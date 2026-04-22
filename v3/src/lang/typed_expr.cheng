@@ -161,6 +161,7 @@ type
     V3TypedExprSourceText =
         workspaceRoot: str
         packageRoot: str
+        externalPackageRoots: parser.V3ParserExternalPackageRoot[]
         sourcePath: str
         text: str
 
@@ -188,6 +189,9 @@ type
         qualifier: str
         targetSourcePath: str
 
+    V3TypedExprLineExprColumns =
+        columns: int32[]
+
     V3TypedExprSourceContext =
         sourcePath: str
         lines: str[]
@@ -196,6 +200,7 @@ type
         importcFunctions: V3TypedExprImportcFunction[]
         importedModules: V3TypedExprImportedModule[]
         declaredTypes: str[]
+        exprLineColumns: V3TypedExprLineExprColumns[]
 
     V3TypedExprSinkInfo =
         sinkType: str
@@ -1000,7 +1005,14 @@ fn v3TypedExprFactsValidateCallResolution(exprLayer: parser.V3NormalizedExprLaye
                (fact.abiClass == v3TypedExprAbiPolymorphic ||
                 fact.loweringMode == v3TypedExprLowerDeferred ||
                 fact.returnKind == v3TypedExprReturnDeferred):
-                err = "v3 typed expr: resolved call fell back to deferred at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                err = "v3 typed expr: resolved call fell back to deferred at " +
+                      expr.sourcePath + ":" + intToStr(expr.lineNumber) +
+                      " target=" + fact.callTarget +
+                      " type=" + fact.typeText +
+                      " abi=" + v3TypedExprAbiClassText(fact.abiClass) +
+                      " lower=" + v3TypedExprLoweringModeText(fact.loweringMode) +
+                      " return=" + v3TypedExprReturnKindText(fact.returnKind) +
+                      " target_source=" + fact.callTargetSourcePath
                 return false
             if fact.callTargetImportc &&
                fact.abiClass == v3TypedExprAbiComposite &&
@@ -1481,7 +1493,14 @@ fn v3TypedExprLoweringRulesValidate(rules: V3TypedExprLoweringRule[],
                (rule.surfaceCallKind == v3TypedExprSurfaceCallExternal ||
                 rule.surfaceCallKind == v3TypedExprSurfaceCallMember):
                 if parser.v3ParserFindText(rule.callTarget, ".") >= 0:
-                    err = "v3 typed expr: qualified call rule missing qualifier"
+                    err = "v3 typed expr: qualified call rule missing qualifier: target=" +
+                          rule.callTarget +
+                          " callee=" +
+                          rule.callCallee +
+                          " source=" +
+                          rule.sourcePath +
+                          " expr=" +
+                          rule.exprId
                     return false
             if rule.callCallee == "" || rule.callTarget == "":
                 err = "v3 typed expr: call rule missing callee or target"
@@ -1575,16 +1594,29 @@ fn v3TypedExprNormalizeTypeText(typeRaw: str): str =
         buffer.AppendBytes(out, piece)
     return rawbytes.bytesToString(buffer.ToBytes(out))
 
+fn v3TypedExprSourceTextNewWithExternalPackageRoots(workspaceRoot: str,
+                                                    packageRoot: str,
+                                                    externalPackageRoots: parser.V3ParserExternalPackageRoot[],
+                                                    sourcePath: str,
+                                                    text: str): V3TypedExprSourceText =
+    var out: V3TypedExprSourceText
+    out.workspaceRoot = parser.v3ParserNormalizePath(workspaceRoot)
+    out.packageRoot = parser.v3ParserNormalizePath(packageRoot)
+    out.externalPackageRoots = parser.v3ParserExternalPackageRootsClone(externalPackageRoots)
+    out.sourcePath = parser.v3ParserNormalizePath(sourcePath)
+    out.text = text
+    return out
+
 fn v3TypedExprSourceTextNew(workspaceRoot: str,
                             packageRoot: str,
                             sourcePath: str,
                             text: str): V3TypedExprSourceText =
-    var out: V3TypedExprSourceText
-    out.workspaceRoot = parser.v3ParserNormalizePath(workspaceRoot)
-    out.packageRoot = parser.v3ParserNormalizePath(packageRoot)
-    out.sourcePath = parser.v3ParserNormalizePath(sourcePath)
-    out.text = text
-    return out
+    var externalPackageRoots: parser.V3ParserExternalPackageRoot[]
+    return v3TypedExprSourceTextNewWithExternalPackageRoots(workspaceRoot,
+                                                            packageRoot,
+                                                            externalPackageRoots,
+                                                            sourcePath,
+                                                            text)
 
 fn v3TypedExprResultType(innerTypeRaw: str): str =
     let innerType = v3TypedExprNormalizeTypeText(innerTypeRaw)
@@ -2163,27 +2195,21 @@ fn v3TypedExprLookupCallTargetReturnTypeFromFact(sourceContexts: V3TypedExprSour
         return v3TypedExprLookupImportcReturnType(sourceContexts[targetIndex], fact.callCallee)
     return v3TypedExprLookupLocalFunctionReturnType(sourceContexts[targetIndex], fact.callCallee)
 
-fn v3TypedExprFirstExprColumnAfter(exprLayer: parser.V3NormalizedExprLayer,
-                                   sourcePathRaw: str,
+fn v3TypedExprFirstExprColumnAfter(ctx: V3TypedExprSourceContext,
                                    lineNumber: int32,
                                    minColumn: int32): int32 =
-    let sourcePath = parser.v3ParserNormalizePath(sourcePathRaw)
-    var best: int32 = -1
-    for i in 0..<exprLayer.exprs.len:
-        let expr = exprLayer.exprs[i]
-        if expr.sourcePath != sourcePath:
-            continue
-        if expr.lineNumber != lineNumber:
-            continue
-        if expr.columnNumber < minColumn:
-            continue
-        if best < 0 || expr.columnNumber < best:
-            best = expr.columnNumber
-    return best
+    if lineNumber <= 0 || lineNumber > ctx.exprLineColumns.len:
+        return -1
+    let lineColumns = ctx.exprLineColumns[lineNumber - 1].columns
+    for i in 0..<lineColumns.len:
+        let exprColumnNumber = lineColumns[i]
+        if exprColumnNumber >= minColumn:
+            return exprColumnNumber
+    return -1
 
 fn v3TypedExprLineHasRootReturn(lineRaw: str,
-                                expr: parser.V3NormalizedExpr,
-                                exprLayer: parser.V3NormalizedExprLayer): bool =
+                                ctx: V3TypedExprSourceContext,
+                                expr: parser.V3NormalizedExpr): bool =
     let firstToken = parser.v3ParserFirstToken(v3path.V3PathTrim(lineRaw))
     if firstToken != "return":
         return false
@@ -2191,11 +2217,21 @@ fn v3TypedExprLineHasRootReturn(lineRaw: str,
     if returnPos < 0:
         return false
     let exprStart = returnPos + len("return") + 1
-    let rootExprColumn = v3TypedExprFirstExprColumnAfter(exprLayer,
-                                                         expr.sourcePath,
+    let rootExprColumn = v3TypedExprFirstExprColumnAfter(ctx,
                                                          expr.lineNumber,
                                                          exprStart)
     return rootExprColumn == expr.columnNumber
+
+fn v3TypedExprSourceContextForPathOrCurrent(currentCtx: V3TypedExprSourceContext,
+                                            sourceContexts: V3TypedExprSourceContext[],
+                                            sourcePathRaw: str): V3TypedExprSourceContext =
+    let sourcePath = parser.v3ParserNormalizePath(sourcePathRaw)
+    if sourcePath == "":
+        return currentCtx
+    let ctxIndex = v3TypedExprSourceContextLookup(sourceContexts, sourcePath)
+    if ctxIndex < 0:
+        return currentCtx
+    return sourceContexts[ctxIndex]
 
 fn v3TypedExprComprehensionFilterIf(lineRaw: str,
                                     expr: parser.V3NormalizedExpr): bool =
@@ -2309,8 +2345,7 @@ fn v3TypedExprInferredResultInputType(ctx: V3TypedExprSourceContext,
     return v3TypedExprLookupBindingType(ctx, scopeIndex, expr.lineNumber, argName)
 
 fn v3TypedExprSinkForExpr(ctx: V3TypedExprSourceContext,
-                          expr: parser.V3NormalizedExpr,
-                          exprLayer: parser.V3NormalizedExprLayer): V3TypedExprSinkInfo =
+                          expr: parser.V3NormalizedExpr): V3TypedExprSinkInfo =
     var sink: V3TypedExprSinkInfo
     sink.sinkType = ""
     sink.sinkPlaceKind = v3TypedExprPlaceTemporary
@@ -2327,15 +2362,14 @@ fn v3TypedExprSinkForExpr(ctx: V3TypedExprSourceContext,
     var bindingType = ""
     var rhsStartColumn: int32 = -1
     if v3TypedExprParseBindingLine(lineRaw, bindingName, bindingType, rhsStartColumn):
-        let bindingRoot = v3TypedExprFirstExprColumnAfter(exprLayer,
-                                                          expr.sourcePath,
+        let bindingRoot = v3TypedExprFirstExprColumnAfter(ctx,
                                                           expr.lineNumber,
                                                           rhsStartColumn)
         if bindingRoot == expr.columnNumber:
             sink.sinkType = bindingType
             sink.sinkPlaceKind = scopeIndex >= 0 ? v3TypedExprPlaceLocal : v3TypedExprPlaceGlobal
             sink.hasSink = true
-    if v3TypedExprLineHasRootReturn(lineRaw, expr, exprLayer) && sink.functionReturnType != "":
+    if v3TypedExprLineHasRootReturn(lineRaw, ctx, expr) && sink.functionReturnType != "":
         sink.sinkType = sink.functionReturnType
         sink.sinkPlaceKind = v3TypedExprPlaceTemporary
         sink.hasSink = true
@@ -2343,7 +2377,7 @@ fn v3TypedExprSinkForExpr(ctx: V3TypedExprSourceContext,
     return sink
 
 fn v3TypedExprApplyResolvedType(fact: var V3TypedExprFact,
-                                currentCtx: V3TypedExprSourceContext,
+                                abiCtx: V3TypedExprSourceContext,
                                 sourceContexts: V3TypedExprSourceContext[],
                                 typeRaw: str,
                                 sink: V3TypedExprSinkInfo,
@@ -2352,7 +2386,7 @@ fn v3TypedExprApplyResolvedType(fact: var V3TypedExprFact,
     if typeText == "":
         return
     fact.typeText = typeText
-    fact.abiClass = v3TypedExprAbiClassForTypeInContext(currentCtx, sourceContexts, typeText)
+    fact.abiClass = v3TypedExprAbiClassForTypeInContext(abiCtx, sourceContexts, typeText)
     fact.valueKind = v3TypedExprValueKindForAbiClass(fact.abiClass)
     if forceCallResult:
         fact.placeKind = v3TypedExprPlaceCallResult
@@ -2377,7 +2411,6 @@ fn v3TypedExprApplyResolvedType(fact: var V3TypedExprFact,
 
 fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
                         sourceContexts: V3TypedExprSourceContext[],
-                        exprLayer: parser.V3NormalizedExprLayer,
                         expr: parser.V3NormalizedExpr): V3TypedExprFact =
     var fact: V3TypedExprFact
     fact.exprId = expr.exprId
@@ -2406,7 +2439,7 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
     fact.callKind = v3TypedExprCallKindForExpr(expr)
     fact.typeCallKind = v3TypedExprTypeCallKindForExpr(expr)
     fact.returnKind = v3TypedExprReturnDeferred
-    let sink = v3TypedExprSinkForExpr(ctx, expr, exprLayer)
+    let sink = v3TypedExprSinkForExpr(ctx, expr)
     let scopeIndex = v3TypedExprScopeIndexForLine(ctx.scopes, expr.lineNumber)
     let sourceResultType = v3TypedExprInferredResultInputType(ctx, scopeIndex, expr)
     if expr.kind == parser.v3NormalizedExprRange:
@@ -2537,7 +2570,10 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
         fact.callArgsText = expr.callArgsText
         let detailReturnType = v3TypedExprLookupCallTargetReturnTypeFromFact(sourceContexts, fact)
         if detailReturnType != "":
-            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, detailReturnType, sink, true)
+            let targetCtx = v3TypedExprSourceContextForPathOrCurrent(ctx,
+                                                                     sourceContexts,
+                                                                     fact.callTargetSourcePath)
+            v3TypedExprApplyResolvedType(fact, targetCtx, sourceContexts, detailReturnType, sink, true)
             if fact.callTargetImportc && fact.abiClass == v3TypedExprAbiComposite:
                 fact.loweringMode = v3TypedExprLowerImportBuffer
                 fact.returnKind = v3TypedExprReturnImportBuffer
@@ -2561,7 +2597,13 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
                                                                                              fact.callQualifier,
                                                                                              fact.callCallee)
             if externalReturnType != "":
-                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, externalReturnType, sink, true)
+                let targetSourcePath = v3TypedExprLookupQualifiedModuleSourcePath(ctx,
+                                                                                  sourceContexts,
+                                                                                  fact.callQualifier)
+                let targetCtx = v3TypedExprSourceContextForPathOrCurrent(ctx,
+                                                                         sourceContexts,
+                                                                         targetSourcePath)
+                v3TypedExprApplyResolvedType(fact, targetCtx, sourceContexts, externalReturnType, sink, true)
                 return fact
         else:
             let localReturnType = v3TypedExprLookupLocalFunctionReturnType(ctx, fact.callTarget)
@@ -2590,6 +2632,11 @@ fn v3TypedExprBuildSourceContext(source: V3TypedExprSourceText,
     ctx.importcFunctions = []
     ctx.importedModules = []
     ctx.declaredTypes = []
+    ctx.exprLineColumns = []
+    for i in 0..<ctx.lines.len:
+        var lineExprColumns: V3TypedExprLineExprColumns
+        lineExprColumns.columns = []
+        add(ctx.exprLineColumns, lineExprColumns)
     var decls: parser.V3NormalizedFunctionDecl[]
     if !parser.v3ParserReadNormalizedFunctionDecls(source.text, decls, err):
         return false
@@ -2658,16 +2705,18 @@ fn v3TypedExprBuildSourceContext(source: V3TypedExprSourceText,
             continue
         add(ctx.declaredTypes, declaredType)
     if source.workspaceRoot != "" && source.packageRoot != "":
-        let ownerModulePath = parser.v3ParserSourcePathToModulePath(source.workspaceRoot,
-                                                                    source.packageRoot,
-                                                                    source.sourcePath)
+        let ownerModulePath = parser.v3ParserSourcePathToModulePathWithExternalPackageRoots(source.workspaceRoot,
+                                                                                             source.packageRoot,
+                                                                                             source.externalPackageRoots,
+                                                                                             source.sourcePath)
         var importEdges: parser.V3ImportEdge[]
-        if !parser.v3ParserReadImportEdges(source.workspaceRoot,
-                                           source.packageRoot,
-                                           ownerModulePath,
-                                           source.text,
-                                           importEdges,
-                                           err):
+        if !parser.v3ParserReadImportEdgesWithExternalPackageRoots(source.workspaceRoot,
+                                                                   source.packageRoot,
+                                                                   source.externalPackageRoots,
+                                                                   ownerModulePath,
+                                                                   source.text,
+                                                                   importEdges,
+                                                                   err):
             return false
         for i in 0..<importEdges.len:
             if !importEdges[i].resolved:
@@ -2679,6 +2728,29 @@ fn v3TypedExprBuildSourceContext(source: V3TypedExprSourceText,
             importedModule.qualifier = qualifier
             importedModule.targetSourcePath = parser.v3ParserNormalizePath(importEdges[i].targetSourcePath)
             add(ctx.importedModules, importedModule)
+    err = ""
+    return true
+
+fn v3TypedExprPopulateSourceExprLineColumns(contexts: var V3TypedExprSourceContext[],
+                                            exprLayer: parser.V3NormalizedExprLayer,
+                                            err: var str): bool =
+    for i in 0..<exprLayer.exprs.len:
+        let expr = exprLayer.exprs[i]
+        let ctxIndex = v3TypedExprSourceContextLookup(contexts, expr.sourcePath)
+        if ctxIndex < 0:
+            err = "v3 typed expr: missing source context"
+            return false
+        if expr.lineNumber <= 0 || expr.lineNumber > contexts[ctxIndex].exprLineColumns.len:
+            err = "v3 typed expr: expr line out of range"
+            return false
+        let lineIndex = expr.lineNumber - 1
+        var lineExprColumns = contexts[ctxIndex].exprLineColumns[lineIndex]
+        var shouldAppend = true
+        if lineExprColumns.columns.len > 0:
+            shouldAppend = lineExprColumns.columns[lineExprColumns.columns.len - 1] != expr.columnNumber
+        if shouldAppend:
+            add(lineExprColumns.columns, expr.columnNumber)
+            contexts[ctxIndex].exprLineColumns[lineIndex] = lineExprColumns
     err = ""
     return true
 
@@ -2695,13 +2767,15 @@ fn v3TypedExprBuildFacts(sourceTexts: V3TypedExprSourceText[],
             err = "v3 typed expr: build source context failed"
             return false
         add(contexts, ctx)
+    if !v3TypedExprPopulateSourceExprLineColumns(contexts, exprLayer, err):
+        return false
     for i in 0..<exprLayer.exprs.len:
         let expr = exprLayer.exprs[i]
         let ctxIndex = v3TypedExprSourceContextLookup(contexts, expr.sourcePath)
         if ctxIndex < 0:
             err = "v3 typed expr: missing source context"
             return false
-        add(facts, v3TypedExprBuildFact(contexts[ctxIndex], contexts, exprLayer, expr))
+        add(facts, v3TypedExprBuildFact(contexts[ctxIndex], contexts, expr))
     var validateErr = ""
     if !v3TypedExprFactsValidateCallResolution(exprLayer, facts, validateErr):
         err = validateErr

@@ -471,8 +471,7 @@ fn v3GateBootstrapBridge(root: str): int32 =
                                [
                                    "compile-bootstrap",
                                    "--in:" + snapshot.stage1Source.path,
-                                   "--out:" + snapshot.stage1Compiler.path,
-                                   "--report-out:" + v3GateBootstrapLog(root, "cheng.stage1.report.txt")
+                                   "--out:" + snapshot.stage1Compiler.path
                                ],
                                "artifacts/v3_bootstrap/cheng.stage1.compile.log") != 0:
         return 1
@@ -488,8 +487,7 @@ fn v3GateBootstrapBridge(root: str): int32 =
                                [
                                    "compile-bootstrap",
                                    "--in:" + snapshot.stage1Source.path,
-                                   "--out:" + snapshot.stage2Compiler.path,
-                                   "--report-out:" + v3GateBootstrapLog(root, "cheng.stage2.report.txt")
+                                   "--out:" + snapshot.stage2Compiler.path
                                ],
                                "artifacts/v3_bootstrap/cheng.stage2.compile.log") != 0:
         return 1
@@ -505,8 +503,7 @@ fn v3GateBootstrapBridge(root: str): int32 =
                                [
                                    "compile-bootstrap",
                                    "--in:" + snapshot.stage1Source.path,
-                                   "--out:" + snapshot.stage3Compiler.path,
-                                   "--report-out:" + v3GateBootstrapLog(root, "cheng.stage3.report.txt")
+                                   "--out:" + snapshot.stage3Compiler.path
                                ],
                                "artifacts/v3_bootstrap/cheng.stage3.compile.log") != 0:
         return 1
@@ -568,6 +565,102 @@ fn v3GateBootstrapFreshInputsReady(root: str, stage3Mtime: int64): bool =
            os.FileMtime(contracts.v3BootstrapCompilerRequestSourcePath(root)) <= stage3Mtime &&
            os.FileMtime(contracts.v3BootstrapGateMainSourcePath(root)) <= stage3Mtime
 
+fn v3GatePathNewerThan(leftPath: str,
+                       rightPath: str): bool =
+    if !v3path.V3PathFileExists(leftPath) || !v3path.V3PathFileExists(rightPath):
+        return false
+    return os.FileMtime(leftPath) > os.FileMtime(rightPath)
+
+fn v3GateChainNodeBuildStampPath(outBin: str): str =
+    return outBin + ".build.txt"
+
+fn v3GateChainNodeBuildStampText(sourcePath: str,
+                                 outBin: str,
+                                 target: str,
+                                 compilerPath: str): str =
+    var out = "format=v3_chain_node_build_v1\n"
+    out = out + "entry=" + sourcePath + "\n"
+    out = out + "output=" + outBin + "\n"
+    out = out + "target=" + target + "\n"
+    out = out + "compiler=" + compilerPath + "\n"
+    return out
+
+fn v3GateChainNodeFresh(root: str,
+                        compilerPath: str,
+                        sourcePath: str,
+                        outBin: str,
+                        target: str): bool =
+    if !v3path.V3FileExistsNonEmpty(root, outBin):
+        return false
+    if !v3path.V3PathFileExists(outBin + ".v3.map"):
+        return false
+    let buildStampPath: str = v3GateChainNodeBuildStampPath(outBin)
+    if !v3path.V3FileExistsNonEmpty(root, buildStampPath):
+        return false
+    let buildStampText: str = v3path.V3ReadTextFile("", buildStampPath)
+    if !v3path.V3TextContains(buildStampText, "format=v3_chain_node_build_v1") ||
+       !v3path.V3TextContains(buildStampText, "entry=" + sourcePath) ||
+       !v3path.V3TextContains(buildStampText, "output=" + outBin) ||
+       !v3path.V3TextContains(buildStampText, "target=" + target) ||
+       !v3path.V3TextContains(buildStampText, "compiler=" + compilerPath):
+        return false
+    if len(compilerPath) > 0 && v3GatePathNewerThan(compilerPath, outBin):
+        return false
+    var freshInputs: str[]
+    var freshErr = ""
+    if !contracts.v3BootstrapChainNodeFreshInputPaths(root, freshInputs, freshErr):
+        return false
+    var i: int32
+    while i < freshInputs.len:
+        if v3GatePathNewerThan(freshInputs[i], outBin):
+            return false
+        i = i + 1
+    return true
+
+fn v3GateBackendDriverFresh(root: str,
+                            backendDriverPath: str): bool =
+    if !v3path.V3FileExistsNonEmpty(root, backendDriverPath):
+        return false
+    if !v3path.V3PathFileExists(backendDriverPath + ".v3.map"):
+        return false
+    let freshInputs = [
+        contracts.v3BootstrapStage3Path(root),
+        contracts.v3BootstrapBackendDriverEntrySourcePath(root),
+        contracts.v3BootstrapCompilerRuntimeSourcePath(root),
+        contracts.v3BootstrapCompilerRequestSourcePath(root),
+        v3path.V3PathAbsolute(root, "v3/src/tooling/compiler_world.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/tooling/compiler_csg.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/tooling/compiler_world_libp2p.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/tooling/compiler_equivalence.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/tooling/compiler_publish_gate.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/lang/parser.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/backend/system_link_plan.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/backend/lowering_plan.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/backend/primary_object_plan.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/backend/object_plan.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/backend/native_link_plan.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/backend/system_link_exec.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/runtime/core_runtime_v3.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/runtime/compiler_runtime_v3.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/runtime/debug_runtime_v3.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/tooling/bootstrap_contracts.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/backend/build_plan.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/runtime/core_runtime_provider_darwin_v3.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/runtime/compiler_runtime_program_entry_provider_v3.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/runtime/compiler_runtime_tooling_entry_provider_v3.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/runtime/program_support_backend_v3.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/runtime/program_support_host_runtime_v3.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/runtime/debug_runtime_stub_v3.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/tooling/host_ops.cheng"),
+        v3path.V3PathAbsolute(root, "v3/src/tooling/path.cheng"),
+        v3path.V3PathAbsolute(root, "src/std/os_host_process.cheng"),
+        v3path.V3PathAbsolute(root, "src/std/os.cheng")
+    ]
+    for i in 0..<freshInputs.len:
+        if v3GatePathNewerThan(freshInputs[i], backendDriverPath):
+            return false
+    return true
+
 fn v3GateBuildBackendDriver(root: str): int32 =
     let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
     let outDir: str = v3path.V3PathAbsolute(root, "artifacts/v3_backend_driver")
@@ -575,6 +668,7 @@ fn v3GateBuildBackendDriver(root: str): int32 =
     let compilerEntrySource: str = contracts.v3BootstrapBackendDriverEntrySourcePath(root)
     let compileReportPath: str = v3path.V3PathAbsolute(root, "artifacts/v3_backend_driver/build_backend_driver_v3.compile.report.txt")
     let compileLogPath: str = "artifacts/v3_backend_driver/build_backend_driver_v3.log"
+    let compileReceiptLogPath: str = "artifacts/v3_backend_driver/build_backend_driver_v3.compile.receipt.log"
     let statusLogPath: str = "artifacts/v3_backend_driver/build_backend_driver_v3.status.txt"
     let verifyExportLogPath: str = "artifacts/v3_backend_driver/build_backend_driver_v3.verify_export_visibility.txt"
     let verifyExportParallelLogPath: str = "artifacts/v3_backend_driver/build_backend_driver_v3.verify_export_visibility_parallel.txt"
@@ -585,6 +679,8 @@ fn v3GateBuildBackendDriver(root: str): int32 =
     let smokeCompileReportPath: str = smokeOut + ".report.txt"
     let smokeCompileLogPath: str =
         "artifacts/v3_backend_driver/ordinary_zero_exit_fixture.selftest.compile.log"
+    let smokeReceiptLogPath: str =
+        "artifacts/v3_backend_driver/ordinary_zero_exit_fixture.selftest.receipt.log"
     let smokeRunLogPath: str =
         "artifacts/v3_backend_driver/ordinary_zero_exit_fixture.selftest.run.log"
     if v3GateEnsureBootstrapBridge(root) != 0:
@@ -598,6 +694,8 @@ fn v3GateBuildBackendDriver(root: str): int32 =
     if !v3path.V3PathFileExists(compilerEntrySource):
         v3GatePrintErr("v3 gate: missing compiler entry source: " + compilerEntrySource)
         return 1
+    if v3path.V3PathFileExists(compileReportPath):
+        let _ = os.RemoveFile(compileReportPath)
     if v3GateBootstrapStageRun(root,
                                "build_backend_driver",
                                snapshot.stage2Compiler.path,
@@ -607,10 +705,26 @@ fn v3GateBuildBackendDriver(root: str): int32 =
                                    "--in:" + compilerEntrySource,
                                    "--emit:exe",
                                    "--target:" + snapshot.targetTriple,
+                                   "--out:" + snapshot.backendDriverOut.path
+                               ],
+                               compileLogPath) != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "build_backend_driver_receipt",
+                               snapshot.stage2Compiler.path,
+                               [
+                                   "world-receipt",
+                                   "--root:" + root,
+                                   "--in:" + compilerEntrySource,
+                                   "--emit:exe",
+                                   "--target:" + snapshot.targetTriple,
                                    "--out:" + snapshot.backendDriverOut.path,
                                    "--report-out:" + compileReportPath
                                ],
-                               compileLogPath) != 0:
+                               compileReceiptLogPath) != 0:
+        return 1
+    if !v3path.V3PathFileExists(compileReportPath):
+        v3GatePrintErr("v3 gate: missing backend driver compile report: " + compileReportPath)
         return 1
     if !contracts.v3BootstrapArtifactReady(snapshot.backendDriverOut):
         v3GatePrintErr("v3 gate: missing backend driver output: " + snapshot.backendDriverOut.path)
@@ -650,6 +764,8 @@ fn v3GateBuildBackendDriver(root: str): int32 =
     if v3GateBuildPlanComparableText(builtPlan) != v3GateBuildPlanComparableText(stage3Plan):
         v3GatePrintErr("v3 gate: backend driver build plan drift vs stage3: " + snapshot.backendDriverOut.path)
         return 1
+    if v3path.V3PathFileExists(smokeCompileReportPath):
+        let _ = os.RemoveFile(smokeCompileReportPath)
     if v3GateBootstrapStageRun(root,
                                "backend_driver_zero_exit_compile",
                                snapshot.backendDriverOut.path,
@@ -659,10 +775,26 @@ fn v3GateBuildBackendDriver(root: str): int32 =
                                    "--in:" + smokeSource,
                                    "--emit:exe",
                                    "--target:" + snapshot.targetTriple,
+                                   "--out:" + smokeOut
+                               ],
+                               smokeCompileLogPath) != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "backend_driver_zero_exit_receipt",
+                               snapshot.backendDriverOut.path,
+                               [
+                                   "world-receipt",
+                                   "--root:" + packageRoot,
+                                   "--in:" + smokeSource,
+                                   "--emit:exe",
+                                   "--target:" + snapshot.targetTriple,
                                    "--out:" + smokeOut,
                                    "--report-out:" + smokeCompileReportPath
                                ],
-                               smokeCompileLogPath) != 0:
+                               smokeReceiptLogPath) != 0:
+        return 1
+    if !v3path.V3PathFileExists(smokeCompileReportPath):
+        v3GatePrintErr("v3 gate: missing backend driver zero-exit receipt report: " + smokeCompileReportPath)
         return 1
     if !v3path.V3PathFileExists(smokeOut) || !v3path.V3PathFileExists(smokeOut + ".v3.map"):
         v3GatePrintErr("v3 gate: backend driver zero-exit smoke missing output: " + smokeOut)
@@ -845,7 +977,10 @@ fn v3GateRunProductionRegression(root: str): int32 =
                                "explicit_default_init_positive_smoke",
                                "explicit_default_init_negative_smoke",
                                "explicit_default_init_gate_smoke",
-                               "composite_zero_helper_gate_smoke"
+                               "composite_zero_helper_gate_smoke",
+                               "latest_snapshot_port_preserves_live_str_smoke",
+                               "list_literal_nested_call_depth_smoke",
+                               "libp2p_quic_twoproc_server_pre_quic_smoke"
                            ]) != 0:
         return 1
     v3GatePrintLine("[v3 gate] production regression: r2c-react-v3 surface")
@@ -881,7 +1016,9 @@ fn v3GateVerifyTcpBioLinuxRegression(root: str): int32 =
 fn v3GateEnsureBackendDriverReady(root: str, outCompiler: var str): int32 =
     let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
     outCompiler = snapshot.backendDriverOut.path
-    if contracts.v3BootstrapArtifactReady(snapshot.backendDriverOut):
+    if v3GateEnsureBootstrapBridge(root) != 0:
+        return 1
+    if v3GateBackendDriverFresh(root, snapshot.backendDriverOut.path):
         return 0
     return v3GateBuildBackendDriver(root)
 
@@ -918,16 +1055,17 @@ fn v3GateEnsureCompilerReady(root: str, compilerPath: str, outCompiler: var str)
     let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
     outCompiler = v3path.V3PathAbsolute(root, compilerPath)
     if outCompiler == snapshot.backendDriverOut.path:
-        if !os.FileExists(outCompiler):
-            return v3GateEnsureBackendDriverReady(root, outCompiler)
-        return 0
+        return v3GateEnsureBackendDriverReady(root, outCompiler)
     if outCompiler == snapshot.stage0Compiler.path ||
        outCompiler == snapshot.stage1Compiler.path ||
        outCompiler == snapshot.stage2Compiler.path ||
        outCompiler == snapshot.stage3Compiler.path:
-        if !os.FileExists(outCompiler):
-            return v3GateEnsureBootstrapBridge(root)
-        return 0
+        if v3GateEnsureBootstrapBridge(root) != 0:
+            return 1
+        if os.FileExists(outCompiler):
+            return 0
+        v3GatePrintErr("v3 gate: missing compiler: " + outCompiler)
+        return 1
     if os.FileExists(outCompiler):
         return 0
     v3GatePrintErr("v3 gate: missing compiler: " + outCompiler)
@@ -942,6 +1080,29 @@ fn v3GateCompileEmitEnv(root: str,
                         target: str,
                         logRelPath: str,
                         envOverrides: str[]): hostops.V3LoggedRun =
+    let timeoutText = os.GetEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300")
+    let timeoutSec = int32(strutil.ParseInt(timeoutText))
+    return v3GateCompileEmitEnvWithTimeout(root,
+                                           label,
+                                           compilerPath,
+                                           sourcePath,
+                                           emitKind,
+                                           outPath,
+                                           target,
+                                           logRelPath,
+                                           envOverrides,
+                                           timeoutSec)
+
+fn v3GateCompileEmitEnvWithTimeout(root: str,
+                                   label: str,
+                                   compilerPath: str,
+                                   sourcePath: str,
+                                   emitKind: str,
+                                   outPath: str,
+                                   target: str,
+                                   logRelPath: str,
+                                   envOverrides: str[],
+                                   timeoutSec: int32): hostops.V3LoggedRun =
     let packageRoot = v3path.V3PathAbsolute(root, "v3")
     var compilerAbs: str
     let outParts: os.SplitFileResult = os.SplitFile(outPath)
@@ -958,8 +1119,6 @@ fn v3GateCompileEmitEnv(root: str,
                                        logAbs,
                                        1,
                                        missingText)
-    let timeoutText = os.GetEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300")
-    let timeoutSec = int32(strutil.ParseInt(timeoutText))
     let run = hostops.v3RunFileLogged(root,
                                       label,
                                       compilerAbs,
@@ -998,6 +1157,26 @@ fn v3GateCompileExeEnv(root: str,
                                 target,
                                 logRelPath,
                                 envOverrides)
+
+fn v3GateCompileExeEnvWithTimeout(root: str,
+                                  label: str,
+                                  compilerPath: str,
+                                  sourcePath: str,
+                                  outPath: str,
+                                  target: str,
+                                  logRelPath: str,
+                                  envOverrides: str[],
+                                  timeoutSec: int32): hostops.V3LoggedRun =
+    return v3GateCompileEmitEnvWithTimeout(root,
+                                           label,
+                                           compilerPath,
+                                           sourcePath,
+                                           "exe",
+                                           outPath,
+                                           target,
+                                           logRelPath,
+                                           envOverrides,
+                                           timeoutSec)
 
 fn v3GateCompileExe(root: str,
                     label: str,
@@ -1461,7 +1640,7 @@ fn v3GateBftRemoteStage3FreshCommand(repoRoot: str): str =
     let stage3 = v3GateBftRemoteStage3(repoRoot)
     let snapshot = v3GateBftRemoteSnapshot(repoRoot)
     let seed = os.JoinPath(repoRoot, "v3/bootstrap/cheng_v3_seed.c")
-    let stage1 = os.JoinPath(repoRoot, "v3/bootstrap/stage1_bootstrap.cheng")
+    let stage1 = contracts.v3BootstrapStage1SourcePath(repoRoot)
     let compilerMain = os.JoinPath(repoRoot, "v3/src/tooling/compiler_main.cheng")
     let compilerRuntime = os.JoinPath(repoRoot, "v3/src/tooling/compiler_runtime.cheng")
     let compilerRequest = os.JoinPath(repoRoot, "v3/src/tooling/compiler_request.cheng")
@@ -3372,12 +3551,17 @@ fn v3GateDefaultHostSmokes(): str[] =
         "stage3_system_link_exec_handoff_smoke",
         "artifact_isolation_audit_smoke",
         "backend_driver_command_surface_smoke",
+        "host_process_pipe_spawn_api_smoke",
+        "backend_driver_selfhost_progress_smoke",
         "build_backend_driver_report_smoke",
         "backend_driver_candidate_output_smoke",
+        "seed_abi_descriptor_contract_smoke",
+        "bootstrap_contract_v2_only_negative_smoke",
         "perf_memory_gate_contract_smoke",
         "runtime_link_input_surface_smoke",
         "runtime_zero_c_surface_smoke",
         "composite_default_init_smoke",
+        "seqs_add_generic_smoke",
         "composite_default_init_negative_smoke",
         "if_enum_composite_return_smoke",
         "out_param_writeback_smoke",
@@ -3391,6 +3575,9 @@ fn v3GateDefaultHostSmokes(): str[] =
         "chain_node_snapshot_write_return_boundary_smoke",
         "chain_node_snapshot_print_return_boundary_smoke",
         "chain_node_cli_return_boundary_smoke",
+        "latest_snapshot_port_preserves_live_str_smoke",
+        "list_literal_nested_call_depth_smoke",
+        "libp2p_quic_twoproc_server_pre_quic_smoke",
         "export_visibility_smoke",
         "export_visibility_negative_smoke",
         "strformat_export_negative_smoke",
@@ -3433,6 +3620,7 @@ fn v3GateDefaultHostSmokes(): str[] =
         "rwad_serial_state_machine_smoke",
         "rwad_bft_state_machine_smoke",
         "parser_path_smoke",
+        "short_circuit_semantics_smoke",
         "call_hir_matrix_smoke",
         "compiler_pipeline_smoke",
         "lowering_plan_smoke",
@@ -3552,6 +3740,7 @@ fn v3GateDefaultStage23Smokes(): str[] =
         "browser_bridge_artifact_write_smoke",
         "compiler_equivalence_smoke",
         "compiler_publish_smoke",
+        "compiler_managed_dependency_mirror_smoke",
         "bft_three_replica_smoke",
         "primary_object_plan_smoke",
         "object_native_link_plan_smoke",
@@ -3625,12 +3814,23 @@ fn v3GateSmokeRunTimeoutSec(): int32 =
         return int32(strutil.ParseInt(timeoutText))
     return 60
 
-fn v3GateSmokeRunTimeoutSecFor(smokeName: str): int32 =
+fn v3GateSmokeMinTimeoutSecFor(smokeName: str): int32 =
     if smokeName == "build_backend_driver_report_smoke":
-        return 240
+        return 600
     if smokeName == "runtime_zero_c_surface_smoke":
         return 180
-    return v3GateSmokeRunTimeoutSec()
+    if smokeName == "backend_driver_command_surface_smoke":
+        return 420
+    if smokeName == "backend_driver_selfhost_progress_smoke":
+        return 240
+    return 60
+
+fn v3GateSmokeRunTimeoutSecFor(smokeName: str): int32 =
+    let minTimeoutSec: int32 = v3GateSmokeMinTimeoutSecFor(smokeName)
+    let requestedTimeoutSec: int32 = v3GateSmokeRunTimeoutSec()
+    if requestedTimeoutSec > minTimeoutSec:
+        return requestedTimeoutSec
+    return minTimeoutSec
 
 fn v3GateRunSingleFixtureSmoke(root: str,
                                suiteLabel: str,
@@ -4390,12 +4590,7 @@ fn v3GateRunChainNodeServeAndSync(root: str,
     let serverSpawn = hostops.v3SpawnFile(root,
                                           "v3 chain_node resilience serve " + label + " " + roundTag,
                                           chainNodeBin,
-                                          [
-                                              "chain-daemon-serve",
-                                              "--state:" + serverState,
-                                              "--port:0",
-                                              "--ready-path:" + readyPath
-                                          ],
+                                          v3GateChainDaemonServeArgs(serverState, readyPath),
                                           [],
                                           root)
     if IsErr(serverSpawn):
@@ -4408,15 +4603,10 @@ fn v3GateRunChainNodeServeAndSync(root: str,
         v3GateMaybePrintRunOutput(serverRun)
         hostops.v3SpawnedProcessKill(serverProc)
         return 1
-    var syncArgs: str[]
-    add(syncArgs, "chain-daemon-sync")
-    add(syncArgs, "--state:" + clientState)
-    if len(clientNodeId) > 0:
-        add(syncArgs, "--node-id:" + clientNodeId)
-    if len(clientAddressSeed) > 0:
-        add(syncArgs, "--address-seed:" + clientAddressSeed)
-    add(syncArgs, "--host:127.0.0.1")
-    add(syncArgs, "--port:" + serverPort)
+    let syncArgs: str[] = v3GateChainDaemonSyncArgs(clientState,
+                                                    clientNodeId,
+                                                    clientAddressSeed,
+                                                    serverPort)
     let syncRun = v3GateRunBinary(root,
                                   "v3 chain_node resilience sync " + label + " " + roundTag,
                                   chainNodeBin,
@@ -4468,10 +4658,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let initRun = v3GateRunBinary(root,
                                   "v3 chain_node cli init " + label,
                                   chainNodeBin,
-                                  ["chain-init",
-                                   "--state:" + serverState,
-                                   "--node-id:node-a",
-                                   "--address-seed:chain-node-a"],
+                                  v3GateChainInitArgs(serverState, "node-a", "chain-node-a"),
                                   20,
                                   os.JoinPath(outDir, "init." + label + ".log"))
     if v3GateRunFailed(initRun):
@@ -4479,7 +4666,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let mintRun = v3GateRunBinary(root,
                                   "v3 chain_node cli mint " + label,
                                   chainNodeBin,
-                                  ["chain-mint", "--state:" + serverState, "--asset:7", "--account:1001", "--amount:100"],
+                                  v3GateChainMintArgs(serverState, "1001", "100"),
                                   20,
                                   os.JoinPath(outDir, "mint." + label + ".log"))
     if v3GateRunFailed(mintRun):
@@ -4487,12 +4674,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let transferRun = v3GateRunBinary(root,
                                       "v3 chain_node cli transfer " + label,
                                       chainNodeBin,
-                                      ["chain-transfer",
-                                       "--state:" + serverState,
-                                       "--asset:7",
-                                       "--from:1001",
-                                       "--to:2002",
-                                       "--amount:40"],
+                                      v3GateChainTransferArgs(serverState, "1001", "2002", "40"),
                                       20,
                                       os.JoinPath(outDir, "transfer." + label + ".log"))
     if v3GateRunFailed(transferRun):
@@ -4500,7 +4682,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let balanceARun = v3GateRunBinary(root,
                                       "v3 chain_node cli balance-a " + label,
                                       chainNodeBin,
-                                      ["chain-balance", "--state:" + serverState, "--asset:7", "--account:1001"],
+                                      v3GateChainBalanceArgs(serverState, "1001"),
                                       20,
                                       os.JoinPath(outDir, "balance_a." + label + ".log"))
     if v3GateRunFailed(balanceARun):
@@ -4508,7 +4690,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let balanceBRun = v3GateRunBinary(root,
                                       "v3 chain_node cli balance-b " + label,
                                       chainNodeBin,
-                                      ["chain-balance", "--state:" + serverState, "--asset:7", "--account:2002"],
+                                      v3GateChainBalanceArgs(serverState, "2002"),
                                       20,
                                       os.JoinPath(outDir, "balance_b." + label + ".log"))
     if v3GateRunFailed(balanceBRun):
@@ -4516,7 +4698,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let showRun = v3GateRunBinary(root,
                                   "v3 chain_node cli show-state " + label,
                                   chainNodeBin,
-                                  ["chain-show-state", "--state:" + serverState],
+                                  v3GateChainShowStateArgs(serverState),
                                   20,
                                   os.JoinPath(outDir, "show." + label + ".log"))
     if v3GateRunFailed(showRun):
@@ -4524,7 +4706,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let snapshotRun = v3GateRunBinary(root,
                                       "v3 chain_node cli dump-snapshot " + label,
                                       chainNodeBin,
-                                      ["chain-dump-snapshot", "--state:" + serverState],
+                                      v3GateChainSnapshotDumpArgs(serverState),
                                       20,
                                       os.JoinPath(outDir, "snapshot." + label + ".log"))
     if v3GateRunFailed(snapshotRun):
@@ -4532,12 +4714,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let serverSpawn = hostops.v3SpawnFile(root,
                                           "v3 chain_node cli daemon-serve " + label,
                                           chainNodeBin,
-                                          [
-                                              "chain-daemon-serve",
-                                              "--state:" + serverState,
-                                              "--port:0",
-                                              "--ready-path:" + readyPath
-                                          ],
+                                          v3GateChainDaemonServeArgs(serverState, readyPath),
                                           [],
                                           root)
     if IsErr(serverSpawn):
@@ -4554,14 +4731,10 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let syncRun = v3GateRunBinary(root,
                                   "v3 chain_node cli daemon-sync " + label,
                                   chainNodeBin,
-                                  [
-                                      "chain-daemon-sync",
-                                      "--state:" + clientState,
-                                      "--node-id:node-b",
-                                      "--address-seed:chain-node-b",
-                                      "--host:127.0.0.1",
-                                      "--port:" + serverPort
-                                  ],
+                                  v3GateChainDaemonSyncArgs(clientState,
+                                                            "node-b",
+                                                            "chain-node-b",
+                                                            serverPort),
                                   20,
                                   syncLog)
     if v3GateRunFailed(syncRun):
@@ -4574,7 +4747,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let clientBalanceARun = v3GateRunBinary(root,
                                             "v3 chain_node cli client-balance-a " + label,
                                             chainNodeBin,
-                                            ["chain-balance", "--state:" + clientState, "--asset:7", "--account:1001"],
+                                            v3GateChainBalanceArgs(clientState, "1001"),
                                             20,
                                             os.JoinPath(outDir, "client_balance_a." + label + ".log"))
     if v3GateRunFailed(clientBalanceARun):
@@ -4582,7 +4755,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let clientBalanceBRun = v3GateRunBinary(root,
                                             "v3 chain_node cli client-balance-b " + label,
                                             chainNodeBin,
-                                            ["chain-balance", "--state:" + clientState, "--asset:7", "--account:2002"],
+                                            v3GateChainBalanceArgs(clientState, "2002"),
                                             20,
                                             os.JoinPath(outDir, "client_balance_b." + label + ".log"))
     if v3GateRunFailed(clientBalanceBRun):
@@ -4590,7 +4763,7 @@ fn v3GateRunChainNodeCliSmoke(root: str,
     let clientShowRun = v3GateRunBinary(root,
                                         "v3 chain_node cli client-show " + label,
                                         chainNodeBin,
-                                        ["chain-show-state", "--state:" + clientState],
+                                        v3GateChainShowStateArgs(clientState),
                                         20,
                                         os.JoinPath(outDir, "client_show." + label + ".log"))
     if v3GateRunFailed(clientShowRun):
@@ -4647,10 +4820,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let initRun = v3GateRunBinary(root,
                                   "v3 chain_node resilience init " + label,
                                   chainNodeBin,
-                                  ["chain-init",
-                                   "--state:" + serverState,
-                                   "--node-id:node-a",
-                                   "--address-seed:chain-node-a"],
+                                  v3GateChainInitArgs(serverState, "node-a", "chain-node-a"),
                                   20,
                                   os.JoinPath(outDir, "init." + label + ".log"))
     if v3GateRunFailed(initRun):
@@ -4661,7 +4831,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let round1MintRun = v3GateRunBinary(root,
                                         "v3 chain_node resilience round1 mint " + label,
                                         chainNodeBin,
-                                        ["chain-mint", "--state:" + serverState, "--asset:7", "--account:1001", "--amount:100"],
+                                        v3GateChainMintArgs(serverState, "1001", "100"),
                                         20,
                                         os.JoinPath(outDir, "round1_mint." + label + ".log"))
     if v3GateRunFailed(round1MintRun):
@@ -4669,12 +4839,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let round1TransferRun = v3GateRunBinary(root,
                                             "v3 chain_node resilience round1 transfer " + label,
                                             chainNodeBin,
-                                            ["chain-transfer",
-                                             "--state:" + serverState,
-                                             "--asset:7",
-                                             "--from:1001",
-                                             "--to:2002",
-                                             "--amount:40"],
+                                            v3GateChainTransferArgs(serverState, "1001", "2002", "40"),
                                             20,
                                             os.JoinPath(outDir, "round1_transfer." + label + ".log"))
     if v3GateRunFailed(round1TransferRun):
@@ -4682,7 +4847,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverAliceRound1 = v3GateRunBinary(root,
                                             "v3 chain_node resilience round1 server alice " + label,
                                             chainNodeBin,
-                                            ["chain-balance", "--state:" + serverState, "--asset:7", "--account:1001"],
+                                            v3GateChainBalanceArgs(serverState, "1001"),
                                             20,
                                             os.JoinPath(outDir, "round1_server_alice." + label + ".log"))
     if v3GateRunFailed(serverAliceRound1):
@@ -4690,7 +4855,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverBobRound1 = v3GateRunBinary(root,
                                           "v3 chain_node resilience round1 server bob " + label,
                                           chainNodeBin,
-                                          ["chain-balance", "--state:" + serverState, "--asset:7", "--account:2002"],
+                                          v3GateChainBalanceArgs(serverState, "2002"),
                                           20,
                                           os.JoinPath(outDir, "round1_server_bob." + label + ".log"))
     if v3GateRunFailed(serverBobRound1):
@@ -4698,7 +4863,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverShowRound1 = v3GateRunBinary(root,
                                            "v3 chain_node resilience round1 server show " + label,
                                            chainNodeBin,
-                                           ["chain-show-state", "--state:" + serverState],
+                                           v3GateChainShowStateArgs(serverState),
                                            20,
                                            os.JoinPath(outDir, "round1_server_show." + label + ".log"))
     if v3GateRunFailed(serverShowRound1):
@@ -4706,7 +4871,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverSnapshotRound1 = v3GateRunBinary(root,
                                                "v3 chain_node resilience round1 server snapshot " + label,
                                                chainNodeBin,
-                                               ["chain-dump-snapshot", "--state:" + serverState],
+                                               v3GateChainSnapshotDumpArgs(serverState),
                                                20,
                                                os.JoinPath(outDir, "round1_server_snapshot." + label + ".log"))
     if v3GateRunFailed(serverSnapshotRound1):
@@ -4731,7 +4896,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let relayShowRound1 = v3GateRunBinary(root,
                                           "v3 chain_node resilience round1 relay show " + label,
                                           chainNodeBin,
-                                          ["chain-show-state", "--state:" + relayState],
+                                          v3GateChainShowStateArgs(relayState),
                                           20,
                                           os.JoinPath(outDir, "round1_relay_show." + label + ".log"))
     if v3GateRunFailed(relayShowRound1):
@@ -4739,7 +4904,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let relayAliceRound1 = v3GateRunBinary(root,
                                            "v3 chain_node resilience round1 relay alice " + label,
                                            chainNodeBin,
-                                           ["chain-balance", "--state:" + relayState, "--asset:7", "--account:1001"],
+                                           v3GateChainBalanceArgs(relayState, "1001"),
                                            20,
                                            os.JoinPath(outDir, "round1_relay_alice." + label + ".log"))
     if v3GateRunFailed(relayAliceRound1):
@@ -4747,7 +4912,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let relayBobRound1 = v3GateRunBinary(root,
                                          "v3 chain_node resilience round1 relay bob " + label,
                                          chainNodeBin,
-                                         ["chain-balance", "--state:" + relayState, "--asset:7", "--account:2002"],
+                                         v3GateChainBalanceArgs(relayState, "2002"),
                                          20,
                                          os.JoinPath(outDir, "round1_relay_bob." + label + ".log"))
     if v3GateRunFailed(relayBobRound1):
@@ -4784,7 +4949,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let clientShowRound1 = v3GateRunBinary(root,
                                            "v3 chain_node resilience round1 client show " + label,
                                            chainNodeBin,
-                                           ["chain-show-state", "--state:" + clientState],
+                                           v3GateChainShowStateArgs(clientState),
                                            20,
                                            os.JoinPath(outDir, "round1_client_show." + label + ".log"))
     if v3GateRunFailed(clientShowRound1):
@@ -4792,7 +4957,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let clientAliceRound1 = v3GateRunBinary(root,
                                             "v3 chain_node resilience round1 client alice " + label,
                                             chainNodeBin,
-                                            ["chain-balance", "--state:" + clientState, "--asset:7", "--account:1001"],
+                                            v3GateChainBalanceArgs(clientState, "1001"),
                                             20,
                                             os.JoinPath(outDir, "round1_client_alice." + label + ".log"))
     if v3GateRunFailed(clientAliceRound1):
@@ -4800,7 +4965,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let clientBobRound1 = v3GateRunBinary(root,
                                           "v3 chain_node resilience round1 client bob " + label,
                                           chainNodeBin,
-                                          ["chain-balance", "--state:" + clientState, "--asset:7", "--account:2002"],
+                                          v3GateChainBalanceArgs(clientState, "2002"),
                                           20,
                                           os.JoinPath(outDir, "round1_client_bob." + label + ".log"))
     if v3GateRunFailed(clientBobRound1):
@@ -4827,7 +4992,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let round2MintRun = v3GateRunBinary(root,
                                         "v3 chain_node resilience round2 mint " + label,
                                         chainNodeBin,
-                                        ["chain-mint", "--state:" + serverState, "--asset:7", "--account:2002", "--amount:25"],
+                                        v3GateChainMintArgs(serverState, "2002", "25"),
                                         20,
                                         os.JoinPath(outDir, "round2_mint." + label + ".log"))
     if v3GateRunFailed(round2MintRun):
@@ -4835,12 +5000,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let round2TransferRun = v3GateRunBinary(root,
                                             "v3 chain_node resilience round2 transfer " + label,
                                             chainNodeBin,
-                                            ["chain-transfer",
-                                             "--state:" + serverState,
-                                             "--asset:7",
-                                             "--from:2002",
-                                             "--to:1001",
-                                             "--amount:15"],
+                                            v3GateChainTransferArgs(serverState, "2002", "1001", "15"),
                                             20,
                                             os.JoinPath(outDir, "round2_transfer." + label + ".log"))
     if v3GateRunFailed(round2TransferRun):
@@ -4848,7 +5008,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverShowRound2 = v3GateRunBinary(root,
                                            "v3 chain_node resilience round2 server show " + label,
                                            chainNodeBin,
-                                           ["chain-show-state", "--state:" + serverState],
+                                           v3GateChainShowStateArgs(serverState),
                                            20,
                                            os.JoinPath(outDir, "round2_server_show." + label + ".log"))
     if v3GateRunFailed(serverShowRound2):
@@ -4856,7 +5016,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverAliceRound2 = v3GateRunBinary(root,
                                             "v3 chain_node resilience round2 server alice " + label,
                                             chainNodeBin,
-                                            ["chain-balance", "--state:" + serverState, "--asset:7", "--account:1001"],
+                                            v3GateChainBalanceArgs(serverState, "1001"),
                                             20,
                                             os.JoinPath(outDir, "round2_server_alice." + label + ".log"))
     if v3GateRunFailed(serverAliceRound2):
@@ -4864,7 +5024,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverBobRound2 = v3GateRunBinary(root,
                                           "v3 chain_node resilience round2 server bob " + label,
                                           chainNodeBin,
-                                          ["chain-balance", "--state:" + serverState, "--asset:7", "--account:2002"],
+                                          v3GateChainBalanceArgs(serverState, "2002"),
                                           20,
                                           os.JoinPath(outDir, "round2_server_bob." + label + ".log"))
     if v3GateRunFailed(serverBobRound2):
@@ -4887,7 +5047,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let relayShowRound2 = v3GateRunBinary(root,
                                           "v3 chain_node resilience round2 relay show " + label,
                                           chainNodeBin,
-                                          ["chain-show-state", "--state:" + relayState],
+                                          v3GateChainShowStateArgs(relayState),
                                           20,
                                           os.JoinPath(outDir, "round2_relay_show." + label + ".log"))
     if v3GateRunFailed(relayShowRound2):
@@ -4895,7 +5055,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let relayAliceRound2 = v3GateRunBinary(root,
                                            "v3 chain_node resilience round2 relay alice " + label,
                                            chainNodeBin,
-                                           ["chain-balance", "--state:" + relayState, "--asset:7", "--account:1001"],
+                                           v3GateChainBalanceArgs(relayState, "1001"),
                                            20,
                                            os.JoinPath(outDir, "round2_relay_alice." + label + ".log"))
     if v3GateRunFailed(relayAliceRound2):
@@ -4903,7 +5063,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let relayBobRound2 = v3GateRunBinary(root,
                                          "v3 chain_node resilience round2 relay bob " + label,
                                          chainNodeBin,
-                                         ["chain-balance", "--state:" + relayState, "--asset:7", "--account:2002"],
+                                         v3GateChainBalanceArgs(relayState, "2002"),
                                          20,
                                          os.JoinPath(outDir, "round2_relay_bob." + label + ".log"))
     if v3GateRunFailed(relayBobRound2):
@@ -4939,7 +5099,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let clientShowRound2 = v3GateRunBinary(root,
                                            "v3 chain_node resilience round2 client show " + label,
                                            chainNodeBin,
-                                           ["chain-show-state", "--state:" + clientState],
+                                           v3GateChainShowStateArgs(clientState),
                                            20,
                                            os.JoinPath(outDir, "round2_client_show." + label + ".log"))
     if v3GateRunFailed(clientShowRound2):
@@ -4947,7 +5107,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let clientAliceRound2 = v3GateRunBinary(root,
                                             "v3 chain_node resilience round2 client alice " + label,
                                             chainNodeBin,
-                                            ["chain-balance", "--state:" + clientState, "--asset:7", "--account:1001"],
+                                            v3GateChainBalanceArgs(clientState, "1001"),
                                             20,
                                             os.JoinPath(outDir, "round2_client_alice." + label + ".log"))
     if v3GateRunFailed(clientAliceRound2):
@@ -4955,7 +5115,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let clientBobRound2 = v3GateRunBinary(root,
                                           "v3 chain_node resilience round2 client bob " + label,
                                           chainNodeBin,
-                                          ["chain-balance", "--state:" + clientState, "--asset:7", "--account:2002"],
+                                          v3GateChainBalanceArgs(clientState, "2002"),
                                           20,
                                           os.JoinPath(outDir, "round2_client_bob." + label + ".log"))
     if v3GateRunFailed(clientBobRound2):
@@ -4981,12 +5141,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let round3TransferRun = v3GateRunBinary(root,
                                             "v3 chain_node resilience round3 transfer " + label,
                                             chainNodeBin,
-                                            ["chain-transfer",
-                                             "--state:" + serverState,
-                                             "--asset:7",
-                                             "--from:1001",
-                                             "--to:2002",
-                                             "--amount:20"],
+                                            v3GateChainTransferArgs(serverState, "1001", "2002", "20"),
                                             20,
                                             os.JoinPath(outDir, "round3_transfer." + label + ".log"))
     if v3GateRunFailed(round3TransferRun):
@@ -4994,7 +5149,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let round3MintRun = v3GateRunBinary(root,
                                         "v3 chain_node resilience round3 mint " + label,
                                         chainNodeBin,
-                                        ["chain-mint", "--state:" + serverState, "--asset:7", "--account:1001", "--amount:30"],
+                                        v3GateChainMintArgs(serverState, "1001", "30"),
                                         20,
                                         os.JoinPath(outDir, "round3_mint." + label + ".log"))
     if v3GateRunFailed(round3MintRun):
@@ -5002,7 +5157,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverShowRound3 = v3GateRunBinary(root,
                                            "v3 chain_node resilience round3 server show " + label,
                                            chainNodeBin,
-                                           ["chain-show-state", "--state:" + serverState],
+                                           v3GateChainShowStateArgs(serverState),
                                            20,
                                            os.JoinPath(outDir, "round3_server_show." + label + ".log"))
     if v3GateRunFailed(serverShowRound3):
@@ -5010,7 +5165,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverAliceRound3 = v3GateRunBinary(root,
                                             "v3 chain_node resilience round3 server alice " + label,
                                             chainNodeBin,
-                                            ["chain-balance", "--state:" + serverState, "--asset:7", "--account:1001"],
+                                            v3GateChainBalanceArgs(serverState, "1001"),
                                             20,
                                             os.JoinPath(outDir, "round3_server_alice." + label + ".log"))
     if v3GateRunFailed(serverAliceRound3):
@@ -5018,7 +5173,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverBobRound3 = v3GateRunBinary(root,
                                           "v3 chain_node resilience round3 server bob " + label,
                                           chainNodeBin,
-                                          ["chain-balance", "--state:" + serverState, "--asset:7", "--account:2002"],
+                                          v3GateChainBalanceArgs(serverState, "2002"),
                                           20,
                                           os.JoinPath(outDir, "round3_server_bob." + label + ".log"))
     if v3GateRunFailed(serverBobRound3):
@@ -5026,7 +5181,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let serverSnapshotRound3 = v3GateRunBinary(root,
                                                "v3 chain_node resilience round3 server snapshot " + label,
                                                chainNodeBin,
-                                               ["chain-dump-snapshot", "--state:" + serverState],
+                                               v3GateChainSnapshotDumpArgs(serverState),
                                                20,
                                                os.JoinPath(outDir, "round3_server_snapshot." + label + ".log"))
     if v3GateRunFailed(serverSnapshotRound3):
@@ -5050,7 +5205,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let relayShowRound3 = v3GateRunBinary(root,
                                           "v3 chain_node resilience round3 relay show " + label,
                                           chainNodeBin,
-                                          ["chain-show-state", "--state:" + relayState],
+                                          v3GateChainShowStateArgs(relayState),
                                           20,
                                           os.JoinPath(outDir, "round3_relay_show." + label + ".log"))
     if v3GateRunFailed(relayShowRound3):
@@ -5058,7 +5213,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let relayAliceRound3 = v3GateRunBinary(root,
                                            "v3 chain_node resilience round3 relay alice " + label,
                                            chainNodeBin,
-                                           ["chain-balance", "--state:" + relayState, "--asset:7", "--account:1001"],
+                                           v3GateChainBalanceArgs(relayState, "1001"),
                                            20,
                                            os.JoinPath(outDir, "round3_relay_alice." + label + ".log"))
     if v3GateRunFailed(relayAliceRound3):
@@ -5066,7 +5221,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let relayBobRound3 = v3GateRunBinary(root,
                                          "v3 chain_node resilience round3 relay bob " + label,
                                          chainNodeBin,
-                                         ["chain-balance", "--state:" + relayState, "--asset:7", "--account:2002"],
+                                         v3GateChainBalanceArgs(relayState, "2002"),
                                          20,
                                          os.JoinPath(outDir, "round3_relay_bob." + label + ".log"))
     if v3GateRunFailed(relayBobRound3):
@@ -5102,7 +5257,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let clientShowRound3 = v3GateRunBinary(root,
                                            "v3 chain_node resilience round3 client show " + label,
                                            chainNodeBin,
-                                           ["chain-show-state", "--state:" + clientState],
+                                           v3GateChainShowStateArgs(clientState),
                                            20,
                                            os.JoinPath(outDir, "round3_client_show." + label + ".log"))
     if v3GateRunFailed(clientShowRound3):
@@ -5110,7 +5265,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let clientAliceRound3 = v3GateRunBinary(root,
                                             "v3 chain_node resilience round3 client alice " + label,
                                             chainNodeBin,
-                                            ["chain-balance", "--state:" + clientState, "--asset:7", "--account:1001"],
+                                            v3GateChainBalanceArgs(clientState, "1001"),
                                             20,
                                             os.JoinPath(outDir, "round3_client_alice." + label + ".log"))
     if v3GateRunFailed(clientAliceRound3):
@@ -5118,7 +5273,7 @@ fn v3GateRunChainNodeResilienceSmoke(root: str,
     let clientBobRound3 = v3GateRunBinary(root,
                                           "v3 chain_node resilience round3 client bob " + label,
                                           chainNodeBin,
-                                          ["chain-balance", "--state:" + clientState, "--asset:7", "--account:2002"],
+                                          v3GateChainBalanceArgs(clientState, "2002"),
                                           20,
                                           os.JoinPath(outDir, "round3_client_bob." + label + ".log"))
     if v3GateRunFailed(clientBobRound3):
@@ -5369,6 +5524,7 @@ fn v3GateRunFreshNodeSelfhostGate(root: str,
     if !v3GateRequirePrefixArtifacts(syncPrefix,
                                      [
                                          ".world.txt",
+                                         ".manifest.txt",
                                          ".compiler.snapshot.txt",
                                          ".std.snapshot.txt",
                                          ".runtime.snapshot.txt",
@@ -5525,6 +5681,7 @@ fn v3GateRunMigrationGate(root: str,
     if !v3GateRequirePrefixArtifacts(publishPrefix,
                                      [
                                          ".world.txt",
+                                         ".manifest.txt",
                                          ".compiler.snapshot.txt",
                                          ".std.snapshot.txt",
                                          ".runtime.snapshot.txt",
@@ -5537,12 +5694,14 @@ fn v3GateRunMigrationGate(root: str,
                                          ".migration.surface.txt",
                                          ".migration.receipt.txt",
                                          ".proof.txt",
+                                         ".fresh.txt",
                                          ".publish.txt"
                                      ],
                                      "v3 migration gate") ||
        !v3GateRequireOutput(publishRun, "proof_mode=migration", "v3 migration gate") ||
        !v3GateRequireOutput(publishRun, "equivalence_passed=1", "v3 migration gate") ||
-       !v3GateRequireOutput(publishRun, "publish_allowed=1", "v3 migration gate"):
+       !v3GateRequireOutput(publishRun, "publish_allowed=1", "v3 migration gate") ||
+       !v3GateRequireOutput(publishRun, "receipt_cid_match=1", "v3 migration gate"):
         return 1
     v3GateMaybePrintRunOutput(migrateRun)
     v3GateMaybePrintRunOutput(proveRun)
@@ -7428,26 +7587,42 @@ fn v3GateVerifyDebugProfile(root: str): int32 =
 fn v3GateBuildChainNode(root: str): int32 =
     var compiler = os.GetEnvDefault("CHENG_V3_CHAIN_NODE_COMPILER", "")
     if len(compiler) <= 0:
-        if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+        if v3GateEnsureBootstrapBridge(root) != 0:
             return 1
+        compiler = contracts.v3BootstrapStage3Path(root)
     else:
         compiler = v3path.V3PathAbsolute(root, compiler)
-    let src: str = v3path.V3PathAbsolute(root, "v3/src/project/cheng_node_main.cheng")
+    let src: str = contracts.v3BootstrapChainNodeEntrySourcePath(root)
     let target: str = os.GetEnvDefault("CHAIN_NODE_TARGET", "arm64-apple-darwin")
     var defaultOutDir: str = v3path.V3PathAbsolute(root, "artifacts/v3_cheng_node_main")
     if target != "arm64-apple-darwin":
         defaultOutDir = os.JoinPath(defaultOutDir, target)
     let outDir: str = os.GetEnvDefault("CHAIN_NODE_OUT_DIR", defaultOutDir)
     let outBin: str = os.GetEnvDefault("CHAIN_NODE_OUT_BIN", os.JoinPath(outDir, "cheng_node_main"))
-    let compileRun = v3GateCompileExe(root,
-                                      "build_chain_node",
-                                      compiler,
-                                      src,
-                                      outBin,
-                                      target,
-                                      os.JoinPath(outDir, "cheng_node_main.compile.log"))
-    if v3GateRunFailed(compileRun):
-        return compileRun.exitCode
+    let compileLogPath: str = os.JoinPath(outDir, "cheng_node_main.compile.log")
+    let buildStampPath: str = v3GateChainNodeBuildStampPath(outBin)
+    let compileTimeoutText: str = strutil.Strip(os.GetEnvDefault("CHENG_V3_CHAIN_NODE_COMPILE_TIMEOUT_SEC", ""))
+    var compileTimeoutSec: int32 = 600
+    if len(compileTimeoutText) > 0:
+        compileTimeoutSec = int32(strutil.ParseInt(compileTimeoutText))
+    if !v3GateChainNodeFresh(root, compiler, src, outBin, target):
+        let compileRun = v3GateCompileExeEnvWithTimeout(root,
+                                                        "build_chain_node",
+                                                        compiler,
+                                                        src,
+                                                        outBin,
+                                                        target,
+                                                        compileLogPath,
+                                                        [],
+                                                        compileTimeoutSec)
+        if v3GateRunFailed(compileRun):
+            return compileRun.exitCode
+        let buildStampText: str = v3GateChainNodeBuildStampText(src, outBin, target, compiler)
+        if !v3path.V3WriteTextFile(root, buildStampPath, buildStampText):
+            v3GatePrintErr("v3 chain_node build: failed to write build stamp: " + buildStampPath)
+            return 1
+    else:
+        v3GatePrintLine("v3 chain_node: fresh target=" + target + " out=" + outBin)
     var runSelfTestDefault = "0"
     if target == "arm64-apple-darwin":
         runSelfTestDefault = "1"
@@ -7456,7 +7631,7 @@ fn v3GateBuildChainNode(root: str): int32 =
         let run = v3GateRunBinary(root,
                                   "build_chain_node_self_test",
                                   outBin,
-                                  ["chain-self-test"],
+                                  v3GateChainSelfTestArgs(),
                                   20,
                                   os.JoinPath(outDir, "cheng_node_main.self-test.log"))
         v3GateMaybePrintRunOutput(run)

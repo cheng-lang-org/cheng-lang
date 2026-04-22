@@ -9,6 +9,10 @@ type
     V3ParsedSourceKind = enum
         v3ParsedOrdinarySource
 
+    V3ParserExternalPackageRoot =
+        packageId: str
+        packageRoot: str
+
     V3ImportEdge =
         ownerModulePath: str
         targetModulePath: str
@@ -103,6 +107,18 @@ type
         surfaceFirstCode: int32
         surfaceLastCode: int32
         items: int32[]
+
+    V3NormalizedExprLookupKey =
+        sourcePathLen: int32
+        sourcePathFirstCode: int32
+        sourcePathLastCode: int32
+        lineNumber: int32
+        columnNumber: int32
+        kindCode: int32
+        detailCode: int32
+        surfaceLen: int32
+        surfaceFirstCode: int32
+        surfaceLastCode: int32
 
     V3NormalizedExprLookup =
         slots: int32[]
@@ -375,70 +391,80 @@ fn v3NormalizedExprLookupInit(minCap: int32): V3NormalizedExprLookup =
         i = i + 1
     return lookup
 
-fn v3NormalizedExprLookupHash(sourcePathLen: int32,
-                              sourcePathFirstCode: int32,
-                              sourcePathLastCode: int32,
-                              lineNumber: int32,
-                              columnNumber: int32,
-                              kindCode: int32,
-                              detailCode: int32,
-                              surfaceLen: int32,
-                              surfaceFirstCode: int32,
-                              surfaceLastCode: int32): int64 =
-    var h: int64 = int64(sourcePathLen)
-    h = h * 131 + int64(sourcePathFirstCode)
-    h = h * 131 + int64(sourcePathLastCode)
-    h = h * 131 + int64(lineNumber)
-    h = h * 131 + int64(columnNumber)
-    h = h * 131 + int64(kindCode)
-    h = h * 131 + int64(detailCode)
-    h = h * 131 + int64(surfaceLen)
-    h = h * 131 + int64(surfaceFirstCode)
-    h = h * 131 + int64(surfaceLastCode)
+fn v3NormalizedExprLookupDetailKind(kind: V3NormalizedExprKind,
+                                    detailKind: V3NormalizedExprDetailKind): V3NormalizedExprDetailKind =
+    if kind == v3NormalizedExprCall:
+        return v3NormalizedExprDetailNone
+    return detailKind
+
+fn v3NormalizedExprLookupKeyExact(sourcePath: str,
+                                  lineNumber: int32,
+                                  columnNumber: int32,
+                                  kind: V3NormalizedExprKind,
+                                  detailKind: V3NormalizedExprDetailKind,
+                                  surfaceText: str): V3NormalizedExprLookupKey =
+    var key: V3NormalizedExprLookupKey
+    key.sourcePathLen = sourcePath.len
+    key.sourcePathFirstCode = v3NormalizedExprLookupTextFirstCode(sourcePath)
+    key.sourcePathLastCode = v3NormalizedExprLookupTextLastCode(sourcePath)
+    key.lineNumber = lineNumber
+    key.columnNumber = columnNumber
+    key.kindCode = v3NormalizedExprKindCode(kind)
+    key.detailCode = v3NormalizedExprDetailKindCode(v3NormalizedExprLookupDetailKind(kind, detailKind))
+    key.surfaceLen = surfaceText.len
+    key.surfaceFirstCode = v3NormalizedExprLookupTextFirstCode(surfaceText)
+    key.surfaceLastCode = v3NormalizedExprLookupTextLastCode(surfaceText)
+    return key
+
+fn v3NormalizedExprLookupKeyFromExpr(expr: V3NormalizedExpr): V3NormalizedExprLookupKey =
+    return v3NormalizedExprLookupKeyExact(expr.sourcePath,
+                                          expr.lineNumber,
+                                          expr.columnNumber,
+                                          expr.kind,
+                                          expr.detailKind,
+                                          expr.surfaceText)
+
+fn v3NormalizedExprLookupHash(key: V3NormalizedExprLookupKey): int64 =
+    var h: int64 = int64(key.sourcePathLen)
+    h = h * 131 + int64(key.sourcePathFirstCode)
+    h = h * 131 + int64(key.sourcePathLastCode)
+    h = h * 131 + int64(key.lineNumber)
+    h = h * 131 + int64(key.columnNumber)
+    h = h * 131 + int64(key.kindCode)
+    h = h * 131 + int64(key.detailCode)
+    h = h * 131 + int64(key.surfaceLen)
+    h = h * 131 + int64(key.surfaceFirstCode)
+    h = h * 131 + int64(key.surfaceLastCode)
     if h < 0:
         h = -h
     return h
 
-fn v3NormalizedExprLookupSlotForParts(lookup: V3NormalizedExprLookup,
-                                      sourcePathLen: int32,
-                                      sourcePathFirstCode: int32,
-                                      sourcePathLastCode: int32,
-                                      lineNumber: int32,
-                                      columnNumber: int32,
-                                      kindCode: int32,
-                                      detailCode: int32,
-                                      surfaceLen: int32,
-                                      surfaceFirstCode: int32,
-                                      surfaceLastCode: int32): int32 =
+fn v3NormalizedExprLookupKeyMatchesBucket(key: V3NormalizedExprLookupKey,
+                                          bucket: V3NormalizedExprLookupBucket): bool =
+    return bucket.sourcePathLen == key.sourcePathLen &&
+           bucket.sourcePathFirstCode == key.sourcePathFirstCode &&
+           bucket.sourcePathLastCode == key.sourcePathLastCode &&
+           bucket.lineNumber == key.lineNumber &&
+           bucket.columnNumber == key.columnNumber &&
+           bucket.kindCode == key.kindCode &&
+           bucket.detailCode == key.detailCode &&
+           bucket.surfaceLen == key.surfaceLen &&
+           bucket.surfaceFirstCode == key.surfaceFirstCode &&
+           bucket.surfaceLastCode == key.surfaceLastCode
+
+fn v3NormalizedExprLookupSlotForKey(lookup: V3NormalizedExprLookup,
+                                    key: V3NormalizedExprLookupKey): int32 =
     if lookup.slots.len <= 0:
         return -1
     let mask = lookup.slots.len - 1
-    var probe: int32 = int32(v3NormalizedExprLookupHash(sourcePathLen,
-                                                        sourcePathFirstCode,
-                                                        sourcePathLastCode,
-                                                        lineNumber,
-                                                        columnNumber,
-                                                        kindCode,
-                                                        detailCode,
-                                                        surfaceLen,
-                                                        surfaceFirstCode,
-                                                        surfaceLastCode) & int64(mask))
+    var probe: int32 = int32(v3NormalizedExprLookupHash(key) & int64(mask))
     var scanned: int32
     while scanned <= mask:
         let bucketIndexPlus1 = lookup.slots[probe]
         if bucketIndexPlus1 == 0:
             return probe
         let bucket = lookup.buckets[bucketIndexPlus1 - 1]
-        if bucket.sourcePathLen == sourcePathLen &&
-           bucket.sourcePathFirstCode == sourcePathFirstCode &&
-           bucket.sourcePathLastCode == sourcePathLastCode &&
-           bucket.lineNumber == lineNumber &&
-           bucket.columnNumber == columnNumber &&
-           bucket.kindCode == kindCode &&
-           bucket.detailCode == detailCode &&
-           bucket.surfaceLen == surfaceLen &&
-           bucket.surfaceFirstCode == surfaceFirstCode &&
-           bucket.surfaceLastCode == surfaceLastCode:
+        if v3NormalizedExprLookupKeyMatchesBucket(key, bucket):
             return probe
         probe = (probe + 1) & mask
         scanned = scanned + 1
@@ -455,17 +481,18 @@ fn v3NormalizedExprLookupRehash(lookup: var V3NormalizedExprLookup,
     var bucketIndex: int32
     while bucketIndex < lookup.buckets.len:
         let bucket = lookup.buckets[bucketIndex]
-        let slot = v3NormalizedExprLookupSlotForParts(lookup,
-                                                      bucket.sourcePathLen,
-                                                      bucket.sourcePathFirstCode,
-                                                      bucket.sourcePathLastCode,
-                                                      bucket.lineNumber,
-                                                      bucket.columnNumber,
-                                                      bucket.kindCode,
-                                                      bucket.detailCode,
-                                                      bucket.surfaceLen,
-                                                      bucket.surfaceFirstCode,
-                                                      bucket.surfaceLastCode)
+        var key: V3NormalizedExprLookupKey
+        key.sourcePathLen = bucket.sourcePathLen
+        key.sourcePathFirstCode = bucket.sourcePathFirstCode
+        key.sourcePathLastCode = bucket.sourcePathLastCode
+        key.lineNumber = bucket.lineNumber
+        key.columnNumber = bucket.columnNumber
+        key.kindCode = bucket.kindCode
+        key.detailCode = bucket.detailCode
+        key.surfaceLen = bucket.surfaceLen
+        key.surfaceFirstCode = bucket.surfaceFirstCode
+        key.surfaceLastCode = bucket.surfaceLastCode
+        let slot = v3NormalizedExprLookupSlotForKey(lookup, key)
         if slot >= 0:
             lookup.slots[slot] = bucketIndex + 1
         bucketIndex = bucketIndex + 1
@@ -487,44 +514,29 @@ fn v3NormalizedExprLookupEnsureBucket(lookup: var V3NormalizedExprLookup,
         lookup = v3NormalizedExprLookupInit(32)
     if (lookup.buckets.len + 1) * 10 >= lookup.slots.len * 7:
         v3NormalizedExprLookupGrow(lookup)
-    let sourcePathLen = sourcePath.len
-    let sourcePathFirstCode = v3NormalizedExprLookupTextFirstCode(sourcePath)
-    let sourcePathLastCode = v3NormalizedExprLookupTextLastCode(sourcePath)
-    let kindCode = v3NormalizedExprKindCode(kind)
-    var lookupDetailKind = detailKind
-    if kind == v3NormalizedExprCall:
-        lookupDetailKind = v3NormalizedExprDetailNone
-    let detailCode = v3NormalizedExprDetailKindCode(lookupDetailKind)
-    let surfaceLen = surfaceText.len
-    let surfaceFirstCode = v3NormalizedExprLookupTextFirstCode(surfaceText)
-    let surfaceLastCode = v3NormalizedExprLookupTextLastCode(surfaceText)
-    let slot = v3NormalizedExprLookupSlotForParts(lookup,
-                                                  sourcePathLen,
-                                                  sourcePathFirstCode,
-                                                  sourcePathLastCode,
-                                                  lineNumber,
-                                                  columnNumber,
-                                                  kindCode,
-                                                  detailCode,
-                                                  surfaceLen,
-                                                  surfaceFirstCode,
-                                                  surfaceLastCode)
+    let key = v3NormalizedExprLookupKeyExact(sourcePath,
+                                             lineNumber,
+                                             columnNumber,
+                                             kind,
+                                             detailKind,
+                                             surfaceText)
+    let slot = v3NormalizedExprLookupSlotForKey(lookup, key)
     if slot < 0:
         return -1
     let existing = lookup.slots[slot]
     if existing > 0:
         return existing - 1
     var bucket: V3NormalizedExprLookupBucket
-    bucket.sourcePathLen = sourcePathLen
-    bucket.sourcePathFirstCode = sourcePathFirstCode
-    bucket.sourcePathLastCode = sourcePathLastCode
-    bucket.lineNumber = lineNumber
-    bucket.columnNumber = columnNumber
-    bucket.kindCode = kindCode
-    bucket.detailCode = detailCode
-    bucket.surfaceLen = surfaceLen
-    bucket.surfaceFirstCode = surfaceFirstCode
-    bucket.surfaceLastCode = surfaceLastCode
+    bucket.sourcePathLen = key.sourcePathLen
+    bucket.sourcePathFirstCode = key.sourcePathFirstCode
+    bucket.sourcePathLastCode = key.sourcePathLastCode
+    bucket.lineNumber = key.lineNumber
+    bucket.columnNumber = key.columnNumber
+    bucket.kindCode = key.kindCode
+    bucket.detailCode = key.detailCode
+    bucket.surfaceLen = key.surfaceLen
+    bucket.surfaceFirstCode = key.surfaceFirstCode
+    bucket.surfaceLastCode = key.surfaceLastCode
     bucket.items = []
     add(lookup.buckets, bucket)
     lookup.slots[slot] = lookup.buckets.len
@@ -539,20 +551,13 @@ fn v3NormalizedExprLookupBucketIndexExact(lookup: V3NormalizedExprLookup,
                                           surfaceText: str): int32 =
     if sourcePath == "":
         return -1
-    var lookupDetailKind = detailKind
-    if kind == v3NormalizedExprCall:
-        lookupDetailKind = v3NormalizedExprDetailNone
-    let slot = v3NormalizedExprLookupSlotForParts(lookup,
-                                                  sourcePath.len,
-                                                  v3NormalizedExprLookupTextFirstCode(sourcePath),
-                                                  v3NormalizedExprLookupTextLastCode(sourcePath),
-                                                  lineNumber,
-                                                  columnNumber,
-                                                  v3NormalizedExprKindCode(kind),
-                                                  v3NormalizedExprDetailKindCode(lookupDetailKind),
-                                                  surfaceText.len,
-                                                  v3NormalizedExprLookupTextFirstCode(surfaceText),
-                                                  v3NormalizedExprLookupTextLastCode(surfaceText))
+    let key = v3NormalizedExprLookupKeyExact(sourcePath,
+                                             lineNumber,
+                                             columnNumber,
+                                             kind,
+                                             detailKind,
+                                             surfaceText)
+    let slot = v3NormalizedExprLookupSlotForKey(lookup, key)
     if slot < 0:
         return -1
     let bucketIndexPlus1 = lookup.slots[slot]
@@ -560,86 +565,53 @@ fn v3NormalizedExprLookupBucketIndexExact(lookup: V3NormalizedExprLookup,
         return bucketIndexPlus1 - 1
     return -1
 
-fn v3NormalizedExprMatchesKey(expr: V3NormalizedExpr,
-                              sourcePath: str,
-                              lineNumber: int32,
-                              columnNumber: int32,
-                              kind: V3NormalizedExprKind,
-                              detailKind: V3NormalizedExprDetailKind,
-                              surfaceText: str,
-                              callSurfaceKind: V3NormalizedExprSurfaceCallKind,
-                              callResolved: bool,
-                              callReason: V3NormalizedExprCallReason,
-                              callQualifier: str,
-                              callCallee: str,
-                              callTarget: str,
-                              callTargetSourcePath: str,
-                              callTargetImportc: bool,
-                              callPrefixStyle: bool,
-                              callArgCount: int32,
-                              callArgsText: str): bool =
-    if expr.sourcePath != sourcePath:
+fn v3NormalizedExprMatchesExact(expr: V3NormalizedExpr,
+                                expected: V3NormalizedExpr): bool =
+    if expr.sourcePath != expected.sourcePath:
         return false
-    if expr.lineNumber != lineNumber:
+    if expr.lineNumber != expected.lineNumber:
         return false
-    if expr.columnNumber != columnNumber:
+    if expr.columnNumber != expected.columnNumber:
         return false
-    if expr.kind != kind:
+    if expr.kind != expected.kind:
         return false
-    if expr.surfaceText != surfaceText:
+    if expr.detailKind != expected.detailKind:
         return false
-    if kind == v3NormalizedExprCall:
-        if expr.callSurfaceKind != callSurfaceKind:
-            return false
-        if expr.callResolved != callResolved:
-            return false
-        if expr.callReason != callReason:
-            return false
-        if expr.callQualifier != callQualifier:
-            return false
-        if expr.callCallee != callCallee:
-            return false
-        if expr.callTarget != callTarget:
-            return false
-        if expr.callTargetSourcePath != callTargetSourcePath:
-            return false
-        if expr.callTargetImportc != callTargetImportc:
-            return false
-    elif expr.detailKind != detailKind:
+    if expr.surfaceText != expected.surfaceText:
         return false
-    if expr.callPrefixStyle != callPrefixStyle:
+    if expr.callSurfaceKind != expected.callSurfaceKind:
         return false
-    if expr.callArgCount != callArgCount:
+    if expr.callResolved != expected.callResolved:
         return false
-    if expr.callArgsText != callArgsText:
+    if expr.callReason != expected.callReason:
+        return false
+    if expr.callQualifier != expected.callQualifier:
+        return false
+    if expr.callCallee != expected.callCallee:
+        return false
+    if expr.callTarget != expected.callTarget:
+        return false
+    if expr.callTargetSourcePath != expected.callTargetSourcePath:
+        return false
+    if expr.callTargetImportc != expected.callTargetImportc:
+        return false
+    if expr.callPrefixStyle != expected.callPrefixStyle:
+        return false
+    if expr.callArgCount != expected.callArgCount:
+        return false
+    if expr.callArgsText != expected.callArgsText:
         return false
     return true
 
-fn v3NormalizedExprLayerContainsExact(layer: V3NormalizedExprLayer,
-                                      sourcePath: str,
-                                      lineNumber: int32,
-                                      columnNumber: int32,
-                                      kind: V3NormalizedExprKind,
-                                      detailKind: V3NormalizedExprDetailKind,
-                                      surfaceText: str,
-                                      callSurfaceKind: V3NormalizedExprSurfaceCallKind,
-                                      callResolved: bool,
-                                      callReason: V3NormalizedExprCallReason,
-                                      callQualifier: str,
-                                      callCallee: str,
-                                      callTarget: str,
-                                      callTargetSourcePath: str,
-                                      callTargetImportc: bool,
-                                      callPrefixStyle: bool,
-                                      callArgCount: int32,
-                                      callArgsText: str): bool =
+fn v3NormalizedExprLayerContainsExpr(layer: V3NormalizedExprLayer,
+                                     expr: V3NormalizedExpr): bool =
     let bucketIndex = v3NormalizedExprLookupBucketIndexExact(layer.exprLookup,
-                                                             sourcePath,
-                                                             lineNumber,
-                                                             columnNumber,
-                                                             kind,
-                                                             detailKind,
-                                                             surfaceText)
+                                                             expr.sourcePath,
+                                                             expr.lineNumber,
+                                                             expr.columnNumber,
+                                                             expr.kind,
+                                                             expr.detailKind,
+                                                             expr.surfaceText)
     if bucketIndex < 0 || bucketIndex >= layer.exprLookup.buckets.len:
         return false
     let bucket = layer.exprLookup.buckets[bucketIndex]
@@ -647,24 +619,7 @@ fn v3NormalizedExprLayerContainsExact(layer: V3NormalizedExprLayer,
         let exprIndex = bucket.items[i]
         if exprIndex < 0 || exprIndex >= layer.exprs.len:
             continue
-        if v3NormalizedExprMatchesKey(layer.exprs[exprIndex],
-                                      sourcePath,
-                                      lineNumber,
-                                      columnNumber,
-                                      kind,
-                                      detailKind,
-                                      surfaceText,
-                                      callSurfaceKind,
-                                      callResolved,
-                                      callReason,
-                                      callQualifier,
-                                      callCallee,
-                                      callTarget,
-                                      callTargetSourcePath,
-                                      callTargetImportc,
-                                      callPrefixStyle,
-                                      callArgCount,
-                                      callArgsText):
+        if v3NormalizedExprMatchesExact(layer.exprs[exprIndex], expr):
             return true
     return false
 
@@ -692,24 +647,7 @@ fn v3NormalizedExprLayerRememberExpr(layer: var V3NormalizedExprLayer,
 
 fn v3NormalizedExprLayerAppendExisting(layer: var V3NormalizedExprLayer,
                                        expr: V3NormalizedExpr) =
-    if v3NormalizedExprLayerContainsExact(layer,
-                                          expr.sourcePath,
-                                          expr.lineNumber,
-                                          expr.columnNumber,
-                                          expr.kind,
-                                          expr.detailKind,
-                                          expr.surfaceText,
-                                          expr.callSurfaceKind,
-                                          expr.callResolved,
-                                          expr.callReason,
-                                          expr.callQualifier,
-                                          expr.callCallee,
-                                          expr.callTarget,
-                                          expr.callTargetSourcePath,
-                                          expr.callTargetImportc,
-                                          expr.callPrefixStyle,
-                                          expr.callArgCount,
-                                          expr.callArgsText):
+    if v3NormalizedExprLayerContainsExpr(layer, expr):
         return
     add(layer.exprs, expr)
     v3NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
@@ -906,25 +844,6 @@ fn v3NormalizedExprLayerAppendSpan(layer: var V3NormalizedExprLayer,
                                    detailKind: V3NormalizedExprDetailKind,
                                    surfaceText: str,
                                    endColumnNumberRaw: int32) =
-    if v3NormalizedExprLayerContainsExact(layer,
-                                          sourcePath,
-                                          lineNumber,
-                                          columnNumber,
-                                          kind,
-                                          detailKind,
-                                          surfaceText,
-                                          v3NormalizedExprSurfaceCallNone,
-                                          false,
-                                          v3NormalizedExprCallReasonNone,
-                                          "",
-                                          "",
-                                          "",
-                                          "",
-                                          false,
-                                          false,
-                                          0,
-                                          ""):
-        return
     var expr: V3NormalizedExpr
     expr.exprId = v3NormalizedExprMakeId(sourcePath, lineNumber, columnNumber, kind, detailKind)
     expr.sourcePath = sourcePath
@@ -948,6 +867,8 @@ fn v3NormalizedExprLayerAppendSpan(layer: var V3NormalizedExprLayer,
     expr.callPrefixStyle = false
     expr.callArgCount = 0
     expr.callArgsText = ""
+    if v3NormalizedExprLayerContainsExpr(layer, expr):
+        return
     add(layer.exprs, expr)
     v3NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
 
@@ -969,25 +890,6 @@ fn v3NormalizedExprLayerAppendCall(layer: var V3NormalizedExprLayer,
                                    callPrefixStyle: bool,
                                    endColumnNumberRaw: int32) =
     let normalizedTargetSourcePath = v3ParserNormalizePath(callTargetSourcePath)
-    if v3NormalizedExprLayerContainsExact(layer,
-                                          sourcePath,
-                                          lineNumber,
-                                          columnNumber,
-                                          v3NormalizedExprCall,
-                                          v3NormalizedExprDetailNone,
-                                          surfaceText,
-                                          callSurfaceKind,
-                                          callResolved,
-                                          callReason,
-                                          callQualifier,
-                                          callCallee,
-                                          callTarget,
-                                          normalizedTargetSourcePath,
-                                          callTargetImportc,
-                                          callPrefixStyle,
-                                          callArgCount,
-                                          callArgsText):
-        return
     var expr: V3NormalizedExpr
     expr.exprId = v3NormalizedExprMakeCallLikeId(sourcePath,
                                                  lineNumber,
@@ -1025,6 +927,8 @@ fn v3NormalizedExprLayerAppendCall(layer: var V3NormalizedExprLayer,
     expr.callPrefixStyle = callPrefixStyle
     expr.callArgCount = callArgCount
     expr.callArgsText = callArgsText
+    if v3NormalizedExprLayerContainsExpr(layer, expr):
+        return
     add(layer.exprs, expr)
     v3NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
 
@@ -1037,25 +941,6 @@ fn v3NormalizedExprLayerAppendConstructor(layer: var V3NormalizedExprLayer,
                                           callArgCount: int32,
                                           callPrefixStyle: bool,
                                           endColumnNumberRaw: int32) =
-    if v3NormalizedExprLayerContainsExact(layer,
-                                          sourcePath,
-                                          lineNumber,
-                                          columnNumber,
-                                          v3NormalizedExprConstructor,
-                                          v3NormalizedExprDetailNone,
-                                          typeText,
-                                          v3NormalizedExprSurfaceCallNone,
-                                          false,
-                                          v3NormalizedExprCallReasonNone,
-                                          "",
-                                          "",
-                                          "",
-                                          "",
-                                          false,
-                                          callPrefixStyle,
-                                          callArgCount,
-                                          callArgsText):
-        return
     var expr: V3NormalizedExpr
     expr.exprId = v3NormalizedExprMakeCallLikeId(sourcePath,
                                                  lineNumber,
@@ -1093,6 +978,8 @@ fn v3NormalizedExprLayerAppendConstructor(layer: var V3NormalizedExprLayer,
     expr.callPrefixStyle = callPrefixStyle
     expr.callArgCount = callArgCount
     expr.callArgsText = callArgsText
+    if v3NormalizedExprLayerContainsExpr(layer, expr):
+        return
     add(layer.exprs, expr)
     v3NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
 
@@ -1393,6 +1280,68 @@ fn v3ParserPackageId(packageRootRaw: str): str =
     if name == "":
         return ""
     return v3ParserConcat2("cheng/", name)
+
+fn v3ParserExternalPackageRootNew(packageIdRaw: str,
+                                  packageRootRaw: str): V3ParserExternalPackageRoot =
+    var out: V3ParserExternalPackageRoot
+    out.packageId = v3path.V3PathTrim(packageIdRaw)
+    out.packageRoot = v3ParserNormalizePath(packageRootRaw)
+    return out
+
+fn v3ParserExternalPackageRootsClone(items: V3ParserExternalPackageRoot[]): V3ParserExternalPackageRoot[] =
+    var out: V3ParserExternalPackageRoot[]
+    for i in 0..<items.len:
+        add(out, v3ParserExternalPackageRootNew(items[i].packageId, items[i].packageRoot))
+    return out
+
+fn v3ParserExternalPackageRootByModulePath(modulePathRaw: str,
+                                           externalPackageRoots: V3ParserExternalPackageRoot[],
+                                           outPackageRoot: var str,
+                                           outPackageId: var str,
+                                           outPackagePrefix: var str): bool =
+    let modulePath = v3path.V3PathTrim(modulePathRaw)
+    outPackageRoot = ""
+    outPackageId = ""
+    outPackagePrefix = ""
+    var bestLen: int32
+    for i in 0..<externalPackageRoots.len:
+        let packageId = v3path.V3PathTrim(externalPackageRoots[i].packageId)
+        let packageRoot = v3ParserNormalizePath(externalPackageRoots[i].packageRoot)
+        if packageId == "" || packageRoot == "":
+            continue
+        let packagePrefix = v3ParserConcat2(packageId, "/")
+        if modulePath.len <= packageId.len || !v3ParserStartsWithExact(modulePath, packagePrefix):
+            continue
+        if packageId.len <= bestLen:
+            continue
+        bestLen = packageId.len
+        outPackageRoot = packageRoot
+        outPackageId = packageId
+        outPackagePrefix = packagePrefix
+    return bestLen > 0
+
+fn v3ParserExternalPackageRootBySourcePath(sourcePathRaw: str,
+                                           externalPackageRoots: V3ParserExternalPackageRoot[],
+                                           outPackageRoot: var str,
+                                           outPackageId: var str): bool =
+    let sourcePath = v3ParserNormalizePath(sourcePathRaw)
+    outPackageRoot = ""
+    outPackageId = ""
+    var bestLen: int32
+    for i in 0..<externalPackageRoots.len:
+        let packageId = v3path.V3PathTrim(externalPackageRoots[i].packageId)
+        let packageRoot = v3ParserNormalizePath(externalPackageRoots[i].packageRoot)
+        if packageId == "" || packageRoot == "":
+            continue
+        let sourcePrefix = v3ParserConcat2(packageRoot, "/src/")
+        if !v3ParserStartsWithExact(sourcePath, sourcePrefix):
+            continue
+        if packageRoot.len <= bestLen:
+            continue
+        bestLen = packageRoot.len
+        outPackageRoot = packageRoot
+        outPackageId = packageId
+    return bestLen > 0
 
 fn v3ParserSourceExists(path: str): bool =
     if path == "":
@@ -1771,61 +1720,7 @@ fn v3ParserParseFmtExprAt(lineRaw: str,
         argTextOut = v3path.V3PathTrim(v3ParserTextSliceFast(lineRaw, cursor + 1, closePos - cursor - 1))
         endColumnOut = closePos + 1
         return true
-    var endPos = lineRaw.len
-    var parenDepth: int32
-    var bracketDepth: int32
-    var braceDepth: int32
-    var inString = false
-    var inChar = false
-    for i in cursor..<lineRaw.len:
-        let ch = lineRaw[i]
-        if !inChar && ch == '"' && !v3ParserQuoteIsEscaped(lineRaw, i):
-            inString = !inString
-            continue
-        if !inString && ch == '\'' && !v3ParserQuoteIsEscaped(lineRaw, i):
-            inChar = !inChar
-            continue
-        if inString || inChar:
-            continue
-        if ch == '(':
-            parenDepth = parenDepth + 1
-            continue
-        if ch == ')':
-            if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0:
-                endPos = i
-                break
-            parenDepth = parenDepth - 1
-            continue
-        if ch == '[':
-            bracketDepth = bracketDepth + 1
-            continue
-        if ch == ']':
-            if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0:
-                endPos = i
-                break
-            bracketDepth = bracketDepth - 1
-            continue
-        if ch == '{':
-            braceDepth = braceDepth + 1
-            continue
-        if ch == '}':
-            if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0:
-                endPos = i
-                break
-            braceDepth = braceDepth - 1
-            continue
-        if parenDepth == 0 &&
-           bracketDepth == 0 &&
-           braceDepth == 0 &&
-           (ch == ',' || ch == ':'):
-            endPos = i
-            break
-    argTextOut = v3path.V3PathTrim(v3ParserTextSliceFast(lineRaw, cursor, endPos - cursor))
-    if argTextOut == "":
-        return false
-    modeOut = "fmt_call"
-    endColumnOut = endPos
-    return true
+    return false
 
 fn v3ParserParseListComprehensionAt(lineRaw: str,
                                     openPos: int32,
@@ -2622,6 +2517,112 @@ fn v3ParserParseTypedInitializerLine(lineRaw: str,
     exprOut = v3path.V3PathTrim(v3path.V3TextSlice(tail, eqPos + 1, tail.len - eqPos - 1))
     return typeOut != "" && exprOut != ""
 
+fn v3ParserParseTupleElemDefaultText(elemRaw: str,
+                                     typeOut: var str,
+                                     exprOut: var str): bool =
+    typeOut = ""
+    exprOut = ""
+    let elem = v3path.V3PathTrim(elemRaw)
+    if elem == "":
+        return false
+    let eqPos = v3ParserFindTopLevelAssignmentEq(elem)
+    if eqPos <= 0:
+        return false
+    let head = v3path.V3PathTrim(v3path.V3TextSlice(elem, 0, eqPos))
+    if head == "":
+        return false
+    let colonPos = v3ParserFindTopLevelToken(head, ":")
+    if colonPos > 0:
+        typeOut = v3path.V3PathTrim(v3path.V3TextSlice(head, colonPos + 1, head.len - colonPos - 1))
+    else:
+        typeOut = head
+    exprOut = v3path.V3PathTrim(v3path.V3TextSlice(elem, eqPos + 1, elem.len - eqPos - 1))
+    return typeOut != "" && exprOut != ""
+
+fn v3ParserFindTupleTypeRedundantDefaultLine(lineRaw: str,
+                                             currentProfile: V3NormalizedExprCallProfile,
+                                             profiles: V3NormalizedExprCallProfile[],
+                                             typeOut: var str,
+                                             exprOut: var str): bool =
+    typeOut = ""
+    exprOut = ""
+    let line = v3path.V3PathTrim(v3ParserStripLineComment(lineRaw))
+    if line == "":
+        return false
+    let eqPos = v3ParserFindTopLevelToken(line, "=")
+    if eqPos <= 0:
+        return false
+    let tupleType = v3path.V3PathTrim(v3path.V3TextSlice(line, eqPos + 1, line.len - eqPos - 1))
+    if !v3ParserTypeExprIsTuple(tupleType):
+        return false
+    let body = v3path.V3TextSlice(tupleType, len("tuple["), tupleType.len - len("tuple[") - 1)
+    var inString = false
+    var inChar = false
+    var parenDepth: int32
+    var bracketDepth: int32
+    var braceDepth: int32
+    var itemStart: int32
+    var i: int32
+    while i <= body.len:
+        let atEnd = i >= body.len
+        if !atEnd:
+            let ch = body[i]
+            if !inChar && ch == '"' && !v3ParserQuoteIsEscaped(body, i):
+                inString = !inString
+                i = i + 1
+                continue
+            if !inString && ch == '\'' && !v3ParserQuoteIsEscaped(body, i):
+                inChar = !inChar
+                i = i + 1
+                continue
+            if inString || inChar:
+                i = i + 1
+                continue
+            if ch == '(':
+                parenDepth = parenDepth + 1
+                i = i + 1
+                continue
+            if ch == ')':
+                parenDepth = parenDepth - 1
+                i = i + 1
+                continue
+            if ch == '[':
+                bracketDepth = bracketDepth + 1
+                i = i + 1
+                continue
+            if ch == ']':
+                bracketDepth = bracketDepth - 1
+                i = i + 1
+                continue
+            if ch == '{':
+                braceDepth = braceDepth + 1
+                i = i + 1
+                continue
+            if ch == '}':
+                braceDepth = braceDepth - 1
+                i = i + 1
+                continue
+        var splitHere = atEnd
+        if !splitHere:
+            splitHere = body[i] == ',' &&
+                        !inString &&
+                        !inChar &&
+                        parenDepth == 0 &&
+                        bracketDepth == 0 &&
+                        braceDepth == 0
+        if splitHere:
+            let item = v3path.V3PathTrim(v3path.V3TextSlice(body, itemStart, i - itemStart))
+            var elemType = ""
+            var elemExpr = ""
+            if v3ParserParseTupleElemDefaultText(item, elemType, elemExpr) &&
+               v3ParserExprMatchesImplicitDefault(currentProfile, profiles, elemType, elemExpr):
+                typeOut = elemType
+                exprOut = elemExpr
+                return true
+            itemStart = i + 1
+        i = i + 1
+    return false
+
 fn v3ParserFindRedundantExplicitDefaultLine(lineRaw: str,
                                             inTypeBlock: bool,
                                             currentProfile: V3NormalizedExprCallProfile,
@@ -2633,8 +2634,11 @@ fn v3ParserFindRedundantExplicitDefaultLine(lineRaw: str,
     if v3ParserParseTypedInitializerLine(lineRaw, "let ", typeOut, exprOut) ||
        v3ParserParseTypedInitializerLine(lineRaw, "var ", typeOut, exprOut):
         return v3ParserExprMatchesImplicitDefault(currentProfile, profiles, typeOut, exprOut)
-    if inTypeBlock && v3ParserParseTypedInitializerLine(lineRaw, "", typeOut, exprOut):
-        return v3ParserExprMatchesImplicitDefault(currentProfile, profiles, typeOut, exprOut)
+    if inTypeBlock:
+        if v3ParserParseTypedInitializerLine(lineRaw, "", typeOut, exprOut):
+            return v3ParserExprMatchesImplicitDefault(currentProfile, profiles, typeOut, exprOut)
+        if v3ParserFindTupleTypeRedundantDefaultLine(lineRaw, currentProfile, profiles, typeOut, exprOut):
+            return true
     return false
 
 fn v3ParserIsTypeExprChar(ch: char): bool =
@@ -3539,14 +3543,16 @@ fn v3ParserAppendCallExprDetailPair(out: var str,
 fn v3ParserAppendCallExprsLine(sourcePath: str,
                                lineNumber: int32,
                                lineRaw: str,
-                               callLookup: V3ParserTextLookup,
+                               callLookup: V3ParserTextLookup*,
                                detailKind: V3NormalizedExprSurfaceCallKind,
                                currentProfile: V3NormalizedExprCallProfile,
                                profiles: V3NormalizedExprCallProfile[],
                                profileIndexLookup: V3ParserSourcePathIndexLookup,
                                profileCallLookupCache: var V3ParserProfileCallLookupCacheEntry[],
                                layer: var V3NormalizedExprLayer) =
-    if callLookup.totalCount <= 0:
+    if callLookup == nil:
+        return
+    if callLookup->totalCount <= 0:
         return
     var i: int32
     while i < lineRaw.len:
@@ -3621,7 +3627,7 @@ fn v3ParserAppendCallExprsLine(sourcePath: str,
         if dottedStart < i:
             dottedCallName = v3ParserTextSliceFast(lineRaw, dottedStart, stop - dottedStart)
             dottedCallNameKey = v3ParserTextLookupKeyExact(dottedCallName)
-        var matchedSurfaceText = v3ParserMatchKnownCallSurfaceTextKeys(callLookup,
+        var matchedSurfaceText = v3ParserMatchKnownCallSurfaceTextKeysPtr(callLookup,
                                                                        callName,
                                                                        callNameKey,
                                                                        qualifiedCallName,
@@ -3877,12 +3883,13 @@ fn v3ParserLocalCallNamesFromDecls(decls: V3NormalizedFunctionDecl[],
         v3ParserAddUniqueText(out, decls[i].name)
     names = out
 
-fn v3ParserBuildExprCallProfile(workspaceRootRaw: str,
-                                packageRootRaw: str,
-                                sourcePathRaw: str,
-                                text: str,
-                                profile: var V3NormalizedExprCallProfile,
-                                err: var str): bool =
+fn v3ParserBuildExprCallProfileWithExternalPackageRoots(workspaceRootRaw: str,
+                                                        packageRootRaw: str,
+                                                        externalPackageRoots: V3ParserExternalPackageRoot[],
+                                                        sourcePathRaw: str,
+                                                        text: str,
+                                                        profile: var V3NormalizedExprCallProfile,
+                                                        err: var str): bool =
     let workspaceRoot = v3ParserNormalizePath(workspaceRootRaw)
     let packageRoot = v3ParserNormalizePath(packageRootRaw)
     let sourcePath = v3ParserNormalizePath(sourcePathRaw)
@@ -3890,7 +3897,10 @@ fn v3ParserBuildExprCallProfile(workspaceRootRaw: str,
         err = "missing source path"
         return false
     profile.sourcePath = sourcePath
-    profile.ownerModulePath = v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
+    profile.ownerModulePath = v3ParserSourcePathToModulePathWithExternalPackageRoots(workspaceRoot,
+                                                                                     packageRoot,
+                                                                                     externalPackageRoots,
+                                                                                     sourcePath)
     profile.text = text
     profile.lines = []
     profile.decls = []
@@ -3906,18 +3916,34 @@ fn v3ParserBuildExprCallProfile(workspaceRootRaw: str,
         return false
     v3ParserReadNormalizedTypeDeclsLines(lines, profile.typeDecls)
     if workspaceRoot != "" && packageRoot != "":
-        if !v3ParserReadImportEdgesLines(workspaceRoot,
-                                         packageRoot,
-                                         profile.ownerModulePath,
-                                         lines,
-                                         profile.importEdges,
-                                         err):
+        if !v3ParserReadImportEdgesLinesWithExternalPackageRoots(workspaceRoot,
+                                                                 packageRoot,
+                                                                 externalPackageRoots,
+                                                                 profile.ownerModulePath,
+                                                                 lines,
+                                                                 profile.importEdges,
+                                                                 err):
             return false
     v3ParserImportcCallNamesFromDecls(profile.decls, profile.importcCallNames)
     v3ParserLocalCallNamesFromDecls(profile.decls, profile.localCallNames)
     profile.maxQualifiedCallDepth = v3ParserMaxQualifiedCallDepthLines(codeLines)
     err = ""
     return true
+
+fn v3ParserBuildExprCallProfile(workspaceRootRaw: str,
+                                packageRootRaw: str,
+                                sourcePathRaw: str,
+                                text: str,
+                                profile: var V3NormalizedExprCallProfile,
+                                err: var str): bool =
+    var externalPackageRoots: V3ParserExternalPackageRoot[]
+    return v3ParserBuildExprCallProfileWithExternalPackageRoots(workspaceRootRaw,
+                                                                packageRootRaw,
+                                                                externalPackageRoots,
+                                                                sourcePathRaw,
+                                                                text,
+                                                                profile,
+                                                                err)
 
 fn v3ParserImportEdgeQualifier(edge: V3ImportEdge): str =
     return edge.qualifier
@@ -4071,7 +4097,6 @@ fn v3ParserProfileCallLookupFlags(profiles: V3NormalizedExprCallProfile[],
 
 fn v3ParserImportedTargetProfileIndex(currentProfile: V3NormalizedExprCallProfile,
                                       profiles: V3NormalizedExprCallProfile[],
-                                      profileIndexLookup: V3ParserSourcePathIndexLookup,
                                       qualifierChainRaw: str): V3ParserImportedTargetLookup =
     let qualifierChain = qualifierChainRaw
     if qualifierChain == "":
@@ -4124,7 +4149,6 @@ fn v3ParserResolveQualifiedCallTarget(currentProfile: V3NormalizedExprCallProfil
     let calleeKey = v3ParserTextLookupKeyExact(callee)
     let targetLookup = v3ParserImportedTargetProfileIndex(currentProfile,
                                                           profiles,
-                                                          profileIndexLookup,
                                                           qualifier)
     if targetLookup.targetProfileIndex < 0:
         return v3ParserResolvedCallTargetUnknown(targetLookup.reason)
@@ -4574,9 +4598,9 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
         return false
     layer = V3NormalizedExprLayer()
     layer.sourceCount = 1
-    let localCallLookup = v3ParserTextLookupBuildExact(localCallNames)
-    let externalCallLookup = v3ParserTextLookupBuildExact(externalCallNames)
-    let importcCallLookup = v3ParserTextLookupBuildExact(importcCallNames)
+    var localCallLookup = v3ParserTextLookupBuildExact(localCallNames)
+    var externalCallLookup = v3ParserTextLookupBuildExact(externalCallNames)
+    var importcCallLookup = v3ParserTextLookupBuildExact(importcCallNames)
     var knownCallLookup = v3ParserTextLookupInit(localCallNames.len +
                                                  externalCallNames.len +
                                                  importcCallNames.len + 8)
@@ -4637,7 +4661,7 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
         v3ParserAppendCallExprsLine(sourcePath,
                                     lineNumber,
                                     line,
-                                    localCallLookup,
+                                    &localCallLookup,
                                     v3NormalizedExprSurfaceCallLocal,
                                     currentProfile,
                                     profiles,
@@ -4647,7 +4671,7 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
         v3ParserAppendCallExprsLine(sourcePath,
                                     lineNumber,
                                     line,
-                                    externalCallLookup,
+                                    &externalCallLookup,
                                     v3NormalizedExprSurfaceCallExternal,
                                     currentProfile,
                                     profiles,
@@ -4657,7 +4681,7 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
         v3ParserAppendCallExprsLine(sourcePath,
                                     lineNumber,
                                     line,
-                                    importcCallLookup,
+                                    &importcCallLookup,
                                     v3NormalizedExprSurfaceCallImportc,
                                     currentProfile,
                                     profiles,
@@ -5007,6 +5031,91 @@ fn v3ParserTextLookupContainsKey(lookup: V3ParserTextLookup,
         if v3ParserTextEqualsExact(lookup.buckets[bucketIndex].items[i], value):
             return true
     return false
+
+fn v3ParserTextLookupSlotForPartsPtr(lookup: V3ParserTextLookup*,
+                                     keyLen: int32,
+                                     firstCode: int32,
+                                     lastCode: int32,
+                                     dotCount: int32,
+                                     textHash: int32): int32 =
+    if lookup == nil || lookup->slots.len <= 0:
+        return -1
+    let mask = lookup->slots.len - 1
+    var probe: int32 = int32(v3ParserTextLookupHash(keyLen,
+                                                    firstCode,
+                                                    lastCode,
+                                                    dotCount,
+                                                    textHash) & int64(mask))
+    var scanned: int32
+    while scanned <= mask:
+        let bucketIndexPlus1 = lookup->slots[probe]
+        if bucketIndexPlus1 == 0:
+            return probe
+        let bucketIndex = bucketIndexPlus1 - 1
+        if lookup->buckets[bucketIndex].keyLen == keyLen &&
+           lookup->buckets[bucketIndex].firstCode == firstCode &&
+           lookup->buckets[bucketIndex].lastCode == lastCode &&
+           lookup->buckets[bucketIndex].dotCount == dotCount &&
+           lookup->buckets[bucketIndex].textHash == textHash:
+            return probe
+        probe = (probe + 1) & mask
+        scanned = scanned + 1
+    return -1
+
+fn v3ParserTextLookupSlotForKeyPtr(lookup: V3ParserTextLookup*,
+                                   key: V3ParserTextLookupKey): int32 =
+    return v3ParserTextLookupSlotForPartsPtr(lookup,
+                                             key.keyLen,
+                                             key.firstCode,
+                                             key.lastCode,
+                                             key.dotCount,
+                                             key.textHash)
+
+fn v3ParserTextLookupBucketIndexKeyPtr(lookup: V3ParserTextLookup*,
+                                       key: V3ParserTextLookupKey): int32 =
+    if lookup == nil || key.keyLen <= 0:
+        return -1
+    let slot = v3ParserTextLookupSlotForKeyPtr(lookup, key)
+    if slot < 0:
+        return -1
+    let bucketIndexPlus1 = lookup->slots[slot]
+    if bucketIndexPlus1 > 0:
+        return bucketIndexPlus1 - 1
+    return -1
+
+fn v3ParserTextLookupContainsKeyPtr(lookup: V3ParserTextLookup*,
+                                    value: str,
+                                    key: V3ParserTextLookupKey): bool =
+    if lookup == nil || value == "" || key.keyLen <= 0:
+        return false
+    let bucketIndex = v3ParserTextLookupBucketIndexKeyPtr(lookup, key)
+    if bucketIndex < 0:
+        return false
+    for i in 0..<lookup->buckets[bucketIndex].items.len:
+        if v3ParserTextEqualsExact(lookup->buckets[bucketIndex].items[i], value):
+            return true
+    return false
+
+fn v3ParserMatchKnownCallSurfaceTextKeysPtr(callLookup: V3ParserTextLookup*,
+                                            callName: str,
+                                            callNameKey: V3ParserTextLookupKey,
+                                            qualifiedCallName: str,
+                                            qualifiedCallNameKey: V3ParserTextLookupKey,
+                                            dottedCallName: str,
+                                            dottedCallNameKey: V3ParserTextLookupKey): str =
+    if dottedCallName != callName &&
+       v3ParserTextLookupContainsKeyPtr(callLookup,
+                                        dottedCallName,
+                                        dottedCallNameKey):
+        return dottedCallName
+    if qualifiedCallName != callName &&
+       v3ParserTextLookupContainsKeyPtr(callLookup,
+                                        qualifiedCallName,
+                                        qualifiedCallNameKey):
+        return qualifiedCallName
+    if v3ParserTextLookupContainsKeyPtr(callLookup, callName, callNameKey):
+        return callName
+    return ""
 
 fn v3ParserSourcePathIndexLookupInit(minCap: int32): V3ParserSourcePathIndexLookup =
     var lookup: V3ParserSourcePathIndexLookup
@@ -5791,12 +5900,13 @@ fn v3ParserSharedV3PackageRoot(workspaceRootRaw: str): str =
         return sharedV3Root
     return ""
 
-fn v3ParserModulePathToSourcePathPrepared(workspaceRoot: str,
-                                          packageRoot: str,
-                                          sharedV3PackageRoot: str,
-                                          packageId: str,
-                                          packagePrefix: str,
-                                          modulePath: str): str =
+fn v3ParserModulePathToSourcePathPreparedWithExternalPackageRoots(workspaceRoot: str,
+                                                                  packageRoot: str,
+                                                                  sharedV3PackageRoot: str,
+                                                                  packageId: str,
+                                                                  packagePrefix: str,
+                                                                  externalPackageRoots: V3ParserExternalPackageRoot[],
+                                                                  modulePath: str): str =
     if modulePath == "":
         return ""
     if v3ParserStartsWithExact(modulePath, "std/") && modulePath.len > 4:
@@ -5810,23 +5920,64 @@ fn v3ParserModulePathToSourcePathPrepared(workspaceRoot: str,
     if packageId != "" && modulePath.len > packageId.len && v3ParserStartsWithExact(modulePath, packagePrefix):
         let rel: str = v3ParserModulePathTailExact(modulePath, 2)
         return v3ParserConcat3(v3ParserConcat2(packageRoot, "/src/"), rel, ".cheng")
+    var externalPackageRoot = ""
+    var externalPackageId = ""
+    var externalPackagePrefix = ""
+    if v3ParserExternalPackageRootByModulePath(modulePath,
+                                               externalPackageRoots,
+                                               externalPackageRoot,
+                                               externalPackageId,
+                                               externalPackagePrefix):
+        let rel = v3path.V3TextSlice(modulePath,
+                                     externalPackagePrefix.len,
+                                     modulePath.len - externalPackagePrefix.len)
+        return v3ParserConcat3(v3ParserConcat2(externalPackageRoot, "/src/"), rel, ".cheng")
     return ""
 
-fn v3ParserModulePathToSourcePath(workspaceRootRaw: str, packageRootRaw: str, modulePathRaw: str): str =
+fn v3ParserModulePathToSourcePathPrepared(workspaceRoot: str,
+                                          packageRoot: str,
+                                          sharedV3PackageRoot: str,
+                                          packageId: str,
+                                          packagePrefix: str,
+                                          modulePath: str): str =
+    var externalPackageRoots: V3ParserExternalPackageRoot[]
+    return v3ParserModulePathToSourcePathPreparedWithExternalPackageRoots(workspaceRoot,
+                                                                          packageRoot,
+                                                                          sharedV3PackageRoot,
+                                                                          packageId,
+                                                                          packagePrefix,
+                                                                          externalPackageRoots,
+                                                                          modulePath)
+
+fn v3ParserModulePathToSourcePathWithExternalPackageRoots(workspaceRootRaw: str,
+                                                          packageRootRaw: str,
+                                                          externalPackageRoots: V3ParserExternalPackageRoot[],
+                                                          modulePathRaw: str): str =
     let workspaceRoot: str = v3ParserNormalizePath(workspaceRootRaw)
     let packageRoot: str = v3ParserNormalizePath(packageRootRaw)
     let modulePath: str = v3path.V3PathTrim(modulePathRaw)
     let sharedV3PackageRoot: str = v3ParserSharedV3PackageRoot(workspaceRoot)
     let packageId: str = v3ParserPackageId(packageRoot)
     let packagePrefix: str = v3ParserConcat2(packageId, "/")
-    return v3ParserModulePathToSourcePathPrepared(workspaceRoot,
-                                                  packageRoot,
-                                                  sharedV3PackageRoot,
-                                                  packageId,
-                                                  packagePrefix,
-                                                  modulePath)
+    return v3ParserModulePathToSourcePathPreparedWithExternalPackageRoots(workspaceRoot,
+                                                                          packageRoot,
+                                                                          sharedV3PackageRoot,
+                                                                          packageId,
+                                                                          packagePrefix,
+                                                                          externalPackageRoots,
+                                                                          modulePath)
 
-fn v3ParserSourcePathToModulePath(workspaceRootRaw: str, packageRootRaw: str, sourcePathRaw: str): str =
+fn v3ParserModulePathToSourcePath(workspaceRootRaw: str, packageRootRaw: str, modulePathRaw: str): str =
+    var externalPackageRoots: V3ParserExternalPackageRoot[]
+    return v3ParserModulePathToSourcePathWithExternalPackageRoots(workspaceRootRaw,
+                                                                  packageRootRaw,
+                                                                  externalPackageRoots,
+                                                                  modulePathRaw)
+
+fn v3ParserSourcePathToModulePathWithExternalPackageRoots(workspaceRootRaw: str,
+                                                          packageRootRaw: str,
+                                                          externalPackageRoots: V3ParserExternalPackageRoot[],
+                                                          sourcePathRaw: str): str =
     let workspaceRoot: str = v3ParserNormalizePath(workspaceRootRaw)
     let packageRoot: str = v3ParserNormalizePath(packageRootRaw)
     let sourcePath: str = v3ParserNormalizePath(sourcePathRaw)
@@ -5848,6 +5999,19 @@ fn v3ParserSourcePathToModulePath(workspaceRootRaw: str, packageRootRaw: str, so
         if rel == "":
             return "cheng/v3"
         return v3ParserConcat2("cheng/v3/", rel)
+    var externalPackageRoot = ""
+    var externalPackageId = ""
+    if v3ParserExternalPackageRootBySourcePath(sourcePath,
+                                               externalPackageRoots,
+                                               externalPackageRoot,
+                                               externalPackageId):
+        let externalPrefix: str = v3ParserConcat2(externalPackageRoot, "/src/")
+        let rel: str = v3ParserRelWithoutExt(v3path.V3TextSlice(sourcePath,
+                                                                externalPrefix.len,
+                                                                sourcePath.len - externalPrefix.len))
+        if rel == "":
+            return externalPackageId
+        return v3ParserConcat3(externalPackageId, "/", rel)
     let stdPrefix: str = v3ParserConcat2(workspaceRoot, "/src/std/")
     if v3ParserStartsWithExact(sourcePath, stdPrefix):
         let rel: str = v3ParserRelWithoutExt(v3path.V3TextSlice(sourcePath,
@@ -5857,6 +6021,13 @@ fn v3ParserSourcePathToModulePath(workspaceRootRaw: str, packageRootRaw: str, so
             return "std"
         return v3ParserConcat2("std/", rel)
     return v3ParserFileStem(sourcePath)
+
+fn v3ParserSourcePathToModulePath(workspaceRootRaw: str, packageRootRaw: str, sourcePathRaw: str): str =
+    var externalPackageRoots: V3ParserExternalPackageRoot[]
+    return v3ParserSourcePathToModulePathWithExternalPackageRoots(workspaceRootRaw,
+                                                                  packageRootRaw,
+                                                                  externalPackageRoots,
+                                                                  sourcePathRaw)
 
 fn v3ParserHasCompilerTopLevel(textRaw: str): bool =
     let lines = v3ParserSplitChar(textRaw, '\n')
@@ -5883,13 +6054,14 @@ fn v3ParserMainFunctionPresent(textRaw: str): bool =
             return true
     return false
 
-fn v3ParserAppendImportEdge(workspaceRoot: str,
-                            packageRoot: str,
-                            ownerModulePath: str,
-                            modulePathRaw: str,
-                            importAliasRaw: str,
-                            edges: var V3ImportEdge[],
-                            err: var str): bool =
+fn v3ParserAppendImportEdgeWithExternalPackageRoots(workspaceRoot: str,
+                                                    packageRoot: str,
+                                                    externalPackageRoots: V3ParserExternalPackageRoot[],
+                                                    ownerModulePath: str,
+                                                    modulePathRaw: str,
+                                                    importAliasRaw: str,
+                                                    edges: var V3ImportEdge[],
+                                                    err: var str): bool =
     let normalizedWorkspaceRoot = v3ParserNormalizePath(workspaceRoot)
     let normalizedPackageRoot = v3ParserNormalizePath(packageRoot)
     let modulePath = v3path.V3PathTrim(modulePathRaw)
@@ -5897,36 +6069,56 @@ fn v3ParserAppendImportEdge(workspaceRoot: str,
     let sharedV3PackageRoot: str = v3ParserSharedV3PackageRoot(normalizedWorkspaceRoot)
     let packageId: str = v3ParserPackageId(normalizedPackageRoot)
     let packagePrefix: str = v3ParserConcat2(packageId, "/")
-    return v3ParserAppendImportEdgePrepared(normalizedWorkspaceRoot,
-                                            normalizedPackageRoot,
-                                            sharedV3PackageRoot,
-                                            packageId,
-                                            packagePrefix,
-                                            ownerModulePath,
-                                            modulePath,
-                                            importAlias,
-                                            edges,
-                                            err)
+    return v3ParserAppendImportEdgePreparedWithExternalPackageRoots(normalizedWorkspaceRoot,
+                                                                    normalizedPackageRoot,
+                                                                    sharedV3PackageRoot,
+                                                                    packageId,
+                                                                    packagePrefix,
+                                                                    externalPackageRoots,
+                                                                    ownerModulePath,
+                                                                    modulePath,
+                                                                    importAlias,
+                                                                    edges,
+                                                                    err)
 
-fn v3ParserAppendImportEdgePrepared(workspaceRoot: str,
-                                    packageRoot: str,
-                                    sharedV3PackageRoot: str,
-                                    packageId: str,
-                                    packagePrefix: str,
-                                    ownerModulePath: str,
-                                    modulePath: str,
-                                    importAlias: str,
-                                    edges: var V3ImportEdge[],
-                                    err: var str): bool =
+fn v3ParserAppendImportEdge(workspaceRoot: str,
+                            packageRoot: str,
+                            ownerModulePath: str,
+                            modulePathRaw: str,
+                            importAliasRaw: str,
+                            edges: var V3ImportEdge[],
+                            err: var str): bool =
+    var externalPackageRoots: V3ParserExternalPackageRoot[]
+    return v3ParserAppendImportEdgeWithExternalPackageRoots(workspaceRoot,
+                                                            packageRoot,
+                                                            externalPackageRoots,
+                                                            ownerModulePath,
+                                                            modulePathRaw,
+                                                            importAliasRaw,
+                                                            edges,
+                                                            err)
+
+fn v3ParserAppendImportEdgePreparedWithExternalPackageRoots(workspaceRoot: str,
+                                                            packageRoot: str,
+                                                            sharedV3PackageRoot: str,
+                                                            packageId: str,
+                                                            packagePrefix: str,
+                                                            externalPackageRoots: V3ParserExternalPackageRoot[],
+                                                            ownerModulePath: str,
+                                                            modulePath: str,
+                                                            importAlias: str,
+                                                            edges: var V3ImportEdge[],
+                                                            err: var str): bool =
     if modulePath == "":
         err = "v3 parser: malformed import"
         return false
-    let sourcePath = v3ParserModulePathToSourcePathPrepared(workspaceRoot,
-                                                            packageRoot,
-                                                            sharedV3PackageRoot,
-                                                            packageId,
-                                                            packagePrefix,
-                                                            modulePath)
+    let sourcePath = v3ParserModulePathToSourcePathPreparedWithExternalPackageRoots(workspaceRoot,
+                                                                                    packageRoot,
+                                                                                    sharedV3PackageRoot,
+                                                                                    packageId,
+                                                                                    packagePrefix,
+                                                                                    externalPackageRoots,
+                                                                                    modulePath)
     let resolved = v3ParserSourceExists(sourcePath)
     var edge: V3ImportEdge
     edge.ownerModulePath = ownerModulePath
@@ -5961,12 +6153,36 @@ fn v3ParserAppendImportEdgePrepared(workspaceRoot: str,
     err = ""
     return true
 
-fn v3ParserReadImportEdgesLines(workspaceRoot: str,
-                                packageRoot: str,
-                                ownerModulePath: str,
-                                lines: str[],
-                                edges: var V3ImportEdge[],
-                                err: var str): bool =
+fn v3ParserAppendImportEdgePrepared(workspaceRoot: str,
+                                    packageRoot: str,
+                                    sharedV3PackageRoot: str,
+                                    packageId: str,
+                                    packagePrefix: str,
+                                    ownerModulePath: str,
+                                    modulePath: str,
+                                    importAlias: str,
+                                    edges: var V3ImportEdge[],
+                                    err: var str): bool =
+    var externalPackageRoots: V3ParserExternalPackageRoot[]
+    return v3ParserAppendImportEdgePreparedWithExternalPackageRoots(workspaceRoot,
+                                                                    packageRoot,
+                                                                    sharedV3PackageRoot,
+                                                                    packageId,
+                                                                    packagePrefix,
+                                                                    externalPackageRoots,
+                                                                    ownerModulePath,
+                                                                    modulePath,
+                                                                    importAlias,
+                                                                    edges,
+                                                                    err)
+
+fn v3ParserReadImportEdgesLinesWithExternalPackageRoots(workspaceRoot: str,
+                                                        packageRoot: str,
+                                                        externalPackageRoots: V3ParserExternalPackageRoot[],
+                                                        ownerModulePath: str,
+                                                        lines: str[],
+                                                        edges: var V3ImportEdge[],
+                                                        err: var str): bool =
     edges = []
     let sharedV3PackageRoot: str = v3ParserSharedV3PackageRoot(workspaceRoot)
     let packageId: str = v3ParserPackageId(packageRoot)
@@ -6023,16 +6239,17 @@ fn v3ParserReadImportEdgesLines(workspaceRoot: str,
                     continue
                 let item = v3ParserTrimmedSliceRange(groupItemsText, start, itemPos)
                 if len(item) > 0:
-                    if !v3ParserAppendImportEdgePrepared(workspaceRoot,
-                                                         packageRoot,
-                                                         sharedV3PackageRoot,
-                                                         packageId,
-                                                         packagePrefix,
-                                                         ownerModulePath,
-                                                         v3ParserConcat3(groupPrefix, "/", item),
-                                                         "",
-                                                         edges,
-                                                         err):
+                    if !v3ParserAppendImportEdgePreparedWithExternalPackageRoots(workspaceRoot,
+                                                                                 packageRoot,
+                                                                                 sharedV3PackageRoot,
+                                                                                 packageId,
+                                                                                 packagePrefix,
+                                                                                 externalPackageRoots,
+                                                                                 ownerModulePath,
+                                                                                 v3ParserConcat3(groupPrefix, "/", item),
+                                                                                 "",
+                                                                                 edges,
+                                                                                 err):
                         return false
                     appended = true
                 start = itemPos + 1
@@ -6041,19 +6258,51 @@ fn v3ParserReadImportEdgesLines(workspaceRoot: str,
                 err = "v3 parser: malformed grouped import"
                 return false
             continue
-        if !v3ParserAppendImportEdgePrepared(workspaceRoot,
-                                             packageRoot,
-                                             sharedV3PackageRoot,
-                                             packageId,
-                                             packagePrefix,
-                                             ownerModulePath,
-                                             importSpec,
-                                             importAlias,
-                                             edges,
-                                             err):
+        if !v3ParserAppendImportEdgePreparedWithExternalPackageRoots(workspaceRoot,
+                                                                     packageRoot,
+                                                                     sharedV3PackageRoot,
+                                                                     packageId,
+                                                                     packagePrefix,
+                                                                     externalPackageRoots,
+                                                                     ownerModulePath,
+                                                                     importSpec,
+                                                                     importAlias,
+                                                                     edges,
+                                                                     err):
             return false
     err = ""
     return true
+
+fn v3ParserReadImportEdgesLines(workspaceRoot: str,
+                                packageRoot: str,
+                                ownerModulePath: str,
+                                lines: str[],
+                                edges: var V3ImportEdge[],
+                                err: var str): bool =
+    var externalPackageRoots: V3ParserExternalPackageRoot[]
+    return v3ParserReadImportEdgesLinesWithExternalPackageRoots(workspaceRoot,
+                                                                packageRoot,
+                                                                externalPackageRoots,
+                                                                ownerModulePath,
+                                                                lines,
+                                                                edges,
+                                                                err)
+
+fn v3ParserReadImportEdgesWithExternalPackageRoots(workspaceRoot: str,
+                                                   packageRoot: str,
+                                                   externalPackageRoots: V3ParserExternalPackageRoot[],
+                                                   ownerModulePath: str,
+                                                   textRaw: str,
+                                                   edges: var V3ImportEdge[],
+                                                   err: var str): bool =
+    let lines = v3ParserSplitChar(textRaw, '\n')
+    return v3ParserReadImportEdgesLinesWithExternalPackageRoots(workspaceRoot,
+                                                                packageRoot,
+                                                                externalPackageRoots,
+                                                                ownerModulePath,
+                                                                lines,
+                                                                edges,
+                                                                err)
 
 fn v3ParserReadImportEdges(workspaceRoot: str,
                            packageRoot: str,
@@ -6061,8 +6310,14 @@ fn v3ParserReadImportEdges(workspaceRoot: str,
                            textRaw: str,
                            edges: var V3ImportEdge[],
                            err: var str): bool =
-    let lines = v3ParserSplitChar(textRaw, '\n')
-    return v3ParserReadImportEdgesLines(workspaceRoot, packageRoot, ownerModulePath, lines, edges, err)
+    var externalPackageRoots: V3ParserExternalPackageRoot[]
+    return v3ParserReadImportEdgesWithExternalPackageRoots(workspaceRoot,
+                                                           packageRoot,
+                                                           externalPackageRoots,
+                                                           ownerModulePath,
+                                                           textRaw,
+                                                           edges,
+                                                           err)
 
 fn v3ImportEdgeTargetSourcePath(edge: V3ImportEdge): str =
     return edge.targetSourcePath
@@ -6093,14 +6348,15 @@ fn v3ParserAddUniqueTextExact(items: var str[],
             return
     add(items, value)
 
-fn v3ParserCollectClosure(workspaceRoot: str,
-                          packageRoot: str,
-                          sourcePathRaw: str,
-                          seen: var str[],
-                          ordered: var str[],
-                          importEdges: var V3ImportEdge[],
-                          unresolved: var int32,
-                          err: var str): bool =
+fn v3ParserCollectClosureWithExternalPackageRoots(workspaceRoot: str,
+                                                  packageRoot: str,
+                                                  externalPackageRoots: V3ParserExternalPackageRoot[],
+                                                  sourcePathRaw: str,
+                                                  seen: var str[],
+                                                  ordered: var str[],
+                                                  importEdges: var V3ImportEdge[],
+                                                  unresolved: var int32,
+                                                  err: var str): bool =
     let sourcePath: str = v3path.V3PathTrim(sourcePathRaw)
     if sourcePath == "":
         err = "v3 parser: missing closure source path"
@@ -6120,9 +6376,18 @@ fn v3ParserCollectClosure(workspaceRoot: str,
         scanPos = scanPos + 1
         let text = v3ParserOwnedText(v3path.V3ReadTextFile("", currentSourcePath))
         let lines = v3ParserSplitChar(text, '\n')
-        let ownerModulePath = v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, currentSourcePath)
+        let ownerModulePath = v3ParserSourcePathToModulePathWithExternalPackageRoots(workspaceRoot,
+                                                                                     packageRoot,
+                                                                                     externalPackageRoots,
+                                                                                     currentSourcePath)
         var edges: V3ImportEdge[]
-        if !v3ParserReadImportEdgesLines(workspaceRoot, packageRoot, ownerModulePath, lines, edges, err):
+        if !v3ParserReadImportEdgesLinesWithExternalPackageRoots(workspaceRoot,
+                                                                 packageRoot,
+                                                                 externalPackageRoots,
+                                                                 ownerModulePath,
+                                                                 lines,
+                                                                 edges,
+                                                                 err):
             return false
         for i in 0..<edges.len:
             v3ParserAddUniqueImportEdge(importEdges, edges[i])
@@ -6137,10 +6402,30 @@ fn v3ParserCollectClosure(workspaceRoot: str,
     err = ""
     return true
 
-fn v3ParseOrdinarySourceStub(packageRootRaw: str,
-                             sourcePathRaw: str,
-                             parsed: var V3ParsedSourceStub,
-                             err: var str): bool =
+fn v3ParserCollectClosure(workspaceRoot: str,
+                          packageRoot: str,
+                          sourcePathRaw: str,
+                          seen: var str[],
+                          ordered: var str[],
+                          importEdges: var V3ImportEdge[],
+                          unresolved: var int32,
+                          err: var str): bool =
+    var externalPackageRoots: V3ParserExternalPackageRoot[]
+    return v3ParserCollectClosureWithExternalPackageRoots(workspaceRoot,
+                                                          packageRoot,
+                                                          externalPackageRoots,
+                                                          sourcePathRaw,
+                                                          seen,
+                                                          ordered,
+                                                          importEdges,
+                                                          unresolved,
+                                                          err)
+
+fn v3ParseOrdinarySourceStubWithExternalPackageRoots(packageRootRaw: str,
+                                                     sourcePathRaw: str,
+                                                     externalPackageRoots: V3ParserExternalPackageRoot[],
+                                                     parsed: var V3ParsedSourceStub,
+                                                     err: var str): bool =
     let packageRoot: str = v3ParserNormalizePath(packageRootRaw)
     let sourcePath: str = v3ParserNormalizePath(sourcePathRaw)
     if sourcePath == "":
@@ -6164,14 +6449,28 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
     var importEdges: V3ImportEdge[]
     var exprLayer = V3NormalizedExprLayer()
     var unresolved: int32
-    if !v3ParserCollectClosure(workspaceRoot, packageRoot, sourcePath, seen, ordered, importEdges, unresolved, err):
+    if !v3ParserCollectClosureWithExternalPackageRoots(workspaceRoot,
+                                                       packageRoot,
+                                                       externalPackageRoots,
+                                                       sourcePath,
+                                                       seen,
+                                                       ordered,
+                                                       importEdges,
+                                                       unresolved,
+                                                       err):
         return false
     var sourceProfiles: V3NormalizedExprCallProfile[]
     for i in 0..<ordered.len:
         let sourceText = v3ParserOwnedText(v3path.V3ReadTextFile("", ordered[i]))
         var profile: V3NormalizedExprCallProfile
         var profileErr = ""
-        if !v3ParserBuildExprCallProfile(workspaceRoot, packageRoot, ordered[i], sourceText, profile, profileErr):
+        if !v3ParserBuildExprCallProfileWithExternalPackageRoots(workspaceRoot,
+                                                                 packageRoot,
+                                                                 externalPackageRoots,
+                                                                 ordered[i],
+                                                                 sourceText,
+                                                                 profile,
+                                                                 profileErr):
             err = profileErr
             return false
         add(sourceProfiles, profile)
@@ -6200,7 +6499,10 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
     var ownerModulePaths: str[]
     for i in 0..<ordered.len:
         v3ParserAddUniqueText(ownerModulePaths,
-                              v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, ordered[i]))
+                              v3ParserSourcePathToModulePathWithExternalPackageRoots(workspaceRoot,
+                                                                                    packageRoot,
+                                                                                    externalPackageRoots,
+                                                                                    ordered[i]))
     parsed.workspaceRoot = workspaceRoot
     parsed.packageRoot = packageRoot
     parsed.packageId = packageId
@@ -6223,3 +6525,14 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
     parsed.unresolvedImportCount = unresolved
     err = ""
     return true
+
+fn v3ParseOrdinarySourceStub(packageRootRaw: str,
+                             sourcePathRaw: str,
+                             parsed: var V3ParsedSourceStub,
+                             err: var str): bool =
+    var externalPackageRoots: V3ParserExternalPackageRoot[]
+    return v3ParseOrdinarySourceStubWithExternalPackageRoots(packageRootRaw,
+                                                             sourcePathRaw,
+                                                             externalPackageRoots,
+                                                             parsed,
+                                                             err)

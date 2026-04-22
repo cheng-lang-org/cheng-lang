@@ -1,6 +1,5 @@
-import std/buffer
-import std/rawbytes
 import std/strutils as strutils
+import std/rawmem_support
 import cheng/v3/tooling/bootstrap_contracts as contracts
 
 type
@@ -54,17 +53,20 @@ fn v3BackendRootPath(rootDir: str, rel: str): str =
         return rel
     if rel == "":
         return rootDir
+    let rootLen: int32 = len(rootDir)
+    let relLen: int32 = len(rel)
     if rootDir[rootDir.len - 1] == '/':
-        var withSep = buffer.newByteBuffer()
-        buffer.AppendBytes(withSep, rootDir)
-        buffer.AppendBytes(withSep, rel)
-        return rawbytes.bytesToString(buffer.toBytes(withSep))
-    var out = buffer.newByteBuffer()
-    let slash: str = "/"
-    buffer.AppendBytes(out, rootDir)
-    buffer.AppendBytes(out, slash)
-    buffer.AppendBytes(out, rel)
-    return rawbytes.bytesToString(buffer.toBytes(out))
+        let out: str = newStringAlloc(rootLen + relLen)
+        let outPtr: ptr = strDataPtr(out)
+        rawmem_support.RawmemCopy(outPtr, strDataPtr(rootDir), rootLen)
+        rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(outPtr, rootLen), strDataPtr(rel), relLen)
+        return out
+    let out: str = newStringAlloc(rootLen + 1 + relLen)
+    let outPtr: ptr = strDataPtr(out)
+    rawmem_support.RawmemCopy(outPtr, strDataPtr(rootDir), rootLen)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(outPtr, rootLen), int32('/'), 1)
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(outPtr, rootLen + 1), strDataPtr(rel), relLen)
+    return out
 
 fn v3BackendBuildPlanJoinLines(rows: str[]): str =
     return strutils.Join(rows, "\n")
@@ -99,7 +101,7 @@ fn v3BackendTargetFromTriple(targetTriple: str): V3BackendTarget =
 fn v3BackendBuildPlanDefaultForTarget(rootDir: str, targetTriple: str): V3BackendBuildPlan =
     var units: V3BackendSourceUnit[]
     units = []
-    add(units, V3BackendSourceUnit(role: v3BackendBootstrapContractSource, path: v3BackendRootPath(rootDir, "v3/bootstrap/stage1_bootstrap.cheng")))
+    add(units, V3BackendSourceUnit(role: v3BackendBootstrapContractSource, path: contracts.V3BootstrapStage1SourcePath(rootDir)))
     add(units, V3BackendSourceUnit(role: v3BackendCompilerEntrySource, path: v3BackendRootPath(rootDir, "v3/src/tooling/compiler_main.cheng")))
     add(units, V3BackendSourceUnit(role: v3BackendCompilerRuntimeSource, path: v3BackendRootPath(rootDir, "v3/src/tooling/compiler_runtime.cheng")))
     add(units, V3BackendSourceUnit(role: v3BackendCompilerSupportMatrixSource, path: v3BackendRootPath(rootDir, "v3/src/tooling/support_matrix.cheng")))
@@ -132,12 +134,12 @@ fn v3BackendBuildPlanDefaultForTarget(rootDir: str, targetTriple: str): V3Backen
     )
 
 fn v3BackendBuildPlanDefault(rootDir: str): V3BackendBuildPlan =
-    return v3BackendBuildPlanDefaultForTarget(rootDir, contracts.v3BootstrapDefaultTarget())
+    return v3BackendBuildPlanDefaultForTarget(rootDir, contracts.V3BootstrapDefaultTarget())
 
 fn v3BackendBuildPlanBackendDriverForTarget(rootDir: str, targetTriple: str): V3BackendBuildPlan =
     var units: V3BackendSourceUnit[]
     units = []
-    add(units, V3BackendSourceUnit(role: v3BackendBootstrapContractSource, path: v3BackendRootPath(rootDir, "v3/bootstrap/stage1_bootstrap.cheng")))
+    add(units, V3BackendSourceUnit(role: v3BackendBootstrapContractSource, path: contracts.V3BootstrapStage1SourcePath(rootDir)))
     add(units, V3BackendSourceUnit(role: v3BackendBackendDriverEntrySource, path: v3BackendBuildPlanBackendDriverEntryPath(rootDir)))
     add(units, V3BackendSourceUnit(role: v3BackendCompilerRuntimeSource, path: v3BackendRootPath(rootDir, "v3/src/tooling/compiler_runtime.cheng")))
     add(units, V3BackendSourceUnit(role: v3BackendCompilerSupportMatrixSource, path: v3BackendRootPath(rootDir, "v3/src/tooling/support_matrix.cheng")))
@@ -170,7 +172,7 @@ fn v3BackendBuildPlanBackendDriverForTarget(rootDir: str, targetTriple: str): V3
     )
 
 fn v3BackendBuildPlanBackendDriver(rootDir: str): V3BackendBuildPlan =
-    return v3BackendBuildPlanBackendDriverForTarget(rootDir, contracts.v3BootstrapDefaultTarget())
+    return v3BackendBuildPlanBackendDriverForTarget(rootDir, contracts.V3BootstrapDefaultTarget())
 
 fn v3BackendTargetText(target: V3BackendTarget): str =
     if target == v3BackendX8664AppleDarwin:
@@ -244,3 +246,15 @@ fn v3BackendBuildPlanReport(plan: V3BackendBuildPlan): str =
         line = line + unit.path
         add(rows, line)
     return v3BackendBuildPlanJoinLines(rows)
+
+fn V3BackendBuildPlanDefault(rootDir: str): V3BackendBuildPlan =
+    return v3BackendBuildPlanDefault(rootDir)
+
+fn V3BackendBuildPlanBackendDriver(rootDir: str): V3BackendBuildPlan =
+    return v3BackendBuildPlanBackendDriver(rootDir)
+
+fn V3BackendBuildPlanBackendDriverForTarget(rootDir: str, targetTriple: str): V3BackendBuildPlan =
+    return v3BackendBuildPlanBackendDriverForTarget(rootDir, targetTriple)
+
+fn V3BackendBuildPlanReport(plan: V3BackendBuildPlan): str =
+    return v3BackendBuildPlanReport(plan)

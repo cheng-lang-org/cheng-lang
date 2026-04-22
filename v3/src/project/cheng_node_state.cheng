@@ -84,20 +84,20 @@ fn v3ChengNodeStateHexValue(ch: char): int32 =
         return 10 + int32(ch) - int32('A')
     return -1
 
-fn v3ChengNodeStateBytesFromHex(text: str): Result[Bytes] =
+fn v3ChengNodeStateBytesFromHexInto(out: var Bytes,
+                                    text: str): Result[bool] =
     if (len(text) % 2) != 0:
-        return Err[Bytes]("cheng_node state: invalid hex length")
-    var out: Bytes
+        return Err[bool]("cheng_node state: invalid hex length")
     out = bytesAlloc(len(text) / 2)
     var i: int32
     while i < len(text):
         let hi = v3ChengNodeStateHexValue(text[i])
         let lo = v3ChengNodeStateHexValue(text[i + 1])
         if hi < 0 || lo < 0:
-            return Err[Bytes]("cheng_node state: invalid hex")
+            return Err[bool]("cheng_node state: invalid hex")
         bytesSet(out, i / 2, (hi << 4) | lo)
         i = i + 2
-    return Ok[Bytes](out)
+    return Ok[bool](true)
 
 fn v3ChengNodeStateRequireFixed32(text: str,
                                   key: str): Result[layout.FixedBytes32] =
@@ -111,10 +111,11 @@ fn v3ChengNodeStateRequireTextHex(text: str,
     let raw = v3ChengNodeStateLineValue(text, key)
     if len(raw) <= 0:
         return Err[str]("cheng_node state: missing " + key)
-    let bytesRes = v3ChengNodeStateBytesFromHex(raw)
-    if IsErr(bytesRes):
-        return Err[str](Error(bytesRes))
-    return Ok[str](bytesToString(Value(bytesRes)))
+    var decoded: Bytes
+    let decodeRes = v3ChengNodeStateBytesFromHexInto(decoded, raw)
+    if IsErr(decodeRes):
+        return Err[str](Error(decodeRes))
+    return Ok[str](bytesToString(decoded))
 
 fn v3ChengNodeStateRequireCount(text: str,
                                 key: str): Result[int32] =
@@ -157,10 +158,11 @@ fn V3ChengNodeLoadLegacyChainSnapshotInto(out: var chain.V3ChainNodeServeSnapsho
     let payloadHex = v3ChengNodeStateLineValue(text, "payload_hex")
     if len(payloadHex) <= 0:
         return Err[bool]("cheng_node state: missing legacy payload")
-    let payloadRes = v3ChengNodeStateBytesFromHex(payloadHex)
+    var payload: Bytes
+    let payloadRes = v3ChengNodeStateBytesFromHexInto(payload, payloadHex)
     if IsErr(payloadRes):
         return Err[bool](Error(payloadRes))
-    let decodeRes = cnet.V3ChainNodeLibp2pDecodeSnapshotInto(Value(payloadRes), out)
+    let decodeRes = cnet.V3ChainNodeLibp2pDecodeSnapshotInto(payload, out)
     if IsErr(decodeRes):
         return Err[bool](Error(decodeRes))
     return Ok[bool](true)
@@ -227,11 +229,12 @@ fn V3ChengNodeLoadStateInto(out: var node.V3ChengNode,
             return Err[bool]("cheng_node state: root seed mismatch")
     let snapshotHex = v3ChengNodeStateLineValue(text, "chain_snapshot_hex")
     if len(snapshotHex) > 0:
-        let payloadRes = v3ChengNodeStateBytesFromHex(snapshotHex)
+        var payload: Bytes
+        let payloadRes = v3ChengNodeStateBytesFromHexInto(payload, snapshotHex)
         if IsErr(payloadRes):
             return Err[bool](Error(payloadRes))
         var snapshot: chain.V3ChainNodeServeSnapshot
-        let decodeRes = cnet.V3ChainNodeLibp2pDecodeSnapshotInto(Value(payloadRes), snapshot)
+        let decodeRes = cnet.V3ChainNodeLibp2pDecodeSnapshotInto(payload, snapshot)
         if IsErr(decodeRes):
             return Err[bool](Error(decodeRes))
         let replayRes = chain.v3ChainNodeReplayFromSnapshotInto(out.chainState,

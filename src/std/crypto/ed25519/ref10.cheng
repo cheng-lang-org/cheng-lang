@@ -1,6 +1,7 @@
 # Ed25519 ref10 core(minimal, no base precomp).
 
 import std/rawbytes
+import std/rawmem_support
 import std/result
 import std/strings
 import std/crypto/sha512
@@ -94,8 +95,15 @@ fn feSet(f: var Fe, i: int32, val: int64) =
         return
     f.v9 = val
 
-fn initCurveOrder(): Bytes =
-    let out: Bytes = bytesAlloc(bytes32Len)
+fn initCurveOrderInto(out: var Bytes) =
+    out.data = nil
+    out.len = 0
+    let raw: ptr = alloc(bytes32Len)
+    if raw == nil:
+        return
+    rawmem_support.RawmemSet(raw, 0, bytes32Len)
+    out.data = raw
+    out.len = bytes32Len
     bytesSet(out, 0, 0xED)
     bytesSet(out, 1, 0xD3)
     bytesSet(out, 2, 0xF5)
@@ -128,10 +136,16 @@ fn initCurveOrder(): Bytes =
     bytesSet(out, 29, 0x00)
     bytesSet(out, 30, 0x00)
     bytesSet(out, 31, 0x10)
-    return out
 
-fn initBasePointBytes(): Bytes =
-    let out: Bytes = bytesAlloc(bytes32Len)
+fn initBasePointBytesInto(out: var Bytes) =
+    out.data = nil
+    out.len = 0
+    let raw: ptr = alloc(bytes32Len)
+    if raw == nil:
+        return
+    rawmem_support.RawmemSet(raw, 0, bytes32Len)
+    out.data = raw
+    out.len = bytes32Len
     bytesSet(out, 0, 88)
     bytesSet(out, 1, 102)
     bytesSet(out, 2, 102)
@@ -164,7 +178,6 @@ fn initBasePointBytes(): Bytes =
     bytesSet(out, 29, 102)
     bytesSet(out, 30, 102)
     bytesSet(out, 31, 102)
-    return out
 
 fn initDConst(out: var Fe) =
     ensureFeLen(out)
@@ -205,26 +218,22 @@ fn initSqrtM1(out: var Fe) =
     feSet(out, 8, 326686)
     feSet(out, 9, 11406482)
 
-fn initDConstValue(): Fe =
-    var out: Fe
-    initDConst(out)
-    return out
+var CurveOrder: Bytes
+var BasePointBytes: Bytes
+var DConst: Fe
+var D2Const: Fe
+var SqrtM1: Fe
+var Ref10GlobalsReady: bool
 
-fn initD2ConstValue(): Fe =
-    var out: Fe
-    initD2Const(out)
-    return out
-
-fn initSqrtM1Value(): Fe =
-    var out: Fe
-    initSqrtM1(out)
-    return out
-
-var CurveOrder: Bytes = initCurveOrder()
-var BasePointBytes: Bytes = initBasePointBytes()
-var DConst: Fe = initDConstValue()
-var D2Const: Fe = initD2ConstValue()
-var SqrtM1: Fe = initSqrtM1Value()
+fn ensureRef10Globals() =
+    if Ref10GlobalsReady:
+        return
+    initCurveOrderInto(CurveOrder)
+    initBasePointBytesInto(BasePointBytes)
+    initDConst(DConst)
+    initD2Const(D2Const)
+    initSqrtM1(SqrtM1)
+    Ref10GlobalsReady = true
 
 fn ashr64(x: int64, n: int32): int64 =
     return x >> n
@@ -867,6 +876,7 @@ fn geP3ToBytes(h: GeP3): Bytes =
     return s
 
 fn geFromBytesNegateVartime(h: var GeP3, s: Bytes): bool =
+    ensureRef10Globals()
     var u: Fe
     var v: Fe
     var v3: Fe
@@ -929,6 +939,7 @@ fn geDouble(r: var GeP3, p: GeP3) =
     feMul(r.z, f, g)
 
 fn geAdd(r: var GeP3, p: GeP3, q: GeP3) =
+    ensureRef10Globals()
     var a: Fe
     var b: Fe
     var c: Fe
@@ -977,6 +988,7 @@ fn geScalarMult(r: var GeP3, a: Bytes, p: GeP3) =
     r = res
 
 fn geScalarMultBase(r: var GeP3, a: Bytes) =
+    ensureRef10Globals()
     let baseBytes: Bytes = BasePointBytes
     var base: GeP3
     if ! geFromBytesNegateVartime(base, baseBytes):
@@ -994,6 +1006,7 @@ fn verify32(x: Bytes, y: Bytes): int32 =
     return d
 
 fn checkScalar(s: Bytes): bool =
+    ensureRef10Globals()
     if bytesLen(s) != 32:
         return false
     var nonzero: bool

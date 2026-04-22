@@ -2,6 +2,7 @@ import std/cmdline as cmdline
 import std/os
 import std/strings
 import std/strutils as strutil
+import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/path as v3path
 import cheng/v3/tooling/r2c_process as r2cproc
 import cheng/v3/tooling/r2c_react_v3_status_support as r2cstatus
@@ -50,6 +51,45 @@ type
         modulePath: str
         componentName: str
         line: int32
+
+    R2cNativeLayoutTypedItem =
+        scope: str
+        index: int32
+        itemId: str
+        kind: str
+        planRole: str
+        layer: str
+        zIndex: int32
+        x: int32
+        y: int32
+        width: int32
+        height: int32
+        text: str
+        detailText: str
+        visibleInViewport: bool
+        synthetic: bool
+        interactive: bool
+        sourceBacked: bool
+        stretchX: bool
+        stretchY: bool
+        column: int32
+        columnSpan: int32
+        visualRole: str
+        density: str
+        prominence: str
+        accentTone: str
+        backgroundColor: str
+        borderColor: str
+        textColor: str
+        detailColor: str
+        fontSize: int32
+        fontWeight: str
+        cornerRadius: int32
+        textLength: int32
+        sourceNodeId: str
+        sourceModulePath: str
+        sourceComponentName: str
+        sourceLine: int32
 
     R2cTruthCompareEval =
         ok: bool
@@ -343,7 +383,26 @@ fn r2cControllerParseInt32(text: str): int32 =
 
 fn r2cControllerJsonQuote(text: str): str =
     let quote: str = strings.CharToStr(char(34))
-    return quote + text + quote
+    var out = quote
+    let total: int32 = strings.Len(text)
+    var i: int32
+    while i < total:
+        let ch = text[i]
+        if ch == char(34):
+            out = out + "\\" + quote
+        elif ch == '\\':
+            out = out + "\\\\"
+        elif ch == char(10):
+            out = out + "\\n"
+        elif ch == char(13):
+            out = out + "\\r"
+        elif ch == char(9):
+            out = out + "\\t"
+        else:
+            out = out + strings.CharToStr(ch)
+        i = i + 1
+    out = out + quote
+    return out
 
 fn r2cControllerJsonBool(value: bool): str =
     if value:
@@ -361,6 +420,12 @@ fn r2cControllerJsonBoolTextOrFalse(textRaw: str): str =
     if text == "true" || text == "false":
         return text
     return "false"
+
+fn r2cControllerJsonIntTextOrNull(textRaw: str): str =
+    let text: str = strutil.Strip(textRaw)
+    if strings.Len(text) <= 0:
+        return "null"
+    return intToStr(r2cControllerParseInt32(text))
 
 fn r2cControllerJsonReadStringFieldFirst(doc: str,
                                          keyA: str,
@@ -403,7 +468,14 @@ fn r2cControllerTextFind(text: str,
     if start > total - needleLen:
         return -1
     for i in start..(total - needleLen):
-        if r2cControllerSlice(text, i, needleLen) == needle:
+        var matched = true
+        var j: int32
+        while j < needleLen:
+            if text[i + j] != needle[j]:
+                matched = false
+                break
+            j = j + 1
+        if matched:
             return i
     return -1
 
@@ -623,6 +695,282 @@ fn r2cControllerJsonArrayNextObjectRaw(arrayText: str,
     nextPos = endPos + 1
     return true
 
+fn r2cControllerNativeLayoutRequireField(itemRaw: str,
+                                         key: str,
+                                         scope: str,
+                                         index: int32,
+                                         sourcePath: str): bool =
+    if r2cControllerJsonHasField(itemRaw, key):
+        return true
+    r2cControllerPrintErr("r2c-react-v3: native layout typed item missing " + key + " scope=" + scope + " index=" + intToStr(index) + " source=" + sourcePath)
+    return false
+
+fn r2cControllerReadNativeLayoutTypedItem(itemRaw: str,
+                                          scope: str,
+                                          index: int32,
+                                          sourcePath: str,
+                                          out: var R2cNativeLayoutTypedItem): bool =
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "id", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "kind", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "plan_role", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "layer", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "z_index", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "visible_in_viewport", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "synthetic", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "x", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "y", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "width", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "height", scope, index, sourcePath):
+        return false
+    if !r2cControllerNativeLayoutRequireField(itemRaw, "text", scope, index, sourcePath):
+        return false
+    out.scope = scope
+    out.index = index
+    out.itemId = r2cControllerJsonReadStringField(itemRaw, "id", "")
+    out.kind = r2cControllerJsonReadStringField(itemRaw, "kind", "")
+    out.planRole = r2cControllerJsonReadStringField(itemRaw, "plan_role", "")
+    out.layer = r2cControllerJsonReadStringField(itemRaw, "layer", "")
+    out.zIndex = r2cControllerJsonReadIntField(itemRaw, "z_index", 0)
+    out.x = r2cControllerJsonReadIntField(itemRaw, "x", 0)
+    out.y = r2cControllerJsonReadIntField(itemRaw, "y", 0)
+    out.width = r2cControllerJsonReadIntField(itemRaw, "width", 0)
+    out.height = r2cControllerJsonReadIntField(itemRaw, "height", 0)
+    if strings.Len(out.itemId) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native layout typed item empty id scope=" + scope + " index=" + intToStr(index) + " source=" + sourcePath)
+        return false
+    if strings.Len(out.kind) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native layout typed item empty kind scope=" + scope + " index=" + intToStr(index) + " source=" + sourcePath)
+        return false
+    if out.width <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native layout typed item invalid width scope=" + scope + " index=" + intToStr(index) + " source=" + sourcePath)
+        return false
+    if out.height <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native layout typed item invalid height scope=" + scope + " index=" + intToStr(index) + " source=" + sourcePath)
+        return false
+    out.text = r2cControllerJsonReadStringField(itemRaw, "text", "")
+    out.detailText = r2cControllerJsonReadStringField(itemRaw, "detail_text", "")
+    out.visibleInViewport = r2cControllerJsonReadBoolField(itemRaw, "visible_in_viewport", false)
+    out.synthetic = r2cControllerJsonReadBoolField(itemRaw, "synthetic", false)
+    out.interactive = r2cControllerJsonReadBoolField(itemRaw, "interactive", false)
+    out.sourceBacked = r2cControllerJsonReadBoolField(itemRaw, "source_backed", false)
+    out.stretchX = r2cControllerJsonReadBoolField(itemRaw, "stretch_x", false)
+    out.stretchY = r2cControllerJsonReadBoolField(itemRaw, "stretch_y", false)
+    out.column = r2cControllerJsonReadIntField(itemRaw, "column", 0)
+    out.columnSpan = r2cControllerJsonReadIntField(itemRaw, "column_span", 0)
+    out.visualRole = r2cControllerJsonReadStringField(itemRaw, "visual_role", "")
+    out.density = r2cControllerJsonReadStringField(itemRaw, "density", "")
+    out.prominence = r2cControllerJsonReadStringField(itemRaw, "prominence", "")
+    out.accentTone = r2cControllerJsonReadStringField(itemRaw, "accent_tone", "")
+    out.backgroundColor = r2cControllerJsonReadStringField(itemRaw, "background_color", "")
+    out.borderColor = r2cControllerJsonReadStringField(itemRaw, "border_color", "")
+    out.textColor = r2cControllerJsonReadStringField(itemRaw, "text_color", "")
+    out.detailColor = r2cControllerJsonReadStringField(itemRaw, "detail_color", "")
+    out.fontSize = r2cControllerJsonReadIntField(itemRaw, "font_size", 0)
+    out.fontWeight = r2cControllerJsonReadStringField(itemRaw, "font_weight", "")
+    out.cornerRadius = r2cControllerJsonReadIntField(itemRaw, "corner_radius", 0)
+    out.sourceNodeId = r2cControllerJsonReadStringField(itemRaw, "source_node_id", "")
+    out.sourceModulePath = r2cControllerJsonReadStringField(itemRaw, "source_module_path", "")
+    out.sourceComponentName = r2cControllerJsonReadStringField(itemRaw, "source_component_name", "")
+    out.sourceLine = r2cControllerJsonReadIntField(itemRaw, "source_line", 0)
+    out.textLength = strings.Len(out.text)
+    if strings.Len(out.sourceNodeId) > 0:
+        out.sourceBacked = true
+    elif strings.Len(out.sourceModulePath) > 0:
+        out.sourceBacked = true
+    elif strings.Len(out.sourceComponentName) > 0:
+        out.sourceBacked = true
+    return true
+
+fn r2cControllerNativeLayoutTypedItemJson(item: R2cNativeLayoutTypedItem): str =
+    var line = "    {"
+    line = line + "\"scope\":" + r2cControllerJsonQuote(item.scope) + ","
+    line = line + "\"index\":" + intToStr(item.index) + ","
+    line = line + "\"id\":" + r2cControllerJsonQuote(item.itemId) + ","
+    line = line + "\"kind\":" + r2cControllerJsonQuote(item.kind) + ","
+    line = line + "\"plan_role\":" + r2cControllerJsonQuote(item.planRole) + ","
+    line = line + "\"layer\":" + r2cControllerJsonQuote(item.layer) + ","
+    line = line + "\"z_index\":" + intToStr(item.zIndex) + ","
+    line = line + "\"x\":" + intToStr(item.x) + ","
+    line = line + "\"y\":" + intToStr(item.y) + ","
+    line = line + "\"width\":" + intToStr(item.width) + ","
+    line = line + "\"height\":" + intToStr(item.height) + ","
+    line = line + "\"text\":" + r2cControllerJsonQuote(item.text) + ","
+    line = line + "\"detail_text\":" + r2cControllerJsonQuote(item.detailText) + ","
+    line = line + "\"visible_in_viewport\":" + r2cControllerJsonBool(item.visibleInViewport) + ","
+    line = line + "\"synthetic\":" + r2cControllerJsonBool(item.synthetic) + ","
+    line = line + "\"interactive\":" + r2cControllerJsonBool(item.interactive) + ","
+    line = line + "\"source_backed\":" + r2cControllerJsonBool(item.sourceBacked) + ","
+    line = line + "\"stretch_x\":" + r2cControllerJsonBool(item.stretchX) + ","
+    line = line + "\"stretch_y\":" + r2cControllerJsonBool(item.stretchY) + ","
+    line = line + "\"column\":" + intToStr(item.column) + ","
+    line = line + "\"column_span\":" + intToStr(item.columnSpan) + ","
+    line = line + "\"visual_role\":" + r2cControllerJsonQuote(item.visualRole) + ","
+    line = line + "\"density\":" + r2cControllerJsonQuote(item.density) + ","
+    line = line + "\"prominence\":" + r2cControllerJsonQuote(item.prominence) + ","
+    line = line + "\"accent_tone\":" + r2cControllerJsonQuote(item.accentTone) + ","
+    line = line + "\"background_color\":" + r2cControllerJsonQuote(item.backgroundColor) + ","
+    line = line + "\"border_color\":" + r2cControllerJsonQuote(item.borderColor) + ","
+    line = line + "\"text_color\":" + r2cControllerJsonQuote(item.textColor) + ","
+    line = line + "\"detail_color\":" + r2cControllerJsonQuote(item.detailColor) + ","
+    line = line + "\"font_size\":" + intToStr(item.fontSize) + ","
+    line = line + "\"font_weight\":" + r2cControllerJsonQuote(item.fontWeight) + ","
+    line = line + "\"corner_radius\":" + intToStr(item.cornerRadius) + ","
+    line = line + "\"text_length\":" + intToStr(item.textLength) + ","
+    line = line + "\"source_node_id\":" + r2cControllerJsonQuote(item.sourceNodeId) + ","
+    line = line + "\"source_module_path\":" + r2cControllerJsonQuote(item.sourceModulePath) + ","
+    line = line + "\"source_component_name\":" + r2cControllerJsonQuote(item.sourceComponentName) + ","
+    line = line + "\"source_line\":" + intToStr(item.sourceLine)
+    line = line + "}"
+    return line
+
+fn r2cControllerNativeLayoutTypedItemsArrayJson(fieldName: str,
+                                                scope: str,
+                                                sourcePath: str,
+                                                arrayText: str,
+                                                expectedCount: int32,
+                                                outCount: var int32,
+                                                outInteractiveCount: var int32,
+                                                outSourceBackedCount: var int32,
+                                                outTextPayloadCount: var int32,
+                                                outStylePayloadCount: var int32,
+                                                outOk: var bool): str =
+    outCount = 0
+    outInteractiveCount = 0
+    outSourceBackedCount = 0
+    outTextPayloadCount = 0
+    outStylePayloadCount = 0
+    outOk = true
+    var out = "  " + r2cControllerJsonQuote(fieldName) + ": [\n"
+    var itemRaw: str
+    var cursor: int32
+    var nextPos: int32
+    while r2cControllerJsonArrayNextObjectRaw(arrayText, cursor, itemRaw, nextPos):
+        cursor = nextPos
+        var item: R2cNativeLayoutTypedItem
+        if !r2cControllerReadNativeLayoutTypedItem(itemRaw, scope, outCount, sourcePath, item):
+            outOk = false
+            return out
+        if outCount > 0:
+            out = out + ",\n"
+        out = out + r2cControllerNativeLayoutTypedItemJson(item) + "\n"
+        outCount = outCount + 1
+        if item.interactive:
+            outInteractiveCount = outInteractiveCount + 1
+        if item.sourceBacked:
+            outSourceBackedCount = outSourceBackedCount + 1
+        var hasTextPayload: bool
+        if item.textLength > 0:
+            hasTextPayload = true
+        elif strings.Len(item.detailText) > 0:
+            hasTextPayload = true
+        if hasTextPayload:
+            outTextPayloadCount = outTextPayloadCount + 1
+        if strings.Len(item.backgroundColor) > 0 || strings.Len(item.borderColor) > 0 || strings.Len(item.textColor) > 0 || strings.Len(item.detailColor) > 0:
+            outStylePayloadCount = outStylePayloadCount + 1
+        elif strings.Len(item.visualRole) > 0 || strings.Len(item.density) > 0 || strings.Len(item.prominence) > 0 || strings.Len(item.accentTone) > 0:
+            outStylePayloadCount = outStylePayloadCount + 1
+        elif item.fontSize > 0 || strings.Len(item.fontWeight) > 0 || item.cornerRadius > 0:
+            outStylePayloadCount = outStylePayloadCount + 1
+    out = out + "  ]"
+    if outCount != expectedCount:
+        r2cControllerPrintErr("r2c-react-v3: native layout typed catalog count mismatch scope=" + scope + " expected=" + intToStr(expectedCount) + " actual=" + intToStr(outCount) + " source=" + sourcePath)
+        outOk = false
+    return out
+
+fn r2cControllerWriteNativeLayoutTypedCatalog(catalogPath: str,
+                                              sourcePath: str,
+                                              routeState: str,
+                                              itemsRaw: str,
+                                              viewportItemsRaw: str,
+                                              expectedItemCount: int32,
+                                              expectedViewportItemCount: int32,
+                                              expectedInteractiveItemCount: int32,
+                                              expectedSourceBackedItemCount: int32,
+                                              outItemCount: var int32,
+                                              outViewportItemCount: var int32,
+                                              outInteractiveItemCount: var int32,
+                                              outSourceBackedItemCount: var int32,
+                                              outTextPayloadItemCount: var int32,
+                                              outStylePayloadItemCount: var int32,
+                                              outViewportTextPayloadItemCount: var int32,
+                                              outViewportStylePayloadItemCount: var int32): bool =
+    var catalog = "{\n"
+    catalog = catalog + "  \"format\": \"native_layout_item_catalog_v1\",\n"
+    catalog = catalog + "  \"controller\": \"cheng.live_controller\",\n"
+    catalog = catalog + "  \"publish_mode\": \"cheng_streamed_typed_layout_items_v1\",\n"
+    catalog = catalog + "  \"payload_profile\": \"cheng_runtime_layout_item_payload_v1\",\n"
+    catalog = catalog + "  \"text_payload_ready\": true,\n"
+    catalog = catalog + "  \"style_payload_ready\": true,\n"
+    catalog = catalog + "  \"route_state\": " + r2cControllerJsonQuote(routeState) + ",\n"
+    catalog = catalog + "  \"source_native_layout_plan_path\": " + r2cControllerJsonQuote(sourcePath) + ",\n"
+    catalog = catalog + "  \"item_count\": " + intToStr(expectedItemCount) + ",\n"
+    catalog = catalog + "  \"viewport_item_count\": " + intToStr(expectedViewportItemCount) + ",\n"
+    var viewportInteractiveCount: int32
+    var viewportSourceBackedCount: int32
+    var itemsTextPayloadCount: int32
+    var itemsStylePayloadCount: int32
+    var itemsOk: bool
+    let itemsJson: str = r2cControllerNativeLayoutTypedItemsArrayJson("items",
+                                                                      "items",
+                                                                      sourcePath,
+                                                                      itemsRaw,
+                                                                      expectedItemCount,
+                                                                      outItemCount,
+                                                                      outInteractiveItemCount,
+                                                                      outSourceBackedItemCount,
+                                                                      itemsTextPayloadCount,
+                                                                      itemsStylePayloadCount,
+                                                                      itemsOk)
+    if !itemsOk:
+        return false
+    outTextPayloadItemCount = itemsTextPayloadCount
+    outStylePayloadItemCount = itemsStylePayloadCount
+    var viewportTextPayloadCount: int32
+    var viewportStylePayloadCount: int32
+    var viewportItemsOk: bool
+    let viewportItemsJson: str = r2cControllerNativeLayoutTypedItemsArrayJson("viewport_items",
+                                                                              "viewport_items",
+                                                                              sourcePath,
+                                                                              viewportItemsRaw,
+                                                                              expectedViewportItemCount,
+                                                                              outViewportItemCount,
+                                                                              viewportInteractiveCount,
+                                                                              viewportSourceBackedCount,
+                                                                              viewportTextPayloadCount,
+                                                                              viewportStylePayloadCount,
+                                                                              viewportItemsOk)
+    if !viewportItemsOk:
+        return false
+    outViewportTextPayloadItemCount = viewportTextPayloadCount
+    outViewportStylePayloadItemCount = viewportStylePayloadCount
+    catalog = catalog + "  \"text_payload_item_count\": " + intToStr(outTextPayloadItemCount) + ",\n"
+    catalog = catalog + "  \"style_payload_item_count\": " + intToStr(outStylePayloadItemCount) + ",\n"
+    catalog = catalog + "  \"viewport_text_payload_item_count\": " + intToStr(outViewportTextPayloadItemCount) + ",\n"
+    catalog = catalog + "  \"viewport_style_payload_item_count\": " + intToStr(outViewportStylePayloadItemCount) + ",\n"
+    catalog = catalog + itemsJson + ",\n"
+    catalog = catalog + viewportItemsJson + "\n"
+    catalog = catalog + "}\n"
+    if outInteractiveItemCount != expectedInteractiveItemCount:
+        r2cControllerPrintErr("r2c-react-v3: native layout typed catalog interactive count mismatch expected=" + intToStr(expectedInteractiveItemCount) + " actual=" + intToStr(outInteractiveItemCount) + " source=" + sourcePath)
+        return false
+    if outSourceBackedItemCount != expectedSourceBackedItemCount:
+        r2cControllerPrintErr("r2c-react-v3: native layout typed catalog source-backed count mismatch expected=" + intToStr(expectedSourceBackedItemCount) + " actual=" + intToStr(outSourceBackedItemCount) + " source=" + sourcePath)
+        return false
+    if !v3path.V3WriteTextFile("", catalogPath, catalog):
+        r2cControllerPrintErr("r2c-react-v3: native layout typed catalog write failed: " + catalogPath)
+        return false
+    return true
+
 fn r2cControllerCsvAppend(csvText: str,
                           item: str): str =
     if strings.Len(item) <= 0:
@@ -636,6 +984,265 @@ fn r2cControllerJsonStringifyStringValue(value: str): str =
 
 fn r2cControllerJsonStringifyBoolValue(value: bool): str =
     return r2cControllerJsonBool(value)
+
+fn r2cControllerEnsureTrailingNewline(textRaw: str): str =
+    let text: str = textRaw
+    if strings.Len(text) <= 0:
+        return "\n"
+    let lastIndex: int32 = strings.Len(text) - 1
+    if text[lastIndex] == '\n':
+        return text
+    return text + "\n"
+
+fn r2cControllerSummaryLineHasKey(line: str,
+                                  key: str): bool =
+    let prefix: str = key + "="
+    let prefixLen: int32 = strings.Len(prefix)
+    if strings.Len(line) < prefixLen:
+        return false
+    return r2cControllerSlice(line, 0, prefixLen) == prefix
+
+fn r2cControllerSummaryLineMatchesAny(line: str,
+                                      keys: str[]): bool =
+    for i in 0..<keys.len:
+        if r2cControllerSummaryLineHasKey(line, keys[i]):
+            return true
+    return false
+
+fn r2cControllerSummaryStripKeys(text: str,
+                                 keys: str[]): str =
+    if keys.len <= 0:
+        return text
+    let total: int32 = strings.Len(text)
+    var out: str
+    var start: int32
+    for i in 0..total:
+        var endHit = false
+        if i == total:
+            endHit = true
+        elif text[i] == '\n':
+            endHit = true
+        if !endHit:
+            continue
+        let lineLen: int32 = i - start
+        let line: str = r2cControllerSlice(text, start, lineLen)
+        if !r2cControllerSummaryLineMatchesAny(line, keys):
+            out = out + line + "\n"
+        start = i + 1
+    return out
+
+fn r2cControllerJsonAppendRootFields(docRaw: str,
+                                     fieldsDoc: str): str =
+    let doc: str = strutil.Strip(docRaw)
+    let total: int32 = strings.Len(doc)
+    if total <= 0:
+        return ""
+    if doc[total - 1] != char(125):
+        return ""
+    let body: str = r2cControllerSlice(doc, 0, total - 1)
+    return body + ",\n" + fieldsDoc + "\n}\n"
+
+fn r2cControllerWriteRuntimeContractWithTypedCatalog(contractPath: str,
+                                                     typedCatalogPath: str,
+                                                     itemCountText: str,
+                                                     viewportItemCountText: str,
+                                                     interactiveItemCountText: str,
+                                                     sourceBackedItemCountText: str): bool =
+    if strings.Len(contractPath) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: runtime contract path missing")
+        return false
+    if !v3path.V3PathFileExists(contractPath):
+        r2cControllerPrintErr("r2c-react-v3: runtime contract missing: " + contractPath)
+        return false
+    let contractText: str = v3path.V3ReadTextFile("", contractPath)
+    if r2cControllerJsonReadStringField(contractText, "format", "") != "native_gui_runtime_contract_v1":
+        r2cControllerPrintErr("r2c-react-v3: runtime contract format mismatch: " + contractPath)
+        return false
+    var fieldsDoc = "  \"runtime_item_source_mode\": \"typed_item_catalog_contract_v1\",\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_path\": " + r2cControllerJsonQuote(typedCatalogPath) + ",\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_ready\": true,\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_format\": \"native_layout_item_catalog_v1\",\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_publish_mode\": \"cheng_streamed_typed_layout_items_v1\",\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_payload_profile\": \"cheng_runtime_layout_item_payload_v1\",\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_text_payload_ready\": true,\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_style_payload_ready\": true,\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_item_count\": " + itemCountText + ",\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_viewport_item_count\": " + viewportItemCountText + ",\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_interactive_item_count\": " + interactiveItemCountText + ",\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog_source_backed_item_count\": " + sourceBackedItemCountText + ",\n"
+    fieldsDoc = fieldsDoc + "  \"typed_item_catalog\": {\n"
+    fieldsDoc = fieldsDoc + "    \"path\": " + r2cControllerJsonQuote(typedCatalogPath) + ",\n"
+    fieldsDoc = fieldsDoc + "    \"ready\": true,\n"
+    fieldsDoc = fieldsDoc + "    \"format\": \"native_layout_item_catalog_v1\",\n"
+    fieldsDoc = fieldsDoc + "    \"publish_mode\": \"cheng_streamed_typed_layout_items_v1\",\n"
+    fieldsDoc = fieldsDoc + "    \"payload_profile\": \"cheng_runtime_layout_item_payload_v1\",\n"
+    fieldsDoc = fieldsDoc + "    \"text_payload_ready\": true,\n"
+    fieldsDoc = fieldsDoc + "    \"style_payload_ready\": true,\n"
+    fieldsDoc = fieldsDoc + "    \"item_count\": " + itemCountText + ",\n"
+    fieldsDoc = fieldsDoc + "    \"viewport_item_count\": " + viewportItemCountText + ",\n"
+    fieldsDoc = fieldsDoc + "    \"interactive_item_count\": " + interactiveItemCountText + ",\n"
+    fieldsDoc = fieldsDoc + "    \"source_backed_item_count\": " + sourceBackedItemCountText + "\n"
+    fieldsDoc = fieldsDoc + "  }"
+    let nextText: str = r2cControllerJsonAppendRootFields(contractText, fieldsDoc)
+    if strings.Len(nextText) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: runtime contract append failed: " + contractPath)
+        return false
+    if !v3path.V3WriteTextFile("", contractPath, nextText):
+        r2cControllerPrintErr("r2c-react-v3: runtime contract write failed: " + contractPath)
+        return false
+    return true
+
+fn r2cControllerWritePayloadSourceCopy(copyPath: str,
+                                       sourcePath: str,
+                                       sourceText: str,
+                                       label: str): bool =
+    if strings.Len(copyPath) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: " + label + " source copy path missing")
+        return false
+    if !v3path.V3WriteTextFile("", copyPath, r2cControllerEnsureTrailingNewline(sourceText)):
+        r2cControllerPrintErr("r2c-react-v3: " + label + " source copy write failed: " + copyPath + " source=" + sourcePath)
+        return false
+    return true
+
+fn r2cControllerRepublishStyleLayoutSurfacePayload(styleLayoutSurfacePath: str,
+                                                   sourcePayloadPath: str,
+                                                   layoutSurfacePath: str,
+                                                   routeState: str,
+                                                   sourceModulePath: str,
+                                                   sourceComponentName: str,
+                                                   nodePayloadHelper: str,
+                                                   sourceText: str,
+                                                   readyText: str,
+                                                   nodeCountText: str,
+                                                   overlayNodeCountText: str,
+                                                   surfaceNodeCountText: str,
+                                                   controlNodeCountText: str): bool =
+    let visualRoleHistogramRaw: str = r2cControllerJsonReadObjectFieldRaw(sourceText, "visual_role_histogram", "")
+    if strings.Len(visualRoleHistogramRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: style layout payload missing visual_role_histogram: " + sourcePayloadPath)
+        return false
+    let layoutRoleHistogramRaw: str = r2cControllerJsonReadObjectFieldRaw(sourceText, "layout_role_histogram", "")
+    if strings.Len(layoutRoleHistogramRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: style layout payload missing layout_role_histogram: " + sourcePayloadPath)
+        return false
+    let densityHistogramRaw: str = r2cControllerJsonReadObjectFieldRaw(sourceText, "density_histogram", "")
+    if strings.Len(densityHistogramRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: style layout payload missing density_histogram: " + sourcePayloadPath)
+        return false
+    let nodesRaw: str = r2cControllerJsonReadArrayFieldRaw(sourceText, "nodes", "")
+    if strings.Len(nodesRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: style layout payload missing nodes[]: " + sourcePayloadPath)
+        return false
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"style_layout_surface_v1\",\n"
+    doc = doc + "  \"controller\": \"cheng.live_controller\",\n"
+    doc = doc + "  \"finalizer\": \"cheng_controller_layout_payload_finalizer_v1\",\n"
+    doc = doc + "  \"publish_mode\": \"cheng_controller_republished_payload_v1\",\n"
+    doc = doc + "  \"node_payload_helper\": " + r2cControllerJsonQuote(nodePayloadHelper) + ",\n"
+    doc = doc + "  \"source_payload_path\": " + r2cControllerJsonQuote(sourcePayloadPath) + ",\n"
+    doc = doc + "  \"source_layout_surface_path\": " + r2cControllerJsonQuote(layoutSurfacePath) + ",\n"
+    doc = doc + "  \"route_state\": " + r2cControllerJsonQuote(routeState) + ",\n"
+    doc = doc + "  \"source_module_path\": " + r2cControllerJsonQuote(sourceModulePath) + ",\n"
+    doc = doc + "  \"source_component_name\": " + r2cControllerJsonQuote(sourceComponentName) + ",\n"
+    doc = doc + "  \"ready\": " + r2cControllerJsonBoolTextOrFalse(readyText) + ",\n"
+    doc = doc + "  \"node_count\": " + nodeCountText + ",\n"
+    doc = doc + "  \"overlay_node_count\": " + overlayNodeCountText + ",\n"
+    doc = doc + "  \"surface_node_count\": " + surfaceNodeCountText + ",\n"
+    doc = doc + "  \"control_node_count\": " + controlNodeCountText + ",\n"
+    doc = doc + "  \"visual_role_histogram\": " + visualRoleHistogramRaw + ",\n"
+    doc = doc + "  \"layout_role_histogram\": " + layoutRoleHistogramRaw + ",\n"
+    doc = doc + "  \"density_histogram\": " + densityHistogramRaw + ",\n"
+    doc = doc + "  \"nodes\": " + nodesRaw + "\n"
+    doc = doc + "}\n"
+    if !v3path.V3WriteTextFile("", styleLayoutSurfacePath, doc):
+        r2cControllerPrintErr("r2c-react-v3: style layout payload republish failed: " + styleLayoutSurfacePath)
+        return false
+    return true
+
+fn r2cControllerRepublishNativeLayoutPlanPayload(nativeLayoutPlanPath: str,
+                                                 sourcePayloadPath: str,
+                                                 layoutSurfacePath: str,
+                                                 styleLayoutSurfacePath: str,
+                                                 typedCatalogPath: str,
+                                                 routeState: str,
+                                                 nodePayloadHelper: str,
+                                                 sourceText: str,
+                                                 readyText: str,
+                                                 layoutPolicySource: str,
+                                                 windowWidthText: str,
+                                                 windowHeightText: str,
+                                                 contentStartYText: str,
+                                                 contentHeightText: str,
+                                                 scrollHeightText: str,
+                                                 itemCountText: str,
+                                                 viewportItemCountText: str,
+                                                 clippedItemCountText: str,
+                                                 overlayItemCountText: str,
+                                                 interactiveItemCountText: str,
+                                                 sourceBackedItemCountText: str,
+                                                 columnCountText: str,
+                                                 layoutPolicyRaw: str,
+                                                 itemsRaw: str,
+                                                 viewportItemsRaw: str): bool =
+    let entryModule: str = r2cControllerJsonReadStringField(sourceText, "entry_module", "")
+    if strings.Len(entryModule) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native layout payload missing entry_module: " + sourcePayloadPath)
+        return false
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_layout_plan_v1\",\n"
+    doc = doc + "  \"controller\": \"cheng.live_controller\",\n"
+    doc = doc + "  \"finalizer\": \"cheng_controller_layout_payload_finalizer_v1\",\n"
+    doc = doc + "  \"publish_mode\": \"cheng_controller_republished_payload_v1\",\n"
+    doc = doc + "  \"node_payload_helper\": " + r2cControllerJsonQuote(nodePayloadHelper) + ",\n"
+    doc = doc + "  \"source_payload_path\": " + r2cControllerJsonQuote(sourcePayloadPath) + ",\n"
+    doc = doc + "  \"typed_item_catalog_path\": " + r2cControllerJsonQuote(typedCatalogPath) + ",\n"
+    doc = doc + "  \"typed_item_catalog_ready\": true,\n"
+    doc = doc + "  \"typed_item_catalog_publish_mode\": \"cheng_streamed_typed_layout_items_v1\",\n"
+    doc = doc + "  \"typed_item_catalog_payload_profile\": \"cheng_runtime_layout_item_payload_v1\",\n"
+    doc = doc + "  \"route_state\": " + r2cControllerJsonQuote(routeState) + ",\n"
+    doc = doc + "  \"entry_module\": " + r2cControllerJsonQuote(entryModule) + ",\n"
+    doc = doc + "  \"layout_policy_source\": " + r2cControllerJsonQuote(layoutPolicySource) + ",\n"
+    doc = doc + "  \"source_layout_surface_path\": " + r2cControllerJsonQuote(layoutSurfacePath) + ",\n"
+    doc = doc + "  \"source_style_layout_surface_path\": " + r2cControllerJsonQuote(styleLayoutSurfacePath) + ",\n"
+    doc = doc + "  \"ready\": " + r2cControllerJsonBoolTextOrFalse(readyText) + ",\n"
+    doc = doc + "  \"window_width\": " + windowWidthText + ",\n"
+    doc = doc + "  \"window_height\": " + windowHeightText + ",\n"
+    doc = doc + "  \"content_start_y\": " + contentStartYText + ",\n"
+    doc = doc + "  \"content_height\": " + contentHeightText + ",\n"
+    doc = doc + "  \"scroll_height\": " + scrollHeightText + ",\n"
+    doc = doc + "  \"item_count\": " + itemCountText + ",\n"
+    doc = doc + "  \"viewport_item_count\": " + viewportItemCountText + ",\n"
+    doc = doc + "  \"clipped_item_count\": " + clippedItemCountText + ",\n"
+    doc = doc + "  \"overlay_item_count\": " + overlayItemCountText + ",\n"
+    doc = doc + "  \"interactive_item_count\": " + interactiveItemCountText + ",\n"
+    doc = doc + "  \"source_backed_item_count\": " + sourceBackedItemCountText + ",\n"
+    doc = doc + "  \"column_count\": " + columnCountText + ",\n"
+    doc = doc + "  \"layout_policy\": " + layoutPolicyRaw + ",\n"
+    doc = doc + "  \"items\": " + itemsRaw + ",\n"
+    doc = doc + "  \"viewport_items\": " + viewportItemsRaw + "\n"
+    doc = doc + "}\n"
+    if !v3path.V3WriteTextFile("", nativeLayoutPlanPath, doc):
+        r2cControllerPrintErr("r2c-react-v3: native layout payload republish failed: " + nativeLayoutPlanPath)
+        return false
+    return true
+
+fn r2cControllerRunCompiledRuntimeLogged(root: str,
+                                         runtimeExePath: str,
+                                         runtimeContractPath: str,
+                                         logPath: str,
+                                         exitCodeOut: var int32,
+                                         outputOut: var str): bool =
+    var argv: str[]
+    add(argv, "--runtime-contract")
+    add(argv, runtimeContractPath)
+    return r2cproc.r2cProcessRunFileLogged(root,
+                                           "r2c-react-v3 compiled runtime",
+                                           runtimeExePath,
+                                           argv,
+                                           root,
+                                           logPath,
+                                           exitCodeOut,
+                                           outputOut)
 
 fn r2cControllerJsonStringifyIntValue(value: int32): str =
     return intToStr(value)
@@ -1502,6 +2109,312 @@ fn r2cControllerJsonArrayFromCsv(csvText: str): str =
         start = i + 1
     out = out + "]"
     return out
+
+fn r2cControllerSummaryAppendLine(summaryText: var str,
+                                  key: str,
+                                  value: str) =
+    summaryText = summaryText + key + "=" + value + "\n"
+
+fn r2cControllerLoggedCommandMetadata(label: str,
+                                      filePath: str,
+                                      argv: str[],
+                                      exitCode: int32,
+                                      output: str): str =
+    var text = ""
+    text = text + "label=" + label + "\n"
+    text = text + "file=" + filePath + "\n"
+    text = text + "exit=" + intToStr(exitCode) + "\n"
+    for i in 0..<argv.len:
+        text = text + "arg_" + intToStr(i) + "=" + argv[i] + "\n"
+    let outputText: str = r2cControllerEnsureTrailingNewline(output)
+    if strings.Len(outputText) > 0:
+        text = text + outputText
+    return text
+
+fn r2cControllerJsonScopeOrSelf(docText: str,
+                                objectKey: str): str =
+    if strings.Len(objectKey) <= 0:
+        return docText
+    return r2cControllerJsonReadObjectFieldRaw(docText, objectKey, "")
+
+fn r2cControllerSummaryValueOrDocString(summaryPath: str,
+                                        key: str,
+                                        docText: str,
+                                        objectKey: str,
+                                        fieldKey: str,
+                                        fallback: str): str =
+    let summaryValue: str = r2cControllerReadSummaryValue(summaryPath, key, "")
+    if strings.Len(summaryValue) > 0:
+        return summaryValue
+    let scopeText: str = r2cControllerJsonScopeOrSelf(docText, objectKey)
+    if strings.Len(scopeText) > 0:
+        if r2cControllerJsonHasField(scopeText, fieldKey):
+            return r2cControllerJsonReadStringField(scopeText, fieldKey, "")
+    return fallback
+
+fn r2cControllerSummaryValueOrDocBoolText(summaryPath: str,
+                                          key: str,
+                                          docText: str,
+                                          objectKey: str,
+                                          fieldKey: str,
+                                          fallbackText: str): str =
+    let summaryValue: str = r2cControllerReadSummaryValue(summaryPath, key, "")
+    if summaryValue == "true" || summaryValue == "false":
+        return summaryValue
+    let scopeText: str = r2cControllerJsonScopeOrSelf(docText, objectKey)
+    if strings.Len(scopeText) > 0:
+        if r2cControllerJsonHasField(scopeText, fieldKey):
+            return r2cControllerJsonBool(r2cControllerJsonReadBoolField(scopeText, fieldKey, false))
+    return fallbackText
+
+fn r2cControllerSummaryValueOrDocIntText(summaryPath: str,
+                                         key: str,
+                                         docText: str,
+                                         objectKey: str,
+                                         fieldKey: str,
+                                         fallbackText: str): str =
+    let summaryValue: str = r2cControllerReadSummaryValue(summaryPath, key, "")
+    if strings.Len(summaryValue) > 0:
+        return summaryValue
+    let scopeText: str = r2cControllerJsonScopeOrSelf(docText, objectKey)
+    if strings.Len(scopeText) > 0:
+        if r2cControllerJsonHasField(scopeText, fieldKey):
+            return intToStr(r2cControllerJsonReadIntField(scopeText, fieldKey, 0))
+    return fallbackText
+
+fn r2cControllerJsonFindObjectByStringField(arrayText: str,
+                                            fieldKey: str,
+                                            targetValue: str,
+                                            itemRaw: var str): bool =
+    itemRaw = ""
+    if strings.Len(targetValue) <= 0:
+        return false
+    var cursor: int32
+    var nextCursor: int32
+    var candidateRaw: str
+    while r2cControllerJsonArrayNextObjectRaw(arrayText, cursor, candidateRaw, nextCursor):
+        let candidateValue: str = r2cControllerJsonReadStringField(candidateRaw, fieldKey, "")
+        if candidateValue == targetValue:
+            itemRaw = candidateRaw
+            return true
+        cursor = nextCursor
+    return false
+
+fn r2cControllerJsonRawOrNull(raw: str): str =
+    if strings.Len(raw) <= 0:
+        return "null"
+    return raw
+
+fn r2cControllerRunNativeGuiResolvedTargetPath(repoRoot: str,
+                                               hitSourceModulePath: str,
+                                               sourceJumpTargetPath: str): str =
+    if strings.Len(sourceJumpTargetPath) > 0:
+        return sourceJumpTargetPath
+    if strings.Len(repoRoot) > 0 && strings.Len(hitSourceModulePath) > 0:
+        return v3path.V3PathAbsolute(repoRoot, hitSourceModulePath)
+    return ""
+
+fn r2cControllerRunNativeGuiResolvedTargetLine(hitSourceLineText: str,
+                                               sourceJumpTargetLineText: str): int32 =
+    var targetLine: int32 = r2cControllerParseInt32(sourceJumpTargetLineText)
+    if targetLine > 0:
+        return targetLine
+    targetLine = r2cControllerParseInt32(hitSourceLineText)
+    if targetLine > 0:
+        return targetLine
+    return 1
+
+fn r2cControllerWriteNativeGuiRunHitInspector(summaryPath: str,
+                                              sessionPath: str,
+                                              outPath: str,
+                                              readyOut: var bool): bool =
+    readyOut = false
+    if !v3path.V3PathFileExists(sessionPath):
+        r2cControllerPrintErr("r2c-react-v3: native gui hit inspector missing session: " + sessionPath)
+        return false
+    let sessionText: str = v3path.V3ReadTextFile("", sessionPath)
+    let nativeLayoutPlanText: str = r2cControllerJsonReadObjectFieldRaw(sessionText, "native_layout_plan", "")
+    let layoutSurfaceText: str = r2cControllerJsonReadObjectFieldRaw(sessionText, "layout_surface", "")
+    let styleLayoutSurfaceText: str = r2cControllerJsonReadObjectFieldRaw(sessionText, "style_layout_surface", "")
+    let layoutItemsText: str = r2cControllerJsonReadArrayFieldRaw(nativeLayoutPlanText, "items", "[]")
+    let layoutNodesText: str = r2cControllerJsonReadArrayFieldRaw(layoutSurfaceText, "nodes", "[]")
+    let styleNodesText: str = r2cControllerJsonReadArrayFieldRaw(styleLayoutSurfaceText, "nodes", "[]")
+    let hitItemId: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_item_id", "")
+    let hitSourceNodeIdSummary: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_node_id", "")
+    var layoutItemRaw: str
+    let layoutItemFound: bool = r2cControllerJsonFindObjectByStringField(layoutItemsText, "id", hitItemId, layoutItemRaw)
+    var sourceNodeId: str = hitSourceNodeIdSummary
+    if strings.Len(sourceNodeId) <= 0 && layoutItemFound:
+        sourceNodeId = r2cControllerJsonReadStringField(layoutItemRaw, "source_node_id", "")
+    var sourceNodeRaw: str
+    let sourceNodeFound: bool = r2cControllerJsonFindObjectByStringField(layoutNodesText, "id", sourceNodeId, sourceNodeRaw)
+    sourceNodeFound
+    var styleNodeRaw: str
+    let styleNodeFound: bool = r2cControllerJsonFindObjectByStringField(styleNodesText, "node_id", sourceNodeId, styleNodeRaw)
+    styleNodeFound
+    var reason: str = "ok"
+    if strings.Len(hitItemId) <= 0:
+        reason = "no_hit_item"
+    elif !layoutItemFound:
+        reason = "layout_item_missing"
+    readyOut = layoutItemFound
+    let scrollOffsetYText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_scroll_offset_y", "")
+    let lastClickXText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_last_click_x", "")
+    let lastClickYText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_last_click_y", "")
+    let hitSourceLineText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_line", "0")
+    let hitItemInteractiveText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_item_interactive", "")
+    let sourceJumpEnabledText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_enabled", "")
+    let sourceJumpAttemptedText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_attempted", "")
+    let sourceJumpOkText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_ok", "")
+    let sourceJumpTargetPath: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_target_path", "")
+    let sourceJumpTargetLineText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_target_line", "0")
+    let sourceJumpCommand: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_command", "")
+    let sourceJumpError: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_error", "")
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_gui_hit_inspector_v1\",\n"
+    doc = doc + "  \"ready\": " + r2cControllerJsonBool(readyOut) + ",\n"
+    doc = doc + "  \"reason\": " + r2cControllerJsonQuote(reason) + ",\n"
+    doc = doc + "  \"route_state\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_route_state", "")) + ",\n"
+    doc = doc + "  \"entry_module\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_entry_module", "")) + ",\n"
+    doc = doc + "  \"native_layout_plan_policy_source\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_native_layout_plan_policy_source", "")) + ",\n"
+    if strings.Len(scrollOffsetYText) > 0:
+        doc = doc + "  \"scroll_offset_y\": " + scrollOffsetYText + ",\n"
+    else:
+        doc = doc + "  \"scroll_offset_y\": null,\n"
+    doc = doc + "  \"click_count\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_click_count", "0") + ",\n"
+    if strings.Len(lastClickXText) > 0:
+        doc = doc + "  \"last_click_x\": " + lastClickXText + ",\n"
+    else:
+        doc = doc + "  \"last_click_x\": null,\n"
+    if strings.Len(lastClickYText) > 0:
+        doc = doc + "  \"last_click_y\": " + lastClickYText + ",\n"
+    else:
+        doc = doc + "  \"last_click_y\": null,\n"
+    doc = doc + "  \"hit_item_id\": " + r2cControllerJsonQuote(hitItemId) + ",\n"
+    doc = doc + "  \"hit_source_node_id\": " + r2cControllerJsonQuote(sourceNodeId) + ",\n"
+    doc = doc + "  \"hit_source_module_path\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_module_path", "")) + ",\n"
+    doc = doc + "  \"hit_source_component_name\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_component_name", "")) + ",\n"
+    doc = doc + "  \"hit_source_line\": " + r2cControllerJsonIntTextOrNull(hitSourceLineText) + ",\n"
+    doc = doc + "  \"hit_item_interactive\": " + r2cControllerJsonBoolTextOrFalse(hitItemInteractiveText) + ",\n"
+    doc = doc + "  \"source_jump\": {\n"
+    doc = doc + "    \"enabled\": " + r2cControllerJsonBoolTextOrFalse(sourceJumpEnabledText) + ",\n"
+    doc = doc + "    \"attempted\": " + r2cControllerJsonBoolTextOrFalse(sourceJumpAttemptedText) + ",\n"
+    doc = doc + "    \"ok\": " + r2cControllerJsonBoolTextOrFalse(sourceJumpOkText) + ",\n"
+    doc = doc + "    \"target_path\": " + r2cControllerJsonQuote(sourceJumpTargetPath) + ",\n"
+    doc = doc + "    \"target_line\": " + r2cControllerJsonIntTextOrNull(sourceJumpTargetLineText) + ",\n"
+    doc = doc + "    \"command\": " + r2cControllerJsonQuote(sourceJumpCommand) + ",\n"
+    doc = doc + "    \"error\": " + r2cControllerJsonQuote(sourceJumpError) + "\n"
+    doc = doc + "  },\n"
+    doc = doc + "  \"layout_item\": " + r2cControllerJsonRawOrNull(layoutItemRaw) + ",\n"
+    doc = doc + "  \"source_node\": " + r2cControllerJsonRawOrNull(sourceNodeRaw) + ",\n"
+    doc = doc + "  \"style_node\": " + r2cControllerJsonRawOrNull(styleNodeRaw) + "\n"
+    doc = doc + "}\n"
+    if !v3path.V3WriteTextFile("", outPath, doc):
+        r2cControllerPrintErr("r2c-react-v3: native gui hit inspector write failed: " + outPath)
+        return false
+    return true
+
+fn r2cControllerWriteNativeGuiRunInspectorState(repoRoot: str,
+                                                bundlePath: str,
+                                                sessionPath: str,
+                                                screenshotPath: str,
+                                                summaryPath: str,
+                                                hitInspectorPath: str,
+                                                outPath: str,
+                                                readyOut: var bool): bool =
+    readyOut = false
+    if !v3path.V3PathFileExists(sessionPath):
+        r2cControllerPrintErr("r2c-react-v3: native gui inspector state missing session: " + sessionPath)
+        return false
+    let sessionText: str = v3path.V3ReadTextFile("", sessionPath)
+    let sessionPreviewMode: str = r2cControllerJsonReadStringField(sessionText, "preview_mode", "")
+    let inspectorReadyText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_ready", "")
+    let hitInspectorReadyText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_inspector_ready", "")
+    readyOut = inspectorReadyText == "true"
+    var reason: str = "hit_missing"
+    if readyOut:
+        reason = "ok"
+    elif hitInspectorReadyText == "true":
+        reason = "panel_missing"
+    let hitSourceModulePath: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_module_path", "")
+    let hitSourceLineText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_line", "0")
+    let sourceJumpTargetPathRaw: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_target_path", "")
+    let sourceJumpTargetLineTextRaw: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_target_line", "0")
+    let resolvedTargetPath: str = r2cControllerRunNativeGuiResolvedTargetPath(repoRoot, hitSourceModulePath, sourceJumpTargetPathRaw)
+    let resolvedTargetLine: int32 = r2cControllerRunNativeGuiResolvedTargetLine(hitSourceLineText, sourceJumpTargetLineTextRaw)
+    let panelLinesJson: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_lines_json", "[]")
+    var hitInspectorJson: str = "null"
+    if v3path.V3PathFileExists(hitInspectorPath):
+        hitInspectorJson = r2cControllerEnsureTrailingNewline(v3path.V3ReadTextFile("", hitInspectorPath))
+        hitInspectorJson = strutil.Strip(hitInspectorJson)
+        if strings.Len(hitInspectorJson) <= 0:
+            hitInspectorJson = "null"
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_gui_inspector_state_v1\",\n"
+    doc = doc + "  \"ready\": " + r2cControllerJsonBool(readyOut) + ",\n"
+    doc = doc + "  \"reason\": " + r2cControllerJsonQuote(reason) + ",\n"
+    doc = doc + "  \"repo_root\": " + r2cControllerJsonQuote(repoRoot) + ",\n"
+    doc = doc + "  \"bundle_path\": " + r2cControllerJsonQuote(bundlePath) + ",\n"
+    doc = doc + "  \"session_path\": " + r2cControllerJsonQuote(sessionPath) + ",\n"
+    doc = doc + "  \"screenshot_path\": " + r2cControllerJsonQuote(screenshotPath) + ",\n"
+    doc = doc + "  \"hit_inspector_path\": " + r2cControllerJsonQuote(hitInspectorPath) + ",\n"
+    doc = doc + "  \"window\": {\n"
+    doc = doc + "    \"title\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_window_title", "")) + ",\n"
+    doc = doc + "    \"width\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_window_width", "0") + ",\n"
+    doc = doc + "    \"height\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_window_height", "0") + ",\n"
+    doc = doc + "    \"route_state\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_route_state", "")) + ",\n"
+    doc = doc + "    \"entry_module\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_entry_module", "")) + ",\n"
+    if strings.Len(r2cControllerReadSummaryValue(summaryPath, "native_gui_scroll_offset_y", "")) > 0:
+        doc = doc + "    \"scroll_offset_y\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_scroll_offset_y", "") + ",\n"
+    else:
+        doc = doc + "    \"scroll_offset_y\": null,\n"
+    doc = doc + "    \"click_count\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_click_count", "0") + ",\n"
+    doc = doc + "    \"resize_count\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_resize_count", "0") + ",\n"
+    doc = doc + "    \"scroll_count\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_scroll_count", "0") + ",\n"
+    if strings.Len(r2cControllerReadSummaryValue(summaryPath, "native_gui_last_click_x", "")) > 0:
+        doc = doc + "    \"last_click_x\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_last_click_x", "") + ",\n"
+    else:
+        doc = doc + "    \"last_click_x\": null,\n"
+    if strings.Len(r2cControllerReadSummaryValue(summaryPath, "native_gui_last_click_y", "")) > 0:
+        doc = doc + "    \"last_click_y\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_last_click_y", "") + "\n"
+    else:
+        doc = doc + "    \"last_click_y\": null\n"
+    doc = doc + "  },\n"
+    doc = doc + "  \"hit\": {\n"
+    doc = doc + "    \"item_id\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_item_id", "")) + ",\n"
+    doc = doc + "    \"source_node_id\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_node_id", "")) + ",\n"
+    doc = doc + "    \"source_module_path\": " + r2cControllerJsonQuote(hitSourceModulePath) + ",\n"
+    doc = doc + "    \"source_component_name\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_component_name", "")) + ",\n"
+    doc = doc + "    \"source_line\": " + r2cControllerJsonIntTextOrNull(hitSourceLineText) + ",\n"
+    doc = doc + "    \"item_interactive\": " + r2cControllerJsonBoolTextOrFalse(r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_item_interactive", "")) + "\n"
+    doc = doc + "  },\n"
+    doc = doc + "  \"panel\": {\n"
+    doc = doc + "    \"ready\": " + r2cControllerJsonBoolTextOrFalse(inspectorReadyText) + ",\n"
+    doc = doc + "    \"title\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_title", "")) + ",\n"
+    doc = doc + "    \"frame\": {\n"
+    doc = doc + "      \"x\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_panel_x", "0") + ",\n"
+    doc = doc + "      \"y\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_panel_y", "0") + ",\n"
+    doc = doc + "      \"width\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_panel_width", "0") + ",\n"
+    doc = doc + "      \"height\": " + r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_panel_height", "0") + "\n"
+    doc = doc + "    },\n"
+    doc = doc + "    \"lines\": " + panelLinesJson + "\n"
+    doc = doc + "  },\n"
+    doc = doc + "  \"source_jump\": {\n"
+    doc = doc + "    \"enabled\": " + r2cControllerJsonBoolTextOrFalse(r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_enabled", "")) + ",\n"
+    doc = doc + "    \"attempted\": " + r2cControllerJsonBoolTextOrFalse(r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_attempted", "")) + ",\n"
+    doc = doc + "    \"ok\": " + r2cControllerJsonBoolTextOrFalse(r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_ok", "")) + ",\n"
+    doc = doc + "    \"target_path\": " + r2cControllerJsonQuote(resolvedTargetPath) + ",\n"
+    doc = doc + "    \"target_line\": " + intToStr(resolvedTargetLine) + ",\n"
+    doc = doc + "    \"command\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_command", "")) + ",\n"
+    doc = doc + "    \"error\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(summaryPath, "native_gui_source_jump_error", "")) + "\n"
+    doc = doc + "  },\n"
+    doc = doc + "  \"hit_inspector\": " + hitInspectorJson + ",\n"
+    doc = doc + "  \"session_preview_mode\": " + r2cControllerJsonQuote(sessionPreviewMode) + "\n"
+    doc = doc + "}\n"
+    if !v3path.V3WriteTextFile("", outPath, doc):
+        r2cControllerPrintErr("r2c-react-v3: native gui inspector state write failed: " + outPath)
+        return false
+    return true
 
 fn r2cControllerShellQuoteSimple(text: str): str =
     return "'" + text + "'"
@@ -3439,28 +4352,28 @@ fn r2cControllerNativeGuiBundle(root: str,
     let nativeLayoutPlanSourceBackedItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_source_backed_item_count", "0")
     let nativeLayoutPlanScrollHeightText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_scroll_height", "0")
     let nativeRenderPlanPath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_render_plan_path", "")
-    let nativeRenderPlanReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_render_plan_ready", "")
-    let nativeRenderPlanCommandCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_render_plan_command_count", "0")
-    let nativeRenderPlanVisibleLayoutItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_render_plan_visible_layout_item_count", "0")
+    var nativeRenderPlanReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_render_plan_ready", "")
+    var nativeRenderPlanCommandCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_render_plan_command_count", "0")
+    var nativeRenderPlanVisibleLayoutItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_render_plan_visible_layout_item_count", "0")
     let nativeRuntimePath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_path", "")
-    let nativeRuntimeReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_ready", "")
+    var nativeRuntimeReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_ready", "")
     let nativeRuntimeStatePath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_state_path", "")
     let nativeRuntimeExePath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_exe_path", "")
     let nativeRuntimeLauncherExePath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_launcher_exe_path", "")
     let nativeRuntimeCompiledExePath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_compiled_exe_path", "")
     let nativeRuntimeContractPath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_path", "")
     let nativeRuntimeMode: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_mode", "")
-    let nativeRuntimeBundleReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_ready", "")
-    let nativeRuntimeContractReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_ready", "")
-    let nativeRuntimeBundleRouteState: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_route_state", routeState)
-    let nativeRuntimeBundleRouteCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_route_count", "0")
-    let nativeRuntimeBundleSupportedCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_supported_count", "0")
-    let nativeRuntimeBundleSemanticNodesCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_semantic_nodes_count", "0")
-    let nativeRuntimeBundleLayoutItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_layout_item_count", "0")
-    let nativeRuntimeBundleRenderCommandCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_render_command_count", "0")
-    let nativeRuntimeContractLayoutItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_layout_item_count", "0")
-    let nativeRuntimeContractViewportItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_viewport_item_count", "0")
-    let nativeRuntimeContractInteractiveItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_interactive_item_count", "0")
+    var nativeRuntimeBundleReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_ready", "")
+    var nativeRuntimeContractReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_ready", "")
+    var nativeRuntimeBundleRouteState: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_route_state", routeState)
+    var nativeRuntimeBundleRouteCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_route_count", "0")
+    var nativeRuntimeBundleSupportedCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_supported_count", "0")
+    var nativeRuntimeBundleSemanticNodesCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_semantic_nodes_count", "0")
+    var nativeRuntimeBundleLayoutItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_layout_item_count", "0")
+    var nativeRuntimeBundleRenderCommandCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_render_command_count", "0")
+    var nativeRuntimeContractLayoutItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_layout_item_count", "0")
+    var nativeRuntimeContractViewportItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_viewport_item_count", "0")
+    var nativeRuntimeContractInteractiveItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_interactive_item_count", "0")
     let reportModuleCountText: str = r2cControllerReadSummaryValue(codegenSummaryPath, "module_count", r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0"))
     let reportRouteCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "route_count", r2cControllerReadSummaryValue(codegenSummaryPath, "route_count", "0"))
     let reportSupportedCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "supported_count", nativeRuntimeBundleSupportedCountText)
@@ -3478,6 +4391,19 @@ fn r2cControllerNativeGuiBundle(root: str,
     let nativeGuiLayoutPayloadFinalizer: str = "cheng_controller_layout_payload_finalizer_v1"
     let styleLayoutSurfaceControllerPath: str = os.JoinPath(outDir, "style_layout_surface_controller_v1.json")
     let nativeLayoutPlanControllerPath: str = os.JoinPath(outDir, "native_layout_plan_controller_v1.json")
+    let nativeLayoutItemCatalogPath: str = os.JoinPath(outDir, "native_layout_item_catalog_v1.json")
+    let styleLayoutSurfaceSourcePayloadPath: str = os.JoinPath(outDir, "style_layout_surface_source_payload_v1.json")
+    let nativeLayoutPlanSourcePayloadPath: str = os.JoinPath(outDir, "native_layout_plan_source_payload_v1.json")
+    if strings.Len(styleLayoutSurfacePath) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer missing style layout surface path")
+        return 1
+    if !v3path.V3PathFileExists(styleLayoutSurfacePath):
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer missing style layout surface: " + styleLayoutSurfacePath)
+        return 1
+    let styleLayoutSurfaceText: str = v3path.V3ReadTextFile("", styleLayoutSurfacePath)
+    if r2cControllerJsonReadStringField(styleLayoutSurfaceText, "format", "") != "style_layout_surface_v1":
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer style layout format mismatch: " + styleLayoutSurfacePath)
+        return 1
     if strings.Len(nativeLayoutPlanPath) <= 0:
         r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer missing native layout plan path")
         return 1
@@ -3519,12 +4445,179 @@ fn r2cControllerNativeGuiBundle(root: str,
     let nativeLayoutContentHeightText: str = intToStr(nativeLayoutContentHeight)
     let nativeLayoutOverlayItemCountText: str = intToStr(r2cControllerJsonReadIntField(nativeLayoutPlanText, "overlay_item_count", 0))
     let nativeLayoutColumnCountText: str = intToStr(nativeLayoutColumnCount)
+    let nativeLayoutExpectedItemCount: int32 = r2cControllerParseInt32(nativeLayoutPlanItemCountText)
+    if nativeLayoutExpectedItemCount <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer invalid native layout item_count: " + nativeLayoutPlanPath)
+        return 1
+    let nativeLayoutExpectedViewportItemCount: int32 = r2cControllerParseInt32(nativeLayoutPlanViewportItemCountText)
+    if nativeLayoutExpectedViewportItemCount <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer invalid native layout viewport_item_count: " + nativeLayoutPlanPath)
+        return 1
+    let nativeLayoutExpectedInteractiveItemCount: int32 = r2cControllerParseInt32(nativeLayoutPlanInteractiveItemCountText)
+    let nativeLayoutExpectedSourceBackedItemCount: int32 = r2cControllerParseInt32(nativeLayoutPlanSourceBackedItemCountText)
+    var nativeLayoutCatalogItemCount: int32
+    var nativeLayoutCatalogViewportItemCount: int32
+    var nativeLayoutCatalogInteractiveItemCount: int32
+    var nativeLayoutCatalogSourceBackedItemCount: int32
+    var nativeLayoutCatalogTextPayloadItemCount: int32
+    var nativeLayoutCatalogStylePayloadItemCount: int32
+    var nativeLayoutCatalogViewportTextPayloadItemCount: int32
+    var nativeLayoutCatalogViewportStylePayloadItemCount: int32
+    if !r2cControllerWriteNativeLayoutTypedCatalog(nativeLayoutItemCatalogPath,
+                                                  nativeLayoutPlanPath,
+                                                  routeState,
+                                                  nativeLayoutItemsRaw,
+                                                  nativeLayoutViewportItemsRaw,
+                                                  nativeLayoutExpectedItemCount,
+                                                  nativeLayoutExpectedViewportItemCount,
+                                                  nativeLayoutExpectedInteractiveItemCount,
+                                                  nativeLayoutExpectedSourceBackedItemCount,
+                                                  nativeLayoutCatalogItemCount,
+                                                  nativeLayoutCatalogViewportItemCount,
+                                                  nativeLayoutCatalogInteractiveItemCount,
+                                                  nativeLayoutCatalogSourceBackedItemCount,
+                                                  nativeLayoutCatalogTextPayloadItemCount,
+                                                  nativeLayoutCatalogStylePayloadItemCount,
+                                                  nativeLayoutCatalogViewportTextPayloadItemCount,
+                                                  nativeLayoutCatalogViewportStylePayloadItemCount):
+        return 1
+    if !r2cControllerWritePayloadSourceCopy(styleLayoutSurfaceSourcePayloadPath,
+                                            styleLayoutSurfacePath,
+                                            styleLayoutSurfaceText,
+                                            "style layout payload"):
+        return 1
+    if !r2cControllerWritePayloadSourceCopy(nativeLayoutPlanSourcePayloadPath,
+                                            nativeLayoutPlanPath,
+                                            nativeLayoutPlanText,
+                                            "native layout payload"):
+        return 1
+    if !r2cControllerRepublishStyleLayoutSurfacePayload(styleLayoutSurfacePath,
+                                                        styleLayoutSurfaceSourcePayloadPath,
+                                                        layoutSurfacePath,
+                                                        routeState,
+                                                        layoutSurfaceSourceModule,
+                                                        layoutSurfaceSourceComponent,
+                                                        nativeGuiBundleHelper,
+                                                        styleLayoutSurfaceText,
+                                                        styleLayoutSurfaceReadyText,
+                                                        styleLayoutSurfaceNodeCountText,
+                                                        styleLayoutOverlayNodeCountText,
+                                                        styleLayoutSurfaceSurfaceNodeCountText,
+                                                        styleLayoutSurfaceControlNodeCountText):
+        return 1
+    if !r2cControllerRepublishNativeLayoutPlanPayload(nativeLayoutPlanPath,
+                                                      nativeLayoutPlanSourcePayloadPath,
+                                                      layoutSurfacePath,
+                                                      styleLayoutSurfacePath,
+                                                      nativeLayoutItemCatalogPath,
+                                                      routeState,
+                                                      nativeGuiBundleHelper,
+                                                      nativeLayoutPlanText,
+                                                      nativeLayoutPlanReadyText,
+                                                      nativeLayoutPlanPolicySource,
+                                                      nativeLayoutWindowWidthText,
+                                                      nativeLayoutWindowHeightText,
+                                                      nativeLayoutContentStartYText,
+                                                      nativeLayoutContentHeightText,
+                                                      nativeLayoutPlanScrollHeightText,
+                                                      nativeLayoutPlanItemCountText,
+                                                      nativeLayoutPlanViewportItemCountText,
+                                                      nativeLayoutPlanClippedItemCountText,
+                                                      nativeLayoutOverlayItemCountText,
+                                                      nativeLayoutPlanInteractiveItemCountText,
+                                                      nativeLayoutPlanSourceBackedItemCountText,
+                                                      nativeLayoutColumnCountText,
+                                                      nativeLayoutPolicyRaw,
+                                                      nativeLayoutItemsRaw,
+                                                      nativeLayoutViewportItemsRaw):
+        return 1
+
+    let nativeLayoutItemCatalogPathJson: str = r2cControllerJsonQuote(nativeLayoutItemCatalogPath)
+    let styleLayoutSurfaceSourcePayloadPathJson: str = r2cControllerJsonQuote(styleLayoutSurfaceSourcePayloadPath)
+    let nativeLayoutPlanSourcePayloadPathJson: str = r2cControllerJsonQuote(nativeLayoutPlanSourcePayloadPath)
+    let nativeLayoutCatalogItemCountText: str = intToStr(nativeLayoutCatalogItemCount)
+    let nativeLayoutCatalogViewportItemCountText: str = intToStr(nativeLayoutCatalogViewportItemCount)
+    let nativeLayoutCatalogInteractiveItemCountText: str = intToStr(nativeLayoutCatalogInteractiveItemCount)
+    let nativeLayoutCatalogSourceBackedItemCountText: str = intToStr(nativeLayoutCatalogSourceBackedItemCount)
+    let nativeLayoutCatalogTextPayloadItemCountText: str = intToStr(nativeLayoutCatalogTextPayloadItemCount)
+    let nativeLayoutCatalogStylePayloadItemCountText: str = intToStr(nativeLayoutCatalogStylePayloadItemCount)
+    let nativeLayoutCatalogViewportTextPayloadItemCountText: str = intToStr(nativeLayoutCatalogViewportTextPayloadItemCount)
+    let nativeLayoutCatalogViewportStylePayloadItemCountText: str = intToStr(nativeLayoutCatalogViewportStylePayloadItemCount)
+    if strings.Len(nativeRuntimeCompiledExePath) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer missing compiled runtime exe path")
+        return 1
+    if !v3path.V3PathFileExists(nativeRuntimeCompiledExePath):
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer missing compiled runtime exe: " + nativeRuntimeCompiledExePath)
+        return 1
+    if !r2cControllerWriteRuntimeContractWithTypedCatalog(nativeRuntimeContractPath,
+                                                         nativeLayoutItemCatalogPath,
+                                                         nativeLayoutCatalogItemCountText,
+                                                         nativeLayoutCatalogViewportItemCountText,
+                                                         nativeLayoutCatalogInteractiveItemCountText,
+                                                         nativeLayoutCatalogSourceBackedItemCountText):
+        return 1
+    let runtimeControllerLogPath: str = os.JoinPath(outDir, "native_gui_runtime_main.controller.log")
+    var runtimeControllerExitCode: int32
+    var runtimeControllerOutput: str
+    if !r2cControllerRunCompiledRuntimeLogged(effectiveRoot,
+                                              nativeRuntimeCompiledExePath,
+                                              nativeRuntimeContractPath,
+                                              runtimeControllerLogPath,
+                                              runtimeControllerExitCode,
+                                              runtimeControllerOutput):
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer runtime rerun failed")
+        if strings.Len(runtimeControllerOutput) > 0:
+            r2cControllerPrintErr(runtimeControllerOutput)
+        if runtimeControllerExitCode != 0:
+            return runtimeControllerExitCode
+        return 1
+    let runtimeDocText: str = r2cControllerEnsureTrailingNewline(runtimeControllerOutput)
+    if r2cControllerJsonReadStringField(runtimeDocText, "format", "") != "native_gui_runtime_v1":
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer runtime doc format mismatch: " + nativeRuntimePath)
+        return 1
+    let runtimeStateRaw: str = r2cControllerJsonReadObjectFieldRaw(runtimeDocText, "state", "")
+    if strings.Len(runtimeStateRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer runtime state missing: " + nativeRuntimePath)
+        return 1
+    let runtimeRenderPlanRaw: str = r2cControllerJsonReadObjectFieldRaw(runtimeDocText, "render_plan", "")
+    if strings.Len(runtimeRenderPlanRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer runtime render plan missing: " + nativeRuntimePath)
+        return 1
+    if r2cControllerJsonReadStringField(runtimeRenderPlanRaw, "format", "") != "native_render_plan_v1":
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer runtime render plan format mismatch: " + nativeRenderPlanPath)
+        return 1
+    if !v3path.V3WriteTextFile("", nativeRuntimePath, runtimeDocText):
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer failed to write runtime doc: " + nativeRuntimePath)
+        return 1
+    if !v3path.V3WriteTextFile("", nativeRuntimeStatePath, r2cControllerEnsureTrailingNewline(runtimeStateRaw)):
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer failed to write runtime state: " + nativeRuntimeStatePath)
+        return 1
+    if !v3path.V3WriteTextFile("", nativeRenderPlanPath, r2cControllerEnsureTrailingNewline(runtimeRenderPlanRaw)):
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer failed to write runtime render plan: " + nativeRenderPlanPath)
+        return 1
+    nativeRuntimeReadyText = "true"
+    nativeRenderPlanReadyText = r2cControllerJsonBool(r2cControllerJsonReadBoolField(runtimeRenderPlanRaw, "ready", false))
+    nativeRenderPlanCommandCountText = intToStr(r2cControllerJsonReadIntField(runtimeRenderPlanRaw, "command_count", 0))
+    nativeRenderPlanVisibleLayoutItemCountText = intToStr(r2cControllerJsonReadIntField(runtimeRenderPlanRaw, "visible_layout_item_count", 0))
+    nativeRuntimeBundleReadyText = "true"
+    nativeRuntimeContractReadyText = "true"
+    nativeRuntimeBundleRouteState = routeState
+    nativeRuntimeBundleRouteCountText = reportRouteCountText
+    nativeRuntimeBundleSupportedCountText = reportSupportedCountText
+    nativeRuntimeBundleSemanticNodesCountText = reportSemanticNodesCountText
+    nativeRuntimeBundleLayoutItemCountText = nativeLayoutCatalogItemCountText
+    nativeRuntimeBundleRenderCommandCountText = nativeRenderPlanCommandCountText
+    nativeRuntimeContractLayoutItemCountText = nativeLayoutCatalogItemCountText
+    nativeRuntimeContractViewportItemCountText = nativeLayoutCatalogViewportItemCountText
+    nativeRuntimeContractInteractiveItemCountText = nativeLayoutCatalogInteractiveItemCountText
 
     var styleLayoutControllerDoc = "{\n"
     styleLayoutControllerDoc = styleLayoutControllerDoc + "  \"format\": \"style_layout_surface_controller_v1\",\n"
     styleLayoutControllerDoc = styleLayoutControllerDoc + "  \"controller\": \"cheng.live_controller\",\n"
     styleLayoutControllerDoc = styleLayoutControllerDoc + "  \"finalizer\": " + r2cControllerJsonQuote(nativeGuiLayoutPayloadFinalizer) + ",\n"
+    styleLayoutControllerDoc = styleLayoutControllerDoc + "  \"publish_mode\": \"cheng_controller_republished_payload_v1\",\n"
     styleLayoutControllerDoc = styleLayoutControllerDoc + "  \"node_payload_helper\": " + r2cControllerJsonQuote(nativeGuiBundleHelper) + ",\n"
+    styleLayoutControllerDoc = styleLayoutControllerDoc + "  \"source_payload_path\": " + styleLayoutSurfaceSourcePayloadPathJson + ",\n"
     styleLayoutControllerDoc = styleLayoutControllerDoc + "  \"route_state\": " + r2cControllerJsonQuote(routeState) + ",\n"
     styleLayoutControllerDoc = styleLayoutControllerDoc + "  \"source_layout_surface_path\": " + r2cControllerJsonQuote(layoutSurfacePath) + ",\n"
     styleLayoutControllerDoc = styleLayoutControllerDoc + "  \"source_style_layout_surface_path\": " + r2cControllerJsonQuote(styleLayoutSurfacePath) + ",\n"
@@ -3549,6 +4642,7 @@ fn r2cControllerNativeGuiBundle(root: str,
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"finalizer\": " + r2cControllerJsonQuote(nativeGuiLayoutPayloadFinalizer) + ",\n"
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"publish_mode\": \"cheng_controller_items_source_checked_v1\",\n"
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"node_payload_helper\": " + r2cControllerJsonQuote(nativeGuiBundleHelper) + ",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"source_payload_path\": " + nativeLayoutPlanSourcePayloadPathJson + ",\n"
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"route_state\": " + r2cControllerJsonQuote(routeState) + ",\n"
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"source_layout_surface_path\": " + r2cControllerJsonQuote(layoutSurfacePath) + ",\n"
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"source_style_layout_surface_path\": " + r2cControllerJsonQuote(styleLayoutSurfacePath) + ",\n"
@@ -3570,6 +4664,21 @@ fn r2cControllerNativeGuiBundle(root: str,
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"published_item_count\": " + nativeLayoutPlanItemCountText + ",\n"
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"published_viewport_item_count\": " + nativeLayoutPlanViewportItemCountText + ",\n"
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"items_source\": " + r2cControllerJsonQuote(nativeLayoutPlanPath) + ",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_path\": " + nativeLayoutItemCatalogPathJson + ",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_ready\": true,\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_format\": \"native_layout_item_catalog_v1\",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_publish_mode\": \"cheng_streamed_typed_layout_items_v1\",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_payload_profile\": \"cheng_runtime_layout_item_payload_v1\",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_text_payload_ready\": true,\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_style_payload_ready\": true,\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_item_count\": " + nativeLayoutCatalogItemCountText + ",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_viewport_item_count\": " + nativeLayoutCatalogViewportItemCountText + ",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_interactive_item_count\": " + nativeLayoutCatalogInteractiveItemCountText + ",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_source_backed_item_count\": " + nativeLayoutCatalogSourceBackedItemCountText + ",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_text_payload_item_count\": " + nativeLayoutCatalogTextPayloadItemCountText + ",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_style_payload_item_count\": " + nativeLayoutCatalogStylePayloadItemCountText + ",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_viewport_text_payload_item_count\": " + nativeLayoutCatalogViewportTextPayloadItemCountText + ",\n"
+    nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"typed_item_catalog_viewport_style_payload_item_count\": " + nativeLayoutCatalogViewportStylePayloadItemCountText + ",\n"
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"items_source_checked\": true,\n"
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"viewport_items_source_checked\": true,\n"
     nativeLayoutControllerDoc = nativeLayoutControllerDoc + "  \"items_publish_status\": \"source_checked\",\n"
@@ -3625,6 +4734,8 @@ fn r2cControllerNativeGuiBundle(root: str,
     finalBundle = finalBundle + "  \"style_layout_surface\": {\n"
     finalBundle = finalBundle + "    \"path\": " + r2cControllerJsonQuote(styleLayoutSurfacePath) + ",\n"
     finalBundle = finalBundle + "    \"controller_path\": " + r2cControllerJsonQuote(styleLayoutSurfaceControllerPath) + ",\n"
+    finalBundle = finalBundle + "    \"publish_mode\": \"cheng_controller_republished_payload_v1\",\n"
+    finalBundle = finalBundle + "    \"source_payload_path\": " + styleLayoutSurfaceSourcePayloadPathJson + ",\n"
     finalBundle = finalBundle + "    \"ready\": " + r2cControllerJsonBoolTextOrFalse(styleLayoutSurfaceReadyText) + ",\n"
     finalBundle = finalBundle + "    \"node_count\": " + styleLayoutSurfaceNodeCountText + ",\n"
     finalBundle = finalBundle + "    \"overlay_node_count\": " + styleLayoutOverlayNodeCountText + ",\n"
@@ -3636,8 +4747,20 @@ fn r2cControllerNativeGuiBundle(root: str,
     finalBundle = finalBundle + "    \"controller_path\": " + r2cControllerJsonQuote(nativeLayoutPlanControllerPath) + ",\n"
     finalBundle = finalBundle + "    \"controller_publish_mode\": \"cheng_controller_items_source_checked_v1\",\n"
     finalBundle = finalBundle + "    \"controller_items_ready\": true,\n"
+    finalBundle = finalBundle + "    \"publish_mode\": \"cheng_controller_republished_payload_v1\",\n"
+    finalBundle = finalBundle + "    \"source_payload_path\": " + nativeLayoutPlanSourcePayloadPathJson + ",\n"
     finalBundle = finalBundle + "    \"controller_item_count\": " + nativeLayoutPlanItemCountText + ",\n"
     finalBundle = finalBundle + "    \"controller_viewport_item_count\": " + nativeLayoutPlanViewportItemCountText + ",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_path\": " + nativeLayoutItemCatalogPathJson + ",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_ready\": true,\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_publish_mode\": \"cheng_streamed_typed_layout_items_v1\",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_payload_profile\": \"cheng_runtime_layout_item_payload_v1\",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_text_payload_ready\": true,\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_style_payload_ready\": true,\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_item_count\": " + nativeLayoutCatalogItemCountText + ",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_viewport_item_count\": " + nativeLayoutCatalogViewportItemCountText + ",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_text_payload_item_count\": " + nativeLayoutCatalogTextPayloadItemCountText + ",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_style_payload_item_count\": " + nativeLayoutCatalogStylePayloadItemCountText + ",\n"
     finalBundle = finalBundle + "    \"ready\": " + r2cControllerJsonBoolTextOrFalse(nativeLayoutPlanReadyText) + ",\n"
     finalBundle = finalBundle + "    \"layout_policy_source\": " + r2cControllerJsonQuote(nativeLayoutPlanPolicySource) + ",\n"
     finalBundle = finalBundle + "    \"item_count\": " + nativeLayoutPlanItemCountText + ",\n"
@@ -3662,6 +4785,12 @@ fn r2cControllerNativeGuiBundle(root: str,
     finalBundle = finalBundle + "    \"runtime_compiled_exe_path\": " + r2cControllerJsonQuote(nativeRuntimeCompiledExePath) + ",\n"
     finalBundle = finalBundle + "    \"runtime_contract_path\": " + r2cControllerJsonQuote(nativeRuntimeContractPath) + ",\n"
     finalBundle = finalBundle + "    \"runtime_mode\": " + r2cControllerJsonQuote(nativeRuntimeMode) + ",\n"
+    finalBundle = finalBundle + "    \"item_source_mode\": \"typed_item_catalog_contract_v1\",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_path\": " + nativeLayoutItemCatalogPathJson + ",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_ready\": true,\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_payload_profile\": \"cheng_runtime_layout_item_payload_v1\",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_item_count\": " + nativeLayoutCatalogItemCountText + ",\n"
+    finalBundle = finalBundle + "    \"typed_item_catalog_viewport_item_count\": " + nativeLayoutCatalogViewportItemCountText + ",\n"
     finalBundle = finalBundle + "    \"runtime_bundle_ready\": " + r2cControllerJsonBoolTextOrFalse(nativeRuntimeBundleReadyText) + ",\n"
     finalBundle = finalBundle + "    \"runtime_contract_ready\": " + r2cControllerJsonBoolTextOrFalse(nativeRuntimeContractReadyText) + ",\n"
     finalBundle = finalBundle + "    \"runtime_bundle_route_state\": " + r2cControllerJsonQuote(nativeRuntimeBundleRouteState) + ",\n"
@@ -3697,6 +4826,34 @@ fn r2cControllerNativeGuiBundle(root: str,
         return 1
 
     var finalSummary = v3path.V3ReadTextFile("", nativeGuiBundleSummaryPath)
+    let runtimeSummaryKeysToReplace: str[] = [
+        "native_gui_render_plan_ready",
+        "native_gui_render_plan_command_count",
+        "native_gui_render_plan_visible_layout_item_count",
+        "native_gui_runtime_ready",
+        "native_gui_runtime_bundle_ready",
+        "native_gui_runtime_contract_ready",
+        "native_gui_runtime_bundle_route_state",
+        "native_gui_runtime_bundle_route_count",
+        "native_gui_runtime_bundle_supported_count",
+        "native_gui_runtime_bundle_semantic_nodes_count",
+        "native_gui_runtime_bundle_layout_item_count",
+        "native_gui_runtime_bundle_render_command_count",
+        "native_gui_runtime_contract_layout_item_count",
+        "native_gui_runtime_contract_viewport_item_count",
+        "native_gui_runtime_contract_interactive_item_count",
+        "native_gui_runtime_item_source_mode",
+        "native_gui_runtime_typed_item_catalog_path",
+        "native_gui_runtime_typed_item_catalog_ready",
+        "native_gui_runtime_typed_item_catalog_payload_profile",
+        "native_gui_runtime_typed_item_catalog_item_count",
+        "native_gui_runtime_typed_item_catalog_viewport_item_count",
+        "native_gui_style_layout_surface_publish_mode",
+        "native_gui_style_layout_surface_source_payload_path",
+        "native_gui_native_layout_plan_publish_mode",
+        "native_gui_native_layout_plan_source_payload_path"
+    ]
+    finalSummary = r2cControllerSummaryStripKeys(finalSummary, runtimeSummaryKeysToReplace)
     if strings.Len(finalSummary) > 0:
         let lastIndex: int32 = strings.Len(finalSummary) - 1
         if finalSummary[lastIndex] != '\n':
@@ -3705,10 +4862,49 @@ fn r2cControllerNativeGuiBundle(root: str,
     finalSummary = finalSummary + "native_gui_bundle_finalizer_owner=cheng.live_controller\n"
     finalSummary = finalSummary + "native_gui_layout_payload_finalizer=" + nativeGuiLayoutPayloadFinalizer + "\n"
     finalSummary = finalSummary + "native_gui_style_layout_surface_controller_path=" + styleLayoutSurfaceControllerPath + "\n"
+    finalSummary = finalSummary + "native_gui_style_layout_surface_publish_mode=cheng_controller_republished_payload_v1\n"
+    finalSummary = finalSummary + "native_gui_style_layout_surface_source_payload_path=" + styleLayoutSurfaceSourcePayloadPath + "\n"
     finalSummary = finalSummary + "native_gui_native_layout_plan_controller_path=" + nativeLayoutPlanControllerPath + "\n"
+    finalSummary = finalSummary + "native_gui_native_layout_plan_publish_mode=cheng_controller_republished_payload_v1\n"
+    finalSummary = finalSummary + "native_gui_native_layout_plan_source_payload_path=" + nativeLayoutPlanSourcePayloadPath + "\n"
     finalSummary = finalSummary + "native_gui_native_layout_plan_controller_items_ready=true\n"
     finalSummary = finalSummary + "native_gui_native_layout_plan_controller_item_count=" + nativeLayoutPlanItemCountText + "\n"
     finalSummary = finalSummary + "native_gui_native_layout_plan_controller_viewport_item_count=" + nativeLayoutPlanViewportItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_path=" + nativeLayoutItemCatalogPath + "\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_ready=true\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_publish_mode=cheng_streamed_typed_layout_items_v1\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_payload_profile=cheng_runtime_layout_item_payload_v1\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_text_payload_ready=true\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_style_payload_ready=true\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_item_count=" + nativeLayoutCatalogItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_viewport_item_count=" + nativeLayoutCatalogViewportItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_interactive_item_count=" + nativeLayoutCatalogInteractiveItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_source_backed_item_count=" + nativeLayoutCatalogSourceBackedItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_text_payload_item_count=" + nativeLayoutCatalogTextPayloadItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_style_payload_item_count=" + nativeLayoutCatalogStylePayloadItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_viewport_text_payload_item_count=" + nativeLayoutCatalogViewportTextPayloadItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_native_layout_item_catalog_viewport_style_payload_item_count=" + nativeLayoutCatalogViewportStylePayloadItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_render_plan_ready=" + nativeRenderPlanReadyText + "\n"
+    finalSummary = finalSummary + "native_gui_render_plan_command_count=" + nativeRenderPlanCommandCountText + "\n"
+    finalSummary = finalSummary + "native_gui_render_plan_visible_layout_item_count=" + nativeRenderPlanVisibleLayoutItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_ready=" + nativeRuntimeReadyText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_bundle_ready=" + nativeRuntimeBundleReadyText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_contract_ready=" + nativeRuntimeContractReadyText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_bundle_route_state=" + nativeRuntimeBundleRouteState + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_bundle_route_count=" + nativeRuntimeBundleRouteCountText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_bundle_supported_count=" + nativeRuntimeBundleSupportedCountText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_bundle_semantic_nodes_count=" + nativeRuntimeBundleSemanticNodesCountText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_bundle_layout_item_count=" + nativeRuntimeBundleLayoutItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_bundle_render_command_count=" + nativeRuntimeBundleRenderCommandCountText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_contract_layout_item_count=" + nativeRuntimeContractLayoutItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_contract_viewport_item_count=" + nativeRuntimeContractViewportItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_contract_interactive_item_count=" + nativeRuntimeContractInteractiveItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_item_source_mode=typed_item_catalog_contract_v1\n"
+    finalSummary = finalSummary + "native_gui_runtime_typed_item_catalog_path=" + nativeLayoutItemCatalogPath + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_typed_item_catalog_ready=true\n"
+    finalSummary = finalSummary + "native_gui_runtime_typed_item_catalog_payload_profile=cheng_runtime_layout_item_payload_v1\n"
+    finalSummary = finalSummary + "native_gui_runtime_typed_item_catalog_item_count=" + nativeLayoutCatalogItemCountText + "\n"
+    finalSummary = finalSummary + "native_gui_runtime_typed_item_catalog_viewport_item_count=" + nativeLayoutCatalogViewportItemCountText + "\n"
     finalSummary = finalSummary + "native_gui_bundle_payload_helper=" + nativeGuiBundleHelper + "\n"
     if !v3path.V3WriteTextFile("", nativeGuiBundleSummaryPath, finalSummary):
         r2cControllerPrintErr("r2c-react-v3: native gui bundle finalizer failed to write summary: " + nativeGuiBundleSummaryPath)
@@ -3751,15 +4947,33 @@ fn r2cControllerNativeGuiBundle(root: str,
     report = report + "  \"native_gui_layout_surface_styled_node_count\": " + layoutSurfaceStyledNodeCountText + ",\n"
     report = report + "  \"native_gui_layout_surface_interactive_node_count\": " + layoutSurfaceInteractiveNodeCountText + ",\n"
     report = report + "  \"native_gui_style_layout_surface_path\": " + r2cControllerJsonQuote(styleLayoutSurfacePath) + ",\n"
+    report = report + "  \"native_gui_style_layout_surface_publish_mode\": \"cheng_controller_republished_payload_v1\",\n"
+    report = report + "  \"native_gui_style_layout_surface_source_payload_path\": " + styleLayoutSurfaceSourcePayloadPathJson + ",\n"
     report = report + "  \"native_gui_style_layout_surface_node_count\": " + styleLayoutSurfaceNodeCountText + ",\n"
     report = report + "  \"native_gui_style_layout_overlay_node_count\": " + styleLayoutOverlayNodeCountText + ",\n"
     report = report + "  \"native_gui_style_layout_surface_surface_node_count\": " + styleLayoutSurfaceSurfaceNodeCountText + ",\n"
     report = report + "  \"native_gui_style_layout_surface_control_node_count\": " + styleLayoutSurfaceControlNodeCountText + ",\n"
     report = report + "  \"native_gui_native_layout_plan_path\": " + r2cControllerJsonQuote(nativeLayoutPlanPath) + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_publish_mode\": \"cheng_controller_republished_payload_v1\",\n"
+    report = report + "  \"native_gui_native_layout_plan_source_payload_path\": " + nativeLayoutPlanSourcePayloadPathJson + ",\n"
     report = report + "  \"native_gui_native_layout_plan_controller_publish_mode\": \"cheng_controller_items_source_checked_v1\",\n"
     report = report + "  \"native_gui_native_layout_plan_controller_items_ready\": true,\n"
     report = report + "  \"native_gui_native_layout_plan_controller_item_count\": " + nativeLayoutPlanItemCountText + ",\n"
     report = report + "  \"native_gui_native_layout_plan_controller_viewport_item_count\": " + nativeLayoutPlanViewportItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_path\": " + nativeLayoutItemCatalogPathJson + ",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_ready\": true,\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_publish_mode\": \"cheng_streamed_typed_layout_items_v1\",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_payload_profile\": \"cheng_runtime_layout_item_payload_v1\",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_text_payload_ready\": true,\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_style_payload_ready\": true,\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_item_count\": " + nativeLayoutCatalogItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_viewport_item_count\": " + nativeLayoutCatalogViewportItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_interactive_item_count\": " + nativeLayoutCatalogInteractiveItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_source_backed_item_count\": " + nativeLayoutCatalogSourceBackedItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_text_payload_item_count\": " + nativeLayoutCatalogTextPayloadItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_style_payload_item_count\": " + nativeLayoutCatalogStylePayloadItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_viewport_text_payload_item_count\": " + nativeLayoutCatalogViewportTextPayloadItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_item_catalog_viewport_style_payload_item_count\": " + nativeLayoutCatalogViewportStylePayloadItemCountText + ",\n"
     report = report + "  \"native_gui_native_layout_plan_policy_source\": " + r2cControllerJsonQuote(nativeLayoutPlanPolicySource) + ",\n"
     report = report + "  \"native_gui_native_layout_plan_item_count\": " + nativeLayoutPlanItemCountText + ",\n"
     report = report + "  \"native_gui_native_layout_plan_viewport_item_count\": " + nativeLayoutPlanViewportItemCountText + ",\n"
@@ -3777,6 +4991,12 @@ fn r2cControllerNativeGuiBundle(root: str,
     report = report + "  \"native_gui_runtime_compiled_exe_path\": " + r2cControllerJsonQuote(nativeRuntimeCompiledExePath) + ",\n"
     report = report + "  \"native_gui_runtime_contract_path\": " + r2cControllerJsonQuote(nativeRuntimeContractPath) + ",\n"
     report = report + "  \"native_gui_runtime_mode\": " + r2cControllerJsonQuote(nativeRuntimeMode) + ",\n"
+    report = report + "  \"native_gui_runtime_item_source_mode\": \"typed_item_catalog_contract_v1\",\n"
+    report = report + "  \"native_gui_runtime_typed_item_catalog_path\": " + nativeLayoutItemCatalogPathJson + ",\n"
+    report = report + "  \"native_gui_runtime_typed_item_catalog_ready\": true,\n"
+    report = report + "  \"native_gui_runtime_typed_item_catalog_payload_profile\": \"cheng_runtime_layout_item_payload_v1\",\n"
+    report = report + "  \"native_gui_runtime_typed_item_catalog_item_count\": " + nativeLayoutCatalogItemCountText + ",\n"
+    report = report + "  \"native_gui_runtime_typed_item_catalog_viewport_item_count\": " + nativeLayoutCatalogViewportItemCountText + ",\n"
     report = report + "  \"native_gui_runtime_bundle_route_state\": " + r2cControllerJsonQuote(nativeRuntimeBundleRouteState) + ",\n"
     report = report + "  \"native_gui_runtime_bundle_route_count\": " + nativeRuntimeBundleRouteCountText + ",\n"
     report = report + "  \"native_gui_runtime_bundle_supported_count\": " + nativeRuntimeBundleSupportedCountText + ",\n"
@@ -3854,7 +5074,7 @@ fn r2cControllerRunNativeGui(root: str,
     var scratchOk: bool = v3path.V3MkdirP("", outDir)
     scratchOk
     let experimentalRoot: str = v3path.V3PathAbsolute(effectiveRoot, "v3/experimental/r2c-react-v3")
-    let nativeGuiRunHelper: str = os.JoinPath(experimentalRoot, "r2c-react-v3-native-gui-run.mjs")
+    let nativeGuiHostSourcePath: str = os.JoinPath(experimentalRoot, "native_gui_host_macos.m")
     let nativeGuiBundleSummaryPath: str = os.JoinPath(outDir, "native_gui_bundle.summary.env")
     let nativeGuiRunSummaryPath: str = os.JoinPath(outDir, "native_gui_run.summary.env")
     let reportPath: str = os.JoinPath(outDir, "native_gui_run_report_v1.json")
@@ -3920,57 +5140,460 @@ fn r2cControllerRunNativeGui(root: str,
         r2cControllerPrintErr("r2c-react-v3: native gui run missing bundle: " + bundlePath)
         return 1
 
-    var nativeGuiRunArgs: str[]
-    add(nativeGuiRunArgs, "--repo")
-    add(nativeGuiRunArgs, repo)
-    add(nativeGuiRunArgs, "--out-dir")
-    add(nativeGuiRunArgs, outDir)
-    add(nativeGuiRunArgs, "--session-path")
-    add(nativeGuiRunArgs, sessionPath)
-    add(nativeGuiRunArgs, "--bundle-path")
-    add(nativeGuiRunArgs, bundlePath)
-    add(nativeGuiRunArgs, "--auto-close-ms")
-    add(nativeGuiRunArgs, autoCloseMs)
-    add(nativeGuiRunArgs, "--screenshot-out")
-    add(nativeGuiRunArgs, screenshotPath)
-    add(nativeGuiRunArgs, "--inspector-state-out")
-    add(nativeGuiRunArgs, inspectorStatePath)
-    if strings.Len(clickSpec) > 0:
-        add(nativeGuiRunArgs, "--click")
-        add(nativeGuiRunArgs, clickSpec)
-    if strings.Len(resizeSpec) > 0:
-        add(nativeGuiRunArgs, "--resize")
-        add(nativeGuiRunArgs, resizeSpec)
-    if strings.Len(scrollY) > 0:
-        add(nativeGuiRunArgs, "--scroll-y")
-        add(nativeGuiRunArgs, scrollY)
-    if strings.Len(waitAfterClickMs) > 0:
-        add(nativeGuiRunArgs, "--wait-after-click-ms")
-        add(nativeGuiRunArgs, waitAfterClickMs)
-    if strings.Len(focusItemId) > 0:
-        add(nativeGuiRunArgs, "--focus-item-id")
-        add(nativeGuiRunArgs, focusItemId)
-    if strings.Len(typeText) > 0:
-        add(nativeGuiRunArgs, "--type-text")
-        add(nativeGuiRunArgs, typeText)
-    if strings.Len(sendKey) > 0:
-        add(nativeGuiRunArgs, "--send-key")
-        add(nativeGuiRunArgs, sendKey)
-    if strings.Len(routeStateFlag) > 0:
-        add(nativeGuiRunArgs, "--route-state")
-        add(nativeGuiRunArgs, routeStateFlag)
-    if openSourceOnClick:
-        add(nativeGuiRunArgs, "--open-source-on-click")
-    add(nativeGuiRunArgs, "--summary-out")
-    add(nativeGuiRunArgs, nativeGuiRunSummaryPath)
-    let nativeGuiRunLogPath: str = os.JoinPath(outDir, "native_gui_run.log")
-    if !r2cControllerRunNodeHelper(effectiveRoot, nativeGuiRunHelper, nativeGuiRunArgs, nativeGuiRunLogPath, helperExitCode, helperOutput):
-        r2cControllerPrintErr("r2c-react-v3: native gui run helper failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    if !v3path.V3PathFileExists(nativeGuiHostSourcePath):
+        r2cControllerPrintErr("r2c-react-v3: native gui host source missing: " + nativeGuiHostSourcePath)
         return 1
+
+    let nativeGuiHostExePath: str = os.JoinPath(outDir, "native_gui_host_macos")
+    let nativeGuiHostCompileLogPath: str = os.JoinPath(outDir, "native_gui_host_macos.compile.log")
+    let nativeGuiRunLogPath: str = os.JoinPath(outDir, "native_gui_run.log")
+    let nativeGuiHostRunFieldsPath: str = os.JoinPath(outDir, "native_gui_host_run.stdout.env")
+    let runtimeRenderPlanPath: str = os.JoinPath(outDir, "native_render_plan_runtime_v1.json")
+    let runtimeStateCapturePath: str = os.JoinPath(outDir, "native_gui_runtime_state_runtime_v1.json")
+    let hitInspectorPath: str = os.JoinPath(outDir, "native_gui_hit_inspector_v1.json")
+    if v3path.V3PathFileExists(nativeGuiHostExePath):
+        os.RemoveFile(nativeGuiHostExePath)
+
+    var nativeGuiHostCompileArgs: str[]
+    add(nativeGuiHostCompileArgs, "--sdk")
+    add(nativeGuiHostCompileArgs, "macosx")
+    add(nativeGuiHostCompileArgs, "clang")
+    add(nativeGuiHostCompileArgs, "-fobjc-arc")
+    add(nativeGuiHostCompileArgs, "-fmodules")
+    add(nativeGuiHostCompileArgs, "-framework")
+    add(nativeGuiHostCompileArgs, "Cocoa")
+    add(nativeGuiHostCompileArgs, nativeGuiHostSourcePath)
+    add(nativeGuiHostCompileArgs, "-o")
+    add(nativeGuiHostCompileArgs, nativeGuiHostExePath)
+    var nativeGuiHostCompileRun = hostops.v3RunProgramLogged(effectiveRoot,
+                                                             "r2c_native_gui_host_compile",
+                                                             "xcrun",
+                                                             nativeGuiHostCompileArgs,
+                                                             [],
+                                                             effectiveRoot,
+                                                             120,
+                                                             nativeGuiHostCompileLogPath)
+    if nativeGuiHostCompileRun.exitCode == 127:
+        nativeGuiHostCompileArgs = [
+            "-fobjc-arc",
+            "-fmodules",
+            "-framework",
+            "Cocoa",
+            nativeGuiHostSourcePath,
+            "-o",
+            nativeGuiHostExePath
+        ]
+        nativeGuiHostCompileRun = hostops.v3RunProgramLogged(effectiveRoot,
+                                                             "r2c_native_gui_host_compile",
+                                                             "clang",
+                                                             nativeGuiHostCompileArgs,
+                                                             [],
+                                                             effectiveRoot,
+                                                             120,
+                                                             nativeGuiHostCompileLogPath)
+    if !hostops.v3LoggedRunOk(nativeGuiHostCompileRun):
+        r2cControllerPrintErr("r2c-react-v3: native gui host compile failed: " + hostops.v3LoggedRunSummary(nativeGuiHostCompileRun))
+        if strings.Len(nativeGuiHostCompileRun.output) > 0:
+            r2cControllerPrintErr(nativeGuiHostCompileRun.output)
+        return nativeGuiHostCompileRun.exitCode
+    let nativeGuiHostCompileLogText: str = r2cControllerLoggedCommandMetadata("r2c_native_gui_host_compile",
+                                                                              nativeGuiHostCompileRun.filePath,
+                                                                              nativeGuiHostCompileArgs,
+                                                                              nativeGuiHostCompileRun.exitCode,
+                                                                              nativeGuiHostCompileRun.output)
+    if !v3path.V3FileExistsNonEmpty(effectiveRoot, nativeGuiHostCompileLogPath):
+        if !v3path.V3WriteTextFile("", nativeGuiHostCompileLogPath, nativeGuiHostCompileLogText):
+            r2cControllerPrintErr("r2c-react-v3: native gui host compile log write failed: " + nativeGuiHostCompileLogPath)
+            return 1
+    if !v3path.V3PathFileExists(nativeGuiHostExePath):
+        r2cControllerPrintErr("r2c-react-v3: native gui host compile missing exe: " + nativeGuiHostExePath)
+        return 1
+
+    var nativeGuiHostRunArgs: str[]
+    add(nativeGuiHostRunArgs, "--session")
+    add(nativeGuiHostRunArgs, sessionPath)
+    add(nativeGuiHostRunArgs, "--repo-root")
+    add(nativeGuiHostRunArgs, repo)
+    add(nativeGuiHostRunArgs, "--auto-close-ms")
+    add(nativeGuiHostRunArgs, autoCloseMs)
+    add(nativeGuiHostRunArgs, "--screenshot-out")
+    add(nativeGuiHostRunArgs, screenshotPath)
+    add(nativeGuiHostRunArgs, "--render-plan-out")
+    add(nativeGuiHostRunArgs, runtimeRenderPlanPath)
+    add(nativeGuiHostRunArgs, "--runtime-state-out")
+    add(nativeGuiHostRunArgs, runtimeStateCapturePath)
+    if strings.Len(clickSpec) > 0:
+        add(nativeGuiHostRunArgs, "--click")
+        add(nativeGuiHostRunArgs, clickSpec)
+    if strings.Len(resizeSpec) > 0:
+        add(nativeGuiHostRunArgs, "--resize")
+        add(nativeGuiHostRunArgs, resizeSpec)
+    if strings.Len(scrollY) > 0:
+        add(nativeGuiHostRunArgs, "--scroll-y")
+        add(nativeGuiHostRunArgs, scrollY)
+    if strings.Len(waitAfterClickMs) > 0:
+        add(nativeGuiHostRunArgs, "--wait-after-click-ms")
+        add(nativeGuiHostRunArgs, waitAfterClickMs)
+    if strings.Len(focusItemId) > 0:
+        add(nativeGuiHostRunArgs, "--focus-item-id")
+        add(nativeGuiHostRunArgs, focusItemId)
+    if strings.Len(typeText) > 0:
+        add(nativeGuiHostRunArgs, "--type-text")
+        add(nativeGuiHostRunArgs, typeText)
+    if strings.Len(sendKey) > 0:
+        add(nativeGuiHostRunArgs, "--send-key")
+        add(nativeGuiHostRunArgs, sendKey)
+    if openSourceOnClick:
+        add(nativeGuiHostRunArgs, "--open-source-on-click")
+    var nativeGuiHostRunTimeoutSec: int32 = 30
+    let autoCloseMsValue: int32 = r2cControllerParseInt32(autoCloseMs)
+    let nativeGuiHostRunTimeoutCandidate: int32 = (autoCloseMsValue / 1000) + 15
+    if nativeGuiHostRunTimeoutCandidate > nativeGuiHostRunTimeoutSec:
+        nativeGuiHostRunTimeoutSec = nativeGuiHostRunTimeoutCandidate
+    let nativeGuiHostRun = hostops.v3RunFileLogged(effectiveRoot,
+                                                   "r2c_native_gui_host_run",
+                                                   nativeGuiHostExePath,
+                                                   nativeGuiHostRunArgs,
+                                                   [],
+                                                   effectiveRoot,
+                                                   nativeGuiHostRunTimeoutSec,
+                                                   nativeGuiRunLogPath)
+    if !v3path.V3WriteTextFile("", nativeGuiHostRunFieldsPath, r2cControllerEnsureTrailingNewline(nativeGuiHostRun.output)):
+        r2cControllerPrintErr("r2c-react-v3: native gui host stdout write failed: " + nativeGuiHostRunFieldsPath)
+        return 1
+    if !hostops.v3LoggedRunOk(nativeGuiHostRun):
+        r2cControllerPrintErr("r2c-react-v3: native gui host run failed: " + hostops.v3LoggedRunSummary(nativeGuiHostRun))
+        if strings.Len(nativeGuiHostRun.output) > 0:
+            r2cControllerPrintErr(nativeGuiHostRun.output)
+        return nativeGuiHostRun.exitCode
+    if r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "format", "") != "native_gui_run_v1":
+        r2cControllerPrintErr("r2c-react-v3: native gui host run format mismatch: " + nativeGuiHostRunFieldsPath)
+        return 1
+
+    let bundleDocTextRaw: str = v3path.V3ReadTextFile("", bundlePath)
+    let bundleLayoutSurfaceTextRaw: str = r2cControllerJsonReadObjectFieldRaw(bundleDocTextRaw, "layout_surface", "")
+    let bundleStyleLayoutSurfaceTextRaw: str = r2cControllerJsonReadObjectFieldRaw(bundleDocTextRaw, "style_layout_surface", "")
+    let bundleNativeLayoutPlanTextRaw: str = r2cControllerJsonReadObjectFieldRaw(bundleDocTextRaw, "native_layout_plan", "")
+    let bundleNativeRenderPlanTextRaw: str = r2cControllerJsonReadObjectFieldRaw(bundleDocTextRaw, "native_render_plan", "")
+    let bundleNativeRuntimeTextRaw: str = r2cControllerJsonReadObjectFieldRaw(bundleDocTextRaw, "native_runtime", "")
+    let bundleSessionPreviewTextRaw: str = r2cControllerJsonReadObjectFieldRaw(bundleDocTextRaw, "session_preview", "")
+    let sessionDocTextRaw: str = v3path.V3ReadTextFile("", sessionPath)
+    let runtimeStateDocTextRaw: str = v3path.V3PathFileExists(runtimeStateCapturePath) ? v3path.V3ReadTextFile("", runtimeStateCapturePath) : ""
+    let screenshotWrittenText: str = (r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "screenshot_written", "") == "true" &&
+                                      v3path.V3PathFileExists(screenshotPath)) ? "true" : "false"
+    let renderPlanReadyTextBuilt: str = (r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "render_plan_ready", "") == "true" &&
+                                         v3path.V3PathFileExists(runtimeRenderPlanPath)) ? "true" : "false"
+
+    var runtimeManifestReadyTextBuilt: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_manifest_ready", "")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "runtime_manifest_ready"):
+        runtimeManifestReadyTextBuilt = r2cControllerJsonBool(r2cControllerJsonReadBoolField(runtimeStateDocTextRaw, "runtime_manifest_ready", false))
+    var runtimeContractPayloadReadyTextBuilt: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_payload_ready", "")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "runtime_contract_payload_ready"):
+        runtimeContractPayloadReadyTextBuilt = r2cControllerJsonBool(r2cControllerJsonReadBoolField(runtimeStateDocTextRaw, "runtime_contract_payload_ready", false))
+    var runtimeBundlePayloadReadyTextBuilt: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_bundle_payload_ready", "")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "runtime_bundle_payload_ready"):
+        runtimeBundlePayloadReadyTextBuilt = r2cControllerJsonBool(r2cControllerJsonReadBoolField(runtimeStateDocTextRaw, "runtime_bundle_payload_ready", false))
+    var runtimeBundleReadyTextBuilt: str = r2cControllerSummaryValueOrDocBoolText(nativeGuiBundleSummaryPath,
+                                                                                 "native_gui_runtime_bundle_ready",
+                                                                                 bundleNativeRuntimeTextRaw,
+                                                                                 "",
+                                                                                 "runtime_bundle_ready",
+                                                                                 "")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "runtime_bundle_ready"):
+        runtimeBundleReadyTextBuilt = r2cControllerJsonBool(r2cControllerJsonReadBoolField(runtimeStateDocTextRaw, "runtime_bundle_ready", false))
+    var runtimeContractReadyTextBuilt: str = r2cControllerSummaryValueOrDocBoolText(nativeGuiBundleSummaryPath,
+                                                                                    "native_gui_runtime_contract_ready",
+                                                                                    bundleNativeRuntimeTextRaw,
+                                                                                    "",
+                                                                                    "runtime_contract_ready",
+                                                                                    "")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "runtime_contract_ready"):
+        runtimeContractReadyTextBuilt = r2cControllerJsonBool(r2cControllerJsonReadBoolField(runtimeStateDocTextRaw, "runtime_contract_ready", false))
+    var runtimeBundleRouteStateBuilt: str = r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath,
+                                                                                 "native_gui_runtime_bundle_route_state",
+                                                                                 bundleNativeRuntimeTextRaw,
+                                                                                 "",
+                                                                                 "runtime_bundle_route_state",
+                                                                                 "")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "bundle_route_state"):
+        runtimeBundleRouteStateBuilt = r2cControllerJsonReadStringField(runtimeStateDocTextRaw, "bundle_route_state", "")
+    var runtimeBundleRouteCountTextBuilt: str = r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath,
+                                                                                      "native_gui_runtime_bundle_route_count",
+                                                                                      bundleNativeRuntimeTextRaw,
+                                                                                      "",
+                                                                                      "runtime_bundle_route_count",
+                                                                                      "0")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "bundle_route_count"):
+        runtimeBundleRouteCountTextBuilt = intToStr(r2cControllerJsonReadIntField(runtimeStateDocTextRaw, "bundle_route_count", 0))
+    var runtimeBundleSupportedCountTextBuilt: str = r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath,
+                                                                                          "native_gui_runtime_bundle_supported_count",
+                                                                                          bundleNativeRuntimeTextRaw,
+                                                                                          "",
+                                                                                          "runtime_bundle_supported_count",
+                                                                                          "0")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "bundle_supported_count"):
+        runtimeBundleSupportedCountTextBuilt = intToStr(r2cControllerJsonReadIntField(runtimeStateDocTextRaw, "bundle_supported_count", 0))
+    var runtimeBundleSemanticNodesCountTextBuilt: str = r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath,
+                                                                                              "native_gui_runtime_bundle_semantic_nodes_count",
+                                                                                              bundleNativeRuntimeTextRaw,
+                                                                                              "",
+                                                                                              "runtime_bundle_semantic_nodes_count",
+                                                                                              "0")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "bundle_semantic_nodes_count"):
+        runtimeBundleSemanticNodesCountTextBuilt = intToStr(r2cControllerJsonReadIntField(runtimeStateDocTextRaw, "bundle_semantic_nodes_count", 0))
+    var runtimeBundleLayoutItemCountTextBuilt: str = r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath,
+                                                                                           "native_gui_runtime_bundle_layout_item_count",
+                                                                                           bundleNativeRuntimeTextRaw,
+                                                                                           "",
+                                                                                           "runtime_bundle_layout_item_count",
+                                                                                           "0")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "bundle_layout_item_count"):
+        runtimeBundleLayoutItemCountTextBuilt = intToStr(r2cControllerJsonReadIntField(runtimeStateDocTextRaw, "bundle_layout_item_count", 0))
+    var runtimeBundleRenderCommandCountTextBuilt: str = r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath,
+                                                                                              "native_gui_runtime_bundle_render_command_count",
+                                                                                              bundleNativeRuntimeTextRaw,
+                                                                                              "",
+                                                                                              "runtime_bundle_render_command_count",
+                                                                                              "0")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "bundle_render_command_count"):
+        runtimeBundleRenderCommandCountTextBuilt = intToStr(r2cControllerJsonReadIntField(runtimeStateDocTextRaw, "bundle_render_command_count", 0))
+    var runtimeContractLayoutItemCountTextBuilt: str = r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath,
+                                                                                             "native_gui_runtime_contract_layout_item_count",
+                                                                                             bundleNativeRuntimeTextRaw,
+                                                                                             "",
+                                                                                             "runtime_contract_layout_item_count",
+                                                                                             "0")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "contract_layout_item_count"):
+        runtimeContractLayoutItemCountTextBuilt = intToStr(r2cControllerJsonReadIntField(runtimeStateDocTextRaw, "contract_layout_item_count", 0))
+    var runtimeContractViewportItemCountTextBuilt: str = r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath,
+                                                                                               "native_gui_runtime_contract_viewport_item_count",
+                                                                                               bundleNativeRuntimeTextRaw,
+                                                                                               "",
+                                                                                               "runtime_contract_viewport_item_count",
+                                                                                               "0")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "contract_viewport_item_count"):
+        runtimeContractViewportItemCountTextBuilt = intToStr(r2cControllerJsonReadIntField(runtimeStateDocTextRaw, "contract_viewport_item_count", 0))
+    var runtimeContractInteractiveItemCountTextBuilt: str = r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath,
+                                                                                                  "native_gui_runtime_contract_interactive_item_count",
+                                                                                                  bundleNativeRuntimeTextRaw,
+                                                                                                  "",
+                                                                                                  "runtime_contract_interactive_item_count",
+                                                                                                  "0")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "contract_interactive_item_count"):
+        runtimeContractInteractiveItemCountTextBuilt = intToStr(r2cControllerJsonReadIntField(runtimeStateDocTextRaw, "contract_interactive_item_count", 0))
+
+    var nativeGuiRunSummaryText = ""
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_bundle_path", bundlePath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_session_path", sessionPath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_source_path", nativeGuiHostSourcePath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_exe_path", nativeGuiHostExePath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_compile_log_path", nativeGuiHostCompileLogPath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_run_log_path", nativeGuiRunLogPath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_compile_ok", "true")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_run_ok", "true")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_compile_returncode", intToStr(nativeGuiHostCompileRun.exitCode))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_run_returncode", intToStr(nativeGuiHostRun.exitCode))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_ready", "true")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_renderer_ready", "true")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_session_preview_ready",
+                                   r2cControllerSummaryValueOrDocBoolText(nativeGuiBundleSummaryPath, "native_gui_session_preview_ready", bundleSessionPreviewTextRaw, "", "ready", "true"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_session_preview_mode",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_session_preview_mode", bundleSessionPreviewTextRaw, "", "mode", r2cControllerJsonReadStringField(sessionDocTextRaw, "preview_mode", "")))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_surface_path",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_layout_surface_path", bundleLayoutSurfaceTextRaw, "", "path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_surface_ready",
+                                   r2cControllerSummaryValueOrDocBoolText(nativeGuiBundleSummaryPath, "native_gui_layout_surface_ready", bundleLayoutSurfaceTextRaw, "", "ready", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_surface_node_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_layout_surface_node_count", bundleLayoutSurfaceTextRaw, "", "node_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_surface_source_module",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_layout_surface_source_module", bundleLayoutSurfaceTextRaw, "", "source_module_path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_surface_source_component",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_layout_surface_source_component", bundleLayoutSurfaceTextRaw, "", "source_component_name", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_surface_strategy",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_layout_surface_strategy", bundleLayoutSurfaceTextRaw, "", "source_strategy", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_surface_component_expansion_count",
+                                   r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_component_expansion_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_surface_parsed_module_count",
+                                   r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_parsed_module_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_surface_styled_node_count",
+                                   r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_styled_node_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_surface_interactive_node_count",
+                                   r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_interactive_node_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_style_layout_surface_path",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_path", bundleStyleLayoutSurfaceTextRaw, "", "path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_style_layout_surface_ready",
+                                   r2cControllerSummaryValueOrDocBoolText(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_ready", bundleStyleLayoutSurfaceTextRaw, "", "ready", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_style_layout_surface_node_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_node_count", bundleStyleLayoutSurfaceTextRaw, "", "node_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_style_layout_overlay_node_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_style_layout_overlay_node_count", bundleStyleLayoutSurfaceTextRaw, "", "overlay_node_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_style_layout_surface_surface_node_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_surface_node_count", bundleStyleLayoutSurfaceTextRaw, "", "surface_node_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_style_layout_surface_control_node_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_control_node_count", bundleStyleLayoutSurfaceTextRaw, "", "control_node_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_native_layout_plan_path",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_path", bundleNativeLayoutPlanTextRaw, "", "path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_native_layout_plan_ready",
+                                   r2cControllerSummaryValueOrDocBoolText(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_ready", bundleNativeLayoutPlanTextRaw, "", "ready", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_native_layout_plan_policy_source",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_policy_source", bundleNativeLayoutPlanTextRaw, "", "layout_policy_source", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_native_layout_plan_item_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_item_count", bundleNativeLayoutPlanTextRaw, "", "item_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_native_layout_plan_viewport_item_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_viewport_item_count", bundleNativeLayoutPlanTextRaw, "", "viewport_item_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_native_layout_plan_clipped_item_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_clipped_item_count", bundleNativeLayoutPlanTextRaw, "", "clipped_item_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_native_layout_plan_interactive_item_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_interactive_item_count", bundleNativeLayoutPlanTextRaw, "", "interactive_item_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_native_layout_plan_source_backed_item_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_source_backed_item_count", bundleNativeLayoutPlanTextRaw, "", "source_backed_item_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_native_layout_plan_scroll_height",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_scroll_height", bundleNativeLayoutPlanTextRaw, "", "scroll_height", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_initial_render_plan_path",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_render_plan_path", bundleNativeRenderPlanTextRaw, "", "path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_initial_render_plan_ready",
+                                   r2cControllerSummaryValueOrDocBoolText(nativeGuiBundleSummaryPath, "native_gui_render_plan_ready", bundleNativeRenderPlanTextRaw, "", "ready", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_initial_render_plan_command_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_render_plan_command_count", bundleNativeRenderPlanTextRaw, "", "command_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_initial_render_plan_visible_layout_item_count",
+                                   r2cControllerSummaryValueOrDocIntText(nativeGuiBundleSummaryPath, "native_gui_render_plan_visible_layout_item_count", bundleNativeRenderPlanTextRaw, "", "visible_layout_item_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_render_plan_path", runtimeRenderPlanPath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_render_plan_ready", renderPlanReadyTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_render_plan_command_count", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "render_plan_command_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_render_plan_visible_layout_item_count",
+                                   r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "visible_layout_item_count",
+                                                                r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "layout_item_count", "0")))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_path",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_runtime_path", bundleNativeRuntimeTextRaw, "", "path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_mode",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_runtime_mode", bundleNativeRuntimeTextRaw, "", "runtime_mode", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_ready", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "runtime_ready", "false"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_error", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "runtime_error", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_exe_path",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_runtime_exe_path", bundleNativeRuntimeTextRaw, "", "runtime_exe_path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_compiled_exe_path",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_runtime_compiled_exe_path", bundleNativeRuntimeTextRaw, "", "runtime_compiled_exe_path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_contract_path",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_path", bundleNativeRuntimeTextRaw, "", "runtime_contract_path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_manifest_ready", runtimeManifestReadyTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_contract_payload_ready", runtimeContractPayloadReadyTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_bundle_payload_ready", runtimeBundlePayloadReadyTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_bundle_ready", runtimeBundleReadyTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_contract_ready", runtimeContractReadyTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_bundle_route_state", runtimeBundleRouteStateBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_bundle_route_count", runtimeBundleRouteCountTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_bundle_supported_count", runtimeBundleSupportedCountTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_bundle_semantic_nodes_count", runtimeBundleSemanticNodesCountTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_bundle_layout_item_count", runtimeBundleLayoutItemCountTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_bundle_render_command_count", runtimeBundleRenderCommandCountTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_contract_layout_item_count", runtimeContractLayoutItemCountTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_contract_viewport_item_count", runtimeContractViewportItemCountTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_contract_interactive_item_count", runtimeContractInteractiveItemCountTextBuilt)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_route_state_requested", routeStateFlag)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_abi_feature_hits",
+                                   r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_abi_feature_hits", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_abi_first_batch_ready",
+                                   r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_abi_first_batch_ready", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_abi_first_batch_features",
+                                   r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_abi_first_batch_features", ""))
+    var hostAbiMissingFeaturesCsv: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_abi_first_batch_missing_features", "")
+    if r2cControllerJsonHasField(runtimeStateDocTextRaw, "host_abi_missing_features_csv"):
+        hostAbiMissingFeaturesCsv = r2cControllerJsonReadStringField(runtimeStateDocTextRaw, "host_abi_missing_features_csv", "")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_abi_first_batch_missing_features", hostAbiMissingFeaturesCsv)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_storage_host_ready",
+                                   r2cControllerJsonBool(r2cControllerJsonReadBoolField(runtimeStateDocTextRaw, "storage_host_ready", false)))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_fetch_host_ready",
+                                   r2cControllerJsonBool(r2cControllerJsonReadBoolField(runtimeStateDocTextRaw, "fetch_host_ready", false)))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_custom_event_host_ready",
+                                   r2cControllerJsonBool(r2cControllerJsonReadBoolField(runtimeStateDocTextRaw, "custom_event_host_ready", false)))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_resize_observer_host_ready",
+                                   r2cControllerJsonBool(r2cControllerJsonReadBoolField(runtimeStateDocTextRaw, "resize_observer_host_ready", false)))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_initial_runtime_state_path",
+                                   r2cControllerSummaryValueOrDocString(nativeGuiBundleSummaryPath, "native_gui_runtime_state_path", bundleNativeRuntimeTextRaw, "", "runtime_state_path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_runtime_state_path", runtimeStateCapturePath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_controller_tool_path", "")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_window_opened", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "window_opened", "false"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_window_title", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "window_title", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_route_state", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "route_state", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_entry_module", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "entry_module", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_layout_item_count", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "layout_item_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_visible_layout_item_count",
+                                   r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "visible_layout_item_count",
+                                                                r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "layout_item_count", "0")))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_click_count", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "click_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_resize_count", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "resize_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_scroll_count", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "scroll_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_focus_count", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "focus_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_key_count", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "key_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_text_count", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "text_count", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_last_click_x", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "last_click_x", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_last_click_y", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "last_click_y", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_scroll_offset_y", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "scroll_offset_y", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_focused_item_id", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "focused_item_id", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_typed_text", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "typed_text", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_last_key", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "last_key", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_hit_item_id", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "hit_item_id", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_hit_source_node_id", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "hit_source_node_id", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_hit_source_module_path", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "hit_source_module_path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_hit_source_component_name", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "hit_source_component_name", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_hit_source_line", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "hit_source_line", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_hit_item_interactive", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "hit_item_interactive", "false"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_inspector_ready", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "inspector_ready", "false"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_inspector_title", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "inspector_title", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_inspector_panel_x", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "inspector_panel_x", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_inspector_panel_y", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "inspector_panel_y", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_inspector_panel_width", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "inspector_panel_width", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_inspector_panel_height", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "inspector_panel_height", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_inspector_lines_json", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "inspector_lines_json", "[]"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_source_jump_enabled", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "source_jump_enabled", "false"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_source_jump_attempted", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "source_jump_attempted", "false"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_source_jump_ok", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "source_jump_ok", "false"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_source_jump_target_path", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "source_jump_target_path", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_source_jump_target_line", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "source_jump_target_line", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_source_jump_command", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "source_jump_command", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_source_jump_error", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "source_jump_error", ""))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_window_width", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "window_width", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_window_height", r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "window_height", "0"))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_screenshot_path", screenshotPath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_screenshot_written", screenshotWrittenText)
+    if !v3path.V3WriteTextFile("", nativeGuiRunSummaryPath, nativeGuiRunSummaryText):
+        r2cControllerPrintErr("r2c-react-v3: native gui run summary write failed: " + nativeGuiRunSummaryPath)
+        return 1
+    var hitInspectorReadyBuilt: bool
+    if !r2cControllerWriteNativeGuiRunHitInspector(nativeGuiRunSummaryPath, sessionPath, hitInspectorPath, hitInspectorReadyBuilt):
+        return 1
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_hit_inspector_path", hitInspectorPath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_hit_inspector_ready", r2cControllerJsonBool(hitInspectorReadyBuilt))
+    var inspectorStateReadyBuilt: bool
+    if !v3path.V3WriteTextFile("", nativeGuiRunSummaryPath, nativeGuiRunSummaryText):
+        r2cControllerPrintErr("r2c-react-v3: native gui run summary write failed before inspector state: " + nativeGuiRunSummaryPath)
+        return 1
+    if !r2cControllerWriteNativeGuiRunInspectorState(repo,
+                                                     bundlePath,
+                                                     sessionPath,
+                                                     screenshotPath,
+                                                     nativeGuiRunSummaryPath,
+                                                     hitInspectorPath,
+                                                     inspectorStatePath,
+                                                     inspectorStateReadyBuilt):
+        return 1
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_inspector_state_path", inspectorStatePath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_inspector_state_ready", r2cControllerJsonBool(inspectorStateReadyBuilt))
+    if !v3path.V3WriteTextFile("", nativeGuiRunSummaryPath, nativeGuiRunSummaryText):
+        r2cControllerPrintErr("r2c-react-v3: native gui run summary final write failed: " + nativeGuiRunSummaryPath)
+        return 1
+    if r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_runtime_ready", "false") != "true":
+        let runtimeErrorBuilt: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_runtime_error", "")
+        r2cControllerPrintErr("r2c-react-v3: native gui runtime unready: " + runtimeErrorBuilt)
+        return 1
+    if r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_render_plan_ready", "false") != "true":
+        r2cControllerPrintErr("r2c-react-v3: native gui render plan unready")
+        return 1
+    if openSourceOnClick && r2cControllerParseInt32(r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_click_count", "0")) > 0:
+        if r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_source_jump_ok", "false") != "true":
+            r2cControllerPrintErr("r2c-react-v3: native gui source jump failed: " +
+                                  r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_source_jump_error", "unknown"))
+            return 1
 
     sessionPath = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_session_path", sessionPath)
     screenshotPath = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_screenshot_path", screenshotPath)
@@ -4089,9 +5712,13 @@ fn r2cControllerRunNativeGui(root: str,
     report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
     report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(sessionPath) + ",\n"
     report = report + "  \"primary_artifact_format\": \"native_gui_session_v1\",\n"
-    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(nativeGuiRunHelper) + ",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote("") + ",\n"
     report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(nativeGuiRunSummaryPath) + ",\n"
     report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(nativeGuiRunLogPath) + ",\n"
+    report = report + "  \"native_gui_host_source_path\": " + r2cControllerJsonQuote(nativeGuiHostSourcePath) + ",\n"
+    report = report + "  \"native_gui_host_compile_log_path\": " + r2cControllerJsonQuote(nativeGuiHostCompileLogPath) + ",\n"
+    report = report + "  \"native_gui_host_run_log_path\": " + r2cControllerJsonQuote(nativeGuiRunLogPath) + ",\n"
+    report = report + "  \"native_gui_host_run_fields_path\": " + r2cControllerJsonQuote(nativeGuiHostRunFieldsPath) + ",\n"
     report = report + "  \"module_count\": " + moduleCountText + ",\n"
     report = report + "  \"route_count\": " + routeCountText + ",\n"
     report = report + "  \"semantic_nodes_count\": " + semanticNodesCountText + ",\n"
@@ -4197,7 +5824,7 @@ fn r2cControllerRunNativeGui(root: str,
     report = report + "  \"native_gui_hit_source_node_id\": " + r2cControllerJsonQuote(hitSourceNodeId) + ",\n"
     report = report + "  \"native_gui_hit_source_module_path\": " + r2cControllerJsonQuote(hitSourceModulePath) + ",\n"
     report = report + "  \"native_gui_hit_source_component_name\": " + r2cControllerJsonQuote(hitSourceComponentName) + ",\n"
-    report = report + "  \"native_gui_hit_source_line\": " + hitSourceLineText + ",\n"
+    report = report + "  \"native_gui_hit_source_line\": " + r2cControllerJsonIntTextOrNull(hitSourceLineText) + ",\n"
     if hitItemInteractiveText == "true" || hitItemInteractiveText == "false":
         report = report + "  \"native_gui_hit_item_interactive\": " + hitItemInteractiveText + ",\n"
     else:
@@ -4225,7 +5852,7 @@ fn r2cControllerRunNativeGui(root: str,
     else:
         report = report + "  \"native_gui_source_jump_ok\": null,\n"
     report = report + "  \"native_gui_source_jump_target_path\": " + r2cControllerJsonQuote(sourceJumpTargetPath) + ",\n"
-    report = report + "  \"native_gui_source_jump_target_line\": " + sourceJumpTargetLineText + ",\n"
+    report = report + "  \"native_gui_source_jump_target_line\": " + r2cControllerJsonIntTextOrNull(sourceJumpTargetLineText) + ",\n"
     report = report + "  \"native_gui_source_jump_command\": " + r2cControllerJsonQuote(sourceJumpCommand) + ",\n"
     report = report + "  \"native_gui_source_jump_error\": " + r2cControllerJsonQuote(sourceJumpError) + ",\n"
     if strings.Len(windowWidthText) > 0:

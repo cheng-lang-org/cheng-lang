@@ -133,6 +133,25 @@ fn v3RunFileLogged(root: str, label: str, filePathRaw: str, argv: str[], envOver
         let missingText = v3HostOpsMissingExecutableText(filePath)
         let _logged: bool = v3path.V3WriteTextFile(root, logPath, missingText)
         return v3LoggedRunMake(label, filePath, logPath, 127, missingText)
+    if v3HostOpsLiveProgressEnabled(envOverrides):
+        let spawnRes = hostos.ExecFilePipeSpawn(filePath, argv, envOverrides, workingDir)
+        if !spawnRes.ok || spawnRes.pid <= 0 || spawnRes.readFd < 0:
+            let outputText = "spawn pid missing: " + filePath + "\n"
+            let _logged: bool = v3path.V3WriteTextFile(root, logPath, outputText)
+            return v3LoggedRunMake(label, filePath, logPath, 1, outputText)
+        var writeFd = spawnRes.writeFd
+        if writeFd >= 0:
+            hostos.PtyClose(writeFd)
+            writeFd = -1
+        var proc = v3SpawnedProcessMake(label,
+                                        filePath,
+                                        spawnRes.readFd,
+                                        writeFd,
+                                        spawnRes.pid,
+                                        "",
+                                        "",
+                                        0)
+        return v3SpawnedProcessWaitLoggedLive(root, proc, timeoutSec, logPathRaw)
     let res: os.ExecCmdResult = v3ExecFileDirect(filePath, argv, envOverrides, workingDir, timeoutSec, true)
     let outputText = os.ExecCmdResultOutput(res)
     let exitCode = os.ExecCmdResultExitCode(res)
@@ -216,11 +235,66 @@ fn v3RunProgramLoggedWithInputText(root: str,
 fn v3LoggedRunOk(run: V3LoggedRun): bool =
     return run.exitCode == 0
 
+fn v3HostOpsEnvOverrideValue(envOverrides: str[],
+                             key: str): str =
+    for i in 0..<envOverrides.len:
+        let item: str = strutil.Strip(envOverrides[i])
+        if strutil.StartsWith(item, key + "="):
+            return strings.SliceBytes(item, len(key) + 1, len(item) - len(key) - 1)
+    return ""
+
+fn v3HostOpsLiveProgressEnabled(envOverrides: str[]): bool =
+    let progressText = strutil.Strip(v3HostOpsEnvOverrideValue(envOverrides, "CHENG_V3_PROGRESS"))
+    if len(progressText) > 0 && progressText != "0" && progressText != "false":
+        return true
+    let pathText = strutil.Strip(v3HostOpsEnvOverrideValue(envOverrides, "CHENG_V3_PROGRESS_OUT"))
+    return len(pathText) > 0
+
+fn v3LoggedRunSignalName(exitCode: int32): str =
+    if exitCode < 129:
+        return ""
+    let signalCode: int32 = exitCode - 128
+    if signalCode == 1:
+        return "SIGHUP"
+    if signalCode == 2:
+        return "SIGINT"
+    if signalCode == 3:
+        return "SIGQUIT"
+    if signalCode == 4:
+        return "SIGILL"
+    if signalCode == 5:
+        return "SIGTRAP"
+    if signalCode == 6:
+        return "SIGABRT"
+    if signalCode == 7:
+        return "SIGBUS"
+    if signalCode == 8:
+        return "SIGFPE"
+    if signalCode == 9:
+        return "SIGKILL"
+    if signalCode == 10:
+        return "SIGUSR1"
+    if signalCode == 11:
+        return "SIGSEGV"
+    if signalCode == 12:
+        return "SIGUSR2"
+    if signalCode == 13:
+        return "SIGPIPE"
+    if signalCode == 14:
+        return "SIGALRM"
+    if signalCode == 15:
+        return "SIGTERM"
+    return ""
+
 fn v3LoggedRunSummary(run: V3LoggedRun): str =
     var out = ""
     out = out + run.label
-    out = out + " rc="
+    out = out + " exit="
     out = out + intToStr(run.exitCode)
+    let signalName: str = v3LoggedRunSignalName(run.exitCode)
+    if len(signalName) > 0:
+        out = out + " signal="
+        out = out + signalName
     out = out + " log="
     out = out + run.logPath
     return out
@@ -368,6 +442,105 @@ fn v3SpawnedProcessPoll(proc: var V3SpawnedProcess): int32 =
 fn v3SpawnedProcessRunning(proc: var V3SpawnedProcess): bool =
     let exitCode = v3SpawnedProcessPoll(proc)
     return exitCode == v3ProcessRunning
+
+fn v3HostOpsEchoProgressChunk(chunk: str) =
+    var start: int32
+    var i: int32
+    while i <= len(chunk):
+        let atEnd = i == len(chunk)
+        if atEnd:
+            let line = strings.SliceBytes(chunk, start, i - start)
+            if len(line) > 0 && strutil.StartsWith(line, "compile_progress "):
+                os.WriteLine(os.Get_stderr(), line)
+            start = i + 1
+        elif chunk[i] == '\n':
+            let line = strings.SliceBytes(chunk, start, i - start)
+            if len(line) > 0 && strutil.StartsWith(line, "compile_progress "):
+                os.WriteLine(os.Get_stderr(), line)
+            start = i + 1
+        i = i + 1
+
+fn v3SpawnedProcessWaitLoggedLive(root: str,
+                                  proc: var V3SpawnedProcess,
+                                  timeoutSec: int32,
+                                  logPathRaw: str): V3LoggedRun =
+    let start = monotimes.getMonoTime()
+    let startNs: int64 = monotimes.monoTimeNs(start)
+    let timeoutNs: int64 = int64(timeoutSec) * int64(1000000000)
+    var timedOut = false
+    var termSent = false
+    var termAtNs: int64
+    var exitCode = -1
+    while proc.pid > 0:
+        let beforeLen = len(proc.output)
+        v3SpawnedProcessDrain(proc, 20)
+        if len(proc.output) > beforeLen:
+            let chunk = strings.SliceBytes(proc.output, beforeLen, len(proc.output) - beforeLen)
+            v3HostOpsEchoProgressChunk(chunk)
+        if len(proc.liveLogPath) > 0:
+            if !hostos.ProcessExists(proc.pid):
+                exitCode = 0
+                proc.pid = 0
+                break
+            if timeoutSec > 0:
+                let nowTime = monotimes.getMonoTime()
+                let nowNs: int64 = monotimes.monoTimeNs(nowTime) - startNs
+                if nowNs >= timeoutNs:
+                    timedOut = true
+                    if !termSent:
+                        let _term = v3SpawnedProcessSignal(proc, v3ProcessSigTerm)
+                        termSent = true
+                        termAtNs = nowNs
+                    elif nowNs - termAtNs >= int64(500000000):
+                        let _kill = v3SpawnedProcessSignal(proc, v3ProcessSigKill)
+                    os.SleepMs(20)
+                    continue
+            os.SleepMs(10)
+            continue
+        let waitRes = hostos.PtyWait(proc.pid)
+        let waitStatus = waitRes.waitStatus
+        if waitStatus == 1:
+            exitCode = waitRes.exitCode
+            proc.pid = 0
+            break
+        if waitStatus < 0:
+            exitCode = -1
+            proc.pid = 0
+            break
+        if timeoutSec > 0:
+            let nowTime = monotimes.getMonoTime()
+            let nowNs: int64 = monotimes.monoTimeNs(nowTime) - startNs
+            if nowNs >= timeoutNs:
+                timedOut = true
+                if !termSent:
+                    let _term = v3SpawnedProcessSignal(proc, v3ProcessSigTerm)
+                    termSent = true
+                    termAtNs = nowNs
+                elif nowNs - termAtNs >= int64(500000000):
+                    let _kill = v3SpawnedProcessSignal(proc, v3ProcessSigKill)
+                os.SleepMs(20)
+                continue
+        os.SleepMs(10)
+    let beforeLen = len(proc.output)
+    v3SpawnedProcessDrain(proc, 0)
+    if len(proc.output) > beforeLen:
+        let chunk = strings.SliceBytes(proc.output, beforeLen, len(proc.output) - beforeLen)
+        v3HostOpsEchoProgressChunk(chunk)
+    v3SpawnedProcessCloseWrite(proc)
+    v3SpawnedProcessCloseRead(proc)
+    if timedOut:
+        exitCode = 124
+    let logPathAbsRaw: str = v3path.V3PathAbsolute(root, logPathRaw)
+    let logPath: str = newStringCopy(strDataPtr(logPathAbsRaw), strLenFast(logPathAbsRaw))
+    let outputText: str = proc.output
+    let _logged: bool = v3path.V3WriteTextFile(root, logPath, outputText)
+    let out = v3LoggedRunMake(proc.label,
+                              proc.filePath,
+                              logPath,
+                              exitCode,
+                              proc.output)
+    proc = V3SpawnedProcess()
+    return out
 
 fn v3SpawnedProcessWaitLogged(root: str,
                               proc: var V3SpawnedProcess,
@@ -563,3 +736,41 @@ fn v3ParallelWaitFailfast(root: str,
                     failedRun = v3LoggedRunZero("parallel_timeout", "", "", 124, "parallel timeout\n")
                 return false
         os.SleepMs(10)
+
+fn V3RunFileLogged(root: str, label: str, filePathRaw: str, argv: str[], envOverrides: str[],
+                   workingDirRaw: str, timeoutSec: int32, logPathRaw: str): V3LoggedRun =
+    return v3RunFileLogged(root, label, filePathRaw, argv, envOverrides, workingDirRaw, timeoutSec, logPathRaw)
+
+fn V3RunProgramLogged(root: str, label: str, programName: str, argv: str[], envOverrides: str[],
+                      workingDirRaw: str, timeoutSec: int32, logPathRaw: str): V3LoggedRun =
+    return v3RunProgramLogged(root, label, programName, argv, envOverrides, workingDirRaw, timeoutSec, logPathRaw)
+
+fn V3LoggedRunZero(label: str,
+                   filePath: str,
+                   logPath: str,
+                   exitCode: int32,
+                   output: str): V3LoggedRun =
+    return v3LoggedRunZero(label, filePath, logPath, exitCode, output)
+
+fn V3SpawnFile(root: str,
+               label: str,
+               filePathRaw: str,
+               argv: str[],
+               envOverrides: str[],
+               workingDirRaw: str): Result[V3SpawnedProcess] =
+    return v3SpawnFile(root, label, filePathRaw, argv, envOverrides, workingDirRaw)
+
+fn V3SpawnedProcessDrain(proc: var V3SpawnedProcess, timeoutMs: int32) =
+    v3SpawnedProcessDrain(proc, timeoutMs)
+
+fn V3SpawnedProcessKill(proc: var V3SpawnedProcess) =
+    v3SpawnedProcessKill(proc)
+
+fn V3SpawnedProcessRunning(proc: var V3SpawnedProcess): bool =
+    return v3SpawnedProcessRunning(proc)
+
+fn V3SpawnedProcessWaitLogged(root: str,
+                              proc: var V3SpawnedProcess,
+                              timeoutSec: int32,
+                              logPathRaw: str): V3LoggedRun =
+    return v3SpawnedProcessWaitLogged(root, proc, timeoutSec, logPathRaw)

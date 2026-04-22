@@ -140,7 +140,9 @@ ${chunkBody}
   const focusColor = '#f59e0b';
 
   const head = `import ${execIoModule} as exec_io
+import std/json as json
 import std/strings as strings
+import cheng/v3/tooling/path as v3path
 
 @importc("driver_c_read_flag_value_bridge")
 fn r2cNativeGuiReadFlagValueBridge(key: str, outValue: var str): bool
@@ -229,6 +231,10 @@ type
         lastKey: str
         visibleLayoutItemCount: int32
 
+var r2cNativeGuiCatalogLoadAttempted: bool
+var r2cNativeGuiCatalogItemsReady: bool
+var r2cNativeGuiCatalogItemsCache: R2cNativeGuiItem[]
+
 fn r2cNativeGuiItemZero(): R2cNativeGuiItem =
     var out: R2cNativeGuiItem
     out.id = ""
@@ -312,7 +318,7 @@ fn r2cNativeGuiStateZero(): R2cNativeGuiState =
 
   const itemsBlock = `${itemChunkFunctions.join('\n\n')}
 
-fn r2cNativeGuiItems(): R2cNativeGuiItem[] =
+fn r2cNativeGuiDefaultItems(): R2cNativeGuiItem[] =
     var out: R2cNativeGuiItem[]
 ${itemChunkCalls}
     return out`;
@@ -364,6 +370,142 @@ fn r2cNativeGuiReadFlag(key: str, defaultValue: str): str =
     if r2cNativeGuiReadFlagValueBridge(key, out):
         return out
     return defaultValue
+
+fn r2cNativeGuiJsonNodeStr(node: json.JsonNode, fallback: str): str =
+    if node.kind == json.JString:
+        return json.GetStr(node)
+    return fallback
+
+fn r2cNativeGuiJsonNodeInt32(node: json.JsonNode, fallback: int32): int32 =
+    if node.kind == json.JInt:
+        return int32(json.GetInt(node))
+    return fallback
+
+fn r2cNativeGuiJsonNodeBool(node: json.JsonNode, fallback: bool): bool =
+    if node.kind == json.JBool:
+        return json.GetBool(node)
+    return fallback
+
+fn r2cNativeGuiJsonFieldStr(node: json.JsonNode, key: str, fallback: str): str =
+    return r2cNativeGuiJsonNodeStr(node[key], fallback)
+
+fn r2cNativeGuiJsonFieldInt32(node: json.JsonNode, key: str, fallback: int32): int32 =
+    return r2cNativeGuiJsonNodeInt32(node[key], fallback)
+
+fn r2cNativeGuiJsonFieldBool(node: json.JsonNode, key: str, fallback: bool): bool =
+    return r2cNativeGuiJsonNodeBool(node[key], fallback)
+
+fn r2cNativeGuiItemFromCatalogNode(node: json.JsonNode): R2cNativeGuiItem =
+    var out = r2cNativeGuiItemZero()
+    out.id = r2cNativeGuiJsonFieldStr(node, "id", "")
+    out.sourceNodeId = r2cNativeGuiJsonFieldStr(node, "source_node_id", "")
+    out.kind = r2cNativeGuiJsonFieldStr(node, "kind", "")
+    out.x = r2cNativeGuiJsonFieldInt32(node, "x", 0)
+    out.y = r2cNativeGuiJsonFieldInt32(node, "y", 0)
+    out.width = r2cNativeGuiJsonFieldInt32(node, "width", 0)
+    out.height = r2cNativeGuiJsonFieldInt32(node, "height", 0)
+    out.text = r2cNativeGuiJsonFieldStr(node, "text", "")
+    out.detailText = r2cNativeGuiJsonFieldStr(node, "detail_text", "")
+    out.zIndex = r2cNativeGuiJsonFieldInt32(node, "z_index", 0)
+    out.planRole = r2cNativeGuiJsonFieldStr(node, "plan_role", "")
+    out.layer = r2cNativeGuiJsonFieldStr(node, "layer", "")
+    out.column = r2cNativeGuiJsonFieldInt32(node, "column", 0)
+    out.columnSpan = r2cNativeGuiJsonFieldInt32(node, "column_span", 0)
+    out.interactive = r2cNativeGuiJsonFieldBool(node, "interactive", false)
+    out.synthetic = r2cNativeGuiJsonFieldBool(node, "synthetic", false)
+    out.visualRole = r2cNativeGuiJsonFieldStr(node, "visual_role", "")
+    out.density = r2cNativeGuiJsonFieldStr(node, "density", "")
+    out.prominence = r2cNativeGuiJsonFieldStr(node, "prominence", "")
+    out.accentTone = r2cNativeGuiJsonFieldStr(node, "accent_tone", "")
+    out.sourceModulePath = r2cNativeGuiJsonFieldStr(node, "source_module_path", "")
+    out.sourceComponentName = r2cNativeGuiJsonFieldStr(node, "source_component_name", "")
+    out.sourceLine = r2cNativeGuiJsonFieldInt32(node, "source_line", 0)
+    out.backgroundColor = r2cNativeGuiJsonFieldStr(node, "background_color", "")
+    out.borderColor = r2cNativeGuiJsonFieldStr(node, "border_color", "")
+    out.textColor = r2cNativeGuiJsonFieldStr(node, "text_color", "")
+    out.detailColor = r2cNativeGuiJsonFieldStr(node, "detail_color", "")
+    out.fontSize = r2cNativeGuiJsonFieldInt32(node, "font_size", 0)
+    out.fontWeight = r2cNativeGuiJsonFieldStr(node, "font_weight", "")
+    out.cornerRadius = r2cNativeGuiJsonFieldInt32(node, "corner_radius", 0)
+    out.stretchX = r2cNativeGuiJsonFieldBool(node, "stretch_x", false)
+    out.stretchY = r2cNativeGuiJsonFieldBool(node, "stretch_y", false)
+    return out
+
+fn r2cNativeGuiTryLoadCatalogPathFromContract(outPath: var str): bool =
+    outPath = ""
+    let contractPath = r2cNativeGuiReadFlag("--runtime-contract", "")
+    if len(contractPath) <= 0:
+        return false
+    let contractText = v3path.V3ReadTextFile("", contractPath)
+    if len(contractText) <= 0:
+        return false
+    let parseRes = json.ParseJsonSafe(contractText)
+    if !parseRes.success:
+        return false
+    let root = parseRes.value
+    if r2cNativeGuiJsonFieldStr(root, "format", "") != "native_gui_runtime_contract_v1":
+        return false
+    outPath = r2cNativeGuiJsonFieldStr(root, "typed_item_catalog_path", "")
+    if len(outPath) <= 0:
+        let typedCatalogNode = root["typed_item_catalog"]
+        if typedCatalogNode.kind == json.JObject:
+            outPath = r2cNativeGuiJsonFieldStr(typedCatalogNode, "path", "")
+    if len(outPath) <= 0:
+        return false
+    return true
+
+fn r2cNativeGuiTryLoadCatalogItems(out: var R2cNativeGuiItem[]): bool =
+    out = []
+    var catalogPath: str
+    if !r2cNativeGuiTryLoadCatalogPathFromContract(catalogPath):
+        return false
+    let catalogText = v3path.V3ReadTextFile("", catalogPath)
+    if len(catalogText) <= 0:
+        return false
+    let parseRes = json.ParseJsonSafe(catalogText)
+    if !parseRes.success:
+        return false
+    let root = parseRes.value
+    if r2cNativeGuiJsonFieldStr(root, "format", "") != "native_layout_item_catalog_v1":
+        return false
+    let itemsNode = root["items"]
+    if itemsNode.kind != json.JArray:
+        return false
+    let expectedCount = r2cNativeGuiJsonFieldInt32(root, "item_count", int32(itemsNode.a.len))
+    for i in 0..<itemsNode.a.len:
+        let item = r2cNativeGuiItemFromCatalogNode(itemsNode.a[i])
+        if len(item.id) <= 0:
+            return false
+        add(out, item)
+    if expectedCount > 0 && int32(out.len) != expectedCount:
+        return false
+    return out.len > 0
+
+fn r2cNativeGuiCachedCatalogItems(out: var R2cNativeGuiItem[]): bool =
+    out = []
+    if r2cNativeGuiCatalogLoadAttempted:
+        if !r2cNativeGuiCatalogItemsReady:
+            return false
+        for i in 0..<r2cNativeGuiCatalogItemsCache.len:
+            add(out, r2cNativeGuiCatalogItemsCache[i])
+        return true
+    r2cNativeGuiCatalogLoadAttempted = true
+    var loaded: R2cNativeGuiItem[]
+    if !r2cNativeGuiTryLoadCatalogItems(loaded):
+        r2cNativeGuiCatalogItemsReady = false
+        return false
+    r2cNativeGuiCatalogItemsCache = []
+    for i in 0..<loaded.len:
+        add(r2cNativeGuiCatalogItemsCache, loaded[i])
+        add(out, loaded[i])
+    r2cNativeGuiCatalogItemsReady = true
+    return true
+
+fn r2cNativeGuiItems(): R2cNativeGuiItem[] =
+    var out: R2cNativeGuiItem[]
+    if r2cNativeGuiCachedCatalogItems(out):
+        return out
+    return r2cNativeGuiDefaultItems()
 
 fn r2cNativeGuiThemeBackgroundTop(): str =
     return ${chengStr(backgroundTop)}
@@ -499,6 +641,34 @@ fn r2cNativeGuiSetSelectedFromItem(state: var R2cNativeGuiState, item: R2cNative
     state.selectedItemHeight = r2cNativeGuiItemRenderHeight(state, item)
     return
 
+fn r2cNativeGuiItemSourceBacked(item: R2cNativeGuiItem): bool =
+    if len(item.sourceModulePath) > 0:
+        return true
+    if len(item.sourceComponentName) > 0:
+        return true
+    if item.sourceLine > 0:
+        return true
+    return false
+
+fn r2cNativeGuiFindDefaultSelectedIndex(state: R2cNativeGuiState): int32 =
+    let items = r2cNativeGuiItems()
+    for i in 0..<items.len:
+        let item = items[i]
+        if item.id == "root":
+            continue
+        if !r2cNativeGuiItemSourceBacked(item):
+            continue
+        if !r2cNativeGuiItemVisible(state, item):
+            continue
+        return i
+    for i in 0..<items.len:
+        let item = items[i]
+        if item.id == "root":
+            continue
+        if r2cNativeGuiItemSourceBacked(item):
+            return i
+    return -1
+
 fn r2cNativeGuiRefreshMetrics(state: var R2cNativeGuiState) =
     state.contentHeight = r2cNativeGuiMeasureContentHeight(state)
     let overflow = state.contentHeight - state.windowHeight
@@ -510,7 +680,12 @@ fn r2cNativeGuiRefreshMetrics(state: var R2cNativeGuiState) =
     let items = r2cNativeGuiItems()
     let selectedIndex = r2cNativeGuiFindItemIndex(state.selectedItemId)
     if selectedIndex < 0:
-        r2cNativeGuiClearSelection(state)
+        let defaultSelectedIndex = r2cNativeGuiFindDefaultSelectedIndex(state)
+        if defaultSelectedIndex >= 0:
+            let defaultSelectedItem = items[defaultSelectedIndex]
+            r2cNativeGuiSetSelectedFromItem(state, defaultSelectedItem)
+        else:
+            r2cNativeGuiClearSelection(state)
     else:
         let selectedItem = items[selectedIndex]
         r2cNativeGuiSetSelectedFromItem(state, selectedItem)

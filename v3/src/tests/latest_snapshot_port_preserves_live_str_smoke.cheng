@@ -1,0 +1,35 @@
+import std/system
+import std/cmdline as cmdline
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/libp2p/host/host
+import cheng/v3/project/chain_node as node
+import cheng/v3/project/chain_node_libp2p as net
+
+fn main(): int32 =
+    let port = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    let keep = cmdline.ReadFlagOrDefault("--value", "/tmp/latest-snapshot-port-preserve-live-str")
+    let keepStable = newStringCopy(strDataPtr(keep), strLenFast(keep))
+    assert(len(keepStable) > 0, "latest snapshot port preserve: arg")
+    var server: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(server, "latest.snapshot.port", "quic.twoproc")),
+           "latest snapshot port preserve: init")
+    var serverHost = host.v3Libp2pHostInit("latest.snapshot.port")
+    let mintRes = node.v3ChainNodeMint(server, 9, 1001, int64(88))
+    assert(mintRes.ok, "latest snapshot port preserve: mint")
+    let transferRes = node.v3ChainNodeTransfer(server, 9, 1001, 2002, int64(33))
+    assert(transferRes.ok, "latest snapshot port preserve: transfer")
+    let serveRes = net.v3ChainNodeLibp2pServeOnce(server, serverHost)
+    assert(serveRes.ok, "latest snapshot port preserve: serve once")
+    var latest: overlay.V3IngressEnvelope
+    let latestRes = net.v3ChainNodeLibp2pLatestSnapshotHostIndex(serverHost, server.address)
+    assert(IsOk(latestRes), "latest snapshot port preserve: latest index")
+    assert(keep == keepStable, "latest snapshot port preserve: keep after latest")
+    let latestIndex = latestRes.value
+    assert(keep == keepStable, "latest snapshot port preserve: keep after latestIndex")
+    let latestEntry = serverHost.storeEntries[latestIndex]
+    assert(keep == keepStable, "latest snapshot port preserve: keep after latestEntry")
+    net.v3ChainNodeLibp2pCopyIngress(latest, latestEntry.ingress)
+    assert(keep == keepStable, "latest snapshot port preserve: keep after copy")
+    assert(port >= 0, "latest snapshot port preserve: keep port live")
+    echo("v3 latest_snapshot_port_preserves_live_str_smoke ok")
+    return 0

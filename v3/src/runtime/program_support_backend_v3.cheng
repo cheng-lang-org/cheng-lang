@@ -667,6 +667,30 @@ fn cheng_str_copy(raw: ptr, n: int32): str =
         return cheng_str_empty()
     return cheng_str_view_owned(outRaw, n)
 
+fn cheng_str_retain_owned(s: str) =
+    if s.flags == chengStrFlagOwned && s.data != nil:
+        cheng_mem_retain_export(s.data)
+
+fn cheng_str_release_owned(s: str) =
+    if s.flags == chengStrFlagOwned && s.data != nil:
+        cheng_mem_release_export(s.data)
+
+fn cheng_str_store_slot(slot: ptr, val: str) =
+    if slot == nil:
+        return
+    let outPtr: StrPtr = StrPtr(slot)
+    var prev: str
+    prev.data = outPtr->data
+    prev.len = outPtr->len
+    prev.store_id = outPtr->store_id
+    prev.flags = outPtr->flags
+    cheng_str_retain_owned(val)
+    cheng_str_release_owned(prev)
+    outPtr->data = val.data
+    outPtr->len = val.len
+    outPtr->store_id = val.store_id
+    outPtr->flags = val.flags
+
 fn cheng_fopen_write(path: ptr): ptr =
     if path == nil:
         return nil
@@ -935,7 +959,7 @@ fn cheng_exec_program_seq_add(out: var str[], value: str) =
     cheng_seq_grow_inst_export(seqPtr, nextLen, int32(sizeof str))
     let hdrAfter: ChengSeqHeaderPtr = ChengSeqHeaderPtr(seqPtr)
     let slot: StrPtr = StrPtr(cheng_ptr_plus(hdrAfter->buffer, hdrAfter->len * int32(sizeof str)))
-    *slot = value
+    cheng_str_store_slot(ptr(slot), value)
     hdrAfter->len = nextLen
 
 fn cheng_exec_program_encode_wire_items(items: str[]): str =
@@ -1511,7 +1535,7 @@ fn native_cheng_exec_file_pipe_spawn_runtime(filePath: ptr,
         argCount = argCount + envCount + 1
     let ok: int32 = cheng_exec_program_spawn_pipe_argv(argvRaw,
                                                        workingDir,
-                                                       0,
+                                                       1,
                                                        outReadFd,
                                                        outWriteFd,
                                                        outPid)
@@ -2148,6 +2172,50 @@ fn cheng_seq_delete_shift_export(buffer: ptr, at: int32, len: int32, elemSize: i
         *(UInt8Ptr(cheng_ptr_plus(buffer, dstOff + i))) = *(UInt8Ptr(cheng_ptr_plus(buffer, srcOff + i)))
         i = i + 1
 
+@exportc("cheng_seq_string_release_range_compat")
+fn cheng_seq_string_release_range_compat_export(buffer: ptr, startIndex: int32, count: int32) =
+    if buffer == nil || count <= 0:
+        return
+    let elemBytes: int32 = int32(sizeof str)
+    var start: int32 = startIndex
+    if start < 0:
+        start = 0
+    var i: int32
+    while i < count:
+        let slot: ptr = cheng_ptr_plus(buffer, (start + i) * elemBytes)
+        let curPtr: StrPtr = StrPtr(slot)
+        var cur: str
+        cur.data = curPtr->data
+        cur.len = curPtr->len
+        cur.store_id = curPtr->store_id
+        cur.flags = curPtr->flags
+        cheng_str_release_owned(cur)
+        curPtr->data = nil
+        curPtr->len = 0
+        curPtr->store_id = 0
+        curPtr->flags = 0
+        i = i + 1
+
+@exportc("cheng_seq_string_delete_shift_compat")
+fn cheng_seq_string_delete_shift_compat_export(buffer: ptr, at: int32, len: int32) =
+    if buffer == nil || at < 0 || at >= len:
+        return
+    cheng_seq_string_release_range_compat_export(buffer, at, 1)
+    let elemBytes: int32 = int32(sizeof str)
+    if at + 1 < len:
+        let dstOff: int32 = at * elemBytes
+        let srcOff: int32 = (at + 1) * elemBytes
+        let moveBytes: int32 = (len - at - 1) * elemBytes
+        var i: int32
+        while i < moveBytes:
+            *(UInt8Ptr(cheng_ptr_plus(buffer, dstOff + i))) = *(UInt8Ptr(cheng_ptr_plus(buffer, srcOff + i)))
+            i = i + 1
+    let lastSlot: StrPtr = StrPtr(cheng_ptr_plus(buffer, (len - 1) * elemBytes))
+    lastSlot->data = nil
+    lastSlot->len = 0
+    lastSlot->store_id = 0
+    lastSlot->flags = 0
+
 @exportc("cheng_seq_grow_to_raw")
 fn cheng_seq_grow_to_raw_export(pBuffer: ptr, pCap: ptr, minCap: int32, elemSize: int32) =
     if pBuffer == nil || pCap == nil || minCap <= 0 || elemSize <= 0:
@@ -2333,13 +2401,7 @@ fn load_int32_export(p: ptr): int32 =
 
 @exportc("store")
 fn store_str_export(p: ptr, val: str) =
-    if p == nil:
-        return
-    let outPtr: StrPtr = StrPtr(p)
-    outPtr->data = val.data
-    outPtr->len = val.len
-    outPtr->store_id = val.store_id
-    outPtr->flags = val.flags
+    cheng_str_store_slot(p, val)
 
 @exportc("cheng_str_bridge_load_into")
 fn cheng_str_bridge_load_into_export(out_raw: ptr, p: ptr) =
@@ -2423,8 +2485,7 @@ fn driver_c_new_string_export(size0: int32): ptr =
 fn driver_c_new_string_copy_n_export(raw: ptr, n: int32): ptr =
     return cheng_string_copy(raw, n)
 
-@exportc("cheng_str_param_to_cstring_compat")
-fn cheng_str_param_to_cstring_compat_export(s: str): ptr =
+fn cheng_str_param_to_cstring_compat_value(s: str): ptr =
     if !cheng_probably_valid_str_bridge(s):
         let compat: ptr = cheng_fallback_string_ptr(s)
         return compat == nil ? "" : compat
@@ -2440,9 +2501,15 @@ fn cheng_str_param_to_cstring_compat_export(s: str): ptr =
         return ""
     return out
 
+@exportc("cheng_str_param_to_cstring_compat")
+fn cheng_str_param_to_cstring_compat_export(s_raw: ptr): ptr =
+    var s: str
+    cheng_str_bridge_load_into_export(&s, s_raw)
+    return cheng_str_param_to_cstring_compat_value(s)
+
 @exportc("cheng_str_to_cstring_temp_bridge")
-fn cheng_str_to_cstring_temp_bridge_export(s: str): ptr =
-    return cheng_str_param_to_cstring_compat_export(s)
+fn cheng_str_to_cstring_temp_bridge_export(s_raw: ptr): ptr =
+    return cheng_str_param_to_cstring_compat_export(s_raw)
 
 @exportc("cheng_seq_string_elem_bytes_compat")
 fn cheng_seq_string_elem_bytes_compat_export(): int32 =

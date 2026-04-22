@@ -10,6 +10,7 @@ import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/compiler_runtime as crun
 import cheng/v3/tooling/support_matrix as smatrix
 import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_world_bundle as cwbundle
 import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/tooling/compiler_equivalence as ceq
 import cheng/v3/tooling/compiler_publish_gate as cpub
@@ -207,13 +208,26 @@ fn v3CompilerBridgeCandidateReady(rootDir: str,
     return true
 
 fn v3CompilerBridgeCompilerPath(rootDir: str): str =
-    let stage3 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage3")
-    if v3CompilerBridgeCandidateReady(rootDir, stage3):
-        return stage3
     if !v3CompilerBackendDriverHandoffDisabled():
         let backendDriver = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng")
         if v3CompilerBridgeCandidateReady(rootDir, backendDriver):
             return backendDriver
+    else:
+        let currentPath = v3CompilerCurrentExecutablePath(rootDir)
+        let backendDriver = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng")
+        let stage3 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage3")
+        let stage2 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage2")
+        let stage1 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage1")
+        let stage0 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage0")
+        if currentPath == backendDriver ||
+           currentPath == stage3 ||
+           currentPath == stage2 ||
+           currentPath == stage1 ||
+           currentPath == stage0:
+            return ""
+    let stage3 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage3")
+    if v3CompilerBridgeCandidateReady(rootDir, stage3):
+        return stage3
     let stage2 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage2")
     if v3CompilerBridgeCandidateReady(rootDir, stage2):
         return stage2
@@ -258,6 +272,101 @@ fn v3CompilerArgsWithoutReportOut(args: str[]): str[] =
             continue
         add(out, args[i])
         i = i + 1
+    return out
+
+fn v3CompilerReadFlagFromArgs(args: str[],
+                              flagName: str,
+                              defaultValue: str): str =
+    var i: int32
+    while i < args.len:
+        let arg = strutil.Strip(args[i])
+        if arg == flagName:
+            if i + 1 < args.len:
+                return args[i + 1]
+            return defaultValue
+        if strutil.StartsWith(arg, flagName + ":") || strutil.StartsWith(arg, flagName + "="):
+            return strings.SliceBytes(arg, len(flagName) + 1, len(arg) - len(flagName) - 1)
+        i = i + 1
+    return defaultValue
+
+fn v3CompilerFlagEnabledFromArgs(args: str[],
+                                 flagName: str): bool =
+    var i: int32
+    while i < args.len:
+        let arg = strutil.Strip(args[i])
+        if arg == flagName:
+            return true
+        if strutil.StartsWith(arg, flagName + ":") || strutil.StartsWith(arg, flagName + "="):
+            let value = strutil.Strip(strings.SliceBytes(arg, len(flagName) + 1, len(arg) - len(flagName) - 1))
+            return len(value) <= 0 || (value != "0" && value != "false")
+        i = i + 1
+    return false
+
+fn v3CompilerArgsWithoutProgress(args: str[]): str[] =
+    var out: str[]
+    var i: int32
+    while i < args.len:
+        let arg = strutil.Strip(args[i])
+        if arg == "--progress":
+            i = i + 1
+            continue
+        if arg == "--progress-out":
+            i = i + 2
+            continue
+        if strutil.StartsWith(arg, "--progress:") || strutil.StartsWith(arg, "--progress="):
+            i = i + 1
+            continue
+        if strutil.StartsWith(arg, "--progress-out:") || strutil.StartsWith(arg, "--progress-out="):
+            i = i + 1
+            continue
+        add(out, args[i])
+        i = i + 1
+    return out
+
+fn v3CompilerProgressRequestedFromArgs(args: str[]): bool =
+    if v3CompilerFlagEnabledFromArgs(args, "--progress"):
+        return true
+    let progressOut = strutil.Strip(v3CompilerReadFlagFromArgs(args, "--progress-out", ""))
+    return len(progressOut) > 0
+
+fn v3CompilerProgressOutPathFromArgs(rootDir: str,
+                                     args: str[]): str =
+    let raw = strutil.Strip(v3CompilerReadFlagFromArgs(args, "--progress-out", ""))
+    if len(raw) <= 0:
+        return ""
+    return v3path.V3PathAbsolute(rootDir, raw)
+
+fn v3CompilerApplyProgressEnvFromArgs(rootDir: str,
+                                      args: str[]) =
+    if v3CompilerProgressRequestedFromArgs(args):
+        os.SetEnv("CHENG_V3_PROGRESS", "1")
+    let progressOut = v3CompilerProgressOutPathFromArgs(rootDir, args)
+    if len(progressOut) > 0:
+        os.SetEnv("CHENG_V3_PROGRESS_OUT", progressOut)
+
+fn v3CompilerProgressEnvOverrides(rootDir: str,
+                                  args: str[]): str[] =
+    var out: str[]
+    if v3CompilerProgressRequestedFromArgs(args):
+        add(out, "CHENG_V3_PROGRESS=1")
+    let progressOut = v3CompilerProgressOutPathFromArgs(rootDir, args)
+    if len(progressOut) > 0:
+        add(out, "CHENG_V3_PROGRESS_OUT=" + progressOut)
+    return out
+
+fn v3CompilerActiveRuntimeEnvOverrides(rootDir: str): str[] =
+    var out: str[]
+    let rootEnv = strutil.Strip(os.GetEnv("CHENG_V3_ROOT"))
+    if len(rootEnv) > 0:
+        add(out, "CHENG_V3_ROOT=" + rootEnv)
+    else:
+        add(out, "CHENG_V3_ROOT=" + rootDir)
+    let progressEnv = strutil.Strip(os.GetEnv("CHENG_V3_PROGRESS"))
+    if len(progressEnv) > 0:
+        add(out, "CHENG_V3_PROGRESS=" + progressEnv)
+    let progressOutEnv = strutil.Strip(os.GetEnv("CHENG_V3_PROGRESS_OUT"))
+    if len(progressOutEnv) > 0:
+        add(out, "CHENG_V3_PROGRESS_OUT=" + progressOutEnv)
     return out
 
 fn v3CompilerPlanNeedsBootstrapBridge(plan: sexec.V3SystemLinkExecPlan): bool =
@@ -394,6 +503,70 @@ fn v3CompilerAppendSystemLinkExecPhaseLines(report: str,
     v3CompilerAppendReportLine(out, "exec_phase_total_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.totalNs))
     return out
 
+fn v3CompilerSystemLinkExecSummary(plan: sexec.V3SystemLinkExecPlan): str =
+    var worldHeadPinned = "0"
+    var lockCheckEnabled = "0"
+    var lockVerified = "0"
+    var baselineSurfaceChecked = "0"
+    var baselineSurfaceCompatible = "0"
+    var lockPath = "-"
+    var baselineSurfacePath = "-"
+    if plan.worldHeadPinned:
+        worldHeadPinned = "1"
+    if plan.lockCheckEnabled:
+        lockCheckEnabled = "1"
+    if plan.lockVerified:
+        lockVerified = "1"
+    if plan.baselineSurfaceChecked:
+        baselineSurfaceChecked = "1"
+    if plan.baselineSurfaceCompatible:
+        baselineSurfaceCompatible = "1"
+    if len(plan.lockPath) > 0:
+        lockPath = plan.lockPath
+    if len(plan.baselineSurfacePath) > 0:
+        baselineSurfacePath = plan.baselineSurfacePath
+    var out = ""
+    out = out + "entry=" + plan.compilerEntrySource + "\n"
+    out = out + "target=" + plan.systemLinkPlan.targetTriple + "\n"
+    out = out + "output=" + plan.systemLinkPlan.outputPath + "\n"
+    out = out + "source_bundle_cid=" + layout.fixedBytes32Hex(plan.sourceBundleCid) + "\n"
+    out = out + "canonical_compiler_csg_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.canonicalGraphCid) + "\n"
+    out = out + "compiler_csg_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.graphCid) + "\n"
+    out = out + "export_surface_cid=" + layout.fixedBytes32Hex(plan.exportSurface.surfaceCid) + "\n"
+    out = out + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
+    out = out + "manifest_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.manifest.manifestCid) + "\n"
+    out = out + "manifest_entry_count=" + intToStr(plan.localUniverse.manifest.entryCount) + "\n"
+    out = out + "compiler_pkg_cid=" + layout.fixedBytes32Hex(plan.localUniverse.compilerSnapshot.snapshotCid) + "\n"
+    out = out + "std_pkg_cid=" + layout.fixedBytes32Hex(plan.localUniverse.stdSnapshot.snapshotCid) + "\n"
+    out = out + "runtime_pkg_cid=" + layout.fixedBytes32Hex(plan.localUniverse.runtimeSnapshot.snapshotCid) + "\n"
+    out = out + "world_head_pinned=" + worldHeadPinned + "\n"
+    out = out + "lock_check_enabled=" + lockCheckEnabled + "\n"
+    out = out + "lock_verified=" + lockVerified + "\n"
+    out = out + "lock_path=" + lockPath + "\n"
+    out = out + "baseline_surface_checked=" + baselineSurfaceChecked + "\n"
+    out = out + "baseline_surface_compatible=" + baselineSurfaceCompatible + "\n"
+    out = out + "baseline_surface_path=" + baselineSurfacePath + "\n"
+    out = out + "compile_receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
+    out = out + "compile_canonical_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.canonicalOutputDigest) + "\n"
+    out = out + "compile_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.outputDigest) + "\n"
+    out = out + "compile_bootstrap_stage=" + plan.compileReceipt.bootstrapStage
+    return v3CompilerAppendSystemLinkExecPhaseLines(out, plan)
+
+fn v3CompilerSystemLinkExecFullReport(plan: sexec.V3SystemLinkExecPlan): str =
+    return v3CompilerAppendSystemLinkExecPhaseLines(sexec.v3SystemLinkExecPlanReport(plan), plan)
+
+fn v3CompilerSystemLinkExecBridgeMergeReport(plan: sexec.V3SystemLinkExecPlan): str =
+    return v3CompilerAppendSystemLinkExecPhaseLines(sexec.v3SystemLinkExecBrowserBridgeReport(plan), plan)
+
+fn v3CompilerWriteSystemLinkExecFullReport(rootDir: str,
+                                           reportPath: str,
+                                           plan: sexec.V3SystemLinkExecPlan): bool =
+    if len(reportPath) <= 0:
+        return true
+    if !v3CompilerWriteOptionalReport(rootDir, reportPath, v3CompilerSystemLinkExecSummary(plan)):
+        return false
+    return v3CompilerWriteOptionalReport(rootDir, reportPath, v3CompilerSystemLinkExecFullReport(plan))
+
 fn v3CompilerBrowserBridgeCompilerPath(rootDir: str,
                                        plan: sexec.V3SystemLinkExecPlan): str =
     let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
@@ -494,6 +667,18 @@ fn v3CompilerCurrentExecutablePath(rootDir: str): str =
         return ""
     return v3path.V3PathAbsolute(rootDir, raw)
 
+fn v3CompilerArtifactSetFreshAgainstOutput(rootDir: str,
+                                           outputPath: str,
+                                           artifacts: str[]): bool =
+    for i in 0..<artifacts.len:
+        let artifactPath = artifacts[i]
+        if !v3path.V3PathFileExists(artifactPath):
+            return false
+        if artifactPath != outputPath &&
+           v3CompilerPathNewerThan(rootDir, outputPath, artifactPath):
+            return false
+    return true
+
 fn v3CompilerBackendDriverReadyOverride(rootDir: str,
                                         backendDriverPath: str): bool =
     let readyText = strutil.Strip(os.GetEnv("CHENG_V3_BACKEND_DRIVER_READY"))
@@ -515,16 +700,16 @@ fn v3CompilerEnsureBootstrapBridge(rootDir: str,
     v3CompilerPrintErr("v3 compiler: bootstrap bridge failed inside " + context)
     return false
 
-fn v3CompilerBackendDriverFresh(rootDir: str,
-                                backendDriverPath: str): bool =
+fn v3CompilerBackendDriverFreshForCompiler(rootDir: str,
+                                           backendDriverPath: str,
+                                           compilerPath: str): bool =
     if !v3path.V3FileExistsNonEmpty(rootDir, backendDriverPath):
         return false
     if !v3path.V3PathFileExists(backendDriverPath + ".v3.map"):
         return false
-    let currentCompiler = v3CompilerBridgeCompilerPath(rootDir)
-    if len(currentCompiler) > 0 &&
-       currentCompiler != backendDriverPath &&
-       v3CompilerPathNewerThan(rootDir, currentCompiler, backendDriverPath):
+    if len(compilerPath) > 0 &&
+       compilerPath != backendDriverPath &&
+       v3CompilerPathNewerThan(rootDir, compilerPath, backendDriverPath):
         return false
     let freshInputs = [
         v3path.V3PathAbsolute(rootDir, "v3/src/tooling/compiler_main.cheng"),
@@ -538,13 +723,21 @@ fn v3CompilerBackendDriverFresh(rootDir: str,
         v3path.V3PathAbsolute(rootDir, "v3/src/runtime/debug_runtime_stub_v3.cheng"),
         v3path.V3PathAbsolute(rootDir, "v3/src/runtime/core_runtime_provider_darwin_v3.cheng"),
         v3path.V3PathAbsolute(rootDir, "v3/src/runtime/core_runtime_provider_linux_v3.cheng"),
+        v3path.V3PathAbsolute(rootDir, "v3/src/runtime/compiler_runtime_program_entry_provider_v3.cheng"),
+        v3path.V3PathAbsolute(rootDir, "v3/src/runtime/compiler_runtime_tooling_entry_provider_v3.cheng"),
         v3path.V3PathAbsolute(rootDir, "src/std/os_host_process.cheng"),
-        v3path.V3PathAbsolute(rootDir, "src/std/os.Cheng")
+        v3path.V3PathAbsolute(rootDir, "src/std/os.cheng")
     ]
     for i in 0..<freshInputs.len:
         if v3CompilerPathNewerThan(rootDir, freshInputs[i], backendDriverPath):
             return false
     return true
+
+fn v3CompilerBackendDriverFresh(rootDir: str,
+                                backendDriverPath: str): bool =
+    return v3CompilerBackendDriverFreshForCompiler(rootDir,
+                                                   backendDriverPath,
+                                                   v3CompilerBridgeCompilerPath(rootDir))
 
 fn v3CompilerEnsureBackendDriver(rootDir: str,
                                  context: str): bool =
@@ -568,18 +761,22 @@ fn v3CompilerBootstrapFreshInputsReady(rootDir: str,
         let raw = strutil.Strip(contracts.v3BootstrapLineValue(snapshotText, "fresh_input_paths"))
         if len(raw) > 0:
             var start: int32
-            for i in 0..len(raw):
+            let n = len(raw)
+            var i = 0
+            while i <= n:
                 var itemEnd = false
-                if i == len(raw):
+                if i == n:
                     itemEnd = true
                 elif raw[i] == ',':
                     itemEnd = true
                 if !itemEnd:
+                    i = i + 1
                     continue
                 let item = strutil.Strip(strings.SliceBytes(raw, start, i - start))
                 if len(item) > 0 && v3CompilerPathNewerThan(rootDir, item, stage3Path):
                     return false
                 start = i + 1
+                i = i + 1
             return true
     return !v3CompilerPathNewerThan(rootDir, contracts.v3BootstrapSeedSourcePath(rootDir), stage3Path) &&
            !v3CompilerPathNewerThan(rootDir, contracts.v3BootstrapStage1SourcePath(rootDir), stage3Path) &&
@@ -600,7 +797,7 @@ fn v3CompilerForwardsToStage3(cmd: str): bool =
     if cmd == "scan-hotpath":
         return true
     if cmd == "run-smokes" || cmd == "run-production-regression" || cmd == "print-bootstrap" ||
-       cmd == "bootstrap-bridge" || cmd == "build-backend-driver" || cmd == "compile-exe":
+       cmd == "bootstrap-bridge" || cmd == "compile-exe":
         return true
     if cmd == "debug-report" || cmd == "print-symbols" || cmd == "print-line-map":
         return true
@@ -662,10 +859,6 @@ fn v3CompilerForwardsToStage3(cmd: str): bool =
         return true
     if cmd == "r2c-react-v3" || cmd == "r2c-react-v3-controller" || cmd == "vpn-gui" || cmd == "vpn-proxy":
         return true
-    if cmd == "emit-csg" || cmd == "migrate-csg" || cmd == "verify-world" ||
-       cmd == "world-sync" || cmd == "prove-equivalence" || cmd == "prove-migration" ||
-       cmd == "publish-world" || cmd == "fresh-node-selfhost" || cmd == "selfhost-build":
-        return true
     if cmd == "run-tcp-twoproc-smoke" || cmd == "run-quic-twoproc-smoke":
         return true
     return false
@@ -676,6 +869,10 @@ fn v3CompilerForwardStage3Command(rootDir: str,
     let stage3Path = contracts.v3BootstrapStage3Path(rootDir)
     if !v3path.V3FileExistsNonEmpty(rootDir, stage3Path):
         v3CompilerPrintErr("v3 compiler: missing stage3 compiler for command: " + cmd)
+        return 2
+    let currentPath = v3CompilerCurrentExecutablePath(rootDir)
+    if len(currentPath) > 0 && currentPath == stage3Path:
+        v3CompilerPrintErr("v3 compiler: command unavailable in bootstrap stage3: " + cmd)
         return 2
     return v3CompilerForwardToBridge(rootDir, stage3Path, cmd, args)
 
@@ -691,12 +888,19 @@ fn v3CompilerForwardToBridgeEnv(rootDir: str,
     logName = logName + cmd
     logName = logName + ".log"
     let logPath = os.JoinPath(logDir, logName)
+    let cleanArgs = v3CompilerArgsWithoutProgress(args)
     var forwardArgs: str[]
     add(forwardArgs, cmd)
-    for i in 0..<args.len:
-        add(forwardArgs, args[i])
+    for i in 0..<cleanArgs.len:
+        add(forwardArgs, cleanArgs[i])
     var forwardEnv: str[]
     add(forwardEnv, "CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1")
+    let progressEnv = v3CompilerProgressEnvOverrides(rootDir, args)
+    for i in 0..<progressEnv.len:
+        add(forwardEnv, progressEnv[i])
+    let backendDriverForwardLog = strutil.Strip(os.GetEnv("CHENG_V3_BACKEND_DRIVER_FORWARD_LOG"))
+    if len(backendDriverForwardLog) > 0:
+        add(forwardEnv, "CHENG_V3_BACKEND_DRIVER_FORWARD_LOG=" + backendDriverForwardLog)
     for i in 0..<envOverrides.len:
         add(forwardEnv, envOverrides[i])
     let run = hostops.v3RunFileLogged(rootDir,
@@ -710,7 +914,8 @@ fn v3CompilerForwardToBridgeEnv(rootDir: str,
     var output = run.output
     output = strutil.Strip(output)
     if len(output) > 0:
-        v3CompilerPrintErr(output)
+        if run.exitCode != 0 || cmd != "system-link-exec":
+            v3CompilerPrintErr(output)
     elif run.exitCode != 0:
         v3CompilerPrintErr("v3 compiler: forward command failed: " + cmd)
     return run.exitCode
@@ -1012,7 +1217,6 @@ fn v3CompilerVerifyRemoteExeSmoke(rootDir: str,
     remoteSmokeOut = remoteSmokeOut + ".selftest"
     let compileLogPath = v3CompilerRemoteLogPath(outDir, hostLabel, smokeName + ".compile")
     let runLogPath = v3CompilerRemoteLogPath(outDir, hostLabel, smokeName + ".run")
-    let reportPath = remoteSmokeOut + ".report.txt"
     var remoteSmokeSource = remotePackageRoot
     remoteSmokeSource = remoteSmokeSource + "/src/tests/"
     remoteSmokeSource = remoteSmokeSource + smokeName
@@ -1032,11 +1236,11 @@ fn v3CompilerVerifyRemoteExeSmoke(rootDir: str,
     add(compileArgv, remoteBackend)
     add(compileArgv, "system-link-exec")
     add(compileArgv, "--root:" + remotePackageRoot)
+    add(compileArgv, "--contract-in:" + remoteRoot + "/" + contracts.v3BootstrapStage1SourceRelPath())
     add(compileArgv, "--in:" + remoteSmokeSource)
     add(compileArgv, "--emit:exe")
     add(compileArgv, "--target:x86_64-unknown-linux-gnu")
     add(compileArgv, "--out:" + remoteSmokeOut)
-    add(compileArgv, "--report-out:" + reportPath)
     var compileOut = ""
     if !v3CompilerRunRemoteCommand(rootDir,
                                    sshTarget,
@@ -1096,7 +1300,6 @@ fn v3CompilerVerifyRemoteChainNodeSelfTest(rootDir: str,
     let remoteOut = remoteRoot + "/artifacts/v3_backend_driver/cheng_node_main.remote_selftest"
     let compileLogPath = v3CompilerRemoteLogPath(outDir, hostLabel, "chain_node_self_test.compile")
     let runLogPath = v3CompilerRemoteLogPath(outDir, hostLabel, "chain_node_self_test.run")
-    let reportPath = remoteOut + ".report.txt"
     var remoteSource = remotePackageRoot
     remoteSource = remoteSource + "/src/project/cheng_node_main.cheng"
     let remoteEnvRoot = "CHENG_V3_ROOT=" + remoteRoot
@@ -1106,11 +1309,11 @@ fn v3CompilerVerifyRemoteChainNodeSelfTest(rootDir: str,
     add(compileArgv, remoteBackend)
     add(compileArgv, "system-link-exec")
     add(compileArgv, "--root:" + remotePackageRoot)
+    add(compileArgv, "--contract-in:" + remoteRoot + "/" + contracts.v3BootstrapStage1SourceRelPath())
     add(compileArgv, "--in:" + remoteSource)
     add(compileArgv, "--emit:exe")
     add(compileArgv, "--target:x86_64-unknown-linux-gnu")
     add(compileArgv, "--out:" + remoteOut)
-    add(compileArgv, "--report-out:" + reportPath)
     var compileOut = ""
     if !v3CompilerRunRemoteCommand(rootDir,
                                    sshTarget,
@@ -1461,11 +1664,14 @@ fn v3CompilerRunFileEnvLogged(rootDir: str,
                               envOverrides: str[],
                               logPath: str,
                               context: str): bool =
+    var mergedEnv = v3CompilerActiveRuntimeEnvOverrides(rootDir)
+    for i in 0..<envOverrides.len:
+        add(mergedEnv, envOverrides[i])
     let run = hostops.v3RunFileLogged(rootDir,
                                       context,
                                       filePath,
                                       argv,
-                                      envOverrides,
+                                      mergedEnv,
                                       rootDir,
                                       0,
                                       logPath)
@@ -1492,7 +1698,14 @@ fn v3CompilerRunProgramLogged(rootDir: str,
                               argv: str[],
                               logPath: str,
                               context: str): bool =
-    let run = hostops.v3RunProgramLogged(rootDir, context, programName, argv, [], rootDir, 0, logPath)
+    let run = hostops.v3RunProgramLogged(rootDir,
+                                         context,
+                                         programName,
+                                         argv,
+                                         v3CompilerActiveRuntimeEnvOverrides(rootDir),
+                                         rootDir,
+                                         0,
+                                         logPath)
     if hostops.v3LoggedRunOk(run):
         return true
     let runOutputRaw = run.output
@@ -1988,6 +2201,8 @@ fn v3CompilerRequestFromRuntimeFlags(workspaceRoot: str,
 
 fn v3CompilerBuildSystemPlanFromRuntimeFlags(rootDir: str,
                                              req: creq.V3CompilerRequest): Result[sexec.V3SystemLinkExecPlan] =
+    v3CompilerApplyProgressEnvFromArgs(rootDir,
+                                       v3CompilerCollectArgsFrom(2, v3CompilerParamCountBridge()))
     return sexec.v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
                                                               req,
                                                               cmdline.ReadFlagOrDefault("--world-head", ""),
@@ -1997,6 +2212,8 @@ fn v3CompilerBuildSystemPlanFromRuntimeFlags(rootDir: str,
 
 fn v3CompilerBuildSystemPlanForEquivalenceFromRuntimeFlags(rootDir: str,
                                                            req: creq.V3CompilerRequest): Result[sexec.V3SystemLinkExecPlan] =
+    v3CompilerApplyProgressEnvFromArgs(rootDir,
+                                       v3CompilerCollectArgsFrom(2, v3CompilerParamCountBridge()))
     return sexec.v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
                                                               req,
                                                               cmdline.ReadFlagOrDefault("--world-head", ""),
@@ -2018,6 +2235,7 @@ fn v3CompilerCollectArgsFrom(startIndex: int32,
 fn v3CompilerBuildSystemPlan(rootDir: str,
                              req: creq.V3CompilerRequest,
                              args: str[]): Result[sexec.V3SystemLinkExecPlan] =
+    v3CompilerApplyProgressEnvFromArgs(rootDir, args)
     return sexec.v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
                                                               req,
                                                               creq.v3CompilerWorldHeadFromArgs(args),
@@ -2033,26 +2251,31 @@ fn v3CompilerRunSystemLinkExec(rootDir: str,
         v3CompilerPrintErr(Error(planRes))
         return 2
     let plan = Value(planRes)
-    let report = v3CompilerAppendSystemLinkExecPhaseLines(sexec.v3SystemLinkExecPlanReport(plan), plan)
-    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
-        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
-        return 2
+    let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
+    var bridgeReport = ""
+    if len(req.reportPath) > 0:
+        bridgeReport = v3CompilerSystemLinkExecBridgeMergeReport(plan)
     if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
+        if !v3CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
+            v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+            return 2
         v3CompilerPrintErr("v3 compiler: failed to materialize browser bridge outputs")
         return 2
     let browserBridgeObjectPath = sexec.v3SystemLinkExecBrowserBridgeObjectPath(plan)
-    let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
     if len(bridgeCompiler) > 0:
         let rc = v3CompilerForwardBootstrapBridge(rootDir,
                                                   bridgeCompiler,
                                                   "system-link-exec",
                                                   req,
                                                   args,
-                                                  report,
+                                                  bridgeReport,
                                                   browserBridgeObjectPath)
         if rc != 0:
             return rc
         if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
+            if !v3CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
+                v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+                return 2
             v3CompilerPrintErr("v3 compiler: failed to restore browser bridge outputs")
             return 2
         return 0
@@ -2064,29 +2287,36 @@ fn v3CompilerRunSystemLinkExec(rootDir: str,
                                                       "system-link-exec",
                                                       req,
                                                       args,
-                                                      report,
+                                                      bridgeReport,
                                                       browserBridgeObjectPath)
             if rc != 0:
                 return rc
             if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
+                if !v3CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
+                    v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+                    return 2
                 v3CompilerPrintErr("v3 compiler: failed to restore browser bridge outputs")
                 return 2
             return 0
+    let summary = v3CompilerSystemLinkExecSummary(plan)
+    if !v3CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
     if sexec.v3SystemLinkExecPlanReady(plan):
         v3CompilerPrintErr("v3 compiler: missing live Cheng bridge for system-link-exec")
-        v3CompilerPrintErr(report)
+        v3CompilerPrintErr(summary)
         return 2
     elif plan.primaryObjectPlan.missingReasons.len > 0:
         v3CompilerPrintErr("v3 compiler: primary object machine code not emitted")
     else:
         v3CompilerPrintErr("v3 compiler: ordinary pipeline blocked")
-    v3CompilerPrintErr(report)
+    v3CompilerPrintErr(summary)
     return 2
 
 fn v3CompilerRunLegacyCompatSystemLinkExec(rootDir: str,
                                            req: creq.V3CompilerRequest,
                                            rawArgs: str[]): int32 =
-    rawArgs
+    v3CompilerApplyProgressEnvFromArgs(rootDir, rawArgs)
     let compatArgs = creq.v3CompilerSystemLinkCompatArgs(req)
     let planRes: Result[sexec.V3SystemLinkExecPlan] = sexec.v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
                                                                                                           req,
@@ -2098,38 +2328,47 @@ fn v3CompilerRunLegacyCompatSystemLinkExec(rootDir: str,
         v3CompilerPrintErr(Error(planRes))
         return 2
     let plan = Value(planRes)
-    let report = v3CompilerAppendSystemLinkExecPhaseLines(sexec.v3SystemLinkExecPlanReport(plan), plan)
-    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
-        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
-        return 2
+    let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
+    var bridgeReport = ""
+    if len(req.reportPath) > 0:
+        bridgeReport = v3CompilerSystemLinkExecBridgeMergeReport(plan)
     if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
+        if !v3CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
+            v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+            return 2
         v3CompilerPrintErr("v3 compiler: failed to materialize browser bridge outputs")
         return 2
     let browserBridgeObjectPath = sexec.v3SystemLinkExecBrowserBridgeObjectPath(plan)
-    let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
     if len(bridgeCompiler) > 0:
         let rc = v3CompilerForwardBootstrapBridge(rootDir,
                                                   bridgeCompiler,
                                                   "system-link-exec",
                                                   req,
                                                   compatArgs,
-                                                  report,
+                                                  bridgeReport,
                                                   browserBridgeObjectPath)
         if rc != 0:
             return rc
         if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
+            if !v3CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
+                v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+                return 2
             v3CompilerPrintErr("v3 compiler: failed to restore browser bridge outputs")
             return 2
         return 0
+    let summary = v3CompilerSystemLinkExecSummary(plan)
+    if !v3CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
     if sexec.v3SystemLinkExecPlanReady(plan):
         v3CompilerPrintErr("v3 compiler: missing live Cheng bridge for system-link-exec")
-        v3CompilerPrintErr(report)
+        v3CompilerPrintErr(summary)
         return 2
     elif plan.primaryObjectPlan.missingReasons.len > 0:
         v3CompilerPrintErr("v3 compiler: primary object machine code not emitted")
     else:
         v3CompilerPrintErr("v3 compiler: ordinary pipeline blocked")
-    v3CompilerPrintErr(report)
+    v3CompilerPrintErr(summary)
     return 2
 
 fn v3CompilerBuildSystemPlanForEquivalence(rootDir: str,
@@ -2321,17 +2560,13 @@ fn v3CompilerPackageRootFromRuntimeFlags(rootDir: str): str =
     let packageRootRaw = cmdline.ReadFlagOrDefault("--root", creq.v3CompilerDefaultPackageRoot(rootDir))
     return creq.v3CompilerResolvePackageRoot(rootDir, sourcePath, packageRootRaw)
 
-fn v3CompilerRunBackendDriverSelftest(rootDir: str,
-                                      packageRoot: str,
-                                      compilerPath: str,
-                                      targetTriple: str,
-                                      sourcePath: str,
-                                      stem: str,
-                                      expectedOutput: str,
-                                      outBin: var str,
-                                      outReportPath: var str,
-                                      outCompileLogPath: var str,
-                                      outRunLogPath: var str): bool =
+fn v3CompilerBackendDriverSelftestArtifactPaths(rootDir: str,
+                                                stem: str,
+                                                outBin: var str,
+                                                outReportPath: var str,
+                                                outCompileLogPath: var str,
+                                                outRunLogPath: var str,
+                                                outReceiptLogPath: var str) =
     var outBinRel = "artifacts/v3_backend_driver/"
     outBinRel = outBinRel + stem
     outBinRel = outBinRel + ".selftest"
@@ -2343,9 +2578,91 @@ fn v3CompilerRunBackendDriverSelftest(rootDir: str,
     var outRunLogRel = "artifacts/v3_backend_driver/"
     outRunLogRel = outRunLogRel + stem
     outRunLogRel = outRunLogRel + ".selftest.run.log"
+    var outReceiptLogRel = "artifacts/v3_backend_driver/"
+    outReceiptLogRel = outReceiptLogRel + stem
+    outReceiptLogRel = outReceiptLogRel + ".selftest.receipt.log"
     outCompileLogPath = v3path.V3PathAbsolute(rootDir, outCompileLogRel)
     outRunLogPath = v3path.V3PathAbsolute(rootDir, outRunLogRel)
+    outReceiptLogPath = v3path.V3PathAbsolute(rootDir, outReceiptLogRel)
+
+fn v3CompilerBackendDriverSelftestBuildStampPath(outBin: str): str =
+    return outBin + ".build.txt"
+
+fn v3CompilerBackendDriverSelftestBuildStampText(sourcePath: str,
+                                                 outBin: str,
+                                                 outReportPath: str,
+                                                 targetTriple: str,
+                                                 compilerPath: str,
+                                                 expectedOutput: str): str =
+    return "format=v3_backend_driver_selftest_build_v1\n" +
+           "entry=" + sourcePath + "\n" +
+           "output=" + outBin + "\n" +
+           "report=" + outReportPath + "\n" +
+           "target=" + targetTriple + "\n" +
+           "compiler=" + compilerPath + "\n" +
+           "expected_output=" + expectedOutput + "\n"
+
+fn v3CompilerBackendDriverSelftestFresh(rootDir: str,
+                                        packageRoot: str,
+                                        compilerPath: str,
+                                        targetTriple: str,
+                                        sourcePath: str,
+                                        expectedOutput: str,
+                                        outBin: str,
+                                        outReportPath: str,
+                                        outCompileLogPath: str,
+                                        outRunLogPath: str): bool =
+    var freshInputPaths: str[]
+    var freshErr = ""
+    if !contracts.v3BootstrapOrdinaryClosurePaths(packageRoot,
+                                                  sourcePath,
+                                                  freshInputPaths,
+                                                  freshErr):
+        return false
+    if !v3CompilerArtifactSetFreshAgainstOutput(rootDir,
+                                                outBin,
+                                                [
+                                                    outBin,
+                                                    outBin + ".v3.map",
+                                                    outReportPath,
+                                                    outCompileLogPath,
+                                                    outRunLogPath
+                                                ]):
+        return false
+    if len(compilerPath) > 0 &&
+       compilerPath != outBin &&
+       v3CompilerPathNewerThan(rootDir, compilerPath, outBin):
+        return false
+    for i in 0..<freshInputPaths.len:
+        if v3CompilerPathNewerThan(rootDir, freshInputPaths[i], outBin):
+            return false
+    let runText = strutil.Strip(v3path.V3ReadTextFile("", outRunLogPath))
+    if len(expectedOutput) <= 0:
+        return len(runText) <= 0
+    return runText == expectedOutput
+
+fn v3CompilerRunBackendDriverSelftest(rootDir: str,
+                                      packageRoot: str,
+                                      compilerPath: str,
+                                      targetTriple: str,
+                                      sourcePath: str,
+                                      stem: str,
+                                      expectedOutput: str,
+                                      outBin: var str,
+                                      outReportPath: var str,
+                                      outCompileLogPath: var str,
+                                      outRunLogPath: var str): bool =
+    var outReceiptLogPath = ""
+    v3CompilerBackendDriverSelftestArtifactPaths(rootDir,
+                                                 stem,
+                                                 outBin,
+                                                 outReportPath,
+                                                 outCompileLogPath,
+                                                 outRunLogPath,
+                                                 outReceiptLogPath)
+    let buildStampPath = v3CompilerBackendDriverSelftestBuildStampPath(outBin)
     let compileContext = v3CompilerConcat3("build-backend-driver ", stem, " compile")
+    let receiptContext = v3CompilerConcat3("build-backend-driver ", stem, " receipt")
     let runContext = v3CompilerConcat3("build-backend-driver ", stem, " run")
     let seedDiagText = v3CompilerConcat3("v3 compiler: backend driver ", stem, " selftest emitted internal seed diagnostics")
     let emptyStdoutText = v3CompilerConcat3("v3 compiler: backend driver ", stem, " selftest expected empty stdout")
@@ -2355,31 +2672,73 @@ fn v3CompilerRunBackendDriverSelftest(rootDir: str,
     var compileArgs: str[]
     add(compileArgs, "system-link-exec")
     add(compileArgs, "--root:" + packageRoot)
+    add(compileArgs, "--contract-in:" + contracts.v3BootstrapStage1SourcePath(rootDir))
     add(compileArgs, "--in:" + sourcePath)
     add(compileArgs, "--emit:exe")
     add(compileArgs, "--target:" + targetTriple)
     add(compileArgs, "--out:" + outBin)
-    add(compileArgs, "--report-out:" + outReportPath)
-    if !v3CompilerRunFileLogged(rootDir,
-                                compilerPath,
-                                compileArgs,
-                                outCompileLogPath,
-                                compileContext):
-        return false
-    let compileText = v3path.V3ReadTextFile("", outCompileLogPath)
-    if strutil.Contains(compileText, "[cheng_v3_seed]"):
-        v3CompilerPrintErr(seedDiagText)
-        return false
-    if !v3path.V3PathFileExists(outBin) || !v3path.V3PathFileExists(outBin + ".v3.map"):
-        v3CompilerPrintErr(missingOutputText)
-        return false
+    var compileEnv: str[]
+    if strutil.StartsWith(stem, "r2c_react_v3_"):
+        add(compileEnv, "BACKEND_INCREMENTAL=0")
+        add(compileEnv, "BACKEND_MULTI_MODULE_CACHE=0")
+        add(compileEnv, "CHENG_V3_DISABLE_PRIMARY_OBJECT_CACHE=1")
+        add(compileEnv, "BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0")
+        add(compileEnv, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
+    let fresh = v3CompilerBackendDriverSelftestFresh(rootDir,
+                                                     packageRoot,
+                                                     compilerPath,
+                                                     targetTriple,
+                                                     sourcePath,
+                                                     expectedOutput,
+                                                     outBin,
+                                                     outReportPath,
+                                                     outCompileLogPath,
+                                                     outRunLogPath)
+    if !fresh:
+        if !v3CompilerRunFileEnvLogged(rootDir,
+                                       compilerPath,
+                                       compileArgs,
+                                       compileEnv,
+                                       outCompileLogPath,
+                                       compileContext):
+            return false
+        let compileText = v3path.V3ReadTextFile("", outCompileLogPath)
+        if strutil.Contains(compileText, "[cheng_v3_seed]"):
+            v3CompilerPrintErr(seedDiagText)
+            return false
+        if !v3path.V3PathFileExists(outBin) || !v3path.V3PathFileExists(outBin + ".v3.map"):
+            v3CompilerPrintErr(missingOutputText)
+            return false
+        if v3path.V3PathFileExists(outReportPath):
+            let _ = os.RemoveFile(outReportPath)
+        let receiptArgs = [
+            "world-receipt",
+            "--root:" + packageRoot,
+            "--contract-in:" + contracts.v3BootstrapStage1SourcePath(rootDir),
+            "--in:" + sourcePath,
+            "--emit:exe",
+            "--target:" + targetTriple,
+            "--out:" + outBin,
+            "--report-out:" + outReportPath
+        ]
+        if !v3CompilerRunFileEnvLogged(rootDir,
+                                       compilerPath,
+                                       receiptArgs,
+                                       compileEnv,
+                                       outReceiptLogPath,
+                                       receiptContext):
+            return false
+        if !v3path.V3PathFileExists(outReportPath):
+            v3CompilerPrintErr("v3 compiler: backend driver selftest missing receipt report: " + outReportPath)
+            return false
     let runArgs: str[]
-    if !v3CompilerRunFileLogged(rootDir,
-                                outBin,
-                                runArgs,
-                                outRunLogPath,
-                                runContext):
-        return false
+    if !fresh:
+        if !v3CompilerRunFileLogged(rootDir,
+                                    outBin,
+                                    runArgs,
+                                    outRunLogPath,
+                                    runContext):
+            return false
     let runText = strutil.Strip(v3path.V3ReadTextFile("", outRunLogPath))
     if len(expectedOutput) <= 0:
         if len(runText) > 0:
@@ -2389,6 +2748,15 @@ fn v3CompilerRunBackendDriverSelftest(rootDir: str,
         v3CompilerPrintErr(driftText)
         if len(runText) > 0:
             v3CompilerPrintErr(runText)
+        return false
+    let buildStampText = v3CompilerBackendDriverSelftestBuildStampText(sourcePath,
+                                                                       outBin,
+                                                                       outReportPath,
+                                                                       targetTriple,
+                                                                       compilerPath,
+                                                                       expectedOutput)
+    if !v3path.V3WriteTextFile(rootDir, buildStampPath, buildStampText):
+        v3CompilerPrintErr("v3 compiler: failed to write backend driver selftest build stamp: " + buildStampPath)
         return false
     return true
 
@@ -2409,6 +2777,7 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
     let backendDriverCandidateBuildMapOut = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng_candidate.v3.map")
     let compileReportPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/build_backend_driver_v3.compile.report.txt")
     let compileLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/build_backend_driver_v3.log")
+    let compileReceiptLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/build_backend_driver_v3.compile.receipt.log")
     let reportPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/build_backend_driver_v3.report.txt")
     let statusLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/build_backend_driver_v3.status.txt")
     let verifyExportLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/build_backend_driver_v3.verify_export_visibility.txt")
@@ -2419,6 +2788,7 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
     let referencePlanCorePath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/reference_backend_driver.plan.core.txt")
     let installLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/build_backend_driver_v3.install.txt")
     let installedStatusLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/build_backend_driver_v3.installed.status.txt")
+    let installedSelfhostProgressSmokeLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/build_backend_driver_v3.installed.selfhost_progress_smoke.txt")
     let smokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/ordinary_zero_exit_fixture.cheng")
     let runtimeSmokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/compiler_runtime_smoke.cheng")
     let migrationSmokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/compiler_migration_publish_smoke.cheng")
@@ -2453,14 +2823,129 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
     if len(currentCompiler) <= 0:
         v3CompilerPrintErr("v3 compiler: missing current compiler for build-backend-driver")
         return 2
+    var ordinaryReceiptLogPath = ""
+    v3CompilerBackendDriverSelftestArtifactPaths(rootDir,
+                                                 "ordinary_zero_exit_fixture",
+                                                 smokeOut,
+                                                 smokeCompileReportPath,
+                                                 smokeCompileLogPath,
+                                                 smokeRunLogPath,
+                                                 ordinaryReceiptLogPath)
+    var runtimeReceiptLogPath = ""
+    v3CompilerBackendDriverSelftestArtifactPaths(rootDir,
+                                                 "compiler_runtime_smoke",
+                                                 runtimeSmokeOut,
+                                                 runtimeSmokeCompileReportPath,
+                                                 runtimeSmokeCompileLogPath,
+                                                 runtimeSmokeRunLogPath,
+                                                 runtimeReceiptLogPath)
+    var migrationReceiptLogPath = ""
+    v3CompilerBackendDriverSelftestArtifactPaths(rootDir,
+                                                 "compiler_migration_publish_smoke",
+                                                 migrationSmokeOut,
+                                                 migrationSmokeCompileReportPath,
+                                                 migrationSmokeCompileLogPath,
+                                                 migrationSmokeRunLogPath,
+                                                 migrationReceiptLogPath)
+    var freshNodeReceiptLogPath = ""
+    v3CompilerBackendDriverSelftestArtifactPaths(rootDir,
+                                                 "compiler_world_fresh_node_selfhost_smoke",
+                                                 freshNodeSmokeOut,
+                                                 freshNodeSmokeCompileReportPath,
+                                                 freshNodeSmokeCompileLogPath,
+                                                 freshNodeSmokeRunLogPath,
+                                                 freshNodeReceiptLogPath)
+    var chainNodeReceiptLogPath = ""
+    v3CompilerBackendDriverSelftestArtifactPaths(rootDir,
+                                                 "chain_node_smoke",
+                                                 chainNodeSmokeOut,
+                                                 chainNodeSmokeCompileReportPath,
+                                                 chainNodeSmokeCompileLogPath,
+                                                 chainNodeSmokeRunLogPath,
+                                                 chainNodeReceiptLogPath)
+    let mainArtifactsFresh = v3CompilerBackendDriverFreshForCompiler(rootDir,
+                                                                     backendDriverOut,
+                                                                     currentCompiler) &&
+                             v3CompilerArtifactSetFreshAgainstOutput(rootDir,
+                                                                     backendDriverOut,
+                                                                     [
+                                                                         backendDriverOut,
+                                                                         backendDriverMapOut,
+                                                                         compileLogPath,
+                                                                         compileReceiptLogPath,
+                                                                         compileReportPath,
+                                                                         reportPath,
+                                                                         statusLogPath,
+                                                                         verifyExportLogPath,
+                                                                         verifyExportParallelLogPath,
+                                                                         planLogPath,
+                                                                         referencePlanLogPath,
+                                                                         planCorePath,
+                                                                         referencePlanCorePath,
+                                                                         installLogPath,
+                                                                         installedStatusLogPath,
+                                                                         installedSelfhostProgressSmokeLogPath
+                                                                     ])
+    if mainArtifactsFresh &&
+       v3CompilerBackendDriverSelftestFresh(rootDir,
+                                            packageRoot,
+                                            backendDriverOut,
+                                            targetTriple,
+                                            smokeSource,
+                                            "",
+                                            smokeOut,
+                                            smokeCompileReportPath,
+                                            smokeCompileLogPath,
+                                            smokeRunLogPath) &&
+       v3CompilerBackendDriverSelftestFresh(rootDir,
+                                            packageRoot,
+                                            backendDriverOut,
+                                            targetTriple,
+                                            runtimeSmokeSource,
+                                            "v3 compiler_runtime_smoke ok",
+                                            runtimeSmokeOut,
+                                            runtimeSmokeCompileReportPath,
+                                            runtimeSmokeCompileLogPath,
+                                            runtimeSmokeRunLogPath) &&
+       v3CompilerBackendDriverSelftestFresh(rootDir,
+                                            packageRoot,
+                                            backendDriverOut,
+                                            targetTriple,
+                                            migrationSmokeSource,
+                                            "v3 compiler_migration_publish_smoke ok",
+                                            migrationSmokeOut,
+                                            migrationSmokeCompileReportPath,
+                                            migrationSmokeCompileLogPath,
+                                            migrationSmokeRunLogPath) &&
+       v3CompilerBackendDriverSelftestFresh(rootDir,
+                                            packageRoot,
+                                            backendDriverOut,
+                                            targetTriple,
+                                            freshNodeSmokeSource,
+                                            "v3 compiler_world_fresh_node_selfhost_smoke ok",
+                                            freshNodeSmokeOut,
+                                            freshNodeSmokeCompileReportPath,
+                                            freshNodeSmokeCompileLogPath,
+                                            freshNodeSmokeRunLogPath) &&
+       v3CompilerBackendDriverSelftestFresh(rootDir,
+                                            packageRoot,
+                                            backendDriverOut,
+                                            targetTriple,
+                                            chainNodeSmokeSource,
+                                            "v3 chain_node_smoke ok",
+                                            chainNodeSmokeOut,
+                                            chainNodeSmokeCompileReportPath,
+                                            chainNodeSmokeCompileLogPath,
+                                            chainNodeSmokeRunLogPath):
+        v3CompilerPrintLine("v3 compiler: backend driver fresh target=" + targetTriple + " out=" + backendDriverOut)
+        return 0
     let compileArgs = [
         "system-link-exec",
         "--root:" + packageRoot,
         "--in:" + compilerEntrySource,
         "--emit:exe",
         "--target:" + targetTriple,
-        "--out:" + backendDriverCandidateBuildOut,
-        "--report-out:" + compileReportPath
+        "--out:" + backendDriverCandidateBuildOut
     ]
     if v3path.V3PathFileExists(backendDriverCandidateBuildOut):
         let _ = os.RemoveFile(backendDriverCandidateBuildOut)
@@ -2476,35 +2961,49 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
                                 compileLogPath,
                                 "build-backend-driver compile"):
         return 2
+    if v3path.V3PathFileExists(compileReportPath):
+        let _ = os.RemoveFile(compileReportPath)
+    let receiptArgs = [
+        "world-receipt",
+        "--root:" + packageRoot,
+        "--in:" + compilerEntrySource,
+        "--emit:exe",
+        "--target:" + targetTriple,
+        "--out:" + backendDriverCandidateBuildOut,
+        "--report-out:" + compileReportPath
+    ]
+    if !v3CompilerRunFileEnvLogged(rootDir,
+                                   currentCompiler,
+                                   receiptArgs,
+                                   ["CHENG_V3_PROGRESS=0", "CHENG_V3_PROGRESS_OUT="],
+                                   compileReceiptLogPath,
+                                   "build-backend-driver receipt"):
+        return 2
+    if !v3path.V3PathFileExists(compileReportPath):
+        v3CompilerPrintErr("v3 compiler: missing backend driver compile report: " + compileReportPath)
+        return 2
     if !v3path.V3PathFileExists(backendDriverCandidateBuildOut):
         v3CompilerPrintErr("v3 compiler: missing backend driver candidate output: " + backendDriverCandidateBuildOut)
         return 2
-    if !v3path.V3PathFileExists(backendDriverCandidateMapOut):
-        if !v3path.V3PathFileExists(backendDriverCandidateBuildMapOut):
-            v3CompilerPrintErr("v3 compiler: missing backend driver candidate map: " + backendDriverCandidateBuildMapOut)
-            return 2
-    if !os.RenameFile(backendDriverCandidateBuildMapOut, backendDriverCandidateMapOut):
-        v3CompilerPrintErr("v3 compiler: failed to stage backend driver candidate map: " + backendDriverCandidateMapOut)
-        return 2
-    if !os.RenameFile(backendDriverCandidateBuildOut, backendDriverCandidateOut):
-        v3CompilerPrintErr("v3 compiler: failed to stage backend driver candidate output: " + backendDriverCandidateOut)
+    if !v3path.V3PathFileExists(backendDriverCandidateBuildMapOut):
+        v3CompilerPrintErr("v3 compiler: missing backend driver candidate map: " + backendDriverCandidateBuildMapOut)
         return 2
     let statusArgs = ["status"]
     if !v3CompilerRunFileLogged(rootDir,
-                                backendDriverCandidateOut,
+                                backendDriverCandidateBuildOut,
                                 statusArgs,
                                 statusLogPath,
                                 "build-backend-driver status"):
         return 2
     if !v3CompilerRunFileLogged(rootDir,
-                                backendDriverCandidateOut,
+                                backendDriverCandidateBuildOut,
                                 ["verify-export-visibility"],
                                 verifyExportLogPath,
                                 "build-backend-driver verify-export-visibility"):
         return 2
     let planArgs = ["print-build-plan", "--target:" + targetTriple]
     if !v3CompilerRunFileLogged(rootDir,
-                                backendDriverCandidateOut,
+                                backendDriverCandidateBuildOut,
                                 planArgs,
                                 planLogPath,
                                 "build-backend-driver plan"):
@@ -2568,7 +3067,7 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
         referencePlanCheck = "ok"
     if !v3CompilerRunBackendDriverSelftest(rootDir,
                                            packageRoot,
-                                           backendDriverCandidateOut,
+                                           backendDriverCandidateBuildOut,
                                            targetTriple,
                                            smokeSource,
                                            "ordinary_zero_exit_fixture",
@@ -2580,7 +3079,7 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
         return 2
     if !v3CompilerRunBackendDriverSelftest(rootDir,
                                            packageRoot,
-                                           backendDriverCandidateOut,
+                                           backendDriverCandidateBuildOut,
                                            targetTriple,
                                            runtimeSmokeSource,
                                            "compiler_runtime_smoke",
@@ -2592,7 +3091,7 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
         return 2
     if !v3CompilerRunBackendDriverSelftest(rootDir,
                                            packageRoot,
-                                           backendDriverCandidateOut,
+                                           backendDriverCandidateBuildOut,
                                            targetTriple,
                                            migrationSmokeSource,
                                            "compiler_migration_publish_smoke",
@@ -2604,7 +3103,7 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
         return 2
     if !v3CompilerRunBackendDriverSelftest(rootDir,
                                            packageRoot,
-                                           backendDriverCandidateOut,
+                                           backendDriverCandidateBuildOut,
                                            targetTriple,
                                            freshNodeSmokeSource,
                                            "compiler_world_fresh_node_selfhost_smoke",
@@ -2616,7 +3115,7 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
         return 2
     if !v3CompilerRunBackendDriverSelftest(rootDir,
                                            packageRoot,
-                                           backendDriverCandidateOut,
+                                           backendDriverCandidateBuildOut,
                                            targetTriple,
                                            chainNodeSmokeSource,
                                            "chain_node_smoke",
@@ -2625,6 +3124,12 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
                                            chainNodeSmokeCompileReportPath,
                                            chainNodeSmokeCompileLogPath,
                                            chainNodeSmokeRunLogPath):
+        return 2
+    if !os.RenameFile(backendDriverCandidateBuildMapOut, backendDriverCandidateMapOut):
+        v3CompilerPrintErr("v3 compiler: failed to stage backend driver candidate map: " + backendDriverCandidateMapOut)
+        return 2
+    if !os.RenameFile(backendDriverCandidateBuildOut, backendDriverCandidateOut):
+        v3CompilerPrintErr("v3 compiler: failed to stage backend driver candidate output: " + backendDriverCandidateOut)
         return 2
     var installReport = ""
     if !v3CompilerBootstrapInstallCandidate(rootDir,
@@ -2661,6 +3166,17 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
         v3path.V3WriteTextFile(rootDir, installLogPath, installReport)
         return 2
     installReport = installReport + "installed_verify_export_parallel=ok\n"
+    if !v3CompilerRunFileLogged(rootDir,
+                                backendDriverOut,
+                                ["run-host-smokes",
+                                 "--label:build_backend_driver_installed_selfhost_progress",
+                                 "backend_driver_selfhost_progress_smoke"],
+                                installedSelfhostProgressSmokeLogPath,
+                                "build-backend-driver installed selfhost-progress smoke"):
+        installReport = installReport + "installed_selfhost_progress_smoke=failed\n"
+        v3path.V3WriteTextFile(rootDir, installLogPath, installReport)
+        return 2
+    installReport = installReport + "installed_selfhost_progress_smoke=ok\n"
     if !v3path.V3WriteTextFile(rootDir, installLogPath, installReport):
         v3CompilerPrintErr("v3 compiler: failed to write backend driver install log: " + installLogPath)
         return 2
@@ -2687,6 +3203,7 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
     report = report + "log=" + compileLogPath + "\n"
     report = report + "install_log=" + installLogPath + "\n"
     report = report + "installed_status_log=" + installedStatusLogPath + "\n"
+    report = report + "installed_selfhost_progress_smoke_log=" + installedSelfhostProgressSmokeLogPath + "\n"
     report = report + "zero_exit_smoke_source=" + smokeSource + "\n"
     report = report + "zero_exit_smoke_output=" + smokeOut + "\n"
     report = report + "zero_exit_smoke_report=" + smokeCompileReportPath + "\n"
@@ -2799,19 +3316,29 @@ fn v3CompilerBootstrapStageRun(rootDir: str,
                                    logPath,
                                    "bootstrap-bridge " + label)
 
+fn v3CompilerBootstrapCompilerFresh(rootDir: str,
+                                    compilerPath: str): bool =
+    if !v3path.V3FileExistsNonEmpty(rootDir, compilerPath):
+        return false
+    let compilerMtime = os.FileMtime(compilerPath)
+    if compilerMtime <= int64(0):
+        return false
+    return os.FileMtime(contracts.v3BootstrapSeedSourcePath(rootDir)) <= compilerMtime &&
+           os.FileMtime(contracts.v3BootstrapStage1SourcePath(rootDir)) <= compilerMtime
+
 fn v3CompilerBootstrapCompilerPath(rootDir: str,
                                    snapshot: contracts.V3BootstrapSnapshot): str =
     if v3path.V3FileExistsNonEmpty(rootDir, snapshot.stage3Compiler.path) &&
-       v3CompilerBootstrapFreshInputsReady(rootDir, snapshot.stage3Compiler.path):
+       v3CompilerBootstrapCompilerFresh(rootDir, snapshot.stage3Compiler.path):
         return snapshot.stage3Compiler.path
     if v3path.V3FileExistsNonEmpty(rootDir, snapshot.stage2Compiler.path) &&
-       v3CompilerBootstrapFreshInputsReady(rootDir, snapshot.stage2Compiler.path):
+       v3CompilerBootstrapCompilerFresh(rootDir, snapshot.stage2Compiler.path):
         return snapshot.stage2Compiler.path
     if v3path.V3FileExistsNonEmpty(rootDir, snapshot.stage1Compiler.path) &&
-       v3CompilerBootstrapFreshInputsReady(rootDir, snapshot.stage1Compiler.path):
+       v3CompilerBootstrapCompilerFresh(rootDir, snapshot.stage1Compiler.path):
         return snapshot.stage1Compiler.path
     if v3path.V3FileExistsNonEmpty(rootDir, snapshot.stage0Compiler.path) &&
-       v3CompilerBootstrapFreshInputsReady(rootDir, snapshot.stage0Compiler.path):
+       v3CompilerBootstrapCompilerFresh(rootDir, snapshot.stage0Compiler.path):
         return snapshot.stage0Compiler.path
     return ""
 
@@ -2909,7 +3436,7 @@ fn v3CompilerBootstrapBridge(rootDir: str): int32 =
     if len(bootstrapCompiler) <= 0:
         v3CompilerPrintErr("v3 compiler: bootstrap inputs newer than live bootstrap compiler; rebuild stage0 and rerun bootstrap-bridge")
         return 2
-    if !v3CompilerBootstrapFreshInputsReady(rootDir, bootstrapCompiler):
+    if !v3CompilerBootstrapCompilerFresh(rootDir, bootstrapCompiler):
         v3CompilerPrintErr("v3 compiler: bootstrap inputs newer than live bootstrap compiler; rebuild stage0 and rerun bootstrap-bridge")
         return 2
     let stage0Candidate = snapshot.stage0Compiler.path + ".next"
@@ -2938,8 +3465,7 @@ fn v3CompilerBootstrapBridge(rootDir: str): int32 =
                                     [
                                         "compile-bootstrap",
                                         "--in:" + snapshot.stage1Source.path,
-                                        "--out:" + stage1Candidate,
-                                        "--report-out:" + stage1ReportPath
+                                        "--out:" + stage1Candidate
                                     ],
                                     v3CompilerBootstrapLog(rootDir, "cheng.stage1.compile.log")):
         return 2
@@ -2955,8 +3481,7 @@ fn v3CompilerBootstrapBridge(rootDir: str): int32 =
                                     [
                                         "compile-bootstrap",
                                         "--in:" + snapshot.stage1Source.path,
-                                        "--out:" + stage2Candidate,
-                                        "--report-out:" + stage2ReportPath
+                                        "--out:" + stage2Candidate
                                     ],
                                     v3CompilerBootstrapLog(rootDir, "cheng.stage2.compile.log")):
         return 2
@@ -2972,8 +3497,7 @@ fn v3CompilerBootstrapBridge(rootDir: str): int32 =
                                     [
                                         "compile-bootstrap",
                                         "--in:" + snapshot.stage1Source.path,
-                                        "--out:" + stage3Candidate,
-                                        "--report-out:" + stage3ReportPath
+                                        "--out:" + stage3Candidate
                                     ],
                                     v3CompilerBootstrapLog(rootDir, "cheng.stage3.compile.log")):
         return 2
@@ -3054,7 +3578,7 @@ fn v3CompilerBootstrapBridge(rootDir: str): int32 =
     return 0
 
 fn v3CompilerHostBridgeAuditText(rootDir: str): str =
-    let stdOsPath = v3path.V3PathAbsolute(rootDir, "src/std/os.Cheng")
+    let stdOsPath = v3path.V3PathAbsolute(rootDir, "src/std/os.cheng")
     let hostProcessPath = v3path.V3PathAbsolute(rootDir, "src/std/os_host_process.cheng")
     let backendPath = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/program_support_backend_v3.cheng")
     let hostRuntimePath = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/program_support_host_runtime_v3.cheng")
@@ -3793,6 +4317,70 @@ fn v3CompilerLegacyArtifactsWrite(rootDir: str,
         return false
     return true
 
+fn v3CompilerManagedMirrorKey(text: str): str =
+    return cworld.v3CompilerManagedMirrorKey(text)
+
+fn v3CompilerManagedMirrorRelSourcePath(packageRoot: str,
+                                        sourcePath: str): str =
+    let packageRootTrimmed = v3path.V3PathTrim(packageRoot)
+    let sourcePathTrimmed = v3path.V3PathTrim(sourcePath)
+    let packagePrefix = packageRootTrimmed + "/"
+    if len(packageRootTrimmed) > 0 && strutil.StartsWith(sourcePathTrimmed, packagePrefix):
+        return strings.DropPrefix(sourcePathTrimmed, packagePrefix)
+    return v3path.V3PathBaseName(sourcePathTrimmed)
+
+fn v3CompilerManagedMirrorPackageManifestText(packageIdRaw: str): str =
+    let packageId = v3path.V3PathTrim(packageIdRaw)
+    var modulePrefix = v3path.V3PathBaseName(packageId)
+    if len(modulePrefix) <= 0:
+        modulePrefix = "pkg"
+    return "package_id = \"pkg://" + packageId + "\"\nmodule_prefix = \"" + modulePrefix + "\"\n"
+
+fn v3CompilerManagedMigrationMirrorWrite(rootDir: str,
+                                         packageRoot: str,
+                                         channel: str,
+                                         migration: ccsg.V3CompilerLegacyMigration,
+                                         receipt: ccsg.V3CompileReceipt,
+                                         proof: ceq.V3CompilerEquivalenceProof,
+                                         lockText: str,
+                                         outMirrorRoot: var str): bool =
+    outMirrorRoot = ""
+    let mirrorRel = cworld.v3CompilerManagedMirrorRel(channel, migration.packageId, proof.proofCid)
+    let mirrorRoot = v3path.V3PathAbsolute(rootDir, mirrorRel)
+    if !v3path.V3MkdirP(rootDir, mirrorRel):
+        return false
+    if !v3path.V3WriteTextFile(rootDir,
+                               v3path.V3PathJoin(mirrorRel, "cheng-package.toml"),
+                               v3CompilerManagedMirrorPackageManifestText(migration.packageId)):
+        return false
+    var sourcesReport = ""
+    for i in 0..<migration.units.len:
+        let unit = migration.units[i]
+        let relSourcePath = v3CompilerManagedMirrorRelSourcePath(packageRoot, unit.sourcePath)
+        let mirrorSourcePath = v3path.V3PathJoin(mirrorRel, relSourcePath)
+        if !v3path.V3WriteTextFile(rootDir, mirrorSourcePath, unit.migratedText):
+            return false
+        if len(sourcesReport) > 0:
+            sourcesReport = sourcesReport + "\n"
+        sourcesReport = sourcesReport + relSourcePath
+    if !v3path.V3WriteTextFile(rootDir, v3path.V3PathJoin(mirrorRel, "sources.list.txt"), sourcesReport + "\n"):
+        return false
+    if !v3path.V3WriteTextFile(rootDir, v3path.V3PathJoin(mirrorRel, "migration.txt"), ccsg.v3CompilerLegacyMigrationReport(migration) + "\n"):
+        return false
+    if !v3path.V3WriteTextFile(rootDir, v3path.V3PathJoin(mirrorRel, "migration.csg.txt"), ccsg.v3CompilerCsgReport(migration.compilerCsg) + "\n"):
+        return false
+    if !v3path.V3WriteTextFile(rootDir, v3path.V3PathJoin(mirrorRel, "migration.surface.txt"), ccsg.v3CompilerExportSurfaceReport(migration.exportSurface) + "\n"):
+        return false
+    if !v3path.V3WriteTextFile(rootDir, v3path.V3PathJoin(mirrorRel, "migration.receipt.txt"), ccsg.v3CompileReceiptReport(receipt) + "\n"):
+        return false
+    if !v3path.V3WriteTextFile(rootDir, v3path.V3PathJoin(mirrorRel, "proof.txt"), ceq.v3CompilerEquivalenceProofReport(proof) + "\n"):
+        return false
+    if len(lockText) > 0:
+        if !v3path.V3WriteTextFile(rootDir, v3path.V3PathJoin(mirrorRel, "cheng.lock.toml"), lockText):
+            return false
+    outMirrorRoot = mirrorRoot
+    return true
+
 fn v3CompilerPublishSummary(prefix: str,
                             channel: str,
                             plan: sexec.V3SystemLinkExecPlan,
@@ -3812,6 +4400,8 @@ fn v3CompilerPublishSummary(prefix: str,
     out = out + "bundle_prefix=" + prefix + "\n"
     out = out + "channel=" + channel + "\n"
     out = out + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
+    out = out + "manifest_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.manifest.manifestCid) + "\n"
+    out = out + "manifest_entry_count=" + intToStr(plan.localUniverse.manifest.entryCount) + "\n"
     out = out + "csg_root_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.graphCid) + "\n"
     out = out + "surface_cid=" + layout.fixedBytes32Hex(plan.exportSurface.surfaceCid) + "\n"
     out = out + "receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
@@ -3835,8 +4425,11 @@ fn v3CompilerEmitCsg(rootDir: str,
     if !slplan.v3BuildSystemLinkPlanStub(rootDir, req, linkPlan, err):
         v3CompilerPrintErr(err)
         return 2
-    let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId,
-                                                                linkPlan.sourceClosurePaths)
+    let sourceBundleRes = slplan.v3SystemLinkPlanSourceBundleCid(linkPlan)
+    if IsErr(sourceBundleRes):
+        v3CompilerPrintErr(Error(sourceBundleRes))
+        return 2
+    let sourceBundleCid = Value(sourceBundleRes)
     let csgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
     if IsErr(csgRes):
         v3CompilerPrintErr(Error(csgRes))
@@ -3911,12 +4504,56 @@ fn v3CompilerVerifyWorld(rootDir: str,
         v3CompilerPrintErr(Error(reqRes))
         return 2
     let req = Value(reqRes)
-    let planRes = v3CompilerBuildSystemPlanFromRuntimeFlags(rootDir, req)
+    let stagedReqRes = v3CompilerStageRequestForWorldPlan(rootDir,
+                                                          req,
+                                                          "artifacts/v3_backend_driver/verify_world_source")
+    if IsErr(stagedReqRes):
+        v3CompilerPrintErr(Error(stagedReqRes))
+        return 2
+    let stagedReq = Value(stagedReqRes)
+    let planRes = v3CompilerBuildSystemPlanFromRuntimeFlags(rootDir, stagedReq)
     if IsErr(planRes):
         v3CompilerPrintErr(Error(planRes))
         return 2
     let plan = Value(planRes)
-    let report = v3CompilerAppendSystemLinkExecPhaseLines(sexec.v3SystemLinkExecPlanReport(plan), plan)
+    if !v3CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    v3CompilerPrintLine(v3CompilerSystemLinkExecSummary(plan))
+    return 0
+
+fn v3CompilerWorldReceiptReport(plan: sexec.V3SystemLinkExecPlan): str =
+    var report = ""
+    report = report + "entry=" + plan.compilerEntrySource + "\n"
+    report = report + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
+    report = report + "manifest_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.manifest.manifestCid) + "\n"
+    report = report + "compile_receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
+    report = report + "compile_canonical_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.canonicalOutputDigest) + "\n"
+    report = report + "compile_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.outputDigest) + "\n"
+    report = report + "compile_bootstrap_stage=" + plan.compileReceipt.bootstrapStage
+    return report
+
+fn v3CompilerWorldReceipt(rootDir: str,
+                          args: str[]): int32 =
+    args
+    let reqRes = v3CompilerRequestFromRuntimeFlags(rootDir, false)
+    if IsErr(reqRes):
+        v3CompilerPrintErr(Error(reqRes))
+        return 2
+    let req = Value(reqRes)
+    let stagedReqRes = v3CompilerStageRequestForWorldPlan(rootDir,
+                                                          req,
+                                                          "artifacts/v3_backend_driver/world_receipt_source")
+    if IsErr(stagedReqRes):
+        v3CompilerPrintErr(Error(stagedReqRes))
+        return 2
+    let stagedReq = Value(stagedReqRes)
+    let planRes = v3CompilerBuildSystemPlanFromRuntimeFlags(rootDir, stagedReq)
+    if IsErr(planRes):
+        v3CompilerPrintErr(Error(planRes))
+        return 2
+    let plan = Value(planRes)
+    let report = v3CompilerWorldReceiptReport(plan)
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
@@ -3925,22 +4562,38 @@ fn v3CompilerVerifyWorld(rootDir: str,
 
 fn v3CompilerWorldSyncWriteBundle(rootDir: str,
                                   prefix: str,
-                                  plan: sexec.V3SystemLinkExecPlan): bool =
-    if !v3path.V3WriteTextFile(rootDir, prefix + ".world.txt", cworld.v3CompilerWorldHeadReport(plan.localUniverse.worldHead) + "\n"):
+                                  plan: sexec.V3SystemLinkExecPlan,
+                                  managedMirrorBundles: cwlp.V3CompilerManagedMirrorBundle[]): bool =
+    let worldText = cworld.v3CompilerWorldHeadReport(plan.localUniverse.worldHead) + "\n"
+    if !v3path.V3WriteTextFile(rootDir, prefix + ".world.txt", worldText):
         return false
-    if !v3path.V3WriteTextFile(rootDir, prefix + ".compiler.snapshot.txt", cworld.v3CompilerPackageSnapshotReport(plan.localUniverse.compilerSnapshot) + "\n"):
+    let manifestText = cworld.v3CompilerUniverseManifestReport(plan.localUniverse.manifest) + "\n"
+    if !v3path.V3WriteTextFile(rootDir, prefix + ".manifest.txt", manifestText):
         return false
-    if !v3path.V3WriteTextFile(rootDir, prefix + ".std.snapshot.txt", cworld.v3CompilerPackageSnapshotReport(plan.localUniverse.stdSnapshot) + "\n"):
+    let compilerSnapshotText = cworld.v3CompilerPackageSnapshotReport(plan.localUniverse.compilerSnapshot) + "\n"
+    if !v3path.V3WriteTextFile(rootDir, prefix + ".compiler.snapshot.txt", compilerSnapshotText):
         return false
-    if !v3path.V3WriteTextFile(rootDir, prefix + ".runtime.snapshot.txt", cworld.v3CompilerPackageSnapshotReport(plan.localUniverse.runtimeSnapshot) + "\n"):
+    let stdSnapshotText = cworld.v3CompilerPackageSnapshotReport(plan.localUniverse.stdSnapshot) + "\n"
+    if !v3path.V3WriteTextFile(rootDir, prefix + ".std.snapshot.txt", stdSnapshotText):
         return false
-    if !v3path.V3WriteTextFile(rootDir, prefix + ".csg.txt", ccsg.v3CompilerCsgReport(plan.compilerCsg) + "\n"):
+    let runtimeSnapshotText = cworld.v3CompilerPackageSnapshotReport(plan.localUniverse.runtimeSnapshot) + "\n"
+    if !v3path.V3WriteTextFile(rootDir, prefix + ".runtime.snapshot.txt", runtimeSnapshotText):
         return false
-    if !v3path.V3WriteTextFile(rootDir, prefix + ".surface.txt", ccsg.v3CompilerExportSurfaceReport(plan.exportSurface) + "\n"):
+    let csgText = ccsg.v3CompilerCsgWireReport(plan.compilerCsg) + "\n"
+    if !v3path.V3WriteTextFile(rootDir, prefix + ".csg.txt", csgText):
         return false
-    if !v3path.V3WriteTextFile(rootDir, prefix + ".receipt.txt", ccsg.v3CompileReceiptReport(plan.compileReceipt) + "\n"):
+    let surfaceText = ccsg.v3CompilerExportSurfaceReport(plan.exportSurface) + "\n"
+    if !v3path.V3WriteTextFile(rootDir, prefix + ".surface.txt", surfaceText):
         return false
-    if !v3path.V3WriteTextFile(rootDir, prefix + ".lock.toml", cworld.v3CompilerLockText(plan.localUniverse)):
+    let receiptText = ccsg.v3CompileReceiptReport(plan.compileReceipt) + "\n"
+    if !v3path.V3WriteTextFile(rootDir, prefix + ".receipt.txt", receiptText):
+        return false
+    let lockText = cworld.v3CompilerLockText(plan.localUniverse)
+    if !v3path.V3WriteTextFile(rootDir, prefix + ".lock.toml", lockText):
+        return false
+    if !cwlp.v3CompilerWorldWriteManagedMirrorBundleFiles(rootDir,
+                                                          prefix,
+                                                          managedMirrorBundles):
         return false
     return true
 
@@ -3952,22 +4605,59 @@ fn v3CompilerWorldSync(rootDir: str,
         v3CompilerPrintErr(Error(reqRes))
         return 2
     let req = Value(reqRes)
-    let planRes = v3CompilerBuildSystemPlanFromRuntimeFlags(rootDir, req)
+    let stagedReqRes = v3CompilerStageRequestForWorldPlan(rootDir,
+                                                          req,
+                                                          "artifacts/v3_backend_driver/world_sync_source")
+    if IsErr(stagedReqRes):
+        v3CompilerPrintErr(Error(stagedReqRes))
+        return 2
+    let stagedReq = Value(stagedReqRes)
+    let planRes = v3CompilerBuildSystemPlanFromRuntimeFlags(rootDir, stagedReq)
     if IsErr(planRes):
         v3CompilerPrintErr(Error(planRes))
         return 2
     let plan = Value(planRes)
-    if !v3CompilerWorldSyncWriteBundle(rootDir, req.outputPath, plan):
+    let managedMirrorBundlesRes = cwlp.v3CompilerWorldManagedMirrorBundlesForPlan(plan)
+    if IsErr(managedMirrorBundlesRes):
+        v3CompilerPrintErr(Error(managedMirrorBundlesRes))
+        return 2
+    let managedMirrorBundles = Value(managedMirrorBundlesRes)
+    if !v3CompilerWorldSyncWriteBundle(rootDir, req.outputPath, plan, managedMirrorBundles):
         v3CompilerPrintErr("v3 compiler: failed to materialize world bundle: " + req.outputPath)
         return 2
-    var report = ""
-    report = report + "bundle_prefix=" + req.outputPath + "\n"
-    report = report + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
-    report = report + "csg_root_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.graphCid) + "\n"
-    report = report + "surface_cid=" + layout.fixedBytes32Hex(plan.exportSurface.surfaceCid) + "\n"
-    report = report + "receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid)
+    let sourceSnapshotRes = v3CompilerWorldBundleSourceSnapshotWrite(rootDir, stagedReq, req.outputPath)
+    if IsErr(sourceSnapshotRes):
+        v3CompilerPrintErr(Error(sourceSnapshotRes))
+        return 2
+    var report = "bundle_prefix=" + req.outputPath
+    report = report + "\nworld_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid)
+    report = report + "\nmanifest_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.manifest.manifestCid)
+    report = report + "\nmanifest_entry_count=" + intToStr(plan.localUniverse.manifest.entryCount)
+    report = report + "\nmanaged_mirror_count=" + intToStr(managedMirrorBundles.len)
+    report = report + "\ncsg_root_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.graphCid)
+    report = report + "\nsurface_cid=" + layout.fixedBytes32Hex(plan.exportSurface.surfaceCid)
+    report = report + "\nreceipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid)
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    v3CompilerPrintLine(report)
+    return 0
+
+fn v3CompilerMaterializeWorldMirrors(rootDir: str,
+                                     args: str[]): int32 =
+    args
+    let bundlePrefix = cmdline.ReadFlagOrDefault("--in", "")
+    if len(bundlePrefix) <= 0:
+        v3CompilerPrintErr("v3 compiler: missing --in")
+        return 2
+    let materializeRes = cwlp.v3CompilerWorldMaterializeManagedMirrorBundlesFromBundlePrefix(rootDir, bundlePrefix)
+    if IsErr(materializeRes):
+        v3CompilerPrintErr(Error(materializeRes))
+        return 2
+    let report = cwlp.v3CompilerWorldManagedMirrorMaterializeReport(bundlePrefix, Value(materializeRes))
+    let reportPath = cmdline.ReadFlagOrDefault("--report-out", "")
+    if !v3CompilerWriteOptionalReport(rootDir, reportPath, report):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + reportPath)
         return 2
     v3CompilerPrintLine(report)
     return 0
@@ -4034,7 +4724,20 @@ fn v3CompilerProveMigration(rootDir: str,
         if !v3path.V3WriteTextFile(rootDir, prefix + ".proof.txt", proofReport + "\n"):
             v3CompilerPrintErr("v3 compiler: failed to write proof: " + prefix + ".proof.txt")
             return 2
-    let report = ccsg.v3CompilerLegacyMigrationReport(migration) + "\n" + proofReport
+    var managedMirrorRoot = ""
+    if !v3CompilerManagedMigrationMirrorWrite(rootDir,
+                                              creq.v3CompilerRequestRootDir(req),
+                                              plan.localUniverse.worldHead.channel,
+                                              migration,
+                                              migrationReceipt,
+                                              proof,
+                                              cworld.v3CompilerLockText(plan.localUniverse),
+                                              managedMirrorRoot):
+        v3CompilerPrintErr("v3 compiler migration: failed to write managed mirror")
+        return 2
+    var report = ccsg.v3CompilerLegacyMigrationReport(migration) + "\n" + proofReport
+    if len(managedMirrorRoot) > 0:
+        report = report + "\nmanaged_mirror_root=" + managedMirrorRoot
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
@@ -4049,7 +4752,14 @@ fn v3CompilerPublishWorld(rootDir: str,
         v3CompilerPrintErr(Error(reqRes))
         return 2
     let req = Value(reqRes)
-    let planRes = v3CompilerBuildSystemPlanForEquivalenceFromRuntimeFlags(rootDir, req)
+    let stagedReqRes = v3CompilerStageRequestForWorldPlan(rootDir,
+                                                          req,
+                                                          "artifacts/v3_backend_driver/publish_world_source")
+    if IsErr(stagedReqRes):
+        v3CompilerPrintErr(Error(stagedReqRes))
+        return 2
+    let stagedReq = Value(stagedReqRes)
+    let planRes = v3CompilerBuildSystemPlanForEquivalenceFromRuntimeFlags(rootDir, stagedReq)
     if IsErr(planRes):
         v3CompilerPrintErr(Error(planRes))
         return 2
@@ -4062,14 +4772,14 @@ fn v3CompilerPublishWorld(rootDir: str,
         return 2
     let proofEnabled = Value(proofModeRes)
     var equivalenceChecked = false
+    var migration: ccsg.V3CompilerLegacyMigration
     var proof: ceq.V3CompilerEquivalenceProof
     var proofReport = ""
     var migrationReport = ""
     var migrationReceipt: ccsg.V3CompileReceipt
     if proofEnabled:
         if proofMode == "migration":
-            var migration: ccsg.V3CompilerLegacyMigration
-            let proofRes = v3CompilerMigrationProofFromRuntimeFlags(rootDir, req, plan, migration, proof)
+            let proofRes = v3CompilerMigrationProofFromRuntimeFlags(rootDir, stagedReq, plan, migration, proof)
             if IsErr(proofRes):
                 v3CompilerPrintErr(Error(proofRes))
                 return 2
@@ -4124,17 +4834,45 @@ fn v3CompilerPublishWorld(rootDir: str,
                 v3CompilerPrintErr(migrationReport)
             v3CompilerPrintErr(proofReport)
         return 2
-    if !v3CompilerWorldSyncWriteBundle(rootDir, req.outputPath, plan):
+    let managedMirrorBundlesRes = cwlp.v3CompilerWorldManagedMirrorBundlesForPlan(plan)
+    if IsErr(managedMirrorBundlesRes):
+        v3CompilerPrintErr(Error(managedMirrorBundlesRes))
+        return 2
+    let managedMirrorBundles = Value(managedMirrorBundlesRes)
+    if !v3CompilerWorldSyncWriteBundle(rootDir, req.outputPath, plan, managedMirrorBundles):
         v3CompilerPrintErr("v3 compiler: failed to materialize world bundle: " + req.outputPath)
         return 2
     if equivalenceChecked:
         if !v3path.V3WriteTextFile(rootDir, req.outputPath + ".proof.txt", proofReport + "\n"):
             v3CompilerPrintErr("v3 compiler: failed to write proof: " + req.outputPath + ".proof.txt")
             return 2
+    var managedMirrorRoot = ""
+    if proofMode == "migration":
+        if !v3CompilerManagedMigrationMirrorWrite(rootDir,
+                                                  creq.v3CompilerRequestRootDir(req),
+                                                  channel,
+                                                  migration,
+                                                  migrationReceipt,
+                                                  proof,
+                                                  cworld.v3CompilerLockText(plan.localUniverse),
+                                                  managedMirrorRoot):
+            v3CompilerPrintErr("v3 compiler migration: failed to write managed mirror")
+            return 2
+    var freshReport = ""
+    if channel == "stable":
+        let freshRes = cwlp.v3CompilerWorldFreshNodeSelfhostReport(rootDir, stagedReq, plan)
+        if IsErr(freshRes):
+            v3CompilerPrintErr("v3 compiler: stable publish requires fresh-node selfhost")
+            v3CompilerPrintErr(Error(freshRes))
+            return 2
+        freshReport = Value(freshRes)
+        if !v3path.V3WriteTextFile(rootDir, req.outputPath + ".fresh.txt", freshReport + "\n"):
+            v3CompilerPrintErr("v3 compiler: failed to write fresh-node report: " + req.outputPath + ".fresh.txt")
+            return 2
     if !v3path.V3WriteTextFile(rootDir, req.outputPath + ".publish.txt", decisionReport + "\n"):
         v3CompilerPrintErr("v3 compiler: failed to write publish gate report: " + req.outputPath + ".publish.txt")
         return 2
-    let summary = v3CompilerPublishSummary(req.outputPath,
+    var summary = v3CompilerPublishSummary(req.outputPath,
                                            channel,
                                            plan,
                                            proofMode,
@@ -4142,6 +4880,10 @@ fn v3CompilerPublishWorld(rootDir: str,
                                            equivalencePassed,
                                            publishAllowed,
                                            proofCid)
+    if len(managedMirrorRoot) > 0:
+        summary = summary + "\nmanaged_mirror_root=" + managedMirrorRoot
+    if len(freshReport) > 0:
+        summary = summary + "\n" + freshReport
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, summary):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
@@ -4151,6 +4893,573 @@ fn v3CompilerPublishWorld(rootDir: str,
 fn v3CompilerFreshNodeSelfhost(rootDir: str,
                                args: str[]): int32 =
     args
+    let reqRes = v3CompilerRequestFromRuntimeFlags(rootDir, true)
+    if IsErr(reqRes):
+        v3CompilerPrintErr(Error(reqRes))
+        return 2
+    let req = Value(reqRes)
+    let stagedReqRes = v3CompilerStageRequestForWorldPlan(rootDir,
+                                                          req,
+                                                          "artifacts/v3_backend_driver/fresh_node_source")
+    if IsErr(stagedReqRes):
+        v3CompilerPrintErr(Error(stagedReqRes))
+        return 2
+    let stagedReq = Value(stagedReqRes)
+    let planRes = v3CompilerBuildSystemPlanForEquivalenceFromRuntimeFlags(rootDir, stagedReq)
+    if IsErr(planRes):
+        v3CompilerPrintErr(Error(planRes))
+        return 2
+    let plan = Value(planRes)
+    let channel = plan.localUniverse.worldHead.channel
+    var proofMode = ""
+    let proofModeRes = v3CompilerProofModeFromRuntimeFlags(channel == "stable", proofMode)
+    if IsErr(proofModeRes):
+        v3CompilerPrintErr(Error(proofModeRes))
+        return 2
+    let proofEnabled = Value(proofModeRes)
+    var equivalenceChecked = false
+    var migration: ccsg.V3CompilerLegacyMigration
+    var proof: ceq.V3CompilerEquivalenceProof
+    var proofReport = ""
+    var migrationReport = ""
+    var migrationReceipt: ccsg.V3CompileReceipt
+    if proofEnabled:
+        if proofMode == "migration":
+            let proofRes = v3CompilerMigrationProofFromRuntimeFlags(rootDir, stagedReq, plan, migration, proof)
+            if IsErr(proofRes):
+                v3CompilerPrintErr(Error(proofRes))
+                return 2
+            migrationReceipt = v3CompilerMigrationReceipt(plan, migration)
+            migrationReport = ccsg.v3CompilerLegacyMigrationReport(migration)
+            if !v3CompilerLegacyArtifactsWrite(rootDir, req.outputPath, migration, migrationReceipt):
+                v3CompilerPrintErr("v3 compiler migration: failed to write migration artifacts: " + req.outputPath)
+                return 2
+        else:
+            let proofRes = v3CompilerEquivalenceProofFromRuntimeFlags(rootDir, plan, proof)
+            if IsErr(proofRes):
+                v3CompilerPrintErr(Error(proofRes))
+                return 2
+        proofReport = ceq.v3CompilerEquivalenceProofReport(proof)
+        equivalenceChecked = true
+    else:
+        proof.proofCid = layout.FixedBytes32()
+    var publishChannel = ""
+    var stableGateRequired = 0
+    var equivalenceCheckedFlag = 0
+    var equivalencePassed = 0
+    var publishAllowed = 0
+    var proofCid = layout.FixedBytes32()
+    let decisionRes = cpub.v3CompilerPublishDecisionEvaluate(channel,
+                                                             plan.localUniverse.worldHead.headCid,
+                                                             equivalenceChecked,
+                                                             proof,
+                                                             publishChannel,
+                                                             stableGateRequired,
+                                                             equivalenceCheckedFlag,
+                                                             equivalencePassed,
+                                                             publishAllowed,
+                                                             proofCid)
+    if IsErr(decisionRes):
+        v3CompilerPrintErr(Error(decisionRes))
+        return 2
+    let decisionReport = cpub.v3CompilerPublishDecisionReport(publishChannel,
+                                                              stableGateRequired,
+                                                              equivalenceCheckedFlag,
+                                                              equivalencePassed,
+                                                              publishAllowed,
+                                                              plan.localUniverse.worldHead.headCid,
+                                                              proofCid)
+    if publishAllowed == 0:
+        if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, decisionReport):
+            v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+            return 2
+        v3CompilerPrintErr("v3 compiler: publish blocked by canonical equivalence gate")
+        v3CompilerPrintErr(decisionReport)
+        if equivalenceChecked:
+            if len(migrationReport) > 0:
+                v3CompilerPrintErr(migrationReport)
+            v3CompilerPrintErr(proofReport)
+        return 2
+    let managedMirrorBundlesRes = cwlp.v3CompilerWorldManagedMirrorBundlesForPlan(plan)
+    if IsErr(managedMirrorBundlesRes):
+        v3CompilerPrintErr(Error(managedMirrorBundlesRes))
+        return 2
+    let managedMirrorBundles = Value(managedMirrorBundlesRes)
+    if !v3CompilerWorldSyncWriteBundle(rootDir, req.outputPath, plan, managedMirrorBundles):
+        v3CompilerPrintErr("v3 compiler: failed to materialize world bundle: " + req.outputPath)
+        return 2
+    if equivalenceChecked:
+        if !v3path.V3WriteTextFile(rootDir, req.outputPath + ".proof.txt", proofReport + "\n"):
+            v3CompilerPrintErr("v3 compiler: failed to write proof: " + req.outputPath + ".proof.txt")
+            return 2
+    var managedMirrorRoot = ""
+    if proofMode == "migration":
+        if !v3CompilerManagedMigrationMirrorWrite(rootDir,
+                                                  creq.v3CompilerRequestRootDir(req),
+                                                  channel,
+                                                  migration,
+                                                  migrationReceipt,
+                                                  proof,
+                                                  cworld.v3CompilerLockText(plan.localUniverse),
+                                                  managedMirrorRoot):
+            v3CompilerPrintErr("v3 compiler migration: failed to write managed mirror")
+            return 2
+    if !v3path.V3WriteTextFile(rootDir, req.outputPath + ".publish.txt", decisionReport + "\n"):
+        v3CompilerPrintErr("v3 compiler: failed to write publish gate report: " + req.outputPath + ".publish.txt")
+        return 2
+    let freshRes = cwlp.v3CompilerWorldFreshNodeSelfhostReport(rootDir, req, plan)
+    if IsErr(freshRes):
+        v3CompilerPrintErr(Error(freshRes))
+        return 2
+    let freshReport = Value(freshRes)
+    if !v3path.V3WriteTextFile(rootDir, req.outputPath + ".fresh.txt", freshReport + "\n"):
+        v3CompilerPrintErr("v3 compiler: failed to write fresh-node report: " + req.outputPath + ".fresh.txt")
+        return 2
+    var summary = v3CompilerPublishSummary(req.outputPath,
+                                           channel,
+                                           plan,
+                                           proofMode,
+                                           equivalenceChecked,
+                                           equivalencePassed,
+                                           publishAllowed,
+                                           proofCid)
+    if len(managedMirrorRoot) > 0:
+        summary = summary + "\nmanaged_mirror_root=" + managedMirrorRoot
+    summary = summary + "\n" + freshReport
+    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, summary):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    v3CompilerPrintLine(summary)
+    return 0
+
+type
+    V3CompilerFollowInstallResult =
+        backendDriverPath: str
+        targetReceiptCid: layout.FixedBytes32
+        candidateReceiptCid: layout.FixedBytes32
+
+fn v3CompilerFollowWorldStageSourceSnapshot(rootDir: str,
+                                            packageRoot: str,
+                                            compilerEntrySource: str,
+                                            stageRootRel: str,
+                                            outPackageRoot: var str,
+                                            outCompilerEntrySource: var str): Result[bool] =
+    let stageRoot = v3path.V3PathAbsolute(rootDir, stageRootRel)
+    if (v3path.V3PathDirExists(stageRoot) || v3path.V3PathFileExists(stageRoot)) &&
+       !v3CompilerRemovePathTree(stageRoot):
+        return Err[bool]("v3 compiler: failed to reset follow-world source stage root: " + stageRoot)
+    if !v3path.V3MkdirP(rootDir, stageRoot):
+        return Err[bool]("v3 compiler: failed to prepare follow-world source stage root: " + stageRoot)
+    let packageLeaf = os.ExtractFilename(packageRoot)
+    if len(packageLeaf) <= 0:
+        return Err[bool]("v3 compiler: invalid follow-world package root: " + packageRoot)
+    let stagedPackageRoot = os.JoinPath(stageRoot, packageLeaf)
+    let entryRelRaw = os.RelativePath(compilerEntrySource, packageRoot)
+    let entryRel = strutil.Strip(entryRelRaw)
+    if len(entryRel) <= 0 ||
+       entryRel == compilerEntrySource ||
+       strutil.StartsWith(entryRel, ".."):
+        return Err[bool]("v3 compiler: follow-world entry is outside package root: " + compilerEntrySource)
+    let copyLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/follow_world.copy.log")
+    let copyRun = hostops.v3RunProgramLogged(rootDir,
+                                             "follow_world_stage_source",
+                                             "cp",
+                                             ["-R", packageRoot, stageRoot],
+                                             [],
+                                             rootDir,
+                                             0,
+                                             copyLogPath)
+    if !hostops.v3LoggedRunOk(copyRun):
+        return Err[bool]("v3 compiler: failed to stage follow-world package root: " + copyRun.output)
+    let stagedEntry = os.JoinPath(stagedPackageRoot, entryRel)
+    if !v3path.V3PathFileExists(stagedEntry):
+        return Err[bool]("v3 compiler: missing staged follow-world entry source: " + stagedEntry)
+    let workspaceRoot = parser.v3ParserWorkspaceRoot(packageRoot)
+    if workspaceRoot != "" && workspaceRoot != packageRoot:
+        let workspaceSrc = os.JoinPath(workspaceRoot, "src")
+        if !v3path.V3PathDirExists(workspaceSrc):
+            return Err[bool]("v3 compiler: missing follow-world shared workspace src: " + workspaceSrc)
+        let workspaceSrcCopyLogPath = v3path.V3PathAbsolute(rootDir,
+                                                            "artifacts/v3_backend_driver/follow_world.workspace_src.copy.log")
+        let workspaceSrcCopyRun = hostops.v3RunProgramLogged(rootDir,
+                                                             "follow_world_stage_workspace_src",
+                                                             "cp",
+                                                             ["-R", workspaceSrc, stageRoot],
+                                                             [],
+                                                             rootDir,
+                                                             0,
+                                                             workspaceSrcCopyLogPath)
+        if !hostops.v3LoggedRunOk(workspaceSrcCopyRun):
+            return Err[bool]("v3 compiler: failed to stage follow-world shared workspace src: " +
+                             workspaceSrcCopyRun.output)
+        let stagedWorkspaceSrc = os.JoinPath(stageRoot, "src")
+        if !v3path.V3PathDirExists(stagedWorkspaceSrc):
+            return Err[bool]("v3 compiler: missing staged follow-world shared workspace src: " + stagedWorkspaceSrc)
+    outPackageRoot = stagedPackageRoot
+    outCompilerEntrySource = stagedEntry
+    return Ok[bool](true)
+
+fn v3CompilerStageRequestForWorldPlan(rootDir: str,
+                                      req: creq.V3CompilerRequest,
+                                      stageRootRel: str): Result[creq.V3CompilerRequest] =
+    var stagedPackageRoot = creq.v3CompilerRequestRootDir(req)
+    var stagedSourcePath = creq.v3CompilerRequestSourcePath(req)
+    let stageRes = v3CompilerFollowWorldStageSourceSnapshot(rootDir,
+                                                            creq.v3CompilerRequestRootDir(req),
+                                                            creq.v3CompilerRequestSourcePath(req),
+                                                            stageRootRel,
+                                                            stagedPackageRoot,
+                                                            stagedSourcePath)
+    if IsErr(stageRes):
+        return Err[creq.V3CompilerRequest](Error(stageRes))
+    let stagedReq0 = creq.v3CompilerRequestNew(stagedPackageRoot,
+                                               stagedSourcePath,
+                                               creq.v3CompilerRequestOutputPath(req),
+                                               creq.v3CompilerRequestTargetTriple(req),
+                                               creq.v3CompilerRequestEmitKind(req),
+                                               req.reportPath)
+    let stagedReq1 = creq.v3CompilerRequestWithSymbolVisibility(stagedReq0,
+                                                                creq.v3CompilerRequestSymbolVisibility(req))
+    let stagedReq = creq.v3CompilerRequestWithBrowserBridgeObject(stagedReq1,
+                                                                  creq.v3CompilerRequestBrowserBridgeObjectPath(req))
+    return Ok[creq.V3CompilerRequest](stagedReq)
+
+fn v3CompilerWorldBundleSourceStageRoot(bundlePrefix: str): str =
+    return bundlePrefix + ".source"
+
+fn v3CompilerWorldBundleSourceSnapshotWrite(rootDir: str,
+                                            stagedReq: creq.V3CompilerRequest,
+                                            bundlePrefix: str): Result[bool] =
+    var snapshotPackageRoot = ""
+    var snapshotEntrySource = ""
+    let stageRes = v3CompilerFollowWorldStageSourceSnapshot(rootDir,
+                                                            creq.v3CompilerRequestRootDir(stagedReq),
+                                                            creq.v3CompilerRequestSourcePath(stagedReq),
+                                                            v3CompilerWorldBundleSourceStageRoot(bundlePrefix),
+                                                            snapshotPackageRoot,
+                                                            snapshotEntrySource)
+    if IsErr(stageRes):
+        return Err[bool](Error(stageRes))
+    return Ok[bool](true)
+
+fn v3CompilerWorldBundleSourceSnapshotPaths(rootDir: str,
+                                            bundlePrefix: str,
+                                            packageRoot: str,
+                                            compilerEntrySource: str,
+                                            outPackageRoot: var str,
+                                            outCompilerEntrySource: var str): Result[bool] =
+    let stageRoot = v3path.V3PathAbsolute(rootDir, v3CompilerWorldBundleSourceStageRoot(bundlePrefix))
+    if !v3path.V3PathDirExists(stageRoot):
+        return Err[bool]("v3 compiler: follow-world bundle missing frozen source snapshot: " + stageRoot)
+    let packageLeaf = os.ExtractFilename(packageRoot)
+    if len(packageLeaf) <= 0:
+        return Err[bool]("v3 compiler: invalid follow-world package root: " + packageRoot)
+    let entryRelRaw = os.RelativePath(compilerEntrySource, packageRoot)
+    let entryRel = strutil.Strip(entryRelRaw)
+    if len(entryRel) <= 0 ||
+       entryRel == compilerEntrySource ||
+       strutil.StartsWith(entryRel, ".."):
+        return Err[bool]("v3 compiler: follow-world entry is outside package root: " + compilerEntrySource)
+    let snapshotPackageRoot = os.JoinPath(stageRoot, packageLeaf)
+    let snapshotEntrySource = os.JoinPath(snapshotPackageRoot, entryRel)
+    if !v3path.V3PathDirExists(snapshotPackageRoot):
+        return Err[bool]("v3 compiler: follow-world bundle missing frozen package root: " + snapshotPackageRoot)
+    if !v3path.V3PathFileExists(snapshotEntrySource):
+        return Err[bool]("v3 compiler: follow-world bundle missing frozen entry source: " + snapshotEntrySource)
+    let workspaceRoot = parser.v3ParserWorkspaceRoot(packageRoot)
+    if workspaceRoot != "" && workspaceRoot != packageRoot:
+        let snapshotWorkspaceSrc = os.JoinPath(stageRoot, "src")
+        if !v3path.V3PathDirExists(snapshotWorkspaceSrc):
+            return Err[bool]("v3 compiler: follow-world bundle missing frozen shared workspace src: " +
+                             snapshotWorkspaceSrc)
+    outPackageRoot = snapshotPackageRoot
+    outCompilerEntrySource = snapshotEntrySource
+    return Ok[bool](true)
+
+fn v3CompilerFollowWorldInstallBackendDriver(rootDir: str,
+                                             packageRoot: str,
+                                             compilerEntrySource: str,
+                                             targetTriple: str,
+                                             requestedWorldHeadHex: str,
+                                             lockPath: str,
+                                             channel: str,
+                                             expectedReceipt: ccsg.V3CompileReceipt,
+                                             enforceExpectedReceipt: bool): Result[V3CompilerFollowInstallResult] =
+    let backendDriverOut = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng")
+    let backendDriverMapOut = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng.v3.map")
+    let backendDriverCandidateOut = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng.follow.next")
+    let backendDriverCandidateMapOut = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng.follow.next.v3.map")
+    let backendDriverCandidateBuildOut = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng_follow_candidate")
+    let backendDriverCandidateBuildMapOut = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng_follow_candidate.v3.map")
+    let compileReportPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/follow_world.compile.report.txt")
+    let compileLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/follow_world.compile.log")
+    let statusLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/follow_world.status.txt")
+    let verifyLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/follow_world.verify_world.txt")
+    let installLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/follow_world.install.txt")
+    var stagedPackageRoot = packageRoot
+    var stagedCompilerEntrySource = compilerEntrySource
+    let stageRes = v3CompilerFollowWorldStageSourceSnapshot(rootDir,
+                                                            packageRoot,
+                                                            compilerEntrySource,
+                                                            "artifacts/v3_backend_driver/follow_world_source",
+                                                            stagedPackageRoot,
+                                                            stagedCompilerEntrySource)
+    if IsErr(stageRes):
+        return Err[V3CompilerFollowInstallResult](Error(stageRes))
+    let installReq = creq.v3CompilerRequestNew(stagedPackageRoot,
+                                               stagedCompilerEntrySource,
+                                               backendDriverCandidateBuildOut,
+                                               targetTriple,
+                                               creq.v3EmitExe,
+                                               "")
+    var targetReceiptCid = expectedReceipt.receiptCid
+    if !enforceExpectedReceipt:
+        let installPlanRes = sexec.v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
+                                                                                installReq,
+                                                                                requestedWorldHeadHex,
+                                                                                lockPath,
+                                                                                "",
+                                                                                channel)
+        if IsErr(installPlanRes):
+            return Err[V3CompilerFollowInstallResult]("v3 compiler: follow-world install plan failed: " + Error(installPlanRes))
+        let installPlan = Value(installPlanRes)
+        targetReceiptCid = installPlan.compileReceipt.receiptCid
+    var currentCompiler = v3CompilerCurrentExecutablePath(rootDir)
+    if len(currentCompiler) > 0 && !v3path.V3FileExistsNonEmpty(rootDir, currentCompiler):
+        currentCompiler = ""
+    if len(currentCompiler) <= 0:
+        currentCompiler = v3CompilerBridgeCompilerPath(rootDir)
+    if len(currentCompiler) <= 0:
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: missing live Cheng bridge for follow-world")
+    if v3path.V3PathFileExists(backendDriverCandidateBuildOut):
+        let _ = os.RemoveFile(backendDriverCandidateBuildOut)
+    if v3path.V3PathFileExists(backendDriverCandidateBuildMapOut):
+        let _ = os.RemoveFile(backendDriverCandidateBuildMapOut)
+    if v3path.V3PathFileExists(backendDriverCandidateOut):
+        let _ = os.RemoveFile(backendDriverCandidateOut)
+    if v3path.V3PathFileExists(backendDriverCandidateMapOut):
+        let _ = os.RemoveFile(backendDriverCandidateMapOut)
+    let compileArgs = [
+        "system-link-exec",
+        "--root:" + stagedPackageRoot,
+        "--in:" + stagedCompilerEntrySource,
+        "--emit:exe",
+        "--target:" + targetTriple,
+        "--out:" + backendDriverCandidateBuildOut,
+        "--world-head:" + requestedWorldHeadHex,
+        "--lock:" + lockPath,
+        "--channel:" + channel
+    ]
+    if !v3CompilerRunFileLogged(rootDir,
+                                currentCompiler,
+                                compileArgs,
+                                compileLogPath,
+                                "follow-world compile"):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: follow-world compile failed")
+    if v3path.V3PathFileExists(compileReportPath):
+        let _ = os.RemoveFile(compileReportPath)
+    let receiptArgs = [
+        "world-receipt",
+        "--root:" + stagedPackageRoot,
+        "--in:" + stagedCompilerEntrySource,
+        "--emit:exe",
+        "--target:" + targetTriple,
+        "--out:" + backendDriverCandidateBuildOut,
+        "--report-out:" + compileReportPath,
+        "--world-head:" + requestedWorldHeadHex,
+        "--lock:" + lockPath,
+        "--channel:" + channel
+    ]
+    if !v3CompilerRunFileLogged(rootDir,
+                                currentCompiler,
+                                receiptArgs,
+                                compileLogPath,
+                                "follow-world receipt"):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: follow-world receipt failed")
+    if !v3path.V3PathFileExists(backendDriverCandidateBuildOut):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: missing follow-world backend driver candidate: " + backendDriverCandidateBuildOut)
+    if !v3path.V3PathFileExists(backendDriverCandidateBuildMapOut):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: missing follow-world backend driver candidate map: " + backendDriverCandidateBuildMapOut)
+    if !os.RenameFile(backendDriverCandidateBuildMapOut, backendDriverCandidateMapOut):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: failed to stage follow-world backend driver candidate map: " + backendDriverCandidateMapOut)
+    if !os.RenameFile(backendDriverCandidateBuildOut, backendDriverCandidateOut):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: failed to stage follow-world backend driver candidate output: " + backendDriverCandidateOut)
+    if !v3CompilerRunFileLogged(rootDir,
+                                backendDriverCandidateOut,
+                                ["status"],
+                                statusLogPath,
+                                "follow-world status"):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: follow-world status failed")
+    let verifyArgs = [
+        "verify-world",
+        "--root:" + stagedPackageRoot,
+        "--in:" + stagedCompilerEntrySource,
+        "--target:" + targetTriple,
+        "--world-head:" + requestedWorldHeadHex,
+        "--lock:" + lockPath,
+        "--channel:" + channel
+    ]
+    if !v3CompilerRunFileLogged(rootDir,
+                                backendDriverCandidateOut,
+                                verifyArgs,
+                                verifyLogPath,
+                                "follow-world verify-world"):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: follow-world verify-world failed")
+    let compileReportText = v3path.V3ReadTextFile("", compileReportPath)
+    let candidateReceiptHex = cworld.v3CompilerWorldLineValue(compileReportText, "compile_receipt_cid")
+    if len(candidateReceiptHex) <= 0:
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: follow-world missing candidate compile receipt")
+    let candidateReceiptRes = layout.fixedBytes32FromHex(candidateReceiptHex)
+    if IsErr(candidateReceiptRes):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: follow-world invalid candidate compile receipt")
+    if !layout.fixedBytes32Equal(Value(candidateReceiptRes), targetReceiptCid):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: follow-world backend driver receipt drift")
+    var installReport = ""
+    if !v3CompilerBootstrapInstallCandidate(rootDir,
+                                            backendDriverCandidateMapOut,
+                                            backendDriverMapOut,
+                                            installLogPath,
+                                            "map",
+                                            installReport):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: failed to install follow-world backend driver map: " + backendDriverMapOut)
+    if !v3CompilerBootstrapInstallCandidate(rootDir,
+                                            backendDriverCandidateOut,
+                                            backendDriverOut,
+                                            installLogPath,
+                                            "binary",
+                                            installReport):
+        return Err[V3CompilerFollowInstallResult]("v3 compiler: failed to install follow-world backend driver output: " + backendDriverOut)
+    var out: V3CompilerFollowInstallResult
+    out.backendDriverPath = backendDriverOut
+    out.targetReceiptCid = targetReceiptCid
+    out.candidateReceiptCid = Value(candidateReceiptRes)
+    return Ok[V3CompilerFollowInstallResult](out)
+
+fn v3CompilerFollowWorldOfflineLockPath(rootDir: str,
+                                        bundle: cwbundle.V3CompilerWorldBundle,
+                                        outLockPath: var str): Result[bool] =
+    let lockPathRaw = strutil.Strip(cmdline.ReadFlagOrDefault("--lock", ""))
+    if len(lockPathRaw) <= 0:
+        outLockPath = bundle.bundlePrefix + ".lock.toml"
+        return Ok[bool](true)
+    let lockRes = cworld.v3CompilerLockSnapshotRead(rootDir, lockPathRaw)
+    if IsErr(lockRes):
+        return Err[bool](Error(lockRes))
+    let verifyRes = cworld.v3CompilerWorldVerifyLock(cwbundle.v3CompilerWorldBundleUniverse(bundle),
+                                                     Value(lockRes))
+    if IsErr(verifyRes):
+        return Err[bool]("v3 compiler: follow-world provided lock mismatches bundle: " + Error(verifyRes))
+    outLockPath = v3path.V3PathAbsolute(rootDir, lockPathRaw)
+    return Ok[bool](true)
+
+fn v3CompilerFollowWorldOfflineSummary(bundle: cwbundle.V3CompilerWorldBundle,
+                                       managedMirrorCount: int32,
+                                       install: V3CompilerFollowInstallResult,
+                                       targetTriple: str): str =
+    var out = ""
+    out = out + "follow_mode=offline_bundle\n"
+    out = out + "bundle_prefix=" + bundle.bundlePrefix + "\n"
+    out = out + "channel=" + bundle.worldHead.channel + "\n"
+    out = out + "world_head_cid=" + layout.fixedBytes32Hex(bundle.worldHead.headCid) + "\n"
+    out = out + "manifest_root_cid=" + layout.fixedBytes32Hex(bundle.manifest.manifestCid) + "\n"
+    out = out + "manifest_entry_count=" + intToStr(bundle.manifest.entryCount) + "\n"
+    out = out + "managed_mirror_count=" + intToStr(managedMirrorCount) + "\n"
+    out = out + "receipt_cid=" + layout.fixedBytes32Hex(bundle.receipt.receiptCid) + "\n"
+    out = out + "follow_target=" + targetTriple + "\n"
+    out = out + "follow_backend_driver=" + install.backendDriverPath + "\n"
+    out = out + "follow_target_receipt_cid=" + layout.fixedBytes32Hex(install.targetReceiptCid) + "\n"
+    out = out + "follow_candidate_receipt_cid=" + layout.fixedBytes32Hex(install.candidateReceiptCid) + "\n"
+    out = out + "follow_candidate_receipt_match=1\n"
+    out = out + "follow_candidate_status=ok\n"
+    out = out + "follow_candidate_verify_world=ok\n"
+    out = out + "follow_install=ok"
+    return out
+
+fn v3CompilerFollowWorldOffline(rootDir: str): int32 =
+    let bundlePrefix = strutil.Strip(cmdline.ReadFlagOrDefault("--bundle-prefix", ""))
+    if len(bundlePrefix) <= 0:
+        v3CompilerPrintErr("v3 compiler: missing --bundle-prefix")
+        return 2
+    var bundle: cwbundle.V3CompilerWorldBundle
+    let bundleRes = cwbundle.v3CompilerWorldBundleReadAndVerify(rootDir, bundlePrefix, bundle)
+    if IsErr(bundleRes):
+        v3CompilerPrintErr(Error(bundleRes))
+        return 2
+    let requestedChannelRaw = strutil.Strip(cmdline.ReadFlagOrDefault("--channel", ""))
+    if len(requestedChannelRaw) > 0:
+        let requestedChannelRes = cworld.v3CompilerWorldNormalizeChannel(requestedChannelRaw)
+        if IsErr(requestedChannelRes):
+            v3CompilerPrintErr(Error(requestedChannelRes))
+            return 2
+        if Value(requestedChannelRes) != bundle.worldHead.channel:
+            v3CompilerPrintErr("v3 compiler: follow-world bundle channel mismatch")
+            return 2
+    let worldHeadMatchRes = cworld.v3CompilerWorldHeadMatchesHex(bundle.worldHead,
+                                                                 strutil.Strip(cmdline.ReadFlagOrDefault("--world-head", "")))
+    if IsErr(worldHeadMatchRes):
+        v3CompilerPrintErr(Error(worldHeadMatchRes))
+        return 2
+    var targetTriple = strutil.Strip(cmdline.ReadFlagOrDefault("--target", ""))
+    if len(targetTriple) <= 0:
+        targetTriple = bundle.receipt.targetTriple
+    if len(targetTriple) <= 0:
+        v3CompilerPrintErr("v3 compiler: follow-world bundle target missing")
+        return 2
+    if targetTriple != bundle.receipt.targetTriple:
+        v3CompilerPrintErr("v3 compiler: follow-world bundle target mismatch")
+        return 2
+    var lockPath = ""
+    let lockPathRes = v3CompilerFollowWorldOfflineLockPath(rootDir, bundle, lockPath)
+    if IsErr(lockPathRes):
+        v3CompilerPrintErr(Error(lockPathRes))
+        return 2
+    let materializeRes = cwlp.v3CompilerWorldMaterializeManagedMirrorBundlesFromBundlePrefix(rootDir,
+                                                                                              bundle.bundlePrefix)
+    if IsErr(materializeRes):
+        v3CompilerPrintErr(Error(materializeRes))
+        return 2
+    let livePackageRoot = v3path.V3PathAbsolute(rootDir, "v3")
+    let liveCompilerEntrySource = buildplan.v3BackendBuildPlanBackendDriverEntryPath(rootDir)
+    var packageRoot = livePackageRoot
+    var compilerEntrySource = liveCompilerEntrySource
+    let sourcePathsRes = v3CompilerWorldBundleSourceSnapshotPaths(rootDir,
+                                                                  bundle.bundlePrefix,
+                                                                  livePackageRoot,
+                                                                  liveCompilerEntrySource,
+                                                                  packageRoot,
+                                                                  compilerEntrySource)
+    if IsErr(sourcePathsRes):
+        v3CompilerPrintErr(Error(sourcePathsRes))
+        return 2
+    let installRes = v3CompilerFollowWorldInstallBackendDriver(rootDir,
+                                                               packageRoot,
+                                                               compilerEntrySource,
+                                                               targetTriple,
+                                                               layout.fixedBytes32Hex(bundle.worldHead.headCid),
+                                                               lockPath,
+                                                               bundle.worldHead.channel,
+                                                               bundle.receipt,
+                                                               true)
+    if IsErr(installRes):
+        v3CompilerPrintErr(Error(installRes))
+        return 2
+    let summary = v3CompilerFollowWorldOfflineSummary(bundle,
+                                                      Value(materializeRes),
+                                                      Value(installRes),
+                                                      targetTriple)
+    let reportPath = cmdline.ReadFlagOrDefault("--report-out", "")
+    if !v3CompilerWriteOptionalReport(rootDir, reportPath, summary):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + reportPath)
+        return 2
+    v3CompilerPrintLine(summary)
+    return 0
+
+fn v3CompilerFollowWorld(rootDir: str,
+                         args: str[]): int32 =
+    args
+    let bundlePrefix = strutil.Strip(cmdline.ReadFlagOrDefault("--bundle-prefix", ""))
+    if len(bundlePrefix) > 0:
+        return v3CompilerFollowWorldOffline(rootDir)
     let reqRes = v3CompilerRequestFromRuntimeFlags(rootDir, true)
     if IsErr(reqRes):
         v3CompilerPrintErr(Error(reqRes))
@@ -4169,13 +5478,13 @@ fn v3CompilerFreshNodeSelfhost(rootDir: str,
         return 2
     let proofEnabled = Value(proofModeRes)
     var equivalenceChecked = false
+    var migration: ccsg.V3CompilerLegacyMigration
     var proof: ceq.V3CompilerEquivalenceProof
     var proofReport = ""
     var migrationReport = ""
     var migrationReceipt: ccsg.V3CompileReceipt
     if proofEnabled:
         if proofMode == "migration":
-            var migration: ccsg.V3CompilerLegacyMigration
             let proofRes = v3CompilerMigrationProofFromRuntimeFlags(rootDir, req, plan, migration, proof)
             if IsErr(proofRes):
                 v3CompilerPrintErr(Error(proofRes))
@@ -4231,12 +5540,29 @@ fn v3CompilerFreshNodeSelfhost(rootDir: str,
                 v3CompilerPrintErr(migrationReport)
             v3CompilerPrintErr(proofReport)
         return 2
-    if !v3CompilerWorldSyncWriteBundle(rootDir, req.outputPath, plan):
+    let managedMirrorBundlesRes = cwlp.v3CompilerWorldManagedMirrorBundlesForPlan(plan)
+    if IsErr(managedMirrorBundlesRes):
+        v3CompilerPrintErr(Error(managedMirrorBundlesRes))
+        return 2
+    let managedMirrorBundles = Value(managedMirrorBundlesRes)
+    if !v3CompilerWorldSyncWriteBundle(rootDir, req.outputPath, plan, managedMirrorBundles):
         v3CompilerPrintErr("v3 compiler: failed to materialize world bundle: " + req.outputPath)
         return 2
     if equivalenceChecked:
         if !v3path.V3WriteTextFile(rootDir, req.outputPath + ".proof.txt", proofReport + "\n"):
             v3CompilerPrintErr("v3 compiler: failed to write proof: " + req.outputPath + ".proof.txt")
+            return 2
+    var managedMirrorRoot = ""
+    if proofMode == "migration":
+        if !v3CompilerManagedMigrationMirrorWrite(rootDir,
+                                                  creq.v3CompilerRequestRootDir(req),
+                                                  channel,
+                                                  migration,
+                                                  migrationReceipt,
+                                                  proof,
+                                                  cworld.v3CompilerLockText(plan.localUniverse),
+                                                  managedMirrorRoot):
+            v3CompilerPrintErr("v3 compiler migration: failed to write managed mirror")
             return 2
     if !v3path.V3WriteTextFile(rootDir, req.outputPath + ".publish.txt", decisionReport + "\n"):
         v3CompilerPrintErr("v3 compiler: failed to write publish gate report: " + req.outputPath + ".publish.txt")
@@ -4249,14 +5575,44 @@ fn v3CompilerFreshNodeSelfhost(rootDir: str,
     if !v3path.V3WriteTextFile(rootDir, req.outputPath + ".fresh.txt", freshReport + "\n"):
         v3CompilerPrintErr("v3 compiler: failed to write fresh-node report: " + req.outputPath + ".fresh.txt")
         return 2
-    let summary = v3CompilerPublishSummary(req.outputPath,
+    let packageRoot = v3path.V3PathAbsolute(rootDir, "v3")
+    let compilerEntrySource = buildplan.v3BackendBuildPlanBackendDriverEntryPath(rootDir)
+    let targetTriple = req.targetTriple
+    let lockPath = req.outputPath + ".lock.toml"
+    var emptyReceipt: ccsg.V3CompileReceipt
+    let installRes = v3CompilerFollowWorldInstallBackendDriver(rootDir,
+                                                               packageRoot,
+                                                               compilerEntrySource,
+                                                               targetTriple,
+                                                               layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid),
+                                                               lockPath,
+                                                               channel,
+                                                               emptyReceipt,
+                                                               false)
+    if IsErr(installRes):
+        v3CompilerPrintErr(Error(installRes))
+        return 2
+    let install = Value(installRes)
+    var summary = v3CompilerPublishSummary(req.outputPath,
                                            channel,
                                            plan,
                                            proofMode,
                                            equivalenceChecked,
                                            equivalencePassed,
                                            publishAllowed,
-                                           proofCid) + "\n" + freshReport
+                                           proofCid)
+    if len(managedMirrorRoot) > 0:
+        summary = summary + "\nmanaged_mirror_root=" + managedMirrorRoot
+    summary = summary + "\n" + freshReport
+    summary = summary + "\nfollow_bundle_prefix=" + req.outputPath
+    summary = summary + "\nfollow_target=" + targetTriple
+    summary = summary + "\nfollow_backend_driver=" + install.backendDriverPath
+    summary = summary + "\nfollow_target_receipt_cid=" + layout.fixedBytes32Hex(install.targetReceiptCid)
+    summary = summary + "\nfollow_candidate_receipt_cid=" + layout.fixedBytes32Hex(install.candidateReceiptCid)
+    summary = summary + "\nfollow_candidate_receipt_match=1"
+    summary = summary + "\nfollow_candidate_status=ok"
+    summary = summary + "\nfollow_candidate_verify_world=ok"
+    summary = summary + "\nfollow_install=ok"
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, summary):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
@@ -4275,31 +5631,35 @@ fn v3CompilerSelfhostBuild(rootDir: str,
         v3CompilerPrintErr(Error(planRes))
         return 2
     let plan = Value(planRes)
-    let report = v3CompilerAppendSystemLinkExecPhaseLines(sexec.v3SystemLinkExecPlanReport(plan), plan)
-    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
-        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
-        return 2
     let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
     if len(bridgeCompiler) > 0:
         return v3CompilerForwardToBridge(rootDir, bridgeCompiler, "selfhost-build", args)
     if v3CompilerPlanNeedsBootstrapBridge(plan):
         let bootstrapBridge = v3CompilerBootstrapBridgePath(rootDir, "selfhost-build")
         if len(bootstrapBridge) > 0:
+            var bridgeReport = ""
+            if len(req.reportPath) > 0:
+                bridgeReport = v3CompilerSystemLinkExecBridgeMergeReport(plan)
             return v3CompilerForwardBootstrapBridge(rootDir,
                                                     bootstrapBridge,
                                                     "selfhost-build",
                                                     req,
                                                     args,
-                                                    report)
+                                                    bridgeReport,
+                                                    "")
+    let summary = v3CompilerSystemLinkExecSummary(plan)
+    if !v3CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
     if sexec.v3SystemLinkExecPlanReady(plan):
         v3CompilerPrintErr("v3 compiler: missing live Cheng bridge for selfhost-build")
-        v3CompilerPrintErr(report)
+        v3CompilerPrintErr(summary)
         return 2
     elif plan.primaryObjectPlan.missingReasons.len > 0:
         v3CompilerPrintErr("v3 compiler: selfhost primary object machine code not emitted")
     else:
         v3CompilerPrintErr("v3 compiler: selfhost build blocked")
-    v3CompilerPrintErr(report)
+    v3CompilerPrintErr(summary)
     return 2
 
 fn v3CompilerTextEndsWith(text: str, suffix: str): bool =
@@ -5346,15 +6706,18 @@ fn v3CompilerVerifyOrphanGuard(rootDir: str): int32 =
     if v3CompilerLoggedRunFailed(pyScan):
         return pyScan.exitCode
     var pathStart = 0
-    for i in 0..len(pyScan.output):
+    let n = len(pyScan.output)
+    var i = 0
+    while i <= n:
         var lineEnd = false
-        if i == len(pyScan.output):
+        if i == n:
             lineEnd = true
         elif pyScan.output[i] == '\n':
             lineEnd = true
         elif pyScan.output[i] == '\r':
             lineEnd = true
         if !lineEnd:
+            i = i + 1
             continue
         let path = strutil.Strip(strings.SliceBytes(pyScan.output, pathStart, i - pathStart))
         if len(path) > 0:
@@ -5368,6 +6731,7 @@ fn v3CompilerVerifyOrphanGuard(rootDir: str): int32 =
                 v3CompilerPrintErr("verify_orphan_guard_v3: banned direct process guard ref in " + path)
                 return 1
         pathStart = i + 1
+        i = i + 1
     var orphanBefore: str[]
     if v3CompilerReadChengOrphanSnapshot(rootDir,
                                          "orphan_guard_before",
@@ -5398,12 +6762,15 @@ fn main(argc: int32, argv: str*): int32 =
     argv
     cmdline.__cheng_captureCmdLine(argc, argv)
     let rootDir = v3CompilerRoot()
+    os.SetEnv("CHENG_V3_ROOT", rootDir)
     let count: int32 = v3CompilerParamCountBridge()
     if count <= 0:
         v3CompilerUsage(rootDir)
         return 0
     let cmd = cmdline.ParamStr(1)
     let args = v3CompilerCollectArgsFrom(2, count)
+    let allArgs = v3CompilerCollectArgsFrom(1, count)
+    v3CompilerApplyProgressEnvFromArgs(rootDir, allArgs)
     if cmd == "--help" || cmd == "-h" || cmd == "help":
         v3CompilerUsage(rootDir)
         return 0
@@ -5450,6 +6817,32 @@ fn main(argc: int32, argv: str*): int32 =
             v3CompilerPrintErr(Error(reqRes))
             return 2
         return v3CompilerRunSystemLinkExec(rootDir, Value(reqRes), args)
+    if cmd == "world-receipt":
+        return v3CompilerWorldReceipt(rootDir, args)
+    if cmd == "emit-csg":
+        return v3CompilerEmitCsg(rootDir, args)
+    if cmd == "migrate-csg":
+        return v3CompilerMigrateCsg(rootDir, args)
+    if cmd == "verify-world":
+        return v3CompilerVerifyWorld(rootDir, args)
+    if cmd == "world-sync":
+        return v3CompilerWorldSync(rootDir, args)
+    if cmd == "materialize-world-mirrors":
+        return v3CompilerMaterializeWorldMirrors(rootDir, args)
+    if cmd == "prove-equivalence":
+        return v3CompilerProveEquivalence(rootDir, args)
+    if cmd == "prove-migration":
+        return v3CompilerProveMigration(rootDir, args)
+    if cmd == "publish-world":
+        return v3CompilerPublishWorld(rootDir, args)
+    if cmd == "fresh-node-selfhost":
+        return v3CompilerFreshNodeSelfhost(rootDir, args)
+    if cmd == "follow-world":
+        return v3CompilerFollowWorld(rootDir, args)
+    if cmd == "selfhost-build":
+        return v3CompilerSelfhostBuild(rootDir, args)
+    if cmd == "build-backend-driver":
+        return v3CompilerBuildBackendDriver(rootDir)
     if cmd == "verify-x86-linux-remote" ||
        cmd == "run-shared-emit-smokes" ||
        cmd == "r2c-react-v3-fresh-clean-gate" ||

@@ -11,6 +11,10 @@ type
 fn cheng_seq_string_elem_bytes_compat(): int32
 @importc("cheng_seq_string_register_compat")
 fn cheng_seq_string_register_compat(seqPtr: ptr)
+@importc("cheng_seq_string_release_range_compat")
+fn cheng_seq_string_release_range_compat(buffer: ptr, startIndex: int32, count: int32)
+@importc("cheng_seq_string_delete_shift_compat")
+fn cheng_seq_string_delete_shift_compat(buffer: ptr, at: int32, len: int32)
 @importc("cheng_seq_set_grow")
 fn cheng_seq_set_grow(seqPtr: ptr, idx: int32, elemSize: int32): ptr
 @importc("cheng_seq_delete_shift")
@@ -38,6 +42,8 @@ fn cheng__seqGrowInst(seqPtr: ptr, minCap: int32, typeSize: int32)
 fn cheng_seq_free_compat(seqPtr: ptr)
 
 fn freeSeq(seqInst: var str[]) =
+    if seqInst.buffer != nil && seqInst.len > 0:
+        cheng_seq_string_release_range_compat(seqInst.buffer, 0, seqInst.len)
     freeSeq_str(seqInst)
 
 fn freeSeq(seqInst: var bool[]) =
@@ -117,6 +123,9 @@ fn reservePtr(seqInst: var T[], newCap: int32) =
 fn clear(seqInst: var T[]) =
     seqInst.len = 0
 
+fn clear(seqInst: var str[]) =
+    setLen(seqInst, 0)
+
 fn resize(seqInst: var T[], newLen: int, capHint: int32 = 0) =
     if capHint > 0:
         reserve(seqInst, capHint)
@@ -185,17 +194,39 @@ fn delete(seqInst: var T[], at: int32) =
         cheng_seq_delete_shift(seqInst.buffer, at, seqInst.len, elemSize[T]())
         seqInst.len = seqInst.len - 1
 
+fn delete(seqInst: var str[], at: int32) =
+    if at >= 0 && at < seqInst.len:
+        cheng_seq_string_delete_shift_compat(seqInst.buffer, at, seqInst.len)
+        seqInst.len = seqInst.len - 1
+
 fn delete(seqInst: T[]*, at: int32) =
     if seqInst != nil:
         if at >= 0 && at < seqInst->len:
             cheng_seq_delete_shift(seqInst->buffer, at, seqInst->len, elemSize[T]())
             seqInst->len = seqInst->len - 1
 
+fn delete(seqInst: str[]*, at: int32) =
+    if seqInst != nil:
+        if at >= 0 && at < seqInst->len:
+            cheng_seq_string_delete_shift_compat(seqInst->buffer, at, seqInst->len)
+            seqInst->len = seqInst->len - 1
+
 fn freeSeqPtr(seqInst: var T[]) =
+    cheng_seq_free_compat(&seqInst)
+
+fn freeSeqPtr(seqInst: var str[]) =
+    if seqInst.buffer != nil && seqInst.len > 0:
+        cheng_seq_string_release_range_compat(seqInst.buffer, 0, seqInst.len)
     cheng_seq_free_compat(&seqInst)
 
 fn freeSeqPtr(seqInst: T[]*) =
     cheng_seq_free_compat(seqInst)
+
+fn freeSeqPtr(seqInst: str[]*) =
+    if seqInst != nil:
+        if seqInst->buffer != nil && seqInst->len > 0:
+            cheng_seq_string_release_range_compat(seqInst->buffer, 0, seqInst->len)
+        cheng_seq_free_compat(seqInst)
 
 fn freeSeq(seqInst: var T[]) =
     cheng_seq_free_compat(&seqInst)
@@ -258,10 +289,13 @@ fn setLen(seqInst: var str[], newLen: int) =
         target = 0
     cheng_seq_string_register_compat(&seqInst)
     let elemBytes: int32 = chengSeqStringElemBytesCompat()
+    let prevLen: int32 = seqInst.len
     if target > seqInst.cap || (target > 0 && seqInst.buffer == nil):
         cheng__seqGrowInst(&seqInst, target, elemBytes)
     if target > seqInst.len:
         cheng__seqZeroTailRaw(seqInst.buffer, seqInst.cap, seqInst.len, target, elemBytes)
+    elif target < prevLen:
+        cheng_seq_string_release_range_compat(seqInst.buffer, target, prevLen - target)
     seqInst.len = target
 
 fn setLen(seqInst: var str[], newLen: int32) =
@@ -270,10 +304,13 @@ fn setLen(seqInst: var str[], newLen: int32) =
         target = 0
     cheng_seq_string_register_compat(&seqInst)
     let elemBytes: int32 = chengSeqStringElemBytesCompat()
+    let prevLen: int32 = seqInst.len
     if target > seqInst.cap || (target > 0 && seqInst.buffer == nil):
         cheng__seqGrowInst(&seqInst, target, elemBytes)
     if target > seqInst.len:
         cheng__seqZeroTailRaw(seqInst.buffer, seqInst.cap, seqInst.len, target, elemBytes)
+    elif target < prevLen:
+        cheng_seq_string_release_range_compat(seqInst.buffer, target, prevLen - target)
     seqInst.len = target
 
 fn setLen(seqInst: str[]*, newLen: int) =
@@ -283,10 +320,13 @@ fn setLen(seqInst: str[]*, newLen: int) =
             target = 0
         cheng_seq_string_register_compat(seqInst)
         let elemBytes: int32 = chengSeqStringElemBytesCompat()
+        let prevLen: int32 = seqInst->len
         if target > seqInst->cap || (target > 0 && seqInst->buffer == nil):
             cheng__seqGrowInst(seqInst, target, elemBytes)
         if target > seqInst->len:
             cheng__seqZeroTailRaw(seqInst->buffer, seqInst->cap, seqInst->len, target, elemBytes)
+        elif target < prevLen:
+            cheng_seq_string_release_range_compat(seqInst->buffer, target, prevLen - target)
         seqInst->len = target
 
 fn setLen(seqInst: str[]*, newLen: int32) =
@@ -296,10 +336,13 @@ fn setLen(seqInst: str[]*, newLen: int32) =
             target = 0
         cheng_seq_string_register_compat(seqInst)
         let elemBytes: int32 = chengSeqStringElemBytesCompat()
+        let prevLen: int32 = seqInst->len
         if target > seqInst->cap || (target > 0 && seqInst->buffer == nil):
             cheng__seqGrowInst(seqInst, target, elemBytes)
         if target > seqInst->len:
             cheng__seqZeroTailRaw(seqInst->buffer, seqInst->cap, seqInst->len, target, elemBytes)
+        elif target < prevLen:
+            cheng_seq_string_release_range_compat(seqInst->buffer, target, prevLen - target)
         seqInst->len = target
 
 fn reserve(seqInst: var str[], newCap: int32) =

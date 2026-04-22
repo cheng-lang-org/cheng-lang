@@ -6,6 +6,7 @@ import std/system
 import std/strings
 import std/times
 import std/rawbytes
+import std/rawmem_support
 
 fn add(dst: var str[], val: str) =
     seqs.Add(dst, val)
@@ -118,6 +119,8 @@ importc fn libc_close(fd: int32): int32
 fn cheng_exec_cmd_capture_raw(command: cstring, workingDir: cstring, mergeStderr: int32): cstring
 @importc("cheng_exec_cmd_last_exit_code")
 fn cheng_exec_cmd_last_exit_code_raw(): int64
+@importc("driver_c_write_text_file_bridge")
+fn driver_c_write_text_file_bridge(path: str, content: str)
 @importc("cheng_exec_cmd_status")
 fn cheng_exec_cmd_status_raw(command: cstring, workingDir: cstring): int32
 @importc("driver_c_read_file_all_bridge_into")
@@ -473,7 +476,7 @@ fn fileMtime(path: str): int64 =
 fn fileSize(path: str): int64 =
     return cheng_file_size(strToCStringTemp(path))
 fn getCurrentDir(): str =
-    return strFromCStringBorrow(cheng_getcwd_raw())
+    return strFromCStringCopy(cheng_getcwd_raw())
 fn removeFile(path: str): bool =
     c_remove(strToCStringTemp(path)) == 0
 fn renameFile(oldPath: str, newPath: str): bool =
@@ -491,7 +494,8 @@ fn getEnv(key: str): str =
 fn getEnvDefault(key: str, defaultValue: str): str =
     return getEnvImpl(key, defaultValue)
 fn setEnv(key: str, value: str) =
-    discard c_setenv(strToCStringTemp(key), strToCStringTemp(value), 1)
+    let ignoredRc: int32 = c_setenv(strToCStringTemp(key), strToCStringTemp(value), 1)
+    ignoredRc
 fn commandLineParams(): str[] =
     # cmdline module now loads argv from runtime bridge lazily.
     let count: int32 = cmdline.ParamCount()
@@ -532,14 +536,21 @@ fn joinPath(a: str, b: str): str =
         hasSep = true
     if last == '\\':
         hasSep = true
-    var out: buffer.ByteBuffer
-    out.data = rawbytes.emptyBytes()
-    buffer.AppendBytes(out, a)
+    let bLen: int32 = strings.Len(b)
+    var outLen: int32 = aLen + bLen
     if !hasSep:
-        let slash = "/"
-        buffer.AppendBytes(out, slash)
-    buffer.AppendBytes(out, b)
-    return rawbytes.bytesToString(buffer.ToBytes(out))
+        outLen = outLen + 1
+    let out: str = newStringAlloc(outLen)
+    if outLen <= 0:
+        return ""
+    let outPtr: ptr = strDataPtr(out)
+    rawmem_support.RawmemCopy(outPtr, strDataPtr(a), aLen)
+    var writePos: int32 = aLen
+    if !hasSep:
+        rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(outPtr, writePos), int32('/'), 1)
+        writePos = writePos + 1
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(outPtr, writePos), strDataPtr(b), bLen)
+    return out
 fn `/`(a: str, b: str): str =
     return joinPath(a, b)
 
@@ -576,7 +587,7 @@ fn isAbsolute(path: str): bool =
         return true
     return false
 fn parentDir(path: str): str =
-    let parts: SplitFileResult = splitFile path
+    let parts: SplitFileResult = splitFile(path)
     return parts.dir
 fn relativePath(path: str, base: str): str =
     if strings.Len(base) == 0 || base[0] == char(0):
@@ -712,7 +723,7 @@ fn walkDir(path: str): str[] =
     return out
 
 fn walkDirRecImpl(path: str, out: var str[]) =
-    let items: seq_WalkDirEntry = walkDir path
+    let items: seq_WalkDirEntry = walkDir(path)
     for i in 0..<items.len:
         let entry: WalkDirEntry = os_get_WalkDirEntry(items, i)
         let kind: PathComponent = walkDirEntryKind(entry)
@@ -724,12 +735,12 @@ fn walkDirRecImpl(path: str, out: var str[]) =
             add(out, pathOwned)
 fn walkDirRec(path: str): str[] =
     var out: str[]
-    if strings.Len(path) == 0 || ! dirExists path:
+    if strings.Len(path) == 0 || !dirExists(path):
         return osReturnStrSeq(out)
     walkDirRecImpl(path, out)
     return osReturnStrSeq(out)
 fn extractFilename(path: str): str =
-    let parts: SplitFileResult = splitFile path
+    let parts: SplitFileResult = splitFile(path)
     if strings.Len(parts.ext) > 0:
         let name0: str = parts.name
         let ext0: str = parts.ext
@@ -817,7 +828,7 @@ fn readFileInto(path: str, out: var str): bool =
         osSetEmpty(out)
         return true
     let ok: bool = readAllInto(f, out)
-    c_fclose f
+    c_fclose(f)
     return ok
 
 fn readFile(path: str): str =
@@ -829,7 +840,7 @@ fn readFile(path: str): str =
         let size: int32 = int32(knownSize64)
         let raw: Bytes = bytesAlloc(size)
         if bytesLen(raw) != size:
-            c_fclose f
+            c_fclose(f)
             return ""
         let size64: int64 = int64(size)
         var totalGot64: int64
@@ -841,7 +852,7 @@ fn readFile(path: str): str =
                 break
             totalGot64 = totalGot64 + int64(got)
             ioMeterReport(ioRead, int64(got))
-        c_fclose f
+        c_fclose(f)
         if int32(totalGot64) != size:
             return ""
         return bytesToString(raw)
@@ -859,18 +870,13 @@ fn readFile(path: str): str =
         else:
             total = bytesConcat(total, bytesSlice(chunk, 0, got))
         ioMeterReport(ioRead, int64(got))
-    c_fclose f
+    c_fclose(f)
     return bytesToString(total)
 fn writeFile(path: str, content: str) =
-    if strings.Len(path) > 0:
-        let filePath: cstring = strToCStringTemp(path)
-        if filePath != nil:
-            let f: File = c_fopen(filePath, "wb")
-            if f != nil:
-                if strings.Len(content) > 0:
-                    let wrote: int32 = c_fwrite(strDataPtr(content), 1, strings.Len(content), f)
-                    ioMeterReport(ioWrite, int64(wrote))
-                c_fclose(f)
+    if strings.Len(path) <= 0:
+        return
+    driver_c_write_text_file_bridge(path, content)
+    ioMeterReport(ioWrite, int64(strings.Len(content)))
 
 fn writeFileBytes(path: str, bytes: uint8[]) =
     if strings.Len(path) > 0:

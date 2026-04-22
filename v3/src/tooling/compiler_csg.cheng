@@ -218,6 +218,7 @@ type
         entrySourcePath: str
         entryModulePath: str
         unitCount: int32
+        units: V3CompilerLegacySourceUnit[]
         appliedRuleCount: int32
         appliedRules: str[]
         legacySourceBundleCid: layout.FixedBytes32
@@ -236,6 +237,20 @@ fn v3CompilerCsgCloneInt32Seq(items: int32[]): int32[] =
     var out: int32[]
     for i in 0..<items.len:
         add(out, items[i])
+    return out
+
+fn v3CompilerLegacySourceUnitClone(unit: V3CompilerLegacySourceUnit): V3CompilerLegacySourceUnit =
+    var out: V3CompilerLegacySourceUnit
+    out.sourcePath = unit.sourcePath
+    out.modulePath = unit.modulePath
+    out.legacyText = unit.legacyText
+    out.migratedText = unit.migratedText
+    return out
+
+fn v3CompilerLegacySourceUnitsClone(units: V3CompilerLegacySourceUnit[]): V3CompilerLegacySourceUnit[] =
+    var out: V3CompilerLegacySourceUnit[]
+    for i in 0..<units.len:
+        add(out, v3CompilerLegacySourceUnitClone(units[i]))
     return out
 
 fn v3CompilerCsgCloneNode(node: V3CompilerCsgNode): V3CompilerCsgNode =
@@ -312,6 +327,7 @@ fn v3CompilerLegacyMigrationClone(migration: V3CompilerLegacyMigration): V3Compi
     out.entrySourcePath = migration.entrySourcePath
     out.entryModulePath = migration.entryModulePath
     out.unitCount = migration.unitCount
+    out.units = v3CompilerLegacySourceUnitsClone(migration.units)
     out.appliedRuleCount = migration.appliedRuleCount
     out.appliedRules = v3CompilerCsgCloneStrSeq(migration.appliedRules)
     out.legacySourceBundleCid = migration.legacySourceBundleCid
@@ -424,8 +440,35 @@ fn v3CompilerCsgBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
     let data = layout.byteBufToBytes(buf)
     return hash256.sha256Fixed(layout.byteSpanFromBytes(data))
 
-fn v3CompilerCsgAppendExprLayer(buf: var layout.ByteBuf,
-                                layer: parser.V3NormalizedExprLayer) =
+fn v3CompilerCsgExprCompatDetailStable(workspaceRoot: str,
+                                       packageRoot: str,
+                                       externalPackageRoots: parser.V3ParserExternalPackageRoot[],
+                                       overrides: V3CompilerCsgSourceText[],
+                                       expr: parser.V3NormalizedExpr): str =
+    if expr.kind != parser.v3NormalizedExprCall:
+        return v3CompilerCsgExprDetailText(expr.kind, expr.detailKind)
+    var stableTargetSourcePath = ""
+    if len(expr.callTargetSourcePath) > 0:
+        stableTargetSourcePath = v3CompilerCsgSourceModulePath(workspaceRoot,
+                                                               packageRoot,
+                                                               externalPackageRoots,
+                                                               overrides,
+                                                               expr.callTargetSourcePath)
+    return parser.v3ParserCallExprDetailExact(v3CompilerCsgCallSurfaceKindText(expr.callSurfaceKind),
+                                              expr.callCallee,
+                                              expr.callQualifier,
+                                              expr.callTarget,
+                                              expr.callResolved,
+                                              expr.callReason,
+                                              stableTargetSourcePath,
+                                              expr.callTargetImportc)
+
+fn v3CompilerCsgAppendExprLayerStable(buf: var layout.ByteBuf,
+                                      workspaceRoot: str,
+                                      packageRoot: str,
+                                      externalPackageRoots: parser.V3ParserExternalPackageRoot[],
+                                      overrides: V3CompilerCsgSourceText[],
+                                      layer: parser.V3NormalizedExprLayer) =
     lt.v3AppendU32BE(buf, layer.sourceCount)
     lt.v3AppendU32BE(buf, layer.exprs.len)
     lt.v3AppendU32BE(buf, layer.questionResidualCount)
@@ -435,14 +478,30 @@ fn v3CompilerCsgAppendExprLayer(buf: var layout.ByteBuf,
         let callReasonText = v3CompilerCsgCallReasonText(expr.callReason)
         let callTargetImportcText = if expr.callTargetImportc: "1" else: "0"
         let callPrefixStyleText = if expr.callPrefixStyle: "1" else: "0"
-        v3CompilerCsgAppendText(buf, expr.exprId)
-        v3CompilerCsgAppendText(buf, expr.sourcePath)
+        let stableSourcePath = v3CompilerCsgSourceModulePath(workspaceRoot,
+                                                             packageRoot,
+                                                             externalPackageRoots,
+                                                             overrides,
+                                                             expr.sourcePath)
+        var stableTargetSourcePath = ""
+        if len(expr.callTargetSourcePath) > 0:
+            stableTargetSourcePath = v3CompilerCsgSourceModulePath(workspaceRoot,
+                                                                   packageRoot,
+                                                                   externalPackageRoots,
+                                                                   overrides,
+                                                                   expr.callTargetSourcePath)
+        v3CompilerCsgAppendText(buf, stableSourcePath)
         lt.v3AppendU32BE(buf, expr.lineNumber)
         lt.v3AppendU32BE(buf, expr.columnNumber)
         lt.v3AppendU32BE(buf, expr.endLineNumber)
         lt.v3AppendU32BE(buf, expr.endColumnNumber)
         v3CompilerCsgAppendText(buf, parser.v3NormalizedExprKindText(expr.kind))
-        v3CompilerCsgAppendExprCompatDetail(buf, expr)
+        v3CompilerCsgAppendText(buf,
+                                v3CompilerCsgExprCompatDetailStable(workspaceRoot,
+                                                                    packageRoot,
+                                                                    externalPackageRoots,
+                                                                    overrides,
+                                                                    expr))
         v3CompilerCsgAppendText(buf, expr.surfaceText)
         v3CompilerCsgAppendText(buf, v3CompilerCsgCallSurfaceKindText(expr.callSurfaceKind))
         v3CompilerCsgAppendText(buf, callResolvedText)
@@ -450,14 +509,18 @@ fn v3CompilerCsgAppendExprLayer(buf: var layout.ByteBuf,
         v3CompilerCsgAppendText(buf, expr.callQualifier)
         v3CompilerCsgAppendText(buf, expr.callCallee)
         v3CompilerCsgAppendText(buf, expr.callTarget)
-        v3CompilerCsgAppendText(buf, expr.callTargetSourcePath)
+        v3CompilerCsgAppendText(buf, stableTargetSourcePath)
         v3CompilerCsgAppendText(buf, callTargetImportcText)
         v3CompilerCsgAppendText(buf, callPrefixStyleText)
         lt.v3AppendU32BE(buf, expr.callArgCount)
         v3CompilerCsgAppendText(buf, expr.callArgsText)
 
-fn v3CompilerCsgAppendTypedExprFacts(buf: var layout.ByteBuf,
-                                     facts: V3TypedExprFact[]) =
+fn v3CompilerCsgAppendTypedExprFactsStable(buf: var layout.ByteBuf,
+                                           workspaceRoot: str,
+                                           packageRoot: str,
+                                           externalPackageRoots: parser.V3ParserExternalPackageRoot[],
+                                           overrides: V3CompilerCsgSourceText[],
+                                           facts: V3TypedExprFact[]) =
     lt.v3AppendU32BE(buf, facts.len)
     for i in 0..<facts.len:
         let fact = facts[i]
@@ -465,8 +528,19 @@ fn v3CompilerCsgAppendTypedExprFacts(buf: var layout.ByteBuf,
         let callReasonText = texpr.v3TypedExprCallReasonText(fact.callReason)
         let callTargetImportcText = if fact.callTargetImportc: "1" else: "0"
         let callPrefixStyleText = if fact.callPrefixStyle: "1" else: "0"
-        v3CompilerCsgAppendText(buf, fact.exprId)
-        v3CompilerCsgAppendText(buf, fact.sourcePath)
+        let stableSourcePath = v3CompilerCsgSourceModulePath(workspaceRoot,
+                                                             packageRoot,
+                                                             externalPackageRoots,
+                                                             overrides,
+                                                             fact.sourcePath)
+        var stableTargetSourcePath = ""
+        if len(fact.callTargetSourcePath) > 0:
+            stableTargetSourcePath = v3CompilerCsgSourceModulePath(workspaceRoot,
+                                                                   packageRoot,
+                                                                   externalPackageRoots,
+                                                                   overrides,
+                                                                   fact.callTargetSourcePath)
+        v3CompilerCsgAppendText(buf, stableSourcePath)
         lt.v3AppendU32BE(buf, fact.lineNumber)
         lt.v3AppendU32BE(buf, fact.columnNumber)
         lt.v3AppendU32BE(buf, fact.endLineNumber)
@@ -478,7 +552,7 @@ fn v3CompilerCsgAppendTypedExprFacts(buf: var layout.ByteBuf,
         v3CompilerCsgAppendText(buf, fact.callQualifier)
         v3CompilerCsgAppendText(buf, fact.callCallee)
         v3CompilerCsgAppendText(buf, fact.callTarget)
-        v3CompilerCsgAppendText(buf, fact.callTargetSourcePath)
+        v3CompilerCsgAppendText(buf, stableTargetSourcePath)
         v3CompilerCsgAppendText(buf, callTargetImportcText)
         v3CompilerCsgAppendText(buf, callPrefixStyleText)
         lt.v3AppendU32BE(buf, fact.callArgCount)
@@ -532,6 +606,10 @@ fn v3CompilerCsgHashEdge(fromNodeId: int32,
 
 fn v3CompilerCsgGraphCid(packageId: str,
                          sourceBundleCid: layout.FixedBytes32,
+                         workspaceRoot: str,
+                         packageRoot: str,
+                         externalPackageRoots: parser.V3ParserExternalPackageRoot[],
+                         overrides: V3CompilerCsgSourceText[],
                          exprLayer: parser.V3NormalizedExprLayer,
                          typedExprFacts: V3TypedExprFact[],
                          nodes: V3CompilerCsgNode[],
@@ -540,8 +618,18 @@ fn v3CompilerCsgGraphCid(packageId: str,
     v3CompilerCsgAppendText(buf, "v3.compiler.csg.graph")
     v3CompilerCsgAppendText(buf, packageId)
     lt.v3AppendFixed32(buf, sourceBundleCid)
-    v3CompilerCsgAppendExprLayer(buf, exprLayer)
-    v3CompilerCsgAppendTypedExprFacts(buf, typedExprFacts)
+    v3CompilerCsgAppendExprLayerStable(buf,
+                                       workspaceRoot,
+                                       packageRoot,
+                                       externalPackageRoots,
+                                       overrides,
+                                       exprLayer)
+    v3CompilerCsgAppendTypedExprFactsStable(buf,
+                                            workspaceRoot,
+                                            packageRoot,
+                                            externalPackageRoots,
+                                            overrides,
+                                            typedExprFacts)
     lt.v3AppendU32BE(buf, nodes.len)
     for i in 0..<nodes.len:
         let node = nodes[i]
@@ -748,6 +836,7 @@ fn v3CompilerCsgSourceTextLookup(overrides: V3CompilerCsgSourceText[],
 
 fn v3CompilerCsgSourceModulePath(workspaceRoot: str,
                                  packageRoot: str,
+                                 externalPackageRoots: parser.V3ParserExternalPackageRoot[],
                                  overrides: V3CompilerCsgSourceText[],
                                  sourcePath: str): str =
     for i in 0..<overrides.len:
@@ -755,7 +844,10 @@ fn v3CompilerCsgSourceModulePath(workspaceRoot: str,
             continue
         if len(overrides[i].modulePath) > 0:
             return overrides[i].modulePath
-    return parser.v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
+    return parser.v3ParserSourcePathToModulePathWithExternalPackageRoots(workspaceRoot,
+                                                                         packageRoot,
+                                                                         externalPackageRoots,
+                                                                         sourcePath)
 
 fn v3CompilerCsgIsBrowserAbiSupportModule(modulePath: str): bool =
     if modulePath == browsercodec.v3BrowserContentCodecModulePath():
@@ -776,6 +868,7 @@ fn v3CompilerCsgAddBrowserAbiRulesForSource(rules: var V3BrowserAbiRule[],
                                             linkPlan: slplan.V3SystemLinkPlanStub,
                                             ownerModulePath: str,
                                             sourcePath: str) =
+    let externalPackageRoots = slplan.v3SystemLinkPlanExternalPackageRoots(linkPlan)
     let normalizedSourcePath = parser.v3ParserNormalizePath(sourcePath)
     let normalizedEntryPath = parser.v3ParserNormalizePath(linkPlan.entryPath)
     if normalizedSourcePath == normalizedEntryPath:
@@ -798,9 +891,10 @@ fn v3CompilerCsgAddBrowserAbiRulesForSource(rules: var V3BrowserAbiRule[],
                 let currentSourcePath = parser.v3ParserNormalizePath(linkPlan.sourceClosurePaths[j])
                 if currentSourcePath == normalizedSourcePath:
                     continue
-                let currentModulePath = parser.v3ParserSourcePathToModulePath(linkPlan.workspaceRoot,
-                                                                              linkPlan.packageRoot,
-                                                                              currentSourcePath)
+                let currentModulePath = parser.v3ParserSourcePathToModulePathWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                                                       linkPlan.packageRoot,
+                                                                                                       externalPackageRoots,
+                                                                                                       currentSourcePath)
                 if v3CompilerCsgIsBrowserAbiSupportModule(currentModulePath):
                     continue
                 let text = v3path.V3ReadTextFile("", currentSourcePath)
@@ -823,9 +917,10 @@ fn v3CompilerCsgAddBrowserAbiRulesForSource(rules: var V3BrowserAbiRule[],
                 let currentSourcePath = parser.v3ParserNormalizePath(linkPlan.sourceClosurePaths[j])
                 if currentSourcePath == normalizedSourcePath:
                     continue
-                let currentModulePath = parser.v3ParserSourcePathToModulePath(linkPlan.workspaceRoot,
-                                                                              linkPlan.packageRoot,
-                                                                              currentSourcePath)
+                let currentModulePath = parser.v3ParserSourcePathToModulePathWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                                                       linkPlan.packageRoot,
+                                                                                                       externalPackageRoots,
+                                                                                                       currentSourcePath)
                 if v3CompilerCsgIsBrowserAbiSupportModule(currentModulePath):
                     continue
                 let text = v3path.V3ReadTextFile("", currentSourcePath)
@@ -843,14 +938,16 @@ fn v3CompilerCsgAddBrowserAbiRulesForSource(rules: var V3BrowserAbiRule[],
 fn v3CompilerBrowserAbiRulesForLinkPlan(linkPlan: slplan.V3SystemLinkPlanStub): V3BrowserAbiRule[] =
     var out: V3BrowserAbiRule[]
     var orderedSources: str[]
+    let externalPackageRoots = slplan.v3SystemLinkPlanExternalPackageRoots(linkPlan)
     for i in 0..<linkPlan.sourceClosurePaths.len:
         add(orderedSources, linkPlan.sourceClosurePaths[i])
     v3CompilerCsgSortStrs(orderedSources)
     for i in 0..<orderedSources.len:
         let sourcePath = orderedSources[i]
-        let ownerModulePath = parser.v3ParserSourcePathToModulePath(linkPlan.workspaceRoot,
-                                                                    linkPlan.packageRoot,
-                                                                    sourcePath)
+        let ownerModulePath = parser.v3ParserSourcePathToModulePathWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                                             linkPlan.packageRoot,
+                                                                                             externalPackageRoots,
+                                                                                             sourcePath)
         v3CompilerCsgAddBrowserAbiRulesForSource(out, linkPlan, ownerModulePath, sourcePath)
     return out
 
@@ -1208,20 +1305,24 @@ fn v3BuildCompilerLegacyMigration(workspaceRoot: str,
                                        err):
         return Err[V3CompilerLegacyMigration](err)
     v3CompilerCsgSortStrs(ownerModulePaths)
-    var legacySourcePaths: str[]
     var legacyTexts: str[]
-    var migratedSourcePaths: str[]
+    var legacyModulePaths: str[]
     var migratedTexts: str[]
+    var migratedModulePaths: str[]
     for i in 0..<units.len:
-        add(legacySourcePaths, units[i].sourcePath)
+        add(legacyModulePaths, units[i].modulePath)
         add(legacyTexts, units[i].legacyText)
-        add(migratedSourcePaths, units[i].sourcePath)
+        add(migratedModulePaths, units[i].modulePath)
         add(migratedTexts, units[i].migratedText)
     let packageId = len(packageIdHint) > 0 ? packageIdHint : v3CompilerLegacyPackageId(units[0].modulePath)
-    let legacyBundleRes = cworld.v3CompilerWorldSourceBundleCidFromTexts(packageId, legacySourcePaths, legacyTexts)
+    let legacyBundleRes = cworld.v3CompilerWorldSourceBundleCidFromModuleTexts(packageId,
+                                                                               legacyModulePaths,
+                                                                               legacyTexts)
     if IsErr(legacyBundleRes):
         return Err[V3CompilerLegacyMigration](Error(legacyBundleRes))
-    let migratedBundleRes = cworld.v3CompilerWorldSourceBundleCidFromTexts(packageId, migratedSourcePaths, migratedTexts)
+    let migratedBundleRes = cworld.v3CompilerWorldSourceBundleCidFromModuleTexts(packageId,
+                                                                                 migratedModulePaths,
+                                                                                 migratedTexts)
     if IsErr(migratedBundleRes):
         return Err[V3CompilerLegacyMigration](Error(migratedBundleRes))
     var plan: slplan.V3SystemLinkPlanStub
@@ -1264,6 +1365,7 @@ fn v3BuildCompilerLegacyMigration(workspaceRoot: str,
     out.entrySourcePath = entrySourcePath
     out.entryModulePath = units[0].modulePath
     out.unitCount = units.len
+    out.units = v3CompilerLegacySourceUnitsClone(units)
     out.appliedRuleCount = appliedCount
     out.appliedRules = appliedRules
     out.legacySourceBundleCid = Value(legacyBundleRes)
@@ -1462,6 +1564,7 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
     var orderedSources: str[]
     var typedSourceTexts: V3TypedExprSourceText[]
     var exprCallProfiles: parser.V3NormalizedExprCallProfile[]
+    let externalPackageRoots = slplan.v3SystemLinkPlanExternalPackageRoots(linkPlan)
     for i in 0..<linkPlan.sourceClosurePaths.len:
         add(orderedSources, linkPlan.sourceClosurePaths[i])
     v3CompilerCsgSortStrs(orderedSources)
@@ -1469,6 +1572,7 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
         let sourcePath = orderedSources[sourceIndex]
         let ownerModulePath = v3CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
                                                             linkPlan.packageRoot,
+                                                            externalPackageRoots,
                                                             sourceTextOverrides,
                                                             sourcePath)
         let ownerModuleNodeId = v3CompilerCsgModuleNodeId(nodes, ownerModulePath)
@@ -1477,18 +1581,20 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
         var text = ""
         if !v3CompilerCsgSourceTextLookup(sourceTextOverrides, sourcePath, text):
             text = v3path.V3ReadTextFile("", sourcePath)
-        add(typedSourceTexts, texpr.v3TypedExprSourceTextNew(linkPlan.workspaceRoot,
-                                                             linkPlan.packageRoot,
-                                                             sourcePath,
-                                                             text))
+        add(typedSourceTexts, texpr.v3TypedExprSourceTextNewWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                                      linkPlan.packageRoot,
+                                                                                      externalPackageRoots,
+                                                                                      sourcePath,
+                                                                                      text))
         var profile: parser.V3NormalizedExprCallProfile
         var profileErr = ""
-        if !parser.v3ParserBuildExprCallProfile(linkPlan.workspaceRoot,
-                                                linkPlan.packageRoot,
-                                                sourcePath,
-                                                text,
-                                                profile,
-                                                profileErr):
+        if !parser.v3ParserBuildExprCallProfileWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                        linkPlan.packageRoot,
+                                                                        externalPackageRoots,
+                                                                        sourcePath,
+                                                                        text,
+                                                                        profile,
+                                                                        profileErr):
             return Err[V3CompilerCsg]("v3 compiler csg: normalized decl read failed")
         add(exprCallProfiles, profile)
     let profileIndexLookup = parser.v3ParserSourcePathIndexLookupBuild(exprCallProfiles)
@@ -1500,6 +1606,7 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
         let decls = profile.decls
         let ownerModulePath = v3CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
                                                             linkPlan.packageRoot,
+                                                            externalPackageRoots,
                                                             sourceTextOverrides,
                                                             sourcePath)
         let ownerModuleNodeId = v3CompilerCsgModuleNodeId(nodes, ownerModulePath)
@@ -1711,7 +1818,16 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
     out.nodeCount = nodes.len
     out.edgeCount = edges.len
     out.canonicalGraphCid = v3CompilerCsgCanonicalGraphCid(out.packageId, out.exprLayer, out.typedExprFacts, out.nodes, out.edges)
-    out.graphCid = v3CompilerCsgGraphCid(out.packageId, out.sourceBundleCid, out.exprLayer, out.typedExprFacts, out.nodes, out.edges)
+    out.graphCid = v3CompilerCsgGraphCid(out.packageId,
+                                         out.sourceBundleCid,
+                                         linkPlan.workspaceRoot,
+                                         linkPlan.packageRoot,
+                                         linkPlan.externalPackageRoots,
+                                         sourceTextOverrides,
+                                         out.exprLayer,
+                                         out.typedExprFacts,
+                                         out.nodes,
+                                         out.edges)
     return Ok[V3CompilerCsg](out)
 
 fn v3BuildCompilerCsg(linkPlan: slplan.V3SystemLinkPlanStub,
@@ -1847,6 +1963,17 @@ fn v3CompilerCsgReport(csg: V3CompilerCsg): str =
         out = out + "\n" + v3CompilerCsgNodeReportLine(i, csg.nodes[i])
     for i in 0..<csg.edges.len:
         out = out + "\n" + v3CompilerCsgEdgeReportLine(i, csg.edges[i])
+    return out
+
+fn v3CompilerCsgWireReport(csg: V3CompilerCsg): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "package_id=" + csg.packageId + "\n"
+    out = out + "source_bundle_cid=" + layout.fixedBytes32Hex(csg.sourceBundleCid) + "\n"
+    out = out + "canonical_graph_cid=" + layout.fixedBytes32Hex(csg.canonicalGraphCid) + "\n"
+    out = out + "graph_cid=" + layout.fixedBytes32Hex(csg.graphCid) + "\n"
+    out = out + "node_count=" + intToStr(csg.nodeCount) + "\n"
+    out = out + "edge_count=" + intToStr(csg.edgeCount)
     return out
 
 fn v3CompilerCsgNodeReportLine(index: int32,

@@ -1,7 +1,9 @@
 import std/result
 import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/compiler_runtime as crun
+import cheng/v3/tooling/compiler_world as cworld
 import cheng/v3/tooling/path as v3path
 import cheng/v3/lang/parser as parser
 import cheng/v3/backend/build_plan as buildplan
@@ -20,6 +22,7 @@ type
         symbolVisibility: str
         browserBridgeObjectPath: str
         packageRoot: str
+        externalPackageRoots: parser.V3ParserExternalPackageRoot[]
         workspaceRoot: str
         packageId: str
         moduleStem: str
@@ -85,6 +88,9 @@ fn v3SystemLinkPlanWorkspaceRoot(plan: V3SystemLinkPlanStub): str =
 fn v3SystemLinkPlanPackageRoot(plan: V3SystemLinkPlanStub): str =
     return plan.packageRoot
 
+fn v3SystemLinkPlanExternalPackageRoots(plan: V3SystemLinkPlanStub): parser.V3ParserExternalPackageRoot[] =
+    return parser.v3ParserExternalPackageRootsClone(plan.externalPackageRoots)
+
 fn v3SystemLinkPlanPackageId(plan: V3SystemLinkPlanStub): str =
     return plan.packageId
 
@@ -145,6 +151,13 @@ fn v3SystemLinkPlanEntrySymbol(plan: V3SystemLinkPlanStub): str =
 fn v3SystemLinkPlanSourceClosurePaths(plan: V3SystemLinkPlanStub): str[] =
     return plan.sourceClosurePaths
 
+fn v3SystemLinkPlanSourceBundleCid(plan: V3SystemLinkPlanStub): Result[layout.FixedBytes32] =
+    return cworld.v3CompilerWorldSourceBundleCidWithExternalPackageRoots(plan.packageId,
+                                                                         plan.workspaceRoot,
+                                                                         plan.packageRoot,
+                                                                         plan.externalPackageRoots,
+                                                                         plan.sourceClosurePaths)
+
 fn v3SystemLinkPlanMissingReasonsField(plan: V3SystemLinkPlanStub): str[] =
     return plan.missingReasons
 
@@ -189,17 +202,22 @@ fn v3SystemLinkPlanMissingReasons(parsed: parser.V3ParsedSourceStub,
         add(missing, "runtime_provider_modules_not_selected")
     return missing
 
-fn v3BuildSystemLinkPlanStub(rootDir: str,
-                             req: creq.V3CompilerRequest,
-                             plan: var V3SystemLinkPlanStub,
-                             err: var str): bool =
+fn v3BuildSystemLinkPlanStubWithExternalPackageRoots(rootDir: str,
+                                                     req: creq.V3CompilerRequest,
+                                                     externalPackageRoots: parser.V3ParserExternalPackageRoot[],
+                                                     plan: var V3SystemLinkPlanStub,
+                                                     err: var str): bool =
     let requestPackageRoot = creq.v3CompilerRequestRootDir(req)
     let requestSourcePath = creq.v3CompilerRequestSourcePath(req)
     let requestOutputPath = creq.v3CompilerRequestOutputPath(req)
     let requestTargetTriple = creq.v3CompilerRequestTargetTriple(req)
     let requestEmitKind = creq.v3CompilerRequestEmitKind(req)
     var parsed: parser.V3ParsedSourceStub
-    if !parser.v3ParseOrdinarySourceStub(requestPackageRoot, requestSourcePath, parsed, err):
+    if !parser.v3ParseOrdinarySourceStubWithExternalPackageRoots(requestPackageRoot,
+                                                                 requestSourcePath,
+                                                                 externalPackageRoots,
+                                                                 parsed,
+                                                                 err):
         return false
     var toolingTrack = false
     for i in 0..<parsed.ownerModulePaths.len:
@@ -236,6 +254,7 @@ fn v3BuildSystemLinkPlanStub(rootDir: str,
     plan.symbolVisibility = creq.v3CompilerRequestSymbolVisibility(req)
     plan.browserBridgeObjectPath = creq.v3CompilerRequestBrowserBridgeObjectPath(req)
     plan.packageRoot = parsed.packageRoot
+    plan.externalPackageRoots = parser.v3ParserExternalPackageRootsClone(externalPackageRoots)
     plan.workspaceRoot = parsed.workspaceRoot
     plan.packageId = parsed.packageId
     plan.moduleStem = parsed.moduleStem
@@ -262,6 +281,17 @@ fn v3BuildSystemLinkPlanStub(rootDir: str,
     plan.pipelineStage = "parser_to_system_link_plan"
     err = ""
     return true
+
+fn v3BuildSystemLinkPlanStub(rootDir: str,
+                             req: creq.V3CompilerRequest,
+                             plan: var V3SystemLinkPlanStub,
+                             err: var str): bool =
+    var externalPackageRoots: parser.V3ParserExternalPackageRoot[]
+    return v3BuildSystemLinkPlanStubWithExternalPackageRoots(rootDir,
+                                                             req,
+                                                             externalPackageRoots,
+                                                             plan,
+                                                             err)
 
 fn v3SystemLinkPlanStubReport(plan: V3SystemLinkPlanStub): str =
     var out: str

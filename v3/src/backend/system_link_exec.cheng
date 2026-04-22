@@ -1,11 +1,13 @@
 import std/result
 import std/strings
 import std/os
+import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/path as v3path
 import cheng/v3/tooling/compiler_world as cworld
 import cheng/v3/tooling/compiler_csg as ccsg
+import cheng/v3/lang/parser as parser
 import cheng/v3/lang/browser_abi_rule as barule
 import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/backend/lowering_plan as lower
@@ -65,6 +67,43 @@ fn v3SystemLinkExecPhaseMsText(ns: int64): str =
     if ns <= 0:
         return "0"
     return int64ToStr(ns / 1000000)
+
+fn v3SystemLinkExecProgressStdErrEnabled(): bool =
+    let raw = strutil.Strip(os.GetEnv("CHENG_V3_PROGRESS"))
+    return len(raw) > 0 && raw != "0" && raw != "false"
+
+fn v3SystemLinkExecProgressPath(): str =
+    return strutil.Strip(os.GetEnv("CHENG_V3_PROGRESS_OUT"))
+
+fn v3SystemLinkExecProgressLine(phase: str,
+                                status: str,
+                                phaseNs: int64,
+                                totalNs: int64): str =
+    var out = "compile_progress phase=" + phase + " status=" + status
+    if phaseNs >= int64(0):
+        out = out + " phase_ms=" + v3SystemLinkExecPhaseMsText(phaseNs)
+    if totalNs >= int64(0):
+        out = out + " total_ms=" + v3SystemLinkExecPhaseMsText(totalNs)
+    return out
+
+fn v3SystemLinkExecProgressEmit(rootDir: str,
+                                stderrEnabled: bool,
+                                progressPath: str,
+                                progressText: var str,
+                                phase: str,
+                                status: str,
+                                phaseNs: int64,
+                                totalNs: int64) =
+    if !stderrEnabled && len(progressPath) <= 0:
+        return
+    let line = v3SystemLinkExecProgressLine(phase, status, phaseNs, totalNs)
+    if stderrEnabled:
+        os.WriteLine(os.Get_stderr(), line)
+    if len(progressPath) > 0:
+        if len(progressText) > 0:
+            progressText = progressText + "\n"
+        progressText = progressText + line
+        let _ = v3path.V3WriteTextFile(rootDir, progressPath, progressText + "\n")
 
 fn v3SystemLinkExecBrowserBridgeArtifactBasePath(outputPath: str): str =
     if len(outputPath) <= 0:
@@ -176,6 +215,44 @@ fn v3ProviderSourcesForPlan(rootDir: str, linkPlan: slplan.V3SystemLinkPlanStub)
             return Err[str[]]("v3 provider source: unsupported module " + modulePath)
     return Ok[str[]](out)
 
+fn v3SystemLinkExecLockCompilerProofCid(lock: cworld.V3CompilerLockSnapshot): layout.FixedBytes32 =
+    for i in 0..<lock.entries.len:
+        if lock.entries[i].packageId == "cheng/v3/compiler":
+            return lock.entries[i].migrationProofCid
+    return layout.FixedBytes32()
+
+fn v3SystemLinkExecBuiltinPackage(packageId: str): bool =
+    if packageId == "cheng/v3/compiler":
+        return true
+    if packageId == "cheng/v3/std":
+        return true
+    return packageId == "cheng/v3/runtime"
+
+fn v3SystemLinkExecExtraManifestEntries(lock: cworld.V3CompilerLockSnapshot): cworld.V3CompilerUniverseManifestEntry[] =
+    var out: cworld.V3CompilerUniverseManifestEntry[]
+    for i in 0..<lock.entries.len:
+        if v3SystemLinkExecBuiltinPackage(lock.entries[i].packageId):
+            continue
+        add(out, lock.entries[i])
+    return out
+
+fn v3SystemLinkExecExternalPackageRoots(rootDir: str,
+                                        lock: cworld.V3CompilerLockSnapshot): parser.V3ParserExternalPackageRoot[] =
+    var out: parser.V3ParserExternalPackageRoot[]
+    for i in 0..<lock.entries.len:
+        let entry = lock.entries[i]
+        if v3SystemLinkExecBuiltinPackage(entry.packageId):
+            continue
+        let mirrorRoot = cworld.v3CompilerManagedMirrorRoot(rootDir,
+                                                            lock.channel,
+                                                            entry.packageId,
+                                                            entry.migrationProofCid)
+        let sourceRoot = v3path.V3PathJoin(mirrorRoot, "src")
+        if !v3path.V3PathDirExists(sourceRoot):
+            continue
+        add(out, parser.v3ParserExternalPackageRootNew(entry.packageId, mirrorRoot))
+    return out
+
 fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
                                                 req: creq.V3CompilerRequest,
                                                 requestedWorldHead: str,
@@ -184,80 +261,366 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
                                                 channelRaw: str): Result[V3SystemLinkExecPlan] =
     var phaseProfile: V3SystemLinkExecPhaseProfile
     let totalStartNs: int64 = v3SystemLinkExecNowNs()
-    let systemLinkPlanStartNs: int64 = totalStartNs
-    var linkPlan: slplan.V3SystemLinkPlanStub
-    var err = ""
-    if !slplan.v3BuildSystemLinkPlanStub(rootDir, req, linkPlan, err):
-        return Err[V3SystemLinkExecPlan](err)
-    phaseProfile.systemLinkPlanNs = v3SystemLinkExecNowNs() - systemLinkPlanStartNs
-    let sourceBundleStartNs: int64 = v3SystemLinkExecNowNs()
-    let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId,
-                                                                linkPlan.sourceClosurePaths)
-    phaseProfile.sourceBundleNs = v3SystemLinkExecNowNs() - sourceBundleStartNs
-    let compilerCsgStartNs: int64 = v3SystemLinkExecNowNs()
-    let compilerCsgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
-    if IsErr(compilerCsgRes):
-        return Err[V3SystemLinkExecPlan](Error(compilerCsgRes))
-    let compilerCsg = ccsg.v3CompilerCsgClone(Value(compilerCsgRes))
-    phaseProfile.compilerCsgNs = v3SystemLinkExecNowNs() - compilerCsgStartNs
-    let exportSurface = ccsg.v3CompilerExportSurfaceFromCsg(compilerCsg)
-    let worldStartNs: int64 = v3SystemLinkExecNowNs()
-    let universeRes = cworld.v3CompilerLocalUniverseBuildForChannel(channelRaw,
-                                                                    sourceBundleCid,
-                                                                    compilerCsg.graphCid,
-                                                                    exportSurface.surfaceCid)
-    if IsErr(universeRes):
-        return Err[V3SystemLinkExecPlan](Error(universeRes))
-    let localUniverse = Value(universeRes)
-    let worldHeadPinned = len(requestedWorldHead) > 0
-    if worldHeadPinned:
-        let pinRes = cworld.v3CompilerWorldHeadMatchesHex(localUniverse.worldHead, requestedWorldHead)
-        if IsErr(pinRes):
-            return Err[V3SystemLinkExecPlan](Error(pinRes))
-    phaseProfile.worldNs = v3SystemLinkExecNowNs() - worldStartNs
+    let progressStdErrEnabled = v3SystemLinkExecProgressStdErrEnabled()
+    let progressPath = v3SystemLinkExecProgressPath()
+    var progressText = ""
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "build",
+                                 "begin",
+                                 int64(-1),
+                                 int64(0))
     let lockCheckEnabled = len(lockPath) > 0
+    let worldHeadPinned = len(requestedWorldHead) > 0
+    if worldHeadPinned && !lockCheckEnabled:
+        v3SystemLinkExecProgressEmit(rootDir,
+                                     progressStdErrEnabled,
+                                     progressPath,
+                                     progressText,
+                                     "build",
+                                     "error",
+                                     int64(-1),
+                                     v3SystemLinkExecNowNs() - totalStartNs)
+        return Err[V3SystemLinkExecPlan]("v3 compiler world: pinned --world-head requires --lock")
+    var lockSnapshot: cworld.V3CompilerLockSnapshot
     var lockVerified = false
+    var compilerProofCid = layout.FixedBytes32()
+    var extraManifestEntries: cworld.V3CompilerUniverseManifestEntry[]
+    var externalPackageRoots: parser.V3ParserExternalPackageRoot[]
     let lockStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "lock",
+                                 "begin",
+                                 int64(-1),
+                                 lockStartNs - totalStartNs)
     if lockCheckEnabled:
         let lockRes = cworld.v3CompilerLockSnapshotRead(rootDir, lockPath)
         if IsErr(lockRes):
+            v3SystemLinkExecProgressEmit(rootDir,
+                                         progressStdErrEnabled,
+                                         progressPath,
+                                         progressText,
+                                         "lock",
+                                         "error",
+                                         int64(-1),
+                                         v3SystemLinkExecNowNs() - totalStartNs)
             return Err[V3SystemLinkExecPlan](Error(lockRes))
-        let verifyLockRes = cworld.v3CompilerWorldVerifyLock(localUniverse, Value(lockRes))
+        lockSnapshot = Value(lockRes)
+        compilerProofCid = v3SystemLinkExecLockCompilerProofCid(lockSnapshot)
+        extraManifestEntries = v3SystemLinkExecExtraManifestEntries(lockSnapshot)
+        externalPackageRoots = v3SystemLinkExecExternalPackageRoots(rootDir, lockSnapshot)
+    phaseProfile.lockNs = v3SystemLinkExecNowNs() - lockStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "lock",
+                                 "done",
+                                 phaseProfile.lockNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
+    let systemLinkPlanStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "system_link_plan",
+                                 "begin",
+                                 int64(-1),
+                                 systemLinkPlanStartNs - totalStartNs)
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    if !slplan.v3BuildSystemLinkPlanStubWithExternalPackageRoots(rootDir,
+                                                                 req,
+                                                                 externalPackageRoots,
+                                                                 linkPlan,
+                                                                 err):
+        v3SystemLinkExecProgressEmit(rootDir,
+                                     progressStdErrEnabled,
+                                     progressPath,
+                                     progressText,
+                                     "system_link_plan",
+                                     "error",
+                                     int64(-1),
+                                     v3SystemLinkExecNowNs() - totalStartNs)
+        return Err[V3SystemLinkExecPlan](err)
+    phaseProfile.systemLinkPlanNs = v3SystemLinkExecNowNs() - systemLinkPlanStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "system_link_plan",
+                                 "done",
+                                 phaseProfile.systemLinkPlanNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
+    let sourceBundleStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "source_bundle",
+                                 "begin",
+                                 int64(-1),
+                                 sourceBundleStartNs - totalStartNs)
+    let sourceBundleRes = slplan.v3SystemLinkPlanSourceBundleCid(linkPlan)
+    if IsErr(sourceBundleRes):
+        v3SystemLinkExecProgressEmit(rootDir,
+                                     progressStdErrEnabled,
+                                     progressPath,
+                                     progressText,
+                                     "source_bundle",
+                                     "error",
+                                     int64(-1),
+                                     v3SystemLinkExecNowNs() - totalStartNs)
+        return Err[V3SystemLinkExecPlan](Error(sourceBundleRes))
+    let sourceBundleCid = Value(sourceBundleRes)
+    phaseProfile.sourceBundleNs = v3SystemLinkExecNowNs() - sourceBundleStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "source_bundle",
+                                 "done",
+                                 phaseProfile.sourceBundleNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
+    let compilerCsgStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "compiler_csg",
+                                 "begin",
+                                 int64(-1),
+                                 compilerCsgStartNs - totalStartNs)
+    let compilerCsgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
+    if IsErr(compilerCsgRes):
+        v3SystemLinkExecProgressEmit(rootDir,
+                                     progressStdErrEnabled,
+                                     progressPath,
+                                     progressText,
+                                     "compiler_csg",
+                                     "error",
+                                     int64(-1),
+                                     v3SystemLinkExecNowNs() - totalStartNs)
+        return Err[V3SystemLinkExecPlan](Error(compilerCsgRes))
+    let compilerCsg = ccsg.v3CompilerCsgClone(Value(compilerCsgRes))
+    phaseProfile.compilerCsgNs = v3SystemLinkExecNowNs() - compilerCsgStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "compiler_csg",
+                                 "done",
+                                 phaseProfile.compilerCsgNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
+    let exportSurface = ccsg.v3CompilerExportSurfaceFromCsg(compilerCsg)
+    let worldStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "world",
+                                 "begin",
+                                 int64(-1),
+                                 worldStartNs - totalStartNs)
+    let universeRes = cworld.v3CompilerLocalUniverseBuildForChannelWithManifestEntries(channelRaw,
+                                                                                       sourceBundleCid,
+                                                                                       compilerCsg.graphCid,
+                                                                                       exportSurface.surfaceCid,
+                                                                                       compilerProofCid,
+                                                                                       extraManifestEntries)
+    if IsErr(universeRes):
+        v3SystemLinkExecProgressEmit(rootDir,
+                                     progressStdErrEnabled,
+                                     progressPath,
+                                     progressText,
+                                     "world",
+                                     "error",
+                                     int64(-1),
+                                     v3SystemLinkExecNowNs() - totalStartNs)
+        return Err[V3SystemLinkExecPlan](Error(universeRes))
+    let localUniverse = Value(universeRes)
+    if worldHeadPinned:
+        let pinRes = cworld.v3CompilerWorldHeadMatchesHex(localUniverse.worldHead, requestedWorldHead)
+        if IsErr(pinRes):
+            v3SystemLinkExecProgressEmit(rootDir,
+                                         progressStdErrEnabled,
+                                         progressPath,
+                                         progressText,
+                                         "world",
+                                         "error",
+                                         int64(-1),
+                                         v3SystemLinkExecNowNs() - totalStartNs)
+            return Err[V3SystemLinkExecPlan](Error(pinRes))
+    phaseProfile.worldNs = v3SystemLinkExecNowNs() - worldStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "world",
+                                 "done",
+                                 phaseProfile.worldNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
+    if lockCheckEnabled:
+        let verifyLockRes = cworld.v3CompilerWorldVerifyLock(localUniverse, lockSnapshot)
         if IsErr(verifyLockRes):
+            v3SystemLinkExecProgressEmit(rootDir,
+                                         progressStdErrEnabled,
+                                         progressPath,
+                                         progressText,
+                                         "world",
+                                         "error",
+                                         int64(-1),
+                                         v3SystemLinkExecNowNs() - totalStartNs)
             return Err[V3SystemLinkExecPlan](Error(verifyLockRes))
         lockVerified = true
-    phaseProfile.lockNs = v3SystemLinkExecNowNs() - lockStartNs
     let baselineSurfaceChecked = len(baselineSurfacePath) > 0
     var baselineSurfaceCompatible = false
     let baselineStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "baseline",
+                                 "begin",
+                                 int64(-1),
+                                 baselineStartNs - totalStartNs)
     if baselineSurfaceChecked:
         let baselinePath = v3path.V3PathAbsolute(rootDir, baselineSurfacePath)
         if !v3path.V3PathFileExists(baselinePath):
+            v3SystemLinkExecProgressEmit(rootDir,
+                                         progressStdErrEnabled,
+                                         progressPath,
+                                         progressText,
+                                         "baseline",
+                                         "error",
+                                         int64(-1),
+                                         v3SystemLinkExecNowNs() - totalStartNs)
             return Err[V3SystemLinkExecPlan]("v3 compiler world: missing baseline surface path: " + baselinePath)
         let baselineText = v3path.V3ReadTextFile("", baselinePath)
         var baselineSurface: ccsg.V3CsgExportSurface
         let baselineRes = ccsg.v3CompilerExportSurfaceFromReportText(baselineText, baselineSurface)
         if IsErr(baselineRes):
+            v3SystemLinkExecProgressEmit(rootDir,
+                                         progressStdErrEnabled,
+                                         progressPath,
+                                         progressText,
+                                         "baseline",
+                                         "error",
+                                         int64(-1),
+                                         v3SystemLinkExecNowNs() - totalStartNs)
             return Err[V3SystemLinkExecPlan](Error(baselineRes))
         if !ccsg.v3CompilerExportSurfaceCompatible(baselineSurface, exportSurface):
+            v3SystemLinkExecProgressEmit(rootDir,
+                                         progressStdErrEnabled,
+                                         progressPath,
+                                         progressText,
+                                         "baseline",
+                                         "error",
+                                         int64(-1),
+                                         v3SystemLinkExecNowNs() - totalStartNs)
             return Err[V3SystemLinkExecPlan]("v3 compiler world: baseline export surface incompatible")
         baselineSurfaceCompatible = true
     phaseProfile.baselineNs = v3SystemLinkExecNowNs() - baselineStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "baseline",
+                                 "done",
+                                 phaseProfile.baselineNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
     let loweringStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "lowering_plan",
+                                 "begin",
+                                 int64(-1),
+                                 loweringStartNs - totalStartNs)
     var loweringPlan: lower.V3LoweringPlanStub
     if !lower.v3BuildLoweringPlanStubFromCompilerCsg(linkPlan, compilerCsg, loweringPlan, err):
+        v3SystemLinkExecProgressEmit(rootDir,
+                                     progressStdErrEnabled,
+                                     progressPath,
+                                     progressText,
+                                     "lowering_plan",
+                                     "error",
+                                     int64(-1),
+                                     v3SystemLinkExecNowNs() - totalStartNs)
         return Err[V3SystemLinkExecPlan](err)
     phaseProfile.loweringPlanNs = v3SystemLinkExecNowNs() - loweringStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "lowering_plan",
+                                 "done",
+                                 phaseProfile.loweringPlanNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
     let primaryObjectStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "primary_object_plan",
+                                 "begin",
+                                 int64(-1),
+                                 primaryObjectStartNs - totalStartNs)
     let primaryRes = pobj.v3BuildPrimaryObjectPlan(linkPlan, loweringPlan)
     if IsErr(primaryRes):
+        v3SystemLinkExecProgressEmit(rootDir,
+                                     progressStdErrEnabled,
+                                     progressPath,
+                                     progressText,
+                                     "primary_object_plan",
+                                     "error",
+                                     int64(-1),
+                                     v3SystemLinkExecNowNs() - totalStartNs)
         return Err[V3SystemLinkExecPlan](Error(primaryRes))
     phaseProfile.primaryObjectPlanNs = v3SystemLinkExecNowNs() - primaryObjectStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "primary_object_plan",
+                                 "done",
+                                 phaseProfile.primaryObjectPlanNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
     let providerSourcesStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "provider_sources",
+                                 "begin",
+                                 int64(-1),
+                                 providerSourcesStartNs - totalStartNs)
     let providerSourcesRes = v3ProviderSourcesForPlan(rootDir, linkPlan)
     if IsErr(providerSourcesRes):
+        v3SystemLinkExecProgressEmit(rootDir,
+                                     progressStdErrEnabled,
+                                     progressPath,
+                                     progressText,
+                                     "provider_sources",
+                                     "error",
+                                     int64(-1),
+                                     v3SystemLinkExecNowNs() - totalStartNs)
         return Err[V3SystemLinkExecPlan](Error(providerSourcesRes))
     phaseProfile.providerSourcesNs = v3SystemLinkExecNowNs() - providerSourcesStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "provider_sources",
+                                 "done",
+                                 phaseProfile.providerSourcesNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
     var providerObjectPaths: str[]
     var linkInputs: str[]
     var objectMissing: str[]
@@ -329,6 +692,14 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
         if len(linuxNolibcStartupObjectPath) <= 0:
             add(objectMissing, "linux_nolibc_startup_object_path_missing")
     let objectPlanStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "object_plan",
+                                 "begin",
+                                 int64(-1),
+                                 objectPlanStartNs - totalStartNs)
     var objectPlan: objplan.V3ObjectPlanStub
     objectPlan.workspaceRoot = linkPlan.workspaceRoot
     objectPlan.packageRoot = linkPlan.packageRoot
@@ -352,6 +723,14 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     objectPlan.missingReasons = objectMissing
     objectPlan.pipelineStage = "lowering_plan_to_object_plan"
     phaseProfile.objectPlanNs = v3SystemLinkExecNowNs() - objectPlanStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "object_plan",
+                                 "done",
+                                 phaseProfile.objectPlanNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
     if linkPlan.missingReasons.len > 0:
         add(nativeMissing, "system_link_plan_not_ready_for_native_link")
     if objectPlan.missingReasons.len > 0:
@@ -368,6 +747,14 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     if linkPlan.emitKind == creq.v3EmitExe:
         outputKind = nplan.v3NativeOutputExecutable
     let nativeLinkStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "native_link_plan",
+                                 "begin",
+                                 int64(-1),
+                                 nativeLinkStartNs - totalStartNs)
     var nativePlan: nplan.V3NativeLinkPlanStub
     nativePlan.targetTriple = linkPlan.targetTriple
     nativePlan.emitKind = linkPlan.emitKind
@@ -382,7 +769,23 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     nativePlan.missingReasons = nativeMissing
     nativePlan.pipelineStage = "object_plan_to_native_link_plan"
     phaseProfile.nativeLinkPlanNs = v3SystemLinkExecNowNs() - nativeLinkStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "native_link_plan",
+                                 "done",
+                                 phaseProfile.nativeLinkPlanNs,
+                                 v3SystemLinkExecNowNs() - totalStartNs)
     let compileReceiptStartNs: int64 = v3SystemLinkExecNowNs()
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "compile_receipt",
+                                 "begin",
+                                 int64(-1),
+                                 compileReceiptStartNs - totalStartNs)
     let outputDigest = ccsg.v3CompileOutputDigest(linkPlan.outputPath,
                                                   linkPlan.targetTriple,
                                                   linkPlan.providerModules,
@@ -401,6 +804,22 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
                                                    linkPlan.providerModules)
     phaseProfile.compileReceiptNs = v3SystemLinkExecNowNs() - compileReceiptStartNs
     phaseProfile.totalNs = v3SystemLinkExecNowNs() - totalStartNs
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "compile_receipt",
+                                 "done",
+                                 phaseProfile.compileReceiptNs,
+                                 phaseProfile.totalNs)
+    v3SystemLinkExecProgressEmit(rootDir,
+                                 progressStdErrEnabled,
+                                 progressPath,
+                                 progressText,
+                                 "build",
+                                 "done",
+                                 phaseProfile.totalNs,
+                                 phaseProfile.totalNs)
     var execPlan: V3SystemLinkExecPlan
     execPlan.compilerEntrySource = linkPlan.buildEntryPath
     execPlan.sourceBundleCid = sourceBundleCid
@@ -625,3 +1044,16 @@ fn v3SystemLinkExecPlanReport(plan: V3SystemLinkExecPlan): str =
     out = out + "native_link_pipeline_stage=" + plan.nativeLinkPlan.pipelineStage + "\n"
     out = out + "exec_pipeline_stage=primary_object_plan_to_native_link_plan"
     return out
+
+fn V3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
+                                                req: creq.V3CompilerRequest,
+                                                worldHead: str,
+                                                lockPath: str,
+                                                baselineSurfacePath: str,
+                                                channelRaw: str): Result[V3SystemLinkExecPlan] =
+    return v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
+                                                        req,
+                                                        worldHead,
+                                                        lockPath,
+                                                        baselineSurfacePath,
+                                                        channelRaw)

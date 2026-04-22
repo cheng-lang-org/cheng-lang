@@ -441,6 +441,47 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
     };
 }
 
+- (BOOL)isInspectableLayoutItem:(NSDictionary *)item state:(NSDictionary *)stateDoc {
+    if (![item isKindOfClass:[NSDictionary class]]) return NO;
+    NSString *itemId = R2CString(item[@"id"]);
+    if ([itemId length] <= 0) return NO;
+    if ([itemId isEqualToString:@"root"]) return NO;
+    if (![self itemVisibleForState:stateDoc item:item]) return NO;
+    if ([R2CString(item[@"source_module_path"]) length] > 0) return YES;
+    if ([R2CString(item[@"source_component_name"]) length] > 0) return YES;
+    if (R2CInteger(item[@"source_line"], 0) > 0) return YES;
+    return NO;
+}
+
+- (NSDictionary *)defaultSelectedLayoutItemForState:(NSDictionary *)stateDoc {
+    for (id rawItem in [self nativeLayoutItems]) {
+        if (![rawItem isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *item = (NSDictionary *)rawItem;
+        if ([self isInspectableLayoutItem:item state:stateDoc]) return item;
+    }
+    return nil;
+}
+
+- (NSDictionary *)stateDocByApplyingDefaultSelectionIfNeeded:(NSDictionary *)stateDoc {
+    NSDictionary *baseStateDoc = [stateDoc isKindOfClass:[NSDictionary class]] ? stateDoc : @{};
+    if ([R2CString(baseStateDoc[@"selected_item_id"]) length] > 0) return baseStateDoc;
+    NSDictionary *item = [self defaultSelectedLayoutItemForState:baseStateDoc];
+    if (![item isKindOfClass:[NSDictionary class]]) return baseStateDoc;
+    NSDictionary *selectionDoc = [self selectionDocForItem:item state:baseStateDoc];
+    NSMutableDictionary *nextStateDoc = [baseStateDoc mutableCopy];
+    nextStateDoc[@"selected_item_id"] = R2CString(selectionDoc[@"id"]);
+    nextStateDoc[@"selected_source_node_id"] = R2CString(selectionDoc[@"source_node_id"]);
+    nextStateDoc[@"selected_source_module_path"] = R2CString(selectionDoc[@"source_module_path"]);
+    nextStateDoc[@"selected_source_component_name"] = R2CString(selectionDoc[@"source_component_name"]);
+    nextStateDoc[@"selected_source_line"] = selectionDoc[@"source_line"] ?: @0;
+    nextStateDoc[@"selected_item_interactive"] = selectionDoc[@"interactive"] ?: @NO;
+    nextStateDoc[@"selected_item"] = selectionDoc;
+    if ([R2CString(nextStateDoc[@"focused_item_id"]) length] <= 0 && R2CBool(selectionDoc[@"interactive"], NO)) {
+        nextStateDoc[@"focused_item_id"] = R2CString(selectionDoc[@"id"]);
+    }
+    return nextStateDoc;
+}
+
 - (NSDictionary *)styleLayoutSurfaceDoc {
     id doc = self.sessionDoc[@"style_layout_surface"];
     return [doc isKindOfClass:[NSDictionary class]] ? (NSDictionary *)doc : nil;
@@ -3391,29 +3432,30 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
 }
 
 - (void)applyRuntimeStateDoc:(NSDictionary *)stateDoc {
-    self.runtimeStateDoc = stateDoc ?: @{};
-    self.sessionWidth = R2CCGFloat(stateDoc[@"window_width"], self.sessionWidth);
-    self.sessionHeight = R2CCGFloat(stateDoc[@"window_height"], self.sessionHeight);
-    self.contentHeight = R2CCGFloat(stateDoc[@"content_height"], self.contentHeight);
-    self.scrollOffsetY = R2CCGFloat(stateDoc[@"scroll_offset_y"], self.scrollOffsetY);
-    self.clickCount = (NSUInteger)R2CInteger(stateDoc[@"click_count"], (NSInteger)self.clickCount);
-    self.resizeCount = (NSUInteger)R2CInteger(stateDoc[@"resize_count"], (NSInteger)self.resizeCount);
-    self.scrollCount = (NSUInteger)R2CInteger(stateDoc[@"scroll_count"], (NSInteger)self.scrollCount);
-    self.keyCount = (NSUInteger)R2CInteger(stateDoc[@"key_count"], (NSInteger)self.keyCount);
-    self.textCount = (NSUInteger)R2CInteger(stateDoc[@"text_count"], (NSInteger)self.textCount);
-    self.focusCount = (NSUInteger)R2CInteger(stateDoc[@"focus_count"], (NSInteger)self.focusCount);
-    self.hasLastClick = R2CBool(stateDoc[@"has_last_click"], self.hasLastClick);
-    self.lastClickX = R2CCGFloat(stateDoc[@"last_click_x"], self.lastClickX);
-    self.lastClickY = R2CCGFloat(stateDoc[@"last_click_y"], self.lastClickY);
-    self.selectedItemId = R2CString(stateDoc[@"selected_item_id"]);
-    self.selectedSourceNodeId = R2CString(stateDoc[@"selected_source_node_id"]);
-    self.selectedSourceModulePath = R2CString(stateDoc[@"selected_source_module_path"]);
-    self.selectedSourceComponentName = R2CString(stateDoc[@"selected_source_component_name"]);
-    self.selectedSourceLine = R2CInteger(stateDoc[@"selected_source_line"], self.selectedSourceLine);
-    self.selectedItemInteractive = R2CBool(stateDoc[@"selected_item_interactive"], self.selectedItemInteractive);
-    self.focusedItemId = R2CString(stateDoc[@"focused_item_id"]);
-    self.typedText = R2CString(stateDoc[@"typed_text"]);
-    self.lastKey = R2CString(stateDoc[@"last_key"]);
+    NSDictionary *effectiveStateDoc = [self stateDocByApplyingDefaultSelectionIfNeeded:stateDoc];
+    self.runtimeStateDoc = effectiveStateDoc ?: @{};
+    self.sessionWidth = R2CCGFloat(effectiveStateDoc[@"window_width"], self.sessionWidth);
+    self.sessionHeight = R2CCGFloat(effectiveStateDoc[@"window_height"], self.sessionHeight);
+    self.contentHeight = R2CCGFloat(effectiveStateDoc[@"content_height"], self.contentHeight);
+    self.scrollOffsetY = R2CCGFloat(effectiveStateDoc[@"scroll_offset_y"], self.scrollOffsetY);
+    self.clickCount = (NSUInteger)R2CInteger(effectiveStateDoc[@"click_count"], (NSInteger)self.clickCount);
+    self.resizeCount = (NSUInteger)R2CInteger(effectiveStateDoc[@"resize_count"], (NSInteger)self.resizeCount);
+    self.scrollCount = (NSUInteger)R2CInteger(effectiveStateDoc[@"scroll_count"], (NSInteger)self.scrollCount);
+    self.keyCount = (NSUInteger)R2CInteger(effectiveStateDoc[@"key_count"], (NSInteger)self.keyCount);
+    self.textCount = (NSUInteger)R2CInteger(effectiveStateDoc[@"text_count"], (NSInteger)self.textCount);
+    self.focusCount = (NSUInteger)R2CInteger(effectiveStateDoc[@"focus_count"], (NSInteger)self.focusCount);
+    self.hasLastClick = R2CBool(effectiveStateDoc[@"has_last_click"], self.hasLastClick);
+    self.lastClickX = R2CCGFloat(effectiveStateDoc[@"last_click_x"], self.lastClickX);
+    self.lastClickY = R2CCGFloat(effectiveStateDoc[@"last_click_y"], self.lastClickY);
+    self.selectedItemId = R2CString(effectiveStateDoc[@"selected_item_id"]);
+    self.selectedSourceNodeId = R2CString(effectiveStateDoc[@"selected_source_node_id"]);
+    self.selectedSourceModulePath = R2CString(effectiveStateDoc[@"selected_source_module_path"]);
+    self.selectedSourceComponentName = R2CString(effectiveStateDoc[@"selected_source_component_name"]);
+    self.selectedSourceLine = R2CInteger(effectiveStateDoc[@"selected_source_line"], self.selectedSourceLine);
+    self.selectedItemInteractive = R2CBool(effectiveStateDoc[@"selected_item_interactive"], self.selectedItemInteractive);
+    self.focusedItemId = R2CString(effectiveStateDoc[@"focused_item_id"]);
+    self.typedText = R2CString(effectiveStateDoc[@"typed_text"]);
+    self.lastKey = R2CString(effectiveStateDoc[@"last_key"]);
     NSDictionary *selectedItem = [self selectedLayoutItemDoc];
     self.selectedItemKind = R2CString(selectedItem[@"kind"]);
     self.selectedItemPlanRole = R2CString(selectedItem[@"plan_role"]);

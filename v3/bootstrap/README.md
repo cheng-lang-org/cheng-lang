@@ -32,31 +32,24 @@ key = value
 - 只允许单个 `key = value` 赋值
 - 值使用逗号分隔的稳定文本，不做旧 tooling/proof/sidecar 兼容
 
-当前必须字段：
+当前 live 合同字段：
 
 - `syntax`
 - `bootstrap_name`
 - `bootstrap_entry`
 - `compiler_class`
-- `bootstrap_source_kind`
 - `target`
-- `compiler_parallel_model`
-- `program_parallel_model`
-- `ir_facts`
-- `data_layout`
-- `aot`
-- `forbidden`
+- `bootstrap_manifest`
 - `supported_commands`
-- `user_program_auto_parallel`
-- `bagua_bpi`
 
-当前默认契约：
+`stage1_bootstrap.cheng` 现在只保留 cold bootstrap 事实，源码路径统一收进 `v3/bootstrap/compiler_bootstrap_manifest.cheng`。
+seed 现在已支持：
 
-- 编译器默认并行：`two_pass,function_scheduler,thread_local_arena`
-- 用户程序默认非隐式并行：`deterministic_single_thread`
-- IR 硬事实：`move,borrow,noalias,escape,layout,abi`
-- 数据布局默认：`dod,soa,fixed_layout`
-- 热路径禁词和自举禁词统一写在 `v3/bootstrap/stage1_bootstrap.cheng`
+- `print-contract` / `self-check` / `status` / `compile-bootstrap` 直接吃最小 v2 合同
+- 由 live 合同编出来的 wrapped stage0/stage1/stage2/stage3 会沿用各自 embedded contract source path，不再硬绑 `stage1_bootstrap.cheng`
+- ordinary 入口和 seed C 里的 remote compile / BFT fresh shell 也都已并回同一路径 helper，不再各自手写 `stage1_bootstrap.cheng`
+
+旧 `v1` 合同已不再由 live seed 兼容读取；当前 seed 只认 `v3-bootstrap-v2`。
 
 当前命令：
 

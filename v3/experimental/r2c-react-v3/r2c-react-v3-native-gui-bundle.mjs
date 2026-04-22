@@ -148,9 +148,13 @@ function requireFile(filePath, label) {
 
 function resolveWorkspaceRoot() {
   const scriptPath = path.resolve(process.argv[1]);
+  const scriptName = path.basename(scriptPath);
   let current = path.dirname(scriptPath);
   while (true) {
-    if (fs.existsSync(path.join(current, 'v3', 'src')) && fs.existsSync(path.join(current, 'src', 'runtime'))) {
+    const mirroredScriptPath = path.join(current, 'v3', 'experimental', 'r2c-react-v3', scriptName);
+    if (fs.existsSync(path.join(current, 'v3', 'src')) &&
+        fs.existsSync(path.join(current, 'src', 'runtime')) &&
+        fs.existsSync(mirroredScriptPath)) {
       return current;
     }
     const parent = path.dirname(current);
@@ -3420,7 +3424,7 @@ function buildSessionDocFromPreview(fields, layoutSurface = null, styleLayoutSur
   };
 }
 
-function compileAndRunEntry(tool, packageRoot, mainPath, exePath, compileReportPath, compileLogPath, runLogPath, runArgs = []) {
+function compileAndRunEntry(tool, workspaceRoot, packageRoot, mainPath, exePath, compileReportPath, compileLogPath, runLogPath, runArgs = []) {
   fs.rmSync(exePath, { force: true });
   fs.rmSync(compileReportPath, { force: true });
   const compile = spawnForExec(tool, [
@@ -3431,7 +3435,13 @@ function compileAndRunEntry(tool, packageRoot, mainPath, exePath, compileReportP
     '--target:arm64-apple-darwin',
     `--out:${exePath}`,
     `--report-out:${compileReportPath}`,
-  ]);
+  ], {
+    cwd: workspaceRoot,
+    env: {
+      ...process.env,
+      CHENG_V3_ROOT: workspaceRoot,
+    },
+  });
   writeText(compileLogPath, [compile.stdout || '', compile.stderr || '', compile.error ? String(compile.error.stack || compile.error.message || compile.error) : ''].filter(Boolean).join('\n'));
   const compileReturnCode = exitCodeOf(compile);
   if (compileReturnCode !== 0) {
@@ -3801,6 +3811,7 @@ function main() {
   ensurePackageCompileSupport(workspaceRoot, packageRoot);
   const previewRun = compileAndRunEntry(
     tool,
+    workspaceRoot,
     packageRoot,
     launcherModulePath,
     launcherExePath,
@@ -3874,6 +3885,7 @@ function main() {
   writeJson(runtimeContractPath, runtimeContract);
   const runtimeRun = compileAndRunEntry(
     tool,
+    workspaceRoot,
     packageRoot,
     runtimeMainModulePath,
     runtimeCompiledExePath,

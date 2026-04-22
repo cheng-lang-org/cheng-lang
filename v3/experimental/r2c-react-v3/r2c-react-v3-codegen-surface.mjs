@@ -43,9 +43,13 @@ function parseArgs(argv) {
 
 function resolveWorkspaceRoot() {
   const scriptPath = path.resolve(process.argv[1]);
+  const scriptName = path.basename(scriptPath);
   let current = path.dirname(scriptPath);
   while (true) {
-    if (fs.existsSync(path.join(current, 'v3', 'src')) && fs.existsSync(path.join(current, 'src', 'runtime'))) {
+    const mirroredScriptPath = path.join(current, 'v3', 'experimental', 'r2c-react-v3', scriptName);
+    if (fs.existsSync(path.join(current, 'v3', 'src')) &&
+        fs.existsSync(path.join(current, 'src', 'runtime')) &&
+        fs.existsSync(mirroredScriptPath)) {
       return current;
     }
     const parent = path.dirname(current);

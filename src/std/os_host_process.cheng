@@ -1,7 +1,6 @@
 import std/os as os
-import std/buffer
-import std/rawbytes
 import std/strings
+import std/rawmem_support
 
 @importc("cheng_pty_is_supported_bridge")
 fn cheng_pty_is_supported_bridge(): int32
@@ -97,12 +96,25 @@ fn osHostProcessStdoutOnlyCommand(command: str): str =
     return command + " 2>/dev/null"
 
 fn osHostProcessEncodeWire(items: str[]): str =
-    var out: buffer.ByteBuffer
-    out.data = rawbytes.emptyBytes()
+    var totalLen: int32
     for i in 0..<items.len:
-        buffer.AppendBytes(out, items[i])
-        buffer.appendByte(out, 0)
-    return rawbytes.bytesToString(buffer.ToBytes(out))
+        totalLen = totalLen + strings.Len(items[i]) + 1
+    if totalLen <= 0:
+        return ""
+    let out: str = newStringAlloc(totalLen)
+    let outPtr: ptr = strDataPtr(out)
+    var writePos: int32
+    for i in 0..<items.len:
+        let item: str = items[i]
+        let itemLen: int32 = strings.Len(item)
+        if itemLen > 0:
+            rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(outPtr, writePos),
+                                      strDataPtr(item),
+                                      itemLen)
+            writePos = writePos + itemLen
+        rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(outPtr, writePos), 0, 1)
+        writePos = writePos + 1
+    return out
 
 fn osHostProcessCloseFd(fd: var int32) =
     if fd >= 0:
@@ -303,7 +315,7 @@ fn ptyWrite(fd: int32, data: str): int32 =
     return cheng_pty_write_bridge(fd, dataPtr, n)
 
 fn ptyClose(fd: int32) =
-    cheng_pty_close_bridge fd
+    cheng_pty_close_bridge(fd)
 
 fn ptyWait(pid: int64): os.PtyWaitResult =
     let waitStatus = cheng_pty_wait_bridge(pid)

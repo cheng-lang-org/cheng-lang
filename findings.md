@@ -1,123 +1,142 @@
 # 当前发现
 
-- provider object 物化之前是真实编译缝隙，不是 planner 理论下界。
-  - 当前已经用 provider object cache 收掉热路径秒级成本，最新 gate 中五个样本均为 `provider_cache_hits=5 provider_cache_misses=0`。
-  - 命中后 `provider_objects_ms` 稳定在 `13-19ms`；`cheng_provider_compile_ms/c_provider_compile_ms` 为 `0` 时表示这轮没有重新编 provider object。
-  - cache key 必须吃 source CID、target、package/root、compiler path、codegen CID 和 suppressed exports；不能只靠输出 object 路径。
-
-- no-handoff 核心 smoke 暴露的 `cstring(dataPtr0)` 失败属实，根因是 parser constructor 分类过宽。
-  - `cstring(x)` 这类标量/指针 cast 不是复合构造，不能进入 `ConstructorExpr`。
-  - 正确处理是让 `v3ParserConstructorTypeStatus(...)` 在入口排除标量/指针类型；typed 的 `type-call fact must materialize composite` 校验必须保留硬失败。
-  - `lowering_plan_smoke` 的空字段读取也要修，否则 smoke helper panic 会遮住真正的 typed/parser 缺口。
-
-- 这轮真实热路径缺口不是先调阈值，而是通用字节搬运还在逐字节跨 helper。
-  - `bytesConcat/bytesConcat3`、SHA-256 输入拷贝、P-256 deterministic concat/fill、公钥/签名字节组装都会反复走 `bytesGet/bytesSet`。
-  - 当前正确修法是复用已有 `RawmemCopy/RawmemSet` 做固定长度 bulk copy/set；不要新增 C bridge、不要靠放宽 perf 阈值掩盖。
-  - `bytesCopyInto` 这种低层 helper 必须 let-it-crash：nil 或越界直接断言，不能静默 return。
-
-- `perf_memory_contract_smoke` 现在能同时回答四件事。
-  - 编译理论下界看 `*_compile_exec_phase_summary.planner_total_ms`。
-  - planner 外编译缝隙看 `*_compile_gap_breakdown`，当前 provider object 热路径已由 cache 命中压到十几毫秒，剩余主耗时是真实 primary object emit，不再混进理论下界。
-  - 内存/生命周期看 `orc_perf_contract` 的 retain/release 与 alloc/free/live。
-  - crypto 热核看 `crypto_hot_kernel_contract` 的 SHA-256、X25519 pubkey、P-256 pubkey、P-256 sign 单次 ns。
-
-- `100ms` 编译和二进制原地更新不能按 release/system-link 口径解释。
-  - 当前只允许说 dev host-only `self-link + direct-exe + host runner hotpatch` 的 dedicated witness。
-  - `dev_hotpatch_100ms_scope_contract_smoke` 已把 formal spec、README、tooling README、repo skill、home skill 里的这句话固定成门禁。
-
-- `lower generic function` 不能只按原始文本或首字母跳过。
-  - `normalize_type_text` 之后，像 `elemSize[T]()` 这类 generic function 可能长得像 bracketed type；如果不先看“是不是已知类型”，就会被误打成 `seq/fixed-array T()`。
-  - 当前正确口径是：先规格化，再排除真实类型面，最后才把剩余 lowercase bracket call 当成 generic function。
-
-- ordinary parser 上这类 helper 也要考虑 seed no-handoff 编译形状。
-  - `v3ParserTypeExprLooksLikeLowerGenericFunction(...)` 之前那种重复 `Trim/FindFirst/IdentPrefix` 的超长表达式，会把 `typed_expr_call_validate_probe` 炸成 `prepare binding infer type failed`。
-  - 这种 helper 保持单次 trim + 线性循环最稳，不要再堆重复 helper call。
-
-- `parser_path_smoke` 里的 normalized layer 是 closure 级，不是单文件级。
-  - 断言 `elemSize[int32]()` 不被误判时，不能用全局 constructor/default-init count；要按 `sourcePath + lineNumber` 精确过滤当前 fixture 行。
-
-- `stage3_system_link_exec_handoff_smoke` 读的是全局 `artifacts/v3_forward/backend_driver.forward.log`。
-  - 它不能和其它会写 forward log 的 smoke 并跑；否则路由本身已经成功，断言也会被后续日志覆盖误伤。
-
-- seed 里真正多余的不是 `V3TypeCallSurface` 本身，而是 `v3_parse_default_expr_text_with_context(...)` 这层 default-init 专用薄壳。
-  - 它之前让 const-eval、infer、native、wasm 各自再走一遍“expr 文本 -> default type”专线，虽然底下最终还是调同一个 `v3_classify_type_call_surface(...)`。
-  - 现在这层已删；后面 seed 再出 type-call 漂移，优先查 `v3_classify_expr_type_call_surface(...)` 和 `v3_classify_type_call_surface(...)`，不要再补第三个 expr helper。
-
-- `v3/bootstrap/stage1_bootstrap.cheng` 不是 helper 真源码，只是 bootstrap 合同清单。
-  - 所以下一步如果要固定 seed 收口，正确动作是重编 `cheng.stage0` 并跑 `bootstrap-bridge`，不是去改 manifest 试图同步 helper。
-
-- ordinary 这边之前缺的不是 `DefaultInitExpr/ConstructorExpr` 节点，而是缺一条显式 `typeCallKind` typed 真相。
-  - 没这个字段时，seed 已经有统一 `type-call` 分类，但 ordinary report / lowering rule / CSG 序列化还只能从 `kind` 间接猜，真源还是分叉。
-  - 现在 `typeCallKind` 已进入 typed fact、lowering rule 和 report；后面这条线再漂，先查这一个字段，不要再去补第四套计数。
-
-- seed 之前不是没有类型调用识别，而是 `default-init` 和 `constructor-like` 分成了两套 helper。
-  - 这会让 duplicate-field、infer type、native/wasm composite materialize、removed-default 诊断各自漂移。
-  - 现在已经改成统一 `V3TypeCallSurface`；后面如果这条线再出洞，应该先查这个中心分类，不要再加第三套判断。
-
-- seed 里这条旧 guard 现在已经只剩一个 source 级前置校验，不再是多出口兜底。
-  - `stage3 system-link-exec` 在 backend driver 就绪时已经优先 handoff 到 `backend_driver/cheng`，用户可见主路径先走 parser 真源。
-  - seed `system-link-exec` 仍会对 `default[T]`、标量 `T()`、`ref object T()` 维持同一条硬错误文本，但这时只剩 no-handoff 或 backend driver 未就绪时的内部 fallback。
-  - `stage3_system_link_exec_handoff_smoke` 已把这条 route 固定成正式门禁；以后只要 `backend_driver.forward.log` 不再落对应输出路径，就会直接红。
-  - 但真正触发位置已经从 lowering function collect 收到 lowering 入口的单一 source 校验相位；后面不该再回流第二份同类扫描。
-
-- `DefaultInitExpr/ConstructorExpr` 这条主线已经收绿；当前不再是阻塞。
-  - 复合 `T()` 现在走 `DefaultInitExpr`，复合 `T(args)` 走 `ConstructorExpr`，typed/csg/lowering/report 已经统一消费这两类节点。
-  - fixed-array 只能按顶层尾部数字下标识别，不能把泛型 `Foo[Bar]`、`Ok[T]`、`Err[T]` 误判成 fixed-array 或 constructor。
-
-- ordinary 函数体这轮的真实缺口不是语义没实现，而是默认 host gate 漏挂 witness。
-  - `if_enum_composite_return_smoke`、`out_param_writeback_smoke`、`nested_out_param_writeback_smoke`、`out_param_direct_call_writeback_smoke`、`var_out_param_writeback_probe`、`consensus_event_varparam_roundtrip_smoke`、`wrapper_*_varparam_smoke` 在当前 backend driver 已经能直接通过。
-  - 所以下一刀先补 gate 是对的；如果以后这批再红，优先看真实回归，不要先假设 `stmt_let` / `stmt_if` / 复合 `out-param` 还是“未支持”。
-
-- `compiler_csg` / `lowering_plan` 的 typed report 第二真源问题已经收掉；当前这条不再是阻塞。
-
-- 旧自举编译器会伪造 contract 漂移。
-  - 源码已经改成 `ready` 时，旧 `cheng.stage3` 之前会被 bootstrap-bridge 当作 live compiler 优先复用，结果 `stage0_self_check` 拿旧内嵌 contract 去验新 `stage1_bootstrap`。
-  - 现在 live compiler 已按 bootstrap 输入新鲜度选择；再出现这类情况时，应该先重编 `stage0`，不是去怀疑 primary-object 又回退了。
-
-- `default[T]` 这条旧语法已经从当前用户面收掉，不再是主阻塞。
-  - parser 已经把它当成硬错误，`parser_path_smoke` 会直接验这条前端拒绝。
-  - 真实编译链路暂时仍需要 seed 在 lowering 收集入口做同口径前置拒绝；只靠 parser smoke 不够，因为 active compile path 还可能在更晚的 body semantics 阶段才炸。
-  - 当前已经只保留这一个前置扫描口，晚期 lowering/codegen 不再重复兜底报同类错误。
-
-- 这条线在用户可见入口上已经收完。
-  - 如果后面还要继续动，只剩内部 bootstrap fallback 自己直接消费 parser 真源这一件事；它不再是当前主线阻塞。
-
-- `verify-export-visibility-parallel` 之前有共享 label 踩产物问题。
-  - 同时或重叠执行时，stage3/backend 两轮 export smoke 会复用固定输出目录，能把 provider object 踩成空文件。
-  - 现在已经改成带 monotime 的独立 label；如果后面再红，就该按真实编译/链接日志排查，不用再怀疑是共享目录。
-
-- `Bytes[] add/setLen` 仍是高风险支线，当前主线没有必要碰；不要把它和 typed report / primary-object composite 收口混在一轮里。
-
-- `exec-route-matrix` helper 和 controller 契约之前不一致。
-  - controller 明确允许 `--route-catalog | --tsx-ast` 二选一，但 helper 只有在同时拿到 `--tsx-ast` 时才肯继续，导致 `--route-catalog` 单独使用必定失败。
-  - 这不是 smoke 特例，而是真实命令面缺口；已经在 helper 里修成“只有缺 `routeCatalog` 时才要求 `tsxAst`”。
-
-- `r2c` 状态报告之前把薄壳 helper 和真实 blocker 混在一起。
-  - `exec_route_matrix_helper` / `truth_route_helper` 仍然是 Node 薄壳，但它们不在 `remaining_non_cheng_blockers` 里；继续塞进 `active_node_helpers` 会让状态读起来前后矛盾。
-  - 现在已经拆出 `thin_node_helpers`，剩余纯 Cheng 阻塞口径更清楚。
-
-- `native_gui_bundle_helper` 不是纯打包 helper，不能直接宣称已薄壳化。
-  - 它还负责 layout surface、style layout、native layout plan、render plan、compiled runtime launcher/session payload。
-  - 当前正确切口是 Cheng controller 接管最终 bundle/summary/report 发布物，显式打 `cheng_controller_native_gui_bundle_finalizer_v1`；下一步再把重 payload 逐块搬进 Cheng。
-
-- layout payload 这轮只能先做 Cheng 发布 sidecar，不能直接覆盖 Node 生成的真实 payload。
-  - `native_gui_session` 和后续 run-native-gui 仍消费 Node helper 生成的 layout/native-layout 细节；如果现在把 `native_layout_plan_v1.json` 直接改成空 `items` 或机械摘要，会把 GUI 运行数据打坏。
-  - 当前正确切口是 sidecar finalizer：Cheng 写 `style_layout_surface_controller_v1.json` / `native_layout_plan_controller_v1.json`，bundle/summary/report/status 记录 `cheng_controller_layout_payload_finalizer_v1`，但 `native_gui_bundle_helper` 继续留在 blocker 里。
-
-- `native_layout_plan_controller` 不能靠 Cheng 字符串循环内联大数组推进。
-  - 尝试把 `items[]` / `viewport_items[]` 全量或预览在 Cheng controller 内用循环拼接发布，会把当前 primary-object 生成推到不稳定边界。
-  - 已改成 `cheng_controller_items_source_checked_v1`：Cheng controller 只硬校验原始 native layout plan 与两个数组字段存在，发布 source path、item/viewport 计数和 layout policy。
-  - 这保持了 GUI 运行 payload 不被破坏，也避免重新引入大内存/空 object 风险；真正替换 `items[]` 的下一步应改成 Cheng typed layout item 生成器，不是继续拼 raw JSON 字符串。
-
-- `cheng_candidate` 不能作为长串自测的稳定可执行路径假设。
-  - 本轮 `artifacts/v3_backend_driver/cheng_candidate verify-r2c-react-v3-surface` 在第二个 selftest 前失败，日志为 `missing executable: /Users/lbcheng/cheng-lang/artifacts/v3_backend_driver/cheng_candidate`。
-  - 这不是 layout finalizer 的语义失败；同一源码重建到标准 `artifacts/v3_backend_driver/cheng` 后，status 和 GUI controller smoke 都通过。后续要单独排查 candidate 自测过程中为什么会丢当前可执行。
-
-- 生成 Cheng 的模板不能再写显式零值初始化。
-  - `native_gui_runtime` 生成出的 `var out: str = ""`、`var count: int32 = 0` 会被当前编译器按 `redundant explicit default init` 硬失败。
-  - truth compare 共享模板也有同类 `int32 = 0`，已经同步清掉，避免后续 controller smoke 再踩同类坑。
-
-- `run-production-regression` 之前和 README 口径已经漂了。
-  - 文档声称它会跑 `composite_zero_helper_gate_smoke`，但 gate 实现里漏掉了。
-  - `r2c-react-v3` surface 已经有正式 verify 命令且实跑能过，但聚合回归没把它串进去，导致“手工过了”和“主线回归过了”不是一回事。
-  - 更关键的是用户可见 `cheng.stage3 verify-r2c-react-v3-surface` 走的 seed C 真入口还是旧壳，只跑一个 `r2c_react_v3_surface_smoke`；如果只改 `gate_main`，用户主路径仍然是假的绿。
+- 2026-04-22：`v3_emit_clone_composite_address_to_address(...)` 之前是个真语义坑：名字叫 clone，实际只是裸 `copy_address_to_address`。一旦源地址里装的是带 ORC 生命周期的复合值，目标地址会拿到未 retain 的浅拷贝，后面非常容易演化成 live-str / bytes 生命周期问题。这个 helper 必须先把源地址 clone/retain，再做字节拷贝。
+- 2026-04-22：`call_result_preserves_live_str_smoke`、`latest_snapshot_preserves_live_str_smoke` 这类 probe 需要显式 `--value` 参数；直接拿无参数 `run-host-smokes` 的 panic 结果判断编译器，会把 harness 用法错误误判成 return-path 回归。
+- 2026-04-22：Cheng 当前最不能容忍的基础语义漂移已经坐实并修掉了：consteval 里的 `&& / ||` 早就是短路求值，但 seed runtime codegen 之前仍把它们降成 eager binary combine，导致 `true || rhs`、`false && rhs` 这类本该跳过右侧的表达式仍会执行右侧。语言层这不是“小优化差异”，而是基础语义错误；必须在 codegen、spec 和 smoke 三处一起锁死。
+- 2026-04-22：`DEST_ADDRESS` 和 `IMPORT_BUFFER` 虽然当前机器语义都还是“call 后回装 result-address 虚拟寄存器”，但不能继续压成同一个 `result_address_call` 布尔位；typed/lowering 真源已经把它们区分成两种 return kind，seed 这层也必须先保留显式枚举，后面才能继续拆 post-call materialize 而不再把语义揉回去。
+- 2026-04-22：result-address call 不能把 `dest spill store` 和 `dest spill load` 粗暴并成同一个晚时点。store 必须早于 arg materialize，不然前面的 composite arg/path 会读到脏目的地址；load 才能留在公共 `call finish` 里按 stack adjust 后的视角统一回装。
+- 2026-04-22：return path 收口不能只盯 scalar result materialize。`ffi_handle` 返回修补这种“看起来只是 scalar 后置补丁”的东西，一旦直接并进公共 `call finish`，就会把原来没走到的无 contract target 一起拉进来，直接在 native-link 阶段炸成空符号 `_`。公共 tail 只能消费显式 `ffi_handle` contract，不能靠 target 默认零值猜。
+- 2026-04-22：`call_from_spills` 这层虽然 stack layout 已经数据化了，但 emit 之前还残着一层“用 layout 决定位置，再用 rule/target 回查 `arg_abi`”的半收口状态。把 `arg_load_abi` 直接落进 layout 以后，`stack/reg` 发射才真正只消费同一份 lowering fact。
+- 2026-04-22：backend 这条旧调用面清理主线已经基本收口。把 `uir_core_builder` 的 `envIsTrue/getEnv/os.C_fflush/stage1Trace/releaseString/hasError/printDiagnostics/typeKey/len(inPathTag)` 和 `uir_opt` 的 `sizeof(T)` 收完以后，同一条聚合复扫口径下已经只剩字符串/注释假命中，说明这条机械迁移可以先视为阶段性完成。
+- 2026-04-22：`root_exec_pipeline/top_level_passes` 这两份 deferred 大文件先收 `envIsTrue/getEnv/os.C_fflush` 是稳的，而且值钱；这轮做完后，backend 全量旧表面扫描已经基本只剩两份聚合大文件 `uir_opt/uir_core_builder`，说明现在再继续扫 leaf 文件收益已经接近零。
+- 2026-04-22：`src/backend` 这层扫到只剩单数命中的 leaf 文件时，先把 tiny tails 清近空是对的；这轮先收了 `reachability_scan` 的 6 处 `os.C_fflush fDbg*` 和 `builder_types` 的 1 处 `getEnv "BACKEND_DEBUG_LET"`，随后顺着同一轮复扫又补掉一串 `sizeof T`。现在按排除大文件后的同一口径，剩余命中已经只剩 `ffi_out_ptr` 里的字符串字面量假命中，说明 leaf 层基本清完了。
+- 2026-04-22：`src/backend/uir/uir_internal` 里大量“值钱但不大的”文件还在，优先级高于 `root_exec_pipeline/top_level_passes` 这种中等大文件；这轮证明 `policy_contract/type_decl_passes/call_resolution/object_runtime_helpers/current_root_cache/symbol_state/...` 这种 helper 文件先收，收益高而且风险低。
+- 2026-04-22：`uir_core_builder_file_exec_pipeline.cheng` 和 `uir_core_builder_file_stage1_phases.cheng` 这种已经动过的 file-phase 文件，最好顺手把剩余 `dbgFile` / `getEnv` 尾巴一次补平；不然后面扫描会一直重复命中同一批残点。
+- 2026-04-22：继续扫 `src/backend` 时，要把 `src/backend/uir/uir_internal/_tmp_*` 这类临时切片文件直接排除；它们会把同一批机械命中放大成海量假优先级，反而遮住真正该先收的 leaf 真文件。
+- 2026-04-22：`machine/select_internal`、`obj`、`uir_internal` 这些非生成 leaf 文件继续证明同一套机械口径很稳，优先级仍然高于聚合文件；像 `aarch64_select`、`macho_linker`、`uir_core_ssu`、`uir_core_builder_types`、`uir_core_builder_policy_contract` 这种文件，先收掉 `sizeof` / `envIsTrue` / `os.C_fflush` 就能稳定推进。
+- 2026-04-22：`src/backend` 这层先吃非生成 leaf 文件最稳，像 `uir_vectorize_*`、`uir_core_builder_base_helpers`、`uir_core_builder_file_exec_pipeline`、`uir_core_builder_file_stage1_phases` 这种文件里的 `sizeof` / 单参调用 / `stage1Trace` / `envIsTrue` / `printDiagnostics` 都能机械收口，而且 fresh `build-backend-driver + run-host-smokes` 仍然保持绿色；暂时不要把同轮范围直接扩到聚合生成的大文件 `uir_core_builder.cheng`、`uir_opt.cheng`。
+- 2026-04-22：oracle helper 现在要继续当成 fresh 重建前的固定前置检查；只要 `backend_driver_main.cheng` 又长回 `V3OracleSignedBatch` 局部槽或 `oracleSmokeBatchFill(...)`，真正首个红点就还是它，不是本轮正在迁移的 backend leaf 文件。
+- 2026-04-22：`src/std` 第二层深一点的 runtime/helper 文件里同样还残着一整批机械旧表面，尤其是 `alloc len/cap/4`、`bytesLen data`、`bytesAlloc outLen/32`、`smallSigma0 w15`、`u32 sumX`、`sizeof Type`、`c_strlen s`、`cheng_async_make_void 0/1`；这批都能直接收成 `f(...)`，不需要碰逻辑。
+- 2026-04-22：`src/std/system_helpers_backend*.cheng` 这类大 runtime 文件虽然行数大，但这轮证明只动 `sizeof Type` / 单参调用也很稳；下一轮继续扫 `src/std` 时，不必因为文件大就回避这类机械命中。
+- 2026-04-22：`src/stage1` 之外的 `src/std` 也还有同一类旧调用面，而且形状一样机械；`len s`、`sizeof bool`、`splitFile path`、`walkDir path`、`! dirExists path`、`c_fclose f`、`close s.f`、`memRetainAtomic a`、`atomicLoadI32 &x`、`cheng_pty_close_bridge fd` 这批点位都能在不改语义的前提下直接收成 `f(...)`。
+- 2026-04-22：`std/os.cheng` 这种大文件在做机械收口时，最容易手滑的是“同一处旧写法改了一半”，比如 `c_fclose f` 改成新写法后又残留一行旧调用；这类文件补丁后一定要立刻做定向复扫，不要只看 build 结果。
+- 2026-04-22：`sizeof T` 这种 built-in special form 也会在多轮 bare-call 清理后继续残留，尤其容易藏在 `token/lexer/frontend_lib` 这种已经基本扫空的文件里；下一轮复扫时要把 `sizeof` 也算进默认旧表面检查，不要只盯普通 helper 或 `c_*` API。
+- 2026-04-22：fresh 验证如果先红在 `bootstrap-bridge bootstrap inputs newer than live bootstrap compiler`，这不是 ordinary 源新回归；先按稳定口径重编 `artifacts/v3_bootstrap/cheng.stage0` 再跑 `bootstrap-bridge`，后面的 backend driver / host smokes 才有判断价值。
+- 2026-04-22：`src/stage1/ownership.cheng` 这条线在更宽口径下也已经只剩很少的数字字面量旧写法了；像 `ownIndexMapInit 256` / `ownLocalMapInit 256` 这种可以直接顺手清零，不需要再拆更细。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 这条线在更宽口径下已经只剩零星散点了；像 `lowerInferExprType res.expr` 这种单行尾巴可以顺手清掉，不用再专门攒一轮。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 之前虽然已经按大块连续段推进过，但换成更宽一点的 helper 名口径后，仍然能再挖出 `lowerValueLookup/lowerInferExprType/asyncAwaitKindFromType/asyncPendingName/asyncSetName` 这一批真尾巴。说明下一轮如果继续往下扫，不能只看词法/字符串类 helper，异步 lowering helper 也要算进去。
+- 2026-04-22：更宽口径继续往下扫时，`src/stage1/ownership.cheng`、`src/stage1/parser.cheng`、`src/stage1/lexer.cheng` 这些之前看起来已收平的文件，仍然会再冒出 `panic "..."`、`chr 0/39`、`charToStr ch` 这类真实尾巴。说明下一轮如果还要继续收，不能只扫某一种函数名。
+- 2026-04-22：`src/stage1/token.cheng` 这种只剩 `chr 0` 的超小文件也值得顺手清零；这轮 4 处单点尾巴收完以后，fresh `build-backend-driver + run-host-smokes` 仍然稳定为绿。
+- 2026-04-22：即使某份文件之前已经按窄口径“扫空”，放宽到 `envIsTrue/parser_isBuiltinTypeName/isLineEnd/charToStr/chr/isContinuationToken` 这类函数名后，`src/stage1/parser.cheng` 和 `src/stage1/lexer.cheng` 仍然能挖出一批真实尾巴。下一轮继续扫 `src/stage1/*.cheng` 时，要用更宽一点的函数名集合，不要只盯 `len/getEnv/stripSpaces/panic`。
+- 2026-04-22：`src/stage1/ast.cheng` 这种“只剩单点尾巴”的文件也值得顺手清掉；这轮只改一处 `panic "..."`，fresh `build-backend-driver + run-host-smokes` 仍然保持绿色，说明这类单点文件不用特地攒成一批再做。
+- 2026-04-22：`src/stage1/diagnostics.cheng` 这条线也已经证明能稳推；不只是 `len/intToStr` 这类裸 helper，连 `bos.OpenRead path`、`bos.ReadAll f`、`bos.Close f` 这种带模块前缀的单参调用一起收口以后，fresh `build-backend-driver + run-host-smokes` 仍然保持绿色。按当前 targeted grep，这份文件已经可以先停。
+- 2026-04-22：重新扫 `src/stage1/*.cheng` 时，别只盯裸函数名；像 `diagnostics.cheng` 这种小文件里，真正的尾巴常常在 `bos.OpenRead path` 这种带模块前缀的单参调用上。
+- 2026-04-22：`src/stage1/type_syntax_lowering.cheng` 这条线也已经证明能稳推；`lowerStrip/stripSpaces/getEnv` 这 6 处 bare call 收口以后，fresh `build-backend-driver + run-host-smokes` 还是绿的。按当前 targeted grep，这份文件已经可以先停。
+- 2026-04-22：重新扫 `src/stage1/*.cheng` 时，`type_syntax_lowering.cheng` 这种“小而真”的中等文件很适合作为切换点；命中少、形状单一，先收这种文件比回头抠已扫空文件的边角更稳。
+- 2026-04-22：`src/stage1/ownership.cheng` 这轮也已经证明能稳推；`getEnv/ownHashStr/len/ownIsExprNode/ownLocalMapDec/ownLocalMapHas/ownLocalMapInc/ownSkipOwnershipKind/ownershipAnalyze*` 再加上剩下那 6 处 `ownRoundUpPow2 cap/newCap` 收口以后，fresh `build-backend-driver + run-host-smokes` 还是绿的。按当前 ownership 专用 grep，这份文件已经可以先停。
+- 2026-04-22：fresh `build-backend-driver` 再次证明 backend driver 的 oracle helper 会被当前树里的别的改动回流到旧形状；只要 `V3OracleSignedBatch` 局部槽一回来，backend driver 就会重新红在 `primary_object_body_semantics_missing`。稳定口径仍然只有一个：调用点直接消费 `oracle_fixture.oracleSmokeBatch(...)`。
+- 2026-04-22：下一刀不要硬猜文件名，先重新扫 `src/stage1/*.cheng` 的真实 bare call 真值再选下一份中等真源。当前 `c_profile_lowering/lexer/ownership` 这三份文件都已经在对应专用口径下扫空，再回头抠边角收益很低。
+- 2026-04-22：`src/stage1/lexer.cheng` 这轮也已经证明能稳推；`isAlphaNum/isHexDigit/isDigit/isAlphaAscii + len s/text/content + isDefKeyword/os.C_fflush` 这批 bare call 收口以后，fresh `build-backend-driver + run-host-smokes` 还是绿的。按当前 targeted grep，这份文件已经可以先停。
+- 2026-04-22：当前更合适接力的是 `src/stage1/ownership.cheng`，不是回头抠 `lexer` 的零散边角。现有命中集中在 `getEnv "..."`、`ownHashStr s`、`len s/name/norm/rhsName`、`ownIsExprNode s/n`、`ownLocalMapDec name`、`ownLocalMapHas norm`、`ownLocalMapInc norm`、`ownSkipOwnershipKind nodeKind(n)`、`ownershipAnalyzeStmtList n`、`ownershipAnalyzeFn n` 这些 ownership helper 连续段，形状机械、风险低。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 的 `4519-4562` `lowerCProfile` orchestration 尾段也已经证明能稳推；补完这批 `lowerTrace/lowerNamedDefault/lowerCollect*/lowerClosures/lowerAsyncDecls/lowerAwaitInSync/lowerQuestion/lowerControlFlow` bare call 以后，fresh `build-backend-driver + run-host-smokes` 还是绿的。按当前 targeted heuristic，这份文件已经基本扫空，可以先切下一份中等真源。
+- 2026-04-22：当前更合适接力的是 `src/stage1/lexer.cheng`，不是回头再抠 `c_profile_lowering` 的零散尾巴。现有命中集中在 `360-490`、`751`、`1418-1562` 这几段字符串切片和扫描 helper，主要是 `len s/text/content` 这一类 bare call，形状集中、风险低，适合按连续块机械推进。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 的 `4255-4562` 这段 async stmt list / driver / wrapper 尾段也已经证明能稳推；这批 `kidCount/cloneTree/lowerCloneShallow/async* bare` 老式单参调用收口以后，fresh `build-backend-driver + run-host-smokes` 还是绿的。下一刀直接切到 `4519-4562` 的 `lowerCProfile` orchestration 尾段，把 `lowerTrace/lowerNamedDefault/lowerCollect*/lowerQuestion/lowerControlFlow` 这批 bare call 一起收平即可。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 的 `3990-4152` 这段 async stmt lowering 也已经证明能稳推；这批 `kidCount/len` 老式单参调用收口以后，fresh `build-backend-driver + run-host-smokes` 还是绿的。下一刀直接顺着 `4255+` 的 async stmt list / driver / wrapper 尾段往下推即可。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 的 `3484-3889` 这段 iterator lowering / async capture 连续段也已经证明能稳推；这批 `kidCount/len/cloneTree` 老式单参调用收口以后，fresh `build-backend-driver + run-host-smokes` 还是绿的。下一刀直接顺着 `3990+` 的 async stmt lowering 连续段往下推即可。
+- 2026-04-22：oracle helper 会被当前树里别的改动反复回流到“局部 `V3OracleSignedBatch` 再填充”的旧形状；只要 fresh 重建前不复看源码真值，就很容易被旧印象误导。稳定口径仍然是调用点直接消费 `oracle_fixture.oracleSmokeBatch(...)`。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 的 `2769-3380` 这段 iterator helper 也已经证明能稳推；这批 `kidCount/len/cloneTree` 老式单参调用收口以后，fresh `build-backend-driver + run-host-smokes` 还是绿的。下一刀直接顺着 `3484+` 的 iterator lowering / async capture 连续段往下推即可。
+- 2026-04-22：fresh `build-backend-driver` 重新证明了 oracle helper 不能回流到“局部 `V3OracleSignedBatch` 再填充”的旧形状；只要 `v3BackendDriverOracleAppendBatch` 和 resilience scenario 改回调用点直接消费 `oracle_fixture.oracleSmokeBatch(...)`，backend driver 就会恢复绿色。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 的 `2449-2679` 这段也已经证明能稳推；`lowerControlShortCircuitExpr/lowerControlStmt` 收口以后，fresh `build-backend-driver + run-host-smokes` 还是绿的。下一刀直接顺着 `2769+` 的 `iterInferSimpleType/iterDefaultValueNode/iterPatternIdent/iterCollectLocals` 往下推即可。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 的 `2175-2415` 这段也已经证明能稳推；`lowerQStmt/lowerControlExpr` 收口以后，fresh `build-backend-driver + run-host-smokes` 还是绿的。下一刀直接顺着 `2449+` 的 `lowerControlShortCircuitExpr/lowerControlStmt` 往下推即可。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 的 `1712-2148` 这段也已经证明能稳推；`async/closure/qexpr` helper 里的老式单参调用收掉以后，fresh `build-backend-driver + run-host-smokes` 仍然是绿的。下一刀直接顺着 `2175-2415` 的 `lowerQStmt/lowerControlExpr` 往下推即可。
+- 2026-04-22：`build-backend-driver` 和 `run-host-smokes` 不能并行跑，它们会共享 `artifacts/v3_backend_driver/*` 路径；这条迁移线的正式验收必须串行，否则日志会掺进假红。
+- 2026-04-22：`v3BackendDriverOracleAppendBatch` / `v3BackendDriverRunOracleResilienceScenario` 这类 oracle helper 里的 `V3OracleSignedBatch` 局部槽会直接把 primary-object 编译卡红。最稳的形状不是“先声明复合值再填充”，而是“调用点直接消费 `oracle_fixture.oracleSmokeBatch(...)`”。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 的 `1498-1660` 纯 helper 段已经证明也能稳推；`if/case/result/type-key` 这一小块机械收口后，fresh `build-backend-driver + run-host-smokes` 仍然保持绿色。下一刀继续顺着同文件的 `1712-2148` async/closure/qexpr helper 往下推即可。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 继续按连续大块推进仍然是稳的。`951-1479` 的 `lowerNamedStmt/lowerClosureExpr/lowerClosureStmt/lowerClosures` 收完后，fresh `build-backend-driver + run-host-smokes` 仍然保持绿色，说明这份文件现在没必要切回散点策略。
+- 2026-04-22：`c_profile_lowering` 下一刀最合适的是 `1498-2148` 的 `if/case/result/async/qexpr` helper 线，不是回头补零散 `len/type` 尾巴。这一段同口径 `kidCount/cloneTree/lower* bare` 命中最密，继续整段机械收口收益最高。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 继续留在同文件线性推进是稳的。第二轮把 `474-520 + 766-980 + 1914-2027` 收掉之后，fresh `build-backend-driver + run-host-smokes` 还是绿的，说明这份文件不需要切回散点策略。
+- 2026-04-22：`c_profile_lowering` 下一刀最合适的是 `951-1479` 的 named stmt/call expr/helper 大块，不是回头捡更散的 `len nm` 尾巴。那一段同口径 `kidCount/cloneTree/child walk` 命中最密，继续整段机械收口收益最高。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 这份文件适合继续按连续 helper 簇推进，而且当前第一轮已经证明是稳的。`101-241`、`435-749`、`1288-1361`、`1618-1905`、`3429-3460` 这几块机械改成 `f(...)` 后，fresh `build-backend-driver + run-host-smokes` 仍然保持绿色。
+- 2026-04-22：`c_profile_lowering` 下一刀最合适的是中段 `474-520 + 766-980` 的 param/type + named/lambda helper，再往后接 `1914-2027` 的 closure env/trampoline builder。那几段同口径命中最密，继续留在同文件线性推进收益最高。
+- 2026-04-22：`src/stage1/frontend_lib.cheng` 在当前 targeted heuristic 下已经基本扫空；剩下那条 `normalizeImportPath` 命中只是 debug 字符串，不是旧单参调用。继续留在这个文件里的收益开始下降，可以切走。
+- 2026-04-22：`src/stage1/c_profile_lowering.cheng` 现在是下一份更合适接力的中等真源文件。当前同口径命中已经成片集中在 `c_fflush get_stdout()`、`rawmemStrFromOffset(s, len prefix)`、以及一整串 `len nm/name/suf/baseName` helper 条件上，适合按连续块推进。
+- 2026-04-22：`src/stage1/frontend_lib.cheng` 继续沿同一条 cache/path/import helper 线性推进是稳的。`1557-1692`、`2022-2168` 和 `1398-1452` 这三块虽然分散，但都是同一类字符串/路径/cache 写盘 helper，机械改成 `f(...)` 后，fresh `build-backend-driver + run-host-smokes` 仍然保持绿色。
+- 2026-04-22：`frontend_lib` 下一刀最合适的是 deps helper 这条线：先从 `2804-3015` 的 `loadSystemModuleId/parseModuleForDepsId/collectResolvedDeps/compileToDepsList` 往下收，而不是回头补更碎的散点。那一段命中集中，而且和前面 import/path/cache/helper 一样，仍然是线性机械收口。
+- 2026-04-22：`src/stage1/frontend_lib.cheng` 的 import/path helper 也很适合按连续块推进。第一块从 `80-240` 到 `953-1212` 已经证明这条线是稳的：虽然夹着不少字符串/路径工具和 token dump helper，但机械改成 `f(...)` 之后，fresh `build-backend-driver + run-host-smokes` 仍然保持绿色。
+- 2026-04-22：`frontend_lib` 下一刀最合适的不是回头补散点，而是继续顺着 `1558-1690` 的 path normalize/root-check helper 往下推；这段命中最集中，而且和本轮已经收掉的 path/string helper 属于同一簇。
+- 2026-04-22：`src/stage1/monomorphize.cheng` 只按连续 range 推还不够，最后必须再做一次全文件 heuristic 复扫；这轮真正漏掉的不是后半段，而是前面 helper 里的散点 `len/typeKey/monoStripVarType/echo/collectFnArities` 老写法。好处是这类漏点都很机械，补完后整份文件就能先停。
+- 2026-04-22：`src/stage1/frontend_lib.cheng` 是当前 `src/stage1` 里更适合接力的中等真源文件。按同一 heuristic 口径，它比 `c_profile_lowering` 更小，但命中已经有成片集中在 import/path/env/cache helper 一带，适合像 `monomorphize` 一样按连续块推进。
+- 2026-04-22：`src/stage1/monomorphize.cheng` 的 `4052-4912` 这段 `transform/call-lowering/helper` 也可以继续按连续块机械推进，不需要拆成更小散点。当前 `looksLikeType*`、`bracketCallToExpr`、`nkLet/nkBracketExpr/nkLambda/nkCall/nkSeqLit` 这一串按同一 grep 口径收成 `f(...)` 后，fresh `build-backend-driver + run-host-smokes` 仍然稳定为绿。下一刀继续顺着同文件后半段线性推就行。
+- 2026-04-22：`src/stage1/semantics.cheng` 进入后半段以后，不只是连续职责簇能推，连散点 `len/getEnv/normalize/plainName` 也可以按统一 grep 口径一轮清掉；只要每轮之后都 fresh `build-backend-driver + run-host-smokes`，这条线依然稳定。
+- 2026-04-22：`src/stage1/semantics.cheng` 现在已经可以在同一文件内持续线性推进，不用再频繁切别的真源文件。call/borrow/stmt-scope/type/pattern/import/global 这些连续段按同一套 grep 口径分轮收口是稳的，下一刀继续留在这份文件里扫剩余 expr/helper 即可。
+- 2026-04-22：`src/stage1/semantics.cheng` 的推进可以继续按“连续职责簇”切，不只是 call/borrow/stmt-scope，type/pattern/import/global 这条线同样能机械收 `f(...)`，而且 fresh `build-backend-driver + run-host-smokes` 仍然稳定。下一刀继续沿剩余的 expr/policy/helper 连续段扫，不需要切回别的文件。
+- 2026-04-22：`src/stage1/semantics.cheng` 不只 call/borrow helper 能按簇推进，连 `semAnalyzeRoutine`、`semAnalyzeStmtCore` 里那种作用域 push/pop 和 call-arg 处理段也能机械收成 `f(...)`，而且 fresh `build-backend-driver + run-host-smokes` 仍然稳定。下一刀继续沿这份文件的 pattern/type/scope 连续段推进即可，不必回到更粗的全仓审计入口。
+- 2026-04-22：`src/stage1/semantics.cheng` 不适合一口气全扫，但可以先按 call/borrow 连续 helper 小簇推进。当前 `semCallArgValue/semIsAddrCall/semIsLValueExpr/semCallInfoNormalized/semBorrowOrigin*/semCheckVarParamCall` 这段已经能机械收成 `f(...)`，而且 fresh `build-backend-driver + run-host-smokes` 仍然保持绿色。
+- 2026-04-22：`src/stage1/ownership.cheng` 这一轮也可以按“单文件 + grep 定义的一簇 helper”稳定推进，不需要一上来就去碰命令面审计。当前这份文件里目标老形态已经先收掉 `kidCount`、`ownExprIdentNode`、`ownStripSpaces`、`ownershipClassifyExpr`、`ownershipAnalyzeNode`、`ownershipEnsure/Index` 这一批，fresh `build-backend-driver + run-host-smokes` 仍然是绿的。
+- 2026-04-22：`verify-backend-driver-command-surface` 现在不能再当这条迁移线的稳定验收。内部 selftest/log 能到 `ok`，但 wrapper 进程会挂在退出收尾；在这条命令修好之前，`spaceCall` 迁移继续以 `build-backend-driver + run-host-smokes` 为准。
+- 2026-04-22：generic `spaceCall` 迁移可以先沿 `src/stage1/parser.cheng` 的连续解析主干推进，不需要等 full repo AST 审计入口。除了表达式主链和 atom/type 小簇，连 `pattern/formal params/record body/suite/if-while-for-case/routine/type decl/import` 这整段连续函数也能直接改成 `f(x)`，然后用 fresh `build-backend-driver + parser_normalized_expr_smoke + verify-backend-driver-command-surface` 稳定验收。
+- 2026-04-22：`src/stage1/parser.cheng` 这一轮已经基本收平；按当前 grep 口径，这个文件里同类旧 `spaceCall` 形态已扫空。继续抠这个文件的收益开始下降，下一刀应转去别的 `src/stage1` 真源文件。
+- 2026-04-22：`spaceCall` 的 full repo AST 审计当前还不能接到 public command 或默认 gate。`verify-export-visibility` 之所以能跑，是因为它只吃 outline parse 子集；`no-space` 一旦需要 function body materialize，就会把 `stage1/parser` / `stage1/lexer` 大片拉进 ordinary compile，fresh 日志直接掉 `primary_object_body_semantics_missing`。在 parser body materialize 进入 ordinary 可编子集前，不要再暴露 `verify-no-space-calls`，也不要把 `space_call_audit_smoke` 挂进默认 host smokes。
+- 2026-04-21：当前能安全硬删的不是全局 `spaceCall`，而是 `Fmt / Lines` 的前缀式空格调用。仓内 generic `f x` 还在大量使用，直接全局移除会先打断自举；`Fmt expr` / `Lines expr` 没有真实存活用法，可以先作为去歧义第一刀。
+- mini-seed 不能只做字段减肥；如果 wrapped stage0 的 `bootstrap-bridge` 还硬绑 `v3/bootstrap/stage1_bootstrap.cheng`，或者 runtime 的 `*_source` 仍只认合同本体，新 v2 合同就只能停在 `print-contract/self-check`，进不了真自举链。
+- mini-seed 接上 seed 以后，ordinary 侧也不能继续把 bootstrap contract path 写死在 `stage1_bootstrap.cheng`；`bootstrap_contracts/build_plan` 如果还不读 snapshot/current stage1 source，`build-backend-driver` 会直接在 plan drift 上假红。
+- live contract 真切到 `v2` 以后，真正要收的不是合同字段本身，而是 helper/远端命令组装里的 `stage1_bootstrap.cheng` 路径真值；现在 ordinary 和 seed C 两边都已经并到共享 helper，剩下同名字符串只应出现在测试断言或 helper 本体里。
+- checked-in live contract 已经切稳以后，seed 继续保留 `v3-bootstrap-v1` 兼容没有实际收益；仓里没有 live v1 合同或 v1 gate，继续留着只会让 mini-seed 边界重新变糊。
+- 当前主线已经不再卡在 parser/HIR 漂移；`parser -> typed_expr -> compiler_csg -> lowering_plan` 这条共享真源已重新接通。
+- 真正的 cold 编译热点是 `primary_object_asm_compile_ms`，不是 `function_emit_ms`、line-map 或写 asm 文件。
+- `provider object` 热路径已经基本收平：正式合同五个样本都是 `provider_cache_hits=5 provider_cache_misses=0`，`provider_objects_ms` 大致在 `13-15ms`。
+- `primary object` warm path 也已被 cache 收掉；正式合同故意保留 cold miss，当前五个样本都是 `primary_object_cache_hits=0 primary_object_cache_misses=1`。
+- 用户看到的 `cheng.stage3` 5GB 目前没复现；新加的 stage3 no-handoff repeated compile 合同里，`libp2p_quic_twoproc_client_smoke` 三次都稳定在约 `1.16GB`，最大只比首轮高 `5MB`。
+- `Fmt(parts)` 这条 native / wasm 调用热路径之前还在手填 `preferred_abi = "composite"`；现在已经改成 `preferred_type -> v3_resolved_type_abi_class(...)`，少了一层调用点文本 ABI 猜测。
+- 剩下更集中的文本 ABI 主要不在 scratch/temp 槽位了，而是在 builtin/import target signature 构造时直接给 `param_abi_classes/return_abi_class` 填 `"composite"` 的几团代码。
+- `content_stub` 和 `crypto_hot_kernel` 仍是最大的 cold 样本；如果继续降编译时延，下一刀只能从 asm 文本规模或自有 object writer 下手。
+- 只减少 `__cstring/.text` section 切换次数没有带来实质收益：`content_stub` / `crypto_hot_kernel` 的切段次数虽然被压到 `2/3`，但 asm 体积只小幅下降，`asm_compile_ms` 没继续降；这条假设已经证伪。
+- `parser.cheng` 这类 normalized-expr 真源不能再做“删字段式精简”；`typed_expr/compiler_csg/lowering_plan/tests` 都直接依赖它，删掉就会立刻分叉。
+- 那组 `idx=8 len=8` 不是 line 19 的 ternary / `Ok` / `Err` 本身，而是 tuple type 冗余默认值扫描的边界 bug：`v3ParserFindTupleTypeRedundantDefaultLine` 在 `i == len` 时还会碰 `body[i]`。这类边界循环不能依赖 `atEnd || text[i] == ...` 这种写法。
+- `artifacts/v3_backend_driver/cheng` 之前确实一度 stale；现在 `build-backend-driver` 已重新打通，后续验收应优先用 fresh backend driver，不再拿旧 artifact 当证据。
+- nested provider object 也必须走当前编译器自举的 `system-link-exec --emit:obj`；seed 内部 materializer 产物会把 `_main` 和 runtime bridge 符号一起编进 provider object，最后在 native link 阶段炸 duplicate symbol。
+- `parser_normalized_expr_smoke` / `call_hir_matrix_smoke` 这轮红过一次，但 fresh backend driver + 新 provider object cache 后已经恢复通过；先重建 backend driver 再判断 parser/HIR 是否真红，比直接改 parser 真源更稳。
+- `Bytes[] add/setLen` 仍是已知支线，不在当前主线内。
+- `r2c_react_v3_run_native_gui_controller_smoke` 之前不只是会吃到 `primary_object_cache`，还会被 backend driver 的 quick/shared cache 复用旧二进制；表现是 compile report 看起来是新的，但实际 controller 可执行文件还缺新字段。这条 smoke 必须同时禁掉 primary object cache 和 driver quick/shared cache。
+- `str` 写入槽位不能直接裸覆盖：`store_str_export`、`cheng_exec_program_seq_add` 必须 retain 新值并 release 旧值；`str[]` 在 `setLen` 收缩、`delete`、`clear`、`freeSeq/freeSeqPtr` 时也必须释放被裁掉的 owned 字符串，否则既会泄漏，也会把返回值/序列场景打炸。
+- `r2c` 生成 runtime 现在不能假设 `std/json` 有 `IsString/IsObject/IsArray` 或小写 `getStr/getInt/getBool`；当前可用的公开面是 `node.kind == json.J*`、`json.Get*` 和 `ParseJsonSafe(...).success`。生成模板一旦偏离这个公开面，native compile 会直接失败。
+- 真正要 Cheng 化的不是旁路 sidecar，而是最终运行读取的官方 payload 路径；正确做法是先保留 Node source payload，再由 Cheng controller 回写正式 payload，并把 `source_payload_path` 放进 summary/report/bundle 合同里。
+- `run-native-gui` 这条主链路里最容易漏的是 report/status 口径，不是功能逻辑本身；只要 `helper_script`、`gui_runtime_non_cheng_blockers`、`active_node_helpers` 还残留 `native_gui_run_helper`，外部就会误判主链路仍然依赖 Node。
+- 这次代码改完后，`native_gui_run_helper` 那个旧残留已经不再阻塞 `r2cControllerRunNativeGui` lowering；编译器已经继续走到 asm/native-link 阶段。host smoke provider 重复符号这条已经修平；如果这里再红，优先看 controller 自身 asm/native-link 真问题，不要把两类问题混写。
+- 这轮 `r2c_react_v3` controller 真正的编译器根因不是 provider duplicate symbol，而是 primary asm text buffer 正好撞满旧预算并静默截断；`debug-report` 给出的 `lowering_function_count=321`、`source_closure_count=20` 推出来的旧 cap 是 `10911744`，失败 asm 文件大小是 `10911743`，两者精确对上。
+- `native_gui_host_macos.compile.log` 为空不是宿主没编，而是 `xcrun clang` 成功时没有 stdout/stderr；如果日志层只原样落输出，就会把成功误报成“缺日志”。这类 compile/run log 需要在零输出成功时补元数据。
+- `run-native-gui` 的 inspector 文档以前会在无命中时把整数字段直接留空，生成非法 JSON；这不是展示小问题，而是 contract 文件真损坏，后续任何 JSON 解析器都会踩雷。
+- `r2c_react_v3_run_native_gui_controller_smoke` 之前还隐含一个新鲜度陷阱：只要 `compiler_main/gate` 这类真源比 `artifacts/v3_backend_driver/cheng` 新，controller 编译就会在 provider materialize 阶段报 `cheng object materialize missing current compiler source`。这不是 GUI 逻辑错，而是 smoke 没先刷新 backend driver。
+- `src/stage1/monomorphize.cheng` 很适合作为 `spaceCall` 下一站：单文件、grep 口径清晰、连续 helper 簇明显，而且 fresh `build-backend-driver + run-host-smokes` 能稳定验收；当前 700-1050 连续块已经安全收口，后续继续沿同文件线性推进比再切回别的大文件更稳。
+- `src/stage1/monomorphize.cheng` 的 `1620-2180` 这段 expr/dispatch/lowering helper 也适合按整段推进：一旦把 `lowerImplicitCallsExpr/lowerImplicitCallsStmt` 周边的旧单参调用收平，同口径 grep 就能整段扫空，而且 fresh backend driver + host smokes 仍然稳定为绿。
+- `src/stage1/monomorphize.cheng` 的 `2350-3266` 这两段也符合同一规律：`instMap/lambda/generic compare` 和 `typeKey/trait/fn helper` 都是连续的真源块，按段机械收口后同口径 grep 可以直接扫空，而且不会破坏 fresh backend driver + host smokes。
+- `src/stage1/monomorphize.cheng` 的 `3359-4045` 这段 `trait/vtable/generic where + instantiateType/Fn/Lambda + template transform` 也适合整段推进；这类 helper 互相紧挨着，按连续块收口比在文件里来回挑散点稳定得多。
+- `native_gui_bundle` 里 Cheng launcher/runtime 的 `system-link-exec` 之前靠 Node 进程 cwd 间接提供工作区根；这条依赖太脆，必须在 helper 里把 `cwd` 和 `CHENG_V3_ROOT` 都固定到 `resolveWorkspaceRoot()`。
+- `verify_export_visibility_parallel.stage3.log` 里那条 `bootstrap-bridge` 报错这轮不是根因；旧日志会误导，真正要看的还是 fresh 重放后的第一条失败日志。
+- `v3/src/runtime/debug_runtime_stub_v3.cheng::debug_copy_source_range` 只要还保留 `debug_bytes_set/debug_bytes_copy` 这类 helper-call 叠加，就会把 provider primary object 顶到 `emit spill depth exceeded`；这种函数必须直接线性展开。
+- `v3/src/tooling/backend_driver_main.cheng` 的 Oracle BFT wrapper 只要同时出现内联数组、字符串拼接和复合返回值直赋，primary object 就容易退化成 `body_semantics_missing`；最稳形状是先构造 `args`，再落本地 `V3LoggedRun`，最后赋给输出变量。
+- `v3/bootstrap/cheng_v3_seed.c` 的 external call signature 之前把 `ret/args` 存成 ABI 类，结果像 `cheng_ptr_seq_get_compat` 这种真实 composite 参数只能写成裸 `"composite"`，连 `param_types` 都落不出真实类型；改成“存类型文本，ABI 现算”后，这层漂移才真正收口。
+- `v3/bootstrap/cheng_v3_seed.c` 里 native / wasm builtin target builder 大量重复手填 `return_abi_class/param_abi_classes`，很容易一边改 `type_text` 一边忘 ABI；这类 builder 最稳做法是统一走 `v3_call_target_set_signature(...)`。
+- `strformat join`、`intrinsic module call` 和 wasm i32 fallback 这类“小 builder + fallback 拼装”也会悄悄复制一份 ABI 规则；它们虽然小，但如果不并到 helper，后面还是会重新分叉。
+- `external_call_signature`、`importc probe fallback`、`resolved call target normalize` 这三团是 target signature 漂移最后最容易漏的地方；它们一旦也走到 `v3_call_target_set_signature(...)`，`target->return_abi_class/param_abi_classes` 就基本只剩 helper 出口本身了。
+- target signature 收口完以后，下一层最容易继续漂移的不是 builder，而是 `param_type/abi -> value/address` 这种 call lowering 判定；如果 native 和 wasm 继续各自写一份，就会重新长出“同一签名两种 lowering”。
+- `v3_call_signature_arg_kind(...)` 这类签名级 helper 必须让 wasm builtin 支线也一起吃到；像 builtin `add` 这种小分支如果还单独保留 `v3_call_arg_passes_by_address(...)`，typed rule 还是会从边角分叉。
+- 不只 arg kind 要共用，`preferred_type/abi` 的归一化也要共用；native / wasm 如果各自再写一遍 `strformat join -> str[]` 和 `preferred_type -> resolved abi`，后面还是会因为一边忘补而重新分叉。
+- prepare 阶段收口之后，emit 阶段同样会重新长重复逻辑；native 标量调用和复合返回调用那两段 `arg_kind` 发射如果不并成单点 helper，后面任何一边补 `ffi handle` 或 `var-lvalue` 规则，另一边都会滞后。
+- 只把大分支并成 helper 还不够；像 direct composite arg、address spill、x64 external composite stack layout 这种“边角热路径”如果还直接读旧 `call_arg_passes_by_address`，truth source 还是会在 emit/import 层分叉。
+- `build-chain-node` 这轮再往下追，真正卡点不是 `chain_node` 逻辑，而是 bootstrap freshness 口径写错了：`bootstrap-bridge` 只需要一个能跑 `compile-bootstrap` 的 live compiler，但旧逻辑把 ordinary 真源更新也算进去了，导致还能自救的旧 stage3 被误判成不可用。
+- `backend driver ready` 以前也有同类口径问题：seed/C/gate 有地方只看二进制存在，不看 `.v3.map` 和 fresh 输入，所以 stale driver 会被继续复用，把后面的 selftest/build-chain-node 拖进假红。
+- `compiler_main.cheng` 里还留过 `src/std/os.Cheng` 这种大小写漂移；在 macOS 上很难看出来，但远端 Linux 会把 freshness/bridge audit 的依赖扫描搞偏。
+- backend driver 的 fresh 列表之前还真漏了 `compiler_runtime_program_entry_provider_v3`，连带 `program_support_host_runtime_v3` / `os_host_process` / `os.cheng` 也没有完全对齐；表面上 driver 已重建，实际一进 provider selftest 还是会报 `missing current compiler source`。
+- backend driver 主进程里就算设置了 `CHENG_V3_ROOT`，也不代表它拉起的 compile/run 子进程会自动继承；`hostops` 这条链只吃显式 envOverrides，不补就会在 `gate_main` / `vpn-gui` 这种二级工具里重新丢根目录。
+- `std/os::setEnv` 的 `discard c_setenv(...)` 不是小样式问题，而是会把 ordinary backend driver 真编卡成 `primary_object_body_semantics_missing`；这类基础 API 必须按 primary-object 能吃的形状写。
+- `call_hir_matrix_smoke` / `lowering_plan_smoke` / `csg_smoke` 当前还不是 backend driver 顶层子命令，验收时要走 `artifacts/v3_backend_driver/cheng run-host-smokes ...`，不要把 smoke 名直接当命令名。
+- `v3_emit_call_from_spills(...)` 现在重复逻辑已经基本缩到只剩“stack 布局策略”本身：x64 external 还要处理 composite-by-memory，generic 只做线性 8-byte stack slot；寄存器实参装载和 `dest load + call + unwind` 已经可以共用单一 helper 口径。
+- `call emit` 再往下收时，先把 `reg ordinal / stack offset / stack bytes / copy-from-ptr` 显式落成 layout，比在 emit 阶段边扫边算更稳；否则 x64 external composite-by-memory 和普通 stack slot 很容易再次在“谁消费寄存器位、谁只占 stack”上长出漂移。
+- 再往下收布局层时，先把“参数是否强制走 stack”从平台函数里拆成 placement fact，再让 layout builder 消费它，比直接在 `v3_build_native_call_stack_layout(...)` 里夹 `if x64 external` 更稳；这样 platform rule 和 layout accumulation 不会继续互相缠住。
+- 下一层真正还没抽开的，不是 emitter，也不是 layout builder，而是 memory-copy placement rule 自己内部的 ABI 门槛：比如当前的 target 判定、`align <= 8`、`size > 16`。这部分如果还挂在“x64 external composite”语义下，后面扩目标时又会重新分叉。
+- 收 ABI 门槛时不能把“拆 predicate”和“扩大支持面”混为一谈。像 `size <= 16` 这种当前还没实现的小 aggregate register ABI，应该保留明确 unsupported，而不是因为 helper 变细了就默认回普通路径。
+- 即使 `src/stage1/semantics.cheng`、`src/stage1/ownership.cheng` 这种大文件前面已经按 helper 簇扫过，profiling/debug 尾段里的 `echo x` 也会继续残留；下一轮放宽扫描口径时，要把 `echo` 这类输出点也纳入默认检查，不要只盯 helper 名。
+- 继续放宽扫描口径时，`releaseString x` 和 `os.C_fflush f` 这种看起来不起眼的基础调用也会在已“基本扫空”的文件里继续残留；`frontend_lib/parser/monomorphize/semantics` 这轮都说明输出/释放类 API 也要纳入默认 bare-call 扫描。
+- `src/stage1/parser.cheng` 这种已经被多轮扫过的大文件，最后还会剩下 `tokenSpan prev`、`isDefiniteTypeExpr node` 这种很分散的 helper 单参调用；说明下一轮不能只扫成团命中，还要补一遍“剩余单点 helper”。
+- 继续放宽到下划线 API 以后，`src/stage1/frontend_lib.cheng` 这种已多轮清理的文件还会剩下 `c_fclose f` 这类单点尾巴；说明 bare-call 复扫不能只盯驼峰 helper，也要把 `c_*` 这种底层 API 算进去。

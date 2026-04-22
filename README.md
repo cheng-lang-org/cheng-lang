@@ -369,10 +369,21 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 
 调试和性能入口也已经固定：
 
+- `artifacts/v3_bootstrap/cheng.stage3 debug-report`
+- `artifacts/v3_bootstrap/cheng.stage3 print-asm`
+- `artifacts/v3_bootstrap/cheng.stage3 crash-report --in:/abs/path/app.run.log --out:/tmp/app.crash-report.txt`
 - `artifacts/v3_bootstrap/cheng.stage3 profile-run --in:/abs/path/file.cheng --target:arm64-apple-darwin --out:/tmp/app`
 - `artifacts/v3_bootstrap/cheng.stage3 profile-report --in:/tmp/app.v3.profile.raw.txt --out:/tmp/app.profile.txt`
 - `artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
 - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
+
+排障顺序也已经固定：
+
+- 先看 Cheng 内建调试面：`debug-report`、`print-asm`、`print-line-map`、`print-symbols`、`print-object`
+- 再看真实产物：`*.compile.log`、`*.run.log`、`*.v3.map`、`*.primary.o.s`
+- 运行崩溃优先对 `*.run.log` 跑 `crash-report`
+- 性能优先用 `profile-run/profile-report` 和 `perf_memory_contract_smoke`
+- 只有问题已经落到宿主 C runtime、系统 linker、`libSystem` 或内建产物不足时，才补用 `lldb/gdb/sample`
 
 `perf_memory_contract_smoke` 的报告默认落在 `artifacts/v3_perf_memory_contract/<label>/perf_memory_contract.report.txt`。
 
