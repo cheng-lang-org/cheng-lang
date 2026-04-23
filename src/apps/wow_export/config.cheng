@@ -1,0 +1,87 @@
+import std/os as os
+import std/result
+import std/strings as strings
+import std/strformat
+import std/strutils as strutils
+import cheng/apps/wow_export/build_info as build_info
+
+type
+    BuildConfig =
+        root: str
+        installContentKey: str
+        installEncodingKey: str
+        encodingContentKey: str
+        encodingEncodingKey: str
+        buildName: str
+        buildUid: str
+        buildProduct: str
+
+fn ConfigValue(line: str): Result[str[]] =
+    let parts: str[] = strutils.Split(line, '=')
+    if parts.len < 2:
+        return Err[str[]]("wowExport config: malformed key/value")
+    return Ok[str[]](parts)
+
+fn ConfigPairFirst(value: str): str =
+    let parts: str[] = strutils.SplitWhitespace(strutils.Strip(value))
+    if parts.len <= 0:
+        return ""
+    return parts[0]
+
+fn ConfigPairSecond(value: str): str =
+    let parts: str[] = strutils.SplitWhitespace(strutils.Strip(value))
+    if parts.len < 2:
+        return ""
+    return parts[1]
+
+fn ParseBuildConfigText(text: str): Result[BuildConfig] =
+    if strings.Len(text) == 0:
+        return Err[BuildConfig]("wowExport config: empty build config")
+    let lines: str[] = strutils.Split(text, '\n')
+    var out: BuildConfig
+    var i: int32
+    while i < lines.len:
+        let line: str = strutils.Strip(lines[i])
+        if strings.Len(line) == 0 || strings.HasPrefix(line, "#"):
+            i = i + 1
+            continue
+        let pairRes: Result[str[]] = ConfigValue(line)
+        if IsErr(pairRes):
+            return Err[BuildConfig](Fmt"{Error(pairRes)} at line={strings.IntToStr(i + 1)}")
+        let parts: str[] = Value(pairRes)
+        let key: str = strutils.Strip(parts[0])
+        let value: str = strutils.Strip(parts[1])
+        if key == "root":
+            out.root = value
+        elif key == "install":
+            out.installContentKey = ConfigPairFirst(value)
+            out.installEncodingKey = ConfigPairSecond(value)
+        elif key == "encoding":
+            out.encodingContentKey = ConfigPairFirst(value)
+            out.encodingEncodingKey = ConfigPairSecond(value)
+        elif key == "build-name":
+            out.buildName = value
+        elif key == "build-uid":
+            out.buildUid = value
+        elif key == "build-product":
+            out.buildProduct = value
+        i = i + 1
+    if strings.Len(out.root) != 32:
+        return Err[BuildConfig]("wowExport config: missing root content key")
+    if strings.Len(out.encodingEncodingKey) != 32:
+        return Err[BuildConfig]("wowExport config: missing encoding encoding key")
+    if strings.Len(out.buildName) == 0:
+        return Err[BuildConfig]("wowExport config: missing build-name")
+    return Ok[BuildConfig](out)
+
+fn LoadBuildConfig(clientPath: str, buildKey: str): Result[BuildConfig] =
+    let pathRes: Result[str] = build_info.ConfigPathForKey(clientPath, buildKey)
+    if IsErr(pathRes):
+        return Err[BuildConfig](Error(pathRes))
+    let path: str = Value(pathRes)
+    if !os.FileExists(path):
+        return Err[BuildConfig](Fmt"wowExport config: missing local build config {path}")
+    return ParseBuildConfigText(os.ReadFile(path))
+
+fn BuildConfigSummary(cfg: BuildConfig): str =
+    return Fmt"buildName={cfg.buildName} root={cfg.root} encoding={cfg.encodingEncodingKey}"

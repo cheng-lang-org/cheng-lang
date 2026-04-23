@@ -9,7 +9,7 @@ import {
   renderNativeGuiRuntimeMainCheng,
 } from './r2c-react-native-gui-runtime-shared.mjs';
 
-const NATIVE_GUI_BUNDLE_HEAP_GUARD_ENV = 'R2C_REACT_V3_NATIVE_GUI_BUNDLE_HEAP_GUARD';
+const NATIVE_GUI_BUNDLE_HEAP_GUARD_ENV = 'R2C_REACT_NATIVE_GUI_BUNDLE_HEAP_GUARD';
 const DEFAULT_NATIVE_GUI_BUNDLE_MAX_OLD_SPACE_MB = 768;
 const DEFAULT_LAYOUT_SURFACE_NODE_LIMIT = 256;
 const DEFAULT_LAYOUT_SURFACE_COMPONENT_EXPANSION_LIMIT = 64;
@@ -151,10 +151,10 @@ function resolveWorkspaceRoot() {
   const scriptName = path.basename(scriptPath);
   let current = path.dirname(scriptPath);
   while (true) {
-    const mirroredScriptPath = path.join(current, 'v3', 'experimental', 'r2c-react', scriptName);
-    if (fs.existsSync(path.join(current, 'v3', 'src')) &&
-        fs.existsSync(path.join(current, 'src', 'runtime')) &&
-        fs.existsSync(mirroredScriptPath)) {
+    const repoScriptPath = path.join(current, 'tools', 'r2c', 'experimental', scriptName);
+    if (fs.existsSync(path.join(current, 'cheng-package.toml')) &&
+        fs.existsSync(path.join(current, 'src', 'core')) &&
+        fs.existsSync(repoScriptPath)) {
       return current;
     }
     const parent = path.dirname(current);
@@ -195,7 +195,7 @@ function ensureNodeHeapLimit() {
   const hasHeapLimit = [...(process.execArgv || []), ...envNodeOptions.split(/\s+/).filter(Boolean)]
     .some((arg) => String(arg).startsWith('--max-old-space-size='));
   if (hasHeapLimit) return;
-  const maxOldSpaceMb = readPositiveIntEnv('R2C_REACT_V3_NATIVE_GUI_BUNDLE_MAX_OLD_SPACE_MB', DEFAULT_NATIVE_GUI_BUNDLE_MAX_OLD_SPACE_MB);
+  const maxOldSpaceMb = readPositiveIntEnv('R2C_REACT_NATIVE_GUI_BUNDLE_MAX_OLD_SPACE_MB', DEFAULT_NATIVE_GUI_BUNDLE_MAX_OLD_SPACE_MB);
   const result = spawnForExec(process.execPath, [
     `--max-old-space-size=${maxOldSpaceMb}`,
     process.argv[1],
@@ -213,11 +213,11 @@ function ensureNodeHeapLimit() {
 }
 
 function resolveDefaultToolingBin(workspaceRoot) {
-  const explicit = String(process.env.R2C_REACT_V3_TOOLING_BIN || '').trim();
+  const explicit = String(process.env.R2C_REACT_TOOLING_BIN || '').trim();
   if (explicit) return explicit;
-  const stage3 = path.join(workspaceRoot, 'artifacts', 'v3_bootstrap', 'cheng.stage3');
+  const stage3 = path.join(workspaceRoot, 'artifacts', 'bootstrap', 'cheng.stage3');
   if (fs.existsSync(stage3)) return stage3;
-  return path.join(workspaceRoot, 'artifacts', 'v3_backend_driver', 'cheng');
+  return path.join(workspaceRoot, 'artifacts', 'backend_driver', 'cheng');
 }
 
 function pathEntryExists(filePath) {
@@ -230,14 +230,10 @@ function pathEntryExists(filePath) {
 }
 
 function ensurePackageCompileSupport(workspaceRoot, packageRoot) {
-  const v3Link = path.join(packageRoot, 'v3');
   const runtimeRoot = path.join(packageRoot, 'src', 'runtime');
   const nativeLink = path.join(runtimeRoot, 'native');
   const stdLink = path.join(packageRoot, 'src', 'std');
   fs.mkdirSync(runtimeRoot, { recursive: true });
-  if (!pathEntryExists(v3Link)) {
-    fs.symlinkSync(path.join(workspaceRoot, 'v3'), v3Link);
-  }
   if (!pathEntryExists(nativeLink)) {
     fs.symlinkSync(path.join(workspaceRoot, 'src', 'runtime', 'native'), nativeLink);
   }
@@ -502,11 +498,11 @@ function currentRssBytes() {
 
 function createLayoutSurfaceBudgetState() {
   return {
-    maxNodes: readPositiveIntEnv('R2C_REACT_V3_LAYOUT_SURFACE_MAX_NODES', DEFAULT_LAYOUT_SURFACE_NODE_LIMIT),
-    maxComponentExpansions: readPositiveIntEnv('R2C_REACT_V3_LAYOUT_SURFACE_MAX_COMPONENT_EXPANSIONS', DEFAULT_LAYOUT_SURFACE_COMPONENT_EXPANSION_LIMIT),
-    maxParsedModules: readPositiveIntEnv('R2C_REACT_V3_LAYOUT_SURFACE_MAX_PARSED_MODULES', DEFAULT_LAYOUT_SURFACE_MODULE_PARSE_LIMIT),
-    maxSourceChars: readPositiveIntEnv('R2C_REACT_V3_LAYOUT_SURFACE_MAX_SOURCE_CHARS', DEFAULT_LAYOUT_SURFACE_MAX_SOURCE_CHARS),
-    maxRssBytes: readPositiveIntEnv('R2C_REACT_V3_LAYOUT_SURFACE_MAX_RSS_MB', DEFAULT_LAYOUT_SURFACE_MAX_RSS_MB) * 1024 * 1024,
+    maxNodes: readPositiveIntEnv('R2C_REACT_LAYOUT_SURFACE_MAX_NODES', DEFAULT_LAYOUT_SURFACE_NODE_LIMIT),
+    maxComponentExpansions: readPositiveIntEnv('R2C_REACT_LAYOUT_SURFACE_MAX_COMPONENT_EXPANSIONS', DEFAULT_LAYOUT_SURFACE_COMPONENT_EXPANSION_LIMIT),
+    maxParsedModules: readPositiveIntEnv('R2C_REACT_LAYOUT_SURFACE_MAX_PARSED_MODULES', DEFAULT_LAYOUT_SURFACE_MODULE_PARSE_LIMIT),
+    maxSourceChars: readPositiveIntEnv('R2C_REACT_LAYOUT_SURFACE_MAX_SOURCE_CHARS', DEFAULT_LAYOUT_SURFACE_MAX_SOURCE_CHARS),
+    maxRssBytes: readPositiveIntEnv('R2C_REACT_LAYOUT_SURFACE_MAX_RSS_MB', DEFAULT_LAYOUT_SURFACE_MAX_RSS_MB) * 1024 * 1024,
     nextId: 0,
     truncated: false,
     componentExpansionCount: 0,

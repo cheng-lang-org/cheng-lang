@@ -30,7 +30,7 @@ Notes:
   `/Users/lbcheng/cheng-lang/cheng_uir_bridge_bootstrap/target/{debug,release}/libcheng_uir_bridge_bootstrap.*`
 - the old Cheng-native bridge build entry
   `/Users/lbcheng/cheng-lang/scripts/build_cheng_uir_native_bridge.sh`
-  is retired with the old tooling bridge and is no longer a maintained v3 path
+  is retired with the old tooling bridge and is no longer a maintained path
 - when the bridge exports `cheng_uir_*_v2`, the backend sends manifest / semantic tables / symbol list
   as split buffers to avoid large manifest inlining and bootstrap file I/O
 - this repository now includes a bootstrap bridge dylib at

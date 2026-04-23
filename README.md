@@ -319,7 +319,7 @@ Cheng 当前最有辨识度的编译器特性包括：
 - `O3` 继续进入 SSA、后 SSA 优化和更强的清理收敛
 - 编译器内部向 `Arena + SoA + int32 index` 收敛
 - UIR call-site ABI lowering 负责 slice / out-ptr / handle / borrow bridge
-- `v3` 自举契约把编译器并行固定为 `two_pass + function_scheduler + thread_local_arena`，用户程序默认仍是确定性单线程
+- 自举契约把编译器并行固定为 `two_pass + function_scheduler + thread_local_arena`，用户程序默认仍是确定性单线程
 - dev 轨支持 direct-exe 和更快的反馈闭环
 - release 轨强调稳定发布和系统链接器收敛
 - tooling 强调 canonical 入口和 verify gate
@@ -335,7 +335,7 @@ Cheng 当前最有辨识度的编译器特性包括：
 - `artifacts/backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
 - `artifacts/backend_driver/cheng system-link-exec`
 
-`v3/tooling/cheng_v3.sh` 现在只该视为兼容壳，不再是 README 主入口。
+外层 shell wrapper 不再是 README 主入口。
 
 ## 性能目标与当前状态
 
@@ -343,7 +343,7 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 
 - 运行时性能目标：核心运行时、热路径程序和数值内核按同机 C `1:1` 对拍
 - 编译性能目标：编译吞吐和关键构建主链不低于同机 C 编译器
-- 当前实际情况：`v3` 的 `stage0 -> stage1 -> stage2 -> stage3`、`program-selfhost` 和 `chain_node` 主链已经打通，但性能闭环还没完全收口；现在能写成硬目标，不能写成“已经达到”
+- 当前实际情况：`stage0 -> stage1 -> stage2 -> stage3`、`program-selfhost` 和 `chain_node` 主链已经打通，但性能闭环还没完全收口；现在能写成硬目标，不能写成“已经达到”
 
 也就是说，今天的 Cheng 已经不是“只能 bootstrap 的壳”，但也还不能在 README 里把运行时性能或编译性能写成既成事实。
 
@@ -361,8 +361,8 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 可以把它们理解成三类入口：
 
 - `bootstrap-bridge`：刷新 `stage0 -> stage3` 自举链
-- `build-backend-driver` / `run-production-regression` / `system-link-exec`：生成并验证当前 v3 编译器主线
-  其中 `run-production-regression` 现在固定包含 `dev_hotpatch_100ms_scope_contract_smoke`、`explicit_default_init_positive_smoke`、`explicit_default_init_negative_smoke`、`explicit_default_init_gate_smoke`、`composite_zero_helper_gate_smoke` 和 `verify-r2c-react-v3-surface`
+- `build-backend-driver` / `run-production-regression` / `system-link-exec`：生成并验证当前编译器主线
+  其中 `run-production-regression` 现在固定包含 `dev_hotpatch_100ms_scope_contract_smoke`、`explicit_default_init_positive_smoke`、`explicit_default_init_negative_smoke`、`explicit_default_init_gate_smoke`、`composite_zero_helper_gate_smoke` 和 `verify-r2c-react-surface`
 - `run-host-smokes` / `status`：校验闭环和查看当前主线状态
 
 其中 `system-link-exec` 的正式入口仍然优先认 `artifacts/backend_driver/cheng`。如果你直接跑 `artifacts/bootstrap/cheng.stage3 system-link-exec`，在 backend driver fresh/ready 时它现在也会先 handoff 到 backend driver，前端语义口径保持 parser 真源一致。
@@ -373,19 +373,19 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 - `artifacts/bootstrap/cheng.stage3 print-asm`
 - `artifacts/bootstrap/cheng.stage3 crash-report --in:/abs/path/app.run.log --out:/tmp/app.crash-report.txt`
 - `artifacts/bootstrap/cheng.stage3 profile-run --in:/abs/path/file.cheng --target:arm64-apple-darwin --out:/tmp/app`
-- `artifacts/bootstrap/cheng.stage3 profile-report --in:/tmp/app.v3.profile.raw.txt --out:/tmp/app.profile.txt`
+- `artifacts/bootstrap/cheng.stage3 profile-report --in:/tmp/app.profile.raw.txt --out:/tmp/app.profile.txt`
 - `artifacts/backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
 - `artifacts/backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
 
 排障顺序也已经固定：
 
 - 先看 Cheng 内建调试面：`debug-report`、`print-asm`、`print-line-map`、`print-symbols`、`print-object`
-- 再看真实产物：`*.compile.log`、`*.run.log`、`*.v3.map`、`*.primary.o.s`
+- 再看真实产物：`*.compile.log`、`*.run.log`、`*.map`、`*.primary.o.s`
 - 运行崩溃优先对 `*.run.log` 跑 `crash-report`
 - 性能优先用 `profile-run/profile-report` 和 `perf_memory_contract_smoke`
 - 只有问题已经落到宿主 C runtime、系统 linker、`libSystem` 或内建产物不足时，才补用 `lldb/gdb/sample`
 
-`perf_memory_contract_smoke` 的报告默认落在 `artifacts/v3_perf_memory_contract/<label>/perf_memory_contract.report.txt`。
+`perf_memory_contract_smoke` 的报告默认落在 `artifacts/perf_memory_contract/<label>/perf_memory_contract.report.txt`。
 
 - `perf_memory_contract_smoke` 默认优先测 `artifacts/backend_driver/cheng`；只有显式 `CHENG_SMOKE_COMPILER` 才覆盖。
 - Darwin 正式内存比较值优先用 `peak memory footprint`；`maximum resident set size` 只保留原始观测，不作为稳定合同阈值。

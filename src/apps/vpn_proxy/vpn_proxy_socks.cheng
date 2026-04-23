@@ -4,47 +4,44 @@ import std/strings
 import std/net/transports/udp_syscall as udp
 
 type
-    V3VpnProxyTarget =
+    VpnProxyTarget =
         host: str
         port: int32
 
-    V3VpnProxySocksRequest =
+    VpnProxySocksRequest =
         cmd: int32
-        target: V3VpnProxyTarget
+        target: VpnProxyTarget
 
-    V3VpnProxySocksTargetDecoded =
-        target: V3VpnProxyTarget
+    VpnProxySocksTargetDecoded =
+        target: VpnProxyTarget
         next: int32
 
-    V3VpnProxySocksUdpDatagram =
+    VpnProxySocksUdpDatagram =
         fragmentId: int32
-        target: V3VpnProxyTarget
+        target: VpnProxyTarget
         payload: Bytes
 
 const
-    v3VpnProxySocksVersion = 5
-    v3VpnProxySocksCmdConnect = 1
-    v3VpnProxySocksCmdBind = 2
-    v3VpnProxySocksCmdUdpAssoc = 3
-    v3VpnProxySocksAtypIpv4 = 1
-    v3VpnProxySocksAtypDomain = 3
-    v3VpnProxySocksAtypIpv6 = 4
+    VpnProxySocksVersion = 5
+    VpnProxySocksCmdConnect = 1
+    VpnProxySocksCmdBind = 2
+    VpnProxySocksCmdUdpAssoc = 3
+    VpnProxySocksAtypIpv4 = 1
+    VpnProxySocksAtypDomain = 3
+    VpnProxySocksAtypIpv6 = 4
 
-fn v3VpnProxySocksReply(code: int32): Bytes =
+fn VpnProxySocksReply(code: int32): Bytes =
     let out: Bytes = bytesAlloc(10)
-    bytesSet(out, 0, v3VpnProxySocksVersion)
+    bytesSet(out, 0, VpnProxySocksVersion)
     bytesSet(out, 1, code)
     bytesSet(out, 2, 0)
-    bytesSet(out, 3, v3VpnProxySocksAtypIpv4)
+    bytesSet(out, 3, VpnProxySocksAtypIpv4)
     return out
 
-fn V3VpnProxySocksReply(code: int32): Bytes =
-    return v3VpnProxySocksReply(code)
-
-fn V3VpnProxySocksMethodReplyFor(request: Bytes): Result[Bytes] =
+fn VpnProxySocksMethodReplyFor(request: Bytes): Result[Bytes] =
     if bytesLen(request) < 2:
         return Err[Bytes]("vpn proxy socks5: request too short")
-    if bytesGet(request, 0) != v3VpnProxySocksVersion:
+    if bytesGet(request, 0) != VpnProxySocksVersion:
         return Err[Bytes]("vpn proxy socks5: version invalid")
     let methodCount: int32 = bytesGet(request, 1)
     if 2 + methodCount > bytesLen(request):
@@ -60,13 +57,13 @@ fn V3VpnProxySocksMethodReplyFor(request: Bytes): Result[Bytes] =
     bytesSet(reply, 1, 0)
     return Ok[Bytes](reply)
 
-fn v3VpnProxySocksBuildBytes(values: int32[]): Bytes =
+fn VpnProxySocksBuildBytes(values: int32[]): Bytes =
     let out: Bytes = bytesAlloc(values.len)
     for i in 0..<values.len:
         bytesSet(out, i, values[i])
     return out
 
-fn v3VpnProxySocksEncodeIpv4TargetWire(target: V3VpnProxyTarget,
+fn VpnProxySocksEncodeIpv4TargetWire(target: VpnProxyTarget,
                                        out: var Bytes): Result[bool] =
     var octets: int32[]
     var current: int32
@@ -91,7 +88,7 @@ fn v3VpnProxySocksEncodeIpv4TargetWire(target: V3VpnProxyTarget,
     add(octets, current)
     if octets.len != 4:
         return Err[bool]("vpn proxy socks5: invalid ipv4 target")
-    out = v3VpnProxySocksBuildBytes([v3VpnProxySocksAtypIpv4,
+    out = VpnProxySocksBuildBytes([VpnProxySocksAtypIpv4,
                                      octets[0],
                                      octets[1],
                                      octets[2],
@@ -100,7 +97,7 @@ fn v3VpnProxySocksEncodeIpv4TargetWire(target: V3VpnProxyTarget,
                                      target.port & 0xff])
     return Ok[bool](true)
 
-fn v3VpnProxySocksEncodeTargetWire(target: V3VpnProxyTarget,
+fn VpnProxySocksEncodeTargetWire(target: VpnProxyTarget,
                                    out: var Bytes): Result[bool] =
     if len(target.host) <= 0 || target.port <= 0 || target.port > 65535:
         return Err[bool]("vpn proxy socks5: invalid target")
@@ -115,20 +112,20 @@ fn v3VpnProxySocksEncodeTargetWire(target: V3VpnProxyTarget,
         if IsErr(addrRes):
             return Err[bool]("vpn proxy socks5: invalid ipv6 target")
         out = bytesAlloc(1 + 16 + 2)
-        bytesSet(out, 0, v3VpnProxySocksAtypIpv6)
+        bytesSet(out, 0, VpnProxySocksAtypIpv6)
         for i in 0..<16:
             bytesSet(out, 1 + i, bytesGet(sockaddr.data, 8 + i))
         bytesSet(out, 17, (target.port >> 8) & 0xff)
         bytesSet(out, 18, target.port & 0xff)
         return Ok[bool](true)
-    let ipv4WireRes: Result[bool] = v3VpnProxySocksEncodeIpv4TargetWire(target, out)
+    let ipv4WireRes: Result[bool] = VpnProxySocksEncodeIpv4TargetWire(target, out)
     if IsOk(ipv4WireRes):
         return ipv4WireRes
     let hostBytes: Bytes = bytesFromString(target.host)
     if bytesLen(hostBytes) <= 0 || bytesLen(hostBytes) > 255:
         return Err[bool]("vpn proxy socks5: invalid domain target")
     out = bytesAlloc(1 + 1 + bytesLen(hostBytes) + 2)
-    bytesSet(out, 0, v3VpnProxySocksAtypDomain)
+    bytesSet(out, 0, VpnProxySocksAtypDomain)
     bytesSet(out, 1, bytesLen(hostBytes))
     for i in 0..<bytesLen(hostBytes):
         bytesSet(out, 2 + i, bytesGet(hostBytes, i))
@@ -137,34 +134,34 @@ fn v3VpnProxySocksEncodeTargetWire(target: V3VpnProxyTarget,
     bytesSet(out, portOffset + 1, target.port & 0xff)
     return Ok[bool](true)
 
-fn v3VpnProxySocksParseTargetAt(request: Bytes,
+fn VpnProxySocksParseTargetAt(request: Bytes,
                                 atypOffset: int32,
-                                allowZeroPort: bool): Result[V3VpnProxySocksTargetDecoded] =
+                                allowZeroPort: bool): Result[VpnProxySocksTargetDecoded] =
     if atypOffset < 0 || atypOffset >= bytesLen(request):
-        return Err[V3VpnProxySocksTargetDecoded]("vpn proxy socks5: request too short")
+        return Err[VpnProxySocksTargetDecoded]("vpn proxy socks5: request too short")
     let atyp: int32 = bytesGet(request, atypOffset)
     var cursor: int32 = atypOffset + 1
     var host = ""
-    if atyp == v3VpnProxySocksAtypIpv4:
+    if atyp == VpnProxySocksAtypIpv4:
         if cursor + 4 + 2 > bytesLen(request):
-            return Err[V3VpnProxySocksTargetDecoded]("vpn proxy socks5: truncated ipv4 target")
+            return Err[VpnProxySocksTargetDecoded]("vpn proxy socks5: truncated ipv4 target")
         host = intToStr(bytesGet(request, cursor)) + "." +
                intToStr(bytesGet(request, cursor + 1)) + "." +
                intToStr(bytesGet(request, cursor + 2)) + "." +
                intToStr(bytesGet(request, cursor + 3))
         cursor = cursor + 4
-    elif atyp == v3VpnProxySocksAtypDomain:
+    elif atyp == VpnProxySocksAtypDomain:
         if cursor + 1 > bytesLen(request):
-            return Err[V3VpnProxySocksTargetDecoded]("vpn proxy socks5: truncated domain target")
+            return Err[VpnProxySocksTargetDecoded]("vpn proxy socks5: truncated domain target")
         let hostLen: int32 = bytesGet(request, cursor)
         cursor = cursor + 1
         if hostLen <= 0 || cursor + hostLen + 2 > bytesLen(request):
-            return Err[V3VpnProxySocksTargetDecoded]("vpn proxy socks5: invalid domain target")
+            return Err[VpnProxySocksTargetDecoded]("vpn proxy socks5: invalid domain target")
         host = bytesToString(bytesSlice(request, cursor, hostLen))
         cursor = cursor + hostLen
-    elif atyp == v3VpnProxySocksAtypIpv6:
+    elif atyp == VpnProxySocksAtypIpv6:
         if cursor + 16 + 2 > bytesLen(request):
-            return Err[V3VpnProxySocksTargetDecoded]("vpn proxy socks5: truncated ipv6 target")
+            return Err[VpnProxySocksTargetDecoded]("vpn proxy socks5: truncated ipv6 target")
         var text = ""
         for i in 0..<8:
             let part: int32 = (bytesGet(request, cursor + i * 2) << 8) | bytesGet(request, cursor + i * 2 + 1)
@@ -174,24 +171,24 @@ fn v3VpnProxySocksParseTargetAt(request: Bytes,
         host = text
         cursor = cursor + 16
     else:
-        return Err[V3VpnProxySocksTargetDecoded]("vpn proxy socks5: unsupported address type")
+        return Err[VpnProxySocksTargetDecoded]("vpn proxy socks5: unsupported address type")
     if cursor + 2 > bytesLen(request):
-        return Err[V3VpnProxySocksTargetDecoded]("vpn proxy socks5: missing target port")
+        return Err[VpnProxySocksTargetDecoded]("vpn proxy socks5: missing target port")
     let port: int32 = (bytesGet(request, cursor) << 8) | bytesGet(request, cursor + 1)
     if len(host) <= 0 || port < 0 || port > 65535:
-        return Err[V3VpnProxySocksTargetDecoded]("vpn proxy socks5: invalid target")
+        return Err[VpnProxySocksTargetDecoded]("vpn proxy socks5: invalid target")
     if !allowZeroPort && port == 0:
-        return Err[V3VpnProxySocksTargetDecoded]("vpn proxy socks5: invalid target")
-    var target: V3VpnProxyTarget
+        return Err[VpnProxySocksTargetDecoded]("vpn proxy socks5: invalid target")
+    var target: VpnProxyTarget
     target.host = host
     target.port = port
-    var out: V3VpnProxySocksTargetDecoded
+    var out: VpnProxySocksTargetDecoded
     out.target = target
     out.next = cursor + 2
-    return Ok[V3VpnProxySocksTargetDecoded](out)
+    return Ok[VpnProxySocksTargetDecoded](out)
 
-fn V3VpnProxySocksReplyForTarget(code: int32,
-                                 target: V3VpnProxyTarget): Result[Bytes] =
+fn VpnProxySocksReplyForTarget(code: int32,
+                                 target: VpnProxyTarget): Result[Bytes] =
     if len(target.host) <= 0 || target.port <= 0 || target.port > 65535:
         return Err[Bytes]("vpn proxy socks5: invalid target")
     if strings.StrContains(target.host, ":"):
@@ -205,10 +202,10 @@ fn V3VpnProxySocksReplyForTarget(code: int32,
         if IsErr(addrRes):
             return Err[Bytes]("vpn proxy socks5: invalid ipv6 target")
         let out: Bytes = bytesAlloc(3 + 1 + 16 + 2)
-        bytesSet(out, 0, v3VpnProxySocksVersion)
+        bytesSet(out, 0, VpnProxySocksVersion)
         bytesSet(out, 1, code)
         bytesSet(out, 2, 0)
-        bytesSet(out, 3, v3VpnProxySocksAtypIpv6)
+        bytesSet(out, 3, VpnProxySocksAtypIpv6)
         for i in 0..<16:
             bytesSet(out, 4 + i, bytesGet(sockaddr.data, 8 + i))
         bytesSet(out, 20, (target.port >> 8) & 0xff)
@@ -241,10 +238,10 @@ fn V3VpnProxySocksReplyForTarget(code: int32,
             add(octets, current)
         if ipv4Ok && octets.len == 4:
             let out: Bytes = bytesAlloc(10)
-            bytesSet(out, 0, v3VpnProxySocksVersion)
+            bytesSet(out, 0, VpnProxySocksVersion)
             bytesSet(out, 1, code)
             bytesSet(out, 2, 0)
-            bytesSet(out, 3, v3VpnProxySocksAtypIpv4)
+            bytesSet(out, 3, VpnProxySocksAtypIpv4)
             bytesSet(out, 4, octets[0])
             bytesSet(out, 5, octets[1])
             bytesSet(out, 6, octets[2])
@@ -257,10 +254,10 @@ fn V3VpnProxySocksReplyForTarget(code: int32,
             if bytesLen(hostBytes) <= 0 || bytesLen(hostBytes) > 255:
                 return Err[Bytes]("vpn proxy socks5: invalid domain target")
             let out: Bytes = bytesAlloc(3 + 1 + 1 + bytesLen(hostBytes) + 2)
-            bytesSet(out, 0, v3VpnProxySocksVersion)
+            bytesSet(out, 0, VpnProxySocksVersion)
             bytesSet(out, 1, code)
             bytesSet(out, 2, 0)
-            bytesSet(out, 3, v3VpnProxySocksAtypDomain)
+            bytesSet(out, 3, VpnProxySocksAtypDomain)
             bytesSet(out, 4, bytesLen(hostBytes))
             for i in 0..<bytesLen(hostBytes):
                 bytesSet(out, 5 + i, bytesGet(hostBytes, i))
@@ -270,51 +267,51 @@ fn V3VpnProxySocksReplyForTarget(code: int32,
             return Ok[Bytes](out)
     return Err[Bytes]("vpn proxy socks5: invalid target")
 
-fn V3VpnProxySocksParseRequestWire(request: Bytes): Result[V3VpnProxySocksRequest] =
+fn VpnProxySocksParseRequestWire(request: Bytes): Result[VpnProxySocksRequest] =
     if bytesLen(request) < 4:
-        return Err[V3VpnProxySocksRequest]("vpn proxy socks5: request too short")
-    if bytesGet(request, 0) != v3VpnProxySocksVersion:
-        return Err[V3VpnProxySocksRequest]("vpn proxy socks5: request version invalid")
+        return Err[VpnProxySocksRequest]("vpn proxy socks5: request too short")
+    if bytesGet(request, 0) != VpnProxySocksVersion:
+        return Err[VpnProxySocksRequest]("vpn proxy socks5: request version invalid")
     let cmd: int32 = bytesGet(request, 1)
-    if cmd == v3VpnProxySocksCmdBind:
-        return Err[V3VpnProxySocksRequest]("vpn proxy socks5: unsupported command")
-    if cmd != v3VpnProxySocksCmdConnect && cmd != v3VpnProxySocksCmdUdpAssoc:
-        return Err[V3VpnProxySocksRequest]("vpn proxy socks5: invalid command")
-    let targetRes: Result[V3VpnProxySocksTargetDecoded] = v3VpnProxySocksParseTargetAt(request,
+    if cmd == VpnProxySocksCmdBind:
+        return Err[VpnProxySocksRequest]("vpn proxy socks5: unsupported command")
+    if cmd != VpnProxySocksCmdConnect && cmd != VpnProxySocksCmdUdpAssoc:
+        return Err[VpnProxySocksRequest]("vpn proxy socks5: invalid command")
+    let targetRes: Result[VpnProxySocksTargetDecoded] = VpnProxySocksParseTargetAt(request,
                                                                                         3,
-                                                                                        cmd == v3VpnProxySocksCmdUdpAssoc)
+                                                                                        cmd == VpnProxySocksCmdUdpAssoc)
     if IsErr(targetRes):
-        return Err[V3VpnProxySocksRequest](ErrorText(targetRes))
-    var out: V3VpnProxySocksRequest
+        return Err[VpnProxySocksRequest](ErrorText(targetRes))
+    var out: VpnProxySocksRequest
     out.cmd = cmd
     out.target = Value(targetRes).target
-    return Ok[V3VpnProxySocksRequest](out)
+    return Ok[VpnProxySocksRequest](out)
 
-fn V3VpnProxySocksParseTargetWire(request: Bytes): Result[V3VpnProxyTarget] =
-    let reqRes: Result[V3VpnProxySocksRequest] = V3VpnProxySocksParseRequestWire(request)
+fn VpnProxySocksParseTargetWire(request: Bytes): Result[VpnProxyTarget] =
+    let reqRes: Result[VpnProxySocksRequest] = VpnProxySocksParseRequestWire(request)
     if IsErr(reqRes):
-        return Err[V3VpnProxyTarget](ErrorText(reqRes))
-    let req: V3VpnProxySocksRequest = Value(reqRes)
-    if req.cmd == v3VpnProxySocksCmdUdpAssoc:
-        return Err[V3VpnProxyTarget]("vpn proxy socks5: unsupported command")
-    return Ok[V3VpnProxyTarget](req.target)
+        return Err[VpnProxyTarget](ErrorText(reqRes))
+    let req: VpnProxySocksRequest = Value(reqRes)
+    if req.cmd == VpnProxySocksCmdUdpAssoc:
+        return Err[VpnProxyTarget]("vpn proxy socks5: unsupported command")
+    return Ok[VpnProxyTarget](req.target)
 
-fn V3VpnProxySocksDecodeUdpDatagram(data: Bytes): Result[V3VpnProxySocksUdpDatagram] =
+fn VpnProxySocksDecodeUdpDatagram(data: Bytes): Result[VpnProxySocksUdpDatagram] =
     if bytesLen(data) < 4:
-        return Err[V3VpnProxySocksUdpDatagram]("vpn proxy socks5: udp datagram too short")
+        return Err[VpnProxySocksUdpDatagram]("vpn proxy socks5: udp datagram too short")
     if bytesGet(data, 0) != 0 || bytesGet(data, 1) != 0:
-        return Err[V3VpnProxySocksUdpDatagram]("vpn proxy socks5: udp reserved field invalid")
-    let targetRes: Result[V3VpnProxySocksTargetDecoded] = v3VpnProxySocksParseTargetAt(data, 3, false)
+        return Err[VpnProxySocksUdpDatagram]("vpn proxy socks5: udp reserved field invalid")
+    let targetRes: Result[VpnProxySocksTargetDecoded] = VpnProxySocksParseTargetAt(data, 3, false)
     if IsErr(targetRes):
-        return Err[V3VpnProxySocksUdpDatagram](ErrorText(targetRes))
-    let decoded: V3VpnProxySocksTargetDecoded = Value(targetRes)
-    var out: V3VpnProxySocksUdpDatagram
+        return Err[VpnProxySocksUdpDatagram](ErrorText(targetRes))
+    let decoded: VpnProxySocksTargetDecoded = Value(targetRes)
+    var out: VpnProxySocksUdpDatagram
     out.fragmentId = bytesGet(data, 2)
     out.target = decoded.target
     out.payload = bytesSlice(data, decoded.next, bytesLen(data) - decoded.next)
-    return Ok[V3VpnProxySocksUdpDatagram](out)
+    return Ok[VpnProxySocksUdpDatagram](out)
 
-fn V3VpnProxySocksEncodeUdpDatagram(datagram: V3VpnProxySocksUdpDatagram): Result[Bytes] =
+fn VpnProxySocksEncodeUdpDatagram(datagram: VpnProxySocksUdpDatagram): Result[Bytes] =
     if datagram.fragmentId < 0 || datagram.fragmentId > 255:
         return Err[Bytes]("vpn proxy socks5: udp fragment invalid")
     if len(datagram.target.host) <= 0 || datagram.target.port <= 0 || datagram.target.port > 65535:
@@ -334,7 +331,7 @@ fn V3VpnProxySocksEncodeUdpDatagram(datagram: V3VpnProxySocksUdpDatagram): Resul
         bytesSet(out, 0, 0)
         bytesSet(out, 1, 0)
         bytesSet(out, 2, datagram.fragmentId)
-        bytesSet(out, 3, v3VpnProxySocksAtypIpv6)
+        bytesSet(out, 3, VpnProxySocksAtypIpv6)
         for i in 0..<16:
             bytesSet(out, 4 + i, bytesGet(sockaddr.data, 8 + i))
         bytesSet(out, 20, (datagram.target.port >> 8) & 0xff)
@@ -371,7 +368,7 @@ fn V3VpnProxySocksEncodeUdpDatagram(datagram: V3VpnProxySocksUdpDatagram): Resul
         bytesSet(out, 0, 0)
         bytesSet(out, 1, 0)
         bytesSet(out, 2, datagram.fragmentId)
-        bytesSet(out, 3, v3VpnProxySocksAtypIpv4)
+        bytesSet(out, 3, VpnProxySocksAtypIpv4)
         bytesSet(out, 4, octets[0])
         bytesSet(out, 5, octets[1])
         bytesSet(out, 6, octets[2])
@@ -388,7 +385,7 @@ fn V3VpnProxySocksEncodeUdpDatagram(datagram: V3VpnProxySocksUdpDatagram): Resul
     bytesSet(out, 0, 0)
     bytesSet(out, 1, 0)
     bytesSet(out, 2, datagram.fragmentId)
-    bytesSet(out, 3, v3VpnProxySocksAtypDomain)
+    bytesSet(out, 3, VpnProxySocksAtypDomain)
     bytesSet(out, 4, bytesLen(hostBytes))
     for i in 0..<bytesLen(hostBytes):
         bytesSet(out, 5 + i, bytesGet(hostBytes, i))

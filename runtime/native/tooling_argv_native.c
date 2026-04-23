@@ -14,13 +14,13 @@
 extern int32_t cheng_tooling_argv_entry(int32_t argc, const char **argv);
 extern void cheng_register_line_map_from_argv0(const char *argv0) __attribute__((weak));
 
-typedef struct V3ChengSeqHeader {
+typedef struct ChengSeqHeader {
   int32_t len;
   int32_t cap;
   void *buffer;
-} V3ChengSeqHeader;
+} ChengSeqHeader;
 
-static char *v3_exec_dup_empty_string(void) {
+static char *cheng_exec_dup_empty_string(void) {
   char *out = (char *)malloc(1);
   if (out != NULL) {
     out[0] = '\0';
@@ -28,7 +28,7 @@ static char *v3_exec_dup_empty_string(void) {
   return out;
 }
 
-static const char *v3_exec_seq_string_item(V3ChengSeqHeader seq, int32_t idx) {
+static const char *cheng_exec_seq_string_item(ChengSeqHeader seq, int32_t idx) {
   if (idx < 0 || idx >= seq.len || seq.buffer == NULL) {
     return "";
   }
@@ -39,14 +39,14 @@ static const char *v3_exec_seq_string_item(V3ChengSeqHeader seq, int32_t idx) {
   }
 }
 
-static char **v3_exec_build_program_argv(const char *program_name, void *argv_seq_ptr) {
-  V3ChengSeqHeader seq;
+static char **cheng_exec_build_program_argv(const char *program_name, void *argv_seq_ptr) {
+  ChengSeqHeader seq;
   size_t extra_count = 0U;
   size_t i = 0U;
   char **argv = NULL;
   memset(&seq, 0, sizeof(seq));
   if (argv_seq_ptr != NULL) {
-    seq = *(V3ChengSeqHeader *)argv_seq_ptr;
+    seq = *(ChengSeqHeader *)argv_seq_ptr;
   }
   extra_count = (size_t)(seq.len > 0 ? seq.len : 0);
   argv = (char **)malloc(sizeof(char *) * (extra_count + 2U));
@@ -55,20 +55,20 @@ static char **v3_exec_build_program_argv(const char *program_name, void *argv_se
   }
   argv[0] = (char *)(program_name != NULL ? program_name : "");
   for (i = 0U; i < extra_count; i += 1U) {
-    argv[i + 1U] = (char *)v3_exec_seq_string_item(seq, (int32_t)i);
+    argv[i + 1U] = (char *)cheng_exec_seq_string_item(seq, (int32_t)i);
   }
   argv[extra_count + 1U] = NULL;
   return argv;
 }
 
-static char *v3_exec_read_file_all(const char *path) {
+static char *cheng_exec_read_file_all(const char *path) {
   FILE *f = NULL;
   char *output = NULL;
   size_t used = 0U;
   size_t cap = 0U;
   f = fopen(path, "rb");
   if (f == NULL) {
-    return v3_exec_dup_empty_string();
+    return cheng_exec_dup_empty_string();
   }
   for (;;) {
     char chunk[4096];
@@ -85,7 +85,7 @@ static char *v3_exec_read_file_all(const char *path) {
         if (next == NULL) {
           free(output);
           fclose(f);
-          return v3_exec_dup_empty_string();
+          return cheng_exec_dup_empty_string();
         }
         output = next;
         cap = next_cap;
@@ -100,7 +100,7 @@ static char *v3_exec_read_file_all(const char *path) {
   }
   fclose(f);
   if (output == NULL) {
-    output = v3_exec_dup_empty_string();
+    output = cheng_exec_dup_empty_string();
   }
   return output;
 }
@@ -119,23 +119,23 @@ char *cheng_exec_program_capture_bridge(const char *programName,
     *exitCode = -1;
   }
   if (programName == NULL || programName[0] == '\0') {
-    return v3_exec_dup_empty_string();
+    return cheng_exec_dup_empty_string();
   }
-  argv = v3_exec_build_program_argv(programName, argvSeqPtr);
+  argv = cheng_exec_build_program_argv(programName, argvSeqPtr);
   if (argv == NULL) {
-    return v3_exec_dup_empty_string();
+    return cheng_exec_dup_empty_string();
   }
   capture_fd = mkstemp(capture_path);
   if (capture_fd < 0) {
     free(argv);
-    return v3_exec_dup_empty_string();
+    return cheng_exec_dup_empty_string();
   }
   pid = fork();
   if (pid < 0) {
     close(capture_fd);
     unlink(capture_path);
     free(argv);
-    return v3_exec_dup_empty_string();
+    return cheng_exec_dup_empty_string();
   }
   if (pid == 0) {
     if (workingDir != NULL && workingDir[0] != '\0') {
@@ -174,7 +174,7 @@ char *cheng_exec_program_capture_bridge(const char *programName,
     }
   }
   free(argv);
-  output = v3_exec_read_file_all(capture_path);
+  output = cheng_exec_read_file_all(capture_path);
   unlink(capture_path);
   return output;
 }
@@ -198,7 +198,7 @@ char *cheng_exec_cmd_ex(const char *command, const char *workingDir, int32_t mer
       have_cwd = 1;
     }
     if (chdir(workingDir) != 0) {
-      return v3_exec_dup_empty_string();
+      return cheng_exec_dup_empty_string();
     }
   }
   shell_len = strlen(command_text) + 8;
@@ -207,7 +207,7 @@ char *cheng_exec_cmd_ex(const char *command, const char *workingDir, int32_t mer
     if (have_cwd) {
       chdir(cwd_buf);
     }
-    return v3_exec_dup_empty_string();
+    return cheng_exec_dup_empty_string();
   }
   snprintf(shell_command,
            shell_len,
@@ -220,7 +220,7 @@ char *cheng_exec_cmd_ex(const char *command, const char *workingDir, int32_t mer
     if (have_cwd) {
       chdir(cwd_buf);
     }
-    return v3_exec_dup_empty_string();
+    return cheng_exec_dup_empty_string();
   }
   for (;;) {
     char chunk[4096];
@@ -240,7 +240,7 @@ char *cheng_exec_cmd_ex(const char *command, const char *workingDir, int32_t mer
           if (have_cwd) {
             chdir(cwd_buf);
           }
-          return v3_exec_dup_empty_string();
+          return cheng_exec_dup_empty_string();
         }
         output = next;
         cap = next_cap;
@@ -258,7 +258,7 @@ char *cheng_exec_cmd_ex(const char *command, const char *workingDir, int32_t mer
     chdir(cwd_buf);
   }
   if (output == NULL) {
-    output = v3_exec_dup_empty_string();
+    output = cheng_exec_dup_empty_string();
   }
   if (exitCode != NULL) {
     if (close_status == -1) {

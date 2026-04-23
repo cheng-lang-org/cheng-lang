@@ -4,7 +4,7 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$root"
 
-echo "build_cheng_uir_native_bridge.sh 已退役：它依赖旧 cheng_tooling / old backend bridge，当前仓库没有维护中的 v3 替代入口" >&2
+echo "build_cheng_uir_native_bridge.sh 已退役：它依赖旧 cheng_tooling / old backend bridge，当前仓库没有维护中的替代入口" >&2
 exit 2
 
 tool="${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling.bin}"

@@ -113,10 +113,10 @@ function resolveWorkspaceRoot() {
   const scriptName = path.basename(scriptPath);
   let current = path.dirname(scriptPath);
   while (true) {
-    const mirroredScriptPath = path.join(current, 'v3', 'experimental', 'r2c-react', scriptName);
-    if (fs.existsSync(path.join(current, 'v3', 'src')) &&
-        fs.existsSync(path.join(current, 'src', 'runtime')) &&
-        fs.existsSync(mirroredScriptPath)) {
+    const repoScriptPath = path.join(current, 'tools', 'r2c', 'experimental', scriptName);
+    if (fs.existsSync(path.join(current, 'cheng-package.toml')) &&
+        fs.existsSync(path.join(current, 'src', 'core')) &&
+        fs.existsSync(repoScriptPath)) {
       return current;
     }
     const parent = path.dirname(current);
@@ -127,9 +127,9 @@ function resolveWorkspaceRoot() {
 }
 
 function resolveStage3(workspaceRoot, explicit) {
-  const configured = String(explicit || process.env.R2C_REACT_V3_TOOLING_BIN || '').trim();
+  const configured = String(explicit || process.env.R2C_REACT_TOOLING_BIN || '').trim();
   if (configured) return path.resolve(configured);
-  const stage3 = path.join(workspaceRoot, 'artifacts', 'v3_bootstrap', 'cheng.stage3');
+  const stage3 = path.join(workspaceRoot, 'artifacts', 'bootstrap', 'cheng.stage3');
   if (fs.existsSync(stage3)) return stage3;
   throw new Error(`missing cheng.stage3: ${stage3}`);
 }
@@ -716,7 +716,7 @@ function main() {
       cwd: workspaceRoot,
       env: {
         ...process.env,
-        R2C_REACT_V3_TOOLING_BIN: stage3,
+        R2C_REACT_TOOLING_BIN: stage3,
       },
     });
     writeText(codegenSurfaceLogPath, [codegenRun.stdout || '', codegenRun.stderr || '', codegenRun.error ? String(codegenRun.error.stack || codegenRun.error.message || codegenRun.error) : ''].filter(Boolean).join('\n'));
@@ -740,7 +740,7 @@ function main() {
       cwd: workspaceRoot,
       env: {
         ...process.env,
-        R2C_REACT_V3_TOOLING_BIN: stage3,
+        R2C_REACT_TOOLING_BIN: stage3,
       },
     });
     writeText(nativeBundleLogPath, [nativeBundleRun.stdout || '', nativeBundleRun.stderr || '', nativeBundleRun.error ? String(nativeBundleRun.error.stack || nativeBundleRun.error.message || nativeBundleRun.error) : ''].filter(Boolean).join('\n'));

@@ -1,38 +1,61 @@
 import std/os
 import std/strutils as strutil
 import cheng/core/tooling/host_ops as hostops
-import cheng/core/tooling/path as v3path
+import cheng/core/tooling/path as chengpath
 
 fn main(): int32 =
     let root: str = os.GetCurrentDir()
     let logPath: str = "/tmp/cheng_host_ops_logged_run_smoke.log"
-    if v3path.V3PathFileExists(logPath):
+    if chengpath.PathFileExists(logPath):
         os.RemoveFile(logPath)
-    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
-                                                           "logged_probe",
-                                                           "/bin/echo",
-                                                           ["logged-ok"],
-                                                           [],
-                                                           root,
-                                                           5,
-                                                           logPath)
-    assert(hostops.v3LoggedRunOk(run), "v3 host_ops logged run rc")
-    assert(run.label == "logged_probe", "v3 host_ops logged run label")
-    assert(run.filePath == "/bin/echo", "v3 host_ops logged run file")
-    assert(run.logPath == logPath, "v3 host_ops logged run log")
-    assert(run.exitCode == 0, "v3 host_ops logged run exitCode")
-    assert(strutil.Strip(run.output) == "logged-ok", "v3 host_ops logged run output")
-    assert(v3path.V3FileExistsNonEmpty(root, logPath), "v3 host_ops logged run log exists")
-    assert(strutil.Strip(v3path.V3ReadTextFile("", logPath)) == "logged-ok",
-           "v3 host_ops logged run log text")
-    let summary: str = hostops.v3LoggedRunSummary(run)
-    assert(strutil.Contains(summary, "exit=0"), "v3 host_ops logged run summary exit")
-    let crashSummary: str = hostops.v3LoggedRunSummary(hostops.v3LoggedRunZero("segv_probe",
-                                                                               "/bin/false",
-                                                                               logPath,
-                                                                               139,
-                                                                               ""))
-    assert(strutil.Contains(crashSummary, "exit=139"), "v3 host_ops logged run summary crash exit")
-    assert(strutil.Contains(crashSummary, "signal=SIGSEGV"), "v3 host_ops logged run summary crash signal")
-    echo("v3 host_ops_logged_run_smoke ok")
+    let exitCode: int32 = hostops.RunFileLoggedExitCode(root,
+                                                        "logged_probe",
+                                                        "/bin/echo",
+                                                        ["logged-ok"],
+                                                        [],
+                                                        root,
+                                                        5,
+                                                        logPath)
+    assert(exitCode == 0, " host_ops logged run exitCode")
+    assert(chengpath.FileExistsNonEmpty(root, logPath), " host_ops logged run log exists")
+    assert(strutil.Strip(chengpath.ReadTextFile("", logPath)) == "logged-ok",
+           " host_ops logged run log text")
+    assert(hostops.LoggedRunSignalName(139) == "SIGSEGV",
+           " host_ops logged run summary crash signal")
+    assert(hostops.HostOpsCurrentPid() > int64(0),
+           " host_ops current pid")
+    assert(hostops.HostOpsCurrentRssBytes() > int64(0),
+           " host_ops current rss")
+
+    let guardLogPath: str = "/tmp/cheng_host_ops_memory_guard_smoke.log"
+    if chengpath.PathFileExists(guardLogPath):
+        os.RemoveFile(guardLogPath)
+    let guardExitCode: int32 = hostops.RunFileLoggedExitCode(root,
+                                                             "memory_guard_probe",
+                                                             "/bin/sleep",
+                                                             ["5"],
+                                                             ["CHENG_PROCESS_MAX_RSS_BYTES=1"],
+                                                             root,
+                                                             5,
+                                                             guardLogPath)
+    assert(guardExitCode == 125, " host_ops memory guard exit")
+    assert(strutil.Contains(chengpath.ReadTextFile("", guardLogPath), "resource_guard status=rss_limit_exceeded"),
+           " host_ops memory guard log")
+
+    let overrideLogPath: str = "/tmp/cheng_host_ops_memory_guard_override_smoke.log"
+    if chengpath.PathFileExists(overrideLogPath):
+        os.RemoveFile(overrideLogPath)
+    let overrideExitCode: int32 = hostops.RunFileLoggedExitCode(root,
+                                                                "memory_guard_override_probe",
+                                                                "/bin/sleep",
+                                                                ["5"],
+                                                                ["CHENG_PROCESS_MAX_RSS_BYTES=invalid",
+                                                                 "CHENG_PROCESS_MAX_RSS_BYTES=1"],
+                                                                root,
+                                                                5,
+                                                                overrideLogPath)
+    assert(overrideExitCode == 125, " host_ops memory guard override precedence")
+    assert(strutil.Contains(chengpath.ReadTextFile("", overrideLogPath), "resource_guard status=rss_limit_exceeded"),
+           " host_ops memory guard override log")
+    echo(" host_ops_logged_run_smoke ok")
     return 0

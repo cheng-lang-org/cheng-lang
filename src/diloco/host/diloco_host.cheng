@@ -2,7 +2,6 @@ import std/result
 import std/os
 import cheng/std/bytes_layout as layout
 import cheng/libp2p/core/types
-import cheng/libp2p/host/host as host_base
 import cheng/libp2p/transports/quic_transport
 import cheng/quic/connection as qconn
 import cheng/quic/msquictransport_native as qtransport
@@ -10,30 +9,27 @@ import cheng/DiLoCo/core/diloco as core
 import cheng/DiLoCo/protocol/wire
 
 type
-    V3DiLoCoHostNode =
-        state: core.V3DiLoCoState
+    DiLoCoHostNode =
+        state: core.DiLoCoState
         autoLeaderEnabled: bool
         autoLeaderJobBundleCid: layout.FixedBytes32
-        autoLeaderPeerId: types.V3Libp2pPeerId
-        autoLeaderModelDeltaRef: core.V3DiLoCoArtifactRef
-        autoLeaderOptimizerDeltaRef: core.V3DiLoCoArtifactRef
+        autoLeaderPeerId: types.Libp2pPeerId
+        autoLeaderModelDeltaRef: core.DiLoCoArtifactRef
+        autoLeaderOptimizerDeltaRef: core.DiLoCoArtifactRef
         autoLeaderSampleCount: int32
         autoLeaderTokenCount: int32
         autoLeaderInnerStepCount: int32
         autoLeaderWeightNumerator: int32
         autoLeaderWeightDenominator: int32
 
-fn v3DiLoCoHostInit(label: str): V3DiLoCoHostNode =
-    return V3DiLoCoHostNode(state: core.v3DiLoCoStateInit(label))
+fn DiLoCoHostInit(label: str): DiLoCoHostNode =
+    return DiLoCoHostNode(state: core.DiLoCoStateInit(label))
 
-fn v3DiLoCoHostRegister(host: var host_base.V3Libp2pHost) =
-    host_base.V3Libp2pRegisterHandler(host, types.V3Libp2pProtocolDiLoCo)
-
-fn v3DiLoCoHostEnableAutoLeader(node: var V3DiLoCoHostNode,
+fn DiLoCoHostEnableAutoLeader(node: var DiLoCoHostNode,
                                 jobBundleCid: layout.FixedBytes32,
-                                leaderPeerId: types.V3Libp2pPeerId,
-                                modelDeltaRef: core.V3DiLoCoArtifactRef,
-                                optimizerDeltaRef: core.V3DiLoCoArtifactRef,
+                                leaderPeerId: types.Libp2pPeerId,
+                                modelDeltaRef: core.DiLoCoArtifactRef,
+                                optimizerDeltaRef: core.DiLoCoArtifactRef,
                                 sampleCount: int32,
                                 tokenCount: int32,
                                 innerStepCount: int32,
@@ -50,38 +46,38 @@ fn v3DiLoCoHostEnableAutoLeader(node: var V3DiLoCoHostNode,
     node.autoLeaderWeightNumerator = weightNumerator
     node.autoLeaderWeightDenominator = weightDenominator
 
-fn v3DiLoCoHostMaybeAdvanceAutoLeader(node: var V3DiLoCoHostNode): Result[bool] =
+fn DiLoCoHostMaybeAdvanceAutoLeader(node: var DiLoCoHostNode): Result[bool] =
     if !node.autoLeaderEnabled:
         return Ok[bool](false)
-    let jobPos = core.v3DiLoCoJobPos(node.state, node.autoLeaderJobBundleCid)
+    let jobPos = core.DiLoCoJobPos(node.state, node.autoLeaderJobBundleCid)
     if jobPos < 0:
-        return Err[bool]("v3 diloco host: auto leader job missing")
+        return Err[bool](" diloco host: auto leader job missing")
     let job = node.state.jobs[jobPos]
     if !job.sealed:
         return Ok[bool](false)
-    var leaderLease = core.V3DiLoCoLease()
-    let leaderLeaseRes = core.v3DiLoCoFetchLeaseFill(leaderLease,
+    var leaderLease = core.DiLoCoLease()
+    let leaderLeaseRes = core.DiLoCoFetchLeaseFill(leaderLease,
                                                      node.state,
                                                      node.autoLeaderJobBundleCid,
                                                      node.autoLeaderPeerId)
     if IsErr(leaderLeaseRes):
         return Err[bool](Error(leaderLeaseRes))
-    let barrierPos = core.v3DiLoCoBarrierPos(node.state,
+    let barrierPos = core.DiLoCoBarrierPos(node.state,
                                              node.autoLeaderJobBundleCid,
                                              job.currentGlobalVersionCid,
                                              job.currentOuterStep)
     if barrierPos >= 0:
         let barrier = node.state.barriers[barrierPos]
         if barrier.completedPeerIds.len > 0 &&
-           !core.v3DiLoCoBarrierHasPeer(barrier, node.autoLeaderPeerId):
-            var barrierOut = core.V3DiLoCoBarrier()
-            let barrierRes = core.v3DiLoCoReportInnerStepDoneFill(barrierOut,
+           !core.DiLoCoBarrierHasPeer(barrier, node.autoLeaderPeerId):
+            var barrierOut = core.DiLoCoBarrier()
+            let barrierRes = core.DiLoCoReportInnerStepDoneFill(barrierOut,
                                                                   node.state,
                                                                   node.autoLeaderJobBundleCid,
                                                                   node.autoLeaderPeerId)
             if IsErr(barrierRes):
                 return Err[bool](Error(barrierRes))
-    let readyBarrierPos = core.v3DiLoCoBarrierPos(node.state,
+    let readyBarrierPos = core.DiLoCoBarrierPos(node.state,
                                                   node.autoLeaderJobBundleCid,
                                                   job.currentGlobalVersionCid,
                                                   job.currentOuterStep)
@@ -90,14 +86,14 @@ fn v3DiLoCoHostMaybeAdvanceAutoLeader(node: var V3DiLoCoHostNode): Result[bool] 
     let readyBarrier = node.state.barriers[readyBarrierPos]
     if !readyBarrier.sealed:
         return Ok[bool](false)
-    if core.v3DiLoCoDeltaPos(node.state,
+    if core.DiLoCoDeltaPos(node.state,
                              node.autoLeaderJobBundleCid,
                              job.currentGlobalVersionCid,
                              job.currentOuterStep,
                              node.autoLeaderPeerId) >= 0:
         return Ok[bool](false)
-    var leaderDelta = core.V3DiLoCoOuterDelta()
-    let leaderDeltaRes = core.v3DiLoCoSubmitOuterDeltaFill(leaderDelta,
+    var leaderDelta = core.DiLoCoOuterDelta()
+    let leaderDeltaRes = core.DiLoCoSubmitOuterDeltaFill(leaderDelta,
                                                            node.state,
                                                            node.autoLeaderJobBundleCid,
                                                            job.currentGlobalVersionCid,
@@ -114,16 +110,16 @@ fn v3DiLoCoHostMaybeAdvanceAutoLeader(node: var V3DiLoCoHostNode): Result[bool] 
         return Err[bool](Error(leaderDeltaRes))
     return Ok[bool](true)
 
-fn v3DiLoCoHostServeOpenJob(out: var Bytes,
-                            node: var V3DiLoCoHostNode,
+fn DiLoCoHostServeOpenJob(out: var Bytes,
+                            node: var DiLoCoHostNode,
                             payload: Bytes): Result[bool] =
-    var req = wire.V3DiLoCoOpenJobRequest()
-    let reqRes = wire.v3DiLoCoOpenJobRequestDecodeFill(req, payload)
+    var req = wire.DiLoCoOpenJobRequest()
+    let reqRes = wire.DiLoCoOpenJobRequestDecodeFill(req, payload)
     if IsErr(reqRes):
         return Err[bool](Error(reqRes))
-    var job = core.V3DiLoCoJob()
-    var version = core.V3DiLoCoGlobalVersion()
-    let openRes = core.v3DiLoCoOpenJobFill(job,
+    var job = core.DiLoCoJob()
+    var version = core.DiLoCoGlobalVersion()
+    let openRes = core.DiLoCoOpenJobFill(job,
                                            version,
                                            node.state,
                                            req.jobBundleCid,
@@ -133,83 +129,83 @@ fn v3DiLoCoHostServeOpenJob(out: var Bytes,
                                            req.initialModelRef,
                                            req.initialOptimizerRef)
     if IsErr(openRes):
-        out = wire.v3DiLoCoWireEncodeErrorEnvelope(wire.v3DiLoCoMessageOpenJob, Error(openRes))
+        out = wire.DiLoCoWireEncodeErrorEnvelope(wire.DiLoCoMessageOpenJob, Error(openRes))
         return Ok[bool](true)
-    var resp = wire.V3DiLoCoOpenJobResponse()
+    var resp = wire.DiLoCoOpenJobResponse()
     resp.job = job
     resp.version = version
-    out = wire.v3DiLoCoOpenJobResponseEncode(resp)
+    out = wire.DiLoCoOpenJobResponseEncode(resp)
     return Ok[bool](true)
 
-fn v3DiLoCoHostServeJoinCohort(out: var Bytes,
-                               node: var V3DiLoCoHostNode,
+fn DiLoCoHostServeJoinCohort(out: var Bytes,
+                               node: var DiLoCoHostNode,
                                payload: Bytes): Result[bool] =
-    var req = wire.V3DiLoCoJoinCohortRequest()
-    let reqRes = wire.v3DiLoCoJoinCohortRequestDecodeFill(req, payload)
+    var req = wire.DiLoCoJoinCohortRequest()
+    let reqRes = wire.DiLoCoJoinCohortRequestDecodeFill(req, payload)
     if IsErr(reqRes):
         return Err[bool](Error(reqRes))
-    var cohort = core.V3DiLoCoCohort()
-    let joinRes = core.v3DiLoCoJoinCohortFill(cohort,
+    var cohort = core.DiLoCoCohort()
+    let joinRes = core.DiLoCoJoinCohortFill(cohort,
                                               node.state,
                                               req.jobBundleCid,
                                               req.peerId)
     if IsErr(joinRes):
-        out = wire.v3DiLoCoWireEncodeErrorEnvelope(wire.v3DiLoCoMessageJoinCohort, Error(joinRes))
+        out = wire.DiLoCoWireEncodeErrorEnvelope(wire.DiLoCoMessageJoinCohort, Error(joinRes))
         return Ok[bool](true)
-    var resp = wire.V3DiLoCoJoinCohortResponse()
+    var resp = wire.DiLoCoJoinCohortResponse()
     resp.cohort = cohort
-    out = wire.v3DiLoCoJoinCohortResponseEncode(resp)
+    out = wire.DiLoCoJoinCohortResponseEncode(resp)
     return Ok[bool](true)
 
-fn v3DiLoCoHostServeFetchLease(out: var Bytes,
-                               node: var V3DiLoCoHostNode,
+fn DiLoCoHostServeFetchLease(out: var Bytes,
+                               node: var DiLoCoHostNode,
                                payload: Bytes): Result[bool] =
-    var req = wire.V3DiLoCoFetchLeaseRequest()
-    let reqRes = wire.v3DiLoCoFetchLeaseRequestDecodeFill(req, payload)
+    var req = wire.DiLoCoFetchLeaseRequest()
+    let reqRes = wire.DiLoCoFetchLeaseRequestDecodeFill(req, payload)
     if IsErr(reqRes):
         return Err[bool](Error(reqRes))
-    var lease = core.V3DiLoCoLease()
-    let leaseRes = core.v3DiLoCoFetchLeaseFill(lease,
+    var lease = core.DiLoCoLease()
+    let leaseRes = core.DiLoCoFetchLeaseFill(lease,
                                                node.state,
                                                req.jobBundleCid,
                                                req.peerId)
     if IsErr(leaseRes):
-        out = wire.v3DiLoCoWireEncodeErrorEnvelope(wire.v3DiLoCoMessageFetchLease, Error(leaseRes))
+        out = wire.DiLoCoWireEncodeErrorEnvelope(wire.DiLoCoMessageFetchLease, Error(leaseRes))
         return Ok[bool](true)
-    var resp = wire.V3DiLoCoFetchLeaseResponse()
+    var resp = wire.DiLoCoFetchLeaseResponse()
     resp.lease = lease
-    out = wire.v3DiLoCoFetchLeaseResponseEncode(resp)
+    out = wire.DiLoCoFetchLeaseResponseEncode(resp)
     return Ok[bool](true)
 
-fn v3DiLoCoHostServeReportInnerStepDone(out: var Bytes,
-                                        node: var V3DiLoCoHostNode,
+fn DiLoCoHostServeReportInnerStepDone(out: var Bytes,
+                                        node: var DiLoCoHostNode,
                                         payload: Bytes): Result[bool] =
-    var req = wire.V3DiLoCoReportInnerStepDoneRequest()
-    let reqRes = wire.v3DiLoCoReportInnerStepDoneRequestDecodeFill(req, payload)
+    var req = wire.DiLoCoReportInnerStepDoneRequest()
+    let reqRes = wire.DiLoCoReportInnerStepDoneRequestDecodeFill(req, payload)
     if IsErr(reqRes):
         return Err[bool](Error(reqRes))
-    var barrier = core.V3DiLoCoBarrier()
-    let barrierRes = core.v3DiLoCoReportInnerStepDoneFill(barrier,
+    var barrier = core.DiLoCoBarrier()
+    let barrierRes = core.DiLoCoReportInnerStepDoneFill(barrier,
                                                           node.state,
                                                           req.jobBundleCid,
                                                           req.peerId)
     if IsErr(barrierRes):
-        out = wire.v3DiLoCoWireEncodeErrorEnvelope(wire.v3DiLoCoMessageReportInnerStepDone, Error(barrierRes))
+        out = wire.DiLoCoWireEncodeErrorEnvelope(wire.DiLoCoMessageReportInnerStepDone, Error(barrierRes))
         return Ok[bool](true)
-    var resp = wire.V3DiLoCoReportInnerStepDoneResponse()
+    var resp = wire.DiLoCoReportInnerStepDoneResponse()
     resp.barrier = barrier
-    out = wire.v3DiLoCoReportInnerStepDoneResponseEncode(resp)
+    out = wire.DiLoCoReportInnerStepDoneResponseEncode(resp)
     return Ok[bool](true)
 
-fn v3DiLoCoHostServeSubmitOuterDelta(out: var Bytes,
-                                     node: var V3DiLoCoHostNode,
+fn DiLoCoHostServeSubmitOuterDelta(out: var Bytes,
+                                     node: var DiLoCoHostNode,
                                      payload: Bytes): Result[bool] =
-    var req = wire.V3DiLoCoSubmitOuterDeltaRequest()
-    let reqRes = wire.v3DiLoCoSubmitOuterDeltaRequestDecodeFill(req, payload)
+    var req = wire.DiLoCoSubmitOuterDeltaRequest()
+    let reqRes = wire.DiLoCoSubmitOuterDeltaRequestDecodeFill(req, payload)
     if IsErr(reqRes):
         return Err[bool](Error(reqRes))
-    var delta = core.V3DiLoCoOuterDelta()
-    let deltaRes = core.v3DiLoCoSubmitOuterDeltaFill(delta,
+    var delta = core.DiLoCoOuterDelta()
+    let deltaRes = core.DiLoCoSubmitOuterDeltaFill(delta,
                                                      node.state,
                                                      req.jobBundleCid,
                                                      req.baseVersionCid,
@@ -223,40 +219,40 @@ fn v3DiLoCoHostServeSubmitOuterDelta(out: var Bytes,
                                                      req.weightNumerator,
                                                      req.weightDenominator)
     if IsErr(deltaRes):
-        out = wire.v3DiLoCoWireEncodeErrorEnvelope(wire.v3DiLoCoMessageSubmitOuterDelta, Error(deltaRes))
+        out = wire.DiLoCoWireEncodeErrorEnvelope(wire.DiLoCoMessageSubmitOuterDelta, Error(deltaRes))
         return Ok[bool](true)
-    var resp = wire.V3DiLoCoSubmitOuterDeltaResponse()
+    var resp = wire.DiLoCoSubmitOuterDeltaResponse()
     resp.delta = delta
-    out = wire.v3DiLoCoSubmitOuterDeltaResponseEncode(resp)
+    out = wire.DiLoCoSubmitOuterDeltaResponseEncode(resp)
     return Ok[bool](true)
 
-fn v3DiLoCoHostServeFetchStepStatus(out: var Bytes,
-                                    node: var V3DiLoCoHostNode,
+fn DiLoCoHostServeFetchStepStatus(out: var Bytes,
+                                    node: var DiLoCoHostNode,
                                     payload: Bytes): Result[bool] =
-    var req = wire.V3DiLoCoFetchStepStatusRequest()
-    let reqRes = wire.v3DiLoCoFetchStepStatusRequestDecodeFill(req, payload)
+    var req = wire.DiLoCoFetchStepStatusRequest()
+    let reqRes = wire.DiLoCoFetchStepStatusRequestDecodeFill(req, payload)
     if IsErr(reqRes):
         return Err[bool](Error(reqRes))
-    var status = core.V3DiLoCoStepStatus()
-    let statusRes = core.v3DiLoCoFetchStepStatusFill(status, node.state, req.jobBundleCid)
+    var status = core.DiLoCoStepStatus()
+    let statusRes = core.DiLoCoFetchStepStatusFill(status, node.state, req.jobBundleCid)
     if IsErr(statusRes):
-        out = wire.v3DiLoCoWireEncodeErrorEnvelope(wire.v3DiLoCoMessageFetchStepStatus, Error(statusRes))
+        out = wire.DiLoCoWireEncodeErrorEnvelope(wire.DiLoCoMessageFetchStepStatus, Error(statusRes))
         return Ok[bool](true)
-    var resp = wire.V3DiLoCoFetchStepStatusResponse()
+    var resp = wire.DiLoCoFetchStepStatusResponse()
     resp.status = status
-    out = wire.v3DiLoCoFetchStepStatusResponseEncode(resp)
+    out = wire.DiLoCoFetchStepStatusResponseEncode(resp)
     return Ok[bool](true)
 
-fn v3DiLoCoHostServePublishMergeCommit(out: var Bytes,
-                                       node: var V3DiLoCoHostNode,
+fn DiLoCoHostServePublishMergeCommit(out: var Bytes,
+                                       node: var DiLoCoHostNode,
                                        payload: Bytes): Result[bool] =
-    var req = wire.V3DiLoCoPublishMergeCommitRequest()
-    let reqRes = wire.v3DiLoCoPublishMergeCommitRequestDecodeFill(req, payload)
+    var req = wire.DiLoCoPublishMergeCommitRequest()
+    let reqRes = wire.DiLoCoPublishMergeCommitRequestDecodeFill(req, payload)
     if IsErr(reqRes):
         return Err[bool](Error(reqRes))
-    var commit = core.V3DiLoCoMergeCommit()
-    var version = core.V3DiLoCoGlobalVersion()
-    let commitRes = core.v3DiLoCoPublishMergeCommitFill(commit,
+    var commit = core.DiLoCoMergeCommit()
+    var version = core.DiLoCoGlobalVersion()
+    let commitRes = core.DiLoCoPublishMergeCommitFill(commit,
                                                         version,
                                                         node.state,
                                                         req.jobBundleCid,
@@ -264,88 +260,88 @@ fn v3DiLoCoHostServePublishMergeCommit(out: var Bytes,
                                                         req.mergedModelRef,
                                                         req.mergedOptimizerRef)
     if IsErr(commitRes):
-        out = wire.v3DiLoCoWireEncodeErrorEnvelope(wire.v3DiLoCoMessagePublishMergeCommit, Error(commitRes))
+        out = wire.DiLoCoWireEncodeErrorEnvelope(wire.DiLoCoMessagePublishMergeCommit, Error(commitRes))
         return Ok[bool](true)
-    var resp = wire.V3DiLoCoPublishMergeCommitResponse()
+    var resp = wire.DiLoCoPublishMergeCommitResponse()
     resp.commit = commit
     resp.version = version
-    out = wire.v3DiLoCoPublishMergeCommitResponseEncode(resp)
+    out = wire.DiLoCoPublishMergeCommitResponseEncode(resp)
     return Ok[bool](true)
 
-fn v3DiLoCoHostServeFetchGlobalVersion(out: var Bytes,
-                                       node: var V3DiLoCoHostNode,
+fn DiLoCoHostServeFetchGlobalVersion(out: var Bytes,
+                                       node: var DiLoCoHostNode,
                                        payload: Bytes): Result[bool] =
-    var req = wire.V3DiLoCoFetchGlobalVersionRequest()
-    let reqRes = wire.v3DiLoCoFetchGlobalVersionRequestDecodeFill(req, payload)
+    var req = wire.DiLoCoFetchGlobalVersionRequest()
+    let reqRes = wire.DiLoCoFetchGlobalVersionRequestDecodeFill(req, payload)
     if IsErr(reqRes):
         return Err[bool](Error(reqRes))
-    var version = core.V3DiLoCoGlobalVersion()
-    let versionRes = core.v3DiLoCoFetchGlobalVersionFill(version, node.state, req.jobBundleCid)
+    var version = core.DiLoCoGlobalVersion()
+    let versionRes = core.DiLoCoFetchGlobalVersionFill(version, node.state, req.jobBundleCid)
     if IsErr(versionRes):
-        out = wire.v3DiLoCoWireEncodeErrorEnvelope(wire.v3DiLoCoMessageFetchGlobalVersion, Error(versionRes))
+        out = wire.DiLoCoWireEncodeErrorEnvelope(wire.DiLoCoMessageFetchGlobalVersion, Error(versionRes))
         return Ok[bool](true)
-    var resp = wire.V3DiLoCoFetchGlobalVersionResponse()
+    var resp = wire.DiLoCoFetchGlobalVersionResponse()
     resp.version = version
-    out = wire.v3DiLoCoFetchGlobalVersionResponseEncode(resp)
+    out = wire.DiLoCoFetchGlobalVersionResponseEncode(resp)
     return Ok[bool](true)
 
-fn v3DiLoCoHostServeFetchLineage(out: var Bytes,
-                                 node: var V3DiLoCoHostNode,
+fn DiLoCoHostServeFetchLineage(out: var Bytes,
+                                 node: var DiLoCoHostNode,
                                  payload: Bytes): Result[bool] =
-    var req = wire.V3DiLoCoFetchLineageRequest()
-    let reqRes = wire.v3DiLoCoFetchLineageRequestDecodeFill(req, payload)
+    var req = wire.DiLoCoFetchLineageRequest()
+    let reqRes = wire.DiLoCoFetchLineageRequestDecodeFill(req, payload)
     if IsErr(reqRes):
         return Err[bool](Error(reqRes))
-    var versions: core.V3DiLoCoGlobalVersion[]
-    let versionsRes = core.v3DiLoCoFetchLineageFill(versions, node.state, req.jobBundleCid)
+    var versions: core.DiLoCoGlobalVersion[]
+    let versionsRes = core.DiLoCoFetchLineageFill(versions, node.state, req.jobBundleCid)
     if IsErr(versionsRes):
-        out = wire.v3DiLoCoWireEncodeErrorEnvelope(wire.v3DiLoCoMessageFetchLineage, Error(versionsRes))
+        out = wire.DiLoCoWireEncodeErrorEnvelope(wire.DiLoCoMessageFetchLineage, Error(versionsRes))
         return Ok[bool](true)
-    var resp = wire.V3DiLoCoFetchLineageResponse()
+    var resp = wire.DiLoCoFetchLineageResponse()
     resp.versions = versions
-    out = wire.v3DiLoCoFetchLineageResponseEncode(resp)
+    out = wire.DiLoCoFetchLineageResponseEncode(resp)
     return Ok[bool](true)
 
-fn v3DiLoCoHostServePayload(out: var Bytes,
-                            node: var V3DiLoCoHostNode,
+fn DiLoCoHostServePayload(out: var Bytes,
+                            node: var DiLoCoHostNode,
                             payload: Bytes): Result[bool] =
-    var envelope = wire.V3DiLoCoEnvelope()
-    let envelopeRes = wire.v3DiLoCoEnvelopeDecodeFill(envelope, payload)
+    var envelope = wire.DiLoCoEnvelope()
+    let envelopeRes = wire.DiLoCoEnvelopeDecodeFill(envelope, payload)
     if IsErr(envelopeRes):
         return Err[bool](Error(envelopeRes))
     if !envelope.ok:
-        return Err[bool]("v3 diloco host: request envelope not ok")
-    if envelope.kind == wire.v3DiLoCoMessageOpenJob:
-        return v3DiLoCoHostServeOpenJob(out, node, payload)
-    elif envelope.kind == wire.v3DiLoCoMessageJoinCohort:
-        return v3DiLoCoHostServeJoinCohort(out, node, payload)
-    elif envelope.kind == wire.v3DiLoCoMessageFetchLease:
-        return v3DiLoCoHostServeFetchLease(out, node, payload)
-    elif envelope.kind == wire.v3DiLoCoMessageReportInnerStepDone:
-        return v3DiLoCoHostServeReportInnerStepDone(out, node, payload)
-    elif envelope.kind == wire.v3DiLoCoMessageSubmitOuterDelta:
-        return v3DiLoCoHostServeSubmitOuterDelta(out, node, payload)
-    elif envelope.kind == wire.v3DiLoCoMessageFetchStepStatus:
-        return v3DiLoCoHostServeFetchStepStatus(out, node, payload)
-    elif envelope.kind == wire.v3DiLoCoMessagePublishMergeCommit:
-        return v3DiLoCoHostServePublishMergeCommit(out, node, payload)
-    elif envelope.kind == wire.v3DiLoCoMessageFetchGlobalVersion:
-        return v3DiLoCoHostServeFetchGlobalVersion(out, node, payload)
-    elif envelope.kind == wire.v3DiLoCoMessageFetchLineage:
-        return v3DiLoCoHostServeFetchLineage(out, node, payload)
-    return Err[bool]("v3 diloco host: unsupported kind")
+        return Err[bool](" diloco host: request envelope not ok")
+    if envelope.kind == wire.DiLoCoMessageOpenJob:
+        return DiLoCoHostServeOpenJob(out, node, payload)
+    elif envelope.kind == wire.DiLoCoMessageJoinCohort:
+        return DiLoCoHostServeJoinCohort(out, node, payload)
+    elif envelope.kind == wire.DiLoCoMessageFetchLease:
+        return DiLoCoHostServeFetchLease(out, node, payload)
+    elif envelope.kind == wire.DiLoCoMessageReportInnerStepDone:
+        return DiLoCoHostServeReportInnerStepDone(out, node, payload)
+    elif envelope.kind == wire.DiLoCoMessageSubmitOuterDelta:
+        return DiLoCoHostServeSubmitOuterDelta(out, node, payload)
+    elif envelope.kind == wire.DiLoCoMessageFetchStepStatus:
+        return DiLoCoHostServeFetchStepStatus(out, node, payload)
+    elif envelope.kind == wire.DiLoCoMessagePublishMergeCommit:
+        return DiLoCoHostServePublishMergeCommit(out, node, payload)
+    elif envelope.kind == wire.DiLoCoMessageFetchGlobalVersion:
+        return DiLoCoHostServeFetchGlobalVersion(out, node, payload)
+    elif envelope.kind == wire.DiLoCoMessageFetchLineage:
+        return DiLoCoHostServeFetchLineage(out, node, payload)
+    return Err[bool](" diloco host: unsupported kind")
 
-fn v3DiLoCoHostRequestResponseNamed(host: str,
+fn DiLoCoHostRequestResponseNamed(host: str,
                                     port: int32,
                                     serverName: str,
                                     payload: Bytes): Result[Bytes] =
-    return quic_transport.V3Libp2pQuicRequestResponseNamed(host,
+    return quic_transport.Libp2pQuicRequestResponseNamed(host,
                                                            port,
                                                            serverName,
-                                                           types.V3Libp2pProtocolDiLoCo,
+                                                           types.Libp2pProtocolDiLoCo,
                                                            payload)
 
-fn v3DiLoCoHostServeWindowNamed(node: var V3DiLoCoHostNode,
+fn DiLoCoHostServeWindowNamed(node: var DiLoCoHostNode,
                                 host: str,
                                 port: int32,
                                 serverName: str,
@@ -353,47 +349,47 @@ fn v3DiLoCoHostServeWindowNamed(node: var V3DiLoCoHostNode,
                                 maxServeCount: int32,
                                 waitMs: int32): Result[bool] =
     var listener = qtransport.InitMsQuicTransport()
-    let startRes = quic_transport.V3Libp2pQuicStartListenerNamed(listener, host, port, serverName)
+    let startRes = quic_transport.Libp2pQuicStartListenerNamed(listener, host, port, serverName)
     if IsErr(startRes):
         return Err[bool](Error(startRes))
-    if !quic_transport.V3Libp2pQuicWriteReadyPort(readyPath, Value(startRes)):
+    if !quic_transport.Libp2pQuicWriteReadyPort(readyPath, Value(startRes)):
         qtransport.Stop(listener)
-        return Err[bool]("v3 diloco host: ready path write failed")
+        return Err[bool](" diloco host: ready path write failed")
     var servedCount = 0
     while maxServeCount <= 0 || servedCount < maxServeCount:
         let acceptRes = qtransport.AcceptTimed(listener, waitMs)
         if IsErr(acceptRes):
             if ErrorText(acceptRes) == "msquic: accept timeout":
                 break
-            os.WriteLine(os.GetStderr(), "v3 diloco host accept error: " + ErrorText(acceptRes))
+            os.WriteLine(os.GetStderr(), " diloco host accept error: " + ErrorText(acceptRes))
             qtransport.Stop(listener)
-            return Err[bool]("v3 diloco host: accept: " + ErrorText(acceptRes))
+            return Err[bool](" diloco host: accept: " + ErrorText(acceptRes))
         var conn = Value(acceptRes)
         var dropConn = false
-        let selectRes = quic_transport.V3Libp2pQuicServerSelectProtocol(listener,
+        let selectRes = quic_transport.Libp2pQuicServerSelectProtocol(listener,
                                                                         conn,
-                                                                        types.V3Libp2pProtocolDiLoCo)
+                                                                        types.Libp2pProtocolDiLoCo)
         var responsePayload = emptyBytes()
         if IsErr(selectRes):
             dropConn = true
         if !dropConn:
-            let requestRes = quic_transport.V3Libp2pQuicReadFrame(listener, conn)
+            let requestRes = quic_transport.Libp2pQuicReadFrame(listener, conn)
             if IsErr(requestRes):
                 dropConn = true
             else:
-                let serveRes = v3DiLoCoHostServePayload(responsePayload, node, Value(requestRes))
+                let serveRes = DiLoCoHostServePayload(responsePayload, node, Value(requestRes))
                 if IsErr(serveRes):
                     dropConn = true
                 else:
-                    let autoLeaderRes = v3DiLoCoHostMaybeAdvanceAutoLeader(node)
+                    let autoLeaderRes = DiLoCoHostMaybeAdvanceAutoLeader(node)
                     if IsErr(autoLeaderRes):
                         qconn.ConnClose(conn)
                         qtransport.Stop(listener)
-                        return Err[bool]("v3 diloco host: auto leader: " + Error(autoLeaderRes))
+                        return Err[bool](" diloco host: auto leader: " + Error(autoLeaderRes))
         if !dropConn:
-            let writeRes = quic_transport.V3Libp2pQuicWriteExact(listener,
+            let writeRes = quic_transport.Libp2pQuicWriteExact(listener,
                                                                  conn,
-                                                                 quic_transport.V3Libp2pQuicEncodeFrame(responsePayload))
+                                                                 quic_transport.Libp2pQuicEncodeFrame(responsePayload))
             if IsErr(writeRes):
                 dropConn = true
         qconn.ConnClose(conn)
@@ -403,146 +399,146 @@ fn v3DiLoCoHostServeWindowNamed(node: var V3DiLoCoHostNode,
     qtransport.Stop(listener)
     return Ok[bool](true)
 
-fn v3DiLoCoOpenJobRequestNamed(host: str,
+fn DiLoCoOpenJobRequestNamed(host: str,
                                port: int32,
                                serverName: str,
-                               req: wire.V3DiLoCoOpenJobRequest): Result[wire.V3DiLoCoOpenJobResponse] =
-    let responseBytesRes = v3DiLoCoHostRequestResponseNamed(host,
+                               req: wire.DiLoCoOpenJobRequest): Result[wire.DiLoCoOpenJobResponse] =
+    let responseBytesRes = DiLoCoHostRequestResponseNamed(host,
                                                             port,
                                                             serverName,
-                                                            wire.v3DiLoCoOpenJobRequestEncode(req))
+                                                            wire.DiLoCoOpenJobRequestEncode(req))
     if IsErr(responseBytesRes):
-        return Err[wire.V3DiLoCoOpenJobResponse](Error(responseBytesRes))
-    var out = wire.V3DiLoCoOpenJobResponse()
-    let decodeRes = wire.v3DiLoCoOpenJobResponseDecodeFill(out, Value(responseBytesRes))
+        return Err[wire.DiLoCoOpenJobResponse](Error(responseBytesRes))
+    var out = wire.DiLoCoOpenJobResponse()
+    let decodeRes = wire.DiLoCoOpenJobResponseDecodeFill(out, Value(responseBytesRes))
     if IsErr(decodeRes):
-        return Err[wire.V3DiLoCoOpenJobResponse](Error(decodeRes))
-    return Ok[wire.V3DiLoCoOpenJobResponse](out)
+        return Err[wire.DiLoCoOpenJobResponse](Error(decodeRes))
+    return Ok[wire.DiLoCoOpenJobResponse](out)
 
-fn v3DiLoCoJoinCohortRequestNamed(host: str,
+fn DiLoCoJoinCohortRequestNamed(host: str,
                                   port: int32,
                                   serverName: str,
-                                  req: wire.V3DiLoCoJoinCohortRequest): Result[wire.V3DiLoCoJoinCohortResponse] =
-    let responseBytesRes = v3DiLoCoHostRequestResponseNamed(host,
+                                  req: wire.DiLoCoJoinCohortRequest): Result[wire.DiLoCoJoinCohortResponse] =
+    let responseBytesRes = DiLoCoHostRequestResponseNamed(host,
                                                             port,
                                                             serverName,
-                                                            wire.v3DiLoCoJoinCohortRequestEncode(req))
+                                                            wire.DiLoCoJoinCohortRequestEncode(req))
     if IsErr(responseBytesRes):
-        return Err[wire.V3DiLoCoJoinCohortResponse](Error(responseBytesRes))
-    var out = wire.V3DiLoCoJoinCohortResponse()
-    let decodeRes = wire.v3DiLoCoJoinCohortResponseDecodeFill(out, Value(responseBytesRes))
+        return Err[wire.DiLoCoJoinCohortResponse](Error(responseBytesRes))
+    var out = wire.DiLoCoJoinCohortResponse()
+    let decodeRes = wire.DiLoCoJoinCohortResponseDecodeFill(out, Value(responseBytesRes))
     if IsErr(decodeRes):
-        return Err[wire.V3DiLoCoJoinCohortResponse](Error(decodeRes))
-    return Ok[wire.V3DiLoCoJoinCohortResponse](out)
+        return Err[wire.DiLoCoJoinCohortResponse](Error(decodeRes))
+    return Ok[wire.DiLoCoJoinCohortResponse](out)
 
-fn v3DiLoCoFetchLeaseRequestNamed(host: str,
+fn DiLoCoFetchLeaseRequestNamed(host: str,
                                   port: int32,
                                   serverName: str,
-                                  req: wire.V3DiLoCoFetchLeaseRequest): Result[wire.V3DiLoCoFetchLeaseResponse] =
-    let responseBytesRes = v3DiLoCoHostRequestResponseNamed(host,
+                                  req: wire.DiLoCoFetchLeaseRequest): Result[wire.DiLoCoFetchLeaseResponse] =
+    let responseBytesRes = DiLoCoHostRequestResponseNamed(host,
                                                             port,
                                                             serverName,
-                                                            wire.v3DiLoCoFetchLeaseRequestEncode(req))
+                                                            wire.DiLoCoFetchLeaseRequestEncode(req))
     if IsErr(responseBytesRes):
-        return Err[wire.V3DiLoCoFetchLeaseResponse](Error(responseBytesRes))
-    var out = wire.V3DiLoCoFetchLeaseResponse()
-    let decodeRes = wire.v3DiLoCoFetchLeaseResponseDecodeFill(out, Value(responseBytesRes))
+        return Err[wire.DiLoCoFetchLeaseResponse](Error(responseBytesRes))
+    var out = wire.DiLoCoFetchLeaseResponse()
+    let decodeRes = wire.DiLoCoFetchLeaseResponseDecodeFill(out, Value(responseBytesRes))
     if IsErr(decodeRes):
-        return Err[wire.V3DiLoCoFetchLeaseResponse](Error(decodeRes))
-    return Ok[wire.V3DiLoCoFetchLeaseResponse](out)
+        return Err[wire.DiLoCoFetchLeaseResponse](Error(decodeRes))
+    return Ok[wire.DiLoCoFetchLeaseResponse](out)
 
-fn v3DiLoCoReportInnerStepDoneRequestNamed(host: str,
+fn DiLoCoReportInnerStepDoneRequestNamed(host: str,
                                            port: int32,
                                            serverName: str,
-                                           req: wire.V3DiLoCoReportInnerStepDoneRequest): Result[wire.V3DiLoCoReportInnerStepDoneResponse] =
-    let responseBytesRes = v3DiLoCoHostRequestResponseNamed(host,
+                                           req: wire.DiLoCoReportInnerStepDoneRequest): Result[wire.DiLoCoReportInnerStepDoneResponse] =
+    let responseBytesRes = DiLoCoHostRequestResponseNamed(host,
                                                             port,
                                                             serverName,
-                                                            wire.v3DiLoCoReportInnerStepDoneRequestEncode(req))
+                                                            wire.DiLoCoReportInnerStepDoneRequestEncode(req))
     if IsErr(responseBytesRes):
-        return Err[wire.V3DiLoCoReportInnerStepDoneResponse](Error(responseBytesRes))
-    var out = wire.V3DiLoCoReportInnerStepDoneResponse()
-    let decodeRes = wire.v3DiLoCoReportInnerStepDoneResponseDecodeFill(out, Value(responseBytesRes))
+        return Err[wire.DiLoCoReportInnerStepDoneResponse](Error(responseBytesRes))
+    var out = wire.DiLoCoReportInnerStepDoneResponse()
+    let decodeRes = wire.DiLoCoReportInnerStepDoneResponseDecodeFill(out, Value(responseBytesRes))
     if IsErr(decodeRes):
-        return Err[wire.V3DiLoCoReportInnerStepDoneResponse](Error(decodeRes))
-    return Ok[wire.V3DiLoCoReportInnerStepDoneResponse](out)
+        return Err[wire.DiLoCoReportInnerStepDoneResponse](Error(decodeRes))
+    return Ok[wire.DiLoCoReportInnerStepDoneResponse](out)
 
-fn v3DiLoCoSubmitOuterDeltaRequestNamed(host: str,
+fn DiLoCoSubmitOuterDeltaRequestNamed(host: str,
                                         port: int32,
                                         serverName: str,
-                                        req: wire.V3DiLoCoSubmitOuterDeltaRequest): Result[wire.V3DiLoCoSubmitOuterDeltaResponse] =
-    let responseBytesRes = v3DiLoCoHostRequestResponseNamed(host,
+                                        req: wire.DiLoCoSubmitOuterDeltaRequest): Result[wire.DiLoCoSubmitOuterDeltaResponse] =
+    let responseBytesRes = DiLoCoHostRequestResponseNamed(host,
                                                             port,
                                                             serverName,
-                                                            wire.v3DiLoCoSubmitOuterDeltaRequestEncode(req))
+                                                            wire.DiLoCoSubmitOuterDeltaRequestEncode(req))
     if IsErr(responseBytesRes):
-        return Err[wire.V3DiLoCoSubmitOuterDeltaResponse](Error(responseBytesRes))
-    var out = wire.V3DiLoCoSubmitOuterDeltaResponse()
-    let decodeRes = wire.v3DiLoCoSubmitOuterDeltaResponseDecodeFill(out, Value(responseBytesRes))
+        return Err[wire.DiLoCoSubmitOuterDeltaResponse](Error(responseBytesRes))
+    var out = wire.DiLoCoSubmitOuterDeltaResponse()
+    let decodeRes = wire.DiLoCoSubmitOuterDeltaResponseDecodeFill(out, Value(responseBytesRes))
     if IsErr(decodeRes):
-        return Err[wire.V3DiLoCoSubmitOuterDeltaResponse](Error(decodeRes))
-    return Ok[wire.V3DiLoCoSubmitOuterDeltaResponse](out)
+        return Err[wire.DiLoCoSubmitOuterDeltaResponse](Error(decodeRes))
+    return Ok[wire.DiLoCoSubmitOuterDeltaResponse](out)
 
-fn v3DiLoCoFetchStepStatusRequestNamed(host: str,
+fn DiLoCoFetchStepStatusRequestNamed(host: str,
                                        port: int32,
                                        serverName: str,
-                                       req: wire.V3DiLoCoFetchStepStatusRequest): Result[wire.V3DiLoCoFetchStepStatusResponse] =
-    let responseBytesRes = v3DiLoCoHostRequestResponseNamed(host,
+                                       req: wire.DiLoCoFetchStepStatusRequest): Result[wire.DiLoCoFetchStepStatusResponse] =
+    let responseBytesRes = DiLoCoHostRequestResponseNamed(host,
                                                             port,
                                                             serverName,
-                                                            wire.v3DiLoCoFetchStepStatusRequestEncode(req))
+                                                            wire.DiLoCoFetchStepStatusRequestEncode(req))
     if IsErr(responseBytesRes):
-        return Err[wire.V3DiLoCoFetchStepStatusResponse](Error(responseBytesRes))
-    var out = wire.V3DiLoCoFetchStepStatusResponse()
-    let decodeRes = wire.v3DiLoCoFetchStepStatusResponseDecodeFill(out, Value(responseBytesRes))
+        return Err[wire.DiLoCoFetchStepStatusResponse](Error(responseBytesRes))
+    var out = wire.DiLoCoFetchStepStatusResponse()
+    let decodeRes = wire.DiLoCoFetchStepStatusResponseDecodeFill(out, Value(responseBytesRes))
     if IsErr(decodeRes):
-        return Err[wire.V3DiLoCoFetchStepStatusResponse](Error(decodeRes))
-    return Ok[wire.V3DiLoCoFetchStepStatusResponse](out)
+        return Err[wire.DiLoCoFetchStepStatusResponse](Error(decodeRes))
+    return Ok[wire.DiLoCoFetchStepStatusResponse](out)
 
-fn v3DiLoCoPublishMergeCommitRequestNamed(host: str,
+fn DiLoCoPublishMergeCommitRequestNamed(host: str,
                                           port: int32,
                                           serverName: str,
-                                          req: wire.V3DiLoCoPublishMergeCommitRequest): Result[wire.V3DiLoCoPublishMergeCommitResponse] =
-    let responseBytesRes = v3DiLoCoHostRequestResponseNamed(host,
+                                          req: wire.DiLoCoPublishMergeCommitRequest): Result[wire.DiLoCoPublishMergeCommitResponse] =
+    let responseBytesRes = DiLoCoHostRequestResponseNamed(host,
                                                             port,
                                                             serverName,
-                                                            wire.v3DiLoCoPublishMergeCommitRequestEncode(req))
+                                                            wire.DiLoCoPublishMergeCommitRequestEncode(req))
     if IsErr(responseBytesRes):
-        return Err[wire.V3DiLoCoPublishMergeCommitResponse](Error(responseBytesRes))
-    var out = wire.V3DiLoCoPublishMergeCommitResponse()
-    let decodeRes = wire.v3DiLoCoPublishMergeCommitResponseDecodeFill(out, Value(responseBytesRes))
+        return Err[wire.DiLoCoPublishMergeCommitResponse](Error(responseBytesRes))
+    var out = wire.DiLoCoPublishMergeCommitResponse()
+    let decodeRes = wire.DiLoCoPublishMergeCommitResponseDecodeFill(out, Value(responseBytesRes))
     if IsErr(decodeRes):
-        return Err[wire.V3DiLoCoPublishMergeCommitResponse](Error(decodeRes))
-    return Ok[wire.V3DiLoCoPublishMergeCommitResponse](out)
+        return Err[wire.DiLoCoPublishMergeCommitResponse](Error(decodeRes))
+    return Ok[wire.DiLoCoPublishMergeCommitResponse](out)
 
-fn v3DiLoCoFetchGlobalVersionRequestNamed(host: str,
+fn DiLoCoFetchGlobalVersionRequestNamed(host: str,
                                           port: int32,
                                           serverName: str,
-                                          req: wire.V3DiLoCoFetchGlobalVersionRequest): Result[wire.V3DiLoCoFetchGlobalVersionResponse] =
-    let responseBytesRes = v3DiLoCoHostRequestResponseNamed(host,
+                                          req: wire.DiLoCoFetchGlobalVersionRequest): Result[wire.DiLoCoFetchGlobalVersionResponse] =
+    let responseBytesRes = DiLoCoHostRequestResponseNamed(host,
                                                             port,
                                                             serverName,
-                                                            wire.v3DiLoCoFetchGlobalVersionRequestEncode(req))
+                                                            wire.DiLoCoFetchGlobalVersionRequestEncode(req))
     if IsErr(responseBytesRes):
-        return Err[wire.V3DiLoCoFetchGlobalVersionResponse](Error(responseBytesRes))
-    var out = wire.V3DiLoCoFetchGlobalVersionResponse()
-    let decodeRes = wire.v3DiLoCoFetchGlobalVersionResponseDecodeFill(out, Value(responseBytesRes))
+        return Err[wire.DiLoCoFetchGlobalVersionResponse](Error(responseBytesRes))
+    var out = wire.DiLoCoFetchGlobalVersionResponse()
+    let decodeRes = wire.DiLoCoFetchGlobalVersionResponseDecodeFill(out, Value(responseBytesRes))
     if IsErr(decodeRes):
-        return Err[wire.V3DiLoCoFetchGlobalVersionResponse](Error(decodeRes))
-    return Ok[wire.V3DiLoCoFetchGlobalVersionResponse](out)
+        return Err[wire.DiLoCoFetchGlobalVersionResponse](Error(decodeRes))
+    return Ok[wire.DiLoCoFetchGlobalVersionResponse](out)
 
-fn v3DiLoCoFetchLineageRequestNamed(host: str,
+fn DiLoCoFetchLineageRequestNamed(host: str,
                                     port: int32,
                                     serverName: str,
-                                    req: wire.V3DiLoCoFetchLineageRequest): Result[wire.V3DiLoCoFetchLineageResponse] =
-    let responseBytesRes = v3DiLoCoHostRequestResponseNamed(host,
+                                    req: wire.DiLoCoFetchLineageRequest): Result[wire.DiLoCoFetchLineageResponse] =
+    let responseBytesRes = DiLoCoHostRequestResponseNamed(host,
                                                             port,
                                                             serverName,
-                                                            wire.v3DiLoCoFetchLineageRequestEncode(req))
+                                                            wire.DiLoCoFetchLineageRequestEncode(req))
     if IsErr(responseBytesRes):
-        return Err[wire.V3DiLoCoFetchLineageResponse](Error(responseBytesRes))
-    var out = wire.V3DiLoCoFetchLineageResponse()
-    let decodeRes = wire.v3DiLoCoFetchLineageResponseDecodeFill(out, Value(responseBytesRes))
+        return Err[wire.DiLoCoFetchLineageResponse](Error(responseBytesRes))
+    var out = wire.DiLoCoFetchLineageResponse()
+    let decodeRes = wire.DiLoCoFetchLineageResponseDecodeFill(out, Value(responseBytesRes))
     if IsErr(decodeRes):
-        return Err[wire.V3DiLoCoFetchLineageResponse](Error(decodeRes))
-    return Ok[wire.V3DiLoCoFetchLineageResponse](out)
+        return Err[wire.DiLoCoFetchLineageResponse](Error(decodeRes))
+    return Ok[wire.DiLoCoFetchLineageResponse](out)

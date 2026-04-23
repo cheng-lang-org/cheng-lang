@@ -195,8 +195,8 @@ static int cheng_core_bio_hex_encode_utf8(const char* src, char* out, size_t out
 }
 
 __attribute__((weak)) ChengStrBridge cheng_mobile_biometric_fingerprint_authorize_bridge_native(ChengStrBridge request_wire) {
-  typedef ChengStrBridge (*ChengV3BioNativeImplFn)(ChengStrBridge);
-  ChengV3BioNativeImplFn impl = (ChengV3BioNativeImplFn)dlsym(RTLD_DEFAULT, "cheng_mobile_biometric_fingerprint_authorize_bridge_native_impl");
+  typedef ChengStrBridge (*ChengBioNativeImplFn)(ChengStrBridge);
+  ChengBioNativeImplFn impl = (ChengBioNativeImplFn)dlsym(RTLD_DEFAULT, "cheng_mobile_biometric_fingerprint_authorize_bridge_native_impl");
   if (impl != NULL) {
     return impl(request_wire);
   }

@@ -1,7 +1,7 @@
 import std/os
 import std/result
 import cheng/std/bytes_layout as layout
-import cheng/core/tooling/path as v3path
+import cheng/core/tooling/path as chengpath
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/tooling/compiler_world as cworld
 import cheng/core/tooling/compiler_csg as ccsg
@@ -11,39 +11,39 @@ import cheng/core/lang/parser
 import cheng/core/backend/system_link_plan as slplan
 
 fn main(): int32 =
-    let workspaceRoot = v3path.V3PathCurrentDir()
+    let workspaceRoot = chengpath.PathCurrentDir()
     let packageRoot = workspaceRoot
     let smokeLabel: str = os.GetEnvDefault("CHENG_SMOKE_LABEL", "host")
-    let outDir: str = v3path.V3PathJoin(workspaceRoot, "artifacts/compiler_migration/" + smokeLabel)
-    assert(v3path.V3MkdirP(workspaceRoot, outDir), "v3 compiler migration publish: mkdir")
-    let currentSourcePath = v3path.V3PathJoin(packageRoot, "src/tests/compiler_migration_fixture.cheng")
-    let legacySourcePath = v3path.V3PathJoin(packageRoot, "testdata/compiler_migration/compiler_migration_fixture_legacy.cheng")
-    let outputPath = v3path.V3PathJoin(outDir, "compiler_migration_publish_fixture")
-    let req = creq.v3CompilerRequestNew(
+    let outDir: str = chengpath.PathJoin(workspaceRoot, "artifacts/compiler_migration/" + smokeLabel)
+    assert(chengpath.MkdirP(workspaceRoot, outDir), " compiler migration publish: mkdir")
+    let currentSourcePath = chengpath.PathJoin(packageRoot, "src/tests/compiler_migration_fixture.cheng")
+    let legacySourcePath = chengpath.PathJoin(packageRoot, "testdata/compiler_migration/compiler_migration_fixture_legacy.cheng")
+    let outputPath = chengpath.PathJoin(outDir, "compiler_migration_publish_fixture")
+    let req = creq.CompilerRequestNew(
         packageRoot,
         currentSourcePath,
         outputPath,
         "arm64-apple-darwin",
-        creq.v3EmitExe,
+        creq.EmitExe,
         ""
     )
-    var linkPlan: slplan.V3SystemLinkPlanStub
+    var linkPlan: slplan.SystemLinkPlanStub
     var err = ""
-    assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), "v3 compiler migration publish: link plan")
-    let sourceBundleRes = slplan.v3SystemLinkPlanSourceBundleCid(linkPlan)
-    assert(IsOk(sourceBundleRes), "v3 compiler migration publish: source bundle")
+    assert(slplan.BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), " compiler migration publish: link plan")
+    let sourceBundleRes = slplan.SystemLinkPlanSourceBundleCid(linkPlan)
+    assert(IsOk(sourceBundleRes), " compiler migration publish: source bundle")
     let sourceBundleCid = Value(sourceBundleRes)
-    let currentCsgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
-    assert(IsOk(currentCsgRes), "v3 compiler migration publish: build current csg")
-    let currentCsg = ccsg.v3CompilerCsgClone(Value(currentCsgRes))
-    let entryModulePath = parser.v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, currentSourcePath)
-    let migrationRes = ccsg.v3BuildCompilerLegacyMigration(workspaceRoot,
+    let currentCsgRes = ccsg.BuildCompilerCsg(linkPlan, sourceBundleCid)
+    assert(IsOk(currentCsgRes), " compiler migration publish: build current csg")
+    let currentCsg = ccsg.CompilerCsgClone(Value(currentCsgRes))
+    let entryModulePath = parser.ParserSourcePathToModulePath(workspaceRoot, packageRoot, currentSourcePath)
+    let migrationRes = ccsg.BuildCompilerLegacyMigration(workspaceRoot,
                                                            packageRoot,
                                                            legacySourcePath,
                                                            linkPlan.packageId,
                                                            entryModulePath)
-    assert(IsOk(migrationRes), "v3 compiler migration publish: build migration")
-    let migration = ccsg.v3CompilerLegacyMigrationClone(Value(migrationRes))
+    assert(IsOk(migrationRes), " compiler migration publish: build migration")
+    let migration = ccsg.CompilerLegacyMigrationClone(Value(migrationRes))
     let providers = [
         "runtime/compiler_runtime",
         "runtime/core_runtime",
@@ -52,27 +52,34 @@ fn main(): int32 =
         "runtime/program_support_host_runtime"
     ]
     let worldHeadCid = layout.FixedBytes32()
-    let currentReceipt = ccsg.v3CompileReceiptMake(worldHeadCid,
+    let currentReceipt = ccsg.CompileReceiptMake(worldHeadCid,
                                                    currentCsg.graphCid,
                                                    currentCsg.canonicalGraphCid,
                                                    req.targetTriple,
-                                                   ccsg.v3CompileOutputDigest(outputPath, req.targetTriple, providers, currentCsg.graphCid),
-                                                   ccsg.v3CompileOutputDigest(outputPath, req.targetTriple, providers, currentCsg.canonicalGraphCid),
+                                                   ccsg.CompileOutputDigest(outputPath, req.targetTriple, providers, currentCsg.graphCid),
+                                                   ccsg.CompileOutputDigest(outputPath, req.targetTriple, providers, currentCsg.canonicalGraphCid),
                                                    "stage3_local",
                                                    providers)
-    let migrationReceipt = ccsg.v3CompileReceiptMake(worldHeadCid,
+    let migrationReceipt = ccsg.CompileReceiptMake(worldHeadCid,
                                                      migration.compilerCsg.graphCid,
                                                      migration.compilerCsg.canonicalGraphCid,
                                                      req.targetTriple,
-                                                     ccsg.v3CompileOutputDigest(outputPath, req.targetTriple, providers, migration.compilerCsg.graphCid),
-                                                     ccsg.v3CompileOutputDigest(outputPath, req.targetTriple, providers, migration.compilerCsg.canonicalGraphCid),
+                                                     ccsg.CompileOutputDigest(outputPath, req.targetTriple, providers, migration.compilerCsg.graphCid),
+                                                     ccsg.CompileOutputDigest(outputPath, req.targetTriple, providers, migration.compilerCsg.canonicalGraphCid),
                                                      "stage3_local",
                                                      providers)
-    assert(ccsg.v3CompileReceiptEquivalent(currentReceipt, migrationReceipt),
-           "v3 compiler migration publish: canonical receipt equivalent")
-    let currentSurface = ccsg.v3CompilerExportSurfaceFromCsg(currentCsg)
-    var proof: ceq.V3CompilerEquivalenceProof
-    let proofRes = ceq.v3CompilerEquivalenceProofMake(linkPlan.packageId,
+    if !ccsg.CompileReceiptEquivalent(currentReceipt, migrationReceipt):
+        echo(" compiler migration publish drift current_canonical_csg=" + layout.fixedBytes32Hex(currentCsg.canonicalGraphCid))
+        echo(" compiler migration publish drift migration_canonical_csg=" + layout.fixedBytes32Hex(migration.compilerCsg.canonicalGraphCid))
+        echo(" compiler migration publish drift current_canonical_output=" + layout.fixedBytes32Hex(currentReceipt.canonicalOutputDigest))
+        echo(" compiler migration publish drift migration_canonical_output=" + layout.fixedBytes32Hex(migrationReceipt.canonicalOutputDigest))
+        echo(" compiler migration publish drift current_receipt=" + layout.fixedBytes32Hex(currentReceipt.receiptCid))
+        echo(" compiler migration publish drift migration_receipt=" + layout.fixedBytes32Hex(migrationReceipt.receiptCid))
+    assert(ccsg.CompileReceiptEquivalent(currentReceipt, migrationReceipt),
+           " compiler migration publish: canonical receipt equivalent")
+    let currentSurface = ccsg.CompilerExportSurfaceFromCsg(currentCsg)
+    var proof: ceq.CompilerEquivalenceProof
+    let proofRes = ceq.CompilerEquivalenceProofMake(linkPlan.packageId,
                                                       "stable",
                                                       currentCsg.canonicalGraphCid,
                                                       migration.compilerCsg.canonicalGraphCid,
@@ -85,15 +92,15 @@ fn main(): int32 =
                                                       1,
                                                       1,
                                                       proof)
-    assert(IsOk(proofRes), "v3 compiler migration publish: proof make")
-    assert(ceq.v3CompilerEquivalencePassed(proof), "v3 compiler migration publish: proof passed")
+    assert(IsOk(proofRes), " compiler migration publish: proof make")
+    assert(ceq.CompilerEquivalencePassed(proof), " compiler migration publish: proof passed")
     var decisionChannel = ""
     var decisionGate = 0
     var decisionChecked = 0
     var decisionPassed = 0
     var decisionPublish = 0
     var decisionProofCid = layout.FixedBytes32()
-    let decisionRes = cpub.v3CompilerPublishDecisionEvaluate("stable",
+    let decisionRes = cpub.CompilerPublishDecisionEvaluate("stable",
                                                              worldHeadCid,
                                                              true,
                                                              proof,
@@ -103,10 +110,10 @@ fn main(): int32 =
                                                              decisionPassed,
                                                              decisionPublish,
                                                              decisionProofCid)
-    assert(IsOk(decisionRes), "v3 compiler migration publish: decision")
-    assert(decisionPublish != 0, "v3 compiler migration publish: stable allowed")
-    let proofReport = ceq.v3CompilerEquivalenceProofReport(proof)
-    assert(v3path.V3TextContains(proofReport, "equivalence_kind=canonical_semantic_identity"),
-           "v3 compiler migration publish: report kind")
-    echo("v3 compiler_migration_publish_smoke ok")
+    assert(IsOk(decisionRes), " compiler migration publish: decision")
+    assert(decisionPublish != 0, " compiler migration publish: stable allowed")
+    let proofReport = ceq.CompilerEquivalenceProofReport(proof)
+    assert(chengpath.TextContains(proofReport, "equivalence_kind=canonical_semantic_identity"),
+           " compiler migration publish: report kind")
+    echo(" compiler_migration_publish_smoke ok")
     return 0

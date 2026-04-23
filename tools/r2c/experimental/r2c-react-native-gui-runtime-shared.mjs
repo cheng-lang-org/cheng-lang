@@ -142,7 +142,7 @@ ${chunkBody}
   const head = `import ${execIoModule} as exec_io
 import std/json as json
 import std/strings as strings
-import cheng/core/tooling/path as v3path
+import cheng/core/tooling/path as chengpath
 
 @importc("driver_c_read_flag_value_bridge")
 fn r2cNativeGuiReadFlagValueBridge(key: str, outValue: var str): bool
@@ -436,7 +436,7 @@ fn r2cNativeGuiTryLoadCatalogPathFromContract(outPath: var str): bool =
     let contractPath = r2cNativeGuiReadFlag("--runtime-contract", "")
     if len(contractPath) <= 0:
         return false
-    let contractText = v3path.V3ReadTextFile("", contractPath)
+    let contractText = chengpath.ReadTextFile("", contractPath)
     if len(contractText) <= 0:
         return false
     let parseRes = json.ParseJsonSafe(contractText)
@@ -459,7 +459,7 @@ fn r2cNativeGuiTryLoadCatalogItems(out: var R2cNativeGuiItem[]): bool =
     var catalogPath: str
     if !r2cNativeGuiTryLoadCatalogPathFromContract(catalogPath):
         return false
-    let catalogText = v3path.V3ReadTextFile("", catalogPath)
+    let catalogText = chengpath.ReadTextFile("", catalogPath)
     if len(catalogText) <= 0:
         return false
     let parseRes = json.ParseJsonSafe(catalogText)

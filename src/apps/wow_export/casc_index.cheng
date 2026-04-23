@@ -1,0 +1,222 @@
+import std/bytes as bytes
+import std/os as os
+import std/result
+import std/strings as strings
+import std/strformat
+import cheng/apps/wow_export/binary as binary
+import cheng/apps/wow_export/build_info as build_info
+
+type
+    CascIndexEntry =
+        keyPrefix: str
+        archiveIndex: int32
+        offset: int32
+        size: int32
+
+    CascIndexSummary =
+        entryCount: int32
+        first: CascIndexEntry
+
+fn ReadBE24TopArchiveBits(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport index: truncated idxLow")
+    let b0: int32 = bytes.BufByteAt(buf, idx)
+    return Ok[int32](b0 / 64)
+
+fn ReadOffset30(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport index: truncated offset")
+    let b0: int32 = bytes.BufByteAt(buf, idx) & 63
+    let b1: int32 = bytes.BufByteAt(buf, idx + 1)
+    let b2: int32 = bytes.BufByteAt(buf, idx + 2)
+    let b3: int32 = bytes.BufByteAt(buf, idx + 3)
+    return Ok[int32]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
+
+fn ParseJournalIndex(buf: bytes.ByteBuffer): Result[CascIndexSummary] =
+    if buf.len < 16:
+        return Err[CascIndexSummary]("wowExport index: file too small")
+    let headerHashSize: int32 = bytes.ReadU32LEAt(buf, 0)
+    if headerHashSize < 0 || headerHashSize > buf.len:
+        return Err[CascIndexSummary]("wowExport index: invalid header hash size")
+    let headerEnd: int32 = 8 + headerHashSize
+    let aligned: int32 = ((headerEnd + 15) / 16) * 16
+    if aligned + 8 > buf.len:
+        return Err[CascIndexSummary]("wowExport index: truncated data header")
+    let dataLength: int32 = bytes.ReadU32LEAt(buf, aligned)
+    if dataLength <= 0:
+        return Err[CascIndexSummary]("wowExport index: empty data section")
+    if dataLength % 18 != 0:
+        return Err[CascIndexSummary]("wowExport index: entry section is not 18-byte aligned")
+    let entryStart: int32 = aligned + 8
+    if entryStart + dataLength > buf.len:
+        return Err[CascIndexSummary]("wowExport index: truncated entries")
+    let entryCount: int32 = dataLength / 18
+    if entryCount <= 0:
+        return Err[CascIndexSummary]("wowExport index: no entries")
+
+    let keyRes: Result[str] = binary.HexSlice(buf, entryStart, 9)
+    if IsErr(keyRes):
+        return Err[CascIndexSummary](Error(keyRes))
+    let idxHigh: int32 = bytes.BufByteAt(buf, entryStart + 9)
+    let topBitsRes: Result[int32] = ReadBE24TopArchiveBits(buf, entryStart + 10)
+    if IsErr(topBitsRes):
+        return Err[CascIndexSummary](Error(topBitsRes))
+    let offsetRes: Result[int32] = ReadOffset30(buf, entryStart + 10)
+    if IsErr(offsetRes):
+        return Err[CascIndexSummary](Error(offsetRes))
+    let size: int32 = bytes.ReadU32LEAt(buf, entryStart + 14)
+    if size < 0:
+        return Err[CascIndexSummary]("wowExport index: invalid first entry size")
+
+    var first: CascIndexEntry
+    first.keyPrefix = Value(keyRes)
+    first.archiveIndex = idxHigh * 4 + Value(topBitsRes)
+    first.offset = Value(offsetRes)
+    first.size = size
+    var out: CascIndexSummary
+    out.entryCount = entryCount
+    out.first = first
+    return Ok[CascIndexSummary](out)
+
+fn ParseEntryAt(buf: bytes.ByteBuffer, pos: int32): Result[CascIndexEntry] =
+    if pos < 0 || pos + 18 > buf.len:
+        return Err[CascIndexEntry]("wowExport index: entry out of bounds")
+    let keyRes: Result[str] = binary.HexSlice(buf, pos, 9)
+    if IsErr(keyRes):
+        return Err[CascIndexEntry](Error(keyRes))
+    let idxHigh: int32 = bytes.BufByteAt(buf, pos + 9)
+    let topBitsRes: Result[int32] = ReadBE24TopArchiveBits(buf, pos + 10)
+    if IsErr(topBitsRes):
+        return Err[CascIndexEntry](Error(topBitsRes))
+    let offsetRes: Result[int32] = ReadOffset30(buf, pos + 10)
+    if IsErr(offsetRes):
+        return Err[CascIndexEntry](Error(offsetRes))
+    let size: int32 = bytes.ReadU32LEAt(buf, pos + 14)
+    if size < 0:
+        return Err[CascIndexEntry]("wowExport index: invalid entry size")
+    var out: CascIndexEntry
+    out.keyPrefix = Value(keyRes)
+    out.archiveIndex = idxHigh * 4 + Value(topBitsRes)
+    out.offset = Value(offsetRes)
+    out.size = size
+    return Ok[CascIndexEntry](out)
+
+fn HexCharValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn KeyPrefixByte(keyPrefix: str, byteIndex: int32): int32 =
+    let pos: int32 = byteIndex * 2
+    if pos < 0 || pos + 1 >= strings.Len(keyPrefix):
+        return -1
+    let hi: int32 = HexCharValue(keyPrefix[pos])
+    let lo: int32 = HexCharValue(keyPrefix[pos + 1])
+    if hi < 0 || lo < 0:
+        return -1
+    return (hi << 4) | lo
+
+fn EntryKeyMatches(buf: bytes.ByteBuffer, pos: int32, keyPrefix: str): bool =
+    if pos < 0 || pos + 9 > buf.len:
+        return false
+    var i: int32
+    while i < 9:
+        let want: int32 = KeyPrefixByte(keyPrefix, i)
+        if want < 0:
+            return false
+        if bytes.BufByteAt(buf, pos + i) != want:
+            return false
+        i = i + 1
+    return true
+
+fn FindJournalIndexEntry(buf: bytes.ByteBuffer, keyPrefix: str): Result[CascIndexEntry] =
+    if strings.Len(keyPrefix) != 18:
+        return Err[CascIndexEntry]("wowExport index: key prefix must be 18 hex chars")
+    if buf.len < 16:
+        return Err[CascIndexEntry]("wowExport index: file too small")
+    let headerHashSize: int32 = bytes.ReadU32LEAt(buf, 0)
+    if headerHashSize < 0 || headerHashSize > buf.len:
+        return Err[CascIndexEntry]("wowExport index: invalid header hash size")
+    let headerEnd: int32 = 8 + headerHashSize
+    let aligned: int32 = ((headerEnd + 15) / 16) * 16
+    if aligned + 8 > buf.len:
+        return Err[CascIndexEntry]("wowExport index: truncated data header")
+    let dataLength: int32 = bytes.ReadU32LEAt(buf, aligned)
+    if dataLength <= 0 || dataLength % 18 != 0:
+        return Err[CascIndexEntry]("wowExport index: invalid entry section")
+    let entryStart: int32 = aligned + 8
+    if entryStart + dataLength > buf.len:
+        return Err[CascIndexEntry]("wowExport index: truncated entries")
+    let entryCount: int32 = dataLength / 18
+    var i: int32
+    while i < entryCount:
+        let pos: int32 = entryStart + i * 18
+        if EntryKeyMatches(buf, pos, keyPrefix):
+            return ParseEntryAt(buf, pos)
+        i = i + 1
+    return Err[CascIndexEntry](Fmt"wowExport index: key prefix not found {keyPrefix}")
+
+fn LoadFirstJournalIndexSummary(clientPath: str): Result[CascIndexSummary] =
+    let dataDir: str = build_info.DataDataPath(clientPath)
+    if !os.DirExists(dataDir):
+        return Err[CascIndexSummary](Fmt"wowExport index: missing data dir {dataDir}")
+    let names: str[] = os.ListDir(dataDir)
+    var i: int32
+    while i < names.len:
+        let name: str = names[i]
+        if strings.HasSuffix(name, ".idx"):
+            let path: str = os.JoinPath(dataDir, name)
+            let buf: bytes.ByteBuffer = bytes.ReadFileBytes(path)
+            if buf.len <= 0:
+                return Err[CascIndexSummary](Fmt"wowExport index: failed to read {path}")
+            return ParseJournalIndex(buf)
+        i = i + 1
+    return Err[CascIndexSummary](Fmt"wowExport index: no .idx files in {dataDir}")
+
+fn EncodingKeyPrefix(encodingKey: str): Result[str] =
+    if strings.Len(encodingKey) < 18:
+        return Err[str]("wowExport index: encoding key too short")
+    return Ok[str](strings.SliceBytes(encodingKey, 0, 18))
+
+fn LoadLocalIndexEntry(clientPath: str, encodingKey: str): Result[CascIndexEntry] =
+    let prefixRes: Result[str] = EncodingKeyPrefix(encodingKey)
+    if IsErr(prefixRes):
+        return Err[CascIndexEntry](Error(prefixRes))
+    let prefix: str = Value(prefixRes)
+    let dataDir: str = build_info.DataDataPath(clientPath)
+    if !os.DirExists(dataDir):
+        return Err[CascIndexEntry](Fmt"wowExport index: missing data dir {dataDir}")
+    let names: str[] = os.ListDir(dataDir)
+    var i: int32
+    while i < names.len:
+        let name: str = names[i]
+        if strings.HasSuffix(name, ".idx"):
+            let path: str = os.JoinPath(dataDir, name)
+            let buf: bytes.ByteBuffer = bytes.ReadFileBytes(path)
+            if buf.len <= 0:
+                return Err[CascIndexEntry](Fmt"wowExport index: failed to read {path}")
+            let entryRes: Result[CascIndexEntry] = FindJournalIndexEntry(buf, prefix)
+            if IsOk(entryRes):
+                return entryRes
+        i = i + 1
+    return Err[CascIndexEntry](Fmt"wowExport index: local encoding key not found {encodingKey}")
+
+fn DataArchivePath(clientPath: str, archiveIndex: int32): Result[str] =
+    if archiveIndex < 0 || archiveIndex > 999:
+        return Err[str]("wowExport index: archive index out of supported range")
+    var idText: str = strings.IntToStr(archiveIndex)
+    if archiveIndex < 10:
+        idText = Fmt"00{idText}"
+    elif archiveIndex < 100:
+        idText = Fmt"0{idText}"
+    return Ok[str](os.JoinPath(build_info.DataDataPath(clientPath), Fmt"data.{idText}"))
+
+fn CascIndexSummaryText(summary: CascIndexSummary): str =
+    return Fmt"entries={strings.IntToStr(summary.entryCount)} firstKey={summary.first.keyPrefix} archive={strings.IntToStr(summary.first.archiveIndex)} offset={strings.IntToStr(summary.first.offset)} size={strings.IntToStr(summary.first.size)}"
+
+fn CascIndexEntryText(entry: CascIndexEntry): str =
+    return Fmt"key={entry.keyPrefix} archive={strings.IntToStr(entry.archiveIndex)} offset={strings.IntToStr(entry.offset)} size={strings.IntToStr(entry.size)}"

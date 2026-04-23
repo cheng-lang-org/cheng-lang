@@ -22,10 +22,10 @@ function resolveWorkspaceRoot() {
   const scriptName = path.basename(scriptPath);
   let current = path.dirname(scriptPath);
   while (true) {
-    const mirroredScriptPath = path.join(current, 'v3', 'experimental', 'r2c-react', scriptName);
-    if (fs.existsSync(path.join(current, 'v3', 'src')) &&
-        fs.existsSync(path.join(current, 'src', 'runtime')) &&
-        fs.existsSync(mirroredScriptPath)) {
+    const repoScriptPath = path.join(current, 'tools', 'r2c', 'experimental', scriptName);
+    if (fs.existsSync(path.join(current, 'cheng-package.toml')) &&
+        fs.existsSync(path.join(current, 'src', 'core')) &&
+        fs.existsSync(repoScriptPath)) {
       return current;
     }
     const parent = path.dirname(current);
@@ -41,22 +41,18 @@ function writeText(filePath, text) {
 }
 
 function resolveDefaultToolingBin(workspaceRoot) {
-  const explicit = String(process.env.R2C_REACT_V3_TOOLING_BIN || '').trim();
+  const explicit = String(process.env.R2C_REACT_TOOLING_BIN || '').trim();
   if (explicit) return explicit;
-  const stage3 = path.join(workspaceRoot, 'artifacts', 'v3_bootstrap', 'cheng.stage3');
+  const stage3 = path.join(workspaceRoot, 'artifacts', 'bootstrap', 'cheng.stage3');
   if (fs.existsSync(stage3)) return stage3;
-  return path.join(workspaceRoot, 'artifacts', 'v3_backend_driver', 'cheng');
+  return path.join(workspaceRoot, 'artifacts', 'backend_driver', 'cheng');
 }
 
 function ensurePackageCompileSupport(workspaceRoot, packageRoot) {
-  const v3Link = path.join(packageRoot, 'v3');
   const runtimeRoot = path.join(packageRoot, 'src', 'runtime');
   const nativeLink = path.join(runtimeRoot, 'native');
   const stdLink = path.join(packageRoot, 'src', 'std');
   fs.mkdirSync(runtimeRoot, { recursive: true });
-  if (!fs.existsSync(v3Link)) {
-    fs.symlinkSync(path.join(workspaceRoot, 'v3'), v3Link);
-  }
   if (!fs.existsSync(nativeLink)) {
     fs.symlinkSync(path.join(workspaceRoot, 'src', 'runtime', 'native'), nativeLink);
   }

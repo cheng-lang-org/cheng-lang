@@ -1,0 +1,116 @@
+import std/os as os
+import std/result
+import std/seqs
+import std/strings as strings
+import std/strformat
+import std/strutils as strutils
+
+type
+    WowBuildEntry =
+        branch: str
+        active: bool
+        buildKey: str
+        cdnKey: str
+        installKey: str
+        cdnPath: str
+        cdnHosts: str
+        cdnServers: str
+        tags: str
+        version: str
+        keyRing: str
+        product: str
+
+const
+    DefaultClientPath = "/Volumes/NVMeSSD1T/World of Warcraft"
+    DefaultProduct = "wow"
+    DefaultVersion = "12.0.5.67165"
+    DefaultBuildKey = "02482dc9c788698c83e7ae0e24ab2bb7"
+    DefaultLocale = "zhCN"
+
+fn BuildInfoPath(clientPath: str): str =
+    return os.JoinPath(clientPath, ".build.info")
+
+fn DataPath(clientPath: str): str =
+    return os.JoinPath(clientPath, "Data")
+
+fn ConfigPathForKey(clientPath: str, key: str): Result[str] =
+    if strings.Len(key) != 32:
+        return Err[str]("wowExport build-info: config key must be 32 hex chars")
+    let a: str = strings.SliceBytes(key, 0, 2)
+    let b: str = strings.SliceBytes(key, 2, 2)
+    return Ok[str](os.JoinPath(os.JoinPath(os.JoinPath(DataPath(clientPath), "config"), a), os.JoinPath(b, key)))
+
+fn DataDataPath(clientPath: str): str =
+    return os.JoinPath(DataPath(clientPath), "data")
+
+fn Field(parts: str[], idx: int32): str =
+    if idx < 0 || idx >= parts.len:
+        return ""
+    return strutils.Strip(parts[idx])
+
+fn ParseBuildInfoText(text: str): Result[WowBuildEntry[]] =
+    if strings.Len(text) == 0:
+        return Err[WowBuildEntry[]]("wowExport build-info: empty .build.info")
+    let lines: str[] = strutils.Split(text, '\n')
+    var out: WowBuildEntry[]
+    var i: int32
+    while i < lines.len:
+        let line: str = strutils.Strip(lines[i])
+        if strings.Len(line) == 0:
+            i = i + 1
+            continue
+        if strutils.Contains(line, "Build Key!"):
+            i = i + 1
+            continue
+        let parts: str[] = strutils.Split(line, '|')
+        if parts.len < 15:
+            return Err[WowBuildEntry[]](Fmt"wowExport build-info: malformed row at line={strings.IntToStr(i + 1)}")
+        var entry: WowBuildEntry
+        entry.branch = Field(parts, 0)
+        entry.active = Field(parts, 1) == "1"
+        entry.buildKey = Field(parts, 2)
+        entry.cdnKey = Field(parts, 3)
+        entry.installKey = Field(parts, 4)
+        entry.cdnPath = Field(parts, 6)
+        entry.cdnHosts = Field(parts, 7)
+        entry.cdnServers = Field(parts, 8)
+        entry.tags = Field(parts, 9)
+        entry.version = Field(parts, 12)
+        entry.keyRing = Field(parts, 13)
+        entry.product = Field(parts, 14)
+        add(out, entry)
+        i = i + 1
+    if out.len == 0:
+        return Err[WowBuildEntry[]]("wowExport build-info: no build rows")
+    return Ok[WowBuildEntry[]](out)
+
+fn LoadBuildInfo(clientPath: str): Result[WowBuildEntry[]] =
+    let path: str = BuildInfoPath(clientPath)
+    if !os.FileExists(path):
+        return Err[WowBuildEntry[]](Fmt"wowExport build-info: missing {path}")
+    let text: str = os.ReadFile(path)
+    return ParseBuildInfoText(text)
+
+fn FindBuild(entries: WowBuildEntry[], product: str, version: str): Result[WowBuildEntry] =
+    var i: int32
+    while i < entries.len:
+        let entry: WowBuildEntry = entries[i]
+        if entry.product == product && entry.version == version && entry.active:
+            return Ok[WowBuildEntry](entry)
+        i = i + 1
+    return Err[WowBuildEntry](Fmt"wowExport build-info: active build not found product={product} version={version}")
+
+fn ProbeRetailDefault(): Result[WowBuildEntry] =
+    let entriesRes: Result[WowBuildEntry[]] = LoadBuildInfo(DefaultClientPath)
+    if IsErr(entriesRes):
+        return Err[WowBuildEntry](Error(entriesRes))
+    let buildRes: Result[WowBuildEntry] = FindBuild(Value(entriesRes), DefaultProduct, DefaultVersion)
+    if IsErr(buildRes):
+        return buildRes
+    let entry: WowBuildEntry = Value(buildRes)
+    if entry.buildKey != DefaultBuildKey:
+        return Err[WowBuildEntry](Fmt"wowExport build-info: build key mismatch expected={DefaultBuildKey} got={entry.buildKey}")
+    return Ok[WowBuildEntry](entry)
+
+fn BuildSummary(entry: WowBuildEntry): str =
+    return Fmt"product={entry.product} version={entry.version} branch={entry.branch} buildKey={entry.buildKey} cdnKey={entry.cdnKey}"

@@ -1,0 +1,251 @@
+import std/rawbytes
+import std/result
+
+fn hexValue(ch: int32): int32 =
+    if ch >= int32('0') && ch <= int32('9'):
+        return ch - int32('0')
+    if ch >= int32('a') && ch <= int32('f'):
+        return 10 + ch - int32('a')
+    if ch >= int32('A') && ch <= int32('F'):
+        return 10 + ch - int32('A')
+    return -1
+
+fn BytesFromHex(text: str): Result[rawbytes.Bytes] =
+    let textLen: int32 = len(text)
+    if textLen == 0:
+        return Ok[rawbytes.Bytes](rawbytes.EmptyBytes())
+    if (textLen % 2) != 0:
+        return Err[rawbytes.Bytes]("wowExport Salsa20: invalid hex length")
+    let textBytes: rawbytes.Bytes = rawbytes.BytesFromString(text)
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(textLen / 2)
+    var i: int32
+    while i < textLen:
+        let hi: int32 = hexValue(rawbytes.BytesGet(textBytes, i))
+        let lo: int32 = hexValue(rawbytes.BytesGet(textBytes, i + 1))
+        if hi < 0 || lo < 0:
+            return Err[rawbytes.Bytes]("wowExport Salsa20: invalid hex byte")
+        rawbytes.BytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[rawbytes.Bytes](out)
+
+fn u32(x: int64): int64 =
+    return x & int64(0xffffffff)
+
+fn rotl32(x: int64, n: int32): int64 =
+    let v: int64 = u32(x)
+    return u32((v << n) | (v >> (32 - n)))
+
+fn getU32LE(data: rawbytes.Bytes, offset: int32): int64 =
+    let b0: int64 = int64(rawbytes.BytesGet(data, offset))
+    let b1: int64 = int64(rawbytes.BytesGet(data, offset + 1))
+    let b2: int64 = int64(rawbytes.BytesGet(data, offset + 2))
+    let b3: int64 = int64(rawbytes.BytesGet(data, offset + 3))
+    return u32(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
+fn putU32LE(out: var rawbytes.Bytes, offset: int32, value: int64) =
+    let v: int64 = u32(value)
+    rawbytes.BytesSet(out, offset, int32(v & 255))
+    rawbytes.BytesSet(out, offset + 1, int32((v >> 8) & 255))
+    rawbytes.BytesSet(out, offset + 2, int32((v >> 16) & 255))
+    rawbytes.BytesSet(out, offset + 3, int32((v >> 24) & 255))
+
+fn sigmaWord(keyLen: int32, idx: int32): int64 =
+    if keyLen == 16:
+        if idx == 0: return int64(0x61707865)
+        if idx == 1: return int64(0x3120646e)
+        if idx == 2: return int64(0x79622d36)
+        return int64(0x6b206574)
+    if idx == 0: return int64(0x61707865)
+    if idx == 1: return int64(0x3320646e)
+    if idx == 2: return int64(0x79622d32)
+    return int64(0x6b206574)
+
+fn keyWord(key: rawbytes.Bytes, wordIndex: int32): int64 =
+    let keyLen: int32 = rawbytes.BytesLen(key)
+    if keyLen == 16 && wordIndex >= 4:
+        return getU32LE(key, (wordIndex - 4) * 4)
+    return getU32LE(key, wordIndex * 4)
+
+fn Salsa20Block(key: rawbytes.Bytes,
+                nonce: rawbytes.Bytes,
+                counter0: int64,
+                counter1: int64): Result[rawbytes.Bytes] =
+    let keyLen: int32 = rawbytes.BytesLen(key)
+    if keyLen != 16 && keyLen != 32:
+        return Err[rawbytes.Bytes]("wowExport Salsa20: key must be 16 or 32 bytes")
+    if rawbytes.BytesLen(nonce) != 8:
+        return Err[rawbytes.Bytes]("wowExport Salsa20: nonce must be 8 bytes")
+
+    let j0: int64 = sigmaWord(keyLen, 0)
+    let j1: int64 = keyWord(key, 0)
+    let j2: int64 = keyWord(key, 1)
+    let j3: int64 = keyWord(key, 2)
+    let j4: int64 = keyWord(key, 3)
+    let j5: int64 = sigmaWord(keyLen, 1)
+    let j6: int64 = getU32LE(nonce, 0)
+    let j7: int64 = getU32LE(nonce, 4)
+    let j8: int64 = u32(counter0)
+    let j9: int64 = u32(counter1)
+    let j10: int64 = sigmaWord(keyLen, 2)
+    let j11: int64 = keyWord(key, 4)
+    let j12: int64 = keyWord(key, 5)
+    let j13: int64 = keyWord(key, 6)
+    let j14: int64 = keyWord(key, 7)
+    let j15: int64 = sigmaWord(keyLen, 3)
+
+    var x0: int64 = j0
+    var x1: int64 = j1
+    var x2: int64 = j2
+    var x3: int64 = j3
+    var x4: int64 = j4
+    var x5: int64 = j5
+    var x6: int64 = j6
+    var x7: int64 = j7
+    var x8: int64 = j8
+    var x9: int64 = j9
+    var x10: int64 = j10
+    var x11: int64 = j11
+    var x12: int64 = j12
+    var x13: int64 = j13
+    var x14: int64 = j14
+    var x15: int64 = j15
+
+    var round: int32
+    while round < 20:
+        var u: int64 = u32(x0 + x12)
+        x4 = u32(x4 ^ rotl32(u, 7))
+        u = u32(x4 + x0)
+        x8 = u32(x8 ^ rotl32(u, 9))
+        u = u32(x8 + x4)
+        x12 = u32(x12 ^ rotl32(u, 13))
+        u = u32(x12 + x8)
+        x0 = u32(x0 ^ rotl32(u, 18))
+
+        u = u32(x5 + x1)
+        x9 = u32(x9 ^ rotl32(u, 7))
+        u = u32(x9 + x5)
+        x13 = u32(x13 ^ rotl32(u, 9))
+        u = u32(x13 + x9)
+        x1 = u32(x1 ^ rotl32(u, 13))
+        u = u32(x1 + x13)
+        x5 = u32(x5 ^ rotl32(u, 18))
+
+        u = u32(x10 + x6)
+        x14 = u32(x14 ^ rotl32(u, 7))
+        u = u32(x14 + x10)
+        x2 = u32(x2 ^ rotl32(u, 9))
+        u = u32(x2 + x14)
+        x6 = u32(x6 ^ rotl32(u, 13))
+        u = u32(x6 + x2)
+        x10 = u32(x10 ^ rotl32(u, 18))
+
+        u = u32(x15 + x11)
+        x3 = u32(x3 ^ rotl32(u, 7))
+        u = u32(x3 + x15)
+        x7 = u32(x7 ^ rotl32(u, 9))
+        u = u32(x7 + x3)
+        x11 = u32(x11 ^ rotl32(u, 13))
+        u = u32(x11 + x7)
+        x15 = u32(x15 ^ rotl32(u, 18))
+
+        u = u32(x0 + x3)
+        x1 = u32(x1 ^ rotl32(u, 7))
+        u = u32(x1 + x0)
+        x2 = u32(x2 ^ rotl32(u, 9))
+        u = u32(x2 + x1)
+        x3 = u32(x3 ^ rotl32(u, 13))
+        u = u32(x3 + x2)
+        x0 = u32(x0 ^ rotl32(u, 18))
+
+        u = u32(x5 + x4)
+        x6 = u32(x6 ^ rotl32(u, 7))
+        u = u32(x6 + x5)
+        x7 = u32(x7 ^ rotl32(u, 9))
+        u = u32(x7 + x6)
+        x4 = u32(x4 ^ rotl32(u, 13))
+        u = u32(x4 + x7)
+        x5 = u32(x5 ^ rotl32(u, 18))
+
+        u = u32(x10 + x9)
+        x11 = u32(x11 ^ rotl32(u, 7))
+        u = u32(x11 + x10)
+        x8 = u32(x8 ^ rotl32(u, 9))
+        u = u32(x8 + x11)
+        x9 = u32(x9 ^ rotl32(u, 13))
+        u = u32(x9 + x8)
+        x10 = u32(x10 ^ rotl32(u, 18))
+
+        u = u32(x15 + x14)
+        x12 = u32(x12 ^ rotl32(u, 7))
+        u = u32(x12 + x15)
+        x13 = u32(x13 ^ rotl32(u, 9))
+        u = u32(x13 + x12)
+        x14 = u32(x14 ^ rotl32(u, 13))
+        u = u32(x14 + x13)
+        x15 = u32(x15 ^ rotl32(u, 18))
+        round = round + 2
+
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(64)
+    putU32LE(out, 0, u32(x0 + j0))
+    putU32LE(out, 4, u32(x1 + j1))
+    putU32LE(out, 8, u32(x2 + j2))
+    putU32LE(out, 12, u32(x3 + j3))
+    putU32LE(out, 16, u32(x4 + j4))
+    putU32LE(out, 20, u32(x5 + j5))
+    putU32LE(out, 24, u32(x6 + j6))
+    putU32LE(out, 28, u32(x7 + j7))
+    putU32LE(out, 32, u32(x8 + j8))
+    putU32LE(out, 36, u32(x9 + j9))
+    putU32LE(out, 40, u32(x10 + j10))
+    putU32LE(out, 44, u32(x11 + j11))
+    putU32LE(out, 48, u32(x12 + j12))
+    putU32LE(out, 52, u32(x13 + j13))
+    putU32LE(out, 56, u32(x14 + j14))
+    putU32LE(out, 60, u32(x15 + j15))
+    return Ok[rawbytes.Bytes](out)
+
+fn Salsa20Keystream(key: rawbytes.Bytes, nonce: rawbytes.Bytes, count: int32): Result[rawbytes.Bytes] =
+    if count < 0:
+        return Err[rawbytes.Bytes]("wowExport Salsa20: negative byte count")
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(count)
+    var produced: int32
+    var c0: int64
+    var c1: int64
+    while produced < count:
+        let blockRes: Result[rawbytes.Bytes] = Salsa20Block(key, nonce, c0, c1)
+        if IsErr(blockRes):
+            return Err[rawbytes.Bytes](Error(blockRes))
+        let block: rawbytes.Bytes = Value(blockRes)
+        var i: int32
+        while i < 64 && produced < count:
+            rawbytes.BytesSet(out, produced, rawbytes.BytesGet(block, i))
+            produced = produced + 1
+            i = i + 1
+        c0 = u32(c0 + int64(1))
+        if c0 == int64(0):
+            c1 = u32(c1 + int64(1))
+    return Ok[rawbytes.Bytes](out)
+
+fn Salsa20Xor(key: rawbytes.Bytes, nonce: rawbytes.Bytes, input: rawbytes.Bytes): Result[rawbytes.Bytes] =
+    let streamRes: Result[rawbytes.Bytes] = Salsa20Keystream(key, nonce, rawbytes.BytesLen(input))
+    if IsErr(streamRes):
+        return Err[rawbytes.Bytes](Error(streamRes))
+    let stream: rawbytes.Bytes = Value(streamRes)
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(rawbytes.BytesLen(input))
+    var i: int32
+    while i < rawbytes.BytesLen(input):
+        rawbytes.BytesSet(out, i, rawbytes.BytesGet(input, i) ^ rawbytes.BytesGet(stream, i))
+        i = i + 1
+    return Ok[rawbytes.Bytes](out)
+
+fn Salsa20XorHexKey(keyHex: str, nonce: rawbytes.Bytes, input: rawbytes.Bytes): Result[rawbytes.Bytes] =
+    let keyRes: Result[rawbytes.Bytes] = BytesFromHex(keyHex)
+    if IsErr(keyRes):
+        return Err[rawbytes.Bytes](Error(keyRes))
+    return Salsa20Xor(Value(keyRes), nonce, input)
+
+fn Salsa20KeystreamHex(key: rawbytes.Bytes, nonce: rawbytes.Bytes, count: int32): Result[str] =
+    let streamRes: Result[rawbytes.Bytes] = Salsa20Keystream(key, nonce, count)
+    if IsErr(streamRes):
+        return Err[str](Error(streamRes))
+    return Ok[str](rawbytes.BytesToHex(Value(streamRes)))

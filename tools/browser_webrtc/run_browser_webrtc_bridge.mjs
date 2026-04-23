@@ -40,7 +40,7 @@ async function launchRuntimePage() {
   });
   const page = await browser.newPage();
   await page.goto(pathToFileURL(htmlPath).href);
-  await page.waitForFunction(() => !!window.v3BrowserWebrtcDatachannelRuntime);
+  await page.waitForFunction(() => !!window.BrowserWebrtcDatachannelRuntime);
   return { browser, page };
 }
 
@@ -69,7 +69,7 @@ async function runSessionBridge() {
       try {
         if (req.command === "open") {
           const result = await page.evaluate(async (input) => {
-            return window.v3BrowserWebrtcDatachannelRuntime.openSession(input);
+            return window.BrowserWebrtcDatachannelRuntime.openSession(input);
           }, {
             policyBytes: Array.from(bytesFromHex(req.policyHex || "")),
             label: Buffer.from(req.labelHex || "", "hex").toString("utf8")
@@ -82,7 +82,7 @@ async function runSessionBridge() {
         }
         if (req.command === "exchange") {
           const result = await page.evaluate(async (input) => {
-            return window.v3BrowserWebrtcDatachannelRuntime.exchangeSession(input);
+            return window.BrowserWebrtcDatachannelRuntime.exchangeSession(input);
           }, {
             protocolBytes: Array.from(bytesFromHex(req.protocolHex || "")),
             requestBytes: Array.from(bytesFromHex(req.requestHex || "")),
@@ -96,14 +96,14 @@ async function runSessionBridge() {
         }
         if (req.command === "close") {
           await page.evaluate(async () => {
-            return window.v3BrowserWebrtcDatachannelRuntime.closeSession();
+            return window.BrowserWebrtcDatachannelRuntime.closeSession();
           });
           await send({ ok: true });
           break;
         }
         await send({
           ok: false,
-          errHex: bytesToHex(Buffer.from("v3 browser webrtc: unknown session command", "utf8"))
+          errHex: bytesToHex(Buffer.from("browser webrtc: unknown session command", "utf8"))
         });
       } catch (err) {
         const text = err instanceof Error ? `${err.message}\n${err.stack || ""}` : String(err);
@@ -135,7 +135,7 @@ async function main() {
     const { browser, page } = await launchRuntimePage();
     try {
       const result = await page.evaluate(async (input) => {
-        return window.v3BrowserWebrtcDatachannelRuntime.runBridge(input);
+        return window.BrowserWebrtcDatachannelRuntime.runBridge(input);
       }, {
         protocolBytes: Array.from(protocolBytes),
         policyBytes: Array.from(policyBytes),

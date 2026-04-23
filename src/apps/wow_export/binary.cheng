@@ -1,0 +1,137 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import std/strformat
+
+type
+    BinaryReader =
+        buf: bytes.ByteBuffer
+        pos: int32
+
+fn ReaderFromBytes(buf: bytes.ByteBuffer): BinaryReader =
+    var out: BinaryReader
+    out.buf = buf
+    out.pos = 0
+    return out
+
+fn ReaderLen(r: BinaryReader): int32 =
+    return r.buf.len
+
+fn ReaderPos(r: BinaryReader): int32 =
+    return r.pos
+
+fn Remaining(r: BinaryReader): int32 =
+    if r.pos >= r.buf.len:
+        return 0
+    return r.buf.len - r.pos
+
+fn CanRead(r: BinaryReader, count: int32): bool =
+    if count < 0:
+        return false
+    if r.pos < 0:
+        return false
+    return r.pos + count <= r.buf.len
+
+fn Seek(r: var BinaryReader, pos: int32): Result[bool] =
+    if pos < 0 || pos > r.buf.len:
+        return Err[bool](Fmt"wowExport binary: seek out of bounds pos={strings.IntToStr(pos)} len={strings.IntToStr(r.buf.len)}")
+    r.pos = pos
+    return Ok[bool](true)
+
+fn Skip(r: var BinaryReader, count: int32): Result[bool] =
+    return Seek(r, r.pos + count)
+
+fn ReadU8(r: var BinaryReader): Result[int32] =
+    if !CanRead(r, 1):
+        return Err[int32]("wowExport binary: truncated u8")
+    let v: int32 = bytes.BufByteAt(r.buf, r.pos)
+    r.pos = r.pos + 1
+    return Ok[int32](v)
+
+fn ReadU16LE(r: var BinaryReader): Result[int32] =
+    if !CanRead(r, 2):
+        return Err[int32]("wowExport binary: truncated u16le")
+    let b0: int32 = bytes.BufByteAt(r.buf, r.pos)
+    let b1: int32 = bytes.BufByteAt(r.buf, r.pos + 1)
+    r.pos = r.pos + 2
+    return Ok[int32](b0 + (b1 << 8))
+
+fn ReadU32LE(r: var BinaryReader): Result[int32] =
+    if !CanRead(r, 4):
+        return Err[int32]("wowExport binary: truncated u32le")
+    let b0: int32 = bytes.BufByteAt(r.buf, r.pos)
+    let b1: int32 = bytes.BufByteAt(r.buf, r.pos + 1)
+    let b2: int32 = bytes.BufByteAt(r.buf, r.pos + 2)
+    let b3: int32 = bytes.BufByteAt(r.buf, r.pos + 3)
+    r.pos = r.pos + 4
+    return Ok[int32](b0 + (b1 << 8) + (b2 << 16) + (b3 << 24))
+
+fn ReadU32BE(r: var BinaryReader): Result[int32] =
+    if !CanRead(r, 4):
+        return Err[int32]("wowExport binary: truncated u32be")
+    let b0: int32 = bytes.BufByteAt(r.buf, r.pos)
+    let b1: int32 = bytes.BufByteAt(r.buf, r.pos + 1)
+    let b2: int32 = bytes.BufByteAt(r.buf, r.pos + 2)
+    let b3: int32 = bytes.BufByteAt(r.buf, r.pos + 3)
+    r.pos = r.pos + 4
+    return Ok[int32]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
+
+fn HexNibble(v: int32): str =
+    let n: int32 = v & 15
+    if n == 0: return "0"
+    if n == 1: return "1"
+    if n == 2: return "2"
+    if n == 3: return "3"
+    if n == 4: return "4"
+    if n == 5: return "5"
+    if n == 6: return "6"
+    if n == 7: return "7"
+    if n == 8: return "8"
+    if n == 9: return "9"
+    if n == 10: return "a"
+    if n == 11: return "b"
+    if n == 12: return "c"
+    if n == 13: return "d"
+    if n == 14: return "e"
+    return "f"
+
+fn HexByte(v: int32): str =
+    return Fmt"{HexNibble(v >> 4)}{HexNibble(v)}"
+
+fn ReadHex(r: var BinaryReader, count: int32): Result[str] =
+    if count < 0:
+        return Err[str]("wowExport binary: negative hex count")
+    if !CanRead(r, count):
+        return Err[str]("wowExport binary: truncated hex")
+    var out: str
+    var i: int32
+    while i < count:
+        let b: int32 = bytes.BufByteAt(r.buf, r.pos + i)
+        out = Fmt"{out}{HexByte(b)}"
+        i = i + 1
+    r.pos = r.pos + count
+    return Ok[str](out)
+
+fn ReadFourCC(r: var BinaryReader): Result[str] =
+    if !CanRead(r, 4):
+        return Err[str]("wowExport binary: truncated fourcc")
+    var out: str
+    var i: int32
+    while i < 4:
+        let b: int32 = bytes.BufByteAt(r.buf, r.pos + i)
+        out = Fmt"{out}{strings.CharToStr(char(b))}"
+        i = i + 1
+    r.pos = r.pos + 4
+    return Ok[str](out)
+
+fn ByteAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx >= buf.len:
+        return Err[int32](Fmt"wowExport binary: byte index out of bounds idx={strings.IntToStr(idx)} len={strings.IntToStr(buf.len)}")
+    return Ok[int32](bytes.BufByteAt(buf, idx))
+
+fn HexSlice(buf: bytes.ByteBuffer, start: int32, count: int32): Result[str] =
+    var r: BinaryReader = ReaderFromBytes(buf)
+    let seekRes: Result[bool] = Seek(r, start)
+    if IsErr(seekRes):
+        return Err[str](Error(seekRes))
+    return ReadHex(r, count)

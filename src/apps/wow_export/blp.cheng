@@ -1,0 +1,57 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import std/strformat
+
+type
+    Blp2Header =
+        version: int32
+        encoding: int32
+        alphaDepth: int32
+        alphaEncoding: int32
+        mipCount: int32
+        width: int32
+        height: int32
+        firstMipOffset: int32
+        firstMipSize: int32
+
+fn CheckBlp2Magic(buf: bytes.ByteBuffer): bool =
+    if buf.len < 4:
+        return false
+    return bytes.BufByteAt(buf, 0) == 0x42 &&
+        bytes.BufByteAt(buf, 1) == 0x4c &&
+        bytes.BufByteAt(buf, 2) == 0x50 &&
+        bytes.BufByteAt(buf, 3) == 0x32
+
+fn ParseBlp2Header(buf: bytes.ByteBuffer): Result[Blp2Header] =
+    if buf.len < 156:
+        return Err[Blp2Header]("wowExport BLP2: header too small")
+    if !CheckBlp2Magic(buf):
+        return Err[Blp2Header]("wowExport BLP2: invalid magic")
+    var out: Blp2Header
+    out.version = bytes.ReadU32LEAt(buf, 4)
+    out.encoding = bytes.BufByteAt(buf, 8)
+    out.alphaDepth = bytes.BufByteAt(buf, 9)
+    out.alphaEncoding = bytes.BufByteAt(buf, 10)
+    out.mipCount = bytes.BufByteAt(buf, 11)
+    out.width = bytes.ReadU32LEAt(buf, 12)
+    out.height = bytes.ReadU32LEAt(buf, 16)
+    out.firstMipOffset = bytes.ReadU32LEAt(buf, 20)
+    out.firstMipSize = bytes.ReadU32LEAt(buf, 84)
+    if out.version != 1:
+        return Err[Blp2Header](Fmt"wowExport BLP2: unsupported type/version {strings.IntToStr(out.version)}")
+    if out.width <= 0 || out.height <= 0:
+        return Err[Blp2Header]("wowExport BLP2: invalid dimensions")
+    return Ok[Blp2Header](out)
+
+fn BlpEncodingText(header: Blp2Header): str =
+    if header.encoding == 1:
+        return "palette"
+    if header.encoding == 2:
+        return "dxt"
+    if header.encoding == 3:
+        return "bgra"
+    return Fmt"unknown-{strings.IntToStr(header.encoding)}"
+
+fn BlpHeaderText(header: Blp2Header): str =
+    return Fmt"{strings.IntToStr(header.width)}x{strings.IntToStr(header.height)} encoding={BlpEncodingText(header)} alphaDepth={strings.IntToStr(header.alphaDepth)} mipCount={strings.IntToStr(header.mipCount)}"

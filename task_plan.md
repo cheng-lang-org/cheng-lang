@@ -1,76 +1,13 @@
-# 当前任务
+# 当前任务计划
 
-- return-path 这轮又往前收了一层：
-  - import-buffer 返回复制现在已经显式走 `v3_emit_call_import_buffer_result_clone_from_spills(...)`。
-  - `v3_emit_clone_composite_address_to_address(...)` 已补上 ORC-safe clone，不再是假 clone。
-  - 下一步不再回头碰 live-str probe 本身，继续回到 `v3_emit_call_finish_from_spills(...)` / `v3_emit_call_post_result_materialize_from_spills(...)` 这一层，把“hidden result address 预装载”和“真正的 post-call result materialize”继续拆成更准确的单出口。
-- Cheng 基础语义这轮已经补上：
-  - seed runtime `&& / ||` 已改成真正短路求值，不再 eager 发射。
-  - `short_circuit_semantics_smoke` 已纳入默认 host smokes。
-  - formal spec 和 skill 镜像已明确写死短路语义。
-  - 下一步不再回头补这一层布尔语义，直接回主线继续做 `v3/bootstrap/cheng_v3_seed.c` 的 call return-path 收口，把 `IMPORT_BUFFER` 从当前与 `DEST_ADDRESS` 共用的 post-call materialize 里继续拆开。
-- 继续做 `v3/bootstrap/cheng_v3_seed.c` 的 call return-path 收口：
-  - result-address contract 已经拆成显式 helper，并固定成“arg spill 前 store、call finish 里 load”的单一时序；`DEST_ADDRESS` / `IMPORT_BUFFER` / `NONE` 也已经提升成 `V3NativeCallPostResultKind`，不再压成一个 `result_address_call` 布尔位。
-  - 下一刀直接继续收 `post_result_kind` 的机器语义，把 `IMPORT_BUFFER` 从当前“先和 `DEST_ADDRESS` 共用回装路径”的阶段继续拆开，显式落成 import-buffer 专属 post-call materialize，而不是继续共用同一个尾段动作。
-- 继续做 `v3/bootstrap/cheng_v3_seed.c` 的 call return-path 收口：
-  - `ffi_handle` 返回修补已经并回 `v3_emit_call_finish_from_spills(...)`，并补上了显式 `ffi_handle contract` 判断，不再让普通 non-composite call 误发射空 helper。
-  - 下一刀不再碰参数发射，直接继续收 `composite_return` 的 dest/result materialize，把 scalar/composite/native/importc 剩余的返回尾差继续压到单出口。
-- 继续按“去旧调用面”这条线往下推，但 `src/backend` 先只扫非生成 leaf 文件：
-  - 当前已完成 `src/backend/uir/uir_vectorize_slp.cheng`、`src/backend/uir/uir_vectorize_loop.cheng`、`src/backend/uir/uir_internal/uir_core_builder_base_helpers.cheng`、`src/backend/uir/uir_internal/uir_core_builder_file_exec_pipeline.cheng`、`src/backend/uir/uir_internal/uir_core_builder_file_stage1_phases.cheng` 这一批机械命中。
-  - 当前又补完了 `src/backend/machine/select_internal/aarch64_select.cheng`、`src/backend/obj/macho_linker.cheng`、`src/backend/uir/uir_internal/uir_core_ssu.cheng`、`src/backend/uir/uir_internal/uir_core_builder_types.cheng`、`src/backend/uir/uir_internal/uir_core_builder_policy_contract.cheng` 这一批 leaf 机械命中。
-  - 当前又补完了 `src/backend/uir/uir_internal/uir_core_builder_type_decl_passes.cheng`、`src/backend/uir/uir_internal/uir_core_builder_call_resolution.cheng`、`src/backend/uir/uir_internal/uir_core_builder_object_runtime_helpers.cheng`、`src/backend/uir/uir_internal/uir_core_builder_current_root_cache.cheng`、`src/backend/uir/uir_internal/uir_core_builder_symbol_state.cheng`、`src/backend/uir/uir_internal/uir_core_builder_indirect_call_helpers.cheng`、`src/backend/uir/uir_internal/uir_core_builder_mangled_decl_helpers.cheng`、`src/backend/uir/uir_internal/uir_core_builder_global_init_runtime_hooks.cheng`、`src/backend/uir/uir_internal/uir_core_builder_current_root_type_decl_helpers.cheng`、`src/backend/uir/uir_internal/uir_core_types.cheng`、`src/backend/uir/uir_internal/uir_core_ssa.cheng` 这一批 helper 机械命中，并顺手收掉了 `file_exec_pipeline/file_stage1_phases` 剩余尾巴。
-  - 当前又补完了 `src/backend/uir/uir_internal/uir_core_builder_reachability_scan.cheng` 剩下的 6 处 `os.C_fflush fDbg*`、`src/backend/uir/uir_internal/uir_core_builder_types.cheng` 最后一处 `getEnv "BACKEND_DEBUG_LET"`，以及 `uir_loop_analysis/macho_linker/macho_direct_exe_writer/obj_buf/machine_core_types/uir_core_ssa/uir_core_builder_type_surface_helpers/uir_core_types` 里残留的 `sizeof T`。
-  - 当前已经补完 `src/backend/uir/uir_internal/uir_core_builder_root_exec_pipeline.cheng`、`src/backend/uir/uir_internal/uir_core_builder_top_level_passes.cheng`、`src/backend/uir/uir_internal/uir_core_builder.cheng`、`src/backend/uir/uir_opt.cheng` 里这一轮目标机械旧表面。
-  - `src/backend/uir/uir_internal/uir_core_builder_ffi_out_ptr.cheng` 当前只剩字符串假命中，先不动。
-  - 下一刀不再继续扫同一批括号化旧表面，直接转去下一条真实主线：要么开始更宽一层的 backend 语法复扫，要么回到 typed lowering / call / primary-object 主线，不再在这条已近空的机械迁移线上打转。
-  - 每次 fresh `build-backend-driver` 前先固定复扫 `v3/src/tooling/backend_driver_main.cheng` 的 oracle helper，确认没有 `V3OracleSignedBatch` 局部槽和 `oracleSmokeBatchFill(...)` 回流。
-- 调用/构造去歧义按两段推进：
-  - 先收 `Fmt / Lines` special form，只认 `Fmt"..."`、`Fmt(...)`、`Lines(...)`，不再认 `Fmt expr` / `Lines expr`。
-  - 后面再做全仓 generic `spaceCall` 迁移和删除，不能跟这轮混做；当前 `src/stage1/parser.cheng`、`src/stage1/semantics.cheng`、`src/stage1/monomorphize.cheng`、`src/stage1/frontend_lib.cheng`、`src/stage1/c_profile_lowering.cheng`、`src/stage1/lexer.cheng`、`src/stage1/ownership.cheng`、`src/stage1/type_syntax_lowering.cheng`、`src/stage1/diagnostics.cheng`、`src/stage1/ast.cheng`、`src/stage1/token.cheng` 都已经按当前更宽一点的 targeted heuristic 收到可以先停。下一刀如果继续，就要再把扫描口径扩大一层，开始把剩余更分散的 helper 调用面、数字字面量旧写法，以及 `sizeof T` 这类 built-in special form 一起纳入默认扫描；同时把范围从 `src/stage1` 扩到 `src/std` 和少量非生成 `src/backend` 真文件，不回头碰命令面审计。
-  - full `spaceCall` AST 审计先不要接到 public command / gate；当前真实前置是 `stage1/parser` body materialize 进入 ordinary 可编子集，否则 fresh compile 会直接红在 parser/lexer。现阶段稳定验收口径固定为 `build-backend-driver + run-host-smokes`，不把会挂住的 command-surface wrapper 算进去。
-- 先把 mini-seed 第一刀做成真入口：
-- seed 支持 `v3-bootstrap-v2` 最小合同。
-- `bootstrap_manifest` 提供源码路径真值。
-- wrapped stage0/stage1/stage2/stage3 跟随 embedded contract source path。
-- ordinary `bootstrap_contracts/build_plan` 跟随 snapshot/current `stage1_source`，不再硬绑旧 v1 contract。
-- live `stage1_bootstrap.cheng` 已切到 `v2`，ordinary / seed C 侧残留硬编码路径也已收回 helper；下一步改成继续收 `compile-bootstrap` 对大 seed wrapper 的依赖，seed 不再保留 `v1` 兼容读取。
-- 继续做 typed lowering 真源收口：把 seed 热路径里剩下的文本 ABI / composite 猜测继续替换成 typed lowering rule / typed fact，不再按源码字符串兜底。
-- `Fmt(parts)` 的 native / wasm 参数 ABI 回填已经切到 `v3_resolved_type_abi_class(...)`；下一步继续搜剩余真正还在“调用点手填 abi/composite”的热路径，而不是重复清理已经 descriptor 化的 helper。
-- `str` scratch/temp slot 的 `abi_class="composite"` 也已经清掉；下一刀优先看 builtin / import target signature 构造里那些成团出现的 `param_abi_classes/return_abi_class = "composite"`。
-- `build-backend-driver` 当前真口径已经固定：stage3 会用 `system-link-exec` 真编 `v3/src/tooling/backend_driver_main.cheng`，nested provider object 也统一走当前编译器自举的 `--emit:obj`；后续只要再碰 parser/call HIR 真源，先重建 fresh backend driver 再验收。
-- `build-backend-driver` / `run-host-smokes` 这条验收现在必须串行，不再并行共享 `artifacts/v3_backend_driver/*`。
-- `parser_normalized_expr_smoke` / `call_hir_matrix_smoke` / `build-backend-driver` 已修平；下一步直接继续 call HIR 工程化验收，把 direct import、grouped import、qualified call、member call、unknown reason 的覆盖固定在 `call_hir_matrix_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke`。
-- 继续做 cold 编译成本优化：`cstring section folding` 已证伪，下一刀只看真正减 asm 文本规模或直接上自有 object writer。
-- bootstrap / memory 稳定性 gate 已有正式 stage3 no-handoff repeated compile 合同；后续除非 stage2 也开始出现异常，否则先不再分叉支线。
-- `Bytes[] add/setLen` 暂不插队，除非它开始直接阻塞 typed lowering 主线。
-- `build-backend-driver` / export visibility / wasm smoke 这轮已恢复；下一步回到 seed 热路径剩余的 builtin / import target signature ABI 硬编码，继续往 typed rule 收口。
-- external signature 表和一批 native / wasm builtin target builder 已切到“类型文本真源 + ABI 统一推导”；下一步继续扫剩余没有接上 `v3_call_target_set_signature(...)` 的 target builder。
-- 下一刀优先看剩余 3 团还在直接写 `target->return_abi_class/param_abi_classes` 的位置：importc probe fallback、resolved call target normalize、以及少量 builtin/importc 粘合层。
-- target signature 这一层现在已经基本收口；下一步该从“签名怎么描述”转向“call lowering 怎么消费这些 typed fact”，优先看 native/wasm/importc 仍然按 target 分支各自猜复合值的地方。
-- `signature -> arg kind / return kind` 这一层已经起了单点 helper；下一步继续把 call 发射端剩下那些 `arg_kind == ...` 大分支和 importc/native/wasm 各自的地址语义判断往同一套 lowering rule 上压。
-- `preferred_type/abi` 归一化已经并到共用 helper；下一步不再清理 prepare 阶段，直接进 call emit / result materialize 这些仍然按 target 分支散开的地方。
-- native call arg emit 现在已经起了单点 helper；下一步直接看 return path，优先清 `call_from_spills` 前后的 dest/result materialize 和 importc/native 的返回修补分叉。
-- `call signature -> address temp` 的热路径残留也已经切完；下一步不再回头清判断 helper，直接处理 `v3_emit_call_from_spills(...)` 两条分支和 scalar return move/compat 校验。
-- `v3_codegen_call_scalar_resolved(...)` 的 scalar return move/compat 校验已经并到 helper；下一刀直接转进 `v3_emit_call_from_spills(...)` 的 x64 / generic 两条分支，把 `composite_return` 的 dest 装载和 stack 调整继续收成更窄的单口径。
-- `v3_emit_call_from_spills(...)` 里的 reg-arg 装载和 call 尾段已经并到共用 helper；下一刀只剩 stack 布局策略本身，优先看能不能把 `v3_snapshot_x64_external_call_stack_layout(...)` / `v3_emit_x64_external_stack_call_args_from_spills(...)` 和 generic 线性 stack slot 再抽成同一份布局结果消费层。
-- `arg_load_abi` 现在也已经落进 `V3NativeCallStackLayout`，`v3_emit_stack_call_args_from_spills(...)` / `v3_emit_call_register_args_from_spills(...)` 不再回查 `target/rule`。下一刀该继续盯 return path，优先看 `composite_return` 的 dest/result materialize 和 importc/native 返回修补还能不能再并掉一层。
-- `V3NativeCallStackLayout` 这一层已经起完；下一刀直接盯 `v3_build_native_call_stack_layout(...)` 里还剩的 x64 external composite-by-memory 特例，看能不能把 `v3_x64_external_memory_arg_stack_bytes(...)` 再压成更通用的“param -> stack placement fact”，避免布局构建里继续读平台特判。
-- `V3NativeCallArgStackPlacement` 这一层也已经起完；下一刀直接看 `v3_x64_external_memory_arg_stack_bytes(...)` 自身，尝试把 “大 composite 走 memory copy” 从 x64 名字和外部调用特判里再抽成更抽象的 ABI placement rule。
-- `v3_resolve_native_call_arg_memory_copy_stack_bytes(...)` 这一层也已经起完；下一刀直接收它内部还硬编码的 ABI 门槛，优先看能不能把 target 判定、size/align 阈值拆成更独立的 placement predicate，而不是继续塞在 memory-copy helper 里。
-- memory-copy placement helper 里的 ABI 门槛也已经拆成 predicate；下一刀不再改 emitter，直接看这些 predicate 能不能进一步并到更通用的 native aggregate ABI rule，同时保持 `size <= 16` 小 aggregate register ABI 继续显式 unsupported。
-- backend driver 这一层先保持新口径不回流：
-  - `bootstrap-bridge` 只按 bootstrap 真输入挑 live compiler。
-  - backend driver ready 必须等于 `binary + .v3.map + fresh`，不能退回“只要文件还在”。
-  - `src/std/os.cheng` 这类真实依赖路径保持小写真名，避免远端 fresh 检查漂移。
-- backend driver 子链路也先保持这轮新口径：
-  - fresh 闭包继续带 `compiler_runtime_program_entry_provider_v3`、`program_support_host_runtime_v3`、`os_host_process`、`os.cheng`，不要再掉回半套依赖。
-  - compile/run 子进程默认显式传 `CHENG_V3_ROOT`，不要再假设宿主环境会继承。
-  - `std/os::setEnv` 保持 primary-object 可编形状，后续如果再补类似 API，也按这套线性口径写。
-- generic `spaceCall` 迁移当前下一刀固定在 `src/stage1/frontend_lib.cheng`：
-  - 已完成 `80-240` 与 `953-1212` 两块 import/path/env/cache helper 的 `len/stage1_getEnv/resolvePkgImportPath/echo/releaseString/... -> f(...)` 机械收口。
-  - 已继续完成 `1557-1692` 的 path normalize/root-check、`2022-2168` 的 import/pkg-root helper、`1398-1452` 的 cache write helper、`2488-2541` 的 import-recursive/cache/module-dir helper、`2804-3015` 的 deps helper，以及 `452-952` / `2233-2242` 这簇 env/plugin/cache-phase/helper 尾巴。
-  - 当前这条 `frontend_lib` targeted heuristic 已基本扫空；`src/stage1/c_profile_lowering.cheng` 已继续完成 `101-241`、`435-749`、`474-520`、`766-980`、`1288-1361`、`1618-1905`、`1914-2027`、`3429-3460` 这几块 trace/map/wrapper/named/closure/iterator helper 的连续机械收口，并已补完 `4255-4562` 的 async/validate/orchestration 尾段；`src/stage1/lexer.cheng`、`src/stage1/ownership.cheng`、`src/stage1/type_syntax_lowering.cheng`、`src/stage1/diagnostics.cheng`、`src/stage1/ast.cheng` 也都已经在各自专用 grep 下扫空。
-  - `src/stage1/semantics.cheng` / `src/stage1/ownership.cheng` 的 profiling/debug `echo x` 尾巴，以及 `src/stage1/frontend_lib.cheng` 的 `releaseString x`、`c_fclose f`，`src/stage1/parser.cheng` / `src/stage1/monomorphize.cheng` / `src/stage1/semantics.cheng` 的 `os.C_fflush f`、`src/stage1/parser.cheng` 的 `tokenSpan prev` / `isDefiniteTypeExpr node` 也已经补平。下一轮先重新扫 `src/stage1/*.cheng` 的真实 bare call，并把这类单点 helper 与 `c_*` API 也算进去，再选下一份中等真源，不跳回 public command 审计入口。
-  - `src/stage1/token.cheng`、`src/stage1/lexer.cheng`、`src/stage1/frontend_lib.cheng` 里残留的 `sizeof T` 旧写法也已经补平成 `sizeof(T)`；下一轮继续复扫时，把 `sizeof` 也算进默认旧表面扫描。
-  - `src/std/algorithm.cheng`、`src/std/hashmaps.cheng`、`src/std/os.cheng`、`src/std/parseutils.cheng`、`src/std/tables.cheng`、`src/std/streams.cheng`、`src/std/sync.cheng`、`src/std/os_host_process.cheng`、`src/std/async_rt.cheng`、`src/std/bytes.cheng`、`src/std/rawbytes.cheng`、`src/std/crypto/sha256.cheng`、`src/std/system.cheng`、`src/std/system_helpers_backend*.cheng` 这轮都已经继续收掉一批真旧写法；下一轮优先继续扫 `src/std/*.cheng` 里剩下的机械命中，再考虑扩到非生成 `src/backend`。
-  - 每轮固定 fresh 验收：如果先红在 `bootstrap-bridge bootstrap inputs newer than live bootstrap compiler`，先执行 `cc -std=c11 -O2 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0` 和 `artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge`，再跑 `artifacts/v3_bootstrap/cheng.stage3 build-backend-driver` + `artifacts/v3_backend_driver/cheng run-host-smokes parser_normalized_expr_smoke cheng_skill_consistency_smoke compiler_runtime_smoke`。
+- 迁移目标：仓库根包固定为 `pkg://cheng`，唯一源码树为 `src`，编译器内核在 `src/core`。
+- 已完成：源码、测试、seed、r2c 工具路径和公开环境变量去掉旧版本标识。
+- 已完成：`chain_node` 从核心编译门禁移除，保留为应用/领域手动命令。
+- 已完成：自托管编译主线补资源硬门禁，避免 backend driver / follow-world 长编译无上限吃内存。
+- 已完成：C seed `build-backend-driver` 长路径改成实时进度、默认 8GiB RSS 上限，并刷新出新的 `artifacts/backend_driver/cheng`。
+- 已完成：旧根 shared builtin、旧根 tooling、驼峰应用目录收口到当前模块布局。
+- 已完成：`run-host-smokes <smoke...>` 的普通 fixture 控制面从 C seed 迁到 backend driver 的纯 Cheng host smoke gate。
+- 已完成：world/libp2p 自托管主线 smoke 通过，覆盖 managed dependency mirror、world bundle sync、fresh-node selfhost receipt、multi-hop migration proof。
+- 已完成：`world-receipt` 控制面从 C seed 转入 `src/core/tooling/world_receipt_gate.cheng`，backend driver 不再把该命令转发给 `stage3 system-link-exec`；它是 world/proof 命令，不进入核心编译门禁。
+- 下一步：继续把 `system-link-exec` 的 object/native-link materializer 从 C seed 拆到小 Cheng 模块；`run-stage23-libp2p-smokes`、tail/domain gates 和大型应用/领域 smoke 保持显式运行，不放回核心门禁。
+- 验收口径：源码、路径名、二进制字符串 grep 清零；`bootstrap-bridge`、路径 smoke、共享 builtin smoke、tooling 文档 smoke、应用迁移 smoke 通过。

@@ -5,43 +5,46 @@ import cheng/qpack/min as qpack
 import cheng/quic/core/quic_varint as qvarint
 
 type
-    V3Http3Frame =
+    Http3Frame =
         kind: int64
         payload: Bytes
 
-    V3Http3FrameDecoded =
-        frame: V3Http3Frame
+    Http3FrameDecoded =
+        frame: Http3Frame
         next: int32
 
-    V3Http3Setting =
+    Http3Setting =
         id: int64
         value: int64
 
-    V3Http3Preamble =
+    Http3Preamble =
         control: Bytes
         qpackEncoder: Bytes
         qpackDecoder: Bytes
 
 const
-    v3Http3FrameData = 0
-    v3Http3FrameHeaders = 1
-    v3Http3FrameCancelPush = 3
-    v3Http3FrameSettings = 4
-    v3Http3FramePushPromise = 5
-    v3Http3FrameGoaway = 7
-    v3Http3FrameMaxPushId = 13
-    v3Http3UniStreamControl = 0
-    v3Http3UniStreamPush = 1
-    v3Http3UniStreamQpackEncoder = 2
-    v3Http3UniStreamQpackDecoder = 3
-    v3Http3SettingQpackMaxTableCapacity = 1
-    v3Http3SettingMaxFieldSectionSize = 6
-    v3Http3SettingQpackBlockedStreams = 7
+    Http3FrameData = 0
+    Http3FrameHeaders = 1
+    Http3FrameCancelPush = 3
+    Http3FrameSettings = 4
+    Http3FramePushPromise = 5
+    Http3FrameGoaway = 7
+    Http3FrameMaxPushId = 13
+    Http3UniStreamControl = 0
+    Http3UniStreamPush = 1
+    Http3UniStreamQpackEncoder = 2
+    Http3UniStreamQpackDecoder = 3
+    Http3SettingQpackMaxTableCapacity = 1
+    Http3SettingMaxFieldSectionSize = 6
+    Http3SettingQpackBlockedStreams = 7
 
-fn v3Http3Frame(kind: int64, payload: Bytes): V3Http3Frame =
-    return V3Http3Frame(kind: kind, payload: payload)
+fn Http3MakeFrame(kind: int64, payload: Bytes): Http3Frame =
+    var out: Http3Frame
+    out.kind = kind
+    out.payload = payload
+    return out
 
-fn v3Http3EncodeFrame(frame: V3Http3Frame): Result[Bytes] =
+fn Http3EncodeFrame(frame: Http3Frame): Result[Bytes] =
     var out = buffer.newByteBuffer()
     let kindRes: Result[Bytes] = qvarint.quicVarIntEncode(frame.kind)
     if IsErr(kindRes):
@@ -55,23 +58,23 @@ fn v3Http3EncodeFrame(frame: V3Http3Frame): Result[Bytes] =
         buffer.appendBytes(out, frame.payload)
     return Ok[Bytes](buffer.toBytes(out))
 
-fn v3Http3DecodeFrame(data: Bytes, offset: int32): Result[V3Http3FrameDecoded] =
+fn Http3DecodeFrame(data: Bytes, offset: int32): Result[Http3FrameDecoded] =
     let kindRes: Result[qvarint.QuicVarIntDecoded] = qvarint.quicVarIntDecode(data, offset)
     if IsErr(kindRes):
-        return Err[V3Http3FrameDecoded](ErrorText(kindRes))
+        return Err[Http3FrameDecoded](ErrorText(kindRes))
     let lenRes: Result[qvarint.QuicVarIntDecoded] = qvarint.quicVarIntDecode(data, Value(kindRes).next)
     if IsErr(lenRes):
-        return Err[V3Http3FrameDecoded](ErrorText(lenRes))
+        return Err[Http3FrameDecoded](ErrorText(lenRes))
     let payloadLen: int32 = int32(Value(lenRes).value)
     if payloadLen < 0 || Value(lenRes).next + payloadLen > bytesLen(data):
-        return Err[V3Http3FrameDecoded]("http3: frame truncated")
+        return Err[Http3FrameDecoded]("http3: frame truncated")
     let payload: Bytes = bytesSlice(data, Value(lenRes).next, payloadLen)
-    var out: V3Http3FrameDecoded
-    out.frame = V3Http3Frame(kind: Value(kindRes).value, payload: payload)
+    var out: Http3FrameDecoded
+    out.frame = Http3MakeFrame(Value(kindRes).value, payload)
     out.next = Value(lenRes).next + payloadLen
-    return Ok[V3Http3FrameDecoded](out)
+    return Ok[Http3FrameDecoded](out)
 
-fn v3Http3EncodeSettingsPayload(entries: V3Http3Setting[]): Result[Bytes] =
+fn Http3EncodeSettingsPayload(entries: Http3Setting[]): Result[Bytes] =
     var out = buffer.newByteBuffer()
     for i in 0..<entries.len:
         let idRes: Result[Bytes] = qvarint.quicVarIntEncode(entries[i].id)
@@ -84,39 +87,39 @@ fn v3Http3EncodeSettingsPayload(entries: V3Http3Setting[]): Result[Bytes] =
         buffer.appendBytes(out, Value(valueRes))
     return Ok[Bytes](buffer.toBytes(out))
 
-fn v3Http3DecodeSettingsPayload(data: Bytes): Result[V3Http3Setting[]] =
-    var out: V3Http3Setting[]
+fn Http3DecodeSettingsPayload(data: Bytes): Result[Http3Setting[]] =
+    var out: Http3Setting[]
     var idx: int32
     while idx < bytesLen(data):
         let idRes: Result[qvarint.QuicVarIntDecoded] = qvarint.quicVarIntDecode(data, idx)
         if IsErr(idRes):
-            return Err[V3Http3Setting[]](ErrorText(idRes))
+            return Err[Http3Setting[]](ErrorText(idRes))
         let valueRes: Result[qvarint.QuicVarIntDecoded] = qvarint.quicVarIntDecode(data, Value(idRes).next)
         if IsErr(valueRes):
-            return Err[V3Http3Setting[]](ErrorText(valueRes))
-        add(out, V3Http3Setting(id: Value(idRes).value, value: Value(valueRes).value))
+            return Err[Http3Setting[]](ErrorText(valueRes))
+        add(out, Http3Setting(id: Value(idRes).value, value: Value(valueRes).value))
         idx = Value(valueRes).next
-    return Ok[V3Http3Setting[]](out)
+    return Ok[Http3Setting[]](out)
 
-fn v3Http3EncodeSettingsFrame(entries: V3Http3Setting[]): Result[Bytes] =
-    let payloadRes: Result[Bytes] = v3Http3EncodeSettingsPayload(entries)
+fn Http3EncodeSettingsFrame(entries: Http3Setting[]): Result[Bytes] =
+    let payloadRes: Result[Bytes] = Http3EncodeSettingsPayload(entries)
     if IsErr(payloadRes):
         return Err[Bytes](ErrorText(payloadRes))
-    return v3Http3EncodeFrame(v3Http3Frame(v3Http3FrameSettings, Value(payloadRes)))
+    return Http3EncodeFrame(Http3MakeFrame(Http3FrameSettings, Value(payloadRes)))
 
-fn v3Http3DecodeSettingsFramePayload(payload: Bytes): Result[V3Http3Setting[]] =
-    return v3Http3DecodeSettingsPayload(payload)
+fn Http3DecodeSettingsFramePayload(payload: Bytes): Result[Http3Setting[]] =
+    return Http3DecodeSettingsPayload(payload)
 
-fn v3Http3EncodeHeadersFrame(fields: qpack.V3QpackHeaderField[]): Result[Bytes] =
-    let blockRes: Result[Bytes] = qpack.V3QpackEncodeLiteralFieldSection(fields)
+fn Http3EncodeHeadersFrame(fields: qpack.QpackHeaderField[]): Result[Bytes] =
+    let blockRes: Result[Bytes] = qpack.QpackEncodeLiteralFieldSection(fields)
     if IsErr(blockRes):
         return Err[Bytes](ErrorText(blockRes))
-    return v3Http3EncodeFrame(v3Http3Frame(v3Http3FrameHeaders, Value(blockRes)))
+    return Http3EncodeFrame(Http3MakeFrame(Http3FrameHeaders, Value(blockRes)))
 
-fn v3Http3DecodeHeadersFramePayload(payload: Bytes): Result[qpack.V3QpackFieldSection] =
-    return qpack.V3QpackDecodeLiteralFieldSection(payload)
+fn Http3DecodeHeadersFramePayload(payload: Bytes): Result[qpack.QpackFieldSection] =
+    return qpack.QpackDecodeLiteralFieldSection(payload)
 
-fn v3Http3EncodeUnidirectionalStream(streamType: int64, payload: Bytes): Result[Bytes] =
+fn Http3EncodeUnidirectionalStream(streamType: int64, payload: Bytes): Result[Bytes] =
     let typeRes: Result[Bytes] = qvarint.quicVarIntEncode(streamType)
     if IsErr(typeRes):
         return Err[Bytes](ErrorText(typeRes))
@@ -126,54 +129,24 @@ fn v3Http3EncodeUnidirectionalStream(streamType: int64, payload: Bytes): Result[
         buffer.appendBytes(out, payload)
     return Ok[Bytes](buffer.toBytes(out))
 
-fn v3Http3EncodeClientPreamble(settings: V3Http3Setting[]): Result[V3Http3Preamble] =
-    let controlFrameRes: Result[Bytes] = v3Http3EncodeSettingsFrame(settings)
+fn Http3EncodeClientPreamble(settings: Http3Setting[]): Result[Http3Preamble] =
+    let controlFrameRes: Result[Bytes] = Http3EncodeSettingsFrame(settings)
     if IsErr(controlFrameRes):
-        return Err[V3Http3Preamble](ErrorText(controlFrameRes))
-    let controlRes: Result[Bytes] = v3Http3EncodeUnidirectionalStream(v3Http3UniStreamControl, Value(controlFrameRes))
+        return Err[Http3Preamble](ErrorText(controlFrameRes))
+    let controlRes: Result[Bytes] = Http3EncodeUnidirectionalStream(Http3UniStreamControl, Value(controlFrameRes))
     if IsErr(controlRes):
-        return Err[V3Http3Preamble](ErrorText(controlRes))
-    let encoderRes: Result[Bytes] = v3Http3EncodeUnidirectionalStream(v3Http3UniStreamQpackEncoder, emptyBytes())
+        return Err[Http3Preamble](ErrorText(controlRes))
+    let encoderRes: Result[Bytes] = Http3EncodeUnidirectionalStream(Http3UniStreamQpackEncoder, emptyBytes())
     if IsErr(encoderRes):
-        return Err[V3Http3Preamble](ErrorText(encoderRes))
-    let decoderRes: Result[Bytes] = v3Http3EncodeUnidirectionalStream(v3Http3UniStreamQpackDecoder, emptyBytes())
+        return Err[Http3Preamble](ErrorText(encoderRes))
+    let decoderRes: Result[Bytes] = Http3EncodeUnidirectionalStream(Http3UniStreamQpackDecoder, emptyBytes())
     if IsErr(decoderRes):
-        return Err[V3Http3Preamble](ErrorText(decoderRes))
-    var out: V3Http3Preamble
+        return Err[Http3Preamble](ErrorText(decoderRes))
+    var out: Http3Preamble
     out.control = Value(controlRes)
     out.qpackEncoder = Value(encoderRes)
     out.qpackDecoder = Value(decoderRes)
-    return Ok[V3Http3Preamble](out)
+    return Ok[Http3Preamble](out)
 
-fn V3Http3MakeSetting(id: int64, value: int64): V3Http3Setting =
-    return V3Http3Setting(id: id, value: value)
-
-fn V3Http3EncodeFrame(frame: V3Http3Frame): Result[Bytes] =
-    return v3Http3EncodeFrame(frame)
-
-fn V3Http3DecodeFrame(data: Bytes, offset: int32): Result[V3Http3FrameDecoded] =
-    return v3Http3DecodeFrame(data, offset)
-
-fn V3Http3EncodeSettingsPayload(entries: V3Http3Setting[]): Result[Bytes] =
-    return v3Http3EncodeSettingsPayload(entries)
-
-fn V3Http3DecodeSettingsPayload(data: Bytes): Result[V3Http3Setting[]] =
-    return v3Http3DecodeSettingsPayload(data)
-
-fn V3Http3EncodeSettingsFrame(entries: V3Http3Setting[]): Result[Bytes] =
-    return v3Http3EncodeSettingsFrame(entries)
-
-fn V3Http3DecodeSettingsFramePayload(payload: Bytes): Result[V3Http3Setting[]] =
-    return v3Http3DecodeSettingsFramePayload(payload)
-
-fn V3Http3EncodeHeadersFrame(fields: qpack.V3QpackHeaderField[]): Result[Bytes] =
-    return v3Http3EncodeHeadersFrame(fields)
-
-fn V3Http3DecodeHeadersFramePayload(payload: Bytes): Result[qpack.V3QpackFieldSection] =
-    return v3Http3DecodeHeadersFramePayload(payload)
-
-fn V3Http3EncodeUnidirectionalStream(streamType: int64, payload: Bytes): Result[Bytes] =
-    return v3Http3EncodeUnidirectionalStream(streamType, payload)
-
-fn V3Http3EncodeClientPreamble(settings: V3Http3Setting[]): Result[V3Http3Preamble] =
-    return v3Http3EncodeClientPreamble(settings)
+fn Http3MakeSetting(id: int64, value: int64): Http3Setting =
+    return Http3Setting(id: id, value: value)

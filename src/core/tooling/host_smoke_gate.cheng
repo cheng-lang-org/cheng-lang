@@ -1,0 +1,205 @@
+import std/os
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+fn HostSmokePrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn HostSmokePrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn HostSmokeStartsWith(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    return strings.SliceBytes(text, 0, len(prefix)) == prefix
+
+fn HostSmokeReadFlag(args: str[],
+                       key: str,
+                       defaultValue: str): str =
+    for i in 0..<args.len:
+        let arg = args[i]
+        if arg == key && i + 1 < args.len:
+            return args[i + 1]
+        if HostSmokeStartsWith(arg, key + ":"):
+            return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
+        if HostSmokeStartsWith(arg, key + "="):
+            return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
+    return defaultValue
+
+fn HostSmokeHasFlag(args: str[], key: str): bool =
+    for i in 0..<args.len:
+        let arg = args[i]
+        if arg == key || HostSmokeStartsWith(arg, key + ":") || HostSmokeStartsWith(arg, key + "="):
+            return true
+    return false
+
+fn HostSmokeCollectPositionals(args: str[]): str[] =
+    var out: str[]
+    var i: int32
+    while i < args.len:
+        let arg = args[i]
+        if arg == "--compiler" || arg == "--label" || arg == "--tail-only":
+            i = i + 2
+        elif HostSmokeStartsWith(arg, "--compiler:") ||
+             HostSmokeStartsWith(arg, "--compiler=") ||
+             HostSmokeStartsWith(arg, "--label:") ||
+             HostSmokeStartsWith(arg, "--label=") ||
+             HostSmokeStartsWith(arg, "--tail-only:") ||
+             HostSmokeStartsWith(arg, "--tail-only="):
+            i = i + 1
+        elif len(arg) > 0 && arg[0] == '-':
+            i = i + 1
+        else:
+            add(out, arg)
+            i = i + 1
+    return out
+
+fn HostSmokeDefaultSmokes(): str[] =
+    return [
+        "compiler_runtime_smoke",
+        "stage3_command_surface_smoke",
+        "stage3_system_link_exec_handoff_smoke",
+        "artifact_isolation_audit_smoke",
+        "backend_driver_command_surface_smoke",
+        "build_backend_driver_report_smoke",
+        "backend_driver_resource_guard_contract_smoke",
+        "runtime_link_input_surface_smoke",
+        "runtime_zero_c_surface_smoke",
+        "parser_path_smoke",
+        "compiler_pipeline_smoke",
+        "lowering_plan_smoke",
+        "primary_object_plan_smoke",
+        "object_native_link_plan_smoke",
+        "compiler_world_manifest_closure_smoke",
+        "compiler_migration_publish_smoke",
+        "compiler_managed_dependency_mirror_smoke",
+        "compiler_world_libp2p_smoke",
+        "compiler_world_fresh_node_selfhost_smoke",
+        "compiler_migration_multihop_smoke",
+        "shared_builtin_import_external_package_smoke",
+        "cheng_skill_consistency_smoke",
+        "libp2p_register_handler_symbol_smoke",
+        "dev_hotpatch_100ms_scope_contract_smoke"
+    ]
+
+fn HostSmokeResolveCompiler(root: str,
+                              args: str[],
+                              outCompiler: var str): int32 =
+    outCompiler = strutil.Strip(HostSmokeReadFlag(args, "--compiler", ""))
+    if len(outCompiler) <= 0:
+        outCompiler = strutil.Strip(os.GetEnvDefault("CHENG_SMOKE_COMPILER", ""))
+    if len(outCompiler) <= 0:
+        outCompiler = chengpath.PathAbsolute(root, "artifacts/backend_driver/cheng")
+    else:
+        outCompiler = chengpath.PathAbsolute(root, outCompiler)
+    if !chengpath.FileExistsNonEmpty(root, outCompiler):
+        HostSmokePrintErr("host smokes: missing compiler: " + outCompiler)
+        return 1
+    return 0
+
+fn HostSmokeLabel(args: str[]): str =
+    let explicit = strutil.Strip(HostSmokeReadFlag(args, "--label", ""))
+    if len(explicit) > 0:
+        return explicit
+    let envLabel = strutil.Strip(os.GetEnvDefault("CHENG_SMOKE_LABEL", ""))
+    if len(envLabel) > 0:
+        return envLabel
+    return "host"
+
+fn HostSmokeRunTimeoutSec(smokeName: str): int32 =
+    if smokeName == "backend_driver_command_surface_smoke":
+        return 420
+    if smokeName == "backend_driver_selfhost_progress_smoke":
+        return 240
+    if smokeName == "compiler_world_fresh_node_selfhost_smoke":
+        return 420
+    if smokeName == "compiler_world_libp2p_smoke" ||
+       smokeName == "compiler_world_manifest_closure_smoke" ||
+       smokeName == "compiler_migration_publish_smoke" ||
+       smokeName == "compiler_managed_dependency_mirror_smoke":
+        return 180
+    if smokeName == "perf_memory_contract_smoke":
+        return 600
+    return 90
+
+fn HostSmokeRunOne(root: str,
+                     compiler: str,
+                     outDir: str,
+                     smokeName: str): int32 =
+    let src = chengpath.PathAbsolute(root, "src/tests/" + smokeName + ".cheng")
+    if !chengpath.FileExistsNonEmpty(root, src):
+        HostSmokePrintErr("host smokes: missing source: " + src)
+        return 1
+    let outBin = os.JoinPath(outDir, smokeName)
+    let compileLog = outBin + ".compile.log"
+    let runLog = outBin + ".run.log"
+    HostSmokePrintLine("[cheng host smokes] compile " + smokeName)
+    let compileRun = hostops.RunFileLogged(root,
+                                             "host_smokes_compile_" + smokeName,
+                                             compiler,
+                                             [
+                                                 "system-link-exec",
+                                                 "--root", root,
+                                                 "--in", src,
+                                                 "--emit", "exe",
+                                                 "--target", "arm64-apple-darwin",
+                                                 "--out", outBin
+                                             ],
+                                             ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                             root,
+                                             300,
+                                             compileLog)
+    if !hostops.LoggedRunOk(compileRun):
+        let outputText = strutil.Strip(compileRun.output)
+        if len(outputText) > 0:
+            HostSmokePrintErr(outputText)
+        return compileRun.exitCode
+    if !chengpath.FileExistsNonEmpty(root, outBin):
+        HostSmokePrintErr("host smokes: compile missing output: " + outBin)
+        return 1
+    HostSmokePrintLine("[cheng host smokes] run " + smokeName)
+    let run = hostops.RunFileLogged(root,
+                                      "host_smokes_run_" + smokeName,
+                                      outBin,
+                                      [],
+                                      [],
+                                      root,
+                                      HostSmokeRunTimeoutSec(smokeName),
+                                      runLog)
+    let runOutput = strutil.Strip(run.output)
+    if len(runOutput) > 0:
+        if !hostops.LoggedRunOk(run):
+            HostSmokePrintErr(runOutput)
+        else:
+            HostSmokePrintLine(runOutput)
+    if !hostops.LoggedRunOk(run):
+        return run.exitCode
+    return 0
+
+fn HostSmokeCanRun(args: str[]): bool =
+    return !HostSmokeHasFlag(args, "--tail-only")
+
+fn HostSmokeRun(root: str, args: str[]): int32 =
+    if !HostSmokeCanRun(args):
+        HostSmokePrintErr("host smokes: --tail-only belongs to explicit domain gates, not core host smoke gate")
+        return 2
+    var compiler = ""
+    if HostSmokeResolveCompiler(root, args, compiler) != 0:
+        return 1
+    var tests = HostSmokeCollectPositionals(args)
+    if tests.len <= 0:
+        tests = HostSmokeDefaultSmokes()
+    let label = HostSmokeLabel(args)
+    var outDir = chengpath.PathAbsolute(root, "artifacts/hostrun")
+    if label != "host":
+        outDir = os.JoinPath(outDir, label)
+    if !chengpath.MkdirP(root, outDir):
+        HostSmokePrintErr("host smokes: failed to create output dir: " + outDir)
+        return 1
+    for i in 0..<tests.len:
+        if HostSmokeRunOne(root, compiler, outDir, tests[i]) != 0:
+            return 1
+    HostSmokePrintLine("cheng host smokes: ok")
+    return 0

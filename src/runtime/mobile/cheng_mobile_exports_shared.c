@@ -2554,7 +2554,7 @@ int32_t cheng_mobile_host_biometric_fingerprint_authorize_bridge(
   }
   if (s_host_api.biometric_fingerprint_authorize == NULL) {
     if (out_error != NULL && out_error_cap > 0) {
-      (void)snprintf(out_error, (size_t)out_error_cap, "%s", "v3 biometric: host api missing");
+      (void)snprintf(out_error, (size_t)out_error_cap, "%s", "biometric: host api missing");
     }
     return 0;
   }
@@ -2579,7 +2579,7 @@ int32_t cheng_mobile_host_biometric_fingerprint_authorize_bridge(
       out_error,
       out_error_cap);
   if (ok == 0 && out_error != NULL && out_error_cap > 0 && out_error[0] == '\0') {
-    (void)snprintf(out_error, (size_t)out_error_cap, "%s", "v3 biometric: host authorize failed");
+    (void)snprintf(out_error, (size_t)out_error_cap, "%s", "biometric: host authorize failed");
   }
   return ok;
 }

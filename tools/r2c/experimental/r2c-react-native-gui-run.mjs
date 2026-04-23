@@ -374,7 +374,7 @@ function main() {
   const outDir = path.resolve(args.outDir || path.join(repo, 'build', 'r2c_react_cheng'));
   const scriptDir = path.dirname(path.resolve(process.argv[1]));
   const workspaceRoot = path.resolve(path.join(scriptDir, '..', '..', '..'));
-  const hostSourcePath = path.resolve(args.hostSourcePath || path.join(workspaceRoot, 'v3', 'experimental', 'r2c-react', 'native_gui_host_macos.m'));
+  const hostSourcePath = path.resolve(args.hostSourcePath || path.join(workspaceRoot, 'tools', 'r2c', 'experimental', 'native_gui_host_macos.m'));
   const bundlePath = path.resolve(args.bundlePath || path.join(outDir, 'native_gui_bundle_v1.json'));
   const bundleSummaryPath = path.join(outDir, 'native_gui_bundle.summary.env');
   const sessionPath = path.resolve(args.sessionPath || path.join(outDir, 'native_gui_session_v1.json'));

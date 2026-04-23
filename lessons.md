@@ -1,156 +1,29 @@
 # Lessons
 
-- 给业务仓接 Cheng 运行链时，不要整包复制或整包软链 `decentralized`、`runtime`、`std`；只能沿最小真实依赖补齐，否则很容易把包边界和真实编译问题一起掩掉。
-- 验证共享 `std/runtime/decentralized` 直编时，不能只把外部包放在仓内 `artifacts/` 下；父目录里现成的 `cheng-package.toml` 会把 `workspace_root` 偶然抬回编译器仓，掩掉真外部包仍然拿错共享根和 provider 根的问题。至少要补一个仓外临时包回归。
-- 在验证新的 `stage3/backend_driver` 候选前，不要直接覆盖官方 live 产物；先放旁路路径验证，确认 `status/system-link-exec` 都正常后再切换，不然一旦候选本身起不来，整条排障链会一起失明。
-- 带 `--value` 这类显式 CLI 参数合同的 live-str probe，不能直接拿无参数 `run-host-smokes` 的 panic 结果当编译器回归；先确认 harness 参数是否满足，再判断是不是 return-path 真红。
-- `&& / ||` 这种语言基础语义不能只在 consteval 或某一条 backend 链上是对的；parser/typed/runtime codegen/spec/smoke 必须同口径一起锁死成短路求值，不然就会出现“编译期是对的、运行期却 eager 执行右侧”的低级语义漂移。
-- 用户要的是主线编译链，不是 report 壳；进度观察必须直接挂在编译 phase 本体上，实时输出/落轻量 progress，异常默认打印 summary 并停，不要再把 full report 当成主路径或失败路径的默认出口。
-- `ExecFilePipeSpawn` 这类只暴露单读管的宿主进程 API，默认就必须把子进程 `stderr` 合并进来；不然哪怕上层已经禁止成功路径回显 `run.output`，旧 bridge/stage3 的 full report 还是会从继承的 `stderr` 直接漏到终端。
-- 只把 backend_driver 成功 summary 和 host_ops live echo 收短还不够；如果 `system-link-exec` 还在 forward 到旧 `artifacts/v3_bootstrap/cheng.stage3`，成功后的 full report 仍会从 stage3 自己冒出来。先确认是不是 stale stage3 在出声，再决定是重建 stage3 还是彻底切掉这条 forward。
-- 旧编译器首跳自举不要直接编 `v3/src/tooling/compiler_main.cheng`；如果看到 `内存 20GB+、CPU 很低`，通常不是 codegen 卡死，而是 `v3SystemLinkExecPlanReport -> v3LoweringPlanStubReport -> v3TypedExprLoweringRulesReportText` 在堆里拼超大字符串。先停进程，再把主编译改成“真实编译无 report，receipt/summary 单独走 world-receipt”，并优先走更窄的 backend-driver 路径。
-- 只要改过 `v3/bootstrap/cheng_v3_seed.c`，就不要拿旧 `cheng.stage3` 的 provider freshness 失败当真回归；先看 mtime，再按标准链重跑 `cc ... cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0` 和 `artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge`。
-- `compiler_main` 自编主线不能再让 `backend_driver -> stage3` 截胡 `system-link-exec`；active backend driver 至少要本地接住这条命令，不然一碰超出 bootstrap 子集的真源又会掉回旧 stage3 边界。
-- `DEST_ADDRESS` 和 `IMPORT_BUFFER` 这种 typed/lowering 已区分的 composite return 语义，seed 里也要先提升成显式枚举再继续收口；哪怕当前机器语义暂时还共用同一个尾段动作，也不要再压回单个布尔位，不然后面继续拆 post-call materialize 时又会重新缠回去。
-- result-address call 的目的地址 contract 是两段时序：`dest spill store` 必须早于 arg materialize，`dest spill load` 才能放进公共 `call finish`；如果把两者都往后挪，前面的 composite arg/path 会直接读脏地址。
-- return-path 收口不能只盯 scalar result materialize；`ffi_handle` return fixup 这种后置补丁一旦并进公共 `call finish`，必须先用显式 contract gate 住，不然普通 non-composite call 会因为 target 默认零值把空 helper 直接发射成 `bl _`。
-- `call_from_spills` 这层如果要真变成“layout fact 驱动”，不能只把 `reg ordinal / stack offset / stack bytes / copy_from_ptr` 放进 layout；`arg_load_abi` 这种 emit 还会回查的字段也要一起落进去，不然 `stack/reg` 发射阶段仍然在偷偷重算 lowering 事实。
-- `uir_core_builder/uir_opt` 这两份聚合大文件也可以按“先低风险机械口径，再 fresh 重建”的方式推进；先收 `envIsTrue/getEnv/os.C_fflush/sizeof`，再顺手吃掉 `stage1Trace/releaseString/hasError/printDiagnostics/typeKey/len(inPathTag)`，最后同口径复扫如果只剩字符串/注释假命中，就该停，不要在这条线继续空转。
-- `root_exec_pipeline/top_level_passes` 这两份 deferred 大文件可以先收 `envIsTrue/getEnv/os.C_fflush` 这一层，风险可控；做完后 backend 全量扫描会很快塌缩到 `uir_opt/uir_core_builder` 两份聚合文件，说明 leaf 阶段确实已经收得差不多了。
-- `src/backend` 这层一旦只剩单数命中的 leaf 文件，就先把 tiny tail 清近空，再顺手追一次同轮复扫冒出来的 `sizeof T`；这轮 `reachability_scan` / `builder_types` 之后又带出了 `uir_loop_analysis/macho_linker/uir_core_ssa/uir_core_types` 这批残点，收完后排除大文件的扫描集合只剩 `ffi_out_ptr` 里的字符串假命中，说明这种收尾顺序最稳。
-- `src/backend/uir/uir_internal` 继续扫尾时，先吃 `policy_contract/type_decl_passes/call_resolution/object_runtime_helpers/current_root_cache/symbol_state/...` 这类小型 helper 文件，别急着上 `root_exec_pipeline/top_level_passes`；这条顺序更稳，也更容易让扫描结果单调下降。
-- 已经动过的 file-phase 文件不要留零散 `dbgFile/getEnv` 尾巴；`uir_core_builder_file_exec_pipeline.cheng`、`uir_core_builder_file_stage1_phases.cheng` 这轮证明，顺手一次补平比后面反复命中同一批残点更省事。
-- `src/backend` 做机械旧调用面复扫时，记得先排除 `src/backend/uir/uir_internal/_tmp_*` 这类临时切片文件；不然扫描结果会被重复命中淹没，真正的小而真 leaf 文件反而不明显。
-- `aarch64_select`、`macho_linker`、`uir_core_ssu`、`uir_core_builder_types`、`uir_core_builder_policy_contract` 这类非生成 leaf 文件可以继续机械推进；`sizeof`、`envIsTrue`、`os.C_fflush` 这几类旧表面收口后，fresh `build-backend-driver + run-host-smokes` 仍然稳定为绿。
-- `src/backend` 继续收旧调用面时，先吃非生成 leaf 文件，不要一上来就改 `uir_core_builder.cheng`、`uir_opt.cheng` 这类聚合大文件；`uir_vectorize_*`、`uir_core_builder_*` leaf 先收完，fresh `build-backend-driver + run-host-smokes` 仍然稳定更绿，也更容易定位真回归。
-- 每次 fresh `build-backend-driver` 前，先用 `rg` 复扫 `backend_driver_main.cheng` 里的 `V3OracleSignedBatch|oracleSmokeBatchFill|oldRoundBatch|futureRoundBatch|duplicateTx`；oracle helper 回流频率太高，不先查源码真值就容易把首个红点误判到本轮迁移文件上。
-- parser、typed_expr、compiler_csg、lowering_plan 必须共享同一份 normalized HIR 真源；不要在其中一层删字段或改枚举再指望别层自己适配。
-- seed / ordinary 的 type-call 只能走一条 `expr -> type-call surface` 入口；不要再长 default-init / constructor 专用薄壳。
-- “禁用显式默认值初始化”只针对 `= 0`、`= ""`、`= false`、`= []` 这类零值重写；有真实业务语义的初始化不在这条规则里。
-- perf 合同如果要观察 primary object cold miss，就清 `artifacts/v3_primary_object_cache`；不要直接把 cache 层整个绕掉。
-- Cheng 自带调试链路优先于 lldb/gdb：先看 `debug-report/print-asm/print-line-map`、`*.compile.log`、`*.run.log`、`*.v3.map`、`*.primary.o.s`，只有落到宿主 C runtime/linker 边界才补外部调试器。
-- provider / primary cache key 只放决定等价性的输入：source、lowering、target、compiler/codegen、exports；不要把生成 asm 文本本身再塞回 key。
-- primary object cache miss 必须直达底层 materializer；从 cache 层绕回 wrapper 会立刻递归爆栈。
-- nested provider plan 之后必须重绑当前 target；不要继续读悬空的 `v3_active_codegen_target_triple`。
-- typed/call/lowering 报告字段只能有一个生成出口；当前出口是 `v3TypedExprReportText(...)`。
-- ordinary helper 要写成 seed no-handoff 能稳编的形状：单次 trim、线性扫描、少薄壳、少重复 helper call。
-- seed 热路径里不要把 `*compositePtr` 直接绑定成本地复合值或当作实参传下去；优先保留外层复合签名不动，只把最先炸掉的复合参数改成指针，并补 `ptr->field`/专用 pointer helper。
-- 会影响真实 payload 的 Node helper 不能被过早宣布“已 Cheng 化”；先做 Cheng finalizer / sidecar，再替换主 payload。
-- 宿主子进程失败不要只打印 `rc=139` 这类裸退出码；至少同时给出标准信号名，比如 `exit=139 signal=SIGSEGV`，不然排障信息不完整。
-- 生成出来的 Cheng 代码只能调用目标包真正导出的公开符号；`std/json` 这类模块不要臆造 `IsString/IsArray` 或小写 helper，统一走公开的大写 API 和可见字段。
-- 只靠减少 `__cstring/.text` section 切换次数压不动 `primary_object_asm_compile_ms`；先盯 asm 体积本身或自有 object writer，不要在 assembler section flip 上继续消耗。
-- `artifacts/v3_backend_driver/cheng` 可能比源码树更旧；只要碰了 `parser.cheng` 这类真源，就必须重新确认 `build-backend-driver` 还能重建，不然 stale driver 会掩盖当前源码已经变红。
-- backend driver 的 nested provider object 不能再走 seed 内部 materializer；必须回到当前编译器自举的 `system-link-exec --emit:obj`，否则 `_main`、runtime bridge 这类符号会被编进 provider object，最后在 native link 才炸 duplicate symbol。
-- Cheng 边界扫描循环不要写成 `atEnd || text[i] == ...` 这种依赖短路的形状；到 `i == len` 的那一轮先拆出 `splitHere/atEnd` 分支，再决定是否读取 `text[i]`。
-- 只要碰了 `v3/bootstrap/cheng_v3_seed.c` 或 `v3/bootstrap/stage1_bootstrap.cheng`，旧 `stage3/backend_driver` 都不会验证到新 seed；先用 `cc ... cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0` 重编 stage0，再跑 `bootstrap-bridge` 和 `build-backend-driver`。
-- 不要先相信旧 `*.log` 的报错；先用 fresh 编译器把失败重放一遍，确认当前第一现场，再决定该改 bootstrap、provider 还是 ordinary 源。
-- 会进 primary object 热路的 ordinary helper 要尽量写成平铺形状：少内联数组、少 helper-call 叠深度、少复合返回值直赋；优先 `args` 临时量 + 本地结果变量 + 线性赋值。
-- target signature 真源要存类型文本，不要存 ABI 字面量；`return_abi_class/param_abi_classes` 一律从 `type_text -> v3_type_abi_class(...)` 推导，特别是 composite 参数，不要再写裸 `"composite"`。
-- 不要只改“大 builder”；`strformat join`、`intrinsic module`、wasm fallback 这种小 target builder 也必须并到同一个 signature helper，不然 ABI 漂移会从边角重新长出来。
-- target signature 只收口到 builder 还不够；`external_call_signature`、`importc probe fallback`、resolved callee normalize 这些“最终装配层”也必须并到同一个 helper，不然最后一公里还是会把 ABI 写散。
-- 签名层收口之后，下一层也要继续收：`param_type/abi -> arg kind`、`type/abi -> return-address preference` 这种 lowering fact 也必须有单一 helper，native/wasm builtin 小支线不能再各自写 value/address 判断。
-- 只统一 `arg kind` 还不够；`preferred_type/abi` 的补全和 `strformat join -> str[]` 这种小归一化也要共用 helper，不然 prepare 阶段照样会留下两份规则。
-- prepare 层收口完后，emit 层也不能留平行大分支；native 标量调用和复合返回调用这种只差 result path 的代码，参数发射必须共用一个 `arg_kind -> spill` helper。
-- helper 起完以后，还要顺手清掉热路径里残留的旧判断入口；不然 `direct arg address`、`address spill`、`external composite stack layout` 这类边角代码会继续绕开新 helper。
-- `discard` 在 Cheng 里已经是移除语法；看到旧日志或旧源码片段里还出现它，正确动作是查 stale 输入或旧产物，不是给 seed/parser 补兼容。
-- `bootstrap-bridge` 选 live compiler 只能看 bootstrap 真输入，也就是 `seed + stage1`；不要把 `compiler_main/gate/runtime/request` 这类 ordinary 真源也混进“还能不能跑 compile-bootstrap”的 fresh 判断，不然旧 stage3 明明还能自救却会被误判成死编译器。
-- `backend driver ready` 不能只看二进制“存在”；必须连 `.v3.map` 和 fresh 输入一起看，不然 stale `artifacts/v3_backend_driver/cheng` 会把后面的 `build-chain-node` / selftest 继续拖进假红。
-- `src/std/os.cheng` 这类真源路径不能写成 `os.Cheng`；macOS 大小写不敏感时会把问题遮住，Linux/远端 fresh 检查和 host bridge 审计会直接漏依赖。
-- backend driver 的 fresh 闭包不能漏 `compiler_runtime_program_entry_provider_v3`、`program_support_host_runtime_v3`、`os_host_process`、`os.cheng`；command surface selftest 一旦编到 ordinary/provider 混合场景，漏任何一个都会重新掉进 `missing current compiler source`。
-- backend driver 拉起子编译器/子工具时，`CHENG_V3_ROOT` 不能指望宿主环境自动继承；compile/run 两条子进程链都要显式带上，不然 `gate_main`、`vpn-gui` 这类二级工具一进 nested provider materialize 就会丢根目录。
-- `std/os::setEnv` 这种基础 API 也得写成 primary-object 可编的线性形状；`discard c_setenv(...)` 会直接把 ordinary backend driver 编译卡在 `stmt_call`。
-- backend driver 里的 host smoke 名不等于顶层命令名；像 `call_hir_matrix_smoke`、`lowering_plan_smoke`、`csg_smoke` 这类验收要走 `run-host-smokes`，先查 command surface 再跑，不要拿 `unknown command` 当成编译回归。
-- call emit 收口到最后一层时，别在 emitter 里继续边扫边算 stack 位；先把 `reg ordinal / stack offset / stack bytes / copy-from-ptr` 显式化成 layout，再让 stack/reg/call 尾段共用它，平台特例才不会反复漏进发射阶段。
-- 如果 layout builder 里还残留 `if x64 external` 这类平台条件，下一步先把它拆成单独的 placement fact helper，再继续收布局；不要让“平台规则”和“累计 stack offset”混在一个循环里反复长分叉。
-- mini-seed 不能只瘦 `validate_contract`；wrapped stage0 的 `bootstrap-bridge` 必须跟随 embedded contract source path，runtime 的 `*_source` 也必须能从 `bootstrap_manifest` 取真值，不然新合同只会卡在 `print-contract/self-check`。
-- mini-seed 接上 seed 以后，ordinary 侧的 `bootstrap_contracts` 和 `build_plan` 也必须跟着切到当前 `stage1_source`；只改 seed 不改 ordinary，`build-backend-driver` 会被旧 `stage1_bootstrap.cheng` 路径拖进假 `plan drift`。
-- live contract 正式切到 `v2` 以后，不要再在 `compiler_main/gate/bft` 这类入口里手写 `stage1_bootstrap.cheng`；路径真值要继续收在 `bootstrap_contracts` helper，不然后续再换 contract 位置会重新散开。
-- ordinary 入口收完以后，seed C 里的 remote compile / BFT fresh shell 也要继续吃同一份 `stage1_bootstrap.cheng` helper；否则 live contract 已经切到 `v2`，seed 里还是会偷偷保留第二份路径真值。
-- checked-in live contract、gate 和 fixture 都已经切到 `v2` 以后，就不要再留 `v3-bootstrap-v1` 兼容读取；最稳的做法是直接删分支，再补一个 old-contract negative smoke 固定“只认 v2”。
-- 把平台特判拆成 placement helper 以后，不要停在“只是改名”；还要继续把 helper 内部的 ABI 门槛拆出来，不然 x64/external 语义只是换了个壳，后面扩目标还是会重新缠回去。
-- 拆 ABI predicate 时不能顺手改变支持面；像当前未实现的小 aggregate register ABI，要继续显式报 unsupported，不能因为 predicate 细化就默认掉回普通寄存器/stack 路径。
-- 不能把“删空格单参调用”直接理解成全局硬删 `spaceCall`；先扫仓内真实用法。像 `Fmt / Lines` 这种 special form 可以先单独收口，但 generic `f x` 仍在大面积存活时只能先分轮迁移。
-- `verify-export-visibility` 能跑不代表别的 stage1 AST 审计也能直接挂 public surface；只要审计需要 `stage1/parser` body materialize/full parser，就先不要接进 backend driver/gate/default smokes，等 ordinary compile 真能吃下那条 parser 子集再开放。
-- generic `spaceCall` 迁移不要卡在“先做全仓审计入口”；可以先沿 `src/stage1/parser.cheng` 自己的 `spaceCall` 解析路径分簇把内部 helper 调用改成 `f(x)`，再用 `build-backend-driver + parser_normalized_expr_smoke + verify-backend-driver-command-surface` 做 fresh 验收。
-- 这条 parser 内部迁移可以直接沿连续主干扩，不必永远停在最小 helper 簇；`pattern/formal params/record/suite/if-while-for-case/routine/type decl/import` 这一整段在同一轮里改成 `f(x)` 也是稳定可验的，只要每轮都 fresh 重建 backend driver。
-- 当 `src/stage1/parser.cheng` 同口径 grep 已经扫空时，就不要继续在这个文件里抠边角收益；下一刀直接换到别的 `src/stage1` 真源，整体推进更快。
-- `spaceCall` 迁移从 `parser.cheng` 往外扩时，先挑单文件、grep 口径清晰、能用 fresh `build-backend-driver + run-host-smokes` 验收的中等真源文件推进，像 `src/stage1/ownership.cheng` 这种就适合先收 `kidCount/ownership*` 一整簇；不要反手又去碰会挂住的 command-surface wrapper。
-- `src/stage1/semantics.cheng` 这种大文件也不用等“整份文件方案”；先抓 call/borrow/stmt-scope 这种连续 helper 段分轮推进，同样能保持 fresh `build-backend-driver + run-host-smokes` 绿色。
-- `src/stage1/semantics.cheng` 一旦 call/borrow/stmt-scope 这条线收顺了，就继续顺着 type/pattern/import/global 同风格连续段推进；同文件内按职责簇线性前进，比来回切文件更稳也更快。
-- `src/stage1/semantics.cheng` 进入线性推进阶段后，优先把同一 grep 口径的尾巴当轮收干净，再做 fresh `build-backend-driver + run-host-smokes`；不要在一簇还没扫空时就跳去下一簇。
-- `src/stage1/semantics.cheng` 到后半段时，不要只盯连续大段；像 `len/getEnv/normalize/plainName` 这种散点单参调用也可以按统一 grep 口径一轮收掉，收益同样稳定。
-- `src/stage1/monomorphize.cheng` 这种中等大文件适合按“连续 helper 簇 + 固定 fresh 验收”推进；先吃 700-1050 这种成片区域，再顺着同文件往 1120+ 推，比一上来全文件散扫更稳。
-- `src/stage1/monomorphize.cheng` 一旦前两段连续块都验绿了，就继续按同文件线性推进到 1600+ 的 expr/dispatch/helper 段；不要中途跳去别的 `src/stage1` 文件打断节奏。
-- `src/stage1/monomorphize.cheng` 的 `lowerImplicitCallsExpr/lowerImplicitCallsStmt` 周边同样适合整段机械收口；把 `kidCount/len/mono* helper` 一次性按连续块扫空，再用 fresh backend driver + host smokes 验证，稳定性很好。
-- `src/stage1/monomorphize.cheng` 的 `instMap/lambda/generic compare` 和 `typeKey/trait/fn helper` 也适合按连续大块推进；只要同段 grep 口径清晰，就优先整段收口，不要切回零散散点。
-- `src/stage1/monomorphize.cheng` 的 `trait/vtable/generic where` 一旦收完，紧挨着的 `instantiateLambda/lambdaFnType/template transform` 最好顺手一起吃掉；同一轮里做完这片连续块，比后面再回补尾巴更省事也更稳。
-- `src/stage1/monomorphize.cheng` 进入 `transform/nkCall` 这一带以后，也还是按连续块收最稳；`looksLikeType*`、`bracketCallToExpr`、`nkLet/nkBracketExpr/nkLambda/nkCall/nkSeqLit` 这一整段虽然更长，但同口径机械改成 `f(...)` 后，fresh `build-backend-driver + run-host-smokes` 依然稳定，不需要拆回小散点。
-- `src/stage1/monomorphize.cheng` 这种按 range 线性推进的文件，最后还要补一次全文件 heuristic 复扫；尾段收完不代表真扫空，前面 helper 里还可能残留少量 `len/typeKey/monoStripVarType/echo/collectFnArities` 这类散点旧写法。
-- `src/stage1/frontend_lib.cheng` 也适合按连续 helper 块推进；`80-240` 的 import/path resolve 和 `953-1212` 的 cache/path/token helper 已经证明这份文件能稳定机械收口。下一刀优先顺着 `1558-1690` 的 path normalize/root-check 继续往下推，比回头捡散点更稳。
-- `src/stage1/frontend_lib.cheng` 的 path normalize/root-check 一旦验绿，就继续顺着同文件的 import/pkg-root/cache write helper 往下推；`1557-1692`、`2022-2168`、`1398-1452` 这几块虽然不完全相邻，但同属 path/import/cache 一条线，机械改成 `f(...)` 后同样稳定。
-- `src/stage1/frontend_lib.cheng` 的 import-recursive/cache/module-dir helper 验绿以后，下一刀可以直接切到 `2804-3015` 的 deps helper 线；`loadSystemModuleId/parseModuleForDepsId/collectResolvedDeps/compileToDepsList` 这段同样是高密度老式单参调用，而且还是同一份前端依赖解析主线。
-- `src/stage1/frontend_lib.cheng` 的 deps helper 验绿以后，可以顺手把同文件当前口径下露出来的 env/plugin/cache-phase 尾巴一起补平；等 targeted heuristic 只剩 debug 字符串这种假命中时，就别继续抠这份文件了，直接切到下一份中等真源。
-- `src/stage1/c_profile_lowering.cheng` 也适合按连续 helper 簇推进；trace/map/wrapper/closure/iterator 这几块首轮验绿以后，就继续留在同文件线性往中段 `param/type + named/lambda helper` 和后段 `closure env/trampoline builder` 推，不要刚起头就切回别的文件。
-- `src/stage1/c_profile_lowering.cheng` 的 `param/type + named/lambda helper` 和 `closure env/trampoline builder` 验绿以后，下一刀继续顺着同文件的 `named stmt/call expr/helper` 大块往下推最稳；这份文件已经证明按连续块线性推进比回头捡散点更高效。
-- `src/stage1/c_profile_lowering.cheng` 的 `951-1479` named stmt/call expr/helper 验绿以后，也继续顺着同文件推进最稳；下一刀直接切 `1498-2148` 的 `if/case/result/async/qexpr` helper，别在这时回头补更散的 `len/type` 尾巴。
-- `src/stage1/c_profile_lowering.cheng` 的 `1498-1660` 纯 helper 段也能稳推；`if/case/result/type-key` 这块可以先单独吃掉，再继续下钻 `1712+` 的 async/closure/qexpr helper，不用硬把整段一次性打完。
-- `src/stage1/c_profile_lowering.cheng` 的 `1712-2148` async/closure/qexpr helper 也能继续按连续块稳定推进；这段收完以后，下一刀直接顺着 `2175+` 的 `lowerQStmt/lowerControlExpr` 往下推最省事，不必回头做散点。
-- `src/stage1/c_profile_lowering.cheng` 的 `2175-2415` `lowerQStmt/lowerControlExpr` 同样能稳推；这段验绿以后，下一刀直接顺着 `2449+` 的 `lowerControlShortCircuitExpr/lowerControlStmt` 往下吃，不要再跳文件。
-- `src/stage1/c_profile_lowering.cheng` 的 `2449-2679` `lowerControlShortCircuitExpr/lowerControlStmt` 同样能稳推；这段验绿以后，下一刀直接顺着 `2769+` 的 iterator helper 往下吃，不要跳回散点或别的文件。
-- `src/stage1/c_profile_lowering.cheng` 的 `2769-3380` iterator helper 也能稳推；这段验绿以后，下一刀直接顺着 `3484+` 的 iterator lowering / async capture 连续段往下吃，不要切回别的文件。
-- `src/stage1/c_profile_lowering.cheng` 的 `3484-3889` iterator lowering / async capture 连续段也能稳推；这段验绿以后，下一刀直接顺着 `3990+` 的 async stmt lowering 连续段往下吃，不要切回别的文件。
-- `src/stage1/c_profile_lowering.cheng` 的 `3990-4152` async stmt lowering 连续段也能稳推；这段验绿以后，下一刀直接顺着 `4255+` 的 async stmt list / driver / wrapper 尾段往下吃，不要切回别的文件。
-- `src/stage1/c_profile_lowering.cheng` 的 `4255-4562` async stmt list / driver / wrapper + validate 尾段也能稳推；这段验绿以后，不要继续死盯 `kidCount` 口径，下一刀直接切 `lowerCProfile` orchestration 尾段，把 `lowerTrace/lowerNamedDefault/lowerCollect*/lowerQuestion/lowerControlFlow` 这批 bare call 一起收掉更省事。
-- `src/stage1/c_profile_lowering.cheng` 的 `lowerCProfile` orchestration 尾段收完以后，当前 targeted heuristic 就基本扫空了；这时不要再回头抠这份文件的零散尾巴，直接切下一份中等真源更快。当前更合适的下一站是 `src/stage1/lexer.cheng`，因为 `len s/text/content` bare call 集中在少数连续 helper 段里。
-- `src/stage1/lexer.cheng` 这类中等真源也适合按“先扫最集中的 bare call，再顺手补尾巴”的两步推进；`len/isDigit/isAlphaNum/isHexDigit/isAlphaAscii/isDefKeyword/os.C_fflush` 这条线验绿以后，当前 targeted grep 就能直接扫空，不必继续在同文件抠边角。
-- `src/stage1/lexer.cheng` 扫空以后，下一刀切 `src/stage1/ownership.cheng` 比回头再碰 `lexer` 更划算；`getEnv/ownHashStr/len/ownIsExprNode/ownLocalMapDec/ownLocalMapHas/ownLocalMapInc/ownSkipOwnershipKind/ownershipAnalyze*` 这批命中集中在少数连续 helper 段里，形状和前几轮一样机械。
-- `src/stage1/ownership.cheng` 也适合按“先清一批连续 helper，再顺手补剩余几处同类 bare call”的两步推进；`getEnv/ownHashStr/len/ownIsExprNode/ownLocalMap*/ownSkipOwnershipKind/ownershipAnalyze*` 这条线验绿以后，再补 6 处 `ownRoundUpPow2 cap/newCap`，当前 ownership 专用 grep 就能直接扫空。
-- `ownership/lexer/c_profile_lowering` 这种文件一旦在专用 grep 下已经空了，就不要继续凭感觉留在原文件抠边角；下一刀先重新扫 `src/stage1/*.cheng` 的真实命中，再选下一份中等真源更稳。
-- backend driver 的 oracle helper 回流是高频真回归；每次 fresh `build-backend-driver` 红在 oracle resilience 时，先看源码里是不是又长回了 `V3OracleSignedBatch` 局部槽，而不是先怀疑本轮正在迁移的 stage1 文件。
-- `build-backend-driver` 和 `run-host-smokes` 不能并行跑；它们会共享 `artifacts/v3_backend_driver/*`，并行只会制造假红。
-- oracle resilience 这类 ordinary helper 里不要再声明 `V3OracleSignedBatch` 这样的复合局部槽；最稳的形状是直接在调用点消费 `oracle_fixture.oracleSmokeBatch(...)`，别先 `var tx` 再填。
-- 碰 backend driver 这种会被别的提交反复改动的文件时，不要只相信“上一轮已经修过”；fresh 重建前先复看源码真值。oracle helper 这轮就再次回流到了旧形状，重新改回直接消费 `oracle_fixture.oracleSmokeBatch(...)` 后才恢复绿色。
-- 重新扫 `src/stage1/*.cheng` 挑下一刀时，优先吃 `src/stage1/type_syntax_lowering.cheng` 这种“小而真”的文件：`lowerStrip/stripSpaces/getEnv` 这类少量集中命中可以快速验绿，比回头抠已扫空文件的零散尾巴更稳。
-- 扫 `src/stage1/*.cheng` 的 bare call 时，记得把带模块前缀的单参调用也算进去，比如 `bos.OpenRead path`、`bos.ReadAll f`、`bos.Close f`；只扫裸函数名会把 `diagnostics.cheng` 这种小文件的真尾巴漏掉。
-- 对 `src/stage1/ast.cheng` 这种几乎只剩单点命中的文件，不用等攒成一批；像 `panic "..." -> panic("...")` 这种单行尾巴可以顺手清掉，验证成本很低。
-- `src/stage1/parser.cheng`、`src/stage1/lexer.cheng` 这种早先看起来“已扫空”的文件，换成更宽一点的函数名口径后仍会冒出真尾巴；下一轮扫 `src/stage1/*.cheng` 时，把 `envIsTrue/parser_isBuiltinTypeName/isLineEnd/charToStr/chr/isContinuationToken` 这类函数也算进去。
-- `src/stage1/token.cheng` 这种只剩 `chr 0` 的超小文件也适合顺手清零；单点 `chr 0 -> chr(0)` 这类尾巴验证成本极低，不必攒到后面再做。
-- 继续往下扫时，别把 `panic "..."`、`chr 0/39`、`charToStr ch` 排除在外；`ownership/parser/lexer` 这轮证明它们也是同一类真实尾巴，而且修完后 `build-backend-driver + run-host-smokes` 仍然稳定为绿。
-- `src/stage1/c_profile_lowering.cheng` 这种已经按大块连续段推进过的文件，放宽 helper 名口径后仍可能再冒出 `lowerValueLookup/lowerInferExprType/asyncAwaitKindFromType/asyncPendingName/asyncSetName` 这类残点；下一轮扫尾不要只盯词法/字符串 helper。
-- 对已经接近扫空的文件，像 `lowerInferExprType res.expr` 这种单行散点可以顺手补掉；不必等它重新凑成一簇。
-- 对已经接近扫空的文件，像 `ownIndexMapInit 256`、`ownLocalMapInit 256` 这种“函数名 + 数字字面量”的旧写法也适合顺手清零；这类点位机械、验证成本低。
-- 重新扫 `src/stage1/*.cheng` 的 bare call 时，不要漏掉 `echo x` 这种 profiling/debug 输出点；`src/stage1/semantics.cheng` 和 `src/stage1/ownership.cheng` 证明它们会在大块 helper 都扫完后作为真尾巴继续存活。
-- 继续扩大 `src/stage1/*.cheng` 的 bare-call 扫描口径时，也要把 `releaseString x`、`os.C_fflush f` 这种输出/释放类基础 API 算进去；它们同样会在 `frontend_lib/parser/monomorphize/semantics` 这种已大面积收口的文件里作为真尾巴继续残留。
-- 对像 `src/stage1/parser.cheng` 这样已经被多轮扫过的文件，最后还要补一次“单点 helper”复扫；`tokenSpan prev`、`isDefiniteTypeExpr node` 这种散点不会再自己长成一簇，但仍然是要清的真尾巴。
-- 做 bare-call 复扫时，不要漏掉 `c_fclose f` 这种下划线底层 API；`src/stage1/frontend_lib.cheng` 说明已多轮清理的文件最后也会只剩这类单点尾巴。
-- 做旧调用面复扫时，也别漏掉 `sizeof T` 这种 built-in special form；`src/stage1/token.cheng`、`src/stage1/lexer.cheng`、`src/stage1/frontend_lib.cheng` 证明它会在普通 helper 基本扫空后继续残留。
-- fresh 验证如果先红在 `bootstrap-bridge bootstrap inputs newer than live bootstrap compiler`，先按稳定口径重编 `artifacts/v3_bootstrap/cheng.stage0` 并重跑 `bootstrap-bridge`，不要把 bootstrap freshness 误判成这轮 ordinary 源改坏了。
-- 扫完 `src/stage1` 以后，下一层最值钱的是 `src/std`，不是立刻去碰更大的 `src/backend`；`std/os`、`std/sync`、`std/hashmaps` 这类文件里还会有同样机械的 `splitFile path`、`c_fclose f`、`memRetainAtomic a`、`atomicLoadI32 &x`、`sizeof bool` 尾巴，先吃这层收益最高。
-- 像 `std/os.cheng` 这种大文件做机械语法收口时，补丁后一定要立刻做同模式定向复扫；不然很容易留下“同一位置新旧写法并存”的手滑残点。
-- `src/std` 再往深一层时，也别只盯容器/文件 API；`async_rt`、`bytes`、`rawbytes`、`sha256`、`system`、`system_helpers_backend*` 里照样会有一整批机械旧表面，尤其是 `alloc len`、`bytesLen data`、`bytesAlloc outLen`、`smallSigma0 w15`、`u32 sumX`、`sizeof Type`、`c_strlen s`、`cheng_async_make_void 0/1`。
-- `src/std/system_helpers_backend*.cheng` 这种 runtime 大文件可以继续收，但前提是只做完全机械的 `sizeof` / 单参调用语法清理；不要在同一轮混入语义改动。
-- `backend_driver` 桥接 `stage3` 时会复用同一个 `CHENG_V3_PROGRESS_OUT` 路径，并从头重写 progress 文件；看到 phase 日志回到 `build/system_link_plan` 不是卡死，先看子进程树和 phase 是否继续推进，再决定要不要停。
-- `stage3` 编 `chain_node` 这类大入口时，纯 debug transcript 文本不要进生产编译热路径；这轮 `msquicTls13*TranscriptHash` 证明，无论包成 `Bytes` 返回、`str` 返回还是 `out: var str` helper，都会把 ordinary backend 再次拖进 `primary_object_body_semantics_missing`。如果只有调试用途且无人依赖，直接删掉这条 debug 输出才是最小正确收口。
-- `build-chain-node` 的真实编译依赖是 `stage3 + chain_node source closure`，不是 backend driver launcher 本身；默认把 compiler 绑到 self path 会让每次 backend driver 改动都把 `chain_node` 缓存白白打脏，正确口径应先选 `stage3`，freshness 也按 `stage3/source closure/outBin` 判。
-- backend driver 外层一旦已经选定了 `stage3`/`stage2` 作为 bridge compiler，就不要让内层 bootstrap compiler 在 `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1` 模式下继续往更低 stage 再桥一次；这轮 `stage3_system_link_exec_handoff_smoke` 证明，内层继续桥接只会把 success summary 漏进 forward log，并把时延拉长。
-- `backend_driver` 内嵌调用 `compiler_main.v3CompilerRunSystemLinkExec(...)` 时，也必须显式设置 `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1`，并让 `v3CompilerBridgeCompilerPath(...)` 把“当前可执行就是 backend_driver”视为本地终点；不然 `system-link-exec` 会重新掉回旧 bootstrap `stage3`，实时 progress 和当前 v3 语义都会一起失效。
-- `backend_driver` 下面那些 `vpn-gui/mobile-shell/vpn-proxy/gate` 子工具不能每次 help 都现编；和 `chain_node` 一样，tool 二进制也要按 `source closure + compiler + target + out path` 写 build stamp 做 freshness，不然 `backend_driver_command_surface_smoke` 会被一串重复自编白白拖长。
-- `build-backend-driver` 也不能继续让 `backend_driver` 走未知命令 fallback 掉回 `stage3`；一旦主线已经把 `system-link-exec` 收回本地，`build-backend-driver` 也必须同口径本地接住，不然 `build_backend_driver_report_smoke` 这种会故意 touch `stage3` 的路径会直接重回旧 bootstrap 语义甚至崩掉。
-- host smoke 的全局 `CHENG_V3_SMOKE_RUN_TIMEOUT_SEC` 不能把单条 smoke 的最低合同压得更短；像 `build_backend_driver_report_smoke` 这种明确会重建 backend driver 的路径，应该用 `max(global_timeout, smoke_min_timeout)`，否则主线已经修好也会被过短超时误杀。
-- `build-backend-driver` 的 selftest 不要占用公共 staging 名字；这轮先后证明了 `artifacts/v3_backend_driver/cheng.next` 和 `artifacts/v3_backend_driver/cheng_candidate` 都会在长链里被别的 build/install 流程碰掉。更稳的口径是 selftest 全程只用这条构建私有的编译器路径，全部通过后再一次性改名安装。
-- `system-link-exec` 的私有符号诊断不能只盯 `exprLayer`。`helper.privateFn()` 这类 member call 可以从 `unknown_qualified_target` 还原，但 `strfmt.fmt"..."` 这类旧表面根本不会进 `exprLayer`；最稳的口径是失败时同时扫源码里的 `import ... as alias` 和去注释后的 `alias.lowercaseMember` 用法，把跨包小写成员直接报成 `imported private symbol ... is not exported`。
-- `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1` 不能只把 `artifacts/v3_backend_driver/cheng` 当成本地终点；`cheng.selftest_driver`、`cheng.private_*` 这类 backend driver 变体也必须一律视为 live bridge。否则正向编译普通程序时会误报 `missing live Cheng bridge for system-link-exec`。
-- `compiler_main` 里那种几十个 `str` 参数排成一长串的 helper，会把 seed 的函数签名元数据解析直接顶炸；这种报表函数要么拆成多段 helper，要么先把重复字段折成小块文本，再传少量参数。
-- `build_backend_driver_report_smoke` 现在跑的是整条 cold `build-backend-driver`，实测已经超过 600 秒；内外两层 timeout 都必须按真实 cold 路径留足，不然只会制造假红。
-- `build_backend_driver_report_smoke` 这类直接 `ExecFileCapture` 子编译器的 smoke，必须显式带上 `CHENG_V3_ROOT`；只靠 cwd 猜根目录会让 `backend_driver/stage3` 口径漂掉。
-- 手工替换 live `cheng` 不能用 `cp` 直接覆盖；会出现 dyld 装载坏态。可执行文件安装只能走原子 `rename/mv`。
-- `system-link-exec` 现在的 `compile_progress phase=build status=done` 只代表 plan/receipt 收束，不代表外层 bridge/restore/实际成功返回已经结束；进度面必须把父子编译串起来并在转发时改成 append，否则用户看到的就是假完成。
-- 父层自己也不能只信内存里的 `progressText` 缓存；子编译写完后如果父层继续按旧缓存重写文件，就会把子 phase 全盖掉。正确口径是每次父层写新进度前先同步现有 progress 文件，再追加自己的 phase。
-- 只要 live `backend_driver` 还是 bootstrap shim，`backend_driver_selfhost_progress_smoke` 的实时 phase 就同时依赖两层：外层 shim 自己要补 `execute/bridge_compile/browser_bridge_restore`，内层 `cheng.stage3 system-link-exec` 也必须原生吐 `system_link_plan/source_bundle/compiler_csg/world/lowering_plan/...`。只修一层，progress 文件都会停在半路。
-- `native_link_plan done` 只代表链接计划已经准备好，不代表 provider 物化、主对象生成、真正 native link 已经结束；progress 必须继续覆盖 `provider_objects / primary_object_emit / native_link / line_map`，否则用户会看到高 CPU 长时间“像卡死”。
-- `cheng.stage3 system-link-exec` 成功路径不能再无条件生成并打印 full report；默认 compile log 只该保留 realtime progress，只有失败或显式 `--report-out` 才需要 report，不然 `backend_driver_selfhost_progress_smoke` 会被 `source_closure_count=` 这类大报表字段误伤。
-- Cheng 语法收口不能只改文档；像空格单参调用这种旧表面要先做 `CHENG_STRICT_CALL_SYNTAX=1` 门禁，让新代码可被硬拦，等仓内迁移清零后再切默认硬错误。
-- bootstrap 合同路径必须和仓里真实文件布局同口径；这轮 `compiler_world_fresh_node_selfhost_smoke` 证明，`bootstrap_contracts.cheng`、`cheng_v3_seed.c`、bootstrap smoke 里只要还有一处写着 `v3/bootstrap/stage1_bootstrap.cheng`，fresh bridge/selfhost 就会在 seed 阶段直接报 `failed to open`。
-- 仓布局从 `v3/` 外移到仓根后，任何 `packageRoot = root/v3` 的残留都会把同仓 `cheng/core/...` 模块错判成跨包，表现成成片的 `imported private symbol ... is not exported`；正确口径是按源码路径就近解析 `cheng-package.toml`，不要手写 `root/v3`。
-- 普通 host smoke 不要直接 import `stage1/parser/ast/frontend_lib` 来做 AST 扫描；这些模块会把内部 deferred 编译器路径拉进 ordinary source closure，表现成 `primary object machine code not emitted`。语法清零要么等 fresh 编译器原生 strict gate 生效，要么先用明确函数名口径做小批机械收口。
-- 解析模块路径时，当前包和显式 external package root 必须优先于编译器共享 `cheng/*` 兼容别名；否则 `pkg://cheng/<业务包>` 会被误解析到编译器源码树，表现成外部业务包 self import 变成 `source_closure_unresolved_imports`。
+- 开始新任务先扫当前入口、源码根和活动 artifact，不要继承历史路径假设。
+- `build-backend-driver` 与 `run-host-smokes` 不要并行跑；它们共享 driver 产物，容易制造假红。
+- `chain_node`、GUI、mobile、r2c 属于应用或领域链路；只有明确要求时才进入核心编译门禁。
+- `build-backend-driver`、`slice-gate`、`run-host-smokes`、`stage2/stage3` 默认门禁只覆盖编译器核心和必要平台链路；`chain_node` 只能作为显式命令运行。
+- 改 bootstrap seed 后先重建 `artifacts/bootstrap/cheng.stage0`，再跑 `bootstrap-bridge`。
+- 当前根包路径就是仓库根；发现 `PathJoin(root, "")` 或 `PathAbsolute(root, "")`，优先改成直接使用根变量。
+- 迁移工具脚本时同步改路径、环境变量和生成包辅助链接；只改源码导入不够。
+- 定长数组字面量写复合元素时，数组基址必须跨元素 spill/reload；内层构造会复用寄存器写字段，不能假设外层基址寄存器不变。
+- `build-backend-driver` 的候选编译必须强制 `BACKEND_INCREMENTAL=0`、`BACKEND_MULTI_MODULE_CACHE=0`、`CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1`；driver 自举不能吃陈旧 primary object。
+- `artifacts/backend_driver/cheng` 缺失时不要用 `artifacts/bootstrap/cheng.stage3 run-host-smokes` 自救；这会触发旧路径自动重建 backend_driver。先停残留进程，恢复已有候选入口；单个 smoke 验证走 `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:<root> --in:<smoke>`。
+- 批量去旧版本前缀时，旧导出壳不能直接改成同名转发；同名同签名自递归会让重载选择歧义并表现为 `primary_object_body_semantics_missing`。
+- 启动任何 `backend_driver_main.cheng` 自托管编译前必须先扫 `cheng.stage3 system-link-exec`、`build-backend-driver`、`/tmp/backend_driver_*`、`lldb -- ... backend_driver_main`；发现同类进程先精准停止，禁止并发长编译和空等。
+- 跨模块 helper 不要复用同一个大写导出名；例如 `CompilerWorldLineValue` 只能有一个公开定义，其他模块必须用小写私有唯一名，否则 primary object 会生成重复全局符号。
+- `artifacts/bootstrap/cheng.stage3 system-link-exec` 是 C seed 路径；需要防内存暴涨时，除了 Cheng 版 host_ops/system_link_exec，还必须同步加 `bootstrap/cheng_seed.c` 级资源守卫。
+- `stage3 build-backend-driver` 也是 C seed 长路径；必须由 seed 默认注入 `CHENG_PROGRESS=1`、8GiB `CHENG_PROCESS_MAX_RSS_BYTES`，并实时透出 `compile_progress`，不能只等最后日志/report。
+- provider object materialize 选择当前编译器时，self executable 可执行即可作为当前编译器；freshness 检查只适合备用 stage 路径，不能阻断正在运行的 self。
+- parser 自举链路里避免写转义单引号字符字面量；需要匹配 quote/comment 字符时用 `char(34)`、`char(39)`、`char(35)` 这类明确码点。
+- 去前缀清理不只扫失败入口文件，要扫该 smoke 的完整 source closure；同名自递归函数壳和 `Foo: T = Foo` 自引用常量壳都会污染后续编译链路。
+- seed 最小化不要一次导入整套 `gate_main.cheng` 到 backend driver；先拆轻量 Cheng 控制面模块，否则 primary object plan 容易被超大 gate 入口打爆。
+- 业务分布式训练需要网络节点时优先接现有 `cheng/libp2p` + `cheng/DiLoCo/host/diloco_host` QUIC 控制面；不要停在本机内存 DiLoCo 状态机，也不要复制库目录。
+- libp2p 的底层协议模块不要复用 `host` 对外 API 的大写导出名；例如 store/kad/quic 内部实现要用 `Libp2pStoreEntries*`、`Libp2pKadState*`、`Libp2pHostQuic*` 这类唯一符号，否则 primary object 会按裸导出名重复定义。
+- source-symbol smoke 不要用 `SliceBytes` 热循环做长文本计数；这种防回潮测试应优先用 `StrContains` 的存在/不存在断言，避免测试自身卡住主线验证。
+- `world-receipt` 可作为 system-link 拆分的第一段纯 Cheng 控制面；它不走 object/native-link materializer。不要在 materializer 离开 C seed 前宣称 `system-link-exec` 已迁完。
+- `world-receipt` 是 world/proof 侧链，不是核心编译门禁；命令面文案和 smoke 必须避免把它列入 `core commands`。
+- 在仓库内做 source staging 时禁止 `cp -R` 整个 root 到 root 下的 artifact 目录；只复制 manifest/lock/src 这类最小真输入。
+- `build-backend-driver` 的报告应由真实 `system-link-exec --report-out` 产生；不要再额外跑 `world-receipt` 当候选收据门禁。
+- `build-backend-driver` 安装 candidate 时必须同时移动 `.map`，并在 ready 验证里把 map 当作同一产物的一部分。

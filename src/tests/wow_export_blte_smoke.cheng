@@ -1,0 +1,113 @@
+import std/bytes as bytes
+import std/rawbytes
+import std/result
+import std/system
+import cheng/apps/wow_export/blte as blte
+import cheng/apps/wow_export/md5 as md5
+import cheng/apps/wow_export/salsa20 as salsa20
+
+fn makeBuf(len: int32): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    out.len = len
+    if len > 0:
+        out.data = alloc(len)
+    return out
+
+fn put(buf: bytes.ByteBuffer, idx: int32, v: int32) =
+    bytes.BufSetByte(buf, idx, v)
+
+fn makeRaw(len: int32): rawbytes.Bytes =
+    return rawbytes.BytesAlloc(len)
+
+fn main(): int32 =
+    let buf: bytes.ByteBuffer = makeBuf(13)
+    put(buf, 0, 0x42)
+    put(buf, 1, 0x4c)
+    put(buf, 2, 0x54)
+    put(buf, 3, 0x45)
+    put(buf, 4, 0)
+    put(buf, 5, 0)
+    put(buf, 6, 0)
+    put(buf, 7, 0)
+    put(buf, 8, 0x4e)
+    put(buf, 9, int32('a'))
+    put(buf, 10, int32('b'))
+    put(buf, 11, int32('c'))
+    put(buf, 12, int32('d'))
+
+    let headerRes: Result[blte.BlteHeader] = blte.ParseBlteHeader(buf, "", false)
+    assert(IsOk(headerRes), Error(headerRes))
+    let header: blte.BlteHeader = Value(headerRes)
+    assert(header.blockCount == 1, "wow_export_blte_smoke block count")
+    assert(header.firstBlock.flag == 0x4e, "wow_export_blte_smoke normal flag")
+    assert(header.firstBlock.compSize == 5, "wow_export_blte_smoke comp size")
+    assert(header.firstBlock.decompSize == 4, "wow_export_blte_smoke decomp size")
+    let hashChecked: Result[blte.BlteHeader] = blte.ParseBlteHeader(buf, md5.Md5ByteBufferHex(buf), true)
+    assert(IsOk(hashChecked), Error(hashChecked))
+    let hashBad: Result[blte.BlteHeader] =
+        blte.ParseBlteHeader(buf, "00000000000000000000000000000000", true)
+    assert(IsErr(hashBad), "wow_export_blte_smoke bad container md5 rejects")
+
+    let decodedRes: Result[bytes.ByteBuffer] = blte.DecodeNormalSingleBlock(buf)
+    assert(IsOk(decodedRes), Error(decodedRes))
+    let decoded: bytes.ByteBuffer = Value(decodedRes)
+    assert(decoded.len == 4, "wow_export_blte_smoke decoded len")
+    assert(bytes.BufByteAt(decoded, 0) == int32('a'), "wow_export_blte_smoke decoded a")
+    assert(bytes.BufByteAt(decoded, 3) == int32('d'), "wow_export_blte_smoke decoded d")
+
+    let bad: bytes.ByteBuffer = makeBuf(4)
+    let badRes: Result[blte.BlteHeader] = blte.ParseBlteHeader(bad, "", false)
+    assert(IsErr(badRes), "wow_export_blte_smoke bad header rejects")
+
+    let keyHex: str = "8000000000000000000000000000000000000000000000000000000000000000"
+    let plain: rawbytes.Bytes = makeRaw(3)
+    rawbytes.BytesSet(plain, 0, 0x4e)
+    rawbytes.BytesSet(plain, 1, int32('x'))
+    rawbytes.BytesSet(plain, 2, int32('y'))
+    let nonce: rawbytes.Bytes = makeRaw(8)
+    rawbytes.BytesSet(nonce, 0, 1)
+    rawbytes.BytesSet(nonce, 1, 2)
+    rawbytes.BytesSet(nonce, 2, 3)
+    rawbytes.BytesSet(nonce, 3, 4)
+    let cipherRes: Result[rawbytes.Bytes] = salsa20.Salsa20XorHexKey(keyHex, nonce, plain)
+    assert(IsOk(cipherRes), Error(cipherRes))
+    let cipher: rawbytes.Bytes = Value(cipherRes)
+
+    let encrypted: bytes.ByteBuffer = makeBuf(27)
+    put(encrypted, 0, 0x42)
+    put(encrypted, 1, 0x4c)
+    put(encrypted, 2, 0x54)
+    put(encrypted, 3, 0x45)
+    put(encrypted, 4, 0)
+    put(encrypted, 5, 0)
+    put(encrypted, 6, 0)
+    put(encrypted, 7, 0)
+    put(encrypted, 8, 0x45)
+    put(encrypted, 9, 8)
+    put(encrypted, 10, 8)
+    put(encrypted, 11, 7)
+    put(encrypted, 12, 6)
+    put(encrypted, 13, 5)
+    put(encrypted, 14, 4)
+    put(encrypted, 15, 3)
+    put(encrypted, 16, 2)
+    put(encrypted, 17, 1)
+    put(encrypted, 18, 4)
+    put(encrypted, 19, 1)
+    put(encrypted, 20, 2)
+    put(encrypted, 21, 3)
+    put(encrypted, 22, 4)
+    put(encrypted, 23, 0x53)
+    put(encrypted, 24, rawbytes.BytesGet(cipher, 0))
+    put(encrypted, 25, rawbytes.BytesGet(cipher, 1))
+    put(encrypted, 26, rawbytes.BytesGet(cipher, 2))
+    let encryptedDecodedRes: Result[bytes.ByteBuffer] = blte.DecodeSingleBlockWithKey(encrypted, keyHex)
+    assert(IsOk(encryptedDecodedRes), Error(encryptedDecodedRes))
+    let encryptedDecoded: bytes.ByteBuffer = Value(encryptedDecodedRes)
+    assert(encryptedDecoded.len == 2, "wow_export_blte_smoke encrypted decoded len")
+    assert(bytes.BufByteAt(encryptedDecoded, 0) == int32('x'), "wow_export_blte_smoke encrypted x")
+    assert(bytes.BufByteAt(encryptedDecoded, 1) == int32('y'), "wow_export_blte_smoke encrypted y")
+    let missingKeyRes: Result[bytes.ByteBuffer] = blte.DecodeSingleBlockWithKey(encrypted, "")
+    assert(IsErr(missingKeyRes), "wow_export_blte_smoke encrypted missing key rejects")
+    echo("wow_export_blte_smoke ok")
+    return 0

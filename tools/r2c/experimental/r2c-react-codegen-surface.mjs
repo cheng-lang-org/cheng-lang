@@ -46,10 +46,10 @@ function resolveWorkspaceRoot() {
   const scriptName = path.basename(scriptPath);
   let current = path.dirname(scriptPath);
   while (true) {
-    const mirroredScriptPath = path.join(current, 'v3', 'experimental', 'r2c-react', scriptName);
-    if (fs.existsSync(path.join(current, 'v3', 'src')) &&
-        fs.existsSync(path.join(current, 'src', 'runtime')) &&
-        fs.existsSync(mirroredScriptPath)) {
+    const repoScriptPath = path.join(current, 'tools', 'r2c', 'experimental', scriptName);
+    if (fs.existsSync(path.join(current, 'cheng-package.toml')) &&
+        fs.existsSync(path.join(current, 'src', 'core')) &&
+        fs.existsSync(repoScriptPath)) {
       return current;
     }
     const parent = path.dirname(current);
@@ -88,11 +88,11 @@ function writeCodegenSurfaceReport(filePath, payload) {
 }
 
 function resolveDefaultToolingBin(workspaceRoot) {
-  const explicit = String(process.env.R2C_REACT_V3_TOOLING_BIN || '').trim();
+  const explicit = String(process.env.R2C_REACT_TOOLING_BIN || '').trim();
   if (explicit) return explicit;
-  const stage3 = path.join(workspaceRoot, 'artifacts', 'v3_bootstrap', 'cheng.stage3');
+  const stage3 = path.join(workspaceRoot, 'artifacts', 'bootstrap', 'cheng.stage3');
   if (fs.existsSync(stage3)) return stage3;
-  return path.join(workspaceRoot, 'artifacts', 'v3_backend_driver', 'cheng');
+  return path.join(workspaceRoot, 'artifacts', 'backend_driver', 'cheng');
 }
 
 function makeSafeIdent(text) {
@@ -1011,7 +1011,7 @@ function renderAppRunnerCheng(manifest) {
     '        effectCount: int32',
     '        stateSlotCount: int32',
     '',
-    'fn v3R2cExecSnapshotZero(): R2cExecSnapshot =',
+    'fn R2cExecSnapshotZero(): R2cExecSnapshot =',
     '    var out: R2cExecSnapshot',
     '    out.routeState = ""',
     '    out.mountPhase = ""',
@@ -1025,8 +1025,8 @@ function renderAppRunnerCheng(manifest) {
     '    out.stateSlotCount = 0',
     '    return out',
     '',
-    'fn v3R2cBuildEntrySnapshot(surface: runtime.R2cGeneratedProjectSurface): R2cExecSnapshot =',
-    '    var out = v3R2cExecSnapshotZero()',
+    'fn R2cBuildEntrySnapshot(surface: runtime.R2cGeneratedProjectSurface): R2cExecSnapshot =',
+    '    var out = R2cExecSnapshotZero()',
     `    out.routeState = ${chengStr(routeState)}`,
     '    out.mountPhase = "prepared"',
     '    out.commitPhase = "committed"',
@@ -1039,19 +1039,19 @@ function renderAppRunnerCheng(manifest) {
     `    out.stateSlotCount = ${stateSlotCount}`,
     '    return out',
     '',
-    'fn v3R2cBoolJson(value: bool): str =',
+    'fn R2cBoolJson(value: bool): str =',
     '    if value:',
     '        return "true"',
     '    return "false"',
     '',
-    'fn v3R2cSnapshotJson(snapshot: R2cExecSnapshot): str =',
+    'fn R2cSnapshotJson(snapshot: R2cExecSnapshot): str =',
     '    return "{" +',
     '        "\\"format\\":\\"cheng_codegen_exec_snapshot_v1\\"," +',
     '        "\\"route_state\\":\\"" + snapshot.routeState + "\\"," +',
     '        "\\"mount_phase\\":\\"" + snapshot.mountPhase + "\\"," +',
     '        "\\"commit_phase\\":\\"" + snapshot.commitPhase + "\\"," +',
-    '        "\\"render_ready\\":" + v3R2cBoolJson(snapshot.renderReady) + "," +',
-    '        "\\"semantic_nodes_loaded\\":" + v3R2cBoolJson(snapshot.semanticNodesLoaded) + "," +',
+    '        "\\"render_ready\\":" + R2cBoolJson(snapshot.renderReady) + "," +',
+    '        "\\"semantic_nodes_loaded\\":" + R2cBoolJson(snapshot.semanticNodesLoaded) + "," +',
     '        "\\"semantic_nodes_count\\":" + strutil.intToStr(snapshot.semanticNodesCount) + "," +',
     '        "\\"module_count\\":" + strutil.intToStr(snapshot.moduleCount) + "," +',
     '        "\\"component_count\\":" + strutil.intToStr(snapshot.componentCount) + "," +',
@@ -1059,14 +1059,14 @@ function renderAppRunnerCheng(manifest) {
     '        "\\"state_slot_count\\":" + strutil.intToStr(snapshot.stateSlotCount) +',
     '        "}"',
     '',
-    'fn v3R2cEntrySnapshotJson(surface: runtime.R2cGeneratedProjectSurface): str =',
+    'fn R2cEntrySnapshotJson(surface: runtime.R2cGeneratedProjectSurface): str =',
     '    var snapshot: R2cExecSnapshot',
     '    var out: str',
-    '    snapshot = v3R2cBuildEntrySnapshot(surface)',
-    '    out = v3R2cSnapshotJson(snapshot)',
+    '    snapshot = R2cBuildEntrySnapshot(surface)',
+    '    out = R2cSnapshotJson(snapshot)',
     '    return out',
     '',
-    'fn v3R2cSmokeExitCode(surface: runtime.R2cGeneratedProjectSurface): int32 =',
+    'fn R2cSmokeExitCode(surface: runtime.R2cGeneratedProjectSurface): int32 =',
     '    if surface.entryModule == "":',
     '        return 11',
     '    if surface.modules.len <= 0:',
@@ -1176,7 +1176,6 @@ function writePackage(manifest, modules, routeCatalog) {
   fs.rmSync(packageRoot, { recursive: true, force: true });
   fs.mkdirSync(modulesRoot, { recursive: true });
   fs.mkdirSync(path.join(srcRoot, 'runtime'), { recursive: true });
-  fs.symlinkSync(path.join(manifest.workspace_root, 'v3'), path.join(packageRoot, 'v3'));
   fs.symlinkSync(path.join(manifest.workspace_root, 'src', 'runtime', 'native'), path.join(srcRoot, 'runtime', 'native'));
   writeText(path.join(packageRoot, 'cheng-package.toml'), `package_id = "${manifest.package_id}"\nmodule_prefix = "${manifest.module_prefix}"\n`);
   writeText(path.join(srcRoot, 'runtime.cheng'), renderRuntimeCheng());

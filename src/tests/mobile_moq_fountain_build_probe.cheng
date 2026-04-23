@@ -1,17 +1,45 @@
 import std/system
 import std/cmdline
 import std/bytes as filebytes
+import std/rawbytes
 import cheng/moq/moq_fountain as moq
-import cheng/libp2p/mobile/mobile_capi as capi
+import cheng/mobile/mobile_capi as capi
 
 fn usage(): int32 =
     echo("usage: mobile_moq_fountain_build_probe <core|raw|request|persist> <sample-path> [remote-peers-csv] [output-dir] [file-stem]")
     return 2
 
+fn runSelfSmoke(): int32 =
+    let sample = bytesFromString("cheng-mobile-moq-fountain-smoke-sample")
+    let buildRes = moq.MoqFountainBuild(sample,
+                                        "peer-android",
+                                        "peer-harmony",
+                                        "video/mp4",
+                                        64,
+                                        16,
+                                        2)
+    assert(IsOk(buildRes), "mobile_moq probe: self core build")
+    let out = Value(buildRes)
+    assert(len(out.bundleCid) > 0, "mobile_moq probe: self bundle")
+    assert(out.objectCount > 0, "mobile_moq probe: self object count")
+    assert(out.droplets.len > 0, "mobile_moq probe: self droplets")
+    let wire = capi.MobileCapiMoqFountainBuildRaw(sample.data,
+                                                    sample.len,
+                                                    "peer-android",
+                                                    "peer-harmony",
+                                                    "video/mp4",
+                                                    64,
+                                                    16,
+                                                    2)
+    assert(len(wire) > 0, "mobile_moq probe: self raw wire")
+    assert(strContains(wire, "ok=1"), "mobile_moq probe: self raw ok")
+    echo(" mobile_moq_fountain_build_probe ok")
+    return 0
+
 fn main(argc: int32, argv: str*): int32 =
     cmdline.CaptureCmdLine(argc, argv)
     if cmdline.ParamCount() < 3:
-        return usage()
+        return runSelfSmoke()
     let mode = cmdline.ParamStr(1)
     let samplePath = cmdline.ParamStr(2)
     let remotePeersCsv = if cmdline.ParamCount() >= 4: cmdline.ParamStr(3) else: "peer-harmony"
@@ -20,7 +48,7 @@ fn main(argc: int32, argv: str*): int32 =
     echo("probe:sample_loaded")
     echo("probe:sample_len=" + intToStr(buf.len))
     if mode == "core":
-        let buildRes = moq.v3Libp2pMoqBuild(bytesView(buf.data, buf.len),
+        let buildRes = moq.MoqFountainBuild(bytesView(buf.data, buf.len),
                                             "peer-android",
                                             remotePeersCsv,
                                             "video/mp4",
@@ -35,7 +63,7 @@ fn main(argc: int32, argv: str*): int32 =
         echo("probe:droplets=" + intToStr(out.droplets.len))
         return 0
     if mode == "raw":
-        let wire = capi.v3MobileCapiMoqFountainBuildRaw(buf.data,
+        let wire = capi.MobileCapiMoqFountainBuildRaw(buf.data,
                                                         buf.len,
                                                         "peer-android",
                                                         remotePeersCsv,
@@ -61,7 +89,7 @@ fn main(argc: int32, argv: str*): int32 =
         requestWire = requestWire + "source_block_bytes=131072\n"
         requestWire = requestWire + "repair_droplet_count=2\n"
         echo("probe:request_wire_built")
-        let wire = capi.v3MobileCapiMoqFountainBuildRequestRaw(buf.data,
+        let wire = capi.MobileCapiMoqFountainBuildRequestRaw(buf.data,
                                                                buf.len,
                                                                strDataPtr(requestWire),
                                                                len(requestWire))
@@ -77,7 +105,7 @@ fn main(argc: int32, argv: str*): int32 =
     if mode == "persist":
         let outputDir = if cmdline.ParamCount() >= 5: cmdline.ParamStr(4) else: "/tmp"
         let fileStem = if cmdline.ParamCount() >= 6: cmdline.ParamStr(5) else: "mobile-moq-probe"
-        let wire = capi.v3MobileCapiMoqFountainBuildPersistRaw(buf.data,
+        let wire = capi.MobileCapiMoqFountainBuildPersistRaw(buf.data,
                                                                buf.len,
                                                                "peer-android",
                                                                remotePeersCsv,

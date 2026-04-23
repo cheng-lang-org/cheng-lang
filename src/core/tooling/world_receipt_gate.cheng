@@ -1,0 +1,206 @@
+import std/os
+import std/result
+import std/strutils as strutil
+import cheng/std/bytes_layout as layout
+import cheng/core/lang/parser
+import cheng/core/backend/system_link_exec as sexec
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+fn WorldReceiptPrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn WorldReceiptPrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn WorldReceiptWriteOptionalReport(rootDir: str,
+                                     rawPath: str,
+                                     report: str): bool =
+    if len(rawPath) <= 0:
+        return true
+    return chengpath.WriteTextFile(rootDir, rawPath, report + "\n")
+
+fn WorldReceiptResetStageRoot(rootDir: str,
+                                stageRoot: str): Result[bool] =
+    if !chengpath.PathDirExists(stageRoot) && !chengpath.PathFileExists(stageRoot):
+        return Ok[bool](true)
+    let logPath = chengpath.PathAbsolute(rootDir, "artifacts/backend_driver/world_receipt.reset.log")
+    let run = hostops.RunProgramLogged(rootDir,
+                                         "world_receipt_reset_stage",
+                                         "rm",
+                                         ["-rf", stageRoot],
+                                         [],
+                                         rootDir,
+                                         0,
+                                         logPath)
+    if !hostops.LoggedRunOk(run):
+        return Err[bool](" compiler: failed to reset world-receipt stage root: " + run.output)
+    return Ok[bool](true)
+
+fn WorldReceiptCopyRequiredPath(rootDir: str,
+                                  label: str,
+                                  sourcePath: str,
+                                  targetDir: str,
+                                  logRelPath: str): Result[bool] =
+    if !chengpath.PathFileExists(sourcePath) && !chengpath.PathDirExists(sourcePath):
+        return Err[bool](" compiler: missing world-receipt source path: " + sourcePath)
+    let run = hostops.RunProgramLogged(rootDir,
+                                         label,
+                                         "cp",
+                                         ["-R", sourcePath, targetDir],
+                                         [],
+                                         rootDir,
+                                         0,
+                                         chengpath.PathAbsolute(rootDir, logRelPath))
+    if !hostops.LoggedRunOk(run):
+        return Err[bool](" compiler: failed to copy world-receipt source path: " + run.output)
+    return Ok[bool](true)
+
+fn WorldReceiptCopyOptionalFile(rootDir: str,
+                                  label: str,
+                                  sourcePath: str,
+                                  targetDir: str,
+                                  logRelPath: str): Result[bool] =
+    if !chengpath.PathFileExists(sourcePath):
+        return Ok[bool](true)
+    return WorldReceiptCopyRequiredPath(rootDir, label, sourcePath, targetDir, logRelPath)
+
+fn WorldReceiptStageSourceSnapshot(rootDir: str,
+                                     packageRoot: str,
+                                     compilerEntrySource: str,
+                                     stageRootRel: str,
+                                     outPackageRoot: var str,
+                                     outCompilerEntrySource: var str): Result[bool] =
+    let stageRoot = chengpath.PathAbsolute(rootDir, stageRootRel)
+    let resetRes = WorldReceiptResetStageRoot(rootDir, stageRoot)
+    if IsErr(resetRes):
+        return Err[bool](Error(resetRes))
+    if !chengpath.MkdirP(rootDir, stageRoot):
+        return Err[bool](" compiler: failed to prepare world-receipt stage root: " + stageRoot)
+    let packageLeaf = os.ExtractFilename(packageRoot)
+    if len(packageLeaf) <= 0:
+        return Err[bool](" compiler: invalid world-receipt package root: " + packageRoot)
+    let stagedPackageRoot = os.JoinPath(stageRoot, packageLeaf)
+    let entryRelRaw = os.RelativePath(compilerEntrySource, packageRoot)
+    let entryRel = strutil.Strip(entryRelRaw)
+    if len(entryRel) <= 0 ||
+       entryRel == compilerEntrySource ||
+       strutil.StartsWith(entryRel, ".."):
+        return Err[bool](" compiler: world-receipt entry is outside package root: " + compilerEntrySource)
+    if !chengpath.MkdirP(rootDir, stagedPackageRoot):
+        return Err[bool](" compiler: failed to prepare staged world-receipt package root: " + stagedPackageRoot)
+    let manifestCopyRes = WorldReceiptCopyRequiredPath(rootDir,
+                                                         "world_receipt_stage_manifest",
+                                                         os.JoinPath(packageRoot, "cheng-package.toml"),
+                                                         stagedPackageRoot,
+                                                         "artifacts/backend_driver/world_receipt.manifest.copy.log")
+    if IsErr(manifestCopyRes):
+        return Err[bool](Error(manifestCopyRes))
+    let lockCopyRes = WorldReceiptCopyOptionalFile(rootDir,
+                                                    "world_receipt_stage_lock",
+                                                    os.JoinPath(packageRoot, "cheng.lock.toml"),
+                                                    stagedPackageRoot,
+                                                    "artifacts/backend_driver/world_receipt.lock.copy.log")
+    if IsErr(lockCopyRes):
+        return Err[bool](Error(lockCopyRes))
+    let srcCopyRes = WorldReceiptCopyRequiredPath(rootDir,
+                                                   "world_receipt_stage_src",
+                                                   os.JoinPath(packageRoot, "src"),
+                                                   stagedPackageRoot,
+                                                   "artifacts/backend_driver/world_receipt.src.copy.log")
+    if IsErr(srcCopyRes):
+        return Err[bool](Error(srcCopyRes))
+    let stagedEntry = os.JoinPath(stagedPackageRoot, entryRel)
+    if !chengpath.PathFileExists(stagedEntry):
+        return Err[bool](" compiler: missing staged world-receipt entry source: " + stagedEntry)
+    let workspaceRoot = parser.ParserWorkspaceRoot(packageRoot)
+    if workspaceRoot != "" && workspaceRoot != packageRoot:
+        let workspaceSrc = os.JoinPath(workspaceRoot, "src")
+        if !chengpath.PathDirExists(workspaceSrc):
+            return Err[bool](" compiler: missing world-receipt shared workspace src: " + workspaceSrc)
+        let workspaceSrcCopyLogPath = chengpath.PathAbsolute(rootDir,
+                                                            "artifacts/backend_driver/world_receipt.workspace_src.copy.log")
+        let workspaceSrcCopyRun = hostops.RunProgramLogged(rootDir,
+                                                             "world_receipt_stage_workspace_src",
+                                                             "cp",
+                                                             ["-R", workspaceSrc, stageRoot],
+                                                             [],
+                                                             rootDir,
+                                                             0,
+                                                             workspaceSrcCopyLogPath)
+        if !hostops.LoggedRunOk(workspaceSrcCopyRun):
+            return Err[bool](" compiler: failed to stage world-receipt shared workspace src: " +
+                             workspaceSrcCopyRun.output)
+        let stagedWorkspaceSrc = os.JoinPath(stageRoot, "src")
+        if !chengpath.PathDirExists(stagedWorkspaceSrc):
+            return Err[bool](" compiler: missing staged world-receipt shared workspace src: " + stagedWorkspaceSrc)
+    outPackageRoot = stagedPackageRoot
+    outCompilerEntrySource = stagedEntry
+    return Ok[bool](true)
+
+fn WorldReceiptStageRequest(rootDir: str,
+                              req: creq.CompilerRequest): Result[creq.CompilerRequest] =
+    var stagedPackageRoot = creq.CompilerRequestRootDir(req)
+    var stagedSourcePath = creq.CompilerRequestSourcePath(req)
+    let stageRes = WorldReceiptStageSourceSnapshot(rootDir,
+                                                     creq.CompilerRequestRootDir(req),
+                                                     creq.CompilerRequestSourcePath(req),
+                                                     "artifacts/backend_driver/world_receipt_source",
+                                                     stagedPackageRoot,
+                                                     stagedSourcePath)
+    if IsErr(stageRes):
+        return Err[creq.CompilerRequest](Error(stageRes))
+    let stagedReq0 = creq.CompilerRequestNew(stagedPackageRoot,
+                                               stagedSourcePath,
+                                               creq.CompilerRequestOutputPath(req),
+                                               creq.CompilerRequestTargetTriple(req),
+                                               creq.CompilerRequestEmitKind(req),
+                                               req.reportPath)
+    let stagedReq1 = creq.CompilerRequestWithSymbolVisibility(stagedReq0,
+                                                                creq.CompilerRequestSymbolVisibility(req))
+    let stagedReq = creq.CompilerRequestWithBrowserBridgeObject(stagedReq1,
+                                                                  creq.CompilerRequestBrowserBridgeObjectPath(req))
+    return Ok[creq.CompilerRequest](stagedReq)
+
+fn WorldReceiptBuildPlan(rootDir: str,
+                           req: creq.CompilerRequest,
+                           args: str[]): Result[sexec.SystemLinkExecPlan] =
+    return sexec.BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
+                                                              req,
+                                                              creq.CompilerWorldHeadFromArgs(args),
+                                                              creq.CompilerLockPathFromArgs(args),
+                                                              creq.CompilerBaselineSurfacePathFromArgs(args),
+                                                              creq.CompilerChannelFromArgs(args))
+
+fn WorldReceiptReport(plan: sexec.SystemLinkExecPlan): str =
+    var report = ""
+    report = report + "entry=" + plan.compilerEntrySource + "\n"
+    report = report + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
+    report = report + "manifest_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.manifest.manifestCid) + "\n"
+    report = report + "compile_receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
+    report = report + "compile_canonical_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.canonicalOutputDigest) + "\n"
+    report = report + "compile_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.outputDigest) + "\n"
+    report = report + "compile_bootstrap_stage=" + plan.compileReceipt.bootstrapStage
+    return report
+
+fn WorldReceiptRun(rootDir: str, args: str[]): int32 =
+    let reqRes = creq.CompilerRequestFromArgsForCommand(rootDir, args, false)
+    if IsErr(reqRes):
+        WorldReceiptPrintErr(Error(reqRes))
+        return 2
+    let req = Value(reqRes)
+    let stagedReqRes = WorldReceiptStageRequest(rootDir, req)
+    if IsErr(stagedReqRes):
+        WorldReceiptPrintErr(Error(stagedReqRes))
+        return 2
+    let planRes = WorldReceiptBuildPlan(rootDir, Value(stagedReqRes), args)
+    if IsErr(planRes):
+        WorldReceiptPrintErr(Error(planRes))
+        return 2
+    let report = WorldReceiptReport(Value(planRes))
+    if !WorldReceiptWriteOptionalReport(rootDir, req.reportPath, report):
+        WorldReceiptPrintErr(" compiler: failed to write report: " + req.reportPath)
+        return 2
+    WorldReceiptPrintLine(report)
+    return 0

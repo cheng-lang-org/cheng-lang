@@ -1,0 +1,62 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import std/strformat
+import cheng/apps/wow_export/binary as binary
+
+type
+    FormatHeader =
+        magic: str
+        versionOrSize: int32
+        chunkCount: int32
+
+fn ParseM2Header(buf: bytes.ByteBuffer): Result[FormatHeader] =
+    if buf.len < 8:
+        return Err[FormatHeader]("wowExport M2: header too small")
+    var r: binary.BinaryReader = binary.ReaderFromBytes(buf)
+    let magicRes: Result[str] = binary.ReadFourCC(r)
+    if IsErr(magicRes):
+        return Err[FormatHeader](Error(magicRes))
+    let versionRes: Result[int32] = binary.ReadU32LE(r)
+    if IsErr(versionRes):
+        return Err[FormatHeader](Error(versionRes))
+    let magic: str = Value(magicRes)
+    if magic != "MD20":
+        return Err[FormatHeader](Fmt"wowExport M2: invalid magic {magic}")
+    var out: FormatHeader
+    out.magic = magic
+    out.versionOrSize = Value(versionRes)
+    out.chunkCount = 0
+    return Ok[FormatHeader](out)
+
+fn ParseChunkedHeader(buf: bytes.ByteBuffer, label: str): Result[FormatHeader] =
+    if buf.len < 8:
+        return Err[FormatHeader](Fmt"wowExport {label}: header too small")
+    var pos: int32
+    var firstMagic: str
+    var firstSize: int32
+    var count: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[FormatHeader](Fmt"wowExport {label}: truncated chunk header")
+        let magicRes: Result[str] = binary.HexSlice(buf, pos, 4)
+        if IsErr(magicRes):
+            return Err[FormatHeader](Error(magicRes))
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        if size < 0:
+            return Err[FormatHeader](Fmt"wowExport {label}: negative chunk size")
+        if pos == 0:
+            firstMagic = Value(magicRes)
+            firstSize = size
+        if pos + 8 + size > buf.len:
+            return Err[FormatHeader](Fmt"wowExport {label}: chunk extends past buffer")
+        count = count + 1
+        pos = pos + 8 + size
+    var out: FormatHeader
+    out.magic = firstMagic
+    out.versionOrSize = firstSize
+    out.chunkCount = count
+    return Ok[FormatHeader](out)
+
+fn FormatHeaderText(header: FormatHeader): str =
+    return Fmt"magic={header.magic} value={strings.IntToStr(header.versionOrSize)} chunks={strings.IntToStr(header.chunkCount)}"

@@ -1,0 +1,276 @@
+import std/bytes as bytes
+import std/rawbytes
+import std/result
+import std/strings as strings
+import std/strformat
+import std/system
+import cheng/apps/wow_export/binary as binary
+import cheng/apps/wow_export/md5 as md5
+import cheng/apps/wow_export/salsa20 as salsa20
+
+type
+    BlteBlock =
+        compSize: int32
+        decompSize: int32
+        hash: str
+        fileOffset: int32
+        flag: int32
+
+    BlteHeader =
+        headerSize: int32
+        dataStart: int32
+        blockCount: int32
+        totalDecompSize: int32
+        firstBlock: BlteBlock
+
+const
+    BlteEmptyHash = "00000000000000000000000000000000"
+    BlteEncTypeSalsa20 = 0x53
+
+fn MakeByteBuffer(len: int32): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    if len <= 0:
+        out.len = 0
+        out.data = nil
+        return out
+    out.len = len
+    out.data = alloc(len)
+    return out
+
+fn U32BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport BLTE: truncated u32be")
+    let b0: int32 = bytes.BufByteAt(buf, idx)
+    let b1: int32 = bytes.BufByteAt(buf, idx + 1)
+    let b2: int32 = bytes.BufByteAt(buf, idx + 2)
+    let b3: int32 = bytes.BufByteAt(buf, idx + 3)
+    return Ok[int32]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
+
+fn ByteBufferSliceToRaw(buf: bytes.ByteBuffer, start: int32, count: int32): Result[rawbytes.Bytes] =
+    if start < 0 || count < 0 || start + count > buf.len:
+        return Err[rawbytes.Bytes]("wowExport BLTE: byte slice out of bounds")
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(count)
+    var i: int32
+    while i < count:
+        rawbytes.BytesSet(out, i, bytes.BufByteAt(buf, start + i))
+        i = i + 1
+    return Ok[rawbytes.Bytes](out)
+
+fn RawBytesToByteBuffer(data: rawbytes.Bytes): bytes.ByteBuffer =
+    let count: int32 = rawbytes.BytesLen(data)
+    let out: bytes.ByteBuffer = MakeByteBuffer(count)
+    var i: int32
+    while i < count:
+        bytes.BufSetByte(out, i, rawbytes.BytesGet(data, i))
+        i = i + 1
+    return out
+
+fn CopyByteBufferSlice(buf: bytes.ByteBuffer, start: int32, count: int32): Result[bytes.ByteBuffer] =
+    if start < 0 || count < 0 || start + count > buf.len:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: buffer slice out of bounds")
+    let out: bytes.ByteBuffer = MakeByteBuffer(count)
+    var i: int32
+    while i < count:
+        bytes.BufSetByte(out, i, bytes.BufByteAt(buf, start + i))
+        i = i + 1
+    return Ok[bytes.ByteBuffer](out)
+
+fn CheckBlteMagic(buf: bytes.ByteBuffer): bool =
+    if buf.len < 4:
+        return false
+    return bytes.BufByteAt(buf, 0) == 0x42 &&
+        bytes.BufByteAt(buf, 1) == 0x4c &&
+        bytes.BufByteAt(buf, 2) == 0x54 &&
+        bytes.BufByteAt(buf, 3) == 0x45
+
+fn ParseBlteHeader(buf: bytes.ByteBuffer, expectedHash: str, verifyHash: bool): Result[BlteHeader] =
+    if buf.len < 8:
+        return Err[BlteHeader]("wowExport BLTE: not enough data")
+    if !CheckBlteMagic(buf):
+        return Err[BlteHeader]("wowExport BLTE: invalid magic")
+    let headerSizeRes: Result[int32] = U32BEAt(buf, 4)
+    if IsErr(headerSizeRes):
+        return Err[BlteHeader](Error(headerSizeRes))
+    let headerSize: int32 = Value(headerSizeRes)
+    if headerSize < 0:
+        return Err[BlteHeader]("wowExport BLTE: negative header size")
+    if headerSize > buf.len:
+        return Err[BlteHeader]("wowExport BLTE: header extends past buffer")
+    if verifyHash && strings.Len(expectedHash) > 0:
+        var hashCheck: str
+        if headerSize > 0:
+            hashCheck = md5.Md5ByteBufferSliceHex(buf, 0, headerSize)
+        else:
+            hashCheck = md5.Md5ByteBufferHex(buf)
+        if hashCheck != expectedHash:
+            return Err[BlteHeader](Fmt"wowExport BLTE: MD5 mismatch expected={expectedHash} got={hashCheck}")
+
+    var blockCount: int32 = 1
+    var dataStart: int32 = 8
+    var first: BlteBlock
+    if headerSize == 0:
+        if buf.len < 9:
+            return Err[BlteHeader]("wowExport BLTE: normal block missing flag")
+        first.compSize = buf.len - 8
+        first.decompSize = buf.len - 9
+        first.hash = BlteEmptyHash
+        first.fileOffset = 0
+        first.flag = bytes.BufByteAt(buf, dataStart)
+    else:
+        if headerSize < 36:
+            return Err[BlteHeader]("wowExport BLTE: frame header too small")
+        let tableMagic: int32 = bytes.BufByteAt(buf, 8)
+        if tableMagic != 0x0f:
+            return Err[BlteHeader]("wowExport BLTE: invalid frame table marker")
+        let b1: int32 = bytes.BufByteAt(buf, 9)
+        let b2: int32 = bytes.BufByteAt(buf, 10)
+        let b3: int32 = bytes.BufByteAt(buf, 11)
+        blockCount = (b1 << 16) + (b2 << 8) + b3
+        if blockCount <= 0:
+            return Err[BlteHeader]("wowExport BLTE: zero block table")
+        if headerSize != 12 + 24 * blockCount:
+            return Err[BlteHeader]("wowExport BLTE: invalid frame header size")
+        let compRes: Result[int32] = U32BEAt(buf, 12)
+        let decompRes: Result[int32] = U32BEAt(buf, 16)
+        if IsErr(compRes):
+            return Err[BlteHeader](Error(compRes))
+        if IsErr(decompRes):
+            return Err[BlteHeader](Error(decompRes))
+        let hashRes: Result[str] = binary.HexSlice(buf, 20, 16)
+        if IsErr(hashRes):
+            return Err[BlteHeader](Error(hashRes))
+        first.compSize = Value(compRes)
+        first.decompSize = Value(decompRes)
+        first.hash = Value(hashRes)
+        first.fileOffset = 0
+        dataStart = headerSize
+        if dataStart >= buf.len:
+            return Err[BlteHeader]("wowExport BLTE: data section missing")
+        first.flag = bytes.BufByteAt(buf, dataStart)
+    if first.compSize <= 0:
+        return Err[BlteHeader]("wowExport BLTE: invalid first block compressed size")
+    if first.decompSize < 0:
+        return Err[BlteHeader]("wowExport BLTE: invalid first block decompressed size")
+    if dataStart + first.compSize > buf.len:
+        return Err[BlteHeader]("wowExport BLTE: first block extends past buffer")
+
+    var out: BlteHeader
+    out.headerSize = headerSize
+    out.dataStart = dataStart
+    out.blockCount = blockCount
+    out.totalDecompSize = first.decompSize
+    out.firstBlock = first
+    return Ok[BlteHeader](out)
+
+fn BlockKindText(flag: int32): str =
+    if flag == 0x45:
+        return "encrypted-salsa20"
+    if flag == 0x46:
+        return "recursive-frame"
+    if flag == 0x4e:
+        return "normal"
+    if flag == 0x5a:
+        return "zlib"
+    return Fmt"unknown-{strings.IntToStr(flag)}"
+
+fn VerifyFirstBlockHash(buf: bytes.ByteBuffer, header: BlteHeader): Result[bool] =
+    if header.firstBlock.hash == BlteEmptyHash:
+        return Ok[bool](true)
+    let blockHash: str = md5.Md5ByteBufferSliceHex(buf, header.dataStart, header.firstBlock.compSize)
+    if blockHash != header.firstBlock.hash:
+        return Err[bool](Fmt"wowExport BLTE: block MD5 mismatch expected={header.firstBlock.hash} got={blockHash}")
+    return Ok[bool](true)
+
+fn FirstBlockPayload(buf: bytes.ByteBuffer, header: BlteHeader): Result[bytes.ByteBuffer] =
+    return CopyByteBufferSlice(buf, header.dataStart, header.firstBlock.compSize)
+
+fn DecodeNormalBlockPayload(block: bytes.ByteBuffer): Result[bytes.ByteBuffer] =
+    if block.len < 1:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: empty block payload")
+    let flag: int32 = bytes.BufByteAt(block, 0)
+    if flag == 0x5a:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: zlib inflate not implemented in pure Cheng yet")
+    if flag == 0x45:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: Salsa20 key required for encrypted block")
+    if flag != 0x4e:
+        return Err[bytes.ByteBuffer](Fmt"wowExport BLTE: unsupported block kind {BlockKindText(flag)}")
+    return CopyByteBufferSlice(block, 1, block.len - 1)
+
+fn DecryptEncryptedBlockPayload(block: bytes.ByteBuffer, blockIndex: int32, keyHex: str): Result[bytes.ByteBuffer] =
+    if block.len < 1:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: empty encrypted block")
+    if bytes.BufByteAt(block, 0) != 0x45:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: encrypted payload missing 0x45 flag")
+    var pos: int32 = 1
+    if pos >= block.len:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: encrypted block missing key name size")
+    let keyNameSize: int32 = bytes.BufByteAt(block, pos)
+    pos = pos + 1
+    if keyNameSize != 8:
+        return Err[bytes.ByteBuffer](Fmt"wowExport BLTE: unexpected keyNameSize={strings.IntToStr(keyNameSize)}")
+    if pos + keyNameSize > block.len:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: encrypted block truncated key name")
+    var keyName: str
+    var i: int32
+    while i < keyNameSize:
+        let byteHex: str = binary.HexByte(bytes.BufByteAt(block, pos + i))
+        keyName = Fmt"{byteHex}{keyName}"
+        i = i + 1
+    pos = pos + keyNameSize
+    if pos >= block.len:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: encrypted block missing IV size")
+    let ivSize: int32 = bytes.BufByteAt(block, pos)
+    pos = pos + 1
+    if (ivSize != 4 && ivSize != 8) || ivSize > 8:
+        return Err[bytes.ByteBuffer](Fmt"wowExport BLTE: unexpected ivSize={strings.IntToStr(ivSize)}")
+    if pos + ivSize >= block.len:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: encrypted block truncated IV or type")
+    var nonce: rawbytes.Bytes = rawbytes.BytesAlloc(8)
+    i = 0
+    while i < ivSize:
+        var v: int32 = bytes.BufByteAt(block, pos + i)
+        if i < 4:
+            v = v ^ ((blockIndex >> (i * 8)) & 255)
+        rawbytes.BytesSet(nonce, i, v)
+        i = i + 1
+    pos = pos + ivSize
+    let encryptType: int32 = bytes.BufByteAt(block, pos)
+    pos = pos + 1
+    if encryptType != BlteEncTypeSalsa20:
+        return Err[bytes.ByteBuffer](Fmt"wowExport BLTE: unexpected encryption type={strings.IntToStr(encryptType)}")
+    if strings.Len(keyHex) == 0:
+        return Err[bytes.ByteBuffer](Fmt"wowExport BLTE: missing Salsa20 key keyName={keyName}")
+    let encryptedRes: Result[rawbytes.Bytes] = ByteBufferSliceToRaw(block, pos, block.len - pos)
+    if IsErr(encryptedRes):
+        return Err[bytes.ByteBuffer](Error(encryptedRes))
+    let decryptedRes: Result[rawbytes.Bytes] = salsa20.Salsa20XorHexKey(keyHex, nonce, Value(encryptedRes))
+    if IsErr(decryptedRes):
+        return Err[bytes.ByteBuffer](Error(decryptedRes))
+    return Ok[bytes.ByteBuffer](RawBytesToByteBuffer(Value(decryptedRes)))
+
+fn DecodeSingleBlockWithKey(buf: bytes.ByteBuffer, keyHex: str): Result[bytes.ByteBuffer] =
+    let headerRes: Result[BlteHeader] = ParseBlteHeader(buf, "", false)
+    if IsErr(headerRes):
+        return Err[bytes.ByteBuffer](Error(headerRes))
+    let header: BlteHeader = Value(headerRes)
+    if header.blockCount != 1:
+        return Err[bytes.ByteBuffer]("wowExport BLTE: multi-block decode not implemented yet")
+    let hashRes: Result[bool] = VerifyFirstBlockHash(buf, header)
+    if IsErr(hashRes):
+        return Err[bytes.ByteBuffer](Error(hashRes))
+    let blockRes: Result[bytes.ByteBuffer] = FirstBlockPayload(buf, header)
+    if IsErr(blockRes):
+        return Err[bytes.ByteBuffer](Error(blockRes))
+    let block: bytes.ByteBuffer = Value(blockRes)
+    if header.firstBlock.flag == 0x45:
+        let decryptedBlockRes: Result[bytes.ByteBuffer] = DecryptEncryptedBlockPayload(block, 0, keyHex)
+        if IsErr(decryptedBlockRes):
+            return Err[bytes.ByteBuffer](Error(decryptedBlockRes))
+        return DecodeNormalBlockPayload(Value(decryptedBlockRes))
+    return DecodeNormalBlockPayload(block)
+
+fn DecodeNormalSingleBlock(buf: bytes.ByteBuffer): Result[bytes.ByteBuffer] =
+    return DecodeSingleBlockWithKey(buf, "")
+
+fn BlteHeaderText(header: BlteHeader): str =
+    return Fmt"headerSize={strings.IntToStr(header.headerSize)} blocks={strings.IntToStr(header.blockCount)} first={BlockKindText(header.firstBlock.flag)} comp={strings.IntToStr(header.firstBlock.compSize)} decomp={strings.IntToStr(header.firstBlock.decompSize)}"
