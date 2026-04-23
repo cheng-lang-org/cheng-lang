@@ -14,6 +14,7 @@ type
         frames: int32
         sceneNonEmpty: bool
         auditedFileCount: int32
+        auditedDependencyCount: int32
         loadedFileCount: int32
         chunkFileCount: int32
         totalChunkCount: int32
@@ -47,8 +48,15 @@ type
         wmoGroupAssetCount: int32
         wmoGroupVertexCount: int32
         wmoGroupIndexCount: int32
+        wmoModelSlotCount: int32
         wmoModelFileDataIDCount: int32
+        wmoModelDependencyCount: int32
+        wmoModelDependenciesReady: bool
         wmoFirstModelFileDataID: int32
+        wmoDoodadModelPlacementCount: int32
+        wmoDoodadReferencedModelFileDataIDCount: int32
+        wmoDoodadModelDependenciesReady: bool
+        wmoFirstDoodadModelFileDataID: int32
         m2Version: int32
         m2SkinFileDataIDCount: int32
         m2FirstSkinFileDataID: int32
@@ -140,8 +148,42 @@ fn previewLoadAuditedAssets(summary: var PreviewSummary,
             summary.wmoDoodadSpanX1000 = Value(wmoRes).maxDoodadX1000 - Value(wmoRes).minDoodadX1000
             summary.wmoDoodadSpanY1000 = Value(wmoRes).maxDoodadY1000 - Value(wmoRes).minDoodadY1000
             summary.wmoDoodadSpanZ1000 = Value(wmoRes).maxDoodadZ1000 - Value(wmoRes).minDoodadZ1000
+            summary.wmoModelSlotCount = Value(wmoRes).modelSlotCount
             summary.wmoModelFileDataIDCount = Value(wmoRes).modelFileDataIDCount
             summary.wmoFirstModelFileDataID = Value(wmoRes).firstModelFileDataID
+            summary.wmoDoodadModelPlacementCount = Value(wmoRes).doodadResolvedModelPlacementCount
+            summary.wmoDoodadReferencedModelFileDataIDCount = Value(wmoRes).doodadReferencedModelFileDataIDCount
+            summary.wmoFirstDoodadModelFileDataID = Value(wmoRes).firstDoodadModelFileDataID
+            let modelIdsRes: Result[int32[]] = asset_formats.ParseWmoModelFileDataIDs(fileBuf)
+            if IsErr(modelIdsRes):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool](Error(modelIdsRes))
+            let modelIds: int32[] = Value(modelIdsRes)
+            var modelIndex: int32
+            while modelIndex < modelIds.len:
+                if !northshire.HasDependencyFileDataID(manifest, file.label, "wmo_modi", modelIds[modelIndex]):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool]("wowExport preview: WMO MODI dependency is not audited " + strings.IntToStr(modelIds[modelIndex]))
+                summary.wmoModelDependencyCount = summary.wmoModelDependencyCount + 1
+                modelIndex = modelIndex + 1
+            summary.wmoModelDependenciesReady =
+                summary.wmoModelDependencyCount == summary.wmoModelFileDataIDCount &&
+                summary.wmoModelDependencyCount == northshire.CountDependenciesForSource(manifest, file.label, "wmo_modi")
+            let doodadModelIdsRes: Result[int32[]] = asset_formats.ParseWmoDoodadModelFileDataIDs(fileBuf)
+            if IsErr(doodadModelIdsRes):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool](Error(doodadModelIdsRes))
+            let doodadModelIds: int32[] = Value(doodadModelIdsRes)
+            var doodadModelIndex: int32
+            while doodadModelIndex < doodadModelIds.len:
+                if !northshire.HasDependencyFileDataID(manifest, file.label, "wmo_modi", doodadModelIds[doodadModelIndex]):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool]("wowExport preview: WMO MODD model dependency is not audited " + strings.IntToStr(doodadModelIds[doodadModelIndex]))
+                doodadModelIndex = doodadModelIndex + 1
+            summary.wmoDoodadModelDependenciesReady =
+                doodadModelIds.len == summary.wmoDoodadModelPlacementCount &&
+                summary.wmoDoodadModelPlacementCount == summary.wmoDoodadPlacementCount &&
+                summary.wmoDoodadReferencedModelFileDataIDCount > 0
             let chunkRes: Result[bool] = previewApplyChunkedAsset(summary, fileBuf, "northshire-wmo")
             bytes.FreeByteBuffer(fileBuf)
             if IsErr(chunkRes):
@@ -215,11 +257,16 @@ fn PreviewNorthshire(frames: int32): Result[PreviewSummary] =
     let auditRes: Result[northshire.NorthshireAuditSummary] = northshire.AuditManifestPayloadsAgainstLocal(manifest)
     if IsErr(auditRes):
         return Err[PreviewSummary](Error(auditRes))
+    let depAuditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestDependenciesAgainstLocal(manifest)
+    if IsErr(depAuditRes):
+        return Err[PreviewSummary](Error(depAuditRes))
     var out: PreviewSummary
     out.width = 1280
     out.height = 720
     out.frames = frames
     out.auditedFileCount = Value(auditRes).matchedFileCount
+    out.auditedDependencyCount = Value(depAuditRes).matchedDependencyCount
     let loadRes: Result[bool] = previewLoadAuditedAssets(out, manifest)
     if IsErr(loadRes):
         return Err[PreviewSummary](Error(loadRes))
@@ -243,6 +290,14 @@ fn PreviewNorthshire(frames: int32): Result[PreviewSummary] =
         out.wmoGroupAssetCount == out.wmoGroupCount &&
         out.wmoGroupVertexCount > 0 &&
         out.wmoGroupIndexCount > 0 &&
+        out.wmoModelFileDataIDCount > 0 &&
+        out.wmoModelDependenciesReady &&
+        out.wmoModelDependencyCount == out.wmoModelFileDataIDCount &&
+        out.wmoModelSlotCount >= out.wmoModelFileDataIDCount &&
+        out.wmoDoodadModelDependenciesReady &&
+        out.wmoDoodadModelPlacementCount == out.wmoDoodadPlacementCount &&
+        out.wmoDoodadReferencedModelFileDataIDCount > 0 &&
+        out.auditedDependencyCount >= out.wmoModelDependencyCount &&
         out.wmoChunkCount > 0 &&
         out.m2Version > 0 &&
         out.m2SkinFileDataIDCount > 0 &&
@@ -269,6 +324,7 @@ fn PreviewSummaryText(summary: PreviewSummary): str =
     let frameText: str = strings.IntToStr(summary.frames)
     let sceneText: str = summary.sceneNonEmpty ? "non-empty" : "empty"
     let auditedText: str = strings.IntToStr(summary.auditedFileCount)
+    let auditedDepText: str = strings.IntToStr(summary.auditedDependencyCount)
     let loadedText: str = strings.IntToStr(summary.loadedFileCount)
     let chunkText: str = strings.IntToStr(summary.chunkFileCount)
     let totalChunkText: str = strings.IntToStr(summary.totalChunkCount)
@@ -301,8 +357,15 @@ fn PreviewSummaryText(summary: PreviewSummary): str =
     let wmoGroupAssetText: str = strings.IntToStr(summary.wmoGroupAssetCount)
     let wmoGroupVertexText: str = strings.IntToStr(summary.wmoGroupVertexCount)
     let wmoGroupIndexText: str = strings.IntToStr(summary.wmoGroupIndexCount)
+    let wmoModelSlotText: str = strings.IntToStr(summary.wmoModelSlotCount)
     let wmoModelIdText: str = strings.IntToStr(summary.wmoModelFileDataIDCount)
+    let wmoModelDepText: str = strings.IntToStr(summary.wmoModelDependencyCount)
+    let wmoModelDepReadyText: str = summary.wmoModelDependenciesReady ? "ready" : "missing"
     let wmoFirstModelText: str = strings.IntToStr(summary.wmoFirstModelFileDataID)
+    let wmoDoodadModelPlacementText: str = strings.IntToStr(summary.wmoDoodadModelPlacementCount)
+    let wmoDoodadReferencedModelText: str = strings.IntToStr(summary.wmoDoodadReferencedModelFileDataIDCount)
+    let wmoDoodadModelDepReadyText: str = summary.wmoDoodadModelDependenciesReady ? "ready" : "missing"
+    let wmoFirstDoodadModelText: str = strings.IntToStr(summary.wmoFirstDoodadModelFileDataID)
     let m2Text: str = strings.IntToStr(summary.m2Version)
     let m2SkinText: str = strings.IntToStr(summary.m2SkinFileDataIDCount)
     let m2FirstSkinText: str = strings.IntToStr(summary.m2FirstSkinFileDataID)
@@ -328,6 +391,7 @@ fn PreviewSummaryText(summary: PreviewSummary): str =
     out = out + Fmt" frames={frameText}"
     out = out + Fmt" scene={sceneText}"
     out = out + Fmt" auditedFiles={auditedText}"
+    out = out + Fmt" auditedDependencies={auditedDepText}"
     out = out + Fmt" loadedFiles={loadedText}"
     out = out + Fmt" chunkFiles={chunkText}"
     out = out + Fmt" totalChunks={totalChunkText}"
@@ -355,8 +419,15 @@ fn PreviewSummaryText(summary: PreviewSummary): str =
     out = out + Fmt" wmoGroupAssets={wmoGroupAssetText}"
     out = out + Fmt" wmoGroupVertices={wmoGroupVertexText}"
     out = out + Fmt" wmoGroupIndices={wmoGroupIndexText}"
+    out = out + Fmt" wmoModelSlots={wmoModelSlotText}"
     out = out + Fmt" wmoModelFileIDs={wmoModelIdText}"
+    out = out + Fmt" wmoModelDependencies={wmoModelDepText}"
+    out = out + Fmt" wmoModelDependencyAudit={wmoModelDepReadyText}"
     out = out + Fmt" wmoFirstModelFileDataID={wmoFirstModelText}"
+    out = out + Fmt" wmoDoodadModelPlacements={wmoDoodadModelPlacementText}"
+    out = out + Fmt" wmoDoodadReferencedModelFileIDs={wmoDoodadReferencedModelText}"
+    out = out + Fmt" wmoDoodadModelDependencyAudit={wmoDoodadModelDepReadyText}"
+    out = out + Fmt" wmoFirstDoodadModelFileDataID={wmoFirstDoodadModelText}"
     out = out + Fmt" m2Version={m2Text}"
     out = out + Fmt" m2SkinFileIDs={m2SkinText}"
     out = out + Fmt" m2FirstSkinFileDataID={m2FirstSkinText}"

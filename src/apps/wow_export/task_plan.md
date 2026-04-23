@@ -35,3 +35,11 @@
 - [x] Narrow Northshire terrain from WDT `MAID` coordinates to four audited Azeroth ADT tiles.
 - [x] Parse ADT `MCNK/MCVT` terrain height samples.
 - [x] Include real ADT terrain in preview, export bundle, render, and memory smoke coverage.
+- [x] Parse WMO `MODS/MODD` doodad sets and placement bounds.
+- [x] Include real WMO doodad placement points in preview, render, and memory smoke coverage.
+- [x] Add pathless audited WMO `MODI` dependency table without fabricating listfile paths.
+- [x] Require preview to match real WMO `MODI` IDs against the audited dependency table.
+- [x] Resolve WMO `MODD` doodad model slots through sparse `IDOM/MODI` and audit every placed model.
+- [x] Export pathless WMO `MODI` dependencies as fileDataID-named resources with a strict manifest.
+- [x] Require render to audit WMO doodad model dependencies before drawing placement markers.
+- [x] Fix CLI single-command argument gate for `manifest` and other one-word commands.

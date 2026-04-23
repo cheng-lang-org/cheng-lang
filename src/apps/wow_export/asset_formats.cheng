@@ -41,8 +41,12 @@ type
         maxDoodadZ1000: int32
         groupFileDataIDCount: int32
         firstGroupFileDataID: int32
+        modelSlotCount: int32
         modelFileDataIDCount: int32
         firstModelFileDataID: int32
+        doodadResolvedModelPlacementCount: int32
+        doodadReferencedModelFileDataIDCount: int32
+        firstDoodadModelFileDataID: int32
 
     WmoGroupSummary =
         header: FormatHeader
@@ -107,6 +111,30 @@ const
     adtMcvTByteCount = 580
     wmoDoodadSetStride = 32
     wmoDoodadPlacementStride = 40
+
+fn int32ListContains(values: int32[], value: int32): bool =
+    var i: int32
+    while i < values.len:
+        if values[i] == value:
+            return true
+        i = i + 1
+    return false
+
+fn wmoResolveDoodadModelSlots(modelSlots: int32[], doodadSlots: int32[]): Result[int32[]] =
+    if doodadSlots.len > 0 && modelSlots.len <= 0:
+        return Err[int32[]]("wowExport WMO: MODD references missing MODI table")
+    var out: int32[]
+    var i: int32
+    while i < doodadSlots.len:
+        let slot: int32 = doodadSlots[i]
+        if slot < 0 || slot >= modelSlots.len:
+            return Err[int32[]]("wowExport WMO: MODD model slot out of MODI range " + strings.IntToStr(slot))
+        let fileDataID: int32 = modelSlots[slot]
+        if fileDataID <= 0:
+            return Err[int32[]]("wowExport WMO: MODD model slot has no MODI fileDataID " + strings.IntToStr(slot))
+        add(out, fileDataID)
+        i = i + 1
+    return Ok[int32[]](out)
 
 fn m2HasMagic(buf: bytes.ByteBuffer,
               start: int32,
@@ -335,6 +363,8 @@ fn ParseWmoRootSummary(buf: bytes.ByteBuffer): Result[WmoRootSummary] =
         return Err[WmoRootSummary](Error(headerRes))
     var out: WmoRootSummary
     out.header = Value(headerRes)
+    var modelSlots: int32[]
+    var doodadModelSlots: int32[]
     var pos: int32
     while pos < buf.len:
         if pos + 8 > buf.len:
@@ -345,7 +375,7 @@ fn ParseWmoRootSummary(buf: bytes.ByteBuffer): Result[WmoRootSummary] =
         let magic: str = Value(magicRes)
         let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
         let dataPos: int32 = pos + 8
-        if dataPos + size > buf.len:
+        if size < 0 || dataPos + size > buf.len:
             return Err[WmoRootSummary]("wowExport WMO: chunk out of bounds")
         if magic == "DHOM":
             if size < 28:
@@ -366,9 +396,11 @@ fn ParseWmoRootSummary(buf: bytes.ByteBuffer): Result[WmoRootSummary] =
         elif magic == "IDOM":
             if (size % 4) != 0:
                 return Err[WmoRootSummary]("wowExport WMO: MODI chunk size invalid")
+            out.modelSlotCount = size / 4
             var i: int32
-            while i < size / 4:
+            while i < out.modelSlotCount:
                 let fileDataID: int32 = bytes.ReadU32LEAt(buf, dataPos + i * 4)
+                add(modelSlots, fileDataID)
                 if fileDataID > 0:
                     if out.firstModelFileDataID == 0:
                         out.firstModelFileDataID = fileDataID
@@ -395,6 +427,7 @@ fn ParseWmoRootSummary(buf: bytes.ByteBuffer): Result[WmoRootSummary] =
             while i < out.doodadPlacementCount:
                 let entryPos: int32 = dataPos + i * wmoDoodadPlacementStride
                 let nameIndex: int32 = bytes.ReadU32LEAt(buf, entryPos)
+                add(doodadModelSlots, nameIndex)
                 let x: int32 = m2F32Scaled1000At(buf, entryPos + 4)
                 let y: int32 = m2F32Scaled1000At(buf, entryPos + 8)
                 let z: int32 = m2F32Scaled1000At(buf, entryPos + 12)
@@ -420,7 +453,94 @@ fn ParseWmoRootSummary(buf: bytes.ByteBuffer): Result[WmoRootSummary] =
         return Err[WmoRootSummary]("wowExport WMO: MOHD group count missing")
     if out.doodadSetDefinitionCount > 0 && out.doodadSetPlacementCount != out.doodadPlacementCount:
         return Err[WmoRootSummary]("wowExport WMO: doodad set placement count mismatch")
+    let resolvedRes: Result[int32[]] = wmoResolveDoodadModelSlots(modelSlots, doodadModelSlots)
+    if IsErr(resolvedRes):
+        return Err[WmoRootSummary](Error(resolvedRes))
+    let resolvedModels: int32[] = Value(resolvedRes)
+    out.doodadResolvedModelPlacementCount = resolvedModels.len
+    var referencedModels: int32[]
+    var modelIndex: int32
+    while modelIndex < resolvedModels.len:
+        let fileDataID: int32 = resolvedModels[modelIndex]
+        if out.firstDoodadModelFileDataID == 0:
+            out.firstDoodadModelFileDataID = fileDataID
+        if !int32ListContains(referencedModels, fileDataID):
+            add(referencedModels, fileDataID)
+            out.doodadReferencedModelFileDataIDCount = out.doodadReferencedModelFileDataIDCount + 1
+        modelIndex = modelIndex + 1
     return Ok[WmoRootSummary](out)
+
+fn ParseWmoModelFileDataIDs(buf: bytes.ByteBuffer): Result[int32[]] =
+    let headerRes: Result[FormatHeader] = ParseChunkedHeader(buf, "WMO")
+    if IsErr(headerRes):
+        return Err[int32[]](Error(headerRes))
+    var out: int32[]
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[int32[]]("wowExport WMO: truncated chunk")
+        let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+        if IsErr(magicRes):
+            return Err[int32[]](Error(magicRes))
+        let magic: str = Value(magicRes)
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[int32[]]("wowExport WMO: chunk out of bounds")
+        if magic == "IDOM":
+            if (size % 4) != 0:
+                return Err[int32[]]("wowExport WMO: MODI chunk size invalid")
+            var i: int32
+            while i < size / 4:
+                let fileDataID: int32 = bytes.ReadU32LEAt(buf, dataPos + i * 4)
+                if fileDataID > 0:
+                    add(out, fileDataID)
+                i = i + 1
+        pos = dataPos + size
+    if out.len <= 0:
+        return Err[int32[]]("wowExport WMO: MODI model fileDataIDs missing")
+    return Ok[int32[]](out)
+
+fn ParseWmoDoodadModelFileDataIDs(buf: bytes.ByteBuffer): Result[int32[]] =
+    let headerRes: Result[FormatHeader] = ParseChunkedHeader(buf, "WMO")
+    if IsErr(headerRes):
+        return Err[int32[]](Error(headerRes))
+    var modelSlots: int32[]
+    var doodadSlots: int32[]
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[int32[]]("wowExport WMO: truncated chunk")
+        let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+        if IsErr(magicRes):
+            return Err[int32[]](Error(magicRes))
+        let magic: str = Value(magicRes)
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[int32[]]("wowExport WMO: chunk out of bounds")
+        if magic == "IDOM":
+            if (size % 4) != 0:
+                return Err[int32[]]("wowExport WMO: MODI chunk size invalid")
+            var i: int32
+            while i < size / 4:
+                add(modelSlots, bytes.ReadU32LEAt(buf, dataPos + i * 4))
+                i = i + 1
+        elif magic == "DDOM":
+            if (size % wmoDoodadPlacementStride) != 0:
+                return Err[int32[]]("wowExport WMO: MODD chunk size invalid")
+            var i: int32
+            while i < size / wmoDoodadPlacementStride:
+                add(doodadSlots, bytes.ReadU32LEAt(buf, dataPos + i * wmoDoodadPlacementStride))
+                i = i + 1
+        pos = dataPos + size
+    let resolvedRes: Result[int32[]] = wmoResolveDoodadModelSlots(modelSlots, doodadSlots)
+    if IsErr(resolvedRes):
+        return Err[int32[]](Error(resolvedRes))
+    let resolved: int32[] = Value(resolvedRes)
+    if resolved.len <= 0:
+        return Err[int32[]]("wowExport WMO: MODD doodad model fileDataIDs missing")
+    return Ok[int32[]](resolved)
 
 fn wmoGroupApplyChunk(magic: str,
                       size: int32,

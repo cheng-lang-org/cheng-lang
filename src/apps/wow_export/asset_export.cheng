@@ -23,6 +23,12 @@ type
         fileCount: int32
         bytesWritten: int32
 
+    AssetExportDependencyBundleSummary =
+        outDir: str
+        manifestPath: str
+        fileCount: int32
+        bytesWritten: int32
+
 fn assetExportMakeDirAll(path: str): bool =
     if strings.Len(path) == 0:
         return false
@@ -66,6 +72,31 @@ fn assetExportWriteBufferAtomic(path: str, buf: bytes.ByteBuffer): Result[int32]
 
 fn AssetExportWriteBufferAtomic(path: str, buf: bytes.ByteBuffer): Result[int32] =
     return assetExportWriteBufferAtomic(path, buf)
+
+fn assetExportWriteTextAtomic(path: str, text: str): Result[int32] =
+    if strings.Len(path) == 0:
+        return Err[int32]("wowExport asset export: missing output path")
+    if strings.Len(text) <= 0:
+        return Err[int32]("wowExport asset export: empty text")
+    if os.FileExists(path):
+        return Err[int32]("wowExport asset export: refusing to overwrite " + path)
+    let parent: str = os.ParentDir(path)
+    if strings.Len(parent) > 0 && !os.DirExists(parent):
+        if !assetExportMakeDirAll(parent):
+            return Err[int32]("wowExport asset export: output directory create failed " + parent)
+    let tmpPath: str = path + ".tmp"
+    if os.FileExists(tmpPath):
+        let _ = os.RemoveFile(tmpPath)
+    os.WriteFile(tmpPath, text)
+    if !os.FileExists(tmpPath):
+        return Err[int32]("wowExport asset export: text write failed " + tmpPath)
+    if os.FileSize(tmpPath) != int64(strings.Len(text)):
+        let _ = os.RemoveFile(tmpPath)
+        return Err[int32]("wowExport asset export: text short write")
+    if !os.RenameFile(tmpPath, path):
+        let _ = os.RemoveFile(tmpPath)
+        return Err[int32]("wowExport asset export: rename output failed " + path)
+    return Ok[int32](strings.Len(text))
 
 fn assetExportValidateFile(file: northshire.NorthshireAuditedFile,
                            buf: bytes.ByteBuffer): Result[str] =
@@ -262,6 +293,105 @@ fn ConvertNorthshireFirstBlp(m: northshire.NorthshireManifest,
 fn NorthshireDefaultOutputName(file: northshire.NorthshireAuditedFile): str =
     return Fmt"{file.label}.{file.kind}"
 
+fn NorthshireDependencyOutputName(dep: northshire.NorthshireAuditedDependency): str =
+    let fidText: str = strings.IntToStr(dep.fileDataID)
+    return dep.label + "-fid-" + fidText + ".m2"
+
+fn assetExportValidateDependency(dep: northshire.NorthshireAuditedDependency,
+                                 buf: bytes.ByteBuffer): Result[str] =
+    if dep.relationKind != "wmo_modi":
+        return Err[str]("wowExport dependency export: unsupported dependency relation " + dep.relationKind)
+    let headerRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(buf)
+    if IsErr(headerRes):
+        return Err[str](Error(headerRes))
+    let header: asset_formats.M2Header = Value(headerRes)
+    if header.version <= 0:
+        return Err[str]("wowExport dependency export: invalid M2 version")
+    let fidText: str = strings.IntToStr(dep.fileDataID)
+    let vertexText: str = strings.IntToStr(header.vertexCount)
+    let skinText: str = strings.IntToStr(header.skinProfileCount)
+    var out: str = "dependency relation=" + dep.relationKind
+    out = out + " fileDataID=" + fidText
+    out = out + " m2Vertices=" + vertexText
+    out = out + " skins=" + skinText
+    return out
+
+fn assetExportDependencyManifestLine(dep: northshire.NorthshireAuditedDependency,
+                                     outName: str,
+                                     bytesWritten: int32): str =
+    let fidText: str = strings.IntToStr(dep.fileDataID)
+    let archiveText: str = strings.IntToStr(dep.archiveIndex)
+    let offsetText: str = strings.IntToStr(dep.offset)
+    let sizeText: str = strings.IntToStr(dep.size)
+    let bytesText: str = strings.IntToStr(bytesWritten)
+    var out: str = "label=" + dep.label
+    out = out + " source=" + dep.sourceLabel
+    out = out + " relation=" + dep.relationKind
+    out = out + " fileDataID=" + fidText
+    out = out + " contentKey=" + dep.contentKey
+    out = out + " encodingKey=" + dep.encodingKey
+    out = out + " archive=" + archiveText
+    out = out + " offset=" + offsetText
+    out = out + " encodedSize=" + sizeText
+    out = out + " decodedBytes=" + bytesText
+    out = out + " file=" + outName
+    return out + "\n"
+
+fn ExportNorthshireDependenciesBundle(m: northshire.NorthshireManifest,
+                                      outDir: str): Result[AssetExportDependencyBundleSummary] =
+    if strings.Len(outDir) == 0:
+        return Err[AssetExportDependencyBundleSummary]("wowExport dependency export: missing output directory")
+    if !assetExportMakeDirAll(outDir):
+        return Err[AssetExportDependencyBundleSummary]("wowExport dependency export: output directory create failed " + outDir)
+    let manifestPath: str = build_info.StablePathJoin(outDir, "dependencies.manifest.txt")
+    if os.FileExists(manifestPath):
+        return Err[AssetExportDependencyBundleSummary]("wowExport dependency export: refusing to overwrite " + manifestPath)
+    var i: int32
+    while i < m.auditedDependencies.len:
+        let dep: northshire.NorthshireAuditedDependency = m.auditedDependencies[i]
+        let path: str = build_info.StablePathJoin(outDir, NorthshireDependencyOutputName(dep))
+        if os.FileExists(path):
+            return Err[AssetExportDependencyBundleSummary]("wowExport dependency export: refusing to overwrite " + path)
+        i = i + 1
+    let auditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestDependenciesAgainstLocal(m)
+    if IsErr(auditRes):
+        return Err[AssetExportDependencyBundleSummary](Error(auditRes))
+    var out: AssetExportDependencyBundleSummary
+    out.outDir = outDir
+    out.manifestPath = manifestPath
+    var manifestText: str = "format=wow_export_dependencies_v1\n"
+    manifestText = manifestText + "buildKey=" + m.buildKey + "\n"
+    manifestText = manifestText + "source=northshire_retail_12_0_5\n"
+    let depCountText: str = strings.IntToStr(m.auditedDependencyCount)
+    manifestText = manifestText + "dependencies=" + depCountText + "\n"
+    i = 0
+    while i < m.auditedDependencies.len:
+        let dep: northshire.NorthshireAuditedDependency = m.auditedDependencies[i]
+        let outName: str = NorthshireDependencyOutputName(dep)
+        let path: str = build_info.StablePathJoin(outDir, outName)
+        let fileRes: Result[bytes.ByteBuffer] =
+            local_files.ReadLocalFileByEntry(m.clientPath, dep.archiveIndex, dep.offset, dep.size)
+        if IsErr(fileRes):
+            return Err[AssetExportDependencyBundleSummary](Error(fileRes))
+        var fileBuf: bytes.ByteBuffer = Value(fileRes)
+        let detailRes: Result[str] = assetExportValidateDependency(dep, fileBuf)
+        if IsErr(detailRes):
+            bytes.FreeByteBuffer(fileBuf)
+            return Err[AssetExportDependencyBundleSummary](Error(detailRes))
+        let writeRes: Result[int32] = assetExportWriteBufferAtomic(path, fileBuf)
+        bytes.FreeByteBuffer(fileBuf)
+        if IsErr(writeRes):
+            return Err[AssetExportDependencyBundleSummary](Error(writeRes))
+        out.fileCount = out.fileCount + 1
+        out.bytesWritten = out.bytesWritten + Value(writeRes)
+        manifestText = manifestText + assetExportDependencyManifestLine(dep, outName, Value(writeRes))
+        i = i + 1
+    let manifestWriteRes: Result[int32] = assetExportWriteTextAtomic(manifestPath, manifestText)
+    if IsErr(manifestWriteRes):
+        return Err[AssetExportDependencyBundleSummary](Error(manifestWriteRes))
+    return Ok[AssetExportDependencyBundleSummary](out)
+
 fn ExportNorthshireBundle(m: northshire.NorthshireManifest,
                           outDir: str): Result[AssetExportBundleSummary] =
     if strings.Len(outDir) == 0:
@@ -302,4 +432,13 @@ fn AssetExportBundleSummaryText(summary: AssetExportBundleSummary): str =
     var out: str = Fmt"exportedBundle files={countText}"
     out = out + Fmt" bytes={bytesText}"
     out = out + Fmt" outDir={summary.outDir}"
+    return out
+
+fn AssetExportDependencyBundleSummaryText(summary: AssetExportDependencyBundleSummary): str =
+    let countText: str = strings.IntToStr(summary.fileCount)
+    let bytesText: str = strings.IntToStr(summary.bytesWritten)
+    var out: str = "exportedDependencies files=" + countText
+    out = out + " bytes=" + bytesText
+    out = out + " manifest=" + summary.manifestPath
+    out = out + " outDir=" + summary.outDir
     return out

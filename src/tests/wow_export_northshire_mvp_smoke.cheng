@@ -1,8 +1,11 @@
+import std/bytes as bytes
 import std/result
 import std/strformat
 import std/strings as strings
 import std/system
+import cheng/apps/wow_export/asset_formats as asset_formats
 import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/local_files as local_files
 import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
 import cheng/apps/wow_export/preview as preview
 
@@ -15,10 +18,33 @@ fn main(): int32 =
     assert(manifest.version == "12.0.5.67165", "wow_export_northshire_mvp_smoke version")
     assert(manifest.buildKey == "02482dc9c788698c83e7ae0e24ab2bb7", "wow_export_northshire_mvp_smoke build key")
     assert(manifest.auditedFileCount == 22, "wow_export_northshire_mvp_smoke audited file count")
+    assert(manifest.auditedDependencyCount == 17, "wow_export_northshire_mvp_smoke dependency count")
     assert(northshire.ManifestReady(manifest), "wow_export_northshire_mvp_smoke manifest ready")
     let auditRes: Result[northshire.NorthshireAuditSummary] = northshire.AuditManifestPayloadsAgainstLocal(manifest)
     assert(IsOk(auditRes), Error(auditRes))
     assert(Value(auditRes).matchedFileCount == 22, "wow_export_northshire_mvp_smoke matched file count")
+    let depAuditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestDependenciesAgainstLocal(manifest)
+    assert(IsOk(depAuditRes), Error(depAuditRes))
+    assert(Value(depAuditRes).matchedDependencyCount == 17,
+           "wow_export_northshire_mvp_smoke matched dependency count")
+    assert(northshire.CountDependenciesForSource(manifest, "northshire-abbey-wmo", "wmo_modi") == 17,
+           "wow_export_northshire_mvp_smoke wmo modi dependency count")
+    assert(northshire.HasDependencyFileDataID(manifest, "northshire-abbey-wmo", "wmo_modi", 198056),
+           "wow_export_northshire_mvp_smoke wmo first modi dependency")
+    var depIndex: int32
+    while depIndex < manifest.auditedDependencies.len:
+        let dep: northshire.NorthshireAuditedDependency = manifest.auditedDependencies[depIndex]
+        let depFileRes: Result[bytes.ByteBuffer] =
+            local_files.ReadLocalFileByEntry(manifest.clientPath, dep.archiveIndex, dep.offset, dep.size)
+        assert(IsOk(depFileRes), Error(depFileRes))
+        let depBuf: bytes.ByteBuffer = Value(depFileRes)
+        let depHeaderRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(depBuf)
+        bytes.FreeByteBuffer(depBuf)
+        assert(IsOk(depHeaderRes), Error(depHeaderRes))
+        assert(Value(depHeaderRes).version > 0, "wow_export_northshire_mvp_smoke dependency m2 header")
+        depIndex = depIndex + 1
+    echo("wow_export_northshire_mvp_smoke dependency_m2_headers=17")
 
     let summaryRes: Result[preview.PreviewSummary] = preview.PreviewNorthshire(120)
     assert(IsOk(summaryRes), Error(summaryRes))
@@ -42,12 +68,17 @@ fn main(): int32 =
     summaryLine = summaryLine + Fmt" wmoGroupAssets={strings.IntToStr(summary.wmoGroupAssetCount)}"
     summaryLine = summaryLine + Fmt" wmoGroupVertices={strings.IntToStr(summary.wmoGroupVertexCount)}"
     summaryLine = summaryLine + Fmt" wmoGroupIndices={strings.IntToStr(summary.wmoGroupIndexCount)}"
+    summaryLine = summaryLine + Fmt" wmoModelSlots={strings.IntToStr(summary.wmoModelSlotCount)}"
+    summaryLine = summaryLine + Fmt" wmoModelDependencies={strings.IntToStr(summary.wmoModelDependencyCount)}"
+    summaryLine = summaryLine + Fmt" wmoDoodadModelPlacements={strings.IntToStr(summary.wmoDoodadModelPlacementCount)}"
+    summaryLine = summaryLine + Fmt" wmoDoodadReferencedModels={strings.IntToStr(summary.wmoDoodadReferencedModelFileDataIDCount)}"
     summaryLine = summaryLine + Fmt" m2SkinIndices={strings.IntToStr(summary.m2SkinIndexCount)}"
     summaryLine = summaryLine + Fmt" m2SkinTriangleIndices={strings.IntToStr(summary.m2SkinTriangleIndexCount)}"
     summaryLine = summaryLine + Fmt" wmoChunks={strings.IntToStr(summary.wmoChunkCount)}"
     echo(summaryLine)
     assert(summary.sceneNonEmpty, "wow_export_northshire_mvp_smoke scene ready")
     assert(summary.auditedFileCount == 22, "wow_export_northshire_mvp_smoke summary audited count")
+    assert(summary.auditedDependencyCount == 17, "wow_export_northshire_mvp_smoke summary dependency count")
     assert(summary.loadedFileCount == 22, "wow_export_northshire_mvp_smoke summary loaded count")
     assert(summary.chunkFileCount == 6, "wow_export_northshire_mvp_smoke chunk file count")
     assert(summary.totalChunkCount > 0, "wow_export_northshire_mvp_smoke total chunk count")
@@ -85,7 +116,19 @@ fn main(): int32 =
     assert(summary.wmoGroupVertexCount == 29304, "wow_export_northshire_mvp_smoke wmo group vertices")
     assert(summary.wmoGroupIndexCount == 91689, "wow_export_northshire_mvp_smoke wmo group indices")
     assert(summary.wmoModelFileDataIDCount > 0, "wow_export_northshire_mvp_smoke wmo model ids")
+    assert(summary.wmoModelSlotCount == 30, "wow_export_northshire_mvp_smoke wmo model slot count")
+    assert(summary.wmoModelFileDataIDCount == 17, "wow_export_northshire_mvp_smoke wmo model id count")
+    assert(summary.wmoModelDependencyCount == 17, "wow_export_northshire_mvp_smoke wmo model dependencies")
+    assert(summary.wmoModelDependenciesReady, "wow_export_northshire_mvp_smoke wmo model dependency ready")
     assert(summary.wmoFirstModelFileDataID == 198056, "wow_export_northshire_mvp_smoke wmo first model id")
+    assert(summary.wmoDoodadModelPlacementCount == 144,
+           "wow_export_northshire_mvp_smoke wmo doodad model placements")
+    assert(summary.wmoDoodadReferencedModelFileDataIDCount == 15,
+           "wow_export_northshire_mvp_smoke wmo doodad referenced models")
+    assert(summary.wmoDoodadModelDependenciesReady,
+           "wow_export_northshire_mvp_smoke wmo doodad model dependency ready")
+    assert(summary.wmoFirstDoodadModelFileDataID == 198056,
+           "wow_export_northshire_mvp_smoke wmo first doodad model id")
     assert(summary.wmoChunkCount > 0, "wow_export_northshire_mvp_smoke wmo chunk count")
     assert(summary.m2Version == 272, "wow_export_northshire_mvp_smoke m2 version")
     assert(summary.m2SkinFileDataIDCount == 1, "wow_export_northshire_mvp_smoke m2 skin ids")

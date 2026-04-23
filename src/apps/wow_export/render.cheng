@@ -25,6 +25,9 @@ type
         adtHeightSampleCount: int32
         wmoVertexCount: int32
         wmoDoodadPlacementCount: int32
+        wmoDoodadModelPlacementCount: int32
+        wmoDoodadReferencedModelFileDataIDCount: int32
+        wmoDoodadModelDependencyCount: int32
         m2VertexCount: int32
         skinTriangleIndexCount: int32
         pixelsTouched: int32
@@ -614,6 +617,10 @@ fn RenderNorthshireTga(outPath: str, width: int32, height: int32): Result[Render
         northshire.AuditManifestPayloadsAgainstLocal(manifest)
     if IsErr(auditRes):
         return Err[RenderSummary](Error(auditRes))
+    let depAuditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestDependenciesAgainstLocal(manifest)
+    if IsErr(depAuditRes):
+        return Err[RenderSummary](Error(depAuditRes))
     var terrainBounds: RenderBounds
     var wmoBounds: RenderBounds
     var m2Bounds: RenderBounds
@@ -639,6 +646,38 @@ fn RenderNorthshireTga(outPath: str, width: int32, height: int32): Result[Render
             if IsErr(bufRes):
                 return Err[RenderSummary](Error(bufRes))
             let buf: bytes.ByteBuffer = Value(bufRes)
+            let wmoRes: Result[asset_formats.WmoRootSummary] = asset_formats.ParseWmoRootSummary(buf)
+            if IsErr(wmoRes):
+                bytes.FreeByteBuffer(buf)
+                return Err[RenderSummary](Error(wmoRes))
+            let wmo: asset_formats.WmoRootSummary = Value(wmoRes)
+            summary.wmoDoodadModelPlacementCount =
+                summary.wmoDoodadModelPlacementCount + wmo.doodadResolvedModelPlacementCount
+            summary.wmoDoodadReferencedModelFileDataIDCount =
+                summary.wmoDoodadReferencedModelFileDataIDCount + wmo.doodadReferencedModelFileDataIDCount
+            let modelIdsRes: Result[int32[]] = asset_formats.ParseWmoModelFileDataIDs(buf)
+            if IsErr(modelIdsRes):
+                bytes.FreeByteBuffer(buf)
+                return Err[RenderSummary](Error(modelIdsRes))
+            let modelIds: int32[] = Value(modelIdsRes)
+            var modelIndex: int32
+            while modelIndex < modelIds.len:
+                if !northshire.HasDependencyFileDataID(manifest, file.label, "wmo_modi", modelIds[modelIndex]):
+                    bytes.FreeByteBuffer(buf)
+                    return Err[RenderSummary]("wowExport render: WMO MODI dependency is not audited " + strings.IntToStr(modelIds[modelIndex]))
+                summary.wmoDoodadModelDependencyCount = summary.wmoDoodadModelDependencyCount + 1
+                modelIndex = modelIndex + 1
+            let doodadModelIdsRes: Result[int32[]] = asset_formats.ParseWmoDoodadModelFileDataIDs(buf)
+            if IsErr(doodadModelIdsRes):
+                bytes.FreeByteBuffer(buf)
+                return Err[RenderSummary](Error(doodadModelIdsRes))
+            let doodadModelIds: int32[] = Value(doodadModelIdsRes)
+            var doodadIndex: int32
+            while doodadIndex < doodadModelIds.len:
+                if !northshire.HasDependencyFileDataID(manifest, file.label, "wmo_modi", doodadModelIds[doodadIndex]):
+                    bytes.FreeByteBuffer(buf)
+                    return Err[RenderSummary]("wowExport render: WMO MODD model dependency is not audited " + strings.IntToStr(doodadModelIds[doodadIndex]))
+                doodadIndex = doodadIndex + 1
             let scanRes: Result[bool] =
                 renderScanWmoDoodadPlacements(buf, wmoBounds, summary.wmoDoodadPlacementCount)
             bytes.FreeByteBuffer(buf)
@@ -675,6 +714,10 @@ fn RenderNorthshireTga(outPath: str, width: int32, height: int32): Result[Render
         i = i + 1
     if !terrainBounds.ready || !wmoBounds.ready || !m2Bounds.ready:
         return Err[RenderSummary]("wowExport render: missing geometry bounds")
+    if summary.wmoDoodadModelPlacementCount != summary.wmoDoodadPlacementCount ||
+        summary.wmoDoodadReferencedModelFileDataIDCount <= 0 ||
+        summary.wmoDoodadModelDependencyCount != northshire.CountDependenciesForSource(manifest, "northshire-abbey-wmo", "wmo_modi"):
+        return Err[RenderSummary]("wowExport render: WMO doodad model dependency audit mismatch")
     let tgaRes: Result[bytes.ByteBuffer] = renderMakeTga(width, height)
     if IsErr(tgaRes):
         return Err[RenderSummary](Error(tgaRes))
@@ -751,6 +794,9 @@ fn RenderSummaryText(summary: RenderSummary): str =
     let adtText: str = strings.IntToStr(summary.adtHeightSampleCount)
     let wmoText: str = strings.IntToStr(summary.wmoVertexCount)
     let doodadText: str = strings.IntToStr(summary.wmoDoodadPlacementCount)
+    let doodadModelText: str = strings.IntToStr(summary.wmoDoodadModelPlacementCount)
+    let doodadReferencedText: str = strings.IntToStr(summary.wmoDoodadReferencedModelFileDataIDCount)
+    let doodadDepText: str = strings.IntToStr(summary.wmoDoodadModelDependencyCount)
     let m2Text: str = strings.IntToStr(summary.m2VertexCount)
     let skinText: str = strings.IntToStr(summary.skinTriangleIndexCount)
     let pixelText: str = strings.IntToStr(summary.pixelsTouched)
@@ -760,6 +806,9 @@ fn RenderSummaryText(summary: RenderSummary): str =
     out = out + Fmt" adtHeightSamples={adtText}"
     out = out + Fmt" wmoVertices={wmoText}"
     out = out + Fmt" wmoDoodadPlacements={doodadText}"
+    out = out + Fmt" wmoDoodadModelPlacements={doodadModelText}"
+    out = out + Fmt" wmoDoodadReferencedModelFileIDs={doodadReferencedText}"
+    out = out + Fmt" wmoDoodadModelDependencies={doodadDepText}"
     out = out + Fmt" m2Vertices={m2Text}"
     out = out + Fmt" skinTriangleIndices={skinText}"
     out = out + Fmt" pixels={pixelText}"

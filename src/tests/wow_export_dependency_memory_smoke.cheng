@@ -1,0 +1,49 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import std/system
+import cheng/apps/wow_export/asset_formats as asset_formats
+import cheng/apps/wow_export/local_files as local_files
+import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
+
+fn probeDependencyOnce(): int32 =
+    let manifest: northshire.NorthshireManifest = northshire.Manifest()
+    assert(northshire.ManifestReady(manifest), "wow_export_dependency_memory manifest ready")
+    assert(manifest.auditedDependencyCount == 17, "wow_export_dependency_memory dependency count")
+    let depAuditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestDependenciesAgainstLocal(manifest)
+    assert(IsOk(depAuditRes), Error(depAuditRes))
+    assert(Value(depAuditRes).matchedDependencyCount == 17,
+           "wow_export_dependency_memory matched dependency count")
+    var totalFacts: int32 = Value(depAuditRes).matchedDependencyCount
+    var i: int32
+    while i < manifest.auditedDependencies.len:
+        let dep: northshire.NorthshireAuditedDependency = manifest.auditedDependencies[i]
+        let fileRes: Result[bytes.ByteBuffer] =
+            local_files.ReadLocalFileByEntry(manifest.clientPath, dep.archiveIndex, dep.offset, dep.size)
+        assert(IsOk(fileRes), Error(fileRes))
+        let fileBuf: bytes.ByteBuffer = Value(fileRes)
+        let headerRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(fileBuf)
+        bytes.FreeByteBuffer(fileBuf)
+        assert(IsOk(headerRes), Error(headerRes))
+        totalFacts = totalFacts + Value(headerRes).version + Value(headerRes).vertexCount
+        i = i + 1
+    return totalFacts
+
+fn main(): int32 =
+    echo("wow_export_dependency_memory first_probe_start")
+    assert(probeDependencyOnce() > 17, "wow_export_dependency_memory facts")
+    echo("wow_export_dependency_memory first_probe_ok")
+    let warm: int64 = memLiveCount()
+    echo("wow_export_dependency_memory second_probe_start")
+    assert(probeDependencyOnce() > 17, "wow_export_dependency_memory facts second")
+    echo("wow_export_dependency_memory second_probe_ok")
+    let second: int64 = memLiveCount()
+    let warmText: str = strings.Int64ToStr(warm)
+    let secondText: str = strings.Int64ToStr(second)
+    let steadyText: str = strings.Int64ToStr(second - warm)
+    echo("wow_export_dependency_memory warm=" + warmText)
+    echo("wow_export_dependency_memory second=" + secondText)
+    echo("wow_export_dependency_memory steady=" + steadyText)
+    echo("wow_export_dependency_memory_smoke ok")
+    return 0

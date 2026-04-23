@@ -9,6 +9,17 @@
 - `preview-northshire` 现在会把 ADT terrain 纳入 scene 判定和摘要；本机输出 `auditedFiles=22 loadedFiles=22 adtTiles=4 adtChunks=1024 adtHeightSamples=148480 assetBytes=3346856`。
 - `export-map --out-dir` 现在导出 `22` 个真实文件、合计 `3346856` 字节；四个 ADT 解码 payload 分别为 `375707/359854/322706/366237` 字节。
 - `render-northshire` 现在先绘制真实 ADT terrain 高度点，再叠加 WMO group 和 M2 点云；`640x360` 输出仍为 `921618` 字节，绘制点数从 `31153` 提升到 `179633`。
+- `asset_formats.ParseWmoRootSummary` 已解析 WMO `SDOM/MODS` doodad set 和 `DDOM/MODD` placement；Northshire Abbey 实测 `2` 个 doodad set、`144` 条真实 placement，placement bounds span 为 `74059,71093,34487`。
+- `preview-northshire` 的 scene 判定现在要求 WMO doodad placement 和 bounds；`render-northshire` 会把 144 个真实 WMO doodad placement 作为红色十字叠到主视图，本机 `640x360` 绘制点数为 `180353`。
+- Northshire manifest 现在额外维护 `17` 条 pathless WMO `MODI` 审计依赖：只记录来源 `northshire-abbey-wmo`、关系 `wmo_modi`、fileDataID、content key、encoding key、archive、offset、encoded size，不伪造 listfile path，也不混进 `export-map` 的有路径文件表。
+- `preview-northshire` 现在要求真实 WMO root 的 `17` 个 `MODI` model fileDataID 与这张审计依赖表逐个匹配；本机输出 `auditedDependencies=17 wmoModelFileIDs=17 wmoModelDependencies=17 wmoModelDependencyAudit=ready`。
+- WMO doodad 模型链已补齐：`DDOM/MODD` 记录首字段按稀疏 `IDOM/MODI` 槽位解析，不再当路径或紧凑索引；Northshire Abbey 实测 `30` 个 MODI 槽、`144` 条 MODD 摆放全部解析成功，实际被摆放引用的唯一模型为 `15` 个。
+- `preview-northshire` 现在会逐条检查 `MODD -> IDOM -> fileDataID` 得到的 `144` 个摆放模型都存在于 `wmo_modi` 审计依赖表；本机输出 `wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencyAudit=ready`。
+- `AuditManifestDependenciesAgainstLocal` 已走快审计：按 encoding key 查本地 `.idx`，校验 archive/offset/size，再解码 payload 算 MD5 对 content key；不再为了已审计依赖重新扫完整 root。
+- `export-dependencies --out-dir` 已新增：把 17 条 pathless `wmo_modi` 依赖按 `label-fid-fileDataID.m2` 导出，并写 `dependencies.manifest.txt`；不伪造 listfile path，不混入 `export-map`。
+- `render-northshire` 现在也要求 WMO doodad 模型依赖审计通过后才画 placement marker；本机输出 `wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencies=17`。
+- `wow_export_dependency_memory_smoke` 已覆盖 17 条 WMO `MODI` 依赖的重复审计和 M2 header 解码；本机 steady delta 为 `1363`。
+- `wow_export_tool_main` 的命令入口已修正为 `ParamCount() < 1` 才显示 usage；`/tmp/wow_export_tool_main manifest` 现在直接输出 manifest 摘要，不再要求额外占位参数。
 - `casc_index.LoadLocalIndexEntry` 不再因为目录路径或悬挂 `ListDir` 结果崩溃；现在会稳定返回真实错误。
 - `std/os.ListDir` 现已在库层修正：目录 listing raw buffer 会在 `ListDir` 内部释放，返回文件名保持 owned 字符串，不再把释放责任和悬挂风险留给业务层。
 - 当前本机重跑最小链路时，阻塞已经从“路径桥/悬挂字符串”收敛到“本地 journal 查不到 config 里的 encoding encoding key `00f6dcef63eafe6254ab5408ea8baa09`”。
@@ -54,6 +65,17 @@
 - `/tmp/wow_export_tool_main preview-northshire --frames 1` 通过，输出 `auditedFiles=22 loadedFiles=22 adtHeightSamples=148480 assetBytes=3346856`。
 - `/tmp/wow_export_tool_main export-map --out-dir /tmp/wow_export_map_adt_current` 通过，输出 `exportedBundle files=22 bytes=3346856`。
 - `/tmp/wow_export_tool_main render-northshire --out /tmp/wow_export_northshire_render_adt.tga --width 640 --height 360` 通过，输出 `adtHeightSamples=148480 pixels=179633`。
+- `/tmp/wow_export_tool_main preview-northshire --frames 1` 通过，输出 `wmoDoodadPlacements=144 wmoDoodadSpan1000=74059,71093,34487`。
+- `/tmp/wow_export_tool_main render-northshire --out /tmp/wow_export_northshire_render_doodads.tga --width 640 --height 360` 通过，输出 `wmoDoodadPlacements=144 pixels=180353`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_dependency_memory_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_dependency_memory_smoke` 通过，`/tmp/wow_export_dependency_memory_smoke` 通过。
+- `/tmp/wow_export_tool_main manifest` 通过，输出 `auditedFiles=22 auditedDependencies=17`。
+- `/tmp/wow_export_tool_main preview-northshire --frames 1` 通过，输出 `auditedDependencies=17 wmoModelFileIDs=17 wmoModelDependencies=17 wmoModelDependencyAudit=ready`。
+- `/tmp/wow_export_tool_main preview-northshire --frames 1` 通过，输出 `wmoModelSlots=30 wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencyAudit=ready`。
+- `/tmp/wow_export_tool_main export-dependencies --out-dir /tmp/wow_export_deps_cli.ghsOwy` 通过，输出 `exportedDependencies files=17 bytes=238866`，并写入 `dependencies.manifest.txt`。
+- `/tmp/wow_export_tool_main render-northshire --out /tmp/wow_export_northshire_render_modd_modi.tga --width 640 --height 360` 通过，输出 `wmoDoodadPlacements=144 pixels=180353`。
+- `/tmp/wow_export_tool_main render-northshire --out /tmp/wow_export_render_cli.ql4Jmx/northshire.tga --width 640 --height 360` 通过，输出 `wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencies=17`。
+- `/tmp/wow_export_tool_main export-map --out-dir /tmp/wow_export_map_dependency_current` 通过，仍导出 `22` 个有路径文件、`3346856` 字节；pathless 依赖不伪装成导出路径。
+- `/tmp/wow_export_tool_main render-northshire --out /tmp/wow_export_northshire_render_dependency.tga --width 640 --height 360` 通过，输出 `wmoDoodadPlacements=144 pixels=180353`。
 - `artifacts/backend_driver/cheng run-host-smokes wow_export_casc_smoke wow_export_md5_smoke wow_export_salsa20_smoke wow_export_blte_smoke wow_export_zlib_smoke wow_export_tact_keys_smoke wow_export_encoding_smoke` 通过。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/os_list_dir_stress_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/os_list_dir_stress_smoke && /usr/bin/time -l /tmp/os_list_dir_stress_smoke` 通过。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/os_list_dir_large_snapshot_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/os_list_dir_large_snapshot_smoke && /tmp/os_list_dir_large_snapshot_smoke` 通过。
@@ -102,4 +124,4 @@
 - `Data/data/data.NNN` 的 30 字节本地 header 继续只解释传统 local archive；`.index` 这边的真实文件格式也已经钉住。下一步应该把 CDN root 从“首块验证”推进成按需 range/block 解码，而不是全量 65MB 解码后再扫表。
 - `Data/indices` 大目录现在能稳定快照真实文件名，但 `os_list_dir_stress_smoke` 当前在 256 文件 * 6000 轮下的 `peak memory footprint` 约 `219005456`；这说明库层崩溃已修掉，长热路径的 allocator 回收表现还需要后续单独压。
 - 北郡预览现在会先跑本地审计，再读取已审计资产；剩余缺口是把真实几何/动画数据继续推进成更完整的 MVP，而不是只验证头部和 chunk 边界。
-- 当前 `extract-file`、`export-m2`、`export-wmo`、`export-map`、`convert-blp`、`preview-northshire`、`render-northshire` 已从占位推进到可用；剩余真正缺口是材质、光照、相机/世界摆放、更多 doodad/model 链路，而不是 ADT/WMO/M2 基础几何。
+- 当前 `extract-file`、`export-m2`、`export-wmo`、`export-map`、`convert-blp`、`preview-northshire`、`render-northshire` 已从占位推进到可用；剩余真实边界是材质、光照、相机/世界摆放和把 pathless `MODI` 依赖升级成有严格路径来源后的可导出资源，不是 ADT/WMO/M2 基础几何。

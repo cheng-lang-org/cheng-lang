@@ -48,7 +48,7 @@ fn BackendDriverUsage(rootDir: str) =
     BackendDriverPrintLine("core commands: status, print-build-plan, host-bridge-audit, system-link-exec")
     BackendDriverPrintLine("world/proof commands: world-receipt")
     BackendDriverPrintLine("debug commands: debug-report, print-symbols, print-line-map, print-asm")
-    BackendDriverPrintLine("verify commands: verify-export-visibility, verify-export-visibility-parallel, verify-debug-tools")
+    BackendDriverPrintLine("verify commands: verify-export-visibility, verify-export-visibility-parallel, verify-backend-driver-command-surface, verify-mobile-shell-build-probe, verify-r2c-react-surface, verify-debug-tools")
     BackendDriverPrintLine("gate commands: run-host-smokes, run-production-regression")
     BackendDriverPrintKeyValue("stage3", BackendDriverStage3Path(rootDir))
 
@@ -137,6 +137,8 @@ fn BackendDriverHostSmokeRunTimeoutSec(smokeName: str): int32 =
         return 600
     if smokeName == "backend_driver_command_surface_smoke":
         return 420
+    if BackendDriverStartsWith(smokeName, "r2c_react_"):
+        return 420
     if smokeName == "compiler_world_fresh_node_selfhost_smoke":
         return 420
     if smokeName == "perf_memory_contract_smoke":
@@ -145,6 +147,11 @@ fn BackendDriverHostSmokeRunTimeoutSec(smokeName: str): int32 =
 
 fn BackendDriverHostSmokeCompileEnv(): str[] =
     var out: str[]
+    add(out, "BACKEND_INCREMENTAL=0")
+    add(out, "BACKEND_MULTI_MODULE_CACHE=0")
+    add(out, "CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
     add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
     add(out, "CHENG_PROGRESS=1")
     add(out, "CHENG_PROCESS_MAX_RSS_BYTES=34359738368")
@@ -163,6 +170,14 @@ fn BackendDriverRunOneHostSmoke(rootDir: str,
     let outBin = os.JoinPath(outDir, smokeName)
     let compileLog = outBin + ".compile.log"
     let runLog = outBin + ".run.log"
+    if chengpath.PathFileExists(outBin):
+        os.RemoveFile(outBin)
+    if chengpath.PathFileExists(outBin + ".map"):
+        os.RemoveFile(outBin + ".map")
+    if chengpath.PathFileExists(compileLog):
+        os.RemoveFile(compileLog)
+    if chengpath.PathFileExists(runLog):
+        os.RemoveFile(runLog)
     var compileArgs: str[]
     add(compileArgs, "system-link-exec")
     add(compileArgs, "--root:" + rootDir)
@@ -229,6 +244,26 @@ fn BackendDriverRunHostSmokes(rootDir: str, args: str[]): int32 =
             return 1
     BackendDriverPrintLine("cheng backend driver host smokes: ok")
     return 0
+
+fn BackendDriverRunBuiltinHostSmoke(rootDir: str,
+                                      label: str,
+                                      smokeName: str): int32 =
+    return BackendDriverRunHostSmokes(rootDir, ["--label:" + label, smokeName])
+
+fn BackendDriverRunR2cReactSurface(rootDir: str): int32 =
+    return BackendDriverRunHostSmokes(rootDir,
+                                      [
+                                          "--label:verify_r2c_react_surface",
+                                          "r2c_react_surface_smoke",
+                                          "r2c_react_publish_selector_bundle_smoke",
+                                          "r2c_react_run_native_gui_controller_smoke",
+                                          "r2c_react_discover_truth_routes_controller_smoke",
+                                          "r2c_react_truth_compare_controller_smoke",
+                                          "r2c_react_exec_route_matrix_controller_smoke",
+                                          "r2c_react_render_compare_direct_smoke",
+                                          "r2c_react_render_compare_controller_smoke",
+                                          "r2c_react_render_compare_matrix_controller_smoke"
+                                      ])
 
 fn BackendDriverForward(rootDir: str,
                           cmd: str,
@@ -302,4 +337,14 @@ fn main(argc: int32, argv: str*): int32 =
             return evgate.ExportVisibilityGateRun(rootDir)
         if cmd == "verify-export-visibility-parallel":
             return evgate.ExportVisibilityGateRunParallel(rootDir)
+        if cmd == "verify-backend-driver-command-surface":
+            return BackendDriverRunBuiltinHostSmoke(rootDir,
+                                                     "verify_backend_driver_command_surface",
+                                                     "backend_driver_command_surface_smoke")
+        if cmd == "verify-mobile-shell-build-probe":
+            return BackendDriverRunBuiltinHostSmoke(rootDir,
+                                                     "verify_mobile_shell_build_probe",
+                                                     "mobile_shell_build_probe_smoke")
+        if cmd == "verify-r2c-react-surface":
+            return BackendDriverRunR2cReactSurface(rootDir)
     return BackendDriverForward(rootDir, cmd, args)

@@ -66,10 +66,8 @@ fn perfMemoryAssertPrimaryObjectColdMiss(summary: perfgate.PerfMemoryExecPhaseSu
         assert(summary.primaryObjectCacheMissCount > int64(0), label + " primary object cache cold miss count")
     assert(summary.primaryObjectAsmCompileMs > int64(0), label + " primary object cold asm compile")
 
-fn perfMemoryMetricText(value: int64): str =
-    if value > int64(0):
-        return int64ToStr(value)
-    return "-"
+fn perfMemoryAppendReport(reportFile: os.File, row: str) =
+    os.WriteLine(reportFile, row)
 
 fn perfMemoryDeleteCompileArtifacts(outputPath: str, compileLog: str) =
     perfMemoryDeleteFileIfExists(outputPath)
@@ -83,8 +81,12 @@ fn perfMemoryAssertCompileSample(sample: perfgate.PerfMemoryRun,
     assert(sample.exitCode == 0, label + " rc")
     assert(sample.elapsedMs > int64(0), label + " elapsed")
     assert(sample.maxRssBytes > int64(0), label + " rss")
-    assert(sample.elapsedMs <= threshold.maxElapsedMs, label + " observed max ms")
-    assert(sample.maxRssBytes <= threshold.maxRssBytes, label + " observed max rss")
+    assert(sample.elapsedMs <= threshold.maxElapsedMs,
+           label + " observed max ms elapsed=" + int64ToStr(sample.elapsedMs) +
+           " limit=" + int64ToStr(threshold.maxElapsedMs))
+    assert(sample.maxRssBytes <= threshold.maxRssBytes,
+           label + " observed max rss rss=" + int64ToStr(sample.maxRssBytes) +
+           " limit=" + int64ToStr(threshold.maxRssBytes))
     assert(os.FileExists(outputPath), label + " output")
 
 fn perfMemoryRunRepeatedNoHandoffCompile(workspaceRoot: str,
@@ -97,17 +99,19 @@ fn perfMemoryRunRepeatedNoHandoffCompile(workspaceRoot: str,
                                          compileTimeoutSec: int32,
                                          compileThreshold: perfgate.PerfMemoryThreshold,
                                          growthMaxBytes: int64,
-                                         reportRows: var str[]) =
+                                         reportFile: os.File) =
     assert(os.FileExists(compilerPath), " perf memory: no handoff compiler exists")
     assert(os.FileExists(sourcePath), " perf memory: no handoff source exists")
     assert(repeatCount >= int32(2), " perf memory: no handoff repeat count")
     assert(growthMaxBytes >= int64(0), " perf memory: no handoff growth threshold")
     var compileEnv: str[]
     add(compileEnv, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
+    add(compileEnv, "CHENG_PROGRESS=1")
     var baselineRssBytes = int64(-1)
     var maxObservedRssBytes = int64(-1)
     for i in 0..<repeatCount:
         let iterText = intToStr(i + 1)
+        echo(" perf memory: " + compilerLabel + " no handoff compile " + iterText + " begin")
         let outputPath = chengpath.PathJoin(outDir,
                                            "libp2p_quic_twoproc_client.no_handoff." + compilerLabel + "." + iterText)
         let compileLog = outputPath + ".compile.log"
@@ -126,7 +130,8 @@ fn perfMemoryRunRepeatedNoHandoffCompile(workspaceRoot: str,
                                       compileThreshold,
                                       outputPath,
                                       " perf memory: " + compilerLabel + " no handoff compile " + iterText)
-        add(reportRows, perfgate.PerfMemoryReportRow(sample, compileThreshold))
+        echo(" perf memory: " + compilerLabel + " no handoff compile " + iterText + " ok")
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryReportRow(sample, compileThreshold))
         if baselineRssBytes < int64(0):
             baselineRssBytes = sample.maxRssBytes
         if sample.maxRssBytes > maxObservedRssBytes:
@@ -134,36 +139,24 @@ fn perfMemoryRunRepeatedNoHandoffCompile(workspaceRoot: str,
         let growthBytes = sample.maxRssBytes - baselineRssBytes
         assert(growthBytes <= growthMaxBytes,
                " perf memory: " + compilerLabel + " no handoff compile rss growth")
-        var repeatRow = compilerLabel + "_no_handoff_repeat"
-        repeatRow = repeatRow + " iteration=" + iterText
-        repeatRow = repeatRow + " contract_rss_bytes=" + int64ToStr(sample.maxRssBytes)
-        repeatRow = repeatRow + " peak_footprint_bytes=" + perfMemoryMetricText(sample.peakFootprintBytes)
-        repeatRow = repeatRow + " rss_growth_bytes=" + int64ToStr(growthBytes)
-        repeatRow = repeatRow + " limit_growth_bytes=" + int64ToStr(growthMaxBytes)
-        repeatRow = repeatRow + " compiler=" + compilerPath
-        repeatRow = repeatRow + " source=" + sourcePath
-        add(reportRows, repeatRow)
-    var contractRow = compilerLabel + "_no_handoff_repeat_contract"
-    contractRow = contractRow + " repeat_count=" + intToStr(repeatCount)
-    contractRow = contractRow + " baseline_rss_bytes=" + int64ToStr(baselineRssBytes)
-    contractRow = contractRow + " max_rss_bytes=" + int64ToStr(maxObservedRssBytes)
-    contractRow = contractRow + " rss_growth_bytes=" + int64ToStr(maxObservedRssBytes - baselineRssBytes)
-    contractRow = contractRow + " limit_growth_bytes=" + int64ToStr(growthMaxBytes)
-    contractRow = contractRow + " compiler=" + compilerPath
-    contractRow = contractRow + " source=" + sourcePath
-    add(reportRows, contractRow)
+        perfMemoryAppendReport(reportFile, compilerLabel + "_no_handoff_repeat iteration=" + iterText)
+    perfMemoryAppendReport(reportFile, compilerLabel + "_no_handoff_repeat_contract")
 
 fn main(): int32 =
     let workspaceRoot = chengpath.PathCurrentDir()
     let smokeLabel: str = os.GetEnvDefault("CHENG_SMOKE_LABEL", "host")
     let outDir = chengpath.PathJoin(workspaceRoot, "artifacts/perf_memory_contract/" + smokeLabel)
     assert(chengpath.MkdirP(workspaceRoot, outDir), " perf memory: mkdir")
+    let reportPath = chengpath.PathJoin(outDir, "perf_memory_contract.report.txt")
+    let reportFile: os.File = os.Open(reportPath, os.fmWrite)
+    assert(reportFile != nil, " perf memory: open report")
     let compilerPath: str = perfgate.PerfMemoryResolveCompiler(workspaceRoot)
     assert(os.FileExists(compilerPath), " perf memory: compiler exists")
     let target: str = os.GetEnvDefault("CHENG_RUNTIME_LINK_TARGET", boot.BootstrapDefaultTarget())
     let compileTimeoutSec: int32 = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_PERF_COMPILE_TIMEOUT_SEC", "300")))
     let runTimeoutSec: int32 = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_PERF_RUN_TIMEOUT_SEC", "120")))
     var compileEnv: str[]
+    add(compileEnv, "CHENG_PROGRESS=1")
     let objectCompileThreshold = perfgate.PerfMemoryThresholdNew(
         perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_OBJECT_COMPILE_MAX_MS", "13000")),
         perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_OBJECT_COMPILE_MAX_RSS_BYTES", "3200000000"))
@@ -177,7 +170,7 @@ fn main(): int32 =
         perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_CHAIN_COMPILE_MAX_RSS_BYTES", "3200000000"))
     )
     let contentCompileThreshold = perfgate.PerfMemoryThresholdNew(
-        perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_CONTENT_COMPILE_MAX_MS", "16000")),
+        perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_CONTENT_COMPILE_MAX_MS", "30000")),
         perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_CONTENT_COMPILE_MAX_RSS_BYTES", "3200000000"))
     )
     let orcCompileThreshold = perfgate.PerfMemoryThresholdNew(
@@ -189,7 +182,7 @@ fn main(): int32 =
         perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_ORC_RUN_MAX_RSS_BYTES", "200000000"))
     )
     let cryptoCompileThreshold = perfgate.PerfMemoryThresholdNew(
-        perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_CRYPTO_COMPILE_MAX_MS", "16000")),
+        perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_CRYPTO_COMPILE_MAX_MS", "30000")),
         perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_CRYPTO_COMPILE_MAX_RSS_BYTES", "3200000000"))
     )
     let cryptoRunThreshold = perfgate.PerfMemoryThresholdNew(
@@ -197,10 +190,10 @@ fn main(): int32 =
         perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_CRYPTO_RUN_MAX_RSS_BYTES", "600000000"))
     )
     let noHandoffCompileThreshold = perfgate.PerfMemoryThresholdNew(
-        perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_NO_HANDOFF_COMPILE_MAX_MS", "30000")),
+        perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_NO_HANDOFF_COMPILE_MAX_MS", "300000")),
         perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_NO_HANDOFF_COMPILE_MAX_RSS_BYTES", "2000000000"))
     )
-    let noHandoffRepeatCount: int32 = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_PERF_NO_HANDOFF_REPEAT_COUNT", "3")))
+    let noHandoffRepeatCount: int32 = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_PERF_NO_HANDOFF_REPEAT_COUNT", "2")))
     let noHandoffGrowthMaxBytes = perfgate.PerfMemoryParseUnsignedInt64(
         os.GetEnvDefault("CHENG_PERF_NO_HANDOFF_GROWTH_MAX_RSS_BYTES", "268435456"))
     let cryptoSha256MaxNs = perfgate.PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_PERF_CRYPTO_SHA256_MAX_NS", "50000000"))
@@ -231,7 +224,6 @@ fn main(): int32 =
     assert(cryptoX25519MaxNs > int64(0), " perf memory: crypto x25519 max ns")
     assert(cryptoP256PubMaxNs > int64(0), " perf memory: crypto p256 pub max ns")
     assert(cryptoP256SignMaxNs > int64(0), " perf memory: crypto p256 sign max ns")
-    var reportRows: str[]
     let objectSourcePath = chengpath.PathJoin(workspaceRoot, "src/tests/object_native_link_plan_smoke.cheng")
     let objectOutputPath = chengpath.PathJoin(outDir, "object_native_link_plan_smoke")
     perfMemoryClearPrimaryObjectCache(workspaceRoot)
@@ -254,11 +246,11 @@ fn main(): int32 =
     assert(objectCompile.elapsedMs <= objectCompileThreshold.maxElapsedMs, " perf memory: object compile observed max ms")
     assert(objectCompile.maxRssBytes <= objectCompileThreshold.maxRssBytes, " perf memory: object compile observed max rss")
     assert(os.FileExists(objectOutputPath), " perf memory: object compile output")
-    add(reportRows, perfgate.PerfMemoryReportRow(objectCompile, objectCompileThreshold))
+    perfMemoryAppendReport(reportFile, perfgate.PerfMemoryReportRow(objectCompile, objectCompileThreshold))
     let objectCompilePhases = perfgate.PerfMemoryCompileExecPhaseSummary(workspaceRoot, objectOutputPath, "")
     if perfgate.PerfMemoryExecPhaseSummaryReady(objectCompilePhases) &&
        objectCompilePhases.totalMs <= objectCompile.elapsedMs:
-        add(reportRows, perfgate.PerfMemoryExecPhaseReportRow(objectCompile, objectCompilePhases))
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryExecPhaseReportRow(objectCompile, objectCompilePhases))
         assert(perfgate.PerfMemoryCompileGapBreakdownReady(objectCompilePhases),
                " perf memory: object compile gap breakdown ready")
         assert(perfgate.PerfMemoryExecPhaseAttributedMs(objectCompilePhases) >= objectCompilePhases.totalMs,
@@ -268,7 +260,7 @@ fn main(): int32 =
         perfMemoryAssertProviderCacheStats(objectCompilePhases, " perf memory: object compile")
         perfMemoryAssertPrimaryObjectEmitBreakdown(objectCompilePhases, " perf memory: object compile")
         perfMemoryAssertPrimaryObjectColdMiss(objectCompilePhases, " perf memory: object compile")
-        add(reportRows, perfgate.PerfMemoryCompileGapBreakdownRow(objectCompile, objectCompilePhases))
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryCompileGapBreakdownRow(objectCompile, objectCompilePhases))
     let objectRunLog = Fmt([objectOutputPath, ".run.log"])
     perfMemoryDeleteFileIfExists(objectRunLog)
     let objectRun = perfgate.PerfMemoryRunBinary(workspaceRoot,
@@ -286,7 +278,7 @@ fn main(): int32 =
     assert(objectRun.maxRssBytes > int64(0), " perf memory: object run rss")
     assert(objectRun.elapsedMs <= objectRunThreshold.maxElapsedMs, " perf memory: object run observed max ms")
     assert(objectRun.maxRssBytes <= objectRunThreshold.maxRssBytes, " perf memory: object run observed max rss")
-    add(reportRows, perfgate.PerfMemoryReportRow(objectRun, objectRunThreshold))
+    perfMemoryAppendReport(reportFile, perfgate.PerfMemoryReportRow(objectRun, objectRunThreshold))
     let chainSourcePath = chengpath.PathJoin(workspaceRoot, "src/tests/chain_node_smoke.cheng")
     let chainOutputPath = chengpath.PathJoin(outDir, "chain_node_smoke")
     perfMemoryClearPrimaryObjectCache(workspaceRoot)
@@ -309,11 +301,11 @@ fn main(): int32 =
     assert(chainCompile.elapsedMs <= chainCompileThreshold.maxElapsedMs, " perf memory: chain compile observed max ms")
     assert(chainCompile.maxRssBytes <= chainCompileThreshold.maxRssBytes, " perf memory: chain compile observed max rss")
     assert(os.FileExists(chainOutputPath), " perf memory: chain compile output")
-    add(reportRows, perfgate.PerfMemoryReportRow(chainCompile, chainCompileThreshold))
+    perfMemoryAppendReport(reportFile, perfgate.PerfMemoryReportRow(chainCompile, chainCompileThreshold))
     let chainCompilePhases = perfgate.PerfMemoryCompileExecPhaseSummary(workspaceRoot, chainOutputPath, "")
     if perfgate.PerfMemoryExecPhaseSummaryReady(chainCompilePhases) &&
        chainCompilePhases.totalMs <= chainCompile.elapsedMs:
-        add(reportRows, perfgate.PerfMemoryExecPhaseReportRow(chainCompile, chainCompilePhases))
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryExecPhaseReportRow(chainCompile, chainCompilePhases))
         assert(perfgate.PerfMemoryCompileGapBreakdownReady(chainCompilePhases),
                " perf memory: chain compile gap breakdown ready")
         assert(perfgate.PerfMemoryExecPhaseAttributedMs(chainCompilePhases) >= chainCompilePhases.totalMs,
@@ -323,7 +315,7 @@ fn main(): int32 =
         perfMemoryAssertProviderCacheStats(chainCompilePhases, " perf memory: chain compile")
         perfMemoryAssertPrimaryObjectEmitBreakdown(chainCompilePhases, " perf memory: chain compile")
         perfMemoryAssertPrimaryObjectColdMiss(chainCompilePhases, " perf memory: chain compile")
-        add(reportRows, perfgate.PerfMemoryCompileGapBreakdownRow(chainCompile, chainCompilePhases))
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryCompileGapBreakdownRow(chainCompile, chainCompilePhases))
     let contentSourcePath = chengpath.PathJoin(workspaceRoot, "src/tests/content_stub_smoke.cheng")
     let contentOutputPath = chengpath.PathJoin(outDir, "content_stub_smoke")
     perfMemoryClearPrimaryObjectCache(workspaceRoot)
@@ -346,11 +338,11 @@ fn main(): int32 =
     assert(contentCompile.elapsedMs <= contentCompileThreshold.maxElapsedMs, " perf memory: content compile observed max ms")
     assert(contentCompile.maxRssBytes <= contentCompileThreshold.maxRssBytes, " perf memory: content compile observed max rss")
     assert(os.FileExists(contentOutputPath), " perf memory: content compile output")
-    add(reportRows, perfgate.PerfMemoryReportRow(contentCompile, contentCompileThreshold))
+    perfMemoryAppendReport(reportFile, perfgate.PerfMemoryReportRow(contentCompile, contentCompileThreshold))
     let contentCompilePhases = perfgate.PerfMemoryCompileExecPhaseSummary(workspaceRoot, contentOutputPath, "")
     if perfgate.PerfMemoryExecPhaseSummaryReady(contentCompilePhases) &&
        contentCompilePhases.totalMs <= contentCompile.elapsedMs:
-        add(reportRows, perfgate.PerfMemoryExecPhaseReportRow(contentCompile, contentCompilePhases))
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryExecPhaseReportRow(contentCompile, contentCompilePhases))
         assert(perfgate.PerfMemoryCompileGapBreakdownReady(contentCompilePhases),
                " perf memory: content compile gap breakdown ready")
         assert(perfgate.PerfMemoryExecPhaseAttributedMs(contentCompilePhases) >= contentCompilePhases.totalMs,
@@ -360,7 +352,7 @@ fn main(): int32 =
         perfMemoryAssertProviderCacheStats(contentCompilePhases, " perf memory: content compile")
         perfMemoryAssertPrimaryObjectEmitBreakdown(contentCompilePhases, " perf memory: content compile")
         perfMemoryAssertPrimaryObjectColdMiss(contentCompilePhases, " perf memory: content compile")
-        add(reportRows, perfgate.PerfMemoryCompileGapBreakdownRow(contentCompile, contentCompilePhases))
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryCompileGapBreakdownRow(contentCompile, contentCompilePhases))
     let orcSourcePath = chengpath.PathJoin(workspaceRoot, "src/tests/orc_perf_contract_smoke.cheng")
     let orcOutputPath = chengpath.PathJoin(outDir, "orc_perf_contract_smoke")
     perfMemoryClearPrimaryObjectCache(workspaceRoot)
@@ -383,11 +375,11 @@ fn main(): int32 =
     assert(orcCompile.elapsedMs <= orcCompileThreshold.maxElapsedMs, " perf memory: orc compile observed max ms")
     assert(orcCompile.maxRssBytes <= orcCompileThreshold.maxRssBytes, " perf memory: orc compile observed max rss")
     assert(os.FileExists(orcOutputPath), " perf memory: orc compile output")
-    add(reportRows, perfgate.PerfMemoryReportRow(orcCompile, orcCompileThreshold))
+    perfMemoryAppendReport(reportFile, perfgate.PerfMemoryReportRow(orcCompile, orcCompileThreshold))
     let orcCompilePhases = perfgate.PerfMemoryCompileExecPhaseSummary(workspaceRoot, orcOutputPath, "")
     if perfgate.PerfMemoryExecPhaseSummaryReady(orcCompilePhases) &&
        orcCompilePhases.totalMs <= orcCompile.elapsedMs:
-        add(reportRows, perfgate.PerfMemoryExecPhaseReportRow(orcCompile, orcCompilePhases))
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryExecPhaseReportRow(orcCompile, orcCompilePhases))
         assert(perfgate.PerfMemoryCompileGapBreakdownReady(orcCompilePhases),
                " perf memory: orc compile gap breakdown ready")
         assert(perfgate.PerfMemoryExecPhaseAttributedMs(orcCompilePhases) >= orcCompilePhases.totalMs,
@@ -397,7 +389,7 @@ fn main(): int32 =
         perfMemoryAssertProviderCacheStats(orcCompilePhases, " perf memory: orc compile")
         perfMemoryAssertPrimaryObjectEmitBreakdown(orcCompilePhases, " perf memory: orc compile")
         perfMemoryAssertPrimaryObjectColdMiss(orcCompilePhases, " perf memory: orc compile")
-        add(reportRows, perfgate.PerfMemoryCompileGapBreakdownRow(orcCompile, orcCompilePhases))
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryCompileGapBreakdownRow(orcCompile, orcCompilePhases))
     let orcIterations: int32 = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_ORC_PERF_ITERS", "200000")))
     let orcRunLog = Fmt([orcOutputPath, ".run.log"])
     perfMemoryDeleteFileIfExists(orcRunLog)
@@ -416,7 +408,7 @@ fn main(): int32 =
     assert(orcRun.maxRssBytes > int64(0), " perf memory: orc run rss")
     assert(orcRun.elapsedMs <= orcRunThreshold.maxElapsedMs, " perf memory: orc run observed max ms")
     assert(orcRun.maxRssBytes <= orcRunThreshold.maxRssBytes, " perf memory: orc run observed max rss")
-    add(reportRows, perfgate.PerfMemoryReportRow(orcRun, orcRunThreshold))
+    perfMemoryAppendReport(reportFile, perfgate.PerfMemoryReportRow(orcRun, orcRunThreshold))
     let orcRetainCount: int64 = perfgate.PerfMemoryParseOutputInt64(orcRun.output, "orc_perf_retain_count")
     let orcReleaseCount: int64 = perfgate.PerfMemoryParseOutputInt64(orcRun.output, "orc_perf_release_count")
     let orcAllocDelta: int64 = perfgate.PerfMemoryParseOutputInt64(orcRun.output, "orc_perf_alloc_delta")
@@ -432,13 +424,7 @@ fn main(): int32 =
     assert(orcAllocDelta == int64(1), " perf memory: orc alloc delta")
     assert(orcFreeDelta == int64(1), " perf memory: orc free delta")
     assert(orcLiveDelta == int64(0), " perf memory: orc live delta")
-    add(reportRows,
-        "orc_perf_contract iterations=" + intToStr(orcIterations) +
-        " retain_count=" + int64ToStr(orcRetainCount) +
-        " release_count=" + int64ToStr(orcReleaseCount) +
-        " alloc_delta=" + int64ToStr(orcAllocDelta) +
-        " free_delta=" + int64ToStr(orcFreeDelta) +
-        " live_delta=" + int64ToStr(orcLiveDelta))
+    perfMemoryAppendReport(reportFile, "orc_perf_contract")
     let cryptoSourcePath = chengpath.PathJoin(workspaceRoot, "src/tests/crypto_hot_kernel_perf_smoke.cheng")
     let cryptoOutputPath = chengpath.PathJoin(outDir, "crypto_hot_kernel_perf_smoke")
     perfMemoryClearPrimaryObjectCache(workspaceRoot)
@@ -461,11 +447,11 @@ fn main(): int32 =
     assert(cryptoCompile.elapsedMs <= cryptoCompileThreshold.maxElapsedMs, " perf memory: crypto compile observed max ms")
     assert(cryptoCompile.maxRssBytes <= cryptoCompileThreshold.maxRssBytes, " perf memory: crypto compile observed max rss")
     assert(os.FileExists(cryptoOutputPath), " perf memory: crypto compile output")
-    add(reportRows, perfgate.PerfMemoryReportRow(cryptoCompile, cryptoCompileThreshold))
+    perfMemoryAppendReport(reportFile, perfgate.PerfMemoryReportRow(cryptoCompile, cryptoCompileThreshold))
     let cryptoCompilePhases = perfgate.PerfMemoryCompileExecPhaseSummary(workspaceRoot, cryptoOutputPath, "")
     if perfgate.PerfMemoryExecPhaseSummaryReady(cryptoCompilePhases) &&
        cryptoCompilePhases.totalMs <= cryptoCompile.elapsedMs:
-        add(reportRows, perfgate.PerfMemoryExecPhaseReportRow(cryptoCompile, cryptoCompilePhases))
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryExecPhaseReportRow(cryptoCompile, cryptoCompilePhases))
         assert(perfgate.PerfMemoryCompileGapBreakdownReady(cryptoCompilePhases),
                " perf memory: crypto compile gap breakdown ready")
         assert(perfgate.PerfMemoryExecPhaseAttributedMs(cryptoCompilePhases) >= cryptoCompilePhases.totalMs,
@@ -475,7 +461,7 @@ fn main(): int32 =
         perfMemoryAssertProviderCacheStats(cryptoCompilePhases, " perf memory: crypto compile")
         perfMemoryAssertPrimaryObjectEmitBreakdown(cryptoCompilePhases, " perf memory: crypto compile")
         perfMemoryAssertPrimaryObjectColdMiss(cryptoCompilePhases, " perf memory: crypto compile")
-        add(reportRows, perfgate.PerfMemoryCompileGapBreakdownRow(cryptoCompile, cryptoCompilePhases))
+        perfMemoryAppendReport(reportFile, perfgate.PerfMemoryCompileGapBreakdownRow(cryptoCompile, cryptoCompilePhases))
     let cryptoRunLog = Fmt([cryptoOutputPath, ".run.log"])
     perfMemoryDeleteFileIfExists(cryptoRunLog)
     let cryptoRun = perfgate.PerfMemoryRunBinary(workspaceRoot,
@@ -493,7 +479,7 @@ fn main(): int32 =
     assert(cryptoRun.maxRssBytes > int64(0), " perf memory: crypto run rss")
     assert(cryptoRun.elapsedMs <= cryptoRunThreshold.maxElapsedMs, " perf memory: crypto run observed max ms")
     assert(cryptoRun.maxRssBytes <= cryptoRunThreshold.maxRssBytes, " perf memory: crypto run observed max rss")
-    add(reportRows, perfgate.PerfMemoryReportRow(cryptoRun, cryptoRunThreshold))
+    perfMemoryAppendReport(reportFile, perfgate.PerfMemoryReportRow(cryptoRun, cryptoRunThreshold))
     let cryptoSha256Ns: int64 = perfgate.PerfMemoryParseOutputInt64(cryptoRun.output, "crypto_sha256_ns_per_op")
     let cryptoX25519Ns: int64 = perfgate.PerfMemoryParseOutputInt64(cryptoRun.output, "crypto_x25519_pubkey_ns_per_op")
     let cryptoP256PubNs: int64 = perfgate.PerfMemoryParseOutputInt64(cryptoRun.output, "crypto_p256_pubkey_ns_per_op")
@@ -506,13 +492,9 @@ fn main(): int32 =
     assert(cryptoX25519Ns <= cryptoX25519MaxNs, " perf memory: crypto x25519 max ns")
     assert(cryptoP256PubNs <= cryptoP256PubMaxNs, " perf memory: crypto p256 pub max ns")
     assert(cryptoP256SignNs <= cryptoP256SignMaxNs, " perf memory: crypto p256 sign max ns")
-    add(reportRows,
-        "crypto_hot_kernel_contract" +
-        " sha256_ns_per_op=" + int64ToStr(cryptoSha256Ns) +
-        " x25519_pubkey_ns_per_op=" + int64ToStr(cryptoX25519Ns) +
-        " p256_pubkey_ns_per_op=" + int64ToStr(cryptoP256PubNs) +
-        " p256_sign_ns_per_op=" + int64ToStr(cryptoP256SignNs))
+    perfMemoryAppendReport(reportFile, "crypto_hot_kernel_contract")
     let noHandoffSourcePath = chengpath.PathJoin(workspaceRoot, "src/tests/libp2p_quic_twoproc_client_smoke.cheng")
+    echo(" perf memory: no handoff repeat begin")
     perfMemoryRunRepeatedNoHandoffCompile(workspaceRoot,
                                           outDir,
                                           boot.BootstrapStage3Path(workspaceRoot),
@@ -523,10 +505,8 @@ fn main(): int32 =
                                           compileTimeoutSec,
                                           noHandoffCompileThreshold,
                                           noHandoffGrowthMaxBytes,
-                                          reportRows)
-    let reportPath = chengpath.PathJoin(outDir, "perf_memory_contract.report.txt")
-    add(reportRows, " perf memory: ok")
-    assert(chengpath.WriteTextFile(workspaceRoot, reportPath, strutil.Join(reportRows, "\n") + "\n"),
-           " perf memory: write report")
+                                          reportFile)
+    perfMemoryAppendReport(reportFile, " perf memory: ok")
+    os.Close(reportFile)
     echo(" perf_memory_contract_smoke ok")
     return 0

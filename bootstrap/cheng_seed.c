@@ -29942,6 +29942,8 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                                           max_call_depth_io);
     }
     if (surface.kind == ChengSeed_EXPR_SURFACE_IF || surface.kind == ChengSeed_EXPR_SURFACE_TERNARY) {
+        int next_call_depth = call_depth + 1;
+        cheng_seed_update_max_i32(max_call_depth_io, next_call_depth);
         return cheng_seed_prepare_expr_call_state(plan,
                                           lowering,
                                           current_function,
@@ -29952,7 +29954,7 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                                           local_cap,
                                           next_offset_io,
                                           surface.cond,
-                                          call_depth,
+                                          next_call_depth,
                                           max_call_depth_io) &&
                cheng_seed_prepare_expr_call_state(plan,
                                           lowering,
@@ -29964,7 +29966,7 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                                           local_cap,
                                           next_offset_io,
                                           surface.when_true,
-                                          call_depth,
+                                          next_call_depth,
                                           max_call_depth_io) &&
                cheng_seed_prepare_expr_call_state(plan,
                                           lowering,
@@ -29976,10 +29978,12 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                                           local_cap,
                                           next_offset_io,
                                           surface.when_false,
-                                          call_depth,
+                                          next_call_depth,
                                           max_call_depth_io);
     }
     if (surface.kind == ChengSeed_EXPR_SURFACE_RANGE) {
+        int next_call_depth = call_depth + 1;
+        cheng_seed_update_max_i32(max_call_depth_io, next_call_depth);
         return cheng_seed_prepare_expr_call_state(plan,
                                           lowering,
                                           current_function,
@@ -29990,7 +29994,7 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                                           local_cap,
                                           next_offset_io,
                                           surface.when_true,
-                                          call_depth,
+                                          next_call_depth,
                                           max_call_depth_io) &&
                cheng_seed_prepare_expr_call_state(plan,
                                           lowering,
@@ -30002,7 +30006,7 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                                           local_cap,
                                           next_offset_io,
                                           surface.when_false,
-                                          call_depth,
+                                          next_call_depth,
                                           max_call_depth_io);
     }
     if (expr[0] == '!') {
@@ -74182,16 +74186,7 @@ static int cheng_seed_cmd_run_production_regression_impl(int argc, char **argv) 
 }
 
 static int cheng_seed_cmd_verify_backend_driver_command_surface_impl(int argc, char **argv) {
-    char *surface_argv[3];
-    const char *argv0 = "cheng_seed";
-    (void)argc;
-    if (argv != NULL && argv[0] != NULL && argv[0][0] != '\0') {
-        argv0 = argv[0];
-    }
-    surface_argv[0] = (char *)argv0;
-    surface_argv[1] = (char *)"run-host-smokes";
-    surface_argv[2] = (char *)"backend_driver_command_surface_smoke";
-    return cheng_seed_cmd_run_host_smokes_impl(3, surface_argv);
+    return cheng_seed_require_backend_driver_cli_passthrough("verify-backend-driver-command-surface", argc, argv);
 }
 
 static int cheng_seed_cmd_verify_mobile_shell_build_probe_impl(int argc, char **argv) {

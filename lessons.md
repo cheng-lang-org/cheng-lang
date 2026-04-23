@@ -41,7 +41,11 @@
 - 用户明确要求“从 seed 迁到纯 Cheng 最小 seed”时，优先迁走 `std` 语义和 runtime shim；不要因为自举方便继续把 `Fmt/$` 一类库行为补进 `cheng_seed.c`。
 - `$` 的公开表面只保留直接写法：简单值支持 `$box`，复杂表达式支持 `$(expr)`；不要再把反引号 `` `$` `` 当用户语法往前推，纯 Cheng 前端负责降糖，seed 只保留兼容。
 - Cheng 字符串输出优先用 `Fmt`，但大 CLI/test 闭包里不要写单个超长 `Fmt` 或超长拼接表达式；稳定写法是多个小 `Fmt"..."` 片段增量 append 到局部变量后再 `echo`。
+- 多个 `artifacts/bootstrap/cheng.stage3 system-link-exec` 编译不要并行跑；同一轮里并发编译会出现无诊断 `-1` 假红，相关 smoke 必须串行验证。
 - wowExport 处理 CDN root/BLTE/zlib 时不要先全量解码再扫表；真实 root 会放大到 49MB encoded / 65MB decoded，必须按 BLTE block range 解码、批量 root lookup，并用 bit-buffer + 小型 Huffman fast table 控制时间和内存。
 - wowExport CLI 可见的摘要函数要保持非常简单；优先用小段 `Fmt"..."`，并逐步 `out = out + part`，不要把整行摘要写成单个巨大 `Fmt`、巨大拼接表达式或一条 return。
 - 发现 `runtime_zero` / `run-browser-host-wasm-smoke` 外部门禁派生长进程链时，先按 label 精准停止并清空进程表，再继续 r2c GUI；不要让这类门禁和 r2c/native GUI 验证并行。
 - r2c GUI smoke 不要每条都现场重编 `src/r2c/r2c_react.cheng` 单体 controller；该入口已足够大，安全做法是复用已存在的 Cheng stage3 `r2c-react` 控制面，并把 per-smoke 编译限制在小 smoke 自身。
+- 砍 r2c native GUI Node helper 时必须同时覆盖 `native-gui-bundle`、`compile` 和 `status` 三个命令面，并扫掉 `node_payload_helper` 这类旧字段名；否则单命令通过但整体状态仍会暴露旧 Node 路径。
+- r2c legacy wrapper 的 `status/help` 必须本地直接返回，不能先尝试 stage3 handoff；只读查询触发长编译会制造内存风险和假卡死。
+- r2c/controller 这类大闭包里不要返回或绑定大 `str[]` 字面量；当前 stage3 对复合字符串数组 temp-move 仍会缺语义，稳定写法是局部 `var str[]` 后逐项 `add`。

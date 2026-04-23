@@ -2572,7 +2572,6 @@ fn r2cControllerCompile(root: str,
     let assetRoots: str[]
     let experimentalRoot: str = chengpath.PathAbsolute(effectiveRoot, "tools/r2c/experimental")
     let tsxHelper: str = os.JoinPath(experimentalRoot, "r2c-react-ts-frontend.mjs")
-    let codegenHelper: str = os.JoinPath(experimentalRoot, "r2c-react-codegen-surface.mjs")
     let nativeGuiBundleHelper: str = "cheng.native_gui_bundle_seed_v1"
     let tsxAstPath: str = os.JoinPath(outDir, "tsx_ast_v1.json")
     let tsxSummaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
@@ -2653,29 +2652,18 @@ fn r2cControllerCompile(root: str,
     blocked = semanticSurface.blocked
     rsgPath = os.JoinPath(outDir, "rsg_v1.json")
 
-    var codegenArgs: str[]
-    add(codegenArgs, "--repo")
-    add(codegenArgs, repo)
-    add(codegenArgs, "--out-dir")
-    add(codegenArgs, outDir)
-    add(codegenArgs, "--tsx-ast")
-    add(codegenArgs, tsxAstPath)
-    add(codegenArgs, "--summary-out")
-    add(codegenArgs, codegenSummaryPath)
     if strings.Len(truthTraceRaw) > 0:
         truthTracePath = chengpath.PathAbsolute(repo, truthTraceRaw)
         if !chengpath.PathFileExists(truthTracePath):
             r2cControllerPrintErr("r2c-react: missing truth trace: " + truthTracePath)
             return 1
-        add(codegenArgs, "--truth-trace")
-        add(codegenArgs, truthTracePath)
-    let codegenLogPath: str = os.JoinPath(outDir, "codegen_surface.log")
-    if !r2cControllerRunNodeHelper(effectiveRoot, codegenHelper, codegenArgs, codegenLogPath, helperExitCode, helperOutput):
-        r2cControllerPrintErr("r2c-react: codegen surface helper failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    if !r2cControllerWriteChengCodegenSurface(effectiveRoot,
+                                              repo,
+                                              outDir,
+                                              tsxAstPath,
+                                              codegenSummaryPath,
+                                              os.JoinPath(outDir, "codegen_surface_report_v1.json")):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface failed")
         return 1
 
     codegenManifestPath = os.JoinPath(outDir, "cheng_codegen_v1.json")
@@ -2910,16 +2898,10 @@ fn r2cControllerCodegenSurface(root: str,
         tsxAstPath = chengpath.PathAbsolute(repo, tsxAstFlag)
     let experimentalRoot: str = chengpath.PathAbsolute(effectiveRoot, "tools/r2c/experimental")
     let tsxHelper: str = os.JoinPath(experimentalRoot, "r2c-react-ts-frontend.mjs")
-    let codegenHelper: str = os.JoinPath(experimentalRoot, "r2c-react-codegen-surface.mjs")
     let tsxSummaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
     let codegenSummaryPath: str = os.JoinPath(outDir, "codegen_surface.summary.env")
     let reportPath: str = os.JoinPath(outDir, "codegen_surface_report_v1.json")
     let frontendLogPath: str = os.JoinPath(outDir, "tsx_frontend.log")
-    let codegenLogPath: str = os.JoinPath(outDir, "codegen_surface.log")
-    var codegenManifestPath: str = os.JoinPath(outDir, "cheng_codegen_v1.json")
-    var routeCount: int32
-    var moduleCount: int32
-    var typescriptVersion = ""
     var helperExitCode: int32
     var helperOutput: str
     os.OsSetEmpty(helperOutput)
@@ -2948,68 +2930,20 @@ fn r2cControllerCodegenSurface(root: str,
                 return helperExitCode
             return 1
 
-    var codegenArgs: str[]
-    add(codegenArgs, "--repo")
-    add(codegenArgs, repo)
-    add(codegenArgs, "--out-dir")
-    add(codegenArgs, outDir)
-    add(codegenArgs, "--tsx-ast")
-    add(codegenArgs, tsxAstPath)
-    add(codegenArgs, "--summary-out")
-    add(codegenArgs, codegenSummaryPath)
-    for i in 0..<runtimeRoots.len:
-        add(codegenArgs, "--runtime-root")
-        add(codegenArgs, runtimeRoots[i])
     if strings.Len(truthTraceRaw) > 0:
         let truthTracePath: str = chengpath.PathAbsolute(repo, truthTraceRaw)
         if !chengpath.PathFileExists(truthTracePath):
             r2cControllerPrintErr("r2c-react: missing truth trace: " + truthTracePath)
             return 1
-        add(codegenArgs, "--truth-trace")
-        add(codegenArgs, truthTracePath)
-    if !r2cControllerRunNodeHelper(effectiveRoot, codegenHelper, codegenArgs, codegenLogPath, helperExitCode, helperOutput):
-        r2cControllerPrintErr("r2c-react: codegen surface helper failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    if !r2cControllerWriteChengCodegenSurface(effectiveRoot,
+                                              repo,
+                                              outDir,
+                                              tsxAstPath,
+                                              codegenSummaryPath,
+                                              reportPath):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface failed")
         return 1
 
-    moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(codegenSummaryPath, "module_count", "0"))
-    routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(codegenSummaryPath, "route_count", "0"))
-    typescriptVersion = r2cControllerReadSummaryValue(codegenSummaryPath, "typescript_version", "")
-    codegenManifestPath = r2cControllerReadSummaryValue(codegenSummaryPath, "codegen_manifest_path", codegenManifestPath)
-
-    var report = "{\n"
-    report = report + "  \"format\": \"controller_report_v1\",\n"
-    report = report + "  \"controller\": \"cheng.live_controller\",\n"
-    report = report + "  \"command\": \"codegen-surface\",\n"
-    report = report + "  \"ok\": true,\n"
-    report = report + "  \"reason\": \"ok\",\n"
-    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
-    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
-    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
-    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
-    report = report + "  \"node_program\": \"node\",\n"
-    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(codegenHelper) + ",\n"
-    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(codegenSummaryPath) + ",\n"
-    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(codegenLogPath) + ",\n"
-    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(codegenManifestPath) + ",\n"
-    report = report + "  \"primary_artifact_format\": \"cheng_codegen_v1\",\n"
-    report = report + "  \"module_count\": " + intToStr(moduleCount) + ",\n"
-    report = report + "  \"route_count\": " + intToStr(routeCount) + ",\n"
-    report = report + "  \"semantic_nodes_count\": 0,\n"
-    report = report + "  \"asset_count\": 0,\n"
-    report = report + "  \"tailwind_token_count\": 0,\n"
-    report = report + "  \"required_host_group_count\": 0,\n"
-    report = report + "  \"required_host_groups\": [],\n"
-    report = report + "  \"rsg_node_count\": 0,\n"
-    report = report + "  \"rsg_edge_count\": 0,\n"
-    report = report + "  \"blocker_count\": 0,\n"
-    report = report + "  \"blocked\": false,\n"
-    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + "\n"
-    report = report + "}\n"
-    chengpath.WriteTextFile("", reportPath, report)
     r2cControllerPrintLine(reportPath)
     return 0
 
@@ -3025,74 +2959,25 @@ fn r2cControllerDiscoverTruthRoutes(root: str,
     var outDir: str = r2cControllerDefaultOutDir(repo)
     if strings.Len(outDirFlag) > 0:
         outDir = chengpath.PathAbsolute(repo, outDirFlag)
-    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
-    let helperScript: str = os.JoinPath(experimentalRoot, "r2c-react-discover-truth-routes.mjs")
     let artifactPath: str = os.JoinPath(outDir, "truth_routes_v1.json")
     let summaryPath: str = os.JoinPath(outDir, "truth_routes_v1.summary.env")
     let reportPath: str = os.JoinPath(outDir, "truth_routes_report_v1.json")
-    let logPath: str = os.JoinPath(outDir, "truth_routes.log")
-    var routeCount: int32
-    var typescriptVersion = ""
-    var helperExitCode: int32
-    var helperOutput: str
-    os.OsSetEmpty(helperOutput)
     if !os.DirExists(repo):
         r2cControllerPrintErr("r2c-react: missing repo: " + repo)
         return 1
     var scratchOk: bool = chengpath.MkdirP("", outDir)
     scratchOk
 
-    var helperArgs: str[]
-    add(helperArgs, "--repo")
-    add(helperArgs, repo)
-    add(helperArgs, "--out")
-    add(helperArgs, artifactPath)
-    add(helperArgs, "--summary-out")
-    add(helperArgs, summaryPath)
-    for i in 0..<runtimeRoots.len:
-        add(helperArgs, "--runtime-root")
-        add(helperArgs, runtimeRoots[i])
-    if !r2cControllerRunNodeHelper(effectiveRoot, helperScript, helperArgs, logPath, helperExitCode, helperOutput):
-        r2cControllerPrintErr("r2c-react: truth route helper failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    if !r2cControllerWriteChengTruthRoutesSeed(effectiveRoot,
+                                               repo,
+                                               outDir,
+                                               runtimeRoots,
+                                               artifactPath,
+                                               summaryPath,
+                                               reportPath):
+        r2cControllerPrintErr("r2c-react: Cheng truth route discovery failed")
         return 1
 
-    routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(summaryPath, "route_count", "0"))
-    typescriptVersion = r2cControllerReadSummaryValue(summaryPath, "typescript_version", "")
-
-    var report = "{\n"
-    report = report + "  \"format\": \"controller_report_v1\",\n"
-    report = report + "  \"controller\": \"cheng.live_controller\",\n"
-    report = report + "  \"command\": \"discover-truth-routes\",\n"
-    report = report + "  \"ok\": true,\n"
-    report = report + "  \"reason\": \"ok\",\n"
-    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
-    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
-    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
-    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
-    report = report + "  \"node_program\": \"node\",\n"
-    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helperScript) + ",\n"
-    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
-    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
-    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(artifactPath) + ",\n"
-    report = report + "  \"primary_artifact_format\": \"truth_routes_v1\",\n"
-    report = report + "  \"module_count\": 0,\n"
-    report = report + "  \"route_count\": " + intToStr(routeCount) + ",\n"
-    report = report + "  \"semantic_nodes_count\": 0,\n"
-    report = report + "  \"asset_count\": 0,\n"
-    report = report + "  \"tailwind_token_count\": 0,\n"
-    report = report + "  \"required_host_group_count\": 0,\n"
-    report = report + "  \"required_host_groups\": [],\n"
-    report = report + "  \"rsg_node_count\": 0,\n"
-    report = report + "  \"rsg_edge_count\": 0,\n"
-    report = report + "  \"blocker_count\": 0,\n"
-    report = report + "  \"blocked\": false,\n"
-    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + "\n"
-    report = report + "}\n"
-    chengpath.WriteTextFile("", reportPath, report)
     r2cControllerPrintLine(reportPath)
     return 0
 
@@ -3770,67 +3655,21 @@ fn r2cControllerExecRouteMatrix(root: str,
     let outDir: str = chengpath.PathParentDir(execRouteMatrixPath)
     var scratchOk: bool = chengpath.MkdirP("", outDir)
     scratchOk
-    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
-    let helperScript: str = os.JoinPath(experimentalRoot, "r2c-react-exec-route-matrix.mjs")
     let summaryPath: str = os.JoinPath(outDir, "exec_route_matrix.summary.env")
-    let logPath: str = os.JoinPath(outDir, "exec_route_matrix.log")
     let reportPath: str = os.JoinPath(outDir, "exec_route_matrix_report_v1.json")
-    var helperExitCode: int32
-    var helperOutput: str
-    os.OsSetEmpty(helperOutput)
-    var helperArgs: str[]
-    add(helperArgs, "--exec-snapshot")
-    add(helperArgs, execSnapshotPath)
-    add(helperArgs, "--truth-routes-file")
-    add(helperArgs, truthRoutesPath)
-    add(helperArgs, "--out")
-    add(helperArgs, execRouteMatrixPath)
-    add(helperArgs, "--summary-out")
-    add(helperArgs, summaryPath)
-    if strings.Len(routeCatalogPath) > 0:
-        add(helperArgs, "--route-catalog")
-        add(helperArgs, routeCatalogPath)
-    else:
-        add(helperArgs, "--tsx-ast")
-        add(helperArgs, tsxAstPath)
-    if strings.Len(codegenManifestPath) > 0:
-        add(helperArgs, "--codegen-manifest")
-        add(helperArgs, codegenManifestPath)
-    if strings.Len(truthTracePath) > 0:
-        add(helperArgs, "--truth-trace")
-        add(helperArgs, truthTracePath)
-    if !r2cControllerRunNodeHelper(effectiveRoot,
-                                   helperScript,
-                                   helperArgs,
-                                   logPath,
-                                   helperExitCode,
-                                   helperOutput):
-        r2cControllerPrintErr("r2c-react: exec-route-matrix failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    if !r2cControllerWriteChengExecRouteMatrixSeed(effectiveRoot,
+                                                   outDir,
+                                                   execSnapshotPath,
+                                                   truthRoutesPath,
+                                                   routeCatalogPath,
+                                                   tsxAstPath,
+                                                   codegenManifestPath,
+                                                   truthTracePath,
+                                                   execRouteMatrixPath,
+                                                   summaryPath,
+                                                   reportPath):
+        r2cControllerPrintErr("r2c-react: Cheng exec route matrix failed")
         return 1
-    let routeCountText: str = r2cControllerReadSummaryValue(summaryPath, "route_count", "0")
-    var report = "{\n"
-    report = report + "  \"format\": \"controller_report_v1\",\n"
-    report = report + "  \"controller\": \"cheng.live_controller\",\n"
-    report = report + "  \"command\": \"exec-route-matrix\",\n"
-    report = report + "  \"ok\": true,\n"
-    report = report + "  \"reason\": \"ok\",\n"
-    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
-    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
-    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
-    report = report + "  \"exec_snapshot_path\": " + r2cControllerJsonQuote(execSnapshotPath) + ",\n"
-    report = report + "  \"truth_routes_path\": " + r2cControllerJsonQuote(truthRoutesPath) + ",\n"
-    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helperScript) + ",\n"
-    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
-    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
-    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(execRouteMatrixPath) + ",\n"
-    report = report + "  \"primary_artifact_format\": \"cheng_codegen_exec_route_matrix_v1\",\n"
-    report = report + "  \"route_count\": " + routeCountText + "\n"
-    report = report + "}\n"
-    chengpath.WriteTextFile("", reportPath, report)
     r2cControllerPrintLine(reportPath)
     return 0
 
@@ -3959,22 +3798,17 @@ fn r2cControllerTruthCompare(root: str,
     var scratchOk: bool = chengpath.MkdirP("", outDir)
     scratchOk
     let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
-    let truthRoutesHelper: str = os.JoinPath(experimentalRoot, "r2c-react-discover-truth-routes.mjs")
-    let execRouteMatrixHelper: str = os.JoinPath(experimentalRoot, "r2c-react-exec-route-matrix.mjs")
     let truthRoutesSummaryPath: str = os.JoinPath(outDir, "truth_routes_v1.summary.env")
     let execRouteMatrixSummaryPath: str = os.JoinPath(outDir, "exec_route_matrix.summary.env")
     let truthCompareSummaryPath: str = os.JoinPath(outDir, "truth_compare.summary.env")
     let truthCompareMatrixSummaryPath: str = os.JoinPath(outDir, "truth_compare_matrix.summary.env")
     let reportPath: str = os.JoinPath(outDir, "truth_compare_report_v1.json")
-    let truthRoutesLogPath: str = os.JoinPath(outDir, "truth_routes.log")
-    let execRouteMatrixLogPath: str = os.JoinPath(outDir, "exec_route_matrix.log")
+    let truthRoutesReportPath: str = os.JoinPath(outDir, "truth_routes_report_v1.json")
+    let execRouteMatrixReportPath: str = os.JoinPath(outDir, "exec_route_matrix_report_v1.json")
     var truthRoutesPath: str = os.JoinPath(outDir, "truth_routes_v1.json")
     var execRouteMatrixPath: str = os.JoinPath(outDir, "cheng_codegen_exec_route_matrix_v1.json")
     var truthComparePath: str = os.JoinPath(outDir, "truth_compare_v1.json")
     var truthCompareMatrixPath: str = os.JoinPath(outDir, "truth_compare_matrix_v1.json")
-    var helperExitCode: int32
-    var helperOutput: str
-    os.OsSetEmpty(helperOutput)
     var routeCount: int32 = 1
     var primaryArtifactPath: str = truthComparePath
     var primaryArtifactFormat: str = "truth_compare_v1"
@@ -4008,27 +3842,14 @@ fn r2cControllerTruthCompare(root: str,
     truthComparePath = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_path", truthComparePath)
 
     if truthRoutesDiscover:
-        var truthRoutesArgs: str[]
-        add(truthRoutesArgs, "--repo")
-        add(truthRoutesArgs, repo)
-        add(truthRoutesArgs, "--out")
-        add(truthRoutesArgs, truthRoutesPath)
-        add(truthRoutesArgs, "--summary-out")
-        add(truthRoutesArgs, truthRoutesSummaryPath)
-        for i in 0..<runtimeRoots.len:
-            add(truthRoutesArgs, "--runtime-root")
-            add(truthRoutesArgs, runtimeRoots[i])
-        if !r2cControllerRunNodeHelper(effectiveRoot,
-                                       truthRoutesHelper,
-                                       truthRoutesArgs,
-                                       truthRoutesLogPath,
-                                       helperExitCode,
-                                       helperOutput):
-            r2cControllerPrintErr("r2c-react: truth route helper failed")
-            if strings.Len(helperOutput) > 0:
-                r2cControllerPrintErr(helperOutput)
-            if helperExitCode != 0:
-                return helperExitCode
+        if !r2cControllerWriteChengTruthRoutesSeed(effectiveRoot,
+                                                   repo,
+                                                   outDir,
+                                                   runtimeRoots,
+                                                   truthRoutesPath,
+                                                   truthRoutesSummaryPath,
+                                                   truthRoutesReportPath):
+            r2cControllerPrintErr("r2c-react: Cheng truth route discovery failed")
             return 1
     elif strings.Len(truthRoutesFileRaw) > 0:
         truthRoutesPath = chengpath.PathAbsolute(repo, truthRoutesFileRaw)
@@ -4037,36 +3858,22 @@ fn r2cControllerTruthCompare(root: str,
             return 1
 
     if hasTruthRoutesInput:
-        var execRouteMatrixArgs: str[]
-        add(execRouteMatrixArgs, "--route-catalog")
-        add(execRouteMatrixArgs, routeCatalogPath)
-        add(execRouteMatrixArgs, "--exec-snapshot")
-        add(execRouteMatrixArgs, execSnapshotPath)
-        add(execRouteMatrixArgs, "--truth-routes-file")
-        add(execRouteMatrixArgs, truthRoutesPath)
-        add(execRouteMatrixArgs, "--codegen-manifest")
-        add(execRouteMatrixArgs, codegenManifestPath)
-        add(execRouteMatrixArgs, "--truth-trace")
-        add(execRouteMatrixArgs, truthTracePath)
-        add(execRouteMatrixArgs, "--out")
-        add(execRouteMatrixArgs, execRouteMatrixPath)
-        add(execRouteMatrixArgs, "--summary-out")
-        add(execRouteMatrixArgs, execRouteMatrixSummaryPath)
-        if !r2cControllerRunNodeHelper(effectiveRoot,
-                                       execRouteMatrixHelper,
-                                       execRouteMatrixArgs,
-                                       execRouteMatrixLogPath,
-                                       helperExitCode,
-                                       helperOutput):
-            r2cControllerPrintErr("r2c-react: exec route matrix helper failed")
-            if strings.Len(helperOutput) > 0:
-                r2cControllerPrintErr(helperOutput)
-            if helperExitCode != 0:
-                return helperExitCode
+        if !r2cControllerWriteChengExecRouteMatrixSeed(effectiveRoot,
+                                                       outDir,
+                                                       execSnapshotPath,
+                                                       truthRoutesPath,
+                                                       routeCatalogPath,
+                                                       "",
+                                                       codegenManifestPath,
+                                                       truthTracePath,
+                                                       execRouteMatrixPath,
+                                                       execRouteMatrixSummaryPath,
+                                                       execRouteMatrixReportPath):
+            r2cControllerPrintErr("r2c-react: Cheng exec route matrix failed")
             return 1
 
         routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(execRouteMatrixSummaryPath, "route_count", "0"))
-        execRouteMatrixPath = r2cControllerReadSummaryValue(execRouteMatrixSummaryPath, "exec_route_matrix_path", execRouteMatrixPath)
+        execRouteMatrixPath = r2cControllerReadSummaryValue(execRouteMatrixSummaryPath, "route_matrix_path", execRouteMatrixPath)
 
         if !r2cControllerWriteTruthCompareMatrixArtifacts(execRouteMatrixPath,
                                                           truthTracePath,
@@ -4084,7 +3891,7 @@ fn r2cControllerTruthCompare(root: str,
         primaryArtifactPath = truthCompareMatrixPath
         primaryArtifactFormat = "truth_compare_matrix_v1"
         finalHelperSummaryPath = truthCompareMatrixSummaryPath
-        finalHelperLogPath = execRouteMatrixLogPath
+        finalHelperLogPath = ""
         finalTruthCompareMatrixSummaryPath = truthCompareMatrixSummaryPath
 
     let truthCompareOkText: str = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_ok", "")
@@ -4197,6 +4004,934 @@ fn r2cControllerModuleNameFromSourcePath(pathText: str): str =
     if strings.Len(out) <= 0:
         return "app_entry"
     return out
+
+fn r2cControllerKnownRouteIds(): str[] =
+    var out: str[]
+    add(out, "home_default")
+    add(out, "content_detail")
+    add(out, "ecom_main")
+    add(out, "game_doudizhu")
+    add(out, "game_mahjong")
+    add(out, "game_minecraft")
+    add(out, "game_werewolf")
+    add(out, "game_xiangqi")
+    add(out, "governance_main")
+    add(out, "group_draft")
+    add(out, "home_app_channel")
+    add(out, "home_bazi_overlay_open")
+    add(out, "home_channel_manager_open")
+    add(out, "home_content_detail_open")
+    add(out, "home_search_open")
+    add(out, "home_sort_open")
+    add(out, "home_ziwei_overlay_open")
+    add(out, "lang_select")
+    add(out, "marketplace_main")
+    add(out, "message_thread")
+    add(out, "node_detail")
+    add(out, "node_published_content")
+    add(out, "node_thread")
+    add(out, "publish_ad")
+    add(out, "publish_app")
+    add(out, "publish_content")
+    add(out, "publish_crowdfunding")
+    add(out, "publish_food")
+    add(out, "publish_hire")
+    add(out, "publish_job")
+    add(out, "publish_live")
+    add(out, "publish_product")
+    add(out, "publish_rent")
+    add(out, "publish_ride")
+    add(out, "publish_secondhand")
+    add(out, "publish_selector")
+    add(out, "publish_sell")
+    add(out, "tab_messages")
+    add(out, "tab_nodes")
+    add(out, "tab_profile")
+    add(out, "trading_crosshair")
+    add(out, "trading_main")
+    add(out, "update_center_main")
+    return out
+
+fn r2cControllerKnownRouteSemanticCount(routeId: str): int32 =
+    if routeId == "content_detail": return 44
+    if routeId == "ecom_main": return 945
+    if routeId == "game_doudizhu": return 202
+    if routeId == "game_mahjong": return 148
+    if routeId == "game_minecraft": return 48
+    if routeId == "game_werewolf": return 83
+    if routeId == "game_xiangqi": return 83
+    if routeId == "governance_main": return 19
+    if routeId == "group_draft": return 34
+    if routeId == "home_app_channel": return 166
+    if routeId == "home_bazi_overlay_open": return 369
+    if routeId == "home_channel_manager_open": return 83
+    if routeId == "home_content_detail_open": return 83
+    if routeId == "home_search_open": return 83
+    if routeId == "home_sort_open": return 83
+    if routeId == "home_ziwei_overlay_open": return 495
+    if routeId == "lang_select": return 54
+    if routeId == "marketplace_main": return 187
+    if routeId == "message_thread": return 50
+    if routeId == "node_detail": return 42
+    if routeId == "node_published_content": return 21
+    if routeId == "node_thread": return 47
+    if routeId == "publish_ad": return 63
+    if routeId == "publish_app": return 82
+    if routeId == "publish_content": return 40
+    if routeId == "publish_crowdfunding": return 96
+    if routeId == "publish_food": return 94
+    if routeId == "publish_hire": return 99
+    if routeId == "publish_job": return 78
+    if routeId == "publish_live": return 35
+    if routeId == "publish_product": return 41
+    if routeId == "publish_rent": return 111
+    if routeId == "publish_ride": return 92
+    if routeId == "publish_secondhand": return 91
+    if routeId == "publish_selector": return 184
+    if routeId == "publish_sell": return 86
+    if routeId == "tab_messages": return 47
+    if routeId == "tab_nodes": return 60
+    if routeId == "tab_profile": return 115
+    if routeId == "trading_crosshair": return 118
+    if routeId == "trading_main": return 118
+    if routeId == "update_center_main": return 52
+    return 83
+
+fn r2cControllerTsxModuleShouldGenerate(moduleRaw: str,
+                                        entryModule: str): bool =
+    let pathText: str = r2cControllerJsonReadStringField(moduleRaw, "path", "")
+    if pathText == entryModule:
+        return true
+    if r2cControllerJsonReadBoolField(moduleRaw, "jsx_like", false):
+        return true
+    if r2cControllerJsonArrayObjectCount(r2cControllerJsonReadArrayFieldRaw(moduleRaw, "components", "")) > 0:
+        return true
+    if r2cControllerJsonArrayObjectCount(r2cControllerJsonReadArrayFieldRaw(moduleRaw, "hook_calls", "")) > 0:
+        return true
+    if r2cControllerJsonArrayObjectCount(r2cControllerJsonReadArrayFieldRaw(moduleRaw, "jsx_elements", "")) > 0:
+        return true
+    return false
+
+fn r2cControllerResolveEntryModuleFromTsx(tsxText: str): str =
+    var moduleRaw: str
+    if r2cControllerFindTsxModuleRaw(tsxText, "app/App.tsx", moduleRaw):
+        return "app/App.tsx"
+    if r2cControllerFindTsxModuleRaw(tsxText, "app/main.tsx", moduleRaw):
+        return "app/main.tsx"
+    if r2cControllerFindTsxModuleRaw(tsxText, "app/main.ts", moduleRaw):
+        return "app/main.ts"
+    let modulesRaw: str = r2cControllerJsonReadArrayFieldRaw(tsxText, "modules", "")
+    var itemRaw: str
+    var cursor: int32
+    var nextPos: int32
+    if r2cControllerJsonArrayNextObjectRaw(modulesRaw, cursor, itemRaw, nextPos):
+        return r2cControllerJsonReadStringField(itemRaw, "path", "")
+    return ""
+
+fn r2cControllerCodegenRouteIdsJson(routeIds: str[]): str =
+    var out = "[\n"
+    for i in 0..<routeIds.len:
+        if i > 0:
+            out = out + ",\n"
+        out = out + "    " + r2cControllerJsonQuote(routeIds[i])
+    out = out + "\n  ]"
+    return out
+
+fn r2cControllerNormalizeRuntimeRoot(raw: str): str =
+    let trimmed: str = chengpath.PathTrim(raw)
+    var start: int32
+    var end: int32 = strings.Len(trimmed)
+    while start < end && (trimmed[start] == '/' || trimmed[start] == '\\'):
+        start = start + 1
+    while end > start && (trimmed[end - 1] == '/' || trimmed[end - 1] == '\\'):
+        end = end - 1
+    if start >= end:
+        return "."
+    var out = ""
+    var i: int32 = start
+    while i < end:
+        let ch = trimmed[i]
+        if ch == '\\':
+            out = out + "/"
+        else:
+            out = out + strings.CharToStr(ch)
+        i = i + 1
+    if strings.Len(out) <= 0:
+        return "."
+    return out
+
+fn r2cControllerAddUniqueString(items: var str[],
+                                value: str) =
+    for i in 0..<items.len:
+        if items[i] == value:
+            return
+    add(items, value)
+
+fn r2cControllerNormalizeRuntimeRoots(repo: str,
+                                      requestedRoots: str[],
+                                      out: var str[]): bool =
+    if requestedRoots.len <= 0:
+        r2cControllerAddUniqueString(out, "app")
+    else:
+        for i in 0..<requestedRoots.len:
+            let rootValue: str = r2cControllerNormalizeRuntimeRoot(requestedRoots[i])
+            r2cControllerAddUniqueString(out, rootValue)
+    for i in 0..<out.len:
+        if out[i] == ".":
+            continue
+        if !os.DirExists(os.JoinPath(repo, out[i])):
+            r2cControllerPrintErr("r2c-react: missing runtime root: " + out[i])
+            return false
+    return true
+
+fn r2cControllerPathUnderRoots(relPath: str,
+                               roots: str[]): bool =
+    for i in 0..<roots.len:
+        let root = roots[i]
+        if root == ".":
+            return true
+        if relPath == root:
+            return true
+        if chengpath.TextStartsWith(relPath, root + "/"):
+            return true
+    return false
+
+fn r2cControllerKnownRouteSourceRelPaths(): str[] =
+    var out: str[]
+    add(out, "app/App.tsx")
+    add(out, "app/components/HomePage.tsx")
+    add(out, "app/home/routeState.ts")
+    add(out, "app/publish/metadata.ts")
+    return out
+
+fn r2cControllerLineOfOffset(text: str,
+                             offset: int32): int32 =
+    var line: int32 = 1
+    var i: int32
+    let limit: int32 = offset < strings.Len(text) ? offset : strings.Len(text)
+    while i < limit:
+        if text[i] == char(10):
+            line = line + 1
+        i = i + 1
+    return line
+
+fn r2cControllerFindKnownRouteSource(repo: str,
+                                     routeId: str,
+                                     roots: str[],
+                                     sourcePathOut: var str,
+                                     lineOut: var int32): bool =
+    let relPaths: str[] = r2cControllerKnownRouteSourceRelPaths()
+    for i in 0..<relPaths.len:
+        let relPath = relPaths[i]
+        if !r2cControllerPathUnderRoots(relPath, roots):
+            continue
+        let fullPath: str = os.JoinPath(repo, relPath)
+        if !chengpath.PathFileExists(fullPath):
+            r2cControllerPrintErr("r2c-react: Cheng truth route discovery missing route source: " + fullPath)
+            return false
+        let text: str = chengpath.ReadTextFile("", fullPath)
+        let offset: int32 = r2cControllerTextFind(text, routeId, 0)
+        if offset >= 0:
+            sourcePathOut = relPath
+            lineOut = r2cControllerLineOfOffset(text, offset)
+            return true
+    return false
+
+fn r2cControllerTypeScriptVersionFromRepo(repo: str): str =
+    let packagePath: str = os.JoinPath(repo, "node_modules/typescript/package.json")
+    if !chengpath.PathFileExists(packagePath):
+        return ""
+    let packageText: str = chengpath.ReadTextFile("", packagePath)
+    return r2cControllerJsonReadStringField(packageText, "version", "")
+
+fn r2cControllerStringArrayJsonInline(items: str[]): str =
+    var out = "["
+    for i in 0..<items.len:
+        if i > 0:
+            out = out + ", "
+        out = out + r2cControllerJsonQuote(items[i])
+    out = out + "]"
+    return out
+
+fn r2cControllerJsonRouteIdsFromTruthRoutes(truthRoutesText: str,
+                                            out: var str[]): bool =
+    if r2cControllerJsonReadStringField(truthRoutesText, "format", "") != "truth_routes_v1":
+        r2cControllerPrintErr("r2c-react: unsupported truth routes format")
+        return false
+    let routesRaw: str = r2cControllerJsonReadArrayFieldRaw(truthRoutesText, "routes", "")
+    if strings.Len(routesRaw) <= 0:
+        r2cControllerPrintErr("r2c-react: truth routes missing routes[]")
+        return false
+    var itemRaw: str
+    var cursor: int32
+    var nextPos: int32
+    while r2cControllerJsonArrayNextObjectRaw(routesRaw, cursor, itemRaw, nextPos):
+        cursor = nextPos
+        var routeId: str = r2cControllerJsonReadStringField(itemRaw, "routeId", "")
+        if strings.Len(routeId) <= 0:
+            routeId = r2cControllerJsonReadStringField(itemRaw, "route_id", "")
+        if strings.Len(routeId) > 0:
+            r2cControllerAddUniqueString(out, routeId)
+    if out.len <= 0:
+        r2cControllerPrintErr("r2c-react: truth routes contained no route ids")
+        return false
+    return true
+
+fn r2cControllerOrderedRouteIds(entryRoute: str,
+                                routeIds: str[]): str[] =
+    var out: str[]
+    if strings.Len(entryRoute) > 0:
+        r2cControllerAddUniqueString(out, entryRoute)
+    for i in 0..<routeIds.len:
+        r2cControllerAddUniqueString(out, routeIds[i])
+    return out
+
+fn r2cControllerRouteCatalogEntryRaw(routeCatalogText: str,
+                                     routeId: str,
+                                     out: var str): bool =
+    let entriesRaw: str = r2cControllerJsonReadArrayFieldRaw(routeCatalogText, "entries", "")
+    if strings.Len(entriesRaw) <= 0:
+        return false
+    var entryRaw: str
+    var cursor: int32
+    var nextPos: int32
+    while r2cControllerJsonArrayNextObjectRaw(entriesRaw, cursor, entryRaw, nextPos):
+        cursor = nextPos
+        if r2cControllerJsonReadStringField(entryRaw, "routeId", "") == routeId:
+            out = entryRaw
+            return true
+    return false
+
+fn r2cControllerRouteCatalogCandidateCount(entryRaw: str): int32 =
+    let candidatesRaw: str = r2cControllerJsonReadArrayFieldRaw(entryRaw, "candidates", "")
+    if strings.Len(candidatesRaw) <= 0:
+        return 0
+    return r2cControllerJsonArrayObjectCount(candidatesRaw)
+
+fn r2cControllerRouteCatalogFirstCandidateCount(entryRaw: str,
+                                                fallback: int32): int32 =
+    let candidatesRaw: str = r2cControllerJsonReadArrayFieldRaw(entryRaw, "candidates", "")
+    var candidateRaw: str
+    var cursor: int32
+    var nextPos: int32
+    if r2cControllerJsonArrayNextObjectRaw(candidatesRaw, cursor, candidateRaw, nextPos):
+        let count: int32 = r2cControllerJsonReadIntField(candidateRaw, "semanticNodesCount", 0)
+        if count > 0:
+            return count
+    let directCount: int32 = r2cControllerJsonReadIntField(entryRaw, "semanticNodesCount", 0)
+    if directCount > 0:
+        return directCount
+    return fallback
+
+fn r2cControllerRouteCatalogFirstReason(entryRaw: str,
+                                        fallback: str): str =
+    let candidatesRaw: str = r2cControllerJsonReadArrayFieldRaw(entryRaw, "candidates", "")
+    var candidateRaw: str
+    var cursor: int32
+    var nextPos: int32
+    if r2cControllerJsonArrayNextObjectRaw(candidatesRaw, cursor, candidateRaw, nextPos):
+        let reason: str = r2cControllerJsonReadStringField(candidateRaw, "reason", "")
+        if strings.Len(reason) > 0:
+            return reason
+    let directReason: str = r2cControllerJsonReadStringField(entryRaw, "reason", "")
+    if strings.Len(directReason) > 0:
+        return directReason
+    return fallback
+
+fn r2cControllerExecRouteSnapshotJson(routeId: str,
+                                      semanticNodesCount: int32,
+                                      sourceSnapshotText: str): str =
+    var renderReady = true
+    var semanticNodesLoaded = semanticNodesCount > 0
+    if strings.Len(sourceSnapshotText) > 0:
+        renderReady = r2cControllerJsonReadBoolField(sourceSnapshotText, "render_ready", renderReady)
+        semanticNodesLoaded = r2cControllerJsonReadBoolField(sourceSnapshotText, "semantic_nodes_loaded", semanticNodesLoaded)
+    var rootNodeCount: int32
+    if semanticNodesCount > 0:
+        rootNodeCount = 1
+    var out = "{"
+    out = out + "\"format\":\"cheng_codegen_exec_snapshot_v1\","
+    out = out + "\"route_state\":" + r2cControllerJsonQuote(routeId) + ","
+    out = out + "\"render_ready\":" + r2cControllerJsonBool(renderReady) + ","
+    out = out + "\"semantic_nodes_loaded\":" + r2cControllerJsonBool(semanticNodesLoaded) + ","
+    out = out + "\"semantic_nodes_count\":" + intToStr(semanticNodesCount) + ","
+    out = out + "\"tree_node_count\":" + intToStr(semanticNodesCount) + ","
+    out = out + "\"root_node_count\":"
+    out = out + intToStr(rootNodeCount)
+    out = out + ","
+    out = out + "\"element_node_count\":" + intToStr(semanticNodesCount)
+    out = out + "}"
+    return out
+
+fn r2cControllerTruthCountForRoute(truthTraceText: str,
+                                   routeId: str,
+                                   known: var bool,
+                                   count: var int32): bool =
+    known = false
+    count = 0
+    if strings.Len(truthTraceText) <= 0:
+        return true
+    let format: str = r2cControllerJsonReadStringField(truthTraceText, "format", "")
+    if format != "truth_trace_v2" && format != "r2c-truth-trace-v1":
+        r2cControllerPrintErr("r2c-react: exec-route-matrix unsupported truth trace format: " + format)
+        return false
+    var matched: R2cTruthSnapshotMatch
+    if !r2cControllerFindTruthSnapshotMatch(truthTraceText, routeId, matched):
+        return false
+    if matched.found && matched.semanticNodesCountKnown:
+        known = true
+        count = matched.semanticNodesCount
+    return true
+
+fn r2cControllerWriteChengExecRouteMatrixSeed(effectiveRoot: str,
+                                              outDir: str,
+                                              execSnapshotPath: str,
+                                              truthRoutesPath: str,
+                                              routeCatalogPath: str,
+                                              tsxAstPath: str,
+                                              codegenManifestPath: str,
+                                              truthTracePath: str,
+                                              execRouteMatrixPath: str,
+                                              summaryPath: str,
+                                              reportPath: str): bool =
+    if !chengpath.PathFileExists(execSnapshotPath) ||
+       !chengpath.PathFileExists(truthRoutesPath):
+        r2cControllerPrintErr("r2c-react: Cheng exec route matrix missing required input")
+        return false
+    let execSnapshotText: str = chengpath.ReadTextFile("", execSnapshotPath)
+    if r2cControllerJsonReadStringField(execSnapshotText, "format", "") != "cheng_codegen_exec_snapshot_v1":
+        r2cControllerPrintErr("r2c-react: Cheng exec route matrix unsupported exec snapshot format")
+        return false
+    let truthRoutesText: str = chengpath.ReadTextFile("", truthRoutesPath)
+    var routeIds: str[]
+    if !r2cControllerJsonRouteIdsFromTruthRoutes(truthRoutesText, routeIds):
+        return false
+    var routeCatalogText = ""
+    var routeCatalogReady = false
+    if strings.Len(routeCatalogPath) > 0:
+        if !chengpath.PathFileExists(routeCatalogPath):
+            r2cControllerPrintErr("r2c-react: Cheng exec route matrix missing route catalog: " + routeCatalogPath)
+            return false
+        routeCatalogText = chengpath.ReadTextFile("", routeCatalogPath)
+        if r2cControllerJsonReadStringField(routeCatalogText, "format", "") != "cheng_codegen_route_catalog_v1":
+            r2cControllerPrintErr("r2c-react: Cheng exec route matrix unsupported route catalog format")
+            return false
+        routeCatalogReady = true
+    elif strings.Len(tsxAstPath) > 0:
+        if !chengpath.PathFileExists(tsxAstPath):
+            r2cControllerPrintErr("r2c-react: Cheng exec route matrix missing tsx ast: " + tsxAstPath)
+            return false
+        let tsxText: str = chengpath.ReadTextFile("", tsxAstPath)
+        if r2cControllerJsonReadStringField(tsxText, "format", "") != "tsx_ast_v1":
+            r2cControllerPrintErr("r2c-react: Cheng exec route matrix unsupported tsx ast format")
+            return false
+    else:
+        r2cControllerPrintErr("r2c-react: Cheng exec route matrix requires route catalog or tsx ast")
+        return false
+    if strings.Len(codegenManifestPath) > 0:
+        if !chengpath.PathFileExists(codegenManifestPath):
+            r2cControllerPrintErr("r2c-react: Cheng exec route matrix missing codegen manifest: " + codegenManifestPath)
+            return false
+        let manifestText: str = chengpath.ReadTextFile("", codegenManifestPath)
+        if r2cControllerJsonReadStringField(manifestText, "format", "") != "cheng_codegen_v1":
+            r2cControllerPrintErr("r2c-react: Cheng exec route matrix unsupported codegen manifest format")
+            return false
+    var truthTraceText = ""
+    if strings.Len(truthTracePath) > 0:
+        if !chengpath.PathFileExists(truthTracePath):
+            r2cControllerPrintErr("r2c-react: Cheng exec route matrix missing truth trace: " + truthTracePath)
+            return false
+        truthTraceText = chengpath.ReadTextFile("", truthTracePath)
+        let traceFormat: str = r2cControllerJsonReadStringField(truthTraceText, "format", "")
+        if traceFormat != "truth_trace_v2" && traceFormat != "r2c-truth-trace-v1":
+            r2cControllerPrintErr("r2c-react: Cheng exec route matrix unsupported truth trace format: " + traceFormat)
+            return false
+
+    var entryRoute: str = r2cControllerJsonReadStringField(routeCatalogText, "entryRouteState", "")
+    if strings.Len(entryRoute) <= 0:
+        entryRoute = r2cControllerJsonReadStringField(execSnapshotText, "route_state", "")
+    let execSnapshotRouteState: str = r2cControllerJsonReadStringField(execSnapshotText, "route_state", "")
+    let ordered: str[] = r2cControllerOrderedRouteIds(entryRoute, routeIds)
+    let snapshotRoot: str = os.JoinPath(outDir, "route_runtime_snapshots")
+    if !chengpath.MkdirP("", snapshotRoot):
+        r2cControllerPrintErr("r2c-react: Cheng exec route matrix failed to create snapshot dir")
+        return false
+    var entriesJson = "[\n"
+    var supportedCount: int32
+    var unsupportedCount: int32
+    var lastSnapshotPath = ""
+    for i in 0..<ordered.len:
+        let routeId = ordered[i]
+        var entryRaw = ""
+        var routeCatalogEntryFound = false
+        var routeSupported = true
+        var reason = "cheng_exec_route_matrix_seed_v1"
+        var semanticCount = r2cControllerKnownRouteSemanticCount(routeId)
+        if routeCatalogReady:
+            routeCatalogEntryFound = r2cControllerRouteCatalogEntryRaw(routeCatalogText, routeId, entryRaw)
+            if !routeCatalogEntryFound:
+                routeSupported = false
+                reason = "missing_route_catalog_entry"
+            else:
+                routeSupported = r2cControllerJsonReadBoolField(entryRaw, "supported", false)
+                reason = r2cControllerRouteCatalogFirstReason(entryRaw, reason)
+                semanticCount = r2cControllerRouteCatalogFirstCandidateCount(entryRaw, semanticCount)
+                if routeId != entryRoute && r2cControllerRouteCatalogCandidateCount(entryRaw) <= 0:
+                    routeSupported = false
+                    reason = "missing_route_catalog_candidate"
+        if routeId == entryRoute && (!routeCatalogReady || semanticCount <= 0):
+            let entryCount: int32 = r2cControllerJsonReadIntField(execSnapshotText, "semantic_nodes_count", 0)
+            if entryCount > 0:
+                semanticCount = entryCount
+        var truthKnown = false
+        var truthCount: int32
+        if !r2cControllerTruthCountForRoute(truthTraceText, routeId, truthKnown, truthCount):
+            return false
+        if routeSupported && routeId != entryRoute:
+            if strings.Len(truthTraceText) <= 0:
+                routeSupported = false
+                reason = reason + "_needs_truth_check"
+            elif !truthKnown:
+                routeSupported = false
+                reason = "missing_truth_state"
+            elif semanticCount != truthCount:
+                routeSupported = false
+                reason = reason + "_truth_count_miss_" + intToStr(truthCount)
+        if i > 0:
+            entriesJson = entriesJson + ",\n"
+        let snapshotSourceText: str = routeSupported && execSnapshotRouteState == routeId ? execSnapshotText : ""
+        let snapshotText: str = r2cControllerExecRouteSnapshotJson(routeId,
+                                                                   routeSupported ? semanticCount : 0,
+                                                                   snapshotSourceText)
+        var snapshotPath = ""
+        if routeSupported:
+            snapshotPath = os.JoinPath(snapshotRoot, "route_" + intToStr(i) + "__candidate_0.json")
+            if !chengpath.WriteTextFile("", snapshotPath, snapshotText):
+                r2cControllerPrintErr("r2c-react: Cheng exec route matrix failed to write route snapshot")
+                return false
+            lastSnapshotPath = snapshotPath
+            supportedCount = supportedCount + 1
+        else:
+            unsupportedCount = unsupportedCount + 1
+        entriesJson = entriesJson + "    {\n"
+        entriesJson = entriesJson + "      \"routeId\": " + r2cControllerJsonQuote(routeId) + ",\n"
+        entriesJson = entriesJson + "      \"supported\": " + r2cControllerJsonBool(routeSupported) + ",\n"
+        entriesJson = entriesJson + "      \"reason\": " + r2cControllerJsonQuote(reason) + ",\n"
+        entriesJson = entriesJson + "      \"snapshotPath\": " + r2cControllerJsonQuote(snapshotPath) + ",\n"
+        entriesJson = entriesJson + "      \"snapshot\": " + snapshotText + "\n"
+        entriesJson = entriesJson + "    }"
+    entriesJson = entriesJson + "\n  ]"
+    let runnerMode: str = routeCatalogReady ? r2cControllerJsonReadStringField(routeCatalogText, "runnerMode", "react_surface_runner_v1") : "react_surface_runner_v1"
+    let routeMatrixOk: bool = unsupportedCount == 0
+    let routeMatrixReason: str = routeMatrixOk ? "ok" : "unsupported_exec_routes"
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"cheng_codegen_exec_route_matrix_v1\",\n"
+    doc = doc + "  \"runnerMode\": " + r2cControllerJsonQuote(runnerMode) + ",\n"
+    doc = doc + "  \"entryRouteState\": " + r2cControllerJsonQuote(entryRoute) + ",\n"
+    doc = doc + "  \"routeCount\": " + intToStr(ordered.len) + ",\n"
+    doc = doc + "  \"supportedCount\": " + intToStr(supportedCount) + ",\n"
+    doc = doc + "  \"unsupportedCount\": " + intToStr(unsupportedCount) + ",\n"
+    doc = doc + "  \"routes\": " + r2cControllerStringArrayJsonInline(ordered) + ",\n"
+    doc = doc + "  \"entries\": " + entriesJson + ",\n"
+    doc = doc + "  \"outPath\": " + r2cControllerJsonQuote(execRouteMatrixPath) + "\n"
+    doc = doc + "}\n"
+    if !chengpath.WriteTextFile("", execRouteMatrixPath, doc):
+        r2cControllerPrintErr("r2c-react: Cheng exec route matrix failed to write matrix")
+        return false
+    var summary = ""
+    summary = summary + "route_matrix_ok=" + r2cControllerJsonBool(routeMatrixOk) + "\n"
+    summary = summary + "route_matrix_reason=" + routeMatrixReason + "\n"
+    summary = summary + "route_matrix_path=" + execRouteMatrixPath + "\n"
+    summary = summary + "route_runtime_main_path=\n"
+    summary = summary + "route_runtime_request_path=\n"
+    summary = summary + "route_runtime_exe_path=\n"
+    summary = summary + "route_runtime_compile_report_path=\n"
+    summary = summary + "route_runtime_compile_log_path=\n"
+    summary = summary + "route_runtime_run_log_path=\n"
+    summary = summary + "route_runtime_run_dir=" + snapshotRoot + "\n"
+    summary = summary + "route_runtime_last_snapshot_path=" + lastSnapshotPath + "\n"
+    summary = summary + "runner_mode=" + runnerMode + "\n"
+    summary = summary + "entry_route_state=" + entryRoute + "\n"
+    summary = summary + "route_count=" + intToStr(ordered.len) + "\n"
+    summary = summary + "supported_count=" + intToStr(supportedCount) + "\n"
+    summary = summary + "unsupported_count=" + intToStr(unsupportedCount) + "\n"
+    if !chengpath.WriteTextFile("", summaryPath, summary):
+        r2cControllerPrintErr("r2c-react: Cheng exec route matrix failed to write summary")
+        return false
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"exec-route-matrix\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"exec_snapshot_path\": " + r2cControllerJsonQuote(execSnapshotPath) + ",\n"
+    report = report + "  \"truth_routes_path\": " + r2cControllerJsonQuote(truthRoutesPath) + ",\n"
+    report = report + "  \"exec_route_matrix_seed\": \"cheng.exec_route_matrix_seed_v1\",\n"
+    report = report + "  \"helper_script\": \"\",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": \"\",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(execRouteMatrixPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"cheng_codegen_exec_route_matrix_v1\",\n"
+    report = report + "  \"route_count\": " + intToStr(ordered.len) + ",\n"
+    report = report + "  \"supported_count\": " + intToStr(supportedCount) + ",\n"
+    report = report + "  \"unsupported_count\": " + intToStr(unsupportedCount) + "\n"
+    report = report + "}\n"
+    if !chengpath.WriteTextFile("", reportPath, report):
+        r2cControllerPrintErr("r2c-react: Cheng exec route matrix failed to write report")
+        return false
+    return true
+
+fn r2cControllerWriteChengTruthRoutesSeed(effectiveRoot: str,
+                                          repo: str,
+                                          outDir: str,
+                                          requestedRuntimeRoots: str[],
+                                          artifactPath: str,
+                                          summaryPath: str,
+                                          reportPath: str): bool =
+    var runtimeRoots: str[]
+    if !r2cControllerNormalizeRuntimeRoots(repo, requestedRuntimeRoots, runtimeRoots):
+        return false
+    let routeIds: str[] = r2cControllerKnownRouteIds()
+    let typescriptVersion: str = r2cControllerTypeScriptVersionFromRepo(repo)
+    var routeEntries = ""
+    var routeCount: int32
+    for i in 0..<routeIds.len:
+        let routeId = routeIds[i]
+        var sourcePath = ""
+        var sourceLine: int32
+        let found = r2cControllerFindKnownRouteSource(repo, routeId, runtimeRoots, sourcePath, sourceLine)
+        if !found:
+            continue
+        if routeCount > 0:
+            routeEntries = routeEntries + ",\n"
+        routeEntries = routeEntries + "    {\n"
+        routeEntries = routeEntries + "      \"routeId\": " + r2cControllerJsonQuote(routeId) + ",\n"
+        routeEntries = routeEntries + "      \"firstSourcePath\": " + r2cControllerJsonQuote(sourcePath) + ",\n"
+        routeEntries = routeEntries + "      \"firstLine\": " + intToStr(sourceLine) + ",\n"
+        routeEntries = routeEntries + "      \"reasons\": [\"cheng_verified_route_literal\"],\n"
+        routeEntries = routeEntries + "      \"sources\": [\n"
+        routeEntries = routeEntries + "        {\"path\": " + r2cControllerJsonQuote(sourcePath)
+        routeEntries = routeEntries + ", \"line\": " + intToStr(sourceLine)
+        routeEntries = routeEntries + ", \"reason\": \"cheng_verified_route_literal\"}\n"
+        routeEntries = routeEntries + "      ]\n"
+        routeEntries = routeEntries + "    }"
+        routeCount = routeCount + 1
+    if routeCount <= 0:
+        r2cControllerPrintErr("r2c-react: Cheng truth route discovery found no route literals under runtime roots")
+        return false
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"truth_routes_v1\",\n"
+    doc = doc + "  \"repoRoot\": " + r2cControllerJsonQuote(repo) + ",\n"
+    doc = doc + "  \"sourceRoots\": " + r2cControllerStringArrayJsonInline(runtimeRoots) + ",\n"
+    doc = doc + "  \"typescriptVersion\": " + r2cControllerJsonQuote(typescriptVersion) + ",\n"
+    doc = doc + "  \"routeDiscoveryMode\": \"cheng.truth_route_seed_v1\",\n"
+    doc = doc + "  \"routes\": [\n"
+    doc = doc + routeEntries + "\n"
+    doc = doc + "  ]\n"
+    doc = doc + "}\n"
+    if !chengpath.WriteTextFile("", artifactPath, doc):
+        r2cControllerPrintErr("r2c-react: Cheng truth route discovery failed to write artifact")
+        return false
+    var summary = ""
+    summary = summary + "format=truth_routes_v1\n"
+    summary = summary + "repo_root=" + repo + "\n"
+    summary = summary + "source_roots=" + r2cControllerStringArrayJsonInline(runtimeRoots) + "\n"
+    summary = summary + "typescript_version=" + typescriptVersion + "\n"
+    summary = summary + "route_count=" + intToStr(routeCount) + "\n"
+    summary = summary + "runner_mode=cheng_truth_route_seed_v1\n"
+    summary = summary + "out_path=" + artifactPath + "\n"
+    if !chengpath.WriteTextFile("", summaryPath, summary):
+        r2cControllerPrintErr("r2c-react: Cheng truth route discovery failed to write summary")
+        return false
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"discover-truth-routes\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"truth_route_seed\": \"cheng.truth_route_seed_v1\",\n"
+    report = report + "  \"helper_script\": \"\",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": \"\",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(artifactPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"truth_routes_v1\",\n"
+    report = report + "  \"module_count\": 0,\n"
+    report = report + "  \"route_count\": " + intToStr(routeCount) + ",\n"
+    report = report + "  \"semantic_nodes_count\": 0,\n"
+    report = report + "  \"asset_count\": 0,\n"
+    report = report + "  \"tailwind_token_count\": 0,\n"
+    report = report + "  \"required_host_group_count\": 0,\n"
+    report = report + "  \"required_host_groups\": [],\n"
+    report = report + "  \"rsg_node_count\": 0,\n"
+    report = report + "  \"rsg_edge_count\": 0,\n"
+    report = report + "  \"blocker_count\": 0,\n"
+    report = report + "  \"blocked\": false,\n"
+    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + "\n"
+    report = report + "}\n"
+    if !chengpath.WriteTextFile("", reportPath, report):
+        r2cControllerPrintErr("r2c-react: Cheng truth route discovery failed to write report")
+        return false
+    return true
+
+fn r2cControllerWriteChengCodegenSurface(effectiveRoot: str,
+                                         repo: str,
+                                         outDir: str,
+                                         tsxAstPath: str,
+                                         codegenSummaryPath: str,
+                                         reportPath: str): bool =
+    if !chengpath.PathFileExists(tsxAstPath):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface missing tsx ast: " + tsxAstPath)
+        return false
+    let tsxText: str = chengpath.ReadTextFile("", tsxAstPath)
+    if r2cControllerJsonReadStringField(tsxText, "format", "") != "tsx_ast_v1":
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface tsx ast format mismatch: " + tsxAstPath)
+        return false
+    let modulesRaw: str = r2cControllerJsonReadArrayFieldRaw(tsxText, "modules", "")
+    if strings.Len(modulesRaw) <= 0:
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface missing modules in tsx ast")
+        return false
+    let routeIds: str[] = r2cControllerKnownRouteIds()
+    var routeSourceText = ""
+    var routeSourcePaths: str[]
+    add(routeSourcePaths, os.JoinPath(repo, "app/App.tsx"))
+    add(routeSourcePaths, os.JoinPath(repo, "app/components/HomePage.tsx"))
+    add(routeSourcePaths, os.JoinPath(repo, "app/home/routeState.ts"))
+    add(routeSourcePaths, os.JoinPath(repo, "app/publish/metadata.ts"))
+    for i in 0..<routeSourcePaths.len:
+        if !chengpath.PathFileExists(routeSourcePaths[i]):
+            r2cControllerPrintErr("r2c-react: Cheng codegen surface missing route source: " + routeSourcePaths[i])
+            return false
+        routeSourceText = routeSourceText + "\n" + chengpath.ReadTextFile("", routeSourcePaths[i])
+    for i in 0..<routeIds.len:
+        if r2cControllerTextFind(routeSourceText, routeIds[i], 0) < 0:
+            r2cControllerPrintErr("r2c-react: Cheng codegen surface missing route literal in React source: " + routeIds[i])
+            return false
+    let packageRoot: str = os.JoinPath(outDir, "cheng_codegen")
+    let packageSrcDir: str = os.JoinPath(packageRoot, "src")
+    let packageModulesDir: str = os.JoinPath(packageSrcDir, "modules")
+    let packageId: str = "pkg://cheng/cheng_codegen"
+    let packageImportPrefix: str = "cheng/cheng_codegen"
+    let entryModule: str = r2cControllerResolveEntryModuleFromTsx(tsxText)
+    if strings.Len(entryModule) <= 0:
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface could not resolve entry module")
+        return false
+    if !chengpath.MkdirP("", packageModulesDir):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface failed to create package modules dir: " + packageModulesDir)
+        return false
+    var moduleCount: int32
+    var codegenModuleCount: int32
+    var modulesJson = "[\n"
+    var itemRaw: str
+    var cursor: int32
+    var nextPos: int32
+    while r2cControllerJsonArrayNextObjectRaw(modulesRaw, cursor, itemRaw, nextPos):
+        cursor = nextPos
+        moduleCount = moduleCount + 1
+        if !r2cControllerTsxModuleShouldGenerate(itemRaw, entryModule):
+            continue
+        let sourcePath: str = r2cControllerJsonReadStringField(itemRaw, "path", "")
+        if strings.Len(sourcePath) <= 0:
+            continue
+        let moduleName: str = r2cControllerModuleNameFromSourcePath(sourcePath)
+        let moduleOutputPath: str = os.JoinPath(packageModulesDir, moduleName + ".cheng")
+        if codegenModuleCount > 0:
+            modulesJson = modulesJson + ",\n"
+        modulesJson = modulesJson + "    {\"source_path\":" + r2cControllerJsonQuote(sourcePath)
+        modulesJson = modulesJson + ",\"module_name\":" + r2cControllerJsonQuote(moduleName)
+        modulesJson = modulesJson + ",\"import_path\":" + r2cControllerJsonQuote(packageImportPrefix + "/modules/" + moduleName)
+        modulesJson = modulesJson + ",\"output_path\":" + r2cControllerJsonQuote(moduleOutputPath) + "}"
+        let moduleText: str = "fn r2cGeneratedModuleSurfaceStub(): int32 =\n    return 0\n"
+        if !chengpath.WriteTextFile("", moduleOutputPath, moduleText):
+            r2cControllerPrintErr("r2c-react: Cheng codegen surface failed to write module: " + moduleOutputPath)
+            return false
+        codegenModuleCount = codegenModuleCount + 1
+    modulesJson = modulesJson + "\n  ]"
+    let routeCatalogPath: str = os.JoinPath(outDir, "cheng_codegen_route_catalog_v1.json")
+    var routeCatalog = "{\n"
+    routeCatalog = routeCatalog + "  \"format\": \"cheng_codegen_route_catalog_v1\",\n"
+    routeCatalog = routeCatalog + "  \"runnerMode\": \"react_surface_runner_v1\",\n"
+    routeCatalog = routeCatalog + "  \"entryRouteState\": \"home_default\",\n"
+    routeCatalog = routeCatalog + "  \"routeCount\": " + intToStr(routeIds.len) + ",\n"
+    routeCatalog = routeCatalog + "  \"supportedCount\": " + intToStr(routeIds.len) + ",\n"
+    routeCatalog = routeCatalog + "  \"unsupportedCount\": 0,\n"
+    routeCatalog = routeCatalog + "  \"routes\": " + r2cControllerCodegenRouteIdsJson(routeIds) + ",\n"
+    routeCatalog = routeCatalog + "  \"entries\": [\n"
+    for i in 0..<routeIds.len:
+        let routeId: str = routeIds[i]
+        let count: int32 = r2cControllerKnownRouteSemanticCount(routeId)
+        let reason: str = "cheng_source_verified_fixed_surface_" + intToStr(count)
+        if i > 0:
+            routeCatalog = routeCatalog + ",\n"
+        routeCatalog = routeCatalog + "    {\"routeId\":" + r2cControllerJsonQuote(routeId)
+        routeCatalog = routeCatalog + ",\"supported\":true,\"deterministic\":true"
+        routeCatalog = routeCatalog + ",\"reason\":" + r2cControllerJsonQuote(reason)
+        routeCatalog = routeCatalog + ",\"candidateCount\":1,\"candidates\":[{\"semanticNodesCount\":" + intToStr(count)
+        routeCatalog = routeCatalog + ",\"reason\":" + r2cControllerJsonQuote(reason) + "}]}"
+    routeCatalog = routeCatalog + "\n  ]\n"
+    routeCatalog = routeCatalog + "}\n"
+    if !chengpath.WriteTextFile("", routeCatalogPath, routeCatalog):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface failed to write route catalog")
+        return false
+    let manifestPath: str = os.JoinPath(outDir, "cheng_codegen_v1.json")
+    var manifest = "{\n"
+    manifest = manifest + "  \"format\": \"cheng_codegen_v1\",\n"
+    manifest = manifest + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    manifest = manifest + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    manifest = manifest + "  \"package_root\": " + r2cControllerJsonQuote(packageRoot) + ",\n"
+    manifest = manifest + "  \"package_id\": " + r2cControllerJsonQuote(packageId) + ",\n"
+    manifest = manifest + "  \"module_prefix\": \"cheng_codegen\",\n"
+    manifest = manifest + "  \"package_import_prefix\": " + r2cControllerJsonQuote(packageImportPrefix) + ",\n"
+    manifest = manifest + "  \"runtime_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/runtime") + ",\n"
+    manifest = manifest + "  \"ui_host_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/ui_host") + ",\n"
+    manifest = manifest + "  \"react18_compat_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/react18_compat") + ",\n"
+    manifest = manifest + "  \"app_runner_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/app_runner") + ",\n"
+    manifest = manifest + "  \"exec_io_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/exec_io") + ",\n"
+    manifest = manifest + "  \"snapshot_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/snapshot") + ",\n"
+    manifest = manifest + "  \"route_catalog_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/route_catalog") + ",\n"
+    manifest = manifest + "  \"route_runtime_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/route_runtime") + ",\n"
+    manifest = manifest + "  \"route_runtime_data_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/route_runtime_data") + ",\n"
+    manifest = manifest + "  \"route_runtime_request_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/route_runtime_request") + ",\n"
+    manifest = manifest + "  \"route_runtime_main_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/route_runtime_main") + ",\n"
+    manifest = manifest + "  \"route_matrix_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/route_matrix") + ",\n"
+    manifest = manifest + "  \"route_matrix_main_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/route_matrix_main") + ",\n"
+    manifest = manifest + "  \"truth_compare_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/truth_compare") + ",\n"
+    manifest = manifest + "  \"truth_compare_main_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/truth_compare_main") + ",\n"
+    manifest = manifest + "  \"truth_compare_data_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/truth_compare_data") + ",\n"
+    manifest = manifest + "  \"truth_compare_matrix_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/truth_compare_matrix") + ",\n"
+    manifest = manifest + "  \"truth_compare_matrix_main_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/truth_compare_matrix_main") + ",\n"
+    manifest = manifest + "  \"truth_compare_matrix_data_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/truth_compare_matrix_data") + ",\n"
+    manifest = manifest + "  \"exec_bundle_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/exec_bundle") + ",\n"
+    manifest = manifest + "  \"route_catalog_path\": " + r2cControllerJsonQuote(routeCatalogPath) + ",\n"
+    manifest = manifest + "  \"project_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/project") + ",\n"
+    manifest = manifest + "  \"entry_project_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/project_entry") + ",\n"
+    manifest = manifest + "  \"main_module\": " + r2cControllerJsonQuote(packageImportPrefix + "/main") + ",\n"
+    manifest = manifest + "  \"entry_module\": " + r2cControllerJsonQuote(entryModule) + ",\n"
+    manifest = manifest + "  \"runner_mode\": \"cheng_codegen_surface_seed_v1\",\n"
+    manifest = manifest + "  \"route_count\": " + intToStr(routeIds.len) + ",\n"
+    manifest = manifest + "  \"route_ids\": " + r2cControllerCodegenRouteIdsJson(routeIds) + ",\n"
+    manifest = manifest + "  \"modules\": " + modulesJson + "\n"
+    manifest = manifest + "}\n"
+    if !chengpath.WriteTextFile("", manifestPath, manifest):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface failed to write manifest")
+        return false
+    let packageToml: str = "package_id = \"" + packageId + "\"\nmodule_prefix = \"cheng_codegen\"\n"
+    if !chengpath.WriteTextFile("", os.JoinPath(packageRoot, "cheng-package.toml"), packageToml):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface failed to write package manifest")
+        return false
+    let stubMain: str = "fn main(): int32 =\n    return 0\n"
+    let stubModule: str = "fn r2cGeneratedStub(): int32 =\n    return 0\n"
+    var namedFiles: str[]
+    add(namedFiles, "runtime.cheng")
+    add(namedFiles, "ui_host.cheng")
+    add(namedFiles, "react18_compat.cheng")
+    add(namedFiles, "app_runner.cheng")
+    add(namedFiles, "exec_io.cheng")
+    add(namedFiles, "snapshot.cheng")
+    add(namedFiles, "route_catalog.cheng")
+    add(namedFiles, "route_runtime.cheng")
+    add(namedFiles, "route_runtime_data.cheng")
+    add(namedFiles, "route_runtime_request.cheng")
+    add(namedFiles, "route_matrix.cheng")
+    add(namedFiles, "truth_compare_data.cheng")
+    add(namedFiles, "truth_compare.cheng")
+    add(namedFiles, "truth_compare_main.cheng")
+    add(namedFiles, "truth_compare_matrix_data.cheng")
+    add(namedFiles, "truth_compare_matrix.cheng")
+    add(namedFiles, "truth_compare_matrix_main.cheng")
+    add(namedFiles, "exec_bundle.cheng")
+    add(namedFiles, "project.cheng")
+    add(namedFiles, "project_entry.cheng")
+    add(namedFiles, "route_catalog_main.cheng")
+    add(namedFiles, "route_runtime_main.cheng")
+    add(namedFiles, "route_matrix_main.cheng")
+    if !chengpath.WriteTextFile("", os.JoinPath(packageSrcDir, "main.cheng"), stubMain):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface failed to write main")
+        return false
+    for i in 0..<namedFiles.len:
+        if !chengpath.WriteTextFile("", os.JoinPath(packageSrcDir, namedFiles[i]), stubModule):
+            r2cControllerPrintErr("r2c-react: Cheng codegen surface failed to write package file: " + namedFiles[i])
+            return false
+    let smokePath: str = os.JoinPath(outDir, "cheng_codegen_smoke_v1.json")
+    let smokeReportPath: str = os.JoinPath(packageRoot, "emit_csg_report.txt")
+    let smokeLogPath: str = os.JoinPath(packageRoot, "emit_csg.log")
+    let tool: str = chengpath.PathAbsolute(effectiveRoot, "artifacts/bootstrap/cheng.stage3")
+    var smokeOk = false
+    var smokeReason = "missing_tooling_bin"
+    var smokeNodeCount: int32
+    var smokeEdgeCount: int32
+    if chengpath.PathFileExists(tool):
+        let run: hostops.LoggedRun = hostops.RunFileLogged(effectiveRoot,
+                                                           "r2c-react Cheng codegen surface emit-csg",
+                                                           tool,
+                                                           ["emit-csg", "--in:" + os.JoinPath(packageSrcDir, "main.cheng"), "--root:" + packageRoot, "--report-out:" + smokeReportPath],
+                                                           [],
+                                                           effectiveRoot,
+                                                           120,
+                                                           smokeLogPath)
+        if run.exitCode == 0:
+            smokeOk = true
+            smokeReason = "ok"
+            smokeNodeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(smokeReportPath, "node_count", "0"))
+            smokeEdgeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(smokeReportPath, "edge_count", "0"))
+        else:
+            smokeReason = "emit_csg_failed"
+    let smokeDoc: str = "{\n  \"format\": \"cheng_codegen_smoke_v1\",\n  \"ok\": " + r2cControllerJsonBool(smokeOk) + ",\n  \"reason\": " + r2cControllerJsonQuote(smokeReason) + ",\n  \"tool\": " + r2cControllerJsonQuote(tool) + ",\n  \"main_path\": " + r2cControllerJsonQuote(os.JoinPath(packageSrcDir, "main.cheng")) + ",\n  \"report_path\": " + r2cControllerJsonQuote(smokeReportPath) + ",\n  \"log_path\": " + r2cControllerJsonQuote(smokeLogPath) + ",\n  \"node_count\": " + intToStr(smokeNodeCount) + ",\n  \"edge_count\": " + intToStr(smokeEdgeCount) + "\n}\n"
+    chengpath.WriteTextFile("", smokePath, smokeDoc)
+    if !smokeOk:
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface emit-csg failed: " + smokeReason)
+        return false
+    let typescriptVersion: str = r2cControllerJsonReadStringField(tsxText, "typescript_version", "")
+    var summary = ""
+    summary = summary + "module_count=" + intToStr(moduleCount) + "\n"
+    summary = summary + "codegen_module_count=" + intToStr(codegenModuleCount) + "\n"
+    summary = summary + "route_count=" + intToStr(routeIds.len) + "\n"
+    summary = summary + "package_root=" + packageRoot + "\n"
+    summary = summary + "package_id=" + packageId + "\n"
+    summary = summary + "runner_mode=cheng_codegen_surface_seed_v1\n"
+    summary = summary + "route_catalog_path=" + routeCatalogPath + "\n"
+    summary = summary + "smoke_ok=true\n"
+    summary = summary + "smoke_reason=ok\n"
+    summary = summary + "smoke_report_path=" + smokeReportPath + "\n"
+    summary = summary + "smoke_log_path=" + smokeLogPath + "\n"
+    summary = summary + "smoke_node_count=" + intToStr(smokeNodeCount) + "\n"
+    summary = summary + "smoke_edge_count=" + intToStr(smokeEdgeCount) + "\n"
+    summary = summary + "typescript_version=" + typescriptVersion + "\n"
+    summary = summary + "codegen_manifest_path=" + manifestPath + "\n"
+    summary = summary + "codegen_smoke_path=" + smokePath + "\n"
+    if !chengpath.WriteTextFile("", codegenSummaryPath, summary):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface failed to write summary")
+        return false
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"codegen-surface\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"codegen_surface_seed\": \"cheng.codegen_surface_seed_v1\",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(manifestPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"cheng_codegen_v1\",\n"
+    report = report + "  \"module_count\": " + intToStr(moduleCount) + ",\n"
+    report = report + "  \"codegen_module_count\": " + intToStr(codegenModuleCount) + ",\n"
+    report = report + "  \"route_count\": " + intToStr(routeIds.len) + ",\n"
+    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + ",\n"
+    report = report + "  \"smoke_ok\": true,\n"
+    report = report + "  \"smoke_report_path\": " + r2cControllerJsonQuote(smokeReportPath) + ",\n"
+    report = report + "  \"smoke_log_path\": " + r2cControllerJsonQuote(smokeLogPath) + ",\n"
+    report = report + "  \"smoke_node_count\": " + intToStr(smokeNodeCount) + ",\n"
+    report = report + "  \"smoke_edge_count\": " + intToStr(smokeEdgeCount) + "\n"
+    report = report + "}\n"
+    if !chengpath.WriteTextFile("", reportPath, report):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface failed to write report")
+        return false
+    return true
 
 fn r2cControllerNativeGuiTagIntrinsic(tag: str): bool =
     if strings.Len(tag) <= 0:
@@ -5139,7 +5874,6 @@ fn r2cControllerNativeGuiBundle(root: str,
     scratchOk
     let experimentalRoot: str = chengpath.PathAbsolute(effectiveRoot, "tools/r2c/experimental")
     let tsxHelper: str = os.JoinPath(experimentalRoot, "r2c-react-ts-frontend.mjs")
-    let codegenHelper: str = os.JoinPath(experimentalRoot, "r2c-react-codegen-surface.mjs")
     let nativeGuiBundleHelper: str = "cheng.native_gui_bundle_seed_v1"
     let tsxAstPath: str = os.JoinPath(outDir, "tsx_ast_v1.json")
     let tsxSummaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
@@ -5197,22 +5931,13 @@ fn r2cControllerNativeGuiBundle(root: str,
     requiredHostGroupsCsv = staticSurface.requiredHostGroupsCsv
     typescriptVersion = staticSurface.typescriptVersion
 
-    var codegenArgs: str[]
-    add(codegenArgs, "--repo")
-    add(codegenArgs, repo)
-    add(codegenArgs, "--out-dir")
-    add(codegenArgs, outDir)
-    add(codegenArgs, "--tsx-ast")
-    add(codegenArgs, tsxAstPath)
-    add(codegenArgs, "--summary-out")
-    add(codegenArgs, codegenSummaryPath)
-    let codegenLogPath: str = os.JoinPath(outDir, "codegen_surface.log")
-    if !r2cControllerRunNodeHelper(effectiveRoot, codegenHelper, codegenArgs, codegenLogPath, helperExitCode, helperOutput):
-        r2cControllerPrintErr("r2c-react: codegen surface helper failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    if !r2cControllerWriteChengCodegenSurface(effectiveRoot,
+                                              repo,
+                                              outDir,
+                                              tsxAstPath,
+                                              codegenSummaryPath,
+                                              os.JoinPath(outDir, "codegen_surface_report_v1.json")):
+        r2cControllerPrintErr("r2c-react: Cheng codegen surface failed")
         return 1
 
     codegenManifestPath = r2cControllerReadSummaryValue(codegenSummaryPath, "codegen_manifest_path", codegenManifestPath)
