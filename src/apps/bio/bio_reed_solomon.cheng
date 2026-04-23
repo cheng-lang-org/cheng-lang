@@ -1,0 +1,296 @@
+import std/result
+import std/rawbytes
+import std/crypto/gf256
+import cheng/std/bytes_layout as layout
+
+const
+    v3BioRsMessageBytes: int32 = 16
+    v3BioRsCodeBytes: int32 = 32
+    v3BioRsParityBytes: int32 = v3BioRsCodeBytes - v3BioRsMessageBytes
+    v3BioRsMaxCorrectable: int32 = v3BioRsParityBytes / 2
+    v3BioRsQCoeffCount: int32 = v3BioRsMessageBytes + v3BioRsMaxCorrectable
+    v3BioRsUnknownCount: int32 = v3BioRsQCoeffCount + v3BioRsMaxCorrectable
+
+type
+    V3BioMessage16 =
+        data: uint8[16]
+
+    V3BioGf256Matrix32 =
+        data: uint8[1024]
+
+fn v3BioGf256Matrix32Clear(matrix: var V3BioGf256Matrix32) =
+    var idx: int32
+    while idx < 1024:
+        matrix.data[idx] = uint8(0)
+        idx = idx + 1
+
+fn v3BioMessage16FromBytes(data: Bytes): Result[V3BioMessage16] =
+    if bytesLen(data) != v3BioRsMessageBytes:
+        return Err[V3BioMessage16]("v3 bio rs: need 16 bytes")
+    var out: V3BioMessage16
+    for i in 0..<v3BioRsMessageBytes:
+        out.data[i] = uint8(bytesGet(data, i))
+    return Ok[V3BioMessage16](out)
+
+fn v3BioMessage16ToBytes(value: V3BioMessage16): Bytes =
+    let out: Bytes = bytesAlloc(v3BioRsMessageBytes)
+    for i in 0..<v3BioRsMessageBytes:
+        bytesSet(out, i, int32(value.data[i]) & 255)
+    return out
+
+fn v3BioGf256PolyDegree(coeffs: layout.FixedBytes32, coeffCount: int32): int32 =
+    if coeffCount <= 0:
+        return -1
+    var i: int32 = coeffCount - 1
+    while i >= 0:
+        if (int32(coeffs.data[i]) & 255) != 0:
+            return i
+        i = i - 1
+    return -1
+
+fn v3BioMessage16PolyEval(coeffs: V3BioMessage16, x: int32): int32 =
+    var acc: int32
+    var i: int32 = v3BioRsMessageBytes - 1
+    while i >= 0:
+        acc = gf256.gf256Mul(acc, x)
+        acc = gf256.gf256Add(acc, int32(coeffs.data[i]) & 255)
+        i = i - 1
+    return acc & 255
+
+fn v3BioGf256SwapFixed32(values: var layout.FixedBytes32, left: int32, right: int32) =
+    if left == right:
+        return
+    let temp = values.data[left]
+    values.data[left] = values.data[right]
+    values.data[right] = temp
+
+fn v3BioGf256MatrixOffset(row: int32, col: int32): int32 =
+    return row * 32 + col
+
+fn v3BioGf256MatrixGet(matrix: V3BioGf256Matrix32, row: int32, col: int32): int32 =
+    return int32(matrix.data[v3BioGf256MatrixOffset(row, col)]) & 255
+
+fn v3BioGf256MatrixSet(matrix: var V3BioGf256Matrix32, row: int32, col: int32, value: int32) =
+    matrix.data[v3BioGf256MatrixOffset(row, col)] = uint8(value & 255)
+
+fn v3BioGf256SwapRows(matrix: var V3BioGf256Matrix32, left: int32, right: int32) =
+    if left == right:
+        return
+    var col: int32
+    while col < 32:
+        let temp = v3BioGf256MatrixGet(matrix, left, col)
+        v3BioGf256MatrixSet(matrix, left, col, v3BioGf256MatrixGet(matrix, right, col))
+        v3BioGf256MatrixSet(matrix, right, col, temp)
+        col = col + 1
+
+fn v3BioGf256SolveLinear(rows: V3BioGf256Matrix32,
+                         rhs: layout.FixedBytes32,
+                         size: int32): Result[layout.FixedBytes32] =
+    if size <= 0 || size > 32:
+        return Err[layout.FixedBytes32]("v3 bio rs: invalid linear size")
+    var rowsWork: V3BioGf256Matrix32
+    var copyIdx: int32
+    var row: int32
+    while copyIdx < 1024:
+        rowsWork.data[copyIdx] = rows.data[copyIdx]
+        copyIdx = copyIdx + 1
+    var rhsWork: layout.FixedBytes32 = rhs
+    var pivotRow: int32
+    var col: int32
+    while col < size:
+        var pivot: int32 = -1
+        row = pivotRow
+        while row < size:
+            if v3BioGf256MatrixGet(rowsWork, row, col) != 0:
+                pivot = row
+                break
+            row = row + 1
+        row = size
+        while pivot < 0 && row < 32:
+            if v3BioGf256MatrixGet(rowsWork, row, col) != 0:
+                pivot = row
+                break
+            row = row + 1
+        if pivot < 0:
+            return Err[layout.FixedBytes32]("v3 bio rs: singular linear system")
+        if pivot != pivotRow:
+            v3BioGf256SwapRows(rowsWork, pivot, pivotRow)
+            v3BioGf256SwapFixed32(rhsWork, pivot, pivotRow)
+        let pivotInvRes = gf256.gf256Inv(v3BioGf256MatrixGet(rowsWork, pivotRow, col))
+        if IsErr(pivotInvRes):
+            return Err[layout.FixedBytes32](Error(pivotInvRes))
+        let pivotInv = Value(pivotInvRes)
+        var j: int32 = col
+        while j < size:
+            let scaled = gf256.gf256Mul(v3BioGf256MatrixGet(rowsWork, pivotRow, j), pivotInv)
+            v3BioGf256MatrixSet(rowsWork, pivotRow, j, scaled)
+            j = j + 1
+        rhsWork.data[pivotRow] = uint8(gf256.gf256Mul(int32(rhsWork.data[pivotRow]) & 255, pivotInv))
+        row = 0
+        while row < size:
+            if row == pivotRow:
+                row = row + 1
+                continue
+            let factor = v3BioGf256MatrixGet(rowsWork, row, col)
+            if factor == 0:
+                row = row + 1
+                continue
+            j = col
+            while j < size:
+                let pivotValue = v3BioGf256MatrixGet(rowsWork, pivotRow, j)
+                let rowValue = v3BioGf256MatrixGet(rowsWork, row, j)
+                let reduced = gf256.gf256Add(rowValue, gf256.gf256Mul(factor, pivotValue))
+                v3BioGf256MatrixSet(rowsWork, row, j, reduced)
+                j = j + 1
+            let rhsReduced = gf256.gf256Add(int32(rhsWork.data[row]) & 255,
+                                            gf256.gf256Mul(factor, int32(rhsWork.data[pivotRow]) & 255))
+            rhsWork.data[row] = uint8(rhsReduced)
+            row = row + 1
+        row = size
+        while row < 32:
+            let factor = v3BioGf256MatrixGet(rowsWork, row, col)
+            if factor != 0:
+                j = col
+                while j < size:
+                    let pivotValue = v3BioGf256MatrixGet(rowsWork, pivotRow, j)
+                    let rowValue = v3BioGf256MatrixGet(rowsWork, row, j)
+                    let reduced = gf256.gf256Add(rowValue, gf256.gf256Mul(factor, pivotValue))
+                    v3BioGf256MatrixSet(rowsWork, row, j, reduced)
+                    j = j + 1
+                let rhsReduced = gf256.gf256Add(int32(rhsWork.data[row]) & 255,
+                                                gf256.gf256Mul(factor, int32(rhsWork.data[pivotRow]) & 255))
+                rhsWork.data[row] = uint8(rhsReduced)
+            row = row + 1
+        if v3BioGf256MatrixGet(rowsWork, pivotRow, col) != 1:
+            return Err[layout.FixedBytes32]("v3 bio rs: pivot normalization failed")
+        pivotRow = pivotRow + 1
+        col = col + 1
+    row = pivotRow
+    while row < 32:
+        if (int32(rhsWork.data[row]) & 255) != 0:
+            return Err[layout.FixedBytes32]("v3 bio rs: inconsistent linear system")
+        row = row + 1
+    return Ok[layout.FixedBytes32](rhsWork)
+
+fn v3BioGf256PolyDivideMonic(dividend: layout.FixedBytes32,
+                             dividendLen: int32,
+                             divisor: layout.FixedBytes32,
+                             divisorLen: int32,
+                             outQuotient: var V3BioMessage16,
+                             outRemainder: var layout.FixedBytes32): Result[bool] =
+    let divisorDegree = v3BioGf256PolyDegree(divisor, divisorLen)
+    if divisorDegree < 0:
+        return Err[bool]("v3 bio rs: divide by zero polynomial")
+    if (int32(divisor.data[divisorDegree]) & 255) != 1:
+        return Err[bool]("v3 bio rs: divisor must be monic")
+    outQuotient = V3BioMessage16()
+    outRemainder = dividend
+    var remDegree = v3BioGf256PolyDegree(outRemainder, dividendLen)
+    while remDegree >= divisorDegree:
+        let shift = remDegree - divisorDegree
+        if shift < 0 || shift >= v3BioRsMessageBytes:
+            return Err[bool]("v3 bio rs: quotient overflow")
+        let scale = int32(outRemainder.data[remDegree]) & 255
+        outQuotient.data[shift] = uint8(scale)
+        for i in 0..divisorDegree:
+            let pos = shift + i
+            let rowValue = int32(outRemainder.data[pos]) & 255
+            let divValue = int32(divisor.data[i]) & 255
+            outRemainder.data[pos] = uint8(rowValue ^ gf256.gf256Mul(scale, divValue))
+        remDegree = v3BioGf256PolyDegree(outRemainder, dividendLen)
+    return Ok[bool](true)
+
+fn v3BioGf256CountMismatchedBytes(left: layout.FixedBytes32, right: layout.FixedBytes32): int32 =
+    var mismatches: int32
+    for i in 0..<v3BioRsCodeBytes:
+        if left.data[i] != right.data[i]:
+            mismatches = mismatches + 1
+    return mismatches
+
+fn v3BioRsEncode16x32(message: V3BioMessage16): layout.FixedBytes32 =
+    var out: layout.FixedBytes32
+    for i in 0..<v3BioRsCodeBytes:
+        out.data[i] = uint8(v3BioMessage16PolyEval(message, i + 1))
+    return out
+
+fn v3BioRsBuildBerlekampWelchSystem(received: layout.FixedBytes32,
+                                    errorCount: int32,
+                                    outRows: var V3BioGf256Matrix32,
+                                    outRhs: var layout.FixedBytes32,
+                                    outSize: var int32) =
+    v3BioGf256Matrix32Clear(outRows)
+    outRhs = layout.FixedBytes32()
+    if errorCount < 0 || errorCount > 8:
+        outSize = 0
+        return
+    let qCount = 16 + errorCount
+    let unknownCount = qCount + errorCount
+    outSize = unknownCount
+    var row: int32
+    while row < 32:
+        let x = row + 1
+        let y = int32(received.data[row]) & 255
+        var xPow: int32 = 1
+        var j: int32
+        while j < qCount:
+            v3BioGf256MatrixSet(outRows, row, j, xPow)
+            xPow = gf256.gf256Mul(xPow, x)
+            j = j + 1
+        xPow = 1
+        j = 0
+        while j < errorCount:
+            v3BioGf256MatrixSet(outRows, row, qCount + j, gf256.gf256Mul(y, xPow))
+            xPow = gf256.gf256Mul(xPow, x)
+            j = j + 1
+        outRhs.data[row] = uint8(gf256.gf256Mul(y, xPow))
+        row = row + 1
+
+fn v3BioRsTryDecode32x16(received: layout.FixedBytes32, errorCount: int32): Result[V3BioMessage16] =
+    var rows: V3BioGf256Matrix32
+    var rhs: layout.FixedBytes32
+    var size: int32
+    v3BioRsBuildBerlekampWelchSystem(received, errorCount, rows, rhs, size)
+    if size <= 0:
+        return Err[V3BioMessage16]("v3 bio rs: invalid error count")
+    let solveRes = v3BioGf256SolveLinear(rows, rhs, size)
+    if IsErr(solveRes):
+        return Err[V3BioMessage16](Error(solveRes))
+    let solution = Value(solveRes)
+    let qCount = 16 + errorCount
+    var qCoeffs: layout.FixedBytes32
+    var i: int32
+    while i < qCount:
+        qCoeffs.data[i] = solution.data[i]
+        i = i + 1
+    var eCoeffs: layout.FixedBytes32
+    i = 0
+    while i < errorCount:
+        eCoeffs.data[i] = solution.data[qCount + i]
+        i = i + 1
+    eCoeffs.data[errorCount] = uint8(1)
+    var quotient: V3BioMessage16
+    var remainder: layout.FixedBytes32
+    let divRes = v3BioGf256PolyDivideMonic(qCoeffs,
+                                           qCount,
+                                           eCoeffs,
+                                           errorCount + 1,
+                                           quotient,
+                                           remainder)
+    if IsErr(divRes):
+        return Err[V3BioMessage16](Error(divRes))
+    if v3BioGf256PolyDegree(remainder, qCount) >= 0:
+        return Err[V3BioMessage16]("v3 bio rs: polynomial division remainder")
+    let decodedCodeword = v3BioRsEncode16x32(quotient)
+    let mismatches = v3BioGf256CountMismatchedBytes(decodedCodeword, received)
+    if mismatches > errorCount:
+        return Err[V3BioMessage16]("v3 bio rs: too many symbol errors")
+    return Ok[V3BioMessage16](quotient)
+
+fn v3BioRsDecode32x16(received: layout.FixedBytes32): Result[V3BioMessage16] =
+    var errorCount: int32
+    while errorCount <= 8:
+        let decodeRes = v3BioRsTryDecode32x16(received, errorCount)
+        if IsOk(decodeRes):
+            return Ok[V3BioMessage16](Value(decodeRes))
+        errorCount = errorCount + 1
+    return Err[V3BioMessage16]("v3 bio rs: decode failed")

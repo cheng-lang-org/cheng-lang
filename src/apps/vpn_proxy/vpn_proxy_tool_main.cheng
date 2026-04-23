@@ -1,0 +1,138 @@
+import std/cmdline as cmdline
+import std/os
+import std/strutils as strutil
+import cheng/core/tooling/bootstrap_contracts as contracts
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as v3path
+
+fn v3VpnProxyToolPrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn v3VpnProxyToolPrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn v3VpnProxyToolUsage() =
+    v3VpnProxyToolPrintLine("usage: cheng vpn-proxy <local|exit|status> --config:<path>")
+    v3VpnProxyToolPrintLine("local flags: --ready-path:<path> --accept-count:<n> --probe-interval-ms:<n> --probe-timeout-ms:<n>")
+    v3VpnProxyToolPrintLine("exit flags: --ready-path:<path> --accept-count:<n>")
+    v3VpnProxyToolPrintLine("status flags: --probe-timeout-ms:<n>")
+
+fn v3VpnProxyToolRoot(): str =
+    let envRoot: str = os.GetEnv("CHENG_ROOT")
+    if len(envRoot) > 0:
+        return envRoot
+    return os.GetCurrentDir()
+
+fn v3VpnProxyToolCollectArgsFrom(startIndex: int32,
+                                 count: int32): str[] =
+    var out: str[]
+    if startIndex > count:
+        return out
+    for i in startIndex..count:
+        let arg: str = cmdline.ParamStr(i)
+        if len(arg) > 0:
+            add(out, arg)
+    return out
+
+fn v3VpnProxyToolHostTarget(): str =
+    let detected: str = contracts.v3BootstrapDetectHostTarget()
+    if len(detected) > 0:
+        return detected
+    return contracts.v3BootstrapDefaultTarget()
+
+fn v3VpnProxyToolCompiler(rootDir: str): str =
+    let envCompilerRaw: str = os.GetEnvDefault("CHENG_VPN_PROXY_COMPILER", "")
+    let envCompiler: str = strutil.Strip(envCompilerRaw)
+    if len(envCompiler) > 0:
+        return v3path.V3PathAbsolute(rootDir, envCompiler)
+    let backendDriver: str = v3path.V3PathAbsolute(rootDir, "artifacts/backend_driver/cheng")
+    if v3path.V3FileExistsNonEmpty(rootDir, backendDriver):
+        return backendDriver
+    let stage3Path: str = v3path.V3PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage3")
+    if v3path.V3FileExistsNonEmpty(rootDir, stage3Path):
+        return stage3Path
+    return ""
+
+fn v3VpnProxyToolRunFailed(context: str,
+                           run: hostops.V3LoggedRun): bool =
+    if run.exitCode == 0:
+        return false
+    v3VpnProxyToolPrintErr(context + " rc=" + intToStr(run.exitCode) + " log=" + run.logPath)
+    let outputText: str = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        v3VpnProxyToolPrintErr(outputText)
+    return true
+
+fn v3VpnProxyToolRunRuntime(rootDir: str,
+                            args: str[]): int32 =
+    let compilerPath: str = v3VpnProxyToolCompiler(rootDir)
+    if len(compilerPath) <= 0:
+        v3VpnProxyToolPrintErr("vpn proxy: missing compiler path")
+        return 1
+    let outDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/backend_driver_tools/vpn_proxy_runtime_tool")
+    if !v3path.V3MkdirP(rootDir, outDir):
+        v3VpnProxyToolPrintErr("vpn proxy: failed to create runtime tool dir")
+        return 1
+    let outBin: str = os.JoinPath(outDir, "vpn_proxy_runtime_tool")
+    let reportPath: str = os.JoinPath(outDir, "vpn_proxy_runtime_tool.report.txt")
+    let compileLogPath: str = os.JoinPath(outDir, "vpn_proxy_runtime_tool.compile.log")
+    let runLogPath: str = os.JoinPath(outDir, "vpn_proxy_runtime_tool.run.log")
+    let sourcePath: str = v3path.V3PathAbsolute(rootDir, "src/apps/vpn_proxy/vpn_proxy_runtime_tool_main.cheng")
+    let packageRoot: str = rootDir
+    let compileArgs: str[] = [
+        "system-link-exec",
+        "--root:" + packageRoot,
+        "--in:" + sourcePath,
+        "--emit:exe",
+        "--target:" + v3VpnProxyToolHostTarget(),
+        "--out:" + outBin,
+        "--report-out:" + reportPath
+    ]
+    let compileRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                                  "vpn_proxy_runtime_tool_compile",
+                                                                  compilerPath,
+                                                                  compileArgs,
+                                                                  [],
+                                                                  rootDir,
+                                                                  300,
+                                                                  compileLogPath)
+    if v3VpnProxyToolRunFailed("vpn proxy: runtime tool compile", compileRun):
+        return compileRun.exitCode
+    if !v3path.V3FileExistsNonEmpty(rootDir, outBin):
+        v3VpnProxyToolPrintErr("vpn proxy: runtime tool output missing: " + outBin)
+        return 1
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                           "vpn_proxy_runtime_tool_run",
+                                                           outBin,
+                                                           args,
+                                                           [],
+                                                           rootDir,
+                                                           0,
+                                                           runLogPath)
+    let outputText: str = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        if run.exitCode == 0:
+            v3VpnProxyToolPrintLine(outputText)
+        else:
+            v3VpnProxyToolPrintErr(outputText)
+    return run.exitCode
+
+fn main(argc: int32, argv: str*): int32 =
+    argc
+    argv
+    cmdline.__cheng_captureCmdLine(argc, argv)
+    let rootDir: str = v3VpnProxyToolRoot()
+    let count: int32 = cmdline.ParamCount()
+    let args: str[] = v3VpnProxyToolCollectArgsFrom(1, count)
+    if args.len <= 0:
+        v3VpnProxyToolUsage()
+        return 1
+    let cmd: str = args[0]
+    if cmd == "help" || cmd == "--help" || cmd == "-h":
+        v3VpnProxyToolUsage()
+        return 0
+    if cmd == "local" || cmd == "exit" || cmd == "status":
+        return v3VpnProxyToolRunRuntime(rootDir, args)
+    v3VpnProxyToolPrintErr("vpn proxy: unknown subcommand: " + cmd)
+    v3VpnProxyToolUsage()
+    return 1

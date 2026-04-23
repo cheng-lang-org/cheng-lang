@@ -1,0 +1,164 @@
+import std/system
+import std/result
+import std/rawbytes
+import std/crypto/rand
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/fixed256
+import cheng/apps/bio/bio_same_person as bio
+
+fn bioSmokeFeature(seed: int32): layout.FixedBytes32 =
+    let raw: Bytes = bytesAlloc(32)
+    for i in 0..<32:
+        bytesSet(raw, i, ((seed * 29) + (i * 17) + 11) & 255)
+    let res = layout.fixedBytes32FromBytes(raw)
+    assert(IsOk(res), "v3 bio smoke: feature build")
+    return Value(res)
+
+fn bioSmokeChallenge(seed: int32): layout.FixedBytes32 =
+    let raw: Bytes = bytesAlloc(32)
+    for i in 0..<32:
+        bytesSet(raw, i, ((seed * 13) + (i * 9) + 7) & 255)
+    let res = layout.fixedBytes32FromBytes(raw)
+    assert(IsOk(res), "v3 bio smoke: challenge build")
+    return Value(res)
+
+fn bioSmokeCorrupt(feature: layout.FixedBytes32, positions: int32[]): layout.FixedBytes32 =
+    var raw: Bytes = layout.fixedBytes32ToBytes(feature)
+    for i in 0..<positions.len:
+        let pos = positions[i]
+        bytesSet(raw, pos, bytesGet(raw, pos) ^ ((0x5a + i) & 255))
+    let res = layout.fixedBytes32FromBytes(raw)
+    assert(IsOk(res), "v3 bio smoke: corrupt fixed32")
+    return Value(res)
+
+fn bioSmokeRejected(res: Result[bool]): bool =
+    if IsErr(res):
+        return true
+    return !Value(res)
+
+fn bioSmokeCorrupt65(value: layout.FixedBytes65, positions: int32[]): layout.FixedBytes65 =
+    var raw: Bytes = layout.fixedBytes65ToBytes(value)
+    for i in 0..<positions.len:
+        let pos = positions[i]
+        bytesSet(raw, pos, bytesGet(raw, pos) ^ ((0x33 + i) & 255))
+    let res = layout.fixedBytes65FromBytes(raw)
+    assert(IsOk(res), "v3 bio smoke: corrupt fixed65")
+    return Value(res)
+
+fn main(): int32 =
+    assert(rand.setRandomSeed(bytesFromString("v3.bio.same.seed.a")),
+           "v3 bio smoke: seed a")
+    let feature = bioSmokeFeature(5)
+    let challenge = bioSmokeChallenge(3)
+    let enrollRes = bio.v3BioEnroll(feature)
+    assert(IsOk(enrollRes), "v3 bio smoke: enroll")
+    let record = Value(enrollRes)
+
+    let exactProofRes = bio.v3BioProve(feature, record, challenge)
+    assert(IsOk(exactProofRes), "v3 bio smoke: exact prove")
+    let exactVerifyRes = bio.v3BioVerify(record, challenge, Value(exactProofRes))
+    assert(IsOk(exactVerifyRes) && Value(exactVerifyRes),
+           "v3 bio smoke: exact verify")
+
+    let lightFeature = bioSmokeCorrupt(feature, [1, 9, 22])
+    let lightProofRes = bio.v3BioProve(lightFeature, record, challenge)
+    assert(IsOk(lightProofRes), "v3 bio smoke: light noise prove")
+    let lightVerifyRes = bio.v3BioVerify(record, challenge, Value(lightProofRes))
+    assert(IsOk(lightVerifyRes) && Value(lightVerifyRes),
+           "v3 bio smoke: light noise verify")
+
+    let maxFeature = bioSmokeCorrupt(feature, [0, 3, 7, 11, 16, 21, 25, 30])
+    let maxProofRes = bio.v3BioProve(maxFeature, record, challenge)
+    assert(IsOk(maxProofRes), "v3 bio smoke: max noise prove")
+    let maxVerifyRes = bio.v3BioVerify(record, challenge, Value(maxProofRes))
+    assert(IsOk(maxVerifyRes) && Value(maxVerifyRes),
+           "v3 bio smoke: max noise verify")
+
+    let tooNoisyFeature = bioSmokeCorrupt(feature, [0, 2, 4, 6, 8, 10, 12, 14, 16])
+    let tooNoisyProofRes = bio.v3BioProve(tooNoisyFeature, record, challenge)
+    assert(IsErr(tooNoisyProofRes), "v3 bio smoke: too noisy reject")
+
+    let wrongChallenge = bioSmokeChallenge(7)
+    let wrongChallengeVerifyRes = bio.v3BioVerify(record, wrongChallenge, Value(exactProofRes))
+    assert(bioSmokeRejected(wrongChallengeVerifyRes),
+           "v3 bio smoke: wrong challenge reject")
+
+    let wrongFeature = bioSmokeFeature(11)
+    let wrongFeatureProofRes = bio.v3BioProve(wrongFeature, record, challenge)
+    assert(IsErr(wrongFeatureProofRes), "v3 bio smoke: wrong record reject")
+
+    let root1Res = bio.v3BioRecoverRoot(feature, record.helper)
+    let root2Res = bio.v3BioRecoverRoot(feature, record.helper)
+    assert(IsOk(root1Res) && IsOk(root2Res), "v3 bio smoke: recover root")
+    assert(layout.fixedBytes32Equal(Value(root1Res), Value(root2Res)),
+           "v3 bio smoke: root stable")
+    let scalar1Res = bio.v3BioScalarFromRootSecret(Value(root1Res))
+    let scalar2Res = bio.v3BioScalarFromRootSecret(Value(root2Res))
+    assert(IsOk(scalar1Res) && IsOk(scalar2Res), "v3 bio smoke: scalar derive")
+    let pub1Res = bio.v3BioPublicKeyFromScalar(Value(scalar1Res))
+    let pub2Res = bio.v3BioPublicKeyFromScalar(Value(scalar2Res))
+    assert(IsOk(pub1Res) && IsOk(pub2Res), "v3 bio smoke: pub derive")
+    assert(layout.fixedBytes65Equal(Value(pub1Res), Value(pub2Res)),
+           "v3 bio smoke: pub stable")
+    assert(layout.fixedBytes65Equal(Value(pub1Res), record.pubKey),
+           "v3 bio smoke: record pub stable")
+
+    assert(rand.setRandomSeed(bytesFromString("v3.bio.same.seed.b")),
+           "v3 bio smoke: seed b")
+    let enrollRes2 = bio.v3BioEnroll(feature)
+    assert(IsOk(enrollRes2), "v3 bio smoke: enroll second")
+    let record2 = Value(enrollRes2)
+    assert(!layout.fixedBytes32Equal(record.recordCid, record2.recordCid),
+           "v3 bio smoke: different enrollment record")
+
+    var tamperedA = Value(exactProofRes)
+    tamperedA.commitA = bioSmokeCorrupt65(tamperedA.commitA, [2, 19])
+    tamperedA.proofCid = bio.v3BioAssertionCid(tamperedA.recordCid,
+                                               tamperedA.challengeNonce,
+                                               tamperedA.commitA,
+                                               tamperedA.responseZ)
+    let tamperedAVerifyRes = bio.v3BioVerify(record, challenge, tamperedA)
+    assert(bioSmokeRejected(tamperedAVerifyRes),
+           "v3 bio smoke: tampered A reject")
+
+    var tamperedZ = Value(exactProofRes)
+    tamperedZ.responseZ = bioSmokeCorrupt(tamperedZ.responseZ, [4, 23])
+    tamperedZ.proofCid = bio.v3BioAssertionCid(tamperedZ.recordCid,
+                                               tamperedZ.challengeNonce,
+                                               tamperedZ.commitA,
+                                               tamperedZ.responseZ)
+    let tamperedZVerifyRes = bio.v3BioVerify(record, challenge, tamperedZ)
+    assert(bioSmokeRejected(tamperedZVerifyRes),
+           "v3 bio smoke: tampered z reject")
+
+    var tamperedRecordCid = Value(exactProofRes)
+    tamperedRecordCid.recordCid = bioSmokeCorrupt(tamperedRecordCid.recordCid, [0])
+    tamperedRecordCid.proofCid = bio.v3BioAssertionCid(tamperedRecordCid.recordCid,
+                                                       tamperedRecordCid.challengeNonce,
+                                                       tamperedRecordCid.commitA,
+                                                       tamperedRecordCid.responseZ)
+    let tamperedRecordVerifyRes = bio.v3BioVerify(record, challenge, tamperedRecordCid)
+    assert(bioSmokeRejected(tamperedRecordVerifyRes),
+           "v3 bio smoke: tampered record cid reject")
+
+    var tamperedProofCid = Value(exactProofRes)
+    tamperedProofCid.proofCid = bioSmokeCorrupt(tamperedProofCid.proofCid, [31])
+    let tamperedProofVerifyRes = bio.v3BioVerify(record, challenge, tamperedProofCid)
+    assert(bioSmokeRejected(tamperedProofVerifyRes),
+           "v3 bio smoke: tampered proof cid reject")
+
+    assert(rand.setRandomSeed(bytesFromString("v3.bio.same.seed.zero")),
+           "v3 bio smoke: seed zero")
+    let zeroFeature = layout.FixedBytes32()
+    let zeroChallenge = bioSmokeChallenge(17)
+    let zeroEnrollRes = bio.v3BioEnroll(zeroFeature)
+    assert(IsOk(zeroEnrollRes), "v3 bio smoke: zero enroll")
+    let zeroRecord = Value(zeroEnrollRes)
+    let zeroProofRes = bio.v3BioProve(zeroFeature, zeroRecord, zeroChallenge)
+    assert(IsOk(zeroProofRes), "v3 bio smoke: zero prove")
+    let zeroVerifyRes = bio.v3BioVerify(zeroRecord, zeroChallenge, Value(zeroProofRes))
+    assert(IsOk(zeroVerifyRes) && Value(zeroVerifyRes),
+           "v3 bio smoke: zero verify")
+
+    echo("v3 bio_same_person_smoke ok")
+    return 0

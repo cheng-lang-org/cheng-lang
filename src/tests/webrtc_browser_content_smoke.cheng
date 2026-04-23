@@ -1,0 +1,152 @@
+import std/system
+import std/rawbytes
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/chain/dag_mempool as dag
+import cheng/chain/erasure_swarm as swarm
+import cheng/chain/content_fetch as fetch
+import cheng/chain/content_runtime as runtime
+import cheng/chain/content_runtime_browser_webrtc as runtime_browser
+import cheng/overlay/contracts as overlay
+import cheng/libp2p/core/types
+import cheng/libp2p/protocols/webrtc_signal as signal
+import cheng/libp2p/transports/webrtc_transport
+import cheng/libp2p/host/host
+
+fn webrtcBrowserContentBytesEqual(left: Bytes, right: Bytes): bool =
+    if bytesLen(left) != bytesLen(right):
+        return false
+    for i in 0..<bytesLen(left):
+        if bytesGet(left, i) != bytesGet(right, i):
+            return false
+    return true
+
+fn main(): int32 =
+    webrtc_transport.v3Libp2pWebrtcTransportResetStats()
+    let shard = bytesFromString("browser-webrtc-shard")
+    let blob = shard
+    let summaryRes = dag.v3DagBlobSummaryFromBytes(blob, bytesLen(shard))
+    assert(IsOk(summaryRes), "v3 webrtc browser content: summary")
+    let summary = Value(summaryRes)
+    let paramsRes = swarm.v3ErasureEncodingParamsMake(swarm.v3ErasureLayoutRsSystematic, 1, 0, bytesLen(shard))
+    assert(IsOk(paramsRes), "v3 webrtc browser content: params")
+    let params = Value(paramsRes)
+    var shardPayloadCids: layout.FixedBytes32[]
+    shardPayloadCids = []
+    add(shardPayloadCids, swarm.v3ErasureShardPayloadCid(shard))
+    let manifestRes = swarm.v3ErasureShardManifestMake(summary.blobCid,
+                                                       summary.payloadLen,
+                                                       params,
+                                                       shardPayloadCids)
+    assert(IsOk(manifestRes), "v3 webrtc browser content: manifest")
+    let manifest = Value(manifestRes)
+    let requestRes = swarm.v3ErasureShardPullRequestMake(manifest, 0)
+    assert(IsOk(requestRes), "v3 webrtc browser content: request")
+    let request = Value(requestRes)
+
+    var serverRuntime = runtime.v3ContentRuntimeInit()
+    let storeManifestRes = runtime.v3ContentRuntimeStoreManifest(serverRuntime, manifest)
+    assert(IsOk(storeManifestRes), "v3 webrtc browser content: store manifest")
+    let storeBlobRes = runtime.v3ContentRuntimeStoreBlobPayload(serverRuntime, summary.blobCid, blob)
+    assert(IsOk(storeBlobRes), "v3 webrtc browser content: store blob")
+    let seedResponseRes = swarm.v3ErasureShardPullResponseMake(request, shard)
+    assert(IsOk(seedResponseRes), "v3 webrtc browser content: seed response")
+    let seedStoreRes = runtime.v3ContentRuntimeStoreShardResponse(serverRuntime, Value(seedResponseRes))
+    assert(IsOk(seedStoreRes), "v3 webrtc browser content: store shard")
+
+    var server = host.v3Libp2pHostInit("content.browser.server")
+    var client = host.v3Libp2pHostInit("content.browser.client")
+    var listenAddr: types.V3Libp2pMultiaddr
+    listenAddr.host = "203.0.113.143"
+    listenAddr.port = 9453
+    listenAddr.transport = types.v3Libp2pTransportWebrtc
+    listenAddr.networkDomain = types.v3Libp2pNetworkDomainBrowserWebrtc
+    listenAddr.visibility = types.v3Libp2pVisibilityPublic
+    let listenRes = host.v3Libp2pListen(server, listenAddr)
+    assert(listenRes.ok, "v3 webrtc browser content: listen")
+
+    host.v3Libp2pRegisterHandler(server, types.v3Libp2pProtocolContent)
+    host.v3Libp2pRegisterHandler(client, types.v3Libp2pProtocolContent)
+    host.v3Libp2pRegisterHandler(server, types.v3Libp2pProtocolWebrtcSignal)
+    host.v3Libp2pRegisterHandler(client, types.v3Libp2pProtocolWebrtcSignal)
+    let dialRes = host.v3Libp2pDial(client,
+                                    server.selfPeerId,
+                                    listenAddr,
+                                    overlay.v3OverlayRoleEdgeRelayStore)
+    assert(dialRes.ok, "v3 webrtc browser content: dial")
+
+    let manifestFetchReqRes = fetch.v3ContentFetchRequestManifest(manifest.manifestCid)
+    assert(IsOk(manifestFetchReqRes), "v3 webrtc browser content: manifest request")
+    let manifestFetchRequest = Value(manifestFetchReqRes)
+    let manifestFetchRes = runtime_browser.v3ContentRuntimeRequestFetch(client,
+                                                                        server,
+                                                                        server.selfPeerId,
+                                                                        serverRuntime,
+                                                                        manifestFetchRequest)
+    assert(IsOk(manifestFetchRes), "v3 webrtc browser content: manifest fetch")
+    var manifestPull = swarm.V3ErasureShardManifest()
+    let manifestPullRes = fetch.v3ContentFetchResponseToManifestFill(manifestPull,
+                                                                     manifestFetchRequest,
+                                                                     Value(manifestFetchRes))
+    assert(IsOk(manifestPullRes), "v3 webrtc browser content: manifest pull")
+    assert(layout.fixedBytes32Equal(manifestPull.manifestCid, manifest.manifestCid),
+        "v3 webrtc browser content: manifest cid")
+    assert(host.v3Libp2pWebrtcSignalEgressCount(client) == 5,
+        "v3 webrtc browser content: manifest signal egress")
+    assert(host.v3Libp2pWebrtcSignalIngressCount(server) == 5,
+        "v3 webrtc browser content: manifest signal ingress")
+    assert(webrtc_transport.v3Libp2pWebrtcBrowserDatachannelOpenCountNow() == 1,
+        "v3 webrtc browser content: manifest browser open")
+    assert(webrtc_transport.v3Libp2pWebrtcBrowserDatachannelRequestCountNow() == 1,
+        "v3 webrtc browser content: manifest browser count")
+    assert(webrtc_transport.v3Libp2pWebrtcNativeDatachannelRequestCountNow() == 0,
+        "v3 webrtc browser content: manifest native count")
+
+    let rangeReqRes = fetch.v3ContentFetchRequestRange(summary.blobCid, 0, 6)
+    assert(IsOk(rangeReqRes), "v3 webrtc browser content: range request")
+    let rangeFetchRes = runtime_browser.v3ContentRuntimeRequestFetch(client,
+                                                                     server,
+                                                                     server.selfPeerId,
+                                                                     serverRuntime,
+                                                                     Value(rangeReqRes))
+    assert(IsOk(rangeFetchRes), "v3 webrtc browser content: range fetch")
+    let rangeFetch = Value(rangeFetchRes)
+    assert(webrtcBrowserContentBytesEqual(rangeFetch.payload, bytesSlice(blob, 0, 6)),
+        "v3 webrtc browser content: range bytes")
+    assert(host.v3Libp2pWebrtcSignalEgressCount(client) == 5,
+        "v3 webrtc browser content: range signal reuse")
+    assert(webrtc_transport.v3Libp2pWebrtcBrowserDatachannelRequestCountNow() == 2,
+        "v3 webrtc browser content: range browser count")
+
+    let pullRes = runtime_browser.v3ContentRuntimeRequestShardPull(client,
+                                                                   server,
+                                                                   server.selfPeerId,
+                                                                   serverRuntime,
+                                                                   request)
+    assert(IsOk(pullRes), "v3 webrtc browser content: pull")
+    let response = Value(pullRes)
+    assert(layout.fixedBytes32Equal(response.shardCid, request.shardCid),
+        "v3 webrtc browser content: shard cid")
+    assert(webrtcBrowserContentBytesEqual(response.payload, shard),
+        "v3 webrtc browser content: shard payload")
+    assert(host.v3Libp2pWebrtcSignalIngressCount(server) == 5,
+        "v3 webrtc browser content: shard signal reuse")
+    assert(webrtc_transport.v3Libp2pWebrtcBrowserDatachannelRequestCountNow() == 3,
+        "v3 webrtc browser content: shard browser count")
+    assert(webrtc_transport.v3Libp2pWebrtcBrowserSessionActiveCountNow() == 1,
+        "v3 webrtc browser content: active session")
+
+    let rebuildRes = runtime.v3ContentRuntimeRebuildBlob(manifest, params, [response])
+    assert(IsOk(rebuildRes), "v3 webrtc browser content: rebuild")
+    assert(webrtcBrowserContentBytesEqual(Value(rebuildRes), blob),
+        "v3 webrtc browser content: rebuild bytes")
+
+    let firstSignalRes = signal.v3Libp2pWebrtcSignalDecode(client.webrtcSignalEgressPayloads[0])
+    let lastSignalRes = signal.v3Libp2pWebrtcSignalDecode(client.webrtcSignalEgressPayloads[4])
+    assert(IsOk(firstSignalRes), "v3 webrtc browser content: first signal")
+    assert(IsOk(lastSignalRes), "v3 webrtc browser content: last signal")
+    assert(layout.fixedBytes32Equal(Value(firstSignalRes).sessionId, Value(lastSignalRes).sessionId),
+        "v3 webrtc browser content: stable session id")
+
+    echo("v3 webrtc_browser_content_smoke ok")
+    return 0

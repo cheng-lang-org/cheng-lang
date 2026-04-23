@@ -1,0 +1,1448 @@
+import std/result
+import std/rawbytes
+import std/strings
+import cheng/std/bytes_layout as layout
+import cheng/libp2p/core/types
+import cheng/libp2p/core/peer_id
+import cheng/libp2p/identity/did
+import cheng/DiLoCo/core/diloco as core
+
+const
+    v3DiLoCoWireVersion: int32 = 1
+    v3DiLoCoWireMagic: int32 = 0x444c4331
+
+    v3DiLoCoMessageOpenJob: int32 = 1
+    v3DiLoCoMessageJoinCohort: int32 = 2
+    v3DiLoCoMessageFetchLease: int32 = 3
+    v3DiLoCoMessageReportInnerStepDone: int32 = 4
+    v3DiLoCoMessageSubmitOuterDelta: int32 = 5
+    v3DiLoCoMessageFetchStepStatus: int32 = 6
+    v3DiLoCoMessagePublishMergeCommit: int32 = 7
+    v3DiLoCoMessageFetchGlobalVersion: int32 = 8
+    v3DiLoCoMessageFetchLineage: int32 = 9
+
+type
+    V3DiLoCoEnvelope =
+        version: int32 = 1
+        kind: int32
+        ok: bool = true
+        errorText: str
+        body: Bytes
+
+    V3DiLoCoOpenJobRequest =
+        jobBundleCid: layout.FixedBytes32
+        requestedWorkerCount: int32
+        innerStepBudget: int32
+        outerStepTimeoutSeconds: int32
+        initialModelRef: core.V3DiLoCoArtifactRef
+        initialOptimizerRef: core.V3DiLoCoArtifactRef
+
+    V3DiLoCoOpenJobResponse =
+        job: core.V3DiLoCoJob
+        version: core.V3DiLoCoGlobalVersion
+
+    V3DiLoCoJoinCohortRequest =
+        jobBundleCid: layout.FixedBytes32
+        peerId: types.V3Libp2pPeerId
+
+    V3DiLoCoJoinCohortResponse =
+        cohort: core.V3DiLoCoCohort
+
+    V3DiLoCoFetchLeaseRequest =
+        jobBundleCid: layout.FixedBytes32
+        peerId: types.V3Libp2pPeerId
+
+    V3DiLoCoFetchLeaseResponse =
+        lease: core.V3DiLoCoLease
+
+    V3DiLoCoReportInnerStepDoneRequest =
+        jobBundleCid: layout.FixedBytes32
+        peerId: types.V3Libp2pPeerId
+
+    V3DiLoCoReportInnerStepDoneResponse =
+        barrier: core.V3DiLoCoBarrier
+
+    V3DiLoCoSubmitOuterDeltaRequest =
+        jobBundleCid: layout.FixedBytes32
+        baseVersionCid: layout.FixedBytes32
+        outerStep: int32
+        publisherPeerId: types.V3Libp2pPeerId
+        modelDeltaRef: core.V3DiLoCoArtifactRef
+        optimizerDeltaRef: core.V3DiLoCoArtifactRef
+        sampleCount: int32
+        tokenCount: int32
+        innerStepCount: int32
+        weightNumerator: int32
+        weightDenominator: int32
+
+    V3DiLoCoSubmitOuterDeltaResponse =
+        delta: core.V3DiLoCoOuterDelta
+
+    V3DiLoCoFetchStepStatusRequest =
+        jobBundleCid: layout.FixedBytes32
+
+    V3DiLoCoFetchStepStatusResponse =
+        status: core.V3DiLoCoStepStatus
+
+    V3DiLoCoPublishMergeCommitRequest =
+        jobBundleCid: layout.FixedBytes32
+        publisherPeerId: types.V3Libp2pPeerId
+        mergedModelRef: core.V3DiLoCoArtifactRef
+        mergedOptimizerRef: core.V3DiLoCoArtifactRef
+
+    V3DiLoCoPublishMergeCommitResponse =
+        commit: core.V3DiLoCoMergeCommit
+        version: core.V3DiLoCoGlobalVersion
+
+    V3DiLoCoFetchGlobalVersionRequest =
+        jobBundleCid: layout.FixedBytes32
+
+    V3DiLoCoFetchGlobalVersionResponse =
+        version: core.V3DiLoCoGlobalVersion
+
+    V3DiLoCoFetchLineageRequest =
+        jobBundleCid: layout.FixedBytes32
+
+    V3DiLoCoFetchLineageResponse =
+        versions: core.V3DiLoCoGlobalVersion[]
+
+fn v3DiLoCoWireKnownKind(kind: int32): bool =
+    return kind == v3DiLoCoMessageOpenJob ||
+           kind == v3DiLoCoMessageJoinCohort ||
+           kind == v3DiLoCoMessageFetchLease ||
+           kind == v3DiLoCoMessageReportInnerStepDone ||
+           kind == v3DiLoCoMessageSubmitOuterDelta ||
+           kind == v3DiLoCoMessageFetchStepStatus ||
+           kind == v3DiLoCoMessagePublishMergeCommit ||
+           kind == v3DiLoCoMessageFetchGlobalVersion ||
+           kind == v3DiLoCoMessageFetchLineage
+
+fn v3DiLoCoWireAppendU32(buf: var layout.ByteBuf, value: int32) =
+    layout.ByteBufAppendByte(buf, (value >> 24) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 16) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 8) & 255)
+    layout.ByteBufAppendByte(buf, value & 255)
+
+fn v3DiLoCoWireAppendI64(buf: var layout.ByteBuf, value: int64) =
+    v3DiLoCoWireAppendU32(buf, int32((value >> 32) & int64(0xffffffff)))
+    v3DiLoCoWireAppendU32(buf, int32(value & int64(0xffffffff)))
+
+fn v3DiLoCoWireReadU32(span: layout.ByteSpan, offset: int32): Result[int32] =
+    if offset < 0 || offset + 4 > layout.ByteSpanLen(span):
+        return Err[int32]("v3 diloco wire: short u32")
+    let b0 = layout.ByteSpanAt(span, offset)
+    let b1 = layout.ByteSpanAt(span, offset + 1)
+    let b2 = layout.ByteSpanAt(span, offset + 2)
+    let b3 = layout.ByteSpanAt(span, offset + 3)
+    return Ok[int32]((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+
+fn v3DiLoCoWireReadI64(span: layout.ByteSpan, offset: int32): Result[int64] =
+    let hiRes = v3DiLoCoWireReadU32(span, offset)
+    if IsErr(hiRes):
+        return Err[int64](Error(hiRes))
+    let loRes = v3DiLoCoWireReadU32(span, offset + 4)
+    if IsErr(loRes):
+        return Err[int64](Error(loRes))
+    return Ok[int64]((int64(Value(hiRes)) << 32) | (int64(Value(loRes)) & int64(0xffffffff)))
+
+fn v3DiLoCoWireField(prefix: str, name: str): str =
+    if len(prefix) <= 0:
+        return name
+    return prefix + "_" + name
+
+fn v3DiLoCoWireBoolText(value: bool): str =
+    if value:
+        return "1"
+    return "0"
+
+fn v3DiLoCoWireParseInt64(text: str): Result[int64] =
+    if len(text) <= 0:
+        return Err[int64]("v3 diloco wire: empty integer")
+    var negative = false
+    var start = 0
+    if text[0] == '-':
+        negative = true
+        start = 1
+    if start >= len(text):
+        return Err[int64]("v3 diloco wire: invalid integer")
+    var value: int64 = int64(0)
+    for i in start..<len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return Err[int64]("v3 diloco wire: invalid integer")
+        value = value * int64(10) + int64(ch - '0')
+    if negative:
+        value = -value
+    return Ok[int64](value)
+
+fn v3DiLoCoWireFindValue(wire: str, key: str): Result[str] =
+    let prefix = key + "="
+    var lineStart = 0
+    while lineStart < len(wire):
+        var lineEnd = lineStart
+        while lineEnd < len(wire) && wire[lineEnd] != '\n':
+            lineEnd = lineEnd + 1
+        if lineEnd - lineStart >= len(prefix):
+            var matched = true
+            for i in 0..<len(prefix):
+                if wire[lineStart + i] != prefix[i]:
+                    matched = false
+                    break
+            if matched:
+                return Ok[str](strings.SliceBytes(wire,
+                                                  lineStart + len(prefix),
+                                                  lineEnd - lineStart - len(prefix)))
+        lineStart = lineEnd + 1
+    return Err[str]("v3 diloco wire: missing key " + key)
+
+fn v3DiLoCoWireRequireInt32(wire: str, key: str): Result[int32] =
+    let valueRes = v3DiLoCoWireFindValue(wire, key)
+    if IsErr(valueRes):
+        return Err[int32](Error(valueRes))
+    let parsedRes = v3DiLoCoWireParseInt64(Value(valueRes))
+    if IsErr(parsedRes):
+        return Err[int32](Error(parsedRes))
+    return Ok[int32](int32(Value(parsedRes)))
+
+fn v3DiLoCoWireRequireI64(wire: str, key: str): Result[int64] =
+    let valueRes = v3DiLoCoWireFindValue(wire, key)
+    if IsErr(valueRes):
+        return Err[int64](Error(valueRes))
+    return v3DiLoCoWireParseInt64(Value(valueRes))
+
+fn v3DiLoCoWireRequireBool(wire: str, key: str): Result[bool] =
+    let valueRes = v3DiLoCoWireFindValue(wire, key)
+    if IsErr(valueRes):
+        return Err[bool](Error(valueRes))
+    if Value(valueRes) == "1":
+        return Ok[bool](true)
+    if Value(valueRes) == "0":
+        return Ok[bool](false)
+    return Err[bool]("v3 diloco wire: invalid bool")
+
+fn v3DiLoCoWireRequireFixed32(wire: str, key: str): Result[layout.FixedBytes32] =
+    let valueRes = v3DiLoCoWireFindValue(wire, key)
+    if IsErr(valueRes):
+        return Err[layout.FixedBytes32](Error(valueRes))
+    return layout.FixedBytes32FromHex(Value(valueRes))
+
+fn v3DiLoCoWireRequirePeerId(wire: str, key: str): Result[types.V3Libp2pPeerId] =
+    let valueRes = v3DiLoCoWireFindValue(wire, key)
+    if IsErr(valueRes):
+        return Err[types.V3Libp2pPeerId](Error(valueRes))
+    var out: types.V3Libp2pPeerId
+    let fillRes = peer_id.V3Libp2pPeerIdFillFromText(out, Value(valueRes))
+    if IsErr(fillRes):
+        return Err[types.V3Libp2pPeerId](Error(fillRes))
+    return Ok[types.V3Libp2pPeerId](out)
+
+fn v3DiLoCoEnvelopeEncode(envelope: V3DiLoCoEnvelope): Bytes =
+    let errorBytes = bytesFromString(envelope.errorText)
+    let bodyBytes = envelope.body
+    var buf = layout.ByteBufInit(32 + bytesLen(errorBytes) + bytesLen(bodyBytes))
+    v3DiLoCoWireAppendU32(buf, v3DiLoCoWireMagic)
+    v3DiLoCoWireAppendU32(buf, envelope.version)
+    v3DiLoCoWireAppendU32(buf, envelope.kind)
+    v3DiLoCoWireAppendU32(buf, int32(envelope.ok))
+    v3DiLoCoWireAppendU32(buf, bytesLen(errorBytes))
+    v3DiLoCoWireAppendU32(buf, bytesLen(bodyBytes))
+    layout.ByteBufAppendBytes(buf, errorBytes)
+    layout.ByteBufAppendBytes(buf, bodyBytes)
+    return layout.ByteBufToBytes(buf)
+
+fn v3DiLoCoEnvelopeDecodeFill(out: var V3DiLoCoEnvelope, payload: Bytes): Result[bool] =
+    var span = layout.ByteSpanFromBytes(payload)
+    let magicRes = v3DiLoCoWireReadU32(span, 0)
+    if IsErr(magicRes):
+        return Err[bool](Error(magicRes))
+    if Value(magicRes) != v3DiLoCoWireMagic:
+        return Err[bool]("v3 diloco wire: envelope magic")
+    let versionRes = v3DiLoCoWireReadU32(span, 4)
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    if Value(versionRes) != v3DiLoCoWireVersion:
+        return Err[bool]("v3 diloco wire: envelope version")
+    let kindRes = v3DiLoCoWireReadU32(span, 8)
+    if IsErr(kindRes):
+        return Err[bool](Error(kindRes))
+    if !v3DiLoCoWireKnownKind(Value(kindRes)):
+        return Err[bool]("v3 diloco wire: envelope kind")
+    let okRes = v3DiLoCoWireReadU32(span, 12)
+    if IsErr(okRes):
+        return Err[bool](Error(okRes))
+    let errorLenRes = v3DiLoCoWireReadU32(span, 16)
+    if IsErr(errorLenRes):
+        return Err[bool](Error(errorLenRes))
+    let bodyLenRes = v3DiLoCoWireReadU32(span, 20)
+    if IsErr(bodyLenRes):
+        return Err[bool](Error(bodyLenRes))
+    let errorLen = Value(errorLenRes)
+    let bodyLen = Value(bodyLenRes)
+    if errorLen < 0 || bodyLen < 0:
+        return Err[bool]("v3 diloco wire: envelope lengths")
+    let total = 24 + errorLen + bodyLen
+    if total != bytesLen(payload):
+        return Err[bool]("v3 diloco wire: envelope shape")
+    out = V3DiLoCoEnvelope()
+    out.version = Value(versionRes)
+    out.kind = Value(kindRes)
+    out.ok = Value(okRes) != 0
+    out.errorText = bytesToString(layout.ByteSpanToBytes(layout.ByteSpanSlice(span, 24, errorLen)))
+    out.body = layout.ByteSpanToBytes(layout.ByteSpanSlice(span, 24 + errorLen, bodyLen))
+    return Ok[bool](true)
+
+fn v3DiLoCoWireEncodeBodyEnvelope(kind: int32, bodyText: str): Bytes =
+    var envelope = V3DiLoCoEnvelope()
+    envelope.kind = kind
+    envelope.ok = true
+    envelope.body = bytesFromString(bodyText)
+    return v3DiLoCoEnvelopeEncode(envelope)
+
+fn v3DiLoCoWireEncodeErrorEnvelope(kind: int32, errorText: str): Bytes =
+    var envelope = V3DiLoCoEnvelope()
+    envelope.kind = kind
+    envelope.ok = false
+    envelope.errorText = errorText
+    return v3DiLoCoEnvelopeEncode(envelope)
+
+fn v3DiLoCoWireDecodeBodyText(payload: Bytes,
+                              kind: int32,
+                              out: var str): Result[bool] =
+    var envelope = V3DiLoCoEnvelope()
+    let decodeRes = v3DiLoCoEnvelopeDecodeFill(envelope, payload)
+    if IsErr(decodeRes):
+        return Err[bool](Error(decodeRes))
+    if envelope.kind != kind:
+        return Err[bool]("v3 diloco wire: unexpected kind")
+    if !envelope.ok:
+        return Err[bool](envelope.errorText)
+    out = bytesToString(envelope.body)
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendArtifactRef(out: str,
+                                 prefix: str,
+                                 ref: core.V3DiLoCoArtifactRef): str =
+    var next = out
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "stub_cid"), layout.FixedBytes32Hex(ref.stubCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "blob_summary_cid"), layout.FixedBytes32Hex(ref.blobSummaryCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "manifest_cid"), layout.FixedBytes32Hex(ref.manifestCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "blob_cid"), layout.FixedBytes32Hex(ref.blobCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "payload_len"), intToStr(ref.payloadLen))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "params_cid"), layout.FixedBytes32Hex(ref.paramsCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "layout_kind"), intToStr(ref.layoutKind))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "data_shard_count"), intToStr(ref.dataShardCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "parity_shard_count"), intToStr(ref.parityShardCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "shard_payload_bytes"), intToStr(ref.shardPayloadBytes))
+    return next
+
+fn v3DiLoCoWireParseArtifactRefFill(out: var core.V3DiLoCoArtifactRef,
+                                    wire: str,
+                                    prefix: str): Result[bool] =
+    out = core.V3DiLoCoArtifactRef()
+    let stubCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "stub_cid"))
+    if IsErr(stubCidRes):
+        return Err[bool](Error(stubCidRes))
+    let blobSummaryCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "blob_summary_cid"))
+    if IsErr(blobSummaryCidRes):
+        return Err[bool](Error(blobSummaryCidRes))
+    let manifestCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "manifest_cid"))
+    if IsErr(manifestCidRes):
+        return Err[bool](Error(manifestCidRes))
+    let blobCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "blob_cid"))
+    if IsErr(blobCidRes):
+        return Err[bool](Error(blobCidRes))
+    let payloadLenRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "payload_len"))
+    if IsErr(payloadLenRes):
+        return Err[bool](Error(payloadLenRes))
+    let paramsCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "params_cid"))
+    if IsErr(paramsCidRes):
+        return Err[bool](Error(paramsCidRes))
+    let layoutKindRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "layout_kind"))
+    if IsErr(layoutKindRes):
+        return Err[bool](Error(layoutKindRes))
+    let dataShardCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "data_shard_count"))
+    if IsErr(dataShardCountRes):
+        return Err[bool](Error(dataShardCountRes))
+    let parityShardCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "parity_shard_count"))
+    if IsErr(parityShardCountRes):
+        return Err[bool](Error(parityShardCountRes))
+    let shardPayloadBytesRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "shard_payload_bytes"))
+    if IsErr(shardPayloadBytesRes):
+        return Err[bool](Error(shardPayloadBytesRes))
+    out.stubCid = Value(stubCidRes)
+    out.blobSummaryCid = Value(blobSummaryCidRes)
+    out.manifestCid = Value(manifestCidRes)
+    out.blobCid = Value(blobCidRes)
+    out.payloadLen = Value(payloadLenRes)
+    out.paramsCid = Value(paramsCidRes)
+    out.layoutKind = Value(layoutKindRes)
+    out.dataShardCount = Value(dataShardCountRes)
+    out.parityShardCount = Value(parityShardCountRes)
+    out.shardPayloadBytes = Value(shardPayloadBytesRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendPeerIdArray(out: str,
+                                 prefix: str,
+                                 peers: types.V3Libp2pPeerId[]): str =
+    var next = did.V3DidStoreAppendLine(out, v3DiLoCoWireField(prefix, "count"), intToStr(peers.len))
+    for i in 0..<peers.len:
+        next = did.V3DidStoreAppendLine(next,
+                                        v3DiLoCoWireField(prefix, intToStr(i)),
+                                        peer_id.V3Libp2pPeerIdText(peers[i]))
+    return next
+
+fn v3DiLoCoWireParsePeerIdArrayFill(out: var types.V3Libp2pPeerId[],
+                                    wire: str,
+                                    prefix: str): Result[bool] =
+    let countRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "count"))
+    if IsErr(countRes):
+        return Err[bool](Error(countRes))
+    out = []
+    for i in 0..<Value(countRes):
+        let peerRes = v3DiLoCoWireRequirePeerId(wire, v3DiLoCoWireField(prefix, intToStr(i)))
+        if IsErr(peerRes):
+            return Err[bool](Error(peerRes))
+        add(out, Value(peerRes))
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendFixed32Array(out: str,
+                                  prefix: str,
+                                  items: layout.FixedBytes32[]): str =
+    var next = did.V3DidStoreAppendLine(out, v3DiLoCoWireField(prefix, "count"), intToStr(items.len))
+    for i in 0..<items.len:
+        next = did.V3DidStoreAppendLine(next,
+                                        v3DiLoCoWireField(prefix, intToStr(i)),
+                                        layout.FixedBytes32Hex(items[i]))
+    return next
+
+fn v3DiLoCoWireParseFixed32ArrayFill(out: var layout.FixedBytes32[],
+                                     wire: str,
+                                     prefix: str): Result[bool] =
+    let countRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "count"))
+    if IsErr(countRes):
+        return Err[bool](Error(countRes))
+    out = []
+    for i in 0..<Value(countRes):
+        let valueRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, intToStr(i)))
+        if IsErr(valueRes):
+            return Err[bool](Error(valueRes))
+        add(out, Value(valueRes))
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendJob(out: str,
+                         prefix: str,
+                         job: core.V3DiLoCoJob): str =
+    var next = out
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "job_bundle_cid"), layout.FixedBytes32Hex(job.jobBundleCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "requested_worker_count"), intToStr(job.requestedWorkerCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "inner_step_budget"), intToStr(job.innerStepBudget))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "outer_step_timeout_seconds"), intToStr(job.outerStepTimeoutSeconds))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "current_global_version_cid"), layout.FixedBytes32Hex(job.currentGlobalVersionCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "current_outer_step"), intToStr(job.currentOuterStep))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "sealed"), v3DiLoCoWireBoolText(job.sealed))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "cohort_cid"), layout.FixedBytes32Hex(job.cohortCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "opened_at_epoch_seconds"), intToStr(int32(job.openedAtEpochSeconds)))
+    return next
+
+fn v3DiLoCoWireParseJobFill(out: var core.V3DiLoCoJob,
+                            wire: str,
+                            prefix: str): Result[bool] =
+    out = core.V3DiLoCoJob()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "job_bundle_cid"))
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let requestedWorkerCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "requested_worker_count"))
+    if IsErr(requestedWorkerCountRes):
+        return Err[bool](Error(requestedWorkerCountRes))
+    let innerStepBudgetRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "inner_step_budget"))
+    if IsErr(innerStepBudgetRes):
+        return Err[bool](Error(innerStepBudgetRes))
+    let timeoutRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "outer_step_timeout_seconds"))
+    if IsErr(timeoutRes):
+        return Err[bool](Error(timeoutRes))
+    let currentVersionRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "current_global_version_cid"))
+    if IsErr(currentVersionRes):
+        return Err[bool](Error(currentVersionRes))
+    let currentStepRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "current_outer_step"))
+    if IsErr(currentStepRes):
+        return Err[bool](Error(currentStepRes))
+    let sealedRes = v3DiLoCoWireRequireBool(wire, v3DiLoCoWireField(prefix, "sealed"))
+    if IsErr(sealedRes):
+        return Err[bool](Error(sealedRes))
+    let cohortCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "cohort_cid"))
+    if IsErr(cohortCidRes):
+        return Err[bool](Error(cohortCidRes))
+    let openedAtRes = v3DiLoCoWireRequireI64(wire, v3DiLoCoWireField(prefix, "opened_at_epoch_seconds"))
+    if IsErr(openedAtRes):
+        return Err[bool](Error(openedAtRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.requestedWorkerCount = Value(requestedWorkerCountRes)
+    out.innerStepBudget = Value(innerStepBudgetRes)
+    out.outerStepTimeoutSeconds = Value(timeoutRes)
+    out.currentGlobalVersionCid = Value(currentVersionRes)
+    out.currentOuterStep = Value(currentStepRes)
+    out.sealed = Value(sealedRes)
+    out.cohortCid = Value(cohortCidRes)
+    out.openedAtEpochSeconds = Value(openedAtRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendCohort(out: str,
+                            prefix: str,
+                            cohort: core.V3DiLoCoCohort): str =
+    var next = out
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "job_bundle_cid"), layout.FixedBytes32Hex(cohort.jobBundleCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "cohort_cid"), layout.FixedBytes32Hex(cohort.cohortCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "leader_peer_id"), peer_id.V3Libp2pPeerIdText(cohort.leaderPeerId))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "sealed_at_epoch_seconds"), intToStr(int32(cohort.sealedAtEpochSeconds)))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "fixed_member_count"), intToStr(cohort.fixedMemberCount))
+    next = v3DiLoCoWireAppendPeerIdArray(next, v3DiLoCoWireField(prefix, "members"), cohort.members)
+    return next
+
+fn v3DiLoCoWireParseCohortFill(out: var core.V3DiLoCoCohort,
+                               wire: str,
+                               prefix: str): Result[bool] =
+    out = core.V3DiLoCoCohort()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "job_bundle_cid"))
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let cohortCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "cohort_cid"))
+    if IsErr(cohortCidRes):
+        return Err[bool](Error(cohortCidRes))
+    let leaderPeerIdRes = v3DiLoCoWireRequirePeerId(wire, v3DiLoCoWireField(prefix, "leader_peer_id"))
+    if IsErr(leaderPeerIdRes):
+        return Err[bool](Error(leaderPeerIdRes))
+    let sealedAtRes = v3DiLoCoWireRequireI64(wire, v3DiLoCoWireField(prefix, "sealed_at_epoch_seconds"))
+    if IsErr(sealedAtRes):
+        return Err[bool](Error(sealedAtRes))
+    let fixedCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "fixed_member_count"))
+    if IsErr(fixedCountRes):
+        return Err[bool](Error(fixedCountRes))
+    var members: types.V3Libp2pPeerId[]
+    let membersRes = v3DiLoCoWireParsePeerIdArrayFill(members, wire, v3DiLoCoWireField(prefix, "members"))
+    if IsErr(membersRes):
+        return Err[bool](Error(membersRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.cohortCid = Value(cohortCidRes)
+    out.leaderPeerId = Value(leaderPeerIdRes)
+    out.members = members
+    out.sealedAtEpochSeconds = Value(sealedAtRes)
+    out.fixedMemberCount = Value(fixedCountRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendLease(out: str,
+                           prefix: str,
+                           lease: core.V3DiLoCoLease): str =
+    var next = out
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "job_bundle_cid"), layout.FixedBytes32Hex(lease.jobBundleCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "cohort_cid"), layout.FixedBytes32Hex(lease.cohortCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "peer_id"), peer_id.V3Libp2pPeerIdText(lease.peerId))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "base_version_cid"), layout.FixedBytes32Hex(lease.baseVersionCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "outer_step"), intToStr(lease.outerStep))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "inner_step_budget"), intToStr(lease.innerStepBudget))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "leased_at_epoch_seconds"), intToStr(int32(lease.leasedAtEpochSeconds)))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "expires_at_epoch_seconds"), intToStr(int32(lease.expiresAtEpochSeconds)))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "active"), v3DiLoCoWireBoolText(lease.active))
+    return next
+
+fn v3DiLoCoWireParseLeaseFill(out: var core.V3DiLoCoLease,
+                              wire: str,
+                              prefix: str): Result[bool] =
+    out = core.V3DiLoCoLease()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "job_bundle_cid"))
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let cohortCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "cohort_cid"))
+    if IsErr(cohortCidRes):
+        return Err[bool](Error(cohortCidRes))
+    let peerIdRes = v3DiLoCoWireRequirePeerId(wire, v3DiLoCoWireField(prefix, "peer_id"))
+    if IsErr(peerIdRes):
+        return Err[bool](Error(peerIdRes))
+    let baseVersionCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "base_version_cid"))
+    if IsErr(baseVersionCidRes):
+        return Err[bool](Error(baseVersionCidRes))
+    let outerStepRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "outer_step"))
+    if IsErr(outerStepRes):
+        return Err[bool](Error(outerStepRes))
+    let innerBudgetRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "inner_step_budget"))
+    if IsErr(innerBudgetRes):
+        return Err[bool](Error(innerBudgetRes))
+    let leasedAtRes = v3DiLoCoWireRequireI64(wire, v3DiLoCoWireField(prefix, "leased_at_epoch_seconds"))
+    if IsErr(leasedAtRes):
+        return Err[bool](Error(leasedAtRes))
+    let expiresAtRes = v3DiLoCoWireRequireI64(wire, v3DiLoCoWireField(prefix, "expires_at_epoch_seconds"))
+    if IsErr(expiresAtRes):
+        return Err[bool](Error(expiresAtRes))
+    let activeRes = v3DiLoCoWireRequireBool(wire, v3DiLoCoWireField(prefix, "active"))
+    if IsErr(activeRes):
+        return Err[bool](Error(activeRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.cohortCid = Value(cohortCidRes)
+    out.peerId = Value(peerIdRes)
+    out.baseVersionCid = Value(baseVersionCidRes)
+    out.outerStep = Value(outerStepRes)
+    out.innerStepBudget = Value(innerBudgetRes)
+    out.leasedAtEpochSeconds = Value(leasedAtRes)
+    out.expiresAtEpochSeconds = Value(expiresAtRes)
+    out.active = Value(activeRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendBarrier(out: str,
+                             prefix: str,
+                             barrier: core.V3DiLoCoBarrier): str =
+    var next = out
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "job_bundle_cid"), layout.FixedBytes32Hex(barrier.jobBundleCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "cohort_cid"), layout.FixedBytes32Hex(barrier.cohortCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "base_version_cid"), layout.FixedBytes32Hex(barrier.baseVersionCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "outer_step"), intToStr(barrier.outerStep))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "expected_member_count"), intToStr(barrier.expectedMemberCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "sealed"), v3DiLoCoWireBoolText(barrier.sealed))
+    next = v3DiLoCoWireAppendPeerIdArray(next, v3DiLoCoWireField(prefix, "completed_peer_ids"), barrier.completedPeerIds)
+    return next
+
+fn v3DiLoCoWireParseBarrierFill(out: var core.V3DiLoCoBarrier,
+                                wire: str,
+                                prefix: str): Result[bool] =
+    out = core.V3DiLoCoBarrier()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "job_bundle_cid"))
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let cohortCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "cohort_cid"))
+    if IsErr(cohortCidRes):
+        return Err[bool](Error(cohortCidRes))
+    let baseVersionCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "base_version_cid"))
+    if IsErr(baseVersionCidRes):
+        return Err[bool](Error(baseVersionCidRes))
+    let outerStepRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "outer_step"))
+    if IsErr(outerStepRes):
+        return Err[bool](Error(outerStepRes))
+    let expectedCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "expected_member_count"))
+    if IsErr(expectedCountRes):
+        return Err[bool](Error(expectedCountRes))
+    let sealedRes = v3DiLoCoWireRequireBool(wire, v3DiLoCoWireField(prefix, "sealed"))
+    if IsErr(sealedRes):
+        return Err[bool](Error(sealedRes))
+    var completedPeerIds: types.V3Libp2pPeerId[]
+    let peersRes = v3DiLoCoWireParsePeerIdArrayFill(completedPeerIds, wire, v3DiLoCoWireField(prefix, "completed_peer_ids"))
+    if IsErr(peersRes):
+        return Err[bool](Error(peersRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.cohortCid = Value(cohortCidRes)
+    out.baseVersionCid = Value(baseVersionCidRes)
+    out.outerStep = Value(outerStepRes)
+    out.expectedMemberCount = Value(expectedCountRes)
+    out.completedPeerIds = completedPeerIds
+    out.sealed = Value(sealedRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendOuterDelta(out: str,
+                                prefix: str,
+                                delta: core.V3DiLoCoOuterDelta): str =
+    var next = out
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "job_bundle_cid"), layout.FixedBytes32Hex(delta.jobBundleCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "delta_cid"), layout.FixedBytes32Hex(delta.deltaCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "base_version_cid"), layout.FixedBytes32Hex(delta.baseVersionCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "outer_step"), intToStr(delta.outerStep))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "publisher_peer_id"), peer_id.V3Libp2pPeerIdText(delta.publisherPeerId))
+    next = v3DiLoCoWireAppendArtifactRef(next, v3DiLoCoWireField(prefix, "model_delta_ref"), delta.modelDeltaRef)
+    next = v3DiLoCoWireAppendArtifactRef(next, v3DiLoCoWireField(prefix, "optimizer_delta_ref"), delta.optimizerDeltaRef)
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "sample_count"), intToStr(delta.sampleCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "token_count"), intToStr(delta.tokenCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "inner_step_count"), intToStr(delta.innerStepCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "weight_numerator"), intToStr(delta.weightNumerator))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "weight_denominator"), intToStr(delta.weightDenominator))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "submitted_at_epoch_seconds"), intToStr(int32(delta.submittedAtEpochSeconds)))
+    return next
+
+fn v3DiLoCoWireParseOuterDeltaFill(out: var core.V3DiLoCoOuterDelta,
+                                   wire: str,
+                                   prefix: str): Result[bool] =
+    out = core.V3DiLoCoOuterDelta()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "job_bundle_cid"))
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let deltaCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "delta_cid"))
+    if IsErr(deltaCidRes):
+        return Err[bool](Error(deltaCidRes))
+    let baseVersionCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "base_version_cid"))
+    if IsErr(baseVersionCidRes):
+        return Err[bool](Error(baseVersionCidRes))
+    let outerStepRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "outer_step"))
+    if IsErr(outerStepRes):
+        return Err[bool](Error(outerStepRes))
+    let publisherPeerIdRes = v3DiLoCoWireRequirePeerId(wire, v3DiLoCoWireField(prefix, "publisher_peer_id"))
+    if IsErr(publisherPeerIdRes):
+        return Err[bool](Error(publisherPeerIdRes))
+    var modelDeltaRef = core.V3DiLoCoArtifactRef()
+    let modelRes = v3DiLoCoWireParseArtifactRefFill(modelDeltaRef, wire, v3DiLoCoWireField(prefix, "model_delta_ref"))
+    if IsErr(modelRes):
+        return Err[bool](Error(modelRes))
+    var optimizerDeltaRef = core.V3DiLoCoArtifactRef()
+    let optimizerRes = v3DiLoCoWireParseArtifactRefFill(optimizerDeltaRef, wire, v3DiLoCoWireField(prefix, "optimizer_delta_ref"))
+    if IsErr(optimizerRes):
+        return Err[bool](Error(optimizerRes))
+    let sampleCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "sample_count"))
+    if IsErr(sampleCountRes):
+        return Err[bool](Error(sampleCountRes))
+    let tokenCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "token_count"))
+    if IsErr(tokenCountRes):
+        return Err[bool](Error(tokenCountRes))
+    let innerStepCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "inner_step_count"))
+    if IsErr(innerStepCountRes):
+        return Err[bool](Error(innerStepCountRes))
+    let weightNumeratorRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "weight_numerator"))
+    if IsErr(weightNumeratorRes):
+        return Err[bool](Error(weightNumeratorRes))
+    let weightDenominatorRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "weight_denominator"))
+    if IsErr(weightDenominatorRes):
+        return Err[bool](Error(weightDenominatorRes))
+    let submittedAtRes = v3DiLoCoWireRequireI64(wire, v3DiLoCoWireField(prefix, "submitted_at_epoch_seconds"))
+    if IsErr(submittedAtRes):
+        return Err[bool](Error(submittedAtRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.deltaCid = Value(deltaCidRes)
+    out.baseVersionCid = Value(baseVersionCidRes)
+    out.outerStep = Value(outerStepRes)
+    out.publisherPeerId = Value(publisherPeerIdRes)
+    out.modelDeltaRef = modelDeltaRef
+    out.optimizerDeltaRef = optimizerDeltaRef
+    out.sampleCount = Value(sampleCountRes)
+    out.tokenCount = Value(tokenCountRes)
+    out.innerStepCount = Value(innerStepCountRes)
+    out.weightNumerator = Value(weightNumeratorRes)
+    out.weightDenominator = Value(weightDenominatorRes)
+    out.submittedAtEpochSeconds = Value(submittedAtRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendMergeCommit(out: str,
+                                 prefix: str,
+                                 commit: core.V3DiLoCoMergeCommit): str =
+    var next = out
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "job_bundle_cid"), layout.FixedBytes32Hex(commit.jobBundleCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "commit_cid"), layout.FixedBytes32Hex(commit.commitCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "base_version_cid"), layout.FixedBytes32Hex(commit.baseVersionCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "next_global_version_cid"), layout.FixedBytes32Hex(commit.nextGlobalVersionCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "outer_step"), intToStr(commit.outerStep))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "leader_peer_id"), peer_id.V3Libp2pPeerIdText(commit.leaderPeerId))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "accepted_count"), intToStr(commit.acceptedCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "published_at_epoch_seconds"), intToStr(int32(commit.publishedAtEpochSeconds)))
+    next = v3DiLoCoWireAppendFixed32Array(next, v3DiLoCoWireField(prefix, "contribution_cids"), commit.contributionCids)
+    return next
+
+fn v3DiLoCoWireParseMergeCommitFill(out: var core.V3DiLoCoMergeCommit,
+                                    wire: str,
+                                    prefix: str): Result[bool] =
+    out = core.V3DiLoCoMergeCommit()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "job_bundle_cid"))
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let commitCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "commit_cid"))
+    if IsErr(commitCidRes):
+        return Err[bool](Error(commitCidRes))
+    let baseVersionCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "base_version_cid"))
+    if IsErr(baseVersionCidRes):
+        return Err[bool](Error(baseVersionCidRes))
+    let nextGlobalVersionCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "next_global_version_cid"))
+    if IsErr(nextGlobalVersionCidRes):
+        return Err[bool](Error(nextGlobalVersionCidRes))
+    let outerStepRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "outer_step"))
+    if IsErr(outerStepRes):
+        return Err[bool](Error(outerStepRes))
+    let leaderPeerIdRes = v3DiLoCoWireRequirePeerId(wire, v3DiLoCoWireField(prefix, "leader_peer_id"))
+    if IsErr(leaderPeerIdRes):
+        return Err[bool](Error(leaderPeerIdRes))
+    let acceptedCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "accepted_count"))
+    if IsErr(acceptedCountRes):
+        return Err[bool](Error(acceptedCountRes))
+    let publishedAtRes = v3DiLoCoWireRequireI64(wire, v3DiLoCoWireField(prefix, "published_at_epoch_seconds"))
+    if IsErr(publishedAtRes):
+        return Err[bool](Error(publishedAtRes))
+    var contributionCids: layout.FixedBytes32[]
+    let contributionsRes = v3DiLoCoWireParseFixed32ArrayFill(contributionCids, wire, v3DiLoCoWireField(prefix, "contribution_cids"))
+    if IsErr(contributionsRes):
+        return Err[bool](Error(contributionsRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.commitCid = Value(commitCidRes)
+    out.baseVersionCid = Value(baseVersionCidRes)
+    out.nextGlobalVersionCid = Value(nextGlobalVersionCidRes)
+    out.outerStep = Value(outerStepRes)
+    out.leaderPeerId = Value(leaderPeerIdRes)
+    out.acceptedCount = Value(acceptedCountRes)
+    out.contributionCids = contributionCids
+    out.publishedAtEpochSeconds = Value(publishedAtRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendGlobalVersion(out: str,
+                                   prefix: str,
+                                   version: core.V3DiLoCoGlobalVersion): str =
+    var next = out
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "job_bundle_cid"), layout.FixedBytes32Hex(version.jobBundleCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "version_cid"), layout.FixedBytes32Hex(version.versionCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "base_version_cid"), layout.FixedBytes32Hex(version.baseVersionCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "committed_outer_step"), intToStr(version.committedOuterStep))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "publisher_peer_id"), peer_id.V3Libp2pPeerIdText(version.publisherPeerId))
+    next = v3DiLoCoWireAppendArtifactRef(next, v3DiLoCoWireField(prefix, "model_ref"), version.modelRef)
+    next = v3DiLoCoWireAppendArtifactRef(next, v3DiLoCoWireField(prefix, "optimizer_ref"), version.optimizerRef)
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "accepted_count"), intToStr(version.acceptedCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "committed_at_epoch_seconds"), intToStr(int32(version.committedAtEpochSeconds)))
+    return next
+
+fn v3DiLoCoWireParseGlobalVersionFill(out: var core.V3DiLoCoGlobalVersion,
+                                      wire: str,
+                                      prefix: str): Result[bool] =
+    out = core.V3DiLoCoGlobalVersion()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "job_bundle_cid"))
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let versionCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "version_cid"))
+    if IsErr(versionCidRes):
+        return Err[bool](Error(versionCidRes))
+    let baseVersionCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "base_version_cid"))
+    if IsErr(baseVersionCidRes):
+        return Err[bool](Error(baseVersionCidRes))
+    let committedOuterStepRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "committed_outer_step"))
+    if IsErr(committedOuterStepRes):
+        return Err[bool](Error(committedOuterStepRes))
+    let publisherPeerIdRes = v3DiLoCoWireRequirePeerId(wire, v3DiLoCoWireField(prefix, "publisher_peer_id"))
+    if IsErr(publisherPeerIdRes):
+        return Err[bool](Error(publisherPeerIdRes))
+    var modelRef = core.V3DiLoCoArtifactRef()
+    let modelRefRes = v3DiLoCoWireParseArtifactRefFill(modelRef, wire, v3DiLoCoWireField(prefix, "model_ref"))
+    if IsErr(modelRefRes):
+        return Err[bool](Error(modelRefRes))
+    var optimizerRef = core.V3DiLoCoArtifactRef()
+    let optimizerRefRes = v3DiLoCoWireParseArtifactRefFill(optimizerRef, wire, v3DiLoCoWireField(prefix, "optimizer_ref"))
+    if IsErr(optimizerRefRes):
+        return Err[bool](Error(optimizerRefRes))
+    let acceptedCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "accepted_count"))
+    if IsErr(acceptedCountRes):
+        return Err[bool](Error(acceptedCountRes))
+    let committedAtRes = v3DiLoCoWireRequireI64(wire, v3DiLoCoWireField(prefix, "committed_at_epoch_seconds"))
+    if IsErr(committedAtRes):
+        return Err[bool](Error(committedAtRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.versionCid = Value(versionCidRes)
+    out.baseVersionCid = Value(baseVersionCidRes)
+    out.committedOuterStep = Value(committedOuterStepRes)
+    out.publisherPeerId.value = Value(publisherPeerIdRes).value
+    out.modelRef.stubCid = modelRef.stubCid
+    out.modelRef.blobSummaryCid = modelRef.blobSummaryCid
+    out.modelRef.manifestCid = modelRef.manifestCid
+    out.modelRef.blobCid = modelRef.blobCid
+    out.modelRef.payloadLen = modelRef.payloadLen
+    out.modelRef.paramsCid = modelRef.paramsCid
+    out.modelRef.layoutKind = modelRef.layoutKind
+    out.modelRef.dataShardCount = modelRef.dataShardCount
+    out.modelRef.parityShardCount = modelRef.parityShardCount
+    out.modelRef.shardPayloadBytes = modelRef.shardPayloadBytes
+    out.optimizerRef.stubCid = optimizerRef.stubCid
+    out.optimizerRef.blobSummaryCid = optimizerRef.blobSummaryCid
+    out.optimizerRef.manifestCid = optimizerRef.manifestCid
+    out.optimizerRef.blobCid = optimizerRef.blobCid
+    out.optimizerRef.payloadLen = optimizerRef.payloadLen
+    out.optimizerRef.paramsCid = optimizerRef.paramsCid
+    out.optimizerRef.layoutKind = optimizerRef.layoutKind
+    out.optimizerRef.dataShardCount = optimizerRef.dataShardCount
+    out.optimizerRef.parityShardCount = optimizerRef.parityShardCount
+    out.optimizerRef.shardPayloadBytes = optimizerRef.shardPayloadBytes
+    out.acceptedCount = Value(acceptedCountRes)
+    out.committedAtEpochSeconds = Value(committedAtRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendStepStatus(out: str,
+                                prefix: str,
+                                status: core.V3DiLoCoStepStatus): str =
+    var next = out
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "job_bundle_cid"), layout.FixedBytes32Hex(status.jobBundleCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "base_version_cid"), layout.FixedBytes32Hex(status.baseVersionCid))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "outer_step"), intToStr(status.outerStep))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "barrier_ready"), v3DiLoCoWireBoolText(status.barrierReady))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "barrier_arrived_count"), intToStr(status.barrierArrivedCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "expected_member_count"), intToStr(status.expectedMemberCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "contribution_count"), intToStr(status.contributionCount))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "commit_published"), v3DiLoCoWireBoolText(status.commitPublished))
+    next = did.V3DidStoreAppendLine(next, v3DiLoCoWireField(prefix, "merge_commit_cid"), layout.FixedBytes32Hex(status.mergeCommitCid))
+    return next
+
+fn v3DiLoCoWireParseStepStatusFill(out: var core.V3DiLoCoStepStatus,
+                                   wire: str,
+                                   prefix: str): Result[bool] =
+    out = core.V3DiLoCoStepStatus()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "job_bundle_cid"))
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let baseVersionCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "base_version_cid"))
+    if IsErr(baseVersionCidRes):
+        return Err[bool](Error(baseVersionCidRes))
+    let outerStepRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "outer_step"))
+    if IsErr(outerStepRes):
+        return Err[bool](Error(outerStepRes))
+    let barrierReadyRes = v3DiLoCoWireRequireBool(wire, v3DiLoCoWireField(prefix, "barrier_ready"))
+    if IsErr(barrierReadyRes):
+        return Err[bool](Error(barrierReadyRes))
+    let barrierArrivedRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "barrier_arrived_count"))
+    if IsErr(barrierArrivedRes):
+        return Err[bool](Error(barrierArrivedRes))
+    let expectedCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "expected_member_count"))
+    if IsErr(expectedCountRes):
+        return Err[bool](Error(expectedCountRes))
+    let contributionCountRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "contribution_count"))
+    if IsErr(contributionCountRes):
+        return Err[bool](Error(contributionCountRes))
+    let commitPublishedRes = v3DiLoCoWireRequireBool(wire, v3DiLoCoWireField(prefix, "commit_published"))
+    if IsErr(commitPublishedRes):
+        return Err[bool](Error(commitPublishedRes))
+    let mergeCommitCidRes = v3DiLoCoWireRequireFixed32(wire, v3DiLoCoWireField(prefix, "merge_commit_cid"))
+    if IsErr(mergeCommitCidRes):
+        return Err[bool](Error(mergeCommitCidRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.baseVersionCid = Value(baseVersionCidRes)
+    out.outerStep = Value(outerStepRes)
+    out.barrierReady = Value(barrierReadyRes)
+    out.barrierArrivedCount = Value(barrierArrivedRes)
+    out.expectedMemberCount = Value(expectedCountRes)
+    out.contributionCount = Value(contributionCountRes)
+    out.commitPublished = Value(commitPublishedRes)
+    out.mergeCommitCid = Value(mergeCommitCidRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoWireAppendGlobalVersionArray(out: str,
+                                        prefix: str,
+                                        versions: core.V3DiLoCoGlobalVersion[]): str =
+    var next = did.V3DidStoreAppendLine(out, v3DiLoCoWireField(prefix, "count"), intToStr(versions.len))
+    for i in 0..<versions.len:
+        next = v3DiLoCoWireAppendGlobalVersion(next,
+                                               v3DiLoCoWireField(prefix, intToStr(i)),
+                                               versions[i])
+    return next
+
+fn v3DiLoCoWireParseGlobalVersionArrayFill(out: var core.V3DiLoCoGlobalVersion[],
+                                           wire: str,
+                                           prefix: str): Result[bool] =
+    let countRes = v3DiLoCoWireRequireInt32(wire, v3DiLoCoWireField(prefix, "count"))
+    if IsErr(countRes):
+        return Err[bool](Error(countRes))
+    out = []
+    for i in 0..<Value(countRes):
+        add(out, core.V3DiLoCoGlobalVersion())
+        let versionRes = v3DiLoCoWireParseGlobalVersionFill(out[out.len - 1],
+                                                            wire,
+                                                            v3DiLoCoWireField(prefix, intToStr(i)))
+        if IsErr(versionRes):
+            return Err[bool](Error(versionRes))
+    return Ok[bool](true)
+
+fn v3DiLoCoOpenJobRequestEncode(req: V3DiLoCoOpenJobRequest): Bytes =
+    var body = ""
+    body = did.V3DidStoreAppendLine(body, "job_bundle_cid", layout.FixedBytes32Hex(req.jobBundleCid))
+    body = did.V3DidStoreAppendLine(body, "requested_worker_count", intToStr(req.requestedWorkerCount))
+    body = did.V3DidStoreAppendLine(body, "inner_step_budget", intToStr(req.innerStepBudget))
+    body = did.V3DidStoreAppendLine(body, "outer_step_timeout_seconds", intToStr(req.outerStepTimeoutSeconds))
+    body = v3DiLoCoWireAppendArtifactRef(body, "initial_model_ref", req.initialModelRef)
+    body = v3DiLoCoWireAppendArtifactRef(body, "initial_optimizer_ref", req.initialOptimizerRef)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageOpenJob, body)
+
+fn v3DiLoCoOpenJobRequestDecodeFill(out: var V3DiLoCoOpenJobRequest,
+                                    payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageOpenJob, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoOpenJobRequest()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(body, "job_bundle_cid")
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let requestedCountRes = v3DiLoCoWireRequireInt32(body, "requested_worker_count")
+    if IsErr(requestedCountRes):
+        return Err[bool](Error(requestedCountRes))
+    let innerBudgetRes = v3DiLoCoWireRequireInt32(body, "inner_step_budget")
+    if IsErr(innerBudgetRes):
+        return Err[bool](Error(innerBudgetRes))
+    let timeoutRes = v3DiLoCoWireRequireInt32(body, "outer_step_timeout_seconds")
+    if IsErr(timeoutRes):
+        return Err[bool](Error(timeoutRes))
+    var initialModelRef = core.V3DiLoCoArtifactRef()
+    let modelRes = v3DiLoCoWireParseArtifactRefFill(initialModelRef, body, "initial_model_ref")
+    if IsErr(modelRes):
+        return Err[bool](Error(modelRes))
+    var initialOptimizerRef = core.V3DiLoCoArtifactRef()
+    let optimizerRes = v3DiLoCoWireParseArtifactRefFill(initialOptimizerRef, body, "initial_optimizer_ref")
+    if IsErr(optimizerRes):
+        return Err[bool](Error(optimizerRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.requestedWorkerCount = Value(requestedCountRes)
+    out.innerStepBudget = Value(innerBudgetRes)
+    out.outerStepTimeoutSeconds = Value(timeoutRes)
+    out.initialModelRef = initialModelRef
+    out.initialOptimizerRef = initialOptimizerRef
+    return Ok[bool](true)
+
+fn v3DiLoCoOpenJobResponseEncode(resp: V3DiLoCoOpenJobResponse): Bytes =
+    var body = ""
+    body = v3DiLoCoWireAppendJob(body, "job", resp.job)
+    body = v3DiLoCoWireAppendGlobalVersion(body, "version", resp.version)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageOpenJob, body)
+
+fn v3DiLoCoOpenJobResponseDecodeFill(out: var V3DiLoCoOpenJobResponse,
+                                     payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageOpenJob, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoOpenJobResponse()
+    let jobRes = v3DiLoCoWireParseJobFill(out.job, body, "job")
+    if IsErr(jobRes):
+        return Err[bool](Error(jobRes))
+    let versionRes = v3DiLoCoWireParseGlobalVersionFill(out.version, body, "version")
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    return Ok[bool](true)
+
+fn v3DiLoCoJoinCohortRequestEncode(req: V3DiLoCoJoinCohortRequest): Bytes =
+    var body = ""
+    body = did.V3DidStoreAppendLine(body, "job_bundle_cid", layout.FixedBytes32Hex(req.jobBundleCid))
+    body = did.V3DidStoreAppendLine(body, "peer_id", peer_id.V3Libp2pPeerIdText(req.peerId))
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageJoinCohort, body)
+
+fn v3DiLoCoJoinCohortRequestDecodeFill(out: var V3DiLoCoJoinCohortRequest,
+                                       payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageJoinCohort, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoJoinCohortRequest()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(body, "job_bundle_cid")
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let peerIdRes = v3DiLoCoWireRequirePeerId(body, "peer_id")
+    if IsErr(peerIdRes):
+        return Err[bool](Error(peerIdRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.peerId = Value(peerIdRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoJoinCohortResponseEncode(resp: V3DiLoCoJoinCohortResponse): Bytes =
+    var body = ""
+    body = v3DiLoCoWireAppendCohort(body, "cohort", resp.cohort)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageJoinCohort, body)
+
+fn v3DiLoCoJoinCohortResponseDecodeFill(out: var V3DiLoCoJoinCohortResponse,
+                                        payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageJoinCohort, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoJoinCohortResponse()
+    return v3DiLoCoWireParseCohortFill(out.cohort, body, "cohort")
+
+fn v3DiLoCoFetchLeaseRequestEncode(req: V3DiLoCoFetchLeaseRequest): Bytes =
+    var body = ""
+    body = did.V3DidStoreAppendLine(body, "job_bundle_cid", layout.FixedBytes32Hex(req.jobBundleCid))
+    body = did.V3DidStoreAppendLine(body, "peer_id", peer_id.V3Libp2pPeerIdText(req.peerId))
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageFetchLease, body)
+
+fn v3DiLoCoFetchLeaseRequestDecodeFill(out: var V3DiLoCoFetchLeaseRequest,
+                                       payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageFetchLease, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoFetchLeaseRequest()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(body, "job_bundle_cid")
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let peerIdRes = v3DiLoCoWireRequirePeerId(body, "peer_id")
+    if IsErr(peerIdRes):
+        return Err[bool](Error(peerIdRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.peerId = Value(peerIdRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoFetchLeaseResponseEncode(resp: V3DiLoCoFetchLeaseResponse): Bytes =
+    var body = ""
+    body = v3DiLoCoWireAppendLease(body, "lease", resp.lease)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageFetchLease, body)
+
+fn v3DiLoCoFetchLeaseResponseDecodeFill(out: var V3DiLoCoFetchLeaseResponse,
+                                        payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageFetchLease, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoFetchLeaseResponse()
+    return v3DiLoCoWireParseLeaseFill(out.lease, body, "lease")
+
+fn v3DiLoCoReportInnerStepDoneRequestEncode(req: V3DiLoCoReportInnerStepDoneRequest): Bytes =
+    var body = ""
+    body = did.V3DidStoreAppendLine(body, "job_bundle_cid", layout.FixedBytes32Hex(req.jobBundleCid))
+    body = did.V3DidStoreAppendLine(body, "peer_id", peer_id.V3Libp2pPeerIdText(req.peerId))
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageReportInnerStepDone, body)
+
+fn v3DiLoCoReportInnerStepDoneRequestDecodeFill(out: var V3DiLoCoReportInnerStepDoneRequest,
+                                                payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageReportInnerStepDone, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoReportInnerStepDoneRequest()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(body, "job_bundle_cid")
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let peerIdRes = v3DiLoCoWireRequirePeerId(body, "peer_id")
+    if IsErr(peerIdRes):
+        return Err[bool](Error(peerIdRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.peerId = Value(peerIdRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoReportInnerStepDoneResponseEncode(resp: V3DiLoCoReportInnerStepDoneResponse): Bytes =
+    var body = ""
+    body = v3DiLoCoWireAppendBarrier(body, "barrier", resp.barrier)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageReportInnerStepDone, body)
+
+fn v3DiLoCoReportInnerStepDoneResponseDecodeFill(out: var V3DiLoCoReportInnerStepDoneResponse,
+                                                 payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageReportInnerStepDone, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoReportInnerStepDoneResponse()
+    return v3DiLoCoWireParseBarrierFill(out.barrier, body, "barrier")
+
+fn v3DiLoCoSubmitOuterDeltaRequestEncode(req: V3DiLoCoSubmitOuterDeltaRequest): Bytes =
+    var body = ""
+    body = did.V3DidStoreAppendLine(body, "job_bundle_cid", layout.FixedBytes32Hex(req.jobBundleCid))
+    body = did.V3DidStoreAppendLine(body, "base_version_cid", layout.FixedBytes32Hex(req.baseVersionCid))
+    body = did.V3DidStoreAppendLine(body, "outer_step", intToStr(req.outerStep))
+    body = did.V3DidStoreAppendLine(body, "publisher_peer_id", peer_id.V3Libp2pPeerIdText(req.publisherPeerId))
+    body = v3DiLoCoWireAppendArtifactRef(body, "model_delta_ref", req.modelDeltaRef)
+    body = v3DiLoCoWireAppendArtifactRef(body, "optimizer_delta_ref", req.optimizerDeltaRef)
+    body = did.V3DidStoreAppendLine(body, "sample_count", intToStr(req.sampleCount))
+    body = did.V3DidStoreAppendLine(body, "token_count", intToStr(req.tokenCount))
+    body = did.V3DidStoreAppendLine(body, "inner_step_count", intToStr(req.innerStepCount))
+    body = did.V3DidStoreAppendLine(body, "weight_numerator", intToStr(req.weightNumerator))
+    body = did.V3DidStoreAppendLine(body, "weight_denominator", intToStr(req.weightDenominator))
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageSubmitOuterDelta, body)
+
+fn v3DiLoCoSubmitOuterDeltaRequestDecodeFill(out: var V3DiLoCoSubmitOuterDeltaRequest,
+                                             payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageSubmitOuterDelta, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoSubmitOuterDeltaRequest()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(body, "job_bundle_cid")
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let baseVersionCidRes = v3DiLoCoWireRequireFixed32(body, "base_version_cid")
+    if IsErr(baseVersionCidRes):
+        return Err[bool](Error(baseVersionCidRes))
+    let outerStepRes = v3DiLoCoWireRequireInt32(body, "outer_step")
+    if IsErr(outerStepRes):
+        return Err[bool](Error(outerStepRes))
+    let publisherPeerIdRes = v3DiLoCoWireRequirePeerId(body, "publisher_peer_id")
+    if IsErr(publisherPeerIdRes):
+        return Err[bool](Error(publisherPeerIdRes))
+    var modelDeltaRef = core.V3DiLoCoArtifactRef()
+    let modelRes = v3DiLoCoWireParseArtifactRefFill(modelDeltaRef, body, "model_delta_ref")
+    if IsErr(modelRes):
+        return Err[bool](Error(modelRes))
+    var optimizerDeltaRef = core.V3DiLoCoArtifactRef()
+    let optimizerRes = v3DiLoCoWireParseArtifactRefFill(optimizerDeltaRef, body, "optimizer_delta_ref")
+    if IsErr(optimizerRes):
+        return Err[bool](Error(optimizerRes))
+    let sampleCountRes = v3DiLoCoWireRequireInt32(body, "sample_count")
+    if IsErr(sampleCountRes):
+        return Err[bool](Error(sampleCountRes))
+    let tokenCountRes = v3DiLoCoWireRequireInt32(body, "token_count")
+    if IsErr(tokenCountRes):
+        return Err[bool](Error(tokenCountRes))
+    let innerStepCountRes = v3DiLoCoWireRequireInt32(body, "inner_step_count")
+    if IsErr(innerStepCountRes):
+        return Err[bool](Error(innerStepCountRes))
+    let weightNumeratorRes = v3DiLoCoWireRequireInt32(body, "weight_numerator")
+    if IsErr(weightNumeratorRes):
+        return Err[bool](Error(weightNumeratorRes))
+    let weightDenominatorRes = v3DiLoCoWireRequireInt32(body, "weight_denominator")
+    if IsErr(weightDenominatorRes):
+        return Err[bool](Error(weightDenominatorRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.baseVersionCid = Value(baseVersionCidRes)
+    out.outerStep = Value(outerStepRes)
+    out.publisherPeerId = Value(publisherPeerIdRes)
+    out.modelDeltaRef = modelDeltaRef
+    out.optimizerDeltaRef = optimizerDeltaRef
+    out.sampleCount = Value(sampleCountRes)
+    out.tokenCount = Value(tokenCountRes)
+    out.innerStepCount = Value(innerStepCountRes)
+    out.weightNumerator = Value(weightNumeratorRes)
+    out.weightDenominator = Value(weightDenominatorRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoSubmitOuterDeltaResponseEncode(resp: V3DiLoCoSubmitOuterDeltaResponse): Bytes =
+    var body = ""
+    body = v3DiLoCoWireAppendOuterDelta(body, "delta", resp.delta)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageSubmitOuterDelta, body)
+
+fn v3DiLoCoSubmitOuterDeltaResponseDecodeFill(out: var V3DiLoCoSubmitOuterDeltaResponse,
+                                              payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageSubmitOuterDelta, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoSubmitOuterDeltaResponse()
+    return v3DiLoCoWireParseOuterDeltaFill(out.delta, body, "delta")
+
+fn v3DiLoCoFetchStepStatusRequestEncode(req: V3DiLoCoFetchStepStatusRequest): Bytes =
+    var body = ""
+    body = did.V3DidStoreAppendLine(body, "job_bundle_cid", layout.FixedBytes32Hex(req.jobBundleCid))
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageFetchStepStatus, body)
+
+fn v3DiLoCoFetchStepStatusRequestDecodeFill(out: var V3DiLoCoFetchStepStatusRequest,
+                                            payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageFetchStepStatus, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoFetchStepStatusRequest()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(body, "job_bundle_cid")
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoFetchStepStatusResponseEncode(resp: V3DiLoCoFetchStepStatusResponse): Bytes =
+    var body = ""
+    body = v3DiLoCoWireAppendStepStatus(body, "status", resp.status)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageFetchStepStatus, body)
+
+fn v3DiLoCoFetchStepStatusResponseDecodeFill(out: var V3DiLoCoFetchStepStatusResponse,
+                                             payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageFetchStepStatus, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoFetchStepStatusResponse()
+    return v3DiLoCoWireParseStepStatusFill(out.status, body, "status")
+
+fn v3DiLoCoPublishMergeCommitRequestEncode(req: V3DiLoCoPublishMergeCommitRequest): Bytes =
+    var body = ""
+    body = did.V3DidStoreAppendLine(body, "job_bundle_cid", layout.FixedBytes32Hex(req.jobBundleCid))
+    body = did.V3DidStoreAppendLine(body, "publisher_peer_id", peer_id.V3Libp2pPeerIdText(req.publisherPeerId))
+    body = v3DiLoCoWireAppendArtifactRef(body, "merged_model_ref", req.mergedModelRef)
+    body = v3DiLoCoWireAppendArtifactRef(body, "merged_optimizer_ref", req.mergedOptimizerRef)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessagePublishMergeCommit, body)
+
+fn v3DiLoCoPublishMergeCommitRequestDecodeFill(out: var V3DiLoCoPublishMergeCommitRequest,
+                                               payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessagePublishMergeCommit, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoPublishMergeCommitRequest()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(body, "job_bundle_cid")
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    let publisherPeerIdRes = v3DiLoCoWireRequirePeerId(body, "publisher_peer_id")
+    if IsErr(publisherPeerIdRes):
+        return Err[bool](Error(publisherPeerIdRes))
+    var mergedModelRef = core.V3DiLoCoArtifactRef()
+    let modelRes = v3DiLoCoWireParseArtifactRefFill(mergedModelRef, body, "merged_model_ref")
+    if IsErr(modelRes):
+        return Err[bool](Error(modelRes))
+    var mergedOptimizerRef = core.V3DiLoCoArtifactRef()
+    let optimizerRes = v3DiLoCoWireParseArtifactRefFill(mergedOptimizerRef, body, "merged_optimizer_ref")
+    if IsErr(optimizerRes):
+        return Err[bool](Error(optimizerRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    out.publisherPeerId = Value(publisherPeerIdRes)
+    out.mergedModelRef = mergedModelRef
+    out.mergedOptimizerRef = mergedOptimizerRef
+    return Ok[bool](true)
+
+fn v3DiLoCoPublishMergeCommitResponseEncode(resp: V3DiLoCoPublishMergeCommitResponse): Bytes =
+    var body = ""
+    body = v3DiLoCoWireAppendMergeCommit(body, "commit", resp.commit)
+    body = v3DiLoCoWireAppendGlobalVersion(body, "version", resp.version)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessagePublishMergeCommit, body)
+
+fn v3DiLoCoPublishMergeCommitResponseDecodeFill(out: var V3DiLoCoPublishMergeCommitResponse,
+                                                payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessagePublishMergeCommit, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoPublishMergeCommitResponse()
+    let commitRes = v3DiLoCoWireParseMergeCommitFill(out.commit, body, "commit")
+    if IsErr(commitRes):
+        return Err[bool](Error(commitRes))
+    let versionRes = v3DiLoCoWireParseGlobalVersionFill(out.version, body, "version")
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    return Ok[bool](true)
+
+fn v3DiLoCoFetchGlobalVersionRequestEncode(req: V3DiLoCoFetchGlobalVersionRequest): Bytes =
+    var body = ""
+    body = did.V3DidStoreAppendLine(body, "job_bundle_cid", layout.FixedBytes32Hex(req.jobBundleCid))
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageFetchGlobalVersion, body)
+
+fn v3DiLoCoFetchGlobalVersionRequestDecodeFill(out: var V3DiLoCoFetchGlobalVersionRequest,
+                                               payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageFetchGlobalVersion, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoFetchGlobalVersionRequest()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(body, "job_bundle_cid")
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoFetchGlobalVersionResponseEncode(resp: V3DiLoCoFetchGlobalVersionResponse): Bytes =
+    var body = ""
+    body = v3DiLoCoWireAppendGlobalVersion(body, "version", resp.version)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageFetchGlobalVersion, body)
+
+fn v3DiLoCoFetchGlobalVersionResponseDecodeFill(out: var V3DiLoCoFetchGlobalVersionResponse,
+                                                payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageFetchGlobalVersion, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoFetchGlobalVersionResponse()
+    return v3DiLoCoWireParseGlobalVersionFill(out.version, body, "version")
+
+fn v3DiLoCoFetchLineageRequestEncode(req: V3DiLoCoFetchLineageRequest): Bytes =
+    var body = ""
+    body = did.V3DidStoreAppendLine(body, "job_bundle_cid", layout.FixedBytes32Hex(req.jobBundleCid))
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageFetchLineage, body)
+
+fn v3DiLoCoFetchLineageRequestDecodeFill(out: var V3DiLoCoFetchLineageRequest,
+                                         payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageFetchLineage, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoFetchLineageRequest()
+    let jobBundleCidRes = v3DiLoCoWireRequireFixed32(body, "job_bundle_cid")
+    if IsErr(jobBundleCidRes):
+        return Err[bool](Error(jobBundleCidRes))
+    out.jobBundleCid = Value(jobBundleCidRes)
+    return Ok[bool](true)
+
+fn v3DiLoCoFetchLineageResponseEncode(resp: V3DiLoCoFetchLineageResponse): Bytes =
+    var body = ""
+    body = v3DiLoCoWireAppendGlobalVersionArray(body, "versions", resp.versions)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageFetchLineage, body)
+
+fn V3DiLoCoFetchLineageResponseEncodeVersions(versions: core.V3DiLoCoGlobalVersion[]): Bytes =
+    var body = ""
+    body = v3DiLoCoWireAppendGlobalVersionArray(body, "versions", versions)
+    return v3DiLoCoWireEncodeBodyEnvelope(v3DiLoCoMessageFetchLineage, body)
+
+fn V3DiLoCoFetchLineageResponseEncodePair(head: core.V3DiLoCoGlobalVersion,
+                                          tail: core.V3DiLoCoGlobalVersion): Bytes =
+    var versions: core.V3DiLoCoGlobalVersion[]
+    versions = []
+    add(versions, head)
+    add(versions, tail)
+    return V3DiLoCoFetchLineageResponseEncodeVersions(versions)
+
+fn v3DiLoCoFetchLineageResponseDecodeFill(out: var V3DiLoCoFetchLineageResponse,
+                                          payload: Bytes): Result[bool] =
+    var body = ""
+    let bodyRes = v3DiLoCoWireDecodeBodyText(payload, v3DiLoCoMessageFetchLineage, body)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    out = V3DiLoCoFetchLineageResponse()
+    return v3DiLoCoWireParseGlobalVersionArrayFill(out.versions, body, "versions")
+
+fn V3DiLoCoFetchLineageResponseDecodeOkFill(out: var V3DiLoCoFetchLineageResponse,
+                                            payload: Bytes): bool =
+    let res = v3DiLoCoFetchLineageResponseDecodeFill(out, payload)
+    return res.ok
+
+fn V3DiLoCoWireAppendJob(out: str,
+                         prefix: str,
+                         job: core.V3DiLoCoJob): str =
+    return v3DiLoCoWireAppendJob(out, prefix, job)
+
+fn V3DiLoCoWireParseJobFill(out: var core.V3DiLoCoJob,
+                            text: str,
+                            prefix: str): Result[bool] =
+    return v3DiLoCoWireParseJobFill(out, text, prefix)
+
+fn V3DiLoCoWireAppendCohort(out: str,
+                            prefix: str,
+                            cohort: core.V3DiLoCoCohort): str =
+    return v3DiLoCoWireAppendCohort(out, prefix, cohort)
+
+fn V3DiLoCoWireParseCohortFill(out: var core.V3DiLoCoCohort,
+                               text: str,
+                               prefix: str): Result[bool] =
+    return v3DiLoCoWireParseCohortFill(out, text, prefix)
+
+fn V3DiLoCoWireAppendLease(out: str,
+                           prefix: str,
+                           lease: core.V3DiLoCoLease): str =
+    return v3DiLoCoWireAppendLease(out, prefix, lease)
+
+fn V3DiLoCoWireParseLeaseFill(out: var core.V3DiLoCoLease,
+                              text: str,
+                              prefix: str): Result[bool] =
+    return v3DiLoCoWireParseLeaseFill(out, text, prefix)
+
+fn V3DiLoCoWireAppendBarrier(out: str,
+                             prefix: str,
+                             barrier: core.V3DiLoCoBarrier): str =
+    return v3DiLoCoWireAppendBarrier(out, prefix, barrier)
+
+fn V3DiLoCoWireParseBarrierFill(out: var core.V3DiLoCoBarrier,
+                                text: str,
+                                prefix: str): Result[bool] =
+    return v3DiLoCoWireParseBarrierFill(out, text, prefix)
+
+fn V3DiLoCoWireAppendOuterDelta(out: str,
+                                prefix: str,
+                                delta: core.V3DiLoCoOuterDelta): str =
+    return v3DiLoCoWireAppendOuterDelta(out, prefix, delta)
+
+fn V3DiLoCoWireParseOuterDeltaFill(out: var core.V3DiLoCoOuterDelta,
+                                   text: str,
+                                   prefix: str): Result[bool] =
+    return v3DiLoCoWireParseOuterDeltaFill(out, text, prefix)
+
+fn V3DiLoCoWireAppendMergeCommit(out: str,
+                                 prefix: str,
+                                 commit: core.V3DiLoCoMergeCommit): str =
+    return v3DiLoCoWireAppendMergeCommit(out, prefix, commit)
+
+fn V3DiLoCoWireParseMergeCommitFill(out: var core.V3DiLoCoMergeCommit,
+                                    text: str,
+                                    prefix: str): Result[bool] =
+    return v3DiLoCoWireParseMergeCommitFill(out, text, prefix)
+
+fn V3DiLoCoWireAppendGlobalVersion(out: str,
+                                   prefix: str,
+                                   version: core.V3DiLoCoGlobalVersion): str =
+    return v3DiLoCoWireAppendGlobalVersion(out, prefix, version)
+
+fn V3DiLoCoWireParseGlobalVersionFill(out: var core.V3DiLoCoGlobalVersion,
+                                      text: str,
+                                      prefix: str): Result[bool] =
+    return v3DiLoCoWireParseGlobalVersionFill(out, text, prefix)
+
+fn V3DiLoCoWireAppendStepStatus(out: str,
+                                prefix: str,
+                                status: core.V3DiLoCoStepStatus): str =
+    return v3DiLoCoWireAppendStepStatus(out, prefix, status)
+
+fn V3DiLoCoWireAppendGlobalVersionArray(out: str,
+                                        prefix: str,
+                                        values: core.V3DiLoCoGlobalVersion[]): str =
+    return v3DiLoCoWireAppendGlobalVersionArray(out, prefix, values)
+
+fn V3DiLoCoWireParseGlobalVersionArrayFill(out: var core.V3DiLoCoGlobalVersion[],
+                                           text: str,
+                                           prefix: str): Result[bool] =
+    return v3DiLoCoWireParseGlobalVersionArrayFill(out, text, prefix)

@@ -1,0 +1,87 @@
+import std/os
+import std/strutils as strutil
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as v3path
+
+fn containsText(text: str, needle: str): bool =
+    return strutil.Contains(text, needle)
+
+fn browserBridgeSmokeDriver(root: str): str =
+    let envDriver = strutil.Strip(os.GetEnv("CHENG_BROWSER_BRIDGE_DRIVER"))
+    if len(envDriver) > 0:
+        return v3path.V3PathAbsolute(root, envDriver)
+    let freshDriver = v3path.V3PathAbsolute(root, "artifacts/bootstrap/cheng.stage3.bridge_object")
+    if v3path.V3FileExistsNonEmpty(root, freshDriver):
+        return freshDriver
+    let livefullDriver = v3path.V3PathAbsolute(root, "artifacts/bootstrap/cheng.stage3.livefull")
+    if v3path.V3FileExistsNonEmpty(root, livefullDriver):
+        return livefullDriver
+    let stage3Driver = v3path.V3PathAbsolute(root, "artifacts/bootstrap/cheng.stage3")
+    if v3path.V3FileExistsNonEmpty(root, stage3Driver):
+        return stage3Driver
+    return v3path.V3PathAbsolute(root, "artifacts/backend_driver/cheng")
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let smokeLabel = os.GetEnvDefault("CHENG_SMOKE_LABEL", "host")
+    let driver = browserBridgeSmokeDriver(root)
+    let packageRoot = v3path.V3PathAbsolute(root, "v3")
+    let source = v3path.V3PathAbsolute(root, "src/tests/browser_host_native_min_smoke.cheng")
+    let outDir = v3path.V3PathAbsolute(root, "artifacts/browser_bridge_compiler_object_surface/" + smokeLabel)
+    let outBin = v3path.V3PathJoin(outDir, "browser_host_native_min_smoke")
+    let reportPath = outBin + ".report.txt"
+    let compileLog = outBin + ".compile.log"
+    let runLog = outBin + ".run.log"
+    let bridgeObjectPath = outBin + ".browser_bridge.generated.o"
+    assert(v3path.V3MkdirP(root, outDir), "v3 browser bridge compiler object: mkdir")
+    if v3path.V3PathFileExists(outBin):
+        os.RemoveFile(outBin)
+    if v3path.V3PathFileExists(reportPath):
+        os.RemoveFile(reportPath)
+    if v3path.V3PathFileExists(bridgeObjectPath):
+        os.RemoveFile(bridgeObjectPath)
+    let compileRun = hostops.v3RunFileLogged(root,
+                                             "browser_bridge_compiler_object_surface_build",
+                                             driver,
+                                             [
+                                                 "system-link-exec",
+                                                 "--root:" + packageRoot,
+                                                 "--in:" + source,
+                                                 "--emit:exe",
+                                                 "--target:arm64-apple-darwin",
+                                                 "--out:" + outBin,
+                                                 "--report-out:" + reportPath
+                                             ],
+                                             ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                             root,
+                                             0,
+                                             compileLog)
+    assert(hostops.v3LoggedRunOk(compileRun), "v3 browser bridge compiler object: compile rc")
+    assert(v3path.V3FileExistsNonEmpty(root, outBin), "v3 browser bridge compiler object: output exists")
+    assert(v3path.V3FileExistsNonEmpty(root, reportPath), "v3 browser bridge compiler object: report exists")
+    assert(v3path.V3FileExistsNonEmpty(root, bridgeObjectPath), "v3 browser bridge compiler object: bridge object exists")
+    let reportText = v3path.V3ReadTextFile("", reportPath)
+    assert(containsText(reportText, "extra_link_input=-"),
+           "v3 browser bridge compiler object: no explicit extra link input")
+    assert(containsText(reportText, "browser_bridge_object=" + bridgeObjectPath),
+           "v3 browser bridge compiler object: browser bridge object field")
+    assert(containsText(reportText, "native_browser_bridge_object=" + bridgeObjectPath),
+           "v3 browser bridge compiler object: native browser bridge object field")
+    assert(containsText(reportText, "object_link_inputs="), "v3 browser bridge compiler object: object inputs")
+    assert(containsText(reportText, bridgeObjectPath), "v3 browser bridge compiler object: object listed")
+    assert(!containsText(reportText, "extra_link_input=" + bridgeObjectPath),
+           "v3 browser bridge compiler object: internal object is not explicit link input")
+    assert(containsText(reportText, "native_link_inputs="), "v3 browser bridge compiler object: native inputs")
+    let run = hostops.v3RunFileLogged(root,
+                                      "browser_bridge_compiler_object_surface_run",
+                                      outBin,
+                                      [],
+                                      [],
+                                      root,
+                                      0,
+                                      runLog)
+    assert(hostops.v3LoggedRunOk(run), "v3 browser bridge compiler object: run rc")
+    assert(containsText(run.output, "v3 browser host wasm smoke: ok"),
+           "v3 browser bridge compiler object: runtime output")
+    echo("v3 browser_bridge_compiler_object_surface_smoke ok")
+    return 0

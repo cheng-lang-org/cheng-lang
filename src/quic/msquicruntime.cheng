@@ -1,0 +1,214 @@
+# MsQuic runtime(pure Cheng, in-process).
+
+import std/result
+import cheng/quic/platform/time
+const
+    maxMsQuicPending = 64
+
+type
+    MsQuicSettings =
+        maxPending: int32
+        maxBytesPerKey: int64
+        handshakeIdleTimeoutMs: int64
+        idleTimeoutMs: int64
+        mtuDiscoverySearchCompleteTimeoutUs: int64
+        tlsClientMaxSendBuffer: int32
+        tlsServerMaxSendBuffer: int32
+        streamRecvWindowDefault: int32
+        streamRecvBufferDefault: int32
+        connFlowControlWindow: int32
+        maxWorkerQueueDelayUs: int32
+        maxStatelessOperations: int32
+        initialWindowPackets: int32
+        sendIdleTimeoutMs: int64
+        initialRttMs: int64
+        maxAckDelayMs: int64
+        disconnectTimeoutMs: int32
+        keepAliveIntervalMs: int64
+        maxDatagram: int32
+        minimumMtu: int32
+        maximumMtu: int32
+        maxStreamsBidi: int32
+        maxStreamsUni: int32
+        sendBufferingEnabled: bool
+        pacingEnabled: bool
+        migrationEnabled: bool
+        allowDatagram: bool
+        allow0Rtt: bool
+        useBbr: bool
+        maxBindingStatelessOperations: int32
+        statelessOperationExpirationMs: int32
+        maxOperationsPerDrain: int32
+        mtuDiscoveryMissingProbeCount: int32
+        destCidUpdateIdleTimeoutMs: int32
+        eventSampleEvery: int32
+        greaseQuicBitEnabled: bool
+        versionNegotiationExtEnabled: bool
+        ecnEnabled: bool
+        hyStartEnabled: bool
+        encryptionOffloadAllowed: bool
+        reliableResetEnabled: bool
+        oneWayDelayEnabled: bool
+        netStatsEventEnabled: bool
+        streamMultiReceiveEnabled: bool
+        xdpEnabled: bool
+        qtipEnabled: bool
+        reservedRioEnabled: bool
+        streamRecvWindowBidiLocalDefault: int32
+        streamRecvWindowBidiRemoteDefault: int32
+        streamRecvWindowUnidiDefault: int32
+        ackFrequencyEnabled: bool
+
+    MsQuicRuntime =
+        settings: MsQuicSettings
+        nextConnId: int64
+        nextStreamId: int64
+        startedAtMs: int64
+
+fn msquicNowMs(): int64 =
+    return msquicPlatformNowMs()
+
+fn initMsQuicSettings(): MsQuicSettings =
+    var out: MsQuicSettings
+    out.maxPending = maxMsQuicPending
+    out.maxBytesPerKey = 0
+    out.handshakeIdleTimeoutMs = 20000
+    out.idleTimeoutMs = 30000
+    out.mtuDiscoverySearchCompleteTimeoutUs = 0
+    out.tlsClientMaxSendBuffer = 0
+    out.tlsServerMaxSendBuffer = 0
+    out.streamRecvWindowDefault = 0
+    out.streamRecvBufferDefault = 0
+    out.connFlowControlWindow = 0
+    out.maxWorkerQueueDelayUs = 0
+    out.maxStatelessOperations = 0
+    out.initialWindowPackets = 0
+    out.sendIdleTimeoutMs = 0
+    out.initialRttMs = 0
+    out.maxAckDelayMs = 25
+    out.disconnectTimeoutMs = 0
+    out.keepAliveIntervalMs = 0
+    out.maxDatagram = 65535
+    out.minimumMtu = 1200
+    out.maximumMtu = 0
+    out.maxStreamsBidi = 128
+    out.maxStreamsUni = 128
+    out.sendBufferingEnabled = true
+    out.pacingEnabled = true
+    out.migrationEnabled = true
+    out.allowDatagram = true
+    out.allow0Rtt = false
+    out.useBbr = false
+    out.maxBindingStatelessOperations = 0
+    out.statelessOperationExpirationMs = 0
+    out.maxOperationsPerDrain = 0
+    out.mtuDiscoveryMissingProbeCount = 0
+    out.destCidUpdateIdleTimeoutMs = 0
+    out.eventSampleEvery = 1
+    out.greaseQuicBitEnabled = false
+    out.versionNegotiationExtEnabled = false
+    out.ecnEnabled = false
+    out.hyStartEnabled = false
+    out.encryptionOffloadAllowed = false
+    out.reliableResetEnabled = false
+    out.oneWayDelayEnabled = false
+    out.netStatsEventEnabled = false
+    out.streamMultiReceiveEnabled = false
+    out.xdpEnabled = false
+    out.qtipEnabled = false
+    out.reservedRioEnabled = false
+    out.streamRecvWindowBidiLocalDefault = 0
+    out.streamRecvWindowBidiRemoteDefault = 0
+    out.streamRecvWindowUnidiDefault = 0
+    out.ackFrequencyEnabled = false
+    return out
+
+fn validateMsQuicSettings(s: var MsQuicSettings): Result[bool] =
+    if s.maxPending <= 0:
+        return Err[bool]("msquic: maxPending must be positive")
+    if s.maxPending > maxMsQuicPending:
+        return Err[bool]("msquic: maxPending exceeds queue capacity")
+    if s.maxBytesPerKey < 0:
+        return Err[bool]("msquic: max bytes per key must be non-negative")
+    if s.idleTimeoutMs < 0:
+        return Err[bool]("msquic: idle timeout must be non-negative")
+    if s.handshakeIdleTimeoutMs < 0:
+        return Err[bool]("msquic: handshake idle timeout must be non-negative")
+    if s.mtuDiscoverySearchCompleteTimeoutUs < 0:
+        return Err[bool]("msquic: mtu discovery search timeout must be non-negative")
+    if s.tlsClientMaxSendBuffer < 0 || s.tlsServerMaxSendBuffer < 0:
+        return Err[bool]("msquic: tls max send buffer must be non-negative")
+    if s.streamRecvBufferDefault < 0:
+        return Err[bool]("msquic: stream recv buffer must be non-negative")
+    if s.maxWorkerQueueDelayUs < 0:
+        return Err[bool]("msquic: max worker queue delay must be non-negative")
+    if s.maxStatelessOperations < 0:
+        return Err[bool]("msquic: max stateless operations must be non-negative")
+    if s.initialWindowPackets < 0:
+        return Err[bool]("msquic: initial window packets must be non-negative")
+    if s.sendIdleTimeoutMs < 0:
+        return Err[bool]("msquic: send idle timeout must be non-negative")
+    if s.keepAliveIntervalMs < 0:
+        return Err[bool]("msquic: keepalive interval must be non-negative")
+    if s.maxAckDelayMs < 0:
+        return Err[bool]("msquic: max ack delay must be non-negative")
+    if s.initialRttMs < 0:
+        return Err[bool]("msquic: initial rtt must be non-negative")
+    if s.disconnectTimeoutMs < 0:
+        return Err[bool]("msquic: disconnect timeout must be non-negative")
+    if s.maxDatagram < 0:
+        return Err[bool]("msquic: maxDatagram must be non-negative")
+    if s.minimumMtu < 0 || s.maximumMtu < 0:
+        return Err[bool]("msquic: mtu must be non-negative")
+    if s.maximumMtu > 0 && s.minimumMtu > 0 && s.maximumMtu < s.minimumMtu:
+        return Err[bool]("msquic: maximum mtu must be >= minimum mtu")
+    if s.maxStreamsBidi < 0 || s.maxStreamsUni < 0:
+        return Err[bool]("msquic: maxStreams must be non-negative")
+    if s.maxBindingStatelessOperations < 0:
+        return Err[bool]("msquic: max binding stateless operations must be non-negative")
+    if s.statelessOperationExpirationMs < 0:
+        return Err[bool]("msquic: stateless operation expiration must be non-negative")
+    if s.maxOperationsPerDrain < 0:
+        return Err[bool]("msquic: max operations per drain must be non-negative")
+    if s.mtuDiscoveryMissingProbeCount < 0:
+        return Err[bool]("msquic: mtu discovery missing probe count must be non-negative")
+    if s.destCidUpdateIdleTimeoutMs < 0:
+        return Err[bool]("msquic: dest cid update idle timeout must be non-negative")
+    if s.eventSampleEvery < 0:
+        return Err[bool]("msquic: event sample interval must be non-negative")
+    if s.connFlowControlWindow < 0:
+        return Err[bool]("msquic: conn flow control window must be non-negative")
+    if s.streamRecvWindowDefault < 0:
+        return Err[bool]("msquic: stream recv window must be non-negative")
+    if s.streamRecvWindowBidiLocalDefault < 0 || s.streamRecvWindowBidiRemoteDefault < 0 || s.streamRecvWindowUnidiDefault < 0:
+        return Err[bool]("msquic: stream recv window defaults must be non-negative")
+    return Ok[bool](true)
+
+fn initMsQuicRuntime(): MsQuicRuntime =
+    let settings: MsQuicSettings = initMsQuicSettings()
+    MsQuicRuntime(
+        settings: settings,
+        nextConnId: 1,
+        nextStreamId: 1,
+        startedAtMs: msquicNowMs()
+    )
+
+fn msquicRuntimeSettings(rt: MsQuicRuntime): MsQuicSettings =
+    rt.settings
+
+fn setMsQuicRuntimeSettings(rt: var MsQuicRuntime, settings: MsQuicSettings): Result[bool] =
+    let validRes: Result[bool] = validateMsQuicSettings(settings)
+    if IsErr(validRes):
+        return Err[bool](ErrorText(validRes))
+    rt.settings = settings
+    return Ok[bool](true)
+
+fn msquicAllocConnectionId(rt: var MsQuicRuntime): int64 =
+    let id: int64 = rt.nextConnId
+    rt.nextConnId = rt.nextConnId + 1
+    return id
+
+fn msquicAllocStreamId(rt: var MsQuicRuntime): int64 =
+    let id: int64 = rt.nextStreamId
+    rt.nextStreamId = rt.nextStreamId + 1
+    return id

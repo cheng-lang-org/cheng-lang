@@ -1,0 +1,112 @@
+import std/os
+import cheng/std/bytes_layout as layout
+import cheng/chain/consensus
+import cheng/apps/chain_node/chain_node as node
+
+fn fixed32Eq(left: layout.FixedBytes32, right: layout.FixedBytes32): bool =
+    for i in 0..<layout.fixedBytes32Size:
+        if left.data[i] != right.data[i]:
+            return false
+    return true
+
+fn main(): int32 =
+    var server: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(server, "node-a", "chain-node-a")),
+           "v3 chain_node: init")
+    let mintCidRes = node.v3ChainNodeMint(server, 7, 1001, int64(100))
+    assert(mintCidRes.ok, "v3 chain_node replay cells probe: mint")
+    let transferCidRes = node.v3ChainNodeTransfer(server, 7, 1001, 2002, int64(40))
+    assert(transferCidRes.ok, "v3 chain_node replay cells probe: transfer")
+
+    var served: node.V3ChainNodeServeSnapshot
+    node.v3ChainNodeServeOnceInto(served, server)
+    var replayed: node.V3ChainNode
+    node.v3ChainNodeZeroInto(replayed, "node-b", served.address)
+    for i in 0..<served.events.len:
+        var event = served.events[i]
+        event.stem = event.ganzhiIndex % 10
+        event.branch = event.ganzhiIndex % 12
+        event.bodyCid = consensus.v3ChainEventBodyCid(event)
+        let applyRes = node.v3ChainNodeApplyEvent(replayed, event)
+        assert(applyRes.ok, "v3 chain_node replay cells probe: replay apply")
+    node.v3ChainNodeRebuildDerived(replayed)
+
+    os.WriteLine(os.Get_stderr(), "cells:server")
+    let serverCells = node.v3ChainNodeStateCells(server.index)
+    os.WriteLine(os.Get_stderr(), "cells:replay")
+    let replayCells = node.v3ChainNodeStateCells(replayed.index)
+    os.WriteLine(os.Get_stderr(), "cells:len")
+    if serverCells.len != replayCells.len:
+        return 11
+    if serverCells.len != 2:
+        return 12
+
+    os.WriteLine(os.Get_stderr(), "cells:ids")
+    if serverCells[0].keyId != replayCells[0].keyId:
+        return 21
+    if serverCells[1].keyId != replayCells[1].keyId:
+        return 22
+    if serverCells[0].baguaId != replayCells[0].baguaId:
+        return 23
+    if serverCells[1].baguaId != replayCells[1].baguaId:
+        return 24
+    if serverCells[0].layerId != replayCells[0].layerId:
+        return 25
+    if serverCells[1].layerId != replayCells[1].layerId:
+        return 26
+    if serverCells[0].resolutionLevel != replayCells[0].resolutionLevel:
+        return 27
+    if serverCells[1].resolutionLevel != replayCells[1].resolutionLevel:
+        return 28
+    os.WriteLine(os.Get_stderr(), "cells:cids")
+    if !fixed32Eq(serverCells[0].contentCid, replayCells[0].contentCid):
+        return 31
+    if !fixed32Eq(serverCells[1].contentCid, replayCells[1].contentCid):
+        return 32
+    if !fixed32Eq(serverCells[0].localityHash, replayCells[0].localityHash):
+        return 33
+    if !fixed32Eq(serverCells[1].localityHash, replayCells[1].localityHash):
+        return 34
+    if !fixed32Eq(serverCells[0].localityCid, replayCells[0].localityCid):
+        return 35
+    if !fixed32Eq(serverCells[1].localityCid, replayCells[1].localityCid):
+        return 36
+
+    os.WriteLine(os.Get_stderr(), "cells:address")
+    if serverCells[0].address.depth != replayCells[0].address.depth:
+        return 41
+    if serverCells[1].address.depth != replayCells[1].address.depth:
+        return 42
+    if serverCells[0].address.digits[0] != replayCells[0].address.digits[0]:
+        return 43
+    if serverCells[0].address.digits[1] != replayCells[0].address.digits[1]:
+        return 44
+    if serverCells[0].address.digits[2] != replayCells[0].address.digits[2]:
+        return 45
+    if serverCells[1].address.digits[0] != replayCells[1].address.digits[0]:
+        return 46
+    if serverCells[1].address.digits[1] != replayCells[1].address.digits[1]:
+        return 47
+    if serverCells[1].address.digits[2] != replayCells[1].address.digits[2]:
+        return 48
+
+    os.WriteLine(os.Get_stderr(), "cells:prefix")
+    if serverCells[0].prefix.prefixDepth != replayCells[0].prefix.prefixDepth:
+        return 51
+    if serverCells[1].prefix.prefixDepth != replayCells[1].prefix.prefixDepth:
+        return 52
+    if serverCells[0].prefix.prefixDigits[0] != replayCells[0].prefix.prefixDigits[0]:
+        return 53
+    if serverCells[0].prefix.prefixDigits[1] != replayCells[0].prefix.prefixDigits[1]:
+        return 54
+    if serverCells[0].prefix.prefixDigits[2] != replayCells[0].prefix.prefixDigits[2]:
+        return 55
+    if serverCells[1].prefix.prefixDigits[0] != replayCells[1].prefix.prefixDigits[0]:
+        return 56
+    if serverCells[1].prefix.prefixDigits[1] != replayCells[1].prefix.prefixDigits[1]:
+        return 57
+    if serverCells[1].prefix.prefixDigits[2] != replayCells[1].prefix.prefixDigits[2]:
+        return 58
+
+    echo("v3 chain_node_replay_cells_probe ok")
+    return 0

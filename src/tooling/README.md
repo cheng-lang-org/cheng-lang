@@ -1,11 +1,11 @@
 # Cheng 工具链（Backend-only，已归档）
 
 > 迁移说明（2026-04-16）：`src/tooling/cheng_tooling.cheng` 已物理删除，`artifacts/tooling_cmd/cheng_tooling`
-> 与 `artifacts/backend_driver/cheng` 都已退出现役主线。当前 v3 统一入口是
-> `artifacts/v3_backend_driver/cheng` 和 `artifacts/v3_bootstrap/cheng.stage3`。
+> 与 `artifacts/backend_driver/cheng` 都已退出现役主线。当前统一入口是
+> `artifacts/backend_driver/cheng` 和 `artifacts/bootstrap/cheng.stage3`。
 >
-> 本文档以下内容仅保留旧 backend-only 链路的历史记录，不能再当作 v3 的现行操作手册。
-> 当前请优先阅读 `v3/tooling/README.md`。
+> 本文档以下内容仅保留旧 backend-only 链路的历史记录，不能再当作当前主线操作手册。
+> 当前请优先阅读 `src/tooling/README.md`。
 
 > 进一步收口说明（2026-04-16）：
 > `src/tooling` 现在只保留 live ABI 合同和历史记录。旧 package/mobile/demo/fullchain/backend-only
@@ -14,6 +14,17 @@
 >
 > `src/tooling/cheng_tooling_embedded_scripts/` 已整体删除。下文再出现这批 wrapper/source 模板，
 > 一律只按历史档案理解。
+
+## 当前 v3 主入口合同
+
+- `artifacts/bootstrap/cheng.stage3 run-production-regression`
+- production regression smoke contract: `build_backend_driver_report_smoke perf_memory_gate_contract_smoke perf_memory_contract_smoke cheng_skill_consistency_smoke dev_hotpatch_100ms_scope_contract_smoke explicit_default_init_positive_smoke explicit_default_init_negative_smoke explicit_default_init_gate_smoke composite_zero_helper_gate_smoke latest_snapshot_port_preserves_live_str_smoke list_literal_nested_call_depth_smoke libp2p_quic_twoproc_server_pre_quic_smoke`
+- `perf_memory_contract_smoke` 默认优先测 `artifacts/backend_driver/cheng`；只有显式 `CHENG_SMOKE_COMPILER` 才覆盖。
+- Darwin 正式内存比较值优先用 `peak memory footprint`；`maximum resident set size` 只保留原始观测，不作为稳定合同阈值。
+- `artifacts/bootstrap/cheng.stage3 profile-run --in:/abs/path/file.cheng --target:arm64-apple-darwin --out:/tmp/app`
+- `artifacts/bootstrap/cheng.stage3 profile-report --in:/tmp/app.v3.profile.raw.txt --out:/tmp/app.profile.txt`
+- `artifacts/backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
+- `artifacts/backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
 
 ## 进程通知（2026-02-25：单 Driver 收口）
 
@@ -147,7 +158,7 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
 - `cheng` 入口（canonical）支持 `--emit:exe`；`--emit-obj/--obj-out/--backend:obj` 已在生产链路移除并会直接报错。`compile/chengc` 已移除并返回 `rc=2`；`cheng` 固定 dev-only：固定注入 `BACKEND_BUILD_TRACK=dev`、`BACKEND_FAST_DEV_PROFILE=1`、`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`、`BACKEND_LINKERLESS_INMEM=1`、`BACKEND_FAST_FALLBACK_ALLOW=0`，并显式透传 `BACKEND_JOBS/BACKEND_FN_JOBS`（未设置时走 host 并行默认），同时拒绝 `--release` 与 `BACKEND_BUILD_TRACK=release` 抬升。
 - 发布编译入口改为 `release-compile`：固定 `BACKEND_BUILD_TRACK=release`、`BACKEND_LINKER=system`、`BACKEND_STAGE1_PARSE_MODE=full`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=0`、`BACKEND_LINKERLESS_INMEM=0`、`BACKEND_FAST_FALLBACK_ALLOW=0`、`BACKEND_OPT_LEVEL=3`（默认 `BACKEND_RELEASE_CFLAGS/BACKEND_RELEASE_LDFLAGS=-O3 -flto`），并显式透传 `BACKEND_JOBS/BACKEND_FN_JOBS`。system-link 默认只链接纯 Cheng runtime object：优先吃显式 `BACKEND_RUNTIME_OBJ`，否则自动解析 `chengcache/runtime_selflink/program_runtime.combined.<target>.o`；如果这份组合物不存在，就从 `chengcache/runtime_selflink/probe_split/` 下的程序 runtime 五件套现场合成，再直接使用；仍然找不到就直接失败。
 - `release-compile` 支持 `--emit:exe|shared|static`。其中 `shared/static` 走 release object-first 打包链（后端先产 `obj`，再由系统工具链打包库；默认附带 runtime C object，可用 `BACKEND_RELEASE_LIBRARY_INCLUDE_RUNTIME=0` 关闭）。
-- `verify-export-visibility` 会扫描仓内 `src/`、`v2/src/`、`v3/src/`、`v3/codex/src/` 的 Cheng 源文件，硬失败任何跨包小写私有符号访问；`build-backend-driver` 与 `run-host-smokes` 现在都会先强制跑这条门禁。
+- `verify-export-visibility` 会扫描仓内 `src/`、`v2/src/`、`codex/src/` 的 Cheng 源文件，硬失败任何跨包小写私有符号访问；`build-backend-driver` 与 `run-host-smokes` 现在都会先强制跑这条门禁。
 - `cheng/release-compile` 都不接受 `--linker:*`，也不接受 `BACKEND_LINKER` 环境覆盖；`cheng` 固定 `self-link + direct-exe`，`release-compile` 固定 `system-link`。
 - 并发公开契约：`BACKEND_JOBS` 是唯一公开 worker 数控制面；`BACKEND_FN_SCHED=serial` 仅保留给内部诊断、perf 对照与低内存 bring-up。
 - `--emit:shared|static` 不允许 `--run/--run:*`；违规返回 `rc=2`。
@@ -710,7 +721,7 @@ cheng_tooling verify_libp2p_prod_closure
 cheng_tooling verify_backend_runtime_abi
 ```
 说明：
-- 校验 [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 加最小 ABI 头 [v3_runtime_abi.h](/Users/lbcheng/cheng-lang/v3/src/runtime/v3_runtime_abi.h) 形成的 runtime 合同与兼容 surface 一致性。
+- 校验 [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 加最小 ABI 头 [v3_runtime_abi.h](/Users/lbcheng/cheng-lang/src/core/runtime/v3_runtime_abi.h) 形成的 runtime 合同与兼容 surface 一致性。
 - 统一权威路径现在固定写在 [backend_runtime_abi_contract.env](/Users/lbcheng/cheng-lang/src/tooling/backend_runtime_abi_contract.env)，对应的脚本入口是 [backend_runtime_abi_contract.sh](/Users/lbcheng/cheng-lang/src/tooling/cheng_tooling_embedded_scripts/backend_runtime_abi_contract.sh)；`verify_backend_runtime_abi`、`verify_backend_ffi_handle_sandbox`、`verify_backend_pure_cheng_surface`、`build_mobile_export` 与 `verify_backend_selfhost_bootstrap_self_obj` 都从这里取 live 路径。
 - `verify.sh`、`verify_backend_closedloop` 与 CI（Linux amd64 / macOS arm64）会执行此检查。
 

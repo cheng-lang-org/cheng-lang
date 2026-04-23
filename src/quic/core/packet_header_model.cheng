@@ -1,0 +1,270 @@
+# QUIC packet header model(RFC 9000, minimal).
+
+import std/result
+import std/rawbytes
+import std/buffer
+import cheng/quic/core/quic_varint
+const
+    quicLongHeaderFormBit = 0x80
+    quicFixedBit = 0x40
+    quicSpinBit = 0x20
+    quicKeyPhaseBit = 0x04
+    quicPnlMask = 0x03
+    quicReservedBitsLongMask = 0x0c
+    quicReservedBitsShortMask = 0x18
+
+type
+    QuicPacketType = enum
+        QuicPacketShort = 0
+        QuicPacketInitial = 1
+        QuicPacket0Rtt = 2
+        QuicPacketHandshake = 3
+        QuicPacketRetry = 4
+
+    QuicPacketHeader =
+        longHeader: bool
+        packetType: QuicPacketType
+        version: int32
+        dcid: Bytes
+        scid: Bytes
+        token: Bytes
+        payloadLength: int64
+        packetNumber: int64
+        packetNumberLen: int32
+        spinBit: bool
+        keyPhase: bool
+
+    QuicPacketHeaderDecoded =
+        header: QuicPacketHeader
+        next: int32
+
+fn quicPacketTypeToBits(packetType: QuicPacketType): int32 =
+    if packetType == QuicPacketInitial:
+        return 0
+    if packetType == QuicPacket0Rtt:
+        return 1
+    if packetType == QuicPacketHandshake:
+        return 2
+    if packetType == QuicPacketRetry:
+        return 3
+    return -1
+
+fn quicPacketTypeFromBits(bits: int32): QuicPacketType =
+    if bits == 0:
+        return QuicPacketInitial
+    if bits == 1:
+        return QuicPacket0Rtt
+    if bits == 2:
+        return QuicPacketHandshake
+    return QuicPacketRetry
+
+fn quicPacketNumberEncode(number: int64, length: int32): Result[Bytes] =
+    if length < 1 || length > 4:
+        return Err[Bytes]("quic header: invalid packet number length")
+    if number < 0:
+        return Err[Bytes]("quic header: negative packet number")
+    let out: Bytes = bytesAlloc(length)
+    for i in 0..<length:
+        let shift: int32 = (length - 1 - i) * 8
+        let b: int32 = int32((number >> shift) & 0xff)
+        bytesSet(out, i, b)
+    return Ok[Bytes](out)
+
+fn quicPacketNumberDecode(data: Bytes, offset: int32, length: int32): Result[QuicVarIntDecoded] =
+    if length < 1 || length > 4:
+        return Err[QuicVarIntDecoded]("quic header: invalid packet number length")
+    if offset < 0 || offset + length > bytesLen(data):
+        return Err[QuicVarIntDecoded]("quic header: packet number truncated")
+    var value: int64
+    for i in 0..<length:
+        value = (value << 8) | int64(bytesGet(data, offset + i))
+    return Ok[QuicVarIntDecoded](QuicVarIntDecoded(value: value, next: offset + length))
+
+fn quicPacketHeaderEncode(header: QuicPacketHeader): Result[Bytes] =
+    if bytesLen(header.dcid) > 255 || bytesLen(header.scid) > 255:
+        return Err[Bytes]("quic header: connection id too long")
+    var buf: ByteBuffer = newByteBuffer()
+    if header.longHeader:
+        if header.packetType == QuicPacketShort:
+            return Err[Bytes]("quic header: short type in long header")
+        let typeBits: int32 = quicPacketTypeToBits(header.packetType)
+        if typeBits < 0:
+            return Err[Bytes]("quic header: invalid long header type")
+        if header.packetType == QuicPacketRetry:
+            let first: int32 = quicLongHeaderFormBit | quicFixedBit | (typeBits << 4)
+            appendByte(buf, first)
+            appendByte(buf, int32((header.version >> 24) & 0xff))
+            appendByte(buf, int32((header.version >> 16) & 0xff))
+            appendByte(buf, int32((header.version >> 8) & 0xff))
+            appendByte(buf, int32(header.version & 0xff))
+            appendByte(buf, bytesLen(header.dcid))
+            if bytesLen(header.dcid) > 0:
+                let dcid: Bytes = header.dcid
+                appendBytes(buf, dcid)
+            appendByte(buf, bytesLen(header.scid))
+            if bytesLen(header.scid) > 0:
+                let scid: Bytes = header.scid
+                appendBytes(buf, scid)
+            if bytesLen(header.token) > 0:
+                let token: Bytes = header.token
+                appendBytes(buf, token)
+            return Ok[Bytes](toBytes(buf))
+        if header.packetNumberLen < 1 || header.packetNumberLen > 4:
+            return Err[Bytes]("quic header: invalid packet number length")
+        let first: int32 = quicLongHeaderFormBit | quicFixedBit | (typeBits << 4) | (header.packetNumberLen - 1)
+        appendByte(buf, first)
+        appendByte(buf, int32((header.version >> 24) & 0xff))
+        appendByte(buf, int32((header.version >> 16) & 0xff))
+        appendByte(buf, int32((header.version >> 8) & 0xff))
+        appendByte(buf, int32(header.version & 0xff))
+        appendByte(buf, bytesLen(header.dcid))
+        if bytesLen(header.dcid) > 0:
+            let dcid: Bytes = header.dcid
+            appendBytes(buf, dcid)
+        appendByte(buf, bytesLen(header.scid))
+        if bytesLen(header.scid) > 0:
+            let scid: Bytes = header.scid
+            appendBytes(buf, scid)
+        if header.packetType == QuicPacketInitial:
+            let tokenLen: int64 = int64(bytesLen(header.token))
+            let tokenRes: Result[bool] = quicVarIntAppend(buf, tokenLen)
+            if IsErr(tokenRes):
+                return Err[Bytes](ErrorText(tokenRes))
+            if tokenLen > 0:
+                let token: Bytes = header.token
+                appendBytes(buf, token)
+        let lenRes: Result[bool] = quicVarIntAppend(buf, header.payloadLength)
+        if IsErr(lenRes):
+            return Err[Bytes](ErrorText(lenRes))
+        let pnRes: Result[Bytes] = quicPacketNumberEncode(header.packetNumber, header.packetNumberLen)
+        if IsErr(pnRes):
+            return Err[Bytes](ErrorText(pnRes))
+        let pnBytes: Bytes = Value(pnRes)
+        appendBytes(buf, pnBytes)
+        return Ok[Bytes](toBytes(buf))
+    if header.packetNumberLen < 1 || header.packetNumberLen > 4:
+        return Err[Bytes]("quic header: invalid packet number length")
+    let spinBitValue: int32 = if header.spinBit: quicSpinBit else: 0
+    let keyPhaseValue: int32 = if header.keyPhase: quicKeyPhaseBit else: 0
+    let first: int32 = quicFixedBit | spinBitValue | keyPhaseValue | (header.packetNumberLen - 1)
+    appendByte(buf, first)
+    if bytesLen(header.dcid) > 0:
+        let dcid: Bytes = header.dcid
+        appendBytes(buf, dcid)
+    let pnRes: Result[Bytes] = quicPacketNumberEncode(header.packetNumber, header.packetNumberLen)
+    if IsErr(pnRes):
+        return Err[Bytes](ErrorText(pnRes))
+    let pnBytes: Bytes = Value(pnRes)
+    appendBytes(buf, pnBytes)
+    return Ok[Bytes](toBytes(buf))
+
+fn quicPacketHeaderDecode(data: Bytes, shortDcidLen: int32): Result[QuicPacketHeaderDecoded] =
+    if bytesLen(data) <= 0:
+        return Err[QuicPacketHeaderDecoded]("quic header: empty input")
+    let first: int32 = bytesGet(data, 0)
+    let isLong: bool = (first & quicLongHeaderFormBit) != 0
+    if (first & quicFixedBit) == 0:
+        return Err[QuicPacketHeaderDecoded]("quic header: fixed bit ! set")
+    if isLong:
+        let typeBits: int32 = (first >> 4) & 0x3
+        let packetType: QuicPacketType = quicPacketTypeFromBits(typeBits)
+        if bytesLen(data) < 6:
+            return Err[QuicPacketHeaderDecoded]("quic header: truncated long header")
+        let version: int32 = (bytesGet(data, 1) << 24) | (bytesGet(data, 2) << 16) | (bytesGet(data, 3) << 8) | bytesGet(data, 4)
+        var offset: int32 = 5
+        let dcidLen: int32 = bytesGet(data, offset)
+        offset = offset + 1
+        if offset + dcidLen > bytesLen(data):
+            return Err[QuicPacketHeaderDecoded]("quic header: dcid truncated")
+        let dcid: Bytes = if dcidLen > 0: bytesSlice(data, offset, dcidLen) else: emptyBytes()
+        offset = offset + dcidLen
+        if offset >= bytesLen(data):
+            return Err[QuicPacketHeaderDecoded]("quic header: scid length missing")
+        let scidLen: int32 = bytesGet(data, offset)
+        offset = offset + 1
+        if offset + scidLen > bytesLen(data):
+            return Err[QuicPacketHeaderDecoded]("quic header: scid truncated")
+        let scid: Bytes = if scidLen > 0: bytesSlice(data, offset, scidLen) else: emptyBytes()
+        offset = offset + scidLen
+        if packetType == QuicPacketRetry:
+            let token: Bytes = if offset < bytesLen(data): bytesSlice(data, offset, bytesLen(data) - offset) else: emptyBytes()
+            let header: QuicPacketHeader = QuicPacketHeader(
+                longHeader: true,
+                packetType: packetType,
+                version: version,
+                dcid: dcid,
+                scid: scid,
+                token: token,
+                payloadLength: 0,
+                packetNumber: 0,
+                packetNumberLen: 0,
+                spinBit: false,
+                keyPhase: false
+            )
+            return Ok[QuicPacketHeaderDecoded](QuicPacketHeaderDecoded(header: header, next: bytesLen(data)))
+        let pnLen: int32 = (first & quicPnlMask) + 1
+        var token: Bytes = emptyBytes()
+        if packetType == QuicPacketInitial:
+            let tokenLenRes: Result[QuicVarIntDecoded] = quicVarIntDecode(data, offset)
+            if IsErr(tokenLenRes):
+                return Err[QuicPacketHeaderDecoded](ErrorText(tokenLenRes))
+            let tokenLen: int64 = Value(tokenLenRes).value
+            offset = Value(tokenLenRes).next
+            if tokenLen < 0 || offset + int32(tokenLen) > bytesLen(data):
+                return Err[QuicPacketHeaderDecoded]("quic header: token truncated")
+            if tokenLen > 0:
+                token = bytesSlice(data, offset, int32(tokenLen))
+            else:
+                token = emptyBytes()
+            offset = offset + int32(tokenLen)
+        let payloadRes: Result[QuicVarIntDecoded] = quicVarIntDecode(data, offset)
+        if IsErr(payloadRes):
+            return Err[QuicPacketHeaderDecoded](ErrorText(payloadRes))
+        let payloadLength: int64 = Value(payloadRes).value
+        offset = Value(payloadRes).next
+        let pnRes: Result[QuicVarIntDecoded] = quicPacketNumberDecode(data, offset, pnLen)
+        if IsErr(pnRes):
+            return Err[QuicPacketHeaderDecoded](ErrorText(pnRes))
+        let packetNumber: int64 = Value(pnRes).value
+        offset = Value(pnRes).next
+        let header: QuicPacketHeader = QuicPacketHeader(
+            longHeader: true,
+            packetType: packetType,
+            version: version,
+            dcid: dcid,
+            scid: scid,
+            token: token,
+            payloadLength: payloadLength,
+            packetNumber: packetNumber,
+            packetNumberLen: pnLen,
+            spinBit: false,
+            keyPhase: false
+        )
+        return Ok[QuicPacketHeaderDecoded](QuicPacketHeaderDecoded(header: header, next: offset))
+    if shortDcidLen < 0:
+        return Err[QuicPacketHeaderDecoded]("quic header: invalid short dcid length")
+    let pnLen: int32 = (first & quicPnlMask) + 1
+    let spinBit: bool = (first & quicSpinBit) != 0
+    let keyPhase: bool = (first & quicKeyPhaseBit) != 0
+    var offset: int32 = 1
+    if offset + shortDcidLen > bytesLen(data):
+        return Err[QuicPacketHeaderDecoded]("quic header: short dcid truncated")
+    let dcid: Bytes = if shortDcidLen > 0: bytesSlice(data, offset, shortDcidLen) else: emptyBytes()
+    offset = offset + shortDcidLen
+    let pnRes: Result[QuicVarIntDecoded] = quicPacketNumberDecode(data, offset, pnLen)
+    if IsErr(pnRes):
+        return Err[QuicPacketHeaderDecoded](ErrorText(pnRes))
+    let header: QuicPacketHeader = QuicPacketHeader(
+        longHeader: false,
+        packetType: QuicPacketShort,
+        version: 0,
+        dcid: dcid,
+        scid: emptyBytes(),
+        token: emptyBytes(),
+        payloadLength: 0,
+        packetNumber: Value(pnRes).value,
+        packetNumberLen: pnLen,
+        spinBit: spinBit,
+        keyPhase: keyPhase
+    )
+    return Ok[QuicPacketHeaderDecoded](QuicPacketHeaderDecoded(header: header, next: Value(pnRes).next))

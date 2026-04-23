@@ -1,0 +1,218 @@
+import std/result
+import std/system as system
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/chain/lsmr_types as lt
+
+type
+    V3ChengNodeEventRecord =
+        seq: int32
+        actorName: str
+        objectKind: str
+        indexGroup: str
+        lookupKind: str
+        keyText: str
+        payloadCid: layout.FixedBytes32
+        prevEventCid: layout.FixedBytes32
+        eventCid: layout.FixedBytes32
+
+    V3ChengNodeSnapshotSegment =
+        snapshotVersion: int32
+        startSeq: int32
+        endSeq: int32
+        snapshotCid: layout.FixedBytes32
+        segmentCid: layout.FixedBytes32
+
+    V3ChengNodeManifest =
+        version: int32
+        headSeq: int32
+        headEventCid: layout.FixedBytes32
+        snapshotVersion: int32
+        snapshotCid: layout.FixedBytes32
+        segmentSnapshotVersions: int32[]
+        segmentStartSeqs: int32[]
+        segmentEndSeqs: int32[]
+        segmentCids: layout.FixedBytes32[]
+        headCid: layout.FixedBytes32
+
+    V3ChengNodeProofBundle =
+        version: int32
+        indexGroup: str
+        lookupKind: str
+        keyText: str
+        valueCid: layout.FixedBytes32
+        eventCid: layout.FixedBytes32
+        manifestHeadCid: layout.FixedBytes32
+        snapshotVersion: int32
+        snapshotCid: layout.FixedBytes32
+        proofCid: layout.FixedBytes32
+
+    V3ChengNodeLedger =
+        manifest: V3ChengNodeManifest
+        events: V3ChengNodeEventRecord[]
+        segments: V3ChengNodeSnapshotSegment[]
+        proofs: V3ChengNodeProofBundle[]
+
+fn v3ChengNodeLedgerOwnText(text: str): str =
+    return system.SystemToStringStr(text)
+
+fn v3ChengNodeLedgerAppendText(buf: var layout.ByteBuf, text: str) =
+    lt.v3AppendU32BE(buf, len(text))
+    for i in 0..<len(text):
+        layout.byteBufAppendByte(buf, int32(text[i]) & 255)
+
+fn v3ChengNodeLedgerAppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
+    lt.v3AppendFixed32(buf, value)
+
+fn v3ChengNodeLedgerBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
+    let data = layout.byteBufToBytes(buf)
+    return hash256.sha256Fixed(layout.byteSpanFromBytes(data))
+
+fn v3ChengNodeLedgerEventCid(event: V3ChengNodeEventRecord): layout.FixedBytes32 =
+    var buf = layout.byteBufInit(256)
+    v3ChengNodeLedgerAppendText(buf, "cheng_node.event")
+    lt.v3AppendU32BE(buf, event.seq)
+    v3ChengNodeLedgerAppendText(buf, event.actorName)
+    v3ChengNodeLedgerAppendText(buf, event.objectKind)
+    v3ChengNodeLedgerAppendText(buf, event.indexGroup)
+    v3ChengNodeLedgerAppendText(buf, event.lookupKind)
+    v3ChengNodeLedgerAppendText(buf, event.keyText)
+    v3ChengNodeLedgerAppendFixed32(buf, event.payloadCid)
+    v3ChengNodeLedgerAppendFixed32(buf, event.prevEventCid)
+    return v3ChengNodeLedgerBufCid(buf)
+
+fn v3ChengNodeLedgerSegmentCid(segment: V3ChengNodeSnapshotSegment,
+                               headEventCid: layout.FixedBytes32): layout.FixedBytes32 =
+    var buf = layout.byteBufInit(192)
+    v3ChengNodeLedgerAppendText(buf, "cheng_node.snapshot_segment")
+    lt.v3AppendU32BE(buf, segment.snapshotVersion)
+    lt.v3AppendU32BE(buf, segment.startSeq)
+    lt.v3AppendU32BE(buf, segment.endSeq)
+    v3ChengNodeLedgerAppendFixed32(buf, segment.snapshotCid)
+    v3ChengNodeLedgerAppendFixed32(buf, headEventCid)
+    return v3ChengNodeLedgerBufCid(buf)
+
+fn v3ChengNodeLedgerRefreshManifestHead(manifest: var V3ChengNodeManifest) =
+    if manifest.segmentSnapshotVersions.len != manifest.segmentCids.len:
+        panic "cheng_node ledger: manifest snapshot version count mismatch"
+    if manifest.segmentStartSeqs.len != manifest.segmentCids.len:
+        panic "cheng_node ledger: manifest segment start count mismatch"
+    if manifest.segmentEndSeqs.len != manifest.segmentCids.len:
+        panic "cheng_node ledger: manifest segment end count mismatch"
+    if manifest.segmentCids.len > 4096:
+        panic "cheng_node ledger: manifest segment count overflow"
+    var buf = layout.byteBufInit(256)
+    v3ChengNodeLedgerAppendText(buf, "cheng_node.manifest")
+    lt.v3AppendU32BE(buf, manifest.version)
+    lt.v3AppendU32BE(buf, manifest.headSeq)
+    v3ChengNodeLedgerAppendFixed32(buf, manifest.headEventCid)
+    lt.v3AppendU32BE(buf, manifest.snapshotVersion)
+    v3ChengNodeLedgerAppendFixed32(buf, manifest.snapshotCid)
+    lt.v3AppendU32BE(buf, manifest.segmentCids.len)
+    for i in 0..<manifest.segmentCids.len:
+        lt.v3AppendU32BE(buf, manifest.segmentSnapshotVersions[i])
+        lt.v3AppendU32BE(buf, manifest.segmentStartSeqs[i])
+        lt.v3AppendU32BE(buf, manifest.segmentEndSeqs[i])
+        v3ChengNodeLedgerAppendFixed32(buf, manifest.segmentCids[i])
+    if layout.byteBufLen(buf) > 4096:
+        panic "cheng_node ledger: manifest head wire overflow"
+    manifest.headCid = v3ChengNodeLedgerBufCid(buf)
+
+fn V3ChengNodeLedgerInit(): V3ChengNodeLedger =
+    var out: V3ChengNodeLedger
+    out.events = []
+    out.segments = []
+    out.proofs = []
+    out.manifest.version = 1
+    out.manifest.headSeq = 0
+    out.manifest.headEventCid = layout.FixedBytes32()
+    out.manifest.snapshotVersion = 0
+    out.manifest.snapshotCid = layout.FixedBytes32()
+    out.manifest.segmentSnapshotVersions = []
+    out.manifest.segmentStartSeqs = []
+    out.manifest.segmentEndSeqs = []
+    out.manifest.segmentCids = []
+    v3ChengNodeLedgerRefreshManifestHead(out.manifest)
+    return out
+
+fn V3ChengNodeLedgerAppend(ledger: var V3ChengNodeLedger,
+                           actorName: str,
+                           objectKind: str,
+                           indexGroup: str,
+                           lookupKind: str,
+                           keyText: str,
+                           payloadCid: layout.FixedBytes32): Result[V3ChengNodeEventRecord] =
+    if len(actorName) <= 0:
+        return Err[V3ChengNodeEventRecord]("cheng_node ledger: empty actor")
+    if len(indexGroup) <= 0:
+        return Err[V3ChengNodeEventRecord]("cheng_node ledger: empty index group")
+    let prevEventCid = ledger.manifest.headEventCid
+    var event: V3ChengNodeEventRecord
+    event.seq = ledger.events.len + 1
+    event.actorName = v3ChengNodeLedgerOwnText(actorName)
+    event.objectKind = v3ChengNodeLedgerOwnText(objectKind)
+    event.indexGroup = v3ChengNodeLedgerOwnText(indexGroup)
+    event.lookupKind = v3ChengNodeLedgerOwnText(lookupKind)
+    event.keyText = v3ChengNodeLedgerOwnText(keyText)
+    event.payloadCid = payloadCid
+    event.prevEventCid = prevEventCid
+    event.eventCid = v3ChengNodeLedgerEventCid(event)
+    add(ledger.events, event)
+    ledger.manifest.headSeq = event.seq
+    ledger.manifest.headEventCid = event.eventCid
+    v3ChengNodeLedgerRefreshManifestHead(ledger.manifest)
+    return Ok[V3ChengNodeEventRecord](event)
+
+fn V3ChengNodeLedgerSealSnapshot(ledger: var V3ChengNodeLedger,
+                                 snapshotVersion: int32,
+                                 snapshotCid: layout.FixedBytes32): Result[V3ChengNodeSnapshotSegment] =
+    if snapshotVersion <= 0:
+        return Err[V3ChengNodeSnapshotSegment]("cheng_node ledger: invalid snapshot version")
+    var segment: V3ChengNodeSnapshotSegment
+    segment.snapshotVersion = snapshotVersion
+    if ledger.segments.len > 0:
+        segment.startSeq = ledger.segments[ledger.segments.len - 1].endSeq + 1
+    else:
+        segment.startSeq = ledger.manifest.headSeq > 0 ? 1 : 0
+    segment.endSeq = ledger.manifest.headSeq
+    segment.snapshotCid = snapshotCid
+    segment.segmentCid = v3ChengNodeLedgerSegmentCid(segment, ledger.manifest.headEventCid)
+    add(ledger.segments, segment)
+    add(ledger.manifest.segmentSnapshotVersions, segment.snapshotVersion)
+    add(ledger.manifest.segmentStartSeqs, segment.startSeq)
+    add(ledger.manifest.segmentEndSeqs, segment.endSeq)
+    add(ledger.manifest.segmentCids, segment.segmentCid)
+    ledger.manifest.snapshotVersion = snapshotVersion
+    ledger.manifest.snapshotCid = snapshotCid
+    v3ChengNodeLedgerRefreshManifestHead(ledger.manifest)
+    return Ok[V3ChengNodeSnapshotSegment](segment)
+
+fn V3ChengNodeLedgerBuildProof(ledger: var V3ChengNodeLedger,
+                               indexGroup: str,
+                               lookupKind: str,
+                               keyText: str,
+                               valueCid: layout.FixedBytes32,
+                               eventCid: layout.FixedBytes32): Result[V3ChengNodeProofBundle] =
+    var proof: V3ChengNodeProofBundle
+    proof.version = 1
+    proof.indexGroup = v3ChengNodeLedgerOwnText(indexGroup)
+    proof.lookupKind = v3ChengNodeLedgerOwnText(lookupKind)
+    proof.keyText = v3ChengNodeLedgerOwnText(keyText)
+    proof.valueCid = valueCid
+    proof.eventCid = eventCid
+    proof.manifestHeadCid = ledger.manifest.headCid
+    proof.snapshotVersion = ledger.manifest.snapshotVersion
+    proof.snapshotCid = ledger.manifest.snapshotCid
+    var buf = layout.byteBufInit(256)
+    v3ChengNodeLedgerAppendText(buf, "cheng_node.proof")
+    v3ChengNodeLedgerAppendText(buf, proof.indexGroup)
+    v3ChengNodeLedgerAppendText(buf, proof.lookupKind)
+    v3ChengNodeLedgerAppendText(buf, proof.keyText)
+    v3ChengNodeLedgerAppendFixed32(buf, proof.valueCid)
+    v3ChengNodeLedgerAppendFixed32(buf, proof.eventCid)
+    v3ChengNodeLedgerAppendFixed32(buf, proof.manifestHeadCid)
+    lt.v3AppendU32BE(buf, proof.snapshotVersion)
+    v3ChengNodeLedgerAppendFixed32(buf, proof.snapshotCid)
+    proof.proofCid = v3ChengNodeLedgerBufCid(buf)
+    add(ledger.proofs, proof)
+    return Ok[V3ChengNodeProofBundle](proof)

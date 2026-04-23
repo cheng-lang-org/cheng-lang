@@ -1,0 +1,133 @@
+import std/system
+import std/strutils as strutil
+import cheng/std/bytes_layout as layout
+import cheng/libp2p/core/types
+import cheng/libp2p/core/multiaddr
+import cheng/libp2p/protocols/webrtc_signal as signal
+import cheng/libp2p/transports/webrtc_transport
+
+fn smokeSessionId(): layout.FixedBytes32 =
+    var out = layout.FixedBytes32()
+    out.data[0] = 11
+    out.data[1] = 22
+    out.data[2] = 33
+    out.data[3] = 44
+    return out
+
+fn main(): int32 =
+    let sessionId = smokeSessionId()
+
+    var offer: signal.V3Libp2pWebrtcSignalMessage
+    offer.kind = signal.v3Libp2pWebrtcSignalOffer
+    offer.sessionId = sessionId
+    offer.sdp = "v=0\no=- 1 2 IN IP4 127.0.0.1"
+    let offerBytes = signal.v3Libp2pWebrtcSignalEncode(offer)
+    let offerRes = signal.v3Libp2pWebrtcSignalDecode(offerBytes)
+    assert(IsOk(offerRes), "v3 webrtc signal codec: decode offer")
+    let decodedOffer = Value(offerRes)
+    assert(decodedOffer.kind == signal.v3Libp2pWebrtcSignalOffer,
+        "v3 webrtc signal codec: offer kind")
+    assert(layout.fixedBytes32Equal(decodedOffer.sessionId, sessionId),
+        "v3 webrtc signal codec: offer session")
+    assert(decodedOffer.sdp == offer.sdp, "v3 webrtc signal codec: offer sdp")
+
+    var candidate: signal.V3Libp2pWebrtcSignalMessage
+    candidate.kind = signal.v3Libp2pWebrtcSignalIceCandidate
+    candidate.sessionId = sessionId
+    candidate.candidateMid = "0"
+    candidate.candidateMLineIndex = 0
+    candidate.candidateText = "candidate:1 1 udp 2130706431 127.0.0.1 3478 typ host"
+    let candidateBytes = signal.v3Libp2pWebrtcSignalEncode(candidate)
+    let candidateRes = signal.v3Libp2pWebrtcSignalDecode(candidateBytes)
+    assert(IsOk(candidateRes), "v3 webrtc signal codec: decode candidate")
+    let decodedCandidate = Value(candidateRes)
+    assert(decodedCandidate.candidateMid == "0", "v3 webrtc signal codec: candidate mid")
+    assert(decodedCandidate.candidateText == candidate.candidateText,
+        "v3 webrtc signal codec: candidate text")
+
+    var cfg: webrtc_transport.V3Libp2pWebrtcTransportConfig
+    cfg.relayOnly = true
+    cfg.stunUrls = ["stun:stun1.example.net", "stun:stun2.example.net"]
+    let turnInsert: signal.V3Libp2pWebrtcTurnServer
+    add(cfg.turnServers, turnInsert)
+    cfg.turnServers[0].url = "turn:turn.example.net"
+    cfg.turnServers[0].username = "alice"
+    cfg.turnServers[0].credential = "secret"
+
+    let policyMsg = webrtc_transport.v3Libp2pWebrtcTransportSignalPolicy(cfg, sessionId)
+    let policyBytes = signal.v3Libp2pWebrtcSignalEncode(policyMsg)
+    let policyRes = signal.v3Libp2pWebrtcSignalDecode(policyBytes)
+    assert(IsOk(policyRes), "v3 webrtc signal codec: decode policy")
+    let decodedPolicy = Value(policyRes)
+    assert(decodedPolicy.kind == signal.v3Libp2pWebrtcSignalTurnPolicy,
+        "v3 webrtc signal codec: policy kind")
+    assert(decodedPolicy.relayOnly, "v3 webrtc signal codec: relay only")
+    assert(decodedPolicy.stunUrls.len == 2, "v3 webrtc signal codec: stun count")
+    assert(decodedPolicy.turnServers.len == 1, "v3 webrtc signal codec: turn count")
+    assert(decodedPolicy.turnServers[0].username == "alice",
+        "v3 webrtc signal codec: turn username")
+
+    var webrtcAddr: types.V3Libp2pMultiaddr
+    webrtcAddr.host = "203.0.113.77"
+    webrtcAddr.port = 9000
+    webrtcAddr.transport = types.v3Libp2pTransportWebrtc
+    webrtcAddr.networkDomain = types.v3Libp2pNetworkDomainBrowserWebrtc
+    webrtcAddr.visibility = types.v3Libp2pVisibilityPublic
+    assert(webrtc_transport.v3Libp2pWebrtcTransportSupportsAddr(webrtcAddr),
+        "v3 webrtc signal codec: transport supports browser addr")
+    assert(types.v3Libp2pTransportText(types.v3Libp2pTransportWebrtc) == "webrtc",
+        "v3 webrtc signal codec: transport text")
+    assert(types.v3Libp2pProtocolWireText(types.v3Libp2pProtocolWebrtcSignal) == "/cheng/webrtc-signal/1.0.0",
+        "v3 webrtc signal codec: protocol wire text")
+
+    var handshakeCfg: webrtc_transport.V3Libp2pWebrtcTransportConfig
+    handshakeCfg.stunUrls = ["stun:codec.example.net"]
+    let handshakeTurnInsert: signal.V3Libp2pWebrtcTurnServer
+    add(handshakeCfg.turnServers, handshakeTurnInsert)
+    handshakeCfg.turnServers[0].url = "turn:codec.example.net"
+    handshakeCfg.turnServers[0].username = "codec-user"
+    handshakeCfg.turnServers[0].credential = "codec-secret"
+    var pair: webrtc_transport.V3Libp2pWebrtcLoopbackPair
+    let openRes = webrtc_transport.v3Libp2pWebrtcLoopbackOpenInto(pair, handshakeCfg, webrtcAddr)
+    assert(IsOk(openRes), "v3 webrtc signal codec: open session")
+    assert(pair.signalTranscript.len == 5, "v3 webrtc signal codec: transcript len")
+    assert(pair.signalTranscript[0].kind == signal.v3Libp2pWebrtcSignalTurnPolicy,
+        "v3 webrtc signal codec: transcript turn policy")
+    assert(pair.signalTranscript[1].kind == signal.v3Libp2pWebrtcSignalOffer,
+        "v3 webrtc signal codec: transcript offer")
+    assert(pair.signalTranscript[2].kind == signal.v3Libp2pWebrtcSignalAnswer,
+        "v3 webrtc signal codec: transcript answer")
+    assert(pair.signalTranscript[3].kind == signal.v3Libp2pWebrtcSignalIceCandidate,
+        "v3 webrtc signal codec: transcript client candidate")
+    assert(pair.signalTranscript[4].kind == signal.v3Libp2pWebrtcSignalIceCandidate,
+        "v3 webrtc signal codec: transcript server candidate")
+    assert(layout.fixedBytes32Equal(pair.signalTranscript[0].sessionId, pair.signalTranscript[4].sessionId),
+        "v3 webrtc signal codec: same session id")
+    assert(pair.signalTranscript[1].sdp == webrtc_transport.v3Libp2pWebrtcOfferSdp(webrtcAddr, handshakeCfg.dataChannelLabel),
+        "v3 webrtc signal codec: offer sdp exact")
+    assert(strutil.Contains(pair.signalTranscript[2].sdp, "answer-bytes="),
+        "v3 webrtc signal codec: answer bytes")
+    assert(strutil.Contains(pair.signalTranscript[3].candidateText, "typ host"),
+        "v3 webrtc signal codec: client host candidate")
+    assert(strutil.Contains(pair.signalTranscript[4].candidateText, "typ host"),
+        "v3 webrtc signal codec: server host candidate")
+
+    let transcriptPayload = signal.v3Libp2pWebrtcSignalTranscriptEncode(pair.signalTranscript)
+    var transcriptMessages: signal.V3Libp2pWebrtcSignalMessage[]
+    let transcriptDecodeRes = signal.v3Libp2pWebrtcSignalTranscriptDecodeFill(transcriptMessages, transcriptPayload)
+    assert(IsOk(transcriptDecodeRes), "v3 webrtc signal codec: transcript decode")
+    assert(transcriptMessages.len == 5, "v3 webrtc signal codec: transcript decoded len")
+    assert(transcriptMessages[0].kind == signal.v3Libp2pWebrtcSignalTurnPolicy,
+        "v3 webrtc signal codec: decoded first kind")
+
+    handshakeCfg.relayOnly = true
+    var relayPair: webrtc_transport.V3Libp2pWebrtcLoopbackPair
+    let relayOpenRes = webrtc_transport.v3Libp2pWebrtcLoopbackOpenInto(relayPair, handshakeCfg, webrtcAddr)
+    assert(IsOk(relayOpenRes), "v3 webrtc signal codec: relay open")
+    assert(strutil.Contains(relayPair.signalTranscript[3].candidateText, "typ relay"),
+        "v3 webrtc signal codec: relay client candidate")
+    assert(strutil.Contains(relayPair.signalTranscript[4].candidateText, "typ relay"),
+        "v3 webrtc signal codec: relay server candidate")
+
+    echo("v3 webrtc_signal_codec_smoke ok")
+    return 0

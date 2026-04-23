@@ -1,0 +1,88 @@
+import std/system
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/fixed256 as fixed256
+import cheng/chain/lsmr as lsmr
+import cheng/chain/lsmr_types as lt
+import cheng/chain/anti_entropy as anti
+
+fn smokeLocalityHash(text: str): layout.FixedBytes32 =
+    return fixed256.sha256Fixed(layout.byteSpanFromBytes(bytesFromString(text)))
+
+fn main(): int32 =
+    let localAddrRes = lsmr.v3LsmrAddressFromSeed("local-qian", 1)
+    assert(localAddrRes.ok, "v3 anti entropy fields: local address")
+    let remoteRegionalAddrRes = lsmr.v3LsmrAddressFromSeed("remote-regional", 2)
+    assert(remoteRegionalAddrRes.ok, "v3 anti entropy fields: remote address")
+
+    let localContent = "local/global/content"
+    let remoteGlobalContent = "remote/global/content"
+    let remoteRegionalContent = "remote/regional/content"
+    let localContentCid = fixed256.sha256Fixed(layout.byteSpanFromBytes(bytesFromString(localContent)))
+    let remoteGlobalContentCid = fixed256.sha256Fixed(layout.byteSpanFromBytes(bytesFromString(remoteGlobalContent)))
+    let remoteRegionalContentCid = fixed256.sha256Fixed(layout.byteSpanFromBytes(bytesFromString(remoteRegionalContent)))
+    let localLocalityHash = smokeLocalityHash(localContent)
+    let remoteGlobalLocalityHash = smokeLocalityHash(remoteGlobalContent)
+    let remoteRegionalLocalityHash = smokeLocalityHash(remoteRegionalContent)
+    assert(!layout.fixedBytes32Equal(localContentCid, remoteGlobalContentCid),
+           "v3 anti entropy fields: raw content cid differ")
+    assert(!layout.fixedBytes32Equal(localLocalityHash, remoteGlobalLocalityHash),
+           "v3 anti entropy fields: raw locality hash differ")
+    var localCell: lt.V3StateCell
+    lsmr.v3LsmrStateCellFill(
+        localCell,
+        1,
+        localAddrRes.value,
+        1,
+        localContentCid,
+        localLocalityHash
+    )
+    var remoteGlobalCell: lt.V3StateCell
+    lsmr.v3LsmrStateCellFill(
+        remoteGlobalCell,
+        1,
+        localAddrRes.value,
+        1,
+        remoteGlobalContentCid,
+        remoteGlobalLocalityHash
+    )
+    var remoteRegionalCell: lt.V3StateCell
+    lsmr.v3LsmrStateCellFill(
+        remoteRegionalCell,
+        2,
+        remoteRegionalAddrRes.value,
+        2,
+        remoteRegionalContentCid,
+        remoteRegionalLocalityHash
+    )
+    assert(!layout.fixedBytes32Equal(localCell.contentCid, remoteGlobalCell.contentCid),
+           "v3 anti entropy fields: content cid differ")
+    assert(!layout.fixedBytes32Equal(localCell.localityHash, remoteGlobalCell.localityHash),
+           "v3 anti entropy fields: locality hash differ")
+    assert(!layout.fixedBytes32Equal(localCell.localityCid, remoteGlobalCell.localityCid),
+           "v3 anti entropy fields: locality cid differ")
+
+    var localCells: lt.V3StateCell[]
+    localCells = []
+    add(localCells, localCell)
+    let localForest = lsmr.v3BuildStateLayerForest(localCells)
+
+    var remoteCells: lt.V3StateCell[]
+    remoteCells = []
+    add(remoteCells, remoteGlobalCell)
+    add(remoteCells, remoteRegionalCell)
+    let remoteForest = lsmr.v3BuildStateLayerForest(remoteCells)
+
+    assert(!layout.fixedBytes32Equal(localForest.forestCid, remoteForest.forestCid),
+           "v3 anti entropy fields: forest cid differ")
+
+    let localSig = anti.v3AntiEntropySignatureFromForest(10, 12, 3, 1, localForest)
+    let remoteSig = anti.v3AntiEntropySignatureFromForest(11, 1, 4, 1, remoteForest)
+    assert(!layout.fixedBytes32Equal(localSig.stateForestCid, remoteSig.stateForestCid),
+           "v3 anti entropy fields: signature forest cid differ")
+
+    let localCid = anti.v3AntiEntropySignatureCid(localSig)
+    let remoteCid = anti.v3AntiEntropySignatureCid(remoteSig)
+    assert(!layout.fixedBytes32Equal(localCid, remoteCid),
+           "v3 anti entropy fields: signature cid differ")
+    echo("v3 anti_entropy_signature_fields_smoke ok")
+    return 0

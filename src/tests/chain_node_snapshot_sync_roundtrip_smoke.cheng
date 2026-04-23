@@ -1,0 +1,148 @@
+import std/system
+import cheng/std/bytes_layout as layout
+import cheng/chain/binary_types as binary
+import cheng/chain/codec_binary as codec
+import cheng/chain/consensus
+import cheng/chain/lsmr_types as lt
+import cheng/overlay/contracts as overlay
+import cheng/libp2p/core/types
+import cheng/libp2p/core/multiaddr
+import cheng/libp2p/host/host
+import cheng/apps/chain_node/chain_node as node
+import cheng/apps/chain_node/chain_node_libp2p as net
+
+fn appendAddressWire(address: binary.V3LsmrAddress): Bytes =
+    var buf = layout.byteBufInit(64)
+    lt.v3AppendAddress(buf, address)
+    return layout.byteBufToBytes(buf)
+
+fn appendAddressWireVar(address: var binary.V3LsmrAddress): Bytes =
+    var buf = layout.byteBufInit(64)
+    codec.v3BufAppendU32BE(buf, address.depth)
+    for i in 0..<binary.v3LsmrMaxDepth:
+        layout.byteBufAppendByte(buf, address.digits[i] & 255)
+    return layout.byteBufToBytes(buf)
+
+fn snapshotWireHasAddress(payload: Bytes,
+                          offset: int32,
+                          expectedAddress: var binary.V3LsmrAddress): bool =
+    let span = layout.byteSpanFromBytes(payload)
+    let rawDepthRes = codec.v3ReadU32BE(span, offset)
+    if IsErr(rawDepthRes):
+        return false
+    if int32(Value(rawDepthRes)) != expectedAddress.depth:
+        return false
+    for i in 0..<expectedAddress.depth:
+        if layout.byteSpanAt(span, offset + 4 + i) != expectedAddress.digits[i]:
+            return false
+    return true
+
+fn main(): int32 =
+    let seedRes = node.v3ChainNodeAddressFromSeed("chain-node-a")
+    assert(IsOk(seedRes), "v3 chain_node snapshot roundtrip: seed")
+    var localAddress = Value(seedRes)
+    var server: node.V3ChainNode
+    let initRes = node.v3ChainNodeInitInto(server, "node-a", "chain-node-a")
+    assert(IsOk(initRes), "v3 chain_node snapshot roundtrip: init")
+    let mintRes = node.v3ChainNodeMint(server, 7, 1001, int64(100))
+    assert(IsOk(mintRes), "v3 chain_node snapshot roundtrip: mint")
+    let transferRes = node.v3ChainNodeTransfer(server, 7, 1001, 2002, int64(40))
+    assert(IsOk(transferRes), "v3 chain_node snapshot roundtrip: transfer")
+    var serverHost = host.v3Libp2pHostInit("chain.roundtrip.server")
+    var clientHost = host.v3Libp2pHostInit("chain.roundtrip.client")
+    var serverAddr: types.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillTcp(serverAddr, "127.0.0.1", 6211)
+    let listenRes = host.v3Libp2pListen(serverHost, serverAddr)
+    assert(listenRes.ok, "v3 chain_node snapshot roundtrip: listen")
+    host.v3Libp2pRegisterHandler(serverHost, types.v3Libp2pProtocolGossipsub)
+    host.v3Libp2pRegisterHandler(serverHost, types.v3Libp2pProtocolStore)
+    host.v3Libp2pRegisterHandler(serverHost, types.v3Libp2pProtocolSync)
+    host.v3Libp2pRegisterHandler(clientHost, types.v3Libp2pProtocolGossipsub)
+    host.v3Libp2pRegisterHandler(clientHost, types.v3Libp2pProtocolStore)
+    host.v3Libp2pRegisterHandler(clientHost, types.v3Libp2pProtocolSync)
+    let dialRes = host.v3Libp2pDial(clientHost,
+                                    serverHost.selfPeerId,
+                                    serverAddr,
+                                    overlay.v3OverlayRoleEdgeRelayStore)
+    assert(dialRes.ok, "v3 chain_node snapshot roundtrip: dial")
+    var snapshot: node.V3ChainNodeServeSnapshot
+    node.v3ChainNodeServeOnceInto(snapshot, server)
+    let localWire = appendAddressWire(localAddress)
+    let localWireVar = appendAddressWireVar(localAddress)
+    let serverWire = appendAddressWire(server.address)
+    let serverWireVar = appendAddressWireVar(server.address)
+    let snapshotWire = appendAddressWire(snapshot.address)
+    let snapshotWireVar = appendAddressWireVar(snapshot.address)
+    assert(bytesEqual(localWire, localWireVar),
+           "v3 chain_node snapshot roundtrip: local value wire")
+    assert(bytesEqual(serverWire, serverWireVar),
+           "v3 chain_node snapshot roundtrip: server value wire")
+    assert(bytesEqual(snapshotWire, snapshotWireVar),
+           "v3 chain_node snapshot roundtrip: snapshot value wire")
+    assert(bytesEqual(localWireVar, serverWireVar),
+           "v3 chain_node snapshot roundtrip: local server wire")
+    assert(bytesEqual(serverWireVar, snapshotWireVar),
+           "v3 chain_node snapshot roundtrip: server snapshot wire")
+    var buf = layout.byteBufInit(2048)
+    net.v3ChainNodeLibp2pAppendSnapshotMagic(buf)
+    codec.v3BufAppendU32BE(buf, net.v3ChainNodeLibp2pSnapshotVersion)
+    let addressOffset = net.v3ChainNodeLibp2pSnapshotMagicLen + 4
+    lt.v3AppendAddress(buf, snapshot.address)
+    assert(snapshotWireHasAddress(layout.byteBufToBytes(buf), addressOffset, snapshot.address),
+           "v3 chain_node snapshot roundtrip: snapshot after address")
+    codec.v3BufAppendU32BE(buf, snapshot.serveCount)
+    assert(snapshotWireHasAddress(layout.byteBufToBytes(buf), addressOffset, snapshot.address),
+           "v3 chain_node snapshot roundtrip: snapshot after serve count")
+    codec.v3BufAppendFixed32(buf, snapshot.tipEventCid)
+    assert(snapshotWireHasAddress(layout.byteBufToBytes(buf), addressOffset, snapshot.address),
+           "v3 chain_node snapshot roundtrip: snapshot after tip cid")
+    net.v3ChainNodeLibp2pAppendSignature(buf, snapshot.signature)
+    assert(snapshotWireHasAddress(layout.byteBufToBytes(buf), addressOffset, snapshot.address),
+           "v3 chain_node snapshot roundtrip: snapshot after signature")
+    codec.v3BufAppendU32BE(buf, snapshot.eventCids.len)
+    assert(snapshotWireHasAddress(layout.byteBufToBytes(buf), addressOffset, snapshot.address),
+           "v3 chain_node snapshot roundtrip: snapshot after event count")
+    for i in 0..<snapshot.eventCids.len:
+        var eventCid = snapshot.eventCids[i]
+        var event: consensus.V3ChainEvent
+        event = snapshot.events[i]
+        net.v3ChainNodeLibp2pAppendEvent(buf, eventCid, event)
+        if i == 0:
+            assert(snapshotWireHasAddress(layout.byteBufToBytes(buf), addressOffset, snapshot.address),
+                   "v3 chain_node snapshot roundtrip: snapshot after event 0")
+        if i == 1:
+            assert(snapshotWireHasAddress(layout.byteBufToBytes(buf), addressOffset, snapshot.address),
+                   "v3 chain_node snapshot roundtrip: snapshot after event 1")
+    let serveRes = net.v3ChainNodeLibp2pServeOnce(server, serverHost)
+    assert(serveRes.ok, "v3 chain_node snapshot roundtrip: serve")
+    assert(serveRes.value, "v3 chain_node snapshot roundtrip: serve active")
+    var hostSnapshot: node.V3ChainNodeServeSnapshot
+    var hostIngress: overlay.V3IngressEnvelope
+    let hostIndexRes = net.v3ChainNodeLibp2pLatestSnapshotHostIndex(serverHost, server.address)
+    assert(IsOk(hostIndexRes), "v3 chain_node snapshot roundtrip: host latest")
+    let hostIndex = hostIndexRes.value
+    let hostEntry = serverHost.storeEntries[hostIndex]
+    net.v3ChainNodeLibp2pCopyIngress(hostIngress, hostEntry.ingress)
+    let hostDecodeRes = net.v3ChainNodeLibp2pDecodeSnapshotFill(hostIngress.payload, hostSnapshot)
+    assert(hostDecodeRes.ok, "v3 chain_node snapshot roundtrip: host decode")
+    assert(binary.v3LsmrAddressEqual(hostSnapshot.address, server.address),
+           "v3 chain_node snapshot roundtrip: host decode address")
+    assert(hostSnapshot.eventCids.len == 2,
+           "v3 chain_node snapshot roundtrip: host decode event cid len")
+    var syncedEntries: overlay.V3IngressEnvelope[]
+    var query: overlay.V3StoreQuery
+    net.v3ChainNodeLibp2pSnapshotQueryFill(query, server.address)
+    let syncEntriesRes = host.v3Libp2pSyncRequest(clientHost, serverHost, serverHost.selfPeerId, query, syncedEntries)
+    assert(syncEntriesRes.ok, "v3 chain_node snapshot roundtrip: sync request")
+    var syncedSnapshot: node.V3ChainNodeServeSnapshot
+    var syncedIngress: overlay.V3IngressEnvelope
+    let syncedIndexRes = net.v3ChainNodeLibp2pLatestSnapshotIndexFromIngresses(syncedEntries, server.address)
+    assert(IsOk(syncedIndexRes), "v3 chain_node snapshot roundtrip: synced latest")
+    let syncedIndex = syncedIndexRes.value
+    net.v3ChainNodeLibp2pCopyIngress(syncedIngress, syncedEntries[syncedIndex])
+    let syncedDecodeRes = net.v3ChainNodeLibp2pDecodeSnapshotFill(syncedIngress.payload, syncedSnapshot)
+    assert(syncedDecodeRes.ok, "v3 chain_node snapshot roundtrip: synced decode")
+    assert(binary.v3LsmrAddressEqual(syncedSnapshot.address, server.address),
+           "v3 chain_node snapshot roundtrip: synced decode address")
+    echo("v3 chain_node_snapshot_sync_roundtrip_smoke ok")
+    return 0

@@ -1,0 +1,46 @@
+import std/system
+import std/result
+import cheng/quic/tls/policy as qpolicy
+import cheng/quic/native_runtime as qnative
+import cheng/quic/core/quic_varint
+
+fn smokeNativeClientPolicy(): qpolicy.MsQuicTlsPolicy =
+    var out: qpolicy.MsQuicTlsPolicy
+    out.serverName = "localhost"
+    return out
+
+fn main(): int32 =
+    qnative.msquicNativeResetSession()
+    let policy: qpolicy.MsQuicTlsPolicy = smokeNativeClientPolicy()
+    qnative.msquicNativeSetClientPolicyCache(policy)
+    let payloadRes: Result[Bytes] = qnative.msquicNativeDebugBuildClientHelloPayload()
+    if IsErr(payloadRes):
+        panic(ErrorText(payloadRes))
+    let payload: Bytes = Value(payloadRes)
+    let kindRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(payload, 0)
+    if IsErr(kindRes):
+        panic(ErrorText(kindRes))
+    let kindDec: quic_varint.QuicVarIntDecoded = Value(kindRes)
+    if kindDec.value != int64(qnative.msquicNativeFrameCryptoCode):
+        panic("v3 native_initial_crypto_frame: crypto frame kind")
+    let streamRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(payload, kindDec.next)
+    if IsErr(streamRes):
+        panic(ErrorText(streamRes))
+    let streamDec: quic_varint.QuicVarIntDecoded = Value(streamRes)
+    if streamDec.value != 0:
+        panic("v3 native_initial_crypto_frame: crypto stream id")
+    let offsetRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(payload, streamDec.next)
+    if IsErr(offsetRes):
+        panic(ErrorText(offsetRes))
+    let offsetDec: quic_varint.QuicVarIntDecoded = Value(offsetRes)
+    if offsetDec.value != 0:
+        panic("v3 native_initial_crypto_frame: crypto offset")
+    let lenRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(payload, offsetDec.next)
+    if IsErr(lenRes):
+        panic(ErrorText(lenRes))
+    let lenDec: quic_varint.QuicVarIntDecoded = Value(lenRes)
+    let cryptoPayloadLen: int32 = int32(lenDec.value)
+    if cryptoPayloadLen <= 0:
+        panic("v3 native_initial_crypto_frame: crypto payload")
+    echo("v3 native_initial_crypto_frame_smoke ok")
+    return 0

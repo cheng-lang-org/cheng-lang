@@ -1,0 +1,194 @@
+import cheng/std/bytes_layout as layout
+import cheng/DiLoCo/core/diloco as core
+import cheng/DiLoCo/tests/support
+
+fn main(): int32 =
+    let jobBundleCid = support.v3DiLoCoTestJobBundleCid("state-smoke")
+    let initialModelRef = support.v3DiLoCoTestArtifact(jobBundleCid, "initial-model")
+    let initialOptimizerRef = support.v3DiLoCoTestArtifact(jobBundleCid, "initial-optimizer")
+    let leaderModelDeltaRef = support.v3DiLoCoTestArtifact(jobBundleCid, "leader-model-delta")
+    let leaderOptimizerDeltaRef = support.v3DiLoCoTestArtifact(jobBundleCid, "leader-optimizer-delta")
+    let workerModelDeltaRef = support.v3DiLoCoTestArtifact(jobBundleCid, "worker-model-delta")
+    let workerOptimizerDeltaRef = support.v3DiLoCoTestArtifact(jobBundleCid, "worker-optimizer-delta")
+    let mergedModelRef = support.v3DiLoCoTestArtifact(jobBundleCid, "merged-model")
+    let mergedOptimizerRef = support.v3DiLoCoTestArtifact(jobBundleCid, "merged-optimizer")
+    let leaderPeerId = support.v3DiLoCoTestPeer("diloco.state.leader")
+    let workerPeerId = support.v3DiLoCoTestPeer("diloco.state.worker")
+    var state = core.v3DiLoCoStateInit("diloco.state.smoke")
+
+    var openedJob = core.V3DiLoCoJob()
+    var genesisVersion = core.V3DiLoCoGlobalVersion()
+    let openRes = core.v3DiLoCoOpenJobFill(openedJob,
+                                           genesisVersion,
+                                           state,
+                                           jobBundleCid,
+                                           2,
+                                           5,
+                                           60,
+                                           initialModelRef,
+                                           initialOptimizerRef)
+    assert(openRes.ok, "v3 diloco state smoke: open job")
+    assert(openedJob.currentOuterStep == 1, "v3 diloco state smoke: current outer step")
+    assert(layout.FixedBytes32Equal(state.jobs[0].currentGlobalVersionCid, state.versions[0].versionCid),
+        "v3 diloco state smoke: state open current version")
+    assert(layout.FixedBytes32Equal(genesisVersion.versionCid, state.versions[0].versionCid),
+        "v3 diloco state smoke: genesis version output")
+    assert(layout.FixedBytes32Equal(openedJob.currentGlobalVersionCid, state.jobs[0].currentGlobalVersionCid),
+        "v3 diloco state smoke: opened job output")
+
+    var cohort = core.V3DiLoCoCohort()
+    let joinLeaderRes = core.v3DiLoCoJoinCohortFill(cohort, state, jobBundleCid, leaderPeerId)
+    assert(joinLeaderRes.ok, "v3 diloco state smoke: join leader")
+    let joinWorkerRes = core.v3DiLoCoJoinCohortFill(cohort, state, jobBundleCid, workerPeerId)
+    assert(joinWorkerRes.ok, "v3 diloco state smoke: join worker")
+    assert(layout.FixedBytes32Equal(state.jobs[0].currentGlobalVersionCid, genesisVersion.versionCid),
+        "v3 diloco state smoke: state job current version after join")
+    assert(cohort.fixedMemberCount == 2, "v3 diloco state smoke: fixed cohort")
+    assert(layout.FixedBytes32Equal(state.jobs[0].cohortCid, cohort.cohortCid),
+        "v3 diloco state smoke: job cohort cid")
+
+    var leaderLease = core.V3DiLoCoLease()
+    var workerLease = core.V3DiLoCoLease()
+    let leaderLeaseRes = core.v3DiLoCoFetchLeaseFill(leaderLease, state, jobBundleCid, leaderPeerId)
+    let workerLeaseRes = core.v3DiLoCoFetchLeaseFill(workerLease, state, jobBundleCid, workerPeerId)
+    assert(leaderLeaseRes.ok, "v3 diloco state smoke: leader lease")
+    assert(workerLeaseRes.ok, "v3 diloco state smoke: worker lease")
+    assert(!layout.FixedBytes32Equal(genesisVersion.versionCid, layout.FixedBytes32()),
+        "v3 diloco state smoke: genesis version nonzero")
+    assert(layout.FixedBytes32Equal(state.jobs[0].currentGlobalVersionCid, genesisVersion.versionCid),
+        "v3 diloco state smoke: job current version")
+    assert(layout.FixedBytes32Equal(leaderLease.baseVersionCid, state.jobs[0].currentGlobalVersionCid),
+        "v3 diloco state smoke: lease current version")
+    assert(layout.FixedBytes32Equal(leaderLease.baseVersionCid, genesisVersion.versionCid),
+        "v3 diloco state smoke: lease base version")
+
+    var barrier = core.V3DiLoCoBarrier()
+    let leaderBarrierRes = core.v3DiLoCoReportInnerStepDoneFill(barrier, state, jobBundleCid, leaderPeerId)
+    assert(leaderBarrierRes.ok, "v3 diloco state smoke: leader barrier")
+    let workerBarrierRes = core.v3DiLoCoReportInnerStepDoneFill(barrier, state, jobBundleCid, workerPeerId)
+    assert(workerBarrierRes.ok, "v3 diloco state smoke: worker barrier")
+    assert(barrier.sealed, "v3 diloco state smoke: barrier sealed")
+
+    let leaderBaseVersionCid: layout.FixedBytes32 = leaderLease.baseVersionCid
+    let leaderOuterStep: int32 = leaderLease.outerStep
+    let leaderInnerStepBudget: int32 = leaderLease.innerStepBudget
+    assert(core.v3DiLoCoCohortHasPeer(state.cohorts[0], leaderPeerId),
+        "v3 diloco state smoke: state cohort has leader")
+    assert(state.cohorts[0].fixedMemberCount == 2,
+        "v3 diloco state smoke: state cohort fixed count")
+    assert(layout.FixedBytes32Equal(leaderBaseVersionCid, state.jobs[0].currentGlobalVersionCid),
+        "v3 diloco state smoke: submit base version current")
+    assert(leaderOuterStep == state.jobs[0].currentOuterStep,
+        "v3 diloco state smoke: submit outer step current")
+    assert(state.barriers.len == 1,
+        "v3 diloco state smoke: state barrier count")
+    assert(state.barriers[0].sealed,
+        "v3 diloco state smoke: state barrier sealed")
+    assert(state.barriers[0].completedPeerIds.len == 2,
+        "v3 diloco state smoke: state barrier completed count")
+    let leaderModelRefOk = core.v3DiLoCoArtifactRefValidate(leaderModelDeltaRef)
+    let leaderOptimizerRefOk = core.v3DiLoCoArtifactRefValidate(leaderOptimizerDeltaRef)
+    assert(leaderModelRefOk.ok,
+        "v3 diloco state smoke: leader model ref valid")
+    assert(leaderOptimizerRefOk.ok,
+        "v3 diloco state smoke: leader optimizer ref valid")
+    assert(core.v3DiLoCoDeltaPos(state,
+                                 jobBundleCid,
+                                 leaderBaseVersionCid,
+                                 leaderOuterStep,
+                                 leaderPeerId) < 0,
+        "v3 diloco state smoke: submit duplicate absent")
+    var leaderDelta = core.V3DiLoCoOuterDelta()
+    let leaderDeltaRes = core.v3DiLoCoSubmitOuterDeltaFill(leaderDelta,
+                                                           state,
+                                                           jobBundleCid,
+                                                           leaderBaseVersionCid,
+                                                           leaderOuterStep,
+                                                           leaderPeerId,
+                                                           leaderModelDeltaRef,
+                                                           leaderOptimizerDeltaRef,
+                                                           8,
+                                                           64,
+                                                           leaderInnerStepBudget,
+                                                           8,
+                                                           16)
+    assert(leaderDeltaRes.ok, "v3 diloco state smoke: leader delta")
+    let workerBaseVersionCid: layout.FixedBytes32 = workerLease.baseVersionCid
+    let workerOuterStep: int32 = workerLease.outerStep
+    let workerInnerStepBudget: int32 = workerLease.innerStepBudget
+    var workerDelta = core.V3DiLoCoOuterDelta()
+    let workerDeltaRes = core.v3DiLoCoSubmitOuterDeltaFill(workerDelta,
+                                                           state,
+                                                           jobBundleCid,
+                                                           workerBaseVersionCid,
+                                                           workerOuterStep,
+                                                           workerPeerId,
+                                                           workerModelDeltaRef,
+                                                           workerOptimizerDeltaRef,
+                                                           9,
+                                                           72,
+                                                           workerInnerStepBudget,
+                                                           9,
+                                                           16)
+    assert(workerDeltaRes.ok, "v3 diloco state smoke: worker delta")
+
+    var status = core.V3DiLoCoStepStatus()
+    let statusRes = core.v3DiLoCoFetchStepStatusFill(status, state, jobBundleCid)
+    assert(statusRes.ok, "v3 diloco state smoke: fetch status")
+    assert(status.barrierReady, "v3 diloco state smoke: status barrier")
+    assert(status.contributionCount == 2, "v3 diloco state smoke: status contributions")
+
+    var mergeCommit = core.V3DiLoCoMergeCommit()
+    var mergedVersion = core.V3DiLoCoGlobalVersion()
+    let commitRes = core.v3DiLoCoPublishMergeCommitFill(mergeCommit,
+                                                        mergedVersion,
+                                                        state,
+                                                        jobBundleCid,
+                                                        leaderPeerId,
+                                                        mergedModelRef,
+                                                        mergedOptimizerRef)
+    assert(commitRes.ok, "v3 diloco state smoke: publish commit")
+    assert(mergedVersion.committedOuterStep == 1, "v3 diloco state smoke: committed outer step")
+    assert(layout.FixedBytes32Equal(mergedVersion.baseVersionCid, genesisVersion.versionCid),
+        "v3 diloco state smoke: merged version base")
+    assert(state.jobs[0].currentOuterStep == 2, "v3 diloco state smoke: advanced outer step")
+    assert(state.versions.len == 2, "v3 diloco state smoke: state versions len")
+    assert(state.versions[0].committedOuterStep == 0, "v3 diloco state smoke: state genesis step")
+    assert(state.versions[1].committedOuterStep == 1, "v3 diloco state smoke: state merged step")
+    assert(layout.FixedBytes32Equal(state.versions[1].baseVersionCid, genesisVersion.versionCid),
+        "v3 diloco state smoke: state merged base")
+
+    var currentVersion = core.V3DiLoCoGlobalVersion()
+    let versionRes = core.v3DiLoCoFetchGlobalVersionFill(currentVersion, state, jobBundleCid)
+    assert(versionRes.ok, "v3 diloco state smoke: fetch global version")
+    assert(layout.FixedBytes32Equal(currentVersion.versionCid, mergedVersion.versionCid),
+        "v3 diloco state smoke: current version")
+    assert(layout.FixedBytes32Equal(currentVersion.baseVersionCid, genesisVersion.versionCid),
+        "v3 diloco state smoke: current version base")
+
+    var lineage: core.V3DiLoCoGlobalVersion[]
+    let lineageRes = core.v3DiLoCoFetchLineageFill(lineage, state, jobBundleCid)
+    assert(lineageRes.ok, "v3 diloco state smoke: fetch lineage")
+    assert(lineage.len == 2, "v3 diloco state smoke: lineage length")
+    assert(layout.FixedBytes32Equal(lineage[0].versionCid, mergedVersion.versionCid),
+        "v3 diloco state smoke: lineage head")
+    assert(lineage[1].committedOuterStep == 0, "v3 diloco state smoke: lineage genesis")
+
+    var staleDelta = core.V3DiLoCoOuterDelta()
+    let staleRes = core.v3DiLoCoSubmitOuterDeltaFill(staleDelta,
+                                                     state,
+                                                     jobBundleCid,
+                                                     leaderBaseVersionCid,
+                                                     leaderOuterStep,
+                                                     leaderPeerId,
+                                                     leaderModelDeltaRef,
+                                                     leaderOptimizerDeltaRef,
+                                                     8,
+                                                     64,
+                                                     leaderInnerStepBudget,
+                                                     8,
+                                                     16)
+    assert(!staleRes.ok, "v3 diloco state smoke: stale submit rejected")
+
+    echo("v3 diloco_state_smoke ok")
+    return 0

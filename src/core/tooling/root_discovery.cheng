@@ -1,0 +1,52 @@
+import std/cmdline as cmdline
+import std/os
+import std/strutils as strutil
+import cheng/core/tooling/path as v3path
+import cheng/core/tooling/host_ops as hostops
+
+fn v3CompilerRootSeedExists(dirRaw: str): bool =
+    let dir = strutil.Strip(dirRaw)
+    if len(dir) <= 0:
+        return false
+    let seedPath = v3path.V3PathAbsolute(dir, "bootstrap/cheng_seed.c")
+    if v3path.V3PathFileExists(seedPath):
+        return true
+    let manifestPath = v3path.V3PathAbsolute(dir, "cheng-package.toml")
+    return v3path.V3PathFileExists(manifestPath)
+
+fn v3CompilerRootFromStartDir(startDirRaw: str): str =
+    var dir = strutil.Strip(startDirRaw)
+    var depth: int32
+    while len(dir) > 0 && depth < 8:
+        if v3CompilerRootSeedExists(dir):
+            return dir
+        let parts = os.SplitFile(dir)
+        if len(parts.dir) <= 0 || parts.dir == dir:
+            break
+        dir = parts.dir
+        depth = depth + 1
+    return ""
+
+fn v3CompilerRootFromProgramName(programNameRaw: str): str =
+    let programName = strutil.Strip(programNameRaw)
+    if len(programName) <= 0:
+        return ""
+    var programPath = hostops.v3ResolveProgram(os.GetCurrentDir(), programName)
+    if len(programPath) <= 0:
+        programPath = programName
+        if !os.IsAbsolute(programPath):
+            programPath = os.JoinPath(os.GetCurrentDir(), programPath)
+    let parts = os.SplitFile(programPath)
+    return v3CompilerRootFromStartDir(parts.dir)
+
+fn v3CompilerRootAuto(): str =
+    let envRoot = strutil.Strip(os.GetEnv("CHENG_ROOT"))
+    if len(envRoot) > 0:
+        return envRoot
+    let programRoot = v3CompilerRootFromProgramName(cmdline.ProgramName())
+    if len(programRoot) > 0:
+        return programRoot
+    let cwdRoot = v3CompilerRootFromStartDir(os.GetCurrentDir())
+    if len(cwdRoot) > 0:
+        return cwdRoot
+    return os.GetCurrentDir()

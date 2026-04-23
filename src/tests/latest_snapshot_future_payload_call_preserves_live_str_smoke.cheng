@@ -1,0 +1,57 @@
+import std/system
+import std/result
+import std/cmdline as cmdline
+import std/os
+import std/rawbytes
+import cheng/overlay/contracts as overlay
+import cheng/libp2p/core/types
+import cheng/libp2p/host/host
+import cheng/apps/chain_node/chain_node as node
+import cheng/apps/chain_node/chain_node_libp2p as net
+
+fn consumeSnapshotPayload(hostText: str,
+                          port: int32,
+                          protocol: types.V3Libp2pProtocolId,
+                          payload: Bytes,
+                          readyPath: str): Result[bool] =
+    assert(len(hostText) > 0, "future payload call preserve: host")
+    assert(port >= 0, "future payload call preserve: port")
+    assert(protocol == types.v3Libp2pProtocolSync, "future payload call preserve: protocol")
+    assert(bytesLen(payload) > 0, "future payload call preserve: payload")
+    assert(len(readyPath) > 0, "future payload call preserve: readyPath")
+    os.WriteFile("/tmp/latest_snapshot_future_payload_ready.txt", readyPath)
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let keep = cmdline.ReadFlagOrDefault("--value", "")
+    let keepStable = newStringCopy(strDataPtr(keep), strLenFast(keep))
+    assert(len(keepStable) > 0, "future payload call preserve: arg")
+    var server: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(server, "future.payload.call", "quic.twoproc")),
+           "future payload call preserve: init")
+    var serverHost = host.v3Libp2pHostInit("future.payload.call")
+    let mintRes = node.v3ChainNodeMint(server, 9, 1001, int64(88))
+    assert(mintRes.ok, "future payload call preserve: mint")
+    let transferRes = node.v3ChainNodeTransfer(server, 9, 1001, 2002, int64(33))
+    assert(transferRes.ok, "future payload call preserve: transfer")
+    let serveRes = net.v3ChainNodeLibp2pServeOnce(server, serverHost)
+    assert(serveRes.ok, "future payload call preserve: serve once")
+    var latest: overlay.V3IngressEnvelope
+    let latestRes = net.v3ChainNodeLibp2pLatestSnapshotHostIndex(serverHost, server.address)
+    assert(IsOk(latestRes), "future payload call preserve: latest index")
+    assert(keep == keepStable, "future payload call preserve: keep after latest")
+    let latestIndex = latestRes.value
+    assert(keep == keepStable, "future payload call preserve: keep after latestIndex")
+    let latestEntry = serverHost.storeEntries[latestIndex]
+    assert(keep == keepStable, "future payload call preserve: keep after latestEntry")
+    net.v3ChainNodeLibp2pCopyIngress(latest, latestEntry.ingress)
+    assert(keep == keepStable, "future payload call preserve: keep after copy")
+    let consumeRes = consumeSnapshotPayload("127.0.0.1",
+                                            0,
+                                            types.v3Libp2pProtocolSync,
+                                            latest.payload,
+                                            keep)
+    assert(IsOk(consumeRes), "future payload call preserve: consume")
+    assert(keep == keepStable, "future payload call preserve: keep after consume")
+    echo("v3 latest_snapshot_future_payload_call_preserves_live_str_smoke ok")
+    return 0

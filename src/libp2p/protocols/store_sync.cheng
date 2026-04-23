@@ -1,0 +1,554 @@
+import std/result
+import std/rawbytes
+import cheng/std/bytes_layout as layout
+import cheng/chain/binary_types as types
+import cheng/chain/codec_binary as codec
+import cheng/chain/lsmr_types as lt
+import cheng/overlay/contracts as overlay
+import cheng/libp2p/core/types as core
+
+const
+    v3Libp2pSyncQueryMagic: str = "v3.libp2p.sync.query"
+    v3Libp2pSyncResponseMagic: str = "v3.libp2p.sync.response"
+    v3Libp2pStoreSyncCodecVersion: int32 = 1
+    v3Libp2pSyncQueryMagicLen: int32 = 20
+    v3Libp2pSyncResponseMagicLen: int32 = 23
+
+type
+    V3Libp2pStoreEntry =
+        ingress: overlay.V3IngressEnvelope
+
+fn v3Libp2pIngressClone(ingress: overlay.V3IngressEnvelope): overlay.V3IngressEnvelope =
+    var out: overlay.V3IngressEnvelope
+    out.sourcePeerId = ingress.sourcePeerId
+    out.topicScope = ingress.topicScope
+    out.address = ingress.address
+    out.payloadKind = ingress.payloadKind
+    out.payload = bytesSlice(ingress.payload, 0, bytesLen(ingress.payload))
+    out.payloadCid = ingress.payloadCid
+    out.payloadLen = ingress.payloadLen
+    out.stampEpoch = ingress.stampEpoch
+    out.stampGanzhi = ingress.stampGanzhi
+    return out
+
+fn v3Libp2pSyncAppendQueryMagic(buf: var layout.ByteBuf) =
+    layout.byteBufAppendByte(buf, int32('v'))
+    layout.byteBufAppendByte(buf, int32('3'))
+    layout.byteBufAppendByte(buf, int32('.'))
+    layout.byteBufAppendByte(buf, int32('l'))
+    layout.byteBufAppendByte(buf, int32('i'))
+    layout.byteBufAppendByte(buf, int32('b'))
+    layout.byteBufAppendByte(buf, int32('p'))
+    layout.byteBufAppendByte(buf, int32('2'))
+    layout.byteBufAppendByte(buf, int32('p'))
+    layout.byteBufAppendByte(buf, int32('.'))
+    layout.byteBufAppendByte(buf, int32('s'))
+    layout.byteBufAppendByte(buf, int32('y'))
+    layout.byteBufAppendByte(buf, int32('n'))
+    layout.byteBufAppendByte(buf, int32('c'))
+    layout.byteBufAppendByte(buf, int32('.'))
+    layout.byteBufAppendByte(buf, int32('q'))
+    layout.byteBufAppendByte(buf, int32('u'))
+    layout.byteBufAppendByte(buf, int32('e'))
+    layout.byteBufAppendByte(buf, int32('r'))
+    layout.byteBufAppendByte(buf, int32('y'))
+
+fn v3Libp2pSyncAppendResponseMagic(buf: var layout.ByteBuf) =
+    layout.byteBufAppendByte(buf, int32('v'))
+    layout.byteBufAppendByte(buf, int32('3'))
+    layout.byteBufAppendByte(buf, int32('.'))
+    layout.byteBufAppendByte(buf, int32('l'))
+    layout.byteBufAppendByte(buf, int32('i'))
+    layout.byteBufAppendByte(buf, int32('b'))
+    layout.byteBufAppendByte(buf, int32('p'))
+    layout.byteBufAppendByte(buf, int32('2'))
+    layout.byteBufAppendByte(buf, int32('p'))
+    layout.byteBufAppendByte(buf, int32('.'))
+    layout.byteBufAppendByte(buf, int32('s'))
+    layout.byteBufAppendByte(buf, int32('y'))
+    layout.byteBufAppendByte(buf, int32('n'))
+    layout.byteBufAppendByte(buf, int32('c'))
+    layout.byteBufAppendByte(buf, int32('.'))
+    layout.byteBufAppendByte(buf, int32('r'))
+    layout.byteBufAppendByte(buf, int32('e'))
+    layout.byteBufAppendByte(buf, int32('s'))
+    layout.byteBufAppendByte(buf, int32('p'))
+    layout.byteBufAppendByte(buf, int32('o'))
+    layout.byteBufAppendByte(buf, int32('n'))
+    layout.byteBufAppendByte(buf, int32('s'))
+    layout.byteBufAppendByte(buf, int32('e'))
+
+fn v3Libp2pSyncPayloadHasQueryMagic(payload: Bytes): bool =
+    if bytesLen(payload) < v3Libp2pSyncQueryMagicLen:
+        return false
+    if bytesGet(payload, 0) != int32('v'):
+        return false
+    if bytesGet(payload, 1) != int32('3'):
+        return false
+    if bytesGet(payload, 2) != int32('.'):
+        return false
+    if bytesGet(payload, 3) != int32('l'):
+        return false
+    if bytesGet(payload, 4) != int32('i'):
+        return false
+    if bytesGet(payload, 5) != int32('b'):
+        return false
+    if bytesGet(payload, 6) != int32('p'):
+        return false
+    if bytesGet(payload, 7) != int32('2'):
+        return false
+    if bytesGet(payload, 8) != int32('p'):
+        return false
+    if bytesGet(payload, 9) != int32('.'):
+        return false
+    if bytesGet(payload, 10) != int32('s'):
+        return false
+    if bytesGet(payload, 11) != int32('y'):
+        return false
+    if bytesGet(payload, 12) != int32('n'):
+        return false
+    if bytesGet(payload, 13) != int32('c'):
+        return false
+    if bytesGet(payload, 14) != int32('.'):
+        return false
+    if bytesGet(payload, 15) != int32('q'):
+        return false
+    if bytesGet(payload, 16) != int32('u'):
+        return false
+    if bytesGet(payload, 17) != int32('e'):
+        return false
+    if bytesGet(payload, 18) != int32('r'):
+        return false
+    if bytesGet(payload, 19) != int32('y'):
+        return false
+    return true
+
+fn v3Libp2pSyncPayloadHasResponseMagic(payload: Bytes): bool =
+    if bytesLen(payload) < v3Libp2pSyncResponseMagicLen:
+        return false
+    if bytesGet(payload, 0) != int32('v'):
+        return false
+    if bytesGet(payload, 1) != int32('3'):
+        return false
+    if bytesGet(payload, 2) != int32('.'):
+        return false
+    if bytesGet(payload, 3) != int32('l'):
+        return false
+    if bytesGet(payload, 4) != int32('i'):
+        return false
+    if bytesGet(payload, 5) != int32('b'):
+        return false
+    if bytesGet(payload, 6) != int32('p'):
+        return false
+    if bytesGet(payload, 7) != int32('2'):
+        return false
+    if bytesGet(payload, 8) != int32('p'):
+        return false
+    if bytesGet(payload, 9) != int32('.'):
+        return false
+    if bytesGet(payload, 10) != int32('s'):
+        return false
+    if bytesGet(payload, 11) != int32('y'):
+        return false
+    if bytesGet(payload, 12) != int32('n'):
+        return false
+    if bytesGet(payload, 13) != int32('c'):
+        return false
+    if bytesGet(payload, 14) != int32('.'):
+        return false
+    if bytesGet(payload, 15) != int32('r'):
+        return false
+    if bytesGet(payload, 16) != int32('e'):
+        return false
+    if bytesGet(payload, 17) != int32('s'):
+        return false
+    if bytesGet(payload, 18) != int32('p'):
+        return false
+    if bytesGet(payload, 19) != int32('o'):
+        return false
+    if bytesGet(payload, 20) != int32('n'):
+        return false
+    if bytesGet(payload, 21) != int32('s'):
+        return false
+    if bytesGet(payload, 22) != int32('e'):
+        return false
+    return true
+
+fn v3Libp2pAddressMatchesPrefix(address: types.V3LsmrAddress,
+                                prefix: lt.V3PrefixRef): bool =
+    if prefix.prefixDepth > address.depth:
+        return false
+    for i in 0..<prefix.prefixDepth:
+        if address.digits[i] != prefix.prefixDigits[i]:
+            return false
+    return true
+
+fn v3Libp2pStorePut(entries: var V3Libp2pStoreEntry[],
+                    ingress: overlay.V3IngressEnvelope) =
+    for i in 0..<entries.len:
+        let entry = entries[i]
+        let existingIngress = entry.ingress
+        let existingPayloadCid = existingIngress.payloadCid
+        let ingressPayloadCid = ingress.payloadCid
+        if layout.fixedBytes32Equal(existingPayloadCid, ingressPayloadCid):
+            entries[i].ingress = v3Libp2pIngressClone(ingress)
+            return
+    var outEntry: V3Libp2pStoreEntry
+    outEntry.ingress = v3Libp2pIngressClone(ingress)
+    add(entries, outEntry)
+
+fn v3Libp2pStoreQueryCount(entries: V3Libp2pStoreEntry[],
+                           query: overlay.V3StoreQuery): int32 =
+    var out = 0
+    let zeroCid = layout.FixedBytes32()
+    let wantEvent = query.wantEventCid
+    for i in 0..<entries.len:
+        let ingress = entries[i].ingress
+        if ingress.topicScope != query.topicScope:
+            continue
+        if !types.v3LsmrAddressEqual(ingress.address, query.address):
+            continue
+        if query.prefix.prefixDepth > 0:
+            if !v3Libp2pAddressMatchesPrefix(ingress.address, query.prefix):
+                continue
+        if !layout.fixedBytes32Equal(wantEvent, zeroCid):
+            if !layout.fixedBytes32Equal(wantEvent, ingress.payloadCid):
+                continue
+        if query.rangeStart > 0 && i < query.rangeStart:
+            continue
+        out = out + 1
+        if query.rangeLimit > 0 && out >= query.rangeLimit:
+            break
+    return out
+
+fn v3Libp2pStoreQueryFirst(entries: V3Libp2pStoreEntry[],
+                           query: overlay.V3StoreQuery,
+                           out: var overlay.V3IngressEnvelope): bool =
+    let zeroCid = layout.FixedBytes32()
+    let wantEvent = query.wantEventCid
+    for i in 0..<entries.len:
+        let ingress = entries[i].ingress
+        if ingress.topicScope != query.topicScope:
+            continue
+        if !types.v3LsmrAddressEqual(ingress.address, query.address):
+            continue
+        if query.prefix.prefixDepth > 0:
+            if !v3Libp2pAddressMatchesPrefix(ingress.address, query.prefix):
+                continue
+        if !layout.fixedBytes32Equal(wantEvent, zeroCid):
+            if !layout.fixedBytes32Equal(wantEvent, ingress.payloadCid):
+                continue
+        if query.rangeStart > 0 && i < query.rangeStart:
+            continue
+        out = v3Libp2pIngressClone(ingress)
+        return true
+    return false
+
+fn v3Libp2pStoreQuery(entries: V3Libp2pStoreEntry[],
+                      query: overlay.V3StoreQuery): overlay.V3IngressEnvelope[] =
+    var out: overlay.V3IngressEnvelope[]
+    v3Libp2pStoreQueryFill(entries, query, out)
+    return out
+
+fn v3Libp2pAppendIngressClone(out: var overlay.V3IngressEnvelope[],
+                              ingress: overlay.V3IngressEnvelope) =
+    add(out, v3Libp2pIngressClone(ingress))
+
+fn v3Libp2pStoreQueryFill(entries: V3Libp2pStoreEntry[],
+                          query: overlay.V3StoreQuery,
+                          out: var overlay.V3IngressEnvelope[]) =
+    out = []
+    for i in 0..<entries.len:
+        let zeroCid = layout.FixedBytes32()
+        let ingress = entries[i].ingress
+        if ingress.topicScope != query.topicScope:
+            continue
+        if !types.v3LsmrAddressEqual(ingress.address, query.address):
+            continue
+        if query.prefix.prefixDepth > 0:
+            if !v3Libp2pAddressMatchesPrefix(ingress.address, query.prefix):
+                continue
+        if !layout.fixedBytes32Equal(query.wantEventCid, zeroCid):
+            if !layout.fixedBytes32Equal(query.wantEventCid, ingress.payloadCid):
+                continue
+        v3Libp2pAppendIngressClone(out, ingress)
+        if query.rangeLimit > 0 && out.len >= query.rangeLimit:
+            break
+
+fn v3Libp2pSyncDigestFillFromEntries(out: var overlay.V3SyncDigest,
+                                     sourcePeerId: core.V3Libp2pPeerId,
+                                     scope: overlay.V3OverlayTopicScope,
+                                     stateForestCid: layout.FixedBytes32,
+                                     tipEventCid: layout.FixedBytes32,
+                                     stampEpoch: int32,
+                                     stampGanzhi: int32,
+                                     entries: V3Libp2pStoreEntry[]) =
+    out.sourcePeerId = sourcePeerId.value
+    out.topicScope = scope
+    out.stateForestCid = stateForestCid
+    out.tipEventCid = tipEventCid
+    out.stampEpoch = stampEpoch
+    out.stampGanzhi = stampGanzhi
+    out.eventCount = entries.len
+    out.accountCount = entries.len
+
+fn v3Libp2pSyncDigestFromEntries(sourcePeerId: core.V3Libp2pPeerId,
+                                 scope: overlay.V3OverlayTopicScope,
+                                 stateForestCid: layout.FixedBytes32,
+                                 tipEventCid: layout.FixedBytes32,
+                                 stampEpoch: int32,
+                                 stampGanzhi: int32,
+                                 entries: V3Libp2pStoreEntry[]): overlay.V3SyncDigest =
+    var out: overlay.V3SyncDigest
+    v3Libp2pSyncDigestFillFromEntries(out,
+                                      sourcePeerId,
+                                      scope,
+                                      stateForestCid,
+                                      tipEventCid,
+                                      stampEpoch,
+                                      stampGanzhi,
+                                      entries)
+    return out
+
+fn v3StoreSyncAppendIngress(buf: var layout.ByteBuf,
+                            ingress: overlay.V3IngressEnvelope) =
+    lt.v3AppendFixed32(buf, ingress.sourcePeerId)
+    lt.v3AppendU32BE(buf, ingress.topicScope)
+    lt.v3AppendAddress(buf, ingress.address)
+    lt.v3AppendU32BE(buf, ingress.payloadKind)
+    lt.v3AppendFixed32(buf, ingress.payloadCid)
+    lt.v3AppendU32BE(buf, ingress.payloadLen)
+    lt.v3AppendU32BE(buf, ingress.stampEpoch)
+    lt.v3AppendU32BE(buf, ingress.stampGanzhi)
+    lt.v3AppendU32BE(buf, bytesLen(ingress.payload))
+    layout.byteBufAppendBytes(buf, ingress.payload)
+
+fn v3StoreSyncReadAddress(payload: Bytes,
+                          offset: int32,
+                          out: var types.V3LsmrAddress): Result[int32] =
+    let span = layout.byteSpanFromBytes(payload)
+    let depthRes = codec.v3ReadU32BE(span, offset)
+    if IsErr(depthRes):
+        return Err[int32](Error(depthRes))
+    var next = offset + 4
+    out.depth = int32(Value(depthRes))
+    if out.depth < 0 || out.depth > types.v3LsmrMaxDepth:
+        return Err[int32]("v3 libp2p sync: invalid address depth")
+    if next + types.v3LsmrMaxDepth > bytesLen(payload):
+        return Err[int32]("v3 libp2p sync: truncated address digits")
+    for i in 0..<types.v3LsmrMaxDepth:
+        out.digits[i] = bytesGet(payload, next + i)
+    return Ok[int32](next + types.v3LsmrMaxDepth)
+
+fn v3StoreSyncReadPrefix(payload: Bytes,
+                         offset: int32,
+                         out: var lt.V3PrefixRef): Result[int32] =
+    let span = layout.byteSpanFromBytes(payload)
+    let baguaIdRes = codec.v3ReadU32BE(span, offset)
+    if IsErr(baguaIdRes):
+        return Err[int32](Error(baguaIdRes))
+    let depthRes = codec.v3ReadU32BE(span, offset + 4)
+    if IsErr(depthRes):
+        return Err[int32](Error(depthRes))
+    var next = offset + 8
+    out.baguaId = int32(Value(baguaIdRes))
+    out.prefixDepth = int32(Value(depthRes))
+    if out.prefixDepth < 0 || out.prefixDepth > types.v3LsmrMaxDepth:
+        return Err[int32]("v3 libp2p sync: invalid prefix depth")
+    if next + types.v3LsmrMaxDepth > bytesLen(payload):
+        return Err[int32]("v3 libp2p sync: truncated prefix digits")
+    for i in 0..<types.v3LsmrMaxDepth:
+        out.prefixDigits[i] = bytesGet(payload, next + i)
+    return Ok[int32](next + types.v3LsmrMaxDepth)
+
+fn v3StoreSyncReadIngress(payload: Bytes,
+                          offset: int32,
+                          out: var overlay.V3IngressEnvelope): Result[int32] =
+    let span = layout.byteSpanFromBytes(payload)
+    let sourcePeerRes = codec.v3ReadFixed32(span, offset)
+    if IsErr(sourcePeerRes):
+        return Err[int32](Error(sourcePeerRes))
+    var next = offset + 32
+    let scopeRes = codec.v3ReadU32BE(span, next)
+    if IsErr(scopeRes):
+        return Err[int32](Error(scopeRes))
+    next = next + 4
+    var address: types.V3LsmrAddress
+    let addressNextRes = v3StoreSyncReadAddress(payload, next, address)
+    if IsErr(addressNextRes):
+        return Err[int32](Error(addressNextRes))
+    next = Value(addressNextRes)
+    let payloadKindRes = codec.v3ReadU32BE(span, next)
+    if IsErr(payloadKindRes):
+        return Err[int32](Error(payloadKindRes))
+    next = next + 4
+    let payloadCidRes = codec.v3ReadFixed32(span, next)
+    if IsErr(payloadCidRes):
+        return Err[int32](Error(payloadCidRes))
+    next = next + 32
+    let payloadLenRes = codec.v3ReadU32BE(span, next)
+    if IsErr(payloadLenRes):
+        return Err[int32](Error(payloadLenRes))
+    next = next + 4
+    let stampEpochRes = codec.v3ReadU32BE(span, next)
+    if IsErr(stampEpochRes):
+        return Err[int32](Error(stampEpochRes))
+    next = next + 4
+    let stampGanzhiRes = codec.v3ReadU32BE(span, next)
+    if IsErr(stampGanzhiRes):
+        return Err[int32](Error(stampGanzhiRes))
+    next = next + 4
+    let rawPayloadLenRes = codec.v3ReadU32BE(span, next)
+    if IsErr(rawPayloadLenRes):
+        return Err[int32](Error(rawPayloadLenRes))
+    next = next + 4
+    let payloadLen = int32(Value(payloadLenRes))
+    let rawPayloadLen = int32(Value(rawPayloadLenRes))
+    if rawPayloadLen < 0 || next + rawPayloadLen > bytesLen(payload):
+        return Err[int32]("v3 libp2p sync: truncated ingress payload")
+    if payloadLen != rawPayloadLen:
+        return Err[int32]("v3 libp2p sync: ingress payload length mismatch")
+    out.sourcePeerId = Value(sourcePeerRes)
+    out.topicScope = int32(Value(scopeRes))
+    out.address = address
+    out.payloadKind = int32(Value(payloadKindRes))
+    out.payloadCid = Value(payloadCidRes)
+    out.payloadLen = payloadLen
+    out.stampEpoch = int32(Value(stampEpochRes))
+    out.stampGanzhi = int32(Value(stampGanzhiRes))
+    out.payload = bytesSlice(payload, next, rawPayloadLen)
+    return Ok[int32](next + rawPayloadLen)
+
+fn v3Libp2pStoreQueryEncode(query: overlay.V3StoreQuery): Bytes =
+    var buf: layout.ByteBuf
+    buf = layout.byteBufInit(160)
+    v3Libp2pSyncAppendQueryMagic(buf)
+    lt.v3AppendU32BE(buf, v3Libp2pStoreSyncCodecVersion)
+    lt.v3AppendFixed32(buf, query.sourcePeerId)
+    lt.v3AppendU32BE(buf, query.topicScope)
+    lt.v3AppendAddress(buf, query.address)
+    lt.v3AppendPrefix(buf, query.prefix)
+    lt.v3AppendFixed32(buf, query.wantForestCid)
+    lt.v3AppendFixed32(buf, query.wantEventCid)
+    lt.v3AppendU32BE(buf, query.rangeStart)
+    lt.v3AppendU32BE(buf, query.rangeLimit)
+    return layout.byteBufToBytes(buf)
+
+fn v3Libp2pStoreQueryDecode(payload: Bytes): Result[overlay.V3StoreQuery] =
+    var out: overlay.V3StoreQuery
+    let fillRes = v3Libp2pStoreQueryDecodeFill(payload, out)
+    if IsErr(fillRes):
+        return Err[overlay.V3StoreQuery](Error(fillRes))
+    return Ok[overlay.V3StoreQuery](out)
+
+fn v3Libp2pStoreQueryDecodeFill(payload: Bytes,
+                                out: var overlay.V3StoreQuery): Result[bool] =
+    if !v3Libp2pSyncPayloadHasQueryMagic(payload):
+        return Err[bool]("v3 libp2p sync: invalid query magic")
+    let magicLen = v3Libp2pSyncQueryMagicLen
+    let span = layout.byteSpanFromBytes(payload)
+    let versionRes = codec.v3ReadU32BE(span, magicLen)
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    if int32(Value(versionRes)) != v3Libp2pStoreSyncCodecVersion:
+        return Err[bool]("v3 libp2p sync: unsupported query version")
+    var next = magicLen + 4
+    let sourcePeerRes = codec.v3ReadFixed32(span, next)
+    if IsErr(sourcePeerRes):
+        return Err[bool](Error(sourcePeerRes))
+    next = next + 32
+    let scopeRes = codec.v3ReadU32BE(span, next)
+    if IsErr(scopeRes):
+        return Err[bool](Error(scopeRes))
+    next = next + 4
+    var address: types.V3LsmrAddress
+    let addressNextRes = v3StoreSyncReadAddress(payload, next, address)
+    if IsErr(addressNextRes):
+        return Err[bool](Error(addressNextRes))
+    next = Value(addressNextRes)
+    var prefix: lt.V3PrefixRef
+    let prefixNextRes = v3StoreSyncReadPrefix(payload, next, prefix)
+    if IsErr(prefixNextRes):
+        return Err[bool](Error(prefixNextRes))
+    next = Value(prefixNextRes)
+    let forestCidRes = codec.v3ReadFixed32(span, next)
+    if IsErr(forestCidRes):
+        return Err[bool](Error(forestCidRes))
+    next = next + 32
+    let eventCidRes = codec.v3ReadFixed32(span, next)
+    if IsErr(eventCidRes):
+        return Err[bool](Error(eventCidRes))
+    next = next + 32
+    let rangeStartRes = codec.v3ReadU32BE(span, next)
+    if IsErr(rangeStartRes):
+        return Err[bool](Error(rangeStartRes))
+    next = next + 4
+    let rangeLimitRes = codec.v3ReadU32BE(span, next)
+    if IsErr(rangeLimitRes):
+        return Err[bool](Error(rangeLimitRes))
+    out = overlay.V3StoreQuery()
+    out.sourcePeerId = Value(sourcePeerRes)
+    out.topicScope = int32(Value(scopeRes))
+    out.address = address
+    out.prefix = prefix
+    out.wantForestCid = Value(forestCidRes)
+    out.wantEventCid = Value(eventCidRes)
+    out.rangeStart = int32(Value(rangeStartRes))
+    out.rangeLimit = int32(Value(rangeLimitRes))
+    return Ok[bool](true)
+
+fn v3Libp2pStoreEntriesEncode(entries: overlay.V3IngressEnvelope[]): Bytes =
+    var buf: layout.ByteBuf
+    buf = layout.byteBufInit(256)
+    v3Libp2pSyncAppendResponseMagic(buf)
+    lt.v3AppendU32BE(buf, v3Libp2pStoreSyncCodecVersion)
+    lt.v3AppendU32BE(buf, entries.len)
+    for i in 0..<entries.len:
+        v3StoreSyncAppendIngress(buf, entries[i])
+    return layout.byteBufToBytes(buf)
+
+fn v3Libp2pStoreEntriesDecodeFill(payload: Bytes,
+                                  out: var overlay.V3IngressEnvelope[]): Result[bool] =
+    if !v3Libp2pSyncPayloadHasResponseMagic(payload):
+        return Err[bool]("v3 libp2p sync: invalid response magic")
+    let magicLen = v3Libp2pSyncResponseMagicLen
+    let span = layout.byteSpanFromBytes(payload)
+    let versionRes = codec.v3ReadU32BE(span, magicLen)
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    if int32(Value(versionRes)) != v3Libp2pStoreSyncCodecVersion:
+        return Err[bool]("v3 libp2p sync: unsupported response version")
+    let countRes = codec.v3ReadU32BE(span, magicLen + 4)
+    if IsErr(countRes):
+        return Err[bool](Error(countRes))
+    let count = int32(Value(countRes))
+    if count < 0:
+        return Err[bool]("v3 libp2p sync: invalid response count")
+    var next = magicLen + 8
+    out = []
+    for i in 0..<count:
+        var ingress: overlay.V3IngressEnvelope
+        ingress = overlay.V3IngressEnvelope()
+        let nextRes = v3StoreSyncReadIngress(payload, next, ingress)
+        if IsErr(nextRes):
+            return Err[bool](Error(nextRes))
+        next = Value(nextRes)
+        v3Libp2pAppendIngressClone(out, ingress)
+    return Ok[bool](true)
+
+fn v3Libp2pStoreEntriesDecode(payload: Bytes): Result[overlay.V3IngressEnvelope[]] =
+    var out: overlay.V3IngressEnvelope[]
+    let fillRes = v3Libp2pStoreEntriesDecodeFill(payload, out)
+    if IsErr(fillRes):
+        return Err[overlay.V3IngressEnvelope[]](Error(fillRes))
+    return Ok[overlay.V3IngressEnvelope[]](out)
+
+fn v3Libp2pSyncServePayload(entries: V3Libp2pStoreEntry[],
+                            requestPayload: Bytes): Result[Bytes] =
+    var query: overlay.V3StoreQuery
+    let queryRes = v3Libp2pStoreQueryDecodeFill(requestPayload, query)
+    if IsErr(queryRes):
+        return Err[Bytes](Error(queryRes))
+    var responseEntries: overlay.V3IngressEnvelope[]
+    v3Libp2pStoreQueryFill(entries, query, responseEntries)
+    return Ok[Bytes](v3Libp2pStoreEntriesEncode(responseEntries))

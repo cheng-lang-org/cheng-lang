@@ -1,0 +1,92 @@
+import std/os
+import cheng/core/backend/system_link_exec as sexec
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/tooling/path as v3path
+import cheng/libp2p/browser/browser_content_codec_codegen as codegen
+import cheng/libp2p/browser/browser_content_codec_rule_schema as browsercodec
+import cheng/libp2p/browser/browser_host_probe_codegen as probegen
+import cheng/libp2p/browser/browser_host_probe_rule_schema as browserprobe
+
+fn browserBridgeArtifactContains(text: str, needle: str): bool =
+    if len(needle) <= 0:
+        return true
+    if len(text) < len(needle):
+        return false
+    var i: int32
+    while i + len(needle) <= len(text):
+        var matched = true
+        var j: int32
+        while j < len(needle):
+            if text[i + j] != needle[j]:
+                matched = false
+                break
+            j = j + 1
+        if matched:
+            return true
+        i = i + 1
+    return false
+
+fn main(): int32 =
+    let workspaceRoot = "/Users/lbcheng/cheng-lang"
+    let packageRoot = "/Users/lbcheng/cheng-lang"
+    let browserRuntimePath = "/Users/lbcheng/cheng-lang/src/tests/browser_host_native_runtime_smoke.cheng"
+    let browserCodecPath = "/Users/lbcheng/cheng-lang/src/libp2p/browser/browser_content_codec_abi.cheng"
+    let browserProbePath = "/Users/lbcheng/cheng-lang/src/libp2p/browser/browser_host_wasm_probe.cheng"
+    let outputPath = "/Users/lbcheng/cheng-lang/artifacts/bootstrap/browser_bridge_artifact_write_smoke.out"
+    let artifactPath = outputPath + ".browser_bridge_plan.txt"
+    let sourcePath = outputPath + ".browser_bridge.generated.cheng"
+    if os.FileExists(artifactPath):
+        let _ = os.RemoveFile(artifactPath)
+    if os.FileExists(sourcePath):
+        let _ = os.RemoveFile(sourcePath)
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    linkPlan.workspaceRoot = workspaceRoot
+    linkPlan.packageRoot = packageRoot
+    linkPlan.entryPath = browserRuntimePath
+    linkPlan.outputPath = outputPath
+    linkPlan.sourceClosurePaths = [
+        browserRuntimePath,
+        browserCodecPath,
+        browserProbePath
+    ]
+    var plan: sexec.V3SystemLinkExecPlan
+    plan.compilerEntrySource = browserRuntimePath
+    plan.systemLinkPlan = linkPlan
+    assert(sexec.v3SystemLinkExecWriteBrowserBridgeArtifact("", plan),
+           "v3 browser bridge artifact write: write failed")
+    assert(sexec.v3SystemLinkExecWriteBrowserBridgeSource("", plan),
+           "v3 browser bridge source write: write failed")
+    assert(os.FileExists(artifactPath),
+           "v3 browser bridge artifact write: artifact missing")
+    assert(os.FileExists(sourcePath),
+           "v3 browser bridge source write: artifact missing")
+    let artifactText = v3path.V3ReadTextFile("", artifactPath)
+    let sourceText = v3path.V3ReadTextFile("", sourcePath)
+    let codecEmitLine = codegen.v3BrowserCodecBridgeEmitLineForSourceRuleName(browserCodecPath,
+                                                                               browsercodec.v3BrowserContentCodecRuleExportMoqFountainTextResultName())
+    let probeEmitLine = probegen.v3BrowserHostProbeBridgeEmitLineForSourceRuleName(browserProbePath,
+                                                                                     browserprobe.v3BrowserHostProbeRuleDmWaitStartName())
+    assert(browserBridgeArtifactContains(artifactText, "format=browser_abi_bridge_plan_v1"),
+           "v3 browser bridge artifact write: format")
+    assert(browserBridgeArtifactContains(artifactText, "bridge_count=14"),
+           "v3 browser bridge artifact write: count")
+    assert(browserBridgeArtifactContains(artifactText, "bridge_unique_key_count=10"),
+           "v3 browser bridge artifact write: unique count")
+    assert(browserBridgeArtifactContains(artifactText, codecEmitLine),
+           "v3 browser bridge artifact write: codec emit line")
+    assert(browserBridgeArtifactContains(artifactText, probeEmitLine),
+           "v3 browser bridge artifact write: probe emit line")
+    assert(browserBridgeArtifactContains(sourceText, "fn v3BrowserBridgeGeneratedSourceFormat(): str ="),
+           "v3 browser bridge source write: format function")
+    assert(browserBridgeArtifactContains(sourceText, "return \"browser_abi_bridge_source_v1\""),
+           "v3 browser bridge source write: format value")
+    assert(browserBridgeArtifactContains(sourceText, "fn v3_browser_bridge_result_export_export_moq_fountain_text_result(textRes: Result[str],"),
+           "v3 browser bridge source write: codec helper")
+    assert(browserBridgeArtifactContains(sourceText, "importc fn cheng_browser_dm_wait_start_bridge(arg0: int32, arg1: int32): int32"),
+           "v3 browser bridge source write: scalar import")
+    assert(browserBridgeArtifactContains(sourceText, "fn v3_browser_bridge_scalar_call_dm_wait_start(arg0: int32,"),
+           "v3 browser bridge source write: scalar helper")
+    let _ = os.RemoveFile(artifactPath)
+    let _ = os.RemoveFile(sourcePath)
+    echo("v3 browser_bridge_artifact_write_smoke ok")
+    return 0

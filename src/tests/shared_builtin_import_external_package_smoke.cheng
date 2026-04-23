@@ -1,0 +1,126 @@
+import std/os
+import std/os_host_process as hostos
+import std/strformat as sf
+import std/strings
+
+fn ensureDir(path: str) =
+    if !os.DirExists(path):
+        os.CreateDir(path)
+
+fn resolveCompiler(root: str): str =
+    let compilerEnv = os.GetEnv("CHENG_SMOKE_COMPILER")
+    if len(compilerEnv) > 0:
+        if os.IsAbsolute(compilerEnv):
+            return compilerEnv
+        return os.JoinPath(root, compilerEnv)
+    let backendDriver = os.JoinPath(root, "artifacts/backend_driver/cheng")
+    if os.FileExists(backendDriver):
+        return backendDriver
+    return os.JoinPath(root, "artifacts/bootstrap/cheng.stage3")
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let outDir = os.JoinPath(root, "artifacts/shared_builtin_import_external_package_smoke")
+    let tmpRoot = os.GetEnvDefault("CHENG_SHARED_BUILTIN_TMPDIR",
+                                   os.GetEnvDefault("TMPDIR", "/tmp"))
+    let workspaceDir = os.JoinPath(tmpRoot, "cheng_shared_builtin_import_external_package_smoke")
+    let packageRoot = os.JoinPath(workspaceDir, "shared_builtin_pkg")
+    let srcDir = os.JoinPath(packageRoot, "src")
+    ensureDir(outDir)
+    ensureDir(workspaceDir)
+    ensureDir(packageRoot)
+    ensureDir(srcDir)
+
+    let packageText = sf.Lines([
+        "package_id = \"pkg://cheng/shared_builtin_pkg\"",
+        "module_prefix = \"shared_builtin_pkg\""
+    ])
+    let helperText = sf.Lines([
+        "fn HelperValue(): int32 =",
+        "    return 11"
+    ])
+    let sourceText = sf.Lines([
+        "import cheng/shared_builtin_pkg/helper as helper",
+        "import runtime/scalars as rscalar",
+        "import runtime/json_ast as json",
+        "import decentralized/storage_proof as proof",
+        "import decentralized/json_parse as jparse",
+        "",
+        "fn main(): int32 =",
+        "    assert(helper.HelperValue() == 11, \"external self package: cheng/package prefix\")",
+        "    assert(rscalar.IsPositiveI32(7), \"external shared builtin: runtime scalar\")",
+        "    let got: int32 = rscalar.IdentityI32(7)",
+        "    let proofId: str = proof.NormalizeStorageProofId(\"provider-a\", \"pkg-a\", \"cid-a\", 7)",
+        "    let parsed = jparse.ParseJsonSafe(\"{\\\"score\\\":1.5,\\\"tags\\\":[\\\"a\\\",\\\"b\\\"],\\\"ok\\\":true}\")",
+        "    assert(parsed.ok, parsed.error)",
+        "    let score: float64 = jparse.GetFloatField(parsed.value, \"score\", 0.0)",
+        "    let scoreNode: json.JsonNode = json.JsonGetField(parsed.value, \"score\")",
+        "    assert(int64(score) == 1, \"external shared builtin: json float value\")",
+        "    assert(scoreNode.kind == json.JFloat, \"external shared builtin: json float kind\")",
+        "    assert(json.HasKey(parsed.value, \"ok\"), \"external shared builtin: json has key\")",
+        "    let tags: json.JsonNode = json.JsonGetField(parsed.value, \"tags\")",
+        "    assert(got == 7, \"external shared builtin: runtime get\")",
+        "    assert(len(proofId) > 0, \"external shared builtin: decentralized id\")",
+        "    assert(tags.kind == json.JArray, \"external shared builtin: json array\")",
+        "    assert(tags.a.len == 2, \"external shared builtin: json array len\")",
+        "    assert(json.GetStr(tags.a[0]) == \"a\", \"external shared builtin: json first tag\")",
+        "    echo(\"external shared builtin ok\")",
+        "    return 0"
+    ])
+    let packagePath = os.JoinPath(packageRoot, "cheng-package.toml")
+    let helperPath = os.JoinPath(srcDir, "helper.cheng")
+    let sourcePath = os.JoinPath(srcDir, "main.cheng")
+    os.WriteFile(packagePath, packageText)
+    os.WriteFile(helperPath, helperText)
+    os.WriteFile(sourcePath, sourceText)
+
+    let compiler = resolveCompiler(root)
+    assert(os.FileExists(compiler), "v3 shared builtin external package: compiler exists")
+    let target = os.GetEnvDefault("CHENG_BOOTSTRAP_TARGET", "arm64-apple-darwin")
+    let outBin = os.JoinPath(outDir, "shared_builtin_pkg")
+    let outMap = outBin + ".map"
+    let compileLog = os.JoinPath(outDir, "shared_builtin_pkg.compile.log")
+    let runLog = os.JoinPath(outDir, "shared_builtin_pkg.run.log")
+    if os.FileExists(outBin):
+        os.RemoveFile(outBin)
+    if os.FileExists(outMap):
+        os.RemoveFile(outMap)
+    var compileArgv: str[]
+    add(compileArgv, "system-link-exec")
+    add(compileArgv, "--root")
+    add(compileArgv, packageRoot)
+    add(compileArgv, "--in")
+    add(compileArgv, sourcePath)
+    add(compileArgv, "--emit")
+    add(compileArgv, "exe")
+    add(compileArgv, "--target")
+    add(compileArgv, target)
+    add(compileArgv, "--out")
+    add(compileArgv, outBin)
+    var compileEnv: str[]
+    let noHandoff = os.GetEnv("CHENG_NO_BACKEND_DRIVER_HANDOFF")
+    if len(noHandoff) > 0 && noHandoff != "0":
+        add(compileEnv, "CHENG_NO_BACKEND_DRIVER_HANDOFF=" + noHandoff)
+    let rootEnv = os.GetEnv("CHENG_ROOT")
+    if len(rootEnv) > 0:
+        add(compileEnv, "CHENG_ROOT=" + rootEnv)
+    let compileRes = hostos.ExecFileCapture(compiler,
+                                            compileArgv,
+                                            compileEnv,
+                                            packageRoot,
+                                            true,
+                                            120)
+    let compileOutput = os.ExecCmdResultOutput(compileRes)
+    os.WriteFile(compileLog, compileOutput)
+    assert(os.ExecCmdResultExitCode(compileRes) == 0,
+           "v3 shared builtin external package: compile rc")
+    assert(os.FileExists(outBin), "v3 shared builtin external package: output exists")
+    let runRes = hostos.ExecFileCapture(outBin, [], [], packageRoot, true, 30)
+    let runOutput = os.ExecCmdResultOutput(runRes)
+    os.WriteFile(runLog, runOutput)
+    assert(os.ExecCmdResultExitCode(runRes) == 0,
+           "v3 shared builtin external package: run rc")
+    assert(strings.StrContains(runOutput, "external shared builtin ok"),
+           "v3 shared builtin external package: run output")
+    echo("v3 shared_builtin_import_external_package_smoke ok")
+    return 0

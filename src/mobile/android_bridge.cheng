@@ -1,0 +1,359 @@
+import std/result
+import cheng/libp2p/core/types
+import cheng/libp2p/core/peer_id
+import cheng/libp2p/core/multiaddr
+import cheng/libp2p/core/peerstore as ps
+import cheng/libp2p/identity/did
+import cheng/libp2p/mobile/mobile_capi as capi
+
+const
+    v3MobileRoutingRoleDefault: int32 = 0
+
+type
+    V3MobileHost =
+        selfPeerId: types.V3Libp2pPeerId
+        hasDidIdentity: bool
+        didIdentity: did.V3DidIdentity
+        started: bool
+        mdnsEnabled: bool
+        mdnsIntervalSeconds: int32
+        trustedInfra: bool
+        listenAddrs: types.V3Libp2pMultiaddr[]
+        peers: ps.V3Libp2pPeerstore
+        bootstrapCount: int32
+
+fn v3MobileHostInit(seed: str): V3MobileHost =
+    var out: V3MobileHost
+    peer_id.v3Libp2pPeerIdFillFromSeed(out.selfPeerId, seed)
+    out.hasDidIdentity = false
+    out.didIdentity = did.V3DidIdentity()
+    out.started = false
+    out.mdnsEnabled = false
+    out.mdnsIntervalSeconds = 15
+    out.trustedInfra = false
+    out.listenAddrs = []
+    out.peers = ps.V3Libp2pPeerstore()
+    out.bootstrapCount = 0
+    return out
+
+fn v3MobileHostInitWithDid(identity: did.V3DidIdentity): V3MobileHost =
+    var out = v3MobileHostInit(identity.deviceSeed)
+    out.selfPeerId = identity.selfDevice.devicePeerId
+    out.hasDidIdentity = true
+    out.didIdentity = did.v3DidIdentityClone(identity)
+    return out
+
+fn v3MobileHostInitWithDidStore(identityStorePath: str,
+                                rootSeedHint: str,
+                                deviceSeedHint: str,
+                                deviceLabelHint: str,
+                                epochSeconds: int64): Result[V3MobileHost] =
+    var out: V3MobileHost
+    let initRes = v3MobileHostInitWithDidStoreFill(out,
+                                                   identityStorePath,
+                                                   rootSeedHint,
+                                                   deviceSeedHint,
+                                                   deviceLabelHint,
+                                                   epochSeconds)
+    if IsErr(initRes):
+        return Err[V3MobileHost](Error(initRes))
+    return Ok[V3MobileHost](out)
+
+fn v3MobileHostInitWithDidStoreFill(out: var V3MobileHost,
+                                    identityStorePath: str,
+                                    rootSeedHint: str,
+                                    deviceSeedHint: str,
+                                    deviceLabelHint: str,
+                                    epochSeconds: int64): Result[bool] =
+    var identity: did.V3DidIdentity
+    let identityRes = did.v3DidLoadOrCreateIdentityFill(identity,
+                                                        "",
+                                                        identityStorePath,
+                                                        rootSeedHint,
+                                                        deviceSeedHint,
+                                                        deviceLabelHint,
+                                                        epochSeconds)
+    if IsErr(identityRes):
+        return Err[bool](Error(identityRes))
+    out = v3MobileHostInitWithDid(identity)
+    return Ok[bool](true)
+
+fn v3MobileHostStart(host: var V3MobileHost) =
+    host.started = true
+
+fn v3MobileHostStop(host: var V3MobileHost) =
+    host.started = false
+
+fn v3MobileHostIsStarted(host: V3MobileHost): bool =
+    return host.started
+
+fn v3MobileHostPeerIdText(host: V3MobileHost): str =
+    return peer_id.v3Libp2pPeerIdText(host.selfPeerId)
+
+fn v3MobileHostHasDidIdentity(host: V3MobileHost): bool =
+    return host.hasDidIdentity
+
+fn v3MobileHostDidText(host: V3MobileHost): str =
+    if !host.hasDidIdentity:
+        return ""
+    return did.v3DidIdentityDid(host.didIdentity)
+
+fn v3MobileHostSaveDidIdentity(identityStorePath: str,
+                               host: V3MobileHost): Result[bool] =
+    if !host.hasDidIdentity:
+        return Err[bool]("v3 mobile host: missing did identity")
+    return did.v3DidSaveIdentity("", identityStorePath, host.didIdentity)
+
+fn v3MobileHostSetMdnsEnabled(host: var V3MobileHost, enabled: bool) =
+    host.mdnsEnabled = enabled
+
+fn v3MobileHostMdnsEnabled(host: V3MobileHost): bool =
+    return host.mdnsEnabled
+
+fn v3MobileHostSetMdnsInterval(host: var V3MobileHost, seconds: int32) =
+    host.mdnsIntervalSeconds = seconds
+
+fn v3MobileHostMdnsInterval(host: V3MobileHost): int32 =
+    return host.mdnsIntervalSeconds
+
+fn v3MobileHostSetTrustedInfra(host: var V3MobileHost, trusted: bool) =
+    host.trustedInfra = trusted
+
+fn v3MobileHostTrustedInfra(host: V3MobileHost): bool =
+    return host.trustedInfra
+
+fn v3MobileHostListenAddrCount(host: V3MobileHost): int32 =
+    return host.listenAddrs.len
+
+fn v3MobileHostListenAddrTextAt(host: V3MobileHost, index: int32): str =
+    if index < 0 || index >= host.listenAddrs.len:
+        return ""
+    return multiaddr.v3Libp2pMultiaddrText(host.listenAddrs[index])
+
+fn v3MobileHostListenAddText(host: var V3MobileHost, addrText: str): Result[bool] =
+    var addr: types.V3Libp2pMultiaddr
+    let parseRes = multiaddr.v3Libp2pMultiaddrFillFromText(addr, addrText)
+    if IsErr(parseRes):
+        return Err[bool](Error(parseRes))
+    add(host.listenAddrs, multiaddr.v3Libp2pMultiaddrClone(addr))
+    return Ok[bool](true)
+
+fn v3MobileHostDialableAddrTextAt(host: V3MobileHost, index: int32): str =
+    let base = v3MobileHostListenAddrTextAt(host, index)
+    let peerText = peer_id.v3Libp2pPeerIdText(host.selfPeerId)
+    if len(base) <= 0:
+        return ""
+    return capi.v3MobileCapiDialableAddr(base, peerText)
+
+fn v3MobilePeerRecordUpsertAddress(record: var ps.V3Libp2pPeerRecord,
+                                   addr: types.V3Libp2pMultiaddr) =
+    ps.v3Libp2pPeerRecordPutEndpoint(record,
+                                     addr,
+                                     false,
+                                     types.v3Libp2pReachabilityUnknown,
+                                     addr.priority)
+
+fn v3MobilePeerRecordSeed(host: V3MobileHost,
+                          peerValue: types.V3Libp2pPeerId): ps.V3Libp2pPeerRecord =
+    let pos = ps.v3Libp2pPeerstorePos(host.peers, peerValue)
+    if pos >= 0:
+        return host.peers.peers[pos]
+    var out: ps.V3Libp2pPeerRecord
+    out.peerId = peerValue
+    out.routingRole = v3MobileRoutingRoleDefault
+    return out
+
+fn v3MobileHostRegisterPeerHintText(host: var V3MobileHost,
+                                    peerText: str,
+                                    addrText: str,
+                                    routingRole: int32,
+                                    bootstrap: bool,
+                                    trusted: bool): Result[bool] =
+    var peerValue: types.V3Libp2pPeerId
+    let peerRes = peer_id.v3Libp2pPeerIdFillFromText(peerValue, peerText)
+    if IsErr(peerRes):
+        return Err[bool](Error(peerRes))
+    var addr: types.V3Libp2pMultiaddr
+    let addrRes = multiaddr.v3Libp2pMultiaddrFillFromText(addr, addrText)
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    var record = v3MobilePeerRecordSeed(host, peerValue)
+    record.routingRole = routingRole
+    if bootstrap:
+        record.bootstrap = true
+        record.trustedInfra = true
+    elif trusted:
+        record.trustedInfra = true
+    v3MobilePeerRecordUpsertAddress(record, addr)
+    ps.v3Libp2pPeerstoreUpsert(host.peers, record)
+    if bootstrap:
+        host.bootstrapCount = host.bootstrapCount + 1
+    return Ok[bool](true)
+
+fn v3MobileHostPeerCount(host: V3MobileHost): int32 =
+    return host.peers.peers.len
+
+fn v3MobileHostPeerTextAt(host: V3MobileHost, index: int32): str =
+    if index < 0 || index >= host.peers.peers.len:
+        return ""
+    return peer_id.v3Libp2pPeerIdText(host.peers.peers[index].peerId)
+
+fn v3MobileHostConnectedPeerCount(host: V3MobileHost): int32 =
+    var out: int32
+    for i in 0..<host.peers.peers.len:
+        if host.peers.peers[i].connected:
+            out = out + 1
+    return out
+
+fn v3MobileHostConnectedPeerTextAt(host: V3MobileHost, index: int32): str =
+    var seen: int32
+    for i in 0..<host.peers.peers.len:
+        if !host.peers.peers[i].connected:
+            continue
+        if seen == index:
+            return peer_id.v3Libp2pPeerIdText(host.peers.peers[i].peerId)
+        seen = seen + 1
+    return ""
+
+fn v3MobileHostBootstrapPeerCount(host: V3MobileHost): int32 =
+    var out: int32
+    for i in 0..<host.peers.peers.len:
+        if host.peers.peers[i].bootstrap:
+            out = out + 1
+    return out
+
+fn v3MobileHostBootstrapPeerTextAt(host: V3MobileHost, index: int32): str =
+    var seen: int32
+    for i in 0..<host.peers.peers.len:
+        if !host.peers.peers[i].bootstrap:
+            continue
+        if seen == index:
+            return peer_id.v3Libp2pPeerIdText(host.peers.peers[i].peerId)
+        seen = seen + 1
+    return ""
+
+fn v3MobileHostFindPeerPosByText(host: V3MobileHost, peerText: str): int32 =
+    var peerValue: types.V3Libp2pPeerId
+    let peerRes = peer_id.v3Libp2pPeerIdFillFromText(peerValue, peerText)
+    if IsErr(peerRes):
+        return -1
+    return ps.v3Libp2pPeerstorePos(host.peers, peerValue)
+
+fn v3MobileHostIsPeerConnectedText(host: V3MobileHost, peerText: str): bool =
+    let pos = v3MobileHostFindPeerPosByText(host, peerText)
+    if pos < 0:
+        return false
+    return host.peers.peers[pos].connected
+
+fn v3MobileHostPeerAddrCountText(host: V3MobileHost, peerText: str): int32 =
+    let pos = v3MobileHostFindPeerPosByText(host, peerText)
+    if pos < 0:
+        return 0
+    return host.peers.peers[pos].endpoints.len
+
+fn v3MobileHostPeerAddrTextAt(host: V3MobileHost, peerText: str, index: int32): str =
+    let pos = v3MobileHostFindPeerPosByText(host, peerText)
+    if pos < 0 || index < 0 || index >= host.peers.peers[pos].endpoints.len:
+        return ""
+    return multiaddr.v3Libp2pMultiaddrText(host.peers.peers[pos].endpoints[index].addr)
+
+fn v3MobileHostPeerDialableAddrTextAt(host: V3MobileHost, peerText: str, index: int32): str =
+    let addrText = v3MobileHostPeerAddrTextAt(host, peerText, index)
+    if len(addrText) <= 0:
+        return ""
+    return capi.v3MobileCapiDialableAddr(addrText, peerText)
+
+fn v3MobileHostConnectPreferredText(host: var V3MobileHost,
+                                    peerText: str,
+                                    preferredAddrText: str): Result[bool] =
+    var peerValue: types.V3Libp2pPeerId
+    let peerRes = peer_id.v3Libp2pPeerIdFillFromText(peerValue, peerText)
+    if IsErr(peerRes):
+        return Err[bool](Error(peerRes))
+    var preferredAddr: types.V3Libp2pMultiaddr
+    let addrRes = multiaddr.v3Libp2pMultiaddrFillFromText(preferredAddr, preferredAddrText)
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    var record = v3MobilePeerRecordSeed(host, peerValue)
+    record.connected = true
+    record.rttEwmaMicros = 1000
+    if record.trustPermille < 800:
+        record.trustPermille = 800
+    ps.v3Libp2pPeerRecordResetLastDialOk(record)
+    ps.v3Libp2pPeerRecordPutEndpoint(record,
+                                     preferredAddr,
+                                     true,
+                                     types.v3Libp2pReachabilityDirect,
+                                     preferredAddr.priority)
+    ps.v3Libp2pPeerstoreUpsert(host.peers, record)
+    return Ok[bool](true)
+
+fn v3MobileHostConnectRegisteredText(host: var V3MobileHost,
+                                     peerText: str): Result[bool] =
+    let pos = v3MobileHostFindPeerPosByText(host, peerText)
+    if pos < 0:
+        return Err[bool]("v3 mobile host: peer missing")
+    if host.peers.peers[pos].endpoints.len <= 0:
+        return Err[bool]("v3 mobile host: peer endpoint missing")
+    var peerValue: types.V3Libp2pPeerId
+    let peerRes = peer_id.v3Libp2pPeerIdFillFromText(peerValue, peerText)
+    if IsErr(peerRes):
+        return Err[bool](Error(peerRes))
+    let addr = host.peers.peers[pos].endpoints[0].addr
+    var record = host.peers.peers[pos]
+    record.connected = true
+    record.rttEwmaMicros = 1000
+    if record.trustPermille < 800:
+        record.trustPermille = 800
+    ps.v3Libp2pPeerRecordResetLastDialOk(record)
+    ps.v3Libp2pPeerRecordPutEndpoint(record,
+                                     addr,
+                                     true,
+                                     types.v3Libp2pReachabilityDirect,
+                                     addr.priority)
+    ps.v3Libp2pPeerstoreUpsert(host.peers, record)
+    return Ok[bool](true)
+
+fn v3MobileHostConnectKnown(host: var V3MobileHost,
+                            peerValue: types.V3Libp2pPeerId,
+                            addr: types.V3Libp2pMultiaddr): Result[bool] =
+    var record = v3MobilePeerRecordSeed(host, peerValue)
+    record.connected = true
+    record.rttEwmaMicros = 1000
+    if record.trustPermille < 800:
+        record.trustPermille = 800
+    ps.v3Libp2pPeerRecordResetLastDialOk(record)
+    ps.v3Libp2pPeerRecordPutEndpoint(record,
+                                     addr,
+                                     true,
+                                     types.v3Libp2pReachabilityDirect,
+                                     addr.priority)
+    ps.v3Libp2pPeerstoreUpsert(host.peers, record)
+    return Ok[bool](true)
+
+fn v3MobileHostDisconnectText(host: var V3MobileHost, peerText: str): bool =
+    let pos = v3MobileHostFindPeerPosByText(host, peerText)
+    if pos < 0:
+        return false
+    var record = host.peers.peers[pos]
+    record.connected = false
+    ps.v3Libp2pPeerRecordResetLastDialOk(record)
+    host.peers.peers[pos] = record
+    return true
+
+fn v3MobileHostReconnectBootstrap(host: var V3MobileHost): int32 =
+    var connected: int32
+    for i in 0..<host.peers.peers.len:
+        let record = host.peers.peers[i]
+        if !record.bootstrap:
+            continue
+        if record.connected:
+            continue
+        if record.endpoints.len <= 0:
+            continue
+        let connectRes = v3MobileHostConnectKnown(host,
+                                                  record.peerId,
+                                                  record.endpoints[0].addr)
+        if IsOk(connectRes):
+            connected = connected + 1
+    return connected

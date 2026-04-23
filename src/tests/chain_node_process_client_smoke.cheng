@@ -1,0 +1,41 @@
+import std/system
+import std/cmdline as cmdline
+import cheng/chain/anti_entropy as anti
+import cheng/apps/chain_node/chain_node as node
+import cheng/apps/chain_node/chain_node_libp2p as net
+import cheng/libp2p/core/types
+import cheng/libp2p/transports/tcp_transport
+
+fn main(): int32 =
+    let port = cmdline.ReadInt32FlagOrDefault("--port", -1)
+    assert(port > 0, "v3 chain_node process client: invalid port")
+
+    var client: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(client, "process.client", "process.loopback")),
+           "v3 chain_node: init")
+    let payloadRes = tcp_transport.v3Libp2pTcpRecvPayloadOnce("127.0.0.1",
+                                                              port,
+                                                              types.v3Libp2pProtocolSync)
+    assert(payloadRes.ok, "v3 chain_node process client: recv payload")
+
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshotInto(payloadRes.value, snapshot)
+    assert(snapshotRes.ok, "v3 chain_node process client: decode snapshot")
+
+    let syncRes = node.v3ChainNodeSyncOnce(client, snapshot)
+    assert(syncRes.ok, "v3 chain_node process client: sync")
+    assert(syncRes.value, "v3 chain_node process client: sync changed")
+
+    let aliceRes = node.v3ChainNodeBalance(client, 11, 1001)
+    let bobRes = node.v3ChainNodeBalance(client, 11, 2002)
+    assert(aliceRes.ok, "v3 chain_node process client: alice balance")
+    assert(bobRes.ok, "v3 chain_node process client: bob balance")
+    assert(aliceRes.value == int64(55), "v3 chain_node process client: alice 55")
+    assert(bobRes.value == int64(33), "v3 chain_node process client: bob 33")
+
+    var clientSnapshot: node.V3ChainNodeServeSnapshot
+    node.v3ChainNodeServeOnceInto(clientSnapshot, client)
+    assert(anti.v3AntiEntropySignatureEqual(snapshot.signature, clientSnapshot.signature),
+        "v3 chain_node process client: signature")
+    echo("v3 chain_node_process_client_smoke ok")
+    return 0

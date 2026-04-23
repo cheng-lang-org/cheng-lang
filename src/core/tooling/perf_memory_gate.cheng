@@ -1,0 +1,615 @@
+import std/os
+import std/strings
+import std/strutils as strutil
+import std/strformat
+import cheng/core/tooling/path as v3path
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/bootstrap_contracts as boot
+
+type
+    V3PerfMemoryThreshold =
+        maxElapsedMs: int64
+        maxRssBytes: int64
+
+    V3PerfMemoryExecPhaseSummary =
+        systemLinkPlanMs: int64
+        sourceBundleMs: int64
+        compilerCsgMs: int64
+        worldMs: int64
+        lockMs: int64
+        baselineMs: int64
+        loweringPlanMs: int64
+        primaryObjectPlanMs: int64
+        providerSourcesMs: int64
+        objectPlanMs: int64
+        nativeLinkPlanMs: int64
+        compileReceiptMs: int64
+        totalMs: int64
+        linuxNolibcObjectsMs: int64
+        providerObjectsMs: int64
+        providerCacheLookupMs: int64
+        providerCacheCopyMs: int64
+        providerCacheStoreMs: int64
+        chengProviderCompileMs: int64
+        cProviderCompileMs: int64
+        providerObjectCacheHitCount: int64
+        providerObjectCacheMissCount: int64
+        primaryObjectCacheLookupMs: int64
+        primaryObjectCacheCopyMs: int64
+        primaryObjectCacheStoreMs: int64
+        primaryObjectCacheHitCount: int64
+        primaryObjectCacheMissCount: int64
+        primaryObjectEmitMs: int64
+        primaryObjectGlobalStorageMs: int64
+        primaryObjectModuleInitMs: int64
+        primaryObjectFunctionEmitMs: int64
+        primaryObjectEntryBridgeMs: int64
+        primaryObjectLineMapEmbedMs: int64
+        primaryObjectSymbolTrailerMs: int64
+        primaryObjectAsmWriteMs: int64
+        primaryObjectAsmCompileMs: int64
+        primaryObjectAsmBytes: int64
+        primaryObjectLineMapAsmBytes: int64
+        nativeLinkMs: int64
+        lineMapMs: int64
+        materializeTotalMs: int64
+        backendTotalMs: int64
+
+    V3PerfMemoryRun =
+        label: str
+        logPath: str
+        exitCode: int32
+        elapsedMs: int64
+        maxRssBytes: int64
+        peakFootprintBytes: int64
+        output: str
+
+fn v3PerfMemoryThresholdNew(maxElapsedMs: int64,
+                            maxRssBytes: int64): V3PerfMemoryThreshold =
+    return V3PerfMemoryThreshold(maxElapsedMs: maxElapsedMs, maxRssBytes: maxRssBytes)
+
+fn v3PerfMemoryExecPhaseSummaryEmpty(): V3PerfMemoryExecPhaseSummary =
+    var out: V3PerfMemoryExecPhaseSummary
+    out.systemLinkPlanMs = int64(-1)
+    out.sourceBundleMs = int64(-1)
+    out.compilerCsgMs = int64(-1)
+    out.worldMs = int64(-1)
+    out.lockMs = int64(-1)
+    out.baselineMs = int64(-1)
+    out.loweringPlanMs = int64(-1)
+    out.primaryObjectPlanMs = int64(-1)
+    out.providerSourcesMs = int64(-1)
+    out.objectPlanMs = int64(-1)
+    out.nativeLinkPlanMs = int64(-1)
+    out.compileReceiptMs = int64(-1)
+    out.totalMs = int64(-1)
+    out.linuxNolibcObjectsMs = int64(-1)
+    out.providerObjectsMs = int64(-1)
+    out.providerCacheLookupMs = int64(-1)
+    out.providerCacheCopyMs = int64(-1)
+    out.providerCacheStoreMs = int64(-1)
+    out.chengProviderCompileMs = int64(-1)
+    out.cProviderCompileMs = int64(-1)
+    out.providerObjectCacheHitCount = int64(-1)
+    out.providerObjectCacheMissCount = int64(-1)
+    out.primaryObjectCacheLookupMs = int64(-1)
+    out.primaryObjectCacheCopyMs = int64(-1)
+    out.primaryObjectCacheStoreMs = int64(-1)
+    out.primaryObjectCacheHitCount = int64(-1)
+    out.primaryObjectCacheMissCount = int64(-1)
+    out.primaryObjectEmitMs = int64(-1)
+    out.primaryObjectGlobalStorageMs = int64(-1)
+    out.primaryObjectModuleInitMs = int64(-1)
+    out.primaryObjectFunctionEmitMs = int64(-1)
+    out.primaryObjectEntryBridgeMs = int64(-1)
+    out.primaryObjectLineMapEmbedMs = int64(-1)
+    out.primaryObjectSymbolTrailerMs = int64(-1)
+    out.primaryObjectAsmWriteMs = int64(-1)
+    out.primaryObjectAsmCompileMs = int64(-1)
+    out.primaryObjectAsmBytes = int64(-1)
+    out.primaryObjectLineMapAsmBytes = int64(-1)
+    out.nativeLinkMs = int64(-1)
+    out.lineMapMs = int64(-1)
+    out.materializeTotalMs = int64(-1)
+    out.backendTotalMs = int64(-1)
+    return out
+
+fn v3PerfMemoryRunNew(label: str,
+                      logPath: str,
+                      exitCode: int32,
+                      elapsedMs: int64,
+                      maxRssBytes: int64,
+                      peakFootprintBytes: int64,
+                      output: str): V3PerfMemoryRun =
+    return V3PerfMemoryRun(label: label,
+                           logPath: logPath,
+                           exitCode: exitCode,
+                           elapsedMs: elapsedMs,
+                           maxRssBytes: maxRssBytes,
+                           peakFootprintBytes: peakFootprintBytes,
+                           output: output)
+
+fn v3PerfMemoryFlag(prefix: str, value: str): str =
+    return Fmt([prefix, value])
+
+fn v3PerfMemoryCompileReportPath(outputPath: str): str =
+    return outputPath + ".compile.report.txt"
+
+fn v3PerfMemoryResolveCompiler(root: str): str =
+    let compilerEnv = os.GetEnv("CHENG_SMOKE_COMPILER")
+    if len(compilerEnv) > 0:
+        if os.IsAbsolute(compilerEnv):
+            return compilerEnv
+        return os.JoinPath(root, compilerEnv)
+    let backendDriver = os.JoinPath(root, "artifacts/backend_driver/cheng")
+    if os.FileExists(backendDriver):
+        return backendDriver
+    let compilerRaw = "artifacts/bootstrap/cheng.stage3"
+    if os.IsAbsolute(compilerRaw):
+        return compilerRaw
+    return os.JoinPath(root, compilerRaw)
+
+fn v3PerfMemoryParseUnsignedInt64(raw: str): int64 =
+    let text: str = strutil.Strip(raw)
+    if len(text) <= 0:
+        return int64(-1)
+    var value: int64 = int64(0)
+    var hadDigit: bool
+    for i in 0..<len(text):
+        let ch: char = text[i]
+        if ch < '0' || ch > '9':
+            return int64(-1)
+        value = value * int64(10) + int64(int32(ch) - int32('0'))
+        hadDigit = true
+    if !hadDigit:
+        return int64(-1)
+    return value
+
+fn v3PerfMemoryParseDecimalMilli(raw: str): int64 =
+    if len(raw) <= 0:
+        return int64(-1)
+    var whole: int64 = int64(0)
+    var frac: int64 = int64(0)
+    var fracDigits: int32
+    var seenDot: bool
+    for i in 0..<len(raw):
+        let ch: char = raw[i]
+        if ch == '.':
+            if seenDot:
+                return int64(-1)
+            seenDot = true
+        elif ch >= '0' && ch <= '9':
+            let digit: int64 = int64(int32(ch) - int32('0'))
+            if !seenDot:
+                whole = whole * int64(10) + digit
+            elif fracDigits < 3:
+                frac = frac * int64(10) + digit
+                fracDigits = fracDigits + int32(1)
+        else:
+            return int64(-1)
+    while fracDigits < 3:
+        frac = frac * int64(10)
+        fracDigits = fracDigits + int32(1)
+    return whole * int64(1000) + frac
+
+fn v3PerfMemoryHostFlavor(): str =
+    let hostTarget: str = boot.v3BootstrapDetectHostTarget()
+    if strutil.Contains(hostTarget, "apple-darwin"):
+        return "darwin"
+    if strutil.Contains(hostTarget, "linux"):
+        return "linux"
+    return ""
+
+fn v3PerfMemoryAppendArgs(out: var str[], extra: str[]) =
+    for i in 0..<extra.len:
+        add(out, extra[i])
+
+fn v3PerfMemoryTimedArgv(filePath: str, argv: str[]): str[] =
+    let hostFlavor: str = v3PerfMemoryHostFlavor()
+    var out: str[]
+    if hostFlavor == "darwin":
+        add(out, "-l")
+    elif hostFlavor == "linux":
+        add(out, "-f")
+        add(out, "cheng_perf_real_seconds=%e\ncheng_perf_max_rss_kb=%M\n")
+    else:
+        assert(false, "v3 perf memory: unsupported host flavor")
+    add(out, filePath)
+    v3PerfMemoryAppendArgs(out, argv)
+    return out
+
+fn v3PerfMemoryParseDarwinMetrics(output: str,
+                                  outElapsedMs: var int64,
+                                  outMaxRssBytes: var int64,
+                                  outPeakFootprintBytes: var int64) =
+    let lines: str[] = strutil.Split(output, '\n')
+    for i in 0..<lines.len:
+        let line: str = strutil.Strip(lines[i])
+        if len(line) <= 0:
+            continue
+        if strutil.Contains(line, " real") && strutil.Contains(line, " user") && strutil.Contains(line, " sys"):
+            let fields: str[] = strutil.SplitWhitespace(line)
+            if fields.len > 0:
+                let elapsedMs: int64 = v3PerfMemoryParseDecimalMilli(fields[0])
+                if elapsedMs > int64(0):
+                    outElapsedMs = elapsedMs
+        elif strutil.Contains(line, "maximum resident set size"):
+            let fields: str[] = strutil.SplitWhitespace(line)
+            if fields.len > 0:
+                let rssBytes: int64 = v3PerfMemoryParseUnsignedInt64(fields[0])
+                if rssBytes > int64(0):
+                    outMaxRssBytes = rssBytes
+        elif strutil.Contains(line, "peak memory footprint"):
+            let fields: str[] = strutil.SplitWhitespace(line)
+            if fields.len > 0:
+                let peakBytes: int64 = v3PerfMemoryParseUnsignedInt64(fields[0])
+                if peakBytes > int64(0):
+                    outPeakFootprintBytes = peakBytes
+    # Darwin `/usr/bin/time -l` reports both metrics, but `maximum resident set size`
+    # can drift badly for compiler subprocess trees. Use peak footprint as the
+    # comparable contract metric when it is available.
+    if outPeakFootprintBytes > int64(0):
+        outMaxRssBytes = outPeakFootprintBytes
+
+fn v3PerfMemoryParseLinuxMetrics(output: str,
+                                 outElapsedMs: var int64,
+                                 outMaxRssBytes: var int64) =
+    let lines: str[] = strutil.Split(output, '\n')
+    let elapsedPrefix = "cheng_perf_real_seconds="
+    let rssPrefix = "cheng_perf_max_rss_kb="
+    for i in 0..<lines.len:
+        let line: str = strutil.Strip(lines[i])
+        if strutil.StartsWith(line, elapsedPrefix):
+            let raw: str = strings.SliceBytes(line, len(elapsedPrefix), len(line) - len(elapsedPrefix))
+            let elapsedMs: int64 = v3PerfMemoryParseDecimalMilli(raw)
+            if elapsedMs > int64(0):
+                outElapsedMs = elapsedMs
+        elif strutil.StartsWith(line, rssPrefix):
+            let raw: str = strings.SliceBytes(line, len(rssPrefix), len(line) - len(rssPrefix))
+            let rssKb: int64 = v3PerfMemoryParseUnsignedInt64(raw)
+            if rssKb > int64(0):
+                outMaxRssBytes = rssKb * int64(1024)
+
+fn v3PerfMemoryParseMetrics(output: str,
+                            outElapsedMs: var int64,
+                            outMaxRssBytes: var int64,
+                            outPeakFootprintBytes: var int64) =
+    outElapsedMs = int64(-1)
+    outMaxRssBytes = int64(-1)
+    outPeakFootprintBytes = int64(-1)
+    let hostFlavor: str = v3PerfMemoryHostFlavor()
+    if hostFlavor == "darwin":
+        v3PerfMemoryParseDarwinMetrics(output, outElapsedMs, outMaxRssBytes, outPeakFootprintBytes)
+        return
+    if hostFlavor == "linux":
+        v3PerfMemoryParseLinuxMetrics(output, outElapsedMs, outMaxRssBytes)
+        return
+    assert(false, "v3 perf memory: parse unsupported host flavor")
+
+fn v3PerfMemoryLineValue(text: str,
+                         key: str): str =
+    let prefix = key + "="
+    let lines: str[] = strutil.Split(text, '\n')
+    for i in 0..<lines.len:
+        let line: str = strutil.Strip(lines[i])
+        if strutil.StartsWith(line, prefix):
+            return strings.SliceBytes(line, len(prefix), len(line) - len(prefix))
+    return ""
+
+fn v3PerfMemoryParseOutputInt64(text: str,
+                                key: str): int64 =
+    let value: str = v3PerfMemoryLineValue(text, key)
+    if len(value) <= 0:
+        return int64(-1)
+    return v3PerfMemoryParseUnsignedInt64(value)
+
+fn v3PerfMemoryExecPhaseSummaryFromOutput(text: str): V3PerfMemoryExecPhaseSummary =
+    var out = v3PerfMemoryExecPhaseSummaryEmpty()
+    out.systemLinkPlanMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_system_link_plan_ms")
+    out.sourceBundleMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_source_bundle_ms")
+    out.compilerCsgMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_compiler_csg_ms")
+    out.worldMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_world_ms")
+    out.lockMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_lock_ms")
+    out.baselineMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_baseline_ms")
+    out.loweringPlanMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_lowering_plan_ms")
+    out.primaryObjectPlanMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_plan_ms")
+    out.providerSourcesMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_provider_sources_ms")
+    out.objectPlanMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_object_plan_ms")
+    out.nativeLinkPlanMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_native_link_plan_ms")
+    out.compileReceiptMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_compile_receipt_ms")
+    out.totalMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_total_ms")
+    out.linuxNolibcObjectsMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_linux_nolibc_objects_ms")
+    out.providerObjectsMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_provider_objects_ms")
+    out.providerCacheLookupMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_provider_cache_lookup_ms")
+    out.providerCacheCopyMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_provider_cache_copy_ms")
+    out.providerCacheStoreMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_provider_cache_store_ms")
+    out.chengProviderCompileMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_cheng_provider_compile_ms")
+    out.cProviderCompileMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_c_provider_compile_ms")
+    out.providerObjectCacheHitCount = v3PerfMemoryParseOutputInt64(text, "provider_object_cache_hit_count")
+    out.providerObjectCacheMissCount = v3PerfMemoryParseOutputInt64(text, "provider_object_cache_miss_count")
+    out.primaryObjectCacheLookupMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_cache_lookup_ms")
+    out.primaryObjectCacheCopyMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_cache_copy_ms")
+    out.primaryObjectCacheStoreMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_cache_store_ms")
+    out.primaryObjectCacheHitCount = v3PerfMemoryParseOutputInt64(text, "primary_object_cache_hit_count")
+    out.primaryObjectCacheMissCount = v3PerfMemoryParseOutputInt64(text, "primary_object_cache_miss_count")
+    out.primaryObjectEmitMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_emit_ms")
+    out.primaryObjectGlobalStorageMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_global_storage_ms")
+    out.primaryObjectModuleInitMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_module_init_ms")
+    out.primaryObjectFunctionEmitMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_function_emit_ms")
+    out.primaryObjectEntryBridgeMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_entry_bridge_ms")
+    out.primaryObjectLineMapEmbedMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_line_map_embed_ms")
+    out.primaryObjectSymbolTrailerMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_symbol_trailer_ms")
+    out.primaryObjectAsmWriteMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_asm_write_ms")
+    out.primaryObjectAsmCompileMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_asm_compile_ms")
+    out.primaryObjectAsmBytes = v3PerfMemoryParseOutputInt64(text, "primary_object_asm_bytes")
+    out.primaryObjectLineMapAsmBytes = v3PerfMemoryParseOutputInt64(text, "primary_object_line_map_asm_bytes")
+    out.nativeLinkMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_native_link_ms")
+    out.lineMapMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_line_map_ms")
+    out.materializeTotalMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_materialize_total_ms")
+    out.backendTotalMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_backend_total_ms")
+    return out
+
+fn v3PerfMemoryExecPhaseSummaryReady(summary: V3PerfMemoryExecPhaseSummary): bool =
+    return summary.totalMs >= int64(0)
+
+fn v3PerfMemoryCompileExecPhaseSummary(root: str,
+                                       outputPath: str,
+                                       fallbackText: str): V3PerfMemoryExecPhaseSummary =
+    let reportPath: str = v3PerfMemoryCompileReportPath(outputPath)
+    if os.FileExists(reportPath):
+        let reportText: str = v3path.V3ReadTextFile(root, reportPath)
+        let reportSummary = v3PerfMemoryExecPhaseSummaryFromOutput(reportText)
+        if v3PerfMemoryExecPhaseSummaryReady(reportSummary):
+            return reportSummary
+    return v3PerfMemoryExecPhaseSummaryFromOutput(fallbackText)
+
+fn v3PerfMemoryExecPhaseGapMs(sample: V3PerfMemoryRun,
+                              summary: V3PerfMemoryExecPhaseSummary): int64 =
+    if sample.elapsedMs < int64(0) || summary.totalMs < int64(0):
+        return int64(-1)
+    return sample.elapsedMs - summary.totalMs
+
+fn v3PerfMemoryExecPhaseMaterializeMs(summary: V3PerfMemoryExecPhaseSummary): int64 =
+    if summary.materializeTotalMs >= int64(0):
+        return summary.materializeTotalMs
+    if summary.linuxNolibcObjectsMs < int64(0) ||
+       summary.providerObjectsMs < int64(0) ||
+       summary.primaryObjectEmitMs < int64(0):
+        return int64(-1)
+    return summary.linuxNolibcObjectsMs + summary.providerObjectsMs + summary.primaryObjectEmitMs
+
+fn v3PerfMemoryExecPhaseAttributedMs(summary: V3PerfMemoryExecPhaseSummary): int64 =
+    if summary.backendTotalMs >= int64(0):
+        return summary.backendTotalMs
+    let materializeMs: int64 = v3PerfMemoryExecPhaseMaterializeMs(summary)
+    if summary.totalMs < int64(0) ||
+       materializeMs < int64(0) ||
+       summary.nativeLinkMs < int64(0) ||
+       summary.lineMapMs < int64(0):
+        return int64(-1)
+    return summary.totalMs + materializeMs + summary.nativeLinkMs + summary.lineMapMs
+
+fn v3PerfMemoryCompileGapBreakdownReady(summary: V3PerfMemoryExecPhaseSummary): bool =
+    return v3PerfMemoryExecPhaseAttributedMs(summary) >= int64(0)
+
+fn v3PerfMemoryCompileGapBreakdownMs(sample: V3PerfMemoryRun,
+                                     summary: V3PerfMemoryExecPhaseSummary): int64 =
+    let attributedMs: int64 = v3PerfMemoryExecPhaseAttributedMs(summary)
+    if sample.elapsedMs < int64(0) || attributedMs < int64(0):
+        return int64(-1)
+    return sample.elapsedMs - attributedMs
+
+fn v3PerfMemoryExecPhaseReportRow(sample: V3PerfMemoryRun,
+                                  summary: V3PerfMemoryExecPhaseSummary): str =
+    return Fmt([sample.label,
+                "_exec_phase_summary",
+                " system_link_plan_ms=",
+                strings.Int64ToStr(summary.systemLinkPlanMs),
+                " source_bundle_ms=",
+                strings.Int64ToStr(summary.sourceBundleMs),
+                " compiler_csg_ms=",
+                strings.Int64ToStr(summary.compilerCsgMs),
+                " world_ms=",
+                strings.Int64ToStr(summary.worldMs),
+                " lock_ms=",
+                strings.Int64ToStr(summary.lockMs),
+                " baseline_ms=",
+                strings.Int64ToStr(summary.baselineMs),
+                " lowering_plan_ms=",
+                strings.Int64ToStr(summary.loweringPlanMs),
+                " primary_object_plan_ms=",
+                strings.Int64ToStr(summary.primaryObjectPlanMs),
+                " provider_sources_ms=",
+                strings.Int64ToStr(summary.providerSourcesMs),
+                " object_plan_ms=",
+                strings.Int64ToStr(summary.objectPlanMs),
+                " native_link_plan_ms=",
+                strings.Int64ToStr(summary.nativeLinkPlanMs),
+                " compile_receipt_ms=",
+                strings.Int64ToStr(summary.compileReceiptMs),
+                " planner_total_ms=",
+                strings.Int64ToStr(summary.totalMs),
+                " compile_gap_ms=",
+                strings.Int64ToStr(v3PerfMemoryExecPhaseGapMs(sample, summary))])
+
+fn v3PerfMemoryCompileGapBreakdownRow(sample: V3PerfMemoryRun,
+                                      summary: V3PerfMemoryExecPhaseSummary): str =
+    let materializeMs: int64 = v3PerfMemoryExecPhaseMaterializeMs(summary)
+    let attributedMs: int64 = v3PerfMemoryExecPhaseAttributedMs(summary)
+    return Fmt([sample.label,
+                "_gap_breakdown",
+                " planner_total_ms=",
+                strings.Int64ToStr(summary.totalMs),
+                " linux_nolibc_objects_ms=",
+                strings.Int64ToStr(summary.linuxNolibcObjectsMs),
+                " provider_objects_ms=",
+                strings.Int64ToStr(summary.providerObjectsMs),
+                " provider_cache_lookup_ms=",
+                strings.Int64ToStr(summary.providerCacheLookupMs),
+                " provider_cache_copy_ms=",
+                strings.Int64ToStr(summary.providerCacheCopyMs),
+                " provider_cache_store_ms=",
+                strings.Int64ToStr(summary.providerCacheStoreMs),
+                " cheng_provider_compile_ms=",
+                strings.Int64ToStr(summary.chengProviderCompileMs),
+                " c_provider_compile_ms=",
+                strings.Int64ToStr(summary.cProviderCompileMs),
+                " provider_cache_hits=",
+                strings.Int64ToStr(summary.providerObjectCacheHitCount),
+                " provider_cache_misses=",
+                strings.Int64ToStr(summary.providerObjectCacheMissCount),
+                " primary_object_cache_lookup_ms=",
+                strings.Int64ToStr(summary.primaryObjectCacheLookupMs),
+                " primary_object_cache_copy_ms=",
+                strings.Int64ToStr(summary.primaryObjectCacheCopyMs),
+                " primary_object_cache_store_ms=",
+                strings.Int64ToStr(summary.primaryObjectCacheStoreMs),
+                " primary_object_cache_hits=",
+                strings.Int64ToStr(summary.primaryObjectCacheHitCount),
+                " primary_object_cache_misses=",
+                strings.Int64ToStr(summary.primaryObjectCacheMissCount),
+                " primary_object_emit_ms=",
+                strings.Int64ToStr(summary.primaryObjectEmitMs),
+                " primary_object_global_storage_ms=",
+                strings.Int64ToStr(summary.primaryObjectGlobalStorageMs),
+                " primary_object_module_init_ms=",
+                strings.Int64ToStr(summary.primaryObjectModuleInitMs),
+                " primary_object_function_emit_ms=",
+                strings.Int64ToStr(summary.primaryObjectFunctionEmitMs),
+                " primary_object_entry_bridge_ms=",
+                strings.Int64ToStr(summary.primaryObjectEntryBridgeMs),
+                " primary_object_line_map_embed_ms=",
+                strings.Int64ToStr(summary.primaryObjectLineMapEmbedMs),
+                " primary_object_symbol_trailer_ms=",
+                strings.Int64ToStr(summary.primaryObjectSymbolTrailerMs),
+                " primary_object_asm_write_ms=",
+                strings.Int64ToStr(summary.primaryObjectAsmWriteMs),
+                " primary_object_asm_compile_ms=",
+                strings.Int64ToStr(summary.primaryObjectAsmCompileMs),
+                " primary_object_asm_bytes=",
+                strings.Int64ToStr(summary.primaryObjectAsmBytes),
+                " primary_object_line_map_asm_bytes=",
+                strings.Int64ToStr(summary.primaryObjectLineMapAsmBytes),
+                " materialize_total_ms=",
+                strings.Int64ToStr(materializeMs),
+                " native_link_ms=",
+                strings.Int64ToStr(summary.nativeLinkMs),
+                " line_map_ms=",
+                strings.Int64ToStr(summary.lineMapMs),
+                " attributed_ms=",
+                strings.Int64ToStr(attributedMs),
+                " unattributed_gap_ms=",
+                strings.Int64ToStr(v3PerfMemoryCompileGapBreakdownMs(sample, summary))])
+
+fn v3PerfMemoryMeasureFileRun(root: str,
+                              label: str,
+                              filePath: str,
+                              argv: str[],
+                              envOverrides: str[],
+                              workingDir: str,
+                              timeoutSec: int32,
+                              logPath: str): V3PerfMemoryRun =
+    let timePath = "/usr/bin/time"
+    assert(v3path.V3FileExistsNonEmpty(root, timePath), "v3 perf memory: /usr/bin/time")
+    let timedArgv: str[] = v3PerfMemoryTimedArgv(filePath, argv)
+    let logged: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                              label,
+                                                              timePath,
+                                                              timedArgv,
+                                                              envOverrides,
+                                                              workingDir,
+                                                              timeoutSec,
+                                                              logPath)
+    var elapsedMs: int64 = int64(-1)
+    var maxRssBytes: int64 = int64(-1)
+    var peakFootprintBytes: int64 = int64(-1)
+    v3PerfMemoryParseMetrics(logged.output, elapsedMs, maxRssBytes, peakFootprintBytes)
+    return v3PerfMemoryRunNew(label,
+                              logged.logPath,
+                              logged.exitCode,
+                              elapsedMs,
+                              maxRssBytes,
+                              peakFootprintBytes,
+                              logged.output)
+
+fn v3PerfMemoryCompileExe(root: str,
+                          label: str,
+                          compilerPath: str,
+                          target: str,
+                          sourcePath: str,
+                          outputPath: str,
+                          timeoutSec: int32,
+                          logPath: str): V3PerfMemoryRun =
+    return v3PerfMemoryCompileExeWithEnv(root,
+                                         label,
+                                         compilerPath,
+                                         target,
+                                         sourcePath,
+                                         outputPath,
+                                         [],
+                                         timeoutSec,
+                                         logPath)
+
+fn v3PerfMemoryCompileExeWithEnv(root: str,
+                                 label: str,
+                                 compilerPath: str,
+                                 target: str,
+                                 sourcePath: str,
+                                 outputPath: str,
+                                 envOverrides: str[],
+                                 timeoutSec: int32,
+                                 logPath: str): V3PerfMemoryRun =
+    return v3PerfMemoryMeasureFileRun(root,
+                                      label,
+                                      compilerPath,
+                                      [
+                                          "system-link-exec",
+                                          v3PerfMemoryFlag("--root:", root),
+                                          v3PerfMemoryFlag("--in:", sourcePath),
+                                          "--emit:exe",
+                                          v3PerfMemoryFlag("--target:", target),
+                                          v3PerfMemoryFlag("--out:", outputPath),
+                                          v3PerfMemoryFlag("--report-out:", v3PerfMemoryCompileReportPath(outputPath))
+                                      ],
+                                      envOverrides,
+                                      root,
+                                      timeoutSec,
+                                      logPath)
+
+fn v3PerfMemoryRunBinary(root: str,
+                         label: str,
+                         binaryPath: str,
+                         argv: str[],
+                         envOverrides: str[],
+                         workingDir: str,
+                         timeoutSec: int32,
+                         logPath: str): V3PerfMemoryRun =
+    return v3PerfMemoryMeasureFileRun(root,
+                                      label,
+                                      binaryPath,
+                                      argv,
+                                      envOverrides,
+                                      workingDir,
+                                      timeoutSec,
+                                      logPath)
+
+fn v3PerfMemoryReportRow(sample: V3PerfMemoryRun,
+                         threshold: V3PerfMemoryThreshold): str =
+    var peakText = "-"
+    if sample.peakFootprintBytes > int64(0):
+        peakText = strings.Int64ToStr(sample.peakFootprintBytes)
+    return Fmt([sample.label,
+                " elapsed_ms=",
+                strings.Int64ToStr(sample.elapsedMs),
+                " max_rss_bytes=",
+                strings.Int64ToStr(sample.maxRssBytes),
+                " peak_footprint_bytes=",
+                peakText,
+                " limit_elapsed_ms=",
+                strings.Int64ToStr(threshold.maxElapsedMs),
+                " limit_max_rss_bytes=",
+                strings.Int64ToStr(threshold.maxRssBytes),
+                " exit_code=",
+                strings.IntToStr(sample.exitCode),
+                " log=",
+                sample.logPath])

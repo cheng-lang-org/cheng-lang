@@ -1,0 +1,86 @@
+import std/system
+import std/result
+import cheng/chain/binary_types as types
+import cheng/chain/lsmr_types as lt
+import cheng/chain/csg
+import cheng/chain/pubsub
+import cheng/chain/plumtree
+
+fn main(): int32 =
+    var centerRes: Result[types.V3LsmrAddress]
+    centerRes = types.v3LsmrAddressFromDigits([5, 5, 5])
+    assert(IsOk(centerRes), "v3 plumtree smoke: center address")
+    var center = Value(centerRes)
+
+    var topicRes: Result[pubsub.V3PubSubTopic]
+    topicRes = pubsub.v3PubSubTopicFromAddress(center,
+                                               2,
+                                               lt.v3PubSubModeXun,
+                                               pubsub.v3PubSubSemanticFingerprint([41, 42, 43]))
+    assert(IsOk(topicRes), "v3 plumtree smoke: topic")
+    var topic = Value(topicRes)
+
+    var payloadCid = lt.v3HashInts("v3.plumtree.payload", [7, 8, 9])
+    var payloadSummaryCid = lt.v3HashInts("v3.plumtree.summary", [3, 2, 1])
+    var envelope = pubsub.v3PubSubEnvelopeMake(topic.topicCid,
+                                               pubsub.v3PubSubPayloadKindStateDelta,
+                                               payloadCid,
+                                               payloadSummaryCid)
+
+    var subscriptions: pubsub.V3PubSubSubscription[]
+    subscriptions = []
+    let root = pubsub.v3PubSubSubscriptionMake(1, center, csg.v3CsgBarrierModeGen, topic.topicCid)
+    add(subscriptions, root)
+
+    var eastPrimaryRes: Result[types.V3LsmrAddress]
+    eastPrimaryRes = types.v3LsmrAddressFromDigits([5, 8, 1])
+    assert(IsOk(eastPrimaryRes), "v3 plumtree smoke: east primary")
+    add(subscriptions,
+        pubsub.v3PubSubSubscriptionMake(2, Value(eastPrimaryRes), csg.v3CsgBarrierModeGen, topic.topicCid))
+
+    var eastBackupRes: Result[types.V3LsmrAddress]
+    eastBackupRes = types.v3LsmrAddressFromDigits([5, 8, 2])
+    assert(IsOk(eastBackupRes), "v3 plumtree smoke: east backup")
+    add(subscriptions,
+        pubsub.v3PubSubSubscriptionMake(3, Value(eastBackupRes), csg.v3CsgBarrierModeGen, topic.topicCid))
+
+    var eastRepairRes: Result[types.V3LsmrAddress]
+    eastRepairRes = types.v3LsmrAddressFromDigits([5, 8, 6])
+    assert(IsOk(eastRepairRes), "v3 plumtree smoke: east repair")
+    add(subscriptions,
+        pubsub.v3PubSubSubscriptionMake(4, Value(eastRepairRes), csg.v3CsgBarrierModeGen, topic.topicCid))
+
+    var northRes: Result[types.V3LsmrAddress]
+    northRes = types.v3LsmrAddressFromDigits([5, 1, 6])
+    assert(IsOk(northRes), "v3 plumtree smoke: north")
+    add(subscriptions,
+        pubsub.v3PubSubSubscriptionMake(5, Value(northRes), csg.v3CsgBarrierModeGen, topic.topicCid))
+
+    var pubPlanRes: Result[pubsub.V3PubSubPlan]
+    pubPlanRes = pubsub.v3PubSubBuildPlan(topic, envelope, subscriptions)
+    assert(IsOk(pubPlanRes), "v3 plumtree smoke: pubsub plan")
+    var pubPlan = Value(pubPlanRes)
+
+    var treeRes: Result[plumtree.V3PlumtreePlan]
+    treeRes = plumtree.v3PlumtreeBuildPlan(topic, root, pubPlan, subscriptions)
+    assert(IsOk(treeRes), "v3 plumtree smoke: tree")
+    var tree = Value(treeRes)
+
+    assert(tree.nodeCount == 5, "v3 plumtree smoke: node count")
+    assert(tree.eagerEdgeCount == 4, "v3 plumtree smoke: eager edge count")
+    assert(tree.lazyPeerCount == 3, "v3 plumtree smoke: lazy peer count")
+    assert(tree.ihaveCount == 3, "v3 plumtree smoke: ihave count")
+    assert(plumtree.v3PlumtreeEagerParentNodeId(tree, 2) == 1, "v3 plumtree smoke: primary parent root")
+    assert(plumtree.v3PlumtreeEagerParentNodeId(tree, 3) == 2, "v3 plumtree smoke: backup parent primary")
+    assert(plumtree.v3PlumtreeEagerParentNodeId(tree, 4) == 2, "v3 plumtree smoke: repair node parent primary")
+    assert(plumtree.v3PlumtreeLazyPeerCount(tree, 4) == 2, "v3 plumtree smoke: repair node lazy peers")
+
+    var repairRes: Result[plumtree.V3PlumtreeIwant]
+    repairRes = plumtree.v3PlumtreeSelectRepair(tree, 4)
+    assert(IsOk(repairRes), "v3 plumtree smoke: repair")
+    var repair = Value(repairRes)
+    assert(repair.sourceNodeId == 3, "v3 plumtree smoke: repair picks deepest lazy peer")
+    assert(repair.branchDigit == 8, "v3 plumtree smoke: repair branch")
+
+    echo("v3 plumtree_smoke ok")
+    return 0

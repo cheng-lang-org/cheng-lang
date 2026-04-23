@@ -1,0 +1,64 @@
+import std/os as os
+import std/os_host_process as hostos
+import std/strings
+
+fn runFile(root: str,
+           filePath: str,
+           argv: str[],
+           logPath: str,
+           context: str): str =
+    let res = hostos.ExecFileCapture(filePath,
+                                     argv,
+                                     ["CHENG_ROOT=" + root],
+                                     root,
+                                     true,
+                                     900)
+    let output = os.ExecCmdResultOutput(res)
+    os.WriteFile(logPath, output)
+    assert(os.ExecCmdResultExitCode(res) == 0, context + ": exit code")
+    return output
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let outDir = os.JoinPath(root, "artifacts/build_backend_driver_report_smoke")
+    if !os.DirExists(outDir):
+        os.CreateDir(outDir)
+    let stage3 = os.JoinPath(root, "artifacts/bootstrap/cheng.stage3")
+    let backendDriver = os.JoinPath(root, "artifacts/backend_driver/cheng")
+    let reportPath = os.JoinPath(root, "artifacts/backend_driver/build_backend_driver.report.txt")
+    assert(os.FileExists(stage3), "cheng build backend driver report: stage3 exists")
+    if !os.FileExists(backendDriver):
+        let bootstrapLog = os.JoinPath(outDir, "bootstrap_build_backend_driver.log")
+        let _ = runFile(root,
+                        stage3,
+                        ["build-backend-driver"],
+                        bootstrapLog,
+                        "cheng build backend driver report bootstrap")
+    let touchLog = os.JoinPath(outDir, "touch_stage3.log")
+    let _ = runFile(root,
+                    "/usr/bin/touch",
+                    [stage3],
+                    touchLog,
+                    "cheng build backend driver report touch")
+    let buildLog = os.JoinPath(outDir, "build_backend_driver.log")
+    let _ = runFile(root,
+                    backendDriver,
+                    ["build-backend-driver"],
+                    buildLog,
+                    "cheng build backend driver report rebuild")
+    assert(os.FileExists(reportPath), "cheng build backend driver report: report exists")
+    let reportText = os.ReadFile(reportPath)
+    let planLogPath = os.JoinPath(root, "artifacts/backend_driver/build_backend_driver.plan.txt")
+    let referencePlanLogPath = os.JoinPath(root, "artifacts/backend_driver/reference_backend_driver.plan.txt")
+    assert(strings.StrContains(reportText, "plan_log="),
+           "cheng build backend driver report: plan log recorded")
+    assert(strings.StrContains(reportText, "reference_plan_log="),
+           "cheng build backend driver report: reference plan log recorded")
+    assert(strings.StrContains(reportText, "candidate_output="),
+           "cheng build backend driver report: candidate output recorded")
+    assert(strings.StrContains(reportText, "artifacts/backend_driver/cheng.build_candidate"),
+           "cheng build backend driver report: candidate path updated")
+    assert(os.FileExists(planLogPath), "cheng build backend driver report: plan log exists")
+    assert(os.FileExists(referencePlanLogPath), "cheng build backend driver report: reference plan log exists")
+    echo("cheng build_backend_driver_report_smoke ok")
+    return 0

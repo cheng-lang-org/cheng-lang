@@ -1,0 +1,77 @@
+import std/rawbytes
+import std/rawmem_support
+import cheng/tests/browser_wasm_probe_minimal as probe
+import cheng/tests/browser_content_codec_abi_min as codec
+
+var browserHostNativePayload: Bytes = bytesFromString("alpha,beta")
+var browserHostNativeLastRawLen: int32
+var browserHostNativeLastTextLen: int32
+
+fn browserHostNativeFail(label: str): int32 =
+    echo("v3 browser host native min smoke failed: " + label)
+    return 1
+
+@exportc("cheng_browser_now_ms_bridge")
+fn cheng_browser_now_ms_bridge_export(): int32 =
+    return 24680
+
+@exportc("cheng_browser_echo_i32_bridge")
+fn cheng_browser_echo_i32_bridge_export(value: int32): int32 =
+    return value
+
+@exportc("cheng_browser_input_len_bridge")
+fn cheng_browser_input_len_bridge_export(handle: int32): int32 =
+    if handle != 11:
+        return 0
+    return bytesLen(browserHostNativePayload)
+
+@exportc("cheng_browser_input_copy_bridge")
+fn cheng_browser_input_copy_bridge_export(handle: int32, data: ptr, n: int32): int32 =
+    if handle != 11:
+        return 0
+    if n != bytesLen(browserHostNativePayload):
+        return 0
+    if n > 0:
+        rawmem_support.RawmemCopy(data, browserHostNativePayload.data, n)
+    return 1
+
+@exportc("cheng_buffer_handle_from_raw_bridge")
+fn cheng_buffer_handle_from_raw_bridge_export(data: ptr, n: int32): int32 =
+    data
+    if n <= 0:
+        return 0
+    browserHostNativeLastRawLen = n
+    return 77
+
+@exportc("cheng_buffer_handle_from_text_bridge")
+fn cheng_buffer_handle_from_text_bridge_export(text: str): int32 =
+    if len(text) <= 0:
+        return 0
+    browserHostNativeLastTextLen = len(text)
+    return 88
+
+@exportc("cheng_browser_buffer_handle_len_bridge")
+fn cheng_browser_buffer_handle_len_bridge_export(handle: int32): int32 =
+    if handle != 77:
+        if handle != 88:
+            return 0
+        return browserHostNativeLastTextLen
+    return browserHostNativeLastRawLen
+
+fn main(): int32 =
+    if probe.browserNowMs() != 24680:
+        return browserHostNativeFail("browserNowMs")
+    if probe.browserEchoI32(31337) != 31337:
+        return browserHostNativeFail("browserEchoI32")
+    let copiedHandle = codec.browserInputCopy(11)
+    if copiedHandle != 77:
+        return browserHostNativeFail("browserInputCopy")
+    if codec.browserBufferHandleLen(copiedHandle) != bytesLen(browserHostNativePayload):
+        return browserHostNativeFail("browserBufferHandleLen")
+    let copiedTextHandle = codec.browserInputTextCopy(11)
+    if copiedTextHandle != 88:
+        return browserHostNativeFail("browserInputTextCopy")
+    if codec.browserBufferHandleLen(copiedTextHandle) != bytesLen(browserHostNativePayload):
+        return browserHostNativeFail("browserInputTextCopy.len")
+    echo("v3 browser host wasm smoke: ok")
+    return 0

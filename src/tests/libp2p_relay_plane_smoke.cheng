@@ -1,0 +1,430 @@
+import std/system
+import std/strings
+import cheng/libp2p/core/types
+import cheng/libp2p/host/host
+import cheng/libp2p/core/multiaddr
+import cheng/libp2p/transports/tailnet_transport as tsnet
+import cheng/libp2p/transports/relay_provider
+import cheng/libp2p/transports/webrtc_transport
+import cheng/libp2p/protocols/relay_plane
+
+fn main(): int32 =
+    var server = host.v3Libp2pHostInit("relay.plane.server")
+    var client = host.v3Libp2pHostInit("relay.plane.client")
+    var stranger = host.v3Libp2pHostInit("relay.plane.stranger")
+    var rogue = host.v3Libp2pHostInit("relay.plane.rogue")
+
+    host.v3Libp2pRegisterHandler(server, types.v3Libp2pProtocolWebrtcSignal)
+    host.v3Libp2pRegisterHandler(server, types.v3Libp2pProtocolRelayDescribe)
+    host.v3Libp2pRegisterHandler(server, types.v3Libp2pProtocolRelayLease)
+    host.v3Libp2pRegisterHandler(client, types.v3Libp2pProtocolRelayDescribe)
+    host.v3Libp2pRegisterHandler(client, types.v3Libp2pProtocolRelayLease)
+    host.v3Libp2pRegisterHandler(stranger, types.v3Libp2pProtocolRelayDescribe)
+    host.v3Libp2pRegisterHandler(stranger, types.v3Libp2pProtocolRelayLease)
+    host.v3Libp2pRegisterHandler(rogue, types.v3Libp2pProtocolWebrtcSignal)
+    host.v3Libp2pRegisterHandler(rogue, types.v3Libp2pProtocolRelayDescribe)
+    host.v3Libp2pRegisterHandler(rogue, types.v3Libp2pProtocolRelayLease)
+
+    host.v3Libp2pHostSetTrustedInfra(server, true)
+
+    var serverTcpAddr: types.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillTcp(serverTcpAddr, "198.51.100.10", 43061)
+    let serverListenRes = host.v3Libp2pListen(server, serverTcpAddr)
+    assert(IsOk(serverListenRes), "v3 libp2p relay plane: server tcp listen")
+
+    var clientTcpAddr: types.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillTcp(clientTcpAddr, "198.51.100.11", 43062)
+    let clientListenRes = host.v3Libp2pListen(client, clientTcpAddr)
+    assert(IsOk(clientListenRes), "v3 libp2p relay plane: client tcp listen")
+
+    var rogueTcpAddr: types.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillTcp(rogueTcpAddr, "198.51.100.12", 43063)
+    let rogueListenRes = host.v3Libp2pListen(rogue, rogueTcpAddr)
+    assert(IsOk(rogueListenRes), "v3 libp2p relay plane: rogue tcp listen")
+
+    var publicWebrtcAddr: types.V3Libp2pMultiaddr
+    publicWebrtcAddr.host = "203.0.113.77"
+    publicWebrtcAddr.port = 3478
+    publicWebrtcAddr.transport = types.v3Libp2pTransportWebrtc
+    publicWebrtcAddr.networkDomain = types.v3Libp2pNetworkDomainPublic
+    publicWebrtcAddr.visibility = types.v3Libp2pVisibilityPublic
+    let webrtcListenRes = host.v3Libp2pListen(server, publicWebrtcAddr)
+    assert(IsOk(webrtcListenRes), "v3 libp2p relay plane: server webrtc listen")
+    let rogueWebrtcListenRes = host.v3Libp2pListen(rogue, publicWebrtcAddr)
+    assert(IsOk(rogueWebrtcListenRes), "v3 libp2p relay plane: rogue webrtc listen")
+
+    var healthyResources: types.V3Libp2pNodeResource
+    healthyResources.sampledAtEpochSeconds = 1
+    healthyResources.cpuLogicalCores = 8
+    healthyResources.memoryAvailableBytes = int64(12) * int64(1024) * int64(1024) * int64(1024)
+    healthyResources.memoryTotalBytes = int64(16) * int64(1024) * int64(1024) * int64(1024)
+    healthyResources.diskAvailableBytes = int64(200) * int64(1024) * int64(1024) * int64(1024)
+    healthyResources.diskTotalBytes = int64(256) * int64(1024) * int64(1024) * int64(1024)
+    host.v3Libp2pHostObserveSelfResources(server, healthyResources)
+    host.v3Libp2pHostObserveSelfResources(rogue, healthyResources)
+
+    let dialClientToServerRes = host.v3Libp2pDial(client, server.selfPeerId, serverTcpAddr, 0)
+    assert(IsOk(dialClientToServerRes), "v3 libp2p relay plane: client dials server")
+    let dialServerToClientRes = host.v3Libp2pDial(server, client.selfPeerId, clientTcpAddr, 0)
+    assert(IsOk(dialServerToClientRes), "v3 libp2p relay plane: server dials client")
+    let dialStrangerToServerRes = host.v3Libp2pDial(stranger, server.selfPeerId, serverTcpAddr, 0)
+    assert(IsOk(dialStrangerToServerRes), "v3 libp2p relay plane: stranger dials server")
+
+    var zeroTailnet = tsnet.v3Libp2pTailnetTransportInit(tsnet.V3Libp2pTailnetTransportConfig())
+    let rogueRefreshRes = host.v3Libp2pHostRefreshRelayRole(rogue, zeroTailnet, "sfo", 60)
+    assert(IsOk(rogueRefreshRes), "v3 libp2p relay plane: rogue refresh")
+    assert(rogue.relayDescriptors.len == 0, "v3 libp2p relay plane: rogue no descriptors")
+    assert(rogue.kadState.providers.len == 0, "v3 libp2p relay plane: rogue no providers")
+
+    var relayCfg: tsnet.V3Libp2pTailnetTransportConfig
+    relayCfg.controlEndpoint = "https://control.example"
+    relayCfg.relayEndpoint = "https://derp.sfo.example:443"
+    relayCfg.derpRegionCode = "sfo"
+    var relayTransport = tsnet.v3Libp2pTailnetTransportInit(relayCfg)
+    tsnet.v3Libp2pTailnetProviderStart(relayTransport)
+    tsnet.v3Libp2pTailnetProviderMarkProxyReady(relayTransport)
+    tsnet.v3Libp2pTailnetProviderDerpReady(relayTransport)
+    assert(relay_provider.v3Libp2pRelayProviderLineValue("ok=1\nhealthy=1\n", "healthy") == "1",
+        "v3 libp2p relay plane: relay line parser")
+    assert(host.v3Libp2pRelayHealthAllowed(host.v3Libp2pHostSelfResources(server)),
+        "v3 libp2p relay plane: server resource health")
+    assert(tsnet.v3Libp2pTailnetProviderFullyReady(relayTransport),
+        "v3 libp2p relay plane: tailnet provider ready")
+    assert(tsnet.v3Libp2pTailnetDerpAvailable(relayTransport),
+        "v3 libp2p relay plane: tailnet derp ready")
+    var turnProvider: relay_provider.V3Libp2pRelayProvider
+    let turnProviderRes = relay_provider.v3Libp2pRelayProviderOpenFill(turnProvider,
+                                                                       types.v3Libp2pRelayServiceTurn,
+                                                                       "turn:203.0.113.77:3478",
+                                                                       "sfo",
+                                                                       "scope:test",
+                                                                       true)
+    assert(IsOk(turnProviderRes), "v3 libp2p relay plane: turn provider open")
+    var turnHealth: types.V3Libp2pRelayHealth
+    let turnProbeRes = relay_provider.v3Libp2pRelayProviderProbeHealthFill(turnHealth,
+                                                                           turnProvider,
+                                                                           1)
+    assert(IsOk(turnProbeRes), "v3 libp2p relay plane: turn provider probe")
+    assert(turnHealth.healthy, "v3 libp2p relay plane: turn provider healthy")
+    assert(relay_provider.v3Libp2pRelayProviderClose(turnProvider),
+        "v3 libp2p relay plane: turn provider close")
+    var turnOnlyHost = host.v3Libp2pHostInit("relay.plane.turn.only")
+    host.v3Libp2pHostObserveSelfResources(turnOnlyHost, healthyResources)
+    let turnDirectAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(turnOnlyHost,
+                                                                           types.v3Libp2pRelayServiceTurn,
+                                                                           "turn:203.0.113.77:3478",
+                                                                           "sfo",
+                                                                           "scope:test",
+                                                                           1,
+                                                                           60)
+    assert(IsOk(turnDirectAdvertiseRes), "v3 libp2p relay plane: direct turn advertise")
+    assert(Value(turnDirectAdvertiseRes), "v3 libp2p relay plane: direct turn advertised")
+    var pairHost = host.v3Libp2pHostInit("relay.plane.pair")
+    host.v3Libp2pHostObserveSelfResources(pairHost, healthyResources)
+    let stunPairAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(pairHost,
+                                                                         types.v3Libp2pRelayServiceStun,
+                                                                         "stun:203.0.113.77:3478",
+                                                                         "sfo",
+                                                                         "scope:test",
+                                                                         1,
+                                                                         60)
+    assert(IsOk(stunPairAdvertiseRes), "v3 libp2p relay plane: pair stun advertise")
+    assert(Value(stunPairAdvertiseRes), "v3 libp2p relay plane: pair stun advertised")
+    let turnPairAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(pairHost,
+                                                                         types.v3Libp2pRelayServiceTurn,
+                                                                         "turn:203.0.113.77:3478",
+                                                                         "sfo",
+                                                                         "scope:test",
+                                                                         1,
+                                                                         60)
+    assert(IsOk(turnPairAdvertiseRes), "v3 libp2p relay plane: pair turn advertise")
+    assert(Value(turnPairAdvertiseRes), "v3 libp2p relay plane: pair turn advertised")
+    var pairSawTurn = false
+    for i in 0..<pairHost.relayDescriptors.len:
+        if pairHost.relayDescriptors[i].serviceKind != types.v3Libp2pRelayServiceTurn:
+            continue
+        if pairHost.relayDescriptors[i].endpointText != "turn:203.0.113.77:3478":
+            continue
+        pairSawTurn = true
+    assert(pairSawTurn, "v3 libp2p relay plane: pair turn descriptor")
+    host.v3Libp2pHostRelaySyncSelfRecord(pairHost)
+    var pairSawTurnAfterSync = false
+    for i in 0..<pairHost.relayDescriptors.len:
+        if pairHost.relayDescriptors[i].serviceKind != types.v3Libp2pRelayServiceTurn:
+            continue
+        if pairHost.relayDescriptors[i].endpointText != "turn:203.0.113.77:3478":
+            continue
+        pairSawTurnAfterSync = true
+    assert(pairSawTurnAfterSync, "v3 libp2p relay plane: pair turn after sync")
+    var tripleHost = host.v3Libp2pHostInit("relay.plane.triple")
+    host.v3Libp2pHostObserveSelfResources(tripleHost, healthyResources)
+    let stunTripleAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(tripleHost,
+                                                                           types.v3Libp2pRelayServiceStun,
+                                                                           "stun:203.0.113.77:3478",
+                                                                           "sfo",
+                                                                           "scope:test",
+                                                                           1,
+                                                                           60)
+    assert(IsOk(stunTripleAdvertiseRes), "v3 libp2p relay plane: triple stun advertise")
+    assert(Value(stunTripleAdvertiseRes), "v3 libp2p relay plane: triple stun advertised")
+    let turnTripleAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(tripleHost,
+                                                                           types.v3Libp2pRelayServiceTurn,
+                                                                           "turn:203.0.113.77:3478",
+                                                                           "sfo",
+                                                                           "scope:test",
+                                                                           1,
+                                                                           60)
+    assert(IsOk(turnTripleAdvertiseRes), "v3 libp2p relay plane: triple turn advertise")
+    assert(Value(turnTripleAdvertiseRes), "v3 libp2p relay plane: triple turn advertised")
+    let tsnetTripleAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(tripleHost,
+                                                                            types.v3Libp2pRelayServiceTsnet,
+                                                                            "https://derp.sfo.example:443",
+                                                                            "sfo",
+                                                                            "scope:test",
+                                                                            1,
+                                                                            60)
+    assert(IsOk(tsnetTripleAdvertiseRes), "v3 libp2p relay plane: triple tsnet advertise")
+    assert(Value(tsnetTripleAdvertiseRes), "v3 libp2p relay plane: triple tsnet advertised")
+    var tripleSawTurn = false
+    for i in 0..<tripleHost.relayDescriptors.len:
+        if tripleHost.relayDescriptors[i].serviceKind != types.v3Libp2pRelayServiceTurn:
+            continue
+        if tripleHost.relayDescriptors[i].endpointText != "turn:203.0.113.77:3478":
+            continue
+        tripleSawTurn = true
+    assert(tripleSawTurn, "v3 libp2p relay plane: triple turn descriptor")
+    host.v3Libp2pRegisterHandler(tripleHost, types.v3Libp2pProtocolRelayDescribe)
+    host.v3Libp2pRegisterHandler(tripleHost, types.v3Libp2pProtocolRelayLease)
+    var tripleSawTurnAfterRegister = false
+    for i in 0..<tripleHost.relayDescriptors.len:
+        if tripleHost.relayDescriptors[i].serviceKind != types.v3Libp2pRelayServiceTurn:
+            continue
+        if tripleHost.relayDescriptors[i].endpointText != "turn:203.0.113.77:3478":
+            continue
+        tripleSawTurnAfterRegister = true
+    assert(tripleSawTurnAfterRegister, "v3 libp2p relay plane: triple turn after handler register")
+    let dynamicStunEndpoint = "stun:" + publicWebrtcAddr.host + ":" + strings.IntToStr(publicWebrtcAddr.port)
+    let dynamicTurnEndpoint = "turn:" + publicWebrtcAddr.host + ":" + strings.IntToStr(publicWebrtcAddr.port)
+    var dynamicTripleHost = host.v3Libp2pHostInit("relay.plane.dynamic.triple")
+    host.v3Libp2pHostObserveSelfResources(dynamicTripleHost, healthyResources)
+    let dynamicStunAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(dynamicTripleHost,
+                                                                            types.v3Libp2pRelayServiceStun,
+                                                                            dynamicStunEndpoint,
+                                                                            "sfo",
+                                                                            "scope:test",
+                                                                            1,
+                                                                            60)
+    assert(IsOk(dynamicStunAdvertiseRes), "v3 libp2p relay plane: dynamic stun advertise")
+    assert(Value(dynamicStunAdvertiseRes), "v3 libp2p relay plane: dynamic stun advertised")
+    let dynamicTurnAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(dynamicTripleHost,
+                                                                            types.v3Libp2pRelayServiceTurn,
+                                                                            dynamicTurnEndpoint,
+                                                                            "sfo",
+                                                                            "scope:test",
+                                                                            1,
+                                                                            60)
+    assert(IsOk(dynamicTurnAdvertiseRes), "v3 libp2p relay plane: dynamic turn advertise")
+    assert(Value(dynamicTurnAdvertiseRes), "v3 libp2p relay plane: dynamic turn advertised")
+    let dynamicTsnetAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(dynamicTripleHost,
+                                                                             types.v3Libp2pRelayServiceTsnet,
+                                                                             "https://derp.sfo.example:443",
+                                                                             "sfo",
+                                                                             "scope:test",
+                                                                             1,
+                                                                             60)
+    assert(IsOk(dynamicTsnetAdvertiseRes), "v3 libp2p relay plane: dynamic tsnet advertise")
+    assert(Value(dynamicTsnetAdvertiseRes), "v3 libp2p relay plane: dynamic tsnet advertised")
+    var dynamicSawTurn = false
+    for i in 0..<dynamicTripleHost.relayDescriptors.len:
+        if dynamicTripleHost.relayDescriptors[i].serviceKind != types.v3Libp2pRelayServiceTurn:
+            continue
+        if dynamicTripleHost.relayDescriptors[i].endpointText != dynamicTurnEndpoint:
+            continue
+        dynamicSawTurn = true
+    assert(dynamicSawTurn, "v3 libp2p relay plane: dynamic triple turn descriptor")
+    var clearThenManualHost = host.v3Libp2pHostInit("relay.plane.clear.then.manual")
+    host.v3Libp2pHostObserveSelfResources(clearThenManualHost, healthyResources)
+    host.v3Libp2pHostRelayClearLocalState(clearThenManualHost)
+    let clearStunAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(clearThenManualHost,
+                                                                          types.v3Libp2pRelayServiceStun,
+                                                                          dynamicStunEndpoint,
+                                                                          "sfo",
+                                                                          "scope:test",
+                                                                          1,
+                                                                          60)
+    assert(IsOk(clearStunAdvertiseRes), "v3 libp2p relay plane: clear stun advertise")
+    assert(Value(clearStunAdvertiseRes), "v3 libp2p relay plane: clear stun advertised")
+    let clearTurnAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(clearThenManualHost,
+                                                                          types.v3Libp2pRelayServiceTurn,
+                                                                          dynamicTurnEndpoint,
+                                                                          "sfo",
+                                                                          "scope:test",
+                                                                          1,
+                                                                          60)
+    assert(IsOk(clearTurnAdvertiseRes), "v3 libp2p relay plane: clear turn advertise")
+    assert(Value(clearTurnAdvertiseRes), "v3 libp2p relay plane: clear turn advertised")
+    let clearTsnetAdvertiseRes = host.v3Libp2pHostRelayAdvertiseDescriptor(clearThenManualHost,
+                                                                           types.v3Libp2pRelayServiceTsnet,
+                                                                           "https://derp.sfo.example:443",
+                                                                           "sfo",
+                                                                           "scope:test",
+                                                                           1,
+                                                                           60)
+    assert(IsOk(clearTsnetAdvertiseRes), "v3 libp2p relay plane: clear tsnet advertise")
+    assert(Value(clearTsnetAdvertiseRes), "v3 libp2p relay plane: clear tsnet advertised")
+    var clearSawTurn = false
+    for i in 0..<clearThenManualHost.relayDescriptors.len:
+        if clearThenManualHost.relayDescriptors[i].serviceKind != types.v3Libp2pRelayServiceTurn:
+            continue
+        if clearThenManualHost.relayDescriptors[i].endpointText != dynamicTurnEndpoint:
+            continue
+        clearSawTurn = true
+    assert(clearSawTurn, "v3 libp2p relay plane: clear then manual turn descriptor")
+    var freshRefreshHost = host.v3Libp2pHostInit("relay.plane.fresh.refresh")
+    host.v3Libp2pHostSetTrustedInfra(freshRefreshHost, true)
+    host.v3Libp2pHostObserveSelfResources(freshRefreshHost, healthyResources)
+    host.v3Libp2pRegisterHandler(freshRefreshHost, types.v3Libp2pProtocolWebrtcSignal)
+    let freshTcpListenRes = host.v3Libp2pListen(freshRefreshHost, serverTcpAddr)
+    assert(IsOk(freshTcpListenRes), "v3 libp2p relay plane: fresh tcp listen")
+    let freshWebrtcListenRes = host.v3Libp2pListen(freshRefreshHost, publicWebrtcAddr)
+    assert(IsOk(freshWebrtcListenRes), "v3 libp2p relay plane: fresh webrtc listen")
+    let freshRefreshRes = host.v3Libp2pHostRefreshRelayRole(freshRefreshHost, relayTransport, "sfo", 60)
+    assert(IsOk(freshRefreshRes), "v3 libp2p relay plane: fresh refresh")
+    assert(Value(freshRefreshRes), "v3 libp2p relay plane: fresh refresh published")
+    var freshSawTurn = false
+    for i in 0..<freshRefreshHost.relayDescriptors.len:
+        if freshRefreshHost.relayDescriptors[i].serviceKind != types.v3Libp2pRelayServiceTurn:
+            continue
+        if freshRefreshHost.relayDescriptors[i].endpointText != "turn:203.0.113.77:3478":
+            continue
+        freshSawTurn = true
+    assert(freshSawTurn, "v3 libp2p relay plane: fresh refresh turn descriptor")
+
+    let refreshRes = host.v3Libp2pHostRefreshRelayRole(server, relayTransport, "sfo", 60)
+    assert(IsOk(refreshRes), "v3 libp2p relay plane: refresh")
+    assert(Value(refreshRes), "v3 libp2p relay plane: refresh published")
+    var sawTurnDescriptor = false
+    for i in 0..<server.relayDescriptors.len:
+        if server.relayDescriptors[i].serviceKind != types.v3Libp2pRelayServiceTurn:
+            continue
+        if server.relayDescriptors[i].endpointText != "turn:203.0.113.77:3478":
+            continue
+        sawTurnDescriptor = true
+    assert(host.v3Libp2pHostRelayProviderPos(server,
+                                             types.v3Libp2pRelayServiceStun,
+                                             "stun:203.0.113.77:3478") >= 0,
+        "v3 libp2p relay plane: stun advertised")
+    assert(sawTurnDescriptor, "v3 libp2p relay plane: turn descriptor advertised")
+    assert(host.v3Libp2pHostRelayProviderPos(server,
+                                             types.v3Libp2pRelayServiceTurn,
+                                             "turn:203.0.113.77:3478") >= 0,
+        "v3 libp2p relay plane: turn advertised")
+    assert(host.v3Libp2pHostRelayProviderPos(server,
+                                             types.v3Libp2pRelayServiceTsnet,
+                                             "https://derp.sfo.example:443") >= 0,
+        "v3 libp2p relay plane: tsnet advertised")
+    assert(server.relayDescriptors.len == 3, "v3 libp2p relay plane: stun+turn+tsnet descriptors")
+    assert(server.kadState.providers.len == 6, "v3 libp2p relay plane: region+global providers")
+
+    client.kadState.providers = server.kadState.providers
+    stranger.kadState.providers = server.kadState.providers
+
+    var deniedDescriptors: types.V3Libp2pRelayDescriptor[]
+    let deniedRes = host.v3Libp2pRelayDescribeRequest(stranger,
+                                                      server,
+                                                      server.selfPeerId,
+                                                      types.v3Libp2pRelayServiceTurn,
+                                                      "sfo",
+                                                      deniedDescriptors)
+    assert(IsErr(deniedRes), "v3 libp2p relay plane: unauth requester denied")
+
+    var turnDescriptors: types.V3Libp2pRelayDescriptor[]
+    let turnDescribeRes = host.v3Libp2pRelayDescribeRequest(client,
+                                                            server,
+                                                            server.selfPeerId,
+                                                            types.v3Libp2pRelayServiceTurn,
+                                                            "sfo",
+                                                            turnDescriptors)
+    assert(IsOk(turnDescribeRes), "v3 libp2p relay plane: describe turn")
+    assert(turnDescriptors.len == 1, "v3 libp2p relay plane: one turn descriptor")
+    assert(turnDescriptors[0].endpointText == "turn:203.0.113.77:3478",
+        "v3 libp2p relay plane: turn endpoint")
+
+    var stunDescriptors: types.V3Libp2pRelayDescriptor[]
+    let stunDescribeRes = host.v3Libp2pRelayDescribeRequest(client,
+                                                            server,
+                                                            server.selfPeerId,
+                                                            types.v3Libp2pRelayServiceStun,
+                                                            "sfo",
+                                                            stunDescriptors)
+    assert(IsOk(stunDescribeRes), "v3 libp2p relay plane: describe stun")
+    assert(stunDescriptors.len == 1, "v3 libp2p relay plane: one stun descriptor")
+
+    var descriptorRoundtrip: types.V3Libp2pRelayDescriptor[]
+    let descriptorRoundtripRes = relay_plane.v3Libp2pRelayDescriptorListDecodeFill(descriptorRoundtrip,
+                                                                                    relay_plane.v3Libp2pRelayDescriptorListEncode(turnDescriptors))
+    assert(IsOk(descriptorRoundtripRes), "v3 libp2p relay plane: descriptor roundtrip")
+    assert(descriptorRoundtrip.len == 1, "v3 libp2p relay plane: descriptor roundtrip len")
+    assert(descriptorRoundtrip[0].endpointText == turnDescriptors[0].endpointText,
+        "v3 libp2p relay plane: descriptor roundtrip endpoint")
+
+    var candidates: host.V3Libp2pRelayCandidate[]
+    let candidatesRes = host.v3Libp2pSelectRelayCandidates(client,
+                                                           types.v3Libp2pRelayServiceTurn,
+                                                           "sfo",
+                                                           3,
+                                                           candidates)
+    assert(IsOk(candidatesRes), "v3 libp2p relay plane: select candidates")
+    assert(candidates.len == 1, "v3 libp2p relay plane: one selected candidate")
+    assert(candidates[0].descriptor.endpointText == "turn:203.0.113.77:3478",
+        "v3 libp2p relay plane: selected turn endpoint")
+
+    let turnLeaseRes = host.v3Libp2pRelayLeaseRequestFetch(client,
+                                                           server,
+                                                           server.selfPeerId,
+                                                           types.v3Libp2pRelayServiceTurn,
+                                                           "sfo")
+    assert(IsOk(turnLeaseRes), "v3 libp2p relay plane: turn lease")
+    let turnLease = Value(turnLeaseRes)
+    assert(turnLease.username != "", "v3 libp2p relay plane: turn username")
+    assert(turnLease.credential != "", "v3 libp2p relay plane: turn credential")
+
+    let stunLeaseRes = host.v3Libp2pRelayLeaseRequestFetch(client,
+                                                           server,
+                                                           server.selfPeerId,
+                                                           types.v3Libp2pRelayServiceStun,
+                                                           "sfo")
+    assert(IsOk(stunLeaseRes), "v3 libp2p relay plane: stun lease")
+    let stunLease = Value(stunLeaseRes)
+    assert(stunLease.username == "", "v3 libp2p relay plane: stun user empty")
+
+    let tsnetLeaseRes = host.v3Libp2pRelayLeaseRequestFetch(client,
+                                                            server,
+                                                            server.selfPeerId,
+                                                            types.v3Libp2pRelayServiceTsnet,
+                                                            "sfo")
+    assert(IsOk(tsnetLeaseRes), "v3 libp2p relay plane: tsnet lease")
+    let tsnetLease = Value(tsnetLeaseRes)
+    assert(tsnetLease.endpointText == "https://derp.sfo.example:443",
+        "v3 libp2p relay plane: tsnet endpoint")
+    assert(tsnetLease.username != "", "v3 libp2p relay plane: tsnet credential user")
+
+    let leaseRoundtripPayload = relay_plane.v3Libp2pRelayLeaseEncode(turnLease)
+    var turnLeaseRoundtrip: types.V3Libp2pRelayLease
+    let leaseRoundtripRes = relay_plane.v3Libp2pRelayLeaseDecodeFill(turnLeaseRoundtrip,
+                                                                     leaseRoundtripPayload)
+    assert(IsOk(leaseRoundtripRes), "v3 libp2p relay plane: lease roundtrip")
+    assert(turnLeaseRoundtrip.endpointText == turnLease.endpointText,
+        "v3 libp2p relay plane: lease roundtrip endpoint")
+
+    var cfg: webrtc_transport.V3Libp2pWebrtcTransportConfig
+    let applyTurnRes = webrtc_transport.v3Libp2pWebrtcTransportConfigApplyRelayLease(cfg, turnLease)
+    assert(IsOk(applyTurnRes), "v3 libp2p relay plane: apply turn lease")
+    let applyStunRes = webrtc_transport.v3Libp2pWebrtcTransportConfigApplyRelayLease(cfg, stunLease)
+    assert(IsOk(applyStunRes), "v3 libp2p relay plane: apply stun lease")
+    assert(cfg.relayOnly, "v3 libp2p relay plane: relay only")
+    assert(cfg.turnServers.len == 1, "v3 libp2p relay plane: turn server count")
+    assert(cfg.stunUrls.len == 1, "v3 libp2p relay plane: stun url count")
+
+    echo("v3 libp2p_relay_plane_smoke ok")
+    return 0

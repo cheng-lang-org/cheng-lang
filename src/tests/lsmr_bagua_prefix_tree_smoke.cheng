@@ -1,0 +1,54 @@
+import std/system
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/chain/lsmr_types as lt
+import cheng/chain/lsmr as lsmr
+import cheng/chain/binary_types as types
+
+fn main(): int32 =
+    let addrGlobalRes = types.v3LsmrAddressFromDigits([6, 7, 9])
+    let addrRegionalRes = types.v3LsmrAddressFromDigits([6, 7, 4])
+    let addrEdgeRes = types.v3LsmrAddressFromDigits([6, 7, 2])
+    assert(IsOk(addrGlobalRes), "v3 lsmr tree: global address")
+    assert(IsOk(addrRegionalRes), "v3 lsmr tree: regional address")
+    assert(IsOk(addrEdgeRes), "v3 lsmr tree: edge address")
+
+    let globalContentCid = lt.v3HashInts("v3.lsmr.tree.content", [1, 11, 111])
+    let regionalContentCid = lt.v3HashInts("v3.lsmr.tree.content", [2, 22, 222])
+    let edgeContentCid = lt.v3HashInts("v3.lsmr.tree.content", [3, 33, 333])
+    let globalLocalityHash = lt.v3HashInts("v3.lsmr.tree.locality", [1, 101])
+    let regionalLocalityHash = lt.v3HashInts("v3.lsmr.tree.locality", [2, 202])
+    let edgeLocalityHash = lt.v3HashInts("v3.lsmr.tree.locality", [3, 303])
+
+    var globalCell: lt.V3StateCell
+    lsmr.v3LsmrStateCellFill(globalCell, 1, Value(addrGlobalRes), 1, globalContentCid, globalLocalityHash)
+    var regionalCell: lt.V3StateCell
+    lsmr.v3LsmrStateCellFill(regionalCell, 2, Value(addrRegionalRes), 2, regionalContentCid, regionalLocalityHash)
+    var edgeCell: lt.V3StateCell
+    lsmr.v3LsmrStateCellFill(edgeCell, 3, Value(addrEdgeRes), 3, edgeContentCid, edgeLocalityHash)
+    var cells: lt.V3StateCell[]
+    cells = []
+    add(cells, globalCell)
+    add(cells, regionalCell)
+    add(cells, edgeCell)
+    let forest = lsmr.v3BuildStateLayerForest(cells)
+    assert(!layout.fixedBytes32Equal(forest.forestCid, layout.FixedBytes32()), "v3 lsmr tree: forest cid")
+    assert(forest.globalTree.entryCount == 1, "v3 lsmr tree: global entry count")
+    assert(forest.regionalTree.entryCount == 1, "v3 lsmr tree: regional entry count")
+    assert(forest.edgeTree.entryCount == 1, "v3 lsmr tree: edge entry count")
+
+    let regionalSummary = lsmr.v3StateLayerSummaryFromForest(forest, lt.v3LayerRegional)
+    assert(regionalSummary.entryCount == 1, "v3 lsmr tree: regional summary count")
+    assert(regionalSummary.nodeCount >= 1, "v3 lsmr tree: regional summary nodes")
+
+    let rootSummaryRes = lsmr.v3BaguaRootSummaryFromTree(
+        lt.v3LayerRegional,
+        forest.regionalTree,
+        regionalCell.baguaId
+    )
+    assert(IsOk(rootSummaryRes), "v3 lsmr tree: bagua root summary")
+    let rootSummary = Value(rootSummaryRes)
+    assert(rootSummary.entryDescCount >= 1, "v3 lsmr tree: root descendant count")
+
+    echo("v3 lsmr_bagua_prefix_tree_smoke ok")
+    return 0

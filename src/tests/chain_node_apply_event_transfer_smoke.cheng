@@ -1,0 +1,43 @@
+import std/system
+import cheng/std/bytes_layout as layout
+import cheng/chain/consensus as consensus
+import cheng/apps/chain_node/chain_node as node
+
+fn main(): int32 =
+    var server: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(server, "node-a", "chain-node-a")),
+           "v3 chain_node: init")
+    let mintCidRes = node.v3ChainNodeMint(server, 7, 1001, int64(100))
+    assert(mintCidRes.ok, "v3 chain_node apply event transfer: mint")
+
+    let fromParentCid = node.v3ChainNodeAccountHead(server.index, 7, 1001)
+    let toParentCid = node.v3ChainNodeAccountHead(server.index, 7, 2002)
+
+    var event: consensus.V3ChainEvent
+    event.version = 1
+    event.kind = consensus.v3ConsensusKindTransferCommit
+    event.assetId = 7
+    event.fromAccount = 1001
+    event.toAccount = 2002
+    event.fromParentCid = fromParentCid
+    event.toParentCid = toParentCid
+    event.amount = int64(40)
+    event.epoch = server.nextEpoch
+    event.ganzhiIndex = server.nextGanzhi
+    event.spaceSlot = node.v3ChainNodeSpaceSlot(1001, 2002)
+    event.tick = server.nextTick
+    event.stem = event.ganzhiIndex % 10
+    event.branch = event.ganzhiIndex % 12
+    event.bodyCid = consensus.v3ChainEventBodyCid(event)
+
+    let applyRes = node.v3ChainNodeApplyEvent(server, event)
+    assert(applyRes.ok, "v3 chain_node apply event transfer: apply")
+    assert(server.index.accountIds.len == 2, "v3 chain_node apply event transfer: account len")
+    assert(node.v3ChainNodeBalanceValue(server.index, 7, 1001) == int64(60),
+           "v3 chain_node apply event transfer: sender 60")
+    assert(node.v3ChainNodeBalanceValue(server.index, 7, 2002) == int64(40),
+           "v3 chain_node apply event transfer: receiver 40")
+    assert(layout.fixedBytes32Equal(server.tipEventCid, applyRes.value),
+           "v3 chain_node apply event transfer: tip event cid")
+    echo("v3 chain_node_apply_event_transfer_smoke ok")
+    return 0

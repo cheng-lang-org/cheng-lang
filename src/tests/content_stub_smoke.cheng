@@ -1,0 +1,287 @@
+import std/system
+import std/result
+import std/rawbytes
+import cheng/std/bytes_layout as layout
+import cheng/chain/binary_types as binary
+import cheng/chain/lsmr_types as lt
+import cheng/chain/csg
+import cheng/chain/pubsub
+import cheng/chain/dag_mempool as dag
+import cheng/chain/plumtree
+import cheng/chain/erasure_swarm as swarm
+import cheng/chain/content_plane as content
+import cheng/chain/content_runtime as runtime
+
+fn contentStubSmokeBytesEqual(left: Bytes, right: Bytes): bool =
+    if bytesLen(left) != bytesLen(right):
+        return false
+    for i in 0..<bytesLen(left):
+        if bytesGet(left, i) != bytesGet(right, i):
+            return false
+    return true
+
+fn contentStubSmokeBlob(shard0: Bytes, shard1: Bytes, shard2: Bytes): Bytes =
+    var buf: layout.ByteBuf = layout.byteBufInit(bytesLen(shard0) + bytesLen(shard1) + bytesLen(shard2))
+    layout.byteBufAppendBytes(buf, shard0)
+    layout.byteBufAppendBytes(buf, shard1)
+    layout.byteBufAppendBytes(buf, shard2)
+    return layout.byteBufToBytes(buf)
+
+fn contentStubSmokeBuildRouting(outCenter: var binary.V3LsmrAddress,
+                                outTopic: var pubsub.V3PubSubTopic,
+                                outRoot: var pubsub.V3PubSubSubscription,
+                                outSubscriptions: var pubsub.V3PubSubSubscription[]): Result[bool] =
+    let centerRes = binary.v3LsmrAddressFromDigits([5, 5, 5])
+    if IsErr(centerRes):
+        return Err[bool](Error(centerRes))
+    let center = Value(centerRes)
+    let topicRes = pubsub.v3PubSubTopicFromAddress(center,
+                                                   2,
+                                                   lt.v3PubSubModeXun,
+                                                   pubsub.v3PubSubSemanticFingerprint([71, 72, 73]))
+    if IsErr(topicRes):
+        return Err[bool](Error(topicRes))
+    let topic = Value(topicRes)
+    let root = pubsub.v3PubSubSubscriptionMake(1, center, csg.v3CsgBarrierModeGen, topic.topicCid)
+    let eastRes = binary.v3LsmrAddressFromDigits([5, 8, 1])
+    if IsErr(eastRes):
+        return Err[bool](Error(eastRes))
+    outCenter = center
+    outTopic = topic
+    outRoot = root
+    outSubscriptions = []
+    add(outSubscriptions, root)
+    add(outSubscriptions, pubsub.v3PubSubSubscriptionMake(2, Value(eastRes), csg.v3CsgBarrierModeGen, topic.topicCid))
+    return Ok[bool](true)
+
+fn contentStubSmokePrepareArtifacts(out: var content.V3ContentPublishArtifacts,
+                                    topic: pubsub.V3PubSubTopic,
+                                    root: pubsub.V3PubSubSubscription,
+                                    subscriptions: pubsub.V3PubSubSubscription[],
+                                    publisherPeerId: layout.FixedBytes32): Result[bool] =
+    let shard0 = bytesFromString("alpha-")
+    let shard1 = bytesFromString("beta--")
+    let shard2 = bytesFromString("gamma!")
+    let blob = contentStubSmokeBlob(shard0, shard1, shard2)
+    let summaryRes = dag.v3DagBlobSummaryFromBytes(blob, 6)
+    if IsErr(summaryRes):
+        return Err[bool](Error(summaryRes))
+    let summary = Value(summaryRes)
+    let paramsRes = swarm.v3ErasureEncodingParamsMake(swarm.v3ErasureLayoutRsSystematic, 3, 0, 6)
+    if IsErr(paramsRes):
+        return Err[bool](Error(paramsRes))
+    let params = Value(paramsRes)
+
+    var shardPayloadCids: layout.FixedBytes32[]
+    shardPayloadCids = []
+    add(shardPayloadCids, swarm.v3ErasureShardPayloadCid(shard0))
+    add(shardPayloadCids, swarm.v3ErasureShardPayloadCid(shard1))
+    add(shardPayloadCids, swarm.v3ErasureShardPayloadCid(shard2))
+
+    let manifestRes = swarm.v3ErasureShardManifestMake(summary.blobCid,
+                                                       summary.payloadLen,
+                                                       params,
+                                                       shardPayloadCids)
+    if IsErr(manifestRes):
+        return Err[bool](Error(manifestRes))
+    let manifest = Value(manifestRes)
+    let denseAdvertRes = swarm.v3ErasurePeerAdvertMake(publisherPeerId,
+                                                       manifest,
+                                                       params,
+                                                       [0, 1, 2],
+                                                       950,
+                                                       3)
+    if IsErr(denseAdvertRes):
+        return Err[bool](Error(denseAdvertRes))
+    var peerAdverts: swarm.V3ErasurePeerAdvert[]
+    peerAdverts = []
+    swarm.v3ErasurePeerAdvertAppend(peerAdverts, Value(denseAdvertRes))
+    var providerPeerIds: layout.FixedBytes32[]
+    providerPeerIds = []
+    add(providerPeerIds, publisherPeerId)
+    var retainedUntilEpochs: int32[]
+    retainedUntilEpochs = []
+    add(retainedUntilEpochs, 120)
+
+    let proofsRes = content.v3ContentBuildAvailabilityProofs(summary, providerPeerIds, retainedUntilEpochs)
+    if IsErr(proofsRes):
+        return Err[bool](Error(proofsRes))
+    let proofs = Value(proofsRes)
+    let certRes = dag.v3DagAvailabilityCertMake(summary, proofs)
+    if IsErr(certRes):
+        return Err[bool](Error(certRes))
+    let cert = Value(certRes)
+    let advertRes = dag.v3DagPublishAdvertMake(topic.topicCid,
+                                               publisherPeerId,
+                                               summary,
+                                               cert,
+                                               11,
+                                               22)
+    if IsErr(advertRes):
+        return Err[bool](Error(advertRes))
+    let advert = Value(advertRes)
+    let envelope = pubsub.v3PubSubEnvelopeMake(topic.topicCid,
+                                               pubsub.v3PubSubPayloadKindDagAdvert,
+                                               advert.advertCid,
+                                               summary.summaryCid)
+    let pubsubPlanRes = pubsub.v3PubSubBuildPlan(topic, envelope, subscriptions)
+    if IsErr(pubsubPlanRes):
+        return Err[bool](Error(pubsubPlanRes))
+    let pubsubPlan = Value(pubsubPlanRes)
+    let plumtreePlanRes = plumtree.v3PlumtreeBuildPlan(topic, root, pubsubPlan, subscriptions)
+    if IsErr(plumtreePlanRes):
+        return Err[bool](Error(plumtreePlanRes))
+    let plumtreePlan = Value(plumtreePlanRes)
+    let recoveryPlanRes = swarm.v3ErasureBuildRecoveryPlan(manifest, params, peerAdverts)
+    if IsErr(recoveryPlanRes):
+        return Err[bool](Error(recoveryPlanRes))
+    let recoveryPlan = Value(recoveryPlanRes)
+    out = content.V3ContentPublishArtifacts()
+    out.topic = topic
+    out.root = root
+    out.subscriptionCount = subscriptions.len
+    out.subscriptions = subscriptions
+    out.blobSummary = summary
+    out.availabilityProofCount = proofs.len
+    out.availabilityProofs = proofs
+    out.availabilityCert = cert
+    out.publishAdvert = advert
+    out.envelope = envelope
+    out.pubsubPlan = pubsubPlan
+    out.plumtreePlan = plumtreePlan
+    out.erasureParams = params
+    out.erasureManifest = manifest
+    out.peerAdvertCount = peerAdverts.len
+    out.peerAdverts = peerAdverts
+    out.recoveryPlan = recoveryPlan
+    out.bundleCid = content.v3ContentPublishArtifactsExpectedBundleCid(out)
+    return Ok[bool](true)
+
+fn main(): int32 =
+    var center = binary.V3LsmrAddress()
+    var topic = pubsub.V3PubSubTopic()
+    var root = pubsub.V3PubSubSubscription()
+    var subscriptions: pubsub.V3PubSubSubscription[]
+    subscriptions = []
+    let routingRes = contentStubSmokeBuildRouting(center, topic, root, subscriptions)
+    assert(IsOk(routingRes), "v3 content stub smoke: routing")
+
+    let publisherPeerId = lt.v3HashInts("v3.content.stub.publisher", [17, 18, 19])
+    let shard0 = bytesFromString("alpha-")
+    let shard1 = bytesFromString("beta--")
+    let shard2 = bytesFromString("gamma!")
+    var shardPayloads: Bytes[]
+    shardPayloads = []
+    add(shardPayloads, shard0)
+    add(shardPayloads, shard1)
+    add(shardPayloads, shard2)
+    let blob = contentStubSmokeBlob(shard0, shard1, shard2)
+
+    var artifacts = content.V3ContentPublishArtifacts()
+    let prepareRes = contentStubSmokePrepareArtifacts(artifacts,
+                                                      topic,
+                                                      root,
+                                                      subscriptions,
+                                                      publisherPeerId)
+    assert(IsOk(prepareRes), "v3 content stub smoke: prepare artifacts")
+    let artifactsOk = content.v3ContentPublishArtifactsValidate(artifacts)
+    assert(IsOk(artifactsOk), "v3 content stub smoke: artifacts")
+
+    let stubRes = content.v3ContentStubFromArtifacts(artifacts)
+    assert(IsOk(stubRes), "v3 content stub smoke: stub")
+    let stub = Value(stubRes)
+    let stubOk = content.v3ContentStubValidate(stub)
+    assert(IsOk(stubOk), "v3 content stub smoke: stub validate")
+    assert(layout.fixedBytes32Equal(stub.manifestCid, artifacts.erasureManifest.manifestCid),
+        "v3 content stub smoke: stub manifest cid")
+    assert(layout.fixedBytes32Equal(stub.recoveryPlanCid, artifacts.recoveryPlan.planCid),
+        "v3 content stub smoke: stub recovery cid")
+
+    let stubDecodedRes = content.v3ContentStubDecode(content.v3ContentStubEncode(stub))
+    assert(IsOk(stubDecodedRes), "v3 content stub smoke: stub decode")
+    assert(layout.fixedBytes32Equal(Value(stubDecodedRes).stubCid, stub.stubCid),
+        "v3 content stub smoke: stub decoded cid")
+
+    var serverRuntime = runtime.v3ContentRuntimeInit()
+    let storeManifestRes = runtime.v3ContentRuntimeStoreManifest(serverRuntime,
+                                                                 artifacts.erasureManifest)
+    assert(IsOk(storeManifestRes), "v3 content stub smoke: store manifest")
+    let storeBlobRes = runtime.v3ContentRuntimeStoreBlobPayload(serverRuntime,
+                                                               artifacts.blobSummary.blobCid,
+                                                               blob)
+    assert(IsOk(storeBlobRes), "v3 content stub smoke: store blob")
+
+    let targetsRes = runtime.v3ContentRuntimeBuildPullTargets(artifacts.erasureManifest.manifestCid,
+                                                              artifacts.erasureManifest.shardIndices,
+                                                              artifacts.erasureManifest.shardPayloadCids,
+                                                              artifacts.recoveryPlan.manifestCid,
+                                                              artifacts.recoveryPlan.requestCount,
+                                                              artifacts.recoveryPlan.requestPeerIds,
+                                                              artifacts.recoveryPlan.requestShardIndices,
+                                                              artifacts.recoveryPlan.requestShardCids)
+    assert(IsOk(targetsRes), "v3 content stub smoke: build pull targets")
+    let targets = Value(targetsRes)
+    assert(targets.len == shardPayloads.len, "v3 content stub smoke: target count")
+
+    let requestsRes = runtime.v3ContentRuntimeBuildPullRequests(artifacts.erasureManifest.manifestCid,
+                                                                artifacts.erasureManifest.shardIndices,
+                                                                artifacts.erasureManifest.shardPayloadCids,
+                                                                artifacts.recoveryPlan.manifestCid,
+                                                                artifacts.recoveryPlan.requestCount,
+                                                                artifacts.recoveryPlan.requestPeerIds,
+                                                                artifacts.recoveryPlan.requestShardIndices,
+                                                                artifacts.recoveryPlan.requestShardCids)
+    assert(IsOk(requestsRes), "v3 content stub smoke: build pull requests")
+    let requests = Value(requestsRes)
+    assert(requests.len == shardPayloads.len, "v3 content stub smoke: request count")
+
+    for i in 0..<requests.len:
+        let shardIndex = requests[i].shardIndex
+        var response = swarm.V3ErasureShardPullResponse()
+        let responseFillRes = swarm.v3ErasureShardPullResponseFill(response,
+                                                                   requests[i],
+                                                                   shardPayloads[shardIndex])
+        assert(IsOk(responseFillRes), "v3 content stub smoke: seed shard response")
+        let storeRes = runtime.v3ContentRuntimeStoreShardResponse(serverRuntime, response)
+        assert(IsOk(storeRes), "v3 content stub smoke: store server cache")
+
+    var clientRuntime = runtime.v3ContentRuntimeInit()
+    var pulled: swarm.V3ErasureShardPullResponse[]
+    pulled = []
+    for i in 0..<targets.len:
+        assert(layout.fixedBytes32Equal(targets[i].peerId, publisherPeerId),
+            "v3 content stub smoke: target peer")
+        var servedPayload: Bytes
+        assert(runtime.v3ContentRuntimeCachedShard(serverRuntime, targets[i].request, servedPayload),
+            "v3 content stub smoke: serve cached shard")
+        var pulledResponse = swarm.V3ErasureShardPullResponse()
+        let pullFillRes = swarm.v3ErasureShardPullResponseFill(pulledResponse,
+                                                               targets[i].request,
+                                                               servedPayload)
+        assert(IsOk(pullFillRes), "v3 content stub smoke: pull shard")
+        let clientStoreRes = runtime.v3ContentRuntimeStoreShardResponse(clientRuntime, pulledResponse)
+        assert(IsOk(clientStoreRes), "v3 content stub smoke: store client cache")
+        add(pulled, pulledResponse)
+
+    var cachedShard: Bytes
+    assert(runtime.v3ContentRuntimeCachedShard(clientRuntime, targets[0].request, cachedShard),
+        "v3 content stub smoke: cached shard")
+    assert(contentStubSmokeBytesEqual(cachedShard, shardPayloads[targets[0].request.shardIndex]),
+        "v3 content stub smoke: cached shard bytes")
+
+    let rebuildRes = runtime.v3ContentRuntimeRebuildBlobAgainstStub(stub,
+                                                                    artifacts.erasureManifest,
+                                                                    artifacts.erasureParams,
+                                                                    pulled)
+    assert(IsOk(rebuildRes), "v3 content stub smoke: rebuild against stub")
+    assert(contentStubSmokeBytesEqual(Value(rebuildRes), blob),
+        "v3 content stub smoke: rebuilt blob")
+
+    assert(contentStubSmokeBytesEqual(bytesFromString("alpha-beta--gamma!"),
+                                      contentStubSmokeBlob(bytesFromString("alpha-"),
+                                                           bytesFromString("beta--"),
+                                                           bytesFromString("gamma!"))),
+        "v3 content stub smoke: blob equality helper")
+
+    echo("v3 content_stub_smoke ok")
+    return 0

@@ -1,0 +1,174 @@
+import std/result
+import std/strings
+import cheng/std/bytes_layout as layout
+import cheng/oracle/oracle_types as oracle_types
+import cheng/apps/chain_node/cheng_node as node
+import cheng/apps/chain_node/cheng_node_state as state
+import cheng/apps/chain_node/cheng_node_domains as cdomain
+import cheng/apps/unimaker/unimaker_edge_types as evotypes
+
+fn main(): int32 =
+    let rootSeed = "cheng-node-stage4-smoke-root"
+    let nodeRes = node.V3ChengNodeInit(rootSeed)
+    assert(IsOk(nodeRes), "cheng_node stage4 smoke: init")
+    var core = Value(nodeRes)
+
+    let oracleRes = node.V3ChengNodeOracleSubmitFixtureRound(core, int64(22))
+    assert(IsOk(oracleRes), "cheng_node stage4 smoke: oracle submit")
+    let oracleQueryRes = node.V3ChengNodeOracleQueryText(core, "BTC/USD", true)
+    assert(IsOk(oracleQueryRes), "cheng_node stage4 smoke: oracle query")
+    let oracleQueryText = Value(oracleQueryRes)
+    assert(strings.StrContains(oracleQueryText, "pair_key=BTC/USD"),
+           "cheng_node stage4 smoke: oracle pair key")
+    assert(strings.StrContains(oracleQueryText, "round_id=22"),
+           "cheng_node stage4 smoke: oracle round")
+    assert(strings.StrContains(oracleQueryText, "found=1"),
+           "cheng_node stage4 smoke: oracle found")
+    assert(strings.StrContains(oracleQueryText, "delta_count=1"),
+           "cheng_node stage4 smoke: oracle delta")
+    let oracleIndexRes = node.V3ChengNodeKeyedQueryText(core, "oracle", "pair", "BTC/USD", false)
+    assert(IsOk(oracleIndexRes), "cheng_node stage4 smoke: oracle index query")
+    assert(strings.StrContains(Value(oracleIndexRes), "payload_kind=oracle_pair_state"),
+           "cheng_node stage4 smoke: oracle payload kind")
+
+    let jobKey = "job-alpha"
+    assert(IsOk(node.V3ChengNodeDilocoOpenJob(core, jobKey, 2, 4, 60)),
+           "cheng_node stage4 smoke: diloco open")
+    assert(IsOk(node.V3ChengNodeDilocoJoinCohort(core, jobKey, "peer-alpha")),
+           "cheng_node stage4 smoke: diloco join alpha")
+    assert(IsOk(node.V3ChengNodeDilocoJoinCohort(core, jobKey, "peer-bravo")),
+           "cheng_node stage4 smoke: diloco join bravo")
+    assert(IsOk(node.V3ChengNodeDilocoFetchLease(core, jobKey, "peer-alpha")),
+           "cheng_node stage4 smoke: diloco lease alpha")
+    assert(IsOk(node.V3ChengNodeDilocoFetchLease(core, jobKey, "peer-bravo")),
+           "cheng_node stage4 smoke: diloco lease bravo")
+    assert(IsOk(node.V3ChengNodeDilocoReportBarrier(core, jobKey, "peer-alpha")),
+           "cheng_node stage4 smoke: diloco barrier alpha")
+    assert(IsOk(node.V3ChengNodeDilocoReportBarrier(core, jobKey, "peer-bravo")),
+           "cheng_node stage4 smoke: diloco barrier bravo")
+    assert(IsOk(node.V3ChengNodeDilocoSubmitOuterDelta(core, jobKey, "peer-alpha", 128, 256, 4, 1, 2)),
+           "cheng_node stage4 smoke: diloco delta alpha")
+    assert(IsOk(node.V3ChengNodeDilocoSubmitOuterDelta(core, jobKey, "peer-bravo", 96, 192, 4, 1, 2)),
+           "cheng_node stage4 smoke: diloco delta bravo")
+    assert(IsOk(node.V3ChengNodeDilocoPublishMerge(core, jobKey, "peer-alpha")),
+           "cheng_node stage4 smoke: diloco merge")
+    let dilocoStatusRes = node.V3ChengNodeDilocoStatusText(core, jobKey)
+    assert(IsOk(dilocoStatusRes), "cheng_node stage4 smoke: diloco status")
+    let dilocoStatus = Value(dilocoStatusRes)
+    assert(strings.StrContains(dilocoStatus, "job_current_outer_step=2"),
+           "cheng_node stage4 smoke: diloco outer step")
+    assert(strings.StrContains(dilocoStatus, "lineage_count=2"),
+           "cheng_node stage4 smoke: diloco lineage")
+    assert(strings.StrContains(dilocoStatus, "lease_count=2"),
+           "cheng_node stage4 smoke: diloco lease count")
+    let dilocoJobQueryRes = node.V3ChengNodeKeyedQueryText(core, "diloco_job", "job", jobKey, false)
+    assert(IsOk(dilocoJobQueryRes), "cheng_node stage4 smoke: diloco job query")
+    assert(strings.StrContains(Value(dilocoJobQueryRes), "payload_kind=diloco_job_state"),
+           "cheng_node stage4 smoke: diloco job payload")
+    let dilocoCohortQueryRes = node.V3ChengNodeKeyedQueryText(core, "diloco_cohort", "cohort", jobKey, false)
+    assert(IsOk(dilocoCohortQueryRes), "cheng_node stage4 smoke: diloco cohort query")
+    assert(strings.StrContains(Value(dilocoCohortQueryRes), "found=1"),
+           "cheng_node stage4 smoke: diloco cohort found")
+    let leaseAlphaKey = jobKey + "/" + cdomain.V3ChengNodeDilocoPeerTextFromSeed("peer-alpha")
+    let dilocoLeaseQueryRes = node.V3ChengNodeKeyedQueryText(core, "diloco_lease", "lease", leaseAlphaKey, false)
+    assert(IsOk(dilocoLeaseQueryRes), "cheng_node stage4 smoke: diloco lease query")
+    assert(strings.StrContains(Value(dilocoLeaseQueryRes), "payload_kind=diloco_lease_state"),
+           "cheng_node stage4 smoke: diloco lease payload")
+
+    let didText = "did:cheng:stage4"
+    let peerText = "peer-stage4"
+    let deviceText = "linux-stage4"
+    let taskId = "evomap-task-1"
+    assert(IsOk(node.V3ChengNodeEvoMapUpsertAgent(core, didText, peerText, deviceText)),
+           "cheng_node stage4 smoke: evomap agent")
+    let taskKeywords = ["agent", "memory"]
+    let emptyContext: layout.FixedBytes32[]
+    assert(IsOk(node.V3ChengNodeEvoMapAnchorTask(core,
+                                                 peerText,
+                                                 taskId,
+                                                 "capture memory and publish",
+                                                 taskKeywords,
+                                                 emptyContext)),
+           "cheng_node stage4 smoke: evomap task")
+    let capsuleKeywordsA = ["hello", "world"]
+    let emptyParents: layout.FixedBytes32[]
+    assert(IsOk(node.V3ChengNodeEvoMapAnchorCapsule(core,
+                                                    didText,
+                                                    peerText,
+                                                    deviceText,
+                                                    evotypes.v3UnimakerEventUserInput,
+                                                    taskId,
+                                                    "first event",
+                                                    capsuleKeywordsA,
+                                                    emptyParents,
+                                                    evotypes.v3UnimakerEdgeKindCausedBy,
+                                                    int64(1700000000),
+                                                    "",
+                                                    "",
+                                                    "")),
+           "cheng_node stage4 smoke: evomap capsule a")
+    var parentCids: layout.FixedBytes32[]
+    parentCids = []
+    add(parentCids, core.evomap.capsules[0].capsuleCid)
+    let capsuleKeywordsB = ["result", "tool"]
+    assert(IsOk(node.V3ChengNodeEvoMapAnchorCapsule(core,
+                                                    didText,
+                                                    peerText,
+                                                    deviceText,
+                                                    evotypes.v3UnimakerEventToolResult,
+                                                    taskId,
+                                                    "second event",
+                                                    capsuleKeywordsB,
+                                                    parentCids,
+                                                    evotypes.v3UnimakerEdgeKindUsefulFor,
+                                                    int64(1700000001),
+                                                    "task_planning",
+                                                    "memory_first_then_capture",
+                                                    "result")),
+           "cheng_node stage4 smoke: evomap capsule b")
+    let evoStatus = node.V3ChengNodeEvoMapStatusText(core)
+    assert(strings.StrContains(evoStatus, "agent_count=1"),
+           "cheng_node stage4 smoke: evomap agent count")
+    assert(strings.StrContains(evoStatus, "task_count=1"),
+           "cheng_node stage4 smoke: evomap task count")
+    assert(strings.StrContains(evoStatus, "capsule_count=2"),
+           "cheng_node stage4 smoke: evomap capsule count")
+    let evomapAgentQueryRes = node.V3ChengNodeKeyedQueryText(core, "evomap", "agent", peerText, false)
+    assert(IsOk(evomapAgentQueryRes), "cheng_node stage4 smoke: evomap agent query")
+    assert(strings.StrContains(Value(evomapAgentQueryRes), "payload_kind=evomap_agent_hello"),
+           "cheng_node stage4 smoke: evomap agent payload")
+    let evomapTaskQueryRes = node.V3ChengNodeKeyedQueryText(core, "evomap", "task", taskId, false)
+    assert(IsOk(evomapTaskQueryRes), "cheng_node stage4 smoke: evomap task query")
+    assert(strings.StrContains(Value(evomapTaskQueryRes), "payload_kind=evomap_task"),
+           "cheng_node stage4 smoke: evomap task payload")
+    let capsuleKey = layout.fixedBytes32Hex(core.evomap.capsules[1].capsuleCid)
+    let evomapCapsuleQueryRes = node.V3ChengNodeKeyedQueryText(core, "evomap", "capsule", capsuleKey, false)
+    assert(IsOk(evomapCapsuleQueryRes), "cheng_node stage4 smoke: evomap capsule query")
+    assert(strings.StrContains(Value(evomapCapsuleQueryRes), "payload_kind=evomap_capsule"),
+           "cheng_node stage4 smoke: evomap capsule payload")
+
+    let statePath = "/tmp/cheng_node_oracle_diloco_evomap.state"
+    let writeRes = state.V3ChengNodeWriteState(statePath, core)
+    assert(IsOk(writeRes), "cheng_node stage4 smoke: write state")
+    var loaded: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadStateInto(loaded, statePath, rootSeed)
+    assert(IsOk(loadRes), "cheng_node stage4 smoke: load state")
+
+    let loadedOracleRes = node.V3ChengNodeOracleQueryText(loaded, "BTC/USD", false)
+    assert(IsOk(loadedOracleRes), "cheng_node stage4 smoke: loaded oracle")
+    assert(strings.StrContains(Value(loadedOracleRes), "round_id=22"),
+           "cheng_node stage4 smoke: loaded oracle round")
+    let loadedDilocoRes = node.V3ChengNodeDilocoStatusText(loaded, jobKey)
+    assert(IsOk(loadedDilocoRes), "cheng_node stage4 smoke: loaded diloco")
+    assert(strings.StrContains(Value(loadedDilocoRes), "job_current_outer_step=2"),
+           "cheng_node stage4 smoke: loaded diloco outer step")
+    let loadedEvoStatus = node.V3ChengNodeEvoMapStatusText(loaded)
+    assert(strings.StrContains(loadedEvoStatus, "capsule_count=2"),
+           "cheng_node stage4 smoke: loaded evomap capsule count")
+    let loadedCapsuleQueryRes = node.V3ChengNodeKeyedQueryText(loaded, "evomap", "capsule", capsuleKey, false)
+    assert(IsOk(loadedCapsuleQueryRes), "cheng_node stage4 smoke: loaded capsule query")
+    assert(strings.StrContains(Value(loadedCapsuleQueryRes), "found=1"),
+           "cheng_node stage4 smoke: loaded capsule found")
+
+    echo("v3 cheng_node_oracle_diloco_evomap_smoke ok")
+    return 0

@@ -1,0 +1,273 @@
+import std/result
+import std/rawbytes
+import cheng/libp2p/core/types
+import cheng/libp2p/core/peer_id
+
+type
+    V3Libp2pSegmentRead =
+        seg: str
+        next: int32
+
+fn v3Libp2pReadSegmentBytes(data: Bytes, start: int32): Result[V3Libp2pSegmentRead] =
+    let dataLen = bytesLen(data)
+    if start >= dataLen:
+        return Err[V3Libp2pSegmentRead]("v3 libp2p multiaddr: trailing slash")
+    var i = start
+    while i < dataLen:
+        if bytesGet(data, i) == int32('/'):
+            break
+        i = i + 1
+    var out: V3Libp2pSegmentRead
+    let segBytes = bytesSliceView(data, start, i - start)
+    let segText = bytesToString(segBytes)
+    out.seg = segText
+    out.next = i
+    if i < dataLen:
+        if bytesGet(data, i) == int32('/'):
+            out.next = i + 1
+    return Ok[V3Libp2pSegmentRead](out)
+
+fn v3Libp2pReadSegment(text: str, start: int32): Result[V3Libp2pSegmentRead] =
+    if start >= len(text):
+        return Err[V3Libp2pSegmentRead]("v3 libp2p multiaddr: trailing slash")
+    var i = start
+    while i < len(text):
+        if text[i] == '/':
+            break
+        i = i + 1
+    var out: V3Libp2pSegmentRead
+    out.seg = v3Libp2pTextSlice(text, start, i - start)
+    out.next = i
+    if i < len(text):
+        if text[i] == '/':
+            out.next = i + 1
+    return Ok[V3Libp2pSegmentRead](out)
+
+fn v3Libp2pTextSlice(text: str, start: int32, count: int32): str =
+    if count <= 0:
+        return ""
+    let out = bytesAlloc(count)
+    for i in 0..<count:
+        bytesSet(out, i, int32(text[start + i]))
+    return bytesToString(out)
+
+fn v3Libp2pParsePositiveI32(text: str): Result[int32] =
+    if len(text) <= 0:
+        return Err[int32]("v3 libp2p multiaddr: empty number")
+    var out = 0
+    for i in 0..<len(text):
+        let c = text[i]
+        if c < '0' || c > '9':
+            return Err[int32]("v3 libp2p multiaddr: invalid number")
+        out = out * 10 + (int32(c) - int32('0'))
+    return Ok[int32](out)
+
+fn v3Libp2pMultiaddrFillTcp(out: var types.V3Libp2pMultiaddr,
+                            host: str,
+                            port: int32) =
+    out.raw = ""
+    out.host = host
+    out.port = port
+    out.transport = types.v3Libp2pTransportTcp
+    out.networkDomain = types.v3Libp2pNetworkDomainPublic
+    out.visibility = types.v3Libp2pVisibilityPublic
+    out.priority = 100
+    out.secure = types.v3Libp2pSecureNoise
+    out.mux = types.v3Libp2pMuxYamux
+    out.hasPeerId = false
+
+fn v3Libp2pMultiaddrFillQuic(out: var types.V3Libp2pMultiaddr,
+                             host: str,
+                             port: int32) =
+    out.raw = ""
+    out.host = host
+    out.port = port
+    out.transport = types.v3Libp2pTransportQuic
+    out.networkDomain = types.v3Libp2pNetworkDomainPublic
+    out.visibility = types.v3Libp2pVisibilityPublic
+    out.priority = 100
+    out.secure = types.v3Libp2pSecureTls
+    out.mux = types.v3Libp2pMuxNone
+    out.hasPeerId = false
+
+fn v3Libp2pMultiaddrSetRoutingMeta(out: var types.V3Libp2pMultiaddr,
+                                   networkDomain: types.V3Libp2pNetworkDomainKind,
+                                   visibility: types.V3Libp2pVisibilityKind,
+                                   priority: int32) =
+    out.networkDomain = networkDomain
+    out.visibility = visibility
+    out.priority = priority
+
+fn v3Libp2pMultiaddrVisible(addr: types.V3Libp2pMultiaddr,
+                            trustedView: bool): bool =
+    if addr.visibility == types.v3Libp2pVisibilityPublic:
+        return true
+    if addr.visibility == types.v3Libp2pVisibilityTrustedOnly:
+        return trustedView
+    return false
+
+fn v3Libp2pMultiaddrEqual(left: types.V3Libp2pMultiaddr,
+                          right: types.V3Libp2pMultiaddr): bool =
+    if left.host != right.host:
+        return false
+    if left.port != right.port:
+        return false
+    if left.transport != right.transport:
+        return false
+    if left.networkDomain != right.networkDomain:
+        return false
+    if left.visibility != right.visibility:
+        return false
+    if left.secure != right.secure:
+        return false
+    if left.mux != right.mux:
+        return false
+    if left.priority != right.priority:
+        return false
+    return true
+
+fn v3Libp2pMultiaddrFillFromBytes(out: var types.V3Libp2pMultiaddr,
+                                  data: Bytes): Result[bool] =
+    let dataLen = bytesLen(data)
+    if dataLen <= 0:
+        return Err[bool]("v3 libp2p multiaddr: empty")
+    if bytesGet(data, 0) != int32('/'):
+        return Err[bool]("v3 libp2p multiaddr: must start with slash")
+    let hostProtoRes = v3Libp2pReadSegmentBytes(data, 1)
+    if IsErr(hostProtoRes):
+        return Err[bool](Error(hostProtoRes))
+    let hostProto = Value(hostProtoRes)
+    let hostProtoSeg = hostProto.seg
+    if hostProtoSeg != "ip4" && hostProtoSeg != "ip6" &&
+       hostProtoSeg != "dns" && hostProtoSeg != "dns4" &&
+       hostProtoSeg != "dns6" && hostProtoSeg != "dnsaddr":
+        return Err[bool]("v3 libp2p multiaddr: unsupported host protocol")
+    let hostRes = v3Libp2pReadSegmentBytes(data, hostProto.next)
+    if IsErr(hostRes):
+        return Err[bool]("v3 libp2p multiaddr: host missing")
+    let hostRead = Value(hostRes)
+    let transportProtoRes = v3Libp2pReadSegmentBytes(data, hostRead.next)
+    if IsErr(transportProtoRes):
+        return Err[bool]("v3 libp2p multiaddr: missing transport")
+    let transportProto = Value(transportProtoRes)
+    var port: int32
+    var transport = types.v3Libp2pTransportNone
+    var secure = types.v3Libp2pSecureNone
+    var mux = types.v3Libp2pMuxNone
+    var hasPeerId = false
+    var peerId: types.V3Libp2pPeerId
+    var idx = transportProto.next
+    if transportProto.seg == "tcp":
+        let tcpPortRes = v3Libp2pReadSegmentBytes(data, idx)
+        if IsErr(tcpPortRes):
+            return Err[bool]("v3 libp2p multiaddr: tcp port missing")
+        let tcpPort = Value(tcpPortRes)
+        let portRes = v3Libp2pParsePositiveI32(tcpPort.seg)
+        if IsErr(portRes):
+            return Err[bool](Error(portRes))
+        port = Value(portRes)
+        transport = types.v3Libp2pTransportTcp
+        secure = types.v3Libp2pSecureNoise
+        mux = types.v3Libp2pMuxYamux
+        idx = tcpPort.next
+    elif transportProto.seg == "udp":
+        let udpPortRes = v3Libp2pReadSegmentBytes(data, idx)
+        if IsErr(udpPortRes):
+            return Err[bool]("v3 libp2p multiaddr: udp port missing")
+        let udpPort = Value(udpPortRes)
+        let portRes = v3Libp2pParsePositiveI32(udpPort.seg)
+        if IsErr(portRes):
+            return Err[bool](Error(portRes))
+        port = Value(portRes)
+        idx = udpPort.next
+        if idx >= dataLen:
+            return Err[bool]("v3 libp2p multiaddr: missing quic transport")
+        let secureOrQuicRes = v3Libp2pReadSegmentBytes(data, idx)
+        if IsErr(secureOrQuicRes):
+            return Err[bool]("v3 libp2p multiaddr: missing quic transport")
+        var quicProto = Value(secureOrQuicRes)
+        idx = quicProto.next
+        if quicProto.seg == "tls":
+            if idx >= dataLen:
+                return Err[bool]("v3 libp2p multiaddr: missing quic transport")
+            let quicRes = v3Libp2pReadSegmentBytes(data, idx)
+            if IsErr(quicRes):
+                return Err[bool]("v3 libp2p multiaddr: missing quic transport")
+            quicProto = Value(quicRes)
+            idx = quicProto.next
+        if quicProto.seg != "quic" && quicProto.seg != "quic-v1":
+            return Err[bool]("v3 libp2p multiaddr: unsupported udp protocol")
+        transport = types.v3Libp2pTransportQuic
+        secure = types.v3Libp2pSecureTls
+        mux = types.v3Libp2pMuxNone
+    else:
+        return Err[bool]("v3 libp2p multiaddr: unsupported transport")
+    if idx < dataLen:
+        let peerProtoRes = v3Libp2pReadSegmentBytes(data, idx)
+        if IsErr(peerProtoRes):
+            return Err[bool](Error(peerProtoRes))
+        let peerProto = Value(peerProtoRes)
+        if peerProto.seg != "p2p" && peerProto.seg != "ipfs":
+            return Err[bool]("v3 libp2p multiaddr: unsupported trailing protocol")
+        let peerRes = v3Libp2pReadSegmentBytes(data, peerProto.next)
+        if IsErr(peerRes):
+            return Err[bool]("v3 libp2p multiaddr: peer id missing")
+        let peerRead = Value(peerRes)
+        let peerFillRes = peer_id.v3Libp2pPeerIdFillFromText(peerId, peerRead.seg)
+        if IsErr(peerFillRes):
+            return Err[bool](Error(peerFillRes))
+        hasPeerId = true
+        idx = peerRead.next
+    if idx < dataLen:
+        return Err[bool]("v3 libp2p multiaddr: unsupported trailing data")
+    out.raw = bytesToString(data)
+    out.encoded = data
+    out.host = hostRead.seg
+    out.port = port
+    out.transport = transport
+    out.networkDomain = types.v3Libp2pNetworkDomainPublic
+    out.visibility = types.v3Libp2pVisibilityPublic
+    out.priority = 100
+    out.secure = secure
+    out.mux = mux
+    out.hasPeerId = hasPeerId
+    out.peerId = peerId
+    return Ok[bool](true)
+
+fn v3Libp2pMultiaddrParseBytes(data: Bytes): Result[types.V3Libp2pMultiaddr] =
+    var out: types.V3Libp2pMultiaddr
+    let fillRes = v3Libp2pMultiaddrFillFromBytes(out, data)
+    if IsErr(fillRes):
+        return Err[types.V3Libp2pMultiaddr](Error(fillRes))
+    return Ok[types.V3Libp2pMultiaddr](out)
+
+fn v3Libp2pMultiaddrFillFromText(out: var types.V3Libp2pMultiaddr,
+                                 text: str): Result[bool] =
+    let encoded = bytesFromString(text)
+    return v3Libp2pMultiaddrFillFromBytes(out, encoded)
+
+fn v3Libp2pMultiaddrParse(text: str): Result[types.V3Libp2pMultiaddr] =
+    var out: types.V3Libp2pMultiaddr
+    let fillRes = v3Libp2pMultiaddrFillFromText(out, text)
+    if IsErr(fillRes):
+        return Err[types.V3Libp2pMultiaddr](Error(fillRes))
+    return Ok[types.V3Libp2pMultiaddr](out)
+
+fn v3Libp2pMultiaddrText(addr: types.V3Libp2pMultiaddr): str =
+    return addr.raw
+
+fn v3Libp2pMultiaddrClone(addr: types.V3Libp2pMultiaddr): types.V3Libp2pMultiaddr =
+    var out: types.V3Libp2pMultiaddr
+    out.raw = addr.raw
+    out.encoded = addr.encoded
+    out.host = addr.host
+    out.port = addr.port
+    out.transport = addr.transport
+    out.networkDomain = addr.networkDomain
+    out.visibility = addr.visibility
+    out.priority = addr.priority
+    out.secure = addr.secure
+    out.mux = addr.mux
+    out.hasPeerId = addr.hasPeerId
+    out.peerId = addr.peerId
+    return out

@@ -1,0 +1,136 @@
+import std/system
+import std/result
+import std/rawbytes
+import std/crypto/rsa
+import std/tls/x509
+import cheng/quic/tls/policy as qpolicy
+import cheng/quic/tls/test_pki as testpki
+
+fn main(): int32 =
+    assert(x509IntToString(840) == "840", "v3 quic tls policy: int 840")
+    assert(x509IntToString(113549) == "113549", "v3 quic tls policy: int 113549")
+    var kuRaw = bytesAlloc(2)
+    bytesSet(kuRaw, 0, 5)
+    bytesSet(kuRaw, 1, 0xa0)
+    let kuRawRes = x509ParseKeyUsage(kuRaw)
+    assert(IsOk(kuRawRes), "v3 quic tls policy: raw key usage parse")
+    assert(Value(kuRawRes) == 5, "v3 quic tls policy: raw key usage value")
+    let decodedCert: Bytes = testpki.msquicLocalhostCertDer()
+    assert(bytesLen(decodedCert) > 0, "v3 quic tls policy: decoded cert der")
+    assert(bytesLen(decodedCert) == testpki.msquicLocalhostCertDerPairCount,
+        "v3 quic tls policy: decoded cert len")
+    var decodedParsed: X509Certificate = initX509Certificate()
+    let decodedParseRes: Result[bool] = x509ParseCertificateInto(decodedParsed, decodedCert)
+    assert(IsOk(decodedParseRes), "v3 quic tls policy: decoded parse cert")
+    assert(decodedParsed.publicKey.kind == X509KeyRsa, "v3 quic tls policy: decoded parse rsa")
+    assert(decodedParsed.hasKeyUsage, "v3 quic tls policy: decoded has key usage")
+    assert(decodedParsed.keyUsage == 5, "v3 quic tls policy: decoded key usage")
+    assert(!decodedParsed.isCa, "v3 quic tls policy: decoded not ca")
+    assert(!decodedParsed.hasUnknownCritical, "v3 quic tls policy: decoded no unknown critical")
+    assert(decodedParsed.dnsNameCount > 0, "v3 quic tls policy: decoded has san dns")
+    assert(x509VerifyHostname(decodedParsed, "localhost"),
+        "v3 quic tls policy: decoded hostname")
+    let leafConstraintRes = x509VerifyLeafConstraints(decodedParsed)
+    if IsErr(leafConstraintRes):
+        panic(ErrorText(leafConstraintRes))
+    let tlsPolicy: qpolicy.MsQuicTlsPolicy = testpki.msquicMakeLocalhostTlsPolicy()
+    assert(tlsPolicy.serverName == "localhost", "v3 quic tls policy: server name")
+    assert(!tlsPolicy.allowInsecure, "v3 quic tls policy: insecure disabled")
+    assert(bytesLen(tlsPolicy.certChain0) > 0, "v3 quic tls policy: cert der")
+    assert(bytesLen(tlsPolicy.trustRoot0) > 0, "v3 quic tls policy: trust root")
+    assert(bytesLen(tlsPolicy.certPrivateKey) > 0, "v3 quic tls policy: private key")
+    assert(tlsPolicy.certLeafKeyKind == X509KeyRsa, "v3 quic tls policy: key kind")
+    var cert: X509Certificate = initX509Certificate()
+    let parseRes: Result[bool] = x509ParseCertificateInto(cert, tlsPolicy.certChain0)
+    if IsErr(parseRes):
+        panic(ErrorText(parseRes))
+    assert(cert.publicKey.kind == X509KeyRsa, "v3 quic tls policy: parse rsa")
+    assert(bytesLen(cert.subject) > 0, "v3 quic tls policy: parse subject")
+    assert(cert.hasKeyUsage, "v3 quic tls policy: policy has key usage")
+    assert(cert.keyUsage == 5, "v3 quic tls policy: policy key usage")
+    assert(!cert.isCa, "v3 quic tls policy: policy not ca")
+    assert(!cert.hasUnknownCritical, "v3 quic tls policy: policy no unknown critical")
+    assert(cert.dnsNameCount > 0, "v3 quic tls policy: policy has san dns")
+    assert(x509VerifyHostname(cert, "localhost"),
+        "v3 quic tls policy: policy hostname")
+    let privRes: Result[RsaBigPrivateKey] = rsaBigPrivateKeyFromBytes(tlsPolicy.certPrivateKey)
+    assert(IsOk(privRes), "v3 quic tls policy: parse private key")
+    let pubRes: Result[RsaBigPublicKey] = rsaBigPublicKeyFromParts(cert.publicKey.rsaN, cert.publicKey.rsaE)
+    assert(IsOk(pubRes), "v3 quic tls policy: parse public key")
+    let pub: RsaBigPublicKey = Value(pubRes)
+    let pssMsg: Bytes = bytesFromString("quic-rsa-pss-smoke")
+    let pkcs1SigRes: Result[Bytes] = rsaBigSignPkcs1(Value(privRes), pssMsg, false)
+    assert(IsOk(pkcs1SigRes), "v3 quic tls policy: pkcs1 sign")
+    let pkcs1VerifyRes: Result[bool] = rsaVerifyPkcs1Diag(pub, pssMsg, Value(pkcs1SigRes), false)
+    if IsErr(pkcs1VerifyRes):
+        panic(Error(pkcs1VerifyRes))
+    let pssSalt: Bytes = bytesFromString("0123456789abcdef0123456789abcdef")
+    let pssEmRes: Result[Bytes] = rsaBuildPssEncodedMessage(
+        pssMsg,
+        pssSalt,
+        Value(privRes).modBits,
+        Value(privRes).modLen,
+        false
+    )
+    if IsErr(pssEmRes):
+        panic(Error(pssEmRes))
+    let pssEncodedVerifyRes: Result[bool] = rsaVerifyPssEncodedMessageDiag(Value(pssEmRes), pssMsg, pub.modBits, false)
+    if IsErr(pssEncodedVerifyRes):
+        panic(Error(pssEncodedVerifyRes))
+    let pssSigRes: Result[Bytes] = rsaBigSignEm(Value(privRes), Value(pssEmRes))
+    assert(IsOk(pssSigRes), "v3 quic tls policy: pss sign em")
+    let pssEmDecryptRes: Result[Bytes] = rsaBigDecrypt(pub, Value(pssSigRes))
+    assert(IsOk(pssEmDecryptRes), "v3 quic tls policy: pss decrypt em")
+    assert(bytesEqual(Value(pssEmRes), Value(pssEmDecryptRes)),
+        "v3 quic tls policy: pss em roundtrip")
+    let pssVerifyRes: Result[bool] = rsaVerifyPssDiag(pub, pssMsg, Value(pssSigRes), false)
+    if IsErr(pssVerifyRes):
+        panic(Error(pssVerifyRes))
+    assert(Value(pssVerifyRes), "v3 quic tls policy: pss verify")
+    let randomPssSigRes: Result[Bytes] = rsaBigSignPss(Value(privRes), pssMsg, false)
+    assert(IsOk(randomPssSigRes), "v3 quic tls policy: random pss sign")
+    let randomPssVerifyRes: Result[bool] = rsaVerifyPssDiag(pub, pssMsg, Value(randomPssSigRes), false)
+    if IsErr(randomPssVerifyRes):
+        panic(Error(randomPssVerifyRes))
+    assert(Value(randomPssVerifyRes), "v3 quic tls policy: random pss verify")
+    let badPssMsg: Bytes = bytesFromString("quic-rsa-pss-smoke-bad")
+    assert(!rsaVerifyPss(pub, badPssMsg, Value(randomPssSigRes), false),
+        "v3 quic tls policy: pss reject bad message")
+    let certLeafRes = x509VerifyLeafConstraints(cert)
+    if IsErr(certLeafRes):
+        panic(ErrorText(certLeafRes))
+    let rootsRes: Result[X509CertList] = qpolicy.msquicTlsPolicyTrustRoots(tlsPolicy)
+    if IsErr(rootsRes):
+        panic("v3 quic tls policy: trust roots")
+    assert(Value(rootsRes).count == 1, "v3 quic tls policy: trust root count")
+    let root = Value(rootsRes).items[0]
+    let rootCaRes = x509VerifyCaConstraints(root)
+    assert(IsOk(rootCaRes), "v3 quic tls policy: trust root ca constraints")
+    let publicPolicy = testpki.msquicMakePublicTransportTlsPolicy("server.cheng-quic.internal")
+    assert(publicPolicy.serverName == "server.cheng-quic.internal",
+        "v3 quic tls policy: public server name")
+    assert(publicPolicy.certLeafKeyKind == X509KeyEcdsaP256,
+        "v3 quic tls policy: public key kind")
+    assert(bytesLen(publicPolicy.certPrivateKey) == testpki.msquicPublicTransportKeyPkcs8DerPairCount,
+        "v3 quic tls policy: public private key len")
+    var publicCert: X509Certificate = initX509Certificate()
+    let publicParseRes: Result[bool] = x509ParseCertificateInto(publicCert, publicPolicy.certChain0)
+    if IsErr(publicParseRes):
+        panic(ErrorText(publicParseRes))
+    assert(publicCert.extKeyUsageCount > 0,
+        "v3 quic tls policy: public has eku")
+    assert(publicCert.hasServerAuthEku,
+        "v3 quic tls policy: public server auth eku")
+    assert(x509VerifyHostname(publicCert, "server.cheng-quic.internal"),
+        "v3 quic tls policy: public exact hostname")
+    assert(x509VerifyHostname(publicCert, "relay.cheng-quic.internal"),
+        "v3 quic tls policy: public alt hostname")
+    assert(x509VerifyHostname(publicCert, "edge.cheng-quic.internal"),
+        "v3 quic tls policy: public wildcard hostname")
+    assert(!x509VerifyHostname(publicCert, "edge.sub.cheng-quic.internal"),
+        "v3 quic tls policy: public reject deep wildcard")
+    let publicLeafRes = x509VerifyLeafConstraints(publicCert)
+    if IsErr(publicLeafRes):
+        panic(ErrorText(publicLeafRes))
+    echo("v3 quic_tls_policy_smoke ok")
+    return 0

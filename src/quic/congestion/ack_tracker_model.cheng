@@ -1,0 +1,140 @@
+# MsQuic ACK tracker model.
+
+import cheng/quic/congestion/common
+
+const
+    maxAckRanges = 64
+
+type
+    AckTrackerInsertResult =
+        changed: bool
+        count: int32
+
+    AckTrackerModel =
+        recvCount: int32
+        ackCount: int32
+        # Keep ranges in primitive parallel arrays so stage3 lowering stays stable.
+        packetNumbersReceivedFirst: int64[maxAckRanges]
+        packetNumbersReceivedLast: int64[maxAckRanges]
+        packetNumbersToAckFirst: int64[maxAckRanges]
+        packetNumbersToAckLast: int64[maxAckRanges]
+        receivedEcn: common.AckEcnSummary
+        largestPacketNumberAcked: int64
+        largestPacketNumberRecvTime: int64
+        counters: common.AckTrackerCounters
+
+fn ackTrackerInit(): AckTrackerModel =
+    var tracker: AckTrackerModel
+    tracker.recvCount = 0
+    tracker.ackCount = 0
+    tracker.receivedEcn = common.AckEcnSummary(ect0Count: 0, ect1Count: 0, ceCount: 0)
+    tracker.largestPacketNumberAcked = 0
+    tracker.largestPacketNumberRecvTime = 0
+    tracker.counters = common.AckTrackerCounters(
+        ackElicitingPacketsToAck: 0,
+        alreadyWrittenAckFrame: false,
+        nonZeroRecvEcn: false
+    )
+    return tracker
+
+fn ackTrackerAppendRange(firsts: var int64[maxAckRanges],
+                         lasts: var int64[maxAckRanges],
+                         count: int32,
+                         first: int64,
+                         last: int64): int32 =
+    if count < maxAckRanges:
+        firsts[count] = first
+        lasts[count] = last
+        return count + 1
+    var shift: int32 = 1
+    while shift < count:
+        firsts[shift - 1] = firsts[shift]
+        lasts[shift - 1] = lasts[shift]
+        shift = shift + 1
+    firsts[count - 1] = first
+    lasts[count - 1] = last
+    return count
+
+fn ackTrackerInsertRange(firsts: var int64[maxAckRanges],
+                         lasts: var int64[maxAckRanges],
+                         count: int32,
+                         packetNumber: int64): AckTrackerInsertResult =
+    var out: AckTrackerInsertResult
+    out.changed = true
+    var mergedFirst: int64 = packetNumber
+    var mergedLast: int64 = packetNumber
+    var inserted: bool
+    var tempCount: int32
+    var tempFirsts: int64[maxAckRanges]
+    var tempLasts: int64[maxAckRanges]
+    var i: int32
+    while i < count:
+        let currentFirst: int64 = firsts[i]
+        let currentLast: int64 = lasts[i]
+        if currentLast + 1 < mergedFirst:
+            tempCount = ackTrackerAppendRange(tempFirsts, tempLasts, tempCount, currentFirst, currentLast)
+        elif currentFirst - 1 > mergedLast:
+            if !inserted:
+                tempCount = ackTrackerAppendRange(tempFirsts, tempLasts, tempCount, mergedFirst, mergedLast)
+                inserted = true
+            tempCount = ackTrackerAppendRange(tempFirsts, tempLasts, tempCount, currentFirst, currentLast)
+        else:
+            if packetNumber >= currentFirst && packetNumber <= currentLast:
+                out.changed = false
+            if currentFirst < mergedFirst:
+                mergedFirst = currentFirst
+            if currentLast > mergedLast:
+                mergedLast = currentLast
+        i = i + 1
+    if !inserted:
+        tempCount = ackTrackerAppendRange(tempFirsts, tempLasts, tempCount, mergedFirst, mergedLast)
+    var copyIndex: int32
+    while copyIndex < tempCount:
+        firsts[copyIndex] = tempFirsts[copyIndex]
+        lasts[copyIndex] = tempLasts[copyIndex]
+        copyIndex = copyIndex + 1
+    out.count = tempCount
+    return out
+
+fn ackTrackerTrackIncomingPacket(tracker: var AckTrackerModel, packetNumber: int64): bool =
+    let res = ackTrackerInsertRange(tracker.packetNumbersReceivedFirst,
+                                    tracker.packetNumbersReceivedLast,
+                                    tracker.recvCount,
+                                    packetNumber)
+    tracker.recvCount = res.count
+    return !res.changed
+
+fn ackTrackerMarkForAck(tracker: var AckTrackerModel,
+                        packetNumber: int64,
+                        recvTimeUs: int64,
+                        ackType: common.AckType,
+                        ackDelayMs: int32) =
+    let res = ackTrackerInsertRange(tracker.packetNumbersToAckFirst,
+                                    tracker.packetNumbersToAckLast,
+                                    tracker.ackCount,
+                                    packetNumber)
+    tracker.ackCount = res.count
+    if res.changed:
+        tracker.counters.ackElicitingPacketsToAck = tracker.counters.ackElicitingPacketsToAck + 1
+        if packetNumber > tracker.largestPacketNumberAcked:
+            tracker.largestPacketNumberAcked = packetNumber
+            tracker.largestPacketNumberRecvTime = recvTimeUs
+    if ackType == common.ackTypeAckImmediate || ackDelayMs == 0:
+        tracker.counters.alreadyWrittenAckFrame = false
+
+fn ackTrackerShouldSendAck(tracker: AckTrackerModel,
+                           packetTolerance: int32,
+                           ackType: common.AckType,
+                           reordered: bool): bool =
+    if ackType == common.ackTypeAckImmediate:
+        return true
+    if tracker.counters.ackElicitingPacketsToAck >= packetTolerance:
+        return true
+    if reordered:
+        return true
+    return false
+
+fn ackTrackerClearToAck(tracker: var AckTrackerModel) =
+    tracker.ackCount = 0
+    tracker.counters.ackElicitingPacketsToAck = 0
+    tracker.counters.alreadyWrittenAckFrame = true

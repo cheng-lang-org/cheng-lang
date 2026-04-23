@@ -1,0 +1,237 @@
+import std/rawbytes
+import std/strutils as strutil
+import cheng/std/bytes_layout as layout
+import cheng/apps/chain_node/cheng_node as node
+import cheng/apps/chain_node/cheng_node_identity as identity
+import cheng/apps/chain_node/cheng_node_index as cindex
+import cheng/apps/chain_node/cheng_node_ctl_main as ctl
+import cheng/apps/chain_node/cheng_node_compiler_domain as compiler_domain
+import cheng/core/tooling/compiler_world as cworld
+import cheng/moq/moq_fountain as moq
+
+fn main(): int32 =
+    let identityRes = identity.V3ChengNodeIdentityDerive("cheng-node-smoke-root")
+    assert(IsOk(identityRes), "cheng_node core smoke: identity derive")
+    let id = Value(identityRes)
+    assert(identity.v3ChengNodeIdentityDomainCount() == 10, "cheng_node core smoke: identity domain count")
+    assert(!layout.fixedBytes32Equal(id.chainKey, id.didKey), "cheng_node core smoke: chain/did distinct")
+    assert(!layout.fixedBytes32Equal(id.compilerKey, id.adminKey), "cheng_node core smoke: compiler/admin distinct")
+    assert(!layout.fixedBytes32Equal(id.evomapKey, id.adminKey), "cheng_node core smoke: evomap/admin distinct")
+    let nodeRes = node.V3ChengNodeInit("cheng-node-smoke-root")
+    assert(IsOk(nodeRes), "cheng_node core smoke: init")
+    var core = Value(nodeRes)
+    assert(node.V3ChengNodeRequiredIndexCount(core) == 13, "cheng_node core smoke: required indexes")
+    assert(node.V3ChengNodeCapabilityActorCount(core) == 12, "cheng_node core smoke: actor count")
+
+    let compilerSourceCid = node.v3ChengNodeHashTextCid("compiler-source", "pkg://cheng/demo")
+    let compilerCsgCid = node.v3ChengNodeHashTextCid("compiler-csg", "demo")
+    let compilerExportCid = node.v3ChengNodeHashTextCid("compiler-export", "demo")
+    let compilerSyntaxCid = node.v3ChengNodeHashTextCid("compiler-syntax", "demo")
+    let emptyDepsManifestCid = cworld.v3CompilerWorldEmptyManifestCid("stable")
+    let pkg = cworld.v3CompilerPackageSnapshotMake("pkg://cheng/demo",
+                                                   "stable",
+                                                   compilerSourceCid,
+                                                   compilerCsgCid,
+                                                   compilerExportCid,
+                                                   compilerSyntaxCid,
+                                                   layout.FixedBytes32(),
+                                                   layout.FixedBytes32(),
+                                                   layout.FixedBytes32(),
+                                                   emptyDepsManifestCid,
+                                                   layout.FixedBytes32(),
+                                                   "stage3_local")
+    let pkgProofRes = node.V3ChengNodeAnchorCompilerPackage(core, pkg)
+    assert(IsOk(pkgProofRes), "cheng_node core smoke: compiler package anchor")
+    let pkgEntryRes = cindex.V3ChengNodeIndexGet(core.indices, "compiler", "package", pkg.packageId)
+    assert(IsOk(pkgEntryRes), "cheng_node core smoke: compiler package query")
+    let pkgQueryRes = node.V3ChengNodeKeyedQueryText(core,
+                                                     "compiler",
+                                                     "package",
+                                                     pkg.packageId,
+                                                     false)
+    assert(IsOk(pkgQueryRes), "cheng_node core smoke: compiler package proof query")
+    let pkgQueryText = Value(pkgQueryRes)
+    assert(strutil.Contains(pkgQueryText, "payload_present=1"),
+           "cheng_node core smoke: compiler package payload")
+    assert(strutil.Contains(pkgQueryText, "payload_text_hex="),
+           "cheng_node core smoke: compiler package report text")
+
+    let manifestRes = cworld.v3CompilerUniverseManifestMake("stable",
+                                                            [cworld.v3CompilerUniverseManifestEntryMake(pkg.packageId,
+                                                                                                       pkg.snapshotCid,
+                                                                                                       pkg.syntaxSurfaceCid,
+                                                                                                       pkg.migrationProofCid)])
+    assert(IsOk(manifestRes), "cheng_node core smoke: compiler manifest make")
+    let worldHead = cworld.v3CompilerWorldHeadMake("stable",
+                                                   1,
+                                                   layout.FixedBytes32(),
+                                                   Value(manifestRes),
+                                                   compilerCsgCid,
+                                                   pkg.snapshotCid,
+                                                   pkg.snapshotCid,
+                                                   pkg.snapshotCid,
+                                                   "stage3_local")
+    let worldProofRes = node.V3ChengNodeAnchorCompilerWorldHead(core, worldHead)
+    assert(IsOk(worldProofRes), "cheng_node core smoke: compiler world head anchor")
+    let worldEntryRes = cindex.V3ChengNodeIndexGet(core.indices,
+                                                   "compiler",
+                                                   "world_head",
+                                                   layout.fixedBytes32Hex(worldHead.headCid))
+    assert(IsOk(worldEntryRes), "cheng_node core smoke: compiler world head query")
+
+    let balanceKey = cindex.v3ChengNodeBalanceKey(1, 42)
+    let balanceCidA = node.v3ChengNodeHashTextCid("balance", "10")
+    let balanceCidB = node.v3ChengNodeHashTextCid("balance", "25")
+    let balanceProofA = node.V3ChengNodeAnchorIndexedObject(core,
+                                                            "chain",
+                                                            "balance",
+                                                            "asset_account",
+                                                            balanceKey,
+                                                            "balance_cell",
+                                                            balanceCidA)
+    assert(IsOk(balanceProofA), "cheng_node core smoke: balance create")
+    let balanceProofB = node.V3ChengNodeAnchorIndexedObject(core,
+                                                            "chain",
+                                                            "balance",
+                                                            "asset_account",
+                                                            balanceKey,
+                                                            "balance_cell",
+                                                            balanceCidB)
+    assert(IsOk(balanceProofB), "cheng_node core smoke: balance update")
+    let balanceEntryRes = cindex.V3ChengNodeIndexGet(core.indices,
+                                                     "balance",
+                                                     "asset_account",
+                                                     balanceKey)
+    assert(IsOk(balanceEntryRes), "cheng_node core smoke: balance query")
+    assert(layout.fixedBytes32Equal(Value(balanceEntryRes).valueCid, balanceCidB),
+           "cheng_node core smoke: balance latest cid")
+    let balanceDropRes = node.V3ChengNodeTombstoneIndexedObject(core,
+                                                                "chain",
+                                                                "balance",
+                                                                "asset_account",
+                                                                balanceKey)
+    assert(IsOk(balanceDropRes), "cheng_node core smoke: balance delete")
+    let balanceGoneRes = cindex.V3ChengNodeIndexGet(core.indices,
+                                                    "balance",
+                                                    "asset_account",
+                                                    balanceKey)
+    assert(IsErr(balanceGoneRes), "cheng_node core smoke: balance tombstoned")
+
+    let moqBuildRes = moq.v3Libp2pMoqBuild(bytesFromString("moq-fountain-smoke"),
+                                           "peer-alpha",
+                                           "peer-bravo,peer-charlie",
+                                           "video/mp4",
+                                           8,
+                                           4,
+                                           2)
+    assert(IsOk(moqBuildRes), "cheng_node core smoke: moq build")
+    let moqProofRes = node.V3ChengNodeAnchorMoqBuild(core, Value(moqBuildRes))
+    assert(IsOk(moqProofRes), "cheng_node core smoke: moq anchor")
+    let moqTopicEntryRes = cindex.V3ChengNodeIndexGet(core.indices,
+                                                      "discovery",
+                                                      "topic",
+                                                      Value(moqBuildRes).catalogKey)
+    assert(IsOk(moqTopicEntryRes), "cheng_node core smoke: moq topic query")
+    let moqCapabilityEntryRes = cindex.V3ChengNodeIndexGet(core.indices,
+                                                           "discovery",
+                                                           "capability",
+                                                           "content.moq_fountain")
+    assert(IsOk(moqCapabilityEntryRes), "cheng_node core smoke: moq capability query")
+
+    let usageText = ctl.v3ChengNodeCtlUsageText()
+    assert(strutil.Contains(usageText, "usage: cheng_node_main <command> [flags]"),
+           "cheng_node core smoke: main usage")
+    assert(strutil.Contains(usageText, "compat: cheng_node_main ctl <command> [flags]"),
+           "cheng_node core smoke: compat usage")
+    assert(strutil.Contains(usageText, "required-surface"), "cheng_node core smoke: command usage")
+    assert(strutil.Contains(usageText, "libp2p surface"), "cheng_node core smoke: libp2p surface usage")
+    assert(strutil.Contains(usageText, "libp2p announce"), "cheng_node core smoke: libp2p announce usage")
+    assert(strutil.Contains(usageText, "libp2p discover"), "cheng_node core smoke: libp2p discover usage")
+    assert(strutil.Contains(usageText, "libp2p stream"), "cheng_node core smoke: libp2p stream usage")
+    assert(strutil.Contains(usageText, "oracle submit"), "cheng_node core smoke: oracle usage")
+    assert(strutil.Contains(usageText, "evomap status"), "cheng_node core smoke: evomap usage")
+    assert(!strutil.Contains(usageText, "oracle-submit"), "cheng_node core smoke: no old oracle command")
+    assert(!strutil.Contains(usageText, "vpn-peer"), "cheng_node core smoke: no old vpn command")
+    assert(!strutil.Contains(usageText, "evomap-status"), "cheng_node core smoke: no old evomap command")
+    assert(!strutil.Contains(usageText, "chain-init"), "cheng_node core smoke: no old chain init command")
+    assert(!strutil.Contains(usageText, "chain-mint"), "cheng_node core smoke: no old chain mint command")
+    assert(!strutil.Contains(usageText, "chain-transfer"), "cheng_node core smoke: no old chain transfer command")
+    assert(!strutil.Contains(usageText, "chain-balance"), "cheng_node core smoke: no old chain balance command")
+    assert(!strutil.Contains(usageText, "chain-show-state"), "cheng_node core smoke: no old chain state command")
+    assert(!strutil.Contains(usageText, "chain-dump-snapshot"), "cheng_node core smoke: no old chain snapshot command")
+    assert(!strutil.Contains(usageText, "chain-daemon-serve"), "cheng_node core smoke: no old chain serve command")
+    assert(!strutil.Contains(usageText, "chain-daemon-sync"), "cheng_node core smoke: no old chain sync command")
+    assert(strutil.Contains(usageText, "chain init"), "cheng_node core smoke: chain init usage")
+    assert(strutil.Contains(usageText, "chain state show"), "cheng_node core smoke: chain state usage")
+    assert(strutil.Contains(usageText, "chain daemon serve"), "cheng_node core smoke: chain daemon usage")
+    assert(strutil.Contains(usageText, "compiler <subcommand> [args]"),
+           "cheng_node core smoke: compiler domain usage")
+    let compilerUsageText = compiler_domain.v3ChengNodeCompilerUsageText()
+    assert(strutil.Contains(compilerUsageText, "compiler system-link-exec"),
+           "cheng_node core smoke: compiler system-link-exec usage")
+    assert(strutil.Contains(compilerUsageText, "compiler debug-report"),
+           "cheng_node core smoke: compiler debug-report usage")
+    assert(strutil.Contains(compilerUsageText, "compiler print-object"),
+           "cheng_node core smoke: compiler print-object usage")
+    assert(strutil.Contains(compilerUsageText, "compiler profile-report"),
+           "cheng_node core smoke: compiler profile-report usage")
+    assert(strutil.Contains(compilerUsageText, "compiler crash-report"),
+           "cheng_node core smoke: compiler crash-report usage")
+    assert(strutil.Contains(compilerUsageText, "compiler verify-world"),
+           "cheng_node core smoke: compiler verify-world usage")
+    assert(strutil.Contains(compilerUsageText, "compiler materialize-world-mirrors"),
+           "cheng_node core smoke: compiler materialize-world-mirrors usage")
+    assert(strutil.Contains(compilerUsageText, "compiler publish-world"),
+           "cheng_node core smoke: compiler publish-world usage")
+    assert(strutil.Contains(compilerUsageText, "compiler prove-migration"),
+           "cheng_node core smoke: compiler prove-migration usage")
+    assert(strutil.Contains(compilerUsageText, "compiler follow-world"),
+           "cheng_node core smoke: compiler follow-world usage")
+    assert(strutil.Contains(compilerUsageText, "compiler follow-world --bundle-prefix"),
+           "cheng_node core smoke: compiler follow-world bundle-prefix usage")
+    assert(strutil.Contains(compilerUsageText, "compiler selfhost-build"),
+           "cheng_node core smoke: compiler selfhost-build usage")
+    let compilerSurfaceText = compiler_domain.V3ChengNodeCompilerSurfaceText()
+    assert(strutil.Contains(compilerSurfaceText, "system_link_exec_command=1"),
+           "cheng_node core smoke: compiler system-link-exec surface")
+    assert(strutil.Contains(compilerSurfaceText, "debug_report_command=1"),
+           "cheng_node core smoke: compiler debug-report surface")
+    assert(strutil.Contains(compilerSurfaceText, "print_object_command=1"),
+           "cheng_node core smoke: compiler print-object surface")
+    assert(strutil.Contains(compilerSurfaceText, "profile_report_command=1"),
+           "cheng_node core smoke: compiler profile-report surface")
+    assert(strutil.Contains(compilerSurfaceText, "crash_report_command=1"),
+           "cheng_node core smoke: compiler crash-report surface")
+    assert(strutil.Contains(compilerSurfaceText, "verify_world_command=1"),
+           "cheng_node core smoke: compiler verify-world surface")
+    assert(strutil.Contains(compilerSurfaceText, "materialize_world_mirrors_command=1"),
+           "cheng_node core smoke: compiler materialize-world-mirrors surface")
+    assert(strutil.Contains(compilerSurfaceText, "publish_world_command=1"),
+           "cheng_node core smoke: compiler publish-world surface")
+    assert(strutil.Contains(compilerSurfaceText, "prove_migration_command=1"),
+           "cheng_node core smoke: compiler prove-migration surface")
+    assert(strutil.Contains(compilerSurfaceText, "follow_world_command=1"),
+           "cheng_node core smoke: compiler follow-world surface")
+    assert(strutil.Contains(compilerSurfaceText, "selfhost_build_command=1"),
+           "cheng_node core smoke: compiler selfhost-build surface")
+    let bridgePath = compiler_domain.V3ChengNodeCompilerBridgeCompilerPathNoHandoff(".")
+    assert(len(bridgePath) > 0, "cheng_node core smoke: no-handoff bridge path")
+    assert(strutil.Contains(bridgePath, "artifacts/bootstrap/cheng.stage3"),
+           "cheng_node core smoke: no-handoff prefers stage3")
+    let bootstrapTextRes = ctl.v3ChengNodeCtlBootstrapText("cheng-node-smoke-root")
+    assert(IsOk(bootstrapTextRes), "cheng_node core smoke: bootstrap")
+    let bootstrapText = Value(bootstrapTextRes)
+    assert(strutil.Contains(bootstrapText, "actor_count=12"), "cheng_node core smoke: actor count")
+    assert(strutil.Contains(bootstrapText, "required_index_count=13"), "cheng_node core smoke: index count")
+    let libp2pSurfaceRes = ctl.v3ChengNodeCtlLibp2pSurfaceText("cheng-node-smoke-root",
+                                                               "/tmp/cheng_node_core_smoke_libp2p.state")
+    assert(IsOk(libp2pSurfaceRes), "cheng_node core smoke: libp2p surface")
+    let libp2pSurfaceText = Value(libp2pSurfaceRes)
+    assert(strutil.Contains(libp2pSurfaceText, "supported_transports=tcp,quic,webrtc"),
+           "cheng_node core smoke: libp2p transports")
+    assert(strutil.Contains(libp2pSurfaceText, "supported_protocols=identify,store,sync,ingress,webrtc_signal,content,proxy_tcp"),
+           "cheng_node core smoke: libp2p protocols")
+    assert(strutil.Contains(libp2pSurfaceText, "stream_protocols=identify,sync,store,content,proxy_tcp"),
+           "cheng_node core smoke: libp2p stream protocols")
+    echo("v3 cheng_node_core_smoke ok")
+    return 0

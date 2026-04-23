@@ -1,0 +1,86 @@
+import std/os
+import std/result
+import cheng/core/tooling/path as v3path
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/compiler_world_libp2p as cwlp
+import cheng/core/tooling/compiler_world as cworld
+import cheng/core/backend/system_link_exec as sexec
+import cheng/std/bytes_layout as layout
+import cheng/chain/pubsub
+import cheng/libp2p/core/types as core
+import cheng/libp2p/core/multiaddr
+import cheng/libp2p/host/host
+
+fn compilerWorldSmokePortBase(label: str): int32 =
+    var acc: int32
+    for i in 0..<label.len:
+        acc = (acc + (int32(label[i]) & 255)) % 200
+    return 6461 + (acc * 2)
+
+fn main(): int32 =
+    let workspaceRoot = v3path.V3PathCurrentDir()
+    let packageRoot = workspaceRoot
+    let smokeLabel: str = os.GetEnvDefault("CHENG_SMOKE_LABEL", "host")
+    let outDir: str = v3path.V3PathJoin(workspaceRoot, "artifacts/compiler_world_libp2p/" + smokeLabel)
+    let portBase: int32 = compilerWorldSmokePortBase(smokeLabel)
+    assert(v3path.V3MkdirP(workspaceRoot, outDir), "v3 compiler world libp2p: mkdir")
+    let sourcePath = v3path.V3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
+    let outputPath = v3path.V3PathJoin(outDir, "program_selfhost_smoke")
+    let req = creq.v3CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.v3EmitExe,
+        ""
+    )
+    let planRes = sexec.v3BuildSystemLinkExecPlan(workspaceRoot, req)
+    assert(IsOk(planRes), "v3 compiler world libp2p: build plan")
+    let plan = Value(planRes)
+    var seedHost = host.v3Libp2pHostInit("compiler-world-seed")
+    var syncHost = host.v3Libp2pHostInit("compiler-world-sync")
+    cwlp.v3CompilerWorldRegister(seedHost)
+    cwlp.v3CompilerWorldRegister(syncHost)
+    var seedAddr: core.V3Libp2pMultiaddr
+    var syncAddr: core.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillTcp(seedAddr, "127.0.0.1", portBase)
+    multiaddr.v3Libp2pMultiaddrFillTcp(syncAddr, "127.0.0.1", portBase + 1)
+    let seedListenRes = host.v3Libp2pListen(seedHost, seedAddr)
+    assert(IsOk(seedListenRes), "v3 compiler world libp2p: seed listen")
+    let syncListenRes = host.v3Libp2pListen(syncHost, syncAddr)
+    assert(IsOk(syncListenRes), "v3 compiler world libp2p: sync listen")
+    let dialSeedRes = host.v3Libp2pDial(syncHost, seedHost.selfPeerId, seedAddr, 1)
+    assert(IsOk(dialSeedRes), "v3 compiler world libp2p: dial seed")
+    let dialSyncRes = host.v3Libp2pDial(seedHost, syncHost.selfPeerId, syncAddr, 1)
+    assert(IsOk(dialSyncRes), "v3 compiler world libp2p: dial sync")
+    cwlp.v3CompilerWorldPublishUniverse(seedHost,
+                                        plan.localUniverse,
+                                        plan.compilerCsg,
+                                        plan.exportSurface,
+                                        plan.compileReceipt)
+    let syncRes = cwlp.v3CompilerWorldSync(syncHost, seedHost, seedHost.selfPeerId)
+    assert(IsOk(syncRes), "v3 compiler world libp2p: sync")
+    assert(cwlp.v3CompilerWorldStoredEntryCount(seedHost) == 8, "v3 compiler world libp2p: seed count")
+    assert(cwlp.v3CompilerWorldStoredEntryCount(syncHost) == 8, "v3 compiler world libp2p: sync count")
+    assert(cwlp.v3CompilerWorldPublishedHeadCount(seedHost) == 1, "v3 compiler world libp2p: published head")
+    assert(Value(syncRes) == 8, "v3 compiler world libp2p: synced entries")
+    var worldText = ""
+    assert(cwlp.v3CompilerWorldFirstPayloadTextByKind(syncHost,
+                                                      pubsub.v3PubSubPayloadKindCompilerWorldHead,
+                                                      worldText),
+           "v3 compiler world libp2p: synced head text")
+    var manifestText = ""
+    assert(cwlp.v3CompilerWorldFirstPayloadTextByKind(syncHost,
+                                                      pubsub.v3PubSubPayloadKindCompilerUniverseManifest,
+                                                      manifestText),
+           "v3 compiler world libp2p: synced manifest text")
+    var parsedManifest: cworld.V3CompilerUniverseManifest
+    let parseManifestRes = cworld.v3CompilerUniverseManifestFromReportText(manifestText, parsedManifest)
+    assert(IsOk(parseManifestRes), "v3 compiler world libp2p: parse manifest")
+    assert(v3path.V3TextContains(worldText, "head_cid="), "v3 compiler world libp2p: head field")
+    assert(v3path.V3TextContains(worldText, layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid)),
+           "v3 compiler world libp2p: synced head cid")
+    assert(layout.fixedBytes32Equal(parsedManifest.manifestCid, plan.localUniverse.manifest.manifestCid),
+           "v3 compiler world libp2p: synced manifest cid")
+    echo("v3 compiler_world_libp2p_smoke ok")
+    return 0

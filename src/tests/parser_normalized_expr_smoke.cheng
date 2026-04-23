@@ -1,0 +1,480 @@
+import std/os
+import std/strutils as strutil
+import cheng/core/lang/parser
+import cheng/core/tooling/path as v3path
+
+fn parserNormalizedExprFixturePath(): str =
+    return v3path.V3PathJoin(v3path.V3PathCurrentDir(),
+                             "src/tests/parser_normalized_expr_fixture.cheng")
+
+fn parserNormalizedExprFixtureLine(fixtureLines: str[], lineNumber: int32): str =
+    if lineNumber <= 0 || lineNumber > fixtureLines.len:
+        return ""
+    return fixtureLines[lineNumber - 1]
+
+fn assertFixtureLayerSummary(layer: parser.V3NormalizedExprLayer) =
+    assert(layer.sourceCount == 1, "v3 parser normalized expr: source count")
+    assert(parser.v3NormalizedExprLayerExprCount(layer) == 21, "v3 parser normalized expr: expr count")
+    assert(parser.v3NormalizedExprLayerIfCount(layer) == 4, "v3 parser normalized expr: if count")
+    assert(parser.v3NormalizedExprLayerRangeCount(layer) == 2, "v3 parser normalized expr: range count")
+    assert(parser.v3NormalizedExprLayerComprehensionCount(layer) == 1, "v3 parser normalized expr: comprehension count")
+    assert(parser.v3NormalizedExprLayerStrFormatCount(layer) == 3, "v3 parser normalized expr: fmt count")
+    assert(parser.v3NormalizedExprLayerResultIntrinsicCount(layer) == 3, "v3 parser normalized expr: result intrinsic count")
+    assert(parser.v3NormalizedExprLayerCallCount(layer) == 3, "v3 parser normalized expr: call count")
+    assert(parser.v3NormalizedExprLayerTryCount(layer) == 1, "v3 parser normalized expr: try count")
+    assert(parser.v3NormalizedExprLayerDefaultInitCount(layer) == 2, "v3 parser normalized expr: default init count")
+    assert(parser.v3NormalizedExprLayerConstructorCount(layer) == 2, "v3 parser normalized expr: constructor count")
+    assert(layer.questionResidualCount == 0, "v3 parser normalized expr: question normalized")
+    assert(layer.exprs[0].exprId != "", "v3 parser normalized expr: expr id")
+    assert(layer.exprs[0].endLineNumber == layer.exprs[0].lineNumber, "v3 parser normalized expr: same line span")
+    assert(layer.exprs[0].endColumnNumber >= layer.exprs[0].columnNumber, "v3 parser normalized expr: end column")
+    assert(parser.v3NormalizedExprLayerHasExprExact(layer,
+                                                    parser.v3NormalizedExprIf,
+                                                    parser.v3NormalizedExprDetailIfTernary,
+                                                    7),
+           "v3 parser normalized expr: ternary normalized to if")
+    assert(parser.v3NormalizedExprLayerHasExprExact(layer,
+                                                    parser.v3NormalizedExprTry,
+                                                    parser.v3NormalizedExprDetailTryPostfixQuestion,
+                                                    10),
+           "v3 parser normalized expr: postfix question normalized")
+    assert(parser.v3NormalizedExprLayerHasExprExact(layer,
+                                                    parser.v3NormalizedExprRange,
+                                                    parser.v3NormalizedExprDetailRangeExclusive,
+                                                    11),
+           "v3 parser normalized expr: exclusive range")
+    assert(parser.v3NormalizedExprLayerHasExprExact(layer,
+                                                    parser.v3NormalizedExprComprehension,
+                                                    parser.v3NormalizedExprDetailComprehensionList,
+                                                    14),
+           "v3 parser normalized expr: comprehension")
+    assert(parser.v3NormalizedExprLayerHasExprExact(layer,
+                                                    parser.v3NormalizedExprResultIntrinsic,
+                                                    parser.v3NormalizedExprDetailResultErr,
+                                                    19),
+           "v3 parser normalized expr: result intrinsic")
+    assert(parser.v3NormalizedExprLayerHasCallExpr(layer, parser.v3NormalizedExprSurfaceCallImportc, 16),
+           "v3 parser normalized expr: importc call")
+    assert(parser.v3NormalizedExprLayerHasCallExpr(layer, parser.v3NormalizedExprSurfaceCallLocal, 17),
+           "v3 parser normalized expr: local call")
+    assert(parser.v3NormalizedExprLayerHasCallExpr(layer, parser.v3NormalizedExprSurfaceCallMember, 18),
+           "v3 parser normalized expr: member call")
+    assert(parser.v3NormalizedExprLayerHasExprExact(layer,
+                                                    parser.v3NormalizedExprDefaultInit,
+                                                    parser.v3NormalizedExprDetailNone,
+                                                    30),
+           "v3 parser normalized expr: object default init")
+    assert(parser.v3NormalizedExprLayerHasExprExact(layer,
+                                                    parser.v3NormalizedExprDefaultInit,
+                                                    parser.v3NormalizedExprDetailNone,
+                                                    31),
+           "v3 parser normalized expr: tuple default init")
+    assert(parser.v3NormalizedExprLayerHasConstructorExpr(layer, 34),
+           "v3 parser normalized expr: object constructor")
+    assert(parser.v3NormalizedExprLayerHasConstructorExpr(layer, 35),
+           "v3 parser normalized expr: tuple constructor")
+
+fn assertFixtureRangeAndFmtShapes(layer: parser.V3NormalizedExprLayer,
+                                  fixtureLines: str[]) =
+    var sawExclusiveRangeShape = false
+    var sawInclusiveRangeShape = false
+    var sawFmtLiteralShape = false
+    var sawFmtArrayCallShape = false
+    var sawFmtParenCallShape = false
+    var sawComprehensionShape = false
+    for i in 0..<layer.exprs.len:
+        let expr = layer.exprs[i]
+        let lineRaw = parserNormalizedExprFixtureLine(fixtureLines, expr.lineNumber)
+        if expr.kind == parser.v3NormalizedExprRange && expr.lineNumber == 11:
+            var startExpr = ""
+            var endExpr = ""
+            var endInclusive = false
+            assert(parser.v3ParserParseRangeExprAt(lineRaw,
+                                                   expr.columnNumber - 1,
+                                                   startExpr,
+                                                   endExpr,
+                                                   endInclusive),
+                   "v3 parser normalized expr: parse exclusive range")
+            assert(startExpr == "0", "v3 parser normalized expr: exclusive range start")
+            assert(endExpr == "4", "v3 parser normalized expr: exclusive range end")
+            assert(!endInclusive, "v3 parser normalized expr: exclusive range flag")
+            sawExclusiveRangeShape = true
+            continue
+        if expr.kind == parser.v3NormalizedExprRange && expr.lineNumber == 12:
+            var startExpr = ""
+            var endExpr = ""
+            var endInclusive = false
+            assert(parser.v3ParserParseRangeExprAt(lineRaw,
+                                                   expr.columnNumber - 1,
+                                                   startExpr,
+                                                   endExpr,
+                                                   endInclusive),
+                   "v3 parser normalized expr: parse inclusive range")
+            assert(startExpr == "1", "v3 parser normalized expr: inclusive range start")
+            assert(endExpr == "5", "v3 parser normalized expr: inclusive range end")
+            assert(endInclusive, "v3 parser normalized expr: inclusive range flag")
+            sawInclusiveRangeShape = true
+            continue
+        if expr.kind == parser.v3NormalizedExprStrFormat &&
+           expr.detailKind == parser.v3NormalizedExprDetailStrFormatLiteral &&
+           expr.lineNumber == 13:
+            var mode = ""
+            var literal = ""
+            var args = ""
+            var endColumn = -1
+            assert(parser.v3ParserParseFmtExprAt(lineRaw,
+                                                 expr.columnNumber - 1,
+                                                 mode,
+                                                 literal,
+                                                 args,
+                                                 endColumn),
+                   "v3 parser normalized expr: parse fmt literal")
+            assert(mode == "fmt_literal", "v3 parser normalized expr: fmt literal mode")
+            assert(literal == "picked={intToStr(settled)}", "v3 parser normalized expr: fmt literal text")
+            assert(endColumn > expr.columnNumber, "v3 parser normalized expr: fmt literal span")
+            sawFmtLiteralShape = true
+            continue
+        if expr.kind == parser.v3NormalizedExprStrFormat &&
+           expr.detailKind == parser.v3NormalizedExprDetailStrFormatCall &&
+           expr.lineNumber == 13:
+            var mode = ""
+            var literal = ""
+            var args = ""
+            var endColumn = -1
+            assert(parser.v3ParserParseFmtExprAt(lineRaw,
+                                                 expr.columnNumber - 1,
+                                                 mode,
+                                                 literal,
+                                                 args,
+                                                 endColumn),
+                   "v3 parser normalized expr: parse fmt array call")
+            assert(mode == "fmt_call", "v3 parser normalized expr: fmt array mode")
+            assert(args == "[\"span\", intToStr(picked)]", "v3 parser normalized expr: fmt array args")
+            assert(endColumn > expr.columnNumber, "v3 parser normalized expr: fmt array span")
+            sawFmtArrayCallShape = true
+            continue
+        if expr.kind == parser.v3NormalizedExprComprehension && expr.lineNumber == 14:
+            var itemText = ""
+            var bindingText = ""
+            var sourceText = ""
+            var filterText = ""
+            var filterColumn = -1
+            var endColumn = -1
+            assert(parser.v3ParserParseListComprehensionAt(lineRaw,
+                                                           expr.columnNumber - 1,
+                                                           itemText,
+                                                           bindingText,
+                                                           sourceText,
+                                                           filterText,
+                                                           filterColumn,
+                                                           endColumn),
+                   "v3 parser normalized expr: parse comprehension")
+            assert(itemText == "row", "v3 parser normalized expr: comprehension item")
+            assert(bindingText == "row", "v3 parser normalized expr: comprehension binding")
+            assert(sourceText == "rows", "v3 parser normalized expr: comprehension source")
+            assert(filterText == "row != \"\"", "v3 parser normalized expr: comprehension filter")
+            assert(filterColumn > expr.columnNumber, "v3 parser normalized expr: comprehension filter column")
+            assert(endColumn > filterColumn, "v3 parser normalized expr: comprehension span")
+            sawComprehensionShape = true
+            continue
+        if expr.kind == parser.v3NormalizedExprStrFormat &&
+           expr.detailKind == parser.v3NormalizedExprDetailStrFormatCall &&
+           expr.lineNumber == 15:
+            var mode = ""
+            var literal = ""
+            var args = ""
+            var endColumn = -1
+            assert(parser.v3ParserParseFmtExprAt(lineRaw,
+                                                 expr.columnNumber - 1,
+                                                 mode,
+                                                 literal,
+                                                 args,
+                                                 endColumn),
+                   "v3 parser normalized expr: parse fmt paren call")
+            assert(mode == "fmt_call", "v3 parser normalized expr: fmt paren mode")
+            assert(args == "filtered", "v3 parser normalized expr: fmt paren args")
+            sawFmtParenCallShape = true
+    assert(sawExclusiveRangeShape, "v3 parser normalized expr: saw exclusive range shape")
+    assert(sawInclusiveRangeShape, "v3 parser normalized expr: saw inclusive range shape")
+    assert(sawFmtLiteralShape, "v3 parser normalized expr: saw fmt literal shape")
+    assert(sawFmtArrayCallShape, "v3 parser normalized expr: saw fmt array call shape")
+    assert(sawFmtParenCallShape, "v3 parser normalized expr: saw fmt paren call shape")
+    assert(sawComprehensionShape, "v3 parser normalized expr: saw comprehension shape")
+
+fn assertFmtPrefixRejected() =
+    let lineRaw = "let rendered = Fmt filtered"
+    var mode = ""
+    var literal = ""
+    var args = ""
+    var endColumn = -1
+    assert(!parser.v3ParserParseFmtExprAt(lineRaw,
+                                          15,
+                                          mode,
+                                          literal,
+                                          args,
+                                          endColumn),
+           "v3 parser normalized expr: reject fmt prefix call")
+
+fn assertFixtureTypeCallShapes(layer: parser.V3NormalizedExprLayer) =
+    var sawObjectDefaultInit = false
+    var sawTupleDefaultInit = false
+    var sawObjectConstructor = false
+    var sawTupleConstructor = false
+    for i in 0..<layer.exprs.len:
+        let expr = layer.exprs[i]
+        if expr.kind == parser.v3NormalizedExprDefaultInit && expr.lineNumber == 30:
+            assert(parser.v3NormalizedExprDefaultInitType(expr) == "SurfaceWrap",
+                   "v3 parser normalized expr: object default init type")
+            sawObjectDefaultInit = true
+            continue
+        if expr.kind == parser.v3NormalizedExprDefaultInit && expr.lineNumber == 31:
+            assert(parser.v3NormalizedExprDefaultInitType(expr) == "SurfacePair",
+                   "v3 parser normalized expr: tuple default init type")
+            sawTupleDefaultInit = true
+            continue
+        if expr.kind == parser.v3NormalizedExprConstructor && expr.lineNumber == 34:
+            assert(parser.v3NormalizedExprConstructorType(expr) == "SurfaceWrap",
+                   "v3 parser normalized expr: object constructor type")
+            assert(expr.callArgCount == 1, "v3 parser normalized expr: object constructor arg count")
+            assert(expr.callArgsText == "count: localCount", "v3 parser normalized expr: object constructor args")
+            sawObjectConstructor = true
+            continue
+        if expr.kind == parser.v3NormalizedExprConstructor && expr.lineNumber == 35:
+            assert(parser.v3NormalizedExprConstructorType(expr) == "SurfacePair",
+                   "v3 parser normalized expr: tuple constructor type")
+            assert(expr.callArgCount == 1, "v3 parser normalized expr: tuple constructor arg count")
+            assert(expr.callArgsText == "a: localPair", "v3 parser normalized expr: tuple constructor args")
+            sawTupleConstructor = true
+    assert(sawObjectDefaultInit, "v3 parser normalized expr: saw object default init")
+    assert(sawTupleDefaultInit, "v3 parser normalized expr: saw tuple default init")
+    assert(sawObjectConstructor, "v3 parser normalized expr: saw object constructor")
+    assert(sawTupleConstructor, "v3 parser normalized expr: saw tuple constructor")
+
+fn assertFixtureCallShapes(layer: parser.V3NormalizedExprLayer) =
+    var sawImportcCallSurface = false
+    var sawLocalCallSurface = false
+    var sawMemberReason = false
+    for i in 0..<layer.exprs.len:
+        let expr = layer.exprs[i]
+        if expr.kind != parser.v3NormalizedExprCall:
+            continue
+        assert(expr.detailKind == parser.v3NormalizedExprDetailNone,
+               "v3 parser normalized expr: call detail stays empty")
+        if expr.lineNumber == 16:
+            assert(!expr.callPrefixStyle, "v3 parser normalized expr: importc call paren style")
+            assert(expr.callArgCount == 1, "v3 parser normalized expr: importc call arg count")
+            assert(expr.callArgsText == "rendered", "v3 parser normalized expr: importc call args")
+            assert(expr.endColumnNumber > expr.columnNumber, "v3 parser normalized expr: importc call span")
+            sawImportcCallSurface = true
+            continue
+        if expr.lineNumber == 17:
+            assert(!expr.callPrefixStyle, "v3 parser normalized expr: local call paren style")
+            assert(expr.callArgCount == 1, "v3 parser normalized expr: local call arg count")
+            assert(expr.callArgsText == "imported", "v3 parser normalized expr: local call args")
+            sawLocalCallSurface = true
+            continue
+        if expr.lineNumber != 18:
+            continue
+        if parser.v3NormalizedExprCallSurfaceKind(expr) != parser.v3NormalizedExprSurfaceCallMember:
+            continue
+        assert(!expr.callPrefixStyle, "v3 parser normalized expr: member call paren style")
+        assert(expr.callArgCount == 1, "v3 parser normalized expr: member call arg count")
+        assert(expr.callArgsText == "wrapped", "v3 parser normalized expr: member call args")
+        assert(!expr.callResolved,
+               "v3 parser normalized expr: member call unresolved")
+        assert(parser.v3NormalizedExprCallReasonKind(expr) == parser.v3NormalizedExprCallReasonUnknownQualifiedTarget,
+               "v3 parser normalized expr: member call reason")
+        sawMemberReason = true
+    assert(sawImportcCallSurface, "v3 parser normalized expr: saw importc call surface")
+    assert(sawLocalCallSurface, "v3 parser normalized expr: saw local call surface")
+    assert(sawMemberReason, "v3 parser normalized expr: saw member call reason")
+
+fn assertSyntheticCallContract(fixturePath: str) =
+    var syntheticCallLayer = parser.V3NormalizedExprLayer()
+    parser.v3NormalizedExprLayerAppendCall(syntheticCallLayer,
+                                           fixturePath,
+                                           99,
+                                           5,
+                                           "typedhelper.TypedExternalEcho",
+                                           parser.v3NormalizedExprSurfaceCallExternal,
+                                           true,
+                                           parser.v3NormalizedExprCallReasonNone,
+                                           "typedhelper",
+                                           "TypedExternalEcho",
+                                           "typedhelper.TypedExternalEcho",
+                                           fixturePath,
+                                           false,
+                                           "payload",
+                                           1,
+                                           false,
+                                           33)
+    parser.v3NormalizedExprLayerAppendCall(syntheticCallLayer,
+                                           fixturePath,
+                                           99,
+                                           5,
+                                           "typedhelper.TypedExternalEcho",
+                                           parser.v3NormalizedExprSurfaceCallExternal,
+                                           true,
+                                           parser.v3NormalizedExprCallReasonNone,
+                                           "typedhelper",
+                                           "TypedExternalEcho",
+                                           "typedhelper.TypedExternalEcho",
+                                           fixturePath,
+                                           false,
+                                           "payload",
+                                           1,
+                                           false,
+                                           33)
+    assert(parser.v3NormalizedExprLayerExprCount(syntheticCallLayer) == 1,
+           "v3 parser normalized expr: call dedup ignores compat detail")
+    parser.v3NormalizedExprLayerAppendCall(syntheticCallLayer,
+                                           fixturePath,
+                                           99,
+                                           5,
+                                           "typedhelper.TypedExternalEcho",
+                                           parser.v3NormalizedExprSurfaceCallExternal,
+                                           false,
+                                           parser.v3NormalizedExprCallReasonAmbiguousExternalTarget,
+                                           "typedhelper",
+                                           "TypedExternalEcho",
+                                           "typedhelper.TypedExternalEcho",
+                                           "",
+                                           false,
+                                           "payload",
+                                           1,
+                                           false,
+                                           33)
+    assert(parser.v3NormalizedExprLayerExprCount(syntheticCallLayer) == 2,
+           "v3 parser normalized expr: call dedup uses structured facts")
+    assert(syntheticCallLayer.exprs[0].detailKind == parser.v3NormalizedExprDetailNone,
+           "v3 parser normalized expr: synthetic call detail empty")
+    assert(syntheticCallLayer.exprs[1].detailKind == parser.v3NormalizedExprDetailNone,
+           "v3 parser normalized expr: synthetic call detail empty second")
+    assert(syntheticCallLayer.exprs[0].exprId != syntheticCallLayer.exprs[1].exprId,
+           "v3 parser normalized expr: call expr id uses structured facts")
+
+fn assertSyntheticConstructorContract(fixturePath: str) =
+    var syntheticConstructorLayer = parser.V3NormalizedExprLayer()
+    parser.v3NormalizedExprLayerAppendConstructor(syntheticConstructorLayer,
+                                                  fixturePath,
+                                                  120,
+                                                  9,
+                                                  "SurfaceWrap",
+                                                  "count: 7",
+                                                  1,
+                                                  false,
+                                                  27)
+    parser.v3NormalizedExprLayerAppendConstructor(syntheticConstructorLayer,
+                                                  fixturePath,
+                                                  120,
+                                                  9,
+                                                  "SurfaceWrap",
+                                                  "count: 7",
+                                                  1,
+                                                  false,
+                                                  27)
+    assert(parser.v3NormalizedExprLayerExprCount(syntheticConstructorLayer) == 1,
+           "v3 parser normalized expr: constructor dedup")
+
+fn assertResolveUnknownTargetContract() =
+    var emptyProfile: parser.V3NormalizedExprCallProfile
+    var emptyProfiles: parser.V3NormalizedExprCallProfile[]
+    var emptyLookup: parser.V3ParserSourcePathIndexLookup
+    var emptyCache: parser.V3ParserProfileCallLookupCacheEntry[]
+    let unknownExternalTarget = parser.v3ParserResolveCallTarget(emptyProfile,
+                                                                 emptyProfiles,
+                                                                 emptyLookup,
+                                                                 emptyCache,
+                                                                 parser.v3NormalizedExprSurfaceCallExternal,
+                                                                 "",
+                                                                 "")
+    assert(unknownExternalTarget.reason == parser.v3NormalizedExprCallReasonUnknownExternalTarget,
+           "v3 parser normalized expr: direct resolve unknown external target")
+    let unknownCallTarget = parser.v3ParserResolveCallTarget(emptyProfile,
+                                                             emptyProfiles,
+                                                             emptyLookup,
+                                                             emptyCache,
+                                                             parser.v3NormalizedExprSurfaceCallMember,
+                                                             "",
+                                                             "")
+    assert(unknownCallTarget.reason == parser.v3NormalizedExprCallReasonUnknownCallTarget,
+           "v3 parser normalized expr: direct resolve unknown call target")
+
+fn assertCallExprDetailContract(fixturePath: str) =
+    let resolvedDetail = parser.v3ParserCallExprDetailExact("external_call",
+                                                            "TypedExternalEcho",
+                                                            "typedhelper",
+                                                            "typedhelper.TypedExternalEcho",
+                                                            true,
+                                                            parser.v3NormalizedExprCallReasonNone,
+                                                            fixturePath,
+                                                            false)
+    assert(resolvedDetail ==
+           "kind=external_call;callee=TypedExternalEcho;qualifier=typedhelper;target=typedhelper.TypedExternalEcho;resolved=1;target_source_path=" + fixturePath,
+           "v3 parser normalized expr: resolved call detail contract")
+    let importcDetail = parser.v3ParserCallExprDetailExact("importc_call",
+                                                           "panic",
+                                                           "",
+                                                           "panic",
+                                                           false,
+                                                           parser.v3NormalizedExprCallReasonUnknownExternalTarget,
+                                                           "",
+                                                           true)
+    assert(importcDetail ==
+           "kind=importc_call;callee=panic;target=panic;reason=unknown_external_target;target_importc=1",
+           "v3 parser normalized expr: importc call detail contract")
+
+fn parserNormalizedExprImportEdge(targetSourcePath: str): parser.V3ImportEdge =
+    var edge: parser.V3ImportEdge
+    edge.targetSourcePath = targetSourcePath
+    edge.targetSourcePathLen = targetSourcePath.len
+    if targetSourcePath != "":
+        edge.targetSourcePathFirstCode = int32(targetSourcePath[0])
+        edge.targetSourcePathLastCode = int32(targetSourcePath[targetSourcePath.len - 1])
+        edge.targetSourcePathDotCount = parser.v3ParserTextLookupDotCount(targetSourcePath)
+        edge.targetSourcePathHash = parser.v3ParserTextLookupContentHash(targetSourcePath)
+    edge.targetProfileIndex = -1
+    return edge
+
+fn assertSourcePathLookupContract(fixturePath: str) =
+    let typedFixturePath = v3path.V3PathJoin(v3path.V3PathCurrentDir(),
+                                             "src/tests/typed_expr_fact_fixture.cheng")
+    var profiles: parser.V3NormalizedExprCallProfile[]
+    var fixtureProfile: parser.V3NormalizedExprCallProfile
+    fixtureProfile.sourcePath = fixturePath
+    add(profiles, fixtureProfile)
+    var typedProfile: parser.V3NormalizedExprCallProfile
+    typedProfile.sourcePath = typedFixturePath
+    add(profiles, typedProfile)
+    let lookup = parser.v3ParserSourcePathIndexLookupBuild(profiles)
+    assert(parser.v3ParserProfileIndexLookupForSourcePath(lookup, fixturePath) == 0,
+           "v3 parser normalized expr: source path lookup fixture")
+    assert(parser.v3ParserProfileIndexLookupForSourcePath(lookup, fixturePath + "/") == 0,
+           "v3 parser normalized expr: source path lookup trims trailing slash")
+    assert(parser.v3ParserProfileIndexLookupForSourcePath(lookup, typedFixturePath) == 1,
+           "v3 parser normalized expr: source path lookup typed fixture")
+    let typedEdge = parserNormalizedExprImportEdge(typedFixturePath)
+    assert(parser.v3ParserProfileIndexLookupForImportEdgeTargetSourcePath(lookup, typedEdge) == 1,
+           "v3 parser normalized expr: import edge target lookup")
+    assert(parser.v3ParserImportEdgeTargetProfileIndex(typedEdge, lookup) == 1,
+           "v3 parser normalized expr: import edge profile index")
+
+fn main(): int32 =
+    let fixturePath = parserNormalizedExprFixturePath()
+    var layer = parser.V3NormalizedExprLayer()
+    var err = ""
+    assert(parser.v3ParserReadNormalizedExprLayerFromPath(fixturePath, layer, err),
+           "v3 parser normalized expr: read layer")
+    let fixtureLines = strutil.Split(os.ReadFile(fixturePath), '\n')
+    assertFixtureLayerSummary(layer)
+    assertFixtureRangeAndFmtShapes(layer, fixtureLines)
+    assertFmtPrefixRejected()
+    assertFixtureTypeCallShapes(layer)
+    assertFixtureCallShapes(layer)
+    assertSyntheticCallContract(fixturePath)
+    assertSyntheticConstructorContract(fixturePath)
+    assertResolveUnknownTargetContract()
+    assertCallExprDetailContract(fixturePath)
+    assertSourcePathLookupContract(fixturePath)
+    echo("v3 parser_normalized_expr_smoke ok")
+    return 0

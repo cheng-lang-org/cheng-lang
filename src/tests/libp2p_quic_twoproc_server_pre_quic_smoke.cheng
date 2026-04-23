@@ -1,0 +1,44 @@
+import std/system
+import std/cmdline as cmdline
+import cheng/overlay/contracts as overlay
+import cheng/libp2p/core/types
+import cheng/libp2p/host/host
+import cheng/libp2p/transports/quic_transport
+import cheng/apps/chain_node/chain_node as node
+import cheng/apps/chain_node/chain_node_libp2p as net
+
+fn main(): int32 =
+    let port = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    let ready_path_value = cmdline.ReadFlagOrDefault("--ready-path", "/tmp/libp2p-quic-twoproc-server-pre-quic-ready")
+    let expected_ready_path = newStringCopy(strDataPtr(ready_path_value), strLenFast(ready_path_value))
+    assert(len(expected_ready_path) > 0, "v3 libp2p quic pre: ready path arg")
+    var server: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(server, "quic.pre.server", "quic.twoproc")),
+           "v3 chain_node: init")
+    var serverHost = host.v3Libp2pHostInit("quic.pre.server")
+    assert(ready_path_value == expected_ready_path, "v3 libp2p quic pre: ready path after host")
+    let mintRes = node.v3ChainNodeMint(server, 9, 1001, int64(88))
+    assert(ready_path_value == expected_ready_path, "v3 libp2p quic pre: ready path after mint")
+    assert(mintRes.ok, "v3 libp2p quic pre: server mint")
+    let transferRes = node.v3ChainNodeTransfer(server, 9, 1001, 2002, int64(33))
+    assert(ready_path_value == expected_ready_path, "v3 libp2p quic pre: ready path after transfer")
+    assert(transferRes.ok, "v3 libp2p quic pre: server transfer")
+    let serveRes = net.v3ChainNodeLibp2pServeOnce(server, serverHost)
+    assert(ready_path_value == expected_ready_path, "v3 libp2p quic pre: ready path after serve")
+    assert(serveRes.ok, "v3 libp2p quic pre: server serve once")
+    var latest: overlay.V3IngressEnvelope
+    let latestRes = net.v3ChainNodeLibp2pLatestSnapshotHostIndex(serverHost, server.address)
+    assert(IsOk(latestRes), "v3 libp2p quic pre: server latest snapshot")
+    assert(ready_path_value == expected_ready_path, "v3 libp2p quic pre: ready path after latest")
+    let latestIndex = latestRes.value
+    assert(ready_path_value == expected_ready_path, "v3 libp2p quic pre: ready path after latestIndex")
+    let latestEntry = serverHost.storeEntries[latestIndex]
+    assert(ready_path_value == expected_ready_path, "v3 libp2p quic pre: ready path after latestEntry")
+    net.v3ChainNodeLibp2pCopyIngress(latest, latestEntry.ingress)
+    assert(ready_path_value == expected_ready_path, "v3 libp2p quic pre: ready path after copy")
+    assert(port >= 0, "v3 libp2p quic pre: keep port live")
+    let transportText = quic_transport.v3Libp2pQuicTransportText()
+    assert(transportText == "quic(tls)->native_stream", "v3 libp2p quic pre: keep quic import live")
+    assert(types.v3Libp2pProtocolSync == types.v3Libp2pProtocolSync, "v3 libp2p quic pre: keep protocol live")
+    echo("v3 libp2p_quic_twoproc_server_pre_quic ok")
+    return 0

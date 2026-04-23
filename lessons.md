@@ -1,6 +1,8 @@
 # Lessons
 
 - 给业务仓接 Cheng 运行链时，不要整包复制或整包软链 `decentralized`、`runtime`、`std`；只能沿最小真实依赖补齐，否则很容易把包边界和真实编译问题一起掩掉。
+- 验证共享 `std/runtime/decentralized` 直编时，不能只把外部包放在仓内 `artifacts/` 下；父目录里现成的 `cheng-package.toml` 会把 `workspace_root` 偶然抬回编译器仓，掩掉真外部包仍然拿错共享根和 provider 根的问题。至少要补一个仓外临时包回归。
+- 在验证新的 `stage3/backend_driver` 候选前，不要直接覆盖官方 live 产物；先放旁路路径验证，确认 `status/system-link-exec` 都正常后再切换，不然一旦候选本身起不来，整条排障链会一起失明。
 - 带 `--value` 这类显式 CLI 参数合同的 live-str probe，不能直接拿无参数 `run-host-smokes` 的 panic 结果当编译器回归；先确认 harness 参数是否满足，再判断是不是 return-path 真红。
 - `&& / ||` 这种语言基础语义不能只在 consteval 或某一条 backend 链上是对的；parser/typed/runtime codegen/spec/smoke 必须同口径一起锁死成短路求值，不然就会出现“编译期是对的、运行期却 eager 执行右侧”的低级语义漂移。
 - 用户要的是主线编译链，不是 report 壳；进度观察必须直接挂在编译 phase 本体上，实时输出/落轻量 progress，异常默认打印 summary 并停，不要再把 full report 当成主路径或失败路径的默认出口。
@@ -135,4 +137,20 @@
 - `backend_driver` 下面那些 `vpn-gui/mobile-shell/vpn-proxy/gate` 子工具不能每次 help 都现编；和 `chain_node` 一样，tool 二进制也要按 `source closure + compiler + target + out path` 写 build stamp 做 freshness，不然 `backend_driver_command_surface_smoke` 会被一串重复自编白白拖长。
 - `build-backend-driver` 也不能继续让 `backend_driver` 走未知命令 fallback 掉回 `stage3`；一旦主线已经把 `system-link-exec` 收回本地，`build-backend-driver` 也必须同口径本地接住，不然 `build_backend_driver_report_smoke` 这种会故意 touch `stage3` 的路径会直接重回旧 bootstrap 语义甚至崩掉。
 - host smoke 的全局 `CHENG_V3_SMOKE_RUN_TIMEOUT_SEC` 不能把单条 smoke 的最低合同压得更短；像 `build_backend_driver_report_smoke` 这种明确会重建 backend driver 的路径，应该用 `max(global_timeout, smoke_min_timeout)`，否则主线已经修好也会被过短超时误杀。
-- `build-backend-driver` 的 selftest 不要太早把候选编译器改名成共享的 `artifacts/v3_backend_driver/cheng.next`；这轮 `chain_node_smoke` 的 receipt 证明，候选如果先占用这条公共 staging 路径，后面很容易在长链里被别的 build/install 流程碰掉。更稳的口径是 selftest 全程用稳定私有路径 `cheng_candidate`，全部通过后再一次性改名安装。
+- `build-backend-driver` 的 selftest 不要占用公共 staging 名字；这轮先后证明了 `artifacts/v3_backend_driver/cheng.next` 和 `artifacts/v3_backend_driver/cheng_candidate` 都会在长链里被别的 build/install 流程碰掉。更稳的口径是 selftest 全程只用这条构建私有的编译器路径，全部通过后再一次性改名安装。
+- `system-link-exec` 的私有符号诊断不能只盯 `exprLayer`。`helper.privateFn()` 这类 member call 可以从 `unknown_qualified_target` 还原，但 `strfmt.fmt"..."` 这类旧表面根本不会进 `exprLayer`；最稳的口径是失败时同时扫源码里的 `import ... as alias` 和去注释后的 `alias.lowercaseMember` 用法，把跨包小写成员直接报成 `imported private symbol ... is not exported`。
+- `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1` 不能只把 `artifacts/v3_backend_driver/cheng` 当成本地终点；`cheng.selftest_driver`、`cheng.private_*` 这类 backend driver 变体也必须一律视为 live bridge。否则正向编译普通程序时会误报 `missing live Cheng bridge for system-link-exec`。
+- `compiler_main` 里那种几十个 `str` 参数排成一长串的 helper，会把 seed 的函数签名元数据解析直接顶炸；这种报表函数要么拆成多段 helper，要么先把重复字段折成小块文本，再传少量参数。
+- `build_backend_driver_report_smoke` 现在跑的是整条 cold `build-backend-driver`，实测已经超过 600 秒；内外两层 timeout 都必须按真实 cold 路径留足，不然只会制造假红。
+- `build_backend_driver_report_smoke` 这类直接 `ExecFileCapture` 子编译器的 smoke，必须显式带上 `CHENG_V3_ROOT`；只靠 cwd 猜根目录会让 `backend_driver/stage3` 口径漂掉。
+- 手工替换 live `cheng` 不能用 `cp` 直接覆盖；会出现 dyld 装载坏态。可执行文件安装只能走原子 `rename/mv`。
+- `system-link-exec` 现在的 `compile_progress phase=build status=done` 只代表 plan/receipt 收束，不代表外层 bridge/restore/实际成功返回已经结束；进度面必须把父子编译串起来并在转发时改成 append，否则用户看到的就是假完成。
+- 父层自己也不能只信内存里的 `progressText` 缓存；子编译写完后如果父层继续按旧缓存重写文件，就会把子 phase 全盖掉。正确口径是每次父层写新进度前先同步现有 progress 文件，再追加自己的 phase。
+- 只要 live `backend_driver` 还是 bootstrap shim，`backend_driver_selfhost_progress_smoke` 的实时 phase 就同时依赖两层：外层 shim 自己要补 `execute/bridge_compile/browser_bridge_restore`，内层 `cheng.stage3 system-link-exec` 也必须原生吐 `system_link_plan/source_bundle/compiler_csg/world/lowering_plan/...`。只修一层，progress 文件都会停在半路。
+- `native_link_plan done` 只代表链接计划已经准备好，不代表 provider 物化、主对象生成、真正 native link 已经结束；progress 必须继续覆盖 `provider_objects / primary_object_emit / native_link / line_map`，否则用户会看到高 CPU 长时间“像卡死”。
+- `cheng.stage3 system-link-exec` 成功路径不能再无条件生成并打印 full report；默认 compile log 只该保留 realtime progress，只有失败或显式 `--report-out` 才需要 report，不然 `backend_driver_selfhost_progress_smoke` 会被 `source_closure_count=` 这类大报表字段误伤。
+- Cheng 语法收口不能只改文档；像空格单参调用这种旧表面要先做 `CHENG_STRICT_CALL_SYNTAX=1` 门禁，让新代码可被硬拦，等仓内迁移清零后再切默认硬错误。
+- bootstrap 合同路径必须和仓里真实文件布局同口径；这轮 `compiler_world_fresh_node_selfhost_smoke` 证明，`bootstrap_contracts.cheng`、`cheng_v3_seed.c`、bootstrap smoke 里只要还有一处写着 `v3/bootstrap/stage1_bootstrap.cheng`，fresh bridge/selfhost 就会在 seed 阶段直接报 `failed to open`。
+- 仓布局从 `v3/` 外移到仓根后，任何 `packageRoot = root/v3` 的残留都会把同仓 `cheng/core/...` 模块错判成跨包，表现成成片的 `imported private symbol ... is not exported`；正确口径是按源码路径就近解析 `cheng-package.toml`，不要手写 `root/v3`。
+- 普通 host smoke 不要直接 import `stage1/parser/ast/frontend_lib` 来做 AST 扫描；这些模块会把内部 deferred 编译器路径拉进 ordinary source closure，表现成 `primary object machine code not emitted`。语法清零要么等 fresh 编译器原生 strict gate 生效，要么先用明确函数名口径做小批机械收口。
+- 解析模块路径时，当前包和显式 external package root 必须优先于编译器共享 `cheng/*` 兼容别名；否则 `pkg://cheng/<业务包>` 会被误解析到编译器源码树，表现成外部业务包 self import 变成 `source_closure_unresolved_imports`。

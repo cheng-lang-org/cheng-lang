@@ -1,0 +1,93 @@
+import std/cmdline as cmdline
+import cheng/std/bytes_layout as layout
+import cheng/DiLoCo/host/diloco_host
+import cheng/DiLoCo/protocol/wire
+import cheng/DiLoCo/tests/support
+
+fn main(): int32 =
+    let port = cmdline.ReadInt32FlagOrDefault("--port", -1)
+    assert(port > 0, "v3 diloco quic twoproc: client port")
+
+    let jobBundleCid = support.v3DiLoCoTestJobBundleCid("quic-twoproc")
+    let leaderPeerId = support.v3DiLoCoTestPeer("diloco.quic.leader")
+    let workerPeerId = support.v3DiLoCoTestPeer("diloco.quic.worker")
+    let workerModelDeltaRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-worker-model-delta")
+    let workerOptimizerDeltaRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-worker-optimizer-delta")
+    let mergedModelRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-merged-model")
+    let mergedOptimizerRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-merged-optimizer")
+
+    var joinReq = wire.V3DiLoCoJoinCohortRequest()
+    joinReq.jobBundleCid = jobBundleCid
+    joinReq.peerId = workerPeerId
+    let joinRes = diloco_host.v3DiLoCoJoinCohortRequestNamed("127.0.0.1", port, "localhost", joinReq)
+    assert(joinRes.ok, "v3 diloco quic twoproc: join")
+    assert(Value(joinRes).cohort.fixedMemberCount == 2, "v3 diloco quic twoproc: fixed cohort")
+    assert(layout.FixedBytes32Equal(Value(joinRes).cohort.jobBundleCid, jobBundleCid),
+        "v3 diloco quic twoproc: cohort job cid")
+
+    var leaseReq = wire.V3DiLoCoFetchLeaseRequest()
+    leaseReq.jobBundleCid = jobBundleCid
+    leaseReq.peerId = workerPeerId
+    let leaseRes = diloco_host.v3DiLoCoFetchLeaseRequestNamed("127.0.0.1", port, "localhost", leaseReq)
+    assert(leaseRes.ok, "v3 diloco quic twoproc: lease")
+    let lease = Value(leaseRes).lease
+    assert(lease.outerStep == 1, "v3 diloco quic twoproc: lease outer step")
+
+    var barrierReq = wire.V3DiLoCoReportInnerStepDoneRequest()
+    barrierReq.jobBundleCid = jobBundleCid
+    barrierReq.peerId = workerPeerId
+    let barrierRes = diloco_host.v3DiLoCoReportInnerStepDoneRequestNamed("127.0.0.1", port, "localhost", barrierReq)
+    assert(barrierRes.ok, "v3 diloco quic twoproc: barrier")
+
+    var deltaReq = wire.V3DiLoCoSubmitOuterDeltaRequest()
+    deltaReq.jobBundleCid = jobBundleCid
+    deltaReq.baseVersionCid = lease.baseVersionCid
+    deltaReq.outerStep = lease.outerStep
+    deltaReq.publisherPeerId = workerPeerId
+    deltaReq.modelDeltaRef = workerModelDeltaRef
+    deltaReq.optimizerDeltaRef = workerOptimizerDeltaRef
+    deltaReq.sampleCount = 9
+    deltaReq.tokenCount = 72
+    deltaReq.innerStepCount = lease.innerStepBudget
+    deltaReq.weightNumerator = 9
+    deltaReq.weightDenominator = 16
+    let deltaRes = diloco_host.v3DiLoCoSubmitOuterDeltaRequestNamed("127.0.0.1", port, "localhost", deltaReq)
+    assert(deltaRes.ok, "v3 diloco quic twoproc: delta")
+
+    var statusReq = wire.V3DiLoCoFetchStepStatusRequest()
+    statusReq.jobBundleCid = jobBundleCid
+    let statusRes = diloco_host.v3DiLoCoFetchStepStatusRequestNamed("127.0.0.1", port, "localhost", statusReq)
+    assert(statusRes.ok, "v3 diloco quic twoproc: status")
+    let status = Value(statusRes).status
+    assert(status.barrierReady, "v3 diloco quic twoproc: status barrier")
+    assert(status.contributionCount != 0, "v3 diloco quic twoproc: status contributions zero")
+    assert(status.contributionCount != 1, "v3 diloco quic twoproc: status contributions one")
+    assert(status.contributionCount == 2, "v3 diloco quic twoproc: status contributions")
+
+    var commitReq = wire.V3DiLoCoPublishMergeCommitRequest()
+    commitReq.jobBundleCid = jobBundleCid
+    commitReq.publisherPeerId = leaderPeerId
+    commitReq.mergedModelRef = mergedModelRef
+    commitReq.mergedOptimizerRef = mergedOptimizerRef
+    let commitRes = diloco_host.v3DiLoCoPublishMergeCommitRequestNamed("127.0.0.1", port, "localhost", commitReq)
+    assert(commitRes.ok, "v3 diloco quic twoproc: commit")
+    let commitVersion = Value(commitRes).version
+    assert(commitVersion.committedOuterStep == 1, "v3 diloco quic twoproc: committed outer step")
+
+    var versionReq = wire.V3DiLoCoFetchGlobalVersionRequest()
+    versionReq.jobBundleCid = jobBundleCid
+    let versionRes = diloco_host.v3DiLoCoFetchGlobalVersionRequestNamed("127.0.0.1", port, "localhost", versionReq)
+    assert(versionRes.ok, "v3 diloco quic twoproc: version")
+    assert(layout.FixedBytes32Equal(Value(versionRes).version.versionCid, commitVersion.versionCid),
+        "v3 diloco quic twoproc: version cid")
+
+    var lineageReq = wire.V3DiLoCoFetchLineageRequest()
+    lineageReq.jobBundleCid = jobBundleCid
+    let lineageRes = diloco_host.v3DiLoCoFetchLineageRequestNamed("127.0.0.1", port, "localhost", lineageReq)
+    assert(lineageRes.ok, "v3 diloco quic twoproc: lineage")
+    assert(Value(lineageRes).versions.len == 2, "v3 diloco quic twoproc: lineage len")
+    assert(layout.FixedBytes32Equal(Value(lineageRes).versions[0].versionCid, commitVersion.versionCid),
+        "v3 diloco quic twoproc: lineage head")
+
+    echo("v3 diloco_quic_twoproc_client_smoke ok")
+    return 0

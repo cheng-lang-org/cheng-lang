@@ -114,6 +114,8 @@ var parserDebugStage1DiagAddReady: bool
 var parserDebugStage1DiagAddCached: bool
 var parserDebugParseDotReady: bool
 var parserDebugParseDotCached: bool
+var parserStrictCallSyntaxReady: bool
+var parserStrictCallSyntaxCached: bool
 var parserNormalizedIdentEpoch: int32
 var parserNormalizedIdentReady: int32[]
 var parserNormalizedIdentIds: int32[]
@@ -365,6 +367,18 @@ fn parserDebugParseDotEnabled(): bool =
     parserDebugParseDotCached = os.GetEnvDefault("BACKEND_DEBUG_PARSE_DOT", "") == "1"
     parserDebugParseDotReady = true
     return parserDebugParseDotCached
+
+fn parserStrictCallSyntaxEnabled(): bool =
+    if parserStrictCallSyntaxReady:
+        return parserStrictCallSyntaxCached
+    let raw: str = os.GetEnvDefault("CHENG_STRICT_CALL_SYNTAX", "")
+    parserStrictCallSyntaxCached = raw == "1" || raw == "true" || raw == "yes"
+    parserStrictCallSyntaxReady = true
+    return parserStrictCallSyntaxCached
+
+fn parserRejectSpaceCallIfStrict(p: var ParserStateObj, t: Token) =
+    if parserStrictCallSyntaxEnabled():
+        addParseDiag(p, t, "Space call syntax is removed in the elegant syntax profile; use f(x)")
 
 fn parserEnsureI8Cache(cache: var int8[], epochSlot: var int32, id: int32) =
     let epoch: int32 = tokenTextPoolCurrentEpoch()
@@ -2575,9 +2589,10 @@ fn chainSpaceCallArgs(p: var ParserStateObj, arg: Node): Node =
     var out: Node = arg
     while !isEmpty(out) && isSpaceCallArgStart(p) && spaceCallSameLine(p):
         let curTok0: Token = current(p)
+        parserRejectSpaceCallIfStrict(p, curTok0)
         if curTok0.kind == tkSymbol && curTok0.lexemeId == parserTokLParenId:
             addParseDiag(p, current(p),
-                         "Space call does not allow parenthesized argument; use 'f x' or 'f(x)' for one argument, and 'f(x, y)' for multiple arguments")
+                         "Space call does not allow parenthesized argument; use f(x) for one argument and f(x, y) for multiple arguments")
         var nested: Node = newNode(nkCall, nodePos(out))
         addSon(nested, out)
         let nextArg: Node = parseSpaceAtom(p)
@@ -2594,12 +2609,13 @@ fn parseExpression(p: var ParserStateObj, minPrec: int32): Node =
     if !isEmpty(lhs) && lhs != lhsBeforeTypePtrBase:
         lhs = parsePostfix(p, lhs)
     if !isEmpty(lhs) && isSpaceCallArgStartFor(p, lhs) && spaceCallSameLine(p):
+        parserRejectSpaceCallIfStrict(p, current(p))
         if isDefiniteTypeExpr(lhs):
             addParseDiag(p, current(p), "Type conversion does not allow space call; use T(x)")
         let curTok1: Token = current(p)
         if curTok1.kind == tkSymbol && curTok1.lexemeId == parserTokLParenId:
             addParseDiag(p, current(p),
-                         "Space call does not allow parenthesized argument; use 'f x' or 'f(x)' for one argument, and 'f(x, y)' for multiple arguments")
+                         "Space call does not allow parenthesized argument; use f(x) for one argument and f(x, y) for multiple arguments")
             if isDefiniteTypeExpr(lhs):
                 addParseDiag(p, current(p), "Type conversions require parentheses; use T(x)")
         parserEnsureGeneratedFixedIds()
@@ -3719,9 +3735,10 @@ fn parseStatement(p: var ParserStateObj): Node =
     if !isEmpty(expr) && (nodeKind(expr) == nkIdent || nodeKind(expr) == nkDotExpr || nodeKind(expr) == nkBracketExpr) &&
        isSpaceCallArgStartFor(p, expr) && spaceCallSameLine(p):
         let tCall: Token = current(p)
+        parserRejectSpaceCallIfStrict(p, tCall)
         if tCall.kind == tkSymbol && tCall.lexemeId == parserTokLParenId:
-                        addParseDiag(p, current(p),
-                                     "Space call does not allow parenthesized argument; use 'f x' or 'f(x)' for one argument, and 'f(x, y)' for multiple arguments")
+            addParseDiag(p, current(p),
+                         "Space call does not allow parenthesized argument; use f(x) for one argument and f(x, y) for multiple arguments")
         var call: Node = newNode(nkCall, nodePos(expr))
         addSon(call, expr)
         let arg: Node = parseSpaceAtom(p)

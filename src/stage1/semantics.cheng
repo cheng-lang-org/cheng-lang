@@ -6630,12 +6630,157 @@ fn semImportedOwnerModulePath(n: Node): str =
         return ""
     return strings.SliceBytes(marker, prefixLen, len(marker) - prefixLen)
 
+fn semFindChar(s: str, ch: char, start: int32): int32 =
+    for i in start..<len(s):
+        if s[i] == ch:
+            return i
+    return -1
+
+fn semParseQuotedValue(line: str): str =
+    let first: int32 = semFindChar(line, '"', 0)
+    if first >= 0:
+        let second: int32 = semFindChar(line, '"', first + 1)
+        if second > first:
+            return strings.SliceBytes(line, first + 1, second)
+    return ""
+
+fn semPackageIdFromManifest(manifestPath: str): str =
+    if len(manifestPath) <= 0 || !os.fileExists(manifestPath):
+        return ""
+    let content: str = os.readFile(manifestPath)
+    if len(content) <= 0:
+        return ""
+    let contentLen: int32 = len(content)
+    var start: int32
+    for i in 0..contentLen:
+        if i == contentLen || content[i] == '\n':
+            if i > start:
+                let line: str = strutils.Trim(strings.SliceBytes(content, start, i))
+                if strings.HasPrefix(line, "package_id"):
+                    let value: str = semParseQuotedValue(line)
+                    if len(value) > 0:
+                        return value
+            start = i + 1
+    return ""
+
+fn semPackageKeyFromPackageId(packageIdRaw: str): str =
+    if len(packageIdRaw) <= 0:
+        return ""
+    if strings.HasPrefix(packageIdRaw, "pkg://"):
+        return strings.SliceBytes(packageIdRaw, 6, len(packageIdRaw) - 6)
+    return packageIdRaw
+
+fn semSplitDir(path: str): str =
+    let pathLen: int32 = len(path)
+    if pathLen == 0:
+        return ""
+    var lastSep: int32 = -1
+    for i in 0..<pathLen:
+        let ch: char = path[i]
+        if ch == '/' || ch == '\\':
+            lastSep = i
+    if lastSep < 0:
+        return ""
+    if lastSep == 0:
+        return strings.SliceBytes(path, 0, 1)
+    return strings.SliceBytes(path, 0, lastSep)
+
+fn semLogicalChengPackageKey(modulePath: str): str =
+    if !strings.HasPrefix(modulePath, "cheng/"):
+        return ""
+    let rest: str = strings.SliceBytes(modulePath, 6, len(modulePath) - 6)
+    if len(rest) <= 0:
+        return "cheng"
+    var slash: int32 = -1
+    for i in 0..<len(rest):
+        if rest[i] == '/':
+            slash = i
+            break
+    let head: str =
+        slash >= 0 ? strings.SliceBytes(rest, 0, slash) : rest
+    if head == "codex":
+        return "cheng/codex"
+    if head == "core" ||
+       head == "runtime" ||
+       head == "std" ||
+       head == "stage1" ||
+       head == "chain" ||
+       head == "tests" ||
+       head == "apps" ||
+       head == "libp2p" ||
+       head == "mobile" ||
+       head == "r2c" ||
+       head == "overlay" ||
+       head == "quic" ||
+       head == "http3" ||
+       head == "qpack" ||
+       head == "oracle" ||
+       head == "evomap" ||
+       head == "moq" ||
+       head == "fountain" ||
+       head == "hysteria2" ||
+       head == "diloco":
+        return "cheng"
+    return "cheng/" + head
+
+fn semManifestPathForModulePath(modulePathRaw: str): str =
+    if len(modulePathRaw) <= 0:
+        return ""
+    if strings.HasPrefix(modulePathRaw, "pkg://"):
+        return ""
+    if !os.fileExists(modulePathRaw) &&
+       !strings.HasPrefix(modulePathRaw, "/") &&
+       !strings.HasPrefix(modulePathRaw, "./") &&
+       !strings.HasPrefix(modulePathRaw, "../"):
+        return ""
+    let normalizedPath: str = os.absolutePath(modulePathRaw)
+    if len(normalizedPath) <= 0:
+        return ""
+    var cursor: str = normalizedPath
+    if os.fileExists(normalizedPath) && strings.HasSuffix(normalizedPath, ".cheng"):
+        cursor = semSplitDir(normalizedPath)
+    while len(cursor) > 0:
+        let manifestPath: str = os.joinPath(cursor, "cheng-package.toml")
+        if os.fileExists(manifestPath):
+            return manifestPath
+        let parent: str = semSplitDir(cursor)
+        if len(parent) <= 0 || parent == cursor:
+            break
+        cursor = parent
+    return ""
+
 fn semModulePackageKeyFromModulePath(modulePath: str): str =
     var normalizedPath: str = modulePath
     if strings.HasPrefix(normalizedPath, "pkg://"):
-        normalizedPath = strings.SliceBytes(normalizedPath, 6, len(normalizedPath) - 6)
+        return semPackageKeyFromPackageId(normalizedPath)
     if len(normalizedPath) <= 0:
         return ""
+    let manifestPath: str = semManifestPathForModulePath(normalizedPath)
+    if len(manifestPath) > 0:
+        let packageId: str = semPackageIdFromManifest(manifestPath)
+        let packageKey: str = semPackageKeyFromPackageId(packageId)
+        if len(packageKey) > 0:
+            return packageKey
+    if normalizedPath == "std" ||
+       strings.HasPrefix(normalizedPath, "std/") ||
+       normalizedPath == "stage1" ||
+       strings.HasPrefix(normalizedPath, "stage1/") ||
+       normalizedPath == "core" ||
+       strings.HasPrefix(normalizedPath, "core/") ||
+       normalizedPath == "system" ||
+       strings.HasPrefix(normalizedPath, "system/"):
+        return "cheng"
+    if normalizedPath == "src" ||
+       strings.HasPrefix(normalizedPath, "src/") ||
+       semTextContains(normalizedPath, "/src/"):
+        return "cheng"
+    if normalizedPath == "codex/src" ||
+       strings.HasPrefix(normalizedPath, "codex/src/") ||
+       semTextContains(normalizedPath, "/codex/src/"):
+        return "cheng/codex"
+    let chengKey: str = semLogicalChengPackageKey(normalizedPath)
+    if len(chengKey) > 0:
+        return chengKey
     var firstSlash: int32 = -1
     var secondSlash: int32 = -1
     for i in 0..<len(normalizedPath):
@@ -6647,14 +6792,23 @@ fn semModulePackageKeyFromModulePath(modulePath: str): str =
             secondSlash = i
             break
     if firstSlash < 0:
-        if normalizedPath == "v3":
-            return "cheng/v3"
+        if normalizedPath == "cheng":
+            return "cheng"
         return normalizedPath
     let firstPart = strings.SliceBytes(normalizedPath, 0, firstSlash)
-    if firstPart == "v3":
-        return "cheng/v3"
-    if firstPart == "cheng" && secondSlash > 0:
-        return strings.SliceBytes(normalizedPath, 0, secondSlash)
+    if firstPart == "src":
+        return "cheng"
+    if firstPart == "cheng":
+        let secondPart =
+            secondSlash > firstSlash ?
+                strings.SliceBytes(normalizedPath, firstSlash + 1, secondSlash) :
+                strings.SliceBytes(normalizedPath, firstSlash + 1, len(normalizedPath))
+        if secondPart == "codex":
+            return "cheng/codex"
+        return "cheng"
+    if firstPart == "codex" &&
+       (normalizedPath == "codex/src" || strings.HasPrefix(normalizedPath, "codex/src/")):
+        return "cheng/codex"
     return firstPart
 
 fn semTextContains(haystack: str, needle: str): bool =
@@ -6677,18 +6831,7 @@ fn semTextContains(haystack: str, needle: str): bool =
     return false
 
 fn semCurrentFilePackageKey(ctx: SemCtx): str =
-    if semTextContains(ctx.filename, "/v3/src/"):
-        return "cheng/v3"
-    if semTextContains(ctx.filename, "/src/std/"):
-        return "std"
-    if semTextContains(ctx.filename, "/src/stage1/"):
-        return "stage1"
-    return ""
-
-fn semInternalUniversePackageKey(key: str): bool =
-    return key == "cheng/v3" ||
-           key == "std" ||
-           key == "stage1"
+    return semModulePackageKeyFromModulePath(ctx.filename)
 
 fn semAllowPackagePrivateImport(ctx: SemCtx, n: Node): bool =
     let importedModulePath: str = semImportedOwnerModulePath(n)
@@ -6696,9 +6839,6 @@ fn semAllowPackagePrivateImport(ctx: SemCtx, n: Node): bool =
     let currentPackageKey: str = semCurrentFilePackageKey(ctx)
     if len(importedPackageKey) <= 0 || len(currentPackageKey) <= 0:
         return false
-    if semInternalUniversePackageKey(importedPackageKey) &&
-       semInternalUniversePackageKey(currentPackageKey):
-        return true
     return importedPackageKey == currentPackageKey
 
 fn semRequireIdentDefined(ctx: var SemCtx, n: Node) =

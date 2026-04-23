@@ -1,0 +1,968 @@
+import std/system
+import std/result
+import std/rawbytes
+import std/strutils as strutil
+import std/strings as strings
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/libp2p/core/types
+import cheng/libp2p/core/peer_id
+import cheng/core/tooling/path as v3path
+
+const
+    v3DidDeviceStatusUnknown: int32 = 0
+    v3DidDeviceStatusActive: int32 = 1
+    v3DidDeviceStatusRevoked: int32 = 2
+    v3DidMethodPrefix = "did:cheng:"
+    v3DidStoreVersionText = "4"
+    v3DidDocumentVersionText = "2"
+
+type
+    V3DidWord64 =
+        hi: int32
+        lo: int32
+
+    V3DidDeviceMethod =
+        devicePeerId: types.V3Libp2pPeerId
+        deviceLabel: str
+        deviceSeedHash: layout.FixedBytes32
+        status: int32
+        addedAtEpochSeconds: V3DidWord64
+        revokedAtEpochSeconds: V3DidWord64
+        proofDigest: layout.FixedBytes32
+
+    V3DidDocument =
+        did: str
+        genesisCid: layout.FixedBytes32
+        rootPeerId: types.V3Libp2pPeerId
+        rootSeedHash: layout.FixedBytes32
+        version: V3DidWord64
+        updatedAtEpochSeconds: V3DidWord64
+        devices: V3DidDeviceMethod[]
+
+    V3DidIdentity =
+        rootSeed: str
+        deviceSeed: str
+        storeText: str
+        selfDevice: V3DidDeviceMethod
+
+fn v3DidWord64FromInt64(value: int64): V3DidWord64 =
+    var out: V3DidWord64
+    let bits = uint64(value)
+    out.hi = int32((bits >> uint64(32)) & uint64(0xffffffff))
+    out.lo = int32(bits & uint64(0xffffffff))
+    return out
+
+fn v3DidWord64Value(value: V3DidWord64): int64 =
+    let hiBits = uint64(value.hi) & uint64(0xffffffff)
+    let loBits = uint64(value.lo) & uint64(0xffffffff)
+    return int64((hiBits << uint64(32)) | loBits)
+
+fn v3DidWord64Text(value: V3DidWord64): str =
+    return strings.Int64ToStr(v3DidWord64Value(value))
+
+fn v3DidWord64AddInt64(value: V3DidWord64, delta: int64): V3DidWord64 =
+    return v3DidWord64FromInt64(v3DidWord64Value(value) + delta)
+
+fn v3DidTextAppend(out: str, piece: str): str =
+    let outBytes = bytesFromString(out)
+    let pieceBytes = bytesFromString(piece)
+    let merged: Bytes = bytesAlloc(outBytes.len + pieceBytes.len)
+    var pos = 0
+    for i in 0..<outBytes.len:
+        bytesSet(merged, pos, bytesGet(outBytes, i))
+        pos = pos + 1
+    for i in 0..<pieceBytes.len:
+        bytesSet(merged, pos, bytesGet(pieceBytes, i))
+        pos = pos + 1
+    return bytesToString(merged)
+
+fn v3DidHashTagged(tag: str, text: str): layout.FixedBytes32 =
+    var taggedText = tag
+    taggedText = v3DidTextAppend(taggedText, "|")
+    taggedText = v3DidTextAppend(taggedText, text)
+    let payload = bytesFromString(taggedText)
+    return hash256.sha256Fixed(layout.byteSpanFromBytes(payload))
+
+fn v3DidRootSeedHash(rootSeed: str): layout.FixedBytes32 =
+    return v3DidHashTagged("v3.did.root.seed", rootSeed)
+
+fn v3DidDeviceSeedHash(deviceSeed: str): layout.FixedBytes32 =
+    return v3DidHashTagged("v3.did.device.seed", deviceSeed)
+
+fn v3DidRootPeerIdFromSeed(rootSeed: str): types.V3Libp2pPeerId =
+    var out = "v3.did.root|"
+    out = v3DidTextAppend(out, rootSeed)
+    return peer_id.v3Libp2pPeerIdFromSeed(out)
+
+fn v3DidDevicePeerIdFromSeed(deviceSeed: str): types.V3Libp2pPeerId =
+    var out = "v3.did.device|"
+    out = v3DidTextAppend(out, deviceSeed)
+    return peer_id.v3Libp2pPeerIdFromSeed(out)
+
+fn v3DidGenesisText(rootPeerId: types.V3Libp2pPeerId,
+                    rootSeedHash: layout.FixedBytes32): str =
+    var out = "v3_did_genesis_version=1"
+    out = v3DidTextAppend(out, "|root_peer_id=")
+    out = v3DidTextAppend(out, peer_id.v3Libp2pPeerIdText(rootPeerId))
+    out = v3DidTextAppend(out, "|root_seed_hash=")
+    out = v3DidTextAppend(out, layout.fixedBytes32Hex(rootSeedHash))
+    return out
+
+fn v3DidGenesisCid(rootPeerId: types.V3Libp2pPeerId,
+                   rootSeedHash: layout.FixedBytes32): layout.FixedBytes32 =
+    return v3DidHashTagged("v3.did.genesis", v3DidGenesisText(rootPeerId, rootSeedHash))
+
+fn v3DidGenesisCidFromSeed(rootSeed: str): layout.FixedBytes32 =
+    return v3DidGenesisCid(v3DidRootPeerIdFromSeed(rootSeed), v3DidRootSeedHash(rootSeed))
+
+fn v3DidGenesisCidText(genesisCid: layout.FixedBytes32): str =
+    var out = "g"
+    out = v3DidTextAppend(out, layout.fixedBytes32Hex(genesisCid))
+    return out
+
+fn v3DidFromGenesisCid(genesisCid: layout.FixedBytes32): str =
+    var out = v3DidMethodPrefix
+    out = v3DidTextAppend(out, v3DidGenesisCidText(genesisCid))
+    return out
+
+fn v3DidFromRootSeed(rootSeed: str): str =
+    return v3DidFromGenesisCid(v3DidGenesisCidFromSeed(rootSeed))
+
+fn v3DidDeviceProofDigest(didText: str,
+                          rootSeedHash: layout.FixedBytes32,
+                          devicePeerId: types.V3Libp2pPeerId,
+                          deviceSeedHash: layout.FixedBytes32,
+                          deviceLabel: str,
+                          status: int32,
+                          addedAtEpochSeconds: V3DidWord64,
+                          revokedAtEpochSeconds: V3DidWord64): layout.FixedBytes32 =
+    var proofText = "did="
+    proofText = v3DidTextAppend(proofText, didText)
+    proofText = v3DidTextAppend(proofText, "|root_seed_hash=")
+    proofText = v3DidTextAppend(proofText, layout.fixedBytes32Hex(rootSeedHash))
+    proofText = v3DidTextAppend(proofText, "|device_peer_id=")
+    proofText = v3DidTextAppend(proofText, peer_id.v3Libp2pPeerIdText(devicePeerId))
+    proofText = v3DidTextAppend(proofText, "|device_seed_hash=")
+    proofText = v3DidTextAppend(proofText, layout.fixedBytes32Hex(deviceSeedHash))
+    proofText = v3DidTextAppend(proofText, "|device_label=")
+    proofText = v3DidTextAppend(proofText, deviceLabel)
+    proofText = v3DidTextAppend(proofText, "|status=")
+    proofText = v3DidTextAppend(proofText, strings.IntToStr(status))
+    proofText = v3DidTextAppend(proofText, "|added_at=")
+    proofText = v3DidTextAppend(proofText, v3DidWord64Text(addedAtEpochSeconds))
+    proofText = v3DidTextAppend(proofText, "|revoked_at=")
+    proofText = v3DidTextAppend(proofText, v3DidWord64Text(revokedAtEpochSeconds))
+    return v3DidHashTagged("v3.did.device.proof", proofText)
+
+fn v3DidDeviceMethodMake(didText: str,
+                         rootSeedHash: layout.FixedBytes32,
+                         deviceSeed: str,
+                         deviceLabel: str,
+                         addedAtEpochSeconds: int64): V3DidDeviceMethod =
+    var out: V3DidDeviceMethod
+    out.devicePeerId = v3DidDevicePeerIdFromSeed(deviceSeed)
+    out.deviceLabel = deviceLabel
+    out.deviceSeedHash = v3DidDeviceSeedHash(deviceSeed)
+    out.status = v3DidDeviceStatusActive
+    out.addedAtEpochSeconds = v3DidWord64FromInt64(addedAtEpochSeconds)
+    out.revokedAtEpochSeconds = V3DidWord64()
+    out.proofDigest = v3DidDeviceProofDigest(didText,
+                                             rootSeedHash,
+                                             out.devicePeerId,
+                                             out.deviceSeedHash,
+                                             out.deviceLabel,
+                                             out.status,
+                                             out.addedAtEpochSeconds,
+                                             out.revokedAtEpochSeconds)
+    return out
+
+fn v3DidDocumentAssign(out: var V3DidDocument, value: V3DidDocument) =
+    out.did = value.did
+    out.genesisCid = value.genesisCid
+    out.rootPeerId = value.rootPeerId
+    out.rootSeedHash = value.rootSeedHash
+    out.version = value.version
+    out.updatedAtEpochSeconds = value.updatedAtEpochSeconds
+    var devices: V3DidDeviceMethod[]
+    for i in 0..<value.devices.len:
+        add(devices, value.devices[i])
+    out.devices = devices
+
+fn v3DidDocumentClone(value: V3DidDocument): V3DidDocument =
+    var out: V3DidDocument
+    v3DidDocumentAssign(out, value)
+    return out
+
+fn v3DidIdentityClone(value: V3DidIdentity): V3DidIdentity =
+    var out: V3DidIdentity
+    out.rootSeed = value.rootSeed
+    out.deviceSeed = value.deviceSeed
+    out.storeText = value.storeText
+    out.selfDevice = value.selfDevice
+    return out
+
+fn v3DidIdentityMake(rootSeed: str,
+                     deviceSeed: str,
+                     deviceLabel: str,
+                     epochSeconds: int64): V3DidIdentity =
+    let rootPeerId = v3DidRootPeerIdFromSeed(rootSeed)
+    let rootSeedHash = v3DidRootSeedHash(rootSeed)
+    let genesisCid = v3DidGenesisCid(rootPeerId, rootSeedHash)
+    let didText = v3DidFromGenesisCid(genesisCid)
+    let selfDevice = v3DidDeviceMethodMake(didText,
+                                           rootSeedHash,
+                                           deviceSeed,
+                                           deviceLabel,
+                                           epochSeconds)
+    var document: V3DidDocument
+    document.did = didText
+    document.genesisCid = genesisCid
+    document.rootPeerId = rootPeerId
+    document.rootSeedHash = rootSeedHash
+    document.version = v3DidWord64FromInt64(int64(1))
+    document.updatedAtEpochSeconds = v3DidWord64FromInt64(epochSeconds)
+    var devices: V3DidDeviceMethod[]
+    add(devices, selfDevice)
+    document.devices = devices
+    var out: V3DidIdentity
+    out.rootSeed = rootSeed
+    out.deviceSeed = deviceSeed
+    out.selfDevice = selfDevice
+    let storeTextRes = v3DidStoreBuildText(rootSeed, deviceSeed, document, selfDevice)
+    assert(IsOk(storeTextRes), "v3 did: build store text")
+    out.storeText = Value(storeTextRes)
+    return out
+
+fn v3DidIdentityDid(identity: V3DidIdentity): str =
+    return v3DidFromRootSeed(identity.rootSeed)
+
+fn v3DidStoreRootDir(rootDir: str): str =
+    if v3path.V3PathNonEmpty(rootDir):
+        return rootDir
+    return v3path.V3PathCurrentDir()
+
+fn v3DidStoreResolvedPath(rootDir: str, pathRaw: str): str =
+    return v3path.V3PathAbsolute(v3DidStoreRootDir(rootDir), pathRaw)
+
+fn v3DidStoreEncodeText(text: str): str =
+    return bytesToHex(bytesFromString(text))
+
+fn v3DidStoreHexNibble(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn v3DidStoreParseInt32(text: str): Result[int32] =
+    if strings.Len(text) <= 0:
+        return Err[int32]("v3 did store: invalid int32")
+    var i = int32(0)
+    var negative = false
+    if text[0] == '+':
+        i = 1
+    elif text[0] == '-':
+        negative = true
+        i = 1
+    if i >= strings.Len(text):
+        return Err[int32]("v3 did store: invalid int32")
+    var value = int64(0)
+    while i < strings.Len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return Err[int32]("v3 did store: invalid int32")
+        value = value * int64(10) + int64(int32(ch) - int32('0'))
+        i = i + 1
+    if negative:
+        value = -value
+    if value < int64(-2147483648) || value > int64(2147483647):
+        return Err[int32]("v3 did store: invalid int32")
+    return Ok[int32](int32(value))
+
+fn v3DidStoreParseWord64Hex(text: str): Result[V3DidWord64] =
+    if strings.Len(text) != 16:
+        return Err[V3DidWord64]("v3 did store: invalid word64 hex length")
+    var hiBits = uint64(0)
+    for i in 0..<8:
+        let nibble = v3DidStoreHexNibble(text[i])
+        if nibble < 0:
+            return Err[V3DidWord64]("v3 did store: invalid word64 hex")
+        hiBits = (hiBits << uint64(4)) | uint64(nibble)
+    var loBits = uint64(0)
+    for i in 8..<16:
+        let nibble = v3DidStoreHexNibble(text[i])
+        if nibble < 0:
+            return Err[V3DidWord64]("v3 did store: invalid word64 hex")
+        loBits = (loBits << uint64(4)) | uint64(nibble)
+    var out: V3DidWord64
+    out.hi = int32(hiBits & uint64(0xffffffff))
+    out.lo = int32(loBits & uint64(0xffffffff))
+    return Ok[V3DidWord64](out)
+
+fn v3DidStoreWord64Hex(value: V3DidWord64): str =
+    let out: Bytes = bytesAlloc(8)
+    let hiBits = uint64(value.hi) & uint64(0xffffffff)
+    let loBits = uint64(value.lo) & uint64(0xffffffff)
+    bytesSet(out, 0, int32((hiBits >> uint64(24)) & uint64(255)))
+    bytesSet(out, 1, int32((hiBits >> uint64(16)) & uint64(255)))
+    bytesSet(out, 2, int32((hiBits >> uint64(8)) & uint64(255)))
+    bytesSet(out, 3, int32(hiBits & uint64(255)))
+    bytesSet(out, 4, int32((loBits >> uint64(24)) & uint64(255)))
+    bytesSet(out, 5, int32((loBits >> uint64(16)) & uint64(255)))
+    bytesSet(out, 6, int32((loBits >> uint64(8)) & uint64(255)))
+    bytesSet(out, 7, int32(loBits & uint64(255)))
+    return bytesToHex(out)
+
+fn v3DidStoreDecodeBytes(encoded: str): Result[Bytes] =
+    if strings.Len(encoded) % 2 != 0:
+        return Err[Bytes]("v3 did store: invalid text hex")
+    let out: Bytes = bytesAlloc(strings.Len(encoded) / 2)
+    var i: int32
+    while i < strings.Len(encoded):
+        let hi = v3DidStoreHexNibble(encoded[i])
+        let lo = v3DidStoreHexNibble(encoded[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("v3 did store: invalid text hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn v3DidStoreAppendLine(out: str, key: str, value: str): str =
+    var next = out
+    next = v3DidTextAppend(next, key)
+    next = v3DidTextAppend(next, "=")
+    next = v3DidTextAppend(next, value)
+    next = v3DidTextAppend(next, "\n")
+    return next
+
+fn v3DidStoreDeviceLine(device: V3DidDeviceMethod): str =
+    var out = peer_id.v3Libp2pPeerIdText(device.devicePeerId)
+    out = v3DidTextAppend(out, "|")
+    out = v3DidTextAppend(out, v3DidStoreEncodeText(device.deviceLabel))
+    out = v3DidTextAppend(out, "|")
+    out = v3DidTextAppend(out, layout.fixedBytes32Hex(device.deviceSeedHash))
+    out = v3DidTextAppend(out, "|")
+    out = v3DidTextAppend(out, strings.IntToStr(device.status))
+    out = v3DidTextAppend(out, "|")
+    out = v3DidTextAppend(out, v3DidStoreWord64Hex(device.addedAtEpochSeconds))
+    out = v3DidTextAppend(out, "|")
+    out = v3DidTextAppend(out, v3DidStoreWord64Hex(device.revokedAtEpochSeconds))
+    out = v3DidTextAppend(out, "|")
+    out = v3DidTextAppend(out, layout.fixedBytes32Hex(device.proofDigest))
+    return out
+
+fn v3DidStoreParseDeviceStatus(text: str): Result[int32] =
+    if text == "0":
+        return Ok[int32](v3DidDeviceStatusUnknown)
+    if text == "1":
+        return Ok[int32](v3DidDeviceStatusActive)
+    if text == "2":
+        return Ok[int32](v3DidDeviceStatusRevoked)
+    return Err[int32]("v3 did store: invalid device status")
+
+fn v3DidStoreParseDevicePayload(didText: str,
+                                rootSeedHash: layout.FixedBytes32,
+                                payload: str): Result[V3DidDeviceMethod] =
+    let fields = strutil.Split(payload, '|')
+    if fields.len != 7:
+        return Err[V3DidDeviceMethod]("v3 did store: invalid device record")
+    let peerValueRes = v3DidPeerIdFromHex(fields[0])
+    if IsErr(peerValueRes):
+        return Err[V3DidDeviceMethod](Error(peerValueRes))
+    let labelBytesRes = v3DidStoreDecodeBytes(fields[1])
+    if IsErr(labelBytesRes):
+        return Err[V3DidDeviceMethod](Error(labelBytesRes))
+    let seedHashRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(fields[2])
+    if IsErr(seedHashRes):
+        return Err[V3DidDeviceMethod](Error(seedHashRes))
+    let statusRes = v3DidStoreParseDeviceStatus(fields[3])
+    if IsErr(statusRes):
+        return Err[V3DidDeviceMethod](Error(statusRes))
+    let addedAtRes = v3DidStoreParseWord64Hex(fields[4])
+    if IsErr(addedAtRes):
+        return Err[V3DidDeviceMethod](Error(addedAtRes))
+    let revokedAtRes = v3DidStoreParseWord64Hex(fields[5])
+    if IsErr(revokedAtRes):
+        return Err[V3DidDeviceMethod](Error(revokedAtRes))
+    let proofRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(fields[6])
+    if IsErr(proofRes):
+        return Err[V3DidDeviceMethod](Error(proofRes))
+    var device: V3DidDeviceMethod
+    device.devicePeerId = Value(peerValueRes)
+    device.deviceLabel = bytesToString(Value(labelBytesRes))
+    device.deviceSeedHash = Value(seedHashRes)
+    device.status = Value(statusRes)
+    device.addedAtEpochSeconds = Value(addedAtRes)
+    device.revokedAtEpochSeconds = Value(revokedAtRes)
+    device.proofDigest = Value(proofRes)
+    let wantProof = v3DidDeviceProofDigest(didText,
+                                           rootSeedHash,
+                                           device.devicePeerId,
+                                           device.deviceSeedHash,
+                                           device.deviceLabel,
+                                           device.status,
+                                           device.addedAtEpochSeconds,
+                                           device.revokedAtEpochSeconds)
+    if !layout.fixedBytes32Equal(device.proofDigest, wantProof):
+        return Err[V3DidDeviceMethod]("v3 did store: device proof mismatch")
+    return Ok[V3DidDeviceMethod](device)
+
+fn v3DidStoreFindValue(lines: str[], key: str): Result[str] =
+    let keyLen = strings.Len(key)
+    for i in 0..<lines.len:
+        let line = lines[i]
+        let lineLen = strings.Len(line)
+        if lineLen <= keyLen:
+            continue
+        var matched = true
+        for j in 0..<keyLen:
+            if line[j] != key[j]:
+                matched = false
+                break
+        if !matched || line[keyLen] != '=':
+            continue
+        let valueStart = keyLen + 1
+        return Ok[str](strings.SliceBytes(line, valueStart, lineLen - valueStart))
+    return Err[str]("v3 did store: missing key " + key)
+
+fn v3DidPeerIdFromHex(text: str): Result[types.V3Libp2pPeerId] =
+    let peerTextRes = peer_id.v3Libp2pPeerIdFromText(text)
+    if IsOk(peerTextRes):
+        return Ok[types.V3Libp2pPeerId](Value(peerTextRes))
+    let fixedRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(text)
+    if IsErr(fixedRes):
+        return Err[types.V3Libp2pPeerId](Error(peerTextRes))
+    var out: types.V3Libp2pPeerId
+    out.value = Value(fixedRes)
+    return Ok[types.V3Libp2pPeerId](out)
+
+fn v3DidStoreBootstrapSeed(tag: str,
+                           resolvedPath: str,
+                           deviceLabel: str,
+                           epochSeconds: int64): str =
+    var payload = resolvedPath
+    payload = v3DidTextAppend(payload, "|")
+    payload = v3DidTextAppend(payload, deviceLabel)
+    payload = v3DidTextAppend(payload, "|")
+    payload = v3DidTextAppend(payload, strings.Int64ToStr(epochSeconds))
+    return layout.fixedBytes32Hex(v3DidHashTagged(tag, payload))
+
+fn v3DidStoreBuildText(rootSeed: str,
+                       deviceSeed: str,
+                       document: V3DidDocument,
+                       selfDevice: V3DidDeviceMethod): Result[str] =
+    let selfPos = v3DidDocumentFindDevicePos(document, selfDevice.devicePeerId)
+    if selfPos < 0:
+        return Err[str]("v3 did store: self device missing")
+    let expectDid = v3DidFromGenesisCid(document.genesisCid)
+    if document.did != expectDid:
+        return Err[str]("v3 did store: document did mismatch")
+    let expectGenesisCid = v3DidGenesisCid(document.rootPeerId, document.rootSeedHash)
+    if !layout.fixedBytes32Equal(document.genesisCid, expectGenesisCid):
+        return Err[str]("v3 did store: genesis cid mismatch")
+    var out = ""
+    out = v3DidStoreAppendLine(out, "v3_did_store_version", v3DidStoreVersionText)
+    out = v3DidStoreAppendLine(out, "root_seed", v3DidStoreEncodeText(rootSeed))
+    out = v3DidStoreAppendLine(out, "device_seed", v3DidStoreEncodeText(deviceSeed))
+    out = v3DidStoreAppendLine(out, "did", document.did)
+    out = v3DidStoreAppendLine(out, "genesis_cid", layout.fixedBytes32Hex(document.genesisCid))
+    out = v3DidStoreAppendLine(out, "root_peer_id", peer_id.v3Libp2pPeerIdText(document.rootPeerId))
+    out = v3DidStoreAppendLine(out, "root_seed_hash", layout.fixedBytes32Hex(document.rootSeedHash))
+    out = v3DidStoreAppendLine(out, "document_version", v3DidStoreWord64Hex(document.version))
+    out = v3DidStoreAppendLine(out, "document_updated_at", v3DidStoreWord64Hex(document.updatedAtEpochSeconds))
+    out = v3DidStoreAppendLine(out, "self_device_peer_id", peer_id.v3Libp2pPeerIdText(selfDevice.devicePeerId))
+    out = v3DidStoreAppendLine(out, "device_count", strings.IntToStr(document.devices.len))
+    for i in 0..<document.devices.len:
+        out = v3DidStoreAppendLine(out, "device", v3DidStoreDeviceLine(document.devices[i]))
+    return Ok[str](out)
+
+fn v3DidDocumentBuildText(document: V3DidDocument): Result[str] =
+    let expectDid = v3DidFromGenesisCid(document.genesisCid)
+    if document.did != expectDid:
+        return Err[str]("v3 did: document did mismatch")
+    let expectGenesisCid = v3DidGenesisCid(document.rootPeerId, document.rootSeedHash)
+    if !layout.fixedBytes32Equal(document.genesisCid, expectGenesisCid):
+        return Err[str]("v3 did: document genesis cid mismatch")
+    var out = ""
+    out = v3DidStoreAppendLine(out, "v3_did_document_version", v3DidDocumentVersionText)
+    out = v3DidStoreAppendLine(out, "did", document.did)
+    out = v3DidStoreAppendLine(out, "genesis_cid", layout.fixedBytes32Hex(document.genesisCid))
+    out = v3DidStoreAppendLine(out, "root_peer_id", peer_id.v3Libp2pPeerIdText(document.rootPeerId))
+    out = v3DidStoreAppendLine(out, "root_seed_hash", layout.fixedBytes32Hex(document.rootSeedHash))
+    out = v3DidStoreAppendLine(out, "document_version", v3DidStoreWord64Hex(document.version))
+    out = v3DidStoreAppendLine(out, "document_updated_at", v3DidStoreWord64Hex(document.updatedAtEpochSeconds))
+    out = v3DidStoreAppendLine(out, "device_count", strings.IntToStr(document.devices.len))
+    for i in 0..<document.devices.len:
+        let device = document.devices[i]
+        let wantProof = v3DidDeviceProofDigest(document.did,
+                                               document.rootSeedHash,
+                                               device.devicePeerId,
+                                               device.deviceSeedHash,
+                                               device.deviceLabel,
+                                               device.status,
+                                               device.addedAtEpochSeconds,
+                                               device.revokedAtEpochSeconds)
+        if !layout.fixedBytes32Equal(device.proofDigest, wantProof):
+            return Err[str]("v3 did: device proof mismatch")
+        out = v3DidStoreAppendLine(out, "device", v3DidStoreDeviceLine(device))
+    return Ok[str](out)
+
+fn v3DidDocumentParseTextFill(out: var V3DidDocument, text: str): Result[bool] =
+    out = V3DidDocument()
+    if strings.Len(text) <= 0:
+        return Err[bool]("v3 did: missing document text")
+    let lines = strutil.Split(text, '\n')
+    let versionRes = v3DidStoreFindValue(lines, "v3_did_document_version")
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    if Value(versionRes) != v3DidDocumentVersionText:
+        return Err[bool]("v3 did: unsupported document version")
+    let didRes = v3DidStoreFindValue(lines, "did")
+    if IsErr(didRes):
+        return Err[bool](Error(didRes))
+    let genesisCidTextRes = v3DidStoreFindValue(lines, "genesis_cid")
+    if IsErr(genesisCidTextRes):
+        return Err[bool](Error(genesisCidTextRes))
+    let rootPeerRes = v3DidStoreFindValue(lines, "root_peer_id")
+    if IsErr(rootPeerRes):
+        return Err[bool](Error(rootPeerRes))
+    let parsedRootPeerRes = v3DidPeerIdFromHex(Value(rootPeerRes))
+    if IsErr(parsedRootPeerRes):
+        return Err[bool](Error(parsedRootPeerRes))
+    let rootHashTextRes = v3DidStoreFindValue(lines, "root_seed_hash")
+    if IsErr(rootHashTextRes):
+        return Err[bool](Error(rootHashTextRes))
+    let rootHashRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(Value(rootHashTextRes))
+    if IsErr(rootHashRes):
+        return Err[bool](Error(rootHashRes))
+    let genesisCidRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(Value(genesisCidTextRes))
+    if IsErr(genesisCidRes):
+        return Err[bool](Error(genesisCidRes))
+    let didText = Value(didRes)
+    let rootPeerId = Value(parsedRootPeerRes)
+    let genesisCid = Value(genesisCidRes)
+    if v3DidFromGenesisCid(genesisCid) != didText:
+        return Err[bool]("v3 did: document did mismatch")
+    let expectGenesisCid = v3DidGenesisCid(rootPeerId, Value(rootHashRes))
+    if !layout.fixedBytes32Equal(genesisCid, expectGenesisCid):
+        return Err[bool]("v3 did: document genesis cid mismatch")
+    let docVersionTextRes = v3DidStoreFindValue(lines, "document_version")
+    if IsErr(docVersionTextRes):
+        return Err[bool](Error(docVersionTextRes))
+    let docUpdatedTextRes = v3DidStoreFindValue(lines, "document_updated_at")
+    if IsErr(docUpdatedTextRes):
+        return Err[bool](Error(docUpdatedTextRes))
+    let deviceCountTextRes = v3DidStoreFindValue(lines, "device_count")
+    if IsErr(deviceCountTextRes):
+        return Err[bool](Error(deviceCountTextRes))
+    let docVersionRes = v3DidStoreParseWord64Hex(Value(docVersionTextRes))
+    if IsErr(docVersionRes):
+        return Err[bool](Error(docVersionRes))
+    let docUpdatedRes = v3DidStoreParseWord64Hex(Value(docUpdatedTextRes))
+    if IsErr(docUpdatedRes):
+        return Err[bool](Error(docUpdatedRes))
+    let deviceCountRes = v3DidStoreParseInt32(Value(deviceCountTextRes))
+    if IsErr(deviceCountRes):
+        return Err[bool](Error(deviceCountRes))
+    let devicePrefix = "device="
+    var devices: V3DidDeviceMethod[]
+    for i in 0..<lines.len:
+        let line = lines[i]
+        if !strings.HasPrefix(line, devicePrefix):
+            continue
+        let payload = strings.SliceBytes(line, strings.Len(devicePrefix), strings.Len(line) - strings.Len(devicePrefix))
+        let deviceRes = v3DidStoreParseDevicePayload(didText, Value(rootHashRes), payload)
+        if IsErr(deviceRes):
+            return Err[bool](Error(deviceRes))
+        add(devices, Value(deviceRes))
+    if devices.len != Value(deviceCountRes):
+        return Err[bool]("v3 did: device count mismatch")
+    out.did = didText
+    out.genesisCid = genesisCid
+    out.rootPeerId = rootPeerId
+    out.rootSeedHash = Value(rootHashRes)
+    out.version = Value(docVersionRes)
+    out.updatedAtEpochSeconds = Value(docUpdatedRes)
+    out.devices = devices
+    return Ok[bool](true)
+
+fn v3DidDocumentParseText(text: str): Result[V3DidDocument] =
+    var out: V3DidDocument
+    let parseRes = v3DidDocumentParseTextFill(out, text)
+    if IsErr(parseRes):
+        return Err[V3DidDocument](Error(parseRes))
+    return Ok[V3DidDocument](out)
+
+fn v3DidIdentityApplyDocument(identity: V3DidIdentity,
+                              document: V3DidDocument): Result[V3DidIdentity] =
+    var out: V3DidIdentity
+    let applyRes = v3DidIdentityApplyDocumentFill(out, identity, document)
+    if IsErr(applyRes):
+        return Err[V3DidIdentity](Error(applyRes))
+    return Ok[V3DidIdentity](out)
+
+fn v3DidIdentityApplyDocumentFill(out: var V3DidIdentity,
+                                  identity: V3DidIdentity,
+                                  document: V3DidDocument): Result[bool] =
+    out = V3DidIdentity()
+    let expectRootPeer = v3DidRootPeerIdFromSeed(identity.rootSeed)
+    let expectRootHash = v3DidRootSeedHash(identity.rootSeed)
+    let expectGenesisCid = v3DidGenesisCid(expectRootPeer, expectRootHash)
+    let expectDid = v3DidFromGenesisCid(expectGenesisCid)
+    if document.did != expectDid:
+        return Err[bool]("v3 did: document did mismatch")
+    if !layout.fixedBytes32Equal(document.genesisCid, expectGenesisCid):
+        return Err[bool]("v3 did: document genesis cid mismatch")
+    if !types.v3Libp2pPeerIdEqual(document.rootPeerId, expectRootPeer):
+        return Err[bool]("v3 did: document root peer mismatch")
+    if !layout.fixedBytes32Equal(document.rootSeedHash, expectRootHash):
+        return Err[bool]("v3 did: document root seed hash mismatch")
+    let selfPeer = v3DidDevicePeerIdFromSeed(identity.deviceSeed)
+    let selfPos = v3DidDocumentFindDevicePos(document, selfPeer)
+    if selfPos < 0:
+        return Err[bool]("v3 did: self device missing from document")
+    let selfSeedHash = v3DidDeviceSeedHash(identity.deviceSeed)
+    if !layout.fixedBytes32Equal(document.devices[selfPos].deviceSeedHash, selfSeedHash):
+        return Err[bool]("v3 did: self device seed hash mismatch")
+    let storeTextRes = v3DidStoreBuildText(identity.rootSeed,
+                                           identity.deviceSeed,
+                                           document,
+                                           document.devices[selfPos])
+    if IsErr(storeTextRes):
+        return Err[bool](Error(storeTextRes))
+    out.rootSeed = identity.rootSeed
+    out.deviceSeed = identity.deviceSeed
+    out.storeText = Value(storeTextRes)
+    out.selfDevice = document.devices[selfPos]
+    return Ok[bool](true)
+
+fn v3DidIdentityDocumentFill(out: var V3DidDocument,
+                             identity: V3DidIdentity): Result[bool] =
+    let identityStoreText = identity.storeText
+    if strings.Len(identityStoreText) <= 0:
+        return Err[bool]("v3 did store: missing store text")
+    let lines = strutil.Split(identityStoreText, '\n')
+    let versionRes = v3DidStoreFindValue(lines, "v3_did_store_version")
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    if Value(versionRes) != v3DidStoreVersionText:
+        return Err[bool]("v3 did store: unsupported version")
+    let rootSeedRes = v3DidStoreFindValue(lines, "root_seed")
+    if IsErr(rootSeedRes):
+        return Err[bool](Error(rootSeedRes))
+    let deviceSeedRes = v3DidStoreFindValue(lines, "device_seed")
+    if IsErr(deviceSeedRes):
+        return Err[bool](Error(deviceSeedRes))
+    let rootSeedBytesRes = v3DidStoreDecodeBytes(Value(rootSeedRes))
+    if IsErr(rootSeedBytesRes):
+        return Err[bool](Error(rootSeedBytesRes))
+    let deviceSeedBytesRes = v3DidStoreDecodeBytes(Value(deviceSeedRes))
+    if IsErr(deviceSeedBytesRes):
+        return Err[bool](Error(deviceSeedBytesRes))
+    let rootSeed = bytesToString(Value(rootSeedBytesRes))
+    let deviceSeed = bytesToString(Value(deviceSeedBytesRes))
+    if rootSeed != identity.rootSeed:
+        return Err[bool]("v3 did store: identity root seed mismatch")
+    if deviceSeed != identity.deviceSeed:
+        return Err[bool]("v3 did store: identity device seed mismatch")
+    let derivedRootPeer = v3DidRootPeerIdFromSeed(rootSeed)
+    let derivedRootHash = v3DidRootSeedHash(rootSeed)
+    let derivedGenesisCid = v3DidGenesisCid(derivedRootPeer, derivedRootHash)
+    let derivedDid = v3DidFromGenesisCid(derivedGenesisCid)
+    let storedDidRes = v3DidStoreFindValue(lines, "did")
+    if IsErr(storedDidRes):
+        return Err[bool](Error(storedDidRes))
+    if Value(storedDidRes) != derivedDid:
+        return Err[bool]("v3 did store: did mismatch")
+    let storedGenesisCidRes = v3DidStoreFindValue(lines, "genesis_cid")
+    if IsErr(storedGenesisCidRes):
+        return Err[bool](Error(storedGenesisCidRes))
+    let parsedGenesisCidRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(Value(storedGenesisCidRes))
+    if IsErr(parsedGenesisCidRes):
+        return Err[bool](Error(parsedGenesisCidRes))
+    if !layout.fixedBytes32Equal(derivedGenesisCid, Value(parsedGenesisCidRes)):
+        return Err[bool]("v3 did store: genesis cid mismatch")
+    let storedRootPeerRes = v3DidStoreFindValue(lines, "root_peer_id")
+    if IsErr(storedRootPeerRes):
+        return Err[bool](Error(storedRootPeerRes))
+    let parsedRootPeerRes = v3DidPeerIdFromHex(Value(storedRootPeerRes))
+    if IsErr(parsedRootPeerRes):
+        return Err[bool](Error(parsedRootPeerRes))
+    if !types.v3Libp2pPeerIdEqual(derivedRootPeer, Value(parsedRootPeerRes)):
+        return Err[bool]("v3 did store: root peer mismatch")
+    let storedRootHashRes = v3DidStoreFindValue(lines, "root_seed_hash")
+    if IsErr(storedRootHashRes):
+        return Err[bool](Error(storedRootHashRes))
+    let parsedRootHashRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(Value(storedRootHashRes))
+    if IsErr(parsedRootHashRes):
+        return Err[bool](Error(parsedRootHashRes))
+    if !layout.fixedBytes32Equal(derivedRootHash, Value(parsedRootHashRes)):
+        return Err[bool]("v3 did store: root seed hash mismatch")
+    let docVersionTextRes = v3DidStoreFindValue(lines, "document_version")
+    if IsErr(docVersionTextRes):
+        return Err[bool](Error(docVersionTextRes))
+    let docUpdatedTextRes = v3DidStoreFindValue(lines, "document_updated_at")
+    if IsErr(docUpdatedTextRes):
+        return Err[bool](Error(docUpdatedTextRes))
+    let deviceCountTextRes = v3DidStoreFindValue(lines, "device_count")
+    if IsErr(deviceCountTextRes):
+        return Err[bool](Error(deviceCountTextRes))
+    let docVersionRes = v3DidStoreParseWord64Hex(Value(docVersionTextRes))
+    if IsErr(docVersionRes):
+        return Err[bool](Error(docVersionRes))
+    let docUpdatedRes = v3DidStoreParseWord64Hex(Value(docUpdatedTextRes))
+    if IsErr(docUpdatedRes):
+        return Err[bool](Error(docUpdatedRes))
+    let deviceCountRes = v3DidStoreParseInt32(Value(deviceCountTextRes))
+    if IsErr(deviceCountRes):
+        return Err[bool](Error(deviceCountRes))
+    out = V3DidDocument()
+    out.did = derivedDid
+    out.genesisCid = derivedGenesisCid
+    out.rootPeerId = derivedRootPeer
+    out.rootSeedHash = derivedRootHash
+    out.version = Value(docVersionRes)
+    out.updatedAtEpochSeconds = Value(docUpdatedRes)
+    let devicePrefix = "device="
+    var devices: V3DidDeviceMethod[]
+    for i in 0..<lines.len:
+        let line = lines[i]
+        if !strings.HasPrefix(line, devicePrefix):
+            continue
+        let payload = strings.SliceBytes(line, strings.Len(devicePrefix), strings.Len(line) - strings.Len(devicePrefix))
+        let deviceRes = v3DidStoreParseDevicePayload(derivedDid, derivedRootHash, payload)
+        if IsErr(deviceRes):
+            return Err[bool](Error(deviceRes))
+        add(devices, Value(deviceRes))
+    out.devices = devices
+    if devices.len != Value(deviceCountRes):
+        return Err[bool]("v3 did store: device count mismatch")
+    return Ok[bool](true)
+
+fn v3DidIdentityStoreText(identity: V3DidIdentity): Result[str] =
+    if strings.Len(identity.storeText) <= 0:
+        return Err[str]("v3 did store: missing store text")
+    return Ok[str](identity.storeText)
+
+fn v3DidSaveIdentity(rootDir: str,
+                     pathRaw: str,
+                     identity: V3DidIdentity): Result[bool] =
+    let pathNonEmpty = v3path.V3PathNonEmpty(pathRaw)
+    if !pathNonEmpty:
+        return Err[bool]("v3 did store: empty path")
+    let textRes = v3DidIdentityStoreText(identity)
+    if IsErr(textRes):
+        return Err[bool](Error(textRes))
+    let path = v3DidStoreResolvedPath(rootDir, pathRaw)
+    if !v3path.V3WriteTextFile("", path, Value(textRes)):
+        return Err[bool]("v3 did store: write failed")
+    return Ok[bool](true)
+
+fn v3DidIdentityLoadFill(out: var V3DidIdentity,
+                         rootDir: str,
+                         pathRaw: str): Result[bool] =
+    out = V3DidIdentity()
+    let pathNonEmpty = v3path.V3PathNonEmpty(pathRaw)
+    if !pathNonEmpty:
+        return Err[bool]("v3 did store: empty path")
+    let path = v3DidStoreResolvedPath(rootDir, pathRaw)
+    let text = v3path.V3ReadTextFile("", path)
+    if strings.Len(text) <= 0:
+        return Err[bool]("v3 did store: missing or empty store")
+    let lines = strutil.Split(text, '\n')
+    let rootSeedRes = v3DidStoreFindValue(lines, "root_seed")
+    if IsErr(rootSeedRes):
+        return Err[bool](Error(rootSeedRes))
+    let deviceSeedRes = v3DidStoreFindValue(lines, "device_seed")
+    if IsErr(deviceSeedRes):
+        return Err[bool](Error(deviceSeedRes))
+    let rootSeedBytesRes = v3DidStoreDecodeBytes(Value(rootSeedRes))
+    if IsErr(rootSeedBytesRes):
+        return Err[bool](Error(rootSeedBytesRes))
+    let deviceSeedBytesRes = v3DidStoreDecodeBytes(Value(deviceSeedRes))
+    if IsErr(deviceSeedBytesRes):
+        return Err[bool](Error(deviceSeedBytesRes))
+    let rootSeed = bytesToString(Value(rootSeedBytesRes))
+    let deviceSeed = bytesToString(Value(deviceSeedBytesRes))
+    let selfPeerTextRes = v3DidStoreFindValue(lines, "self_device_peer_id")
+    if IsErr(selfPeerTextRes):
+        return Err[bool](Error(selfPeerTextRes))
+    let selfPeerRes = v3DidPeerIdFromHex(Value(selfPeerTextRes))
+    if IsErr(selfPeerRes):
+        return Err[bool](Error(selfPeerRes))
+    let selfPeer = Value(selfPeerRes)
+    let expectSelfPeer = v3DidDevicePeerIdFromSeed(deviceSeed)
+    if !types.v3Libp2pPeerIdEqual(expectSelfPeer, selfPeer):
+        return Err[bool]("v3 did store: self peer mismatch")
+    let expectSelfSeedHash = v3DidDeviceSeedHash(deviceSeed)
+    var probe: V3DidIdentity
+    probe.rootSeed = rootSeed
+    probe.deviceSeed = deviceSeed
+    probe.storeText = text
+    var document: V3DidDocument
+    let documentRes = v3DidIdentityDocumentFill(document, probe)
+    if IsErr(documentRes):
+        return Err[bool](Error(documentRes))
+    let selfPos = v3DidDocumentFindDevicePos(document, selfPeer)
+    if selfPos < 0:
+        return Err[bool]("v3 did store: self device missing")
+    let selfDevice = document.devices[selfPos]
+    if !layout.fixedBytes32Equal(selfDevice.deviceSeedHash, expectSelfSeedHash):
+        return Err[bool]("v3 did store: self device seed hash mismatch")
+    let storeTextRes = v3DidStoreBuildText(rootSeed, deviceSeed, document, selfDevice)
+    if IsErr(storeTextRes):
+        return Err[bool](Error(storeTextRes))
+    out.rootSeed = rootSeed
+    out.deviceSeed = deviceSeed
+    out.storeText = Value(storeTextRes)
+    out.selfDevice = selfDevice
+    return Ok[bool](true)
+
+fn v3DidIdentityLoad(rootDir: str,
+                     pathRaw: str): Result[V3DidIdentity] =
+    var out: V3DidIdentity
+    let loadRes = v3DidIdentityLoadFill(out, rootDir, pathRaw)
+    if IsErr(loadRes):
+        return Err[V3DidIdentity](Error(loadRes))
+    return Ok[V3DidIdentity](out)
+
+fn v3DidLoadOrCreateIdentityFill(out: var V3DidIdentity,
+                                 rootDir: str,
+                                 pathRaw: str,
+                                 rootSeedHint: str,
+                                 deviceSeedHint: str,
+                                 deviceLabelHint: str,
+                                 epochSeconds: int64): Result[bool] =
+    out = V3DidIdentity()
+    let pathNonEmpty = v3path.V3PathNonEmpty(pathRaw)
+    if !pathNonEmpty:
+        return Err[bool]("v3 did store: empty path")
+    let resolvedPath = v3DidStoreResolvedPath(rootDir, pathRaw)
+    if v3path.V3PathFileExists(resolvedPath):
+        return v3DidIdentityLoadFill(out, "", resolvedPath)
+    if strings.Len(deviceLabelHint) <= 0:
+        return Err[bool]("v3 did store: device label required for create")
+    var rootSeed = rootSeedHint
+    if strings.Len(rootSeed) <= 0:
+        rootSeed = v3DidStoreBootstrapSeed("v3.did.store.root", resolvedPath, deviceLabelHint, epochSeconds)
+    var deviceSeed = deviceSeedHint
+    if strings.Len(deviceSeed) <= 0:
+        deviceSeed = v3DidStoreBootstrapSeed("v3.did.store.device", resolvedPath, deviceLabelHint, epochSeconds)
+    let identity = v3DidIdentityMake(rootSeed, deviceSeed, deviceLabelHint, epochSeconds)
+    let saveRes = v3DidSaveIdentity("", resolvedPath, identity)
+    if IsErr(saveRes):
+        return Err[bool](Error(saveRes))
+    return v3DidIdentityLoadFill(out, "", resolvedPath)
+
+fn v3DidLoadOrCreateIdentity(rootDir: str,
+                             pathRaw: str,
+                             rootSeedHint: str,
+                             deviceSeedHint: str,
+                             deviceLabelHint: str,
+                             epochSeconds: int64): Result[V3DidIdentity] =
+    var out: V3DidIdentity
+    let loadRes = v3DidLoadOrCreateIdentityFill(out,
+                                                rootDir,
+                                                pathRaw,
+                                                rootSeedHint,
+                                                deviceSeedHint,
+                                                deviceLabelHint,
+                                                epochSeconds)
+    if IsErr(loadRes):
+        return Err[V3DidIdentity](Error(loadRes))
+    return Ok[V3DidIdentity](out)
+
+fn v3DidDocumentFindDevicePos(document: V3DidDocument,
+                              devicePeerId: types.V3Libp2pPeerId): int32 =
+    for i in 0..<document.devices.len:
+        if types.v3Libp2pPeerIdEqual(document.devices[i].devicePeerId, devicePeerId):
+            return i
+    return -1
+
+fn v3DidDocumentDeviceActive(document: V3DidDocument,
+                             devicePeerId: types.V3Libp2pPeerId): bool =
+    let pos = v3DidDocumentFindDevicePos(document, devicePeerId)
+    if pos < 0:
+        return false
+    return document.devices[pos].status == v3DidDeviceStatusActive
+
+fn v3DidDocumentMatchesRootSeed(document: V3DidDocument, rootSeed: str): bool =
+    return layout.fixedBytes32Equal(document.rootSeedHash, v3DidRootSeedHash(rootSeed))
+
+fn v3DidDocumentEnrollDevice(document: V3DidDocument,
+                             rootSeed: str,
+                             deviceSeed: str,
+                             deviceLabel: str,
+                             epochSeconds: int64): Result[V3DidDocument] =
+    let rootMatches = v3DidDocumentMatchesRootSeed(document, rootSeed)
+    if !rootMatches:
+        return Err[V3DidDocument]("v3 did: root seed mismatch")
+    let devicePeerId = v3DidDevicePeerIdFromSeed(deviceSeed)
+    let existingPos = v3DidDocumentFindDevicePos(document, devicePeerId)
+    if existingPos >= 0:
+        return Err[V3DidDocument]("v3 did: device already enrolled")
+    let device = v3DidDeviceMethodMake(document.did,
+                                       document.rootSeedHash,
+                                       deviceSeed,
+                                       deviceLabel,
+                                       epochSeconds)
+    var out: V3DidDocument
+    v3DidDocumentAssign(out, document)
+    var devices: V3DidDeviceMethod[]
+    for i in 0..<document.devices.len:
+        add(devices, document.devices[i])
+    add(devices, device)
+    out.devices = devices
+    out.version = v3DidWord64AddInt64(document.version, int64(1))
+    out.updatedAtEpochSeconds = v3DidWord64FromInt64(epochSeconds)
+    return Ok[V3DidDocument](out)
+
+fn v3DidDocumentRevokeDevice(document: V3DidDocument,
+                             rootSeed: str,
+                             devicePeerId: types.V3Libp2pPeerId,
+                             revokedAtEpochSeconds: int64): Result[V3DidDocument] =
+    let rootMatches = v3DidDocumentMatchesRootSeed(document, rootSeed)
+    if !rootMatches:
+        return Err[V3DidDocument]("v3 did: root seed mismatch")
+    let pos = v3DidDocumentFindDevicePos(document, devicePeerId)
+    if pos < 0:
+        return Err[V3DidDocument]("v3 did: device not found")
+    if document.devices[pos].status != v3DidDeviceStatusActive:
+        return Err[V3DidDocument]("v3 did: device not active")
+    var out: V3DidDocument
+    v3DidDocumentAssign(out, document)
+    var devices: V3DidDeviceMethod[]
+    for i in 0..<document.devices.len:
+        var device = document.devices[i]
+        if i == pos:
+            device.status = v3DidDeviceStatusRevoked
+            device.revokedAtEpochSeconds = v3DidWord64FromInt64(revokedAtEpochSeconds)
+            device.proofDigest = v3DidDeviceProofDigest(document.did,
+                                                        document.rootSeedHash,
+                                                        device.devicePeerId,
+                                                        device.deviceSeedHash,
+                                                        device.deviceLabel,
+                                                        device.status,
+                                                        device.addedAtEpochSeconds,
+                                                        device.revokedAtEpochSeconds)
+        add(devices, device)
+    out.devices = devices
+    out.version = v3DidWord64AddInt64(document.version, int64(1))
+    out.updatedAtEpochSeconds = v3DidWord64FromInt64(revokedAtEpochSeconds)
+    return Ok[V3DidDocument](out)
+
+fn V3DidWord64Value(value: V3DidWord64): int64 =
+    return v3DidWord64Value(value)
+
+fn V3DidIdentityDid(identity: V3DidIdentity): str =
+    return v3DidIdentityDid(identity)
+
+fn V3DidDocumentFindDevicePos(document: V3DidDocument,
+                              devicePeerId: types.V3Libp2pPeerId): int32 =
+    return v3DidDocumentFindDevicePos(document, devicePeerId)
+
+fn V3DidStoreAppendLine(out: str, key: str, value: str): str =
+    return v3DidStoreAppendLine(out, key, value)

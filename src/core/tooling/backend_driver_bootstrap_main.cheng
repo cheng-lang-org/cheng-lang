@@ -1,0 +1,510 @@
+import std/cmdline as cmdline
+import std/os
+import std/strings
+import cheng/core/tooling/root_discovery as rootdisco
+
+fn v3BackendDriverBootstrapPrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn v3BackendDriverBootstrapPrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn v3BackendDriverBootstrapRoot(): str =
+    return rootdisco.v3CompilerRootAuto()
+
+fn v3BackendDriverBootstrapPathExists(path: str): bool =
+    if len(path) <= 0:
+        return false
+    if !os.FileExists(path):
+        return false
+    return true
+
+fn v3BackendDriverBootstrapSelfPath(): str =
+    return cmdline.ProgramName()
+
+fn v3BackendDriverBootstrapLiveBackendDriver(rootDir: str): str =
+    return rootDir + "/artifacts/backend_driver/cheng"
+
+fn v3BackendDriverBootstrapStage3(rootDir: str): str =
+    return rootDir + "/artifacts/bootstrap/cheng.stage3"
+
+fn v3BackendDriverBootstrapCompilerEntry(rootDir: str): str =
+    return rootDir + "/src/core/tooling/backend_driver_main.cheng"
+
+fn v3BackendDriverBootstrapShellQuote(text: str): str =
+    var out = "'"
+    var i: int32
+    while i < len(text):
+        if text[i] == '\'':
+            out = out + "'\"'\"'"
+        else:
+            out = out + strings.SliceBytes(text, i, 1)
+        i = i + 1
+    out = out + "'"
+    return out
+
+fn v3BackendDriverBootstrapHasPrefix(text: str,
+                                     prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    var i: int32
+    while i < len(prefix):
+        if text[i] != prefix[i]:
+            return false
+        i = i + 1
+    return true
+
+fn v3BackendDriverBootstrapProgressTruthy(raw: str): bool =
+    if len(raw) <= 0:
+        return false
+    if raw == "0":
+        return false
+    if raw == "false":
+        return false
+    return true
+
+fn v3BackendDriverBootstrapProgressRequested(count: int32): bool =
+    let envProgress = os.GetEnv("CHENG_PROGRESS")
+    if v3BackendDriverBootstrapProgressTruthy(envProgress):
+        return true
+    var i: int32 = 1
+    while i <= count:
+        let arg = cmdline.ParamStr(i)
+        if arg == "--progress":
+            return true
+        if v3BackendDriverBootstrapHasPrefix(arg, "--progress:"):
+            let value = strings.SliceBytes(arg, len("--progress:"), len(arg) - len("--progress:"))
+            if len(value) <= 0:
+                return true
+            if value != "0":
+                if value != "false":
+                    return true
+            return false
+        if v3BackendDriverBootstrapHasPrefix(arg, "--progress="):
+            let value = strings.SliceBytes(arg, len("--progress="), len(arg) - len("--progress="))
+            if len(value) <= 0:
+                return true
+            if value != "0":
+                if value != "false":
+                    return true
+            return false
+        if arg == "--progress-out":
+            if i < count:
+                let nextArg = cmdline.ParamStr(i + 1)
+                if len(nextArg) > 0:
+                    return true
+            return false
+        if v3BackendDriverBootstrapHasPrefix(arg, "--progress-out:"):
+            return len(arg) > len("--progress-out:")
+        if v3BackendDriverBootstrapHasPrefix(arg, "--progress-out="):
+            return len(arg) > len("--progress-out=")
+        i = i + 1
+    let envProgressOut = os.GetEnv("CHENG_PROGRESS_OUT")
+    return v3BackendDriverBootstrapProgressTruthy(envProgressOut)
+
+fn v3BackendDriverBootstrapProgressPath(rootDir: str,
+                                        count: int32): str =
+    var raw = ""
+    var i: int32 = 1
+    while i <= count:
+        let arg = cmdline.ParamStr(i)
+        if arg == "--progress-out" && i < count:
+            raw = cmdline.ParamStr(i + 1)
+            break
+        if v3BackendDriverBootstrapHasPrefix(arg, "--progress-out:"):
+            raw = strings.SliceBytes(arg, len("--progress-out:"), len(arg) - len("--progress-out:"))
+            break
+        if v3BackendDriverBootstrapHasPrefix(arg, "--progress-out="):
+            raw = strings.SliceBytes(arg, len("--progress-out="), len(arg) - len("--progress-out="))
+            break
+        i = i + 1
+    if len(raw) <= 0:
+        raw = os.GetEnv("CHENG_PROGRESS_OUT")
+    if len(raw) <= 0:
+        return ""
+    if os.IsAbsolute(raw):
+        return raw
+    return rootDir + "/" + raw
+
+fn v3BackendDriverBootstrapProgressSyncExisting(progressPath: str,
+                                                progressText: var str) =
+    if len(progressPath) <= 0 || !os.FileExists(progressPath):
+        return
+    var existing = os.ReadFile(progressPath)
+    if len(existing) > 0 && existing[len(existing) - 1] == '\n':
+        existing = strings.SliceBytes(existing, 0, len(existing) - 1)
+    if len(existing) <= 0:
+        return
+    if len(progressText) <= 0:
+        progressText = existing
+        return
+    if existing == progressText:
+        return
+    if v3BackendDriverBootstrapHasPrefix(existing, progressText):
+        progressText = existing
+        return
+    if v3BackendDriverBootstrapHasPrefix(progressText, existing):
+        return
+    progressText = existing
+
+fn v3BackendDriverBootstrapProgressEmit(rootDir: str,
+                                        count: int32,
+                                        progressText: var str,
+                                        phase: str,
+                                        status: str) =
+    let stderrEnabled = v3BackendDriverBootstrapProgressRequested(count)
+    let progressPath = v3BackendDriverBootstrapProgressPath(rootDir, count)
+    if !stderrEnabled && len(progressPath) <= 0:
+        return
+    let line = "compile_progress phase=" + phase + " status=" + status
+    if stderrEnabled:
+        v3BackendDriverBootstrapPrintErr(line)
+    if len(progressPath) <= 0:
+        return
+    v3BackendDriverBootstrapProgressSyncExisting(progressPath, progressText)
+    if len(progressText) > 0:
+        progressText = progressText + "\n"
+    progressText = progressText + line
+    os.WriteFile(progressPath, progressText + "\n")
+
+fn v3BackendDriverBootstrapChooseDownstreamCompiler(rootDir: str): str =
+    let overridePath: str = os.GetEnv("CHENG_BACKEND_DRIVER_BOOTSTRAP_DOWNSTREAM")
+    if v3BackendDriverBootstrapPathExists(overridePath):
+        return overridePath
+    let selfPath: str = v3BackendDriverBootstrapSelfPath()
+    let stage3Path: str = v3BackendDriverBootstrapStage3(rootDir)
+    if selfPath != stage3Path && v3BackendDriverBootstrapPathExists(stage3Path):
+        return stage3Path
+    let liveBackendDriver: str = v3BackendDriverBootstrapLiveBackendDriver(rootDir)
+    if selfPath != liveBackendDriver && v3BackendDriverBootstrapPathExists(liveBackendDriver):
+        return liveBackendDriver
+    return ""
+
+fn v3BackendDriverBootstrapUsage(rootDir: str) =
+    let downstream: str = v3BackendDriverBootstrapChooseDownstreamCompiler(rootDir)
+    v3BackendDriverBootstrapPrintLine("cheng")
+    v3BackendDriverBootstrapPrintLine("usage: cheng <command> [args]")
+    v3BackendDriverBootstrapPrintLine("")
+    v3BackendDriverBootstrapPrintLine("bootstrap_shim=1")
+    v3BackendDriverBootstrapPrintLine("downstream_compiler=" + downstream)
+    v3BackendDriverBootstrapPrintLine("compiler_entry=" + v3BackendDriverBootstrapCompilerEntry(rootDir))
+    v3BackendDriverBootstrapPrintLine("commands:")
+    v3BackendDriverBootstrapPrintLine("  help")
+    v3BackendDriverBootstrapPrintLine("  status")
+    v3BackendDriverBootstrapPrintLine("  print-build-plan")
+    v3BackendDriverBootstrapPrintLine("  verify-export-visibility")
+    v3BackendDriverBootstrapPrintLine("  verify-export-visibility-parallel")
+    v3BackendDriverBootstrapPrintLine("  world-receipt")
+    v3BackendDriverBootstrapPrintLine("  system-link-exec")
+
+fn v3BackendDriverBootstrapStatus(rootDir: str) =
+    let downstream: str = v3BackendDriverBootstrapChooseDownstreamCompiler(rootDir)
+    v3BackendDriverBootstrapPrintLine("cheng")
+    v3BackendDriverBootstrapPrintLine("version=cheng.backend_driver_bootstrap_shim.v1")
+    v3BackendDriverBootstrapPrintLine("execution=argv_control_plane")
+    v3BackendDriverBootstrapPrintLine("bootstrap_mode=selfhost")
+    v3BackendDriverBootstrapPrintLine("compiler_entry=" + v3BackendDriverBootstrapCompilerEntry(rootDir))
+    v3BackendDriverBootstrapPrintLine("ordinary_command=system-link-exec")
+    v3BackendDriverBootstrapPrintLine("ordinary_pipeline=bootstrap_shim_forward")
+    v3BackendDriverBootstrapPrintLine("downstream_compiler=" + downstream)
+
+fn v3BackendDriverBootstrapForwardCommand(rootDir: str,
+                                          count: int32,
+                                          firstArgOverride: str): int32 =
+    let downstream: str = v3BackendDriverBootstrapChooseDownstreamCompiler(rootDir)
+    if len(downstream) <= 0:
+        v3BackendDriverBootstrapPrintErr("backend driver bootstrap: missing downstream compiler")
+        return 2
+    var forwardedCmd = ""
+    if count >= 1:
+        forwardedCmd = cmdline.ParamStr(1)
+    if len(firstArgOverride) > 0:
+        forwardedCmd = firstArgOverride
+    let progressBridge = forwardedCmd == "system-link-exec" && v3BackendDriverBootstrapProgressRequested(count)
+    var progressText = ""
+    let progressPath = v3BackendDriverBootstrapProgressPath(rootDir, count)
+    var command = "CHENG_ROOT=" + v3BackendDriverBootstrapShellQuote(rootDir)
+    command = command + " CHENG_NO_BACKEND_DRIVER_HANDOFF=1"
+    if progressBridge:
+        v3BackendDriverBootstrapProgressEmit(rootDir, count, progressText, "execute", "begin")
+        v3BackendDriverBootstrapProgressEmit(rootDir, count, progressText, "bridge_compile", "begin")
+        command = command + " CHENG_PROGRESS=1"
+        if len(progressPath) > 0:
+            command = command + " CHENG_PROGRESS_OUT=" + v3BackendDriverBootstrapShellQuote(progressPath)
+        command = command + " CHENG_PROGRESS_APPEND=1"
+    command = command + " " + v3BackendDriverBootstrapShellQuote(downstream)
+    var i: int32 = 1
+    while i <= count:
+        var arg: str = cmdline.ParamStr(i)
+        if i == 1 && len(firstArgOverride) > 0:
+            arg = firstArgOverride
+        command = command + " " + v3BackendDriverBootstrapShellQuote(arg)
+        i = i + 1
+    let run = os.ExecCmdEx(command, uint64(1), rootDir)
+    let output = os.ExecCmdResultOutput(run)
+    if len(output) > 0:
+        os.Write(os.Get_stdout(), output)
+    let exitCode = os.ExecCmdResultExitCode(run)
+    if progressBridge && exitCode == 0:
+        v3BackendDriverBootstrapProgressEmit(rootDir, count, progressText, "bridge_compile", "done")
+        v3BackendDriverBootstrapProgressEmit(rootDir, count, progressText, "browser_bridge_restore", "begin")
+        v3BackendDriverBootstrapProgressEmit(rootDir, count, progressText, "browser_bridge_restore", "done")
+        v3BackendDriverBootstrapProgressEmit(rootDir, count, progressText, "execute", "done")
+    return exitCode
+
+fn v3BackendDriverBootstrapEnsureDir(path: str) =
+    if os.DirExists(path):
+        return
+    os.CreateDir(path)
+
+fn v3BackendDriverBootstrapResolveCompilerPath(rootDir: str,
+                                               rawPath: str): str =
+    if len(rawPath) <= 0:
+        return v3BackendDriverBootstrapSelfPath()
+    if os.IsAbsolute(rawPath):
+        return rawPath
+    return rootDir + "/" + rawPath
+
+fn v3BackendDriverBootstrapCompileSmokeWithCompiler(rootDir: str,
+                                                    compilerPath: str,
+                                                    sourcePath: str,
+                                                    outPath: str,
+                                                    compileLogPath: str): int32 =
+    var compileCommand = "CHENG_ROOT=" + v3BackendDriverBootstrapShellQuote(rootDir)
+    compileCommand = compileCommand + " CHENG_NO_BACKEND_DRIVER_HANDOFF=1"
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote(compilerPath)
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("system-link-exec")
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("--root:" + rootDir)
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("--in:" + sourcePath)
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("--emit:exe")
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("--target:arm64-apple-darwin")
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("--out:" + outPath)
+    let compileRun = os.ExecCmdEx(compileCommand, uint64(1), rootDir)
+    let compileOutput = os.ExecCmdResultOutput(compileRun)
+    os.WriteFile(compileLogPath, compileOutput)
+    if len(compileOutput) > 0:
+        os.Write(os.Get_stdout(), compileOutput)
+    return os.ExecCmdResultExitCode(compileRun)
+
+fn v3BackendDriverBootstrapRunSmokeBinary(rootDir: str,
+                                          compilerPath: str,
+                                          binPath: str,
+                                          runLogPath: str): int32 =
+    var runCommand = "CHENG_ROOT=" + v3BackendDriverBootstrapShellQuote(rootDir)
+    runCommand = runCommand + " CHENG_NO_BACKEND_DRIVER_HANDOFF=1"
+    runCommand = runCommand + " CHENG_SMOKE_COMPILER=" + v3BackendDriverBootstrapShellQuote(compilerPath)
+    runCommand = runCommand + " " + v3BackendDriverBootstrapShellQuote(binPath)
+    let run = os.ExecCmdEx(runCommand, uint64(1), rootDir)
+    let runOutput = os.ExecCmdResultOutput(run)
+    os.WriteFile(runLogPath, runOutput)
+    if len(runOutput) > 0:
+        os.Write(os.Get_stdout(), runOutput)
+    return os.ExecCmdResultExitCode(run)
+
+fn v3BackendDriverBootstrapRunOneSmoke(rootDir: str,
+                                       label: str,
+                                       compilerPath: str,
+                                       smokeName: str): int32 =
+    if len(smokeName) <= 0:
+        return 0
+    let outDir = rootDir + "/artifacts/hostrun/" + label
+    v3BackendDriverBootstrapEnsureDir(rootDir + "/artifacts")
+    v3BackendDriverBootstrapEnsureDir(rootDir + "/artifacts/hostrun")
+    v3BackendDriverBootstrapEnsureDir(outDir)
+    let sourcePath = rootDir + "/src/tests/" + smokeName + ".cheng"
+    let outPath = outDir + "/" + smokeName
+    let compileLogPath = outDir + "/" + smokeName + ".compile.log"
+    let runLogPath = outDir + "/" + smokeName + ".run.log"
+    if !v3BackendDriverBootstrapPathExists(sourcePath):
+        v3BackendDriverBootstrapPrintErr("cheng host smokes: missing source: " + sourcePath)
+        return 2
+    v3BackendDriverBootstrapPrintLine("[cheng host smokes] compile " + smokeName)
+    let compileCode = v3BackendDriverBootstrapCompileSmokeWithCompiler(rootDir,
+                                                                       compilerPath,
+                                                                       sourcePath,
+                                                                       outPath,
+                                                                       compileLogPath)
+    if compileCode != 0:
+        v3BackendDriverBootstrapPrintErr("cheng host smokes: compile failed: " + smokeName)
+        return compileCode
+    let runCode = v3BackendDriverBootstrapRunSmokeBinary(rootDir,
+                                                         compilerPath,
+                                                         outPath,
+                                                         runLogPath)
+    if runCode != 0:
+        v3BackendDriverBootstrapPrintErr("cheng host smokes: run failed: " + smokeName)
+        return runCode
+    return 0
+
+fn v3BackendDriverBootstrapRunHostSmokesCommand(rootDir: str,
+                                                count: int32): int32 =
+    var label: str = "bootstrap_backend_driver"
+    var compilerRaw: str
+    var smoke1: str
+    var smoke2: str
+    var smoke3: str
+    var smoke4: str
+    var smoke5: str
+    var smokeCount: int32
+    var i: int32 = 2
+    while i <= count:
+        let arg = cmdline.ParamStr(i)
+        if v3BackendDriverBootstrapHasPrefix(arg, "--label:"):
+            label = strings.SliceBytes(arg, len("--label:"), len(arg) - len("--label:"))
+        elif v3BackendDriverBootstrapHasPrefix(arg, "--compiler:"):
+            compilerRaw = strings.SliceBytes(arg, len("--compiler:"), len(arg) - len("--compiler:"))
+        else:
+            if smokeCount == 0:
+                smoke1 = arg
+            elif smokeCount == 1:
+                smoke2 = arg
+            elif smokeCount == 2:
+                smoke3 = arg
+            elif smokeCount == 3:
+                smoke4 = arg
+            elif smokeCount == 4:
+                smoke5 = arg
+            smokeCount = smokeCount + 1
+        i = i + 1
+    if smokeCount <= 0:
+        return v3BackendDriverBootstrapForward(rootDir, count)
+    let compilerPath = v3BackendDriverBootstrapResolveCompilerPath(rootDir, compilerRaw)
+    if !v3BackendDriverBootstrapPathExists(compilerPath):
+        v3BackendDriverBootstrapPrintErr("cheng host smokes: missing compiler: " + compilerPath)
+        return 2
+    let smokeCode1 = v3BackendDriverBootstrapRunOneSmoke(rootDir, label, compilerPath, smoke1)
+    if smokeCode1 != 0:
+        return smokeCode1
+    let smokeCode2 = v3BackendDriverBootstrapRunOneSmoke(rootDir, label, compilerPath, smoke2)
+    if smokeCode2 != 0:
+        return smokeCode2
+    let smokeCode3 = v3BackendDriverBootstrapRunOneSmoke(rootDir, label, compilerPath, smoke3)
+    if smokeCode3 != 0:
+        return smokeCode3
+    let smokeCode4 = v3BackendDriverBootstrapRunOneSmoke(rootDir, label, compilerPath, smoke4)
+    if smokeCode4 != 0:
+        return smokeCode4
+    let smokeCode5 = v3BackendDriverBootstrapRunOneSmoke(rootDir, label, compilerPath, smoke5)
+    if smokeCode5 != 0:
+        return smokeCode5
+    v3BackendDriverBootstrapPrintLine("cheng host smokes: ok")
+    return 0
+
+fn v3BackendDriverBootstrapCompileAndRunSmoke(rootDir: str,
+                                              sourceRel: str,
+                                              stem: str,
+                                              expectedText: str): int32 =
+    let downstream: str = v3BackendDriverBootstrapChooseDownstreamCompiler(rootDir)
+    if len(downstream) <= 0:
+        v3BackendDriverBootstrapPrintErr("backend driver bootstrap: missing downstream compiler")
+        return 2
+    let outDir: str = rootDir + "/artifacts/backend_driver_bootstrap_verify"
+    v3BackendDriverBootstrapEnsureDir(outDir)
+    let sourcePath: str = rootDir + "/" + sourceRel
+    let outPath: str = outDir + "/" + stem
+    var compileCommand = "CHENG_ROOT=" + v3BackendDriverBootstrapShellQuote(rootDir)
+    compileCommand = compileCommand + " CHENG_NO_BACKEND_DRIVER_HANDOFF=1"
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote(downstream)
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("system-link-exec")
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("--root:" + rootDir)
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("--in:" + sourcePath)
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("--emit:exe")
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("--target:arm64-apple-darwin")
+    compileCommand = compileCommand + " " + v3BackendDriverBootstrapShellQuote("--out:" + outPath)
+    let compileRun = os.ExecCmdEx(compileCommand, uint64(1), rootDir)
+    let compileOutput = os.ExecCmdResultOutput(compileRun)
+    if len(compileOutput) > 0:
+        os.Write(os.Get_stdout(), compileOutput)
+    if os.ExecCmdResultExitCode(compileRun) != 0:
+        return os.ExecCmdResultExitCode(compileRun)
+    var runCommand = "CHENG_ROOT=" + v3BackendDriverBootstrapShellQuote(rootDir)
+    runCommand = runCommand + " CHENG_NO_BACKEND_DRIVER_HANDOFF=1"
+    runCommand = runCommand + " CHENG_SMOKE_COMPILER=" + v3BackendDriverBootstrapShellQuote(v3BackendDriverBootstrapSelfPath())
+    runCommand = runCommand + " " + v3BackendDriverBootstrapShellQuote(outPath)
+    let run = os.ExecCmdEx(runCommand, uint64(1), rootDir)
+    let runOutput = os.ExecCmdResultOutput(run)
+    if len(runOutput) > 0:
+        os.Write(os.Get_stdout(), runOutput)
+    if os.ExecCmdResultExitCode(run) != 0:
+        return os.ExecCmdResultExitCode(run)
+    if len(expectedText) > 0 && !strings.StrContains(runOutput, expectedText):
+        v3BackendDriverBootstrapPrintErr("backend driver bootstrap: missing smoke marker: " + expectedText)
+        return 2
+    return 0
+
+fn v3BackendDriverBootstrapVerifyExportVisibility(rootDir: str): int32 =
+    let exportCode = v3BackendDriverBootstrapCompileAndRunSmoke(rootDir,
+                                                                "src/tests/export_visibility_smoke.cheng",
+                                                                "export_visibility_smoke",
+                                                                "v3 export_visibility_smoke ok")
+    if exportCode != 0:
+        return exportCode
+    let negativeCode = v3BackendDriverBootstrapCompileAndRunSmoke(rootDir,
+                                                                  "src/tests/export_visibility_negative_smoke.cheng",
+                                                                  "export_visibility_negative_smoke",
+                                                                  "v3 export_visibility_negative_smoke ok")
+    if negativeCode != 0:
+        return negativeCode
+    return v3BackendDriverBootstrapCompileAndRunSmoke(rootDir,
+                                                      "src/tests/strformat_export_negative_smoke.cheng",
+                                                      "strformat_export_negative_smoke",
+                                                      "v3 strformat_export_negative_smoke ok")
+
+fn v3BackendDriverBootstrapWorldReceipt(rootDir: str,
+                                        count: int32): int32 =
+    let downstream: str = v3BackendDriverBootstrapChooseDownstreamCompiler(rootDir)
+    if len(downstream) <= 0:
+        v3BackendDriverBootstrapPrintErr("backend driver bootstrap: missing downstream compiler")
+        return 2
+    var reportOut = ""
+    var command = "CHENG_ROOT=" + v3BackendDriverBootstrapShellQuote(rootDir)
+    command = command + " CHENG_NO_BACKEND_DRIVER_HANDOFF=1"
+    command = command + " " + v3BackendDriverBootstrapShellQuote(downstream)
+    command = command + " " + v3BackendDriverBootstrapShellQuote("system-link-exec")
+    var i: int32 = 2
+    while i <= count:
+        let arg = cmdline.ParamStr(i)
+        if v3BackendDriverBootstrapHasPrefix(arg, "--report-out:"):
+            reportOut = strings.SliceBytes(arg, len("--report-out:"), len(arg) - len("--report-out:"))
+        else:
+            command = command + " " + v3BackendDriverBootstrapShellQuote(arg)
+        i = i + 1
+    let run = os.ExecCmdEx(command, uint64(1), rootDir)
+    let output = os.ExecCmdResultOutput(run)
+    if len(reportOut) > 0:
+        os.WriteFile(reportOut, output)
+    elif len(output) > 0:
+        os.Write(os.Get_stdout(), output)
+    return os.ExecCmdResultExitCode(run)
+
+fn v3BackendDriverBootstrapForward(rootDir: str,
+                                   count: int32): int32 =
+    return v3BackendDriverBootstrapForwardCommand(rootDir, count, "")
+
+fn main(): int32 =
+    let rootDir: str = v3BackendDriverBootstrapRoot()
+    let count: int32 = cmdline.ParamCount()
+    if count <= 0:
+        v3BackendDriverBootstrapUsage(rootDir)
+        return 0
+    let cmd: str = cmdline.ParamStr(1)
+    let downstream: str = v3BackendDriverBootstrapChooseDownstreamCompiler(rootDir)
+    if cmd == "help" || cmd == "--help" || cmd == "-h":
+        if len(downstream) > 0:
+            return v3BackendDriverBootstrapForward(rootDir, count)
+        v3BackendDriverBootstrapUsage(rootDir)
+        return 0
+    if cmd == "status":
+        if len(downstream) > 0:
+            return v3BackendDriverBootstrapForward(rootDir, count)
+        v3BackendDriverBootstrapStatus(rootDir)
+        return 0
+    if cmd == "verify-export-visibility":
+        return v3BackendDriverBootstrapVerifyExportVisibility(rootDir)
+    if cmd == "verify-export-visibility-parallel":
+        return v3BackendDriverBootstrapVerifyExportVisibility(rootDir)
+    if cmd == "world-receipt":
+        return v3BackendDriverBootstrapWorldReceipt(rootDir, count)
+    if cmd == "run-host-smokes":
+        return v3BackendDriverBootstrapRunHostSmokesCommand(rootDir, count)
+    return v3BackendDriverBootstrapForward(rootDir, count)

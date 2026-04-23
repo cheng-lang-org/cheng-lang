@@ -1,0 +1,289 @@
+# MsQuic TLS 1.3 key schedule helpers(pure Cheng).
+
+import std/result
+import std/rawbytes
+import std/buffer
+import std/crypto/hkdf
+import std/crypto/sha256
+import std/crypto/sha384
+import cheng/quic/tls/common
+const
+    tls13LabelPrefix = "tls13 "
+
+type
+    MsQuicTls13Secrets =
+        clientHandshakeTrafficSecret: Bytes
+        serverHandshakeTrafficSecret: Bytes
+        clientTrafficSecret0: Bytes
+        serverTrafficSecret0: Bytes
+        masterSecret: Bytes
+        resumptionMasterSecret: Bytes
+
+    MsQuicTls13KeyMaterial =
+        sendKey: Bytes
+        sendIv: Bytes
+        recvKey: Bytes
+        recvIv: Bytes
+        secrets: MsQuicTls13Secrets
+
+    MsQuicTls13KeyIv =
+        key: Bytes
+        iv: Bytes
+
+    MsQuicTls13KeyIvHp =
+        key: Bytes
+        iv: Bytes
+        hp: Bytes
+
+    MsQuicQuicInitialKeys =
+        sendKey: Bytes
+        sendIv: Bytes
+        sendHp: Bytes
+        recvKey: Bytes
+        recvIv: Bytes
+        recvHp: Bytes
+
+fn msquicTls13HashLen(cipher: MsQuicCipherSuite): int32 =
+    if cipher == MsQuicCipherAes256Gcm:
+        return 48
+    return 32
+
+fn msquicTls13KeyLen(cipher: MsQuicCipherSuite): int32 =
+    if cipher == MsQuicCipherAes128Gcm:
+        return 16
+    if cipher == MsQuicCipherAes256Gcm:
+        return 32
+    return 32
+
+fn msquicTls13IvLen(cipher: MsQuicCipherSuite): int32 =
+    cipher
+    return 12
+
+fn msquicTls13EmptyHash(cipher: MsQuicCipherSuite): Bytes =
+    if cipher == MsQuicCipherAes256Gcm:
+        return sha384Digest(emptyBytes())
+    return sha256Digest(emptyBytes())
+
+fn msquicTls13HkdfExtract(cipher: MsQuicCipherSuite, ikm: Bytes, salt: Bytes): Bytes =
+    if cipher == MsQuicCipherAes256Gcm:
+        return hkdfExtractSha384(ikm, salt)
+    return hkdfExtractSha256(ikm, salt)
+
+fn msquicTls13HkdfExpand(cipher: MsQuicCipherSuite, prk: Bytes, info: Bytes, length: int32): Result[Bytes] =
+    if cipher == MsQuicCipherAes256Gcm:
+        return hkdfExpandSha384(prk, info, length)
+    return hkdfExpandSha256(prk, info, length)
+
+fn msquicTls13BuildLabel(length: int32, label: str, context: Bytes): Bytes =
+    var buf: ByteBuffer = newByteBuffer()
+    appendByte(buf, (length >> 8) & 0xff)
+    appendByte(buf, length & 0xff)
+    let fullLabel: str = tls13LabelPrefix + label
+    appendByte(buf, len(fullLabel))
+    appendBytes(buf, fullLabel)
+    appendByte(buf, bytesLen(context))
+    appendBytes(buf, context)
+    return toBytes(buf)
+
+fn msquicTls13ExpandLabel(secret: Bytes, label: str, context: Bytes, length: int32, cipher: MsQuicCipherSuite): Result[Bytes] =
+    let info: Bytes = msquicTls13BuildLabel(length, label, context)
+    return msquicTls13HkdfExpand(cipher, secret, info, length)
+
+fn msquicTls13DeriveSecret(secret: Bytes, label: str, transcriptHash: Bytes, cipher: MsQuicCipherSuite): Result[Bytes] =
+    let hashLen: int32 = msquicTls13HashLen(cipher)
+    return msquicTls13ExpandLabel(secret, label, transcriptHash, hashLen, cipher)
+
+fn msquicTls13UpdateSecret(secret: Bytes, cipher: MsQuicCipherSuite): Result[Bytes] =
+    if bytesLen(secret) <= 0:
+        return Err[Bytes]("tls13: empty traffic secret")
+    let hashLen: int32 = msquicTls13HashLen(cipher)
+    return msquicTls13ExpandLabel(secret, "quic ku", emptyBytes(), hashLen, cipher)
+
+fn msquicTls13DeriveSecretsInto(
+    out: var MsQuicTls13Secrets,
+    psk: Bytes,
+    sharedSecret: Bytes,
+    transcriptHash: Bytes,
+    cipher: MsQuicCipherSuite
+): Result[bool] =
+    let zeroSalt: Bytes = emptyBytes()
+    let early: Bytes = msquicTls13HkdfExtract(cipher, psk, zeroSalt)
+    let emptyHash: Bytes = msquicTls13EmptyHash(cipher)
+    let derivedRes: Result[Bytes] = msquicTls13DeriveSecret(early, "derived", emptyHash, cipher)
+    if IsErr(derivedRes):
+        return Err[bool](ErrorText(derivedRes))
+    let derived: Bytes = Value(derivedRes)
+    let handshake: Bytes = msquicTls13HkdfExtract(cipher, sharedSecret, derived)
+    let chsRes: Result[Bytes] = msquicTls13DeriveSecret(handshake, "c hs traffic", transcriptHash, cipher)
+    if IsErr(chsRes):
+        return Err[bool](ErrorText(chsRes))
+    let shsRes: Result[Bytes] = msquicTls13DeriveSecret(handshake, "s hs traffic", transcriptHash, cipher)
+    if IsErr(shsRes):
+        return Err[bool](ErrorText(shsRes))
+    let derived2Res: Result[Bytes] = msquicTls13DeriveSecret(handshake, "derived", emptyHash, cipher)
+    if IsErr(derived2Res):
+        return Err[bool](ErrorText(derived2Res))
+    let derived2: Bytes = Value(derived2Res)
+    let master: Bytes = msquicTls13HkdfExtract(cipher, emptyBytes(), derived2)
+    let hashLen: int32 = msquicTls13HashLen(cipher)
+    let resMasterRes: Result[Bytes] = msquicTls13ExpandLabel(master, "res master", emptyBytes(), hashLen, cipher)
+    if IsErr(resMasterRes):
+        return Err[bool](ErrorText(resMasterRes))
+    let capRes: Result[Bytes] = msquicTls13DeriveSecret(master, "c ap traffic", transcriptHash, cipher)
+    if IsErr(capRes):
+        return Err[bool](ErrorText(capRes))
+    let sapRes: Result[Bytes] = msquicTls13DeriveSecret(master, "s ap traffic", transcriptHash, cipher)
+    if IsErr(sapRes):
+        return Err[bool](ErrorText(sapRes))
+    out.clientHandshakeTrafficSecret = Value(chsRes)
+    out.serverHandshakeTrafficSecret = Value(shsRes)
+    out.clientTrafficSecret0 = Value(capRes)
+    out.serverTrafficSecret0 = Value(sapRes)
+    out.masterSecret = master
+    out.resumptionMasterSecret = Value(resMasterRes)
+    return Ok[bool](true)
+
+fn msquicTls13DeriveSecrets(psk: Bytes, sharedSecret: Bytes, transcriptHash: Bytes, cipher: MsQuicCipherSuite): Result[MsQuicTls13Secrets] =
+    var out: MsQuicTls13Secrets
+    let fillRes: Result[bool] = msquicTls13DeriveSecretsInto(out, psk, sharedSecret, transcriptHash, cipher)
+    if IsErr(fillRes):
+        return Err[MsQuicTls13Secrets](ErrorText(fillRes))
+    return Ok[MsQuicTls13Secrets](out)
+
+fn msquicTls13DeriveEarlyTrafficSecret(psk: Bytes, transcriptHash: Bytes, cipher: MsQuicCipherSuite): Result[Bytes] =
+    if bytesLen(psk) <= 0:
+        return Err[Bytes]("tls13: psk missing")
+    let early: Bytes = msquicTls13HkdfExtract(cipher, psk, emptyBytes())
+    return msquicTls13DeriveSecret(early, "c e traffic", transcriptHash, cipher)
+
+fn msquicTls13DeriveResumptionPsk(
+    resumptionMasterSecret: Bytes,
+    nonce: Bytes,
+    cipher: MsQuicCipherSuite
+): Result[Bytes] =
+    if bytesLen(resumptionMasterSecret) <= 0:
+        return Err[Bytes]("tls13: resumption master secret missing")
+    let hashLen: int32 = msquicTls13HashLen(cipher)
+    return msquicTls13ExpandLabel(resumptionMasterSecret, "resumption", nonce, hashLen, cipher)
+
+fn msquicTls13DeriveKeyIv(secret: Bytes, cipher: MsQuicCipherSuite): Result[MsQuicTls13KeyIv] =
+    let keyLen: int32 = msquicTls13KeyLen(cipher)
+    let ivLen: int32 = msquicTls13IvLen(cipher)
+    if keyLen <= 0 || ivLen <= 0:
+        return Err[MsQuicTls13KeyIv]("tls13: invalid key lengths")
+    let keyRes: Result[Bytes] = msquicTls13ExpandLabel(secret, "key", emptyBytes(), keyLen, cipher)
+    if IsErr(keyRes):
+        return Err[MsQuicTls13KeyIv](ErrorText(keyRes))
+    let ivRes: Result[Bytes] = msquicTls13ExpandLabel(secret, "iv", emptyBytes(), ivLen, cipher)
+    if IsErr(ivRes):
+        return Err[MsQuicTls13KeyIv](ErrorText(ivRes))
+    return Ok[MsQuicTls13KeyIv](MsQuicTls13KeyIv(key: Value(keyRes), iv: Value(ivRes)))
+
+fn msquicTls13KeyMaterial(psk: Bytes, sharedSecret: Bytes, cipher: MsQuicCipherSuite, isClient: bool): Result[MsQuicTls13KeyMaterial] =
+    let transcript: Bytes = msquicTls13EmptyHash(cipher)
+    let secretsRes: Result[MsQuicTls13Secrets] = msquicTls13DeriveSecrets(psk, sharedSecret, transcript, cipher)
+    if IsErr(secretsRes):
+        return Err[MsQuicTls13KeyMaterial](ErrorText(secretsRes))
+    let secrets: MsQuicTls13Secrets = Value(secretsRes)
+    let clientRes: Result[MsQuicTls13KeyIv] = msquicTls13DeriveKeyIv(secrets.clientTrafficSecret0, cipher)
+    if IsErr(clientRes):
+        return Err[MsQuicTls13KeyMaterial](ErrorText(clientRes))
+    let serverRes: Result[MsQuicTls13KeyIv] = msquicTls13DeriveKeyIv(secrets.serverTrafficSecret0, cipher)
+    if IsErr(serverRes):
+        return Err[MsQuicTls13KeyMaterial](ErrorText(serverRes))
+    var out: MsQuicTls13KeyMaterial = MsQuicTls13KeyMaterial(secrets: secrets)
+    if isClient:
+        out.sendKey = Value(clientRes).key
+        out.sendIv = Value(clientRes).iv
+        out.recvKey = Value(serverRes).key
+        out.recvIv = Value(serverRes).iv
+    else:
+        out.sendKey = Value(serverRes).key
+        out.sendIv = Value(serverRes).iv
+        out.recvKey = Value(clientRes).key
+        out.recvIv = Value(clientRes).iv
+    return Ok[MsQuicTls13KeyMaterial](out)
+
+fn msquicTls13HexValue(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + int32(c) - int32('a')
+    if c >= 'A' && c <= 'F':
+        return 10 + int32(c) - int32('A')
+    return -1
+
+fn msquicTls13HexDecode(text: str): Result[Bytes] =
+    if len(text) % 2 != 0:
+        return Err[Bytes]("tls13: hex length must be even")
+    let out: Bytes = bytesAlloc(len(text) / 2)
+    var i: int32
+    while i < len(text):
+        let hi: int32 = msquicTls13HexValue(text[i])
+        let lo: int32 = msquicTls13HexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("tls13: invalid hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn msquicQuicInitialSalt(): Bytes =
+    let hex: str = "38762cf7f55934b34d179ae6a4c80cadccbb7f0a"
+    let res: Result[Bytes] = msquicTls13HexDecode(hex)
+    if IsErr(res):
+        return emptyBytes()
+    return Value(res)
+
+fn msquicQuicDeriveKeyIvHp(secret: Bytes, cipher: MsQuicCipherSuite): Result[MsQuicTls13KeyIvHp] =
+    let keyLen: int32 = msquicTls13KeyLen(cipher)
+    let ivLen: int32 = msquicTls13IvLen(cipher)
+    if keyLen <= 0 || ivLen <= 0:
+        return Err[MsQuicTls13KeyIvHp]("tls13: invalid key lengths")
+    let keyRes: Result[Bytes] = msquicTls13ExpandLabel(secret, "quic key", emptyBytes(), keyLen, cipher)
+    if IsErr(keyRes):
+        return Err[MsQuicTls13KeyIvHp](ErrorText(keyRes))
+    let ivRes: Result[Bytes] = msquicTls13ExpandLabel(secret, "quic iv", emptyBytes(), ivLen, cipher)
+    if IsErr(ivRes):
+        return Err[MsQuicTls13KeyIvHp](ErrorText(ivRes))
+    let hpRes: Result[Bytes] = msquicTls13ExpandLabel(secret, "quic hp", emptyBytes(), keyLen, cipher)
+    if IsErr(hpRes):
+        return Err[MsQuicTls13KeyIvHp](ErrorText(hpRes))
+    return Ok[MsQuicTls13KeyIvHp](MsQuicTls13KeyIvHp(key: Value(keyRes), iv: Value(ivRes), hp: Value(hpRes)))
+
+fn msquicQuicInitialKeys(dcid: Bytes, cipher: MsQuicCipherSuite, isClient: bool): Result[MsQuicQuicInitialKeys] =
+    if bytesLen(dcid) <= 0:
+        return Err[MsQuicQuicInitialKeys]("tls13: empty initial dcid")
+    let salt: Bytes = msquicQuicInitialSalt()
+    if bytesLen(salt) <= 0:
+        return Err[MsQuicQuicInitialKeys]("tls13: initial salt unavailable")
+    let initialSecret: Bytes = hkdfExtractSha256(dcid, salt)
+    let clientSecretRes: Result[Bytes] = msquicTls13ExpandLabel(initialSecret, "client in", emptyBytes(), 32, MsQuicCipherAes128Gcm)
+    if IsErr(clientSecretRes):
+        return Err[MsQuicQuicInitialKeys](ErrorText(clientSecretRes))
+    let serverSecretRes: Result[Bytes] = msquicTls13ExpandLabel(initialSecret, "server in", emptyBytes(), 32, MsQuicCipherAes128Gcm)
+    if IsErr(serverSecretRes):
+        return Err[MsQuicQuicInitialKeys](ErrorText(serverSecretRes))
+    let clientSecret: Bytes = Value(clientSecretRes)
+    let serverSecret: Bytes = Value(serverSecretRes)
+    let clientKeysRes: Result[MsQuicTls13KeyIvHp] = msquicQuicDeriveKeyIvHp(clientSecret, cipher)
+    if IsErr(clientKeysRes):
+        return Err[MsQuicQuicInitialKeys](ErrorText(clientKeysRes))
+    let serverKeysRes: Result[MsQuicTls13KeyIvHp] = msquicQuicDeriveKeyIvHp(serverSecret, cipher)
+    if IsErr(serverKeysRes):
+        return Err[MsQuicQuicInitialKeys](ErrorText(serverKeysRes))
+    var out: MsQuicQuicInitialKeys
+    if isClient:
+        out.sendKey = Value(clientKeysRes).key
+        out.sendIv = Value(clientKeysRes).iv
+        out.sendHp = Value(clientKeysRes).hp
+        out.recvKey = Value(serverKeysRes).key
+        out.recvIv = Value(serverKeysRes).iv
+        out.recvHp = Value(serverKeysRes).hp
+    else:
+        out.sendKey = Value(serverKeysRes).key
+        out.sendIv = Value(serverKeysRes).iv
+        out.sendHp = Value(serverKeysRes).hp
+        out.recvKey = Value(clientKeysRes).key
+        out.recvIv = Value(clientKeysRes).iv
+        out.recvHp = Value(clientKeysRes).hp
+    return Ok[MsQuicQuicInitialKeys](out)

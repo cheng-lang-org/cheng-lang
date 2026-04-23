@@ -1,0 +1,82 @@
+import std/result
+import cheng/hysteria2/hysteria2_protocol as hy2
+
+fn bytesEq(left: Bytes, right: Bytes): bool =
+    if bytesLen(left) != bytesLen(right):
+        return false
+    for i in 0..<bytesLen(left):
+        if bytesGet(left, i) != bytesGet(right, i):
+            return false
+    return true
+
+fn main(): int32 =
+    let authReq = hy2.V3Hysteria2MakeAuthRequest("hysteria",
+                                                 "top-secret",
+                                                 123456,
+                                                 "pad")
+    let authReqWireRes: Result[Bytes] = hy2.V3Hysteria2EncodeAuthRequestFrame(authReq)
+    assert(IsOk(authReqWireRes), "v3 hysteria2 protocol: auth request encode")
+    let authReqDecRes: Result[hy2.V3Hysteria2AuthRequest] = hy2.V3Hysteria2DecodeAuthRequestFrame(Value(authReqWireRes))
+    assert(IsOk(authReqDecRes), "v3 hysteria2 protocol: auth request decode")
+    let authReqDec: hy2.V3Hysteria2AuthRequest = Value(authReqDecRes)
+    assert(authReqDec.authority == "hysteria", "v3 hysteria2 protocol: auth authority")
+    assert(authReqDec.auth == "top-secret", "v3 hysteria2 protocol: auth secret")
+    assert(authReqDec.ccRx == 123456, "v3 hysteria2 protocol: auth cc-rx")
+
+    let authResp = hy2.V3Hysteria2MakeAuthResponse(233,
+                                                   true,
+                                                   "auto",
+                                                   "resp")
+    let authRespWireRes: Result[Bytes] = hy2.V3Hysteria2EncodeAuthResponseFrame(authResp)
+    assert(IsOk(authRespWireRes), "v3 hysteria2 protocol: auth response encode")
+    let authRespDecRes: Result[hy2.V3Hysteria2AuthResponse] = hy2.V3Hysteria2DecodeAuthResponseFrame(Value(authRespWireRes))
+    assert(IsOk(authRespDecRes), "v3 hysteria2 protocol: auth response decode")
+    let authRespDec: hy2.V3Hysteria2AuthResponse = Value(authRespDecRes)
+    assert(authRespDec.statusCode == 233, "v3 hysteria2 protocol: auth response status")
+    assert(authRespDec.udpEnabled, "v3 hysteria2 protocol: auth response udp")
+    assert(authRespDec.ccRxText == "auto", "v3 hysteria2 protocol: auth response cc-rx")
+
+    let tcpReq = hy2.V3Hysteria2MakeTcpRequest("example.com:443", bytesFromString("pad"))
+    let tcpReqWireRes: Result[Bytes] = hy2.V3Hysteria2EncodeTcpRequest(tcpReq)
+    assert(IsOk(tcpReqWireRes), "v3 hysteria2 protocol: tcp request encode")
+    let tcpReqDecRes: Result[hy2.V3Hysteria2TcpRequest] = hy2.V3Hysteria2DecodeTcpRequest(Value(tcpReqWireRes))
+    assert(IsOk(tcpReqDecRes), "v3 hysteria2 protocol: tcp request decode")
+    assert(Value(tcpReqDecRes).address == "example.com:443", "v3 hysteria2 protocol: tcp request address")
+
+    let tcpResp = hy2.V3Hysteria2MakeTcpResponse(true, "", bytesFromString("ok"))
+    let tcpRespWireRes: Result[Bytes] = hy2.V3Hysteria2EncodeTcpResponse(tcpResp)
+    assert(IsOk(tcpRespWireRes), "v3 hysteria2 protocol: tcp response encode")
+    let tcpRespDecRes: Result[hy2.V3Hysteria2TcpResponse] = hy2.V3Hysteria2DecodeTcpResponse(Value(tcpRespWireRes))
+    assert(IsOk(tcpRespDecRes), "v3 hysteria2 protocol: tcp response decode")
+    assert(Value(tcpRespDecRes).ok, "v3 hysteria2 protocol: tcp response ok")
+
+    let udpMsg = hy2.V3Hysteria2MakeUdpMessage(7,
+                                               9,
+                                               0,
+                                               1,
+                                               "1.1.1.1:53",
+                                               bytesFromString("hello-udp-world"))
+    let udpWireRes: Result[Bytes] = hy2.V3Hysteria2EncodeUdpMessage(udpMsg)
+    assert(IsOk(udpWireRes), "v3 hysteria2 protocol: udp encode")
+    let udpDecRes: Result[hy2.V3Hysteria2UdpMessage] = hy2.V3Hysteria2DecodeUdpMessage(Value(udpWireRes))
+    assert(IsOk(udpDecRes), "v3 hysteria2 protocol: udp decode")
+    let udpDec: hy2.V3Hysteria2UdpMessage = Value(udpDecRes)
+    assert(udpDec.sessionId == 7, "v3 hysteria2 protocol: udp session")
+    assert(udpDec.address == "1.1.1.1:53", "v3 hysteria2 protocol: udp address")
+    assert(bytesEq(udpDec.payload, bytesFromString("hello-udp-world")), "v3 hysteria2 protocol: udp payload")
+
+    let fragmentsRes: Result[hy2.V3Hysteria2UdpMessage[]] = hy2.V3Hysteria2FragmentUdpMessage(udpMsg, 5)
+    assert(IsOk(fragmentsRes), "v3 hysteria2 protocol: udp fragment")
+    let fragments: hy2.V3Hysteria2UdpMessage[] = Value(fragmentsRes)
+    assert(fragments.len == 3, "v3 hysteria2 protocol: udp fragment count")
+    var reassembledFill: hy2.V3Hysteria2UdpMessage
+    let reassembleFillRes: Result[bool] = hy2.V3Hysteria2ReassembleUdpMessagesFill(fragments, reassembledFill)
+    assert(IsOk(reassembleFillRes), "v3 hysteria2 protocol: udp reassemble fill")
+    assert(bytesEq(reassembledFill.payload, udpMsg.payload), "v3 hysteria2 protocol: udp reassemble fill payload")
+    let reassembleRes: Result[hy2.V3Hysteria2UdpMessage] = hy2.V3Hysteria2ReassembleUdpMessages(fragments)
+    assert(IsOk(reassembleRes), "v3 hysteria2 protocol: udp reassemble")
+    let reassembled: hy2.V3Hysteria2UdpMessage = Value(reassembleRes)
+    assert(bytesEq(reassembled.payload, udpMsg.payload), "v3 hysteria2 protocol: udp reassemble payload")
+
+    echo("v3 hysteria2_protocol_smoke ok")
+    return 0

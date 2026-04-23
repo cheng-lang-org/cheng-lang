@@ -1,0 +1,118 @@
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/core/tooling/compiler_world as cworld
+import cheng/core/tooling/compiler_csg as ccsg
+import cheng/core/tooling/compiler_equivalence as ceq
+
+fn main(): int32 =
+    let packageId = "pkg://cheng/multi-hop"
+    let targetTriple = "arm64-apple-darwin"
+    let providers = [
+        "runtime/compiler_runtime",
+        "runtime/core_runtime",
+        "runtime/debug_runtime"
+    ]
+    let worldHeadCid = cworld.v3CompilerWorldHashText("world", [packageId, "stable"])
+    let graphCidA = cworld.v3CompilerWorldHashText("graph", [packageId, "a"])
+    let graphCidB = cworld.v3CompilerWorldHashText("graph", [packageId, "b"])
+    let graphCidC = cworld.v3CompilerWorldHashText("graph", [packageId, "c"])
+    let canonicalGraphCid = cworld.v3CompilerWorldHashText("canonical_graph", [packageId])
+    let surfaceCid = cworld.v3CompilerWorldHashText("surface", [packageId])
+    let canonicalOutputDigest = ccsg.v3CompileOutputDigest(packageId,
+                                                           targetTriple,
+                                                           providers,
+                                                           canonicalGraphCid)
+    let receiptA = ccsg.v3CompileReceiptMake(worldHeadCid,
+                                             graphCidA,
+                                             canonicalGraphCid,
+                                             targetTriple,
+                                             ccsg.v3CompileOutputDigest(packageId + ":a",
+                                                                        targetTriple,
+                                                                        providers,
+                                                                        graphCidA),
+                                             canonicalOutputDigest,
+                                             "stage3_local",
+                                             providers)
+    let receiptB = ccsg.v3CompileReceiptMake(worldHeadCid,
+                                             graphCidB,
+                                             canonicalGraphCid,
+                                             targetTriple,
+                                             ccsg.v3CompileOutputDigest(packageId + ":b",
+                                                                        targetTriple,
+                                                                        providers,
+                                                                        graphCidB),
+                                             canonicalOutputDigest,
+                                             "stage3_local",
+                                             providers)
+    let receiptC = ccsg.v3CompileReceiptMake(worldHeadCid,
+                                             graphCidC,
+                                             canonicalGraphCid,
+                                             targetTriple,
+                                             ccsg.v3CompileOutputDigest(packageId + ":c",
+                                                                        targetTriple,
+                                                                        providers,
+                                                                        graphCidC),
+                                             canonicalOutputDigest,
+                                             "stage3_local",
+                                             providers)
+    assert(ccsg.v3CompileReceiptEquivalent(receiptA, receiptB),
+           "v3 compiler migration multihop: receipt ab equivalent")
+    assert(ccsg.v3CompileReceiptEquivalent(receiptB, receiptC),
+           "v3 compiler migration multihop: receipt bc equivalent")
+    assert(ccsg.v3CompileReceiptEquivalent(receiptA, receiptC),
+           "v3 compiler migration multihop: receipt ac equivalent")
+    var proofAB: ceq.V3CompilerEquivalenceProof
+    let proofABRes = ceq.v3CompilerEquivalenceProofMake(packageId,
+                                                        "stable",
+                                                        canonicalGraphCid,
+                                                        canonicalGraphCid,
+                                                        surfaceCid,
+                                                        surfaceCid,
+                                                        receiptA.receiptCid,
+                                                        receiptB.receiptCid,
+                                                        targetTriple,
+                                                        1,
+                                                        1,
+                                                        1,
+                                                        proofAB)
+    assert(IsOk(proofABRes), "v3 compiler migration multihop: proof ab")
+    assert(ceq.v3CompilerEquivalencePassed(proofAB),
+           "v3 compiler migration multihop: proof ab passed")
+    var proofBC: ceq.V3CompilerEquivalenceProof
+    let proofBCRes = ceq.v3CompilerEquivalenceProofMake(packageId,
+                                                        "stable",
+                                                        canonicalGraphCid,
+                                                        canonicalGraphCid,
+                                                        surfaceCid,
+                                                        surfaceCid,
+                                                        receiptB.receiptCid,
+                                                        receiptC.receiptCid,
+                                                        targetTriple,
+                                                        1,
+                                                        1,
+                                                        1,
+                                                        proofBC)
+    assert(IsOk(proofBCRes), "v3 compiler migration multihop: proof bc")
+    assert(ceq.v3CompilerEquivalencePassed(proofBC),
+           "v3 compiler migration multihop: proof bc passed")
+    assert(layout.fixedBytes32Equal(proofAB.migratedReceiptCid, proofBC.baselineReceiptCid),
+           "v3 compiler migration multihop: proof chain link")
+    var proofAC: ceq.V3CompilerEquivalenceProof
+    let proofACRes = ceq.v3CompilerEquivalenceProofMake(packageId,
+                                                        "stable",
+                                                        canonicalGraphCid,
+                                                        canonicalGraphCid,
+                                                        surfaceCid,
+                                                        surfaceCid,
+                                                        receiptA.receiptCid,
+                                                        receiptC.receiptCid,
+                                                        targetTriple,
+                                                        1,
+                                                        1,
+                                                        1,
+                                                        proofAC)
+    assert(IsOk(proofACRes), "v3 compiler migration multihop: proof ac")
+    assert(ceq.v3CompilerEquivalencePassed(proofAC),
+           "v3 compiler migration multihop: proof ac passed")
+    echo("v3 compiler_migration_multihop_smoke ok")
+    return 0

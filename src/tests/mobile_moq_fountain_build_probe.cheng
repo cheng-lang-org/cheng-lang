@@ -1,0 +1,98 @@
+import std/system
+import std/cmdline
+import std/bytes as filebytes
+import cheng/moq/moq_fountain as moq
+import cheng/libp2p/mobile/mobile_capi as capi
+
+fn usage(): int32 =
+    echo("usage: mobile_moq_fountain_build_probe <core|raw|request|persist> <sample-path> [remote-peers-csv] [output-dir] [file-stem]")
+    return 2
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.CaptureCmdLine(argc, argv)
+    if cmdline.ParamCount() < 3:
+        return usage()
+    let mode = cmdline.ParamStr(1)
+    let samplePath = cmdline.ParamStr(2)
+    let remotePeersCsv = if cmdline.ParamCount() >= 4: cmdline.ParamStr(3) else: "peer-harmony"
+    let buf = filebytes.ReadFileBytes(samplePath)
+    assert(buf.data != nil && buf.len > 0, "mobile_moq probe: sample bytes")
+    echo("probe:sample_loaded")
+    echo("probe:sample_len=" + intToStr(buf.len))
+    if mode == "core":
+        let buildRes = moq.v3Libp2pMoqBuild(bytesView(buf.data, buf.len),
+                                            "peer-android",
+                                            remotePeersCsv,
+                                            "video/mp4",
+                                            512 * 1024,
+                                            128 * 1024,
+                                            2)
+        assert(IsOk(buildRes), "mobile_moq probe: core build")
+        let out = Value(buildRes)
+        echo("probe:core_ok")
+        echo("probe:bundle=" + out.bundleCid)
+        echo("probe:objects=" + intToStr(out.objectCount))
+        echo("probe:droplets=" + intToStr(out.droplets.len))
+        return 0
+    if mode == "raw":
+        let wire = capi.v3MobileCapiMoqFountainBuildRaw(buf.data,
+                                                        buf.len,
+                                                        "peer-android",
+                                                        remotePeersCsv,
+                                                        "video/mp4",
+                                                        512 * 1024,
+                                                        128 * 1024,
+                                                        2)
+        assert(len(wire) > 0, "mobile_moq probe: raw wire")
+        echo("probe:raw_ok")
+        echo("probe:wire_len=" + intToStr(len(wire)))
+        if strContains(wire, "ok=1"):
+            echo("probe:wire_ok=1")
+        else:
+            echo("probe:wire_ok=0")
+        return 0
+    if mode == "request":
+        echo("probe:request_begin")
+        var requestWire = ""
+        requestWire = requestWire + "owner_peer_id=peer-android\n"
+        requestWire = requestWire + "remote_peers_csv=" + remotePeersCsv + "\n"
+        requestWire = requestWire + "mime_type=video/mp4\n"
+        requestWire = requestWire + "object_target_bytes=524288\n"
+        requestWire = requestWire + "source_block_bytes=131072\n"
+        requestWire = requestWire + "repair_droplet_count=2\n"
+        echo("probe:request_wire_built")
+        let wire = capi.v3MobileCapiMoqFountainBuildRequestRaw(buf.data,
+                                                               buf.len,
+                                                               strDataPtr(requestWire),
+                                                               len(requestWire))
+        echo("probe:request_call_returned")
+        assert(len(wire) > 0, "mobile_moq probe: request wire")
+        echo("probe:request_ok")
+        echo("probe:wire_len=" + intToStr(len(wire)))
+        if strContains(wire, "ok=1"):
+            echo("probe:wire_ok=1")
+        else:
+            echo("probe:wire_ok=0")
+        return 0
+    if mode == "persist":
+        let outputDir = if cmdline.ParamCount() >= 5: cmdline.ParamStr(4) else: "/tmp"
+        let fileStem = if cmdline.ParamCount() >= 6: cmdline.ParamStr(5) else: "mobile-moq-probe"
+        let wire = capi.v3MobileCapiMoqFountainBuildPersistRaw(buf.data,
+                                                               buf.len,
+                                                               "peer-android",
+                                                               remotePeersCsv,
+                                                               "video/mp4",
+                                                               512 * 1024,
+                                                               128 * 1024,
+                                                               2,
+                                                               outputDir,
+                                                               fileStem)
+        assert(len(wire) > 0, "mobile_moq probe: persist wire")
+        echo("probe:persist_ok")
+        echo("probe:wire_len=" + intToStr(len(wire)))
+        if strContains(wire, "ok=1"):
+            echo("probe:wire_ok=1")
+        else:
+            echo("probe:wire_ok=0")
+        return 0
+    return usage()

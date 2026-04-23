@@ -1,0 +1,101 @@
+import std/system
+import std/rawbytes
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/chain/binary_types as binary
+import cheng/overlay/contracts as overlay
+import cheng/libp2p/core/types
+import cheng/libp2p/core/peer_id
+import cheng/libp2p/core/multiaddr
+import cheng/libp2p/protocols/webrtc_signal as signal
+import cheng/libp2p/transports/webrtc_transport
+import cheng/libp2p/host/host
+
+fn smokeAddress(): binary.V3LsmrAddress =
+    var out: binary.V3LsmrAddress
+    out.depth = 2
+    out.digits[0] = 3
+    out.digits[1] = 6
+    return out
+
+fn main(): int32 =
+    webrtc_transport.v3Libp2pWebrtcTransportResetStats()
+    var server = host.v3Libp2pHostInit("webrtc.sync.server")
+    var client = host.v3Libp2pHostInit("webrtc.sync.client")
+    let address = smokeAddress()
+
+    host.v3Libp2pRegisterHandler(server, types.v3Libp2pProtocolSync)
+    host.v3Libp2pRegisterHandler(client, types.v3Libp2pProtocolSync)
+    host.v3Libp2pRegisterHandler(server, types.v3Libp2pProtocolWebrtcSignal)
+    host.v3Libp2pRegisterHandler(client, types.v3Libp2pProtocolWebrtcSignal)
+
+    var listenAddr: types.V3Libp2pMultiaddr
+    listenAddr.host = "203.0.113.101"
+    listenAddr.port = 9777
+    listenAddr.transport = types.v3Libp2pTransportWebrtc
+    listenAddr.networkDomain = types.v3Libp2pNetworkDomainBrowserWebrtc
+    listenAddr.visibility = types.v3Libp2pVisibilityPublic
+    let listenRes = host.v3Libp2pListen(server, listenAddr)
+    assert(listenRes.ok, "v3 libp2p webrtc sync: listen")
+
+    let dialRes = host.v3Libp2pDial(client,
+                                    server.selfPeerId,
+                                    listenAddr,
+                                    overlay.v3OverlayRoleEdgeRelayStore)
+    assert(dialRes.ok, "v3 libp2p webrtc sync: dial")
+
+    let payload = bytesFromString("v3.webrtc.sync.payload")
+    let payloadCid = hash256.sha256Fixed(layout.byteSpanFromBytes(payload))
+    let sourcePeer = peer_id.v3Libp2pPeerIdFromSeed("webrtc.sync.source")
+
+    var ingress: overlay.V3IngressEnvelope
+    ingress.sourcePeerId = sourcePeer.value
+    ingress.topicScope = overlay.v3OverlayScopeRegion
+    ingress.address = address
+    ingress.payloadKind = 0
+    ingress.payload = payload
+    ingress.payloadCid = payloadCid
+    ingress.payloadLen = bytesLen(payload)
+    ingress.stampEpoch = 9
+    ingress.stampGanzhi = 18
+    host.v3Libp2pStorePut(server, ingress)
+
+    var query = overlay.V3StoreQuery()
+    query.topicScope = overlay.v3OverlayScopeRegion
+    query.address = address
+    query.rangeLimit = 2
+
+    var entries: overlay.V3IngressEnvelope[]
+    let syncRes = host.v3Libp2pSyncRequest(client, server, server.selfPeerId, query, entries)
+    assert(syncRes.ok, "v3 libp2p webrtc sync: sync request")
+    assert(entries.len == 1, "v3 libp2p webrtc sync: entry count")
+    assert(layout.fixedBytes32Equal(entries[0].payloadCid, payloadCid),
+        "v3 libp2p webrtc sync: payload cid")
+    assert(client.openStreamPeers.len == 2, "v3 libp2p webrtc sync: opened sync + signal")
+    assert(client.openStreamProtocols[0] == types.v3Libp2pProtocolSync,
+        "v3 libp2p webrtc sync: sync stream")
+    assert(client.openStreamProtocols[1] == types.v3Libp2pProtocolWebrtcSignal,
+        "v3 libp2p webrtc sync: signal stream")
+    assert(host.v3Libp2pWebrtcSignalEgressCount(client) == 5,
+        "v3 libp2p webrtc sync: signal egress count")
+    assert(host.v3Libp2pWebrtcSignalIngressCount(server) == 5,
+        "v3 libp2p webrtc sync: signal ingress count")
+    let firstSignalRes = signal.v3Libp2pWebrtcSignalDecode(client.webrtcSignalEgressPayloads[0])
+    assert(IsOk(firstSignalRes), "v3 libp2p webrtc sync: decode first signal")
+    let lastSignalRes = signal.v3Libp2pWebrtcSignalDecode(client.webrtcSignalEgressPayloads[4])
+    assert(IsOk(lastSignalRes), "v3 libp2p webrtc sync: decode last signal")
+    let firstSignal = Value(firstSignalRes)
+    let lastSignal = Value(lastSignalRes)
+    assert(firstSignal.kind == signal.v3Libp2pWebrtcSignalTurnPolicy,
+        "v3 libp2p webrtc sync: first signal kind")
+    assert(lastSignal.kind == signal.v3Libp2pWebrtcSignalIceCandidate,
+        "v3 libp2p webrtc sync: last signal kind")
+    assert(webrtc_transport.v3Libp2pWebrtcBrowserDatachannelRequestCountNow() == 1,
+        "v3 libp2p webrtc sync: browser request count")
+    assert(webrtc_transport.v3Libp2pWebrtcNativeDatachannelRequestCountNow() == 0,
+        "v3 libp2p webrtc sync: native request count")
+    assert(webrtc_transport.v3Libp2pWebrtcLoopbackRequestResponseCountNow() == 0,
+        "v3 libp2p webrtc sync: loopback request count")
+
+    echo("v3 libp2p_webrtc_sync_smoke ok")
+    return 0

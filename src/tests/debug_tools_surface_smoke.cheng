@@ -1,0 +1,263 @@
+import std/os
+import std/strutils as strutil
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as v3path
+
+fn containsText(text: str, needle: str): bool =
+    return strutil.Contains(text, needle)
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let outDir = v3path.V3PathAbsolute(root, "artifacts/debug_tools_surface")
+    assert(v3path.V3MkdirP(root, outDir), "cheng debug tools surface: mkdir")
+    let driver = v3path.V3PathAbsolute(root, "artifacts/backend_driver/cheng")
+    assert(v3path.V3FileExistsNonEmpty(root, driver), "cheng debug tools surface: backend_driver exists")
+    let packageRoot = root
+    let ordinarySource = v3path.V3PathAbsolute(root, "src/tests/ordinary_zero_exit_fixture.cheng")
+    let asmSource = v3path.V3PathAbsolute(root, "src/tests/ordinary_call_chain_fixture.cheng")
+
+    let debugLog = v3path.V3PathJoin(outDir, "debug-report.log")
+    if v3path.V3PathFileExists(debugLog):
+        os.RemoveFile(debugLog)
+    let debugRun = hostops.v3RunFileLogged(root,
+                                           "debug_report",
+                                           driver,
+                                           [
+                                               "debug-report",
+                                               "--root:" + packageRoot,
+                                               "--in:" + ordinarySource,
+                                               "--target:arm64-apple-darwin",
+                                               "--emit:obj"
+                                           ],
+                                           [],
+                                           root,
+                                           120,
+                                           debugLog)
+    assert(hostops.v3LoggedRunOk(debugRun), "debug-report rc")
+    assert(v3path.V3PathFileExists(debugLog), "debug-report log")
+    assert(containsText(debugRun.output, "cheng_debug_report_v1"), "debug-report header")
+    assert(containsText(debugRun.output, "entry="), "debug-report entry")
+    assert(containsText(debugRun.output, "lowering_function_count="), "debug-report lowering")
+    assert(containsText(debugRun.output, "primary_object_item_count="), "debug-report primary")
+    assert(containsText(debugRun.output, "native_linker_program="), "debug-report linker")
+    assert(containsText(debugRun.output, ordinarySource), "debug-report source")
+
+    let symbolsLog = v3path.V3PathJoin(outDir, "print-symbols.log")
+    if v3path.V3PathFileExists(symbolsLog):
+        os.RemoveFile(symbolsLog)
+    let symbolsRun = hostops.v3RunFileLogged(root,
+                                             "print_symbols",
+                                             driver,
+                                             [
+                                                 "print-symbols",
+                                                 "--root:" + packageRoot,
+                                                 "--in:" + ordinarySource,
+                                                 "--target:arm64-apple-darwin",
+                                                 "--emit:obj"
+                                             ],
+                                             [],
+                                             root,
+                                             120,
+                                             symbolsLog)
+    assert(hostops.v3LoggedRunOk(symbolsRun), "print-symbols rc")
+    assert(v3path.V3PathFileExists(symbolsLog), "print-symbols log")
+    assert(containsText(symbolsRun.output, "cheng_symbols_v1"), "print-symbols header")
+    assert(containsText(symbolsRun.output, "lowering_symbol_count="), "print-symbols lowering")
+    assert(containsText(symbolsRun.output, "primary_symbol_count="), "print-symbols primary")
+    assert(containsText(symbolsRun.output, "primary_unsupported_count=0"), "print-symbols unsupported")
+
+    let lineMapLog = v3path.V3PathJoin(outDir, "print-line-map.log")
+    if v3path.V3PathFileExists(lineMapLog):
+        os.RemoveFile(lineMapLog)
+    let lineMapRun = hostops.v3RunFileLogged(root,
+                                             "print_line_map",
+                                             driver,
+                                             [
+                                                 "print-line-map",
+                                                 "--root:" + packageRoot,
+                                                 "--in:" + ordinarySource,
+                                                 "--target:arm64-apple-darwin",
+                                                 "--emit:obj"
+                                             ],
+                                             [],
+                                             root,
+                                             120,
+                                             lineMapLog)
+    assert(hostops.v3LoggedRunOk(lineMapRun), "print-line-map rc")
+    assert(v3path.V3PathFileExists(lineMapLog), "print-line-map log")
+    assert(containsText(lineMapRun.output, "cheng_line_map_v1"), "print-line-map header")
+    assert(containsText(lineMapRun.output, "entry_count="), "print-line-map count")
+    assert(containsText(lineMapRun.output, "entry\t"), "print-line-map entry")
+
+    let machoObject = v3path.V3PathJoin(outDir, "ordinary_zero_exit_fixture.macho.o")
+    let machoReport = machoObject + ".report.txt"
+    let machoCompileLog = machoObject + ".compile.log"
+    if v3path.V3PathFileExists(machoObject):
+        os.RemoveFile(machoObject)
+    if v3path.V3PathFileExists(machoReport):
+        os.RemoveFile(machoReport)
+    let machoCompileRun = hostops.v3RunFileLogged(root,
+                                                  "compile_arm64_apple_darwin",
+                                                  driver,
+                                                  [
+                                                      "system-link-exec",
+                                                      "--root:" + packageRoot,
+                                                      "--in:" + ordinarySource,
+                                                      "--emit:obj",
+                                                      "--target:arm64-apple-darwin",
+                                                      "--out:" + machoObject,
+                                                      "--report-out:" + machoReport
+                                                  ],
+                                                  [],
+                                                  root,
+                                                  120,
+                                                  machoCompileLog)
+    assert(hostops.v3LoggedRunOk(machoCompileRun), "compile macho rc")
+    assert(v3path.V3FileExistsNonEmpty(root, machoObject), "compile macho object")
+    assert(v3path.V3PathFileExists(machoReport), "compile macho report")
+    let machoPrintLog = v3path.V3PathJoin(outDir, "print-object.macho.log")
+    if v3path.V3PathFileExists(machoPrintLog):
+        os.RemoveFile(machoPrintLog)
+    let machoRun = hostops.v3RunFileLogged(root,
+                                           "print_object_macho",
+                                           driver,
+                                           ["print-object", "--object:" + machoObject],
+                                           [],
+                                           root,
+                                           120,
+                                           machoPrintLog)
+    assert(hostops.v3LoggedRunOk(machoRun), "print-object macho rc")
+    assert(containsText(machoRun.output, "cheng_object_report_v1"), "print-object macho header")
+    assert(containsText(machoRun.output, "format=macho64"), "print-object macho format")
+    assert(containsText(machoRun.output, "load_command_count="), "print-object macho load")
+    assert(containsText(machoRun.output, "section_count="), "print-object macho sections")
+
+    let elfObject = v3path.V3PathJoin(outDir, "ordinary_zero_exit_fixture.elf.o")
+    let elfReport = elfObject + ".report.txt"
+    let elfCompileLog = elfObject + ".compile.log"
+    if v3path.V3PathFileExists(elfObject):
+        os.RemoveFile(elfObject)
+    if v3path.V3PathFileExists(elfReport):
+        os.RemoveFile(elfReport)
+    let elfCompileRun = hostops.v3RunFileLogged(root,
+                                                "compile_aarch64_unknown_linux_gnu",
+                                                driver,
+                                                [
+                                                    "system-link-exec",
+                                                    "--root:" + packageRoot,
+                                                    "--in:" + ordinarySource,
+                                                    "--emit:obj",
+                                                    "--target:aarch64-unknown-linux-gnu",
+                                                    "--out:" + elfObject,
+                                                    "--report-out:" + elfReport
+                                                ],
+                                                [],
+                                                root,
+                                                120,
+                                                elfCompileLog)
+    assert(hostops.v3LoggedRunOk(elfCompileRun), "compile elf rc")
+    assert(v3path.V3FileExistsNonEmpty(root, elfObject), "compile elf object")
+    assert(v3path.V3PathFileExists(elfReport), "compile elf report")
+    let elfPrintLog = v3path.V3PathJoin(outDir, "print-object.elf.log")
+    if v3path.V3PathFileExists(elfPrintLog):
+        os.RemoveFile(elfPrintLog)
+    let elfRun = hostops.v3RunFileLogged(root,
+                                         "print_object_elf",
+                                         driver,
+                                         ["print-object", "--object:" + elfObject],
+                                         [],
+                                         root,
+                                         120,
+                                         elfPrintLog)
+    assert(hostops.v3LoggedRunOk(elfRun), "print-object elf rc")
+    assert(containsText(elfRun.output, "cheng_object_report_v1"), "print-object elf header")
+    assert(containsText(elfRun.output, "format=elf64"), "print-object elf format")
+    assert(containsText(elfRun.output, "section_count="), "print-object elf sections")
+    assert(containsText(elfRun.output, "symbol_count="), "print-object elf symbols")
+    assert(containsText(elfRun.output, "reloc_count="), "print-object elf relocs")
+    let elfAliasLog = v3path.V3PathJoin(outDir, "print-elf.log")
+    if v3path.V3PathFileExists(elfAliasLog):
+        os.RemoveFile(elfAliasLog)
+    let elfAliasRun = hostops.v3RunFileLogged(root,
+                                              "print_elf",
+                                              driver,
+                                              ["print-elf", "--object:" + elfObject],
+                                              [],
+                                              root,
+                                              120,
+                                              elfAliasLog)
+    assert(hostops.v3LoggedRunOk(elfAliasRun), "print-elf rc")
+    let elfAliasOutputRaw = elfAliasRun.output
+    let elfOutputRaw = elfRun.output
+    let elfAliasOutput = strutil.Strip(elfAliasOutputRaw)
+    let elfOutput = strutil.Strip(elfOutputRaw)
+    assert(elfAliasOutput == elfOutput, "print-elf alias drift")
+
+    let peObject = v3path.V3PathJoin(outDir, "ordinary_zero_exit_fixture.pe.exe")
+    let peReport = peObject + ".report.txt"
+    let peCompileLog = peObject + ".compile.log"
+    if v3path.V3PathFileExists(peObject):
+        os.RemoveFile(peObject)
+    if v3path.V3PathFileExists(peReport):
+        os.RemoveFile(peReport)
+    let peCompileRun = hostops.v3RunFileLogged(root,
+                                               "compile_aarch64_pc_windows_msvc",
+                                               driver,
+                                               [
+                                                   "system-link-exec",
+                                                   "--root:" + packageRoot,
+                                                   "--in:" + ordinarySource,
+                                                   "--emit:exe",
+                                                   "--target:aarch64-pc-windows-msvc",
+                                                   "--out:" + peObject,
+                                                   "--report-out:" + peReport
+                                               ],
+                                               [],
+                                               root,
+                                               120,
+                                               peCompileLog)
+    assert(hostops.v3LoggedRunOk(peCompileRun), "compile pe rc")
+    assert(v3path.V3FileExistsNonEmpty(root, peObject), "compile pe object")
+    assert(v3path.V3PathFileExists(peReport), "compile pe report")
+    let pePrintLog = v3path.V3PathJoin(outDir, "print-object.pe.log")
+    if v3path.V3PathFileExists(pePrintLog):
+        os.RemoveFile(pePrintLog)
+    let peRun = hostops.v3RunFileLogged(root,
+                                        "print_object_pe",
+                                        driver,
+                                        ["print-object", "--object:" + peObject],
+                                        [],
+                                        root,
+                                        120,
+                                        pePrintLog)
+    assert(hostops.v3LoggedRunOk(peRun), "print-object pe rc")
+    assert(containsText(peRun.output, "cheng_object_report_v1"), "print-object pe header")
+    assert(containsText(peRun.output, "format=pe/coff"), "print-object pe format")
+    assert(containsText(peRun.output, "section_count="), "print-object pe sections")
+    assert(containsText(peRun.output, "import_count="), "print-object pe imports")
+
+    let asmLog = v3path.V3PathJoin(outDir, "print-asm.log")
+    if v3path.V3PathFileExists(asmLog):
+        os.RemoveFile(asmLog)
+    let asmRun = hostops.v3RunFileLogged(root,
+                                         "print_asm",
+                                         driver,
+                                         [
+                                             "print-asm",
+                                             "--root:" + packageRoot,
+                                             "--in:" + asmSource,
+                                             "--target:arm64-apple-darwin",
+                                             "--emit:obj"
+                                         ],
+                                         [],
+                                         root,
+                                         120,
+                                         asmLog)
+    assert(hostops.v3LoggedRunOk(asmRun), "print-asm rc")
+    assert(containsText(asmRun.output, "cheng_asm_report_v1"), "print-asm header")
+    assert(containsText(asmRun.output, "asm_text_begin"), "print-asm begin")
+    assert(containsText(asmRun.output, ".globl"), "print-asm globl")
+    assert(containsText(asmRun.output, "v3Leaf"), "print-asm symbol")
+
+    echo("cheng debug_tools_surface_smoke ok")
+    return 0

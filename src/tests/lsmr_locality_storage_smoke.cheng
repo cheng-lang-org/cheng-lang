@@ -1,0 +1,48 @@
+import std/system
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/chain/binary_types as types
+import cheng/chain/lsmr_types as lt
+import cheng/chain/lsmr as lsmr
+
+fn main(): int32 =
+    let addr0Res: Result[types.V3LsmrAddress] = types.v3LsmrAddressFromDigits([6, 7, 9, 3])
+    assert(IsOk(addr0Res), "v3 lsmr: address from digits")
+    let addr1Res: Result[types.V3LsmrAddress] = types.v3LsmrAddressFromDigits([6, 7, 4, 2])
+    assert(IsOk(addr1Res), "v3 lsmr: second address from digits")
+    let addr0 = Value(addr0Res)
+    let addr1 = Value(addr1Res)
+    assert(addr0.depth == 4, "v3 lsmr: depth")
+    assert(types.v3LsmrDigitOk(addr0.digits[0]), "v3 lsmr: first digit valid")
+
+    let baguaId = lsmr.v3LsmrAddressBagua(addr0, "peer-0")
+    assert(lt.v3BaguaValid(baguaId), "v3 lsmr: address bagua")
+    assert(lsmr.v3LsmrSharedPrefixDepth(addr0, addr0) == addr0.depth, "v3 lsmr: self shared prefix")
+
+    let locality0 = lt.v3HashInts("v3.lsmr.locality", [1, 10, 100])
+    let locality1 = lt.v3HashInts("v3.lsmr.locality", [1, 10, 100])
+    assert(layout.fixedBytes32Equal(locality0, locality1), "v3 lsmr: locality hash stable")
+
+    let contentRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    assert(IsOk(contentRes), "v3 lsmr: content cid")
+    let localityCidRes: Result[lt.V3LocalityCid] = lsmr.v3LsmrLocalityCidMake(7, addr0, 2, Value(contentRes), locality0)
+    assert(IsOk(localityCidRes), "v3 lsmr: locality cid")
+    assert(Value(localityCidRes).layerId == lt.v3LayerRegional, "v3 lsmr: resolution to layer")
+    assert(Value(localityCidRes).prefix.prefixDepth == 2, "v3 lsmr: locality prefix depth")
+
+    var cell: lt.V3StateCell
+    lsmr.v3LsmrStateCellFill(cell, 7, addr0, 2, Value(contentRes), locality0)
+    assert(cell.baguaId == Value(localityCidRes).baguaId, "v3 lsmr: state cell bagua")
+
+    let routeRes: Result[lsmr.V3RoutePlan] = lsmr.v3LsmrRoutePlanFromAddresses(addr0, addr1)
+    assert(IsOk(routeRes), "v3 lsmr: route plan")
+    assert(Value(routeRes).hopCount >= 0, "v3 lsmr: hop count")
+    assert(Value(routeRes).firstHopDigits.len <= 1, "v3 lsmr: first hop collapsed")
+
+    let treeRes: Result[lsmr.V3MulticastTree] = lsmr.v3LsmrBuildMulticastTree(addr0, [addr0, addr1])
+    assert(IsOk(treeRes), "v3 lsmr: multicast tree")
+    assert(Value(treeRes).branchCount >= 1, "v3 lsmr: multicast branches")
+
+    echo("v3 lsmr_locality_storage_smoke ok")
+    return 0

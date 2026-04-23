@@ -1,0 +1,768 @@
+import std/system
+import std/os
+import std/result
+import std/rawbytes
+import std/rawmem_support
+import std/cmdline as cmdline
+import std/strings
+import cheng/std/bytes_layout as layout
+import cheng/chain/anti_entropy as anti
+import cheng/chain/consensus as consensus
+import cheng/apps/bio/bio_did_chain_node as bio_did
+import cheng/apps/chain_node/chain_node as node
+import cheng/apps/chain_node/chain_node_libp2p as net
+import cheng/libp2p/core/types
+import cheng/libp2p/transports/tcp_transport
+
+@importc("get_stdout")
+fn v3ChainNodeCliStdoutBridge(): os.File
+@importc("get_stderr")
+fn v3ChainNodeCliStderrBridge(): os.File
+@importc("paramCount")
+fn v3ChainNodeCliParamCountBridge(): int32
+@importc("cheng_exit")
+fn v3ChainNodeCliExitBridge(code: int32)
+
+const
+    v3ChainNodeCliStateMagic: str = "v3.chain_node.state.v1"
+
+fn v3ChainNodeCliPrintLine(text: str) =
+    os.WriteLine(v3ChainNodeCliStdoutBridge(), text)
+
+fn v3ChainNodeCliPrintErr(text: str) =
+    os.WriteLine(v3ChainNodeCliStderrBridge(), text)
+
+fn v3ChainNodeCliExit(code: int32): int32 =
+    v3ChainNodeCliExitBridge(code)
+    return code
+
+fn v3ChainNodeCliPrintBlock(text: str) =
+    var start: int32
+    var i: int32
+    while i < text.len:
+        if text[i] != '\n':
+            i = i + 1
+            continue
+        let line: str = strings.SliceBytes(text, start, i - start)
+        v3ChainNodeCliPrintLine(line)
+        start = i + 1
+        i = i + 1
+    if start < text.len:
+        let tail: str = strings.SliceBytes(text, start, text.len - start)
+        v3ChainNodeCliPrintLine(tail)
+
+fn v3ChainNodeCliIsSpace(ch: char): bool =
+    let code = int32(ch)
+    if code == 32:
+        return true
+    if code == 9:
+        return true
+    if code == 10:
+        return true
+    if code == 13:
+        return true
+    return false
+
+fn v3ChainNodeCliTrimAscii(raw: str): str =
+    if len(raw) <= 0:
+        return ""
+    let n = len(raw)
+    var start = 0
+    while start < n && v3ChainNodeCliIsSpace(raw[start]):
+        start = start + 1
+    if start >= n:
+        return ""
+    var stop = n
+    while stop > start && v3ChainNodeCliIsSpace(raw[stop - 1]):
+        stop = stop - 1
+    if start == 0 && stop == n:
+        return raw
+    return strings.SliceBytes(raw, start, stop - start)
+
+fn v3ChainNodeCliParamCount(): int32 =
+    return v3ChainNodeCliParamCountBridge()
+
+fn v3ChainNodeCliFlagInlineValue(arg: str,
+                                 key: str,
+                                 outValue: var str): bool =
+    outValue = ""
+    let keyLen = len(key)
+    let argLen = len(arg)
+    if keyLen <= 0 || argLen <= keyLen:
+        return false
+    var matched = true
+    var i = 0
+    while i < keyLen:
+        if arg[i] != key[i]:
+            matched = false
+            break
+        i = i + 1
+    if !matched:
+        return false
+    let sep = arg[keyLen]
+    if sep != ':' && sep != '=':
+        return false
+    outValue = strings.SliceBytes(arg, keyLen + 1, argLen - keyLen - 1)
+    return true
+
+fn v3ChainNodeCliHasFlag(flag: str): bool =
+    let count = v3ChainNodeCliParamCount()
+    var i = 1
+    while i <= count:
+        if cmdline.ParamStr(i) == flag:
+            return true
+        i = i + 1
+    return false
+
+fn v3ChainNodeCliReadFlag(key: str, defaultValue: str): str =
+    var out = ""
+    if v3ChainNodeCliReadFlagValue(key, out):
+        return out
+    return defaultValue
+
+fn v3ChainNodeCliReadFlagValue(key: str, outValue: var str): bool =
+    outValue = ""
+    let count = v3ChainNodeCliParamCount()
+    var i = 1
+    while i <= count:
+        let arg = cmdline.ParamStr(i)
+        if v3ChainNodeCliFlagInlineValue(arg, key, outValue):
+            return true
+        if arg == key:
+            if i >= count:
+                return false
+            outValue = cmdline.ParamStr(i + 1)
+            return true
+        i = i + 1
+    return false
+
+fn v3ChainNodeCliReadInt32FlagOrDefault(key: str, defaultValue: int32): int32 =
+    let raw = v3ChainNodeCliReadFlag(key, "")
+    if len(raw) <= 0:
+        return defaultValue
+    let parsedRes = v3ChainNodeCliParseInt32Text(raw)
+    if IsErr(parsedRes):
+        return defaultValue
+    return Value(parsedRes)
+
+fn v3ChainNodeCliParseInt64Text(raw: str): Result[int64] =
+    var text = ""
+    text = v3ChainNodeCliTrimAscii(raw)
+    if len(text) <= 0:
+        return Err[int64]("v3 chain_node: invalid integer: " + raw)
+    var sign: int64 = int64(1)
+    var i: int32
+    if text[0] == '+':
+        i = 1
+    elif text[0] == '-':
+        sign = int64(-1)
+        i = 1
+    if i >= len(text):
+        return Err[int64]("v3 chain_node: invalid integer: " + raw)
+    var value: int64 = int64(0)
+    while i < len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return Err[int64]("v3 chain_node: invalid integer: " + raw)
+        let digit = int64(int32(ch) - int32('0'))
+        value = value * int64(10) + digit
+        i = i + 1
+    return Ok[int64](value * sign)
+
+fn v3ChainNodeCliParseInt32Text(raw: str): Result[int32] =
+    let parsedRes = v3ChainNodeCliParseInt64Text(raw)
+    if IsErr(parsedRes):
+        return Err[int32](Error(parsedRes))
+    let value64 = Value(parsedRes)
+    if value64 < int64(-2147483648) || value64 > int64(2147483647):
+        return Err[int32]("v3 chain_node: invalid int32: " + raw)
+    return Ok[int32](int32(value64))
+
+fn v3ChainNodeCliReadRequiredFlag(key: str,
+                                  outValue: var str): Result[bool] =
+    outValue = ""
+    if !v3ChainNodeCliReadFlagValue(key, outValue):
+        return Err[bool]("v3 chain_node: missing " + key)
+    outValue = v3ChainNodeCliTrimAscii(outValue)
+    if len(outValue) <= 0:
+        return Err[bool]("v3 chain_node: missing " + key)
+    return Ok[bool](true)
+
+fn v3ChainNodeCliReadRequiredInt64Flag(key: str,
+                                       outValue: var int64): Result[bool] =
+    outValue = int64(0)
+    var raw: str
+    raw = ""
+    let readRes = v3ChainNodeCliReadRequiredFlag(key, raw)
+    if IsErr(readRes):
+        return Err[bool](Error(readRes))
+    let parsedRes = v3ChainNodeCliParseInt64Text(raw)
+    if IsErr(parsedRes):
+        return Err[bool]("v3 chain_node: invalid integer for " + key + ": " + raw)
+    outValue = Value(parsedRes)
+    return Ok[bool](true)
+
+fn v3ChainNodeCliHexValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn v3ChainNodeCliBytesFromHex(text: str): Result[Bytes] =
+    if (len(text) % 2) != 0:
+        return Err[Bytes]("v3 chain_node: invalid hex length")
+    var out: Bytes
+    out = bytesAlloc(len(text) / 2)
+    var i: int32
+    while i < len(text):
+        let hi = v3ChainNodeCliHexValue(text[i])
+        let lo = v3ChainNodeCliHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("v3 chain_node: invalid hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn v3ChainNodeCliCurrentDir(): str =
+    var out = ""
+    out = os.GetCurrentDir()
+    return out
+
+fn v3ChainNodeCliPathIsAbsolute(pathRaw: str): bool =
+    let path = v3ChainNodeCliTrimAscii(pathRaw)
+    if len(path) <= 0:
+        return false
+    if path[0] == '/' || path[0] == '\\':
+        return true
+    if len(path) > 1 && path[1] == char(58):
+        return true
+    return false
+
+fn v3ChainNodeCliEnsureDir(pathRaw: str): bool =
+    let path = v3ChainNodeCliTrimAscii(pathRaw)
+    if len(path) <= 0:
+        return false
+    if os.DirExists(path):
+        return true
+    let parent = os.ParentDir(path)
+    if len(parent) > 0 && parent != path && !os.DirExists(parent):
+        if !v3ChainNodeCliEnsureDir(parent):
+            return false
+    if !os.DirExists(path):
+        os.CreateDir(path)
+    return os.DirExists(path)
+
+fn v3ChainNodeCliAbsolutePath(pathRaw: str): str =
+    var path = ""
+    path = v3ChainNodeCliTrimAscii(pathRaw)
+    if len(path) <= 0:
+        return ""
+    if v3ChainNodeCliPathIsAbsolute(path):
+        return path
+    var cwd = ""
+    cwd = v3ChainNodeCliCurrentDir()
+    if len(cwd) <= 0:
+        return path
+    return os.JoinPath(cwd, path)
+
+fn v3ChainNodeCliFileExists(pathRaw: str): bool =
+    var path = ""
+    path = v3ChainNodeCliAbsolutePath(pathRaw)
+    if len(path) <= 0:
+        return false
+    return os.FileExists(path)
+
+fn v3ChainNodeCliTextEmpty(text: str): bool =
+    return len(text) <= 0
+
+fn v3ChainNodeCliStateText(snapshot: node.V3ChainNodeServeSnapshot): str =
+    let payload = net.v3ChainNodeLibp2pEncodeSnapshot(snapshot)
+    return v3ChainNodeCliStateMagic + "\n" +
+        "node_id=" + snapshot.nodeId + "\n" +
+        "payload_hex=" + bytesToHex(payload) + "\n"
+
+fn v3ChainNodeCliReadFileTextInto(outText: var str, path: str): bool =
+    outText = ""
+    if len(path) <= 0:
+        return false
+    let size64 = os.FileSize(path)
+    if size64 < int64(0) || size64 > int64(2147483647):
+        return false
+    let file = os.openRead(path)
+    if file == nil:
+        return false
+    let size = int32(size64)
+    if size <= 0:
+        os.Close(file)
+        return true
+    outText = newStringAlloc(size)
+    let outPtr = rawmemAsVoid(outText)
+    if outPtr == nil:
+        os.Close(file)
+        outText = ""
+        return false
+    let got = os.c_fread(outPtr, 1, int64(size), file)
+    os.Close(file)
+    if got != size:
+        outText = ""
+        return false
+    return true
+
+fn v3ChainNodeCliCloneText(text: str): str =
+    let textLen: int32 = len(text)
+    if textLen <= 0:
+        return ""
+    let out: str = newStringAlloc(textLen)
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    rawmem_support.RawmemCopy(outPtr, rawmemAsVoid(text), textLen)
+    return out
+
+fn v3ChainNodeCliWriteState(pathRaw: str,
+                            snapshot: node.V3ChainNodeServeSnapshot): bool =
+    var path = ""
+    path = v3ChainNodeCliAbsolutePath(pathRaw)
+    if len(path) <= 0:
+        return false
+    var parent = ""
+    parent = os.ParentDir(path)
+    if len(parent) > 0 && !v3ChainNodeCliEnsureDir(parent):
+        return false
+    let payload = net.v3ChainNodeLibp2pEncodeSnapshot(snapshot)
+    let payloadHex = bytesToHex(payload)
+    let file = os.Open(path, os.fmWrite)
+    if file == nil:
+        return false
+    let magicText = v3ChainNodeCliStateMagic
+    let nodeIdLine = "node_id=" + snapshot.nodeId
+    let payloadLine = "payload_hex=" + payloadHex
+    os.WriteLine(file, magicText)
+    os.WriteLine(file, nodeIdLine)
+    os.WriteLine(file, payloadLine)
+    os.Close(file)
+    return os.FileExists(path)
+
+fn v3ChainNodeCliExtractStateText(text: str,
+                                  outNodeId: var str,
+                                  outPayloadHex: var str): bool =
+    outNodeId = ""
+    outPayloadHex = ""
+    var phase: int32
+    var start: int32
+    var i: int32
+    while i < len(text):
+        if text[i] != '\n':
+            i = i + 1
+            continue
+        let line = v3ChainNodeCliTrimAscii(strings.SliceBytes(text, start, i - start))
+        if len(line) <= 0:
+            start = i + 1
+            i = i + 1
+            continue
+        if phase == 0:
+            if line != v3ChainNodeCliStateMagic:
+                return false
+            phase = 1
+            start = i + 1
+            i = i + 1
+            continue
+        if phase == 1:
+            if len(line) <= 8 || strings.SliceBytes(line, 0, 8) != "node_id=":
+                return false
+            outNodeId = v3ChainNodeCliTrimAscii(strings.SliceBytes(line, 8, len(line) - 8))
+            phase = 2
+            start = i + 1
+            i = i + 1
+            continue
+        if phase == 2:
+            if len(line) <= 12 || strings.SliceBytes(line, 0, 12) != "payload_hex=":
+                return false
+            outPayloadHex = v3ChainNodeCliTrimAscii(strings.SliceBytes(line, 12, len(line) - 12))
+            phase = 3
+            start = i + 1
+            i = i + 1
+            continue
+        return false
+    if start < len(text):
+        let line = v3ChainNodeCliTrimAscii(strings.SliceBytes(text, start, len(text) - start))
+        if len(line) > 0:
+            if phase == 0:
+                if line != v3ChainNodeCliStateMagic:
+                    return false
+                phase = 1
+            elif phase == 1:
+                if len(line) <= 8 || strings.SliceBytes(line, 0, 8) != "node_id=":
+                    return false
+                outNodeId = v3ChainNodeCliTrimAscii(strings.SliceBytes(line, 8, len(line) - 8))
+                phase = 2
+            elif phase == 2:
+                if len(line) <= 12 || strings.SliceBytes(line, 0, 12) != "payload_hex=":
+                    return false
+                outPayloadHex = v3ChainNodeCliTrimAscii(strings.SliceBytes(line, 12, len(line) - 12))
+                phase = 3
+            else:
+                return false
+    if phase != 3:
+        return false
+    if len(outNodeId) <= 0:
+        return false
+    if len(outPayloadHex) <= 0:
+        return false
+    return true
+
+fn v3ChainNodeCliLoadStateInto(out: var node.V3ChainNode, pathRaw: str): Result[bool] =
+    var path = ""
+    path = v3ChainNodeCliAbsolutePath(pathRaw)
+    var text = ""
+    if len(path) <= 0 || !v3ChainNodeCliReadFileTextInto(text, path) || len(text) <= 0:
+        return Err[bool]("v3 chain_node: missing or empty state file: " + path)
+    var nodeId: str
+    var payloadHex: str
+    nodeId = ""
+    payloadHex = ""
+    if !v3ChainNodeCliExtractStateText(text, nodeId, payloadHex):
+        return Err[bool]("v3 chain_node: invalid state file: " + path)
+    let payloadRes = v3ChainNodeCliBytesFromHex(payloadHex)
+    if IsErr(payloadRes):
+        return Err[bool](Error(payloadRes))
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshotInto(Value(payloadRes), snapshot)
+    if IsErr(snapshotRes):
+        return Err[bool](Error(snapshotRes))
+    let replayRes = node.v3ChainNodeReplayFromSnapshotInto(out,
+                                                           nodeId,
+                                                           snapshot.address,
+                                                           snapshot)
+    if IsErr(replayRes):
+        return Err[bool](Error(replayRes))
+    return Ok[bool](true)
+
+fn v3ChainNodeCliLoadOrInitForSyncInto(out: var node.V3ChainNode, statePath: str): Result[bool] =
+    return v3ChainNodeCliLoadOrInitForSyncWithIdentityInto(out,
+                                                           statePath,
+                                                           v3ChainNodeCliReadFlag("--node-id", ""),
+                                                           v3ChainNodeCliReadFlag("--address-seed", ""))
+
+fn v3ChainNodeCliLoadOrInitForSyncWithIdentityInto(out: var node.V3ChainNode,
+                                                   statePath: str,
+                                                   nodeId: str,
+                                                   addressSeed: str): Result[bool] =
+    if v3ChainNodeCliFileExists(statePath):
+        return v3ChainNodeCliLoadStateInto(out, statePath)
+    let trimmedNodeId = v3ChainNodeCliTrimAscii(nodeId)
+    if len(trimmedNodeId) <= 0:
+        return Err[bool]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
+    let trimmedAddressSeed = v3ChainNodeCliTrimAscii(addressSeed)
+    if len(trimmedAddressSeed) <= 0:
+        return Err[bool]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
+    return node.v3ChainNodeInitInto(out, trimmedNodeId, trimmedAddressSeed)
+
+fn v3ChainNodeCliLoadBioDidStateInto(out: var bio_did.V3BioDidChainState,
+                                     pathRaw: str): Result[bool] =
+    var loadedNode: node.V3ChainNode
+    let loadRes = v3ChainNodeCliLoadStateInto(loadedNode, pathRaw)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    return bio_did.v3BioDidChainStateFromNodeInto(out, loadedNode)
+
+fn v3ChainNodeCliBioDidOperatorLookupJson(statePath: str,
+                                          operatorIdHex: str): Result[str] =
+    var emptyKinds: str[]
+    emptyKinds.len = 0
+    return v3ChainNodeCliBioDidOperatorLookupJsonWithKinds(statePath, operatorIdHex, emptyKinds)
+
+fn v3ChainNodeCliBioDidOperatorLookupJsonWithKinds(statePath: str,
+                                                   operatorIdHex: str,
+                                                   preferredKinds: str[]): Result[str] =
+    var loadedNode: node.V3ChainNode
+    let loadNodeRes = v3ChainNodeCliLoadStateInto(loadedNode, statePath)
+    if IsErr(loadNodeRes):
+        return Err[str](Error(loadNodeRes))
+    var state: bio_did.V3BioDidChainState
+    let stateRes = bio_did.v3BioDidChainStateFromNodeInto(state, loadedNode)
+    if IsErr(stateRes):
+        return Err[str](Error(stateRes))
+    return Ok[str](bio_did.v3BioDidOperatorLookupJsonFromStateWithKinds(state,
+                                                                        operatorIdHex,
+                                                                        preferredKinds))
+
+fn v3ChainNodeCliSnapshotReport(snapshot: node.V3ChainNodeServeSnapshot): str =
+    var out: str
+    out = ""
+    out = out + "node_id=" + snapshot.nodeId + "\n"
+    out = out + "serve_count=" + intToStr(snapshot.serveCount) + "\n"
+    out = out + "event_count=" + intToStr(snapshot.events.len) + "\n"
+    out = out + "tip_event_cid=" + layout.fixedBytes32Hex(snapshot.tipEventCid) + "\n"
+    out = out + "forest_cid=" + layout.fixedBytes32Hex(snapshot.forest.forestCid) + "\n"
+    out = out + "signature_event_count=" + intToStr(snapshot.signature.eventCount) + "\n"
+    out = out + "signature_account_count=" + intToStr(snapshot.signature.accountCount)
+    return out
+
+fn v3ChainNodeCliPrintSnapshotReport(snapshot: node.V3ChainNodeServeSnapshot) =
+    v3ChainNodeCliPrintLine("node_id=" + snapshot.nodeId)
+    v3ChainNodeCliPrintLine("serve_count=" + intToStr(snapshot.serveCount))
+    v3ChainNodeCliPrintLine("event_count=" + intToStr(snapshot.events.len))
+    v3ChainNodeCliPrintLine("tip_event_cid=" + layout.fixedBytes32Hex(snapshot.tipEventCid))
+    v3ChainNodeCliPrintLine("forest_cid=" + layout.fixedBytes32Hex(snapshot.forest.forestCid))
+    v3ChainNodeCliPrintLine("signature_event_count=" + intToStr(snapshot.signature.eventCount))
+    v3ChainNodeCliPrintLine("signature_account_count=" + intToStr(snapshot.signature.accountCount))
+
+fn v3ChainNodeCliLoadSnapshotInto(outSnapshot: var node.V3ChainNodeServeSnapshot,
+                                  pathRaw: str): Result[bool] =
+    var path = ""
+    path = v3ChainNodeCliAbsolutePath(pathRaw)
+    var text = ""
+    if len(path) <= 0 || !v3ChainNodeCliReadFileTextInto(text, path) || len(text) <= 0:
+        return Err[bool]("v3 chain_node: missing or empty state file: " + path)
+    var nodeId: str
+    var payloadHex: str
+    nodeId = ""
+    payloadHex = ""
+    if !v3ChainNodeCliExtractStateText(text, nodeId, payloadHex):
+        return Err[bool]("v3 chain_node: invalid state file: " + path)
+    let payloadRes = v3ChainNodeCliBytesFromHex(payloadHex)
+    if IsErr(payloadRes):
+        return Err[bool](Error(payloadRes))
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshotInto(Value(payloadRes), outSnapshot)
+    if IsErr(snapshotRes):
+        return Err[bool](Error(snapshotRes))
+    outSnapshot.nodeId = v3ChainNodeCliCloneText(nodeId)
+    return Ok[bool](true)
+
+fn v3ChainNodeCliPrintStateReport(snapshot: node.V3ChainNodeServeSnapshot) =
+    v3ChainNodeCliPrintLine("node_id=" + snapshot.nodeId)
+    v3ChainNodeCliPrintLine("serve_count=" + intToStr(snapshot.serveCount + 1))
+    v3ChainNodeCliPrintLine("event_count=" + intToStr(snapshot.events.len))
+    v3ChainNodeCliPrintLine("tip_event_cid=" + layout.fixedBytes32Hex(snapshot.tipEventCid))
+    v3ChainNodeCliPrintLine("forest_cid=" + layout.fixedBytes32Hex(snapshot.forest.forestCid))
+    v3ChainNodeCliPrintLine("signature_event_count=" + intToStr(snapshot.signature.eventCount))
+    v3ChainNodeCliPrintLine("signature_account_count=" + intToStr(snapshot.signature.accountCount))
+
+fn v3ChainNodeCliSnapshotBalanceValue(snapshot: node.V3ChainNodeServeSnapshot,
+                                      assetId: int32,
+                                      accountId: int32): int64 =
+    var balance: int64 = int64(0)
+    for i in 0..<snapshot.events.len:
+        let event = snapshot.events[i]
+        if event.assetId != assetId:
+            continue
+        if event.kind == consensus.v3ConsensusKindMint:
+            if event.toAccount == accountId:
+                balance = balance + event.amount
+            continue
+        if event.kind != consensus.v3ConsensusKindTransferCommit:
+            continue
+        if event.fromAccount == accountId:
+            balance = balance - event.amount
+        if event.toAccount == accountId:
+            balance = balance + event.amount
+    return balance
+
+fn v3ChainNodeCliBalanceFromStatePath(pathRaw: str,
+                                      assetId: int32,
+                                      accountId: int32,
+                                      outBalance: var int64): Result[bool] =
+    outBalance = int64(0)
+    if assetId <= 0:
+        return Err[bool]("v3 chain_node: invalid balance target")
+    if accountId <= 0:
+        return Err[bool]("v3 chain_node: invalid balance target")
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let loadRes = v3ChainNodeCliLoadSnapshotInto(snapshot, pathRaw)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    outBalance = v3ChainNodeCliSnapshotBalanceValue(snapshot, assetId, accountId)
+    return Ok[bool](true)
+
+fn v3ChainNodeCliPrintStateReportFromPath(pathRaw: str): Result[bool] =
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let loadRes = v3ChainNodeCliLoadSnapshotInto(snapshot, pathRaw)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    v3ChainNodeCliPrintStateReport(snapshot)
+    return Ok[bool](true)
+
+fn v3ChainNodeCliRequireText(raw: str, flagName: str): Result[str] =
+    var text = ""
+    text = v3ChainNodeCliTrimAscii(raw)
+    if len(text) <= 0:
+        return Err[str]("v3 chain_node: missing " + flagName)
+    return Ok[str](text)
+
+fn v3ChainNodeCliRequireTextInto(outText: var str,
+                                 raw: str,
+                                 flagName: str): Result[bool] =
+    outText = ""
+    let textRes = v3ChainNodeCliRequireText(raw, flagName)
+    if IsErr(textRes):
+        return Err[bool](Error(textRes))
+    outText = v3ChainNodeCliCloneText(Value(textRes))
+    return Ok[bool](true)
+
+fn v3ChainNodeCliRequirePositiveInt32(raw: str, flagName: str): Result[int32] =
+    let textRes = v3ChainNodeCliRequireText(raw, flagName)
+    if IsErr(textRes):
+        return Err[int32](Error(textRes))
+    let parsedRes = v3ChainNodeCliParseInt32Text(Value(textRes))
+    if IsErr(parsedRes):
+        return Err[int32]("v3 chain_node: invalid integer for " + flagName + ": " + raw)
+    let value = Value(parsedRes)
+    if value <= 0:
+        return Err[int32]("v3 chain_node: invalid integer for " + flagName + ": " + raw)
+    return Ok[int32](value)
+
+fn v3ChainNodeCliRequireInt64(raw: str, flagName: str): Result[int64] =
+    let textRes = v3ChainNodeCliRequireText(raw, flagName)
+    if IsErr(textRes):
+        return Err[int64](Error(textRes))
+    let parsedRes = v3ChainNodeCliParseInt64Text(Value(textRes))
+    if IsErr(parsedRes):
+        return Err[int64]("v3 chain_node: invalid integer for " + flagName + ": " + raw)
+    return Ok[int64](Value(parsedRes))
+
+fn v3ChainNodeCliAppendCsvKinds(out: var str[], csvText: str) =
+    var trimmed = ""
+    trimmed = v3ChainNodeCliTrimAscii(csvText)
+    if len(trimmed) <= 0:
+        return
+    var start = 0
+    var i = 0
+    while i <= len(trimmed):
+        let atEnd = i >= len(trimmed)
+        var stop = false
+        if atEnd:
+            stop = true
+        elif trimmed[i] == ',':
+            stop = true
+        if !stop:
+            i = i + 1
+            continue
+        let part = v3ChainNodeCliTrimAscii(strings.SliceBytes(trimmed, start, i - start))
+        if len(part) > 0:
+            add(out, part)
+        start = i + 1
+        i = i + 1
+
+fn v3ChainNodeCmdSelfTestMain(): int32 =
+    var server: node.V3ChainNode
+    assert(IsOk(node.V3ChainNodeInitInto(server, "node-a", "chain-node-a")),
+           "v3 chain_node cli: init server")
+    var client: node.V3ChainNode
+    assert(IsOk(node.V3ChainNodeInitInto(client, "node-b", "chain-node-b")),
+           "v3 chain_node cli: init client")
+    let mintCidRes = node.V3ChainNodeMint(server, 7, 1001, int64(100))
+    assert(mintCidRes.ok, "v3 chain_node cli: mint")
+    let transferCidRes = node.V3ChainNodeTransfer(server, 7, 1001, 2002, int64(40))
+    assert(transferCidRes.ok, "v3 chain_node cli: transfer")
+    var served: node.V3ChainNodeServeSnapshot
+    node.V3ChainNodeServeOnceInto(served, server)
+    let syncRes = node.V3ChainNodeSyncOnce(client, served)
+    assert(syncRes.ok, "v3 chain_node cli: sync result")
+    assert(syncRes.value, "v3 chain_node cli: sync changed")
+    let aliceClientRes = node.V3ChainNodeBalance(client, 7, 1001)
+    let bobClientRes = node.V3ChainNodeBalance(client, 7, 2002)
+    assert(aliceClientRes.ok, "v3 chain_node cli: alice balance")
+    assert(bobClientRes.ok, "v3 chain_node cli: bob balance")
+    assert(aliceClientRes.value == int64(60), "v3 chain_node cli: alice 60")
+    assert(bobClientRes.value == int64(40), "v3 chain_node cli: bob 40")
+    var clientServed: node.V3ChainNodeServeSnapshot
+    node.V3ChainNodeServeOnceInto(clientServed, client)
+    let servedTipCid = served.tipEventCid
+    let clientTipCid = clientServed.tipEventCid
+    assert(layout.FixedBytes32Equal(servedTipCid, clientTipCid), "v3 chain_node cli: tip")
+    let servedForestCid = served.forest.forestCid
+    let clientForestCid = clientServed.forest.forestCid
+    assert(layout.FixedBytes32Equal(servedForestCid, clientForestCid), "v3 chain_node cli: forest")
+    let servedSignature = served.signature
+    let clientSignature = clientServed.signature
+    assert(anti.V3AntiEntropySignatureEqual(servedSignature, clientSignature), "v3 chain_node cli: signature")
+    v3ChainNodeCliPrintLine("cheng chain_node self-test ok")
+    return 0
+
+fn V3ChainNodeCliPrintLine(text: str) =
+    v3ChainNodeCliPrintLine(text)
+
+fn V3ChainNodeCliPrintErr(text: str) =
+    v3ChainNodeCliPrintErr(text)
+
+fn V3ChainNodeCliPrintBlock(text: str) =
+    v3ChainNodeCliPrintBlock(text)
+
+fn V3ChainNodeCliHasFlag(flag: str): bool =
+    return v3ChainNodeCliHasFlag(flag)
+
+fn V3ChainNodeCliReadFlag(key: str, defaultValue: str): str =
+    return v3ChainNodeCliReadFlag(key, defaultValue)
+
+fn V3ChainNodeCliReadInt32FlagOrDefault(key: str, defaultValue: int32): int32 =
+    return v3ChainNodeCliReadInt32FlagOrDefault(key, defaultValue)
+
+fn V3ChainNodeCliAbsolutePath(pathRaw: str): str =
+    return v3ChainNodeCliAbsolutePath(pathRaw)
+
+fn V3ChainNodeCliFileExists(pathRaw: str): bool =
+    return v3ChainNodeCliFileExists(pathRaw)
+
+fn V3ChainNodeCliWriteState(pathRaw: str,
+                            snapshot: node.V3ChainNodeServeSnapshot): bool =
+    return v3ChainNodeCliWriteState(pathRaw, snapshot)
+
+fn V3ChainNodeCliLoadStateInto(out: var node.V3ChainNode, pathRaw: str): Result[bool] =
+    return v3ChainNodeCliLoadStateInto(out, pathRaw)
+
+fn V3ChainNodeCliLoadOrInitForSyncWithIdentityInto(out: var node.V3ChainNode,
+                                                   statePath: str,
+                                                   nodeId: str,
+                                                   addressSeed: str): Result[bool] =
+    return v3ChainNodeCliLoadOrInitForSyncWithIdentityInto(out, statePath, nodeId, addressSeed)
+
+fn V3ChainNodeCliBioDidOperatorLookupJson(statePath: str,
+                                          operatorIdHex: str): Result[str] =
+    return v3ChainNodeCliBioDidOperatorLookupJson(statePath, operatorIdHex)
+
+fn V3ChainNodeCliBioDidOperatorLookupJsonWithKinds(statePath: str,
+                                                   operatorIdHex: str,
+                                                   preferredKinds: str[]): Result[str] =
+    return v3ChainNodeCliBioDidOperatorLookupJsonWithKinds(statePath, operatorIdHex, preferredKinds)
+
+fn V3ChainNodeCliSnapshotReport(snapshot: node.V3ChainNodeServeSnapshot): str =
+    return v3ChainNodeCliSnapshotReport(snapshot)
+
+fn V3ChainNodeCliPrintSnapshotReport(snapshot: node.V3ChainNodeServeSnapshot) =
+    v3ChainNodeCliPrintSnapshotReport(snapshot)
+
+fn V3ChainNodeCliLoadSnapshotInto(outSnapshot: var node.V3ChainNodeServeSnapshot,
+                                  pathRaw: str): Result[bool] =
+    return v3ChainNodeCliLoadSnapshotInto(outSnapshot, pathRaw)
+
+fn V3ChainNodeCliPrintStateReport(snapshot: node.V3ChainNodeServeSnapshot) =
+    v3ChainNodeCliPrintStateReport(snapshot)
+
+fn V3ChainNodeCliSnapshotBalanceValue(snapshot: node.V3ChainNodeServeSnapshot,
+                                      assetId: int32,
+                                      accountId: int32): int64 =
+    return v3ChainNodeCliSnapshotBalanceValue(snapshot, assetId, accountId)
+
+fn V3ChainNodeCliRequireText(raw: str, flagName: str): Result[str] =
+    return v3ChainNodeCliRequireText(raw, flagName)
+
+fn V3ChainNodeCliRequireTextInto(outText: var str,
+                                 raw: str,
+                                 flagName: str): Result[bool] =
+    return v3ChainNodeCliRequireTextInto(outText, raw, flagName)
+
+fn V3ChainNodeCliRequirePositiveInt32(raw: str, flagName: str): Result[int32] =
+    return v3ChainNodeCliRequirePositiveInt32(raw, flagName)
+
+fn V3ChainNodeCliRequireInt64(raw: str, flagName: str): Result[int64] =
+    return v3ChainNodeCliRequireInt64(raw, flagName)
+
+fn V3ChainNodeCliAppendCsvKinds(out: var str[], csvText: str) =
+    v3ChainNodeCliAppendCsvKinds(out, csvText)
+
+fn V3ChainNodeCmdSelfTestMain(): int32 =
+    return v3ChainNodeCmdSelfTestMain()

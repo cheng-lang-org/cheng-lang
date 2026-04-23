@@ -1,0 +1,45 @@
+import std/system
+import std/result
+import std/rawbytes
+import cheng/std/bytes_layout as layout
+import cheng/apps/bio/bio_reed_solomon as rs
+
+fn bioRsSmokeMessage(): rs.V3BioMessage16 =
+    let raw: Bytes = bytesAlloc(rs.v3BioRsMessageBytes)
+    for i in 0..<rs.v3BioRsMessageBytes:
+        bytesSet(raw, i, (i + 1) & 255)
+    let msgRes = rs.v3BioMessage16FromBytes(raw)
+    assert(IsOk(msgRes), "v3 bio rs smoke: message build")
+    return Value(msgRes)
+
+fn bioRsSmokeCorrupt(codeword: layout.FixedBytes32, positions: int32[]): layout.FixedBytes32 =
+    var raw: Bytes = layout.fixedBytes32ToBytes(codeword)
+    for i in 0..<positions.len:
+        let pos = positions[i]
+        bytesSet(raw, pos, bytesGet(raw, pos) ^ ((0x31 + i) & 255))
+    let outRes = layout.fixedBytes32FromBytes(raw)
+    assert(IsOk(outRes), "v3 bio rs smoke: corrupt fixed32")
+    return Value(outRes)
+
+fn main(): int32 =
+    let message = bioRsSmokeMessage()
+    let encoded = rs.v3BioRsEncode16x32(message)
+    let decodedRes = rs.v3BioRsDecode32x16(encoded)
+    assert(IsOk(decodedRes), "v3 bio rs smoke: exact decode")
+    assert(bytesEqual(rs.v3BioMessage16ToBytes(Value(decodedRes)),
+                      rs.v3BioMessage16ToBytes(message)),
+           "v3 bio rs smoke: exact roundtrip")
+
+    let lightNoise = bioRsSmokeCorrupt(encoded, [0, 3, 7, 11, 16, 21, 25, 30])
+    let lightDecodeRes = rs.v3BioRsDecode32x16(lightNoise)
+    assert(IsOk(lightDecodeRes), "v3 bio rs smoke: 8-byte decode")
+    assert(bytesEqual(rs.v3BioMessage16ToBytes(Value(lightDecodeRes)),
+                      rs.v3BioMessage16ToBytes(message)),
+           "v3 bio rs smoke: 8-byte roundtrip")
+
+    let heavyNoise = bioRsSmokeCorrupt(encoded, [0, 2, 4, 6, 8, 10, 12, 14, 16])
+    let heavyDecodeRes = rs.v3BioRsDecode32x16(heavyNoise)
+    assert(IsErr(heavyDecodeRes), "v3 bio rs smoke: 9-byte reject")
+
+    echo("v3 bio_reed_solomon_smoke ok")
+    return 0

@@ -13,213 +13,311 @@ type
         value: json.JsonNode
         error: str
 
+const
+    jsonByteQuote = 34
+    jsonByteComma = 44
+    jsonBytePlus = 43
+    jsonByteMinus = 45
+    jsonByteDot = 46
+    jsonByteZero = 48
+    jsonByteNine = 57
+    jsonByteColon = 58
+    jsonByteOpenBracket = 91
+    jsonByteBackslash = 92
+    jsonByteCloseBracket = 93
+    jsonByteUpperE = 69
+    jsonByteOpenBrace = 123
+    jsonByteCloseBrace = 125
+    jsonByteSpace = 32
+    jsonByteTab = 9
+    jsonByteLf = 10
+    jsonByteCr = 13
+    jsonByteLowerE = 101
+    jsonByteLowerN = 110
+    jsonByteLowerR = 114
+    jsonByteLowerT = 116
+
 fn parserInit(text: str): JsonParser =
-    JsonParser(text: text, pos: 0, length: len(text), error: "")
+    var out: JsonParser
+    out.text = text
+    out.length = len(text)
+    return out
 
 fn parserFail(p: var JsonParser, msg: str) =
-    let err = p.error
-    if len(err) == 0:
+    if len(p.error) <= 0:
         p.error = msg
 
-fn parserPeek(p: var JsonParser): char =
+fn parserPeekByte(p: JsonParser): int32 =
     if p.pos >= p.length:
-        return '\0'
-    return p.text[p.pos]
+        return 0
+    return int32(p.text[p.pos])
 
-fn parserNext(p: var JsonParser): char =
+fn parserNextByte(p: var JsonParser): int32 =
     if p.pos >= p.length:
-        return '\0'
-    let ch = p.text[p.pos]
+        return 0
+    let out: int32 = int32(p.text[p.pos])
     p.pos = p.pos + 1
-    return ch
+    return out
+
+fn parserByteText(p: JsonParser, pos: int32): str =
+    if pos < 0:
+        return ""
+    if pos >= p.length:
+        return ""
+    return strings.SliceBytes(p.text, pos, 1)
 
 fn skipWhitespace(p: var JsonParser) =
     while p.pos < p.length:
-        let ch = p.text[p.pos]
-        if ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t':
+        let b: int32 = parserPeekByte(p)
+        if b == jsonByteSpace:
             p.pos = p.pos + 1
         else:
-            break
+            if b == jsonByteLf:
+                p.pos = p.pos + 1
+            else:
+                if b == jsonByteCr:
+                    p.pos = p.pos + 1
+                else:
+                    if b == jsonByteTab:
+                        p.pos = p.pos + 1
+                    else:
+                        return
 
-fn isDigit(ch: char): bool =
-    ch >= '0' && ch <= '9'
+fn isDigitByte(b: int32): bool =
+    if b < jsonByteZero:
+        return false
+    if b > jsonByteNine:
+        return false
+    return true
 
 fn parseValue(p: var JsonParser): json.JsonNode
 
 fn parseString(p: var JsonParser): str =
-    if parserPeek(p) != '"':
-        parserFail(p, "expected '\"'")
+    if parserPeekByte(p) != jsonByteQuote:
+        parserFail(p, "expected string")
         return ""
-    parserNext(p)
+    let _open: int32 = parserNextByte(p)
+    _open
     var out: str
     while p.pos < p.length:
-        let ch = parserNext(p)
-        if ch == '"':
+        let chPos: int32 = p.pos
+        let b: int32 = parserNextByte(p)
+        if b == jsonByteQuote:
             return out
-        if ch == '\\':
+        if b == jsonByteBackslash:
             if p.pos >= p.length:
-                parserFail(p, "unterminated str escape")
+                parserFail(p, "unterminated string escape")
                 return out
-            let esc = parserNext(p)
-            if esc == '"':
-                out = out + charToStr('"')
-            elif esc == '\\':
-                out = out + charToStr('\\')
-            elif esc == 'n':
-                out = out + "\n"
-            elif esc == 'r':
-                out = out + "\r"
-            elif esc == 't':
-                out = out + "\t"
+            let esc: int32 = parserNextByte(p)
+            if esc == jsonByteQuote:
+                out = out + "\""
             else:
-                out = out + charToStr(esc)
+                if esc == jsonByteBackslash:
+                    out = out + "\\"
+                else:
+                    if esc == jsonByteLowerN:
+                        out = out + "\n"
+                    else:
+                        if esc == jsonByteLowerR:
+                            out = out + "\r"
+                        else:
+                            if esc == jsonByteLowerT:
+                                out = out + "\t"
+                            else:
+                                out = out + parserByteText(p, p.pos - 1)
         else:
-            out = out + charToStr(ch)
-    parserFail(p, "unterminated str")
+            out = out + parserByteText(p, chPos)
+    parserFail(p, "unterminated string")
     return out
 
 fn parseNumber(p: var JsonParser): json.JsonNode =
-    var sign: int64 = 1
-    let first = parserPeek(p)
-    if first == '-':
-        sign = -1
-        parserNext(p)
+    var negative: bool
+    if parserPeekByte(p) == jsonByteMinus:
+        negative = true
+        let _minus: int32 = parserNextByte(p)
+        _minus
+
     var intPart: int64
-    var digitCount: int32
-    while isDigit(parserPeek(p)):
-        let ch = parserNext(p)
-        intPart = intPart * 10 + int64(ch) - int64('0')
-        digitCount = digitCount + 1
-    var hasFrac = false
-    var fracPart: float64
-    var fracDiv: float64 = 1.0
-    if parserPeek(p) == '.':
+    var intDigits: int32
+    while true:
+        let b: int32 = parserPeekByte(p)
+        if !isDigitByte(b):
+            break
+        let _digit: int32 = parserNextByte(p)
+        _digit
+        intPart = intPart * int64(10) + int64(b - jsonByteZero)
+        intDigits = intDigits + 1
+
+    var hasFrac: bool
+    var fracPart: int64
+    var fracDiv: int64 = 1
+    var fracDigits: int32
+    if parserPeekByte(p) == jsonByteDot:
         hasFrac = true
-        parserNext(p)
-        while isDigit(parserPeek(p)):
-            let ch = parserNext(p)
-            fracPart = fracPart * 10.0 + float64(int32(ch) - int32('0'))
-            fracDiv = fracDiv * 10.0
-            digitCount = digitCount + 1
-    if digitCount == 0:
+        let _dot: int32 = parserNextByte(p)
+        _dot
+        while true:
+            let b: int32 = parserPeekByte(p)
+            if !isDigitByte(b):
+                break
+            let _digit: int32 = parserNextByte(p)
+            _digit
+            fracPart = fracPart * int64(10) + int64(b - jsonByteZero)
+            fracDiv = fracDiv * int64(10)
+            fracDigits = fracDigits + 1
+        if fracDigits <= 0:
+            parserFail(p, "invalid fraction")
+            return json.NewJInt(0)
+
+    if intDigits <= 0 && fracDigits <= 0:
         parserFail(p, "invalid number")
-        return json.NewJFloat(0.0)
-    var hasExp = false
-    var expSign: int32 = 1
-    var expVal: int32
-    if parserPeek(p) == 'e' || parserPeek(p) == 'E':
+        return json.NewJInt(0)
+
+    var hasExp: bool
+    var expNegative: bool
+    var expValue: int32
+    if parserPeekByte(p) == jsonByteLowerE || parserPeekByte(p) == jsonByteUpperE:
         hasExp = true
-        parserNext(p)
-        if parserPeek(p) == '+':
-            parserNext(p)
-        elif parserPeek(p) == '-':
-            expSign = -1
-            parserNext(p)
-        if ! isDigit(parserPeek(p)):
+        let _exp: int32 = parserNextByte(p)
+        _exp
+        if parserPeekByte(p) == jsonBytePlus:
+            let _plus: int32 = parserNextByte(p)
+            _plus
+        else:
+            if parserPeekByte(p) == jsonByteMinus:
+                expNegative = true
+                let _minus: int32 = parserNextByte(p)
+                _minus
+        var expDigits: int32
+        while true:
+            let b: int32 = parserPeekByte(p)
+            if !isDigitByte(b):
+                break
+            let _digit: int32 = parserNextByte(p)
+            _digit
+            expValue = expValue * 10 + int32(b - jsonByteZero)
+            expDigits = expDigits + 1
+        if expDigits <= 0:
             parserFail(p, "invalid exponent")
-            return json.NewJFloat(0.0)
-        while isDigit(parserPeek(p)):
-            let ch = parserNext(p)
-            expVal = expVal * 10 + (int32(ch) - int32('0'))
-    if ! hasFrac && ! hasExp:
-        return json.NewJInt(intPart * sign)
+            return json.NewJInt(0)
+
+    if !hasFrac && !hasExp:
+        if negative:
+            return json.NewJInt(0 - intPart)
+        return json.NewJInt(intPart)
+
     var value: float64 = float64(intPart)
-    value = value + (fracPart / fracDiv)
+    if fracDiv > 1:
+        value = value + float64(fracPart) / float64(fracDiv)
     if hasExp:
-        var i: int32
-        var exp: int32 = expVal * expSign
-        if exp > 0:
-            let __for_start_i_1 = i
-            for __for_i_1 in __for_start_i_1..<exp:
-                i = __for_i_1
-                value = value * 10.0
-                i = i + 1
-        elif exp < 0:
-            exp = 0 - exp
-            let __for_start_i_2 = i
-            for __for_i_2 in __for_start_i_2..<exp:
-                i = __for_i_2
-                value = value / 10.0
-                i = i + 1
-    return json.NewJFloat(value * float64(sign))
+        var remaining: int32 = expValue
+        if expNegative:
+            while remaining > 0:
+                value = value / float64(int32(10))
+                remaining = remaining - 1
+        else:
+            while remaining > 0:
+                value = value * float64(int32(10))
+                remaining = remaining - 1
+    if negative:
+        value = float64(int32(0)) - value
+    return json.NewJFloat(value)
 
 fn consumeLiteral(p: var JsonParser, lit: str): bool =
-    for i in 0..<len(lit):
-        if parserPeek(p) != lit[i]:
+    var i: int32
+    while i < len(lit):
+        if parserPeekByte(p) != int32(lit[i]):
             return false
-        parserNext(p)
+        let _b: int32 = parserNextByte(p)
+        _b
+        i = i + 1
     return true
 
 fn parseArray(p: var JsonParser): json.JsonNode =
-    if parserPeek(p) != '[':
+    if parserPeekByte(p) != jsonByteOpenBracket:
         parserFail(p, "expected '['")
         return json.NewJArray()
-    parserNext(p)
-    var out = json.NewJArray()
+    let _open: int32 = parserNextByte(p)
+    _open
+    var out: json.JsonNode = json.NewJArray()
     skipWhitespace(p)
-    if parserPeek(p) == ']':
-        parserNext(p)
+    if parserPeekByte(p) == jsonByteCloseBracket:
+        let _close: int32 = parserNextByte(p)
+        _close
         return out
-    while p.pos < p.length:
-        let item = parseValue(p)
-        out.add(item)
+    var done: bool
+    while !done:
+        let item: json.JsonNode = parseValue(p)
+        add(out.a, item)
         skipWhitespace(p)
-        let ch = parserPeek(p)
-        if ch == ',':
-            parserNext(p)
+        let b: int32 = parserPeekByte(p)
+        if b == jsonByteComma:
+            let _comma: int32 = parserNextByte(p)
+            _comma
             skipWhitespace(p)
-            continue
-        if ch == ']':
-            parserNext(p)
-            break
-        parserFail(p, "expected ',' or ']'")
-        break
+        else:
+            if b == jsonByteCloseBracket:
+                let _close: int32 = parserNextByte(p)
+                _close
+                done = true
+            else:
+                parserFail(p, "expected ',' or ']'")
+                return out
     return out
 
 fn parseObject(p: var JsonParser): json.JsonNode =
-    if parserPeek(p) != '{':
+    if parserPeekByte(p) != jsonByteOpenBrace:
         parserFail(p, "expected '{'")
         return json.NewJObject()
-    parserNext(p)
-    var out = json.NewJObject()
+    let _open: int32 = parserNextByte(p)
+    _open
+    var out: json.JsonNode = json.NewJObject()
     skipWhitespace(p)
-    if parserPeek(p) == '}':
-        parserNext(p)
+    if parserPeekByte(p) == jsonByteCloseBrace:
+        let _close: int32 = parserNextByte(p)
+        _close
         return out
-    while p.pos < p.length:
+    var done: bool
+    while !done:
         skipWhitespace(p)
-        let key = parseString(p)
+        let key: str = parseString(p)
         skipWhitespace(p)
-        if parserPeek(p) != ':':
+        if parserPeekByte(p) != jsonByteColon:
             parserFail(p, "expected ':'")
-            break
-        parserNext(p)
+            return out
+        let _colon: int32 = parserNextByte(p)
+        _colon
         skipWhitespace(p)
-        let value = parseValue(p)
+        let value: json.JsonNode = parseValue(p)
         json.JsonSetField(out, key, value)
         skipWhitespace(p)
-        let ch = parserPeek(p)
-        if ch == ',':
-            parserNext(p)
+        let b: int32 = parserPeekByte(p)
+        if b == jsonByteComma:
+            let _comma: int32 = parserNextByte(p)
+            _comma
             skipWhitespace(p)
-            continue
-        if ch == '}':
-            parserNext(p)
-            break
-        parserFail(p, "expected ',' or '}'")
-        break
+        else:
+            if b == jsonByteCloseBrace:
+                let _close: int32 = parserNextByte(p)
+                _close
+                done = true
+            else:
+                parserFail(p, "expected ',' or '}'")
+                return out
     return out
 
 fn parseValue(p: var JsonParser): json.JsonNode =
     skipWhitespace(p)
-    let ch = parserPeek(p)
-    if ch == '"':
+    let b: int32 = parserPeekByte(p)
+    if b == jsonByteQuote:
         return json.NewJString(parseString(p))
-    if ch == '{':
+    if b == jsonByteOpenBrace:
         return parseObject(p)
-    if ch == '[':
+    if b == jsonByteOpenBracket:
         return parseArray(p)
-    if ch == '-' || isDigit(ch):
+    if b == jsonByteMinus:
+        return parseNumber(p)
+    if isDigitByte(b):
         return parseNumber(p)
     if consumeLiteral(p, "true"):
         return json.NewJBool(true)
@@ -236,61 +334,75 @@ fn parseJsonSafe(content: str): ParseResult =
         res.ok = false
         res.error = "empty input"
         return res
-    var p = parserInit(content)
-    let node = parseValue(p)
+    var p: JsonParser = parserInit(content)
+    let node: json.JsonNode = parseValue(p)
     skipWhitespace(p)
     if p.pos < p.length:
         parserFail(p, "trailing data")
-    let err = p.error
-    if len(err) > 0:
+    if len(p.error) > 0:
         res.ok = false
-        res.error = err
+        res.error = p.error
         return res
     res.ok = true
     res.value = node
     return res
 
 fn hasField(node: json.JsonNode, key: str): bool =
-    return node.hasKey(key)
+    return json.HasKey(node, key)
 
 fn getStringField(node: json.JsonNode, key: str, fallback: str): str =
-    if ! node.hasKey(key):
+    if !json.HasKey(node, key):
         return fallback
-    let value = json.JsonGetField(node, key)
+    let value: json.JsonNode = json.JsonGetField(node, key)
     if value.kind == json.JString:
-        let text = value.getStr()
+        let text: str = json.GetStr(value)
         if len(text) == 0:
             return text
         return "" + text
     return fallback
 
 fn getFloatField(node: json.JsonNode, key: str, fallback: float64): float64 =
-    if ! node.hasKey(key):
+    if !json.HasKey(node, key):
         return fallback
-    let value = json.JsonGetField(node, key)
+    let value: json.JsonNode = json.JsonGetField(node, key)
     if value.kind == json.JFloat:
-        return value.getFloat()
+        return json.GetFloat(value)
     if value.kind == json.JInt:
-        return float64(value.getInt())
+        return float64(json.GetInt(value))
     return fallback
 
 fn getIntField(node: json.JsonNode, key: str, fallback: int64): int64 =
-    if ! node.hasKey(key):
+    if !json.HasKey(node, key):
         return fallback
-    let value = json.JsonGetField(node, key)
+    let value: json.JsonNode = json.JsonGetField(node, key)
     if value.kind == json.JInt:
-        return value.getInt()
+        return json.GetInt(value)
     if value.kind == json.JFloat:
-        return int64(value.getFloat())
+        return int64(json.GetFloat(value))
     return fallback
 
 fn getBoolField(node: json.JsonNode, key: str, fallback: bool): bool =
-    if ! node.hasKey(key):
+    if !json.HasKey(node, key):
         return fallback
-    let value = json.JsonGetField(node, key)
+    let value: json.JsonNode = json.JsonGetField(node, key)
     if value.kind == json.JBool:
-        return value.getBool()
+        return json.GetBool(value)
     return fallback
+
+fn HasField(node: json.JsonNode, key: str): bool =
+    return hasField(node, key)
+
+fn GetStringField(node: json.JsonNode, key: str, fallback: str): str =
+    return getStringField(node, key, fallback)
+
+fn GetFloatField(node: json.JsonNode, key: str, fallback: float64): float64 =
+    return getFloatField(node, key, fallback)
+
+fn GetIntField(node: json.JsonNode, key: str, fallback: int64): int64 =
+    return getIntField(node, key, fallback)
+
+fn GetBoolField(node: json.JsonNode, key: str, fallback: bool): bool =
+    return getBoolField(node, key, fallback)
 
 fn ParseJsonSafe(content: str): ParseResult =
     return parseJsonSafe(content)

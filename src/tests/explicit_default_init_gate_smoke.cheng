@@ -1,0 +1,32 @@
+import std/os
+import std/strutils as strutil
+
+fn main(): int32 =
+    let command =
+        "((rg --files src codex/src --glob '*.cheng' || true)" +
+        " | xargs perl -ne '" +
+        "BEGIN { $current_file = \"\"; $line_no = 0; $in_type = 0; $type_indent = -1; } " +
+        "sub trim { my ($s) = @_; $s =~ s/^\\s+//; $s =~ s/\\s+$//; return $s; } " +
+        "sub compact { my ($s) = @_; $s =~ s/\\s+//g; return $s; } " +
+        "sub indent_of { my ($s) = @_; $s =~ /^([ \\t]*)/; return length($1); } " +
+        "sub is_int_type { my ($t) = @_; return $t =~ /^(int8|uint8|int16|uint16|int32|uint32|int64|uint64|int|uint)$/; } " +
+        "sub is_float_type { my ($t) = @_; return $t =~ /^(float|float32|float64)$/; } " +
+        "sub is_str_type { my ($t) = @_; return $t eq \"str\" || $t eq \"cstring\"; } " +
+        "sub is_seq_type { my ($t) = @_; return $t =~ /\\[\\]$/; } " +
+        "sub is_fixed_type { my ($t) = @_; return $t =~ /\\[[0-9]+\\]$/; } " +
+        "sub default_expr_matches { my ($type, $expr) = @_; $type = trim($type); $expr = trim($expr); my $ct = compact($type); my $ce = compact($expr); return 1 if $type eq \"bool\" && $expr eq \"false\"; return 1 if is_int_type($type) && $expr eq \"0\"; return 1 if is_float_type($type) && ($expr eq \"0\" || $expr eq \"0.0\"); return 1 if is_str_type($type) && $expr eq qq{\"\"}; return 1 if (is_seq_type($type) || is_fixed_type($type)) && $expr eq \"[]\"; return 1 if $ce eq $ct . \"()\"; return 0; } " +
+        "if ($ARGV ne $current_file) { $current_file = $ARGV; $line_no = 0; $in_type = 0; $type_indent = -1; } " +
+        "++$line_no; chomp; my $line = $_; my $trimmed = trim($line); " +
+        "if ($in_type && $trimmed ne \"\" && $trimmed !~ /^#/ && indent_of($line) <= $type_indent) { $in_type = 0; } " +
+        "if ($trimmed eq \"type\") { $in_type = 1; $type_indent = indent_of($line); next; } " +
+        "if ($trimmed =~ /^(?:let|var)\\s+[A-Za-z_][A-Za-z0-9_]*\\s*:\\s*([^=]+)\\s*=\\s*(.+)$/ && default_expr_matches($1, $2)) { print qq{$ARGV:$line_no:$line\\n}; } " +
+        "if ($in_type && $trimmed =~ /^[A-Za-z_][A-Za-z0-9_]*\\s*:\\s*([^=]+)\\s*=\\s*(.+)$/ && default_expr_matches($1, $2)) { print qq{$ARGV:$line_no:$line\\n}; }'" +
+        " | grep -v '^src/tests/explicit_default_init_gate_smoke.cheng:'" +
+        " | grep -v '^src/tests/explicit_default_init_negative_'" +
+        " | grep -v '^src/backend/uir/uir_instance_cache.cheng:13:    let c: UirInstanceCache = UirInstanceCache()$'" +
+        " | sort -u || true)"
+    let output = strutil.Strip(os.ExecCmdResultOutput(os.ExecCmdEx(command, uint64(1), "")))
+    assert(output == "",
+           "redundant explicit default init forbidden; use typed implicit init or a non-redundant constructor/literal\n" + output)
+    echo("v3 explicit_default_init_gate_smoke ok")
+    return 0

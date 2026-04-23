@@ -1,0 +1,48 @@
+import std/system
+import std/result
+import cheng/apps/bft/bft_validator_host as host
+
+@importc("cheng_sleep_ms_bridge")
+fn cheng_sleep_ms_bridge(value: int32)
+
+fn v3BftPublicProbeStartsWith(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn v3BftPublicProbeAttempt(proposalHost: str,
+                           proposalPort: int32,
+                           outErr: var str): bool =
+    outErr = ""
+    let proposalRes = host.v3BftValidatorRecvProposal(proposalHost, proposalPort)
+    if IsErr(proposalRes):
+        outErr = Error(proposalRes)
+        return false
+    let proposal = Value(proposalRes)
+    echo("proposal_height=" + host.v3BftValidatorInt64Text(proposal.height))
+    echo("proposal_txs=" + intToStr(proposal.txs.len))
+    return true
+
+fn main(): int32 =
+    let proposalHost = "64.176.84.12"
+    let proposalPort = 42061
+    var lastErr = ""
+    var found = false
+    var fatal = false
+    for attempt in 0..<256:
+        if v3BftPublicProbeAttempt(proposalHost, proposalPort, lastErr):
+            found = true
+            break
+        if !v3BftPublicProbeStartsWith(lastErr, "v3 libp2p quic: dial"):
+            fatal = true
+            break
+        cheng_sleep_ms_bridge(50)
+        attempt
+    if found:
+        return 0
+    echo(lastErr)
+    fatal
+    return 1

@@ -1,0 +1,62 @@
+import std/os
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/core/tooling/path as v3path
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/compiler_world as cworld
+import cheng/core/tooling/compiler_csg as ccsg
+import cheng/core/lang/parser
+import cheng/core/backend/system_link_plan as slplan
+
+fn main(): int32 =
+    let workspaceRoot = v3path.V3PathCurrentDir()
+    let packageRoot = workspaceRoot
+    let smokeLabel: str = os.GetEnvDefault("CHENG_SMOKE_LABEL", "host")
+    let outDir: str = v3path.V3PathJoin(workspaceRoot, "artifacts/compiler_migration/" + smokeLabel)
+    assert(v3path.V3MkdirP(workspaceRoot, outDir), "v3 compiler migration: mkdir")
+    let currentSourcePath = v3path.V3PathJoin(packageRoot, "src/tests/compiler_migration_fixture.cheng")
+    let legacySourcePath = v3path.V3PathJoin(packageRoot, "testdata/compiler_migration/compiler_migration_fixture_legacy.cheng")
+    let outputPath = v3path.V3PathJoin(outDir, "compiler_migration_fixture")
+    let req = creq.v3CompilerRequestNew(
+        packageRoot,
+        currentSourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.v3EmitExe,
+        ""
+    )
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), "v3 compiler migration: link plan")
+    let sourceBundleRes = slplan.v3SystemLinkPlanSourceBundleCid(linkPlan)
+    assert(IsOk(sourceBundleRes), "v3 compiler migration: source bundle")
+    let sourceBundleCid = Value(sourceBundleRes)
+    let currentCsgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
+    assert(IsOk(currentCsgRes), "v3 compiler migration: build current csg")
+    let currentCsg = ccsg.v3CompilerCsgClone(Value(currentCsgRes))
+    let entryModulePath = parser.v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, currentSourcePath)
+    let migrationRes = ccsg.v3BuildCompilerLegacyMigration(workspaceRoot,
+                                                           packageRoot,
+                                                           legacySourcePath,
+                                                           linkPlan.packageId,
+                                                           entryModulePath)
+    assert(IsOk(migrationRes), "v3 compiler migration: build legacy migration")
+    let migration = ccsg.v3CompilerLegacyMigrationClone(Value(migrationRes))
+    assert(migration.units.len == migration.unitCount, "v3 compiler migration: unit count")
+    assert(migration.unitCount > 0, "v3 compiler migration: has migrated units")
+    assert(migration.appliedRuleCount > 0, "v3 compiler migration: applied rules")
+    assert(migration.units[0].sourcePath == legacySourcePath, "v3 compiler migration: first unit source path")
+    assert(v3path.V3TextContains(migration.units[0].migratedText, "fn ExportedAdd"),
+           "v3 compiler migration: migrated syntax")
+    assert(!v3path.V3TextContains(migration.units[0].migratedText, "proc ExportedAdd"),
+           "v3 compiler migration: legacy syntax removed")
+    assert(layout.fixedBytes32Equal(currentCsg.canonicalGraphCid, migration.compilerCsg.canonicalGraphCid),
+           "v3 compiler migration: canonical graph match")
+    let currentSurface = ccsg.v3CompilerExportSurfaceFromCsg(currentCsg)
+    assert(ccsg.v3CompilerExportSurfaceCompatible(currentSurface, migration.exportSurface),
+           "v3 compiler migration: export surface compatible")
+    let report = ccsg.v3CompilerLegacyMigrationReport(migration)
+    assert(v3path.V3TextContains(report, "migration_cid="), "v3 compiler migration: report cid")
+    assert(v3path.V3TextContains(report, "applied_rule[0]="), "v3 compiler migration: report rule")
+    echo("v3 compiler_migration_smoke ok")
+    return 0

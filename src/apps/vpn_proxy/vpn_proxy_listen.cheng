@@ -1,0 +1,64 @@
+import std/result
+import std/strings
+import std/strutils as strutil
+import cheng/apps/vpn_proxy/vpn_proxy_cli as cli
+
+type
+    V3VpnProxyListenAddress =
+        host: str
+        port: int32
+
+const
+    vpnProxyByteColon = 58
+    vpnProxyByteOpenBracket = 91
+    vpnProxyByteCloseBracket = 93
+
+fn v3VpnProxyTextSlice(text: str, start: int32, count: int32): str =
+    if count <= 0:
+        return ""
+    return strings.SliceBytes(text, start, count)
+
+fn v3VpnProxyTextFindCloseBracket(text: str): int32 =
+    var out: int32 = -1
+    for i in 1..<len(text):
+        if out < 0 && int32(text[i]) == vpnProxyByteCloseBracket:
+            out = i
+    return out
+
+fn v3VpnProxyTextFindLastColon(text: str): int32 =
+    var out: int32 = -1
+    for i in 0..<len(text):
+        if int32(text[i]) == vpnProxyByteColon:
+            out = i
+    return out
+
+fn V3VpnProxyParseListenAddress(textRaw: str): Result[V3VpnProxyListenAddress] =
+    let text: str = strutil.Strip(textRaw)
+    if len(text) <= 0:
+        return Err[V3VpnProxyListenAddress]("vpn proxy: listen address must be host:port")
+    var out: V3VpnProxyListenAddress
+    if int32(text[0]) == vpnProxyByteOpenBracket:
+        let closeIdx: int32 = v3VpnProxyTextFindCloseBracket(text)
+        if closeIdx < 0:
+            return Err[V3VpnProxyListenAddress]("vpn proxy: invalid ipv6 listen address")
+        if closeIdx + 1 >= len(text) || int32(text[closeIdx + 1]) != vpnProxyByteColon:
+            return Err[V3VpnProxyListenAddress]("vpn proxy: invalid ipv6 listen address")
+        out.host = v3VpnProxyTextSlice(text, 1, closeIdx - 1)
+        let portText: str = v3VpnProxyTextSlice(text, closeIdx + 2, len(text) - closeIdx - 2)
+        let portRes: Result[int32] = cli.V3VpnProxyParseInt32(portText)
+        if IsErr(portRes):
+            return Err[V3VpnProxyListenAddress](ErrorText(portRes))
+        out.port = Value(portRes)
+    else:
+        let lastColon: int32 = v3VpnProxyTextFindLastColon(text)
+        if lastColon <= 0 || lastColon + 1 >= len(text):
+            return Err[V3VpnProxyListenAddress]("vpn proxy: listen address must be host:port")
+        out.host = v3VpnProxyTextSlice(text, 0, lastColon)
+        let portText: str = v3VpnProxyTextSlice(text, lastColon + 1, len(text) - lastColon - 1)
+        let portRes: Result[int32] = cli.V3VpnProxyParseInt32(portText)
+        if IsErr(portRes):
+            return Err[V3VpnProxyListenAddress](ErrorText(portRes))
+        out.port = Value(portRes)
+    if len(out.host) <= 0 || out.port < 0 || out.port > 65535:
+        return Err[V3VpnProxyListenAddress]("vpn proxy: listen address must be host:port")
+    return Ok[V3VpnProxyListenAddress](out)

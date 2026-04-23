@@ -1,0 +1,45 @@
+import std/result
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/path as v3path
+import cheng/core/tooling/compiler_world as cworld
+import cheng/core/tooling/compiler_csg as ccsg
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/lang/parser
+import cheng/core/lang/typed_expr as texpr
+
+fn main(): int32 =
+    let workspaceRoot = v3path.V3PathCurrentDir()
+    let packageRoot = workspaceRoot
+    let fixturePath = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_fixture.cheng")
+    let outputPath = v3path.V3PathJoin(workspaceRoot, "artifacts/compiler_csg/typed_expr_cross_file_probe")
+    let req = creq.v3CompilerRequestNew(packageRoot, fixturePath, outputPath, "arm64-apple-darwin", creq.v3EmitShared, "")
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), "typed expr cross file probe: link plan")
+    let sourceBundleRes = slplan.v3SystemLinkPlanSourceBundleCid(linkPlan)
+    assert(IsOk(sourceBundleRes), "typed expr cross file probe: source bundle")
+    let sourceBundleCid = Value(sourceBundleRes)
+    let csgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
+    assert(IsOk(csgRes), "typed expr cross file probe: build csg")
+    let csg = ccsg.v3CompilerCsgClone(Value(csgRes))
+    let facts = texpr.v3TypedExprFactsForSource(csg.typedExprFacts, fixturePath)
+    for i in 0..<facts.len:
+        let fact = facts[i]
+        if texpr.v3TypedExprFactAbiIsPolymorphic(fact):
+            echo("poly line=" + intToStr(fact.lineNumber) +
+                 " col=" + intToStr(fact.columnNumber) +
+                 " kind=" + parser.v3NormalizedExprKindText(fact.kind) +
+                 " type=" + fact.typeText +
+                 " lower=" + texpr.v3TypedExprLoweringModeText(fact.loweringMode) +
+                 " call=" + texpr.v3TypedExprCallKindText(fact.callKind) +
+                 " ret=" + texpr.v3TypedExprReturnKindText(fact.returnKind))
+    for i in 0..<facts.len:
+        let fact = facts[i]
+        if fact.kind == parser.v3NormalizedExprCall:
+            echo("call line=" + intToStr(fact.lineNumber) +
+                 " col=" + intToStr(fact.columnNumber) +
+                 " type=" + fact.typeText +
+                 " abi=" + texpr.v3TypedExprAbiClassText(fact.abiClass) +
+                 " lower=" + texpr.v3TypedExprLoweringModeText(fact.loweringMode) +
+                 " ret=" + texpr.v3TypedExprReturnKindText(fact.returnKind))
+    return 0

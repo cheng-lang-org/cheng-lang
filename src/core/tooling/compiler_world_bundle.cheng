@@ -1,0 +1,243 @@
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/core/tooling/path as v3path
+import cheng/core/tooling/compiler_world as cworld
+import cheng/core/tooling/compiler_csg as ccsg
+
+type
+    V3CompilerWorldBundle =
+        bundlePrefix: str
+        worldHead: cworld.V3CompilerWorldHead
+        manifest: cworld.V3CompilerUniverseManifest
+        compilerSnapshot: cworld.V3CompilerPackageSnapshot
+        stdSnapshot: cworld.V3CompilerPackageSnapshot
+        runtimeSnapshot: cworld.V3CompilerPackageSnapshot
+        compilerCsgCid: layout.FixedBytes32
+        compilerCanonicalCsgCid: layout.FixedBytes32
+        exportSurface: ccsg.V3CsgExportSurface
+        receipt: ccsg.V3CompileReceipt
+        lock: cworld.V3CompilerLockSnapshot
+
+fn v3CompilerWorldBundleUniverse(bundle: V3CompilerWorldBundle): cworld.V3CompilerLocalUniverse =
+    var out: cworld.V3CompilerLocalUniverse
+    out.compilerSnapshot = bundle.compilerSnapshot
+    out.stdSnapshot = bundle.stdSnapshot
+    out.runtimeSnapshot = bundle.runtimeSnapshot
+    out.manifest = bundle.manifest
+    out.worldHead = bundle.worldHead
+    return out
+
+fn v3CompilerWorldBundleReadText(rootDir: str,
+                                 path: str,
+                                 label: str): Result[str] =
+    let absPath = v3path.V3PathAbsolute(rootDir, path)
+    if !v3path.V3PathFileExists(absPath):
+        return Err[str]("v3 compiler world bundle: missing " + label + ": " + absPath)
+    return Ok[str](v3path.V3ReadTextFile("", absPath))
+
+fn v3CompilerWorldBundleManifestEntry(manifest: cworld.V3CompilerUniverseManifest,
+                                      packageId: str,
+                                      outEntry: var cworld.V3CompilerUniverseManifestEntry): bool =
+    for i in 0..<manifest.entries.len:
+        if manifest.entries[i].packageId != packageId:
+            continue
+        outEntry = manifest.entries[i]
+        return true
+    return false
+
+fn v3CompilerWorldBundleVerifyManifestBinding(manifest: cworld.V3CompilerUniverseManifest,
+                                              snapshot: cworld.V3CompilerPackageSnapshot): Result[bool] =
+    var entry: cworld.V3CompilerUniverseManifestEntry
+    if !v3CompilerWorldBundleManifestEntry(manifest, snapshot.packageId, entry):
+        return Err[bool]("v3 compiler world bundle: manifest missing package: " + snapshot.packageId)
+    if !layout.fixedBytes32Equal(entry.snapshotCid, snapshot.snapshotCid):
+        return Err[bool]("v3 compiler world bundle: manifest snapshot mismatch: " + snapshot.packageId)
+    if !layout.fixedBytes32Equal(entry.syntaxSurfaceCid, snapshot.syntaxSurfaceCid):
+        return Err[bool]("v3 compiler world bundle: manifest syntax mismatch: " + snapshot.packageId)
+    if !layout.fixedBytes32Equal(entry.migrationProofCid, snapshot.migrationProofCid):
+        return Err[bool]("v3 compiler world bundle: manifest proof mismatch: " + snapshot.packageId)
+    return Ok[bool](true)
+
+fn v3CompilerWorldBundleExpectedCompilerDeps(bundle: V3CompilerWorldBundle): layout.FixedBytes32 =
+    var depsEntries: cworld.V3CompilerUniverseManifestEntry[]
+    for i in 0..<bundle.manifest.entries.len:
+        let entry = bundle.manifest.entries[i]
+        if entry.packageId == bundle.compilerSnapshot.packageId:
+            continue
+        add(depsEntries, entry)
+    return cworld.v3CompilerWorldDepsManifestCid(bundle.worldHead.channel, depsEntries)
+
+fn v3CompilerWorldBundleRead(rootDir: str,
+                             prefixRaw: str,
+                             out: var V3CompilerWorldBundle): Result[bool] =
+    let prefix = v3path.V3PathAbsolute(rootDir, prefixRaw)
+    let worldTextRes = v3CompilerWorldBundleReadText("", prefix + ".world.txt", "world report")
+    if IsErr(worldTextRes):
+        return Err[bool](Error(worldTextRes))
+    let manifestTextRes = v3CompilerWorldBundleReadText("", prefix + ".manifest.txt", "manifest report")
+    if IsErr(manifestTextRes):
+        return Err[bool](Error(manifestTextRes))
+    let compilerSnapshotTextRes = v3CompilerWorldBundleReadText("", prefix + ".compiler.snapshot.txt", "compiler snapshot")
+    if IsErr(compilerSnapshotTextRes):
+        return Err[bool](Error(compilerSnapshotTextRes))
+    let stdSnapshotTextRes = v3CompilerWorldBundleReadText("", prefix + ".std.snapshot.txt", "std snapshot")
+    if IsErr(stdSnapshotTextRes):
+        return Err[bool](Error(stdSnapshotTextRes))
+    let runtimeSnapshotTextRes = v3CompilerWorldBundleReadText("", prefix + ".runtime.snapshot.txt", "runtime snapshot")
+    if IsErr(runtimeSnapshotTextRes):
+        return Err[bool](Error(runtimeSnapshotTextRes))
+    let csgTextRes = v3CompilerWorldBundleReadText("", prefix + ".csg.txt", "csg report")
+    if IsErr(csgTextRes):
+        return Err[bool](Error(csgTextRes))
+    let surfaceTextRes = v3CompilerWorldBundleReadText("", prefix + ".surface.txt", "export surface")
+    if IsErr(surfaceTextRes):
+        return Err[bool](Error(surfaceTextRes))
+    let receiptTextRes = v3CompilerWorldBundleReadText("", prefix + ".receipt.txt", "compile receipt")
+    if IsErr(receiptTextRes):
+        return Err[bool](Error(receiptTextRes))
+    let lockTextRes = v3CompilerWorldBundleReadText("", prefix + ".lock.toml", "lock")
+    if IsErr(lockTextRes):
+        return Err[bool](Error(lockTextRes))
+    var worldHead: cworld.V3CompilerWorldHead
+    let worldRes = cworld.v3CompilerWorldHeadFromReportText(Value(worldTextRes), worldHead)
+    if IsErr(worldRes):
+        return Err[bool](Error(worldRes))
+    var manifest: cworld.V3CompilerUniverseManifest
+    let manifestRes = cworld.v3CompilerUniverseManifestFromReportText(Value(manifestTextRes), manifest)
+    if IsErr(manifestRes):
+        return Err[bool](Error(manifestRes))
+    var compilerSnapshot: cworld.V3CompilerPackageSnapshot
+    let compilerSnapshotRes = cworld.v3CompilerPackageSnapshotFromReportText(Value(compilerSnapshotTextRes), compilerSnapshot)
+    if IsErr(compilerSnapshotRes):
+        return Err[bool](Error(compilerSnapshotRes))
+    var stdSnapshot: cworld.V3CompilerPackageSnapshot
+    let stdSnapshotRes = cworld.v3CompilerPackageSnapshotFromReportText(Value(stdSnapshotTextRes), stdSnapshot)
+    if IsErr(stdSnapshotRes):
+        return Err[bool](Error(stdSnapshotRes))
+    var runtimeSnapshot: cworld.V3CompilerPackageSnapshot
+    let runtimeSnapshotRes = cworld.v3CompilerPackageSnapshotFromReportText(Value(runtimeSnapshotTextRes), runtimeSnapshot)
+    if IsErr(runtimeSnapshotRes):
+        return Err[bool](Error(runtimeSnapshotRes))
+    let csgCidRes = ccsg.v3CompilerCsgGraphCidFromReportText(Value(csgTextRes))
+    if IsErr(csgCidRes):
+        return Err[bool](Error(csgCidRes))
+    let canonicalCsgCidRes = ccsg.v3CompilerCsgCanonicalGraphCidFromReportText(Value(csgTextRes))
+    if IsErr(canonicalCsgCidRes):
+        return Err[bool](Error(canonicalCsgCidRes))
+    var exportSurface: ccsg.V3CsgExportSurface
+    let exportSurfaceRes = ccsg.v3CompilerExportSurfaceFromReportText(Value(surfaceTextRes), exportSurface)
+    if IsErr(exportSurfaceRes):
+        return Err[bool](Error(exportSurfaceRes))
+    var receipt: ccsg.V3CompileReceipt
+    let receiptRes = ccsg.v3CompileReceiptFromReportText(Value(receiptTextRes), receipt)
+    if IsErr(receiptRes):
+        return Err[bool](Error(receiptRes))
+    let lockRes = cworld.v3CompilerLockSnapshotFromText(Value(lockTextRes), prefix + ".lock.toml")
+    if IsErr(lockRes):
+        return Err[bool](Error(lockRes))
+    out.bundlePrefix = prefix
+    out.worldHead = worldHead
+    out.manifest = manifest
+    out.compilerSnapshot = compilerSnapshot
+    out.stdSnapshot = stdSnapshot
+    out.runtimeSnapshot = runtimeSnapshot
+    out.compilerCsgCid = Value(csgCidRes)
+    out.compilerCanonicalCsgCid = Value(canonicalCsgCidRes)
+    out.exportSurface = exportSurface
+    out.receipt = receipt
+    out.lock = Value(lockRes)
+    return Ok[bool](true)
+
+fn v3CompilerWorldBundleVerify(bundle: V3CompilerWorldBundle): Result[bool] =
+    if bundle.worldHead.universeId != cworld.v3CompilerWorldUniverseId():
+        return Err[bool]("v3 compiler world bundle: universe id mismatch")
+    if bundle.worldHead.channel != bundle.manifest.channel:
+        return Err[bool]("v3 compiler world bundle: manifest channel mismatch")
+    if bundle.worldHead.channel != bundle.compilerSnapshot.channel:
+        return Err[bool]("v3 compiler world bundle: compiler snapshot channel mismatch")
+    if bundle.worldHead.channel != bundle.stdSnapshot.channel:
+        return Err[bool]("v3 compiler world bundle: std snapshot channel mismatch")
+    if bundle.worldHead.channel != bundle.runtimeSnapshot.channel:
+        return Err[bool]("v3 compiler world bundle: runtime snapshot channel mismatch")
+    if bundle.worldHead.channel != bundle.lock.channel:
+        return Err[bool]("v3 compiler world bundle: lock channel mismatch")
+    if bundle.compilerSnapshot.packageId != "cheng/compiler":
+        return Err[bool]("v3 compiler world bundle: unexpected compiler package id")
+    if bundle.stdSnapshot.packageId != "cheng/std":
+        return Err[bool]("v3 compiler world bundle: unexpected std package id")
+    if bundle.runtimeSnapshot.packageId != "cheng/runtime":
+        return Err[bool]("v3 compiler world bundle: unexpected runtime package id")
+    if !layout.fixedBytes32Equal(bundle.worldHead.manifestRootCid, bundle.manifest.manifestCid):
+        return Err[bool]("v3 compiler world bundle: manifest root mismatch")
+    if !layout.fixedBytes32Equal(bundle.worldHead.compilerPkgCid, bundle.compilerSnapshot.snapshotCid):
+        return Err[bool]("v3 compiler world bundle: compiler snapshot cid mismatch")
+    if !layout.fixedBytes32Equal(bundle.worldHead.stdPkgCid, bundle.stdSnapshot.snapshotCid):
+        return Err[bool]("v3 compiler world bundle: std snapshot cid mismatch")
+    if !layout.fixedBytes32Equal(bundle.worldHead.runtimePkgCid, bundle.runtimeSnapshot.snapshotCid):
+        return Err[bool]("v3 compiler world bundle: runtime snapshot cid mismatch")
+    let compilerManifestBindingRes = v3CompilerWorldBundleVerifyManifestBinding(bundle.manifest, bundle.compilerSnapshot)
+    if IsErr(compilerManifestBindingRes):
+        return Err[bool](Error(compilerManifestBindingRes))
+    let stdManifestBindingRes = v3CompilerWorldBundleVerifyManifestBinding(bundle.manifest, bundle.stdSnapshot)
+    if IsErr(stdManifestBindingRes):
+        return Err[bool](Error(stdManifestBindingRes))
+    let runtimeManifestBindingRes = v3CompilerWorldBundleVerifyManifestBinding(bundle.manifest, bundle.runtimeSnapshot)
+    if IsErr(runtimeManifestBindingRes):
+        return Err[bool](Error(runtimeManifestBindingRes))
+    if !layout.fixedBytes32Equal(bundle.compilerSnapshot.csgRootCid, bundle.worldHead.csgRootCid):
+        return Err[bool]("v3 compiler world bundle: compiler csg root mismatch")
+    if !layout.fixedBytes32Equal(bundle.stdSnapshot.csgRootCid, bundle.worldHead.csgRootCid):
+        return Err[bool]("v3 compiler world bundle: std csg root mismatch")
+    if !layout.fixedBytes32Equal(bundle.runtimeSnapshot.csgRootCid, bundle.worldHead.csgRootCid):
+        return Err[bool]("v3 compiler world bundle: runtime csg root mismatch")
+    if !layout.fixedBytes32Equal(bundle.compilerCsgCid, bundle.worldHead.csgRootCid):
+        return Err[bool]("v3 compiler world bundle: csg report mismatch")
+    if !layout.fixedBytes32Equal(bundle.exportSurface.surfaceCid, bundle.compilerSnapshot.exportSurfaceCid):
+        return Err[bool]("v3 compiler world bundle: export surface cid mismatch")
+    let compilerDepsCid = v3CompilerWorldBundleExpectedCompilerDeps(bundle)
+    if !layout.fixedBytes32Equal(bundle.compilerSnapshot.depsManifestCid, compilerDepsCid):
+        return Err[bool]("v3 compiler world bundle: compiler deps manifest mismatch")
+    let emptyDepsCid = cworld.v3CompilerWorldEmptyManifestCid(bundle.worldHead.channel)
+    if !layout.fixedBytes32Equal(bundle.stdSnapshot.depsManifestCid, emptyDepsCid):
+        return Err[bool]("v3 compiler world bundle: std deps manifest mismatch")
+    if !layout.fixedBytes32Equal(bundle.runtimeSnapshot.depsManifestCid, emptyDepsCid):
+        return Err[bool]("v3 compiler world bundle: runtime deps manifest mismatch")
+    if !layout.fixedBytes32Equal(bundle.receipt.worldHeadCid, bundle.worldHead.headCid):
+        return Err[bool]("v3 compiler world bundle: receipt world head mismatch")
+    if !layout.fixedBytes32Equal(bundle.receipt.compilerCsgCid, bundle.compilerCsgCid):
+        return Err[bool]("v3 compiler world bundle: receipt csg mismatch")
+    if !layout.fixedBytes32Equal(bundle.receipt.canonicalCompilerCsgCid, bundle.compilerCanonicalCsgCid):
+        return Err[bool]("v3 compiler world bundle: receipt canonical csg mismatch")
+    let expectedHead = cworld.v3CompilerWorldHeadMake(bundle.worldHead.channel,
+                                                      bundle.worldHead.headEpoch,
+                                                      bundle.worldHead.prevHeadCid,
+                                                      bundle.manifest,
+                                                      bundle.compilerCsgCid,
+                                                      bundle.compilerSnapshot.snapshotCid,
+                                                      bundle.stdSnapshot.snapshotCid,
+                                                      bundle.runtimeSnapshot.snapshotCid,
+                                                      bundle.worldHead.signature)
+    if !layout.fixedBytes32Equal(expectedHead.headCid, bundle.worldHead.headCid):
+        return Err[bool]("v3 compiler world bundle: world head cid mismatch")
+    let expectedReceipt = ccsg.v3CompileReceiptMake(bundle.worldHead.headCid,
+                                                    bundle.compilerCsgCid,
+                                                    bundle.compilerCanonicalCsgCid,
+                                                    bundle.receipt.targetTriple,
+                                                    bundle.receipt.outputDigest,
+                                                    bundle.receipt.canonicalOutputDigest,
+                                                    bundle.receipt.bootstrapStage,
+                                                    bundle.receipt.runtimeProviderSet)
+    if !layout.fixedBytes32Equal(expectedReceipt.receiptCid, bundle.receipt.receiptCid):
+        return Err[bool]("v3 compiler world bundle: receipt cid mismatch")
+    let lockVerifyRes = cworld.v3CompilerWorldVerifyLock(v3CompilerWorldBundleUniverse(bundle), bundle.lock)
+    if IsErr(lockVerifyRes):
+        return Err[bool](Error(lockVerifyRes))
+    return Ok[bool](true)
+
+fn v3CompilerWorldBundleReadAndVerify(rootDir: str,
+                                      prefixRaw: str,
+                                      out: var V3CompilerWorldBundle): Result[bool] =
+    let readRes = v3CompilerWorldBundleRead(rootDir, prefixRaw, out)
+    if IsErr(readRes):
+        return Err[bool](Error(readRes))
+    return v3CompilerWorldBundleVerify(out)

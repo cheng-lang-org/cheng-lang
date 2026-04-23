@@ -1,0 +1,195 @@
+import std/system
+import std/rawbytes
+import cheng/std/bytes_layout as layout
+import cheng/apps/bft/bft_state_machine as bft
+
+fn txSeq1(a: bft.V3BftTx): bft.V3BftTx[] =
+    var out: bft.V3BftTx[]
+    out = []
+    add(out, a)
+    return out
+
+fn txSeq2(a: bft.V3BftTx, b: bft.V3BftTx): bft.V3BftTx[] =
+    var out: bft.V3BftTx[]
+    out = []
+    add(out, a)
+    add(out, b)
+    return out
+
+fn bytesSeq1(a: Bytes): Bytes[] =
+    var out: Bytes[]
+    out = []
+    add(out, a)
+    return out
+
+fn bytesSeq2(a: Bytes, b: Bytes): Bytes[] =
+    var out: Bytes[]
+    out = []
+    add(out, a)
+    add(out, b)
+    return out
+
+fn main(): int32 =
+    let appId = "bft-three-replica"
+    var replicaA = bft.v3BftStateMachineInit(appId)
+    var replicaB = bft.v3BftStateMachineInit(appId)
+    var replicaC = bft.v3BftStateMachineInit(appId)
+
+    let mint = bft.v3BftTxMint(7, 1001, int64(100))
+    let transfer = bft.v3BftTxTransfer(7, 1001, 2002, int64(33))
+    let badTransfer = bft.v3BftTxTransfer(7, 1001, 1001, int64(1))
+    let mintRaw = bft.v3BftEncodeTx(mint)
+    let transferRaw = bft.v3BftEncodeTx(transfer)
+    let badTransferRaw = bft.v3BftEncodeTx(badTransfer)
+
+    let mintCheckA = bft.v3BftStateMachineCheckTx(replicaA, mint)
+    let mintCheckB = bft.v3BftStateMachineCheckTxBytes(replicaB, mintRaw)
+    let mintCtx = bft.v3BftBlockContextMake(int64(1), 0, int64(11), layout.FixedBytes32())
+    let mintCheckC = bft.v3BftStateMachineCheckTxBytesWithContext(replicaC, mintCtx, mintRaw)
+    assert(mintCheckA.code == bft.v3BftCodeOk, "v3 bft three replica: mint check a")
+    assert(mintCheckB.code == bft.v3BftCodeOk, "v3 bft three replica: mint check b")
+    assert(mintCheckC.code == bft.v3BftCodeOk, "v3 bft three replica: mint check c")
+    assert(layout.fixedBytes32Equal(mintCheckB.eventCid, mintCheckA.eventCid),
+        "v3 bft three replica: mint check cid b")
+    assert(layout.fixedBytes32Equal(mintCheckC.eventCid, mintCheckA.eventCid),
+        "v3 bft three replica: mint check cid c")
+
+    var block1BatchB = bft.V3BftTxBatch()
+    let block1AddB = bft.v3BftTxBatchAddDecoded(block1BatchB, mintRaw)
+    assert(IsOk(block1AddB), "v3 bft three replica: block1 decode batch b")
+    var block1BatchC = bft.V3BftTxBatch()
+    bft.v3BftTxBatchAdd(block1BatchC, mint)
+
+    var block1SummaryA = bft.v3BftBlockSummaryZero(int64(0))
+    var block1SummaryB = bft.v3BftBlockSummaryZero(int64(0))
+    var block1SummaryC = bft.v3BftBlockSummaryZero(int64(0))
+    bft.v3BftStateMachineFinalizeBlockSummary(replicaA, int64(1), txSeq1(mint), block1SummaryA)
+    bft.v3BftStateMachineFinalizeBatchSummary(replicaB, int64(1), block1BatchB, block1SummaryB)
+    bft.v3BftStateMachineFinalizeBatchSummary(replicaC, int64(1), block1BatchC, block1SummaryC)
+
+    assert(block1SummaryA.txCount == 1, "v3 bft three replica: block1 tx count")
+    assert(block1SummaryA.appliedCount == 1, "v3 bft three replica: block1 applied")
+    assert(block1SummaryA.rejectedCount == 0, "v3 bft three replica: block1 rejected")
+    assert(block1SummaryB.txCount == block1SummaryA.txCount, "v3 bft three replica: block1 tx count b")
+    assert(block1SummaryC.txCount == block1SummaryA.txCount, "v3 bft three replica: block1 tx count c")
+    assert(block1SummaryB.appliedCount == block1SummaryA.appliedCount, "v3 bft three replica: block1 applied b")
+    assert(block1SummaryC.appliedCount == block1SummaryA.appliedCount, "v3 bft three replica: block1 applied c")
+    assert(block1SummaryB.rejectedCount == block1SummaryA.rejectedCount, "v3 bft three replica: block1 rejected b")
+    assert(block1SummaryC.rejectedCount == block1SummaryA.rejectedCount, "v3 bft three replica: block1 rejected c")
+    assert(layout.fixedBytes32Equal(block1SummaryB.tipEventCid, block1SummaryA.tipEventCid),
+        "v3 bft three replica: block1 tip b")
+    assert(layout.fixedBytes32Equal(block1SummaryC.tipEventCid, block1SummaryA.tipEventCid),
+        "v3 bft three replica: block1 tip c")
+    assert(replicaA.index.eventCids.len == 1, "v3 bft three replica: block1 state len a")
+    assert(replicaB.index.eventCids.len == replicaA.index.eventCids.len, "v3 bft three replica: block1 state len b")
+    assert(replicaC.index.eventCids.len == replicaA.index.eventCids.len, "v3 bft three replica: block1 state len c")
+    assert(layout.fixedBytes32Equal(replicaB.index.eventCids[0], replicaA.index.eventCids[0]),
+        "v3 bft three replica: block1 state cid b")
+    assert(layout.fixedBytes32Equal(replicaC.index.eventCids[0], replicaA.index.eventCids[0]),
+        "v3 bft three replica: block1 state cid c")
+    assert(layout.fixedBytes32Equal(bft.v3BftStateMachineQueryAppHash(replicaB),
+                                    bft.v3BftStateMachineQueryAppHash(replicaA)),
+        "v3 bft three replica: block1 state hash b")
+    assert(layout.fixedBytes32Equal(bft.v3BftStateMachineQueryAppHash(replicaC),
+                                    bft.v3BftStateMachineQueryAppHash(replicaA)),
+        "v3 bft three replica: block1 state hash c")
+
+    let badCheckA = bft.v3BftStateMachineCheckTx(replicaA, badTransfer)
+    let badCheckB = bft.v3BftStateMachineCheckTxBytes(replicaB, badTransferRaw)
+    let badCtx = bft.v3BftBlockContextMake(int64(2), 1, int64(22), layout.FixedBytes32())
+    let badCheckC = bft.v3BftStateMachineCheckTxBytesWithContext(replicaC, badCtx, badTransferRaw)
+    assert(badCheckA.code == bft.v3BftCodeBadTarget, "v3 bft three replica: bad check a")
+    assert(badCheckB.code == bft.v3BftCodeBadTarget, "v3 bft three replica: bad check b")
+    assert(badCheckC.code == bft.v3BftCodeBadTarget, "v3 bft three replica: bad check c")
+
+    var block2BatchB = bft.V3BftTxBatch()
+    let block2Add0B = bft.v3BftTxBatchAddDecoded(block2BatchB, transferRaw)
+    assert(IsOk(block2Add0B), "v3 bft three replica: block2 decode0 batch b")
+    var block2BatchC = bft.V3BftTxBatch()
+    bft.v3BftTxBatchAdd(block2BatchC, transfer)
+
+    var block2SummaryA = bft.v3BftBlockSummaryZero(int64(0))
+    var block2SummaryB = bft.v3BftBlockSummaryZero(int64(0))
+    var block2SummaryC = bft.v3BftBlockSummaryZero(int64(0))
+    bft.v3BftStateMachineFinalizeBlockSummary(replicaA,
+                                              int64(2),
+                                              txSeq1(transfer),
+                                              block2SummaryA)
+    bft.v3BftStateMachineFinalizeBatchSummary(replicaB, int64(2), block2BatchB, block2SummaryB)
+    bft.v3BftStateMachineFinalizeBatchSummary(replicaC, int64(2), block2BatchC, block2SummaryC)
+
+    assert(block2SummaryA.txCount == 1, "v3 bft three replica: block2 tx count")
+    assert(block2SummaryA.appliedCount == 1, "v3 bft three replica: block2 applied")
+    assert(block2SummaryA.rejectedCount == 0, "v3 bft three replica: block2 rejected")
+    assert(block2SummaryB.txCount == block2SummaryA.txCount, "v3 bft three replica: block2 tx count b")
+    assert(block2SummaryC.txCount == block2SummaryA.txCount, "v3 bft three replica: block2 tx count c")
+    assert(block2SummaryB.appliedCount == block2SummaryA.appliedCount, "v3 bft three replica: block2 applied b")
+    assert(block2SummaryC.appliedCount == block2SummaryA.appliedCount, "v3 bft three replica: block2 applied c")
+    assert(block2SummaryB.rejectedCount == block2SummaryA.rejectedCount, "v3 bft three replica: block2 rejected b")
+    assert(block2SummaryC.rejectedCount == block2SummaryA.rejectedCount, "v3 bft three replica: block2 rejected c")
+    assert(layout.fixedBytes32Equal(block2SummaryB.tipEventCid, block2SummaryA.tipEventCid),
+        "v3 bft three replica: block2 tip b")
+    assert(layout.fixedBytes32Equal(block2SummaryC.tipEventCid, block2SummaryA.tipEventCid),
+        "v3 bft three replica: block2 tip c")
+    assert(replicaA.index.eventCids.len == 2, "v3 bft three replica: block2 state len a")
+    assert(replicaB.index.eventCids.len == replicaA.index.eventCids.len, "v3 bft three replica: block2 state len b")
+    assert(replicaC.index.eventCids.len == replicaA.index.eventCids.len, "v3 bft three replica: block2 state len c")
+    assert(layout.fixedBytes32Equal(replicaB.index.eventCids[1], replicaA.index.eventCids[1]),
+        "v3 bft three replica: block2 state cid b")
+    assert(layout.fixedBytes32Equal(replicaC.index.eventCids[1], replicaA.index.eventCids[1]),
+        "v3 bft three replica: block2 state cid c")
+    assert(layout.fixedBytes32Equal(bft.v3BftStateMachineQueryAppHash(replicaB),
+                                    bft.v3BftStateMachineQueryAppHash(replicaA)),
+        "v3 bft three replica: block2 state hash b")
+    assert(layout.fixedBytes32Equal(bft.v3BftStateMachineQueryAppHash(replicaC),
+                                    bft.v3BftStateMachineQueryAppHash(replicaA)),
+        "v3 bft three replica: block2 state hash c")
+
+    let commitA = bft.v3BftStateMachineCommit(replicaA)
+    let commitB = bft.v3BftStateMachineCommit(replicaB)
+    let commitC = bft.v3BftStateMachineCommit(replicaC)
+    assert(commitA.height == int64(2), "v3 bft three replica: commit height")
+    assert(commitA.eventCount == 2, "v3 bft three replica: commit event count")
+    assert(commitA.accountCount == 2, "v3 bft three replica: commit account count")
+    assert(commitB.height == commitA.height, "v3 bft three replica: commit height b")
+    assert(commitC.height == commitA.height, "v3 bft three replica: commit height c")
+    assert(commitB.eventCount == commitA.eventCount, "v3 bft three replica: commit event count b")
+    assert(commitC.eventCount == commitA.eventCount, "v3 bft three replica: commit event count c")
+    assert(commitB.accountCount == commitA.accountCount, "v3 bft three replica: commit account count b")
+    assert(commitC.accountCount == commitA.accountCount, "v3 bft three replica: commit account count c")
+    assert(layout.fixedBytes32Equal(commitB.appHash, commitA.appHash), "v3 bft three replica: commit app hash b")
+    assert(layout.fixedBytes32Equal(commitC.appHash, commitA.appHash), "v3 bft three replica: commit app hash c")
+    assert(layout.fixedBytes32Equal(commitB.tipEventCid, commitA.tipEventCid), "v3 bft three replica: commit tip b")
+    assert(layout.fixedBytes32Equal(commitC.tipEventCid, commitA.tipEventCid), "v3 bft three replica: commit tip c")
+    assert(layout.fixedBytes32Equal(bft.v3BftStateMachineQueryAppHash(replicaA), commitA.appHash),
+        "v3 bft three replica: query app hash a")
+    assert(layout.fixedBytes32Equal(bft.v3BftStateMachineQueryAppHash(replicaB), commitA.appHash),
+        "v3 bft three replica: query app hash b")
+    assert(layout.fixedBytes32Equal(bft.v3BftStateMachineQueryAppHash(replicaC), commitA.appHash),
+        "v3 bft three replica: query app hash c")
+
+    let aliceA = bft.v3BftStateMachineQueryBalance(replicaA, 7, 1001)
+    let aliceB = bft.v3BftStateMachineQueryBalance(replicaB, 7, 1001)
+    let aliceC = bft.v3BftStateMachineQueryBalance(replicaC, 7, 1001)
+    let bobA = bft.v3BftStateMachineQueryBalance(replicaA, 7, 2002)
+    let bobB = bft.v3BftStateMachineQueryBalance(replicaB, 7, 2002)
+    let bobC = bft.v3BftStateMachineQueryBalance(replicaC, 7, 2002)
+    assert(aliceA.code == bft.v3BftCodeOk, "v3 bft three replica: alice query a")
+    assert(aliceB.code == bft.v3BftCodeOk, "v3 bft three replica: alice query b")
+    assert(aliceC.code == bft.v3BftCodeOk, "v3 bft three replica: alice query c")
+    assert(bobA.code == bft.v3BftCodeOk, "v3 bft three replica: bob query a")
+    assert(bobB.code == bft.v3BftCodeOk, "v3 bft three replica: bob query b")
+    assert(bobC.code == bft.v3BftCodeOk, "v3 bft three replica: bob query c")
+    assert(aliceB.balance == aliceA.balance, "v3 bft three replica: alice balance b")
+    assert(aliceC.balance == aliceA.balance, "v3 bft three replica: alice balance c")
+    assert(bobB.balance == bobA.balance, "v3 bft three replica: bob balance b")
+    assert(bobC.balance == bobA.balance, "v3 bft three replica: bob balance c")
+    assert(layout.fixedBytes32Equal(aliceA.appHash, commitA.appHash), "v3 bft three replica: alice app hash a")
+    assert(layout.fixedBytes32Equal(aliceB.appHash, commitA.appHash), "v3 bft three replica: alice app hash b")
+    assert(layout.fixedBytes32Equal(aliceC.appHash, commitA.appHash), "v3 bft three replica: alice app hash c")
+    assert(layout.fixedBytes32Equal(bobA.appHash, commitA.appHash), "v3 bft three replica: bob app hash a")
+    assert(layout.fixedBytes32Equal(bobB.appHash, commitA.appHash), "v3 bft three replica: bob app hash b")
+    assert(layout.fixedBytes32Equal(bobC.appHash, commitA.appHash), "v3 bft three replica: bob app hash c")
+
+    echo("v3 bft_three_replica_smoke ok")
+    return 0

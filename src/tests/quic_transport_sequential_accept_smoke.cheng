@@ -1,0 +1,117 @@
+import std/system
+import std/result
+import std/rawbytes
+import cheng/libp2p/core/types
+import cheng/libp2p/core/multistream
+import cheng/libp2p/transports/quic_transport
+import cheng/quic/connection as qconn
+import cheng/quic/msquictransport_native as qtransport
+
+fn quicSequentialSmokeBytesEqual(left: Bytes, right: Bytes): bool =
+    if bytesLen(left) != bytesLen(right):
+        return false
+    for i in 0..<bytesLen(left):
+        if bytesGet(left, i) != bytesGet(right, i):
+            return false
+    return true
+
+fn quicSequentialSmokeRound(listener: var qtransport.MsQuicTransport,
+                            port: int32,
+                            requestPayload: Bytes,
+                            responsePayload: Bytes): Result[bool] =
+    var client = qtransport.InitMsQuicTransport()
+    var clientConn: qconn.Connection
+    let dialRes = quic_transport.v3Libp2pQuicDialClient(client, clientConn, "127.0.0.1", port)
+    if IsErr(dialRes):
+        return Err[bool](Error(dialRes))
+    let acceptRes = qtransport.accept(listener)
+    if IsErr(acceptRes):
+        qconn.ConnClose(clientConn)
+        return Err[bool](ErrorText(acceptRes))
+    var serverConn = Value(acceptRes)
+
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(types.v3Libp2pProtocolBftProposal)
+    let clientSelectWriteRes = quic_transport.V3Libp2pQuicWriteExact(client, clientConn, selectBytes)
+    if IsErr(clientSelectWriteRes):
+        qconn.ConnClose(serverConn)
+        qconn.ConnClose(clientConn)
+        return Err[bool](Error(clientSelectWriteRes))
+    let serverSelectReadRes = quic_transport.v3Libp2pQuicReadExact(listener, serverConn, bytesLen(selectBytes))
+    if IsErr(serverSelectReadRes):
+        qconn.ConnClose(serverConn)
+        qconn.ConnClose(clientConn)
+        return Err[bool](Error(serverSelectReadRes))
+    if !multistream.v3Libp2pMultistreamAccepts(Value(serverSelectReadRes), types.v3Libp2pProtocolBftProposal):
+        qconn.ConnClose(serverConn)
+        qconn.ConnClose(clientConn)
+        return Err[bool]("v3 quic sequential accept: select request mismatch")
+    let serverSelectWriteRes = quic_transport.V3Libp2pQuicWriteExact(listener, serverConn, selectBytes)
+    if IsErr(serverSelectWriteRes):
+        qconn.ConnClose(serverConn)
+        qconn.ConnClose(clientConn)
+        return Err[bool](Error(serverSelectWriteRes))
+    let clientSelectReadRes = quic_transport.v3Libp2pQuicReadExact(client, clientConn, bytesLen(selectBytes))
+    if IsErr(clientSelectReadRes):
+        qconn.ConnClose(serverConn)
+        qconn.ConnClose(clientConn)
+        return Err[bool](Error(clientSelectReadRes))
+    if !multistream.v3Libp2pMultistreamAccepts(Value(clientSelectReadRes), types.v3Libp2pProtocolBftProposal):
+        qconn.ConnClose(serverConn)
+        qconn.ConnClose(clientConn)
+        return Err[bool]("v3 quic sequential accept: select response mismatch")
+
+    let clientRequestWriteRes = quic_transport.V3Libp2pQuicWriteExact(client,
+                                                                      clientConn,
+                                                                      quic_transport.V3Libp2pQuicEncodeFrame(requestPayload))
+    if IsErr(clientRequestWriteRes):
+        qconn.ConnClose(serverConn)
+        qconn.ConnClose(clientConn)
+        return Err[bool](Error(clientRequestWriteRes))
+    let serverRequestReadRes = quic_transport.V3Libp2pQuicReadFrame(listener, serverConn)
+    if IsErr(serverRequestReadRes):
+        qconn.ConnClose(serverConn)
+        qconn.ConnClose(clientConn)
+        return Err[bool](Error(serverRequestReadRes))
+    if !quicSequentialSmokeBytesEqual(Value(serverRequestReadRes), requestPayload):
+        qconn.ConnClose(serverConn)
+        qconn.ConnClose(clientConn)
+        return Err[bool]("v3 quic sequential accept: request payload mismatch")
+
+    let serverResponseWriteRes = quic_transport.V3Libp2pQuicWriteExact(listener,
+                                                                       serverConn,
+                                                                       quic_transport.V3Libp2pQuicEncodeFrame(responsePayload))
+    if IsErr(serverResponseWriteRes):
+        qconn.ConnClose(serverConn)
+        qconn.ConnClose(clientConn)
+        return Err[bool](Error(serverResponseWriteRes))
+    let clientResponseReadRes = quic_transport.V3Libp2pQuicReadFrame(client, clientConn)
+    qconn.ConnClose(serverConn)
+    qconn.ConnClose(clientConn)
+    if IsErr(clientResponseReadRes):
+        return Err[bool](Error(clientResponseReadRes))
+    if !quicSequentialSmokeBytesEqual(Value(clientResponseReadRes), responsePayload):
+        return Err[bool]("v3 quic sequential accept: response payload mismatch")
+    return Ok[bool](true)
+
+fn main(): int32 =
+    var listener = qtransport.InitMsQuicTransport()
+    let startRes = quic_transport.v3Libp2pQuicStartListener(listener, "127.0.0.1", 0)
+    assert(IsOk(startRes), "v3 quic sequential accept: start listener")
+    let port = Value(startRes)
+    assert(port > 0, "v3 quic sequential accept: bound port")
+
+    let round1Res = quicSequentialSmokeRound(listener,
+                                             port,
+                                             bytesFromString("round-1"),
+                                             bytesFromString("ack-1"))
+    assert(IsOk(round1Res), "v3 quic sequential accept: round1")
+
+    let round2Res = quicSequentialSmokeRound(listener,
+                                             port,
+                                             bytesFromString("round-2"),
+                                             bytesFromString("ack-2"))
+    assert(IsOk(round2Res), "v3 quic sequential accept: round2")
+
+    qtransport.Stop(listener)
+    echo("v3 quic_transport_sequential_accept_smoke ok")
+    return 0

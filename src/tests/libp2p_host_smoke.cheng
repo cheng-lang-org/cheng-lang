@@ -1,0 +1,66 @@
+import std/system
+import cheng/overlay/contracts as overlay
+import cheng/libp2p/core/types
+import cheng/libp2p/core/peer_id
+import cheng/libp2p/core/multiaddr
+import cheng/libp2p/core/peerstore as ps
+import cheng/libp2p/host/host
+
+fn main(): int32 =
+    var node = host.v3Libp2pHostInit("host.alpha")
+    var tcpAddr: types.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillTcp(tcpAddr, "127.0.0.1", 5101)
+    var quicAddr: types.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillQuic(quicAddr, "127.0.0.1", 5102)
+    let listenTcpRes = host.v3Libp2pListen(node, tcpAddr)
+    assert(listenTcpRes.ok, "v3 libp2p host: listen tcp")
+    let listenQuicRes = host.v3Libp2pListen(node, quicAddr)
+    assert(listenQuicRes.ok, "v3 libp2p host: listen quic")
+
+    host.v3Libp2pRegisterHandler(node, types.v3Libp2pProtocolIdentify)
+    host.v3Libp2pRegisterHandler(node, types.v3Libp2pProtocolKad)
+    host.v3Libp2pRegisterHandler(node, types.v3Libp2pProtocolGossipsub)
+    host.v3Libp2pRegisterHandler(node, types.v3Libp2pProtocolStore)
+    host.v3Libp2pRegisterHandler(node, types.v3Libp2pProtocolSync)
+
+    var bootstrapPeer: types.V3Libp2pPeerId
+    peer_id.v3Libp2pPeerIdFillFromSeed(bootstrapPeer, "bootstrap.one")
+    var bootstrapRecord: ps.V3Libp2pPeerRecord
+    bootstrapRecord.peerId = bootstrapPeer
+    bootstrapRecord.routingRole = overlay.v3OverlayRoleRegionalRouter
+    bootstrapRecord.connected = true
+    bootstrapRecord.bootstrap = true
+    bootstrapRecord.trustPermille = 900
+    bootstrapRecord.rttEwmaMicros = 1200
+    ps.v3Libp2pPeerRecordPutEndpoint(bootstrapRecord,
+                                     tcpAddr,
+                                     true,
+                                     types.v3Libp2pReachabilityDirect,
+                                     tcpAddr.priority)
+    host.v3Libp2pAddBootstrapPeer(node, bootstrapRecord)
+
+    var edgePeer: types.V3Libp2pPeerId
+    peer_id.v3Libp2pPeerIdFillFromSeed(edgePeer, "edge.two")
+    let dialRes = host.v3Libp2pDial(node, edgePeer, quicAddr, overlay.v3OverlayRoleEdgeRelayStore)
+    assert(dialRes.ok, "v3 libp2p host: dial peer")
+
+    let streamRes = host.v3Libp2pOpenStream(node, bootstrapPeer, types.v3Libp2pProtocolIdentify)
+    assert(streamRes.ok, "v3 libp2p host: open identify stream")
+    assert(streamRes.value == 1, "v3 libp2p host: first stream id")
+
+    let closest = host.v3Libp2pFindPeers(node, bootstrapPeer, 2)
+    assert(closest.len >= 1, "v3 libp2p host: kad closest")
+    let closestPeer = closest[0].peerId
+    assert(types.v3Libp2pPeerIdEqual(closestPeer, bootstrapPeer),
+        "v3 libp2p host: bootstrap closest")
+
+    let snapshot = host.v3Libp2pPeerSnapshot(node)
+    assert(snapshot.listenCount == 2, "v3 libp2p host: listen count")
+    assert(snapshot.peerCount == 2, "v3 libp2p host: peer count")
+    assert(snapshot.handlerCount == 5, "v3 libp2p host: handler count")
+    assert(snapshot.streamCount == 1, "v3 libp2p host: stream count")
+    assert(node.peers.peers[0].endpoints.len == 1, "v3 libp2p host: bootstrap endpoint count")
+    assert(node.peers.peers[1].endpoints.len == 1, "v3 libp2p host: edge endpoint count")
+
+    echo("v3 libp2p_host_smoke ok")
+    return 0

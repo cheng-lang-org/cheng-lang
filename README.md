@@ -326,14 +326,14 @@ Cheng 当前最有辨识度的编译器特性包括：
 
 当前几个关键入口是：
 
-- `artifacts/v3_bootstrap/cheng.stage3`
-- `artifacts/v3_backend_driver/cheng`
-- `artifacts/v3_bootstrap/cheng.stage3 bootstrap-bridge / build-backend-driver`
-- `artifacts/v3_bootstrap/cheng.stage3 run-production-regression`
-- `artifacts/v3_bootstrap/cheng.stage3 profile-run / profile-report`
-- `artifacts/v3_backend_driver/cheng status / run-host-smokes`
-- `artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
-- `artifacts/v3_backend_driver/cheng system-link-exec`
+- `artifacts/bootstrap/cheng.stage3`
+- `artifacts/backend_driver/cheng`
+- `artifacts/bootstrap/cheng.stage3 bootstrap-bridge / build-backend-driver`
+- `artifacts/bootstrap/cheng.stage3 run-production-regression`
+- `artifacts/bootstrap/cheng.stage3 profile-run / profile-report`
+- `artifacts/backend_driver/cheng status / run-host-smokes`
+- `artifacts/backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
+- `artifacts/backend_driver/cheng system-link-exec`
 
 `v3/tooling/cheng_v3.sh` 现在只该视为兼容壳，不再是 README 主入口。
 
@@ -350,12 +350,12 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 ## 快速上手
 
 ```sh
-./artifacts/v3_bootstrap/cheng.stage3 bootstrap-bridge
-./artifacts/v3_bootstrap/cheng.stage3 build-backend-driver
-./artifacts/v3_bootstrap/cheng.stage3 run-production-regression
-./artifacts/v3_backend_driver/cheng status
-./artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke
-./artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke
+./artifacts/bootstrap/cheng.stage3 bootstrap-bridge
+./artifacts/bootstrap/cheng.stage3 build-backend-driver
+./artifacts/bootstrap/cheng.stage3 run-production-regression
+./artifacts/backend_driver/cheng status
+./artifacts/backend_driver/cheng run-host-smokes perf_memory_contract_smoke
+./artifacts/backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke
 ```
 
 可以把它们理解成三类入口：
@@ -365,17 +365,17 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
   其中 `run-production-regression` 现在固定包含 `dev_hotpatch_100ms_scope_contract_smoke`、`explicit_default_init_positive_smoke`、`explicit_default_init_negative_smoke`、`explicit_default_init_gate_smoke`、`composite_zero_helper_gate_smoke` 和 `verify-r2c-react-v3-surface`
 - `run-host-smokes` / `status`：校验闭环和查看当前主线状态
 
-其中 `system-link-exec` 的正式入口仍然优先认 `artifacts/v3_backend_driver/cheng`。如果你直接跑 `artifacts/v3_bootstrap/cheng.stage3 system-link-exec`，在 backend driver fresh/ready 时它现在也会先 handoff 到 backend driver，前端语义口径保持 parser 真源一致。
+其中 `system-link-exec` 的正式入口仍然优先认 `artifacts/backend_driver/cheng`。如果你直接跑 `artifacts/bootstrap/cheng.stage3 system-link-exec`，在 backend driver fresh/ready 时它现在也会先 handoff 到 backend driver，前端语义口径保持 parser 真源一致。
 
 调试和性能入口也已经固定：
 
-- `artifacts/v3_bootstrap/cheng.stage3 debug-report`
-- `artifacts/v3_bootstrap/cheng.stage3 print-asm`
-- `artifacts/v3_bootstrap/cheng.stage3 crash-report --in:/abs/path/app.run.log --out:/tmp/app.crash-report.txt`
-- `artifacts/v3_bootstrap/cheng.stage3 profile-run --in:/abs/path/file.cheng --target:arm64-apple-darwin --out:/tmp/app`
-- `artifacts/v3_bootstrap/cheng.stage3 profile-report --in:/tmp/app.v3.profile.raw.txt --out:/tmp/app.profile.txt`
-- `artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
-- `artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
+- `artifacts/bootstrap/cheng.stage3 debug-report`
+- `artifacts/bootstrap/cheng.stage3 print-asm`
+- `artifacts/bootstrap/cheng.stage3 crash-report --in:/abs/path/app.run.log --out:/tmp/app.crash-report.txt`
+- `artifacts/bootstrap/cheng.stage3 profile-run --in:/abs/path/file.cheng --target:arm64-apple-darwin --out:/tmp/app`
+- `artifacts/bootstrap/cheng.stage3 profile-report --in:/tmp/app.v3.profile.raw.txt --out:/tmp/app.profile.txt`
+- `artifacts/backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
+- `artifacts/backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
 
 排障顺序也已经固定：
 
@@ -387,7 +387,7 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 
 `perf_memory_contract_smoke` 的报告默认落在 `artifacts/v3_perf_memory_contract/<label>/perf_memory_contract.report.txt`。
 
-- `perf_memory_contract_smoke` 默认优先测 `artifacts/v3_backend_driver/cheng`；只有显式 `CHENG_V3_SMOKE_COMPILER` 才覆盖。
+- `perf_memory_contract_smoke` 默认优先测 `artifacts/backend_driver/cheng`；只有显式 `CHENG_SMOKE_COMPILER` 才覆盖。
 - Darwin 正式内存比较值优先用 `peak memory footprint`；`maximum resident set size` 只保留原始观测，不作为稳定合同阈值。
 
 这份报告现在同时给四类事实：

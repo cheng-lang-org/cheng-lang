@@ -1,0 +1,239 @@
+# MsQuic connection(pure Cheng, in-process, minimized for v3).
+
+import std/result
+import cheng/quic/multiaddress
+import cheng/quic/msquicruntime
+import cheng/quic/msquicstream
+
+type
+    MsQuicConnection =
+        id: int64
+        localAddr: MultiAddress
+        remoteAddr: MultiAddress
+        isClient: bool
+        open: bool
+        createdAtMs: int64
+        lastActiveMs: int64
+        settings: MsQuicSettings
+        bytesSent: int64
+        bytesRecv: int64
+        packetsSent: int64
+        packetsRecv: int64
+        streamsOpened: int32
+        streamsClosed: int32
+        maxStreamsBidi: int32
+        maxStreamsUni: int32
+        peerMaxStreamsBidi: int32
+        peerMaxStreamsUni: int32
+        nextBidiId: int64
+        nextUniId: int64
+
+fn initMsQuicConnectionInto(
+    out: var MsQuicConnection,
+    id: int64,
+    localAddr: var MultiAddress,
+    remoteAddr: var MultiAddress,
+    settings: var MsQuicSettings,
+    isClient: bool
+) =
+    let now: int64 = msquicNowMs()
+    out.id = id
+    out.localAddr = localAddr
+    out.remoteAddr = remoteAddr
+    out.isClient = isClient
+    out.open = true
+    out.createdAtMs = now
+    out.lastActiveMs = now
+    out.settings = settings
+    out.bytesSent = 0
+    out.bytesRecv = 0
+    out.packetsSent = 0
+    out.packetsRecv = 0
+    out.streamsOpened = 0
+    out.streamsClosed = 0
+    out.maxStreamsBidi = settings.maxStreamsBidi
+    out.maxStreamsUni = settings.maxStreamsUni
+    out.peerMaxStreamsBidi = settings.maxStreamsBidi
+    out.peerMaxStreamsUni = settings.maxStreamsUni
+    out.nextBidiId = 0
+    out.nextUniId = 0
+
+fn initMsQuicConnection(
+    id: int64,
+    localAddr: MultiAddress,
+    remoteAddr: MultiAddress,
+    settings: MsQuicSettings,
+    isClient: bool
+): MsQuicConnection =
+    let now: int64 = msquicNowMs()
+    var out: MsQuicConnection
+    out.id = id
+    out.localAddr = localAddr
+    out.remoteAddr = remoteAddr
+    out.isClient = isClient
+    out.open = true
+    out.createdAtMs = now
+    out.lastActiveMs = now
+    out.settings = settings
+    out.bytesSent = 0
+    out.bytesRecv = 0
+    out.packetsSent = 0
+    out.packetsRecv = 0
+    out.streamsOpened = 0
+    out.streamsClosed = 0
+    out.maxStreamsBidi = settings.maxStreamsBidi
+    out.maxStreamsUni = settings.maxStreamsUni
+    out.peerMaxStreamsBidi = settings.maxStreamsBidi
+    out.peerMaxStreamsUni = settings.maxStreamsUni
+    out.nextBidiId = 0
+    out.nextUniId = 0
+    return out
+
+fn msquicConnectionId(c: MsQuicConnection): int64 =
+    c.id
+
+fn msquicConnectionCreatedAtMs(c: MsQuicConnection): int64 =
+    c.createdAtMs
+
+fn msquicConnectionIsClient(c: MsQuicConnection): bool =
+    c.isClient
+
+fn msquicConnectionSetIsClient(c: var MsQuicConnection, isClient: bool) =
+    c.isClient = isClient
+
+fn msquicStreamIdIsBidi(streamId: int64): bool =
+    return (streamId & 0x2) == 0
+
+fn msquicStreamIdIsUni(streamId: int64): bool =
+    return (streamId & 0x2) != 0
+
+fn msquicStreamIdIsClientInitiated(streamId: int64): bool =
+    return (streamId & 0x1) == 0
+
+fn msquicStreamIdSequence(streamId: int64): int64 =
+    if streamId < 0:
+        return -1
+    return streamId >> 2
+
+fn msquicStreamIdFromParts(seq: int64, isClient: bool, bidi: bool): int64 =
+    var out: int64 = seq << 2
+    if ! bidi:
+        out = out | 0x2
+    if ! isClient:
+        out = out | 0x1
+    return out
+
+fn msquicStreamIdIsLocalInitiated(c: MsQuicConnection, streamId: int64): bool =
+    if msquicStreamIdIsClientInitiated(streamId):
+        return c.isClient
+    return ! c.isClient
+
+fn msquicStreamIdIsPeerInitiated(c: MsQuicConnection, streamId: int64): bool =
+    return ! msquicStreamIdIsLocalInitiated(c, streamId)
+
+fn msquicConnectionIsOpen(c: MsQuicConnection): bool =
+    c.open
+
+fn msquicConnectionLocalAddr(c: MsQuicConnection): MultiAddress =
+    c.localAddr
+
+fn msquicConnectionRemoteAddr(c: MsQuicConnection): MultiAddress =
+    c.remoteAddr
+
+fn msquicConnectionSetLocalAddr(c: var MsQuicConnection, addr: MultiAddress) =
+    c.localAddr = addr
+    msquicConnectionTouch(c)
+
+fn msquicConnectionSetRemoteAddr(c: var MsQuicConnection, addr: MultiAddress) =
+    c.remoteAddr = addr
+    msquicConnectionTouch(c)
+
+fn msquicConnectionTouch(c: var MsQuicConnection) =
+    c.lastActiveMs = msquicNowMs()
+
+fn msquicConnectionIdleMs(c: MsQuicConnection): int64 =
+    return msquicNowMs() - c.lastActiveMs
+
+fn msquicConnectionOpenedStreamCount(c: MsQuicConnection): int32 =
+    return c.streamsOpened - c.streamsClosed
+
+fn msquicConnectionStreamsOpened(c: MsQuicConnection): int32 =
+    c.streamsOpened
+
+fn msquicConnectionStreamsClosed(c: MsQuicConnection): int32 =
+    c.streamsClosed
+
+fn msquicConnectionBytesSent(c: MsQuicConnection): int64 =
+    c.bytesSent
+
+fn msquicConnectionBytesRecv(c: MsQuicConnection): int64 =
+    c.bytesRecv
+
+fn msquicConnectionPacketsSent(c: MsQuicConnection): int64 =
+    c.packetsSent
+
+fn msquicConnectionPacketsRecv(c: MsQuicConnection): int64 =
+    c.packetsRecv
+
+fn msquicConnectionOpenBidiStream(c: var MsQuicConnection): Result[MsQuicStream] =
+    if ! c.open:
+        return Err[MsQuicStream]("msquic: connection closed")
+    if c.maxStreamsBidi >= 0 && c.nextBidiId >= int64(c.maxStreamsBidi):
+        return Err[MsQuicStream]("msquic: bidi stream limit reached")
+    let streamId: int64 = msquicStreamIdFromParts(c.nextBidiId, c.isClient, true)
+    c.nextBidiId = c.nextBidiId + 1
+    c.streamsOpened = c.streamsOpened + 1
+    msquicConnectionTouch(c)
+    return Ok[MsQuicStream](initMsQuicStream(streamId, true))
+
+fn msquicConnectionOpenUniStream(c: var MsQuicConnection): Result[MsQuicStream] =
+    if ! c.open:
+        return Err[MsQuicStream]("msquic: connection closed")
+    if c.maxStreamsUni >= 0 && c.nextUniId >= int64(c.maxStreamsUni):
+        return Err[MsQuicStream]("msquic: unidi stream limit reached")
+    let streamId: int64 = msquicStreamIdFromParts(c.nextUniId, c.isClient, false)
+    c.nextUniId = c.nextUniId + 1
+    c.streamsOpened = c.streamsOpened + 1
+    msquicConnectionTouch(c)
+    return Ok[MsQuicStream](initMsQuicStream(streamId, false))
+
+fn msquicConnectionClose(c: var MsQuicConnection) =
+    c.open = false
+    msquicConnectionTouch(c)
+
+fn msquicConnectionRecordPacketSent(c: var MsQuicConnection, bytes: int64) =
+    if bytes > 0:
+        c.bytesSent = c.bytesSent + bytes
+    c.packetsSent = c.packetsSent + 1
+    msquicConnectionTouch(c)
+
+fn msquicConnectionRecordPacketRecv(c: var MsQuicConnection, bytes: int64) =
+    if bytes > 0:
+        c.bytesRecv = c.bytesRecv + bytes
+    c.packetsRecv = c.packetsRecv + 1
+    msquicConnectionTouch(c)
+
+fn msquicConnectionRecordStreamOpened(c: var MsQuicConnection) =
+    c.streamsOpened = c.streamsOpened + 1
+    msquicConnectionTouch(c)
+
+fn msquicConnectionRecordStreamClosed(c: var MsQuicConnection) =
+    c.streamsClosed = c.streamsClosed + 1
+    msquicConnectionTouch(c)
+
+fn msquicConnectionSettings(c: MsQuicConnection): MsQuicSettings =
+    c.settings
+
+fn msquicConnectionApplySettings(c: var MsQuicConnection, settings: MsQuicSettings): Result[bool] =
+    let validRes: Result[bool] = validateMsQuicSettings(settings)
+    if IsErr(validRes):
+        return Err[bool](ErrorText(validRes))
+    c.settings = settings
+    c.maxStreamsBidi = settings.maxStreamsBidi
+    c.maxStreamsUni = settings.maxStreamsUni
+    if c.peerMaxStreamsBidi <= 0:
+        c.peerMaxStreamsBidi = settings.maxStreamsBidi
+    if c.peerMaxStreamsUni <= 0:
+        c.peerMaxStreamsUni = settings.maxStreamsUni
+    msquicConnectionTouch(c)
+    return Ok[bool](true)

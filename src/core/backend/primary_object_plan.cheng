@@ -1,0 +1,336 @@
+import std/strings
+import std/strutils as strutil
+import std/result
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/path as v3path
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/target_matrix as tmat
+import cheng/core/lang/parser
+
+type
+    V3PrimaryObjectPlan =
+        targetTriple: str
+        objectFormat: str
+        outputPath: str
+        entryPath: str
+        entrySymbol: str
+        itemIds: int32[]
+        symbolNames: str[]
+        functionWordOffsets: int32[]
+        functionWordCounts: int32[]
+        instructionWords: int32[]
+        dataLabels: str[]
+        dataPayloadTexts: str[]
+        relocSourceItemIds: int32[]
+        relocWordOffsets: int32[]
+        relocTargetSymbols: str[]
+        missingReasons: str[]
+        pipelineStage: str
+
+    V3PrimarySourceCacheEntry =
+        sourcePath: str
+        lines: str[]
+        decls: parser.V3NormalizedFunctionDecl[]
+        ok: bool
+
+fn v3PrimaryTargetSymbolName(targetTriple: str,
+                             raw: str): str =
+    if targetTriple == "arm64-apple-darwin" ||
+       targetTriple == "aarch64-apple-ios" ||
+       targetTriple == "arm64-apple-ios":
+        return "_" + raw
+    return raw
+
+fn v3PrimarySanitizeSymbolPart(text: str): str =
+    var out = ""
+    for i in 0..<len(text):
+        let ch = text[i]
+        let digit = ch >= '0' && ch <= '9'
+        let upper = ch >= 'A' && ch <= 'Z'
+        let lower = ch >= 'a' && ch <= 'z'
+        if digit || upper || lower || ch == '_':
+            out = out + strings.SliceBytes(text, i, 1)
+        else:
+            out = out + "_"
+    return out
+
+fn v3PrimarySymbolNameForFunction(targetTriple: str,
+                                  symbolText: str,
+                                  signatureLineNumber: int32,
+                                  emitKind: creq.V3CompilerEmit): str =
+    var raw = symbolText
+    if len(raw) == 0:
+        raw = "v3_primary_unnamed"
+    raw = v3PrimarySanitizeSymbolPart(raw)
+    if signatureLineNumber > 0:
+        raw = raw + "__L" + intToStr(signatureLineNumber)
+    return v3PrimaryTargetSymbolName(targetTriple, raw)
+
+fn v3PrimaryRuntimeEntryBridgeSymbol(linkPlan: slplan.V3SystemLinkPlanStub): str =
+    var raw = "cheng_program_argv_entry"
+    if linkPlan.moduleKind == slplan.v3SystemCompilerControlPlane:
+        raw = "cheng_tooling_argv_entry"
+    return v3PrimaryTargetSymbolName(linkPlan.targetTriple, raw)
+
+fn v3PrimarySplitLines(text: str): str[] =
+    var out: str[]
+    var start = 0
+    let n = len(text)
+    var i = 0
+    while i <= n:
+        var lineEnd = false
+        if i == n:
+            lineEnd = true
+        elif text[i] == '\n':
+            lineEnd = true
+        if !lineEnd:
+            i = i + 1
+            continue
+        add(out, strings.SliceBytes(text, start, i - start))
+        start = i + 1
+        i = i + 1
+    return out
+
+fn v3PrimaryFindDeclLineIndex(decls: parser.V3NormalizedFunctionDecl[],
+                              functionName: str): int32 =
+    for i in 0..<decls.len:
+        if decls[i].name == functionName:
+            return decls[i].lineIndex
+    return 0
+
+fn v3PrimarySourceCacheIndex(entries: V3PrimarySourceCacheEntry[],
+                             sourcePath: str): int32 =
+    for i in 0..<entries.len:
+        if entries[i].sourcePath == sourcePath:
+            return i
+    return -1
+
+fn v3PrimarySourceCacheEnsure(entries: var V3PrimarySourceCacheEntry[],
+                              sourcePath: str): int32 =
+    let existing = v3PrimarySourceCacheIndex(entries, sourcePath)
+    if existing >= 0:
+        return existing
+    let sourceText = v3path.V3ReadTextFile("", sourcePath)
+    var decls: parser.V3NormalizedFunctionDecl[]
+    var declErr = ""
+    var entry: V3PrimarySourceCacheEntry
+    entry.sourcePath = sourcePath
+    entry.lines = v3PrimarySplitLines(sourceText)
+    entry.ok = parser.v3ParserReadNormalizedFunctionDecls(sourceText, decls, declErr)
+    entry.decls = decls
+    add(entries, entry)
+    return entries.len - 1
+
+fn v3PrimaryBodyTextAfterEquals(lineRaw: str): str =
+    for i in 0..<len(lineRaw):
+        if lineRaw[i] != '=':
+            continue
+        return v3path.V3PathTrim(strings.SliceBytes(lineRaw, i + 1, len(lineRaw) - i - 1))
+    return ""
+
+fn v3PrimaryFunctionBodyLine(lines: str[],
+                             declLineIndex: int32,
+                             bodyLineNumber: var int32): str =
+    bodyLineNumber = 0
+    if declLineIndex <= 0 || declLineIndex > lines.len:
+        return ""
+    let declLine = lines[declLineIndex - 1]
+    let inlineBody = v3PrimaryBodyTextAfterEquals(declLine)
+    if len(inlineBody) > 0:
+        bodyLineNumber = declLineIndex
+        return inlineBody
+    for i in declLineIndex..<lines.len:
+        let bodyRaw = lines[i]
+        let bodyTrim = v3path.V3PathTrim(bodyRaw)
+        if len(bodyTrim) <= 0:
+            continue
+        if !parser.v3ParserHasLeadingIndent(bodyRaw):
+            break
+        bodyLineNumber = i + 1
+        return bodyTrim
+    return ""
+
+fn v3PrimaryFindResolvedCallIndex(lowering: lower.V3LoweringPlanStub,
+                                  sourcePath: str,
+                                  lineNumber: int32): int32 =
+    if lineNumber <= 0:
+        return -1
+    var insideTargetSource = false
+    for i in 0..<lowering.typedExprFacts.len:
+        let factSourcePath = lowering.typedExprFacts[i].sourcePath
+        if factSourcePath != sourcePath:
+            if insideTargetSource:
+                break
+            continue
+        insideTargetSource = true
+        let factLineNumber = lowering.typedExprFacts[i].lineNumber
+        if factLineNumber != lineNumber:
+            if factLineNumber > lineNumber:
+                break
+            continue
+        if !lowering.typedExprFacts[i].callResolved:
+            continue
+        if lowering.typedExprFacts[i].callTargetImportc:
+            continue
+        if len(lowering.typedExprFacts[i].callTarget) <= 0:
+            continue
+        return i
+    return -1
+
+fn v3PrimaryFunctionTargetSymbol(functionSymbolTexts: str[],
+                                 allSymbolNames: str[],
+                                 targetText: str): str =
+    for i in 0..<functionSymbolTexts.len:
+        if functionSymbolTexts[i] == targetText:
+            return allSymbolNames[i]
+    return ""
+
+fn v3PrimaryFunctionWordCount(bodyText: str,
+                              callArgCount: int32,
+                              targetSymbol: str): int32 =
+    let trimmed = v3path.V3PathTrim(bodyText)
+    if trimmed == "return 0" || trimmed == "0":
+        return 2
+    if len(targetSymbol) <= 0:
+        return 0
+    if callArgCount == 0:
+        return 1
+    if callArgCount == 1:
+        return 2
+    return 0
+
+fn v3PrimaryObjectMissingReasons(linkPlan: slplan.V3SystemLinkPlanStub,
+                                 lowering: lower.V3LoweringPlanStub,
+                                 itemIds: int32[],
+                                 instructionWords: int32[],
+                                 bodySemanticsMissing: bool): str[] =
+    var missing: str[]
+    if linkPlan.missingReasons.len > 0:
+        add(missing, "system_link_plan_not_ready_for_primary_object")
+    if lowering.missingReasons.len > 0:
+        add(missing, "lowering_plan_not_ready_for_primary_object")
+    if itemIds.len <= 0:
+        add(missing, "primary_object_items_missing")
+    if instructionWords.len <= 0:
+        add(missing, "primary_object_machine_words_missing")
+    if bodySemanticsMissing:
+        add(missing, "primary_object_body_semantics_missing")
+    if linkPlan.emitKind == creq.v3EmitExe && len(linkPlan.entrySymbol) <= 0:
+        add(missing, "primary_object_entry_symbol_missing")
+    return missing
+
+fn v3BuildPrimaryObjectPlan(linkPlan: slplan.V3SystemLinkPlanStub,
+                            lowering: lower.V3LoweringPlanStub): Result[V3PrimaryObjectPlan] =
+    var sourceCache: V3PrimarySourceCacheEntry[]
+    var allSymbolNames: str[]
+    var declLineIndices: int32[]
+    var bodyTexts: str[]
+    var bodyLineNumbers: int32[]
+    var itemIds: int32[]
+    var symbolNames: str[]
+    var functionWordOffsets: int32[]
+    var functionWordCounts: int32[]
+    var plan: V3PrimaryObjectPlan
+    var totalWordCount: int32
+    var bodySemanticsMissing = false
+    allSymbolNames = []
+    declLineIndices = []
+    bodyTexts = []
+    bodyLineNumbers = []
+    itemIds = []
+    symbolNames = []
+    functionWordOffsets = []
+    functionWordCounts = []
+    for i in 0..<lowering.functionNames.len:
+        let sourcePath = lowering.functionSourcePaths[i]
+        let cacheIndex = v3PrimarySourceCacheEnsure(sourceCache, sourcePath)
+        let sourceEntry = sourceCache[cacheIndex]
+        var declLineIndex: int32
+        var bodyLineNumber: int32
+        var bodyText = ""
+        if !sourceEntry.ok:
+            bodySemanticsMissing = true
+        else:
+            declLineIndex = v3PrimaryFindDeclLineIndex(sourceEntry.decls, lowering.functionNames[i])
+            bodyText = v3PrimaryFunctionBodyLine(sourceEntry.lines, declLineIndex, bodyLineNumber)
+            if declLineIndex <= 0 || len(bodyText) <= 0:
+                bodySemanticsMissing = true
+        add(declLineIndices, declLineIndex)
+        add(bodyTexts, bodyText)
+        add(bodyLineNumbers, bodyLineNumber)
+        add(allSymbolNames,
+            v3PrimarySymbolNameForFunction(linkPlan.targetTriple,
+                                           lowering.functionSymbolTexts[i],
+                                           declLineIndex,
+                                           linkPlan.emitKind))
+    for i in 0..<lowering.functionNames.len:
+        let bodyText = bodyTexts[i]
+        let bodyLineNumber = bodyLineNumbers[i]
+        let sourcePath = lowering.functionSourcePaths[i]
+        let callIndex = v3PrimaryFindResolvedCallIndex(lowering, sourcePath, bodyLineNumber)
+        var targetSymbol = ""
+        var callArgCount = -1
+        if callIndex >= 0:
+            let fact = lowering.typedExprFacts[callIndex]
+            callArgCount = fact.callArgCount
+            targetSymbol = v3PrimaryFunctionTargetSymbol(lowering.functionSymbolTexts,
+                                                         allSymbolNames,
+                                                         fact.callTarget)
+        let wordCount = v3PrimaryFunctionWordCount(bodyText, callArgCount, targetSymbol)
+        if wordCount <= 0:
+            bodySemanticsMissing = true
+            continue
+        add(itemIds, int32(100000 + i))
+        add(symbolNames, allSymbolNames[i])
+        add(functionWordOffsets, totalWordCount)
+        add(functionWordCounts, wordCount)
+        totalWordCount = totalWordCount + wordCount
+    if linkPlan.emitKind == creq.v3EmitExe && len(linkPlan.entrySymbol) > 0 && itemIds.len > 0:
+        add(itemIds, int32(900000 + itemIds.len))
+        add(symbolNames, v3PrimaryRuntimeEntryBridgeSymbol(linkPlan))
+        add(functionWordOffsets, totalWordCount)
+        add(functionWordCounts, 1)
+        totalWordCount = totalWordCount + 1
+    plan.targetTriple = linkPlan.targetTriple
+    plan.objectFormat = tmat.v3TargetPrimaryObjectFormat(linkPlan.targetTriple)
+    if linkPlan.emitKind == creq.v3EmitObj:
+        plan.outputPath = linkPlan.outputPath
+    else:
+        plan.outputPath = linkPlan.outputPath + ".primary.o"
+    plan.entryPath = linkPlan.entryPath
+    plan.entrySymbol = linkPlan.entrySymbol
+    plan.itemIds = itemIds
+    plan.symbolNames = symbolNames
+    plan.functionWordOffsets = functionWordOffsets
+    plan.functionWordCounts = functionWordCounts
+    plan.instructionWords = []
+    for i in 0..<totalWordCount:
+        add(plan.instructionWords, 0)
+    plan.dataLabels = []
+    plan.dataPayloadTexts = []
+    plan.relocSourceItemIds = []
+    plan.relocWordOffsets = []
+    plan.relocTargetSymbols = []
+    plan.missingReasons = v3PrimaryObjectMissingReasons(linkPlan,
+                                                        lowering,
+                                                        itemIds,
+                                                        plan.instructionWords,
+                                                        bodySemanticsMissing)
+    plan.pipelineStage = "lowering_plan_to_primary_object_plan"
+    return Ok[V3PrimaryObjectPlan](plan)
+
+fn v3PrimaryObjectPlanReport(plan: V3PrimaryObjectPlan): str =
+    var symbolText = "-"
+    if plan.symbolNames.len > 0:
+        symbolText = strutil.Join(plan.symbolNames, ",")
+    var out = ""
+    out = out + "primary_object_format=" + plan.objectFormat + "\n"
+    out = out + "primary_object_item_count=" + intToStr(plan.itemIds.len) + "\n"
+    out = out + "primary_object_symbols=" + symbolText + "\n"
+    out = out + "primary_object_instruction_word_count=" + intToStr(plan.instructionWords.len) + "\n"
+    out = out + "primary_object_data_label_count=" + intToStr(plan.dataLabels.len) + "\n"
+    out = out + "primary_object_reloc_count=" + intToStr(plan.relocSourceItemIds.len) + "\n"
+    out = out + "primary_object_missing_reasons=" + slplan.v3SystemLinkPlanListText(plan.missingReasons) + "\n"
+    out = out + "primary_object_pipeline_stage=" + plan.pipelineStage
+    return out

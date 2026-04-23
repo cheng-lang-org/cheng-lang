@@ -1,0 +1,98 @@
+import std/os
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as v3path
+
+fn main(): int32 =
+    var root: str = os.GetEnv("CHENG_ROOT")
+    if len(root) <= 0:
+        root = "/Users/lbcheng/cheng-lang"
+    let outDir = v3path.V3PathAbsolute(root, "artifacts/r2c_discover_truth_routes_controller_smoke")
+    assert(v3path.V3MkdirP(root, outDir), "v3 r2c discover truth routes smoke: mkdir")
+    let driver = v3path.V3PathAbsolute(root, "artifacts/backend_driver/cheng")
+    let packageRoot = v3path.V3PathAbsolute(root, "v3")
+    let controllerSource = v3path.V3PathAbsolute(root, "src/r2c/r2c_react.cheng")
+    assert(v3path.V3FileExistsNonEmpty(root, driver), "v3 r2c discover truth routes smoke: backend_driver exists")
+    assert(v3path.V3FileExistsNonEmpty(root, controllerSource), "v3 r2c discover truth routes smoke: controller source exists")
+
+    let repoEnv = os.GetEnv("R2C_REACT_V3_REPO")
+    var repo = "/Users/lbcheng/UniMaker/React.js"
+    if len(repoEnv) > 0:
+        repo = repoEnv
+    assert(os.DirExists(repo), "v3 r2c discover truth routes smoke: React.js repo exists")
+
+    let controllerExe = os.JoinPath(outDir, "r2c_react_discover_truth_routes_controller_smoke")
+    let controllerCompileReport = controllerExe + ".report.txt"
+    let controllerCompileLog = controllerExe + ".compile.log"
+    if v3path.V3PathFileExists(controllerExe):
+        os.RemoveFile(controllerExe)
+    if v3path.V3PathFileExists(controllerCompileReport):
+        os.RemoveFile(controllerCompileReport)
+    let controllerCompileRun = hostops.v3RunFileLogged(root,
+                                                       "r2c_discover_truth_routes_controller_compile",
+                                                       driver,
+                                                       [
+                                                           "system-link-exec",
+                                                           "--root:" + packageRoot,
+                                                           "--in:" + controllerSource,
+                                                           "--emit:exe",
+                                                           "--target:arm64-apple-darwin",
+                                                           "--out:" + controllerExe,
+                                                           "--report-out:" + controllerCompileReport
+                                                       ],
+                                                       ["CHENG_BACKEND_DRIVER_READY=1"],
+                                                       root,
+                                                       0,
+                                                       controllerCompileLog)
+    assert(hostops.v3LoggedRunOk(controllerCompileRun), "v3 r2c discover truth routes smoke: controller compile rc")
+    assert(v3path.V3FileExistsNonEmpty(root, controllerExe), "v3 r2c discover truth routes smoke: controller exe")
+
+    let artifactDir = os.JoinPath(outDir, "controller_out")
+    let truthRoutesPath = os.JoinPath(artifactDir, "truth_routes_v1.json")
+    let truthRoutesSummaryPath = os.JoinPath(artifactDir, "truth_routes_v1.summary.env")
+    let reportPath = os.JoinPath(artifactDir, "truth_routes_report_v1.json")
+    let controllerLog = os.JoinPath(outDir, "discover_truth_routes_controller.log")
+    if v3path.V3PathFileExists(controllerLog):
+        os.RemoveFile(controllerLog)
+    let controllerRun = hostops.v3RunFileLogged(root,
+                                                "r2c_discover_truth_routes_controller_smoke",
+                                                controllerExe,
+                                                [
+                                                    "discover-truth-routes",
+                                                    "--repo", repo,
+                                                    "--out-dir", artifactDir
+                                                ],
+                                                [],
+                                                root,
+                                                0,
+                                                controllerLog)
+    assert(hostops.v3LoggedRunOk(controllerRun), "v3 r2c discover truth routes smoke: controller rc")
+    assert(v3path.V3FileExistsNonEmpty(root, truthRoutesPath), "v3 r2c discover truth routes smoke: truth routes json")
+    assert(v3path.V3FileExistsNonEmpty(root, truthRoutesSummaryPath), "v3 r2c discover truth routes smoke: truth routes summary")
+    assert(v3path.V3FileExistsNonEmpty(root, reportPath), "v3 r2c discover truth routes smoke: report")
+
+    let truthRoutesText = v3path.V3ReadTextFile("", truthRoutesPath)
+    let truthRoutesSummaryText = v3path.V3ReadTextFile("", truthRoutesSummaryPath)
+    let reportText = v3path.V3ReadTextFile("", reportPath)
+    assert(v3path.V3TextContains(truthRoutesText, "\"format\": \"truth_routes_v1\""),
+           "v3 r2c discover truth routes smoke: truth routes format")
+    assert(v3path.V3TextContains(truthRoutesText, "\"routeId\": \"home_default\""),
+           "v3 r2c discover truth routes smoke: truth routes home_default")
+    assert(v3path.V3TextContains(truthRoutesText, "\"routeId\": \"publish_selector\""),
+           "v3 r2c discover truth routes smoke: truth routes publish_selector")
+    assert(v3path.V3TextContains(truthRoutesSummaryText, "route_count="),
+           "v3 r2c discover truth routes smoke: summary route count key")
+    assert(!v3path.V3TextContains(truthRoutesSummaryText, "route_count=0"),
+           "v3 r2c discover truth routes smoke: summary route count nonzero")
+    assert(v3path.V3TextContains(truthRoutesSummaryText, "typescript_version="),
+           "v3 r2c discover truth routes smoke: summary typescript version")
+    assert(v3path.V3TextContains(reportText, "\"command\": \"discover-truth-routes\""),
+           "v3 r2c discover truth routes smoke: report command")
+    assert(v3path.V3TextContains(reportText, "\"ok\": true"),
+           "v3 r2c discover truth routes smoke: report ok")
+    assert(v3path.V3TextContains(reportText, "\"primary_artifact_format\": \"truth_routes_v1\""),
+           "v3 r2c discover truth routes smoke: report artifact format")
+    assert(v3path.V3TextContains(reportText, "\"helper_script\":"),
+           "v3 r2c discover truth routes smoke: report helper path")
+
+    echo("v3 r2c_react_discover_truth_routes_controller_smoke ok")
+    return 0

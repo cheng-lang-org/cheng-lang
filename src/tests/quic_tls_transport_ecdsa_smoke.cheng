@@ -1,0 +1,76 @@
+import std/system
+import std/result
+import std/rawbytes
+import std/crypto/ecnist
+import std/crypto/sha256
+import std/tls/x509
+import cheng/quic/tls/test_pki
+
+fn main(): int32 =
+    let policy = test_pki.msquicMakeLocalhostTransportTlsPolicy()
+    assert(policy.certLeafKeyKind == X509KeyEcdsaP256, "v3 quic transport ecdsa: policy key kind")
+    assert(bytesLen(policy.certPrivateKey) == 32, "v3 quic transport ecdsa: policy private key")
+
+    var root: X509Certificate = initX509Certificate()
+    let rootParseRes = x509ParseCertificateInto(root, policy.trustRoot0)
+    if IsErr(rootParseRes):
+        panic(ErrorText(rootParseRes))
+    assert(root.publicKey.kind == X509KeyEcdsaP256, "v3 quic transport ecdsa: root key kind")
+    let rootCaRes = x509VerifyCaConstraints(root)
+    if IsErr(rootCaRes):
+        panic(ErrorText(rootCaRes))
+
+    var leaf: X509Certificate = initX509Certificate()
+    let leafParseRes = x509ParseCertificateInto(leaf, policy.certChain0)
+    if IsErr(leafParseRes):
+        panic(ErrorText(leafParseRes))
+    assert(leaf.publicKey.kind == X509KeyEcdsaP256, "v3 quic transport ecdsa: leaf key kind")
+    let leafConstraintRes = x509VerifyLeafConstraints(leaf)
+    if IsErr(leafConstraintRes):
+        panic(ErrorText(leafConstraintRes))
+
+    let derivedLeafPubRes = ecnist.ecdsaPublicKeyFromPrivateBytes(policy.certPrivateKey)
+    if IsErr(derivedLeafPubRes):
+        panic(ErrorText(derivedLeafPubRes))
+    assert(bytesEqual(Value(derivedLeafPubRes), leaf.publicKey.ecdsaBytes),
+        "v3 quic transport ecdsa: derived pub key")
+
+    let msg = bytesFromString("v3 quic transport ecdsa sign verify")
+    let signedMsgRes = ecnist.ecdsaSignBytes(policy.certPrivateKey, msg)
+    if IsErr(signedMsgRes):
+        panic(ErrorText(signedMsgRes))
+    assert(ecnist.ecdsaVerifyTrustedBytes(leaf.publicKey.ecdsaBytes, msg, Value(signedMsgRes)),
+        "v3 quic transport ecdsa: direct sign verify")
+
+    let expectedTbsHash = test_pki.msquicTestPkiHexDecode("67215d867ab92a27fb41486b1a5a73acb13e828e68f825c885e91f0637a1832a")
+    assert(bytesEqual(sha256.sha256Digest(leaf.tbs), expectedTbsHash),
+        "v3 quic transport ecdsa: tbs hash")
+    let expectedDerSig = test_pki.msquicTestPkiHexDecode("30450220565198e15f6559722b4cfbae810f019316073fdd0b64d28296decbc31d24be0402210082408acd6f40c12098375de2ed09b5fde499e08eb2419ce3aeb72b1f87415bc8")
+    assert(bytesEqual(leaf.signature, expectedDerSig), "v3 quic transport ecdsa: der signature bytes")
+    let rawSigRes = x509DecodeEcdsaSignature(leaf.signature)
+    if IsErr(rawSigRes):
+        panic(ErrorText(rawSigRes))
+    let expectedRawSig = test_pki.msquicTestPkiHexDecode("565198e15f6559722b4cfbae810f019316073fdd0b64d28296decbc31d24be0482408acd6f40c12098375de2ed09b5fde499e08eb2419ce3aeb72b1f87415bc8")
+    assert(bytesLen(Value(rawSigRes)) == 64, "v3 quic transport ecdsa: raw signature len")
+    assert(bytesEqual(bytesSliceView(Value(rawSigRes), 0, 32), bytesSliceView(expectedRawSig, 0, 32)),
+        "v3 quic transport ecdsa: raw signature r")
+    assert(bytesEqual(bytesSliceView(Value(rawSigRes), 32, 32), bytesSliceView(expectedRawSig, 32, 32)),
+        "v3 quic transport ecdsa: raw signature s")
+    assert(ecnist.ecdsaVerifyTrustedBytes(root.publicKey.ecdsaBytes, leaf.tbs, Value(rawSigRes)),
+        "v3 quic transport ecdsa: direct cert verify")
+
+    let certSigRes = x509VerifySignature(leaf, root)
+    if IsErr(certSigRes):
+        panic(ErrorText(certSigRes))
+    assert(Value(certSigRes), "v3 quic transport ecdsa: x509 signature")
+
+    var roots = initX509CertList()
+    let addRootRes = x509CertListAdd(roots, root)
+    if IsErr(addRootRes):
+        panic(ErrorText(addRootRes))
+    let chainRes = x509VerifyChain(leaf, initX509CertList(), roots, 1800000000)
+    if IsErr(chainRes):
+        panic(ErrorText(chainRes))
+    assert(Value(chainRes), "v3 quic transport ecdsa: x509 chain")
+    echo("v3 quic_tls_transport_ecdsa_smoke ok")
+    return 0

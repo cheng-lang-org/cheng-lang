@@ -1,0 +1,115 @@
+import std/os
+import std/result
+import std/strings
+import cheng/std/bytes_layout as layout
+import cheng/apps/chain_node/chain_node as chain
+import cheng/apps/chain_node/chain_node_cli_core as cli
+import cheng/apps/bio/bio_did_chain_node as flow
+import cheng/mobile/hardware/biometric
+
+fn chainNodeBioDidLookupCommandSmokeFeatureInto(out: var layout.FixedBytes32, seed: int32) =
+    for i in 0..<32:
+        out.data[i] = uint8(((seed * 31) + (i * 19) + 7) & 255)
+
+fn chainNodeBioDidLookupCommandSmokeCaptureInto(out: var flow.V3BioDidHardwareCapture,
+                                                feature: layout.FixedBytes32,
+                                                bindingSeed: str,
+                                                label: str,
+                                                requestId: str,
+                                                purpose: int32) =
+    out.verified = true
+    out.feature32 = feature
+    out.requestId = requestId
+    out.sensorId = "sensor|" + bindingSeed
+    out.deviceBindingSeed = bindingSeed
+    out.deviceLabel = label
+    var req = biometric.V3BiometricFingerprintAuthorizeReq()
+    req.requestId = requestId
+    req.purpose = purpose
+    req.didText = ""
+    req.promptTitle = "chain node bio did lookup command smoke"
+    req.promptReason = "chain node bio did lookup command smoke"
+    req.deviceBindingSeedHint = bindingSeed
+    req.deviceLabelHint = label
+    let sensorId = out.sensorId
+    var attestorPrivHex: str = "60d71049a0cafe01faa9948dc77ee5bc4bd5e05b8e328fdb9cc4c38237250a05"
+    let attestationRes = biometric.V3BiometricFingerprintAttestationBuildSigned(req,
+                                                                                feature,
+                                                                                bindingSeed,
+                                                                                label,
+                                                                                sensorId,
+                                                                                attestorPrivHex)
+    assert(IsOk(attestationRes), "chain node bio did lookup command smoke: signed attestation")
+    out.hardwareAttestation = Value(attestationRes)
+
+fn main(): int32 =
+    var rootKeyId: str = "cheng.scripted.root"
+    let trustRes = flow.V3BioDidSetTrustedAttestorRootHex(
+        "04963c1356849b8478030a6eb572581063ccedf53fda0bc7241247eba977e3b0666e4bf0c12caa47487c2927f83b17d6f9f332481cd2ab0c4885f91fc2a6c547d5",
+                                                          rootKeyId)
+    assert(IsOk(trustRes), "chain node bio did lookup command smoke: trust attestor")
+    let operatorIdRes = flow.V3BioDidOperatorIdFromRecoverySecretHex(
+        "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+    )
+    assert(IsOk(operatorIdRes), "chain node bio did lookup command smoke: operator id")
+    let operatorId = Value(operatorIdRes)
+    let operatorIdHex = layout.FixedBytes32Hex(operatorId)
+    let statePath = "/tmp/chain_node_bio_did_operator_lookup_command_smoke.state"
+    if os.FileExists(statePath):
+        os.RemoveFile(statePath)
+    let nodeId = "bio.did.lookup.command.node"
+    let addressSeed = "bio.did.lookup.command.addr"
+    var node: chain.V3ChainNode
+    let initNodeRes = chain.V3ChainNodeInitInto(node, nodeId, addressSeed)
+    assert(IsOk(initNodeRes), "chain node bio did lookup command smoke: init node")
+    var feature: layout.FixedBytes32
+    chainNodeBioDidLookupCommandSmokeFeatureInto(feature, 11)
+    var capture: flow.V3BioDidHardwareCapture
+    chainNodeBioDidLookupCommandSmokeCaptureInto(capture,
+                                                 feature,
+                                                 "device.lookup.command.phone",
+                                                 "lookup-command-phone",
+                                                 "lookup-command-create-1",
+                                                 biometric.V3BiometricPurposeDidCreate)
+    let createRes = flow.V3BioDidCreateWithHardwareCapture(node, capture, int64(1000))
+    assert(IsOk(createRes), "chain node bio did lookup command smoke: create")
+    let create = Value(createRes)
+    let createBundle = create.bundle
+    let anchorRes = flow.V3BioDidChainAppendOperatorBundleAnchor(node,
+                                                                 operatorId,
+                                                                 createBundle,
+                                                                 "lookup-command-anchor-1")
+    assert(IsOk(anchorRes), "chain node bio did lookup command smoke: anchor")
+    var snapshot: chain.V3ChainNodeServeSnapshot
+    chain.V3ChainNodeServeOnceInto(snapshot, node)
+    assert(cli.V3ChainNodeCliWriteState(statePath, snapshot),
+           "chain node bio did lookup command smoke: write state")
+    let preferredKind = flow.V3BioDidOperatorBundleKindAndroidBioV1
+    var preferredKinds: str[]
+    preferredKinds = [preferredKind]
+    let hitRes = cli.V3ChainNodeCliBioDidOperatorLookupJsonWithKinds(statePath,
+                                                                     operatorIdHex,
+                                                                     preferredKinds)
+    assert(IsOk(hitRes),
+           "chain node bio did lookup command smoke: lookup hit rc")
+    let hitText = Value(hitRes)
+    let hitOperatorNeedle = "\"operatorId\":\"" + operatorIdHex + "\""
+    assert(strings.StrContains(hitText, "\"found\":true"),
+           "chain node bio did lookup command smoke: lookup hit found")
+    assert(strings.StrContains(hitText, hitOperatorNeedle),
+           "chain node bio did lookup command smoke: lookup hit operator")
+    assert(strings.StrContains(hitText, "\"bundleSeq\":1"),
+           "chain node bio did lookup command smoke: lookup hit seq")
+    assert(strings.StrContains(hitText, "\"bundleKind\":\"android_bio_v1\""),
+           "chain node bio did lookup command smoke: lookup hit kind")
+    let missRes = cli.V3ChainNodeCliBioDidOperatorLookupJson(
+        statePath,
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    )
+    assert(IsOk(missRes),
+           "chain node bio did lookup command smoke: lookup miss rc")
+    let missText = Value(missRes)
+    assert(strings.StrContains(missText, "\"found\":false"),
+           "chain node bio did lookup command smoke: lookup miss found")
+    echo("v3 chain_node_bio_did_operator_lookup_command_smoke ok")
+    return 0

@@ -1,0 +1,284 @@
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/chain/binary_types as binary
+import cheng/chain/pubsub
+import cheng/chain/dag_mempool as dag
+import cheng/chain/erasure_swarm as swarm
+import cheng/chain/content_plane as content
+import cheng/chain/content_fetch as fetch
+import cheng/chain/content_runtime as runtime
+import cheng/overlay/contracts as overlay
+import cheng/overlay/libp2p_bridge as bridge
+import cheng/libp2p/core/types as core
+import cheng/libp2p/core/peerstore as ps
+import cheng/libp2p/host/host as host_base
+import cheng/libp2p/transports/tcp_transport
+
+fn v3ContentRuntimePublishStub(hostState: var host_base.V3Libp2pHost,
+                               artifacts: content.V3ContentPublishArtifacts): Result[content.V3ContentStub] =
+    let artifactsOk = content.v3ContentPublishArtifactsValidate(artifacts)
+    if IsErr(artifactsOk):
+        return Err[content.V3ContentStub](Error(artifactsOk))
+    let stubRes = content.v3ContentStubFromArtifacts(artifacts)
+    if IsErr(stubRes):
+        return Err[content.V3ContentStub](Error(stubRes))
+    let stub = Value(stubRes)
+    let scope = bridge.v3Libp2pScopeFromLayerId(artifacts.topic.layerId)
+    let address = artifacts.topic.centerAddress
+    let sourcePeerId = hostState.selfPeerId
+    let stampEpoch = artifacts.publishAdvert.stampEpoch
+    let stampGanzhi = artifacts.publishAdvert.stampGanzhi
+
+    let manifestPayload = swarm.v3ErasureShardManifestEncode(artifacts.erasureManifest)
+    let manifestPayloadOk = swarm.v3ErasureShardManifestValidatePayload(manifestPayload,
+                                                                        artifacts.erasureManifest.manifestCid)
+    if IsErr(manifestPayloadOk):
+        return Err[content.V3ContentStub](Error(manifestPayloadOk))
+    let recoveryPlanPayload = swarm.v3ErasureRecoveryPlanEncode(artifacts.recoveryPlan)
+    let recoveryPlanPayloadOk = swarm.v3ErasureRecoveryPlanValidatePayload(recoveryPlanPayload,
+                                                                           artifacts.recoveryPlan.planCid)
+    if IsErr(recoveryPlanPayloadOk):
+        return Err[content.V3ContentStub](Error(recoveryPlanPayloadOk))
+
+    let stubIngress = bridge.v3Libp2pIngressMake(sourcePeerId,
+                                                 scope,
+                                                 address,
+                                                 pubsub.v3PubSubPayloadKindContentStub,
+                                                 stub.stubCid,
+                                                 content.v3ContentStubEncode(stub),
+                                                 stampEpoch,
+                                                 stampGanzhi)
+    let advertIngress = bridge.v3Libp2pIngressMake(sourcePeerId,
+                                                   scope,
+                                                   address,
+                                                   pubsub.v3PubSubPayloadKindDagAdvert,
+                                                   artifacts.publishAdvert.advertCid,
+                                                   dag.v3DagPublishAdvertEncode(artifacts.publishAdvert),
+                                                   stampEpoch,
+                                                   stampGanzhi)
+    let manifestIngress = bridge.v3Libp2pIngressMake(sourcePeerId,
+                                                     scope,
+                                                     address,
+                                                     pubsub.v3PubSubPayloadKindErasureManifest,
+                                                     artifacts.erasureManifest.manifestCid,
+                                                     manifestPayload,
+                                                     stampEpoch,
+                                                     stampGanzhi)
+    let recoveryPlanIngress = bridge.v3Libp2pIngressMake(sourcePeerId,
+                                                         scope,
+                                                         address,
+                                                         pubsub.v3PubSubPayloadKindErasureRecoveryPlan,
+                                                         artifacts.recoveryPlan.planCid,
+                                                         recoveryPlanPayload,
+                                                         stampEpoch,
+                                                         stampGanzhi)
+
+    bridge.v3Libp2pRelayPublish(hostState, stubIngress)
+    host_base.v3Libp2pStorePut(hostState, advertIngress)
+    host_base.v3Libp2pStorePut(hostState, manifestIngress)
+    host_base.v3Libp2pStorePut(hostState, recoveryPlanIngress)
+    host_base.v3Libp2pKadProvide(hostState, artifacts.bundleCid)
+    host_base.v3Libp2pKadProvide(hostState, artifacts.blobSummary.blobCid)
+    host_base.v3Libp2pKadProvide(hostState, artifacts.erasureManifest.manifestCid)
+    return Ok[content.V3ContentStub](stub)
+
+fn v3ContentRuntimeSelectSyncRequest(localHost: var host_base.V3Libp2pHost,
+                                     remoteHost: var host_base.V3Libp2pHost,
+                                     remotePeerId: core.V3Libp2pPeerId,
+                                     query: overlay.V3StoreQuery,
+                                     out: var overlay.V3IngressEnvelope[]): Result[bool] =
+    var endpoint: ps.V3Libp2pPeerEndpoint
+    let endpointRes = host_base.v3Libp2pSelectPeerEndpoint(localHost, remotePeerId, endpoint)
+    if IsErr(endpointRes):
+        return Err[bool](Error(endpointRes))
+    let remoteAddr = endpoint.addr
+    if remoteAddr.transport == core.v3Libp2pTransportQuic:
+        return Err[bool]("v3 content runtime host: quic sync requires content_runtime_host_quic")
+    return host_base.v3Libp2pSyncRequest(localHost, remoteHost, remotePeerId, query, out)
+
+fn v3ContentRuntimeFindIngress(entries: overlay.V3IngressEnvelope[],
+                               payloadCid: layout.FixedBytes32,
+                               payloadKind: int32): Result[overlay.V3IngressEnvelope] =
+    for i in 0..<entries.len:
+        let ingress = entries[i]
+        if !layout.fixedBytes32Equal(ingress.payloadCid, payloadCid):
+            continue
+        if ingress.payloadKind != payloadKind:
+            continue
+        return Ok[overlay.V3IngressEnvelope](ingress)
+    return Err[overlay.V3IngressEnvelope]("v3 content runtime host: ingress missing")
+
+fn v3ContentRuntimeFetchAdvert(localHost: var host_base.V3Libp2pHost,
+                               remoteHost: var host_base.V3Libp2pHost,
+                               remotePeerId: core.V3Libp2pPeerId,
+                               scope: overlay.V3OverlayTopicScope,
+                               address: binary.V3LsmrAddress,
+                               stub: content.V3ContentStub): Result[dag.V3DagPublishAdvert] =
+    var query = overlay.V3StoreQuery()
+    query.topicScope = scope
+    query.address = address
+    query.wantEventCid = stub.advertCid
+    var entries: overlay.V3IngressEnvelope[]
+    let entriesRes = v3ContentRuntimeSelectSyncRequest(localHost, remoteHost, remotePeerId, query, entries)
+    if IsErr(entriesRes):
+        return Err[dag.V3DagPublishAdvert](Error(entriesRes))
+    let ingressRes = v3ContentRuntimeFindIngress(entries,
+                                                 stub.advertCid,
+                                                 pubsub.v3PubSubPayloadKindDagAdvert)
+    if IsErr(ingressRes):
+        return Err[dag.V3DagPublishAdvert](Error(ingressRes))
+    let ingress = Value(ingressRes)
+    let payloadOk = dag.v3DagPublishAdvertValidatePayload(ingress.payload, stub.advertCid)
+    if IsErr(payloadOk):
+        return Err[dag.V3DagPublishAdvert](Error(payloadOk))
+    return dag.v3DagPublishAdvertDecode(ingress.payload)
+
+fn v3ContentRuntimeFetchManifest(localHost: var host_base.V3Libp2pHost,
+                                 remoteHost: var host_base.V3Libp2pHost,
+                                 remotePeerId: core.V3Libp2pPeerId,
+                                 scope: overlay.V3OverlayTopicScope,
+                                 address: binary.V3LsmrAddress,
+                                 stub: content.V3ContentStub): Result[swarm.V3ErasureShardManifest] =
+    var query = overlay.V3StoreQuery()
+    query.topicScope = scope
+    query.address = address
+    query.wantEventCid = stub.manifestCid
+    var entries: overlay.V3IngressEnvelope[]
+    let entriesRes = v3ContentRuntimeSelectSyncRequest(localHost, remoteHost, remotePeerId, query, entries)
+    if IsErr(entriesRes):
+        return Err[swarm.V3ErasureShardManifest](Error(entriesRes))
+    let ingressRes = v3ContentRuntimeFindIngress(entries,
+                                                 stub.manifestCid,
+                                                 pubsub.v3PubSubPayloadKindErasureManifest)
+    if IsErr(ingressRes):
+        return Err[swarm.V3ErasureShardManifest](Error(ingressRes))
+    let ingress = Value(ingressRes)
+    let payloadOk = swarm.v3ErasureShardManifestValidatePayload(ingress.payload, stub.manifestCid)
+    if IsErr(payloadOk):
+        return Err[swarm.V3ErasureShardManifest](Error(payloadOk))
+    return swarm.v3ErasureShardManifestDecode(ingress.payload)
+
+fn v3ContentRuntimeRequestManifestFill(out: var swarm.V3ErasureShardManifest,
+                                       localHost: var host_base.V3Libp2pHost,
+                                       remoteHost: var host_base.V3Libp2pHost,
+                                       remotePeerId: core.V3Libp2pPeerId,
+                                       remoteRuntime: var runtime.V3ContentRuntime,
+                                       stub: content.V3ContentStub): Result[bool] =
+    let requestRes = fetch.v3ContentFetchRequestManifest(stub.manifestCid)
+    if IsErr(requestRes):
+        return Err[bool](Error(requestRes))
+    let request = Value(requestRes)
+    let responseRes = v3ContentRuntimeRequestFetch(localHost,
+                                                   remoteHost,
+                                                   remotePeerId,
+                                                   remoteRuntime,
+                                                   request)
+    if IsErr(responseRes):
+        return Err[bool](Error(responseRes))
+    let response = Value(responseRes)
+    let fillRes = fetch.v3ContentFetchResponseToManifestFill(out, request, response)
+    if IsErr(fillRes):
+        return Err[bool](Error(fillRes))
+    return Ok[bool](true)
+
+fn v3ContentRuntimeFetchRecoveryPlan(localHost: var host_base.V3Libp2pHost,
+                                     remoteHost: var host_base.V3Libp2pHost,
+                                     remotePeerId: core.V3Libp2pPeerId,
+                                     scope: overlay.V3OverlayTopicScope,
+                                     address: binary.V3LsmrAddress,
+                                     stub: content.V3ContentStub): Result[swarm.V3ErasureRecoveryPlan] =
+    var query = overlay.V3StoreQuery()
+    query.topicScope = scope
+    query.address = address
+    query.wantEventCid = stub.recoveryPlanCid
+    var entries: overlay.V3IngressEnvelope[]
+    let entriesRes = v3ContentRuntimeSelectSyncRequest(localHost, remoteHost, remotePeerId, query, entries)
+    if IsErr(entriesRes):
+        return Err[swarm.V3ErasureRecoveryPlan](Error(entriesRes))
+    let ingressRes = v3ContentRuntimeFindIngress(entries,
+                                                 stub.recoveryPlanCid,
+                                                 pubsub.v3PubSubPayloadKindErasureRecoveryPlan)
+    if IsErr(ingressRes):
+        return Err[swarm.V3ErasureRecoveryPlan](Error(ingressRes))
+    let ingress = Value(ingressRes)
+    let payloadOk = swarm.v3ErasureRecoveryPlanValidatePayload(ingress.payload, stub.recoveryPlanCid)
+    if IsErr(payloadOk):
+        return Err[swarm.V3ErasureRecoveryPlan](Error(payloadOk))
+    return swarm.v3ErasureRecoveryPlanDecode(ingress.payload)
+
+fn v3ContentRuntimeRequestShardPull(localHost: var host_base.V3Libp2pHost,
+                                    remoteHost: var host_base.V3Libp2pHost,
+                                    remotePeerId: core.V3Libp2pPeerId,
+                                    remoteRuntime: var runtime.V3ContentRuntime,
+                                    request: swarm.V3ErasureShardPullRequest): Result[swarm.V3ErasureShardPullResponse] =
+    let fetchRequestRes = fetch.v3ContentFetchRequestFromShardPull(request)
+    if IsErr(fetchRequestRes):
+        return Err[swarm.V3ErasureShardPullResponse](Error(fetchRequestRes))
+    let fetchRequest = Value(fetchRequestRes)
+    let fetchResponseRes = v3ContentRuntimeRequestFetch(localHost,
+                                                        remoteHost,
+                                                        remotePeerId,
+                                                        remoteRuntime,
+                                                        fetchRequest)
+    if IsErr(fetchResponseRes):
+        return Err[swarm.V3ErasureShardPullResponse](Error(fetchResponseRes))
+    let fetchResponse = Value(fetchResponseRes)
+    var response = swarm.V3ErasureShardPullResponse()
+    let responseFillRes = fetch.v3ContentFetchResponseToShardPullFill(response,
+                                                                      fetchRequest,
+                                                                      fetchResponse)
+    if IsErr(responseFillRes):
+        return Err[swarm.V3ErasureShardPullResponse](Error(responseFillRes))
+    return Ok[swarm.V3ErasureShardPullResponse](response)
+
+fn v3ContentRuntimeDecodeFetchPayload(payload: Bytes,
+                                      request: fetch.V3ContentFetchRequest): Result[fetch.V3ContentFetchResponse] =
+    let responseRes = fetch.v3ContentFetchResponseDecode(payload)
+    if IsErr(responseRes):
+        return Err[fetch.V3ContentFetchResponse](Error(responseRes))
+    let response = Value(responseRes)
+    let responseOk = fetch.v3ContentFetchResponseValidate(response, request)
+    if IsErr(responseOk):
+        return Err[fetch.V3ContentFetchResponse](Error(responseOk))
+    return Ok[fetch.V3ContentFetchResponse](response)
+
+fn v3ContentRuntimeRequestFetchTcp(requestPayload: Bytes,
+                                   servePayload: Bytes,
+                                   request: fetch.V3ContentFetchRequest): Result[fetch.V3ContentFetchResponse] =
+    let responsePayloadRes = tcp_transport.v3Libp2pTcpLoopbackRequestResponse(core.v3Libp2pProtocolContent,
+                                                                              requestPayload,
+                                                                              servePayload)
+    if IsErr(responsePayloadRes):
+        return Err[fetch.V3ContentFetchResponse](Error(responsePayloadRes))
+    var responsePayload: Bytes
+    responsePayload = Value(responsePayloadRes)
+    return v3ContentRuntimeDecodeFetchPayload(responsePayload, request)
+
+fn v3ContentRuntimeRequestFetch(localHost: var host_base.V3Libp2pHost,
+                                remoteHost: var host_base.V3Libp2pHost,
+                                remotePeerId: core.V3Libp2pPeerId,
+                                remoteRuntime: var runtime.V3ContentRuntime,
+                                request: fetch.V3ContentFetchRequest): Result[fetch.V3ContentFetchResponse] =
+    if !core.v3Libp2pPeerIdEqual(remoteHost.selfPeerId, remotePeerId):
+        return Err[fetch.V3ContentFetchResponse]("v3 content runtime host: content peer mismatch")
+    if !host_base.v3Libp2pProtocolRegistered(remoteHost, core.v3Libp2pProtocolContent):
+        return Err[fetch.V3ContentFetchResponse]("v3 content runtime host: remote content handler missing")
+    let streamRes = host_base.v3Libp2pOpenStream(localHost, remotePeerId, core.v3Libp2pProtocolContent)
+    if IsErr(streamRes):
+        return Err[fetch.V3ContentFetchResponse](Error(streamRes))
+    let requestPayload = fetch.v3ContentFetchRequestEncode(request)
+    var endpoint: ps.V3Libp2pPeerEndpoint
+    let endpointRes = host_base.v3Libp2pSelectPeerEndpoint(localHost, remotePeerId, endpoint)
+    if IsErr(endpointRes):
+        return Err[fetch.V3ContentFetchResponse](Error(endpointRes))
+    let remoteAddr = endpoint.addr
+    let servePayloadRes = runtime.v3ContentRuntimeServeFetchPayload(remoteRuntime, requestPayload)
+    if IsErr(servePayloadRes):
+        return Err[fetch.V3ContentFetchResponse](Error(servePayloadRes))
+    var servePayload: Bytes
+    servePayload = Value(servePayloadRes)
+    if remoteAddr.transport == core.v3Libp2pTransportQuic:
+        return Err[fetch.V3ContentFetchResponse]("v3 content runtime host: quic content requires content_runtime_host_quic")
+    if remoteAddr.transport == core.v3Libp2pTransportWebrtc:
+        return Err[fetch.V3ContentFetchResponse]("v3 content runtime host: webrtc content requires content_runtime_host_webrtc")
+    return v3ContentRuntimeRequestFetchTcp(requestPayload, servePayload, request)
