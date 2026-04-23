@@ -40,6 +40,8 @@
 - 当前 Cheng 复合实参 ABI 仍是“callee 直接借 caller frame 里的 call temp 地址”；这类 call temp 不能在调用返回后立刻 release/zero，必须等 caller 函数 epilogue 和普通 local 一起回收，否则会提前打断仍然活着的 borrow。
 - 用户明确要求“从 seed 迁到纯 Cheng 最小 seed”时，优先迁走 `std` 语义和 runtime shim；不要因为自举方便继续把 `Fmt/$` 一类库行为补进 `cheng_seed.c`。
 - `$` 的公开表面只保留直接写法：简单值支持 `$box`，复杂表达式支持 `$(expr)`；不要再把反引号 `` `$` `` 当用户语法往前推，纯 Cheng 前端负责降糖，seed 只保留兼容。
+- Cheng 字符串输出优先用 `Fmt`，但大 CLI/test 闭包里不要写单个超长 `Fmt` 或超长拼接表达式；稳定写法是多个小 `Fmt"..."` 片段增量 append 到局部变量后再 `echo`。
 - wowExport 处理 CDN root/BLTE/zlib 时不要先全量解码再扫表；真实 root 会放大到 49MB encoded / 65MB decoded，必须按 BLTE block range 解码、批量 root lookup，并用 bit-buffer + 小型 Huffman fast table 控制时间和内存。
-- wowExport CLI 可见的 `Fmt` 摘要函数要保持非常简单；`Result[str]` 返回路径和大闭包里优先用字符串拼接，至少先把表达式落局部变量，否则当前 seed/materialize 链路容易触发 `primary_object_body_semantics_missing`。
-- wowExport CLI 大闭包里的超长字符串拼接也会触发 seed concat rewrite 限制；摘要文本要用短局部变量和逐步 `out = out + part`，不要一条 return 拼完整行。
+- wowExport CLI 可见的摘要函数要保持非常简单；优先用小段 `Fmt"..."`，并逐步 `out = out + part`，不要把整行摘要写成单个巨大 `Fmt`、巨大拼接表达式或一条 return。
+- 发现 `runtime_zero` / `run-browser-host-wasm-smoke` 外部门禁派生长进程链时，先按 label 精准停止并清空进程表，再继续 r2c GUI；不要让这类门禁和 r2c/native GUI 验证并行。
+- r2c GUI smoke 不要每条都现场重编 `src/r2c/r2c_react.cheng` 单体 controller；该入口已足够大，安全做法是复用已存在的 Cheng stage3 `r2c-react` 控制面，并把 per-smoke 编译限制在小 smoke 自身。

@@ -29,6 +29,9 @@
 - [x] Convert real Northshire BLP2 DXT texture to TGA from CLI.
 - [x] Parse WDT/WMO scene counts for Northshire preview.
 - [x] Discover WDT/WMO/M2 dependency fileDataIDs from real assets.
-- [ ] Extend audited manifest with required WMO group and M2 skin dependencies.
-- [ ] Decode WMO group geometry and M2 skin/index data.
-- [ ] Render Northshire MVP from real local assets.
+- [x] Extend audited manifest with required WMO group and M2 skin dependencies.
+- [x] Decode WMO group geometry and M2 skin/index data.
+- [x] Render Northshire MVP from real local assets.
+- [x] Narrow Northshire terrain from WDT `MAID` coordinates to four audited Azeroth ADT tiles.
+- [x] Parse ADT `MCNK/MCVT` terrain height samples.
+- [x] Include real ADT terrain in preview, export bundle, render, and memory smoke coverage.

@@ -23,7 +23,13 @@
 - 当前 root 的 Northshire 已审计 4 条 entry 都带 `NoNameHash`，不能用路径 Jenkins96/lookup3 反查它们；后续资源发现必须优先使用资产内嵌 fileDataID 引用。
 - WMO root `GFID` 直接给出 Northshire Abbey 的 13 个 group fileDataID：`107075..107087`；`MODI` 给出 17 个非零 doodad/model fileDataID，首项 `198056`。
 - M2 `nsabbeyBell.m2` 的 `SFID` 给出 skin fileDataID `494438`，`TXID` 给出 texture fileDataID `127489` 和已审计 texture `189598`。
+- Northshire Abbey 13 个 WMO group 均已审计并解码；真实 group payload 是顶层 `REVM` + `PGOM`，几何 chunk 嵌在 `PGOM` 68 字节 group header 后，四字符在文件中仍是反向写法：`TVOM/MOVT`、`IVOM/MOVI`、`ABOM/MOBA`、`YPOM/MOPY`。
+- 13 个 WMO group 合计 `29304` 顶点、`91689` 个索引；M2 skin `494438` 解码后为 `5088` 字节，含 `370` indices、`1302` triangle indices、`2` submeshes。
+- `render-northshire` 当前是严格真实数据的几何 MVP：画已解码 ADT terrain 高度、WMO group 顶点和 M2 顶点，不做材质、光照、相机碰撞或占位 mesh；若真实几何缺失会失败，不会补假点。
 - WDT `Azeroth.wdt` 的 `MAID` 有 `1176` 个非零 tile、`9408` 个 referenced fileDataID，首项 `6173014`；不能一次性当 Northshire 局部地形，下一步要按坐标/区域收窄后审计。
+- Northshire 局部地形已按 listfile/WDT 坐标收窄到四个 Azeroth 基础 ADT：`Azeroth_31_48.adt`、`Azeroth_32_48.adt`、`Azeroth_31_49.adt`、`Azeroth_32_49.adt`，对应 fileDataID `777827/778027/777832/778032`。
+- 真实 ADT 地形是顶层 `REVM` + 256 个 `KNCM/MCNK`；每个 `MCNK` 的 128 字节 header 后必须有 `TVCM/MCVT`，每块 `145` 个 float 高度样本，四个 tile 合计 `148480` 个样本。
+- ADT `MCNK` header 的 `0x68/0x6c/0x70` 是地形块基准 x/y/z；渲染现在用真实块基准坐标和 `MCVT` 样本布局画 terrain，不再只画 WMO/M2 点云。
 - `std/os.ListDir` 这次进一步改成“两遍扫描计数 + owned move 填充”，本机 1536 文件一次性快照 smoke 已通过，说明 `wow_export` 扫真实 `Data/indices` 不会再因为目录规模崩掉；但当前 256 文件 * 6000 轮 stress 的 `peak memory footprint` 仍在约 219MB，说明 runtime/allocator 对这条长时间热路径还有内存回收观察值需要继续压。
 
 - 本机 `.build.info` 有 active `wow 12.0.5.67165`，build key 为 `02482dc9c788698c83e7ae0e24ab2bb7`。

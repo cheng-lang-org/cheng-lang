@@ -279,8 +279,11 @@ fn CompilerRuntimeHostBridgeAuditText(rootDir: str): str =
     let seedText = chengpath.ReadTextFile("", seedPath)
     let legacyExecFileCaptureBridge = strutil.Contains(hostProcessText, "@importc(\"cheng_exec_file_capture_bridge\")") ||
                                       strutil.Contains(backendText, "@exportc(\"cheng_exec_file_capture_bridge\")")
-    let legacyExecFilePipeBridge = strutil.Contains(hostProcessText, "cheng_exec_file_pipe_spawn_bridge")
     let legacyExecFilePipeImport = strutil.Contains(backendText, "@importc(\"cheng_exec_file_pipe_spawn\")")
+    let execFilePipeBridgeImportsReady = strutil.Contains(hostProcessText, "@importc(\"cheng_host_exec_file_pipe_spawn_bridge\")") &&
+                                         strutil.Contains(hostProcessText, "@importc(\"cheng_host_exec_file_pipe_spawn_bridge_last_read_fd\")") &&
+                                         strutil.Contains(hostProcessText, "@importc(\"cheng_host_exec_file_pipe_spawn_bridge_last_write_fd\")") &&
+                                         strutil.Contains(hostProcessText, "@importc(\"cheng_host_exec_file_pipe_spawn_bridge_last_pid_i32\")")
     let legacyExecCmdFileRaw = strutil.Contains(stdOsText, "cheng_exec_file_capture_raw")
     let directProgramRuntimeC = strutil.Contains(backendText, "system_helpers_program_runtime_bridge.c")
     let legacyRuntimeNativePathPresent = strutil.Contains(runtimeContractText, "runtime/native/") ||
@@ -438,7 +441,19 @@ fn CompilerRuntimeHostBridgeAuditText(rootDir: str): str =
                                     strutil.Contains(backendText, "@exportc(\"cheng_pty_close_bridge\")") &&
                                     strutil.Contains(backendText, "@exportc(\"cheng_pty_wait_bridge\")") &&
                                     strutil.Contains(backendText, "@exportc(\"cheng_pty_wait_bridge_last_exit_code\")")
-    let pureProcessReady = !legacyProcessImportsRaw && processBridgeImportsReady && processBridgeExportsReady
+    let execFilePipeBridgeExportsReady = strutil.Contains(backendText, "@exportc(\"cheng_host_exec_file_pipe_spawn_bridge\")") &&
+                                         strutil.Contains(backendText, "@exportc(\"cheng_host_exec_file_pipe_spawn_bridge_last_read_fd\")") &&
+                                         strutil.Contains(backendText, "@exportc(\"cheng_host_exec_file_pipe_spawn_bridge_last_write_fd\")") &&
+                                         strutil.Contains(backendText, "@exportc(\"cheng_host_exec_file_pipe_spawn_bridge_last_pid_i32\")")
+    let legacyExecFilePipeBridge = (strutil.Contains(hostProcessText, "cheng_exec_file_pipe_spawn_bridge") &&
+                                    !execFilePipeBridgeImportsReady) ||
+                                   (strutil.Contains(backendText, "@exportc(\"cheng_exec_file_pipe_spawn_bridge\")") &&
+                                    !execFilePipeBridgeExportsReady)
+    let pureProcessReady = !legacyProcessImportsRaw &&
+                           processBridgeImportsReady &&
+                           processBridgeExportsReady &&
+                           execFilePipeBridgeImportsReady &&
+                           execFilePipeBridgeExportsReady
     var remainingBoundary = ""
     if programSupportDirectLibcImportsPresent || !programSupportHostRuntimeReady:
         remainingBoundary = "program_support_host_abi"
@@ -582,6 +597,10 @@ fn CompilerRuntimeHostBridgeAuditText(rootDir: str): str =
         out = out + "pure_cheng_process_ready=1\n"
     else:
         out = out + "pure_cheng_process_ready=0\n"
+    if execFilePipeBridgeImportsReady && execFilePipeBridgeExportsReady:
+        out = out + "exec_file_pipe_spawn_runtime_bridge_ready=1\n"
+    else:
+        out = out + "exec_file_pipe_spawn_runtime_bridge_ready=0\n"
     out = out + "remaining_non_pure_cheng_boundary=" + remainingBoundary + "\n"
     if remainingBoundary == "none":
         out = out + "pure_cheng_zero_c_ready=1\n"
@@ -603,6 +622,7 @@ fn CompilerRuntimeHostBridgeAuditFailed(auditText: str): bool =
            strutil.Contains(auditText, "legacy_runtime_combined_fallback_present=1") ||
            strutil.Contains(auditText, "legacy_node_wasm_host_present=1") ||
            strutil.Contains(auditText, "legacy_browser_host_wasm_runner_present=1") ||
+           strutil.Contains(auditText, "pure_cheng_zero_c_ready=0") ||
            strutil.Contains(auditText, "program_support_direct_libc_imports_present=1") ||
            strutil.Contains(auditText, "program_support_host_runtime_ready=0") ||
            strutil.Contains(auditText, "debug_runtime_direct_libc_imports_present=1") ||

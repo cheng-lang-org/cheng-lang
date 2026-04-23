@@ -1,0 +1,767 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import std/strformat
+import cheng/apps/wow_export/asset_export as asset_export
+import cheng/apps/wow_export/asset_formats as asset_formats
+import cheng/apps/wow_export/local_files as local_files
+import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
+
+type
+    RenderBounds =
+        ready: bool
+        minX1000: int32
+        minY1000: int32
+        minZ1000: int32
+        maxX1000: int32
+        maxY1000: int32
+        maxZ1000: int32
+
+    RenderSummary =
+        outPath: str
+        width: int32
+        height: int32
+        bytesWritten: int32
+        adtHeightSampleCount: int32
+        wmoVertexCount: int32
+        wmoDoodadPlacementCount: int32
+        m2VertexCount: int32
+        skinTriangleIndexCount: int32
+        pixelsTouched: int32
+
+const
+    renderTgaHeaderSize = 18
+    renderMargin = 18
+    renderAdtMcnkHeaderBytes = 128
+    renderAdtMcnkBaseXOffset = 104
+    renderAdtMcnkBaseYOffset = 108
+    renderAdtMcnkBaseZOffset = 112
+    renderAdtHeightSamplesPerChunk = 145
+    renderAdtMcvTByteCount = 580
+    renderAdtChunkStep1000 = 33333
+    renderWmoDoodadPlacementStride = 40
+
+fn renderMakeByteBuffer(len: int32): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    if len <= 0:
+        out.len = 0
+        out.data = nil
+        return out
+    out.len = len
+    out.data = alloc(len)
+    return out
+
+fn renderWriteU16LEAt(buf: bytes.ByteBuffer, pos: int32, value: int32) =
+    bytes.BufSetByte(buf, pos, value & 255)
+    bytes.BufSetByte(buf, pos + 1, (value >> 8) & 255)
+
+fn renderFillTgaBackground(buf: bytes.ByteBuffer, width: int32, height: int32) =
+    var y: int32
+    while y < height:
+        var x: int32
+        while x < width:
+            let pos: int32 = renderTgaHeaderSize + (y * width + x) * 4
+            let shade: int32 = 18 + ((x + y) % 31)
+            bytes.BufSetByte(buf, pos, shade)
+            bytes.BufSetByte(buf, pos + 1, 24 + (y % 29))
+            bytes.BufSetByte(buf, pos + 2, 30 + (x % 41))
+            bytes.BufSetByte(buf, pos + 3, 255)
+            x = x + 1
+        y = y + 1
+
+fn renderMakeTga(width: int32, height: int32): Result[bytes.ByteBuffer] =
+    if width <= renderMargin * 2 || height <= renderMargin * 2:
+        return Err[bytes.ByteBuffer]("wowExport render: invalid image size")
+    if width > 4096 || height > 4096:
+        return Err[bytes.ByteBuffer]("wowExport render: image size too large")
+    let total: int32 = renderTgaHeaderSize + width * height * 4
+    let out: bytes.ByteBuffer = renderMakeByteBuffer(total)
+    if out.data == nil || out.len != total:
+        return Err[bytes.ByteBuffer]("wowExport render: TGA allocation failed")
+    var i: int32
+    while i < renderTgaHeaderSize:
+        bytes.BufSetByte(out, i, 0)
+        i = i + 1
+    bytes.BufSetByte(out, 2, 2)
+    renderWriteU16LEAt(out, 12, width)
+    renderWriteU16LEAt(out, 14, height)
+    bytes.BufSetByte(out, 16, 32)
+    bytes.BufSetByte(out, 17, 0x20)
+    renderFillTgaBackground(out, width, height)
+    return Ok[bytes.ByteBuffer](out)
+
+fn renderF32ClampI64ToI32(value: int64): int32 =
+    if value > int64(2147483647):
+        return 2147483647
+    if value < int64(-2147483647):
+        return -2147483647
+    return int32(value)
+
+fn renderF32Scaled1000At(buf: bytes.ByteBuffer, idx: int32): int32 =
+    let bits: int32 = bytes.ReadU32LEAt(buf, idx)
+    let exponentRaw: int32 = (bits >> 23) & 255
+    var mantissa: int64 = int64(bits & 0x7fffff)
+    var exponent: int32 = exponentRaw - 127
+    if exponentRaw == 0:
+        exponent = -126
+    else:
+        mantissa = mantissa | int64(0x800000)
+    var scaled: int64 = mantissa * int64(1000)
+    let shift: int32 = exponent - 23
+    if shift > 0:
+        var i: int32
+        while i < shift:
+            scaled = scaled * int64(2)
+            i = i + 1
+    elif shift < 0:
+        var i: int32
+        while i < 0 - shift:
+            scaled = scaled / int64(2)
+            i = i + 1
+    if bits < 0:
+        scaled = int64(0) - scaled
+    return renderF32ClampI64ToI32(scaled)
+
+fn renderHasFourCC(buf: bytes.ByteBuffer,
+                   pos: int32,
+                   a: int32,
+                   b: int32,
+                   c: int32,
+                   d: int32): bool =
+    if pos < 0 || pos + 4 > buf.len:
+        return false
+    return bytes.BufByteAt(buf, pos) == a &&
+        bytes.BufByteAt(buf, pos + 1) == b &&
+        bytes.BufByteAt(buf, pos + 2) == c &&
+        bytes.BufByteAt(buf, pos + 3) == d
+
+fn renderAccumulateBounds(bounds: var RenderBounds,
+                          x: int32,
+                          y: int32,
+                          z: int32) =
+    if !bounds.ready:
+        bounds.ready = true
+        bounds.minX1000 = x
+        bounds.maxX1000 = x
+        bounds.minY1000 = y
+        bounds.maxY1000 = y
+        bounds.minZ1000 = z
+        bounds.maxZ1000 = z
+        return
+    if x < bounds.minX1000: bounds.minX1000 = x
+    if x > bounds.maxX1000: bounds.maxX1000 = x
+    if y < bounds.minY1000: bounds.minY1000 = y
+    if y > bounds.maxY1000: bounds.maxY1000 = y
+    if z < bounds.minZ1000: bounds.minZ1000 = z
+    if z > bounds.maxZ1000: bounds.maxZ1000 = z
+
+fn renderFindWmoMovt(buf: bytes.ByteBuffer,
+                     outStart: var int32,
+                     outCount: var int32): Result[bool] =
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[bool]("wowExport render: WMO group truncated chunk")
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[bool]("wowExport render: WMO group chunk out of bounds")
+        if renderHasFourCC(buf, pos, int32('P'), int32('G'), int32('O'), int32('M')):
+            if size < 68:
+                return Err[bool]("wowExport render: WMO MOGP header too small")
+            var inner: int32 = dataPos + 68
+            let end: int32 = dataPos + size
+            while inner < end:
+                if inner + 8 > end:
+                    return Err[bool]("wowExport render: WMO nested chunk truncated")
+                let innerSize: int32 = bytes.ReadU32LEAt(buf, inner + 4)
+                let innerData: int32 = inner + 8
+                if innerSize < 0 || innerData + innerSize > end:
+                    return Err[bool]("wowExport render: WMO nested chunk out of bounds")
+                if renderHasFourCC(buf, inner, int32('T'), int32('V'), int32('O'), int32('M')):
+                    if (innerSize % 12) != 0:
+                        return Err[bool]("wowExport render: WMO MOVT chunk size invalid")
+                    outStart = innerData
+                    outCount = innerSize / 12
+                    return Ok[bool](true)
+                inner = innerData + innerSize
+        pos = dataPos + size
+    return Err[bool]("wowExport render: WMO MOVT missing")
+
+fn renderAdtSampleLocalOffset(sampleIndex: int32,
+                              xOut: var int32,
+                              yOut: var int32): Result[bool] =
+    if sampleIndex < 0 || sampleIndex >= renderAdtHeightSamplesPerChunk:
+        return Err[bool]("wowExport render: ADT height sample index out of range")
+    var row: int32
+    var remaining: int32 = sampleIndex
+    while row < 17:
+        if (row % 2) == 0:
+            if remaining < 9:
+                xOut = remaining * renderAdtChunkStep1000 / 8
+                yOut = (row / 2) * renderAdtChunkStep1000 / 8
+                return Ok[bool](true)
+            remaining = remaining - 9
+        else:
+            if remaining < 8:
+                xOut = (remaining * 2 + 1) * renderAdtChunkStep1000 / 16
+                yOut = row * renderAdtChunkStep1000 / 16
+                return Ok[bool](true)
+            remaining = remaining - 8
+        row = row + 1
+    return Err[bool]("wowExport render: ADT height sample layout failed")
+
+fn renderScanAdtMcvT(buf: bytes.ByteBuffer,
+                     start: int32,
+                     size: int32,
+                     baseX1000: int32,
+                     baseY1000: int32,
+                     baseZ1000: int32,
+                     bounds: var RenderBounds,
+                     countOut: var int32): Result[bool] =
+    if size != renderAdtMcvTByteCount:
+        return Err[bool]("wowExport render: ADT MCVT size invalid")
+    if start < 0 || start + size > buf.len:
+        return Err[bool]("wowExport render: ADT MCVT out of bounds")
+    var i: int32
+    while i < renderAdtHeightSamplesPerChunk:
+        var localX1000: int32
+        var localY1000: int32
+        let offsetRes: Result[bool] = renderAdtSampleLocalOffset(i, localX1000, localY1000)
+        if IsErr(offsetRes):
+            return Err[bool](Error(offsetRes))
+        let x1000: int32 = baseX1000 - localX1000
+        let y1000: int32 = baseY1000 - localY1000
+        let z1000: int32 = baseZ1000 + renderF32Scaled1000At(buf, start + i * 4)
+        renderAccumulateBounds(bounds, x1000, y1000, z1000)
+        countOut = countOut + 1
+        i = i + 1
+    return Ok[bool](true)
+
+fn renderScanAdtMcnkNested(buf: bytes.ByteBuffer,
+                           start: int32,
+                           end: int32,
+                           baseX1000: int32,
+                           baseY1000: int32,
+                           baseZ1000: int32,
+                           bounds: var RenderBounds,
+                           countOut: var int32): Result[bool] =
+    if start < 0 || end < start || end > buf.len:
+        return Err[bool]("wowExport render: ADT MCNK nested range out of bounds")
+    var foundHeight: bool
+    var pos: int32 = start
+    while pos < end:
+        if pos + 8 > end:
+            return Err[bool]("wowExport render: ADT MCNK nested chunk truncated")
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > end:
+            return Err[bool]("wowExport render: ADT MCNK nested chunk out of bounds")
+        if renderHasFourCC(buf, pos, int32('T'), int32('V'), int32('C'), int32('M')):
+            if foundHeight:
+                return Err[bool]("wowExport render: ADT duplicate MCVT chunk")
+            let scanRes: Result[bool] =
+                renderScanAdtMcvT(buf,
+                                  dataPos,
+                                  size,
+                                  baseX1000,
+                                  baseY1000,
+                                  baseZ1000,
+                                  bounds,
+                                  countOut)
+            if IsErr(scanRes):
+                return Err[bool](Error(scanRes))
+            foundHeight = true
+        pos = dataPos + size
+    if !foundHeight:
+        return Err[bool]("wowExport render: ADT MCNK missing MCVT")
+    return Ok[bool](true)
+
+fn renderScanAdtTerrain(buf: bytes.ByteBuffer,
+                        bounds: var RenderBounds,
+                        countOut: var int32): Result[bool] =
+    var pos: int32
+    var mcnkCount: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[bool]("wowExport render: ADT truncated chunk")
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[bool]("wowExport render: ADT chunk out of bounds")
+        if renderHasFourCC(buf, pos, int32('K'), int32('N'), int32('C'), int32('M')):
+            if size < renderAdtMcnkHeaderBytes:
+                return Err[bool]("wowExport render: ADT MCNK header too small")
+            mcnkCount = mcnkCount + 1
+            let baseX1000: int32 = renderF32Scaled1000At(buf, dataPos + renderAdtMcnkBaseXOffset)
+            let baseY1000: int32 = renderF32Scaled1000At(buf, dataPos + renderAdtMcnkBaseYOffset)
+            let baseZ1000: int32 = renderF32Scaled1000At(buf, dataPos + renderAdtMcnkBaseZOffset)
+            let nestedRes: Result[bool] =
+                renderScanAdtMcnkNested(buf,
+                                        dataPos + renderAdtMcnkHeaderBytes,
+                                        dataPos + size,
+                                        baseX1000,
+                                        baseY1000,
+                                        baseZ1000,
+                                        bounds,
+                                        countOut)
+            if IsErr(nestedRes):
+                return Err[bool](Error(nestedRes))
+        pos = dataPos + size
+    if mcnkCount <= 0:
+        return Err[bool]("wowExport render: ADT MCNK chunks missing")
+    return Ok[bool](true)
+
+fn renderMapCoord(value: int32,
+                  minValue: int32,
+                  maxValue: int32,
+                  screenMin: int32,
+                  screenMax: int32): int32 =
+    if maxValue <= minValue:
+        return (screenMin + screenMax) / 2
+    let span: int64 = int64(maxValue) - int64(minValue)
+    let rel: int64 = int64(value) - int64(minValue)
+    let screenSpan: int64 = int64(screenMax - screenMin)
+    return screenMin + int32((rel * screenSpan) / span)
+
+fn renderPlot(tga: bytes.ByteBuffer,
+              width: int32,
+              height: int32,
+              x: int32,
+              y: int32,
+              r: int32,
+              g: int32,
+              b: int32,
+              pixels: var int32) =
+    if x < 0 || y < 0 || x >= width || y >= height:
+        return
+    let pos: int32 = renderTgaHeaderSize + (y * width + x) * 4
+    bytes.BufSetByte(tga, pos, b)
+    bytes.BufSetByte(tga, pos + 1, g)
+    bytes.BufSetByte(tga, pos + 2, r)
+    bytes.BufSetByte(tga, pos + 3, 255)
+    pixels = pixels + 1
+
+fn renderPlotCross(tga: bytes.ByteBuffer,
+                   width: int32,
+                   height: int32,
+                   x: int32,
+                   y: int32,
+                   r: int32,
+                   g: int32,
+                   b: int32,
+                   pixels: var int32) =
+    renderPlot(tga, width, height, x, y, r, g, b, pixels)
+    renderPlot(tga, width, height, x - 1, y, r, g, b, pixels)
+    renderPlot(tga, width, height, x + 1, y, r, g, b, pixels)
+    renderPlot(tga, width, height, x, y - 1, r, g, b, pixels)
+    renderPlot(tga, width, height, x, y + 1, r, g, b, pixels)
+
+fn renderDrawAdtMcvT(tga: bytes.ByteBuffer,
+                     width: int32,
+                     height: int32,
+                     buf: bytes.ByteBuffer,
+                     start: int32,
+                     size: int32,
+                     baseX1000: int32,
+                     baseY1000: int32,
+                     baseZ1000: int32,
+                     bounds: RenderBounds,
+                     pixels: var int32): Result[bool] =
+    if size != renderAdtMcvTByteCount:
+        return Err[bool]("wowExport render: ADT draw MCVT size invalid")
+    var i: int32
+    while i < renderAdtHeightSamplesPerChunk:
+        var localX1000: int32
+        var localY1000: int32
+        let offsetRes: Result[bool] = renderAdtSampleLocalOffset(i, localX1000, localY1000)
+        if IsErr(offsetRes):
+            return Err[bool](Error(offsetRes))
+        let x1000: int32 = baseX1000 - localX1000
+        let y1000: int32 = baseY1000 - localY1000
+        let z1000: int32 = baseZ1000 + renderF32Scaled1000At(buf, start + i * 4)
+        let px: int32 = renderMapCoord(x1000, bounds.minX1000, bounds.maxX1000,
+                                        renderMargin, width - renderMargin - 1)
+        let pyRaw: int32 = renderMapCoord(y1000, bounds.minY1000, bounds.maxY1000,
+                                           renderMargin, height - renderMargin - 1)
+        let shade: int32 = renderMapCoord(z1000, bounds.minZ1000, bounds.maxZ1000, 72, 190)
+        renderPlot(tga, width, height, px, height - 1 - pyRaw, 66, shade, 92, pixels)
+        i = i + 1
+    return Ok[bool](true)
+
+fn renderDrawAdtTerrain(tga: bytes.ByteBuffer,
+                        width: int32,
+                        height: int32,
+                        buf: bytes.ByteBuffer,
+                        bounds: RenderBounds,
+                        pixels: var int32): Result[bool] =
+    var pos: int32
+    var mcnkCount: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[bool]("wowExport render: ADT draw truncated chunk")
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[bool]("wowExport render: ADT draw chunk out of bounds")
+        if renderHasFourCC(buf, pos, int32('K'), int32('N'), int32('C'), int32('M')):
+            if size < renderAdtMcnkHeaderBytes:
+                return Err[bool]("wowExport render: ADT draw MCNK header too small")
+            mcnkCount = mcnkCount + 1
+            let baseX1000: int32 = renderF32Scaled1000At(buf, dataPos + renderAdtMcnkBaseXOffset)
+            let baseY1000: int32 = renderF32Scaled1000At(buf, dataPos + renderAdtMcnkBaseYOffset)
+            let baseZ1000: int32 = renderF32Scaled1000At(buf, dataPos + renderAdtMcnkBaseZOffset)
+            var inner: int32 = dataPos + renderAdtMcnkHeaderBytes
+            let end: int32 = dataPos + size
+            var foundHeight: bool
+            while inner < end:
+                if inner + 8 > end:
+                    return Err[bool]("wowExport render: ADT draw nested chunk truncated")
+                let innerSize: int32 = bytes.ReadU32LEAt(buf, inner + 4)
+                let innerData: int32 = inner + 8
+                if innerSize < 0 || innerData + innerSize > end:
+                    return Err[bool]("wowExport render: ADT draw nested chunk out of bounds")
+                if renderHasFourCC(buf, inner, int32('T'), int32('V'), int32('C'), int32('M')):
+                    if foundHeight:
+                        return Err[bool]("wowExport render: ADT draw duplicate MCVT")
+                    let drawRes: Result[bool] =
+                        renderDrawAdtMcvT(tga,
+                                          width,
+                                          height,
+                                          buf,
+                                          innerData,
+                                          innerSize,
+                                          baseX1000,
+                                          baseY1000,
+                                          baseZ1000,
+                                          bounds,
+                                          pixels)
+                    if IsErr(drawRes):
+                        return Err[bool](Error(drawRes))
+                    foundHeight = true
+                inner = innerData + innerSize
+            if !foundHeight:
+                return Err[bool]("wowExport render: ADT draw MCNK missing MCVT")
+        pos = dataPos + size
+    if mcnkCount <= 0:
+        return Err[bool]("wowExport render: ADT draw MCNK chunks missing")
+    return Ok[bool](true)
+
+fn renderScanWmoVertices(buf: bytes.ByteBuffer,
+                         bounds: var RenderBounds,
+                         countOut: var int32): Result[bool] =
+    var start: int32
+    var count: int32
+    let movtRes: Result[bool] = renderFindWmoMovt(buf, start, count)
+    if IsErr(movtRes):
+        return Err[bool](Error(movtRes))
+    var i: int32
+    while i < count:
+        let pos: int32 = start + i * 12
+        let x: int32 = renderF32Scaled1000At(buf, pos)
+        let y: int32 = renderF32Scaled1000At(buf, pos + 4)
+        let z: int32 = renderF32Scaled1000At(buf, pos + 8)
+        renderAccumulateBounds(bounds, x, y, z)
+        countOut = countOut + 1
+        i = i + 1
+    return Ok[bool](true)
+
+fn renderDrawWmoVertices(tga: bytes.ByteBuffer,
+                         width: int32,
+                         height: int32,
+                         buf: bytes.ByteBuffer,
+                         bounds: RenderBounds,
+                         pixels: var int32): Result[bool] =
+    var start: int32
+    var count: int32
+    let movtRes: Result[bool] = renderFindWmoMovt(buf, start, count)
+    if IsErr(movtRes):
+        return Err[bool](Error(movtRes))
+    var i: int32
+    while i < count:
+        let pos: int32 = start + i * 12
+        let x1000: int32 = renderF32Scaled1000At(buf, pos)
+        let y1000: int32 = renderF32Scaled1000At(buf, pos + 4)
+        let px: int32 = renderMapCoord(x1000, bounds.minX1000, bounds.maxX1000,
+                                        renderMargin, width - renderMargin - 1)
+        let pyRaw: int32 = renderMapCoord(y1000, bounds.minY1000, bounds.maxY1000,
+                                           renderMargin, height - renderMargin - 1)
+        let py: int32 = height - 1 - pyRaw
+        renderPlot(tga, width, height, px, py, 224, 190, 96, pixels)
+        i = i + 1
+    return Ok[bool](true)
+
+fn renderScanWmoDoodadPlacements(buf: bytes.ByteBuffer,
+                                 bounds: var RenderBounds,
+                                 countOut: var int32): Result[bool] =
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[bool]("wowExport render: WMO root truncated chunk")
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[bool]("wowExport render: WMO root chunk out of bounds")
+        if renderHasFourCC(buf, pos, int32('D'), int32('D'), int32('O'), int32('M')):
+            if (size % renderWmoDoodadPlacementStride) != 0:
+                return Err[bool]("wowExport render: WMO MODD size invalid")
+            var i: int32
+            while i < size / renderWmoDoodadPlacementStride:
+                let rec: int32 = dataPos + i * renderWmoDoodadPlacementStride
+                let x: int32 = renderF32Scaled1000At(buf, rec + 4)
+                let y: int32 = renderF32Scaled1000At(buf, rec + 8)
+                let z: int32 = renderF32Scaled1000At(buf, rec + 12)
+                renderAccumulateBounds(bounds, x, y, z)
+                countOut = countOut + 1
+                i = i + 1
+            return Ok[bool](true)
+        pos = dataPos + size
+    return Err[bool]("wowExport render: WMO MODD placements missing")
+
+fn renderDrawWmoDoodadPlacements(tga: bytes.ByteBuffer,
+                                 width: int32,
+                                 height: int32,
+                                 buf: bytes.ByteBuffer,
+                                 bounds: RenderBounds,
+                                 pixels: var int32): Result[bool] =
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[bool]("wowExport render: WMO draw root truncated chunk")
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[bool]("wowExport render: WMO draw root chunk out of bounds")
+        if renderHasFourCC(buf, pos, int32('D'), int32('D'), int32('O'), int32('M')):
+            if (size % renderWmoDoodadPlacementStride) != 0:
+                return Err[bool]("wowExport render: WMO draw MODD size invalid")
+            var i: int32
+            while i < size / renderWmoDoodadPlacementStride:
+                let rec: int32 = dataPos + i * renderWmoDoodadPlacementStride
+                let x1000: int32 = renderF32Scaled1000At(buf, rec + 4)
+                let y1000: int32 = renderF32Scaled1000At(buf, rec + 8)
+                let px: int32 = renderMapCoord(x1000, bounds.minX1000, bounds.maxX1000,
+                                                renderMargin, width - renderMargin - 1)
+                let pyRaw: int32 = renderMapCoord(y1000, bounds.minY1000, bounds.maxY1000,
+                                                   renderMargin, height - renderMargin - 1)
+                renderPlotCross(tga, width, height, px, height - 1 - pyRaw, 238, 92, 72, pixels)
+                i = i + 1
+            return Ok[bool](true)
+        pos = dataPos + size
+    return Err[bool]("wowExport render: WMO draw MODD placements missing")
+
+fn renderScanM2Bounds(buf: bytes.ByteBuffer,
+                      bounds: var RenderBounds,
+                      countOut: var int32): Result[bool] =
+    let headerRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(buf)
+    if IsErr(headerRes):
+        return Err[bool](Error(headerRes))
+    let header: asset_formats.M2Header = Value(headerRes)
+    if header.vertexOffset < 0 || header.vertexOffset + header.vertexCount * 48 > buf.len:
+        return Err[bool]("wowExport render: M2 vertex array out of bounds")
+    var i: int32
+    while i < header.vertexCount:
+        let pos: int32 = header.vertexOffset + i * 48
+        let x: int32 = renderF32Scaled1000At(buf, pos)
+        let y: int32 = renderF32Scaled1000At(buf, pos + 4)
+        let z: int32 = renderF32Scaled1000At(buf, pos + 8)
+        renderAccumulateBounds(bounds, x, y, z)
+        countOut = countOut + 1
+        i = i + 1
+    return Ok[bool](true)
+
+fn renderDrawM2Inset(tga: bytes.ByteBuffer,
+                     width: int32,
+                     height: int32,
+                     buf: bytes.ByteBuffer,
+                     bounds: RenderBounds,
+                     pixels: var int32): Result[bool] =
+    let headerRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(buf)
+    if IsErr(headerRes):
+        return Err[bool](Error(headerRes))
+    let header: asset_formats.M2Header = Value(headerRes)
+    if header.vertexOffset < 0 || header.vertexOffset + header.vertexCount * 48 > buf.len:
+        return Err[bool]("wowExport render: M2 vertex array out of bounds")
+    let left: int32 = width * 2 / 3
+    let right: int32 = width - renderMargin - 1
+    let top: int32 = renderMargin
+    let bottom: int32 = height / 3
+    var i: int32
+    while i < header.vertexCount:
+        let pos: int32 = header.vertexOffset + i * 48
+        let x1000: int32 = renderF32Scaled1000At(buf, pos)
+        let y1000: int32 = renderF32Scaled1000At(buf, pos + 4)
+        let px: int32 = renderMapCoord(x1000, bounds.minX1000, bounds.maxX1000, left, right)
+        let py: int32 = renderMapCoord(y1000, bounds.minY1000, bounds.maxY1000, bottom, top)
+        renderPlotCross(tga, width, height, px, py, 96, 210, 240, pixels)
+        i = i + 1
+    return Ok[bool](true)
+
+fn renderLoadFile(manifest: northshire.NorthshireManifest,
+                  file: northshire.NorthshireAuditedFile): Result[bytes.ByteBuffer] =
+    return local_files.ReadLocalFileByEntry(manifest.clientPath,
+                                            file.archiveIndex,
+                                            file.offset,
+                                            file.size)
+
+fn RenderNorthshireTga(outPath: str, width: int32, height: int32): Result[RenderSummary] =
+    if strings.Len(outPath) == 0:
+        return Err[RenderSummary]("wowExport render: missing output path")
+    let manifest: northshire.NorthshireManifest = northshire.Manifest()
+    if !northshire.ManifestReady(manifest):
+        return Err[RenderSummary]("wowExport render: manifest not ready")
+    let auditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestPayloadsAgainstLocal(manifest)
+    if IsErr(auditRes):
+        return Err[RenderSummary](Error(auditRes))
+    var terrainBounds: RenderBounds
+    var wmoBounds: RenderBounds
+    var m2Bounds: RenderBounds
+    var summary: RenderSummary
+    summary.outPath = outPath
+    summary.width = width
+    summary.height = height
+    var i: int32
+    while i < manifest.auditedFiles.len:
+        let file: northshire.NorthshireAuditedFile = manifest.auditedFiles[i]
+        if file.kind == "adt":
+            let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
+            if IsErr(bufRes):
+                return Err[RenderSummary](Error(bufRes))
+            let buf: bytes.ByteBuffer = Value(bufRes)
+            let scanRes: Result[bool] =
+                renderScanAdtTerrain(buf, terrainBounds, summary.adtHeightSampleCount)
+            bytes.FreeByteBuffer(buf)
+            if IsErr(scanRes):
+                return Err[RenderSummary](Error(scanRes))
+        elif file.kind == "wmo":
+            let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
+            if IsErr(bufRes):
+                return Err[RenderSummary](Error(bufRes))
+            let buf: bytes.ByteBuffer = Value(bufRes)
+            let scanRes: Result[bool] =
+                renderScanWmoDoodadPlacements(buf, wmoBounds, summary.wmoDoodadPlacementCount)
+            bytes.FreeByteBuffer(buf)
+            if IsErr(scanRes):
+                return Err[RenderSummary](Error(scanRes))
+        elif file.kind == "wmo_group":
+            let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
+            if IsErr(bufRes):
+                return Err[RenderSummary](Error(bufRes))
+            let buf: bytes.ByteBuffer = Value(bufRes)
+            let scanRes: Result[bool] = renderScanWmoVertices(buf, wmoBounds, summary.wmoVertexCount)
+            bytes.FreeByteBuffer(buf)
+            if IsErr(scanRes):
+                return Err[RenderSummary](Error(scanRes))
+        elif file.kind == "m2":
+            let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
+            if IsErr(bufRes):
+                return Err[RenderSummary](Error(bufRes))
+            let buf: bytes.ByteBuffer = Value(bufRes)
+            let scanRes: Result[bool] = renderScanM2Bounds(buf, m2Bounds, summary.m2VertexCount)
+            bytes.FreeByteBuffer(buf)
+            if IsErr(scanRes):
+                return Err[RenderSummary](Error(scanRes))
+        elif file.kind == "skin":
+            let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
+            if IsErr(bufRes):
+                return Err[RenderSummary](Error(bufRes))
+            let buf: bytes.ByteBuffer = Value(bufRes)
+            let skinRes: Result[asset_formats.M2SkinSummary] = asset_formats.ParseM2SkinSummary(buf)
+            bytes.FreeByteBuffer(buf)
+            if IsErr(skinRes):
+                return Err[RenderSummary](Error(skinRes))
+            summary.skinTriangleIndexCount = summary.skinTriangleIndexCount + Value(skinRes).triangleIndexCount
+        i = i + 1
+    if !terrainBounds.ready || !wmoBounds.ready || !m2Bounds.ready:
+        return Err[RenderSummary]("wowExport render: missing geometry bounds")
+    let tgaRes: Result[bytes.ByteBuffer] = renderMakeTga(width, height)
+    if IsErr(tgaRes):
+        return Err[RenderSummary](Error(tgaRes))
+    var tga: bytes.ByteBuffer = Value(tgaRes)
+    i = 0
+    while i < manifest.auditedFiles.len:
+        let file: northshire.NorthshireAuditedFile = manifest.auditedFiles[i]
+        if file.kind == "adt":
+            let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
+            if IsErr(bufRes):
+                bytes.FreeByteBuffer(tga)
+                return Err[RenderSummary](Error(bufRes))
+            let buf: bytes.ByteBuffer = Value(bufRes)
+            let drawRes: Result[bool] =
+                renderDrawAdtTerrain(tga, width, height, buf, terrainBounds, summary.pixelsTouched)
+            bytes.FreeByteBuffer(buf)
+            if IsErr(drawRes):
+                bytes.FreeByteBuffer(tga)
+                return Err[RenderSummary](Error(drawRes))
+        elif file.kind == "wmo_group":
+            let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
+            if IsErr(bufRes):
+                bytes.FreeByteBuffer(tga)
+                return Err[RenderSummary](Error(bufRes))
+            let buf: bytes.ByteBuffer = Value(bufRes)
+            let drawRes: Result[bool] =
+                renderDrawWmoVertices(tga, width, height, buf, wmoBounds, summary.pixelsTouched)
+            bytes.FreeByteBuffer(buf)
+            if IsErr(drawRes):
+                bytes.FreeByteBuffer(tga)
+                return Err[RenderSummary](Error(drawRes))
+        elif file.kind == "m2":
+            let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
+            if IsErr(bufRes):
+                bytes.FreeByteBuffer(tga)
+                return Err[RenderSummary](Error(bufRes))
+            let buf: bytes.ByteBuffer = Value(bufRes)
+            let drawRes: Result[bool] =
+                renderDrawM2Inset(tga, width, height, buf, m2Bounds, summary.pixelsTouched)
+            bytes.FreeByteBuffer(buf)
+            if IsErr(drawRes):
+                bytes.FreeByteBuffer(tga)
+                return Err[RenderSummary](Error(drawRes))
+        i = i + 1
+    i = 0
+    while i < manifest.auditedFiles.len:
+        let file: northshire.NorthshireAuditedFile = manifest.auditedFiles[i]
+        if file.kind == "wmo":
+            let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
+            if IsErr(bufRes):
+                bytes.FreeByteBuffer(tga)
+                return Err[RenderSummary](Error(bufRes))
+            let buf: bytes.ByteBuffer = Value(bufRes)
+            let drawRes: Result[bool] =
+                renderDrawWmoDoodadPlacements(tga, width, height, buf, wmoBounds, summary.pixelsTouched)
+            bytes.FreeByteBuffer(buf)
+            if IsErr(drawRes):
+                bytes.FreeByteBuffer(tga)
+                return Err[RenderSummary](Error(drawRes))
+        i = i + 1
+    let writeRes: Result[int32] = asset_export.AssetExportWriteBufferAtomic(outPath, tga)
+    bytes.FreeByteBuffer(tga)
+    if IsErr(writeRes):
+        return Err[RenderSummary](Error(writeRes))
+    summary.bytesWritten = Value(writeRes)
+    if summary.pixelsTouched <= 0:
+        return Err[RenderSummary]("wowExport render: no pixels drawn")
+    return Ok[RenderSummary](summary)
+
+fn RenderSummaryText(summary: RenderSummary): str =
+    let widthText: str = strings.IntToStr(summary.width)
+    let heightText: str = strings.IntToStr(summary.height)
+    let bytesText: str = strings.IntToStr(summary.bytesWritten)
+    let adtText: str = strings.IntToStr(summary.adtHeightSampleCount)
+    let wmoText: str = strings.IntToStr(summary.wmoVertexCount)
+    let doodadText: str = strings.IntToStr(summary.wmoDoodadPlacementCount)
+    let m2Text: str = strings.IntToStr(summary.m2VertexCount)
+    let skinText: str = strings.IntToStr(summary.skinTriangleIndexCount)
+    let pixelText: str = strings.IntToStr(summary.pixelsTouched)
+    var out: str = Fmt"rendered width={widthText}"
+    out = out + Fmt" height={heightText}"
+    out = out + Fmt" bytes={bytesText}"
+    out = out + Fmt" adtHeightSamples={adtText}"
+    out = out + Fmt" wmoVertices={wmoText}"
+    out = out + Fmt" wmoDoodadPlacements={doodadText}"
+    out = out + Fmt" m2Vertices={m2Text}"
+    out = out + Fmt" skinTriangleIndices={skinText}"
+    out = out + Fmt" pixels={pixelText}"
+    out = out + Fmt" out={summary.outPath}"
+    return out

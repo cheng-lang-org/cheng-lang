@@ -1,5 +1,6 @@
 import std/cmdline as cmdline
 import std/os
+import std/strings
 import std/system as system
 import std/strutils as strutil
 import cheng/core/tooling/compiler_runtime as crun
@@ -7,6 +8,7 @@ import cheng/core/tooling/export_visibility_gate as evgate
 import cheng/core/tooling/host_bridge_audit_gate as hbagate
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/path as chengpath
+import cheng/core/tooling/wasm_smoke_gate as wsgate
 
 @importc("get_stdout")
 fn BackendDriverStdoutBridge(): os.File
@@ -43,11 +45,11 @@ fn BackendDriverStage3Path(rootDir: str): str =
 
 fn BackendDriverUsage(rootDir: str) =
     BackendDriverPrintLine("usage: cheng <command> [args]")
-    BackendDriverPrintLine("core commands: status, print-build-plan, system-link-exec")
+    BackendDriverPrintLine("core commands: status, print-build-plan, host-bridge-audit, system-link-exec")
     BackendDriverPrintLine("world/proof commands: world-receipt")
     BackendDriverPrintLine("debug commands: debug-report, print-symbols, print-line-map, print-asm")
     BackendDriverPrintLine("verify commands: verify-export-visibility, verify-export-visibility-parallel, verify-debug-tools")
-    BackendDriverPrintLine("gate commands: run-host-smokes")
+    BackendDriverPrintLine("gate commands: run-host-smokes, run-production-regression")
     BackendDriverPrintKeyValue("stage3", BackendDriverStage3Path(rootDir))
 
 fn BackendDriverEnsureRootEnv(rootDir: str) =
@@ -66,11 +68,167 @@ fn BackendDriverCollectArgsFrom(startIndex: int32,
             add(out, arg)
     return out
 
+fn BackendDriverStartsWith(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    return strings.SliceBytes(text, 0, len(prefix)) == prefix
+
+fn BackendDriverReadFlag(args: str[],
+                           key: str,
+                           defaultValue: str): str =
+    var i: int32
+    while i < args.len:
+        let arg = args[i]
+        if arg == key && i + 1 < args.len:
+            return args[i + 1]
+        if BackendDriverStartsWith(arg, key + ":"):
+            return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
+        if BackendDriverStartsWith(arg, key + "="):
+            return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
+        i = i + 1
+    return defaultValue
+
+fn BackendDriverCollectHostSmokeNames(args: str[]): str[] =
+    var out: str[]
+    var i: int32
+    while i < args.len:
+        let arg = args[i]
+        if arg == "--compiler" || arg == "--label" || arg == "--tail-only":
+            i = i + 2
+        elif BackendDriverStartsWith(arg, "--compiler:") ||
+             BackendDriverStartsWith(arg, "--compiler=") ||
+             BackendDriverStartsWith(arg, "--label:") ||
+             BackendDriverStartsWith(arg, "--label=") ||
+             BackendDriverStartsWith(arg, "--tail-only:") ||
+             BackendDriverStartsWith(arg, "--tail-only="):
+            i = i + 1
+        elif len(arg) > 0 && arg[0] == '-':
+            i = i + 1
+        else:
+            add(out, arg)
+            i = i + 1
+    return out
+
 fn BackendDriverParamStr(i: int32): str =
     let raw = BackendDriverParamStrRawBridge(i)
     if raw == nil:
         return ""
     return system.strFromCStringBorrow(raw)
+
+fn BackendDriverHostSmokeCompiler(rootDir: str, args: str[]): str =
+    var compiler = strutil.Strip(BackendDriverReadFlag(args, "--compiler", ""))
+    if len(compiler) <= 0:
+        compiler = strutil.Strip(os.GetEnvDefault("CHENG_SMOKE_COMPILER", ""))
+    if len(compiler) <= 0:
+        compiler = "artifacts/backend_driver/cheng"
+    return chengpath.PathAbsolute(rootDir, compiler)
+
+fn BackendDriverHostSmokeLabel(args: str[]): str =
+    let explicit = strutil.Strip(BackendDriverReadFlag(args, "--label", ""))
+    if len(explicit) > 0:
+        return explicit
+    let envLabel = strutil.Strip(os.GetEnvDefault("CHENG_SMOKE_LABEL", ""))
+    if len(envLabel) > 0:
+        return envLabel
+    return "host"
+
+fn BackendDriverHostSmokeRunTimeoutSec(smokeName: str): int32 =
+    if smokeName == "runtime_zero_c_surface_smoke":
+        return 600
+    if smokeName == "backend_driver_command_surface_smoke":
+        return 420
+    if smokeName == "compiler_world_fresh_node_selfhost_smoke":
+        return 420
+    if smokeName == "perf_memory_contract_smoke":
+        return 600
+    return 120
+
+fn BackendDriverHostSmokeCompileEnv(): str[] =
+    var out: str[]
+    add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
+    add(out, "CHENG_PROGRESS=1")
+    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=34359738368")
+    add(out, "CHENG_COMPILE_TIMEOUT_SEC=420")
+    return out
+
+fn BackendDriverRunOneHostSmoke(rootDir: str,
+                                  compilerPath: str,
+                                  outDir: str,
+                                  label: str,
+                                  smokeName: str): int32 =
+    let src = chengpath.PathAbsolute(rootDir, "src/tests/" + smokeName + ".cheng")
+    if !chengpath.FileExistsNonEmpty(rootDir, src):
+        BackendDriverPrintErr("backend driver host smokes: missing source: " + src)
+        return 1
+    let outBin = os.JoinPath(outDir, smokeName)
+    let compileLog = outBin + ".compile.log"
+    let runLog = outBin + ".run.log"
+    var compileArgs: str[]
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, "--root:" + rootDir)
+    add(compileArgs, "--in:" + src)
+    add(compileArgs, "--emit:exe")
+    add(compileArgs, "--target:arm64-apple-darwin")
+    add(compileArgs, "--out:" + outBin)
+    let compileRun = hostops.RunFileLogged(rootDir,
+                                             "backend_driver_host_smoke_compile_" + label + "_" + smokeName,
+                                             compilerPath,
+                                             compileArgs,
+                                             BackendDriverHostSmokeCompileEnv(),
+                                             rootDir,
+                                             420,
+                                             compileLog)
+    if !hostops.LoggedRunOk(compileRun):
+        let outputText = strutil.Strip(compileRun.output)
+        if len(outputText) > 0:
+            BackendDriverPrintErr(outputText)
+        return compileRun.exitCode
+    if !chengpath.FileExistsNonEmpty(rootDir, outBin):
+        BackendDriverPrintErr("backend driver host smokes: compile missing output: " + outBin)
+        return 1
+    let run = hostops.RunFileLogged(rootDir,
+                                      "backend_driver_host_smoke_run_" + label + "_" + smokeName,
+                                      outBin,
+                                      [],
+                                      [],
+                                      rootDir,
+                                      BackendDriverHostSmokeRunTimeoutSec(smokeName),
+                                      runLog)
+    let runOutput = strutil.Strip(run.output)
+    if len(runOutput) > 0:
+        if hostops.LoggedRunOk(run):
+            BackendDriverPrintLine(runOutput)
+        else:
+            BackendDriverPrintErr(runOutput)
+    if !hostops.LoggedRunOk(run):
+        return run.exitCode
+    return 0
+
+fn BackendDriverRunHostSmokes(rootDir: str, args: str[]): int32 =
+    let tailOnly = strutil.Strip(BackendDriverReadFlag(args, "--tail-only", ""))
+    if len(tailOnly) > 0:
+        BackendDriverPrintErr("backend driver host smokes: --tail-only is not part of the minimal direct gate")
+        return 2
+    let compilerPath = BackendDriverHostSmokeCompiler(rootDir, args)
+    if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        BackendDriverPrintErr("backend driver host smokes: missing compiler: " + compilerPath)
+        return 1
+    let tests = BackendDriverCollectHostSmokeNames(args)
+    if tests.len <= 0:
+        BackendDriverPrintErr("backend driver host smokes: explicit smoke names required")
+        return 2
+    let label = BackendDriverHostSmokeLabel(args)
+    var outDir = chengpath.PathAbsolute(rootDir, "artifacts/hostrun")
+    if label != "host":
+        outDir = os.JoinPath(outDir, label)
+    if !chengpath.MkdirP(rootDir, outDir):
+        BackendDriverPrintErr("backend driver host smokes: mkdir failed: " + outDir)
+        return 1
+    for i in 0..<tests.len:
+        if BackendDriverRunOneHostSmoke(rootDir, compilerPath, outDir, label, tests[i]) != 0:
+            return 1
+    BackendDriverPrintLine("cheng backend driver host smokes: ok")
+    return 0
 
 fn BackendDriverForward(rootDir: str,
                           cmd: str,
@@ -134,6 +292,12 @@ fn main(argc: int32, argv: str*): int32 =
             return 0
         if cmd == "host-bridge-audit":
             return hbagate.HostBridgeAuditGateRun(rootDir)
+        if cmd == "run-host-smokes":
+            return BackendDriverRunHostSmokes(rootDir, args)
+        if cmd == "run-browser-host-wasm-smoke":
+            return wsgate.WasmSmokeRunBrowserHostWasmCommand(rootDir, args)
+        if cmd == "run-wasm-smokes":
+            return wsgate.WasmSmokeRunWasmSmokesCommand(rootDir, args)
         if cmd == "verify-export-visibility":
             return evgate.ExportVisibilityGateRun(rootDir)
         if cmd == "verify-export-visibility-parallel":

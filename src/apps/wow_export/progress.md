@@ -4,6 +4,11 @@
 
 最新进展（2026-04-24）：
 
+- Northshire 地形已从 WDT `MAID` + listfile 坐标收窄到四个真实基础 ADT：`Azeroth_31_48`、`Azeroth_32_48`、`Azeroth_31_49`、`Azeroth_32_49`；四条 fileDataID `777827/778027/777832/778032` 均已审计 content key、encoding key、archive、offset、encoded size。
+- `asset_formats.ParseAdtTerrainSummary` 已严格解析 ADT `KNCM/MCNK -> TVCM/MCVT`，每个 `MCNK` 必须带一个 `MCVT`；四个 Northshire tile 实测 `1024` 个 terrain chunk、`148480` 个高度样本，高度范围 `32500..384127`。
+- `preview-northshire` 现在会把 ADT terrain 纳入 scene 判定和摘要；本机输出 `auditedFiles=22 loadedFiles=22 adtTiles=4 adtChunks=1024 adtHeightSamples=148480 assetBytes=3346856`。
+- `export-map --out-dir` 现在导出 `22` 个真实文件、合计 `3346856` 字节；四个 ADT 解码 payload 分别为 `375707/359854/322706/366237` 字节。
+- `render-northshire` 现在先绘制真实 ADT terrain 高度点，再叠加 WMO group 和 M2 点云；`640x360` 输出仍为 `921618` 字节，绘制点数从 `31153` 提升到 `179633`。
 - `casc_index.LoadLocalIndexEntry` 不再因为目录路径或悬挂 `ListDir` 结果崩溃；现在会稳定返回真实错误。
 - `std/os.ListDir` 现已在库层修正：目录 listing raw buffer 会在 `ListDir` 内部释放，返回文件名保持 owned 字符串，不再把释放责任和悬挂风险留给业务层。
 - 当前本机重跑最小链路时，阻塞已经从“路径桥/悬挂字符串”收敛到“本地 journal 查不到 config 里的 encoding encoding key `00f6dcef63eafe6254ab5408ea8baa09`”。
@@ -31,9 +36,24 @@
 - `preview-northshire` 的 scene 判定已升级：必须有 WDT 活跃 tile、WMO group/material、M2 bounds、动画序列和 BLP->TGA 解码结果，不能只靠 header 非空。
 - WDT/WMO/M2 依赖发现已接入 preview：WDT `MAID` 解析出 `9408` 个 referenced fileDataID，首项 `6173014`；WMO `GFID` 解析出 `13` 个 group fileDataID，首项 `107075`；WMO `MODI` 解析出 `17` 个非零 model fileDataID，首项 `198056`；M2 `SFID/TXID` 解析出 skin `494438` 和 texture fileDataID `127489/189598`。
 - 已确认当前 Northshire manifest 4 条 root entry 在 root 中都是 ID-only，没有 name hash；因此不能靠路径 hash 严谨发现这些文件，下一步应从资产内嵌 `GFID/SFID/TXID/MAID/MODI` fileDataID 扩展审计 manifest。
+- Northshire manifest 已扩展到 `18` 个真实审计资产：原 WDT/WMO/BLP/M2，加上 WMO root `GFID` 指向的 `13` 个 `NSabbey_000..012` group，以及 M2 `SFID` 指向的 skin `494438`。这些新增条目均用本地 root/encoding/index 审计出真实 content key、encoding key、archive、offset、encoded size。
+- `asset_formats.ParseWmoGroupSummary` 已解析真实 WMO group 的 `MOGP(PGOM)` 内嵌 chunk，统计 `MOVT/TVOM` 顶点、`MOVI/IVOM` 索引、`MOBA/ABOM` batch 和 `MOPY/YPOM` 材质信息；13 个 group 合计 `29304` 顶点、`91689` 个索引。
+- `asset_formats.ParseM2SkinSummary` 已解析真实 `.skin` header 和 index/triangle/property/submesh/texture-unit 数组边界；`abbey-bell-skin-00` 实测 `370` indices、`1302` triangle indices、`2` submeshes。
+- `preview-northshire` 现在会读取并验证全部 18 个真实资产，scene 非空条件已升级为必须加载 WMO group 几何和 M2 skin/index 数据；本机输出 `wmoGroupAssets=13 wmoGroupVertices=29304 wmoGroupIndices=91689 m2SkinIndices=370 m2SkinTriangleIndices=1302`。
+- `export-map --out-dir` 现在导出 18 个文件、合计 `1922352` 字节；新增的 WMO group 解码 payload 最大为 group 010 的 `290592` 字节，skin payload 为 `5088` 字节。
+- 新增纯 Cheng `render` 模块和 CLI `render-northshire`：生成无压缩 32-bit TGA，主视图来自 13 个真实 WMO group `MOVT` 顶点，右上角 inset 来自真实 M2 顶点，skin 必须解析成功。`render-northshire --out /tmp/wow_export_northshire_render.tga --width 640 --height 360` 输出 `921618` 字节，绘制 `31153` 个真实几何点。
 
 验证：
 
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_asset_formats_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_asset_formats_smoke` 通过，`/tmp/wow_export_asset_formats_smoke` 通过。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_northshire_mvp_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_northshire_mvp_smoke` 通过，`/tmp/wow_export_northshire_mvp_smoke` 输出 `adtTiles=4 adtChunks=1024 adtHeightSamples=148480`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_render_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_render_smoke` 通过，`/tmp/wow_export_render_smoke` 通过。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_asset_export_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_asset_export_smoke` 通过，`/tmp/wow_export_asset_export_smoke` 通过。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_memory_probe_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_memory_probe_smoke` 通过，`/tmp/wow_export_memory_probe_smoke` 通过；preview steady delta 当前为 `10470`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/apps/wow_export/wow_export_tool_main.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_tool_main` 通过。
+- `/tmp/wow_export_tool_main preview-northshire --frames 1` 通过，输出 `auditedFiles=22 loadedFiles=22 adtHeightSamples=148480 assetBytes=3346856`。
+- `/tmp/wow_export_tool_main export-map --out-dir /tmp/wow_export_map_adt_current` 通过，输出 `exportedBundle files=22 bytes=3346856`。
+- `/tmp/wow_export_tool_main render-northshire --out /tmp/wow_export_northshire_render_adt.tga --width 640 --height 360` 通过，输出 `adtHeightSamples=148480 pixels=179633`。
 - `artifacts/backend_driver/cheng run-host-smokes wow_export_casc_smoke wow_export_md5_smoke wow_export_salsa20_smoke wow_export_blte_smoke wow_export_zlib_smoke wow_export_tact_keys_smoke wow_export_encoding_smoke` 通过。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/os_list_dir_stress_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/os_list_dir_stress_smoke && /usr/bin/time -l /tmp/os_list_dir_stress_smoke` 通过。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/os_list_dir_large_snapshot_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/os_list_dir_large_snapshot_smoke && /tmp/os_list_dir_large_snapshot_smoke` 通过。
@@ -82,4 +102,4 @@
 - `Data/data/data.NNN` 的 30 字节本地 header 继续只解释传统 local archive；`.index` 这边的真实文件格式也已经钉住。下一步应该把 CDN root 从“首块验证”推进成按需 range/block 解码，而不是全量 65MB 解码后再扫表。
 - `Data/indices` 大目录现在能稳定快照真实文件名，但 `os_list_dir_stress_smoke` 当前在 256 文件 * 6000 轮下的 `peak memory footprint` 约 `219005456`；这说明库层崩溃已修掉，长热路径的 allocator 回收表现还需要后续单独压。
 - 北郡预览现在会先跑本地审计，再读取已审计资产；剩余缺口是把真实几何/动画数据继续推进成更完整的 MVP，而不是只验证头部和 chunk 边界。
-- 当前 `extract-file`、`export-m2`、`export-wmo`、`export-map`、`convert-blp` 已从占位推进到可用；剩余真正缺口是把已发现的 group/skin/ADT/model fileDataID 扩展进审计 manifest 并解码 WMO group/ADT 几何。
+- 当前 `extract-file`、`export-m2`、`export-wmo`、`export-map`、`convert-blp`、`preview-northshire`、`render-northshire` 已从占位推进到可用；剩余真正缺口是材质、光照、相机/世界摆放、更多 doodad/model 链路，而不是 ADT/WMO/M2 基础几何。

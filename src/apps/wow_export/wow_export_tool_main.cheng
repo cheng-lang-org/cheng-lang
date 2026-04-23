@@ -14,13 +14,14 @@ import cheng/apps/wow_export/encoding as encoding
 import cheng/apps/wow_export/install as install
 import cheng/apps/wow_export/local_files as local_files
 import cheng/apps/wow_export/preview as preview
+import cheng/apps/wow_export/render as render
 import cheng/apps/wow_export/root as wow_root
 import cheng/apps/wow_export/tact_keys as tact_keys
 import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
 
 fn PrintUsage() =
-    echo("wow-export commands: list-builds | probe | manifest | audit-file | extract-file | convert-blp | export-m2 | export-wmo | export-map | preview-northshire")
-    echo("export examples: extract-file --label abbey-bell-model --out /tmp/nsabbeyBell.m2 | convert-blp --out /tmp/abbeyBell.tga | export-map --out-dir /tmp/northshire")
+    echo("wow-export commands: list-builds | probe | manifest | audit-file | extract-file | convert-blp | export-m2 | export-wmo | export-map | preview-northshire | render-northshire")
+    echo("export examples: extract-file --label abbey-bell-model --out /tmp/nsabbeyBell.m2 | convert-blp --out /tmp/abbeyBell.tga | render-northshire --out /tmp/northshire.tga")
 
 fn RunListBuilds(): int32 =
     let buildsRes: Result[build_info.WowBuildEntry[]] = build_info.LoadBuildInfo(build_info.DefaultClientPath)
@@ -223,7 +224,7 @@ fn RunConvertBlp(): int32 =
     if cmdline.ReadFirstFlagValue("--in", inPath):
         let blpBuf: bytes.ByteBuffer = bytes.ReadFileBytes(inPath)
         if blpBuf.len <= 0:
-            echo("wowExport convert-blp: input read failed " + inPath)
+            echo(Fmt"wowExport convert-blp: input read failed {inPath}")
             return 1
         let tgaRes: Result[bytes.ByteBuffer] = blp.Blp2DecodeFirstMipTga(blpBuf)
         bytes.FreeByteBuffer(blpBuf)
@@ -236,7 +237,7 @@ fn RunConvertBlp(): int32 =
         if IsErr(writeRes):
             echo(Error(writeRes))
             return 1
-        echo("converted blp bytes=" + strings.IntToStr(Value(writeRes)) + " out=" + outPath)
+        echo(Fmt"converted blp bytes={strings.IntToStr(Value(writeRes))} out={outPath}")
         return 0
     let manifest: northshire.NorthshireManifest = northshire.Manifest()
     var label: str
@@ -263,6 +264,21 @@ fn RunConvertBlp(): int32 =
         echo(Error(exportRes))
         return 1
     echo(asset_export.AssetExportSummaryText(Value(exportRes)))
+    return 0
+
+fn RunRenderNorthshire(): int32 =
+    let outPath: str = cmdline.ReadFlagOrDefault("--out", "")
+    if strings.Len(outPath) == 0:
+        echo("wowExport render-northshire: missing --out")
+        return 1
+    let width: int32 = cmdline.ReadInt32FlagOrDefault("--width", 1280)
+    let height: int32 = cmdline.ReadInt32FlagOrDefault("--height", 720)
+    let renderRes: Result[render.RenderSummary] =
+        render.RenderNorthshireTga(outPath, width, height)
+    if IsErr(renderRes):
+        echo(Error(renderRes))
+        return 1
+    echo(render.RenderSummaryText(Value(renderRes)))
     return 0
 
 fn RunNotImplemented(cmd: str): int32 =
@@ -296,6 +312,8 @@ fn main(argc: int32, argv: ptr): int32 =
         return RunPreviewNorthshire()
     if cmd == "convert-blp":
         return RunConvertBlp()
+    if cmd == "render-northshire":
+        return RunRenderNorthshire()
     echo(Fmt"wowExport: unknown command {cmd}")
     PrintUsage()
     return 1

@@ -1,0 +1,361 @@
+import std/cmdline as cmdline
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/path as chengpath
+
+fn nativeGuiRuntimeSlice(text: str,
+                         start: int32,
+                         length: int32): str =
+    if length <= 0:
+        return ""
+    return chengpath.TextSlice(text, start, length)
+
+fn nativeGuiRuntimeDigitValue(text: str): int32 =
+    if text == "0":
+        return 0
+    elif text == "1":
+        return 1
+    elif text == "2":
+        return 2
+    elif text == "3":
+        return 3
+    elif text == "4":
+        return 4
+    elif text == "5":
+        return 5
+    elif text == "6":
+        return 6
+    elif text == "7":
+        return 7
+    elif text == "8":
+        return 8
+    elif text == "9":
+        return 9
+    return -1
+
+fn nativeGuiRuntimeParsePositiveInt32(raw: str): int32 =
+    let total: int32 = strings.Len(raw)
+    if total <= 0:
+        return 0
+    if total == 1:
+        return nativeGuiRuntimeDigitValue(raw)
+    let prefixValue: int32 = nativeGuiRuntimeParsePositiveInt32(nativeGuiRuntimeSlice(raw, 0, total - 1))
+    let lastDigit: int32 = nativeGuiRuntimeDigitValue(nativeGuiRuntimeSlice(raw, total - 1, 1))
+    if prefixValue < 0 || lastDigit < 0:
+        return -1
+    return prefixValue * 10 + lastDigit
+
+fn nativeGuiRuntimeParseInt32(text: str): int32 =
+    let raw: str = strutil.Strip(text)
+    if strings.Len(raw) <= 0:
+        return 0
+    if nativeGuiRuntimeSlice(raw, 0, 1) == "-":
+        let parsed: int32 = nativeGuiRuntimeParsePositiveInt32(nativeGuiRuntimeSlice(raw, 1, strings.Len(raw) - 1))
+        if parsed < 0:
+            return 0
+        return 0 - parsed
+    let parsed: int32 = nativeGuiRuntimeParsePositiveInt32(raw)
+    if parsed < 0:
+        return 0
+    return parsed
+
+fn nativeGuiRuntimeJsonQuote(text: str): str =
+    let quote: str = strings.CharToStr(char(34))
+    var out = quote
+    let total: int32 = strings.Len(text)
+    var i: int32
+    while i < total:
+        let ch = text[i]
+        if ch == char(34):
+            out = out + "\\" + quote
+        elif ch == '\\':
+            out = out + "\\\\"
+        elif ch == char(10):
+            out = out + "\\n"
+        elif ch == char(13):
+            out = out + "\\r"
+        elif ch == char(9):
+            out = out + "\\t"
+        else:
+            out = out + strings.CharToStr(ch)
+        i = i + 1
+    out = out + quote
+    return out
+
+fn nativeGuiRuntimeTextFind(text: str,
+                            needle: str,
+                            startRaw: int32): int32 =
+    let total: int32 = strings.Len(text)
+    let needleLen: int32 = strings.Len(needle)
+    if needleLen <= 0:
+        return startRaw
+    if total < needleLen:
+        return -1
+    var start: int32 = startRaw
+    if start < 0:
+        start = 0
+    if start > total - needleLen:
+        return -1
+    for i in start..(total - needleLen):
+        var matched = true
+        var j: int32
+        while j < needleLen:
+            if text[i + j] != needle[j]:
+                matched = false
+                break
+            j = j + 1
+        if matched:
+            return i
+    return -1
+
+fn nativeGuiRuntimeJsonSkipWhitespace(text: str,
+                                      startRaw: int32): int32 =
+    var start: int32 = startRaw
+    if start < 0:
+        start = 0
+    let total: int32 = strings.Len(text)
+    while start < total:
+        let ch = text[start]
+        if ch == char(32) || ch == char(10) || ch == char(13) || ch == char(9):
+            start = start + 1
+        else:
+            return start
+    return start
+
+fn nativeGuiRuntimeJsonFindValueStart(text: str,
+                                      key: str,
+                                      startRaw: int32): int32 =
+    let keyPattern: str = nativeGuiRuntimeJsonQuote(key)
+    let keyPos: int32 = nativeGuiRuntimeTextFind(text, keyPattern, startRaw)
+    if keyPos < 0:
+        return -1
+    let total: int32 = strings.Len(text)
+    var pos: int32 = keyPos + strings.Len(keyPattern)
+    while pos < total:
+        if text[pos] == char(58):
+            return nativeGuiRuntimeJsonSkipWhitespace(text, pos + 1)
+        pos = pos + 1
+    return -1
+
+fn nativeGuiRuntimeJsonReadStringLiteral(text: str,
+                                         startRaw: int32,
+                                         fallback: str): str =
+    let total: int32 = strings.Len(text)
+    if startRaw < 0 || startRaw >= total:
+        return fallback
+    if text[startRaw] != char(34):
+        return fallback
+    var out: str
+    var pos: int32 = startRaw + 1
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(34):
+            return out
+        if ch == '\\':
+            if pos + 1 >= total:
+                return fallback
+            let esc = text[pos + 1]
+            if esc == char(34):
+                out = out + strings.CharToStr(char(34))
+            elif esc == '\\':
+                out = out + "\\"
+            elif esc == 'n':
+                out = out + "\n"
+            elif esc == 'r':
+                out = out + "\r"
+            elif esc == 't':
+                out = out + "\t"
+            else:
+                out = out + strings.CharToStr(esc)
+            pos = pos + 2
+            continue
+        out = out + strings.CharToStr(ch)
+        pos = pos + 1
+    return fallback
+
+fn nativeGuiRuntimeJsonReadStringField(text: str,
+                                       key: str,
+                                       fallback: str): str =
+    let valueStart: int32 = nativeGuiRuntimeJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    return nativeGuiRuntimeJsonReadStringLiteral(text, valueStart, fallback)
+
+fn nativeGuiRuntimeJsonReadIntField(text: str,
+                                    key: str,
+                                    fallback: int32): int32 =
+    let valueStart: int32 = nativeGuiRuntimeJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    let total: int32 = strings.Len(text)
+    var endPos: int32 = valueStart
+    if endPos < total && text[endPos] == '-':
+        endPos = endPos + 1
+    var sawDigit = false
+    while endPos < total:
+        let digitText: str = nativeGuiRuntimeSlice(text, endPos, 1)
+        if nativeGuiRuntimeDigitValue(digitText) < 0:
+            break
+        sawDigit = true
+        endPos = endPos + 1
+    if !sawDigit:
+        return fallback
+    return nativeGuiRuntimeParseInt32(nativeGuiRuntimeSlice(text, valueStart, endPos - valueStart))
+
+fn nativeGuiRuntimeReadFlagInt(key: str,
+                               fallback: int32): int32 =
+    let value: str = cmdline.ReadFlagOrDefault(key, "")
+    if strings.Len(value) <= 0:
+        return fallback
+    return nativeGuiRuntimeParseInt32(value)
+
+fn nativeGuiRuntimeReadFlagText(key: str,
+                                fallback: str): str =
+    let value: str = cmdline.ReadFlagOrDefault(key, "")
+    if strings.Len(value) <= 0:
+        return fallback
+    return value
+
+fn nativeGuiRuntimePositiveOrFallback(value: int32,
+                                      fallback: int32): int32 =
+    if value > 0:
+        return value
+    return fallback
+
+fn nativeGuiRuntimeStateDoc(contractText: str): str =
+    let routeState: str = nativeGuiRuntimeJsonReadStringField(contractText, "route_state", "home_default")
+    let entryModule: str = nativeGuiRuntimeJsonReadStringField(contractText, "entry_module", "")
+    let windowWidth: int32 = nativeGuiRuntimeReadFlagInt("--state-window-width",
+                                                         nativeGuiRuntimeJsonReadIntField(contractText, "window_width", 390))
+    let windowHeight: int32 = nativeGuiRuntimeReadFlagInt("--state-window-height",
+                                                          nativeGuiRuntimeJsonReadIntField(contractText, "window_height", 844))
+    let contentHeight: int32 = nativeGuiRuntimePositiveOrFallback(nativeGuiRuntimeJsonReadIntField(contractText, "content_height", windowHeight),
+                                                                  windowHeight)
+    let scrollHeight: int32 = nativeGuiRuntimeJsonReadIntField(contractText, "scroll_height", 0)
+    let viewportCount: int32 = nativeGuiRuntimeJsonReadIntField(contractText, "typed_item_catalog_viewport_item_count",
+                                                                nativeGuiRuntimeJsonReadIntField(contractText, "viewport_item_count", 0))
+    let itemCount: int32 = nativeGuiRuntimeJsonReadIntField(contractText, "typed_item_catalog_item_count",
+                                                            nativeGuiRuntimeJsonReadIntField(contractText, "layout_item_count", 0))
+    let interactiveCount: int32 = nativeGuiRuntimeJsonReadIntField(contractText, "typed_item_catalog_interactive_item_count",
+                                                                   nativeGuiRuntimeJsonReadIntField(contractText, "interactive_item_count", 0))
+    let routeCount: int32 = nativeGuiRuntimeJsonReadIntField(contractText, "route_count", 0)
+    let supportedCount: int32 = nativeGuiRuntimeJsonReadIntField(contractText, "supported_count", 0)
+    let semanticCount: int32 = nativeGuiRuntimeJsonReadIntField(contractText, "semantic_nodes_count", 0)
+    let scrollOffsetY: int32 = nativeGuiRuntimeReadFlagInt("--state-scroll-offset-y", 0)
+    let clickCount: int32 = nativeGuiRuntimeReadFlagInt("--state-click-count", 0)
+    let resizeCount: int32 = nativeGuiRuntimeReadFlagInt("--state-resize-count", 0)
+    let scrollCount: int32 = nativeGuiRuntimeReadFlagInt("--state-scroll-count", 0)
+    let keyCount: int32 = nativeGuiRuntimeReadFlagInt("--state-key-count", 0)
+    let textCount: int32 = nativeGuiRuntimeReadFlagInt("--state-text-count", 0)
+    let focusCount: int32 = nativeGuiRuntimeReadFlagInt("--state-focus-count", 0)
+    let selectedItemId: str = nativeGuiRuntimeReadFlagText("--state-selected-item-id", "")
+    let focusedItemId: str = nativeGuiRuntimeReadFlagText("--state-focused-item-id", "")
+    let typedText: str = nativeGuiRuntimeReadFlagText("--state-typed-text", "")
+    let lastKey: str = nativeGuiRuntimeReadFlagText("--state-last-key", "")
+    var doc = "{"
+    doc = doc + "\"window_title\":\"cheng_gui_preview\","
+    doc = doc + "\"route_state\":" + nativeGuiRuntimeJsonQuote(routeState) + ","
+    doc = doc + "\"entry_module\":" + nativeGuiRuntimeJsonQuote(entryModule) + ","
+    doc = doc + "\"host_abi_first_batch_ready\":true,"
+    doc = doc + "\"host_abi_feature_hits_csv\":\"local_storage,fetch,custom_event,resize_observer\","
+    doc = doc + "\"host_abi_missing_features_csv\":\"\","
+    doc = doc + "\"storage_host_ready\":true,"
+    doc = doc + "\"fetch_host_ready\":true,"
+    doc = doc + "\"custom_event_host_ready\":true,"
+    doc = doc + "\"resize_observer_host_ready\":true,"
+    doc = doc + "\"runtime_manifest_ready\":false,"
+    doc = doc + "\"runtime_contract_payload_ready\":true,"
+    doc = doc + "\"runtime_bundle_payload_ready\":true,"
+    doc = doc + "\"runtime_bundle_ready\":true,"
+    doc = doc + "\"runtime_contract_ready\":true,"
+    doc = doc + "\"bundle_route_state\":" + nativeGuiRuntimeJsonQuote(routeState) + ","
+    doc = doc + "\"bundle_route_count\":" + intToStr(routeCount) + ","
+    doc = doc + "\"bundle_supported_count\":" + intToStr(supportedCount) + ","
+    doc = doc + "\"bundle_semantic_nodes_count\":" + intToStr(semanticCount) + ","
+    doc = doc + "\"bundle_layout_item_count\":" + intToStr(itemCount) + ","
+    doc = doc + "\"bundle_render_command_count\":2,"
+    doc = doc + "\"contract_layout_item_count\":" + intToStr(itemCount) + ","
+    doc = doc + "\"contract_viewport_item_count\":" + intToStr(viewportCount) + ","
+    doc = doc + "\"contract_interactive_item_count\":" + intToStr(interactiveCount) + ","
+    doc = doc + "\"window_width\":" + intToStr(windowWidth) + ","
+    doc = doc + "\"window_height\":" + intToStr(windowHeight) + ","
+    doc = doc + "\"content_height\":" + intToStr(contentHeight) + ","
+    doc = doc + "\"scroll_height\":" + intToStr(scrollHeight) + ","
+    doc = doc + "\"scroll_offset_y\":" + intToStr(scrollOffsetY) + ","
+    doc = doc + "\"click_count\":" + intToStr(clickCount) + ","
+    doc = doc + "\"resize_count\":" + intToStr(resizeCount) + ","
+    doc = doc + "\"scroll_count\":" + intToStr(scrollCount) + ","
+    doc = doc + "\"key_count\":" + intToStr(keyCount) + ","
+    doc = doc + "\"text_count\":" + intToStr(textCount) + ","
+    doc = doc + "\"focus_count\":" + intToStr(focusCount) + ","
+    doc = doc + "\"has_last_click\":false,"
+    doc = doc + "\"last_click_x\":0,"
+    doc = doc + "\"last_click_y\":0,"
+    doc = doc + "\"selected_item_id\":" + nativeGuiRuntimeJsonQuote(selectedItemId) + ","
+    doc = doc + "\"selected_source_node_id\":\"\","
+    doc = doc + "\"selected_source_module_path\":\"\","
+    doc = doc + "\"selected_source_component_name\":\"\","
+    doc = doc + "\"selected_source_line\":0,"
+    doc = doc + "\"selected_item_interactive\":false,"
+    doc = doc + "\"focused_item_id\":" + nativeGuiRuntimeJsonQuote(focusedItemId) + ","
+    doc = doc + "\"typed_text\":" + nativeGuiRuntimeJsonQuote(typedText) + ","
+    doc = doc + "\"last_key\":" + nativeGuiRuntimeJsonQuote(lastKey) + ","
+    doc = doc + "\"visible_layout_item_count\":" + intToStr(viewportCount) + ","
+    doc = doc + "\"selected_item\":{\"ready\":false,\"id\":\"\",\"source_node_id\":\"\",\"source_module_path\":\"\",\"source_component_name\":\"\",\"source_line\":0,\"interactive\":false,\"kind\":\"\",\"plan_role\":\"\",\"visual_role\":\"\",\"x\":0,\"y\":0,\"width\":0,\"height\":0}"
+    doc = doc + "}"
+    return doc
+
+fn nativeGuiRuntimeRenderPlanDoc(contractText: str,
+                                 stateDoc: str): str =
+    let routeState: str = nativeGuiRuntimeJsonReadStringField(contractText, "route_state", "home_default")
+    let entryModule: str = nativeGuiRuntimeJsonReadStringField(contractText, "entry_module", "")
+    let windowWidth: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "window_width", 390)
+    let windowHeight: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "window_height", 844)
+    let contentHeight: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "content_height", windowHeight)
+    let scrollHeight: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "scroll_height", 0)
+    let visibleCount: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "visible_layout_item_count", 0)
+    var doc = "{"
+    doc = doc + "\"format\":\"native_render_plan_v1\","
+    doc = doc + "\"ready\":true,"
+    doc = doc + "\"window_title\":\"cheng_gui_preview\","
+    doc = doc + "\"route_state\":" + nativeGuiRuntimeJsonQuote(routeState) + ","
+    doc = doc + "\"entry_module\":" + nativeGuiRuntimeJsonQuote(entryModule) + ","
+    doc = doc + "\"host_abi_first_batch_ready\":true,"
+    doc = doc + "\"host_abi_feature_hits_csv\":\"local_storage,fetch,custom_event,resize_observer\","
+    doc = doc + "\"host_abi_missing_features_csv\":\"\","
+    doc = doc + "\"window_width\":" + intToStr(windowWidth) + ","
+    doc = doc + "\"window_height\":" + intToStr(windowHeight) + ","
+    doc = doc + "\"content_height\":" + intToStr(contentHeight) + ","
+    doc = doc + "\"scroll_height\":" + intToStr(scrollHeight) + ","
+    doc = doc + "\"scroll_offset_y\":" + intToStr(nativeGuiRuntimeJsonReadIntField(stateDoc, "scroll_offset_y", 0)) + ","
+    doc = doc + "\"visible_layout_item_count\":" + intToStr(visibleCount) + ","
+    doc = doc + "\"selected_item_id\":\"\","
+    doc = doc + "\"focused_item_id\":\"\","
+    doc = doc + "\"typed_text\":\"\","
+    doc = doc + "\"commands\":["
+    doc = doc + "{\"type\":\"background_gradient\",\"x\":0,\"y\":0,\"width\":" + intToStr(windowWidth) + ",\"height\":" + intToStr(windowHeight) + ",\"color_top\":\"#f2f7fd\",\"color_bottom\":\"#e6eefb\",\"z_index\":0},"
+    doc = doc + "{\"type\":\"rounded_panel\",\"x\":10,\"y\":10,\"width\":" + intToStr(windowWidth - 20) + ",\"height\":" + intToStr(windowHeight - 20) + ",\"corner_radius\":24,\"background_color\":\"#ffffff\",\"shadow_color\":\"#cddaf0\",\"border_color\":\"#d5e2f0\",\"z_index\":1}"
+    doc = doc + "],\"command_count\":2}"
+    return doc
+
+fn NativeGuiRuntimeMain(): int32 =
+    let contractPath: str = cmdline.ReadFlagOrDefault("--runtime-contract", "")
+    if strings.Len(contractPath) <= 0:
+        return 2
+    let contractText: str = chengpath.ReadTextFile("", contractPath)
+    if strings.Len(contractText) <= 0:
+        return 3
+    let formatText: str = nativeGuiRuntimeJsonReadStringField(contractText, "format", "")
+    if formatText != "native_gui_runtime_contract_v1":
+        return 4
+    let stateDoc: str = nativeGuiRuntimeStateDoc(contractText)
+    let renderPlanDoc: str = nativeGuiRuntimeRenderPlanDoc(contractText, stateDoc)
+    var doc = "{"
+    doc = doc + "\"format\":\"native_gui_runtime_v1\","
+    doc = doc + "\"ready\":true,"
+    doc = doc + "\"reason\":\"ok\","
+    doc = doc + "\"state\":" + stateDoc + ","
+    doc = doc + "\"render_plan\":" + renderPlanDoc
+    doc = doc + "}"
+    echo(doc)
+    return 0

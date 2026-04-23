@@ -3,34 +3,35 @@ import std/os_host_process as hostos
 import std/strutils as strutil
 import std/strings
 
-type DrainResult = object
-    output: str
-    exitCode: int32
+type
+    DrainResult = object
+        output: str
+        exitCode: int32
 
 fn drainReadFdFill(readFd0: int32,
-                   pid: int64,
-                   out: var DrainResult) =
+                   pid: int64): DrainResult =
     var readFd: int32 = readFd0
     var output = ""
     var eof = false
     var spins: int32
     var exitCode: int32 = -1
     var waited = false
-    while !eof && spins < 200:
+    while spins < 200:
         spins = spins + 1
         let readRes: os.TextReadResult = hostos.FdReadWait(readFd, 65536, 20)
         let text: str = readRes.text
         if strings.Len(text) > 0:
             output = output + text
         eof = readRes.eof
-        if !eof:
+        if !waited:
             let waitRes: os.PtyWaitResult = hostos.PtyWait(pid)
             if waitRes.waitStatus < 0:
                 assert(false, "api wait failed")
             if waitRes.waitStatus == 1:
                 exitCode = waitRes.exitCode
                 waited = true
-                break
+        if eof && waited:
+            break
         os.SleepMs(10)
     hostos.PtyClose(readFd)
     if !waited:
@@ -46,22 +47,18 @@ fn drainReadFdFill(readFd0: int32,
                 break
             os.SleepMs(10)
     assert(waited, "api wait timeout")
-    out.output = output
-    out.exitCode = exitCode
+    return DrainResult(output: output, exitCode: exitCode)
 
 fn main(): int32 =
-    let argv: str[] = ["api-ok"]
-    var env: str[]
-    let spawnRes: os.ExecFilePipeSpawnResult = hostos.ExecFilePipeSpawn("/bin/echo", argv, env, "")
+    let spawnRes: os.ExecFilePipeSpawnResult = hostos.ExecFilePipeSpawn("/bin/echo", ["api-ok"], [], "")
     assert(spawnRes.ok, "execFilePipeSpawn ok")
     assert(spawnRes.readFd >= 0, "execFilePipeSpawn read fd")
     assert(spawnRes.writeFd >= 0, "execFilePipeSpawn write fd")
     assert(spawnRes.pid > 0, "execFilePipeSpawn pid")
     hostos.PtyClose(spawnRes.writeFd)
-    var spawnDrain: DrainResult
-    drainReadFdFill(spawnRes.readFd, spawnRes.pid, spawnDrain)
-    assert(spawnDrain.exitCode == 0, "execFilePipeSpawn exit")
+    let spawnDrain = drainReadFdFill(spawnRes.readFd, spawnRes.pid)
     assert(strutil.Strip(spawnDrain.output) == "api-ok", "execFilePipeSpawn output")
+    assert(spawnDrain.exitCode == 0, "execFilePipeSpawn exit")
 
     let pipeRes: os.PipeSpawnResult = hostos.PipeSpawn("/bin/echo pipe-ok", "")
     assert(pipeRes.ok, "pipeSpawn ok")
@@ -69,13 +66,11 @@ fn main(): int32 =
     assert(pipeRes.writeFd >= 0, "pipeSpawn write fd")
     assert(pipeRes.pid > 0, "pipeSpawn pid")
     hostos.PtyClose(pipeRes.writeFd)
-    var pipeDrain: DrainResult
-    drainReadFdFill(pipeRes.readFd, pipeRes.pid, pipeDrain)
+    let pipeDrain = drainReadFdFill(pipeRes.readFd, pipeRes.pid)
     assert(pipeDrain.exitCode == 0, "pipeSpawn exit")
     assert(strutil.Strip(pipeDrain.output) == "pipe-ok", "pipeSpawn output")
 
-    var stdinArgv: str[]
-    let stdinRes: os.ExecFilePipeSpawnResult = hostos.ExecFilePipeSpawn("/bin/cat", stdinArgv, env, "")
+    let stdinRes: os.ExecFilePipeSpawnResult = hostos.ExecFilePipeSpawn("/bin/cat", [], [], "")
     assert(stdinRes.ok, "execFilePipeSpawn stdin ok")
     assert(stdinRes.readFd >= 0, "execFilePipeSpawn stdin read fd")
     assert(stdinRes.writeFd >= 0, "execFilePipeSpawn stdin write fd")
@@ -84,20 +79,20 @@ fn main(): int32 =
     let wrote: int32 = hostos.PtyWrite(stdinRes.writeFd, stdinText)
     assert(wrote == len(stdinText), "execFilePipeSpawn stdin write")
     hostos.PtyClose(stdinRes.writeFd)
-    var stdinDrain: DrainResult
-    drainReadFdFill(stdinRes.readFd, stdinRes.pid, stdinDrain)
+    let stdinDrain = drainReadFdFill(stdinRes.readFd, stdinRes.pid)
     assert(stdinDrain.exitCode == 0, "execFilePipeSpawn stdin exit")
     assert(stdinDrain.output == stdinText, "execFilePipeSpawn stdin output")
 
-    let stderrArgv: str[] = ["-c", "printf stderr-ok >&2"]
-    let stderrRes: os.ExecFilePipeSpawnResult = hostos.ExecFilePipeSpawn("/bin/sh", stderrArgv, env, "")
+    let stderrRes: os.ExecFilePipeSpawnResult = hostos.ExecFilePipeSpawn("/bin/sh",
+                                                                         ["-c", "printf stderr-ok >&2"],
+                                                                         [],
+                                                                         "")
     assert(stderrRes.ok, "execFilePipeSpawn stderr ok")
     assert(stderrRes.readFd >= 0, "execFilePipeSpawn stderr read fd")
     assert(stderrRes.writeFd >= 0, "execFilePipeSpawn stderr write fd")
     assert(stderrRes.pid > 0, "execFilePipeSpawn stderr pid")
     hostos.PtyClose(stderrRes.writeFd)
-    var stderrDrain: DrainResult
-    drainReadFdFill(stderrRes.readFd, stderrRes.pid, stderrDrain)
+    let stderrDrain = drainReadFdFill(stderrRes.readFd, stderrRes.pid)
     assert(stderrDrain.exitCode == 0, "execFilePipeSpawn stderr exit")
     assert(strutil.Strip(stderrDrain.output) == "stderr-ok", "execFilePipeSpawn stderr output")
 

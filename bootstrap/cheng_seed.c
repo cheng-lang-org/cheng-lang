@@ -212,6 +212,8 @@ static const char *ChengSeed_REMOVED_KEYS_V2[] = {
     "tooling_debug_tools_gate_source",
     "tooling_export_visibility_gate_source",
     "tooling_host_bridge_audit_gate_source",
+    "tooling_wasm_binary_audit_source",
+    "tooling_wasm_smoke_gate_source",
     "backend_build_plan_source",
     "ordinary_command",
     "ordinary_pipeline_state",
@@ -249,6 +251,8 @@ static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "tooling_debug_tools_gate_source",
     "tooling_export_visibility_gate_source",
     "tooling_host_bridge_audit_gate_source",
+    "tooling_wasm_binary_audit_source",
+    "tooling_wasm_smoke_gate_source",
     "backend_build_plan_source"
 };
 
@@ -1651,6 +1655,8 @@ typedef struct {
     char tooling_debug_tools_gate_source[PATH_MAX];
     char tooling_export_visibility_gate_source[PATH_MAX];
     char tooling_host_bridge_audit_gate_source[PATH_MAX];
+    char tooling_wasm_binary_audit_source[PATH_MAX];
+    char tooling_wasm_smoke_gate_source[PATH_MAX];
     char std_os_host_process_source[PATH_MAX];
     char std_os_source[PATH_MAX];
     char backend_build_plan_source[PATH_MAX];
@@ -1803,6 +1809,8 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->tooling_debug_tools_gate_source, sizeof(paths->tooling_debug_tools_gate_source), paths->root, "src/core/tooling/debug_tools_gate.cheng");
     cheng_seed_join_path(paths->tooling_export_visibility_gate_source, sizeof(paths->tooling_export_visibility_gate_source), paths->root, "src/core/tooling/export_visibility_gate.cheng");
     cheng_seed_join_path(paths->tooling_host_bridge_audit_gate_source, sizeof(paths->tooling_host_bridge_audit_gate_source), paths->root, "src/core/tooling/host_bridge_audit_gate.cheng");
+    cheng_seed_join_path(paths->tooling_wasm_binary_audit_source, sizeof(paths->tooling_wasm_binary_audit_source), paths->root, "src/core/tooling/wasm_binary_audit.cheng");
+    cheng_seed_join_path(paths->tooling_wasm_smoke_gate_source, sizeof(paths->tooling_wasm_smoke_gate_source), paths->root, "src/core/tooling/wasm_smoke_gate.cheng");
     cheng_seed_join_path(paths->std_os_host_process_source, sizeof(paths->std_os_host_process_source), paths->root, "src/std/os_host_process.cheng");
     cheng_seed_join_path(paths->std_os_source, sizeof(paths->std_os_source), paths->root, "src/std/os.cheng");
     cheng_seed_join_path(paths->backend_build_plan_source, sizeof(paths->backend_build_plan_source), paths->root, "src/core/backend/build_plan.cheng");
@@ -1999,7 +2007,7 @@ static bool cheng_seed_bootstrap_artifacts_fresh(const ChengSeedBootstrapPaths *
 }
 
 static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths) {
-    const char *inputs[39];
+    const char *inputs[41];
     char map_path[PATH_MAX];
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
@@ -2051,10 +2059,12 @@ static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths
     inputs[34] = paths->tooling_debug_tools_gate_source;
     inputs[35] = paths->tooling_export_visibility_gate_source;
     inputs[36] = paths->tooling_host_bridge_audit_gate_source;
-    inputs[37] = paths->std_os_host_process_source;
-    inputs[38] = paths->std_os_source;
-    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 39U) &&
-           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 39U);
+    inputs[37] = paths->tooling_wasm_binary_audit_source;
+    inputs[38] = paths->tooling_wasm_smoke_gate_source;
+    inputs[39] = paths->std_os_host_process_source;
+    inputs[40] = paths->std_os_source;
+    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 41U) &&
+           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 41U);
 }
 
 static int cheng_seed_cmd_bootstrap_bridge(int argc, char **argv);
@@ -3065,7 +3075,7 @@ static const char *cheng_seed_flag_value(int argc, char **argv, const char *flag
 #define CHENG_MAX_ASM_LOCALS 1024
 #define CHENG_MAX_TYPE_TEXT 512
 #define CHENG_MAX_DEFAULT_EXPR 4096
-#define CHENG_PROVIDER_OBJECT_CACHE_VERSION "provider-object-cache-v4"
+#define CHENG_PROVIDER_OBJECT_CACHE_VERSION "provider-object-cache-v5"
 #define CHENG_PRIMARY_OBJECT_CACHE_VERSION "primary-object-cache-v1"
 
 typedef struct {
@@ -5405,6 +5415,7 @@ static bool cheng_seed_parse_call_text_parts(const char *text,
             paren_depth -= 1;
             if (paren_depth == 0) {
                 close_paren = trimmed + i;
+                break;
             }
             continue;
         }
@@ -5412,8 +5423,10 @@ static bool cheng_seed_parse_call_text_parts(const char *text,
     if (!open_paren || !close_paren || close_paren <= open_paren || paren_depth != 0 || bracket_depth != 0) {
         return false;
     }
-    if (trimmed[strlen(trimmed) - 1U] != ')') {
-        return false;
+    for (i = (size_t)(close_paren - trimmed) + 1U; trimmed[i] != '\0'; ++i) {
+        if (!isspace((unsigned char)trimmed[i])) {
+            return false;
+        }
     }
     snprintf(callee, callee_cap, "%.*s", (int)(open_paren - trimmed), trimmed);
     cheng_seed_trim_copy_text(callee, callee, callee_cap);
@@ -62817,7 +62830,7 @@ static char *cheng_seed_system_link_plan_report(const ChengSeedBootstrapContract
     cheng_seed_report_append(&out, &cap, &used, "parser_source_kind=ordinary_cheng_source");
     snprintf(line, sizeof(line), "build_entry=%s", compiler_entry);
     cheng_seed_report_append(&out, &cap, &used, line);
-    cheng_seed_report_append(&out, &cap, &used, "build_source_unit_count=25");
+    cheng_seed_report_append(&out, &cap, &used, "build_source_unit_count=29");
     cheng_seed_report_append(&out, &cap, &used, "link_mode=system_link");
     cheng_seed_report_append(&out, &cap, &used, "pipeline_stage=parser_to_system_link_plan");
     return out;
@@ -63315,6 +63328,8 @@ static int cheng_seed_cmd_print_build_plan(int argc, char **argv) {
         "tooling_debug_tools_gate_source",
         "tooling_export_visibility_gate_source",
         "tooling_host_bridge_audit_gate_source",
+        "tooling_wasm_binary_audit_source",
+        "tooling_wasm_smoke_gate_source",
         "backend_build_plan_source"
     };
     const char *labels[] = {
@@ -63343,6 +63358,8 @@ static int cheng_seed_cmd_print_build_plan(int argc, char **argv) {
         "tooling_source",
         "tooling_source",
         "tooling_source",
+        "tooling_source",
+        "tooling_source",
         "tooling_source"
     };
     const char *manual_paths[] = {
@@ -63355,6 +63372,8 @@ static int cheng_seed_cmd_print_build_plan(int argc, char **argv) {
         "src/core/tooling/compiler_world_libp2p.cheng",
         "src/core/tooling/compiler_equivalence.cheng",
         "src/core/tooling/compiler_publish_gate.cheng",
+        NULL,
+        NULL,
         NULL,
         NULL,
         NULL,

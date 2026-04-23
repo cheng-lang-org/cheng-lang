@@ -1,0 +1,359 @@
+import std/os
+import std/result
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+import cheng/core/tooling/wasm_binary_audit as wasmaudit
+
+fn WasmSmokePrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn WasmSmokePrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn WasmSmokeReadFlag(args: str[], key: str, defaultValue: str): str =
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if strutil.StartsWith(arg, key + ":"):
+            return strings.DropPrefix(arg, key + ":")
+        if strutil.StartsWith(arg, key + "="):
+            return strings.DropPrefix(arg, key + "=")
+    return defaultValue
+
+fn WasmSmokeRunFailed(run: hostops.LoggedRun): bool =
+    if hostops.LoggedRunOk(run):
+        return false
+    WasmSmokePrintErr(hostops.LoggedRunSummary(run))
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        WasmSmokePrintErr(outputText)
+    return true
+
+fn WasmSmokeMaybePrintOutput(outputText: str) =
+    let stripped = strutil.Strip(outputText)
+    if len(stripped) > 0:
+        WasmSmokePrintLine(outputText)
+
+fn WasmSmokeRequireOutput(run: hostops.LoggedRun, needle: str, context: str): bool =
+    if strutil.Contains(run.output, needle):
+        return true
+    WasmSmokePrintErr(context + ": missing output: " + needle)
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        WasmSmokePrintErr(outputText)
+    return false
+
+fn WasmSmokeResolveCompiler(root: str,
+                              explicitPath: str,
+                              primaryEnvKey: str,
+                              fallbackEnvKey: str,
+                              outCompiler: var str): int32 =
+    outCompiler = strutil.Strip(explicitPath)
+    if len(outCompiler) <= 0 && len(primaryEnvKey) > 0:
+        outCompiler = strutil.Strip(os.GetEnvDefault(primaryEnvKey, ""))
+    if len(outCompiler) <= 0 && len(fallbackEnvKey) > 0:
+        outCompiler = strutil.Strip(os.GetEnvDefault(fallbackEnvKey, ""))
+    if len(outCompiler) <= 0:
+        outCompiler = "artifacts/backend_driver/cheng"
+    outCompiler = chengpath.PathAbsolute(root, outCompiler)
+    if os.FileExists(outCompiler):
+        return 0
+    WasmSmokePrintErr(" wasm smoke: missing compiler: " + outCompiler)
+    return 1
+
+fn WasmSmokeResolveLabel(args: str[], envKey: str, defaultLabel: str): str =
+    let explicit = strutil.Strip(WasmSmokeReadFlag(args, "--label", ""))
+    if len(explicit) > 0:
+        return explicit
+    let keyed = strutil.Strip(os.GetEnvDefault(envKey, ""))
+    if len(keyed) > 0:
+        return keyed
+    let shared = strutil.Strip(os.GetEnvDefault("CHENG_SMOKE_LABEL", ""))
+    if len(shared) > 0:
+        return shared
+    return defaultLabel
+
+fn WasmSmokeCompileEmit(root: str,
+                          label: str,
+                          compilerPath: str,
+                          sourcePath: str,
+                          emitKind: str,
+                          outPath: str,
+                          target: str,
+                          logRelPath: str,
+                          envOverrides: str[]): hostops.LoggedRun =
+    let outParts: os.SplitFileResult = os.SplitFile(outPath)
+    if len(outParts.dir) > 0:
+        let _ = chengpath.MkdirP(root, outParts.dir)
+    let logAbs = chengpath.PathAbsolute(root, logRelPath)
+    let logParts: os.SplitFileResult = os.SplitFile(logAbs)
+    if len(logParts.dir) > 0:
+        let _ = chengpath.MkdirP(root, logParts.dir)
+    let timeoutSec = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_COMPILE_TIMEOUT_SEC", "300")))
+    let run = hostops.RunFileLogged(root,
+                                      label,
+                                      compilerPath,
+                                      [
+                                          "system-link-exec",
+                                          "--root", root,
+                                          "--in", sourcePath,
+                                          "--emit", emitKind,
+                                          "--target", target,
+                                          "--out", outPath
+                                      ],
+                                      envOverrides,
+                                      root,
+                                      timeoutSec,
+                                      logRelPath)
+    if hostops.LoggedRunOk(run) && !os.FileExists(outPath):
+        let outputText = run.output + " wasm smoke: compile missing output: " + outPath + "\n"
+        let _logged = chengpath.WriteTextFile(root, logAbs, outputText)
+        return hostops.LoggedRunZero(label, compilerPath, logAbs, 1, outputText)
+    return run
+
+fn WasmSmokeCompileExe(root: str,
+                         label: str,
+                         compilerPath: str,
+                         sourcePath: str,
+                         outPath: str,
+                         target: str,
+                         logRelPath: str,
+                         envOverrides: str[]): hostops.LoggedRun =
+    return WasmSmokeCompileEmit(root,
+                                  label,
+                                  compilerPath,
+                                  sourcePath,
+                                  "exe",
+                                  outPath,
+                                  target,
+                                  logRelPath,
+                                  envOverrides)
+
+fn WasmSmokeRequireWasmAudit(label: str,
+                               wasmPath: str,
+                               expectedExports: str[],
+                               expectedImports: str[],
+                               minExportCount: int32): bool =
+    let infoRes = wasmaudit.WasmBinaryInspect(wasmPath)
+    if IsErr(infoRes):
+        WasmSmokePrintErr(label + ": " + Error(infoRes))
+        return false
+    let info = Value(infoRes)
+    if info.exportNames.len < minExportCount:
+        WasmSmokePrintErr(label + ": wasm export count too small: " + strings.IntToStr(info.exportNames.len))
+        return false
+    for i in 0..<expectedExports.len:
+        if !wasmaudit.WasmBinaryHasExport(info, expectedExports[i]):
+            WasmSmokePrintErr(label + ": missing wasm export: " + expectedExports[i])
+            return false
+    for i in 0..<expectedImports.len:
+        if !wasmaudit.WasmBinaryHasImport(info, expectedImports[i]):
+            WasmSmokePrintErr(label + ": missing wasm import: " + expectedImports[i])
+            return false
+    return true
+
+fn WasmSmokeHostTarget(root: str): str =
+    let unameS = os.ExecCmdEx("uname -s", uint64(1), root)
+    let unameM = os.ExecCmdEx("uname -m", uint64(1), root)
+    let hostOs = strutil.Strip(unameS.output)
+    let hostArch = strutil.Strip(unameM.output)
+    if hostOs == "Darwin" && hostArch == "arm64":
+        return "arm64-apple-darwin"
+    if hostOs == "Linux" && hostArch == "x86_64":
+        return "x86_64-unknown-linux-gnu"
+    if hostOs == "Linux" && (hostArch == "aarch64" || hostArch == "arm64"):
+        return "aarch64-unknown-linux-gnu"
+    return ""
+
+fn WasmSmokeRunBrowserHostWasm(root: str,
+                                 compilerPath: str,
+                                 label: str,
+                                 envOverrides: str[]): int32 =
+    let outDir = chengpath.PathAbsolute(root, "artifacts/browser_host_wasm")
+    let src = chengpath.PathAbsolute(root, "src/libp2p/browser/browser_host_wasm_surface_probe.cheng")
+    let outWasm = os.JoinPath(outDir, "cheng_browser_host_abi." + label + ".wasm")
+    let compileRun = WasmSmokeCompileEmit(root,
+                                           " browser host wasm compile " + label,
+                                           compilerPath,
+                                           src,
+                                           "shared",
+                                           outWasm,
+                                           "wasm32-unknown-unknown",
+                                           os.JoinPath(outDir, "cheng_browser_host_abi." + label + ".compile.log"),
+                                           envOverrides)
+    if WasmSmokeRunFailed(compileRun):
+        return compileRun.exitCode
+    var expectedExports: str[]
+    add(expectedExports, "main")
+    add(expectedExports, "browserNowMs")
+    add(expectedExports, "browserEchoI32")
+    add(expectedExports, "browserPeerHandle")
+    add(expectedExports, "browserDistributedVideoBuild")
+    add(expectedExports, "browserDistributedVideoRebuild")
+    add(expectedExports, "browserMoqFountainBuild")
+    add(expectedExports, "browserMoqFountainBuildBytes")
+    add(expectedExports, "browserMoqFountainRebuild")
+    add(expectedExports, "browserMoqBuildLongBlobComputedBundleCidLenProbe")
+    add(expectedExports, "browserMoqPeerCsvCountProbe")
+    var expectedImports: str[]
+    add(expectedImports, "env.cheng_browser_now_ms_bridge")
+    add(expectedImports, "env.cheng_browser_echo_i32_bridge")
+    add(expectedImports, "env.cheng_browser_peer_handle_bridge")
+    add(expectedImports, "env.cheng_browser_did_handle_bridge")
+    add(expectedImports, "env.cheng_browser_dm_active_count_bridge")
+    add(expectedImports, "env.cheng_browser_dm_connect_start_bridge")
+    add(expectedImports, "env.cheng_browser_dm_wait_start_bridge")
+    add(expectedImports, "env.cheng_browser_dm_send_start_bridge")
+    add(expectedImports, "env.cheng_browser_distributed_video_build_bridge")
+    add(expectedImports, "env.cheng_browser_distributed_video_rebuild_bridge")
+    add(expectedImports, "env.cheng_browser_distributed_video_last_error_handle_bridge")
+    add(expectedImports, "env.cheng_browser_input_len_bridge")
+    add(expectedImports, "env.cheng_browser_input_copy_bridge")
+    add(expectedImports, "env.cheng_browser_buffer_handle_from_raw_bridge")
+    add(expectedImports, "env.cheng_browser_buffer_handle_from_text_bridge")
+    add(expectedImports, "env.cheng_browser_buffer_handle_len_bridge")
+    add(expectedImports, "env.cheng_browser_buffer_handle_byte_bridge")
+    add(expectedImports, "env.cheng_browser_buffer_handle_release_bridge")
+    add(expectedImports, "env.cheng_browser_moq_fountain_last_error_store_bridge")
+    add(expectedImports, "env.cheng_browser_moq_fountain_last_error_handle_bridge")
+    if !WasmSmokeRequireWasmAudit(" browser host wasm audit",
+                                   outWasm,
+                                   expectedExports,
+                                   expectedImports,
+                                   expectedExports.len):
+        return 1
+    let hostTarget = WasmSmokeHostTarget(root)
+    if len(hostTarget) <= 0:
+        WasmSmokePrintErr(" browser host wasm smoke: unsupported host target")
+        return 1
+    let hostSrc = chengpath.PathAbsolute(root, "src/tests/browser_host_native_runtime_smoke.cheng")
+    let hostBin = os.JoinPath(outDir, "browser_host_native_runtime_smoke." + label)
+    let hostCompile = WasmSmokeCompileExe(root,
+                                           " browser host native compile " + label,
+                                           compilerPath,
+                                           hostSrc,
+                                           hostBin,
+                                           hostTarget,
+                                           os.JoinPath(outDir, "browser_host_native_runtime_smoke." + label + ".compile.log"),
+                                           envOverrides)
+    if WasmSmokeRunFailed(hostCompile):
+        return hostCompile.exitCode
+    let run = hostops.RunFileLogged(root,
+                                      " browser host wasm smoke run " + label,
+                                      hostBin,
+                                      [],
+                                      [],
+                                      root,
+                                      0,
+                                      os.JoinPath(outDir, "browser_host_wasm." + label + ".run.log"))
+    WasmSmokeMaybePrintOutput(run.output)
+    if WasmSmokeRunFailed(run):
+        return run.exitCode
+    if !WasmSmokeRequireOutput(run, " browser host wasm smoke: ok", " browser host wasm smoke"):
+        return 1
+    return 0
+
+fn WasmSmokeRunBrowserHostWasmCommand(root: str, args: str[]): int32 =
+    let explicitCompiler = WasmSmokeReadFlag(args, "--compiler", "")
+    var compiler = ""
+    if WasmSmokeResolveCompiler(root, explicitCompiler, "CHENG_WASM_COMPILER", "CHENG_SMOKE_COMPILER", compiler) != 0:
+        return 1
+    let label = WasmSmokeResolveLabel(args, "CHENG_WASM_LABEL", "host")
+    return WasmSmokeRunBrowserHostWasm(root, compiler, label, [])
+
+fn WasmSmokeRunWasmSmokes(root: str,
+                            compilerPath: str,
+                            label: str,
+                            envOverrides: str[]): int32 =
+    let outDir = chengpath.PathAbsolute(root, "artifacts/wasm_smokes")
+    let names: str[] = [
+        "wasm_zero_smoke",
+        "wasm_internal_call_smoke",
+        "wasm_importc_noarg_i32_smoke",
+        "wasm_shadowed_local_scope_smoke",
+        "wasm_composite_field_smoke"
+    ]
+    for i in 0..<names.len:
+        let smokeName = names[i]
+        let src = chengpath.PathAbsolute(root, "src/tests/" + smokeName + ".cheng")
+        let outWasm = os.JoinPath(outDir, smokeName + "." + label + ".wasm")
+        let compileRun = WasmSmokeCompileExe(root,
+                                              " wasm smokes compile " + smokeName + " " + label,
+                                              compilerPath,
+                                              src,
+                                              outWasm,
+                                              "wasm32-unknown-unknown",
+                                              os.JoinPath(outDir, smokeName + "." + label + ".compile.log"),
+                                              envOverrides)
+        if WasmSmokeRunFailed(compileRun):
+            return compileRun.exitCode
+    var expectedExports: str[]
+    add(expectedExports, "main")
+    if !WasmSmokeRequireWasmAudit(" wasm audit zero", os.JoinPath(outDir, "wasm_zero_smoke." + label + ".wasm"), expectedExports, [], 1):
+        return 1
+    if !WasmSmokeRequireWasmAudit(" wasm audit internal", os.JoinPath(outDir, "wasm_internal_call_smoke." + label + ".wasm"), expectedExports, [], 1):
+        return 1
+    if !WasmSmokeRequireWasmAudit(" wasm audit importc", os.JoinPath(outDir, "wasm_importc_noarg_i32_smoke." + label + ".wasm"), expectedExports, ["env.cheng_test_zero"], 1):
+        return 1
+    if !WasmSmokeRequireWasmAudit(" wasm audit shadowed", os.JoinPath(outDir, "wasm_shadowed_local_scope_smoke." + label + ".wasm"), expectedExports, [], 1):
+        return 1
+    var compositeExports: str[]
+    add(compositeExports, "main")
+    add(compositeExports, "bytesLen")
+    add(compositeExports, "textLen")
+    add(compositeExports, "seqLen")
+    add(compositeExports, "resultOk")
+    add(compositeExports, "resultValue")
+    add(compositeExports, "echoBytes")
+    add(compositeExports, "echoText")
+    add(compositeExports, "echoSeq")
+    add(compositeExports, "echoResult")
+    if !WasmSmokeRequireWasmAudit(" wasm audit composite",
+                                   os.JoinPath(outDir, "wasm_composite_field_smoke." + label + ".wasm"),
+                                   compositeExports,
+                                   [],
+                                   compositeExports.len):
+        return 1
+    let hostTarget = WasmSmokeHostTarget(root)
+    if len(hostTarget) <= 0:
+        WasmSmokePrintErr(" wasm smokes: unsupported host target")
+        return 1
+    for i in 0..<names.len:
+        let smokeName = names[i]
+        if smokeName == "wasm_importc_noarg_i32_smoke":
+            WasmSmokePrintLine(smokeName + ": ok")
+            continue
+        let hostSrc = chengpath.PathAbsolute(root, "src/tests/" + smokeName + ".cheng")
+        let hostBin = os.JoinPath(outDir, smokeName + "." + label + ".host")
+        let hostCompile = WasmSmokeCompileExe(root,
+                                               " wasm host compile " + smokeName + " " + label,
+                                               compilerPath,
+                                               hostSrc,
+                                               hostBin,
+                                               hostTarget,
+                                               os.JoinPath(outDir, smokeName + "." + label + ".host.compile.log"),
+                                               envOverrides)
+        if WasmSmokeRunFailed(hostCompile):
+            return hostCompile.exitCode
+        let run = hostops.RunFileLogged(root,
+                                          " wasm host run " + smokeName + " " + label,
+                                          hostBin,
+                                          [],
+                                          [],
+                                          root,
+                                          0,
+                                          os.JoinPath(outDir, smokeName + "." + label + ".host.run.log"))
+        if WasmSmokeRunFailed(run):
+            return run.exitCode
+        WasmSmokeMaybePrintOutput(run.output)
+    WasmSmokePrintLine(" wasm smokes: ok")
+    return 0
+
+fn WasmSmokeRunWasmSmokesCommand(root: str, args: str[]): int32 =
+    let explicitCompiler = WasmSmokeReadFlag(args, "--compiler", "")
+    var compiler = ""
+    if WasmSmokeResolveCompiler(root, explicitCompiler, "CHENG_WASM_COMPILER", "CHENG_SMOKE_COMPILER", compiler) != 0:
+        return 1
+    let label = WasmSmokeResolveLabel(args, "CHENG_WASM_LABEL", "host")
+    return WasmSmokeRunWasmSmokes(root, compiler, label, [])

@@ -28,16 +28,49 @@ type
         modelCount: int32
         doodadCount: int32
         doodadSetCount: int32
+        doodadSetDefinitionCount: int32
+        doodadPlacementCount: int32
+        doodadSetPlacementCount: int32
+        firstDoodadNameIndex: int32
+        doodadBoundsReady: bool
+        minDoodadX1000: int32
+        minDoodadY1000: int32
+        minDoodadZ1000: int32
+        maxDoodadX1000: int32
+        maxDoodadY1000: int32
+        maxDoodadZ1000: int32
         groupFileDataIDCount: int32
         firstGroupFileDataID: int32
         modelFileDataIDCount: int32
         firstModelFileDataID: int32
+
+    WmoGroupSummary =
+        header: FormatHeader
+        vertexCount: int32
+        indexCount: int32
+        batchCount: int32
+        materialInfoCount: int32
+
+    AdtTerrainSummary =
+        header: FormatHeader
+        mapChunkCount: int32
+        heightChunkCount: int32
+        heightSampleCount: int32
+        minHeight1000: int32
+        maxHeight1000: int32
 
     M2DependencySummary =
         skinFileDataIDCount: int32
         firstSkinFileDataID: int32
         textureFileDataIDCount: int32
         firstTextureFileDataID: int32
+
+    M2SkinSummary =
+        indexCount: int32
+        triangleIndexCount: int32
+        propertyCount: int32
+        submeshCount: int32
+        textureUnitCount: int32
 
     M2Header =
         version: int32
@@ -68,6 +101,12 @@ const
     m2TextureCountOffset = 0x50
     m2ClassicHeaderBytes = 0x54
     m2VertexStride = 48
+    adtMcnkHeaderBytes = 128
+    adtMcnkBaseZOffset = 112
+    adtHeightSamplesPerChunk = 145
+    adtMcvTByteCount = 580
+    wmoDoodadSetStride = 32
+    wmoDoodadPlacementStride = 40
 
 fn m2HasMagic(buf: bytes.ByteBuffer,
               start: int32,
@@ -335,10 +374,230 @@ fn ParseWmoRootSummary(buf: bytes.ByteBuffer): Result[WmoRootSummary] =
                         out.firstModelFileDataID = fileDataID
                     out.modelFileDataIDCount = out.modelFileDataIDCount + 1
                 i = i + 1
+        elif magic == "SDOM":
+            if (size % wmoDoodadSetStride) != 0:
+                return Err[WmoRootSummary]("wowExport WMO: MODS chunk size invalid")
+            out.doodadSetDefinitionCount = size / wmoDoodadSetStride
+            var i: int32
+            while i < out.doodadSetDefinitionCount:
+                let entryPos: int32 = dataPos + i * wmoDoodadSetStride
+                let firstIndex: int32 = bytes.ReadU32LEAt(buf, entryPos + 20)
+                let count: int32 = bytes.ReadU32LEAt(buf, entryPos + 24)
+                if firstIndex < 0 || count < 0:
+                    return Err[WmoRootSummary]("wowExport WMO: MODS negative range")
+                out.doodadSetPlacementCount = out.doodadSetPlacementCount + count
+                i = i + 1
+        elif magic == "DDOM":
+            if (size % wmoDoodadPlacementStride) != 0:
+                return Err[WmoRootSummary]("wowExport WMO: MODD chunk size invalid")
+            out.doodadPlacementCount = size / wmoDoodadPlacementStride
+            var i: int32
+            while i < out.doodadPlacementCount:
+                let entryPos: int32 = dataPos + i * wmoDoodadPlacementStride
+                let nameIndex: int32 = bytes.ReadU32LEAt(buf, entryPos)
+                let x: int32 = m2F32Scaled1000At(buf, entryPos + 4)
+                let y: int32 = m2F32Scaled1000At(buf, entryPos + 8)
+                let z: int32 = m2F32Scaled1000At(buf, entryPos + 12)
+                if i == 0:
+                    out.firstDoodadNameIndex = nameIndex
+                    out.doodadBoundsReady = true
+                    out.minDoodadX1000 = x
+                    out.maxDoodadX1000 = x
+                    out.minDoodadY1000 = y
+                    out.maxDoodadY1000 = y
+                    out.minDoodadZ1000 = z
+                    out.maxDoodadZ1000 = z
+                else:
+                    if x < out.minDoodadX1000: out.minDoodadX1000 = x
+                    if x > out.maxDoodadX1000: out.maxDoodadX1000 = x
+                    if y < out.minDoodadY1000: out.minDoodadY1000 = y
+                    if y > out.maxDoodadY1000: out.maxDoodadY1000 = y
+                    if z < out.minDoodadZ1000: out.minDoodadZ1000 = z
+                    if z > out.maxDoodadZ1000: out.maxDoodadZ1000 = z
+                i = i + 1
         pos = dataPos + size
     if out.groupCount <= 0:
         return Err[WmoRootSummary]("wowExport WMO: MOHD group count missing")
+    if out.doodadSetDefinitionCount > 0 && out.doodadSetPlacementCount != out.doodadPlacementCount:
+        return Err[WmoRootSummary]("wowExport WMO: doodad set placement count mismatch")
     return Ok[WmoRootSummary](out)
+
+fn wmoGroupApplyChunk(magic: str,
+                      size: int32,
+                      summary: var WmoGroupSummary): Result[bool] =
+    if magic == "TVOM":
+        if (size % 12) != 0:
+            return Err[bool]("wowExport WMO group: MOVT chunk size invalid")
+        summary.vertexCount = size / 12
+    elif magic == "IVOM":
+        if (size % 2) != 0:
+            return Err[bool]("wowExport WMO group: MOVI chunk size invalid")
+        summary.indexCount = size / 2
+    elif magic == "ABOM":
+        if (size % 24) != 0:
+            return Err[bool]("wowExport WMO group: MOBA chunk size invalid")
+        summary.batchCount = size / 24
+    elif magic == "YPOM":
+        if (size % 2) != 0:
+            return Err[bool]("wowExport WMO group: MOPY chunk size invalid")
+        summary.materialInfoCount = size / 2
+    return Ok[bool](true)
+
+fn wmoGroupParseNestedChunks(buf: bytes.ByteBuffer,
+                             start: int32,
+                             end: int32,
+                             summary: var WmoGroupSummary): Result[bool] =
+    if start < 0 || end < start || end > buf.len:
+        return Err[bool]("wowExport WMO group: nested range out of bounds")
+    var pos: int32 = start
+    while pos < end:
+        if pos + 8 > end:
+            return Err[bool]("wowExport WMO group: truncated nested chunk")
+        let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+        if IsErr(magicRes):
+            return Err[bool](Error(magicRes))
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > end:
+            return Err[bool]("wowExport WMO group: nested chunk out of bounds")
+        let applyRes: Result[bool] = wmoGroupApplyChunk(Value(magicRes), size, summary)
+        if IsErr(applyRes):
+            return Err[bool](Error(applyRes))
+        pos = dataPos + size
+    return Ok[bool](true)
+
+fn ParseWmoGroupSummary(buf: bytes.ByteBuffer): Result[WmoGroupSummary] =
+    let headerRes: Result[FormatHeader] = ParseChunkedHeader(buf, "WMO group")
+    if IsErr(headerRes):
+        return Err[WmoGroupSummary](Error(headerRes))
+    var out: WmoGroupSummary
+    out.header = Value(headerRes)
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[WmoGroupSummary]("wowExport WMO group: truncated chunk")
+        let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+        if IsErr(magicRes):
+            return Err[WmoGroupSummary](Error(magicRes))
+        let magic: str = Value(magicRes)
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[WmoGroupSummary]("wowExport WMO group: chunk out of bounds")
+        if magic == "PGOM":
+            if size < 68:
+                return Err[WmoGroupSummary]("wowExport WMO group: MOGP header too small")
+            let nestedRes: Result[bool] =
+                wmoGroupParseNestedChunks(buf, dataPos + 68, dataPos + size, out)
+            if IsErr(nestedRes):
+                return Err[WmoGroupSummary](Error(nestedRes))
+        else:
+            let applyRes: Result[bool] = wmoGroupApplyChunk(magic, size, out)
+            if IsErr(applyRes):
+                return Err[WmoGroupSummary](Error(applyRes))
+        pos = dataPos + size
+    if out.vertexCount <= 0:
+        return Err[WmoGroupSummary]("wowExport WMO group: MOVT vertex data missing")
+    if out.indexCount <= 0:
+        return Err[WmoGroupSummary]("wowExport WMO group: MOVI index data missing")
+    return Ok[WmoGroupSummary](out)
+
+fn adtApplyHeightSample(summary: var AdtTerrainSummary, height1000: int32) =
+    if summary.heightSampleCount == 0:
+        summary.minHeight1000 = height1000
+        summary.maxHeight1000 = height1000
+    else:
+        if height1000 < summary.minHeight1000: summary.minHeight1000 = height1000
+        if height1000 > summary.maxHeight1000: summary.maxHeight1000 = height1000
+    summary.heightSampleCount = summary.heightSampleCount + 1
+
+fn adtParseMcvT(buf: bytes.ByteBuffer,
+                start: int32,
+                size: int32,
+                baseZ1000: int32,
+                summary: var AdtTerrainSummary): Result[bool] =
+    if size != adtMcvTByteCount:
+        return Err[bool]("wowExport ADT: MCVT height chunk size invalid")
+    if start < 0 || start + size > buf.len:
+        return Err[bool]("wowExport ADT: MCVT height chunk out of bounds")
+    var i: int32
+    while i < adtHeightSamplesPerChunk:
+        let sample1000: int32 = baseZ1000 + m2F32Scaled1000At(buf, start + i * 4)
+        adtApplyHeightSample(summary, sample1000)
+        i = i + 1
+    return Ok[bool](true)
+
+fn adtParseMcnkNestedChunks(buf: bytes.ByteBuffer,
+                            start: int32,
+                            end: int32,
+                            baseZ1000: int32,
+                            summary: var AdtTerrainSummary): Result[bool] =
+    if start < 0 || end < start || end > buf.len:
+        return Err[bool]("wowExport ADT: MCNK nested range out of bounds")
+    var foundHeight: bool
+    var pos: int32 = start
+    while pos < end:
+        if pos + 8 > end:
+            return Err[bool]("wowExport ADT: truncated MCNK nested chunk")
+        let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+        if IsErr(magicRes):
+            return Err[bool](Error(magicRes))
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > end:
+            return Err[bool]("wowExport ADT: MCNK nested chunk out of bounds")
+        if Value(magicRes) == "TVCM":
+            if foundHeight:
+                return Err[bool]("wowExport ADT: duplicate MCVT height chunk")
+            let heightRes: Result[bool] = adtParseMcvT(buf, dataPos, size, baseZ1000, summary)
+            if IsErr(heightRes):
+                return Err[bool](Error(heightRes))
+            summary.heightChunkCount = summary.heightChunkCount + 1
+            foundHeight = true
+        pos = dataPos + size
+    if !foundHeight:
+        return Err[bool]("wowExport ADT: MCNK missing MCVT height chunk")
+    return Ok[bool](true)
+
+fn ParseAdtTerrainSummary(buf: bytes.ByteBuffer): Result[AdtTerrainSummary] =
+    let headerRes: Result[FormatHeader] = ParseChunkedHeader(buf, "ADT")
+    if IsErr(headerRes):
+        return Err[AdtTerrainSummary](Error(headerRes))
+    var out: AdtTerrainSummary
+    out.header = Value(headerRes)
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[AdtTerrainSummary]("wowExport ADT: truncated chunk")
+        let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+        if IsErr(magicRes):
+            return Err[AdtTerrainSummary](Error(magicRes))
+        let magic: str = Value(magicRes)
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[AdtTerrainSummary]("wowExport ADT: chunk out of bounds")
+        if magic == "KNCM":
+            if size < adtMcnkHeaderBytes:
+                return Err[AdtTerrainSummary]("wowExport ADT: MCNK header too small")
+            out.mapChunkCount = out.mapChunkCount + 1
+            let baseZ1000: int32 = m2F32Scaled1000At(buf, dataPos + adtMcnkBaseZOffset)
+            let nestedRes: Result[bool] =
+                adtParseMcnkNestedChunks(buf,
+                                         dataPos + adtMcnkHeaderBytes,
+                                         dataPos + size,
+                                         baseZ1000,
+                                         out)
+            if IsErr(nestedRes):
+                return Err[AdtTerrainSummary](Error(nestedRes))
+        pos = dataPos + size
+    if out.mapChunkCount <= 0:
+        return Err[AdtTerrainSummary]("wowExport ADT: MCNK chunks missing")
+    if out.heightChunkCount != out.mapChunkCount:
+        return Err[AdtTerrainSummary]("wowExport ADT: height chunk count mismatch")
+    if out.heightSampleCount != out.heightChunkCount * adtHeightSamplesPerChunk:
+        return Err[AdtTerrainSummary]("wowExport ADT: height sample count mismatch")
+    return Ok[AdtTerrainSummary](out)
 
 fn ParseM2DependencySummary(buf: bytes.ByteBuffer): Result[M2DependencySummary] =
     if buf.len < 8:
@@ -378,6 +637,43 @@ fn ParseM2DependencySummary(buf: bytes.ByteBuffer): Result[M2DependencySummary] 
         return Err[M2DependencySummary]("wowExport M2 deps: no dependency chunks found")
     return Ok[M2DependencySummary](out)
 
+fn m2SkinRangeValid(offset: int32, count: int32, stride: int32, len: int32): bool =
+    if offset < 0 || count < 0 || stride <= 0:
+        return false
+    if offset > len:
+        return false
+    return offset + count * stride <= len
+
+fn ParseM2SkinSummary(buf: bytes.ByteBuffer): Result[M2SkinSummary] =
+    if buf.len < 44:
+        return Err[M2SkinSummary]("wowExport M2 skin: header too small")
+    if !m2HasMagic(buf, 0, int32('S'), int32('K'), int32('I'), int32('N')):
+        return Err[M2SkinSummary]("wowExport M2 skin: invalid magic")
+    var out: M2SkinSummary
+    out.indexCount = bytes.ReadU32LEAt(buf, 4)
+    let indexOffset: int32 = bytes.ReadU32LEAt(buf, 8)
+    out.triangleIndexCount = bytes.ReadU32LEAt(buf, 12)
+    let triangleOffset: int32 = bytes.ReadU32LEAt(buf, 16)
+    out.propertyCount = bytes.ReadU32LEAt(buf, 20)
+    let propertyOffset: int32 = bytes.ReadU32LEAt(buf, 24)
+    out.submeshCount = bytes.ReadU32LEAt(buf, 28)
+    let submeshOffset: int32 = bytes.ReadU32LEAt(buf, 32)
+    out.textureUnitCount = bytes.ReadU32LEAt(buf, 36)
+    let textureUnitOffset: int32 = bytes.ReadU32LEAt(buf, 40)
+    if out.indexCount <= 0 || out.triangleIndexCount <= 0:
+        return Err[M2SkinSummary]("wowExport M2 skin: empty index data")
+    if !m2SkinRangeValid(indexOffset, out.indexCount, 2, buf.len):
+        return Err[M2SkinSummary]("wowExport M2 skin: index array out of bounds")
+    if !m2SkinRangeValid(triangleOffset, out.triangleIndexCount, 2, buf.len):
+        return Err[M2SkinSummary]("wowExport M2 skin: triangle array out of bounds")
+    if !m2SkinRangeValid(propertyOffset, out.propertyCount, 4, buf.len):
+        return Err[M2SkinSummary]("wowExport M2 skin: property array out of bounds")
+    if !m2SkinRangeValid(submeshOffset, out.submeshCount, 48, buf.len):
+        return Err[M2SkinSummary]("wowExport M2 skin: submesh array out of bounds")
+    if !m2SkinRangeValid(textureUnitOffset, out.textureUnitCount, 24, buf.len):
+        return Err[M2SkinSummary]("wowExport M2 skin: texture unit array out of bounds")
+    return Ok[M2SkinSummary](out)
+
 fn FormatHeaderText(header: FormatHeader): str =
     return Fmt"magic={header.magic} value={strings.IntToStr(header.versionOrSize)} chunks={strings.IntToStr(header.chunkCount)}"
 
@@ -391,28 +687,82 @@ fn WdtSummaryText(summary: WdtSummary): str =
     let maidText: str = strings.IntToStr(summary.maidEntryCount)
     let maidFileText: str = strings.IntToStr(summary.maidReferencedFileCount)
     let firstMaidText: str = strings.IntToStr(summary.firstMaidFileDataID)
-    return "wdt mainEntries=" + mainText + " activeTiles=" + activeText +
-        " modelPlacements=" + placementText + " maidEntries=" + maidText +
-        " maidFileIDs=" + maidFileText + " firstMaidFileDataID=" + firstMaidText
+    var out: str = Fmt"wdt mainEntries={mainText}"
+    out = out + Fmt" activeTiles={activeText}"
+    out = out + Fmt" modelPlacements={placementText}"
+    out = out + Fmt" maidEntries={maidText}"
+    out = out + Fmt" maidFileIDs={maidFileText}"
+    out = out + Fmt" firstMaidFileDataID={firstMaidText}"
+    return out
 
 fn WmoRootSummaryText(summary: WmoRootSummary): str =
     let matText: str = strings.IntToStr(summary.materialCount)
     let groupText: str = strings.IntToStr(summary.groupCount)
     let doodadText: str = strings.IntToStr(summary.doodadCount)
     let setText: str = strings.IntToStr(summary.doodadSetCount)
+    let setDefText: str = strings.IntToStr(summary.doodadSetDefinitionCount)
+    let placementText: str = strings.IntToStr(summary.doodadPlacementCount)
+    let setPlacementText: str = strings.IntToStr(summary.doodadSetPlacementCount)
+    let firstDoodadText: str = strings.IntToStr(summary.firstDoodadNameIndex)
     let gfidText: str = strings.IntToStr(summary.groupFileDataIDCount)
     let firstGroupText: str = strings.IntToStr(summary.firstGroupFileDataID)
     let modelIdText: str = strings.IntToStr(summary.modelFileDataIDCount)
     let firstModelText: str = strings.IntToStr(summary.firstModelFileDataID)
-    return "wmo materials=" + matText + " groups=" + groupText +
-        " doodads=" + doodadText + " doodadSets=" + setText +
-        " groupFileIDs=" + gfidText + " firstGroupFileDataID=" + firstGroupText +
-        " modelFileIDs=" + modelIdText + " firstModelFileDataID=" + firstModelText
+    var out: str = Fmt"wmo materials={matText}"
+    out = out + Fmt" groups={groupText}"
+    out = out + Fmt" doodads={doodadText}"
+    out = out + Fmt" doodadSets={setText}"
+    out = out + Fmt" doodadSetDefs={setDefText}"
+    out = out + Fmt" doodadPlacements={placementText}"
+    out = out + Fmt" doodadSetPlacements={setPlacementText}"
+    out = out + Fmt" firstDoodadNameIndex={firstDoodadText}"
+    out = out + Fmt" groupFileIDs={gfidText}"
+    out = out + Fmt" firstGroupFileDataID={firstGroupText}"
+    out = out + Fmt" modelFileIDs={modelIdText}"
+    out = out + Fmt" firstModelFileDataID={firstModelText}"
+    return out
+
+fn WmoGroupSummaryText(summary: WmoGroupSummary): str =
+    let vertexText: str = strings.IntToStr(summary.vertexCount)
+    let indexText: str = strings.IntToStr(summary.indexCount)
+    let batchText: str = strings.IntToStr(summary.batchCount)
+    let materialText: str = strings.IntToStr(summary.materialInfoCount)
+    var out: str = Fmt"wmoGroup vertices={vertexText}"
+    out = out + Fmt" indices={indexText}"
+    out = out + Fmt" batches={batchText}"
+    out = out + Fmt" materialInfo={materialText}"
+    return out
+
+fn AdtTerrainSummaryText(summary: AdtTerrainSummary): str =
+    let chunkText: str = strings.IntToStr(summary.mapChunkCount)
+    let heightChunkText: str = strings.IntToStr(summary.heightChunkCount)
+    let sampleText: str = strings.IntToStr(summary.heightSampleCount)
+    let minText: str = strings.IntToStr(summary.minHeight1000)
+    let maxText: str = strings.IntToStr(summary.maxHeight1000)
+    var out: str = Fmt"adt mapChunks={chunkText}"
+    out = out + Fmt" heightChunks={heightChunkText}"
+    out = out + Fmt" heightSamples={sampleText}"
+    out = out + Fmt" heightMinMax1000={minText},{maxText}"
+    return out
 
 fn M2DependencySummaryText(summary: M2DependencySummary): str =
     let skinText: str = strings.IntToStr(summary.skinFileDataIDCount)
     let firstSkinText: str = strings.IntToStr(summary.firstSkinFileDataID)
     let textureText: str = strings.IntToStr(summary.textureFileDataIDCount)
     let firstTextureText: str = strings.IntToStr(summary.firstTextureFileDataID)
-    return "m2Deps skinFileIDs=" + skinText + " firstSkinFileDataID=" + firstSkinText +
-        " textureFileIDs=" + textureText + " firstTextureFileDataID=" + firstTextureText
+    var out: str = Fmt"m2Deps skinFileIDs={skinText}"
+    out = out + Fmt" firstSkinFileDataID={firstSkinText}"
+    out = out + Fmt" textureFileIDs={textureText}"
+    out = out + Fmt" firstTextureFileDataID={firstTextureText}"
+    return out
+
+fn M2SkinSummaryText(summary: M2SkinSummary): str =
+    let indexText: str = strings.IntToStr(summary.indexCount)
+    let triText: str = strings.IntToStr(summary.triangleIndexCount)
+    let submeshText: str = strings.IntToStr(summary.submeshCount)
+    let textureUnitText: str = strings.IntToStr(summary.textureUnitCount)
+    var out: str = Fmt"m2Skin indices={indexText}"
+    out = out + Fmt" triangleIndices={triText}"
+    out = out + Fmt" submeshes={submeshText}"
+    out = out + Fmt" textureUnits={textureUnitText}"
+    return out
