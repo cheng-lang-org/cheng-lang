@@ -1,0 +1,93 @@
+import std/bytes as bytes
+import std/result
+import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/cdn_config as cdn_config
+import cheng/apps/wow_export/cdn_fetch as cdn_fetch
+import cheng/apps/wow_export/config as config
+import cheng/apps/wow_export/root as wow_root
+import cheng/apps/wow_export/tact_index as tact_index
+import cheng/apps/wow_export/tvfs as tvfs
+
+const
+    wowExportCdnRootCacheRoot = "/tmp/wow_export_cdn_root_smoke_cache"
+    wowExportCdnRootFullEKey = "108aaa378a9a07d9a926150259ecbdad"
+
+fn main(): int32 =
+    let buildRes: Result[build_info.WowBuildEntry] = build_info.ProbeRetailDefault()
+    assert(IsOk(buildRes), Error(buildRes))
+    let build: build_info.WowBuildEntry = Value(buildRes)
+
+    let cfgRes: Result[config.BuildConfig] =
+        config.LoadBuildConfig(build_info.DefaultClientPath, build.buildKey)
+    assert(IsOk(cfgRes), Error(cfgRes))
+    let cfg: config.BuildConfig = Value(cfgRes)
+
+    let vfsFetchRes: Result[cdn_fetch.CdnFetchResult] =
+        cdn_fetch.CdnFetchLooseObjectToCache(build,
+                                             wowExportCdnRootCacheRoot,
+                                             cfg.vfsRootEncodingKey,
+                                             cfg.vfsRootEncodingSize)
+    assert(IsOk(vfsFetchRes), Error(vfsFetchRes))
+    let vfsFetch: cdn_fetch.CdnFetchResult = Value(vfsFetchRes)
+
+    let vfsDecodedRes: Result[bytes.ByteBuffer] =
+        cdn_fetch.CdnDecodeCachedBlte(vfsFetch.cachePath, cfg.vfsRootEncodingSize)
+    assert(IsOk(vfsDecodedRes), Error(vfsDecodedRes))
+    let vfsDecoded: bytes.ByteBuffer = Value(vfsDecodedRes)
+
+    let tvfsSummaryRes: Result[tvfs.TvfsSummary] = tvfs.TvfsParseSummary(vfsDecoded)
+    assert(IsOk(tvfsSummaryRes), Error(tvfsSummaryRes))
+    let tvfsSummary: tvfs.TvfsSummary = Value(tvfsSummaryRes)
+    assert(tvfsSummary.firstFile.path == ".root", "wow_export_cdn_root_smoke first path")
+    assert(tvfsSummary.firstFile.firstSpan.container.contentKey == cfg.root,
+           "wow_export_cdn_root_smoke root content key")
+
+    let cdnCfgRes: Result[cdn_config.CdnConfig] =
+        cdn_config.LoadCdnConfig(build_info.DefaultClientPath, build.cdnKey)
+    assert(IsOk(cdnCfgRes), Error(cdnCfgRes))
+    let cdnCfg: cdn_config.CdnConfig = Value(cdnCfgRes)
+    let indexDir: str = build_info.StablePathJoin(build_info.DataPath(build_info.DefaultClientPath), "indices")
+    let fileIndexPath: str =
+        build_info.StablePathJoin(indexDir, build_info.StableConcat(cdnCfg.fileIndex, ".index"))
+    let rootLookupRes: Result[tact_index.TactIndexLookup] =
+        tact_index.LoadTactIndexLookupPrefixFromPath(
+            fileIndexPath,
+            tvfsSummary.firstFile.firstSpan.container.encodingKey)
+    assert(IsOk(rootLookupRes), Error(rootLookupRes))
+    let rootLookup: tact_index.TactIndexLookup = Value(rootLookupRes)
+    assert(rootLookup.entry.key == wowExportCdnRootFullEKey,
+           "wow_export_cdn_root_smoke full root ekey")
+    assert(rootLookup.entry.size == tvfsSummary.firstFile.firstSpan.container.encodedSize,
+           "wow_export_cdn_root_smoke root encoded size from file-index")
+
+    let rootFetchRes: Result[cdn_fetch.CdnFetchResult] =
+        cdn_fetch.CdnFetchLooseObjectToCache(build,
+                                             wowExportCdnRootCacheRoot,
+                                             rootLookup.entry.key,
+                                             tvfsSummary.firstFile.firstSpan.container.encodedSize)
+    assert(IsOk(rootFetchRes), Error(rootFetchRes))
+    let rootFetch: cdn_fetch.CdnFetchResult = Value(rootFetchRes)
+
+    let rootFirstBlockRes: Result[bytes.ByteBuffer] =
+        cdn_fetch.CdnDecodeCachedBlteFirstBlock(rootFetch.cachePath,
+                                                tvfsSummary.firstFile.firstSpan.container.encodedSize)
+    assert(IsOk(rootFirstBlockRes), Error(rootFirstBlockRes))
+    let rootFirstBlock: bytes.ByteBuffer = Value(rootFirstBlockRes)
+    assert(rootFirstBlock.len == 262144,
+           "wow_export_cdn_root_smoke decoded first root block size")
+
+    let rootHeaderRes: Result[wow_root.RootHeader] = wow_root.WowRootParseHeader(rootFirstBlock)
+    assert(IsOk(rootHeaderRes), Error(rootHeaderRes))
+    let rootHeader: wow_root.RootHeader = Value(rootHeaderRes)
+    assert(rootHeader.version == 2, "wow_export_cdn_root_smoke root version")
+    assert(rootHeader.totalFiles == 3191145, "wow_export_cdn_root_smoke root total files")
+
+    let rootFirstRes: Result[wow_root.RootEntry] = wow_root.WowRootFirstEntry(rootFirstBlock)
+    assert(IsOk(rootFirstRes), Error(rootFirstRes))
+    let rootFirst: wow_root.RootEntry = Value(rootFirstRes)
+    assert(rootFirst.fileDataID == 121595, "wow_export_cdn_root_smoke first fileDataID")
+
+    bytes.FreeByteBuffer(rootFirstBlock)
+    bytes.FreeByteBuffer(vfsDecoded)
+    echo("wow_export_cdn_root_smoke ok")
+    return 0

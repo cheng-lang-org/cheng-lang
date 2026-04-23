@@ -1,0 +1,81 @@
+import std/bytes as bytes
+import std/result
+import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/cdn_fetch as cdn_fetch
+import cheng/apps/wow_export/config as config
+import cheng/apps/wow_export/tvfs as tvfs
+
+const
+    wowExportTvfsCacheRoot = "/tmp/wow_export_tvfs_smoke_cache"
+
+fn main(): int32 =
+    let buildRes: Result[build_info.WowBuildEntry] = build_info.ProbeRetailDefault()
+    assert(IsOk(buildRes), Error(buildRes))
+    let build: build_info.WowBuildEntry = Value(buildRes)
+
+    let cfgRes: Result[config.BuildConfig] =
+        config.LoadBuildConfig(build_info.DefaultClientPath, build.buildKey)
+    assert(IsOk(cfgRes), Error(cfgRes))
+    let cfg: config.BuildConfig = Value(cfgRes)
+
+    let fetchRes: Result[cdn_fetch.CdnFetchResult] =
+        cdn_fetch.CdnFetchLooseObjectToCache(build,
+                                             wowExportTvfsCacheRoot,
+                                             cfg.vfsRootEncodingKey,
+                                             cfg.vfsRootEncodingSize)
+    assert(IsOk(fetchRes), Error(fetchRes))
+    let fetched: cdn_fetch.CdnFetchResult = Value(fetchRes)
+
+    let decodedRes: Result[bytes.ByteBuffer] =
+        cdn_fetch.CdnDecodeCachedBlte(fetched.cachePath, cfg.vfsRootEncodingSize)
+    assert(IsOk(decodedRes), Error(decodedRes))
+    let decoded: bytes.ByteBuffer = Value(decodedRes)
+    assert(decoded.len == cfg.vfsRootContentSize, "wow_export_tvfs_smoke decoded size")
+
+    let summaryRes: Result[tvfs.TvfsSummary] = tvfs.TvfsParseSummary(decoded)
+    assert(IsOk(summaryRes), Error(summaryRes))
+    let summary: tvfs.TvfsSummary = Value(summaryRes)
+    assert(summary.header.version == 1, "wow_export_tvfs_smoke version")
+    assert(summary.header.headerSize == 46, "wow_export_tvfs_smoke header size")
+    assert(summary.header.encodingKeySize == 9, "wow_export_tvfs_smoke ekey size")
+    assert(summary.header.patchKeySize == 9, "wow_export_tvfs_smoke pkey size")
+    assert(summary.header.flags == 7, "wow_export_tvfs_smoke flags")
+    assert(summary.header.pathTableOffset == 46, "wow_export_tvfs_smoke path offset")
+    assert(summary.header.pathTableSize == 15521, "wow_export_tvfs_smoke path size")
+    assert(summary.header.containerTableOffset == 15589, "wow_export_tvfs_smoke cft offset")
+    assert(summary.header.containerTableSize == 30345, "wow_export_tvfs_smoke cft size")
+    assert(summary.header.fileTableOffset == 45934, "wow_export_tvfs_smoke file offset")
+    assert(summary.header.fileTableSize == 9537, "wow_export_tvfs_smoke file size")
+    assert(summary.header.eSpecTableOffset == 15567, "wow_export_tvfs_smoke espec offset")
+    assert(summary.header.eSpecTableSize == 22, "wow_export_tvfs_smoke espec size")
+    assert(summary.header.pathTableMaxDepth == 10, "wow_export_tvfs_smoke max depth")
+    assert(summary.header.containerOffsetSize == 2, "wow_export_tvfs_smoke cft offset size")
+    assert(summary.header.eSpecOffsetSize == 1, "wow_export_tvfs_smoke espec offset size")
+    assert(summary.firstEncodingSpec == "b:256K*=z", "wow_export_tvfs_smoke first espec")
+    assert(summary.secondEncodingSpec == "b:{256K*=z}", "wow_export_tvfs_smoke second espec")
+    assert(summary.pathNodeCount == 1178, "wow_export_tvfs_smoke path nodes")
+    assert(summary.directoryCount == 311, "wow_export_tvfs_smoke dirs")
+    assert(summary.fileCount == 867, "wow_export_tvfs_smoke files")
+    assert(summary.containerEntryCount == 867, "wow_export_tvfs_smoke cft entries")
+    assert(summary.maxObservedDepth == 10, "wow_export_tvfs_smoke observed depth")
+    assert(summary.firstFileFound, "wow_export_tvfs_smoke first file found")
+    assert(summary.firstFile.path == ".root", "wow_export_tvfs_smoke first path")
+    assert(summary.firstFile.fileTableOffset == 0, "wow_export_tvfs_smoke first file offset")
+    assert(summary.firstFile.spanCount == 1, "wow_export_tvfs_smoke first spans")
+    assert(summary.firstFile.firstSpan.offset == 0, "wow_export_tvfs_smoke first span offset")
+    assert(summary.firstFile.firstSpan.size == 65837614, "wow_export_tvfs_smoke first span size")
+    assert(summary.firstFile.firstSpan.containerOffset == 1785, "wow_export_tvfs_smoke first cft offset")
+    assert(summary.firstFile.firstSpan.container.encodingKey == "108aaa378a9a07d9a9",
+           "wow_export_tvfs_smoke root ekey prefix")
+    assert(summary.firstFile.firstSpan.container.encodedSize == 49480175,
+           "wow_export_tvfs_smoke root encoded size")
+    assert(summary.firstFile.firstSpan.container.contentSize == 65837614,
+           "wow_export_tvfs_smoke root content size")
+    assert(summary.firstFile.firstSpan.container.contentKey == cfg.root,
+           "wow_export_tvfs_smoke root content key")
+    assert(summary.firstFile.firstSpan.container.patchRecordCount == 0,
+           "wow_export_tvfs_smoke root patch records")
+
+    bytes.FreeByteBuffer(decoded)
+    echo("wow_export_tvfs_smoke ok")
+    return 0

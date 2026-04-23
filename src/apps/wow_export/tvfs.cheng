@@ -1,0 +1,470 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import std/strformat
+import cheng/apps/wow_export/binary as binary
+
+type
+    TvfsHeader =
+        version: int32
+        headerSize: int32
+        encodingKeySize: int32
+        patchKeySize: int32
+        flags: int32
+        pathTableOffset: int32
+        pathTableSize: int32
+        fileTableOffset: int32
+        fileTableSize: int32
+        containerTableOffset: int32
+        containerTableSize: int32
+        pathTableMaxDepth: int32
+        eSpecTableOffset: int32
+        eSpecTableSize: int32
+        containerOffsetSize: int32
+        eSpecOffsetSize: int32
+
+    TvfsContainerEntry =
+        relativeOffset: int32
+        nextRelativeOffset: int32
+        encodingKey: str
+        encodedSize: int32
+        encodingSpecOffset: int32
+        contentSize: int32
+        contentKey: str
+        patchRecordCount: int32
+
+    TvfsSpan =
+        offset: int32
+        size: int32
+        containerOffset: int32
+        container: TvfsContainerEntry
+
+    TvfsFileInfo =
+        path: str
+        fileTableOffset: int32
+        spanCount: int32
+        firstSpan: TvfsSpan
+
+    TvfsSummary =
+        header: TvfsHeader
+        pathNodeCount: int32
+        directoryCount: int32
+        fileCount: int32
+        containerEntryCount: int32
+        maxObservedDepth: int32
+        firstEncodingSpec: str
+        secondEncodingSpec: str
+        firstFileFound: bool
+        firstFile: TvfsFileInfo
+
+    tvfsPathEntry =
+        nextOffset: int32
+        flags: int32
+        name: str
+        hasNodeValue: bool
+        nodeValue: int64
+
+const
+    tvfsFlagIncludeCKey = 0x0001
+    tvfsFlagWriteSupport = 0x0002
+    tvfsFlagPatchSupport = 0x0004
+    tvfsPathSeparatorPre = 0x0001
+    tvfsPathSeparatorPost = 0x0002
+    tvfsPathNodeValue = 0x0004
+
+fn tvfsReadU16BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 2 > buf.len:
+        return Err[int32]("wowExport TVFS: truncated u16be")
+    return Ok[int32]((bytes.BufByteAt(buf, idx) << 8) + bytes.BufByteAt(buf, idx + 1))
+
+fn tvfsReadU32BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport TVFS: truncated u32be")
+    let b0: int32 = bytes.BufByteAt(buf, idx)
+    let b1: int32 = bytes.BufByteAt(buf, idx + 1)
+    let b2: int32 = bytes.BufByteAt(buf, idx + 2)
+    let b3: int32 = bytes.BufByteAt(buf, idx + 3)
+    return Ok[int32]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
+
+fn tvfsReadU32BE64At(buf: bytes.ByteBuffer, idx: int32): Result[int64] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int64]("wowExport TVFS: truncated u32be")
+    let b0: int64 = int64(bytes.BufByteAt(buf, idx))
+    let b1: int64 = int64(bytes.BufByteAt(buf, idx + 1))
+    let b2: int64 = int64(bytes.BufByteAt(buf, idx + 2))
+    let b3: int64 = int64(bytes.BufByteAt(buf, idx + 3))
+    return Ok[int64]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
+
+fn tvfsReadOffsetAt(buf: bytes.ByteBuffer, idx: int32, count: int32): Result[int32] =
+    if count < 0 || count > 4:
+        return Err[int32]("wowExport TVFS: invalid offset field size")
+    if idx < 0 || idx + count > buf.len:
+        return Err[int32]("wowExport TVFS: truncated variable offset")
+    var out: int32
+    var i: int32
+    while i < count:
+        out = (out << 8) + bytes.BufByteAt(buf, idx + i)
+        i = i + 1
+    return Ok[int32](out)
+
+fn tvfsOffsetFieldSize(tableSize: int32): int32 =
+    if tableSize <= 0:
+        return 0
+    if tableSize <= 0xff:
+        return 1
+    if tableSize <= 0xffff:
+        return 2
+    if tableSize <= 0xffffff:
+        return 3
+    return 4
+
+fn tvfsRangeValid(offset: int32, size: int32, len: int32): bool =
+    if offset < 0 || size < 0:
+        return false
+    if offset > len:
+        return false
+    return offset + size <= len
+
+fn tvfsAsciiSlice(buf: bytes.ByteBuffer, start: int32, count: int32): Result[str] =
+    if count < 0 || start < 0 || start + count > buf.len:
+        return Err[str]("wowExport TVFS: truncated ascii slice")
+    var out: str
+    var i: int32
+    while i < count:
+        let b: int32 = bytes.BufByteAt(buf, start + i)
+        if b < 0x20 || b > 0x7e:
+            return Err[str]("wowExport TVFS: non-ascii path fragment")
+        out = strings.ConcatStr(out, strings.CharToStr(char(b)))
+        i = i + 1
+    return Ok[str](out)
+
+fn TvfsParseHeader(buf: bytes.ByteBuffer): Result[TvfsHeader] =
+    if buf.len < 38:
+        return Err[TvfsHeader]("wowExport TVFS: header too small")
+    if bytes.BufByteAt(buf, 0) != int32('T') ||
+        bytes.BufByteAt(buf, 1) != int32('V') ||
+        bytes.BufByteAt(buf, 2) != int32('F') ||
+        bytes.BufByteAt(buf, 3) != int32('S'):
+        return Err[TvfsHeader]("wowExport TVFS: invalid magic")
+    var out: TvfsHeader
+    out.version = bytes.BufByteAt(buf, 4)
+    out.headerSize = bytes.BufByteAt(buf, 5)
+    out.encodingKeySize = bytes.BufByteAt(buf, 6)
+    out.patchKeySize = bytes.BufByteAt(buf, 7)
+    if out.version != 1:
+        return Err[TvfsHeader]("wowExport TVFS: unsupported version")
+    if out.headerSize < 38 || out.headerSize > buf.len:
+        return Err[TvfsHeader]("wowExport TVFS: invalid header size")
+    if out.encodingKeySize != 9 || out.patchKeySize != 9:
+        return Err[TvfsHeader]("wowExport TVFS: unsupported key size")
+    let flagsRes: Result[int32] = tvfsReadU32BEAt(buf, 8)
+    let pathOffRes: Result[int32] = tvfsReadU32BEAt(buf, 12)
+    let pathSizeRes: Result[int32] = tvfsReadU32BEAt(buf, 16)
+    let fileOffRes: Result[int32] = tvfsReadU32BEAt(buf, 20)
+    let fileSizeRes: Result[int32] = tvfsReadU32BEAt(buf, 24)
+    let cftOffRes: Result[int32] = tvfsReadU32BEAt(buf, 28)
+    let cftSizeRes: Result[int32] = tvfsReadU32BEAt(buf, 32)
+    let maxDepthRes: Result[int32] = tvfsReadU16BEAt(buf, 36)
+    if IsErr(flagsRes): return Err[TvfsHeader](Error(flagsRes))
+    if IsErr(pathOffRes): return Err[TvfsHeader](Error(pathOffRes))
+    if IsErr(pathSizeRes): return Err[TvfsHeader](Error(pathSizeRes))
+    if IsErr(fileOffRes): return Err[TvfsHeader](Error(fileOffRes))
+    if IsErr(fileSizeRes): return Err[TvfsHeader](Error(fileSizeRes))
+    if IsErr(cftOffRes): return Err[TvfsHeader](Error(cftOffRes))
+    if IsErr(cftSizeRes): return Err[TvfsHeader](Error(cftSizeRes))
+    if IsErr(maxDepthRes): return Err[TvfsHeader](Error(maxDepthRes))
+    out.flags = Value(flagsRes)
+    out.pathTableOffset = Value(pathOffRes)
+    out.pathTableSize = Value(pathSizeRes)
+    out.fileTableOffset = Value(fileOffRes)
+    out.fileTableSize = Value(fileSizeRes)
+    out.containerTableOffset = Value(cftOffRes)
+    out.containerTableSize = Value(cftSizeRes)
+    out.pathTableMaxDepth = Value(maxDepthRes)
+    if (out.flags & tvfsFlagWriteSupport) != 0:
+        if out.headerSize < 46:
+            return Err[TvfsHeader]("wowExport TVFS: write-support header is truncated")
+        let eSpecOffRes: Result[int32] = tvfsReadU32BEAt(buf, 38)
+        let eSpecSizeRes: Result[int32] = tvfsReadU32BEAt(buf, 42)
+        if IsErr(eSpecOffRes): return Err[TvfsHeader](Error(eSpecOffRes))
+        if IsErr(eSpecSizeRes): return Err[TvfsHeader](Error(eSpecSizeRes))
+        out.eSpecTableOffset = Value(eSpecOffRes)
+        out.eSpecTableSize = Value(eSpecSizeRes)
+    if !tvfsRangeValid(out.pathTableOffset, out.pathTableSize, buf.len):
+        return Err[TvfsHeader]("wowExport TVFS: invalid path table range")
+    if !tvfsRangeValid(out.fileTableOffset, out.fileTableSize, buf.len):
+        return Err[TvfsHeader]("wowExport TVFS: invalid file table range")
+    if !tvfsRangeValid(out.containerTableOffset, out.containerTableSize, buf.len):
+        return Err[TvfsHeader]("wowExport TVFS: invalid container table range")
+    if !tvfsRangeValid(out.eSpecTableOffset, out.eSpecTableSize, buf.len):
+        return Err[TvfsHeader]("wowExport TVFS: invalid ESpec table range")
+    if out.pathTableOffset < out.headerSize:
+        return Err[TvfsHeader]("wowExport TVFS: path table overlaps header")
+    out.containerOffsetSize = tvfsOffsetFieldSize(out.containerTableSize)
+    out.eSpecOffsetSize = tvfsOffsetFieldSize(out.eSpecTableSize)
+    if out.pathTableMaxDepth <= 0:
+        return Err[TvfsHeader]("wowExport TVFS: invalid path max depth")
+    return Ok[TvfsHeader](out)
+
+fn TvfsReadEncodingSpecAt(buf: bytes.ByteBuffer, header: TvfsHeader, relativeOffset: int32): Result[str] =
+    if relativeOffset < 0 || relativeOffset >= header.eSpecTableSize:
+        return Err[str]("wowExport TVFS: ESpec offset out of bounds")
+    let start: int32 = header.eSpecTableOffset + relativeOffset
+    let end: int32 = header.eSpecTableOffset + header.eSpecTableSize
+    var pos: int32 = start
+    while pos < end && bytes.BufByteAt(buf, pos) != 0:
+        pos = pos + 1
+    if pos >= end:
+        return Err[str]("wowExport TVFS: unterminated ESpec")
+    return tvfsAsciiSlice(buf, start, pos - start)
+
+fn tvfsSecondEncodingSpec(buf: bytes.ByteBuffer, header: TvfsHeader, first: str): Result[str] =
+    let nextOffset: int32 = strings.Len(first) + 1
+    if nextOffset >= header.eSpecTableSize:
+        return Ok[str]("")
+    return TvfsReadEncodingSpecAt(buf, header, nextOffset)
+
+fn TvfsParseContainerEntryAt(buf: bytes.ByteBuffer,
+                             header: TvfsHeader,
+                             relativeOffset: int32): Result[TvfsContainerEntry] =
+    if relativeOffset < 0 || relativeOffset >= header.containerTableSize:
+        return Err[TvfsContainerEntry]("wowExport TVFS: container offset out of bounds")
+    let cftEnd: int32 = header.containerTableOffset + header.containerTableSize
+    var pos: int32 = header.containerTableOffset + relativeOffset
+    let eKeyRes: Result[str] = binary.HexSlice(buf, pos, header.encodingKeySize)
+    if IsErr(eKeyRes):
+        return Err[TvfsContainerEntry](Error(eKeyRes))
+    pos = pos + header.encodingKeySize
+    let encodedSizeRes: Result[int32] = tvfsReadU32BEAt(buf, pos)
+    if IsErr(encodedSizeRes):
+        return Err[TvfsContainerEntry](Error(encodedSizeRes))
+    pos = pos + 4
+    let specOffRes: Result[int32] = tvfsReadOffsetAt(buf, pos, header.eSpecOffsetSize)
+    if IsErr(specOffRes):
+        return Err[TvfsContainerEntry](Error(specOffRes))
+    if header.eSpecTableSize > 0 && Value(specOffRes) >= header.eSpecTableSize:
+        return Err[TvfsContainerEntry]("wowExport TVFS: ESpec offset out of bounds")
+    pos = pos + header.eSpecOffsetSize
+    let contentSizeRes: Result[int32] = tvfsReadU32BEAt(buf, pos)
+    if IsErr(contentSizeRes):
+        return Err[TvfsContainerEntry](Error(contentSizeRes))
+    pos = pos + 4
+    var contentKey: str
+    if (header.flags & tvfsFlagIncludeCKey) != 0:
+        let contentKeyRes: Result[str] = binary.HexSlice(buf, pos, 16)
+        if IsErr(contentKeyRes):
+            return Err[TvfsContainerEntry](Error(contentKeyRes))
+        contentKey = Value(contentKeyRes)
+        pos = pos + 16
+    var patchRecordCount: int32
+    if (header.flags & tvfsFlagPatchSupport) != 0:
+        if pos >= cftEnd:
+            return Err[TvfsContainerEntry]("wowExport TVFS: truncated patch count")
+        patchRecordCount = bytes.BufByteAt(buf, pos)
+        pos = pos + 1
+        let patchRecordSize: int32 = header.encodingKeySize + 4 + header.patchKeySize + 4 + 1
+        if pos + patchRecordCount * patchRecordSize > cftEnd:
+            return Err[TvfsContainerEntry]("wowExport TVFS: truncated patch records")
+        pos = pos + patchRecordCount * patchRecordSize
+    if pos > cftEnd:
+        return Err[TvfsContainerEntry]("wowExport TVFS: container entry extends past table")
+    var out: TvfsContainerEntry
+    out.relativeOffset = relativeOffset
+    out.nextRelativeOffset = pos - header.containerTableOffset
+    out.encodingKey = Value(eKeyRes)
+    out.encodedSize = Value(encodedSizeRes)
+    out.encodingSpecOffset = Value(specOffRes)
+    out.contentSize = Value(contentSizeRes)
+    out.contentKey = contentKey
+    out.patchRecordCount = patchRecordCount
+    return Ok[TvfsContainerEntry](out)
+
+fn TvfsCountContainerEntries(buf: bytes.ByteBuffer, header: TvfsHeader): Result[int32] =
+    var pos: int32
+    var count: int32
+    while pos < header.containerTableSize:
+        let entryRes: Result[TvfsContainerEntry] = TvfsParseContainerEntryAt(buf, header, pos)
+        if IsErr(entryRes):
+            return Err[int32](Error(entryRes))
+        let nextPos: int32 = Value(entryRes).nextRelativeOffset
+        if nextPos <= pos:
+            return Err[int32]("wowExport TVFS: container parser did not advance")
+        pos = nextPos
+        count = count + 1
+    if pos != header.containerTableSize:
+        return Err[int32]("wowExport TVFS: container parser overshot table")
+    return Ok[int32](count)
+
+fn TvfsReadFileInfoAt(buf: bytes.ByteBuffer,
+                      header: TvfsHeader,
+                      fileTableOffset: int32,
+                      path: str): Result[TvfsFileInfo] =
+    if fileTableOffset < 0 || fileTableOffset >= header.fileTableSize:
+        return Err[TvfsFileInfo]("wowExport TVFS: file table offset out of bounds")
+    let filePos: int32 = header.fileTableOffset + fileTableOffset
+    let fileEnd: int32 = header.fileTableOffset + header.fileTableSize
+    let spanCount: int32 = bytes.BufByteAt(buf, filePos)
+    if spanCount < 1 || spanCount > 224:
+        return Err[TvfsFileInfo]("wowExport TVFS: unsupported file entry type")
+    let spanSize: int32 = 8 + header.containerOffsetSize
+    if filePos + 1 + spanCount * spanSize > fileEnd:
+        return Err[TvfsFileInfo]("wowExport TVFS: truncated file spans")
+    let spanPos: int32 = filePos + 1
+    let offsetRes: Result[int32] = tvfsReadU32BEAt(buf, spanPos)
+    let sizeRes: Result[int32] = tvfsReadU32BEAt(buf, spanPos + 4)
+    let containerOffsetRes: Result[int32] =
+        tvfsReadOffsetAt(buf, spanPos + 8, header.containerOffsetSize)
+    if IsErr(offsetRes): return Err[TvfsFileInfo](Error(offsetRes))
+    if IsErr(sizeRes): return Err[TvfsFileInfo](Error(sizeRes))
+    if IsErr(containerOffsetRes): return Err[TvfsFileInfo](Error(containerOffsetRes))
+    let containerRes: Result[TvfsContainerEntry] =
+        TvfsParseContainerEntryAt(buf, header, Value(containerOffsetRes))
+    if IsErr(containerRes):
+        return Err[TvfsFileInfo](Error(containerRes))
+    var span: TvfsSpan
+    span.offset = Value(offsetRes)
+    span.size = Value(sizeRes)
+    span.containerOffset = Value(containerOffsetRes)
+    span.container = Value(containerRes)
+    var out: TvfsFileInfo
+    out.path = path
+    out.fileTableOffset = fileTableOffset
+    out.spanCount = spanCount
+    out.firstSpan = span
+    return Ok[TvfsFileInfo](out)
+
+fn tvfsCapturePathEntry(buf: bytes.ByteBuffer, posIn: int32, end: int32): Result[tvfsPathEntry] =
+    var pos: int32 = posIn
+    var out: tvfsPathEntry
+    if pos < 0 || pos >= end || end > buf.len:
+        return Err[tvfsPathEntry]("wowExport TVFS: path entry out of bounds")
+    if bytes.BufByteAt(buf, pos) == 0:
+        out.flags = out.flags | tvfsPathSeparatorPre
+        pos = pos + 1
+    if pos < end && bytes.BufByteAt(buf, pos) != 0xff:
+        let nameLen: int32 = bytes.BufByteAt(buf, pos)
+        pos = pos + 1
+        let nameRes: Result[str] = tvfsAsciiSlice(buf, pos, nameLen)
+        if IsErr(nameRes):
+            return Err[tvfsPathEntry](Error(nameRes))
+        out.name = Value(nameRes)
+        pos = pos + nameLen
+    if pos < end && bytes.BufByteAt(buf, pos) == 0:
+        out.flags = out.flags | tvfsPathSeparatorPost
+        pos = pos + 1
+    if pos < end:
+        if bytes.BufByteAt(buf, pos) == 0xff:
+            let nodeValueRes: Result[int64] = tvfsReadU32BE64At(buf, pos + 1)
+            if IsErr(nodeValueRes):
+                return Err[tvfsPathEntry](Error(nodeValueRes))
+            out.flags = out.flags | tvfsPathNodeValue
+            out.hasNodeValue = true
+            out.nodeValue = Value(nodeValueRes)
+            pos = pos + 5
+        else:
+            out.flags = out.flags | tvfsPathSeparatorPost
+    if pos <= posIn:
+        return Err[tvfsPathEntry]("wowExport TVFS: path parser did not advance")
+    out.nextOffset = pos
+    return Ok[tvfsPathEntry](out)
+
+fn tvfsAppendPathNode(path: str, entry: tvfsPathEntry): str =
+    var out: str = path
+    if (entry.flags & tvfsPathSeparatorPre) != 0:
+        out = strings.ConcatStr(out, "/")
+    if strings.Len(entry.name) > 0:
+        out = strings.ConcatStr(out, entry.name)
+    if (entry.flags & tvfsPathSeparatorPost) != 0:
+        out = strings.ConcatStr(out, "/")
+    return out
+
+fn tvfsWalkPathRange(buf: bytes.ByteBuffer,
+                     header: TvfsHeader,
+                     start: int32,
+                     end: int32,
+                     path: str,
+                     depth: int32,
+                     summary: var TvfsSummary): Result[int32] =
+    if start < 0 || end < start || end > buf.len:
+        return Err[int32]("wowExport TVFS: invalid path walk range")
+    if depth > header.pathTableMaxDepth:
+        return Err[int32]("wowExport TVFS: path depth exceeds header maximum")
+    var pos: int32 = start
+    while pos < end:
+        let entryRes: Result[tvfsPathEntry] = tvfsCapturePathEntry(buf, pos, end)
+        if IsErr(entryRes):
+            return Err[int32](Error(entryRes))
+        let entry: tvfsPathEntry = Value(entryRes)
+        let nodePath: str = tvfsAppendPathNode(path, entry)
+        summary.pathNodeCount = summary.pathNodeCount + 1
+        if depth > summary.maxObservedDepth:
+            summary.maxObservedDepth = depth
+        if entry.hasNodeValue:
+            if entry.nodeValue >= int64(2147483648):
+                let childSize64: int64 = entry.nodeValue - int64(2147483648)
+                if childSize64 < int64(4) || childSize64 > int64(end - entry.nextOffset + 4):
+                    return Err[int32]("wowExport TVFS: invalid folder node size")
+                let childEnd: int32 = entry.nextOffset + int32(childSize64) - 4
+                summary.directoryCount = summary.directoryCount + 1
+                let childRes: Result[int32] =
+                    tvfsWalkPathRange(buf, header, entry.nextOffset, childEnd, nodePath, depth + 1, summary)
+                if IsErr(childRes):
+                    return Err[int32](Error(childRes))
+                if Value(childRes) != childEnd:
+                    return Err[int32]("wowExport TVFS: folder parser stopped early")
+                pos = childEnd
+            else:
+                summary.fileCount = summary.fileCount + 1
+                if !summary.firstFileFound:
+                    let fileInfoRes: Result[TvfsFileInfo] =
+                        TvfsReadFileInfoAt(buf, header, int32(entry.nodeValue), nodePath)
+                    if IsErr(fileInfoRes):
+                        return Err[int32](Error(fileInfoRes))
+                    summary.firstFile = Value(fileInfoRes)
+                    summary.firstFileFound = true
+                pos = entry.nextOffset
+        else:
+            pos = entry.nextOffset
+    return Ok[int32](pos)
+
+fn TvfsParseSummary(buf: bytes.ByteBuffer): Result[TvfsSummary] =
+    let headerRes: Result[TvfsHeader] = TvfsParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[TvfsSummary](Error(headerRes))
+    let header: TvfsHeader = Value(headerRes)
+    var out: TvfsSummary
+    out.header = header
+    let countRes: Result[int32] = TvfsCountContainerEntries(buf, header)
+    if IsErr(countRes):
+        return Err[TvfsSummary](Error(countRes))
+    out.containerEntryCount = Value(countRes)
+    if header.eSpecTableSize > 0:
+        let firstSpecRes: Result[str] = TvfsReadEncodingSpecAt(buf, header, 0)
+        if IsErr(firstSpecRes):
+            return Err[TvfsSummary](Error(firstSpecRes))
+        out.firstEncodingSpec = Value(firstSpecRes)
+        let secondSpecRes: Result[str] = tvfsSecondEncodingSpec(buf, header, out.firstEncodingSpec)
+        if IsErr(secondSpecRes):
+            return Err[TvfsSummary](Error(secondSpecRes))
+        out.secondEncodingSpec = Value(secondSpecRes)
+    let pathEnd: int32 = header.pathTableOffset + header.pathTableSize
+    let walkRes: Result[int32] =
+        tvfsWalkPathRange(buf, header, header.pathTableOffset, pathEnd, "", 0, out)
+    if IsErr(walkRes):
+        return Err[TvfsSummary](Error(walkRes))
+    if Value(walkRes) != pathEnd:
+        return Err[TvfsSummary]("wowExport TVFS: path table parser stopped early")
+    if !out.firstFileFound:
+        return Err[TvfsSummary]("wowExport TVFS: path table has no file entries")
+    return Ok[TvfsSummary](out)
+
+fn TvfsHeaderText(header: TvfsHeader): str =
+    return Fmt"tvfsVersion={strings.IntToStr(header.version)} headerSize={strings.IntToStr(header.headerSize)} flags={strings.IntToStr(header.flags)} path={strings.IntToStr(header.pathTableOffset)}+{strings.IntToStr(header.pathTableSize)} cft={strings.IntToStr(header.containerTableOffset)}+{strings.IntToStr(header.containerTableSize)} file={strings.IntToStr(header.fileTableOffset)}+{strings.IntToStr(header.fileTableSize)} eSpec={strings.IntToStr(header.eSpecTableOffset)}+{strings.IntToStr(header.eSpecTableSize)}"
+
+fn TvfsSummaryText(summary: TvfsSummary): str =
+    let headerText: str = TvfsHeaderText(summary.header)
+    let nodesText: str = strings.IntToStr(summary.pathNodeCount)
+    let dirsText: str = strings.IntToStr(summary.directoryCount)
+    let filesText: str = strings.IntToStr(summary.fileCount)
+    let cftEntriesText: str = strings.IntToStr(summary.containerEntryCount)
+    return Fmt"{headerText} nodes={nodesText} dirs={dirsText} files={filesText} cftEntries={cftEntriesText} firstPath={summary.firstFile.path} firstCKey={summary.firstFile.firstSpan.container.contentKey} firstEKeyPrefix={summary.firstFile.firstSpan.container.encodingKey}"

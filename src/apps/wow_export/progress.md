@@ -24,6 +24,13 @@
 - `asset_formats.ParseM2GeometrySummary` 已解析真实 `MD21 -> MD20` M2 顶点数组，按 48 字节顶点 stride 读取 position，并用纯 Cheng IEEE754 fixed-point 解码算出模型包围盒跨度。
 - `wow_export_tool_main preview-northshire --frames 1` 已编译并运行通过，本机输出 `scene=non-empty`、`wmoChunks=17`、`characterVertices=370`、`modelSpan1000=1916,5856,25208`，普通计时约 `2.15s`。
 - CLI 可见摘要函数已避开嵌套 helper 插值导致的 seed materialize 限制；`wow_export_tool_main` 当前可重新编译。
+- 新增 `asset_export` 模块和 CLI 真实导出路径：`extract-file` 支持已审计 Northshire `--label` / `--file-data-id`，`export-m2`、`export-wmo`、`export-map` 会写出 BLTE 解码后的真实 asset payload；输出存在时直接失败，不覆盖。
+- `export-map --out-dir` 现在会导出 4 个 Northshire 审计资产：WDT `294988` 字节、WMO `9784` 字节、BLP `44876` 字节、M2 `20308` 字节，合计 `369956` 字节。
+- `blp.Blp2DecodeFirstMipTga` 已实现 BLP2 DXT1/DXT3/DXT5 首 mip 到无压缩 32-bit TGA；`convert-blp` 现在支持默认 Northshire 贴图、`--label`、`--file-data-id` 和 `--in` 本地 BLP 输入。
+- `asset_formats.ParseWdtSummary` 已解析 WDT `MAIN` 活跃 tile、`MODF` placement 和 `MAID` entry；`ParseWmoRootSummary` 已解析 WMO `MOHD` 材质、group、portal、light、model、doodad、doodad set 计数。
+- `preview-northshire` 的 scene 判定已升级：必须有 WDT 活跃 tile、WMO group/material、M2 bounds、动画序列和 BLP->TGA 解码结果，不能只靠 header 非空。
+- WDT/WMO/M2 依赖发现已接入 preview：WDT `MAID` 解析出 `9408` 个 referenced fileDataID，首项 `6173014`；WMO `GFID` 解析出 `13` 个 group fileDataID，首项 `107075`；WMO `MODI` 解析出 `17` 个非零 model fileDataID，首项 `198056`；M2 `SFID/TXID` 解析出 skin `494438` 和 texture fileDataID `127489/189598`。
+- 已确认当前 Northshire manifest 4 条 root entry 在 root 中都是 ID-only，没有 name hash；因此不能靠路径 hash 严谨发现这些文件，下一步应从资产内嵌 `GFID/SFID/TXID/MAID/MODI` fileDataID 扩展审计 manifest。
 
 验证：
 
@@ -44,6 +51,15 @@
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_asset_formats_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_asset_formats_smoke` 通过，`/tmp/wow_export_asset_formats_smoke` 通过。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_northshire_mvp_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_northshire_mvp_smoke` 通过，`/tmp/wow_export_northshire_mvp_smoke` 通过。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_memory_probe_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_memory_probe_smoke` 通过，`/tmp/wow_export_memory_probe_smoke` 通过；preview steady delta 当前为 `479`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_asset_export_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_asset_export_smoke` 通过，`/tmp/wow_export_asset_export_smoke` 通过。
+- `/tmp/wow_export_tool_main extract-file --file-data-id 189599 --out /tmp/wow_export_cli_extract_file_189599.m2` 通过，导出 `abbey-bell-model` 解码后 M2 `20308` 字节。
+- `/tmp/wow_export_tool_main export-map --out-dir /tmp/wow_export_cli_export_map_probe` 通过，导出 bundle `4` 文件、`369956` 字节。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_blp_convert_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_blp_convert_smoke` 通过，`/tmp/wow_export_blp_convert_smoke` 通过。
+- `/tmp/wow_export_tool_main convert-blp --out /tmp/wow_export_cli_abbeyBell.tga` 通过，输出 `262162` 字节 TGA。
+- `/tmp/wow_export_tool_main convert-blp --in /tmp/wow_export_cli_export_map_probe/abbey-bell-texture.blp --out /tmp/wow_export_cli_abbeyBell_in.tga` 通过，输出 `262162` 字节 TGA。
+- 重新编译并运行 `wow_export_asset_formats_smoke` 通过，覆盖 WDT `MAIN/MAID`、WMO `MOHD/GFID/MODI`、M2 `SFID/TXID` 依赖解析。
+- 重新编译并运行 `wow_export_northshire_mvp_smoke` 通过，输出 `wdtMaidFileIDs=9408`、`wmoGroupFileIDs=13`。
+- 重新编译并运行 `wow_export_memory_probe_smoke` 通过；新增依赖解析后 preview steady delta 当前为 `506`。
 - 纯 Cheng zlib/deflate inflate 已接入 BLTE `0x5a` 块，覆盖 stored/fixed Huffman smoke；dynamic Huffman 解析已实现，后续用真实 encoding/root 读取链路继续压实。
 - `wow_export_tool_main probe` 通过，识别 `wow 12.0.5.67165` 和本地 `.idx`。
 - `wow_export_casc_smoke` 曾因 `.idx` 热循环逐条转 hex 字符串超时；已改为字节级 key prefix 比较后通过。
@@ -66,4 +82,4 @@
 - `Data/data/data.NNN` 的 30 字节本地 header 继续只解释传统 local archive；`.index` 这边的真实文件格式也已经钉住。下一步应该把 CDN root 从“首块验证”推进成按需 range/block 解码，而不是全量 65MB 解码后再扫表。
 - `Data/indices` 大目录现在能稳定快照真实文件名，但 `os_list_dir_stress_smoke` 当前在 256 文件 * 6000 轮下的 `peak memory footprint` 约 `219005456`；这说明库层崩溃已修掉，长热路径的 allocator 回收表现还需要后续单独压。
 - 北郡预览现在会先跑本地审计，再读取已审计资产；剩余缺口是把真实几何/动画数据继续推进成更完整的 MVP，而不是只验证头部和 chunk 边界。
-- 当前 `wow_export_northshire_mvp_smoke` 和 `wow_export_memory_probe_smoke` 已重新编译通过；剩余不是编译器阻塞，而是继续把真实资产导出命令从占位推进到可用。
+- 当前 `extract-file`、`export-m2`、`export-wmo`、`export-map`、`convert-blp` 已从占位推进到可用；剩余真正缺口是把已发现的 group/skin/ADT/model fileDataID 扩展进审计 manifest 并解码 WMO group/ADT 几何。

@@ -1,0 +1,282 @@
+import std/os
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import cheng/apps/wow_export/asset_formats as asset_formats
+import cheng/apps/wow_export/blp as blp
+import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/local_files as local_files
+import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
+
+type
+    AssetExportSummary =
+        label: str
+        kind: str
+        path: str
+        outPath: str
+        bytesWritten: int32
+        detail: str
+
+    AssetExportBundleSummary =
+        outDir: str
+        fileCount: int32
+        bytesWritten: int32
+
+fn assetExportMakeDirAll(path: str): bool =
+    if strings.Len(path) == 0:
+        return false
+    if os.DirExists(path):
+        return true
+    let parent: str = os.ParentDir(path)
+    if strings.Len(parent) > 0 && parent != path && !os.DirExists(parent):
+        if !assetExportMakeDirAll(parent):
+            return false
+    if !os.DirExists(path):
+        os.CreateDir(path)
+    return os.DirExists(path)
+
+fn assetExportWriteBufferAtomic(path: str, buf: bytes.ByteBuffer): Result[int32] =
+    if strings.Len(path) == 0:
+        return Err[int32]("wowExport asset export: missing output path")
+    if buf.len <= 0 || buf.data == nil:
+        return Err[int32]("wowExport asset export: empty buffer")
+    if os.FileExists(path):
+        return Err[int32]("wowExport asset export: refusing to overwrite " + path)
+    let parent: str = os.ParentDir(path)
+    if strings.Len(parent) > 0 && !os.DirExists(parent):
+        if !assetExportMakeDirAll(parent):
+            return Err[int32]("wowExport asset export: output directory create failed " + parent)
+    let tmpPath: str = path + ".tmp"
+    if os.FileExists(tmpPath):
+        let _ = os.RemoveFile(tmpPath)
+    let file: os.File = os.Open(tmpPath, os.fmWrite)
+    if file == nil:
+        return Err[int32]("wowExport asset export: open output failed " + tmpPath)
+    let wrote: int32 = os.C_fwrite(buf.data, 1, int64(buf.len), file)
+    let _ = os.C_fflush(file)
+    let _ = os.C_fclose(file)
+    if wrote != buf.len:
+        let _ = os.RemoveFile(tmpPath)
+        return Err[int32]("wowExport asset export: short write")
+    if !os.RenameFile(tmpPath, path):
+        let _ = os.RemoveFile(tmpPath)
+        return Err[int32]("wowExport asset export: rename output failed " + path)
+    return Ok[int32](wrote)
+
+fn AssetExportWriteBufferAtomic(path: str, buf: bytes.ByteBuffer): Result[int32] =
+    return assetExportWriteBufferAtomic(path, buf)
+
+fn assetExportValidateFile(file: northshire.NorthshireAuditedFile,
+                           buf: bytes.ByteBuffer): Result[str] =
+    if file.kind == "wdt":
+        let wdtRes: Result[asset_formats.WdtSummary] = asset_formats.ParseWdtSummary(buf)
+        if IsErr(wdtRes):
+            return Err[str](Error(wdtRes))
+        return Ok[str](asset_formats.WdtSummaryText(Value(wdtRes)))
+    if file.kind == "wmo":
+        let wmoRes: Result[asset_formats.WmoRootSummary] = asset_formats.ParseWmoRootSummary(buf)
+        if IsErr(wmoRes):
+            return Err[str](Error(wmoRes))
+        return Ok[str](asset_formats.WmoRootSummaryText(Value(wmoRes)))
+    if file.kind == "m2":
+        let geometryRes: Result[asset_formats.M2GeometrySummary] =
+            asset_formats.ParseM2GeometrySummary(buf)
+        if IsErr(geometryRes):
+            return Err[str](Error(geometryRes))
+        let geometry: asset_formats.M2GeometrySummary = Value(geometryRes)
+        let vertexText: str = strings.IntToStr(geometry.header.vertexCount)
+        let spanXText: str = strings.IntToStr(asset_formats.M2GeometrySpanX1000(geometry))
+        let spanYText: str = strings.IntToStr(asset_formats.M2GeometrySpanY1000(geometry))
+        let spanZText: str = strings.IntToStr(asset_formats.M2GeometrySpanZ1000(geometry))
+        return Ok[str]("m2 vertices=" + vertexText + " span1000=" + spanXText + "," + spanYText + "," + spanZText)
+    if file.kind == "blp":
+        let headerRes: Result[blp.Blp2Header] = blp.ParseBlp2Header(buf)
+        if IsErr(headerRes):
+            return Err[str](Error(headerRes))
+        let widthText: str = strings.IntToStr(Value(headerRes).width)
+        let heightText: str = strings.IntToStr(Value(headerRes).height)
+        return Ok[str]("blp size=" + widthText + "x" + heightText)
+    return Err[str]("wowExport asset export: unsupported manifest kind " + file.kind)
+
+fn NorthshireFindByLabel(m: northshire.NorthshireManifest,
+                         label: str): Result[northshire.NorthshireAuditedFile] =
+    if strings.Len(label) == 0:
+        return Err[northshire.NorthshireAuditedFile]("wowExport asset export: empty label")
+    var i: int32
+    while i < m.auditedFiles.len:
+        let file: northshire.NorthshireAuditedFile = m.auditedFiles[i]
+        if file.label == label:
+            return Ok[northshire.NorthshireAuditedFile](file)
+        i = i + 1
+    return Err[northshire.NorthshireAuditedFile]("wowExport asset export: audited label not found " + label)
+
+fn NorthshireFindByFileDataID(m: northshire.NorthshireManifest,
+                              fileDataID: int32): Result[northshire.NorthshireAuditedFile] =
+    var i: int32
+    while i < m.auditedFiles.len:
+        let file: northshire.NorthshireAuditedFile = m.auditedFiles[i]
+        if file.fileDataID == fileDataID:
+            return Ok[northshire.NorthshireAuditedFile](file)
+        i = i + 1
+    return Err[northshire.NorthshireAuditedFile]("wowExport asset export: fileDataID is not in audited Northshire manifest " + strings.IntToStr(fileDataID))
+
+fn NorthshireFindFirstKind(m: northshire.NorthshireManifest,
+                           kind: str): Result[northshire.NorthshireAuditedFile] =
+    var i: int32
+    while i < m.auditedFiles.len:
+        let file: northshire.NorthshireAuditedFile = m.auditedFiles[i]
+        if file.kind == kind:
+            return Ok[northshire.NorthshireAuditedFile](file)
+        i = i + 1
+    return Err[northshire.NorthshireAuditedFile]("wowExport asset export: audited kind not found " + kind)
+
+fn assetExportNorthshireFileAfterAudit(m: northshire.NorthshireManifest,
+                                       file: northshire.NorthshireAuditedFile,
+                                       outPath: str): Result[AssetExportSummary] =
+    let fileRes: Result[bytes.ByteBuffer] =
+        local_files.ReadLocalFileByEntry(m.clientPath, file.archiveIndex, file.offset, file.size)
+    if IsErr(fileRes):
+        return Err[AssetExportSummary](Error(fileRes))
+    var fileBuf: bytes.ByteBuffer = Value(fileRes)
+    let detailRes: Result[str] = assetExportValidateFile(file, fileBuf)
+    if IsErr(detailRes):
+        bytes.FreeByteBuffer(fileBuf)
+        return Err[AssetExportSummary](Error(detailRes))
+    let writeRes: Result[int32] = assetExportWriteBufferAtomic(outPath, fileBuf)
+    bytes.FreeByteBuffer(fileBuf)
+    if IsErr(writeRes):
+        return Err[AssetExportSummary](Error(writeRes))
+    var out: AssetExportSummary
+    out.label = file.label
+    out.kind = file.kind
+    out.path = file.path
+    out.outPath = outPath
+    out.bytesWritten = Value(writeRes)
+    out.detail = Value(detailRes)
+    return Ok[AssetExportSummary](out)
+
+fn ExportNorthshireFile(m: northshire.NorthshireManifest,
+                        file: northshire.NorthshireAuditedFile,
+                        outPath: str): Result[AssetExportSummary] =
+    let auditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestPayloadsAgainstLocal(m)
+    if IsErr(auditRes):
+        return Err[AssetExportSummary](Error(auditRes))
+    return assetExportNorthshireFileAfterAudit(m, file, outPath)
+
+fn ExportNorthshireLabel(m: northshire.NorthshireManifest,
+                         label: str,
+                         outPath: str): Result[AssetExportSummary] =
+    let fileRes: Result[northshire.NorthshireAuditedFile] = NorthshireFindByLabel(m, label)
+    if IsErr(fileRes):
+        return Err[AssetExportSummary](Error(fileRes))
+    return ExportNorthshireFile(m, Value(fileRes), outPath)
+
+fn ExportNorthshireFileDataID(m: northshire.NorthshireManifest,
+                              fileDataID: int32,
+                              outPath: str): Result[AssetExportSummary] =
+    let fileRes: Result[northshire.NorthshireAuditedFile] = NorthshireFindByFileDataID(m, fileDataID)
+    if IsErr(fileRes):
+        return Err[AssetExportSummary](Error(fileRes))
+    return ExportNorthshireFile(m, Value(fileRes), outPath)
+
+fn ExportNorthshireKind(m: northshire.NorthshireManifest,
+                        kind: str,
+                        outPath: str): Result[AssetExportSummary] =
+    let fileRes: Result[northshire.NorthshireAuditedFile] = NorthshireFindFirstKind(m, kind)
+    if IsErr(fileRes):
+        return Err[AssetExportSummary](Error(fileRes))
+    return ExportNorthshireFile(m, Value(fileRes), outPath)
+
+fn ConvertNorthshireBlpFile(m: northshire.NorthshireManifest,
+                            file: northshire.NorthshireAuditedFile,
+                            outPath: str): Result[AssetExportSummary] =
+    if file.kind != "blp":
+        return Err[AssetExportSummary]("wowExport BLP convert: audited file is not BLP " + file.label)
+    let auditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestPayloadsAgainstLocal(m)
+    if IsErr(auditRes):
+        return Err[AssetExportSummary](Error(auditRes))
+    let fileRes: Result[bytes.ByteBuffer] =
+        local_files.ReadLocalFileByEntry(m.clientPath, file.archiveIndex, file.offset, file.size)
+    if IsErr(fileRes):
+        return Err[AssetExportSummary](Error(fileRes))
+    var fileBuf: bytes.ByteBuffer = Value(fileRes)
+    let tgaRes: Result[bytes.ByteBuffer] = blp.Blp2DecodeFirstMipTga(fileBuf)
+    bytes.FreeByteBuffer(fileBuf)
+    if IsErr(tgaRes):
+        return Err[AssetExportSummary](Error(tgaRes))
+    var tgaBuf: bytes.ByteBuffer = Value(tgaRes)
+    let writeRes: Result[int32] = assetExportWriteBufferAtomic(outPath, tgaBuf)
+    bytes.FreeByteBuffer(tgaBuf)
+    if IsErr(writeRes):
+        return Err[AssetExportSummary](Error(writeRes))
+    var out: AssetExportSummary
+    out.label = file.label
+    out.kind = "tga"
+    out.path = file.path
+    out.outPath = outPath
+    out.bytesWritten = Value(writeRes)
+    out.detail = "blp2-dxt-to-tga"
+    return Ok[AssetExportSummary](out)
+
+fn ConvertNorthshireBlpLabel(m: northshire.NorthshireManifest,
+                             label: str,
+                             outPath: str): Result[AssetExportSummary] =
+    let fileRes: Result[northshire.NorthshireAuditedFile] = NorthshireFindByLabel(m, label)
+    if IsErr(fileRes):
+        return Err[AssetExportSummary](Error(fileRes))
+    return ConvertNorthshireBlpFile(m, Value(fileRes), outPath)
+
+fn ConvertNorthshireBlpFileDataID(m: northshire.NorthshireManifest,
+                                  fileDataID: int32,
+                                  outPath: str): Result[AssetExportSummary] =
+    let fileRes: Result[northshire.NorthshireAuditedFile] = NorthshireFindByFileDataID(m, fileDataID)
+    if IsErr(fileRes):
+        return Err[AssetExportSummary](Error(fileRes))
+    return ConvertNorthshireBlpFile(m, Value(fileRes), outPath)
+
+fn ConvertNorthshireFirstBlp(m: northshire.NorthshireManifest,
+                             outPath: str): Result[AssetExportSummary] =
+    let fileRes: Result[northshire.NorthshireAuditedFile] = NorthshireFindFirstKind(m, "blp")
+    if IsErr(fileRes):
+        return Err[AssetExportSummary](Error(fileRes))
+    return ConvertNorthshireBlpFile(m, Value(fileRes), outPath)
+
+fn NorthshireDefaultOutputName(file: northshire.NorthshireAuditedFile): str =
+    return file.label + "." + file.kind
+
+fn ExportNorthshireBundle(m: northshire.NorthshireManifest,
+                          outDir: str): Result[AssetExportBundleSummary] =
+    if strings.Len(outDir) == 0:
+        return Err[AssetExportBundleSummary]("wowExport asset export: missing output directory")
+    if !assetExportMakeDirAll(outDir):
+        return Err[AssetExportBundleSummary]("wowExport asset export: output directory create failed " + outDir)
+    let auditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestPayloadsAgainstLocal(m)
+    if IsErr(auditRes):
+        return Err[AssetExportBundleSummary](Error(auditRes))
+    var out: AssetExportBundleSummary
+    out.outDir = outDir
+    var i: int32
+    while i < m.auditedFiles.len:
+        let file: northshire.NorthshireAuditedFile = m.auditedFiles[i]
+        let name: str = NorthshireDefaultOutputName(file)
+        let path: str = build_info.StablePathJoin(outDir, name)
+        let exportRes: Result[AssetExportSummary] = assetExportNorthshireFileAfterAudit(m, file, path)
+        if IsErr(exportRes):
+            return Err[AssetExportBundleSummary](Error(exportRes))
+        out.fileCount = out.fileCount + 1
+        out.bytesWritten = out.bytesWritten + Value(exportRes).bytesWritten
+        i = i + 1
+    return Ok[AssetExportBundleSummary](out)
+
+fn AssetExportSummaryText(summary: AssetExportSummary): str =
+    let bytesText: str = strings.IntToStr(summary.bytesWritten)
+    return "exported label=" + summary.label + " kind=" + summary.kind + " bytes=" + bytesText +
+        " out=" + summary.outPath + " detail=" + summary.detail
+
+fn AssetExportBundleSummaryText(summary: AssetExportBundleSummary): str =
+    let countText: str = strings.IntToStr(summary.fileCount)
+    let bytesText: str = strings.IntToStr(summary.bytesWritten)
+    return "exportedBundle files=" + countText + " bytes=" + bytesText + " outDir=" + summary.outDir

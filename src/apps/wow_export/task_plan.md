@@ -25,5 +25,10 @@
 - [x] Optimize pure Cheng zlib hot path for CDN root range decode.
 - [x] Make Northshire CLI preview load real local assets without full root rescans.
 - [x] Parse real M2 vertex bounds for Northshire preview.
-- [ ] Export audited Northshire assets to files from CLI.
+- [x] Export audited Northshire assets to files from CLI.
+- [x] Convert real Northshire BLP2 DXT texture to TGA from CLI.
+- [x] Parse WDT/WMO scene counts for Northshire preview.
+- [x] Discover WDT/WMO/M2 dependency fileDataIDs from real assets.
+- [ ] Extend audited manifest with required WMO group and M2 skin dependencies.
+- [ ] Decode WMO group geometry and M2 skin/index data.
 - [ ] Render Northshire MVP from real local assets.

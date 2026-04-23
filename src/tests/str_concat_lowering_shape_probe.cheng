@@ -1,0 +1,74 @@
+import std/os
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/path as chengpath
+
+type
+    DummyResult = object
+        text: str
+        exitCode: int32
+
+fn StrConcatLoweringFlag(prefix: str, value: str): str =
+    var parts: str[]
+    add(parts, prefix)
+    add(parts, value)
+    return Fmt(parts)
+
+fn Sink(root: str,
+        label: str,
+        filePathRaw: str,
+        argv: str[],
+        envOverrides: str[],
+        workingDirRaw: str,
+        timeoutSec: int32,
+        logPathRaw: str): DummyResult =
+    let joined = argv[0] + "|" + argv[1] + "|" + argv[2] + "|" + argv[4] + "|" + argv[5] + "|" + argv[6]
+    let meta = root + "|" + label + "|" + filePathRaw + "|" + workingDirRaw + "|" + logPathRaw
+    if len(envOverrides) != 0:
+        return DummyResult(text: meta, exitCode: 9)
+    if timeoutSec != 0:
+        return DummyResult(text: meta, exitCode: 8)
+    return DummyResult(text: joined, exitCode: 0)
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let compilerEnv = os.GetEnv("CHENG_SMOKE_COMPILER")
+    var compilerRaw = "artifacts/bootstrap/cheng.stage3"
+    if len(compilerEnv) > 0:
+        compilerRaw = compilerEnv
+    var driver = compilerRaw
+    if !os.IsAbsolute(compilerRaw):
+        driver = os.JoinPath(root, compilerRaw)
+    let target = os.GetEnvDefault("CHENG_RUNTIME_LINK_TARGET", "arm64-apple-darwin")
+    let outDir = chengpath.PathAbsolute(root, "artifacts/str_concat_lowering_shape_probe")
+    let sourcePath = os.JoinPath(root, "src/tests/str_concat_lowering_fixture.cheng")
+    let outBin = os.JoinPath(outDir, "str_concat_lowering_probe")
+    let exeReportPath = os.JoinPath(outDir, "str_concat_lowering_probe.compile.report.txt")
+    let exeCompileLog = os.JoinPath(outDir, "str_concat_lowering_probe.compile.log")
+    assert(chengpath.MkdirP(root, outDir), " str concat lowering shape: mkdir")
+    assert(os.FileExists(driver), " str concat lowering shape: compiler exists")
+    let run = Sink(root,
+                   "str_concat_lowering_shape_probe",
+                   driver,
+                   [
+                       "system-link-exec",
+                       StrConcatLoweringFlag("--root:", root),
+                       StrConcatLoweringFlag("--in:", sourcePath),
+                       "--emit:exe",
+                       StrConcatLoweringFlag("--target:", target),
+                       StrConcatLoweringFlag("--out:", outBin),
+                       StrConcatLoweringFlag("--report-out:", exeReportPath)
+                   ],
+                   [],
+                   root,
+                   0,
+                   exeCompileLog)
+    assert(run.exitCode == 0, " str concat lowering shape: rc")
+    assert(strings.StrContains(run.text, "--root:"), " str concat lowering shape: root")
+    assert(strings.StrContains(run.text, "--in:"), " str concat lowering shape: in")
+    assert(strings.StrContains(run.text, "--target:"), " str concat lowering shape: target")
+    assert(strings.StrContains(run.text, "--out:"), " str concat lowering shape: out")
+    assert(strings.StrContains(run.text, "--report-out:"), " str concat lowering shape: report")
+    assert(!strutil.Contains(run.text, "||"), " str concat lowering shape: nonempty")
+    echo(" str_concat_lowering_shape_probe ok")
+    return 0

@@ -19,8 +19,24 @@ type
         totalChunkCount: int32
         textureWidth: int32
         textureHeight: int32
+        textureTgaBytes: int32
+        wdtActiveTileCount: int32
+        wdtModelPlacementCount: int32
+        wdtMaidFileDataIDCount: int32
+        wdtFirstMaidFileDataID: int32
         wmoChunkCount: int32
+        wmoMaterialCount: int32
+        wmoGroupCount: int32
+        wmoDoodadCount: int32
+        wmoGroupFileDataIDCount: int32
+        wmoFirstGroupFileDataID: int32
+        wmoModelFileDataIDCount: int32
+        wmoFirstModelFileDataID: int32
         m2Version: int32
+        m2SkinFileDataIDCount: int32
+        m2FirstSkinFileDataID: int32
+        m2TextureFileDataIDCount: int32
+        m2FirstTextureFileDataID: int32
         assetBytes: int32
         characterVertexCount: int32
         animationSequenceCount: int32
@@ -53,19 +69,38 @@ fn previewLoadAuditedAssets(summary: var PreviewSummary,
         summary.loadedFileCount = summary.loadedFileCount + 1
         summary.assetBytes = summary.assetBytes + fileBuf.len
         if file.kind == "wdt":
+            let wdtRes: Result[asset_formats.WdtSummary] = asset_formats.ParseWdtSummary(fileBuf)
+            if IsErr(wdtRes):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool](Error(wdtRes))
+            summary.wdtActiveTileCount = Value(wdtRes).activeTileCount
+            summary.wdtModelPlacementCount = Value(wdtRes).modelPlacementCount
+            summary.wdtMaidFileDataIDCount = Value(wdtRes).maidReferencedFileCount
+            summary.wdtFirstMaidFileDataID = Value(wdtRes).firstMaidFileDataID
             let chunkRes: Result[bool] = previewApplyChunkedAsset(summary, fileBuf, "northshire-wdt")
             bytes.FreeByteBuffer(fileBuf)
             if IsErr(chunkRes):
                 return Err[bool](Error(chunkRes))
         elif file.kind == "wmo":
+            let wmoRes: Result[asset_formats.WmoRootSummary] = asset_formats.ParseWmoRootSummary(fileBuf)
+            if IsErr(wmoRes):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool](Error(wmoRes))
+            summary.wmoMaterialCount = Value(wmoRes).materialCount
+            summary.wmoGroupCount = Value(wmoRes).groupCount
+            summary.wmoDoodadCount = Value(wmoRes).doodadCount
+            summary.wmoGroupFileDataIDCount = Value(wmoRes).groupFileDataIDCount
+            summary.wmoFirstGroupFileDataID = Value(wmoRes).firstGroupFileDataID
+            summary.wmoModelFileDataIDCount = Value(wmoRes).modelFileDataIDCount
+            summary.wmoFirstModelFileDataID = Value(wmoRes).firstModelFileDataID
             let chunkRes: Result[bool] = previewApplyChunkedAsset(summary, fileBuf, "northshire-wmo")
             bytes.FreeByteBuffer(fileBuf)
             if IsErr(chunkRes):
                 return Err[bool](Error(chunkRes))
         elif file.kind == "m2":
             let geometryRes: Result[asset_formats.M2GeometrySummary] = asset_formats.ParseM2GeometrySummary(fileBuf)
-            bytes.FreeByteBuffer(fileBuf)
             if IsErr(geometryRes):
+                bytes.FreeByteBuffer(fileBuf)
                 return Err[bool](Error(geometryRes))
             let geometry: asset_formats.M2GeometrySummary = Value(geometryRes)
             summary.m2Version = geometry.header.version
@@ -75,13 +110,29 @@ fn previewLoadAuditedAssets(summary: var PreviewSummary,
             summary.modelSpanX1000 = asset_formats.M2GeometrySpanX1000(geometry)
             summary.modelSpanY1000 = asset_formats.M2GeometrySpanY1000(geometry)
             summary.modelSpanZ1000 = asset_formats.M2GeometrySpanZ1000(geometry)
+            let depRes: Result[asset_formats.M2DependencySummary] =
+                asset_formats.ParseM2DependencySummary(fileBuf)
+            bytes.FreeByteBuffer(fileBuf)
+            if IsErr(depRes):
+                return Err[bool](Error(depRes))
+            summary.m2SkinFileDataIDCount = Value(depRes).skinFileDataIDCount
+            summary.m2FirstSkinFileDataID = Value(depRes).firstSkinFileDataID
+            summary.m2TextureFileDataIDCount = Value(depRes).textureFileDataIDCount
+            summary.m2FirstTextureFileDataID = Value(depRes).firstTextureFileDataID
         elif file.kind == "blp":
             let headerRes: Result[blp.Blp2Header] = blp.ParseBlp2Header(fileBuf)
-            bytes.FreeByteBuffer(fileBuf)
             if IsErr(headerRes):
+                bytes.FreeByteBuffer(fileBuf)
                 return Err[bool](Error(headerRes))
             summary.textureWidth = Value(headerRes).width
             summary.textureHeight = Value(headerRes).height
+            let tgaRes: Result[bytes.ByteBuffer] = blp.Blp2DecodeFirstMipTga(fileBuf)
+            bytes.FreeByteBuffer(fileBuf)
+            if IsErr(tgaRes):
+                return Err[bool](Error(tgaRes))
+            let tgaBuf: bytes.ByteBuffer = Value(tgaRes)
+            summary.textureTgaBytes = tgaBuf.len
+            bytes.FreeByteBuffer(tgaBuf)
         else:
             bytes.FreeByteBuffer(fileBuf)
             return Err[bool]("wowExport preview: unsupported audited file kind " + file.kind)
@@ -106,8 +157,15 @@ fn PreviewNorthshire(frames: int32): Result[PreviewSummary] =
     if IsErr(loadRes):
         return Err[PreviewSummary](Error(loadRes))
     out.sceneNonEmpty = out.loadedFileCount == out.auditedFileCount &&
+        out.wdtActiveTileCount > 0 &&
+        out.wdtMaidFileDataIDCount > 0 &&
+        out.wmoGroupCount > 0 &&
+        out.wmoMaterialCount > 0 &&
+        out.wmoGroupFileDataIDCount == out.wmoGroupCount &&
         out.wmoChunkCount > 0 &&
         out.m2Version > 0 &&
+        out.m2SkinFileDataIDCount > 0 &&
+        out.m2TextureFileDataIDCount > 0 &&
         out.characterVertexCount > 0 &&
         out.modelBoundsReady &&
         out.modelSpanX1000 > 0 &&
@@ -115,9 +173,81 @@ fn PreviewNorthshire(frames: int32): Result[PreviewSummary] =
         out.modelSpanZ1000 > 0 &&
         out.animationSequenceCount > 0 &&
         out.textureWidth > 0 &&
-        out.textureHeight > 0
+        out.textureHeight > 0 &&
+        out.textureTgaBytes > 0
     out.memoryOutstanding = 0
     return Ok[PreviewSummary](out)
 
 fn PreviewSummaryText(summary: PreviewSummary): str =
-    return Fmt"size={strings.IntToStr(summary.width)}x{strings.IntToStr(summary.height)} frames={strings.IntToStr(summary.frames)} scene={summary.sceneNonEmpty ? \"non-empty\" : \"empty\"} auditedFiles={strings.IntToStr(summary.auditedFileCount)} loadedFiles={strings.IntToStr(summary.loadedFileCount)} chunkFiles={strings.IntToStr(summary.chunkFileCount)} totalChunks={strings.IntToStr(summary.totalChunkCount)} wmoChunks={strings.IntToStr(summary.wmoChunkCount)} m2Version={strings.IntToStr(summary.m2Version)} texture={strings.IntToStr(summary.textureWidth)}x{strings.IntToStr(summary.textureHeight)} assetBytes={strings.IntToStr(summary.assetBytes)} characterVertices={strings.IntToStr(summary.characterVertexCount)} animationSequences={strings.IntToStr(summary.animationSequenceCount)} modelBounds={summary.modelBoundsReady ? \"ready\" : \"missing\"} modelSpan1000={strings.IntToStr(summary.modelSpanX1000)},{strings.IntToStr(summary.modelSpanY1000)},{strings.IntToStr(summary.modelSpanZ1000)} memoryOutstanding={strings.IntToStr(summary.memoryOutstanding)}"
+    let widthText: str = strings.IntToStr(summary.width)
+    let heightText: str = strings.IntToStr(summary.height)
+    let sizeText: str = widthText + "x" + heightText
+    let frameText: str = strings.IntToStr(summary.frames)
+    let sceneText: str = summary.sceneNonEmpty ? "non-empty" : "empty"
+    let auditedText: str = strings.IntToStr(summary.auditedFileCount)
+    let loadedText: str = strings.IntToStr(summary.loadedFileCount)
+    let chunkText: str = strings.IntToStr(summary.chunkFileCount)
+    let totalChunkText: str = strings.IntToStr(summary.totalChunkCount)
+    let wdtTileText: str = strings.IntToStr(summary.wdtActiveTileCount)
+    let wdtPlacementText: str = strings.IntToStr(summary.wdtModelPlacementCount)
+    let wdtMaidText: str = strings.IntToStr(summary.wdtMaidFileDataIDCount)
+    let wdtFirstMaidText: str = strings.IntToStr(summary.wdtFirstMaidFileDataID)
+    let wmoChunkText: str = strings.IntToStr(summary.wmoChunkCount)
+    let wmoGroupText: str = strings.IntToStr(summary.wmoGroupCount)
+    let wmoMaterialText: str = strings.IntToStr(summary.wmoMaterialCount)
+    let wmoDoodadText: str = strings.IntToStr(summary.wmoDoodadCount)
+    let wmoGfidText: str = strings.IntToStr(summary.wmoGroupFileDataIDCount)
+    let wmoFirstGroupText: str = strings.IntToStr(summary.wmoFirstGroupFileDataID)
+    let wmoModelIdText: str = strings.IntToStr(summary.wmoModelFileDataIDCount)
+    let wmoFirstModelText: str = strings.IntToStr(summary.wmoFirstModelFileDataID)
+    let m2Text: str = strings.IntToStr(summary.m2Version)
+    let m2SkinText: str = strings.IntToStr(summary.m2SkinFileDataIDCount)
+    let m2FirstSkinText: str = strings.IntToStr(summary.m2FirstSkinFileDataID)
+    let m2TextureIdText: str = strings.IntToStr(summary.m2TextureFileDataIDCount)
+    let m2FirstTextureIdText: str = strings.IntToStr(summary.m2FirstTextureFileDataID)
+    let textureWidthText: str = strings.IntToStr(summary.textureWidth)
+    let textureHeightText: str = strings.IntToStr(summary.textureHeight)
+    let textureText: str = textureWidthText + "x" + textureHeightText
+    let tgaText: str = strings.IntToStr(summary.textureTgaBytes)
+    let assetBytesText: str = strings.IntToStr(summary.assetBytes)
+    let vertexText: str = strings.IntToStr(summary.characterVertexCount)
+    let sequenceText: str = strings.IntToStr(summary.animationSequenceCount)
+    let boundsText: str = summary.modelBoundsReady ? "ready" : "missing"
+    let spanXText: str = strings.IntToStr(summary.modelSpanX1000)
+    let spanYText: str = strings.IntToStr(summary.modelSpanY1000)
+    let spanZText: str = strings.IntToStr(summary.modelSpanZ1000)
+    let spanText: str = spanXText + "," + spanYText + "," + spanZText
+    let memoryText: str = strings.IntToStr(summary.memoryOutstanding)
+    var out: str = "size=" + sizeText
+    out = out + " frames=" + frameText
+    out = out + " scene=" + sceneText
+    out = out + " auditedFiles=" + auditedText
+    out = out + " loadedFiles=" + loadedText
+    out = out + " chunkFiles=" + chunkText
+    out = out + " totalChunks=" + totalChunkText
+    out = out + " wdtActiveTiles=" + wdtTileText
+    out = out + " wdtModelPlacements=" + wdtPlacementText
+    out = out + " wdtMaidFileIDs=" + wdtMaidText
+    out = out + " wdtFirstMaidFileDataID=" + wdtFirstMaidText
+    out = out + " wmoChunks=" + wmoChunkText
+    out = out + " wmoGroups=" + wmoGroupText
+    out = out + " wmoMaterials=" + wmoMaterialText
+    out = out + " wmoDoodads=" + wmoDoodadText
+    out = out + " wmoGroupFileIDs=" + wmoGfidText
+    out = out + " wmoFirstGroupFileDataID=" + wmoFirstGroupText
+    out = out + " wmoModelFileIDs=" + wmoModelIdText
+    out = out + " wmoFirstModelFileDataID=" + wmoFirstModelText
+    out = out + " m2Version=" + m2Text
+    out = out + " m2SkinFileIDs=" + m2SkinText
+    out = out + " m2FirstSkinFileDataID=" + m2FirstSkinText
+    out = out + " m2TextureFileIDs=" + m2TextureIdText
+    out = out + " m2FirstTextureFileDataID=" + m2FirstTextureIdText
+    out = out + " texture=" + textureText
+    out = out + " textureTgaBytes=" + tgaText
+    out = out + " assetBytes=" + assetBytesText
+    out = out + " characterVertices=" + vertexText
+    out = out + " animationSequences=" + sequenceText
+    out = out + " modelBounds=" + boundsText
+    out = out + " modelSpan1000=" + spanText
+    out = out + " memoryOutstanding=" + memoryText
+    return out

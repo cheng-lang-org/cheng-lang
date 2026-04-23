@@ -10,6 +10,35 @@ type
         versionOrSize: int32
         chunkCount: int32
 
+    WdtSummary =
+        header: FormatHeader
+        mainEntryCount: int32
+        activeTileCount: int32
+        modelPlacementCount: int32
+        maidEntryCount: int32
+        maidReferencedFileCount: int32
+        firstMaidFileDataID: int32
+
+    WmoRootSummary =
+        header: FormatHeader
+        materialCount: int32
+        groupCount: int32
+        portalCount: int32
+        lightCount: int32
+        modelCount: int32
+        doodadCount: int32
+        doodadSetCount: int32
+        groupFileDataIDCount: int32
+        firstGroupFileDataID: int32
+        modelFileDataIDCount: int32
+        firstModelFileDataID: int32
+
+    M2DependencySummary =
+        skinFileDataIDCount: int32
+        firstSkinFileDataID: int32
+        textureFileDataIDCount: int32
+        firstTextureFileDataID: int32
+
     M2Header =
         version: int32
         sequenceCount: int32
@@ -207,8 +236,183 @@ fn ParseChunkedHeader(buf: bytes.ByteBuffer, label: str): Result[FormatHeader] =
     out.chunkCount = count
     return Ok[FormatHeader](out)
 
+fn ParseWdtSummary(buf: bytes.ByteBuffer): Result[WdtSummary] =
+    let headerRes: Result[FormatHeader] = ParseChunkedHeader(buf, "WDT")
+    if IsErr(headerRes):
+        return Err[WdtSummary](Error(headerRes))
+    var out: WdtSummary
+    out.header = Value(headerRes)
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[WdtSummary]("wowExport WDT: truncated chunk")
+        let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+        if IsErr(magicRes):
+            return Err[WdtSummary](Error(magicRes))
+        let magic: str = Value(magicRes)
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if dataPos + size > buf.len:
+            return Err[WdtSummary]("wowExport WDT: chunk out of bounds")
+        if magic == "NIAM":
+            if (size % 8) != 0:
+                return Err[WdtSummary]("wowExport WDT: MAIN chunk size invalid")
+            out.mainEntryCount = size / 8
+            var i: int32
+            while i < out.mainEntryCount:
+                let entryPos: int32 = dataPos + i * 8
+                let flags: int32 = bytes.ReadU32LEAt(buf, entryPos)
+                let asyncId: int32 = bytes.ReadU32LEAt(buf, entryPos + 4)
+                if flags != 0 || asyncId != 0:
+                    out.activeTileCount = out.activeTileCount + 1
+                i = i + 1
+        elif magic == "FDOM":
+            if (size % 64) != 0:
+                return Err[WdtSummary]("wowExport WDT: MODF chunk size invalid")
+            out.modelPlacementCount = size / 64
+        elif magic == "DIAM":
+            if (size % 32) != 0:
+                return Err[WdtSummary]("wowExport WDT: MAID chunk size invalid")
+            out.maidEntryCount = size / 32
+            var entryIndex: int32
+            while entryIndex < out.maidEntryCount:
+                var slot: int32
+                while slot < 8:
+                    let fileDataID: int32 = bytes.ReadU32LEAt(buf, dataPos + entryIndex * 32 + slot * 4)
+                    if fileDataID > 0:
+                        if out.firstMaidFileDataID == 0:
+                            out.firstMaidFileDataID = fileDataID
+                        out.maidReferencedFileCount = out.maidReferencedFileCount + 1
+                    slot = slot + 1
+                entryIndex = entryIndex + 1
+        pos = dataPos + size
+    if out.mainEntryCount <= 0:
+        return Err[WdtSummary]("wowExport WDT: MAIN chunk missing")
+    return Ok[WdtSummary](out)
+
+fn ParseWmoRootSummary(buf: bytes.ByteBuffer): Result[WmoRootSummary] =
+    let headerRes: Result[FormatHeader] = ParseChunkedHeader(buf, "WMO")
+    if IsErr(headerRes):
+        return Err[WmoRootSummary](Error(headerRes))
+    var out: WmoRootSummary
+    out.header = Value(headerRes)
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[WmoRootSummary]("wowExport WMO: truncated chunk")
+        let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+        if IsErr(magicRes):
+            return Err[WmoRootSummary](Error(magicRes))
+        let magic: str = Value(magicRes)
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if dataPos + size > buf.len:
+            return Err[WmoRootSummary]("wowExport WMO: chunk out of bounds")
+        if magic == "DHOM":
+            if size < 28:
+                return Err[WmoRootSummary]("wowExport WMO: MOHD chunk too small")
+            out.materialCount = bytes.ReadU32LEAt(buf, dataPos)
+            out.groupCount = bytes.ReadU32LEAt(buf, dataPos + 4)
+            out.portalCount = bytes.ReadU32LEAt(buf, dataPos + 8)
+            out.lightCount = bytes.ReadU32LEAt(buf, dataPos + 12)
+            out.modelCount = bytes.ReadU32LEAt(buf, dataPos + 16)
+            out.doodadCount = bytes.ReadU32LEAt(buf, dataPos + 20)
+            out.doodadSetCount = bytes.ReadU32LEAt(buf, dataPos + 24)
+        elif magic == "DIFG":
+            if (size % 4) != 0:
+                return Err[WmoRootSummary]("wowExport WMO: GFID chunk size invalid")
+            out.groupFileDataIDCount = size / 4
+            if out.groupFileDataIDCount > 0:
+                out.firstGroupFileDataID = bytes.ReadU32LEAt(buf, dataPos)
+        elif magic == "IDOM":
+            if (size % 4) != 0:
+                return Err[WmoRootSummary]("wowExport WMO: MODI chunk size invalid")
+            var i: int32
+            while i < size / 4:
+                let fileDataID: int32 = bytes.ReadU32LEAt(buf, dataPos + i * 4)
+                if fileDataID > 0:
+                    if out.firstModelFileDataID == 0:
+                        out.firstModelFileDataID = fileDataID
+                    out.modelFileDataIDCount = out.modelFileDataIDCount + 1
+                i = i + 1
+        pos = dataPos + size
+    if out.groupCount <= 0:
+        return Err[WmoRootSummary]("wowExport WMO: MOHD group count missing")
+    return Ok[WmoRootSummary](out)
+
+fn ParseM2DependencySummary(buf: bytes.ByteBuffer): Result[M2DependencySummary] =
+    if buf.len < 8:
+        return Err[M2DependencySummary]("wowExport M2 deps: file too small")
+    var out: M2DependencySummary
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[M2DependencySummary]("wowExport M2 deps: truncated chunk")
+        let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+        if IsErr(magicRes):
+            return Err[M2DependencySummary](Error(magicRes))
+        let magic: str = Value(magicRes)
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[M2DependencySummary]("wowExport M2 deps: chunk out of bounds")
+        if magic == "SFID":
+            if (size % 4) != 0:
+                return Err[M2DependencySummary]("wowExport M2 deps: SFID chunk size invalid")
+            out.skinFileDataIDCount = size / 4
+            if out.skinFileDataIDCount > 0:
+                out.firstSkinFileDataID = bytes.ReadU32LEAt(buf, dataPos)
+        elif magic == "TXID":
+            if (size % 4) != 0:
+                return Err[M2DependencySummary]("wowExport M2 deps: TXID chunk size invalid")
+            var i: int32
+            while i < size / 4:
+                let fileDataID: int32 = bytes.ReadU32LEAt(buf, dataPos + i * 4)
+                if fileDataID > 0:
+                    if out.firstTextureFileDataID == 0:
+                        out.firstTextureFileDataID = fileDataID
+                    out.textureFileDataIDCount = out.textureFileDataIDCount + 1
+                i = i + 1
+        pos = dataPos + size
+    if out.skinFileDataIDCount <= 0 && out.textureFileDataIDCount <= 0:
+        return Err[M2DependencySummary]("wowExport M2 deps: no dependency chunks found")
+    return Ok[M2DependencySummary](out)
+
 fn FormatHeaderText(header: FormatHeader): str =
     return Fmt"magic={header.magic} value={strings.IntToStr(header.versionOrSize)} chunks={strings.IntToStr(header.chunkCount)}"
 
 fn M2HeaderText(header: M2Header): str =
     return Fmt"version={strings.IntToStr(header.version)} sequences={strings.IntToStr(header.sequenceCount)} bones={strings.IntToStr(header.boneCount)} vertices={strings.IntToStr(header.vertexCount)} vertexOffset={strings.IntToStr(header.vertexOffset)} skins={strings.IntToStr(header.skinProfileCount)} textures={strings.IntToStr(header.textureCount)}"
+
+fn WdtSummaryText(summary: WdtSummary): str =
+    let mainText: str = strings.IntToStr(summary.mainEntryCount)
+    let activeText: str = strings.IntToStr(summary.activeTileCount)
+    let placementText: str = strings.IntToStr(summary.modelPlacementCount)
+    let maidText: str = strings.IntToStr(summary.maidEntryCount)
+    let maidFileText: str = strings.IntToStr(summary.maidReferencedFileCount)
+    let firstMaidText: str = strings.IntToStr(summary.firstMaidFileDataID)
+    return "wdt mainEntries=" + mainText + " activeTiles=" + activeText +
+        " modelPlacements=" + placementText + " maidEntries=" + maidText +
+        " maidFileIDs=" + maidFileText + " firstMaidFileDataID=" + firstMaidText
+
+fn WmoRootSummaryText(summary: WmoRootSummary): str =
+    let matText: str = strings.IntToStr(summary.materialCount)
+    let groupText: str = strings.IntToStr(summary.groupCount)
+    let doodadText: str = strings.IntToStr(summary.doodadCount)
+    let setText: str = strings.IntToStr(summary.doodadSetCount)
+    let gfidText: str = strings.IntToStr(summary.groupFileDataIDCount)
+    let firstGroupText: str = strings.IntToStr(summary.firstGroupFileDataID)
+    let modelIdText: str = strings.IntToStr(summary.modelFileDataIDCount)
+    let firstModelText: str = strings.IntToStr(summary.firstModelFileDataID)
+    return "wmo materials=" + matText + " groups=" + groupText +
+        " doodads=" + doodadText + " doodadSets=" + setText +
+        " groupFileIDs=" + gfidText + " firstGroupFileDataID=" + firstGroupText +
+        " modelFileIDs=" + modelIdText + " firstModelFileDataID=" + firstModelText
+
+fn M2DependencySummaryText(summary: M2DependencySummary): str =
+    let skinText: str = strings.IntToStr(summary.skinFileDataIDCount)
+    let firstSkinText: str = strings.IntToStr(summary.firstSkinFileDataID)
+    let textureText: str = strings.IntToStr(summary.textureFileDataIDCount)
+    let firstTextureText: str = strings.IntToStr(summary.firstTextureFileDataID)
+    return "m2Deps skinFileIDs=" + skinText + " firstSkinFileDataID=" + firstSkinText +
+        " textureFileIDs=" + textureText + " firstTextureFileDataID=" + firstTextureText

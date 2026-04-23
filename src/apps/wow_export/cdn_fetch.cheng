@@ -1,0 +1,577 @@
+import std/os
+import std/bytes as bytes
+import std/rawbytes as rawbytes
+import std/result
+import std/strings as strings
+import std/strformat
+import std/strutils as strutils
+import std/net/transports/tcp_syscall as tcp
+import cheng/apps/wow_export/binary as binary
+import cheng/apps/wow_export/blte as blte
+import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/casc_archive as casc_archive
+import cheng/apps/wow_export/cdn_config as cdn_config
+
+const
+    cdnFetchRecvCap = 32768
+    cdnFetchHeaderLimit = 32768
+
+type
+    CdnFetchResult =
+        cachePath: str
+        url: str
+        statusCode: int32
+        bytesWritten: int32
+        fromCache: bool
+
+fn cdnFetchMakeDirAll(path: str): bool =
+    if strings.Len(path) == 0:
+        return false
+    if os.DirExists(path):
+        return true
+    let parent: str = os.ParentDir(path)
+    if strings.Len(parent) > 0 && parent != path && !os.DirExists(parent):
+        if !cdnFetchMakeDirAll(parent):
+            return false
+    if !os.DirExists(path):
+        os.CreateDir(path)
+    return os.DirExists(path)
+
+fn CdnCachePath(cacheRoot: str, ekey: str): Result[str] =
+    let looseRes: Result[str] = cdn_config.CdnLooseDataPath(ekey)
+    if IsErr(looseRes):
+        return Err[str](Error(looseRes))
+    return Ok[str](build_info.StablePathJoin(cacheRoot, Value(looseRes)))
+
+fn cdnFetchRequestPath(entry: build_info.WowBuildEntry, ekey: str): Result[str] =
+    let looseRes: Result[str] = cdn_config.CdnLooseDataPath(ekey)
+    if IsErr(looseRes):
+        return Err[str](Error(looseRes))
+    let path: str = build_info.StablePathJoin(entry.cdnPath, Value(looseRes))
+    return Ok[str](build_info.StableConcat("/", path))
+
+fn cdnFetchRequestText(host: str, requestPath: str): str =
+    var out: str = "GET "
+    out = out + requestPath
+    out = out + " HTTP/1.1\r\nHost: "
+    out = out + host
+    out = out + "\r\nUser-Agent: wow_export/1\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    return out
+
+fn cdnFetchCharEqFold(a: char, b: char): bool =
+    if a == b:
+        return true
+    var av: int32 = int32(a)
+    var bv: int32 = int32(b)
+    if av >= int32('A') && av <= int32('Z'):
+        av = av + 32
+    if bv >= int32('A') && bv <= int32('Z'):
+        bv = bv + 32
+    return av == bv
+
+fn cdnFetchLineKeyMatches(line: str, key: str): bool =
+    if strings.Len(line) < strings.Len(key) + 1:
+        return false
+    var pos: int32
+    while pos < strings.Len(key):
+        if !cdnFetchCharEqFold(line[pos], key[pos]):
+            return false
+        pos = pos + 1
+    let sep: char = line[pos]
+    if sep == ':':
+        return true
+    return false
+
+fn cdnFetchLineValue(line: str, key: str): str =
+    if strings.Len(line) <= strings.Len(key) + 1:
+        return ""
+    return strutils.Strip(strings.SliceBytes(line, strings.Len(key) + 1, strings.Len(line) - strings.Len(key) - 1))
+
+fn cdnFetchContainsFold(text: str, needle: str): bool =
+    if strings.Len(needle) == 0:
+        return true
+    if strings.Len(text) < strings.Len(needle):
+        return false
+    var pos: int32
+    while pos + strings.Len(needle) <= strings.Len(text):
+        var matched: bool = true
+        var idx: int32
+        while idx < strings.Len(needle):
+            if !cdnFetchCharEqFold(text[pos + idx], needle[idx]):
+                matched = false
+                break
+            idx = idx + 1
+        if matched:
+            return true
+        pos = pos + 1
+    return false
+
+fn cdnFetchStatusCode(header: str): Result[int32] =
+    if strings.Len(header) < 12:
+        return Err[int32]("wowExport CDN fetch: truncated HTTP status")
+    if !strings.HasPrefix(header, "HTTP/"):
+        return Err[int32]("wowExport CDN fetch: invalid HTTP status")
+    let codeText: str = strings.SliceBytes(header, 9, 3)
+    let code: int32 = int32(strutils.ParseInt(codeText))
+    if code <= 0:
+        return Err[int32]("wowExport CDN fetch: invalid HTTP status code")
+    return Ok[int32](code)
+
+fn cdnFetchContentLength(header: str): Result[int32] =
+    let n: int32 = strings.Len(header)
+    var lineStart: int32
+    var pos: int32
+    var found: bool
+    var contentLength: int32
+    var chunked: bool
+    while pos <= n:
+        if pos == n || header[pos] == '\n':
+            var lineEnd: int32 = pos
+            if lineEnd > lineStart && header[lineEnd - 1] == '\r':
+                lineEnd = lineEnd - 1
+            if lineEnd > lineStart:
+                let line: str = strings.SliceBytes(header, lineStart, lineEnd - lineStart)
+                if cdnFetchLineKeyMatches(line, "Content-Length"):
+                    let rawValue: str = cdnFetchLineValue(line, "Content-Length")
+                    let value: int32 = int32(strutils.ParseInt(rawValue))
+                    if value > 0:
+                        contentLength = value
+                        found = true
+                    else:
+                        return Err[int32]("wowExport CDN fetch: invalid Content-Length")
+                if cdnFetchLineKeyMatches(line, "Transfer-Encoding"):
+                    let valueText: str = cdnFetchLineValue(line, "Transfer-Encoding")
+                    if cdnFetchContainsFold(valueText, "chunked"):
+                        chunked = true
+            lineStart = pos + 1
+        pos = pos + 1
+    if chunked:
+        return Err[int32]("wowExport CDN fetch: chunked transfer is unsupported")
+    if found:
+        return Ok[int32](contentLength)
+    return Err[int32]("wowExport CDN fetch: missing Content-Length")
+
+fn cdnFetchAppendHeaderByte(header: str, chunk: rawbytes.Bytes, idx: int32): str =
+    let one: rawbytes.Bytes = rawbytes.BytesSliceView(chunk, idx, 1)
+    return header + rawbytes.BytesToString(one)
+
+fn cdnFetchHeaderComplete(header: str): bool =
+    let n: int32 = strings.Len(header)
+    if n < 4:
+        return false
+    if header[n - 4] != '\r':
+        return false
+    if header[n - 3] != '\n':
+        return false
+    if header[n - 2] != '\r':
+        return false
+    if header[n - 1] != '\n':
+        return false
+    return true
+
+fn cdnFetchWriteBody(file: os.File, body: rawbytes.Bytes): Result[int32] =
+    let n: int32 = rawbytes.BytesLen(body)
+    if n <= 0:
+        return Ok[int32](0)
+    let wrote: int32 = os.C_fwrite(body.data, 1, int64(n), file)
+    if wrote != n:
+        return Err[int32]("wowExport CDN fetch: short cache write")
+    return Ok[int32](wrote)
+
+fn CdnFetchLooseObjectToCache(entry: build_info.WowBuildEntry,
+                              cacheRoot: str,
+                              ekey: str,
+                              expectedSize: int32): Result[CdnFetchResult] =
+    if expectedSize <= 0:
+        return Err[CdnFetchResult]("wowExport CDN fetch: expected size must be positive")
+    let cachePathRes: Result[str] = CdnCachePath(cacheRoot, ekey)
+    if IsErr(cachePathRes):
+        return Err[CdnFetchResult](Error(cachePathRes))
+    let cachePath: str = Value(cachePathRes)
+    let urlRes: Result[str] = cdn_config.CdnLooseDataUrl(entry, ekey, false)
+    if IsErr(urlRes):
+        return Err[CdnFetchResult](Error(urlRes))
+    if os.FileExists(cachePath):
+        let sizeNow: int64 = os.FileSize(cachePath)
+        if sizeNow == int64(expectedSize):
+            var cached: CdnFetchResult
+            cached.cachePath = cachePath
+            cached.url = Value(urlRes)
+            cached.statusCode = 200
+            cached.bytesWritten = expectedSize
+            cached.fromCache = true
+            return Ok[CdnFetchResult](cached)
+        return Err[CdnFetchResult]("wowExport CDN fetch: cached object size mismatch")
+    let parent: str = os.ParentDir(cachePath)
+    if strings.Len(parent) == 0 || !cdnFetchMakeDirAll(parent):
+        return Err[CdnFetchResult]("wowExport CDN fetch: cache mkdir failed")
+    let hostRes: Result[str] = cdn_config.CdnFirstHost(entry.cdnHosts)
+    if IsErr(hostRes):
+        return Err[CdnFetchResult](Error(hostRes))
+    let requestPathRes: Result[str] = cdnFetchRequestPath(entry, ekey)
+    if IsErr(requestPathRes):
+        return Err[CdnFetchResult](Error(requestPathRes))
+    let host: str = Value(hostRes)
+    let requestPath: str = Value(requestPathRes)
+    let connectRes: Result[tcp.TcpConnectionHandle] = tcp.TcpConnectResolved(host, 80)
+    if IsErr(connectRes):
+        return Err[CdnFetchResult](Error(connectRes))
+    var conn: tcp.TcpConnectionHandle = Value(connectRes)
+    let requestText: str = cdnFetchRequestText(host, requestPath)
+    let requestBytes: rawbytes.Bytes = rawbytes.BytesFromString(requestText)
+    let sendRes: Result[int32] = tcp.TcpSend(conn, requestBytes)
+    if IsErr(sendRes):
+        tcp.TcpClose(conn)
+        return Err[CdnFetchResult](Error(sendRes))
+    let tmpPath: str = cachePath + ".tmp"
+    if os.FileExists(tmpPath):
+        let _ = os.RemoveFile(tmpPath)
+    var file: os.File = nil
+    var recvBuf: rawbytes.Bytes = rawbytes.BytesAlloc(cdnFetchRecvCap)
+    if rawbytes.BytesLen(recvBuf) != cdnFetchRecvCap:
+        tcp.TcpClose(conn)
+        return Err[CdnFetchResult]("wowExport CDN fetch: recv buffer alloc failed")
+    var header: str
+    var headerDone: bool
+    var contentLength: int32
+    var statusCode: int32
+    var bytesWritten: int32
+    while true:
+        let gotRes: Result[int32] = tcp.TcpRecvRaw(conn, recvBuf.data, rawbytes.BytesLen(recvBuf))
+        if IsErr(gotRes):
+            rawbytes.BytesFree(recvBuf)
+            if file != nil:
+                os.Close(file)
+                let _ = os.RemoveFile(tmpPath)
+            tcp.TcpClose(conn)
+            return Err[CdnFetchResult](Error(gotRes))
+        let got: int32 = Value(gotRes)
+        if got <= 0:
+            break
+        let chunk: rawbytes.Bytes = rawbytes.BytesSliceView(recvBuf, 0, got)
+        var bodyStart: int32
+        if !headerDone:
+            var idx: int32
+            while idx < got && !headerDone:
+                header = cdnFetchAppendHeaderByte(header, chunk, idx)
+                if strings.Len(header) > cdnFetchHeaderLimit:
+                    rawbytes.BytesFree(recvBuf)
+                    tcp.TcpClose(conn)
+                    return Err[CdnFetchResult]("wowExport CDN fetch: HTTP header too large")
+                if cdnFetchHeaderComplete(header):
+                    let statusRes: Result[int32] = cdnFetchStatusCode(header)
+                    if IsErr(statusRes):
+                        rawbytes.BytesFree(recvBuf)
+                        tcp.TcpClose(conn)
+                        return Err[CdnFetchResult](Error(statusRes))
+                    statusCode = Value(statusRes)
+                    if statusCode != 200:
+                        rawbytes.BytesFree(recvBuf)
+                        tcp.TcpClose(conn)
+                        return Err[CdnFetchResult]("wowExport CDN fetch: HTTP status " + strings.IntToStr(statusCode))
+                    let lenRes: Result[int32] = cdnFetchContentLength(header)
+                    if IsErr(lenRes):
+                        rawbytes.BytesFree(recvBuf)
+                        tcp.TcpClose(conn)
+                        return Err[CdnFetchResult](Error(lenRes))
+                    contentLength = Value(lenRes)
+                    if contentLength != expectedSize:
+                        rawbytes.BytesFree(recvBuf)
+                        tcp.TcpClose(conn)
+                        return Err[CdnFetchResult]("wowExport CDN fetch: Content-Length mismatch")
+                    file = os.openImplWrite(tmpPath)
+                    if file == nil:
+                        rawbytes.BytesFree(recvBuf)
+                        tcp.TcpClose(conn)
+                        return Err[CdnFetchResult]("wowExport CDN fetch: cache open failed")
+                    headerDone = true
+                    bodyStart = idx + 1
+                idx = idx + 1
+            if headerDone && bodyStart < got:
+                let body: rawbytes.Bytes = rawbytes.BytesSliceView(chunk, bodyStart, got - bodyStart)
+                let writeRes: Result[int32] = cdnFetchWriteBody(file, body)
+                if IsErr(writeRes):
+                    rawbytes.BytesFree(recvBuf)
+                    os.Close(file)
+                    let _ = os.RemoveFile(tmpPath)
+                    tcp.TcpClose(conn)
+                    return Err[CdnFetchResult](Error(writeRes))
+                bytesWritten = bytesWritten + Value(writeRes)
+        else:
+            let writeRes: Result[int32] = cdnFetchWriteBody(file, chunk)
+            if IsErr(writeRes):
+                rawbytes.BytesFree(recvBuf)
+                os.Close(file)
+                let _ = os.RemoveFile(tmpPath)
+                tcp.TcpClose(conn)
+                return Err[CdnFetchResult](Error(writeRes))
+            bytesWritten = bytesWritten + Value(writeRes)
+    rawbytes.BytesFree(recvBuf)
+    tcp.TcpClose(conn)
+    if !headerDone:
+        return Err[CdnFetchResult]("wowExport CDN fetch: missing HTTP header")
+    if file == nil:
+        return Err[CdnFetchResult]("wowExport CDN fetch: cache file was not opened")
+    os.Close(file)
+    if bytesWritten != contentLength:
+        let _ = os.RemoveFile(tmpPath)
+        return Err[CdnFetchResult]("wowExport CDN fetch: body size mismatch")
+    if os.FileExists(cachePath):
+        let _ = os.RemoveFile(cachePath)
+    if !os.RenameFile(tmpPath, cachePath):
+        let _ = os.RemoveFile(tmpPath)
+        return Err[CdnFetchResult]("wowExport CDN fetch: cache rename failed")
+    if !os.FileExists(cachePath) || os.FileSize(cachePath) != int64(expectedSize):
+        return Err[CdnFetchResult]("wowExport CDN fetch: cached file verification failed")
+    var out: CdnFetchResult
+    out.cachePath = cachePath
+    out.url = Value(urlRes)
+    out.statusCode = statusCode
+    out.bytesWritten = bytesWritten
+    out.fromCache = false
+    return Ok[CdnFetchResult](out)
+
+fn CdnFetchResultSummary(result: CdnFetchResult): str =
+    return Fmt"status={strings.IntToStr(result.statusCode)} bytes={strings.IntToStr(result.bytesWritten)} cached={result.fromCache ? \"true\" : \"false\"} path={result.cachePath}"
+
+fn CdnDecodeCachedBlte(cachePath: str, expectedEncodedSize: int32): Result[bytes.ByteBuffer] =
+    if expectedEncodedSize <= 0:
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: expected encoded size must be positive")
+    if !os.FileExists(cachePath):
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: cached BLTE file missing")
+    if os.FileSize(cachePath) != int64(expectedEncodedSize):
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: cached BLTE size mismatch")
+    let encoded: bytes.ByteBuffer = bytes.ReadFileBytes(cachePath)
+    if encoded.len != expectedEncodedSize:
+        bytes.FreeByteBuffer(encoded)
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: cached BLTE read size mismatch")
+    let decodedRes: Result[bytes.ByteBuffer] = blte.DecodeAllBlocksWithKey(encoded, "")
+    bytes.FreeByteBuffer(encoded)
+    return decodedRes
+
+fn cdnFetchMakeByteBuffer(len: int32): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    if len <= 0:
+        out.len = 0
+        out.data = nil
+        return out
+    out.len = len
+    out.data = alloc(len)
+    return out
+
+fn CdnDecodeCachedBlteFirstBlock(cachePath: str, expectedEncodedSize: int32): Result[bytes.ByteBuffer] =
+    if expectedEncodedSize <= 0:
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: expected encoded size must be positive")
+    if !os.FileExists(cachePath):
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: cached BLTE file missing")
+    if os.FileSize(cachePath) != int64(expectedEncodedSize):
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: cached BLTE size mismatch")
+    let prefixRes: Result[bytes.ByteBuffer] = casc_archive.CascArchiveReadFileSlice(cachePath, 0, 8)
+    if IsErr(prefixRes):
+        return Err[bytes.ByteBuffer](Error(prefixRes))
+    let prefix: bytes.ByteBuffer = Value(prefixRes)
+    let headerSizeRes: Result[int32] = binary.ReadU32BEAt(prefix, 4)
+    bytes.FreeByteBuffer(prefix)
+    if IsErr(headerSizeRes):
+        return Err[bytes.ByteBuffer](Error(headerSizeRes))
+    let headerSize: int32 = Value(headerSizeRes)
+    if headerSize == 0:
+        return CdnDecodeCachedBlte(cachePath, expectedEncodedSize)
+    if headerSize < 36 || headerSize > expectedEncodedSize:
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: invalid cached BLTE header size")
+    let headerRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveReadFileSlice(cachePath, 0, headerSize)
+    if IsErr(headerRes):
+        return Err[bytes.ByteBuffer](Error(headerRes))
+    let header: bytes.ByteBuffer = Value(headerRes)
+    if bytes.BufByteAt(header, 8) != 0x0f:
+        bytes.FreeByteBuffer(header)
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: invalid cached BLTE frame marker")
+    let blockCount: int32 =
+        (bytes.BufByteAt(header, 9) << 16) +
+        (bytes.BufByteAt(header, 10) << 8) +
+        bytes.BufByteAt(header, 11)
+    if blockCount <= 0 || headerSize != 12 + blockCount * 24:
+        bytes.FreeByteBuffer(header)
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: invalid cached BLTE block table")
+    let firstCompRes: Result[int32] = binary.ReadU32BEAt(header, 12)
+    bytes.FreeByteBuffer(header)
+    if IsErr(firstCompRes):
+        return Err[bytes.ByteBuffer](Error(firstCompRes))
+    let totalNeed: int32 = headerSize + Value(firstCompRes)
+    if totalNeed <= headerSize || totalNeed > expectedEncodedSize:
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: invalid cached BLTE first block size")
+    let firstFrameRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveReadFileSlice(cachePath, 0, totalNeed)
+    if IsErr(firstFrameRes):
+        return Err[bytes.ByteBuffer](Error(firstFrameRes))
+    let firstFrame: bytes.ByteBuffer = Value(firstFrameRes)
+    let decodedRes: Result[bytes.ByteBuffer] = blte.DecodeFirstBlockWithKey(firstFrame, "")
+    bytes.FreeByteBuffer(firstFrame)
+    return decodedRes
+
+fn cdnFetchCopyRangeInto(dst: bytes.ByteBuffer,
+                         dstOffset: int32,
+                         src: bytes.ByteBuffer,
+                         srcOffset: int32,
+                         count: int32): Result[bool] =
+    if dstOffset < 0 || srcOffset < 0 || count < 0:
+        return Err[bool]("wowExport CDN fetch: range copy negative bounds")
+    if dstOffset + count > dst.len || srcOffset + count > src.len:
+        return Err[bool]("wowExport CDN fetch: range copy out of bounds")
+    var i: int32
+    while i < count:
+        bytes.BufSetByte(dst, dstOffset + i, bytes.BufByteAt(src, srcOffset + i))
+        i = i + 1
+    return Ok[bool](true)
+
+fn CdnDecodeCachedBlteRange(cachePath: str,
+                            expectedEncodedSize: int32,
+                            decodedStart: int32,
+                            decodedCount: int32): Result[bytes.ByteBuffer] =
+    if expectedEncodedSize <= 0:
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: expected encoded size must be positive")
+    if decodedStart < 0 || decodedCount <= 0:
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: invalid decoded range")
+    if !os.FileExists(cachePath):
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: cached BLTE file missing")
+    if os.FileSize(cachePath) != int64(expectedEncodedSize):
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: cached BLTE size mismatch")
+    let prefixRes: Result[bytes.ByteBuffer] = casc_archive.CascArchiveReadFileSlice(cachePath, 0, 8)
+    if IsErr(prefixRes):
+        return Err[bytes.ByteBuffer](Error(prefixRes))
+    let prefix: bytes.ByteBuffer = Value(prefixRes)
+    let headerSizeRes: Result[int32] = binary.ReadU32BEAt(prefix, 4)
+    bytes.FreeByteBuffer(prefix)
+    if IsErr(headerSizeRes):
+        return Err[bytes.ByteBuffer](Error(headerSizeRes))
+    let headerSize: int32 = Value(headerSizeRes)
+    if headerSize == 0:
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: range decode requires framed BLTE")
+    if headerSize < 36 || headerSize > expectedEncodedSize:
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: invalid cached BLTE header size")
+    let headerBytesRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveReadFileSlice(cachePath, 0, headerSize)
+    if IsErr(headerBytesRes):
+        return Err[bytes.ByteBuffer](Error(headerBytesRes))
+    let headerBytes: bytes.ByteBuffer = Value(headerBytesRes)
+    if bytes.BufByteAt(headerBytes, 0) != int32('B') ||
+        bytes.BufByteAt(headerBytes, 1) != int32('L') ||
+        bytes.BufByteAt(headerBytes, 2) != int32('T') ||
+        bytes.BufByteAt(headerBytes, 3) != int32('E') ||
+        bytes.BufByteAt(headerBytes, 8) != 0x0f:
+        bytes.FreeByteBuffer(headerBytes)
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: invalid cached BLTE frame header")
+    let blockCount: int32 =
+        (bytes.BufByteAt(headerBytes, 9) << 16) +
+        (bytes.BufByteAt(headerBytes, 10) << 8) +
+        bytes.BufByteAt(headerBytes, 11)
+    if blockCount <= 0 || headerSize != 12 + blockCount * 24:
+        bytes.FreeByteBuffer(headerBytes)
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: invalid cached BLTE frame table")
+    var totalDecompSize: int32
+    var checkFileOffset: int32
+    var scan: int32
+    while scan < blockCount:
+        let pos: int32 = 12 + scan * 24
+        let compRes: Result[int32] = binary.ReadU32BEAt(headerBytes, pos)
+        let decompRes: Result[int32] = binary.ReadU32BEAt(headerBytes, pos + 4)
+        if IsErr(compRes):
+            bytes.FreeByteBuffer(headerBytes)
+            return Err[bytes.ByteBuffer](Error(compRes))
+        if IsErr(decompRes):
+            bytes.FreeByteBuffer(headerBytes)
+            return Err[bytes.ByteBuffer](Error(decompRes))
+        let compSize: int32 = Value(compRes)
+        let decompSize: int32 = Value(decompRes)
+        if compSize <= 0 || decompSize < 0 || headerSize + checkFileOffset + compSize > expectedEncodedSize:
+            bytes.FreeByteBuffer(headerBytes)
+            return Err[bytes.ByteBuffer]("wowExport CDN fetch: invalid cached BLTE block table")
+        checkFileOffset = checkFileOffset + compSize
+        totalDecompSize = totalDecompSize + decompSize
+        scan = scan + 1
+    if decodedStart + decodedCount > totalDecompSize:
+        bytes.FreeByteBuffer(headerBytes)
+        return Err[bytes.ByteBuffer]("wowExport CDN fetch: decoded range extends past BLTE output")
+    let out: bytes.ByteBuffer = cdnFetchMakeByteBuffer(decodedCount)
+    var copied: int32
+    while copied < decodedCount:
+        let absDecoded: int32 = decodedStart + copied
+        var blockIndex: int32 = -1
+        var blockFileOffset: int32
+        var blockDecompOffset: int32
+        var blockCompSize: int32
+        var blockDecompSize: int32
+        var blockHash: str
+        var findFileOffset: int32
+        var findDecompOffset: int32
+        var findIndex: int32
+        while findIndex < blockCount:
+            let pos: int32 = 12 + findIndex * 24
+            let compRes: Result[int32] = binary.ReadU32BEAt(headerBytes, pos)
+            let decompRes: Result[int32] = binary.ReadU32BEAt(headerBytes, pos + 4)
+            if IsErr(compRes):
+                bytes.FreeByteBuffer(headerBytes)
+                bytes.FreeByteBuffer(out)
+                return Err[bytes.ByteBuffer](Error(compRes))
+            if IsErr(decompRes):
+                bytes.FreeByteBuffer(headerBytes)
+                bytes.FreeByteBuffer(out)
+                return Err[bytes.ByteBuffer](Error(decompRes))
+            let compSize: int32 = Value(compRes)
+            let decompSize: int32 = Value(decompRes)
+            if absDecoded >= findDecompOffset && absDecoded < findDecompOffset + decompSize:
+                let hashRes: Result[str] = binary.HexSlice(headerBytes, pos + 8, 16)
+                if IsErr(hashRes):
+                    bytes.FreeByteBuffer(headerBytes)
+                    bytes.FreeByteBuffer(out)
+                    return Err[bytes.ByteBuffer](Error(hashRes))
+                blockIndex = findIndex
+                blockFileOffset = findFileOffset
+                blockDecompOffset = findDecompOffset
+                blockCompSize = compSize
+                blockDecompSize = decompSize
+                blockHash = Value(hashRes)
+                break
+            findFileOffset = findFileOffset + compSize
+            findDecompOffset = findDecompOffset + decompSize
+            findIndex = findIndex + 1
+        if blockIndex < 0:
+            bytes.FreeByteBuffer(headerBytes)
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer]("wowExport CDN fetch: decoded range block not found")
+        let blockOffsetInDecoded: int32 = absDecoded - blockDecompOffset
+        var take: int32 = blockDecompSize - blockOffsetInDecoded
+        if take > decodedCount - copied:
+            take = decodedCount - copied
+        let blockBytesRes: Result[bytes.ByteBuffer] =
+            casc_archive.CascArchiveReadFileSlice(cachePath, headerSize + blockFileOffset, blockCompSize)
+        if IsErr(blockBytesRes):
+            bytes.FreeByteBuffer(headerBytes)
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer](Error(blockBytesRes))
+        let blockBytes: bytes.ByteBuffer = Value(blockBytesRes)
+        let hashRes: Result[bool] = blte.VerifyBlockPayloadHash(blockBytes, blockHash)
+        if IsErr(hashRes):
+            bytes.FreeByteBuffer(blockBytes)
+            bytes.FreeByteBuffer(headerBytes)
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer](Error(hashRes))
+        let decodedBlockRes: Result[bytes.ByteBuffer] =
+            blte.DecodeBlockPayloadWithKey(blockBytes, blockIndex, blockDecompSize, "")
+        bytes.FreeByteBuffer(blockBytes)
+        if IsErr(decodedBlockRes):
+            bytes.FreeByteBuffer(headerBytes)
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer](Error(decodedBlockRes))
+        let decodedBlock: bytes.ByteBuffer = Value(decodedBlockRes)
+        let copyRes: Result[bool] =
+            cdnFetchCopyRangeInto(out, copied, decodedBlock, blockOffsetInDecoded, take)
+        bytes.FreeByteBuffer(decodedBlock)
+        if IsErr(copyRes):
+            bytes.FreeByteBuffer(headerBytes)
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer](Error(copyRes))
+        copied = copied + take
+    bytes.FreeByteBuffer(headerBytes)
+    return Ok[bytes.ByteBuffer](out)

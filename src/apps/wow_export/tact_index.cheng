@@ -1,0 +1,642 @@
+import std/bytes as bytes
+import std/os as os
+import std/result
+import std/strings as strings
+import std/strformat
+import std/system as system
+import cheng/apps/wow_export/binary as binary
+import cheng/apps/wow_export/build_info as build_info
+
+type
+    File = ptr
+
+type
+    TactIndexFooter =
+        formatRevision: int32
+        blockSizeKB: int32
+        offsetBytes: int32
+        sizeBytes: int32
+        keyBytes: int32
+        hashBytes: int32
+        entryCount: int32
+        footerStart: int32
+        footerSize: int32
+        blockCount: int32
+        tocStart: int32
+
+    TactIndexEntry =
+        key: str
+        archiveKey: str
+        archiveIndex: int32
+        keyWord0: int32
+        keyWord1: int32
+        keyWord2: int32
+        keyWord3: int32
+        size: int32
+        offset: int32
+
+    TactIndexBlock =
+        blockIndex: int32
+        keyWord0: int32
+        keyWord1: int32
+        keyWord2: int32
+        keyWord3: int32
+        hashWord0: int32
+        hashWord1: int32
+        blockKey: str
+        blockHash: str
+
+    TactIndexLookup =
+        indexPath: str
+        indexName: str
+        footer: TactIndexFooter
+        entryIndex: int32
+        entry: TactIndexEntry
+        block: TactIndexBlock
+
+    TactIndexFollowStep =
+        lookupKey: str
+        lookupKeyWord0: int32
+        lookupKeyWord1: int32
+        lookupKeyWord2: int32
+        lookupKeyWord3: int32
+        hit: TactIndexLookup
+
+    TactIndexFollowChain =
+        stepCount: int32
+        steps: TactIndexFollowStep[8]
+        stopKey: str
+        stopReason: str
+
+    TactIndexSummary =
+        footer: TactIndexFooter
+        first: TactIndexEntry
+
+@importc("cheng_fopen")
+fn tactIndexFopen(filename, mode: cstring): File
+@importc("cheng_fclose")
+fn tactIndexFclose(f: File): int32
+@importc("cheng_fread")
+fn tactIndexFread(dst: ptr, size, n: int64, stream: File): int32
+@importc("cheng_file_size")
+fn tactIndexFileSize(path: cstring): int64
+
+const
+    tactIndexFooterMaxHashBytes = 16
+    tactIndexKeyHexBytes = 16
+
+fn tactIndexReadFileBytesRaw(path: cstring): Result[bytes.ByteBuffer] =
+    let f: File = tactIndexFopen(path, "rb")
+    if f == nil:
+        return Err[bytes.ByteBuffer]("wowExport tact-index: failed to open local index")
+    let size64: int64 = tactIndexFileSize(path)
+    if size64 <= 0 || size64 > int64(2147483647):
+        let _ = tactIndexFclose(f)
+        return Err[bytes.ByteBuffer]("wowExport tact-index: invalid local index size")
+    let total: int32 = int32(size64)
+    var out: bytes.ByteBuffer
+    out.len = total
+    out.data = alloc(total)
+    if out.data == nil:
+        let _ = tactIndexFclose(f)
+        return Err[bytes.ByteBuffer]("wowExport tact-index: alloc failed")
+    var lenRead: int32
+    while lenRead < total:
+        let want: int32 = total - lenRead
+        let dst: ptr = system.system_ptr_add(out.data, lenRead)
+        let got: int32 = tactIndexFread(dst, 1, int64(want), f)
+        if got <= 0:
+            let _ = tactIndexFclose(f)
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer]("wowExport tact-index: truncated local index")
+        lenRead = lenRead + got
+    let _ = tactIndexFclose(f)
+    return Ok[bytes.ByteBuffer](out)
+
+fn tactIndexReadUIntBEAt(buf: bytes.ByteBuffer, idx: int32, width: int32): Result[int32] =
+    if width < 0 || width > 4:
+        return Err[int32]("wowExport tact-index: unsupported big-endian width")
+    if idx < 0 || idx + width > buf.len:
+        return Err[int32]("wowExport tact-index: truncated big-endian integer")
+    var out: int32
+    var i: int32
+    while i < width:
+        out = (out << 8) + bytes.BufByteAt(buf, idx + i)
+        i = i + 1
+    return Ok[int32](out)
+
+fn tactIndexHexCharValid(ch: char): bool =
+    if ch >= '0' && ch <= '9':
+        return true
+    if ch >= 'a' && ch <= 'f':
+        return true
+    if ch >= 'A' && ch <= 'F':
+        return true
+    return false
+
+fn tactIndexHexKeyValid(text: str, expectedBytes: int32): bool =
+    if strings.Len(text) != expectedBytes * 2:
+        return false
+    var i: int32
+    while i < strings.Len(text):
+        if !tactIndexHexCharValid(text[i]):
+            return false
+        i = i + 1
+    return true
+
+fn tactIndexHexPrefixValid(text: str, maxBytes: int32): bool =
+    if strings.Len(text) <= 0 || strings.Len(text) > maxBytes * 2:
+        return false
+    if strings.Len(text) % 2 != 0:
+        return false
+    var i: int32
+    while i < strings.Len(text):
+        if !tactIndexHexCharValid(text[i]):
+            return false
+        i = i + 1
+    return true
+
+fn tactIndexTryParseFooter(buf: bytes.ByteBuffer, hashBytes: int32): Result[TactIndexFooter] =
+    let footerSize: int32 = 12 + hashBytes * 2
+    if footerSize <= 0 || footerSize > buf.len:
+        return Err[TactIndexFooter]("wowExport tact-index: footer candidate out of bounds")
+    let footerStart: int32 = buf.len - footerSize
+    let formatRevision: int32 = bytes.BufByteAt(buf, footerStart + hashBytes)
+    let flags0: int32 = bytes.BufByteAt(buf, footerStart + hashBytes + 1)
+    let flags1: int32 = bytes.BufByteAt(buf, footerStart + hashBytes + 2)
+    let blockSizeKB: int32 = bytes.BufByteAt(buf, footerStart + hashBytes + 3)
+    let offsetBytes: int32 = bytes.BufByteAt(buf, footerStart + hashBytes + 4)
+    let sizeBytes: int32 = bytes.BufByteAt(buf, footerStart + hashBytes + 5)
+    let keyBytes: int32 = bytes.BufByteAt(buf, footerStart + hashBytes + 6)
+    let foundHashBytes: int32 = bytes.BufByteAt(buf, footerStart + hashBytes + 7)
+    if formatRevision != 1 || flags0 != 0 || flags1 != 0 || foundHashBytes != hashBytes:
+        return Err[TactIndexFooter]("wowExport tact-index: footer candidate mismatch")
+    let entryCount: int32 = bytes.ReadU32LEAt(buf, footerStart + hashBytes + 8)
+    if blockSizeKB <= 0 || sizeBytes <= 0 || keyBytes <= 0 || entryCount <= 0:
+        return Err[TactIndexFooter]("wowExport tact-index: invalid footer values")
+    var out: TactIndexFooter
+    out.formatRevision = formatRevision
+    out.blockSizeKB = blockSizeKB
+    out.offsetBytes = offsetBytes
+    out.sizeBytes = sizeBytes
+    out.keyBytes = keyBytes
+    out.hashBytes = hashBytes
+    out.entryCount = entryCount
+    out.footerStart = footerStart
+    out.footerSize = footerSize
+    return Ok[TactIndexFooter](out)
+
+fn tactIndexRecordSize(footer: TactIndexFooter): Result[int32] =
+    let size: int32 = footer.keyBytes + footer.sizeBytes + footer.offsetBytes
+    if size <= 0:
+        return Err[int32]("wowExport tact-index: invalid record size")
+    return Ok[int32](size)
+
+fn tactIndexBlockSize(footer: TactIndexFooter): int32 =
+    return footer.blockSizeKB * 1024
+
+fn tactIndexEntriesPerBlock(footer: TactIndexFooter): Result[int32] =
+    let recordSizeRes: Result[int32] = tactIndexRecordSize(footer)
+    if IsErr(recordSizeRes):
+        return Err[int32](Error(recordSizeRes))
+    let recordSize: int32 = Value(recordSizeRes)
+    let blockSize: int32 = tactIndexBlockSize(footer)
+    if blockSize <= 0 || recordSize > blockSize:
+        return Err[int32]("wowExport tact-index: invalid block geometry")
+    let perBlock: int32 = blockSize / recordSize
+    if perBlock <= 0:
+        return Err[int32]("wowExport tact-index: empty block geometry")
+    return Ok[int32](perBlock)
+
+fn tactIndexDataBlockCount(footer: TactIndexFooter): Result[int32] =
+    let perBlockRes: Result[int32] = tactIndexEntriesPerBlock(footer)
+    if IsErr(perBlockRes):
+        return Err[int32](Error(perBlockRes))
+    let perBlock: int32 = Value(perBlockRes)
+    return Ok[int32]((footer.entryCount + perBlock - 1) / perBlock)
+
+fn tactIndexFinalizeFooterLayout(buf: bytes.ByteBuffer, footer: TactIndexFooter): Result[TactIndexFooter] =
+    let blockCountRes: Result[int32] = tactIndexDataBlockCount(footer)
+    if IsErr(blockCountRes):
+        return Err[TactIndexFooter](Error(blockCountRes))
+    let blockCount: int32 = Value(blockCountRes)
+    let tocSize: int32 = blockCount * (footer.keyBytes + footer.hashBytes)
+    let dataSize: int32 = blockCount * tactIndexBlockSize(footer)
+    if dataSize + tocSize != footer.footerStart:
+        return Err[TactIndexFooter]("wowExport tact-index: footer position mismatch")
+    var out: TactIndexFooter = footer
+    out.blockCount = blockCount
+    out.tocStart = footer.footerStart - tocSize
+    return Ok[TactIndexFooter](out)
+
+fn ParseTactIndexFooter(buf: bytes.ByteBuffer): Result[TactIndexFooter] =
+    var matched: bool
+    var out: TactIndexFooter
+    var hashBytes: int32 = 1
+    while hashBytes <= tactIndexFooterMaxHashBytes:
+        let candidateRes: Result[TactIndexFooter] = tactIndexTryParseFooter(buf, hashBytes)
+        if IsOk(candidateRes):
+            if matched:
+                return Err[TactIndexFooter]("wowExport tact-index: ambiguous footer")
+            matched = true
+            out = Value(candidateRes)
+        hashBytes = hashBytes + 1
+    if !matched:
+        return Err[TactIndexFooter]("wowExport tact-index: missing footer")
+    return tactIndexFinalizeFooterLayout(buf, out)
+
+fn tactIndexEntryPos(footer: TactIndexFooter, entryIndex: int32): Result[int32] =
+    if entryIndex < 0 || entryIndex >= footer.entryCount:
+        return Err[int32]("wowExport tact-index: entry index out of bounds")
+    let perBlockRes: Result[int32] = tactIndexEntriesPerBlock(footer)
+    if IsErr(perBlockRes):
+        return Err[int32](Error(perBlockRes))
+    let recordSizeRes: Result[int32] = tactIndexRecordSize(footer)
+    if IsErr(recordSizeRes):
+        return Err[int32](Error(recordSizeRes))
+    let perBlock: int32 = Value(perBlockRes)
+    let recordSize: int32 = Value(recordSizeRes)
+    let blockIndex: int32 = entryIndex / perBlock
+    let withinBlock: int32 = entryIndex % perBlock
+    return Ok[int32](blockIndex * tactIndexBlockSize(footer) + withinBlock * recordSize)
+
+fn tactIndexBlockIndexForEntry(footer: TactIndexFooter, entryIndex: int32): Result[int32] =
+    if entryIndex < 0 || entryIndex >= footer.entryCount:
+        return Err[int32]("wowExport tact-index: entry index out of bounds")
+    let perBlockRes: Result[int32] = tactIndexEntriesPerBlock(footer)
+    if IsErr(perBlockRes):
+        return Err[int32](Error(perBlockRes))
+    return Ok[int32](entryIndex / Value(perBlockRes))
+
+fn ParseTactIndexEntryAt(buf: bytes.ByteBuffer,
+                         footer: TactIndexFooter,
+                         archiveKey: str,
+                         pos: int32): Result[TactIndexEntry] =
+    let recordSizeRes: Result[int32] = tactIndexRecordSize(footer)
+    if IsErr(recordSizeRes):
+        return Err[TactIndexEntry](Error(recordSizeRes))
+    let recordSize: int32 = Value(recordSizeRes)
+    if pos < 0 || pos + recordSize > footer.footerStart:
+        return Err[TactIndexEntry]("wowExport tact-index: entry position out of bounds")
+    if footer.keyBytes != tactIndexKeyHexBytes:
+        return Err[TactIndexEntry]("wowExport tact-index: unsupported key width")
+    let keyRes: Result[str] = binary.HexSlice(buf, pos, footer.keyBytes)
+    if IsErr(keyRes):
+        return Err[TactIndexEntry](Error(keyRes))
+    let key0Res: Result[int32] = binary.ReadU32BEAt(buf, pos)
+    let key1Res: Result[int32] = binary.ReadU32BEAt(buf, pos + 4)
+    let key2Res: Result[int32] = binary.ReadU32BEAt(buf, pos + 8)
+    let key3Res: Result[int32] = binary.ReadU32BEAt(buf, pos + 12)
+    if IsErr(key0Res): return Err[TactIndexEntry](Error(key0Res))
+    if IsErr(key1Res): return Err[TactIndexEntry](Error(key1Res))
+    if IsErr(key2Res): return Err[TactIndexEntry](Error(key2Res))
+    if IsErr(key3Res): return Err[TactIndexEntry](Error(key3Res))
+    let sizeRes: Result[int32] = tactIndexReadUIntBEAt(buf, pos + footer.keyBytes, footer.sizeBytes)
+    if IsErr(sizeRes):
+        return Err[TactIndexEntry](Error(sizeRes))
+    var archiveIndex: int32 = -1
+    var offsetRes: Result[int32] = Ok[int32](0)
+    if footer.offsetBytes == 0:
+        offsetRes = Ok[int32](0)
+    elif footer.offsetBytes == 4:
+        offsetRes = tactIndexReadUIntBEAt(buf, pos + footer.keyBytes + footer.sizeBytes, 4)
+    elif footer.offsetBytes == 6:
+        let archiveIndexRes: Result[int32] =
+            tactIndexReadUIntBEAt(buf, pos + footer.keyBytes + footer.sizeBytes, 2)
+        if IsErr(archiveIndexRes):
+            return Err[TactIndexEntry](Error(archiveIndexRes))
+        archiveIndex = Value(archiveIndexRes)
+        offsetRes = tactIndexReadUIntBEAt(buf, pos + footer.keyBytes + footer.sizeBytes + 2, 4)
+    else:
+        return Err[TactIndexEntry]("wowExport tact-index: unsupported offset width")
+    if IsErr(offsetRes):
+        return Err[TactIndexEntry](Error(offsetRes))
+    var out: TactIndexEntry
+    out.key = Value(keyRes)
+    out.archiveKey = archiveKey
+    out.archiveIndex = archiveIndex
+    out.keyWord0 = Value(key0Res)
+    out.keyWord1 = Value(key1Res)
+    out.keyWord2 = Value(key2Res)
+    out.keyWord3 = Value(key3Res)
+    out.size = Value(sizeRes)
+    out.offset = Value(offsetRes)
+    return Ok[TactIndexEntry](out)
+
+fn tactIndexParseBlockAt(buf: bytes.ByteBuffer,
+                         footer: TactIndexFooter,
+                         blockIndex: int32): Result[TactIndexBlock] =
+    if blockIndex < 0 || blockIndex >= footer.blockCount:
+        return Err[TactIndexBlock]("wowExport tact-index: block index out of bounds")
+    let blockPos: int32 = footer.tocStart + blockIndex * (footer.keyBytes + footer.hashBytes)
+    let key0Res: Result[int32] = binary.ReadU32BEAt(buf, blockPos)
+    let key1Res: Result[int32] = binary.ReadU32BEAt(buf, blockPos + 4)
+    let key2Res: Result[int32] = binary.ReadU32BEAt(buf, blockPos + 8)
+    let key3Res: Result[int32] = binary.ReadU32BEAt(buf, blockPos + 12)
+    if IsErr(key0Res): return Err[TactIndexBlock](Error(key0Res))
+    if IsErr(key1Res): return Err[TactIndexBlock](Error(key1Res))
+    if IsErr(key2Res): return Err[TactIndexBlock](Error(key2Res))
+    if IsErr(key3Res): return Err[TactIndexBlock](Error(key3Res))
+    let blockKeyRes: Result[str] = binary.HexSlice(buf, blockPos, footer.keyBytes)
+    if IsErr(blockKeyRes):
+        return Err[TactIndexBlock](Error(blockKeyRes))
+    let blockHashRes: Result[str] = binary.HexSlice(buf, blockPos + footer.keyBytes, footer.hashBytes)
+    if IsErr(blockHashRes):
+        return Err[TactIndexBlock](Error(blockHashRes))
+    var out: TactIndexBlock
+    out.blockIndex = blockIndex
+    out.keyWord0 = Value(key0Res)
+    out.keyWord1 = Value(key1Res)
+    out.keyWord2 = Value(key2Res)
+    out.keyWord3 = Value(key3Res)
+    if footer.hashBytes == 8:
+        let hash0Res: Result[int32] = binary.ReadU32BEAt(buf, blockPos + footer.keyBytes)
+        let hash1Res: Result[int32] = binary.ReadU32BEAt(buf, blockPos + footer.keyBytes + 4)
+        if IsErr(hash0Res): return Err[TactIndexBlock](Error(hash0Res))
+        if IsErr(hash1Res): return Err[TactIndexBlock](Error(hash1Res))
+        out.hashWord0 = Value(hash0Res)
+        out.hashWord1 = Value(hash1Res)
+    out.blockKey = Value(blockKeyRes)
+    out.blockHash = Value(blockHashRes)
+    return Ok[TactIndexBlock](out)
+
+fn tactIndexNotFoundError(keyHex: str, path: str): str =
+    keyHex
+    path
+    return "wowExport tact-index: key not found"
+
+fn tactIndexIsNotFoundError(err: str): bool =
+    return err == "wowExport tact-index: key not found"
+
+fn tactIndexLookupLoaded(buf: bytes.ByteBuffer,
+                         footer: TactIndexFooter,
+                         indexPath: str,
+                         indexName: str,
+                         keyHex: str): Result[TactIndexLookup] =
+    if !tactIndexHexKeyValid(keyHex, footer.keyBytes):
+        return Err[TactIndexLookup]("wowExport tact-index: lookup key must be exact hex width")
+    var entryIndex: int32
+    while entryIndex < footer.entryCount:
+        let posRes: Result[int32] = tactIndexEntryPos(footer, entryIndex)
+        if IsErr(posRes):
+            return Err[TactIndexLookup](Error(posRes) + " path=" + indexPath)
+        let pos: int32 = Value(posRes)
+        if binary.ByteSliceMatchesHex(buf, pos, keyHex):
+            let entryRes: Result[TactIndexEntry] = ParseTactIndexEntryAt(buf, footer, "", pos)
+            if IsErr(entryRes):
+                return Err[TactIndexLookup](Error(entryRes) + " path=" + indexPath)
+            let blockIndexRes: Result[int32] = tactIndexBlockIndexForEntry(footer, entryIndex)
+            if IsErr(blockIndexRes):
+                return Err[TactIndexLookup](Error(blockIndexRes) + " path=" + indexPath)
+            let blockRes: Result[TactIndexBlock] = tactIndexParseBlockAt(buf, footer, Value(blockIndexRes))
+            if IsErr(blockRes):
+                return Err[TactIndexLookup](Error(blockRes) + " path=" + indexPath)
+            var out: TactIndexLookup
+            out.indexPath = indexPath
+            out.indexName = indexName
+            out.footer = footer
+            out.entryIndex = entryIndex
+            out.entry = Value(entryRes)
+            out.block = Value(blockRes)
+            return Ok[TactIndexLookup](out)
+        entryIndex = entryIndex + 1
+    return Err[TactIndexLookup](tactIndexNotFoundError(keyHex, indexPath))
+
+fn tactIndexLookupPrefixLoaded(buf: bytes.ByteBuffer,
+                               footer: TactIndexFooter,
+                               indexPath: str,
+                               indexName: str,
+                               keyPrefixHex: str): Result[TactIndexLookup] =
+    if !tactIndexHexPrefixValid(keyPrefixHex, footer.keyBytes):
+        return Err[TactIndexLookup]("wowExport tact-index: lookup prefix must be non-empty even-width hex")
+    var matched: bool
+    var out: TactIndexLookup
+    var entryIndex: int32
+    while entryIndex < footer.entryCount:
+        let posRes: Result[int32] = tactIndexEntryPos(footer, entryIndex)
+        if IsErr(posRes):
+            return Err[TactIndexLookup](Error(posRes) + " path=" + indexPath)
+        let pos: int32 = Value(posRes)
+        if binary.ByteSliceMatchesHex(buf, pos, keyPrefixHex):
+            if matched:
+                return Err[TactIndexLookup]("wowExport tact-index: duplicate key prefix " + keyPrefixHex)
+            let entryRes: Result[TactIndexEntry] = ParseTactIndexEntryAt(buf, footer, "", pos)
+            if IsErr(entryRes):
+                return Err[TactIndexLookup](Error(entryRes) + " path=" + indexPath)
+            let blockIndexRes: Result[int32] = tactIndexBlockIndexForEntry(footer, entryIndex)
+            if IsErr(blockIndexRes):
+                return Err[TactIndexLookup](Error(blockIndexRes) + " path=" + indexPath)
+            let blockRes: Result[TactIndexBlock] = tactIndexParseBlockAt(buf, footer, Value(blockIndexRes))
+            if IsErr(blockRes):
+                return Err[TactIndexLookup](Error(blockRes) + " path=" + indexPath)
+            matched = true
+            out.indexPath = indexPath
+            out.indexName = indexName
+            out.footer = footer
+            out.entryIndex = entryIndex
+            out.entry = Value(entryRes)
+            out.block = Value(blockRes)
+        entryIndex = entryIndex + 1
+    if !matched:
+        return Err[TactIndexLookup](tactIndexNotFoundError(keyPrefixHex, indexPath))
+    return Ok[TactIndexLookup](out)
+
+fn LoadTactIndexEntryAtPathIndex(path: str, entryIndex: int32): Result[TactIndexEntry] =
+    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytesRaw(system.strToCStringTemp(path))
+    if IsErr(readRes):
+        return Err[TactIndexEntry](Error(readRes) + " path=" + path)
+    let buf: bytes.ByteBuffer = Value(readRes)
+    let footerRes: Result[TactIndexFooter] = ParseTactIndexFooter(buf)
+    if IsErr(footerRes):
+        bytes.FreeByteBuffer(buf)
+        return Err[TactIndexEntry](Error(footerRes) + " path=" + path)
+    let footer: TactIndexFooter = Value(footerRes)
+    let posRes: Result[int32] = tactIndexEntryPos(footer, entryIndex)
+    if IsErr(posRes):
+        bytes.FreeByteBuffer(buf)
+        return Err[TactIndexEntry](Error(posRes) + " path=" + path)
+    let entryRes: Result[TactIndexEntry] =
+        ParseTactIndexEntryAt(buf, footer, "", Value(posRes))
+    bytes.FreeByteBuffer(buf)
+    if IsErr(entryRes):
+        return Err[TactIndexEntry](Error(entryRes) + " path=" + path)
+    return entryRes
+
+fn LoadTactIndexLookupFromPath(path: str, keyHex: str): Result[TactIndexLookup] =
+    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytesRaw(system.strToCStringTemp(path))
+    if IsErr(readRes):
+        return Err[TactIndexLookup](Error(readRes) + " path=" + path)
+    let buf: bytes.ByteBuffer = Value(readRes)
+    let footerRes: Result[TactIndexFooter] = ParseTactIndexFooter(buf)
+    if IsErr(footerRes):
+        bytes.FreeByteBuffer(buf)
+        return Err[TactIndexLookup](Error(footerRes) + " path=" + path)
+    let lookupRes: Result[TactIndexLookup] =
+        tactIndexLookupLoaded(buf, Value(footerRes), path, os.ExtractFilename(path), keyHex)
+    bytes.FreeByteBuffer(buf)
+    return lookupRes
+
+fn LoadTactIndexLookupPrefixFromPath(path: str, keyPrefixHex: str): Result[TactIndexLookup] =
+    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytesRaw(system.strToCStringTemp(path))
+    if IsErr(readRes):
+        return Err[TactIndexLookup](Error(readRes) + " path=" + path)
+    let buf: bytes.ByteBuffer = Value(readRes)
+    let footerRes: Result[TactIndexFooter] = ParseTactIndexFooter(buf)
+    if IsErr(footerRes):
+        bytes.FreeByteBuffer(buf)
+        return Err[TactIndexLookup](Error(footerRes) + " path=" + path)
+    let lookupRes: Result[TactIndexLookup] =
+        tactIndexLookupPrefixLoaded(buf, Value(footerRes), path, os.ExtractFilename(path), keyPrefixHex)
+    bytes.FreeByteBuffer(buf)
+    return lookupRes
+
+fn tactIndexDirPath(clientPath: str): str =
+    return build_info.StablePathJoin(build_info.DataPath(clientPath), "indices")
+
+fn LoadTactIndexLookupFromIndexDir(indexDir: str, keyHex: str): Result[TactIndexLookup] =
+    let names: str[] = os.ListDir(indexDir)
+    var matched: bool
+    var out: TactIndexLookup
+    var i: int32
+    while i < names.len:
+        let name: str = names[i]
+        if strings.HasSuffix(name, ".index"):
+            let path: str = build_info.StablePathJoin(indexDir, name)
+            let lookupRes: Result[TactIndexLookup] = LoadTactIndexLookupFromPath(path, keyHex)
+            if IsOk(lookupRes):
+                if matched:
+                    return Err[TactIndexLookup]("wowExport tact-index: duplicate key across local indices key=" + keyHex)
+                matched = true
+                out = Value(lookupRes)
+            elif !tactIndexIsNotFoundError(Error(lookupRes)):
+                return lookupRes
+        i = i + 1
+    if !matched:
+        return Err[TactIndexLookup](tactIndexNotFoundError(keyHex, indexDir))
+    return Ok[TactIndexLookup](out)
+
+fn LoadTactIndexLookupPrefixFromIndexDir(indexDir: str, keyPrefixHex: str): Result[TactIndexLookup] =
+    let names: str[] = os.ListDir(indexDir)
+    var matched: bool
+    var out: TactIndexLookup
+    var i: int32
+    while i < names.len:
+        let name: str = names[i]
+        if strings.HasSuffix(name, ".index"):
+            let path: str = build_info.StablePathJoin(indexDir, name)
+            let lookupRes: Result[TactIndexLookup] = LoadTactIndexLookupPrefixFromPath(path, keyPrefixHex)
+            if IsOk(lookupRes):
+                if matched:
+                    return Err[TactIndexLookup]("wowExport tact-index: duplicate key prefix across local indices key=" + keyPrefixHex)
+                matched = true
+                out = Value(lookupRes)
+            elif !tactIndexIsNotFoundError(Error(lookupRes)):
+                return lookupRes
+        i = i + 1
+    if !matched:
+        return Err[TactIndexLookup](tactIndexNotFoundError(keyPrefixHex, indexDir))
+    return Ok[TactIndexLookup](out)
+
+fn LoadTactIndexLookupFromClientIndices(clientPath: str, keyHex: str): Result[TactIndexLookup] =
+    return LoadTactIndexLookupFromIndexDir(tactIndexDirPath(clientPath), keyHex)
+
+fn LoadTactIndexLookupPrefixFromClientIndices(clientPath: str, keyPrefixHex: str): Result[TactIndexLookup] =
+    return LoadTactIndexLookupPrefixFromIndexDir(tactIndexDirPath(clientPath), keyPrefixHex)
+
+fn tactIndexChainContains(chain: TactIndexFollowChain,
+                          keyWord0: int32,
+                          keyWord1: int32,
+                          keyWord2: int32,
+                          keyWord3: int32): bool =
+    var i: int32
+    while i < chain.stepCount:
+        if chain.steps[i].lookupKeyWord0 == keyWord0 &&
+           chain.steps[i].lookupKeyWord1 == keyWord1 &&
+           chain.steps[i].lookupKeyWord2 == keyWord2 &&
+           chain.steps[i].lookupKeyWord3 == keyWord3:
+            return true
+        i = i + 1
+    return false
+
+fn LoadTactIndexFollowChainFromPath(path: str, startKeyHex: str, maxDepth: int32): Result[TactIndexFollowChain] =
+    if maxDepth <= 0:
+        return Err[TactIndexFollowChain]("wowExport tact-index: maxDepth must be positive")
+    if maxDepth > 8:
+        return Err[TactIndexFollowChain]("wowExport tact-index: maxDepth exceeds fixed chain capacity")
+    if !tactIndexHexKeyValid(startKeyHex, tactIndexKeyHexBytes):
+        return Err[TactIndexFollowChain]("wowExport tact-index: start key must be 32 hex chars")
+    var chain: TactIndexFollowChain
+    var currentKey: str = startKeyHex
+    var depth: int32
+    while depth < maxDepth:
+        let lookupRes: Result[TactIndexLookup] = LoadTactIndexLookupFromPath(path, currentKey)
+        if IsErr(lookupRes):
+            if chain.stepCount == 0:
+                return Err[TactIndexFollowChain](Error(lookupRes))
+            chain.stopKey = currentKey
+            chain.stopReason = Error(lookupRes)
+            return Ok[TactIndexFollowChain](chain)
+        var step: TactIndexFollowStep
+        step.lookupKey = currentKey
+        step.hit = Value(lookupRes)
+        step.lookupKeyWord0 = step.hit.entry.keyWord0
+        step.lookupKeyWord1 = step.hit.entry.keyWord1
+        step.lookupKeyWord2 = step.hit.entry.keyWord2
+        step.lookupKeyWord3 = step.hit.entry.keyWord3
+        chain.steps[chain.stepCount] = step
+        chain.stepCount = chain.stepCount + 1
+        let nextKey: str = step.hit.block.blockKey
+        if strings.Len(nextKey) == 0:
+            chain.stopKey = currentKey
+            chain.stopReason = "wowExport tact-index: empty block key"
+            return Ok[TactIndexFollowChain](chain)
+        if tactIndexChainContains(chain,
+                                  step.hit.block.keyWord0,
+                                  step.hit.block.keyWord1,
+                                  step.hit.block.keyWord2,
+                                  step.hit.block.keyWord3):
+            chain.stopKey = nextKey
+            chain.stopReason = "wowExport tact-index: block key cycle"
+            return Ok[TactIndexFollowChain](chain)
+        currentKey = nextKey
+        depth = depth + 1
+    chain.stopKey = currentKey
+    chain.stopReason = "wowExport tact-index: max depth reached"
+    return Ok[TactIndexFollowChain](chain)
+
+fn LoadTactIndexSummaryFromPath(path: str): Result[TactIndexSummary] =
+    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytesRaw(system.strToCStringTemp(path))
+    if IsErr(readRes):
+        return Err[TactIndexSummary](Error(readRes) + " path=" + path)
+    let buf: bytes.ByteBuffer = Value(readRes)
+    let footerRes: Result[TactIndexFooter] = ParseTactIndexFooter(buf)
+    if IsErr(footerRes):
+        bytes.FreeByteBuffer(buf)
+        return Err[TactIndexSummary](Error(footerRes) + " path=" + path)
+    let firstRes: Result[TactIndexEntry] = ParseTactIndexEntryAt(buf, Value(footerRes), "", 0)
+    bytes.FreeByteBuffer(buf)
+    if IsErr(firstRes):
+        return Err[TactIndexSummary](Error(firstRes) + " path=" + path)
+    var out: TactIndexSummary
+    out.footer = Value(footerRes)
+    out.first = Value(firstRes)
+    return Ok[TactIndexSummary](out)
+
+fn TactIndexFooterText(footer: TactIndexFooter): str =
+    return Fmt"format={strings.IntToStr(footer.formatRevision)} blockKB={strings.IntToStr(footer.blockSizeKB)} offsetBytes={strings.IntToStr(footer.offsetBytes)} sizeBytes={strings.IntToStr(footer.sizeBytes)} keyBytes={strings.IntToStr(footer.keyBytes)} hashBytes={strings.IntToStr(footer.hashBytes)} entries={strings.IntToStr(footer.entryCount)} blocks={strings.IntToStr(footer.blockCount)}"
+
+fn TactIndexEntryText(entry: TactIndexEntry): str =
+    if entry.archiveIndex >= 0:
+        return Fmt"key={entry.key} archiveIndex={strings.IntToStr(entry.archiveIndex)} archiveKey={entry.archiveKey} size={strings.IntToStr(entry.size)} offset={strings.IntToStr(entry.offset)}"
+    return Fmt"key={entry.key} archiveKey={entry.archiveKey} size={strings.IntToStr(entry.size)} offset={strings.IntToStr(entry.offset)}"
+
+fn TactIndexLookupText(lookup: TactIndexLookup): str =
+    let entryIndexText: str = strings.IntToStr(lookup.entryIndex)
+    let blockIndexText: str = strings.IntToStr(lookup.block.blockIndex)
+    let entryText: str = TactIndexEntryText(lookup.entry)
+    return Fmt"index={lookup.indexName} entryIndex={entryIndexText} blockIndex={blockIndexText} blockKey={lookup.block.blockKey} blockHash={lookup.block.blockHash} {entryText}"
+
+fn TactIndexSummaryText(summary: TactIndexSummary): str =
+    let footerText: str = TactIndexFooterText(summary.footer)
+    let firstText: str = TactIndexEntryText(summary.first)
+    return Fmt"{footerText} first={firstText}"

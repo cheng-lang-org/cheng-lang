@@ -5,6 +5,8 @@ import std/strings as strings
 import std/strformat
 import std/strutils as strutils
 import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/asset_export as asset_export
+import cheng/apps/wow_export/blp as blp
 import cheng/apps/wow_export/config as config
 import cheng/apps/wow_export/casc_archive as casc_archive
 import cheng/apps/wow_export/casc_index as casc_index
@@ -18,6 +20,7 @@ import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
 
 fn PrintUsage() =
     echo("wow-export commands: list-builds | probe | manifest | audit-file | extract-file | convert-blp | export-m2 | export-wmo | export-map | preview-northshire")
+    echo("export examples: extract-file --label abbey-bell-model --out /tmp/nsabbeyBell.m2 | convert-blp --out /tmp/abbeyBell.tga | export-map --out-dir /tmp/northshire")
 
 fn RunListBuilds(): int32 =
     let buildsRes: Result[build_info.WowBuildEntry[]] = build_info.LoadBuildInfo(build_info.DefaultClientPath)
@@ -125,55 +128,145 @@ fn RunManifest(): int32 =
     return 0
 
 fn RunAuditFile(): int32 =
-    let ctxRes: Result[local_files.LocalCascContext] =
-        local_files.LoadLocalCascContext(build_info.DefaultClientPath)
-    if IsErr(ctxRes):
-        echo(Error(ctxRes))
-        return 1
-    var ctx: local_files.LocalCascContext = Value(ctxRes)
     let count: int32 = cmdline.ParamCount()
-    var printed: int32
-    if count > 2:
+    var wanted: int32[]
+    if count >= 2 && !strings.HasPrefix(cmdline.ParamStr(2), "-"):
         var i: int32 = 2
-        while i < count:
+        while i <= count:
             let raw: str = cmdline.ParamStr(i)
             let fileDataID: int32 = int32(strutils.ParseInt(raw))
             if fileDataID < 0:
                 echo(Fmt"wowExport audit-file: invalid fileDataID {raw}")
-                local_files.FreeLocalCascContext(ctx)
                 return 1
-            let auditRes: Result[local_files.LocalFileAudit] =
-                local_files.ResolveLocalFileAudit(ctx, fileDataID)
-            if IsErr(auditRes):
-                echo(Error(auditRes))
-                local_files.FreeLocalCascContext(ctx)
-                return 1
-            echo(local_files.AuditText(Value(auditRes)))
-            printed = printed + 1
+            add(wanted, fileDataID)
             i = i + 1
     else:
         let fileDataID: int32 = cmdline.ReadInt32FlagOrDefault("--file-data-id", -1)
         if fileDataID < 0:
             echo("wowExport audit-file: missing --file-data-id or positional fileDataIDs")
-            local_files.FreeLocalCascContext(ctx)
             return 1
-        let auditRes: Result[local_files.LocalFileAudit] =
-            local_files.ResolveLocalFileAudit(ctx, fileDataID)
-        if IsErr(auditRes):
-            echo(Error(auditRes))
-            local_files.FreeLocalCascContext(ctx)
-            return 1
-        echo(local_files.AuditText(Value(auditRes)))
-        printed = 1
-    if printed <= 0:
+        add(wanted, fileDataID)
+    if wanted.len <= 0:
         echo("wowExport audit-file: no fileDataIDs supplied")
-        local_files.FreeLocalCascContext(ctx)
         return 1
-    local_files.FreeLocalCascContext(ctx)
+    let auditsRes: Result[local_files.LocalFileAudit[]] =
+        local_files.ResolveLocalFileAuditsRanged(build_info.DefaultClientPath, wanted)
+    if IsErr(auditsRes):
+        echo(Error(auditsRes))
+        return 1
+    let audits: local_files.LocalFileAudit[] = Value(auditsRes)
+    var printed: int32
+    while printed < audits.len:
+        echo(local_files.AuditText(audits[printed]))
+        printed = printed + 1
+    return 0
+
+fn RunExtractFile(): int32 =
+    let manifest: northshire.NorthshireManifest = northshire.Manifest()
+    let outPath: str = cmdline.ReadFlagOrDefault("--out", "")
+    if strings.Len(outPath) == 0:
+        echo("wowExport extract-file: missing --out")
+        return 1
+    var label: str
+    if cmdline.ReadFirstFlagValue("--label", label):
+        let exportRes: Result[asset_export.AssetExportSummary] =
+            asset_export.ExportNorthshireLabel(manifest, label, outPath)
+        if IsErr(exportRes):
+            echo(Error(exportRes))
+            return 1
+        echo(asset_export.AssetExportSummaryText(Value(exportRes)))
+        return 0
+    let fileDataID: int32 = cmdline.ReadInt32FlagOrDefault("--file-data-id", -1)
+    if fileDataID < 0:
+        echo("wowExport extract-file: missing --label or audited --file-data-id")
+        return 1
+    let exportRes: Result[asset_export.AssetExportSummary] =
+        asset_export.ExportNorthshireFileDataID(manifest, fileDataID, outPath)
+    if IsErr(exportRes):
+        echo(Error(exportRes))
+        return 1
+    echo(asset_export.AssetExportSummaryText(Value(exportRes)))
+    return 0
+
+fn RunExportKind(kind: str): int32 =
+    let outPath: str = cmdline.ReadFlagOrDefault("--out", "")
+    if strings.Len(outPath) == 0:
+        echo(Fmt"wowExport export-{kind}: missing --out")
+        return 1
+    let exportRes: Result[asset_export.AssetExportSummary] =
+        asset_export.ExportNorthshireKind(northshire.Manifest(), kind, outPath)
+    if IsErr(exportRes):
+        echo(Error(exportRes))
+        return 1
+    echo(asset_export.AssetExportSummaryText(Value(exportRes)))
+    return 0
+
+fn RunExportMap(): int32 =
+    let outDir: str = cmdline.ReadFlagOrDefault("--out-dir", "")
+    if strings.Len(outDir) == 0:
+        echo("wowExport export-map: missing --out-dir")
+        return 1
+    let exportRes: Result[asset_export.AssetExportBundleSummary] =
+        asset_export.ExportNorthshireBundle(northshire.Manifest(), outDir)
+    if IsErr(exportRes):
+        echo(Error(exportRes))
+        return 1
+    echo(asset_export.AssetExportBundleSummaryText(Value(exportRes)))
+    return 0
+
+fn RunConvertBlp(): int32 =
+    let outPath: str = cmdline.ReadFlagOrDefault("--out", "")
+    if strings.Len(outPath) == 0:
+        echo("wowExport convert-blp: missing --out")
+        return 1
+    var inPath: str
+    if cmdline.ReadFirstFlagValue("--in", inPath):
+        let blpBuf: bytes.ByteBuffer = bytes.ReadFileBytes(inPath)
+        if blpBuf.len <= 0:
+            echo("wowExport convert-blp: input read failed " + inPath)
+            return 1
+        let tgaRes: Result[bytes.ByteBuffer] = blp.Blp2DecodeFirstMipTga(blpBuf)
+        bytes.FreeByteBuffer(blpBuf)
+        if IsErr(tgaRes):
+            echo(Error(tgaRes))
+            return 1
+        var tgaBuf: bytes.ByteBuffer = Value(tgaRes)
+        let writeRes: Result[int32] = asset_export.AssetExportWriteBufferAtomic(outPath, tgaBuf)
+        bytes.FreeByteBuffer(tgaBuf)
+        if IsErr(writeRes):
+            echo(Error(writeRes))
+            return 1
+        echo("converted blp bytes=" + strings.IntToStr(Value(writeRes)) + " out=" + outPath)
+        return 0
+    let manifest: northshire.NorthshireManifest = northshire.Manifest()
+    var label: str
+    if cmdline.ReadFirstFlagValue("--label", label):
+        let exportRes: Result[asset_export.AssetExportSummary] =
+            asset_export.ConvertNorthshireBlpLabel(manifest, label, outPath)
+        if IsErr(exportRes):
+            echo(Error(exportRes))
+            return 1
+        echo(asset_export.AssetExportSummaryText(Value(exportRes)))
+        return 0
+    let fileDataID: int32 = cmdline.ReadInt32FlagOrDefault("--file-data-id", -1)
+    if fileDataID >= 0:
+        let exportRes: Result[asset_export.AssetExportSummary] =
+            asset_export.ConvertNorthshireBlpFileDataID(manifest, fileDataID, outPath)
+        if IsErr(exportRes):
+            echo(Error(exportRes))
+            return 1
+        echo(asset_export.AssetExportSummaryText(Value(exportRes)))
+        return 0
+    let exportRes: Result[asset_export.AssetExportSummary] =
+        asset_export.ConvertNorthshireFirstBlp(manifest, outPath)
+    if IsErr(exportRes):
+        echo(Error(exportRes))
+        return 1
+    echo(asset_export.AssetExportSummaryText(Value(exportRes)))
     return 0
 
 fn RunNotImplemented(cmd: str): int32 =
-    echo(Fmt"wowExport {cmd}: blocked until audited fileDataID manifest and real asset export path are implemented; no fake extraction")
+    echo(Fmt"wowExport {cmd}: blocked until real BLP pixel decoding and target encoding are implemented; no fake conversion")
     return 1
 
 fn main(argc: int32, argv: ptr): int32 =
@@ -191,11 +284,18 @@ fn main(argc: int32, argv: ptr): int32 =
         return RunManifest()
     if cmd == "audit-file":
         return RunAuditFile()
+    if cmd == "extract-file":
+        return RunExtractFile()
+    if cmd == "export-m2":
+        return RunExportKind("m2")
+    if cmd == "export-wmo":
+        return RunExportKind("wmo")
+    if cmd == "export-map":
+        return RunExportMap()
     if cmd == "preview-northshire":
         return RunPreviewNorthshire()
-    if cmd == "extract-file" || cmd == "convert-blp" || cmd == "export-m2" ||
-        cmd == "export-wmo" || cmd == "export-map":
-        return RunNotImplemented(cmd)
+    if cmd == "convert-blp":
+        return RunConvertBlp()
     echo(Fmt"wowExport: unknown command {cmd}")
     PrintUsage()
     return 1

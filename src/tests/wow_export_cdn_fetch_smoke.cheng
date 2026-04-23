@@ -1,0 +1,67 @@
+import std/os
+import std/bytes as bytes
+import std/result
+import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/cdn_fetch as cdn_fetch
+import cheng/apps/wow_export/config as config
+
+const
+    wowExportCdnFetchCacheRoot = "/tmp/wow_export_cdn_fetch_smoke_cache"
+
+fn main(): int32 =
+    let buildRes: Result[build_info.WowBuildEntry] = build_info.ProbeRetailDefault()
+    assert(IsOk(buildRes), Error(buildRes))
+    let build: build_info.WowBuildEntry = Value(buildRes)
+
+    let cfgRes: Result[config.BuildConfig] =
+        config.LoadBuildConfig(build_info.DefaultClientPath, build.buildKey)
+    assert(IsOk(cfgRes), Error(cfgRes))
+    let cfg: config.BuildConfig = Value(cfgRes)
+    assert(cfg.vfsRootEncodingKey == "2aece4e2ec64a8c89753c53f4d0207ca",
+           "wow_export_cdn_fetch_smoke vfs-root ekey")
+    assert(cfg.vfsRootEncodingSize == 34973,
+           "wow_export_cdn_fetch_smoke vfs-root size")
+
+    let cachePathRes: Result[str] =
+        cdn_fetch.CdnCachePath(wowExportCdnFetchCacheRoot, cfg.vfsRootEncodingKey)
+    assert(IsOk(cachePathRes), Error(cachePathRes))
+    let cachePath: str = Value(cachePathRes)
+    let tmpPath: str = cachePath + ".tmp"
+    if os.FileExists(cachePath):
+        assert(os.RemoveFile(cachePath), "wow_export_cdn_fetch_smoke remove old cache")
+    if os.FileExists(tmpPath):
+        assert(os.RemoveFile(tmpPath), "wow_export_cdn_fetch_smoke remove old tmp")
+
+    let fetchRes: Result[cdn_fetch.CdnFetchResult] =
+        cdn_fetch.CdnFetchLooseObjectToCache(build,
+                                             wowExportCdnFetchCacheRoot,
+                                             cfg.vfsRootEncodingKey,
+                                             cfg.vfsRootEncodingSize)
+    assert(IsOk(fetchRes), Error(fetchRes))
+    let fetched: cdn_fetch.CdnFetchResult = Value(fetchRes)
+    assert(!fetched.fromCache, "wow_export_cdn_fetch_smoke first fetch is network")
+    assert(fetched.statusCode == 200, "wow_export_cdn_fetch_smoke status")
+    assert(fetched.bytesWritten == 34973, "wow_export_cdn_fetch_smoke bytes")
+    assert(os.FileExists(fetched.cachePath), "wow_export_cdn_fetch_smoke cache exists")
+    assert(os.FileSize(fetched.cachePath) == int64(34973), "wow_export_cdn_fetch_smoke cache size")
+
+    let cachedRes: Result[cdn_fetch.CdnFetchResult] =
+        cdn_fetch.CdnFetchLooseObjectToCache(build,
+                                             wowExportCdnFetchCacheRoot,
+                                             cfg.vfsRootEncodingKey,
+                                             cfg.vfsRootEncodingSize)
+    assert(IsOk(cachedRes), Error(cachedRes))
+    let cached: cdn_fetch.CdnFetchResult = Value(cachedRes)
+    assert(cached.fromCache, "wow_export_cdn_fetch_smoke second fetch is cache")
+    assert(cached.bytesWritten == 34973, "wow_export_cdn_fetch_smoke cached bytes")
+
+    let decodedRes: Result[bytes.ByteBuffer] =
+        cdn_fetch.CdnDecodeCachedBlte(cached.cachePath, cfg.vfsRootEncodingSize)
+    assert(IsOk(decodedRes), Error(decodedRes))
+    let decoded: bytes.ByteBuffer = Value(decodedRes)
+    assert(decoded.len == cfg.vfsRootContentSize,
+           "wow_export_cdn_fetch_smoke decoded vfs-root size")
+    bytes.FreeByteBuffer(decoded)
+
+    echo("wow_export_cdn_fetch_smoke ok")
+    return 0

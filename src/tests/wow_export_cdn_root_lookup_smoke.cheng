@@ -1,0 +1,86 @@
+import std/bytes as bytes
+import std/result
+import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/cdn_config as cdn_config
+import cheng/apps/wow_export/cdn_fetch as cdn_fetch
+import cheng/apps/wow_export/cdn_root as cdn_root
+import cheng/apps/wow_export/config as config
+import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
+import cheng/apps/wow_export/root as wow_root
+import cheng/apps/wow_export/tact_index as tact_index
+import cheng/apps/wow_export/tvfs as tvfs
+
+const
+    wowExportCdnRootLookupCacheRoot = "/tmp/wow_export_cdn_root_lookup_smoke_cache"
+
+fn main(): int32 =
+    let buildRes: Result[build_info.WowBuildEntry] = build_info.ProbeRetailDefault()
+    assert(IsOk(buildRes), Error(buildRes))
+    let build: build_info.WowBuildEntry = Value(buildRes)
+
+    let cfgRes: Result[config.BuildConfig] =
+        config.LoadBuildConfig(build_info.DefaultClientPath, build.buildKey)
+    assert(IsOk(cfgRes), Error(cfgRes))
+    let cfg: config.BuildConfig = Value(cfgRes)
+
+    let vfsFetchRes: Result[cdn_fetch.CdnFetchResult] =
+        cdn_fetch.CdnFetchLooseObjectToCache(build,
+                                             wowExportCdnRootLookupCacheRoot,
+                                             cfg.vfsRootEncodingKey,
+                                             cfg.vfsRootEncodingSize)
+    assert(IsOk(vfsFetchRes), Error(vfsFetchRes))
+    let vfsDecodedRes: Result[bytes.ByteBuffer] =
+        cdn_fetch.CdnDecodeCachedBlte(Value(vfsFetchRes).cachePath, cfg.vfsRootEncodingSize)
+    assert(IsOk(vfsDecodedRes), Error(vfsDecodedRes))
+    let vfsDecoded: bytes.ByteBuffer = Value(vfsDecodedRes)
+    let tvfsSummaryRes: Result[tvfs.TvfsSummary] = tvfs.TvfsParseSummary(vfsDecoded)
+    bytes.FreeByteBuffer(vfsDecoded)
+    assert(IsOk(tvfsSummaryRes), Error(tvfsSummaryRes))
+    let tvfsSummary: tvfs.TvfsSummary = Value(tvfsSummaryRes)
+
+    let cdnCfgRes: Result[cdn_config.CdnConfig] =
+        cdn_config.LoadCdnConfig(build_info.DefaultClientPath, build.cdnKey)
+    assert(IsOk(cdnCfgRes), Error(cdnCfgRes))
+    let cdnCfg: cdn_config.CdnConfig = Value(cdnCfgRes)
+    let indexDir: str = build_info.StablePathJoin(build_info.DataPath(build_info.DefaultClientPath), "indices")
+    let fileIndexPath: str =
+        build_info.StablePathJoin(indexDir, build_info.StableConcat(cdnCfg.fileIndex, ".index"))
+    let rootLookupRes: Result[tact_index.TactIndexLookup] =
+        tact_index.LoadTactIndexLookupPrefixFromPath(
+            fileIndexPath,
+            tvfsSummary.firstFile.firstSpan.container.encodingKey)
+    assert(IsOk(rootLookupRes), Error(rootLookupRes))
+    let rootLookup: tact_index.TactIndexLookup = Value(rootLookupRes)
+
+    let rootFetchRes: Result[cdn_fetch.CdnFetchResult] =
+        cdn_fetch.CdnFetchLooseObjectToCache(build,
+                                             wowExportCdnRootLookupCacheRoot,
+                                             rootLookup.entry.key,
+                                             tvfsSummary.firstFile.firstSpan.container.encodedSize)
+    assert(IsOk(rootFetchRes), Error(rootFetchRes))
+    let rootFetch: cdn_fetch.CdnFetchResult = Value(rootFetchRes)
+
+    let manifest: northshire.NorthshireManifest = northshire.Manifest()
+    assert(northshire.ManifestReady(manifest), "wow_export_cdn_root_lookup_smoke manifest ready")
+    var wanted: int32[]
+    var i: int32
+    while i < manifest.auditedFiles.len:
+        let file: northshire.NorthshireAuditedFile = manifest.auditedFiles[i]
+        add(wanted, file.fileDataID)
+        i = i + 1
+    let rootEntriesRes: Result[wow_root.RootEntry[]] =
+        cdn_root.CdnRootFindFileDataIDs(rootFetch.cachePath,
+                                        tvfsSummary.firstFile.firstSpan.container.encodedSize,
+                                        tvfsSummary.firstFile.firstSpan.container.contentSize,
+                                        wanted,
+                                        0)
+    assert(IsOk(rootEntriesRes), Error(rootEntriesRes))
+    let rootEntries: wow_root.RootEntry[] = Value(rootEntriesRes)
+    i = 0
+    while i < manifest.auditedFiles.len:
+        let file: northshire.NorthshireAuditedFile = manifest.auditedFiles[i]
+        assert(rootEntries[i].contentKey == file.contentKey,
+               "wow_export_cdn_root_lookup_smoke content key")
+        i = i + 1
+    echo("wow_export_cdn_root_lookup_smoke ok")
+    return 0

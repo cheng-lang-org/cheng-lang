@@ -96,10 +96,13 @@ fn ManifestReady(m: NorthshireManifest): bool =
         i = i + 1
     return true
 
-fn northshireAuditFreeErr(ctx: var local_files.LocalCascContext,
-                          message: str): Result[NorthshireAuditSummary] =
-    local_files.FreeLocalCascContext(ctx)
-    return Err[NorthshireAuditSummary](message)
+fn northshireManifestFileDataIDs(m: NorthshireManifest): int32[] =
+    var out: int32[]
+    var i: int32
+    while i < m.auditedFiles.len:
+        add(out, m.auditedFiles[i].fileDataID)
+        i = i + 1
+    return out
 
 fn AuditManifestAgainstLocal(m: NorthshireManifest): Result[NorthshireAuditSummary] =
     if !ManifestReady(m):
@@ -108,38 +111,29 @@ fn AuditManifestAgainstLocal(m: NorthshireManifest): Result[NorthshireAuditSumma
         m.version != build_info.DefaultVersion ||
         m.buildKey != build_info.DefaultBuildKey:
         return Err[NorthshireAuditSummary]("wowExport northshire manifest: build identity drift")
-    let ctxRes: Result[local_files.LocalCascContext] = local_files.LoadLocalCascContext(m.clientPath)
-    if IsErr(ctxRes):
-        return Err[NorthshireAuditSummary](Error(ctxRes))
-    var ctx: local_files.LocalCascContext = Value(ctxRes)
+    let fileIDs: int32[] = northshireManifestFileDataIDs(m)
+    let auditsRes: Result[local_files.LocalFileAudit[]] =
+        local_files.ResolveLocalFileAuditsRanged(m.clientPath, fileIDs)
+    if IsErr(auditsRes):
+        return Err[NorthshireAuditSummary](Error(auditsRes))
+    let audits: local_files.LocalFileAudit[] = Value(auditsRes)
     var out: NorthshireAuditSummary
     var i: int32
     while i < m.auditedFiles.len:
         let file: NorthshireAuditedFile = m.auditedFiles[i]
-        let auditRes: Result[local_files.LocalFileAudit] =
-            local_files.ResolveLocalFileAudit(ctx, file.fileDataID)
-        if IsErr(auditRes):
-            return northshireAuditFreeErr(ctx,
-                                          "wowExport northshire manifest: " + file.label + " audit failed: " + Error(auditRes))
-        let audit: local_files.LocalFileAudit = Value(auditRes)
+        let audit: local_files.LocalFileAudit = audits[i]
         if audit.contentKey != file.contentKey:
-            return northshireAuditFreeErr(ctx,
-                                          "wowExport northshire manifest: " + file.label + " contentKey mismatch want=" + file.contentKey + " got=" + audit.contentKey)
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " contentKey mismatch want=" + file.contentKey + " got=" + audit.contentKey)
         if audit.encodingKey != file.encodingKey:
-            return northshireAuditFreeErr(ctx,
-                                          "wowExport northshire manifest: " + file.label + " encodingKey mismatch want=" + file.encodingKey + " got=" + audit.encodingKey)
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " encodingKey mismatch want=" + file.encodingKey + " got=" + audit.encodingKey)
         if audit.entry.archiveIndex != file.archiveIndex:
-            return northshireAuditFreeErr(ctx,
-                                          "wowExport northshire manifest: " + file.label + " archive mismatch want=" + strings.IntToStr(file.archiveIndex) + " got=" + strings.IntToStr(audit.entry.archiveIndex))
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " archive mismatch want=" + strings.IntToStr(file.archiveIndex) + " got=" + strings.IntToStr(audit.entry.archiveIndex))
         if audit.entry.offset != file.offset:
-            return northshireAuditFreeErr(ctx,
-                                          "wowExport northshire manifest: " + file.label + " offset mismatch want=" + strings.IntToStr(file.offset) + " got=" + strings.IntToStr(audit.entry.offset))
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " offset mismatch want=" + strings.IntToStr(file.offset) + " got=" + strings.IntToStr(audit.entry.offset))
         if audit.entry.size != file.size:
-            return northshireAuditFreeErr(ctx,
-                                          "wowExport northshire manifest: " + file.label + " size mismatch want=" + strings.IntToStr(file.size) + " got=" + strings.IntToStr(audit.entry.size))
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " size mismatch want=" + strings.IntToStr(file.size) + " got=" + strings.IntToStr(audit.entry.size))
         out.matchedFileCount = out.matchedFileCount + 1
         i = i + 1
-    local_files.FreeLocalCascContext(ctx)
     return Ok[NorthshireAuditSummary](out)
 
 fn AuditManifestPayloadsAgainstLocal(m: NorthshireManifest): Result[NorthshireAuditSummary] =

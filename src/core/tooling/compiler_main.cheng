@@ -15,6 +15,8 @@ import cheng/core/tooling/compiler_csg as ccsg
 import cheng/core/tooling/compiler_equivalence as ceq
 import cheng/core/tooling/compiler_publish_gate as cpub
 import cheng/core/tooling/compiler_world_libp2p as cwlp
+import cheng/core/tooling/export_visibility_gate as evgate
+import cheng/core/tooling/host_bridge_audit_gate as hbagate
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/mobile_shell_codegen as mshell
 import cheng/core/tooling/path as chengpath
@@ -321,201 +323,6 @@ fn CompilerRequestedTarget(): str =
 fn CompilerStage3CommandPath(rootDir: str): str =
     return chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage3")
 
-fn CompilerVerifyExportVisibilityCompilerPath(rootDir: str): str =
-    let explicitRaw = strutil.Strip(cmdline.ReadFlagOrDefault("--compiler", ""))
-    if len(explicitRaw) > 0:
-        return chengpath.PathAbsolute(rootDir, explicitRaw)
-    return CompilerStage3CommandPath(rootDir)
-
-fn CompilerVerifyExportVisibilityArtifactsDir(rootDir: str): str =
-    return chengpath.PathAbsolute(rootDir, "artifacts/forward/verify_export_visibility")
-
-fn CompilerVerifyExportVisibilityEnsureDir(rootDir: str,
-                                            dirPath: str): bool =
-    if chengpath.MkdirP(rootDir, dirPath):
-        return true
-    CompilerPrintErr(" compiler: failed to create verify-export-visibility dir: " + dirPath)
-    return false
-
-fn CompilerVerifyExportVisibilityWriteManifest(rootDir: str,
-                                                 packageRoot: str,
-                                                 packageId: str,
-                                                 modulePrefix: str): bool =
-    let manifestPath = os.JoinPath(packageRoot, "cheng-package.toml")
-    let manifestText = "package_id = \"" + packageId + "\"\nmodule_prefix = \"" + modulePrefix + "\"\n"
-    if chengpath.WriteTextFile(rootDir, manifestPath, manifestText):
-        return true
-    CompilerPrintErr(" compiler: failed to write verify-export-visibility manifest: " + manifestPath)
-    return false
-
-fn CompilerExecFileCapture(rootDir: str,
-                             filePath: str,
-                             argv: str[],
-                             envOverrides: str[],
-                             logPath: str,
-                             outOutput: var str): int32 =
-    var mergedEnv = CompilerActiveRuntimeEnvOverrides(rootDir)
-    for i in 0..<envOverrides.len:
-        add(mergedEnv, envOverrides[i])
-    var command = "env"
-    for i in 0..<mergedEnv.len:
-        let envText = strutil.Strip(mergedEnv[i])
-        if len(envText) > 0:
-            command = command + " " + CompilerQuoteShell(envText)
-    command = command + " " + CompilerFileCommand(filePath, argv)
-    let run = os.ExecCmdEx(command, uint64(1), rootDir)
-    outOutput = run.output
-    if len(logPath) > 0:
-        let _ = chengpath.WriteTextFile(rootDir, logPath, outOutput)
-    return run.exitCode
-
-fn CompilerVerifyExportVisibilityCompileFixture(rootDir: str,
-                                                  compilerPath: str,
-                                                  packageRoot: str,
-                                                  inputPath: str,
-                                                  outPath: str,
-                                                  logPath: str,
-                                                  outOutput: var str): int32 =
-    let argv = [
-        "system-link-exec",
-        "--root:" + packageRoot,
-        "--in:" + inputPath,
-        "--emit:exe",
-        "--target:" + contracts.BootstrapDefaultTarget(),
-        "--out:" + outPath
-    ]
-    return CompilerExecFileCapture(rootDir,
-                                   compilerPath,
-                                   argv,
-                                   ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
-                                   logPath,
-                                   outOutput)
-
-fn CompilerVerifyExportVisibilityCheckNegative(caseLabel: str,
-                                                 exitCode: int32,
-                                                 output: str,
-                                                 needle: str): bool =
-    if exitCode == 0:
-        CompilerPrintErr(" compiler: verify-export-visibility unexpected success: " + caseLabel)
-        return false
-    if chengpath.TextContains(output, needle):
-        return true
-    CompilerPrintErr(" compiler: verify-export-visibility missing diagnostic: " + caseLabel)
-    let outputText = strutil.Strip(output)
-    if len(outputText) > 0:
-        CompilerPrintErr(outputText)
-    return false
-
-fn CompilerVerifyExportVisibilityPrivateSymbolNegative(rootDir: str,
-                                                         compilerPath: str): bool =
-    let caseDir = os.JoinPath(CompilerVerifyExportVisibilityArtifactsDir(rootDir), "private_symbol")
-    let workspaceDir = os.JoinPath(caseDir, "workspace")
-    let helperRoot = os.JoinPath(workspaceDir, "private_helper_pkg")
-    let helperSrcDir = os.JoinPath(helperRoot, "src")
-    let consumerRoot = os.JoinPath(workspaceDir, "private_consumer_pkg")
-    let consumerSrcDir = os.JoinPath(consumerRoot, "src")
-    if !CompilerVerifyExportVisibilityEnsureDir(rootDir, helperSrcDir):
-        return false
-    if !CompilerVerifyExportVisibilityEnsureDir(rootDir, consumerSrcDir):
-        return false
-    if !CompilerVerifyExportVisibilityWriteManifest(rootDir,
-                                                      helperRoot,
-                                                      "pkg://cheng/private_helper_pkg",
-                                                      "private_helper_pkg"):
-        return false
-    if !CompilerVerifyExportVisibilityWriteManifest(rootDir,
-                                                      consumerRoot,
-                                                      "pkg://cheng/private_consumer_pkg",
-                                                      "private_consumer_pkg"):
-        return false
-    let helperSrcPath = os.JoinPath(helperSrcDir, "helper.cheng")
-    let consumerSrcPath = os.JoinPath(consumerSrcDir, "main.cheng")
-    let helperSrcText = "fn privateFn(): int32 =\n    return 1\n\nfn PublicFn(): int32 =\n    return 2\n"
-    let consumerSrcText = "import cheng/private_helper_pkg/helper as helper\n\nfn main(): int32 =\n    let x = helper.privateFn()\n    return x\n"
-    if !chengpath.WriteTextFile(rootDir, helperSrcPath, helperSrcText):
-        CompilerPrintErr(" compiler: failed to write verify-export-visibility helper source: " + helperSrcPath)
-        return false
-    if !chengpath.WriteTextFile(rootDir, consumerSrcPath, consumerSrcText):
-        CompilerPrintErr(" compiler: failed to write verify-export-visibility consumer source: " + consumerSrcPath)
-        return false
-    let outPath = os.JoinPath(caseDir, "private_symbol")
-    let logPath = os.JoinPath(caseDir, "private_symbol.compile.log")
-    var output = ""
-    let exitCode = CompilerVerifyExportVisibilityCompileFixture(rootDir,
-                                                                  compilerPath,
-                                                                  consumerRoot,
-                                                                  consumerSrcPath,
-                                                                  outPath,
-                                                                  logPath,
-                                                                  output)
-    if !CompilerVerifyExportVisibilityCheckNegative("private symbol",
-                                                      exitCode,
-                                                      output,
-                                                      "imported private symbol 'privateFn' is not exported"):
-        return false
-    CompilerPrintLine(" verify-export-visibility private symbol ok")
-    return true
-
-fn CompilerVerifyExportVisibilityStrformatCase(rootDir: str,
-                                                 compilerPath: str,
-                                                 packageRoot: str,
-                                                 caseDir: str,
-                                                 stem: str,
-                                                 sourceText: str,
-                                                 needle: str): bool =
-    let srcDir = os.JoinPath(packageRoot, "src")
-    let srcPath = os.JoinPath(srcDir, stem + ".cheng")
-    if !chengpath.WriteTextFile(rootDir, srcPath, sourceText):
-        CompilerPrintErr(" compiler: failed to write verify-export-visibility source: " + srcPath)
-        return false
-    let outPath = os.JoinPath(caseDir, stem)
-    let logPath = os.JoinPath(caseDir, stem + ".compile.log")
-    var output = ""
-    let exitCode = CompilerVerifyExportVisibilityCompileFixture(rootDir,
-                                                                  compilerPath,
-                                                                  packageRoot,
-                                                                  srcPath,
-                                                                  outPath,
-                                                                  logPath,
-                                                                  output)
-    return CompilerVerifyExportVisibilityCheckNegative(stem,
-                                                       exitCode,
-                                                       output,
-                                                       needle)
-
-fn CompilerVerifyExportVisibilityStrformatNegative(rootDir: str,
-                                                     compilerPath: str): bool =
-    let caseDir = os.JoinPath(CompilerVerifyExportVisibilityArtifactsDir(rootDir), "strformat_private")
-    let packageRoot = os.JoinPath(caseDir, "strformat_negative_pkg")
-    let srcDir = os.JoinPath(packageRoot, "src")
-    if !CompilerVerifyExportVisibilityEnsureDir(rootDir, srcDir):
-        return false
-    if !CompilerVerifyExportVisibilityWriteManifest(rootDir,
-                                                      packageRoot,
-                                                      "pkg://cheng/strformat_negative_pkg",
-                                                      "strformat_negative_pkg"):
-        return false
-    let fmtSource = "import std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.fmt(\"bad\")\n    echo(text)\n    return 0\n"
-    if !CompilerVerifyExportVisibilityStrformatCase(rootDir,
-                                                      compilerPath,
-                                                      packageRoot,
-                                                      caseDir,
-                                                      "fmt_private_main",
-                                                      fmtSource,
-                                                      "imported private symbol 'fmt' is not exported"):
-        return false
-    let linesSource = "import std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.lines([\"a\", \"b\"])\n    echo(text)\n    return 0\n"
-    if !CompilerVerifyExportVisibilityStrformatCase(rootDir,
-                                                      compilerPath,
-                                                      packageRoot,
-                                                      caseDir,
-                                                      "lines_private_main",
-                                                      linesSource,
-                                                      "imported private symbol 'lines' is not exported"):
-        return false
-    CompilerPrintLine(" verify-export-visibility strformat ok")
-    return true
-
 fn CompilerPrintBuildPlan(rootDir: str,
                             args: str[]): int32 =
     let stage3Path = CompilerStage3CommandPath(rootDir)
@@ -537,64 +344,6 @@ fn CompilerPrintBuildPlan(rootDir: str,
     let outputText = strutil.Strip(outputRaw)
     if len(outputText) > 0:
         CompilerPrintBlock(outputText)
-    return 0
-
-fn CompilerVerifyExportVisibility(rootDir: str): int32 =
-    let stage3Path = CompilerStage3CommandPath(rootDir)
-    let compilerPath = CompilerVerifyExportVisibilityCompilerPath(rootDir)
-    let logPath = chengpath.PathAbsolute(rootDir, "artifacts/forward/verify-export-visibility.local.log")
-    if !chengpath.FileExistsNonEmpty(rootDir, stage3Path):
-        CompilerPrintErr(" compiler: missing stage3 compiler for command: verify-export-visibility")
-        return 2
-    if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
-        CompilerPrintErr(" compiler: missing verify-export-visibility compiler: " + compilerPath)
-        return 2
-    let smokeArgs = [
-        "run-host-smokes",
-        "--compiler:" + compilerPath,
-        "--label:verify_export_stage3",
-        "export_visibility_smoke"
-    ]
-    if !CompilerRunFileEnvLogged(rootDir,
-                                   stage3Path,
-                                   smokeArgs,
-                                   ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
-                                   logPath,
-                                   "verify-export-visibility"):
-        CompilerPrintErr(" compiler: verify-export-visibility failed")
-        return 1
-    if !CompilerVerifyExportVisibilityPrivateSymbolNegative(rootDir, compilerPath):
-        CompilerPrintErr(" compiler: verify-export-visibility failed")
-        return 1
-    if !CompilerVerifyExportVisibilityStrformatNegative(rootDir, compilerPath):
-        CompilerPrintErr(" compiler: verify-export-visibility failed")
-        return 1
-    let outputRaw = chengpath.ReadTextFile("", logPath)
-    let outputText = strutil.Strip(outputRaw)
-    if len(outputText) > 0:
-        CompilerPrintBlock(outputText)
-    CompilerPrintLine(" verify-export-visibility ok")
-    return 0
-
-fn CompilerVerifyExportVisibilityParallel(rootDir: str): int32 =
-    let stage3Path = CompilerStage3CommandPath(rootDir)
-    let logPath = chengpath.PathAbsolute(rootDir, "artifacts/forward/verify-export-visibility-parallel.local.log")
-    if !chengpath.FileExistsNonEmpty(rootDir, stage3Path):
-        CompilerPrintErr(" compiler: missing stage3 compiler for command: verify-export-visibility-parallel")
-        return 2
-    if !CompilerRunFileEnvLogged(rootDir,
-                                   stage3Path,
-                                   ["verify-export-visibility-parallel"],
-                                   ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
-                                   logPath,
-                                   "verify-export-visibility-parallel"):
-        CompilerPrintErr(" compiler: verify-export-visibility-parallel failed")
-        return 1
-    let outputRaw = chengpath.ReadTextFile("", logPath)
-    let outputText = strutil.Strip(outputRaw)
-    if len(outputText) > 0:
-        CompilerPrintBlock(outputText)
-    CompilerPrintLine(" verify-export-visibility-parallel ok")
     return 0
 
 fn CompilerWriteOptionalReport(rootDir: str,
@@ -4986,7 +4735,7 @@ fn CompilerR2cReactFreshCleanGate(rootDir: str,
     if CompilerForwardToBridge(rootDir, stage3Path, "run-host-smokes", smokeNames) != 0:
         CompilerPrintErr(" compiler: run-host-smokes failed inside r2c fresh gate")
         return 2
-    let auditText = CompilerHostBridgeAuditText(rootDir)
+    let auditText = hbagate.HostBridgeAuditGateText(rootDir)
     CompilerPrintLine(auditText)
     if !strutil.Contains(auditText, "pure_cheng_zero_c_ready=1") ||
        !strutil.Contains(auditText, "remaining_non_pure_cheng_boundary=none"):
@@ -8283,13 +8032,13 @@ fn main(argc: int32, argv: str*): int32 =
     if cmd == "print-build-plan":
         return CompilerPrintBuildPlan(rootDir, args)
     if cmd == "verify-export-visibility":
-        return CompilerVerifyExportVisibility(rootDir)
+        return evgate.ExportVisibilityGateRun(rootDir)
     if cmd == "verify-export-visibility-parallel":
-        return CompilerVerifyExportVisibilityParallel(rootDir)
+        return evgate.ExportVisibilityGateRunParallel(rootDir)
     if cmd == "verify-mobile-shell-build-probe":
         return CompilerVerifyMobileShellBuildProbe(rootDir)
     if cmd == "host-bridge-audit":
-        return CompilerHostBridgeAudit(rootDir)
+        return hbagate.HostBridgeAuditGateRun(rootDir)
     if cmd == "mobile-shell":
         var outputText: str
         var errorText: str

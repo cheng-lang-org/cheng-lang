@@ -245,6 +245,62 @@ fn FindJournalIndexEntry(buf: bytes.ByteBuffer, keyPrefix: str): Result[CascInde
         i = i + 1
     return Err[CascIndexEntry]("wowExport index: key prefix not found " + keyPrefix)
 
+fn cascIndexInitEntryArray(count: int32): CascIndexEntry[] =
+    var out: CascIndexEntry[]
+    var i: int32
+    while i < count:
+        var entry: CascIndexEntry
+        add(out, entry)
+        i = i + 1
+    return out
+
+fn cascIndexInitBoolArray(count: int32): bool[] =
+    var out: bool[]
+    var i: int32
+    while i < count:
+        add(out, false)
+        i = i + 1
+    return out
+
+fn FindJournalIndexEntries(buf: bytes.ByteBuffer,
+                           keyPrefixes: str[],
+                           foundFlags: var bool[],
+                           entries: var CascIndexEntry[],
+                           matchedCount: var int32): Result[bool] =
+    if keyPrefixes.len <= 0:
+        return Err[bool]("wowExport index: empty key prefix list")
+    if buf.len < 16:
+        return Err[bool]("wowExport index: file too small")
+    let headerHashSize: int32 = bytes.ReadU32LEAt(buf, 0)
+    if headerHashSize < 0 || headerHashSize > buf.len:
+        return Err[bool]("wowExport index: invalid header hash size")
+    let headerEnd: int32 = 8 + headerHashSize
+    let aligned: int32 = ((headerEnd + 15) / 16) * 16
+    if aligned + 8 > buf.len:
+        return Err[bool]("wowExport index: truncated data header")
+    let dataLength: int32 = bytes.ReadU32LEAt(buf, aligned)
+    if dataLength <= 0 || dataLength % 18 != 0:
+        return Err[bool]("wowExport index: invalid entry section")
+    let entryStart: int32 = aligned + 8
+    if entryStart + dataLength > buf.len:
+        return Err[bool]("wowExport index: truncated entries")
+    let entryCount: int32 = dataLength / 18
+    var i: int32
+    while i < entryCount && matchedCount < keyPrefixes.len:
+        let pos: int32 = entryStart + i * 18
+        var wantedIndex: int32
+        while wantedIndex < keyPrefixes.len:
+            if !foundFlags[wantedIndex] && EntryKeyMatches(buf, pos, keyPrefixes[wantedIndex]):
+                let entryRes: Result[CascIndexEntry] = ParseEntryAt(buf, pos)
+                if IsErr(entryRes):
+                    return Err[bool](Error(entryRes))
+                entries[wantedIndex] = Value(entryRes)
+                foundFlags[wantedIndex] = true
+                matchedCount = matchedCount + 1
+            wantedIndex = wantedIndex + 1
+        i = i + 1
+    return Ok[bool](true)
+
 fn LoadFirstJournalIndexSummary(clientPath: str): Result[CascIndexSummary] =
     let listRawRes: Result[cstring] = cascIndexListDataDirRawListing(clientPath)
     if IsErr(listRawRes):
@@ -334,6 +390,63 @@ fn LoadLocalIndexEntry(clientPath: str, encodingKey: str): Result[CascIndexEntry
         i = i + 1
     free(ptr(listRaw))
     return Err[CascIndexEntry]("wowExport index: local encoding key not found " + encodingKey)
+
+fn LoadLocalIndexEntries(clientPath: str, encodingKeys: str[]): Result[CascIndexEntry[]] =
+    if encodingKeys.len <= 0:
+        return Err[CascIndexEntry[]]("wowExport index: empty encoding key list")
+    var keyPrefixes: str[]
+    var keyIndex: int32
+    while keyIndex < encodingKeys.len:
+        let prefixRes: Result[str] = EncodingKeyPrefix(encodingKeys[keyIndex])
+        if IsErr(prefixRes):
+            return Err[CascIndexEntry[]](Error(prefixRes))
+        add(keyPrefixes, Value(prefixRes))
+        keyIndex = keyIndex + 1
+    let listRawRes: Result[cstring] = cascIndexListDataDirRawListing(clientPath)
+    if IsErr(listRawRes):
+        return Err[CascIndexEntry[]](Error(listRawRes))
+    let listRaw: cstring = Value(listRawRes)
+    let listText: str = system.strFromCStringBorrow(listRaw)
+    let total: int32 = strings.Len(listText)
+    var entries: CascIndexEntry[] = cascIndexInitEntryArray(encodingKeys.len)
+    var foundFlags: bool[] = cascIndexInitBoolArray(encodingKeys.len)
+    var matchedCount: int32
+    var start: int32
+    var i: int32
+    while i <= total && matchedCount < encodingKeys.len:
+        var endHit: bool
+        if i == total:
+            endHit = true
+        elif listText[i] == '\n':
+            endHit = true
+        if endHit:
+            var endIdx: int32 = i - 1
+            if endIdx >= start && listText[endIdx] == '\r':
+                endIdx = endIdx - 1
+            if endIdx >= start:
+                let name: str = strings.SliceBytes(listText, start, endIdx - start + 1)
+                if strings.HasSuffix(name, ".idx"):
+                    let pathRawBytes: rawbytes.Bytes =
+                        cascIndexCStringBytesFrom3(clientPath, cascIndexDataDirSlashSuffix, name)
+                    let readRes: Result[bytes.ByteBuffer] =
+                        cascIndexReadFileBytesRaw(cstring(pathRawBytes.data))
+                    rawbytes.BytesFree(pathRawBytes)
+                    if IsErr(readRes):
+                        free(ptr(listRaw))
+                        return Err[CascIndexEntry[]](Error(readRes) + " name=" + name)
+                    let buf: bytes.ByteBuffer = Value(readRes)
+                    let findRes: Result[bool] =
+                        FindJournalIndexEntries(buf, keyPrefixes, foundFlags, entries, matchedCount)
+                    bytes.FreeByteBuffer(buf)
+                    if IsErr(findRes):
+                        free(ptr(listRaw))
+                        return Err[CascIndexEntry[]](Error(findRes) + " name=" + name)
+            start = i + 1
+        i = i + 1
+    free(ptr(listRaw))
+    if matchedCount != encodingKeys.len:
+        return Err[CascIndexEntry[]]("wowExport index: not all local encoding keys found")
+    return Ok[CascIndexEntry[]](entries)
 
 fn DataArchivePath(clientPath: str, archiveIndex: int32): Result[str] =
     if archiveIndex < 0 || archiveIndex > 999:

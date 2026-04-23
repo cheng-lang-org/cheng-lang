@@ -2,7 +2,9 @@ import std/bytes as bytes
 import std/result
 import std/strings as strings
 import std/strformat
+import cheng/apps/wow_export/binary as binary
 import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/blte as blte
 import cheng/apps/wow_export/casc_archive as casc_archive
 import cheng/apps/wow_export/casc_index as casc_index
 import cheng/apps/wow_export/config as config
@@ -10,84 +12,319 @@ import cheng/apps/wow_export/encoding as encoding
 import cheng/apps/wow_export/root as wow_root
 
 type
-    LocalCascContext =
-        clientPath: str
-        build: build_info.WowBuildEntry
-        cfg: config.BuildConfig
-        encodingBuf: bytes.ByteBuffer
-        rootBuf: bytes.ByteBuffer
-
     LocalFileAudit =
         fileDataID: int32
         contentKey: str
         encodingKey: str
         entry: casc_index.CascIndexEntry
 
-fn LoadLocalCascContext(clientPath: str): Result[LocalCascContext] =
+fn localRootU32LEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport local root: truncated u32le")
+    return Ok[int32](bytes.BufByteAt(buf, idx) +
+        (bytes.BufByteAt(buf, idx + 1) << 8) +
+        (bytes.BufByteAt(buf, idx + 2) << 16) +
+        (bytes.BufByteAt(buf, idx + 3) << 24))
+
+fn localRootGroupHeaderSize(header: wow_root.RootHeader): int32 =
+    return header.version == 2 ? 17 : 12
+
+fn localRootLocaleMatches(localeFlags: int32, localeMask: int32): bool =
+    if localeMask == 0:
+        return true
+    if localeFlags == 0:
+        return true
+    return (localeFlags & localeMask) != 0
+
+fn localRootParseGroupHeader(buf: bytes.ByteBuffer,
+                             bufOffset: int32,
+                             header: wow_root.RootHeader,
+                             groupOffset: int32,
+                             fileCount: var int32,
+                             localeFlags: var int32,
+                             contentFlags: var int32,
+                             fileIdsOffset: var int32,
+                             contentKeysOffset: var int32,
+                             nextGroupOffset: var int32,
+                             hasNameHashes: var bool): Result[bool] =
+    let groupHeaderSize: int32 = localRootGroupHeaderSize(header)
+    if bufOffset < 0 || bufOffset + groupHeaderSize > buf.len:
+        return Err[bool]("wowExport local root: truncated group header")
+    let fileCountRes: Result[int32] = localRootU32LEAt(buf, bufOffset)
+    if IsErr(fileCountRes):
+        return Err[bool](Error(fileCountRes))
+    fileCount = Value(fileCountRes)
+    if fileCount <= 0:
+        return Err[bool]("wowExport local root: invalid file count")
+    if header.version == 2:
+        let localeRes: Result[int32] = localRootU32LEAt(buf, bufOffset + 4)
+        let flags1Res: Result[int32] = localRootU32LEAt(buf, bufOffset + 8)
+        let flags2Res: Result[int32] = localRootU32LEAt(buf, bufOffset + 12)
+        if IsErr(localeRes): return Err[bool](Error(localeRes))
+        if IsErr(flags1Res): return Err[bool](Error(flags1Res))
+        if IsErr(flags2Res): return Err[bool](Error(flags2Res))
+        localeFlags = Value(localeRes)
+        contentFlags = Value(flags1Res) | Value(flags2Res) | (bytes.BufByteAt(buf, bufOffset + 16) << 17)
+    else:
+        let flagsRes: Result[int32] = localRootU32LEAt(buf, bufOffset + 4)
+        let localeRes: Result[int32] = localRootU32LEAt(buf, bufOffset + 8)
+        if IsErr(flagsRes): return Err[bool](Error(flagsRes))
+        if IsErr(localeRes): return Err[bool](Error(localeRes))
+        contentFlags = Value(flagsRes)
+        localeFlags = Value(localeRes)
+    fileIdsOffset = groupOffset + groupHeaderSize
+    contentKeysOffset = fileIdsOffset + fileCount * 4
+    nextGroupOffset = contentKeysOffset + fileCount * 16
+    hasNameHashes = (contentFlags & 0x10000000) == 0
+    if hasNameHashes:
+        nextGroupOffset = nextGroupOffset + fileCount * 8
+    return Ok[bool](true)
+
+fn localRootFindManyInGroupBuffer(buf: bytes.ByteBuffer,
+                                  bufferAbsoluteStart: int32,
+                                  fileCount: int32,
+                                  localeFlags: int32,
+                                  contentFlags: int32,
+                                  fileIdsOffset: int32,
+                                  contentKeysOffset: int32,
+                                  hasNameHashes: bool,
+                                  wantedFileDataIDs: int32[],
+                                  localeMask: int32,
+                                  foundFlags: var bool[],
+                                  entries: var wow_root.RootEntry[],
+                                  matchedCount: var int32): Result[bool] =
+    if fileIdsOffset < bufferAbsoluteStart ||
+        contentKeysOffset < bufferAbsoluteStart ||
+        contentKeysOffset + fileCount * 16 > bufferAbsoluteStart + buf.len:
+        return Err[bool]("wowExport local root: group buffer does not cover payload")
+    var fileDataID: int32
+    var i: int32
+    while i < fileCount:
+        let deltaOffset: int32 = fileIdsOffset - bufferAbsoluteStart + i * 4
+        let deltaRes: Result[int32] = localRootU32LEAt(buf, deltaOffset)
+        if IsErr(deltaRes):
+            return Err[bool](Error(deltaRes))
+        fileDataID = fileDataID + Value(deltaRes)
+        if localRootLocaleMatches(localeFlags, localeMask):
+            var wantedIndex: int32
+            while wantedIndex < wantedFileDataIDs.len:
+                if !foundFlags[wantedIndex] && wantedFileDataIDs[wantedIndex] == fileDataID:
+                    let keyOffset: int32 = contentKeysOffset - bufferAbsoluteStart + i * 16
+                    let contentKeyRes: Result[str] = binary.HexSlice(buf, keyOffset, 16)
+                    if IsErr(contentKeyRes):
+                        return Err[bool](Error(contentKeyRes))
+                    var entry: wow_root.RootEntry
+                    entry.fileDataID = fileDataID
+                    entry.contentKey = Value(contentKeyRes)
+                    entry.localeFlags = localeFlags
+                    entry.contentFlags = contentFlags
+                    entry.hasNameHash = hasNameHashes
+                    entries[wantedIndex] = entry
+                    foundFlags[wantedIndex] = true
+                    matchedCount = matchedCount + 1
+                wantedIndex = wantedIndex + 1
+        fileDataID = fileDataID + 1
+        i = i + 1
+    return Ok[bool](true)
+
+fn localRootInitEntryArray(count: int32): wow_root.RootEntry[] =
+    var out: wow_root.RootEntry[]
+    var i: int32
+    while i < count:
+        var entry: wow_root.RootEntry
+        add(out, entry)
+        i = i + 1
+    return out
+
+fn localRootInitBoolArray(count: int32): bool[] =
+    var out: bool[]
+    var i: int32
+    while i < count:
+        add(out, false)
+        i = i + 1
+    return out
+
+fn LocalRootFindFileDataIDs(clientPath: str,
+                            rootIndexEntry: casc_index.CascIndexEntry,
+                            wantedFileDataIDs: int32[],
+                            localeMask: int32): Result[wow_root.RootEntry[]] =
+    if wantedFileDataIDs.len <= 0:
+        return Err[wow_root.RootEntry[]]("wowExport local root: empty fileDataID list")
+    var wantedIndex: int32
+    while wantedIndex < wantedFileDataIDs.len:
+        if wantedFileDataIDs[wantedIndex] < 0:
+            return Err[wow_root.RootEntry[]]("wowExport local root: fileDataID must be non-negative")
+        wantedIndex = wantedIndex + 1
+    let blteHeaderRes: Result[blte.BlteHeader] =
+        casc_archive.CascArchiveReadLocalEntryBlteHeader(clientPath, rootIndexEntry)
+    if IsErr(blteHeaderRes):
+        return Err[wow_root.RootEntry[]](Error(blteHeaderRes))
+    let contentSize: int32 = Value(blteHeaderRes).totalDecompSize
+    let firstBlockRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFirstBlock(clientPath, rootIndexEntry)
+    if IsErr(firstBlockRes):
+        return Err[wow_root.RootEntry[]](Error(firstBlockRes))
+    var window: bytes.ByteBuffer = Value(firstBlockRes)
+    var windowStart: int32
+    let windowSize: int32 = window.len
+    if windowSize <= 0:
+        bytes.FreeByteBuffer(window)
+        return Err[wow_root.RootEntry[]]("wowExport local root: empty first decoded block")
+    let headerRes: Result[wow_root.RootHeader] = wow_root.WowRootParseHeader(window)
+    if IsErr(headerRes):
+        bytes.FreeByteBuffer(window)
+        return Err[wow_root.RootEntry[]](Error(headerRes))
+    let header: wow_root.RootHeader = Value(headerRes)
+    var entries: wow_root.RootEntry[] = localRootInitEntryArray(wantedFileDataIDs.len)
+    var foundFlags: bool[] = localRootInitBoolArray(wantedFileDataIDs.len)
+    var matchedCount: int32
+    var groupOffset: int32 = header.dataOffset
+    while groupOffset < contentSize && matchedCount < wantedFileDataIDs.len:
+        let groupHeaderSize: int32 = localRootGroupHeaderSize(header)
+        if groupOffset < windowStart || groupOffset + groupHeaderSize > windowStart + window.len:
+            bytes.FreeByteBuffer(window)
+            windowStart = (groupOffset / windowSize) * windowSize
+            var nextWindowCount: int32 = windowSize
+            if windowStart + nextWindowCount > contentSize:
+                nextWindowCount = contentSize - windowStart
+            let windowRes: Result[bytes.ByteBuffer] =
+                casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, rootIndexEntry, windowStart, nextWindowCount)
+            if IsErr(windowRes):
+                return Err[wow_root.RootEntry[]](Error(windowRes))
+            window = Value(windowRes)
+        let groupHeaderOffset: int32 = groupOffset - windowStart
+        var fileCount: int32
+        var localeFlags: int32
+        var contentFlags: int32
+        var fileIdsOffset: int32
+        var contentKeysOffset: int32
+        var nextGroupOffset: int32
+        var hasNameHashes: bool
+        let parseRes: Result[bool] =
+            localRootParseGroupHeader(window, groupHeaderOffset, header, groupOffset, fileCount, localeFlags,
+                contentFlags, fileIdsOffset, contentKeysOffset, nextGroupOffset, hasNameHashes)
+        if IsErr(parseRes):
+            bytes.FreeByteBuffer(window)
+            return Err[wow_root.RootEntry[]](Error(parseRes))
+        if nextGroupOffset <= groupOffset || nextGroupOffset > contentSize:
+            bytes.FreeByteBuffer(window)
+            return Err[wow_root.RootEntry[]]("wowExport local root: invalid group bounds")
+        if nextGroupOffset <= windowStart + window.len:
+            let findRes: Result[bool] =
+                localRootFindManyInGroupBuffer(window, windowStart, fileCount, localeFlags, contentFlags,
+                    fileIdsOffset, contentKeysOffset, hasNameHashes, wantedFileDataIDs, localeMask,
+                    foundFlags, entries, matchedCount)
+            if IsErr(findRes):
+                bytes.FreeByteBuffer(window)
+                return Err[wow_root.RootEntry[]](Error(findRes))
+        else:
+            let groupSize: int32 = nextGroupOffset - groupOffset
+            let groupRes: Result[bytes.ByteBuffer] =
+                casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, rootIndexEntry, groupOffset, groupSize)
+            if IsErr(groupRes):
+                bytes.FreeByteBuffer(window)
+                return Err[wow_root.RootEntry[]](Error(groupRes))
+            let group: bytes.ByteBuffer = Value(groupRes)
+            let findRes: Result[bool] =
+                localRootFindManyInGroupBuffer(group, groupOffset, fileCount, localeFlags, contentFlags,
+                    fileIdsOffset, contentKeysOffset, hasNameHashes, wantedFileDataIDs, localeMask,
+                    foundFlags, entries, matchedCount)
+            bytes.FreeByteBuffer(group)
+            if IsErr(findRes):
+                bytes.FreeByteBuffer(window)
+                return Err[wow_root.RootEntry[]](Error(findRes))
+        groupOffset = nextGroupOffset
+        if groupOffset >= windowStart + window.len && groupOffset < contentSize && matchedCount < wantedFileDataIDs.len:
+            bytes.FreeByteBuffer(window)
+            windowStart = (groupOffset / windowSize) * windowSize
+            var nextWindowCount: int32 = windowSize
+            if windowStart + nextWindowCount > contentSize:
+                nextWindowCount = contentSize - windowStart
+            let windowRes: Result[bytes.ByteBuffer] =
+                casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, rootIndexEntry, windowStart, nextWindowCount)
+            if IsErr(windowRes):
+                return Err[wow_root.RootEntry[]](Error(windowRes))
+            window = Value(windowRes)
+    bytes.FreeByteBuffer(window)
+    if matchedCount != wantedFileDataIDs.len:
+        return Err[wow_root.RootEntry[]]("wowExport local root: not all fileDataIDs found")
+    return Ok[wow_root.RootEntry[]](entries)
+
+fn localFilesInitAuditArray(count: int32): LocalFileAudit[] =
+    var out: LocalFileAudit[]
+    var i: int32
+    while i < count:
+        var audit: LocalFileAudit
+        add(out, audit)
+        i = i + 1
+    return out
+
+fn ResolveLocalFileAuditsRanged(clientPath: str,
+                                fileDataIDs: int32[]): Result[LocalFileAudit[]] =
+    if fileDataIDs.len <= 0:
+        return Err[LocalFileAudit[]]("wowExport local-files: empty fileDataID list")
     let buildRes: Result[build_info.WowBuildEntry] =
         build_info.LoadBuild(clientPath, build_info.DefaultProduct, build_info.DefaultVersion)
     if IsErr(buildRes):
-        return Err[LocalCascContext](Error(buildRes))
+        return Err[LocalFileAudit[]](Error(buildRes))
     if Value(buildRes).buildKey != build_info.DefaultBuildKey:
-        return Err[LocalCascContext]("wowExport local-files: build key mismatch expected=" + build_info.DefaultBuildKey + " got=" + Value(buildRes).buildKey)
+        return Err[LocalFileAudit[]]("wowExport local-files: build key mismatch expected=" + build_info.DefaultBuildKey + " got=" + Value(buildRes).buildKey)
     let cfgRes: Result[config.BuildConfig] =
         config.LoadBuildConfig(clientPath, build_info.DefaultBuildKey)
     if IsErr(cfgRes):
-        return Err[LocalCascContext](Error(cfgRes))
+        return Err[LocalFileAudit[]](Error(cfgRes))
     let cfg: config.BuildConfig = Value(cfgRes)
     let encEntryRes: Result[casc_index.CascIndexEntry] =
         casc_index.LoadLocalIndexEntry(clientPath, cfg.encodingEncodingKey)
     if IsErr(encEntryRes):
-        return Err[LocalCascContext](Error(encEntryRes))
-    let encBufRes: Result[bytes.ByteBuffer] =
-        casc_archive.CascArchiveDecodeLocalEntryFull(clientPath, Value(encEntryRes))
-    if IsErr(encBufRes):
-        return Err[LocalCascContext](Error(encBufRes))
+        return Err[LocalFileAudit[]](Error(encEntryRes))
+    let encEntry: casc_index.CascIndexEntry = Value(encEntryRes)
     let rootEncodingKeyRes: Result[str] =
-        encoding.WowEncodingFindEncodingKey(Value(encBufRes), cfg.root)
+        encoding.WowEncodingFindEncodingKeyRanged(clientPath, encEntry, cfg.root)
     if IsErr(rootEncodingKeyRes):
-        return Err[LocalCascContext](Error(rootEncodingKeyRes))
-    let rootEntryRes: Result[casc_index.CascIndexEntry] =
+        return Err[LocalFileAudit[]](Error(rootEncodingKeyRes))
+    let rootIndexEntryRes: Result[casc_index.CascIndexEntry] =
         casc_index.LoadLocalIndexEntry(clientPath, Value(rootEncodingKeyRes))
-    if IsErr(rootEntryRes):
-        return Err[LocalCascContext](Error(rootEntryRes))
-    let rootBufRes: Result[bytes.ByteBuffer] =
-        casc_archive.CascArchiveDecodeLocalEntryFull(clientPath, Value(rootEntryRes))
-    if IsErr(rootBufRes):
-        return Err[LocalCascContext](Error(rootBufRes))
-    var out: LocalCascContext
-    out.clientPath = clientPath
-    out.build = Value(buildRes)
-    out.cfg = cfg
-    out.encodingBuf = Value(encBufRes)
-    out.rootBuf = Value(rootBufRes)
-    return Ok[LocalCascContext](out)
-
-fn FreeLocalCascContext(ctx: var LocalCascContext) =
-    bytes.FreeByteBuffer(ctx.encodingBuf)
-    bytes.FreeByteBuffer(ctx.rootBuf)
-    ctx.clientPath = ""
-
-fn ResolveLocalFileAudit(ctx: LocalCascContext, fileDataID: int32): Result[LocalFileAudit] =
-    let rootEntryRes: Result[wow_root.RootEntry] =
-        wow_root.WowRootFindByFileDataID(ctx.rootBuf, fileDataID, 0)
-    if IsErr(rootEntryRes):
-        return Err[LocalFileAudit](Error(rootEntryRes))
-    let rootEntry: wow_root.RootEntry = Value(rootEntryRes)
-    let encodingKeyRes: Result[str] =
-        encoding.WowEncodingFindEncodingKey(ctx.encodingBuf, rootEntry.contentKey)
-    if IsErr(encodingKeyRes):
-        return Err[LocalFileAudit](Error(encodingKeyRes))
-    let idxEntryRes: Result[casc_index.CascIndexEntry] =
-        casc_index.LoadLocalIndexEntry(ctx.clientPath, Value(encodingKeyRes))
-    if IsErr(idxEntryRes):
-        return Err[LocalFileAudit](Error(idxEntryRes))
-    var out: LocalFileAudit
-    out.fileDataID = fileDataID
-    out.contentKey = rootEntry.contentKey
-    out.encodingKey = Value(encodingKeyRes)
-    out.entry = Value(idxEntryRes)
-    return Ok[LocalFileAudit](out)
+    if IsErr(rootIndexEntryRes):
+        return Err[LocalFileAudit[]](Error(rootIndexEntryRes))
+    let rootEntriesRes: Result[wow_root.RootEntry[]] =
+        LocalRootFindFileDataIDs(clientPath, Value(rootIndexEntryRes), fileDataIDs, 0)
+    if IsErr(rootEntriesRes):
+        return Err[LocalFileAudit[]](Error(rootEntriesRes))
+    let rootEntries: wow_root.RootEntry[] = Value(rootEntriesRes)
+    var contentKeys: str[]
+    var keyIndex: int32
+    while keyIndex < rootEntries.len:
+        add(contentKeys, rootEntries[keyIndex].contentKey)
+        keyIndex = keyIndex + 1
+    let encodingEntriesRes: Result[encoding.EncodingEntry[]] =
+        encoding.WowEncodingFindEntriesRanged(clientPath, encEntry, contentKeys)
+    if IsErr(encodingEntriesRes):
+        return Err[LocalFileAudit[]](Error(encodingEntriesRes))
+    let encodingEntries: encoding.EncodingEntry[] = Value(encodingEntriesRes)
+    var encodingKeys: str[]
+    var encodingKeyIndex: int32
+    while encodingKeyIndex < encodingEntries.len:
+        add(encodingKeys, encodingEntries[encodingKeyIndex].encodingKey)
+        encodingKeyIndex = encodingKeyIndex + 1
+    let idxEntriesRes: Result[casc_index.CascIndexEntry[]] =
+        casc_index.LoadLocalIndexEntries(clientPath, encodingKeys)
+    if IsErr(idxEntriesRes):
+        return Err[LocalFileAudit[]](Error(idxEntriesRes))
+    let idxEntries: casc_index.CascIndexEntry[] = Value(idxEntriesRes)
+    var out: LocalFileAudit[] = localFilesInitAuditArray(fileDataIDs.len)
+    var i: int32
+    while i < fileDataIDs.len:
+        let rootEntry: wow_root.RootEntry = rootEntries[i]
+        let encodingEntry: encoding.EncodingEntry = encodingEntries[i]
+        var audit: LocalFileAudit
+        audit.fileDataID = fileDataIDs[i]
+        audit.contentKey = rootEntry.contentKey
+        audit.encodingKey = encodingEntry.encodingKey
+        audit.entry = idxEntries[i]
+        out[i] = audit
+        i = i + 1
+    return Ok[LocalFileAudit[]](out)
 
 fn ReadLocalFileByEncodingKey(clientPath: str, encodingKey: str): Result[bytes.ByteBuffer] =
     let idxEntryRes: Result[casc_index.CascIndexEntry] =

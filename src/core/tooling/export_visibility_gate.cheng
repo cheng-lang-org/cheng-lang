@@ -1,0 +1,272 @@
+import std/cmdline as cmdline
+import std/os
+import std/strutils as strutil
+import cheng/core/tooling/bootstrap_contracts as contracts
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+fn ExportVisibilityGatePrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn ExportVisibilityGatePrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn ExportVisibilityGateCurrentExecutablePath(rootDir: str): str =
+    let raw = strutil.Strip(cmdline.ProgramName())
+    if len(raw) <= 0:
+        return ""
+    let resolved = hostops.ResolveProgram(rootDir, raw)
+    if len(resolved) > 0:
+        return resolved
+    return chengpath.PathAbsolute(rootDir, raw)
+
+fn ExportVisibilityGateCompilerPath(rootDir: str): str =
+    let explicitRaw = strutil.Strip(cmdline.ReadFlagOrDefault("--compiler", ""))
+    if len(explicitRaw) > 0:
+        return chengpath.PathAbsolute(rootDir, explicitRaw)
+    let smokeRaw = strutil.Strip(os.GetEnv("CHENG_SMOKE_COMPILER"))
+    if len(smokeRaw) > 0:
+        return chengpath.PathAbsolute(rootDir, smokeRaw)
+    return ExportVisibilityGateCurrentExecutablePath(rootDir)
+
+fn ExportVisibilityGateArtifactsDir(rootDir: str): str =
+    return chengpath.PathAbsolute(rootDir, "artifacts/forward/verify_export_visibility")
+
+fn ExportVisibilityGateEnsureDir(rootDir: str,
+                                  dirPath: str): bool =
+    if chengpath.MkdirP(rootDir, dirPath):
+        return true
+    ExportVisibilityGatePrintErr(" backend driver: failed to create verify-export-visibility dir: " + dirPath)
+    return false
+
+fn ExportVisibilityGateWriteManifest(rootDir: str,
+                                      packageRoot: str,
+                                      packageId: str,
+                                      modulePrefix: str): bool =
+    let manifestPath = os.JoinPath(packageRoot, "cheng-package.toml")
+    let manifestText = "package_id = \"" + packageId + "\"\nmodule_prefix = \"" + modulePrefix + "\"\n"
+    if chengpath.WriteTextFile(rootDir, manifestPath, manifestText):
+        return true
+    ExportVisibilityGatePrintErr(" backend driver: failed to write verify-export-visibility manifest: " + manifestPath)
+    return false
+
+fn ExportVisibilityGateCompileFixture(rootDir: str,
+                                       compilerPath: str,
+                                       packageRoot: str,
+                                       inputPath: str,
+                                       outPath: str,
+                                       logPath: str,
+                                       outOutput: var str): int32 =
+    let argv = [
+        "system-link-exec",
+        "--root:" + packageRoot,
+        "--in:" + inputPath,
+        "--emit:exe",
+        "--target:" + contracts.BootstrapDefaultTarget(),
+        "--out:" + outPath
+    ]
+    let run = hostops.RunFileLogged(rootDir,
+                                      "verify_export_visibility_compile",
+                                      compilerPath,
+                                      argv,
+                                      ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                      rootDir,
+                                      0,
+                                      logPath)
+    outOutput = run.output
+    return run.exitCode
+
+fn ExportVisibilityGateCheckNegative(caseLabel: str,
+                                      exitCode: int32,
+                                      output: str,
+                                      needle: str): bool =
+    if exitCode == 0:
+        ExportVisibilityGatePrintErr(" backend driver: verify-export-visibility unexpected success: " + caseLabel)
+        return false
+    if chengpath.TextContains(output, needle):
+        return true
+    ExportVisibilityGatePrintErr(" backend driver: verify-export-visibility missing diagnostic: " + caseLabel)
+    let outputText = strutil.Strip(output)
+    if len(outputText) > 0:
+        ExportVisibilityGatePrintErr(outputText)
+    return false
+
+fn ExportVisibilityGatePositiveSmoke(rootDir: str,
+                                      compilerPath: str): bool =
+    let caseDir = os.JoinPath(ExportVisibilityGateArtifactsDir(rootDir), "positive_smoke")
+    if !ExportVisibilityGateEnsureDir(rootDir, caseDir):
+        return false
+    let srcPath = chengpath.PathAbsolute(rootDir, "src/tests/export_visibility_smoke.cheng")
+    let outPath = os.JoinPath(caseDir, "export_visibility_smoke")
+    let compileLogPath = os.JoinPath(caseDir, "export_visibility_smoke.compile.log")
+    var compileOutput = ""
+    let compileCode = ExportVisibilityGateCompileFixture(rootDir,
+                                                          compilerPath,
+                                                          rootDir,
+                                                          srcPath,
+                                                          outPath,
+                                                          compileLogPath,
+                                                          compileOutput)
+    if compileCode != 0:
+        ExportVisibilityGatePrintErr(" backend driver: verify-export-visibility positive smoke compile failed")
+        let outputText = strutil.Strip(compileOutput)
+        if len(outputText) > 0:
+            ExportVisibilityGatePrintErr(outputText)
+        return false
+    let runLogPath = os.JoinPath(caseDir, "export_visibility_smoke.run.log")
+    let run = hostops.RunFileLogged(rootDir,
+                                      "verify_export_visibility_positive",
+                                      outPath,
+                                      [],
+                                      [],
+                                      rootDir,
+                                      60,
+                                      runLogPath)
+    if run.exitCode != 0:
+        ExportVisibilityGatePrintErr(" backend driver: verify-export-visibility positive smoke run failed")
+        let runText = strutil.Strip(run.output)
+        if len(runText) > 0:
+            ExportVisibilityGatePrintErr(runText)
+        return false
+    if !chengpath.TextContains(run.output, " export_visibility_smoke ok"):
+        ExportVisibilityGatePrintErr(" backend driver: verify-export-visibility positive smoke marker missing")
+        let runText = strutil.Strip(run.output)
+        if len(runText) > 0:
+            ExportVisibilityGatePrintErr(runText)
+        return false
+    ExportVisibilityGatePrintLine(" verify-export-visibility export smoke ok")
+    return true
+
+fn ExportVisibilityGatePrivateSymbolNegative(rootDir: str,
+                                              compilerPath: str): bool =
+    let caseDir = os.JoinPath(ExportVisibilityGateArtifactsDir(rootDir), "private_symbol")
+    let workspaceDir = os.JoinPath(caseDir, "workspace")
+    let helperRoot = os.JoinPath(workspaceDir, "private_helper_pkg")
+    let helperSrcDir = os.JoinPath(helperRoot, "src")
+    let consumerRoot = os.JoinPath(workspaceDir, "private_consumer_pkg")
+    let consumerSrcDir = os.JoinPath(consumerRoot, "src")
+    if !ExportVisibilityGateEnsureDir(rootDir, helperSrcDir):
+        return false
+    if !ExportVisibilityGateEnsureDir(rootDir, consumerSrcDir):
+        return false
+    if !ExportVisibilityGateWriteManifest(rootDir,
+                                           helperRoot,
+                                           "pkg://cheng/private_helper_pkg",
+                                           "private_helper_pkg"):
+        return false
+    if !ExportVisibilityGateWriteManifest(rootDir,
+                                           consumerRoot,
+                                           "pkg://cheng/private_consumer_pkg",
+                                           "private_consumer_pkg"):
+        return false
+    let helperSrcPath = os.JoinPath(helperSrcDir, "helper.cheng")
+    let consumerSrcPath = os.JoinPath(consumerSrcDir, "main.cheng")
+    let helperSrcText = "fn privateFn(): int32 =\n    return 1\n\nfn PublicFn(): int32 =\n    return 2\n"
+    let consumerSrcText = "import cheng/private_helper_pkg/helper as helper\n\nfn main(): int32 =\n    let x = helper.privateFn()\n    return x\n"
+    if !chengpath.WriteTextFile(rootDir, helperSrcPath, helperSrcText):
+        ExportVisibilityGatePrintErr(" backend driver: failed to write verify-export-visibility helper source: " + helperSrcPath)
+        return false
+    if !chengpath.WriteTextFile(rootDir, consumerSrcPath, consumerSrcText):
+        ExportVisibilityGatePrintErr(" backend driver: failed to write verify-export-visibility consumer source: " + consumerSrcPath)
+        return false
+    let outPath = os.JoinPath(caseDir, "private_symbol")
+    let logPath = os.JoinPath(caseDir, "private_symbol.compile.log")
+    var output = ""
+    let exitCode = ExportVisibilityGateCompileFixture(rootDir,
+                                                       compilerPath,
+                                                       consumerRoot,
+                                                       consumerSrcPath,
+                                                       outPath,
+                                                       logPath,
+                                                       output)
+    if !ExportVisibilityGateCheckNegative("private symbol",
+                                           exitCode,
+                                           output,
+                                           "imported private symbol 'privateFn' is not exported"):
+        return false
+    ExportVisibilityGatePrintLine(" verify-export-visibility private symbol ok")
+    return true
+
+fn ExportVisibilityGateStrformatCase(rootDir: str,
+                                      compilerPath: str,
+                                      packageRoot: str,
+                                      caseDir: str,
+                                      stem: str,
+                                      sourceText: str,
+                                      needle: str): bool =
+    let srcDir = os.JoinPath(packageRoot, "src")
+    let srcPath = os.JoinPath(srcDir, stem + ".cheng")
+    if !chengpath.WriteTextFile(rootDir, srcPath, sourceText):
+        ExportVisibilityGatePrintErr(" backend driver: failed to write verify-export-visibility source: " + srcPath)
+        return false
+    let outPath = os.JoinPath(caseDir, stem)
+    let logPath = os.JoinPath(caseDir, stem + ".compile.log")
+    var output = ""
+    let exitCode = ExportVisibilityGateCompileFixture(rootDir,
+                                                       compilerPath,
+                                                       packageRoot,
+                                                       srcPath,
+                                                       outPath,
+                                                       logPath,
+                                                       output)
+    return ExportVisibilityGateCheckNegative(stem,
+                                              exitCode,
+                                              output,
+                                              needle)
+
+fn ExportVisibilityGateStrformatNegative(rootDir: str,
+                                          compilerPath: str): bool =
+    let caseDir = os.JoinPath(ExportVisibilityGateArtifactsDir(rootDir), "strformat_private")
+    let packageRoot = os.JoinPath(caseDir, "strformat_negative_pkg")
+    let srcDir = os.JoinPath(packageRoot, "src")
+    if !ExportVisibilityGateEnsureDir(rootDir, srcDir):
+        return false
+    if !ExportVisibilityGateWriteManifest(rootDir,
+                                           packageRoot,
+                                           "pkg://cheng/strformat_negative_pkg",
+                                           "strformat_negative_pkg"):
+        return false
+    let fmtSource = "import std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.fmt(\"bad\")\n    echo(text)\n    return 0\n"
+    if !ExportVisibilityGateStrformatCase(rootDir,
+                                           compilerPath,
+                                           packageRoot,
+                                           caseDir,
+                                           "fmt_private_main",
+                                           fmtSource,
+                                           "imported private symbol 'fmt' is not exported"):
+        return false
+    let linesSource = "import std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.lines([\"a\", \"b\"])\n    echo(text)\n    return 0\n"
+    if !ExportVisibilityGateStrformatCase(rootDir,
+                                           compilerPath,
+                                           packageRoot,
+                                           caseDir,
+                                           "lines_private_main",
+                                           linesSource,
+                                           "imported private symbol 'lines' is not exported"):
+        return false
+    ExportVisibilityGatePrintLine(" verify-export-visibility strformat ok")
+    return true
+
+fn ExportVisibilityGateRun(rootDir: str): int32 =
+    let compilerPath = ExportVisibilityGateCompilerPath(rootDir)
+    if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        ExportVisibilityGatePrintErr(" backend driver: missing verify-export-visibility compiler: " + compilerPath)
+        return 2
+    if !ExportVisibilityGatePositiveSmoke(rootDir, compilerPath):
+        ExportVisibilityGatePrintErr(" backend driver: verify-export-visibility failed")
+        return 1
+    if !ExportVisibilityGatePrivateSymbolNegative(rootDir, compilerPath):
+        ExportVisibilityGatePrintErr(" backend driver: verify-export-visibility failed")
+        return 1
+    if !ExportVisibilityGateStrformatNegative(rootDir, compilerPath):
+        ExportVisibilityGatePrintErr(" backend driver: verify-export-visibility failed")
+        return 1
+    ExportVisibilityGatePrintLine(" verify-export-visibility ok")
+    return 0
+
+fn ExportVisibilityGateRunParallel(rootDir: str): int32 =
+    let code = ExportVisibilityGateRun(rootDir)
+    if code != 0:
+        return code
+    ExportVisibilityGatePrintLine(" verify-export-visibility-parallel ok")
+    return 0

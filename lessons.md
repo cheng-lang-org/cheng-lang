@@ -41,4 +41,5 @@
 - 用户明确要求“从 seed 迁到纯 Cheng 最小 seed”时，优先迁走 `std` 语义和 runtime shim；不要因为自举方便继续把 `Fmt/$` 一类库行为补进 `cheng_seed.c`。
 - `$` 的公开表面只保留直接写法：简单值支持 `$box`，复杂表达式支持 `$(expr)`；不要再把反引号 `` `$` `` 当用户语法往前推，纯 Cheng 前端负责降糖，seed 只保留兼容。
 - wowExport 处理 CDN root/BLTE/zlib 时不要先全量解码再扫表；真实 root 会放大到 49MB encoded / 65MB decoded，必须按 BLTE block range 解码、批量 root lookup，并用 bit-buffer + 小型 Huffman fast table 控制时间和内存。
-- wowExport CLI 可见的 `Fmt` 摘要函数不要直接插入自定义 helper 调用；先把 helper 结果落到本地变量再插值，否则当前 seed/materialize 链路容易触发 `primary_object_body_semantics_missing`。
+- wowExport CLI 可见的 `Fmt` 摘要函数要保持非常简单；`Result[str]` 返回路径和大闭包里优先用字符串拼接，至少先把表达式落局部变量，否则当前 seed/materialize 链路容易触发 `primary_object_body_semantics_missing`。
+- wowExport CLI 大闭包里的超长字符串拼接也会触发 seed concat rewrite 限制；摘要文本要用短局部变量和逐步 `out = out + part`，不要一条 return 拼完整行。

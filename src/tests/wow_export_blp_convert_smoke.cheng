@@ -1,0 +1,65 @@
+import std/bytes as bytes
+import std/result
+import cheng/apps/wow_export/blp as blp
+
+fn makeBuf(len: int32): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    out.len = len
+    if len > 0:
+        out.data = alloc(len)
+    var i: int32
+    while i < len:
+        bytes.BufSetByte(out, i, 0)
+        i = i + 1
+    return out
+
+fn putFourCC(buf: bytes.ByteBuffer, offset: int32, text: str) =
+    bytes.BufSetByte(buf, offset, int32(text[0]))
+    bytes.BufSetByte(buf, offset + 1, int32(text[1]))
+    bytes.BufSetByte(buf, offset + 2, int32(text[2]))
+    bytes.BufSetByte(buf, offset + 3, int32(text[3]))
+
+fn putU16LE(buf: bytes.ByteBuffer, offset: int32, value: int32) =
+    bytes.BufSetByte(buf, offset, value & 255)
+    bytes.BufSetByte(buf, offset + 1, (value >> 8) & 255)
+
+fn putU32LE(buf: bytes.ByteBuffer, offset: int32, value: int32) =
+    bytes.BufSetByte(buf, offset, value & 255)
+    bytes.BufSetByte(buf, offset + 1, (value >> 8) & 255)
+    bytes.BufSetByte(buf, offset + 2, (value >> 16) & 255)
+    bytes.BufSetByte(buf, offset + 3, (value >> 24) & 255)
+
+fn main(): int32 =
+    let mipOffset: int32 = 1172
+    let sample: bytes.ByteBuffer = makeBuf(mipOffset + 8)
+    putFourCC(sample, 0, "BLP2")
+    putU32LE(sample, 4, 1)
+    bytes.BufSetByte(sample, 8, 2)
+    bytes.BufSetByte(sample, 9, 0)
+    bytes.BufSetByte(sample, 10, 0)
+    bytes.BufSetByte(sample, 11, 1)
+    putU32LE(sample, 12, 4)
+    putU32LE(sample, 16, 4)
+    putU32LE(sample, 20, mipOffset)
+    putU32LE(sample, 84, 8)
+    putU16LE(sample, mipOffset, 0xf800)
+    putU16LE(sample, mipOffset + 2, 0x07e0)
+    putU32LE(sample, mipOffset + 4, 0)
+
+    let tgaRes: Result[bytes.ByteBuffer] = blp.Blp2DecodeFirstMipTga(sample)
+    assert(IsOk(tgaRes), Error(tgaRes))
+    let tga: bytes.ByteBuffer = Value(tgaRes)
+    assert(tga.len == 82, "wow_export_blp_convert_smoke tga len")
+    assert(bytes.BufByteAt(tga, 2) == 2, "wow_export_blp_convert_smoke tga type")
+    assert(bytes.ReadU16LEAt(tga, 12) == 4, "wow_export_blp_convert_smoke width")
+    assert(bytes.ReadU16LEAt(tga, 14) == 4, "wow_export_blp_convert_smoke height")
+    assert(bytes.BufByteAt(tga, 16) == 32, "wow_export_blp_convert_smoke depth")
+    assert(bytes.BufByteAt(tga, 17) == 0x28, "wow_export_blp_convert_smoke origin")
+    assert(bytes.BufByteAt(tga, 18) == 0, "wow_export_blp_convert_smoke first b")
+    assert(bytes.BufByteAt(tga, 19) == 0, "wow_export_blp_convert_smoke first g")
+    assert(bytes.BufByteAt(tga, 20) == 255, "wow_export_blp_convert_smoke first r")
+    assert(bytes.BufByteAt(tga, 21) == 255, "wow_export_blp_convert_smoke first a")
+    bytes.FreeByteBuffer(tga)
+    bytes.FreeByteBuffer(sample)
+    echo("wow_export_blp_convert_smoke ok")
+    return 0

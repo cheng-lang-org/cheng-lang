@@ -16,7 +16,14 @@
 - 15-bit 全量 Huffman fast table 能提速但会把 root lookup 峰值推到数百 MB；10-bit fast table 覆盖常见短码，长码严格回退慢路径，当前 root lookup 普通运行通过，运行中 RSS 采样约 `45632KB`。
 - 纯 Cheng 当前慢点不是运行时整体性能问题；北郡预览此前慢是每次走完整 root/encoding 深审计，已改成已审计 payload/index/MD5 快审计，CLI `preview-northshire --frames 1` 本机约 `2.15s`。
 - M2 顶点 offset 在 `MD21` 包装下是相对内部 `MD20` payload 起点，不是文件起点；不加 `MD20` start 会读错顶点包围盒，真实 `nsabbeyBell.m2` 修正后跨度为 `1916,5856,25208`。
-- 当前 seed/materialize 对 CLI 大闭包里 `Fmt"{CustomText(x)}"` 这类自定义 helper 插值仍不稳；把 helper 调用结果先放进局部变量后，`wow_export_tool_main` 可重新编译通过。
+- 当前 seed/materialize 对 CLI 大闭包里的复杂 `Fmt` 仍不稳；导出模块的 `Result[str]` 路径已改成字符串拼接，`wow_export_tool_main` 和 `wow_export_asset_export_smoke` 均可重新编译通过。
+- 已审计 Northshire manifest 的 `size` 是 CASC/BLTE encoded entry 大小，不是导出 payload 大小；例如 `abbey-bell-model` manifest size 为 `6898`，真实解码后 M2 输出为 `20308` 字节。
+- Northshire `abbey-bell-texture` 是 BLP2 DXT1：`encoding=2`、`alphaDepth=0`、`256x256`，首 mip 压缩块 `32768` 字节；真实转换为 32-bit TGA 后是 `262162` 字节。
+- Northshire WDT 当前解析出 `4096` 个活跃 MAIN tile；WMO root `MOHD` 解析出 `30` 个材质、`13` 个 group、`165` 个 doodad，preview 现在把这些作为 scene 非空条件。
+- 当前 root 的 Northshire 已审计 4 条 entry 都带 `NoNameHash`，不能用路径 Jenkins96/lookup3 反查它们；后续资源发现必须优先使用资产内嵌 fileDataID 引用。
+- WMO root `GFID` 直接给出 Northshire Abbey 的 13 个 group fileDataID：`107075..107087`；`MODI` 给出 17 个非零 doodad/model fileDataID，首项 `198056`。
+- M2 `nsabbeyBell.m2` 的 `SFID` 给出 skin fileDataID `494438`，`TXID` 给出 texture fileDataID `127489` 和已审计 texture `189598`。
+- WDT `Azeroth.wdt` 的 `MAID` 有 `1176` 个非零 tile、`9408` 个 referenced fileDataID，首项 `6173014`；不能一次性当 Northshire 局部地形，下一步要按坐标/区域收窄后审计。
 - `std/os.ListDir` 这次进一步改成“两遍扫描计数 + owned move 填充”，本机 1536 文件一次性快照 smoke 已通过，说明 `wow_export` 扫真实 `Data/indices` 不会再因为目录规模崩掉；但当前 256 文件 * 6000 轮 stress 的 `peak memory footprint` 仍在约 219MB，说明 runtime/allocator 对这条长时间热路径还有内存回收观察值需要继续压。
 
 - 本机 `.build.info` 有 active `wow 12.0.5.67165`，build key 为 `02482dc9c788698c83e7ae0e24ab2bb7`。

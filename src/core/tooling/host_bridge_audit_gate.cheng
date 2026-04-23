@@ -1,0 +1,445 @@
+import std/os
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/path as chengpath
+
+fn HostBridgeAuditGatePrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn HostBridgeAuditGatePrintBlock(text: str) =
+    var start: int32
+    var i: int32
+    while i <= text.len:
+        let atEnd: bool = i == text.len
+        if atEnd:
+            let line: str = strings.SliceBytes(text, start, i - start)
+            HostBridgeAuditGatePrintLine(line)
+            start = i + 1
+        elif text[i] == '\n':
+            let line: str = strings.SliceBytes(text, start, i - start)
+            HostBridgeAuditGatePrintLine(line)
+            start = i + 1
+        i = i + 1
+
+fn HostBridgeAuditGateEnvLineValue(text: str, key: str): str =
+    let prefix = key + "="
+    var start: int32
+    var i: int32
+    while i <= text.len:
+        var lineEnd = false
+        if i == text.len:
+            lineEnd = true
+        elif text[i] == '\n':
+            lineEnd = true
+        if lineEnd:
+            let line = strings.SliceBytes(text, start, i - start)
+            if line.len >= prefix.len:
+                if strings.SliceBytes(line, 0, prefix.len) == prefix:
+                    return strings.SliceBytes(line, prefix.len, line.len - prefix.len)
+            start = i + 1
+        i = i + 1
+    return ""
+
+fn HostBridgeAuditGateRuntimeAbiContractText(rootDir: str): str =
+    let relPath = "src/core/tooling/backend_runtime_abi_contract.env"
+    let absPath = chengpath.PathAbsolute(rootDir, relPath)
+    return chengpath.ReadTextFile("", absPath)
+
+fn HostBridgeAuditGateRuntimeAbiPath(rootDir: str,
+                                      contractText: str,
+                                      key: str,
+                                      fallbackRel: str): str =
+    var relPath = HostBridgeAuditGateEnvLineValue(contractText, key)
+    relPath = strutil.Strip(relPath)
+    if len(relPath) > 0:
+        return chengpath.PathAbsolute(rootDir, relPath)
+    return chengpath.PathAbsolute(rootDir, fallbackRel)
+
+fn HostBridgeAuditGateFailureText(out: str): bool =
+    if strutil.Contains(out, "legacy_exec_file_capture_raw_present=1"):
+        return true
+    if strutil.Contains(out, "legacy_exec_file_capture_bridge_present=1"):
+        return true
+    if strutil.Contains(out, "legacy_exec_file_pipe_bridge_present=1"):
+        return true
+    if strutil.Contains(out, "legacy_exec_file_pipe_import_present=1"):
+        return true
+    if strutil.Contains(out, "runtime_authority_is_pure_cheng=0"):
+        return true
+    if strutil.Contains(out, "legacy_runtime_native_path_present=1"):
+        return true
+    if strutil.Contains(out, "legacy_runtime_native_source_path_present=1"):
+        return true
+    if strutil.Contains(out, "legacy_runtime_program_obj_command_present=1"):
+        return true
+    if strutil.Contains(out, "legacy_runtime_program_obj_import_present=1"):
+        return true
+    if strutil.Contains(out, "legacy_runtime_program_combined_smoke_present=1"):
+        return true
+    if strutil.Contains(out, "legacy_runtime_combined_fallback_present=1"):
+        return true
+    if strutil.Contains(out, "legacy_browser_host_wasm_runner_present=1"):
+        return true
+    if strutil.Contains(out, "program_support_direct_libc_imports_present=1"):
+        return true
+    if strutil.Contains(out, "program_support_host_runtime_ready=0"):
+        return true
+    if strutil.Contains(out, "debug_runtime_direct_libc_imports_present=1"):
+        return true
+    if strutil.Contains(out, "debug_runtime_host_runtime_ready=0"):
+        return true
+    if strutil.Contains(out, "core_runtime_common_direct_libc_imports_present=1"):
+        return true
+    if strutil.Contains(out, "core_runtime_common_host_runtime_ready=0"):
+        return true
+    if strutil.Contains(out, "legacy_peer_id_base58_bridge_present=1"):
+        return true
+    return false
+
+fn HostBridgeAuditGateText(rootDir: str): str =
+    let stdOsPath = chengpath.PathAbsolute(rootDir, "src/std/os.cheng")
+    let hostProcessPath = chengpath.PathAbsolute(rootDir, "src/std/os_host_process.cheng")
+    let backendPath = chengpath.PathAbsolute(rootDir, "src/core/runtime/program_support_backend.cheng")
+    let hostRuntimePath = chengpath.PathAbsolute(rootDir, "src/core/runtime/program_support_host_runtime.cheng")
+    let debugRuntimePath = chengpath.PathAbsolute(rootDir, "src/core/runtime/debug_runtime_stub.cheng")
+    let coreRuntimeDarwinPath = chengpath.PathAbsolute(rootDir, "src/core/runtime/core_runtime_provider_darwin.cheng")
+    let coreRuntimeLinuxPath = chengpath.PathAbsolute(rootDir, "src/core/runtime/core_runtime_provider_linux.cheng")
+    let peerIdPath = chengpath.PathAbsolute(rootDir, "src/libp2p/core/peer_id.cheng")
+    let systemLinkExecPath = chengpath.PathAbsolute(rootDir, "src/core/backend/system_link_exec.cheng")
+    let compilerMainPath = chengpath.PathAbsolute(rootDir, "src/core/tooling/compiler_main.cheng")
+    let compilerRuntimePath = chengpath.PathAbsolute(rootDir, "src/core/tooling/compiler_runtime.cheng")
+    let gateMainPath = chengpath.PathAbsolute(rootDir, "src/core/tooling/gate_main.cheng")
+    let seedPath = chengpath.PathAbsolute(rootDir, "bootstrap/cheng_seed.c")
+    let runtimeContractText = HostBridgeAuditGateRuntimeAbiContractText(rootDir)
+    let runtimeAuthorityPath = HostBridgeAuditGateRuntimeAbiPath(
+        rootDir,
+        runtimeContractText,
+        "BACKEND_RUNTIME_ABI_AUTHORITY",
+        "src/std/system_helpers_backend.cheng"
+    )
+    let expectedRuntimeAuthorityPath = chengpath.PathAbsolute(rootDir, "src/std/system_helpers_backend.cheng")
+    let runtimeCompatHeaderPath = HostBridgeAuditGateRuntimeAbiPath(
+        rootDir,
+        runtimeContractText,
+        "BACKEND_RUNTIME_ABI_COMPAT_HEADER",
+        "src/core/runtime/cheng_runtime_abi.h"
+    )
+    let stdOsText = chengpath.ReadTextFile("", stdOsPath)
+    let hostProcessText = chengpath.ReadTextFile("", hostProcessPath)
+    let backendText = chengpath.ReadTextFile("", backendPath)
+    let hostRuntimeText = chengpath.ReadTextFile("", hostRuntimePath)
+    let debugRuntimeText = chengpath.ReadTextFile("", debugRuntimePath)
+    let coreRuntimeDarwinText = chengpath.ReadTextFile("", coreRuntimeDarwinPath)
+    let coreRuntimeLinuxText = chengpath.ReadTextFile("", coreRuntimeLinuxPath)
+    let peerIdText = chengpath.ReadTextFile("", peerIdPath)
+    let systemLinkExecText = chengpath.ReadTextFile("", systemLinkExecPath)
+    let compilerMainText = chengpath.ReadTextFile("", compilerMainPath)
+    let compilerRuntimeText = chengpath.ReadTextFile("", compilerRuntimePath)
+    let gateMainText = chengpath.ReadTextFile("", gateMainPath)
+    let seedText = chengpath.ReadTextFile("", seedPath)
+    let legacyExecFileCaptureBridge = strutil.Contains(hostProcessText, "@importc(\"cheng_exec_file_capture_bridge\")") ||
+                                      strutil.Contains(backendText, "@exportc(\"cheng_exec_file_capture_bridge\")")
+    let legacyExecFilePipeBridge = strutil.Contains(hostProcessText, "cheng_exec_file_pipe_spawn_bridge")
+    let legacyExecFilePipeImport = strutil.Contains(backendText, "@importc(\"cheng_exec_file_pipe_spawn\")")
+    let legacyExecCmdFileRaw = strutil.Contains(stdOsText, "cheng_exec_file_capture_raw")
+    let directProgramRuntimeC = strutil.Contains(backendText, "system_helpers_program_runtime_bridge.c")
+    let legacyRuntimeNativePathPresent = strutil.Contains(runtimeContractText, "runtime/native/") ||
+                                         strutil.Contains(systemLinkExecText, "runtime/native/")
+    let buildRuntimeObjCmd = "build-program" + "-runtime-obj"
+    let verifyRuntimeObjCmd = "verify-program" + "-runtime-obj"
+    let runtimeObjImportNeedle = "runtime_program_obj as " + "runtimeobj"
+    let runtimeCombinedSmoke = "runtime_program_" + "combined_smoke"
+    let runtimeCombinedNegativeSmoke = "runtime_program_" + "combined_negative_smoke"
+    let runtimeNativeSourceNeedle = "src/runtime/" + "native/"
+    let browserHostWasmRunnerPathRel = "tools/browser_host_" + "wasm_runner.js"
+    let browserHostWasmRunnerPath = chengpath.PathAbsolute(rootDir, browserHostWasmRunnerPathRel)
+    let browserHostWasmRunnerPathNeedle = "tooling/browser_host_" + "wasm_runner.js"
+    let legacyRuntimeProgramObjCommandPresent = strutil.Contains(compilerRuntimeText, buildRuntimeObjCmd) ||
+                                                strutil.Contains(compilerRuntimeText, verifyRuntimeObjCmd) ||
+                                                strutil.Contains(compilerMainText, buildRuntimeObjCmd) ||
+                                                strutil.Contains(compilerMainText, verifyRuntimeObjCmd)
+    let legacyRuntimeProgramObjImportPresent = strutil.Contains(compilerMainText, runtimeObjImportNeedle)
+    let legacyRuntimeProgramCombinedSmokePresent = strutil.Contains(gateMainText, runtimeCombinedSmoke) ||
+                                                   strutil.Contains(gateMainText, runtimeCombinedNegativeSmoke) ||
+                                                   strutil.Contains(seedText, runtimeCombinedSmoke) ||
+                                                   strutil.Contains(seedText, runtimeCombinedNegativeSmoke)
+    let legacyRuntimeNativeSourcePathPresent = strutil.Contains(compilerMainText, runtimeNativeSourceNeedle) ||
+                                               strutil.Contains(compilerRuntimeText, runtimeNativeSourceNeedle) ||
+                                               strutil.Contains(gateMainText, runtimeNativeSourceNeedle) ||
+                                               strutil.Contains(seedText, runtimeNativeSourceNeedle)
+    let legacyRuntimeCombinedFallbackPresent = false
+    let legacyBrowserHostWasmRunnerPresent = chengpath.PathFileExists(browserHostWasmRunnerPath) ||
+                                             strutil.Contains(compilerMainText, browserHostWasmRunnerPathNeedle) ||
+                                             strutil.Contains(compilerRuntimeText, browserHostWasmRunnerPathNeedle) ||
+                                             strutil.Contains(gateMainText, browserHostWasmRunnerPathNeedle) ||
+                                             strutil.Contains(seedText, browserHostWasmRunnerPathNeedle)
+    let pureChengRuntimeAuthority = runtimeAuthorityPath == expectedRuntimeAuthorityPath
+    let programSupportDirectLibcImportsPresent = strutil.Contains(backendText, "@importc(\"malloc\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"fopen\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"getcwd\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"getentropy\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"pipe\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"fork\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"socket\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"poll\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"recvfrom\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"clock_gettime\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"strerror\")")
+    let programSupportHostRuntimeReady = strutil.Contains(backendText, "@importc(\"cheng_host_malloc\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_fopen\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_getcwd\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_pipe_runtime\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_socket\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_clock_gettime\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_strerror\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_program_support_host_trace\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_malloc\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_getenv\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_fopen\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_fgets\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_sysconf\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_statfs\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_getcwd\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_pipe_runtime\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_socket\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_clock_gettime\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_strerror\")")
+    let debugRuntimeDirectLibcImportsPresent = strutil.Contains(debugRuntimeText, "@importc(\"puts\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"exit\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"getenv\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"fopen\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"fclose\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"fflush\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"fgets\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"fwrite\")")
+    let debugRuntimeHostRuntimeReady = strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_puts_runtime\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_exit_runtime\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_getenv\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_fopen\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_fclose\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_fflush\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_fgets\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_fwrite\")")
+    let coreRuntimeCommonDirectLibcImportsPresent = strutil.Contains(coreRuntimeDarwinText, "@importc(\"malloc\")") ||
+                                                    strutil.Contains(coreRuntimeDarwinText, "@importc(\"free\")") ||
+                                                    strutil.Contains(coreRuntimeDarwinText, "@importc(\"sysconf\")") ||
+                                                    strutil.Contains(coreRuntimeDarwinText, "@importc(\"statfs\")") ||
+                                                    strutil.Contains(coreRuntimeLinuxText, "@importc(\"malloc\")") ||
+                                                    strutil.Contains(coreRuntimeLinuxText, "@importc(\"statfs\")")
+    let coreRuntimeDarwinAllocatorReady = (strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_host_malloc\")") &&
+                                           strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_host_free\")")) ||
+                                          (strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_malloc\")") &&
+                                           strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_free\")"))
+    let coreRuntimeLinuxAllocatorReady = strutil.Contains(coreRuntimeLinuxText, "@importc(\"cheng_host_malloc\")") ||
+                                         strutil.Contains(coreRuntimeLinuxText, "@importc(\"cheng_malloc\")")
+    let coreRuntimeCommonHostRuntimeReady = coreRuntimeDarwinAllocatorReady &&
+                                            strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_host_sysconf\")") &&
+                                            strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_host_statfs\")") &&
+                                            coreRuntimeLinuxAllocatorReady &&
+                                            strutil.Contains(coreRuntimeLinuxText, "@importc(\"cheng_host_statfs\")")
+    let legacyPeerIdBase58Bridge = strutil.Contains(peerIdText, "cheng_base58btc_encode_bridge") ||
+                                   strutil.Contains(peerIdText, "cheng_base58btc_decode_bridge") ||
+                                   strutil.Contains(backendText, "@exportc(\"cheng_base58btc_encode_bridge\")") ||
+                                   strutil.Contains(backendText, "@exportc(\"cheng_base58btc_decode_bridge\")") ||
+                                   strutil.Contains(backendText, "fn cheng_base58btc_value(") ||
+                                   strutil.Contains(backendText, "fn cheng_base58btc_encode_raw(") ||
+                                   strutil.Contains(backendText, "fn cheng_base58btc_decode_raw(")
+    let pureFsReady = strutil.Contains(backendText, "@exportc(\"cheng_getcwd\")") &&
+                      strutil.Contains(backendText, "@exportc(\"cheng_file_exists\")") &&
+                      strutil.Contains(backendText, "@exportc(\"cheng_dir_exists\")") &&
+                      strutil.Contains(backendText, "@exportc(\"cheng_mkdir1\")") &&
+                      strutil.Contains(backendText, "@exportc(\"cheng_file_size\")") &&
+                      strutil.Contains(backendText, "@exportc(\"cheng_file_mtime\")")
+    let pureSocketReady = strutil.Contains(backendText, "@exportc(\"libc_socket\")") &&
+                          strutil.Contains(backendText, "@exportc(\"libc_bind\")") &&
+                          strutil.Contains(backendText, "@exportc(\"libc_getsockname\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_recvfrom_fd_ex\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_udp_recvfrom_addr_bridge\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_udp_bind_fd_bridge\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_udp_bound_port_bridge\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_udp_platform_use_len_field_bridge\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_udp_platform_msg_dontwait_bridge\")")
+    let pureEntropyReady = strutil.Contains(backendText, "@exportc(\"cheng_system_entropy_fill\")")
+    let legacyProcessImportsRaw = strutil.Contains(hostProcessText, "@importc(\"cheng_pipe_spawn\")") ||
+                                  strutil.Contains(backendText, "@importc(\"cheng_pipe_spawn\")") ||
+                                  strutil.Contains(hostProcessText, "@importc(\"cheng_pty_spawn\")") ||
+                                  strutil.Contains(hostProcessText, "@importc(\"cheng_pty_read\")") ||
+                                  strutil.Contains(hostProcessText, "@importc(\"cheng_fd_read\")") ||
+                                  strutil.Contains(hostProcessText, "@importc(\"cheng_fd_read_wait\")") ||
+                                  strutil.Contains(hostProcessText, "@importc(\"cheng_pty_wait\")")
+    let processBridgeImportsReady = strutil.Contains(hostProcessText, "@importc(\"cheng_pty_is_supported_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pipe_spawn_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pty_spawn_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pty_read_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_fd_read_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_fd_read_wait_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pty_write_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pty_close_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pty_wait_bridge\")")
+    let processBridgeExportsReady = strutil.Contains(backendText, "@exportc(\"cheng_pty_is_supported_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_spawn_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_spawn_bridge_last_master_fd\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_spawn_bridge_last_pid\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pipe_spawn_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pipe_spawn_bridge_last_read_fd\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pipe_spawn_bridge_last_write_fd\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pipe_spawn_bridge_last_pid\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_read_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_read_bridge_last_eof\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_fd_read_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_fd_read_bridge_last_eof\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_fd_read_wait_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_fd_read_wait_bridge_last_eof\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_write_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_close_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_wait_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_wait_bridge_last_exit_code\")")
+    let pureProcessReady = !legacyProcessImportsRaw && processBridgeImportsReady && processBridgeExportsReady
+    var remainingBoundary = ""
+    if programSupportDirectLibcImportsPresent || !programSupportHostRuntimeReady:
+        remainingBoundary = "program_support_host_abi"
+    if !pureProcessReady:
+        remainingBoundary = "process"
+        if programSupportDirectLibcImportsPresent || !programSupportHostRuntimeReady:
+            remainingBoundary = remainingBoundary + "_program_support_host_abi"
+    if !pureFsReady:
+        if len(remainingBoundary) > 0:
+            remainingBoundary = remainingBoundary + "_"
+        remainingBoundary = remainingBoundary + "fs"
+    if !pureSocketReady:
+        if len(remainingBoundary) > 0:
+            remainingBoundary = remainingBoundary + "_"
+        remainingBoundary = remainingBoundary + "socket"
+    if !pureEntropyReady:
+        if len(remainingBoundary) > 0:
+            remainingBoundary = remainingBoundary + "_"
+        remainingBoundary = remainingBoundary + "entropy"
+    if legacyBrowserHostWasmRunnerPresent:
+        if len(remainingBoundary) > 0:
+            remainingBoundary = remainingBoundary + "_"
+        remainingBoundary = remainingBoundary + "browser_host_wasm_runner"
+    if len(remainingBoundary) == 0:
+        remainingBoundary = "none"
+    var out = ""
+    out = out + "cheng_host_bridge_audit_v1\n"
+    out = out + "std_os_path=" + stdOsPath + "\n"
+    out = out + "host_process_path=" + hostProcessPath + "\n"
+    out = out + "peer_id_path=" + peerIdPath + "\n"
+    out = out + "program_support_backend_path=" + backendPath + "\n"
+    out = out + "program_support_host_runtime_path=" + hostRuntimePath + "\n"
+    out = out + "debug_runtime_path=" + debugRuntimePath + "\n"
+    out = out + "core_runtime_darwin_path=" + coreRuntimeDarwinPath + "\n"
+    out = out + "core_runtime_linux_path=" + coreRuntimeLinuxPath + "\n"
+    out = out + "runtime_authority_path=" + runtimeAuthorityPath + "\n"
+    out = out + "runtime_compat_header_path=" + runtimeCompatHeaderPath + "\n"
+    if pureChengRuntimeAuthority:
+        out = out + "runtime_authority_is_pure_cheng=1\n"
+    else:
+        out = out + "runtime_authority_is_pure_cheng=0\n"
+    if legacyExecCmdFileRaw:
+        out = out + "legacy_exec_file_capture_raw_present=1\n"
+    else:
+        out = out + "legacy_exec_file_capture_raw_present=0\n"
+    if legacyExecFileCaptureBridge:
+        out = out + "legacy_exec_file_capture_bridge_present=1\n"
+    else:
+        out = out + "legacy_exec_file_capture_bridge_present=0\n"
+    if legacyExecFilePipeBridge:
+        out = out + "legacy_exec_file_pipe_bridge_present=1\n"
+    else:
+        out = out + "legacy_exec_file_pipe_bridge_present=0\n"
+    if legacyExecFilePipeImport:
+        out = out + "legacy_exec_file_pipe_import_present=1\n"
+    else:
+        out = out + "legacy_exec_file_pipe_import_present=0\n"
+    if directProgramRuntimeC:
+        out = out + "direct_program_runtime_c_path_present=1\n"
+    else:
+        out = out + "direct_program_runtime_c_path_present=0\n"
+    if legacyRuntimeNativePathPresent:
+        out = out + "legacy_runtime_native_path_present=1\n"
+    else:
+        out = out + "legacy_runtime_native_path_present=0\n"
+    if legacyRuntimeProgramObjCommandPresent:
+        out = out + "legacy_runtime_program_obj_command_present=1\n"
+    else:
+        out = out + "legacy_runtime_program_obj_command_present=0\n"
+    if legacyRuntimeProgramObjImportPresent:
+        out = out + "legacy_runtime_program_obj_import_present=1\n"
+    else:
+        out = out + "legacy_runtime_program_obj_import_present=0\n"
+    if legacyRuntimeProgramCombinedSmokePresent:
+        out = out + "legacy_runtime_program_combined_smoke_present=1\n"
+    else:
+        out = out + "legacy_runtime_program_combined_smoke_present=0\n"
+    if legacyRuntimeNativeSourcePathPresent:
+        out = out + "legacy_runtime_native_source_path_present=1\n"
+    else:
+        out = out + "legacy_runtime_native_source_path_present=0\n"
+    if legacyRuntimeCombinedFallbackPresent:
+        out = out + "legacy_runtime_combined_fallback_present=1\n"
+    else:
+        out = out + "legacy_runtime_combined_fallback_present=0\n"
+    if legacyBrowserHostWasmRunnerPresent:
+        out = out + "legacy_browser_host_wasm_runner_present=1\n"
+    else:
+        out = out + "legacy_browser_host_wasm_runner_present=0\n"
+    if programSupportDirectLibcImportsPresent:
+        out = out + "program_support_direct_libc_imports_present=1\n"
+    else:
+        out = out + "program_support_direct_libc_imports_present=0\n"
+    if programSupportHostRuntimeReady:
+        out = out + "program_support_host_runtime_ready=1\n"
+    else:
+        out = out + "program_support_host_runtime_ready=0\n"
+    if debugRuntimeDirectLibcImportsPresent:
+        out = out + "debug_runtime_direct_libc_imports_present=1\n"
+    else:
+        out = out + "debug_runtime_direct_libc_imports_present=0\n"
+    if debugRuntimeHostRuntimeReady:
+        out = out + "debug_runtime_host_runtime_ready=1\n"
+    else:
+        out = out + "debug_runtime_host_runtime_ready=0\n"
+    if coreRuntimeCommonDirectLibcImportsPresent:
+        out = out + "core_runtime_common_direct_libc_imports_present=1\n"
+    else:
+        out = out + "core_runtime_common_direct_libc_imports_present=0\n"
+    if coreRuntimeCommonHostRuntimeReady:
+        out = out + "core_runtime_common_host_runtime_ready=1\n"
+    else:
+        out = out + "core_runtime_common_host_runtime_ready=0\n"
+    if legacyPeerIdBase58Bridge:
+        out = out + "legacy_peer_id_base58_bridge_present=1\n"
+        out = out + "libp2p_peer_id_pure_cheng_ready=0\n"
+    else:
+        out = out + "legacy_peer_id_base58_bridge_present=0\n"
+        out = out + "libp2p_peer_id_pure_cheng_ready=1\n"
+    if pureFsReady:
+        out = out + "pure_cheng_fs_ready=1\n"
+    else:
+        out = out + "pure_cheng_fs_ready=0\n"
+    if pureSocketReady:
+        out = out + "pure_cheng_socket_ready=1\n"
+    else:
+        out = out + "pure_cheng_socket_ready=0\n"
+    if pureEntropyReady:
+        out = out + "pure_cheng_entropy_ready=1\n"
+    else:
+        out = out + "pure_cheng_entropy_ready=0\n"
+    if pureProcessReady:
+        out = out + "pure_cheng_process_ready=1\n"
+    else:
+        out = out + "pure_cheng_process_ready=0\n"
+    out = out + "remaining_non_pure_cheng_boundary=" + remainingBoundary + "\n"
+    if remainingBoundary == "none":
+        out = out + "pure_cheng_zero_c_ready=1\n"
+    else:
+        out = out + "pure_cheng_zero_c_ready=0\n"
+    return strutil.Strip(out)
+
+fn HostBridgeAuditGateRun(rootDir: str): int32 =
+    let out = HostBridgeAuditGateText(rootDir)
+    HostBridgeAuditGatePrintBlock(out)
+    if HostBridgeAuditGateFailureText(out):
+        return 2
+    return 0

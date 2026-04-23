@@ -57,6 +57,17 @@ fn encodingU32BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
     return Ok[int32]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
 
 fn WowEncodingParseHeader(buf: bytes.ByteBuffer): Result[EncodingHeader] =
+    let headerRes: Result[EncodingHeader] = WowEncodingParseHeaderPrefix(buf)
+    if IsErr(headerRes):
+        return Err[EncodingHeader](Error(headerRes))
+    let out: EncodingHeader = Value(headerRes)
+    let minNeed: int32 = encodingHeaderSize + out.specBlockSize +
+        out.contentPageCount * encodingPageHeaderSize
+    if minNeed > buf.len:
+        return Err[EncodingHeader]("wowExport encoding: truncated page table")
+    return Ok[EncodingHeader](out)
+
+fn WowEncodingParseHeaderPrefix(buf: bytes.ByteBuffer): Result[EncodingHeader] =
     if buf.len < encodingHeaderSize:
         return Err[EncodingHeader]("wowExport encoding: header too small")
     if bytes.BufByteAt(buf, 0) != int32('E') || bytes.BufByteAt(buf, 1) != int32('N'):
@@ -90,10 +101,6 @@ fn WowEncodingParseHeader(buf: bytes.ByteBuffer): Result[EncodingHeader] =
         return Err[EncodingHeader]("wowExport encoding: invalid page size")
     if out.specBlockSize < 0:
         return Err[EncodingHeader]("wowExport encoding: invalid spec block size")
-    let minNeed: int32 = encodingHeaderSize + out.specBlockSize +
-        out.contentPageCount * encodingPageHeaderSize
-    if minNeed > buf.len:
-        return Err[EncodingHeader]("wowExport encoding: truncated page table")
     return Ok[EncodingHeader](out)
 
 fn encodingContentPageHeadersOffset(header: EncodingHeader): int32 =
@@ -190,6 +197,238 @@ fn WowEncodingFindEntry(buf: bytes.ByteBuffer, contentKey: str): Result[Encoding
             pos = pos + sizeNeed
         pageIndex = pageIndex + 1
     return Err[EncodingEntry]("wowExport encoding: content key not found " + contentKey)
+
+fn encodingCompareSliceHex(buf: bytes.ByteBuffer, start: int32, hexText: str): Result[int32] =
+    let byteCount: int32 = strings.Len(hexText) / 2
+    if strings.Len(hexText) % 2 != 0 || byteCount <= 0:
+        return Err[int32]("wowExport encoding: invalid hex key")
+    if start < 0 || start + byteCount > buf.len:
+        return Err[int32]("wowExport encoding: compare slice out of bounds")
+    var i: int32
+    while i < byteCount:
+        let lhs: int32 = bytes.BufByteAt(buf, start + i)
+        let rhs: int32 = binary.HexTextByteAt(hexText, i)
+        if rhs < 0:
+            return Err[int32]("wowExport encoding: invalid hex key")
+        if lhs < rhs:
+            return Ok[int32](-1)
+        if lhs > rhs:
+            return Ok[int32](1)
+        i = i + 1
+    return Ok[int32](0)
+
+fn encodingFindCandidateContentPage(tableBuf: bytes.ByteBuffer,
+                                    header: EncodingHeader,
+                                    contentKey: str): Result[int32] =
+    var bestPage: int32
+    var pageIndex: int32
+    while pageIndex < header.contentPageCount:
+        let pageHeaderPos: int32 = encodingContentPageHeadersOffset(header) + pageIndex * encodingPageHeaderSize
+        let cmpRes: Result[int32] = encodingCompareSliceHex(tableBuf, pageHeaderPos, contentKey)
+        if IsErr(cmpRes):
+            return Err[int32](Error(cmpRes))
+        if Value(cmpRes) <= 0:
+            bestPage = pageIndex
+        else:
+            break
+        pageIndex = pageIndex + 1
+    return Ok[int32](bestPage)
+
+fn encodingFindEntryInPage(pageBuf: bytes.ByteBuffer,
+                           contentKey: str): Result[EncodingEntry] =
+    var pos: int32
+    while pos + 2 <= pageBuf.len:
+        let keyCountRes: Result[int32] = encodingU16LEAt(pageBuf, pos)
+        if IsErr(keyCountRes):
+            return Err[EncodingEntry](Error(keyCountRes))
+        let keyCount: int32 = Value(keyCountRes)
+        if keyCount == 0:
+            break
+        let sizeNeed: int32 = encodingEntrySize(keyCount)
+        if pos + sizeNeed > pageBuf.len:
+            return Err[EncodingEntry]("wowExport encoding: truncated ranged content page entry")
+        if binary.ByteSliceMatchesHex(pageBuf, pos + 6, contentKey):
+            return encodingParseEntryAt(pageBuf, pos, pageBuf.len)
+        pos = pos + sizeNeed
+    return Err[EncodingEntry]("wowExport encoding: content key not found in ranged page " + contentKey)
+ 
+fn WowEncodingFindEntryRanged(clientPath: str,
+                              encodingIndexEntry: casc_index.CascIndexEntry,
+                              contentKey: str): Result[EncodingEntry] =
+    if strings.Len(contentKey) != 32:
+        return Err[EncodingEntry]("wowExport encoding: content key must be 16-byte hex")
+    let headerBytesRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, encodingIndexEntry, 0, encodingHeaderSize)
+    if IsErr(headerBytesRes):
+        return Err[EncodingEntry](Error(headerBytesRes))
+    let headerBytes: bytes.ByteBuffer = Value(headerBytesRes)
+    let headerRes: Result[EncodingHeader] = WowEncodingParseHeaderPrefix(headerBytes)
+    bytes.FreeByteBuffer(headerBytes)
+    if IsErr(headerRes):
+        return Err[EncodingEntry](Error(headerRes))
+    let header: EncodingHeader = Value(headerRes)
+    let tableEnd: int32 = encodingContentPagesOffset(header)
+    let tableBufRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, encodingIndexEntry, 0, tableEnd)
+    if IsErr(tableBufRes):
+        return Err[EncodingEntry](Error(tableBufRes))
+    let tableBuf: bytes.ByteBuffer = Value(tableBufRes)
+    let tableHeaderRes: Result[EncodingHeader] = WowEncodingParseHeader(tableBuf)
+    if IsErr(tableHeaderRes):
+        bytes.FreeByteBuffer(tableBuf)
+        return Err[EncodingEntry](Error(tableHeaderRes))
+    let pageIndexRes: Result[int32] = encodingFindCandidateContentPage(tableBuf, header, contentKey)
+    bytes.FreeByteBuffer(tableBuf)
+    if IsErr(pageIndexRes):
+        return Err[EncodingEntry](Error(pageIndexRes))
+    let pageSize: int32 = encodingContentPageSizeBytes(header)
+    let pageStart: int32 = encodingContentPagesOffset(header) + Value(pageIndexRes) * pageSize
+    let pageBufRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, encodingIndexEntry, pageStart, pageSize)
+    if IsErr(pageBufRes):
+        return Err[EncodingEntry](Error(pageBufRes))
+    let pageBuf: bytes.ByteBuffer = Value(pageBufRes)
+    let foundRes: Result[EncodingEntry] = encodingFindEntryInPage(pageBuf, contentKey)
+    bytes.FreeByteBuffer(pageBuf)
+    return foundRes
+
+fn encodingInitEntryArray(count: int32): EncodingEntry[] =
+    var out: EncodingEntry[]
+    var i: int32
+    while i < count:
+        var entry: EncodingEntry
+        add(out, entry)
+        i = i + 1
+    return out
+
+fn encodingInitBoolArray(count: int32): bool[] =
+    var out: bool[]
+    var i: int32
+    while i < count:
+        add(out, false)
+        i = i + 1
+    return out
+
+fn encodingInitIntArray(count: int32, value: int32): int32[] =
+    var out: int32[]
+    var i: int32
+    while i < count:
+        add(out, value)
+        i = i + 1
+    return out
+
+fn encodingFindManyEntriesInPage(pageBuf: bytes.ByteBuffer,
+                                 contentKeys: str[],
+                                 pageForKey: int32[],
+                                 pageIndex: int32,
+                                 foundFlags: var bool[],
+                                 entries: var EncodingEntry[],
+                                 matchedCount: var int32): Result[bool] =
+    var pos: int32
+    while pos + 2 <= pageBuf.len:
+        let keyCountRes: Result[int32] = encodingU16LEAt(pageBuf, pos)
+        if IsErr(keyCountRes):
+            return Err[bool](Error(keyCountRes))
+        let keyCount: int32 = Value(keyCountRes)
+        if keyCount == 0:
+            break
+        let sizeNeed: int32 = encodingEntrySize(keyCount)
+        if pos + sizeNeed > pageBuf.len:
+            return Err[bool]("wowExport encoding: truncated ranged content page entry")
+        var wantedIndex: int32
+        while wantedIndex < contentKeys.len:
+            if !foundFlags[wantedIndex] && pageForKey[wantedIndex] == pageIndex:
+                if binary.ByteSliceMatchesHex(pageBuf, pos + 6, contentKeys[wantedIndex]):
+                    let entryRes: Result[EncodingEntry] = encodingParseEntryAt(pageBuf, pos, pageBuf.len)
+                    if IsErr(entryRes):
+                        return Err[bool](Error(entryRes))
+                    entries[wantedIndex] = Value(entryRes)
+                    foundFlags[wantedIndex] = true
+                    matchedCount = matchedCount + 1
+            wantedIndex = wantedIndex + 1
+        pos = pos + sizeNeed
+    return Ok[bool](true)
+
+fn WowEncodingFindEntriesRanged(clientPath: str,
+                                encodingIndexEntry: casc_index.CascIndexEntry,
+                                contentKeys: str[]): Result[EncodingEntry[]] =
+    if contentKeys.len <= 0:
+        return Err[EncodingEntry[]]("wowExport encoding: empty content key list")
+    var keyIndex: int32
+    while keyIndex < contentKeys.len:
+        if strings.Len(contentKeys[keyIndex]) != 32:
+            return Err[EncodingEntry[]]("wowExport encoding: content key must be 16-byte hex")
+        keyIndex = keyIndex + 1
+    let headerBytesRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, encodingIndexEntry, 0, encodingHeaderSize)
+    if IsErr(headerBytesRes):
+        return Err[EncodingEntry[]](Error(headerBytesRes))
+    let headerBytes: bytes.ByteBuffer = Value(headerBytesRes)
+    let headerRes: Result[EncodingHeader] = WowEncodingParseHeaderPrefix(headerBytes)
+    bytes.FreeByteBuffer(headerBytes)
+    if IsErr(headerRes):
+        return Err[EncodingEntry[]](Error(headerRes))
+    let header: EncodingHeader = Value(headerRes)
+    let tableEnd: int32 = encodingContentPagesOffset(header)
+    let tableBufRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, encodingIndexEntry, 0, tableEnd)
+    if IsErr(tableBufRes):
+        return Err[EncodingEntry[]](Error(tableBufRes))
+    let tableBuf: bytes.ByteBuffer = Value(tableBufRes)
+    let tableHeaderRes: Result[EncodingHeader] = WowEncodingParseHeader(tableBuf)
+    if IsErr(tableHeaderRes):
+        bytes.FreeByteBuffer(tableBuf)
+        return Err[EncodingEntry[]](Error(tableHeaderRes))
+    var pageForKey: int32[] = encodingInitIntArray(contentKeys.len, -1)
+    keyIndex = 0
+    while keyIndex < contentKeys.len:
+        let pageIndexRes: Result[int32] =
+            encodingFindCandidateContentPage(tableBuf, header, contentKeys[keyIndex])
+        if IsErr(pageIndexRes):
+            bytes.FreeByteBuffer(tableBuf)
+            return Err[EncodingEntry[]](Error(pageIndexRes))
+        pageForKey[keyIndex] = Value(pageIndexRes)
+        keyIndex = keyIndex + 1
+    bytes.FreeByteBuffer(tableBuf)
+    var entries: EncodingEntry[] = encodingInitEntryArray(contentKeys.len)
+    var foundFlags: bool[] = encodingInitBoolArray(contentKeys.len)
+    var matchedCount: int32
+    let pageSize: int32 = encodingContentPageSizeBytes(header)
+    var pageIndex: int32
+    while pageIndex < header.contentPageCount && matchedCount < contentKeys.len:
+        var needPage: bool
+        keyIndex = 0
+        while keyIndex < contentKeys.len:
+            if !foundFlags[keyIndex] && pageForKey[keyIndex] == pageIndex:
+                needPage = true
+                break
+            keyIndex = keyIndex + 1
+        if needPage:
+            let pageStart: int32 = encodingContentPagesOffset(header) + pageIndex * pageSize
+            let pageBufRes: Result[bytes.ByteBuffer] =
+                casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, encodingIndexEntry, pageStart, pageSize)
+            if IsErr(pageBufRes):
+                return Err[EncodingEntry[]](Error(pageBufRes))
+            let pageBuf: bytes.ByteBuffer = Value(pageBufRes)
+            let findRes: Result[bool] =
+                encodingFindManyEntriesInPage(pageBuf, contentKeys, pageForKey, pageIndex,
+                    foundFlags, entries, matchedCount)
+            bytes.FreeByteBuffer(pageBuf)
+            if IsErr(findRes):
+                return Err[EncodingEntry[]](Error(findRes))
+        pageIndex = pageIndex + 1
+    if matchedCount != contentKeys.len:
+        return Err[EncodingEntry[]]("wowExport encoding: not all ranged content keys found")
+    return Ok[EncodingEntry[]](entries)
+
+fn WowEncodingFindEncodingKeyRanged(clientPath: str,
+                                    encodingIndexEntry: casc_index.CascIndexEntry,
+                                    contentKey: str): Result[str] =
+    let entryRes: Result[EncodingEntry] =
+        WowEncodingFindEntryRanged(clientPath, encodingIndexEntry, contentKey)
+    if IsErr(entryRes):
+        return Err[str](Error(entryRes))
+    return Ok[str](Value(entryRes).encodingKey)
 
 fn WowEncodingFindEncodingKey(buf: bytes.ByteBuffer, contentKey: str): Result[str] =
     let entryRes: Result[EncodingEntry] = WowEncodingFindEntry(buf, contentKey)

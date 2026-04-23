@@ -147,7 +147,6 @@ static bool cheng_seed_expand_strformat_fmt_expr(const char *expr_text,
                                          size_t error_cap);
 static char *cheng_seed_debug_object_report(const char *path);
 static bool cheng_seed_backend_driver_handoff_enabled(void);
-static int cheng_seed_cmd_verify_export_visibility_impl(int argc, char **argv);
 static int cheng_seed_cmd_verify_backend_driver_command_surface_impl(int argc, char **argv);
 static int cheng_seed_cmd_verify_mobile_shell_build_probe_impl(int argc, char **argv);
 static int cheng_seed_cmd_verify_r2c_react_surface_impl(int argc, char **argv);
@@ -211,6 +210,8 @@ static const char *ChengSeed_REMOVED_KEYS_V2[] = {
     "runtime_debug_runtime_source",
     "tooling_bootstrap_contract_source",
     "tooling_debug_tools_gate_source",
+    "tooling_export_visibility_gate_source",
+    "tooling_host_bridge_audit_gate_source",
     "backend_build_plan_source",
     "ordinary_command",
     "ordinary_pipeline_state",
@@ -246,6 +247,8 @@ static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "runtime_debug_runtime_source",
     "tooling_bootstrap_contract_source",
     "tooling_debug_tools_gate_source",
+    "tooling_export_visibility_gate_source",
+    "tooling_host_bridge_audit_gate_source",
     "backend_build_plan_source"
 };
 
@@ -278,8 +281,6 @@ static void cheng_seed_usage(void) {
     puts("  cheng_seed profile-report --in:<raw-report> [--out:<final-report>]");
     puts("  cheng_seed crash-report --in:<raw-log> [--out:<final-report>]");
     puts("  cheng_seed verify-orphan-guard");
-    puts("  cheng_seed verify-export-visibility");
-    puts("  cheng_seed verify-export-visibility-parallel");
     puts("  cheng_seed verify-backend-driver-command-surface");
     puts("  cheng_seed verify-mobile-shell-build-probe");
     puts("  cheng_seed verify-chain-node-resilience [--compiler:<path>] [--label:<name>]");
@@ -1648,6 +1649,8 @@ typedef struct {
     char tooling_path_source[PATH_MAX];
     char tooling_world_receipt_gate_source[PATH_MAX];
     char tooling_debug_tools_gate_source[PATH_MAX];
+    char tooling_export_visibility_gate_source[PATH_MAX];
+    char tooling_host_bridge_audit_gate_source[PATH_MAX];
     char std_os_host_process_source[PATH_MAX];
     char std_os_source[PATH_MAX];
     char backend_build_plan_source[PATH_MAX];
@@ -1798,6 +1801,8 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->tooling_path_source, sizeof(paths->tooling_path_source), paths->root, "src/core/tooling/path.cheng");
     cheng_seed_join_path(paths->tooling_world_receipt_gate_source, sizeof(paths->tooling_world_receipt_gate_source), paths->root, "src/core/tooling/world_receipt_gate.cheng");
     cheng_seed_join_path(paths->tooling_debug_tools_gate_source, sizeof(paths->tooling_debug_tools_gate_source), paths->root, "src/core/tooling/debug_tools_gate.cheng");
+    cheng_seed_join_path(paths->tooling_export_visibility_gate_source, sizeof(paths->tooling_export_visibility_gate_source), paths->root, "src/core/tooling/export_visibility_gate.cheng");
+    cheng_seed_join_path(paths->tooling_host_bridge_audit_gate_source, sizeof(paths->tooling_host_bridge_audit_gate_source), paths->root, "src/core/tooling/host_bridge_audit_gate.cheng");
     cheng_seed_join_path(paths->std_os_host_process_source, sizeof(paths->std_os_host_process_source), paths->root, "src/std/os_host_process.cheng");
     cheng_seed_join_path(paths->std_os_source, sizeof(paths->std_os_source), paths->root, "src/std/os.cheng");
     cheng_seed_join_path(paths->backend_build_plan_source, sizeof(paths->backend_build_plan_source), paths->root, "src/core/backend/build_plan.cheng");
@@ -1994,7 +1999,7 @@ static bool cheng_seed_bootstrap_artifacts_fresh(const ChengSeedBootstrapPaths *
 }
 
 static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths) {
-    const char *inputs[37];
+    const char *inputs[39];
     char map_path[PATH_MAX];
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
@@ -2044,10 +2049,12 @@ static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths
     inputs[32] = paths->tooling_path_source;
     inputs[33] = paths->tooling_world_receipt_gate_source;
     inputs[34] = paths->tooling_debug_tools_gate_source;
-    inputs[35] = paths->std_os_host_process_source;
-    inputs[36] = paths->std_os_source;
-    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 37U) &&
-           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 37U);
+    inputs[35] = paths->tooling_export_visibility_gate_source;
+    inputs[36] = paths->tooling_host_bridge_audit_gate_source;
+    inputs[37] = paths->std_os_host_process_source;
+    inputs[38] = paths->std_os_source;
+    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 39U) &&
+           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 39U);
 }
 
 static int cheng_seed_cmd_bootstrap_bridge(int argc, char **argv);
@@ -63306,6 +63313,8 @@ static int cheng_seed_cmd_print_build_plan(int argc, char **argv) {
         "runtime_debug_runtime_source",
         "tooling_bootstrap_contract_source",
         "tooling_debug_tools_gate_source",
+        "tooling_export_visibility_gate_source",
+        "tooling_host_bridge_audit_gate_source",
         "backend_build_plan_source"
     };
     const char *labels[] = {
@@ -63332,6 +63341,8 @@ static int cheng_seed_cmd_print_build_plan(int argc, char **argv) {
         "runtime_debug_runtime_source",
         "tooling_source",
         "tooling_source",
+        "tooling_source",
+        "tooling_source",
         "tooling_source"
     };
     const char *manual_paths[] = {
@@ -63344,6 +63355,8 @@ static int cheng_seed_cmd_print_build_plan(int argc, char **argv) {
         "src/core/tooling/compiler_world_libp2p.cheng",
         "src/core/tooling/compiler_equivalence.cheng",
         "src/core/tooling/compiler_publish_gate.cheng",
+        NULL,
+        NULL,
         NULL,
         NULL,
         NULL,
@@ -70373,38 +70386,6 @@ static const char *cheng_seed_leaf_resolve_label(int argc,
     return default_label;
 }
 
-static const char *cheng_seed_verify_export_visibility_label_for_argv0(const char *argv0) {
-    if (argv0 == NULL || argv0[0] == '\0') {
-        return "verify_export_seed";
-    }
-    if (strstr(argv0, "cheng.stage3") != NULL || strstr(argv0, "/bootstrap/") != NULL) {
-        return "verify_export_stage3";
-    }
-    if (strstr(argv0, "cheng.stage2") != NULL) {
-        return "verify_export_stage2";
-    }
-    if (strstr(argv0, "cheng.stage1") != NULL) {
-        return "verify_export_stage1";
-    }
-    return "verify_export_seed";
-}
-
-static const char *cheng_seed_verify_export_visibility_parallel_label_for_argv0(const char *argv0) {
-    if (argv0 == NULL || argv0[0] == '\0') {
-        return "verify_export_parallel_seed";
-    }
-    if (strstr(argv0, "cheng.stage3") != NULL || strstr(argv0, "/bootstrap/") != NULL) {
-        return "verify_export_parallel_stage3";
-    }
-    if (strstr(argv0, "cheng.stage2") != NULL) {
-        return "verify_export_parallel_stage2";
-    }
-    if (strstr(argv0, "cheng.stage1") != NULL) {
-        return "verify_export_parallel_stage1";
-    }
-    return "verify_export_parallel_seed";
-}
-
 static bool cheng_seed_leaf_expect_compiler(const char *label,
                                     const char *compiler_bin) {
     ChengSeedBootstrapPaths paths;
@@ -73824,8 +73805,6 @@ static int cheng_seed_cmd_run_host_smokes_impl(int argc, char **argv) {
         "list_literal_nested_call_depth_smoke",
         "libp2p_quic_twoproc_server_pre_quic_smoke",
         "export_visibility_smoke",
-        "export_visibility_negative_smoke",
-        "strformat_export_negative_smoke",
         "cheng_skill_consistency_smoke",
         "dev_hotpatch_100ms_scope_contract_smoke",
         "json_bracket_assign_smoke",
@@ -74198,49 +74177,6 @@ static int cheng_seed_cmd_verify_backend_driver_command_surface_impl(int argc, c
 
 static int cheng_seed_cmd_verify_mobile_shell_build_probe_impl(int argc, char **argv) {
     return cheng_seed_require_backend_driver_cli_passthrough("verify-mobile-shell-build-probe", argc, argv);
-}
-
-static int cheng_seed_cmd_verify_export_visibility_impl(int argc, char **argv) {
-    char compiler_flag[PATH_MAX + 16];
-    char label_flag[128];
-    char *surface_argv[7];
-    const char *argv0 = "cheng_seed";
-    (void)argc;
-    if (argv != NULL && argv[0] != NULL && argv[0][0] != '\0') {
-        argv0 = argv[0];
-    }
-    snprintf(compiler_flag, sizeof(compiler_flag), "--compiler:%s", argv0);
-    snprintf(label_flag, sizeof(label_flag), "--label:%s", cheng_seed_verify_export_visibility_label_for_argv0(argv0));
-    surface_argv[0] = (char *)argv0;
-    surface_argv[1] = (char *)"run-host-smokes";
-    surface_argv[2] = compiler_flag;
-    surface_argv[3] = label_flag;
-    surface_argv[4] = (char *)"export_visibility_smoke";
-    surface_argv[5] = (char *)"export_visibility_negative_smoke";
-    surface_argv[6] = (char *)"strformat_export_negative_smoke";
-    return cheng_seed_cmd_run_host_smokes_impl(7, surface_argv);
-}
-
-static int cheng_seed_cmd_verify_export_visibility_parallel_impl(int argc, char **argv) {
-    char compiler_flag[PATH_MAX + 16];
-    char label_flag[128];
-    char *surface_argv[5];
-    const char *argv0 = "cheng_seed";
-    (void)argc;
-    if (argv != NULL && argv[0] != NULL && argv[0][0] != '\0') {
-        argv0 = argv[0];
-    }
-    snprintf(compiler_flag, sizeof(compiler_flag), "--compiler:%s", argv0);
-    snprintf(label_flag,
-             sizeof(label_flag),
-             "--label:%s",
-             cheng_seed_verify_export_visibility_parallel_label_for_argv0(argv0));
-    surface_argv[0] = (char *)argv0;
-    surface_argv[1] = (char *)"run-host-smokes";
-    surface_argv[2] = compiler_flag;
-    surface_argv[3] = label_flag;
-    surface_argv[4] = (char *)"export_visibility_parallel_smoke";
-    return cheng_seed_cmd_run_host_smokes_impl(5, surface_argv);
 }
 
 static int cheng_seed_cmd_verify_r2c_react_surface_impl(int argc, char **argv) {
@@ -77129,12 +77065,6 @@ int main(int argc, char **argv) {
     }
     if (cheng_seed_streq(argv[1], "verify-orphan-guard")) {
         return cheng_seed_cmd_verify_orphan_guard_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-export-visibility")) {
-        return cheng_seed_cmd_verify_export_visibility_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-export-visibility-parallel")) {
-        return cheng_seed_cmd_verify_export_visibility_parallel_impl(argc, argv);
     }
     if (cheng_seed_streq(argv[1], "verify-backend-driver-command-surface")) {
         return cheng_seed_cmd_verify_backend_driver_command_surface_impl(argc, argv);
