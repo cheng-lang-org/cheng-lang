@@ -34,7 +34,7 @@ fn CanRead(r: BinaryReader, count: int32): bool =
 
 fn Seek(r: var BinaryReader, pos: int32): Result[bool] =
     if pos < 0 || pos > r.buf.len:
-        return Err[bool](Fmt"wowExport binary: seek out of bounds pos={strings.IntToStr(pos)} len={strings.IntToStr(r.buf.len)}")
+        return Err[bool]("wowExport binary: seek out of bounds pos=" + strings.IntToStr(pos) + " len=" + strings.IntToStr(r.buf.len))
     r.pos = pos
     return Ok[bool](true)
 
@@ -76,6 +76,22 @@ fn ReadU32BE(r: var BinaryReader): Result[int32] =
     r.pos = r.pos + 4
     return Ok[int32]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
 
+fn ReadU16BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 2 > buf.len:
+        return Err[int32]("wowExport binary: truncated u16be")
+    let b0: int32 = bytes.BufByteAt(buf, idx)
+    let b1: int32 = bytes.BufByteAt(buf, idx + 1)
+    return Ok[int32]((b0 << 8) + b1)
+
+fn ReadU32BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport binary: truncated u32be")
+    let b0: int32 = bytes.BufByteAt(buf, idx)
+    let b1: int32 = bytes.BufByteAt(buf, idx + 1)
+    let b2: int32 = bytes.BufByteAt(buf, idx + 2)
+    let b3: int32 = bytes.BufByteAt(buf, idx + 3)
+    return Ok[int32]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
+
 fn HexNibble(v: int32): str =
     let n: int32 = v & 15
     if n == 0: return "0"
@@ -96,7 +112,42 @@ fn HexNibble(v: int32): str =
     return "f"
 
 fn HexByte(v: int32): str =
-    return Fmt"{HexNibble(v >> 4)}{HexNibble(v)}"
+    return strings.ConcatStr(HexNibble(v >> 4), HexNibble(v))
+
+fn hexCharValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn HexTextByteAt(text: str, byteIndex: int32): int32 =
+    let pos: int32 = byteIndex * 2
+    if pos < 0 || pos + 1 >= strings.Len(text):
+        return -1
+    let hi: int32 = hexCharValue(text[pos])
+    let lo: int32 = hexCharValue(text[pos + 1])
+    if hi < 0 || lo < 0:
+        return -1
+    return (hi << 4) | lo
+
+fn ByteSliceMatchesHex(buf: bytes.ByteBuffer, start: int32, hexText: str): bool =
+    let byteCount: int32 = strings.Len(hexText) / 2
+    if strings.Len(hexText) % 2 != 0:
+        return false
+    if start < 0 || start + byteCount > buf.len:
+        return false
+    var i: int32
+    while i < byteCount:
+        let want: int32 = HexTextByteAt(hexText, i)
+        if want < 0:
+            return false
+        if bytes.BufByteAt(buf, start + i) != want:
+            return false
+        i = i + 1
+    return true
 
 fn ReadHex(r: var BinaryReader, count: int32): Result[str] =
     if count < 0:
@@ -107,7 +158,7 @@ fn ReadHex(r: var BinaryReader, count: int32): Result[str] =
     var i: int32
     while i < count:
         let b: int32 = bytes.BufByteAt(r.buf, r.pos + i)
-        out = Fmt"{out}{HexByte(b)}"
+        out = strings.ConcatStr(out, HexByte(b))
         i = i + 1
     r.pos = r.pos + count
     return Ok[str](out)
@@ -119,14 +170,14 @@ fn ReadFourCC(r: var BinaryReader): Result[str] =
     var i: int32
     while i < 4:
         let b: int32 = bytes.BufByteAt(r.buf, r.pos + i)
-        out = Fmt"{out}{strings.CharToStr(char(b))}"
+        out = strings.ConcatStr(out, strings.CharToStr(char(b)))
         i = i + 1
     r.pos = r.pos + 4
     return Ok[str](out)
 
 fn ByteAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
     if idx < 0 || idx >= buf.len:
-        return Err[int32](Fmt"wowExport binary: byte index out of bounds idx={strings.IntToStr(idx)} len={strings.IntToStr(buf.len)}")
+        return Err[int32]("wowExport binary: byte index out of bounds idx=" + strings.IntToStr(idx) + " len=" + strings.IntToStr(buf.len))
     return Ok[int32](bytes.BufByteAt(buf, idx))
 
 fn HexSlice(buf: bytes.ByteBuffer, start: int32, count: int32): Result[str] =

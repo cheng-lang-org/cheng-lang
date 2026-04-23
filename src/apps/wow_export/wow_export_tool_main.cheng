@@ -1,15 +1,23 @@
 import std/cmdline as cmdline
+import std/bytes as bytes
 import std/result
 import std/strings as strings
 import std/strformat
+import std/strutils as strutils
 import cheng/apps/wow_export/build_info as build_info
 import cheng/apps/wow_export/config as config
+import cheng/apps/wow_export/casc_archive as casc_archive
 import cheng/apps/wow_export/casc_index as casc_index
+import cheng/apps/wow_export/encoding as encoding
+import cheng/apps/wow_export/install as install
+import cheng/apps/wow_export/local_files as local_files
 import cheng/apps/wow_export/preview as preview
+import cheng/apps/wow_export/root as wow_root
+import cheng/apps/wow_export/tact_keys as tact_keys
 import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
 
 fn PrintUsage() =
-    echo("wow-export commands: list-builds | probe | extract-file | convert-blp | export-m2 | export-wmo | export-map | preview-northshire")
+    echo("wow-export commands: list-builds | probe | manifest | audit-file | extract-file | convert-blp | export-m2 | export-wmo | export-map | preview-northshire")
 
 fn RunListBuilds(): int32 =
     let buildsRes: Result[build_info.WowBuildEntry[]] = build_info.LoadBuildInfo(build_info.DefaultClientPath)
@@ -34,12 +42,73 @@ fn RunProbe(): int32 =
     if IsErr(cfgRes):
         echo(Error(cfgRes))
         return 1
-    echo(config.BuildConfigSummary(Value(cfgRes)))
+    let cfg: config.BuildConfig = Value(cfgRes)
+    echo(config.BuildConfigSummary(cfg))
     let idxRes: Result[casc_index.CascIndexSummary] = casc_index.LoadFirstJournalIndexSummary(build_info.DefaultClientPath)
     if IsErr(idxRes):
         echo(Error(idxRes))
         return 1
     echo(casc_index.CascIndexSummaryText(Value(idxRes)))
+    let encEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(build_info.DefaultClientPath, cfg.encodingEncodingKey)
+    if IsErr(encEntryRes):
+        echo(Error(encEntryRes))
+        return 1
+    echo(Fmt"encodingEntry={casc_index.CascIndexEntryText(Value(encEntryRes))}")
+    let encFullRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFull(build_info.DefaultClientPath, Value(encEntryRes))
+    if IsErr(encFullRes):
+        echo(Error(encFullRes))
+        return 1
+    let encSummaryRes: Result[encoding.EncodingSummary] = encoding.WowEncodingSummary(Value(encFullRes))
+    if IsErr(encSummaryRes):
+        echo(Error(encSummaryRes))
+        return 1
+    echo(encoding.WowEncodingSummaryText(Value(encSummaryRes)))
+    let rootKeyRes: Result[str] = encoding.WowEncodingFindEncodingKey(Value(encFullRes), cfg.root)
+    if IsErr(rootKeyRes):
+        echo(Error(rootKeyRes))
+        return 1
+    echo(Fmt"rootEncodingKey={Value(rootKeyRes)}")
+    let rootEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(build_info.DefaultClientPath, Value(rootKeyRes))
+    if IsErr(rootEntryRes):
+        echo(Error(rootEntryRes))
+        return 1
+    let rootBytesRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFirstBlock(build_info.DefaultClientPath, Value(rootEntryRes))
+    if IsErr(rootBytesRes):
+        echo(Error(rootBytesRes))
+        return 1
+    let rootHeaderRes: Result[wow_root.RootHeader] = wow_root.WowRootParseHeader(Value(rootBytesRes))
+    if IsErr(rootHeaderRes):
+        echo(Error(rootHeaderRes))
+        return 1
+    let rootFirstRes: Result[wow_root.RootEntry] = wow_root.WowRootFirstEntry(Value(rootBytesRes))
+    if IsErr(rootFirstRes):
+        echo(Error(rootFirstRes))
+        return 1
+    echo(Fmt"rootVersion={strings.IntToStr(Value(rootHeaderRes).version)} totalFiles={strings.IntToStr(Value(rootHeaderRes).totalFiles)} firstFileDataID={strings.IntToStr(Value(rootFirstRes).fileDataID)} firstCKey={Value(rootFirstRes).contentKey}")
+    let installEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(build_info.DefaultClientPath, cfg.installEncodingKey)
+    if IsErr(installEntryRes):
+        echo(Error(installEntryRes))
+        return 1
+    let installBytesRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFull(build_info.DefaultClientPath, Value(installEntryRes))
+    if IsErr(installBytesRes):
+        echo(Error(installBytesRes))
+        return 1
+    let installSummaryRes: Result[install.InstallSummary] = install.WowInstallSummary(Value(installBytesRes))
+    if IsErr(installSummaryRes):
+        echo(Error(installSummaryRes))
+        return 1
+    echo(install.WowInstallSummaryText(Value(installSummaryRes)))
+    let keyRes: Result[tact_keys.TactKeyTable] = tact_keys.LoadTactKeyTable(build_info.DefaultClientPath, build.keyRing)
+    if IsErr(keyRes):
+        echo(Error(keyRes))
+        return 1
+    echo(tact_keys.TactKeyTableSummary(Value(keyRes)))
     return 0
 
 fn RunPreviewNorthshire(): int32 =
@@ -55,8 +124,56 @@ fn RunManifest(): int32 =
     echo(northshire.ManifestText(northshire.Manifest()))
     return 0
 
+fn RunAuditFile(): int32 =
+    let ctxRes: Result[local_files.LocalCascContext] =
+        local_files.LoadLocalCascContext(build_info.DefaultClientPath)
+    if IsErr(ctxRes):
+        echo(Error(ctxRes))
+        return 1
+    var ctx: local_files.LocalCascContext = Value(ctxRes)
+    let count: int32 = cmdline.ParamCount()
+    var printed: int32
+    if count > 2:
+        var i: int32 = 2
+        while i < count:
+            let raw: str = cmdline.ParamStr(i)
+            let fileDataID: int32 = int32(strutils.ParseInt(raw))
+            if fileDataID < 0:
+                echo(Fmt"wowExport audit-file: invalid fileDataID {raw}")
+                local_files.FreeLocalCascContext(ctx)
+                return 1
+            let auditRes: Result[local_files.LocalFileAudit] =
+                local_files.ResolveLocalFileAudit(ctx, fileDataID)
+            if IsErr(auditRes):
+                echo(Error(auditRes))
+                local_files.FreeLocalCascContext(ctx)
+                return 1
+            echo(local_files.AuditText(Value(auditRes)))
+            printed = printed + 1
+            i = i + 1
+    else:
+        let fileDataID: int32 = cmdline.ReadInt32FlagOrDefault("--file-data-id", -1)
+        if fileDataID < 0:
+            echo("wowExport audit-file: missing --file-data-id or positional fileDataIDs")
+            local_files.FreeLocalCascContext(ctx)
+            return 1
+        let auditRes: Result[local_files.LocalFileAudit] =
+            local_files.ResolveLocalFileAudit(ctx, fileDataID)
+        if IsErr(auditRes):
+            echo(Error(auditRes))
+            local_files.FreeLocalCascContext(ctx)
+            return 1
+        echo(local_files.AuditText(Value(auditRes)))
+        printed = 1
+    if printed <= 0:
+        echo("wowExport audit-file: no fileDataIDs supplied")
+        local_files.FreeLocalCascContext(ctx)
+        return 1
+    local_files.FreeLocalCascContext(ctx)
+    return 0
+
 fn RunNotImplemented(cmd: str): int32 =
-    echo(Fmt"wowExport {cmd}: blocked until root/encoding + audited fileDataID manifest are implemented; no fake extraction")
+    echo(Fmt"wowExport {cmd}: blocked until audited fileDataID manifest and real asset export path are implemented; no fake extraction")
     return 1
 
 fn main(argc: int32, argv: ptr): int32 =
@@ -72,6 +189,8 @@ fn main(argc: int32, argv: ptr): int32 =
         return RunProbe()
     if cmd == "manifest":
         return RunManifest()
+    if cmd == "audit-file":
+        return RunAuditFile()
     if cmd == "preview-northshire":
         return RunPreviewNorthshire()
     if cmd == "extract-file" || cmd == "convert-blp" || cmd == "export-m2" ||

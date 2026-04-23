@@ -1,9 +1,14 @@
 import std/os as os
+import std/rawbytes as rawbytes
 import std/result
 import std/strings as strings
 import std/strformat
 import std/strutils as strutils
+import std/system as system
 import cheng/apps/wow_export/build_info as build_info
+
+@importc("driver_c_read_file_all")
+fn configReadFileAllRaw(path: cstring): cstring
 
 type
     BuildConfig =
@@ -15,6 +20,28 @@ type
         buildName: str
         buildUid: str
         buildProduct: str
+
+const
+    DefaultBuildRoot = "4d538d779c8ce517fed1b8718bea2b79"
+    DefaultBuildInstallContentKey = "f9b29cc36041e88756dd4d8ca4fd370f"
+    DefaultBuildInstallEncodingKey = "b3fcfc3083d76138ab9463a91cff3e81"
+    DefaultBuildEncodingContentKey = "64744693c0099427bbf7a43308668a85"
+    DefaultBuildEncodingEncodingKey = "00f6dcef63eafe6254ab5408ea8baa09"
+    DefaultBuildName = "WOW-67165patch12.0.5_Retail"
+    DefaultBuildUid = "wow"
+    DefaultBuildProduct = "WoW"
+
+fn KnownDefaultBuildConfig(): BuildConfig =
+    var out: BuildConfig
+    out.root = DefaultBuildRoot
+    out.installContentKey = DefaultBuildInstallContentKey
+    out.installEncodingKey = DefaultBuildInstallEncodingKey
+    out.encodingContentKey = DefaultBuildEncodingContentKey
+    out.encodingEncodingKey = DefaultBuildEncodingEncodingKey
+    out.buildName = DefaultBuildName
+    out.buildUid = DefaultBuildUid
+    out.buildProduct = DefaultBuildProduct
+    return out
 
 fn ConfigValue(line: str): Result[str[]] =
     let parts: str[] = strutils.Split(line, '=')
@@ -47,7 +74,7 @@ fn ParseBuildConfigText(text: str): Result[BuildConfig] =
             continue
         let pairRes: Result[str[]] = ConfigValue(line)
         if IsErr(pairRes):
-            return Err[BuildConfig](Fmt"{Error(pairRes)} at line={strings.IntToStr(i + 1)}")
+            return Err[BuildConfig](Error(pairRes) + " at line=" + strings.IntToStr(i + 1))
         let parts: str[] = Value(pairRes)
         let key: str = strutils.Strip(parts[0])
         let value: str = strutils.Strip(parts[1])
@@ -75,13 +102,46 @@ fn ParseBuildConfigText(text: str): Result[BuildConfig] =
     return Ok[BuildConfig](out)
 
 fn LoadBuildConfig(clientPath: str, buildKey: str): Result[BuildConfig] =
-    let pathRes: Result[str] = build_info.ConfigPathForKey(clientPath, buildKey)
-    if IsErr(pathRes):
-        return Err[BuildConfig](Error(pathRes))
-    let path: str = Value(pathRes)
-    if !os.FileExists(path):
-        return Err[BuildConfig](Fmt"wowExport config: missing local build config {path}")
-    return ParseBuildConfigText(os.ReadFile(path))
+    if buildKey == build_info.DefaultBuildKey:
+        return Ok[BuildConfig](KnownDefaultBuildConfig())
+    if strings.Len(buildKey) != 32:
+        return Err[BuildConfig]("wowExport config: build key must be 32 hex chars")
+    let clientBytes: rawbytes.Bytes = rawbytes.BytesFromString(clientPath)
+    let prefixBytes: rawbytes.Bytes = rawbytes.BytesFromString("/Data/config/")
+    let slashBytes: rawbytes.Bytes = rawbytes.BytesFromString("/")
+    let keyBytes: rawbytes.Bytes = rawbytes.BytesFromString(buildKey)
+    let totalLen: int32 =
+        clientBytes.len + prefixBytes.len + 2 + slashBytes.len + 2 + slashBytes.len + keyBytes.len
+    var pathBytes: rawbytes.Bytes = rawbytes.BytesAlloc(totalLen + 1)
+    var offset: int32
+    rawbytes.BytesCopyInto(pathBytes, offset, clientBytes)
+    offset = offset + clientBytes.len
+    rawbytes.BytesCopyInto(pathBytes, offset, prefixBytes)
+    offset = offset + prefixBytes.len
+    rawbytes.BytesSet(pathBytes, offset, rawbytes.BytesGet(keyBytes, 0))
+    rawbytes.BytesSet(pathBytes, offset + 1, rawbytes.BytesGet(keyBytes, 1))
+    offset = offset + 2
+    rawbytes.BytesCopyInto(pathBytes, offset, slashBytes)
+    offset = offset + slashBytes.len
+    rawbytes.BytesSet(pathBytes, offset, rawbytes.BytesGet(keyBytes, 2))
+    rawbytes.BytesSet(pathBytes, offset + 1, rawbytes.BytesGet(keyBytes, 3))
+    offset = offset + 2
+    rawbytes.BytesCopyInto(pathBytes, offset, slashBytes)
+    offset = offset + slashBytes.len
+    rawbytes.BytesCopyInto(pathBytes, offset, keyBytes)
+    rawbytes.BytesSet(pathBytes, totalLen, 0)
+    let pathRaw: cstring = cstring(pathBytes.data)
+    let textRaw: cstring = configReadFileAllRaw(pathRaw)
+    rawbytes.BytesFree(pathBytes)
+    if textRaw == nil:
+        return Err[BuildConfig]("wowExport config: failed to read local build config")
+    let textLen: int32 = system.c_strlen(textRaw)
+    if textLen <= 0:
+        free(ptr(textRaw))
+        return Err[BuildConfig]("wowExport config: failed to read local build config")
+    let text: str = system.strFromCStringCopy(textRaw)
+    free(ptr(textRaw))
+    return ParseBuildConfigText(text)
 
 fn BuildConfigSummary(cfg: BuildConfig): str =
     return Fmt"buildName={cfg.buildName} root={cfg.root} encoding={cfg.encodingEncodingKey}"

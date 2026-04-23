@@ -10,24 +10,20 @@ fn __cheng_rt_paramCount(): int32
 @importc("__cheng_rt_paramStr")
 fn __cheng_rt_paramStr(i: int32): cstring
 
-@importc("__cheng_rt_paramStrCopyBridgeInto")
-fn cmdlineParamStrCopyIntoBridge(i: int32, out: var str)
-
 @importc("driver_c_cli_param1_eq_bridge")
 fn cliParam1Eq(expected: str): bool
 
 @importc("driver_c_read_flag_or_default_bridge")
-fn readFlagOrDefaultBridge(key: str, defaultValue: str): str
+fn driverReadFlagOrDefault(key: str, defaultValue: str): str
+
 @importc("driver_c_read_flag_value_bridge")
-fn readFlagValueBridge(key: str, outValue: var str): bool
+fn driverReadFlagValue(key: str, outValue: var str): bool
 
 @importc("driver_c_read_int32_flag_or_default_bridge")
-fn readInt32FlagOrDefaultBridge(key: str, defaultValue: int32): int32
+fn driverReadInt32FlagOrDefault(key: str, defaultValue: int32): int32
 
 fn cmdlineParamStrCopy(i: int32): str =
-    var out: str
-    cmdlineParamStrCopyIntoBridge(i, out)
-    return out
+    return strFromCStringCopy(__cheng_rt_paramStr(i))
 
 fn __cheng_cmdCountMax(): int32 =
     return 4096
@@ -167,14 +163,23 @@ fn hasFlag(flag: str): bool =
 
 fn tryInlineFlagValue(arg: str, key: str, outValue: var str): bool =
     cmdSetEmpty(outValue)
-    if strings.Len(arg) == 0 || strings.Len(key) == 0:
+    let argLen: int32 = strings.Len(arg)
+    let keyLen: int32 = strings.Len(key)
+    if argLen == 0 || keyLen == 0:
         return false
-    if cmdStartsWith(arg, key + ":"):
-        cmdSetStr(outValue, strings.DropPrefix(arg, key + ":"))
-        return true
-    if cmdStartsWith(arg, key + "="):
-        cmdSetStr(outValue, strings.DropPrefix(arg, key + "="))
-        return true
+    if argLen <= keyLen:
+        return false
+    var i: int32
+    while i < keyLen:
+        if arg[i] != key[i]:
+            return false
+        i = i + 1
+    let sep: char = arg[keyLen]
+    if sep != ':' && sep != '=':
+        return false
+    cmdSetStr(outValue,
+              cmdOwnText(strings.SliceBytes(arg, keyLen + 1, argLen - keyLen - 1)))
+    return true
     return false
 
 fn flagValue(arg: str, key: str): str =
@@ -215,18 +220,7 @@ fn readFirstFlagValue(key: str, outValue: var str): bool =
     outValue = ""
     if strings.Len(key) == 0:
         return false
-    let count: int32 = paramCount()
-    for i in 1..count:
-        let arg: str = paramStr(i)
-        if tryInlineFlagValue(arg, key, outValue):
-            return true
-        if !(arg == key):
-            continue
-        if i >= count:
-            return false
-        outValue = paramStr(i + 1)
-        return true
-    return false
+    return driverReadFlagValue(key, outValue)
 
 fn readLastFlagValue(key: str, outValue: var str): bool =
     outValue = ""
@@ -246,20 +240,17 @@ fn readLastFlagValue(key: str, outValue: var str): bool =
     return found
 
 fn readFlagValue(key: str, outValue: var str): bool =
-    var raw: str
-    let ok: bool = readFlagValueBridge(key, raw)
-    if !ok:
-        outValue = ""
-        return false
-    outValue = cmdOwnText(raw)
-    return true
+    return readFirstFlagValue(key, outValue)
 
 fn readFlagOrDefault(key: str, defaultValue: str): str =
-    let raw: str = readFlagOrDefaultBridge(key, defaultValue)
-    return cmdOwnText(raw)
+    if strings.Len(key) == 0:
+        return defaultValue
+    return driverReadFlagOrDefault(key, defaultValue)
 
 fn readInt32FlagOrDefault(key: str, defaultValue: int32): int32 =
-    return readInt32FlagOrDefaultBridge(key, defaultValue)
+    if strings.Len(key) == 0:
+        return defaultValue
+    return driverReadInt32FlagOrDefault(key, defaultValue)
 
 fn parseBool(raw: str, outValue: var bool): bool =
     let s: str = cmdLowerAscii(cmdTrimAsciiSpace(raw))

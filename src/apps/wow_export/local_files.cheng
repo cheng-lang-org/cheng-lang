@@ -1,0 +1,111 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import std/strformat
+import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/casc_archive as casc_archive
+import cheng/apps/wow_export/casc_index as casc_index
+import cheng/apps/wow_export/config as config
+import cheng/apps/wow_export/encoding as encoding
+import cheng/apps/wow_export/root as wow_root
+
+type
+    LocalCascContext =
+        clientPath: str
+        build: build_info.WowBuildEntry
+        cfg: config.BuildConfig
+        encodingBuf: bytes.ByteBuffer
+        rootBuf: bytes.ByteBuffer
+
+    LocalFileAudit =
+        fileDataID: int32
+        contentKey: str
+        encodingKey: str
+        entry: casc_index.CascIndexEntry
+
+fn LoadLocalCascContext(clientPath: str): Result[LocalCascContext] =
+    let buildRes: Result[build_info.WowBuildEntry] =
+        build_info.LoadBuild(clientPath, build_info.DefaultProduct, build_info.DefaultVersion)
+    if IsErr(buildRes):
+        return Err[LocalCascContext](Error(buildRes))
+    if Value(buildRes).buildKey != build_info.DefaultBuildKey:
+        return Err[LocalCascContext]("wowExport local-files: build key mismatch expected=" + build_info.DefaultBuildKey + " got=" + Value(buildRes).buildKey)
+    let cfgRes: Result[config.BuildConfig] =
+        config.LoadBuildConfig(clientPath, build_info.DefaultBuildKey)
+    if IsErr(cfgRes):
+        return Err[LocalCascContext](Error(cfgRes))
+    let cfg: config.BuildConfig = Value(cfgRes)
+    let encEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(clientPath, cfg.encodingEncodingKey)
+    if IsErr(encEntryRes):
+        return Err[LocalCascContext](Error(encEntryRes))
+    let encBufRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFull(clientPath, Value(encEntryRes))
+    if IsErr(encBufRes):
+        return Err[LocalCascContext](Error(encBufRes))
+    let rootEncodingKeyRes: Result[str] =
+        encoding.WowEncodingFindEncodingKey(Value(encBufRes), cfg.root)
+    if IsErr(rootEncodingKeyRes):
+        return Err[LocalCascContext](Error(rootEncodingKeyRes))
+    let rootEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(clientPath, Value(rootEncodingKeyRes))
+    if IsErr(rootEntryRes):
+        return Err[LocalCascContext](Error(rootEntryRes))
+    let rootBufRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFull(clientPath, Value(rootEntryRes))
+    if IsErr(rootBufRes):
+        return Err[LocalCascContext](Error(rootBufRes))
+    var out: LocalCascContext
+    out.clientPath = clientPath
+    out.build = Value(buildRes)
+    out.cfg = cfg
+    out.encodingBuf = Value(encBufRes)
+    out.rootBuf = Value(rootBufRes)
+    return Ok[LocalCascContext](out)
+
+fn FreeLocalCascContext(ctx: var LocalCascContext) =
+    bytes.FreeByteBuffer(ctx.encodingBuf)
+    bytes.FreeByteBuffer(ctx.rootBuf)
+    ctx.clientPath = ""
+
+fn ResolveLocalFileAudit(ctx: LocalCascContext, fileDataID: int32): Result[LocalFileAudit] =
+    let rootEntryRes: Result[wow_root.RootEntry] =
+        wow_root.WowRootFindByFileDataID(ctx.rootBuf, fileDataID, 0)
+    if IsErr(rootEntryRes):
+        return Err[LocalFileAudit](Error(rootEntryRes))
+    let rootEntry: wow_root.RootEntry = Value(rootEntryRes)
+    let encodingKeyRes: Result[str] =
+        encoding.WowEncodingFindEncodingKey(ctx.encodingBuf, rootEntry.contentKey)
+    if IsErr(encodingKeyRes):
+        return Err[LocalFileAudit](Error(encodingKeyRes))
+    let idxEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(ctx.clientPath, Value(encodingKeyRes))
+    if IsErr(idxEntryRes):
+        return Err[LocalFileAudit](Error(idxEntryRes))
+    var out: LocalFileAudit
+    out.fileDataID = fileDataID
+    out.contentKey = rootEntry.contentKey
+    out.encodingKey = Value(encodingKeyRes)
+    out.entry = Value(idxEntryRes)
+    return Ok[LocalFileAudit](out)
+
+fn ReadLocalFileByEncodingKey(clientPath: str, encodingKey: str): Result[bytes.ByteBuffer] =
+    let idxEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(clientPath, encodingKey)
+    if IsErr(idxEntryRes):
+        return Err[bytes.ByteBuffer](Error(idxEntryRes))
+    return casc_archive.CascArchiveDecodeLocalEntryFull(clientPath, Value(idxEntryRes))
+
+fn ReadLocalFileByEntry(clientPath: str,
+                        archiveIndex: int32,
+                        offset: int32,
+                        size: int32): Result[bytes.ByteBuffer] =
+    var entry: casc_index.CascIndexEntry
+    entry.keyPrefix = ""
+    entry.archiveIndex = archiveIndex
+    entry.offset = offset
+    entry.size = size
+    return casc_archive.CascArchiveDecodeLocalEntryFull(clientPath, entry)
+
+fn AuditText(audit: LocalFileAudit): str =
+    return Fmt"fileDataID={strings.IntToStr(audit.fileDataID)} contentKey={audit.contentKey} encodingKey={audit.encodingKey} archive={strings.IntToStr(audit.entry.archiveIndex)} offset={strings.IntToStr(audit.entry.offset)} size={strings.IntToStr(audit.entry.size)}"

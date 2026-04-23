@@ -2100,6 +2100,68 @@ fn ParserAppendFmtExprsLine(sourcePath: str,
                                         endColumn)
     return
 
+fn ParserAppendBacktickStringifyCallExprsLine(sourcePath: str,
+                                                lineNumber: int32,
+                                                lineRaw: str,
+                                                layer: var NormalizedExprLayer) =
+    var i: int32
+    var inString = false
+    var inChar = false
+    while i < lineRaw.len:
+        let ch = lineRaw[i]
+        if !inChar && ch == '"' && !ParserQuoteIsEscaped(lineRaw, i):
+            inString = !inString
+            i = i + 1
+            continue
+        if !inString && ch == '\'' && !ParserQuoteIsEscaped(lineRaw, i):
+            inChar = !inChar
+            i = i + 1
+            continue
+        if inString || inChar:
+            i = i + 1
+            continue
+        if ch == '#':
+            return
+        if ch != '`' || i + 2 >= lineRaw.len:
+            i = i + 1
+            continue
+        if lineRaw[i + 1] != '$' || lineRaw[i + 2] != '`':
+            i = i + 1
+            continue
+        let openPos = ParserSkipInlineSpaces(lineRaw, i + 3)
+        if openPos >= lineRaw.len || lineRaw[openPos] != '(':
+            i = i + 1
+            continue
+        var callArgsText = ""
+        var callArgCount: int32
+        var endColumnNumber: int32 = -1
+        if !ParserCallSurfaceFromOpenParen(lineRaw,
+                                             openPos,
+                                             callArgsText,
+                                             callArgCount,
+                                             endColumnNumber):
+            i = i + 1
+            continue
+        NormalizedExprLayerAppendCall(layer,
+                                        sourcePath,
+                                        lineNumber,
+                                        i + 1,
+                                        "`$`",
+                                        NormalizedExprSurfaceCallNone,
+                                        true,
+                                        NormalizedExprCallReasonNone,
+                                        "",
+                                        "$",
+                                        "$",
+                                        "",
+                                        false,
+                                        callArgsText,
+                                        callArgCount,
+                                        false,
+                                        endColumnNumber)
+        i = endColumnNumber
+    return
+
 fn ParserAppendRangeExprsLine(sourcePath: str,
                                 lineNumber: int32,
                                 lineRaw: str,
@@ -4779,6 +4841,10 @@ fn ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRaw:
         ParserAppendRangeExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendComprehensionExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendFmtExprsLine(sourcePath, lineNumber, line, layer)
+        ParserAppendBacktickStringifyCallExprsLine(sourcePath,
+                                                     lineNumber,
+                                                     line,
+                                                     layer)
         if !ParserAppendDefaultInitExprsLine(sourcePath,
                                                lineNumber,
                                                line,

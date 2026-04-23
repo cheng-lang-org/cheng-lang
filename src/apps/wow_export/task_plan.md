@@ -7,9 +7,10 @@
 - [x] Add smoke coverage for CASC, BLTE, Northshire gate.
 - [x] Compile CLI entry and verify `probe` against local client.
 - [x] Implement pure Cheng MD5.
-- [ ] Implement pure Cheng zlib/deflate inflate.
+- [x] Implement pure Cheng zlib/deflate inflate.
 - [x] Implement pure Cheng Salsa20 core.
 - [x] Parse BLTE encrypted block metadata and decrypt with supplied Salsa20 key.
-- [ ] Implement TACT key table handling.
-- [ ] Parse encoding/root/install and audited fileDataID manifest.
+- [x] Implement TACT key table handling.
+- [x] Parse encoding/root/install from local CASC.
+- [x] Add audited Northshire fileDataID manifest.
 - [ ] Render Northshire MVP from real local assets.

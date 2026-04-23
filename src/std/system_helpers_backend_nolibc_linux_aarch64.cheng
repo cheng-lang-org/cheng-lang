@@ -2403,7 +2403,8 @@ fn __cheng_rt_paramStrCopyBridgeInto_export(i: int32, out: var str) =
 
 @exportc("paramCount")
 fn paramCount_export(): int32 =
-    return paramCount()
+    let total: int32 = paramCount()
+    return total > 0 ? (total - 1) : 0
 
 @exportc("driver_c_cli_param1_eq_bridge")
 fn driver_c_cli_param1_eq_bridge_export(expected: str): bool =
@@ -2415,9 +2416,11 @@ fn driver_c_cli_param1_eq_bridge_export(expected: str): bool =
 
 @exportc("driver_c_read_flag_or_default_bridge")
 fn driver_c_read_flag_or_default_bridge_export(key: str, defaultValue: str): str =
+    let defaultData: ptr = cheng_runtime_str_data(defaultValue)
+    let defaultLen: int32 = cheng_runtime_str_len(defaultValue)
     let count: int32 = paramCount()
     if count <= 1:
-        return defaultValue
+        return cheng_runtime_str_copy(defaultData, defaultLen)
     var i: int32 = 1
     while i <= count:
         let arg: str = paramStr(i)
@@ -2426,10 +2429,11 @@ fn driver_c_read_flag_or_default_bridge_export(key: str, defaultValue: str): str
             return inlineValue
         if cheng_runtime_flag_key_matches(arg, key):
             if i >= count:
-                return defaultValue
-            return paramStr(i + 1)
+                return cheng_runtime_str_copy(defaultData, defaultLen)
+            let value: str = paramStr(i + 1)
+            return cheng_runtime_str_copy(cheng_runtime_str_data(value), cheng_runtime_str_len(value))
         i = i + 1
-    return defaultValue
+    return cheng_runtime_str_copy(defaultData, defaultLen)
 
 @exportc("driver_c_read_flag_value_bridge")
 fn driver_c_read_flag_value_bridge_export(key: str, outValue: var str): bool =
@@ -2445,7 +2449,8 @@ fn driver_c_read_flag_value_bridge_export(key: str, outValue: var str): bool =
         if cheng_runtime_flag_key_matches(arg, key):
             if i >= count:
                 return false
-            outValue = paramStr(i + 1)
+            let value: str = paramStr(i + 1)
+            outValue = cheng_runtime_str_copy(cheng_runtime_str_data(value), cheng_runtime_str_len(value))
             return true
         i = i + 1
     return false
@@ -2797,10 +2802,22 @@ fn store_str_export(p: ptr, val: str) =
     if p == nil:
         return
     let pp: StrPtr = StrPtr(p)
-    pp->data = val.data
-    pp->len = val.len
-    pp->store_id = val.store_id
-    pp->flags = val.flags
+    var next: str = val
+    if val.flags != chengStrFlagOwned && val.data != nil && val.len > 0:
+        next = cheng_runtime_str_copy(val.data, val.len)
+    elif val.flags == chengStrFlagOwned && val.data != nil:
+        cheng_mem_retain(val.data)
+    var prev: str
+    prev.data = pp->data
+    prev.len = pp->len
+    prev.store_id = pp->store_id
+    prev.flags = pp->flags
+    if prev.flags == chengStrFlagOwned && prev.data != nil:
+        cheng_mem_release(prev.data)
+    pp->data = next.data
+    pp->len = next.len
+    pp->store_id = next.store_id
+    pp->flags = next.flags
 
 @exportc("cheng_str_bridge_load_into")
 fn cheng_str_bridge_load_into_export(out_raw: ptr, p: ptr) =

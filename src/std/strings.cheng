@@ -1,17 +1,8 @@
 # Strings module (minimal)
 import std/system
-import std/rawmem_support
-import std/seqs
 
 type
     UInt8Ptr = uint8 *
-
-@importc("driver_c_i32_to_str")
-fn driver_c_i32_to_cstring(value: int32): cstring
-@importc("driver_c_i64_to_str")
-fn driver_c_i64_to_cstring(value: int64): cstring
-@importc("driver_c_u64_to_str")
-fn driver_c_u64_to_cstring(value: uint64): cstring
 @importc("__cheng_str_concat")
 fn cheng_str_concat_runtime(a: cstring, b: cstring): cstring
 
@@ -72,7 +63,10 @@ fn hasSuffix(s: str, suffix: str): bool =
 fn dropPrefix(s: str, prefix: str): str =
     if !hasPrefix(s, prefix):
         return s
-    return strSubView(s, strLenFast(prefix), strLenFast(s) - strLenFast(prefix))
+    let prefixLen = strLenFast(prefix)
+    let totalLen = strLenFast(s)
+    let out = strSubView(s, prefixLen, totalLen - prefixLen)
+    return out
 
 @importc("cheng_str_arc_retain")
 fn arcRetainString(s: str)
@@ -89,7 +83,9 @@ fn concatStr(s1: str, s2: str): str =
     let raw: cstring = cheng_str_concat_runtime(strToCStringTemp(s1), strToCStringTemp(s2))
     if raw == nil:
         return strEmpty()
-    return strViewWithFlags(ptr(raw), c_strlen(raw), 0, chengStrFlagOwned)
+    let rawLen = c_strlen(raw)
+    let out = strViewWithFlags(ptr(raw), rawLen, 0, chengStrFlagOwned)
+    return out
 
 fn charToStr(c: char): str =
     return strFromBytesCopy(&c, 1)
@@ -157,50 +153,163 @@ fn strContains(text: str, sub: str): bool =
             return true
         i = i + 1
     return false
-@importc("driver_c_i32_to_str")
-fn intToStrRaw(i: int32): cstring
 
-@importc("driver_c_u64_to_str")
-fn uint64ToStrRaw(x: uint64): cstring
+type
+    U64Div10Step =
+        hi: uint32
+        lo: uint32
+        rem: int32
 
-@importc("driver_c_i64_to_str")
-fn int64ToStrRaw(i: int64): cstring
+fn uint64HighWord(value: uint64): uint32 =
+    return uint32((value >> uint64(32)) & uint64(0xffffffff))
+
+fn uint64LowWord(value: uint64): uint32 =
+    return uint32(value & uint64(0xffffffff))
+
+fn divModU64WordsBy10(hi: uint32, lo: uint32): U64Div10Step =
+    let hiPart: uint64 = uint64(hi) & uint64(0xffffffff)
+    let qHi: uint32 = uint32(hiPart / uint64(10))
+    let remHi: uint64 = hiPart - (uint64(qHi) * uint64(10))
+    let combined: uint64 = (remHi << uint64(32)) | (uint64(lo) & uint64(0xffffffff))
+    let qLo: uint32 = uint32(combined / uint64(10))
+    let rem: int32 = int32(combined - (uint64(qLo) * uint64(10)))
+    return U64Div10Step(hi: qHi, lo: qLo, rem: rem)
+
+fn uint64DigitsToStr(value: uint64, negative: bool): str =
+    var buf: uint8[32]
+    var cursor: int32 = 32
+    var hi: uint32 = uint64HighWord(value)
+    var lo: uint32 = uint64LowWord(value)
+    if hi == uint32(0) && lo == uint32(0):
+        cursor = cursor - 1
+        buf[cursor] = uint8('0')
+    else:
+        while hi != uint32(0) || lo != uint32(0):
+            let step: U64Div10Step = divModU64WordsBy10(hi, lo)
+            cursor = cursor - 1
+            buf[cursor] = uint8(int32('0') + step.rem)
+            hi = step.hi
+            lo = step.lo
+    if negative:
+        cursor = cursor - 1
+        buf[cursor] = uint8('-')
+    let out: str = strFromBytesCopy(system_ptr_add(&buf[0], cursor), 32 - cursor)
+    return out
 
 fn intToStr(i: int32): str =
-    return strFromCStringBorrow(intToStrRaw(i))
+    if i >= int32(0):
+        let out: str = uint64DigitsToStr(uint64(i), false)
+        return out
+    let mag: uint64 = uint64(int64(0) - int64(i))
+    let out: str = uint64DigitsToStr(mag, true)
+    return out
 
 fn uint64ToStr(x: uint64): str =
-    return strFromCStringBorrow(uint64ToStrRaw(x))
+    let out: str = uint64DigitsToStr(x, false)
+    return out
 
 fn int64ToStr(i: int64): str =
-    return strFromCStringBorrow(int64ToStrRaw(i))
+    if i >= int64(0):
+        let out: str = uint64DigitsToStr(uint64(i), false)
+        return out
+    let mag: uint64 = uint64(0) - uint64(i)
+    let out: str = uint64DigitsToStr(mag, true)
+    return out
+
+fn `$`(x: bool): str =
+    return boolToString(x)
+
+fn `$`(x: char): str =
+    return charToString(x)
+
+fn `$`(x: int8): str =
+    return intToStr(int32(x))
+
+fn `$`(x: uint8): str =
+    return uint64ToStr(uint64(x))
+
+fn `$`(x: int16): str =
+    return intToStr(int32(x))
+
+fn `$`(x: uint16): str =
+    return uint64ToStr(uint64(x))
+
+fn `$`(x: int32): str =
+    return intToStr(x)
+
+fn `$`(x: int): str =
+    return intToStr(int32(x))
+
+fn `$`(x: uint32): str =
+    return uint64ToStr(uint64(x))
+
+fn `$`(x: int64): str =
+    return int64ToStr(x)
+
+fn `$`(x: uint64): str =
+    return uint64ToStr(x)
 
 fn `$`(s: str): str =
-    return newStringCopy(strDataPtr(s), strLenFast(s))
+    let data = strDataPtr(s)
+    let size = strLenFast(s)
+    let out = newStringCopy(data, size)
+    return out
 
-@importc("cheng_seq_string_repr_compat")
-fn repr_seq_string(xs: str[]): cstring
+fn appendSeqPrefix(out: str, index: int32): str =
+    if index > 0:
+        return out + ", "
+    return out
 
-@importc("cheng_seq_bool_repr_compat")
-fn repr_seq_bool(xs: bool[]): cstring
+fn reprSeqString(xs: str[]): str =
+    var out: str = "["
+    var i: int32
+    while i < xs.len:
+        out = appendSeqPrefix(out, i)
+        out = out + xs[i]
+        i = i + 1
+    return out + "]"
 
-@importc("cheng_seq_i32_repr_compat")
-fn repr_seq_i32(xs: int32[]): cstring
+fn reprSeqBool(xs: bool[]): str =
+    var out: str = "["
+    var i: int32
+    while i < xs.len:
+        out = appendSeqPrefix(out, i)
+        if xs[i]:
+            out = out + "true"
+        else:
+            out = out + "false"
+        i = i + 1
+    return out + "]"
 
-@importc("cheng_seq_i64_repr_compat")
-fn repr_seq_i64(xs: int64[]): cstring
+fn reprSeqI32(xs: int32[]): str =
+    var out: str = "["
+    var i: int32
+    while i < xs.len:
+        out = appendSeqPrefix(out, i)
+        out = out + intToStr(xs[i])
+        i = i + 1
+    return out + "]"
+
+fn reprSeqI64(xs: int64[]): str =
+    var out: str = "["
+    var i: int32
+    while i < xs.len:
+        out = appendSeqPrefix(out, i)
+        out = out + int64ToStr(xs[i])
+        i = i + 1
+    return out + "]"
 
 fn `$`(xs: str[]): str =
-    return strFromCStringBorrow(repr_seq_string(xs))
+    return reprSeqString(xs)
 
 fn `$`(xs: bool[]): str =
-    return strFromCStringBorrow(repr_seq_bool(xs))
+    return reprSeqBool(xs)
 
 fn `$`(xs: int32[]): str =
-    return strFromCStringBorrow(repr_seq_i32(xs))
+    return reprSeqI32(xs)
 
 fn `$`(xs: int64[]): str =
-    return strFromCStringBorrow(repr_seq_i64(xs))
+    return reprSeqI64(xs)
 
 fn Len(s: str): int32 =
     return len(s)

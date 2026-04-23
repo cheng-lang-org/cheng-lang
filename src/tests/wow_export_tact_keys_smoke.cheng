@@ -1,0 +1,86 @@
+import std/bytes as bytes
+import std/rawbytes
+import std/result
+import std/system
+import cheng/apps/wow_export/blte as blte
+import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/salsa20 as salsa20
+import cheng/apps/wow_export/tact_keys as tact_keys
+
+fn makeBuf(len: int32): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    out.len = len
+    if len > 0:
+        out.data = alloc(len)
+    return out
+
+fn makeRaw(len: int32): rawbytes.Bytes =
+    return rawbytes.BytesAlloc(len)
+
+fn put(buf: bytes.ByteBuffer, idx: int32, value: int32) =
+    bytes.BufSetByte(buf, idx, value)
+
+fn main(): int32 =
+    let tableRes: Result[tact_keys.TactKeyTable] =
+        tact_keys.ParseTactKeyTableText("key-0102030405060708 = 8000000000000000000000000000000000000000000000000000000000000000\n")
+    assert(IsOk(tableRes), Error(tableRes))
+    let table: tact_keys.TactKeyTable = Value(tableRes)
+    let keyRes: Result[str] = tact_keys.FindTactKey(table, "0102030405060708")
+    assert(IsOk(keyRes), Error(keyRes))
+
+    let localBuildRes: Result[build_info.WowBuildEntry] = build_info.ProbeRetailDefault()
+    assert(IsOk(localBuildRes), Error(localBuildRes))
+    let localKeysRes: Result[tact_keys.TactKeyTable] =
+        tact_keys.LoadTactKeyTable(build_info.DefaultClientPath, Value(localBuildRes).keyRing)
+    assert(IsOk(localKeysRes), Error(localKeysRes))
+    assert(Value(localKeysRes).entries.len > 0, "wow_export_tact_keys local keyring entries")
+
+    let plain: rawbytes.Bytes = makeRaw(3)
+    rawbytes.BytesSet(plain, 0, 0x4e)
+    rawbytes.BytesSet(plain, 1, int32('k'))
+    rawbytes.BytesSet(plain, 2, int32('y'))
+    let nonce: rawbytes.Bytes = makeRaw(8)
+    rawbytes.BytesSet(nonce, 0, 1)
+    rawbytes.BytesSet(nonce, 1, 2)
+    rawbytes.BytesSet(nonce, 2, 3)
+    rawbytes.BytesSet(nonce, 3, 4)
+    let cipherRes: Result[rawbytes.Bytes] = salsa20.Salsa20XorHexKey(Value(keyRes), nonce, plain)
+    assert(IsOk(cipherRes), Error(cipherRes))
+    let cipher: rawbytes.Bytes = Value(cipherRes)
+
+    let encrypted: bytes.ByteBuffer = makeBuf(27)
+    put(encrypted, 0, 0x42)
+    put(encrypted, 1, 0x4c)
+    put(encrypted, 2, 0x54)
+    put(encrypted, 3, 0x45)
+    put(encrypted, 4, 0)
+    put(encrypted, 5, 0)
+    put(encrypted, 6, 0)
+    put(encrypted, 7, 0)
+    put(encrypted, 8, 0x45)
+    put(encrypted, 9, 8)
+    put(encrypted, 10, 8)
+    put(encrypted, 11, 7)
+    put(encrypted, 12, 6)
+    put(encrypted, 13, 5)
+    put(encrypted, 14, 4)
+    put(encrypted, 15, 3)
+    put(encrypted, 16, 2)
+    put(encrypted, 17, 1)
+    put(encrypted, 18, 4)
+    put(encrypted, 19, 1)
+    put(encrypted, 20, 2)
+    put(encrypted, 21, 3)
+    put(encrypted, 22, 4)
+    put(encrypted, 23, 0x53)
+    put(encrypted, 24, rawbytes.BytesGet(cipher, 0))
+    put(encrypted, 25, rawbytes.BytesGet(cipher, 1))
+    put(encrypted, 26, rawbytes.BytesGet(cipher, 2))
+    let decodedRes: Result[bytes.ByteBuffer] = blte.DecodeSingleBlockWithKeys(encrypted, table)
+    assert(IsOk(decodedRes), Error(decodedRes))
+    let decoded: bytes.ByteBuffer = Value(decodedRes)
+    assert(decoded.len == 2, "wow_export_tact_keys decoded len")
+    assert(bytes.BufByteAt(decoded, 0) == int32('k'), "wow_export_tact_keys decoded k")
+    assert(bytes.BufByteAt(decoded, 1) == int32('y'), "wow_export_tact_keys decoded y")
+    echo("wow_export_tact_keys_smoke ok")
+    return 0

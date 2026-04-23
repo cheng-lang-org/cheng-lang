@@ -1,0 +1,237 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import std/strformat
+import cheng/apps/wow_export/binary as binary
+import cheng/apps/wow_export/casc_archive as casc_archive
+import cheng/apps/wow_export/casc_index as casc_index
+
+type
+    EncodingHeader =
+        version: int32
+        contentKeySize: int32
+        encodingKeySize: int32
+        contentPageSizeKB: int32
+        encodingPageSizeKB: int32
+        contentPageCount: int32
+        encodingPageCount: int32
+        specBlockSize: int32
+
+    EncodingEntry =
+        contentSize: int32
+        contentKey: str
+        encodingKey: str
+        encodingKeyCount: int32
+
+    EncodingSummary =
+        header: EncodingHeader
+        first: EncodingEntry
+
+    EncodingLookupResult =
+        contentKey: str
+        encodingKey: str
+        contentSize: int32
+        encodingKeyCount: int32
+
+const
+    encodingHeaderSize = 22
+    encodingPageHeaderSize = 32
+
+fn encodingU16LEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 2 > buf.len:
+        return Err[int32]("wowExport encoding: truncated u16le")
+    return Ok[int32](bytes.BufByteAt(buf, idx) + (bytes.BufByteAt(buf, idx + 1) << 8))
+
+fn encodingU16BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 2 > buf.len:
+        return Err[int32]("wowExport encoding: truncated u16be")
+    return Ok[int32]((bytes.BufByteAt(buf, idx) << 8) + bytes.BufByteAt(buf, idx + 1))
+
+fn encodingU32BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport encoding: truncated u32be")
+    let b0: int32 = bytes.BufByteAt(buf, idx)
+    let b1: int32 = bytes.BufByteAt(buf, idx + 1)
+    let b2: int32 = bytes.BufByteAt(buf, idx + 2)
+    let b3: int32 = bytes.BufByteAt(buf, idx + 3)
+    return Ok[int32]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
+
+fn WowEncodingParseHeader(buf: bytes.ByteBuffer): Result[EncodingHeader] =
+    if buf.len < encodingHeaderSize:
+        return Err[EncodingHeader]("wowExport encoding: header too small")
+    if bytes.BufByteAt(buf, 0) != int32('E') || bytes.BufByteAt(buf, 1) != int32('N'):
+        return Err[EncodingHeader]("wowExport encoding: invalid magic")
+    let cPageSizeRes: Result[int32] = encodingU16BEAt(buf, 5)
+    let ePageSizeRes: Result[int32] = encodingU16BEAt(buf, 7)
+    let cPageCountRes: Result[int32] = encodingU32BEAt(buf, 9)
+    let ePageCountRes: Result[int32] = encodingU32BEAt(buf, 13)
+    let specBlockSizeRes: Result[int32] = encodingU32BEAt(buf, 18)
+    if IsErr(cPageSizeRes): return Err[EncodingHeader](Error(cPageSizeRes))
+    if IsErr(ePageSizeRes): return Err[EncodingHeader](Error(ePageSizeRes))
+    if IsErr(cPageCountRes): return Err[EncodingHeader](Error(cPageCountRes))
+    if IsErr(ePageCountRes): return Err[EncodingHeader](Error(ePageCountRes))
+    if IsErr(specBlockSizeRes): return Err[EncodingHeader](Error(specBlockSizeRes))
+    var out: EncodingHeader
+    out.version = bytes.BufByteAt(buf, 2)
+    out.contentKeySize = bytes.BufByteAt(buf, 3)
+    out.encodingKeySize = bytes.BufByteAt(buf, 4)
+    out.contentPageSizeKB = Value(cPageSizeRes)
+    out.encodingPageSizeKB = Value(ePageSizeRes)
+    out.contentPageCount = Value(cPageCountRes)
+    out.encodingPageCount = Value(ePageCountRes)
+    out.specBlockSize = Value(specBlockSizeRes)
+    if out.version <= 0:
+        return Err[EncodingHeader]("wowExport encoding: invalid version")
+    if out.contentKeySize != 16 || out.encodingKeySize != 16:
+        return Err[EncodingHeader]("wowExport encoding: unsupported key size")
+    if out.contentPageCount <= 0 || out.encodingPageCount <= 0:
+        return Err[EncodingHeader]("wowExport encoding: empty page table")
+    if out.contentPageSizeKB <= 0 || out.encodingPageSizeKB <= 0:
+        return Err[EncodingHeader]("wowExport encoding: invalid page size")
+    if out.specBlockSize < 0:
+        return Err[EncodingHeader]("wowExport encoding: invalid spec block size")
+    let minNeed: int32 = encodingHeaderSize + out.specBlockSize +
+        out.contentPageCount * encodingPageHeaderSize
+    if minNeed > buf.len:
+        return Err[EncodingHeader]("wowExport encoding: truncated page table")
+    return Ok[EncodingHeader](out)
+
+fn encodingContentPageHeadersOffset(header: EncodingHeader): int32 =
+    return encodingHeaderSize + header.specBlockSize
+
+fn encodingContentPagesOffset(header: EncodingHeader): int32 =
+    return encodingContentPageHeadersOffset(header) + header.contentPageCount * encodingPageHeaderSize
+
+fn encodingContentPageSizeBytes(header: EncodingHeader): int32 =
+    return header.contentPageSizeKB * 1024
+
+fn encodingEntrySize(keyCount: int32): int32 =
+    return 2 + 4 + 16 + keyCount * 16
+
+fn encodingParseEntryAt(buf: bytes.ByteBuffer, pos: int32, pageEnd: int32): Result[EncodingEntry] =
+    let countRes: Result[int32] = encodingU16LEAt(buf, pos)
+    if IsErr(countRes):
+        return Err[EncodingEntry](Error(countRes))
+    let keyCount: int32 = Value(countRes)
+    if keyCount <= 0:
+        return Err[EncodingEntry]("wowExport encoding: end of content page")
+    let sizeNeed: int32 = encodingEntrySize(keyCount)
+    if pos + sizeNeed > pageEnd:
+        return Err[EncodingEntry]("wowExport encoding: truncated content entry")
+    let contentSizeRes: Result[int32] = encodingU32BEAt(buf, pos + 2)
+    if IsErr(contentSizeRes):
+        return Err[EncodingEntry](Error(contentSizeRes))
+    let contentKeyRes: Result[str] = binary.HexSlice(buf, pos + 6, 16)
+    if IsErr(contentKeyRes):
+        return Err[EncodingEntry](Error(contentKeyRes))
+    let encodingKeyRes: Result[str] = binary.HexSlice(buf, pos + 22, 16)
+    if IsErr(encodingKeyRes):
+        return Err[EncodingEntry](Error(encodingKeyRes))
+    var out: EncodingEntry
+    out.contentSize = Value(contentSizeRes)
+    out.contentKey = Value(contentKeyRes)
+    out.encodingKey = Value(encodingKeyRes)
+    out.encodingKeyCount = keyCount
+    return Ok[EncodingEntry](out)
+
+fn encodingPageBounds(buf: bytes.ByteBuffer,
+                      header: EncodingHeader,
+                      pageIndex: int32,
+                      pageStart: var int32,
+                      pageEnd: var int32): Result[bool] =
+    if pageIndex < 0 || pageIndex >= header.contentPageCount:
+        return Err[bool]("wowExport encoding: page index out of bounds")
+    let pageSize: int32 = encodingContentPageSizeBytes(header)
+    pageStart = encodingContentPagesOffset(header) + pageIndex * pageSize
+    pageEnd = pageStart + pageSize
+    if pageStart < 0 || pageEnd > buf.len:
+        return Err[bool]("wowExport encoding: truncated content page")
+    return Ok[bool](true)
+
+fn WowEncodingFirstEntry(buf: bytes.ByteBuffer): Result[EncodingEntry] =
+    let headerRes: Result[EncodingHeader] = WowEncodingParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[EncodingEntry](Error(headerRes))
+    let header: EncodingHeader = Value(headerRes)
+    var pageStart: int32
+    var pageEnd: int32
+    let boundsRes: Result[bool] = encodingPageBounds(buf, header, 0, pageStart, pageEnd)
+    if IsErr(boundsRes):
+        return Err[EncodingEntry](Error(boundsRes))
+    return encodingParseEntryAt(buf, pageStart, pageEnd)
+
+fn WowEncodingFindEntry(buf: bytes.ByteBuffer, contentKey: str): Result[EncodingEntry] =
+    if strings.Len(contentKey) != 32:
+        return Err[EncodingEntry]("wowExport encoding: content key must be 16-byte hex")
+    let headerRes: Result[EncodingHeader] = WowEncodingParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[EncodingEntry](Error(headerRes))
+    let header: EncodingHeader = Value(headerRes)
+    var pageIndex: int32
+    while pageIndex < header.contentPageCount:
+        var pageStart: int32
+        var pageEnd: int32
+        let boundsRes: Result[bool] = encodingPageBounds(buf, header, pageIndex, pageStart, pageEnd)
+        if IsErr(boundsRes):
+            return Err[EncodingEntry](Error(boundsRes))
+        var pos: int32 = pageStart
+        while pos + 2 <= pageEnd:
+            let keyCountRes: Result[int32] = encodingU16LEAt(buf, pos)
+            if IsErr(keyCountRes):
+                return Err[EncodingEntry](Error(keyCountRes))
+            let keyCount: int32 = Value(keyCountRes)
+            if keyCount == 0:
+                break
+            let sizeNeed: int32 = encodingEntrySize(keyCount)
+            if pos + sizeNeed > pageEnd:
+                return Err[EncodingEntry]("wowExport encoding: truncated content page entry")
+            if binary.ByteSliceMatchesHex(buf, pos + 6, contentKey):
+                return encodingParseEntryAt(buf, pos, pageEnd)
+            pos = pos + sizeNeed
+        pageIndex = pageIndex + 1
+    return Err[EncodingEntry]("wowExport encoding: content key not found " + contentKey)
+
+fn WowEncodingFindEncodingKey(buf: bytes.ByteBuffer, contentKey: str): Result[str] =
+    let entryRes: Result[EncodingEntry] = WowEncodingFindEntry(buf, contentKey)
+    if IsErr(entryRes):
+        return Err[str](Error(entryRes))
+    return Ok[str](Value(entryRes).encodingKey)
+
+fn WowEncodingSummary(buf: bytes.ByteBuffer): Result[EncodingSummary] =
+    let headerRes: Result[EncodingHeader] = WowEncodingParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[EncodingSummary](Error(headerRes))
+    let firstRes: Result[EncodingEntry] = WowEncodingFirstEntry(buf)
+    if IsErr(firstRes):
+        return Err[EncodingSummary](Error(firstRes))
+    var out: EncodingSummary
+    out.header = Value(headerRes)
+    out.first = Value(firstRes)
+    return Ok[EncodingSummary](out)
+
+fn WowEncodingHeaderText(header: EncodingHeader): str =
+    return Fmt"encodingVersion={strings.IntToStr(header.version)} cKeySize={strings.IntToStr(header.contentKeySize)} eKeySize={strings.IntToStr(header.encodingKeySize)} cPages={strings.IntToStr(header.contentPageCount)} ePages={strings.IntToStr(header.encodingPageCount)} spec={strings.IntToStr(header.specBlockSize)}"
+
+fn WowEncodingSummaryText(summary: EncodingSummary): str =
+    return Fmt"{WowEncodingHeaderText(summary.header)} firstCKey={summary.first.contentKey} firstEKey={summary.first.encodingKey} firstSize={strings.IntToStr(summary.first.contentSize)} eKeys={strings.IntToStr(summary.first.encodingKeyCount)}"
+
+fn WowEncodingLookupContentKey(clientPath: str,
+                               entry: casc_index.CascIndexEntry,
+                               contentKey: str): Result[EncodingLookupResult] =
+    let encodingBufRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFull(clientPath, entry)
+    if IsErr(encodingBufRes):
+        return Err[EncodingLookupResult](Error(encodingBufRes))
+    let entryRes: Result[EncodingEntry] = WowEncodingFindEntry(Value(encodingBufRes), contentKey)
+    if IsErr(entryRes):
+        return Err[EncodingLookupResult](Error(entryRes))
+    let found: EncodingEntry = Value(entryRes)
+    var out: EncodingLookupResult
+    out.contentKey = found.contentKey
+    out.encodingKey = found.encodingKey
+    out.contentSize = found.contentSize
+    out.encodingKeyCount = found.encodingKeyCount
+    return Ok[EncodingLookupResult](out)
+
+fn EncodingLookupText(result: EncodingLookupResult): str =
+    return Fmt"contentKey={result.contentKey} encodingKey={result.encodingKey} contentSize={strings.IntToStr(result.contentSize)} eKeys={strings.IntToStr(result.encodingKeyCount)}"

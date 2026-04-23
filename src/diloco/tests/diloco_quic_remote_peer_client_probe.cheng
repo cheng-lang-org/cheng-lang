@@ -1,0 +1,55 @@
+import std/cmdline as cmdline
+import cheng/std/bytes_layout as layout
+import cheng/DiLoCo/host/diloco_client
+import cheng/DiLoCo/protocol/wire
+import cheng/DiLoCo/tests/support
+
+fn joinPeer(port: int32,
+            jobBundleCid: layout.FixedBytes32,
+            seed: str,
+            expectedFixedCount: int32): int32 =
+    var joinReq = wire.DiLoCoJoinCohortRequest()
+    joinReq.jobBundleCid = jobBundleCid
+    joinReq.peerId = support.DiLoCoTestPeer(seed)
+    let joinRes = diloco_client.DiLoCoJoinCohortRequestNamed("127.0.0.1",
+                                                             port,
+                                                             "localhost",
+                                                             joinReq)
+    if !joinRes.ok:
+        echo("join failed seed=" + seed + " err=" + Error(joinRes))
+        return 1
+    if Value(joinRes).cohort.fixedMemberCount != expectedFixedCount:
+        echo("join fixed count mismatch seed=" + seed)
+        return 1
+    echo("join ok seed=" + seed)
+    return 0
+
+fn fetchLease(port: int32,
+              jobBundleCid: layout.FixedBytes32,
+              seed: str): int32 =
+    var leaseReq = wire.DiLoCoFetchLeaseRequest()
+    leaseReq.jobBundleCid = jobBundleCid
+    leaseReq.peerId = support.DiLoCoTestPeer(seed)
+    let leaseRes = diloco_client.DiLoCoFetchLeaseRequestNamed("127.0.0.1",
+                                                              port,
+                                                              "localhost",
+                                                              leaseReq)
+    if !leaseRes.ok:
+        echo("lease failed seed=" + seed + " err=" + Error(leaseRes))
+        return 1
+    echo("lease ok seed=" + seed + " outer_step=" + intToStr(Value(leaseRes).lease.outerStep))
+    return 0
+
+fn main(): int32 =
+    let port = cmdline.ReadInt32FlagOrDefault("--port", -1)
+    assert(port > 0, " diloco quic remote peer: client port")
+    let mode = cmdline.ReadFlagOrDefault("--mode", "")
+    let seed = cmdline.ReadFlagOrDefault("--seed", "")
+    let expectedFixedCount = cmdline.ReadInt32FlagOrDefault("--expected-fixed-count", 0)
+    let jobBundleCid = support.DiLoCoTestJobBundleCid("quic-remote-two")
+    if mode == "join":
+        return joinPeer(port, jobBundleCid, seed, expectedFixedCount)
+    if mode == "fetch":
+        return fetchLease(port, jobBundleCid, seed)
+    echo("unknown mode")
+    return 2

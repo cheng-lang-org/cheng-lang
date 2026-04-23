@@ -2,7 +2,6 @@ import std/bytes as bytes
 import std/result
 import std/strings as strings
 import std/strformat
-import cheng/apps/wow_export/binary as binary
 
 type
     FormatHeader =
@@ -10,46 +9,81 @@ type
         versionOrSize: int32
         chunkCount: int32
 
-fn ParseM2Header(buf: bytes.ByteBuffer): Result[FormatHeader] =
+    M2Header =
+        version: int32
+        sequenceCount: int32
+        boneCount: int32
+        vertexCount: int32
+        skinProfileCount: int32
+        textureCount: int32
+
+const
+    m2InnerHeaderOffset = 8
+    m2SequenceCountOffset = 0x1c
+    m2BoneCountOffset = 0x2c
+    m2VertexCountOffset = 0x3c
+    m2SkinProfileCountOffset = 0x44
+    m2TextureCountOffset = 0x50
+    m2ClassicHeaderBytes = 0x54
+
+fn m2HasMagic(buf: bytes.ByteBuffer,
+              start: int32,
+              b0: int32,
+              b1: int32,
+              b2: int32,
+              b3: int32): bool =
+    if start < 0 || start + 4 > buf.len:
+        return false
+    return bytes.BufByteAt(buf, start) == b0 &&
+        bytes.BufByteAt(buf, start + 1) == b1 &&
+        bytes.BufByteAt(buf, start + 2) == b2 &&
+        bytes.BufByteAt(buf, start + 3) == b3
+
+fn parseClassicM2Header(buf: bytes.ByteBuffer, start: int32): Result[M2Header] =
+    if start < 0 || start + m2ClassicHeaderBytes > buf.len:
+        return Err[M2Header]("wowExport M2: classic header too small")
+    if !m2HasMagic(buf, start, int32('M'), int32('D'), int32('2'), int32('0')):
+        return Err[M2Header]("wowExport M2: missing MD20 header")
+    var out: M2Header
+    out.version = bytes.ReadU32LEAt(buf, start + 4)
+    out.sequenceCount = bytes.ReadU32LEAt(buf, start + m2SequenceCountOffset)
+    out.boneCount = bytes.ReadU32LEAt(buf, start + m2BoneCountOffset)
+    out.vertexCount = bytes.ReadU32LEAt(buf, start + m2VertexCountOffset)
+    out.skinProfileCount = bytes.ReadU32LEAt(buf, start + m2SkinProfileCountOffset)
+    out.textureCount = bytes.ReadU32LEAt(buf, start + m2TextureCountOffset)
+    return Ok[M2Header](out)
+
+fn ParseM2Header(buf: bytes.ByteBuffer): Result[M2Header] =
     if buf.len < 8:
-        return Err[FormatHeader]("wowExport M2: header too small")
-    var r: binary.BinaryReader = binary.ReaderFromBytes(buf)
-    let magicRes: Result[str] = binary.ReadFourCC(r)
-    if IsErr(magicRes):
-        return Err[FormatHeader](Error(magicRes))
-    let versionRes: Result[int32] = binary.ReadU32LE(r)
-    if IsErr(versionRes):
-        return Err[FormatHeader](Error(versionRes))
-    let magic: str = Value(magicRes)
-    if magic != "MD20":
-        return Err[FormatHeader](Fmt"wowExport M2: invalid magic {magic}")
-    var out: FormatHeader
-    out.magic = magic
-    out.versionOrSize = Value(versionRes)
-    out.chunkCount = 0
-    return Ok[FormatHeader](out)
+        return Err[M2Header]("wowExport M2: header too small")
+    if m2HasMagic(buf, 0, int32('M'), int32('D'), int32('2'), int32('0')):
+        return parseClassicM2Header(buf, 0)
+    if m2HasMagic(buf, 0, int32('M'), int32('D'), int32('2'), int32('1')):
+        return parseClassicM2Header(buf, m2InnerHeaderOffset)
+    return Err[M2Header]("wowExport M2: invalid magic")
 
 fn ParseChunkedHeader(buf: bytes.ByteBuffer, label: str): Result[FormatHeader] =
     if buf.len < 8:
-        return Err[FormatHeader](Fmt"wowExport {label}: header too small")
+        return Err[FormatHeader]("wowExport " + label + ": header too small")
     var pos: int32
     var firstMagic: str
     var firstSize: int32
     var count: int32
     while pos < buf.len:
         if pos + 8 > buf.len:
-            return Err[FormatHeader](Fmt"wowExport {label}: truncated chunk header")
-        let magicRes: Result[str] = binary.HexSlice(buf, pos, 4)
-        if IsErr(magicRes):
-            return Err[FormatHeader](Error(magicRes))
+            return Err[FormatHeader]("wowExport " + label + ": truncated chunk header")
         let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
         if size < 0:
-            return Err[FormatHeader](Fmt"wowExport {label}: negative chunk size")
+            return Err[FormatHeader]("wowExport " + label + ": negative chunk size")
         if pos == 0:
-            firstMagic = Value(magicRes)
+            firstMagic =
+                strings.CharToStr(char(bytes.BufByteAt(buf, pos))) +
+                strings.CharToStr(char(bytes.BufByteAt(buf, pos + 1))) +
+                strings.CharToStr(char(bytes.BufByteAt(buf, pos + 2))) +
+                strings.CharToStr(char(bytes.BufByteAt(buf, pos + 3)))
             firstSize = size
         if pos + 8 + size > buf.len:
-            return Err[FormatHeader](Fmt"wowExport {label}: chunk extends past buffer")
+            return Err[FormatHeader]("wowExport " + label + ": chunk extends past buffer")
         count = count + 1
         pos = pos + 8 + size
     var out: FormatHeader
@@ -60,3 +94,6 @@ fn ParseChunkedHeader(buf: bytes.ByteBuffer, label: str): Result[FormatHeader] =
 
 fn FormatHeaderText(header: FormatHeader): str =
     return Fmt"magic={header.magic} value={strings.IntToStr(header.versionOrSize)} chunks={strings.IntToStr(header.chunkCount)}"
+
+fn M2HeaderText(header: M2Header): str =
+    return Fmt"version={strings.IntToStr(header.version)} sequences={strings.IntToStr(header.sequenceCount)} bones={strings.IntToStr(header.boneCount)} vertices={strings.IntToStr(header.vertexCount)} skins={strings.IntToStr(header.skinProfileCount)} textures={strings.IntToStr(header.textureCount)}"

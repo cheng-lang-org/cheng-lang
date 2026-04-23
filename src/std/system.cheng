@@ -56,20 +56,16 @@ fn strEmpty(): str =
     return out
 
 fn strDataPtr(s: str): ptr =
-    let compatRaw: cstring = cheng_str_param_to_cstring_compat(s)
-    let compatPtr: ptr = ptr(compatRaw)
-    if compatPtr != nil:
-        return ptr(compatRaw)
+    if s.data == nil:
+        return nil
+    if s.len <= 0:
+        return nil
     return s.data
 
 fn strLenFast(s: str): int32 =
-    let compatRaw: cstring = cheng_str_param_to_cstring_compat(s)
-    let compatPtr: ptr = ptr(compatRaw)
-    if compatPtr != nil:
-        return c_strlen(compatRaw)
-    if s.len <= 0:
-        return 0
     if s.data == nil:
+        return 0
+    if s.len <= 0:
         return 0
     return s.len
 
@@ -107,16 +103,12 @@ importc fn cheng_dump_backtrace_if_enabled()
 importc fn driver_c_new_string(size: int32): cstring
 importc fn driver_c_new_string_copy_n(raw: ptr, count: int32): cstring
 fn panicCString(msg: str): cstring =
-    let compatRaw: cstring = cheng_str_param_to_cstring_compat(msg)
-    let compatPtr: ptr = ptr(compatRaw)
-    if compatPtr != nil:
-        return compatRaw
     if strLenFast(msg) == 0:
         return driver_c_new_string(0)
     let dataPtr0: ptr = strDataPtr(msg)
     if dataPtr0 == nil:
         return driver_c_new_string(0)
-    if bitandCompat(msg.flags, chengStrFlagOwned) != 0:
+    if msg.flags == chengStrFlagOwned:
         return cstring(dataPtr0)
     return driver_c_new_string_copy_n(dataPtr0, strLenFast(msg))
 fn panic(msg: ptr) =
@@ -225,10 +217,6 @@ fn heapAllocLegacy(size: int32): ptr
 fn heapFreeLegacy(p: ptr)
 @importc("cheng_cstrlen")
 fn c_strlen(s: cstring): int32
-@importc("cheng_str_param_to_cstring_compat")
-fn cheng_str_param_to_cstring_compat_raw(var sRaw: str): cstring
-@importc("cheng_str_to_cstring_temp_bridge")
-fn cheng_str_to_cstring_temp_bridge_raw(var sRaw: str): cstring
 @importc("cheng_seq_string_elem_bytes_compat")
 fn cheng_seq_string_elem_bytes_compat_system(): int32
 importc fn cheng_ptr_size(): int32
@@ -439,20 +427,21 @@ fn chr(x: int32): char =
     return chrCompat(x)
 fn ord(c: char): int32 =
     return ordCompat(c)
-@importc("driver_c_bool_to_str")
-fn system_boolToCString(x: bool): cstring
-@importc("driver_c_char_to_str")
-fn system_charToCString(x: char): cstring
 @importc("driver_c_bool_identity")
 fn defined(x: bool): bool
 fn systemToStringStr(x: str): str =
     return newStringCopy(strDataPtr(x), strLenFast(x))
 
 fn boolToString(x: bool): str =
-    return strFromCStringBorrow(system_boolToCString(x))
+    if x:
+        return "true"
+    return "false"
 
 fn charToString(x: char): str =
-    return strFromCStringBorrow(system_charToCString(x))
+    let out: str = newStringAlloc(1)
+    if out.data != nil && out.len == 1:
+        rawmemWriteI8Compat(out.data, 0, int8(int32(x)))
+    return out
 fn ParseF64Bits(text: str): int64 =
     return parseF64BitsRaw(strToCStringTemp(text))
 fn BitsToF64(bits: int64): float64 =
@@ -601,10 +590,15 @@ fn strFromCStringCopy(raw: cstring): str =
     return out
 
 fn cheng_str_param_to_cstring_compat(s: str): cstring =
-    return cheng_str_param_to_cstring_compat_raw(s)
+    let n: int32 = strLenFast(s)
+    if n <= 0:
+        return driver_c_new_string(0)
+    if s.flags == chengStrFlagOwned:
+        return cstring(s.data)
+    return driver_c_new_string_copy_n(s.data, n)
 
 fn strToCStringTemp(s: str): cstring =
-    return cheng_str_to_cstring_temp_bridge_raw(s)
+    return cheng_str_param_to_cstring_compat(s)
 fn strToCStringTemp(s: ptr): cstring =
     if s == nil:
         return driver_c_new_string(0)

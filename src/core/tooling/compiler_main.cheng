@@ -1236,12 +1236,18 @@ fn CompilerForwardBootstrapBridge(rootDir: str,
     let bridgeReportPath = CompilerBridgeTempReportPath(req, "bootstrap_bridge")
     if len(bridgeReportPath) > 0 && os.FileExists(bridgeReportPath):
         let _ = os.RemoveFile(bridgeReportPath)
-    let bridgeArgsRes = CompilerArgsWithBrowserBridgeObject(CompilerArgsWithReportOut(args, bridgeReportPath),
-                                                              browserBridgeObjectPath)
-    if IsErr(bridgeArgsRes):
-        CompilerPrintErr(Error(bridgeArgsRes))
+    let baseBridgeArgsRes = CompilerArgsWithBrowserBridgeObject(CompilerArgsWithReportOut(args, bridgeReportPath),
+                                                                  browserBridgeObjectPath)
+    if IsErr(baseBridgeArgsRes):
+        CompilerPrintErr(Error(baseBridgeArgsRes))
         return 2
-    let bridgeArgs = Value(bridgeArgsRes)
+    var bridgeArgs = Value(baseBridgeArgsRes)
+    if cmd == "system-link-exec" && CompilerBridgeRequestNeedsSurfaceRewrite(rootDir, req):
+        let stagedReqRes = CompilerBridgeSurfaceStageRequest(rootDir, req)
+        if IsErr(stagedReqRes):
+            CompilerPrintErr(Error(stagedReqRes))
+            return 2
+        bridgeArgs = CompilerArgsWithBridgeStagedRequest(bridgeArgs, Value(stagedReqRes))
     let rc = CompilerForwardToBridge(rootDir, bridgeCompiler, cmd, bridgeArgs)
     if rc != 0:
         return rc
@@ -5909,6 +5915,488 @@ fn CompilerStageRequestForWorldPlan(rootDir: str,
 
 fn CompilerWorldBundleSourceStageRoot(bundlePrefix: str): str =
     return bundlePrefix + ".source"
+
+fn CompilerBridgeSurfaceStageRoot(): str =
+    return "artifacts/backend_driver/bridge_surface_source"
+
+fn CompilerBridgeIsIdentChar(ch: char): bool =
+    let digit = ch >= '0' && ch <= '9'
+    let upper = ch >= 'A' && ch <= 'Z'
+    let lower = ch >= 'a' && ch <= 'z'
+    return digit || upper || lower || ch == '_'
+
+fn CompilerBridgeIsInlineSpace(ch: char): bool =
+    return ch == ' ' || ch == '\t'
+
+fn CompilerBridgeSkipInlineSpaces(text: str,
+                                    startRaw: int32): int32 =
+    var start = startRaw
+    if start < 0:
+        start = 0
+    while start < text.len:
+        if !CompilerBridgeIsInlineSpace(text[start]):
+            break
+        start = start + 1
+    return start
+
+fn CompilerBridgeQuoteIsEscaped(text: str,
+                                  pos: int32): bool =
+    if pos <= 0 || pos > text.len:
+        return false
+    var slashCount: int32
+    var i = pos - 1
+    while i >= 0:
+        if text[i] != '\\':
+            break
+        slashCount = slashCount + 1
+        i = i - 1
+    return (slashCount % 2) != 0
+
+fn CompilerBridgeFindMatchingParen(text: str,
+                                     openPos: int32): int32 =
+    if openPos < 0 || openPos >= text.len || text[openPos] != '(':
+        return -1
+    var depth: int32 = 1
+    var inString = false
+    var inChar = false
+    var i = openPos + 1
+    while i < text.len:
+        let ch = text[i]
+        if !inChar && ch == '"' && !CompilerBridgeQuoteIsEscaped(text, i):
+            inString = !inString
+            i = i + 1
+            continue
+        if !inString && ch == '\'' && !CompilerBridgeQuoteIsEscaped(text, i):
+            inChar = !inChar
+            i = i + 1
+            continue
+        if inString || inChar:
+            i = i + 1
+            continue
+        if ch == '(':
+            depth = depth + 1
+        elif ch == ')':
+            depth = depth - 1
+            if depth == 0:
+                return i
+        i = i + 1
+    return -1
+
+fn CompilerBridgeAppendFmtPiece(out: var str,
+                                  pieceCount: var int32,
+                                  piece: str) =
+    if pieceCount > 0:
+        out = out + ", "
+    out = out + piece
+    pieceCount = pieceCount + 1
+
+fn CompilerBridgeFmtQuotedPiece(raw: str): str =
+    return "\"" + raw + "\""
+
+fn CompilerBridgeRewriteSimplePrefixStringify(lineRaw: str,
+                                                dollarPos: int32,
+                                                rewrittenOut: var str,
+                                                stopExclusiveOut: var int32): bool =
+    rewrittenOut = ""
+    stopExclusiveOut = dollarPos
+    if dollarPos < 0 || dollarPos >= lineRaw.len || lineRaw[dollarPos] != '$':
+        return false
+    if dollarPos + 1 >= lineRaw.len:
+        return false
+    let first = lineRaw[dollarPos + 1]
+    if first == '(' || !CompilerBridgeIsIdentChar(first):
+        return false
+    var stop = dollarPos + 1
+    while stop < lineRaw.len:
+        let ch = lineRaw[stop]
+        if CompilerBridgeIsIdentChar(ch) || ch == '.':
+            stop = stop + 1
+            continue
+        break
+    let operand = strings.SliceBytes(lineRaw, dollarPos + 1, stop - dollarPos - 1)
+    if len(strutil.Strip(operand)) <= 0:
+        return false
+    rewrittenOut = "`$`(" + operand + ")"
+    stopExclusiveOut = stop
+    return true
+
+fn CompilerBridgeRewriteParenStringify(lineRaw: str,
+                                         dollarPos: int32,
+                                         rewrittenOut: var str,
+                                         stopExclusiveOut: var int32): bool =
+    rewrittenOut = ""
+    stopExclusiveOut = dollarPos
+    if dollarPos < 0 || dollarPos + 1 >= lineRaw.len:
+        return false
+    if lineRaw[dollarPos] != '$' || lineRaw[dollarPos + 1] != '(':
+        return false
+    let closePos = CompilerBridgeFindMatchingParen(lineRaw, dollarPos + 1)
+    if closePos <= dollarPos + 1:
+        return false
+    let inner = strings.SliceBytes(lineRaw, dollarPos + 2, closePos - dollarPos - 2)
+    rewrittenOut = "`$`(" + inner + ")"
+    stopExclusiveOut = closePos + 1
+    return true
+
+fn CompilerBridgeRewriteFmtLiteral(lineRaw: str,
+                                     fmtPos: int32,
+                                     rewrittenOut: var str,
+                                     stopExclusiveOut: var int32): bool =
+    rewrittenOut = ""
+    stopExclusiveOut = fmtPos
+    if fmtPos < 0 || fmtPos + 3 > lineRaw.len:
+        return false
+    if strings.SliceBytes(lineRaw, fmtPos, 3) != "Fmt":
+        return false
+    if fmtPos > 0 && CompilerBridgeIsIdentChar(lineRaw[fmtPos - 1]):
+        return false
+    if fmtPos + 3 < lineRaw.len && CompilerBridgeIsIdentChar(lineRaw[fmtPos + 3]):
+        return false
+    let quotePos = CompilerBridgeSkipInlineSpaces(lineRaw, fmtPos + 3)
+    if quotePos >= lineRaw.len || lineRaw[quotePos] != '"':
+        return false
+    var closePos = quotePos + 1
+    while closePos < lineRaw.len:
+        if lineRaw[closePos] == '"' && !CompilerBridgeQuoteIsEscaped(lineRaw, closePos):
+            break
+        closePos = closePos + 1
+    if closePos >= lineRaw.len:
+        return false
+    let literalRaw = strings.SliceBytes(lineRaw, quotePos + 1, closePos - quotePos - 1)
+    var fmtOut = "Fmt(["
+    var pieceCount: int32
+    var currentLiteral = ""
+    var i: int32
+    while i < literalRaw.len:
+        let ch = literalRaw[i]
+        if ch == '{':
+            if i + 1 < literalRaw.len && literalRaw[i + 1] == '{':
+                currentLiteral = currentLiteral + "{"
+                i = i + 2
+                continue
+            if len(currentLiteral) > 0:
+                CompilerBridgeAppendFmtPiece(fmtOut,
+                                               pieceCount,
+                                               CompilerBridgeFmtQuotedPiece(currentLiteral))
+                currentLiteral = ""
+            var exprStart = i + 1
+            var exprEnd = -1
+            var inExprString = false
+            var inExprChar = false
+            var parenDepth: int32
+            var bracketDepth: int32
+            var braceDepth: int32
+            var cursor = exprStart
+            while cursor < literalRaw.len:
+                let exprCh = literalRaw[cursor]
+                if !inExprChar && exprCh == '"' && !CompilerBridgeQuoteIsEscaped(literalRaw, cursor):
+                    inExprString = !inExprString
+                    cursor = cursor + 1
+                    continue
+                if !inExprString && exprCh == '\'' && !CompilerBridgeQuoteIsEscaped(literalRaw, cursor):
+                    inExprChar = !inExprChar
+                    cursor = cursor + 1
+                    continue
+                if inExprString || inExprChar:
+                    cursor = cursor + 1
+                    continue
+                if exprCh == '(':
+                    parenDepth = parenDepth + 1
+                    cursor = cursor + 1
+                    continue
+                if exprCh == ')':
+                    if parenDepth > 0:
+                        parenDepth = parenDepth - 1
+                    cursor = cursor + 1
+                    continue
+                if exprCh == '[':
+                    bracketDepth = bracketDepth + 1
+                    cursor = cursor + 1
+                    continue
+                if exprCh == ']':
+                    if bracketDepth > 0:
+                        bracketDepth = bracketDepth - 1
+                    cursor = cursor + 1
+                    continue
+                if exprCh == '{':
+                    braceDepth = braceDepth + 1
+                    cursor = cursor + 1
+                    continue
+                if exprCh == '}':
+                    if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0:
+                        exprEnd = cursor
+                        break
+                    braceDepth = braceDepth - 1
+                    cursor = cursor + 1
+                    continue
+                cursor = cursor + 1
+            if exprEnd < exprStart:
+                return false
+            let exprText = strutil.Strip(strings.SliceBytes(literalRaw, exprStart, exprEnd - exprStart))
+            if len(exprText) <= 0:
+                return false
+            CompilerBridgeAppendFmtPiece(fmtOut,
+                                           pieceCount,
+                                           "`$`(" + exprText + ")")
+            i = exprEnd + 1
+            continue
+        if ch == '}':
+            if i + 1 < literalRaw.len && literalRaw[i + 1] == '}':
+                currentLiteral = currentLiteral + "}"
+                i = i + 2
+                continue
+            return false
+        currentLiteral = currentLiteral + strings.CharToStr(ch)
+        i = i + 1
+    if len(currentLiteral) > 0 || pieceCount == 0:
+        CompilerBridgeAppendFmtPiece(fmtOut,
+                                       pieceCount,
+                                       CompilerBridgeFmtQuotedPiece(currentLiteral))
+    fmtOut = fmtOut + "])"
+    rewrittenOut = fmtOut
+    stopExclusiveOut = closePos + 1
+    return true
+
+fn CompilerBridgeRewriteLine(lineRaw: str): str =
+    var out = ""
+    var i: int32
+    var inString = false
+    var inChar = false
+    while i < lineRaw.len:
+        let ch = lineRaw[i]
+        if !inString && !inChar:
+            if ch == '#':
+                out = out + strings.SliceBytes(lineRaw, i, lineRaw.len - i)
+                break
+            if ch == '`':
+                var closePos = i + 1
+                while closePos < lineRaw.len:
+                    if lineRaw[closePos] == '`':
+                        closePos = closePos + 1
+                        break
+                    closePos = closePos + 1
+                out = out + strings.SliceBytes(lineRaw, i, closePos - i)
+                i = closePos
+                continue
+            if ch == 'F':
+                var rewrittenFmt = ""
+                var fmtStop = i
+                if CompilerBridgeRewriteFmtLiteral(lineRaw, i, rewrittenFmt, fmtStop):
+                    out = out + rewrittenFmt
+                    i = fmtStop
+                    continue
+            if ch == '$':
+                var rewrittenStringify = ""
+                var stringifyStop = i
+                if CompilerBridgeRewriteParenStringify(lineRaw,
+                                                         i,
+                                                         rewrittenStringify,
+                                                         stringifyStop) ||
+                   CompilerBridgeRewriteSimplePrefixStringify(lineRaw,
+                                                                i,
+                                                                rewrittenStringify,
+                                                                stringifyStop):
+                    out = out + rewrittenStringify
+                    i = stringifyStop
+                    continue
+            if ch == '"':
+                inString = true
+                out = out + "\""
+                i = i + 1
+                continue
+            if ch == '\'':
+                inChar = true
+                out = out + "'"
+                i = i + 1
+                continue
+            out = out + strings.CharToStr(ch)
+            i = i + 1
+            continue
+        out = out + strings.CharToStr(ch)
+        if inString && ch == '"' && !CompilerBridgeQuoteIsEscaped(lineRaw, i):
+            inString = false
+        elif inChar && ch == '\'' && !CompilerBridgeQuoteIsEscaped(lineRaw, i):
+            inChar = false
+        i = i + 1
+    return out
+
+fn CompilerBridgeRewriteSourceText(text: str): str =
+    var out = ""
+    var start: int32
+    var i: int32
+    while i <= text.len:
+        var atLineEnd = false
+        if i == text.len:
+            atLineEnd = true
+        elif text[i] == '\n':
+            atLineEnd = true
+        if !atLineEnd:
+            i = i + 1
+            continue
+        let lineRaw = strings.SliceBytes(text, start, i - start)
+        out = out + CompilerBridgeRewriteLine(lineRaw)
+        if i < text.len:
+            out = out + "\n"
+        start = i + 1
+        i = i + 1
+    return out
+
+fn CompilerBridgeSourceNeedsRewrite(text: str): bool =
+    return CompilerBridgeRewriteSourceText(text) != text
+
+fn CompilerBridgeStageCopyRequired(rootDir: str,
+                                     srcPath: str,
+                                     destDir: str,
+                                     logRel: str,
+                                     context: str): Result[bool] =
+    let command = "cp -R " + CompilerQuoteShell(srcPath) + " " + CompilerQuoteShell(destDir)
+    if CompilerRunCommandLogged(rootDir, command, chengpath.PathAbsolute(rootDir, logRel), context):
+        return Ok[bool](true)
+    return Err[bool](" compiler: " + context + " failed: " + srcPath)
+
+fn CompilerBridgeStageCopyOptional(rootDir: str,
+                                     srcPath: str,
+                                     destDir: str,
+                                     logRel: str,
+                                     context: str): Result[bool] =
+    if !chengpath.PathFileExists(srcPath):
+        return Ok[bool](true)
+    return CompilerBridgeStageCopyRequired(rootDir, srcPath, destDir, logRel, context)
+
+fn CompilerBridgeRewriteStagedTree(rootDir: str,
+                                     stageRoot: str): Result[bool] =
+    if !chengpath.PathDirExists(stageRoot):
+        return Err[bool](" compiler: missing bridge surface stage root: " + stageRoot)
+    let files = os.WalkDirRec(stageRoot)
+    for i in 0..<files.len:
+        let path = files[i]
+        if !strutil.EndsWith(path, ".cheng"):
+            continue
+        let sourceText = chengpath.ReadTextFile("", path)
+        if len(sourceText) <= 0:
+            continue
+        let rewritten = CompilerBridgeRewriteSourceText(sourceText)
+        if rewritten == sourceText:
+            continue
+        if !chengpath.WriteTextFile("", path, rewritten):
+            return Err[bool](" compiler: failed to rewrite staged source: " + path)
+    return Ok[bool](true)
+
+fn CompilerBridgeRequestNeedsSurfaceRewrite(rootDir: str,
+                                              req: creq.CompilerRequest): bool =
+    var closure: str[]
+    var err = ""
+    if CompilerAppendOrdinaryClosure(creq.CompilerRequestRootDir(req),
+                                       creq.CompilerRequestSourcePath(req),
+                                       closure,
+                                       err):
+        for i in 0..<closure.len:
+            let sourceText = chengpath.ReadTextFile("", closure[i])
+            if CompilerBridgeSourceNeedsRewrite(sourceText):
+                return true
+        return false
+    let entryText = chengpath.ReadTextFile("", creq.CompilerRequestSourcePath(req))
+    return CompilerBridgeSourceNeedsRewrite(entryText)
+
+fn CompilerArgsWithoutPathFlag(args: str[],
+                                 flagName: str): str[] =
+    var out: str[]
+    var i: int32
+    while i < args.len:
+        let arg = strutil.Strip(args[i])
+        if arg == flagName:
+            i = i + 2
+            continue
+        if strutil.StartsWith(arg, flagName + ":") || strutil.StartsWith(arg, flagName + "="):
+            i = i + 1
+            continue
+        add(out, args[i])
+        i = i + 1
+    return out
+
+fn CompilerArgsWithBridgeStagedRequest(args: str[],
+                                         stagedReq: creq.CompilerRequest): str[] =
+    var out = CompilerArgsWithoutPathFlag(args, "--root")
+    out = CompilerArgsWithoutPathFlag(out, "--in")
+    add(out, "--root:" + creq.CompilerRequestRootDir(stagedReq))
+    add(out, "--in:" + creq.CompilerRequestSourcePath(stagedReq))
+    return out
+
+fn CompilerBridgeSurfaceStageRequest(rootDir: str,
+                                       req: creq.CompilerRequest): Result[creq.CompilerRequest] =
+    let stageRoot = chengpath.PathAbsolute(rootDir, CompilerBridgeSurfaceStageRoot())
+    if (chengpath.PathDirExists(stageRoot) || chengpath.PathFileExists(stageRoot)) &&
+       !CompilerRemovePathTree(stageRoot):
+        return Err[creq.CompilerRequest](" compiler: failed to reset bridge surface stage root: " + stageRoot)
+    if !chengpath.MkdirP(rootDir, stageRoot):
+        return Err[creq.CompilerRequest](" compiler: failed to prepare bridge surface stage root: " + stageRoot)
+    let packageRoot = creq.CompilerRequestRootDir(req)
+    let compilerEntrySource = creq.CompilerRequestSourcePath(req)
+    let packageLeaf = os.ExtractFilename(packageRoot)
+    if len(packageLeaf) <= 0:
+        return Err[creq.CompilerRequest](" compiler: invalid bridge surface package root: " + packageRoot)
+    let stagedPackageRoot = os.JoinPath(stageRoot, packageLeaf)
+    let entryRelRaw = os.RelativePath(compilerEntrySource, packageRoot)
+    let entryRel = strutil.Strip(entryRelRaw)
+    if len(entryRel) <= 0 ||
+       entryRel == compilerEntrySource ||
+       strutil.StartsWith(entryRel, ".."):
+        return Err[creq.CompilerRequest](" compiler: bridge surface entry is outside package root: " +
+                                         compilerEntrySource)
+    if !chengpath.MkdirP(rootDir, stagedPackageRoot):
+        return Err[creq.CompilerRequest](" compiler: failed to prepare bridge surface package root: " +
+                                         stagedPackageRoot)
+    let manifestCopyRes = CompilerBridgeStageCopyRequired(rootDir,
+                                                            os.JoinPath(packageRoot, "cheng-package.toml"),
+                                                            stagedPackageRoot,
+                                                            "artifacts/backend_driver/bridge_surface.manifest.copy.log",
+                                                            "bridge_surface_stage_manifest")
+    if IsErr(manifestCopyRes):
+        return Err[creq.CompilerRequest](Error(manifestCopyRes))
+    let lockCopyRes = CompilerBridgeStageCopyOptional(rootDir,
+                                                        os.JoinPath(packageRoot, "cheng.lock.toml"),
+                                                        stagedPackageRoot,
+                                                        "artifacts/backend_driver/bridge_surface.lock.copy.log",
+                                                        "bridge_surface_stage_lock")
+    if IsErr(lockCopyRes):
+        return Err[creq.CompilerRequest](Error(lockCopyRes))
+    let srcCopyRes = CompilerBridgeStageCopyRequired(rootDir,
+                                                       os.JoinPath(packageRoot, "src"),
+                                                       stagedPackageRoot,
+                                                       "artifacts/backend_driver/bridge_surface.src.copy.log",
+                                                       "bridge_surface_stage_src")
+    if IsErr(srcCopyRes):
+        return Err[creq.CompilerRequest](Error(srcCopyRes))
+    let workspaceRoot = parser.ParserWorkspaceRoot(packageRoot)
+    if workspaceRoot != "" && workspaceRoot != packageRoot:
+        let workspaceSrc = os.JoinPath(workspaceRoot, "src")
+        if !chengpath.PathDirExists(workspaceSrc):
+            return Err[creq.CompilerRequest](" compiler: missing bridge surface shared workspace src: " +
+                                             workspaceSrc)
+        let workspaceCopyRes = CompilerBridgeStageCopyRequired(rootDir,
+                                                                 workspaceSrc,
+                                                                 stageRoot,
+                                                                 "artifacts/backend_driver/bridge_surface.workspace_src.copy.log",
+                                                                 "bridge_surface_stage_workspace_src")
+        if IsErr(workspaceCopyRes):
+            return Err[creq.CompilerRequest](Error(workspaceCopyRes))
+    let rewriteRes = CompilerBridgeRewriteStagedTree(rootDir, stageRoot)
+    if IsErr(rewriteRes):
+        return Err[creq.CompilerRequest](Error(rewriteRes))
+    let stagedEntry = os.JoinPath(stagedPackageRoot, entryRel)
+    if !chengpath.PathFileExists(stagedEntry):
+        return Err[creq.CompilerRequest](" compiler: missing staged bridge surface entry source: " + stagedEntry)
+    let stagedReq0 = creq.CompilerRequestNew(stagedPackageRoot,
+                                               stagedEntry,
+                                               creq.CompilerRequestOutputPath(req),
+                                               creq.CompilerRequestTargetTriple(req),
+                                               creq.CompilerRequestEmitKind(req),
+                                               req.reportPath)
+    let stagedReq1 = creq.CompilerRequestWithSymbolVisibility(stagedReq0,
+                                                                creq.CompilerRequestSymbolVisibility(req))
+    let stagedReq = creq.CompilerRequestWithBrowserBridgeObject(stagedReq1,
+                                                                  creq.CompilerRequestBrowserBridgeObjectPath(req))
+    return Ok[creq.CompilerRequest](stagedReq)
 
 fn CompilerWorldBundleSourceSnapshotWrite(rootDir: str,
                                             stagedReq: creq.CompilerRequest,

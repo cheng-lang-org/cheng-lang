@@ -1,0 +1,51 @@
+import std/os
+import std/result
+import std/strings
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/debug_tools_gate as debuggate
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let sourcePath = os.JoinPath(root, "src/tests/ordinary_zero_exit_fixture.cheng")
+    let outputPath = "/tmp/debug_tools_gate_text_smoke.out"
+    let reqRes = creq.CompilerRequestFromArgsForCommand(root,
+                                                          [
+                                                              "--root:" + root,
+                                                              "--in:" + sourcePath,
+                                                              "--emit:obj",
+                                                              "--target:arm64-apple-darwin",
+                                                              "--out:" + outputPath
+                                                          ],
+                                                          false)
+    assert(IsErr(reqRes) == false, "debug tools gate text smoke: request")
+    let req = Value(reqRes)
+    var linkPlan: slplan.SystemLinkPlanStub
+    var linkErr = ""
+    assert(slplan.BuildSystemLinkPlanStub(root, req, linkPlan, linkErr),
+           "debug tools gate text smoke: link plan")
+    var loweringPlan: lower.LoweringPlanStub
+    var loweringErr = ""
+    assert(lower.BuildLoweringPlanStub(linkPlan, loweringPlan, loweringErr),
+           "debug tools gate text smoke: lowering plan")
+    let primaryRes = pobj.BuildPrimaryObjectPlan(linkPlan, loweringPlan)
+    assert(IsErr(primaryRes) == false, "debug tools gate text smoke: primary plan")
+    let primaryPlan = Value(primaryRes)
+    let debugText = debuggate.DebugToolsDebugReportText(linkPlan, loweringPlan, primaryPlan)
+    let symbolsText = debuggate.DebugToolsSymbolsReportText(linkPlan, loweringPlan, primaryPlan)
+    assert(strings.StrContains(debugText, "cheng_debug_report_v1"), "debug tools gate text smoke: debug header")
+    assert(strings.StrContains(debugText, "entry="), "debug tools gate text smoke: debug entry")
+    assert(strings.StrContains(debugText, "source_path=" + sourcePath), "debug tools gate text smoke: debug source")
+    assert(strings.StrContains(debugText, "lowering_function_count="), "debug tools gate text smoke: debug lowering count")
+    assert(strings.StrContains(debugText, "primary_object_item_count="), "debug tools gate text smoke: debug primary count")
+    assert(strings.StrContains(debugText, "native_linker_program="), "debug tools gate text smoke: debug linker")
+    assert(strings.StrContains(symbolsText, "cheng_symbols_v1"), "debug tools gate text smoke: symbols header")
+    assert(strings.StrContains(symbolsText, "lowering_symbol_count="), "debug tools gate text smoke: symbols lowering count")
+    assert(strings.StrContains(symbolsText, "primary_symbol_count="), "debug tools gate text smoke: symbols primary count")
+    assert(strings.StrContains(symbolsText, "primary_unsupported_count="), "debug tools gate text smoke: symbols unsupported count")
+    assert(strings.StrContains(symbolsText, "lowering_symbols="), "debug tools gate text smoke: symbols list")
+    assert(strings.StrContains(symbolsText, "primary_symbols="), "debug tools gate text smoke: primary symbol list")
+    echo(" debug_tools_gate_text_smoke ok")
+    return 0

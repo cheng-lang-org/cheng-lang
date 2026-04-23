@@ -1,0 +1,42 @@
+import std/cmdline as cmdline
+import cheng/DiLoCo/core/diloco as core
+import cheng/DiLoCo/host/diloco_host
+import cheng/DiLoCo/tests/support
+
+fn main(): int32 =
+    let port = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    var readyPathRaw: str
+    let hasReady = cmdline.ReadFirstFlagValue("--ready-path", readyPathRaw)
+    let readyPath = if hasReady: readyPathRaw else: ""
+
+    let jobBundleCid = support.DiLoCoTestJobBundleCid("quic-remote-two")
+    let initialModelRef = support.DiLoCoTestArtifact(jobBundleCid, "remote-two-initial-model")
+    let initialOptimizerRef = support.DiLoCoTestArtifact(jobBundleCid, "remote-two-initial-optimizer")
+
+    var node = diloco_host.DiLoCoHostInit("diloco.quic.remote.two.server")
+    var job = core.DiLoCoJob()
+    var version = core.DiLoCoGlobalVersion()
+    let openRes = core.DiLoCoOpenJobFill(job,
+                                           version,
+                                           node.state,
+                                           jobBundleCid,
+                                           2,
+                                           1,
+                                           60,
+                                           initialModelRef,
+                                           initialOptimizerRef)
+    assert(openRes.ok, " diloco quic remote two: open")
+
+    let serveRes = diloco_host.DiLoCoHostServeWindowNamed(node,
+                                                            "127.0.0.1",
+                                                            port,
+                                                            "localhost",
+                                                            readyPath,
+                                                            4,
+                                                            -1)
+    assert(serveRes.ok, " diloco quic remote two: serve")
+    assert(node.state.cohorts.len == 1, " diloco quic remote two: cohort len")
+    assert(node.state.cohorts[0].fixedMemberCount == 2, " diloco quic remote two: fixed count")
+    assert(node.state.leases.len == 2, " diloco quic remote two: lease count")
+    echo(" diloco_quic_remote_two_server_probe ok")
+    return 0

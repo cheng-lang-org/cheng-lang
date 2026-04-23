@@ -680,16 +680,20 @@ fn cheng_str_store_slot(slot: ptr, val: str) =
         return
     let outPtr: StrPtr = StrPtr(slot)
     var prev: str
+    var next: str = val
     prev.data = outPtr->data
     prev.len = outPtr->len
     prev.store_id = outPtr->store_id
     prev.flags = outPtr->flags
-    cheng_str_retain_owned(val)
+    if val.flags != chengStrFlagOwned && val.data != nil && val.len > 0:
+        next = cheng_str_copy(val.data, val.len)
+    else:
+        cheng_str_retain_owned(val)
     cheng_str_release_owned(prev)
-    outPtr->data = val.data
-    outPtr->len = val.len
-    outPtr->store_id = val.store_id
-    outPtr->flags = val.flags
+    outPtr->data = next.data
+    outPtr->len = next.len
+    outPtr->store_id = next.store_id
+    outPtr->flags = next.flags
 
 fn cheng_fopen_write(path: ptr): ptr =
     if path == nil:
@@ -1161,7 +1165,8 @@ fn cheng_exec_program_build_argv(programName: ptr, argvWire: str): ptr =
     if argvRaw == nil:
         return nil
     cheng_bytes_set(argvRaw, 0, slotCount * int32(sizeof(ptr)))
-    let programCopy: ptr = cheng_string_copy(programName, cheng_cstrlen_raw(programName))
+    let programNameLen = cheng_cstrlen_raw(programName)
+    let programCopy: ptr = cheng_string_copy(programName, programNameLen)
     if programCopy == nil:
         cheng_free_export(argvRaw)
         return nil
@@ -1193,7 +1198,8 @@ fn cheng_exec_program_build_exec_argv(programName: ptr,
         if !cheng_exec_program_append_wire_items(argvRaw, builtCount, envWire):
             cheng_exec_program_free_argv(argvRaw, builtCount)
             return nil
-    let programCopy: ptr = cheng_string_copy(programName, cheng_cstrlen_raw(programName))
+    let programNameLen = cheng_cstrlen_raw(programName)
+    let programCopy: ptr = cheng_string_copy(programName, programNameLen)
     if programCopy == nil:
         cheng_exec_program_free_argv(argvRaw, builtCount)
         return nil
@@ -2655,14 +2661,18 @@ fn __cheng_rt_paramStrCopy_export(i: int32): ptr =
     let raw = cheng_runtime_param_raw(i)
     if raw == nil:
         return driver_c_new_string_export(0)
-    return cheng_string_copy(raw, cheng_cstrlen_raw(raw))
+    let rawLen = cheng_cstrlen_raw(raw)
+    let out = cheng_string_copy(raw, rawLen)
+    return out
 
 @exportc("__cheng_rt_paramStrCopyBridge")
 fn __cheng_rt_paramStrCopyBridge_export(i: int32): str =
     let raw = __cheng_rt_paramStrCopy_export(i)
     if raw == nil:
         return cheng_str_empty()
-    return cheng_str_view_owned(raw, cheng_cstrlen_raw(raw))
+    let rawLen = cheng_cstrlen_raw(raw)
+    let out = cheng_str_view_owned(raw, rawLen)
+    return out
 
 @exportc("__cheng_rt_paramStrCopyBridgeInto")
 fn __cheng_rt_paramStrCopyBridgeInto_export(i: int32, out: var str) =
@@ -2670,7 +2680,8 @@ fn __cheng_rt_paramStrCopyBridgeInto_export(i: int32, out: var str) =
 
 @exportc("paramCount")
 fn paramCount_export(): int32 =
-    return cheng_runtime_param_count()
+    let total: int32 = cheng_runtime_param_count()
+    return total > 0 ? (total - 1) : 0
 
 @exportc("driver_c_cli_param1_eq_bridge")
 fn driver_c_cli_param1_eq_bridge_export(expected: str): bool =
@@ -2682,9 +2693,11 @@ fn driver_c_cli_param1_eq_bridge_export(expected: str): bool =
 
 @exportc("driver_c_read_flag_or_default_bridge")
 fn driver_c_read_flag_or_default_bridge_export(key: str, defaultValue: str): str =
+    let defaultData = cheng_str_data(defaultValue)
+    let defaultLen = cheng_str_len(defaultValue)
     let count = cheng_runtime_param_count()
     if count <= 1:
-        return defaultValue
+        return cheng_str_copy(defaultData, defaultLen)
     var i: int32 = 1
     while i < count:
         let arg = cheng_runtime_param_str(i)
@@ -2693,10 +2706,11 @@ fn driver_c_read_flag_or_default_bridge_export(key: str, defaultValue: str): str
             return inlineValue
         if cheng_runtime_flag_key_matches(arg, key):
             if i + 1 >= count:
-                return defaultValue
-            return cheng_runtime_param_str(i + 1)
+                return cheng_str_copy(defaultData, defaultLen)
+            let value = cheng_runtime_param_str(i + 1)
+            return cheng_str_copy(cheng_str_data(value), cheng_str_len(value))
         i = i + 1
-    return defaultValue
+    return cheng_str_copy(defaultData, defaultLen)
 
 @exportc("driver_c_read_flag_value_bridge")
 fn driver_c_read_flag_value_bridge_export(key: str, outValue: var str): bool =
@@ -2712,7 +2726,8 @@ fn driver_c_read_flag_value_bridge_export(key: str, outValue: var str): bool =
         if cheng_runtime_flag_key_matches(arg, key):
             if i + 1 >= count:
                 return false
-            outValue = cheng_runtime_param_str(i + 1)
+            let value = cheng_runtime_param_str(i + 1)
+            outValue = cheng_str_copy(cheng_str_data(value), cheng_str_len(value))
             return true
         i = i + 1
     return false
@@ -2820,7 +2835,10 @@ fn cheng_str_strip_bridge_export(s: str): str =
         start = start + 1
     while stop > start && cheng_ascii_space(*(UInt8Ptr(cheng_ptr_plus(data, stop - 1)))):
         stop = stop - 1
-    return cheng_str_copy(cheng_ptr_plus(data, start), stop - start)
+    let sliceData = cheng_ptr_plus(data, start)
+    let sliceLen = stop - start
+    let out = cheng_str_copy(sliceData, sliceLen)
+    return out
 
 fn cheng_strformat_join_runtime(parts: str[], sep: str): str =
     if parts.len <= 0:
@@ -2838,12 +2856,15 @@ fn cheng_strformat_join_runtime(parts: str[], sep: str): str =
     var writeAt: int32
     for i in 0..<parts.len:
         if i > 0 && sepLen > 0:
-            cheng_bytes_copy(cheng_ptr_plus(outRaw, writeAt), sepData, sepLen)
+            let dst = cheng_ptr_plus(outRaw, writeAt)
+            cheng_bytes_copy(dst, sepData, sepLen)
             writeAt = writeAt + sepLen
         let part: str = parts[i]
         let partLen: int32 = cheng_str_len(part)
         if partLen > 0:
-            cheng_bytes_copy(cheng_ptr_plus(outRaw, writeAt), cheng_str_data(part), partLen)
+            let dst = cheng_ptr_plus(outRaw, writeAt)
+            let partData = cheng_str_data(part)
+            cheng_bytes_copy(dst, partData, partLen)
             writeAt = writeAt + partLen
     return cheng_str_view_owned(outRaw, total)
 
@@ -3170,10 +3191,15 @@ fn cheng_buffer_handle_from_raw_bridge_export(data: ptr, n: int32): uint64 =
 fn cheng_str_copy_cstring(text: ptr): str =
     if text == nil:
         return cheng_str_empty()
-    return cheng_str_copy(text, cheng_cstrlen_raw(text))
+    let textLen = cheng_cstrlen_raw(text)
+    let out = cheng_str_copy(text, textLen)
+    return out
 
 fn cheng_str_dup(text: str): str =
-    return cheng_str_copy(cheng_str_data(text), cheng_str_len(text))
+    let textData = cheng_str_data(text)
+    let textLen = cheng_str_len(text)
+    let out = cheng_str_copy(textData, textLen)
+    return out
 
 fn cheng_str_dispose(s: var str) =
     if s.flags == chengStrFlagOwned && s.data != nil:
@@ -3184,7 +3210,10 @@ fn cheng_tcp_bridge_str_dispose_bridge_export(value: var str) =
     cheng_str_dispose(value)
 
 fn cheng_copy_cstring_from_str(text: str): ptr =
-    return cheng_string_copy(cheng_str_data(text), cheng_str_len(text))
+    let textData = cheng_str_data(text)
+    let textLen = cheng_str_len(text)
+    let out = cheng_string_copy(textData, textLen)
+    return out
 
 fn cheng_empty_cstring_alloc(): ptr =
     return cheng_string_copy("", 0)
@@ -3604,7 +3633,9 @@ fn cheng_http_load_endpoint_payload_ex(endpoint: str, outErr: var str): str =
     cheng_runtime_concat_assign_cstring(request, "\r\n")
     cheng_runtime_concat_assign_cstring(request, "Connection: close\r\n")
     cheng_runtime_concat_assign_cstring(request, "Accept: application/json\r\n\r\n")
-    let sentOk = cheng_send_all(fd, cheng_str_data(request), cheng_str_len(request))
+    let requestData = cheng_str_data(request)
+    let requestLen = cheng_str_len(request)
+    let sentOk = cheng_send_all(fd, requestData, requestLen)
     var response = cheng_str_empty()
     if sentOk:
         response = cheng_http_recv_all(fd)
@@ -3814,13 +3845,15 @@ fn cheng_tailnet_provider_set_stage_cstring(runtime: ChengTailnetProviderRuntime
     if runtime == nil:
         return
     cheng_free_export(runtime->startupStage)
-    runtime->startupStage = cheng_string_copy(stage, cheng_cstrlen_raw(stage))
+    let stageLen = cheng_cstrlen_raw(stage)
+    runtime->startupStage = cheng_string_copy(stage, stageLen)
 
 fn cheng_tailnet_provider_set_error_cstring(runtime: ChengTailnetProviderRuntimePtr, text: ptr) =
     if runtime == nil:
         return
     cheng_free_export(runtime->lastError)
-    runtime->lastError = cheng_string_copy(text, cheng_cstrlen_raw(text))
+    let textLen = cheng_cstrlen_raw(text)
+    runtime->lastError = cheng_string_copy(text, textLen)
 
 fn cheng_tailnet_provider_set_error(runtime: ChengTailnetProviderRuntimePtr, text: str) =
     if runtime == nil:
@@ -3951,7 +3984,8 @@ fn cheng_relay_provider_set_error_cstring(runtime: ChengRelayProviderRuntimePtr,
     if runtime == nil:
         return
     cheng_free_export(runtime->lastError)
-    runtime->lastError = cheng_string_copy(text, cheng_cstrlen_raw(text))
+    let textLen = cheng_cstrlen_raw(text)
+    runtime->lastError = cheng_string_copy(text, textLen)
 
 fn cheng_relay_provider_set_error(runtime: ChengRelayProviderRuntimePtr, text: str) =
     if runtime == nil:
@@ -4637,9 +4671,11 @@ fn cheng_write_text_file(pathText: str, content: str): bool =
     cheng_free_export(path)
     if fp == nil:
         return false
-    let wrote = libc_fwrite(cheng_str_data(content), 1, cheng_str_len(content), fp)
+    let contentData = cheng_str_data(content)
+    let contentLen = cheng_str_len(content)
+    let wrote = libc_fwrite(contentData, 1, contentLen, fp)
     let closeRc = libc_fclose(fp)
-    return wrote == int64(cheng_str_len(content)) && closeRc == 0
+    return wrote == int64(contentLen) && closeRc == 0
 
 fn cheng_write_ready_port(readyPath: str, boundPort: int32, errWire: var str): bool =
     if cheng_str_len(readyPath) <= 0:
@@ -4890,7 +4926,9 @@ fn cheng_webrtc_unsupported(errWire: var str, text: ptr): int32 =
     return 0
 
 fn cheng_webrtc_error(errWire: var str, text: str): int32 =
-    errWire = cheng_str_copy(cheng_str_data(text), cheng_str_len(text))
+    let textData = cheng_str_data(text)
+    let textLen = cheng_str_len(text)
+    errWire = cheng_str_copy(textData, textLen)
     return 0
 
 fn cheng_webrtc_last_error_clear() =
@@ -5317,7 +5355,9 @@ fn cheng_webrtc_browser_signal_transcript(policyText: str,
 fn cheng_webrtc_browser_copy_response(responseWire: str,
                                       clientResponseWire: var str,
                                       errWire: var str): int32 =
-    clientResponseWire = cheng_str_copy(cheng_str_data(responseWire), cheng_str_len(responseWire))
+    let responseData = cheng_str_data(responseWire)
+    let responseLen = cheng_str_len(responseWire)
+    clientResponseWire = cheng_str_copy(responseData, responseLen)
     errWire = cheng_str_empty()
     return 1
 
@@ -5528,7 +5568,9 @@ fn driver_c_read_file_all_bridge_export(path: ptr): str =
     let raw = cheng_read_file_all_raw(path)
     if raw == nil:
         return cheng_str_empty()
-    return cheng_str_view_owned(raw, cheng_cstrlen_raw(raw))
+    let rawLen = cheng_cstrlen_raw(raw)
+    let out = cheng_str_view_owned(raw, rawLen)
+    return out
 
 @exportc("driver_c_read_file_all_bridge_into")
 fn driver_c_read_file_all_bridge_into_export(path: ptr, out: var str) =

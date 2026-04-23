@@ -27,3 +27,15 @@
 - 在仓库内做 source staging 时禁止 `cp -R` 整个 root 到 root 下的 artifact 目录；只复制 manifest/lock/src 这类最小真输入。
 - `build-backend-driver` 的报告应由真实 `system-link-exec --report-out` 产生；不要再额外跑 `world-receipt` 当候选收据门禁。
 - `build-backend-driver` 安装 candidate 时必须同时移动 `.map`，并在 ready 验证里把 map 当作同一产物的一部分。
+- 并行子代理也可能触发 `system-link-exec` 或重写 stage artifacts；主代理在刷新 `stage2/stage3/backend_driver` 前必须扫进程并等待或精准停止这些子进程。
+- backend driver 里的最小调试命令不要直接拉完整 `system_link_exec`；能用 `system_link_plan + lowering_plan` 完成的命令应保持轻量，避免把 browser/native materializer 闭包带进 seed 最小化切片。
+- 新增 backend driver 自身源码时，同步改 `bootstrap/compiler_bootstrap_manifest.cheng`、C seed manifest required keys、`print-build-plan` 硬编码数组、freshness inputs 和 build source count；只改 `build_plan.cheng` 会让计划文本与自举 freshness 漂移。
+- world head 的 `csg_root_cid` 固定绑定 `canonicalGraphCid`，不是 raw `graphCid`；手工构造 universe、bundle verify、publish/sync smoke 都必须同口径，否则 lock/pinned world 会假失败。
+- `canonicalGraphCid` 不能绑定 `sourceBundleCid` 或表达式源码表面；源码闭包归 package snapshot，canonical semantic identity 只比较 CSG 语义节点/边，否则语法迁移证明会被源码差异误杀。
+- CSG 构建的 source closure 必须按 module path 排序，不能按绝对 source path 排序；否则同内容换 root 会改变节点 ID，导致 canonical CSG、manifest、world head 漂移。
+- 不要为 root-stable CSG 用巨型字符串 row 做 O(n²) 排序；先稳定源顺序，再顺序写 node/edge，能保持 6-7 秒级 `compiler_csg`，避免退化到 18 秒以上。
+- 将 C seed 的 sidecar 写入迁到 backend driver 时，不能让 seed 先发 `build done`；driver 必须在 Cheng 侧 sidecar 写完后再发 `build done`，否则实时进度会提前宣称完成。
+- `verify-debug-tools` 底层会跑 host smoke；它和 `run-host-smokes`、`build-backend-driver` 一样属于会编译的门禁，必须串行执行。
+- seed 最小化时，新语言表面和库语义优先落纯 Cheng；seed 只保留自举活路径必须承担的降糖和 correctness，不能把新能力继续堆回 `cheng_seed.c`。
+- 组合按值调用参数若在 caller 侧 materialize 到 call temp，并且类型带 `Bytes` ORC 生命周期，调用返回后必须立刻 release+zero 这个 temp；拖到函数 epilogue 会把中间 refcount 观测弄脏。
+- 用户明确要求“从 seed 迁到纯 Cheng 最小 seed”时，优先迁走 `std` 语义和 runtime shim；不要因为自举方便继续把 `Fmt/$` 一类库行为补进 `cheng_seed.c`。

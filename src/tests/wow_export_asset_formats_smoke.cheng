@@ -1,0 +1,65 @@
+import std/bytes as bytes
+import std/result
+import std/system
+import cheng/apps/wow_export/asset_formats as asset_formats
+
+fn makeBuf(len: int32): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    out.len = len
+    if len > 0:
+        out.data = alloc(len)
+    return out
+
+fn putFourCC(buf: bytes.ByteBuffer, offset: int32, text: str) =
+    bytes.BufSetByte(buf, offset, int32(text[0]))
+    bytes.BufSetByte(buf, offset + 1, int32(text[1]))
+    bytes.BufSetByte(buf, offset + 2, int32(text[2]))
+    bytes.BufSetByte(buf, offset + 3, int32(text[3]))
+
+fn putU32LE(buf: bytes.ByteBuffer, offset: int32, value: int32) =
+    bytes.BufSetByte(buf, offset, value & 255)
+    bytes.BufSetByte(buf, offset + 1, (value >> 8) & 255)
+    bytes.BufSetByte(buf, offset + 2, (value >> 16) & 255)
+    bytes.BufSetByte(buf, offset + 3, (value >> 24) & 255)
+
+fn seedClassicM2Header(buf: bytes.ByteBuffer, start: int32) =
+    putFourCC(buf, start, "MD20")
+    putU32LE(buf, start + 4, 272)
+    putU32LE(buf, start + 0x1c, 2)
+    putU32LE(buf, start + 0x2c, 7)
+    putU32LE(buf, start + 0x3c, 370)
+    putU32LE(buf, start + 0x44, 1)
+    putU32LE(buf, start + 0x50, 2)
+
+fn assertHeader(header: asset_formats.M2Header) =
+    assert(header.version == 272, "wow_export_asset_formats_smoke version")
+    assert(header.sequenceCount == 2, "wow_export_asset_formats_smoke sequences")
+    assert(header.boneCount == 7, "wow_export_asset_formats_smoke bones")
+    assert(header.vertexCount == 370, "wow_export_asset_formats_smoke vertices")
+    assert(header.skinProfileCount == 1, "wow_export_asset_formats_smoke skins")
+    assert(header.textureCount == 2, "wow_export_asset_formats_smoke textures")
+
+fn main(): int32 =
+    let classic: bytes.ByteBuffer = makeBuf(0x54)
+    seedClassicM2Header(classic, 0)
+    let classicRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(classic)
+    assert(IsOk(classicRes), Error(classicRes))
+    assertHeader(Value(classicRes))
+    bytes.FreeByteBuffer(classic)
+
+    let wrapped: bytes.ByteBuffer = makeBuf(8 + 0x54)
+    putFourCC(wrapped, 0, "MD21")
+    putU32LE(wrapped, 4, 0x4f30)
+    seedClassicM2Header(wrapped, 8)
+    let wrappedRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(wrapped)
+    assert(IsOk(wrappedRes), Error(wrappedRes))
+    assertHeader(Value(wrappedRes))
+    bytes.FreeByteBuffer(wrapped)
+
+    let bad: bytes.ByteBuffer = makeBuf(8)
+    let badRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(bad)
+    assert(IsErr(badRes), "wow_export_asset_formats_smoke bad magic rejects")
+    bytes.FreeByteBuffer(bad)
+
+    echo("wow_export_asset_formats_smoke ok")
+    return 0

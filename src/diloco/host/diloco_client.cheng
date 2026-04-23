@@ -4,6 +4,18 @@ import cheng/libp2p/core/types
 import cheng/libp2p/transports/quic_transport
 import cheng/DiLoCo/protocol/wire
 
+fn DiLoCoClientStartsWith(text: str, prefix: str): bool =
+    if prefix.len > text.len:
+        return false
+    for i in 0..<prefix.len:
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn DiLoCoClientFetchLeaseRetryable(err: str): bool =
+    return err == "msquic native: pipe read timeout" ||
+           DiLoCoClientStartsWith(err, "libp2p quic: dial: msquic native: pipe read timeout")
+
 fn DiLoCoHostRequestResponseNamed(host: str,
                                     port: int32,
                                     serverName: str,
@@ -54,10 +66,16 @@ fn DiLoCoFetchLeaseRequestNamed(host: str,
                                                             port,
                                                             serverName,
                                                             wire.DiLoCoFetchLeaseRequestEncode(req))
-    if IsErr(responseBytesRes):
-        return Err[wire.DiLoCoFetchLeaseResponse](Error(responseBytesRes))
+    var finalResponseBytesRes = responseBytesRes
+    if IsErr(finalResponseBytesRes) && DiLoCoClientFetchLeaseRetryable(Error(finalResponseBytesRes)):
+        finalResponseBytesRes = DiLoCoHostRequestResponseNamed(host,
+                                                               port,
+                                                               serverName,
+                                                               wire.DiLoCoFetchLeaseRequestEncode(req))
+    if IsErr(finalResponseBytesRes):
+        return Err[wire.DiLoCoFetchLeaseResponse](Error(finalResponseBytesRes))
     var out = wire.DiLoCoFetchLeaseResponse()
-    let decodeRes = wire.DiLoCoFetchLeaseResponseDecodeFill(out, Value(responseBytesRes))
+    let decodeRes = wire.DiLoCoFetchLeaseResponseDecodeFill(out, Value(finalResponseBytesRes))
     if IsErr(decodeRes):
         return Err[wire.DiLoCoFetchLeaseResponse](Error(decodeRes))
     return Ok[wire.DiLoCoFetchLeaseResponse](out)

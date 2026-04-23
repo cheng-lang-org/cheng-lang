@@ -1,0 +1,183 @@
+import std/os
+import std/strings
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let driver = chengpath.PathAbsolute(root, "artifacts/backend_driver/cheng")
+    assert(chengpath.FileExistsNonEmpty(root, driver), "seed minimization boundary: backend driver exists")
+
+    let outDir = chengpath.PathAbsolute(root, "artifacts/seed_minimization_boundary_smoke")
+    assert(chengpath.MkdirP(root, outDir), "seed minimization boundary: mkdir")
+
+    let helpLog = chengpath.PathJoin(outDir, "help.log")
+    if chengpath.PathFileExists(helpLog):
+        os.RemoveFile(helpLog)
+    let helpRun = hostops.RunFileLogged(root,
+                                         "seed_minimization_boundary_help",
+                                         driver,
+                                         ["help"],
+                                         [],
+                                         root,
+                                         0,
+                                         helpLog)
+    assert(helpRun.exitCode == 0, "seed minimization boundary: help rc")
+    assert(strings.StrContains(helpRun.output, "core commands: status, print-build-plan, system-link-exec"),
+           "seed minimization boundary: help core commands")
+    assert(strings.StrContains(helpRun.output, "world/proof commands: world-receipt"),
+           "seed minimization boundary: help world proof commands")
+    assert(strings.StrContains(helpRun.output, "debug commands: debug-report, print-symbols, print-line-map, print-asm"),
+           "seed minimization boundary: help debug commands")
+    assert(strings.StrContains(helpRun.output, "verify commands: verify-export-visibility, verify-export-visibility-parallel, verify-debug-tools"),
+           "seed minimization boundary: help verify commands")
+    assert(!strings.StrContains(helpRun.output, "core commands: status, print-build-plan, system-link-exec, world-receipt"),
+           "seed minimization boundary: help excludes world-receipt from core")
+
+    let source = chengpath.PathAbsolute(root, "src/tests/ordinary_zero_exit_fixture.cheng")
+    let debugReportLog = chengpath.PathJoin(outDir, "debug-report.log")
+    if chengpath.PathFileExists(debugReportLog):
+        os.RemoveFile(debugReportLog)
+    let debugReportRun = hostops.RunFileLogged(root,
+                                                "seed_minimization_boundary_debug_report",
+                                                driver,
+                                                [
+                                                    "debug-report",
+                                                    "--root:" + root,
+                                                    "--in:" + source,
+                                                    "--target:arm64-apple-darwin",
+                                                    "--emit:obj"
+                                                ],
+                                                [],
+                                                root,
+                                                120,
+                                                debugReportLog)
+    assert(debugReportRun.exitCode == 0, "seed minimization boundary: debug-report rc")
+    assert(strings.StrContains(debugReportRun.output, "cheng_debug_report_v1"),
+           "seed minimization boundary: debug-report header")
+    assert(strings.StrContains(debugReportRun.output, "primary_object_item_count="),
+           "seed minimization boundary: debug-report primary count")
+    assert(strings.StrContains(debugReportRun.output, "native_linker_program="),
+           "seed minimization boundary: debug-report linker")
+
+    let symbolsLog = chengpath.PathJoin(outDir, "print-symbols.log")
+    if chengpath.PathFileExists(symbolsLog):
+        os.RemoveFile(symbolsLog)
+    let symbolsRun = hostops.RunFileLogged(root,
+                                            "seed_minimization_boundary_print_symbols",
+                                            driver,
+                                            [
+                                                "print-symbols",
+                                                "--root:" + root,
+                                                "--in:" + source,
+                                                "--target:arm64-apple-darwin",
+                                                "--emit:obj"
+                                            ],
+                                            [],
+                                            root,
+                                            120,
+                                            symbolsLog)
+    assert(symbolsRun.exitCode == 0, "seed minimization boundary: print-symbols rc")
+    assert(strings.StrContains(symbolsRun.output, "cheng_symbols_v1"),
+           "seed minimization boundary: print-symbols header")
+    assert(strings.StrContains(symbolsRun.output, "primary_unsupported_count=0"),
+           "seed minimization boundary: print-symbols unsupported")
+
+    let lineMapLog = chengpath.PathJoin(outDir, "print-line-map.log")
+    if chengpath.PathFileExists(lineMapLog):
+        os.RemoveFile(lineMapLog)
+    let lineMapRun = hostops.RunFileLogged(root,
+                                            "seed_minimization_boundary_line_map",
+                                            driver,
+                                            [
+                                                "print-line-map",
+                                                "--root:" + root,
+                                                "--in:" + source,
+                                                "--target:arm64-apple-darwin",
+                                                "--emit:obj"
+                                            ],
+                                            [],
+                                            root,
+                                            120,
+                                            lineMapLog)
+    assert(lineMapRun.exitCode == 0, "seed minimization boundary: print-line-map rc")
+    assert(chengpath.PathFileExists(lineMapLog), "seed minimization boundary: print-line-map log")
+    assert(strings.StrContains(lineMapRun.output, "cheng_line_map_v1"),
+           "seed minimization boundary: line-map header")
+    assert(strings.StrContains(lineMapRun.output, "entry_count="),
+           "seed minimization boundary: line-map count")
+    assert(strings.StrContains(lineMapRun.output, "entry\t"),
+           "seed minimization boundary: line-map entries")
+    assert(strings.StrContains(lineMapRun.output, source),
+           "seed minimization boundary: line-map source path")
+    assert(!strings.StrContains(lineMapRun.output, "cheng_debug_report_v1"),
+           "seed minimization boundary: line-map stays direct")
+
+    let asmLog = chengpath.PathJoin(outDir, "print-asm.log")
+    if chengpath.PathFileExists(asmLog):
+        os.RemoveFile(asmLog)
+    let asmRun = hostops.RunFileLogged(root,
+                                        "seed_minimization_boundary_print_asm",
+                                        driver,
+                                        [
+                                            "print-asm",
+                                            "--root:" + root,
+                                            "--in:" + source,
+                                            "--target:arm64-apple-darwin",
+                                            "--emit:obj"
+                                        ],
+                                        [],
+                                        root,
+                                        120,
+                                        asmLog)
+    assert(asmRun.exitCode == 0, "seed minimization boundary: print-asm rc")
+    assert(strings.StrContains(asmRun.output, "cheng_asm_report_v1"),
+           "seed minimization boundary: print-asm header")
+    assert(strings.StrContains(asmRun.output, "asm_text_begin"),
+           "seed minimization boundary: print-asm begin")
+    assert(strings.StrContains(asmRun.output, ".globl"),
+           "seed minimization boundary: print-asm globl")
+
+    let sidecarOut = chengpath.PathJoin(outDir, "line-map-sidecar-exe")
+    let sidecarMap = sidecarOut + ".map"
+    let sidecarLog = chengpath.PathJoin(outDir, "line-map-sidecar.log")
+    let sidecarReport = chengpath.PathJoin(outDir, "line-map-sidecar.report.txt")
+    if chengpath.PathFileExists(sidecarOut):
+        os.RemoveFile(sidecarOut)
+    if chengpath.PathFileExists(sidecarMap):
+        os.RemoveFile(sidecarMap)
+    if chengpath.PathFileExists(sidecarLog):
+        os.RemoveFile(sidecarLog)
+    if chengpath.PathFileExists(sidecarReport):
+        os.RemoveFile(sidecarReport)
+    let sidecarRun = hostops.RunFileLogged(root,
+                                            "seed_minimization_boundary_line_map_sidecar",
+                                            driver,
+                                            [
+                                                "system-link-exec",
+                                                "--root:" + root,
+                                                "--in:" + source,
+                                                "--target:arm64-apple-darwin",
+                                                "--emit:exe",
+                                                "--out:" + sidecarOut,
+                                                "--report-out:" + sidecarReport
+                                            ],
+                                            ["CHENG_PROGRESS=1"],
+                                            root,
+                                            180,
+                                            sidecarLog)
+    assert(sidecarRun.exitCode == 0, "seed minimization boundary: line-map sidecar rc")
+    assert(chengpath.FileExistsNonEmpty(root, sidecarOut),
+           "seed minimization boundary: line-map sidecar output")
+    assert(chengpath.FileExistsNonEmpty(root, sidecarMap),
+           "seed minimization boundary: line-map sidecar map")
+    assert(chengpath.FileExistsNonEmpty(root, sidecarReport),
+           "seed minimization boundary: line-map sidecar report")
+    let sidecarMapText = chengpath.ReadTextFile(root, sidecarMap)
+    assert(strings.StrContains(sidecarMapText, "cheng_line_map_v1"),
+           "seed minimization boundary: line-map sidecar header")
+    assert(strings.StrContains(sidecarMapText, source),
+           "seed minimization boundary: line-map sidecar source")
+
+    echo("cheng seed_minimization_boundary_smoke ok")
+    return 0

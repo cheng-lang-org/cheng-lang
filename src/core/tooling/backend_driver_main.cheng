@@ -1,13 +1,10 @@
 import std/cmdline as cmdline
 import std/os
-import std/strings
+import std/system as system
 import std/strutils as strutil
 import cheng/core/tooling/compiler_runtime as crun
-import cheng/core/tooling/host_smoke_gate as hsmoke
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/path as chengpath
-import cheng/core/tooling/root_discovery as rootdisco
-import cheng/core/tooling/world_receipt_gate as wreceipt
 
 @importc("get_stdout")
 fn BackendDriverStdoutBridge(): os.File
@@ -18,14 +15,26 @@ fn BackendDriverStderrBridge(): os.File
 @importc("paramCount")
 fn BackendDriverParamCountBridge(): int32
 
+@importc("__cheng_rt_paramStr")
+fn BackendDriverParamStrRawBridge(i: int32): cstring
+
 fn BackendDriverPrintLine(text: str) =
     os.WriteLine(BackendDriverStdoutBridge(), text)
 
 fn BackendDriverPrintErr(text: str) =
     os.WriteLine(BackendDriverStderrBridge(), text)
 
+fn BackendDriverPrintKeyValue(key: str,
+                                value: str) =
+    os.Write(BackendDriverStdoutBridge(), key)
+    os.Write(BackendDriverStdoutBridge(), "=")
+    os.WriteLine(BackendDriverStdoutBridge(), value)
+
 fn BackendDriverRoot(): str =
-    return rootdisco.CompilerRootAuto()
+    let envRoot = strutil.Strip(os.GetEnv("CHENG_ROOT"))
+    if len(envRoot) > 0:
+        return envRoot
+    return os.GetCurrentDir()
 
 fn BackendDriverStage3Path(rootDir: str): str =
     return chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage3")
@@ -34,15 +43,15 @@ fn BackendDriverUsage(rootDir: str) =
     BackendDriverPrintLine("usage: cheng <command> [args]")
     BackendDriverPrintLine("core commands: status, print-build-plan, system-link-exec")
     BackendDriverPrintLine("world/proof commands: world-receipt")
-    BackendDriverPrintLine("verify commands: verify-export-visibility, verify-export-visibility-parallel")
+    BackendDriverPrintLine("debug commands: debug-report, print-symbols, print-line-map, print-asm")
+    BackendDriverPrintLine("verify commands: verify-export-visibility, verify-export-visibility-parallel, verify-debug-tools")
     BackendDriverPrintLine("gate commands: run-host-smokes")
-    BackendDriverPrintLine("stage3=" + BackendDriverStage3Path(rootDir))
+    BackendDriverPrintKeyValue("stage3", BackendDriverStage3Path(rootDir))
 
 fn BackendDriverEnsureRootEnv(rootDir: str) =
     let rootEnvRaw = strutil.Strip(os.GetEnv("CHENG_ROOT"))
     if rootEnvRaw == "":
-        if rootdisco.CompilerRootSeedExists(rootDir):
-            os.SetEnv("CHENG_ROOT", rootDir)
+        os.SetEnv("CHENG_ROOT", rootDir)
 
 fn BackendDriverCollectArgsFrom(startIndex: int32,
                                   count: int32): str[] =
@@ -50,58 +59,33 @@ fn BackendDriverCollectArgsFrom(startIndex: int32,
     if startIndex > count:
         return out
     for i in startIndex..count:
-        let arg = cmdline.ParamStr(i)
+        let arg = BackendDriverParamStr(i)
         if len(arg) > 0:
             add(out, arg)
     return out
 
-fn BackendDriverProgressEnvOverrides(args: str[]): str[] =
-    var out: str[]
-    let progressRaw = strutil.Strip(os.GetEnv("CHENG_PROGRESS"))
-    if len(progressRaw) > 0:
-        add(out, "CHENG_PROGRESS=" + progressRaw)
-    let progressOutRaw = strutil.Strip(os.GetEnv("CHENG_PROGRESS_OUT"))
-    if len(progressOutRaw) > 0:
-        add(out, "CHENG_PROGRESS_OUT=" + progressOutRaw)
-    for i in 0..<args.len:
-        let arg = args[i]
-        if arg == "--progress":
-            add(out, "CHENG_PROGRESS=1")
-        elif strutil.StartsWith(arg, "--progress-out:"):
-            let path = strings.SliceBytes(arg, 15, len(arg) - 15)
-            add(out, "CHENG_PROGRESS_OUT=" + path)
-        elif strutil.StartsWith(arg, "--progress-out="):
-            let path = strings.SliceBytes(arg, 15, len(arg) - 15)
-            add(out, "CHENG_PROGRESS_OUT=" + path)
-    return out
-
-fn BackendDriverForwardSuccessEchoEnabled(cmd: str): bool =
-    return cmd != "system-link-exec"
+fn BackendDriverParamStr(i: int32): str =
+    let raw = BackendDriverParamStrRawBridge(i)
+    if raw == nil:
+        return ""
+    return system.strFromCStringBorrow(raw)
 
 fn BackendDriverForward(rootDir: str,
                           cmd: str,
                           args: str[]): int32 =
     let stage3Path = BackendDriverStage3Path(rootDir)
-    if !chengpath.FileExistsNonEmpty(rootDir, stage3Path):
-        BackendDriverPrintErr(" backend driver: missing stage3 compiler: " + stage3Path)
-        return 2
     let logDir = chengpath.PathAbsolute(rootDir, "artifacts/forward")
-    let _made = chengpath.MkdirP(rootDir, logDir)
-    let logPath = os.JoinPath(logDir, "backend_driver." + cmd + ".log")
+    let _ = chengpath.MkdirP(rootDir, logDir)
+    let logPath = chengpath.PathAbsolute(rootDir, "artifacts/forward/backend_driver.forward.log")
     var forwardArgs: str[]
     add(forwardArgs, cmd)
     for i in 0..<args.len:
         add(forwardArgs, args[i])
-    var forwardEnv: str[]
-    add(forwardEnv, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
-    let progressEnv = BackendDriverProgressEnvOverrides(args)
-    for i in 0..<progressEnv.len:
-        add(forwardEnv, progressEnv[i])
     let run = hostops.RunFileLogged(rootDir,
-                                      "backend_driver_forward_" + cmd,
+                                      "backend_driver_forward",
                                       stage3Path,
                                       forwardArgs,
-                                      forwardEnv,
+                                      ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
                                       rootDir,
                                       0,
                                       logPath)
@@ -109,26 +93,23 @@ fn BackendDriverForward(rootDir: str,
     if len(outputText) > 0:
         if run.exitCode != 0:
             BackendDriverPrintErr(outputText)
-        elif BackendDriverForwardSuccessEchoEnabled(cmd):
+        else:
             BackendDriverPrintLine(outputText)
     elif run.exitCode != 0:
-        BackendDriverPrintErr(" backend driver: forward failed: " + cmd)
+        BackendDriverPrintErr(" backend driver: forward failed")
     return run.exitCode
-
-fn BackendDriverWorldReceipt(rootDir: str,
-                               args: str[]): int32 =
-    return wreceipt.WorldReceiptRun(rootDir, args)
 
 fn BackendDriverStatus(rootDir: str) =
     let contract = crun.CompilerRuntimeGetContract(rootDir)
     BackendDriverPrintLine("cheng")
-    BackendDriverPrintLine("version=" + contract.version)
-    BackendDriverPrintLine("execution=" + contract.executionModel)
-    BackendDriverPrintLine("bootstrap_mode=" + contract.bootstrapMode)
-    BackendDriverPrintLine("compiler_entry=" + chengpath.PathAbsolute(rootDir, "src/core/tooling/backend_driver_main.cheng"))
-    BackendDriverPrintLine("ordinary_command=" + contract.ordinaryCommand)
-    BackendDriverPrintLine("ordinary_pipeline=" + contract.ordinaryPipelineState)
-    BackendDriverPrintLine("stage3=" + BackendDriverStage3Path(rootDir))
+    BackendDriverPrintKeyValue("version", contract.version)
+    BackendDriverPrintKeyValue("execution", contract.executionModel)
+    BackendDriverPrintKeyValue("bootstrap_mode", contract.bootstrapMode)
+    BackendDriverPrintKeyValue("compiler_entry",
+                               chengpath.PathAbsolute(rootDir, "src/core/tooling/backend_driver_main.cheng"))
+    BackendDriverPrintKeyValue("ordinary_command", contract.ordinaryCommand)
+    BackendDriverPrintKeyValue("ordinary_pipeline", contract.ordinaryPipelineState)
+    BackendDriverPrintKeyValue("stage3", BackendDriverStage3Path(rootDir))
 
 fn main(argc: int32, argv: str*): int32 =
     argc
@@ -140,16 +121,13 @@ fn main(argc: int32, argv: str*): int32 =
     if count <= 0:
         BackendDriverUsage(rootDir)
         return 0
-    let cmd = cmdline.ParamStr(1)
+    let cmd = BackendDriverParamStr(1)
     let args = BackendDriverCollectArgsFrom(2, count)
-    if cmd == "--help" || cmd == "-h" || cmd == "help":
-        BackendDriverUsage(rootDir)
-        return 0
-    if cmd == "status":
-        BackendDriverStatus(rootDir)
-        return 0
-    if cmd == "world-receipt":
-        return BackendDriverWorldReceipt(rootDir, args)
-    if cmd == "run-host-smokes":
-        return hsmoke.HostSmokeRun(rootDir, args)
+    if len(cmd) > 0:
+        if count <= 2 && (cmd[0] == 'h' || cmd[0] == '-'):
+            BackendDriverUsage(rootDir)
+            return 0
+        if count <= 2 && cmd[0] == 's':
+            BackendDriverStatus(rootDir)
+            return 0
     return BackendDriverForward(rootDir, cmd, args)

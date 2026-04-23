@@ -24,3 +24,16 @@
 - staging 目录绝不能放在被复制的仓库树内部再 `cp -R` 整个 root；这会把 `.git/artifacts/chengcache` 一起卷进去，制造递归膨胀和假卡死。源快照只复制 manifest、lock 和 `src/`。
 - `build-backend-driver` 不能用 `world-receipt` 给候选编译补收据；收据必须来自真正执行的 `system-link-exec --report-out`，否则核心门禁会被 proof 侧链污染。
 - backend driver 自举安装必须同步安装 `.map`；只替换二进制不替换 line map 会让 crash-report/debug 定位漂移。
+- `bootstrap/cheng_seed.c` 里仍留着核心 materializer 的五个可拆函数簇：`cheng_seed_materialize_provider_objects` / `cheng_seed_materialize_provider_object_cached` / `cheng_seed_provider_source_for_module`，`cheng_seed_materialize_primary_object_internal` / `cheng_seed_materialize_primary_object_cached`，`cheng_seed_build_native_link_plan_stub`，`cheng_seed_write_executable_line_map` / `cheng_seed_build_line_map_text`，`cheng_seed_cmd_debug_report` / `cheng_seed_cmd_print_symbols` / `cheng_seed_cmd_print_line_map` / `cheng_seed_cmd_print_object` / `cheng_seed_cmd_print_asm` / `cheng_seed_cmd_verify_debug_tools_impl`。
+- 这次最小边界建议切成 5 片：provider objects、primary object emit、native link、line-map write、debug tools。每片都应该先落 Cheng 控制面，再回头收 C seed；其中 `world-receipt` 仍然不应被并进 core commands。
+- `print-line-map` 可以先用纯 Cheng `system_link_plan + lowering_plan + line_map` 生成，不应直接在 backend driver 拉完整 `system_link_exec`；完整 plan 会把 browser ABI bridge 计划函数带进 primary emit，扩大 seed 最小切片。
+- 当前 `src/core/backend/line_map.cheng` 只接管 backend driver 的 `print-line-map` 文本生成；C seed 的 `cheng_seed_write_executable_line_map` 仍负责 `system-link-exec` 成功后的 `.map` sidecar 写入。
+- `debug-report` / `print-symbols` 可以和 `print-line-map` 一样走 lightweight plan，不需要导入完整 `system_link_exec`；直接导入 full exec 会把 browser/native materializer 闭包带回 backend driver 主入口。
+- `print-build-plan` 仍有 C seed 硬编码输出路径；新增 backend driver 源文件时必须同步 `bootstrap/compiler_bootstrap_manifest.cheng`、C seed manifest required keys、print-build-plan 数组、freshness inputs 和 `build_source_unit_count`，否则计划文本会和真实 freshness 输入漂移。
+- `compiler_world_manifest_closure_smoke` 暴露了 world head root 漂移：source bundle 和 export surface 已稳定，真正漂的是 CSG 节点 ID/边 ID；源文件排序必须使用 module path。
+- `compiler_migration_publish_smoke` 暴露了 canonical 语义边界：把 `sourceBundleCid` 或表达式源码表面纳入 canonical CSG 会破坏 syntax migration equivalence；这些字段只能进 raw graph/package snapshot。
+- `compiler_managed_dependency_mirror_smoke` 暴露了旧 raw CSG 绑定残留：manual universe 和 bundle expected head 仍用 `graphCid` 会导致 pinned lock/world verify 失败，必须统一为 `canonicalGraphCid`。
+- Codex app-server 会持续自动启动外部/旧 smoke（如 `build-backend-driver`、`compile-bootstrap`、UniMaker、dapanyouxuan）；长 gate 前必须扫并精准停止，否则会杀掉当前 exec 或刷新 stage/driver 产物。
+- `system-link-exec` 的 `.map` sidecar 是安全的小切片：它只依赖 `system_link_plan + lowering_plan`，可以先由 backend driver 在 stage3 链接成功后写入，不需要等待 provider object、primary emit、native link 全部迁出 C seed。
+- driver 转发 stage3 时若让 C seed 跳过 `.map`，必须由 driver 接管 `line_map` 与最终 `build done` 进度；否则用户看到的实时进度会先完成、后补写 sidecar。
+- `verify-debug-tools` 不是纯文本检查，它会调用 host smoke gate 编译运行 `debug_tools_surface_smoke`；调它时按 `run-host-smokes` 处理，不能和其他编译门禁并行。

@@ -23,6 +23,7 @@ fn BytesFromHex(text: str): Result[rawbytes.Bytes] =
         let hi: int32 = hexValue(rawbytes.BytesGet(textBytes, i))
         let lo: int32 = hexValue(rawbytes.BytesGet(textBytes, i + 1))
         if hi < 0 || lo < 0:
+            rawbytes.BytesFree(out)
             return Err[rawbytes.Bytes]("wowExport Salsa20: invalid hex byte")
         rawbytes.BytesSet(out, i / 2, (hi << 4) | lo)
         i = i + 2
@@ -214,6 +215,7 @@ fn Salsa20Keystream(key: rawbytes.Bytes, nonce: rawbytes.Bytes, count: int32): R
     while produced < count:
         let blockRes: Result[rawbytes.Bytes] = Salsa20Block(key, nonce, c0, c1)
         if IsErr(blockRes):
+            rawbytes.BytesFree(out)
             return Err[rawbytes.Bytes](Error(blockRes))
         let block: rawbytes.Bytes = Value(blockRes)
         var i: int32
@@ -221,6 +223,7 @@ fn Salsa20Keystream(key: rawbytes.Bytes, nonce: rawbytes.Bytes, count: int32): R
             rawbytes.BytesSet(out, produced, rawbytes.BytesGet(block, i))
             produced = produced + 1
             i = i + 1
+        rawbytes.BytesFree(block)
         c0 = u32(c0 + int64(1))
         if c0 == int64(0):
             c1 = u32(c1 + int64(1))
@@ -230,22 +233,29 @@ fn Salsa20Xor(key: rawbytes.Bytes, nonce: rawbytes.Bytes, input: rawbytes.Bytes)
     let streamRes: Result[rawbytes.Bytes] = Salsa20Keystream(key, nonce, rawbytes.BytesLen(input))
     if IsErr(streamRes):
         return Err[rawbytes.Bytes](Error(streamRes))
-    let stream: rawbytes.Bytes = Value(streamRes)
+    var stream: rawbytes.Bytes = Value(streamRes)
     var out: rawbytes.Bytes = rawbytes.BytesAlloc(rawbytes.BytesLen(input))
     var i: int32
     while i < rawbytes.BytesLen(input):
         rawbytes.BytesSet(out, i, rawbytes.BytesGet(input, i) ^ rawbytes.BytesGet(stream, i))
         i = i + 1
+    rawbytes.BytesFree(stream)
     return Ok[rawbytes.Bytes](out)
 
 fn Salsa20XorHexKey(keyHex: str, nonce: rawbytes.Bytes, input: rawbytes.Bytes): Result[rawbytes.Bytes] =
     let keyRes: Result[rawbytes.Bytes] = BytesFromHex(keyHex)
     if IsErr(keyRes):
         return Err[rawbytes.Bytes](Error(keyRes))
-    return Salsa20Xor(Value(keyRes), nonce, input)
+    var key: rawbytes.Bytes = Value(keyRes)
+    let outRes: Result[rawbytes.Bytes] = Salsa20Xor(key, nonce, input)
+    rawbytes.BytesFree(key)
+    return outRes
 
 fn Salsa20KeystreamHex(key: rawbytes.Bytes, nonce: rawbytes.Bytes, count: int32): Result[str] =
     let streamRes: Result[rawbytes.Bytes] = Salsa20Keystream(key, nonce, count)
     if IsErr(streamRes):
         return Err[str](Error(streamRes))
-    return Ok[str](rawbytes.BytesToHex(Value(streamRes)))
+    var stream: rawbytes.Bytes = Value(streamRes)
+    let out: str = rawbytes.BytesToHex(stream)
+    rawbytes.BytesFree(stream)
+    return Ok[str](out)

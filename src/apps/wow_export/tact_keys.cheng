@@ -1,0 +1,113 @@
+import std/os as os
+import std/result
+import std/seqs
+import std/strings as strings
+import std/strformat
+import std/strutils as strutils
+import cheng/apps/wow_export/build_info as build_info
+
+type
+    TactKeyEntry =
+        keyName: str
+        keyHex: str
+
+    TactKeyTable =
+        entries: TactKeyEntry[]
+
+fn tactHexCharValid(ch: char): bool =
+    if ch >= '0' && ch <= '9':
+        return true
+    if ch >= 'a' && ch <= 'f':
+        return true
+    if ch >= 'A' && ch <= 'F':
+        return true
+    return false
+
+fn tactIsHexText(text: str, expectedLen: int32): bool =
+    if strings.Len(text) != expectedLen:
+        return false
+    var i: int32
+    while i < strings.Len(text):
+        if !tactHexCharValid(text[i]):
+            return false
+        i = i + 1
+    return true
+
+fn tactNormalizeHex(text: str): str =
+    var out: str
+    var i: int32
+    while i < strings.Len(text):
+        let ch: char = text[i]
+        if ch >= 'A' && ch <= 'F':
+            out = strings.ConcatStr(out, strings.CharToStr(char(int32(ch) + 32)))
+        else:
+            out = strings.ConcatStr(out, strings.CharToStr(ch))
+        i = i + 1
+    return out
+
+fn tactParseKeyLine(lineRaw: str, lineNo: int32): Result[TactKeyEntry] =
+    let line: str = strutils.Strip(lineRaw)
+    let parts: str[] = strutils.Split(line, '=')
+    if parts.len != 2:
+        return Err[TactKeyEntry]("wowExport TACT keys: malformed key line=" + strings.IntToStr(lineNo))
+    let nameRaw: str = strutils.Strip(parts[0])
+    let valueRaw: str = strutils.Strip(parts[1])
+    if !strings.HasPrefix(nameRaw, "key-"):
+        return Err[TactKeyEntry]("wowExport TACT keys: expected key-* at line=" + strings.IntToStr(lineNo))
+    let keyName: str = tactNormalizeHex(strings.SliceBytes(nameRaw, 4, strings.Len(nameRaw) - 4))
+    let keyHex: str = tactNormalizeHex(valueRaw)
+    if !tactIsHexText(keyName, 16):
+        return Err[TactKeyEntry]("wowExport TACT keys: invalid key name at line=" + strings.IntToStr(lineNo))
+    if !tactIsHexText(keyHex, 32) && !tactIsHexText(keyHex, 64):
+        return Err[TactKeyEntry]("wowExport TACT keys: key must be 16 or 32 bytes at line=" + strings.IntToStr(lineNo))
+    var out: TactKeyEntry
+    out.keyName = keyName
+    out.keyHex = keyHex
+    return Ok[TactKeyEntry](out)
+
+fn ParseTactKeyTableText(text: str): Result[TactKeyTable] =
+    if strings.Len(text) == 0:
+        return Err[TactKeyTable]("wowExport TACT keys: empty key table")
+    let lines: str[] = strutils.Split(text, '\n')
+    var out: TactKeyTable
+    var i: int32
+    while i < lines.len:
+        let line: str = strutils.Strip(lines[i])
+        if strings.Len(line) == 0 || strings.HasPrefix(line, "#"):
+            i = i + 1
+            continue
+        let entryRes: Result[TactKeyEntry] = tactParseKeyLine(line, i + 1)
+        if IsErr(entryRes):
+            return Err[TactKeyTable](Error(entryRes))
+        add(out.entries, Value(entryRes))
+        i = i + 1
+    if out.entries.len == 0:
+        return Err[TactKeyTable]("wowExport TACT keys: no key entries")
+    return Ok[TactKeyTable](out)
+
+fn FindTactKey(table: TactKeyTable, keyNameRaw: str): Result[str] =
+    let keyName: str = tactNormalizeHex(keyNameRaw)
+    if !tactIsHexText(keyName, 16):
+        return Err[str]("wowExport TACT keys: lookup key name must be 8 bytes hex")
+    var i: int32
+    while i < table.entries.len:
+        let entry: TactKeyEntry = table.entries[i]
+        if entry.keyName == keyName:
+            return Ok[str](entry.keyHex)
+        i = i + 1
+    return Err[str]("wowExport TACT keys: key not found keyName=" + keyName)
+
+fn LoadTactKeyTable(clientPath: str, keyRingKey: str): Result[TactKeyTable] =
+    let pathRes: Result[str] = build_info.ConfigPathForKey(clientPath, keyRingKey)
+    if IsErr(pathRes):
+        return Err[TactKeyTable](Error(pathRes))
+    let path: str = Value(pathRes)
+    if !os.FileExists(path):
+        return Err[TactKeyTable]("wowExport TACT keys: missing local keyring " + path)
+    return ParseTactKeyTableText(os.ReadFile(path))
+
+fn TactKeyTableSummary(table: TactKeyTable): str =
+    var first: str
+    if table.entries.len > 0:
+        first = table.entries[0].keyName
+    return Fmt"keys={strings.IntToStr(table.entries.len)} firstKey={first}"

@@ -1,0 +1,553 @@
+import std/bytes as bytes
+import std/result
+import std/seqs
+import std/strings as strings
+import std/strformat
+import std/system
+
+type
+    DeflateBitReader =
+        buf: bytes.ByteBuffer
+        bitPos: int32
+        endBit: int32
+
+    HuffmanTable =
+        codes: int32[]
+        lengths: int32[]
+        symbolCount: int32
+        maxBits: int32
+
+const
+    ZlibAdlerMod = 65521
+
+fn zlibMakeByteBuffer(len: int32): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    if len <= 0:
+        out.len = 0
+        out.data = nil
+        return out
+    out.len = len
+    out.data = alloc(len)
+    return out
+
+fn zlibMakeIntArray(count: int32, value: int32): int32[] =
+    var out: int32[]
+    var i: int32
+    while i < count:
+        add(out, value)
+        i = i + 1
+    return out
+
+fn zlibReadBits(r: var DeflateBitReader, count: int32): Result[int32] =
+    if count < 0 || count > 24:
+        return Err[int32]("wowExport zlib: invalid bit count")
+    var out: int32
+    var shift: int32
+    while shift < count:
+        if r.bitPos >= r.endBit:
+            return Err[int32]("wowExport zlib: truncated deflate bitstream")
+        let byteIdx: int32 = r.bitPos / 8
+        let bitIdx: int32 = r.bitPos % 8
+        let bit: int32 = (bytes.BufByteAt(r.buf, byteIdx) >> bitIdx) & 1
+        out = out | (bit << shift)
+        r.bitPos = r.bitPos + 1
+        shift = shift + 1
+    return Ok[int32](out)
+
+fn zlibAlignByte(r: var DeflateBitReader) =
+    let rem: int32 = r.bitPos % 8
+    if rem != 0:
+        r.bitPos = r.bitPos + (8 - rem)
+
+fn zlibReverseBits(value: int32, count: int32): int32 =
+    var out: int32
+    var i: int32
+    while i < count:
+        out = (out << 1) | ((value >> i) & 1)
+        i = i + 1
+    return out
+
+fn zlibBuildHuffman(lengths: int32[], maxBits: int32): Result[HuffmanTable] =
+    if maxBits <= 0 || maxBits > 15:
+        return Err[HuffmanTable]("wowExport zlib: invalid huffman max bits")
+    let symbolCount: int32 = lengths.len
+    if symbolCount <= 0:
+        return Err[HuffmanTable]("wowExport zlib: empty huffman alphabet")
+    var counts: int32[] = zlibMakeIntArray(maxBits + 1, 0)
+    var nonZero: int32
+    var i: int32
+    while i < symbolCount:
+        let length: int32 = lengths[i]
+        if length < 0 || length > maxBits:
+            return Err[HuffmanTable]("wowExport zlib: invalid huffman code length")
+        if length > 0:
+            counts[length] = counts[length] + 1
+            nonZero = nonZero + 1
+        i = i + 1
+    if nonZero <= 0:
+        return Err[HuffmanTable]("wowExport zlib: empty huffman code set")
+    var left: int32 = 1
+    var bits: int32 = 1
+    while bits <= maxBits:
+        left = (left << 1) - counts[bits]
+        if left < 0:
+            return Err[HuffmanTable]("wowExport zlib: oversubscribed huffman tree")
+        bits = bits + 1
+    var nextCodes: int32[] = zlibMakeIntArray(maxBits + 1, 0)
+    var code: int32
+    bits = 1
+    while bits <= maxBits:
+        code = (code + counts[bits - 1]) << 1
+        nextCodes[bits] = code
+        bits = bits + 1
+    var out: HuffmanTable
+    out.codes = zlibMakeIntArray(symbolCount, 0)
+    out.lengths = zlibMakeIntArray(symbolCount, 0)
+    out.symbolCount = symbolCount
+    out.maxBits = maxBits
+    i = 0
+    while i < symbolCount:
+        let length: int32 = lengths[i]
+        out.lengths[i] = length
+        if length > 0:
+            out.codes[i] = zlibReverseBits(nextCodes[length], length)
+            nextCodes[length] = nextCodes[length] + 1
+        i = i + 1
+    return Ok[HuffmanTable](out)
+
+fn zlibHasNonZeroLength(lengths: int32[]): bool =
+    var i: int32
+    while i < lengths.len:
+        if lengths[i] > 0:
+            return true
+        i = i + 1
+    return false
+
+fn zlibEmptyHuffman(): HuffmanTable =
+    var out: HuffmanTable
+    out.maxBits = 0
+    out.symbolCount = 0
+    return out
+
+fn zlibDecodeSymbol(r: var DeflateBitReader, table: HuffmanTable): Result[int32] =
+    var code: int32
+    var bits: int32 = 1
+    while bits <= table.maxBits:
+        let bitRes: Result[int32] = zlibReadBits(r, 1)
+        if IsErr(bitRes):
+            return Err[int32](Error(bitRes))
+        code = code | (Value(bitRes) << (bits - 1))
+        var sym: int32
+        while sym < table.symbolCount:
+            if table.lengths[sym] == bits && table.codes[sym] == code:
+                return Ok[int32](sym)
+            sym = sym + 1
+        bits = bits + 1
+    return Err[int32]("wowExport zlib: invalid huffman code")
+
+fn zlibFixedLiteralLengths(): int32[] =
+    var out: int32[]
+    var i: int32
+    while i < 288:
+        var length: int32 = 8
+        if i <= 143:
+            length = 8
+        elif i <= 255:
+            length = 9
+        elif i <= 279:
+            length = 7
+        else:
+            length = 8
+        add(out, length)
+        i = i + 1
+    return out
+
+fn zlibFixedDistanceLengths(): int32[] =
+    return zlibMakeIntArray(32, 5)
+
+fn zlibLengthBase(symbol: int32): int32 =
+    if symbol == 257: return 3
+    if symbol == 258: return 4
+    if symbol == 259: return 5
+    if symbol == 260: return 6
+    if symbol == 261: return 7
+    if symbol == 262: return 8
+    if symbol == 263: return 9
+    if symbol == 264: return 10
+    if symbol == 265: return 11
+    if symbol == 266: return 13
+    if symbol == 267: return 15
+    if symbol == 268: return 17
+    if symbol == 269: return 19
+    if symbol == 270: return 23
+    if symbol == 271: return 27
+    if symbol == 272: return 31
+    if symbol == 273: return 35
+    if symbol == 274: return 43
+    if symbol == 275: return 51
+    if symbol == 276: return 59
+    if symbol == 277: return 67
+    if symbol == 278: return 83
+    if symbol == 279: return 99
+    if symbol == 280: return 115
+    if symbol == 281: return 131
+    if symbol == 282: return 163
+    if symbol == 283: return 195
+    if symbol == 284: return 227
+    return 258
+
+fn zlibLengthExtraBits(symbol: int32): int32 =
+    if symbol <= 264: return 0
+    if symbol <= 268: return 1
+    if symbol <= 272: return 2
+    if symbol <= 276: return 3
+    if symbol <= 280: return 4
+    if symbol <= 284: return 5
+    return 0
+
+fn zlibDistanceBase(code: int32): int32 =
+    if code == 0: return 1
+    if code == 1: return 2
+    if code == 2: return 3
+    if code == 3: return 4
+    if code == 4: return 5
+    if code == 5: return 7
+    if code == 6: return 9
+    if code == 7: return 13
+    if code == 8: return 17
+    if code == 9: return 25
+    if code == 10: return 33
+    if code == 11: return 49
+    if code == 12: return 65
+    if code == 13: return 97
+    if code == 14: return 129
+    if code == 15: return 193
+    if code == 16: return 257
+    if code == 17: return 385
+    if code == 18: return 513
+    if code == 19: return 769
+    if code == 20: return 1025
+    if code == 21: return 1537
+    if code == 22: return 2049
+    if code == 23: return 3073
+    if code == 24: return 4097
+    if code == 25: return 6145
+    if code == 26: return 8193
+    if code == 27: return 12289
+    if code == 28: return 16385
+    return 24577
+
+fn zlibDistanceExtraBits(code: int32): int32 =
+    if code <= 3: return 0
+    if code <= 5: return 1
+    if code <= 7: return 2
+    if code <= 9: return 3
+    if code <= 11: return 4
+    if code <= 13: return 5
+    if code <= 15: return 6
+    if code <= 17: return 7
+    if code <= 19: return 8
+    if code <= 21: return 9
+    if code <= 23: return 10
+    if code <= 25: return 11
+    if code <= 27: return 12
+    return 13
+
+fn zlibInflateCodes(r: var DeflateBitReader,
+                literalTable: HuffmanTable,
+                distanceTable: HuffmanTable,
+                out: bytes.ByteBuffer,
+                outPos: var int32): Result[bool] =
+    while true:
+        let symRes: Result[int32] = zlibDecodeSymbol(r, literalTable)
+        if IsErr(symRes):
+            return Err[bool](Error(symRes))
+        let symbol: int32 = Value(symRes)
+        if symbol < 256:
+            if outPos >= out.len:
+                return Err[bool]("wowExport zlib: output exceeds expected size")
+            bytes.BufSetByte(out, outPos, symbol)
+            outPos = outPos + 1
+        elif symbol == 256:
+            return Ok[bool](true)
+        elif symbol <= 285:
+            var length: int32 = zlibLengthBase(symbol)
+            let extraBits: int32 = zlibLengthExtraBits(symbol)
+            if extraBits > 0:
+                let extraRes: Result[int32] = zlibReadBits(r, extraBits)
+                if IsErr(extraRes):
+                    return Err[bool](Error(extraRes))
+                length = length + Value(extraRes)
+            let distSymRes: Result[int32] = zlibDecodeSymbol(r, distanceTable)
+            if IsErr(distSymRes):
+                return Err[bool](Error(distSymRes))
+            let distCode: int32 = Value(distSymRes)
+            if distCode < 0 || distCode > 29:
+                return Err[bool]("wowExport zlib: invalid distance code")
+            var distance: int32 = zlibDistanceBase(distCode)
+            let distExtra: int32 = zlibDistanceExtraBits(distCode)
+            if distExtra > 0:
+                let distExtraRes: Result[int32] = zlibReadBits(r, distExtra)
+                if IsErr(distExtraRes):
+                    return Err[bool](Error(distExtraRes))
+                distance = distance + Value(distExtraRes)
+            if distance <= 0 || distance > outPos:
+                return Err[bool]("wowExport zlib: invalid back-reference distance")
+            var copied: int32
+            while copied < length:
+                if outPos >= out.len:
+                    return Err[bool]("wowExport zlib: back-reference exceeds expected size")
+                let value: int32 = bytes.BufByteAt(out, outPos - distance)
+                bytes.BufSetByte(out, outPos, value)
+                outPos = outPos + 1
+                copied = copied + 1
+        else:
+            return Err[bool]("wowExport zlib: invalid literal/length symbol")
+    return Ok[bool](true)
+
+fn zlibInflateStoredBlock(r: var DeflateBitReader, out: bytes.ByteBuffer, outPos: var int32): Result[bool] =
+    zlibAlignByte(r)
+    let lenRes: Result[int32] = zlibReadBits(r, 16)
+    let nlenRes: Result[int32] = zlibReadBits(r, 16)
+    if IsErr(lenRes):
+        return Err[bool](Error(lenRes))
+    if IsErr(nlenRes):
+        return Err[bool](Error(nlenRes))
+    let lenValue: int32 = Value(lenRes)
+    let nlenValue: int32 = Value(nlenRes)
+    if (lenValue ^ nlenValue) != 0xffff:
+        return Err[bool]("wowExport zlib: stored block LEN/NLEN mismatch")
+    var i: int32
+    while i < lenValue:
+        if outPos >= out.len:
+            return Err[bool]("wowExport zlib: stored block exceeds expected size")
+        let byteRes: Result[int32] = zlibReadBits(r, 8)
+        if IsErr(byteRes):
+            return Err[bool](Error(byteRes))
+        bytes.BufSetByte(out, outPos, Value(byteRes))
+        outPos = outPos + 1
+        i = i + 1
+    return Ok[bool](true)
+
+fn zlibInflateFixedBlock(r: var DeflateBitReader, out: bytes.ByteBuffer, outPos: var int32): Result[bool] =
+    let litRes: Result[HuffmanTable] = zlibBuildHuffman(zlibFixedLiteralLengths(), 15)
+    if IsErr(litRes):
+        return Err[bool](Error(litRes))
+    let distRes: Result[HuffmanTable] = zlibBuildHuffman(zlibFixedDistanceLengths(), 15)
+    if IsErr(distRes):
+        return Err[bool](Error(distRes))
+    return zlibInflateCodes(r, Value(litRes), Value(distRes), out, outPos)
+
+fn zlibCodeLengthOrder(idx: int32): int32 =
+    if idx == 0: return 16
+    if idx == 1: return 17
+    if idx == 2: return 18
+    if idx == 3: return 0
+    if idx == 4: return 8
+    if idx == 5: return 7
+    if idx == 6: return 9
+    if idx == 7: return 6
+    if idx == 8: return 10
+    if idx == 9: return 5
+    if idx == 10: return 11
+    if idx == 11: return 4
+    if idx == 12: return 12
+    if idx == 13: return 3
+    if idx == 14: return 13
+    if idx == 15: return 2
+    if idx == 16: return 14
+    if idx == 17: return 1
+    return 15
+
+fn zlibDecodeDynamicLengths(r: var DeflateBitReader,
+                        codeLengthTable: HuffmanTable,
+                        total: int32): Result[int32[]] =
+    var out: int32[]
+    var idx: int32
+    var previous: int32
+    while idx < total:
+        let symRes: Result[int32] = zlibDecodeSymbol(r, codeLengthTable)
+        if IsErr(symRes):
+            return Err[int32[]](Error(symRes))
+        let symbol: int32 = Value(symRes)
+        if symbol <= 15:
+            add(out, symbol)
+            previous = symbol
+            idx = idx + 1
+        elif symbol == 16:
+            if idx == 0:
+                return Err[int32[]]("wowExport zlib: repeat length without previous code")
+            let repeatRes: Result[int32] = zlibReadBits(r, 2)
+            if IsErr(repeatRes):
+                return Err[int32[]](Error(repeatRes))
+            let repeat: int32 = Value(repeatRes) + 3
+            var j: int32
+            while j < repeat:
+                if idx >= total:
+                    return Err[int32[]]("wowExport zlib: repeated code length overflow")
+                add(out, previous)
+                idx = idx + 1
+                j = j + 1
+        elif symbol == 17:
+            let repeatRes: Result[int32] = zlibReadBits(r, 3)
+            if IsErr(repeatRes):
+                return Err[int32[]](Error(repeatRes))
+            let repeat: int32 = Value(repeatRes) + 3
+            var j: int32
+            while j < repeat:
+                if idx >= total:
+                    return Err[int32[]]("wowExport zlib: zero repeat overflow")
+                add(out, 0)
+                previous = 0
+                idx = idx + 1
+                j = j + 1
+        elif symbol == 18:
+            let repeatRes: Result[int32] = zlibReadBits(r, 7)
+            if IsErr(repeatRes):
+                return Err[int32[]](Error(repeatRes))
+            let repeat: int32 = Value(repeatRes) + 11
+            var j: int32
+            while j < repeat:
+                if idx >= total:
+                    return Err[int32[]]("wowExport zlib: long zero repeat overflow")
+                add(out, 0)
+                previous = 0
+                idx = idx + 1
+                j = j + 1
+        else:
+            return Err[int32[]]("wowExport zlib: invalid code length symbol")
+    return Ok[int32[]](out)
+
+fn zlibSliceLengths(values: int32[], start: int32, count: int32): Result[int32[]] =
+    if start < 0 || count < 0 || start + count > values.len:
+        return Err[int32[]]("wowExport zlib: code length slice out of bounds")
+    var out: int32[]
+    var i: int32
+    while i < count:
+        add(out, values[start + i])
+        i = i + 1
+    return Ok[int32[]](out)
+
+fn zlibInflateDynamicBlock(r: var DeflateBitReader, out: bytes.ByteBuffer, outPos: var int32): Result[bool] =
+    let hlitRes: Result[int32] = zlibReadBits(r, 5)
+    let hdistRes: Result[int32] = zlibReadBits(r, 5)
+    let hclenRes: Result[int32] = zlibReadBits(r, 4)
+    if IsErr(hlitRes): return Err[bool](Error(hlitRes))
+    if IsErr(hdistRes): return Err[bool](Error(hdistRes))
+    if IsErr(hclenRes): return Err[bool](Error(hclenRes))
+    let hlit: int32 = Value(hlitRes) + 257
+    let hdist: int32 = Value(hdistRes) + 1
+    let hclen: int32 = Value(hclenRes) + 4
+    var codeLengths: int32[] = zlibMakeIntArray(19, 0)
+    var i: int32
+    while i < hclen:
+        let lenRes: Result[int32] = zlibReadBits(r, 3)
+        if IsErr(lenRes):
+            return Err[bool](Error(lenRes))
+        codeLengths[zlibCodeLengthOrder(i)] = Value(lenRes)
+        i = i + 1
+    let codeLengthTableRes: Result[HuffmanTable] = zlibBuildHuffman(codeLengths, 7)
+    if IsErr(codeLengthTableRes):
+        return Err[bool](Error(codeLengthTableRes))
+    let allLengthsRes: Result[int32[]] = zlibDecodeDynamicLengths(r, Value(codeLengthTableRes), hlit + hdist)
+    if IsErr(allLengthsRes):
+        return Err[bool](Error(allLengthsRes))
+    let allLengths: int32[] = Value(allLengthsRes)
+    let litLengthsRes: Result[int32[]] = zlibSliceLengths(allLengths, 0, hlit)
+    if IsErr(litLengthsRes):
+        return Err[bool](Error(litLengthsRes))
+    let distLengthsRes: Result[int32[]] = zlibSliceLengths(allLengths, hlit, hdist)
+    if IsErr(distLengthsRes):
+        return Err[bool](Error(distLengthsRes))
+    let litLengths: int32[] = Value(litLengthsRes)
+    if litLengths[256] == 0:
+        return Err[bool]("wowExport zlib: dynamic block missing end-of-block code")
+    let litTableRes: Result[HuffmanTable] = zlibBuildHuffman(litLengths, 15)
+    if IsErr(litTableRes):
+        return Err[bool](Error(litTableRes))
+    let distLengths: int32[] = Value(distLengthsRes)
+    var distTable: HuffmanTable
+    if zlibHasNonZeroLength(distLengths):
+        let distTableRes: Result[HuffmanTable] = zlibBuildHuffman(distLengths, 15)
+        if IsErr(distTableRes):
+            return Err[bool](Error(distTableRes))
+        distTable = Value(distTableRes)
+    else:
+        distTable = zlibEmptyHuffman()
+    return zlibInflateCodes(r, Value(litTableRes), distTable, out, outPos)
+
+fn zlibAdler32ByteBuffer(buf: bytes.ByteBuffer): int32 =
+    var a: int32 = 1
+    var b: int32
+    var i: int32
+    while i < buf.len:
+        a = (a + bytes.BufByteAt(buf, i)) % ZlibAdlerMod
+        b = (b + a) % ZlibAdlerMod
+        i = i + 1
+    return (b << 16) | a
+
+fn zlibAdlerByte(adler: int32, idx: int32): int32 =
+    let shift: int32 = (3 - idx) * 8
+    return (adler >> shift) & 255
+
+fn zlibCheckAdler(buf: bytes.ByteBuffer, adlerStart: int32, out: bytes.ByteBuffer): Result[bool] =
+    if adlerStart < 0 || adlerStart + 4 > buf.len:
+        return Err[bool]("wowExport zlib: missing Adler32")
+    let adler: int32 = zlibAdler32ByteBuffer(out)
+    var i: int32
+    while i < 4:
+        let got: int32 = bytes.BufByteAt(buf, adlerStart + i)
+        let want: int32 = zlibAdlerByte(adler, i)
+        if got != want:
+            return Err[bool]("wowExport zlib: Adler32 mismatch expected=" + strings.IntToStr(want) + " got=" + strings.IntToStr(got) + " byte=" + strings.IntToStr(i))
+        i = i + 1
+    return Ok[bool](true)
+
+fn WowZlibInflate(buf: bytes.ByteBuffer, start: int32, count: int32, expectedSize: int32): Result[bytes.ByteBuffer] =
+    if start < 0 || count < 6 || expectedSize < 0 || start + count > buf.len:
+        return Err[bytes.ByteBuffer]("wowExport zlib: invalid stream bounds")
+    let cmf: int32 = bytes.BufByteAt(buf, start)
+    let flg: int32 = bytes.BufByteAt(buf, start + 1)
+    if (cmf & 15) != 8:
+        return Err[bytes.ByteBuffer]("wowExport zlib: unsupported compression method")
+    if (cmf >> 4) > 7:
+        return Err[bytes.ByteBuffer]("wowExport zlib: invalid window size")
+    if ((cmf << 8) + flg) % 31 != 0:
+        return Err[bytes.ByteBuffer]("wowExport zlib: invalid header check")
+    if (flg & 32) != 0:
+        return Err[bytes.ByteBuffer]("wowExport zlib: preset dictionary unsupported")
+    let deflateStart: int32 = start + 2
+    let adlerStart: int32 = start + count - 4
+    if deflateStart >= adlerStart:
+        return Err[bytes.ByteBuffer]("wowExport zlib: missing deflate payload")
+    var r: DeflateBitReader
+    r.buf = buf
+    r.bitPos = deflateStart * 8
+    r.endBit = adlerStart * 8
+    let out: bytes.ByteBuffer = zlibMakeByteBuffer(expectedSize)
+    var outPos: int32
+    var finalBlock: bool
+    while !finalBlock:
+        let finalRes: Result[int32] = zlibReadBits(r, 1)
+        let typeRes: Result[int32] = zlibReadBits(r, 2)
+        if IsErr(finalRes): return Err[bytes.ByteBuffer](Error(finalRes))
+        if IsErr(typeRes): return Err[bytes.ByteBuffer](Error(typeRes))
+        finalBlock = Value(finalRes) == 1
+        let blockType: int32 = Value(typeRes)
+        var blockRes: Result[bool]
+        if blockType == 0:
+            blockRes = zlibInflateStoredBlock(r, out, outPos)
+        elif blockType == 1:
+            blockRes = zlibInflateFixedBlock(r, out, outPos)
+        elif blockType == 2:
+            blockRes = zlibInflateDynamicBlock(r, out, outPos)
+        else:
+            return Err[bytes.ByteBuffer]("wowExport zlib: reserved deflate block type")
+        if IsErr(blockRes):
+            return Err[bytes.ByteBuffer](Error(blockRes))
+    if outPos != expectedSize:
+        return Err[bytes.ByteBuffer]("wowExport zlib: output size mismatch expected=" + strings.IntToStr(expectedSize) + " got=" + strings.IntToStr(outPos))
+    let adlerRes: Result[bool] = zlibCheckAdler(buf, adlerStart, out)
+    if IsErr(adlerRes):
+        return Err[bytes.ByteBuffer](Error(adlerRes))
+    return Ok[bytes.ByteBuffer](out)

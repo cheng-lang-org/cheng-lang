@@ -1,0 +1,65 @@
+import std/bytes as bytes
+import std/result
+import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/casc_archive as casc_archive
+import cheng/apps/wow_export/casc_index as casc_index
+import cheng/apps/wow_export/config as config
+import cheng/apps/wow_export/encoding as encoding
+import cheng/apps/wow_export/install as install
+import cheng/apps/wow_export/root as wow_root
+
+fn main(): int32 =
+    let buildRes: Result[build_info.WowBuildEntry] = build_info.ProbeRetailDefault()
+    assert(IsOk(buildRes), Error(buildRes))
+    let cfgRes: Result[config.BuildConfig] =
+        config.LoadBuildConfig(build_info.DefaultClientPath, Value(buildRes).buildKey)
+    assert(IsOk(cfgRes), Error(cfgRes))
+    let cfg: config.BuildConfig = Value(cfgRes)
+
+    let entryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(build_info.DefaultClientPath, cfg.encodingEncodingKey)
+    assert(IsOk(entryRes), Error(entryRes))
+    let fullRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFull(build_info.DefaultClientPath, Value(entryRes))
+    assert(IsOk(fullRes), Error(fullRes))
+    let enc: bytes.ByteBuffer = Value(fullRes)
+
+    let summaryRes: Result[encoding.EncodingSummary] = encoding.WowEncodingSummary(enc)
+    assert(IsOk(summaryRes), Error(summaryRes))
+    let summary: encoding.EncodingSummary = Value(summaryRes)
+    assert(summary.header.version >= 1, "wow_export_encoding version")
+    assert(summary.header.contentKeySize == 16, "wow_export_encoding ckey size")
+    assert(summary.header.encodingKeySize == 16, "wow_export_encoding ekey size")
+    assert(summary.header.contentPageCount > 0, "wow_export_encoding c pages")
+    assert(summary.header.encodingPageCount > 0, "wow_export_encoding e pages")
+    assert(summary.first.contentSize > 0, "wow_export_encoding first size")
+
+    let rootKeyRes: Result[str] = encoding.WowEncodingFindEncodingKey(enc, cfg.root)
+    assert(IsOk(rootKeyRes), Error(rootKeyRes))
+    let installKeyRes: Result[str] = encoding.WowEncodingFindEncodingKey(enc, cfg.installContentKey)
+    assert(IsOk(installKeyRes), Error(installKeyRes))
+    assert(Value(rootKeyRes).len == 32, "wow_export_encoding root ekey len")
+    assert(Value(installKeyRes).len == 32, "wow_export_encoding install ekey len")
+    let rootEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(build_info.DefaultClientPath, Value(rootKeyRes))
+    assert(IsOk(rootEntryRes), Error(rootEntryRes))
+    let rootBytesRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFirstBlock(build_info.DefaultClientPath, Value(rootEntryRes))
+    assert(IsOk(rootBytesRes), Error(rootBytesRes))
+    let rootHeaderRes: Result[wow_root.RootHeader] = wow_root.WowRootParseHeader(Value(rootBytesRes))
+    assert(IsOk(rootHeaderRes), Error(rootHeaderRes))
+    assert(Value(rootHeaderRes).totalFiles > 0, "wow_export_encoding root files")
+    let rootFirstRes: Result[wow_root.RootEntry] = wow_root.WowRootFirstEntry(Value(rootBytesRes))
+    assert(IsOk(rootFirstRes), Error(rootFirstRes))
+    assert(Value(rootFirstRes).fileDataID >= 0, "wow_export_encoding root first fileDataID")
+    let installEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(build_info.DefaultClientPath, Value(installKeyRes))
+    assert(IsOk(installEntryRes), Error(installEntryRes))
+    let installBytesRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFull(build_info.DefaultClientPath, Value(installEntryRes))
+    assert(IsOk(installBytesRes), Error(installBytesRes))
+    let installSummaryRes: Result[install.InstallSummary] = install.WowInstallSummary(Value(installBytesRes))
+    assert(IsOk(installSummaryRes), Error(installSummaryRes))
+    assert(Value(installSummaryRes).header.entryCount > 0, "wow_export_encoding install entries")
+    echo("wow_export_encoding_smoke ok")
+    return 0

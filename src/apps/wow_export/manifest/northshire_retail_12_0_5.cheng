@@ -1,8 +1,22 @@
+import std/result
+import std/seqs
 import std/strings as strings
 import std/strformat
 import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/local_files as local_files
 
 type
+    NorthshireAuditedFile =
+        label: str
+        kind: str
+        path: str
+        fileDataID: int32
+        contentKey: str
+        encodingKey: str
+        archiveIndex: int32
+        offset: int32
+        size: int32
+
     NorthshireManifest =
         product: str
         version: str
@@ -10,6 +24,10 @@ type
         locale: str
         clientPath: str
         auditedFileCount: int32
+        auditedFiles: NorthshireAuditedFile[]
+
+    NorthshireAuditSummary =
+        matchedFileCount: int32
 
 fn Manifest(): NorthshireManifest =
     var out: NorthshireManifest
@@ -18,11 +36,111 @@ fn Manifest(): NorthshireManifest =
     out.buildKey = build_info.DefaultBuildKey
     out.locale = build_info.DefaultLocale
     out.clientPath = build_info.DefaultClientPath
-    out.auditedFileCount = 0
+    out.auditedFiles = []
+    add(out.auditedFiles, NorthshireAuditedFile(label: "azeroth-wdt",
+                                                kind: "wdt",
+                                                path: "World/Maps/Azeroth/Azeroth.wdt",
+                                                fileDataID: 775971,
+                                                contentKey: "2c3ad0761f1baa8032c6c7ee84f77049",
+                                                encodingKey: "ed96d69da38751d830a8fe8d3f728529",
+                                                archiveIndex: 3,
+                                                offset: 77206312,
+                                                size: 19820))
+    add(out.auditedFiles, NorthshireAuditedFile(label: "northshire-abbey-wmo",
+                                                kind: "wmo",
+                                                path: "World/wmo/Azeroth/Buildings/NSabbey/NSabbey.wmo",
+                                                fileDataID: 107074,
+                                                contentKey: "7bee98b184d1f1e6ae514f1eae490b23",
+                                                encodingKey: "47d231e98004a43cc57ef6ca9836afaf",
+                                                archiveIndex: 52,
+                                                offset: 500200207,
+                                                size: 4780))
+    add(out.auditedFiles, NorthshireAuditedFile(label: "abbey-bell-texture",
+                                                kind: "blp",
+                                                path: "World/Azeroth/Elwynn/ActiveDoodads/AbbeyBell/ABBEYBELL.BLP",
+                                                fileDataID: 189598,
+                                                contentKey: "181baf573792fd5e108aa4ccec399f92",
+                                                encodingKey: "9dddb8c93d8746f5fabedb3a98719b5b",
+                                                archiveIndex: 57,
+                                                offset: 305877890,
+                                                size: 35831))
+    add(out.auditedFiles, NorthshireAuditedFile(label: "abbey-bell-model",
+                                                kind: "m2",
+                                                path: "World/Azeroth/ELWYNN/ActiveDoodads/AbbeyBell/nsabbeyBell.m2",
+                                                fileDataID: 189599,
+                                                contentKey: "c253d5be7f958452992ca4315200ced3",
+                                                encodingKey: "0f08d9373d5f0b3f15feeca0295f6917",
+                                                archiveIndex: 57,
+                                                offset: 627291208,
+                                                size: 6898))
+    out.auditedFileCount = out.auditedFiles.len
     return out
 
 fn ManifestReady(m: NorthshireManifest): bool =
-    return m.auditedFileCount > 0
+    if m.auditedFileCount <= 0 || m.auditedFiles.len != m.auditedFileCount:
+        return false
+    var i: int32
+    while i < m.auditedFiles.len:
+        let file: NorthshireAuditedFile = m.auditedFiles[i]
+        if file.fileDataID <= 0:
+            return false
+        if strings.Len(file.path) == 0 || strings.Len(file.kind) == 0:
+            return false
+        if strings.Len(file.contentKey) != 32 || strings.Len(file.encodingKey) != 32:
+            return false
+        if file.archiveIndex < 0 || file.offset < 0 || file.size <= 0:
+            return false
+        i = i + 1
+    return true
+
+fn northshireAuditFreeErr(ctx: var local_files.LocalCascContext,
+                          message: str): Result[NorthshireAuditSummary] =
+    local_files.FreeLocalCascContext(ctx)
+    return Err[NorthshireAuditSummary](message)
+
+fn AuditManifestAgainstLocal(m: NorthshireManifest): Result[NorthshireAuditSummary] =
+    if !ManifestReady(m):
+        return Err[NorthshireAuditSummary]("wowExport northshire manifest: incomplete audited file table")
+    if m.product != build_info.DefaultProduct ||
+        m.version != build_info.DefaultVersion ||
+        m.buildKey != build_info.DefaultBuildKey:
+        return Err[NorthshireAuditSummary]("wowExport northshire manifest: build identity drift")
+    let ctxRes: Result[local_files.LocalCascContext] = local_files.LoadLocalCascContext(m.clientPath)
+    if IsErr(ctxRes):
+        return Err[NorthshireAuditSummary](Error(ctxRes))
+    var ctx: local_files.LocalCascContext = Value(ctxRes)
+    var out: NorthshireAuditSummary
+    var i: int32
+    while i < m.auditedFiles.len:
+        let file: NorthshireAuditedFile = m.auditedFiles[i]
+        let auditRes: Result[local_files.LocalFileAudit] =
+            local_files.ResolveLocalFileAudit(ctx, file.fileDataID)
+        if IsErr(auditRes):
+            return northshireAuditFreeErr(ctx,
+                                          "wowExport northshire manifest: " + file.label + " audit failed: " + Error(auditRes))
+        let audit: local_files.LocalFileAudit = Value(auditRes)
+        if audit.contentKey != file.contentKey:
+            return northshireAuditFreeErr(ctx,
+                                          "wowExport northshire manifest: " + file.label + " contentKey mismatch want=" + file.contentKey + " got=" + audit.contentKey)
+        if audit.encodingKey != file.encodingKey:
+            return northshireAuditFreeErr(ctx,
+                                          "wowExport northshire manifest: " + file.label + " encodingKey mismatch want=" + file.encodingKey + " got=" + audit.encodingKey)
+        if audit.entry.archiveIndex != file.archiveIndex:
+            return northshireAuditFreeErr(ctx,
+                                          "wowExport northshire manifest: " + file.label + " archive mismatch want=" + strings.IntToStr(file.archiveIndex) + " got=" + strings.IntToStr(audit.entry.archiveIndex))
+        if audit.entry.offset != file.offset:
+            return northshireAuditFreeErr(ctx,
+                                          "wowExport northshire manifest: " + file.label + " offset mismatch want=" + strings.IntToStr(file.offset) + " got=" + strings.IntToStr(audit.entry.offset))
+        if audit.entry.size != file.size:
+            return northshireAuditFreeErr(ctx,
+                                          "wowExport northshire manifest: " + file.label + " size mismatch want=" + strings.IntToStr(file.size) + " got=" + strings.IntToStr(audit.entry.size))
+        out.matchedFileCount = out.matchedFileCount + 1
+        i = i + 1
+    local_files.FreeLocalCascContext(ctx)
+    return Ok[NorthshireAuditSummary](out)
+
+fn NorthshireAuditSummaryText(summary: NorthshireAuditSummary): str =
+    return Fmt"northshireAudit matchedFiles={strings.IntToStr(summary.matchedFileCount)}"
 
 fn ManifestText(m: NorthshireManifest): str =
     return Fmt"northshire_retail_12_0_5 product={m.product} version={m.version} buildKey={m.buildKey} locale={m.locale} auditedFiles={strings.IntToStr(m.auditedFileCount)}"

@@ -1,0 +1,343 @@
+import std/bytes as bytes
+import std/rawbytes as rawbytes
+import std/result
+import std/strings as strings
+import std/strformat
+import std/system
+import cheng/apps/wow_export/blte as blte
+import cheng/apps/wow_export/casc_index as casc_index
+
+type
+    File = ptr
+
+@importc("cheng_fopen")
+fn cascArchiveFopen(filename, mode: cstring): File
+@importc("cheng_fclose")
+fn cascArchiveFclose(f: File): int32
+@importc("cheng_fread")
+fn cascArchiveFread(dst: ptr, size, n: int64, stream: File): int32
+@importc("cheng_fseek")
+fn cascArchiveFseek(stream: File, offset: int64, whence: int32): int32
+
+const
+    cascArchiveSeekSet = 0
+    cascArchiveDataPrefix = "/Data/data/data."
+
+fn cascArchiveMakeByteBuffer(len: int32): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    if len <= 0:
+        out.len = 0
+        out.data = nil
+        return out
+    out.len = len
+    out.data = alloc(len)
+    return out
+
+fn cascArchiveArchivePathBytes(clientPath: str, archiveIndex: int32): Result[rawbytes.Bytes] =
+    if archiveIndex < 0 || archiveIndex > 999:
+        return Err[rawbytes.Bytes]("wowExport archive: archive index out of supported range")
+    let clientBytes: rawbytes.Bytes = rawbytes.BytesFromString(clientPath)
+    let prefixBytes: rawbytes.Bytes = rawbytes.BytesFromString(cascArchiveDataPrefix)
+    var pathNoNull: rawbytes.Bytes = rawbytes.BytesConcat(clientBytes, prefixBytes)
+    let totalLen: int32 = pathNoNull.len + 3
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(totalLen + 1)
+    rawbytes.BytesCopyInto(out, 0, pathNoNull)
+    rawbytes.BytesSet(out, pathNoNull.len, int32('0') + archiveIndex / 100)
+    rawbytes.BytesSet(out, pathNoNull.len + 1, int32('0') + (archiveIndex / 10) % 10)
+    rawbytes.BytesSet(out, pathNoNull.len + 2, int32('0') + archiveIndex % 10)
+    rawbytes.BytesSet(out, totalLen, 0)
+    rawbytes.BytesFree(pathNoNull)
+    return Ok[rawbytes.Bytes](out)
+
+fn CascArchiveReadFileSlice(path: str, offset: int32, count: int32): Result[bytes.ByteBuffer] =
+    if offset < 0 || count <= 0:
+        return Err[bytes.ByteBuffer]("wowExport archive: invalid file slice bounds")
+    let f: File = cascArchiveFopen(path, "rb")
+    if f == nil:
+        return Err[bytes.ByteBuffer]("wowExport archive: failed to open " + path)
+    let seekRc: int32 = cascArchiveFseek(f, int64(offset), cascArchiveSeekSet)
+    if seekRc != 0:
+        let _ = cascArchiveFclose(f)
+        return Err[bytes.ByteBuffer]("wowExport archive: failed to seek " + path)
+    let out: bytes.ByteBuffer = cascArchiveMakeByteBuffer(count)
+    var lenRead: int32
+    while lenRead < count:
+        let want: int32 = count - lenRead
+        let dst: ptr = system.system_ptr_add(out.data, lenRead)
+        let got: int32 = cascArchiveFread(dst, 1, int64(want), f)
+        if got <= 0:
+            let _ = cascArchiveFclose(f)
+            return Err[bytes.ByteBuffer]("wowExport archive: truncated slice " + path + " read=" + strings.IntToStr(lenRead) + " want=" + strings.IntToStr(count))
+        lenRead = lenRead + got
+    let _ = cascArchiveFclose(f)
+    return Ok[bytes.ByteBuffer](out)
+
+fn cascArchiveReadLocalArchiveSlice(clientPath: str,
+                                    archiveIndex: int32,
+                                    offset: int32,
+                                    count: int32): Result[bytes.ByteBuffer] =
+    let pathBytesRes: Result[rawbytes.Bytes] = cascArchiveArchivePathBytes(clientPath, archiveIndex)
+    if IsErr(pathBytesRes):
+        return Err[bytes.ByteBuffer](Error(pathBytesRes))
+    let pathBytes: rawbytes.Bytes = Value(pathBytesRes)
+    if offset < 0 || count <= 0:
+        rawbytes.BytesFree(pathBytes)
+        return Err[bytes.ByteBuffer]("wowExport archive: invalid file slice bounds")
+    let f: File = cascArchiveFopen(cstring(pathBytes.data), "rb")
+    if f == nil:
+        rawbytes.BytesFree(pathBytes)
+        return Err[bytes.ByteBuffer]("wowExport archive: failed to open local archive")
+    let seekRc: int32 = cascArchiveFseek(f, int64(offset), cascArchiveSeekSet)
+    if seekRc != 0:
+        let _ = cascArchiveFclose(f)
+        rawbytes.BytesFree(pathBytes)
+        return Err[bytes.ByteBuffer]("wowExport archive: failed to seek local archive")
+    let out: bytes.ByteBuffer = cascArchiveMakeByteBuffer(count)
+    var lenRead: int32
+    while lenRead < count:
+        let want: int32 = count - lenRead
+        let dst: ptr = system.system_ptr_add(out.data, lenRead)
+        let got: int32 = cascArchiveFread(dst, 1, int64(want), f)
+        if got <= 0:
+            let _ = cascArchiveFclose(f)
+            rawbytes.BytesFree(pathBytes)
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer]("wowExport archive: truncated local archive slice")
+        lenRead = lenRead + got
+    let _ = cascArchiveFclose(f)
+    rawbytes.BytesFree(pathBytes)
+    return Ok[bytes.ByteBuffer](out)
+
+fn cascArchiveU32BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport archive: truncated u32be")
+    let b0: int32 = bytes.BufByteAt(buf, idx)
+    let b1: int32 = bytes.BufByteAt(buf, idx + 1)
+    let b2: int32 = bytes.BufByteAt(buf, idx + 2)
+    let b3: int32 = bytes.BufByteAt(buf, idx + 3)
+    return Ok[int32]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
+
+fn cascArchiveBlteMagicAt(buf: bytes.ByteBuffer, idx: int32): bool =
+    if idx < 0 || idx + 4 > buf.len:
+        return false
+    return bytes.BufByteAt(buf, idx) == 0x42 &&
+        bytes.BufByteAt(buf, idx + 1) == 0x4c &&
+        bytes.BufByteAt(buf, idx + 2) == 0x54 &&
+        bytes.BufByteAt(buf, idx + 3) == 0x45
+
+fn cascArchiveBltePayloadOffset(prefix: bytes.ByteBuffer): Result[int32] =
+    if cascArchiveBlteMagicAt(prefix, 0):
+        return Ok[int32](0)
+    if cascArchiveBlteMagicAt(prefix, 30):
+        return Ok[int32](30)
+    return Err[int32]("wowExport archive: archive entry is not BLTE")
+
+fn CascArchiveReadLocalEntryFirstBlock(clientPath: str, entry: casc_index.CascIndexEntry): Result[bytes.ByteBuffer] =
+    var prefixCount: int32 = 38
+    if entry.size < prefixCount:
+        prefixCount = entry.size
+    let prefixRes: Result[bytes.ByteBuffer] =
+        cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, entry.offset, prefixCount)
+    if IsErr(prefixRes):
+        return Err[bytes.ByteBuffer](Error(prefixRes))
+    let prefix: bytes.ByteBuffer = Value(prefixRes)
+    let payloadOffsetRes: Result[int32] = cascArchiveBltePayloadOffset(prefix)
+    if IsErr(payloadOffsetRes):
+        bytes.FreeByteBuffer(prefix)
+        return Err[bytes.ByteBuffer](Error(payloadOffsetRes))
+    let payloadOffset: int32 = Value(payloadOffsetRes)
+    let payloadSize: int32 = entry.size - payloadOffset
+    if payloadSize < 8:
+        bytes.FreeByteBuffer(prefix)
+        return Err[bytes.ByteBuffer]("wowExport archive: BLTE payload too small")
+    let headerSizeRes: Result[int32] = cascArchiveU32BEAt(prefix, payloadOffset + 4)
+    if IsErr(headerSizeRes):
+        bytes.FreeByteBuffer(prefix)
+        return Err[bytes.ByteBuffer](Error(headerSizeRes))
+    let headerSize: int32 = Value(headerSizeRes)
+    bytes.FreeByteBuffer(prefix)
+    if headerSize < 0 || headerSize > payloadSize:
+        return Err[bytes.ByteBuffer]("wowExport archive: invalid BLTE header size")
+    if headerSize == 0:
+        return cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, entry.offset + payloadOffset, payloadSize)
+    let headerRes: Result[bytes.ByteBuffer] =
+        cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, entry.offset + payloadOffset, headerSize)
+    if IsErr(headerRes):
+        return Err[bytes.ByteBuffer](Error(headerRes))
+    let header: bytes.ByteBuffer = Value(headerRes)
+    if headerSize < 36:
+        bytes.FreeByteBuffer(header)
+        return Err[bytes.ByteBuffer]("wowExport archive: BLTE frame header too small")
+    let compSizeRes: Result[int32] = cascArchiveU32BEAt(header, 12)
+    if IsErr(compSizeRes):
+        bytes.FreeByteBuffer(header)
+        return Err[bytes.ByteBuffer](Error(compSizeRes))
+    let totalNeed: int32 = headerSize + Value(compSizeRes)
+    bytes.FreeByteBuffer(header)
+    if totalNeed <= 0 || totalNeed > payloadSize:
+        return Err[bytes.ByteBuffer]("wowExport archive: invalid first block size")
+    return cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, entry.offset + payloadOffset, totalNeed)
+
+fn CascArchiveDecodeLocalEntryFirstBlock(clientPath: str, entry: casc_index.CascIndexEntry): Result[bytes.ByteBuffer] =
+    let blteRes: Result[bytes.ByteBuffer] = CascArchiveReadLocalEntryFirstBlock(clientPath, entry)
+    if IsErr(blteRes):
+        return Err[bytes.ByteBuffer](Error(blteRes))
+    let blteBuf: bytes.ByteBuffer = Value(blteRes)
+    let decodedRes: Result[bytes.ByteBuffer] = blte.DecodeFirstBlockWithKey(blteBuf, "")
+    bytes.FreeByteBuffer(blteBuf)
+    return decodedRes
+
+fn CascArchiveReadLocalEntryBlte(clientPath: str, entry: casc_index.CascIndexEntry): Result[bytes.ByteBuffer] =
+    var payloadOffset: int32
+    var payloadSize: int32
+    let payloadRes: Result[bool] =
+        cascArchiveResolveLocalEntryPayload(clientPath, entry, payloadOffset, payloadSize)
+    if IsErr(payloadRes):
+        return Err[bytes.ByteBuffer](Error(payloadRes))
+    return cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, entry.offset + payloadOffset, payloadSize)
+
+fn CascArchiveDecodeLocalEntryFull(clientPath: str, entry: casc_index.CascIndexEntry): Result[bytes.ByteBuffer] =
+    let blteRes: Result[bytes.ByteBuffer] = CascArchiveReadLocalEntryBlte(clientPath, entry)
+    if IsErr(blteRes):
+        return Err[bytes.ByteBuffer](Error(blteRes))
+    let blteBuf: bytes.ByteBuffer = Value(blteRes)
+    let decodedRes: Result[bytes.ByteBuffer] = blte.DecodeAllBlocksWithKey(blteBuf, "")
+    bytes.FreeByteBuffer(blteBuf)
+    return decodedRes
+
+fn cascArchiveResolveLocalEntryPayload(clientPath: str,
+                                       entry: casc_index.CascIndexEntry,
+                                       payloadOffsetOut: var int32,
+                                       payloadSizeOut: var int32): Result[bool] =
+    var prefixCount: int32 = 38
+    if entry.size < prefixCount:
+        prefixCount = entry.size
+    let prefixRes: Result[bytes.ByteBuffer] =
+        cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, entry.offset, prefixCount)
+    if IsErr(prefixRes):
+        return Err[bool](Error(prefixRes))
+    let prefix: bytes.ByteBuffer = Value(prefixRes)
+    let payloadOffsetRes: Result[int32] = cascArchiveBltePayloadOffset(prefix)
+    if IsErr(payloadOffsetRes):
+        bytes.FreeByteBuffer(prefix)
+        return Err[bool](Error(payloadOffsetRes))
+    bytes.FreeByteBuffer(prefix)
+    payloadOffsetOut = Value(payloadOffsetRes)
+    payloadSizeOut = entry.size - payloadOffsetOut
+    if payloadSizeOut < 9:
+        return Err[bool]("wowExport archive: BLTE payload too small")
+    return Ok[bool](true)
+
+fn cascArchiveReadLocalEntryHeaderBytes(clientPath: str,
+                                        entry: casc_index.CascIndexEntry,
+                                        payloadOffsetOut: var int32,
+                                        payloadSizeOut: var int32): Result[bytes.ByteBuffer] =
+    let payloadRes: Result[bool] =
+        cascArchiveResolveLocalEntryPayload(clientPath, entry, payloadOffsetOut, payloadSizeOut)
+    if IsErr(payloadRes):
+        return Err[bytes.ByteBuffer](Error(payloadRes))
+    let headerPrefixRes: Result[bytes.ByteBuffer] =
+        cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, entry.offset + payloadOffsetOut, 8)
+    if IsErr(headerPrefixRes):
+        return Err[bytes.ByteBuffer](Error(headerPrefixRes))
+    let headerPrefix: bytes.ByteBuffer = Value(headerPrefixRes)
+    let headerSizeRes: Result[int32] = cascArchiveU32BEAt(headerPrefix, 4)
+    if IsErr(headerSizeRes):
+        bytes.FreeByteBuffer(headerPrefix)
+        return Err[bytes.ByteBuffer](Error(headerSizeRes))
+    bytes.FreeByteBuffer(headerPrefix)
+    let headerSize: int32 = Value(headerSizeRes)
+    if headerSize < 0 || headerSize > payloadSizeOut:
+        return Err[bytes.ByteBuffer]("wowExport archive: invalid BLTE header size")
+    if headerSize == 0:
+        return cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, entry.offset + payloadOffsetOut, payloadSizeOut)
+    return cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, entry.offset + payloadOffsetOut, headerSize)
+
+fn CascArchiveReadLocalEntryBlteHeader(clientPath: str, entry: casc_index.CascIndexEntry): Result[blte.BlteHeader] =
+    var payloadOffset: int32
+    var payloadSize: int32
+    let headerBytesRes: Result[bytes.ByteBuffer] =
+        cascArchiveReadLocalEntryHeaderBytes(clientPath, entry, payloadOffset, payloadSize)
+    if IsErr(headerBytesRes):
+        return Err[blte.BlteHeader](Error(headerBytesRes))
+    let headerBytes: bytes.ByteBuffer = Value(headerBytesRes)
+    let headerRes: Result[blte.BlteHeader] = blte.ParseBlteHeader(headerBytes, "", false)
+    bytes.FreeByteBuffer(headerBytes)
+    return headerRes
+
+fn cascArchiveCopyRangeInto(dst: bytes.ByteBuffer,
+                            dstOffset: int32,
+                            src: bytes.ByteBuffer,
+                            srcOffset: int32,
+                            count: int32): Result[bool] =
+    if dstOffset < 0 || srcOffset < 0 || count < 0:
+        return Err[bool]("wowExport archive: range copy negative bounds")
+    if dstOffset + count > dst.len || srcOffset + count > src.len:
+        return Err[bool]("wowExport archive: range copy out of bounds")
+    var i: int32
+    while i < count:
+        bytes.BufSetByte(dst, dstOffset + i, bytes.BufByteAt(src, srcOffset + i))
+        i = i + 1
+    return Ok[bool](true)
+
+fn CascArchiveDecodeLocalEntryRange(clientPath: str,
+                                    entry: casc_index.CascIndexEntry,
+                                    decodedStart: int32,
+                                    decodedCount: int32): Result[bytes.ByteBuffer] =
+    if decodedStart < 0 || decodedCount <= 0:
+        return Err[bytes.ByteBuffer]("wowExport archive: invalid decoded range")
+    var payloadOffset: int32
+    var payloadSize: int32
+    let headerBytesRes: Result[bytes.ByteBuffer] =
+        cascArchiveReadLocalEntryHeaderBytes(clientPath, entry, payloadOffset, payloadSize)
+    if IsErr(headerBytesRes):
+        return Err[bytes.ByteBuffer](Error(headerBytesRes))
+    let headerBytes: bytes.ByteBuffer = Value(headerBytesRes)
+    let headerRes: Result[blte.BlteHeader] = blte.ParseBlteHeader(headerBytes, "", false)
+    bytes.FreeByteBuffer(headerBytes)
+    if IsErr(headerRes):
+        return Err[bytes.ByteBuffer](Error(headerRes))
+    let header: blte.BlteHeader = Value(headerRes)
+    if decodedStart + decodedCount > header.totalDecompSize:
+        return Err[bytes.ByteBuffer]("wowExport archive: decoded range extends past BLTE output")
+    let out: bytes.ByteBuffer = cascArchiveMakeByteBuffer(decodedCount)
+    var copied: int32
+    while copied < decodedCount:
+        let absDecoded: int32 = decodedStart + copied
+        let blockIndexRes: Result[int32] = blte.FindBlockForDecodedRange(header, absDecoded)
+        if IsErr(blockIndexRes):
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer](Error(blockIndexRes))
+        let blockIndex: int32 = Value(blockIndexRes)
+        let block: blte.BlteBlock = header.blocks[blockIndex]
+        let blockOffsetInDecoded: int32 = absDecoded - block.decompOffset
+        var take: int32 = block.decompSize - blockOffsetInDecoded
+        if take > decodedCount - copied:
+            take = decodedCount - copied
+        let blockFileOffset: int32 = entry.offset + payloadOffset + header.dataStart + block.fileOffset
+        let blockBytesRes: Result[bytes.ByteBuffer] =
+            cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, blockFileOffset, block.compSize)
+        if IsErr(blockBytesRes):
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer](Error(blockBytesRes))
+        let blockBytes: bytes.ByteBuffer = Value(blockBytesRes)
+        let hashRes: Result[bool] = blte.VerifyBlockPayloadHash(blockBytes, block.hash)
+        if IsErr(hashRes):
+            bytes.FreeByteBuffer(blockBytes)
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer](Error(hashRes))
+        let decodedBlockRes: Result[bytes.ByteBuffer] =
+            blte.DecodeBlockPayloadWithKey(blockBytes, blockIndex, block.decompSize, "")
+        bytes.FreeByteBuffer(blockBytes)
+        if IsErr(decodedBlockRes):
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer](Error(decodedBlockRes))
+        let decodedBlock: bytes.ByteBuffer = Value(decodedBlockRes)
+        let copyRes: Result[bool] =
+            cascArchiveCopyRangeInto(out, copied, decodedBlock, blockOffsetInDecoded, take)
+        bytes.FreeByteBuffer(decodedBlock)
+        if IsErr(copyRes):
+            bytes.FreeByteBuffer(out)
+            return Err[bytes.ByteBuffer](Error(copyRes))
+        copied = copied + take
+    return Ok[bytes.ByteBuffer](out)

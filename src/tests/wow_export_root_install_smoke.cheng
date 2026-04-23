@@ -1,0 +1,70 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/casc_archive as casc_archive
+import cheng/apps/wow_export/casc_index as casc_index
+import cheng/apps/wow_export/config as config
+import cheng/apps/wow_export/encoding as encoding
+import cheng/apps/wow_export/install as install
+import cheng/apps/wow_export/root as root
+
+fn loadDecodedByEncodingKey(encodingKey: str): Result[bytes.ByteBuffer] =
+    let entryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(build_info.DefaultClientPath, encodingKey)
+    if IsErr(entryRes):
+        return Err[bytes.ByteBuffer](Error(entryRes))
+    return casc_archive.CascArchiveDecodeLocalEntryFull(build_info.DefaultClientPath, Value(entryRes))
+
+fn main(): int32 =
+    let buildRes: Result[build_info.WowBuildEntry] = build_info.ProbeRetailDefault()
+    assert(IsOk(buildRes), Error(buildRes))
+    let cfgRes: Result[config.BuildConfig] =
+        config.LoadBuildConfig(build_info.DefaultClientPath, Value(buildRes).buildKey)
+    assert(IsOk(cfgRes), Error(cfgRes))
+    let cfg: config.BuildConfig = Value(cfgRes)
+
+    let encodingEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(build_info.DefaultClientPath, cfg.encodingEncodingKey)
+    assert(IsOk(encodingEntryRes), Error(encodingEntryRes))
+    let encodingBufRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryFull(build_info.DefaultClientPath, Value(encodingEntryRes))
+    assert(IsOk(encodingBufRes), Error(encodingBufRes))
+    let encodingBuf: bytes.ByteBuffer = Value(encodingBufRes)
+
+    let rootKeyRes: Result[str] = encoding.WowEncodingFindEncodingKey(encodingBuf, cfg.root)
+    assert(IsOk(rootKeyRes), Error(rootKeyRes))
+    let installKeyRes: Result[str] = encoding.WowEncodingFindEncodingKey(encodingBuf, cfg.installContentKey)
+    assert(IsOk(installKeyRes), Error(installKeyRes))
+
+    let rootBufRes: Result[bytes.ByteBuffer] = loadDecodedByEncodingKey(Value(rootKeyRes))
+    assert(IsOk(rootBufRes), Error(rootBufRes))
+    let installBufRes: Result[bytes.ByteBuffer] = loadDecodedByEncodingKey(Value(installKeyRes))
+    assert(IsOk(installBufRes), Error(installBufRes))
+
+    let rootSummaryRes: Result[root.RootSummary] = root.WowRootSummary(Value(rootBufRes))
+    assert(IsOk(rootSummaryRes), Error(rootSummaryRes))
+    let rootSummary: root.RootSummary = Value(rootSummaryRes)
+    assert(rootSummary.groupCount > 0, "wow_export_root_install root group count")
+    assert(rootSummary.first.fileDataID >= 0, "wow_export_root_install first fileDataID")
+    assert(strings.Len(rootSummary.first.contentKey) == 32, "wow_export_root_install first root ckey")
+
+    let rootByIdRes: Result[root.RootEntry] =
+        root.WowRootFindByFileDataID(Value(rootBufRes), rootSummary.first.fileDataID, 0)
+    assert(IsOk(rootByIdRes), Error(rootByIdRes))
+    let rootByKeyRes: Result[root.RootEntry] =
+        root.WowRootFindByContentKey(Value(rootBufRes), rootSummary.first.contentKey, 0)
+    assert(IsOk(rootByKeyRes), Error(rootByKeyRes))
+
+    let installSummaryRes: Result[install.InstallSummary] = install.WowInstallSummary(Value(installBufRes))
+    assert(IsOk(installSummaryRes), Error(installSummaryRes))
+    let installSummary: install.InstallSummary = Value(installSummaryRes)
+    assert(installSummary.header.entryCount > 0, "wow_export_root_install install entry count")
+    assert(strings.Len(installSummary.first.name) > 0, "wow_export_root_install first install name")
+    assert(strings.Len(installSummary.first.contentKey) == 32, "wow_export_root_install first install ckey")
+
+    let installFindRes: Result[install.InstallEntry] =
+        install.WowInstallFindEntryByNameContains(Value(installBufRes), installSummary.first.name)
+    assert(IsOk(installFindRes), Error(installFindRes))
+    echo("wow_export_root_install_smoke ok")
+    return 0

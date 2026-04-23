@@ -9,5 +9,16 @@
 - 已完成：`run-host-smokes <smoke...>` 的普通 fixture 控制面从 C seed 迁到 backend driver 的纯 Cheng host smoke gate。
 - 已完成：world/libp2p 自托管主线 smoke 通过，覆盖 managed dependency mirror、world bundle sync、fresh-node selfhost receipt、multi-hop migration proof。
 - 已完成：`world-receipt` 控制面从 C seed 转入 `src/core/tooling/world_receipt_gate.cheng`，backend driver 不再把该命令转发给 `stage3 system-link-exec`；它是 world/proof 命令，不进入核心编译门禁。
-- 下一步：继续把 `system-link-exec` 的 object/native-link materializer 从 C seed 拆到小 Cheng 模块；`run-stage23-libp2p-smokes`、tail/domain gates 和大型应用/领域 smoke 保持显式运行，不放回核心门禁。
+- 已完成：backend driver 的 `print-line-map` 文本生成改由 `src/core/backend/line_map.cheng` 执行，不再为该命令转发到 C seed。
+- 已完成：backend driver 的 `debug-report` / `print-symbols` 文本生成改由轻量 `src/core/tooling/debug_tools_gate.cheng` 执行，不再为这两个命令转发到 C seed。
+- 已完成：world/full-closure manifest 的 root-stable 口径修正，`csg_root_cid` 全面使用 canonical CSG，source closure 按 module path 稳定排序，migration equivalence 不再绑定 source bundle/raw graph。
+- 已完成：backend driver 的 `system-link-exec` 成功 exe 编译后由 `src/core/backend/line_map.cheng::WriteExecutableLineMap` 写 `.map` sidecar；C seed 在 driver 转发路径只负责链接，不再写该 sidecar。
+- 下一步：继续把 `system-link-exec` 的 provider objects、primary object emit、native link 从 C seed 拆到小 Cheng 模块；`run-stage23-libp2p-smokes`、tail/domain gates 和大型应用/领域 smoke 保持显式运行，不放回核心门禁。
+- 本次边界审计切片：
+  - provider objects -> `src/core/backend/provider_object_materializer.cheng`; 验证用 `artifacts/backend_driver/cheng debug-report --root:. --in:src/tests/ordinary_call_chain_fixture.cheng --target:arm64-apple-darwin --emit:obj`
+  - primary object emit -> `src/core/backend/primary_object_materializer.cheng`; 验证用 `artifacts/backend_driver/cheng print-asm --root:. --in:src/tests/ordinary_call_chain_fixture.cheng --target:arm64-apple-darwin --emit:obj`
+  - native link -> `src/core/backend/native_link_materializer.cheng`; 验证用 `artifacts/backend_driver/cheng system-link-exec --root:. --in:src/tests/ordinary_zero_exit_fixture.cheng --target:arm64-apple-darwin --emit:exe --out:/tmp/cheng-native-link-smoke`
+  - line-map text/print command -> 已落 `src/core/backend/line_map.cheng`; 验证用 `artifacts/backend_driver/cheng print-line-map --root:. --in:src/tests/ordinary_zero_exit_fixture.cheng --target:arm64-apple-darwin --emit:obj`
+  - line-map sidecar write -> 已接 `src/core/backend/line_map.cheng::WriteExecutableLineMap` 到 backend driver `system-link-exec` 成功路径；验证用 `artifacts/backend_driver/cheng run-host-smokes seed_minimization_boundary_smoke`
+  - debug tools -> 已接入 backend driver command surface 和 `verify-debug-tools`；验证用 `artifacts/backend_driver/cheng verify-debug-tools`
 - 验收口径：源码、路径名、二进制字符串 grep 清零；`bootstrap-bridge`、路径 smoke、共享 builtin smoke、tooling 文档 smoke、应用迁移 smoke 通过。

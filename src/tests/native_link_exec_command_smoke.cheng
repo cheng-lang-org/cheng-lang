@@ -1,0 +1,132 @@
+import std/os
+import std/strings
+import std/os_host_process as hostos
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/native_link_exec as nlexec
+import cheng/core/backend/native_link_plan as nplan
+
+fn expectArgv(actual: str[], expected: str[], label: str) =
+    assert(actual.len == expected.len, label + " len")
+    var i: int32
+    while i < expected.len:
+        assert(actual[i] == expected[i], label + " item[" + intToStr(i) + "]")
+        i = i + 1
+
+fn buildPlan(targetTriple: str,
+               emitKind: creq.CompilerEmit,
+               outputKind: nplan.NativeOutputKind,
+               linkerProgram: str,
+               linkerFlavor: str,
+               outputPath: str,
+               input0: str,
+               input1: str): nplan.NativeLinkPlanStub =
+    var plan: nplan.NativeLinkPlanStub
+    plan.targetTriple = targetTriple
+    plan.emitKind = emitKind
+    plan.outputPath = outputPath
+    plan.linkerProgram = linkerProgram
+    plan.linkerFlavor = linkerFlavor
+    plan.outputKind = outputKind
+    plan.entrySymbol = "main"
+    plan.primaryObjectPath = input0
+    plan.browserBridgeObjectPath = ""
+    plan.linkInputPaths = [input0, input1]
+    plan.missingReasons = []
+    plan.pipelineStage = "object_plan_to_native_link_plan"
+    return plan
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let outDir = chengpath.PathAbsolute(root, "artifacts/native_link_exec_command_smoke")
+    assert(chengpath.MkdirP(root, outDir), " native link exec smoke: mkdir")
+
+    let input0 = os.JoinPath(outDir, "input-0.o")
+    let input1 = os.JoinPath(outDir, "input-1.o")
+    let exeOut = os.JoinPath(outDir, "native-link-exe")
+    let sharedOut = os.JoinPath(outDir, "native-link-shared.dylib")
+    os.WriteFile(input0, "x")
+    os.WriteFile(input1, "y")
+    if chengpath.PathFileExists(exeOut):
+        os.RemoveFile(exeOut)
+    if chengpath.PathFileExists(sharedOut):
+        os.RemoveFile(sharedOut)
+
+    let exePlan = buildPlan("arm64-apple-darwin",
+                             creq.EmitExe,
+                             nplan.NativeOutputExecutable,
+                             "cc",
+                             "ld64",
+                             exeOut,
+                             input0,
+                             input1)
+    let exeArgvRes = nlexec.NativeLinkExecArgv(exePlan)
+    assert(IsOk(exeArgvRes), " native link exec smoke: exe argv ok")
+    let exeArgv = Value(exeArgvRes)
+    expectArgv(exeArgv,
+               [
+                   "-arch",
+                   "arm64",
+                   input0,
+                   input1,
+                   "-o",
+                   exeOut
+               ],
+               " native link exec smoke: exe argv")
+    let exeCommandTextRes = nlexec.NativeLinkExecCommandText(exePlan)
+    assert(IsOk(exeCommandTextRes), " native link exec smoke: exe command text ok")
+    let exeCommandText = Value(exeCommandTextRes)
+    let exeExpectedCommandText = hostos.OsHostProcessCommandText("cc", exeArgv, [])
+    assert(exeCommandText == exeExpectedCommandText,
+           " native link exec smoke: exe command text")
+    assert(strings.StrContains(exeCommandText, "'-arch'"),
+           " native link exec smoke: exe arch text")
+    assert(!strings.StrContains(exeCommandText, "-dynamiclib"),
+           " native link exec smoke: exe no shared flag")
+
+    let sharedPlan = buildPlan("arm64-apple-darwin",
+                               creq.EmitShared,
+                               nplan.NativeOutputArtifact,
+                               "cc",
+                               "ld64",
+                               sharedOut,
+                               input0,
+                               input1)
+    let sharedArgvRes = nlexec.NativeLinkExecArgv(sharedPlan)
+    assert(IsOk(sharedArgvRes), " native link exec smoke: shared argv ok")
+    let sharedArgv = Value(sharedArgvRes)
+    expectArgv(sharedArgv,
+               [
+                   "-dynamiclib",
+                   "-arch",
+                   "arm64",
+                   input0,
+                   input1,
+                   "-o",
+                   sharedOut
+               ],
+               " native link exec smoke: shared argv")
+    let sharedCommandTextRes = nlexec.NativeLinkExecCommandText(sharedPlan)
+    assert(IsOk(sharedCommandTextRes), " native link exec smoke: shared command text ok")
+    let sharedCommandText = Value(sharedCommandTextRes)
+    let sharedExpectedCommandText = hostos.OsHostProcessCommandText("cc", sharedArgv, [])
+    assert(sharedCommandText == sharedExpectedCommandText,
+           " native link exec smoke: shared command text")
+    assert(strings.StrContains(sharedCommandText, "'-dynamiclib'"),
+           " native link exec smoke: shared dynamiclib text")
+
+    let badTargetPlan = buildPlan("x86_64-apple-darwin",
+                                  creq.EmitExe,
+                                  nplan.NativeOutputExecutable,
+                                  "cc",
+                                  "ld64",
+                                  exeOut,
+                                  input0,
+                                  input1)
+    let badTargetRes = nlexec.NativeLinkExecArgv(badTargetPlan)
+    assert(!IsOk(badTargetRes), " native link exec smoke: unsupported target rejected")
+    assert(strings.StrContains(Error(badTargetRes), "unsupported target"),
+           " native link exec smoke: unsupported target message")
+
+    echo(" native_link_exec_command_smoke ok")
+    return 0

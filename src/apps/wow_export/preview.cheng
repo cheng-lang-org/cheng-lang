@@ -1,7 +1,10 @@
+import std/bytes as bytes
 import std/result
 import std/strings as strings
 import std/strformat
-import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/asset_formats as asset_formats
+import cheng/apps/wow_export/blp as blp
+import cheng/apps/wow_export/local_files as local_files
 import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
 
 type
@@ -10,28 +13,98 @@ type
         height: int32
         frames: int32
         sceneNonEmpty: bool
+        auditedFileCount: int32
+        loadedFileCount: int32
+        chunkFileCount: int32
+        totalChunkCount: int32
+        textureWidth: int32
+        textureHeight: int32
+        wmoChunkCount: int32
+        m2Version: int32
+        assetBytes: int32
         characterVertexCount: int32
-        animationTicks: int32
+        animationSequenceCount: int32
         memoryOutstanding: int32
+
+fn previewApplyChunkedAsset(summary: var PreviewSummary, buf: bytes.ByteBuffer, label: str): Result[bool] =
+    let headerRes: Result[asset_formats.FormatHeader] = asset_formats.ParseChunkedHeader(buf, label)
+    if IsErr(headerRes):
+        return Err[bool](Error(headerRes))
+    summary.chunkFileCount = summary.chunkFileCount + 1
+    summary.totalChunkCount = summary.totalChunkCount + Value(headerRes).chunkCount
+    if label == "northshire-wmo":
+        summary.wmoChunkCount = Value(headerRes).chunkCount
+    return Ok[bool](true)
+
+fn previewLoadAuditedAssets(summary: var PreviewSummary,
+                            manifest: northshire.NorthshireManifest): Result[bool] =
+    var i: int32
+    while i < manifest.auditedFiles.len:
+        let file: northshire.NorthshireAuditedFile = manifest.auditedFiles[i]
+        let fileRes: Result[bytes.ByteBuffer] =
+            local_files.ReadLocalFileByEntry(manifest.clientPath, file.archiveIndex, file.offset, file.size)
+        if IsErr(fileRes):
+            return Err[bool]("wowExport preview: failed to load " + file.path + ": " + Error(fileRes))
+        let fileBuf: bytes.ByteBuffer = Value(fileRes)
+        summary.loadedFileCount = summary.loadedFileCount + 1
+        summary.assetBytes = summary.assetBytes + fileBuf.len
+        if file.kind == "wdt":
+            let chunkRes: Result[bool] = previewApplyChunkedAsset(summary, fileBuf, "northshire-wdt")
+            bytes.FreeByteBuffer(fileBuf)
+            if IsErr(chunkRes):
+                return Err[bool](Error(chunkRes))
+        elif file.kind == "wmo":
+            let chunkRes: Result[bool] = previewApplyChunkedAsset(summary, fileBuf, "northshire-wmo")
+            bytes.FreeByteBuffer(fileBuf)
+            if IsErr(chunkRes):
+                return Err[bool](Error(chunkRes))
+        elif file.kind == "m2":
+            let headerRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(fileBuf)
+            bytes.FreeByteBuffer(fileBuf)
+            if IsErr(headerRes):
+                return Err[bool](Error(headerRes))
+            summary.m2Version = Value(headerRes).version
+            summary.characterVertexCount = Value(headerRes).vertexCount
+            summary.animationSequenceCount = Value(headerRes).sequenceCount
+        elif file.kind == "blp":
+            let headerRes: Result[blp.Blp2Header] = blp.ParseBlp2Header(fileBuf)
+            bytes.FreeByteBuffer(fileBuf)
+            if IsErr(headerRes):
+                return Err[bool](Error(headerRes))
+            summary.textureWidth = Value(headerRes).width
+            summary.textureHeight = Value(headerRes).height
+        else:
+            bytes.FreeByteBuffer(fileBuf)
+            return Err[bool]("wowExport preview: unsupported audited file kind " + file.kind)
+        i = i + 1
+    return Ok[bool](true)
 
 fn PreviewNorthshire(frames: int32): Result[PreviewSummary] =
     if frames <= 0:
         return Err[PreviewSummary]("wowExport preview: frames must be positive")
-    let buildRes: Result[build_info.WowBuildEntry] = build_info.ProbeRetailDefault()
-    if IsErr(buildRes):
-        return Err[PreviewSummary](Error(buildRes))
     let manifest: northshire.NorthshireManifest = northshire.Manifest()
     if !northshire.ManifestReady(manifest):
         return Err[PreviewSummary]("wowExport preview: northshire manifest has no audited fileDataIDs; refusing to render fake geometry")
+    let auditRes: Result[northshire.NorthshireAuditSummary] = northshire.AuditManifestAgainstLocal(manifest)
+    if IsErr(auditRes):
+        return Err[PreviewSummary](Error(auditRes))
     var out: PreviewSummary
     out.width = 1280
     out.height = 720
     out.frames = frames
-    out.sceneNonEmpty = true
-    out.characterVertexCount = 0
-    out.animationTicks = frames
+    out.auditedFileCount = Value(auditRes).matchedFileCount
+    let loadRes: Result[bool] = previewLoadAuditedAssets(out, manifest)
+    if IsErr(loadRes):
+        return Err[PreviewSummary](Error(loadRes))
+    out.sceneNonEmpty = out.loadedFileCount == out.auditedFileCount &&
+        out.wmoChunkCount > 0 &&
+        out.m2Version > 0 &&
+        out.characterVertexCount > 0 &&
+        out.animationSequenceCount > 0 &&
+        out.textureWidth > 0 &&
+        out.textureHeight > 0
     out.memoryOutstanding = 0
     return Ok[PreviewSummary](out)
 
 fn PreviewSummaryText(summary: PreviewSummary): str =
-    return Fmt"size={strings.IntToStr(summary.width)}x{strings.IntToStr(summary.height)} frames={strings.IntToStr(summary.frames)} scene={summary.sceneNonEmpty ? \"non-empty\" : \"empty\"} characterVertices={strings.IntToStr(summary.characterVertexCount)} animationTicks={strings.IntToStr(summary.animationTicks)} memoryOutstanding={strings.IntToStr(summary.memoryOutstanding)}"
+    return Fmt"size={strings.IntToStr(summary.width)}x{strings.IntToStr(summary.height)} frames={strings.IntToStr(summary.frames)} scene={summary.sceneNonEmpty ? \"non-empty\" : \"empty\"} auditedFiles={strings.IntToStr(summary.auditedFileCount)} loadedFiles={strings.IntToStr(summary.loadedFileCount)} chunkFiles={strings.IntToStr(summary.chunkFileCount)} totalChunks={strings.IntToStr(summary.totalChunkCount)} wmoChunks={strings.IntToStr(summary.wmoChunkCount)} m2Version={strings.IntToStr(summary.m2Version)} texture={strings.IntToStr(summary.textureWidth)}x{strings.IntToStr(summary.textureHeight)} assetBytes={strings.IntToStr(summary.assetBytes)} characterVertices={strings.IntToStr(summary.characterVertexCount)} animationSequences={strings.IntToStr(summary.animationSequenceCount)} memoryOutstanding={strings.IntToStr(summary.memoryOutstanding)}"

@@ -1,0 +1,252 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import std/strformat
+import cheng/apps/wow_export/binary as binary
+
+type
+    RootHeader =
+        version: int32
+        dataOffset: int32
+        totalFiles: int32
+        filesWithNameHash: int32
+
+    RootEntry =
+        fileDataID: int32
+        contentKey: str
+        localeFlags: int32
+        contentFlags: int32
+        hasNameHash: bool
+
+    RootSummary =
+        header: RootHeader
+        groupCount: int32
+        first: RootEntry
+
+const
+    wowRootNoNameHash = 0x10000000
+
+fn rootHasSignature(buf: bytes.ByteBuffer): bool =
+    if buf.len < 4:
+        return false
+    return bytes.BufByteAt(buf, 0) == int32('T') &&
+        bytes.BufByteAt(buf, 1) == int32('S') &&
+        bytes.BufByteAt(buf, 2) == int32('F') &&
+        bytes.BufByteAt(buf, 3) == int32('M')
+
+fn WowRootParseHeader(buf: bytes.ByteBuffer): Result[RootHeader] =
+    if buf.len < 12:
+        return Err[RootHeader]("wowExport root: file too small")
+    var out: RootHeader
+    if rootHasSignature(buf):
+        if buf.len >= 20:
+            let sizeOfHeader: int32 = bytes.ReadU32LEAt(buf, 4)
+            let version: int32 = bytes.ReadU32LEAt(buf, 8)
+            let totalFiles: int32 = bytes.ReadU32LEAt(buf, 12)
+            let filesWithNameHash: int32 = bytes.ReadU32LEAt(buf, 16)
+            if (version == 1 || version == 2) && filesWithNameHash <= totalFiles:
+                out.version = version
+                out.dataOffset = sizeOfHeader < 4 ? 4 : sizeOfHeader
+                out.totalFiles = totalFiles
+                out.filesWithNameHash = filesWithNameHash
+                if out.dataOffset > buf.len:
+                    return Err[RootHeader]("wowExport root: header extends past buffer")
+                return Ok[RootHeader](out)
+        let totalFiles: int32 = bytes.ReadU32LEAt(buf, 4)
+        let filesWithNameHash: int32 = bytes.ReadU32LEAt(buf, 8)
+        if filesWithNameHash > totalFiles:
+            return Err[RootHeader]("wowExport root: invalid TSFM header")
+        out.version = 0
+        out.dataOffset = 12
+        out.totalFiles = totalFiles
+        out.filesWithNameHash = filesWithNameHash
+        return Ok[RootHeader](out)
+    out.version = 0
+    out.dataOffset = 0
+    out.totalFiles = 0
+    out.filesWithNameHash = 0
+    return Ok[RootHeader](out)
+
+fn rootGroupHeaderSize(header: RootHeader): int32 =
+    return header.version == 2 ? 17 : 12
+
+fn rootParseGroup(buf: bytes.ByteBuffer,
+                  header: RootHeader,
+                  groupOffset: int32,
+                  nextGroupOffset: var int32,
+                  fileCount: var int32,
+                  localeFlags: var int32,
+                  contentFlags: var int32,
+                  fileIdsOffset: var int32,
+                  contentKeysOffset: var int32,
+                  hasNameHashes: var bool): Result[bool] =
+    let groupHeaderSize: int32 = rootGroupHeaderSize(header)
+    if groupOffset < 0 || groupOffset + groupHeaderSize > buf.len:
+        return Err[bool]("wowExport root: truncated group header")
+    fileCount = bytes.ReadU32LEAt(buf, groupOffset)
+    if fileCount < 0:
+        return Err[bool]("wowExport root: invalid file count")
+    if header.version == 2:
+        localeFlags = bytes.ReadU32LEAt(buf, groupOffset + 4)
+        let contentFlags1: int32 = bytes.ReadU32LEAt(buf, groupOffset + 8)
+        let contentFlags2: int32 = bytes.ReadU32LEAt(buf, groupOffset + 12)
+        let contentFlags3: int32 = bytes.BufByteAt(buf, groupOffset + 16)
+        contentFlags = contentFlags1 | contentFlags2 | (contentFlags3 << 17)
+    else:
+        contentFlags = bytes.ReadU32LEAt(buf, groupOffset + 4)
+        localeFlags = bytes.ReadU32LEAt(buf, groupOffset + 8)
+    fileIdsOffset = groupOffset + groupHeaderSize
+    contentKeysOffset = fileIdsOffset + fileCount * 4
+    nextGroupOffset = contentKeysOffset + fileCount * 16
+    hasNameHashes = (contentFlags & wowRootNoNameHash) == 0
+    if hasNameHashes:
+        nextGroupOffset = nextGroupOffset + fileCount * 8
+    if fileIdsOffset < 0 || contentKeysOffset < 0 || nextGroupOffset < 0 || nextGroupOffset > buf.len:
+        return Err[bool]("wowExport root: truncated group payload")
+    return Ok[bool](true)
+
+fn rootLocaleMatches(localeFlags: int32, localeMask: int32): bool =
+    if localeMask == 0:
+        return true
+    if localeFlags == 0:
+        return true
+    return (localeFlags & localeMask) != 0
+
+fn rootBuildEntry(buf: bytes.ByteBuffer,
+                  contentKeysOffset: int32,
+                  localeFlags: int32,
+                  contentFlags: int32,
+                  hasNameHashes: bool,
+                  itemIndex: int32,
+                  fileDataID: int32): Result[RootEntry] =
+    let contentKeyRes: Result[str] = binary.HexSlice(buf, contentKeysOffset + itemIndex * 16, 16)
+    if IsErr(contentKeyRes):
+        return Err[RootEntry](Error(contentKeyRes))
+    var out: RootEntry
+    out.fileDataID = fileDataID
+    out.contentKey = Value(contentKeyRes)
+    out.localeFlags = localeFlags
+    out.contentFlags = contentFlags
+    out.hasNameHash = hasNameHashes
+    return Ok[RootEntry](out)
+
+fn WowRootFirstEntry(buf: bytes.ByteBuffer): Result[RootEntry] =
+    let headerRes: Result[RootHeader] = WowRootParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[RootEntry](Error(headerRes))
+    let header: RootHeader = Value(headerRes)
+    var nextGroupOffset: int32
+    var fileCount: int32
+    var localeFlags: int32
+    var contentFlags: int32
+    var fileIdsOffset: int32
+    var contentKeysOffset: int32
+    var hasNameHashes: bool
+    let groupRes: Result[bool] =
+        rootParseGroup(buf, header, header.dataOffset, nextGroupOffset, fileCount, localeFlags,
+            contentFlags, fileIdsOffset, contentKeysOffset, hasNameHashes)
+    if IsErr(groupRes):
+        return Err[RootEntry](Error(groupRes))
+    if fileCount <= 0:
+        return Err[RootEntry]("wowExport root: first group is empty")
+    let firstFileDataID: int32 = bytes.ReadU32LEAt(buf, fileIdsOffset)
+    return rootBuildEntry(buf, contentKeysOffset, localeFlags, contentFlags, hasNameHashes, 0, firstFileDataID)
+
+fn WowRootFindByFileDataID(buf: bytes.ByteBuffer, wantedFileDataID: int32, localeMask: int32): Result[RootEntry] =
+    if wantedFileDataID < 0:
+        return Err[RootEntry]("wowExport root: fileDataID must be non-negative")
+    let headerRes: Result[RootHeader] = WowRootParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[RootEntry](Error(headerRes))
+    let header: RootHeader = Value(headerRes)
+    var groupOffset: int32 = header.dataOffset
+    while groupOffset < buf.len:
+        var nextGroupOffset: int32
+        var fileCount: int32
+        var localeFlags: int32
+        var contentFlags: int32
+        var fileIdsOffset: int32
+        var contentKeysOffset: int32
+        var hasNameHashes: bool
+        let groupRes: Result[bool] =
+            rootParseGroup(buf, header, groupOffset, nextGroupOffset, fileCount, localeFlags,
+                contentFlags, fileIdsOffset, contentKeysOffset, hasNameHashes)
+        if IsErr(groupRes):
+            return Err[RootEntry](Error(groupRes))
+        var fileDataID: int32
+        var i: int32
+        while i < fileCount:
+            fileDataID = fileDataID + bytes.ReadU32LEAt(buf, fileIdsOffset + i * 4)
+            if fileDataID == wantedFileDataID && rootLocaleMatches(localeFlags, localeMask):
+                return rootBuildEntry(buf, contentKeysOffset, localeFlags, contentFlags, hasNameHashes, i, fileDataID)
+            fileDataID = fileDataID + 1
+            i = i + 1
+        groupOffset = nextGroupOffset
+    return Err[RootEntry]("wowExport root: fileDataID not found " + strings.IntToStr(wantedFileDataID))
+
+fn WowRootFindByContentKey(buf: bytes.ByteBuffer, contentKey: str, localeMask: int32): Result[RootEntry] =
+    if strings.Len(contentKey) != 32:
+        return Err[RootEntry]("wowExport root: content key must be 16-byte hex")
+    let headerRes: Result[RootHeader] = WowRootParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[RootEntry](Error(headerRes))
+    let header: RootHeader = Value(headerRes)
+    var groupOffset: int32 = header.dataOffset
+    while groupOffset < buf.len:
+        var nextGroupOffset: int32
+        var fileCount: int32
+        var localeFlags: int32
+        var contentFlags: int32
+        var fileIdsOffset: int32
+        var contentKeysOffset: int32
+        var hasNameHashes: bool
+        let groupRes: Result[bool] =
+            rootParseGroup(buf, header, groupOffset, nextGroupOffset, fileCount, localeFlags,
+                contentFlags, fileIdsOffset, contentKeysOffset, hasNameHashes)
+        if IsErr(groupRes):
+            return Err[RootEntry](Error(groupRes))
+        var fileDataID: int32
+        var i: int32
+        while i < fileCount:
+            fileDataID = fileDataID + bytes.ReadU32LEAt(buf, fileIdsOffset + i * 4)
+            if binary.ByteSliceMatchesHex(buf, contentKeysOffset + i * 16, contentKey) &&
+                rootLocaleMatches(localeFlags, localeMask):
+                return rootBuildEntry(buf, contentKeysOffset, localeFlags, contentFlags, hasNameHashes, i, fileDataID)
+            fileDataID = fileDataID + 1
+            i = i + 1
+        groupOffset = nextGroupOffset
+    return Err[RootEntry]("wowExport root: content key not found " + contentKey)
+
+fn WowRootSummary(buf: bytes.ByteBuffer): Result[RootSummary] =
+    let headerRes: Result[RootHeader] = WowRootParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[RootSummary](Error(headerRes))
+    let firstRes: Result[RootEntry] = WowRootFirstEntry(buf)
+    if IsErr(firstRes):
+        return Err[RootSummary](Error(firstRes))
+    let header: RootHeader = Value(headerRes)
+    var groupCount: int32
+    var groupOffset: int32 = header.dataOffset
+    while groupOffset < buf.len:
+        var nextGroupOffset: int32
+        var fileCount: int32
+        var localeFlags: int32
+        var contentFlags: int32
+        var fileIdsOffset: int32
+        var contentKeysOffset: int32
+        var hasNameHashes: bool
+        let groupRes: Result[bool] =
+            rootParseGroup(buf, header, groupOffset, nextGroupOffset, fileCount, localeFlags,
+                contentFlags, fileIdsOffset, contentKeysOffset, hasNameHashes)
+        if IsErr(groupRes):
+            return Err[RootSummary](Error(groupRes))
+        groupCount = groupCount + 1
+        groupOffset = nextGroupOffset
+    var out: RootSummary
+    out.header = header
+    out.groupCount = groupCount
+    out.first = Value(firstRes)
+    return Ok[RootSummary](out)
+
+fn WowRootSummaryText(summary: RootSummary): str =
+    return Fmt"rootVersion={strings.IntToStr(summary.header.version)} totalFiles={strings.IntToStr(summary.header.totalFiles)} nameHashes={strings.IntToStr(summary.header.filesWithNameHash)} groups={strings.IntToStr(summary.groupCount)} firstFileDataID={strings.IntToStr(summary.first.fileDataID)} firstCKey={summary.first.contentKey}"

@@ -1,0 +1,160 @@
+import std/bytes as bytes
+import std/result
+import std/strings as strings
+import std/strformat
+import cheng/apps/wow_export/binary as binary
+
+type
+    InstallHeader =
+        version: int32
+        encodingKeySize: int32
+        tagCount: int32
+        entryCount: int32
+
+    InstallEntry =
+        name: str
+        contentKey: str
+        extraValue: int32
+
+    InstallSummary =
+        header: InstallHeader
+        first: InstallEntry
+
+const
+    installHeaderSize = 10
+
+fn installU16BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 2 > buf.len:
+        return Err[int32]("wowExport install: truncated u16be")
+    return Ok[int32]((bytes.BufByteAt(buf, idx) << 8) + bytes.BufByteAt(buf, idx + 1))
+
+fn installU32BEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport install: truncated u32be")
+    let b0: int32 = bytes.BufByteAt(buf, idx)
+    let b1: int32 = bytes.BufByteAt(buf, idx + 1)
+    let b2: int32 = bytes.BufByteAt(buf, idx + 2)
+    let b3: int32 = bytes.BufByteAt(buf, idx + 3)
+    return Ok[int32]((b0 << 24) + (b1 << 16) + (b2 << 8) + b3)
+
+fn installBitmapLength(entryCount: int32): int32 =
+    let fullBytes: int32 = entryCount / 8
+    return (entryCount % 8) == 0 ? fullBytes : fullBytes + 1
+
+fn installReadCString(buf: bytes.ByteBuffer, start: int32, nextPos: var int32): Result[str] =
+    if start < 0 || start >= buf.len:
+        return Err[str]("wowExport install: cstring start out of bounds")
+    var pos: int32 = start
+    var out: str
+    while pos < buf.len:
+        let ch: int32 = bytes.BufByteAt(buf, pos)
+        pos = pos + 1
+        if ch == 0:
+            nextPos = pos
+            return Ok[str](out)
+        out = strings.ConcatStr(out, strings.CharToStr(char(ch)))
+    return Err[str]("wowExport install: unterminated cstring")
+
+fn WowInstallParseHeader(buf: bytes.ByteBuffer): Result[InstallHeader] =
+    if buf.len < installHeaderSize:
+        return Err[InstallHeader]("wowExport install: header too small")
+    if bytes.BufByteAt(buf, 0) != int32('I') || bytes.BufByteAt(buf, 1) != int32('N'):
+        return Err[InstallHeader]("wowExport install: invalid magic")
+    let tagCountRes: Result[int32] = installU16BEAt(buf, 4)
+    let entryCountRes: Result[int32] = installU32BEAt(buf, 6)
+    if IsErr(tagCountRes):
+        return Err[InstallHeader](Error(tagCountRes))
+    if IsErr(entryCountRes):
+        return Err[InstallHeader](Error(entryCountRes))
+    var out: InstallHeader
+    out.version = bytes.BufByteAt(buf, 2)
+    out.encodingKeySize = bytes.BufByteAt(buf, 3)
+    out.tagCount = Value(tagCountRes)
+    out.entryCount = Value(entryCountRes)
+    if out.version != 1:
+        return Err[InstallHeader]("wowExport install: unsupported version")
+    if out.encodingKeySize != 16:
+        return Err[InstallHeader]("wowExport install: unsupported key size")
+    if out.tagCount < 0 || out.entryCount <= 0:
+        return Err[InstallHeader]("wowExport install: invalid counts")
+    return Ok[InstallHeader](out)
+
+fn installEntriesOffset(buf: bytes.ByteBuffer, header: InstallHeader): Result[int32] =
+    let bitmapLen: int32 = installBitmapLength(header.entryCount)
+    var pos: int32 = installHeaderSize
+    var i: int32
+    while i < header.tagCount:
+        let nameRes: Result[str] = installReadCString(buf, pos, pos)
+        if IsErr(nameRes):
+            return Err[int32](Error(nameRes))
+        if pos + 2 + bitmapLen > buf.len:
+            return Err[int32]("wowExport install: truncated tag table")
+        pos = pos + 2 + bitmapLen
+        i = i + 1
+    return Ok[int32](pos)
+
+fn installParseEntryAt(buf: bytes.ByteBuffer, entryOffset: int32, nextOffset: var int32): Result[InstallEntry] =
+    let nameRes: Result[str] = installReadCString(buf, entryOffset, nextOffset)
+    if IsErr(nameRes):
+        return Err[InstallEntry](Error(nameRes))
+    if nextOffset + 20 > buf.len:
+        return Err[InstallEntry]("wowExport install: truncated entry")
+    let contentKeyRes: Result[str] = binary.HexSlice(buf, nextOffset, 16)
+    if IsErr(contentKeyRes):
+        return Err[InstallEntry](Error(contentKeyRes))
+    let extraValue: int32 = bytes.ReadU32LEAt(buf, nextOffset + 16)
+    var out: InstallEntry
+    out.name = Value(nameRes)
+    out.contentKey = Value(contentKeyRes)
+    out.extraValue = extraValue
+    nextOffset = nextOffset + 20
+    return Ok[InstallEntry](out)
+
+fn WowInstallFirstEntry(buf: bytes.ByteBuffer): Result[InstallEntry] =
+    let headerRes: Result[InstallHeader] = WowInstallParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[InstallEntry](Error(headerRes))
+    let entriesOffsetRes: Result[int32] = installEntriesOffset(buf, Value(headerRes))
+    if IsErr(entriesOffsetRes):
+        return Err[InstallEntry](Error(entriesOffsetRes))
+    var nextOffset: int32
+    return installParseEntryAt(buf, Value(entriesOffsetRes), nextOffset)
+
+fn WowInstallFindEntryByNameContains(buf: bytes.ByteBuffer, needle: str): Result[InstallEntry] =
+    if strings.Len(needle) == 0:
+        return Err[InstallEntry]("wowExport install: empty search needle")
+    let headerRes: Result[InstallHeader] = WowInstallParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[InstallEntry](Error(headerRes))
+    let header: InstallHeader = Value(headerRes)
+    let entriesOffsetRes: Result[int32] = installEntriesOffset(buf, header)
+    if IsErr(entriesOffsetRes):
+        return Err[InstallEntry](Error(entriesOffsetRes))
+    var pos: int32 = Value(entriesOffsetRes)
+    var i: int32
+    while i < header.entryCount:
+        var nextOffset: int32
+        let entryRes: Result[InstallEntry] = installParseEntryAt(buf, pos, nextOffset)
+        if IsErr(entryRes):
+            return Err[InstallEntry](Error(entryRes))
+        let entry: InstallEntry = Value(entryRes)
+        if strings.StrContains(entry.name, needle):
+            return Ok[InstallEntry](entry)
+        pos = nextOffset
+        i = i + 1
+    return Err[InstallEntry]("wowExport install: entry not found needle=" + needle)
+
+fn WowInstallSummary(buf: bytes.ByteBuffer): Result[InstallSummary] =
+    let headerRes: Result[InstallHeader] = WowInstallParseHeader(buf)
+    if IsErr(headerRes):
+        return Err[InstallSummary](Error(headerRes))
+    let firstRes: Result[InstallEntry] = WowInstallFirstEntry(buf)
+    if IsErr(firstRes):
+        return Err[InstallSummary](Error(firstRes))
+    var out: InstallSummary
+    out.header = Value(headerRes)
+    out.first = Value(firstRes)
+    return Ok[InstallSummary](out)
+
+fn WowInstallSummaryText(summary: InstallSummary): str =
+    return Fmt"installVersion={strings.IntToStr(summary.header.version)} tags={strings.IntToStr(summary.header.tagCount)} entries={strings.IntToStr(summary.header.entryCount)} firstName={summary.first.name} firstCKey={summary.first.contentKey}"

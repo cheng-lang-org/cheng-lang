@@ -1,0 +1,75 @@
+import std/result
+import std/os_host_process as hostos
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/native_link_plan as nplan
+
+fn NativeLinkExecTargetSupported(targetTriple: str): bool =
+    return targetTriple == "arm64-apple-darwin"
+
+fn NativeLinkExecOutputModeText(plan: nplan.NativeLinkPlanStub): Result[str] =
+    if plan.emitKind == creq.EmitExe && plan.outputKind == nplan.NativeOutputExecutable:
+        return Ok[str]("executable")
+    if plan.emitKind == creq.EmitShared && plan.outputKind == nplan.NativeOutputArtifact:
+        return Ok[str]("shared")
+    if plan.emitKind == creq.EmitObj:
+        return Err[str](" native link exec: unsupported emit kind: obj")
+    return Err[str](" native link exec: unsupported output kind")
+
+fn NativeLinkExecValidatePlan(plan: nplan.NativeLinkPlanStub): Result[str] =
+    if !NativeLinkExecTargetSupported(plan.targetTriple):
+        return Err[str](" native link exec: unsupported target: " + plan.targetTriple)
+    if len(plan.outputPath) <= 0:
+        return Err[str](" native link exec: missing output path")
+    if len(plan.linkInputPaths) <= 0:
+        return Err[str](" native link exec: missing link input paths")
+    if len(plan.linkerProgram) <= 0:
+        return Err[str](" native link exec: missing linker program")
+    let outputModeRes = NativeLinkExecOutputModeText(plan)
+    if !IsOk(outputModeRes):
+        return Err[str](Error(outputModeRes))
+    for i in 0..<plan.linkInputPaths.len:
+        let inputPath = plan.linkInputPaths[i]
+        if !chengpath.PathFileExists(inputPath):
+            return Err[str](" native link exec: missing input file: " + inputPath)
+    return Ok[str](Value(outputModeRes))
+
+fn NativeLinkExecArgv(plan: nplan.NativeLinkPlanStub): Result[str[]] =
+    let outputModeRes = NativeLinkExecValidatePlan(plan)
+    if !IsOk(outputModeRes):
+        return Err[str[]](Error(outputModeRes))
+    var argv: str[]
+    if Value(outputModeRes) == "shared":
+        add(argv, "-dynamiclib")
+    add(argv, "-arch")
+    add(argv, "arm64")
+    for i in 0..<plan.linkInputPaths.len:
+        add(argv, plan.linkInputPaths[i])
+    add(argv, "-o")
+    add(argv, plan.outputPath)
+    return Ok[str[]](argv)
+
+fn NativeLinkExecCommandText(plan: nplan.NativeLinkPlanStub): Result[str] =
+    let argvRes = NativeLinkExecArgv(plan)
+    if !IsOk(argvRes):
+        return Err[str](Error(argvRes))
+    return Ok[str](hostos.OsHostProcessCommandText(plan.linkerProgram, Value(argvRes), []))
+
+fn NativeLinkExecRunLogged(rootDir: str,
+                            label: str,
+                            plan: nplan.NativeLinkPlanStub,
+                            logPath: str): hostops.LoggedRun =
+    let argvRes = NativeLinkExecArgv(plan)
+    if !IsOk(argvRes):
+        let outputText = Error(argvRes) + "\n"
+        let _logged = chengpath.WriteTextFile(rootDir, logPath, outputText)
+        return hostops.LoggedRunZero(label, plan.linkerProgram, chengpath.PathAbsolute(rootDir, logPath), 2, outputText)
+    return hostops.RunProgramLogged(rootDir,
+                                     label,
+                                     plan.linkerProgram,
+                                     Value(argvRes),
+                                     [],
+                                     rootDir,
+                                     0,
+                                     logPath)
