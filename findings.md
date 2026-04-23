@@ -37,3 +37,4 @@
 - `system-link-exec` 的 `.map` sidecar 是安全的小切片：它只依赖 `system_link_plan + lowering_plan`，可以先由 backend driver 在 stage3 链接成功后写入，不需要等待 provider object、primary emit、native link 全部迁出 C seed。
 - driver 转发 stage3 时若让 C seed 跳过 `.map`，必须由 driver 接管 `line_map` 与最终 `build done` 进度；否则用户看到的实时进度会先完成、后补写 sidecar。
 - `verify-debug-tools` 不是纯文本检查，它会调用 host smoke gate 编译运行 `debug_tools_surface_smoke`；调它时按 `run-host-smokes` 处理，不能和其他编译门禁并行。
+- arm64 seed backend 的嵌套调用保值不能把 `x0` 暂存到裸 `call_arg_base`；那块是外层参数区，内层 ORC/字符串比较一旦借用它就会把外层实参覆盖。保值必须走按 `call_depth` 隔离的 `call_dest_spill`。

@@ -24,6 +24,10 @@ type
         assetBytes: int32
         characterVertexCount: int32
         animationSequenceCount: int32
+        modelBoundsReady: bool
+        modelSpanX1000: int32
+        modelSpanY1000: int32
+        modelSpanZ1000: int32
         memoryOutstanding: int32
 
 fn previewApplyChunkedAsset(summary: var PreviewSummary, buf: bytes.ByteBuffer, label: str): Result[bool] =
@@ -59,13 +63,18 @@ fn previewLoadAuditedAssets(summary: var PreviewSummary,
             if IsErr(chunkRes):
                 return Err[bool](Error(chunkRes))
         elif file.kind == "m2":
-            let headerRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(fileBuf)
+            let geometryRes: Result[asset_formats.M2GeometrySummary] = asset_formats.ParseM2GeometrySummary(fileBuf)
             bytes.FreeByteBuffer(fileBuf)
-            if IsErr(headerRes):
-                return Err[bool](Error(headerRes))
-            summary.m2Version = Value(headerRes).version
-            summary.characterVertexCount = Value(headerRes).vertexCount
-            summary.animationSequenceCount = Value(headerRes).sequenceCount
+            if IsErr(geometryRes):
+                return Err[bool](Error(geometryRes))
+            let geometry: asset_formats.M2GeometrySummary = Value(geometryRes)
+            summary.m2Version = geometry.header.version
+            summary.characterVertexCount = geometry.header.vertexCount
+            summary.animationSequenceCount = geometry.header.sequenceCount
+            summary.modelBoundsReady = true
+            summary.modelSpanX1000 = asset_formats.M2GeometrySpanX1000(geometry)
+            summary.modelSpanY1000 = asset_formats.M2GeometrySpanY1000(geometry)
+            summary.modelSpanZ1000 = asset_formats.M2GeometrySpanZ1000(geometry)
         elif file.kind == "blp":
             let headerRes: Result[blp.Blp2Header] = blp.ParseBlp2Header(fileBuf)
             bytes.FreeByteBuffer(fileBuf)
@@ -85,7 +94,7 @@ fn PreviewNorthshire(frames: int32): Result[PreviewSummary] =
     let manifest: northshire.NorthshireManifest = northshire.Manifest()
     if !northshire.ManifestReady(manifest):
         return Err[PreviewSummary]("wowExport preview: northshire manifest has no audited fileDataIDs; refusing to render fake geometry")
-    let auditRes: Result[northshire.NorthshireAuditSummary] = northshire.AuditManifestAgainstLocal(manifest)
+    let auditRes: Result[northshire.NorthshireAuditSummary] = northshire.AuditManifestPayloadsAgainstLocal(manifest)
     if IsErr(auditRes):
         return Err[PreviewSummary](Error(auditRes))
     var out: PreviewSummary
@@ -100,6 +109,10 @@ fn PreviewNorthshire(frames: int32): Result[PreviewSummary] =
         out.wmoChunkCount > 0 &&
         out.m2Version > 0 &&
         out.characterVertexCount > 0 &&
+        out.modelBoundsReady &&
+        out.modelSpanX1000 > 0 &&
+        out.modelSpanY1000 > 0 &&
+        out.modelSpanZ1000 > 0 &&
         out.animationSequenceCount > 0 &&
         out.textureWidth > 0 &&
         out.textureHeight > 0
@@ -107,4 +120,4 @@ fn PreviewNorthshire(frames: int32): Result[PreviewSummary] =
     return Ok[PreviewSummary](out)
 
 fn PreviewSummaryText(summary: PreviewSummary): str =
-    return Fmt"size={strings.IntToStr(summary.width)}x{strings.IntToStr(summary.height)} frames={strings.IntToStr(summary.frames)} scene={summary.sceneNonEmpty ? \"non-empty\" : \"empty\"} auditedFiles={strings.IntToStr(summary.auditedFileCount)} loadedFiles={strings.IntToStr(summary.loadedFileCount)} chunkFiles={strings.IntToStr(summary.chunkFileCount)} totalChunks={strings.IntToStr(summary.totalChunkCount)} wmoChunks={strings.IntToStr(summary.wmoChunkCount)} m2Version={strings.IntToStr(summary.m2Version)} texture={strings.IntToStr(summary.textureWidth)}x{strings.IntToStr(summary.textureHeight)} assetBytes={strings.IntToStr(summary.assetBytes)} characterVertices={strings.IntToStr(summary.characterVertexCount)} animationSequences={strings.IntToStr(summary.animationSequenceCount)} memoryOutstanding={strings.IntToStr(summary.memoryOutstanding)}"
+    return Fmt"size={strings.IntToStr(summary.width)}x{strings.IntToStr(summary.height)} frames={strings.IntToStr(summary.frames)} scene={summary.sceneNonEmpty ? \"non-empty\" : \"empty\"} auditedFiles={strings.IntToStr(summary.auditedFileCount)} loadedFiles={strings.IntToStr(summary.loadedFileCount)} chunkFiles={strings.IntToStr(summary.chunkFileCount)} totalChunks={strings.IntToStr(summary.totalChunkCount)} wmoChunks={strings.IntToStr(summary.wmoChunkCount)} m2Version={strings.IntToStr(summary.m2Version)} texture={strings.IntToStr(summary.textureWidth)}x{strings.IntToStr(summary.textureHeight)} assetBytes={strings.IntToStr(summary.assetBytes)} characterVertices={strings.IntToStr(summary.characterVertexCount)} animationSequences={strings.IntToStr(summary.animationSequenceCount)} modelBounds={summary.modelBoundsReady ? \"ready\" : \"missing\"} modelSpan1000={strings.IntToStr(summary.modelSpanX1000)},{strings.IntToStr(summary.modelSpanY1000)},{strings.IntToStr(summary.modelSpanZ1000)} memoryOutstanding={strings.IntToStr(summary.memoryOutstanding)}"

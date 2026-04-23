@@ -21,14 +21,71 @@ fn currentExecutablePath(root: str): str =
         return raw
     return os.joinPath(root, raw)
 
+fn joinPieces(parts: str[]): str =
+    var total: int32
+    for i in 0..<parts.len:
+        total = total + len(parts[i])
+    if total <= 0:
+        return ""
+    let out = newStringAlloc(total)
+    var writePos: int32
+    for i in 0..<parts.len:
+        let part = parts[i]
+        for j in 0..<len(part):
+            out[writePos] = part[j]
+            writePos = writePos + 1
+    return out
+
+fn charText(ch: char): str =
+    let out = newStringAlloc(1)
+    out[0] = ch
+    return out
+
+fn ownedText(text: str): str =
+    if len(text) <= 0:
+        return ""
+    return newStringCopy(strDataPtr(text), len(text))
+
+fn quoteShellStable(value: str): str =
+    if len(value) == 0:
+        return "''"
+    var parts: str[]
+    add(parts, "'")
+    for i in 0..<len(value):
+        let ch = value[i]
+        if ch == '\'':
+            add(parts, "'\"'\"'")
+        else:
+            add(parts, charText(ch))
+    add(parts, "'")
+    return joinPieces(parts)
+
+fn compileCommandText(filePath: str, argv: str[], envOverrides: str[], logPath: str): str =
+    var parts: str[]
+    if envOverrides.len > 0:
+        add(parts, "env")
+        for i in 0..<envOverrides.len:
+            let envText = envOverrides[i]
+            if len(envText) > 0:
+                add(parts, " ")
+                add(parts, quoteShellStable(envText))
+        add(parts, " ")
+    add(parts, quoteShellStable(filePath))
+    for i in 0..<argv.len:
+        add(parts, " ")
+        add(parts, quoteShellStable(argv[i]))
+    add(parts, " > ")
+    add(parts, quoteShellStable(logPath))
+    add(parts, " 2>&1")
+    return joinPieces(parts)
+
 fn main(): int32 =
     let root: str = os.getCurrentDir()
     let exePath: str = currentExecutablePath(root)
     assert(len(exePath) > 0 && os.fileExists(exePath),
            " export visibility negative: executable path")
-    let exeParts = os.splitFile(exePath)
-    let exeDir = exeParts.dir
-    let exeName = exeParts.name
+    let exeDir = os.ParentDir(exePath)
+    let exeName = os.ExtractFilename(exePath)
     let outDirName = exeName + ".workspace"
     let outDir = os.joinPath(exeDir, outDirName)
     ensureDir(outDir)
@@ -64,6 +121,7 @@ fn main(): int32 =
     var compiler = compilerRaw
     if !os.isAbsolute(compilerRaw):
         compiler = os.joinPath(root, compilerRaw)
+    compiler = ownedText(compiler)
     assert(os.fileExists(compiler),
            " export visibility negative: compiler exists")
 
@@ -74,29 +132,27 @@ fn main(): int32 =
     var compileArgv: str[]
     add(compileArgv, "system-link-exec")
     add(compileArgv, "--root")
-    add(compileArgv, consumerRoot)
+    add(compileArgv, ownedText(consumerRoot))
     add(compileArgv, "--in")
-    add(compileArgv, inputPath)
+    add(compileArgv, ownedText(inputPath))
     add(compileArgv, "--emit")
     add(compileArgv, "exe")
     add(compileArgv, "--target")
-    add(compileArgv, target)
+    add(compileArgv, ownedText(target))
     add(compileArgv, "--out")
-    add(compileArgv, outPath)
+    add(compileArgv, ownedText(outPath))
     var compileEnv: str[]
-    let noHandoff = os.getEnv("CHENG_NO_BACKEND_DRIVER_HANDOFF")
-    if len(noHandoff) > 0 && noHandoff != "0":
-        add(compileEnv, "CHENG_NO_BACKEND_DRIVER_HANDOFF=" + noHandoff)
-    let compileRes = hostos.execFileCapture(
-        compiler,
-        compileArgv,
-        compileEnv,
-        root,
-        true,
-        60)
-    let compileOutput = os.execCmdResultOutput(compileRes)
-    os.writeFile(compileLog, compileOutput)
-    assert(os.execCmdResultExitCode(compileRes) != 0, " export visibility negative: private symbol rejected")
+    let compileCommand = compileCommandText(compiler, compileArgv, compileEnv, compileLog)
+    var shellArgv: str[]
+    add(shellArgv, "-lc")
+    add(shellArgv, ownedText(compileCommand))
+    let compileExitCode: int32 = hostos.ExecFileStatus("/bin/sh",
+                                                       shellArgv,
+                                                       [],
+                                                       root,
+                                                       60)
+    let compileOutput = os.ReadFile(compileLog)
+    assert(compileExitCode != 0, " export visibility negative: private symbol rejected")
     assert(strings.StrContains(compileOutput,
                                "imported private symbol 'privateFn' is not exported"),
            " export visibility negative: diagnostic")

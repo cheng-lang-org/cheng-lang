@@ -1,5 +1,4 @@
 import std/bytes as bytes
-import std/os as os
 import std/rawbytes as rawbytes
 import std/result
 import std/strings as strings
@@ -90,20 +89,18 @@ fn cascIndexReadFileBytesRaw(path: cstring): Result[bytes.ByteBuffer] =
     let _ = cascIndexFclose(f)
     return Ok[bytes.ByteBuffer](out)
 
-fn cascIndexListDataDirText(clientPath: str): Result[str] =
+fn cascIndexListDataDirRawListing(clientPath: str): Result[cstring] =
     let dataDirPath: str = build_info.DataDataPath(clientPath)
     let dataDirRawBytes: rawbytes.Bytes = cascIndexCStringBytesFrom2(clientPath, cascIndexDataDirSuffix)
     let dataDirRaw: cstring = cstring(dataDirRawBytes.data)
     if cascIndexDirExistsRaw(dataDirRaw) == 0:
         rawbytes.BytesFree(dataDirRawBytes)
-        return Err[str]("wowExport index: missing data dir " + dataDirPath)
+        return Err[cstring]("wowExport index: missing data dir " + dataDirPath)
     let listRaw: cstring = cascIndexListDirRaw(dataDirRaw)
     rawbytes.BytesFree(dataDirRawBytes)
     if listRaw == nil:
-        return Err[str]("wowExport index: failed to list data dir " + dataDirPath)
-    let listText: str = system.strFromCStringCopy(listRaw)
-    free(ptr(listRaw))
-    return Ok[str](listText)
+        return Err[cstring]("wowExport index: failed to list data dir " + dataDirPath)
+    return Ok[cstring](listRaw)
 
 fn ReadBE24TopArchiveBits(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
     if idx < 0 || idx + 4 > buf.len:
@@ -249,10 +246,11 @@ fn FindJournalIndexEntry(buf: bytes.ByteBuffer, keyPrefix: str): Result[CascInde
     return Err[CascIndexEntry]("wowExport index: key prefix not found " + keyPrefix)
 
 fn LoadFirstJournalIndexSummary(clientPath: str): Result[CascIndexSummary] =
-    let listTextRes: Result[str] = cascIndexListDataDirText(clientPath)
-    if IsErr(listTextRes):
-        return Err[CascIndexSummary](Error(listTextRes))
-    let listText: str = Value(listTextRes)
+    let listRawRes: Result[cstring] = cascIndexListDataDirRawListing(clientPath)
+    if IsErr(listRawRes):
+        return Err[CascIndexSummary](Error(listRawRes))
+    let listRaw: cstring = Value(listRawRes)
+    let listText: str = system.strFromCStringBorrow(listRaw)
     let total: int32 = strings.Len(listText)
     var start: int32
     var i: int32
@@ -275,10 +273,16 @@ fn LoadFirstJournalIndexSummary(clientPath: str): Result[CascIndexSummary] =
                         cascIndexReadFileBytesRaw(cstring(pathRawBytes.data))
                     rawbytes.BytesFree(pathRawBytes)
                     if IsErr(readRes):
+                        free(ptr(listRaw))
                         return Err[CascIndexSummary](Error(readRes) + " name=" + name)
-                    return ParseJournalIndex(Value(readRes))
+                    let buf: bytes.ByteBuffer = Value(readRes)
+                    let summaryRes: Result[CascIndexSummary] = ParseJournalIndex(buf)
+                    bytes.FreeByteBuffer(buf)
+                    free(ptr(listRaw))
+                    return summaryRes
             start = i + 1
         i = i + 1
+    free(ptr(listRaw))
     return Err[CascIndexSummary]("wowExport index: no .idx files in " + build_info.DataDataPath(clientPath))
 
 fn EncodingKeyPrefix(encodingKey: str): Result[str] =
@@ -291,10 +295,11 @@ fn LoadLocalIndexEntry(clientPath: str, encodingKey: str): Result[CascIndexEntry
     if IsErr(prefixRes):
         return Err[CascIndexEntry](Error(prefixRes))
     let prefix: str = Value(prefixRes)
-    let listTextRes: Result[str] = cascIndexListDataDirText(clientPath)
-    if IsErr(listTextRes):
-        return Err[CascIndexEntry](Error(listTextRes))
-    let listText: str = Value(listTextRes)
+    let listRawRes: Result[cstring] = cascIndexListDataDirRawListing(clientPath)
+    if IsErr(listRawRes):
+        return Err[CascIndexEntry](Error(listRawRes))
+    let listRaw: cstring = Value(listRawRes)
+    let listText: str = system.strFromCStringBorrow(listRaw)
     let total: int32 = strings.Len(listText)
     var start: int32
     var i: int32
@@ -317,14 +322,17 @@ fn LoadLocalIndexEntry(clientPath: str, encodingKey: str): Result[CascIndexEntry
                         cascIndexReadFileBytesRaw(cstring(pathRawBytes.data))
                     rawbytes.BytesFree(pathRawBytes)
                     if IsErr(readRes):
+                        free(ptr(listRaw))
                         return Err[CascIndexEntry](Error(readRes) + " name=" + name)
                     let buf: bytes.ByteBuffer = Value(readRes)
                     let entryRes: Result[CascIndexEntry] = FindJournalIndexEntry(buf, prefix)
                     bytes.FreeByteBuffer(buf)
                     if IsOk(entryRes):
+                        free(ptr(listRaw))
                         return entryRes
             start = i + 1
         i = i + 1
+    free(ptr(listRaw))
     return Err[CascIndexEntry]("wowExport index: local encoding key not found " + encodingKey)
 
 fn DataArchivePath(clientPath: str, archiveIndex: int32): Result[str] =

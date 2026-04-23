@@ -1,4 +1,5 @@
 import std/bytes as bytes
+import std/rawbytes as rawbytes
 import std/result
 import std/strings as strings
 import std/strformat
@@ -14,17 +15,30 @@ type
         sequenceCount: int32
         boneCount: int32
         vertexCount: int32
+        vertexOffset: int32
         skinProfileCount: int32
         textureCount: int32
+
+    M2GeometrySummary =
+        header: M2Header
+        vertexStride: int32
+        minX1000: int32
+        minY1000: int32
+        minZ1000: int32
+        maxX1000: int32
+        maxY1000: int32
+        maxZ1000: int32
 
 const
     m2InnerHeaderOffset = 8
     m2SequenceCountOffset = 0x1c
     m2BoneCountOffset = 0x2c
     m2VertexCountOffset = 0x3c
+    m2VertexOffsetOffset = 0x40
     m2SkinProfileCountOffset = 0x44
     m2TextureCountOffset = 0x50
     m2ClassicHeaderBytes = 0x54
+    m2VertexStride = 48
 
 fn m2HasMagic(buf: bytes.ByteBuffer,
               start: int32,
@@ -49,18 +63,120 @@ fn parseClassicM2Header(buf: bytes.ByteBuffer, start: int32): Result[M2Header] =
     out.sequenceCount = bytes.ReadU32LEAt(buf, start + m2SequenceCountOffset)
     out.boneCount = bytes.ReadU32LEAt(buf, start + m2BoneCountOffset)
     out.vertexCount = bytes.ReadU32LEAt(buf, start + m2VertexCountOffset)
+    out.vertexOffset = start + bytes.ReadU32LEAt(buf, start + m2VertexOffsetOffset)
     out.skinProfileCount = bytes.ReadU32LEAt(buf, start + m2SkinProfileCountOffset)
     out.textureCount = bytes.ReadU32LEAt(buf, start + m2TextureCountOffset)
     return Ok[M2Header](out)
 
-fn ParseM2Header(buf: bytes.ByteBuffer): Result[M2Header] =
+fn m2HeaderStart(buf: bytes.ByteBuffer): Result[int32] =
     if buf.len < 8:
-        return Err[M2Header]("wowExport M2: header too small")
+        return Err[int32]("wowExport M2: header too small")
     if m2HasMagic(buf, 0, int32('M'), int32('D'), int32('2'), int32('0')):
-        return parseClassicM2Header(buf, 0)
+        return Ok[int32](0)
     if m2HasMagic(buf, 0, int32('M'), int32('D'), int32('2'), int32('1')):
-        return parseClassicM2Header(buf, m2InnerHeaderOffset)
-    return Err[M2Header]("wowExport M2: invalid magic")
+        return Ok[int32](m2InnerHeaderOffset)
+    return Err[int32]("wowExport M2: invalid magic")
+
+fn ParseM2Header(buf: bytes.ByteBuffer): Result[M2Header] =
+    let startRes: Result[int32] = m2HeaderStart(buf)
+    if IsErr(startRes):
+        return Err[M2Header](Error(startRes))
+    return parseClassicM2Header(buf, Value(startRes))
+
+fn m2ClampI64ToI32(value: int64): int32 =
+    if value > int64(2147483647):
+        return 2147483647
+    if value < int64(-2147483647):
+        return -2147483647
+    return int32(value)
+
+fn m2F32Scaled1000At(buf: bytes.ByteBuffer, idx: int32): int32 =
+    let bits: int32 = bytes.ReadU32LEAt(buf, idx)
+    let exponentRaw: int32 = (bits >> 23) & 255
+    var mantissa: int64 = int64(bits & 0x7fffff)
+    var exponent: int32 = exponentRaw - 127
+    if exponentRaw == 0:
+        exponent = -126
+    else:
+        mantissa = mantissa | int64(0x800000)
+    var scaled: int64 = mantissa * int64(1000)
+    let shift: int32 = exponent - 23
+    if shift > 0:
+        var i: int32
+        while i < shift:
+            scaled = scaled * int64(2)
+            i = i + 1
+    elif shift < 0:
+        var i: int32
+        while i < 0 - shift:
+            scaled = scaled / int64(2)
+            i = i + 1
+    if bits < 0:
+        scaled = int64(0) - scaled
+    return m2ClampI64ToI32(scaled)
+
+fn ParseM2GeometrySummary(buf: bytes.ByteBuffer): Result[M2GeometrySummary] =
+    let headerRes: Result[M2Header] = ParseM2Header(buf)
+    if IsErr(headerRes):
+        return Err[M2GeometrySummary](Error(headerRes))
+    let header: M2Header = Value(headerRes)
+    if header.vertexCount <= 0:
+        return Err[M2GeometrySummary]("wowExport M2: missing vertex array")
+    if header.vertexOffset < 0 ||
+        header.vertexOffset + header.vertexCount * m2VertexStride > buf.len:
+        return Err[M2GeometrySummary]("wowExport M2: vertex array out of bounds")
+    var out: M2GeometrySummary
+    out.header = header
+    out.vertexStride = m2VertexStride
+    var i: int32
+    while i < header.vertexCount:
+        let pos: int32 = header.vertexOffset + i * m2VertexStride
+        let x: int32 = m2F32Scaled1000At(buf, pos)
+        let y: int32 = m2F32Scaled1000At(buf, pos + 4)
+        let z: int32 = m2F32Scaled1000At(buf, pos + 8)
+        if i == 0:
+            out.minX1000 = x
+            out.maxX1000 = x
+            out.minY1000 = y
+            out.maxY1000 = y
+            out.minZ1000 = z
+            out.maxZ1000 = z
+        else:
+            if x < out.minX1000: out.minX1000 = x
+            if x > out.maxX1000: out.maxX1000 = x
+            if y < out.minY1000: out.minY1000 = y
+            if y > out.maxY1000: out.maxY1000 = y
+            if z < out.minZ1000: out.minZ1000 = z
+            if z > out.maxZ1000: out.maxZ1000 = z
+        i = i + 1
+    return Ok[M2GeometrySummary](out)
+
+fn M2GeometrySpanX1000(summary: M2GeometrySummary): int32 =
+    return summary.maxX1000 - summary.minX1000
+
+fn M2GeometrySpanY1000(summary: M2GeometrySummary): int32 =
+    return summary.maxY1000 - summary.minY1000
+
+fn M2GeometrySpanZ1000(summary: M2GeometrySummary): int32 =
+    return summary.maxZ1000 - summary.minZ1000
+
+fn formatFourCCTextAt(buf: bytes.ByteBuffer, pos: int32): Result[str] =
+    if pos < 0 || pos + 4 > buf.len:
+        return Err[str]("wowExport format: fourCC out of bounds")
+    var raw: rawbytes.Bytes = rawbytes.BytesAlloc(4)
+    if rawbytes.BytesLen(raw) != 4:
+        return Err[str]("wowExport format: fourCC allocation failed")
+    let b0: int32 = bytes.BufByteAt(buf, pos)
+    let b1: int32 = bytes.BufByteAt(buf, pos + 1)
+    let b2: int32 = bytes.BufByteAt(buf, pos + 2)
+    let b3: int32 = bytes.BufByteAt(buf, pos + 3)
+    rawbytes.BytesSet(raw, 0, b0)
+    rawbytes.BytesSet(raw, 1, b1)
+    rawbytes.BytesSet(raw, 2, b2)
+    rawbytes.BytesSet(raw, 3, b3)
+    let out: str = rawbytes.BytesToString(raw)
+    rawbytes.BytesFree(raw)
+    return Ok[str](out)
 
 fn ParseChunkedHeader(buf: bytes.ByteBuffer, label: str): Result[FormatHeader] =
     if buf.len < 8:
@@ -76,11 +192,10 @@ fn ParseChunkedHeader(buf: bytes.ByteBuffer, label: str): Result[FormatHeader] =
         if size < 0:
             return Err[FormatHeader]("wowExport " + label + ": negative chunk size")
         if pos == 0:
-            firstMagic =
-                strings.CharToStr(char(bytes.BufByteAt(buf, pos))) +
-                strings.CharToStr(char(bytes.BufByteAt(buf, pos + 1))) +
-                strings.CharToStr(char(bytes.BufByteAt(buf, pos + 2))) +
-                strings.CharToStr(char(bytes.BufByteAt(buf, pos + 3)))
+            let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+            if IsErr(magicRes):
+                return Err[FormatHeader](Error(magicRes))
+            firstMagic = Value(magicRes)
             firstSize = size
         if pos + 8 + size > buf.len:
             return Err[FormatHeader]("wowExport " + label + ": chunk extends past buffer")
@@ -96,4 +211,4 @@ fn FormatHeaderText(header: FormatHeader): str =
     return Fmt"magic={header.magic} value={strings.IntToStr(header.versionOrSize)} chunks={strings.IntToStr(header.chunkCount)}"
 
 fn M2HeaderText(header: M2Header): str =
-    return Fmt"version={strings.IntToStr(header.version)} sequences={strings.IntToStr(header.sequenceCount)} bones={strings.IntToStr(header.boneCount)} vertices={strings.IntToStr(header.vertexCount)} skins={strings.IntToStr(header.skinProfileCount)} textures={strings.IntToStr(header.textureCount)}"
+    return Fmt"version={strings.IntToStr(header.version)} sequences={strings.IntToStr(header.sequenceCount)} bones={strings.IntToStr(header.boneCount)} vertices={strings.IntToStr(header.vertexCount)} vertexOffset={strings.IntToStr(header.vertexOffset)} skins={strings.IntToStr(header.skinProfileCount)} textures={strings.IntToStr(header.textureCount)}"

@@ -160,6 +160,8 @@ fn libc_kill_runtime(pid: int32, signalCode: int32): int32
 fn libc_strerror(err: int32): ptr
 const
     chengStrFlagOwned: int32 = 1
+    chengStatTypeMask: int32 = 61440
+    chengStatTypeDir: int32 = 16384
     probe_handle_slot_mod: uint64 = 4294967296
     probe_handle_err_invalid: int32 = -1
     probe_handle_max_generation: uint32 = uint32(4294967295)
@@ -1213,9 +1215,32 @@ fn cheng_exec_program_build_exec_argv(programName: ptr,
 fn cheng_exec_program_build_shell_raw_argv(command: ptr): ptr =
     if command == nil || *UInt8Ptr(command) == uint8(0):
         return nil
-    let commandText: str = cheng_str_copy_cstring(command)
-    let argvWire: str = cheng_exec_program_encode_wire_items(["-lc", commandText])
-    return cheng_exec_program_build_argv("/bin/sh", argvWire)
+    let slotCount: int32 = 4
+    let argvRaw: ptr = cheng_malloc_export(slotCount * int32(sizeof(ptr)))
+    if argvRaw == nil:
+        return nil
+    cheng_bytes_set(argvRaw, 0, slotCount * int32(sizeof(ptr)))
+    var builtCount: int32
+    let shellCopy: ptr = cheng_string_copy("/bin/sh", 7)
+    if shellCopy == nil:
+        cheng_free_export(argvRaw)
+        return nil
+    *(VoidPtrPtr(cheng_ptr_plus(argvRaw, builtCount * int32(sizeof(ptr))))) = shellCopy
+    builtCount = builtCount + 1
+    let flagCopy: ptr = cheng_string_copy("-lc", 3)
+    if flagCopy == nil:
+        cheng_exec_program_free_argv(argvRaw, builtCount)
+        return nil
+    *(VoidPtrPtr(cheng_ptr_plus(argvRaw, builtCount * int32(sizeof(ptr))))) = flagCopy
+    builtCount = builtCount + 1
+    let commandLen: int32 = cheng_cstrlen_raw(command)
+    let commandCopy: ptr = cheng_string_copy(command, commandLen)
+    if commandCopy == nil:
+        cheng_exec_program_free_argv(argvRaw, builtCount)
+        return nil
+    *(VoidPtrPtr(cheng_ptr_plus(argvRaw, builtCount * int32(sizeof(ptr))))) = commandCopy
+    builtCount = builtCount + 1
+    return argvRaw
 
 fn cheng_exec_program_signal(pid: int32, signalCode: int32): bool =
     if pid <= 0 || signalCode <= 0:
@@ -1345,23 +1370,15 @@ fn cheng_exec_program_capture_with_timeout(programName: ptr,
     var readFd: int32 = -1
     var writeFd: int32 = -1
     var pid: int64 = int64(-1)
-    if mergeStderr != 0:
-        let commandText: ptr = cheng_exec_program_build_shell_command(programName, argvWire, envWire)
-        if commandText == nil:
-            return cheng_exec_program_empty_cstring()
-        let ok: int32 = native_cheng_pipe_spawn_runtime(commandText, workingDir, readFd, writeFd, pid)
-        cheng_free_export(commandText)
-        if ok == 0:
-            return cheng_exec_program_empty_cstring()
-    else:
-        if native_cheng_exec_file_pipe_spawn_runtime(programName,
-                                                     argvWire,
-                                                     envWire,
-                                                     workingDir,
-                                                     readFd,
-                                                     writeFd,
-                                                     pid) == 0:
-            return cheng_exec_program_empty_cstring()
+    if native_cheng_exec_file_pipe_spawn_runtime(programName,
+                                                 argvWire,
+                                                 envWire,
+                                                 workingDir,
+                                                 mergeStderr,
+                                                 readFd,
+                                                 writeFd,
+                                                 pid) == 0:
+        return cheng_exec_program_empty_cstring()
     cheng_exec_program_close_fd_if_valid(writeFd)
     let startNs: int64 = cheng_monotime_ns_export()
     let timeoutNs: int64 = int64(timeoutSec) * int64(1000000000)
@@ -1526,6 +1543,7 @@ fn native_cheng_exec_file_pipe_spawn_runtime(filePath: ptr,
                                              argvWire: str,
                                              envWire: str,
                                              workingDir: ptr,
+                                             mergeStderr: int32,
                                              outReadFd: var int32,
                                              outWriteFd: var int32,
                                              outPid: var int64): int32 =
@@ -1541,7 +1559,7 @@ fn native_cheng_exec_file_pipe_spawn_runtime(filePath: ptr,
         argCount = argCount + envCount + 1
     let ok: int32 = cheng_exec_program_spawn_pipe_argv(argvRaw,
                                                        workingDir,
-                                                       1,
+                                                       mergeStderr,
                                                        outReadFd,
                                                        outWriteFd,
                                                        outPid)
@@ -1682,7 +1700,8 @@ fn cheng_pipe_spawn_bridge_last_pid_i32(): int32 =
 fn cheng_exec_file_pipe_spawn_bridge(filePath: ptr,
                                         argvWire: str,
                                         envWire: str,
-                                        workingDir: ptr): int32 =
+                                        workingDir: ptr,
+                                        mergeStderr: int32): int32 =
     cheng_exec_file_pipe_spawn_last_read_fd_runtime = -1
     cheng_exec_file_pipe_spawn_last_write_fd_runtime = -1
     cheng_exec_file_pipe_spawn_last_pid_runtime = int64(-1)
@@ -1693,6 +1712,7 @@ fn cheng_exec_file_pipe_spawn_bridge(filePath: ptr,
                                                               argvWire,
                                                               envWire,
                                                               workingDir,
+                                                              mergeStderr,
                                                               readFd,
                                                               writeFd,
                                                               pid)
@@ -2509,9 +2529,28 @@ fn cheng_str_param_to_cstring_compat_value(s: str): ptr =
 
 @exportc("cheng_str_param_to_cstring_compat")
 fn cheng_str_param_to_cstring_compat_export(s_raw: ptr): ptr =
-    var s: str
-    cheng_str_bridge_load_into_export(&s, s_raw)
-    return cheng_str_param_to_cstring_compat_value(s)
+    if s_raw == nil:
+        let empty: ptr = driver_c_new_string_export(0)
+        return empty == nil ? "" : empty
+    let inPtr: StrPtr = StrPtr(s_raw)
+    let data: ptr = inPtr->data
+    let len: int32 = inPtr->len
+    let flags: int32 = inPtr->flags
+    if len < 0 || len > 268435456:
+        let compat: ptr = data != nil && uint64(data) >= uint64(65536) ? data : nil
+        return compat == nil ? "" : compat
+    if flags != 0 && flags != chengStrFlagOwned:
+        let compat: ptr = data != nil && uint64(data) >= uint64(65536) ? data : nil
+        return compat == nil ? "" : compat
+    if data == nil || len <= 0:
+        let empty: ptr = driver_c_new_string_export(0)
+        return empty == nil ? "" : empty
+    if flags == chengStrFlagOwned:
+        return data
+    let out: ptr = cheng_string_copy(data, len)
+    if out == nil:
+        return ""
+    return out
 
 @exportc("cheng_str_to_cstring_temp_bridge")
 fn cheng_str_to_cstring_temp_bridge_export(s_raw: ptr): ptr =
@@ -2697,7 +2736,8 @@ fn driver_c_read_flag_or_default_bridge_export(key: str, defaultValue: str): str
     let defaultLen = cheng_str_len(defaultValue)
     let count = cheng_runtime_param_count()
     if count <= 1:
-        return cheng_str_copy(defaultData, defaultLen)
+        let copied = cheng_str_copy(defaultData, defaultLen)
+        return copied
     var i: int32 = 1
     while i < count:
         let arg = cheng_runtime_param_str(i)
@@ -2706,11 +2746,14 @@ fn driver_c_read_flag_or_default_bridge_export(key: str, defaultValue: str): str
             return inlineValue
         if cheng_runtime_flag_key_matches(arg, key):
             if i + 1 >= count:
-                return cheng_str_copy(defaultData, defaultLen)
+                let copied = cheng_str_copy(defaultData, defaultLen)
+                return copied
             let value = cheng_runtime_param_str(i + 1)
-            return cheng_str_copy(cheng_str_data(value), cheng_str_len(value))
+            let copied = cheng_str_copy(cheng_str_data(value), cheng_str_len(value))
+            return copied
         i = i + 1
-    return cheng_str_copy(defaultData, defaultLen)
+    let copied = cheng_str_copy(defaultData, defaultLen)
+    return copied
 
 @exportc("driver_c_read_flag_value_bridge")
 fn driver_c_read_flag_value_bridge_export(key: str, outValue: var str): bool =
@@ -2866,15 +2909,18 @@ fn cheng_strformat_join_runtime(parts: str[], sep: str): str =
             let partData = cheng_str_data(part)
             cheng_bytes_copy(dst, partData, partLen)
             writeAt = writeAt + partLen
-    return cheng_str_view_owned(outRaw, total)
+    let out: str = cheng_str_view_owned(outRaw, total)
+    return out
 
 @exportc("cheng_strformat_fmt_bridge")
 fn cheng_strformat_fmt_bridge_export(parts: str[]): str =
-    return cheng_strformat_join_runtime(parts, "")
+    let out: str = cheng_strformat_join_runtime(parts, "")
+    return out
 
 @exportc("cheng_strformat_lines_bridge")
 fn cheng_strformat_lines_bridge_export(parts: str[]): str =
-    return cheng_strformat_join_runtime(parts, "\n")
+    let out: str = cheng_strformat_join_runtime(parts, "\n")
+    return out
 
 @exportc("cheng_os_is_absolute_bridge")
 fn cheng_os_is_absolute_bridge_export(path: str): int32 =
@@ -3343,38 +3389,28 @@ fn cheng_read_file_all_raw(path: ptr): ptr =
 fn cheng_file_exists_raw(path: ptr): bool =
     if path == nil || *(UInt8Ptr(path)) == uint8(0):
         return false
-    let dir = libc_opendir(path)
-    if dir != nil:
-        libc_closedir(dir)
-        return false
     var st: DarwinStat
     if libc_stat(path, ptr(&st)) != 0:
         return false
-    return true
+    return (int32(st.st_mode) & chengStatTypeMask) != chengStatTypeDir
 
 fn cheng_dir_exists_raw(path: ptr): bool =
     if path == nil || *(UInt8Ptr(path)) == uint8(0):
         return false
-    let dir = libc_opendir(path)
-    if dir == nil:
+    var st: DarwinStat
+    if libc_stat(path, ptr(&st)) != 0:
         return false
-    libc_closedir(dir)
-    return true
+    return (int32(st.st_mode) & chengStatTypeMask) == chengStatTypeDir
 
 fn cheng_file_size_raw(path: ptr): int64 =
     if path == nil || *(UInt8Ptr(path)) == uint8(0):
         return 0
-    let fp = cheng_fopen_read(path)
-    if fp == nil:
+    var st: DarwinStat
+    if libc_stat(path, ptr(&st)) != 0:
         return 0
-    if libc_fseek(fp, 0, chengSeekEnd) != 0:
-        libc_fclose(fp)
+    if (int32(st.st_mode) & chengStatTypeMask) == chengStatTypeDir:
         return 0
-    let size = libc_ftell(fp)
-    libc_fclose(fp)
-    if size < 0:
-        return 0
-    return size
+    return st.st_size
 
 fn cheng_file_mtime_raw(path: ptr): int64 =
     if path == nil || *(UInt8Ptr(path)) == uint8(0):
@@ -5475,8 +5511,9 @@ fn cheng_pipe_spawn_bridge_last_pid_i32_export(): int32 =
 fn cheng_exec_file_pipe_spawn_bridge_export(filePath: ptr,
                                                argvWire: str,
                                                envWire: str,
-                                               workingDir: ptr): int32 =
-    return cheng_exec_file_pipe_spawn_bridge(filePath, argvWire, envWire, workingDir)
+                                               workingDir: ptr,
+                                               mergeStderr: int32): int32 =
+    return cheng_exec_file_pipe_spawn_bridge(filePath, argvWire, envWire, workingDir, mergeStderr)
 
 @exportc("cheng_exec_file_pipe_spawn_bridge_last_read_fd")
 fn cheng_exec_file_pipe_spawn_bridge_last_read_fd_export(): int32 =
@@ -5630,6 +5667,20 @@ fn cheng_os_file_size_bridge_export(path: str): int64 =
     let size = cheng_file_size_raw(raw)
     cheng_free_export(raw)
     return size
+
+@exportc("cheng_os_fopen_mode_bridge")
+fn cheng_os_fopen_mode_bridge_export(path: str, mode: str): ptr =
+    let rawPath = cheng_copy_cstring_from_str(path)
+    if rawPath == nil:
+        return nil
+    let rawMode = cheng_copy_cstring_from_str(mode)
+    if rawMode == nil:
+        cheng_free_export(rawPath)
+        return nil
+    let fp = libc_fopen(rawPath, rawMode)
+    cheng_free_export(rawMode)
+    cheng_free_export(rawPath)
+    return fp
 
 @exportc("cheng_read_file_bridge")
 fn cheng_read_file_bridge_export(path: str): str =

@@ -13,4 +13,17 @@
 - [x] Implement TACT key table handling.
 - [x] Parse encoding/root/install from local CASC.
 - [x] Add audited Northshire fileDataID manifest.
+- [x] Parse modern `Data/indices/*.index` footer and record layout.
+- [x] Stabilize large `Data/indices` directory enumeration in Cheng runtime.
+- [x] Prove modern `Data/indices` indexes loose `encoding/root/vfs` ekeys and block-key chain.
+- [x] Resolve loose config blob store as CDN `data/xx/yy/eKey` from local CDN config.
+- [x] Add pure Cheng HTTP CDN fetch/cache path for loose config blobs.
+- [x] Decode cached CDN `vfs-root` BLTE blob.
+- [x] Parse decoded CDN `vfs-root` payload and continue VFS/root chain.
+- [x] Use TVFS `.root` mapping to fetch CDN root BLTE and decode first root block.
+- [x] Add range/block streaming lookup for CDN root payload.
+- [x] Optimize pure Cheng zlib hot path for CDN root range decode.
+- [x] Make Northshire CLI preview load real local assets without full root rescans.
+- [x] Parse real M2 vertex bounds for Northshire preview.
+- [ ] Export audited Northshire assets to files from CLI.
 - [ ] Render Northshire MVP from real local assets.

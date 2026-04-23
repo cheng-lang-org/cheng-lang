@@ -1,9 +1,12 @@
+import std/bytes as bytes
 import std/result
 import std/seqs
 import std/strings as strings
 import std/strformat
 import cheng/apps/wow_export/build_info as build_info
+import cheng/apps/wow_export/casc_index as casc_index
 import cheng/apps/wow_export/local_files as local_files
+import cheng/apps/wow_export/md5 as md5
 
 type
     NorthshireAuditedFile =
@@ -137,6 +140,41 @@ fn AuditManifestAgainstLocal(m: NorthshireManifest): Result[NorthshireAuditSumma
         out.matchedFileCount = out.matchedFileCount + 1
         i = i + 1
     local_files.FreeLocalCascContext(ctx)
+    return Ok[NorthshireAuditSummary](out)
+
+fn AuditManifestPayloadsAgainstLocal(m: NorthshireManifest): Result[NorthshireAuditSummary] =
+    if !ManifestReady(m):
+        return Err[NorthshireAuditSummary]("wowExport northshire manifest: incomplete audited file table")
+    if m.product != build_info.DefaultProduct ||
+        m.version != build_info.DefaultVersion ||
+        m.buildKey != build_info.DefaultBuildKey:
+        return Err[NorthshireAuditSummary]("wowExport northshire manifest: build identity drift")
+    var out: NorthshireAuditSummary
+    var i: int32
+    while i < m.auditedFiles.len:
+        let file: NorthshireAuditedFile = m.auditedFiles[i]
+        let idxEntryRes: Result[casc_index.CascIndexEntry] =
+            casc_index.LoadLocalIndexEntry(m.clientPath, file.encodingKey)
+        if IsErr(idxEntryRes):
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " encoding index failed: " + Error(idxEntryRes))
+        let entry: casc_index.CascIndexEntry = Value(idxEntryRes)
+        if entry.archiveIndex != file.archiveIndex:
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " archive mismatch want=" + strings.IntToStr(file.archiveIndex) + " got=" + strings.IntToStr(entry.archiveIndex))
+        if entry.offset != file.offset:
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " offset mismatch want=" + strings.IntToStr(file.offset) + " got=" + strings.IntToStr(entry.offset))
+        if entry.size != file.size:
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " size mismatch want=" + strings.IntToStr(file.size) + " got=" + strings.IntToStr(entry.size))
+        let fileRes: Result[bytes.ByteBuffer] =
+            local_files.ReadLocalFileByEntry(m.clientPath, file.archiveIndex, file.offset, file.size)
+        if IsErr(fileRes):
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " payload load failed: " + Error(fileRes))
+        let fileBuf: bytes.ByteBuffer = Value(fileRes)
+        let contentHash: str = md5.Md5ByteBufferHex(fileBuf)
+        bytes.FreeByteBuffer(fileBuf)
+        if contentHash != file.contentKey:
+            return Err[NorthshireAuditSummary]("wowExport northshire manifest: " + file.label + " contentKey mismatch want=" + file.contentKey + " got=" + contentHash)
+        out.matchedFileCount = out.matchedFileCount + 1
+        i = i + 1
     return Ok[NorthshireAuditSummary](out)
 
 fn NorthshireAuditSummaryText(summary: NorthshireAuditSummary): str =

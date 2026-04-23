@@ -21,42 +21,105 @@ fn currentExecutablePath(root: str): str =
         return raw
     return os.joinPath(root, raw)
 
+fn joinPieces(parts: str[]): str =
+    var total: int32
+    for i in 0..<parts.len:
+        total = total + len(parts[i])
+    if total <= 0:
+        return ""
+    let out = newStringAlloc(total)
+    var writePos: int32
+    for i in 0..<parts.len:
+        let part = parts[i]
+        for j in 0..<len(part):
+            out[writePos] = part[j]
+            writePos = writePos + 1
+    return out
+
+fn charText(ch: char): str =
+    let out = newStringAlloc(1)
+    out[0] = ch
+    return out
+
+fn ownedText(text: str): str =
+    if len(text) <= 0:
+        return ""
+    return newStringCopy(strDataPtr(text), len(text))
+
+fn quoteShellStable(value: str): str =
+    if len(value) == 0:
+        return "''"
+    var parts: str[]
+    add(parts, "'")
+    for i in 0..<len(value):
+        let ch = value[i]
+        if ch == '\'':
+            add(parts, "'\"'\"'")
+        else:
+            add(parts, charText(ch))
+    add(parts, "'")
+    return joinPieces(parts)
+
+fn compileCommandText(filePath: str, argv: str[], envOverrides: str[], logPath: str): str =
+    var parts: str[]
+    if envOverrides.len > 0:
+        add(parts, "env")
+        for i in 0..<envOverrides.len:
+            let envText = envOverrides[i]
+            if len(envText) > 0:
+                add(parts, " ")
+                add(parts, quoteShellStable(envText))
+        add(parts, " ")
+    add(parts, quoteShellStable(filePath))
+    for i in 0..<argv.len:
+        add(parts, " ")
+        add(parts, quoteShellStable(argv[i]))
+    add(parts, " > ")
+    add(parts, quoteShellStable(logPath))
+    add(parts, " 2>&1")
+    return joinPieces(parts)
+
 fn compileFixture(compiler: str,
                   root: str,
                   packageRoot: str,
                   inputPath: str,
                   outputPath: str,
-                  logPath: str): os.ExecCmdResult =
+                  logPath: str,
+                  outOutput: var str): int32 =
     let target: str = envDefault("CHENG_BOOTSTRAP_TARGET", "arm64-apple-darwin")
     var argv: str[]
     add(argv, "system-link-exec")
     add(argv, "--root")
-    add(argv, packageRoot)
+    add(argv, ownedText(packageRoot))
     add(argv, "--in")
-    add(argv, inputPath)
+    add(argv, ownedText(inputPath))
     add(argv, "--emit")
     add(argv, "exe")
     add(argv, "--target")
-    add(argv, target)
+    add(argv, ownedText(target))
     add(argv, "--out")
-    add(argv, outputPath)
+    add(argv, ownedText(outputPath))
     var envv: str[]
-    let noHandoff = os.getEnv("CHENG_NO_BACKEND_DRIVER_HANDOFF")
-    if len(noHandoff) > 0 && noHandoff != "0":
-        add(envv, "CHENG_NO_BACKEND_DRIVER_HANDOFF=" + noHandoff)
-    let res = hostos.execFileCapture(compiler, argv, envv, root, true, 60)
-    let resOutput = os.execCmdResultOutput(res)
-    os.writeFile(logPath, resOutput)
-    return res
+    let command = compileCommandText(compiler, argv, envv, logPath)
+    outOutput = ""
+    var shellArgv: str[]
+    add(shellArgv, "-lc")
+    add(shellArgv, ownedText(command))
+    let exitCode: int32 = hostos.ExecFileStatus("/bin/sh",
+                                                shellArgv,
+                                                [],
+                                                root,
+                                                60)
+    outOutput = os.ReadFile(logPath)
+    return exitCode
 
 fn main(): int32 =
     let root: str = os.getCurrentDir()
     let exePath: str = currentExecutablePath(root)
     assert(len(exePath) > 0 && os.fileExists(exePath),
            " strformat export negative: executable path")
-    let exeParts = os.splitFile(exePath)
-    let exeDir = exeParts.dir
-    let exeName = exeParts.name
+    let exeDir = os.ParentDir(exePath)
+    let exeName = os.ExtractFilename(exePath)
     let outDirName = exeName + ".workspace"
     let outDir = os.joinPath(exeDir, outDirName)
     ensureDir(outDir)
@@ -78,6 +141,7 @@ fn main(): int32 =
     var compiler = compilerRaw
     if !os.isAbsolute(compilerRaw):
         compiler = os.joinPath(root, compilerRaw)
+    compiler = ownedText(compiler)
     assert(os.fileExists(compiler),
            " strformat export negative: compiler exists")
 
@@ -86,14 +150,15 @@ fn main(): int32 =
                  "import std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.fmt(\"bad\")\n    echo(text)\n    return 0\n")
     let fmtOutPath = os.joinPath(outDir, "fmt_private")
     let fmtLogPath = os.joinPath(outDir, "fmt_private.compile.log")
-    let fmtRes = compileFixture(compiler,
-                                root,
-                                pkgRoot,
-                                fmtSrc,
-                                fmtOutPath,
-                                fmtLogPath)
-    let fmtOutput = os.execCmdResultOutput(fmtRes)
-    assert(os.execCmdResultExitCode(fmtRes) != 0,
+    var fmtOutput = ""
+    let fmtExitCode = compileFixture(compiler,
+                                     root,
+                                     pkgRoot,
+                                     fmtSrc,
+                                     fmtOutPath,
+                                     fmtLogPath,
+                                     fmtOutput)
+    assert(fmtExitCode != 0,
            " strformat export negative: lowercase fmt rejected")
     assert(strings.StrContains(fmtOutput,
                                "imported private symbol 'fmt' is not exported"),
@@ -104,14 +169,15 @@ fn main(): int32 =
                  "import std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.lines([\"a\", \"b\"])\n    echo(text)\n    return 0\n")
     let linesOutPath = os.joinPath(outDir, "lines_private")
     let linesLogPath = os.joinPath(outDir, "lines_private.compile.log")
-    let linesRes = compileFixture(compiler,
-                                  root,
-                                  pkgRoot,
-                                  linesSrc,
-                                  linesOutPath,
-                                  linesLogPath)
-    let linesOutput = os.execCmdResultOutput(linesRes)
-    assert(os.execCmdResultExitCode(linesRes) != 0,
+    var linesOutput = ""
+    let linesExitCode = compileFixture(compiler,
+                                       root,
+                                       pkgRoot,
+                                       linesSrc,
+                                       linesOutPath,
+                                       linesLogPath,
+                                       linesOutput)
+    assert(linesExitCode != 0,
            " strformat export negative: lowercase lines rejected")
     assert(strings.StrContains(linesOutput,
                                "imported private symbol 'lines' is not exported"),

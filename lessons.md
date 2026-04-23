@@ -37,5 +37,8 @@
 - 将 C seed 的 sidecar 写入迁到 backend driver 时，不能让 seed 先发 `build done`；driver 必须在 Cheng 侧 sidecar 写完后再发 `build done`，否则实时进度会提前宣称完成。
 - `verify-debug-tools` 底层会跑 host smoke；它和 `run-host-smokes`、`build-backend-driver` 一样属于会编译的门禁，必须串行执行。
 - seed 最小化时，新语言表面和库语义优先落纯 Cheng；seed 只保留自举活路径必须承担的降糖和 correctness，不能把新能力继续堆回 `cheng_seed.c`。
-- 组合按值调用参数若在 caller 侧 materialize 到 call temp，并且类型带 `Bytes` ORC 生命周期，调用返回后必须立刻 release+zero 这个 temp；拖到函数 epilogue 会把中间 refcount 观测弄脏。
+- 当前 Cheng 复合实参 ABI 仍是“callee 直接借 caller frame 里的 call temp 地址”；这类 call temp 不能在调用返回后立刻 release/zero，必须等 caller 函数 epilogue 和普通 local 一起回收，否则会提前打断仍然活着的 borrow。
 - 用户明确要求“从 seed 迁到纯 Cheng 最小 seed”时，优先迁走 `std` 语义和 runtime shim；不要因为自举方便继续把 `Fmt/$` 一类库行为补进 `cheng_seed.c`。
+- `$` 的公开表面只保留直接写法：简单值支持 `$box`，复杂表达式支持 `$(expr)`；不要再把反引号 `` `$` `` 当用户语法往前推，纯 Cheng 前端负责降糖，seed 只保留兼容。
+- wowExport 处理 CDN root/BLTE/zlib 时不要先全量解码再扫表；真实 root 会放大到 49MB encoded / 65MB decoded，必须按 BLTE block range 解码、批量 root lookup，并用 bit-buffer + 小型 Huffman fast table 控制时间和内存。
+- wowExport CLI 可见的 `Fmt` 摘要函数不要直接插入自定义 helper 调用；先把 helper 结果落到本地变量再插值，否则当前 seed/materialize 链路容易触发 `primary_object_body_semantics_missing`。

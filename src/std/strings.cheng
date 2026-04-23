@@ -3,8 +3,8 @@ import std/system
 
 type
     UInt8Ptr = uint8 *
-@importc("__cheng_str_concat")
-fn cheng_str_concat_runtime(a: cstring, b: cstring): cstring
+@importc("driver_c_str_concat_bridge")
+fn cheng_str_concat_bridge_runtime(a: str, b: str): str
 
 fn len(s: str): int32 =
     return strLenFast(s)
@@ -80,12 +80,7 @@ fn __cheng_str_from_bytes(data: uint8[], len: int32): str =
     return strFromBytesCopy(data.buffer, len)
 
 fn concatStr(s1: str, s2: str): str =
-    let raw: cstring = cheng_str_concat_runtime(strToCStringTemp(s1), strToCStringTemp(s2))
-    if raw == nil:
-        return strEmpty()
-    let rawLen = c_strlen(raw)
-    let out = strViewWithFlags(ptr(raw), rawLen, 0, chengStrFlagOwned)
-    return out
+    return cheng_str_concat_bridge_runtime(s1, s2)
 
 fn charToStr(c: char): str =
     return strFromBytesCopy(&c, 1)
@@ -154,102 +149,101 @@ fn strContains(text: str, sub: str): bool =
         i = i + 1
     return false
 
-type
-    U64Div10Step =
-        hi: uint32
-        lo: uint32
-        rem: int32
+fn uint64DigitToStr(value: uint64): str =
+    return charToStr(char(int32('0') + int32(value)))
 
-fn uint64HighWord(value: uint64): uint32 =
-    return uint32((value >> uint64(32)) & uint64(0xffffffff))
-
-fn uint64LowWord(value: uint64): uint32 =
-    return uint32(value & uint64(0xffffffff))
-
-fn divModU64WordsBy10(hi: uint32, lo: uint32): U64Div10Step =
-    let hiPart: uint64 = uint64(hi) & uint64(0xffffffff)
-    let qHi: uint32 = uint32(hiPart / uint64(10))
-    let remHi: uint64 = hiPart - (uint64(qHi) * uint64(10))
-    let combined: uint64 = (remHi << uint64(32)) | (uint64(lo) & uint64(0xffffffff))
-    let qLo: uint32 = uint32(combined / uint64(10))
-    let rem: int32 = int32(combined - (uint64(qLo) * uint64(10)))
-    return U64Div10Step(hi: qHi, lo: qLo, rem: rem)
-
-fn uint64DigitsToStr(value: uint64, negative: bool): str =
-    var buf: uint8[32]
-    var cursor: int32 = 32
-    var hi: uint32 = uint64HighWord(value)
-    var lo: uint32 = uint64LowWord(value)
-    if hi == uint32(0) && lo == uint32(0):
-        cursor = cursor - 1
-        buf[cursor] = uint8('0')
-    else:
-        while hi != uint32(0) || lo != uint32(0):
-            let step: U64Div10Step = divModU64WordsBy10(hi, lo)
-            cursor = cursor - 1
-            buf[cursor] = uint8(int32('0') + step.rem)
-            hi = step.hi
-            lo = step.lo
-    if negative:
-        cursor = cursor - 1
-        buf[cursor] = uint8('-')
-    let out: str = strFromBytesCopy(system_ptr_add(&buf[0], cursor), 32 - cursor)
-    return out
+fn uint64DigitsText(value: uint64): str =
+    if value < uint64(10):
+        return uint64DigitToStr(value)
+    let prefix: str = uint64DigitsText(value / uint64(10))
+    let digitValue: uint64 = value - ((value / uint64(10)) * uint64(10))
+    return prefix + uint64DigitToStr(digitValue)
 
 fn intToStr(i: int32): str =
     if i >= int32(0):
-        let out: str = uint64DigitsToStr(uint64(i), false)
-        return out
+        return uint64DigitsText(uint64(i))
     let mag: uint64 = uint64(int64(0) - int64(i))
-    let out: str = uint64DigitsToStr(mag, true)
-    return out
+    return "-" + uint64DigitsText(mag)
 
 fn uint64ToStr(x: uint64): str =
-    let out: str = uint64DigitsToStr(x, false)
-    return out
+    return uint64DigitsText(x)
 
 fn int64ToStr(i: int64): str =
     if i >= int64(0):
-        let out: str = uint64DigitsToStr(uint64(i), false)
-        return out
+        return uint64DigitsText(uint64(i))
     let mag: uint64 = uint64(0) - uint64(i)
-    let out: str = uint64DigitsToStr(mag, true)
-    return out
+    return "-" + uint64DigitsText(mag)
 
 fn `$`(x: bool): str =
-    return boolToString(x)
+    return stdStringifyBoolImpl(x)
 
 fn `$`(x: char): str =
-    return charToString(x)
+    return stdStringifyCharImpl(x)
 
 fn `$`(x: int8): str =
-    return intToStr(int32(x))
+    return stdStringifyInt8Impl(x)
 
 fn `$`(x: uint8): str =
-    return uint64ToStr(uint64(x))
+    return stdStringifyUInt8Impl(x)
 
 fn `$`(x: int16): str =
-    return intToStr(int32(x))
+    return stdStringifyInt16Impl(x)
 
 fn `$`(x: uint16): str =
-    return uint64ToStr(uint64(x))
+    return stdStringifyUInt16Impl(x)
 
 fn `$`(x: int32): str =
-    return intToStr(x)
+    return stdStringifyInt32Impl(x)
 
 fn `$`(x: int): str =
-    return intToStr(int32(x))
+    return stdStringifyIntImpl(x)
 
 fn `$`(x: uint32): str =
-    return uint64ToStr(uint64(x))
+    return stdStringifyUInt32Impl(x)
 
 fn `$`(x: int64): str =
-    return int64ToStr(x)
+    return stdStringifyInt64Impl(x)
 
 fn `$`(x: uint64): str =
-    return uint64ToStr(x)
+    return stdStringifyUInt64Impl(x)
 
 fn `$`(s: str): str =
+    return stdStringifyStrImpl(s)
+
+fn stdStringifyBoolImpl(x: bool): str =
+    return boolToString(x)
+
+fn stdStringifyCharImpl(x: char): str =
+    return charToString(x)
+
+fn stdStringifyInt8Impl(x: int8): str =
+    return intToStr(int32(x))
+
+fn stdStringifyUInt8Impl(x: uint8): str =
+    return uint64ToStr(uint64(x))
+
+fn stdStringifyInt16Impl(x: int16): str =
+    return intToStr(int32(x))
+
+fn stdStringifyUInt16Impl(x: uint16): str =
+    return uint64ToStr(uint64(x))
+
+fn stdStringifyInt32Impl(x: int32): str =
+    return intToStr(x)
+
+fn stdStringifyIntImpl(x: int): str =
+    return intToStr(int32(x))
+
+fn stdStringifyUInt32Impl(x: uint32): str =
+    return uint64ToStr(uint64(x))
+
+fn stdStringifyInt64Impl(x: int64): str =
+    return int64ToStr(x)
+
+fn stdStringifyUInt64Impl(x: uint64): str =
+    return uint64ToStr(x)
+
+fn stdStringifyStrImpl(s: str): str =
     let data = strDataPtr(s)
     let size = strLenFast(s)
     let out = newStringCopy(data, size)
@@ -300,15 +294,27 @@ fn reprSeqI64(xs: int64[]): str =
     return out + "]"
 
 fn `$`(xs: str[]): str =
-    return reprSeqString(xs)
+    return stdStringifySeqStrImpl(xs)
 
 fn `$`(xs: bool[]): str =
-    return reprSeqBool(xs)
+    return stdStringifySeqBoolImpl(xs)
 
 fn `$`(xs: int32[]): str =
-    return reprSeqI32(xs)
+    return stdStringifySeqInt32Impl(xs)
 
 fn `$`(xs: int64[]): str =
+    return stdStringifySeqInt64Impl(xs)
+
+fn stdStringifySeqStrImpl(xs: str[]): str =
+    return reprSeqString(xs)
+
+fn stdStringifySeqBoolImpl(xs: bool[]): str =
+    return reprSeqBool(xs)
+
+fn stdStringifySeqInt32Impl(xs: int32[]): str =
+    return reprSeqI32(xs)
+
+fn stdStringifySeqInt64Impl(xs: int64[]): str =
     return reprSeqI64(xs)
 
 fn Len(s: str): int32 =

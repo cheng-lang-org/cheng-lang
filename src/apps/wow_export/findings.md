@@ -1,5 +1,24 @@
 # wowExport Findings
 
+- `std/os.ListDir` 的库层根因已经钉住并修掉：`cheng_list_dir` 返回的 raw listing 之前没有在 `ListDir` 内部释放，业务层只能自己借用扫描；现在 `ListDir` 已在库层释放 raw buffer，并返回 owned 文件名。
+- `casc_index.LoadLocalIndexEntry` 已改成“原始 listing 文本在同一作用域内借用扫描”，因此路径桥崩溃和悬挂文件名都已经收住；现状是明确返回 `wowExport index: local encoding key not found 00f6dcef63eafe6254ab5408ea8baa09`。
+- 已补纯 Cheng `tact_index` 解析器，当前本机 `Data/indices/bd643d2dac9bfdc365890dafbbea83d6.index` 的 footer/record 事实已经钉住：`formatRevision=1`、`blockSizeKB=4`、`offsetBytes=4`、`sizeBytes=4`、`keyBytes=16`、`hashBytes=8`，record 是标准 `ekey + size + offset`。
+- 现代 `.index` 文件格式现在不只是“能解 footer/record”，还已经能按真实 ekey 跨 `Data/indices` 定位样本：本机 `encoding` ekey `00f6dcef63eafe6254ab5408ea8baa09`、`root` ekey `108aaa378a9a07d9a926150259ecbdad`、`vfs-root` ekey `2aece4e2ec64a8c89753c53f4d0207ca` 都能落到 `303b4155efa35ae393a48c869f1d1899.index`。
+- `303b...index` 的 TOC block key 链也已经钉住：`encoding` 会在 `02197ea63010610c26af7491e3f321f2` 自环，`vfs-root` 会沿 `4196313e956bd41f9b2425c8e171af43 -> 6151521e2902cccc10e7c4d77fb0f497 -> 8bdfef615338a75d9199dd5a74913d14` 继续追；真正剩下的缺口已经从“索引里找不到”缩成“终点 block key 对应的 loose blob 具体存放处还没解出来”。
+- 终点 key `8bdfef615338a75d9199dd5a74913d14` 已经对 `Data/indices`、WoW 根目录隐藏 `.battle.net/indices`、Battle.net `Versions/.battle.net/indices` 做过全量精确扫描，当前结论是它不在任何本机 `.index` record 里；也就是说下一步不该继续加大 `.index` 搜索，而该直接找索引外的最终 loose blob 仓。
+- 本地 CDN config 已把 `file-index` 钉为 `303b4155efa35ae393a48c869f1d1899`，所以 `303b...index` 是 CDN file-index。实际 config loose object 名仍是原 ekey：`00f6dcef63eafe6254ab5408ea8baa09` 对应 `data/00/f6/00f6dcef63eafe6254ab5408ea8baa09`，`2aece4e2ec64a8c89753c53f4d0207ca` 对应 `data/2a/ec/2aece4e2ec64a8c89753c53f4d0207ca`。
+- 已用远端 HEAD 手工校验 CDN loose path：`00f6...` 返回 200 且 `Content-Length=183655454`，`2aec...` 返回 200 且 `Content-Length=34973`；`8bdf...` 返回 404，说明它只是 file-index 内部 block key，不是最终可拉取对象。
+- CDN fetch 主线已改成纯 Cheng HTTP/1.1 over TCP：只接受 `Content-Length` 明确的 `200` 响应，流式写 cache 并校验最终大小；不接受 chunked，也不做 redirect/猜测补救。
+- CDN `vfs-root` loose object 已确认是标准 BLTE/zlib，缓存后可用现有纯 Cheng BLTE 解码器解出 `55471` 字节 payload；payload 是 `TVFS`，当前已解析出 `1178` 个 path node、`311` 个目录、`867` 个文件和 `867` 个 container entry。
+- `vfs-root` 的首个 path 是 `.root`，其 file span 指向 container offset `1785`，partial ekey 为 `108aaa378a9a07d9a9`，content key 为本机 build config root `4d538d779c8ce517fed1b8718bea2b79`；下一步应从这条 TVFS 映射继续取 CDN root payload。
+- `.root` partial ekey 已通过 CDN config `file-index` 对应的本机 `.index` 补全为 `108aaa378a9a07d9a926150259ecbdad`；远端 root loose object 已缓存，大小 `49480175`，首个 BLTE block 解出 `262144` 字节后可解析 TSFM root header，总文件数 `3191145`，首个 fileDataID `121595`。
+- 纯 Cheng CDN root lookup 慢的根因不是 Cheng 运行时整体性能，而是 wowExport 热路径先全量解码/重复扫表，且 zlib Huffman decode 逐 symbol 线性查找；现已改为 BLTE range/block 解码、批量 root scan、zlib bit-buffer + 10-bit fast table。
+- 15-bit 全量 Huffman fast table 能提速但会把 root lookup 峰值推到数百 MB；10-bit fast table 覆盖常见短码，长码严格回退慢路径，当前 root lookup 普通运行通过，运行中 RSS 采样约 `45632KB`。
+- 纯 Cheng 当前慢点不是运行时整体性能问题；北郡预览此前慢是每次走完整 root/encoding 深审计，已改成已审计 payload/index/MD5 快审计，CLI `preview-northshire --frames 1` 本机约 `2.15s`。
+- M2 顶点 offset 在 `MD21` 包装下是相对内部 `MD20` payload 起点，不是文件起点；不加 `MD20` start 会读错顶点包围盒，真实 `nsabbeyBell.m2` 修正后跨度为 `1916,5856,25208`。
+- 当前 seed/materialize 对 CLI 大闭包里 `Fmt"{CustomText(x)}"` 这类自定义 helper 插值仍不稳；把 helper 调用结果先放进局部变量后，`wow_export_tool_main` 可重新编译通过。
+- `std/os.ListDir` 这次进一步改成“两遍扫描计数 + owned move 填充”，本机 1536 文件一次性快照 smoke 已通过，说明 `wow_export` 扫真实 `Data/indices` 不会再因为目录规模崩掉；但当前 256 文件 * 6000 轮 stress 的 `peak memory footprint` 仍在约 219MB，说明 runtime/allocator 对这条长时间热路径还有内存回收观察值需要继续压。
+
 - 本机 `.build.info` 有 active `wow 12.0.5.67165`，build key 为 `02482dc9c788698c83e7ae0e24ab2bb7`。
 - 本机 build config 暴露 root、install、encoding keys；encoding 已能把 root/install content key 映射到本地 archive entry，后续缺口是北郡已审计 fileDataID manifest。
 - 已新增可复用纯 Cheng zlib/deflate inflate；入口校验 zlib header、stored/fixed/dynamic deflate 和 Adler32，不依赖脚本或 C 解压。

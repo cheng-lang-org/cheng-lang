@@ -31,6 +31,16 @@ fn seedClassicM2Header(buf: bytes.ByteBuffer, start: int32) =
     putU32LE(buf, start + 0x44, 1)
     putU32LE(buf, start + 0x50, 2)
 
+fn seedGeometryM2Header(buf: bytes.ByteBuffer, start: int32, vertexCount: int32, vertexOffset: int32) =
+    seedClassicM2Header(buf, start)
+    putU32LE(buf, start + 0x3c, vertexCount)
+    putU32LE(buf, start + 0x40, vertexOffset)
+
+fn seedM2VertexPosition(buf: bytes.ByteBuffer, start: int32, xBits: int32, yBits: int32, zBits: int32) =
+    putU32LE(buf, start, xBits)
+    putU32LE(buf, start + 4, yBits)
+    putU32LE(buf, start + 8, zBits)
+
 fn assertHeader(header: asset_formats.M2Header) =
     assert(header.version == 272, "wow_export_asset_formats_smoke version")
     assert(header.sequenceCount == 2, "wow_export_asset_formats_smoke sequences")
@@ -60,6 +70,25 @@ fn main(): int32 =
     let badRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(bad)
     assert(IsErr(badRes), "wow_export_asset_formats_smoke bad magic rejects")
     bytes.FreeByteBuffer(bad)
+
+    let geomOffset: int32 = 0x80
+    let geom: bytes.ByteBuffer = makeBuf(8 + geomOffset + 2 * 48)
+    putFourCC(geom, 0, "MD21")
+    putU32LE(geom, 4, geomOffset + 2 * 48)
+    seedGeometryM2Header(geom, 8, 2, geomOffset)
+    seedM2VertexPosition(geom, 8 + geomOffset, 0x3f800000, 0x40000000, 0x40400000)
+    seedM2VertexPosition(geom, 8 + geomOffset + 48, 0x40800000, 0x40c00000, 0x41100000)
+    let geomRes: Result[asset_formats.M2GeometrySummary] = asset_formats.ParseM2GeometrySummary(geom)
+    assert(IsOk(geomRes), Error(geomRes))
+    assert(Value(geomRes).header.vertexOffset == 8 + geomOffset,
+           "wow_export_asset_formats_smoke geometry offset")
+    assert(asset_formats.M2GeometrySpanX1000(Value(geomRes)) == 3000,
+           "wow_export_asset_formats_smoke geometry span x")
+    assert(asset_formats.M2GeometrySpanY1000(Value(geomRes)) == 4000,
+           "wow_export_asset_formats_smoke geometry span y")
+    assert(asset_formats.M2GeometrySpanZ1000(Value(geomRes)) == 6000,
+           "wow_export_asset_formats_smoke geometry span z")
+    bytes.FreeByteBuffer(geom)
 
     echo("wow_export_asset_formats_smoke ok")
     return 0

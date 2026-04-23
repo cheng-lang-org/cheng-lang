@@ -321,6 +321,201 @@ fn CompilerRequestedTarget(): str =
 fn CompilerStage3CommandPath(rootDir: str): str =
     return chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage3")
 
+fn CompilerVerifyExportVisibilityCompilerPath(rootDir: str): str =
+    let explicitRaw = strutil.Strip(cmdline.ReadFlagOrDefault("--compiler", ""))
+    if len(explicitRaw) > 0:
+        return chengpath.PathAbsolute(rootDir, explicitRaw)
+    return CompilerStage3CommandPath(rootDir)
+
+fn CompilerVerifyExportVisibilityArtifactsDir(rootDir: str): str =
+    return chengpath.PathAbsolute(rootDir, "artifacts/forward/verify_export_visibility")
+
+fn CompilerVerifyExportVisibilityEnsureDir(rootDir: str,
+                                            dirPath: str): bool =
+    if chengpath.MkdirP(rootDir, dirPath):
+        return true
+    CompilerPrintErr(" compiler: failed to create verify-export-visibility dir: " + dirPath)
+    return false
+
+fn CompilerVerifyExportVisibilityWriteManifest(rootDir: str,
+                                                 packageRoot: str,
+                                                 packageId: str,
+                                                 modulePrefix: str): bool =
+    let manifestPath = os.JoinPath(packageRoot, "cheng-package.toml")
+    let manifestText = "package_id = \"" + packageId + "\"\nmodule_prefix = \"" + modulePrefix + "\"\n"
+    if chengpath.WriteTextFile(rootDir, manifestPath, manifestText):
+        return true
+    CompilerPrintErr(" compiler: failed to write verify-export-visibility manifest: " + manifestPath)
+    return false
+
+fn CompilerExecFileCapture(rootDir: str,
+                             filePath: str,
+                             argv: str[],
+                             envOverrides: str[],
+                             logPath: str,
+                             outOutput: var str): int32 =
+    var mergedEnv = CompilerActiveRuntimeEnvOverrides(rootDir)
+    for i in 0..<envOverrides.len:
+        add(mergedEnv, envOverrides[i])
+    var command = "env"
+    for i in 0..<mergedEnv.len:
+        let envText = strutil.Strip(mergedEnv[i])
+        if len(envText) > 0:
+            command = command + " " + CompilerQuoteShell(envText)
+    command = command + " " + CompilerFileCommand(filePath, argv)
+    let run = os.ExecCmdEx(command, uint64(1), rootDir)
+    outOutput = run.output
+    if len(logPath) > 0:
+        let _ = chengpath.WriteTextFile(rootDir, logPath, outOutput)
+    return run.exitCode
+
+fn CompilerVerifyExportVisibilityCompileFixture(rootDir: str,
+                                                  compilerPath: str,
+                                                  packageRoot: str,
+                                                  inputPath: str,
+                                                  outPath: str,
+                                                  logPath: str,
+                                                  outOutput: var str): int32 =
+    let argv = [
+        "system-link-exec",
+        "--root:" + packageRoot,
+        "--in:" + inputPath,
+        "--emit:exe",
+        "--target:" + contracts.BootstrapDefaultTarget(),
+        "--out:" + outPath
+    ]
+    return CompilerExecFileCapture(rootDir,
+                                   compilerPath,
+                                   argv,
+                                   ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                   logPath,
+                                   outOutput)
+
+fn CompilerVerifyExportVisibilityCheckNegative(caseLabel: str,
+                                                 exitCode: int32,
+                                                 output: str,
+                                                 needle: str): bool =
+    if exitCode == 0:
+        CompilerPrintErr(" compiler: verify-export-visibility unexpected success: " + caseLabel)
+        return false
+    if chengpath.TextContains(output, needle):
+        return true
+    CompilerPrintErr(" compiler: verify-export-visibility missing diagnostic: " + caseLabel)
+    let outputText = strutil.Strip(output)
+    if len(outputText) > 0:
+        CompilerPrintErr(outputText)
+    return false
+
+fn CompilerVerifyExportVisibilityPrivateSymbolNegative(rootDir: str,
+                                                         compilerPath: str): bool =
+    let caseDir = os.JoinPath(CompilerVerifyExportVisibilityArtifactsDir(rootDir), "private_symbol")
+    let workspaceDir = os.JoinPath(caseDir, "workspace")
+    let helperRoot = os.JoinPath(workspaceDir, "private_helper_pkg")
+    let helperSrcDir = os.JoinPath(helperRoot, "src")
+    let consumerRoot = os.JoinPath(workspaceDir, "private_consumer_pkg")
+    let consumerSrcDir = os.JoinPath(consumerRoot, "src")
+    if !CompilerVerifyExportVisibilityEnsureDir(rootDir, helperSrcDir):
+        return false
+    if !CompilerVerifyExportVisibilityEnsureDir(rootDir, consumerSrcDir):
+        return false
+    if !CompilerVerifyExportVisibilityWriteManifest(rootDir,
+                                                      helperRoot,
+                                                      "pkg://cheng/private_helper_pkg",
+                                                      "private_helper_pkg"):
+        return false
+    if !CompilerVerifyExportVisibilityWriteManifest(rootDir,
+                                                      consumerRoot,
+                                                      "pkg://cheng/private_consumer_pkg",
+                                                      "private_consumer_pkg"):
+        return false
+    let helperSrcPath = os.JoinPath(helperSrcDir, "helper.cheng")
+    let consumerSrcPath = os.JoinPath(consumerSrcDir, "main.cheng")
+    let helperSrcText = "fn privateFn(): int32 =\n    return 1\n\nfn PublicFn(): int32 =\n    return 2\n"
+    let consumerSrcText = "import cheng/private_helper_pkg/helper as helper\n\nfn main(): int32 =\n    let x = helper.privateFn()\n    return x\n"
+    if !chengpath.WriteTextFile(rootDir, helperSrcPath, helperSrcText):
+        CompilerPrintErr(" compiler: failed to write verify-export-visibility helper source: " + helperSrcPath)
+        return false
+    if !chengpath.WriteTextFile(rootDir, consumerSrcPath, consumerSrcText):
+        CompilerPrintErr(" compiler: failed to write verify-export-visibility consumer source: " + consumerSrcPath)
+        return false
+    let outPath = os.JoinPath(caseDir, "private_symbol")
+    let logPath = os.JoinPath(caseDir, "private_symbol.compile.log")
+    var output = ""
+    let exitCode = CompilerVerifyExportVisibilityCompileFixture(rootDir,
+                                                                  compilerPath,
+                                                                  consumerRoot,
+                                                                  consumerSrcPath,
+                                                                  outPath,
+                                                                  logPath,
+                                                                  output)
+    if !CompilerVerifyExportVisibilityCheckNegative("private symbol",
+                                                      exitCode,
+                                                      output,
+                                                      "imported private symbol 'privateFn' is not exported"):
+        return false
+    CompilerPrintLine(" verify-export-visibility private symbol ok")
+    return true
+
+fn CompilerVerifyExportVisibilityStrformatCase(rootDir: str,
+                                                 compilerPath: str,
+                                                 packageRoot: str,
+                                                 caseDir: str,
+                                                 stem: str,
+                                                 sourceText: str,
+                                                 needle: str): bool =
+    let srcDir = os.JoinPath(packageRoot, "src")
+    let srcPath = os.JoinPath(srcDir, stem + ".cheng")
+    if !chengpath.WriteTextFile(rootDir, srcPath, sourceText):
+        CompilerPrintErr(" compiler: failed to write verify-export-visibility source: " + srcPath)
+        return false
+    let outPath = os.JoinPath(caseDir, stem)
+    let logPath = os.JoinPath(caseDir, stem + ".compile.log")
+    var output = ""
+    let exitCode = CompilerVerifyExportVisibilityCompileFixture(rootDir,
+                                                                  compilerPath,
+                                                                  packageRoot,
+                                                                  srcPath,
+                                                                  outPath,
+                                                                  logPath,
+                                                                  output)
+    return CompilerVerifyExportVisibilityCheckNegative(stem,
+                                                       exitCode,
+                                                       output,
+                                                       needle)
+
+fn CompilerVerifyExportVisibilityStrformatNegative(rootDir: str,
+                                                     compilerPath: str): bool =
+    let caseDir = os.JoinPath(CompilerVerifyExportVisibilityArtifactsDir(rootDir), "strformat_private")
+    let packageRoot = os.JoinPath(caseDir, "strformat_negative_pkg")
+    let srcDir = os.JoinPath(packageRoot, "src")
+    if !CompilerVerifyExportVisibilityEnsureDir(rootDir, srcDir):
+        return false
+    if !CompilerVerifyExportVisibilityWriteManifest(rootDir,
+                                                      packageRoot,
+                                                      "pkg://cheng/strformat_negative_pkg",
+                                                      "strformat_negative_pkg"):
+        return false
+    let fmtSource = "import std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.fmt(\"bad\")\n    echo(text)\n    return 0\n"
+    if !CompilerVerifyExportVisibilityStrformatCase(rootDir,
+                                                      compilerPath,
+                                                      packageRoot,
+                                                      caseDir,
+                                                      "fmt_private_main",
+                                                      fmtSource,
+                                                      "imported private symbol 'fmt' is not exported"):
+        return false
+    let linesSource = "import std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.lines([\"a\", \"b\"])\n    echo(text)\n    return 0\n"
+    if !CompilerVerifyExportVisibilityStrformatCase(rootDir,
+                                                      compilerPath,
+                                                      packageRoot,
+                                                      caseDir,
+                                                      "lines_private_main",
+                                                      linesSource,
+                                                      "imported private symbol 'lines' is not exported"):
+        return false
+    CompilerPrintLine(" verify-export-visibility strformat ok")
+    return true
+
 fn CompilerPrintBuildPlan(rootDir: str,
                             args: str[]): int32 =
     let stage3Path = CompilerStage3CommandPath(rootDir)
@@ -346,17 +541,19 @@ fn CompilerPrintBuildPlan(rootDir: str,
 
 fn CompilerVerifyExportVisibility(rootDir: str): int32 =
     let stage3Path = CompilerStage3CommandPath(rootDir)
+    let compilerPath = CompilerVerifyExportVisibilityCompilerPath(rootDir)
     let logPath = chengpath.PathAbsolute(rootDir, "artifacts/forward/verify-export-visibility.local.log")
     if !chengpath.FileExistsNonEmpty(rootDir, stage3Path):
         CompilerPrintErr(" compiler: missing stage3 compiler for command: verify-export-visibility")
         return 2
+    if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        CompilerPrintErr(" compiler: missing verify-export-visibility compiler: " + compilerPath)
+        return 2
     let smokeArgs = [
         "run-host-smokes",
-        "--compiler:" + stage3Path,
+        "--compiler:" + compilerPath,
         "--label:verify_export_stage3",
-        "export_visibility_smoke",
-        "export_visibility_negative_smoke",
-        "strformat_export_negative_smoke"
+        "export_visibility_smoke"
     ]
     if !CompilerRunFileEnvLogged(rootDir,
                                    stage3Path,
@@ -364,6 +561,12 @@ fn CompilerVerifyExportVisibility(rootDir: str): int32 =
                                    ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
                                    logPath,
                                    "verify-export-visibility"):
+        CompilerPrintErr(" compiler: verify-export-visibility failed")
+        return 1
+    if !CompilerVerifyExportVisibilityPrivateSymbolNegative(rootDir, compilerPath):
+        CompilerPrintErr(" compiler: verify-export-visibility failed")
+        return 1
+    if !CompilerVerifyExportVisibilityStrformatNegative(rootDir, compilerPath):
         CompilerPrintErr(" compiler: verify-export-visibility failed")
         return 1
     let outputRaw = chengpath.ReadTextFile("", logPath)
@@ -830,16 +1033,16 @@ fn CompilerSystemLinkExecSummary(plan: sexec.SystemLinkExecPlan): str =
     out = out + "entry=" + plan.compilerEntrySource + "\n"
     out = out + "target=" + plan.systemLinkPlan.targetTriple + "\n"
     out = out + "output=" + plan.systemLinkPlan.outputPath + "\n"
-    out = out + "source_bundle_cid=" + layout.fixedBytes32Hex(plan.sourceBundleCid) + "\n"
-    out = out + "canonical_compiler_csg_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.canonicalGraphCid) + "\n"
-    out = out + "compiler_csg_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.graphCid) + "\n"
-    out = out + "export_surface_cid=" + layout.fixedBytes32Hex(plan.exportSurface.surfaceCid) + "\n"
-    out = out + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
-    out = out + "manifest_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.manifest.manifestCid) + "\n"
+    out = out + "source_bundle_cid=" + layout.FixedBytes32Hex(plan.sourceBundleCid) + "\n"
+    out = out + "canonical_compiler_csg_cid=" + layout.FixedBytes32Hex(plan.compilerCsg.canonicalGraphCid) + "\n"
+    out = out + "compiler_csg_cid=" + layout.FixedBytes32Hex(plan.compilerCsg.graphCid) + "\n"
+    out = out + "export_surface_cid=" + layout.FixedBytes32Hex(plan.exportSurface.surfaceCid) + "\n"
+    out = out + "world_head_cid=" + layout.FixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
+    out = out + "manifest_root_cid=" + layout.FixedBytes32Hex(plan.localUniverse.manifest.manifestCid) + "\n"
     out = out + "manifest_entry_count=" + intToStr(plan.localUniverse.manifest.entryCount) + "\n"
-    out = out + "compiler_pkg_cid=" + layout.fixedBytes32Hex(plan.localUniverse.compilerSnapshot.snapshotCid) + "\n"
-    out = out + "std_pkg_cid=" + layout.fixedBytes32Hex(plan.localUniverse.stdSnapshot.snapshotCid) + "\n"
-    out = out + "runtime_pkg_cid=" + layout.fixedBytes32Hex(plan.localUniverse.runtimeSnapshot.snapshotCid) + "\n"
+    out = out + "compiler_pkg_cid=" + layout.FixedBytes32Hex(plan.localUniverse.compilerSnapshot.snapshotCid) + "\n"
+    out = out + "std_pkg_cid=" + layout.FixedBytes32Hex(plan.localUniverse.stdSnapshot.snapshotCid) + "\n"
+    out = out + "runtime_pkg_cid=" + layout.FixedBytes32Hex(plan.localUniverse.runtimeSnapshot.snapshotCid) + "\n"
     out = out + "world_head_pinned=" + worldHeadPinned + "\n"
     out = out + "lock_check_enabled=" + lockCheckEnabled + "\n"
     out = out + "lock_verified=" + lockVerified + "\n"
@@ -847,9 +1050,9 @@ fn CompilerSystemLinkExecSummary(plan: sexec.SystemLinkExecPlan): str =
     out = out + "baseline_surface_checked=" + baselineSurfaceChecked + "\n"
     out = out + "baseline_surface_compatible=" + baselineSurfaceCompatible + "\n"
     out = out + "baseline_surface_path=" + baselineSurfacePath + "\n"
-    out = out + "compile_receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
-    out = out + "compile_canonical_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.canonicalOutputDigest) + "\n"
-    out = out + "compile_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.outputDigest) + "\n"
+    out = out + "compile_receipt_cid=" + layout.FixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
+    out = out + "compile_canonical_output_digest=" + layout.FixedBytes32Hex(plan.compileReceipt.canonicalOutputDigest) + "\n"
+    out = out + "compile_output_digest=" + layout.FixedBytes32Hex(plan.compileReceipt.outputDigest) + "\n"
     out = out + "compile_bootstrap_stage=" + plan.compileReceipt.bootstrapStage
     return CompilerAppendSystemLinkExecPhaseLines(out, plan)
 
@@ -994,11 +1197,11 @@ fn CompilerScanAliasPrivateUsesInLines(lines: str[],
         var inChar = false
         while pos < line.len:
             let ch = line[pos]
-            if !inChar && ch == '"' && !parser.ParserQuoteIsEscaped(line, pos):
+            if !inChar && ch == char(34) && !parser.ParserQuoteIsEscaped(line, pos):
                 inString = !inString
                 pos = pos + 1
                 continue
-            if !inString && ch == '\'' && !parser.ParserQuoteIsEscaped(line, pos):
+            if !inString && ch == char(39) && !parser.ParserQuoteIsEscaped(line, pos):
                 inChar = !inChar
                 pos = pos + 1
                 continue
@@ -1573,7 +1776,7 @@ fn CompilerQuoteShell(value: str): str =
         return "''"
     var out = "'"
     for i in 0..<len(value):
-        if value[i] == '\'':
+        if value[i] == char(39):
             out = out + "'\"'\"'"
         else:
             out = out + strings.CharToStr(value[i])
@@ -5188,17 +5391,17 @@ fn CompilerPublishSummary(prefix: str,
     var out = ""
     out = out + "bundle_prefix=" + prefix + "\n"
     out = out + "channel=" + channel + "\n"
-    out = out + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
-    out = out + "manifest_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.manifest.manifestCid) + "\n"
+    out = out + "world_head_cid=" + layout.FixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
+    out = out + "manifest_root_cid=" + layout.FixedBytes32Hex(plan.localUniverse.manifest.manifestCid) + "\n"
     out = out + "manifest_entry_count=" + intToStr(plan.localUniverse.manifest.entryCount) + "\n"
-    out = out + "csg_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.csgRootCid) + "\n"
-    out = out + "surface_cid=" + layout.fixedBytes32Hex(plan.exportSurface.surfaceCid) + "\n"
-    out = out + "receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
+    out = out + "csg_root_cid=" + layout.FixedBytes32Hex(plan.localUniverse.worldHead.csgRootCid) + "\n"
+    out = out + "surface_cid=" + layout.FixedBytes32Hex(plan.exportSurface.surfaceCid) + "\n"
+    out = out + "receipt_cid=" + layout.FixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
     out = out + "proof_mode=" + proofModeText + "\n"
     out = out + "equivalence_checked=" + checked + "\n"
     out = out + "equivalence_passed=" + passed + "\n"
     out = out + "publish_allowed=" + intToStr(publishAllowed) + "\n"
-    out = out + "proof_cid=" + layout.fixedBytes32Hex(proofCid)
+    out = out + "proof_cid=" + layout.FixedBytes32Hex(proofCid)
     return out
 
 fn CompilerEmitCsg(rootDir: str,
@@ -5314,11 +5517,11 @@ fn CompilerVerifyWorld(rootDir: str,
 fn CompilerWorldReceiptReport(plan: sexec.SystemLinkExecPlan): str =
     var report = ""
     report = report + "entry=" + plan.compilerEntrySource + "\n"
-    report = report + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
-    report = report + "manifest_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.manifest.manifestCid) + "\n"
-    report = report + "compile_receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
-    report = report + "compile_canonical_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.canonicalOutputDigest) + "\n"
-    report = report + "compile_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.outputDigest) + "\n"
+    report = report + "world_head_cid=" + layout.FixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
+    report = report + "manifest_root_cid=" + layout.FixedBytes32Hex(plan.localUniverse.manifest.manifestCid) + "\n"
+    report = report + "compile_receipt_cid=" + layout.FixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
+    report = report + "compile_canonical_output_digest=" + layout.FixedBytes32Hex(plan.compileReceipt.canonicalOutputDigest) + "\n"
+    report = report + "compile_output_digest=" + layout.FixedBytes32Hex(plan.compileReceipt.outputDigest) + "\n"
     report = report + "compile_bootstrap_stage=" + plan.compileReceipt.bootstrapStage
     return report
 
@@ -5386,8 +5589,8 @@ fn CompilerWorldSyncWriteBundle(rootDir: str,
         return false
     return true
 
-fn CompilerWorldSync(rootDir: str,
-                       args: str[]): int32 =
+fn compilerMainWorldSync(rootDir: str,
+                           args: str[]): int32 =
     args
     let reqRes = CompilerRequestFromRuntimeFlags(rootDir, true)
     if IsErr(reqRes):
@@ -5419,13 +5622,13 @@ fn CompilerWorldSync(rootDir: str,
         CompilerPrintErr(Error(sourceSnapshotRes))
         return 2
     var report = "bundle_prefix=" + req.outputPath
-    report = report + "\nworld_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid)
-    report = report + "\nmanifest_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.manifest.manifestCid)
+    report = report + "\nworld_head_cid=" + layout.FixedBytes32Hex(plan.localUniverse.worldHead.headCid)
+    report = report + "\nmanifest_root_cid=" + layout.FixedBytes32Hex(plan.localUniverse.manifest.manifestCid)
     report = report + "\nmanifest_entry_count=" + intToStr(plan.localUniverse.manifest.entryCount)
     report = report + "\nmanaged_mirror_count=" + intToStr(managedMirrorBundles.len)
-    report = report + "\ncsg_root_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.csgRootCid)
-    report = report + "\nsurface_cid=" + layout.fixedBytes32Hex(plan.exportSurface.surfaceCid)
-    report = report + "\nreceipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid)
+    report = report + "\ncsg_root_cid=" + layout.FixedBytes32Hex(plan.localUniverse.worldHead.csgRootCid)
+    report = report + "\nsurface_cid=" + layout.FixedBytes32Hex(plan.exportSurface.surfaceCid)
+    report = report + "\nreceipt_cid=" + layout.FixedBytes32Hex(plan.compileReceipt.receiptCid)
     if !CompilerWriteOptionalReport(rootDir, req.reportPath, report):
         CompilerPrintErr(" compiler: failed to write report: " + req.reportPath)
         return 2
@@ -5946,7 +6149,7 @@ fn CompilerBridgeQuoteIsEscaped(text: str,
     var slashCount: int32
     var i = pos - 1
     while i >= 0:
-        if text[i] != '\\':
+        if int32(text[i]) != 92:
             break
         slashCount = slashCount + 1
         i = i - 1
@@ -5962,11 +6165,11 @@ fn CompilerBridgeFindMatchingParen(text: str,
     var i = openPos + 1
     while i < text.len:
         let ch = text[i]
-        if !inChar && ch == '"' && !CompilerBridgeQuoteIsEscaped(text, i):
+        if !inChar && ch == char(34) && !CompilerBridgeQuoteIsEscaped(text, i):
             inString = !inString
             i = i + 1
             continue
-        if !inString && ch == '\'' && !CompilerBridgeQuoteIsEscaped(text, i):
+        if !inString && ch == char(39) && !CompilerBridgeQuoteIsEscaped(text, i):
             inChar = !inChar
             i = i + 1
             continue
@@ -6014,9 +6217,10 @@ fn CompilerBridgeRewriteSimplePrefixStringify(lineRaw: str,
             continue
         break
     let operand = strings.SliceBytes(lineRaw, dollarPos + 1, stop - dollarPos - 1)
-    if len(strutil.Strip(operand)) <= 0:
+    let operandTrimmed = strutil.Strip(operand)
+    if len(operandTrimmed) <= 0:
         return false
-    rewrittenOut = "`$`(" + operand + ")"
+    rewrittenOut = CompilerConcat3("$(", operand, ")")
     stopExclusiveOut = stop
     return true
 
@@ -6034,7 +6238,7 @@ fn CompilerBridgeRewriteParenStringify(lineRaw: str,
     if closePos <= dollarPos + 1:
         return false
     let inner = strings.SliceBytes(lineRaw, dollarPos + 2, closePos - dollarPos - 2)
-    rewrittenOut = "`$`(" + inner + ")"
+    rewrittenOut = CompilerConcat3("$(", inner, ")")
     stopExclusiveOut = closePos + 1
     return true
 
@@ -6053,11 +6257,11 @@ fn CompilerBridgeRewriteFmtLiteral(lineRaw: str,
     if fmtPos + 3 < lineRaw.len && CompilerBridgeIsIdentChar(lineRaw[fmtPos + 3]):
         return false
     let quotePos = CompilerBridgeSkipInlineSpaces(lineRaw, fmtPos + 3)
-    if quotePos >= lineRaw.len || lineRaw[quotePos] != '"':
+    if quotePos >= lineRaw.len || lineRaw[quotePos] != char(34):
         return false
     var closePos = quotePos + 1
     while closePos < lineRaw.len:
-        if lineRaw[closePos] == '"' && !CompilerBridgeQuoteIsEscaped(lineRaw, closePos):
+        if lineRaw[closePos] == char(34) && !CompilerBridgeQuoteIsEscaped(lineRaw, closePos):
             break
         closePos = closePos + 1
     if closePos >= lineRaw.len:
@@ -6089,11 +6293,11 @@ fn CompilerBridgeRewriteFmtLiteral(lineRaw: str,
             var cursor = exprStart
             while cursor < literalRaw.len:
                 let exprCh = literalRaw[cursor]
-                if !inExprChar && exprCh == '"' && !CompilerBridgeQuoteIsEscaped(literalRaw, cursor):
+                if !inExprChar && exprCh == char(34) && !CompilerBridgeQuoteIsEscaped(literalRaw, cursor):
                     inExprString = !inExprString
                     cursor = cursor + 1
                     continue
-                if !inExprString && exprCh == '\'' && !CompilerBridgeQuoteIsEscaped(literalRaw, cursor):
+                if !inExprString && exprCh == char(39) && !CompilerBridgeQuoteIsEscaped(literalRaw, cursor):
                     inExprChar = !inExprChar
                     cursor = cursor + 1
                     continue
@@ -6137,7 +6341,7 @@ fn CompilerBridgeRewriteFmtLiteral(lineRaw: str,
                 return false
             CompilerBridgeAppendFmtPiece(fmtOut,
                                            pieceCount,
-                                           "`$`(" + exprText + ")")
+                                           CompilerConcat3("$(", exprText, ")"))
             i = exprEnd + 1
             continue
         if ch == '}':
@@ -6157,67 +6361,71 @@ fn CompilerBridgeRewriteFmtLiteral(lineRaw: str,
     stopExclusiveOut = closePos + 1
     return true
 
-fn CompilerBridgeRewriteLine(lineRaw: str): str =
-    var out = ""
-    var i: int32
+fn CompilerBridgeNextRewriteCandidate(lineRaw: str,
+                                        startRaw: int32): int32 =
+    var i = startRaw
+    if i < 0:
+        i = 0
     var inString = false
     var inChar = false
     while i < lineRaw.len:
         let ch = lineRaw[i]
         if !inString && !inChar:
-            if ch == '#':
-                out = out + strings.SliceBytes(lineRaw, i, lineRaw.len - i)
-                break
-            if ch == '`':
+            if ch == char(35):
+                return -1
+            if int32(ch) == 96:
                 var closePos = i + 1
                 while closePos < lineRaw.len:
-                    if lineRaw[closePos] == '`':
+                    if int32(lineRaw[closePos]) == 96:
                         closePos = closePos + 1
                         break
                     closePos = closePos + 1
-                out = out + strings.SliceBytes(lineRaw, i, closePos - i)
                 i = closePos
                 continue
-            if ch == 'F':
-                var rewrittenFmt = ""
-                var fmtStop = i
-                if CompilerBridgeRewriteFmtLiteral(lineRaw, i, rewrittenFmt, fmtStop):
-                    out = out + rewrittenFmt
-                    i = fmtStop
-                    continue
-            if ch == '$':
-                var rewrittenStringify = ""
-                var stringifyStop = i
-                if CompilerBridgeRewriteParenStringify(lineRaw,
-                                                         i,
-                                                         rewrittenStringify,
-                                                         stringifyStop) ||
-                   CompilerBridgeRewriteSimplePrefixStringify(lineRaw,
-                                                                i,
-                                                                rewrittenStringify,
-                                                                stringifyStop):
-                    out = out + rewrittenStringify
-                    i = stringifyStop
-                    continue
-            if ch == '"':
+            if ch == char(70) || ch == char(36):
+                return i
+            if ch == char(34):
                 inString = true
-                out = out + "\""
                 i = i + 1
                 continue
-            if ch == '\'':
+            if int32(ch) == 39:
                 inChar = true
-                out = out + "'"
                 i = i + 1
                 continue
-            out = out + strings.CharToStr(ch)
             i = i + 1
             continue
-        out = out + strings.CharToStr(ch)
-        if inString && ch == '"' && !CompilerBridgeQuoteIsEscaped(lineRaw, i):
+        if inString && ch == char(34) && !CompilerBridgeQuoteIsEscaped(lineRaw, i):
             inString = false
-        elif inChar && ch == '\'' && !CompilerBridgeQuoteIsEscaped(lineRaw, i):
+        elif inChar && int32(ch) == 39 && !CompilerBridgeQuoteIsEscaped(lineRaw, i):
             inChar = false
         i = i + 1
+    return -1
+
+fn CompilerBridgeRewriteLine(lineRaw: str): str =
+    var out = ""
+    var cursor: int32
+    while cursor < lineRaw.len:
+        let candidate = CompilerBridgeNextRewriteCandidate(lineRaw, cursor)
+        if candidate < 0:
+            out = out + strings.SliceBytes(lineRaw, cursor, lineRaw.len - cursor)
+            break
+        if candidate > cursor:
+            out = out + strings.SliceBytes(lineRaw, cursor, candidate - cursor)
+        var rewritten = ""
+        var stop = candidate
+        var didRewrite = false
+        if lineRaw[candidate] == char(70):
+            didRewrite = CompilerBridgeRewriteFmtLiteral(lineRaw, candidate, rewritten, stop)
+        elif lineRaw[candidate] == char(36):
+            didRewrite = CompilerBridgeRewriteParenStringify(lineRaw, candidate, rewritten, stop)
+            if !didRewrite:
+                didRewrite = CompilerBridgeRewriteSimplePrefixStringify(lineRaw, candidate, rewritten, stop)
+        if didRewrite:
+            out = out + rewritten
+            cursor = stop
+            continue
+        out = out + strings.CharToStr(lineRaw[candidate])
+        cursor = candidate + 1
     return out
 
 fn CompilerBridgeRewriteSourceText(text: str): str =
@@ -6270,7 +6478,7 @@ fn CompilerBridgeRewriteStagedTree(rootDir: str,
     let files = os.WalkDirRec(stageRoot)
     for i in 0..<files.len:
         let path = files[i]
-        if !strutil.EndsWith(path, ".cheng"):
+        if !strings.HasSuffix(path, ".cheng"):
             continue
         let sourceText = chengpath.ReadTextFile("", path)
         if len(sourceText) <= 0:
@@ -6598,10 +6806,10 @@ fn CompilerFollowWorldInstallBackendDriver(rootDir: str,
     let candidateReceiptHex = cworld.CompilerWorldLineValue(compileReportText, "compile_receipt_cid")
     if len(candidateReceiptHex) <= 0:
         return Err[CompilerFollowInstallResult](" compiler: follow-world missing candidate compile receipt")
-    let candidateReceiptRes = layout.fixedBytes32FromHex(candidateReceiptHex)
+    let candidateReceiptRes = layout.FixedBytes32FromHex(candidateReceiptHex)
     if IsErr(candidateReceiptRes):
         return Err[CompilerFollowInstallResult](" compiler: follow-world invalid candidate compile receipt")
-    if !layout.fixedBytes32Equal(Value(candidateReceiptRes), targetReceiptCid):
+    if !layout.FixedBytes32Equal(Value(candidateReceiptRes), targetReceiptCid):
         return Err[CompilerFollowInstallResult](" compiler: follow-world backend driver receipt drift")
     var installReport = ""
     if !CompilerBootstrapInstallCandidate(rootDir,
@@ -6649,15 +6857,15 @@ fn CompilerFollowWorldOfflineSummary(bundle: cwbundle.CompilerWorldBundle,
     out = out + "follow_mode=offline_bundle\n"
     out = out + "bundle_prefix=" + bundle.bundlePrefix + "\n"
     out = out + "channel=" + bundle.worldHead.channel + "\n"
-    out = out + "world_head_cid=" + layout.fixedBytes32Hex(bundle.worldHead.headCid) + "\n"
-    out = out + "manifest_root_cid=" + layout.fixedBytes32Hex(bundle.manifest.manifestCid) + "\n"
+    out = out + "world_head_cid=" + layout.FixedBytes32Hex(bundle.worldHead.headCid) + "\n"
+    out = out + "manifest_root_cid=" + layout.FixedBytes32Hex(bundle.manifest.manifestCid) + "\n"
     out = out + "manifest_entry_count=" + intToStr(bundle.manifest.entryCount) + "\n"
     out = out + "managed_mirror_count=" + intToStr(managedMirrorCount) + "\n"
-    out = out + "receipt_cid=" + layout.fixedBytes32Hex(bundle.receipt.receiptCid) + "\n"
+    out = out + "receipt_cid=" + layout.FixedBytes32Hex(bundle.receipt.receiptCid) + "\n"
     out = out + "follow_target=" + targetTriple + "\n"
     out = out + "follow_backend_driver=" + install.backendDriverPath + "\n"
-    out = out + "follow_target_receipt_cid=" + layout.fixedBytes32Hex(install.targetReceiptCid) + "\n"
-    out = out + "follow_candidate_receipt_cid=" + layout.fixedBytes32Hex(install.candidateReceiptCid) + "\n"
+    out = out + "follow_target_receipt_cid=" + layout.FixedBytes32Hex(install.targetReceiptCid) + "\n"
+    out = out + "follow_candidate_receipt_cid=" + layout.FixedBytes32Hex(install.candidateReceiptCid) + "\n"
     out = out + "follow_candidate_receipt_match=1\n"
     out = out + "follow_candidate_status=ok\n"
     out = out + "follow_candidate_verify_world=ok\n"
@@ -6724,7 +6932,7 @@ fn CompilerFollowWorldOffline(rootDir: str): int32 =
                                                                packageRoot,
                                                                compilerEntrySource,
                                                                targetTriple,
-                                                               layout.fixedBytes32Hex(bundle.worldHead.headCid),
+                                                               layout.FixedBytes32Hex(bundle.worldHead.headCid),
                                                                lockPath,
                                                                bundle.worldHead.channel,
                                                                bundle.receipt,
@@ -6873,7 +7081,7 @@ fn CompilerFollowWorld(rootDir: str,
                                                                packageRoot,
                                                                compilerEntrySource,
                                                                targetTriple,
-                                                               layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid),
+                                                               layout.FixedBytes32Hex(plan.localUniverse.worldHead.headCid),
                                                                lockPath,
                                                                channel,
                                                                emptyReceipt,
@@ -6896,8 +7104,8 @@ fn CompilerFollowWorld(rootDir: str,
     summary = summary + "\nfollow_bundle_prefix=" + req.outputPath
     summary = summary + "\nfollow_target=" + targetTriple
     summary = summary + "\nfollow_backend_driver=" + install.backendDriverPath
-    summary = summary + "\nfollow_target_receipt_cid=" + layout.fixedBytes32Hex(install.targetReceiptCid)
-    summary = summary + "\nfollow_candidate_receipt_cid=" + layout.fixedBytes32Hex(install.candidateReceiptCid)
+    summary = summary + "\nfollow_target_receipt_cid=" + layout.FixedBytes32Hex(install.targetReceiptCid)
+    summary = summary + "\nfollow_candidate_receipt_cid=" + layout.FixedBytes32Hex(install.candidateReceiptCid)
     summary = summary + "\nfollow_candidate_receipt_match=1"
     summary = summary + "\nfollow_candidate_status=ok"
     summary = summary + "\nfollow_candidate_verify_world=ok"
@@ -8049,7 +8257,7 @@ fn CompilerVerifyOrphanGuard(rootDir: str): int32 =
 fn main(argc: int32, argv: str*): int32 =
     argc
     argv
-    cmdline.__cheng_captureCmdLine(argc, argv)
+    cmdline.CaptureCmdLine(argc, argv)
     let rootDir = CompilerRoot()
     let rootEnvRaw = strutil.Strip(os.GetEnv("CHENG_ROOT"))
     if rootEnvRaw == "":
@@ -8127,7 +8335,7 @@ fn main(argc: int32, argv: str*): int32 =
     if cmd == "verify-world":
         return CompilerVerifyWorld(rootDir, args)
     if cmd == "world-sync":
-        return CompilerWorldSync(rootDir, args)
+        return compilerMainWorldSync(rootDir, args)
     if cmd == "materialize-world-mirrors":
         return CompilerMaterializeWorldMirrors(rootDir, args)
     if cmd == "prove-equivalence":

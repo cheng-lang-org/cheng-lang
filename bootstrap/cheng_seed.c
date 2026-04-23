@@ -3050,7 +3050,7 @@ static const char *cheng_seed_flag_value(int argc, char **argv, const char *flag
 #define CHENG_MAX_IMPORT_ALIAS_CACHE 512
 #define CHENG_MAX_TOP_LEVEL_VAR_CACHE 512
 #define CHENG_MAX_IMPORTC_TARGET_CACHE 2048
-#define CHENG_MAX_CALLEES 64
+#define CHENG_CALLEE_INITIAL_CAP 8
 #define CHENG_CONST_MAX_FIELDS 64
 #define CHENG_CONST_MAX_BINDINGS 64
 #define CHENG_CONST_MAX_ECHOS 8
@@ -3064,6 +3064,10 @@ static const char *cheng_seed_flag_value(int argc, char **argv, const char *flag
 typedef struct {
     char text[PATH_MAX];
 } ChengSeedPlanPath;
+
+typedef struct {
+    char *text;
+} ChengSeedCalleeSymbol;
 
 static void cheng_seed_plan_path_add_unique(ChengSeedPlanPath *items,
                                     size_t *len,
@@ -3174,7 +3178,8 @@ typedef struct {
     char body_call_arg_names[CHENG_MAX_CALL_ARGS][128];
     char first_body_line[512];
     size_t callee_count;
-    ChengSeedPlanPath callee_symbols[CHENG_MAX_CALLEES];
+    size_t callee_cap;
+    ChengSeedCalleeSymbol *callee_symbols;
     bool is_entry;
     bool reachable;
     size_t generic_binding_count;
@@ -3395,9 +3400,61 @@ static bool cheng_seed_lowering_plan_reserve_type_defs(ChengSeedLoweringPlanStub
     return true;
 }
 
+static void cheng_seed_lowered_function_reset_callees(ChengSeedLoweredFunctionStub *function) {
+    size_t i;
+    if (function == NULL) {
+        return;
+    }
+    for (i = 0U; i < function->callee_count; ++i) {
+        free(function->callee_symbols[i].text);
+        function->callee_symbols[i].text = NULL;
+    }
+    function->callee_count = 0U;
+}
+
+static void cheng_seed_lowered_function_dispose_callees(ChengSeedLoweredFunctionStub *function) {
+    if (function == NULL) {
+        return;
+    }
+    cheng_seed_lowered_function_reset_callees(function);
+    free(function->callee_symbols);
+    function->callee_symbols = NULL;
+    function->callee_cap = 0U;
+}
+
+static bool cheng_seed_lowered_function_reserve_callees(ChengSeedLoweredFunctionStub *function,
+                                                size_t needed) {
+    size_t old_cap;
+    size_t new_cap;
+    ChengSeedCalleeSymbol *grown;
+    if (function == NULL) {
+        return false;
+    }
+    if (needed <= function->callee_cap) {
+        return true;
+    }
+    new_cap = function->callee_cap > 0U ? function->callee_cap : CHENG_CALLEE_INITIAL_CAP;
+    while (new_cap < needed) {
+        new_cap *= 2U;
+    }
+    old_cap = function->callee_cap;
+    grown = (ChengSeedCalleeSymbol *)cheng_seed_xrealloc(function->callee_symbols,
+                                                  sizeof(ChengSeedCalleeSymbol) * new_cap);
+    if (new_cap > old_cap) {
+        memset(grown + old_cap, 0, sizeof(ChengSeedCalleeSymbol) * (new_cap - old_cap));
+    }
+    function->callee_symbols = grown;
+    function->callee_cap = new_cap;
+    return true;
+}
+
 static void cheng_seed_lowering_plan_stub_dispose(ChengSeedLoweringPlanStub *lowering) {
+    size_t i;
     if (lowering == NULL) {
         return;
+    }
+    for (i = 0U; i < lowering->function_count; ++i) {
+        cheng_seed_lowered_function_dispose_callees(&lowering->functions[i]);
     }
     free(lowering->functions);
     free(lowering->consts);
@@ -7592,18 +7649,21 @@ static bool cheng_seed_prepare_native_composite_call_lowering_rule_with_args(con
     *arg_count_io = arg_count;
     memset(target, 0, sizeof(*target));
     memset(rule, 0, sizeof(*rule));
-    if (!cheng_seed_resolve_call_target_with_args(plan,
-                                          lowering,
-                                          current_function,
-                                          aliases,
-                                          alias_count,
-                                          locals,
-                                          local_count,
-                                          callee,
-                                          (const char (*)[4096])args,
-                                          arg_count,
-                                          target)) {
-        return true;
+    {
+        bool target_ok = cheng_seed_resolve_call_target_with_args(plan,
+                                                          lowering,
+                                                          current_function,
+                                                          aliases,
+                                                          alias_count,
+                                                          locals,
+                                                          local_count,
+                                                          callee,
+                                                          (const char (*)[4096])args,
+                                                          arg_count,
+                                                          target);
+        if (!target_ok) {
+            return true;
+        }
     }
     if (!cheng_seed_build_native_composite_call_lowering_rule(target, rule)) {
         return false;
@@ -12832,10 +12892,11 @@ static bool cheng_seed_const_eval_expr(const ChengSeedLoweringPlanStub *lowering
                                   out,
                                   depth + 1U);
     }
-    if (expr[0] == '"' && expr[strlen(expr) - 1U] == '"') {
+    {
         char literal[8192];
-        snprintf(literal, sizeof(literal), "%.*s", (int)(strlen(expr) - 2U), expr + 1);
-        return cheng_seed_const_value_set_str_kind(out, ChengSeed_CONST_STR, literal);
+        if (cheng_seed_parse_string_literal_text(expr, literal, sizeof(literal))) {
+            return cheng_seed_const_value_set_str_kind(out, ChengSeed_CONST_STR, literal);
+        }
     }
     if (strcmp(expr, "true") == 0) {
         return cheng_seed_const_value_set_bool(out, true);
@@ -16078,21 +16139,19 @@ static bool cheng_seed_is_builtin_statement_call_name(const char *callee) {
 static void cheng_seed_lowered_function_add_callee(ChengSeedLoweredFunctionStub *function,
                                            const char *symbol_text) {
     size_t i;
-    if (!symbol_text || *symbol_text == '\0') {
+    if (function == NULL || !symbol_text || *symbol_text == '\0') {
         return;
     }
     for (i = 0; i < function->callee_count; ++i) {
-        if (strcmp(function->callee_symbols[i].text, symbol_text) == 0) {
+        if (function->callee_symbols[i].text != NULL &&
+            strcmp(function->callee_symbols[i].text, symbol_text) == 0) {
             return;
         }
     }
-    if (function->callee_count >= CHENG_MAX_CALLEES) {
+    if (!cheng_seed_lowered_function_reserve_callees(function, function->callee_count + 1U)) {
         return;
     }
-    snprintf(function->callee_symbols[function->callee_count].text,
-             sizeof(function->callee_symbols[function->callee_count].text),
-             "%s",
-             symbol_text);
+    function->callee_symbols[function->callee_count].text = cheng_seed_strdup(symbol_text);
     function->callee_count += 1U;
 }
 
@@ -16739,6 +16798,9 @@ static void cheng_seed_collect_calls_from_text_resolved(const char *expr_text,
                                                 size_t alias_count,
                                                 const ChengSeedLoweringPlanStub *lowering,
                                                 ChengSeedLoweredFunctionStub *function) {
+    static const char *BINARY_OPS[] = {
+        "||", "&&", "==", "!=", "<=", ">=", "<<", ">>", "<", ">", "|", "^", "xor", "&", "+", "-", "*", "/", "%"
+    };
     char assign_lhs[4096];
     char assign_rhs[4096];
     char base_expr[4096];
@@ -16746,9 +16808,51 @@ static void cheng_seed_collect_calls_from_text_resolved(const char *expr_text,
     char value_expr[4096];
     char outer_expr[32768];
     char rewritten_expr[32768];
+    char binding_name[256];
+    char binding_type[256];
+    char binding_expr[4096];
     ChengSeedAsmLocalSlot param_locals[CHENG_MAX_CALL_ARGS];
     size_t param_local_count =
         cheng_seed_build_param_locals_for_call_collection(function, param_locals, CHENG_MAX_CALL_ARGS);
+    if (expr_text == NULL) {
+        return;
+    }
+    if (strcmp(expr_text, "return") == 0) {
+        return;
+    }
+    if (cheng_seed_startswith(expr_text, "return ")) {
+        cheng_seed_collect_calls_from_text_resolved(expr_text + 7,
+                                            owner_module_path,
+                                            aliases,
+                                            alias_count,
+                                            lowering,
+                                            function);
+        return;
+    }
+    if (cheng_seed_parse_binding_meta(expr_text,
+                              "let ",
+                              binding_name,
+                              sizeof(binding_name),
+                              binding_type,
+                              sizeof(binding_type),
+                              binding_expr,
+                              sizeof(binding_expr)) ||
+        cheng_seed_parse_binding_meta(expr_text,
+                              "var ",
+                              binding_name,
+                              sizeof(binding_name),
+                              binding_type,
+                              sizeof(binding_type),
+                              binding_expr,
+                              sizeof(binding_expr))) {
+        cheng_seed_collect_calls_from_text_resolved(binding_expr,
+                                            owner_module_path,
+                                            aliases,
+                                            alias_count,
+                                            lowering,
+                                            function);
+        return;
+    }
     if (cheng_seed_trim_outer_parens(expr_text, outer_expr, sizeof(outer_expr))) {
         cheng_seed_collect_calls_from_text_resolved(outer_expr,
                                             owner_module_path,
@@ -16824,6 +16928,69 @@ static void cheng_seed_collect_calls_from_text_resolved(const char *expr_text,
                     cheng_seed_lowered_function_add_callee(function, resolved_symbol);
                 } else {
                     cheng_seed_lowered_function_add_all_callees_by_name(lowering, function, "$");
+                }
+                return;
+            }
+        }
+    }
+    {
+        size_t op_i;
+        for (op_i = 0U; op_i < sizeof(BINARY_OPS) / sizeof(BINARY_OPS[0]); ++op_i) {
+            int32_t op_index = cheng_seed_find_top_level_binary_op_last(expr_text, BINARY_OPS[op_i]);
+            if (op_index <= 0) {
+                continue;
+            }
+            {
+                char left_expr[4096];
+                char right_expr[4096];
+                char operator_args[CHENG_MAX_CALL_ARGS][4096];
+                char resolved_symbol[PATH_MAX];
+                snprintf(left_expr, sizeof(left_expr), "%.*s", op_index, expr_text);
+                snprintf(right_expr,
+                         sizeof(right_expr),
+                         "%s",
+                         expr_text + op_index + strlen(BINARY_OPS[op_i]));
+                cheng_seed_trim_copy_text(left_expr, left_expr, sizeof(left_expr));
+                cheng_seed_trim_copy_text(right_expr, right_expr, sizeof(right_expr));
+                if (left_expr[0] == '\0' || right_expr[0] == '\0') {
+                    continue;
+                }
+                cheng_seed_collect_calls_from_text_resolved(left_expr,
+                                                    owner_module_path,
+                                                    aliases,
+                                                    alias_count,
+                                                    lowering,
+                                                    function);
+                cheng_seed_collect_calls_from_text_resolved(right_expr,
+                                                    owner_module_path,
+                                                    aliases,
+                                                    alias_count,
+                                                    lowering,
+                                                    function);
+                memset(operator_args, 0, sizeof(operator_args));
+                snprintf(operator_args[0], sizeof(operator_args[0]), "%s", left_expr);
+                snprintf(operator_args[1], sizeof(operator_args[1]), "%s", right_expr);
+                if (cheng_seed_select_visible_overloaded_function_symbol(NULL,
+                                                                 lowering,
+                                                                 function,
+                                                                 aliases,
+                                                                 alias_count,
+                                                                 param_locals,
+                                                                 param_local_count,
+                                                                 BINARY_OPS[op_i],
+                                                                 operator_args,
+                                                                 2U,
+                                                                 NULL,
+                                                                 resolved_symbol,
+                                                                 sizeof(resolved_symbol))) {
+                    cheng_seed_lowered_function_add_callee(function, resolved_symbol);
+                } else {
+                    cheng_seed_lowered_function_add_preferred_visible_operator_callees(lowering,
+                                                                               function,
+                                                                               owner_module_path,
+                                                                               aliases,
+                                                                               alias_count,
+                                                                               BINARY_OPS[op_i]);
                 }
                 return;
             }
@@ -16953,6 +17120,17 @@ static void cheng_seed_collect_calls_from_text_resolved(const char *expr_text,
                                            &parsed_arg_count,
                                            CHENG_MAX_CALL_ARGS)) {
                         parsed_call = true;
+                    }
+                    if (parsed_call) {
+                        size_t parsed_arg_index;
+                        for (parsed_arg_index = 0U; parsed_arg_index < parsed_arg_count; ++parsed_arg_index) {
+                            cheng_seed_collect_calls_from_text_resolved(parsed_args[parsed_arg_index],
+                                                                owner_module_path,
+                                                                aliases,
+                                                                alias_count,
+                                                                lowering,
+                                                                function);
+                        }
                     }
                     char *dot = strchr(token, '.');
                     ChengSeedResultIntrinsicKind result_kind =
@@ -19032,6 +19210,8 @@ static bool cheng_seed_collect_lowering_functions_from_source(const ChengSeedSys
             cheng_seed_streq(function_name, plan->entry_symbol);
         lowering->functions[lowering->function_count].reachable = false;
         lowering->functions[lowering->function_count].callee_count = 0U;
+        lowering->functions[lowering->function_count].callee_cap = 0U;
+        lowering->functions[lowering->function_count].callee_symbols = NULL;
         lowering->functions[lowering->function_count].generic_binding_count = 0U;
         memset(lowering->functions[lowering->function_count].generic_binding_names,
                0,
@@ -19091,7 +19271,7 @@ static bool cheng_seed_refresh_function_callees(const ChengSeedLoweringPlanStub 
         free(owned_lines);
         return false;
     }
-    function->callee_count = 0U;
+    cheng_seed_lowered_function_reset_callees(function);
     {
         char signature_copy[8192];
         char *eq;
@@ -19244,7 +19424,7 @@ static bool cheng_seed_reachable_from_module_inits(const ChengSeedSystemLinkPlan
                 !has_init) {
                 continue;
             }
-            synthetic_function.callee_count = 0U;
+            cheng_seed_lowered_function_reset_callees(&synthetic_function);
             cheng_seed_collect_calls_from_text_resolved(expr,
                                                 owner_module_path,
                                                 aliases,
@@ -19260,6 +19440,7 @@ static bool cheng_seed_reachable_from_module_inits(const ChengSeedSystemLinkPlan
                 }
             }
         }
+        cheng_seed_lowered_function_dispose_callees(&synthetic_function);
         free(lines);
         free(owned);
     }
@@ -19494,12 +19675,14 @@ static void cheng_seed_prune_lowering_to_reachable(const ChengSeedSystemLinkPlan
     size_t queue_head = 0U;
     size_t queue_tail = 0U;
     size_t i;
+    size_t old_function_count;
     size_t write_index = 0U;
     bool saw_entry = false;
     bool seeded_export_roots = false;
     bool entry_has_explicit_exports = cheng_seed_lowering_entry_has_explicit_exports(plan, lowering);
     bool seed_entry_export_roots = false;
-    for (i = 0; i < lowering->function_count; ++i) {
+    old_function_count = lowering->function_count;
+    for (i = 0; i < old_function_count; ++i) {
         lowering->functions[i].reachable = false;
         if (lowering->functions[i].is_entry) {
             cheng_seed_mark_reachable_with_overload_group(lowering, (int32_t)i, queue, &queue_tail);
@@ -19512,7 +19695,7 @@ static void cheng_seed_prune_lowering_to_reachable(const ChengSeedSystemLinkPlan
          cheng_seed_streq(plan->emit_kind, "obj") ||
          (cheng_seed_streq(plan->emit_kind, "exe") && entry_has_explicit_exports));
     if (seed_entry_export_roots) {
-        for (i = 0; i < lowering->function_count; ++i) {
+        for (i = 0; i < old_function_count; ++i) {
             if (!cheng_seed_lowered_function_is_entry_export_root(plan,
                                                           lowering,
                                                           &lowering->functions[i],
@@ -19544,14 +19727,21 @@ static void cheng_seed_prune_lowering_to_reachable(const ChengSeedSystemLinkPlan
             }
         }
     }
-    for (i = 0; i < lowering->function_count; ++i) {
+    for (i = 0; i < old_function_count; ++i) {
         if (!lowering->functions[i].reachable) {
             continue;
         }
         if (write_index != i) {
+            cheng_seed_lowered_function_dispose_callees(&lowering->functions[write_index]);
             lowering->functions[write_index] = lowering->functions[i];
+            lowering->functions[i].callee_count = 0U;
+            lowering->functions[i].callee_cap = 0U;
+            lowering->functions[i].callee_symbols = NULL;
         }
         write_index += 1U;
+    }
+    for (i = write_index; i < old_function_count; ++i) {
+        cheng_seed_lowered_function_dispose_callees(&lowering->functions[i]);
     }
     lowering->function_count = write_index;
 }
@@ -23035,6 +23225,19 @@ static const char *cheng_seed_resolved_type_abi_class(const ChengSeedLoweringPla
                                               const char *type_text,
                                               char *normalized_out,
                                               size_t normalized_cap);
+static void cheng_seed_update_max_i32(int32_t *value_io, int32_t candidate);
+static bool cheng_seed_prepare_expr_call_state(const ChengSeedSystemLinkPlanStub *plan,
+                                       const ChengSeedLoweringPlanStub *lowering,
+                                       const ChengSeedLoweredFunctionStub *current_function,
+                                       const ChengSeedImportAlias *aliases,
+                                       size_t alias_count,
+                                       ChengSeedAsmLocalSlot *locals,
+                                       size_t *local_count,
+                                       size_t local_cap,
+                                       int32_t *next_offset_io,
+                                       const char *expr_text,
+                                       int call_depth,
+                                       int32_t *max_call_depth_io);
 
 static void cheng_seed_resolve_call_arg_preferred_signature(const ChengSeedLoweringPlanStub *lowering,
                                                     const char *owner_module_path,
@@ -23092,7 +23295,9 @@ static bool cheng_seed_prepare_composite_call_arg_temp(const ChengSeedSystemLink
                                                size_t arg_index,
                                                const char *arg_expr,
                                                const char *preferred_type,
-                                               const char *preferred_abi) {
+                                               const char *preferred_abi,
+                                               int call_depth,
+                                               int32_t *max_call_depth_io) {
     const char *trace_arg_kind = getenv("CHENG_TRACE_ARG_KIND");
     char named_field[128];
     char named_expr[4096];
@@ -23196,6 +23401,50 @@ static bool cheng_seed_prepare_composite_call_arg_temp(const ChengSeedSystemLink
     }
     if (!cheng_seed_expr_materializes_to_address(inferred_type, inferred_abi)) {
         return true;
+    }
+    if ((strlen(inferred_type) > 2U &&
+         strcmp(inferred_type + strlen(inferred_type) - 2U, "[]") == 0 &&
+         cheng_seed_parse_list_literal_text(value_expr,
+                                    list_items,
+                                    &list_item_count,
+                                    CHENG_MAX_CALL_ARGS)) ||
+        (cheng_seed_parse_fixed_array_type(inferred_type,
+                                   fixed_elem_type,
+                                   sizeof(fixed_elem_type),
+                                   &fixed_len) &&
+         cheng_seed_parse_list_literal_text(value_expr,
+                                    list_items,
+                                    &list_item_count,
+                                    CHENG_MAX_CALL_ARGS))) {
+        int next_call_depth = call_depth + 1;
+        size_t item_index;
+        if (max_call_depth_io != NULL) {
+            cheng_seed_update_max_i32(max_call_depth_io, next_call_depth);
+        }
+        for (item_index = 0U; item_index < list_item_count; ++item_index) {
+            if (!cheng_seed_prepare_expr_call_state(plan,
+                                            lowering,
+                                            current_function,
+                                            aliases,
+                                            alias_count,
+                                            locals,
+                                            local_count,
+                                            local_cap,
+                                            next_offset_io,
+                                            list_items[item_index],
+                                            next_call_depth,
+                                            max_call_depth_io)) {
+                fprintf(stderr,
+                        "[cheng_seed] prepare composite arg list item failed caller=%s callee=%s arg_index=%zu item_index=%zu expr=%s item=%s\n",
+                        current_function->symbol_text,
+                        callee,
+                        arg_index,
+                        item_index,
+                        arg_expr,
+                        list_items[item_index]);
+                return false;
+            }
+        }
     }
     if (!cheng_seed_add_local_slot_for_type(lowering,
                                     current_function->owner_module_path,
@@ -24204,6 +24453,7 @@ static bool cheng_seed_external_call_signature(const ChengSeedSystemLinkPlanStub
         {"memZeroCompat", "cheng_zero_mem_compat", "void", 2U, {"ptr", "int32"}},
         {"chengRawbytesGetAt", "cheng_rawbytes_get_at", "int32", 2U, {"ptr", "int32"}},
         {"chengRawbytesSetAt", "cheng_rawbytes_set_at", "void", 3U, {"ptr", "int32", "int32"}},
+        {"driver_c_str_concat_bridge", "driver_c_str_concat_bridge", "str", 2U, {"str", "str"}},
         {"driver_c_i32_to_str", "driver_c_i32_to_str", "ptr", 1U, {"int32"}},
         {"driver_c_i64_to_str", "driver_c_i64_to_str", "ptr", 1U, {"int64"}},
         {"driver_c_u64_to_str", "driver_c_u64_to_str", "ptr", 1U, {"int64"}},
@@ -24638,6 +24888,8 @@ static bool cheng_seed_ensure_specialized_function(const ChengSeedLoweringPlanSt
                  generic_types[i]);
     }
     mutable_lowering->functions[mutable_lowering->function_count].callee_count = 0U;
+    mutable_lowering->functions[mutable_lowering->function_count].callee_cap = 0U;
+    mutable_lowering->functions[mutable_lowering->function_count].callee_symbols = NULL;
     mutable_lowering->functions[mutable_lowering->function_count].reachable = true;
     mutable_lowering->function_count += 1U;
     snprintf(out_symbol, out_symbol_cap, "%s", specialized_symbol);
@@ -25332,6 +25584,7 @@ static bool cheng_seed_select_visible_overloaded_function_symbol(const ChengSeed
     int32_t best_score = -1;
     int32_t best_exact_score = -1;
     bool ambiguous = false;
+    bool allow_global_operator = false;
     const char *trace_overload = getenv("CHENG_TRACE_OVERLOAD");
     char best_generic_names[CHENG_MAX_TYPE_PARAMS][128];
     char best_generic_types[CHENG_MAX_TYPE_PARAMS][256];
@@ -25345,22 +25598,44 @@ static bool cheng_seed_select_visible_overloaded_function_symbol(const ChengSeed
         !function_name || function_name[0] == '\0' || !out || cap == 0U) {
         return false;
     }
+    allow_global_operator = strcmp(function_name, "$") == 0;
     out[0] = '\0';
     for (i = 0U; i < lowering->function_count; ++i) {
         const ChengSeedLoweredFunctionStub *candidate = &lowering->functions[i];
+        bool trace_candidate = false;
+        bool visible = false;
         char generic_names[CHENG_MAX_TYPE_PARAMS][128];
         char generic_types[CHENG_MAX_TYPE_PARAMS][256];
         size_t generic_count = 0U;
         int32_t score = 0;
         int32_t exact_score = 0;
         size_t arg_index;
+        trace_candidate = trace_overload &&
+                          trace_overload[0] != '\0' &&
+                          (strcmp(trace_overload, "1") == 0 ||
+                           strstr(current_function->symbol_text, trace_overload) != NULL ||
+                           strstr(function_name, trace_overload) != NULL);
+        visible = allow_global_operator ||
+                  cheng_seed_function_name_visible_from_module(current_function->owner_module_path,
+                                                               aliases,
+                                                               alias_count,
+                                                               candidate->owner_module_path,
+                                                               function_name);
+        if (trace_candidate &&
+            strcmp(candidate->function_name, function_name) == 0) {
+            fprintf(stderr,
+                    "[cheng_seed] overload candidate caller=%s callee=%s candidate=%s owner=%s param_count=%zu want_arg_count=%zu visible=%d\n",
+                    current_function->symbol_text,
+                    function_name,
+                    candidate->symbol_text,
+                    candidate->owner_module_path,
+                    candidate->param_count,
+                    arg_count,
+                    visible ? 1 : 0);
+        }
         if (strcmp(candidate->function_name, function_name) != 0 ||
             candidate->param_count != arg_count ||
-            !cheng_seed_function_name_visible_from_module(current_function->owner_module_path,
-                                                  aliases,
-                                                  alias_count,
-                                                  candidate->owner_module_path,
-                                                  function_name)) {
+            !visible) {
             continue;
         }
         memset(generic_names, 0, sizeof(generic_names));
@@ -25562,6 +25837,112 @@ static bool cheng_seed_select_visible_overloaded_function_symbol(const ChengSeed
     return true;
 }
 
+static bool cheng_seed_resolve_builtin_stringify_helper_name(const ChengSeedSystemLinkPlanStub *plan,
+                                                     const ChengSeedLoweringPlanStub *lowering,
+                                                     const ChengSeedLoweredFunctionStub *current_function,
+                                                     const ChengSeedImportAlias *aliases,
+                                                     size_t alias_count,
+                                                     const ChengSeedAsmLocalSlot *locals,
+                                                     size_t local_count,
+                                                     const char *arg_expr,
+                                                     char *out,
+                                                     size_t cap) {
+    char arg_type[256];
+    char arg_abi[32];
+    char normalized_arg_type[256];
+    (void)plan;
+    if (!lowering || !current_function || !arg_expr || !out || cap == 0U) {
+        return false;
+    }
+    out[0] = '\0';
+    if (!cheng_seed_infer_expr_type(plan,
+                            lowering,
+                            current_function,
+                            aliases,
+                            alias_count,
+                            locals,
+                            local_count,
+                            arg_expr,
+                            arg_type,
+                            sizeof(arg_type),
+                            arg_abi,
+                            sizeof(arg_abi)) ||
+        !cheng_seed_normalize_type_text(lowering,
+                                current_function->owner_module_path,
+                                aliases,
+                                alias_count,
+                                arg_type,
+                                normalized_arg_type,
+                                sizeof(normalized_arg_type))) {
+        return false;
+    }
+    if (strcmp(normalized_arg_type, "bool") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyBoolImpl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "char") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyCharImpl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "int8") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyInt8Impl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "uint8") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyUInt8Impl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "int16") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyInt16Impl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "uint16") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyUInt16Impl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "int32") == 0 || strcmp(normalized_arg_type, "int") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyInt32Impl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "uint32") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyUInt32Impl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "int64") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyInt64Impl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "uint64") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyUInt64Impl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "str") == 0) {
+        snprintf(out, cap, "%s", "stdStringifyStrImpl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "str[]") == 0) {
+        snprintf(out, cap, "%s", "stdStringifySeqStrImpl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "bool[]") == 0) {
+        snprintf(out, cap, "%s", "stdStringifySeqBoolImpl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "int32[]") == 0) {
+        snprintf(out, cap, "%s", "stdStringifySeqInt32Impl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "int64[]") == 0) {
+        snprintf(out, cap, "%s", "stdStringifySeqInt64Impl");
+        return true;
+    }
+    if (strcmp(normalized_arg_type, "Bytes") == 0) {
+        snprintf(out, cap, "%s", "bytesToHex");
+        return true;
+    }
+    return false;
+}
+
 static bool cheng_seed_resolve_call_target_with_args(const ChengSeedSystemLinkPlanStub *plan,
                                              const ChengSeedLoweringPlanStub *lowering,
                                              const ChengSeedLoweredFunctionStub *current_function,
@@ -25576,10 +25957,12 @@ static bool cheng_seed_resolve_call_target_with_args(const ChengSeedSystemLinkPl
     char trimmed_callee[PATH_MAX];
     char canonical_callee[PATH_MAX];
     char symbol_text[PATH_MAX];
+    char helper_callee[PATH_MAX];
     int32_t function_index;
     int32_t selected_function_index = -1;
     int32_t char_value = 0;
     bool resolved = false;
+    bool builtin_stringify_helper_ready = false;
     if (!plan || !lowering || !current_function || !callee || !target) {
         return false;
     }
@@ -25587,14 +25970,16 @@ static bool cheng_seed_resolve_call_target_with_args(const ChengSeedSystemLinkPl
     if (trimmed_callee[0] == '\0') {
         return false;
     }
-    if (cheng_seed_parse_int_literal_text(trimmed_callee, NULL) ||
-        cheng_seed_parse_char_literal_text(trimmed_callee, &char_value) ||
-        strcmp(trimmed_callee, "true") == 0 ||
-        strcmp(trimmed_callee, "false") == 0 ||
-        strcmp(trimmed_callee, "nil") == 0 ||
-        (trimmed_callee[0] == '"' &&
-         trimmed_callee[strlen(trimmed_callee) - 1U] == '"')) {
-        return false;
+    {
+        char literal[4096];
+        if (cheng_seed_parse_int_literal_text(trimmed_callee, NULL) ||
+            cheng_seed_parse_char_literal_text(trimmed_callee, &char_value) ||
+            strcmp(trimmed_callee, "true") == 0 ||
+            strcmp(trimmed_callee, "false") == 0 ||
+            strcmp(trimmed_callee, "nil") == 0 ||
+            cheng_seed_parse_string_literal_text(trimmed_callee, literal, sizeof(literal))) {
+            return false;
+        }
     }
     callee = trimmed_callee;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
@@ -25610,6 +25995,21 @@ static bool cheng_seed_resolve_call_target_with_args(const ChengSeedSystemLinkPl
         return false;
     }
     callee = canonical_callee;
+    if (args != NULL &&
+        arg_count == 1U &&
+        strcmp(callee, "$") == 0) {
+        builtin_stringify_helper_ready =
+            cheng_seed_resolve_builtin_stringify_helper_name(plan,
+                                                     lowering,
+                                                     current_function,
+                                                     aliases,
+                                                     alias_count,
+                                                     locals,
+                                                     local_count,
+                                                     args[0],
+                                                     helper_callee,
+                                                     sizeof(helper_callee));
+    }
     symbol_text[0] = '\0';
     if (strchr(callee, '.') == NULL &&
         cheng_seed_is_strformat_join_name(callee) &&
@@ -25697,6 +26097,22 @@ static bool cheng_seed_resolve_call_target_with_args(const ChengSeedSystemLinkPl
                                             symbol_text,
                                             sizeof(symbol_text)))) {
         resolved = true;
+        if (builtin_stringify_helper_ready &&
+            selected_function_index >= 0 &&
+            strcmp(lowering->functions[selected_function_index].owner_module_path, "std/strings") == 0 &&
+            cheng_seed_resolve_call_target_with_args(plan,
+                                             lowering,
+                                             current_function,
+                                             aliases,
+                                             alias_count,
+                                             locals,
+                                             local_count,
+                                             helper_callee,
+                                             args,
+                                             arg_count,
+                                             target)) {
+            return true;
+        }
     } else if (!cheng_seed_is_intrinsic_call_name(callee) &&
                cheng_seed_resolve_importc_call_target_from_aliases(plan,
                                                            lowering,
@@ -25713,6 +26129,21 @@ static bool cheng_seed_resolve_call_target_with_args(const ChengSeedSystemLinkPl
                                             symbol_text,
                                             sizeof(symbol_text))) {
         resolved = true;
+    }
+    if (!resolved &&
+        builtin_stringify_helper_ready &&
+        cheng_seed_resolve_call_target_with_args(plan,
+                                         lowering,
+                                         current_function,
+                                         aliases,
+                                         alias_count,
+                                         locals,
+                                         local_count,
+                                         helper_callee,
+                                         args,
+                                         arg_count,
+                                         target)) {
+            return true;
     }
     if (resolved) {
         function_index = -1;
@@ -26943,6 +27374,19 @@ static bool cheng_seed_emit_copy_address_to_address(const ChengSeedSystemLinkPla
     return true;
 }
 
+static bool cheng_seed_emit_clone_composite_address_to_address(const ChengSeedSystemLinkPlanStub *plan,
+                                                       const ChengSeedLoweringPlanStub *lowering,
+                                                       const ChengSeedLoweredFunctionStub *current_function,
+                                                       const ChengSeedImportAlias *aliases,
+                                                       size_t alias_count,
+                                                       const char *type_text,
+                                                       int dst_addr_reg,
+                                                       int src_addr_reg,
+                                                       int32_t call_arg_base,
+                                                       int call_depth,
+                                                       char *out,
+                                                       size_t cap);
+
 static bool cheng_seed_emit_bytes_orc_mem_call(const ChengSeedSystemLinkPlanStub *plan,
                                        const char *symbol,
                                        int ptr_reg,
@@ -27562,52 +28006,6 @@ static bool cheng_seed_emit_call_from_spills(const ChengSeedSystemLinkPlanStub *
                                            &layout,
                                            out,
                                            cap);
-}
-
-static bool cheng_seed_emit_copy_slot_to_address(const ChengSeedSystemLinkPlanStub *plan,
-                                         const ChengSeedLoweringPlanStub *lowering,
-                                         const ChengSeedLoweredFunctionStub *current_function,
-                                         const ChengSeedImportAlias *aliases,
-                                         size_t alias_count,
-                                         int32_t call_arg_base,
-                                         int call_depth,
-                                         char *out,
-                                         size_t cap,
-                                         const ChengSeedAsmLocalSlot *src_slot,
-                                         int dst_reg) {
-    ChengSeedTypeLayoutStub layout;
-    char value_type[256];
-    int32_t copy_size;
-    int src_reg;
-    (void)current_function;
-    (void)aliases;
-    (void)alias_count;
-    (void)call_arg_base;
-    (void)call_depth;
-    if (!src_slot || src_slot->stack_size < 0) {
-        return false;
-    }
-    if (src_slot->indirect_value) {
-        if (!lowering) {
-            return false;
-        }
-        cheng_seed_strip_var_type_text(src_slot->type_text, value_type, sizeof(value_type));
-        if (!cheng_seed_compute_type_layout_impl(lowering, value_type, &layout, 0U)) {
-            return false;
-        }
-        copy_size = layout.size;
-        src_reg = dst_reg == 14 ? 15 : 14;
-        if (!cheng_seed_emit_local_value_address(out, cap, src_slot, src_reg)) {
-            return false;
-        }
-        return cheng_seed_emit_copy_address_to_address(plan, out, cap, dst_reg, src_reg, copy_size);
-    }
-    copy_size = src_slot->stack_size;
-    src_reg = dst_reg == 14 ? 15 : 14;
-    if (!cheng_seed_emit_local_value_address(out, cap, src_slot, src_reg)) {
-        return false;
-    }
-    return cheng_seed_emit_copy_address_to_address(plan, out, cap, dst_reg, src_reg, copy_size);
 }
 
 static bool cheng_seed_emit_clone_slot_to_address_for_assignment(const ChengSeedSystemLinkPlanStub *plan,
@@ -29655,6 +30053,7 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                                                   sizeof(concat_error))) {
                     return false;
                 }
+                cheng_seed_update_max_i32(max_call_depth_io, next_call_depth);
                 return cheng_seed_prepare_expr_call_state(plan,
                                                   lowering,
                                                   current_function,
@@ -29665,7 +30064,7 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                                                   local_cap,
                                                   next_offset_io,
                                                   rewritten_concat_expr,
-                                                  call_depth,
+                                                  next_call_depth,
                                                   max_call_depth_io);
             }
             snprintf(left, sizeof(left), "%.*s", op_index, expr);
@@ -30037,7 +30436,9 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                                                         : "",
                                                     has_target && i < rule.param_count
                                                         ? target_param_abis[i]
-                                                        : "")) {
+                                                        : "",
+                                                    next_call_depth,
+                                                    max_call_depth_io)) {
                 fprintf(stderr,
                         "[cheng_seed] prepare composite call arg temp failed caller=%s callee=%s arg_index=%zu expr=%s has_target=%d\n",
                         current_function->symbol_text,
@@ -30047,6 +30448,45 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                         has_target ? 1 : 0);
                 return false;
             }
+        }
+        if (((strcmp(callee, "echo") == 0) ||
+             (strcmp(callee, "panic") == 0) ||
+             (strcmp(callee, "system.panic") == 0)) &&
+            arg_count == 1U &&
+            !cheng_seed_prepare_composite_expr_temp(plan,
+                                            lowering,
+                                            current_function,
+                                            aliases,
+                                            alias_count,
+                                            locals,
+                                            local_count,
+                                            local_cap,
+                                            next_offset_io,
+                                            args[0])) {
+            fprintf(stderr,
+                    "[cheng_seed] prepare builtin str sink temp failed caller=%s callee=%s expr=%s\n",
+                    current_function->symbol_text,
+                    callee,
+                    args[0]);
+            return false;
+        }
+        if (strcmp(callee, "assert") == 0 &&
+            arg_count == 2U &&
+            !cheng_seed_prepare_composite_expr_temp(plan,
+                                            lowering,
+                                            current_function,
+                                            aliases,
+                                            alias_count,
+                                            locals,
+                                            local_count,
+                                            local_cap,
+                                            next_offset_io,
+                                            args[1])) {
+            fprintf(stderr,
+                    "[cheng_seed] prepare assert message temp failed caller=%s expr=%s\n",
+                    current_function->symbol_text,
+                    args[1]);
+            return false;
         }
         if ((result_kind == ChengSeed_RESULT_INTRINSIC_IS_ERR ||
              result_kind == ChengSeed_RESULT_INTRINSIC_IS_OK ||
@@ -31032,6 +31472,11 @@ static bool cheng_seed_infer_call_expr_type_from_args(const ChengSeedSystemLinkP
         snprintf(abi_out, abi_cap, "%s", cheng_seed_type_abi_class(type_out));
         return true;
     }
+    if (strcmp(callee, "$") == 0 && arg_count == 1U) {
+        snprintf(type_out, type_cap, "%s", "str");
+        snprintf(abi_out, abi_cap, "%s", cheng_seed_type_abi_class(type_out));
+        return true;
+    }
     {
         char cast_target_type[256];
         char cast_target_abi[32];
@@ -31161,10 +31606,13 @@ static bool cheng_seed_infer_expr_type_impl(const ChengSeedSystemLinkPlanStub *p
         return false;
     }
     snprintf(expr, sizeof(expr), "%s", surface.text);
-    if (expr[0] == '"' && expr[strlen(expr) - 1U] == '"') {
-        snprintf(type_out, type_cap, "%s", "str");
-        snprintf(abi_out, abi_cap, "%s", cheng_seed_type_abi_class("str"));
-        return true;
+    {
+        char literal[4096];
+        if (cheng_seed_parse_string_literal_text(expr, literal, sizeof(literal))) {
+            snprintf(type_out, type_cap, "%s", "str");
+            snprintf(abi_out, abi_cap, "%s", cheng_seed_type_abi_class("str"));
+            return true;
+        }
     }
         if (strcmp(expr, "true") == 0 || strcmp(expr, "false") == 0) {
             snprintf(type_out, type_cap, "%s", "bool");
@@ -31900,7 +32348,9 @@ static bool cheng_seed_try_prepare_index_assignment_call_state(const ChengSeedSy
                                                 i,
                                                 args[i],
                                                 i < target.param_count ? target_param_types[i] : "",
-                                                i < target.param_count ? target_param_abis[i] : "")) {
+                                                i < target.param_count ? target_param_abis[i] : "",
+                                                next_call_depth,
+                                                max_call_depth_io)) {
             return false;
         }
     }
@@ -32035,7 +32485,9 @@ static bool cheng_seed_try_prepare_index_access_call_state(const ChengSeedSystem
                                                 i,
                                                 args[i],
                                                 i < target.param_count ? target_param_types[i] : "",
-                                                i < target.param_count ? target_param_abis[i] : "")) {
+                                                i < target.param_count ? target_param_abis[i] : "",
+                                                next_call_depth,
+                                                max_call_depth_io)) {
             return false;
         }
     }
@@ -33142,8 +33594,13 @@ static bool cheng_seed_codegen_compare_expr_scalar(const ChengSeedSystemLinkPlan
                                 target_reg,
                                 strcmp(op, "==") == 0 ? "ne" : "eq");
             }
-            if (!cheng_seed_emit_sp_store_reg(out, cap, call_arg_base, "i32", target_reg) ||
-                !cheng_seed_emit_slot_address(out, cap, &left_scratch_slot, 15) ||
+            cheng_seed_emit_call_dest_spill_store_abi(out,
+                                              cap,
+                                              call_arg_base,
+                                              call_depth,
+                                              "i32",
+                                              target_reg);
+            if (!cheng_seed_emit_slot_address(out, cap, &left_scratch_slot, 15) ||
                 !cheng_seed_emit_bytes_orc_lifecycle_at_address(plan,
                                                         lowering,
                                                         current_function,
@@ -33173,9 +33630,15 @@ static bool cheng_seed_codegen_compare_expr_scalar(const ChengSeedSystemLinkPlan
                                                         out,
                                                         cap,
                                                         0U) ||
-                !cheng_seed_emit_sp_load_reg(out, cap, call_arg_base, "i32", target_reg)) {
+                false) {
                 return false;
             }
+            cheng_seed_emit_call_dest_spill_load_abi(out,
+                                             cap,
+                                             call_arg_base,
+                                             call_depth,
+                                             target_reg,
+                                             "i32");
             return true;
         } else if (strcmp(op, "<") == 0) {
             cond = "lt";
@@ -33218,8 +33681,13 @@ static bool cheng_seed_codegen_compare_expr_scalar(const ChengSeedSystemLinkPlan
                             target_reg,
                             cond);
         }
-        if (!cheng_seed_emit_sp_store_reg(out, cap, call_arg_base, "i32", target_reg) ||
-            !cheng_seed_emit_slot_address(out, cap, &left_scratch_slot, 15) ||
+        cheng_seed_emit_call_dest_spill_store_abi(out,
+                                          cap,
+                                          call_arg_base,
+                                          call_depth,
+                                          "i32",
+                                          target_reg);
+        if (!cheng_seed_emit_slot_address(out, cap, &left_scratch_slot, 15) ||
             !cheng_seed_emit_bytes_orc_lifecycle_at_address(plan,
                                                     lowering,
                                                     current_function,
@@ -33249,9 +33717,15 @@ static bool cheng_seed_codegen_compare_expr_scalar(const ChengSeedSystemLinkPlan
                                                     out,
                                                     cap,
                                                     0U) ||
-            !cheng_seed_emit_sp_load_reg(out, cap, call_arg_base, "i32", target_reg)) {
+            false) {
             return false;
         }
+        cheng_seed_emit_call_dest_spill_load_abi(out,
+                                         cap,
+                                         call_arg_base,
+                                         call_depth,
+                                         target_reg,
+                                         "i32");
         return true;
     }
     if (strcmp(left_abi, "ptr") == 0 && strcmp(right_abi, "ptr") == 0) {
@@ -33634,22 +34108,23 @@ static bool cheng_seed_codegen_expr_scalar(const ChengSeedSystemLinkPlanStub *pl
         return false;
     }
     snprintf(expr, sizeof(expr), "%s", surface.text);
-    if (expr[0] == '"' && expr[strlen(expr) - 1U] == '"' &&
-        strcmp(expected_abi, "ptr") == 0) {
+    {
         char literal[4096];
         char label[128];
-        if (!cheng_seed_parse_string_literal_text(expr, literal, sizeof(literal)) ||
-            !cheng_seed_emit_cstring_literal_label(plan,
-                                           current_function,
-                                           literal,
-                                           NULL,
-                                           label,
-                                           sizeof(label),
-                                           out,
-                                           cap)) {
-            return false;
+        if (strcmp(expected_abi, "ptr") == 0 &&
+            cheng_seed_parse_string_literal_text(expr, literal, sizeof(literal))) {
+            if (!cheng_seed_emit_cstring_literal_label(plan,
+                                               current_function,
+                                               literal,
+                                               NULL,
+                                               label,
+                                               sizeof(label),
+                                               out,
+                                               cap)) {
+                return false;
+            }
+            return cheng_seed_emit_symbol_address_for_target(plan, out, cap, target_reg, label);
         }
-        return cheng_seed_emit_symbol_address_for_target(plan, out, cap, target_reg, label);
     }
     if (expr[0] == '-' && expr[1] != '\0' &&
         !cheng_seed_parse_int_literal_text(expr, &literal_value)) {
@@ -35383,8 +35858,11 @@ static ChengSeedFieldDefaultExprKind cheng_seed_classify_field_default_expr(cons
     while (cheng_seed_trim_outer_parens(expr, inner, sizeof(inner))) {
         snprintf(expr, sizeof(expr), "%s", inner);
     }
-    if (expr[0] == '"' && expr[strlen(expr) - 1U] == '"') {
-        return ChengSeed_FIELD_DEFAULT_EXPR_STABLE;
+    {
+        char literal[4096];
+        if (cheng_seed_parse_string_literal_text(expr, literal, sizeof(literal))) {
+            return ChengSeed_FIELD_DEFAULT_EXPR_STABLE;
+        }
     }
     if (strcmp(expr, "[]") == 0 ||
         strcmp(expr, "true") == 0 ||
@@ -36977,7 +37455,9 @@ static bool cheng_seed_materialize_composite_call_expr_into_address(const ChengS
     ChengSeedNativeCompositeCallLoweringRule composite_rule;
     ChengSeedTypeCallSurface type_call_surface;
     ChengSeedResultIntrinsicKind result_kind;
+    ChengSeedTypeLayoutStub layout;
     size_t arg_count = 0U;
+    int32_t local_index = 0;
     bool resolved = false;
     if (plan == NULL || lowering == NULL || current_function == NULL ||
         callee == NULL || arg_count_io == NULL || normalized_dest_type == NULL ||
@@ -36999,6 +37479,11 @@ static bool cheng_seed_materialize_composite_call_expr_into_address(const ChengS
                                                                   &target,
                                                                   &composite_rule,
                                                                   &resolved)) {
+        fprintf(stderr,
+                "[cheng_seed] prepare composite call lowering rule failed function=%s expr=%s callee=%s\n",
+                current_function ? current_function->symbol_text : "-",
+                expr_text ? expr_text : "-",
+                callee ? callee : "-");
         return false;
     }
     *arg_count_io = arg_count;
@@ -37033,29 +37518,188 @@ static bool cheng_seed_materialize_composite_call_expr_into_address(const ChengS
                                                        out,
                                                        cap);
     }
+    if (arg_count == 1U &&
+        (result_kind == ChengSeed_RESULT_INTRINSIC_VALUE ||
+         result_kind == ChengSeed_RESULT_INTRINSIC_ERROR ||
+         result_kind == ChengSeed_RESULT_INTRINSIC_ERROR_TEXT ||
+         result_kind == ChengSeed_RESULT_INTRINSIC_ERROR_INFO_OF)) {
+        char field_type[256];
+        char field_abi[32];
+        int src_addr_reg = dest_addr_reg == 14 ? 15 : 14;
+        bool ok = false;
+        if (result_kind == ChengSeed_RESULT_INTRINSIC_VALUE) {
+            if (!cheng_seed_emit_result_field_address(plan,
+                                              lowering,
+                                              current_function,
+                                              aliases,
+                                              alias_count,
+                                              locals,
+                                              local_count,
+                                              args[0],
+                                              "value",
+                                              src_addr_reg,
+                                              call_arg_base,
+                                              string_temp_base,
+                                              string_temp_stride,
+                                              string_label_index_io,
+                                              call_depth,
+                                              out,
+                                              cap,
+                                              field_type,
+                                              sizeof(field_type),
+                                              field_abi,
+                                              sizeof(field_abi)) ||
+                !cheng_seed_expr_materializes_to_address(field_type, field_abi) ||
+                !cheng_seed_compute_type_layout_impl(lowering, field_type, &layout, 0U)) {
+                return false;
+            }
+            return cheng_seed_emit_clone_composite_address_to_address(plan,
+                                                              lowering,
+                                                              current_function,
+                                                              aliases,
+                                                              alias_count,
+                                                              field_type,
+                                                              dest_addr_reg,
+                                                              src_addr_reg,
+                                                              call_arg_base,
+                                                              call_depth,
+                                                              out,
+                                                              cap);
+        }
+        if (result_kind == ChengSeed_RESULT_INTRINSIC_ERROR_INFO_OF) {
+            if (!cheng_seed_emit_result_field_address(plan,
+                                              lowering,
+                                              current_function,
+                                              aliases,
+                                              alias_count,
+                                              locals,
+                                              local_count,
+                                              args[0],
+                                              "err",
+                                              src_addr_reg,
+                                              call_arg_base,
+                                              string_temp_base,
+                                              string_temp_stride,
+                                              string_label_index_io,
+                                              call_depth,
+                                              out,
+                                              cap,
+                                              field_type,
+                                              sizeof(field_type),
+                                              field_abi,
+                                              sizeof(field_abi)) ||
+                !cheng_seed_expr_materializes_to_address(field_type, field_abi) ||
+                !cheng_seed_compute_type_layout_impl(lowering, field_type, &layout, 0U)) {
+                return false;
+            }
+            return cheng_seed_emit_clone_composite_address_to_address(plan,
+                                                              lowering,
+                                                              current_function,
+                                                              aliases,
+                                                              alias_count,
+                                                              field_type,
+                                                              dest_addr_reg,
+                                                              src_addr_reg,
+                                                              call_arg_base,
+                                                              call_depth,
+                                                              out,
+                                                              cap);
+        }
+        if (!cheng_seed_emit_result_field_address(plan,
+                                          lowering,
+                                          current_function,
+                                          aliases,
+                                          alias_count,
+                                          locals,
+                                          local_count,
+                                          args[0],
+                                          "err",
+                                          src_addr_reg,
+                                          call_arg_base,
+                                          string_temp_base,
+                                          string_temp_stride,
+                                          string_label_index_io,
+                                          call_depth,
+                                          out,
+                                          cap,
+                                          field_type,
+                                          sizeof(field_type),
+                                          field_abi,
+                                          sizeof(field_abi)) ||
+            !cheng_seed_resolve_field_meta(lowering,
+                                   field_type,
+                                   "msg",
+                                   field_type,
+                                   sizeof(field_type),
+                                   field_abi,
+                                   sizeof(field_abi),
+                                   &local_index) ||
+            !cheng_seed_expr_materializes_to_address(field_type, field_abi) ||
+            !cheng_seed_compute_type_layout_impl(lowering, field_type, &layout, 0U)) {
+            return false;
+        }
+        if (local_index != 0 &&
+            !cheng_seed_emit_add_address_offset(out, cap, src_addr_reg, src_addr_reg, local_index)) {
+            return false;
+        }
+        ok = cheng_seed_emit_clone_composite_address_to_address(plan,
+                                                        lowering,
+                                                        current_function,
+                                                        aliases,
+                                                        alias_count,
+                                                        field_type,
+                                                        dest_addr_reg,
+                                                        src_addr_reg,
+                                                        call_arg_base,
+                                                        call_depth,
+                                                        out,
+                                                        cap);
+        return ok;
+    }
+    if (!resolved &&
+        cheng_seed_resolve_call_target(plan,
+                               lowering,
+                               current_function,
+                               aliases,
+                               alias_count,
+                               callee,
+                               &target) &&
+        cheng_seed_build_native_composite_call_lowering_rule(&target, &composite_rule)) {
+        resolved = true;
+    }
     if (resolved) {
-        return cheng_seed_codegen_call_into_address_resolved(plan,
-                                                     lowering,
-                                                     current_function,
-                                                     aliases,
-                                                     alias_count,
-                                                     locals,
-                                                     local_count,
-                                                     expr_text,
-                                                     normalized_dest_type,
-                                                     callee,
-                                                     args,
-                                                     arg_count,
-                                                     &target,
-                                                     &composite_rule,
-                                                     dest_addr_reg,
-                                                     call_arg_base,
-                                                     string_temp_base,
-                                                     string_temp_stride,
-                                                     string_label_index_io,
-                                                     call_depth,
-                                                     out,
-                                                     cap);
+        bool ok = cheng_seed_codegen_call_into_address_resolved(plan,
+                                                        lowering,
+                                                        current_function,
+                                                        aliases,
+                                                        alias_count,
+                                                        locals,
+                                                        local_count,
+                                                        expr_text,
+                                                        normalized_dest_type,
+                                                        callee,
+                                                        args,
+                                                        arg_count,
+                                                        &target,
+                                                        &composite_rule,
+                                                        dest_addr_reg,
+                                                        call_arg_base,
+                                                        string_temp_base,
+                                                        string_temp_stride,
+                                                        string_label_index_io,
+                                                        call_depth,
+                                                        out,
+                                                        cap);
+        if (!ok) {
+            fprintf(stderr,
+                    "[cheng_seed] composite call-into-address resolved emit failed function=%s expr=%s callee=%s dest_type=%s arg_count=%zu\n",
+                    current_function ? current_function->symbol_text : "-",
+                    expr_text ? expr_text : "-",
+                    callee ? callee : "-",
+                    normalized_dest_type ? normalized_dest_type : "-",
+                    arg_count);
+        }
+        return ok;
     }
     if (!cheng_seed_classify_type_call_surface(lowering,
                                        current_function->owner_module_path,
@@ -37064,6 +37708,12 @@ static bool cheng_seed_materialize_composite_call_expr_into_address(const ChengS
                                        callee,
                                        arg_count,
                                        &type_call_surface)) {
+        fprintf(stderr,
+                "[cheng_seed] composite call type surface classify failed function=%s expr=%s callee=%s arg_count=%zu\n",
+                current_function ? current_function->symbol_text : "-",
+                expr_text ? expr_text : "-",
+                callee ? callee : "-",
+                arg_count);
         return false;
     }
     if (cheng_seed_type_call_kind_is_materialize(type_call_surface.kind)) {
@@ -37087,6 +37737,13 @@ static bool cheng_seed_materialize_composite_call_expr_into_address(const ChengS
                                                 out,
                                                 cap);
     }
+    fprintf(stderr,
+            "[cheng_seed] composite call expr unresolved non-materialize function=%s expr=%s callee=%s type_call_kind=%d arg_count=%zu\n",
+            current_function ? current_function->symbol_text : "-",
+            expr_text ? expr_text : "-",
+            callee ? callee : "-",
+            (int)type_call_surface.kind,
+            arg_count);
     return false;
 }
 
@@ -37917,6 +38574,87 @@ static bool cheng_seed_emit_orc_safe_composite_assignment_to_address(const Cheng
     return true;
 }
 
+static bool cheng_seed_emit_materialize_composite_expr_via_temp_move_to_address(const ChengSeedSystemLinkPlanStub *plan,
+                                                                         const ChengSeedLoweringPlanStub *lowering,
+                                                                         const ChengSeedLoweredFunctionStub *current_function,
+                                                                         const ChengSeedImportAlias *aliases,
+                                                                         size_t alias_count,
+                                                                         const ChengSeedAsmLocalSlot *locals,
+                                                                         size_t local_count,
+                                                                         const char *expr_text,
+                                                                         const char *dest_type_text,
+                                                                         int dest_addr_reg,
+                                                                         int32_t call_arg_base,
+                                                                         int32_t string_temp_base,
+                                                                         int32_t string_temp_stride,
+                                                                         int32_t *string_label_index_io,
+                                                                         int call_depth,
+                                                                         char *out,
+                                                                         size_t cap) {
+    char normalized_type[CHENG_MAX_TYPE_TEXT];
+    ChengSeedTypeLayoutStub layout;
+    int32_t temp_bytes;
+    int32_t stack_bytes;
+    int temp_addr_reg;
+    if (!cheng_seed_normalize_type_text(lowering,
+                                current_function->owner_module_path,
+                                aliases,
+                                alias_count,
+                                dest_type_text,
+                                normalized_type,
+                                sizeof(normalized_type)) ||
+        !cheng_seed_compute_type_layout_impl(lowering, normalized_type, &layout, 0U)) {
+        return false;
+    }
+    temp_bytes = cheng_seed_align_up_i32(layout.size, 16);
+    stack_bytes = cheng_seed_align_up_i32(temp_bytes + 8, 16);
+    if (temp_bytes <= 0 || stack_bytes < temp_bytes + 8 ||
+        !cheng_seed_emit_sp_adjust(out, cap, true, stack_bytes)) {
+        return false;
+    }
+    temp_addr_reg = dest_addr_reg == 14 ? 15 : 14;
+    if (!cheng_seed_emit_sp_store_reg(out, cap, temp_bytes, "ptr", dest_addr_reg) ||
+        !cheng_seed_emit_sp_offset_address(out, cap, temp_addr_reg, 0) ||
+        !cheng_seed_materialize_composite_expr_into_address(plan,
+                                                    lowering,
+                                                    current_function,
+                                                    aliases,
+                                                    alias_count,
+                                                    locals,
+                                                    local_count,
+                                                    expr_text,
+                                                    normalized_type,
+                                                    temp_addr_reg,
+                                                    call_arg_base,
+                                                    string_temp_base,
+                                                    string_temp_stride,
+                                                    string_label_index_io,
+                                                    call_depth,
+                                                    out,
+                                                    cap)) {
+        fprintf(stderr,
+                "[cheng_seed] temp-move composite materialize failed function=%s expr=%s dest_type=%s call_depth=%d\n",
+                current_function ? current_function->symbol_text : "-",
+                expr_text ? expr_text : "-",
+                normalized_type,
+                call_depth);
+        cheng_seed_emit_sp_adjust(out, cap, false, stack_bytes);
+        return false;
+    }
+    if (!cheng_seed_emit_sp_load_reg(out, cap, temp_bytes, "ptr", dest_addr_reg) ||
+        !cheng_seed_emit_sp_offset_address(out, cap, temp_addr_reg, 0) ||
+        !cheng_seed_emit_copy_address_to_address(plan, out, cap, dest_addr_reg, temp_addr_reg, layout.size)) {
+        cheng_seed_emit_sp_adjust(out, cap, false, stack_bytes);
+        return false;
+    }
+    if (!cheng_seed_emit_sp_offset_address(out, cap, temp_addr_reg, 0) ||
+        !cheng_seed_emit_zero_address_range(out, cap, temp_addr_reg, layout.size) ||
+        !cheng_seed_emit_sp_adjust(out, cap, false, stack_bytes)) {
+        return false;
+    }
+    return true;
+}
+
 static bool cheng_seed_local_slot_needs_bytes_orc_cleanup(const ChengSeedLoweringPlanStub *lowering,
                                                   const ChengSeedLoweredFunctionStub *current_function,
                                                   const ChengSeedImportAlias *aliases,
@@ -37994,39 +38732,6 @@ static bool cheng_seed_emit_bytes_orc_clear_returned_local(const ChengSeedLoweri
     return cheng_seed_emit_zero_slot(out, cap, &locals[local_index]);
 }
 
-static int32_t cheng_seed_find_call_arg_temp_local_index(const ChengSeedLoweredFunctionStub *current_function,
-                                                 const ChengSeedAsmLocalSlot *locals,
-                                                 size_t local_count,
-                                                 const char *callee,
-                                                 size_t arg_index,
-                                                 const char *arg_expr) {
-    char named_field[128];
-    char named_expr[4096];
-    const char *value_expr = arg_expr;
-    char temp_name[128];
-    if (current_function == NULL || locals == NULL || callee == NULL ||
-        arg_expr == NULL || arg_expr[0] == '\0') {
-        return -1;
-    }
-    if (cheng_seed_parse_named_arg_meta(arg_expr,
-                                named_field,
-                                sizeof(named_field),
-                                named_expr,
-                                sizeof(named_expr))) {
-        value_expr = named_expr;
-    }
-    if (cheng_seed_find_local_slot(locals, local_count, value_expr) >= 0) {
-        return -1;
-    }
-    cheng_seed_call_arg_temp_name(current_function,
-                          callee,
-                          arg_index,
-                          value_expr,
-                          temp_name,
-                          sizeof(temp_name));
-    return cheng_seed_find_local_slot(locals, local_count, temp_name);
-}
-
 static bool cheng_seed_emit_bytes_orc_cleanup_call_arg_temps(const ChengSeedSystemLinkPlanStub *plan,
                                                      const ChengSeedLoweringPlanStub *lowering,
                                                      const ChengSeedLoweredFunctionStub *current_function,
@@ -38043,65 +38748,27 @@ static bool cheng_seed_emit_bytes_orc_cleanup_call_arg_temps(const ChengSeedSyst
                                                      const char *preserve_return_abi,
                                                      char *out,
                                                      size_t cap) {
-    size_t i = arg_count;
-    bool preserve_return =
-        preserve_return_abi != NULL &&
-        preserve_return_abi[0] != '\0' &&
-        strcmp(preserve_return_abi, "void") != 0;
-    if (plan == NULL || lowering == NULL || current_function == NULL ||
-        locals == NULL || callee == NULL || args == NULL || target == NULL ||
-        out == NULL) {
-        return false;
-    }
-    if (preserve_return &&
-        !cheng_seed_emit_sp_store_reg(out, cap, call_arg_base, preserve_return_abi, 0)) {
-        return false;
-    }
-    while (i > 0U) {
-        size_t arg_pos = i - 1U;
-        int32_t local_index = -1;
-        if (arg_pos >= target->param_count ||
-            !cheng_seed_call_signature_needs_address_temp(target->param_types[arg_pos],
-                                                  target->param_abi_classes[arg_pos])) {
-            i -= 1U;
-            continue;
-        }
-        local_index = cheng_seed_find_call_arg_temp_local_index(current_function,
-                                                        locals,
-                                                        local_count,
-                                                        callee,
-                                                        arg_pos,
-                                                        args[arg_pos]);
-        if (local_index >= 0 &&
-            cheng_seed_local_slot_needs_bytes_orc_cleanup(lowering,
-                                                  current_function,
-                                                  aliases,
-                                                  alias_count,
-                                                  &locals[local_index]) &&
-            (!cheng_seed_emit_slot_address(out, cap, &locals[local_index], 15) ||
-             !cheng_seed_emit_bytes_orc_lifecycle_at_address(plan,
-                                                     lowering,
-                                                     current_function,
-                                                     aliases,
-                                                     alias_count,
-                                                     current_function->owner_module_path,
-                                                     locals[local_index].type_text,
-                                                     15,
-                                                     call_arg_base + 32,
-                                                     call_depth,
-                                                     false,
-                                                     out,
-                                                     cap,
-                                                     0U) ||
-             !cheng_seed_emit_zero_slot(out, cap, &locals[local_index]))) {
-            return false;
-        }
-        i -= 1U;
-    }
-    if (preserve_return &&
-        !cheng_seed_emit_sp_load_reg(out, cap, call_arg_base, preserve_return_abi, 0)) {
-        return false;
-    }
+    /* Current Cheng composite-call ABI passes caller-owned temp addresses
+     * directly into the callee. Those temp slots therefore stay semantically
+     * live until the caller frame unwinds. The normal function-epilogue local
+     * cleanup releases them, so skipping eager post-call cleanup here avoids
+     * invalidating still-live borrows while remaining leak-free. */
+    (void)plan;
+    (void)lowering;
+    (void)current_function;
+    (void)aliases;
+    (void)alias_count;
+    (void)locals;
+    (void)local_count;
+    (void)callee;
+    (void)args;
+    (void)arg_count;
+    (void)target;
+    (void)call_arg_base;
+    (void)call_depth;
+    (void)preserve_return_abi;
+    (void)out;
+    (void)cap;
     return true;
 }
 
@@ -38121,9 +38788,13 @@ static bool cheng_seed_emit_bytes_orc_cleanup_locals(const ChengSeedSystemLinkPl
     if (plan == NULL || lowering == NULL || current_function == NULL || out == NULL) {
         return false;
     }
-    if (preserve_return &&
-        !cheng_seed_emit_sp_store_reg(out, cap, call_arg_base, preserve_return_abi, 0)) {
-        return false;
+    if (preserve_return) {
+        cheng_seed_emit_call_dest_spill_store_abi(out,
+                                          cap,
+                                          call_arg_base,
+                                          0,
+                                          preserve_return_abi,
+                                          0);
     }
     while (i > 0U) {
         size_t index = i - 1U;
@@ -38151,9 +38822,13 @@ static bool cheng_seed_emit_bytes_orc_cleanup_locals(const ChengSeedSystemLinkPl
         }
         i -= 1U;
     }
-    if (preserve_return &&
-        !cheng_seed_emit_sp_load_reg(out, cap, call_arg_base, preserve_return_abi, 0)) {
-        return false;
+    if (preserve_return) {
+        cheng_seed_emit_call_dest_spill_load_abi(out,
+                                         cap,
+                                         call_arg_base,
+                                         0,
+                                         0,
+                                         preserve_return_abi);
     }
     return true;
 }
@@ -38247,6 +38922,48 @@ static bool cheng_seed_materialize_composite_expr_into_address(const ChengSeedSy
                                                          cap,
                                                          0U);
         }
+    }
+    if (surface.kind == ChengSeed_EXPR_SURFACE_CALL) {
+        char (*call_args)[4096] = cheng_seed_alloc_call_arg_scratch();
+        size_t call_arg_count = 0U;
+        bool ok = false;
+        if (call_args == NULL ||
+            !cheng_seed_split_expr_surface_call_args(&surface,
+                                             call_args,
+                                             &call_arg_count,
+                                             CHENG_MAX_CALL_ARGS)) {
+            free(call_args);
+            fprintf(stderr,
+                    "[cheng_seed] composite call surface split failed function=%s expr=%s callee=%s\n",
+                    current_function ? current_function->symbol_text : "-",
+                    expr,
+                    surface.call_callee);
+            return false;
+        }
+        snprintf(inner_callee, sizeof(inner_callee), "%s", surface.call_callee);
+        ok = cheng_seed_materialize_composite_call_expr_into_address(plan,
+                                                             lowering,
+                                                             current_function,
+                                                             aliases,
+                                                             alias_count,
+                                                             locals,
+                                                             local_count,
+                                                             expr,
+                                                             inner_callee,
+                                                             sizeof(inner_callee),
+                                                             call_args,
+                                                             &call_arg_count,
+                                                             normalized_dest_type,
+                                                             dest_addr_reg,
+                                                             call_arg_base,
+                                                             string_temp_base,
+                                                             string_temp_stride,
+                                                             string_label_index_io,
+                                                             call_depth,
+                                                             out,
+                                                             cap);
+        free(call_args);
+        return ok;
     }
     if (surface.kind == ChengSeed_EXPR_SURFACE_IF) {
         int32_t label_id = cheng_seed_next_expr_label_id();
@@ -38626,23 +39343,29 @@ static bool cheng_seed_materialize_composite_expr_into_address(const ChengSeedSy
                         free(args);
                         return false;
                     }
-                    if (!cheng_seed_materialize_composite_expr_into_address(plan,
-                                                                    lowering,
-                                                                    current_function,
-                                                                    aliases,
-                                                                    alias_count,
-                                                                    locals,
-                                                                    local_count,
-                                                                    args[i],
-                                                                    elem_type,
-                                                                    elem_addr_reg,
-                                                                    call_arg_base,
-                                                                    string_temp_base,
-                                                                    string_temp_stride,
-                                                                    string_label_index_io,
-                                                                    call_depth + 1,
-                                                                    out,
-                                                                    cap)) {
+                    if (!cheng_seed_emit_materialize_composite_expr_via_temp_move_to_address(plan,
+                                                                                    lowering,
+                                                                                    current_function,
+                                                                                    aliases,
+                                                                                    alias_count,
+                                                                                    locals,
+                                                                                    local_count,
+                                                                                    args[i],
+                                                                                    elem_type,
+                                                                                    elem_addr_reg,
+                                                                                    call_arg_base,
+                                                                                    string_temp_base,
+                                                                                    string_temp_stride,
+                                                                                    string_label_index_io,
+                                                                                    call_depth + 1,
+                                                                                    out,
+                                                                                    cap)) {
+                        fprintf(stderr,
+                                "[cheng_seed] composite list elem temp-move failed function=%s expr=%s elem_type=%s elem_index=%zu\n",
+                                current_function ? current_function->symbol_text : "-",
+                                args[i],
+                                elem_type,
+                                i);
                         free(args);
                         return false;
                     }
@@ -38751,23 +39474,29 @@ static bool cheng_seed_materialize_composite_expr_into_address(const ChengSeedSy
                     free(args);
                     return false;
                 }
-                if (!cheng_seed_materialize_composite_expr_into_address(plan,
-                                                                lowering,
-                                                                current_function,
-                                                                aliases,
-                                                                alias_count,
-                                                                locals,
-                                                                local_count,
-                                                                args[i],
-                                                                elem_type,
-                                                                15,
-                                                                call_arg_base,
-                                                                string_temp_base,
-                                                                string_temp_stride,
-                                                                string_label_index_io,
-                                                                call_depth + 1,
-                                                                out,
-                                                                cap)) {
+                if (!cheng_seed_emit_materialize_composite_expr_via_temp_move_to_address(plan,
+                                                                                lowering,
+                                                                                current_function,
+                                                                                aliases,
+                                                                                alias_count,
+                                                                                locals,
+                                                                                local_count,
+                                                                                args[i],
+                                                                                elem_type,
+                                                                                15,
+                                                                                call_arg_base,
+                                                                                string_temp_base,
+                                                                                string_temp_stride,
+                                                                                string_label_index_io,
+                                                                                call_depth + 1,
+                                                                                out,
+                                                                                cap)) {
+                    fprintf(stderr,
+                            "[cheng_seed] composite fixed-array elem temp-move failed function=%s expr=%s elem_type=%s elem_index=%zu\n",
+                            current_function ? current_function->symbol_text : "-",
+                            args[i],
+                            elem_type,
+                            i);
                     free(args);
                     return false;
                 }
@@ -38967,17 +39696,18 @@ static bool cheng_seed_materialize_composite_expr_into_address(const ChengSeedSy
     if (local_index >= 0 &&
         cheng_seed_expr_materializes_to_address(locals[local_index].type_text,
                                         locals[local_index].abi_class)) {
-        return cheng_seed_emit_copy_slot_to_address(plan,
-                                            lowering,
-                                            current_function,
-                                            aliases,
-                                            alias_count,
-                                            call_arg_base,
-                                            call_depth,
-                                            out,
-                                            cap,
-                                            &locals[local_index],
-                                            dest_addr_reg);
+        return cheng_seed_emit_clone_slot_to_address_for_assignment(plan,
+                                                            lowering,
+                                                            current_function,
+                                                            aliases,
+                                                            alias_count,
+                                                            call_arg_base,
+                                                            call_depth,
+                                                            out,
+                                                            cap,
+                                                            &locals[local_index],
+                                                            -1,
+                                                            dest_addr_reg);
     }
     {
         const ChengSeedTopLevelConstStub *top_level_const =
@@ -39241,6 +39971,11 @@ static bool cheng_seed_materialize_composite_expr_into_address(const ChengSeedSy
             return ok;
         }
     }
+    fprintf(stderr,
+            "[cheng_seed] composite expr materialize unsupported function=%s expr=%s dest_type=%s\n",
+            current_function ? current_function->symbol_text : "-",
+            expr,
+            normalized_dest_type);
     return false;
 }
 
@@ -39741,6 +40476,8 @@ static bool cheng_seed_emit_builtin_str_expr_address(const ChengSeedSystemLinkPl
     char field_type[256];
     char field_abi[32];
     int32_t local_index = -1;
+    char canonical_expr[8192];
+    char temp_name[128];
     local_index = cheng_seed_find_local_slot(locals, local_count, expr_text);
     if (local_index >= 0) {
         return cheng_seed_emit_local_value_address(out, cap, &locals[local_index], addr_reg);
@@ -39778,43 +40515,39 @@ static bool cheng_seed_emit_builtin_str_expr_address(const ChengSeedSystemLinkPl
         return strcmp(field_type, "str") == 0 &&
                cheng_seed_expr_materializes_to_address(field_type, field_abi);
     }
-    {
-        ChengSeedAsmLocalSlot temp_slot;
-        if (string_temp_stride < cheng_seed_active_target_str_size_i32()) {
-            return false;
-        }
-        memset(&temp_slot, 0, sizeof(temp_slot));
-        snprintf(temp_slot.name, sizeof(temp_slot.name), "%s", temp_slot_name);
-        snprintf(temp_slot.type_text, sizeof(temp_slot.type_text), "%s", "str");
-        snprintf(temp_slot.abi_class,
-                 sizeof(temp_slot.abi_class),
-                 "%s",
-                 cheng_seed_type_abi_class(temp_slot.type_text));
-        temp_slot.stack_offset = string_temp_base + call_depth * string_temp_stride;
-        temp_slot.stack_size = cheng_seed_active_target_str_size_i32();
-        temp_slot.stack_align = cheng_seed_active_target_pointer_align_i32();
-        if (!cheng_seed_emit_slot_address(out, cap, &temp_slot, addr_reg) ||
-            !cheng_seed_materialize_composite_expr_into_address(plan,
-                                                        lowering,
-                                                        current_function,
-                                                        aliases,
-                                                        alias_count,
-                                                        locals,
-                                                        local_count,
-                                                        expr_text,
-                                                        "str",
-                                                        addr_reg,
-                                                        call_arg_base,
-                                                        string_temp_base,
-                                                        string_temp_stride,
-                                                        string_label_index_io,
-                                                        call_depth + 1,
-                                                        out,
-                                                        cap)) {
-            return false;
-        }
-        return cheng_seed_emit_slot_address(out, cap, &temp_slot, addr_reg);
+    cheng_seed_copy_expr_temp_key_text(expr_text, canonical_expr, sizeof(canonical_expr));
+    cheng_seed_expr_temp_name(current_function, canonical_expr, temp_name, sizeof(temp_name));
+    local_index = cheng_seed_find_local_slot(locals, local_count, temp_name);
+    if (local_index < 0) {
+        fprintf(stderr,
+                "[cheng_seed] builtin str expr temp missing function=%s expr=%s temp=%s fallback=%s\n",
+                current_function ? current_function->symbol_text : "-",
+                expr_text ? expr_text : "-",
+                temp_name,
+                temp_slot_name ? temp_slot_name : "-");
+        return false;
     }
+    if (!cheng_seed_materialize_composite_expr_into_slot(plan,
+                                                 lowering,
+                                                 current_function,
+                                                 aliases,
+                                                 alias_count,
+                                                 locals,
+                                                 local_count,
+                                                 temp_slot_name,
+                                                 0U,
+                                                 expr_text,
+                                                 &locals[local_index],
+                                                 call_arg_base,
+                                                 string_temp_base,
+                                                 string_temp_stride,
+                                                 string_label_index_io,
+                                                 call_depth + 1,
+                                                 out,
+                                                 cap)) {
+        return false;
+    }
+    return cheng_seed_emit_local_value_address(out, cap, &locals[local_index], addr_reg);
 }
 
 static bool cheng_seed_emit_builtin_str_to_cstring_bridge(const ChengSeedSystemLinkPlanStub *plan,
@@ -56789,8 +57522,8 @@ static void cheng_seed_primary_object_cache_append_lowered_function(ChengSeedByt
     }
     cheng_seed_bytebuf_append_text(buf, function->first_body_line);
     cheng_seed_bytebuf_append_u32_be(buf, (uint32_t)function->callee_count);
-    for (i = 0U; i < function->callee_count && i < CHENG_MAX_CALLEES; ++i) {
-        cheng_seed_bytebuf_append_text(buf, function->callee_symbols[i].text);
+    for (i = 0U; i < function->callee_count; ++i) {
+        cheng_seed_bytebuf_append_text(buf, function->callee_symbols[i].text ? function->callee_symbols[i].text : "");
     }
     cheng_seed_bytebuf_append_u32_be(buf, function->is_entry ? 1U : 0U);
     cheng_seed_bytebuf_append_u32_be(buf, function->reachable ? 1U : 0U);
@@ -64718,6 +65451,10 @@ static int cheng_seed_cmd_r2c_react_impl(int argc, char **argv) {
                                                controller_label);
 }
 
+static int cheng_seed_invoke_with_fresh_compile_env(ChengSeedSeedCommandFn fn,
+                                            int argc,
+                                            char **argv);
+
 static int cheng_seed_invoke_command_with_common_flags(ChengSeedSeedCommandFn fn,
                                                const char *cmd_name,
                                                const char *contract_path,
@@ -64766,7 +65503,65 @@ static int cheng_seed_invoke_command_with_common_flags(ChengSeedSeedCommandFn fn
         snprintf(report_flag, sizeof(report_flag), "--report-out:%s", report_path);
         argv_local[argc_local++] = report_flag;
     }
-    return fn(argc_local, argv_local);
+    return cheng_seed_invoke_with_fresh_compile_env(fn, argc_local, argv_local);
+}
+
+static int cheng_seed_invoke_with_fresh_compile_env(ChengSeedSeedCommandFn fn,
+                                            int argc,
+                                            char **argv) {
+    char saved_incremental[64];
+    char saved_multi_module_cache[64];
+    char saved_primary_object_cache[64];
+    char saved_quick_stamp_cache[64];
+    char saved_quick_shared_cache[64];
+    bool had_incremental = false;
+    bool had_multi_module_cache = false;
+    bool had_primary_object_cache = false;
+    bool had_quick_stamp_cache = false;
+    bool had_quick_shared_cache = false;
+    int rc;
+    cheng_seed_save_env_value("BACKEND_INCREMENTAL",
+                              saved_incremental,
+                              sizeof(saved_incremental),
+                              &had_incremental);
+    cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE",
+                              saved_multi_module_cache,
+                              sizeof(saved_multi_module_cache),
+                              &had_multi_module_cache);
+    cheng_seed_save_env_value("CHENG_DISABLE_PRIMARY_OBJECT_CACHE",
+                              saved_primary_object_cache,
+                              sizeof(saved_primary_object_cache),
+                              &had_primary_object_cache);
+    cheng_seed_save_env_value("BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE",
+                              saved_quick_stamp_cache,
+                              sizeof(saved_quick_stamp_cache),
+                              &had_quick_stamp_cache);
+    cheng_seed_save_env_value("BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE",
+                              saved_quick_shared_cache,
+                              sizeof(saved_quick_shared_cache),
+                              &had_quick_shared_cache);
+    setenv("BACKEND_INCREMENTAL", "0", 1);
+    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
+    setenv("CHENG_DISABLE_PRIMARY_OBJECT_CACHE", "1", 1);
+    setenv("BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE", "0", 1);
+    setenv("BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE", "0", 1);
+    rc = fn(argc, argv);
+    cheng_seed_restore_env_value("BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE",
+                                 saved_quick_shared_cache,
+                                 had_quick_shared_cache);
+    cheng_seed_restore_env_value("BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE",
+                                 saved_quick_stamp_cache,
+                                 had_quick_stamp_cache);
+    cheng_seed_restore_env_value("CHENG_DISABLE_PRIMARY_OBJECT_CACHE",
+                                 saved_primary_object_cache,
+                                 had_primary_object_cache);
+    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE",
+                                 saved_multi_module_cache,
+                                 had_multi_module_cache);
+    cheng_seed_restore_env_value("BACKEND_INCREMENTAL",
+                                 saved_incremental,
+                                 had_incremental);
+    return rc;
 }
 
 static int cheng_seed_cmd_profile_run(int argc, char **argv);
@@ -73016,6 +73811,8 @@ static int cheng_seed_cmd_run_host_smokes_impl(int argc, char **argv) {
         "runtime_link_input_surface_smoke",
         "runtime_zero_c_surface_smoke",
         "composite_default_init_smoke",
+        "composite_call_regression_smoke",
+        "large_dispatch_callee_smoke",
         "composite_default_init_negative_smoke",
         "if_enum_composite_return_smoke",
         "out_param_writeback_smoke",
@@ -76304,25 +77101,25 @@ int main(int argc, char **argv) {
         return cheng_seed_cmd_slice_gate(argc, argv);
     }
     if (cheng_seed_streq(argv[1], "debug-report")) {
-        return cheng_seed_cmd_debug_report(argc, argv);
+        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_debug_report, argc, argv);
     }
     if (cheng_seed_streq(argv[1], "print-symbols")) {
-        return cheng_seed_cmd_print_symbols(argc, argv);
+        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_symbols, argc, argv);
     }
     if (cheng_seed_streq(argv[1], "print-line-map")) {
-        return cheng_seed_cmd_print_line_map(argc, argv);
+        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_line_map, argc, argv);
     }
     if (cheng_seed_streq(argv[1], "print-object")) {
-        return cheng_seed_cmd_print_object(argc, argv);
+        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_object, argc, argv);
     }
     if (cheng_seed_streq(argv[1], "print-elf")) {
-        return cheng_seed_cmd_print_elf(argc, argv);
+        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_elf, argc, argv);
     }
     if (cheng_seed_streq(argv[1], "print-asm")) {
-        return cheng_seed_cmd_print_asm(argc, argv);
+        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_asm, argc, argv);
     }
     if (cheng_seed_streq(argv[1], "profile-run")) {
-        return cheng_seed_cmd_profile_run(argc, argv);
+        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_profile_run, argc, argv);
     }
     if (cheng_seed_streq(argv[1], "profile-report")) {
         return cheng_seed_cmd_profile_report(argc, argv);
@@ -76502,7 +77299,7 @@ int main(int argc, char **argv) {
         return cheng_seed_cmd_selfhost_build(argc, argv);
     }
     if (cheng_seed_streq(argv[1], "system-link-exec")) {
-        return cheng_seed_cmd_system_link_exec(argc, argv);
+        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_system_link_exec, argc, argv);
     }
     if (cheng_seed_streq(argv[1], "compile-bootstrap")) {
         return cheng_seed_cmd_compile_bootstrap(argc, argv);

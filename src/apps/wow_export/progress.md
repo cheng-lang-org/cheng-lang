@@ -2,9 +2,48 @@
 
 当前阶段只接受真实本机数据。缺少已审计 fileDataID 时，北郡预览必须失败，不能生成占位几何。
 
+最新进展（2026-04-24）：
+
+- `casc_index.LoadLocalIndexEntry` 不再因为目录路径或悬挂 `ListDir` 结果崩溃；现在会稳定返回真实错误。
+- `std/os.ListDir` 现已在库层修正：目录 listing raw buffer 会在 `ListDir` 内部释放，返回文件名保持 owned 字符串，不再把释放责任和悬挂风险留给业务层。
+- 当前本机重跑最小链路时，阻塞已经从“路径桥/悬挂字符串”收敛到“本地 journal 查不到 config 里的 encoding encoding key `00f6dcef63eafe6254ab5408ea8baa09`”。
+- 已新增纯 Cheng `tact_index` 解析器，现已用真实本机 `Data/indices/bd643d2dac9bfdc365890dafbbea83d6.index` 钉住现代 `.index` footer 和 24 字节 record 布局：`formatRevision=1`、`blockSizeKB=4`、`offsetBytes=4`、`sizeBytes=4`、`keyBytes=16`、`hashBytes=8`，首条 record 的 ekey/size/offset 也已经按实值解出。
+- `wow_export_tact_index_smoke` 现在验证“固定本机 `.index` 样本 -> footer -> 首条 record -> `entryIndex=0` 回读同一条 record”，说明 `.index` 文件格式本身已经从猜测变成 Cheng 代码事实。
+- 现在已经不是“`encoding/root/vfs-root` 在本机找不到”。新增的 `wow_export_tact_index_lookup_smoke` 已经证明这些关键 ekey 会真实落到 `Data/indices/303b4155efa35ae393a48c869f1d1899.index`，并且 `vfs-root` 的 block-key 链能继续追到终点 key `8bdfef615338a75d9199dd5a74913d14`。
+- 已确认 `303b4155efa35ae393a48c869f1d1899.index` 来自本地 CDN config 的 `file-index` 字段，不是普通 data archive 索引；`encoding` 和 `vfs-root` 这类 config ekey 的 loose blob 应走 CDN `data/xx/yy/eKey` 路径。
+- 已新增纯 Cheng `cdn_config` 模块读取本地 CDN config，并生成 `data/00/f6/00f6...`、`data/2a/ec/2aec...` 这类 loose data 路径和完整 CDN URL；终点 block key `8bdf...` 是 file-index 内部 block key，不是最终 loose object 名。
+- 已新增纯 Cheng `cdn_fetch`，用 HTTP/1.1 over TCP 直连 CDN，流式写入 `.tmp`，校验 `status=200`、`Content-Length` 和期望大小后再原子 rename 到本地 cache；不会把 CDN blob 整体载入内存。
+- `cdn_fetch.CdnDecodeCachedBlte` 已经能读回缓存的 CDN BLTE blob 并复用现有 BLTE/zlib 解码器；`vfs-root` 从 `34973` 字节 encoded blob 解成 build config 声明的 `55471` 字节 payload。
+- 新增 `tvfs.TvfsParseSummary`，已经能严格解析 CDN `vfs-root` 的 `TVFS` header、ESpec、container table、path tree 和首个 `.root` 文件 span；本机 payload 为 `1178` 个 path node、`311` 个目录、`867` 个文件，`.root` 映射到 content key `4d538d779c8ce517fed1b8718bea2b79`。
+- 新增 `tact_index` partial ekey 唯一补全查询；`wow_export_cdn_root_smoke` 现在直接用 CDN config 的 `file-index` 打开单个 `.index`，把 TVFS `.root` 的 `108aaa378a9a07d9a9` 补全为 `108aaa378a9a07d9a926150259ecbdad`，并拉取 root CDN BLTE。
+- `cdn_fetch.CdnDecodeCachedBlteFirstBlock` 已经能只读缓存 BLTE header + 首块，解出 root 首个 `262144` 字节块并通过 TSFM root header/first entry 验证；避免把 49MB encoded root 和 65MB decoded root 同时常驻。
+- `cdn_fetch.CdnDecodeCachedBlteRange` 已能只读 BLTE header + 目标 block，校验 block MD5 后只解码覆盖目标 decoded range 的块；不再为了查 root 条目全量解码 49MB encoded / 65MB decoded root。
+- `cdn_root.CdnRootFindFileDataIDs` 已改成一趟批量 root lookup，按 decoded block window 扫 group，找到北郡 manifest 全部 fileDataID 后立即停止；不再每个 fileDataID 重复扫 root。
+- 纯 Cheng zlib 热核已从“逐 bit 读 + Huffman 逐 symbol 线性扫”改成字节 bit-buffer、10-bit Huffman fast table、back-reference 非重叠分块复制/distance=1 填充；当前慢点不是 Cheng 运行时整体慢，而是之前解码器热路径粒度错误。
+- 北郡预览不再为了 4 个已审计资产每次全量解码 root/encoding 扫表；新增 `AuditManifestPayloadsAgainstLocal`，只校验 manifest 身份、encoding key 的本地 `.index` 条目、archive/offset/size 和解码 payload MD5。
+- `asset_formats.ParseM2GeometrySummary` 已解析真实 `MD21 -> MD20` M2 顶点数组，按 48 字节顶点 stride 读取 position，并用纯 Cheng IEEE754 fixed-point 解码算出模型包围盒跨度。
+- `wow_export_tool_main preview-northshire --frames 1` 已编译并运行通过，本机输出 `scene=non-empty`、`wmoChunks=17`、`characterVertices=370`、`modelSpan1000=1916,5856,25208`，普通计时约 `2.15s`。
+- CLI 可见摘要函数已避开嵌套 helper 插值导致的 seed materialize 限制；`wow_export_tool_main` 当前可重新编译。
+
 验证：
 
 - `artifacts/backend_driver/cheng run-host-smokes wow_export_casc_smoke wow_export_md5_smoke wow_export_salsa20_smoke wow_export_blte_smoke wow_export_zlib_smoke wow_export_tact_keys_smoke wow_export_encoding_smoke` 通过。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/os_list_dir_stress_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/os_list_dir_stress_smoke && /usr/bin/time -l /tmp/os_list_dir_stress_smoke` 通过。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/os_list_dir_large_snapshot_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/os_list_dir_large_snapshot_smoke && /tmp/os_list_dir_large_snapshot_smoke` 通过。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/os_list_dir_negative_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/os_list_dir_negative_smoke && /tmp/os_list_dir_negative_smoke` 通过。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_tact_index_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_tact_index_smoke && /tmp/wow_export_tact_index_smoke` 通过。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_tact_index_lookup_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_tact_index_lookup_smoke && /usr/bin/time -l /tmp/wow_export_tact_index_lookup_smoke` 通过；本机观测 `real 5.04s`、`peak memory footprint 156631472`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_cdn_config_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_cdn_config_smoke && /usr/bin/time -l /tmp/wow_export_cdn_config_smoke` 通过；本机观测 `real 0.66s`、`peak memory footprint 1130784`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_cdn_fetch_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_cdn_fetch_smoke && /usr/bin/time -l /tmp/wow_export_cdn_fetch_smoke` 通过；本机观测 `real 2.12s`、`peak memory footprint 2113848`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_tvfs_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_tvfs_smoke && /usr/bin/time -l /tmp/wow_export_tvfs_smoke` 通过；本机观测 `real 0.99s`、`peak memory footprint 4456760`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_zlib_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_zlib_smoke` 通过，`/usr/bin/time -l /tmp/wow_export_zlib_smoke` 通过；本机观测 `real 0.65s`、`peak memory footprint 1179936`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_cdn_root_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_cdn_root_smoke` 通过，`/usr/bin/time -l /tmp/wow_export_cdn_root_smoke` 通过；本机观测 `real 0.76s`、`peak memory footprint 5767480`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_cdn_root_lookup_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_cdn_root_lookup_smoke` 通过；`/tmp/wow_export_cdn_root_lookup_smoke` 通过并输出 `wow_export_cdn_root_lookup_smoke ok`，普通运行约 9.45s，运行中 `ps` 采样 RSS `45632KB`。`/usr/bin/time -l` 包装该二进制时会无输出杀进程，未作为有效业务失败采信。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/apps/wow_export/wow_export_tool_main.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_tool_main` 通过。
+- `/usr/bin/time -p /tmp/wow_export_tool_main preview-northshire --frames 1` 通过；本机观测 `real 2.15`。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_asset_formats_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_asset_formats_smoke` 通过，`/tmp/wow_export_asset_formats_smoke` 通过。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_northshire_mvp_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_northshire_mvp_smoke` 通过，`/tmp/wow_export_northshire_mvp_smoke` 通过。
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_memory_probe_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_memory_probe_smoke` 通过，`/tmp/wow_export_memory_probe_smoke` 通过；preview steady delta 当前为 `479`。
 - 纯 Cheng zlib/deflate inflate 已接入 BLTE `0x5a` 块，覆盖 stored/fixed Huffman smoke；dynamic Huffman 解析已实现，后续用真实 encoding/root 读取链路继续压实。
 - `wow_export_tool_main probe` 通过，识别 `wow 12.0.5.67165` 和本地 `.idx`。
 - `wow_export_casc_smoke` 曾因 `.idx` 热循环逐条转 hex 字符串超时；已改为字节级 key prefix 比较后通过。
@@ -24,5 +63,7 @@
 - 之前那批由同名自递归导出壳和 `ref10.feSet` 真源码错误触发的 `primary_object_body_semantics_missing` 已修掉，但当前 wowExport 大闭包仍会触发另一批同类编译器限制。
 - `artifacts/backend_driver/cheng run-host-smokes perf_memory_contract_smoke` 当前剩余失败是 stage3 no-handoff 大 libp2p 冷编译耗时超过默认 30000ms；直接编译报告中 `primary_object_missing_reasons=-`、`object_missing_reasons=-`、`native_link_missing_reasons=-`。
 - 本机 `.build.info` 的 `KeyRing` 指向 `3ca57fe7319a297346440e4d2a03a0cd`，本地 keyring 已能通过 `LoadTactKeyTable` 解析。
+- `Data/data/data.NNN` 的 30 字节本地 header 继续只解释传统 local archive；`.index` 这边的真实文件格式也已经钉住。下一步应该把 CDN root 从“首块验证”推进成按需 range/block 解码，而不是全量 65MB 解码后再扫表。
+- `Data/indices` 大目录现在能稳定快照真实文件名，但 `os_list_dir_stress_smoke` 当前在 256 文件 * 6000 轮下的 `peak memory footprint` 约 `219005456`；这说明库层崩溃已修掉，长热路径的 allocator 回收表现还需要后续单独压。
 - 北郡预览现在会先跑本地审计，再读取已审计资产；剩余缺口是把真实几何/动画数据继续推进成更完整的 MVP，而不是只验证头部和 chunk 边界。
-- 当前工作区重新编译 `wow_export_root_install_smoke`、`wow_export_northshire_mvp_smoke`、`wow_export_memory_probe_smoke` 会撞到现有编译器的 `primary_object_body_semantics_missing`；这次改动的源码门禁已接上，但本地整链复验被这个现有问题阻塞。
+- 当前 `wow_export_northshire_mvp_smoke` 和 `wow_export_memory_probe_smoke` 已重新编译通过；剩余不是编译器阻塞，而是继续把真实资产导出命令从占位推进到可用。

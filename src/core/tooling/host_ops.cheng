@@ -166,8 +166,8 @@ fn RunFileLogged(root: str, label: str, filePathRaw: str, argv: str[], envOverri
                                         0)
         return SpawnedProcessWaitLoggedLive(root, proc, timeoutSec, maxRssBytes, logPathRaw)
     let res: os.ExecCmdResult = ExecFileDirect(filePath, argv, envOverrides, workingDir, timeoutSec, true)
-    let outputText = os.ExecCmdResultOutput(res)
-    let exitCode = os.ExecCmdResultExitCode(res)
+    let outputText = res.output
+    let exitCode = res.exitCode
     let _logged: bool = chengpath.WriteTextFile(root, logPath, outputText)
     return LoggedRunMake(label, filePath, logPath, exitCode, outputText)
 
@@ -227,8 +227,8 @@ fn RunFileLoggedExitCode(root: str,
                                                     maxRssBytes,
                                                     logPathRaw)
     let res: os.ExecCmdResult = ExecFileDirect(filePath, argv, envOverrides, workingDir, timeoutSec, true)
-    let outputText = os.ExecCmdResultOutput(res)
-    let exitCode = os.ExecCmdResultExitCode(res)
+    let outputText = res.output
+    let exitCode = res.exitCode
     let _logged: bool = chengpath.WriteTextFile(root, logPath, outputText)
     return exitCode
 
@@ -356,9 +356,9 @@ fn HostOpsProcessGroupRssBytes(pid: int64): int64 =
                                                          "",
                                                          true,
                                                          2)
-    if os.ExecCmdResultExitCode(psRun) != 0:
+    if psRun.exitCode != 0:
         return int64(-1)
-    let text: str = os.ExecCmdResultOutput(psRun)
+    let text: str = psRun.output
     var totalKb: int64
     var lineStart: int32
     var i: int32
@@ -393,9 +393,9 @@ fn HostOpsCurrentRssBytes(): int64 =
                                                          "",
                                                          true,
                                                          2)
-    if os.ExecCmdResultExitCode(psRun) != 0:
+    if psRun.exitCode != 0:
         return int64(-1)
-    let kb: int64 = HostOpsParseUnsignedInt64(os.ExecCmdResultOutput(psRun))
+    let kb: int64 = HostOpsParseUnsignedInt64(psRun.output)
     if kb <= int64(0):
         return int64(-1)
     return kb * int64(1024)
@@ -481,8 +481,11 @@ fn HostOpsAppendLiveLog(proc: var SpawnedProcess) =
     if logLen == proc.liveLogLen:
         return
     let chunk: str = strings.SliceBytes(logText, proc.liveLogLen, logLen - proc.liveLogLen)
-    proc.output = proc.output + chunk
+    proc.output = strings.ConcatStr(proc.output, chunk)
     proc.liveLogLen = logLen
+
+fn SpawnedProcessAppendOutput(proc: var SpawnedProcess, chunk: str) =
+    proc.output = strings.ConcatStr(proc.output, chunk)
 
 fn SpawnedProcessCloseRead(proc: var SpawnedProcess) =
     if proc.readFd >= 0:
@@ -527,13 +530,12 @@ fn SpawnedProcessDrain(proc: var SpawnedProcess, timeoutMs: int32) =
         let readRes = hostos.FdReadWait(proc.readFd, 65536, waitMs)
         let chunk = readRes.text
         let eof = readRes.eof
-        if strings.Len(chunk) > 0:
-            proc.output = proc.output + chunk
-            waitMs = 0
-            continue
-        if eof:
-            SpawnedProcessCloseRead(proc)
-        break
+        if strings.Len(chunk) <= 0:
+            if eof:
+                SpawnedProcessCloseRead(proc)
+            break
+        SpawnedProcessAppendOutput(proc, chunk)
+        waitMs = 0
 
 fn SpawnedProcessSignal(proc: SpawnedProcess, signalCode: int32): bool =
     if proc.pid <= 0:

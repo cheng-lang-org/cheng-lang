@@ -340,7 +340,7 @@ fn CompilerLegacyMigrationClone(migration: CompilerLegacyMigration): CompilerLeg
 fn CompilerCsgAppendText(buf: var layout.ByteBuf, text: str) =
     lt.AppendU32BE(buf, len(text))
     for i in 0..<len(text):
-        layout.byteBufAppendByte(buf, int32(text[i]) & 255)
+        layout.ByteBufAppendByte(buf, int32(text[i]) & 255)
 
 fn CompilerCsgExprDetailText(kind: parser.NormalizedExprKind,
                                detailKind: parser.NormalizedExprDetailKind): str =
@@ -437,8 +437,8 @@ fn CompilerCsgAppendExprCompatDetail(buf: var layout.ByteBuf,
     CompilerCsgAppendText(buf, CompilerCsgExprCompatDetail(expr))
 
 fn CompilerCsgBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
-    let data = layout.byteBufToBytes(buf)
-    return hash256.sha256Fixed(layout.byteSpanFromBytes(data))
+    let data = layout.ByteBufToBytes(buf)
+    return hash256.sha256Fixed(layout.ByteSpanFromBytes(data))
 
 fn CompilerCsgExprCompatDetailStable(workspaceRoot: str,
                                        packageRoot: str,
@@ -578,7 +578,7 @@ fn CompilerCsgHashNode(nodeKind: int32,
                          entryFlag: int32,
                          exportedFlag: int32,
                          exportSymbolName: str): layout.FixedBytes32 =
-    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerCsgAppendText(buf, "cheng.compiler.csg.node")
     lt.AppendU32BE(buf, nodeKind)
     lt.AppendU32BE(buf, ownerNodeId)
@@ -597,7 +597,7 @@ fn CompilerCsgHashNode(nodeKind: int32,
 fn CompilerCsgHashEdge(fromNodeId: int32,
                          toNodeId: int32,
                          edgeKind: int32): layout.FixedBytes32 =
-    var buf: layout.ByteBuf = layout.byteBufInit(96)
+    var buf: layout.ByteBuf = layout.ByteBufInit(96)
     CompilerCsgAppendText(buf, "cheng.compiler.csg.edge")
     lt.AppendU32BE(buf, fromNodeId)
     lt.AppendU32BE(buf, toNodeId)
@@ -614,7 +614,7 @@ fn CompilerCsgGraphCid(packageId: str,
                          typedExprFacts: TypedExprFact[],
                          nodes: CompilerCsgNode[],
                          edges: CompilerCsgEdge[]): layout.FixedBytes32 =
-    var buf: layout.ByteBuf = layout.byteBufInit(512)
+    var buf: layout.ByteBuf = layout.ByteBufInit(512)
     CompilerCsgAppendText(buf, "cheng.compiler.csg.graph")
     CompilerCsgAppendText(buf, packageId)
     lt.AppendFixed32(buf, sourceBundleCid)
@@ -667,7 +667,7 @@ fn CompilerCsgCanonicalGraphCid(packageId: str,
                                   typedExprFacts: TypedExprFact[],
                                   nodes: CompilerCsgNode[],
                                   edges: CompilerCsgEdge[]): layout.FixedBytes32 =
-    var buf: layout.ByteBuf = layout.byteBufInit(512)
+    var buf: layout.ByteBuf = layout.ByteBufInit(512)
     CompilerCsgAppendText(buf, "cheng.compiler.csg.canonical_graph")
     CompilerCsgAppendText(buf, packageId)
     let _ = sourceBundleCid
@@ -1081,9 +1081,11 @@ fn CompilerLegacyRewriteSeqTypes(textRaw: str,
             continue
         let inner = chengpath.TextSlice(text, i + 4, closePos - (i + 4))
         let replacement = strutil.Strip(inner) + "[]"
-        text = chengpath.TextSlice(text, 0, i) +
-               replacement +
-               chengpath.TextSlice(text, closePos + 1, len(text) - (closePos + 1))
+        let prefix = chengpath.TextSlice(text, 0, i)
+        let suffix = chengpath.TextSlice(text, closePos + 1, len(text) - (closePos + 1))
+        var rewritten = prefix + replacement
+        rewritten = rewritten + suffix
+        text = rewritten
         outAppliedCount = outAppliedCount + 1
         i = i + len(replacement)
     return text
@@ -1111,9 +1113,11 @@ fn CompilerLegacyRewriteArrayTypes(textRaw: str,
         let elemText = strutil.Strip(chengpath.TextSlice(inner, 0, commaPos))
         let lenText = strutil.Strip(chengpath.TextSlice(inner, commaPos + 1, len(inner) - (commaPos + 1)))
         let replacement = elemText + "[" + lenText + "]"
-        text = chengpath.TextSlice(text, 0, i) +
-               replacement +
-               chengpath.TextSlice(text, closePos + 1, len(text) - (closePos + 1))
+        let prefix = chengpath.TextSlice(text, 0, i)
+        let suffix = chengpath.TextSlice(text, closePos + 1, len(text) - (closePos + 1))
+        var rewritten = prefix + replacement
+        rewritten = rewritten + suffix
+        text = rewritten
         outAppliedCount = outAppliedCount + 1
         i = i + len(replacement)
     return text
@@ -1385,7 +1389,7 @@ fn BuildCompilerLegacyMigration(workspaceRoot: str,
         return Err[CompilerLegacyMigration](Error(csgRes))
     let csg = CompilerCsgClone(Value(csgRes))
     let surface = CompilerExportSurfaceClone(CompilerExportSurfaceFromCsg(csg))
-    var migBuf: layout.ByteBuf = layout.byteBufInit(256)
+    var migBuf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerCsgAppendText(migBuf, "cheng.compiler.legacy_migration")
     CompilerCsgAppendText(migBuf, packageId)
     CompilerCsgAppendText(migBuf, entrySourcePath)
@@ -1420,12 +1424,12 @@ fn CompilerLegacyMigrationReport(migration: CompilerLegacyMigration): str =
     out = out + "entry_module_path=" + migration.entryModulePath + "\n"
     out = out + "unit_count=" + intToStr(migration.unitCount) + "\n"
     out = out + "applied_rule_count=" + intToStr(migration.appliedRuleCount) + "\n"
-    out = out + "legacy_source_bundle_cid=" + layout.fixedBytes32Hex(migration.legacySourceBundleCid) + "\n"
-    out = out + "migrated_source_bundle_cid=" + layout.fixedBytes32Hex(migration.migratedSourceBundleCid) + "\n"
-    out = out + "canonical_graph_cid=" + layout.fixedBytes32Hex(migration.compilerCsg.canonicalGraphCid) + "\n"
-    out = out + "graph_cid=" + layout.fixedBytes32Hex(migration.compilerCsg.graphCid) + "\n"
-    out = out + "surface_cid=" + layout.fixedBytes32Hex(migration.exportSurface.surfaceCid) + "\n"
-    out = out + "migration_cid=" + layout.fixedBytes32Hex(migration.migrationCid)
+    out = out + "legacy_source_bundle_cid=" + layout.FixedBytes32Hex(migration.legacySourceBundleCid) + "\n"
+    out = out + "migrated_source_bundle_cid=" + layout.FixedBytes32Hex(migration.migratedSourceBundleCid) + "\n"
+    out = out + "canonical_graph_cid=" + layout.FixedBytes32Hex(migration.compilerCsg.canonicalGraphCid) + "\n"
+    out = out + "graph_cid=" + layout.FixedBytes32Hex(migration.compilerCsg.graphCid) + "\n"
+    out = out + "surface_cid=" + layout.FixedBytes32Hex(migration.exportSurface.surfaceCid) + "\n"
+    out = out + "migration_cid=" + layout.FixedBytes32Hex(migration.migrationCid)
     for i in 0..<migration.appliedRules.len:
         out = out + "\n" + "applied_rule[" + intToStr(i) + "]=" + migration.appliedRules[i]
     return out
@@ -1542,7 +1546,7 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
     packageNode.entryFlag = 0
     packageNode.exportedFlag = 0
     packageNode.exportSymbolName = ""
-    var packageBuf: layout.ByteBuf = layout.byteBufInit(256)
+    var packageBuf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerCsgAppendText(packageBuf, "cheng.compiler.csg.node")
     lt.AppendU32BE(packageBuf, packageNode.nodeKind)
     lt.AppendU32BE(packageBuf, packageNode.ownerNodeId)
@@ -1574,7 +1578,7 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
         moduleNode.entryFlag = 0
         moduleNode.exportedFlag = 0
         moduleNode.exportSymbolName = ""
-        var moduleBuf: layout.ByteBuf = layout.byteBufInit(256)
+        var moduleBuf: layout.ByteBuf = layout.ByteBufInit(256)
         CompilerCsgAppendText(moduleBuf, "cheng.compiler.csg.node")
         lt.AppendU32BE(moduleBuf, moduleNode.nodeKind)
         lt.AppendU32BE(moduleBuf, moduleNode.ownerNodeId)
@@ -1731,7 +1735,7 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
             symbolNode.entryFlag = entryFlag
             symbolNode.exportedFlag = exportedFlag
             symbolNode.exportSymbolName = exportSymbolName
-            var symbolBuf: layout.ByteBuf = layout.byteBufInit(256)
+            var symbolBuf: layout.ByteBuf = layout.ByteBufInit(256)
             CompilerCsgAppendText(symbolBuf, "cheng.compiler.csg.node")
             lt.AppendU32BE(symbolBuf, symbolNode.nodeKind)
             lt.AppendU32BE(symbolBuf, symbolNode.ownerNodeId)
@@ -1763,7 +1767,7 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
             layoutNode.entryFlag = entryFlag
             layoutNode.exportedFlag = 0
             layoutNode.exportSymbolName = ""
-            var layoutBuf: layout.ByteBuf = layout.byteBufInit(256)
+            var layoutBuf: layout.ByteBuf = layout.ByteBufInit(256)
             CompilerCsgAppendText(layoutBuf, "cheng.compiler.csg.node")
             lt.AppendU32BE(layoutBuf, layoutNode.nodeKind)
             lt.AppendU32BE(layoutBuf, layoutNode.ownerNodeId)
@@ -1794,7 +1798,7 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
             effectNode.entryFlag = entryFlag
             effectNode.exportedFlag = 0
             effectNode.exportSymbolName = ""
-            var effectBuf: layout.ByteBuf = layout.byteBufInit(256)
+            var effectBuf: layout.ByteBuf = layout.ByteBufInit(256)
             CompilerCsgAppendText(effectBuf, "cheng.compiler.csg.node")
             lt.AppendU32BE(effectBuf, effectNode.nodeKind)
             lt.AppendU32BE(effectBuf, effectNode.ownerNodeId)
@@ -1825,7 +1829,7 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
             capabilityNode.entryFlag = entryFlag
             capabilityNode.exportedFlag = 0
             capabilityNode.exportSymbolName = ""
-            var capabilityBuf: layout.ByteBuf = layout.byteBufInit(256)
+            var capabilityBuf: layout.ByteBuf = layout.ByteBufInit(256)
             CompilerCsgAppendText(capabilityBuf, "cheng.compiler.csg.node")
             lt.AppendU32BE(capabilityBuf, capabilityNode.nodeKind)
             lt.AppendU32BE(capabilityBuf, capabilityNode.ownerNodeId)
@@ -1911,7 +1915,7 @@ fn CompilerExportSurfaceFromCsg(csg: CompilerCsg): CsgExportSurface =
         add(out.exportedEffects, node.effectKind)
         add(out.exportedCapabilities, node.capabilityKind)
     out.exportedSymbolCount = out.exportedSymbols.len
-    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerCsgAppendText(buf, "cheng.compiler.export_surface")
     CompilerCsgAppendText(buf, out.packageId)
     lt.AppendU32BE(buf, out.exportedSymbolCount)
@@ -1951,7 +1955,7 @@ fn CompileReceiptMake(worldHeadCid: layout.FixedBytes32,
                         canonicalOutputDigest: layout.FixedBytes32,
                         bootstrapStage: str,
                         runtimeProviderSet: str[]): CompileReceipt =
-    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerCsgAppendText(buf, "cheng.compiler.compile_receipt")
     lt.AppendFixed32(buf, worldHeadCid)
     lt.AppendFixed32(buf, compilerCsgCid)
@@ -1980,7 +1984,7 @@ fn CompileOutputDigest(outputPath: str,
                          targetTriple: str,
                          providerModules: str[],
                          csgCid: layout.FixedBytes32): layout.FixedBytes32 =
-    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerCsgAppendText(buf, "cheng.compiler.output_digest")
     let _ = outputPath
     CompilerCsgAppendText(buf, targetTriple)
@@ -1996,7 +2000,7 @@ fn CompilerCsgReport(csg: CompilerCsg): str =
     let loweringRules = texpr.TypedExprLoweringRulesFromFacts(typedExprFacts)
     out = out + "version=1\n"
     out = out + "package_id=" + csg.packageId + "\n"
-    out = out + "source_bundle_cid=" + layout.fixedBytes32Hex(csg.sourceBundleCid) + "\n"
+    out = out + "source_bundle_cid=" + layout.FixedBytes32Hex(csg.sourceBundleCid) + "\n"
     out = out + "expr_surface_source_count=" + intToStr(csg.exprLayer.sourceCount) + "\n"
     out = out + "expr_surface_expr_count=" + intToStr(parser.NormalizedExprLayerExprCount(csg.exprLayer)) + "\n"
     out = out + "expr_surface_if_count=" + intToStr(parser.NormalizedExprLayerIfCount(csg.exprLayer)) + "\n"
@@ -2009,8 +2013,8 @@ fn CompilerCsgReport(csg: CompilerCsg): str =
     out = out + "expr_surface_constructor_count=" + intToStr(parser.NormalizedExprLayerConstructorCount(csg.exprLayer)) + "\n"
     out = out + "expr_surface_question_residual_count=" + intToStr(csg.exprLayer.questionResidualCount) + "\n"
     out = out + texpr.TypedExprReportText(typedExprFacts, loweringRules)
-    out = out + "canonical_graph_cid=" + layout.fixedBytes32Hex(csg.canonicalGraphCid) + "\n"
-    out = out + "graph_cid=" + layout.fixedBytes32Hex(csg.graphCid) + "\n"
+    out = out + "canonical_graph_cid=" + layout.FixedBytes32Hex(csg.canonicalGraphCid) + "\n"
+    out = out + "graph_cid=" + layout.FixedBytes32Hex(csg.graphCid) + "\n"
     out = out + "node_count=" + intToStr(csg.nodeCount) + "\n"
     out = out + "edge_count=" + intToStr(csg.edgeCount)
     for i in 0..<csg.nodes.len:
@@ -2023,9 +2027,9 @@ fn CompilerCsgWireReport(csg: CompilerCsg): str =
     var out = ""
     out = out + "version=1\n"
     out = out + "package_id=" + csg.packageId + "\n"
-    out = out + "source_bundle_cid=" + layout.fixedBytes32Hex(csg.sourceBundleCid) + "\n"
-    out = out + "canonical_graph_cid=" + layout.fixedBytes32Hex(csg.canonicalGraphCid) + "\n"
-    out = out + "graph_cid=" + layout.fixedBytes32Hex(csg.graphCid) + "\n"
+    out = out + "source_bundle_cid=" + layout.FixedBytes32Hex(csg.sourceBundleCid) + "\n"
+    out = out + "canonical_graph_cid=" + layout.FixedBytes32Hex(csg.canonicalGraphCid) + "\n"
+    out = out + "graph_cid=" + layout.FixedBytes32Hex(csg.graphCid) + "\n"
     out = out + "node_count=" + intToStr(csg.nodeCount) + "\n"
     out = out + "edge_count=" + intToStr(csg.edgeCount)
     return out
@@ -2046,7 +2050,7 @@ fn CompilerCsgNodeReportLine(index: int32,
     out = out + intToStr(node.entryFlag) + "|"
     out = out + intToStr(node.exportedFlag) + "|"
     out = out + node.exportSymbolName + "|"
-    out = out + layout.fixedBytes32Hex(node.factCid)
+    out = out + layout.FixedBytes32Hex(node.factCid)
     return out
 
 fn CompilerCsgEdgeReportLine(index: int32,
@@ -2056,7 +2060,7 @@ fn CompilerCsgEdgeReportLine(index: int32,
     out = out + intToStr(edge.edgeKind) + "|"
     out = out + intToStr(edge.fromNodeId) + "|"
     out = out + intToStr(edge.toNodeId) + "|"
-    out = out + layout.fixedBytes32Hex(edge.edgeCid)
+    out = out + layout.FixedBytes32Hex(edge.edgeCid)
     return out
 
 fn CompilerExportSurfaceReport(surface: CsgExportSurface): str =
@@ -2064,7 +2068,7 @@ fn CompilerExportSurfaceReport(surface: CsgExportSurface): str =
     out = out + "version=1\n"
     out = out + "package_id=" + surface.packageId + "\n"
     out = out + "exported_count=" + intToStr(surface.exportedSymbolCount) + "\n"
-    out = out + "surface_cid=" + layout.fixedBytes32Hex(surface.surfaceCid)
+    out = out + "surface_cid=" + layout.FixedBytes32Hex(surface.surfaceCid)
     for i in 0..<surface.exportedSymbolCount:
         out = out + "\n" + CompilerExportSurfaceReportLine(surface, i)
     return out
@@ -2120,7 +2124,7 @@ fn CompilerExportSurfaceFromReportText(text: str,
     out.exportedLayouts = []
     out.exportedEffects = []
     out.exportedCapabilities = []
-    let surfaceCidRes = layout.fixedBytes32FromHex(compilerCsgLineValue(text, "surface_cid"))
+    let surfaceCidRes = layout.FixedBytes32FromHex(compilerCsgLineValue(text, "surface_cid"))
     if IsErr(surfaceCidRes):
         return Err[bool](" compiler csg: invalid surface cid")
     let surfaceCid = Value(surfaceCidRes)
@@ -2205,26 +2209,26 @@ fn CompilerCsgGraphCidFromReportText(text: str): Result[layout.FixedBytes32] =
     let raw = compilerCsgLineValue(text, "graph_cid")
     if len(raw) <= 0:
         return Err[layout.FixedBytes32](" compiler csg: graph_cid missing")
-    return layout.fixedBytes32FromHex(raw)
+    return layout.FixedBytes32FromHex(raw)
 
 fn CompilerCsgCanonicalGraphCidFromReportText(text: str): Result[layout.FixedBytes32] =
     let raw = compilerCsgLineValue(text, "canonical_graph_cid")
     if len(raw) > 0:
-        return layout.fixedBytes32FromHex(raw)
+        return layout.FixedBytes32FromHex(raw)
     return CompilerCsgGraphCidFromReportText(text)
 
 fn CompileReceiptReport(receipt: CompileReceipt): str =
     var out = ""
     out = out + "version=1\n"
-    out = out + "world_head_cid=" + layout.fixedBytes32Hex(receipt.worldHeadCid) + "\n"
-    out = out + "compiler_csg_cid=" + layout.fixedBytes32Hex(receipt.compilerCsgCid) + "\n"
-    out = out + "canonical_compiler_csg_cid=" + layout.fixedBytes32Hex(receipt.canonicalCompilerCsgCid) + "\n"
+    out = out + "world_head_cid=" + layout.FixedBytes32Hex(receipt.worldHeadCid) + "\n"
+    out = out + "compiler_csg_cid=" + layout.FixedBytes32Hex(receipt.compilerCsgCid) + "\n"
+    out = out + "canonical_compiler_csg_cid=" + layout.FixedBytes32Hex(receipt.canonicalCompilerCsgCid) + "\n"
     out = out + "target=" + receipt.targetTriple + "\n"
-    out = out + "output_digest=" + layout.fixedBytes32Hex(receipt.outputDigest) + "\n"
-    out = out + "canonical_output_digest=" + layout.fixedBytes32Hex(receipt.canonicalOutputDigest) + "\n"
+    out = out + "output_digest=" + layout.FixedBytes32Hex(receipt.outputDigest) + "\n"
+    out = out + "canonical_output_digest=" + layout.FixedBytes32Hex(receipt.canonicalOutputDigest) + "\n"
     out = out + "bootstrap_stage=" + receipt.bootstrapStage + "\n"
     out = out + "runtime_provider_count=" + intToStr(receipt.runtimeProviderSet.len) + "\n"
-    out = out + "receipt_cid=" + layout.fixedBytes32Hex(receipt.receiptCid)
+    out = out + "receipt_cid=" + layout.FixedBytes32Hex(receipt.receiptCid)
     for i in 0..<receipt.runtimeProviderSet.len:
         out = out + "\n" + CompileReceiptProviderReportLine(receipt.runtimeProviderSet[i], i)
     return out
@@ -2238,32 +2242,32 @@ fn CompileReceiptProviderReportLine(provider: str,
 
 fn CompileReceiptFromReportText(text: str,
                                   out: var CompileReceipt): Result[bool] =
-    let worldHeadRes = layout.fixedBytes32FromHex(compilerCsgLineValue(text, "world_head_cid"))
+    let worldHeadRes = layout.FixedBytes32FromHex(compilerCsgLineValue(text, "world_head_cid"))
     if IsErr(worldHeadRes):
         return Err[bool](" compiler csg: invalid world_head_cid")
-    let csgRes = layout.fixedBytes32FromHex(compilerCsgLineValue(text, "compiler_csg_cid"))
+    let csgRes = layout.FixedBytes32FromHex(compilerCsgLineValue(text, "compiler_csg_cid"))
     if IsErr(csgRes):
         return Err[bool](" compiler csg: invalid compiler_csg_cid")
     let canonicalCsgRaw = compilerCsgLineValue(text, "canonical_compiler_csg_cid")
     var canonicalCsgRes: Result[layout.FixedBytes32]
     if len(canonicalCsgRaw) > 0:
-        canonicalCsgRes = layout.fixedBytes32FromHex(canonicalCsgRaw)
+        canonicalCsgRes = layout.FixedBytes32FromHex(canonicalCsgRaw)
     else:
-        canonicalCsgRes = layout.fixedBytes32FromHex(compilerCsgLineValue(text, "compiler_csg_cid"))
+        canonicalCsgRes = layout.FixedBytes32FromHex(compilerCsgLineValue(text, "compiler_csg_cid"))
     if IsErr(canonicalCsgRes):
         return Err[bool](" compiler csg: invalid canonical_compiler_csg_cid")
-    let digestRes = layout.fixedBytes32FromHex(compilerCsgLineValue(text, "output_digest"))
+    let digestRes = layout.FixedBytes32FromHex(compilerCsgLineValue(text, "output_digest"))
     if IsErr(digestRes):
         return Err[bool](" compiler csg: invalid output_digest")
     let canonicalDigestRaw = compilerCsgLineValue(text, "canonical_output_digest")
     var canonicalDigestRes: Result[layout.FixedBytes32]
     if len(canonicalDigestRaw) > 0:
-        canonicalDigestRes = layout.fixedBytes32FromHex(canonicalDigestRaw)
+        canonicalDigestRes = layout.FixedBytes32FromHex(canonicalDigestRaw)
     else:
-        canonicalDigestRes = layout.fixedBytes32FromHex(compilerCsgLineValue(text, "output_digest"))
+        canonicalDigestRes = layout.FixedBytes32FromHex(compilerCsgLineValue(text, "output_digest"))
     if IsErr(canonicalDigestRes):
         return Err[bool](" compiler csg: invalid canonical_output_digest")
-    let receiptCidRes = layout.fixedBytes32FromHex(compilerCsgLineValue(text, "receipt_cid"))
+    let receiptCidRes = layout.FixedBytes32FromHex(compilerCsgLineValue(text, "receipt_cid"))
     if IsErr(receiptCidRes):
         return Err[bool](" compiler csg: invalid receipt_cid")
     out.version = 1
@@ -2306,11 +2310,11 @@ fn CompileReceiptRuntimeProviderSetEqual(left: str[],
 
 fn CompileReceiptEquivalent(base: CompileReceipt,
                               next: CompileReceipt): bool =
-    if !layout.fixedBytes32Equal(base.canonicalCompilerCsgCid, next.canonicalCompilerCsgCid):
+    if !layout.FixedBytes32Equal(base.canonicalCompilerCsgCid, next.canonicalCompilerCsgCid):
         return false
     if base.targetTriple != next.targetTriple:
         return false
-    if !layout.fixedBytes32Equal(base.canonicalOutputDigest, next.canonicalOutputDigest):
+    if !layout.FixedBytes32Equal(base.canonicalOutputDigest, next.canonicalOutputDigest):
         return false
     if base.bootstrapStage != next.bootstrapStage:
         return false

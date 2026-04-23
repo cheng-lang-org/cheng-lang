@@ -1,4 +1,5 @@
 import std/bytes as bytes
+import std/rawmem_support as rawmem_support
 import std/result
 import std/seqs
 import std/strings as strings
@@ -10,15 +11,21 @@ type
         buf: bytes.ByteBuffer
         bitPos: int32
         endBit: int32
+        bitBuf: int32
+        bitCount: int32
 
     HuffmanTable =
         codes: int32[]
         lengths: int32[]
+        fastSymbols: int32[]
+        fastLengths: int32[]
         symbolCount: int32
         maxBits: int32
+        fastBits: int32
 
 const
     ZlibAdlerMod = 65521
+    ZlibFastDecodeBits = 10
 
 fn zlibMakeByteBuffer(len: int32): bytes.ByteBuffer =
     var out: bytes.ByteBuffer
@@ -38,26 +45,65 @@ fn zlibMakeIntArray(count: int32, value: int32): int32[] =
         i = i + 1
     return out
 
-fn zlibReadBits(r: var DeflateBitReader, count: int32): Result[int32] =
+fn zlibBitMask(count: int32): int32 =
+    if count <= 0:
+        return 0
+    return (1 << count) - 1
+
+fn zlibRemainingBits(r: DeflateBitReader): int32 =
+    return r.bitCount + (r.endBit - r.bitPos)
+
+fn zlibEnsureBits(r: var DeflateBitReader, count: int32): Result[bool] =
     if count < 0 || count > 24:
-        return Err[int32]("wowExport zlib: invalid bit count")
-    var out: int32
-    var shift: int32
-    while shift < count:
+        return Err[bool]("wowExport zlib: invalid bit count")
+    while r.bitCount < count:
         if r.bitPos >= r.endBit:
-            return Err[int32]("wowExport zlib: truncated deflate bitstream")
+            return Err[bool]("wowExport zlib: truncated deflate bitstream")
         let byteIdx: int32 = r.bitPos / 8
         let bitIdx: int32 = r.bitPos % 8
-        let bit: int32 = (bytes.BufByteAt(r.buf, byteIdx) >> bitIdx) & 1
-        out = out | (bit << shift)
-        r.bitPos = r.bitPos + 1
-        shift = shift + 1
+        var takeBits: int32 = 8 - bitIdx
+        if r.bitPos + takeBits > r.endBit:
+            takeBits = r.endBit - r.bitPos
+        let byteValue: int32 = (bytes.BufByteAt(r.buf, byteIdx) >> bitIdx) & zlibBitMask(takeBits)
+        r.bitBuf = r.bitBuf | (byteValue << r.bitCount)
+        r.bitCount = r.bitCount + takeBits
+        r.bitPos = r.bitPos + takeBits
+    return Ok[bool](true)
+
+fn zlibReadBits(r: var DeflateBitReader, count: int32): Result[int32] =
+    let ensureRes: Result[bool] = zlibEnsureBits(r, count)
+    if IsErr(ensureRes):
+        return Err[int32](Error(ensureRes))
+    let out: int32 = r.bitBuf & zlibBitMask(count)
+    r.bitBuf = r.bitBuf >> count
+    r.bitCount = r.bitCount - count
     return Ok[int32](out)
 
-fn zlibAlignByte(r: var DeflateBitReader) =
-    let rem: int32 = r.bitPos % 8
+fn zlibPeekBits(r: var DeflateBitReader, count: int32): Result[int32] =
+    let ensureRes: Result[bool] = zlibEnsureBits(r, count)
+    if IsErr(ensureRes):
+        return Err[int32](Error(ensureRes))
+    return Ok[int32](r.bitBuf & zlibBitMask(count))
+
+fn zlibDropBits(r: var DeflateBitReader, count: int32): Result[bool] =
+    let ensureRes: Result[bool] = zlibEnsureBits(r, count)
+    if IsErr(ensureRes):
+        return Err[bool](Error(ensureRes))
+    r.bitBuf = r.bitBuf >> count
+    r.bitCount = r.bitCount - count
+    return Ok[bool](true)
+
+fn zlibConsumedBitPos(r: DeflateBitReader): int32 =
+    return r.bitPos - r.bitCount
+
+fn zlibAlignByte(r: var DeflateBitReader): Result[bool] =
+    let rem: int32 = zlibConsumedBitPos(r) % 8
     if rem != 0:
-        r.bitPos = r.bitPos + (8 - rem)
+        let dropCount: int32 = 8 - rem
+        let dropRes: Result[bool] = zlibDropBits(r, dropCount)
+        if IsErr(dropRes):
+            return Err[bool](Error(dropRes))
+    return Ok[bool](true)
 
 fn zlibReverseBits(value: int32, count: int32): int32 =
     var out: int32
@@ -66,6 +112,14 @@ fn zlibReverseBits(value: int32, count: int32): int32 =
         out = (out << 1) | ((value >> i) & 1)
         i = i + 1
     return out
+
+fn zlibFastTableSize(maxBits: int32): int32 =
+    return 1 << maxBits
+
+fn zlibFastBitsFor(maxBits: int32): int32 =
+    if maxBits < ZlibFastDecodeBits:
+        return maxBits
+    return ZlibFastDecodeBits
 
 fn zlibBuildHuffman(lengths: int32[], maxBits: int32): Result[HuffmanTable] =
     if maxBits <= 0 || maxBits > 15:
@@ -105,12 +159,24 @@ fn zlibBuildHuffman(lengths: int32[], maxBits: int32): Result[HuffmanTable] =
     out.lengths = zlibMakeIntArray(symbolCount, 0)
     out.symbolCount = symbolCount
     out.maxBits = maxBits
+    out.fastBits = zlibFastBitsFor(maxBits)
+    let fastSize: int32 = zlibFastTableSize(out.fastBits)
+    out.fastSymbols = zlibMakeIntArray(fastSize, -1)
+    out.fastLengths = zlibMakeIntArray(fastSize, 0)
     i = 0
     while i < symbolCount:
         let length: int32 = lengths[i]
         out.lengths[i] = length
         if length > 0:
-            out.codes[i] = zlibReverseBits(nextCodes[length], length)
+            let reversedCode: int32 = zlibReverseBits(nextCodes[length], length)
+            out.codes[i] = reversedCode
+            if length <= out.fastBits:
+                let step: int32 = 1 << length
+                var fastIndex: int32 = reversedCode
+                while fastIndex < fastSize:
+                    out.fastSymbols[fastIndex] = i
+                    out.fastLengths[fastIndex] = length
+                    fastIndex = fastIndex + step
             nextCodes[length] = nextCodes[length] + 1
         i = i + 1
     return Ok[HuffmanTable](out)
@@ -127,9 +193,22 @@ fn zlibEmptyHuffman(): HuffmanTable =
     var out: HuffmanTable
     out.maxBits = 0
     out.symbolCount = 0
+    out.fastBits = 0
     return out
 
 fn zlibDecodeSymbol(r: var DeflateBitReader, table: HuffmanTable): Result[int32] =
+    if table.fastBits > 0 && table.fastSymbols.len > 0 && zlibRemainingBits(r) >= table.fastBits:
+        let peekRes: Result[int32] = zlibPeekBits(r, table.fastBits)
+        if IsOk(peekRes):
+            let fastIndex: int32 = Value(peekRes)
+            if fastIndex >= 0 && fastIndex < table.fastSymbols.len:
+                let symbol: int32 = table.fastSymbols[fastIndex]
+                let length: int32 = table.fastLengths[fastIndex]
+                if symbol >= 0 && length > 0:
+                    let dropRes: Result[bool] = zlibDropBits(r, length)
+                    if IsErr(dropRes):
+                        return Err[int32](Error(dropRes))
+                    return Ok[int32](symbol)
     var code: int32
     var bits: int32 = 1
     while bits <= table.maxBits:
@@ -253,6 +332,33 @@ fn zlibDistanceExtraBits(code: int32): int32 =
     if code <= 27: return 12
     return 13
 
+fn zlibCopyBackReference(out: bytes.ByteBuffer,
+                         outPos: var int32,
+                         distance: int32,
+                         length: int32): Result[bool] =
+    if distance <= 0 || distance > outPos || length < 0:
+        return Err[bool]("wowExport zlib: invalid back-reference distance")
+    if outPos + length > out.len:
+        return Err[bool]("wowExport zlib: back-reference exceeds expected size")
+    if length == 0:
+        return Ok[bool](true)
+    if distance == 1:
+        let value: int32 = bytes.BufByteAt(out, outPos - 1)
+        rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(out.data, outPos), value, length)
+        outPos = outPos + length
+        return Ok[bool](true)
+    var copied: int32
+    while copied < length:
+        var chunk: int32 = distance
+        if chunk > length - copied:
+            chunk = length - copied
+        rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(out.data, outPos + copied),
+            rawmem_support.RawmemPtrAdd(out.data, outPos + copied - distance),
+            chunk)
+        copied = copied + chunk
+    outPos = outPos + length
+    return Ok[bool](true)
+
 fn zlibInflateCodes(r: var DeflateBitReader,
                 literalTable: HuffmanTable,
                 distanceTable: HuffmanTable,
@@ -291,22 +397,17 @@ fn zlibInflateCodes(r: var DeflateBitReader,
                 if IsErr(distExtraRes):
                     return Err[bool](Error(distExtraRes))
                 distance = distance + Value(distExtraRes)
-            if distance <= 0 || distance > outPos:
-                return Err[bool]("wowExport zlib: invalid back-reference distance")
-            var copied: int32
-            while copied < length:
-                if outPos >= out.len:
-                    return Err[bool]("wowExport zlib: back-reference exceeds expected size")
-                let value: int32 = bytes.BufByteAt(out, outPos - distance)
-                bytes.BufSetByte(out, outPos, value)
-                outPos = outPos + 1
-                copied = copied + 1
+            let copyRes: Result[bool] = zlibCopyBackReference(out, outPos, distance, length)
+            if IsErr(copyRes):
+                return Err[bool](Error(copyRes))
         else:
             return Err[bool]("wowExport zlib: invalid literal/length symbol")
     return Ok[bool](true)
 
 fn zlibInflateStoredBlock(r: var DeflateBitReader, out: bytes.ByteBuffer, outPos: var int32): Result[bool] =
-    zlibAlignByte(r)
+    let alignRes: Result[bool] = zlibAlignByte(r)
+    if IsErr(alignRes):
+        return Err[bool](Error(alignRes))
     let lenRes: Result[int32] = zlibReadBits(r, 16)
     let nlenRes: Result[int32] = zlibReadBits(r, 16)
     if IsErr(lenRes):
@@ -444,7 +545,8 @@ fn zlibInflateDynamicBlock(r: var DeflateBitReader, out: bytes.ByteBuffer, outPo
         let lenRes: Result[int32] = zlibReadBits(r, 3)
         if IsErr(lenRes):
             return Err[bool](Error(lenRes))
-        codeLengths[zlibCodeLengthOrder(i)] = Value(lenRes)
+        let orderIndex: int32 = zlibCodeLengthOrder(i)
+        codeLengths[orderIndex] = Value(lenRes)
         i = i + 1
     let codeLengthTableRes: Result[HuffmanTable] = zlibBuildHuffman(codeLengths, 7)
     if IsErr(codeLengthTableRes):

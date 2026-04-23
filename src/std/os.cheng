@@ -8,6 +8,9 @@ import std/times
 import std/rawbytes
 import std/rawmem_support
 
+@importc("cheng_mem_release")
+fn os_mem_release(p: ptr)
+
 fn add(dst: var str[], val: str) =
     seqs.Add(dst, val)
 
@@ -25,6 +28,23 @@ fn osSetStr(out: var str, value: str) =
     out.len = value.len
     out.store_id = value.store_id
     out.flags = value.flags
+
+fn osReleaseStr(out: var str) =
+    if out.flags == 1 && out.data != nil:
+        os_mem_release(out.data)
+    osSetEmpty(out)
+
+fn osMoveStr(out: var str, value: var str) =
+    if out.data != value.data:
+        osReleaseStr(out)
+    out.data = value.data
+    out.len = value.len
+    out.store_id = value.store_id
+    out.flags = value.flags
+    value.data = nil
+    value.len = 0
+    value.store_id = 0
+    value.flags = 0
 
 type
     File = ptr
@@ -92,6 +112,8 @@ fn cheng_os_file_exists_bridge(path: str): int32
 fn cheng_os_dir_exists_bridge(path: str): int32
 @importc("cheng_os_file_size_bridge")
 fn cheng_os_file_size_bridge(path: str): int64
+@importc("cheng_os_fopen_mode_bridge")
+fn cheng_os_fopen_mode_bridge(path: str, mode: str): File
 @importc("cheng_getcwd")
 fn cheng_getcwd_raw(): cstring
 @importc("remove")
@@ -291,32 +313,13 @@ fn udpPlatformMsgDontWaitBridge(): int32 =
     return cheng_udp_platform_msg_dontwait_bridge()
 
 fn openImplRead(filename: str): File =
-    let pathText: cstring = strToCStringTemp(filename)
-    let modeRaw: str = newStringAlloc(2)
-    if modeRaw.len == 2:
-        modeRaw[0] = 'r'
-        modeRaw[1] = 'b'
-    let modeText: cstring = strToCStringTemp(modeRaw)
-    return c_fopen(pathText, modeText)
+    return cheng_os_fopen_mode_bridge(filename, "rb")
 
 fn openImplWrite(filename: str): File =
-    let pathText: cstring = strToCStringTemp(filename)
-    let modeRaw: str = newStringAlloc(2)
-    if modeRaw.len == 2:
-        modeRaw[0] = 'w'
-        modeRaw[1] = 'b'
-    let modeText: cstring = strToCStringTemp(modeRaw)
-    return c_fopen(pathText, modeText)
+    return cheng_os_fopen_mode_bridge(filename, "wb")
 
 fn openImplReadWrite(filename: str): File =
-    let pathText: cstring = strToCStringTemp(filename)
-    let modeRaw: str = newStringAlloc(3)
-    if modeRaw.len == 3:
-        modeRaw[0] = 'r'
-        modeRaw[1] = 'b'
-        modeRaw[2] = '+'
-    let modeText: cstring = strToCStringTemp(modeRaw)
-    return c_fopen(pathText, modeText)
+    return cheng_os_fopen_mode_bridge(filename, "rb+")
 
 fn setIoMeterHook(hook: IoMeterHook) =
     ioMeterHasHook = (hook != nil)
@@ -382,11 +385,11 @@ fn readAllInto(f: File, out: var str): bool =
         else:
             buffer.AppendBytes(outBuf, bytesSlice(chunk, 0, got))
         ioMeterReport(ioRead, int64(got))
-    let outText: str = bytesToString(buffer.ToBytes(outBuf))
+    var outText: str = bytesToString(buffer.ToBytes(outBuf))
     let finalLen: int32 = strings.Len(outText)
     osDebugFileReadKV("final.lenRead", finalLen)
     osDebugFileReadKV("final.outLen", strings.Len(outText))
-    out = outText
+    osMoveStr(out, outText)
     return true
 
 fn readAll(f: File): str =
@@ -475,6 +478,14 @@ fn walkDirEntryPath(entry: str): str =
     if entry[1] != '|':
         return ""
     return strings.SliceBytes(entry, 2, strings.Len(entry) - 2)
+
+fn splitFileResult(dir: str, name: str, ext: str): SplitFileResult =
+    var out: SplitFileResult
+    out.dir = dir
+    out.name = name
+    out.ext = ext
+    return out
+
 fn pathComponentDir(): PathComponent =
     return PathComponent(1)
 fn os_addPtr_WalkDirEntry(seqInst: var str[], val: WalkDirEntry) =
@@ -555,28 +566,9 @@ fn joinPath(a: str, b: str): str =
         hasSep = true
     if last == '\\':
         hasSep = true
-    let bLen: int32 = strings.Len(b)
-    var outLen: int32 = aLen + bLen
     if !hasSep:
-        outLen = outLen + 1
-    let out: str = newStringAlloc(outLen)
-    if outLen <= 0:
-        return ""
-    var writePos: int32
-    var i: int32
-    while i < aLen:
-        out[writePos] = a[i]
-        writePos = writePos + 1
-        i = i + 1
-    if !hasSep:
-        out[writePos] = '/'
-        writePos = writePos + 1
-    i = 0
-    while i < bLen:
-        out[writePos] = b[i]
-        writePos = writePos + 1
-        i = i + 1
-    return out
+        return strings.ConcatStr(strings.ConcatStr(a, "/"), b)
+    return strings.ConcatStr(a, b)
 fn `/`(a: str, b: str): str =
     return joinPath(a, b)
 
@@ -593,14 +585,14 @@ fn osSliceStr(text: str, start: int32, stop: int32): str =
     if e >= n:
         e = n - 1
     let count: int32 = e - s + 1
-    return strings.SliceBytes(text, s, count)
+    return newStringCopy(system_ptr_add(strDataPtr(text), s), count)
 fn absolutePath(path: str): str =
     if strings.Len(path) == 0 || path[0] == char(0):
         return getCurrentDir()
     let c0: char = path[0]
     if c0 == '/' || c0 == '\\':
         return path
-    if path[1] == ':':
+    if strings.Len(path) > 1 && path[1] == ':':
         return path
     return joinPath(getCurrentDir(), path)
 fn isAbsolute(path: str): bool =
@@ -609,12 +601,21 @@ fn isAbsolute(path: str): bool =
     let c0: char = path[0]
     if c0 == '/' || c0 == '\\':
         return true
-    if path[1] == ':':
+    if strings.Len(path) > 1 && path[1] == ':':
         return true
     return false
 fn parentDir(path: str): str =
-    let parts: SplitFileResult = splitFile(path)
-    return parts.dir
+    let n: int32 = strings.Len(path)
+    if n <= 0:
+        return ""
+    var lastSep: int32 = -1
+    for i in 0..<n:
+        let ch: char = path[i]
+        if ch == '/' || ch == '\\':
+            lastSep = i
+    if lastSep <= 0:
+        return ""
+    return osSliceStr(path, 0, lastSep - 1)
 fn relativePath(path: str, base: str): str =
     if strings.Len(base) == 0 || base[0] == char(0):
         return path
@@ -630,7 +631,7 @@ fn relativePath(path: str, base: str): str =
 fn splitFile(path: str): SplitFileResult =
     let pathLen: int32 = strings.Len(path)
     if pathLen == 0:
-        return SplitFileResult(dir: "", name: "", ext: "")
+        return splitFileResult("", "", "")
     var lastSep: int32 = -1
     for i in 0..<pathLen:
         let ch: char = path[i]
@@ -650,41 +651,41 @@ fn splitFile(path: str): SplitFileResult =
         if lastSep >= 0:
             if lastSep <= 0:
                 if lastDot - 1 >= nameStart:
-                    return SplitFileResult(dir: "",
-                                           name: osSliceStr(path, nameStart, lastDot - 1),
-                                           ext: osSliceStr(path, lastDot, pathLen - 1))
-                return SplitFileResult(dir: "",
-                                       name: "",
-                                       ext: osSliceStr(path, lastDot, pathLen - 1))
+                    return splitFileResult("",
+                                           osSliceStr(path, nameStart, lastDot - 1),
+                                           osSliceStr(path, lastDot, pathLen - 1))
+                return splitFileResult("",
+                                       "",
+                                       osSliceStr(path, lastDot, pathLen - 1))
             if lastDot - 1 >= nameStart:
-                return SplitFileResult(dir: osSliceStr(path, 0, lastSep - 1),
-                                       name: osSliceStr(path, nameStart, lastDot - 1),
-                                       ext: osSliceStr(path, lastDot, pathLen - 1))
-            return SplitFileResult(dir: osSliceStr(path, 0, lastSep - 1),
-                                   name: "",
-                                   ext: osSliceStr(path, lastDot, pathLen - 1))
+                return splitFileResult(osSliceStr(path, 0, lastSep - 1),
+                                       osSliceStr(path, nameStart, lastDot - 1),
+                                       osSliceStr(path, lastDot, pathLen - 1))
+            return splitFileResult(osSliceStr(path, 0, lastSep - 1),
+                                   "",
+                                   osSliceStr(path, lastDot, pathLen - 1))
         if lastDot > 0:
-            return SplitFileResult(dir: "",
-                                   name: osSliceStr(path, 0, lastDot - 1),
-                                   ext: osSliceStr(path, lastDot, pathLen - 1))
-        return SplitFileResult(dir: "",
-                               name: "",
-                               ext: osSliceStr(path, lastDot, pathLen - 1))
+            return splitFileResult("",
+                                   osSliceStr(path, 0, lastDot - 1),
+                                   osSliceStr(path, lastDot, pathLen - 1))
+        return splitFileResult("",
+                               "",
+                               osSliceStr(path, lastDot, pathLen - 1))
     if lastSep >= 0:
         if lastSep <= 0:
             if nameStart >= pathLen:
-                return SplitFileResult(dir: "", name: "", ext: "")
-            return SplitFileResult(dir: "",
-                                   name: osSliceStr(path, nameStart, pathLen - 1),
-                                   ext: "")
+                return splitFileResult("", "", "")
+            return splitFileResult("",
+                                   osSliceStr(path, nameStart, pathLen - 1),
+                                   "")
         if nameStart >= pathLen:
-            return SplitFileResult(dir: osSliceStr(path, 0, lastSep - 1),
-                                   name: "",
-                                   ext: "")
-        return SplitFileResult(dir: osSliceStr(path, 0, lastSep - 1),
-                               name: osSliceStr(path, nameStart, pathLen - 1),
-                               ext: "")
-    return SplitFileResult(dir: "", name: path, ext: "")
+            return splitFileResult(osSliceStr(path, 0, lastSep - 1),
+                                   "",
+                                   "")
+        return splitFileResult(osSliceStr(path, 0, lastSep - 1),
+                               osSliceStr(path, nameStart, pathLen - 1),
+                               "")
+    return splitFileResult("", path, "")
 fn getFileSize(path: str): int64 =
     path
     return 0
@@ -699,18 +700,24 @@ fn copyDir(src: str, dest: str) =
     src
     dest
 fn makeWalkDirEntry(kind: PathComponent, path: str): str =
-    var out: str = intToStr(int32(kind))
-    out = out + "|"
-    out = out + path
-    return out
+    let kindText: str = intToStr(int32(kind))
+    return strings.ConcatStr(strings.ConcatStr(kindText, "|"), path)
 fn listDir(path: str): str[] =
     var out: str[]
     if len(path) == 0 || path[0] == char(0) || !dirExists(path):
         return out
-    let listText: str = strFromCStringBorrow(cheng_list_dir_raw(strToCStringTemp(path)))
+    let pathRaw: cstring = strToCStringTemp(path)
+    let listRaw: cstring = cheng_list_dir_raw(pathRaw)
+    if path.flags == 0 && pathRaw != nil:
+        free(ptr(pathRaw))
+    if listRaw == nil:
+        return out
+    let listText: str = strFromCStringBorrow(listRaw)
     if len(listText) == 0 || listText[0] == char(0):
+        free(ptr(listRaw))
         return out
     let total: int32 = len(listText)
+    var count: int32
     var start: int32
     for i in 0..total:
         var endHit: bool
@@ -723,11 +730,31 @@ fn listDir(path: str): str[] =
             if endIdx >= start && listText[endIdx] == '\r':
                 endIdx = endIdx - 1
             if endIdx >= start:
-                let name: str = osSliceStr(listText, start, endIdx)
-                if len(name) > 0 && name[0] != char(0):
-                    var nameOwned: str = name
-                    add(out, nameOwned)
+                count = count + 1
             start = i + 1
+    if count <= 0:
+        free(ptr(listRaw))
+        return out
+    setLen(out, count)
+    var outLen: int32
+    start = 0
+    for i in 0..total:
+        var endHit: bool
+        if i == total:
+            endHit = true
+        elif listText[i] == '\n':
+            endHit = true
+        if endHit:
+            var endIdx: int32 = i - 1
+            if endIdx >= start && listText[endIdx] == '\r':
+                endIdx = endIdx - 1
+            if endIdx >= start:
+                var nameOwned: str = osSliceStr(listText, start, endIdx)
+                if len(nameOwned) > 0 && nameOwned[0] != char(0):
+                    osMoveStr(out[outLen], nameOwned)
+                    outLen = outLen + 1
+            start = i + 1
+    free(ptr(listRaw))
     return out
 fn walkDir(path: str): str[] =
     var out: str[]
@@ -766,12 +793,18 @@ fn walkDirRec(path: str): str[] =
     walkDirRecImpl(path, out)
     return osReturnStrSeq(out)
 fn extractFilename(path: str): str =
-    let parts: SplitFileResult = splitFile(path)
-    if strings.Len(parts.ext) > 0:
-        let name0: str = parts.name
-        let ext0: str = parts.ext
-        return name0 + ext0
-    return parts.name
+    let pathLen: int32 = strings.Len(path)
+    if pathLen <= 0:
+        return ""
+    var lastSep: int32 = -1
+    for i in 0..<pathLen:
+        let ch: char = path[i]
+        if ch == '/' || ch == '\\':
+            lastSep = i
+    let nameStart: int32 = lastSep + 1
+    if nameStart >= pathLen:
+        return ""
+    return osSliceStr(path, nameStart, pathLen - 1)
 fn getLastModificationTime(path: str): DateTime =
     path
     return getTime()
@@ -783,7 +816,10 @@ fn execCmdExImpl(command: str, options: uint64, workingDir: str): ExecCmdResult 
     osSetEmpty(output0)
     var exitCode0: int32 = -1
     if strings.Len(command) == 0:
-        return ExecCmdResult(output: output0, exitCode: exitCode0)
+        var emptyResult: ExecCmdResult
+        emptyResult.output = output0
+        emptyResult.exitCode = exitCode0
+        return emptyResult
     var merge: int32
     let mask: uint64 = uint64(1)
     if (options & mask) != 0:
@@ -794,7 +830,10 @@ fn execCmdExImpl(command: str, options: uint64, workingDir: str): ExecCmdResult 
     let exitCode64: int64 = cheng_exec_cmd_last_exit_code_raw()
     osSetStr(output0, output1)
     exitCode0 = int32(exitCode64)
-    return ExecCmdResult(output: output0, exitCode: exitCode0)
+    var out: ExecCmdResult
+    out.output = output0
+    out.exitCode = exitCode0
+    return out
 fn execCmdEx(command: str, options: uint64, workingDir: str): ExecCmdResult =
     return execCmdExImpl(command, options, workingDir)
 fn execCmdStatus(command: str, workingDir: str): int32 =
@@ -835,8 +874,8 @@ fn readFileSizedInto(path: str, size: int32, out: var str): bool =
     if totalGot != size:
         osSetEmpty(out)
         return true
-    let outText: str = bytesToString(raw)
-    out = outText
+    var outText: str = bytesToString(raw)
+    osMoveStr(out, outText)
     return true
 
 fn readFileInto(path: str, out: var str): bool =

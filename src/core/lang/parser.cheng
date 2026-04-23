@@ -1688,7 +1688,7 @@ fn ParserParseRangeExprAt(lineRaw: str,
     var i: int32
     while i < opPos:
         let ch = lineRaw[i]
-        if !inChar && ch == '"' && !ParserQuoteIsEscaped(lineRaw, i):
+        if !inChar && ch == char(34) && !ParserQuoteIsEscaped(lineRaw, i):
             inString = !inString
             i = i + 1
             continue
@@ -2100,10 +2100,10 @@ fn ParserAppendFmtExprsLine(sourcePath: str,
                                         endColumn)
     return
 
-fn ParserAppendBacktickStringifyCallExprsLine(sourcePath: str,
-                                                lineNumber: int32,
-                                                lineRaw: str,
-                                                layer: var NormalizedExprLayer) =
+fn ParserAppendStringifyCallExprsLine(sourcePath: str,
+                                        lineNumber: int32,
+                                        lineRaw: str,
+                                        layer: var NormalizedExprLayer) =
     var i: int32
     var inString = false
     var inChar = false
@@ -2113,40 +2113,67 @@ fn ParserAppendBacktickStringifyCallExprsLine(sourcePath: str,
             inString = !inString
             i = i + 1
             continue
-        if !inString && ch == '\'' && !ParserQuoteIsEscaped(lineRaw, i):
+        if !inString && ch == char(39) && !ParserQuoteIsEscaped(lineRaw, i):
             inChar = !inChar
             i = i + 1
             continue
         if inString || inChar:
             i = i + 1
             continue
-        if ch == '#':
+        if ch == char(35):
             return
-        if ch != '`' || i + 2 >= lineRaw.len:
+        if ch != '$' || i + 1 >= lineRaw.len:
             i = i + 1
             continue
-        if lineRaw[i + 1] != '$' || lineRaw[i + 2] != '`':
+        if lineRaw[i + 1] == '(':
+            var callArgsText = ""
+            var callArgCount: int32
+            var endColumnNumber: int32 = -1
+            if !ParserCallSurfaceFromOpenParen(lineRaw,
+                                                 i + 1,
+                                                 callArgsText,
+                                                 callArgCount,
+                                                 endColumnNumber):
+                i = i + 1
+                continue
+            NormalizedExprLayerAppendCall(layer,
+                                            sourcePath,
+                                            lineNumber,
+                                            i + 1,
+                                            "$",
+                                            NormalizedExprSurfaceCallNone,
+                                            true,
+                                            NormalizedExprCallReasonNone,
+                                            "",
+                                            "$",
+                                            "$",
+                                            "",
+                                            false,
+                                            callArgsText,
+                                            callArgCount,
+                                            false,
+                                            endColumnNumber)
+            i = endColumnNumber
+            continue
+        if !ParserIsIdentChar(lineRaw[i + 1]):
             i = i + 1
             continue
-        let openPos = ParserSkipInlineSpaces(lineRaw, i + 3)
-        if openPos >= lineRaw.len || lineRaw[openPos] != '(':
-            i = i + 1
-            continue
-        var callArgsText = ""
-        var callArgCount: int32
-        var endColumnNumber: int32 = -1
-        if !ParserCallSurfaceFromOpenParen(lineRaw,
-                                             openPos,
-                                             callArgsText,
-                                             callArgCount,
-                                             endColumnNumber):
+        var stop = i + 1
+        while stop < lineRaw.len:
+            let operandCh = lineRaw[stop]
+            if ParserIsIdentChar(operandCh) || operandCh == '.':
+                stop = stop + 1
+                continue
+            break
+        let callArgsText = ParserTextSliceFast(lineRaw, i + 1, stop - i - 1)
+        if callArgsText == "":
             i = i + 1
             continue
         NormalizedExprLayerAppendCall(layer,
                                         sourcePath,
                                         lineNumber,
                                         i + 1,
-                                        "`$`",
+                                        "$",
                                         NormalizedExprSurfaceCallNone,
                                         true,
                                         NormalizedExprCallReasonNone,
@@ -2156,10 +2183,10 @@ fn ParserAppendBacktickStringifyCallExprsLine(sourcePath: str,
                                         "",
                                         false,
                                         callArgsText,
-                                        callArgCount,
-                                        false,
-                                        endColumnNumber)
-        i = endColumnNumber
+                                        1,
+                                        true,
+                                        stop)
+        i = stop
     return
 
 fn ParserAppendRangeExprsLine(sourcePath: str,
@@ -4841,10 +4868,10 @@ fn ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRaw:
         ParserAppendRangeExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendComprehensionExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendFmtExprsLine(sourcePath, lineNumber, line, layer)
-        ParserAppendBacktickStringifyCallExprsLine(sourcePath,
-                                                     lineNumber,
-                                                     line,
-                                                     layer)
+        ParserAppendStringifyCallExprsLine(sourcePath,
+                                             lineNumber,
+                                             line,
+                                             layer)
         if !ParserAppendDefaultInitExprsLine(sourcePath,
                                                lineNumber,
                                                line,
@@ -5692,7 +5719,12 @@ fn ParserTextSliceFast(text: str,
     let data = strDataPtr(text)
     if data == nil:
         return ""
-    return strViewWithFlags(system_ptr_add(data, start), count, text.store_id, 0)
+    var out: str
+    out.data = system_ptr_add(data, start)
+    out.len = count
+    out.store_id = text.store_id
+    out.flags = 0
+    return out
 
 fn ParserSplitChar(textRaw: str, sep: char): str[] =
     let text = textRaw
