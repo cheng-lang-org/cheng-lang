@@ -26,6 +26,7 @@ import cheng/core/lang/parser
 import cheng/core/backend/build_plan as buildplan
 import cheng/core/backend/system_link_plan as slplan
 import cheng/core/backend/system_link_exec as sexec
+import cheng/core/backend/system_link_exec_runtime as sexecrt
 import cheng/core/backend/target_matrix as tmat
 
 @importc("get_stdout")
@@ -1116,6 +1117,44 @@ fn CompilerWriteSystemLinkExecFullReport(rootDir: str,
         return false
     return CompilerWriteOptionalReport(rootDir, reportPath, CompilerSystemLinkExecFullReport(plan))
 
+fn CompilerRequirePureSystemLinkExec(): bool =
+    let raw = strutil.Strip(os.GetEnv("CHENG_REQUIRE_PURE_SYSTEM_LINK_EXEC"))
+    return len(raw) > 0 && raw != "0" && raw != "false"
+
+fn CompilerWriteSystemLinkExecRuntimeReport(rootDir: str,
+                                             reportPath: str,
+                                             plan: sexec.SystemLinkExecPlan,
+                                             runtimeReport: str): bool =
+    if len(reportPath) <= 0:
+        return true
+    var report = CompilerSystemLinkExecFullReport(plan)
+    if len(runtimeReport) > 0:
+        report = report + "\n" + runtimeReport
+    return CompilerWriteOptionalReport(rootDir, reportPath, report)
+
+fn CompilerPureSystemLinkExecUnsupported(reason: str): int32 =
+    if CompilerRequirePureSystemLinkExec():
+        CompilerPrintErr(reason)
+        return 2
+    return -1
+
+fn CompilerTryRunPureSystemLinkExec(rootDir: str,
+                                      req: creq.CompilerRequest,
+                                      plan: sexec.SystemLinkExecPlan): int32 =
+    if !sexec.SystemLinkExecPlanReady(plan):
+        return CompilerPureSystemLinkExecUnsupported(" compiler pure system-link-exec: plan not ready")
+    let browserBridgeObjectPath = sexec.SystemLinkExecBrowserBridgeObjectPath(plan)
+    if len(browserBridgeObjectPath) > 0:
+        return CompilerPureSystemLinkExecUnsupported(" compiler pure system-link-exec: browser bridge object not yet in pure runtime")
+    let execRes = sexecrt.SystemLinkExecRuntimeExecutePlan(rootDir, plan)
+    if IsErr(execRes):
+        return CompilerPureSystemLinkExecUnsupported(Error(execRes))
+    let runtimeReport = sexecrt.SystemLinkExecRuntimeResultReport(Value(execRes))
+    if !CompilerWriteSystemLinkExecRuntimeReport(rootDir, req.reportPath, plan, runtimeReport):
+        CompilerPrintErr(" compiler: failed to write pure system-link-exec report: " + req.reportPath)
+        return 2
+    return 0
+
 fn CompilerBrowserBridgeCompilerPath(rootDir: str,
                                        plan: sexec.SystemLinkExecPlan): str =
     let bridgeCompiler = CompilerBridgeCompilerPath(rootDir)
@@ -1481,24 +1520,12 @@ fn CompilerForwardToBridgeEnv(rootDir: str,
     logName = logName + ".log"
     let logPath = os.JoinPath(logDir, logName)
     let cleanArgs = CompilerArgsWithoutProgress(args)
-    let snapshot = contracts.BootstrapSnapshotDefault(rootDir)
-    var forwardCmd = cmd
-    var bridgeNeedsInternalSystemLinkExec = false
-    if cmd == "system-link-exec":
-        if CompilerBootstrapStageVariantPath(bridgeCompiler, snapshot.stage3Compiler.path) ||
-           CompilerBootstrapStageVariantPath(bridgeCompiler, snapshot.stage2Compiler.path) ||
-           CompilerBootstrapStageVariantPath(bridgeCompiler, snapshot.stage1Compiler.path) ||
-           CompilerBootstrapStageVariantPath(bridgeCompiler, snapshot.stage0Compiler.path):
-            forwardCmd = "__seed-system-link-exec"
-            bridgeNeedsInternalSystemLinkExec = true
     var forwardArgs: str[]
-    add(forwardArgs, forwardCmd)
+    add(forwardArgs, cmd)
     for i in 0..<cleanArgs.len:
         add(forwardArgs, cleanArgs[i])
     var forwardEnv: str[]
     add(forwardEnv, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
-    if bridgeNeedsInternalSystemLinkExec:
-        add(forwardEnv, "CHENG_SEED_INTERNAL_SYSTEM_LINK_EXEC=1")
     let progressEnv = CompilerProgressEnvOverrides(rootDir, args)
     for i in 0..<progressEnv.len:
         add(forwardEnv, progressEnv[i])
@@ -2872,6 +2899,10 @@ fn CompilerRunSystemLinkExec(rootDir: str,
         return 2
     CompilerProgressEmit(rootDir, progressText, "browser_bridge_prepare", "done")
     let browserBridgeObjectPath = sexec.SystemLinkExecBrowserBridgeObjectPath(plan)
+    let pureRc = CompilerTryRunPureSystemLinkExec(rootDir, req, plan)
+    if pureRc >= 0:
+        CompilerProgressEmit(rootDir, progressText, "execute", "done")
+        return pureRc
     if len(bridgeCompiler) > 0:
         CompilerProgressEmit(rootDir, progressText, "bridge_compile", "begin")
         let rc = CompilerForwardBootstrapBridge(rootDir,

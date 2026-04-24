@@ -1,0 +1,846 @@
+import std/result
+
+const
+    InferencePackedWordBits: int32 = 60
+    InferenceTurboQuantMinBitWidth: int32 = 2
+    InferenceTurboQuantMaxBitWidth: int32 = 8
+    InferenceSoftmaxInternalScale: int32 = 10000
+
+type
+    TensorQ =
+        shape: int32[]
+        scale: int32
+        data: int32[]
+
+    InferencePackedBits =
+        bitWidth: int32
+        valueCount: int32
+        words: int64[]
+
+    TurboQuantVector =
+        dim: int32
+        bitWidth: int32
+        scale: int32
+        radius: int32
+        residualMeanAbs: int32
+        baseCodes: InferencePackedBits
+        residualSigns: InferencePackedBits
+
+    TurboQuantKVCache =
+        keyDim: int32
+        valueDim: int32
+        keyBitWidth: int32
+        valueBitWidth: int32
+        keyScale: int32
+        valueScale: int32
+        keys: TurboQuantVector[]
+        values: TurboQuantVector[]
+
+fn InferenceAbsI32(value: int32): int32 =
+    if value < 0:
+        return 0 - value
+    return value
+
+fn InferenceAbsI64(value: int64): int64 =
+    if value < int64(0):
+        return int64(0) - value
+    return value
+
+fn InferenceMinI32(a: int32, b: int32): int32 =
+    if a < b:
+        return a
+    return b
+
+fn InferenceSaturateI32(value: int64): int32 =
+    if value > int64(2147483647):
+        return 2147483647
+    if value < int64(-2147483648):
+        return -2147483648
+    return int32(value)
+
+fn InferenceRoundDivI64(numer: int64, denom: int64): int64 =
+    if denom <= int64(0):
+        return int64(0)
+    let half = denom / int64(2)
+    if numer >= int64(0):
+        return (numer + half) / denom
+    return (numer - half) / denom
+
+fn InferenceShapeCopy(src: int32[]): int32[] =
+    var out: int32[]
+    var i: int32
+    i = 0
+    while i < src.len:
+        add(out, src[i])
+        i = i + 1
+    return out
+
+fn InferenceIntCopy(src: int32[]): int32[] =
+    var out: int32[]
+    var i: int32
+    i = 0
+    while i < src.len:
+        add(out, src[i])
+        i = i + 1
+    return out
+
+fn TensorElementCount(shape: int32[]): Result[int32] =
+    if shape.len <= 0:
+        return Err[int32](" inference tensor: shape rank")
+    var total: int32 = 1
+    var i: int32
+    i = 0
+    while i < shape.len:
+        if shape[i] <= 0:
+            return Err[int32](" inference tensor: shape dim")
+        if total > 2147483647 / shape[i]:
+            return Err[int32](" inference tensor: element count overflow")
+        total = total * shape[i]
+        i = i + 1
+    return Ok[int32](total)
+
+fn TensorValidate(tensor: TensorQ): Result[bool] =
+    if tensor.scale <= 0:
+        return Err[bool](" inference tensor: scale")
+    let countRes = TensorElementCount(tensor.shape)
+    if IsErr(countRes):
+        return Err[bool](Error(countRes))
+    if tensor.data.len != Value(countRes):
+        return Err[bool](" inference tensor: data length mismatch")
+    return Ok[bool](true)
+
+fn TensorZerosFill(out: var TensorQ, shape: int32[], scale: int32): Result[bool] =
+    if scale <= 0:
+        return Err[bool](" inference tensor: scale")
+    let countRes = TensorElementCount(shape)
+    if IsErr(countRes):
+        return Err[bool](Error(countRes))
+    out.shape = InferenceShapeCopy(shape)
+    out.scale = scale
+    out.data = []
+    var i: int32
+    i = 0
+    while i < Value(countRes):
+        add(out.data, 0)
+        i = i + 1
+    return Ok[bool](true)
+
+fn TensorFromDataFill(out: var TensorQ, shape: int32[], scale: int32, data: int32[]): Result[bool] =
+    if scale <= 0:
+        return Err[bool](" inference tensor: scale")
+    let countRes = TensorElementCount(shape)
+    if IsErr(countRes):
+        return Err[bool](Error(countRes))
+    if data.len != Value(countRes):
+        return Err[bool](" inference tensor: input data length")
+    out.shape = InferenceShapeCopy(shape)
+    out.scale = scale
+    out.data = InferenceIntCopy(data)
+    return Ok[bool](true)
+
+fn TensorIsVector(tensor: TensorQ): bool =
+    return tensor.shape.len == 1 && tensor.data.len == tensor.shape[0]
+
+fn TensorOffset4(shape: int32[], n: int32, c: int32, h: int32, w: int32): int32 =
+    return ((n * shape[1] + c) * shape[2] + h) * shape[3] + w
+
+fn TensorOffset2(shape: int32[], row: int32, col: int32): int32 =
+    return row * shape[1] + col
+
+fn InferenceMulQ(a: int32, b: int32, scale: int32): int32 =
+    let product = int64(a) * int64(b)
+    return InferenceSaturateI32(InferenceRoundDivI64(product, int64(scale)))
+
+fn DenseFill(out: var TensorQ,
+             input: TensorQ,
+             weight: TensorQ,
+             bias: TensorQ): Result[bool] =
+    let inputOk = TensorValidate(input)
+    if IsErr(inputOk):
+        return Err[bool](Error(inputOk))
+    let weightOk = TensorValidate(weight)
+    if IsErr(weightOk):
+        return Err[bool](Error(weightOk))
+    if input.scale != weight.scale:
+        return Err[bool](" inference dense: scale mismatch")
+    if weight.shape.len != 2:
+        return Err[bool](" inference dense: weight rank")
+    let outFeatures = weight.shape[0]
+    let inFeatures = weight.shape[1]
+    var batch: int32 = 1
+    var inputRank1: bool
+    inputRank1 = false
+    if input.shape.len == 1:
+        inputRank1 = true
+        if input.shape[0] != inFeatures:
+            return Err[bool](" inference dense: input feature count")
+    elif input.shape.len == 2:
+        batch = input.shape[0]
+        if input.shape[1] != inFeatures:
+            return Err[bool](" inference dense: input feature count")
+    else:
+        return Err[bool](" inference dense: input rank")
+    var hasBias: bool
+    hasBias = false
+    if bias.data.len > 0:
+        let biasOk = TensorValidate(bias)
+        if IsErr(biasOk):
+            return Err[bool](Error(biasOk))
+        if bias.scale != input.scale || bias.shape.len != 1 || bias.shape[0] != outFeatures:
+            return Err[bool](" inference dense: bias shape")
+        hasBias = true
+    var outShape: int32[]
+    if inputRank1:
+        outShape = [outFeatures]
+    else:
+        outShape = [batch, outFeatures]
+    let zerosRes = TensorZerosFill(out, outShape, input.scale)
+    if IsErr(zerosRes):
+        return Err[bool](Error(zerosRes))
+    var b: int32
+    b = 0
+    while b < batch:
+        var oc: int32
+        oc = 0
+        while oc < outFeatures:
+            var sum: int64
+            sum = int64(0)
+            if hasBias:
+                sum = int64(bias.data[oc])
+            var ic: int32
+            ic = 0
+            while ic < inFeatures:
+                var inputIndex: int32
+                inputIndex = 0
+                if inputRank1:
+                    inputIndex = ic
+                else:
+                    inputIndex = TensorOffset2(input.shape, b, ic)
+                let product = int64(input.data[inputIndex]) * int64(weight.data[TensorOffset2(weight.shape, oc, ic)])
+                sum = sum + InferenceRoundDivI64(product, int64(input.scale))
+                ic = ic + 1
+            var outIndex: int32
+            outIndex = 0
+            if inputRank1:
+                outIndex = oc
+            else:
+                outIndex = TensorOffset2(out.shape, b, oc)
+            out.data[outIndex] = InferenceSaturateI32(sum)
+            oc = oc + 1
+        b = b + 1
+    return Ok[bool](true)
+
+fn MatMul2dFill(out: var TensorQ, left: TensorQ, right: TensorQ): Result[bool] =
+    let leftOk = TensorValidate(left)
+    if IsErr(leftOk):
+        return Err[bool](Error(leftOk))
+    let rightOk = TensorValidate(right)
+    if IsErr(rightOk):
+        return Err[bool](Error(rightOk))
+    if left.scale != right.scale:
+        return Err[bool](" inference matmul: scale mismatch")
+    if left.shape.len != 2 || right.shape.len != 2:
+        return Err[bool](" inference matmul: rank")
+    if left.shape[1] != right.shape[0]:
+        return Err[bool](" inference matmul: inner dim")
+    let m = left.shape[0]
+    let k = left.shape[1]
+    let n = right.shape[1]
+    let zerosRes = TensorZerosFill(out, [m, n], left.scale)
+    if IsErr(zerosRes):
+        return Err[bool](Error(zerosRes))
+    var row: int32
+    row = 0
+    while row < m:
+        var col: int32
+        col = 0
+        while col < n:
+            var sum: int64
+            sum = int64(0)
+            var kk: int32
+            kk = 0
+            while kk < k:
+                let product = int64(left.data[TensorOffset2(left.shape, row, kk)]) *
+                              int64(right.data[TensorOffset2(right.shape, kk, col)])
+                sum = sum + InferenceRoundDivI64(product, int64(left.scale))
+                kk = kk + 1
+            out.data[TensorOffset2(out.shape, row, col)] = InferenceSaturateI32(sum)
+            col = col + 1
+        row = row + 1
+    return Ok[bool](true)
+
+fn Conv2dNchwFill(out: var TensorQ,
+                  input: TensorQ,
+                  weight: TensorQ,
+                  bias: TensorQ,
+                  strideH: int32,
+                  strideW: int32,
+                  padH: int32,
+                  padW: int32): Result[bool] =
+    let inputOk = TensorValidate(input)
+    if IsErr(inputOk):
+        return Err[bool](Error(inputOk))
+    let weightOk = TensorValidate(weight)
+    if IsErr(weightOk):
+        return Err[bool](Error(weightOk))
+    if input.scale != weight.scale:
+        return Err[bool](" inference conv2d: scale mismatch")
+    if input.shape.len != 4 || weight.shape.len != 4:
+        return Err[bool](" inference conv2d: rank")
+    if strideH <= 0 || strideW <= 0 || padH < 0 || padW < 0:
+        return Err[bool](" inference conv2d: stride or padding")
+    let batch = input.shape[0]
+    let inChannels = input.shape[1]
+    let inH = input.shape[2]
+    let inW = input.shape[3]
+    let outChannels = weight.shape[0]
+    if weight.shape[1] != inChannels:
+        return Err[bool](" inference conv2d: channel mismatch")
+    let kernelH = weight.shape[2]
+    let kernelW = weight.shape[3]
+    let outH = ((inH + padH * 2 - kernelH) / strideH) + 1
+    let outW = ((inW + padW * 2 - kernelW) / strideW) + 1
+    if outH <= 0 || outW <= 0:
+        return Err[bool](" inference conv2d: output shape")
+    var hasBias: bool
+    hasBias = false
+    if bias.data.len > 0:
+        let biasOk = TensorValidate(bias)
+        if IsErr(biasOk):
+            return Err[bool](Error(biasOk))
+        if bias.scale != input.scale || bias.shape.len != 1 || bias.shape[0] != outChannels:
+            return Err[bool](" inference conv2d: bias shape")
+        hasBias = true
+    let zerosRes = TensorZerosFill(out, [batch, outChannels, outH, outW], input.scale)
+    if IsErr(zerosRes):
+        return Err[bool](Error(zerosRes))
+    var n: int32
+    n = 0
+    while n < batch:
+        var oc: int32
+        oc = 0
+        while oc < outChannels:
+            var oh: int32
+            oh = 0
+            while oh < outH:
+                var ow: int32
+                ow = 0
+                while ow < outW:
+                    var sum: int64
+                    sum = int64(0)
+                    if hasBias:
+                        sum = int64(bias.data[oc])
+                    var ic: int32
+                    ic = 0
+                    while ic < inChannels:
+                        var kh: int32
+                        kh = 0
+                        while kh < kernelH:
+                            let ih = oh * strideH + kh - padH
+                            if ih >= 0 && ih < inH:
+                                var kw: int32
+                                kw = 0
+                                while kw < kernelW:
+                                    let iw = ow * strideW + kw - padW
+                                    if iw >= 0 && iw < inW:
+                                        let inputIndex = TensorOffset4(input.shape, n, ic, ih, iw)
+                                        let weightIndex = ((oc * inChannels + ic) * kernelH + kh) * kernelW + kw
+                                        let product = int64(input.data[inputIndex]) * int64(weight.data[weightIndex])
+                                        sum = sum + InferenceRoundDivI64(product, int64(input.scale))
+                                    kw = kw + 1
+                            kh = kh + 1
+                        ic = ic + 1
+                    out.data[TensorOffset4(out.shape, n, oc, oh, ow)] = InferenceSaturateI32(sum)
+                    ow = ow + 1
+                oh = oh + 1
+            oc = oc + 1
+        n = n + 1
+    return Ok[bool](true)
+
+fn ReluFill(out: var TensorQ, input: TensorQ): Result[bool] =
+    let inputOk = TensorValidate(input)
+    if IsErr(inputOk):
+        return Err[bool](Error(inputOk))
+    out.shape = InferenceShapeCopy(input.shape)
+    out.scale = input.scale
+    out.data = []
+    var i: int32
+    i = 0
+    while i < input.data.len:
+        if input.data[i] < 0:
+            add(out.data, 0)
+        else:
+            add(out.data, input.data[i])
+        i = i + 1
+    return Ok[bool](true)
+
+fn MaxPool2dNchwFill(out: var TensorQ,
+                     input: TensorQ,
+                     kernelH: int32,
+                     kernelW: int32,
+                     strideH: int32,
+                     strideW: int32): Result[bool] =
+    let inputOk = TensorValidate(input)
+    if IsErr(inputOk):
+        return Err[bool](Error(inputOk))
+    if input.shape.len != 4:
+        return Err[bool](" inference maxpool2d: rank")
+    if kernelH <= 0 || kernelW <= 0 || strideH <= 0 || strideW <= 0:
+        return Err[bool](" inference maxpool2d: params")
+    let batch = input.shape[0]
+    let channels = input.shape[1]
+    let inH = input.shape[2]
+    let inW = input.shape[3]
+    let outH = ((inH - kernelH) / strideH) + 1
+    let outW = ((inW - kernelW) / strideW) + 1
+    if outH <= 0 || outW <= 0:
+        return Err[bool](" inference maxpool2d: output shape")
+    let zerosRes = TensorZerosFill(out, [batch, channels, outH, outW], input.scale)
+    if IsErr(zerosRes):
+        return Err[bool](Error(zerosRes))
+    var n: int32
+    n = 0
+    while n < batch:
+        var c: int32
+        c = 0
+        while c < channels:
+            var oh: int32
+            oh = 0
+            while oh < outH:
+                var ow: int32
+                ow = 0
+                while ow < outW:
+                    var best = input.data[TensorOffset4(input.shape, n, c, oh * strideH, ow * strideW)]
+                    var kh: int32
+                    kh = 0
+                    while kh < kernelH:
+                        var kw: int32
+                        kw = 0
+                        while kw < kernelW:
+                            let value = input.data[TensorOffset4(input.shape, n, c, oh * strideH + kh, ow * strideW + kw)]
+                            if value > best:
+                                best = value
+                            kw = kw + 1
+                        kh = kh + 1
+                    out.data[TensorOffset4(out.shape, n, c, oh, ow)] = best
+                    ow = ow + 1
+                oh = oh + 1
+            c = c + 1
+        n = n + 1
+    return Ok[bool](true)
+
+fn InferenceExpNegQ(delta: int32, inputScale: int32, outputScale: int32): int32 =
+    if delta >= 0:
+        return outputScale
+    if delta <= 0 - inputScale * 8:
+        return 0
+    let dQ = InferenceSaturateI32(InferenceRoundDivI64(int64(0 - delta) * int64(outputScale), int64(inputScale)))
+    var term: int64
+    term = int64(outputScale)
+    var sum: int64
+    sum = int64(outputScale)
+    var k: int32
+    k = 1
+    while k <= 12:
+        term = InferenceRoundDivI64(term * int64(dQ), int64(outputScale * k))
+        sum = sum + term
+        k = k + 1
+    if sum <= int64(0):
+        return 0
+    return InferenceSaturateI32(InferenceRoundDivI64(int64(outputScale) * int64(outputScale), sum))
+
+fn SoftmaxLastDimFill(out: var TensorQ, input: TensorQ, outputScale: int32): Result[bool] =
+    let inputOk = TensorValidate(input)
+    if IsErr(inputOk):
+        return Err[bool](Error(inputOk))
+    if outputScale <= 0:
+        return Err[bool](" inference softmax: output scale")
+    if input.shape.len != 1 && input.shape.len != 2:
+        return Err[bool](" inference softmax: rank")
+    out.shape = InferenceShapeCopy(input.shape)
+    out.scale = outputScale
+    out.data = []
+    var fill: int32
+    fill = 0
+    while fill < input.data.len:
+        add(out.data, 0)
+        fill = fill + 1
+    var rows: int32
+    var cols: int32
+    rows = 1
+    cols = input.shape[0]
+    if input.shape.len == 2:
+        rows = input.shape[0]
+        cols = input.shape[1]
+    var row: int32
+    row = 0
+    while row < rows:
+        let rowOffset = row * cols
+        var best = input.data[rowOffset]
+        var col: int32
+        col = 1
+        while col < cols:
+            let value = input.data[rowOffset + col]
+            if value > best:
+                best = value
+            col = col + 1
+        var expValues: int32[]
+        var denom: int64
+        denom = int64(0)
+        col = 0
+        while col < cols:
+            let e = InferenceExpNegQ(input.data[rowOffset + col] - best, input.scale, InferenceSoftmaxInternalScale)
+            add(expValues, e)
+            denom = denom + int64(e)
+            col = col + 1
+        if denom <= int64(0):
+            return Err[bool](" inference softmax: zero denominator")
+        col = 0
+        while col < cols:
+            let scaled = InferenceRoundDivI64(int64(expValues[col]) * int64(outputScale), denom)
+            out.data[rowOffset + col] = InferenceSaturateI32(scaled)
+            col = col + 1
+        row = row + 1
+    return Ok[bool](true)
+
+fn Argmax(input: TensorQ): Result[int32] =
+    let inputOk = TensorValidate(input)
+    if IsErr(inputOk):
+        return Err[int32](Error(inputOk))
+    if input.data.len <= 0:
+        return Err[int32](" inference argmax: empty")
+    var bestIndex: int32
+    bestIndex = 0
+    var best = input.data[0]
+    var i: int32
+    i = 1
+    while i < input.data.len:
+        if input.data[i] > best:
+            best = input.data[i]
+            bestIndex = i
+        i = i + 1
+    return Ok[int32](bestIndex)
+
+fn PackedBitMask(bitCount: int32): int64 =
+    if bitCount <= 0:
+        return int64(0)
+    return (int64(1) << uint64(bitCount)) - int64(1)
+
+fn PackedBitsValidateBitWidth(bitWidth: int32): Result[bool] =
+    if bitWidth <= 0 || bitWidth > 8:
+        return Err[bool](" inference packed bits: bit width")
+    return Ok[bool](true)
+
+fn PackedBitsFromValuesFill(out: var InferencePackedBits,
+                            bitWidth: int32,
+                            values: int32[]): Result[bool] =
+    let bitWidthOk = PackedBitsValidateBitWidth(bitWidth)
+    if IsErr(bitWidthOk):
+        return Err[bool](Error(bitWidthOk))
+    let valueMax = int32(PackedBitMask(bitWidth))
+    var i: int32
+    i = 0
+    while i < values.len:
+        if values[i] < 0 || values[i] > valueMax:
+            return Err[bool](" inference packed bits: value out of range")
+        i = i + 1
+    let totalBits = values.len * bitWidth
+    var wordCount: int32
+    wordCount = 0
+    if totalBits > 0:
+        wordCount = (totalBits + InferencePackedWordBits - 1) / InferencePackedWordBits
+    out.bitWidth = bitWidth
+    out.valueCount = values.len
+    out.words = []
+    i = 0
+    while i < wordCount:
+        add(out.words, int64(0))
+        i = i + 1
+    i = 0
+    while i < values.len:
+        var remaining = bitWidth
+        var srcShift: int32
+        srcShift = 0
+        var bitOffset = i * bitWidth
+        var wordIndex = bitOffset / InferencePackedWordBits
+        var localOffset = bitOffset % InferencePackedWordBits
+        while remaining > 0:
+            let take = InferenceMinI32(remaining, InferencePackedWordBits - localOffset)
+            let partMask = PackedBitMask(take)
+            let part = (int64(values[i]) >> uint64(srcShift)) & partMask
+            out.words[wordIndex] = out.words[wordIndex] | (part << uint64(localOffset))
+            remaining = remaining - take
+            srcShift = srcShift + take
+            wordIndex = wordIndex + 1
+            localOffset = 0
+        i = i + 1
+    return Ok[bool](true)
+
+fn PackedBitsGet(packed: InferencePackedBits, index: int32): Result[int32] =
+    let bitWidthOk = PackedBitsValidateBitWidth(packed.bitWidth)
+    if IsErr(bitWidthOk):
+        return Err[int32](Error(bitWidthOk))
+    if index < 0 || index >= packed.valueCount:
+        return Err[int32](" inference packed bits: index")
+    var remaining = packed.bitWidth
+    var dstShift: int32
+    dstShift = 0
+    var bitOffset = index * packed.bitWidth
+    var wordIndex = bitOffset / InferencePackedWordBits
+    var localOffset = bitOffset % InferencePackedWordBits
+    var value: int64
+    value = int64(0)
+    while remaining > 0:
+        if wordIndex < 0 || wordIndex >= packed.words.len:
+            return Err[int32](" inference packed bits: word index")
+        let take = InferenceMinI32(remaining, InferencePackedWordBits - localOffset)
+        let partMask = PackedBitMask(take)
+        let part = (packed.words[wordIndex] >> uint64(localOffset)) & partMask
+        value = value | (part << uint64(dstShift))
+        remaining = remaining - take
+        dstShift = dstShift + take
+        wordIndex = wordIndex + 1
+        localOffset = 0
+    return Ok[int32](int32(value))
+
+fn TurboQuantPositiveMax(bitWidth: int32): int32 =
+    return int32((int64(1) << uint64(bitWidth - 1)) - int64(1))
+
+fn TurboQuantVectorValidate(vector: TurboQuantVector): Result[bool] =
+    if vector.dim <= 0 || vector.scale <= 0:
+        return Err[bool](" turboquant vector: shape")
+    if vector.bitWidth < InferenceTurboQuantMinBitWidth || vector.bitWidth > InferenceTurboQuantMaxBitWidth:
+        return Err[bool](" turboquant vector: bit width")
+    if vector.baseCodes.valueCount != vector.dim || vector.residualSigns.valueCount != vector.dim:
+        return Err[bool](" turboquant vector: packed count")
+    if vector.baseCodes.bitWidth != vector.bitWidth || vector.residualSigns.bitWidth != 1:
+        return Err[bool](" turboquant vector: packed bit width")
+    if vector.radius < 0 || vector.residualMeanAbs < 0:
+        return Err[bool](" turboquant vector: scale")
+    return Ok[bool](true)
+
+fn TurboQuantVectorFromTensorFill(out: var TurboQuantVector,
+                                  vector: TensorQ,
+                                  bitWidth: int32): Result[bool] =
+    let tensorOk = TensorValidate(vector)
+    if IsErr(tensorOk):
+        return Err[bool](Error(tensorOk))
+    if !TensorIsVector(vector):
+        return Err[bool](" turboquant vector: input rank")
+    if bitWidth < InferenceTurboQuantMinBitWidth || bitWidth > InferenceTurboQuantMaxBitWidth:
+        return Err[bool](" turboquant vector: bit width")
+    let dim = vector.shape[0]
+    let positiveMax = TurboQuantPositiveMax(bitWidth)
+    if positiveMax <= 0:
+        return Err[bool](" turboquant vector: positive max")
+    var radius: int32
+    radius = 0
+    var i: int32
+    i = 0
+    while i < dim:
+        let av = InferenceAbsI32(vector.data[i])
+        if av > radius:
+            radius = av
+        i = i + 1
+    var baseValues: int32[]
+    var signValues: int32[]
+    var residualAbsTotal: int64
+    residualAbsTotal = int64(0)
+    i = 0
+    while i < dim:
+        var q: int32
+        q = 0
+        var deq: int32
+        deq = 0
+        if radius > 0:
+            q = InferenceSaturateI32(InferenceRoundDivI64(int64(vector.data[i]) * int64(positiveMax), int64(radius)))
+            if q > positiveMax:
+                q = positiveMax
+            if q < 0 - positiveMax:
+                q = 0 - positiveMax
+            deq = InferenceSaturateI32(InferenceRoundDivI64(int64(q) * int64(radius), int64(positiveMax)))
+        let residual = vector.data[i] - deq
+        residualAbsTotal = residualAbsTotal + InferenceAbsI64(int64(residual))
+        add(baseValues, q + positiveMax)
+        if residual >= 0:
+            add(signValues, 1)
+        else:
+            add(signValues, 0)
+        i = i + 1
+    out.dim = dim
+    out.bitWidth = bitWidth
+    out.scale = vector.scale
+    out.radius = radius
+    if dim > 0:
+        out.residualMeanAbs = InferenceSaturateI32(InferenceRoundDivI64(residualAbsTotal, int64(dim)))
+    let baseRes = PackedBitsFromValuesFill(out.baseCodes, bitWidth, baseValues)
+    if IsErr(baseRes):
+        return Err[bool](Error(baseRes))
+    let signRes = PackedBitsFromValuesFill(out.residualSigns, 1, signValues)
+    if IsErr(signRes):
+        return Err[bool](Error(signRes))
+    return TurboQuantVectorValidate(out)
+
+fn TurboQuantVectorApproxValue(vector: TurboQuantVector, index: int32): Result[int32] =
+    let vectorOk = TurboQuantVectorValidate(vector)
+    if IsErr(vectorOk):
+        return Err[int32](Error(vectorOk))
+    if index < 0 || index >= vector.dim:
+        return Err[int32](" turboquant vector: index")
+    let positiveMax = TurboQuantPositiveMax(vector.bitWidth)
+    let codeRes = PackedBitsGet(vector.baseCodes, index)
+    if IsErr(codeRes):
+        return Err[int32](Error(codeRes))
+    let q = Value(codeRes) - positiveMax
+    var value: int32
+    value = 0
+    if vector.radius > 0:
+        value = InferenceSaturateI32(InferenceRoundDivI64(int64(q) * int64(vector.radius), int64(positiveMax)))
+    let signRes = PackedBitsGet(vector.residualSigns, index)
+    if IsErr(signRes):
+        return Err[int32](Error(signRes))
+    if Value(signRes) == 0:
+        value = value - vector.residualMeanAbs
+    else:
+        value = value + vector.residualMeanAbs
+    return Ok[int32](value)
+
+fn TurboQuantVectorDequantizeFill(out: var TensorQ, vector: TurboQuantVector): Result[bool] =
+    let vectorOk = TurboQuantVectorValidate(vector)
+    if IsErr(vectorOk):
+        return Err[bool](Error(vectorOk))
+    let zerosRes = TensorZerosFill(out, [vector.dim], vector.scale)
+    if IsErr(zerosRes):
+        return Err[bool](Error(zerosRes))
+    var i: int32
+    i = 0
+    while i < vector.dim:
+        let valueRes = TurboQuantVectorApproxValue(vector, i)
+        if IsErr(valueRes):
+            return Err[bool](Error(valueRes))
+        out.data[i] = Value(valueRes)
+        i = i + 1
+    return Ok[bool](true)
+
+fn TurboQuantDot(vector: TurboQuantVector, query: TensorQ): Result[int32] =
+    let vectorOk = TurboQuantVectorValidate(vector)
+    if IsErr(vectorOk):
+        return Err[int32](Error(vectorOk))
+    let queryOk = TensorValidate(query)
+    if IsErr(queryOk):
+        return Err[int32](Error(queryOk))
+    if !TensorIsVector(query) || query.shape[0] != vector.dim || query.scale != vector.scale:
+        return Err[int32](" turboquant dot: query shape")
+    var sum: int64
+    sum = int64(0)
+    var i: int32
+    i = 0
+    while i < vector.dim:
+        let valueRes = TurboQuantVectorApproxValue(vector, i)
+        if IsErr(valueRes):
+            return Err[int32](Error(valueRes))
+        let product = int64(Value(valueRes)) * int64(query.data[i])
+        sum = sum + InferenceRoundDivI64(product, int64(query.scale))
+        i = i + 1
+    return Ok[int32](InferenceSaturateI32(sum))
+
+fn TurboQuantKVCacheInit(keyDim: int32,
+                         valueDim: int32,
+                         keyBitWidth: int32,
+                         valueBitWidth: int32,
+                         keyScale: int32,
+                         valueScale: int32): Result[TurboQuantKVCache] =
+    if keyDim <= 0 || valueDim <= 0 || keyScale <= 0 || valueScale <= 0:
+        return Err[TurboQuantKVCache](" turboquant kv: dim or scale")
+    if keyBitWidth < InferenceTurboQuantMinBitWidth || keyBitWidth > InferenceTurboQuantMaxBitWidth:
+        return Err[TurboQuantKVCache](" turboquant kv: key bit width")
+    if valueBitWidth < InferenceTurboQuantMinBitWidth || valueBitWidth > InferenceTurboQuantMaxBitWidth:
+        return Err[TurboQuantKVCache](" turboquant kv: value bit width")
+    return Ok[TurboQuantKVCache](TurboQuantKVCache(
+        keyDim: keyDim,
+        valueDim: valueDim,
+        keyBitWidth: keyBitWidth,
+        valueBitWidth: valueBitWidth,
+        keyScale: keyScale,
+        valueScale: valueScale
+    ))
+
+fn TurboQuantKVCacheAppend(cache: var TurboQuantKVCache,
+                           key: TensorQ,
+                           value: TensorQ): Result[bool] =
+    let keyOk = TensorValidate(key)
+    if IsErr(keyOk):
+        return Err[bool](Error(keyOk))
+    let valueOk = TensorValidate(value)
+    if IsErr(valueOk):
+        return Err[bool](Error(valueOk))
+    if !TensorIsVector(key) || key.shape[0] != cache.keyDim || key.scale != cache.keyScale:
+        return Err[bool](" turboquant kv: key shape")
+    if !TensorIsVector(value) || value.shape[0] != cache.valueDim || value.scale != cache.valueScale:
+        return Err[bool](" turboquant kv: value shape")
+    var qKey: TurboQuantVector
+    let keyRes = TurboQuantVectorFromTensorFill(qKey, key, cache.keyBitWidth)
+    if IsErr(keyRes):
+        return Err[bool](Error(keyRes))
+    var qValue: TurboQuantVector
+    let valueRes = TurboQuantVectorFromTensorFill(qValue, value, cache.valueBitWidth)
+    if IsErr(valueRes):
+        return Err[bool](Error(valueRes))
+    add(cache.keys, qKey)
+    add(cache.values, qValue)
+    return Ok[bool](true)
+
+fn TurboQuantKVCacheScoresFill(out: var TensorQ,
+                               cache: TurboQuantKVCache,
+                               query: TensorQ): Result[bool] =
+    let queryOk = TensorValidate(query)
+    if IsErr(queryOk):
+        return Err[bool](Error(queryOk))
+    if !TensorIsVector(query) || query.shape[0] != cache.keyDim || query.scale != cache.keyScale:
+        return Err[bool](" turboquant kv: query shape")
+    if cache.keys.len != cache.values.len:
+        return Err[bool](" turboquant kv: cache shape")
+    let zerosRes = TensorZerosFill(out, [cache.keys.len], cache.keyScale)
+    if IsErr(zerosRes):
+        return Err[bool](Error(zerosRes))
+    var i: int32
+    i = 0
+    while i < cache.keys.len:
+        let scoreRes = TurboQuantDot(cache.keys[i], query)
+        if IsErr(scoreRes):
+            return Err[bool](Error(scoreRes))
+        out.data[i] = Value(scoreRes)
+        i = i + 1
+    return Ok[bool](true)
+
+fn TurboQuantKVAttentionFill(out: var TensorQ,
+                             cache: TurboQuantKVCache,
+                             query: TensorQ,
+                             weightScale: int32): Result[bool] =
+    if cache.keys.len <= 0 || cache.keys.len != cache.values.len:
+        return Err[bool](" turboquant kv: empty or invalid cache")
+    var scores: TensorQ
+    let scoreRes = TurboQuantKVCacheScoresFill(scores, cache, query)
+    if IsErr(scoreRes):
+        return Err[bool](Error(scoreRes))
+    var weights: TensorQ
+    let softmaxRes = SoftmaxLastDimFill(weights, scores, weightScale)
+    if IsErr(softmaxRes):
+        return Err[bool](Error(softmaxRes))
+    let zerosRes = TensorZerosFill(out, [cache.valueDim], cache.valueScale)
+    if IsErr(zerosRes):
+        return Err[bool](Error(zerosRes))
+    var item: int32
+    item = 0
+    while item < cache.values.len:
+        var dim: int32
+        dim = 0
+        while dim < cache.valueDim:
+            let valueRes = TurboQuantVectorApproxValue(cache.values[item], dim)
+            if IsErr(valueRes):
+                return Err[bool](Error(valueRes))
+            let product = int64(weights.data[item]) * int64(Value(valueRes))
+            out.data[dim] = out.data[dim] + InferenceSaturateI32(InferenceRoundDivI64(product, int64(weights.scale)))
+            dim = dim + 1
+        item = item + 1
+    return Ok[bool](true)

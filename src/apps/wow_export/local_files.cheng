@@ -1,4 +1,5 @@
 import std/bytes as bytes
+import std/os
 import std/result
 import std/strings as strings
 import std/strformat
@@ -20,9 +21,56 @@ type
 
     LocalFileAuditEntryStat =
         fileDataID: int32
+        encodingKey: str
         archiveIndex: int32
         offset: int32
         size: int32
+
+const
+    localFilesDecodedCacheDir = "/tmp/cheng_wow_export_decode_cache_v1"
+
+fn localFilesMakeDirAll(path: str): bool =
+    if strings.Len(path) == 0:
+        return false
+    if os.DirExists(path):
+        return true
+    let parent: str = os.ParentDir(path)
+    if strings.Len(parent) > 0 && parent != path && !os.DirExists(parent):
+        if !localFilesMakeDirAll(parent):
+            return false
+    if !os.DirExists(path):
+        os.CreateDir(path)
+    return os.DirExists(path)
+
+fn localFilesDecodedCachePath(encodingKey: str, encodedSize: int32): str =
+    let sizeText: str = strings.IntToStr(encodedSize)
+    return Fmt"{localFilesDecodedCacheDir}/{encodingKey}-{sizeText}.bin"
+
+fn localFilesWriteBufferAtomic(path: str, buf: bytes.ByteBuffer): Result[bool] =
+    if strings.Len(path) == 0 || buf.len <= 0 || buf.data == nil:
+        return Err[bool]("wowExport local-files: invalid decoded cache write")
+    let parent: str = os.ParentDir(path)
+    if strings.Len(parent) > 0 && !os.DirExists(parent):
+        if !localFilesMakeDirAll(parent):
+            return Err[bool]("wowExport local-files: decoded cache dir create failed")
+    if os.FileExists(path):
+        return Ok[bool](true)
+    let tmpPath: str = Fmt"{path}.tmp"
+    if os.FileExists(tmpPath):
+        let _ = os.RemoveFile(tmpPath)
+    let file: os.File = os.Open(tmpPath, os.fmWrite)
+    if file == nil:
+        return Err[bool]("wowExport local-files: decoded cache open failed")
+    let wrote: int32 = os.C_fwrite(buf.data, 1, int64(buf.len), file)
+    let _ = os.C_fflush(file)
+    let _ = os.C_fclose(file)
+    if wrote != buf.len:
+        let _ = os.RemoveFile(tmpPath)
+        return Err[bool]("wowExport local-files: decoded cache short write")
+    if !os.RenameFile(tmpPath, path):
+        let _ = os.RemoveFile(tmpPath)
+        return Err[bool]("wowExport local-files: decoded cache rename failed")
+    return Ok[bool](true)
 
 fn localRootU32LEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
     if idx < 0 || idx + 4 > buf.len:
@@ -515,6 +563,7 @@ fn ResolveLocalFileAuditEntryStatsRanged(clientPath: str,
             return Err[LocalFileAuditEntryStat[]]("wowExport local-files: index entry invalid")
         var stat: LocalFileAuditEntryStat
         stat.fileDataID = fileDataIDs[i]
+        stat.encodingKey = encodingEntries[i].encodingKey
         stat.archiveIndex = idxEntry.archiveIndex
         stat.offset = idxEntry.offset
         stat.size = idxEntry.size
@@ -539,6 +588,39 @@ fn ReadLocalFileByEntry(clientPath: str,
     entry.offset = offset
     entry.size = size
     return casc_archive.CascArchiveDecodeLocalEntryFull(clientPath, entry)
+
+fn ReadLocalFileByEntryCached(clientPath: str,
+                              encodingKey: str,
+                              archiveIndex: int32,
+                              offset: int32,
+                              size: int32): Result[bytes.ByteBuffer] =
+    if strings.Len(encodingKey) == 32 && size > 0:
+        let cachePath: str = localFilesDecodedCachePath(encodingKey, size)
+        if os.FileExists(cachePath):
+            var cached: bytes.ByteBuffer = bytes.ReadFileBytes(cachePath)
+            if cached.len > 0 && cached.data != nil:
+                return Ok[bytes.ByteBuffer](cached)
+            bytes.FreeByteBuffer(cached)
+            let _ = os.RemoveFile(cachePath)
+        let decodedRes: Result[bytes.ByteBuffer] =
+            ReadLocalFileByEntry(clientPath, archiveIndex, offset, size)
+        if IsErr(decodedRes):
+            return Err[bytes.ByteBuffer](Error(decodedRes))
+        let decoded: bytes.ByteBuffer = Value(decodedRes)
+        let writeRes: Result[bool] = localFilesWriteBufferAtomic(cachePath, decoded)
+        if IsErr(writeRes):
+            bytes.FreeByteBuffer(decoded)
+            return Err[bytes.ByteBuffer](Error(writeRes))
+        return Ok[bytes.ByteBuffer](decoded)
+    return ReadLocalFileByEntry(clientPath, archiveIndex, offset, size)
+
+fn ReadLocalFileByStat(clientPath: str,
+                       stat: LocalFileAuditEntryStat): Result[bytes.ByteBuffer] =
+    return ReadLocalFileByEntryCached(clientPath,
+                                      stat.encodingKey,
+                                      stat.archiveIndex,
+                                      stat.offset,
+                                      stat.size)
 
 fn AuditText(audit: LocalFileAudit): str =
     return Fmt"fileDataID={strings.IntToStr(audit.fileDataID)} contentKey={audit.contentKey} encodingKey={audit.encodingKey} archive={strings.IntToStr(audit.entry.archiveIndex)} offset={strings.IntToStr(audit.entry.offset)} size={strings.IntToStr(audit.entry.size)}"

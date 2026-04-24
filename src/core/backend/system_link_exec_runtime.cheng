@@ -1,0 +1,343 @@
+import std/result
+import std/os
+import std/cmdline as cmdline
+import std/strformat
+import std/strutils as strutil
+import cheng/core/tooling/bootstrap_contracts as contracts
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/line_map as linemap
+import cheng/core/backend/native_link_exec as nlink
+import cheng/core/backend/native_link_plan as nplan
+import cheng/core/backend/primary_object_emit as pemit
+import cheng/core/backend/system_link_exec as sexec
+import cheng/core/backend/system_link_plan as slplan
+
+type
+    SystemLinkExecRuntimeResult =
+        providerCompilerPath: str
+        primaryObjectPath: str
+        primaryObjectAsmPath: str
+        primaryObjectCompileLogPath: str
+        providerObjectPaths: str[]
+        providerCompileLogPaths: str[]
+        nativeLinkLogPath: str
+        lineMapPath: str
+        primaryObjectNs: int64
+        providerObjectsNs: int64
+        nativeLinkNs: int64
+        lineMapNs: int64
+        standaloneZeroExit: bool
+
+fn SystemLinkExecRuntimeNowNs(): int64 =
+    return sexec.SystemLinkExecNowNs()
+
+fn SystemLinkExecRuntimePhaseMsText(ns: int64): str =
+    if ns <= int64(0):
+        return "0"
+    return int64ToStr(ns / int64(1000000))
+
+fn SystemLinkExecRuntimeAppendLine(out: var str, line: str) =
+    if len(out) > 0:
+        out = out + "\n"
+    out = out + line
+
+fn SystemLinkExecRuntimeCurrentExecutablePath(rootDir: str): str =
+    let raw = strutil.Strip(cmdline.ProgramName())
+    if len(raw) <= 0:
+        return ""
+    let resolved = hostops.ResolveProgram(rootDir, raw)
+    if len(resolved) > 0:
+        return resolved
+    return chengpath.PathAbsolute(rootDir, raw)
+
+fn SystemLinkExecRuntimeResolveProviderCompiler(rootDir: str,
+                                                 requestedCompilerPath: str): Result[str] =
+    let requested = strutil.Strip(requestedCompilerPath)
+    if len(requested) > 0:
+        let absolute = chengpath.PathAbsolute(rootDir, requested)
+        if chengpath.FileExistsNonEmpty(rootDir, absolute):
+            return Ok[str](absolute)
+        return Err[str](" system link exec runtime: missing provider compiler: " + absolute)
+    let current = SystemLinkExecRuntimeCurrentExecutablePath(rootDir)
+    if len(current) > 0 && chengpath.FileExistsNonEmpty(rootDir, current):
+        return Ok[str](current)
+    let stage3 = contracts.BootstrapStage3Path(rootDir)
+    if chengpath.FileExistsNonEmpty(rootDir, stage3):
+        return Ok[str](stage3)
+    return Err[str](" system link exec runtime: missing provider compiler/current stage3")
+
+fn SystemLinkExecRuntimeReasonsError(label: str, reasons: str[]): str =
+    return Fmt" system link exec runtime: {label}: {slplan.SystemLinkPlanListText(reasons)}"
+
+fn SystemLinkExecRuntimeValidateProviderPlan(plan: sexec.SystemLinkExecPlan): Result[bool] =
+    if plan.objectPlan.providerSourcePaths.len != plan.objectPlan.providerObjectPaths.len:
+        return Err[bool](" system link exec runtime: provider source/object count mismatch")
+    for i in 0..<plan.objectPlan.providerSourcePaths.len:
+        let sourcePath = plan.objectPlan.providerSourcePaths[i]
+        let objectPath = plan.objectPlan.providerObjectPaths[i]
+        if len(sourcePath) <= 0:
+            return Err[bool](Fmt" system link exec runtime: provider source missing at index {intToStr(i)}")
+        if len(objectPath) <= 0:
+            return Err[bool](Fmt" system link exec runtime: provider object missing at index {intToStr(i)}")
+        if !chengpath.PathFileExists(sourcePath):
+            return Err[bool](" system link exec runtime: provider source file missing: " + sourcePath)
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeValidateExecutablePlan(rootDir: str,
+                                                plan: sexec.SystemLinkExecPlan): Result[bool] =
+    if plan.systemLinkPlan.missingReasons.len > 0:
+        return Err[bool](SystemLinkExecRuntimeReasonsError("system link plan blocked",
+                                                           plan.systemLinkPlan.missingReasons))
+    if plan.loweringPlan.missingReasons.len > 0:
+        return Err[bool](SystemLinkExecRuntimeReasonsError("lowering plan blocked",
+                                                           plan.loweringPlan.missingReasons))
+    if plan.primaryObjectPlan.missingReasons.len > 0:
+        return Err[bool](SystemLinkExecRuntimeReasonsError("primary object plan blocked",
+                                                           plan.primaryObjectPlan.missingReasons))
+    if plan.objectPlan.missingReasons.len > 0:
+        return Err[bool](SystemLinkExecRuntimeReasonsError("object plan blocked",
+                                                           plan.objectPlan.missingReasons))
+    if plan.nativeLinkPlan.missingReasons.len > 0:
+        return Err[bool](SystemLinkExecRuntimeReasonsError("native link plan blocked",
+                                                           plan.nativeLinkPlan.missingReasons))
+    let providerRes = SystemLinkExecRuntimeValidateProviderPlan(plan)
+    if IsErr(providerRes):
+        return providerRes
+    if len(plan.objectPlan.browserBridgeObjectPath) > 0 &&
+       !chengpath.FileExistsNonEmpty(rootDir, plan.objectPlan.browserBridgeObjectPath):
+        return Err[bool](" system link exec runtime: browser bridge object not materialized: " + plan.objectPlan.browserBridgeObjectPath)
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeCanStandaloneZeroExit(plan: sexec.SystemLinkExecPlan): bool =
+    if plan.systemLinkPlan.emitKind != creq.EmitExe:
+        return false
+    if plan.systemLinkPlan.targetTriple != "arm64-apple-darwin":
+        return false
+    if len(plan.objectPlan.browserBridgeObjectPath) > 0:
+        return false
+    if plan.loweringPlan.functionNames.len != 1:
+        return false
+    if plan.loweringPlan.functionEntryFlags.len != 1 || plan.loweringPlan.functionEntryFlags[0] == 0:
+        return false
+    if plan.primaryObjectPlan.functionBodyKinds.len < 1:
+        return false
+    return plan.primaryObjectPlan.functionBodyKinds[0] == "return_zero_i32"
+
+fn SystemLinkExecRuntimeMaterializePrimaryObject(rootDir: str,
+                                                  plan: sexec.SystemLinkExecPlan,
+                                                  standaloneMain: bool,
+                                                  result: var SystemLinkExecRuntimeResult): Result[bool] =
+    let startNs = SystemLinkExecRuntimeNowNs()
+    var emitRes: Result[pemit.PrimaryObjectEmitResult]
+    if standaloneMain:
+        emitRes = pemit.PrimaryObjectEmitRunStandaloneMainLogged(rootDir,
+                                                                 "system_link_exec_primary_object_standalone",
+                                                                 plan.primaryObjectPlan)
+    else:
+        emitRes = pemit.PrimaryObjectEmitRunLogged(rootDir,
+                                                   "system_link_exec_primary_object",
+                                                   plan.primaryObjectPlan)
+    result.primaryObjectNs = SystemLinkExecRuntimeNowNs() - startNs
+    if IsErr(emitRes):
+        return Err[bool](Error(emitRes))
+    let emit = Value(emitRes)
+    result.primaryObjectPath = emit.objectPath
+    result.primaryObjectAsmPath = emit.asmPath
+    result.primaryObjectCompileLogPath = emit.compileLogPath
+    if !chengpath.FileExistsNonEmpty(rootDir, emit.objectPath):
+        return Err[bool](" system link exec runtime: primary object missing after emit: " + emit.objectPath)
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeProviderCompileArgs(plan: sexec.SystemLinkExecPlan,
+                                             sourcePath: str,
+                                             objectPath: str): str[] =
+    var argv: str[]
+    add(argv, "system-link-exec")
+    add(argv, "--root:" + plan.systemLinkPlan.packageRoot)
+    add(argv, "--in:" + sourcePath)
+    add(argv, "--emit:obj")
+    add(argv, "--target:" + plan.systemLinkPlan.targetTriple)
+    add(argv, "--out:" + objectPath)
+    return argv
+
+fn SystemLinkExecRuntimeCompileProviderObject(rootDir: str,
+                                               compilerPath: str,
+                                               plan: sexec.SystemLinkExecPlan,
+                                               sourcePath: str,
+                                               objectPath: str,
+                                               index: int32): Result[hostops.LoggedRun] =
+    let parent = chengpath.PathParentDir(objectPath)
+    if len(parent) > 0 && !chengpath.MkdirP(rootDir, parent):
+        return Err[hostops.LoggedRun](" system link exec runtime: failed to create provider object dir: " + parent)
+    let objectAbs = chengpath.PathAbsolute(rootDir, objectPath)
+    if os.FileExists(objectAbs):
+        let _ = os.RemoveFile(objectAbs)
+    let logPath = objectPath + ".compile.log"
+    let logAbs = chengpath.PathAbsolute(rootDir, logPath)
+    if os.FileExists(logAbs):
+        let _ = os.RemoveFile(logAbs)
+    let argv = SystemLinkExecRuntimeProviderCompileArgs(plan, sourcePath, objectPath)
+    let run = hostops.RunFileLogged(rootDir,
+                                    Fmt"system_link_exec_provider_{intToStr(index)}",
+                                    compilerPath,
+                                    argv,
+                                    [],
+                                    rootDir,
+                                    0,
+                                    logPath)
+    if run.exitCode != 0:
+        return Err[hostops.LoggedRun](Fmt" system link exec runtime: provider compile failed rc={intToStr(run.exitCode)} source={sourcePath} log={run.logPath}\n{run.output}")
+    if !chengpath.FileExistsNonEmpty(rootDir, objectPath):
+        return Err[hostops.LoggedRun](" system link exec runtime: provider object missing after compile: " + objectPath)
+    return Ok[hostops.LoggedRun](run)
+
+fn SystemLinkExecRuntimeMaterializeProviderObjects(rootDir: str,
+                                                    compilerPath: str,
+                                                    plan: sexec.SystemLinkExecPlan,
+                                                    result: var SystemLinkExecRuntimeResult): Result[bool] =
+    let startNs = SystemLinkExecRuntimeNowNs()
+    for i in 0..<plan.objectPlan.providerSourcePaths.len:
+        let sourcePath = plan.objectPlan.providerSourcePaths[i]
+        let objectPath = plan.objectPlan.providerObjectPaths[i]
+        let runRes = SystemLinkExecRuntimeCompileProviderObject(rootDir,
+                                                                compilerPath,
+                                                                plan,
+                                                                sourcePath,
+                                                                objectPath,
+                                                                i)
+        if IsErr(runRes):
+            result.providerObjectsNs = SystemLinkExecRuntimeNowNs() - startNs
+            return Err[bool](Error(runRes))
+        let run = Value(runRes)
+        add(result.providerObjectPaths, objectPath)
+        add(result.providerCompileLogPaths, run.logPath)
+    result.providerObjectsNs = SystemLinkExecRuntimeNowNs() - startNs
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeStandaloneNativePlan(plan: sexec.SystemLinkExecPlan,
+                                              primaryObjectPath: str): nplan.NativeLinkPlanStub =
+    var out: nplan.NativeLinkPlanStub
+    var linkInputs: str[]
+    add(linkInputs, primaryObjectPath)
+    out.targetTriple = plan.systemLinkPlan.targetTriple
+    out.emitKind = creq.EmitExe
+    out.outputPath = plan.systemLinkPlan.outputPath
+    out.linkerProgram = "cc"
+    out.linkerFlavor = "ld64"
+    out.outputKind = nplan.NativeOutputExecutable
+    out.entrySymbol = "main"
+    out.primaryObjectPath = primaryObjectPath
+    out.browserBridgeObjectPath = ""
+    out.linkInputPaths = linkInputs
+    out.missingReasons = []
+    out.pipelineStage = "standalone_primary_object_to_native_link_plan"
+    return out
+
+fn SystemLinkExecRuntimeNativeLinkLogPath(plan: sexec.SystemLinkExecPlan): str =
+    if len(plan.systemLinkPlan.outputPath) <= 0:
+        return ""
+    return plan.systemLinkPlan.outputPath + ".native_link.log"
+
+fn SystemLinkExecRuntimeRunNativeLink(rootDir: str,
+                                       plan: sexec.SystemLinkExecPlan,
+                                       nativePlan: nplan.NativeLinkPlanStub,
+                                       result: var SystemLinkExecRuntimeResult): Result[bool] =
+    let startNs = SystemLinkExecRuntimeNowNs()
+    let logPath = SystemLinkExecRuntimeNativeLinkLogPath(plan)
+    let outputAbs = chengpath.PathAbsolute(rootDir, plan.systemLinkPlan.outputPath)
+    if len(outputAbs) > 0 && os.FileExists(outputAbs):
+        let _ = os.RemoveFile(outputAbs)
+    let run = nlink.NativeLinkExecRunLogged(rootDir,
+                                            "system_link_exec_native_link",
+                                            nativePlan,
+                                            logPath)
+    result.nativeLinkLogPath = run.logPath
+    result.nativeLinkNs = SystemLinkExecRuntimeNowNs() - startNs
+    if run.exitCode != 0:
+        return Err[bool](Fmt" system link exec runtime: native link failed rc={intToStr(run.exitCode)} log={run.logPath}\n{run.output}")
+    if !chengpath.FileExistsNonEmpty(rootDir, plan.systemLinkPlan.outputPath):
+        return Err[bool](" system link exec runtime: native output missing after link: " + plan.systemLinkPlan.outputPath)
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeWriteLineMap(rootDir: str,
+                                      plan: sexec.SystemLinkExecPlan,
+                                      result: var SystemLinkExecRuntimeResult): Result[bool] =
+    let startNs = SystemLinkExecRuntimeNowNs()
+    let lineMapRes = linemap.WriteExecutableLineMap(rootDir,
+                                                    plan.systemLinkPlan,
+                                                    plan.loweringPlan)
+    result.lineMapNs = SystemLinkExecRuntimeNowNs() - startNs
+    if IsErr(lineMapRes):
+        return Err[bool](Error(lineMapRes))
+    result.lineMapPath = Value(lineMapRes)
+    if plan.systemLinkPlan.emitKind == creq.EmitExe &&
+       len(result.lineMapPath) > 0 &&
+       !chengpath.FileExistsNonEmpty(rootDir, result.lineMapPath):
+        return Err[bool](" system link exec runtime: line-map missing after write: " + result.lineMapPath)
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeExecutePlanWithCompiler(rootDir: str,
+                                                 plan: sexec.SystemLinkExecPlan,
+                                                 requestedProviderCompilerPath: str): Result[SystemLinkExecRuntimeResult] =
+    var result: SystemLinkExecRuntimeResult
+    let standaloneMain = SystemLinkExecRuntimeCanStandaloneZeroExit(plan)
+    let primaryRes = SystemLinkExecRuntimeMaterializePrimaryObject(rootDir,
+                                                                   plan,
+                                                                   standaloneMain,
+                                                                   result)
+    if IsErr(primaryRes):
+        return Err[SystemLinkExecRuntimeResult](Error(primaryRes))
+    if plan.systemLinkPlan.emitKind == creq.EmitObj:
+        return Ok[SystemLinkExecRuntimeResult](result)
+    result.standaloneZeroExit = standaloneMain
+    let validRes = SystemLinkExecRuntimeValidateExecutablePlan(rootDir, plan)
+    if IsErr(validRes):
+        return Err[SystemLinkExecRuntimeResult](Error(validRes))
+    if !standaloneMain && plan.objectPlan.providerSourcePaths.len > 0:
+        let compilerRes = SystemLinkExecRuntimeResolveProviderCompiler(rootDir, requestedProviderCompilerPath)
+        if IsErr(compilerRes):
+            return Err[SystemLinkExecRuntimeResult](Error(compilerRes))
+        result.providerCompilerPath = Value(compilerRes)
+        let providerRes = SystemLinkExecRuntimeMaterializeProviderObjects(rootDir,
+                                                                          result.providerCompilerPath,
+                                                                          plan,
+                                                                          result)
+        if IsErr(providerRes):
+            return Err[SystemLinkExecRuntimeResult](Error(providerRes))
+    var nativePlan = plan.nativeLinkPlan
+    if standaloneMain:
+        nativePlan = SystemLinkExecRuntimeStandaloneNativePlan(plan, result.primaryObjectPath)
+    let nativeRes = SystemLinkExecRuntimeRunNativeLink(rootDir, plan, nativePlan, result)
+    if IsErr(nativeRes):
+        return Err[SystemLinkExecRuntimeResult](Error(nativeRes))
+    let lineMapRes = SystemLinkExecRuntimeWriteLineMap(rootDir, plan, result)
+    if IsErr(lineMapRes):
+        return Err[SystemLinkExecRuntimeResult](Error(lineMapRes))
+    return Ok[SystemLinkExecRuntimeResult](result)
+
+fn SystemLinkExecRuntimeExecutePlan(rootDir: str,
+                                     plan: sexec.SystemLinkExecPlan): Result[SystemLinkExecRuntimeResult] =
+    return SystemLinkExecRuntimeExecutePlanWithCompiler(rootDir, plan, "")
+
+fn SystemLinkExecRuntimeResultReport(result: SystemLinkExecRuntimeResult): str =
+    var out = ""
+    let standaloneText = result.standaloneZeroExit ? "1" : "0"
+    SystemLinkExecRuntimeAppendLine(out, "system_link_exec_runtime_execute=1")
+    SystemLinkExecRuntimeAppendLine(out, "system_link_exec_runtime_standalone_zero_exit=" + standaloneText)
+    SystemLinkExecRuntimeAppendLine(out, "primary_object_path=" + result.primaryObjectPath)
+    SystemLinkExecRuntimeAppendLine(out, "primary_object_asm_path=" + result.primaryObjectAsmPath)
+    SystemLinkExecRuntimeAppendLine(out, "primary_object_compile_log=" + result.primaryObjectCompileLogPath)
+    SystemLinkExecRuntimeAppendLine(out, "provider_compiler=" + result.providerCompilerPath)
+    SystemLinkExecRuntimeAppendLine(out, "provider_object_count=" + intToStr(result.providerObjectPaths.len))
+    SystemLinkExecRuntimeAppendLine(out, "provider_object_paths=" + slplan.SystemLinkPlanListText(result.providerObjectPaths))
+    SystemLinkExecRuntimeAppendLine(out, "provider_compile_logs=" + slplan.SystemLinkPlanListText(result.providerCompileLogPaths))
+    SystemLinkExecRuntimeAppendLine(out, "native_link_log=" + result.nativeLinkLogPath)
+    SystemLinkExecRuntimeAppendLine(out, "debug_line_map_path=" + result.lineMapPath)
+    SystemLinkExecRuntimeAppendLine(out, "exec_phase_primary_object_emit_ms=" + SystemLinkExecRuntimePhaseMsText(result.primaryObjectNs))
+    SystemLinkExecRuntimeAppendLine(out, "exec_phase_provider_objects_ms=" + SystemLinkExecRuntimePhaseMsText(result.providerObjectsNs))
+    SystemLinkExecRuntimeAppendLine(out, "exec_phase_native_link_ms=" + SystemLinkExecRuntimePhaseMsText(result.nativeLinkNs))
+    SystemLinkExecRuntimeAppendLine(out, "exec_phase_line_map_ms=" + SystemLinkExecRuntimePhaseMsText(result.lineMapNs))
+    SystemLinkExecRuntimeAppendLine(out, "exec_pipeline_stage=system_link_exec_runtime_execute")
+    return out

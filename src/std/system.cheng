@@ -350,7 +350,35 @@ fn chengStrBorrowLoadCompat(slot: ptr): str =
 fn chengStrStoreCompat(slot: ptr, val: str) =
     if slot == nil:
         return
-    chengStrBridgeStoreCompatRaw(slot, val)
+    let ptrBytes: int32 = ptrSize()
+    let i32Bytes: int32 = int32(sizeof(int32))
+    let prevData: ptr = ptrLoadCompat(slot)
+    let prevFlags: int32 = int32LoadCompat(system_ptr_add(slot, ptrBytes + i32Bytes + i32Bytes))
+    var nextData: ptr
+    var nextLen: int32
+    var nextStoreId: int32
+    var nextFlags: int32
+    if val.data != nil && val.len > 0:
+        if val.flags == chengStrFlagOwned:
+            memRetain(val.data)
+            nextData = val.data
+            nextLen = val.len
+            nextStoreId = val.store_id
+            nextFlags = val.flags
+        else:
+            let copied: str = newStringCopy(val.data, val.len)
+            if copied.data != nil && copied.flags == chengStrFlagOwned:
+                memRetain(copied.data)
+            nextData = copied.data
+            nextLen = copied.len
+            nextStoreId = copied.store_id
+            nextFlags = copied.flags
+    ptrStoreCompat(slot, nextData)
+    int32StoreCompat(system_ptr_add(slot, ptrBytes), nextLen)
+    int32StoreCompat(system_ptr_add(slot, ptrBytes + i32Bytes), nextStoreId)
+    int32StoreCompat(system_ptr_add(slot, ptrBytes + i32Bytes + i32Bytes), nextFlags)
+    if prevData != nil && prevFlags == chengStrFlagOwned:
+        memRelease(prevData)
 
 fn `[]`(seqInst: str[], i: int32): str =
     let seqLen: int32 = seqInst.len

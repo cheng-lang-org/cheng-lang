@@ -10,6 +10,8 @@ import cheng/core/backend/line_map as linemap
 import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/build_plan as buildplan
+import cheng/core/backend/system_link_exec as sexec
+import cheng/core/backend/system_link_exec_runtime as sexecrt
 import cheng/core/backend/system_link_plan as slplan
 import cheng/core/tooling/bootstrap_contracts as contracts
 import cheng/core/tooling/compiler_runtime as crun
@@ -33,7 +35,7 @@ import cheng/core/tooling/support_matrix as smatrix
 import cheng/core/tooling/wasm_smoke_gate as wsgate
 
 const
-    BackendDriverSystemLinkExecCacheVersion = "system-link-exec-cache-v2"
+    BackendDriverSystemLinkExecCacheVersion = "system-link-exec-cache-v3"
     BackendDriverSystemLinkExecCacheRequireHitEnv = "CHENG_BACKEND_DRIVER_REQUIRE_SYSTEM_LINK_EXEC_CACHE_HIT"
 
 @importc("get_stdout")
@@ -1322,8 +1324,54 @@ fn BackendDriverCacheSourceFileCid(pathRaw: str): Result[layout.FixedBytes32] =
         return Err[layout.FixedBytes32](" backend driver system-link-exec cache: missing source path: " + path)
     return Ok[layout.FixedBytes32](BackendDriverCacheHashText(chengpath.ReadTextFile("", path)))
 
+fn BackendDriverCacheAppendSourceFile(buf: var layout.ByteBuf,
+                                        rootDir: str,
+                                        relPath: str): Result[bool] =
+    let path = chengpath.PathAbsolute(rootDir, relPath)
+    let cidRes = BackendDriverCacheSourceFileCid(path)
+    if IsErr(cidRes):
+        return Err[bool](Error(cidRes))
+    BackendDriverCacheAppendText(buf, relPath)
+    BackendDriverCacheAppendFixed32(buf, Value(cidRes))
+    return Ok[bool](true)
+
 fn BackendDriverCacheCodegenCid(rootDir: str): Result[layout.FixedBytes32] =
-    return BackendDriverCacheSourceFileCid(chengpath.PathAbsolute(rootDir, "bootstrap/cheng_seed.c"))
+    var buf = layout.ByteBufInit(4096)
+    BackendDriverCacheAppendText(buf, "backend-driver-system-link-exec-codegen-v3")
+    let seedRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "bootstrap/cheng_seed.c")
+    if IsErr(seedRes):
+        return Err[layout.FixedBytes32](Error(seedRes))
+    let driverRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/tooling/backend_driver_main.cheng")
+    if IsErr(driverRes):
+        return Err[layout.FixedBytes32](Error(driverRes))
+    let systemPlanRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/backend/system_link_plan.cheng")
+    if IsErr(systemPlanRes):
+        return Err[layout.FixedBytes32](Error(systemPlanRes))
+    let systemExecRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/backend/system_link_exec.cheng")
+    if IsErr(systemExecRes):
+        return Err[layout.FixedBytes32](Error(systemExecRes))
+    let primaryPlanRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/backend/primary_object_plan.cheng")
+    if IsErr(primaryPlanRes):
+        return Err[layout.FixedBytes32](Error(primaryPlanRes))
+    let primaryEmitRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/backend/primary_object_emit.cheng")
+    if IsErr(primaryEmitRes):
+        return Err[layout.FixedBytes32](Error(primaryEmitRes))
+    let nativePlanRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/backend/native_link_plan.cheng")
+    if IsErr(nativePlanRes):
+        return Err[layout.FixedBytes32](Error(nativePlanRes))
+    let runtimeRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/backend/system_link_exec_runtime.cheng")
+    if IsErr(runtimeRes):
+        return Err[layout.FixedBytes32](Error(runtimeRes))
+    let nativeLinkRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/backend/native_link_exec.cheng")
+    if IsErr(nativeLinkRes):
+        return Err[layout.FixedBytes32](Error(nativeLinkRes))
+    let lineMapRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/backend/line_map.cheng")
+    if IsErr(lineMapRes):
+        return Err[layout.FixedBytes32](Error(lineMapRes))
+    let targetMatrixRes = BackendDriverCacheAppendSourceFile(buf, rootDir, "src/core/backend/target_matrix.cheng")
+    if IsErr(targetMatrixRes):
+        return Err[layout.FixedBytes32](Error(targetMatrixRes))
+    return Ok[layout.FixedBytes32](hash256.sha256Fixed(layout.ByteBufView(buf)))
 
 fn BackendDriverCacheResolveTargetCc(targetTriple: str): Result[str] =
     if targetTriple == "wasm32-unknown-unknown":
@@ -1453,17 +1501,12 @@ fn BackendDriverCopyFileBytes(rootDir: str,
     if len(parent) > 0:
         if !chengpath.MkdirP(rootDir, parent):
             return false
-    let logPath = outputPath + ".cache_copy.log"
-    let run = hostops.RunProgramLogged(rootDir,
-                                        "backend_driver_system_link_exec_cache_copy",
-                                        "cp",
-                                        ["-f", sourcePath, outputPath],
-                                        [],
-                                        rootDir,
-                                        30,
-                                        logPath)
-    if run.exitCode != 0:
+    if !chengpath.PathFileExists(sourcePath):
         return false
+    let bytes = os.ReadFile(sourcePath)
+    if len(bytes) <= 0:
+        return false
+    os.WriteFile(outputPath, bytes)
     return chengpath.FileExistsNonEmpty(rootDir, outputPath)
 
 fn BackendDriverChmodExecutable(rootDir: str,
@@ -1576,6 +1619,115 @@ fn BackendDriverTryRestoreSystemLinkExecCache(rootDir: str,
             return 1
     return 0
 
+fn BackendDriverStoreSystemLinkExecCache(rootDir: str,
+                                           args: str[]): bool =
+    if !BackendDriverSystemLinkExecCacheEnabled():
+        return true
+    let reqRes = creq.CompilerRequestFromArgs(rootDir, args)
+    if IsErr(reqRes):
+        BackendDriverPrintErr("backend driver system-link-exec cache store: " + Error(reqRes))
+        return false
+    var plan: slplan.SystemLinkPlanStub
+    var err = ""
+    if !slplan.BuildSystemLinkPlanStub(rootDir, Value(reqRes), plan, err):
+        BackendDriverPrintErr("backend driver system-link-exec cache store: " + err)
+        return false
+    if !BackendDriverSystemLinkExecCacheSupported(plan):
+        return true
+    let sourceBundleRes = BackendDriverSystemLinkExecCacheSourceBundleCid(plan)
+    if IsErr(sourceBundleRes):
+        BackendDriverPrintErr("backend driver system-link-exec cache store: " + Error(sourceBundleRes))
+        return false
+    let keyRes = BackendDriverSystemLinkExecCacheKey(rootDir, plan, Value(sourceBundleRes))
+    if IsErr(keyRes):
+        BackendDriverPrintErr("backend driver system-link-exec cache store: " + Error(keyRes))
+        return false
+    let key = Value(keyRes)
+    let outputPath = chengpath.PathAbsolute(rootDir, slplan.SystemLinkPlanOutputPath(plan))
+    let outputMapPath = BackendDriverSystemLinkExecMapPath(outputPath)
+    let cacheDir = BackendDriverSystemLinkExecCacheDir(rootDir, plan)
+    let cacheExePath = BackendDriverSystemLinkExecCacheExePath(rootDir, plan, key)
+    let cacheMapPath = BackendDriverSystemLinkExecCacheMapPath(rootDir, plan, key)
+    if !chengpath.MkdirP(rootDir, cacheDir):
+        BackendDriverPrintErr("backend driver system-link-exec cache store: failed to create cache dir: " + cacheDir)
+        return false
+    if !chengpath.FileExistsNonEmpty(rootDir, outputPath):
+        BackendDriverPrintErr("backend driver system-link-exec cache store: missing output: " + outputPath)
+        return false
+    if !BackendDriverCopyFileBytes(rootDir, outputPath, cacheExePath):
+        BackendDriverPrintErr("backend driver system-link-exec cache store: failed to copy exe: " + cacheExePath)
+        return false
+    if BackendDriverSystemLinkExecNeedMap(plan):
+        if !chengpath.FileExistsNonEmpty(rootDir, outputMapPath):
+            BackendDriverPrintErr("backend driver system-link-exec cache store: missing map: " + outputMapPath)
+            return false
+        if !BackendDriverCopyFileBytes(rootDir, outputMapPath, cacheMapPath):
+            BackendDriverPrintErr("backend driver system-link-exec cache store: failed to copy map: " + cacheMapPath)
+            return false
+    let req = Value(reqRes)
+    if len(req.reportPath) > 0 && chengpath.PathFileExists(req.reportPath):
+        var report = chengpath.ReadTextFile("", req.reportPath)
+        report = report + "\nbackend_driver_system_link_exec_cache_store=1"
+        report = report + "\nsystem_link_exec_cache_version=" + BackendDriverSystemLinkExecCacheVersion
+        report = report + "\nsystem_link_exec_cache_key=" + key
+        report = report + "\nsystem_link_exec_cache_output=" + cacheExePath
+        report = report + "\nsystem_link_exec_cache_map=" + cacheMapPath
+        if !chengpath.WriteTextFile(rootDir, req.reportPath, report):
+            BackendDriverPrintErr("backend driver system-link-exec cache store: failed to update report: " + req.reportPath)
+            return false
+    return true
+
+fn BackendDriverRequirePureSystemLinkExec(): bool =
+    return BackendDriverTruthyEnv("CHENG_REQUIRE_PURE_SYSTEM_LINK_EXEC")
+
+fn BackendDriverWritePureSystemLinkExecReport(rootDir: str,
+                                                reportPath: str,
+                                                plan: sexec.SystemLinkExecPlan,
+                                                runtimeReport: str): bool =
+    if len(reportPath) <= 0:
+        return true
+    var report = sexec.SystemLinkExecPlanReport(plan)
+    if len(runtimeReport) > 0:
+        report = report + "\n" + runtimeReport
+    return chengpath.WriteTextFile(rootDir, reportPath, report + "\n")
+
+fn BackendDriverPureSystemLinkExecUnsupported(rootDir: str,
+                                               reason: str): int32 =
+    if BackendDriverRequirePureSystemLinkExec():
+        BackendDriverPrintErr(reason)
+        return 2
+    return -1
+
+fn BackendDriverTryRunPureSystemLinkExec(rootDir: str,
+                                           args: str[]): int32 =
+    let reqRes = creq.CompilerRequestFromArgs(rootDir, args)
+    if IsErr(reqRes):
+        return BackendDriverPureSystemLinkExecUnsupported(rootDir, Error(reqRes))
+    let req = Value(reqRes)
+    let planRes = sexec.BuildSystemLinkExecPlan(rootDir, req)
+    if IsErr(planRes):
+        return BackendDriverPureSystemLinkExecUnsupported(rootDir, Error(planRes))
+    let plan = Value(planRes)
+    if !sexec.SystemLinkExecPlanReady(plan):
+        let _ = BackendDriverWritePureSystemLinkExecReport(rootDir,
+                                                           req.reportPath,
+                                                           plan,
+                                                           "system_link_exec_runtime_execute=0")
+        return BackendDriverPureSystemLinkExecUnsupported(rootDir,
+                                                         "backend driver pure system-link-exec: plan not ready")
+    let browserBridgeObjectPath = sexec.SystemLinkExecBrowserBridgeObjectPath(plan)
+    if len(browserBridgeObjectPath) > 0:
+        return BackendDriverPureSystemLinkExecUnsupported(rootDir,
+                                                         "backend driver pure system-link-exec: browser bridge object not yet in pure runtime")
+    let execRes = sexecrt.SystemLinkExecRuntimeExecutePlan(rootDir, plan)
+    if IsErr(execRes):
+        return BackendDriverPureSystemLinkExecUnsupported(rootDir, Error(execRes))
+    let runtimeReport = sexecrt.SystemLinkExecRuntimeResultReport(Value(execRes))
+    if !BackendDriverWritePureSystemLinkExecReport(rootDir, req.reportPath, plan, runtimeReport):
+        BackendDriverPrintErr("backend driver pure system-link-exec: failed to write report: " + req.reportPath)
+        return 1
+    return 0
+
 fn BackendDriverForward(rootDir: str,
                           cmd: str,
                           args: str[]): int32 =
@@ -1583,14 +1735,10 @@ fn BackendDriverForward(rootDir: str,
     let logDir = chengpath.PathAbsolute(rootDir, "artifacts/forward")
     let _ = chengpath.MkdirP(rootDir, logDir)
     let logPath = chengpath.PathAbsolute(rootDir, "artifacts/forward/backend_driver.forward.log")
-    var forwardCmd = cmd
     var forwardArgs: str[]
     var forwardEnv: str[]
     add(forwardEnv, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
-    if cmd == "system-link-exec":
-        forwardCmd = "__seed-system-link-exec"
-        add(forwardEnv, "CHENG_SEED_INTERNAL_SYSTEM_LINK_EXEC=1")
-    add(forwardArgs, forwardCmd)
+    add(forwardArgs, cmd)
     for i in 0..<args.len:
         add(forwardArgs, args[i])
     let run = hostops.RunFileLogged(rootDir,
@@ -1767,4 +1915,13 @@ fn main(argc: int32, argv: str*): int32 =
             let cacheRc = BackendDriverTryRestoreSystemLinkExecCache(rootDir, args)
             if cacheRc >= 0:
                 return cacheRc
+            let pureRc = BackendDriverTryRunPureSystemLinkExec(rootDir, args)
+            if pureRc >= 0:
+                if pureRc == 0 && !BackendDriverStoreSystemLinkExecCache(rootDir, args):
+                    return 1
+                return pureRc
+            let forwardRc = BackendDriverForward(rootDir, cmd, args)
+            if forwardRc == 0 && !BackendDriverStoreSystemLinkExecCache(rootDir, args):
+                return 1
+            return forwardRc
     return BackendDriverForward(rootDir, cmd, args)

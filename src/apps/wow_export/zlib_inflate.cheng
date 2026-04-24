@@ -7,6 +7,8 @@ import std/strformat
 import std/system
 
 type
+    UInt8Ptr = uint8 *
+
     DeflateBitReader =
         buf: bytes.ByteBuffer
         bitPos: int32
@@ -25,7 +27,7 @@ type
 
 const
     ZlibAdlerMod = 65521
-    ZlibFastDecodeBits = 10
+    ZlibFastDecodeBits = 12
 
 fn zlibMakeByteBuffer(len: int32): bytes.ByteBuffer =
     var out: bytes.ByteBuffer
@@ -44,6 +46,17 @@ fn zlibMakeIntArray(count: int32, value: int32): int32[] =
         add(out, value)
         i = i + 1
     return out
+
+fn zlibByteAt(buf: bytes.ByteBuffer, idx: int32): int32 =
+    if idx < 0 || idx >= buf.len:
+        return -1
+    let value: uint8 = *(UInt8Ptr(rawmem_support.RawmemPtrAdd(buf.data, idx)))
+    return int32(value)
+
+fn zlibSetByte(buf: bytes.ByteBuffer, idx: int32, value: int32) =
+    if idx < 0 || idx >= buf.len:
+        return
+    rawmem_support.RawmemWriteI8(buf.data, idx, int8(value & 255))
 
 fn zlibBitMask(count: int32): int32 =
     if count <= 0:
@@ -64,7 +77,7 @@ fn zlibEnsureBits(r: var DeflateBitReader, count: int32): Result[bool] =
         var takeBits: int32 = 8 - bitIdx
         if r.bitPos + takeBits > r.endBit:
             takeBits = r.endBit - r.bitPos
-        let byteValue: int32 = (bytes.BufByteAt(r.buf, byteIdx) >> bitIdx) & zlibBitMask(takeBits)
+        let byteValue: int32 = (zlibByteAt(r.buf, byteIdx) >> bitIdx) & zlibBitMask(takeBits)
         r.bitBuf = r.bitBuf | (byteValue << r.bitCount)
         r.bitCount = r.bitCount + takeBits
         r.bitPos = r.bitPos + takeBits
@@ -198,16 +211,15 @@ fn zlibEmptyHuffman(): HuffmanTable =
 
 fn zlibDecodeSymbol(r: var DeflateBitReader, table: HuffmanTable): Result[int32] =
     if table.fastBits > 0 && table.fastSymbols.len > 0 && zlibRemainingBits(r) >= table.fastBits:
-        let peekRes: Result[int32] = zlibPeekBits(r, table.fastBits)
-        if IsOk(peekRes):
-            let fastIndex: int32 = Value(peekRes)
+        let ensureRes: Result[bool] = zlibEnsureBits(r, table.fastBits)
+        if IsOk(ensureRes):
+            let fastIndex: int32 = r.bitBuf & zlibBitMask(table.fastBits)
             if fastIndex >= 0 && fastIndex < table.fastSymbols.len:
                 let symbol: int32 = table.fastSymbols[fastIndex]
                 let length: int32 = table.fastLengths[fastIndex]
                 if symbol >= 0 && length > 0:
-                    let dropRes: Result[bool] = zlibDropBits(r, length)
-                    if IsErr(dropRes):
-                        return Err[int32](Error(dropRes))
+                    r.bitBuf = r.bitBuf >> length
+                    r.bitCount = r.bitCount - length
                     return Ok[int32](symbol)
     var code: int32
     var bits: int32 = 1
@@ -343,7 +355,7 @@ fn zlibCopyBackReference(out: bytes.ByteBuffer,
     if length == 0:
         return Ok[bool](true)
     if distance == 1:
-        let value: int32 = bytes.BufByteAt(out, outPos - 1)
+        let value: int32 = zlibByteAt(out, outPos - 1)
         rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(out.data, outPos), value, length)
         outPos = outPos + length
         return Ok[bool](true)
@@ -372,7 +384,7 @@ fn zlibInflateCodes(r: var DeflateBitReader,
         if symbol < 256:
             if outPos >= out.len:
                 return Err[bool]("wowExport zlib: output exceeds expected size")
-            bytes.BufSetByte(out, outPos, symbol)
+            zlibSetByte(out, outPos, symbol)
             outPos = outPos + 1
         elif symbol == 256:
             return Ok[bool](true)
@@ -425,7 +437,7 @@ fn zlibInflateStoredBlock(r: var DeflateBitReader, out: bytes.ByteBuffer, outPos
         let byteRes: Result[int32] = zlibReadBits(r, 8)
         if IsErr(byteRes):
             return Err[bool](Error(byteRes))
-        bytes.BufSetByte(out, outPos, Value(byteRes))
+        zlibSetByte(out, outPos, Value(byteRes))
         outPos = outPos + 1
         i = i + 1
     return Ok[bool](true)
@@ -583,7 +595,7 @@ fn zlibAdler32ByteBuffer(buf: bytes.ByteBuffer): int32 =
     var b: int32
     var i: int32
     while i < buf.len:
-        a = (a + bytes.BufByteAt(buf, i)) % ZlibAdlerMod
+        a = (a + zlibByteAt(buf, i)) % ZlibAdlerMod
         b = (b + a) % ZlibAdlerMod
         i = i + 1
     return (b << 16) | a
@@ -598,7 +610,7 @@ fn zlibCheckAdler(buf: bytes.ByteBuffer, adlerStart: int32, out: bytes.ByteBuffe
     let adler: int32 = zlibAdler32ByteBuffer(out)
     var i: int32
     while i < 4:
-        let got: int32 = bytes.BufByteAt(buf, adlerStart + i)
+        let got: int32 = zlibByteAt(buf, adlerStart + i)
         let want: int32 = zlibAdlerByte(adler, i)
         if got != want:
             return Err[bool]("wowExport zlib: Adler32 mismatch expected=" + strings.IntToStr(want) + " got=" + strings.IntToStr(got) + " byte=" + strings.IntToStr(i))
@@ -608,8 +620,8 @@ fn zlibCheckAdler(buf: bytes.ByteBuffer, adlerStart: int32, out: bytes.ByteBuffe
 fn WowZlibInflate(buf: bytes.ByteBuffer, start: int32, count: int32, expectedSize: int32): Result[bytes.ByteBuffer] =
     if start < 0 || count < 6 || expectedSize < 0 || start + count > buf.len:
         return Err[bytes.ByteBuffer]("wowExport zlib: invalid stream bounds")
-    let cmf: int32 = bytes.BufByteAt(buf, start)
-    let flg: int32 = bytes.BufByteAt(buf, start + 1)
+    let cmf: int32 = zlibByteAt(buf, start)
+    let flg: int32 = zlibByteAt(buf, start + 1)
     if (cmf & 15) != 8:
         return Err[bytes.ByteBuffer]("wowExport zlib: unsupported compression method")
     if (cmf >> 4) > 7:

@@ -1,0 +1,109 @@
+import std/result
+import cheng/inference/kernel as infer
+
+fn closeI32(a: int32, b: int32, tolerance: int32): bool =
+    var diff = a - b
+    if diff < 0:
+        diff = 0 - diff
+    return diff <= tolerance
+
+fn makeTensor(shape: int32[], scale: int32, data: int32[]): infer.TensorQ =
+    var out: infer.TensorQ
+    let fillRes = infer.TensorFromDataFill(out, shape, scale, data)
+    assert(IsOk(fillRes), " inference smoke: tensor fill")
+    return out
+
+fn assertTensorClose(tensor: infer.TensorQ, expected: int32[], tolerance: int32, label: str) =
+    assert(tensor.data.len == expected.len, label + " len")
+    var i: int32
+    i = 0
+    while i < expected.len:
+        assert(closeI32(tensor.data[i], expected[i], tolerance), label)
+        i = i + 1
+
+fn main(): int32 =
+    let scale: int32 = 1000
+    let input = makeTensor([1, 3], scale, [1000, 2000, 3000])
+    let weight = makeTensor([2, 3], scale, [1000, 0, -1000, 500, 500, 500])
+    let bias = makeTensor([2], scale, [500, -1000])
+    var denseOut: infer.TensorQ
+    let denseRes = infer.DenseFill(denseOut, input, weight, bias)
+    assert(IsOk(denseRes), " inference smoke: dense")
+    assertTensorClose(denseOut, [-1500, 2000], 0, " inference smoke: dense value")
+
+    var reluOut: infer.TensorQ
+    let reluRes = infer.ReluFill(reluOut, denseOut)
+    assert(IsOk(reluRes), " inference smoke: relu")
+    assertTensorClose(reluOut, [0, 2000], 0, " inference smoke: relu value")
+
+    let left = makeTensor([2, 2], scale, [1000, 2000, 3000, 4000])
+    let right = makeTensor([2, 2], scale, [5000, 6000, 7000, 8000])
+    var matmulOut: infer.TensorQ
+    let matmulRes = infer.MatMul2dFill(matmulOut, left, right)
+    assert(IsOk(matmulRes), " inference smoke: matmul")
+    assertTensorClose(matmulOut, [19000, 22000, 43000, 50000], 0, " inference smoke: matmul value")
+
+    let convInput = makeTensor([1, 1, 3, 3], scale, [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000])
+    let convWeight = makeTensor([1, 1, 2, 2], scale, [1000, 0, 0, -1000])
+    let convBias = makeTensor([1], scale, [0])
+    var convOut: infer.TensorQ
+    let convRes = infer.Conv2dNchwFill(convOut, convInput, convWeight, convBias, 1, 1, 0, 0)
+    assert(IsOk(convRes), " inference smoke: conv2d")
+    assertTensorClose(convOut, [-4000, -4000, -4000, -4000], 0, " inference smoke: conv2d value")
+
+    var poolOut: infer.TensorQ
+    let poolRes = infer.MaxPool2dNchwFill(poolOut, convInput, 2, 2, 1, 1)
+    assert(IsOk(poolRes), " inference smoke: maxpool")
+    assertTensorClose(poolOut, [5000, 6000, 8000, 9000], 0, " inference smoke: maxpool value")
+
+    let softmaxInput = makeTensor([2], scale, [0, 0])
+    var softmaxOut: infer.TensorQ
+    let softmaxRes = infer.SoftmaxLastDimFill(softmaxOut, softmaxInput, 10000)
+    assert(IsOk(softmaxRes), " inference smoke: softmax")
+    assertTensorClose(softmaxOut, [5000, 5000], 1, " inference smoke: softmax value")
+
+    let argmaxInput = makeTensor([3], scale, [100, 2000, 1000])
+    let argmaxRes = infer.Argmax(argmaxInput)
+    assert(IsOk(argmaxRes), " inference smoke: argmax")
+    assert(Value(argmaxRes) == 1, " inference smoke: argmax value")
+
+    var packed: infer.InferencePackedBits
+    let packedRes = infer.PackedBitsFromValuesFill(packed, 3, [0, 1, 7, 3, 2, 5, 6, 4])
+    assert(IsOk(packedRes), " inference smoke: pack bits")
+    let packedExpected: int32[] = [0, 1, 7, 3, 2, 5, 6, 4]
+    var packedIndex: int32
+    packedIndex = 0
+    while packedIndex < packedExpected.len:
+        let itemRes = infer.PackedBitsGet(packed, packedIndex)
+        assert(IsOk(itemRes), " inference smoke: pack get")
+        assert(Value(itemRes) == packedExpected[packedIndex], " inference smoke: pack value")
+        packedIndex = packedIndex + 1
+
+    let quantInput = makeTensor([4], scale, [1000, -2000, 3000, -4000])
+    var qVector: infer.TurboQuantVector
+    let quantRes = infer.TurboQuantVectorFromTensorFill(qVector, quantInput, 4)
+    assert(IsOk(quantRes), " inference smoke: turboquant vector")
+    let dotRes = infer.TurboQuantDot(qVector, quantInput)
+    assert(IsOk(dotRes), " inference smoke: turboquant dot")
+    assert(closeI32(Value(dotRes), 30000, 2500), " inference smoke: turboquant dot value")
+
+    let cacheRes = infer.TurboQuantKVCacheInit(2, 2, 4, 4, scale, scale)
+    assert(IsOk(cacheRes), " inference smoke: kv init")
+    var cache = Value(cacheRes)
+    let key0 = makeTensor([2], scale, [1000, 0])
+    let value0 = makeTensor([2], scale, [10000, 0])
+    let append0Res = infer.TurboQuantKVCacheAppend(cache, key0, value0)
+    assert(IsOk(append0Res), " inference smoke: kv append 0")
+    let key1 = makeTensor([2], scale, [0, 1000])
+    let value1 = makeTensor([2], scale, [0, 20000])
+    let append1Res = infer.TurboQuantKVCacheAppend(cache, key1, value1)
+    assert(IsOk(append1Res), " inference smoke: kv append 1")
+    let query = makeTensor([2], scale, [2000, 0])
+    var attentionOut: infer.TensorQ
+    let attentionRes = infer.TurboQuantKVAttentionFill(attentionOut, cache, query, 10000)
+    assert(IsOk(attentionRes), " inference smoke: kv attention")
+    assert(attentionOut.data.len == 2, " inference smoke: kv attention len")
+    assert(attentionOut.data[0] > attentionOut.data[1], " inference smoke: kv attention prefers first")
+
+    echo(" inference_kernel_smoke ok")
+    return 0

@@ -1,0 +1,255 @@
+import std/result
+import std/os_host_process as hostos
+import std/strformat
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/primary_object_plan as pobj
+
+type
+    PrimaryObjectEmitResult =
+        asmPath: str
+        objectPath: str
+        compileLogPath: str
+        commandText: str
+        exitCode: int32
+        asmText: str
+        compilerOutput: str
+
+fn PrimaryObjectEmitAsmPath(plan: pobj.PrimaryObjectPlan): str =
+    return plan.outputPath + ".s"
+
+fn PrimaryObjectEmitCompileLogPath(plan: pobj.PrimaryObjectPlan): str =
+    return plan.outputPath + ".compile.log"
+
+fn PrimaryObjectEmitTargetSupported(plan: pobj.PrimaryObjectPlan): bool =
+    return plan.targetTriple == "arm64-apple-darwin" && plan.objectFormat == "macho"
+
+fn PrimaryObjectEmitHasEntryBridge(plan: pobj.PrimaryObjectPlan): bool =
+    return len(plan.entrySymbol) > 0 && plan.symbolNames.len >= 2
+
+fn PrimaryObjectEmitFunctionCount(plan: pobj.PrimaryObjectPlan): int32 =
+    if PrimaryObjectEmitHasEntryBridge(plan):
+        return plan.symbolNames.len - 1
+    return plan.symbolNames.len
+
+fn PrimaryObjectEmitValidateReturnZeroShape(plan: pobj.PrimaryObjectPlan): Result[bool] =
+    if !PrimaryObjectEmitTargetSupported(plan):
+        return Err[bool](Fmt" primary object emit: unsupported target: {plan.targetTriple}")
+    if len(plan.outputPath) <= 0:
+        return Err[bool](" primary object emit: missing output path")
+    if plan.missingReasons.len > 0:
+        return Err[bool](" primary object emit: plan has missing reasons: " + pobj.PrimaryObjectPlanReport(plan))
+    if plan.symbolNames.len <= 0:
+        return Err[bool](" primary object emit: missing symbols")
+    if len(plan.entrySymbol) > 0 && plan.symbolNames.len < 2:
+        return Err[bool](" primary object emit: executable entry bridge missing")
+    if plan.symbolNames.len != plan.functionWordCounts.len ||
+       plan.symbolNames.len != plan.functionWordOffsets.len ||
+       plan.symbolNames.len != plan.functionBodyKinds.len ||
+       plan.symbolNames.len != plan.itemIds.len:
+        return Err[bool](" primary object emit: malformed function table")
+    let functionCount = PrimaryObjectEmitFunctionCount(plan)
+    if functionCount <= 0:
+        return Err[bool](" primary object emit: missing primary function")
+    var expectedWords: int32
+    for i in 0..<functionCount:
+        if len(plan.symbolNames[i]) <= 0:
+            return Err[bool](" primary object emit: empty function symbol")
+        if i >= plan.functionBodyKinds.len || plan.functionBodyKinds[i] != "return_zero_i32":
+            return Err[bool](" primary object emit: unsupported function body kind")
+        if plan.functionWordOffsets[i] != expectedWords:
+            return Err[bool](" primary object emit: function word offset mismatch")
+        if plan.functionWordCounts[i] != 2:
+            return Err[bool](Fmt" primary object emit: unsupported function word count: {intToStr(plan.functionWordCounts[i])}")
+        expectedWords = expectedWords + plan.functionWordCounts[i]
+    if PrimaryObjectEmitHasEntryBridge(plan):
+        let bridgeIndex = plan.symbolNames.len - 1
+        if len(plan.symbolNames[bridgeIndex]) <= 0:
+            return Err[bool](" primary object emit: empty entry bridge symbol")
+        if bridgeIndex >= plan.functionBodyKinds.len || plan.functionBodyKinds[bridgeIndex] != "entry_bridge":
+            return Err[bool](" primary object emit: unsupported entry bridge body kind")
+        if plan.functionWordOffsets[bridgeIndex] != expectedWords:
+            return Err[bool](" primary object emit: entry bridge word offset mismatch")
+        if plan.functionWordCounts[bridgeIndex] != 1:
+            return Err[bool](" primary object emit: unsupported entry bridge shape")
+        expectedWords = expectedWords + plan.functionWordCounts[bridgeIndex]
+    if expectedWords != plan.instructionWords.len:
+        return Err[bool](" primary object emit: instruction word table size mismatch")
+    return Ok[bool](true)
+
+fn PrimaryObjectEmitReturnZeroFunctionAsm(symbolName: str, ordinal: int32): str =
+    let labelOrdinal = intToStr(ordinal)
+    var out = ""
+    out = out + Fmt".globl {symbolName}\n"
+    out = out + Fmt"{symbolName}:\n"
+    out = out + "  mov w0, #0\n"
+    out = out + "  ret\n"
+    out = out + Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"
+    return out
+
+fn PrimaryObjectEmitEntryBridgeAsm(plan: pobj.PrimaryObjectPlan,
+                                    bridgeSymbol: str,
+                                    entrySymbol: str,
+                                    ordinal: int32): str =
+    let setCmdLine = pobj.PrimaryTargetSymbolName(plan.targetTriple, "__cheng_setCmdLine")
+    let lineMap = pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_register_line_map_from_argv0")
+    let profileFlush = pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_debug_profile_flush_from_argv0")
+    let labelOrdinal = intToStr(ordinal)
+    var out = ""
+    out = out + Fmt".globl {bridgeSymbol}\n"
+    out = out + Fmt".extern {setCmdLine}\n"
+    out = out + Fmt".extern {lineMap}\n"
+    out = out + Fmt".extern {profileFlush}\n"
+    out = out + Fmt"{bridgeSymbol}:\n"
+    out = out + "  sub sp, sp, #32\n"
+    out = out + "  stp x0, x1, [sp]\n"
+    out = out + "  str x30, [sp, #24]\n"
+    out = out + Fmt"  bl {setCmdLine}\n"
+    out = out + "  ldr x1, [sp, #8]\n"
+    out = out + "  ldr x0, [x1]\n"
+    out = out + Fmt"  bl {lineMap}\n"
+    out = out + "  ldp x0, x1, [sp]\n"
+    out = out + Fmt"  bl {entrySymbol}\n"
+    out = out + "  str w0, [sp, #16]\n"
+    out = out + "  ldr x1, [sp, #8]\n"
+    out = out + "  ldr x0, [x1]\n"
+    out = out + Fmt"  bl {profileFlush}\n"
+    out = out + "  ldr w0, [sp, #16]\n"
+    out = out + "  ldr x30, [sp, #24]\n"
+    out = out + "  add sp, sp, #32\n"
+    out = out + "  ret\n"
+    out = out + Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"
+    return out
+
+fn PrimaryObjectEmitAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
+    let validRes = PrimaryObjectEmitValidateReturnZeroShape(plan)
+    if !IsOk(validRes):
+        return Err[str](Error(validRes))
+    let functionCount = PrimaryObjectEmitFunctionCount(plan)
+    var out = ".text\n.p2align 2\n"
+    for i in 0..<functionCount:
+        out = out + PrimaryObjectEmitReturnZeroFunctionAsm(plan.symbolNames[i], i)
+    if PrimaryObjectEmitHasEntryBridge(plan):
+        let bridgeIndex = plan.symbolNames.len - 1
+        out = out + PrimaryObjectEmitEntryBridgeAsm(plan,
+                                                     plan.symbolNames[bridgeIndex],
+                                                     plan.symbolNames[0],
+                                                     bridgeIndex)
+    out = out + ".subsections_via_symbols\n"
+    return Ok[str](out)
+
+fn PrimaryObjectEmitCompileArgv(plan: pobj.PrimaryObjectPlan,
+                                 asmPath: str): Result[str[]] =
+    let validRes = PrimaryObjectEmitValidateReturnZeroShape(plan)
+    if !IsOk(validRes):
+        return Err[str[]](Error(validRes))
+    var argv: str[]
+    add(argv, "-arch")
+    add(argv, "arm64")
+    add(argv, "-c")
+    add(argv, asmPath)
+    add(argv, "-o")
+    add(argv, plan.outputPath)
+    return Ok[str[]](argv)
+
+fn PrimaryObjectEmitValidateStandaloneZeroExit(plan: pobj.PrimaryObjectPlan): Result[bool] =
+    if !PrimaryObjectEmitTargetSupported(plan):
+        return Err[bool](Fmt" primary object emit: unsupported standalone target: {plan.targetTriple}")
+    if len(plan.outputPath) <= 0:
+        return Err[bool](" primary object emit: missing standalone output path")
+    if plan.missingReasons.len > 0:
+        return Err[bool](" primary object emit: standalone plan has missing reasons")
+    if plan.symbolNames.len < 1 || plan.functionBodyKinds.len < 1:
+        return Err[bool](" primary object emit: standalone function missing")
+    if plan.functionBodyKinds[0] != "return_zero_i32":
+        return Err[bool](" primary object emit: standalone only supports return_zero_i32")
+    return Ok[bool](true)
+
+fn PrimaryObjectEmitStandaloneMainAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
+    let validRes = PrimaryObjectEmitValidateStandaloneZeroExit(plan)
+    if !IsOk(validRes):
+        return Err[str](Error(validRes))
+    var out = ".text\n.p2align 2\n"
+    out = out + ".globl _main\n"
+    out = out + "_main:\n"
+    out = out + "  mov w0, #0\n"
+    out = out + "  ret\n"
+    out = out + "L_cheng_embedded_line_map_end_0:\n"
+    out = out + ".subsections_via_symbols\n"
+    return Ok[str](out)
+
+fn PrimaryObjectEmitRunStandaloneMainLogged(rootDir: str,
+                                             label: str,
+                                             plan: pobj.PrimaryObjectPlan): Result[PrimaryObjectEmitResult] =
+    let asmRes = PrimaryObjectEmitStandaloneMainAsmText(plan)
+    if !IsOk(asmRes):
+        return Err[PrimaryObjectEmitResult](Error(asmRes))
+    let asmPath = PrimaryObjectEmitAsmPath(plan)
+    let compileLogPath = PrimaryObjectEmitCompileLogPath(plan)
+    let asmText = Value(asmRes)
+    if !chengpath.WriteTextFile(rootDir, asmPath, asmText):
+        return Err[PrimaryObjectEmitResult](" primary object emit: failed to write standalone asm: " + asmPath)
+    let argvRes = PrimaryObjectEmitCompileArgv(plan, asmPath)
+    if !IsOk(argvRes):
+        return Err[PrimaryObjectEmitResult](Error(argvRes))
+    let argv = Value(argvRes)
+    let commandText = hostos.OsHostProcessCommandText("cc", argv, [])
+    let run = hostops.RunProgramLogged(rootDir,
+                                       label,
+                                       "cc",
+                                       argv,
+                                       [],
+                                       rootDir,
+                                       0,
+                                       compileLogPath)
+    var out: PrimaryObjectEmitResult
+    out.asmPath = asmPath
+    out.objectPath = plan.outputPath
+    out.compileLogPath = compileLogPath
+    out.commandText = commandText
+    out.exitCode = run.exitCode
+    out.asmText = asmText
+    out.compilerOutput = run.output
+    if run.exitCode != 0:
+        return Err[PrimaryObjectEmitResult](Fmt" primary object emit: standalone cc failed rc={intToStr(run.exitCode)} command={commandText}")
+    if !chengpath.FileExistsNonEmpty(rootDir, plan.outputPath):
+        return Err[PrimaryObjectEmitResult](" primary object emit: missing standalone output object: " + plan.outputPath)
+    return Ok[PrimaryObjectEmitResult](out)
+
+fn PrimaryObjectEmitRunLogged(rootDir: str,
+                               label: str,
+                               plan: pobj.PrimaryObjectPlan): Result[PrimaryObjectEmitResult] =
+    let asmRes = PrimaryObjectEmitAsmText(plan)
+    if !IsOk(asmRes):
+        return Err[PrimaryObjectEmitResult](Error(asmRes))
+    let asmPath = PrimaryObjectEmitAsmPath(plan)
+    let compileLogPath = PrimaryObjectEmitCompileLogPath(plan)
+    let asmText = Value(asmRes)
+    if !chengpath.WriteTextFile(rootDir, asmPath, asmText):
+        return Err[PrimaryObjectEmitResult](" primary object emit: failed to write asm: " + asmPath)
+    let argvRes = PrimaryObjectEmitCompileArgv(plan, asmPath)
+    if !IsOk(argvRes):
+        return Err[PrimaryObjectEmitResult](Error(argvRes))
+    let argv = Value(argvRes)
+    let commandText = hostos.OsHostProcessCommandText("cc", argv, [])
+    let run = hostops.RunProgramLogged(rootDir,
+                                       label,
+                                       "cc",
+                                       argv,
+                                       [],
+                                       rootDir,
+                                       0,
+                                       compileLogPath)
+    var out: PrimaryObjectEmitResult
+    out.asmPath = asmPath
+    out.objectPath = plan.outputPath
+    out.compileLogPath = compileLogPath
+    out.commandText = commandText
+    out.exitCode = run.exitCode
+    out.asmText = asmText
+    out.compilerOutput = run.output
+    if run.exitCode != 0:
+        return Err[PrimaryObjectEmitResult](Fmt" primary object emit: cc failed rc={intToStr(run.exitCode)} command={commandText}")
+    if !chengpath.FileExistsNonEmpty(rootDir, plan.outputPath):
+        return Err[PrimaryObjectEmitResult](" primary object emit: missing output object: " + plan.outputPath)
+    return Ok[PrimaryObjectEmitResult](out)

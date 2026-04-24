@@ -171,10 +171,12 @@ static const char *ChengSeed_REMOVED_KEYS_V2[] = {
     "backend_system_link_plan_source",
     "backend_lowering_plan_source",
     "backend_primary_object_plan_source",
+    "backend_primary_object_emit_source",
     "backend_object_plan_source",
     "backend_native_link_plan_source",
     "backend_native_link_exec_source",
     "backend_system_link_exec_source",
+    "backend_system_link_exec_runtime_source",
     "backend_line_map_source",
     "runtime_core_runtime_source",
     "runtime_compiler_runtime_source",
@@ -212,10 +214,12 @@ static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "backend_system_link_plan_source",
     "backend_lowering_plan_source",
     "backend_primary_object_plan_source",
+    "backend_primary_object_emit_source",
     "backend_object_plan_source",
     "backend_native_link_plan_source",
     "backend_native_link_exec_source",
     "backend_system_link_exec_source",
+    "backend_system_link_exec_runtime_source",
     "backend_line_map_source",
     "runtime_core_runtime_source",
     "runtime_compiler_runtime_source",
@@ -1460,10 +1464,12 @@ typedef struct {
     char backend_system_link_plan_source[PATH_MAX];
     char backend_lowering_plan_source[PATH_MAX];
     char backend_primary_object_plan_source[PATH_MAX];
+    char backend_primary_object_emit_source[PATH_MAX];
     char backend_object_plan_source[PATH_MAX];
     char backend_native_link_plan_source[PATH_MAX];
     char backend_native_link_exec_source[PATH_MAX];
     char backend_system_link_exec_source[PATH_MAX];
+    char backend_system_link_exec_runtime_source[PATH_MAX];
     char backend_line_map_source[PATH_MAX];
     char runtime_core_runtime_source[PATH_MAX];
     char runtime_compiler_runtime_source[PATH_MAX];
@@ -1616,10 +1622,12 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->backend_system_link_plan_source, sizeof(paths->backend_system_link_plan_source), paths->root, "src/core/backend/system_link_plan.cheng");
     cheng_seed_join_path(paths->backend_lowering_plan_source, sizeof(paths->backend_lowering_plan_source), paths->root, "src/core/backend/lowering_plan.cheng");
     cheng_seed_join_path(paths->backend_primary_object_plan_source, sizeof(paths->backend_primary_object_plan_source), paths->root, "src/core/backend/primary_object_plan.cheng");
+    cheng_seed_join_path(paths->backend_primary_object_emit_source, sizeof(paths->backend_primary_object_emit_source), paths->root, "src/core/backend/primary_object_emit.cheng");
     cheng_seed_join_path(paths->backend_object_plan_source, sizeof(paths->backend_object_plan_source), paths->root, "src/core/backend/object_plan.cheng");
     cheng_seed_join_path(paths->backend_native_link_plan_source, sizeof(paths->backend_native_link_plan_source), paths->root, "src/core/backend/native_link_plan.cheng");
     cheng_seed_join_path(paths->backend_native_link_exec_source, sizeof(paths->backend_native_link_exec_source), paths->root, "src/core/backend/native_link_exec.cheng");
     cheng_seed_join_path(paths->backend_system_link_exec_source, sizeof(paths->backend_system_link_exec_source), paths->root, "src/core/backend/system_link_exec.cheng");
+    cheng_seed_join_path(paths->backend_system_link_exec_runtime_source, sizeof(paths->backend_system_link_exec_runtime_source), paths->root, "src/core/backend/system_link_exec_runtime.cheng");
     cheng_seed_join_path(paths->backend_line_map_source, sizeof(paths->backend_line_map_source), paths->root, "src/core/backend/line_map.cheng");
     cheng_seed_join_path(paths->runtime_core_runtime_source, sizeof(paths->runtime_core_runtime_source), paths->root, "src/core/runtime/core_runtime.cheng");
     cheng_seed_join_path(paths->runtime_compiler_runtime_source, sizeof(paths->runtime_compiler_runtime_source), paths->root, "src/core/runtime/compiler_runtime.cheng");
@@ -1838,7 +1846,7 @@ static bool cheng_seed_bootstrap_artifacts_fresh(const ChengSeedBootstrapPaths *
 }
 
 static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths) {
-    const char *inputs[43];
+    const char *inputs[45];
     char map_path[PATH_MAX];
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
@@ -1868,36 +1876,38 @@ static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths
     inputs[12] = paths->backend_system_link_plan_source;
     inputs[13] = paths->backend_lowering_plan_source;
     inputs[14] = paths->backend_primary_object_plan_source;
-    inputs[15] = paths->backend_object_plan_source;
-    inputs[16] = paths->backend_native_link_plan_source;
-    inputs[17] = paths->backend_native_link_exec_source;
-    inputs[18] = paths->backend_system_link_exec_source;
-    inputs[19] = paths->backend_line_map_source;
-    inputs[20] = paths->runtime_core_runtime_source;
-    inputs[21] = paths->runtime_compiler_runtime_source;
-    inputs[22] = paths->runtime_debug_runtime_source;
-    inputs[23] = paths->tooling_bootstrap_contract_source;
-    inputs[24] = paths->backend_build_plan_source;
-    inputs[25] = paths->runtime_core_provider_source;
-    inputs[26] = paths->runtime_compiler_program_provider_source;
-    inputs[27] = paths->runtime_compiler_tooling_provider_source;
-    inputs[28] = paths->runtime_program_support_provider_source;
-    inputs[29] = paths->runtime_program_support_host_provider_source;
-    inputs[30] = paths->runtime_debug_provider_source;
-    inputs[31] = paths->tooling_host_ops_source;
-    inputs[32] = paths->tooling_path_source;
-    inputs[33] = paths->tooling_world_receipt_gate_source;
-    inputs[34] = paths->tooling_debug_tools_gate_source;
-    inputs[35] = paths->tooling_hotpath_scan_source;
-    inputs[36] = paths->tooling_export_visibility_gate_source;
-    inputs[37] = paths->tooling_host_bridge_audit_gate_source;
-    inputs[38] = paths->tooling_seed_cross_target_gate_source;
-    inputs[39] = paths->tooling_wasm_binary_audit_source;
-    inputs[40] = paths->tooling_wasm_smoke_gate_source;
-    inputs[41] = paths->std_os_host_process_source;
-    inputs[42] = paths->std_os_source;
-    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 43U) &&
-           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 43U);
+    inputs[15] = paths->backend_primary_object_emit_source;
+    inputs[16] = paths->backend_object_plan_source;
+    inputs[17] = paths->backend_native_link_plan_source;
+    inputs[18] = paths->backend_native_link_exec_source;
+    inputs[19] = paths->backend_system_link_exec_source;
+    inputs[20] = paths->backend_system_link_exec_runtime_source;
+    inputs[21] = paths->backend_line_map_source;
+    inputs[22] = paths->runtime_core_runtime_source;
+    inputs[23] = paths->runtime_compiler_runtime_source;
+    inputs[24] = paths->runtime_debug_runtime_source;
+    inputs[25] = paths->tooling_bootstrap_contract_source;
+    inputs[26] = paths->backend_build_plan_source;
+    inputs[27] = paths->runtime_core_provider_source;
+    inputs[28] = paths->runtime_compiler_program_provider_source;
+    inputs[29] = paths->runtime_compiler_tooling_provider_source;
+    inputs[30] = paths->runtime_program_support_provider_source;
+    inputs[31] = paths->runtime_program_support_host_provider_source;
+    inputs[32] = paths->runtime_debug_provider_source;
+    inputs[33] = paths->tooling_host_ops_source;
+    inputs[34] = paths->tooling_path_source;
+    inputs[35] = paths->tooling_world_receipt_gate_source;
+    inputs[36] = paths->tooling_debug_tools_gate_source;
+    inputs[37] = paths->tooling_hotpath_scan_source;
+    inputs[38] = paths->tooling_export_visibility_gate_source;
+    inputs[39] = paths->tooling_host_bridge_audit_gate_source;
+    inputs[40] = paths->tooling_seed_cross_target_gate_source;
+    inputs[41] = paths->tooling_wasm_binary_audit_source;
+    inputs[42] = paths->tooling_wasm_smoke_gate_source;
+    inputs[43] = paths->std_os_host_process_source;
+    inputs[44] = paths->std_os_source;
+    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 45U) &&
+           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 45U);
 }
 
 static int cheng_seed_cmd_bootstrap_bridge(int argc, char **argv);
@@ -62762,7 +62772,7 @@ static char *cheng_seed_system_link_plan_report(const ChengSeedBootstrapContract
     cheng_seed_report_append(&out, &cap, &used, "parser_source_kind=ordinary_cheng_source");
     snprintf(line, sizeof(line), "build_entry=%s", compiler_entry);
     cheng_seed_report_append(&out, &cap, &used, line);
-    cheng_seed_report_append(&out, &cap, &used, "build_source_unit_count=29");
+    cheng_seed_report_append(&out, &cap, &used, "build_source_unit_count=31");
     cheng_seed_report_append(&out, &cap, &used, "link_mode=system_link");
     cheng_seed_report_append(&out, &cap, &used, "pipeline_stage=parser_to_system_link_plan");
     return out;

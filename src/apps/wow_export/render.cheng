@@ -1,5 +1,6 @@
 import std/bytes as bytes
 import std/result
+import std/seqs
 import std/strings as strings
 import std/strformat
 import cheng/apps/wow_export/asset_export as asset_export
@@ -37,6 +38,8 @@ type
         wmoLightCount: int32
         wmoGroupBatchCount: int32
         wmoGroupMaterialInfoCount: int32
+        wmoGroupTriangleIndexCount: int32
+        wmoGroupTriangleCount: int32
         wmoMaterialLightPassReady: bool
         textureFileCount: int32
         textureMaxWidth: int32
@@ -80,10 +83,14 @@ type
         wdtMaidWorldModelLightCount: int32
         wdtMaidWorldModelGroupBatchCount: int32
         wdtMaidWorldModelGroupMaterialInfoCount: int32
+        wdtMaidWorldModelGroupTriangleIndexCount: int32
+        wdtMaidWorldModelGroupTriangleCount: int32
         wdtMaidWorldModelMaterialPassReady: bool
         wdtMaidWorldModelInstancePlacementCount: int32
         wdtMaidWorldModelInstanceVertexCount: int32
+        wdtMaidWorldModelInstanceTriangleCount: int32
         wdtMaidWorldModelInstanceBoundsReady: bool
+        wdtMaidWorldModelIndexedTrianglePassReady: bool
         wdtMaidPlacementDependencyAuditReady: bool
         wdtMaidPlacementDependencyEncodedBytes: int32
         wdtMaidPlacementDependencyDecodedBytes: int32
@@ -138,6 +145,22 @@ type
         rotationZ1000: int32
         scale1024: int32
 
+    RenderMaidWorldModelTransform =
+        scale1024: int32
+        translateX1000: int32
+        translateY1000: int32
+        translateZ1000: int32
+        x1Sin1000: int32
+        x1Cos1000: int32
+        z1Sin1000: int32
+        z1Cos1000: int32
+        y1Sin1000: int32
+        y1Cos1000: int32
+        y2Sin1000: int32
+        y2Cos1000: int32
+        x2Sin1000: int32
+        x2Cos1000: int32
+
     RenderMaidWorldModelGroupRef =
         rootFileDataID: int32
         groupFileDataID: int32
@@ -146,7 +169,23 @@ type
         fileDataID: int32
         vertexCount: int32
         vertexOffset: int32
+        indexCount: int32
+        indexOffset: int32
+        materialInfoCount: int32
+        materialInfoOffset: int32
+        batchCount: int32
+        batchOffset: int32
         buf: bytes.ByteBuffer
+
+    RenderWmoGroupChunks =
+        vertexOffset: int32
+        vertexCount: int32
+        indexOffset: int32
+        indexCount: int32
+        materialInfoOffset: int32
+        materialInfoCount: int32
+        batchOffset: int32
+        batchCount: int32
 
     RenderMaidDoodadAssets =
         doodadModels: RenderDoodadModel[]
@@ -382,6 +421,85 @@ fn renderRotateZDeg1000(angleDeg1000: int32,
     outY1000 = renderMulDiv1000(x1000, sin1000) + renderMulDiv1000(y1000, cos1000)
     outZ1000 = z1000
 
+fn renderRotateXSinCos1000(sin1000: int32,
+                           cos1000: int32,
+                           x1000: int32,
+                           y1000: int32,
+                           z1000: int32,
+                           outX1000: var int32,
+                           outY1000: var int32,
+                           outZ1000: var int32) =
+    outX1000 = x1000
+    outY1000 = renderMulDiv1000(y1000, cos1000) - renderMulDiv1000(z1000, sin1000)
+    outZ1000 = renderMulDiv1000(y1000, sin1000) + renderMulDiv1000(z1000, cos1000)
+
+fn renderRotateYSinCos1000(sin1000: int32,
+                           cos1000: int32,
+                           x1000: int32,
+                           y1000: int32,
+                           z1000: int32,
+                           outX1000: var int32,
+                           outY1000: var int32,
+                           outZ1000: var int32) =
+    outX1000 = renderMulDiv1000(x1000, cos1000) + renderMulDiv1000(z1000, sin1000)
+    outY1000 = y1000
+    outZ1000 = 0 - renderMulDiv1000(x1000, sin1000) + renderMulDiv1000(z1000, cos1000)
+
+fn renderRotateZSinCos1000(sin1000: int32,
+                           cos1000: int32,
+                           x1000: int32,
+                           y1000: int32,
+                           z1000: int32,
+                           outX1000: var int32,
+                           outY1000: var int32,
+                           outZ1000: var int32) =
+    outX1000 = renderMulDiv1000(x1000, cos1000) - renderMulDiv1000(y1000, sin1000)
+    outY1000 = renderMulDiv1000(x1000, sin1000) + renderMulDiv1000(y1000, cos1000)
+    outZ1000 = z1000
+
+fn renderMakeMaidWorldModelTransform(placement: RenderMaidWorldModelPlacement,
+                                     out: var RenderMaidWorldModelTransform) =
+    out.scale1024 = placement.scale1024
+    out.translateX1000 = renderTileCenter1000 - placement.x1000
+    out.translateY1000 = placement.y1000
+    out.translateZ1000 = renderTileCenter1000 - placement.z1000
+    renderSinCosDeg1000(placement.rotationZ1000 - 90000, out.x1Sin1000, out.x1Cos1000)
+    renderSinCosDeg1000(0 - placement.rotationX1000, out.z1Sin1000, out.z1Cos1000)
+    renderSinCosDeg1000(placement.rotationY1000 - 270000, out.y1Sin1000, out.y1Cos1000)
+    renderSinCosDeg1000(90000, out.y2Sin1000, out.y2Cos1000)
+    renderSinCosDeg1000(90000, out.x2Sin1000, out.x2Cos1000)
+
+fn renderMakeMaidDoodadTransform(placement: RenderMaidDoodadPlacement,
+                                 out: var RenderMaidWorldModelTransform) =
+    out.scale1024 = placement.scale1024
+    out.translateX1000 = renderTileCenter1000 - placement.x1000
+    out.translateY1000 = placement.y1000
+    out.translateZ1000 = renderTileCenter1000 - placement.z1000
+    renderSinCosDeg1000(placement.rotationZ1000 - 90000, out.x1Sin1000, out.x1Cos1000)
+    renderSinCosDeg1000(0 - placement.rotationX1000, out.z1Sin1000, out.z1Cos1000)
+    renderSinCosDeg1000(placement.rotationY1000 - 270000, out.y1Sin1000, out.y1Cos1000)
+    renderSinCosDeg1000(90000, out.y2Sin1000, out.y2Cos1000)
+    renderSinCosDeg1000(90000, out.x2Sin1000, out.x2Cos1000)
+
+fn renderApplyMaidWorldModelTransform(transform: RenderMaidWorldModelTransform,
+                                      localX1000: int32,
+                                      localY1000: int32,
+                                      localZ1000: int32,
+                                      outX1000: var int32,
+                                      outY1000: var int32,
+                                      outZ1000: var int32) =
+    var x: int32 = renderMulDivScale(localX1000, transform.scale1024, 1024)
+    var y: int32 = renderMulDivScale(localY1000, transform.scale1024, 1024)
+    var z: int32 = renderMulDivScale(localZ1000, transform.scale1024, 1024)
+    renderRotateXSinCos1000(transform.x1Sin1000, transform.x1Cos1000, x, y, z, x, y, z)
+    renderRotateZSinCos1000(transform.z1Sin1000, transform.z1Cos1000, x, y, z, x, y, z)
+    renderRotateYSinCos1000(transform.y1Sin1000, transform.y1Cos1000, x, y, z, x, y, z)
+    x = x + transform.translateX1000
+    y = y + transform.translateY1000
+    z = z + transform.translateZ1000
+    renderRotateYSinCos1000(transform.y2Sin1000, transform.y2Cos1000, x, y, z, x, y, z)
+    renderRotateXSinCos1000(transform.x2Sin1000, transform.x2Cos1000, x, y, z, outX1000, outY1000, outZ1000)
+
 fn renderTransformDoodadVertex(placement: RenderDoodadPlacement,
                                localX1000: int32,
                                localY1000: int32,
@@ -521,6 +639,86 @@ fn renderFindWmoMovt(buf: bytes.ByteBuffer,
                 inner = innerData + innerSize
         pos = dataPos + size
     return Err[bool]("wowExport render: WMO MOVT missing")
+
+fn renderApplyWmoGroupChunk(buf: bytes.ByteBuffer,
+                            chunkPos: int32,
+                            dataPos: int32,
+                            size: int32,
+                            chunks: var RenderWmoGroupChunks): Result[bool] =
+    if renderHasFourCC(buf, chunkPos, int32('T'), int32('V'), int32('O'), int32('M')):
+        if (size % 12) != 0:
+            return Err[bool]("wowExport render: WMO MOVT chunk size invalid")
+        if chunks.vertexCount > 0:
+            return Err[bool]("wowExport render: duplicate WMO MOVT chunk")
+        chunks.vertexOffset = dataPos
+        chunks.vertexCount = size / 12
+    elif renderHasFourCC(buf, chunkPos, int32('I'), int32('V'), int32('O'), int32('M')):
+        if (size % 2) != 0:
+            return Err[bool]("wowExport render: WMO MOVI chunk size invalid")
+        if chunks.indexCount > 0:
+            return Err[bool]("wowExport render: duplicate WMO MOVI chunk")
+        chunks.indexOffset = dataPos
+        chunks.indexCount = size / 2
+    elif renderHasFourCC(buf, chunkPos, int32('Y'), int32('P'), int32('O'), int32('M')):
+        if (size % 2) != 0:
+            return Err[bool]("wowExport render: WMO MOPY chunk size invalid")
+        if chunks.materialInfoCount > 0:
+            return Err[bool]("wowExport render: duplicate WMO MOPY chunk")
+        chunks.materialInfoOffset = dataPos
+        chunks.materialInfoCount = size / 2
+    elif renderHasFourCC(buf, chunkPos, int32('A'), int32('B'), int32('O'), int32('M')):
+        if (size % 24) != 0:
+            return Err[bool]("wowExport render: WMO MOBA chunk size invalid")
+        if chunks.batchCount > 0:
+            return Err[bool]("wowExport render: duplicate WMO MOBA chunk")
+        chunks.batchOffset = dataPos
+        chunks.batchCount = size / 24
+    return Ok[bool](true)
+
+fn renderFindWmoGroupChunks(buf: bytes.ByteBuffer,
+                            chunks: var RenderWmoGroupChunks): Result[bool] =
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[bool]("wowExport render: WMO group truncated chunk")
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[bool]("wowExport render: WMO group chunk out of bounds")
+        if renderHasFourCC(buf, pos, int32('P'), int32('G'), int32('O'), int32('M')):
+            if size < 68:
+                return Err[bool]("wowExport render: WMO MOGP header too small")
+            var inner: int32 = dataPos + 68
+            let end: int32 = dataPos + size
+            while inner < end:
+                if inner + 8 > end:
+                    return Err[bool]("wowExport render: WMO nested chunk truncated")
+                let innerSize: int32 = bytes.ReadU32LEAt(buf, inner + 4)
+                let innerData: int32 = inner + 8
+                if innerSize < 0 || innerData + innerSize > end:
+                    return Err[bool]("wowExport render: WMO nested chunk out of bounds")
+                let applyRes: Result[bool] =
+                    renderApplyWmoGroupChunk(buf, inner, innerData, innerSize, chunks)
+                if IsErr(applyRes):
+                    return Err[bool](Error(applyRes))
+                inner = innerData + innerSize
+        else:
+            let applyRes: Result[bool] =
+                renderApplyWmoGroupChunk(buf, pos, dataPos, size, chunks)
+            if IsErr(applyRes):
+                return Err[bool](Error(applyRes))
+        pos = dataPos + size
+    if chunks.vertexCount <= 0:
+        return Err[bool]("wowExport render: WMO MOVT missing")
+    if chunks.indexCount <= 0:
+        return Err[bool]("wowExport render: WMO MOVI missing")
+    if (chunks.indexCount % 3) != 0:
+        return Err[bool]("wowExport render: WMO MOVI triangle index count invalid")
+    if chunks.materialInfoCount <= 0:
+        return Err[bool]("wowExport render: WMO MOPY missing")
+    if chunks.materialInfoCount != chunks.indexCount / 3:
+        return Err[bool]("wowExport render: WMO MOPY triangle count mismatch")
+    return Ok[bool](true)
 
 fn renderAdtSampleLocalOffset(sampleIndex: int32,
                               xOut: var int32,
@@ -675,6 +873,15 @@ fn renderPlot(tga: bytes.ByteBuffer,
     bytes.BufSetByte(tga, pos + 2, r)
     bytes.BufSetByte(tga, pos + 3, 255)
     pixels = pixels + 1
+
+fn renderWmoMaterialColor(materialID: int32,
+                          rOut: var int32,
+                          gOut: var int32,
+                          bOut: var int32) =
+    let m: int32 = materialID & 255
+    rOut = 136 + ((m * 37) % 96)
+    gOut = 92 + ((m * 53) % 112)
+    bOut = 54 + ((m * 29) % 96)
 
 fn renderPlotCross(tga: bytes.ByteBuffer,
                    width: int32,
@@ -1034,13 +1241,18 @@ fn renderFreeMaidDoodadAssets(assets: var RenderMaidDoodadAssets) =
 
 fn renderLoadM2ModelFromEntry(clientPath: str,
                               fileDataID: int32,
+                              encodingKey: str,
                               archiveIndex: int32,
                               offset: int32,
                               size: int32,
                               label: str,
                               requireVertices: bool): Result[RenderDoodadModel] =
     let bufRes: Result[bytes.ByteBuffer] =
-        local_files.ReadLocalFileByEntry(clientPath, archiveIndex, offset, size)
+        local_files.ReadLocalFileByEntryCached(clientPath,
+                                               encodingKey,
+                                               archiveIndex,
+                                               offset,
+                                               size)
     if IsErr(bufRes):
         return Err[RenderDoodadModel](Error(bufRes))
     let buf: bytes.ByteBuffer = Value(bufRes)
@@ -1075,6 +1287,7 @@ fn renderLoadDoodadModels(manifest: northshire.NorthshireManifest): Result[Rende
             let modelRes: Result[RenderDoodadModel] =
                 renderLoadM2ModelFromEntry(manifest.clientPath,
                                            dep.fileDataID,
+                                           dep.encodingKey,
                                            dep.archiveIndex,
                                            dep.offset,
                                            dep.size,
@@ -1114,6 +1327,7 @@ fn renderLoadMaidDoodadModels(manifest: northshire.NorthshireManifest,
         let modelRes: Result[RenderDoodadModel] =
             renderLoadM2ModelFromEntry(manifest.clientPath,
                                        stat.fileDataID,
+                                       stat.encodingKey,
                                        stat.archiveIndex,
                                        stat.offset,
                                        stat.size,
@@ -1195,7 +1409,9 @@ fn renderLoadMaidWorldModelGroups(manifest: northshire.NorthshireManifest,
                                   materialCountOut: var int32,
                                   lightCountOut: var int32,
                                   groupBatchCountOut: var int32,
-                                  groupMaterialInfoCountOut: var int32): Result[RenderWmoGroupModel[]] =
+                                  groupMaterialInfoCountOut: var int32,
+                                  groupTriangleIndexCountOut: var int32,
+                                  groupTriangleCountOut: var int32): Result[RenderWmoGroupModel[]] =
     if rootFileDataIDs.len <= 0:
         return Err[RenderWmoGroupModel[]]("wowExport render: no MAID world-model WMO fileDataIDs")
     let rootStatsRes: Result[local_files.LocalFileAuditEntryStat[]] =
@@ -1212,10 +1428,7 @@ fn renderLoadMaidWorldModelGroups(manifest: northshire.NorthshireManifest,
         if rootStat.fileDataID != rootFileDataIDs[rootIndex]:
             return Err[RenderWmoGroupModel[]]("wowExport render: MAID world-model root stat order mismatch")
         let rootBufRes: Result[bytes.ByteBuffer] =
-            local_files.ReadLocalFileByEntry(manifest.clientPath,
-                                            rootStat.archiveIndex,
-                                            rootStat.offset,
-                                            rootStat.size)
+            local_files.ReadLocalFileByStat(manifest.clientPath, rootStat)
         if IsErr(rootBufRes):
             return Err[RenderWmoGroupModel[]](Error(rootBufRes))
         let rootBuf: bytes.ByteBuffer = Value(rootBufRes)
@@ -1264,10 +1477,7 @@ fn renderLoadMaidWorldModelGroups(manifest: northshire.NorthshireManifest,
             renderFreeWmoGroupModels(out)
             return Err[RenderWmoGroupModel[]]("wowExport render: MAID WMO group stat order mismatch")
         let groupBufRes: Result[bytes.ByteBuffer] =
-            local_files.ReadLocalFileByEntry(manifest.clientPath,
-                                            groupStat.archiveIndex,
-                                            groupStat.offset,
-                                            groupStat.size)
+            local_files.ReadLocalFileByStat(manifest.clientPath, groupStat)
         if IsErr(groupBufRes):
             renderFreeWmoGroupModels(out)
             return Err[RenderWmoGroupModel[]](Error(groupBufRes))
@@ -1281,21 +1491,32 @@ fn renderLoadMaidWorldModelGroups(manifest: northshire.NorthshireManifest,
         let groupSummary: asset_formats.WmoGroupSummary = Value(groupSummaryRes)
         groupBatchCountOut = groupBatchCountOut + groupSummary.batchCount
         groupMaterialInfoCountOut = groupMaterialInfoCountOut + groupSummary.materialInfoCount
-        var vertexOffset: int32
-        var vertexCount: int32
-        let movtRes: Result[bool] = renderFindWmoMovt(groupBuf, vertexOffset, vertexCount)
-        if IsErr(movtRes):
+        var chunks: RenderWmoGroupChunks
+        let chunksRes: Result[bool] = renderFindWmoGroupChunks(groupBuf, chunks)
+        if IsErr(chunksRes):
             bytes.FreeByteBuffer(groupBuf)
             renderFreeWmoGroupModels(out)
-            return Err[RenderWmoGroupModel[]](Error(movtRes))
-        if vertexCount <= 0 || vertexCount != groupSummary.vertexCount:
+            return Err[RenderWmoGroupModel[]](Error(chunksRes))
+        if chunks.vertexCount <= 0 ||
+            chunks.vertexCount != groupSummary.vertexCount ||
+            chunks.indexCount != groupSummary.indexCount ||
+            chunks.materialInfoCount != groupSummary.materialInfoCount ||
+            chunks.batchCount != groupSummary.batchCount:
             bytes.FreeByteBuffer(groupBuf)
             renderFreeWmoGroupModels(out)
-            return Err[RenderWmoGroupModel[]]("wowExport render: MAID WMO group vertex count mismatch")
+            return Err[RenderWmoGroupModel[]]("wowExport render: MAID WMO group chunk count mismatch")
+        groupTriangleIndexCountOut = groupTriangleIndexCountOut + chunks.indexCount
+        groupTriangleCountOut = groupTriangleCountOut + chunks.indexCount / 3
         var group: RenderWmoGroupModel
         group.fileDataID = groupStat.fileDataID
-        group.vertexCount = vertexCount
-        group.vertexOffset = vertexOffset
+        group.vertexCount = chunks.vertexCount
+        group.vertexOffset = chunks.vertexOffset
+        group.indexCount = chunks.indexCount
+        group.indexOffset = chunks.indexOffset
+        group.materialInfoCount = chunks.materialInfoCount
+        group.materialInfoOffset = chunks.materialInfoOffset
+        group.batchCount = chunks.batchCount
+        group.batchOffset = chunks.batchOffset
         group.buf = groupBuf
         add(out, group)
         groupIndex = groupIndex + 1
@@ -1853,6 +2074,8 @@ fn renderScanMaidDoodadModelInstance(model: RenderDoodadModel,
                                      placement: RenderMaidDoodadPlacement,
                                      bounds: var RenderBounds,
                                      countOut: var int32): Result[bool] =
+    var transform: RenderMaidWorldModelTransform
+    renderMakeMaidDoodadTransform(placement, transform)
     var i: int32
     while i < model.vertexCount:
         let pos: int32 = model.vertexOffset + i * 48
@@ -1865,13 +2088,13 @@ fn renderScanMaidDoodadModelInstance(model: RenderDoodadModel,
         var outX1000: int32
         var outY1000: int32
         var outZ1000: int32
-        renderTransformMaidDoodadVertex(placement,
-                                        Value(xRes),
-                                        Value(yRes),
-                                        Value(zRes),
-                                        outX1000,
-                                        outY1000,
-                                        outZ1000)
+        renderApplyMaidWorldModelTransform(transform,
+                                           Value(xRes),
+                                           Value(yRes),
+                                           Value(zRes),
+                                           outX1000,
+                                           outY1000,
+                                           outZ1000)
         renderAccumulateBounds(bounds, outX1000, outY1000, outZ1000)
         countOut = countOut + 1
         i = i + 1
@@ -1905,6 +2128,8 @@ fn renderDrawMaidDoodadModelInstance(tga: bytes.ByteBuffer,
                                      placement: RenderMaidDoodadPlacement,
                                      bounds: RenderBounds,
                                      pixels: var int32): Result[bool] =
+    var transform: RenderMaidWorldModelTransform
+    renderMakeMaidDoodadTransform(placement, transform)
     var i: int32
     while i < model.vertexCount:
         let pos: int32 = model.vertexOffset + i * 48
@@ -1917,13 +2142,13 @@ fn renderDrawMaidDoodadModelInstance(tga: bytes.ByteBuffer,
         var outX1000: int32
         var outY1000: int32
         var outZ1000: int32
-        renderTransformMaidDoodadVertex(placement,
-                                        Value(xRes),
-                                        Value(yRes),
-                                        Value(zRes),
-                                        outX1000,
-                                        outY1000,
-                                        outZ1000)
+        renderApplyMaidWorldModelTransform(transform,
+                                           Value(xRes),
+                                           Value(yRes),
+                                           Value(zRes),
+                                           outX1000,
+                                           outY1000,
+                                           outZ1000)
         let px: int32 = renderMapCoord(outX1000, bounds.minX1000, bounds.maxX1000,
                                         renderMargin, width - renderMargin - 1)
         let pyRaw: int32 = renderMapCoord(outY1000, bounds.minY1000, bounds.maxY1000,
@@ -1962,7 +2187,14 @@ fn renderDrawMaidDoodadModelInstances(tga: bytes.ByteBuffer,
 fn renderScanMaidWorldModelGroupInstance(model: RenderWmoGroupModel,
                                          placement: RenderMaidWorldModelPlacement,
                                          bounds: var RenderBounds,
-                                         countOut: var int32): Result[bool] =
+                                         countOut: var int32,
+                                         triangleCountOut: var int32): Result[bool] =
+    if model.indexCount <= 0 || (model.indexCount % 3) != 0:
+        return Err[bool]("wowExport render: MAID WMO group instance index count invalid")
+    if model.materialInfoCount != model.indexCount / 3:
+        return Err[bool]("wowExport render: MAID WMO group instance material count mismatch")
+    var transform: RenderMaidWorldModelTransform
+    renderMakeMaidWorldModelTransform(placement, transform)
     var i: int32
     while i < model.vertexCount:
         let pos: int32 = model.vertexOffset + i * 12
@@ -1975,21 +2207,23 @@ fn renderScanMaidWorldModelGroupInstance(model: RenderWmoGroupModel,
         var outX1000: int32
         var outY1000: int32
         var outZ1000: int32
-        renderTransformMaidWorldModelVertex(placement,
-                                            Value(xRes),
-                                            Value(yRes),
-                                            Value(zRes),
-                                            outX1000,
-                                            outY1000,
-                                            outZ1000)
+        renderApplyMaidWorldModelTransform(transform,
+                                           Value(xRes),
+                                           Value(yRes),
+                                           Value(zRes),
+                                           outX1000,
+                                           outY1000,
+                                           outZ1000)
         renderAccumulateBounds(bounds, outX1000, outY1000, outZ1000)
         countOut = countOut + 1
         i = i + 1
+    triangleCountOut = triangleCountOut + model.indexCount / 3
     return Ok[bool](true)
 
 fn renderScanMaidWorldModelInstances(assets: RenderMaidDoodadAssets,
                                      bounds: var RenderBounds,
-                                     countOut: var int32): Result[bool] =
+                                     countOut: var int32,
+                                     triangleCountOut: var int32): Result[bool] =
     if assets.worldModelPlacements.len <= 0 ||
         assets.worldModelGroupRefs.len <= 0 ||
         assets.worldModelGroups.len <= 0:
@@ -2010,7 +2244,8 @@ fn renderScanMaidWorldModelInstances(assets: RenderMaidDoodadAssets,
                     renderScanMaidWorldModelGroupInstance(assets.worldModelGroups[modelIndex],
                                                           placement,
                                                           bounds,
-                                                          countOut)
+                                                          countOut,
+                                                          triangleCountOut)
                 if IsErr(scanRes):
                     return Err[bool](Error(scanRes))
                 groupCount = groupCount + 1
@@ -2027,6 +2262,16 @@ fn renderDrawMaidWorldModelGroupInstance(tga: bytes.ByteBuffer,
                                          placement: RenderMaidWorldModelPlacement,
                                          bounds: RenderBounds,
                                          pixels: var int32): Result[bool] =
+    if model.indexCount <= 0 || (model.indexCount % 3) != 0:
+        return Err[bool]("wowExport render: MAID WMO draw index count invalid")
+    if model.materialInfoCount != model.indexCount / 3:
+        return Err[bool]("wowExport render: MAID WMO draw material count mismatch")
+    var screenX: int32[]
+    var screenY: int32[]
+    reserve(screenX, model.vertexCount)
+    reserve(screenY, model.vertexCount)
+    var transform: RenderMaidWorldModelTransform
+    renderMakeMaidWorldModelTransform(placement, transform)
     var i: int32
     while i < model.vertexCount:
         let pos: int32 = model.vertexOffset + i * 12
@@ -2039,19 +2284,39 @@ fn renderDrawMaidWorldModelGroupInstance(tga: bytes.ByteBuffer,
         var outX1000: int32
         var outY1000: int32
         var outZ1000: int32
-        renderTransformMaidWorldModelVertex(placement,
-                                            Value(xRes),
-                                            Value(yRes),
-                                            Value(zRes),
-                                            outX1000,
-                                            outY1000,
-                                            outZ1000)
+        renderApplyMaidWorldModelTransform(transform,
+                                           Value(xRes),
+                                           Value(yRes),
+                                           Value(zRes),
+                                           outX1000,
+                                           outY1000,
+                                           outZ1000)
         let px: int32 = renderMapCoord(outX1000, bounds.minX1000, bounds.maxX1000,
                                         renderMargin, width - renderMargin - 1)
         let pyRaw: int32 = renderMapCoord(outY1000, bounds.minY1000, bounds.maxY1000,
                                            renderMargin, height - renderMargin - 1)
-        renderPlot(tga, width, height, px, height - 1 - pyRaw, 246, 154, 78, pixels)
+        add(screenX, px)
+        add(screenY, height - 1 - pyRaw)
         i = i + 1
+    var tri: int32
+    while tri < model.indexCount / 3:
+        let indexPos: int32 = model.indexOffset + tri * 6
+        let i0: int32 = bytes.ReadU16LEAt(model.buf, indexPos)
+        let i1: int32 = bytes.ReadU16LEAt(model.buf, indexPos + 2)
+        let i2: int32 = bytes.ReadU16LEAt(model.buf, indexPos + 4)
+        if i0 < 0 || i0 >= screenX.len ||
+            i1 < 0 || i1 >= screenX.len ||
+            i2 < 0 || i2 >= screenX.len:
+            return Err[bool]("wowExport render: MAID WMO draw index out of MOVT range")
+        let materialID: int32 = bytes.BufByteAt(model.buf, model.materialInfoOffset + tri * 2 + 1)
+        var r: int32
+        var g: int32
+        var b: int32
+        renderWmoMaterialColor(materialID, r, g, b)
+        let px: int32 = (screenX[i0] + screenX[i1] + screenX[i2]) / 3
+        let py: int32 = (screenY[i0] + screenY[i1] + screenY[i2]) / 3
+        renderPlot(tga, width, height, px, py, r, g, b, pixels)
+        tri = tri + 1
     return Ok[bool](true)
 
 fn renderDrawMaidWorldModelInstances(tga: bytes.ByteBuffer,
@@ -2142,10 +2407,11 @@ fn renderDrawM2Inset(tga: bytes.ByteBuffer,
 
 fn renderLoadFile(manifest: northshire.NorthshireManifest,
                   file: northshire.NorthshireAuditedFile): Result[bytes.ByteBuffer] =
-    return local_files.ReadLocalFileByEntry(manifest.clientPath,
-                                            file.archiveIndex,
-                                            file.offset,
-                                            file.size)
+    return local_files.ReadLocalFileByEntryCached(manifest.clientPath,
+                                                  file.encodingKey,
+                                                  file.archiveIndex,
+                                                  file.offset,
+                                                  file.size)
 
 fn renderCheckWdtMaidTileDependencies(summary: var RenderSummary,
                                       manifest: northshire.NorthshireManifest,
@@ -2387,10 +2653,11 @@ fn renderLoadWdtMaidDependencyAssets(summary: var RenderSummary,
         let dep: northshire.NorthshireAuditedDependency = manifest.auditedDependencies[i]
         if dep.relationKind == "wdt_maid_split":
             let fileRes: Result[bytes.ByteBuffer] =
-                local_files.ReadLocalFileByEntry(manifest.clientPath,
-                                                dep.archiveIndex,
-                                                dep.offset,
-                                                dep.size)
+                local_files.ReadLocalFileByEntryCached(manifest.clientPath,
+                                                       dep.encodingKey,
+                                                       dep.archiveIndex,
+                                                       dep.offset,
+                                                       dep.size)
             if IsErr(fileRes):
                 return Err[bool]("wowExport render: WDT MAID dependency load failed " + dep.label + ": " + Error(fileRes))
             let fileBuf: bytes.ByteBuffer = Value(fileRes)
@@ -2525,7 +2792,9 @@ fn renderLoadWdtMaidDependencyAssets(summary: var RenderSummary,
                                        summary.wdtMaidWorldModelMaterialCount,
                                        summary.wdtMaidWorldModelLightCount,
                                        summary.wdtMaidWorldModelGroupBatchCount,
-                                       summary.wdtMaidWorldModelGroupMaterialInfoCount)
+                                       summary.wdtMaidWorldModelGroupMaterialInfoCount,
+                                       summary.wdtMaidWorldModelGroupTriangleIndexCount,
+                                       summary.wdtMaidWorldModelGroupTriangleCount)
     if IsErr(groupModelsRes):
         return Err[bool](Error(groupModelsRes))
     assets.worldModelGroups = Value(groupModelsRes)
@@ -2533,7 +2802,8 @@ fn renderLoadWdtMaidDependencyAssets(summary: var RenderSummary,
     summary.wdtMaidWorldModelMaterialPassReady =
         summary.wdtMaidWorldModelMaterialCount > 0 &&
         summary.wdtMaidWorldModelGroupBatchCount > 0 &&
-        summary.wdtMaidWorldModelGroupMaterialInfoCount > 0
+        summary.wdtMaidWorldModelGroupMaterialInfoCount > 0 &&
+        summary.wdtMaidWorldModelGroupMaterialInfoCount == summary.wdtMaidWorldModelGroupTriangleCount
     summary.wdtMaidWorldModelInstancePlacementCount = assets.worldModelPlacements.len
     return Ok[bool](true)
 
@@ -2659,14 +2929,20 @@ fn renderNorthshireTgaWithDoodadModels(manifest: northshire.NorthshireManifest,
             summary.wmoGroupBatchCount = summary.wmoGroupBatchCount + group.batchCount
             summary.wmoGroupMaterialInfoCount =
                 summary.wmoGroupMaterialInfoCount + group.materialInfoCount
-            var countedVertexCount: int32
-            let scanRes: Result[bool] = renderCountWmoVertices(buf, countedVertexCount)
+            var chunks: RenderWmoGroupChunks
+            let scanRes: Result[bool] = renderFindWmoGroupChunks(buf, chunks)
             bytes.FreeByteBuffer(buf)
             if IsErr(scanRes):
                 return Err[RenderSummary](Error(scanRes))
-            if countedVertexCount != group.vertexCount:
-                return Err[RenderSummary]("wowExport render: WMO group material pass vertex count mismatch")
-            summary.wmoVertexCount = summary.wmoVertexCount + countedVertexCount
+            if chunks.vertexCount != group.vertexCount ||
+                chunks.indexCount != group.indexCount ||
+                chunks.materialInfoCount != group.materialInfoCount ||
+                chunks.batchCount != group.batchCount:
+                return Err[RenderSummary]("wowExport render: WMO group material pass chunk count mismatch")
+            summary.wmoGroupTriangleIndexCount =
+                summary.wmoGroupTriangleIndexCount + chunks.indexCount
+            summary.wmoGroupTriangleCount = summary.wmoGroupTriangleCount + chunks.indexCount / 3
+            summary.wmoVertexCount = summary.wmoVertexCount + chunks.vertexCount
         elif file.kind == "m2":
             let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
             if IsErr(bufRes):
@@ -2717,7 +2993,8 @@ fn renderNorthshireTgaWithDoodadModels(manifest: northshire.NorthshireManifest,
     summary.wmoMaterialLightPassReady =
         summary.wmoMaterialCount > 0 &&
         summary.wmoGroupBatchCount > 0 &&
-        summary.wmoGroupMaterialInfoCount > 0
+        summary.wmoGroupMaterialInfoCount > 0 &&
+        summary.wmoGroupMaterialInfoCount == summary.wmoGroupTriangleCount
     summary.texturePassReady =
         summary.textureFileCount > 0 &&
         summary.textureMaxWidth > 0 &&
@@ -2738,11 +3015,17 @@ fn renderNorthshireTgaWithDoodadModels(manifest: northshire.NorthshireManifest,
     let maidWorldModelScanRes: Result[bool] =
         renderScanMaidWorldModelInstances(maidAssets,
                                           maidWorldModelBounds,
-                                          summary.wdtMaidWorldModelInstanceVertexCount)
+                                          summary.wdtMaidWorldModelInstanceVertexCount,
+                                          summary.wdtMaidWorldModelInstanceTriangleCount)
     if IsErr(maidWorldModelScanRes):
         renderFreeMaidDoodadAssets(maidAssets)
         return Err[RenderSummary](Error(maidWorldModelScanRes))
     summary.wdtMaidWorldModelInstanceBoundsReady = maidWorldModelBounds.ready
+    summary.wdtMaidWorldModelIndexedTrianglePassReady =
+        summary.wdtMaidWorldModelGroupTriangleCount > 0 &&
+        summary.wdtMaidWorldModelGroupTriangleIndexCount == summary.wdtMaidWorldModelGroupTriangleCount * 3 &&
+        summary.wdtMaidWorldModelGroupMaterialInfoCount == summary.wdtMaidWorldModelGroupTriangleCount &&
+        summary.wdtMaidWorldModelInstanceTriangleCount > 0
     i = 0
     while i < manifest.auditedFiles.len:
         let file: northshire.NorthshireAuditedFile = manifest.auditedFiles[i]
@@ -2787,6 +3070,8 @@ fn renderNorthshireTgaWithDoodadModels(manifest: northshire.NorthshireManifest,
         !summary.wmoDoodadWorldBoundsReady ||
         !summary.wmoMaterialLightPassReady ||
         !summary.texturePassReady ||
+        summary.wmoGroupTriangleIndexCount != summary.wmoGroupTriangleCount * 3 ||
+        summary.wmoGroupMaterialInfoCount != summary.wmoGroupTriangleCount ||
         summary.wmoDoodadModelVertexCount <= 0 ||
         summary.wmoDoodadModelWorldInstanceVertexCount <= 0:
         renderFreeMaidDoodadAssets(maidAssets)
@@ -2820,10 +3105,15 @@ fn renderNorthshireTgaWithDoodadModels(manifest: northshire.NorthshireManifest,
         summary.wdtMaidWorldModelWmoAssetCount != summary.wdtMaidWorldModelReferencedFileDataIDCount ||
         summary.wdtMaidWorldModelGroupReferenceCount <= 0 ||
         summary.wdtMaidWorldModelGroupAssetCount <= 0 ||
+        summary.wdtMaidWorldModelGroupTriangleIndexCount <= 0 ||
+        summary.wdtMaidWorldModelGroupTriangleCount <= 0 ||
+        summary.wdtMaidWorldModelGroupTriangleIndexCount != summary.wdtMaidWorldModelGroupTriangleCount * 3 ||
         !summary.wdtMaidWorldModelMaterialPassReady ||
         summary.wdtMaidWorldModelInstancePlacementCount != summary.wdtMaidWorldModelPlacementCount ||
         summary.wdtMaidWorldModelInstanceVertexCount <= 0 ||
+        summary.wdtMaidWorldModelInstanceTriangleCount <= 0 ||
         !summary.wdtMaidWorldModelInstanceBoundsReady ||
+        !summary.wdtMaidWorldModelIndexedTrianglePassReady ||
         !summary.wdtMaidPlacementDependencyAuditReady ||
         summary.wdtMaidPlacementDependencyEncodedBytes <= 0 ||
         summary.wdtMaidPlacementDependencyDecodedBytes <= 0 ||
@@ -2972,6 +3262,8 @@ fn RenderSummaryText(summary: RenderSummary): str =
     let wmoLightText: str = strings.IntToStr(summary.wmoLightCount)
     let wmoGroupBatchText: str = strings.IntToStr(summary.wmoGroupBatchCount)
     let wmoGroupMaterialInfoText: str = strings.IntToStr(summary.wmoGroupMaterialInfoCount)
+    let wmoGroupTriangleIndexText: str = strings.IntToStr(summary.wmoGroupTriangleIndexCount)
+    let wmoGroupTriangleText: str = strings.IntToStr(summary.wmoGroupTriangleCount)
     let wmoMaterialPassText: str = summary.wmoMaterialLightPassReady ? "ready" : "missing"
     let textureFileText: str = strings.IntToStr(summary.textureFileCount)
     let textureWidthText: str = strings.IntToStr(summary.textureMaxWidth)
@@ -3013,14 +3305,22 @@ fn RenderSummaryText(summary: RenderSummary): str =
     let wdtMaidWorldModelGroupBatchText: str = strings.IntToStr(summary.wdtMaidWorldModelGroupBatchCount)
     let wdtMaidWorldModelGroupMaterialInfoText: str =
         strings.IntToStr(summary.wdtMaidWorldModelGroupMaterialInfoCount)
+    let wdtMaidWorldModelGroupTriangleIndexText: str =
+        strings.IntToStr(summary.wdtMaidWorldModelGroupTriangleIndexCount)
+    let wdtMaidWorldModelGroupTriangleText: str =
+        strings.IntToStr(summary.wdtMaidWorldModelGroupTriangleCount)
     let wdtMaidWorldModelMaterialPassText: str =
         summary.wdtMaidWorldModelMaterialPassReady ? "ready" : "missing"
     let wdtMaidWorldModelInstancePlacementText: str =
         strings.IntToStr(summary.wdtMaidWorldModelInstancePlacementCount)
     let wdtMaidWorldModelInstanceVertexText: str =
         strings.IntToStr(summary.wdtMaidWorldModelInstanceVertexCount)
+    let wdtMaidWorldModelInstanceTriangleText: str =
+        strings.IntToStr(summary.wdtMaidWorldModelInstanceTriangleCount)
     let wdtMaidWorldModelInstanceBoundsText: str =
         summary.wdtMaidWorldModelInstanceBoundsReady ? "ready" : "missing"
+    let wdtMaidWorldModelIndexedTrianglePassText: str =
+        summary.wdtMaidWorldModelIndexedTrianglePassReady ? "ready" : "missing"
     let wdtMaidPlacementAuditText: str = summary.wdtMaidPlacementDependencyAuditReady ? "ready" : "missing"
     let wdtMaidPlacementEncodedBytesText: str = strings.IntToStr(summary.wdtMaidPlacementDependencyEncodedBytes)
     let wdtMaidPlacementDecodedBytesText: str = strings.IntToStr(summary.wdtMaidPlacementDependencyDecodedBytes)
@@ -3067,6 +3367,8 @@ fn RenderSummaryText(summary: RenderSummary): str =
     out = out + Fmt" wmoLights={wmoLightText}"
     out = out + Fmt" wmoGroupBatches={wmoGroupBatchText}"
     out = out + Fmt" wmoGroupMaterialInfo={wmoGroupMaterialInfoText}"
+    out = out + Fmt" wmoGroupTriangleIndices={wmoGroupTriangleIndexText}"
+    out = out + Fmt" wmoGroupTriangles={wmoGroupTriangleText}"
     out = out + Fmt" wmoMaterialLightPass={wmoMaterialPassText}"
     out = out + Fmt" textureFiles={textureFileText}"
     out = out + Fmt" textureMax={textureSizeText}"
@@ -3103,10 +3405,14 @@ fn RenderSummaryText(summary: RenderSummary): str =
     out = out + " wdtMaidWorldModelLights=" + wdtMaidWorldModelLightText
     out = out + " wdtMaidWorldModelGroupBatches=" + wdtMaidWorldModelGroupBatchText
     out = out + " wdtMaidWorldModelGroupMaterialInfo=" + wdtMaidWorldModelGroupMaterialInfoText
+    out = out + " wdtMaidWorldModelGroupTriangleIndices=" + wdtMaidWorldModelGroupTriangleIndexText
+    out = out + " wdtMaidWorldModelGroupTriangles=" + wdtMaidWorldModelGroupTriangleText
     out = out + " wdtMaidWorldModelMaterialPass=" + wdtMaidWorldModelMaterialPassText
     out = out + " wdtMaidWorldModelInstancePlacements=" + wdtMaidWorldModelInstancePlacementText
     out = out + " wdtMaidWorldModelInstanceVertices=" + wdtMaidWorldModelInstanceVertexText
+    out = out + " wdtMaidWorldModelInstanceTriangles=" + wdtMaidWorldModelInstanceTriangleText
     out = out + " wdtMaidWorldModelInstanceBounds=" + wdtMaidWorldModelInstanceBoundsText
+    out = out + " wdtMaidWorldModelIndexedTrianglePass=" + wdtMaidWorldModelIndexedTrianglePassText
     out = out + Fmt" wdtMaidPlacementDependencyAudit={wdtMaidPlacementAuditText}"
     out = out + Fmt" wdtMaidPlacementDependencyEncodedBytes={wdtMaidPlacementEncodedBytesText}"
     out = out + Fmt" wdtMaidPlacementDependencyDecodedBytes={wdtMaidPlacementDecodedBytesText}"

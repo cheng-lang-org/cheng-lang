@@ -19,6 +19,7 @@ type
         symbolNames: str[]
         functionWordOffsets: int32[]
         functionWordCounts: int32[]
+        functionBodyKinds: str[]
         instructionWords: int32[]
         dataLabels: str[]
         dataPayloadTexts: str[]
@@ -97,6 +98,19 @@ fn PrimaryFindDeclLineIndex(decls: parser.NormalizedFunctionDecl[],
     for i in 0..<decls.len:
         if decls[i].name == functionName:
             return decls[i].lineIndex
+    var tailStart = 0
+    var j = 0
+    while j + 1 < len(functionName):
+        if functionName[j] == ':' && functionName[j + 1] == ':':
+            tailStart = j + 2
+            j = j + 2
+            continue
+        j = j + 1
+    if tailStart > 0 && tailStart < len(functionName):
+        let tailName = strings.SliceBytes(functionName, tailStart, len(functionName) - tailStart)
+        for i in 0..<decls.len:
+            if decls[i].name == tailName:
+                return decls[i].lineIndex
     return 0
 
 fn PrimarySourceCacheIndex(entries: PrimarySourceCacheEntry[],
@@ -186,19 +200,34 @@ fn PrimaryFunctionTargetSymbol(functionSymbolTexts: str[],
             return allSymbolNames[i]
     return ""
 
+fn PrimaryFunctionBodyKind(bodyText: str,
+                            callArgCount: int32,
+                            targetSymbol: str): str =
+    let trimmed = chengpath.PathTrim(bodyText)
+    if trimmed == "return 0" || trimmed == "0":
+        return "return_zero_i32"
+    if len(targetSymbol) <= 0:
+        return "unsupported"
+    if callArgCount == 0:
+        return "return_call_noarg_i32"
+    if callArgCount == 1:
+        return "return_call_arg0_i32"
+    return "unsupported"
+
+fn PrimaryFunctionWordCountForBodyKind(bodyKind: str): int32 =
+    if bodyKind == "return_zero_i32":
+        return 2
+    if bodyKind == "return_call_noarg_i32":
+        return 1
+    if bodyKind == "return_call_arg0_i32":
+        return 2
+    return 0
+
 fn PrimaryFunctionWordCount(bodyText: str,
                               callArgCount: int32,
                               targetSymbol: str): int32 =
-    let trimmed = chengpath.PathTrim(bodyText)
-    if trimmed == "return 0" || trimmed == "0":
-        return 2
-    if len(targetSymbol) <= 0:
-        return 0
-    if callArgCount == 0:
-        return 1
-    if callArgCount == 1:
-        return 2
-    return 0
+    let bodyKind = PrimaryFunctionBodyKind(bodyText, callArgCount, targetSymbol)
+    return PrimaryFunctionWordCountForBodyKind(bodyKind)
 
 fn PrimaryObjectMissingReasons(linkPlan: slplan.SystemLinkPlanStub,
                                  lowering: lower.LoweringPlanStub,
@@ -231,6 +260,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     var symbolNames: str[]
     var functionWordOffsets: int32[]
     var functionWordCounts: int32[]
+    var functionBodyKinds: str[]
     var plan: PrimaryObjectPlan
     var totalWordCount: int32
     var bodySemanticsMissing = false
@@ -242,6 +272,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     symbolNames = []
     functionWordOffsets = []
     functionWordCounts = []
+    functionBodyKinds = []
     for i in 0..<lowering.functionNames.len:
         let sourcePath = lowering.functionSourcePaths[i]
         let cacheIndex = PrimarySourceCacheEnsure(sourceCache, sourcePath)
@@ -277,7 +308,8 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
             targetSymbol = PrimaryFunctionTargetSymbol(lowering.functionSymbolTexts,
                                                          allSymbolNames,
                                                          fact.callTarget)
-        let wordCount = PrimaryFunctionWordCount(bodyText, callArgCount, targetSymbol)
+        let bodyKind = PrimaryFunctionBodyKind(bodyText, callArgCount, targetSymbol)
+        let wordCount = PrimaryFunctionWordCountForBodyKind(bodyKind)
         if wordCount <= 0:
             bodySemanticsMissing = true
             continue
@@ -285,12 +317,14 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
         add(symbolNames, allSymbolNames[i])
         add(functionWordOffsets, totalWordCount)
         add(functionWordCounts, wordCount)
+        add(functionBodyKinds, bodyKind)
         totalWordCount = totalWordCount + wordCount
     if linkPlan.emitKind == creq.EmitExe && len(linkPlan.entrySymbol) > 0 && itemIds.len > 0:
         add(itemIds, int32(900000 + itemIds.len))
         add(symbolNames, PrimaryRuntimeEntryBridgeSymbol(linkPlan))
         add(functionWordOffsets, totalWordCount)
         add(functionWordCounts, 1)
+        add(functionBodyKinds, "entry_bridge")
         totalWordCount = totalWordCount + 1
     plan.targetTriple = linkPlan.targetTriple
     plan.objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
@@ -304,6 +338,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     plan.symbolNames = symbolNames
     plan.functionWordOffsets = functionWordOffsets
     plan.functionWordCounts = functionWordCounts
+    plan.functionBodyKinds = functionBodyKinds
     plan.instructionWords = []
     for i in 0..<totalWordCount:
         add(plan.instructionWords, 0)

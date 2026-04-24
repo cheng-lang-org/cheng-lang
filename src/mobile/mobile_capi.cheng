@@ -163,18 +163,29 @@ fn MobileCapiBioDidErrorJson(errorText: str): str =
 fn MobileCapiTextBufferHandle(text: str): uint64 =
     let raw = bytesFromString(text)
     let textLen = bytesLen(raw)
-    if textLen <= 0 || raw.data == nil:
+    let rawData = raw.data
+    if textLen <= 0 || rawData == nil:
         return uint64(0)
     MobileCapiEmitLog("mobile_moq:text_buffer_handle_before_bridge")
-    let handle = cheng_buffer_handle_from_raw_bridge(raw.data, textLen)
+    let handle = cheng_buffer_handle_from_raw_bridge(rawData, textLen)
     MobileCapiEmitLog("mobile_moq:text_buffer_handle_after_bridge")
     return handle
 
-fn MobileCapiBytesBufferHandle(payload: Bytes): int32 =
+fn MobileCapiBytesBufferHandle(payload: Bytes): uint64 =
     let payloadLen = bytesLen(payload)
-    if payloadLen <= 0 || payload.data == nil:
-        return 0
-    return int32(cheng_buffer_handle_from_raw_bridge(payload.data, payloadLen))
+    if payloadLen <= 0:
+        return uint64(0)
+    var snapshot = bytesAlloc(payloadLen)
+    if snapshot.data == nil:
+        return uint64(0)
+    var i: int32
+    while i < payloadLen:
+        bytesSet(snapshot, i, bytesGet(payload, i))
+        i = i + 1
+    let snapshotData = snapshot.data
+    let handle = cheng_buffer_handle_from_raw_bridge(snapshotData, payloadLen)
+    bytesFree(snapshot)
+    return handle
 
 fn MobileCapiTextCString(text: str): ptr =
     let textLen = len(text)
@@ -238,10 +249,12 @@ type MobileMoqBuildResult = object
     catalogKey: str
     catalogCid: str
     catalogSizeBytes: int32
+    catalogPayloadText: str
     catalogPayload: Bytes
     rebuildTemplateKey: str
     rebuildTemplateCid: str
     rebuildTemplateSizeBytes: int32
+    rebuildTemplatePayloadText: str
     rebuildTemplatePayload: Bytes
     blobByteLen: int32
     objectTargetBytes: int32
@@ -280,6 +293,9 @@ fn MobileCapiWireRow(key: str, value: str): str =
 
 fn MobileCapiWireRowInt(key: str, value: int32): str =
     return MobileCapiWireRow(key, strings.IntToStr(value))
+
+fn MobileCapiWireRowUint64(key: str, value: uint64): str =
+    return MobileCapiWireRow(key, strings.Uint64ToStr(value))
 
 fn MobileCapiWireRowsText(rows: str[]): str =
     if rows.len <= 0:
@@ -443,13 +459,19 @@ fn MobileCapiMoqBuildPersistWire(result: MobileMoqBuildResult,
     MobileCapiEmitLog("mobile_moq:build_persist_wire_enter")
     let catalogPath = MobileCapiPathJoinStemSuffix(outputDir, fileNameStem, ".catalog.json")
     MobileCapiEmitLog("mobile_moq:build_persist_wire_after_catalog_path")
-    let catalogWriteRes = MobileCapiWriteBytesFile(catalogPath, result.catalogPayload)
+    let catalogPayloadForWrite = bytesFromString(result.catalogPayloadText)
+    if bytesLen(catalogPayloadForWrite) <= 0:
+        return Err[str]("moq_fountain_empty_catalog_payload")
+    let catalogWriteRes = MobileCapiWriteBytesFile(catalogPath, catalogPayloadForWrite)
     if IsErr(catalogWriteRes):
         return Err[str](Error(catalogWriteRes))
     MobileCapiEmitLog("mobile_moq:build_persist_wire_after_catalog_write")
     let rebuildPath = MobileCapiPathJoinStemSuffix(outputDir, fileNameStem, ".rebuild.txt")
     MobileCapiEmitLog("mobile_moq:build_persist_wire_after_rebuild_path")
-    let rebuildWriteRes = MobileCapiWriteBytesFile(rebuildPath, result.rebuildTemplatePayload)
+    let rebuildPayloadForWrite = bytesFromString(result.rebuildTemplatePayloadText)
+    if bytesLen(rebuildPayloadForWrite) <= 0:
+        return Err[str]("moq_fountain_empty_rebuild_template")
+    let rebuildWriteRes = MobileCapiWriteBytesFile(rebuildPath, rebuildPayloadForWrite)
     if IsErr(rebuildWriteRes):
         return Err[str](Error(rebuildWriteRes))
     MobileCapiEmitLog("mobile_moq:build_persist_wire_after_rebuild_write")
@@ -687,11 +709,17 @@ fn MobileCapiMoqBuildHandleWire(result: var MobileMoqBuildResult): str =
     add(rows, MobileCapiWireRow("catalog_key", result.catalogKey))
     add(rows, MobileCapiWireRow("catalog_cid", result.catalogCid))
     add(rows, MobileCapiWireRowInt("catalog_size_bytes", result.catalogSizeBytes))
-    add(rows, MobileCapiWireRowInt("catalog_handle", MobileCapiBytesBufferHandle(result.catalogPayload)))
+    let catalogHandle = MobileCapiTextBufferHandle(result.catalogPayloadText)
+    if catalogHandle == uint64(0):
+        return MobileCapiMoqError("moq_fountain_empty_catalog_payload")
+    add(rows, MobileCapiWireRowUint64("catalog_handle", catalogHandle))
     add(rows, MobileCapiWireRow("rebuild_template_key", result.rebuildTemplateKey))
     add(rows, MobileCapiWireRow("rebuild_template_cid", result.rebuildTemplateCid))
     add(rows, MobileCapiWireRowInt("rebuild_template_size_bytes", result.rebuildTemplateSizeBytes))
-    add(rows, MobileCapiWireRowInt("rebuild_template_handle", MobileCapiBytesBufferHandle(result.rebuildTemplatePayload)))
+    let rebuildTemplateHandle = MobileCapiTextBufferHandle(result.rebuildTemplatePayloadText)
+    if rebuildTemplateHandle == uint64(0):
+        return MobileCapiMoqError("moq_fountain_empty_rebuild_template")
+    add(rows, MobileCapiWireRowUint64("rebuild_template_handle", rebuildTemplateHandle))
     add(rows, MobileCapiWireRowInt("blob_byte_len", result.blobByteLen))
     add(rows, MobileCapiWireRowInt("object_target_bytes", result.objectTargetBytes))
     add(rows, MobileCapiWireRowInt("source_block_bytes", result.sourceBlockBytes))
@@ -725,7 +753,7 @@ fn MobileCapiMoqBuildHandleWire(result: var MobileMoqBuildResult): str =
         add(rows, MobileCapiWireRow(prefix + "cid", droplet.cid))
         add(rows, MobileCapiWireRowInt(prefix + "degree", droplet.degree))
         add(rows, MobileCapiWireRow(prefix + "block_indexes", MobileCapiJoinIntCsv(droplet.blockIndexes)))
-        add(rows, MobileCapiWireRowInt(prefix + "handle", MobileCapiBytesBufferHandle(droplet.payload)))
+        add(rows, MobileCapiWireRowUint64(prefix + "handle", MobileCapiBytesBufferHandle(droplet.payload)))
         dropletRow = dropletRow + 1
     let outRes = MobileCapiWireRowsResult(rows, "moq_fountain_empty_build_handle_wire")
     if IsErr(outRes):
@@ -1285,11 +1313,11 @@ fn MobileCapiMoqBuildResultToWire(result: MobileMoqBuildResult): str =
     add(rows, MobileCapiWireRow("catalog_key", result.catalogKey))
     add(rows, MobileCapiWireRow("catalog_cid", result.catalogCid))
     add(rows, MobileCapiWireRowInt("catalog_size_bytes", result.catalogSizeBytes))
-    add(rows, MobileCapiWireRow("catalog_payload_hex", bytesToHex(result.catalogPayload)))
+    add(rows, MobileCapiWireRow("catalog_payload_hex", bytesToHex(bytesFromString(result.catalogPayloadText))))
     add(rows, MobileCapiWireRow("rebuild_template_key", result.rebuildTemplateKey))
     add(rows, MobileCapiWireRow("rebuild_template_cid", result.rebuildTemplateCid))
     add(rows, MobileCapiWireRowInt("rebuild_template_size_bytes", result.rebuildTemplateSizeBytes))
-    add(rows, MobileCapiWireRow("rebuild_template_payload_hex", bytesToHex(result.rebuildTemplatePayload)))
+    add(rows, MobileCapiWireRow("rebuild_template_payload_hex", bytesToHex(bytesFromString(result.rebuildTemplatePayloadText))))
     add(rows, MobileCapiWireRowInt("blob_byte_len", result.blobByteLen))
     add(rows, MobileCapiWireRowInt("object_target_bytes", result.objectTargetBytes))
     add(rows, MobileCapiWireRowInt("source_block_bytes", result.sourceBlockBytes))
@@ -1382,10 +1410,12 @@ fn MobileCapiMoqBuildResultFromCore(item: moq.MoqFountainBuildResult): MobileMoq
         catalogKey: item.catalogKey,
         catalogCid: item.catalogCid,
         catalogSizeBytes: item.catalogSizeBytes,
+        catalogPayloadText: "",
         catalogPayload: item.catalogPayload,
         rebuildTemplateKey: item.rebuildTemplateKey,
         rebuildTemplateCid: item.rebuildTemplateCid,
         rebuildTemplateSizeBytes: item.rebuildTemplateSizeBytes,
+        rebuildTemplatePayloadText: "",
         rebuildTemplatePayload: item.rebuildTemplatePayload,
         blobByteLen: item.blobByteLen,
         objectTargetBytes: item.objectTargetBytes,
@@ -1498,6 +1528,7 @@ fn MobileCapiMoqHydratedCoreResult(base: MobileMoqBuildResult,
     out.catalogKey = Fmt(["moqcatalog-", bundleCid])
     out.catalogCid = MobileCapiSha256HexBytes(catalogPayload)
     out.catalogSizeBytes = bytesLen(catalogPayload)
+    out.catalogPayloadText = catalogText
     out.catalogPayload = catalogPayload
 
     let rebuildTemplateText = MobileCapiMoqRebuildTemplateWire(out.objects,
@@ -1510,6 +1541,7 @@ fn MobileCapiMoqHydratedCoreResult(base: MobileMoqBuildResult,
     out.rebuildTemplateKey = Fmt(["moqrebuild-", bundleCid])
     out.rebuildTemplateCid = MobileCapiSha256HexBytes(rebuildTemplatePayload)
     out.rebuildTemplateSizeBytes = bytesLen(rebuildTemplatePayload)
+    out.rebuildTemplatePayloadText = rebuildTemplateText
     out.rebuildTemplatePayload = rebuildTemplatePayload
     return Ok[MobileMoqBuildResult](out)
 
