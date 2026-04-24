@@ -1,6 +1,7 @@
 import std/os
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/path as chengpath
+import cheng/r2c/r2c_react_smoke_support as r2csmoke
 
 fn main(): int32 =
     var root: str = os.GetEnv("CHENG_ROOT")
@@ -14,30 +15,45 @@ fn main(): int32 =
     assert(chengpath.FileExistsNonEmpty(root, driver), " r2c truth compare controller smoke: backend_driver exists")
     assert(chengpath.FileExistsNonEmpty(root, controllerSource), " r2c truth compare controller smoke: controller source exists")
 
-    let controllerExe = os.JoinPath(outDir, "r2c_react_truth_compare_smoke")
-    let controllerCompileReport = controllerExe + ".report.txt"
-    let controllerCompileLog = controllerExe + ".compile.log"
-    if chengpath.PathFileExists(controllerExe):
-        os.RemoveFile(controllerExe)
-    if chengpath.PathFileExists(controllerCompileReport):
-        os.RemoveFile(controllerCompileReport)
-    let controllerCompileRun = hostops.RunFileLogged(root,
-                                                       "r2c_truth_compare_controller_compile",
-                                                       driver,
-                                                       [
-                                                           "system-link-exec",
-                                                           "--root:" + packageRoot,
-                                                           "--in:" + controllerSource,
-                                                           "--emit:exe",
-                                                           "--target:arm64-apple-darwin",
-                                                           "--out:" + controllerExe,
-                                                           "--report-out:" + controllerCompileReport
-                                                       ],
-                                                       ["CHENG_BACKEND_DRIVER_READY=1"],
-                                                       root,
-                                                       0,
-                                                       controllerCompileLog)
-    assert(hostops.LoggedRunOk(controllerCompileRun), " r2c truth compare controller smoke: controller compile rc")
+    let controllerEnv = os.GetEnv("R2C_REACT_CONTROLLER_EXE")
+    let allowControllerCompile = os.GetEnv("R2C_REACT_ALLOW_CONTROLLER_COMPILE") == "1"
+    var controllerExe = ""
+    if len(controllerEnv) > 0:
+        controllerExe = chengpath.PathAbsolute(root, controllerEnv)
+    elif allowControllerCompile:
+        controllerExe = os.JoinPath(outDir, "r2c_react_truth_compare_smoke")
+    else:
+        assert(false,
+               " r2c truth compare controller smoke: set R2C_REACT_CONTROLLER_EXE or R2C_REACT_ALLOW_CONTROLLER_COMPILE=1")
+    if allowControllerCompile && len(controllerEnv) <= 0:
+        let controllerCompileReport = controllerExe + ".report.txt"
+        let controllerCompileLog = controllerExe + ".compile.log"
+        if chengpath.PathFileExists(controllerExe):
+            os.RemoveFile(controllerExe)
+        if chengpath.PathFileExists(controllerExe + ".map"):
+            os.RemoveFile(controllerExe + ".map")
+        if chengpath.PathFileExists(controllerCompileReport):
+            os.RemoveFile(controllerCompileReport)
+        if chengpath.PathFileExists(controllerCompileLog):
+            os.RemoveFile(controllerCompileLog)
+        let controllerCompileRun = hostops.RunFileLogged(root,
+                                                           "r2c_truth_compare_controller_compile",
+                                                           driver,
+                                                           [
+                                                               "system-link-exec",
+                                                               "--root:" + packageRoot,
+                                                               "--in:" + controllerSource,
+                                                               "--emit:exe",
+                                                               "--target:arm64-apple-darwin",
+                                                               "--out:" + controllerExe,
+                                                               "--report-out:" + controllerCompileReport
+                                                           ],
+                                                           r2csmoke.R2cReactSmokeControllerCompileEnv(),
+                                                           root,
+                                                           420,
+                                                           controllerCompileLog)
+        assert(hostops.LoggedRunOk(controllerCompileRun), " r2c truth compare controller smoke: controller compile rc")
+        assert(chengpath.FileExistsNonEmpty(root, controllerCompileReport), " r2c truth compare controller smoke: controller compile report")
     assert(chengpath.FileExistsNonEmpty(root, controllerExe), " r2c truth compare controller smoke: controller exe")
 
     let execSnapshotPath = os.JoinPath(outDir, "cheng_codegen_exec_snapshot_v1.json")
@@ -106,7 +122,7 @@ fn main(): int32 =
                                                 ],
                                                 [],
                                                 root,
-                                                0,
+                                                120,
                                                 controllerLog)
     assert(hostops.LoggedRunOk(controllerRun), " r2c truth compare controller smoke: controller rc")
     assert(chengpath.FileExistsNonEmpty(root, truthComparePath), " r2c truth compare controller smoke: truth compare json")

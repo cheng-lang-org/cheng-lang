@@ -50,8 +50,8 @@ fn R2cReactSmokeNativeEnv(stage3: str): str[] =
     add(out, "R2C_REACT_TOOLING_BIN=" + stage3)
     add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
     add(out, "CHENG_PROGRESS=1")
-    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=34359738368")
-    add(out, "CHENG_COMPILE_TIMEOUT_SEC=420")
+    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
+    add(out, "CHENG_COMPILE_TIMEOUT_SEC=300")
     return out
 
 fn R2cReactSmokeControllerCompileEnv(): str[] =
@@ -63,8 +63,8 @@ fn R2cReactSmokeControllerCompileEnv(): str[] =
     add(out, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
     add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
     add(out, "CHENG_PROGRESS=1")
-    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=34359738368")
-    add(out, "CHENG_COMPILE_TIMEOUT_SEC=420")
+    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
+    add(out, "CHENG_COMPILE_TIMEOUT_SEC=300")
     return out
 
 fn R2cReactSmokeControllerArgs(subcommand: str,
@@ -74,6 +74,20 @@ fn R2cReactSmokeControllerArgs(subcommand: str,
     for i in 0..<tail.len:
         add(out, tail[i])
     return out
+
+fn R2cReactSmokeWriteTinyPng(path: str) =
+    let payload: uint8[] = [
+        uint8(137), uint8(80), uint8(78), uint8(71), uint8(13), uint8(10), uint8(26), uint8(10),
+        uint8(0), uint8(0), uint8(0), uint8(13), uint8(73), uint8(72), uint8(68), uint8(82),
+        uint8(0), uint8(0), uint8(0), uint8(1), uint8(0), uint8(0), uint8(0), uint8(1),
+        uint8(8), uint8(4), uint8(0), uint8(0), uint8(0), uint8(181), uint8(28), uint8(12),
+        uint8(2), uint8(0), uint8(0), uint8(0), uint8(11), uint8(73), uint8(68), uint8(65),
+        uint8(84), uint8(120), uint8(218), uint8(99), uint8(252), uint8(255), uint8(31), uint8(0),
+        uint8(3), uint8(3), uint8(2), uint8(0), uint8(239), uint8(154), uint8(93), uint8(251),
+        uint8(0), uint8(0), uint8(0), uint8(0), uint8(73), uint8(69), uint8(78), uint8(68),
+        uint8(174), uint8(66), uint8(96), uint8(130)
+    ]
+    os.WriteFileBytes(path, payload)
 
 fn R2cReactSmokeSetup(outRel: str,
                         compileLabel: str,
@@ -87,37 +101,46 @@ fn R2cReactSmokeSetup(outRel: str,
     assert(chengpath.FileExistsNonEmpty(root, stage3), assertPrefix + ": stage3 exists")
     let repo = R2cReactSmokeRepo()
     assert(os.DirExists(repo), assertPrefix + ": React.js repo exists")
-    let controllerSource = chengpath.PathAbsolute(root, "src/r2c/r2c_react.cheng")
-    let controllerExe = os.JoinPath(outDir, "r2c_react_controller_smoke")
-    let controllerCompileLog = controllerExe + ".compile.log"
-    let controllerCompileReport = controllerExe + ".report.txt"
-    if chengpath.PathFileExists(controllerExe):
-        os.RemoveFile(controllerExe)
-    if chengpath.PathFileExists(controllerExe + ".map"):
-        os.RemoveFile(controllerExe + ".map")
-    if chengpath.PathFileExists(controllerCompileLog):
-        os.RemoveFile(controllerCompileLog)
-    if chengpath.PathFileExists(controllerCompileReport):
-        os.RemoveFile(controllerCompileReport)
-    var controllerCompileArgs: str[]
-    add(controllerCompileArgs, "system-link-exec")
-    add(controllerCompileArgs, "--root:" + root)
-    add(controllerCompileArgs, "--in:" + controllerSource)
-    add(controllerCompileArgs, "--emit:exe")
-    add(controllerCompileArgs, "--target:arm64-apple-darwin")
-    add(controllerCompileArgs, "--out:" + controllerExe)
-    add(controllerCompileArgs, "--report-out:" + controllerCompileReport)
-    let controllerCompileRun = hostops.RunFileLogged(root,
-                                                       compileLabel,
-                                                       driver,
-                                                       controllerCompileArgs,
-                                                       R2cReactSmokeControllerCompileEnv(),
-                                                       root,
-                                                       420,
-                                                       controllerCompileLog)
-    assert(hostops.LoggedRunOk(controllerCompileRun), assertPrefix + ": controller compile rc")
+    let controllerEnv = os.GetEnv("R2C_REACT_CONTROLLER_EXE")
+    let allowControllerCompile = os.GetEnv("R2C_REACT_ALLOW_CONTROLLER_COMPILE") == "1"
+    var controllerExe = ""
+    if len(controllerEnv) > 0:
+        controllerExe = chengpath.PathAbsolute(root, controllerEnv)
+    elif allowControllerCompile:
+        controllerExe = os.JoinPath(outDir, "r2c_react_controller_smoke")
+    else:
+        assert(false, assertPrefix + ": set R2C_REACT_CONTROLLER_EXE or R2C_REACT_ALLOW_CONTROLLER_COMPILE=1")
+    if allowControllerCompile && len(controllerEnv) <= 0:
+        let controllerSource = chengpath.PathAbsolute(root, "src/r2c/r2c_react.cheng")
+        let controllerCompileLog = controllerExe + ".compile.log"
+        let controllerCompileReport = controllerExe + ".report.txt"
+        if chengpath.PathFileExists(controllerExe):
+            os.RemoveFile(controllerExe)
+        if chengpath.PathFileExists(controllerExe + ".map"):
+            os.RemoveFile(controllerExe + ".map")
+        if chengpath.PathFileExists(controllerCompileLog):
+            os.RemoveFile(controllerCompileLog)
+        if chengpath.PathFileExists(controllerCompileReport):
+            os.RemoveFile(controllerCompileReport)
+        var controllerCompileArgs: str[]
+        add(controllerCompileArgs, "system-link-exec")
+        add(controllerCompileArgs, "--root:" + root)
+        add(controllerCompileArgs, "--in:" + controllerSource)
+        add(controllerCompileArgs, "--emit:exe")
+        add(controllerCompileArgs, "--target:arm64-apple-darwin")
+        add(controllerCompileArgs, "--out:" + controllerExe)
+        add(controllerCompileArgs, "--report-out:" + controllerCompileReport)
+        let controllerCompileRun = hostops.RunFileLogged(root,
+                                                           compileLabel,
+                                                           driver,
+                                                           controllerCompileArgs,
+                                                           R2cReactSmokeControllerCompileEnv(),
+                                                           root,
+                                                           420,
+                                                           controllerCompileLog)
+        assert(hostops.LoggedRunOk(controllerCompileRun), assertPrefix + ": controller compile rc")
+        assert(chengpath.FileExistsNonEmpty(root, controllerCompileReport), assertPrefix + ": controller compile report")
     assert(chengpath.FileExistsNonEmpty(root, controllerExe), assertPrefix + ": controller exe")
-    assert(chengpath.FileExistsNonEmpty(root, controllerCompileReport), assertPrefix + ": controller compile report")
     let statusPath = os.JoinPath(outDir, "r2c_react_status_report_v1.json")
     let statusLog = os.JoinPath(outDir, "r2c_react_status.log")
     if chengpath.PathFileExists(statusPath):

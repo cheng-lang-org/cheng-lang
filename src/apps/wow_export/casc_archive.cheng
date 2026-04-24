@@ -315,29 +315,54 @@ fn CascArchiveDecodeLocalEntryRange(clientPath: str,
         if take > decodedCount - copied:
             take = decodedCount - copied
         let blockFileOffset: int32 = entry.offset + payloadOffset + header.dataStart + block.fileOffset
-        let blockBytesRes: Result[bytes.ByteBuffer] =
-            cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, blockFileOffset, block.compSize)
-        if IsErr(blockBytesRes):
+        let flagBytesRes: Result[bytes.ByteBuffer] =
+            cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, blockFileOffset, 1)
+        if IsErr(flagBytesRes):
             bytes.FreeByteBuffer(out)
-            return Err[bytes.ByteBuffer](Error(blockBytesRes))
-        let blockBytes: bytes.ByteBuffer = Value(blockBytesRes)
-        let hashRes: Result[bool] = blte.VerifyBlockPayloadHash(blockBytes, block.hash)
-        if IsErr(hashRes):
+            return Err[bytes.ByteBuffer](Error(flagBytesRes))
+        let flagBytes: bytes.ByteBuffer = Value(flagBytesRes)
+        let blockKind: int32 = bytes.BufByteAt(flagBytes, 0)
+        bytes.FreeByteBuffer(flagBytes)
+        if blockKind == 0x4e:
+            if block.compSize != block.decompSize + 1:
+                bytes.FreeByteBuffer(out)
+                return Err[bytes.ByteBuffer]("wowExport archive: normal block size mismatch")
+            let sliceRes: Result[bytes.ByteBuffer] =
+                cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex,
+                    blockFileOffset + 1 + blockOffsetInDecoded, take)
+            if IsErr(sliceRes):
+                bytes.FreeByteBuffer(out)
+                return Err[bytes.ByteBuffer](Error(sliceRes))
+            let slice: bytes.ByteBuffer = Value(sliceRes)
+            let copyRes: Result[bool] = cascArchiveCopyRangeInto(out, copied, slice, 0, take)
+            bytes.FreeByteBuffer(slice)
+            if IsErr(copyRes):
+                bytes.FreeByteBuffer(out)
+                return Err[bytes.ByteBuffer](Error(copyRes))
+        else:
+            let blockBytesRes: Result[bytes.ByteBuffer] =
+                cascArchiveReadLocalArchiveSlice(clientPath, entry.archiveIndex, blockFileOffset, block.compSize)
+            if IsErr(blockBytesRes):
+                bytes.FreeByteBuffer(out)
+                return Err[bytes.ByteBuffer](Error(blockBytesRes))
+            let blockBytes: bytes.ByteBuffer = Value(blockBytesRes)
+            let hashRes: Result[bool] = blte.VerifyBlockPayloadHash(blockBytes, block.hash)
+            if IsErr(hashRes):
+                bytes.FreeByteBuffer(blockBytes)
+                bytes.FreeByteBuffer(out)
+                return Err[bytes.ByteBuffer](Error(hashRes))
+            let decodedBlockRes: Result[bytes.ByteBuffer] =
+                blte.DecodeBlockPayloadWithKey(blockBytes, blockIndex, block.decompSize, "")
             bytes.FreeByteBuffer(blockBytes)
-            bytes.FreeByteBuffer(out)
-            return Err[bytes.ByteBuffer](Error(hashRes))
-        let decodedBlockRes: Result[bytes.ByteBuffer] =
-            blte.DecodeBlockPayloadWithKey(blockBytes, blockIndex, block.decompSize, "")
-        bytes.FreeByteBuffer(blockBytes)
-        if IsErr(decodedBlockRes):
-            bytes.FreeByteBuffer(out)
-            return Err[bytes.ByteBuffer](Error(decodedBlockRes))
-        let decodedBlock: bytes.ByteBuffer = Value(decodedBlockRes)
-        let copyRes: Result[bool] =
-            cascArchiveCopyRangeInto(out, copied, decodedBlock, blockOffsetInDecoded, take)
-        bytes.FreeByteBuffer(decodedBlock)
-        if IsErr(copyRes):
-            bytes.FreeByteBuffer(out)
-            return Err[bytes.ByteBuffer](Error(copyRes))
+            if IsErr(decodedBlockRes):
+                bytes.FreeByteBuffer(out)
+                return Err[bytes.ByteBuffer](Error(decodedBlockRes))
+            let decodedBlock: bytes.ByteBuffer = Value(decodedBlockRes)
+            let copyRes: Result[bool] =
+                cascArchiveCopyRangeInto(out, copied, decodedBlock, blockOffsetInDecoded, take)
+            bytes.FreeByteBuffer(decodedBlock)
+            if IsErr(copyRes):
+                bytes.FreeByteBuffer(out)
+                return Err[bytes.ByteBuffer](Error(copyRes))
         copied = copied + take
     return Ok[bytes.ByteBuffer](out)

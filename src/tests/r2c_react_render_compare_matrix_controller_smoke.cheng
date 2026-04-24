@@ -1,6 +1,7 @@
 import std/os
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/path as chengpath
+import cheng/r2c/r2c_react_smoke_support as r2csmoke
 
 fn r2cRenderCompareMatrixWriteRoute(root: str,
                                     routeDir: str,
@@ -127,30 +128,45 @@ fn main(): int32 =
         repo = repoEnv
     assert(os.DirExists(repo), " r2c render compare matrix smoke: React.js repo exists")
 
-    let controllerExe = os.JoinPath(outDir, "r2c_react_render_compare_matrix_controller_smoke")
-    let controllerCompileReport = controllerExe + ".report.txt"
-    let controllerCompileLog = controllerExe + ".compile.log"
-    if chengpath.PathFileExists(controllerExe):
-        os.RemoveFile(controllerExe)
-    if chengpath.PathFileExists(controllerCompileReport):
-        os.RemoveFile(controllerCompileReport)
-    let controllerCompileRun = hostops.RunFileLogged(root,
-                                                       "r2c_render_compare_matrix_controller_compile",
-                                                       driver,
-                                                       [
-                                                           "system-link-exec",
-                                                           "--root:" + packageRoot,
-                                                           "--in:" + controllerSource,
-                                                           "--emit:exe",
-                                                           "--target:arm64-apple-darwin",
-                                                           "--out:" + controllerExe,
-                                                           "--report-out:" + controllerCompileReport
-                                                       ],
-                                                       ["CHENG_BACKEND_DRIVER_READY=1"],
-                                                       root,
-                                                       0,
-                                                       controllerCompileLog)
-    assert(hostops.LoggedRunOk(controllerCompileRun), " r2c render compare matrix smoke: controller compile rc")
+    let controllerEnv = os.GetEnv("R2C_REACT_CONTROLLER_EXE")
+    let allowControllerCompile = os.GetEnv("R2C_REACT_ALLOW_CONTROLLER_COMPILE") == "1"
+    var controllerExe = ""
+    if len(controllerEnv) > 0:
+        controllerExe = chengpath.PathAbsolute(root, controllerEnv)
+    elif allowControllerCompile:
+        controllerExe = os.JoinPath(outDir, "r2c_react_render_compare_matrix_controller_smoke")
+    else:
+        assert(false,
+               " r2c render compare matrix smoke: set R2C_REACT_CONTROLLER_EXE or R2C_REACT_ALLOW_CONTROLLER_COMPILE=1")
+    if allowControllerCompile && len(controllerEnv) <= 0:
+        let controllerCompileReport = controllerExe + ".report.txt"
+        let controllerCompileLog = controllerExe + ".compile.log"
+        if chengpath.PathFileExists(controllerExe):
+            os.RemoveFile(controllerExe)
+        if chengpath.PathFileExists(controllerExe + ".map"):
+            os.RemoveFile(controllerExe + ".map")
+        if chengpath.PathFileExists(controllerCompileReport):
+            os.RemoveFile(controllerCompileReport)
+        if chengpath.PathFileExists(controllerCompileLog):
+            os.RemoveFile(controllerCompileLog)
+        let controllerCompileRun = hostops.RunFileLogged(root,
+                                                           "r2c_render_compare_matrix_controller_compile",
+                                                           driver,
+                                                           [
+                                                               "system-link-exec",
+                                                               "--root:" + packageRoot,
+                                                               "--in:" + controllerSource,
+                                                               "--emit:exe",
+                                                               "--target:arm64-apple-darwin",
+                                                               "--out:" + controllerExe,
+                                                               "--report-out:" + controllerCompileReport
+                                                           ],
+                                                           r2csmoke.R2cReactSmokeControllerCompileEnv(),
+                                                           root,
+                                                           420,
+                                                           controllerCompileLog)
+        assert(hostops.LoggedRunOk(controllerCompileRun), " r2c render compare matrix smoke: controller compile rc")
+        assert(chengpath.FileExistsNonEmpty(root, controllerCompileReport), " r2c render compare matrix smoke: controller compile report")
     assert(chengpath.FileExistsNonEmpty(root, controllerExe), " r2c render compare matrix smoke: controller exe")
 
     let inputDir = os.JoinPath(outDir, "matrix_input")
@@ -164,22 +180,10 @@ fn main(): int32 =
     let homeTruthPngPath = os.JoinPath(homeDir, "truth_session.png")
     let publishNativePngPath = os.JoinPath(publishDir, "native_gui_session.png")
     let publishTruthPngPath = os.JoinPath(publishDir, "truth_session.png")
-    let pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aXfsAAAAASUVORK5CYII="
-    let pngWriterScript = "const fs=require('node:fs');" +
-                          "const png=Buffer.from(process.argv[1],'base64');" +
-                          "for (let i=2;i<process.argv.length;i++) fs.writeFileSync(process.argv[i],png);"
-    let pngWriterLog = os.JoinPath(outDir, "write_png.log")
-    if chengpath.PathFileExists(pngWriterLog):
-        os.RemoveFile(pngWriterLog)
-    let pngWriterRun = hostops.RunProgramLogged(root,
-                                                  "r2c_render_compare_matrix_write_png",
-                                                  "node",
-                                                  ["-e", pngWriterScript, pngBase64, homeNativePngPath, homeTruthPngPath, publishNativePngPath, publishTruthPngPath],
-                                                  [],
-                                                  root,
-                                                  0,
-                                                  pngWriterLog)
-    assert(hostops.LoggedRunOk(pngWriterRun), " r2c render compare matrix smoke: write png rc")
+    r2csmoke.R2cReactSmokeWriteTinyPng(homeNativePngPath)
+    r2csmoke.R2cReactSmokeWriteTinyPng(homeTruthPngPath)
+    r2csmoke.R2cReactSmokeWriteTinyPng(publishNativePngPath)
+    r2csmoke.R2cReactSmokeWriteTinyPng(publishTruthPngPath)
 
     assert(r2cRenderCompareMatrixWriteRoute(root, homeDir, "home_default", "83", "21", "31", "44", "7", homeNativePngPath, homeTruthPngPath),
            " r2c render compare matrix smoke: write home route")
@@ -227,7 +231,7 @@ fn main(): int32 =
                                                 ],
                                                 [],
                                                 root,
-                                                0,
+                                                120,
                                                 controllerLog)
     assert(hostops.LoggedRunOk(controllerRun), " r2c render compare matrix smoke: controller rc")
     assert(chengpath.FileExistsNonEmpty(root, matrixReportPath), " r2c render compare matrix smoke: report")

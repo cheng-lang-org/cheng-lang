@@ -49,3 +49,16 @@
 - 砍 r2c native GUI Node helper 时必须同时覆盖 `native-gui-bundle`、`compile` 和 `status` 三个命令面，并扫掉 `node_payload_helper` 这类旧字段名；否则单命令通过但整体状态仍会暴露旧 Node 路径。
 - r2c legacy wrapper 的 `status/help` 必须本地直接返回，不能先尝试 stage3 handoff；只读查询触发长编译会制造内存风险和假卡死。
 - r2c/controller 这类大闭包里不要返回或绑定大 `str[]` 字面量；当前 stage3 对复合字符串数组 temp-move 仍会缺语义，稳定写法是局部 `var str[]` 后逐项 `add`。
+- r2c controller 重烟测默认禁止自动重编完整 controller；必须由外部显式提供 `R2C_REACT_CONTROLLER_EXE` 或 `R2C_REACT_ALLOW_CONTROLLER_COMPILE=1`，verify 聚合默认只跑不重编 controller 的 direct smoke，完整 controller surface 只在 `R2C_REACT_HEAVY_CONTROLLER_SMOKE=1` 时纳入。
+- r2c TSX 前端迁移主线先下沉“后续 Cheng surface 实际消费的 tsx_ast/feed 生成”，不要把它包装成完整 TS 语义前端；完整 TS/JSX 语义前端必须另设硬门禁逐步补齐。
+- `verify-r2c-react-surface` 重型聚合不能让每个 smoke 重编完整 controller；先编译一次共享 `R2C_REACT_CONTROLLER_EXE`，后续 smoke 直接复用，并给 r2c 运行阶段启用 live progress/内存守卫。
+- r2c render-compare 直接对拍不能用 PNG 文件 hash 代替像素等价；同像素可有不同压缩，应走 Cheng PNG 解码 + zlib inflate + RGBA diff，非 direct 自动串 Node 的路径必须硬失败。
+- 发现 React.js `.build` 或 libp2p shim 后台编译残留时先精准停 PID；这些链路会写 React.js 工作树，不能和 r2c 主线验证并行。
+- r2c 重编译和 native GUI 验证默认 RSS 守卫固定 8GiB；发现旧命令带 32GiB/无上限时先精准停 PID，再用当前守卫命令重跑。
+- r2c render-compare-matrix 不能通过循环调用外部 Node helper 聚合；矩阵每个 entry 必须直接调用 Cheng PNG 对拍内核并写 route summary/report。
+- r2c capture-truth 在 Cheng CDP/browser host 落地前只能做显式真值导入；没有 `--truth-summary` 或 `--truth-trace` 必须硬失败，禁止退回 Node/Chrome helper。
+- r2c 正式命令入口只保留 `artifacts/bootstrap/cheng.stage3 r2c-react ...`；`tools/r2c/experimental/r2c-react` 这类 shell wrapper 删除后不要再恢复成兼容入口。
+- r2c `run-native-gui` 活路径已收口到 Cheng session runner 调 compiled Cheng runtime；不要恢复 `native_gui_host_macos.m`、ObjC/Cocoa 编译壳或 Node runner。
+- `tools/r2c/experimental` 现在应保持空目录；r2c helper/host 文件若回潮，必须先视为架构违规而不是兼容入口。
+- 不要用裸 `args` 表达式语句消隐 `str[]` 等复合形参；当前后端会把复合数组形参表达式语句判成 unsupported，未用形参直接留空或按真实语义读取。
+- r2c `run-native-gui` 收到显式 `--bundle-path` 时，bundle summary 必须从 bundle 文件所在目录解析；run 输出目录只负责 run report/summary，不能混用两套 artifact 根。

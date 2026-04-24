@@ -28,9 +28,27 @@ type
         wmoDoodadModelPlacementCount: int32
         wmoDoodadReferencedModelFileDataIDCount: int32
         wmoDoodadModelDependencyCount: int32
+        wmoDoodadModelVertexCount: int32
         m2VertexCount: int32
         skinTriangleIndexCount: int32
         pixelsTouched: int32
+
+    RenderDoodadModel =
+        fileDataID: int32
+        vertexCount: int32
+        vertexOffset: int32
+        buf: bytes.ByteBuffer
+
+    RenderDoodadPlacement =
+        fileDataID: int32
+        x1000: int32
+        y1000: int32
+        z1000: int32
+        qx1000: int32
+        qy1000: int32
+        qz1000: int32
+        qw1000: int32
+        scale1000: int32
 
 const
     renderTgaHeaderSize = 18
@@ -124,6 +142,52 @@ fn renderF32Scaled1000At(buf: bytes.ByteBuffer, idx: int32): int32 =
     if bits < 0:
         scaled = int64(0) - scaled
     return renderF32ClampI64ToI32(scaled)
+
+fn renderF32FiniteScaled1000At(buf: bytes.ByteBuffer,
+                               idx: int32,
+                               label: str): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport render: " + label + " f32 out of bounds")
+    let bits: int32 = bytes.ReadU32LEAt(buf, idx)
+    let exponentRaw: int32 = (bits >> 23) & 255
+    if exponentRaw == 255:
+        return Err[int32]("wowExport render: " + label + " non-finite f32")
+    return Ok[int32](renderF32Scaled1000At(buf, idx))
+
+fn renderMulDiv1000(a: int32, b: int32): int32 =
+    return renderF32ClampI64ToI32((int64(a) * int64(b)) / int64(1000))
+
+fn renderDouble(value: int32): int32 =
+    return renderF32ClampI64ToI32(int64(value) * int64(2))
+
+fn renderTransformDoodadVertex(placement: RenderDoodadPlacement,
+                               localX1000: int32,
+                               localY1000: int32,
+                               localZ1000: int32,
+                               outX1000: var int32,
+                               outY1000: var int32,
+                               outZ1000: var int32) =
+    let tx: int32 = renderDouble(renderMulDiv1000(placement.qy1000, localZ1000) -
+        renderMulDiv1000(placement.qz1000, localY1000))
+    let ty: int32 = renderDouble(renderMulDiv1000(placement.qz1000, localX1000) -
+        renderMulDiv1000(placement.qx1000, localZ1000))
+    let tz: int32 = renderDouble(renderMulDiv1000(placement.qx1000, localY1000) -
+        renderMulDiv1000(placement.qy1000, localX1000))
+    let rx: int32 = localX1000 +
+        renderMulDiv1000(placement.qw1000, tx) +
+        renderMulDiv1000(placement.qy1000, tz) -
+        renderMulDiv1000(placement.qz1000, ty)
+    let ry: int32 = localY1000 +
+        renderMulDiv1000(placement.qw1000, ty) +
+        renderMulDiv1000(placement.qz1000, tx) -
+        renderMulDiv1000(placement.qx1000, tz)
+    let rz: int32 = localZ1000 +
+        renderMulDiv1000(placement.qw1000, tz) +
+        renderMulDiv1000(placement.qx1000, ty) -
+        renderMulDiv1000(placement.qy1000, tx)
+    outX1000 = placement.x1000 + renderMulDiv1000(rx, placement.scale1000)
+    outY1000 = placement.y1000 + renderMulDiv1000(ry, placement.scale1000)
+    outZ1000 = placement.z1000 + renderMulDiv1000(rz, placement.scale1000)
 
 fn renderHasFourCC(buf: bytes.ByteBuffer,
                    pos: int32,
@@ -553,6 +617,297 @@ fn renderDrawWmoDoodadPlacements(tga: bytes.ByteBuffer,
         pos = dataPos + size
     return Err[bool]("wowExport render: WMO draw MODD placements missing")
 
+fn renderFindDoodadModelIndex(models: RenderDoodadModel[], fileDataID: int32): int32 =
+    var i: int32
+    while i < models.len:
+        if models[i].fileDataID == fileDataID:
+            return i
+        i = i + 1
+    return -1
+
+fn renderFreeDoodadModels(models: var RenderDoodadModel[]) =
+    var i: int32
+    while i < models.len:
+        bytes.FreeByteBuffer(models[i].buf)
+        i = i + 1
+
+fn renderLoadDoodadModels(manifest: northshire.NorthshireManifest): Result[RenderDoodadModel[]] =
+    var out: RenderDoodadModel[]
+    var i: int32
+    while i < manifest.auditedDependencies.len:
+        let dep: northshire.NorthshireAuditedDependency = manifest.auditedDependencies[i]
+        if dep.sourceLabel == "northshire-abbey-wmo" && dep.relationKind == "wmo_modi":
+            if renderFindDoodadModelIndex(out, dep.fileDataID) >= 0:
+                renderFreeDoodadModels(out)
+                return Err[RenderDoodadModel[]]("wowExport render: duplicate WMO doodad model dependency " + strings.IntToStr(dep.fileDataID))
+            let bufRes: Result[bytes.ByteBuffer] =
+                local_files.ReadLocalFileByEntry(manifest.clientPath,
+                                                dep.archiveIndex,
+                                                dep.offset,
+                                                dep.size)
+            if IsErr(bufRes):
+                renderFreeDoodadModels(out)
+                return Err[RenderDoodadModel[]](Error(bufRes))
+            let buf: bytes.ByteBuffer = Value(bufRes)
+            let headerRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(buf)
+            if IsErr(headerRes):
+                bytes.FreeByteBuffer(buf)
+                renderFreeDoodadModels(out)
+                return Err[RenderDoodadModel[]](Error(headerRes))
+            let header: asset_formats.M2Header = Value(headerRes)
+            if header.vertexCount <= 0:
+                bytes.FreeByteBuffer(buf)
+                renderFreeDoodadModels(out)
+                return Err[RenderDoodadModel[]]("wowExport render: WMO doodad M2 has no vertices " + strings.IntToStr(dep.fileDataID))
+            if header.vertexOffset < 0 || header.vertexOffset + header.vertexCount * 48 > buf.len:
+                bytes.FreeByteBuffer(buf)
+                renderFreeDoodadModels(out)
+                return Err[RenderDoodadModel[]]("wowExport render: WMO doodad M2 vertex array out of bounds " + strings.IntToStr(dep.fileDataID))
+            var model: RenderDoodadModel
+            model.fileDataID = dep.fileDataID
+            model.vertexCount = header.vertexCount
+            model.vertexOffset = header.vertexOffset
+            model.buf = buf
+            add(out, model)
+        i = i + 1
+    if out.len <= 0:
+        return Err[RenderDoodadModel[]]("wowExport render: no WMO doodad models loaded")
+    return Ok[RenderDoodadModel[]](out)
+
+fn renderCollectWmoModelSlots(buf: bytes.ByteBuffer): Result[int32[]] =
+    var out: int32[]
+    var found: bool
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[int32[]]("wowExport render: WMO root truncated chunk")
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[int32[]]("wowExport render: WMO root chunk out of bounds")
+        if renderHasFourCC(buf, pos, int32('I'), int32('D'), int32('O'), int32('M')):
+            if found:
+                return Err[int32[]]("wowExport render: duplicate WMO MODI chunk")
+            if (size % 4) != 0:
+                return Err[int32[]]("wowExport render: WMO MODI chunk size invalid")
+            var i: int32
+            while i < size / 4:
+                add(out, bytes.ReadU32LEAt(buf, dataPos + i * 4))
+                i = i + 1
+            found = true
+        pos = dataPos + size
+    if !found || out.len <= 0:
+        return Err[int32[]]("wowExport render: WMO MODI slots missing")
+    return Ok[int32[]](out)
+
+fn renderResolveWmoModelSlot(modelSlots: int32[], slot: int32): Result[int32] =
+    if slot < 0 || slot >= modelSlots.len:
+        return Err[int32]("wowExport render: WMO MODD model slot out of MODI range " + strings.IntToStr(slot))
+    let fileDataID: int32 = modelSlots[slot]
+    if fileDataID <= 0:
+        return Err[int32]("wowExport render: WMO MODD model slot has no MODI fileDataID " + strings.IntToStr(slot))
+    return Ok[int32](fileDataID)
+
+fn renderReadDoodadPlacement(buf: bytes.ByteBuffer,
+                             rec: int32,
+                             modelSlots: int32[]): Result[RenderDoodadPlacement] =
+    if rec < 0 || rec + renderWmoDoodadPlacementStride > buf.len:
+        return Err[RenderDoodadPlacement]("wowExport render: WMO MODD record out of bounds")
+    let slot: int32 = bytes.ReadU32LEAt(buf, rec) & 0x00ffffff
+    let fileDataIDRes: Result[int32] = renderResolveWmoModelSlot(modelSlots, slot)
+    if IsErr(fileDataIDRes):
+        return Err[RenderDoodadPlacement](Error(fileDataIDRes))
+    let xRes: Result[int32] = renderF32FiniteScaled1000At(buf, rec + 4, "WMO MODD x")
+    let yRes: Result[int32] = renderF32FiniteScaled1000At(buf, rec + 8, "WMO MODD y")
+    let zRes: Result[int32] = renderF32FiniteScaled1000At(buf, rec + 12, "WMO MODD z")
+    let qxRes: Result[int32] = renderF32FiniteScaled1000At(buf, rec + 16, "WMO MODD quaternion x")
+    let qyRes: Result[int32] = renderF32FiniteScaled1000At(buf, rec + 20, "WMO MODD quaternion y")
+    let qzRes: Result[int32] = renderF32FiniteScaled1000At(buf, rec + 24, "WMO MODD quaternion z")
+    let qwRes: Result[int32] = renderF32FiniteScaled1000At(buf, rec + 28, "WMO MODD quaternion w")
+    let scaleRes: Result[int32] = renderF32FiniteScaled1000At(buf, rec + 32, "WMO MODD scale")
+    if IsErr(xRes): return Err[RenderDoodadPlacement](Error(xRes))
+    if IsErr(yRes): return Err[RenderDoodadPlacement](Error(yRes))
+    if IsErr(zRes): return Err[RenderDoodadPlacement](Error(zRes))
+    if IsErr(qxRes): return Err[RenderDoodadPlacement](Error(qxRes))
+    if IsErr(qyRes): return Err[RenderDoodadPlacement](Error(qyRes))
+    if IsErr(qzRes): return Err[RenderDoodadPlacement](Error(qzRes))
+    if IsErr(qwRes): return Err[RenderDoodadPlacement](Error(qwRes))
+    if IsErr(scaleRes): return Err[RenderDoodadPlacement](Error(scaleRes))
+    var out: RenderDoodadPlacement
+    out.fileDataID = Value(fileDataIDRes)
+    out.x1000 = Value(xRes)
+    out.y1000 = Value(yRes)
+    out.z1000 = Value(zRes)
+    out.qx1000 = Value(qxRes)
+    out.qy1000 = Value(qyRes)
+    out.qz1000 = Value(qzRes)
+    out.qw1000 = Value(qwRes)
+    out.scale1000 = Value(scaleRes)
+    if out.qx1000 == 0 && out.qy1000 == 0 && out.qz1000 == 0 && out.qw1000 == 0:
+        return Err[RenderDoodadPlacement]("wowExport render: WMO MODD quaternion is zero")
+    if out.scale1000 <= 0:
+        return Err[RenderDoodadPlacement]("wowExport render: WMO MODD scale is not positive")
+    return Ok[RenderDoodadPlacement](out)
+
+fn renderScanDoodadModelInstance(model: RenderDoodadModel,
+                                 placement: RenderDoodadPlacement,
+                                 bounds: var RenderBounds,
+                                 countOut: var int32): Result[bool] =
+    var i: int32
+    while i < model.vertexCount:
+        let pos: int32 = model.vertexOffset + i * 48
+        let xRes: Result[int32] = renderF32FiniteScaled1000At(model.buf, pos, "WMO doodad M2 x")
+        let yRes: Result[int32] = renderF32FiniteScaled1000At(model.buf, pos + 4, "WMO doodad M2 y")
+        let zRes: Result[int32] = renderF32FiniteScaled1000At(model.buf, pos + 8, "WMO doodad M2 z")
+        if IsErr(xRes): return Err[bool](Error(xRes))
+        if IsErr(yRes): return Err[bool](Error(yRes))
+        if IsErr(zRes): return Err[bool](Error(zRes))
+        var outX1000: int32
+        var outY1000: int32
+        var outZ1000: int32
+        renderTransformDoodadVertex(placement,
+                                    Value(xRes),
+                                    Value(yRes),
+                                    Value(zRes),
+                                    outX1000,
+                                    outY1000,
+                                    outZ1000)
+        renderAccumulateBounds(bounds, outX1000, outY1000, outZ1000)
+        countOut = countOut + 1
+        i = i + 1
+    return Ok[bool](true)
+
+fn renderScanWmoDoodadModelInstances(buf: bytes.ByteBuffer,
+                                     models: RenderDoodadModel[],
+                                     bounds: var RenderBounds,
+                                     countOut: var int32): Result[bool] =
+    let modelSlotsRes: Result[int32[]] = renderCollectWmoModelSlots(buf)
+    if IsErr(modelSlotsRes):
+        return Err[bool](Error(modelSlotsRes))
+    let modelSlots: int32[] = Value(modelSlotsRes)
+    var found: bool
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[bool]("wowExport render: WMO root truncated chunk")
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[bool]("wowExport render: WMO root chunk out of bounds")
+        if renderHasFourCC(buf, pos, int32('D'), int32('D'), int32('O'), int32('M')):
+            if found:
+                return Err[bool]("wowExport render: duplicate WMO MODD chunk")
+            if (size % renderWmoDoodadPlacementStride) != 0:
+                return Err[bool]("wowExport render: WMO MODD size invalid")
+            var i: int32
+            while i < size / renderWmoDoodadPlacementStride:
+                let rec: int32 = dataPos + i * renderWmoDoodadPlacementStride
+                let placementRes: Result[RenderDoodadPlacement] =
+                    renderReadDoodadPlacement(buf, rec, modelSlots)
+                if IsErr(placementRes):
+                    return Err[bool](Error(placementRes))
+                let placement: RenderDoodadPlacement = Value(placementRes)
+                let modelIndex: int32 = renderFindDoodadModelIndex(models, placement.fileDataID)
+                if modelIndex < 0:
+                    return Err[bool]("wowExport render: WMO doodad model not loaded " + strings.IntToStr(placement.fileDataID))
+                let scanRes: Result[bool] =
+                    renderScanDoodadModelInstance(models[modelIndex], placement, bounds, countOut)
+                if IsErr(scanRes):
+                    return Err[bool](Error(scanRes))
+                i = i + 1
+            found = true
+        pos = dataPos + size
+    if !found:
+        return Err[bool]("wowExport render: WMO MODD placements missing")
+    return Ok[bool](true)
+
+fn renderDrawDoodadModelInstance(tga: bytes.ByteBuffer,
+                                 width: int32,
+                                 height: int32,
+                                 model: RenderDoodadModel,
+                                 placement: RenderDoodadPlacement,
+                                 bounds: RenderBounds,
+                                 pixels: var int32): Result[bool] =
+    var i: int32
+    while i < model.vertexCount:
+        let pos: int32 = model.vertexOffset + i * 48
+        let xRes: Result[int32] = renderF32FiniteScaled1000At(model.buf, pos, "WMO doodad M2 x")
+        let yRes: Result[int32] = renderF32FiniteScaled1000At(model.buf, pos + 4, "WMO doodad M2 y")
+        let zRes: Result[int32] = renderF32FiniteScaled1000At(model.buf, pos + 8, "WMO doodad M2 z")
+        if IsErr(xRes): return Err[bool](Error(xRes))
+        if IsErr(yRes): return Err[bool](Error(yRes))
+        if IsErr(zRes): return Err[bool](Error(zRes))
+        var outX1000: int32
+        var outY1000: int32
+        var outZ1000: int32
+        renderTransformDoodadVertex(placement,
+                                    Value(xRes),
+                                    Value(yRes),
+                                    Value(zRes),
+                                    outX1000,
+                                    outY1000,
+                                    outZ1000)
+        let px: int32 = renderMapCoord(outX1000, bounds.minX1000, bounds.maxX1000,
+                                        renderMargin, width - renderMargin - 1)
+        let pyRaw: int32 = renderMapCoord(outY1000, bounds.minY1000, bounds.maxY1000,
+                                           renderMargin, height - renderMargin - 1)
+        renderPlot(tga, width, height, px, height - 1 - pyRaw, 86, 204, 246, pixels)
+        i = i + 1
+    return Ok[bool](true)
+
+fn renderDrawWmoDoodadModelInstances(tga: bytes.ByteBuffer,
+                                     width: int32,
+                                     height: int32,
+                                     buf: bytes.ByteBuffer,
+                                     models: RenderDoodadModel[],
+                                     bounds: RenderBounds,
+                                     pixels: var int32): Result[bool] =
+    let modelSlotsRes: Result[int32[]] = renderCollectWmoModelSlots(buf)
+    if IsErr(modelSlotsRes):
+        return Err[bool](Error(modelSlotsRes))
+    let modelSlots: int32[] = Value(modelSlotsRes)
+    var found: bool
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[bool]("wowExport render: WMO draw root truncated chunk")
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[bool]("wowExport render: WMO draw root chunk out of bounds")
+        if renderHasFourCC(buf, pos, int32('D'), int32('D'), int32('O'), int32('M')):
+            if found:
+                return Err[bool]("wowExport render: duplicate WMO draw MODD chunk")
+            if (size % renderWmoDoodadPlacementStride) != 0:
+                return Err[bool]("wowExport render: WMO draw MODD size invalid")
+            var i: int32
+            while i < size / renderWmoDoodadPlacementStride:
+                let rec: int32 = dataPos + i * renderWmoDoodadPlacementStride
+                let placementRes: Result[RenderDoodadPlacement] =
+                    renderReadDoodadPlacement(buf, rec, modelSlots)
+                if IsErr(placementRes):
+                    return Err[bool](Error(placementRes))
+                let placement: RenderDoodadPlacement = Value(placementRes)
+                let modelIndex: int32 = renderFindDoodadModelIndex(models, placement.fileDataID)
+                if modelIndex < 0:
+                    return Err[bool]("wowExport render: WMO doodad model not loaded " + strings.IntToStr(placement.fileDataID))
+                let drawRes: Result[bool] =
+                    renderDrawDoodadModelInstance(tga,
+                                                  width,
+                                                  height,
+                                                  models[modelIndex],
+                                                  placement,
+                                                  bounds,
+                                                  pixels)
+                if IsErr(drawRes):
+                    return Err[bool](Error(drawRes))
+                i = i + 1
+            found = true
+        pos = dataPos + size
+    if !found:
+        return Err[bool]("wowExport render: WMO draw MODD placements missing")
+    return Ok[bool](true)
+
 fn renderScanM2Bounds(buf: bytes.ByteBuffer,
                       bounds: var RenderBounds,
                       countOut: var int32): Result[bool] =
@@ -607,20 +962,11 @@ fn renderLoadFile(manifest: northshire.NorthshireManifest,
                                             file.offset,
                                             file.size)
 
-fn RenderNorthshireTga(outPath: str, width: int32, height: int32): Result[RenderSummary] =
-    if strings.Len(outPath) == 0:
-        return Err[RenderSummary]("wowExport render: missing output path")
-    let manifest: northshire.NorthshireManifest = northshire.Manifest()
-    if !northshire.ManifestReady(manifest):
-        return Err[RenderSummary]("wowExport render: manifest not ready")
-    let auditRes: Result[northshire.NorthshireAuditSummary] =
-        northshire.AuditManifestPayloadsAgainstLocal(manifest)
-    if IsErr(auditRes):
-        return Err[RenderSummary](Error(auditRes))
-    let depAuditRes: Result[northshire.NorthshireAuditSummary] =
-        northshire.AuditManifestDependenciesAgainstLocal(manifest)
-    if IsErr(depAuditRes):
-        return Err[RenderSummary](Error(depAuditRes))
+fn renderNorthshireTgaWithDoodadModels(manifest: northshire.NorthshireManifest,
+                                       doodadModels: RenderDoodadModel[],
+                                       outPath: str,
+                                       width: int32,
+                                       height: int32): Result[RenderSummary] =
     var terrainBounds: RenderBounds
     var wmoBounds: RenderBounds
     var m2Bounds: RenderBounds
@@ -680,9 +1026,17 @@ fn RenderNorthshireTga(outPath: str, width: int32, height: int32): Result[Render
                 doodadIndex = doodadIndex + 1
             let scanRes: Result[bool] =
                 renderScanWmoDoodadPlacements(buf, wmoBounds, summary.wmoDoodadPlacementCount)
-            bytes.FreeByteBuffer(buf)
             if IsErr(scanRes):
+                bytes.FreeByteBuffer(buf)
                 return Err[RenderSummary](Error(scanRes))
+            let modelScanRes: Result[bool] =
+                renderScanWmoDoodadModelInstances(buf,
+                                                  doodadModels,
+                                                  wmoBounds,
+                                                  summary.wmoDoodadModelVertexCount)
+            bytes.FreeByteBuffer(buf)
+            if IsErr(modelScanRes):
+                return Err[RenderSummary](Error(modelScanRes))
         elif file.kind == "wmo_group":
             let bufRes: Result[bytes.ByteBuffer] = renderLoadFile(manifest, file)
             if IsErr(bufRes):
@@ -716,7 +1070,8 @@ fn RenderNorthshireTga(outPath: str, width: int32, height: int32): Result[Render
         return Err[RenderSummary]("wowExport render: missing geometry bounds")
     if summary.wmoDoodadModelPlacementCount != summary.wmoDoodadPlacementCount ||
         summary.wmoDoodadReferencedModelFileDataIDCount <= 0 ||
-        summary.wmoDoodadModelDependencyCount != northshire.CountDependenciesForSource(manifest, "northshire-abbey-wmo", "wmo_modi"):
+        summary.wmoDoodadModelDependencyCount != northshire.CountDependenciesForSource(manifest, "northshire-abbey-wmo", "wmo_modi") ||
+        summary.wmoDoodadModelVertexCount <= 0:
         return Err[RenderSummary]("wowExport render: WMO doodad model dependency audit mismatch")
     let tgaRes: Result[bytes.ByteBuffer] = renderMakeTga(width, height)
     if IsErr(tgaRes):
@@ -771,6 +1126,18 @@ fn RenderNorthshireTga(outPath: str, width: int32, height: int32): Result[Render
                 bytes.FreeByteBuffer(tga)
                 return Err[RenderSummary](Error(bufRes))
             let buf: bytes.ByteBuffer = Value(bufRes)
+            let modelDrawRes: Result[bool] =
+                renderDrawWmoDoodadModelInstances(tga,
+                                                  width,
+                                                  height,
+                                                  buf,
+                                                  doodadModels,
+                                                  wmoBounds,
+                                                  summary.pixelsTouched)
+            if IsErr(modelDrawRes):
+                bytes.FreeByteBuffer(buf)
+                bytes.FreeByteBuffer(tga)
+                return Err[RenderSummary](Error(modelDrawRes))
             let drawRes: Result[bool] =
                 renderDrawWmoDoodadPlacements(tga, width, height, buf, wmoBounds, summary.pixelsTouched)
             bytes.FreeByteBuffer(buf)
@@ -787,6 +1154,31 @@ fn RenderNorthshireTga(outPath: str, width: int32, height: int32): Result[Render
         return Err[RenderSummary]("wowExport render: no pixels drawn")
     return Ok[RenderSummary](summary)
 
+fn RenderNorthshireTga(outPath: str, width: int32, height: int32): Result[RenderSummary] =
+    if strings.Len(outPath) == 0:
+        return Err[RenderSummary]("wowExport render: missing output path")
+    let manifest: northshire.NorthshireManifest = northshire.Manifest()
+    if !northshire.ManifestReady(manifest):
+        return Err[RenderSummary]("wowExport render: manifest not ready")
+    let auditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestPayloadsAgainstLocal(manifest)
+    if IsErr(auditRes):
+        return Err[RenderSummary](Error(auditRes))
+    let depAuditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestDependenciesAgainstLocal(manifest)
+    if IsErr(depAuditRes):
+        return Err[RenderSummary](Error(depAuditRes))
+    let doodadModelsRes: Result[RenderDoodadModel[]] = renderLoadDoodadModels(manifest)
+    if IsErr(doodadModelsRes):
+        return Err[RenderSummary](Error(doodadModelsRes))
+    var doodadModels: RenderDoodadModel[] = Value(doodadModelsRes)
+    let renderRes: Result[RenderSummary] =
+        renderNorthshireTgaWithDoodadModels(manifest, doodadModels, outPath, width, height)
+    renderFreeDoodadModels(doodadModels)
+    if IsErr(renderRes):
+        return Err[RenderSummary](Error(renderRes))
+    return Ok[RenderSummary](Value(renderRes))
+
 fn RenderSummaryText(summary: RenderSummary): str =
     let widthText: str = strings.IntToStr(summary.width)
     let heightText: str = strings.IntToStr(summary.height)
@@ -797,6 +1189,7 @@ fn RenderSummaryText(summary: RenderSummary): str =
     let doodadModelText: str = strings.IntToStr(summary.wmoDoodadModelPlacementCount)
     let doodadReferencedText: str = strings.IntToStr(summary.wmoDoodadReferencedModelFileDataIDCount)
     let doodadDepText: str = strings.IntToStr(summary.wmoDoodadModelDependencyCount)
+    let doodadVertexText: str = strings.IntToStr(summary.wmoDoodadModelVertexCount)
     let m2Text: str = strings.IntToStr(summary.m2VertexCount)
     let skinText: str = strings.IntToStr(summary.skinTriangleIndexCount)
     let pixelText: str = strings.IntToStr(summary.pixelsTouched)
@@ -809,6 +1202,7 @@ fn RenderSummaryText(summary: RenderSummary): str =
     out = out + Fmt" wmoDoodadModelPlacements={doodadModelText}"
     out = out + Fmt" wmoDoodadReferencedModelFileIDs={doodadReferencedText}"
     out = out + Fmt" wmoDoodadModelDependencies={doodadDepText}"
+    out = out + Fmt" wmoDoodadModelVertices={doodadVertexText}"
     out = out + Fmt" m2Vertices={m2Text}"
     out = out + Fmt" skinTriangleIndices={skinText}"
     out = out + Fmt" pixels={pixelText}"

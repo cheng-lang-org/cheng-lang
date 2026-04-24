@@ -4,20 +4,24 @@
 
 最新进展（2026-04-24）：
 
+- WDT `MAID` 现在可按 tile 坐标严格解析 8 个 split fileDataID slot；新增 `wdt-maid-tile --x --y` CLI。本机 Northshire 四 tile 实测：`31,48 -> 777827,777828,777829,777830,1287882,1293739,1293740,204453`；`32,48 -> 778027,778028,778029,778030,1287884,1293745,1293746,204493`；`31,49 -> 777832,777833,777834,777835,1287916,1293871,1293872,204454`；`32,49 -> 778032,778033,778034,778035,1287918,1293879,1293880,204494`。
+- 已新增 `wow_export_maid_audit_smoke`，钉住 12 个 Northshire MAID split ID 的 root/encoding/index 审计结果，首项 `777828` 和末项 `778035` 的 content key、encoding key、archive、offset、encoded size 都按真实本机数据断言。
+- 纯 Cheng MAID 审计慢的根因不是 Cheng 运行时整体性能，而是 wowExport 自己在 local CASC range 解码里对 BLTE `normal` block 先读整块、复制整块、再切 range；现在 normal block 只读请求 payload 区间，12-ID 审计从约 `46.56s / 277MB peak footprint` 降到 `5.77s / 61604224 peak memory footprint`。
+- 本地 `.idx` batch lookup 已把 18 位 hex key prefix 预解成 9 字节整数表，扫表热循环不再逐 entry 反复解析 hex 字符；这进一步减少 `LoadLocalIndexEntries` CPU 热点。
 - Northshire 地形已从 WDT `MAID` + listfile 坐标收窄到四个真实基础 ADT：`Azeroth_31_48`、`Azeroth_32_48`、`Azeroth_31_49`、`Azeroth_32_49`；四条 fileDataID `777827/778027/777832/778032` 均已审计 content key、encoding key、archive、offset、encoded size。
 - `asset_formats.ParseAdtTerrainSummary` 已严格解析 ADT `KNCM/MCNK -> TVCM/MCVT`，每个 `MCNK` 必须带一个 `MCVT`；四个 Northshire tile 实测 `1024` 个 terrain chunk、`148480` 个高度样本，高度范围 `32500..384127`。
 - `preview-northshire` 现在会把 ADT terrain 纳入 scene 判定和摘要；本机输出 `auditedFiles=22 loadedFiles=22 adtTiles=4 adtChunks=1024 adtHeightSamples=148480 assetBytes=3346856`。
 - `export-map --out-dir` 现在导出 `22` 个真实文件、合计 `3346856` 字节；四个 ADT 解码 payload 分别为 `375707/359854/322706/366237` 字节。
 - `render-northshire` 现在先绘制真实 ADT terrain 高度点，再叠加 WMO group 和 M2 点云；`640x360` 输出仍为 `921618` 字节，绘制点数从 `31153` 提升到 `179633`。
 - `asset_formats.ParseWmoRootSummary` 已解析 WMO `SDOM/MODS` doodad set 和 `DDOM/MODD` placement；Northshire Abbey 实测 `2` 个 doodad set、`144` 条真实 placement，placement bounds span 为 `74059,71093,34487`。
-- `preview-northshire` 的 scene 判定现在要求 WMO doodad placement 和 bounds；`render-northshire` 会把 144 个真实 WMO doodad placement 作为红色十字叠到主视图，本机 `640x360` 绘制点数为 `180353`。
+- `preview-northshire` 的 scene 判定现在要求 WMO doodad placement 和 bounds；`render-northshire` 会把 144 个真实 WMO doodad placement 作为红色十字叠到主视图。
 - Northshire manifest 现在额外维护 `17` 条 pathless WMO `MODI` 审计依赖：只记录来源 `northshire-abbey-wmo`、关系 `wmo_modi`、fileDataID、content key、encoding key、archive、offset、encoded size，不伪造 listfile path，也不混进 `export-map` 的有路径文件表。
 - `preview-northshire` 现在要求真实 WMO root 的 `17` 个 `MODI` model fileDataID 与这张审计依赖表逐个匹配；本机输出 `auditedDependencies=17 wmoModelFileIDs=17 wmoModelDependencies=17 wmoModelDependencyAudit=ready`。
 - WMO doodad 模型链已补齐：`DDOM/MODD` 记录首字段按稀疏 `IDOM/MODI` 槽位解析，不再当路径或紧凑索引；Northshire Abbey 实测 `30` 个 MODI 槽、`144` 条 MODD 摆放全部解析成功，实际被摆放引用的唯一模型为 `15` 个。
 - `preview-northshire` 现在会逐条检查 `MODD -> IDOM -> fileDataID` 得到的 `144` 个摆放模型都存在于 `wmo_modi` 审计依赖表；本机输出 `wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencyAudit=ready`。
 - `AuditManifestDependenciesAgainstLocal` 已走快审计：按 encoding key 查本地 `.idx`，校验 archive/offset/size，再解码 payload 算 MD5 对 content key；不再为了已审计依赖重新扫完整 root。
 - `export-dependencies --out-dir` 已新增：把 17 条 pathless `wmo_modi` 依赖按 `label-fid-fileDataID.m2` 导出，并写 `dependencies.manifest.txt`；不伪造 listfile path，不混入 `export-map`。
-- `render-northshire` 现在也要求 WMO doodad 模型依赖审计通过后才画 placement marker；本机输出 `wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencies=17`。
+- `render-northshire` 现在也要求 WMO doodad 模型依赖审计通过后才画 placement marker，并按 `MODD` 的 position/quaternion/scale 实例化真实 M2 顶点；本机输出 `wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencies=17 wmoDoodadModelVertices=31665 pixels=212018`，`wow_export_render_smoke` 峰值内存 `20398416` 字节。
 - `wow_export_dependency_memory_smoke` 已覆盖 17 条 WMO `MODI` 依赖的重复审计和 M2 header 解码；本机 steady delta 为 `1363`。
 - `wow_export_tool_main` 的命令入口已修正为 `ParamCount() < 1` 才显示 usage；`/tmp/wow_export_tool_main manifest` 现在直接输出 manifest 摘要，不再要求额外占位参数。
 - `casc_index.LoadLocalIndexEntry` 不再因为目录路径或悬挂 `ListDir` 结果崩溃；现在会稳定返回真实错误。
@@ -56,6 +60,7 @@
 
 验证：
 
+- `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_maid_audit_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_maid_audit_smoke` 通过；`/usr/bin/time -l /tmp/wow_export_maid_audit_smoke` 通过，本机观测 `real 5.77s`、`peak memory footprint 61604224`。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_asset_formats_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_asset_formats_smoke` 通过，`/tmp/wow_export_asset_formats_smoke` 通过。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_northshire_mvp_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_northshire_mvp_smoke` 通过，`/tmp/wow_export_northshire_mvp_smoke` 输出 `adtTiles=4 adtChunks=1024 adtHeightSamples=148480`。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_render_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_render_smoke` 通过，`/tmp/wow_export_render_smoke` 通过。

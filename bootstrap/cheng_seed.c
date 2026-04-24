@@ -263,94 +263,12 @@ static char cheng_seed_manifest_cache_path[PATH_MAX];
 static void cheng_seed_usage(void) {
     puts("cheng_seed");
     puts("usage:");
-    puts("  note: when artifacts/backend_driver/cheng is ready, non-bootstrap commands auto-forward there");
+    puts("  note: non-bootstrap commands are handled by artifacts/backend_driver/cheng");
     puts("  cheng_seed print-contract [--in:<path>]");
     puts("  cheng_seed self-check [--in:<path>]");
     puts("  cheng_seed status [--contract-in:<path>]");
-    puts("  cheng_seed print-build-plan [--contract-in:<path>]");
-    puts("  cheng_seed scan-hotpath");
-    puts("  cheng_seed print-bootstrap");
     puts("  cheng_seed bootstrap-bridge");
     puts("  cheng_seed build-backend-driver");
-    puts("  cheng_seed run-production-regression");
-    puts("  cheng_seed run-smokes");
-    puts("  cheng_seed slice-gate");
-    puts("  cheng_seed debug-report [--contract-in:<path>] [--in:<path>] [--root:<path>] [--emit:<exe|shared|obj>] [--target:<triple>] [--out:<path>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--report-out:<path>]");
-    puts("  cheng_seed print-symbols [--contract-in:<path>] [--in:<path>] [--root:<path>] [--emit:<exe|shared|obj>] [--target:<triple>] [--out:<path>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
-    puts("  cheng_seed print-line-map [--contract-in:<path>] [--in:<path>] [--root:<path>] [--emit:<exe|shared|obj>] [--target:<triple>] [--out:<path>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
-    puts("  cheng_seed print-object --object:<path> [--report-out:<path>]");
-    puts("  cheng_seed print-elf --object:<path> [--report-out:<path>]");
-    puts("  cheng_seed print-asm [--contract-in:<path>] [--in:<path>] [--root:<path>] [--emit:<exe|shared|obj>] [--target:<triple>] [--out:<path>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
-    puts("  cheng_seed profile-run [--contract-in:<path>] [--in:<path>] [--root:<path>] [--target:<triple>] [--out:<path>] [--profile-hz:<int>] [--report-out:<path>]");
-    puts("  cheng_seed profile-report --in:<raw-report> [--out:<final-report>]");
-    puts("  cheng_seed crash-report --in:<raw-log> [--out:<final-report>]");
-    puts("  cheng_seed verify-orphan-guard");
-    puts("  cheng_seed verify-backend-driver-command-surface");
-    puts("  cheng_seed verify-mobile-shell-build-probe");
-    puts("  cheng_seed verify-chain-node-resilience [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed verify-oracle-resilience [--label:<name>]");
-    puts("  cheng_seed oracle-fixture-query [--pair:<PAIR>] [--window-rounds:<n>]");
-    puts("  cheng_seed verify-r2c-react-surface");
-    puts("  cheng_seed verify-debug-tools");
-    puts("  cheng_seed verify-debug-runtime");
-    puts("  cheng_seed verify-debug-profile");
-    puts("  cheng_seed verify-diloco");
-    puts("  cheng_seed verify-windows-builtin");
-    puts("  cheng_seed verify-riscv64-builtin");
-    puts("  cheng_seed run-cross-target-smokes");
-    puts("  cheng_seed run-host-smokes [smoke_name ...]");
-    puts("  cheng_seed run-stage23-libp2p-smokes [smoke_name ...]");
-    puts("  cheng_seed build-zero-exit");
-    puts("  cheng_seed build-panic-trace");
-    puts("  cheng_seed build-bounds-trace");
-    puts("  cheng_seed build-signal-trace");
-    puts("  cheng_seed build-call-chain");
-    puts("  cheng_seed build-ffi-handle");
-    puts("  cheng_seed build-program-selfhost");
-    puts("  cheng_seed build-bft-state-machine");
-    puts("  cheng_seed deploy-bft-validator-three-node");
-    puts("  cheng_seed verify-bft-validator-three-node");
-    puts("  cheng_seed status-bft-validator-three-node");
-    puts("  cheng_seed stop-bft-validator-three-node");
-    puts("  cheng_seed bench-bft-validator-three-node [--tx-count:<n>] [--wave-count:<n>] [--transfer-amount:<n>] [--max-txs-per-block:<n>] [--restart-node:none|server|relay|local] [--restart-wave:<n>] [--restart-pause-ms:<n>]");
-    puts("  cheng_seed build-oracle-bft-state-machine");
-    puts("  cheng_seed deploy-oracle-bft-three-node");
-    puts("  cheng_seed verify-oracle-bft-three-node");
-    puts("  cheng_seed status-oracle-bft-three-node");
-    puts("  cheng_seed stop-oracle-bft-three-node");
-    puts("  cheng_seed build-browser-host-wasm [out.wasm]");
-    puts("  cheng_seed build-chain-node");
-    puts("  cheng_seed build-rwad-bft-state-machine");
-    puts("  cheng_seed build-chain-node-linux");
-    puts("  cheng_seed build-linux-nolibc-exe");
-    puts("  cheng_seed build-rwad-bft-linux");
-    puts("  cheng_seed run-linux-object-smokes");
-    puts("  cheng_seed run-tcp-twoproc-smoke [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed run-quic-twoproc-smoke [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed run-udp-importc-smoke [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed run-wasm-smokes [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed run-browser-host-wasm-smoke [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed run-chain-node-cli-smoke [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed run-chain-node-process-smoke");
-    puts("  cheng_seed run-chain-node-three-node-smoke");
-    puts("  cheng_seed run-chain-node-resilience-smoke [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed run-oracle-resilience-smoke [--label:<name>]");
-    puts("  cheng_seed run-tailnet-control-smoke [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed run-fresh-node-selfhost-gate [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed run-migration-gate [--compiler:<path>] [--label:<name>]");
-    puts("  cheng_seed run-browser-webrtc-smokes [smoke_name ...]");
-    puts("  cheng_seed r2c-react <subcommand> [args]");
-    puts("  cheng_seed vpn-proxy <subcommand> [args]");
-    puts("  cheng_seed emit-csg [--contract-in:<path>] [--in:<path>] [--root:<path>] [--report-out:<path>]");
-    puts("  cheng_seed migrate-csg [--contract-in:<path>] [--legacy-in:<path>] [--in:<path>] [--root:<path>] [--out:<bundle-prefix>] [--report-out:<path>]");
-    puts("  cheng_seed verify-world [--contract-in:<path>] [--in:<path>] [--root:<path>] [--target:<triple>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--report-out:<path>]");
-    puts("  cheng_seed world-sync [--contract-in:<path>] [--in:<path>] [--root:<path>] --target:<triple> --out:<bundle-prefix> [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--report-out:<path>]");
-    puts("  cheng_seed prove-equivalence [--contract-in:<path>] [--in:<path>] [--root:<path>] [--target:<triple>] [--channel:<stable|edge>] --baseline-csg:<path> --baseline-surface:<path> --baseline-receipt:<path> [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
-    puts("  cheng_seed prove-migration [--contract-in:<path>] [--legacy-in:<path>] [--in:<path>] [--root:<path>] [--target:<triple>] [--channel:<stable|edge>] [--out:<bundle-prefix>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
-    puts("  cheng_seed publish-world [--contract-in:<path>] [--in:<path>] [--root:<path>] --target:<triple> --out:<bundle-prefix> [--channel:<stable|edge>] [--legacy-in:<path>] [--baseline-csg:<path>] [--baseline-surface:<path>] [--baseline-receipt:<path>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
-    puts("  cheng_seed fresh-node-selfhost [--contract-in:<path>] [--in:<path>] [--root:<path>] --target:<triple> --out:<bundle-prefix> [--channel:<stable|edge>] [--legacy-in:<path>] [--baseline-csg:<path>] [--baseline-surface:<path>] [--baseline-receipt:<path>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
-    puts("  cheng_seed selfhost-build [--contract-in:<path>] [--in:<path>] [--root:<path>] --target:<triple> --out:<path> [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--report-out:<path>]");
-    puts("  cheng_seed system-link-exec [--contract-in:<path>] [--in:<path>] [--root:<path>] --emit:<exe|shared|obj> --target:<triple> --out:<path> [--browser-bridge-object:<obj>] [--link-input:<obj>] [--channel:<stable|edge>] [--report-out:<path>]");
     puts("  cheng_seed compile-bootstrap --in:<path> --out:<path> [--report-out:<path>]");
 }
 
@@ -5169,6 +5087,7 @@ static int32_t cheng_seed_find_top_level_binary_op(const char *text, const char 
 
 static int32_t cheng_seed_find_top_level_char(const char *text, char target) {
     bool in_string = false;
+    bool in_char = false;
     int32_t paren_depth = 0;
     int32_t bracket_depth = 0;
     int32_t brace_depth = 0;
@@ -5178,11 +5097,15 @@ static int32_t cheng_seed_find_top_level_char(const char *text, char target) {
     }
     for (i = 0; text[i] != '\0'; ++i) {
         char ch = text[i];
-        if (ch == '"' && !cheng_seed_quote_is_escaped(text, i)) {
+        if (!in_char && ch == '"' && !cheng_seed_quote_is_escaped(text, i)) {
             in_string = !in_string;
             continue;
         }
-        if (in_string) {
+        if (!in_string && ch == '\'' && !cheng_seed_quote_is_escaped(text, i)) {
+            in_char = !in_char;
+            continue;
+        }
+        if (in_string || in_char) {
             continue;
         }
         if (ch == '(') {
@@ -5224,6 +5147,7 @@ static bool cheng_seed_split_top_level_args(const char *text,
                                     size_t *item_count,
                                     size_t item_cap) {
     bool in_string = false;
+    bool in_char = false;
     int32_t paren_depth = 0;
     int32_t bracket_depth = 0;
     int32_t brace_depth = 0;
@@ -5232,22 +5156,25 @@ static bool cheng_seed_split_top_level_args(const char *text,
     *item_count = 0U;
     for (i = 0; ; ++i) {
         const char ch = text[i];
-        if (ch == '"' && !cheng_seed_quote_is_escaped(text, i)) {
+        if (!in_char && ch == '"' && !cheng_seed_quote_is_escaped(text, i)) {
             in_string = !in_string;
-        } else if (!in_string && ch == '(') {
+        } else if (!in_string && ch == '\'' && !cheng_seed_quote_is_escaped(text, i)) {
+            in_char = !in_char;
+        } else if (!in_string && !in_char && ch == '(') {
             paren_depth += 1;
-        } else if (!in_string && ch == ')') {
+        } else if (!in_string && !in_char && ch == ')') {
             paren_depth -= 1;
-        } else if (!in_string && ch == '[') {
+        } else if (!in_string && !in_char && ch == '[') {
             bracket_depth += 1;
-        } else if (!in_string && ch == ']') {
+        } else if (!in_string && !in_char && ch == ']') {
             bracket_depth -= 1;
-        } else if (!in_string && ch == '{') {
+        } else if (!in_string && !in_char && ch == '{') {
             brace_depth += 1;
-        } else if (!in_string && ch == '}') {
+        } else if (!in_string && !in_char && ch == '}') {
             brace_depth -= 1;
         }
         if ((!in_string &&
+             !in_char &&
              paren_depth == 0 &&
              bracket_depth == 0 &&
              brace_depth == 0 &&
@@ -5383,17 +5310,23 @@ static bool cheng_seed_parse_call_text_parts(const char *text,
     const char *open_paren = NULL;
     const char *close_paren = NULL;
     bool in_string = false;
+    bool in_char = false;
     int32_t bracket_depth = 0;
+    int32_t brace_depth = 0;
     int32_t paren_depth = 0;
     size_t i;
     cheng_seed_trim_copy_text(text, trimmed, sizeof(trimmed));
     for (i = 0; trimmed[i] != '\0'; ++i) {
         char ch = trimmed[i];
-        if (ch == '"' && !cheng_seed_quote_is_escaped(trimmed, i)) {
+        if (!in_char && ch == '"' && !cheng_seed_quote_is_escaped(trimmed, i)) {
             in_string = !in_string;
             continue;
         }
-        if (in_string) {
+        if (!in_string && ch == '\'' && !cheng_seed_quote_is_escaped(trimmed, i)) {
+            in_char = !in_char;
+            continue;
+        }
+        if (in_string || in_char) {
             continue;
         }
         if (ch == '[') {
@@ -5404,14 +5337,22 @@ static bool cheng_seed_parse_call_text_parts(const char *text,
             bracket_depth -= 1;
             continue;
         }
-        if (ch == '(' && bracket_depth == 0) {
+        if (ch == '{') {
+            brace_depth += 1;
+            continue;
+        }
+        if (ch == '}') {
+            brace_depth -= 1;
+            continue;
+        }
+        if (ch == '(' && bracket_depth == 0 && brace_depth == 0) {
             if (!open_paren) {
                 open_paren = trimmed + i;
             }
             paren_depth += 1;
             continue;
         }
-        if (ch == ')' && bracket_depth == 0) {
+        if (ch == ')' && bracket_depth == 0 && brace_depth == 0) {
             paren_depth -= 1;
             if (paren_depth == 0) {
                 close_paren = trimmed + i;
@@ -5420,7 +5361,8 @@ static bool cheng_seed_parse_call_text_parts(const char *text,
             continue;
         }
     }
-    if (!open_paren || !close_paren || close_paren <= open_paren || paren_depth != 0 || bracket_depth != 0) {
+    if (!open_paren || !close_paren || close_paren <= open_paren || paren_depth != 0 ||
+        bracket_depth != 0 || brace_depth != 0 || in_string || in_char) {
         return false;
     }
     for (i = (size_t)(close_paren - trimmed) + 1U; trimmed[i] != '\0'; ++i) {
@@ -63678,6 +63620,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     char saved_quick_shared_cache[64];
     char saved_progress[64];
     char saved_process_max_rss[64];
+    char saved_backend_driver_handoff[64];
     char *run_argv[2];
     char *report_text = NULL;
     const char *target;
@@ -63694,6 +63637,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     bool had_quick_shared_cache = false;
     bool had_progress = false;
     bool had_process_max_rss = false;
+    bool had_backend_driver_handoff = false;
     int rc = 1;
     int status = 0;
     cheng_seed_bootstrap_paths_init(&paths);
@@ -63766,6 +63710,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     cheng_seed_save_env_value("BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE", saved_quick_shared_cache, sizeof(saved_quick_shared_cache), &had_quick_shared_cache);
     cheng_seed_save_env_value("CHENG_PROGRESS", saved_progress, sizeof(saved_progress), &had_progress);
     cheng_seed_save_env_value("CHENG_PROCESS_MAX_RSS_BYTES", saved_process_max_rss, sizeof(saved_process_max_rss), &had_process_max_rss);
+    cheng_seed_save_env_value("CHENG_NO_BACKEND_DRIVER_HANDOFF", saved_backend_driver_handoff, sizeof(saved_backend_driver_handoff), &had_backend_driver_handoff);
     setenv("BACKEND_INCREMENTAL", "0", 1);
     setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
     setenv("CHENG_DISABLE_PRIMARY_OBJECT_CACHE", "1", 1);
@@ -63773,6 +63718,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     setenv("BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE", "0", 1);
     setenv("CHENG_PROGRESS", "1", 1);
     setenv("CHENG_PROCESS_MAX_RSS_BYTES", cheng_seed_build_backend_driver_max_rss_bytes_text(), 1);
+    setenv("CHENG_NO_BACKEND_DRIVER_HANDOFF", "1", 1);
     build_env_pushed = true;
 
     snprintf(root_flag, sizeof(root_flag), "--root:%s", package_root);
@@ -64014,6 +63960,7 @@ done:
         cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
         cheng_seed_restore_env_value("CHENG_PROCESS_MAX_RSS_BYTES", saved_process_max_rss, had_process_max_rss);
         cheng_seed_restore_env_value("CHENG_PROGRESS", saved_progress, had_progress);
+        cheng_seed_restore_env_value("CHENG_NO_BACKEND_DRIVER_HANDOFF", saved_backend_driver_handoff, had_backend_driver_handoff);
     }
     if (rc != 0 && candidate_out[0] != '\0') {
         unlink(candidate_out);
@@ -65191,7 +65138,27 @@ static bool cheng_seed_command_requires_backend_driver_passthrough(const char *c
     if (!cheng_seed_backend_driver_handoff_enabled()) {
         return false;
     }
-    return cheng_seed_streq(cmd, "debug-report") ||
+    return cheng_seed_streq(cmd, "print-build-plan") ||
+           cheng_seed_streq(cmd, "scan-hotpath") ||
+           cheng_seed_streq(cmd, "print-bootstrap") ||
+           cheng_seed_streq(cmd, "run-smokes") ||
+           cheng_seed_streq(cmd, "run-production-regression") ||
+           cheng_seed_streq(cmd, "slice-gate") ||
+           cheng_seed_streq(cmd, "support-matrix") ||
+           cheng_seed_streq(cmd, "compile-exe") ||
+           cheng_seed_streq(cmd, "system-link-exec") ||
+           cheng_seed_streq(cmd, "host-bridge-audit") ||
+           cheng_seed_streq(cmd, "world-receipt") ||
+           cheng_seed_streq(cmd, "emit-csg") ||
+           cheng_seed_streq(cmd, "migrate-csg") ||
+           cheng_seed_streq(cmd, "verify-world") ||
+           cheng_seed_streq(cmd, "world-sync") ||
+           cheng_seed_streq(cmd, "prove-equivalence") ||
+           cheng_seed_streq(cmd, "prove-migration") ||
+           cheng_seed_streq(cmd, "publish-world") ||
+           cheng_seed_streq(cmd, "fresh-node-selfhost") ||
+           cheng_seed_streq(cmd, "selfhost-build") ||
+           cheng_seed_streq(cmd, "debug-report") ||
            cheng_seed_streq(cmd, "print-symbols") ||
            cheng_seed_streq(cmd, "print-line-map") ||
            cheng_seed_streq(cmd, "run-cross-target-smokes") ||
@@ -65217,6 +65184,9 @@ static bool cheng_seed_command_requires_backend_driver_passthrough(const char *c
            cheng_seed_streq(cmd, "verify-debug-tools") ||
            cheng_seed_streq(cmd, "verify-debug-runtime") ||
            cheng_seed_streq(cmd, "verify-debug-profile") ||
+           cheng_seed_streq(cmd, "verify-diloco") ||
+           cheng_seed_streq(cmd, "verify-windows-builtin") ||
+           cheng_seed_streq(cmd, "verify-riscv64-builtin") ||
            cheng_seed_streq(cmd, "build-zero-exit") ||
            cheng_seed_streq(cmd, "build-panic-trace") ||
            cheng_seed_streq(cmd, "build-bounds-trace") ||
@@ -77003,6 +76973,9 @@ int main(int argc, char **argv) {
         cheng_seed_usage();
         return 1;
     }
+    if (cheng_seed_command_requires_backend_driver_passthrough(argv[1])) {
+        return cheng_seed_require_backend_driver_cli_passthrough(argv[1], argc, argv);
+    }
     if (cheng_seed_streq(argv[1], "print-contract")) {
         return cheng_seed_cmd_print_contract(argc, argv);
     }
@@ -77026,9 +76999,6 @@ int main(int argc, char **argv) {
     }
     if (cheng_seed_streq(argv[1], "build-backend-driver")) {
         return cheng_seed_cmd_build_backend_driver(argc, argv);
-    }
-    if (cheng_seed_command_requires_backend_driver_passthrough(argv[1])) {
-        return cheng_seed_require_backend_driver_cli_passthrough(argv[1], argc, argv);
     }
     if (cheng_seed_command_prefers_backend_driver_passthrough(argv[1])) {
         cheng_seed_bootstrap_paths_init(&paths);

@@ -3,6 +3,7 @@ import std/os
 import std/strings
 import std/system as system
 import std/strutils as strutil
+import cheng/core/backend/build_plan as buildplan
 import cheng/core/tooling/compiler_runtime as crun
 import cheng/core/tooling/export_visibility_gate as evgate
 import cheng/core/tooling/host_bridge_audit_gate as hbagate
@@ -88,6 +89,16 @@ fn BackendDriverReadFlag(args: str[],
         i = i + 1
     return defaultValue
 
+fn BackendDriverPrintBuildPlan(rootDir: str,
+                                 args: str[]) =
+    let target = strutil.Strip(BackendDriverReadFlag(args, "--target", ""))
+    if len(target) > 0:
+        let plan: buildplan.BackendBuildPlan = buildplan.BackendBuildPlanBackendDriverForTarget(rootDir, target)
+        BackendDriverPrintLine(strutil.Strip(buildplan.BackendBuildPlanReport(plan)))
+        return
+    let plan: buildplan.BackendBuildPlan = buildplan.BackendBuildPlanBackendDriver(rootDir)
+    BackendDriverPrintLine(strutil.Strip(buildplan.BackendBuildPlanReport(plan)))
+
 fn BackendDriverCollectHostSmokeNames(args: str[]): str[] =
     var out: str[]
     var i: int32
@@ -158,11 +169,87 @@ fn BackendDriverHostSmokeCompileEnv(): str[] =
     add(out, "CHENG_COMPILE_TIMEOUT_SEC=420")
     return out
 
+fn BackendDriverHostSmokeRunEnv(smokeName: str,
+                                  r2cControllerExe: str): str[] =
+    var out: str[]
+    if BackendDriverStartsWith(smokeName, "r2c_react_"):
+        add(out, "CHENG_PROGRESS=1")
+        add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
+        add(out, "CHENG_COMPILE_TIMEOUT_SEC=420")
+        if len(r2cControllerExe) > 0:
+            add(out, "R2C_REACT_CONTROLLER_EXE=" + r2cControllerExe)
+        else:
+            add(out, "R2C_REACT_ALLOW_CONTROLLER_COMPILE=1")
+    return out
+
+fn BackendDriverCompileR2cReactController(rootDir: str,
+                                           compilerPath: str,
+                                           outDir: str): str =
+    let controllerSource = chengpath.PathAbsolute(rootDir, "src/r2c/r2c_react.cheng")
+    let controllerExe = os.JoinPath(outDir, "r2c_react_controller_shared")
+    let controllerCompileLog = controllerExe + ".compile.log"
+    let controllerCompileReport = controllerExe + ".report.txt"
+    if chengpath.PathFileExists(controllerExe):
+        os.RemoveFile(controllerExe)
+    if chengpath.PathFileExists(controllerExe + ".map"):
+        os.RemoveFile(controllerExe + ".map")
+    if chengpath.PathFileExists(controllerCompileLog):
+        os.RemoveFile(controllerCompileLog)
+    if chengpath.PathFileExists(controllerCompileReport):
+        os.RemoveFile(controllerCompileReport)
+    var controllerCompileArgs: str[]
+    add(controllerCompileArgs, "system-link-exec")
+    add(controllerCompileArgs, "--root:" + rootDir)
+    add(controllerCompileArgs, "--in:" + controllerSource)
+    add(controllerCompileArgs, "--emit:exe")
+    add(controllerCompileArgs, "--target:arm64-apple-darwin")
+    add(controllerCompileArgs, "--out:" + controllerExe)
+    add(controllerCompileArgs, "--report-out:" + controllerCompileReport)
+    let controllerCompileRun = hostops.RunFileLogged(rootDir,
+                                                       "backend_driver_r2c_controller_shared_compile",
+                                                       compilerPath,
+                                                       controllerCompileArgs,
+                                                       BackendDriverHostSmokeCompileEnv(),
+                                                       rootDir,
+                                                       420,
+                                                       controllerCompileLog)
+    if !hostops.LoggedRunOk(controllerCompileRun):
+        let outputText = strutil.Strip(controllerCompileRun.output)
+        if len(outputText) > 0:
+            BackendDriverPrintErr(outputText)
+        return ""
+    if !chengpath.FileExistsNonEmpty(rootDir, controllerExe):
+        BackendDriverPrintErr("backend driver r2c controller: compile missing output: " + controllerExe)
+        return ""
+    if !chengpath.FileExistsNonEmpty(rootDir, controllerCompileReport):
+        BackendDriverPrintErr("backend driver r2c controller: compile missing report: " + controllerCompileReport)
+        return ""
+    return controllerExe
+
+fn BackendDriverResolveR2cReactController(rootDir: str,
+                                           compilerPath: str,
+                                           outDir: str): str =
+    let explicitRaw = strutil.Strip(os.GetEnv("R2C_REACT_CONTROLLER_EXE"))
+    if len(explicitRaw) > 0:
+        let explicitPath = chengpath.PathAbsolute(rootDir, explicitRaw)
+        if !chengpath.FileExistsNonEmpty(rootDir, explicitPath):
+            BackendDriverPrintErr("backend driver r2c controller: missing R2C_REACT_CONTROLLER_EXE: " + explicitPath)
+            return ""
+        return explicitPath
+    return BackendDriverCompileR2cReactController(rootDir, compilerPath, outDir)
+
+fn BackendDriverHostSmokesNeedR2cController(tests: str[]): bool =
+    for i in 0..<tests.len:
+        if BackendDriverStartsWith(tests[i], "r2c_react_"):
+            return true
+    return false
+
 fn BackendDriverRunOneHostSmoke(rootDir: str,
                                   compilerPath: str,
                                   outDir: str,
                                   label: str,
-                                  smokeName: str): int32 =
+                                  smokeName: str,
+                                  r2cControllerExe: str): int32 =
     let src = chengpath.PathAbsolute(rootDir, "src/tests/" + smokeName + ".cheng")
     if !chengpath.FileExistsNonEmpty(rootDir, src):
         BackendDriverPrintErr("backend driver host smokes: missing source: " + src)
@@ -205,7 +292,7 @@ fn BackendDriverRunOneHostSmoke(rootDir: str,
                                       "backend_driver_host_smoke_run_" + label + "_" + smokeName,
                                       outBin,
                                       [],
-                                      [],
+                                      BackendDriverHostSmokeRunEnv(smokeName, r2cControllerExe),
                                       rootDir,
                                       BackendDriverHostSmokeRunTimeoutSec(smokeName),
                                       runLog)
@@ -219,7 +306,9 @@ fn BackendDriverRunOneHostSmoke(rootDir: str,
         return run.exitCode
     return 0
 
-fn BackendDriverRunHostSmokes(rootDir: str, args: str[]): int32 =
+fn BackendDriverRunHostSmokesWithR2cController(rootDir: str,
+                                                args: str[],
+                                                r2cControllerExe: str): int32 =
     let tailOnly = strutil.Strip(BackendDriverReadFlag(args, "--tail-only", ""))
     if len(tailOnly) > 0:
         BackendDriverPrintErr("backend driver host smokes: --tail-only is not part of the minimal direct gate")
@@ -239,11 +328,21 @@ fn BackendDriverRunHostSmokes(rootDir: str, args: str[]): int32 =
     if !chengpath.MkdirP(rootDir, outDir):
         BackendDriverPrintErr("backend driver host smokes: mkdir failed: " + outDir)
         return 1
+    var effectiveR2cControllerExe = r2cControllerExe
+    if len(effectiveR2cControllerExe) <= 0 && BackendDriverHostSmokesNeedR2cController(tests):
+        effectiveR2cControllerExe = BackendDriverResolveR2cReactController(rootDir,
+                                                                           compilerPath,
+                                                                           outDir)
+        if len(effectiveR2cControllerExe) <= 0:
+            return 1
     for i in 0..<tests.len:
-        if BackendDriverRunOneHostSmoke(rootDir, compilerPath, outDir, label, tests[i]) != 0:
+        if BackendDriverRunOneHostSmoke(rootDir, compilerPath, outDir, label, tests[i], effectiveR2cControllerExe) != 0:
             return 1
     BackendDriverPrintLine("cheng backend driver host smokes: ok")
     return 0
+
+fn BackendDriverRunHostSmokes(rootDir: str, args: str[]): int32 =
+    return BackendDriverRunHostSmokesWithR2cController(rootDir, args, "")
 
 fn BackendDriverRunBuiltinHostSmoke(rootDir: str,
                                       label: str,
@@ -251,19 +350,20 @@ fn BackendDriverRunBuiltinHostSmoke(rootDir: str,
     return BackendDriverRunHostSmokes(rootDir, ["--label:" + label, smokeName])
 
 fn BackendDriverRunR2cReactSurface(rootDir: str): int32 =
-    return BackendDriverRunHostSmokes(rootDir,
-                                      [
-                                          "--label:verify_r2c_react_surface",
-                                          "r2c_react_surface_smoke",
-                                          "r2c_react_publish_selector_bundle_smoke",
-                                          "r2c_react_run_native_gui_controller_smoke",
-                                          "r2c_react_discover_truth_routes_controller_smoke",
-                                          "r2c_react_truth_compare_controller_smoke",
-                                          "r2c_react_exec_route_matrix_controller_smoke",
-                                          "r2c_react_render_compare_direct_smoke",
-                                          "r2c_react_render_compare_controller_smoke",
-                                          "r2c_react_render_compare_matrix_controller_smoke"
-                                      ])
+    var smokes: str[]
+    add(smokes, "--label:verify_r2c_react_surface")
+    if os.GetEnv("R2C_REACT_HEAVY_CONTROLLER_SMOKE") == "1":
+        add(smokes, "r2c_react_surface_smoke")
+        add(smokes, "r2c_react_publish_selector_bundle_smoke")
+        add(smokes, "r2c_react_run_native_gui_controller_smoke")
+        add(smokes, "r2c_react_discover_truth_routes_controller_smoke")
+        add(smokes, "r2c_react_truth_compare_controller_smoke")
+        add(smokes, "r2c_react_exec_route_matrix_controller_smoke")
+    add(smokes, "r2c_react_render_compare_direct_smoke")
+    if os.GetEnv("R2C_REACT_HEAVY_CONTROLLER_SMOKE") == "1":
+        add(smokes, "r2c_react_render_compare_controller_smoke")
+        add(smokes, "r2c_react_render_compare_matrix_controller_smoke")
+    return BackendDriverRunHostSmokesWithR2cController(rootDir, smokes, "")
 
 fn BackendDriverForward(rootDir: str,
                           cmd: str,
@@ -324,6 +424,9 @@ fn main(argc: int32, argv: str*): int32 =
             return 0
         if count <= 2 && cmd == "status":
             BackendDriverStatus(rootDir)
+            return 0
+        if cmd == "print-build-plan":
+            BackendDriverPrintBuildPlan(rootDir, args)
             return 0
         if cmd == "host-bridge-audit":
             return hbagate.HostBridgeAuditGateRun(rootDir)

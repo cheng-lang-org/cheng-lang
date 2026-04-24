@@ -6,6 +6,7 @@ import std/strformat
 import std/strutils as strutils
 import cheng/apps/wow_export/build_info as build_info
 import cheng/apps/wow_export/asset_export as asset_export
+import cheng/apps/wow_export/asset_formats as asset_formats
 import cheng/apps/wow_export/blp as blp
 import cheng/apps/wow_export/config as config
 import cheng/apps/wow_export/casc_archive as casc_archive
@@ -20,7 +21,7 @@ import cheng/apps/wow_export/tact_keys as tact_keys
 import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
 
 fn PrintUsage() =
-    echo("wow-export commands: list-builds | probe | manifest | audit-file | extract-file | convert-blp | export-m2 | export-wmo | export-map | export-dependencies | preview-northshire | render-northshire")
+    echo("wow-export commands: list-builds | probe | manifest | audit-file | wdt-maid-tile | extract-file | convert-blp | export-m2 | export-wmo | export-map | export-dependencies | preview-northshire | render-northshire")
     echo("export examples: extract-file --label abbey-bell-model --out /tmp/nsabbeyBell.m2 | convert-blp --out /tmp/abbeyBell.tga | render-northshire --out /tmp/northshire.tga")
 
 fn RunListBuilds(): int32 =
@@ -160,6 +161,34 @@ fn RunAuditFile(): int32 =
     while printed < audits.len:
         echo(local_files.AuditText(audits[printed]))
         printed = printed + 1
+    return 0
+
+fn RunWdtMaidTile(): int32 =
+    let tileX: int32 = cmdline.ReadInt32FlagOrDefault("--x", -1)
+    let tileY: int32 = cmdline.ReadInt32FlagOrDefault("--y", -1)
+    if tileX < 0 || tileY < 0:
+        echo("wowExport wdt-maid-tile: missing --x --y")
+        return 1
+    let manifest: northshire.NorthshireManifest = northshire.Manifest()
+    let fileRes: Result[northshire.NorthshireAuditedFile] =
+        asset_export.NorthshireFindByLabel(manifest, "azeroth-wdt")
+    if IsErr(fileRes):
+        echo(Error(fileRes))
+        return 1
+    let file: northshire.NorthshireAuditedFile = Value(fileRes)
+    let bufRes: Result[bytes.ByteBuffer] =
+        local_files.ReadLocalFileByEntry(manifest.clientPath, file.archiveIndex, file.offset, file.size)
+    if IsErr(bufRes):
+        echo(Error(bufRes))
+        return 1
+    let buf: bytes.ByteBuffer = Value(bufRes)
+    let tileRes: Result[asset_formats.WdtMaidTile] =
+        asset_formats.ParseWdtMaidTileFileDataIDs(buf, tileX, tileY)
+    bytes.FreeByteBuffer(buf)
+    if IsErr(tileRes):
+        echo(Error(tileRes))
+        return 1
+    echo(asset_formats.WdtMaidTileText(Value(tileRes)))
     return 0
 
 fn RunExtractFile(): int32 =
@@ -313,6 +342,8 @@ fn main(argc: int32, argv: ptr): int32 =
         return RunManifest()
     if cmd == "audit-file":
         return RunAuditFile()
+    if cmd == "wdt-maid-tile":
+        return RunWdtMaidTile()
     if cmd == "extract-file":
         return RunExtractFile()
     if cmd == "export-m2":

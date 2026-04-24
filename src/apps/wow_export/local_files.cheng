@@ -36,6 +36,24 @@ fn localRootLocaleMatches(localeFlags: int32, localeMask: int32): bool =
         return true
     return (localeFlags & localeMask) != 0
 
+fn localRootMinFileDataID(fileDataIDs: int32[]): int32 =
+    var out: int32 = fileDataIDs[0]
+    var i: int32 = 1
+    while i < fileDataIDs.len:
+        if fileDataIDs[i] < out:
+            out = fileDataIDs[i]
+        i = i + 1
+    return out
+
+fn localRootMaxFileDataID(fileDataIDs: int32[]): int32 =
+    var out: int32 = fileDataIDs[0]
+    var i: int32 = 1
+    while i < fileDataIDs.len:
+        if fileDataIDs[i] > out:
+            out = fileDataIDs[i]
+        i = i + 1
+    return out
+
 fn localRootParseGroupHeader(buf: bytes.ByteBuffer,
                              bufOffset: int32,
                              header: wow_root.RootHeader,
@@ -89,6 +107,8 @@ fn localRootFindManyInGroupBuffer(buf: bytes.ByteBuffer,
                                   contentKeysOffset: int32,
                                   hasNameHashes: bool,
                                   wantedFileDataIDs: int32[],
+                                  wantedMinFileDataID: int32,
+                                  wantedMaxFileDataID: int32,
                                   localeMask: int32,
                                   foundFlags: var bool[],
                                   entries: var wow_root.RootEntry[],
@@ -99,13 +119,15 @@ fn localRootFindManyInGroupBuffer(buf: bytes.ByteBuffer,
         return Err[bool]("wowExport local root: group buffer does not cover payload")
     var fileDataID: int32
     var i: int32
-    while i < fileCount:
+    while i < fileCount && matchedCount < wantedFileDataIDs.len:
         let deltaOffset: int32 = fileIdsOffset - bufferAbsoluteStart + i * 4
         let deltaRes: Result[int32] = localRootU32LEAt(buf, deltaOffset)
         if IsErr(deltaRes):
             return Err[bool](Error(deltaRes))
         fileDataID = fileDataID + Value(deltaRes)
-        if localRootLocaleMatches(localeFlags, localeMask):
+        if fileDataID > wantedMaxFileDataID:
+            break
+        if fileDataID >= wantedMinFileDataID && localRootLocaleMatches(localeFlags, localeMask):
             var wantedIndex: int32
             while wantedIndex < wantedFileDataIDs.len:
                 if !foundFlags[wantedIndex] && wantedFileDataIDs[wantedIndex] == fileDataID:
@@ -125,6 +147,95 @@ fn localRootFindManyInGroupBuffer(buf: bytes.ByteBuffer,
                 wantedIndex = wantedIndex + 1
         fileDataID = fileDataID + 1
         i = i + 1
+    return Ok[bool](true)
+
+fn localRootFindManyInGroupRanged(clientPath: str,
+                                  rootIndexEntry: casc_index.CascIndexEntry,
+                                  fileCount: int32,
+                                  localeFlags: int32,
+                                  contentFlags: int32,
+                                  fileIdsOffset: int32,
+                                  contentKeysOffset: int32,
+                                  nextGroupOffset: int32,
+                                  hasNameHashes: bool,
+                                  wantedFileDataIDs: int32[],
+                                  wantedMinFileDataID: int32,
+                                  wantedMaxFileDataID: int32,
+                                  localeMask: int32,
+                                  foundFlags: var bool[],
+                                  entries: var wow_root.RootEntry[],
+                                  matchedCount: var int32): Result[bool] =
+    if fileCount <= 0:
+        return Err[bool]("wowExport local root: invalid ranged file count")
+    if fileIdsOffset < 0 ||
+        contentKeysOffset < fileIdsOffset ||
+        contentKeysOffset + fileCount * 16 > nextGroupOffset:
+        return Err[bool]("wowExport local root: ranged group bounds invalid")
+    if !localRootLocaleMatches(localeFlags, localeMask):
+        return Ok[bool](true)
+    let idsSize: int32 = fileCount * 4
+    let idsRes: Result[bytes.ByteBuffer] =
+        casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, rootIndexEntry, fileIdsOffset, idsSize)
+    if IsErr(idsRes):
+        return Err[bool](Error(idsRes))
+    let ids: bytes.ByteBuffer = Value(idsRes)
+    if ids.len != idsSize:
+        bytes.FreeByteBuffer(ids)
+        return Err[bool]("wowExport local root: ranged id array size mismatch")
+    var matchedIndices: int32[]
+    var initIndex: int32
+    while initIndex < wantedFileDataIDs.len:
+        add(matchedIndices, -1)
+        initIndex = initIndex + 1
+    var minMatchedIndex: int32 = 2147483647
+    var maxMatchedIndex: int32 = -1
+    var fileDataID: int32
+    var i: int32
+    while i < fileCount && matchedCount < wantedFileDataIDs.len:
+        fileDataID = fileDataID + bytes.ReadU32LEAt(ids, i * 4)
+        if fileDataID > wantedMaxFileDataID:
+            break
+        if fileDataID >= wantedMinFileDataID:
+            var wantedIndex: int32
+            while wantedIndex < wantedFileDataIDs.len:
+                if !foundFlags[wantedIndex] && wantedFileDataIDs[wantedIndex] == fileDataID:
+                    matchedIndices[wantedIndex] = i
+                    foundFlags[wantedIndex] = true
+                    matchedCount = matchedCount + 1
+                    if i < minMatchedIndex:
+                        minMatchedIndex = i
+                    if i > maxMatchedIndex:
+                        maxMatchedIndex = i
+                wantedIndex = wantedIndex + 1
+        fileDataID = fileDataID + 1
+        i = i + 1
+    bytes.FreeByteBuffer(ids)
+    if maxMatchedIndex >= 0:
+        let keyStart: int32 = contentKeysOffset + minMatchedIndex * 16
+        let keyCount: int32 = (maxMatchedIndex - minMatchedIndex + 1) * 16
+        let keysRes: Result[bytes.ByteBuffer] =
+            casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, rootIndexEntry, keyStart, keyCount)
+        if IsErr(keysRes):
+            return Err[bool](Error(keysRes))
+        let keys: bytes.ByteBuffer = Value(keysRes)
+        var wantedIndex: int32
+        while wantedIndex < wantedFileDataIDs.len:
+            let matchedIndex: int32 = matchedIndices[wantedIndex]
+            if matchedIndex >= 0:
+                let keyOffset: int32 = (matchedIndex - minMatchedIndex) * 16
+                let contentKeyRes: Result[str] = binary.HexSlice(keys, keyOffset, 16)
+                if IsErr(contentKeyRes):
+                    bytes.FreeByteBuffer(keys)
+                    return Err[bool](Error(contentKeyRes))
+                var entry: wow_root.RootEntry
+                entry.fileDataID = wantedFileDataIDs[wantedIndex]
+                entry.contentKey = Value(contentKeyRes)
+                entry.localeFlags = localeFlags
+                entry.contentFlags = contentFlags
+                entry.hasNameHash = hasNameHashes
+                entries[wantedIndex] = entry
+            wantedIndex = wantedIndex + 1
+        bytes.FreeByteBuffer(keys)
     return Ok[bool](true)
 
 fn localRootInitEntryArray(count: int32): wow_root.RootEntry[] =
@@ -177,6 +288,8 @@ fn LocalRootFindFileDataIDs(clientPath: str,
     let header: wow_root.RootHeader = Value(headerRes)
     var entries: wow_root.RootEntry[] = localRootInitEntryArray(wantedFileDataIDs.len)
     var foundFlags: bool[] = localRootInitBoolArray(wantedFileDataIDs.len)
+    let wantedMinFileDataID: int32 = localRootMinFileDataID(wantedFileDataIDs)
+    let wantedMaxFileDataID: int32 = localRootMaxFileDataID(wantedFileDataIDs)
     var matchedCount: int32
     var groupOffset: int32 = header.dataOffset
     while groupOffset < contentSize && matchedCount < wantedFileDataIDs.len:
@@ -212,24 +325,16 @@ fn LocalRootFindFileDataIDs(clientPath: str,
         if nextGroupOffset <= windowStart + window.len:
             let findRes: Result[bool] =
                 localRootFindManyInGroupBuffer(window, windowStart, fileCount, localeFlags, contentFlags,
-                    fileIdsOffset, contentKeysOffset, hasNameHashes, wantedFileDataIDs, localeMask,
-                    foundFlags, entries, matchedCount)
+                    fileIdsOffset, contentKeysOffset, hasNameHashes, wantedFileDataIDs,
+                    wantedMinFileDataID, wantedMaxFileDataID, localeMask, foundFlags, entries, matchedCount)
             if IsErr(findRes):
                 bytes.FreeByteBuffer(window)
                 return Err[wow_root.RootEntry[]](Error(findRes))
         else:
-            let groupSize: int32 = nextGroupOffset - groupOffset
-            let groupRes: Result[bytes.ByteBuffer] =
-                casc_archive.CascArchiveDecodeLocalEntryRange(clientPath, rootIndexEntry, groupOffset, groupSize)
-            if IsErr(groupRes):
-                bytes.FreeByteBuffer(window)
-                return Err[wow_root.RootEntry[]](Error(groupRes))
-            let group: bytes.ByteBuffer = Value(groupRes)
             let findRes: Result[bool] =
-                localRootFindManyInGroupBuffer(group, groupOffset, fileCount, localeFlags, contentFlags,
-                    fileIdsOffset, contentKeysOffset, hasNameHashes, wantedFileDataIDs, localeMask,
-                    foundFlags, entries, matchedCount)
-            bytes.FreeByteBuffer(group)
+                localRootFindManyInGroupRanged(clientPath, rootIndexEntry, fileCount, localeFlags, contentFlags,
+                    fileIdsOffset, contentKeysOffset, nextGroupOffset, hasNameHashes, wantedFileDataIDs,
+                    wantedMinFileDataID, wantedMaxFileDataID, localeMask, foundFlags, entries, matchedCount)
             if IsErr(findRes):
                 bytes.FreeByteBuffer(window)
                 return Err[wow_root.RootEntry[]](Error(findRes))

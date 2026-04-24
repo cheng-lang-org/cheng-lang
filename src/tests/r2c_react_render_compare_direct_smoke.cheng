@@ -1,6 +1,7 @@
 import std/os
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/path as chengpath
+import cheng/r2c/r2c_react_smoke_support as r2csmoke
 
 fn main(): int32 =
     var root: str = os.GetEnv("CHENG_ROOT")
@@ -8,8 +9,13 @@ fn main(): int32 =
         root = "/Users/lbcheng/cheng-lang"
     let outDir = chengpath.PathAbsolute(root, "artifacts/r2c_render_compare_direct_smoke")
     assert(chengpath.MkdirP(root, outDir), " r2c render compare direct smoke: mkdir")
-    let renderCompareScript = chengpath.PathAbsolute(root, "tools/r2c/experimental/r2c-react-render-compare.mjs")
-    assert(chengpath.FileExistsNonEmpty(root, renderCompareScript), " r2c render compare direct smoke: render compare script exists")
+    let stage3 = chengpath.PathAbsolute(root, "artifacts/bootstrap/cheng.stage3")
+    assert(chengpath.FileExistsNonEmpty(root, stage3), " r2c render compare direct smoke: stage3 exists")
+    let controllerEnv = os.GetEnv("R2C_REACT_CONTROLLER_EXE")
+    assert(len(controllerEnv) > 0,
+           " r2c render compare direct smoke: set R2C_REACT_CONTROLLER_EXE; direct smoke never recompiles controller")
+    let controllerExe = chengpath.PathAbsolute(root, controllerEnv)
+    assert(chengpath.FileExistsNonEmpty(root, controllerExe), " r2c render compare direct smoke: controller exe")
 
     let repoEnv = os.GetEnv("R2C_REACT_REPO")
     var repo = "/Users/lbcheng/UniMaker/React.js"
@@ -29,23 +35,8 @@ fn main(): int32 =
     let renderComparePath = os.JoinPath(outDir, "render_compare_report_v1.json")
     let renderCompareSummaryPath = os.JoinPath(outDir, "render_compare.summary.env")
 
-    let pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aXfsAAAAASUVORK5CYII="
-    let pngWriterScript = "const fs=require('node:fs');" +
-                          "const png=Buffer.from(process.argv[1],'base64');" +
-                          "fs.writeFileSync(process.argv[2],png);" +
-                          "fs.writeFileSync(process.argv[3],png);"
-    let pngWriterLog = os.JoinPath(outDir, "write_png.log")
-    if chengpath.PathFileExists(pngWriterLog):
-        os.RemoveFile(pngWriterLog)
-    let pngWriterRun = hostops.RunProgramLogged(root,
-                                                  "r2c_render_compare_direct_write_png",
-                                                  "node",
-                                                  ["-e", pngWriterScript, pngBase64, nativePngPath, truthPngPath],
-                                                  [],
-                                                  root,
-                                                  0,
-                                                  pngWriterLog)
-    assert(hostops.LoggedRunOk(pngWriterRun), " r2c render compare direct smoke: write png rc")
+    r2csmoke.R2cReactSmokeWriteTinyPng(nativePngPath)
+    r2csmoke.R2cReactSmokeWriteTinyPng(truthPngPath)
     assert(chengpath.FileExistsNonEmpty(root, nativePngPath), " r2c render compare direct smoke: native png")
     assert(chengpath.FileExistsNonEmpty(root, truthPngPath), " r2c render compare direct smoke: truth png")
 
@@ -137,23 +128,23 @@ fn main(): int32 =
     let renderCompareLog = os.JoinPath(outDir, "render_compare.log")
     if chengpath.PathFileExists(renderCompareLog):
         os.RemoveFile(renderCompareLog)
-    let renderCompareRun = hostops.RunProgramLogged(root,
-                                                      "r2c_render_compare_direct_smoke",
-                                                      "node",
-                                                      [
-                                                          renderCompareScript,
-                                                          "--repo", repo,
-                                                          "--route", "home_default",
-                                                          "--out-dir", outDir,
-                                                          "--native-summary", nativeSummaryPath,
-                                                          "--truth-summary", truthSummaryPath,
-                                                          "--native-screenshot", nativePngPath,
-                                                          "--truth-screenshot", truthPngPath
-                                                      ],
-                                                      [],
-                                                      root,
-                                                      0,
-                                                      renderCompareLog)
+    let renderCompareRun = hostops.RunFileLogged(root,
+                                                   "r2c_render_compare_direct_smoke",
+                                                   controllerExe,
+                                                   [
+                                                       "render-compare",
+                                                       "--repo", repo,
+                                                       "--route", "home_default",
+                                                       "--out-dir", outDir,
+                                                       "--native-summary", nativeSummaryPath,
+                                                       "--truth-summary", truthSummaryPath,
+                                                       "--native-screenshot", nativePngPath,
+                                                       "--truth-screenshot", truthPngPath
+                                                   ],
+                                                   r2csmoke.R2cReactSmokeNativeEnv(stage3),
+                                                   root,
+                                                   120,
+                                                   renderCompareLog)
     assert(hostops.LoggedRunOk(renderCompareRun), " r2c render compare direct smoke: render compare rc")
     assert(chengpath.FileExistsNonEmpty(root, renderComparePath), " r2c render compare direct smoke: report")
     assert(chengpath.FileExistsNonEmpty(root, renderCompareSummaryPath), " r2c render compare direct smoke: summary")

@@ -2,6 +2,7 @@ import std/os
 import std/strutils as strutil
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/path as chengpath
+import cheng/r2c/r2c_react_smoke_support as r2csmoke
 import cheng/r2c/r2c_react_surface_main as r2csurface
 
 fn containsText(text: str, needle: str): bool =
@@ -53,53 +54,60 @@ fn main(): int32 =
     if len(repoEnv) > 0:
         repo = repoEnv
     assert(os.DirExists(repo), " r2c run-native-gui controller smoke: React.js repo exists")
-    var controllerCompileEnv: str[]
-    add(controllerCompileEnv, "BACKEND_INCREMENTAL=0")
-    add(controllerCompileEnv, "BACKEND_MULTI_MODULE_CACHE=0")
-    add(controllerCompileEnv, "CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1")
-    add(controllerCompileEnv, "BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0")
-    add(controllerCompileEnv, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
-    add(controllerCompileEnv, "CHENG_PROGRESS=1")
-    add(controllerCompileEnv, "CHENG_PROCESS_MAX_RSS_BYTES=34359738368")
+    let controllerEnv = os.GetEnv("R2C_REACT_CONTROLLER_EXE")
+    let allowControllerCompile = os.GetEnv("R2C_REACT_ALLOW_CONTROLLER_COMPILE") == "1"
+    var controllerExe = ""
+    if len(controllerEnv) > 0:
+        controllerExe = chengpath.PathAbsolute(root, controllerEnv)
+    elif allowControllerCompile:
+        controllerExe = os.JoinPath(outDir, "r2c_react_controller_smoke")
+    else:
+        assert(false,
+               " r2c run-native-gui controller smoke: set R2C_REACT_CONTROLLER_EXE or R2C_REACT_ALLOW_CONTROLLER_COMPILE=1")
     var nativeEnv: str[]
     add(nativeEnv, "R2C_REACT_TOOLING_BIN=" + stage3)
     add(nativeEnv, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
     add(nativeEnv, "CHENG_PROGRESS=1")
-    add(nativeEnv, "CHENG_PROCESS_MAX_RSS_BYTES=34359738368")
+    add(nativeEnv, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
 
-    let controllerExe = os.JoinPath(outDir, "r2c_react_controller_smoke")
-    let controllerCompileReport = controllerExe + ".report.txt"
-    let controllerCompileLog = controllerExe + ".compile.log"
-    if chengpath.PathFileExists(controllerExe):
-        os.RemoveFile(controllerExe)
-    if chengpath.PathFileExists(controllerCompileReport):
-        os.RemoveFile(controllerCompileReport)
-    var controllerCompileArgs: str[]
-    add(controllerCompileArgs, "system-link-exec")
-    add(controllerCompileArgs, "--root:" + packageRoot)
-    add(controllerCompileArgs, "--in:" + controllerSource)
-    add(controllerCompileArgs, "--emit:exe")
-    add(controllerCompileArgs, "--target:arm64-apple-darwin")
-    add(controllerCompileArgs, "--out:" + controllerExe)
-    add(controllerCompileArgs, "--report-out:" + controllerCompileReport)
-    let controllerCompileRun = hostops.RunFileLogged(root,
-                                                       "r2c_run_native_gui_controller_compile",
-                                                       driver,
-                                                       controllerCompileArgs,
-                                                       controllerCompileEnv,
-                                                       root,
-                                                       0,
-                                                       controllerCompileLog)
-    assert(hostops.LoggedRunOk(controllerCompileRun), " r2c run-native-gui controller smoke: controller compile rc")
+    if allowControllerCompile && len(controllerEnv) <= 0:
+        let controllerCompileReport = controllerExe + ".report.txt"
+        let controllerCompileLog = controllerExe + ".compile.log"
+        if chengpath.PathFileExists(controllerExe):
+            os.RemoveFile(controllerExe)
+        if chengpath.PathFileExists(controllerExe + ".map"):
+            os.RemoveFile(controllerExe + ".map")
+        if chengpath.PathFileExists(controllerCompileReport):
+            os.RemoveFile(controllerCompileReport)
+        if chengpath.PathFileExists(controllerCompileLog):
+            os.RemoveFile(controllerCompileLog)
+        var controllerCompileArgs: str[]
+        add(controllerCompileArgs, "system-link-exec")
+        add(controllerCompileArgs, "--root:" + packageRoot)
+        add(controllerCompileArgs, "--in:" + controllerSource)
+        add(controllerCompileArgs, "--emit:exe")
+        add(controllerCompileArgs, "--target:arm64-apple-darwin")
+        add(controllerCompileArgs, "--out:" + controllerExe)
+        add(controllerCompileArgs, "--report-out:" + controllerCompileReport)
+        let controllerCompileRun = hostops.RunFileLogged(root,
+                                                           "r2c_run_native_gui_controller_compile",
+                                                           driver,
+                                                           controllerCompileArgs,
+                                                           r2csmoke.R2cReactSmokeControllerCompileEnv(),
+                                                           root,
+                                                           420,
+                                                           controllerCompileLog)
+        assert(hostops.LoggedRunOk(controllerCompileRun), " r2c run-native-gui controller smoke: controller compile rc")
+        assert(chengpath.FileExistsNonEmpty(root, controllerExe), " r2c run-native-gui controller smoke: controller compiled exe")
+        assert(chengpath.FileExistsNonEmpty(root, controllerCompileReport), " r2c run-native-gui controller smoke: controller compile report")
+        let controllerCompileReportText = chengpath.ReadTextFile("", controllerCompileReport)
+        assert(containsText(controllerCompileReportText, "source_closure_paths=" + controllerSource),
+               " r2c run-native-gui controller smoke: controller compile source closure")
+        assert(containsText(controllerCompileReportText, "/Users/lbcheng/cheng-lang/src/r2c/r2c_react_controller_main.cheng"),
+               " r2c run-native-gui controller smoke: controller compile controller main closure")
+        assert(containsText(controllerCompileReportText, "primary_object_cache_hit_count=0"),
+               " r2c run-native-gui controller smoke: controller compile primary cache disabled")
     assert(chengpath.FileExistsNonEmpty(root, controllerExe), " r2c run-native-gui controller smoke: controller exe")
-    assert(chengpath.FileExistsNonEmpty(root, controllerCompileReport), " r2c run-native-gui controller smoke: controller compile report")
-    let controllerCompileReportText = chengpath.ReadTextFile("", controllerCompileReport)
-    assert(containsText(controllerCompileReportText, "source_closure_paths=" + controllerSource),
-           " r2c run-native-gui controller smoke: controller compile source closure")
-    assert(containsText(controllerCompileReportText, "/Users/lbcheng/cheng-lang/src/r2c/r2c_react_controller_main.cheng"),
-           " r2c run-native-gui controller smoke: controller compile controller main closure")
-    assert(containsText(controllerCompileReportText, "primary_object_cache_hit_count=0"),
-           " r2c run-native-gui controller smoke: controller compile primary cache disabled")
 
     let codegenOutDir = chengpath.PathJoin(outDir, "codegen_surface")
     let codegenLog = chengpath.PathJoin(outDir, "r2c_codegen_surface.log")
@@ -156,6 +164,20 @@ fn main(): int32 =
     add(bundleArgs, "home_default")
     add(bundleArgs, "--out-dir")
     add(bundleArgs, outDir)
+    add(bundleArgs, "--codegen-manifest")
+    add(bundleArgs, codegenManifestPath)
+    add(bundleArgs, "--host-contract")
+    add(bundleArgs, bundleHostContractPath)
+    add(bundleArgs, "--asset-manifest")
+    add(bundleArgs, bundleAssetManifestPath)
+    add(bundleArgs, "--tailwind-manifest")
+    add(bundleArgs, bundleTailwindManifestPath)
+    add(bundleArgs, "--route-catalog")
+    add(bundleArgs, codegenRouteCatalogPath)
+    add(bundleArgs, "--tsx-ast")
+    add(bundleArgs, codegenTsxAstPath)
+    add(bundleArgs, "--summary-out")
+    add(bundleArgs, bundleSummaryPath)
     let bundleRun = hostops.RunFileLogged(root,
                                             "r2c_native_gui_bundle_controller_smoke",
                                             controllerExe,
@@ -510,7 +532,7 @@ fn main(): int32 =
     add(controllerArgs, "600")
     var controllerRunEnv: str[]
     add(controllerRunEnv, "CHENG_PROGRESS=1")
-    add(controllerRunEnv, "CHENG_PROCESS_MAX_RSS_BYTES=34359738368")
+    add(controllerRunEnv, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
     let controllerRun = hostops.RunFileLogged(root,
                                                 "r2c_run_native_gui_controller_smoke",
                                                 controllerExe,
@@ -525,7 +547,6 @@ fn main(): int32 =
     let reportPath = os.JoinPath(outDir, "native_gui_run_report_v1.json")
     let summaryPath = os.JoinPath(outDir, "native_gui_run.summary.env")
     let screenshotPath = os.JoinPath(outDir, "native_gui_session.png")
-    let hostCompileLogPath = os.JoinPath(outDir, "native_gui_host_macos.compile.log")
     let hostRunLogPath = os.JoinPath(outDir, "native_gui_run.log")
     let hostRunFieldsPath = os.JoinPath(outDir, "native_gui_host_run.stdout.env")
     let hitInspectorPath = os.JoinPath(outDir, "native_gui_hit_inspector_v1.json")
@@ -535,7 +556,6 @@ fn main(): int32 =
     assert(chengpath.FileExistsNonEmpty(root, reportPath), " r2c run-native-gui controller smoke: report")
     assert(chengpath.FileExistsNonEmpty(root, summaryPath), " r2c run-native-gui controller smoke: summary")
     assert(chengpath.FileExistsNonEmpty(root, screenshotPath), " r2c run-native-gui controller smoke: screenshot")
-    assert(chengpath.FileExistsNonEmpty(root, hostCompileLogPath), " r2c run-native-gui controller smoke: host compile log")
     assert(chengpath.FileExistsNonEmpty(root, hostRunLogPath), " r2c run-native-gui controller smoke: host run log")
     assert(chengpath.FileExistsNonEmpty(root, hostRunFieldsPath), " r2c run-native-gui controller smoke: host run fields")
     assert(chengpath.FileExistsNonEmpty(root, hitInspectorPath), " r2c run-native-gui controller smoke: hit inspector")
@@ -551,10 +571,12 @@ fn main(): int32 =
            " r2c run-native-gui controller smoke: report ok")
     assert(containsText(reportText, "\"helper_script\": \"\""),
            " r2c run-native-gui controller smoke: helper script retired")
-    assert(containsText(reportText, "\"native_gui_host_source_path\": "),
-           " r2c run-native-gui controller smoke: host source path")
-    assert(containsText(reportText, "\"native_gui_host_compile_log_path\": "),
-           " r2c run-native-gui controller smoke: host compile log path")
+    assert(containsText(reportText, "\"native_gui_session_runner_mode\": \"cheng.native_gui_session_runner_v1\""),
+           " r2c run-native-gui controller smoke: Cheng session runner mode")
+    assert(containsText(reportText, "\"native_gui_host_source_path\": \"\""),
+           " r2c run-native-gui controller smoke: no ObjC host source path")
+    assert(containsText(reportText, "\"native_gui_host_compile_log_path\": \"\""),
+           " r2c run-native-gui controller smoke: no host compile log path")
     assert(containsText(reportText, "\"native_gui_host_run_log_path\": "),
            " r2c run-native-gui controller smoke: host run log path")
     assert(containsText(reportText, "\"native_gui_host_run_fields_path\": "),
@@ -589,10 +611,12 @@ fn main(): int32 =
            " r2c run-native-gui controller smoke: screenshot path")
     assert(containsText(summaryText, "native_gui_runtime_bundle_ready=true"),
            " r2c run-native-gui controller smoke: summary runtime bundle ready")
-    assert(containsText(summaryText, "native_gui_host_source_path="),
-           " r2c run-native-gui controller smoke: summary host source path")
-    assert(containsText(summaryText, "native_gui_host_compile_log_path=" + hostCompileLogPath),
-           " r2c run-native-gui controller smoke: summary host compile log path")
+    assert(containsText(summaryText, "native_gui_session_runner_mode=cheng.native_gui_session_runner_v1"),
+           " r2c run-native-gui controller smoke: summary Cheng session runner")
+    assert(containsText(summaryText, "native_gui_host_source_path=\n"),
+           " r2c run-native-gui controller smoke: summary no ObjC host source")
+    assert(containsText(summaryText, "native_gui_host_compile_log_path=\n"),
+           " r2c run-native-gui controller smoke: summary no host compile log")
     assert(containsText(summaryText, "native_gui_host_run_log_path=" + hostRunLogPath),
            " r2c run-native-gui controller smoke: summary host run log path")
     assert(containsText(summaryText, "native_gui_hit_inspector_path=" + hitInspectorPath),

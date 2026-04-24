@@ -42,4 +42,9 @@
 - [x] Resolve WMO `MODD` doodad model slots through sparse `IDOM/MODI` and audit every placed model.
 - [x] Export pathless WMO `MODI` dependencies as fileDataID-named resources with a strict manifest.
 - [x] Require render to audit WMO doodad model dependencies before drawing placement markers.
+- [x] Render WMO doodad M2 meshes by strict `MODD` quaternion/scale placement instancing.
 - [x] Fix CLI single-command argument gate for `manifest` and other one-word commands.
+- [x] Parse WDT `MAID` per-tile split fileDataID slots and expose `wdt-maid-tile` CLI audit view.
+- [x] Add strict smoke for Northshire MAID split fileDataID audit chain.
+- [x] Remove local CASC range decode full-block copies for BLTE `normal` blocks.
+- [x] Predecode local `.idx` key prefixes before batch index scans.

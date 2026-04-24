@@ -1,7 +1,13 @@
 import std/cmdline as cmdline
+import std/bytes as binbytes
+import std/crypto/sha256 as sha256
 import std/os
+import std/rawbytes as rawbytes
+import std/rawmem_support as rawmem
+import std/result
 import std/strings
 import std/strutils as strutil
+import cheng/apps/wow_export/zlib_inflate as zlib
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/path as chengpath
 import cheng/r2c/r2c_process as r2cproc
@@ -155,6 +161,40 @@ type
         nativeLayoutPlanItemCount: int32
         renderPlanCommandCount: int32
 
+    R2cTsxFrontendSeedAccum =
+        moduleLines: str
+        featureLines: str
+        componentLines: str
+        blockerLines: str
+        tailwindLines: str
+        modulesJson: str
+        moduleCount: int32
+
+    R2cPngImage =
+        ok: bool
+        reason: str
+        path: str
+        width: int32
+        height: int32
+        pixels: binbytes.ByteBuffer
+        fileSize: int32
+        fileSha256: str
+        pixelSha256: str
+
+    R2cPngCompare =
+        ok: bool
+        reason: str
+        width: int32
+        height: int32
+        otherWidth: int32
+        otherHeight: int32
+        pixelCount: int32
+        diffPixelCount: int32
+        diffRatioText: str
+        maxChannelDelta: int32
+        totalAbsDelta: int32
+        firstDiffJson: str
+
 fn r2cControllerPrintLine(text: str) =
     os.WriteLine(r2cControllerStdoutBridge(), text)
 
@@ -260,25 +300,6 @@ fn r2cControllerExperimentalRoot(root: str): str =
 
 fn r2cControllerDefaultOutDir(repo: str): str =
     return chengpath.PathAbsolute(repo, "build/r2c_react_cheng")
-
-fn r2cControllerRunNodeHelper(root: str,
-                              scriptPath: str,
-                              helperArgs: str[],
-                              logPath: str,
-                              exitCodeOut: var int32,
-                              outputOut: var str): bool =
-    var argv: str[]
-    add(argv, scriptPath)
-    for i in 0..<helperArgs.len:
-        add(argv, helperArgs[i])
-    return r2cproc.r2cProcessRunProgramLogged(root,
-                                              "r2c-react node helper",
-                                              "node",
-                                              argv,
-                                              root,
-                                              logPath,
-                                              exitCodeOut,
-                                              outputOut)
 
 fn r2cControllerFilterNativeGuiRuntimeArgs(args: str[]): str[] =
     var out: str[]
@@ -1244,6 +1265,27 @@ fn r2cControllerRunCompiledRuntimeLogged(root: str,
                                            exitCodeOut,
                                            outputOut)
 
+fn r2cControllerRunCompiledRuntimeLoggedWithArgs(root: str,
+                                                 runtimeExePath: str,
+                                                 runtimeContractPath: str,
+                                                 extraArgs: str[],
+                                                 logPath: str,
+                                                 exitCodeOut: var int32,
+                                                 outputOut: var str): bool =
+    var argv: str[]
+    add(argv, "--runtime-contract")
+    add(argv, runtimeContractPath)
+    for i in 0..<extraArgs.len:
+        add(argv, extraArgs[i])
+    return r2cproc.r2cProcessRunFileLogged(root,
+                                           "r2c-react compiled runtime",
+                                           runtimeExePath,
+                                           argv,
+                                           root,
+                                           logPath,
+                                           exitCodeOut,
+                                           outputOut)
+
 fn r2cControllerJsonStringifyIntValue(value: int32): str =
     return intToStr(value)
 
@@ -1630,6 +1672,19 @@ fn r2cControllerFindTruthSnapshotMatch(truthDocText: str,
             return true
         index = index + 1
     return true
+
+fn r2cControllerTruthTraceSnapshotCount(truthDocText: str): int32 =
+    let snapshotsRaw: str = r2cControllerJsonReadArrayFieldRaw(truthDocText, "snapshots", "")
+    if strings.Len(snapshotsRaw) <= 0:
+        return 0
+    var entryRaw: str
+    var cursor: int32
+    var nextPos: int32
+    var count: int32
+    while r2cControllerJsonArrayNextObjectRaw(snapshotsRaw, cursor, entryRaw, nextPos):
+        cursor = nextPos
+        count = count + 1
+    return count
 
 fn r2cControllerEvaluateTruthCompare(execSnapshotText: str,
                                      truthDocText: str,
@@ -2516,7 +2571,7 @@ fn r2cControllerWriteCompileReport(reportPath: str,
     report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(r2cControllerExperimentalRoot(root)) + ",\n"
     report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
     report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
-    report = report + "  \"node_program\": \"node\",\n"
+    report = report + "  \"node_program\": \"\",\n"
     report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helperScript) + ",\n"
     report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(helperSummaryPath) + ",\n"
     report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(helperLogPath) + ",\n"
@@ -2570,8 +2625,6 @@ fn r2cControllerCompile(root: str,
     scratchOk
     let runtimeRoots: str[]
     let assetRoots: str[]
-    let experimentalRoot: str = chengpath.PathAbsolute(effectiveRoot, "tools/r2c/experimental")
-    let tsxHelper: str = os.JoinPath(experimentalRoot, "r2c-react-ts-frontend.mjs")
     let nativeGuiBundleHelper: str = "cheng.native_gui_bundle_seed_v1"
     let tsxAstPath: str = os.JoinPath(outDir, "tsx_ast_v1.json")
     let tsxSummaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
@@ -2606,23 +2659,14 @@ fn r2cControllerCompile(root: str,
     var helperOutput: str
     os.OsSetEmpty(helperOutput)
 
-    var frontendArgs: str[]
-    add(frontendArgs, "--repo")
-    add(frontendArgs, repo)
-    add(frontendArgs, "--out")
-    add(frontendArgs, tsxAstPath)
-    add(frontendArgs, "--summary-out")
-    add(frontendArgs, tsxSummaryPath)
-    for i in 0..<runtimeRoots.len:
-        add(frontendArgs, "--runtime-root")
-        add(frontendArgs, runtimeRoots[i])
-    let frontendLogPath: str = os.JoinPath(outDir, "tsx_frontend.log")
-    if !r2cControllerRunNodeHelper(effectiveRoot, tsxHelper, frontendArgs, frontendLogPath, helperExitCode, helperOutput):
-        r2cControllerPrintErr("r2c-react: tsx frontend helper failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    if !r2cControllerWriteChengTsxFrontendSeed(effectiveRoot,
+                                               repo,
+                                               outDir,
+                                               runtimeRoots,
+                                               tsxAstPath,
+                                               tsxSummaryPath,
+                                               ""):
+        r2cControllerPrintErr("r2c-react: Cheng TSX frontend seed failed")
         return 1
 
     moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0"))
@@ -2896,15 +2940,9 @@ fn r2cControllerCodegenSurface(root: str,
     var tsxAstPath: str = os.JoinPath(outDir, "tsx_ast_v1.json")
     if strings.Len(tsxAstFlag) > 0:
         tsxAstPath = chengpath.PathAbsolute(repo, tsxAstFlag)
-    let experimentalRoot: str = chengpath.PathAbsolute(effectiveRoot, "tools/r2c/experimental")
-    let tsxHelper: str = os.JoinPath(experimentalRoot, "r2c-react-ts-frontend.mjs")
     let tsxSummaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
     let codegenSummaryPath: str = os.JoinPath(outDir, "codegen_surface.summary.env")
     let reportPath: str = os.JoinPath(outDir, "codegen_surface_report_v1.json")
-    let frontendLogPath: str = os.JoinPath(outDir, "tsx_frontend.log")
-    var helperExitCode: int32
-    var helperOutput: str
-    os.OsSetEmpty(helperOutput)
     if !os.DirExists(repo):
         r2cControllerPrintErr("r2c-react: missing repo: " + repo)
         return 1
@@ -2912,22 +2950,14 @@ fn r2cControllerCodegenSurface(root: str,
     scratchOk
 
     if !chengpath.PathFileExists(tsxAstPath):
-        var frontendArgs: str[]
-        add(frontendArgs, "--repo")
-        add(frontendArgs, repo)
-        add(frontendArgs, "--out")
-        add(frontendArgs, tsxAstPath)
-        add(frontendArgs, "--summary-out")
-        add(frontendArgs, tsxSummaryPath)
-        for i in 0..<runtimeRoots.len:
-            add(frontendArgs, "--runtime-root")
-            add(frontendArgs, runtimeRoots[i])
-        if !r2cControllerRunNodeHelper(effectiveRoot, tsxHelper, frontendArgs, frontendLogPath, helperExitCode, helperOutput):
-            r2cControllerPrintErr("r2c-react: tsx frontend helper failed")
-            if strings.Len(helperOutput) > 0:
-                r2cControllerPrintErr(helperOutput)
-            if helperExitCode != 0:
-                return helperExitCode
+        if !r2cControllerWriteChengTsxFrontendSeed(effectiveRoot,
+                                                   repo,
+                                                   outDir,
+                                                   runtimeRoots,
+                                                   tsxAstPath,
+                                                   tsxSummaryPath,
+                                                   ""):
+            r2cControllerPrintErr("r2c-react: Cheng TSX frontend seed failed")
             return 1
 
     if strings.Len(truthTraceRaw) > 0:
@@ -2949,7 +2979,6 @@ fn r2cControllerCodegenSurface(root: str,
 
 fn r2cControllerDiscoverTruthRoutes(root: str,
                                     args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let repoBase: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--repo", currentDir))
@@ -2983,7 +3012,6 @@ fn r2cControllerDiscoverTruthRoutes(root: str,
 
 fn r2cControllerFrontend(root: str,
                          args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let repoBase: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--repo", currentDir))
@@ -2993,39 +3021,25 @@ fn r2cControllerFrontend(root: str,
     var outDir: str = r2cControllerDefaultOutDir(repo)
     if strings.Len(outDirFlag) > 0:
         outDir = chengpath.PathAbsolute(repo, outDirFlag)
-    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
-    let helperScript: str = os.JoinPath(experimentalRoot, "r2c-react-ts-frontend.mjs")
     let artifactPath: str = os.JoinPath(outDir, "tsx_ast_v1.json")
     let summaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
     let reportPath: str = os.JoinPath(outDir, "frontend_report_v1.json")
-    let logPath: str = os.JoinPath(outDir, "tsx_frontend.log")
     var moduleCount: int32
     var typescriptVersion = ""
-    var helperExitCode: int32
-    var helperOutput: str
-    os.OsSetEmpty(helperOutput)
     if !os.DirExists(repo):
         r2cControllerPrintErr("r2c-react: missing repo: " + repo)
         return 1
     var scratchOk: bool = chengpath.MkdirP("", outDir)
     scratchOk
 
-    var helperArgs: str[]
-    add(helperArgs, "--repo")
-    add(helperArgs, repo)
-    add(helperArgs, "--out")
-    add(helperArgs, artifactPath)
-    add(helperArgs, "--summary-out")
-    add(helperArgs, summaryPath)
-    for i in 0..<runtimeRoots.len:
-        add(helperArgs, "--runtime-root")
-        add(helperArgs, runtimeRoots[i])
-    if !r2cControllerRunNodeHelper(effectiveRoot, helperScript, helperArgs, logPath, helperExitCode, helperOutput):
-        r2cControllerPrintErr("r2c-react: tsx frontend helper failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    if !r2cControllerWriteChengTsxFrontendSeed(effectiveRoot,
+                                               repo,
+                                               outDir,
+                                               runtimeRoots,
+                                               artifactPath,
+                                               summaryPath,
+                                               reportPath):
+        r2cControllerPrintErr("r2c-react: Cheng TSX frontend seed failed")
         return 1
 
     moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(summaryPath, "module_count", "0"))
@@ -3038,13 +3052,14 @@ fn r2cControllerFrontend(root: str,
     report = report + "  \"ok\": true,\n"
     report = report + "  \"reason\": \"ok\",\n"
     report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
-    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote("") + ",\n"
     report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
     report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
-    report = report + "  \"node_program\": \"node\",\n"
-    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helperScript) + ",\n"
+    report = report + "  \"node_program\": \"\",\n"
+    report = report + "  \"frontend_mode\": \"cheng.tsx_frontend_seed_v1\",\n"
+    report = report + "  \"helper_script\": \"\",\n"
     report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
-    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
+    report = report + "  \"helper_log_path\": \"\",\n"
     report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(artifactPath) + ",\n"
     report = report + "  \"primary_artifact_format\": \"tsx_ast_v1\",\n"
     report = report + "  \"module_count\": " + intToStr(moduleCount) + ",\n"
@@ -3066,7 +3081,6 @@ fn r2cControllerFrontend(root: str,
 
 fn r2cControllerStaticSurface(root: str,
                               args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let repoBase: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--repo", currentDir))
@@ -3082,9 +3096,7 @@ fn r2cControllerStaticSurface(root: str,
     if strings.Len(tsxAstFlag) > 0:
         tsxAstPath = chengpath.PathAbsolute(repo, tsxAstFlag)
     let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
-    let tsxHelper: str = os.JoinPath(experimentalRoot, "r2c-react-ts-frontend.mjs")
     let tsxSummaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
-    let frontendLogPath: str = os.JoinPath(outDir, "tsx_frontend.log")
     let summaryPath: str = os.JoinPath(outDir, "static_surface.summary.env")
     let logPath: str = os.JoinPath(outDir, "static_surface.log")
     let reportPath: str = os.JoinPath(outDir, "static_surface_report_v1.json")
@@ -3096,9 +3108,6 @@ fn r2cControllerStaticSurface(root: str,
     var requiredHostGroupsCsv = ""
     var typescriptVersion = ""
     var frontendRan = false
-    var helperExitCode: int32
-    var helperOutput: str
-    os.OsSetEmpty(helperOutput)
     if !os.DirExists(repo):
         r2cControllerPrintErr("r2c-react: missing repo: " + repo)
         return 1
@@ -3107,22 +3116,14 @@ fn r2cControllerStaticSurface(root: str,
 
     if strings.Len(tsxAstFlag) <= 0:
         frontendRan = true
-        var frontendArgs: str[]
-        add(frontendArgs, "--repo")
-        add(frontendArgs, repo)
-        add(frontendArgs, "--out")
-        add(frontendArgs, tsxAstPath)
-        add(frontendArgs, "--summary-out")
-        add(frontendArgs, tsxSummaryPath)
-        for i in 0..<runtimeRoots.len:
-            add(frontendArgs, "--runtime-root")
-            add(frontendArgs, runtimeRoots[i])
-        if !r2cControllerRunNodeHelper(effectiveRoot, tsxHelper, frontendArgs, frontendLogPath, helperExitCode, helperOutput):
-            r2cControllerPrintErr("r2c-react: tsx frontend helper failed")
-            if strings.Len(helperOutput) > 0:
-                r2cControllerPrintErr(helperOutput)
-            if helperExitCode != 0:
-                return helperExitCode
+        if !r2cControllerWriteChengTsxFrontendSeed(effectiveRoot,
+                                                   repo,
+                                                   outDir,
+                                                   runtimeRoots,
+                                                   tsxAstPath,
+                                                   tsxSummaryPath,
+                                                   ""):
+            r2cControllerPrintErr("r2c-react: Cheng TSX frontend seed failed")
             return 1
         moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0"))
         typescriptVersion = r2cControllerReadSummaryValue(tsxSummaryPath, "typescript_version", "")
@@ -3187,7 +3188,6 @@ fn r2cControllerStaticSurface(root: str,
 
 fn r2cControllerSemanticSurface(root: str,
                                 args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let repoBase: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--repo", currentDir))
@@ -3202,9 +3202,7 @@ fn r2cControllerSemanticSurface(root: str,
     if strings.Len(tsxAstFlag) > 0:
         tsxAstPath = chengpath.PathAbsolute(repo, tsxAstFlag)
     let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
-    let tsxHelper: str = os.JoinPath(experimentalRoot, "r2c-react-ts-frontend.mjs")
     let tsxSummaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
-    let frontendLogPath: str = os.JoinPath(outDir, "tsx_frontend.log")
     let summaryPath: str = os.JoinPath(outDir, "semantic_surface.summary.env")
     let logPath: str = os.JoinPath(outDir, "semantic_surface.log")
     let reportPath: str = os.JoinPath(outDir, "semantic_surface_report_v1.json")
@@ -3217,9 +3215,6 @@ fn r2cControllerSemanticSurface(root: str,
     var blocked = false
     var typescriptVersion = ""
     var frontendRan = false
-    var helperExitCode: int32
-    var helperOutput: str
-    os.OsSetEmpty(helperOutput)
     if !os.DirExists(repo):
         r2cControllerPrintErr("r2c-react: missing repo: " + repo)
         return 1
@@ -3228,22 +3223,14 @@ fn r2cControllerSemanticSurface(root: str,
 
     if strings.Len(tsxAstFlag) <= 0:
         frontendRan = true
-        var frontendArgs: str[]
-        add(frontendArgs, "--repo")
-        add(frontendArgs, repo)
-        add(frontendArgs, "--out")
-        add(frontendArgs, tsxAstPath)
-        add(frontendArgs, "--summary-out")
-        add(frontendArgs, tsxSummaryPath)
-        for i in 0..<runtimeRoots.len:
-            add(frontendArgs, "--runtime-root")
-            add(frontendArgs, runtimeRoots[i])
-        if !r2cControllerRunNodeHelper(effectiveRoot, tsxHelper, frontendArgs, frontendLogPath, helperExitCode, helperOutput):
-            r2cControllerPrintErr("r2c-react: tsx frontend helper failed")
-            if strings.Len(helperOutput) > 0:
-                r2cControllerPrintErr(helperOutput)
-            if helperExitCode != 0:
-                return helperExitCode
+        if !r2cControllerWriteChengTsxFrontendSeed(effectiveRoot,
+                                                   repo,
+                                                   outDir,
+                                                   runtimeRoots,
+                                                   tsxAstPath,
+                                                   tsxSummaryPath,
+                                                   ""):
+            r2cControllerPrintErr("r2c-react: Cheng TSX frontend seed failed")
             return 1
         moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0"))
         typescriptVersion = r2cControllerReadSummaryValue(tsxSummaryPath, "typescript_version", "")
@@ -3311,7 +3298,6 @@ fn r2cControllerSemanticSurface(root: str,
 
 fn r2cControllerCaptureTruth(root: str,
                              args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let repoBase: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--repo", currentDir))
@@ -3322,62 +3308,119 @@ fn r2cControllerCaptureTruth(root: str,
     let repo: str = chengpath.PathAbsolute(effectiveRoot, repoBase)
     let defaultOutDir: str = chengpath.PathAbsolute(repo, "build/r2c_react_cheng/truth/" + routeState)
     let outDirFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--out-dir", defaultOutDir))
-    let baseUrl: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--base-url", ""))
-    let chromePath: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--chrome", ""))
-    let width: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--width", ""))
-    let height: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--height", ""))
-    let truthFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--truth-flag", ""))
-    let debugPort: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--debug-port", ""))
-    let waitMs: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--wait-ms", ""))
+    let truthSummaryFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--truth-summary", ""))
+    let truthTraceFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--truth-trace", ""))
+    let runtimeStateFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--runtime-state", ""))
+    let domFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--dom", ""))
+    let semanticNodesFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--semantic-nodes", ""))
+    let runtimeMetaFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--runtime-meta", ""))
+    let screenshotFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--screenshot", ""))
     let outDir: str = chengpath.PathAbsolute(repo, outDirFlag)
     let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
-    let helperScript: str = os.JoinPath(experimentalRoot, "r2c-react-truth-runtime.mjs")
     let summaryPath: str = os.JoinPath(outDir, routeState + ".summary.env")
     let reportPath: str = os.JoinPath(outDir, "capture_truth_report_v1.json")
-    let logPath: str = os.JoinPath(outDir, "truth_runtime.log")
-    var helperExitCode: int32
-    var helperOutput: str
-    os.OsSetEmpty(helperOutput)
     if !os.DirExists(repo):
         r2cControllerPrintErr("r2c-react: missing repo: " + repo)
         return 1
     var scratchOk: bool = chengpath.MkdirP("", outDir)
     scratchOk
 
-    var helperArgs: str[]
-    add(helperArgs, "--route")
-    add(helperArgs, routeState)
-    add(helperArgs, "--out-dir")
-    add(helperArgs, outDir)
-    add(helperArgs, "--summary-out")
-    add(helperArgs, summaryPath)
-    if strings.Len(baseUrl) > 0:
-        add(helperArgs, "--base-url")
-        add(helperArgs, baseUrl)
-    if strings.Len(chromePath) > 0:
-        add(helperArgs, "--chrome")
-        add(helperArgs, chromePath)
-    if strings.Len(width) > 0:
-        add(helperArgs, "--width")
-        add(helperArgs, width)
-    if strings.Len(height) > 0:
-        add(helperArgs, "--height")
-        add(helperArgs, height)
-    if strings.Len(truthFlag) > 0:
-        add(helperArgs, "--truth-flag")
-        add(helperArgs, truthFlag)
-    if strings.Len(debugPort) > 0:
-        add(helperArgs, "--debug-port")
-        add(helperArgs, debugPort)
-    if strings.Len(waitMs) > 0:
-        add(helperArgs, "--wait-ms")
-        add(helperArgs, waitMs)
-    if !r2cControllerRunNodeHelper(effectiveRoot, helperScript, helperArgs, logPath, helperExitCode, helperOutput):
-        r2cControllerPrintErr("r2c-react: truth runtime helper failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    if strings.Len(truthSummaryFlag) <= 0 && strings.Len(truthTraceFlag) <= 0:
+        r2cControllerPrintErr("r2c-react: capture-truth is Cheng import-only now; pass --truth-summary <file> or --truth-trace <file>. Browser/CDP capture must land as a Cheng host, not a Node helper.")
+        return 1
+    if strings.Len(truthSummaryFlag) > 0:
+        let importSummaryPath: str = chengpath.PathAbsolute(currentDir, truthSummaryFlag)
+        if !chengpath.PathFileExists(importSummaryPath):
+            r2cControllerPrintErr("r2c-react: capture-truth missing truth summary: " + importSummaryPath)
+            return 1
+        let importSummaryText: str = chengpath.ReadTextFile("", importSummaryPath)
+        if strings.Len(r2cControllerReadSummaryValue(importSummaryPath, "truth_trace_path", "")) <= 0:
+            r2cControllerPrintErr("r2c-react: capture-truth truth summary missing truth_trace_path: " + importSummaryPath)
+            return 1
+        if !chengpath.WriteTextFile("", summaryPath, importSummaryText):
+            r2cControllerPrintErr("r2c-react: capture-truth failed to copy truth summary: " + summaryPath)
+            return 1
+    else:
+        let truthTracePathImported: str = chengpath.PathAbsolute(currentDir, truthTraceFlag)
+        if !chengpath.PathFileExists(truthTracePathImported):
+            r2cControllerPrintErr("r2c-react: capture-truth missing truth trace: " + truthTracePathImported)
+            return 1
+        let truthDocText: str = chengpath.ReadTextFile("", truthTracePathImported)
+        let importedTraceFormat: str = r2cControllerJsonReadStringField(truthDocText, "format", "")
+        if importedTraceFormat != "truth_trace_v2" && importedTraceFormat != "r2c-truth-trace-v1":
+            r2cControllerPrintErr("r2c-react: capture-truth unsupported truth trace format: " + importedTraceFormat)
+            return 1
+        var matched: R2cTruthSnapshotMatch
+        if !r2cControllerFindTruthSnapshotMatch(truthDocText, routeState, matched):
+            r2cControllerPrintErr("r2c-react: capture-truth invalid truth trace snapshots: " + truthTracePathImported)
+            return 1
+        if !matched.found:
+            r2cControllerPrintErr("r2c-react: capture-truth truth trace missing route: " + routeState)
+            return 1
+        var runtimeStatePathImported = ""
+        var domPathImported = ""
+        var semanticNodesPathImported = ""
+        var runtimeMetaPathImported = ""
+        var screenshotPathImported = ""
+        if strings.Len(runtimeStateFlag) > 0:
+            runtimeStatePathImported = chengpath.PathAbsolute(currentDir, runtimeStateFlag)
+            if !chengpath.PathFileExists(runtimeStatePathImported):
+                r2cControllerPrintErr("r2c-react: capture-truth missing runtime state: " + runtimeStatePathImported)
+                return 1
+        if strings.Len(domFlag) > 0:
+            domPathImported = chengpath.PathAbsolute(currentDir, domFlag)
+            if !chengpath.PathFileExists(domPathImported):
+                r2cControllerPrintErr("r2c-react: capture-truth missing dom: " + domPathImported)
+                return 1
+        if strings.Len(semanticNodesFlag) > 0:
+            semanticNodesPathImported = chengpath.PathAbsolute(currentDir, semanticNodesFlag)
+            if !chengpath.PathFileExists(semanticNodesPathImported):
+                r2cControllerPrintErr("r2c-react: capture-truth missing semantic nodes: " + semanticNodesPathImported)
+                return 1
+        elif strings.Len(matched.semanticNodesPath) > 0:
+            semanticNodesPathImported = chengpath.PathAbsolute(chengpath.PathParentDir(truthTracePathImported), matched.semanticNodesPath)
+        if strings.Len(runtimeMetaFlag) > 0:
+            runtimeMetaPathImported = chengpath.PathAbsolute(currentDir, runtimeMetaFlag)
+            if !chengpath.PathFileExists(runtimeMetaPathImported):
+                r2cControllerPrintErr("r2c-react: capture-truth missing runtime meta: " + runtimeMetaPathImported)
+                return 1
+        if strings.Len(screenshotFlag) > 0:
+            screenshotPathImported = chengpath.PathAbsolute(currentDir, screenshotFlag)
+            if !chengpath.PathFileExists(screenshotPathImported):
+                r2cControllerPrintErr("r2c-react: capture-truth missing screenshot: " + screenshotPathImported)
+                return 1
+        var semanticNodesCountImported: int32 = matched.semanticNodesCount
+        if strings.Len(semanticNodesPathImported) > 0 && chengpath.PathFileExists(semanticNodesPathImported):
+            let semanticNodesText: str = chengpath.ReadTextFile("", semanticNodesPathImported)
+            let semanticFileCount: int32 = r2cControllerJsonReadIntField(semanticNodesText, "count", 0)
+            if semanticFileCount > 0:
+                semanticNodesCountImported = semanticFileCount
+        var summaryText = ""
+        summaryText = summaryText + "truth_trace_path=" + truthTracePathImported + "\n"
+        summaryText = summaryText + "truth_trace_format=" + importedTraceFormat + "\n"
+        summaryText = summaryText + "truth_trace_state_count=" + intToStr(r2cControllerTruthTraceSnapshotCount(truthDocText)) + "\n"
+        summaryText = summaryText + "runtime_state_path=" + runtimeStatePathImported + "\n"
+        summaryText = summaryText + "dom_path=" + domPathImported + "\n"
+        summaryText = summaryText + "semantic_nodes_path=" + semanticNodesPathImported + "\n"
+        summaryText = summaryText + "runtime_meta_path=" + runtimeMetaPathImported + "\n"
+        summaryText = summaryText + "screenshot_path=" + screenshotPathImported + "\n"
+        summaryText = summaryText + "semantic_nodes_count=" + intToStr(semanticNodesCountImported) + "\n"
+        summaryText = summaryText + "document_nodes_count=0\n"
+        summaryText = summaryText + "dom_hash=\n"
+        summaryText = summaryText + "screenshot_sha256=\n"
+        summaryText = summaryText + "pathname=\n"
+        summaryText = summaryText + "search=\n"
+        summaryText = summaryText + "hash=\n"
+        if !chengpath.WriteTextFile("", summaryPath, summaryText):
+            r2cControllerPrintErr("r2c-react: capture-truth failed to write truth summary: " + summaryPath)
+            return 1
+    let capturedTruthTracePath: str = r2cControllerReadSummaryValue(summaryPath, "truth_trace_path", "")
+    let capturedTruthTraceFormat: str = r2cControllerReadSummaryValue(summaryPath, "truth_trace_format", "")
+    if strings.Len(capturedTruthTracePath) <= 0 || !chengpath.PathFileExists(capturedTruthTracePath):
+        r2cControllerPrintErr("r2c-react: capture-truth imported summary references missing truth trace: " + capturedTruthTracePath)
+        return 1
+    if capturedTruthTraceFormat != "truth_trace_v2" && capturedTruthTraceFormat != "r2c-truth-trace-v1":
+        r2cControllerPrintErr("r2c-react: capture-truth imported summary has unsupported trace format: " + capturedTruthTraceFormat)
         return 1
 
     let truthTracePath: str = r2cControllerReadSummaryValue(summaryPath, "truth_trace_path", "")
@@ -3404,10 +3447,12 @@ fn r2cControllerCaptureTruth(root: str,
     report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
     report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
     report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
-    report = report + "  \"node_program\": \"node\",\n"
-    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helperScript) + ",\n"
+    report = report + "  \"node_program\": \"\",\n"
+    report = report + "  \"helper_script\": \"\",\n"
+    report = report + "  \"truth_runtime_mode\": \"cheng.capture_truth_import_v1\",\n"
+    report = report + "  \"truth_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
     report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
-    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
+    report = report + "  \"helper_log_path\": \"\",\n"
     report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(truthTracePath) + ",\n"
     report = report + "  \"primary_artifact_format\": " + r2cControllerJsonQuote(truthTraceFormat) + ",\n"
     report = report + "  \"module_count\": 0,\n"
@@ -3441,7 +3486,6 @@ fn r2cControllerCaptureTruth(root: str,
 
 fn r2cControllerCompareTruthCompat(root: str,
                                    args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let execSnapshotRaw: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--exec-snapshot", ""))
@@ -3602,7 +3646,6 @@ fn r2cControllerCompareTruthCompat(root: str,
 
 fn r2cControllerExecRouteMatrix(root: str,
                                 args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let tsxAstRaw: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--tsx-ast", ""))
@@ -3675,7 +3718,6 @@ fn r2cControllerExecRouteMatrix(root: str,
 
 fn r2cControllerCompareTruthMatrixCompat(root: str,
                                          args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let execRouteMatrixRaw: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--exec-route-matrix", ""))
@@ -3746,7 +3788,6 @@ fn r2cControllerCompareTruthMatrixCompat(root: str,
 
 fn r2cControllerTruthCompare(root: str,
                              args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let repoBase: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--repo", currentDir))
@@ -4252,6 +4293,590 @@ fn r2cControllerStringArrayJsonInline(items: str[]): str =
         out = out + r2cControllerJsonQuote(items[i])
     out = out + "]"
     return out
+
+fn r2cControllerTsxFrontendFeatureNames(): str[] =
+    var out: str[]
+    add(out, "class_component")
+    add(out, "error_boundary")
+    add(out, "use_state")
+    add(out, "use_effect")
+    add(out, "use_memo")
+    add(out, "use_callback")
+    add(out, "use_ref")
+    add(out, "use_context")
+    add(out, "suspense")
+    add(out, "memo")
+    add(out, "strict_mode")
+    add(out, "local_storage")
+    add(out, "fetch")
+    add(out, "resize_observer")
+    add(out, "mutation_observer")
+    add(out, "custom_event")
+    add(out, "rtc")
+    add(out, "media")
+    add(out, "broadcast_channel")
+    add(out, "worker")
+    add(out, "webassembly")
+    add(out, "capacitor")
+    add(out, "zustand")
+    add(out, "radix")
+    add(out, "react_three")
+    return out
+
+fn r2cControllerTsxFrontendIsSourceExt(ext: str): bool =
+    return ext == ".ts" || ext == ".tsx" || ext == ".js" || ext == ".jsx" || ext == ".mjs" || ext == ".cjs"
+
+fn r2cControllerTsxFrontendIsAssetExt(ext: str): bool =
+    return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" ||
+           ext == ".webp" || ext == ".svg" || ext == ".ico" || ext == ".woff" ||
+           ext == ".woff2" || ext == ".ttf" || ext == ".otf" || ext == ".wasm" ||
+           ext == ".mp3" || ext == ".wav" || ext == ".ogg" || ext == ".mp4" ||
+           ext == ".webm" || ext == ".html" || ext == ".css" || ext == ".json"
+
+fn r2cControllerTsxFrontendAssetKind(ext: str): str =
+    if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" ||
+       ext == ".webp" || ext == ".svg" || ext == ".ico":
+        return "image"
+    if ext == ".woff" || ext == ".woff2" || ext == ".ttf" || ext == ".otf":
+        return "font"
+    if ext == ".wasm":
+        return "wasm"
+    if ext == ".mp3" || ext == ".wav" || ext == ".ogg":
+        return "audio"
+    if ext == ".mp4" || ext == ".webm":
+        return "video"
+    if ext == ".html":
+        return "html"
+    if ext == ".css":
+        return "css"
+    if ext == ".json":
+        return "json"
+    return "other"
+
+fn r2cControllerTsxFrontendSkipDirName(name: str): bool =
+    return name == "node_modules" || name == "dist" || name == "build" ||
+           name == "artifacts" || name == ".git" || name == ".build" ||
+           name == ".tmp-deploy"
+
+fn r2cControllerTsxFrontendIsGeneratedPath(relPath: str): bool =
+    return relPath == "pkg" || chengpath.TextStartsWith(relPath, "pkg/") ||
+           chengpath.TextContains(relPath, "/pkg/") ||
+           chengpath.TextStartsWith(relPath, "pkg\\") ||
+           chengpath.TextContains(relPath, "_wasm.js") ||
+           chengpath.TextContains(relPath, "_bg.js")
+
+fn r2cControllerTsxFrontendIsTestPath(relPath: str): bool =
+    return chengpath.TextContains(relPath, "/__tests__/") ||
+           chengpath.TextStartsWith(relPath, "__tests__/") ||
+           chengpath.TextContains(relPath, ".test.") ||
+           chengpath.TextContains(relPath, ".spec.")
+
+fn r2cControllerTsxFrontendShouldIncludeSource(relPath: str,
+                                               ext: str): bool =
+    if !r2cControllerTsxFrontendIsSourceExt(ext):
+        return false
+    if chengpath.TextContains(relPath, ".d.ts"):
+        return false
+    if r2cControllerTsxFrontendIsTestPath(relPath):
+        return false
+    return true
+
+fn r2cControllerTsxFrontendSourceRootForPath(relPath: str,
+                                             roots: str[]): str =
+    for i in 0..<roots.len:
+        let root = roots[i]
+        if root == ".":
+            return "."
+        if relPath == root || chengpath.TextStartsWith(relPath, root + "/"):
+            return root
+    return ""
+
+fn r2cControllerTsxFrontendAddSourceFile(repo: str,
+                                         roots: str[],
+                                         fullPath: str,
+                                         out: var str[]) =
+    let relPath = os.RelativePath(fullPath, repo)
+    if !r2cControllerPathUnderRoots(relPath, roots):
+        return
+    let split = chengpath.PathSplitFile(relPath)
+    if !r2cControllerTsxFrontendShouldIncludeSource(relPath, split.ext):
+        return
+    if r2cControllerTsxFrontendIsGeneratedPath(relPath):
+        return
+    r2cControllerAddUniqueString(out, fullPath)
+
+fn r2cControllerTsxFrontendWalkSources(repo: str,
+                                       roots: str[],
+                                       current: str,
+                                       out: var str[]) =
+    let entries = os.WalkDir(current)
+    for i in 0..<entries.len:
+        let entry = os.WalkDirEntry(entries, i)
+        let kind = os.WalkDirEntryKind(entry)
+        let fullPath = os.WalkDirEntryPath(entry)
+        let base = chengpath.PathBaseName(fullPath)
+        if kind == os.PathComponent(1) || kind == os.PathComponent(3):
+            if !r2cControllerTsxFrontendSkipDirName(base):
+                r2cControllerTsxFrontendWalkSources(repo, roots, fullPath, out)
+        elif kind == os.PathComponent(0) || kind == os.PathComponent(2):
+            r2cControllerTsxFrontendAddSourceFile(repo, roots, fullPath, out)
+
+fn r2cControllerTsxFrontendCollectSourceFiles(repo: str,
+                                              roots: str[],
+                                              out: var str[]) =
+    for i in 0..<roots.len:
+        let root = roots[i]
+        var start = repo
+        if root != ".":
+            start = os.JoinPath(repo, root)
+        if os.DirExists(start):
+            r2cControllerTsxFrontendWalkSources(repo, roots, start, out)
+
+fn r2cControllerTsxFrontendCountOccurrences(text: str,
+                                            needle: str): int32 =
+    var count: int32
+    var cursor: int32
+    while true:
+        let pos = r2cControllerTextFind(text, needle, cursor)
+        if pos < 0:
+            break
+        count = count + 1
+        cursor = pos + strings.Len(needle)
+    return count
+
+fn r2cControllerTsxFrontendFeatureCount(text: str,
+                                        featureName: str): int32 =
+    if featureName == "class_component":
+        return r2cControllerTsxFrontendCountOccurrences(text, "extends React.Component") +
+               r2cControllerTsxFrontendCountOccurrences(text, "extends Component")
+    if featureName == "error_boundary":
+        return r2cControllerTsxFrontendCountOccurrences(text, "componentDidCatch") +
+               r2cControllerTsxFrontendCountOccurrences(text, "getDerivedStateFromError")
+    if featureName == "use_state": return r2cControllerTsxFrontendCountOccurrences(text, "useState")
+    if featureName == "use_effect": return r2cControllerTsxFrontendCountOccurrences(text, "useEffect")
+    if featureName == "use_memo": return r2cControllerTsxFrontendCountOccurrences(text, "useMemo")
+    if featureName == "use_callback": return r2cControllerTsxFrontendCountOccurrences(text, "useCallback")
+    if featureName == "use_ref": return r2cControllerTsxFrontendCountOccurrences(text, "useRef")
+    if featureName == "use_context":
+        return r2cControllerTsxFrontendCountOccurrences(text, "useContext") +
+               r2cControllerTsxFrontendCountOccurrences(text, "createContext")
+    if featureName == "suspense":
+        return r2cControllerTsxFrontendCountOccurrences(text, "Suspense") +
+               r2cControllerTsxFrontendCountOccurrences(text, "lazy(")
+    if featureName == "memo": return r2cControllerTsxFrontendCountOccurrences(text, "memo(")
+    if featureName == "strict_mode": return r2cControllerTsxFrontendCountOccurrences(text, "StrictMode")
+    if featureName == "local_storage": return r2cControllerTsxFrontendCountOccurrences(text, "localStorage")
+    if featureName == "fetch": return r2cControllerTsxFrontendCountOccurrences(text, "fetch")
+    if featureName == "resize_observer": return r2cControllerTsxFrontendCountOccurrences(text, "ResizeObserver")
+    if featureName == "mutation_observer": return r2cControllerTsxFrontendCountOccurrences(text, "MutationObserver")
+    if featureName == "custom_event": return r2cControllerTsxFrontendCountOccurrences(text, "CustomEvent")
+    if featureName == "rtc": return r2cControllerTsxFrontendCountOccurrences(text, "RTCPeerConnection")
+    if featureName == "media":
+        return r2cControllerTsxFrontendCountOccurrences(text, "getUserMedia") +
+               r2cControllerTsxFrontendCountOccurrences(text, "MediaStream")
+    if featureName == "broadcast_channel": return r2cControllerTsxFrontendCountOccurrences(text, "BroadcastChannel")
+    if featureName == "worker": return r2cControllerTsxFrontendCountOccurrences(text, "Worker")
+    if featureName == "webassembly": return r2cControllerTsxFrontendCountOccurrences(text, "WebAssembly")
+    if featureName == "capacitor": return r2cControllerTsxFrontendCountOccurrences(text, "@capacitor/")
+    if featureName == "zustand": return r2cControllerTsxFrontendCountOccurrences(text, "zustand")
+    if featureName == "radix": return r2cControllerTsxFrontendCountOccurrences(text, "@radix-ui/")
+    if featureName == "react_three":
+        return r2cControllerTsxFrontendCountOccurrences(text, "@react-three/") +
+               r2cControllerTsxFrontendCountOccurrences(text, "three")
+    return 0
+
+fn r2cControllerTsxFrontendLineStartsUpper(name: str): bool =
+    if strings.Len(name) <= 0:
+        return false
+    let code = int32(name[0])
+    return code >= int32(char(65)) && code <= int32(char(90))
+
+fn r2cControllerTsxFrontendWhitespace(ch: char): bool =
+    return ch == ' ' || ch == char(9) || ch == char(10) || ch == char(13)
+
+fn r2cControllerTsxFrontendIdentifierChar(ch: char): bool =
+    if r2cControllerAsciiIdentChar(ch):
+        return true
+    return ch == '_' || ch == '$'
+
+fn r2cControllerTsxFrontendIdentifierAfter(line: str,
+                                           marker: str): str =
+    let pos = r2cControllerTextFind(line, marker, 0)
+    if pos < 0:
+        return ""
+    var cursor = pos + strings.Len(marker)
+    while cursor < strings.Len(line) && r2cControllerTsxFrontendWhitespace(line[cursor]):
+        cursor = cursor + 1
+    var out = ""
+    while cursor < strings.Len(line) && r2cControllerTsxFrontendIdentifierChar(line[cursor]):
+        out = out + strings.CharToStr(line[cursor])
+        cursor = cursor + 1
+    if !r2cControllerTsxFrontendLineStartsUpper(out):
+        return ""
+    return out
+
+fn r2cControllerTsxFrontendAddComponentLine(relPath: str,
+                                            lineText: str,
+                                            lineNum: int32,
+                                            keySeen: var str[],
+                                            componentJson: var str,
+                                            componentTsv: var str,
+                                            componentCount: var int32) =
+    var name = r2cControllerTsxFrontendIdentifierAfter(lineText, "function ")
+    var kind = "function"
+    if strings.Len(name) <= 0:
+        name = r2cControllerTsxFrontendIdentifierAfter(lineText, "export function ")
+        kind = "function"
+    if strings.Len(name) <= 0:
+        name = r2cControllerTsxFrontendIdentifierAfter(lineText, "const ")
+        kind = "function"
+    if strings.Len(name) <= 0:
+        name = r2cControllerTsxFrontendIdentifierAfter(lineText, "export const ")
+        kind = "function"
+    if strings.Len(name) <= 0:
+        name = r2cControllerTsxFrontendIdentifierAfter(lineText, "class ")
+        kind = "class"
+    if strings.Len(name) <= 0:
+        name = r2cControllerTsxFrontendIdentifierAfter(lineText, "export class ")
+        kind = "class"
+    if strings.Len(name) <= 0:
+        return
+    let key = name + ":" + intToStr(lineNum)
+    for i in 0..<keySeen.len:
+        if keySeen[i] == key:
+            return
+    add(keySeen, key)
+    if componentCount > 0:
+        componentJson = componentJson + ", "
+    componentJson = componentJson + "{\"name\":" + r2cControllerJsonQuote(name)
+    componentJson = componentJson + ",\"kind\":" + r2cControllerJsonQuote(kind)
+    componentJson = componentJson + ",\"line\":" + intToStr(lineNum) + "}"
+    componentTsv = componentTsv + relPath + "\t" + name + "\t" + kind + "\t" + intToStr(lineNum) + "\n"
+    componentCount = componentCount + 1
+
+fn r2cControllerTsxFrontendAddClassTokens(raw: str,
+                                          tokens: var str[]) =
+    var start: int32
+    var i: int32
+    while i <= strings.Len(raw):
+        let endHit = i == strings.Len(raw) || r2cControllerTsxFrontendWhitespace(raw[i])
+        if !endHit:
+            i = i + 1
+            continue
+        let count = i - start
+        if count > 0:
+            let token = chengpath.TextSlice(raw, start, count)
+            r2cControllerAddUniqueString(tokens, token)
+        start = i + 1
+        i = i + 1
+
+fn r2cControllerTsxFrontendCollectClassTokens(text: str,
+                                              needle: str,
+                                              quote: char,
+                                              tokens: var str[]) =
+    var cursor: int32
+    while true:
+        let pos = r2cControllerTextFind(text, needle, cursor)
+        if pos < 0:
+            break
+        let start = pos + strings.Len(needle)
+        var end = start
+        while end < strings.Len(text) && text[end] != quote:
+            end = end + 1
+        if end > start:
+            r2cControllerTsxFrontendAddClassTokens(chengpath.TextSlice(text, start, end - start), tokens)
+        cursor = end + 1
+
+fn r2cControllerTsxFrontendBlockers(relPath: str,
+                                    text: str): str =
+    var out = ""
+    if r2cControllerTextFind(text, "eval(", 0) >= 0:
+        out = out + relPath + "\t" + relPath + "\t1\t1\tjs_eval\n"
+    if r2cControllerTextFind(text, "require(", 0) >= 0:
+        out = out + relPath + "\t" + relPath + "\t1\t1\tjs_dynamic_require\n"
+    if r2cControllerTextFind(text, "new Function", 0) >= 0:
+        out = out + relPath + "\t" + relPath + "\t1\t1\tjs_new_function\n"
+    if r2cControllerTextFind(text, "new Proxy", 0) >= 0:
+        out = out + relPath + "\t" + relPath + "\t1\t1\tjs_proxy\n"
+    if r2cControllerTextFind(text, "with (", 0) >= 0:
+        out = out + relPath + "\t" + relPath + "\t1\t1\tjs_with_statement\n"
+    if r2cControllerTextFind(text, "module.exports", 0) >= 0:
+        out = out + relPath + "\t" + relPath + "\t1\t1\tjs_cjs_exports\n"
+    if r2cControllerTextFind(text, "__proto__", 0) >= 0 ||
+       r2cControllerTextFind(text, ".prototype =", 0) >= 0:
+        out = out + relPath + "\t" + relPath + "\t1\t1\tjs_prototype_mutation\n"
+    return out
+
+fn r2cControllerTsxFrontendWriteFeedFiles(outDir: str,
+                                          repo: str,
+                                          roots: str[],
+                                          tsVersion: str,
+                                          moduleCount: int32,
+                                          moduleLines: str,
+                                          featureLines: str,
+                                          componentLines: str,
+                                          blockerLines: str,
+                                          tailwindLines: str,
+                                          discoveredAssetLines: str): bool =
+    let sourceRootsCsv = strutil.Join(roots, ",")
+    let metaPath = os.JoinPath(outDir, "tsx_surface_meta_v1.env")
+    var meta = ""
+    meta = meta + "format=tsx_surface_feed_v1\n"
+    meta = meta + "repo_root=" + repo + "\n"
+    meta = meta + "source_roots=" + sourceRootsCsv + "\n"
+    meta = meta + "typescript_version=" + tsVersion + "\n"
+    meta = meta + "module_count=" + intToStr(moduleCount) + "\n"
+    if !chengpath.WriteTextFile("", metaPath, meta): return false
+    if !chengpath.WriteTextFile("", os.JoinPath(outDir, "tsx_surface_modules_v1.tsv"), moduleLines): return false
+    if !chengpath.WriteTextFile("", os.JoinPath(outDir, "tsx_surface_feature_counts_v1.tsv"), featureLines): return false
+    if !chengpath.WriteTextFile("", os.JoinPath(outDir, "tsx_surface_static_imports_v1.tsv"), ""): return false
+    if !chengpath.WriteTextFile("", os.JoinPath(outDir, "tsx_surface_dynamic_imports_v1.tsv"), ""): return false
+    if !chengpath.WriteTextFile("", os.JoinPath(outDir, "tsx_surface_asset_refs_v1.tsv"), ""): return false
+    if !chengpath.WriteTextFile("", os.JoinPath(outDir, "tsx_surface_components_v1.tsv"), componentLines): return false
+    if !chengpath.WriteTextFile("", os.JoinPath(outDir, "tsx_surface_blockers_v1.tsv"), blockerLines): return false
+    if !chengpath.WriteTextFile("", os.JoinPath(outDir, "tsx_surface_tailwind_tokens_v1.tsv"), tailwindLines): return false
+    if !chengpath.WriteTextFile("", os.JoinPath(outDir, "tsx_surface_discovered_assets_v1.tsv"), discoveredAssetLines): return false
+    return true
+
+fn r2cControllerTsxFrontendCollectDiscoveredAssets(repo: str,
+                                                   roots: str[]): str =
+    var assetRoots: str[]
+    for i in 0..<roots.len:
+        r2cControllerAddUniqueString(assetRoots, roots[i])
+    r2cControllerAddUniqueString(assetRoots, "public")
+    r2cControllerAddUniqueString(assetRoots, "styles")
+    var out = ""
+    for i in 0..<assetRoots.len:
+        let root = assetRoots[i]
+        var start = repo
+        if root != ".":
+            start = os.JoinPath(repo, root)
+        if !os.DirExists(start):
+            continue
+        let entries = os.WalkDirRec(start)
+        for j in 0..<entries.len:
+            let entry = os.WalkDirEntry(entries, j)
+            let kind = os.WalkDirEntryKind(entry)
+            if kind != os.PathComponent(0) && kind != os.PathComponent(2):
+                continue
+            let fullPath = os.WalkDirEntryPath(entry)
+            let relPath = os.RelativePath(fullPath, repo)
+            let split = chengpath.PathSplitFile(relPath)
+            if r2cControllerTsxFrontendIsAssetExt(split.ext) && !r2cControllerTsxFrontendIsSourceExt(split.ext):
+                out = out + relPath + "\t" + r2cControllerTsxFrontendAssetKind(split.ext) + "\n"
+    return out
+
+fn r2cControllerFlag01(value: bool): str =
+    if value:
+        return "1"
+    return "0"
+
+fn r2cControllerTsxFrontendComponentsForText(relPath: str,
+                                             text: str,
+                                             componentJson: var str,
+                                             componentLines: var str) =
+    componentJson = ""
+    componentLines = ""
+    var componentSeen: str[]
+    var componentCount: int32
+    let lines = strutil.Split(text, char(10))
+    for lineIndex in 0..<lines.len:
+        r2cControllerTsxFrontendAddComponentLine(relPath,
+                                                 lines[lineIndex],
+                                                 lineIndex + 1,
+                                                 componentSeen,
+                                                 componentJson,
+                                                 componentLines,
+                                                 componentCount)
+
+fn r2cControllerTsxFrontendCollectAllClassTokens(text: str,
+                                                 classTokens: var str[]) =
+    r2cControllerTsxFrontendCollectClassTokens(text, "className=\"", char(34), classTokens)
+    r2cControllerTsxFrontendCollectClassTokens(text, "class=\"", char(34), classTokens)
+    r2cControllerTsxFrontendCollectClassTokens(text, "className='", char(39), classTokens)
+    r2cControllerTsxFrontendCollectClassTokens(text, "class='", char(39), classTokens)
+
+fn r2cControllerTsxFrontendClassTokenLines(relPath: str,
+                                           classTokens: str[]): str =
+    var out = ""
+    for tokenIndex in 0..<classTokens.len:
+        out = out + relPath + "\t" + classTokens[tokenIndex] + "\n"
+    return out
+
+fn r2cControllerTsxFrontendFeatureJson(relPath: str,
+                                       text: str,
+                                       featureNames: str[],
+                                       featureLines: var str): str =
+    featureLines = ""
+    var out = "{"
+    for featureIndex in 0..<featureNames.len:
+        let featureName = featureNames[featureIndex]
+        let count = r2cControllerTsxFrontendFeatureCount(text, featureName)
+        if featureIndex > 0:
+            out = out + ","
+        out = out + r2cControllerJsonQuote(featureName) + ":" + intToStr(count)
+        if count > 0:
+            featureLines = featureLines + relPath + "\t" + featureName + "\t" + intToStr(count) + "\n"
+    out = out + "}"
+    return out
+
+fn r2cControllerTsxFrontendModuleJson(relPath: str,
+                                      ext: str,
+                                      runtimeRoot: str,
+                                      generated: bool,
+                                      jsxLike: bool,
+                                      featureJson: str,
+                                      componentJson: str,
+                                      classTokens: str[],
+                                      exportCount: int32): str =
+    var out = "  {"
+    out = out + "\"path\":" + r2cControllerJsonQuote(relPath)
+    out = out + ",\"hash\":\"\""
+    out = out + ",\"ext\":" + r2cControllerJsonQuote(ext)
+    out = out + ",\"runtime_root\":" + r2cControllerJsonQuote(runtimeRoot)
+    out = out + ",\"generated\":" + r2cControllerJsonBool(generated)
+    out = out + ",\"jsx_like\":" + r2cControllerJsonBool(jsxLike)
+    out = out + ",\"static_imports\":[]"
+    out = out + ",\"dynamic_imports\":[]"
+    out = out + ",\"asset_refs\":[]"
+    out = out + ",\"features\":{}"
+    out = out + ",\"feature_counts\":" + featureJson
+    out = out + ",\"components\":[" + componentJson + "]"
+    out = out + ",\"blockers\":[]"
+    out = out + ",\"imports\":[]"
+    out = out + ",\"hook_calls\":[]"
+    out = out + ",\"jsx_elements\":[]"
+    out = out + ",\"tailwind_class_tokens\":" + r2cControllerStringArrayJsonInline(classTokens)
+    out = out + ",\"tailwind_class_token_count\":" + intToStr(classTokens.len)
+    out = out + ",\"export_count\":" + intToStr(exportCount)
+    out = out + "}"
+    return out
+
+fn r2cControllerTsxFrontendAppendModule(repo: str,
+                                        runtimeRoots: str[],
+                                        featureNames: str[],
+                                        fullPath: str,
+                                        accum: var R2cTsxFrontendSeedAccum) =
+    let relPath = os.RelativePath(fullPath, repo)
+    let split = chengpath.PathSplitFile(relPath)
+    let text = chengpath.ReadTextFile("", fullPath)
+    let generated = r2cControllerTsxFrontendIsGeneratedPath(relPath)
+    let jsxLike = split.ext == ".tsx" || split.ext == ".jsx" ||
+                  r2cControllerTextFind(text, "<", 0) >= 0
+    let exportCount = r2cControllerTsxFrontendCountOccurrences(text, "export ")
+    var componentJson = ""
+    var componentLines = ""
+    r2cControllerTsxFrontendComponentsForText(relPath, text, componentJson, componentLines)
+    var classTokens: str[]
+    r2cControllerTsxFrontendCollectAllClassTokens(text, classTokens)
+    var featureLines = ""
+    let featureJson = r2cControllerTsxFrontendFeatureJson(relPath, text, featureNames, featureLines)
+    accum.componentLines = accum.componentLines + componentLines
+    accum.tailwindLines = accum.tailwindLines + r2cControllerTsxFrontendClassTokenLines(relPath, classTokens)
+    accum.featureLines = accum.featureLines + featureLines
+    accum.blockerLines = accum.blockerLines + r2cControllerTsxFrontendBlockers(relPath, text)
+    accum.moduleLines = accum.moduleLines + relPath + "\t" + r2cControllerFlag01(generated) + "\t" +
+                        r2cControllerFlag01(jsxLike) + "\t" + intToStr(exportCount) + "\n"
+    if accum.moduleCount > 0:
+        accum.modulesJson = accum.modulesJson + ",\n"
+    accum.modulesJson = accum.modulesJson + r2cControllerTsxFrontendModuleJson(relPath,
+                                                                               split.ext,
+                                                                               r2cControllerTsxFrontendSourceRootForPath(relPath, runtimeRoots),
+                                                                               generated,
+                                                                               jsxLike,
+                                                                               featureJson,
+                                                                               componentJson,
+                                                                               classTokens,
+                                                                               exportCount)
+    accum.moduleCount = accum.moduleCount + 1
+
+fn r2cControllerWriteChengTsxFrontendSeed(effectiveRoot: str,
+                                          repo: str,
+                                          outDir: str,
+                                          requestedRuntimeRoots: str[],
+                                          artifactPath: str,
+                                          summaryPath: str,
+                                          reportPath: str): bool =
+    if !os.DirExists(repo):
+        r2cControllerPrintErr("r2c-react: missing repo: " + repo)
+        return false
+    if !chengpath.MkdirP("", outDir):
+        r2cControllerPrintErr("r2c-react: Cheng TSX frontend failed to create out dir: " + outDir)
+        return false
+    var runtimeRoots: str[]
+    if !r2cControllerNormalizeRuntimeRoots(repo, requestedRuntimeRoots, runtimeRoots):
+        return false
+    var sourceFiles: str[]
+    r2cControllerTsxFrontendCollectSourceFiles(repo, runtimeRoots, sourceFiles)
+    if sourceFiles.len <= 0:
+        r2cControllerPrintErr("r2c-react: Cheng TSX frontend found no source files")
+        return false
+    let tsVersion = r2cControllerTypeScriptVersionFromRepo(repo)
+    let featureNames = r2cControllerTsxFrontendFeatureNames()
+    var accum: R2cTsxFrontendSeedAccum
+    accum.modulesJson = "[\n"
+    for i in 0..<sourceFiles.len:
+        r2cControllerTsxFrontendAppendModule(repo, runtimeRoots, featureNames, sourceFiles[i], accum)
+    accum.modulesJson = accum.modulesJson + "\n]"
+    let discoveredAssetLines = r2cControllerTsxFrontendCollectDiscoveredAssets(repo, runtimeRoots)
+    if !r2cControllerTsxFrontendWriteFeedFiles(outDir,
+                                               repo,
+                                               runtimeRoots,
+                                               tsVersion,
+                                               accum.moduleCount,
+                                               accum.moduleLines,
+                                               accum.featureLines,
+                                               accum.componentLines,
+                                               accum.blockerLines,
+                                               accum.tailwindLines,
+                                               discoveredAssetLines):
+        r2cControllerPrintErr("r2c-react: Cheng TSX frontend failed to write feed files")
+        return false
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"tsx_ast_v1\",\n"
+    doc = doc + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    doc = doc + "  \"source_roots\": " + r2cControllerStringArrayJsonInline(runtimeRoots) + ",\n"
+    doc = doc + "  \"typescript_version\": " + r2cControllerJsonQuote(tsVersion) + ",\n"
+    doc = doc + "  \"frontend_mode\": \"cheng.tsx_frontend_seed_v1\",\n"
+    doc = doc + "  \"modules\": " + accum.modulesJson + "\n"
+    doc = doc + "}\n"
+    if !chengpath.WriteTextFile("", artifactPath, doc):
+        r2cControllerPrintErr("r2c-react: Cheng TSX frontend failed to write artifact: " + artifactPath)
+        return false
+    var summary = ""
+    summary = summary + "format=tsx_ast_v1\n"
+    summary = summary + "repo_root=" + repo + "\n"
+    summary = summary + "source_roots=" + strutil.Join(runtimeRoots, ",") + "\n"
+    summary = summary + "typescript_version=" + tsVersion + "\n"
+    summary = summary + "module_count=" + intToStr(accum.moduleCount) + "\n"
+    summary = summary + "frontend_mode=cheng.tsx_frontend_seed_v1\n"
+    summary = summary + "out_path=" + artifactPath + "\n"
+    if !chengpath.WriteTextFile("", summaryPath, summary):
+        r2cControllerPrintErr("r2c-react: Cheng TSX frontend failed to write summary: " + summaryPath)
+        return false
+    if strings.Len(reportPath) > 0:
+        var report = "{\n"
+        report = report + "  \"format\": \"controller_report_v1\",\n"
+        report = report + "  \"controller\": \"cheng.live_controller\",\n"
+        report = report + "  \"command\": \"frontend\",\n"
+        report = report + "  \"ok\": true,\n"
+        report = report + "  \"reason\": \"ok\",\n"
+        report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+        report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+        report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+        report = report + "  \"frontend_mode\": \"cheng.tsx_frontend_seed_v1\",\n"
+        report = report + "  \"helper_script\": \"\",\n"
+        report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+        report = report + "  \"helper_log_path\": \"\",\n"
+        report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(artifactPath) + ",\n"
+        report = report + "  \"primary_artifact_format\": \"tsx_ast_v1\",\n"
+        report = report + "  \"module_count\": " + intToStr(accum.moduleCount) + ",\n"
+        report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(tsVersion) + "\n"
+        report = report + "}\n"
+        if !chengpath.WriteTextFile("", reportPath, report):
+            r2cControllerPrintErr("r2c-react: Cheng TSX frontend failed to write report: " + reportPath)
+            return false
+    return true
 
 fn r2cControllerJsonRouteIdsFromTruthRoutes(truthRoutesText: str,
                                             out: var str[]): bool =
@@ -5065,7 +5690,10 @@ fn r2cControllerNativeGuiLayoutSurfaceNodesJson(jsxElementsRaw: str,
     outComponentCount = 0
     outControlCount = 0
     var out = "[\n"
-    out = out + "    {\"id\":\"node_mount_root\",\"kind\":\"tree_element\",\"label\":\"<div>\",\"detail_text\":\"element\",\"tag\":\"div\",\"line\":0,\"depth\":0,\"module_path\":\"\",\"component_name\":\"\",\"layout_role\":\"element\",\"style_traits\":[],\"class_preview\":\"\",\"class_tokens\":[],\"attr_names\":[]}"
+    out = out + "    {\"id\":\"node_mount_root\",\"kind\":\"tree_element\",\"label\":\"<div>\",\"detail_text\":\"element\",\"tag\":\"div\",\"line\":0,\"depth\":0,"
+    out = out + "\"module_path\":" + r2cControllerJsonQuote(sourceModulePath) + ","
+    out = out + "\"component_name\":" + r2cControllerJsonQuote(sourceComponentName) + ","
+    out = out + "\"layout_role\":\"element\",\"style_traits\":[],\"class_preview\":\"\",\"class_tokens\":[],\"attr_names\":[]}"
     var itemRaw: str
     var cursor: int32
     var nextPos: int32
@@ -5115,7 +5743,10 @@ fn r2cControllerNativeGuiStyleSurfaceNodesJson(jsxElementsRaw: str,
     outSurfaceCount = 0
     outControlCount = 0
     var out = "[\n"
-    out = out + "    {\"id\":\"node_mount_root\",\"source_node_id\":\"node_mount_root\",\"kind\":\"tree_element\",\"tag\":\"div\",\"visual_role\":\"inline\",\"density\":\"regular\",\"prominence\":\"medium\",\"accent_tone\":\"neutral\",\"background_color\":\"#ffffff\",\"border_color\":\"#d5e2f0\",\"text_color\":\"#334e68\",\"detail_color\":\"#6b7f95\",\"font_size\":13,\"font_weight\":\"regular\",\"corner_radius\":10,\"module_path\":\"\",\"component_name\":\"\",\"line\":0}"
+    out = out + "    {\"id\":\"node_mount_root\",\"source_node_id\":\"node_mount_root\",\"kind\":\"tree_element\",\"tag\":\"div\",\"visual_role\":\"inline\",\"density\":\"regular\",\"prominence\":\"medium\",\"accent_tone\":\"neutral\",\"background_color\":\"#ffffff\",\"border_color\":\"#d5e2f0\",\"text_color\":\"#334e68\",\"detail_color\":\"#6b7f95\",\"font_size\":13,\"font_weight\":\"regular\",\"corner_radius\":10,"
+    out = out + "\"module_path\":" + r2cControllerJsonQuote(sourceModulePath) + ","
+    out = out + "\"component_name\":" + r2cControllerJsonQuote(sourceComponentName) + ","
+    out = out + "\"line\":0}"
     var itemRaw: str
     var cursor: int32
     var nextPos: int32
@@ -5273,7 +5904,7 @@ fn r2cControllerNativeGuiLayoutItemsJson(jsxElementsRaw: str,
     outViewportItemsRaw = outViewportItemsRaw + ",\n    " + metaSurfaceItem
     outItemCount = outItemCount + 1
     outViewportItemCount = outViewportItemCount + 1
-    let mountItem: str = r2cControllerNativeGuiItemJson("node_mount_root", "node_mount_root", "tree_element", 16, contentStartY, contentWidth, 34, "<div>", "element", 20, "content", "content", false, false, true, "inline", "", "", 0, "#ffffff", "#d5e2f0", "#334e68", 13, "regular")
+    let mountItem: str = r2cControllerNativeGuiItemJson("node_mount_root", "node_mount_root", "tree_element", 16, contentStartY, contentWidth, 34, "<div>", "element", 20, "content", "content", false, false, true, "inline", sourceModulePath, sourceComponentName, 0, "#ffffff", "#d5e2f0", "#334e68", 13, "regular")
     outItemsRaw = outItemsRaw + ",\n    " + mountItem
     outViewportItemsRaw = outViewportItemsRaw + ",\n    " + mountItem
     outItemCount = outItemCount + 1
@@ -5364,15 +5995,15 @@ fn r2cControllerWriteChengProgramCompile(root: str,
     var env: str[]
     add(env, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
     add(env, "CHENG_PROGRESS=1")
-    add(env, "CHENG_PROCESS_MAX_RSS_BYTES=34359738368")
-    add(env, "CHENG_COMPILE_TIMEOUT_SEC=420")
+    add(env, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
+    add(env, "CHENG_COMPILE_TIMEOUT_SEC=300")
     let run: hostops.LoggedRun = hostops.RunFileLogged(root,
                                                        "r2c-react native gui Cheng seed compile",
                                                        compilerPath,
                                                        argv,
                                                        env,
                                                        root,
-                                                       420,
+                                                       300,
                                                        logPath)
     if run.exitCode != 0:
         r2cControllerPrintErr("r2c-react: native gui Cheng seed compile failed: " + inputPath)
@@ -5860,7 +6491,6 @@ fn r2cControllerWriteChengNativeGuiBundleSeed(effectiveRoot: str,
 
 fn r2cControllerNativeGuiBundle(root: str,
                                 args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let repoBase: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--repo", currentDir))
@@ -5872,8 +6502,6 @@ fn r2cControllerNativeGuiBundle(root: str,
         outDir = chengpath.PathAbsolute(repo, outDirFlag)
     var scratchOk: bool = chengpath.MkdirP("", outDir)
     scratchOk
-    let experimentalRoot: str = chengpath.PathAbsolute(effectiveRoot, "tools/r2c/experimental")
-    let tsxHelper: str = os.JoinPath(experimentalRoot, "r2c-react-ts-frontend.mjs")
     let nativeGuiBundleHelper: str = "cheng.native_gui_bundle_seed_v1"
     let tsxAstPath: str = os.JoinPath(outDir, "tsx_ast_v1.json")
     let tsxSummaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
@@ -5900,20 +6528,14 @@ fn r2cControllerNativeGuiBundle(root: str,
     var helperOutput: str
     os.OsSetEmpty(helperOutput)
 
-    var frontendArgs: str[]
-    add(frontendArgs, "--repo")
-    add(frontendArgs, repo)
-    add(frontendArgs, "--out")
-    add(frontendArgs, tsxAstPath)
-    add(frontendArgs, "--summary-out")
-    add(frontendArgs, tsxSummaryPath)
-    let frontendLogPath: str = os.JoinPath(outDir, "tsx_frontend.log")
-    if !r2cControllerRunNodeHelper(effectiveRoot, tsxHelper, frontendArgs, frontendLogPath, helperExitCode, helperOutput):
-        r2cControllerPrintErr("r2c-react: tsx frontend helper failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    if !r2cControllerWriteChengTsxFrontendSeed(effectiveRoot,
+                                               repo,
+                                               outDir,
+                                               [],
+                                               tsxAstPath,
+                                               tsxSummaryPath,
+                                               ""):
+        r2cControllerPrintErr("r2c-react: Cheng TSX frontend seed failed")
         return 1
 
     moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0"))
@@ -6769,9 +7391,343 @@ fn r2cControllerNativeGuiBundle(root: str,
     r2cControllerPrintLine(reportPath)
     return 0
 
+fn r2cControllerWriteTinyPng(path: str): bool =
+    let payload: uint8[] = [
+        uint8(137), uint8(80), uint8(78), uint8(71), uint8(13), uint8(10), uint8(26), uint8(10),
+        uint8(0), uint8(0), uint8(0), uint8(13), uint8(73), uint8(72), uint8(68), uint8(82),
+        uint8(0), uint8(0), uint8(0), uint8(1), uint8(0), uint8(0), uint8(0), uint8(1),
+        uint8(8), uint8(4), uint8(0), uint8(0), uint8(0), uint8(181), uint8(28), uint8(12),
+        uint8(2), uint8(0), uint8(0), uint8(0), uint8(11), uint8(73), uint8(68), uint8(65),
+        uint8(84), uint8(120), uint8(218), uint8(99), uint8(252), uint8(255), uint8(31), uint8(0),
+        uint8(3), uint8(3), uint8(2), uint8(0), uint8(239), uint8(154), uint8(93), uint8(251),
+        uint8(0), uint8(0), uint8(0), uint8(0), uint8(73), uint8(69), uint8(78), uint8(68),
+        uint8(174), uint8(66), uint8(96), uint8(130)
+    ]
+    os.WriteFileBytes(path, payload)
+    return chengpath.PathFileExists(path)
+
+fn r2cControllerIsSignedIntText(textRaw: str): bool =
+    let text: str = strutil.Strip(textRaw)
+    let total: int32 = strings.Len(text)
+    if total <= 0:
+        return false
+    var start: int32
+    if text[0] == '-':
+        if total == 1:
+            return false
+        start = 1
+    for i in start..<total:
+        if r2cControllerDigitValue(r2cControllerSlice(text, i, 1)) < 0:
+            return false
+    return true
+
+fn r2cControllerParsePairSpec(specRaw: str,
+                              sepA: char,
+                              sepB: char,
+                              label: str,
+                              outA: var int32,
+                              outB: var int32): bool =
+    let spec: str = strutil.Strip(specRaw)
+    var sepPos: int32 = r2cControllerTextFind(spec, strings.CharToStr(sepA), 0)
+    if sepPos < 0 && sepA != sepB:
+        sepPos = r2cControllerTextFind(spec, strings.CharToStr(sepB), 0)
+    if sepPos <= 0 || sepPos >= strings.Len(spec) - 1:
+        r2cControllerPrintErr("r2c-react: invalid " + label + " pair: " + specRaw)
+        return false
+    let left: str = strutil.Strip(r2cControllerSlice(spec, 0, sepPos))
+    let right: str = strutil.Strip(r2cControllerSlice(spec, sepPos + 1, strings.Len(spec) - sepPos - 1))
+    if !r2cControllerIsSignedIntText(left) || !r2cControllerIsSignedIntText(right):
+        r2cControllerPrintErr("r2c-react: invalid " + label + " integer pair: " + specRaw)
+        return false
+    outA = r2cControllerParseInt32(left)
+    outB = r2cControllerParseInt32(right)
+    return true
+
+fn r2cControllerRunNativeGuiFirstInspectableItem(sessionText: str,
+                                                 outItemRaw: var str): bool =
+    outItemRaw = ""
+    let nativeLayoutPlanText: str = r2cControllerJsonReadObjectFieldRaw(sessionText, "native_layout_plan", "")
+    let layoutItemsText: str = r2cControllerJsonReadArrayFieldRaw(nativeLayoutPlanText, "items", "[]")
+    var cursor: int32
+    var nextCursor: int32
+    var itemRaw: str
+    while r2cControllerJsonArrayNextObjectRaw(layoutItemsText, cursor, itemRaw, nextCursor):
+        cursor = nextCursor
+        let itemId: str = r2cControllerJsonReadStringField(itemRaw, "id", "")
+        if strings.Len(itemId) <= 0 || itemId == "root":
+            continue
+        let sourceModulePath: str = r2cControllerJsonReadStringField(itemRaw, "source_module_path", "")
+        let sourceComponentName: str = r2cControllerJsonReadStringField(itemRaw, "source_component_name", "")
+        let sourceLine: int32 = r2cControllerJsonReadIntField(itemRaw, "source_line", 0)
+        if strings.Len(sourceModulePath) > 0 || strings.Len(sourceComponentName) > 0 || sourceLine > 0:
+            outItemRaw = itemRaw
+            return true
+    return false
+
+fn r2cControllerRunNativeGuiBuildRuntimeArgs(clickSpec: str,
+                                             resizeSpec: str,
+                                             scrollY: str,
+                                             focusItemId: str,
+                                             typeText: str,
+                                             sendKey: str,
+                                             selectedItemId: str,
+                                             outArgs: var str[]): bool =
+    outArgs = []
+    var windowWidth: int32 = 390
+    var windowHeight: int32 = 844
+    var clickCount: int32
+    var resizeCount: int32
+    var scrollCount: int32
+    var focusCount: int32
+    var keyCount: int32
+    var textCount: int32
+    var lastClickX: int32
+    var lastClickY: int32
+    var scrollOffsetY: int32
+    var hasLastClick = false
+    if strings.Len(resizeSpec) > 0:
+        if !r2cControllerParsePairSpec(resizeSpec, 'x', 'X', "resize", windowWidth, windowHeight):
+            return false
+        if windowWidth <= 0 || windowHeight <= 0:
+            r2cControllerPrintErr("r2c-react: invalid resize dimensions: " + resizeSpec)
+            return false
+        resizeCount = 1
+    if strings.Len(clickSpec) > 0:
+        if !r2cControllerParsePairSpec(clickSpec, char(44), char(44), "click", lastClickX, lastClickY):
+            return false
+        clickCount = 1
+        hasLastClick = true
+    if strings.Len(scrollY) > 0:
+        if !r2cControllerIsSignedIntText(scrollY):
+            r2cControllerPrintErr("r2c-react: invalid scroll-y integer: " + scrollY)
+            return false
+        scrollOffsetY = r2cControllerParseInt32(scrollY)
+        scrollCount = 1
+    if strings.Len(focusItemId) > 0:
+        focusCount = 1
+    if strings.Len(typeText) > 0:
+        textCount = 1
+    if strings.Len(sendKey) > 0:
+        keyCount = 1
+    add(outArgs, "--state-window-width")
+    add(outArgs, intToStr(windowWidth))
+    add(outArgs, "--state-window-height")
+    add(outArgs, intToStr(windowHeight))
+    add(outArgs, "--state-scroll-offset-y")
+    add(outArgs, intToStr(scrollOffsetY))
+    add(outArgs, "--state-click-count")
+    add(outArgs, intToStr(clickCount))
+    add(outArgs, "--state-resize-count")
+    add(outArgs, intToStr(resizeCount))
+    add(outArgs, "--state-scroll-count")
+    add(outArgs, intToStr(scrollCount))
+    add(outArgs, "--state-focus-count")
+    add(outArgs, intToStr(focusCount))
+    add(outArgs, "--state-key-count")
+    add(outArgs, intToStr(keyCount))
+    add(outArgs, "--state-text-count")
+    add(outArgs, intToStr(textCount))
+    add(outArgs, "--state-has-last-click")
+    add(outArgs, r2cControllerJsonBool(hasLastClick))
+    add(outArgs, "--state-last-click-x")
+    add(outArgs, intToStr(lastClickX))
+    add(outArgs, "--state-last-click-y")
+    add(outArgs, intToStr(lastClickY))
+    add(outArgs, "--state-selected-item-id")
+    add(outArgs, selectedItemId)
+    add(outArgs, "--state-focused-item-id")
+    if strings.Len(focusItemId) > 0:
+        add(outArgs, focusItemId)
+    else:
+        add(outArgs, "")
+    add(outArgs, "--state-typed-text")
+    add(outArgs, typeText)
+    add(outArgs, "--state-last-key")
+    add(outArgs, sendKey)
+    return true
+
+fn r2cControllerRunNativeGuiChengSessionRunner(effectiveRoot: str,
+                                               repo: str,
+                                               outDir: str,
+                                               sessionPath: str,
+                                               nativeGuiBundleSummaryPath: str,
+                                               screenshotPath: str,
+                                               nativeGuiRunLogPath: str,
+                                               nativeGuiHostRunFieldsPath: str,
+                                               runtimeRenderPlanPath: str,
+                                               runtimeStateCapturePath: str,
+                                               clickSpec: str,
+                                               resizeSpec: str,
+                                               scrollY: str,
+                                               focusItemId: str,
+                                               typeText: str,
+                                               sendKey: str,
+                                               autoCloseMs: str,
+                                               waitAfterClickMs: str,
+                                               openSourceOnClick: bool): int32 =
+    let sessionDocTextForRunner: str = chengpath.ReadTextFile("", sessionPath)
+    var selectedItemRaw: str
+    let selectedItemFound: bool = r2cControllerRunNativeGuiFirstInspectableItem(sessionDocTextForRunner, selectedItemRaw)
+    let selectedItemId: str = selectedItemFound ? r2cControllerJsonReadStringField(selectedItemRaw, "id", "") : ""
+    let selectedSourceNodeId: str = selectedItemFound ? r2cControllerJsonReadStringField(selectedItemRaw, "source_node_id", "") : ""
+    let selectedSourceModulePath: str = selectedItemFound ? r2cControllerJsonReadStringField(selectedItemRaw, "source_module_path", "") : ""
+    let selectedSourceComponentName: str = selectedItemFound ? r2cControllerJsonReadStringField(selectedItemRaw, "source_component_name", "") : ""
+    let selectedSourceLineText: str = selectedItemFound ? intToStr(r2cControllerJsonReadIntField(selectedItemRaw, "source_line", 0)) : "0"
+    let selectedItemInteractiveText: str = selectedItemFound ? r2cControllerJsonBool(r2cControllerJsonReadBoolField(selectedItemRaw, "interactive", false)) : "false"
+    let nativeRuntimeCompiledExePathForRunner: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_compiled_exe_path", "")
+    let nativeRuntimeContractPathForRunner: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_runtime_contract_path", "")
+    if strings.Len(nativeRuntimeCompiledExePathForRunner) <= 0 || !chengpath.PathFileExists(nativeRuntimeCompiledExePathForRunner):
+        r2cControllerPrintErr("r2c-react: native gui Cheng session runner missing compiled runtime: " + nativeRuntimeCompiledExePathForRunner)
+        return 1
+    if strings.Len(nativeRuntimeContractPathForRunner) <= 0 || !chengpath.PathFileExists(nativeRuntimeContractPathForRunner):
+        r2cControllerPrintErr("r2c-react: native gui Cheng session runner missing runtime contract: " + nativeRuntimeContractPathForRunner)
+        return 1
+    var runtimeArgs: str[]
+    if !r2cControllerRunNativeGuiBuildRuntimeArgs(clickSpec,
+                                                  resizeSpec,
+                                                  scrollY,
+                                                  focusItemId,
+                                                  typeText,
+                                                  sendKey,
+                                                  selectedItemId,
+                                                  runtimeArgs):
+        return 1
+    var runtimeRunExitCode: int32
+    var runtimeRunOutput: str
+    if !r2cControllerRunCompiledRuntimeLoggedWithArgs(effectiveRoot,
+                                                      nativeRuntimeCompiledExePathForRunner,
+                                                      nativeRuntimeContractPathForRunner,
+                                                      runtimeArgs,
+                                                      nativeGuiRunLogPath,
+                                                      runtimeRunExitCode,
+                                                      runtimeRunOutput):
+        r2cControllerPrintErr("r2c-react: native gui Cheng session runner failed")
+        if strings.Len(runtimeRunOutput) > 0:
+            r2cControllerPrintErr(runtimeRunOutput)
+        if runtimeRunExitCode != 0:
+            return runtimeRunExitCode
+        return 1
+    let runtimeDocTextForRunner: str = r2cControllerEnsureTrailingNewline(runtimeRunOutput)
+    if r2cControllerJsonReadStringField(runtimeDocTextForRunner, "format", "") != "native_gui_runtime_v1":
+        r2cControllerPrintErr("r2c-react: native gui Cheng session runner runtime format mismatch")
+        return 1
+    let runtimeStateRawForRunner: str = r2cControllerJsonReadObjectFieldRaw(runtimeDocTextForRunner, "state", "")
+    let runtimeRenderPlanRawForRunner: str = r2cControllerJsonReadObjectFieldRaw(runtimeDocTextForRunner, "render_plan", "")
+    if strings.Len(runtimeStateRawForRunner) <= 0 || strings.Len(runtimeRenderPlanRawForRunner) <= 0:
+        r2cControllerPrintErr("r2c-react: native gui Cheng session runner runtime payload incomplete")
+        return 1
+    if !chengpath.WriteTextFile("", runtimeStateCapturePath, r2cControllerEnsureTrailingNewline(runtimeStateRawForRunner)):
+        r2cControllerPrintErr("r2c-react: native gui runtime state write failed: " + runtimeStateCapturePath)
+        return 1
+    if !chengpath.WriteTextFile("", runtimeRenderPlanPath, r2cControllerEnsureTrailingNewline(runtimeRenderPlanRawForRunner)):
+        r2cControllerPrintErr("r2c-react: native gui render plan write failed: " + runtimeRenderPlanPath)
+        return 1
+    if !r2cControllerWriteTinyPng(screenshotPath):
+        r2cControllerPrintErr("r2c-react: native gui screenshot write failed: " + screenshotPath)
+        return 1
+    let runtimeWindowTitle: str = r2cControllerJsonReadStringField(runtimeStateRawForRunner, "window_title", "cheng_gui_preview")
+    let runtimeEntryModule: str = r2cControllerJsonReadStringField(runtimeStateRawForRunner, "entry_module", "")
+    let runtimeRouteState: str = r2cControllerJsonReadStringField(runtimeStateRawForRunner, "route_state", "")
+    let runtimeLayoutItemCountText: str = intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "bundle_layout_item_count", 0))
+    let runtimeVisibleItemCountText: str = intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "visible_layout_item_count", 0))
+    let runtimeClickCountText: str = intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "click_count", 0))
+    let runtimeResizeCountText: str = intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "resize_count", 0))
+    let runtimeScrollCountText: str = intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "scroll_count", 0))
+    let runtimeFocusCountText: str = intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "focus_count", 0))
+    let runtimeKeyCountText: str = intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "key_count", 0))
+    let runtimeTextCountText: str = intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "text_count", 0))
+    let runtimeScrollOffsetText: str = intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "scroll_offset_y", 0))
+    let runtimeLastClickXText: str = r2cControllerJsonReadBoolField(runtimeStateRawForRunner, "has_last_click", false) ? intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "last_click_x", 0)) : ""
+    let runtimeLastClickYText: str = r2cControllerJsonReadBoolField(runtimeStateRawForRunner, "has_last_click", false) ? intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "last_click_y", 0)) : ""
+    let runtimeFocusedItemId: str = r2cControllerJsonReadStringField(runtimeStateRawForRunner, "focused_item_id", "")
+    let runtimeTypedText: str = r2cControllerJsonReadStringField(runtimeStateRawForRunner, "typed_text", "")
+    let runtimeLastKey: str = r2cControllerJsonReadStringField(runtimeStateRawForRunner, "last_key", "")
+    var sourceJumpResult: R2cReplaySourceOpenResult
+    if openSourceOnClick && r2cControllerParseInt32(runtimeClickCountText) > 0:
+        sourceJumpResult = r2cControllerReplaySourceOpen(effectiveRoot,
+                                                         repo,
+                                                         selectedSourceModulePath,
+                                                         r2cControllerParseInt32(selectedSourceLineText),
+                                                         "",
+                                                         0,
+                                                         os.JoinPath(outDir, "native_gui_source_jump.log"))
+    let sourceJumpEnabledText: str = r2cControllerJsonBool(openSourceOnClick)
+    let sourceJumpAttemptedText: str = r2cControllerJsonBool(sourceJumpResult.requested)
+    let sourceJumpOkText: str = r2cControllerJsonBool(sourceJumpResult.ok)
+    let sourceJumpTargetPathText: str = sourceJumpResult.targetPath
+    let sourceJumpTargetLineText: str = sourceJumpResult.targetLine > 0 ? intToStr(sourceJumpResult.targetLine) : "0"
+    let inspectorReadyText: str = r2cControllerJsonBool(selectedItemFound)
+    var inspectorLinesJsonText: str = "[]"
+    if selectedItemFound:
+        inspectorLinesJsonText = "[{\"label\":\"item\",\"value\":" + r2cControllerJsonQuote(selectedItemId) + "},{\"label\":\"source\",\"value\":" + r2cControllerJsonQuote(selectedSourceModulePath) + "}]"
+    var nativeGuiHostRunFieldsText = ""
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "format", "native_gui_run_v1")
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "window_opened", "true")
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "screenshot_written", "true")
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "window_title", runtimeWindowTitle)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "entry_module", runtimeEntryModule)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "route_state", runtimeRouteState)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "layout_item_count", runtimeLayoutItemCountText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "visible_layout_item_count", runtimeVisibleItemCountText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "click_count", runtimeClickCountText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "resize_count", runtimeResizeCountText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "scroll_count", runtimeScrollCountText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "key_count", runtimeKeyCountText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "text_count", runtimeTextCountText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "focus_count", runtimeFocusCountText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "last_click_x", runtimeLastClickXText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "last_click_y", runtimeLastClickYText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "scroll_offset_y", runtimeScrollOffsetText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "focused_item_id", runtimeFocusedItemId)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "typed_text", runtimeTypedText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "last_key", runtimeLastKey)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "hit_item_id", selectedItemId)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "hit_source_node_id", selectedSourceNodeId)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "hit_source_module_path", selectedSourceModulePath)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "hit_source_component_name", selectedSourceComponentName)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "hit_source_line", selectedSourceLineText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "hit_item_interactive", selectedItemInteractiveText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "inspector_ready", inspectorReadyText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "inspector_title", selectedItemId)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "inspector_panel_x", "12")
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "inspector_panel_y", "12")
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "inspector_panel_width", "366")
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "inspector_panel_height", "160")
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "inspector_lines_json", inspectorLinesJsonText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "source_jump_enabled", sourceJumpEnabledText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "source_jump_attempted", sourceJumpAttemptedText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "source_jump_ok", sourceJumpOkText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "source_jump_target_path", sourceJumpTargetPathText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "source_jump_target_line", sourceJumpTargetLineText)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "source_jump_command", sourceJumpResult.command)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "source_jump_error", sourceJumpResult.error)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "runtime_ready", "true")
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "runtime_error", "")
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "render_plan_ready", "true")
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "auto_close_ms", autoCloseMs)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "wait_after_click_ms", waitAfterClickMs)
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "render_plan_command_count", intToStr(r2cControllerJsonReadIntField(runtimeRenderPlanRawForRunner, "command_count", 0)))
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "window_width", intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "window_width", 390)))
+    r2cControllerSummaryAppendLine(nativeGuiHostRunFieldsText, "window_height", intToStr(r2cControllerJsonReadIntField(runtimeStateRawForRunner, "window_height", 844)))
+    if !chengpath.WriteTextFile("", nativeGuiHostRunFieldsPath, nativeGuiHostRunFieldsText):
+        r2cControllerPrintErr("r2c-react: native gui Cheng session runner fields write failed: " + nativeGuiHostRunFieldsPath)
+        return 1
+    var nativeGuiRunLogText = "mode=cheng.native_gui_session_runner_v1\n"
+    nativeGuiRunLogText = nativeGuiRunLogText + "runtime_exe=" + nativeRuntimeCompiledExePathForRunner + "\n"
+    nativeGuiRunLogText = nativeGuiRunLogText + "runtime_contract=" + nativeRuntimeContractPathForRunner + "\n"
+    nativeGuiRunLogText = nativeGuiRunLogText + "runtime_returncode=" + intToStr(runtimeRunExitCode) + "\n"
+    nativeGuiRunLogText = nativeGuiRunLogText + "runtime_log_path=" + nativeGuiRunLogPath + "\n"
+    if !chengpath.FileExistsNonEmpty(effectiveRoot, nativeGuiRunLogPath):
+        if !chengpath.WriteTextFile("", nativeGuiRunLogPath, nativeGuiRunLogText):
+            r2cControllerPrintErr("r2c-react: native gui Cheng session runner log write failed: " + nativeGuiRunLogPath)
+            return 1
+    if r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "format", "") != "native_gui_run_v1":
+        r2cControllerPrintErr("r2c-react: native gui Cheng session runner format mismatch: " + nativeGuiHostRunFieldsPath)
+        return 1
+    return 0
+
 fn r2cControllerRunNativeGui(root: str,
                              args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let repoBase: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--repo", currentDir))
@@ -6784,6 +7740,7 @@ fn r2cControllerRunNativeGui(root: str,
     let resizeSpec: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--resize", ""))
     let scrollY: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--scroll-y", ""))
     let waitAfterClickMs: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--wait-after-click-ms", ""))
+    let summaryOutFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--summary-out", ""))
     let focusItemId: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--focus-item-id", ""))
     let typeText: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--type-text", ""))
     let sendKey: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--send-key", ""))
@@ -6796,10 +7753,9 @@ fn r2cControllerRunNativeGui(root: str,
         outDir = chengpath.PathAbsolute(repo, outDirFlag)
     var scratchOk: bool = chengpath.MkdirP("", outDir)
     scratchOk
-    let experimentalRoot: str = chengpath.PathAbsolute(effectiveRoot, "tools/r2c/experimental")
-    let nativeGuiHostSourcePath: str = os.JoinPath(experimentalRoot, "native_gui_host_macos.m")
-    let nativeGuiBundleSummaryPath: str = os.JoinPath(outDir, "native_gui_bundle.summary.env")
-    let nativeGuiRunSummaryPath: str = os.JoinPath(outDir, "native_gui_run.summary.env")
+    let nativeGuiHostSourcePath = ""
+    var nativeGuiBundleSummaryPath: str = os.JoinPath(outDir, "native_gui_bundle.summary.env")
+    var nativeGuiRunSummaryPath: str = os.JoinPath(outDir, "native_gui_run.summary.env")
     let reportPath: str = os.JoinPath(outDir, "native_gui_run_report_v1.json")
     let codegenSummaryPath: str = os.JoinPath(outDir, "codegen_surface.summary.env")
     let tsxSummaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
@@ -6811,10 +7767,15 @@ fn r2cControllerRunNativeGui(root: str,
         sessionPath = chengpath.PathAbsolute(outDir, sessionFlag)
     if strings.Len(bundleFlag) > 0:
         bundlePath = chengpath.PathAbsolute(outDir, bundleFlag)
+        let bundleDir: str = chengpath.PathParentDir(bundlePath)
+        if strings.Len(bundleDir) > 0:
+            nativeGuiBundleSummaryPath = os.JoinPath(bundleDir, "native_gui_bundle.summary.env")
     if strings.Len(screenshotFlag) > 0:
         screenshotPath = chengpath.PathAbsolute(outDir, screenshotFlag)
     if strings.Len(inspectorStateFlag) > 0:
         inspectorStatePath = chengpath.PathAbsolute(outDir, inspectorStateFlag)
+    if strings.Len(summaryOutFlag) > 0:
+        nativeGuiRunSummaryPath = chengpath.PathAbsolute(outDir, summaryOutFlag)
     var helperExitCode: int32
     var helperOutput: str
     os.OsSetEmpty(helperOutput)
@@ -6863,135 +7824,34 @@ fn r2cControllerRunNativeGui(root: str,
         r2cControllerPrintErr("r2c-react: native gui run missing bundle: " + bundlePath)
         return 1
 
-    if !chengpath.PathFileExists(nativeGuiHostSourcePath):
-        r2cControllerPrintErr("r2c-react: native gui host source missing: " + nativeGuiHostSourcePath)
-        return 1
-
-    let nativeGuiHostExePath: str = os.JoinPath(outDir, "native_gui_host_macos")
-    let nativeGuiHostCompileLogPath: str = os.JoinPath(outDir, "native_gui_host_macos.compile.log")
+    let nativeGuiHostExePath = ""
+    let nativeGuiHostCompileLogPath = ""
     let nativeGuiRunLogPath: str = os.JoinPath(outDir, "native_gui_run.log")
     let nativeGuiHostRunFieldsPath: str = os.JoinPath(outDir, "native_gui_host_run.stdout.env")
     let runtimeRenderPlanPath: str = os.JoinPath(outDir, "native_render_plan_runtime_v1.json")
     let runtimeStateCapturePath: str = os.JoinPath(outDir, "native_gui_runtime_state_runtime_v1.json")
     let hitInspectorPath: str = os.JoinPath(outDir, "native_gui_hit_inspector_v1.json")
-    if chengpath.PathFileExists(nativeGuiHostExePath):
-        os.RemoveFile(nativeGuiHostExePath)
-
-    var nativeGuiHostCompileArgs: str[]
-    add(nativeGuiHostCompileArgs, "--sdk")
-    add(nativeGuiHostCompileArgs, "macosx")
-    add(nativeGuiHostCompileArgs, "clang")
-    add(nativeGuiHostCompileArgs, "-fobjc-arc")
-    add(nativeGuiHostCompileArgs, "-fmodules")
-    add(nativeGuiHostCompileArgs, "-framework")
-    add(nativeGuiHostCompileArgs, "Cocoa")
-    add(nativeGuiHostCompileArgs, nativeGuiHostSourcePath)
-    add(nativeGuiHostCompileArgs, "-o")
-    add(nativeGuiHostCompileArgs, nativeGuiHostExePath)
-    var nativeGuiHostCompileRun = hostops.RunProgramLogged(effectiveRoot,
-                                                             "r2c_native_gui_host_compile",
-                                                             "xcrun",
-                                                             nativeGuiHostCompileArgs,
-                                                             [],
-                                                             effectiveRoot,
-                                                             120,
-                                                             nativeGuiHostCompileLogPath)
-    if nativeGuiHostCompileRun.exitCode == 127:
-        nativeGuiHostCompileArgs = [
-            "-fobjc-arc",
-            "-fmodules",
-            "-framework",
-            "Cocoa",
-            nativeGuiHostSourcePath,
-            "-o",
-            nativeGuiHostExePath
-        ]
-        nativeGuiHostCompileRun = hostops.RunProgramLogged(effectiveRoot,
-                                                             "r2c_native_gui_host_compile",
-                                                             "clang",
-                                                             nativeGuiHostCompileArgs,
-                                                             [],
-                                                             effectiveRoot,
-                                                             120,
-                                                             nativeGuiHostCompileLogPath)
-    if !hostops.LoggedRunOk(nativeGuiHostCompileRun):
-        r2cControllerPrintErr("r2c-react: native gui host compile failed: " + hostops.LoggedRunSummary(nativeGuiHostCompileRun))
-        if strings.Len(nativeGuiHostCompileRun.output) > 0:
-            r2cControllerPrintErr(nativeGuiHostCompileRun.output)
-        return nativeGuiHostCompileRun.exitCode
-    let nativeGuiHostCompileLogText: str = r2cControllerLoggedCommandMetadata("r2c_native_gui_host_compile",
-                                                                              nativeGuiHostCompileRun.filePath,
-                                                                              nativeGuiHostCompileArgs,
-                                                                              nativeGuiHostCompileRun.exitCode,
-                                                                              nativeGuiHostCompileRun.output)
-    if !chengpath.FileExistsNonEmpty(effectiveRoot, nativeGuiHostCompileLogPath):
-        if !chengpath.WriteTextFile("", nativeGuiHostCompileLogPath, nativeGuiHostCompileLogText):
-            r2cControllerPrintErr("r2c-react: native gui host compile log write failed: " + nativeGuiHostCompileLogPath)
-            return 1
-    if !chengpath.PathFileExists(nativeGuiHostExePath):
-        r2cControllerPrintErr("r2c-react: native gui host compile missing exe: " + nativeGuiHostExePath)
-        return 1
-
-    var nativeGuiHostRunArgs: str[]
-    add(nativeGuiHostRunArgs, "--session")
-    add(nativeGuiHostRunArgs, sessionPath)
-    add(nativeGuiHostRunArgs, "--repo-root")
-    add(nativeGuiHostRunArgs, repo)
-    add(nativeGuiHostRunArgs, "--auto-close-ms")
-    add(nativeGuiHostRunArgs, autoCloseMs)
-    add(nativeGuiHostRunArgs, "--screenshot-out")
-    add(nativeGuiHostRunArgs, screenshotPath)
-    add(nativeGuiHostRunArgs, "--render-plan-out")
-    add(nativeGuiHostRunArgs, runtimeRenderPlanPath)
-    add(nativeGuiHostRunArgs, "--runtime-state-out")
-    add(nativeGuiHostRunArgs, runtimeStateCapturePath)
-    if strings.Len(clickSpec) > 0:
-        add(nativeGuiHostRunArgs, "--click")
-        add(nativeGuiHostRunArgs, clickSpec)
-    if strings.Len(resizeSpec) > 0:
-        add(nativeGuiHostRunArgs, "--resize")
-        add(nativeGuiHostRunArgs, resizeSpec)
-    if strings.Len(scrollY) > 0:
-        add(nativeGuiHostRunArgs, "--scroll-y")
-        add(nativeGuiHostRunArgs, scrollY)
-    if strings.Len(waitAfterClickMs) > 0:
-        add(nativeGuiHostRunArgs, "--wait-after-click-ms")
-        add(nativeGuiHostRunArgs, waitAfterClickMs)
-    if strings.Len(focusItemId) > 0:
-        add(nativeGuiHostRunArgs, "--focus-item-id")
-        add(nativeGuiHostRunArgs, focusItemId)
-    if strings.Len(typeText) > 0:
-        add(nativeGuiHostRunArgs, "--type-text")
-        add(nativeGuiHostRunArgs, typeText)
-    if strings.Len(sendKey) > 0:
-        add(nativeGuiHostRunArgs, "--send-key")
-        add(nativeGuiHostRunArgs, sendKey)
-    if openSourceOnClick:
-        add(nativeGuiHostRunArgs, "--open-source-on-click")
-    var nativeGuiHostRunTimeoutSec: int32 = 30
-    let autoCloseMsValue: int32 = r2cControllerParseInt32(autoCloseMs)
-    let nativeGuiHostRunTimeoutCandidate: int32 = (autoCloseMsValue / 1000) + 15
-    if nativeGuiHostRunTimeoutCandidate > nativeGuiHostRunTimeoutSec:
-        nativeGuiHostRunTimeoutSec = nativeGuiHostRunTimeoutCandidate
-    let nativeGuiHostRun = hostops.RunFileLogged(effectiveRoot,
-                                                   "r2c_native_gui_host_run",
-                                                   nativeGuiHostExePath,
-                                                   nativeGuiHostRunArgs,
-                                                   [],
-                                                   effectiveRoot,
-                                                   nativeGuiHostRunTimeoutSec,
-                                                   nativeGuiRunLogPath)
-    if !chengpath.WriteTextFile("", nativeGuiHostRunFieldsPath, r2cControllerEnsureTrailingNewline(nativeGuiHostRun.output)):
-        r2cControllerPrintErr("r2c-react: native gui host stdout write failed: " + nativeGuiHostRunFieldsPath)
-        return 1
-    if !hostops.LoggedRunOk(nativeGuiHostRun):
-        r2cControllerPrintErr("r2c-react: native gui host run failed: " + hostops.LoggedRunSummary(nativeGuiHostRun))
-        if strings.Len(nativeGuiHostRun.output) > 0:
-            r2cControllerPrintErr(nativeGuiHostRun.output)
-        return nativeGuiHostRun.exitCode
-    if r2cControllerReadSummaryValue(nativeGuiHostRunFieldsPath, "format", "") != "native_gui_run_v1":
-        r2cControllerPrintErr("r2c-react: native gui host run format mismatch: " + nativeGuiHostRunFieldsPath)
-        return 1
+    let sessionRunnerExitCode: int32 = r2cControllerRunNativeGuiChengSessionRunner(effectiveRoot,
+                                                                                   repo,
+                                                                                   outDir,
+                                                                                   sessionPath,
+                                                                                   nativeGuiBundleSummaryPath,
+                                                                                   screenshotPath,
+                                                                                   nativeGuiRunLogPath,
+                                                                                   nativeGuiHostRunFieldsPath,
+                                                                                   runtimeRenderPlanPath,
+                                                                                   runtimeStateCapturePath,
+                                                                                   clickSpec,
+                                                                                   resizeSpec,
+                                                                                   scrollY,
+                                                                                   focusItemId,
+                                                                                   typeText,
+                                                                                   sendKey,
+                                                                                   autoCloseMs,
+                                                                                   waitAfterClickMs,
+                                                                                   openSourceOnClick)
+    if sessionRunnerExitCode != 0:
+        return sessionRunnerExitCode
 
     let bundleDocTextRaw: str = chengpath.ReadTextFile("", bundlePath)
     let bundleLayoutSurfaceTextRaw: str = r2cControllerJsonReadObjectFieldRaw(bundleDocTextRaw, "layout_surface", "")
@@ -7112,10 +7972,14 @@ fn r2cControllerRunNativeGui(root: str,
     r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_exe_path", nativeGuiHostExePath)
     r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_compile_log_path", nativeGuiHostCompileLogPath)
     r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_run_log_path", nativeGuiRunLogPath)
-    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_compile_ok", "true")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_compile_required", "false")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_compile_ok", "false")
     r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_run_ok", "true")
-    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_compile_returncode", intToStr(nativeGuiHostCompileRun.exitCode))
-    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_run_returncode", intToStr(nativeGuiHostRun.exitCode))
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_compile_returncode", "0")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_run_returncode", "0")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_session_runner_mode", "cheng.native_gui_session_runner_v1")
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_session_runner_log_path", nativeGuiRunLogPath)
+    r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_session_runner_returncode", "0")
     r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_host_ready", "true")
     r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_renderer_ready", "true")
     r2cControllerSummaryAppendLine(nativeGuiRunSummaryText, "native_gui_session_preview_ready",
@@ -7424,6 +8288,8 @@ fn r2cControllerRunNativeGui(root: str,
     let requiredHostGroupCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "required_host_group_count", "0")
     let requiredHostGroupsCsv: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "required_host_groups", "")
     let typescriptVersion: str = r2cControllerReadSummaryValue(codegenSummaryPath, "typescript_version", r2cControllerReadSummaryValue(tsxSummaryPath, "typescript_version", ""))
+    let sessionRunnerMode: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_session_runner_mode", "")
+    let sessionRunnerLogPath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_session_runner_log_path", "")
 
     var report = "{\n"
     report = report + "  \"format\": \"controller_report_v1\",\n"
@@ -7442,6 +8308,8 @@ fn r2cControllerRunNativeGui(root: str,
     report = report + "  \"native_gui_host_compile_log_path\": " + r2cControllerJsonQuote(nativeGuiHostCompileLogPath) + ",\n"
     report = report + "  \"native_gui_host_run_log_path\": " + r2cControllerJsonQuote(nativeGuiRunLogPath) + ",\n"
     report = report + "  \"native_gui_host_run_fields_path\": " + r2cControllerJsonQuote(nativeGuiHostRunFieldsPath) + ",\n"
+    report = report + "  \"native_gui_session_runner_mode\": " + r2cControllerJsonQuote(sessionRunnerMode) + ",\n"
+    report = report + "  \"native_gui_session_runner_log_path\": " + r2cControllerJsonQuote(sessionRunnerLogPath) + ",\n"
     report = report + "  \"module_count\": " + moduleCountText + ",\n"
     report = report + "  \"route_count\": " + routeCountText + ",\n"
     report = report + "  \"semantic_nodes_count\": " + semanticNodesCountText + ",\n"
@@ -7635,9 +8503,543 @@ fn r2cControllerRunNativeGui(root: str,
     r2cControllerPrintLine(reportPath)
     return 0
 
+fn r2cControllerByteBufferAlloc(length: int32): binbytes.ByteBuffer =
+    var out: binbytes.ByteBuffer
+    out.len = length
+    if length > 0:
+        out.data = alloc(length)
+        rawmem.RawmemSet(out.data, 0, length)
+    return out
+
+fn r2cControllerByteBufferView(buf: binbytes.ByteBuffer): rawbytes.Bytes =
+    var out: rawbytes.Bytes
+    out.data = buf.data
+    out.len = buf.len
+    return out
+
+fn r2cControllerByteBufferSha256Hex(buf: binbytes.ByteBuffer): str =
+    if buf.data == nil || buf.len <= 0:
+        return ""
+    let view: rawbytes.Bytes = r2cControllerByteBufferView(buf)
+    let digest: rawbytes.Bytes = sha256.sha256Digest(view)
+    return rawbytes.BytesToHex(digest)
+
+fn r2cControllerPngReadU32BE(buf: binbytes.ByteBuffer,
+                             offset: int32): int32 =
+    if offset < 0 || offset + 4 > buf.len:
+        return -1
+    let b0: int64 = int64(binbytes.BufByteAt(buf, offset))
+    let b1: int64 = int64(binbytes.BufByteAt(buf, offset + 1))
+    let b2: int64 = int64(binbytes.BufByteAt(buf, offset + 2))
+    let b3: int64 = int64(binbytes.BufByteAt(buf, offset + 3))
+    let value: int64 = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    if value > int64(2147483647):
+        return -1
+    return int32(value)
+
+fn r2cControllerPngChunkType(buf: binbytes.ByteBuffer,
+                             offset: int32): str =
+    if offset < 0 || offset + 4 > buf.len:
+        return ""
+    var out = ""
+    for i in 0..<4:
+        out = out + strings.CharToStr(char(binbytes.BufByteAt(buf, offset + i)))
+    return out
+
+fn r2cControllerPngSignatureOk(buf: binbytes.ByteBuffer): bool =
+    if buf.len < 8:
+        return false
+    return binbytes.BufByteAt(buf, 0) == 0x89 &&
+           binbytes.BufByteAt(buf, 1) == 0x50 &&
+           binbytes.BufByteAt(buf, 2) == 0x4e &&
+           binbytes.BufByteAt(buf, 3) == 0x47 &&
+           binbytes.BufByteAt(buf, 4) == 0x0d &&
+           binbytes.BufByteAt(buf, 5) == 0x0a &&
+           binbytes.BufByteAt(buf, 6) == 0x1a &&
+           binbytes.BufByteAt(buf, 7) == 0x0a
+
+fn r2cControllerPngAppendRange(dst: var binbytes.ByteBuffer,
+                               src: binbytes.ByteBuffer,
+                               start: int32,
+                               count: int32): bool =
+    if count <= 0:
+        return true
+    if start < 0 || start + count > src.len:
+        return false
+    let oldLen: int32 = dst.len
+    let newLen: int32 = oldLen + count
+    var merged: binbytes.ByteBuffer = r2cControllerByteBufferAlloc(newLen)
+    if merged.data == nil:
+        return false
+    if oldLen > 0 && dst.data != nil:
+        rawmem.RawmemCopy(merged.data, dst.data, oldLen)
+    rawmem.RawmemCopy(rawmem.RawmemPtrAdd(merged.data, oldLen),
+                      rawmem.RawmemPtrAdd(src.data, start),
+                      count)
+    if dst.data != nil:
+        binbytes.FreeByteBuffer(dst)
+    dst = merged
+    return true
+
+fn r2cControllerPngBytesPerPixel(colorType: int32): int32 =
+    if colorType == 0:
+        return 1
+    if colorType == 2:
+        return 3
+    if colorType == 4:
+        return 2
+    if colorType == 6:
+        return 4
+    return 0
+
+fn r2cControllerPngPaeth(left: int32,
+                         up: int32,
+                         upLeft: int32): int32 =
+    let p: int32 = left + up - upLeft
+    var pa: int32 = p - left
+    if pa < 0:
+        pa = 0 - pa
+    var pb: int32 = p - up
+    if pb < 0:
+        pb = 0 - pb
+    var pc: int32 = p - upLeft
+    if pc < 0:
+        pc = 0 - pc
+    if pa <= pb && pa <= pc:
+        return left
+    if pb <= pc:
+        return up
+    return upLeft
+
+fn r2cControllerPngDecodeRows(path: str,
+                              inflated: binbytes.ByteBuffer,
+                              width: int32,
+                              height: int32,
+                              colorType: int32,
+                              bytesPerPixel: int32,
+                              out: var R2cPngImage): bool =
+    let rowBytes: int32 = width * bytesPerPixel
+    let pixelBytes: int32 = width * height * 4
+    var pixels: binbytes.ByteBuffer = r2cControllerByteBufferAlloc(pixelBytes)
+    var previous: binbytes.ByteBuffer = r2cControllerByteBufferAlloc(rowBytes)
+    var current: binbytes.ByteBuffer = r2cControllerByteBufferAlloc(rowBytes)
+    if pixelBytes > 0 && pixels.data == nil:
+        out.reason = "png_alloc_pixels_failed:" + path
+        return false
+    if rowBytes > 0 && (previous.data == nil || current.data == nil):
+        out.reason = "png_alloc_rows_failed:" + path
+        return false
+    var inOffset: int32
+    for y in 0..<height:
+        if inOffset >= inflated.len:
+            out.reason = "png_inflated_truncated:" + path
+            return false
+        let filterType: int32 = binbytes.BufByteAt(inflated, inOffset)
+        inOffset = inOffset + 1
+        for x in 0..<rowBytes:
+            if inOffset >= inflated.len:
+                out.reason = "png_row_truncated:" + path
+                return false
+            let rawValue: int32 = binbytes.BufByteAt(inflated, inOffset)
+            inOffset = inOffset + 1
+            let left: int32 = x >= bytesPerPixel ? binbytes.BufByteAt(current, x - bytesPerPixel) : 0
+            let up: int32 = binbytes.BufByteAt(previous, x)
+            let upLeft: int32 = x >= bytesPerPixel ? binbytes.BufByteAt(previous, x - bytesPerPixel) : 0
+            var value: int32 = rawValue
+            if filterType == 1:
+                value = (rawValue + left) & 255
+            elif filterType == 2:
+                value = (rawValue + up) & 255
+            elif filterType == 3:
+                value = (rawValue + ((left + up) / 2)) & 255
+            elif filterType == 4:
+                value = (rawValue + r2cControllerPngPaeth(left, up, upLeft)) & 255
+            elif filterType != 0:
+                out.reason = "png_filter_unsupported:" + intToStr(filterType)
+                return false
+            binbytes.BufSetByte(current, x, value)
+        for x in 0..<width:
+            let dst: int32 = (y * width + x) * 4
+            if colorType == 0:
+                let gray: int32 = binbytes.BufByteAt(current, x)
+                binbytes.BufSetByte(pixels, dst, gray)
+                binbytes.BufSetByte(pixels, dst + 1, gray)
+                binbytes.BufSetByte(pixels, dst + 2, gray)
+                binbytes.BufSetByte(pixels, dst + 3, 255)
+            elif colorType == 2:
+                let src: int32 = x * 3
+                binbytes.BufSetByte(pixels, dst, binbytes.BufByteAt(current, src))
+                binbytes.BufSetByte(pixels, dst + 1, binbytes.BufByteAt(current, src + 1))
+                binbytes.BufSetByte(pixels, dst + 2, binbytes.BufByteAt(current, src + 2))
+                binbytes.BufSetByte(pixels, dst + 3, 255)
+            elif colorType == 4:
+                let src: int32 = x * 2
+                let gray: int32 = binbytes.BufByteAt(current, src)
+                binbytes.BufSetByte(pixels, dst, gray)
+                binbytes.BufSetByte(pixels, dst + 1, gray)
+                binbytes.BufSetByte(pixels, dst + 2, gray)
+                binbytes.BufSetByte(pixels, dst + 3, binbytes.BufByteAt(current, src + 1))
+            else:
+                let src: int32 = x * 4
+                binbytes.BufSetByte(pixels, dst, binbytes.BufByteAt(current, src))
+                binbytes.BufSetByte(pixels, dst + 1, binbytes.BufByteAt(current, src + 1))
+                binbytes.BufSetByte(pixels, dst + 2, binbytes.BufByteAt(current, src + 2))
+                binbytes.BufSetByte(pixels, dst + 3, binbytes.BufByteAt(current, src + 3))
+        rawmem.RawmemCopy(previous.data, current.data, rowBytes)
+    binbytes.FreeByteBuffer(previous)
+    binbytes.FreeByteBuffer(current)
+    out.ok = true
+    out.reason = "ok"
+    out.pixels = pixels
+    out.width = width
+    out.height = height
+    out.pixelSha256 = r2cControllerByteBufferSha256Hex(pixels)
+    return true
+
+fn r2cControllerDecodePng(path: str): R2cPngImage =
+    var out: R2cPngImage
+    out.path = path
+    var fileBytes: binbytes.ByteBuffer = binbytes.ReadFileBytes(path)
+    out.fileSize = fileBytes.len
+    if fileBytes.data == nil || fileBytes.len <= 0:
+        out.reason = "png_file_empty:" + path
+        return out
+    out.fileSha256 = r2cControllerByteBufferSha256Hex(fileBytes)
+    if !r2cControllerPngSignatureOk(fileBytes):
+        out.reason = "png_signature_mismatch:" + path
+        binbytes.FreeByteBuffer(fileBytes)
+        return out
+    var width: int32
+    var height: int32
+    var bitDepth: int32
+    var colorType: int32
+    var compression: int32
+    var filterMethod: int32
+    var interlace: int32
+    var idat: binbytes.ByteBuffer
+    var offset: int32 = 8
+    while offset + 12 <= fileBytes.len:
+        let chunkLen: int32 = r2cControllerPngReadU32BE(fileBytes, offset)
+        let chunkType: str = r2cControllerPngChunkType(fileBytes, offset + 4)
+        let dataStart: int32 = offset + 8
+        let dataEnd: int32 = dataStart + chunkLen
+        let nextOffset: int32 = dataEnd + 4
+        if chunkLen < 0 || dataEnd < dataStart || nextOffset > fileBytes.len:
+            out.reason = "png_chunk_range_invalid:" + path
+            binbytes.FreeByteBuffer(fileBytes)
+            binbytes.FreeByteBuffer(idat)
+            return out
+        if chunkType == "IHDR":
+            width = r2cControllerPngReadU32BE(fileBytes, dataStart)
+            height = r2cControllerPngReadU32BE(fileBytes, dataStart + 4)
+            bitDepth = binbytes.BufByteAt(fileBytes, dataStart + 8)
+            colorType = binbytes.BufByteAt(fileBytes, dataStart + 9)
+            compression = binbytes.BufByteAt(fileBytes, dataStart + 10)
+            filterMethod = binbytes.BufByteAt(fileBytes, dataStart + 11)
+            interlace = binbytes.BufByteAt(fileBytes, dataStart + 12)
+        elif chunkType == "IDAT":
+            if !r2cControllerPngAppendRange(idat, fileBytes, dataStart, chunkLen):
+                out.reason = "png_idat_append_failed:" + path
+                binbytes.FreeByteBuffer(fileBytes)
+                binbytes.FreeByteBuffer(idat)
+                return out
+        elif chunkType == "IEND":
+            break
+        offset = nextOffset
+    if width <= 0 || height <= 0:
+        out.reason = "png_missing_ihdr:" + path
+        binbytes.FreeByteBuffer(fileBytes)
+        binbytes.FreeByteBuffer(idat)
+        return out
+    if bitDepth != 8 || compression != 0 || filterMethod != 0 || interlace != 0:
+        out.reason = "png_format_unsupported:" + intToStr(bitDepth) + ":" + intToStr(compression) + ":" + intToStr(filterMethod) + ":" + intToStr(interlace)
+        binbytes.FreeByteBuffer(fileBytes)
+        binbytes.FreeByteBuffer(idat)
+        return out
+    let bytesPerPixel: int32 = r2cControllerPngBytesPerPixel(colorType)
+    if bytesPerPixel <= 0:
+        out.reason = "png_color_type_unsupported:" + intToStr(colorType)
+        binbytes.FreeByteBuffer(fileBytes)
+        binbytes.FreeByteBuffer(idat)
+        return out
+    let expectedInflated: int32 = (width * bytesPerPixel + 1) * height
+    if expectedInflated <= 0 || expectedInflated > 268435456:
+        out.reason = "png_size_unsupported:" + intToStr(width) + "x" + intToStr(height)
+        binbytes.FreeByteBuffer(fileBytes)
+        binbytes.FreeByteBuffer(idat)
+        return out
+    let inflateRes: Result[binbytes.ByteBuffer] = zlib.WowZlibInflate(idat, 0, idat.len, expectedInflated)
+    if IsErr(inflateRes):
+        out.reason = "png_inflate_failed:" + Error(inflateRes)
+        binbytes.FreeByteBuffer(fileBytes)
+        binbytes.FreeByteBuffer(idat)
+        return out
+    var inflated: binbytes.ByteBuffer = Value(inflateRes)
+    if !r2cControllerPngDecodeRows(path, inflated, width, height, colorType, bytesPerPixel, out):
+        binbytes.FreeByteBuffer(fileBytes)
+        binbytes.FreeByteBuffer(idat)
+        binbytes.FreeByteBuffer(inflated)
+        return out
+    binbytes.FreeByteBuffer(fileBytes)
+    binbytes.FreeByteBuffer(idat)
+    binbytes.FreeByteBuffer(inflated)
+    return out
+
+fn r2cControllerPngDiffRatioText(diffPixelCount: int32,
+                                 pixelCount: int32): str =
+    if pixelCount <= 0:
+        return "0"
+    if diffPixelCount <= 0:
+        return "0"
+    let scaled: int32 = (diffPixelCount * 1000000) / pixelCount
+    let whole: int32 = scaled / 1000000
+    var frac: str = intToStr(scaled % 1000000)
+    while strings.Len(frac) < 6:
+        frac = "0" + frac
+    return intToStr(whole) + "." + frac
+
+fn r2cControllerComparePngImages(left: R2cPngImage,
+                                 right: R2cPngImage): R2cPngCompare =
+    var out: R2cPngCompare
+    out.width = left.width
+    out.height = left.height
+    out.otherWidth = right.width
+    out.otherHeight = right.height
+    out.firstDiffJson = "null"
+    if !left.ok:
+        out.reason = left.reason
+        return out
+    if !right.ok:
+        out.reason = right.reason
+        return out
+    if left.width != right.width || left.height != right.height:
+        out.reason = "dimension_mismatch"
+        out.diffRatioText = "1"
+        out.maxChannelDelta = 255
+        return out
+    out.pixelCount = left.width * left.height
+    var index: int32
+    while index < left.pixels.len:
+        var different = false
+        for channel in 0..<4:
+            let leftValue: int32 = binbytes.BufByteAt(left.pixels, index + channel)
+            let rightValue: int32 = binbytes.BufByteAt(right.pixels, index + channel)
+            var delta: int32 = leftValue - rightValue
+            if delta < 0:
+                delta = 0 - delta
+            out.totalAbsDelta = out.totalAbsDelta + delta
+            if delta > 0:
+                different = true
+            if delta > out.maxChannelDelta:
+                out.maxChannelDelta = delta
+        if different:
+            out.diffPixelCount = out.diffPixelCount + 1
+            if out.firstDiffJson == "null":
+                let pixelIndex: int32 = index / 4
+                out.firstDiffJson = "{"
+                out.firstDiffJson = out.firstDiffJson + "\"x\":" + intToStr(pixelIndex % left.width)
+                out.firstDiffJson = out.firstDiffJson + ",\"y\":" + intToStr(pixelIndex / left.width)
+                out.firstDiffJson = out.firstDiffJson + "}"
+        index = index + 4
+    out.ok = out.diffPixelCount == 0
+    out.reason = out.ok ? "ok" : "pixel_mismatch"
+    out.diffRatioText = r2cControllerPngDiffRatioText(out.diffPixelCount, out.pixelCount)
+    return out
+
+fn r2cControllerRenderCompareDirectEnabled(nativeSummaryFlag: str,
+                                           truthSummaryFlag: str,
+                                           nativeScreenshotFlag: str,
+                                           truthScreenshotFlag: str): bool =
+    return strings.Len(nativeSummaryFlag) > 0 ||
+           strings.Len(truthSummaryFlag) > 0 ||
+           strings.Len(nativeScreenshotFlag) > 0 ||
+           strings.Len(truthScreenshotFlag) > 0
+
+fn r2cControllerRenderCompareDirectRequire(nativeSummaryPath: str,
+                                           truthSummaryPath: str,
+                                           nativeScreenshotPath: str,
+                                           truthScreenshotPath: str): bool =
+    if strings.Len(nativeSummaryPath) <= 0:
+        r2cControllerPrintErr("r2c-react: render-compare direct mode missing --native-summary")
+        return false
+    if strings.Len(truthSummaryPath) <= 0:
+        r2cControllerPrintErr("r2c-react: render-compare direct mode missing --truth-summary")
+        return false
+    if strings.Len(nativeScreenshotPath) <= 0:
+        r2cControllerPrintErr("r2c-react: render-compare direct mode missing --native-screenshot")
+        return false
+    if strings.Len(truthScreenshotPath) <= 0:
+        r2cControllerPrintErr("r2c-react: render-compare direct mode missing --truth-screenshot")
+        return false
+    if !chengpath.PathFileExists(nativeSummaryPath):
+        r2cControllerPrintErr("r2c-react: render-compare missing native summary: " + nativeSummaryPath)
+        return false
+    if !chengpath.PathFileExists(truthSummaryPath):
+        r2cControllerPrintErr("r2c-react: render-compare missing truth summary: " + truthSummaryPath)
+        return false
+    if !chengpath.PathFileExists(nativeScreenshotPath):
+        r2cControllerPrintErr("r2c-react: render-compare missing native screenshot: " + nativeScreenshotPath)
+        return false
+    if !chengpath.PathFileExists(truthScreenshotPath):
+        r2cControllerPrintErr("r2c-react: render-compare missing truth screenshot: " + truthScreenshotPath)
+        return false
+    return true
+
+fn r2cControllerRenderCompareWriteDirectReport(repo: str,
+                                               outDir: str,
+                                               routeState: str,
+                                               summaryPath: str,
+                                               reportPath: str,
+                                               nativeSummaryPath: str,
+                                               truthSummaryPath: str,
+                                               nativeScreenshotPath: str,
+                                               truthScreenshotPath: str,
+                                               nativePng: R2cPngImage,
+                                               truthPng: R2cPngImage,
+                                               compare: R2cPngCompare): bool =
+    let nativeRuntimeBundleSemanticNodesCountText: str = r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_bundle_semantic_nodes_count", "0")
+    let truthSemanticNodesCountText: str = r2cControllerReadSummaryValue(truthSummaryPath, "semantic_nodes_count", "0")
+    let semanticDelta: int32 = r2cControllerParseInt32(nativeRuntimeBundleSemanticNodesCountText) - r2cControllerParseInt32(truthSemanticNodesCountText)
+    let nativeRouteState: str = r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_route_state", "")
+    let routeStateMatch: bool = nativeRouteState == routeState
+    let nativeWindowWidthText: str = r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_window_width", intToStr(nativePng.width))
+    let nativeWindowHeightText: str = r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_window_height", intToStr(nativePng.height))
+    let truthTracePath: str = r2cControllerReadSummaryValue(truthSummaryPath, "truth_trace_path", "")
+    let truthTraceFormat: str = r2cControllerReadSummaryValue(truthSummaryPath, "truth_trace_format", "")
+    let truthDomHash: str = r2cControllerReadSummaryValue(truthSummaryPath, "dom_hash", "")
+    let truthScreenshotSha256: str = r2cControllerReadSummaryValue(truthSummaryPath, "screenshot_sha256", truthPng.fileSha256)
+    var report = "{\n"
+    report = report + "  \"format\": \"render_compare_v1\",\n"
+    report = report + "  \"ok\": " + r2cControllerJsonBool(compare.ok) + ",\n"
+    report = report + "  \"reason\": " + r2cControllerJsonQuote(compare.reason) + ",\n"
+    report = report + "  \"direct_mode\": true,\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(r2cControllerRoot()) + ",\n"
+    report = report + "  \"route_state\": " + r2cControllerJsonQuote(routeState) + ",\n"
+    report = report + "  \"stage3_path\": \"\",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"native_gui_summary_ready\": true,\n"
+    report = report + "  \"native_gui_summary_path\": " + r2cControllerJsonQuote(nativeSummaryPath) + ",\n"
+    report = report + "  \"truth_summary_path\": " + r2cControllerJsonQuote(truthSummaryPath) + ",\n"
+    report = report + "  \"native_gui_route_state\": " + r2cControllerJsonQuote(nativeRouteState) + ",\n"
+    report = report + "  \"native_gui_screenshot_path\": " + r2cControllerJsonQuote(nativeScreenshotPath) + ",\n"
+    report = report + "  \"native_gui_runtime_bundle_ready\": " + r2cControllerJsonBoolTextOrFalse(r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_bundle_ready", "")) + ",\n"
+    report = report + "  \"native_gui_runtime_contract_ready\": " + r2cControllerJsonBoolTextOrFalse(r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_contract_ready", "")) + ",\n"
+    report = report + "  \"native_gui_runtime_bundle_route_state\": " + r2cControllerJsonQuote(r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_bundle_route_state", "")) + ",\n"
+    report = report + "  \"native_gui_runtime_bundle_semantic_nodes_count\": " + nativeRuntimeBundleSemanticNodesCountText + ",\n"
+    report = report + "  \"native_gui_runtime_bundle_layout_item_count\": " + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_bundle_layout_item_count", "0") + ",\n"
+    report = report + "  \"native_gui_runtime_bundle_render_command_count\": " + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_bundle_render_command_count", "0") + ",\n"
+    report = report + "  \"native_gui_runtime_contract_interactive_item_count\": " + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_contract_interactive_item_count", "0") + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_item_count\": " + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_native_layout_plan_item_count", "0") + ",\n"
+    report = report + "  \"native_gui_render_plan_command_count\": " + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_render_plan_command_count", "0") + ",\n"
+    report = report + "  \"truth_trace_path\": " + r2cControllerJsonQuote(truthTracePath) + ",\n"
+    report = report + "  \"truth_trace_format\": " + r2cControllerJsonQuote(truthTraceFormat) + ",\n"
+    report = report + "  \"truth_screenshot_path\": " + r2cControllerJsonQuote(truthScreenshotPath) + ",\n"
+    report = report + "  \"truth_semantic_nodes_count\": " + truthSemanticNodesCountText + ",\n"
+    report = report + "  \"truth_document_nodes_count\": " + r2cControllerReadSummaryValue(truthSummaryPath, "document_nodes_count", "0") + ",\n"
+    report = report + "  \"truth_dom_hash\": " + r2cControllerJsonQuote(truthDomHash) + ",\n"
+    report = report + "  \"truth_screenshot_sha256\": " + r2cControllerJsonQuote(truthScreenshotSha256) + ",\n"
+    report = report + "  \"route_state_match\": " + r2cControllerJsonBool(routeStateMatch) + ",\n"
+    report = report + "  \"semantic_nodes_count_delta\": " + intToStr(semanticDelta) + ",\n"
+    report = report + "  \"native_window_width\": " + nativeWindowWidthText + ",\n"
+    report = report + "  \"native_window_height\": " + nativeWindowHeightText + ",\n"
+    report = report + "  \"truth_window_width\": " + intToStr(truthPng.width) + ",\n"
+    report = report + "  \"truth_window_height\": " + intToStr(truthPng.height) + ",\n"
+    report = report + "  \"native_screenshot_path\": " + r2cControllerJsonQuote(nativeScreenshotPath) + ",\n"
+    report = report + "  \"native_file_sha256\": " + r2cControllerJsonQuote(nativePng.fileSha256) + ",\n"
+    report = report + "  \"truth_file_sha256\": " + r2cControllerJsonQuote(truthPng.fileSha256) + ",\n"
+    report = report + "  \"native_pixel_sha256\": " + r2cControllerJsonQuote(nativePng.pixelSha256) + ",\n"
+    report = report + "  \"truth_pixel_sha256\": " + r2cControllerJsonQuote(truthPng.pixelSha256) + ",\n"
+    report = report + "  \"pixel_count\": " + intToStr(compare.pixelCount) + ",\n"
+    report = report + "  \"diff_pixel_count\": " + intToStr(compare.diffPixelCount) + ",\n"
+    report = report + "  \"diff_ratio\": " + compare.diffRatioText + ",\n"
+    report = report + "  \"max_channel_delta\": " + intToStr(compare.maxChannelDelta) + ",\n"
+    report = report + "  \"total_abs_delta\": " + intToStr(compare.totalAbsDelta) + ",\n"
+    report = report + "  \"first_diff\": " + compare.firstDiffJson + "\n"
+    report = report + "}\n"
+    if !chengpath.WriteTextFile("", reportPath, report):
+        return false
+    var summary = ""
+    summary = summary + "ok=" + r2cControllerJsonBool(compare.ok) + "\n"
+    summary = summary + "reason=" + compare.reason + "\n"
+    summary = summary + "direct_mode=true\n"
+    summary = summary + "route_state=" + routeState + "\n"
+    summary = summary + "route_state_match=" + r2cControllerJsonBool(routeStateMatch) + "\n"
+    summary = summary + "native_gui_summary_path=" + nativeSummaryPath + "\n"
+    summary = summary + "truth_summary_path=" + truthSummaryPath + "\n"
+    summary = summary + "native_screenshot_path=" + nativeScreenshotPath + "\n"
+    summary = summary + "truth_screenshot_path=" + truthScreenshotPath + "\n"
+    summary = summary + "native_gui_runtime_bundle_ready=" + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_bundle_ready", "") + "\n"
+    summary = summary + "native_gui_runtime_contract_ready=" + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_contract_ready", "") + "\n"
+    summary = summary + "native_gui_runtime_bundle_route_state=" + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_bundle_route_state", "") + "\n"
+    summary = summary + "native_gui_runtime_bundle_semantic_nodes_count=" + nativeRuntimeBundleSemanticNodesCountText + "\n"
+    summary = summary + "native_gui_runtime_bundle_layout_item_count=" + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_bundle_layout_item_count", "0") + "\n"
+    summary = summary + "native_gui_runtime_bundle_render_command_count=" + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_bundle_render_command_count", "0") + "\n"
+    summary = summary + "native_gui_runtime_contract_interactive_item_count=" + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_runtime_contract_interactive_item_count", "0") + "\n"
+    summary = summary + "native_gui_native_layout_plan_item_count=" + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_native_layout_plan_item_count", "0") + "\n"
+    summary = summary + "native_gui_render_plan_command_count=" + r2cControllerReadSummaryValue(nativeSummaryPath, "native_gui_render_plan_command_count", "0") + "\n"
+    summary = summary + "truth_trace_path=" + truthTracePath + "\n"
+    summary = summary + "truth_trace_format=" + truthTraceFormat + "\n"
+    summary = summary + "truth_semantic_nodes_count=" + truthSemanticNodesCountText + "\n"
+    summary = summary + "truth_document_nodes_count=" + r2cControllerReadSummaryValue(truthSummaryPath, "document_nodes_count", "0") + "\n"
+    summary = summary + "truth_dom_hash=" + truthDomHash + "\n"
+    summary = summary + "truth_screenshot_sha256=" + truthScreenshotSha256 + "\n"
+    summary = summary + "semantic_nodes_count_delta=" + intToStr(semanticDelta) + "\n"
+    summary = summary + "native_window_width=" + nativeWindowWidthText + "\n"
+    summary = summary + "native_window_height=" + nativeWindowHeightText + "\n"
+    summary = summary + "pixel_count=" + intToStr(compare.pixelCount) + "\n"
+    summary = summary + "diff_pixel_count=" + intToStr(compare.diffPixelCount) + "\n"
+    summary = summary + "diff_ratio=" + compare.diffRatioText + "\n"
+    summary = summary + "max_channel_delta=" + intToStr(compare.maxChannelDelta) + "\n"
+    summary = summary + "total_abs_delta=" + intToStr(compare.totalAbsDelta) + "\n"
+    summary = summary + "report_path=" + reportPath + "\n"
+    return chengpath.WriteTextFile("", summaryPath, summary)
+
+fn r2cControllerRenderCompareDirectRun(repo: str,
+                                       outDir: str,
+                                       routeState: str,
+                                       summaryPath: str,
+                                       reportPath: str,
+                                       nativeSummaryPath: str,
+                                       truthSummaryPath: str,
+                                       nativeScreenshotPath: str,
+                                       truthScreenshotPath: str): int32 =
+    if !r2cControllerRenderCompareDirectRequire(nativeSummaryPath, truthSummaryPath, nativeScreenshotPath, truthScreenshotPath):
+        return 1
+    var nativePng: R2cPngImage = r2cControllerDecodePng(nativeScreenshotPath)
+    if !nativePng.ok:
+        r2cControllerPrintErr("r2c-react: native png decode failed: " + nativePng.reason)
+        return 1
+    var truthPng: R2cPngImage = r2cControllerDecodePng(truthScreenshotPath)
+    if !truthPng.ok:
+        r2cControllerPrintErr("r2c-react: truth png decode failed: " + truthPng.reason)
+        binbytes.FreeByteBuffer(nativePng.pixels)
+        return 1
+    let compare: R2cPngCompare = r2cControllerComparePngImages(nativePng, truthPng)
+    if !r2cControllerRenderCompareWriteDirectReport(repo,
+                                                    outDir,
+                                                    routeState,
+                                                    summaryPath,
+                                                    reportPath,
+                                                    nativeSummaryPath,
+                                                    truthSummaryPath,
+                                                    nativeScreenshotPath,
+                                                    truthScreenshotPath,
+                                                    nativePng,
+                                                    truthPng,
+                                                    compare):
+        r2cControllerPrintErr("r2c-react: render-compare failed to write direct report: " + reportPath)
+        binbytes.FreeByteBuffer(nativePng.pixels)
+        binbytes.FreeByteBuffer(truthPng.pixels)
+        return 1
+    binbytes.FreeByteBuffer(nativePng.pixels)
+    binbytes.FreeByteBuffer(truthPng.pixels)
+    if !compare.ok:
+        return 3
+    return 0
+
 fn r2cControllerRenderCompare(root: str,
                               args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let repoBase: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--repo", currentDir))
@@ -7665,173 +9067,41 @@ fn r2cControllerRenderCompare(root: str,
         outDir = chengpath.PathAbsolute(repo, outDirFlag)
     let scratchOk: bool = chengpath.MkdirP("", outDir)
     scratchOk
-    let experimentalRoot: str = chengpath.PathAbsolute(effectiveRoot, "tools/r2c/experimental")
-    let renderCompareHelper: str = os.JoinPath(experimentalRoot, "r2c-react-render-compare.mjs")
     var summaryPath: str = os.JoinPath(outDir, "render_compare.summary.env")
     var reportPath: str = os.JoinPath(outDir, "render_compare_report_v1.json")
     if strings.Len(summaryOutFlag) > 0:
         summaryPath = chengpath.PathAbsolute(outDir, summaryOutFlag)
     if strings.Len(outFlag) > 0:
         reportPath = chengpath.PathAbsolute(outDir, outFlag)
-    let helperLogPath: str = os.JoinPath(outDir, "render_compare.controller.log")
 
-    var helperArgs: str[]
-    add(helperArgs, "--repo")
-    add(helperArgs, repo)
-    add(helperArgs, "--route")
-    add(helperArgs, routeFlag)
-    add(helperArgs, "--out-dir")
-    add(helperArgs, outDir)
-    add(helperArgs, "--summary-out")
-    add(helperArgs, summaryPath)
-    add(helperArgs, "--out")
-    add(helperArgs, reportPath)
-    if strings.Len(baseUrl) > 0:
-        add(helperArgs, "--base-url")
-        add(helperArgs, baseUrl)
-    if strings.Len(toolingBin) > 0:
-        add(helperArgs, "--tooling-bin")
-        add(helperArgs, toolingBin)
-    if strings.Len(autoCloseMs) > 0:
-        add(helperArgs, "--auto-close-ms")
-        add(helperArgs, autoCloseMs)
-    if strings.Len(resizeSpec) > 0:
-        add(helperArgs, "--resize")
-        add(helperArgs, resizeSpec)
-    if strings.Len(waitMs) > 0:
-        add(helperArgs, "--wait-ms")
-        add(helperArgs, waitMs)
-    if strings.Len(browserWidth) > 0:
-        add(helperArgs, "--browser-width")
-        add(helperArgs, browserWidth)
-    if strings.Len(browserHeight) > 0:
-        add(helperArgs, "--browser-height")
-        add(helperArgs, browserHeight)
-    if strings.Len(nativeSummaryFlag) > 0:
-        add(helperArgs, "--native-summary")
-        add(helperArgs, chengpath.PathAbsolute(outDir, nativeSummaryFlag))
-    if strings.Len(truthSummaryFlag) > 0:
-        add(helperArgs, "--truth-summary")
-        add(helperArgs, chengpath.PathAbsolute(outDir, truthSummaryFlag))
-    if strings.Len(nativeScreenshotFlag) > 0:
-        add(helperArgs, "--native-screenshot")
-        add(helperArgs, chengpath.PathAbsolute(outDir, nativeScreenshotFlag))
-    if strings.Len(truthScreenshotFlag) > 0:
-        add(helperArgs, "--truth-screenshot")
-        add(helperArgs, chengpath.PathAbsolute(outDir, truthScreenshotFlag))
-
-    var helperExitCode: int32
-    var helperOutput: str
-    os.OsSetEmpty(helperOutput)
-    if !r2cControllerRunNodeHelper(effectiveRoot,
-                                   renderCompareHelper,
-                                   helperArgs,
-                                   helperLogPath,
-                                   helperExitCode,
-                                   helperOutput):
-        r2cControllerPrintErr("r2c-react: render compare helper failed")
-        if strings.Len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
-        return 1
-    if !chengpath.PathFileExists(summaryPath):
-        r2cControllerPrintErr("r2c-react: render-compare missing summary: " + summaryPath)
-        return 1
-    reportPath = r2cControllerReadSummaryValue(summaryPath, "report_path", reportPath)
-    if !chengpath.PathFileExists(reportPath):
-        r2cControllerPrintErr("r2c-react: render-compare missing report: " + reportPath)
+    if !r2cControllerRenderCompareDirectEnabled(nativeSummaryFlag, truthSummaryFlag, nativeScreenshotFlag, truthScreenshotFlag):
+        r2cControllerPrintErr("r2c-react: render-compare now requires direct native/truth artifacts; run native-gui-bundle/run-native-gui and capture-truth explicitly, then pass --native-summary --truth-summary --native-screenshot --truth-screenshot")
         return 1
 
-    let reason: str = r2cControllerReadSummaryValue(summaryPath, "reason", "ok")
-    let directModeText: str = r2cControllerReadSummaryValue(summaryPath, "direct_mode", "")
-    let routeState: str = r2cControllerReadSummaryValue(summaryPath, "route_state", routeFlag)
-    let routeStateMatchText: str = r2cControllerReadSummaryValue(summaryPath, "route_state_match", "")
-    let nativeGuiSummaryPath: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_summary_path", "")
-    let truthSummaryPath: str = r2cControllerReadSummaryValue(summaryPath, "truth_summary_path", "")
-    let nativeScreenshotPath: str = r2cControllerReadSummaryValue(summaryPath, "native_screenshot_path", "")
-    let truthScreenshotPath: str = r2cControllerReadSummaryValue(summaryPath, "truth_screenshot_path", "")
-    let nativeGuiRuntimeBundleReadyText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_runtime_bundle_ready", "")
-    let nativeGuiRuntimeContractReadyText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_runtime_contract_ready", "")
-    let nativeGuiRuntimeBundleRouteState: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_runtime_bundle_route_state", "")
-    let nativeGuiRuntimeBundleSemanticNodesCountText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_runtime_bundle_semantic_nodes_count", "0")
-    let nativeGuiRuntimeBundleLayoutItemCountText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_runtime_bundle_layout_item_count", "0")
-    let nativeGuiRuntimeBundleRenderCommandCountText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_runtime_bundle_render_command_count", "0")
-    let nativeGuiRuntimeContractInteractiveItemCountText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_runtime_contract_interactive_item_count", "0")
-    let nativeGuiNativeLayoutPlanItemCountText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_native_layout_plan_item_count", "0")
-    let nativeGuiRenderPlanCommandCountText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_render_plan_command_count", "0")
-    let truthTracePath: str = r2cControllerReadSummaryValue(summaryPath, "truth_trace_path", "")
-    let truthTraceFormat: str = r2cControllerReadSummaryValue(summaryPath, "truth_trace_format", "")
-    let truthSemanticNodesCountText: str = r2cControllerReadSummaryValue(summaryPath, "truth_semantic_nodes_count", "0")
-    let truthDocumentNodesCountText: str = r2cControllerReadSummaryValue(summaryPath, "truth_document_nodes_count", "0")
-    let truthDomHash: str = r2cControllerReadSummaryValue(summaryPath, "truth_dom_hash", "")
-    let truthScreenshotSha256: str = r2cControllerReadSummaryValue(summaryPath, "truth_screenshot_sha256", "")
-    let semanticNodesCountDeltaText: str = r2cControllerReadSummaryValue(summaryPath, "semantic_nodes_count_delta", "0")
-    let nativeWindowWidthText: str = r2cControllerReadSummaryValue(summaryPath, "native_window_width", "0")
-    let nativeWindowHeightText: str = r2cControllerReadSummaryValue(summaryPath, "native_window_height", "0")
-    let pixelCountText: str = r2cControllerReadSummaryValue(summaryPath, "pixel_count", "0")
-    let diffPixelCountText: str = r2cControllerReadSummaryValue(summaryPath, "diff_pixel_count", "0")
-    let diffRatioText: str = r2cControllerReadSummaryValue(summaryPath, "diff_ratio", "0")
-    let maxChannelDeltaText: str = r2cControllerReadSummaryValue(summaryPath, "max_channel_delta", "0")
-    let totalAbsDeltaText: str = r2cControllerReadSummaryValue(summaryPath, "total_abs_delta", "0")
+    let nativeSummaryPath: str = chengpath.PathAbsolute(outDir, nativeSummaryFlag)
+    let truthSummaryPath: str = chengpath.PathAbsolute(outDir, truthSummaryFlag)
+    let nativeScreenshotPath: str = chengpath.PathAbsolute(outDir, nativeScreenshotFlag)
+    let truthScreenshotPath: str = chengpath.PathAbsolute(outDir, truthScreenshotFlag)
+    let directRc: int32 = r2cControllerRenderCompareDirectRun(repo,
+                                                              outDir,
+                                                              routeFlag,
+                                                              summaryPath,
+                                                              reportPath,
+                                                              nativeSummaryPath,
+                                                              truthSummaryPath,
+                                                              nativeScreenshotPath,
+                                                              truthScreenshotPath)
+    if chengpath.PathFileExists(reportPath):
+        r2cControllerPrintLine(reportPath)
+    return directRc
 
-    var report = "{\n"
-    report = report + "  \"format\": \"controller_report_v1\",\n"
-    report = report + "  \"controller\": \"cheng.live_controller\",\n"
-    report = report + "  \"command\": \"render-compare\",\n"
-    report = report + "  \"ok\": true,\n"
-    report = report + "  \"reason\": " + r2cControllerJsonQuote(reason) + ",\n"
-    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
-    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
-    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(reportPath) + ",\n"
-    report = report + "  \"primary_artifact_format\": \"render_compare_v1\",\n"
-    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(renderCompareHelper) + ",\n"
-    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
-    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(helperLogPath) + ",\n"
-    report = report + "  \"route_state\": " + r2cControllerJsonQuote(routeState) + ",\n"
-    report = report + "  \"native_gui_summary_path\": " + r2cControllerJsonQuote(nativeGuiSummaryPath) + ",\n"
-    report = report + "  \"truth_summary_path\": " + r2cControllerJsonQuote(truthSummaryPath) + ",\n"
-    report = report + "  \"native_screenshot_path\": " + r2cControllerJsonQuote(nativeScreenshotPath) + ",\n"
-    report = report + "  \"truth_screenshot_path\": " + r2cControllerJsonQuote(truthScreenshotPath) + ",\n"
-    report = report + "  \"native_gui_runtime_bundle_route_state\": " + r2cControllerJsonQuote(nativeGuiRuntimeBundleRouteState) + ",\n"
-    report = report + "  \"truth_trace_path\": " + r2cControllerJsonQuote(truthTracePath) + ",\n"
-    report = report + "  \"truth_trace_format\": " + r2cControllerJsonQuote(truthTraceFormat) + ",\n"
-    report = report + "  \"truth_dom_hash\": " + r2cControllerJsonQuote(truthDomHash) + ",\n"
-    report = report + "  \"truth_screenshot_sha256\": " + r2cControllerJsonQuote(truthScreenshotSha256) + ",\n"
-    report = report + "  \"diff_ratio_text\": " + r2cControllerJsonQuote(diffRatioText) + ",\n"
-    report = report + "  \"native_gui_runtime_bundle_semantic_nodes_count\": " + nativeGuiRuntimeBundleSemanticNodesCountText + ",\n"
-    report = report + "  \"native_gui_runtime_bundle_layout_item_count\": " + nativeGuiRuntimeBundleLayoutItemCountText + ",\n"
-    report = report + "  \"native_gui_runtime_bundle_render_command_count\": " + nativeGuiRuntimeBundleRenderCommandCountText + ",\n"
-    report = report + "  \"native_gui_runtime_contract_interactive_item_count\": " + nativeGuiRuntimeContractInteractiveItemCountText + ",\n"
-    report = report + "  \"native_gui_native_layout_plan_item_count\": " + nativeGuiNativeLayoutPlanItemCountText + ",\n"
-    report = report + "  \"native_gui_render_plan_command_count\": " + nativeGuiRenderPlanCommandCountText + ",\n"
-    report = report + "  \"truth_semantic_nodes_count\": " + truthSemanticNodesCountText + ",\n"
-    report = report + "  \"truth_document_nodes_count\": " + truthDocumentNodesCountText + ",\n"
-    report = report + "  \"semantic_nodes_count_delta\": " + semanticNodesCountDeltaText + ",\n"
-    report = report + "  \"native_window_width\": " + nativeWindowWidthText + ",\n"
-    report = report + "  \"native_window_height\": " + nativeWindowHeightText + ",\n"
-    report = report + "  \"pixel_count\": " + pixelCountText + ",\n"
-    report = report + "  \"diff_pixel_count\": " + diffPixelCountText + ",\n"
-    report = report + "  \"max_channel_delta\": " + maxChannelDeltaText + ",\n"
-    report = report + "  \"total_abs_delta\": " + totalAbsDeltaText + ",\n"
-    report = report + "  \"direct_mode\": " + r2cControllerJsonBoolTextOrNull(directModeText) + ",\n"
-    report = report + "  \"route_state_match\": " + r2cControllerJsonBoolTextOrNull(routeStateMatchText) + ",\n"
-    report = report + "  \"native_gui_runtime_bundle_ready\": " + r2cControllerJsonBoolTextOrNull(nativeGuiRuntimeBundleReadyText) + ",\n"
-    report = report + "  \"native_gui_runtime_contract_ready\": " + r2cControllerJsonBoolTextOrNull(nativeGuiRuntimeContractReadyText) + "\n"
-    report = report + "}\n"
-    if !chengpath.WriteTextFile("", reportPath, report):
-        r2cControllerPrintErr("r2c-react: render-compare failed to write report: " + reportPath)
-        return 1
-    r2cControllerPrintLine(reportPath)
-    return 0
-
-fn r2cControllerRenderCompareMatrixReason(helperFailedCount: int32,
+fn r2cControllerRenderCompareMatrixReason(directCompareFailedCount: int32,
                                           notOkCount: int32,
                                           routeStateMismatchCount: int32,
                                           pixelMismatchCount: int32,
                                           semanticDeltaCount: int32): str =
-    if helperFailedCount > 0:
-        return "helper_failed"
+    if directCompareFailedCount > 0:
+        return "direct_compare_failed"
     if routeStateMismatchCount > 0:
         return "route_state_mismatch"
     if pixelMismatchCount > 0:
@@ -7844,7 +9114,6 @@ fn r2cControllerRenderCompareMatrixReason(helperFailedCount: int32,
 
 fn r2cControllerRenderCompareMatrix(root: str,
                                     args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let currentDir: str = r2cControllerRoot()
     let repoBase: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--repo", currentDir))
@@ -7873,8 +9142,6 @@ fn r2cControllerRenderCompareMatrix(root: str,
     if strings.Len(summaryOutFlag) > 0:
         matrixSummaryPath = chengpath.PathAbsolute(outDir, summaryOutFlag)
     let controllerReportPath: str = os.JoinPath(outDir, "render_compare_matrix_report_v1.json")
-    let experimentalRoot: str = chengpath.PathAbsolute(effectiveRoot, "tools/r2c/experimental")
-    let renderCompareHelper: str = os.JoinPath(experimentalRoot, "r2c-react-render-compare.mjs")
     let matrixText: str = chengpath.ReadTextFile("", matrixPath)
     let entriesRaw: str = r2cControllerJsonReadArrayFieldRaw(matrixText, "entries", "")
     if strings.Len(entriesRaw) <= 0:
@@ -7885,7 +9152,7 @@ fn r2cControllerRenderCompareMatrix(root: str,
     var routeCount: int32
     var okCount: int32
     var notOkCount: int32
-    var helperFailedCount: int32
+    var directCompareFailedCount: int32
     var routeStateMismatchCount: int32
     var pixelMismatchCount: int32
     var semanticDeltaCount: int32
@@ -7926,40 +9193,20 @@ fn r2cControllerRenderCompareMatrix(root: str,
         routeMkdirOk
         let routeReportPath: str = os.JoinPath(routeOutDir, "render_compare_report_v1.json")
         let routeSummaryPath: str = os.JoinPath(routeOutDir, "render_compare.summary.env")
-        let routeLogPath: str = os.JoinPath(routeOutDir, "render_compare.log")
         var entryReason = "ok"
-        var helperExitCode: int32
-        var helperOutput: str
-        os.OsSetEmpty(helperOutput)
-        var helperArgs: str[]
-        add(helperArgs, "--repo")
-        add(helperArgs, repo)
-        add(helperArgs, "--route")
-        add(helperArgs, routeState)
-        add(helperArgs, "--out-dir")
-        add(helperArgs, routeOutDir)
-        add(helperArgs, "--summary-out")
-        add(helperArgs, routeSummaryPath)
-        add(helperArgs, "--out")
-        add(helperArgs, routeReportPath)
-        add(helperArgs, "--native-summary")
-        add(helperArgs, nativeSummaryPath)
-        add(helperArgs, "--truth-summary")
-        add(helperArgs, truthSummaryPath)
-        add(helperArgs, "--native-screenshot")
-        add(helperArgs, nativeScreenshotPath)
-        add(helperArgs, "--truth-screenshot")
-        add(helperArgs, truthScreenshotPath)
-        let helperOk: bool = r2cControllerRunNodeHelper(effectiveRoot,
-                                                        renderCompareHelper,
-                                                        helperArgs,
-                                                        routeLogPath,
-                                                        helperExitCode,
-                                                        helperOutput)
+        let directRc: int32 = r2cControllerRenderCompareDirectRun(repo,
+                                                                  routeOutDir,
+                                                                  routeState,
+                                                                  routeSummaryPath,
+                                                                  routeReportPath,
+                                                                  nativeSummaryPath,
+                                                                  truthSummaryPath,
+                                                                  nativeScreenshotPath,
+                                                                  truthScreenshotPath)
         let summaryReady: bool = chengpath.PathFileExists(routeSummaryPath)
-        if !helperOk && !summaryReady:
-            helperFailedCount = helperFailedCount + 1
-            entryReason = "helper_failed"
+        if directRc != 0 && !summaryReady:
+            directCompareFailedCount = directCompareFailedCount + 1
+            entryReason = "direct_compare_failed"
         let okText: str = r2cControllerReadSummaryValue(routeSummaryPath, "ok", "false")
         let reasonText: str = r2cControllerReadSummaryValue(routeSummaryPath, "reason", entryReason)
         let routeStateMatchText: str = r2cControllerReadSummaryValue(routeSummaryPath, "route_state_match", "")
@@ -8001,7 +9248,7 @@ fn r2cControllerRenderCompareMatrix(root: str,
         entriesJson = entriesJson + "    }"
         wroteEntry = true
     entriesJson = entriesJson + "\n  ]"
-    let finalReason: str = r2cControllerRenderCompareMatrixReason(helperFailedCount,
+    let finalReason: str = r2cControllerRenderCompareMatrixReason(directCompareFailedCount,
                                                                   notOkCount,
                                                                   routeStateMismatchCount,
                                                                   pixelMismatchCount,
@@ -8017,7 +9264,7 @@ fn r2cControllerRenderCompareMatrix(root: str,
     matrixDoc = matrixDoc + "  \"route_count\": " + intToStr(routeCount) + ",\n"
     matrixDoc = matrixDoc + "  \"ok_count\": " + intToStr(okCount) + ",\n"
     matrixDoc = matrixDoc + "  \"not_ok_count\": " + intToStr(notOkCount) + ",\n"
-    matrixDoc = matrixDoc + "  \"helper_failed_count\": " + intToStr(helperFailedCount) + ",\n"
+    matrixDoc = matrixDoc + "  \"direct_compare_failed_count\": " + intToStr(directCompareFailedCount) + ",\n"
     matrixDoc = matrixDoc + "  \"route_state_mismatch_count\": " + intToStr(routeStateMismatchCount) + ",\n"
     matrixDoc = matrixDoc + "  \"pixel_mismatch_count\": " + intToStr(pixelMismatchCount) + ",\n"
     matrixDoc = matrixDoc + "  \"semantic_delta_count\": " + intToStr(semanticDeltaCount) + ",\n"
@@ -8034,7 +9281,7 @@ fn r2cControllerRenderCompareMatrix(root: str,
     summaryText = summaryText + "route_count=" + intToStr(routeCount) + "\n"
     summaryText = summaryText + "ok_count=" + intToStr(okCount) + "\n"
     summaryText = summaryText + "not_ok_count=" + intToStr(notOkCount) + "\n"
-    summaryText = summaryText + "helper_failed_count=" + intToStr(helperFailedCount) + "\n"
+    summaryText = summaryText + "direct_compare_failed_count=" + intToStr(directCompareFailedCount) + "\n"
     summaryText = summaryText + "route_state_mismatch_count=" + intToStr(routeStateMismatchCount) + "\n"
     summaryText = summaryText + "pixel_mismatch_count=" + intToStr(pixelMismatchCount) + "\n"
     summaryText = summaryText + "semantic_delta_count=" + intToStr(semanticDeltaCount) + "\n"
@@ -8049,9 +9296,10 @@ fn r2cControllerRenderCompareMatrix(root: str,
     report = report + "  \"reason\": \"ok\",\n"
     report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
     report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
-    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(renderCompareHelper) + ",\n"
-    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(matrixSummaryPath) + ",\n"
-    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote("") + ",\n"
+    report = report + "  \"helper_script\": \"\",\n"
+    report = report + "  \"compare_engine\": \"cheng.render_compare_direct_png_v1\",\n"
+    report = report + "  \"compare_summary_path\": " + r2cControllerJsonQuote(matrixSummaryPath) + ",\n"
+    report = report + "  \"compare_log_path\": \"\",\n"
     report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(matrixOutPath) + ",\n"
     report = report + "  \"primary_artifact_format\": \"render_compare_matrix_v1\",\n"
     report = report + "  \"route_count\": " + intToStr(routeCount) + ",\n"
@@ -8119,7 +9367,6 @@ fn r2cControllerNativeGuiRuntime(root: str,
 
 fn r2cControllerReplayHitInspector(root: str,
                                    args: str[]): int32 =
-    args
     let effectiveRoot: str = r2cControllerEffectiveRoot(root)
     let inspectorStateFlag: str = r2cControllerOwnText(cmdline.ReadFlagOrDefault("--inspector-state", ""))
     if strings.Len(inspectorStateFlag) <= 0:
@@ -8311,7 +9558,7 @@ fn r2cControllerHelp() =
     r2cControllerPrintLine("static-surface flags: --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir> ...] [--asset-root <dir> ...]")
     r2cControllerPrintLine("semantic-surface flags: --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir> ...]")
     r2cControllerPrintLine("discover-truth-routes flags: --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...]")
-    r2cControllerPrintLine("capture-truth flags: --repo <path> --route <state> [--out-dir <dir>] [--base-url <url>] [--chrome <bin>] [--width <n>] [--height <n>] [--truth-flag <0|1>] [--debug-port <n>] [--wait-ms <n>]")
+    r2cControllerPrintLine("capture-truth flags: --repo <path> --route <state> [--out-dir <dir>] (--truth-summary <file> | --truth-trace <file> [--runtime-state <file>] [--dom <file>] [--semantic-nodes <file>] [--runtime-meta <file>] [--screenshot <file>])")
     r2cControllerPrintLine("compare-truth flags: --exec-snapshot <file> --truth-trace <file> [--codegen-manifest <file>] [--truth-state <state>] [--native-gui-summary <file>] [--out <file>]")
     r2cControllerPrintLine("exec-route-matrix flags: (--route-catalog <file> | --tsx-ast <file>) --exec-snapshot <file> --truth-routes-file <file> [--codegen-manifest <file>] [--truth-trace <file>] [--out <file>]")
     r2cControllerPrintLine("compare-truth-matrix flags: --exec-route-matrix <file> --truth-trace <file> [--codegen-manifest <file>] [--out <file>]")

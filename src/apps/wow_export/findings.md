@@ -1,5 +1,9 @@
 # wowExport Findings
 
+- WDT `MAID` 是 tile-local 8-slot split fileDataID 表，不是单个基础 ADT；Northshire 四 tile 的 slot0 是基础 ADT，slot1/2/3 等 split 仍有真实 fileDataID，后续对象/纹理/地表层资源应从这些 split 继续审计。
+- 本地 MAID split 审计慢的根因已经钉住：`CascArchiveDecodeLocalEntryRange` 对 BLTE `0x4e normal` block 走了“读整块 -> 复制整块 decodedBlock -> 再复制目标 range”的路径。encoding page lookup 大量命中 normal block 时会把 CPU 和内存打到不必要的整块拷贝上。
+- 当前修复是严格 range 读取：先读 block flag，若为 `normal` 且 `compSize == decompSize + 1`，直接读取 `blockFileOffset + 1 + blockOffsetInDecoded` 的目标子区间；zlib/encrypted block 仍走完整解码路径，不做降级或猜测。
+- 本地 `.idx` batch lookup 的旧热点是每个 entry 对每个候选 key 都把 18 位 hex prefix 重新转 9 个字节；现在进入扫表前一次性预解 key prefix，热循环只做字节比较。
 - `std/os.ListDir` 的库层根因已经钉住并修掉：`cheng_list_dir` 返回的 raw listing 之前没有在 `ListDir` 内部释放，业务层只能自己借用扫描；现在 `ListDir` 已在库层释放 raw buffer，并返回 owned 文件名。
 - `casc_index.LoadLocalIndexEntry` 已改成“原始 listing 文本在同一作用域内借用扫描”，因此路径桥崩溃和悬挂文件名都已经收住；现状是明确返回 `wowExport index: local encoding key not found 00f6dcef63eafe6254ab5408ea8baa09`。
 - 已补纯 Cheng `tact_index` 解析器，当前本机 `Data/indices/bd643d2dac9bfdc365890dafbbea83d6.index` 的 footer/record 事实已经钉住：`formatRevision=1`、`blockSizeKB=4`、`offsetBytes=4`、`sizeBytes=4`、`keyBytes=16`、`hashBytes=8`，record 是标准 `ekey + size + offset`。
@@ -26,12 +30,12 @@
 - 17 个 WMO `MODI` 依赖当前均可解码并通过 M2 header 解析；preview 的 scene 判定已要求真实 WMO `MODI` 列表与审计依赖表逐项匹配。
 - `export-dependencies` 现在是 pathless `MODI` 资源的唯一导出面：文件名使用审计 label 和 fileDataID，manifest 记录 content/encoding/archive/offset/encodedSize/decodedBytes；这保持了“可导出”与“不伪造路径”两条约束。
 - WMO `MODD` 记录首字段不是模型路径偏移，也不是 0..N 的紧凑序号；在 Northshire Abbey root 里它是指向 `IDOM/MODI` u32 表的稀疏槽位。真实 `IDOM` 有 `30` 个槽，其中 `17` 个非零 fileDataID；真实 `MODD` 的 `144` 条摆放只引用其中 `15` 个非零槽。
-- `MODD -> IDOM -> fileDataID` 链路现在是硬校验：槽越界、槽值为 0、或解析出的 fileDataID 不在 pathless `wmo_modi` 审计依赖表，preview 都会失败。
-- `render-northshire` 现在同 preview 一样检查 `MODD -> IDOM -> fileDataID` 与 `wmo_modi` 依赖表；但仍不把 doodad M2 网格做成实例化 mesh，因为当前还没有严格解析 `MODD` 旋转/缩放字段，不能用猜测变换画假网格。
+- `MODD -> IDOM -> fileDataID` 链路现在是硬校验：槽越界、槽值为 0、或解析出的 fileDataID 不在 pathless `wmo_modi` 审计依赖表，preview/render 都会失败。
+- `render-northshire` 现在严格读取 `MODD` 的低 24 位 model slot、position、`(X,Y,Z,W)` quaternion 和 scale，再把审计过的 `wmo_modi` M2 顶点实例化进主视图；Northshire 当前为 `144` 个 placement、`31665` 个实例顶点。
 - M2 `nsabbeyBell.m2` 的 `SFID` 给出 skin fileDataID `494438`，`TXID` 给出 texture fileDataID `127489` 和已审计 texture `189598`。
 - Northshire Abbey 13 个 WMO group 均已审计并解码；真实 group payload 是顶层 `REVM` + `PGOM`，几何 chunk 嵌在 `PGOM` 68 字节 group header 后，四字符在文件中仍是反向写法：`TVOM/MOVT`、`IVOM/MOVI`、`ABOM/MOBA`、`YPOM/MOPY`。
 - 13 个 WMO group 合计 `29304` 顶点、`91689` 个索引；M2 skin `494438` 解码后为 `5088` 字节，含 `370` indices、`1302` triangle indices、`2` submeshes。
-- `render-northshire` 当前是严格真实数据的几何 MVP：画已解码 ADT terrain 高度、WMO group 顶点、WMO doodad placement 和 M2 顶点，不做材质、光照、相机碰撞或占位 mesh；若真实几何缺失会失败，不会补假点。
+- `render-northshire` 当前是严格真实数据的几何 MVP：画已解码 ADT terrain 高度、WMO group 顶点、WMO doodad placement、WMO doodad M2 实例顶点和审计 M2 inset 顶点，不做材质、光照、相机碰撞或占位 mesh；若真实几何缺失会失败，不会补假点。
 - WDT `Azeroth.wdt` 的 `MAID` 有 `1176` 个非零 tile、`9408` 个 referenced fileDataID，首项 `6173014`；不能一次性当 Northshire 局部地形，下一步要按坐标/区域收窄后审计。
 - Northshire 局部地形已按 listfile/WDT 坐标收窄到四个 Azeroth 基础 ADT：`Azeroth_31_48.adt`、`Azeroth_32_48.adt`、`Azeroth_31_49.adt`、`Azeroth_32_49.adt`，对应 fileDataID `777827/778027/777832/778032`。
 - 真实 ADT 地形是顶层 `REVM` + 256 个 `KNCM/MCNK`；每个 `MCNK` 的 128 字节 header 后必须有 `TVCM/MCVT`，每块 `145` 个 float 高度样本，四个 tile 合计 `148480` 个样本。
