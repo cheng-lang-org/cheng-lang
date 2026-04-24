@@ -48,9 +48,20 @@
 - [x] Add strict smoke for Northshire MAID split fileDataID audit chain.
 - [x] Remove local CASC range decode full-block copies for BLTE `normal` blocks.
 - [x] Predecode local `.idx` key prefixes before batch index scans.
+- [x] Replace hot-path per-byte hex string concatenation with one-shot raw bytes hex conversion.
 - [x] Add all four Northshire WDT MAID tile non-base resources to audited dependency manifest.
 - [x] Classify MAID dependencies by real format: 16 `adt_split` resources and 12 `blp` resources.
 - [x] Require preview/render/export/tests to audit the 28 WDT MAID resources without fabricating listfile paths.
 - [x] Parse WDT MAID ADT split payload chunks and require preview/render to match real MDDF/MODF/MCNK counts.
 - [x] Parse WDT MAID `MDDF/MODF` placement records and require preview/render to expose real bounds and scale ranges.
 - [x] Treat modern WDT MAID `MDDF/MODF.nameID` as fileDataID and expose unique referenced doodad/world-model counts.
+- [x] Audit WDT MAID placement-referenced fileDataIDs through local root/encoding/index before preview/render accept the scene.
+- [x] Load and classify WDT MAID placement-referenced doodads as M2 and world models as WMO before preview/render accept the scene.
+- [x] Stabilize standalone Northshire preview closure and reconnect CLI `preview-northshire` to `PreviewNorthshire`.
+- [x] Fix `StableConcat` string-view ownership so export paths stay stable in large closures.
+- [x] Export WDT MAID placement-referenced M2/WMO payloads as a strict manifest bundle.
+- [x] Render WDT MAID `MDDF` doodad M2 placements as real instance vertices.
+- [x] Audit/load WDT MAID `MODF` world-model WMO `GFID` group geometry and render those instances.
+- [x] Use one world-space projection for ADT terrain, MAID doodads, MAID WMO groups, and Abbey WMO doodads.
+- [x] Add strict material/texture/light audit pass for Northshire render.
+- [ ] Render textured/materialized triangles instead of point-cloud geometry.

@@ -1,0 +1,1377 @@
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/path as chengpath
+import cheng/r2c/native_platform_shell_package as shellpackage
+
+fn nativeProjectSlice(text: str,
+                      start: int32,
+                      length: int32): str =
+    if length <= 0:
+        return ""
+    return chengpath.TextSlice(text, start, length)
+
+fn nativeProjectDigitValue(text: str): int32 =
+    if text == "0":
+        return 0
+    elif text == "1":
+        return 1
+    elif text == "2":
+        return 2
+    elif text == "3":
+        return 3
+    elif text == "4":
+        return 4
+    elif text == "5":
+        return 5
+    elif text == "6":
+        return 6
+    elif text == "7":
+        return 7
+    elif text == "8":
+        return 8
+    elif text == "9":
+        return 9
+    return -1
+
+fn nativeProjectParsePositiveInt32(raw: str): int32 =
+    let total: int32 = strings.Len(raw)
+    if total <= 0:
+        return 0
+    var out: int32
+    for i in 0..<total:
+        let digit: int32 = nativeProjectDigitValue(nativeProjectSlice(raw, i, 1))
+        if digit < 0:
+            return -1
+        out = (out * 10) + digit
+    return out
+
+fn nativeProjectParseInt32(text: str): int32 =
+    let raw: str = strutil.Strip(text)
+    if strings.Len(raw) <= 0:
+        return 0
+    if raw[0] == '-':
+        let parsed: int32 = nativeProjectParsePositiveInt32(nativeProjectSlice(raw, 1, strings.Len(raw) - 1))
+        if parsed < 0:
+            return 0
+        return 0 - parsed
+    let parsed: int32 = nativeProjectParsePositiveInt32(raw)
+    if parsed < 0:
+        return 0
+    return parsed
+
+fn nativeProjectJsonQuote(text: str): str =
+    let quote: str = strings.CharToStr(char(34))
+    var out = quote
+    let total: int32 = strings.Len(text)
+    for i in 0..<total:
+        let ch = text[i]
+        if ch == char(34):
+            out = out + "\\" + quote
+        elif ch == '\\':
+            out = out + "\\\\"
+        elif ch == char(10):
+            out = out + "\\n"
+        elif ch == char(13):
+            out = out + "\\r"
+        elif ch == char(9):
+            out = out + "\\t"
+        else:
+            out = out + strings.CharToStr(ch)
+    out = out + quote
+    return out
+
+fn nativeProjectTextFind(text: str,
+                         needle: str,
+                         startRaw: int32): int32 =
+    let total: int32 = strings.Len(text)
+    let needleLen: int32 = strings.Len(needle)
+    if needleLen <= 0:
+        return startRaw
+    if total < needleLen:
+        return -1
+    var start: int32 = startRaw
+    if start < 0:
+        start = 0
+    if start > total - needleLen:
+        return -1
+    for i in start..(total - needleLen):
+        var matched = true
+        for j in 0..<needleLen:
+            if text[i + j] != needle[j]:
+                matched = false
+                break
+        if matched:
+            return i
+    return -1
+
+fn nativeProjectJsonSkipWhitespace(text: str,
+                                   startRaw: int32): int32 =
+    var pos: int32 = startRaw
+    if pos < 0:
+        pos = 0
+    let total: int32 = strings.Len(text)
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(32) || ch == char(10) || ch == char(13) || ch == char(9):
+            pos = pos + 1
+        else:
+            return pos
+    return pos
+
+fn nativeProjectJsonFindValueStart(text: str,
+                                   key: str,
+                                   startRaw: int32): int32 =
+    let keyPattern: str = nativeProjectJsonQuote(key)
+    let keyPos: int32 = nativeProjectTextFind(text, keyPattern, startRaw)
+    if keyPos < 0:
+        return -1
+    var pos: int32 = keyPos + strings.Len(keyPattern)
+    let total: int32 = strings.Len(text)
+    while pos < total:
+        if text[pos] == char(58):
+            return nativeProjectJsonSkipWhitespace(text, pos + 1)
+        pos = pos + 1
+    return -1
+
+fn nativeProjectJsonReadStringLiteral(text: str,
+                                      startRaw: int32,
+                                      fallback: str): str =
+    let total: int32 = strings.Len(text)
+    if startRaw < 0 || startRaw >= total || text[startRaw] != char(34):
+        return fallback
+    var out: str
+    var pos: int32 = startRaw + 1
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(34):
+            return out
+        if ch == '\\':
+            if pos + 1 >= total:
+                return fallback
+            let esc = text[pos + 1]
+            if esc == char(34):
+                out = out + strings.CharToStr(char(34))
+            elif esc == '\\':
+                out = out + "\\"
+            elif esc == 'n':
+                out = out + "\n"
+            elif esc == 'r':
+                out = out + "\r"
+            elif esc == 't':
+                out = out + "\t"
+            else:
+                out = out + strings.CharToStr(esc)
+            pos = pos + 2
+            continue
+        out = out + strings.CharToStr(ch)
+        pos = pos + 1
+    return fallback
+
+fn nativeProjectJsonReadStringField(text: str,
+                                    key: str,
+                                    fallback: str): str =
+    let valueStart: int32 = nativeProjectJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    return nativeProjectJsonReadStringLiteral(text, valueStart, fallback)
+
+fn nativeProjectJsonReadIntField(text: str,
+                                 key: str,
+                                 fallback: int32): int32 =
+    let valueStart: int32 = nativeProjectJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    let total: int32 = strings.Len(text)
+    var endPos: int32 = valueStart
+    if endPos < total && text[endPos] == '-':
+        endPos = endPos + 1
+    var sawDigit = false
+    while endPos < total:
+        if nativeProjectDigitValue(nativeProjectSlice(text, endPos, 1)) < 0:
+            break
+        sawDigit = true
+        endPos = endPos + 1
+    if !sawDigit:
+        return fallback
+    return nativeProjectParseInt32(nativeProjectSlice(text, valueStart, endPos - valueStart))
+
+fn nativeProjectPlatformText(packageManifestPath: str,
+                             packageText: str,
+                             platformId: str,
+                             projectKind: str,
+                             shellKind: str,
+                             surfaceBinding: str,
+                             inputBinding: str,
+                             launchPlanPath: str,
+                             platformDir: str): str =
+    let framePath: str = nativeProjectJsonReadStringField(packageText, "frame_path", "")
+    let frameFormat: str = nativeProjectJsonReadStringField(packageText, "frame_format", "surface_frame_rgba_v1")
+    let pixelFormat: str = nativeProjectJsonReadStringField(packageText, "pixel_format", "rgba8_unpremultiplied")
+    let width: int32 = nativeProjectJsonReadIntField(packageText, "width", 0)
+    let height: int32 = nativeProjectJsonReadIntField(packageText, "height", 0)
+    let strideBytes: int32 = nativeProjectJsonReadIntField(packageText, "stride_bytes", 0)
+    let frameByteCount: int32 = nativeProjectJsonReadIntField(packageText, "frame_byte_count", 0)
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_platform_project_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"platform\": " + nativeProjectJsonQuote(platformId) + ",\n"
+    doc = doc + "  \"project_kind\": " + nativeProjectJsonQuote(projectKind) + ",\n"
+    doc = doc + "  \"shell_kind\": " + nativeProjectJsonQuote(shellKind) + ",\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"polling\": false,\n"
+    doc = doc + "  \"project_dir\": " + nativeProjectJsonQuote(platformDir) + ",\n"
+    doc = doc + "  \"package_manifest_path\": " + nativeProjectJsonQuote(packageManifestPath) + ",\n"
+    doc = doc + "  \"launch_plan_path\": " + nativeProjectJsonQuote(launchPlanPath) + ",\n"
+    doc = doc + "  \"frame_path\": " + nativeProjectJsonQuote(framePath) + ",\n"
+    doc = doc + "  \"frame_format\": " + nativeProjectJsonQuote(frameFormat) + ",\n"
+    doc = doc + "  \"pixel_format\": " + nativeProjectJsonQuote(pixelFormat) + ",\n"
+    doc = doc + "  \"width\": " + intToStr(width) + ",\n"
+    doc = doc + "  \"height\": " + intToStr(height) + ",\n"
+    doc = doc + "  \"stride_bytes\": " + intToStr(strideBytes) + ",\n"
+    doc = doc + "  \"frame_byte_count\": " + intToStr(frameByteCount) + ",\n"
+    doc = doc + "  \"surface_binding\": " + nativeProjectJsonQuote(surfaceBinding) + ",\n"
+    doc = doc + "  \"input_binding\": " + nativeProjectJsonQuote(inputBinding) + ",\n"
+    doc = doc + "  \"surface_contract\": \"rgba8_stride_copy_v1\",\n"
+    doc = doc + "  \"entry_contract\": \"cheng_event_driven_native_surface_shell_v1\",\n"
+    doc = doc + "  \"business_js\": false\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectSummaryText(projectManifestPath: str,
+                            androidProjectPath: str,
+                            iosProjectPath: str,
+                            ohosProjectPath: str,
+                            entryManifestPath: str,
+                            installManifestPath: str,
+                            androidInstallPackagePath: str,
+                            iosInstallPackagePath: str,
+                            ohosInstallPackagePath: str,
+                            filesManifestPath: str,
+                            androidPlatformManifestPath: str,
+                            androidShellSourcePath: str,
+                            iosInfoPlistPath: str,
+                            iosShellSourcePath: str,
+                            ohosModulePath: str,
+                            ohosShellSourcePath: str,
+                            buildInputsManifestPath: str,
+                            androidBuildInputPath: str,
+                            iosBuildInputPath: str,
+                            ohosBuildInputPath: str,
+                            packagingPlanManifestPath: str,
+                            androidPackagingPlanPath: str,
+                            iosPackagingPlanPath: str,
+                            ohosPackagingPlanPath: str): str =
+    var out: str
+    out = out + "format=native_platform_shell_project_summary_v1\n"
+    out = out + "ready=true\n"
+    out = out + "runtime_purity=node:false,react:false,webview_business_layer:false,business_js:false\n"
+    out = out + "event_loop=event_driven_v1\n"
+    out = out + "project_manifest_path=" + projectManifestPath + "\n"
+    out = out + "android_project_path=" + androidProjectPath + "\n"
+    out = out + "ios_project_path=" + iosProjectPath + "\n"
+    out = out + "ohos_project_path=" + ohosProjectPath + "\n"
+    out = out + "entry_manifest_path=" + entryManifestPath + "\n"
+    out = out + "install_manifest_path=" + installManifestPath + "\n"
+    out = out + "android_install_package_path=" + androidInstallPackagePath + "\n"
+    out = out + "ios_install_package_path=" + iosInstallPackagePath + "\n"
+    out = out + "ohos_install_package_path=" + ohosInstallPackagePath + "\n"
+    out = out + "files_manifest_path=" + filesManifestPath + "\n"
+    out = out + "android_platform_manifest_path=" + androidPlatformManifestPath + "\n"
+    out = out + "android_shell_source_path=" + androidShellSourcePath + "\n"
+    out = out + "ios_info_plist_path=" + iosInfoPlistPath + "\n"
+    out = out + "ios_shell_source_path=" + iosShellSourcePath + "\n"
+    out = out + "ohos_module_path=" + ohosModulePath + "\n"
+    out = out + "ohos_shell_source_path=" + ohosShellSourcePath + "\n"
+    out = out + "build_inputs_manifest_path=" + buildInputsManifestPath + "\n"
+    out = out + "android_build_input_path=" + androidBuildInputPath + "\n"
+    out = out + "ios_build_input_path=" + iosBuildInputPath + "\n"
+    out = out + "ohos_build_input_path=" + ohosBuildInputPath + "\n"
+    out = out + "packaging_plan_manifest_path=" + packagingPlanManifestPath + "\n"
+    out = out + "android_packaging_plan_path=" + androidPackagingPlanPath + "\n"
+    out = out + "ios_packaging_plan_path=" + iosPackagingPlanPath + "\n"
+    out = out + "ohos_packaging_plan_path=" + ohosPackagingPlanPath + "\n"
+    return out
+
+fn nativeProjectEntryText(packageManifestPath: str,
+                          projectPath: str,
+                          platformId: str,
+                          entryKind: str,
+                          shellKind: str,
+                          surfaceBinding: str,
+                          inputBinding: str,
+                          projectDir: str,
+                          packageText: str): str =
+    let framePath: str = nativeProjectJsonReadStringField(packageText, "frame_path", "")
+    let frameByteCount: int32 = nativeProjectJsonReadIntField(packageText, "frame_byte_count", 0)
+    let width: int32 = nativeProjectJsonReadIntField(packageText, "width", 0)
+    let height: int32 = nativeProjectJsonReadIntField(packageText, "height", 0)
+    let strideBytes: int32 = nativeProjectJsonReadIntField(packageText, "stride_bytes", 0)
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_entry_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"platform\": " + nativeProjectJsonQuote(platformId) + ",\n"
+    doc = doc + "  \"entry_kind\": " + nativeProjectJsonQuote(entryKind) + ",\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"polling\": false,\n"
+    doc = doc + "  \"package_manifest_path\": " + nativeProjectJsonQuote(packageManifestPath) + ",\n"
+    doc = doc + "  \"project_path\": " + nativeProjectJsonQuote(projectPath) + ",\n"
+    doc = doc + "  \"project_dir\": " + nativeProjectJsonQuote(projectDir) + ",\n"
+    doc = doc + "  \"shell_kind\": " + nativeProjectJsonQuote(shellKind) + ",\n"
+    doc = doc + "  \"surface_binding\": " + nativeProjectJsonQuote(surfaceBinding) + ",\n"
+    doc = doc + "  \"input_binding\": " + nativeProjectJsonQuote(inputBinding) + ",\n"
+    doc = doc + "  \"entry_symbol\": \"ChengNativeSurfaceShellMain\",\n"
+    doc = doc + "  \"render_contract\": \"rgba8_stride_copy_v1\",\n"
+    doc = doc + "  \"lifecycle_contract\": \"create_surface_resume_pause_destroy_v1\",\n"
+    doc = doc + "  \"input_contract\": \"event_driven_pointer_key_text_resize_v1\",\n"
+    doc = doc + "  \"frame_path\": " + nativeProjectJsonQuote(framePath) + ",\n"
+    doc = doc + "  \"width\": " + intToStr(width) + ",\n"
+    doc = doc + "  \"height\": " + intToStr(height) + ",\n"
+    doc = doc + "  \"stride_bytes\": " + intToStr(strideBytes) + ",\n"
+    doc = doc + "  \"frame_byte_count\": " + intToStr(frameByteCount) + "\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectEntryManifestText(projectManifestPath: str,
+                                  androidEntryPath: str,
+                                  iosEntryPath: str,
+                                  ohosEntryPath: str): str =
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_entry_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"platform_count\": 3,\n"
+    doc = doc + "  \"project_manifest_path\": " + nativeProjectJsonQuote(projectManifestPath) + ",\n"
+    doc = doc + "  \"platforms\": [\n"
+    doc = doc + "    {\"id\":\"android\",\"entry_path\":" + nativeProjectJsonQuote(androidEntryPath) + ",\"entry_symbol\":\"ChengNativeSurfaceShellMain\",\"surface_binding\":\"ANativeWindow_rgba_blit_v1\",\"input_binding\":\"AInputQueue_event_driven_v1\"},\n"
+    doc = doc + "    {\"id\":\"ios\",\"entry_path\":" + nativeProjectJsonQuote(iosEntryPath) + ",\"entry_symbol\":\"ChengNativeSurfaceShellMain\",\"surface_binding\":\"CAMetalLayer_rgba_blit_v1\",\"input_binding\":\"UIKit_touch_event_driven_v1\"},\n"
+    doc = doc + "    {\"id\":\"ohos\",\"entry_path\":" + nativeProjectJsonQuote(ohosEntryPath) + ",\"entry_symbol\":\"ChengNativeSurfaceShellMain\",\"surface_binding\":\"OHNativeWindow_rgba_blit_v1\",\"input_binding\":\"XComponent_event_driven_v1\"}\n"
+    doc = doc + "  ]\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectInstallPackageText(packageManifestPath: str,
+                                   projectPath: str,
+                                   entryPath: str,
+                                   platformId: str,
+                                   packageKind: str,
+                                   shellAppKind: str,
+                                   packageId: str,
+                                   primaryComponent: str,
+                                   surfaceBinding: str,
+                                   inputBinding: str,
+                                   projectDir: str,
+                                   packageText: str): str =
+    let framePath: str = nativeProjectJsonReadStringField(packageText, "frame_path", "")
+    let frameByteCount: int32 = nativeProjectJsonReadIntField(packageText, "frame_byte_count", 0)
+    let width: int32 = nativeProjectJsonReadIntField(packageText, "width", 0)
+    let height: int32 = nativeProjectJsonReadIntField(packageText, "height", 0)
+    let strideBytes: int32 = nativeProjectJsonReadIntField(packageText, "stride_bytes", 0)
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_install_package_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"platform\": " + nativeProjectJsonQuote(platformId) + ",\n"
+    doc = doc + "  \"package_kind\": " + nativeProjectJsonQuote(packageKind) + ",\n"
+    doc = doc + "  \"shell_app_kind\": " + nativeProjectJsonQuote(shellAppKind) + ",\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"source_language\": \"cheng\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"polling\": false,\n"
+    doc = doc + "  \"c_dependency\": false,\n"
+    doc = doc + "  \"node_dependency\": false,\n"
+    doc = doc + "  \"script_dependency\": false,\n"
+    doc = doc + "  \"webview_business_layer\": false,\n"
+    doc = doc + "  \"package_id\": " + nativeProjectJsonQuote(packageId) + ",\n"
+    doc = doc + "  \"primary_component\": " + nativeProjectJsonQuote(primaryComponent) + ",\n"
+    doc = doc + "  \"package_manifest_path\": " + nativeProjectJsonQuote(packageManifestPath) + ",\n"
+    doc = doc + "  \"project_path\": " + nativeProjectJsonQuote(projectPath) + ",\n"
+    doc = doc + "  \"entry_path\": " + nativeProjectJsonQuote(entryPath) + ",\n"
+    doc = doc + "  \"project_dir\": " + nativeProjectJsonQuote(projectDir) + ",\n"
+    doc = doc + "  \"entry_symbol\": \"ChengNativeSurfaceShellMain\",\n"
+    doc = doc + "  \"surface_binding\": " + nativeProjectJsonQuote(surfaceBinding) + ",\n"
+    doc = doc + "  \"input_binding\": " + nativeProjectJsonQuote(inputBinding) + ",\n"
+    doc = doc + "  \"install_contract\": \"cheng_generated_native_mobile_install_package_v1\",\n"
+    doc = doc + "  \"runtime_artifact_kind\": \"cheng_native_module_v1\",\n"
+    doc = doc + "  \"surface_contract\": \"rgba8_stride_copy_v1\",\n"
+    doc = doc + "  \"lifecycle_contract\": \"create_surface_resume_pause_destroy_v1\",\n"
+    doc = doc + "  \"input_contract\": \"event_driven_pointer_key_text_resize_v1\",\n"
+    doc = doc + "  \"frame_path\": " + nativeProjectJsonQuote(framePath) + ",\n"
+    doc = doc + "  \"width\": " + intToStr(width) + ",\n"
+    doc = doc + "  \"height\": " + intToStr(height) + ",\n"
+    doc = doc + "  \"stride_bytes\": " + intToStr(strideBytes) + ",\n"
+    doc = doc + "  \"frame_byte_count\": " + intToStr(frameByteCount) + "\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectInstallManifestText(projectManifestPath: str,
+                                    androidInstallPackagePath: str,
+                                    iosInstallPackagePath: str,
+                                    ohosInstallPackagePath: str): str =
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_install_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"source_language\": \"cheng\",\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"polling\": false,\n"
+    doc = doc + "  \"c_dependency\": false,\n"
+    doc = doc + "  \"node_dependency\": false,\n"
+    doc = doc + "  \"script_dependency\": false,\n"
+    doc = doc + "  \"install_package_count\": 3,\n"
+    doc = doc + "  \"project_manifest_path\": " + nativeProjectJsonQuote(projectManifestPath) + ",\n"
+    doc = doc + "  \"platforms\": [\n"
+    doc = doc + "    {\"id\":\"android\",\"install_package_path\":" + nativeProjectJsonQuote(androidInstallPackagePath) + ",\"package_kind\":\"android_native_surface_app_manifest_v1\",\"surface_binding\":\"ANativeWindow_rgba_blit_v1\",\"input_binding\":\"AInputQueue_event_driven_v1\"},\n"
+    doc = doc + "    {\"id\":\"ios\",\"install_package_path\":" + nativeProjectJsonQuote(iosInstallPackagePath) + ",\"package_kind\":\"ios_native_surface_app_manifest_v1\",\"surface_binding\":\"CAMetalLayer_rgba_blit_v1\",\"input_binding\":\"UIKit_touch_event_driven_v1\"},\n"
+    doc = doc + "    {\"id\":\"ohos\",\"install_package_path\":" + nativeProjectJsonQuote(ohosInstallPackagePath) + ",\"package_kind\":\"ohos_native_surface_app_manifest_v1\",\"surface_binding\":\"OHNativeWindow_rgba_blit_v1\",\"input_binding\":\"XComponent_event_driven_v1\"}\n"
+    doc = doc + "  ]\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectAndroidManifestText(packageId: str): str =
+    var doc = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+    doc = doc + "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"" + packageId + "\">\n"
+    doc = doc + "  <application android:label=\"UniMaker Cheng\" android:hardwareAccelerated=\"true\" android:usesCleartextTraffic=\"false\">\n"
+    doc = doc + "    <activity android:name=\".ChengNativeSurfaceActivity\" android:exported=\"true\" android:screenOrientation=\"portrait\">\n"
+    doc = doc + "      <intent-filter>\n"
+    doc = doc + "        <action android:name=\"android.intent.action.MAIN\" />\n"
+    doc = doc + "        <category android:name=\"android.intent.category.LAUNCHER\" />\n"
+    doc = doc + "      </intent-filter>\n"
+    doc = doc + "    </activity>\n"
+    doc = doc + "  </application>\n"
+    doc = doc + "</manifest>\n"
+    return doc
+
+fn nativeProjectAndroidShellSourceText(packageId: str,
+                                       framePath: str): str =
+    var doc: str
+    doc = doc + "const ChengNativeSurfaceShellPlatform: str = \"android\"\n"
+    doc = doc + "const ChengNativeSurfaceShellPackageId: str = \"" + packageId + "\"\n"
+    doc = doc + "const ChengNativeSurfaceShellEntrySymbol: str = \"ChengNativeSurfaceShellMain\"\n"
+    doc = doc + "const ChengNativeSurfaceShellSurfaceBinding: str = \"ANativeWindow_rgba_blit_v1\"\n"
+    doc = doc + "const ChengNativeSurfaceShellInputBinding: str = \"AInputQueue_event_driven_v1\"\n"
+    doc = doc + "const ChengNativeSurfaceShellFramePath: str = \"" + framePath + "\"\n\n"
+    doc = doc + "fn ChengNativeSurfaceActivityContract(): str =\n"
+    doc = doc + "    return \"platform=android,event_loop=event_driven_v1,polling=false,webview_business_layer=false,business_js=false\"\n"
+    return doc
+
+fn nativeProjectIosInfoPlistText(packageId: str): str =
+    var doc = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    doc = doc + "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+    doc = doc + "<plist version=\"1.0\">\n"
+    doc = doc + "<dict>\n"
+    doc = doc + "  <key>CFBundleIdentifier</key>\n"
+    doc = doc + "  <string>" + packageId + "</string>\n"
+    doc = doc + "  <key>CFBundleName</key>\n"
+    doc = doc + "  <string>UniMaker Cheng</string>\n"
+    doc = doc + "  <key>UILaunchStoryboardName</key>\n"
+    doc = doc + "  <string>LaunchScreen</string>\n"
+    doc = doc + "</dict>\n"
+    doc = doc + "</plist>\n"
+    return doc
+
+fn nativeProjectIosShellSourceText(packageId: str,
+                                   framePath: str): str =
+    var doc: str
+    doc = doc + "const ChengNativeSurfaceShellPlatform: str = \"ios\"\n"
+    doc = doc + "const ChengNativeSurfaceShellPackageId: str = \"" + packageId + "\"\n"
+    doc = doc + "const ChengNativeSurfaceShellEntrySymbol: str = \"ChengNativeSurfaceShellMain\"\n"
+    doc = doc + "const ChengNativeSurfaceShellSurfaceBinding: str = \"CAMetalLayer_rgba_blit_v1\"\n"
+    doc = doc + "const ChengNativeSurfaceShellInputBinding: str = \"UIKit_touch_event_driven_v1\"\n"
+    doc = doc + "const ChengNativeSurfaceShellFramePath: str = \"" + framePath + "\"\n\n"
+    doc = doc + "fn ChengNativeSurfaceViewControllerContract(): str =\n"
+    doc = doc + "    return \"platform=ios,event_loop=event_driven_v1,polling=false,webview_business_layer=false,business_js=false\"\n"
+    return doc
+
+fn nativeProjectOhosModuleText(packageId: str): str =
+    var doc = "{\n"
+    doc = doc + "  \"module\": {\n"
+    doc = doc + "    \"name\": \"entry\",\n"
+    doc = doc + "    \"type\": \"entry\",\n"
+    doc = doc + "    \"srcEntry\": \"./ets/ChengNativeSurfaceAbility.ets\",\n"
+    doc = doc + "    \"abilities\": [{\"name\": \"ChengNativeSurfaceAbility\", \"exported\": true}],\n"
+    doc = doc + "    \"metadata\": [{\"name\": \"cheng.package\", \"value\": \"" + packageId + "\"}]\n"
+    doc = doc + "  }\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectOhosShellSourceText(packageId: str,
+                                    framePath: str): str =
+    var doc: str
+    doc = doc + "const ChengNativeSurfaceShellPlatform: str = \"ohos\"\n"
+    doc = doc + "const ChengNativeSurfaceShellPackageId: str = \"" + packageId + "\"\n"
+    doc = doc + "const ChengNativeSurfaceShellEntrySymbol: str = \"ChengNativeSurfaceShellMain\"\n"
+    doc = doc + "const ChengNativeSurfaceShellSurfaceBinding: str = \"OHNativeWindow_rgba_blit_v1\"\n"
+    doc = doc + "const ChengNativeSurfaceShellInputBinding: str = \"XComponent_event_driven_v1\"\n"
+    doc = doc + "const ChengNativeSurfaceShellFramePath: str = \"" + framePath + "\"\n\n"
+    doc = doc + "fn ChengNativeSurfaceAbilityContract(): str =\n"
+    doc = doc + "    return \"platform=ohos,event_loop=event_driven_v1,polling=false,webview_business_layer=false,business_js=false\"\n"
+    return doc
+
+fn nativeProjectFilesManifestText(projectManifestPath: str,
+                                  androidPlatformManifestPath: str,
+                                  androidShellSourcePath: str,
+                                  iosInfoPlistPath: str,
+                                  iosShellSourcePath: str,
+                                  ohosModulePath: str,
+                                  ohosShellSourcePath: str): str =
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_files_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"source_language\": \"cheng\",\n"
+    doc = doc + "  \"platform_file_count\": 6,\n"
+    doc = doc + "  \"project_manifest_path\": " + nativeProjectJsonQuote(projectManifestPath) + ",\n"
+    doc = doc + "  \"files\": [\n"
+    doc = doc + "    {\"platform\":\"android\",\"kind\":\"platform_manifest\",\"path\":" + nativeProjectJsonQuote(androidPlatformManifestPath) + ",\"language\":\"xml\",\"webview_business_layer\":false},\n"
+    doc = doc + "    {\"platform\":\"android\",\"kind\":\"shell_source\",\"path\":" + nativeProjectJsonQuote(androidShellSourcePath) + ",\"language\":\"cheng\",\"surface_binding\":\"ANativeWindow_rgba_blit_v1\"},\n"
+    doc = doc + "    {\"platform\":\"ios\",\"kind\":\"platform_manifest\",\"path\":" + nativeProjectJsonQuote(iosInfoPlistPath) + ",\"language\":\"plist\",\"webview_business_layer\":false},\n"
+    doc = doc + "    {\"platform\":\"ios\",\"kind\":\"shell_source\",\"path\":" + nativeProjectJsonQuote(iosShellSourcePath) + ",\"language\":\"cheng\",\"surface_binding\":\"CAMetalLayer_rgba_blit_v1\"},\n"
+    doc = doc + "    {\"platform\":\"ohos\",\"kind\":\"platform_manifest\",\"path\":" + nativeProjectJsonQuote(ohosModulePath) + ",\"language\":\"json5\",\"webview_business_layer\":false},\n"
+    doc = doc + "    {\"platform\":\"ohos\",\"kind\":\"shell_source\",\"path\":" + nativeProjectJsonQuote(ohosShellSourcePath) + ",\"language\":\"cheng\",\"surface_binding\":\"OHNativeWindow_rgba_blit_v1\"}\n"
+    doc = doc + "  ]\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectBuildInputText(packageManifestPath: str,
+                               projectManifestPath: str,
+                               platformProjectPath: str,
+                               entryManifestPath: str,
+                               entryPath: str,
+                               installManifestPath: str,
+                               installPackagePath: str,
+                               filesManifestPath: str,
+                               platformManifestPath: str,
+                               shellSourcePath: str,
+                               platformId: str,
+                               targetTriple: str,
+                               artifactKind: str,
+                               packageId: str,
+                               identifierKind: str,
+                               primaryComponent: str,
+                               surfaceBinding: str,
+                               inputBinding: str,
+                               outputArtifactPath: str,
+                               packageText: str): str =
+    let framePath: str = nativeProjectJsonReadStringField(packageText, "frame_path", "")
+    let frameByteCount: int32 = nativeProjectJsonReadIntField(packageText, "frame_byte_count", 0)
+    let width: int32 = nativeProjectJsonReadIntField(packageText, "width", 0)
+    let height: int32 = nativeProjectJsonReadIntField(packageText, "height", 0)
+    let strideBytes: int32 = nativeProjectJsonReadIntField(packageText, "stride_bytes", 0)
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_build_input_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"platform\": " + nativeProjectJsonQuote(platformId) + ",\n"
+    doc = doc + "  \"target_triple\": " + nativeProjectJsonQuote(targetTriple) + ",\n"
+    doc = doc + "  \"artifact_kind\": " + nativeProjectJsonQuote(artifactKind) + ",\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"source_language\": \"cheng\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"requires_node\": false,\n"
+    doc = doc + "  \"requires_react\": false,\n"
+    doc = doc + "  \"requires_webview_business_layer\": false,\n"
+    doc = doc + "  \"requires_business_js\": false,\n"
+    doc = doc + "  \"requires_c_dependency\": false,\n"
+    doc = doc + "  \"requires_script\": false,\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"polling\": false,\n"
+    doc = doc + "  \"package_id\": " + nativeProjectJsonQuote(packageId) + ",\n"
+    doc = doc + "  \"platform_identifier_kind\": " + nativeProjectJsonQuote(identifierKind) + ",\n"
+    doc = doc + "  \"platform_identifier\": " + nativeProjectJsonQuote(packageId) + ",\n"
+    doc = doc + "  \"primary_component\": " + nativeProjectJsonQuote(primaryComponent) + ",\n"
+    doc = doc + "  \"entry_symbol\": \"ChengNativeSurfaceShellMain\",\n"
+    doc = doc + "  \"surface_binding\": " + nativeProjectJsonQuote(surfaceBinding) + ",\n"
+    doc = doc + "  \"input_binding\": " + nativeProjectJsonQuote(inputBinding) + ",\n"
+    doc = doc + "  \"mobile_surface_abi\": \"surface_frame_rgba_v1\",\n"
+    doc = doc + "  \"build_contract\": \"cheng_native_mobile_build_input_contract_v1\",\n"
+    doc = doc + "  \"package_manifest_path\": " + nativeProjectJsonQuote(packageManifestPath) + ",\n"
+    doc = doc + "  \"project_manifest_path\": " + nativeProjectJsonQuote(projectManifestPath) + ",\n"
+    doc = doc + "  \"platform_project_path\": " + nativeProjectJsonQuote(platformProjectPath) + ",\n"
+    doc = doc + "  \"entry_manifest_path\": " + nativeProjectJsonQuote(entryManifestPath) + ",\n"
+    doc = doc + "  \"entry_path\": " + nativeProjectJsonQuote(entryPath) + ",\n"
+    doc = doc + "  \"install_manifest_path\": " + nativeProjectJsonQuote(installManifestPath) + ",\n"
+    doc = doc + "  \"install_package_path\": " + nativeProjectJsonQuote(installPackagePath) + ",\n"
+    doc = doc + "  \"files_manifest_path\": " + nativeProjectJsonQuote(filesManifestPath) + ",\n"
+    doc = doc + "  \"platform_manifest_path\": " + nativeProjectJsonQuote(platformManifestPath) + ",\n"
+    doc = doc + "  \"shell_source_path\": " + nativeProjectJsonQuote(shellSourcePath) + ",\n"
+    doc = doc + "  \"frame_path\": " + nativeProjectJsonQuote(framePath) + ",\n"
+    doc = doc + "  \"width\": " + intToStr(width) + ",\n"
+    doc = doc + "  \"height\": " + intToStr(height) + ",\n"
+    doc = doc + "  \"stride_bytes\": " + intToStr(strideBytes) + ",\n"
+    doc = doc + "  \"frame_byte_count\": " + intToStr(frameByteCount) + ",\n"
+    doc = doc + "  \"output_artifact_path\": " + nativeProjectJsonQuote(outputArtifactPath) + "\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectBuildInputsManifestText(packageManifestPath: str,
+                                        projectManifestPath: str,
+                                        androidBuildInputPath: str,
+                                        iosBuildInputPath: str,
+                                        ohosBuildInputPath: str): str =
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_build_inputs_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"source_language\": \"cheng\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"polling\": false,\n"
+    doc = doc + "  \"c_dependency\": false,\n"
+    doc = doc + "  \"node_dependency\": false,\n"
+    doc = doc + "  \"script_dependency\": false,\n"
+    doc = doc + "  \"build_input_count\": 3,\n"
+    doc = doc + "  \"package_manifest_path\": " + nativeProjectJsonQuote(packageManifestPath) + ",\n"
+    doc = doc + "  \"project_manifest_path\": " + nativeProjectJsonQuote(projectManifestPath) + ",\n"
+    doc = doc + "  \"platforms\": [\n"
+    doc = doc + "    {\"id\":\"android\",\"target_triple\":\"aarch64-linux-android\",\"artifact_kind\":\"apk_or_aab_input_contract_v1\",\"platform_identifier_kind\":\"android_package_id\",\"platform_identifier\":\"org.cheng.unimaker.nativegui\",\"build_input_path\":" + nativeProjectJsonQuote(androidBuildInputPath) + ",\"surface_binding\":\"ANativeWindow_rgba_blit_v1\",\"input_binding\":\"AInputQueue_event_driven_v1\"},\n"
+    doc = doc + "    {\"id\":\"ios\",\"target_triple\":\"arm64-apple-ios\",\"artifact_kind\":\"ipa_or_app_bundle_input_contract_v1\",\"platform_identifier_kind\":\"ios_bundle_id\",\"platform_identifier\":\"org.cheng.unimaker.nativegui\",\"build_input_path\":" + nativeProjectJsonQuote(iosBuildInputPath) + ",\"surface_binding\":\"CAMetalLayer_rgba_blit_v1\",\"input_binding\":\"UIKit_touch_event_driven_v1\"},\n"
+    doc = doc + "    {\"id\":\"ohos\",\"target_triple\":\"aarch64-linux-ohos\",\"artifact_kind\":\"hap_input_contract_v1\",\"platform_identifier_kind\":\"ohos_bundle_name\",\"platform_identifier\":\"org.cheng.unimaker.nativegui\",\"build_input_path\":" + nativeProjectJsonQuote(ohosBuildInputPath) + ",\"surface_binding\":\"OHNativeWindow_rgba_blit_v1\",\"input_binding\":\"XComponent_event_driven_v1\"}\n"
+    doc = doc + "  ]\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectPackagingPlanText(buildInputPath: str,
+                                  platformId: str,
+                                  targetTriple: str,
+                                  artifactKind: str,
+                                  identifierKind: str,
+                                  surfaceBinding: str,
+                                  inputBinding: str,
+                                  outputArtifactPath: str): str =
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_packaging_plan_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"artifact_emitted\": false,\n"
+    doc = doc + "  \"platform\": " + nativeProjectJsonQuote(platformId) + ",\n"
+    doc = doc + "  \"target_triple\": " + nativeProjectJsonQuote(targetTriple) + ",\n"
+    doc = doc + "  \"artifact_kind\": " + nativeProjectJsonQuote(artifactKind) + ",\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"source_language\": \"cheng\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"requires_node\": false,\n"
+    doc = doc + "  \"requires_react\": false,\n"
+    doc = doc + "  \"requires_webview_business_layer\": false,\n"
+    doc = doc + "  \"requires_business_js\": false,\n"
+    doc = doc + "  \"requires_c_dependency\": false,\n"
+    doc = doc + "  \"requires_script\": false,\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"polling\": false,\n"
+    doc = doc + "  \"build_input_path\": " + nativeProjectJsonQuote(buildInputPath) + ",\n"
+    doc = doc + "  \"build_input_format\": \"native_platform_shell_build_input_v1\",\n"
+    doc = doc + "  \"platform_identifier_kind\": " + nativeProjectJsonQuote(identifierKind) + ",\n"
+    doc = doc + "  \"platform_identifier\": \"org.cheng.unimaker.nativegui\",\n"
+    doc = doc + "  \"entry_symbol\": \"ChengNativeSurfaceShellMain\",\n"
+    doc = doc + "  \"surface_binding\": " + nativeProjectJsonQuote(surfaceBinding) + ",\n"
+    doc = doc + "  \"input_binding\": " + nativeProjectJsonQuote(inputBinding) + ",\n"
+    doc = doc + "  \"compile_contract\": \"cheng_release_native_mobile_module_v1\",\n"
+    doc = doc + "  \"packaging_contract\": \"cheng_native_mobile_package_plan_v1\",\n"
+    doc = doc + "  \"planned_output_artifact_path\": " + nativeProjectJsonQuote(outputArtifactPath) + "\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectPackagingPlanManifestText(projectManifestPath: str,
+                                          buildInputsManifestPath: str,
+                                          androidPackagingPlanPath: str,
+                                          iosPackagingPlanPath: str,
+                                          ohosPackagingPlanPath: str): str =
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_packaging_plan_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"artifact_emitted\": false,\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"source_language\": \"cheng\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"polling\": false,\n"
+    doc = doc + "  \"c_dependency\": false,\n"
+    doc = doc + "  \"node_dependency\": false,\n"
+    doc = doc + "  \"script_dependency\": false,\n"
+    doc = doc + "  \"packaging_plan_count\": 3,\n"
+    doc = doc + "  \"project_manifest_path\": " + nativeProjectJsonQuote(projectManifestPath) + ",\n"
+    doc = doc + "  \"build_inputs_manifest_path\": " + nativeProjectJsonQuote(buildInputsManifestPath) + ",\n"
+    doc = doc + "  \"platforms\": [\n"
+    doc = doc + "    {\"id\":\"android\",\"target_triple\":\"aarch64-linux-android\",\"artifact_kind\":\"apk_or_aab_input_contract_v1\",\"packaging_plan_path\":" + nativeProjectJsonQuote(androidPackagingPlanPath) + ",\"surface_binding\":\"ANativeWindow_rgba_blit_v1\"},\n"
+    doc = doc + "    {\"id\":\"ios\",\"target_triple\":\"arm64-apple-ios\",\"artifact_kind\":\"ipa_or_app_bundle_input_contract_v1\",\"packaging_plan_path\":" + nativeProjectJsonQuote(iosPackagingPlanPath) + ",\"surface_binding\":\"CAMetalLayer_rgba_blit_v1\"},\n"
+    doc = doc + "    {\"id\":\"ohos\",\"target_triple\":\"aarch64-linux-ohos\",\"artifact_kind\":\"hap_input_contract_v1\",\"packaging_plan_path\":" + nativeProjectJsonQuote(ohosPackagingPlanPath) + ",\"surface_binding\":\"OHNativeWindow_rgba_blit_v1\"}\n"
+    doc = doc + "  ]\n"
+    doc = doc + "}\n"
+    return doc
+
+fn nativeProjectManifestText(packageManifestPath: str,
+                             projectDir: str,
+                             androidDir: str,
+                             iosDir: str,
+                             ohosDir: str,
+                             androidProjectPath: str,
+                             iosProjectPath: str,
+                             ohosProjectPath: str,
+                             entryManifestPath: str,
+                             androidEntryPath: str,
+                             iosEntryPath: str,
+                             ohosEntryPath: str,
+                             installManifestPath: str,
+                             androidInstallPackagePath: str,
+                             iosInstallPackagePath: str,
+                             ohosInstallPackagePath: str,
+                             filesManifestPath: str,
+                             androidPlatformManifestPath: str,
+                             androidShellSourcePath: str,
+                             iosInfoPlistPath: str,
+                             iosShellSourcePath: str,
+                             ohosModulePath: str,
+                             ohosShellSourcePath: str,
+                             buildInputsManifestPath: str,
+                             androidBuildInputPath: str,
+                             iosBuildInputPath: str,
+                             ohosBuildInputPath: str,
+                             summaryPath: str,
+                             packageText: str): str =
+    let framePath: str = nativeProjectJsonReadStringField(packageText, "frame_path", "")
+    let frameByteCount: int32 = nativeProjectJsonReadIntField(packageText, "frame_byte_count", 0)
+    let packagingPlanManifestPath: str = chengpath.PathJoin(projectDir, "native_platform_shell_packaging_plan_manifest_v1.json")
+    let androidPackagingPlanPath: str = chengpath.PathJoin(androidDir, "android_packaging_plan_v1.json")
+    let iosPackagingPlanPath: str = chengpath.PathJoin(iosDir, "ios_packaging_plan_v1.json")
+    let ohosPackagingPlanPath: str = chengpath.PathJoin(ohosDir, "ohos_packaging_plan_v1.json")
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_project_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_project_v1\",\n"
+    doc = doc + "  \"project_kind\": \"cheng_generated_native_surface_shell_project_v1\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"platform_count\": 3,\n"
+    doc = doc + "  \"package_manifest_path\": " + nativeProjectJsonQuote(packageManifestPath) + ",\n"
+    doc = doc + "  \"project_dir\": " + nativeProjectJsonQuote(projectDir) + ",\n"
+    doc = doc + "  \"summary_path\": " + nativeProjectJsonQuote(summaryPath) + ",\n"
+    doc = doc + "  \"entry_manifest_path\": " + nativeProjectJsonQuote(entryManifestPath) + ",\n"
+    doc = doc + "  \"install_manifest_path\": " + nativeProjectJsonQuote(installManifestPath) + ",\n"
+    doc = doc + "  \"files_manifest_path\": " + nativeProjectJsonQuote(filesManifestPath) + ",\n"
+    doc = doc + "  \"build_inputs_manifest_path\": " + nativeProjectJsonQuote(buildInputsManifestPath) + ",\n"
+    doc = doc + "  \"packaging_plan_manifest_path\": " + nativeProjectJsonQuote(packagingPlanManifestPath) + ",\n"
+    doc = doc + "  \"install_package_count\": 3,\n"
+    doc = doc + "  \"platform_file_count\": 6,\n"
+    doc = doc + "  \"build_input_count\": 3,\n"
+    doc = doc + "  \"packaging_plan_count\": 3,\n"
+    doc = doc + "  \"frame_path\": " + nativeProjectJsonQuote(framePath) + ",\n"
+    doc = doc + "  \"frame_byte_count\": " + intToStr(frameByteCount) + ",\n"
+    doc = doc + "  \"platforms\": [\n"
+    doc = doc + "    {\"id\":\"android\",\"target_triple\":\"aarch64-linux-android\",\"project_dir\":" + nativeProjectJsonQuote(androidDir) + ",\"project_path\":" + nativeProjectJsonQuote(androidProjectPath) + ",\"entry_path\":" + nativeProjectJsonQuote(androidEntryPath) + ",\"install_package_path\":" + nativeProjectJsonQuote(androidInstallPackagePath) + ",\"platform_manifest_path\":" + nativeProjectJsonQuote(androidPlatformManifestPath) + ",\"shell_source_path\":" + nativeProjectJsonQuote(androidShellSourcePath) + ",\"build_input_path\":" + nativeProjectJsonQuote(androidBuildInputPath) + ",\"packaging_plan_path\":" + nativeProjectJsonQuote(androidPackagingPlanPath) + ",\"surface_binding\":\"ANativeWindow_rgba_blit_v1\",\"input_binding\":\"AInputQueue_event_driven_v1\"},\n"
+    doc = doc + "    {\"id\":\"ios\",\"target_triple\":\"arm64-apple-ios\",\"project_dir\":" + nativeProjectJsonQuote(iosDir) + ",\"project_path\":" + nativeProjectJsonQuote(iosProjectPath) + ",\"entry_path\":" + nativeProjectJsonQuote(iosEntryPath) + ",\"install_package_path\":" + nativeProjectJsonQuote(iosInstallPackagePath) + ",\"platform_manifest_path\":" + nativeProjectJsonQuote(iosInfoPlistPath) + ",\"shell_source_path\":" + nativeProjectJsonQuote(iosShellSourcePath) + ",\"build_input_path\":" + nativeProjectJsonQuote(iosBuildInputPath) + ",\"packaging_plan_path\":" + nativeProjectJsonQuote(iosPackagingPlanPath) + ",\"surface_binding\":\"CAMetalLayer_rgba_blit_v1\",\"input_binding\":\"UIKit_touch_event_driven_v1\"},\n"
+    doc = doc + "    {\"id\":\"ohos\",\"target_triple\":\"aarch64-linux-ohos\",\"project_dir\":" + nativeProjectJsonQuote(ohosDir) + ",\"project_path\":" + nativeProjectJsonQuote(ohosProjectPath) + ",\"entry_path\":" + nativeProjectJsonQuote(ohosEntryPath) + ",\"install_package_path\":" + nativeProjectJsonQuote(ohosInstallPackagePath) + ",\"platform_manifest_path\":" + nativeProjectJsonQuote(ohosModulePath) + ",\"shell_source_path\":" + nativeProjectJsonQuote(ohosShellSourcePath) + ",\"build_input_path\":" + nativeProjectJsonQuote(ohosBuildInputPath) + ",\"packaging_plan_path\":" + nativeProjectJsonQuote(ohosPackagingPlanPath) + ",\"surface_binding\":\"OHNativeWindow_rgba_blit_v1\",\"input_binding\":\"XComponent_event_driven_v1\"}\n"
+    doc = doc + "  ]\n"
+    doc = doc + "}\n"
+    return doc
+
+fn NativePlatformShellProjectManifestValid(manifestText: str): bool =
+    if nativeProjectJsonReadStringField(manifestText, "format", "") != "native_platform_shell_project_manifest_v1":
+        return false
+    if nativeProjectJsonReadStringField(manifestText, "project_kind", "") != "cheng_generated_native_surface_shell_project_v1":
+        return false
+    if nativeProjectJsonReadStringField(manifestText, "event_loop", "") != "event_driven_v1":
+        return false
+    if nativeProjectJsonReadIntField(manifestText, "platform_count", 0) != 3:
+        return false
+    if !strutil.Contains(manifestText, "\"node\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"react\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"webview_business_layer\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"business_js\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"project_dir\":"):
+        return false
+    if !strutil.Contains(manifestText, "\"entry_manifest_path\":"):
+        return false
+    if !strutil.Contains(manifestText, "\"install_manifest_path\":"):
+        return false
+    if !strutil.Contains(manifestText, "\"files_manifest_path\":"):
+        return false
+    if !strutil.Contains(manifestText, "\"build_inputs_manifest_path\":"):
+        return false
+    if !strutil.Contains(manifestText, "\"packaging_plan_manifest_path\":"):
+        return false
+    if nativeProjectJsonReadIntField(manifestText, "install_package_count", 0) != 3:
+        return false
+    if nativeProjectJsonReadIntField(manifestText, "platform_file_count", 0) != 6:
+        return false
+    if nativeProjectJsonReadIntField(manifestText, "build_input_count", 0) != 3:
+        return false
+    if nativeProjectJsonReadIntField(manifestText, "packaging_plan_count", 0) != 3:
+        return false
+    if !strutil.Contains(manifestText, "\"id\":\"android\""):
+        return false
+    if !strutil.Contains(manifestText, "\"id\":\"ios\""):
+        return false
+    if !strutil.Contains(manifestText, "\"id\":\"ohos\""):
+        return false
+    if !strutil.Contains(manifestText, "\"target_triple\":\"aarch64-linux-android\""):
+        return false
+    if !strutil.Contains(manifestText, "\"target_triple\":\"arm64-apple-ios\""):
+        return false
+    if !strutil.Contains(manifestText, "\"target_triple\":\"aarch64-linux-ohos\""):
+        return false
+    if !strutil.Contains(manifestText, "\"packaging_plan_path\":"):
+        return false
+    return true
+
+fn NativePlatformShellFilesManifestValid(manifestText: str): bool =
+    if nativeProjectJsonReadStringField(manifestText, "format", "") != "native_platform_shell_files_manifest_v1":
+        return false
+    if nativeProjectJsonReadStringField(manifestText, "event_loop", "") != "event_driven_v1":
+        return false
+    if nativeProjectJsonReadIntField(manifestText, "platform_file_count", 0) != 6:
+        return false
+    if !strutil.Contains(manifestText, "\"node\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"react\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"webview_business_layer\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"business_js\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"language\":\"cheng\""):
+        return false
+    if !strutil.Contains(manifestText, "\"surface_binding\":\"ANativeWindow_rgba_blit_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"surface_binding\":\"CAMetalLayer_rgba_blit_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"surface_binding\":\"OHNativeWindow_rgba_blit_v1\""):
+        return false
+    return true
+
+fn NativePlatformShellInstallManifestValid(manifestText: str): bool =
+    if nativeProjectJsonReadStringField(manifestText, "format", "") != "native_platform_shell_install_manifest_v1":
+        return false
+    if nativeProjectJsonReadStringField(manifestText, "event_loop", "") != "event_driven_v1":
+        return false
+    if nativeProjectJsonReadIntField(manifestText, "install_package_count", 0) != 3:
+        return false
+    if !strutil.Contains(manifestText, "\"node\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"react\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"webview_business_layer\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"business_js\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"c_dependency\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"script_dependency\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"package_kind\":\"android_native_surface_app_manifest_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"package_kind\":\"ios_native_surface_app_manifest_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"package_kind\":\"ohos_native_surface_app_manifest_v1\""):
+        return false
+    return true
+
+fn NativePlatformShellBuildInputsManifestValid(manifestText: str): bool =
+    if nativeProjectJsonReadStringField(manifestText, "format", "") != "native_platform_shell_build_inputs_manifest_v1":
+        return false
+    if nativeProjectJsonReadStringField(manifestText, "event_loop", "") != "event_driven_v1":
+        return false
+    if nativeProjectJsonReadIntField(manifestText, "build_input_count", 0) != 3:
+        return false
+    if !strutil.Contains(manifestText, "\"node\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"react\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"webview_business_layer\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"business_js\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"c_dependency\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"node_dependency\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"script_dependency\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"target_triple\":\"aarch64-linux-android\""):
+        return false
+    if !strutil.Contains(manifestText, "\"target_triple\":\"arm64-apple-ios\""):
+        return false
+    if !strutil.Contains(manifestText, "\"target_triple\":\"aarch64-linux-ohos\""):
+        return false
+    if !strutil.Contains(manifestText, "\"artifact_kind\":\"apk_or_aab_input_contract_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"artifact_kind\":\"ipa_or_app_bundle_input_contract_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"artifact_kind\":\"hap_input_contract_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"platform_identifier_kind\":\"android_package_id\""):
+        return false
+    if !strutil.Contains(manifestText, "\"platform_identifier_kind\":\"ios_bundle_id\""):
+        return false
+    if !strutil.Contains(manifestText, "\"platform_identifier_kind\":\"ohos_bundle_name\""):
+        return false
+    return true
+
+fn NativePlatformShellPackagingPlanManifestValid(manifestText: str): bool =
+    if nativeProjectJsonReadStringField(manifestText, "format", "") != "native_platform_shell_packaging_plan_manifest_v1":
+        return false
+    if nativeProjectJsonReadStringField(manifestText, "event_loop", "") != "event_driven_v1":
+        return false
+    if nativeProjectJsonReadIntField(manifestText, "packaging_plan_count", 0) != 3:
+        return false
+    if !strutil.Contains(manifestText, "\"artifact_emitted\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"node\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"react\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"webview_business_layer\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"business_js\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"c_dependency\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"node_dependency\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"script_dependency\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"target_triple\":\"aarch64-linux-android\""):
+        return false
+    if !strutil.Contains(manifestText, "\"target_triple\":\"arm64-apple-ios\""):
+        return false
+    if !strutil.Contains(manifestText, "\"target_triple\":\"aarch64-linux-ohos\""):
+        return false
+    if !strutil.Contains(manifestText, "\"packaging_plan_path\":"):
+        return false
+    return true
+
+fn WriteNativePlatformShellProject(packageManifestPath: str,
+                                   projectDir: str,
+                                   projectManifestOut: str): bool =
+    if strings.Len(packageManifestPath) <= 0 || !chengpath.FileExistsNonEmpty("", packageManifestPath):
+        return false
+    if strings.Len(projectDir) <= 0 || strings.Len(projectManifestOut) <= 0:
+        return false
+    if !chengpath.MkdirP("", projectDir):
+        return false
+    let packageText: str = chengpath.ReadTextFile("", packageManifestPath)
+    if !shellpackage.NativePlatformShellPackageManifestValid(packageText):
+        return false
+    let androidDir: str = chengpath.PathJoin(projectDir, "android")
+    let iosDir: str = chengpath.PathJoin(projectDir, "ios")
+    let ohosDir: str = chengpath.PathJoin(projectDir, "ohos")
+    if !chengpath.MkdirP("", androidDir):
+        return false
+    if !chengpath.MkdirP("", iosDir):
+        return false
+    if !chengpath.MkdirP("", ohosDir):
+        return false
+    let androidProjectPath: str = chengpath.PathJoin(androidDir, "native_surface_shell_project_v1.json")
+    let iosProjectPath: str = chengpath.PathJoin(iosDir, "native_surface_shell_project_v1.json")
+    let ohosProjectPath: str = chengpath.PathJoin(ohosDir, "native_surface_shell_project_v1.json")
+    let androidEntryPath: str = chengpath.PathJoin(androidDir, "native_surface_shell_entry_v1.json")
+    let iosEntryPath: str = chengpath.PathJoin(iosDir, "native_surface_shell_entry_v1.json")
+    let ohosEntryPath: str = chengpath.PathJoin(ohosDir, "native_surface_shell_entry_v1.json")
+    let entryManifestPath: str = chengpath.PathJoin(projectDir, "native_platform_shell_entry_manifest_v1.json")
+    let androidInstallPackagePath: str = chengpath.PathJoin(androidDir, "android_package_manifest_v1.json")
+    let iosInstallPackagePath: str = chengpath.PathJoin(iosDir, "ios_package_manifest_v1.json")
+    let ohosInstallPackagePath: str = chengpath.PathJoin(ohosDir, "ohos_package_manifest_v1.json")
+    let installManifestPath: str = chengpath.PathJoin(projectDir, "native_platform_shell_install_manifest_v1.json")
+    let androidPlatformManifestPath: str = chengpath.PathJoin(androidDir, "AndroidManifest.xml")
+    let androidShellSourcePath: str = chengpath.PathJoin(androidDir, "ChengNativeSurfaceActivity.cheng")
+    let iosInfoPlistPath: str = chengpath.PathJoin(iosDir, "Info.plist")
+    let iosShellSourcePath: str = chengpath.PathJoin(iosDir, "ChengNativeSurfaceViewController.cheng")
+    let ohosModulePath: str = chengpath.PathJoin(ohosDir, "module.json5")
+    let ohosShellSourcePath: str = chengpath.PathJoin(ohosDir, "ChengNativeSurfaceAbility.cheng")
+    let filesManifestPath: str = chengpath.PathJoin(projectDir, "native_platform_shell_files_manifest_v1.json")
+    let buildInputsManifestPath: str = chengpath.PathJoin(projectDir, "native_platform_shell_build_inputs_manifest_v1.json")
+    let androidBuildInputPath: str = chengpath.PathJoin(androidDir, "android_build_input_v1.json")
+    let iosBuildInputPath: str = chengpath.PathJoin(iosDir, "ios_build_input_v1.json")
+    let ohosBuildInputPath: str = chengpath.PathJoin(ohosDir, "ohos_build_input_v1.json")
+    let packagingPlanManifestPath: str = chengpath.PathJoin(projectDir, "native_platform_shell_packaging_plan_manifest_v1.json")
+    let androidPackagingPlanPath: str = chengpath.PathJoin(androidDir, "android_packaging_plan_v1.json")
+    let iosPackagingPlanPath: str = chengpath.PathJoin(iosDir, "ios_packaging_plan_v1.json")
+    let ohosPackagingPlanPath: str = chengpath.PathJoin(ohosDir, "ohos_packaging_plan_v1.json")
+    let summaryPath: str = chengpath.PathJoin(projectDir, "native_platform_shell_project.summary.env")
+    let androidLaunchPath: str = nativeProjectJsonReadStringField(packageText, "android_launch_plan_path", "")
+    let iosLaunchPath: str = nativeProjectJsonReadStringField(packageText, "ios_launch_plan_path", "")
+    let ohosLaunchPath: str = nativeProjectJsonReadStringField(packageText, "ohos_launch_plan_path", "")
+    let androidDoc: str = nativeProjectPlatformText(packageManifestPath,
+                                                    packageText,
+                                                    "android",
+                                                    "cheng_generated_android_native_surface_project_v1",
+                                                    "cheng_generated_android_surface_shell_v1",
+                                                    "ANativeWindow_rgba_blit_v1",
+                                                    "AInputQueue_event_driven_v1",
+                                                    androidLaunchPath,
+                                                    androidDir)
+    let iosDoc: str = nativeProjectPlatformText(packageManifestPath,
+                                                packageText,
+                                                "ios",
+                                                "cheng_generated_ios_native_surface_project_v1",
+                                                "cheng_generated_ios_surface_shell_v1",
+                                                "CAMetalLayer_rgba_blit_v1",
+                                                "UIKit_touch_event_driven_v1",
+                                                iosLaunchPath,
+                                                iosDir)
+    let ohosDoc: str = nativeProjectPlatformText(packageManifestPath,
+                                                 packageText,
+                                                 "ohos",
+                                                 "cheng_generated_ohos_native_surface_project_v1",
+                                                 "cheng_generated_ohos_surface_shell_v1",
+                                                 "OHNativeWindow_rgba_blit_v1",
+                                                 "XComponent_event_driven_v1",
+                                                 ohosLaunchPath,
+                                                 ohosDir)
+    if !chengpath.WriteTextFile("", androidProjectPath, androidDoc):
+        return false
+    if !chengpath.WriteTextFile("", iosProjectPath, iosDoc):
+        return false
+    if !chengpath.WriteTextFile("", ohosProjectPath, ohosDoc):
+        return false
+    let androidEntryDoc: str = nativeProjectEntryText(packageManifestPath,
+                                                      androidProjectPath,
+                                                      "android",
+                                                      "cheng_android_native_surface_entry_v1",
+                                                      "cheng_generated_android_surface_shell_v1",
+                                                      "ANativeWindow_rgba_blit_v1",
+                                                      "AInputQueue_event_driven_v1",
+                                                      androidDir,
+                                                      packageText)
+    let iosEntryDoc: str = nativeProjectEntryText(packageManifestPath,
+                                                  iosProjectPath,
+                                                  "ios",
+                                                  "cheng_ios_native_surface_entry_v1",
+                                                  "cheng_generated_ios_surface_shell_v1",
+                                                  "CAMetalLayer_rgba_blit_v1",
+                                                  "UIKit_touch_event_driven_v1",
+                                                  iosDir,
+                                                  packageText)
+    let ohosEntryDoc: str = nativeProjectEntryText(packageManifestPath,
+                                                   ohosProjectPath,
+                                                   "ohos",
+                                                   "cheng_ohos_native_surface_entry_v1",
+                                                   "cheng_generated_ohos_surface_shell_v1",
+                                                   "OHNativeWindow_rgba_blit_v1",
+                                                   "XComponent_event_driven_v1",
+                                                   ohosDir,
+                                                   packageText)
+    if !chengpath.WriteTextFile("", androidEntryPath, androidEntryDoc):
+        return false
+    if !chengpath.WriteTextFile("", iosEntryPath, iosEntryDoc):
+        return false
+    if !chengpath.WriteTextFile("", ohosEntryPath, ohosEntryDoc):
+        return false
+    let androidInstallDoc: str = nativeProjectInstallPackageText(packageManifestPath,
+                                                                 androidProjectPath,
+                                                                 androidEntryPath,
+                                                                 "android",
+                                                                 "android_native_surface_app_manifest_v1",
+                                                                 "cheng_generated_android_surface_app_v1",
+                                                                 "org.cheng.unimaker.nativegui",
+                                                                 "ChengNativeSurfaceActivity",
+                                                                 "ANativeWindow_rgba_blit_v1",
+                                                                 "AInputQueue_event_driven_v1",
+                                                                 androidDir,
+                                                                 packageText)
+    let iosInstallDoc: str = nativeProjectInstallPackageText(packageManifestPath,
+                                                             iosProjectPath,
+                                                             iosEntryPath,
+                                                             "ios",
+                                                             "ios_native_surface_app_manifest_v1",
+                                                             "cheng_generated_ios_surface_app_v1",
+                                                             "org.cheng.unimaker.nativegui",
+                                                             "ChengNativeSurfaceViewController",
+                                                             "CAMetalLayer_rgba_blit_v1",
+                                                             "UIKit_touch_event_driven_v1",
+                                                             iosDir,
+                                                             packageText)
+    let ohosInstallDoc: str = nativeProjectInstallPackageText(packageManifestPath,
+                                                              ohosProjectPath,
+                                                              ohosEntryPath,
+                                                              "ohos",
+                                                              "ohos_native_surface_app_manifest_v1",
+                                                              "cheng_generated_ohos_surface_app_v1",
+                                                              "org.cheng.unimaker.nativegui",
+                                                              "ChengNativeSurfaceAbility",
+                                                              "OHNativeWindow_rgba_blit_v1",
+                                                              "XComponent_event_driven_v1",
+                                                              ohosDir,
+                                                              packageText)
+    if !chengpath.WriteTextFile("", androidInstallPackagePath, androidInstallDoc):
+        return false
+    if !chengpath.WriteTextFile("", iosInstallPackagePath, iosInstallDoc):
+        return false
+    if !chengpath.WriteTextFile("", ohosInstallPackagePath, ohosInstallDoc):
+        return false
+    let framePath: str = nativeProjectJsonReadStringField(packageText, "frame_path", "")
+    let packageId: str = "org.cheng.unimaker.nativegui"
+    if !chengpath.WriteTextFile("", androidPlatformManifestPath, nativeProjectAndroidManifestText(packageId)):
+        return false
+    if !chengpath.WriteTextFile("", androidShellSourcePath, nativeProjectAndroidShellSourceText(packageId, framePath)):
+        return false
+    if !chengpath.WriteTextFile("", iosInfoPlistPath, nativeProjectIosInfoPlistText(packageId)):
+        return false
+    if !chengpath.WriteTextFile("", iosShellSourcePath, nativeProjectIosShellSourceText(packageId, framePath)):
+        return false
+    if !chengpath.WriteTextFile("", ohosModulePath, nativeProjectOhosModuleText(packageId)):
+        return false
+    if !chengpath.WriteTextFile("", ohosShellSourcePath, nativeProjectOhosShellSourceText(packageId, framePath)):
+        return false
+    let filesManifestDoc: str = nativeProjectFilesManifestText(projectManifestOut,
+                                                               androidPlatformManifestPath,
+                                                               androidShellSourcePath,
+                                                               iosInfoPlistPath,
+                                                               iosShellSourcePath,
+                                                               ohosModulePath,
+                                                               ohosShellSourcePath)
+    if !NativePlatformShellFilesManifestValid(filesManifestDoc):
+        return false
+    if !chengpath.WriteTextFile("", filesManifestPath, filesManifestDoc):
+        return false
+    if !chengpath.WriteTextFile("", entryManifestPath,
+                                nativeProjectEntryManifestText(projectManifestOut,
+                                                               androidEntryPath,
+                                                               iosEntryPath,
+                                                               ohosEntryPath)):
+        return false
+    let installManifestDoc: str = nativeProjectInstallManifestText(projectManifestOut,
+                                                                   androidInstallPackagePath,
+                                                                   iosInstallPackagePath,
+                                                                   ohosInstallPackagePath)
+    if !NativePlatformShellInstallManifestValid(installManifestDoc):
+        return false
+    if !chengpath.WriteTextFile("", installManifestPath, installManifestDoc):
+        return false
+    let androidBuildInputDoc: str = nativeProjectBuildInputText(packageManifestPath,
+                                                                projectManifestOut,
+                                                                androidProjectPath,
+                                                                entryManifestPath,
+                                                                androidEntryPath,
+                                                                installManifestPath,
+                                                                androidInstallPackagePath,
+                                                                filesManifestPath,
+                                                                androidPlatformManifestPath,
+                                                                androidShellSourcePath,
+                                                                "android",
+                                                                "aarch64-linux-android",
+                                                                "apk_or_aab_input_contract_v1",
+                                                                packageId,
+                                                                "android_package_id",
+                                                                "ChengNativeSurfaceActivity",
+                                                                "ANativeWindow_rgba_blit_v1",
+                                                                "AInputQueue_event_driven_v1",
+                                                                chengpath.PathJoin(androidDir, "build/outputs/unimaker-cheng-native.apk"),
+                                                                packageText)
+    let iosBuildInputDoc: str = nativeProjectBuildInputText(packageManifestPath,
+                                                            projectManifestOut,
+                                                            iosProjectPath,
+                                                            entryManifestPath,
+                                                            iosEntryPath,
+                                                            installManifestPath,
+                                                            iosInstallPackagePath,
+                                                            filesManifestPath,
+                                                            iosInfoPlistPath,
+                                                            iosShellSourcePath,
+                                                            "ios",
+                                                            "arm64-apple-ios",
+                                                            "ipa_or_app_bundle_input_contract_v1",
+                                                            packageId,
+                                                            "ios_bundle_id",
+                                                            "ChengNativeSurfaceViewController",
+                                                            "CAMetalLayer_rgba_blit_v1",
+                                                            "UIKit_touch_event_driven_v1",
+                                                            chengpath.PathJoin(iosDir, "build/UniMakerCheng.app"),
+                                                            packageText)
+    let ohosBuildInputDoc: str = nativeProjectBuildInputText(packageManifestPath,
+                                                             projectManifestOut,
+                                                             ohosProjectPath,
+                                                             entryManifestPath,
+                                                             ohosEntryPath,
+                                                             installManifestPath,
+                                                             ohosInstallPackagePath,
+                                                             filesManifestPath,
+                                                             ohosModulePath,
+                                                             ohosShellSourcePath,
+                                                             "ohos",
+                                                             "aarch64-linux-ohos",
+                                                             "hap_input_contract_v1",
+                                                             packageId,
+                                                             "ohos_bundle_name",
+                                                             "ChengNativeSurfaceAbility",
+                                                             "OHNativeWindow_rgba_blit_v1",
+                                                             "XComponent_event_driven_v1",
+                                                             chengpath.PathJoin(ohosDir, "build/UniMakerCheng.hap"),
+                                                             packageText)
+    if !chengpath.WriteTextFile("", androidBuildInputPath, androidBuildInputDoc):
+        return false
+    if !chengpath.WriteTextFile("", iosBuildInputPath, iosBuildInputDoc):
+        return false
+    if !chengpath.WriteTextFile("", ohosBuildInputPath, ohosBuildInputDoc):
+        return false
+    let buildInputsManifestDoc: str = nativeProjectBuildInputsManifestText(packageManifestPath,
+                                                                           projectManifestOut,
+                                                                           androidBuildInputPath,
+                                                                           iosBuildInputPath,
+                                                                           ohosBuildInputPath)
+    if !NativePlatformShellBuildInputsManifestValid(buildInputsManifestDoc):
+        return false
+    if !chengpath.WriteTextFile("", buildInputsManifestPath, buildInputsManifestDoc):
+        return false
+    if !chengpath.WriteTextFile("", androidPackagingPlanPath,
+                                nativeProjectPackagingPlanText(androidBuildInputPath,
+                                                               "android",
+                                                               "aarch64-linux-android",
+                                                               "apk_or_aab_input_contract_v1",
+                                                               "android_package_id",
+                                                               "ANativeWindow_rgba_blit_v1",
+                                                               "AInputQueue_event_driven_v1",
+                                                               chengpath.PathJoin(androidDir, "build/outputs/unimaker-cheng-native.apk"))):
+        return false
+    if !chengpath.WriteTextFile("", iosPackagingPlanPath,
+                                nativeProjectPackagingPlanText(iosBuildInputPath,
+                                                               "ios",
+                                                               "arm64-apple-ios",
+                                                               "ipa_or_app_bundle_input_contract_v1",
+                                                               "ios_bundle_id",
+                                                               "CAMetalLayer_rgba_blit_v1",
+                                                               "UIKit_touch_event_driven_v1",
+                                                               chengpath.PathJoin(iosDir, "build/UniMakerCheng.app"))):
+        return false
+    if !chengpath.WriteTextFile("", ohosPackagingPlanPath,
+                                nativeProjectPackagingPlanText(ohosBuildInputPath,
+                                                               "ohos",
+                                                               "aarch64-linux-ohos",
+                                                               "hap_input_contract_v1",
+                                                               "ohos_bundle_name",
+                                                               "OHNativeWindow_rgba_blit_v1",
+                                                               "XComponent_event_driven_v1",
+                                                               chengpath.PathJoin(ohosDir, "build/UniMakerCheng.hap"))):
+        return false
+    let packagingPlanManifestDoc: str = nativeProjectPackagingPlanManifestText(projectManifestOut,
+                                                                               buildInputsManifestPath,
+                                                                               androidPackagingPlanPath,
+                                                                               iosPackagingPlanPath,
+                                                                               ohosPackagingPlanPath)
+    if !NativePlatformShellPackagingPlanManifestValid(packagingPlanManifestDoc):
+        return false
+    if !chengpath.WriteTextFile("", packagingPlanManifestPath, packagingPlanManifestDoc):
+        return false
+    if !chengpath.WriteTextFile("", summaryPath,
+                                nativeProjectSummaryText(projectManifestOut,
+                                                         androidProjectPath,
+                                                         iosProjectPath,
+                                                         ohosProjectPath,
+                                                         entryManifestPath,
+                                                         installManifestPath,
+                                                         androidInstallPackagePath,
+                                                         iosInstallPackagePath,
+                                                         ohosInstallPackagePath,
+                                                         filesManifestPath,
+                                                         androidPlatformManifestPath,
+                                                         androidShellSourcePath,
+                                                         iosInfoPlistPath,
+                                                         iosShellSourcePath,
+                                                         ohosModulePath,
+                                                         ohosShellSourcePath,
+                                                         buildInputsManifestPath,
+                                                         androidBuildInputPath,
+                                                         iosBuildInputPath,
+                                                         ohosBuildInputPath,
+                                                         packagingPlanManifestPath,
+                                                         androidPackagingPlanPath,
+                                                         iosPackagingPlanPath,
+                                                         ohosPackagingPlanPath)):
+        return false
+    let projectDoc: str = nativeProjectManifestText(packageManifestPath,
+                                                    projectDir,
+                                                    androidDir,
+                                                    iosDir,
+                                                    ohosDir,
+                                                    androidProjectPath,
+                                                    iosProjectPath,
+                                                    ohosProjectPath,
+                                                    entryManifestPath,
+                                                    androidEntryPath,
+                                                    iosEntryPath,
+                                                    ohosEntryPath,
+                                                    installManifestPath,
+                                                    androidInstallPackagePath,
+                                                    iosInstallPackagePath,
+                                                    ohosInstallPackagePath,
+                                                    filesManifestPath,
+                                                    androidPlatformManifestPath,
+                                                    androidShellSourcePath,
+                                                    iosInfoPlistPath,
+                                                    iosShellSourcePath,
+                                                    ohosModulePath,
+                                                    ohosShellSourcePath,
+                                                    buildInputsManifestPath,
+                                                    androidBuildInputPath,
+                                                    iosBuildInputPath,
+                                                    ohosBuildInputPath,
+                                                    summaryPath,
+                                                    packageText)
+    if !NativePlatformShellProjectManifestValid(projectDoc):
+        return false
+    if !chengpath.WriteTextFile("", projectManifestOut, projectDoc):
+        return false
+    if !chengpath.FileExistsNonEmpty("", androidProjectPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", iosProjectPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", ohosProjectPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", androidEntryPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", iosEntryPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", ohosEntryPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", entryManifestPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", androidInstallPackagePath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", iosInstallPackagePath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", ohosInstallPackagePath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", installManifestPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", androidPlatformManifestPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", androidShellSourcePath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", iosInfoPlistPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", iosShellSourcePath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", ohosModulePath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", ohosShellSourcePath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", filesManifestPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", androidBuildInputPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", iosBuildInputPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", ohosBuildInputPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", buildInputsManifestPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", androidPackagingPlanPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", iosPackagingPlanPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", ohosPackagingPlanPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", packagingPlanManifestPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", summaryPath):
+        return false
+    return chengpath.FileExistsNonEmpty("", projectManifestOut)

@@ -2,7 +2,6 @@ import std/os
 import std/bytes as bytes
 import std/result
 import std/strings as strings
-import std/strformat
 import cheng/apps/wow_export/asset_formats as asset_formats
 import cheng/apps/wow_export/blp as blp
 import cheng/apps/wow_export/build_info as build_info
@@ -29,6 +28,14 @@ type
         fileCount: int32
         bytesWritten: int32
 
+    AssetExportPlacementDependencyBundleSummary =
+        outDir: str
+        manifestPath: str
+        fileCount: int32
+        doodadFileCount: int32
+        worldModelFileCount: int32
+        bytesWritten: int32
+
 fn assetExportMakeDirAll(path: str): bool =
     if strings.Len(path) == 0:
         return false
@@ -45,15 +52,16 @@ fn assetExportMakeDirAll(path: str): bool =
 fn assetExportWriteBufferAtomic(path: str, buf: bytes.ByteBuffer): Result[int32] =
     if strings.Len(path) == 0:
         return Err[int32]("wowExport asset export: missing output path")
+    let stablePath: str = build_info.StableConcat(path, "")
     if buf.len <= 0 || buf.data == nil:
         return Err[int32]("wowExport asset export: empty buffer")
-    if os.FileExists(path):
-        return Err[int32]("wowExport asset export: refusing to overwrite " + path)
-    let parent: str = os.ParentDir(path)
+    if os.FileExists(stablePath):
+        return Err[int32]("wowExport asset export: refusing to overwrite " + stablePath)
+    let parent: str = os.ParentDir(stablePath)
     if strings.Len(parent) > 0 && !os.DirExists(parent):
         if !assetExportMakeDirAll(parent):
             return Err[int32]("wowExport asset export: output directory create failed " + parent)
-    let tmpPath: str = path + ".tmp"
+    let tmpPath: str = build_info.StableConcat(stablePath, ".tmp")
     if os.FileExists(tmpPath):
         let _ = os.RemoveFile(tmpPath)
     let file: os.File = os.Open(tmpPath, os.fmWrite)
@@ -65,9 +73,9 @@ fn assetExportWriteBufferAtomic(path: str, buf: bytes.ByteBuffer): Result[int32]
     if wrote != buf.len:
         let _ = os.RemoveFile(tmpPath)
         return Err[int32]("wowExport asset export: short write")
-    if !os.RenameFile(tmpPath, path):
+    if !os.RenameFile(tmpPath, stablePath):
         let _ = os.RemoveFile(tmpPath)
-        return Err[int32]("wowExport asset export: rename output failed " + path)
+        return Err[int32]("wowExport asset export: rename output failed " + stablePath)
     return Ok[int32](wrote)
 
 fn AssetExportWriteBufferAtomic(path: str, buf: bytes.ByteBuffer): Result[int32] =
@@ -76,15 +84,16 @@ fn AssetExportWriteBufferAtomic(path: str, buf: bytes.ByteBuffer): Result[int32]
 fn assetExportWriteTextAtomic(path: str, text: str): Result[int32] =
     if strings.Len(path) == 0:
         return Err[int32]("wowExport asset export: missing output path")
+    let stablePath: str = build_info.StableConcat(path, "")
     if strings.Len(text) <= 0:
         return Err[int32]("wowExport asset export: empty text")
-    if os.FileExists(path):
-        return Err[int32]("wowExport asset export: refusing to overwrite " + path)
-    let parent: str = os.ParentDir(path)
+    if os.FileExists(stablePath):
+        return Err[int32]("wowExport asset export: refusing to overwrite " + stablePath)
+    let parent: str = os.ParentDir(stablePath)
     if strings.Len(parent) > 0 && !os.DirExists(parent):
         if !assetExportMakeDirAll(parent):
             return Err[int32]("wowExport asset export: output directory create failed " + parent)
-    let tmpPath: str = path + ".tmp"
+    let tmpPath: str = build_info.StableConcat(stablePath, ".tmp")
     if os.FileExists(tmpPath):
         let _ = os.RemoveFile(tmpPath)
     os.WriteFile(tmpPath, text)
@@ -93,9 +102,9 @@ fn assetExportWriteTextAtomic(path: str, text: str): Result[int32] =
     if os.FileSize(tmpPath) != int64(strings.Len(text)):
         let _ = os.RemoveFile(tmpPath)
         return Err[int32]("wowExport asset export: text short write")
-    if !os.RenameFile(tmpPath, path):
+    if !os.RenameFile(tmpPath, stablePath):
         let _ = os.RemoveFile(tmpPath)
-        return Err[int32]("wowExport asset export: rename output failed " + path)
+        return Err[int32]("wowExport asset export: rename output failed " + stablePath)
     return Ok[int32](strings.Len(text))
 
 fn assetExportValidateFile(file: northshire.NorthshireAuditedFile,
@@ -104,22 +113,26 @@ fn assetExportValidateFile(file: northshire.NorthshireAuditedFile,
         let wdtRes: Result[asset_formats.WdtSummary] = asset_formats.ParseWdtSummary(buf)
         if IsErr(wdtRes):
             return Err[str](Error(wdtRes))
-        return Ok[str](asset_formats.WdtSummaryText(Value(wdtRes)))
+        let tileText: str = strings.IntToStr(Value(wdtRes).activeTileCount)
+        return Ok[str]("wdt activeTiles=" + tileText)
     if file.kind == "wmo":
         let wmoRes: Result[asset_formats.WmoRootSummary] = asset_formats.ParseWmoRootSummary(buf)
         if IsErr(wmoRes):
             return Err[str](Error(wmoRes))
-        return Ok[str](asset_formats.WmoRootSummaryText(Value(wmoRes)))
+        let groupText: str = strings.IntToStr(Value(wmoRes).groupCount)
+        return Ok[str]("wmo groups=" + groupText)
     if file.kind == "wmo_group":
         let groupRes: Result[asset_formats.WmoGroupSummary] = asset_formats.ParseWmoGroupSummary(buf)
         if IsErr(groupRes):
             return Err[str](Error(groupRes))
-        return Ok[str](asset_formats.WmoGroupSummaryText(Value(groupRes)))
+        let vertexText: str = strings.IntToStr(Value(groupRes).vertexCount)
+        return Ok[str]("wmo_group vertices=" + vertexText)
     if file.kind == "adt":
         let adtRes: Result[asset_formats.AdtTerrainSummary] = asset_formats.ParseAdtTerrainSummary(buf)
         if IsErr(adtRes):
             return Err[str](Error(adtRes))
-        return Ok[str](asset_formats.AdtTerrainSummaryText(Value(adtRes)))
+        let chunkText: str = strings.IntToStr(Value(adtRes).mapChunkCount)
+        return Ok[str]("adt chunks=" + chunkText)
     if file.kind == "m2":
         let geometryRes: Result[asset_formats.M2GeometrySummary] =
             asset_formats.ParseM2GeometrySummary(buf)
@@ -130,19 +143,24 @@ fn assetExportValidateFile(file: northshire.NorthshireAuditedFile,
         let spanXText: str = strings.IntToStr(asset_formats.M2GeometrySpanX1000(geometry))
         let spanYText: str = strings.IntToStr(asset_formats.M2GeometrySpanY1000(geometry))
         let spanZText: str = strings.IntToStr(asset_formats.M2GeometrySpanZ1000(geometry))
-        return Ok[str](Fmt"m2 vertices={vertexText} span1000={spanXText},{spanYText},{spanZText}")
+        var out: str = "m2 vertices=" + vertexText
+        out = out + " span1000=" + spanXText
+        out = out + "," + spanYText
+        out = out + "," + spanZText
+        return Ok[str](out)
     if file.kind == "skin":
         let skinRes: Result[asset_formats.M2SkinSummary] = asset_formats.ParseM2SkinSummary(buf)
         if IsErr(skinRes):
             return Err[str](Error(skinRes))
-        return Ok[str](asset_formats.M2SkinSummaryText(Value(skinRes)))
+        let indexText: str = strings.IntToStr(Value(skinRes).indexCount)
+        return Ok[str]("skin indices=" + indexText)
     if file.kind == "blp":
         let headerRes: Result[blp.Blp2Header] = blp.ParseBlp2Header(buf)
         if IsErr(headerRes):
             return Err[str](Error(headerRes))
         let widthText: str = strings.IntToStr(Value(headerRes).width)
         let heightText: str = strings.IntToStr(Value(headerRes).height)
-        return Ok[str](Fmt"blp size={widthText}x{heightText}")
+        return Ok[str]("blp size=" + widthText + "x" + heightText)
     return Err[str]("wowExport asset export: unsupported manifest kind " + file.kind)
 
 fn NorthshireFindByLabel(m: northshire.NorthshireManifest,
@@ -291,7 +309,7 @@ fn ConvertNorthshireFirstBlp(m: northshire.NorthshireManifest,
     return ConvertNorthshireBlpFile(m, Value(fileRes), outPath)
 
 fn NorthshireDefaultOutputName(file: northshire.NorthshireAuditedFile): str =
-    return Fmt"{file.label}.{file.kind}"
+    return build_info.StableConcat3(file.label, ".", file.kind)
 
 fn NorthshireDependencyOutputName(dep: northshire.NorthshireAuditedDependency): str =
     let fidText: str = strings.IntToStr(dep.fileDataID)
@@ -304,6 +322,14 @@ fn NorthshireDependencyOutputName(dep: northshire.NorthshireAuditedDependency): 
             return dep.label + "-fid-" + fidText + ".blp"
         return dep.label + "-fid-" + fidText + ".bin"
     return dep.label + "-fid-" + fidText + ".bin"
+
+fn NorthshirePlacementDependencyOutputName(kind: str, fileDataID: int32): str =
+    let fidText: str = strings.IntToStr(fileDataID)
+    if kind == "doodad_m2":
+        return build_info.StableConcat3("maid-doodad-fid-", fidText, ".m2")
+    if kind == "world_model_wmo":
+        return build_info.StableConcat3("maid-worldmodel-fid-", fidText, ".wmo")
+    return build_info.StableConcat3("maid-placement-fid-", fidText, ".bin")
 
 fn assetExportValidateDependency(dep: northshire.NorthshireAuditedDependency,
                                  buf: bytes.ByteBuffer): Result[str] =
@@ -367,6 +393,259 @@ fn assetExportDependencyManifestLine(dep: northshire.NorthshireAuditedDependency
     out = out + " decodedBytes=" + bytesText
     out = out + " file=" + outName
     return out + "\n"
+
+fn assetExportInt32ListContains(values: int32[], value: int32): bool =
+    var i: int32
+    while i < values.len:
+        if values[i] == value:
+            return true
+        i = i + 1
+    return false
+
+fn assetExportMergeUniqueFileDataIDs(source: int32[],
+                                     unique: var int32[]): Result[bool] =
+    var i: int32
+    while i < source.len:
+        let fileDataID: int32 = source[i]
+        if fileDataID <= 0:
+            return Err[bool]("wowExport placement dependency export: invalid placement fileDataID")
+        if !assetExportInt32ListContains(unique, fileDataID):
+            add(unique, fileDataID)
+        i = i + 1
+    return Ok[bool](true)
+
+fn assetExportCollectWdtMaidPlacementFileDataIDs(m: northshire.NorthshireManifest,
+                                                 doodadFileDataIDs: var int32[],
+                                                 worldModelFileDataIDs: var int32[]): Result[bool] =
+    var parsedCount: int32
+    var i: int32
+    while i < m.auditedDependencies.len:
+        let dep: northshire.NorthshireAuditedDependency = m.auditedDependencies[i]
+        if dep.relationKind == "wdt_maid_split":
+            let fileRes: Result[bytes.ByteBuffer] =
+                local_files.ReadLocalFileByEntry(m.clientPath, dep.archiveIndex, dep.offset, dep.size)
+            if IsErr(fileRes):
+                return Err[bool](Error(fileRes))
+            let fileBuf: bytes.ByteBuffer = Value(fileRes)
+            let resourceRes: Result[asset_formats.WdtMaidResourceSummary] =
+                asset_formats.ParseWdtMaidResourceSummary(fileBuf)
+            if IsErr(resourceRes):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool](Error(resourceRes))
+            let resource: asset_formats.WdtMaidResourceSummary = Value(resourceRes)
+            if resource.formatKind != dep.formatKind:
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool]("wowExport placement dependency export: MAID resource format mismatch " + dep.label)
+            parsedCount = parsedCount + 1
+            if dep.formatKind == "adt_split":
+                let splitRes: Result[asset_formats.WdtMaidAdtSplitSummary] =
+                    asset_formats.ParseWdtMaidAdtSplitSummary(fileBuf)
+                if IsErr(splitRes):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool](Error(splitRes))
+                let split: asset_formats.WdtMaidAdtSplitSummary = Value(splitRes)
+                let doodadRes: Result[bool] =
+                    assetExportMergeUniqueFileDataIDs(split.doodadPlacementFileDataIDs,
+                                                      doodadFileDataIDs)
+                if IsErr(doodadRes):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool](Error(doodadRes))
+                let worldRes: Result[bool] =
+                    assetExportMergeUniqueFileDataIDs(split.worldModelPlacementFileDataIDs,
+                                                      worldModelFileDataIDs)
+                if IsErr(worldRes):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool](Error(worldRes))
+            elif dep.formatKind == "blp":
+                let blpRes: Result[blp.Blp2Header] = blp.ParseBlp2Header(fileBuf)
+                if IsErr(blpRes):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool](Error(blpRes))
+            else:
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool]("wowExport placement dependency export: unsupported MAID format " + dep.formatKind)
+            bytes.FreeByteBuffer(fileBuf)
+        i = i + 1
+    if parsedCount != northshire.CountDependenciesForSource(m, "azeroth-wdt", "wdt_maid_split"):
+        return Err[bool]("wowExport placement dependency export: parsed MAID dependency count mismatch")
+    if doodadFileDataIDs.len <= 0 || worldModelFileDataIDs.len <= 0:
+        return Err[bool]("wowExport placement dependency export: empty placement fileDataID list")
+    return Ok[bool](true)
+
+fn assetExportPlacementManifestLine(kind: str,
+                                    formatKind: str,
+                                    fileDataID: int32,
+                                    stat: local_files.LocalFileAuditEntryStat,
+                                    outName: str,
+                                    bytesWritten: int32): str =
+    let fidText: str = strings.IntToStr(fileDataID)
+    let archiveText: str = strings.IntToStr(stat.archiveIndex)
+    let offsetText: str = strings.IntToStr(stat.offset)
+    let sizeText: str = strings.IntToStr(stat.size)
+    let bytesText: str = strings.IntToStr(bytesWritten)
+    var out: str = "kind=" + kind
+    out = out + " format=" + formatKind
+    out = out + " fileDataID=" + fidText
+    out = out + " archive=" + archiveText
+    out = out + " offset=" + offsetText
+    out = out + " encodedSize=" + sizeText
+    out = out + " decodedBytes=" + bytesText
+    out = out + " file=" + outName
+    return out + "\n"
+
+fn assetExportValidatePlacementAsset(kind: str,
+                                     fileDataID: int32,
+                                     buf: bytes.ByteBuffer): Result[bool] =
+    if kind == "doodad_m2":
+        let m2Res: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(buf)
+        if IsErr(m2Res):
+            return Err[bool]("wowExport placement dependency export: placement doodad is not M2 " + strings.IntToStr(fileDataID) + ": " + Error(m2Res))
+        if Value(m2Res).vertexCount < 0:
+            return Err[bool]("wowExport placement dependency export: invalid M2 vertex count " + strings.IntToStr(fileDataID))
+        return Ok[bool](true)
+    if kind == "world_model_wmo":
+        let wmoRes: Result[asset_formats.WmoRootSummary] = asset_formats.ParseWmoRootSummary(buf)
+        if IsErr(wmoRes):
+            return Err[bool]("wowExport placement dependency export: placement world model is not WMO " + strings.IntToStr(fileDataID) + ": " + Error(wmoRes))
+        return Ok[bool](true)
+    return Err[bool]("wowExport placement dependency export: unsupported placement kind " + kind)
+
+fn assetExportWritePlacementRange(m: northshire.NorthshireManifest,
+                                  outDir: str,
+                                  kind: str,
+                                  formatKind: str,
+                                  fileDataIDs: int32[],
+                                  stats: local_files.LocalFileAuditEntryStat[],
+                                  startIndex: int32,
+                                  manifestText: var str,
+                                  summary: var AssetExportPlacementDependencyBundleSummary): Result[bool] =
+    if startIndex < 0 || startIndex > stats.len || fileDataIDs.len > stats.len - startIndex:
+        return Err[bool]("wowExport placement dependency export: stat range invalid")
+    var i: int32
+    while i < fileDataIDs.len:
+        let fileDataID: int32 = fileDataIDs[i]
+        let stat: local_files.LocalFileAuditEntryStat = stats[startIndex + i]
+        if stat.fileDataID != fileDataID:
+            return Err[bool]("wowExport placement dependency export: stat fileDataID order mismatch")
+        let outName: str = NorthshirePlacementDependencyOutputName(kind, fileDataID)
+        let outPath: str = build_info.StablePathJoin(outDir, outName)
+        let fileRes: Result[bytes.ByteBuffer] =
+            local_files.ReadLocalFileByEntry(m.clientPath, stat.archiveIndex, stat.offset, stat.size)
+        if IsErr(fileRes):
+            return Err[bool](Error(fileRes))
+        let fileBuf: bytes.ByteBuffer = Value(fileRes)
+        let validateRes: Result[bool] = assetExportValidatePlacementAsset(kind, fileDataID, fileBuf)
+        if IsErr(validateRes):
+            bytes.FreeByteBuffer(fileBuf)
+            return Err[bool](Error(validateRes))
+        let writeRes: Result[int32] = assetExportWriteBufferAtomic(outPath, fileBuf)
+        bytes.FreeByteBuffer(fileBuf)
+        if IsErr(writeRes):
+            return Err[bool](Error(writeRes))
+        summary.fileCount = summary.fileCount + 1
+        summary.bytesWritten = summary.bytesWritten + Value(writeRes)
+        if kind == "doodad_m2":
+            summary.doodadFileCount = summary.doodadFileCount + 1
+        elif kind == "world_model_wmo":
+            summary.worldModelFileCount = summary.worldModelFileCount + 1
+        manifestText = manifestText + assetExportPlacementManifestLine(kind,
+                                                                       formatKind,
+                                                                       fileDataID,
+                                                                       stat,
+                                                                       outName,
+                                                                       Value(writeRes))
+        i = i + 1
+    return Ok[bool](true)
+
+fn ExportNorthshirePlacementDependenciesBundle(m: northshire.NorthshireManifest,
+                                               outDir: str): Result[AssetExportPlacementDependencyBundleSummary] =
+    if strings.Len(outDir) == 0:
+        return Err[AssetExportPlacementDependencyBundleSummary]("wowExport placement dependency export: missing output directory")
+    let stableOutDir: str = build_info.StableConcat(outDir, "")
+    if !assetExportMakeDirAll(stableOutDir):
+        return Err[AssetExportPlacementDependencyBundleSummary]("wowExport placement dependency export: output directory create failed " + stableOutDir)
+    let manifestPath: str = build_info.StablePathJoin(stableOutDir, "placement_dependencies.manifest.txt")
+    if os.FileExists(manifestPath):
+        return Err[AssetExportPlacementDependencyBundleSummary]("wowExport placement dependency export: refusing to overwrite " + manifestPath)
+    var doodadFileDataIDs: int32[]
+    var worldModelFileDataIDs: int32[]
+    let collectRes: Result[bool] =
+        assetExportCollectWdtMaidPlacementFileDataIDs(m, doodadFileDataIDs, worldModelFileDataIDs)
+    if IsErr(collectRes):
+        return Err[AssetExportPlacementDependencyBundleSummary](Error(collectRes))
+    var precheckIndex: int32
+    while precheckIndex < doodadFileDataIDs.len:
+        let path: str = build_info.StablePathJoin(stableOutDir,
+            NorthshirePlacementDependencyOutputName("doodad_m2", doodadFileDataIDs[precheckIndex]))
+        if os.FileExists(path):
+            return Err[AssetExportPlacementDependencyBundleSummary]("wowExport placement dependency export: refusing to overwrite " + path)
+        precheckIndex = precheckIndex + 1
+    precheckIndex = 0
+    while precheckIndex < worldModelFileDataIDs.len:
+        let path: str = build_info.StablePathJoin(stableOutDir,
+            NorthshirePlacementDependencyOutputName("world_model_wmo", worldModelFileDataIDs[precheckIndex]))
+        if os.FileExists(path):
+            return Err[AssetExportPlacementDependencyBundleSummary]("wowExport placement dependency export: refusing to overwrite " + path)
+        precheckIndex = precheckIndex + 1
+    let auditRes: Result[northshire.NorthshireMaidPlacementDependencyAuditSummary] =
+        northshire.AuditWdtMaidPlacementReferencesAgainstLocal(m,
+                                                              doodadFileDataIDs,
+                                                              worldModelFileDataIDs)
+    if IsErr(auditRes):
+        return Err[AssetExportPlacementDependencyBundleSummary](Error(auditRes))
+    var allFileDataIDs: int32[]
+    var i: int32
+    while i < doodadFileDataIDs.len:
+        add(allFileDataIDs, doodadFileDataIDs[i])
+        i = i + 1
+    i = 0
+    while i < worldModelFileDataIDs.len:
+        add(allFileDataIDs, worldModelFileDataIDs[i])
+        i = i + 1
+    let statsRes: Result[local_files.LocalFileAuditEntryStat[]] =
+        local_files.ResolveLocalFileAuditEntryStatsRanged(m.clientPath, allFileDataIDs)
+    if IsErr(statsRes):
+        return Err[AssetExportPlacementDependencyBundleSummary](Error(statsRes))
+    let stats: local_files.LocalFileAuditEntryStat[] = Value(statsRes)
+    if stats.len != allFileDataIDs.len:
+        return Err[AssetExportPlacementDependencyBundleSummary]("wowExport placement dependency export: audit stat count mismatch")
+    var out: AssetExportPlacementDependencyBundleSummary
+    out.outDir = stableOutDir
+    out.manifestPath = manifestPath
+    var manifestText: str = "format=wow_export_placement_dependencies_v1\n"
+    manifestText = manifestText + "buildKey=" + m.buildKey + "\n"
+    manifestText = manifestText + "source=northshire_retail_12_0_5\n"
+    manifestText = manifestText + "doodadM2Assets=" + strings.IntToStr(Value(auditRes).doodadM2AssetCount) + "\n"
+    manifestText = manifestText + "worldModelWmoAssets=" + strings.IntToStr(Value(auditRes).worldModelWmoAssetCount) + "\n"
+    manifestText = manifestText + "decodedBytes=" + strings.IntToStr(Value(auditRes).doodadDecodedBytes + Value(auditRes).worldModelDecodedBytes) + "\n"
+    let doodadWriteRes: Result[bool] =
+        assetExportWritePlacementRange(m,
+                                       stableOutDir,
+                                       "doodad_m2",
+                                       "m2",
+                                       doodadFileDataIDs,
+                                       stats,
+                                       0,
+                                       manifestText,
+                                       out)
+    if IsErr(doodadWriteRes):
+        return Err[AssetExportPlacementDependencyBundleSummary](Error(doodadWriteRes))
+    let worldWriteRes: Result[bool] =
+        assetExportWritePlacementRange(m,
+                                       stableOutDir,
+                                       "world_model_wmo",
+                                       "wmo",
+                                       worldModelFileDataIDs,
+                                       stats,
+                                       doodadFileDataIDs.len,
+                                       manifestText,
+                                       out)
+    if IsErr(worldWriteRes):
+        return Err[AssetExportPlacementDependencyBundleSummary](Error(worldWriteRes))
+    let manifestWriteRes: Result[int32] = assetExportWriteTextAtomic(manifestPath, manifestText)
+    if IsErr(manifestWriteRes):
+        return Err[AssetExportPlacementDependencyBundleSummary](Error(manifestWriteRes))
+    return Ok[AssetExportPlacementDependencyBundleSummary](out)
 
 fn ExportNorthshireDependenciesBundle(m: northshire.NorthshireManifest,
                                       outDir: str): Result[AssetExportDependencyBundleSummary] =
@@ -450,25 +729,38 @@ fn ExportNorthshireBundle(m: northshire.NorthshireManifest,
 
 fn AssetExportSummaryText(summary: AssetExportSummary): str =
     let bytesText: str = strings.IntToStr(summary.bytesWritten)
-    var out: str = Fmt"exported label={summary.label}"
-    out = out + Fmt" kind={summary.kind}"
-    out = out + Fmt" bytes={bytesText}"
-    out = out + Fmt" out={summary.outPath}"
-    out = out + Fmt" detail={summary.detail}"
+    var out: str = "exported label=" + summary.label
+    out = out + " kind=" + summary.kind
+    out = out + " bytes=" + bytesText
+    out = out + " out=" + summary.outPath
+    out = out + " detail=" + summary.detail
     return out
 
 fn AssetExportBundleSummaryText(summary: AssetExportBundleSummary): str =
     let countText: str = strings.IntToStr(summary.fileCount)
     let bytesText: str = strings.IntToStr(summary.bytesWritten)
-    var out: str = Fmt"exportedBundle files={countText}"
-    out = out + Fmt" bytes={bytesText}"
-    out = out + Fmt" outDir={summary.outDir}"
+    var out: str = "exportedBundle files=" + countText
+    out = out + " bytes=" + bytesText
+    out = out + " outDir=" + summary.outDir
     return out
 
 fn AssetExportDependencyBundleSummaryText(summary: AssetExportDependencyBundleSummary): str =
     let countText: str = strings.IntToStr(summary.fileCount)
     let bytesText: str = strings.IntToStr(summary.bytesWritten)
     var out: str = "exportedDependencies files=" + countText
+    out = out + " bytes=" + bytesText
+    out = out + " manifest=" + summary.manifestPath
+    out = out + " outDir=" + summary.outDir
+    return out
+
+fn AssetExportPlacementDependencyBundleSummaryText(summary: AssetExportPlacementDependencyBundleSummary): str =
+    let countText: str = strings.IntToStr(summary.fileCount)
+    let doodadText: str = strings.IntToStr(summary.doodadFileCount)
+    let worldText: str = strings.IntToStr(summary.worldModelFileCount)
+    let bytesText: str = strings.IntToStr(summary.bytesWritten)
+    var out: str = "exportedPlacementDependencies files=" + countText
+    out = out + " doodadM2=" + doodadText
+    out = out + " worldModelWmo=" + worldText
     out = out + " bytes=" + bytesText
     out = out + " manifest=" + summary.manifestPath
     out = out + " outDir=" + summary.outDir

@@ -18,6 +18,12 @@ type
         encodingKey: str
         entry: casc_index.CascIndexEntry
 
+    LocalFileAuditEntryStat =
+        fileDataID: int32
+        archiveIndex: int32
+        offset: int32
+        size: int32
+
 fn localRootU32LEAt(buf: bytes.ByteBuffer, idx: int32): Result[int32] =
     if idx < 0 || idx + 4 > buf.len:
         return Err[int32]("wowExport local root: truncated u32le")
@@ -364,6 +370,15 @@ fn localFilesInitAuditArray(count: int32): LocalFileAudit[] =
         i = i + 1
     return out
 
+fn localFilesInitAuditEntryStatArray(count: int32): LocalFileAuditEntryStat[] =
+    var out: LocalFileAuditEntryStat[]
+    var i: int32
+    while i < count:
+        var stat: LocalFileAuditEntryStat
+        add(out, stat)
+        i = i + 1
+    return out
+
 fn ResolveLocalFileAuditsRanged(clientPath: str,
                                 fileDataIDs: int32[]): Result[LocalFileAudit[]] =
     if fileDataIDs.len <= 0:
@@ -430,6 +445,82 @@ fn ResolveLocalFileAuditsRanged(clientPath: str,
         out[i] = audit
         i = i + 1
     return Ok[LocalFileAudit[]](out)
+
+fn ResolveLocalFileAuditEntryStatsRanged(clientPath: str,
+                                         fileDataIDs: int32[]): Result[LocalFileAuditEntryStat[]] =
+    if fileDataIDs.len <= 0:
+        return Err[LocalFileAuditEntryStat[]]("wowExport local-files: empty fileDataID list")
+    let buildRes: Result[build_info.WowBuildEntry] =
+        build_info.LoadBuild(clientPath, build_info.DefaultProduct, build_info.DefaultVersion)
+    if IsErr(buildRes):
+        return Err[LocalFileAuditEntryStat[]](Error(buildRes))
+    if Value(buildRes).buildKey != build_info.DefaultBuildKey:
+        return Err[LocalFileAuditEntryStat[]]("wowExport local-files: build key mismatch expected=" + build_info.DefaultBuildKey + " got=" + Value(buildRes).buildKey)
+    let cfgRes: Result[config.BuildConfig] =
+        config.LoadBuildConfig(clientPath, build_info.DefaultBuildKey)
+    if IsErr(cfgRes):
+        return Err[LocalFileAuditEntryStat[]](Error(cfgRes))
+    let cfg: config.BuildConfig = Value(cfgRes)
+    let encEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(clientPath, cfg.encodingEncodingKey)
+    if IsErr(encEntryRes):
+        return Err[LocalFileAuditEntryStat[]](Error(encEntryRes))
+    let encEntry: casc_index.CascIndexEntry = Value(encEntryRes)
+    let rootEncodingKeyRes: Result[str] =
+        encoding.WowEncodingFindEncodingKeyRanged(clientPath, encEntry, cfg.root)
+    if IsErr(rootEncodingKeyRes):
+        return Err[LocalFileAuditEntryStat[]](Error(rootEncodingKeyRes))
+    let rootIndexEntryRes: Result[casc_index.CascIndexEntry] =
+        casc_index.LoadLocalIndexEntry(clientPath, Value(rootEncodingKeyRes))
+    if IsErr(rootIndexEntryRes):
+        return Err[LocalFileAuditEntryStat[]](Error(rootIndexEntryRes))
+    let rootEntriesRes: Result[wow_root.RootEntry[]] =
+        LocalRootFindFileDataIDs(clientPath, Value(rootIndexEntryRes), fileDataIDs, 0)
+    if IsErr(rootEntriesRes):
+        return Err[LocalFileAuditEntryStat[]](Error(rootEntriesRes))
+    let rootEntries: wow_root.RootEntry[] = Value(rootEntriesRes)
+    var contentKeys: str[]
+    var keyIndex: int32
+    while keyIndex < rootEntries.len:
+        if rootEntries[keyIndex].fileDataID != fileDataIDs[keyIndex]:
+            return Err[LocalFileAuditEntryStat[]]("wowExport local-files: root fileDataID order mismatch")
+        if strings.Len(rootEntries[keyIndex].contentKey) != 32:
+            return Err[LocalFileAuditEntryStat[]]("wowExport local-files: root content key length invalid")
+        add(contentKeys, rootEntries[keyIndex].contentKey)
+        keyIndex = keyIndex + 1
+    let encodingEntriesRes: Result[encoding.EncodingEntry[]] =
+        encoding.WowEncodingFindEntriesRanged(clientPath, encEntry, contentKeys)
+    if IsErr(encodingEntriesRes):
+        return Err[LocalFileAuditEntryStat[]](Error(encodingEntriesRes))
+    let encodingEntries: encoding.EncodingEntry[] = Value(encodingEntriesRes)
+    var encodingKeys: str[]
+    var encodingKeyIndex: int32
+    while encodingKeyIndex < encodingEntries.len:
+        if encodingEntries[encodingKeyIndex].contentKey != rootEntries[encodingKeyIndex].contentKey:
+            return Err[LocalFileAuditEntryStat[]]("wowExport local-files: encoding content key order mismatch")
+        if strings.Len(encodingEntries[encodingKeyIndex].encodingKey) != 32:
+            return Err[LocalFileAuditEntryStat[]]("wowExport local-files: encoding key length invalid")
+        add(encodingKeys, encodingEntries[encodingKeyIndex].encodingKey)
+        encodingKeyIndex = encodingKeyIndex + 1
+    let idxEntriesRes: Result[casc_index.CascIndexEntry[]] =
+        casc_index.LoadLocalIndexEntries(clientPath, encodingKeys)
+    if IsErr(idxEntriesRes):
+        return Err[LocalFileAuditEntryStat[]](Error(idxEntriesRes))
+    let idxEntries: casc_index.CascIndexEntry[] = Value(idxEntriesRes)
+    var out: LocalFileAuditEntryStat[] = localFilesInitAuditEntryStatArray(fileDataIDs.len)
+    var i: int32
+    while i < fileDataIDs.len:
+        let idxEntry: casc_index.CascIndexEntry = idxEntries[i]
+        if idxEntry.archiveIndex < 0 || idxEntry.offset < 0 || idxEntry.size <= 0:
+            return Err[LocalFileAuditEntryStat[]]("wowExport local-files: index entry invalid")
+        var stat: LocalFileAuditEntryStat
+        stat.fileDataID = fileDataIDs[i]
+        stat.archiveIndex = idxEntry.archiveIndex
+        stat.offset = idxEntry.offset
+        stat.size = idxEntry.size
+        out[i] = stat
+        i = i + 1
+    return Ok[LocalFileAuditEntryStat[]](out)
 
 fn ReadLocalFileByEncodingKey(clientPath: str, encodingKey: str): Result[bytes.ByteBuffer] =
     let idxEntryRes: Result[casc_index.CascIndexEntry] =

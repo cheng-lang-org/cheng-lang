@@ -1,0 +1,276 @@
+import std/os
+import std/strings
+import std/strformat
+import std/strutils as strutil
+import cheng/core/tooling/bft_three_node as bft
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+fn SeedAppPrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn SeedAppPrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn SeedAppStartsWith(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    return strings.SliceBytes(text, 0, len(prefix)) == prefix
+
+fn SeedAppReadFlag(args: str[],
+                     key: str,
+                     defaultValue: str): str =
+    var i: int32
+    while i < args.len:
+        let arg = args[i]
+        if arg == key && i + 1 < args.len:
+            return args[i + 1]
+        if SeedAppStartsWith(arg, key + ":"):
+            return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
+        if SeedAppStartsWith(arg, key + "="):
+            return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
+        i = i + 1
+    return defaultValue
+
+fn SeedAppCollectPositionals(args: str[]): str[] =
+    var out: str[]
+    var i: int32
+    while i < args.len:
+        let arg = args[i]
+        if arg == "--compiler":
+            i = i + 2
+        elif SeedAppStartsWith(arg, "--compiler:") ||
+             SeedAppStartsWith(arg, "--compiler="):
+            i = i + 1
+        elif len(arg) > 0 && arg[0] == '-':
+            i = i + 1
+        else:
+            add(out, arg)
+            i = i + 1
+    return out
+
+fn SeedAppCompilerPath(rootDir: str,
+                         explicitPath: str,
+                         envKey: str,
+                         defaultRelPath: str): str =
+    var compiler = strutil.Strip(explicitPath)
+    if len(compiler) <= 0 && len(envKey) > 0:
+        compiler = strutil.Strip(os.GetEnvDefault(envKey, ""))
+    if len(compiler) <= 0:
+        compiler = defaultRelPath
+    return chengpath.PathAbsolute(rootDir, compiler)
+
+fn SeedAppRequireCompiler(rootDir: str,
+                            compilerPath: str,
+                            label: str): bool =
+    if chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        return true
+    SeedAppPrintErr(Fmt"{label}: missing compiler: {compilerPath}")
+    return false
+
+fn SeedAppCompileEnv(): str[] =
+    var out: str[]
+    add(out, "BACKEND_INCREMENTAL=0")
+    add(out, "BACKEND_MULTI_MODULE_CACHE=0")
+    add(out, "CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
+    add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
+    add(out, "CHENG_PROGRESS=1")
+    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
+    return out
+
+fn SeedAppRunFailed(run: hostops.LoggedRun): bool =
+    if hostops.LoggedRunOk(run):
+        return false
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        SeedAppPrintErr(outputText)
+    else:
+        SeedAppPrintErr(hostops.LoggedRunSummary(run))
+    return true
+
+fn SeedAppCompile(rootDir: str,
+                    label: str,
+                    compilerPath: str,
+                    srcPath: str,
+                    emitKind: str,
+                    target: str,
+                    outPath: str,
+                    compileLog: str): int32 =
+    if !SeedAppRequireCompiler(rootDir, compilerPath, label):
+        return 1
+    if !chengpath.FileExistsNonEmpty(rootDir, srcPath):
+        SeedAppPrintErr(Fmt"{label}: missing source: {srcPath}")
+        return 1
+    let parent = chengpath.PathParentDir(outPath)
+    if len(parent) > 0 && !chengpath.MkdirP(rootDir, parent):
+        SeedAppPrintErr(Fmt"{label}: failed to create output dir: {parent}")
+        return 1
+    let run = hostops.RunFileLogged(rootDir,
+                                      label,
+                                      compilerPath,
+                                      [
+                                          "system-link-exec",
+                                          "--root:" + rootDir,
+                                          "--in:" + srcPath,
+                                          "--emit:" + emitKind,
+                                          "--target:" + target,
+                                          "--out:" + outPath
+                                      ],
+                                      SeedAppCompileEnv(),
+                                      rootDir,
+                                      int32(strutil.ParseInt(os.GetEnvDefault("CHENG_COMPILE_TIMEOUT_SEC", "300"))),
+                                      compileLog)
+    if SeedAppRunFailed(run):
+        return run.exitCode
+    if !chengpath.FileExistsNonEmpty(rootDir, outPath):
+        SeedAppPrintErr(Fmt"{label}: missing output: {outPath}")
+        return 1
+    return 0
+
+fn SeedAppHostTarget(rootDir: str): str =
+    let unameS = hostops.RunProgramLogged(rootDir,
+                                            "seed_app_uname_s",
+                                            "uname",
+                                            ["-s"],
+                                            [],
+                                            rootDir,
+                                            10,
+                                            "artifacts/seed_app_build_gate/uname_s.log")
+    if SeedAppRunFailed(unameS):
+        return ""
+    let unameM = hostops.RunProgramLogged(rootDir,
+                                            "seed_app_uname_m",
+                                            "uname",
+                                            ["-m"],
+                                            [],
+                                            rootDir,
+                                            10,
+                                            "artifacts/seed_app_build_gate/uname_m.log")
+    if SeedAppRunFailed(unameM):
+        return ""
+    let hostOs = strutil.Strip(unameS.output)
+    let hostArch = strutil.Strip(unameM.output)
+    if hostOs == "Darwin" && hostArch == "arm64":
+        return "arm64-apple-darwin"
+    if hostOs == "Linux" && hostArch == "x86_64":
+        return "x86_64-unknown-linux-gnu"
+    if hostOs == "Linux" && (hostArch == "aarch64" || hostArch == "arm64"):
+        return "aarch64-unknown-linux-gnu"
+    return ""
+
+fn SeedAppRunBinary(rootDir: str,
+                      label: str,
+                      binPath: str,
+                      args: str[],
+                      timeoutSec: int32,
+                      logPath: str): int32 =
+    let run = hostops.RunFileLogged(rootDir,
+                                      label,
+                                      binPath,
+                                      args,
+                                      [],
+                                      rootDir,
+                                      timeoutSec,
+                                      logPath)
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        if hostops.LoggedRunOk(run):
+            SeedAppPrintLine(outputText)
+        else:
+            SeedAppPrintErr(outputText)
+    if !hostops.LoggedRunOk(run):
+        return run.exitCode
+    return 0
+
+fn SeedAppBftCompiler(rootDir: str): str =
+    return SeedAppCompilerPath(rootDir,
+                                "",
+                                "CHENG_BFT_COMPILER",
+                                "artifacts/backend_driver/cheng")
+
+fn SeedBuildBftStateMachine(rootDir: str): int32 =
+    return bft.GateBuildBftStateMachine(rootDir, SeedAppBftCompiler(rootDir))
+
+fn SeedDeployBftValidatorThreeNode(rootDir: str): int32 =
+    return bft.GateDeployBftValidatorThreeNode(rootDir, SeedAppBftCompiler(rootDir), 0)
+
+fn SeedVerifyBftValidatorThreeNode(rootDir: str): int32 =
+    return bft.GateVerifyBftValidatorThreeNode(rootDir, SeedAppBftCompiler(rootDir))
+
+fn SeedStatusBftValidatorThreeNode(rootDir: str): int32 =
+    return bft.GateStatusBftValidatorThreeNode(rootDir)
+
+fn SeedStopBftValidatorThreeNode(rootDir: str): int32 =
+    return bft.GateStopBftValidatorThreeNode(rootDir)
+
+fn SeedBenchBftValidatorThreeNode(rootDir: str,
+                                    args: str[]): int32 =
+    return bft.GateBenchBftValidatorThreeNode(rootDir, SeedAppBftCompiler(rootDir), args)
+
+fn SeedBuildBrowserHostWasm(rootDir: str,
+                              args: str[]): int32 =
+    let explicitCompiler = SeedAppReadFlag(args, "--compiler", "")
+    let compilerPath = SeedAppCompilerPath(rootDir,
+                                             explicitCompiler,
+                                             "CHENG_WASM_COMPILER",
+                                             "artifacts/backend_driver/cheng")
+    let outDir = chengpath.PathAbsolute(rootDir, "artifacts/browser_host_wasm")
+    let srcPath = chengpath.PathAbsolute(rootDir, "src/libp2p/browser/browser_host_wasm_probe.cheng")
+    let positionals = SeedAppCollectPositionals(args)
+    var outWasm = strutil.Strip(os.GetEnvDefault("CHENG_BROWSER_HOST_WASM_OUT", ""))
+    if len(outWasm) <= 0 && positionals.len > 0:
+        outWasm = positionals[0]
+    if len(outWasm) <= 0:
+        outWasm = os.JoinPath(outDir, "cheng_browser_host_abi.wasm")
+    else:
+        outWasm = chengpath.PathAbsolute(rootDir, outWasm)
+    let rc = SeedAppCompile(rootDir,
+                              "build_browser_host_wasm",
+                              compilerPath,
+                              srcPath,
+                              "shared",
+                              "wasm32-unknown-unknown",
+                              outWasm,
+                              os.JoinPath(outDir, "cheng_browser_host_abi.compile.log"))
+    if rc != 0:
+        return rc
+    SeedAppPrintLine(Fmt"browser host wasm: build ok out={outWasm}")
+    return 0
+
+fn SeedBuildRwadBftStateMachine(rootDir: str): int32 =
+    let compilerPath = SeedAppCompilerPath(rootDir,
+                                             "",
+                                             "CHENG_RWAD_COMPILER",
+                                             "artifacts/backend_driver/cheng")
+    let target = os.GetEnvDefault("RWAD_BFT_TARGET", "arm64-apple-darwin")
+    var defaultOutDir = chengpath.PathAbsolute(rootDir, "artifacts/rwad_bft_state_machine")
+    if target != "arm64-apple-darwin":
+        defaultOutDir = os.JoinPath(defaultOutDir, target)
+    let outDir = os.GetEnvDefault("RWAD_BFT_OUT_DIR", defaultOutDir)
+    let outBin = os.GetEnvDefault("RWAD_BFT_OUT_BIN", os.JoinPath(outDir, "rwad_bft_state_machine"))
+    let srcPath = chengpath.PathAbsolute(rootDir, "src/apps/rwad/rwad_bft_state_machine_main.cheng")
+    let rc = SeedAppCompile(rootDir,
+                              "build_rwad_bft_state_machine",
+                              compilerPath,
+                              srcPath,
+                              "exe",
+                              target,
+                              outBin,
+                              os.JoinPath(outDir, "rwad_bft_state_machine.compile.log"))
+    if rc != 0:
+        return rc
+    var runSelfTestDefault = "0"
+    if target == SeedAppHostTarget(rootDir):
+        runSelfTestDefault = "1"
+    let runSelfTest = os.GetEnvDefault("RWAD_BFT_RUN_SELF_TEST", runSelfTestDefault)
+    if runSelfTest != "0":
+        return SeedAppRunBinary(rootDir,
+                                  "build_rwad_bft_state_machine_run",
+                                  outBin,
+                                  ["self-test"],
+                                  20,
+                                  os.JoinPath(outDir, "rwad_bft_state_machine.self-test.log"))
+    SeedAppPrintLine(Fmt"rwad_bft_state_machine: build ok target={target} out={outBin}")
+    return 0

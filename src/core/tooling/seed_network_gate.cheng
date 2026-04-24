@@ -1,0 +1,453 @@
+import std/os
+import std/result
+import std/strings
+import std/strutils as strutil
+import std/strformat
+import cheng/core/tooling/bootstrap_contracts as contracts
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+import cheng/core/tooling/seed_stage23_libp2p_gate as stage23gate
+
+const
+    SeedNetworkTarget = "arm64-apple-darwin"
+
+fn SeedNetworkPrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn SeedNetworkPrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn SeedNetworkStartsWith(text: str,
+                           prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    return strings.SliceBytes(text, 0, len(prefix)) == prefix
+
+fn SeedNetworkReadFlag(args: str[],
+                         key: str,
+                         defaultValue: str): str =
+    var i: int32
+    while i < args.len:
+        let arg = args[i]
+        if arg == key && i + 1 < args.len:
+            return args[i + 1]
+        if SeedNetworkStartsWith(arg, key + ":"):
+            return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
+        if SeedNetworkStartsWith(arg, key + "="):
+            return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
+        i = i + 1
+    return defaultValue
+
+fn SeedNetworkCollectPositionals(args: str[]): str[] =
+    var out: str[]
+    var i: int32
+    while i < args.len:
+        let arg = args[i]
+        if arg == "--compiler" || arg == "--label":
+            i = i + 2
+        elif SeedNetworkStartsWith(arg, "--compiler:") ||
+             SeedNetworkStartsWith(arg, "--compiler=") ||
+             SeedNetworkStartsWith(arg, "--label:") ||
+             SeedNetworkStartsWith(arg, "--label="):
+            i = i + 1
+        elif len(arg) > 0 && arg[0] == '-':
+            i = i + 1
+        else:
+            add(out, arg)
+            i = i + 1
+    return out
+
+fn SeedNetworkCompileEnv(): str[] =
+    var out: str[]
+    add(out, "BACKEND_INCREMENTAL=0")
+    add(out, "BACKEND_MULTI_MODULE_CACHE=0")
+    add(out, "CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
+    add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
+    add(out, "CHENG_PROGRESS=1")
+    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
+    return out
+
+fn SeedNetworkCompileTimeoutSec(): int32 =
+    let raw = strutil.Strip(os.GetEnvDefault("CHENG_COMPILE_TIMEOUT_SEC", "300"))
+    if len(raw) > 0:
+        return int32(strutil.ParseInt(raw))
+    return 300
+
+fn SeedNetworkRunTimeoutSec(): int32 =
+    let raw = strutil.Strip(os.GetEnvDefault("CHENG_SMOKE_RUN_TIMEOUT_SEC", "60"))
+    if len(raw) > 0:
+        return int32(strutil.ParseInt(raw))
+    return 60
+
+fn SeedNetworkResolveCompiler(root: str,
+                                args: str[],
+                                primaryEnvKey: str,
+                                fallbackEnvKey: str,
+                                defaultPath: str,
+                                outCompiler: var str): int32 =
+    outCompiler = strutil.Strip(SeedNetworkReadFlag(args, "--compiler", ""))
+    if len(outCompiler) <= 0 && len(primaryEnvKey) > 0:
+        outCompiler = strutil.Strip(os.GetEnvDefault(primaryEnvKey, ""))
+    if len(outCompiler) <= 0 && len(fallbackEnvKey) > 0:
+        outCompiler = strutil.Strip(os.GetEnvDefault(fallbackEnvKey, ""))
+    if len(outCompiler) <= 0:
+        outCompiler = defaultPath
+    outCompiler = chengpath.PathAbsolute(root, outCompiler)
+    if !chengpath.FileExistsNonEmpty(root, outCompiler):
+        SeedNetworkPrintErr(" seed network gate: missing compiler: " + outCompiler)
+        return 1
+    return 0
+
+fn SeedNetworkResolveLabel(args: str[],
+                             envKey: str,
+                             defaultLabel: str): str =
+    let explicit = strutil.Strip(SeedNetworkReadFlag(args, "--label", ""))
+    if len(explicit) > 0:
+        return explicit
+    let keyed = strutil.Strip(os.GetEnvDefault(envKey, ""))
+    if len(keyed) > 0:
+        return keyed
+    let shared = strutil.Strip(os.GetEnvDefault("CHENG_SMOKE_LABEL", ""))
+    if len(shared) > 0:
+        return shared
+    return defaultLabel
+
+fn SeedNetworkRunFailed(run: hostops.LoggedRun): bool =
+    if hostops.LoggedRunOk(run):
+        return false
+    SeedNetworkPrintErr(hostops.LoggedRunSummary(run))
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        SeedNetworkPrintErr(outputText)
+    return true
+
+fn SeedNetworkMaybePrintRunOutput(run: hostops.LoggedRun) =
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        SeedNetworkPrintLine(outputText)
+
+fn SeedNetworkRemoveIfExists(path: str) =
+    if chengpath.PathFileExists(path):
+        os.RemoveFile(path)
+
+fn SeedNetworkPrepareOutput(root: str,
+                              outBin: str): bool =
+    let parent = chengpath.PathParentDir(outBin)
+    if len(parent) > 0 && !chengpath.MkdirP(root, parent):
+        SeedNetworkPrintErr(" seed network gate: failed to create output dir: " + parent)
+        return false
+    SeedNetworkRemoveIfExists(outBin)
+    SeedNetworkRemoveIfExists(outBin + ".map")
+    SeedNetworkRemoveIfExists(outBin + ".compile.log")
+    SeedNetworkRemoveIfExists(outBin + ".run.log")
+    return true
+
+fn SeedNetworkCompileAtRoot(root: str,
+                              compilerPath: str,
+                              packageRoot: str,
+                              src: str,
+                              outBin: str,
+                              stageName: str,
+                              smokeName: str): int32 =
+    SeedNetworkPrintLine(Fmt"[seed network] compile {stageName} {smokeName}")
+    if !SeedNetworkPrepareOutput(root, outBin):
+        return 1
+    let run = hostops.RunFileLogged(root,
+                                      Fmt"seed_network_compile_{stageName}_{smokeName}",
+                                      compilerPath,
+                                      [
+                                          "system-link-exec",
+                                          "--root", packageRoot,
+                                          "--in", src,
+                                          "--emit", "exe",
+                                          "--target", SeedNetworkTarget,
+                                          "--out", outBin
+                                      ],
+                                      SeedNetworkCompileEnv(),
+                                      root,
+                                      SeedNetworkCompileTimeoutSec(),
+                                      outBin + ".compile.log")
+    if SeedNetworkRunFailed(run):
+        return run.exitCode
+    if !chengpath.FileExistsNonEmpty(root, outBin):
+        SeedNetworkPrintErr(" seed network gate: compile missing output: " + outBin)
+        return 1
+    return 0
+
+fn SeedNetworkRunBinary(root: str,
+                          label: str,
+                          binPath: str,
+                          args: str[],
+                          timeoutSec: int32,
+                          logPath: str): hostops.LoggedRun =
+    let logAbs = chengpath.PathAbsolute(root, logPath)
+    let logParent = chengpath.PathParentDir(logAbs)
+    if len(logParent) > 0:
+        let _ = chengpath.MkdirP(root, logParent)
+    return hostops.RunFileLogged(root, label, binPath, args, [], root, timeoutSec, logPath)
+
+fn SeedNetworkIsDigits(text: str): bool =
+    if len(text) <= 0:
+        return false
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return false
+    return true
+
+fn SeedNetworkWaitReadyPort(readyPath: str,
+                              proc: var hostops.SpawnedProcess,
+                              outPort: var str): bool =
+    outPort = ""
+    var attempts: int32
+    while attempts < 400:
+        hostops.SpawnedProcessDrain(proc, 0)
+        if chengpath.PathFileExists(readyPath):
+            let candidate = strutil.Strip(chengpath.ReadTextFile("", readyPath))
+            if SeedNetworkIsDigits(candidate):
+                outPort = candidate
+                return true
+        if !hostops.SpawnedProcessRunning(proc):
+            return false
+        os.SleepMs(50)
+        attempts = attempts + 1
+    return false
+
+fn SeedNetworkWriteProcessSnapshot(root: str,
+                                     proc: hostops.SpawnedProcess,
+                                     logPath: str,
+                                     exitCode: int32): hostops.LoggedRun =
+    let logAbs = chengpath.PathAbsolute(root, logPath)
+    let logParent = chengpath.PathParentDir(logAbs)
+    if len(logParent) > 0:
+        let _ = chengpath.MkdirP(root, logParent)
+    let _logged = chengpath.WriteTextFile(root, logPath, proc.output)
+    return hostops.LoggedRun(label: proc.label,
+                               filePath: proc.filePath,
+                               logPath: logAbs,
+                               exitCode: exitCode,
+                               output: proc.output)
+
+fn SeedNetworkRunDilocoSingle(root: str,
+                                compilerPath: str,
+                                stageName: str,
+                                packageRoot: str,
+                                smokeName: str): int32 =
+    let outDir = chengpath.PathAbsolute(root, "artifacts/diloco")
+    let src = chengpath.PathAbsolute(root, "src/diloco/tests/" + smokeName + ".cheng")
+    let outBin = os.JoinPath(outDir, smokeName + "." + stageName)
+    if !chengpath.FileExistsNonEmpty(root, src):
+        SeedNetworkPrintErr(" diloco verify: missing source: " + src)
+        return 1
+    let compileCode = SeedNetworkCompileAtRoot(root,
+                                                compilerPath,
+                                                packageRoot,
+                                                src,
+                                                outBin,
+                                                stageName,
+                                                smokeName)
+    if compileCode != 0:
+        return compileCode
+    let run = SeedNetworkRunBinary(root,
+                                    " diloco run " + smokeName + " " + stageName,
+                                    outBin,
+                                    [],
+                                    SeedNetworkRunTimeoutSec(),
+                                    outBin + ".run.log")
+    SeedNetworkMaybePrintRunOutput(run)
+    if SeedNetworkRunFailed(run):
+        return run.exitCode
+    return 0
+
+fn SeedNetworkRunDilocoQuicTwoproc(root: str,
+                                     compilerPath: str,
+                                     stageName: str,
+                                     packageRoot: str): int32 =
+    let outDir = chengpath.PathAbsolute(root, "artifacts/diloco")
+    let serverSrc = chengpath.PathAbsolute(root, "src/diloco/tests/diloco_quic_twoproc_server_smoke.cheng")
+    let clientSrc = chengpath.PathAbsolute(root, "src/diloco/tests/diloco_quic_twoproc_client_smoke.cheng")
+    let serverBin = os.JoinPath(outDir, "diloco_quic_twoproc_server." + stageName)
+    let clientBin = os.JoinPath(outDir, "diloco_quic_twoproc_client." + stageName)
+    let readyPath = os.JoinPath(outDir, "diloco_quic_twoproc_server." + stageName + ".ready")
+    SeedNetworkRemoveIfExists(readyPath)
+    if !chengpath.FileExistsNonEmpty(root, serverSrc) ||
+       !chengpath.FileExistsNonEmpty(root, clientSrc):
+        SeedNetworkPrintErr(" diloco quic twoproc: missing source fixture")
+        return 1
+    let serverCompile = SeedNetworkCompileAtRoot(root,
+                                                  compilerPath,
+                                                  packageRoot,
+                                                  serverSrc,
+                                                  serverBin,
+                                                  stageName,
+                                                  "diloco_quic_twoproc_server_smoke")
+    if serverCompile != 0:
+        return serverCompile
+    let clientCompile = SeedNetworkCompileAtRoot(root,
+                                                  compilerPath,
+                                                  packageRoot,
+                                                  clientSrc,
+                                                  clientBin,
+                                                  stageName,
+                                                  "diloco_quic_twoproc_client_smoke")
+    if clientCompile != 0:
+        return clientCompile
+    let serverSpawn = hostops.SpawnFile(root,
+                                          " diloco quic twoproc server " + stageName,
+                                          serverBin,
+                                          ["--port:0", "--ready-path:" + readyPath],
+                                          [],
+                                          root)
+    if IsErr(serverSpawn):
+        SeedNetworkPrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var port = ""
+    if !SeedNetworkWaitReadyPort(readyPath, serverProc, port):
+        let serverRun = SeedNetworkWriteProcessSnapshot(root, serverProc, serverBin + ".run.log", 1)
+        SeedNetworkPrintErr(" diloco quic twoproc: invalid ready port: " + port)
+        SeedNetworkMaybePrintRunOutput(serverRun)
+        hostops.SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun = SeedNetworkRunBinary(root,
+                                          " diloco quic twoproc client " + stageName,
+                                          clientBin,
+                                          ["--port:" + port],
+                                          20,
+                                          clientBin + ".run.log")
+    if SeedNetworkRunFailed(clientRun):
+        let serverRun = hostops.SpawnedProcessWaitLogged(root, serverProc, 1, serverBin + ".run.log")
+        SeedNetworkMaybePrintRunOutput(serverRun)
+        return clientRun.exitCode
+    let serverRun = hostops.SpawnedProcessWaitLogged(root, serverProc, 20, serverBin + ".run.log")
+    SeedNetworkMaybePrintRunOutput(serverRun)
+    if SeedNetworkRunFailed(serverRun):
+        return serverRun.exitCode
+    SeedNetworkMaybePrintRunOutput(clientRun)
+    SeedNetworkPrintLine(" diloco_quic_twoproc_smoke ok (" + stageName + ")")
+    return 0
+
+fn SeedNetworkVerifyDilocoStage(root: str,
+                                  compilerPath: str,
+                                  stageName: str,
+                                  packageRoot: str): int32 =
+    SeedNetworkPrintLine(" verify-diloco stage begin (" + stageName + ")")
+    let singleSmokes = ["diloco_state_smoke", "diloco_wire_smoke"]
+    for i in 0..<singleSmokes.len:
+        if SeedNetworkRunDilocoSingle(root, compilerPath, stageName, packageRoot, singleSmokes[i]) != 0:
+            return 1
+    if SeedNetworkRunDilocoQuicTwoproc(root, compilerPath, stageName, packageRoot) != 0:
+        return 1
+    SeedNetworkPrintLine(" verify-diloco stage ok (" + stageName + ")")
+    return 0
+
+fn SeedVerifyDiloco(rootDir: str): int32 =
+    let root = strutil.Strip(rootDir)
+    if len(root) <= 0:
+        SeedNetworkPrintErr(" diloco verify: missing root")
+        return 1
+    let packageRoot = root
+    if !chengpath.PathFileExists(os.JoinPath(packageRoot, "cheng-package.toml")):
+        SeedNetworkPrintErr(" diloco verify: missing package root: " + packageRoot)
+        return 1
+    let outDir = chengpath.PathAbsolute(root, "artifacts/diloco")
+    if !chengpath.MkdirP(root, outDir):
+        SeedNetworkPrintErr(" diloco verify: failed to create out dir")
+        return 1
+    let stage2 = contracts.BootstrapStage2Path(root)
+    let stage3 = contracts.BootstrapStage3Path(root)
+    if !chengpath.FileExistsNonEmpty(root, stage2) ||
+       !chengpath.FileExistsNonEmpty(root, stage3):
+        SeedNetworkPrintErr(" diloco verify: missing bootstrap compiler")
+        return 1
+    var hostCompiler = ""
+    if SeedNetworkResolveCompiler(root, [], "CHENG_SMOKE_COMPILER", "", stage3, hostCompiler) != 0:
+        return 1
+    if SeedNetworkVerifyDilocoStage(root, hostCompiler, "host", packageRoot) != 0:
+        return 1
+    if SeedNetworkVerifyDilocoStage(root, stage2, "stage2", packageRoot) != 0:
+        return 1
+    if SeedNetworkVerifyDilocoStage(root, stage3, "stage3", packageRoot) != 0:
+        return 1
+    SeedNetworkPrintLine(" verify-diloco ok")
+    return 0
+
+fn SeedRunTcpTwoprocSmoke(rootDir: str,
+                            args: str[]): int32 =
+    let root = strutil.Strip(rootDir)
+    var compiler = ""
+    if SeedNetworkResolveCompiler(root, args, "CHENG_SMOKE_COMPILER", "", contracts.BootstrapStage3Path(root), compiler) != 0:
+        return 1
+    let label = SeedNetworkResolveLabel(args, "CHENG_SMOKE_LABEL", "host")
+    return stage23gate.SeedStage23RunTcpTwoprocSmoke(root, compiler, label)
+
+fn SeedRunQuicTwoprocSmoke(rootDir: str,
+                             args: str[]): int32 =
+    let root = strutil.Strip(rootDir)
+    var compiler = ""
+    if SeedNetworkResolveCompiler(root, args, "CHENG_SMOKE_COMPILER", "", contracts.BootstrapStage3Path(root), compiler) != 0:
+        return 1
+    let label = SeedNetworkResolveLabel(args, "CHENG_SMOKE_LABEL", "host")
+    return stage23gate.SeedStage23RunQuicTwoprocSmoke(root, compiler, label)
+
+fn SeedRunTailnetControlSmoke(rootDir: str,
+                                args: str[]): int32 =
+    let root = strutil.Strip(rootDir)
+    var compiler = ""
+    if SeedNetworkResolveCompiler(root,
+                                    args,
+                                    "CHENG_TAILNET_COMPILER",
+                                    "CHENG_SMOKE_COMPILER",
+                                    contracts.BootstrapStage3Path(root),
+                                    compiler) != 0:
+        return 1
+    let label = SeedNetworkResolveLabel(args, "CHENG_TAILNET_LABEL", "host")
+    return stage23gate.SeedStage23RunTailnetControlSmoke(root, compiler, label)
+
+fn SeedRunFreshNodeSelfhostGate(rootDir: str,
+                                  args: str[]): int32 =
+    let root = strutil.Strip(rootDir)
+    var compiler = ""
+    if SeedNetworkResolveCompiler(root,
+                                    args,
+                                    "CHENG_FRESH_NODE_COMPILER",
+                                    "CHENG_SMOKE_COMPILER",
+                                    contracts.BootstrapStage3Path(root),
+                                    compiler) != 0:
+        return 1
+    let label = SeedNetworkResolveLabel(args, "CHENG_FRESH_NODE_LABEL", "host")
+    return stage23gate.SeedStage23RunFreshNodeSelfhostGate(root, compiler, label)
+
+fn SeedRunMigrationGate(rootDir: str,
+                          args: str[]): int32 =
+    let root = strutil.Strip(rootDir)
+    var compiler = ""
+    if SeedNetworkResolveCompiler(root,
+                                    args,
+                                    "CHENG_MIGRATION_COMPILER",
+                                    "CHENG_SMOKE_COMPILER",
+                                    contracts.BootstrapStage3Path(root),
+                                    compiler) != 0:
+        return 1
+    let label = SeedNetworkResolveLabel(args, "CHENG_MIGRATION_LABEL", "host")
+    return stage23gate.SeedStage23RunMigrationGate(root, compiler, label)
+
+fn SeedRunBrowserWebrtcSmokes(rootDir: str,
+                                args: str[]): int32 =
+    let root = strutil.Strip(rootDir)
+    var hostCompiler = ""
+    if SeedNetworkResolveCompiler(root,
+                                    args,
+                                    "CHENG_SMOKE_COMPILER",
+                                    "",
+                                    contracts.BootstrapStage3Path(root),
+                                    hostCompiler) != 0:
+        return 1
+    let tests = SeedNetworkCollectPositionals(args)
+    return stage23gate.SeedStage23RunBrowserWebrtcSmokes(root,
+                                                          hostCompiler,
+                                                          contracts.BootstrapStage2Path(root),
+                                                          contracts.BootstrapStage3Path(root),
+                                                          tests)

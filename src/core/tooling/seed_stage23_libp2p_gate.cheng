@@ -1,0 +1,1046 @@
+import std/os
+import std/result
+import std/strings
+import std/strformat
+import std/strutils as strutil
+import cheng/core/tooling/bootstrap_contracts as contracts
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+const
+    SeedStage23Target = "arm64-apple-darwin"
+
+fn SeedStage23PrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn SeedStage23PrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn SeedStage23StartsWith(text: str,
+                           prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    return strings.SliceBytes(text, 0, len(prefix)) == prefix
+
+fn SeedStage23ReadFlag(args: str[],
+                         key: str,
+                         defaultValue: str): str =
+    var i: int32
+    while i < args.len:
+        let arg = args[i]
+        if arg == key && i + 1 < args.len:
+            return args[i + 1]
+        if SeedStage23StartsWith(arg, key + ":"):
+            return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
+        if SeedStage23StartsWith(arg, key + "="):
+            return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
+        i = i + 1
+    return defaultValue
+
+fn SeedStage23CollectPositionals(args: str[]): str[] =
+    var out: str[]
+    var i: int32
+    while i < args.len:
+        let arg = args[i]
+        if arg == "--compiler" || arg == "--label" || arg == "--tail-only":
+            i = i + 2
+        elif SeedStage23StartsWith(arg, "--compiler:") ||
+             SeedStage23StartsWith(arg, "--compiler=") ||
+             SeedStage23StartsWith(arg, "--label:") ||
+             SeedStage23StartsWith(arg, "--label=") ||
+             SeedStage23StartsWith(arg, "--tail-only:") ||
+             SeedStage23StartsWith(arg, "--tail-only="):
+            i = i + 1
+        elif len(arg) > 0 && arg[0] == '-':
+            i = i + 1
+        else:
+            add(out, arg)
+            i = i + 1
+    return out
+
+fn SeedStage23DefaultSmokes(): str[] =
+    return [
+        "fixed256_curve25519_smoke",
+        "compiler_runtime_smoke",
+        "compiler_pipeline_smoke",
+        "call_hir_matrix_smoke",
+        "lowering_plan_smoke",
+        "browser_content_codec_rule_schema_smoke",
+        "browser_content_codec_codegen_smoke",
+        "browser_host_probe_rule_schema_smoke",
+        "browser_host_probe_codegen_smoke",
+        "browser_host_probe_abi_rule_smoke",
+        "browser_host_probe_bridge_plan_report_smoke",
+        "browser_abi_rule_smoke",
+        "browser_bridge_artifact_write_smoke",
+        "compiler_equivalence_smoke",
+        "compiler_publish_smoke",
+        "compiler_managed_dependency_mirror_smoke",
+        "bft_three_replica_smoke",
+        "primary_object_plan_smoke",
+        "object_native_link_plan_smoke",
+        "program_selfhost_smoke",
+        "libp2p_core_smoke",
+        "libp2p_multiaddr_parse_boundary_smoke",
+        "libp2p_host_smoke",
+        "libp2p_tailnet_policy_smoke",
+        "libp2p_tailnet_visibility_smoke",
+        "libp2p_tailnet_transport_smoke",
+        "libp2p_tailnet_derp_smoke",
+        "libp2p_resource_smoke",
+        "libp2p_scheduler_smoke",
+        "libp2p_quic_tls_smoke",
+        "quic_feature_matrix_smoke",
+        "quic_multistream_smoke",
+        "quic_close_order_smoke",
+        "bft_daemon_quic_close_order_smoke",
+        "tailnet_control_core_smoke",
+        "tailnet_train_island_smoke",
+        "webrtc_signal_codec_smoke",
+        "webrtc_signal_session_smoke",
+        "webrtc_turn_fallback_smoke",
+        "libp2p_webrtc_sync_smoke",
+        "libp2p_tcp_smoke",
+        "libp2p_overlay_smoke",
+        "libp2p_protocols_smoke",
+        "chain_codec_binary_smoke",
+        "location_proof_smoke",
+        "anti_entropy_smoke",
+        "anti_entropy_signature_fields_smoke",
+        "lsmr_types_smoke",
+        "lsmr_locality_storage_smoke",
+        "lsmr_bagua_prefix_tree_smoke",
+        "overlay_contracts_smoke",
+        "pubsub_smoke",
+        "dag_mempool_smoke",
+        "plumtree_smoke",
+        "erasure_swarm_smoke",
+        "pin_plane_smoke",
+        "pin_scheduler_smoke",
+        "content_codec_smoke",
+        "content_runtime_smoke",
+        "content_stub_smoke",
+        "mobile_bridge_smoke",
+        "mobile_sdk_smoke",
+        "did_identity_smoke"
+    ]
+
+fn SeedStage23CompileEnv(): str[] =
+    var out: str[]
+    add(out, "BACKEND_INCREMENTAL=0")
+    add(out, "BACKEND_MULTI_MODULE_CACHE=0")
+    add(out, "CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
+    add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
+    add(out, "CHENG_PROGRESS=1")
+    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
+    return out
+
+fn SeedStage23CompileTimeoutSec(): int32 =
+    let raw = strutil.Strip(os.GetEnvDefault("CHENG_COMPILE_TIMEOUT_SEC", "300"))
+    if len(raw) > 0:
+        return int32(strutil.ParseInt(raw))
+    return 300
+
+fn SeedStage23RunTimeoutSec(): int32 =
+    let raw = strutil.Strip(os.GetEnvDefault("CHENG_SMOKE_RUN_TIMEOUT_SEC", "60"))
+    if len(raw) > 0:
+        return int32(strutil.ParseInt(raw))
+    return 60
+
+fn SeedStage23RunTimeoutSecFor(smokeName: str): int32 =
+    let requested = SeedStage23RunTimeoutSec()
+    var minimum: int32 = 60
+    if smokeName == "runtime_zero_c_surface_smoke" ||
+       smokeName == "backend_driver_command_surface_smoke":
+        minimum = 420
+    if requested > minimum:
+        return requested
+    return minimum
+
+fn SeedStage23RunFailed(run: hostops.LoggedRun): bool =
+    if hostops.LoggedRunOk(run):
+        return false
+    SeedStage23PrintErr(hostops.LoggedRunSummary(run))
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        SeedStage23PrintErr(outputText)
+    return true
+
+fn SeedStage23MaybePrintRunOutput(run: hostops.LoggedRun) =
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        SeedStage23PrintLine(outputText)
+
+fn SeedStage23OutputContains(text: str,
+                               needle: str): bool =
+    return strutil.Contains(text, needle)
+
+fn SeedStage23TextContainsAny(text: str,
+                                needles: str[]): bool =
+    for i in 0..<needles.len:
+        if SeedStage23OutputContains(text, needles[i]):
+            return true
+    return false
+
+fn SeedStage23RequireOutput(run: hostops.LoggedRun,
+                              needle: str,
+                              context: str): bool =
+    if SeedStage23OutputContains(run.output, needle):
+        return true
+    SeedStage23PrintErr(context + ": missing output: " + needle)
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        SeedStage23PrintErr(outputText)
+    return false
+
+fn SeedStage23RequireAnyOutput(text: str,
+                                 needles: str[],
+                                 context: str): bool =
+    if SeedStage23TextContainsAny(text, needles):
+        return true
+    SeedStage23PrintErr(context + ": missing expected output set")
+    let outputText = strutil.Strip(text)
+    if len(outputText) > 0:
+        SeedStage23PrintErr(outputText)
+    return false
+
+fn SeedStage23RequireFile(path: str,
+                            context: str): bool =
+    if chengpath.PathFileExists(path):
+        return true
+    SeedStage23PrintErr(context + ": missing file: " + path)
+    return false
+
+fn SeedStage23RequireFileContains(path: str,
+                                    needle: str,
+                                    context: str): bool =
+    if !SeedStage23RequireFile(path, context):
+        return false
+    let text = chengpath.ReadTextFile("", path)
+    if SeedStage23OutputContains(text, needle):
+        return true
+    SeedStage23PrintErr(context + ": missing output: " + needle)
+    let outputText = strutil.Strip(text)
+    if len(outputText) > 0:
+        SeedStage23PrintErr(outputText)
+    return false
+
+fn SeedStage23RequirePrefixArtifacts(prefix: str,
+                                       suffixes: str[],
+                                       context: str): bool =
+    for i in 0..<suffixes.len:
+        if !SeedStage23RequireFile(prefix + suffixes[i], context):
+            return false
+    return true
+
+fn SeedStage23RemoveIfExists(path: str) =
+    if chengpath.PathFileExists(path):
+        os.RemoveFile(path)
+
+fn SeedStage23PrepareOutput(root: str,
+                              outBin: str): bool =
+    let parent = chengpath.PathParentDir(outBin)
+    if len(parent) > 0 && !chengpath.MkdirP(root, parent):
+        SeedStage23PrintErr("stage2/stage3 libp2p: failed to create output dir: " + parent)
+        return false
+    SeedStage23RemoveIfExists(outBin)
+    SeedStage23RemoveIfExists(outBin + ".map")
+    SeedStage23RemoveIfExists(outBin + ".compile.log")
+    SeedStage23RemoveIfExists(outBin + ".run.log")
+    return true
+
+fn SeedStage23CompileFixture(root: str,
+                               compilerPath: str,
+                               src: str,
+                               outBin: str,
+                               stageName: str,
+                               smokeName: str): int32 =
+    SeedStage23PrintLine(Fmt"[stage23 libp2p] compile {stageName} {smokeName}")
+    let compileRun = hostops.RunFileLogged(root,
+                                            Fmt"stage23_libp2p_compile_{stageName}_{smokeName}",
+                                            compilerPath,
+                                            [
+                                                "system-link-exec",
+                                                "--root:" + root,
+                                                "--in:" + src,
+                                                "--emit:exe",
+                                                "--target:" + SeedStage23Target,
+                                                "--out:" + outBin
+                                            ],
+                                            SeedStage23CompileEnv(),
+                                            root,
+                                            SeedStage23CompileTimeoutSec(),
+                                            outBin + ".compile.log")
+    if SeedStage23RunFailed(compileRun):
+        return compileRun.exitCode
+    if !chengpath.FileExistsNonEmpty(root, outBin):
+        SeedStage23PrintErr("stage2/stage3 libp2p: compile missing output: " + outBin)
+        return 1
+    return 0
+
+fn SeedStage23RunFixtureBinary(root: str,
+                                 outBin: str,
+                                 stageName: str,
+                                 smokeName: str): int32 =
+    SeedStage23PrintLine(Fmt"[stage23 libp2p] run {stageName} {smokeName}")
+    let run = hostops.RunFileLogged(root,
+                                      Fmt"stage23_libp2p_run_{stageName}_{smokeName}",
+                                      outBin,
+                                      [],
+                                      [],
+                                      root,
+                                      SeedStage23RunTimeoutSecFor(smokeName),
+                                      outBin + ".run.log")
+    if SeedStage23RunFailed(run):
+        return run.exitCode
+    SeedStage23MaybePrintRunOutput(run)
+    return 0
+
+fn SeedStage23RunBinaryArgs(root: str,
+                              label: str,
+                              binPath: str,
+                              args: str[],
+                              timeoutSec: int32,
+                              logPath: str): hostops.LoggedRun =
+    let logAbs = chengpath.PathAbsolute(root, logPath)
+    let logParent = chengpath.PathParentDir(logAbs)
+    if len(logParent) > 0:
+        let _ = chengpath.MkdirP(root, logParent)
+    return hostops.RunFileLogged(root, label, binPath, args, [], root, timeoutSec, logPath)
+
+fn SeedStage23RunOneFixture(root: str,
+                              compilerPath: str,
+                              outDir: str,
+                              stageName: str,
+                              smokeName: str): int32 =
+    let src = chengpath.PathAbsolute(root, "src/tests/" + smokeName + ".cheng")
+    if !chengpath.FileExistsNonEmpty(root, src):
+        SeedStage23PrintErr("stage2/stage3 libp2p: missing source: " + src)
+        return 1
+    let outBin = os.JoinPath(outDir, smokeName + "." + stageName)
+    if !SeedStage23PrepareOutput(root, outBin):
+        return 1
+    let compileCode = SeedStage23CompileFixture(root, compilerPath, src, outBin, stageName, smokeName)
+    if compileCode != 0:
+        return compileCode
+    return SeedStage23RunFixtureBinary(root, outBin, stageName, smokeName)
+
+fn SeedStage23IsDigits(text: str): bool =
+    if len(text) <= 0:
+        return false
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return false
+    return true
+
+fn SeedStage23WaitReadyPort(readyPath: str,
+                              proc: var hostops.SpawnedProcess,
+                              outPort: var str): bool =
+    outPort = ""
+    var attempts: int32
+    while attempts < 400:
+        hostops.SpawnedProcessDrain(proc, 0)
+        if chengpath.PathFileExists(readyPath):
+            let candidate = strutil.Strip(chengpath.ReadTextFile("", readyPath))
+            if SeedStage23IsDigits(candidate):
+                outPort = candidate
+                return true
+        if !hostops.SpawnedProcessRunning(proc):
+            return false
+        os.SleepMs(50)
+        attempts = attempts + 1
+    return false
+
+fn SeedStage23WriteProcessSnapshot(root: str,
+                                     proc: hostops.SpawnedProcess,
+                                     logPath: str,
+                                     exitCode: int32): hostops.LoggedRun =
+    let logAbs = chengpath.PathAbsolute(root, logPath)
+    let logParent = chengpath.PathParentDir(logAbs)
+    if len(logParent) > 0:
+        let _ = chengpath.MkdirP(root, logParent)
+    let _logged = chengpath.WriteTextFile(root, logPath, proc.output)
+    return hostops.LoggedRun(label: proc.label,
+                               filePath: proc.filePath,
+                               logPath: logAbs,
+                               exitCode: exitCode,
+                               output: proc.output)
+
+fn SeedStage23RunTwoprocSmoke(root: str,
+                                compilerPath: str,
+                                stageName: str,
+                                protocolName: str,
+                                serverSmokeName: str,
+                                clientSmokeName: str,
+                                outSubdir: str,
+                                okLine: str): int32 =
+    let outDir = chengpath.PathAbsolute(root, "artifacts/" + outSubdir)
+    let serverSrc = chengpath.PathAbsolute(root, "src/tests/" + serverSmokeName + ".cheng")
+    let clientSrc = chengpath.PathAbsolute(root, "src/tests/" + clientSmokeName + ".cheng")
+    let serverBin = os.JoinPath(outDir, serverSmokeName + "." + stageName)
+    let clientBin = os.JoinPath(outDir, clientSmokeName + "." + stageName)
+    let readyPath = os.JoinPath(outDir, serverSmokeName + "." + stageName + ".ready")
+    SeedStage23RemoveIfExists(readyPath)
+    if !chengpath.FileExistsNonEmpty(root, serverSrc) ||
+       !chengpath.FileExistsNonEmpty(root, clientSrc):
+        SeedStage23PrintErr(" " + protocolName + " twoproc: missing source fixture")
+        return 1
+    if !SeedStage23PrepareOutput(root, serverBin) ||
+       !SeedStage23PrepareOutput(root, clientBin):
+        return 1
+    let serverCompile = SeedStage23CompileFixture(root,
+                                                   compilerPath,
+                                                   serverSrc,
+                                                   serverBin,
+                                                   stageName,
+                                                   serverSmokeName)
+    if serverCompile != 0:
+        return serverCompile
+    let clientCompile = SeedStage23CompileFixture(root,
+                                                   compilerPath,
+                                                   clientSrc,
+                                                   clientBin,
+                                                   stageName,
+                                                   clientSmokeName)
+    if clientCompile != 0:
+        return clientCompile
+    let serverSpawn = hostops.SpawnFile(root,
+                                          " " + protocolName + " twoproc server " + stageName,
+                                          serverBin,
+                                          ["--port:0", "--ready-path:" + readyPath],
+                                          [],
+                                          root)
+    if IsErr(serverSpawn):
+        SeedStage23PrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var port = ""
+    if !SeedStage23WaitReadyPort(readyPath, serverProc, port):
+        let serverRun = SeedStage23WriteProcessSnapshot(root, serverProc, serverBin + ".run.log", 1)
+        SeedStage23PrintErr(" " + protocolName + " twoproc: invalid ready port: " + port)
+        SeedStage23MaybePrintRunOutput(serverRun)
+        hostops.SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun = SeedStage23RunBinaryArgs(root,
+                                              " " + protocolName + " twoproc client " + stageName,
+                                              clientBin,
+                                              ["--port:" + port],
+                                              20,
+                                              clientBin + ".run.log")
+    if SeedStage23RunFailed(clientRun):
+        let serverRun = hostops.SpawnedProcessWaitLogged(root, serverProc, 1, serverBin + ".run.log")
+        SeedStage23MaybePrintRunOutput(serverRun)
+        return clientRun.exitCode
+    let serverRun = hostops.SpawnedProcessWaitLogged(root, serverProc, 20, serverBin + ".run.log")
+    SeedStage23MaybePrintRunOutput(serverRun)
+    if SeedStage23RunFailed(serverRun):
+        return serverRun.exitCode
+    SeedStage23MaybePrintRunOutput(clientRun)
+    SeedStage23PrintLine(okLine)
+    return 0
+
+fn SeedStage23RunTcpTwoprocSmoke(root: str,
+                                   compilerPath: str,
+                                   stageName: str): int32 =
+    return SeedStage23RunTwoprocSmoke(root,
+                                       compilerPath,
+                                       stageName,
+                                       "libp2p tcp",
+                                       "libp2p_tcp_twoproc_server_smoke",
+                                       "libp2p_tcp_twoproc_client_smoke",
+                                       "tcp_twoproc",
+                                       " libp2p_tcp_twoproc_smoke ok")
+
+fn SeedStage23RunQuicTwoprocSmoke(root: str,
+                                    compilerPath: str,
+                                    stageName: str): int32 =
+    return SeedStage23RunTwoprocSmoke(root,
+                                       compilerPath,
+                                       stageName,
+                                       "libp2p quic",
+                                       "libp2p_quic_twoproc_server_smoke",
+                                       "libp2p_quic_twoproc_client_smoke",
+                                       "quic_twoproc",
+                                       " libp2p_quic_twoproc_smoke ok")
+
+fn SeedStage23RunTailnetControlSmoke(root: str,
+                                       compilerPath: str,
+                                       stageName: str): int32 =
+    let outDir = chengpath.PathAbsolute(root, "artifacts/tailnet_control")
+    let controlProbeEndpoint = chengpath.PathAbsolute(root, "testdata/tailnet/headscale_control_ready.json")
+    let relayProbeEndpoint = chengpath.PathAbsolute(root, "testdata/tailnet/derp_ready.json")
+    let baselineSrc = chengpath.PathAbsolute(root, "src/tests/libp2p_tailnet_transport_smoke.cheng")
+    let baselineBin = os.JoinPath(outDir, "libp2p_tailnet_transport_smoke." + stageName)
+    if !SeedStage23PrepareOutput(root, baselineBin):
+        return 1
+    let baselineCompile = SeedStage23CompileFixture(root,
+                                                     compilerPath,
+                                                     baselineSrc,
+                                                     baselineBin,
+                                                     stageName,
+                                                     "libp2p_tailnet_transport_smoke")
+    if baselineCompile != 0:
+        return baselineCompile
+    let baselineExec = SeedStage23RunBinaryArgs(root,
+                                                 " tailnet control run baseline " + stageName,
+                                                 baselineBin,
+                                                 [],
+                                                 20,
+                                                 os.JoinPath(outDir,
+                                                             "libp2p_tailnet_transport_smoke." +
+                                                                 stageName + ".run.log"))
+    if SeedStage23RunFailed(baselineExec):
+        return baselineExec.exitCode
+    let coreSmokeSrc = chengpath.PathAbsolute(root, "src/tests/tailnet_control_core_smoke.cheng")
+    let coreSmokeBin = os.JoinPath(outDir, "tailnet_control_core_smoke." + stageName)
+    if !SeedStage23PrepareOutput(root, coreSmokeBin):
+        return 1
+    let coreSmokeCompile = SeedStage23CompileFixture(root,
+                                                      compilerPath,
+                                                      coreSmokeSrc,
+                                                      coreSmokeBin,
+                                                      stageName,
+                                                      "tailnet_control_core_smoke")
+    if coreSmokeCompile != 0:
+        return coreSmokeCompile
+    let coreSmokeRun = SeedStage23RunBinaryArgs(root,
+                                                 " tailnet control run decode smoke " + stageName,
+                                                 coreSmokeBin,
+                                                 [],
+                                                 20,
+                                                 os.JoinPath(outDir,
+                                                             "tailnet_control_core_smoke." +
+                                                                 stageName + ".run.log"))
+    if SeedStage23RunFailed(coreSmokeRun):
+        return coreSmokeRun.exitCode
+    let coreSrc = chengpath.PathAbsolute(root, "src/apps/tailnet/tailnet_control_core.cheng")
+    let coreBin = os.JoinPath(outDir, "tailnet_control_core." + stageName)
+    if !SeedStage23PrepareOutput(root, coreBin):
+        return 1
+    let coreCompile = SeedStage23CompileFixture(root,
+                                                 compilerPath,
+                                                 coreSrc,
+                                                 coreBin,
+                                                 stageName,
+                                                 "tailnet_control_core")
+    if coreCompile != 0:
+        return coreCompile
+    let configureArgs = [
+        "--command", "configure",
+        "--provider-headscale", "1",
+        "--control-url", "https://headscale.example",
+        "--control-endpoint", "https://headscale.example/control",
+        "--relay-endpoint", "https://derp.sfo.example:443",
+        "--control-probe-endpoint", controlProbeEndpoint,
+        "--relay-probe-endpoint", relayProbeEndpoint,
+        "--namespace", "infra",
+        "--noise-public-key", "noise-pub-cli",
+        "--derp-region-code", "sfo",
+        "--derp-region-name", "SanFrancisco",
+        "--derp-hostname", "derp.sfo.example",
+        "--synthetic-ipv4", "100.64.0.44",
+        "--synthetic-ipv6", "fd7a:115c:a1e0::44",
+        "--local-peer-id", "tailnet-control-test",
+        "--exact-routing", "1",
+        "--provider-ready", "1",
+        "--proxy-ready", "1"
+    ]
+    let configureRun = SeedStage23RunBinaryArgs(root,
+                                                 " tailnet control configure " + stageName,
+                                                 coreBin,
+                                                 configureArgs,
+                                                 20,
+                                                 os.JoinPath(outDir,
+                                                             "tailnet_control_configure." +
+                                                                 stageName + ".run.log"))
+    if SeedStage23RunFailed(configureRun):
+        return configureRun.exitCode
+    if !SeedStage23RequireOutput(configureRun, "configured=1", " tailnet control") ||
+       !SeedStage23RequireOutput(configureRun, "providerKind=headscale", " tailnet control") ||
+       !SeedStage23RequireOutput(configureRun,
+                                   "controlProbeEndpoint=" + controlProbeEndpoint,
+                                   " tailnet control") ||
+       !SeedStage23RequireOutput(configureRun, "controlPlane=headscale", " tailnet control") ||
+       !SeedStage23RequireOutput(configureRun, "providerReady=1", " tailnet control") ||
+       !SeedStage23RequireOutput(configureRun, "proxyListenersReady=1", " tailnet control") ||
+       !SeedStage23RequireOutput(configureRun, "providerRuntimeActive=1", " tailnet control"):
+        return 1
+    let listenArgs = [
+        "--command", "listen",
+        "--provider-headscale", "1",
+        "--control-url", "https://headscale.example",
+        "--control-endpoint", "https://headscale.example/control",
+        "--relay-endpoint", "https://derp.sfo.example:443",
+        "--control-probe-endpoint", controlProbeEndpoint,
+        "--relay-probe-endpoint", relayProbeEndpoint,
+        "--namespace", "infra",
+        "--noise-public-key", "noise-pub-cli",
+        "--derp-region-code", "sfo",
+        "--derp-region-name", "SanFrancisco",
+        "--derp-hostname", "derp.sfo.example",
+        "--synthetic-ipv4", "100.64.0.44",
+        "--synthetic-ipv6", "fd7a:115c:a1e0::44",
+        "--local-peer-id", "tailnet-control-test",
+        "--exact-routing", "1",
+        "--provider-ready", "1",
+        "--proxy-ready", "1",
+        "--host", "127.0.0.1",
+        "--port", "7101",
+        "--transport", "tcp"
+    ]
+    let listenRun = SeedStage23RunBinaryArgs(root,
+                                              " tailnet control listen " + stageName,
+                                              coreBin,
+                                              listenArgs,
+                                              20,
+                                              os.JoinPath(outDir,
+                                                          "tailnet_control_listen." +
+                                                              stageName + ".run.log"))
+    if SeedStage23RunFailed(listenRun):
+        return listenRun.exitCode
+    if !SeedStage23RequireOutput(listenRun,
+                                   "publishedAddr=/ip4/100.64.0.44/tcp/7101",
+                                   " tailnet control") ||
+       !SeedStage23RequireOutput(listenRun,
+                                   "listener.0.raw=/ip4/127.0.0.1/tcp/7101",
+                                   " tailnet control") ||
+       !SeedStage23RequireOutput(listenRun, "providerKind=headscale", " tailnet control") ||
+       !SeedStage23RequireOutput(listenRun,
+                                   "tailnetDerpMapSummary=headscale/infra@https://headscale.example#sfo/derp.sfo.example",
+                                   " tailnet control") ||
+       !SeedStage23RequireOutput(listenRun, "providerRuntimeActive=1", " tailnet control"):
+        return 1
+    let dialArgs = [
+        "--command", "dial-plan",
+        "--provider-headscale", "1",
+        "--control-url", "https://headscale.example",
+        "--control-endpoint", "https://headscale.example/control",
+        "--relay-endpoint", "https://derp.sfo.example:443",
+        "--control-probe-endpoint", controlProbeEndpoint,
+        "--relay-probe-endpoint", relayProbeEndpoint,
+        "--namespace", "infra",
+        "--noise-public-key", "noise-pub-cli",
+        "--derp-region-code", "sfo",
+        "--derp-region-name", "SanFrancisco",
+        "--derp-hostname", "derp.sfo.example",
+        "--synthetic-ipv4", "100.64.0.44",
+        "--synthetic-ipv6", "fd7a:115c:a1e0::44",
+        "--local-peer-id", "tailnet-control-test",
+        "--exact-routing", "1",
+        "--provider-ready", "1",
+        "--proxy-ready", "1",
+        "--derp-healthy", "1",
+        "--bootstrap-listen-count", "1",
+        "--bootstrap-listen-raw-0", "/ip4/127.0.0.1/tcp/7101",
+        "--bootstrap-peer-count", "1",
+        "--bootstrap-peer-id-0", "peer-direct",
+        "--bootstrap-peer-remote-tailnet-ip-0", "100.64.0.88",
+        "--bootstrap-peer-direct-reachable-0", "1",
+        "--bootstrap-peer-relay-allowed-0", "1",
+        "--bootstrap-peer-relay-only-0", "0",
+        "--bootstrap-peer-derp-region-code-0", "sfo",
+        "--bootstrap-peer-signed-preface-0", "test-preface",
+        "--bootstrap-peer-bound-addr-text-0", "/ip4/127.0.0.1/tcp/7101",
+        "--bootstrap-peer-last-path-0", "direct",
+        "--bootstrap-peer-last-error-0", "",
+        "--peer-id", "peer-direct",
+        "--addr", "/ip4/100.64.0.44/tcp/7101"
+    ]
+    let dialRun = SeedStage23RunBinaryArgs(root,
+                                            " tailnet control dial-plan " + stageName,
+                                            coreBin,
+                                            dialArgs,
+                                            20,
+                                            os.JoinPath(outDir,
+                                                        "tailnet_control_dial." +
+                                                            stageName + ".run.log"))
+    if SeedStage23RunFailed(dialRun):
+        return dialRun.exitCode
+    if !SeedStage23RequireOutput(dialRun, "dial.pathKind=direct", " tailnet control") ||
+       !SeedStage23RequireOutput(dialRun,
+                                   "dial.routeText=/ip4/127.0.0.1/tcp/7101",
+                                   " tailnet control") ||
+       !SeedStage23RequireOutput(dialRun, "sessionCount=1", " tailnet control") ||
+       !SeedStage23RequireOutput(dialRun, "relayHealthy=1", " tailnet control") ||
+       !SeedStage23RequireOutput(dialRun, "startupStage=derp-ready", " tailnet control") ||
+       !SeedStage23RequireOutput(dialRun,
+                                   "tailnetDerpMapSummary=headscale/infra@https://headscale.example#sfo/derp.sfo.example",
+                                   " tailnet control") ||
+       !SeedStage23RequireOutput(dialRun, "peer.0.lastPath=direct", " tailnet control") ||
+       !SeedStage23RequireOutput(dialRun, "providerRuntimeActive=1", " tailnet control") ||
+       !SeedStage23RequireOutput(dialRun, "providerRuntimeCommands=3", " tailnet control"):
+        return 1
+    SeedStage23MaybePrintRunOutput(baselineExec)
+    SeedStage23MaybePrintRunOutput(coreSmokeRun)
+    SeedStage23MaybePrintRunOutput(configureRun)
+    SeedStage23MaybePrintRunOutput(listenRun)
+    SeedStage23MaybePrintRunOutput(dialRun)
+    SeedStage23PrintLine(" tailnet_control_smoke ok")
+    return 0
+
+fn SeedStage23RunCompilerCommand(root: str,
+                                   label: str,
+                                   compilerPath: str,
+                                   argv: str[],
+                                   logPath: str): hostops.LoggedRun =
+    let logAbs = chengpath.PathAbsolute(root, logPath)
+    let logParent = chengpath.PathParentDir(logAbs)
+    if len(logParent) > 0:
+        let _ = chengpath.MkdirP(root, logParent)
+    return hostops.RunFileLogged(root,
+                                  label,
+                                  compilerPath,
+                                  argv,
+                                  SeedStage23CompileEnv(),
+                                  root,
+                                  0,
+                                  logPath)
+
+fn SeedStage23RunFreshNodeSelfhostGate(root: str,
+                                         compilerPath: str,
+                                         label: str): int32 =
+    let src = chengpath.PathAbsolute(root, "src/tests/program_selfhost_smoke.cheng")
+    let outDir = chengpath.PathAbsolute(root, "artifacts/fresh_node_gate/" + label)
+    let syncPrefix = os.JoinPath(outDir, "program_selfhost_smoke.sync")
+    let freshPrefix = os.JoinPath(outDir, "program_selfhost_smoke.fresh")
+    if !chengpath.FileExistsNonEmpty(root, src):
+        SeedStage23PrintErr(" fresh-node selfhost gate: missing source: " + src)
+        return 1
+    let syncRun = SeedStage23RunCompilerCommand(root,
+                                                 " fresh-node selfhost world-sync " + label,
+                                                 compilerPath,
+                                                 [
+                                                     "world-sync",
+                                                     "--root:" + root,
+                                                     "--in:" + src,
+                                                     "--target:arm64-apple-darwin",
+                                                     "--out:" + syncPrefix,
+                                                     "--channel:stable"
+                                                 ],
+                                                 os.JoinPath(outDir, "world_sync.log"))
+    if SeedStage23RunFailed(syncRun):
+        return syncRun.exitCode
+    if !SeedStage23RequirePrefixArtifacts(syncPrefix,
+                                            [
+                                                ".world.txt",
+                                                ".manifest.txt",
+                                                ".compiler.snapshot.txt",
+                                                ".std.snapshot.txt",
+                                                ".runtime.snapshot.txt",
+                                                ".csg.txt",
+                                                ".surface.txt",
+                                                ".receipt.txt",
+                                                ".lock.toml"
+                                            ],
+                                            " fresh-node selfhost gate"):
+        return 1
+    let freshRun = SeedStage23RunCompilerCommand(root,
+                                                  " fresh-node selfhost fresh " + label,
+                                                  compilerPath,
+                                                  [
+                                                      "fresh-node-selfhost",
+                                                      "--root:" + root,
+                                                      "--in:" + src,
+                                                      "--target:arm64-apple-darwin",
+                                                      "--out:" + freshPrefix,
+                                                      "--channel:stable",
+                                                      "--baseline-csg:" + syncPrefix + ".csg.txt",
+                                                      "--baseline-surface:" +
+                                                          syncPrefix + ".surface.txt",
+                                                      "--baseline-receipt:" + syncPrefix + ".receipt.txt"
+                                                  ],
+                                                  os.JoinPath(outDir, "fresh_node.log"))
+    if SeedStage23RunFailed(freshRun):
+        return freshRun.exitCode
+    if !SeedStage23RequireOutput(freshRun,
+                                   "equivalence_passed=1",
+                                   " fresh-node selfhost gate") ||
+       !SeedStage23RequireOutput(freshRun, "publish_allowed=1", " fresh-node selfhost gate") ||
+       !SeedStage23RequireOutput(freshRun,
+                                   "receipt_equivalent=1",
+                                   " fresh-node selfhost gate") ||
+       !SeedStage23RequireOutput(freshRun, "receipt_cid_match=1", " fresh-node selfhost gate") ||
+       !SeedStage23RequireFileContains(freshPrefix + ".fresh.txt",
+                                         "receipt_equivalent=1",
+                                         " fresh-node selfhost gate") ||
+       !SeedStage23RequireFileContains(freshPrefix + ".fresh.txt",
+                                         "receipt_cid_match=1",
+                                         " fresh-node selfhost gate"):
+        return 1
+    SeedStage23MaybePrintRunOutput(syncRun)
+    SeedStage23MaybePrintRunOutput(freshRun)
+    SeedStage23PrintLine(" fresh-node selfhost gate ok (" + label + ")")
+    return 0
+
+fn SeedStage23RunMigrationGate(root: str,
+                                 compilerPath: str,
+                                 label: str): int32 =
+    let currentSrc = chengpath.PathAbsolute(root, "src/tests/compiler_migration_fixture.cheng")
+    let legacySrc = chengpath.PathAbsolute(root,
+                                            "testdata/compiler_migration/" +
+                                                "compiler_migration_fixture_legacy.cheng")
+    let outDir = chengpath.PathAbsolute(root, "artifacts/migration_gate/" + label)
+    let migratePrefix = os.JoinPath(outDir, "compiler_migration_fixture.migrate")
+    let proofPrefix = os.JoinPath(outDir, "compiler_migration_fixture.prove")
+    let blockedPrefix = os.JoinPath(outDir, "compiler_migration_fixture.blocked")
+    let publishPrefix = os.JoinPath(outDir, "compiler_migration_fixture.publish")
+    if !chengpath.FileExistsNonEmpty(root, currentSrc) ||
+       !chengpath.FileExistsNonEmpty(root, legacySrc):
+        SeedStage23PrintErr(" migration gate: missing fixture sources")
+        return 1
+    let migrateRun = SeedStage23RunCompilerCommand(root,
+                                                    " migration gate migrate-csg " + label,
+                                                    compilerPath,
+                                                    [
+                                                        "migrate-csg",
+                                                        "--root:" + root,
+                                                        "--in:" + currentSrc,
+                                                        "--legacy-in:" + legacySrc,
+                                                        "--out:" + migratePrefix
+                                                    ],
+                                                    os.JoinPath(outDir, "migrate_csg.log"))
+    if SeedStage23RunFailed(migrateRun):
+        return migrateRun.exitCode
+    if !SeedStage23RequirePrefixArtifacts(migratePrefix,
+                                            [
+                                                ".migration.txt",
+                                                ".migration.csg.txt",
+                                                ".migration.surface.txt",
+                                                ".migration.receipt.txt"
+                                            ],
+                                            " migration gate") ||
+       !SeedStage23RequireOutput(migrateRun, "canonical_graph_cid=", " migration gate"):
+        return 1
+    let proveRun = SeedStage23RunCompilerCommand(root,
+                                                  " migration gate prove-migration " + label,
+                                                  compilerPath,
+                                                  [
+                                                      "prove-migration",
+                                                      "--root:" + root,
+                                                      "--in:" + currentSrc,
+                                                      "--legacy-in:" + legacySrc,
+                                                      "--target:arm64-apple-darwin",
+                                                      "--channel:stable",
+                                                      "--out:" + proofPrefix
+                                                  ],
+                                                  os.JoinPath(outDir, "prove_migration.log"))
+    if SeedStage23RunFailed(proveRun):
+        return proveRun.exitCode
+    if !SeedStage23RequirePrefixArtifacts(proofPrefix,
+                                            [
+                                                ".migration.txt",
+                                                ".migration.csg.txt",
+                                                ".migration.surface.txt",
+                                                ".migration.receipt.txt",
+                                                ".proof.txt"
+                                            ],
+                                            " migration gate") ||
+       !SeedStage23RequireOutput(proveRun,
+                                   "equivalence_kind=canonical_semantic_identity",
+                                   " migration gate") ||
+       !SeedStage23RequireOutput(proveRun, "graph_equivalent=1", " migration gate") ||
+       !SeedStage23RequireOutput(proveRun,
+                                   "export_surface_compatible=1",
+                                   " migration gate") ||
+       !SeedStage23RequireOutput(proveRun,
+                                   "compile_receipt_equivalent=1",
+                                   " migration gate"):
+        return 1
+    let blockedRun = SeedStage23RunCompilerCommand(root,
+                                                    " migration gate publish-blocked " + label,
+                                                    compilerPath,
+                                                    [
+                                                        "publish-world",
+                                                        "--root:" + root,
+                                                        "--in:" + currentSrc,
+                                                        "--target:arm64-apple-darwin",
+                                                        "--out:" + blockedPrefix,
+                                                        "--channel:stable"
+                                                    ],
+                                                    os.JoinPath(outDir, "publish_blocked.log"))
+    if blockedRun.exitCode == 0:
+        SeedStage23PrintErr(" migration gate: stable publish unexpectedly passed without proof")
+        return 1
+    if !SeedStage23RequireAnyOutput(blockedRun.output,
+                                      ["stable requires", "publish blocked", "missing --baseline"],
+                                      " migration gate"):
+        return 1
+    let publishRun = SeedStage23RunCompilerCommand(root,
+                                                    " migration gate publish-world " + label,
+                                                    compilerPath,
+                                                    [
+                                                        "publish-world",
+                                                        "--root:" + root,
+                                                        "--in:" + currentSrc,
+                                                        "--legacy-in:" + legacySrc,
+                                                        "--target:arm64-apple-darwin",
+                                                        "--out:" + publishPrefix,
+                                                        "--channel:stable"
+                                                    ],
+                                                    os.JoinPath(outDir, "publish_migration.log"))
+    if SeedStage23RunFailed(publishRun):
+        return publishRun.exitCode
+    if !SeedStage23RequirePrefixArtifacts(publishPrefix,
+                                            [
+                                                ".world.txt",
+                                                ".manifest.txt",
+                                                ".compiler.snapshot.txt",
+                                                ".std.snapshot.txt",
+                                                ".runtime.snapshot.txt",
+                                                ".csg.txt",
+                                                ".surface.txt",
+                                                ".receipt.txt",
+                                                ".lock.toml",
+                                                ".migration.txt",
+                                                ".migration.csg.txt",
+                                                ".migration.surface.txt",
+                                                ".migration.receipt.txt",
+                                                ".proof.txt",
+                                                ".fresh.txt",
+                                                ".publish.txt"
+                                            ],
+                                            " migration gate") ||
+       !SeedStage23RequireOutput(publishRun, "proof_mode=migration", " migration gate") ||
+       !SeedStage23RequireOutput(publishRun, "equivalence_passed=1", " migration gate") ||
+       !SeedStage23RequireOutput(publishRun, "publish_allowed=1", " migration gate") ||
+       !SeedStage23RequireOutput(publishRun, "receipt_cid_match=1", " migration gate"):
+        return 1
+    SeedStage23MaybePrintRunOutput(migrateRun)
+    SeedStage23MaybePrintRunOutput(proveRun)
+    SeedStage23MaybePrintRunOutput(blockedRun)
+    SeedStage23MaybePrintRunOutput(publishRun)
+    SeedStage23PrintLine(" migration gate ok (" + label + ")")
+    return 0
+
+fn SeedStage23DefaultBrowserWebrtcSmokes(): str[] =
+    return [
+        "webrtc_signal_stream_smoke",
+        "webrtc_datachannel_browser_smoke",
+        "webrtc_browser_content_smoke",
+        "libp2p_webrtc_sync_smoke",
+        "webrtc_browser_pubsub_smoke",
+        "webrtc_browser_light_node_smoke",
+        "browser_sdk_smoke"
+    ]
+
+fn SeedStage23RunBrowserWebrtcSmokes(root: str,
+                                       hostCompilerPath: str,
+                                       stage2Path: str,
+                                       stage3Path: str,
+                                       tests: str[]): int32 =
+    let browserDir = chengpath.PathAbsolute(root, "tools/browser_webrtc")
+    let outDir = chengpath.PathAbsolute(root, "artifacts/browser_webrtc")
+    if !chengpath.MkdirP(root, outDir):
+        SeedStage23PrintErr(" browser webrtc smokes: failed to create output dir: " + outDir)
+        return 1
+    if !chengpath.PathDirExists(browserDir):
+        SeedStage23PrintErr(" browser webrtc smokes: missing browser dir: " + browserDir)
+        return 1
+    if !chengpath.PathDirExists(os.JoinPath(browserDir, "node_modules/playwright")):
+        let npmRun = hostops.RunProgramLogged(root,
+                                                " browser webrtc npm-install",
+                                                "npm",
+                                                ["install", "--no-fund", "--no-audit"],
+                                                [],
+                                                browserDir,
+                                                600,
+                                                os.JoinPath(outDir, "npm_install.log"))
+        if SeedStage23RunFailed(npmRun):
+            return npmRun.exitCode
+    let playwrightRun = hostops.RunProgramLogged(root,
+                                                  " browser webrtc playwright-install",
+                                                  "npx",
+                                                  ["playwright", "install", "chromium"],
+                                                  [],
+                                                  browserDir,
+                                                  600,
+                                                  os.JoinPath(outDir, "playwright_install.log"))
+    if SeedStage23RunFailed(playwrightRun):
+        return playwrightRun.exitCode
+    var names = SeedStage23DefaultBrowserWebrtcSmokes()
+    if tests.len > 0:
+        names = tests
+    for i in 0..<names.len:
+        let smokeName = names[i]
+        if SeedStage23RunOneFixture(root, hostCompilerPath, outDir, "host", smokeName) != 0:
+            return 1
+        if SeedStage23RunOneFixture(root, stage2Path, outDir, "stage2", smokeName) != 0:
+            return 1
+        if SeedStage23RunOneFixture(root, stage3Path, outDir, "stage3", smokeName) != 0:
+            return 1
+    SeedStage23PrintLine(" browser webrtc smokes: ok")
+    return 0
+
+fn SeedStage23RequireBootstrapCompiler(root: str,
+                                         path: str,
+                                         label: str): bool =
+    if chengpath.FileExistsNonEmpty(root, path):
+        return true
+    SeedStage23PrintErr(Fmt"stage2/stage3 libp2p: missing {label} compiler: {path}")
+    return false
+
+fn SeedRunStage23Libp2pSmokes(rootDir: str,
+                                args: str[]): int32 =
+    let root = strutil.Strip(rootDir)
+    if len(root) <= 0:
+        SeedStage23PrintErr("stage2/stage3 libp2p: missing root")
+        return 1
+    let tailOnly = strutil.Strip(SeedStage23ReadFlag(args, "--tail-only", ""))
+    let positionals = SeedStage23CollectPositionals(args)
+    let stage2 = contracts.BootstrapStage2Path(root)
+    let stage3 = contracts.BootstrapStage3Path(root)
+    if !SeedStage23RequireBootstrapCompiler(root, stage2, "stage2") ||
+       !SeedStage23RequireBootstrapCompiler(root, stage3, "stage3"):
+        return 1
+    if tailOnly == "browser_webrtc":
+        return SeedStage23RunBrowserWebrtcSmokes(root, stage3, stage2, stage3, positionals)
+    if len(tailOnly) > 0:
+        SeedStage23PrintErr("stage2/stage3 libp2p: unknown --tail-only: " + tailOnly)
+        return 1
+    let outDir = chengpath.PathAbsolute(root, "artifacts/stage23_libp2p")
+    if !chengpath.MkdirP(root, outDir):
+        SeedStage23PrintErr("stage2/stage3 libp2p: failed to create output dir: " + outDir)
+        return 1
+    var tests = positionals
+    var runTail = false
+    if tests.len <= 0:
+        tests = SeedStage23DefaultSmokes()
+        runTail = true
+    for i in 0..<tests.len:
+        let smokeName = tests[i]
+        if SeedStage23RunOneFixture(root, stage2, outDir, "stage2", smokeName) != 0:
+            return 1
+        if smokeName == "libp2p_tcp_smoke":
+            if SeedStage23RunTcpTwoprocSmoke(root, stage2, "stage2") != 0:
+                return 1
+        if smokeName == "libp2p_quic_tls_smoke":
+            if SeedStage23RunQuicTwoprocSmoke(root, stage2, "stage2") != 0:
+                return 1
+        if SeedStage23RunOneFixture(root, stage3, outDir, "stage3", smokeName) != 0:
+            return 1
+        if smokeName == "libp2p_tcp_smoke":
+            if SeedStage23RunTcpTwoprocSmoke(root, stage3, "stage3") != 0:
+                return 1
+        if smokeName == "libp2p_quic_tls_smoke":
+            if SeedStage23RunQuicTwoprocSmoke(root, stage3, "stage3") != 0:
+                return 1
+    if runTail:
+        if SeedStage23RunTailnetControlSmoke(root, stage2, "stage2") != 0:
+            return 1
+        if SeedStage23RunTailnetControlSmoke(root, stage3, "stage3") != 0:
+            return 1
+        if SeedStage23RunFreshNodeSelfhostGate(root, stage2, "stage2") != 0:
+            return 1
+        if SeedStage23RunFreshNodeSelfhostGate(root, stage3, "stage3") != 0:
+            return 1
+        if SeedStage23RunMigrationGate(root, stage2, "stage2") != 0:
+            return 1
+        if SeedStage23RunMigrationGate(root, stage3, "stage3") != 0:
+            return 1
+        if SeedStage23RunBrowserWebrtcSmokes(root, stage3, stage2, stage3, []) != 0:
+            return 1
+    SeedStage23PrintLine("stage2/stage3 libp2p fixture smokes: ok")
+    return 0

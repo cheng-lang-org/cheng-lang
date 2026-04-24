@@ -2,6 +2,7 @@
 import std/system
 import std/strings
 import std/strutils
+import std/rawmem_support
 
 @importc("cheng_seq_set_grow")
 fn json_cheng_seq_set_grow(seqPtr: ptr, idx: int32, elemSize: int32): ptr
@@ -106,15 +107,19 @@ fn jsonAppendNode(seqInst: var JsonNode[], value: JsonNode) =
 fn jsonAppendStr(seqInst: var str[], value: str) =
     strutilsAppendStr(seqInst, value)
 
-fn add(node: var JsonNode, item: JsonNode) =
+fn jsonAddNode(node: var JsonNode, item: JsonNode) =
     if node.kind != JArray:
         return
     jsonAppendNode(node.a, item)
 
+fn add(node: var JsonNode, item: JsonNode) =
+    jsonAddNode(node, item)
+
 fn jsonArray(items: JsonNode[]): JsonNode =
     var node: JsonNode = newJArray()
     for i in 0..<items.len:
-        add(node, items[i])
+        let item: JsonNode = items[i]
+        jsonAddNode(node, item)
     return node
 
 fn jsonPair(key: str, value: JsonNode): JsonPair =
@@ -375,7 +380,8 @@ fn toJsonValue(value: float64): JsonNode =
 fn toJsonValue(value: T[]): JsonNode =
     var node: JsonNode = newJArray()
     for item in value:
-        add(node, toJsonValue(item))
+        let boxed: JsonNode = toJsonValue(item)
+        jsonAddNode(node, boxed)
     return node
 
 fn jsonValue(node: JsonNode): JsonNode =
@@ -402,66 +408,189 @@ fn jsonValue(value: float64): JsonNode =
 fn jsonValue(value: T[]): JsonNode =
     return toJsonValue(value)
 
-fn escapeJsonString(value: str): str =
-    var parts: str[]
-    for i in 0..<len(value):
+fn jsonHexNibble(value: int32): char =
+    if value < 10:
+        return char(int32('0') + value)
+    return char(int32('a') + (value - 10))
+
+fn jsonEscapedCharLen(ch: char): int32 =
+    let chCode: int32 = int32(ch)
+    if chCode == 92:
+        return 2
+    if chCode == 34:
+        return 2
+    if chCode == 10:
+        return 2
+    if chCode == 13:
+        return 2
+    if chCode == 9:
+        return 2
+    if chCode >= 0 && chCode < 32:
+        return 6
+    return 1
+
+fn jsonEscapedLen(value: str): int32 =
+    var total: int32
+    let n: int32 = strings.Len(value)
+    for i in 0..<n:
+        total = total + jsonEscapedCharLen(value[i])
+    return total
+
+fn jsonQuotedLen(value: str): int32 =
+    return jsonEscapedLen(value) + 2
+
+fn jsonStringifiedLen(node: JsonNode): int32 =
+    if node.kind == JNull:
+        return 4
+    if node.kind == JBool:
+        return node.b ? 4 : 5
+    if node.kind == JInt:
+        return strings.Len(int64ToStr(node.i))
+    if node.kind == JFloat:
+        return strings.Len(strutils.FormatFloat(node.f))
+    if node.kind == JString:
+        return jsonQuotedLen(node.s)
+    if node.kind == JArray:
+        var total: int32 = 2
+        for i in 0..<node.a.len:
+            if i > 0:
+                total = total + 1
+            total = total + jsonStringifiedLen(node.a[i])
+        return total
+    if node.kind == JObject:
+        var total: int32 = 2
+        for i in 0..<node.okeys.len:
+            if i > 0:
+                total = total + 1
+            total = total + jsonQuotedLen(node.okeys[i]) + 1 + jsonStringifiedLen(node.ovalues[i])
+        return total
+    return 4
+
+fn jsonWriteByte(out: str, pos: var int32, value: int32) =
+    rawmem_support.RawmemWriteI8(strDataPtr(out), pos, int8(value))
+    pos = pos + 1
+
+fn jsonWriteSlice(out: str, pos: var int32, value: str, start: int32, count: int32) =
+    if count <= 0:
+        return
+    let dst: ptr = rawmem_support.RawmemPtrAdd(strDataPtr(out), pos)
+    let src: ptr = rawmem_support.RawmemPtrAdd(strDataPtr(value), start)
+    rawmem_support.RawmemCopy(dst, src, count)
+    pos = pos + count
+
+fn jsonWriteLiteral(out: str, pos: var int32, value: str) =
+    jsonWriteSlice(out, pos, value, 0, strings.Len(value))
+
+fn jsonWriteUnicodeEscape(out: str, pos: var int32, chCode: int32) =
+    jsonWriteByte(out, pos, 92)
+    jsonWriteByte(out, pos, 117)
+    jsonWriteByte(out, pos, 48)
+    jsonWriteByte(out, pos, 48)
+    jsonWriteByte(out, pos, int32(jsonHexNibble((chCode >> 4) & 15)))
+    jsonWriteByte(out, pos, int32(jsonHexNibble(chCode & 15)))
+
+fn jsonWriteEscapedContent(out: str, pos: var int32, value: str) =
+    let n: int32 = strings.Len(value)
+    var runStart: int32
+    var i: int32
+    while i < n:
         let ch: char = value[i]
         let chCode: int32 = int32(ch)
-        if chCode == 92:
-            jsonAppendStr(parts, "\\\\")
-        elif chCode == 34:
-            jsonAppendStr(parts, "\\\"")
-        elif chCode == 10:
-            jsonAppendStr(parts, "\\n")
-        elif chCode == 13:
-            jsonAppendStr(parts, "\\r")
-        elif chCode == 9:
-            jsonAppendStr(parts, "\\t")
+        var escaped: bool
+        if chCode == 92 || chCode == 34 || chCode == 10 || chCode == 13 || chCode == 9 || (chCode >= 0 && chCode < 32):
+            escaped = true
+        if escaped:
+            jsonWriteSlice(out, pos, value, runStart, i - runStart)
+            if chCode == 92:
+                jsonWriteLiteral(out, pos, "\\\\")
+            elif chCode == 34:
+                jsonWriteLiteral(out, pos, "\\\"")
+            elif chCode == 10:
+                jsonWriteLiteral(out, pos, "\\n")
+            elif chCode == 13:
+                jsonWriteLiteral(out, pos, "\\r")
+            elif chCode == 9:
+                jsonWriteLiteral(out, pos, "\\t")
+            else:
+                jsonWriteUnicodeEscape(out, pos, chCode)
+            runStart = i + 1
+        i = i + 1
+    jsonWriteSlice(out, pos, value, runStart, n - runStart)
+
+fn jsonWriteQuoted(out: str, pos: var int32, value: str) =
+    jsonWriteByte(out, pos, 34)
+    jsonWriteEscapedContent(out, pos, value)
+    jsonWriteByte(out, pos, 34)
+
+fn jsonWriteNode(out: str, pos: var int32, node: JsonNode) =
+    if node.kind == JNull:
+        jsonWriteLiteral(out, pos, "null")
+        return
+    if node.kind == JBool:
+        if node.b:
+            jsonWriteLiteral(out, pos, "true")
         else:
-            jsonAppendStr(parts, charToStr(ch))
-    return strutils.Join(parts, "")
+            jsonWriteLiteral(out, pos, "false")
+        return
+    if node.kind == JInt:
+        jsonWriteLiteral(out, pos, int64ToStr(node.i))
+        return
+    if node.kind == JFloat:
+        jsonWriteLiteral(out, pos, strutils.FormatFloat(node.f))
+        return
+    if node.kind == JString:
+        jsonWriteQuoted(out, pos, node.s)
+        return
+    if node.kind == JArray:
+        jsonWriteByte(out, pos, 91)
+        for i in 0..<node.a.len:
+            if i > 0:
+                jsonWriteByte(out, pos, 44)
+            jsonWriteNode(out, pos, node.a[i])
+        jsonWriteByte(out, pos, 93)
+        return
+    if node.kind == JObject:
+        jsonWriteByte(out, pos, 123)
+        for i in 0..<node.okeys.len:
+            if i > 0:
+                jsonWriteByte(out, pos, 44)
+            jsonWriteQuoted(out, pos, node.okeys[i])
+            jsonWriteByte(out, pos, 58)
+            jsonWriteNode(out, pos, node.ovalues[i])
+        jsonWriteByte(out, pos, 125)
+        return
+    jsonWriteLiteral(out, pos, "null")
+
+fn stringify(node: JsonNode): str =
+    let total: int32 = jsonStringifiedLen(node)
+    let out: str = newStringAlloc(total)
+    var pos: int32
+    jsonWriteNode(out, pos, node)
+    assert(pos == total, "std/json stringify length mismatch")
+    return out
+
+fn escapeJsonString(value: str): str =
+    let total: int32 = jsonEscapedLen(value)
+    if total <= 0:
+        return ""
+    let out: str = newStringAlloc(total)
+    var pos: int32
+    jsonWriteEscapedContent(out, pos, value)
+    assert(pos == total, "std/json escape length mismatch")
+    return out
 
 fn pretty(node: JsonNode, indent: int): str =
     indent
-    if node.kind == JNull:
-        return "null"
-    if node.kind == JBool:
-        return node.b ? "true" : "false"
-    if node.kind == JInt:
-        return int64ToStr(node.i)
-    if node.kind == JFloat:
-        return strutils.FormatFloat(node.f)
-    if node.kind == JString:
-        let quotedParts: str[] = ["\"", escapeJsonString(node.s), "\""]
-        return strutils.Join(quotedParts, "")
-    if node.kind == JArray:
-        var parts: str[]
-        jsonAppendStr(parts, "[")
-        for i in 0..<node.a.len:
-            if i > 0:
-                jsonAppendStr(parts, ",")
-            jsonAppendStr(parts, pretty(node.a[i], indent))
-        jsonAppendStr(parts, "]")
-        return strutils.Join(parts, "")
-    if node.kind == JObject:
-        var parts: str[]
-        jsonAppendStr(parts, "{")
-        for i in 0..<node.okeys.len:
-            if i > 0:
-                jsonAppendStr(parts, ",")
-            jsonAppendStr(parts, "\"")
-            jsonAppendStr(parts, escapeJsonString(node.okeys[i]))
-            jsonAppendStr(parts, "\":")
-            jsonAppendStr(parts, pretty(node.ovalues[i], indent))
-        jsonAppendStr(parts, "}")
-        return strutils.Join(parts, "")
-    return "null"
+    return stringify(node)
 
 fn toPretty(node: JsonNode, indent: int): str =
     return pretty(node, indent)
 
+fn toJsonString(node: JsonNode): str =
+    return stringify(node)
+
 fn `$`(node: JsonNode): str =
-    return pretty(node, 2)
+    return stringify(node)
 
 fn parseJson(content: str): JsonNode =
     content
@@ -571,17 +700,53 @@ fn JsonSetFieldFloat64(node: var JsonNode, key: str, value: float64) =
     var boxed: JsonNode = newJFloat(value)
     jsonSetField(node, key, boxed)
 
+fn NewJNull(): JsonNode =
+    return newJNull()
+
 fn NewJBool(value: bool): JsonNode =
     return newJBool(value)
 
 fn NewJInt(value: int64): JsonNode =
     return newJInt(value)
 
+fn NewJFloat(value: float64): JsonNode =
+    return newJFloat(value)
+
+fn NewJArray(): JsonNode =
+    return newJArray()
+
 fn NewJObject(): JsonNode =
     return newJObject()
 
 fn NewJString(value: str): JsonNode =
     return newJString(value)
+
+fn JsonAdd(node: var JsonNode, item: JsonNode) =
+    jsonAddNode(node, item)
+
+fn JsonAddStr(node: var JsonNode, value: str) =
+    var item: JsonNode = newJString(value)
+    jsonAddNode(node, item)
+
+fn JsonAddBool(node: var JsonNode, value: bool) =
+    var item: JsonNode = newJBool(value)
+    jsonAddNode(node, item)
+
+fn JsonAddInt(node: var JsonNode, value: int) =
+    var item: JsonNode = newJInt(int64(value))
+    jsonAddNode(node, item)
+
+fn JsonAddInt32(node: var JsonNode, value: int32) =
+    var item: JsonNode = newJInt(int64(value))
+    jsonAddNode(node, item)
+
+fn JsonAddInt64(node: var JsonNode, value: int64) =
+    var item: JsonNode = newJInt(value)
+    jsonAddNode(node, item)
+
+fn JsonAddFloat64(node: var JsonNode, value: float64) =
+    var item: JsonNode = newJFloat(value)
+    jsonAddNode(node, item)
 
 fn ParseJsonSafe(content: str): JsonParseResult =
     return parseJsonSafe(content)
@@ -609,3 +774,12 @@ fn Pretty(node: JsonNode, indent: int): str =
 
 fn ToPretty(node: JsonNode, indent: int): str =
     return toPretty(node, indent)
+
+fn Stringify(node: JsonNode): str =
+    return stringify(node)
+
+fn JsonStringify(node: JsonNode): str =
+    return stringify(node)
+
+fn ToJsonString(node: JsonNode): str =
+    return toJsonString(node)

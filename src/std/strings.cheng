@@ -1,5 +1,6 @@
 # Strings module (minimal)
 import std/system
+import std/rawmem_support
 
 type
     UInt8Ptr = uint8 *
@@ -106,7 +107,7 @@ fn `[]=`(s: str, i: int32, val: char) =
         return
     if i >= n:
         return
-    rawmemWriteI8(data, i, int8(int32(val)))
+    rawmem_support.RawmemWriteI8(data, i, int8(int32(val)))
 
 fn __cheng_slice_string(s: str, start: int32, stop: int32, exclusive: bool): str =
     let count: int32 = exclusive ? (stop - start) : (stop - start + 1)
@@ -149,30 +150,92 @@ fn strContains(text: str, sub: str): bool =
         i = i + 1
     return false
 
-fn uint64DigitToStr(value: uint64): str =
-    return charToStr(char(int32('0') + int32(value)))
+fn int32PositiveDecimalLen(value: int32): int32 =
+    if value == 0:
+        return 1
+    var n: int32 = value
+    var count: int32
+    while n != 0:
+        count = count + 1
+        n = n / 10
+    return count
 
-fn uint64DigitsText(value: uint64): str =
-    if value < uint64(10):
-        return uint64DigitToStr(value)
-    let prefix: str = uint64DigitsText(value / uint64(10))
-    let digitValue: uint64 = value - ((value / uint64(10)) * uint64(10))
-    return prefix + uint64DigitToStr(digitValue)
+fn uint64DecimalLen(value: uint64): int32 =
+    if value == uint64(0):
+        return 1
+    var n: uint64 = value
+    var count: int32
+    while n != uint64(0):
+        count = count + 1
+        n = n / uint64(10)
+    return count
+
+fn stringWriteByte(out: str, index: int32, value: int32) =
+    rawmem_support.RawmemWriteI8(strDataPtr(out), index, int8(value))
+
+fn int32PositiveToStr(value: int32): str =
+    let digitCount: int32 = int32PositiveDecimalLen(value)
+    let out: str = newStringAlloc(digitCount)
+    var n: int32 = value
+    var cursor: int32 = digitCount
+    if n == 0:
+        stringWriteByte(out, 0, int32('0'))
+        return out
+    while n != 0:
+        let q: int32 = n / 10
+        let digit: int32 = n - (q * 10)
+        cursor = cursor - 1
+        stringWriteByte(out, cursor, int32('0') + digit)
+        n = q
+    return out
+
+fn uint64ToStr(x: uint64): str =
+    let value: uint64 = x
+    let digitCount: int32 = uint64DecimalLen(value)
+    let out: str = newStringAlloc(digitCount)
+    var n: uint64 = value
+    var cursor: int32 = digitCount
+    if n == uint64(0):
+        stringWriteByte(out, 0, int32('0'))
+        return out
+    while n != uint64(0):
+        let q: uint64 = n / uint64(10)
+        let digit: uint64 = n - (q * uint64(10))
+        cursor = cursor - 1
+        stringWriteByte(out, cursor, int32('0') + int32(digit))
+        n = q
+    return out
+
+fn prependByte(text: str, value: int32): str =
+    let n: int32 = len(text)
+    let out: str = newStringAlloc(n + 1)
+    stringWriteByte(out, 0, value)
+    var i: int32
+    while i < n:
+        stringWriteByte(out, i + 1, int32(text[i]))
+        i = i + 1
+    return out
+
+fn int32NegativeToStr(i: int32): str =
+    if i < int32(-2147483647):
+        return "-2147483648"
+    return prependByte(int32PositiveToStr(int32(0) - i), int32('-'))
+
+fn positiveInt64ToStr(value: uint64): str =
+    return uint64ToStr(value)
 
 fn intToStr(i: int32): str =
     if i >= int32(0):
-        return uint64DigitsText(uint64(i))
-    let mag: uint64 = uint64(int64(0) - int64(i))
-    return "-" + uint64DigitsText(mag)
-
-fn uint64ToStr(x: uint64): str =
-    return uint64DigitsText(x)
+        return int32PositiveToStr(i)
+    return int32NegativeToStr(i)
 
 fn int64ToStr(i: int64): str =
     if i >= int64(0):
-        return uint64DigitsText(uint64(i))
+        return positiveInt64ToStr(uint64(i))
+    if i < int64(-9223372036854775807):
+        return "-9223372036854775808"
     let mag: uint64 = uint64(0) - uint64(i)
-    return "-" + uint64DigitsText(mag)
+    return prependByte(positiveInt64ToStr(mag), int32('-'))
 
 fn `$`(x: bool): str =
     return stdStringifyBoolImpl(x)

@@ -1,0 +1,283 @@
+import std/os
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+fn SeedOrphanPrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn SeedOrphanPrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn SeedOrphanTextContainsAny(text: str, needles: str[]): bool =
+    for i in 0..<needles.len:
+        if chengpath.TextContains(text, needles[i]):
+            return true
+    return false
+
+fn SeedOrphanTextEqualsAny(text: str, needles: str[]): bool =
+    for i in 0..<needles.len:
+        if text == needles[i]:
+            return true
+    return false
+
+fn SeedOrphanAsciiSpace(ch: char): bool =
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
+
+fn SeedOrphanSkipSpaces(line: str, cursorRaw: int32): int32 =
+    var cursor = cursorRaw
+    while cursor < len(line):
+        if !SeedOrphanAsciiSpace(line[cursor]):
+            break
+        cursor = cursor + 1
+    return cursor
+
+fn SeedOrphanNextField(line: str,
+                         cursorRaw: int32,
+                         fieldOut: var str,
+                         nextOut: var int32): bool =
+    var cursor = SeedOrphanSkipSpaces(line, cursorRaw)
+    if cursor >= len(line):
+        fieldOut = ""
+        nextOut = cursor
+        return false
+    let start = cursor
+    while cursor < len(line):
+        if SeedOrphanAsciiSpace(line[cursor]):
+            break
+        cursor = cursor + 1
+    fieldOut = strings.SliceBytes(line, start, cursor - start)
+    nextOut = cursor
+    return len(fieldOut) > 0
+
+fn SeedOrphanSnapshotKey(root: str,
+                           lineRaw: str): str =
+    let line = strutil.Strip(lineRaw)
+    if len(line) <= 0 || !chengpath.TextContains(line, root):
+        return ""
+    var cursor: int32
+    var pid = ""
+    var ppid = ""
+    var state = ""
+    var elapsed = ""
+    if !SeedOrphanNextField(line, cursor, pid, cursor):
+        return ""
+    if !SeedOrphanNextField(line, cursor, ppid, cursor):
+        return ""
+    if !SeedOrphanNextField(line, cursor, state, cursor):
+        return ""
+    if !SeedOrphanNextField(line, cursor, elapsed, cursor):
+        return ""
+    if ppid != "1":
+        return ""
+    if len(state) <= 0 || state[0] != 'U':
+        return ""
+    cursor = SeedOrphanSkipSpaces(line, cursor)
+    if cursor >= len(line):
+        return ""
+    let commandText = strings.SliceBytes(line, cursor, len(line) - cursor)
+    return pid + "|" + commandText
+
+fn SeedOrphanNormalizeSnapshot(root: str,
+                                 text: str): str[] =
+    var out: str[]
+    let lines = strutil.Split(text, '\n')
+    for i in 0..<lines.len:
+        let key = SeedOrphanSnapshotKey(root, lines[i])
+        if len(key) > 0:
+            add(out, key)
+    return out
+
+fn SeedOrphanFilterSnapshot(root: str,
+                              text: str): str =
+    var out = ""
+    let lines = strutil.Split(text, '\n')
+    for i in 0..<lines.len:
+        let line = lines[i]
+        let key = SeedOrphanSnapshotKey(root, line)
+        if len(key) > 0:
+            out = out + line + "\n"
+    return out
+
+fn SeedOrphanSeqContains(items: str[],
+                           value: str): bool =
+    for i in 0..<items.len:
+        if items[i] == value:
+            return true
+    return false
+
+fn SeedOrphanCollectNew(before: str[],
+                          after: str[]): str[] =
+    var out: str[]
+    for i in 0..<after.len:
+        let key = after[i]
+        if !SeedOrphanSeqContains(before, key) && !SeedOrphanSeqContains(out, key):
+            add(out, key)
+    return out
+
+fn SeedOrphanReadSnapshot(root: str,
+                            label: str,
+                            logPath: str,
+                            outLines: var str[]): int32 =
+    let run = hostops.RunProgramLogged(root,
+                                         label,
+                                         "ps",
+                                         ["-Ao", "pid=,ppid=,state=,etime=,command="],
+                                         [],
+                                         root,
+                                         10,
+                                         logPath)
+    if !hostops.LoggedRunOk(run):
+        SeedOrphanPrintErr(hostops.LoggedRunSummary(run))
+        outLines = []
+        return run.exitCode
+    let filtered = SeedOrphanFilterSnapshot(root, run.output)
+    if !chengpath.WriteTextFile(root, logPath, filtered):
+        SeedOrphanPrintErr("[cheng_seed] verify-orphan-guard snapshot failed log=" + chengpath.PathAbsolute(root, logPath))
+        outLines = []
+        return 1
+    outLines = SeedOrphanNormalizeSnapshot(root, filtered)
+    return 0
+
+fn SeedOrphanBannedEntries(): str[] =
+    return [
+        "guarded_exec.py",
+        "orphan_guard_run.sh",
+        "failfast_parallel.sh",
+        "bootstrap_bridge.sh",
+        "build_bft_state_machine.sh",
+        "build_backend_driver.sh",
+        "build_bounds_trace.sh",
+        "build_browser_host_wasm.sh",
+        "browser_host_wasm_runner.js",
+        "build_call_chain.sh",
+        "build_chain_node_linux_obj.sh",
+        "build_chain_node_linux.sh",
+        "build_chain_node.sh",
+        "build_ffi_handle.sh",
+        "build_linux_nolibc_exe.sh",
+        "build_panic_trace.sh",
+        "build_program_selfhost.sh",
+        "build_rwad_bft_state_machine_linux_obj.sh",
+        "build_rwad_bft_state_machine_linux.sh",
+        "build_rwad_bft_state_machine.sh",
+        "build_signal_trace.sh",
+        "build_twoway_search_smoke.sh",
+        "build_zero_exit.sh",
+        "cheng_tooling_repo_dispatch.sh",
+        "cheng.sh",
+        "compare_bench.sh",
+        "profile_run.sh",
+        "r2c_react_fresh_clean_gate.sh",
+        "run_slice_gate.sh",
+        "run_browser_host_wasm_smoke.sh",
+        "run_browser_webrtc_smokes.sh",
+        "run_chain_node_cli_smoke.sh",
+        "run_chain_node_process_smoke.sh",
+        "run_chain_node_three_node_smoke.sh",
+        "run_compile_exe.sh",
+        "run_fresh_node_selfhost_gate.sh",
+        "run_host_smokes.sh",
+        "run_linux_object_smokes.sh",
+        "run_migration_gate.sh",
+        "run_single_smoke.sh",
+        "run_stage23_libp2p_smokes.sh",
+        "run_tailnet_control_smoke.sh",
+        "run_tcp_twoproc_smoke.sh",
+        "run_quic_twoproc_smoke.sh",
+        "run_udp_importc_smoke.sh",
+        "run_wasm_smokes.sh",
+        "run_windows_riscv_builtin_smokes.sh",
+        "scan_forbidden_hotpath.sh",
+        "verify_debug_profile.sh",
+        "verify_debug_runtime.sh",
+        "verify_debug_tools.sh",
+        "verify_orphan_guard.sh",
+        "verify_riscv64_builtin_linker.sh",
+        "verify_windows_builtin_linker.sh"
+    ]
+
+fn SeedOrphanVerifyTooling(root: str): int32 =
+    let toolingDir = chengpath.PathAbsolute(root, "tools")
+    if !os.DirExists(toolingDir):
+        SeedOrphanPrintErr("[cheng_seed] verify-orphan-guard open failed: " + toolingDir)
+        return 1
+    let bannedEntries = SeedOrphanBannedEntries()
+    let entries = os.WalkDir(toolingDir)
+    for i in 0..<entries.len:
+        let entry = os.WalkDirEntry(entries, i)
+        let path = os.WalkDirEntryPath(entry)
+        let parts = os.SplitFile(path)
+        let fileName = parts.name + parts.ext
+        if SeedOrphanTextEqualsAny(fileName, bannedEntries):
+            SeedOrphanPrintErr("verify_orphan_guard: banned tooling entry name: " + path)
+            return 1
+        if parts.ext == ".sh":
+            SeedOrphanPrintErr("verify_orphan_guard: shell tooling entry not allowed: " + path)
+            return 1
+        if parts.ext != ".py":
+            continue
+        let kind = os.WalkDirEntryKind(entry)
+        if kind != os.PathComponent(0) && kind != os.PathComponent(2):
+            continue
+        let text = chengpath.ReadTextFile("", path)
+        if os.FileSize(path) > int64(0) && len(text) <= 0:
+            SeedOrphanPrintErr("[cheng_seed] verify-orphan-guard read failed: " + path)
+            return 1
+        if SeedOrphanTextContainsAny(text, bannedEntries):
+            SeedOrphanPrintErr("verify_orphan_guard: banned direct process guard ref in " + path)
+            return 1
+    return 0
+
+fn SeedOrphanRunStage3(root: str,
+                         label: str,
+                         args: str[],
+                         logPath: str): int32 =
+    let stage3 = chengpath.PathAbsolute(root, "artifacts/bootstrap/cheng.stage3")
+    if !chengpath.FileExistsNonEmpty(root, stage3):
+        SeedOrphanPrintErr("verify_orphan_guard: missing stage3: " + stage3)
+        return 1
+    let run = hostops.RunFileLogged(root, label, stage3, args, [], root, 0, logPath)
+    if !hostops.LoggedRunOk(run):
+        SeedOrphanPrintErr(hostops.LoggedRunSummary(run))
+        return run.exitCode
+    return 0
+
+fn SeedOrphanGuardRun(rootDir: str): int32 =
+    let root = strutil.Strip(rootDir)
+    if len(root) <= 0:
+        SeedOrphanPrintErr("verify_orphan_guard: missing root")
+        return 1
+    if SeedOrphanVerifyTooling(root) != 0:
+        return 1
+    var orphanBefore: str[]
+    if SeedOrphanReadSnapshot(root,
+                               "orphan_guard_before",
+                               "artifacts/gate/orphan_guard_before.log",
+                               orphanBefore) != 0:
+        return 1
+    if SeedOrphanRunStage3(root,
+                            "orphan_guard_bootstrap_bridge",
+                            ["bootstrap-bridge"],
+                            "artifacts/gate/orphan_guard_bootstrap_bridge.log") != 0:
+        return 1
+    if SeedOrphanRunStage3(root,
+                            "orphan_guard_build_backend_driver",
+                            ["build-backend-driver"],
+                            "artifacts/gate/orphan_guard_build_backend_driver.log") != 0:
+        return 1
+    var orphanAfter: str[]
+    if SeedOrphanReadSnapshot(root,
+                               "orphan_guard_after",
+                               "artifacts/gate/orphan_guard_after.log",
+                               orphanAfter) != 0:
+        return 1
+    let orphanDelta = SeedOrphanCollectNew(orphanBefore, orphanAfter)
+    if orphanDelta.len > 0:
+        SeedOrphanPrintErr("verify_orphan_guard: new Cheng U/UE process leaked after bootstrap/build")
+        for i in 0..<orphanDelta.len:
+            SeedOrphanPrintErr(orphanDelta[i])
+        return 1
+    SeedOrphanPrintLine("verify_orphan_guard ok")
+    return 0

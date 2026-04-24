@@ -2,7 +2,6 @@ import std/cmdline as cmdline
 import std/bytes as bytes
 import std/result
 import std/strings as strings
-import std/strformat
 import std/strutils as strutils
 import cheng/apps/wow_export/build_info as build_info
 import cheng/apps/wow_export/asset_export as asset_export
@@ -59,7 +58,8 @@ fn RunProbe(): int32 =
     if IsErr(encEntryRes):
         echo(Error(encEntryRes))
         return 1
-    echo(Fmt"encodingEntry={casc_index.CascIndexEntryText(Value(encEntryRes))}")
+    let encEntryText: str = casc_index.CascIndexEntryText(Value(encEntryRes))
+    echo(strings.ConcatStr("encodingEntry=", encEntryText))
     let encFullRes: Result[bytes.ByteBuffer] =
         casc_archive.CascArchiveDecodeLocalEntryFull(build_info.DefaultClientPath, Value(encEntryRes))
     if IsErr(encFullRes):
@@ -74,7 +74,7 @@ fn RunProbe(): int32 =
     if IsErr(rootKeyRes):
         echo(Error(rootKeyRes))
         return 1
-    echo(Fmt"rootEncodingKey={Value(rootKeyRes)}")
+    echo(strings.ConcatStr("rootEncodingKey=", Value(rootKeyRes)))
     let rootEntryRes: Result[casc_index.CascIndexEntry] =
         casc_index.LoadLocalIndexEntry(build_info.DefaultClientPath, Value(rootKeyRes))
     if IsErr(rootEntryRes):
@@ -93,7 +93,14 @@ fn RunProbe(): int32 =
     if IsErr(rootFirstRes):
         echo(Error(rootFirstRes))
         return 1
-    echo(Fmt"rootVersion={strings.IntToStr(Value(rootHeaderRes).version)} totalFiles={strings.IntToStr(Value(rootHeaderRes).totalFiles)} firstFileDataID={strings.IntToStr(Value(rootFirstRes).fileDataID)} firstCKey={Value(rootFirstRes).contentKey}")
+    let rootVersionText: str = strings.IntToStr(Value(rootHeaderRes).version)
+    let rootTotalFilesText: str = strings.IntToStr(Value(rootHeaderRes).totalFiles)
+    let rootFirstFileDataIDText: str = strings.IntToStr(Value(rootFirstRes).fileDataID)
+    var rootLine: str = strings.ConcatStr("rootVersion=", rootVersionText)
+    rootLine = strings.ConcatStr(rootLine, strings.ConcatStr(" totalFiles=", rootTotalFilesText))
+    rootLine = strings.ConcatStr(rootLine, strings.ConcatStr(" firstFileDataID=", rootFirstFileDataIDText))
+    rootLine = strings.ConcatStr(rootLine, strings.ConcatStr(" firstCKey=", Value(rootFirstRes).contentKey))
+    echo(rootLine)
     let installEntryRes: Result[casc_index.CascIndexEntry] =
         casc_index.LoadLocalIndexEntry(build_info.DefaultClientPath, cfg.installEncodingKey)
     if IsErr(installEntryRes):
@@ -117,13 +124,35 @@ fn RunProbe(): int32 =
     return 0
 
 fn RunPreviewNorthshire(): int32 =
-    let frames: int32 = cmdline.ReadInt32FlagOrDefault("--frames", 120)
-    let summaryRes: Result[preview.PreviewSummary] = preview.PreviewNorthshire(frames)
-    if IsErr(summaryRes):
-        echo(Error(summaryRes))
+    let frames: int32 = cmdline.ReadInt32FlagOrDefault("--frames", 1)
+    let previewRes: Result[preview.PreviewSummary] = preview.PreviewNorthshire(frames)
+    if IsErr(previewRes):
+        echo(Error(previewRes))
         return 1
-    echo(preview.PreviewSummaryText(Value(summaryRes)))
+    echo(preview.PreviewSummaryText(Value(previewRes)))
     return 0
+
+fn ReadOwnedFlagValue(key: str, outValue: var str): bool =
+    outValue = ""
+    let count: int32 = cmdline.ParamCount()
+    let eqPrefix: str = strings.ConcatStr(key, "=")
+    let colonPrefix: str = strings.ConcatStr(key, ":")
+    var i: int32 = 1
+    while i <= count:
+        let arg: str = cmdline.ParamStr(i)
+        if arg == key:
+            if i < count:
+                outValue = cmdline.ParamStr(i + 1)
+                return true
+            return false
+        if strings.HasPrefix(arg, eqPrefix):
+            outValue = strings.SliceBytes(arg, strings.Len(eqPrefix), strings.Len(arg) - strings.Len(eqPrefix))
+            return true
+        if strings.HasPrefix(arg, colonPrefix):
+            outValue = strings.SliceBytes(arg, strings.Len(colonPrefix), strings.Len(arg) - strings.Len(colonPrefix))
+            return true
+        i = i + 1
+    return false
 
 fn RunManifest(): int32 =
     echo(northshire.ManifestText(northshire.Manifest()))
@@ -138,7 +167,7 @@ fn RunAuditFile(): int32 =
             let raw: str = cmdline.ParamStr(i)
             let fileDataID: int32 = int32(strutils.ParseInt(raw))
             if fileDataID < 0:
-                echo(Fmt"wowExport audit-file: invalid fileDataID {raw}")
+                echo(strings.ConcatStr("wowExport audit-file: invalid fileDataID ", raw))
                 return 1
             add(wanted, fileDataID)
             i = i + 1
@@ -221,7 +250,7 @@ fn RunExtractFile(): int32 =
 fn RunExportKind(kind: str): int32 =
     let outPath: str = cmdline.ReadFlagOrDefault("--out", "")
     if strings.Len(outPath) == 0:
-        echo(Fmt"wowExport export-{kind}: missing --out")
+        echo(strings.ConcatStr(strings.ConcatStr("wowExport export-", kind), ": missing --out"))
         return 1
     let exportRes: Result[asset_export.AssetExportSummary] =
         asset_export.ExportNorthshireKind(northshire.Manifest(), kind, outPath)
@@ -232,7 +261,10 @@ fn RunExportKind(kind: str): int32 =
     return 0
 
 fn RunExportMap(): int32 =
-    let outDir: str = cmdline.ReadFlagOrDefault("--out-dir", "")
+    var outDir: str
+    let outDirFound: bool = ReadOwnedFlagValue("--out-dir", outDir)
+    if outDirFound:
+        outDir = strings.ConcatStr(outDir, "/.")
     if strings.Len(outDir) == 0:
         echo("wowExport export-map: missing --out-dir")
         return 1
@@ -245,7 +277,10 @@ fn RunExportMap(): int32 =
     return 0
 
 fn RunExportDependencies(): int32 =
-    let outDir: str = cmdline.ReadFlagOrDefault("--out-dir", "")
+    var outDir: str
+    let outDirFound: bool = ReadOwnedFlagValue("--out-dir", outDir)
+    if outDirFound:
+        outDir = strings.ConcatStr(outDir, "/.")
     if strings.Len(outDir) == 0:
         echo("wowExport export-dependencies: missing --out-dir")
         return 1
@@ -266,7 +301,7 @@ fn RunConvertBlp(): int32 =
     if cmdline.ReadFirstFlagValue("--in", inPath):
         let blpBuf: bytes.ByteBuffer = bytes.ReadFileBytes(inPath)
         if blpBuf.len <= 0:
-            echo(Fmt"wowExport convert-blp: input read failed {inPath}")
+            echo(strings.ConcatStr("wowExport convert-blp: input read failed ", inPath))
             return 1
         let tgaRes: Result[bytes.ByteBuffer] = blp.Blp2DecodeFirstMipTga(blpBuf)
         bytes.FreeByteBuffer(blpBuf)
@@ -279,7 +314,8 @@ fn RunConvertBlp(): int32 =
         if IsErr(writeRes):
             echo(Error(writeRes))
             return 1
-        echo(Fmt"converted blp bytes={strings.IntToStr(Value(writeRes))} out={outPath}")
+        let convertedBytesText: str = strings.IntToStr(Value(writeRes))
+        echo(strings.ConcatStr(strings.ConcatStr("converted blp bytes=", convertedBytesText), strings.ConcatStr(" out=", outPath)))
         return 0
     let manifest: northshire.NorthshireManifest = northshire.Manifest()
     var label: str
@@ -324,7 +360,7 @@ fn RunRenderNorthshire(): int32 =
     return 0
 
 fn RunNotImplemented(cmd: str): int32 =
-    echo(Fmt"wowExport {cmd}: blocked until real BLP pixel decoding and target encoding are implemented; no fake conversion")
+    echo(strings.ConcatStr(strings.ConcatStr("wowExport ", cmd), ": blocked until real BLP pixel decoding and target encoding are implemented; no fake conversion"))
     return 1
 
 fn main(argc: int32, argv: ptr): int32 =
@@ -360,6 +396,6 @@ fn main(argc: int32, argv: ptr): int32 =
         return RunConvertBlp()
     if cmd == "render-northshire":
         return RunRenderNorthshire()
-    echo(Fmt"wowExport: unknown command {cmd}")
+    echo(strings.ConcatStr("wowExport: unknown command ", cmd))
     PrintUsage()
     return 1

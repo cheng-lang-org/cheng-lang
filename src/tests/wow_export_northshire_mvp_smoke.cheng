@@ -1,28 +1,33 @@
-import std/bytes as bytes
+import std/os
 import std/result
-import std/strformat
 import std/strings as strings
-import std/system
-import cheng/apps/wow_export/asset_formats as asset_formats
 import cheng/apps/wow_export/build_info as build_info
-import cheng/apps/wow_export/local_files as local_files
 import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
 import cheng/apps/wow_export/preview as preview
+import cheng/apps/wow_export/render as render
 
-fn main(): int32 =
-    let buildRes: Result[build_info.WowBuildEntry] = build_info.ProbeRetailDefault()
-    assert(IsOk(buildRes), Error(buildRes))
+fn removeIfExists(path: str) =
+    if os.FileExists(path):
+        let _ = os.RemoveFile(path)
 
-    let manifest: northshire.NorthshireManifest = northshire.Manifest()
+fn assertManifest(manifest: northshire.NorthshireManifest) =
     assert(manifest.product == "wow", "wow_export_northshire_mvp_smoke product")
     assert(manifest.version == "12.0.5.67165", "wow_export_northshire_mvp_smoke version")
-    assert(manifest.buildKey == "02482dc9c788698c83e7ae0e24ab2bb7", "wow_export_northshire_mvp_smoke build key")
-    assert(manifest.auditedFileCount == 22, "wow_export_northshire_mvp_smoke audited file count")
-    assert(manifest.auditedDependencyCount == 45, "wow_export_northshire_mvp_smoke dependency count")
-    assert(northshire.ManifestReady(manifest), "wow_export_northshire_mvp_smoke manifest ready")
-    let auditRes: Result[northshire.NorthshireAuditSummary] = northshire.AuditManifestPayloadsAgainstLocal(manifest)
-    assert(IsOk(auditRes), Error(auditRes))
-    assert(Value(auditRes).matchedFileCount == 22, "wow_export_northshire_mvp_smoke matched file count")
+    assert(manifest.buildKey == "02482dc9c788698c83e7ae0e24ab2bb7",
+           "wow_export_northshire_mvp_smoke build key")
+    assert(manifest.auditedFileCount == 22,
+           "wow_export_northshire_mvp_smoke audited file count")
+    assert(manifest.auditedDependencyCount == 45,
+           "wow_export_northshire_mvp_smoke dependency count")
+    assert(northshire.ManifestReady(manifest),
+           "wow_export_northshire_mvp_smoke manifest ready")
+
+fn assertManifestAudits(manifest: northshire.NorthshireManifest) =
+    let fileAuditRes: Result[northshire.NorthshireAuditSummary] =
+        northshire.AuditManifestPayloadsAgainstLocal(manifest)
+    assert(IsOk(fileAuditRes), Error(fileAuditRes))
+    assert(Value(fileAuditRes).matchedFileCount == 22,
+           "wow_export_northshire_mvp_smoke matched file count")
     let depAuditRes: Result[northshire.NorthshireAuditSummary] =
         northshire.AuditManifestDependenciesAgainstLocal(manifest)
     assert(IsOk(depAuditRes), Error(depAuditRes))
@@ -32,248 +37,178 @@ fn main(): int32 =
            "wow_export_northshire_mvp_smoke wmo modi dependency count")
     assert(northshire.CountDependenciesForSource(manifest, "azeroth-wdt", "wdt_maid_split") == 28,
            "wow_export_northshire_mvp_smoke wdt maid split dependency count")
-    assert(northshire.HasDependencyFileDataID(manifest, "northshire-abbey-wmo", "wmo_modi", 198056),
-           "wow_export_northshire_mvp_smoke wmo first modi dependency")
-    assert(northshire.HasDependencyFileDataID(manifest, "azeroth-wdt", "wdt_maid_split", 777828),
-           "wow_export_northshire_mvp_smoke wdt first split dependency")
-    assert(northshire.HasDependencyFileDataID(manifest, "azeroth-wdt", "wdt_maid_split", 204494),
-           "wow_export_northshire_mvp_smoke wdt last split dependency")
-    var m2HeaderCount: int32
-    var adtSplitHeaderCount: int32
-    var blpResourceHeaderCount: int32
-    var depIndex: int32
-    while depIndex < manifest.auditedDependencies.len:
-        let dep: northshire.NorthshireAuditedDependency = manifest.auditedDependencies[depIndex]
-        let depFileRes: Result[bytes.ByteBuffer] =
-            local_files.ReadLocalFileByEntry(manifest.clientPath, dep.archiveIndex, dep.offset, dep.size)
-        assert(IsOk(depFileRes), Error(depFileRes))
-        let depBuf: bytes.ByteBuffer = Value(depFileRes)
-        if dep.relationKind == "wmo_modi":
-            let depHeaderRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(depBuf)
-            assert(IsOk(depHeaderRes), Error(depHeaderRes))
-            assert(Value(depHeaderRes).version > 0, "wow_export_northshire_mvp_smoke dependency m2 header")
-            m2HeaderCount = m2HeaderCount + 1
-        elif dep.relationKind == "wdt_maid_split":
-            let resourceRes: Result[asset_formats.WdtMaidResourceSummary] =
-                asset_formats.ParseWdtMaidResourceSummary(depBuf)
-            assert(IsOk(resourceRes), Error(resourceRes))
-            assert(Value(resourceRes).formatKind == dep.formatKind,
-                   "wow_export_northshire_mvp_smoke dependency maid format")
-            if dep.formatKind == "adt_split":
-                assert(Value(resourceRes).firstMagic == "REVM",
-                       "wow_export_northshire_mvp_smoke dependency adt split header")
-                assert(Value(resourceRes).secondMagic != "",
-                       "wow_export_northshire_mvp_smoke dependency adt split second chunk")
-                adtSplitHeaderCount = adtSplitHeaderCount + 1
-            elif dep.formatKind == "blp":
-                assert(Value(resourceRes).firstMagic == "BLP2",
-                       "wow_export_northshire_mvp_smoke dependency blp header")
-                blpResourceHeaderCount = blpResourceHeaderCount + 1
-            else:
-                assert(false, "wow_export_northshire_mvp_smoke unsupported maid format")
-        else:
-            assert(false, "wow_export_northshire_mvp_smoke unsupported dependency relation")
-        bytes.FreeByteBuffer(depBuf)
-        depIndex = depIndex + 1
-    echo("wow_export_northshire_mvp_smoke dependency_m2_headers=17")
-    echo(Fmt"wow_export_northshire_mvp_smoke dependency_adt_split_headers={strings.IntToStr(adtSplitHeaderCount)}")
-    echo(Fmt"wow_export_northshire_mvp_smoke dependency_blp_headers={strings.IntToStr(blpResourceHeaderCount)}")
-    assert(m2HeaderCount == 17, "wow_export_northshire_mvp_smoke m2 dependency headers")
-    assert(adtSplitHeaderCount == 16, "wow_export_northshire_mvp_smoke adt split dependency headers")
-    assert(blpResourceHeaderCount == 12, "wow_export_northshire_mvp_smoke blp dependency headers")
 
-    let summaryRes: Result[preview.PreviewSummary] = preview.PreviewNorthshire(120)
-    assert(IsOk(summaryRes), Error(summaryRes))
-    let summary: preview.PreviewSummary = Value(summaryRes)
-    var summaryLine: str = Fmt"wow_export_northshire_mvp_smoke scene={summary.sceneNonEmpty ? \"true\" : \"false\"}"
-    summaryLine = summaryLine + Fmt" span={strings.IntToStr(summary.modelSpanX1000)}"
-    summaryLine = summaryLine + Fmt",{strings.IntToStr(summary.modelSpanY1000)}"
-    summaryLine = summaryLine + Fmt",{strings.IntToStr(summary.modelSpanZ1000)}"
-    summaryLine = summaryLine + Fmt" bounds={summary.modelBoundsReady ? \"true\" : \"false\"}"
-    summaryLine = summaryLine + Fmt" texture={strings.IntToStr(summary.textureWidth)}"
-    summaryLine = summaryLine + Fmt"x{strings.IntToStr(summary.textureHeight)}"
-    summaryLine = summaryLine + Fmt" textureTgaBytes={strings.IntToStr(summary.textureTgaBytes)}"
-    summaryLine = summaryLine + Fmt" wdtTiles={strings.IntToStr(summary.wdtActiveTileCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidFileIDs={strings.IntToStr(summary.wdtMaidFileDataIDCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidSplitDependencies={strings.IntToStr(summary.wdtMaidSplitDependencyCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidParsedDependencies={strings.IntToStr(summary.wdtMaidParsedDependencyCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidAdtSplits={strings.IntToStr(summary.wdtMaidAdtSplitResourceCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidBlps={strings.IntToStr(summary.wdtMaidBlpResourceCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidAdtSplitChunks={strings.IntToStr(summary.wdtMaidAdtSplitChunkCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidDoodads={strings.IntToStr(summary.wdtMaidDoodadPlacementCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidDoodadFileIDs={strings.IntToStr(summary.wdtMaidDoodadReferencedFileDataIDCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidFirstDoodadFileID={strings.IntToStr(summary.wdtMaidFirstDoodadReferencedFileDataID)}"
-    summaryLine = summaryLine + Fmt" wdtMaidDoodadPlacementDependencies={strings.IntToStr(summary.wdtMaidDoodadPlacementDependencyCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidDoodadSpan={strings.IntToStr(summary.wdtMaidDoodadPlacementMaxX1000 - summary.wdtMaidDoodadPlacementMinX1000)}"
-    summaryLine = summaryLine + Fmt",{strings.IntToStr(summary.wdtMaidDoodadPlacementMaxY1000 - summary.wdtMaidDoodadPlacementMinY1000)}"
-    summaryLine = summaryLine + Fmt",{strings.IntToStr(summary.wdtMaidDoodadPlacementMaxZ1000 - summary.wdtMaidDoodadPlacementMinZ1000)}"
-    summaryLine = summaryLine + Fmt" wdtMaidDoodadScale={strings.IntToStr(summary.wdtMaidDoodadMinScale)}"
-    summaryLine = summaryLine + Fmt",{strings.IntToStr(summary.wdtMaidDoodadMaxScale)}"
-    summaryLine = summaryLine + Fmt" wdtMaidWorldModels={strings.IntToStr(summary.wdtMaidWorldModelPlacementCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidWorldModelFileIDs={strings.IntToStr(summary.wdtMaidWorldModelReferencedFileDataIDCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidFirstWorldModelFileID={strings.IntToStr(summary.wdtMaidFirstWorldModelReferencedFileDataID)}"
-    summaryLine = summaryLine + Fmt" wdtMaidWorldModelPlacementDependencies={strings.IntToStr(summary.wdtMaidWorldModelPlacementDependencyCount)}"
-    summaryLine = summaryLine + Fmt" wdtMaidPlacementDependencyAudit={summary.wdtMaidPlacementDependencyAuditReady ? \"ready\" : \"missing\"}"
-    summaryLine = summaryLine + Fmt" wdtMaidPlacementDependencyEncodedBytes={strings.IntToStr(summary.wdtMaidPlacementDependencyEncodedBytes)}"
-    summaryLine = summaryLine + Fmt" wdtMaidWorldModelSpan={strings.IntToStr(summary.wdtMaidWorldModelPlacementMaxX1000 - summary.wdtMaidWorldModelPlacementMinX1000)}"
-    summaryLine = summaryLine + Fmt",{strings.IntToStr(summary.wdtMaidWorldModelPlacementMaxY1000 - summary.wdtMaidWorldModelPlacementMinY1000)}"
-    summaryLine = summaryLine + Fmt",{strings.IntToStr(summary.wdtMaidWorldModelPlacementMaxZ1000 - summary.wdtMaidWorldModelPlacementMinZ1000)}"
-    summaryLine = summaryLine + Fmt" wdtMaidWorldModelScale={strings.IntToStr(summary.wdtMaidWorldModelMinScale)}"
-    summaryLine = summaryLine + Fmt",{strings.IntToStr(summary.wdtMaidWorldModelMaxScale)}"
-    summaryLine = summaryLine + Fmt" wdtMaidDependencyBytes={strings.IntToStr(summary.wdtMaidDependencyBytes)}"
-    summaryLine = summaryLine + Fmt" adtTiles={strings.IntToStr(summary.adtTileCount)}"
-    summaryLine = summaryLine + Fmt" adtChunks={strings.IntToStr(summary.adtChunkCount)}"
-    summaryLine = summaryLine + Fmt" adtHeightSamples={strings.IntToStr(summary.adtHeightSampleCount)}"
-    summaryLine = summaryLine + Fmt" wmoGroups={strings.IntToStr(summary.wmoGroupCount)}"
-    summaryLine = summaryLine + Fmt" wmoDoodadPlacements={strings.IntToStr(summary.wmoDoodadPlacementCount)}"
-    summaryLine = summaryLine + Fmt" wmoGroupFileIDs={strings.IntToStr(summary.wmoGroupFileDataIDCount)}"
-    summaryLine = summaryLine + Fmt" wmoGroupAssets={strings.IntToStr(summary.wmoGroupAssetCount)}"
-    summaryLine = summaryLine + Fmt" wmoGroupVertices={strings.IntToStr(summary.wmoGroupVertexCount)}"
-    summaryLine = summaryLine + Fmt" wmoGroupIndices={strings.IntToStr(summary.wmoGroupIndexCount)}"
-    summaryLine = summaryLine + Fmt" wmoModelSlots={strings.IntToStr(summary.wmoModelSlotCount)}"
-    summaryLine = summaryLine + Fmt" wmoModelDependencies={strings.IntToStr(summary.wmoModelDependencyCount)}"
-    summaryLine = summaryLine + Fmt" wmoDoodadModelPlacements={strings.IntToStr(summary.wmoDoodadModelPlacementCount)}"
-    summaryLine = summaryLine + Fmt" wmoDoodadReferencedModels={strings.IntToStr(summary.wmoDoodadReferencedModelFileDataIDCount)}"
-    summaryLine = summaryLine + Fmt" m2SkinIndices={strings.IntToStr(summary.m2SkinIndexCount)}"
-    summaryLine = summaryLine + Fmt" m2SkinTriangleIndices={strings.IntToStr(summary.m2SkinTriangleIndexCount)}"
-    summaryLine = summaryLine + Fmt" wmoChunks={strings.IntToStr(summary.wmoChunkCount)}"
-    echo(summaryLine)
-    assert(summary.sceneNonEmpty, "wow_export_northshire_mvp_smoke scene ready")
-    assert(summary.auditedFileCount == 22, "wow_export_northshire_mvp_smoke summary audited count")
-    assert(summary.auditedDependencyCount == 45, "wow_export_northshire_mvp_smoke summary dependency count")
-    assert(summary.loadedFileCount == 22, "wow_export_northshire_mvp_smoke summary loaded count")
-    assert(summary.chunkFileCount == 6, "wow_export_northshire_mvp_smoke chunk file count")
-    assert(summary.totalChunkCount > 0, "wow_export_northshire_mvp_smoke total chunk count")
-    assert(summary.wdtActiveTileCount > 0, "wow_export_northshire_mvp_smoke wdt active tiles")
-    assert(summary.wdtMaidFileDataIDCount > 0, "wow_export_northshire_mvp_smoke wdt maid ids")
-    assert(summary.wdtFirstMaidFileDataID == 6173014, "wow_export_northshire_mvp_smoke wdt first maid")
-    assert(summary.wdtMaidSplitDependencyCount == 28,
-           "wow_export_northshire_mvp_smoke wdt maid split dependencies")
-    assert(summary.wdtMaidSplitDependenciesReady,
-           "wow_export_northshire_mvp_smoke wdt maid split dependency ready")
+fn assertRenderSummary(summary: render.RenderSummary) =
+    assert(summary.bytesWritten == 18 + 320 * 180 * 4,
+           "wow_export_northshire_mvp_smoke tga bytes")
+    assert(summary.adtHeightSampleCount == 148480,
+           "wow_export_northshire_mvp_smoke adt height samples")
+    assert(summary.wmoVertexCount == 29304,
+           "wow_export_northshire_mvp_smoke wmo vertices")
+    assert(summary.wmoDoodadModelPlacementCount == 144,
+           "wow_export_northshire_mvp_smoke wmo doodad model placements")
+    assert(summary.wmoRootWorldPlacementCount == 1,
+           "wow_export_northshire_mvp_smoke wmo root world placements")
+    assert(summary.wmoDoodadWorldPlacementCount == 144,
+           "wow_export_northshire_mvp_smoke wmo doodad world placements")
+    assert(summary.wmoDoodadWorldBoundsReady,
+           "wow_export_northshire_mvp_smoke wmo doodad world bounds")
+    assert(summary.wmoDoodadModelWorldInstanceVertexCount == 31665,
+           "wow_export_northshire_mvp_smoke wmo doodad model world instance vertices")
+    assert(summary.wmoMaterialCount == 30,
+           "wow_export_northshire_mvp_smoke wmo materials")
+    assert(summary.wmoLightCount == 0,
+           "wow_export_northshire_mvp_smoke wmo lights")
+    assert(summary.wmoGroupBatchCount == 136,
+           "wow_export_northshire_mvp_smoke wmo group batches")
+    assert(summary.wmoGroupMaterialInfoCount == 30563,
+           "wow_export_northshire_mvp_smoke wmo group material info")
+    assert(summary.wmoMaterialLightPassReady,
+           "wow_export_northshire_mvp_smoke wmo material light pass")
+    assert(summary.textureFileCount == 1,
+           "wow_export_northshire_mvp_smoke texture files")
+    assert(summary.textureMaxWidth == 256 && summary.textureMaxHeight == 256,
+           "wow_export_northshire_mvp_smoke texture max size")
+    assert(summary.textureDecodedTgaBytes == 262162,
+           "wow_export_northshire_mvp_smoke texture tga bytes")
+    assert(summary.texturePassReady,
+           "wow_export_northshire_mvp_smoke texture pass")
     assert(summary.wdtMaidParsedDependencyCount == 28,
            "wow_export_northshire_mvp_smoke wdt maid parsed dependencies")
     assert(summary.wdtMaidAdtSplitResourceCount == 16,
            "wow_export_northshire_mvp_smoke wdt maid adt split resources")
     assert(summary.wdtMaidBlpResourceCount == 12,
            "wow_export_northshire_mvp_smoke wdt maid blp resources")
-    assert(summary.wdtMaidAdtSplitChunkCount == 2164,
-           "wow_export_northshire_mvp_smoke wdt maid split chunks")
-    assert(summary.wdtMaidAdtSplitMapChunkCount == 2048,
-           "wow_export_northshire_mvp_smoke wdt maid split mcnk chunks")
     assert(summary.wdtMaidDoodadPlacementCount == 4345,
            "wow_export_northshire_mvp_smoke wdt maid doodad placements")
     assert(summary.wdtMaidDoodadReferencedFileDataIDCount == 222,
            "wow_export_northshire_mvp_smoke wdt maid doodad fileDataIDs")
-    assert(summary.wdtMaidFirstDoodadReferencedFileDataID == 189929,
-           "wow_export_northshire_mvp_smoke wdt maid first doodad fileDataID")
     assert(summary.wdtMaidDoodadPlacementDependencyCount == 222,
            "wow_export_northshire_mvp_smoke wdt maid doodad placement dependencies")
-    assert(summary.wdtMaidDoodadPlacementBoundsReady,
-           "wow_export_northshire_mvp_smoke wdt maid doodad placement bounds")
-    assert(summary.wdtMaidDoodadPlacementMaxX1000 - summary.wdtMaidDoodadPlacementMinX1000 == 1125287,
-           "wow_export_northshire_mvp_smoke wdt maid doodad placement span x")
-    assert(summary.wdtMaidDoodadPlacementMaxY1000 - summary.wdtMaidDoodadPlacementMinY1000 == 221256,
-           "wow_export_northshire_mvp_smoke wdt maid doodad placement span y")
-    assert(summary.wdtMaidDoodadPlacementMaxZ1000 - summary.wdtMaidDoodadPlacementMinZ1000 == 1145929,
-           "wow_export_northshire_mvp_smoke wdt maid doodad placement span z")
-    assert(summary.wdtMaidDoodadMinScale == 133 && summary.wdtMaidDoodadMaxScale == 3389,
-           "wow_export_northshire_mvp_smoke wdt maid doodad placement scale")
+    assert(summary.wdtMaidDoodadM2AssetCount == 222,
+           "wow_export_northshire_mvp_smoke wdt maid doodad m2 assets")
+    assert(summary.wdtMaidDoodadM2RenderableAssetCount == 218,
+           "wow_export_northshire_mvp_smoke wdt maid doodad renderable m2 assets")
+    assert(summary.wdtMaidDoodadM2ZeroVertexAssetCount == 4,
+           "wow_export_northshire_mvp_smoke wdt maid doodad zero vertex m2 assets")
+    assert(summary.wdtMaidDoodadM2InstancePlacementCount == 4345,
+           "wow_export_northshire_mvp_smoke wdt maid doodad m2 instance placements")
+    assert(summary.wdtMaidDoodadM2InstanceVertexCount == 558543,
+           "wow_export_northshire_mvp_smoke wdt maid doodad m2 instance vertices")
+    assert(summary.wdtMaidDoodadM2InstanceBoundsReady,
+           "wow_export_northshire_mvp_smoke wdt maid doodad m2 instance bounds")
     assert(summary.wdtMaidWorldModelPlacementCount == 32,
            "wow_export_northshire_mvp_smoke wdt maid world model placements")
     assert(summary.wdtMaidWorldModelReferencedFileDataIDCount == 18,
            "wow_export_northshire_mvp_smoke wdt maid world model fileDataIDs")
-    assert(summary.wdtMaidFirstWorldModelReferencedFileDataID == 108104,
-           "wow_export_northshire_mvp_smoke wdt maid first world model fileDataID")
     assert(summary.wdtMaidWorldModelPlacementDependencyCount == 18,
            "wow_export_northshire_mvp_smoke wdt maid world model placement dependencies")
+    assert(summary.wdtMaidWorldModelWmoAssetCount == 18,
+           "wow_export_northshire_mvp_smoke wdt maid world model wmo assets")
+    assert(summary.wdtMaidWorldModelGroupReferenceCount == 287,
+           "wow_export_northshire_mvp_smoke wdt maid world model group references")
+    assert(summary.wdtMaidWorldModelGroupAssetCount == 287,
+           "wow_export_northshire_mvp_smoke wdt maid world model group assets")
+    assert(summary.wdtMaidWorldModelMaterialCount == 670,
+           "wow_export_northshire_mvp_smoke wdt maid world model materials")
+    assert(summary.wdtMaidWorldModelLightCount == 19,
+           "wow_export_northshire_mvp_smoke wdt maid world model lights")
+    assert(summary.wdtMaidWorldModelGroupBatchCount == 2531,
+           "wow_export_northshire_mvp_smoke wdt maid world model group batches")
+    assert(summary.wdtMaidWorldModelGroupMaterialInfoCount == 522540,
+           "wow_export_northshire_mvp_smoke wdt maid world model group material info")
+    assert(summary.wdtMaidWorldModelMaterialPassReady,
+           "wow_export_northshire_mvp_smoke wdt maid world model material pass")
+    assert(summary.wdtMaidWorldModelInstancePlacementCount == 32,
+           "wow_export_northshire_mvp_smoke wdt maid world model instance placements")
+    assert(summary.wdtMaidWorldModelInstanceVertexCount == 709092,
+           "wow_export_northshire_mvp_smoke wdt maid world model instance vertices")
+    assert(summary.wdtMaidWorldModelInstanceBoundsReady,
+           "wow_export_northshire_mvp_smoke wdt maid world model instance bounds")
     assert(summary.wdtMaidPlacementDependencyAuditReady,
            "wow_export_northshire_mvp_smoke wdt maid placement dependency audit")
     assert(summary.wdtMaidPlacementDependencyEncodedBytes == 1299207,
            "wow_export_northshire_mvp_smoke wdt maid placement dependency encoded bytes")
-    assert(summary.wdtMaidWorldModelPlacementBoundsReady,
-           "wow_export_northshire_mvp_smoke wdt maid world model placement bounds")
-    assert(summary.wdtMaidWorldModelPlacementMaxX1000 - summary.wdtMaidWorldModelPlacementMinX1000 == 1133681,
-           "wow_export_northshire_mvp_smoke wdt maid world model placement span x")
-    assert(summary.wdtMaidWorldModelPlacementMaxY1000 - summary.wdtMaidWorldModelPlacementMinY1000 == 61759,
-           "wow_export_northshire_mvp_smoke wdt maid world model placement span y")
-    assert(summary.wdtMaidWorldModelPlacementMaxZ1000 - summary.wdtMaidWorldModelPlacementMinZ1000 == 899866,
-           "wow_export_northshire_mvp_smoke wdt maid world model placement span z")
-    assert(summary.wdtMaidWorldModelMinScale == 1024 && summary.wdtMaidWorldModelMaxScale == 1024,
-           "wow_export_northshire_mvp_smoke wdt maid world model placement scale")
-    assert(summary.wdtMaidDependencyBytes == 8023142,
-           "wow_export_northshire_mvp_smoke wdt maid dependency bytes")
-    assert(summary.adtTileCount == 4, "wow_export_northshire_mvp_smoke adt tiles")
-    assert(summary.adtChunkCount == 1024, "wow_export_northshire_mvp_smoke adt chunks")
-    assert(summary.adtHeightChunkCount == 1024, "wow_export_northshire_mvp_smoke adt height chunks")
-    assert(summary.adtHeightSampleCount == 148480, "wow_export_northshire_mvp_smoke adt height samples")
-    assert(summary.adtMaxHeight1000 > summary.adtMinHeight1000,
-           "wow_export_northshire_mvp_smoke adt height span")
-    assert(summary.wmoGroupCount > 0, "wow_export_northshire_mvp_smoke wmo groups")
-    assert(summary.wmoMaterialCount > 0, "wow_export_northshire_mvp_smoke wmo materials")
-    assert(summary.wmoDoodadCount > 0, "wow_export_northshire_mvp_smoke wmo doodads")
-    assert(summary.wmoDoodadSetDefinitionCount == 2,
-           "wow_export_northshire_mvp_smoke wmo doodad set defs")
-    assert(summary.wmoDoodadPlacementCount == 144,
-           "wow_export_northshire_mvp_smoke wmo doodad placements")
-    assert(summary.wmoDoodadSetPlacementCount == 144,
-           "wow_export_northshire_mvp_smoke wmo doodad set placements")
-    assert(summary.wmoFirstDoodadNameIndex == 0,
-           "wow_export_northshire_mvp_smoke wmo first doodad")
-    assert(summary.wmoDoodadBoundsReady,
-           "wow_export_northshire_mvp_smoke wmo doodad bounds")
-    assert(summary.wmoDoodadSpanX1000 > 0,
-           "wow_export_northshire_mvp_smoke wmo doodad span x")
-    assert(summary.wmoDoodadSpanY1000 > 0,
-           "wow_export_northshire_mvp_smoke wmo doodad span y")
-    assert(summary.wmoDoodadSpanZ1000 > 0,
-           "wow_export_northshire_mvp_smoke wmo doodad span z")
-    assert(summary.wmoGroupFileDataIDCount == 13, "wow_export_northshire_mvp_smoke wmo group ids")
-    assert(summary.wmoFirstGroupFileDataID == 107075, "wow_export_northshire_mvp_smoke wmo first group id")
-    assert(summary.wmoGroupAssetCount == 13, "wow_export_northshire_mvp_smoke wmo group assets")
-    assert(summary.wmoGroupVertexCount == 29304, "wow_export_northshire_mvp_smoke wmo group vertices")
-    assert(summary.wmoGroupIndexCount == 91689, "wow_export_northshire_mvp_smoke wmo group indices")
-    assert(summary.wmoModelFileDataIDCount > 0, "wow_export_northshire_mvp_smoke wmo model ids")
-    assert(summary.wmoModelSlotCount == 30, "wow_export_northshire_mvp_smoke wmo model slot count")
-    assert(summary.wmoModelFileDataIDCount == 17, "wow_export_northshire_mvp_smoke wmo model id count")
-    assert(summary.wmoModelDependencyCount == 17, "wow_export_northshire_mvp_smoke wmo model dependencies")
-    assert(summary.wmoModelDependenciesReady, "wow_export_northshire_mvp_smoke wmo model dependency ready")
-    assert(summary.wmoFirstModelFileDataID == 198056, "wow_export_northshire_mvp_smoke wmo first model id")
-    assert(summary.wmoDoodadModelPlacementCount == 144,
-           "wow_export_northshire_mvp_smoke wmo doodad model placements")
-    assert(summary.wmoDoodadReferencedModelFileDataIDCount == 15,
-           "wow_export_northshire_mvp_smoke wmo doodad referenced models")
-    assert(summary.wmoDoodadModelDependenciesReady,
-           "wow_export_northshire_mvp_smoke wmo doodad model dependency ready")
-    assert(summary.wmoFirstDoodadModelFileDataID == 198056,
-           "wow_export_northshire_mvp_smoke wmo first doodad model id")
-    assert(summary.wmoChunkCount > 0, "wow_export_northshire_mvp_smoke wmo chunk count")
-    assert(summary.m2Version == 272, "wow_export_northshire_mvp_smoke m2 version")
-    assert(summary.m2SkinFileDataIDCount == 1, "wow_export_northshire_mvp_smoke m2 skin ids")
-    assert(summary.m2FirstSkinFileDataID == 494438, "wow_export_northshire_mvp_smoke m2 first skin id")
-    assert(summary.m2TextureFileDataIDCount == 2, "wow_export_northshire_mvp_smoke m2 texture ids")
-    assert(summary.m2FirstTextureFileDataID == 127489, "wow_export_northshire_mvp_smoke m2 first texture id")
-    assert(summary.m2SkinIndexCount == 370, "wow_export_northshire_mvp_smoke m2 skin indices")
-    assert(summary.m2SkinTriangleIndexCount == 1302, "wow_export_northshire_mvp_smoke m2 skin triangles")
-    assert(summary.m2SkinSubmeshCount == 2, "wow_export_northshire_mvp_smoke m2 skin submeshes")
-    assert(summary.characterVertexCount == 370, "wow_export_northshire_mvp_smoke vertex count")
-    assert(summary.animationSequenceCount == 2, "wow_export_northshire_mvp_smoke animation sequence count")
-    assert(summary.modelBoundsReady, "wow_export_northshire_mvp_smoke model bounds")
-    assert(summary.modelSpanX1000 > 0, "wow_export_northshire_mvp_smoke model span x")
-    assert(summary.modelSpanY1000 > 0, "wow_export_northshire_mvp_smoke model span y")
-    assert(summary.modelSpanZ1000 > 0, "wow_export_northshire_mvp_smoke model span z")
-    assert(summary.textureWidth > 0 && summary.textureHeight > 0,
-           "wow_export_northshire_mvp_smoke texture size")
-    assert(summary.textureTgaBytes == 262162, "wow_export_northshire_mvp_smoke texture tga bytes")
-    assert(summary.assetBytes > 0, "wow_export_northshire_mvp_smoke asset bytes")
-    let liveAfterWarm: int64 = memLiveCount()
+    assert(summary.wdtMaidPlacementDependencyDecodedBytes == 3221104,
+           "wow_export_northshire_mvp_smoke wdt maid placement dependency decoded bytes")
+    assert(summary.wmoDoodadModelVertexCount == 31665,
+           "wow_export_northshire_mvp_smoke wmo doodad model vertices")
+    assert(summary.m2VertexCount == 370,
+           "wow_export_northshire_mvp_smoke m2 vertices")
+    assert(summary.skinTriangleIndexCount == 1302,
+           "wow_export_northshire_mvp_smoke skin triangles")
+    assert(summary.pixelsTouched == 1450349,
+           "wow_export_northshire_mvp_smoke pixels")
 
-    let secondRes: Result[preview.PreviewSummary] = preview.PreviewNorthshire(30)
-    assert(IsOk(secondRes), Error(secondRes))
-    assert(Value(secondRes).sceneNonEmpty, "wow_export_northshire_mvp_smoke second scene ready")
-    let liveAfterSecond: int64 = memLiveCount()
-    echo(Fmt"wow_export_northshire_mvp_smoke live_after_warm={strings.Int64ToStr(liveAfterWarm)}")
-    echo(Fmt"wow_export_northshire_mvp_smoke live_after_second={strings.Int64ToStr(liveAfterSecond)}")
-    echo(Fmt"wow_export_northshire_mvp_smoke steady_delta={strings.Int64ToStr(liveAfterSecond - liveAfterWarm)}")
+fn assertPreviewSummary(summary: preview.PreviewSummary) =
+    assert(summary.sceneNonEmpty,
+           "wow_export_northshire_mvp_smoke preview scene non empty")
+    assert(summary.auditedFileCount == 22,
+           "wow_export_northshire_mvp_smoke preview audited files")
+    assert(summary.auditedDependencyCount == 45,
+           "wow_export_northshire_mvp_smoke preview audited dependencies")
+    assert(summary.wdtMaidParsedDependencyCount == 28,
+           "wow_export_northshire_mvp_smoke preview maid parsed dependencies")
+    assert(summary.wdtMaidAdtSplitResourceCount == 16,
+           "wow_export_northshire_mvp_smoke preview maid adt split resources")
+    assert(summary.wdtMaidBlpResourceCount == 12,
+           "wow_export_northshire_mvp_smoke preview maid blp resources")
+    assert(summary.wdtMaidDoodadPlacementCount == 4345,
+           "wow_export_northshire_mvp_smoke preview doodad placements")
+    assert(summary.wdtMaidDoodadReferencedFileDataIDCount == 222,
+           "wow_export_northshire_mvp_smoke preview doodad fileDataIDs")
+    assert(summary.wdtMaidDoodadPlacementDependencyCount == 222,
+           "wow_export_northshire_mvp_smoke preview doodad placement dependencies")
+    assert(summary.wdtMaidDoodadM2AssetCount == 222,
+           "wow_export_northshire_mvp_smoke preview doodad m2 assets")
+    assert(summary.wdtMaidWorldModelPlacementCount == 32,
+           "wow_export_northshire_mvp_smoke preview world model placements")
+    assert(summary.wdtMaidWorldModelReferencedFileDataIDCount == 18,
+           "wow_export_northshire_mvp_smoke preview world model fileDataIDs")
+    assert(summary.wdtMaidWorldModelPlacementDependencyCount == 18,
+           "wow_export_northshire_mvp_smoke preview world model placement dependencies")
+    assert(summary.wdtMaidWorldModelWmoAssetCount == 18,
+           "wow_export_northshire_mvp_smoke preview world model wmo assets")
+    assert(summary.wdtMaidPlacementDependencyAuditReady,
+           "wow_export_northshire_mvp_smoke preview placement dependency audit")
+    assert(summary.wdtMaidPlacementDependencyEncodedBytes == 1299207,
+           "wow_export_northshire_mvp_smoke preview placement encoded bytes")
+    assert(summary.wdtMaidPlacementDependencyDecodedBytes == 3221104,
+           "wow_export_northshire_mvp_smoke preview placement decoded bytes")
+    assert(summary.wdtMaidDependencyBytes == 8023142,
+           "wow_export_northshire_mvp_smoke preview maid dependency bytes")
+    assert(summary.memoryOutstanding == 0,
+           "wow_export_northshire_mvp_smoke preview memory")
+    let text: str = preview.PreviewSummaryText(summary)
+    assert(strings.StrContains(text, "wdtMaidDoodadM2Assets=222"),
+           "wow_export_northshire_mvp_smoke preview text doodad m2 assets")
+    assert(strings.StrContains(text, "wdtMaidWorldModelWmoAssets=18"),
+           "wow_export_northshire_mvp_smoke preview text world model wmo assets")
+    assert(strings.StrContains(text, "wdtMaidPlacementDependencyDecodedBytes=3221104"),
+           "wow_export_northshire_mvp_smoke preview text decoded bytes")
+
+fn main(): int32 =
+    let buildRes: Result[build_info.WowBuildEntry] = build_info.ProbeRetailDefault()
+    assert(IsOk(buildRes), Error(buildRes))
+
+    let manifest: northshire.NorthshireManifest = northshire.Manifest()
+    assertManifest(manifest)
+    assertManifestAudits(manifest)
+
+    let previewRes: Result[preview.PreviewSummary] = preview.PreviewNorthshire(1)
+    assert(IsOk(previewRes), Error(previewRes))
+    assertPreviewSummary(Value(previewRes))
+
+    let outPath: str = "/tmp/wow_export_northshire_mvp_smoke.tga"
+    removeIfExists(outPath)
+    let renderRes: Result[render.RenderSummary] =
+        render.RenderNorthshireTga(outPath, 320, 180)
+    assert(IsOk(renderRes), Error(renderRes))
+    let summary: render.RenderSummary = Value(renderRes)
+    assertRenderSummary(summary)
+    assert(os.FileExists(outPath), "wow_export_northshire_mvp_smoke output exists")
+    assert(os.FileSize(outPath) == int64(summary.bytesWritten),
+           "wow_export_northshire_mvp_smoke output size")
+    removeIfExists(outPath)
     echo("wow_export_northshire_mvp_smoke ok")
     return 0

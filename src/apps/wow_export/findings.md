@@ -5,6 +5,18 @@
 - `MDDF` records are parsed at 36-byte stride as nameID, uniqueID, position, rotation, scale and flags. Current Northshire aggregate position span is `1125287,221256,1145929`, with scale range `133..3389`.
 - `MODF` records are parsed at 64-byte stride as nameID, uniqueID, position, rotation, bounds, flags/doodad-set/name-set and scale. Current Northshire aggregate position span is `1133681,61759,899866`, with scale range `1024..1024`.
 - Northshire MAID modern placement `nameID` fields are fileDataIDs, not local path table indexes: `MDDF` aggregates to `222` unique doodad fileDataIDs, first `189929`; `MODF` aggregates to `18` unique world model fileDataIDs, first `108104`.
+- These `222 + 18` placement-referenced fileDataIDs are not handwritten into the manifest as fake paths. Preview/render parse them from real `MDDF/MODF`, then run one strict local root/encoding/index batch audit, load each payload, classify doodads with `ParseM2Header`, classify world models with `ParseWmoRootSummary`, and require `1299207` encoded bytes plus `3221104` decoded bytes before accepting the scene.
+- Current placement asset classification is exact on this machine: `222/222` MAID doodad references are real M2 payloads and `18/18` MAID world-model references are real WMO root payloads.
+- Current MAID doodad renderability is exact on this machine: `218/222` M2 payloads contain vertices, and `4/222` are valid zero-vertex M2 assets. Zero-vertex assets are counted and skipped, not repaired with fake geometry.
+- `render-northshire` now reads real `MDDF` records and instantiates renderable MAID doodad M2 vertices. Northshire currently expands `4345` placements into `558543` instance vertices and requires instance bounds before accepting the render.
+- MAID `MODF` world-model rendering is now driven by the real WMO group chain, not by root markers. For the `18` referenced WMO roots, render reads `GFID`, takes the base `MOHD.nGroups` group fileDataID block, audits/loads `287` WMO group payloads, and expands `32` MODF placements into `709092` instance vertices.
+- Modern WMO `GFID` can contain multiple `MOHD.nGroups` blocks for LOD selection; zeros can appear in later LOD blocks. The strict base render path uses the first `MOHD.nGroups` IDs and rejects invalid base IDs instead of treating the whole GFID chunk as one flat no-zero table.
+- `Azeroth.wdt` itself has no top-level `FDOM/MODF` root WMO placement in this build; Northshire Abbey's world placement comes from MAID `MODF`, so drawing audited WMO groups in local coordinates was the real projection bug.
+- Main render now uses one world-space projection bounds for ADT terrain, MAID doodad M2, MAID WMO groups, and Abbey WMO `MODD` doodad M2. Abbey root currently has `1` MAID world placement, `144` placed WMO doodads, and `31665` placed WMO doodad M2 vertices; static WMO group local draw is removed from the main view.
+- Render now has a strict material/texture/light audit pass instead of fake shading. Abbey WMO contributes `30` materials, `0` lights, `136` group batches, and `30563` material-info records; the audited BLP texture decodes to a real `256x256` TGA of `262162` bytes.
+- MAID world-model WMO material facts are also audited while loading the real roots/groups: `18` roots currently contribute `670` materials and `19` lights, while `287` groups contribute `2531` batches and `522540` material-info records.
+- `ExportNorthshirePlacementDependenciesBundle` now writes those placement-referenced payloads as a strict bundle: `222` `.m2` doodads plus `18` `.wmo` world models, total decoded bytes `3221104`, with `placement_dependencies.manifest.txt`.
+- `build_info.StableConcat/StableConcat3` previously freed `BytesFromString` views. That corrupted caller-owned strings in larger export closures and produced broken output paths; now only the newly allocated concat buffers are freed.
 - Slot 3 contains `DIDM/DIHM` modern ID chunks, but current Northshire `MDDF/MODF` placement IDs are already direct fileDataIDs; treating them as indexes into `DIDM/DIHM` would be wrong.
 - Northshire WDT `MAID` non-base slots are heterogeneous resources, not 28 identical ADT files: for each audited tile, slots `1..4` decode to `REVM/MVER` chunked split payloads and slots `5..7` decode to `BLP2` textures.
 - The audited dependency table now keeps `relationKind=wdt_maid_split` for the WDT source edge and `formatKind` for the real payload format; this avoids fabricating paths and avoids exporting BLP textures with `.adt` names.
@@ -14,6 +26,7 @@
 - 本地 MAID split 审计慢的根因已经钉住：`CascArchiveDecodeLocalEntryRange` 对 BLTE `0x4e normal` block 走了“读整块 -> 复制整块 decodedBlock -> 再复制目标 range”的路径。encoding page lookup 大量命中 normal block 时会把 CPU 和内存打到不必要的整块拷贝上。
 - 当前修复是严格 range 读取：先读 block flag，若为 `normal` 且 `compSize == decompSize + 1`，直接读取 `blockFileOffset + 1 + blockOffsetInDecoded` 的目标子区间；zlib/encrypted block 仍走完整解码路径，不做降级或猜测。
 - 本地 `.idx` batch lookup 的旧热点是每个 entry 对每个候选 key 都把 18 位 hex prefix 重新转 9 个字节；现在进入扫表前一次性预解 key prefix，热循环只做字节比较。
+- `binary.HexSlice` 的旧实现实际回到了 `ReadHex`，每个 byte 都 `ConcatStr` 一次。这里不用 `Fmt`，因为 `Fmt` 仍会在热循环里制造临时字符串；当前实现直接对 `ByteBuffer` 切片做 raw bytes 视图并一次性 `BytesToHex`。
 - `std/os.ListDir` 的库层根因已经钉住并修掉：`cheng_list_dir` 返回的 raw listing 之前没有在 `ListDir` 内部释放，业务层只能自己借用扫描；现在 `ListDir` 已在库层释放 raw buffer，并返回 owned 文件名。
 - `casc_index.LoadLocalIndexEntry` 已改成“原始 listing 文本在同一作用域内借用扫描”，因此路径桥崩溃和悬挂文件名都已经收住；现状是明确返回 `wowExport index: local encoding key not found 00f6dcef63eafe6254ab5408ea8baa09`。
 - 已补纯 Cheng `tact_index` 解析器，当前本机 `Data/indices/bd643d2dac9bfdc365890dafbbea83d6.index` 的 footer/record 事实已经钉住：`formatRevision=1`、`blockSizeKB=4`、`offsetBytes=4`、`sizeBytes=4`、`keyBytes=16`、`hashBytes=8`，record 是标准 `ekey + size + offset`。
@@ -29,8 +42,9 @@
 - 纯 Cheng CDN root lookup 慢的根因不是 Cheng 运行时整体性能，而是 wowExport 热路径先全量解码/重复扫表，且 zlib Huffman decode 逐 symbol 线性查找；现已改为 BLTE range/block 解码、批量 root scan、zlib bit-buffer + 10-bit fast table。
 - 15-bit 全量 Huffman fast table 能提速但会把 root lookup 峰值推到数百 MB；10-bit fast table 覆盖常见短码，长码严格回退慢路径，当前 root lookup 普通运行通过，运行中 RSS 采样约 `45632KB`。
 - 纯 Cheng 当前慢点不是运行时整体性能问题；北郡预览此前慢是每次走完整 root/encoding 深审计，已改成已审计 payload/index/MD5 快审计，CLI `preview-northshire --frames 1` 本机约 `2.15s`。
+- standalone preview 闭包不稳的直接触发点已收住：`preview.cheng` 去掉 `std/strformat/Fmt`，`PreviewSummaryText` 改为小 helper 拼接，`sceneNonEmpty` 巨型布尔式拆成 WDT/ADT/WMO/M2 小判定；统一 CLI 已重新 import `preview`，`preview-northshire --frames 1` 真正走 `PreviewNorthshire` 并通过。
 - M2 顶点 offset 在 `MD21` 包装下是相对内部 `MD20` payload 起点，不是文件起点；不加 `MD20` start 会读错顶点包围盒，真实 `nsabbeyBell.m2` 修正后跨度为 `1916,5856,25208`。
-- 当前 seed/materialize 对 CLI 大闭包里的复杂 `Fmt` 仍不稳；导出模块的 `Result[str]` 路径已改成字符串拼接，`wow_export_tool_main` 和 `wow_export_asset_export_smoke` 均可重新编译通过。
+- 当前 seed/materialize 对大闭包里的复杂 `Fmt` 仍不稳；wowExport 可见摘要和导出 `Result[str]` 路径已改成字符串拼接，`wow_export_tool_main`、`wow_export_northshire_mvp_smoke` 和 `wow_export_asset_export_smoke` 均可重新编译通过。
 - 已审计 Northshire manifest 的 `size` 是 CASC/BLTE encoded entry 大小，不是导出 payload 大小；例如 `abbey-bell-model` manifest size 为 `6898`，真实解码后 M2 输出为 `20308` 字节。
 - Northshire `abbey-bell-texture` 是 BLP2 DXT1：`encoding=2`、`alphaDepth=0`、`256x256`，首 mip 压缩块 `32768` 字节；真实转换为 32-bit TGA 后是 `262162` 字节。
 - Northshire WDT 当前解析出 `4096` 个活跃 MAIN tile；WMO root `MOHD` 解析出 `30` 个材质、`13` 个 group、`165` 个 doodad，preview 现在把这些作为 scene 非空条件。
@@ -45,7 +59,7 @@
 - M2 `nsabbeyBell.m2` 的 `SFID` 给出 skin fileDataID `494438`，`TXID` 给出 texture fileDataID `127489` 和已审计 texture `189598`。
 - Northshire Abbey 13 个 WMO group 均已审计并解码；真实 group payload 是顶层 `REVM` + `PGOM`，几何 chunk 嵌在 `PGOM` 68 字节 group header 后，四字符在文件中仍是反向写法：`TVOM/MOVT`、`IVOM/MOVI`、`ABOM/MOBA`、`YPOM/MOPY`。
 - 13 个 WMO group 合计 `29304` 顶点、`91689` 个索引；M2 skin `494438` 解码后为 `5088` 字节，含 `370` indices、`1302` triangle indices、`2` submeshes。
-- `render-northshire` 当前是严格真实数据的几何 MVP：画已解码 ADT terrain 高度、WMO group 顶点、WMO doodad placement、WMO doodad M2 实例顶点和审计 M2 inset 顶点，不做材质、光照、相机碰撞或占位 mesh；若真实几何缺失会失败，不会补假点。
+- `render-northshire` 当前是严格真实数据的几何 MVP：主视图画已解码 ADT terrain 高度、MAID world-space WMO group 顶点、MAID doodad M2 实例顶点、Abbey WMO doodad placement 和 Abbey WMO doodad M2 实例顶点；右上角仍画审计 M2 inset。不做材质、光照、相机碰撞或占位 mesh；若真实几何缺失会失败，不会补假点。
 - WDT `Azeroth.wdt` 的 `MAID` 有 `1176` 个非零 tile、`9408` 个 referenced fileDataID，首项 `6173014`；不能一次性当 Northshire 局部地形，下一步要按坐标/区域收窄后审计。
 - Northshire 局部地形已按 listfile/WDT 坐标收窄到四个 Azeroth 基础 ADT：`Azeroth_31_48.adt`、`Azeroth_32_48.adt`、`Azeroth_31_49.adt`、`Azeroth_32_49.adt`，对应 fileDataID `777827/778027/777832/778032`。
 - 真实 ADT 地形是顶层 `REVM` + 256 个 `KNCM/MCNK`；每个 `MCNK` 的 128 字节 header 后必须有 `TVCM/MCVT`，每块 `145` 个 float 高度样本，四个 tile 合计 `148480` 个样本。

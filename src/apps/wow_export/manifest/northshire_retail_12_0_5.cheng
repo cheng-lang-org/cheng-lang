@@ -3,6 +3,7 @@ import std/result
 import std/seqs
 import std/strings as strings
 import std/strformat
+import cheng/apps/wow_export/asset_formats as asset_formats
 import cheng/apps/wow_export/build_info as build_info
 import cheng/apps/wow_export/casc_index as casc_index
 import cheng/apps/wow_export/local_files as local_files
@@ -54,6 +55,10 @@ type
         firstWorldModelFileDataID: int32
         doodadEncodedBytes: int32
         worldModelEncodedBytes: int32
+        doodadDecodedBytes: int32
+        worldModelDecodedBytes: int32
+        doodadM2AssetCount: int32
+        worldModelWmoAssetCount: int32
 
 fn northshireAddWmoModiDependency(out: var NorthshireManifest,
                                   label: str,
@@ -764,29 +769,52 @@ fn HasDependencyFileDataID(m: NorthshireManifest,
     return false
 
 fn northshireValidatePlacementAuditRange(label: str,
+                                         clientPath: str,
+                                         expectedFormatKind: str,
                                          fileDataIDs: int32[],
-                                         audits: local_files.LocalFileAudit[],
+                                         stats: local_files.LocalFileAuditEntryStat[],
                                          startIndex: int32,
                                          matchedCount: var int32,
                                          firstFileDataID: var int32,
-                                         encodedBytes: var int32): Result[bool] =
+                                         encodedBytes: var int32,
+                                         decodedBytes: var int32,
+                                         assetCount: var int32): Result[bool] =
     if fileDataIDs.len <= 0:
         return Err[bool]("wowExport northshire manifest: empty " + label + " placement dependency list")
-    if startIndex < 0 || startIndex + fileDataIDs.len > audits.len:
+    if startIndex < 0 || startIndex > stats.len || fileDataIDs.len > stats.len - startIndex:
         return Err[bool]("wowExport northshire manifest: " + label + " placement dependency audit range invalid")
     var i: int32
     while i < fileDataIDs.len:
-        let audit: local_files.LocalFileAudit = audits[startIndex + i]
-        if audit.fileDataID != fileDataIDs[i]:
+        let stat: local_files.LocalFileAuditEntryStat = stats[startIndex + i]
+        if stat.fileDataID != fileDataIDs[i]:
             return Err[bool]("wowExport northshire manifest: " + label + " placement fileDataID order mismatch")
-        if strings.Len(audit.contentKey) != 32 || strings.Len(audit.encodingKey) != 32:
-            return Err[bool]("wowExport northshire manifest: " + label + " placement key length invalid")
-        if audit.entry.archiveIndex < 0 || audit.entry.offset < 0 || audit.entry.size <= 0:
+        if stat.archiveIndex < 0 || stat.offset < 0 || stat.size <= 0:
             return Err[bool]("wowExport northshire manifest: " + label + " placement index entry invalid")
+        let fileRes: Result[bytes.ByteBuffer] =
+            local_files.ReadLocalFileByEntry(clientPath, stat.archiveIndex, stat.offset, stat.size)
+        if IsErr(fileRes):
+            return Err[bool]("wowExport northshire manifest: " + label + " placement asset load failed " + strings.IntToStr(stat.fileDataID) + ": " + Error(fileRes))
+        let fileBuf: bytes.ByteBuffer = Value(fileRes)
+        if expectedFormatKind == "m2":
+            let m2Res: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(fileBuf)
+            if IsErr(m2Res):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool]("wowExport northshire manifest: " + label + " placement asset is not M2 " + strings.IntToStr(stat.fileDataID) + ": " + Error(m2Res))
+        elif expectedFormatKind == "wmo":
+            let wmoRes: Result[asset_formats.WmoRootSummary] = asset_formats.ParseWmoRootSummary(fileBuf)
+            if IsErr(wmoRes):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool]("wowExport northshire manifest: " + label + " placement asset is not WMO " + strings.IntToStr(stat.fileDataID) + ": " + Error(wmoRes))
+        else:
+            bytes.FreeByteBuffer(fileBuf)
+            return Err[bool]("wowExport northshire manifest: unsupported placement asset format " + expectedFormatKind)
         if matchedCount == 0:
-            firstFileDataID = audit.fileDataID
+            firstFileDataID = stat.fileDataID
         matchedCount = matchedCount + 1
-        encodedBytes = encodedBytes + audit.entry.size
+        encodedBytes = encodedBytes + stat.size
+        decodedBytes = decodedBytes + fileBuf.len
+        assetCount = assetCount + 1
+        bytes.FreeByteBuffer(fileBuf)
         i = i + 1
     return Ok[bool](true)
 
@@ -812,32 +840,40 @@ fn AuditWdtMaidPlacementReferencesAgainstLocal(m: NorthshireManifest,
     while allIndex < worldModelFileDataIDs.len:
         add(allFileDataIDs, worldModelFileDataIDs[allIndex])
         allIndex = allIndex + 1
-    let auditsRes: Result[local_files.LocalFileAudit[]] =
-        local_files.ResolveLocalFileAuditsRanged(m.clientPath, allFileDataIDs)
-    if IsErr(auditsRes):
-        return Err[NorthshireMaidPlacementDependencyAuditSummary]("wowExport northshire manifest: WDT MAID placement dependency audit failed: " + Error(auditsRes))
-    let audits: local_files.LocalFileAudit[] = Value(auditsRes)
-    if audits.len != allFileDataIDs.len:
+    let statsRes: Result[local_files.LocalFileAuditEntryStat[]] =
+        local_files.ResolveLocalFileAuditEntryStatsRanged(m.clientPath, allFileDataIDs)
+    if IsErr(statsRes):
+        return Err[NorthshireMaidPlacementDependencyAuditSummary]("wowExport northshire manifest: WDT MAID placement dependency audit failed: " + Error(statsRes))
+    let stats: local_files.LocalFileAuditEntryStat[] = Value(statsRes)
+    if stats.len != allFileDataIDs.len:
         return Err[NorthshireMaidPlacementDependencyAuditSummary]("wowExport northshire manifest: WDT MAID placement dependency audit count mismatch")
     var out: NorthshireMaidPlacementDependencyAuditSummary
     let doodadRes: Result[bool] =
         northshireValidatePlacementAuditRange("WDT MAID doodad",
+                                              m.clientPath,
+                                              "m2",
                                               doodadFileDataIDs,
-                                              audits,
+                                              stats,
                                               0,
                                               out.matchedDoodadDependencyCount,
                                               out.firstDoodadFileDataID,
-                                              out.doodadEncodedBytes)
+                                              out.doodadEncodedBytes,
+                                              out.doodadDecodedBytes,
+                                              out.doodadM2AssetCount)
     if IsErr(doodadRes):
         return Err[NorthshireMaidPlacementDependencyAuditSummary](Error(doodadRes))
     let worldRes: Result[bool] =
         northshireValidatePlacementAuditRange("WDT MAID world model",
+                                              m.clientPath,
+                                              "wmo",
                                               worldModelFileDataIDs,
-                                              audits,
+                                              stats,
                                               doodadFileDataIDs.len,
                                               out.matchedWorldModelDependencyCount,
                                               out.firstWorldModelFileDataID,
-                                              out.worldModelEncodedBytes)
+                                              out.worldModelEncodedBytes,
+                                              out.worldModelDecodedBytes,
+                                              out.worldModelWmoAssetCount)
     if IsErr(worldRes):
         return Err[NorthshireMaidPlacementDependencyAuditSummary](Error(worldRes))
     return Ok[NorthshireMaidPlacementDependencyAuditSummary](out)

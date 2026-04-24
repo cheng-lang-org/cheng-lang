@@ -1,6 +1,9 @@
 import std/result
 import std/strings
 import std/strutils as strutil
+import cheng/core/lang/parser
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/path as chengpath
 import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/system_link_plan as slplan
@@ -10,6 +13,12 @@ type
     DebugToolsProfileCount =
         key: str
         count: int32
+
+    DebugToolsAsmSourceCacheEntry =
+        sourcePath: str
+        lines: str[]
+        decls: parser.NormalizedFunctionDecl[]
+        ok: bool
 
 fn DebugToolsAppendLine(out: var str, key: str, value: str) =
     out = out + key + "=" + value + "\n"
@@ -253,3 +262,241 @@ fn DebugToolsSymbolsReportText(linkPlan: slplan.SystemLinkPlanStub,
     DebugToolsAppendLine(out, "primary_symbols", slplan.SystemLinkPlanListText(primaryPlan.symbolNames))
     DebugToolsAppendLine(out, "primary_unsupported_count", primaryUnsupportedCount)
     return out
+
+fn DebugToolsAsmTargetIsAarch64(targetTriple: str): bool =
+    return targetTriple == "arm64-apple-darwin" ||
+           targetTriple == "aarch64-apple-ios" ||
+           targetTriple == "arm64-apple-ios" ||
+           targetTriple == "aarch64-unknown-linux-gnu" ||
+           targetTriple == "aarch64-linux-android" ||
+           targetTriple == "aarch64-linux-ohos" ||
+           targetTriple == "aarch64-unknown-linux-ohos"
+
+fn DebugToolsAsmTargetIsX86_64(targetTriple: str): bool =
+    return targetTriple == "x86_64-unknown-linux-gnu"
+
+fn DebugToolsAsmSplitLines(text: str): str[] =
+    var out: str[]
+    var start = 0
+    let n = len(text)
+    var i = 0
+    while i <= n:
+        var lineEnd = false
+        if i == n:
+            lineEnd = true
+        elif text[i] == '\n':
+            lineEnd = true
+        if !lineEnd:
+            i = i + 1
+            continue
+        add(out, strings.SliceBytes(text, start, i - start))
+        start = i + 1
+        i = i + 1
+    return out
+
+fn DebugToolsAsmSourceCacheIndex(entries: DebugToolsAsmSourceCacheEntry[],
+                                   sourcePath: str): int32 =
+    for i in 0..<entries.len:
+        if entries[i].sourcePath == sourcePath:
+            return i
+    return -1
+
+fn DebugToolsAsmSourceCacheEnsure(entries: var DebugToolsAsmSourceCacheEntry[],
+                                    sourcePath: str): int32 =
+    let existing = DebugToolsAsmSourceCacheIndex(entries, sourcePath)
+    if existing >= 0:
+        return existing
+    let sourceText = chengpath.ReadTextFile("", sourcePath)
+    var decls: parser.NormalizedFunctionDecl[]
+    var err = ""
+    var entry: DebugToolsAsmSourceCacheEntry
+    entry.sourcePath = sourcePath
+    entry.lines = DebugToolsAsmSplitLines(sourceText)
+    entry.ok = parser.ParserReadNormalizedFunctionDecls(sourceText, decls, err)
+    entry.decls = decls
+    add(entries, entry)
+    return entries.len - 1
+
+fn DebugToolsAsmFindDeclLineIndex(decls: parser.NormalizedFunctionDecl[],
+                                    functionName: str): int32 =
+    for i in 0..<decls.len:
+        if decls[i].name == functionName:
+            return decls[i].lineIndex
+    return 0
+
+fn DebugToolsAsmBodyTextAfterEquals(lineRaw: str): str =
+    for i in 0..<len(lineRaw):
+        if lineRaw[i] != '=':
+            continue
+        return strutil.Strip(strings.SliceBytes(lineRaw, i + 1, len(lineRaw) - i - 1))
+    return ""
+
+fn DebugToolsAsmFunctionBodyLine(lines: str[],
+                                   declLineIndex: int32,
+                                   bodyLineNumber: var int32): str =
+    bodyLineNumber = 0
+    if declLineIndex <= 0 || declLineIndex > lines.len:
+        return ""
+    let declLine = lines[declLineIndex - 1]
+    let inlineBody = DebugToolsAsmBodyTextAfterEquals(declLine)
+    if len(inlineBody) > 0:
+        bodyLineNumber = declLineIndex
+        return inlineBody
+    for i in declLineIndex..<lines.len:
+        let bodyRaw = lines[i]
+        let bodyTrim = strutil.Strip(bodyRaw)
+        if len(bodyTrim) <= 0:
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        bodyLineNumber = i + 1
+        return bodyTrim
+    return ""
+
+fn DebugToolsAsmFindResolvedCallIndex(loweringPlan: lower.LoweringPlanStub,
+                                        sourcePath: str,
+                                        lineNumber: int32): int32 =
+    if lineNumber <= 0:
+        return -1
+    var insideTargetSource = false
+    for i in 0..<loweringPlan.typedExprFacts.len:
+        let factSourcePath = loweringPlan.typedExprFacts[i].sourcePath
+        if factSourcePath != sourcePath:
+            if insideTargetSource:
+                break
+            continue
+        insideTargetSource = true
+        let factLineNumber = loweringPlan.typedExprFacts[i].lineNumber
+        if factLineNumber != lineNumber:
+            if factLineNumber > lineNumber:
+                break
+            continue
+        if !loweringPlan.typedExprFacts[i].callResolved:
+            continue
+        if loweringPlan.typedExprFacts[i].callTargetImportc:
+            continue
+        if len(loweringPlan.typedExprFacts[i].callTarget) <= 0:
+            continue
+        return i
+    return -1
+
+fn DebugToolsAsmSymbolForFunction(linkPlan: slplan.SystemLinkPlanStub,
+                                    loweringPlan: lower.LoweringPlanStub,
+                                    sourceCache: var DebugToolsAsmSourceCacheEntry[],
+                                    symbolText: str): str =
+    for i in 0..<loweringPlan.functionSymbolTexts.len:
+        if loweringPlan.functionSymbolTexts[i] != symbolText &&
+           loweringPlan.functionNames[i] != symbolText:
+            continue
+        let sourcePath = loweringPlan.functionSourcePaths[i]
+        let cacheIndex = DebugToolsAsmSourceCacheEnsure(sourceCache, sourcePath)
+        let sourceEntry = sourceCache[cacheIndex]
+        if !sourceEntry.ok:
+            return ""
+        let declLineIndex = DebugToolsAsmFindDeclLineIndex(sourceEntry.decls, loweringPlan.functionNames[i])
+        return pobj.PrimarySymbolNameForFunction(linkPlan.targetTriple,
+                                                 loweringPlan.functionSymbolTexts[i],
+                                                 declLineIndex,
+                                                 linkPlan.emitKind)
+    return ""
+
+fn DebugToolsAsmAppendFunction(out: var str,
+                                 targetTriple: str,
+                                 symbolName: str,
+                                 bodyTextRaw: str,
+                                 targetSymbol: str): bool =
+    let bodyText = strutil.Strip(bodyTextRaw)
+    out = out + ".globl " + symbolName + "\n"
+    if DebugToolsAsmTargetIsAarch64(targetTriple):
+        out = out + ".p2align 2\n"
+        out = out + symbolName + ":\n"
+        if bodyText == "return 0" || bodyText == "0":
+            out = out + "  mov w0, #0\n"
+            out = out + "  ret\n"
+            return true
+        if len(targetSymbol) > 0:
+            out = out + "  b " + targetSymbol + "\n"
+            return true
+        return false
+    if DebugToolsAsmTargetIsX86_64(targetTriple):
+        out = out + ".p2align 4\n"
+        out = out + symbolName + ":\n"
+        if bodyText == "return 0" || bodyText == "0":
+            out = out + "  xorl %eax, %eax\n"
+            out = out + "  retq\n"
+            return true
+        if len(targetSymbol) > 0:
+            out = out + "  jmp " + targetSymbol + "\n"
+            return true
+        return false
+    return false
+
+fn DebugToolsAsmAppendBridge(out: var str,
+                               targetTriple: str,
+                               bridgeSymbol: str,
+                               entrySymbol: str): bool =
+    if len(bridgeSymbol) <= 0 || len(entrySymbol) <= 0:
+        return true
+    out = out + ".globl " + bridgeSymbol + "\n"
+    if DebugToolsAsmTargetIsAarch64(targetTriple):
+        out = out + ".p2align 2\n"
+        out = out + bridgeSymbol + ":\n"
+        out = out + "  b " + entrySymbol + "\n"
+        return true
+    if DebugToolsAsmTargetIsX86_64(targetTriple):
+        out = out + ".p2align 4\n"
+        out = out + bridgeSymbol + ":\n"
+        out = out + "  jmp " + entrySymbol + "\n"
+        return true
+    return false
+
+fn DebugToolsAsmReportText(linkPlan: slplan.SystemLinkPlanStub,
+                             loweringPlan: lower.LoweringPlanStub,
+                             primaryPlan: pobj.PrimaryObjectPlan): Result[str] =
+    if !DebugToolsAsmTargetIsAarch64(linkPlan.targetTriple) &&
+       !DebugToolsAsmTargetIsX86_64(linkPlan.targetTriple):
+        return Err[str]("cheng asm report: unsupported target: " + linkPlan.targetTriple)
+    var sourceCache: DebugToolsAsmSourceCacheEntry[]
+    var asmText = ""
+    var entryPrimarySymbol = ""
+    for i in 0..<loweringPlan.functionNames.len:
+        let sourcePath = loweringPlan.functionSourcePaths[i]
+        let cacheIndex = DebugToolsAsmSourceCacheEnsure(sourceCache, sourcePath)
+        let sourceEntry = sourceCache[cacheIndex]
+        if !sourceEntry.ok:
+            return Err[str]("cheng asm report: function declaration parse failed: " + sourcePath)
+        let declLineIndex = DebugToolsAsmFindDeclLineIndex(sourceEntry.decls, loweringPlan.functionNames[i])
+        var bodyLineNumber: int32
+        let bodyText = DebugToolsAsmFunctionBodyLine(sourceEntry.lines, declLineIndex, bodyLineNumber)
+        var targetSymbol = ""
+        let callIndex = DebugToolsAsmFindResolvedCallIndex(loweringPlan, sourcePath, bodyLineNumber)
+        if callIndex >= 0 && loweringPlan.typedExprFacts[callIndex].callArgCount == 0:
+            targetSymbol = DebugToolsAsmSymbolForFunction(linkPlan,
+                                                          loweringPlan,
+                                                          sourceCache,
+                                                          loweringPlan.typedExprFacts[callIndex].callTarget)
+        let symbolName = pobj.PrimarySymbolNameForFunction(linkPlan.targetTriple,
+                                                           loweringPlan.functionSymbolTexts[i],
+                                                           declLineIndex,
+                                                           linkPlan.emitKind)
+        if loweringPlan.functionEntryFlags[i] != 0:
+            entryPrimarySymbol = symbolName
+        if !DebugToolsAsmAppendFunction(asmText, linkPlan.targetTriple, symbolName, bodyText, targetSymbol):
+            return Err[str]("cheng asm report: unsupported function body: " + loweringPlan.functionSymbolTexts[i])
+        asmText = asmText + "\n"
+    let bridgeSymbol = pobj.PrimaryRuntimeEntryBridgeSymbol(linkPlan)
+    if linkPlan.emitKind == creq.EmitExe:
+        if !DebugToolsAsmAppendBridge(asmText, linkPlan.targetTriple, bridgeSymbol, entryPrimarySymbol):
+            return Err[str]("cheng asm report: unsupported entry bridge")
+        asmText = asmText + "\n"
+    var asmPath = primaryPlan.outputPath + ".s"
+    if len(primaryPlan.outputPath) <= 0:
+        asmPath = DebugToolsReplaceSuffix(DebugToolsSourcePath(linkPlan), ".cheng", ".s")
+    var out = ""
+    DebugToolsAppendRawLine(out, "cheng_asm_report_v1")
+    DebugToolsAppendLine(out, "path", asmPath)
+    DebugToolsAppendLine(out, "target", linkPlan.targetTriple)
+    DebugToolsAppendLine(out, "emit", creq.CompilerEmitText(linkPlan.emitKind))
+    DebugToolsAppendRawLine(out, "asm_text_begin")
+    out = out + asmText
+    return Ok[str](out)

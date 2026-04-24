@@ -1,0 +1,156 @@
+import std/os
+import std/strutils as strutil
+import cheng/core/tooling/bootstrap_contracts as contracts
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+const
+    SeedR2cMaxRssBytesText = "8589934592"
+    SeedR2cCompileTimeoutSec = 420
+    SeedR2cRunTimeoutSec = 0
+
+fn seedR2cPrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn seedR2cResolveRoot(rootDir: str): str =
+    let explicit = strutil.Strip(rootDir)
+    if len(explicit) > 0:
+        if chengpath.PathIsAbsolute(explicit):
+            return explicit
+        return chengpath.PathAbsolute(os.GetCurrentDir(), explicit)
+    let envRoot = strutil.Strip(os.GetEnv("CHENG_ROOT"))
+    if len(envRoot) > 0:
+        if chengpath.PathIsAbsolute(envRoot):
+            return envRoot
+        return chengpath.PathAbsolute(os.GetCurrentDir(), envRoot)
+    return os.GetCurrentDir()
+
+fn seedR2cStableEnv(rootDir: str): str[] =
+    var out: str[]
+    add(out, "CHENG_ROOT=" + rootDir)
+    add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
+    add(out, "CHENG_PROGRESS=1")
+    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=" + SeedR2cMaxRssBytesText)
+    return out
+
+fn seedR2cControllerOutDir(rootDir: str): str =
+    return chengpath.PathAbsolute(rootDir, "artifacts/r2c_react_controller")
+
+fn seedR2cControllerPath(rootDir: str): str =
+    return os.JoinPath(seedR2cControllerOutDir(rootDir), "cheng")
+
+fn seedR2cCompileLogPath(rootDir: str): str =
+    return os.JoinPath(seedR2cControllerOutDir(rootDir), "build.compile.log")
+
+fn seedR2cCompileReportPath(rootDir: str): str =
+    return os.JoinPath(seedR2cControllerOutDir(rootDir), "build.report.txt")
+
+fn seedR2cControllerSource(rootDir: str): str =
+    return chengpath.PathAbsolute(rootDir, "src/r2c/r2c_react.cheng")
+
+fn seedR2cControllerInputPaths(rootDir: str,
+                                compilerPath: str): str[] =
+    var out: str[]
+    add(out, compilerPath)
+    add(out, seedR2cControllerSource(rootDir))
+    add(out, chengpath.PathAbsolute(rootDir, "src/r2c/r2c_react_controller_main.cheng"))
+    add(out, chengpath.PathAbsolute(rootDir, "src/core/tooling/path.cheng"))
+    add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/compiler_runtime_program_entry_provider.cheng"))
+    let target = contracts.BootstrapDetectHostTarget()
+    if target == "arm64-apple-darwin" || target == "x86_64-apple-darwin":
+        add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/core_runtime_provider_darwin.cheng"))
+    else:
+        add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/core_runtime_provider_linux.cheng"))
+    add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/debug_runtime_stub.cheng"))
+    add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/program_support_backend.cheng"))
+    return out
+
+fn seedR2cOutputFreshAgainstInputs(outputPath: str,
+                                    inputPaths: str[]): bool =
+    if !chengpath.PathFileExists(outputPath):
+        return false
+    if os.FileSize(outputPath) <= int64(0):
+        return false
+    let outputMtime = os.FileMtime(outputPath)
+    if outputMtime <= int64(0):
+        return false
+    for i in 0..<inputPaths.len:
+        let inputPath = inputPaths[i]
+        if !chengpath.PathFileExists(inputPath):
+            return false
+        if os.FileMtime(inputPath) > outputMtime:
+            return false
+    return true
+
+fn seedR2cCompilerPath(rootDir: str): str =
+    let backendDriver = chengpath.PathAbsolute(rootDir, "artifacts/backend_driver/cheng")
+    if chengpath.FileExistsNonEmpty(rootDir, backendDriver):
+        return backendDriver
+    return chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage3")
+
+fn seedR2cHostTarget(): str =
+    let target = contracts.BootstrapDetectHostTarget()
+    if len(target) > 0:
+        return target
+    return contracts.BootstrapDefaultTarget()
+
+fn seedR2cEnsureController(rootDir: str): str =
+    let compilerPath = seedR2cCompilerPath(rootDir)
+    if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        seedR2cPrintErr("[seed_r2c_gate] missing compiler for r2c controller: " + compilerPath)
+        return ""
+    let controllerPath = seedR2cControllerPath(rootDir)
+    let inputs = seedR2cControllerInputPaths(rootDir, compilerPath)
+    if seedR2cOutputFreshAgainstInputs(controllerPath, inputs):
+        return controllerPath
+    let outDir = seedR2cControllerOutDir(rootDir)
+    if !chengpath.MkdirP(rootDir, outDir):
+        seedR2cPrintErr("[seed_r2c_gate] failed to create r2c controller out-dir: " + outDir)
+        return ""
+    let sourcePath = seedR2cControllerSource(rootDir)
+    let target = seedR2cHostTarget()
+    if len(target) <= 0:
+        seedR2cPrintErr("[seed_r2c_gate] unsupported host target for r2c controller")
+        return ""
+    var compileArgs: str[]
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, "--root:" + rootDir)
+    add(compileArgs, "--contract-in:" + contracts.BootstrapStage1SourcePath(rootDir))
+    add(compileArgs, "--in:" + sourcePath)
+    add(compileArgs, "--emit:exe")
+    add(compileArgs, "--target:" + target)
+    add(compileArgs, "--out:" + controllerPath)
+    add(compileArgs, "--report-out:" + seedR2cCompileReportPath(rootDir))
+    let rc = hostops.RunFileLoggedExitCode(rootDir,
+                                           "seed_r2c_react_controller_compile",
+                                           compilerPath,
+                                           compileArgs,
+                                           seedR2cStableEnv(rootDir),
+                                           rootDir,
+                                           SeedR2cCompileTimeoutSec,
+                                           seedR2cCompileLogPath(rootDir))
+    if rc != 0:
+        seedR2cPrintErr("[seed_r2c_gate] failed to compile r2c controller log=" + seedR2cCompileLogPath(rootDir))
+        return ""
+    if !chengpath.FileExistsNonEmpty(rootDir, controllerPath):
+        seedR2cPrintErr("[seed_r2c_gate] missing r2c controller binary: " + controllerPath)
+        return ""
+    return controllerPath
+
+fn SeedR2cReact(rootDir: str,
+                  args: str[]): int32 =
+    let root = seedR2cResolveRoot(rootDir)
+    if len(root) <= 0 || !chengpath.PathDirExists(root):
+        seedR2cPrintErr("[seed_r2c_gate] r2c-react root detect failed")
+        return 1
+    let controllerPath = seedR2cEnsureController(root)
+    if len(controllerPath) <= 0:
+        return 1
+    return hostops.RunFileLoggedExitCode(root,
+                                         "R2C_REACT_CONTROLLER",
+                                         controllerPath,
+                                         args,
+                                         seedR2cStableEnv(root),
+                                         root,
+                                         SeedR2cRunTimeoutSec,
+                                         os.JoinPath(seedR2cControllerOutDir(root), "run.log"))

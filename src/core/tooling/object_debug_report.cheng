@@ -47,9 +47,13 @@ fn ObjectDebugElfReport(path: str,
     let sectionOffset = ObjectDebugU64LELow(buf, 40)
     let sectionEntrySize = ObjectDebugU16LE(buf, 58)
     let sectionCount = ObjectDebugU16LE(buf, 60)
-    if sectionOffset < 0 || sectionEntrySize < 64 || sectionCount < 0:
+    if sectionCount < 0:
         return Err[str]("cheng object report: invalid elf section table")
-    if !ObjectDebugRangeFits(buf, sectionOffset, sectionEntrySize * sectionCount):
+    if sectionCount > 0 && sectionOffset < 0:
+        return Err[str]("cheng object report: invalid elf section table")
+    if sectionCount > 0 && sectionEntrySize < 64:
+        return Err[str]("cheng object report: invalid elf section table")
+    if sectionCount > 0 && !ObjectDebugRangeFits(buf, sectionOffset, sectionEntrySize * sectionCount):
         return Err[str]("cheng object report: truncated elf section table")
     var symbolCount: int32
     var relocCount: int32
@@ -77,6 +81,112 @@ fn ObjectDebugElfReport(path: str,
     ObjectDebugAppendLine(out, "import_count", "0")
     return Ok[str](out)
 
+fn ObjectDebugMachOFileTypeName(fileType: int32): str =
+    if fileType == 1:
+        return "relocatable"
+    if fileType == 2:
+        return "executable"
+    if fileType == 6:
+        return "dylib"
+    return "unknown"
+
+fn ObjectDebugMachOReport(path: str,
+                            buf: rawbytes.ByteBuffer): Result[str] =
+    if !ObjectDebugRangeFits(buf, 0, 32):
+        return Err[str]("cheng object report: truncated macho header")
+    let fileType = ObjectDebugU32LE(buf, 12)
+    let loadCommandCount = ObjectDebugU32LE(buf, 16)
+    let loadCommandBytes = ObjectDebugU32LE(buf, 20)
+    if loadCommandCount < 0 || loadCommandBytes < 0:
+        return Err[str]("cheng object report: invalid macho load command table")
+    if !ObjectDebugRangeFits(buf, 32, loadCommandBytes):
+        return Err[str]("cheng object report: truncated macho load command table")
+    var cursor = 32
+    var sectionCount: int32
+    var symbolCount: int32
+    var relocCount: int32
+    for i in 0..<loadCommandCount:
+        if !ObjectDebugRangeFits(buf, cursor, 8):
+            return Err[str]("cheng object report: truncated macho load command")
+        let cmd = ObjectDebugU32LE(buf, cursor)
+        let cmdSize = ObjectDebugU32LE(buf, cursor + 4)
+        if cmdSize < 8 || !ObjectDebugRangeFits(buf, cursor, cmdSize):
+            return Err[str]("cheng object report: invalid macho load command")
+        if cmd == 25:
+            if cmdSize < 72:
+                return Err[str]("cheng object report: truncated macho segment64")
+            let nsects = ObjectDebugU32LE(buf, cursor + 64)
+            sectionCount = sectionCount + nsects
+            var sectionCursor = cursor + 72
+            for s in 0..<nsects:
+                if !ObjectDebugRangeFits(buf, sectionCursor, 80):
+                    return Err[str]("cheng object report: truncated macho section64")
+                relocCount = relocCount + ObjectDebugU32LE(buf, sectionCursor + 60)
+                sectionCursor = sectionCursor + 80
+        elif cmd == 2:
+            if cmdSize < 24:
+                return Err[str]("cheng object report: truncated macho symtab")
+            symbolCount = ObjectDebugU32LE(buf, cursor + 12)
+        cursor = cursor + cmdSize
+    var out = ""
+    out = out + "cheng_object_report_v1\n"
+    ObjectDebugAppendLine(out, "format", "macho64")
+    ObjectDebugAppendLine(out, "path", path)
+    ObjectDebugAppendLine(out, "macho_type", ObjectDebugMachOFileTypeName(fileType))
+    ObjectDebugAppendLine(out, "section_count", intToStr(sectionCount))
+    ObjectDebugAppendLine(out, "load_command_count", intToStr(loadCommandCount))
+    ObjectDebugAppendLine(out, "symbol_count", intToStr(symbolCount))
+    ObjectDebugAppendLine(out, "reloc_count", intToStr(relocCount))
+    ObjectDebugAppendLine(out, "import_count", "0")
+    return Ok[str](out)
+
+fn ObjectDebugPeReportFromCoffHeader(path: str,
+                                      buf: rawbytes.ByteBuffer,
+                                      coffOffset: int32): Result[str] =
+    if !ObjectDebugRangeFits(buf, coffOffset, 20):
+        return Err[str]("cheng object report: truncated coff header")
+    let machine = ObjectDebugU16LE(buf, coffOffset)
+    let sectionCount = ObjectDebugU16LE(buf, coffOffset + 2)
+    let symbolTableOffset = ObjectDebugU32LE(buf, coffOffset + 8)
+    let symbolCount = ObjectDebugU32LE(buf, coffOffset + 12)
+    let optionalHeaderSize = ObjectDebugU16LE(buf, coffOffset + 16)
+    if sectionCount < 0 || optionalHeaderSize < 0:
+        return Err[str]("cheng object report: invalid coff header")
+    if symbolTableOffset < 0:
+        return Err[str]("cheng object report: invalid coff symbol table")
+    let sectionTableOffset = coffOffset + 20 + optionalHeaderSize
+    if !ObjectDebugRangeFits(buf, sectionTableOffset, sectionCount * 40):
+        return Err[str]("cheng object report: truncated coff section table")
+    var out = ""
+    out = out + "cheng_object_report_v1\n"
+    ObjectDebugAppendLine(out, "format", "pe/coff")
+    ObjectDebugAppendLine(out, "path", path)
+    ObjectDebugAppendLine(out, "machine", intToStr(machine))
+    ObjectDebugAppendLine(out, "section_count", intToStr(sectionCount))
+    ObjectDebugAppendLine(out, "load_command_count", "0")
+    ObjectDebugAppendLine(out, "symbol_count", intToStr(symbolCount))
+    ObjectDebugAppendLine(out, "reloc_count", "0")
+    ObjectDebugAppendLine(out, "import_count", "0")
+    return Ok[str](out)
+
+fn ObjectDebugPeReport(path: str,
+                        buf: rawbytes.ByteBuffer): Result[str] =
+    if ObjectDebugRangeFits(buf, 0, 2) &&
+       ObjectDebugByte(buf, 0) == 77 &&
+       ObjectDebugByte(buf, 1) == 90:
+        if !ObjectDebugRangeFits(buf, 60, 4):
+            return Err[str]("cheng object report: truncated mz header")
+        let peOffset = ObjectDebugU32LE(buf, 60)
+        if peOffset < 0 || !ObjectDebugRangeFits(buf, peOffset, 24):
+            return Err[str]("cheng object report: invalid pe header")
+        if ObjectDebugByte(buf, peOffset) != 80 ||
+           ObjectDebugByte(buf, peOffset + 1) != 69 ||
+           ObjectDebugByte(buf, peOffset + 2) != 0 ||
+           ObjectDebugByte(buf, peOffset + 3) != 0:
+            return Err[str]("cheng object report: invalid pe signature")
+        return ObjectDebugPeReportFromCoffHeader(path, buf, peOffset + 4)
+    return ObjectDebugPeReportFromCoffHeader(path, buf, 0)
+
 fn ObjectDebugReportText(path: str): Result[str] =
     var buf = rawbytes.ReadFileBytes(path)
     if buf.len <= 0 || buf.data == nil:
@@ -89,5 +199,25 @@ fn ObjectDebugReportText(path: str): Result[str] =
         let res = ObjectDebugElfReport(path, buf)
         rawbytes.FreeByteBuffer(buf)
         return res
+    if buf.len >= 4 &&
+       ObjectDebugByte(buf, 0) == 207 &&
+       ObjectDebugByte(buf, 1) == 250 &&
+       ObjectDebugByte(buf, 2) == 237 &&
+       ObjectDebugByte(buf, 3) == 254:
+        let res = ObjectDebugMachOReport(path, buf)
+        rawbytes.FreeByteBuffer(buf)
+        return res
+    if buf.len >= 2 &&
+       ObjectDebugByte(buf, 0) == 77 &&
+       ObjectDebugByte(buf, 1) == 90:
+        let res = ObjectDebugPeReport(path, buf)
+        rawbytes.FreeByteBuffer(buf)
+        return res
+    if buf.len >= 2:
+        let machine = ObjectDebugU16LE(buf, 0)
+        if machine == 332 || machine == 34404 || machine == 43620:
+            let res = ObjectDebugPeReport(path, buf)
+            rawbytes.FreeByteBuffer(buf)
+            return res
     rawbytes.FreeByteBuffer(buf)
-    return Err[str]("cheng object report: pure Cheng report currently supports elf64 only")
+    return Err[str]("cheng object report: unsupported object format")

@@ -50,6 +50,7 @@
 - r2c legacy wrapper 的 `status/help` 必须本地直接返回，不能先尝试 stage3 handoff；只读查询触发长编译会制造内存风险和假卡死。
 - r2c/controller 这类大闭包里不要返回或绑定大 `str[]` 字面量；当前 stage3 对复合字符串数组 temp-move 仍会缺语义，稳定写法是局部 `var str[]` 后逐项 `add`。
 - r2c controller 重烟测默认禁止自动重编完整 controller；必须由外部显式提供 `R2C_REACT_CONTROLLER_EXE` 或 `R2C_REACT_ALLOW_CONTROLLER_COMPILE=1`，verify 聚合默认只跑不重编 controller 的 direct smoke，完整 controller surface 只在 `R2C_REACT_HEAVY_CONTROLLER_SMOKE=1` 时纳入。
+- r2c controller 生成 Cheng 源码时，不要把 `import ...` 作为完整字符串字面量写进 controller 源；source closure 可能误扫字符串 import，稳定写法是分段拼接生成物。
 - r2c TSX 前端迁移主线先下沉“后续 Cheng surface 实际消费的 tsx_ast/feed 生成”，不要把它包装成完整 TS 语义前端；完整 TS/JSX 语义前端必须另设硬门禁逐步补齐。
 - `verify-r2c-react-surface` 重型聚合不能让每个 smoke 重编完整 controller；先编译一次共享 `R2C_REACT_CONTROLLER_EXE`，后续 smoke 直接复用，并给 r2c 运行阶段启用 live progress/内存守卫。
 - r2c render-compare 直接对拍不能用 PNG 文件 hash 代替像素等价；同像素可有不同压缩，应走 Cheng PNG 解码 + zlib inflate + RGBA diff，非 direct 自动串 Node 的路径必须硬失败。
@@ -64,7 +65,8 @@
 - r2c `run-native-gui` 收到显式 `--bundle-path` 时，bundle summary 必须从 bundle 文件所在目录解析；run 输出目录只负责 run report/summary，不能混用两套 artifact 根。
 - r2c native GUI 软件 framebuffer 必须放在 runtime 侧模块；controller 只传 `--screenshot-out` 并验证产物，避免把大栅格/PNG 编码闭包并入巨型 controller。
 - 纯 Cheng 写 PNG chunk type 不要从字符串循环转字节；当前稳定写法是显式 ASCII 数字写 `IHDR/IDAT/IEND` 并在 smoke 里校验文件头，不能只查文件存在和大小。
-- r2c 大入口出现无诊断 `-1` 时先扫其它 Codex/app-server 触发的 `system-link-exec` 长编译并精准停止；并发编译会制造假红和内存风险。
+- r2c 大入口出现无诊断 `-1` 时先扫其它 Codex/app-server 触发的 `system-link-exec` 长编译；非当前主线进程只能等待或避开，不能擅自停止。
+- 非当前 r2c 主线自己拉起的后台编译只观察不 kill；验证需要独占资源时等待或避开，不能擅自停止用户/其它任务进程。
 - 用户明确限定 seed 主线时，不得停止 dapanyouxuan/mobile/r2c/GUI 等非主线后台工作进程；发现并发干扰只能避开或先汇报，不擅自 kill。
 - entry bridge 接 debug/profile runtime hook 时必须按 target provider 能力加条件；Linux nolibc 这类无 native provider 目标不能无条件引用 `cheng_register_line_map_from_argv0` / `cheng_debug_profile_flush_from_argv0`。
 - r2c native GUI 上屏闭环优先落 `surface_frame_rgba_v1` 原始帧 + manifest；Android/iOS/OHOS 壳只消费这个稳定 ABI，smoke 必须校验 RGBA 字节数、route replay manifest 和 event-driven interaction manifest。

@@ -1,0 +1,402 @@
+import std/os
+import std/result
+import std/strings
+import std/strutils as strutil
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/tooling/bootstrap_contracts as contracts
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/compiler_runtime as crun
+import cheng/core/tooling/debug_tools_gate as debuggate
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+@importc("get_stdout")
+fn seedDebugRuntimeStdoutBridge(): os.File
+
+@importc("get_stderr")
+fn seedDebugRuntimeStderrBridge(): os.File
+
+fn seedDebugRuntimePrintLine(text: str) =
+    os.WriteLine(seedDebugRuntimeStdoutBridge(), text)
+
+fn seedDebugRuntimePrintErr(text: str) =
+    os.WriteLine(seedDebugRuntimeStderrBridge(), text)
+
+fn seedDebugRuntimeHostTarget(): str =
+    let detected = contracts.BootstrapDetectHostTarget()
+    if detected == "arm64-apple-darwin" ||
+       detected == "x86_64-apple-darwin" ||
+       detected == "x86_64-unknown-linux-gnu" ||
+       detected == "aarch64-unknown-linux-gnu":
+        return detected
+    return ""
+
+fn seedDebugRuntimeIsDarwinTarget(target: str): bool =
+    return target == "arm64-apple-darwin" || target == "x86_64-apple-darwin"
+
+fn seedDebugRuntimeListContains(items: str[], expected: str): bool =
+    for i in 0..<items.len:
+        if items[i] == expected:
+            return true
+    return false
+
+fn seedDebugRuntimeRemoveFileIfExists(path: str) =
+    if chengpath.PathFileExists(path):
+        os.RemoveFile(path)
+
+fn seedDebugRuntimeEnsureParentDir(rootDir: str, path: str): bool =
+    let parent = chengpath.PathParentDir(path)
+    if len(parent) <= 0:
+        return true
+    return chengpath.MkdirP(rootDir, parent)
+
+fn seedDebugRuntimeCompileEnv(): str[] =
+    var out: str[]
+    add(out, "BACKEND_INCREMENTAL=0")
+    add(out, "BACKEND_MULTI_MODULE_CACHE=0")
+    add(out, "CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
+    add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
+    add(out, "CHENG_PROGRESS=1")
+    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
+    add(out, "CHENG_COMPILE_TIMEOUT_SEC=420")
+    return out
+
+fn seedDebugRuntimeSelfCompiler(rootDir: str): str =
+    return chengpath.PathAbsolute(rootDir, "artifacts/backend_driver/cheng")
+
+fn seedDebugRuntimeProviderSourcePath(rootDir: str,
+                                        targetTriple: str,
+                                        moduleKind: slplan.SystemModuleKind,
+                                        modulePath: str): str =
+    if modulePath == crun.CoreRuntimeProviderModule():
+        if seedDebugRuntimeIsDarwinTarget(targetTriple):
+            return chengpath.PathAbsolute(rootDir, "src/core/runtime/core_runtime_provider_darwin.cheng")
+        return chengpath.PathAbsolute(rootDir, "src/core/runtime/core_runtime_provider_linux.cheng")
+    if modulePath == crun.DebugRuntimeProviderModule():
+        return chengpath.PathAbsolute(rootDir, "src/core/runtime/debug_runtime_stub.cheng")
+    if modulePath == crun.ProgramSupportProviderModule():
+        return chengpath.PathAbsolute(rootDir, "src/core/runtime/program_support_backend.cheng")
+    if modulePath == crun.ProgramSupportHostProviderModule():
+        return chengpath.PathAbsolute(rootDir, "src/core/runtime/program_support_host_runtime.cheng")
+    if modulePath == crun.CompilerRuntimeProviderModule():
+        if moduleKind == slplan.SystemCompilerControlPlane:
+            return chengpath.PathAbsolute(rootDir, "src/core/runtime/compiler_runtime_tooling_entry_provider.cheng")
+        return chengpath.PathAbsolute(rootDir, "src/core/runtime/compiler_runtime_program_entry_provider.cheng")
+    return ""
+
+fn seedDebugRuntimeProviderSourcesForPlan(rootDir: str,
+                                            plan: slplan.SystemLinkPlanStub,
+                                            out: var str[],
+                                            err: var str): bool =
+    out = []
+    err = ""
+    let modules = slplan.SystemLinkPlanProviderModules(plan)
+    let targetTriple = slplan.SystemLinkPlanTargetTriple(plan)
+    let moduleKind = slplan.SystemLinkPlanModuleKind(plan)
+    for i in 0..<modules.len:
+        let sourcePath = seedDebugRuntimeProviderSourcePath(rootDir,
+                                                            targetTriple,
+                                                            moduleKind,
+                                                            modules[i])
+        if len(sourcePath) <= 0:
+            err = "debug runtime provider plan: unsupported provider module: " + modules[i]
+            return false
+        add(out, sourcePath)
+    return true
+
+fn seedDebugRuntimeExpectedProviderModules(track: crun.CompilerExecutionTrack): str[] =
+    var out: str[]
+    crun.RuntimeProviderModulesForTrack(track, out)
+    return out
+
+fn seedDebugRuntimeVerifyProviderModuleSet(plan: slplan.SystemLinkPlanStub,
+                                             expectedModules: str[],
+                                             label: str): bool =
+    let actualModules = slplan.SystemLinkPlanProviderModules(plan)
+    for i in 0..<expectedModules.len:
+        if !seedDebugRuntimeListContains(actualModules, expectedModules[i]):
+            seedDebugRuntimePrintErr(label + ": missing provider module: " + expectedModules[i])
+            return false
+    for i in 0..<actualModules.len:
+        if !seedDebugRuntimeListContains(expectedModules, actualModules[i]):
+            seedDebugRuntimePrintErr(label + ": unexpected provider module: " + actualModules[i])
+            return false
+    return true
+
+fn seedDebugRuntimeVerifyProviderSources(rootDir: str,
+                                           sources: str[],
+                                           expectedSources: str[],
+                                           label: str): bool =
+    for i in 0..<sources.len:
+        if !strings.HasSuffix(sources[i], ".cheng"):
+            seedDebugRuntimePrintErr(label + ": non-Cheng provider source detected: " + sources[i])
+            return false
+        if !chengpath.FileExistsNonEmpty(rootDir, sources[i]):
+            seedDebugRuntimePrintErr(label + ": missing provider source: " + sources[i])
+            return false
+    for i in 0..<expectedSources.len:
+        if !seedDebugRuntimeListContains(sources, expectedSources[i]):
+            seedDebugRuntimePrintErr(label + ": missing provider source: " + expectedSources[i])
+            return false
+    return true
+
+fn seedDebugRuntimeExpectedProviderSources(rootDir: str,
+                                             targetTriple: str,
+                                             track: crun.CompilerExecutionTrack): str[] =
+    var out: str[]
+    if track == crun.CompilerTrackTooling:
+        add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/compiler_runtime_tooling_entry_provider.cheng"))
+    else:
+        add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/compiler_runtime_program_entry_provider.cheng"))
+    if seedDebugRuntimeIsDarwinTarget(targetTriple):
+        add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/core_runtime_provider_darwin.cheng"))
+    else:
+        add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/core_runtime_provider_linux.cheng"))
+    add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/debug_runtime_stub.cheng"))
+    add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/program_support_backend.cheng"))
+    add(out, chengpath.PathAbsolute(rootDir, "src/core/runtime/program_support_host_runtime.cheng"))
+    return out
+
+fn seedDebugRuntimeVerifyProviderPlan(rootDir: str,
+                                        sourcePath: str,
+                                        outputPath: str,
+                                        targetTriple: str,
+                                        expectedKind: slplan.SystemModuleKind,
+                                        expectedRuntimeTarget: str,
+                                        track: crun.CompilerExecutionTrack,
+                                        label: str): bool =
+    let req = creq.CompilerRequestNew(rootDir,
+                                      sourcePath,
+                                      outputPath,
+                                      targetTriple,
+                                      creq.EmitExe,
+                                      "")
+    var plan: slplan.SystemLinkPlanStub
+    var planErr = ""
+    if !slplan.BuildSystemLinkPlanStub(rootDir, req, plan, planErr):
+        seedDebugRuntimePrintErr(label + ": " + planErr)
+        return false
+    let missingReasons = slplan.SystemLinkPlanMissingReasonsField(plan)
+    if missingReasons.len > 0:
+        seedDebugRuntimePrintErr(label + ": missing reasons: " + slplan.SystemLinkPlanListText(missingReasons))
+        return false
+    let actualKind = slplan.SystemLinkPlanModuleKind(plan)
+    if actualKind != expectedKind:
+        seedDebugRuntimePrintErr(label + ": module kind mismatch: " + slplan.SystemModuleKindText(actualKind))
+        return false
+    if !seedDebugRuntimeListContains(slplan.SystemLinkPlanRuntimeTargets(plan), expectedRuntimeTarget):
+        seedDebugRuntimePrintErr(label + ": missing runtime target: " + expectedRuntimeTarget)
+        return false
+    let expectedModules = seedDebugRuntimeExpectedProviderModules(track)
+    if !seedDebugRuntimeVerifyProviderModuleSet(plan, expectedModules, label):
+        return false
+    var providerSources: str[]
+    var providerErr = ""
+    if !seedDebugRuntimeProviderSourcesForPlan(rootDir, plan, providerSources, providerErr):
+        seedDebugRuntimePrintErr(label + ": " + providerErr)
+        return false
+    let expectedSources = seedDebugRuntimeExpectedProviderSources(rootDir, targetTriple, track)
+    return seedDebugRuntimeVerifyProviderSources(rootDir, providerSources, expectedSources, label)
+
+fn seedDebugRuntimeCompileExe(rootDir: str,
+                                label: str,
+                                sourcePath: str,
+                                outputPath: str,
+                                targetTriple: str,
+                                compileLog: str): int32 =
+    let compilerPath = seedDebugRuntimeSelfCompiler(rootDir)
+    if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        seedDebugRuntimePrintErr(label + ": missing compiler: " + compilerPath)
+        return 1
+    if !chengpath.FileExistsNonEmpty(rootDir, sourcePath):
+        seedDebugRuntimePrintErr(label + ": missing source: " + sourcePath)
+        return 1
+    if !seedDebugRuntimeEnsureParentDir(rootDir, outputPath) ||
+       !seedDebugRuntimeEnsureParentDir(rootDir, compileLog):
+        seedDebugRuntimePrintErr(label + ": failed to create output dirs")
+        return 1
+    seedDebugRuntimeRemoveFileIfExists(outputPath)
+    seedDebugRuntimeRemoveFileIfExists(outputPath + ".map")
+    seedDebugRuntimeRemoveFileIfExists(compileLog)
+    var compileArgs: str[]
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, "--root:" + rootDir)
+    add(compileArgs, "--in:" + sourcePath)
+    add(compileArgs, "--emit:exe")
+    add(compileArgs, "--target:" + targetTriple)
+    add(compileArgs, "--out:" + outputPath)
+    let run = hostops.RunFileLogged(rootDir,
+                                    label + "_compile",
+                                    compilerPath,
+                                    compileArgs,
+                                    seedDebugRuntimeCompileEnv(),
+                                    rootDir,
+                                    420,
+                                    compileLog)
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        if hostops.LoggedRunOk(run):
+            seedDebugRuntimePrintLine(outputText)
+        else:
+            seedDebugRuntimePrintErr(outputText)
+    if !hostops.LoggedRunOk(run):
+        return run.exitCode
+    if !chengpath.FileExistsNonEmpty(rootDir, outputPath):
+        seedDebugRuntimePrintErr(label + ": missing output: " + outputPath)
+        return 1
+    return 0
+
+fn seedDebugRuntimeRunCompiled(rootDir: str,
+                                label: str,
+                                outputPath: str,
+                                runLog: str): hostops.LoggedRun =
+    seedDebugRuntimeRemoveFileIfExists(runLog)
+    let run = hostops.RunFileLogged(rootDir,
+                                    label + "_run",
+                                    outputPath,
+                                    [],
+                                    [],
+                                    rootDir,
+                                    20,
+                                    runLog)
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        if hostops.LoggedRunOk(run):
+            seedDebugRuntimePrintErr(outputText)
+        else:
+            seedDebugRuntimePrintLine(outputText)
+    return run
+
+fn seedDebugRuntimeRequireOutput(text: str,
+                                  needle: str,
+                                  label: str): bool =
+    if strutil.Contains(text, needle):
+        return true
+    seedDebugRuntimePrintErr(label + ": missing output: " + needle)
+    return false
+
+fn seedDebugRuntimeBuildCrashTrace(rootDir: str,
+                                    targetTriple: str,
+                                    commandName: str,
+                                    artifactDirRel: str,
+                                    sourceRel: str,
+                                    outputName: str,
+                                    requiredRuntimeText: str,
+                                    requiredReasonText: str): int32 =
+    let outDir = chengpath.PathAbsolute(rootDir, artifactDirRel)
+    let sourcePath = chengpath.PathAbsolute(rootDir, sourceRel)
+    let outputPath = os.JoinPath(outDir, outputName)
+    let reportPath = os.JoinPath(outDir, outputName + ".report.txt")
+    let compileLog = os.JoinPath(outDir, outputName + ".compile.log")
+    let runLog = os.JoinPath(outDir, outputName + ".run.log")
+    let reportLog = os.JoinPath(outDir, outputName + ".crash-report.log")
+    let compileRc = seedDebugRuntimeCompileExe(rootDir,
+                                               commandName,
+                                               sourcePath,
+                                               outputPath,
+                                               targetTriple,
+                                               compileLog)
+    if compileRc != 0:
+        return compileRc
+    if !chengpath.FileExistsNonEmpty(rootDir, outputPath + ".map"):
+        seedDebugRuntimePrintErr(commandName + ": missing line-map")
+        return 1
+    seedDebugRuntimeRemoveFileIfExists(reportPath)
+    seedDebugRuntimeRemoveFileIfExists(reportLog)
+    let run = seedDebugRuntimeRunCompiled(rootDir,
+                                          commandName,
+                                          outputPath,
+                                          runLog)
+    if hostops.LoggedRunOk(run):
+        seedDebugRuntimePrintErr(commandName + ": expected non-zero exit")
+        return 1
+    let reportRes = debuggate.DebugToolsCrashReportText(chengpath.ReadTextFile(rootDir, run.logPath))
+    if IsErr(reportRes):
+        let _ = chengpath.WriteTextFile(rootDir, reportLog, Error(reportRes) + "\n")
+        seedDebugRuntimePrintErr(Error(reportRes))
+        return 1
+    let reportText = Value(reportRes)
+    if !chengpath.WriteTextFile(rootDir, reportPath, reportText):
+        seedDebugRuntimePrintErr(commandName + ": failed to write report: " + reportPath)
+        return 1
+    if !chengpath.FileExistsNonEmpty(rootDir, reportPath):
+        seedDebugRuntimePrintErr(commandName + ": missing report")
+        return 1
+    if !seedDebugRuntimeRequireOutput(run.output, requiredRuntimeText, commandName) ||
+       !seedDebugRuntimeRequireOutput(run.output, "cheng_crash_raw_v1", commandName) ||
+       !seedDebugRuntimeRequireOutput(run.output, requiredReasonText, commandName) ||
+       !seedDebugRuntimeRequireOutput(run.output, outputName + ".cheng:", commandName) ||
+       !seedDebugRuntimeRequireOutput(reportText, "[cheng] cheng_crash_report_v1", commandName) ||
+       !seedDebugRuntimeRequireOutput(reportText, "[cheng] " + requiredReasonText, commandName) ||
+       !seedDebugRuntimeRequireOutput(reportText, outputName + ".cheng:", commandName):
+        return 1
+    seedDebugRuntimePrintLine(strutil.Strip(reportText))
+    return 0
+
+fn seedDebugRuntimeBuildPanicTrace(rootDir: str, targetTriple: str): int32 =
+    return seedDebugRuntimeBuildCrashTrace(rootDir,
+                                           targetTriple,
+                                           "build-panic-trace",
+                                           "artifacts/panic_trace",
+                                           "src/tests/ordinary_panic_fixture.cheng",
+                                           "ordinary_panic_fixture",
+                                           "panic fixture",
+                                           "reason=panic mode=backtrace")
+
+fn seedDebugRuntimeBuildBoundsTrace(rootDir: str, targetTriple: str): int32 =
+    return seedDebugRuntimeBuildCrashTrace(rootDir,
+                                           targetTriple,
+                                           "build-bounds-trace",
+                                           "artifacts/bounds_trace",
+                                           "src/tests/ordinary_bounds_trace_fixture.cheng",
+                                           "ordinary_bounds_trace_fixture",
+                                           "bounds check failed",
+                                           "reason=bounds mode=backtrace")
+
+fn seedDebugRuntimeBuildSignalTrace(rootDir: str, targetTriple: str): int32 =
+    return seedDebugRuntimeBuildCrashTrace(rootDir,
+                                           targetTriple,
+                                           "build-signal-trace",
+                                           "artifacts/signal_trace",
+                                           "src/tests/ordinary_signal_trace_fixture.cheng",
+                                           "ordinary_signal_trace_fixture",
+                                           "cheng_crash_raw_v1",
+                                           "reason=signal mode=signal")
+
+fn SeedVerifyDebugRuntime(rootDir: str): int32 =
+    let hostTarget = seedDebugRuntimeHostTarget()
+    if len(hostTarget) <= 0:
+        seedDebugRuntimePrintErr("debug runtime: unsupported host target")
+        return 1
+    let ordinarySource = chengpath.PathAbsolute(rootDir, "src/tests/ordinary_panic_fixture.cheng")
+    let toolingSource = chengpath.PathAbsolute(rootDir, "src/core/tooling/compiler_main.cheng")
+    let ordinaryOutput = chengpath.PathAbsolute(rootDir, "artifacts/debug_runtime_verify/provider_plan_ordinary")
+    let toolingOutput = chengpath.PathAbsolute(rootDir, "artifacts/debug_runtime_verify/provider_plan_tooling")
+    if !seedDebugRuntimeVerifyProviderPlan(rootDir,
+                                           ordinarySource,
+                                           ordinaryOutput,
+                                           hostTarget,
+                                           slplan.SystemOrdinaryProgram,
+                                           crun.CompilerProgramArgvRuntimeTarget(),
+                                           crun.CompilerTrackProgram,
+                                           "debug runtime provider plan ordinary"):
+        return 1
+    if !seedDebugRuntimeVerifyProviderPlan(rootDir,
+                                           toolingSource,
+                                           toolingOutput,
+                                           hostTarget,
+                                           slplan.SystemCompilerControlPlane,
+                                           crun.CompilerToolingArgvRuntimeTarget(),
+                                           crun.CompilerTrackTooling,
+                                           "debug runtime provider plan tooling"):
+        return 1
+    if seedDebugRuntimeBuildPanicTrace(rootDir, hostTarget) != 0:
+        return 1
+    if seedDebugRuntimeBuildBoundsTrace(rootDir, hostTarget) != 0:
+        return 1
+    if seedDebugRuntimeBuildSignalTrace(rootDir, hostTarget) != 0:
+        return 1
+    seedDebugRuntimePrintLine("debug runtime: ok")
+    return 0

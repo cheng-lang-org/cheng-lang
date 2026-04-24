@@ -4,6 +4,8 @@ import std/os
 import std/strings
 import std/system as system
 import std/strutils as strutil
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
 import cheng/core/backend/line_map as linemap
 import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/primary_object_plan as pobj
@@ -15,13 +17,24 @@ import cheng/core/tooling/compiler_request as creq
 import cheng/core/tooling/debug_tools_gate as debuggate
 import cheng/core/tooling/export_visibility_gate as evgate
 import cheng/core/tooling/host_bridge_audit_gate as hbagate
+import cheng/core/tooling/host_smoke_gate as hsgate
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/hotpath_scan as hotscan
 import cheng/core/tooling/object_debug_report as objectreport
 import cheng/core/tooling/path as chengpath
 import cheng/core/tooling/seed_cross_target_gate as crossgate
+import cheng/core/tooling/seed_debug_runtime_gate as debugruntimegate
+import cheng/core/tooling/seed_app_build_gate as appbuildgate
+import cheng/core/tooling/seed_network_gate as networkgate
+import cheng/core/tooling/seed_orphan_guard_gate as orphangate
+import cheng/core/tooling/seed_r2c_gate as r2cgate
+import cheng/core/tooling/seed_stage23_libp2p_gate as stage23gate
 import cheng/core/tooling/support_matrix as smatrix
 import cheng/core/tooling/wasm_smoke_gate as wsgate
+
+const
+    BackendDriverSystemLinkExecCacheVersion = "system-link-exec-cache-v2"
+    BackendDriverSystemLinkExecCacheRequireHitEnv = "CHENG_BACKEND_DRIVER_REQUIRE_SYSTEM_LINK_EXEC_CACHE_HIT"
 
 @importc("get_stdout")
 fn BackendDriverStdoutBridge(): os.File
@@ -47,6 +60,10 @@ fn BackendDriverPrintKeyValue(key: str,
     os.Write(BackendDriverStdoutBridge(), "=")
     os.WriteLine(BackendDriverStdoutBridge(), value)
 
+fn BackendDriverTruthyEnv(name: str): bool =
+    let raw = os.GetEnv(name)
+    return len(raw) > 0 && raw != "0" && raw != "false"
+
 fn BackendDriverRoot(): str =
     let envRoot = strutil.Strip(os.GetEnv("CHENG_ROOT"))
     if len(envRoot) > 0:
@@ -61,8 +78,8 @@ fn BackendDriverUsage(rootDir: str) =
     BackendDriverPrintLine("core commands: status, print-build-plan, host-bridge-audit, system-link-exec")
     BackendDriverPrintLine("world/proof commands: world-receipt")
     BackendDriverPrintLine("debug commands: debug-report, print-symbols, print-line-map, print-object, print-elf, print-asm, profile-report, crash-report")
-    BackendDriverPrintLine("verify commands: verify-export-visibility, verify-export-visibility-parallel, verify-backend-driver-command-surface, verify-mobile-shell-build-probe, verify-r2c-react-surface, verify-debug-tools, verify-debug-profile, verify-windows-builtin, verify-riscv64-builtin")
-    BackendDriverPrintLine("gate commands: run-host-smokes, run-production-regression")
+    BackendDriverPrintLine("verify commands: verify-orphan-guard, verify-export-visibility, verify-export-visibility-parallel, verify-backend-driver-command-surface, verify-mobile-shell-build-probe, verify-r2c-react-surface, verify-debug-tools, verify-debug-runtime, verify-debug-profile, verify-windows-builtin, verify-riscv64-builtin")
+    BackendDriverPrintLine("gate commands: run-host-smokes, run-stage23-libp2p-smokes, run-production-regression, slice-gate")
     BackendDriverPrintKeyValue("stage3", BackendDriverStage3Path(rootDir))
 
 fn BackendDriverEnsureRootEnv(rootDir: str) =
@@ -400,8 +417,7 @@ fn BackendDriverRunHostSmokesWithR2cController(rootDir: str,
         return 1
     let tests = BackendDriverCollectHostSmokeNames(args)
     if tests.len <= 0:
-        BackendDriverPrintErr("backend driver host smokes: explicit smoke names required")
-        return 2
+        return hsgate.HostSmokeRun(rootDir, args)
     let label = BackendDriverHostSmokeLabel(args)
     var outDir = chengpath.PathAbsolute(rootDir, "artifacts/hostrun")
     if label != "host":
@@ -488,6 +504,14 @@ fn BackendDriverRunDebugTextCommand(rootDir: str,
                                                         plans.primaryPlan)
     elif commandName == "print-line-map":
         report = linemap.LineMapText(plans.linkPlan, plans.loweringPlan)
+    elif commandName == "print-asm":
+        let asmReport = debuggate.DebugToolsAsmReportText(plans.linkPlan,
+                                                          plans.loweringPlan,
+                                                          plans.primaryPlan)
+        if IsErr(asmReport):
+            BackendDriverPrintErr(Error(asmReport))
+            return 1
+        report = Value(asmReport)
     else:
         BackendDriverPrintErr("backend driver debug: unsupported direct command: " + commandName)
         return 2
@@ -584,6 +608,437 @@ fn BackendDriverEnsureParentDir(rootDir: str,
 fn BackendDriverRemoveFileIfExists(path: str) =
     if chengpath.PathFileExists(path):
         os.RemoveFile(path)
+
+fn BackendDriverBuildLinuxNolibcExe(rootDir: str): int32 =
+    let targetRaw = strutil.Strip(os.GetEnvDefault("CHENG_LINUX_EXE_TARGET", "aarch64-unknown-linux-gnu"))
+    let sourceRaw = strutil.Strip(os.GetEnvDefault("CHENG_LINUX_EXE_SOURCE", ""))
+    let outRaw = strutil.Strip(os.GetEnvDefault("CHENG_LINUX_EXE_OUT", ""))
+    if len(sourceRaw) <= 0:
+        BackendDriverPrintErr(" linux exe: missing CHENG_LINUX_EXE_SOURCE")
+        return 1
+    if len(outRaw) <= 0:
+        BackendDriverPrintErr(" linux exe: missing CHENG_LINUX_EXE_OUT")
+        return 1
+    var target = targetRaw
+    if target == "arm64-unknown-linux-gnu":
+        target = "aarch64-unknown-linux-gnu"
+    if target != "aarch64-unknown-linux-gnu":
+        BackendDriverPrintErr(" linux exe: unsupported target=" + targetRaw)
+        return 1
+    let compilerRaw = strutil.Strip(os.GetEnvDefault("CHENG_LINUX_EXE_COMPILER", "artifacts/backend_driver/cheng"))
+    let compilerPath = chengpath.PathAbsolute(rootDir, compilerRaw)
+    if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        BackendDriverPrintErr(" linux exe: missing compiler: " + compilerPath)
+        return 1
+    let sourcePath = chengpath.PathAbsolute(rootDir, sourceRaw)
+    let outPath = chengpath.PathAbsolute(rootDir, outRaw)
+    let reportRaw = strutil.Strip(os.GetEnvDefault("CHENG_LINUX_EXE_REPORT", ""))
+    let compileLog = outPath + ".compile.log"
+    if !chengpath.FileExistsNonEmpty(rootDir, sourcePath):
+        BackendDriverPrintErr(" linux exe: missing source: " + sourcePath)
+        return 1
+    if !BackendDriverEnsureParentDir(rootDir, outPath):
+        BackendDriverPrintErr(" linux exe: failed to create output dir: " + outPath)
+        return 1
+    if len(reportRaw) > 0:
+        let reportPath = chengpath.PathAbsolute(rootDir, reportRaw)
+        if !BackendDriverEnsureParentDir(rootDir, reportPath):
+            BackendDriverPrintErr(" linux exe: failed to create report dir: " + reportPath)
+            return 1
+    BackendDriverRemoveFileIfExists(outPath)
+    BackendDriverRemoveFileIfExists(outPath + ".map")
+    BackendDriverRemoveFileIfExists(compileLog)
+    var compileArgs: str[]
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, "--root:" + rootDir)
+    add(compileArgs, "--in:" + sourcePath)
+    add(compileArgs, "--emit:exe")
+    add(compileArgs, "--target:" + target)
+    add(compileArgs, "--out:" + outPath)
+    if len(reportRaw) > 0:
+        add(compileArgs, "--report-out:" + chengpath.PathAbsolute(rootDir, reportRaw))
+    let run = hostops.RunFileLogged(rootDir,
+                                      "backend_driver_linux_nolibc_exe",
+                                      compilerPath,
+                                      compileArgs,
+                                      BackendDriverHostSmokeCompileEnv(),
+                                      rootDir,
+                                      int32(strutil.ParseInt(os.GetEnvDefault("CHENG_COMPILE_TIMEOUT_SEC", "300"))),
+                                      compileLog)
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        if hostops.LoggedRunOk(run):
+            BackendDriverPrintLine(outputText)
+        else:
+            BackendDriverPrintErr(outputText)
+    if !hostops.LoggedRunOk(run):
+        return run.exitCode
+    if !chengpath.FileExistsNonEmpty(rootDir, outPath):
+        BackendDriverPrintErr(" linux exe: missing output: " + outPath)
+        return 1
+    BackendDriverPrintLine("cheng linux exe: build ok target=" + target + " out=" + outPath)
+    return 0
+
+fn BackendDriverSelfCompiler(rootDir: str): str =
+    return chengpath.PathAbsolute(rootDir, "artifacts/backend_driver/cheng")
+
+fn BackendDriverRequireOutput(text: str,
+                                needle: str,
+                                label: str): bool =
+    if strutil.Contains(text, needle):
+        return true
+    BackendDriverPrintErr(label + ": missing output: " + needle)
+    return false
+
+fn BackendDriverCompileDarwinExe(rootDir: str,
+                                   label: str,
+                                   sourcePath: str,
+                                   outputPath: str,
+                                   compileLog: str): int32 =
+    return BackendDriverCompileDarwinExeWithCompiler(rootDir,
+                                                     label,
+                                                     BackendDriverSelfCompiler(rootDir),
+                                                     sourcePath,
+                                                     outputPath,
+                                                     compileLog)
+
+fn BackendDriverCompileDarwinExeWithCompiler(rootDir: str,
+                                               label: str,
+                                               compilerPath: str,
+                                   sourcePath: str,
+                                   outputPath: str,
+                                   compileLog: str): int32 =
+    if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        BackendDriverPrintErr(label + ": missing compiler: " + compilerPath)
+        return 1
+    if !chengpath.FileExistsNonEmpty(rootDir, sourcePath):
+        BackendDriverPrintErr(label + ": missing source: " + sourcePath)
+        return 1
+    if !BackendDriverEnsureParentDir(rootDir, outputPath) ||
+       !BackendDriverEnsureParentDir(rootDir, compileLog):
+        BackendDriverPrintErr(label + ": failed to create output dirs")
+        return 1
+    BackendDriverRemoveFileIfExists(outputPath)
+    BackendDriverRemoveFileIfExists(outputPath + ".map")
+    BackendDriverRemoveFileIfExists(compileLog)
+    var compileArgs: str[]
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, "--root:" + rootDir)
+    add(compileArgs, "--in:" + sourcePath)
+    add(compileArgs, "--emit:exe")
+    add(compileArgs, "--target:arm64-apple-darwin")
+    add(compileArgs, "--out:" + outputPath)
+    let run = hostops.RunFileLogged(rootDir,
+                                      label + "_compile",
+                                      compilerPath,
+                                      compileArgs,
+                                      BackendDriverHostSmokeCompileEnv(),
+                                      rootDir,
+                                      420,
+                                      compileLog)
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        if hostops.LoggedRunOk(run):
+            BackendDriverPrintLine(outputText)
+        else:
+            BackendDriverPrintErr(outputText)
+    if !hostops.LoggedRunOk(run):
+        return run.exitCode
+    if !chengpath.FileExistsNonEmpty(rootDir, outputPath):
+        BackendDriverPrintErr(label + ": missing output: " + outputPath)
+        return 1
+    return 0
+
+fn BackendDriverRunCompiled(rootDir: str,
+                              label: str,
+                              outputPath: str,
+                              runLog: str,
+                              expectSuccess: bool): hostops.LoggedRun =
+    BackendDriverRemoveFileIfExists(runLog)
+    let run = hostops.RunFileLogged(rootDir,
+                                      label + "_run",
+                                      outputPath,
+                                      [],
+                                      [],
+                                      rootDir,
+                                      20,
+                                      runLog)
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        if expectSuccess:
+            if hostops.LoggedRunOk(run):
+                BackendDriverPrintLine(outputText)
+            else:
+                BackendDriverPrintErr(outputText)
+        else:
+            if hostops.LoggedRunOk(run):
+                BackendDriverPrintErr(outputText)
+            else:
+                BackendDriverPrintLine(outputText)
+    return run
+
+fn BackendDriverBuildRunSuccessFixture(rootDir: str,
+                                         commandName: str,
+                                         artifactDirRel: str,
+                                         sourceRel: str,
+                                         outputName: str): int32 =
+    let outDir = chengpath.PathAbsolute(rootDir, artifactDirRel)
+    let sourcePath = chengpath.PathAbsolute(rootDir, sourceRel)
+    let outputPath = os.JoinPath(outDir, outputName)
+    let compileLog = os.JoinPath(outDir, outputName + ".compile.log")
+    let runLog = os.JoinPath(outDir, outputName + ".run.log")
+    let compileRc = BackendDriverCompileDarwinExe(rootDir,
+                                                   commandName,
+                                                   sourcePath,
+                                                   outputPath,
+                                                   compileLog)
+    if compileRc != 0:
+        return compileRc
+    if commandName == "build-zero-exit" &&
+       !chengpath.FileExistsNonEmpty(rootDir, outputPath + ".map"):
+        BackendDriverPrintErr("zero-exit: missing line-map")
+        return 1
+    let run = BackendDriverRunCompiled(rootDir,
+                                        commandName,
+                                        outputPath,
+                                        runLog,
+                                        true)
+    if !hostops.LoggedRunOk(run):
+        return run.exitCode
+    return 0
+
+fn BackendDriverBuildZeroExit(rootDir: str): int32 =
+    return BackendDriverBuildRunSuccessFixture(rootDir,
+                                               "build-zero-exit",
+                                               "artifacts/zero_exit",
+                                               "src/tests/ordinary_zero_exit_fixture.cheng",
+                                               "ordinary_zero_exit_fixture")
+
+fn BackendDriverBuildCallChain(rootDir: str): int32 =
+    return BackendDriverBuildRunSuccessFixture(rootDir,
+                                               "build-call-chain",
+                                               "artifacts/call_chain",
+                                               "src/tests/ordinary_call_chain_fixture.cheng",
+                                               "ordinary_call_chain_fixture")
+
+fn BackendDriverBuildProgramSelfhost(rootDir: str): int32 =
+    return BackendDriverBuildRunSuccessFixture(rootDir,
+                                               "build-program-selfhost",
+                                               "artifacts/program_selfhost",
+                                               "src/tests/program_selfhost_smoke.cheng",
+                                               "program_selfhost_smoke")
+
+fn BackendDriverBuildCrashTrace(rootDir: str,
+                                  commandName: str,
+                                  artifactDirRel: str,
+                                  sourceRel: str,
+                                  outputName: str,
+                                  requiredRuntimeText: str,
+                                  requiredReasonText: str): int32 =
+    let compilerPath = BackendDriverSelfCompiler(rootDir)
+    let outDir = chengpath.PathAbsolute(rootDir, artifactDirRel)
+    let sourcePath = chengpath.PathAbsolute(rootDir, sourceRel)
+    let outputPath = os.JoinPath(outDir, outputName)
+    let reportPath = os.JoinPath(outDir, outputName + ".report.txt")
+    let compileLog = os.JoinPath(outDir, outputName + ".compile.log")
+    let runLog = os.JoinPath(outDir, outputName + ".run.log")
+    let reportLog = os.JoinPath(outDir, outputName + ".crash-report.log")
+    let compileRc = BackendDriverCompileDarwinExe(rootDir,
+                                                   commandName,
+                                                   sourcePath,
+                                                   outputPath,
+                                                   compileLog)
+    if compileRc != 0:
+        return compileRc
+    if !chengpath.FileExistsNonEmpty(rootDir, outputPath + ".map"):
+        BackendDriverPrintErr(commandName + ": missing line-map")
+        return 1
+    BackendDriverRemoveFileIfExists(reportPath)
+    BackendDriverRemoveFileIfExists(reportLog)
+    let run = BackendDriverRunCompiled(rootDir,
+                                        commandName,
+                                        outputPath,
+                                        runLog,
+                                        false)
+    if hostops.LoggedRunOk(run):
+        BackendDriverPrintErr(commandName + ": expected non-zero exit")
+        return 1
+    let reportRun = hostops.RunFileLogged(rootDir,
+                                           commandName + "_crash_report",
+                                           compilerPath,
+                                           [
+                                               "crash-report",
+                                               "--in:" + run.logPath,
+                                               "--out:" + reportPath
+                                           ],
+                                           [],
+                                           rootDir,
+                                           20,
+                                           reportLog)
+    if !hostops.LoggedRunOk(reportRun):
+        let outputText = strutil.Strip(reportRun.output)
+        if len(outputText) > 0:
+            BackendDriverPrintErr(outputText)
+        return reportRun.exitCode
+    if !chengpath.FileExistsNonEmpty(rootDir, reportPath):
+        BackendDriverPrintErr(commandName + ": missing report")
+        return 1
+    let reportText = chengpath.ReadTextFile(rootDir, reportPath)
+    if !BackendDriverRequireOutput(run.output, requiredRuntimeText, commandName) ||
+       !BackendDriverRequireOutput(run.output, "cheng_crash_raw_v1", commandName) ||
+       !BackendDriverRequireOutput(run.output, requiredReasonText, commandName) ||
+       !BackendDriverRequireOutput(run.output, outputName + ".cheng:", commandName) ||
+       !BackendDriverRequireOutput(reportText, "[cheng] cheng_crash_report_v1", commandName) ||
+       !BackendDriverRequireOutput(reportText, "[cheng] " + requiredReasonText, commandName) ||
+       !BackendDriverRequireOutput(reportText, outputName + ".cheng:", commandName):
+        return 1
+    BackendDriverPrintLine(strutil.Strip(reportText))
+    return 0
+
+fn BackendDriverBuildPanicTrace(rootDir: str): int32 =
+    return BackendDriverBuildCrashTrace(rootDir,
+                                        "build-panic-trace",
+                                        "artifacts/panic_trace",
+                                        "src/tests/ordinary_panic_fixture.cheng",
+                                        "ordinary_panic_fixture",
+                                        "panic fixture",
+                                        "reason=panic mode=backtrace")
+
+fn BackendDriverBuildBoundsTrace(rootDir: str): int32 =
+    return BackendDriverBuildCrashTrace(rootDir,
+                                        "build-bounds-trace",
+                                        "artifacts/bounds_trace",
+                                        "src/tests/ordinary_bounds_trace_fixture.cheng",
+                                        "ordinary_bounds_trace_fixture",
+                                        "bounds check failed",
+                                        "reason=bounds mode=backtrace")
+
+fn BackendDriverBuildSignalTrace(rootDir: str): int32 =
+    return BackendDriverBuildCrashTrace(rootDir,
+                                        "build-signal-trace",
+                                        "artifacts/signal_trace",
+                                        "src/tests/ordinary_signal_trace_fixture.cheng",
+                                        "ordinary_signal_trace_fixture",
+                                        "cheng_crash_raw_v1",
+                                        "reason=signal mode=signal")
+
+fn BackendDriverRunFfiHandleTrap(rootDir: str,
+                                  label: str,
+                                  outputPath: str,
+                                  runLog: str,
+                                  sourceName: str,
+                                  requireDetailStale: bool): int32 =
+    let run = BackendDriverRunCompiled(rootDir,
+                                        label,
+                                        outputPath,
+                                        runLog,
+                                        false)
+    if hostops.LoggedRunOk(run):
+        BackendDriverPrintErr(label + ": expected non-zero exit")
+        return 1
+    if !BackendDriverRequireOutput(run.output, "ffi handle invalid", label) ||
+       !BackendDriverRequireOutput(run.output, "reason=ffi_handle", label) ||
+       !BackendDriverRequireOutput(run.output, sourceName + ".cheng:", label):
+        return 1
+    if requireDetailStale &&
+       !BackendDriverRequireOutput(run.output, "detail=stale", label):
+        return 1
+    return 0
+
+fn BackendDriverBuildFfiHandle(rootDir: str): int32 =
+    let outDir = chengpath.PathAbsolute(rootDir, "artifacts/ffi_handle")
+    let okBin = os.JoinPath(outDir, "ffi_handle_smoke")
+    let reuseBin = os.JoinPath(outDir, "ffi_handle_generation_reuse_smoke")
+    let trapBin = os.JoinPath(outDir, "ffi_handle_stale_trap_smoke")
+    let staleReuseBin = os.JoinPath(outDir, "ffi_handle_generation_stale_trap_smoke")
+    let okCompile = BackendDriverCompileDarwinExe(rootDir,
+                                                   "build-ffi-handle-ok",
+                                                   chengpath.PathAbsolute(rootDir, "src/tests/ffi_handle_smoke.cheng"),
+                                                   okBin,
+                                                   os.JoinPath(outDir, "ffi_handle_smoke.compile.log"))
+    if okCompile != 0:
+        return okCompile
+    let reuseCompile = BackendDriverCompileDarwinExe(rootDir,
+                                                      "build-ffi-handle-generation-reuse",
+                                                      chengpath.PathAbsolute(rootDir, "src/tests/ffi_handle_generation_reuse_smoke.cheng"),
+                                                      reuseBin,
+                                                      os.JoinPath(outDir, "ffi_handle_generation_reuse_smoke.compile.log"))
+    if reuseCompile != 0:
+        return reuseCompile
+    let trapCompile = BackendDriverCompileDarwinExe(rootDir,
+                                                     "build-ffi-handle-trap",
+                                                     chengpath.PathAbsolute(rootDir, "src/tests/ffi_handle_stale_trap_smoke.cheng"),
+                                                     trapBin,
+                                                     os.JoinPath(outDir, "ffi_handle_stale_trap_smoke.compile.log"))
+    if trapCompile != 0:
+        return trapCompile
+    let staleReuseCompile = BackendDriverCompileDarwinExe(rootDir,
+                                                           "build-ffi-handle-stale-reuse-trap",
+                                                           chengpath.PathAbsolute(rootDir, "src/tests/ffi_handle_generation_stale_trap_smoke.cheng"),
+                                                           staleReuseBin,
+                                                           os.JoinPath(outDir, "ffi_handle_generation_stale_trap_smoke.compile.log"))
+    if staleReuseCompile != 0:
+        return staleReuseCompile
+    if !chengpath.FileExistsNonEmpty(rootDir, okBin + ".map") ||
+       !chengpath.FileExistsNonEmpty(rootDir, reuseBin + ".map") ||
+       !chengpath.FileExistsNonEmpty(rootDir, trapBin + ".map") ||
+       !chengpath.FileExistsNonEmpty(rootDir, staleReuseBin + ".map"):
+        BackendDriverPrintErr("ffi-handle: missing line-map")
+        return 1
+    let okRun = BackendDriverRunCompiled(rootDir,
+                                          "build-ffi-handle-ok",
+                                          okBin,
+                                          os.JoinPath(outDir, "ffi_handle_smoke.run.log"),
+                                          true)
+    if !hostops.LoggedRunOk(okRun):
+        return okRun.exitCode
+    let reuseRun = BackendDriverRunCompiled(rootDir,
+                                             "build-ffi-handle-generation-reuse",
+                                             reuseBin,
+                                             os.JoinPath(outDir, "ffi_handle_generation_reuse_smoke.run.log"),
+                                             true)
+    if !hostops.LoggedRunOk(reuseRun):
+        return reuseRun.exitCode
+    let trapRc = BackendDriverRunFfiHandleTrap(rootDir,
+                                                "build-ffi-handle-trap",
+                                                trapBin,
+                                                os.JoinPath(outDir, "ffi_handle_stale_trap_smoke.run.log"),
+                                                "ffi_handle_stale_trap_smoke",
+                                                false)
+    if trapRc != 0:
+        return trapRc
+    return BackendDriverRunFfiHandleTrap(rootDir,
+                                         "build-ffi-handle-stale-reuse-trap",
+                                         staleReuseBin,
+                                         os.JoinPath(outDir, "ffi_handle_generation_stale_trap_smoke.run.log"),
+                                         "ffi_handle_generation_stale_trap_smoke",
+                                         true)
+
+fn BackendDriverRunUdpImportcSmoke(rootDir: str,
+                                    args: str[]): int32 =
+    let compilerPath = BackendDriverHostSmokeCompiler(rootDir, args)
+    let label = BackendDriverHostSmokeLabel(args)
+    let outDir = chengpath.PathAbsolute(rootDir, "artifacts/udp_importc")
+    let sourcePath = chengpath.PathAbsolute(rootDir, "src/tests/udp_importc_smoke.cheng")
+    let outputPath = os.JoinPath(outDir, "udp_importc_smoke." + label)
+    let compileRc = BackendDriverCompileDarwinExeWithCompiler(rootDir,
+                                                               "run-udp-importc-smoke-" + label,
+                                                               compilerPath,
+                                                               sourcePath,
+                                                               outputPath,
+                                                               os.JoinPath(outDir, "udp_importc_smoke." + label + ".compile.log"))
+    if compileRc != 0:
+        return compileRc
+    let run = BackendDriverRunCompiled(rootDir,
+                                        "run-udp-importc-smoke-" + label,
+                                        outputPath,
+                                        os.JoinPath(outDir, "udp_importc_smoke." + label + ".run.log"),
+                                        true)
+    if !hostops.LoggedRunOk(run):
+        return run.exitCode
+    if !BackendDriverRequireOutput(run.output, "udp_importc_smoke ok", "udp importc smoke"):
+        return 1
+    return 0
 
 fn BackendDriverRunProfileRun(rootDir: str,
                                 args: str[]): int32 =
@@ -743,6 +1198,86 @@ fn BackendDriverVerifyDebugTools(rootDir: str): int32 =
                                              "verify_debug_tools",
                                              "debug_tools_surface_smoke")
 
+fn BackendDriverForwardGateStep(rootDir: str,
+                                  command: str,
+                                  args: str[]): int32 =
+    let rc = BackendDriverForward(rootDir, command, args)
+    if rc != 0:
+        return rc
+    return 0
+
+fn BackendDriverSliceGate(rootDir: str): int32 =
+    BackendDriverPrintLine("[ gate] hot-path forbidden scan")
+    if BackendDriverScanHotpath(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] orphan guard + bootstrap path")
+    if orphangate.SeedOrphanGuardRun(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] zero-exit ordinary compile")
+    if BackendDriverBuildZeroExit(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] panic-trace ordinary compile")
+    if BackendDriverBuildPanicTrace(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] bounds-trace ordinary compile")
+    if BackendDriverBuildBoundsTrace(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] signal-trace ordinary compile")
+    if BackendDriverBuildSignalTrace(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] debug tools")
+    if BackendDriverVerifyDebugTools(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] debug runtime")
+    if debugruntimegate.SeedVerifyDebugRuntime(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] debug profile")
+    if BackendDriverVerifyDebugProfile(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] call-chain ordinary compile")
+    if BackendDriverBuildCallChain(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] ffi-handle ordinary compile")
+    if BackendDriverBuildFfiHandle(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] program-selfhost")
+    if BackendDriverBuildProgramSelfhost(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] tcp/bio/linux early regression: bio_same_person_smoke")
+    if BackendDriverRunBuiltinHostSmoke(rootDir, "slice_tcp_bio", "bio_same_person_smoke") != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] bootstrap subset self-checks")
+    if BackendDriverRunSmokes(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] host fixed256 sha256 smoke")
+    if BackendDriverRunBuiltinHostSmoke(rootDir, "slice_fixed256", "fixed256_sha256_smoke") != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] host default-init literals smoke")
+    if BackendDriverRunBuiltinHostSmoke(rootDir, "slice_default_init", "default_init_literals_smoke") != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] backend_driver command surface")
+    if BackendDriverRunBuiltinHostSmoke(rootDir,
+                                         "slice_command_surface",
+                                         "backend_driver_command_surface_smoke") != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] cross-target builtin smokes")
+    if crossgate.SeedRunCrossTargetSmokes(rootDir) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] host smokes")
+    if BackendDriverRunHostSmokes(rootDir, ["--label:slice_host_full"]) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] stage2/stage3 libp2p smokes")
+    if stage23gate.SeedRunStage23Libp2pSmokes(rootDir, []) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] remote x86 linux release gate")
+    if BackendDriverForwardGateStep(rootDir, "verify-x86-linux-remote", []) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] bft three-node verify")
+    if BackendDriverForwardGateStep(rootDir, "verify-bft-validator-three-node", []) != 0:
+        return 1
+    BackendDriverPrintLine("[ gate] ok")
+    return 0
+
 fn BackendDriverRunR2cReactSurface(rootDir: str): int32 =
     var smokes: str[]
     add(smokes, "--label:verify_r2c_react_surface")
@@ -759,6 +1294,288 @@ fn BackendDriverRunR2cReactSurface(rootDir: str): int32 =
         add(smokes, "r2c_react_render_compare_matrix_controller_smoke")
     return BackendDriverRunHostSmokesWithR2cController(rootDir, smokes, "")
 
+fn BackendDriverCacheAppendU32BE(buf: var layout.ByteBuf,
+                                   value: int32) =
+    layout.ByteBufAppendByte(buf, (value >> 24) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 16) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 8) & 255)
+    layout.ByteBufAppendByte(buf, value & 255)
+
+fn BackendDriverCacheAppendText(buf: var layout.ByteBuf,
+                                  text: str) =
+    let data = bytesFromString(text)
+    BackendDriverCacheAppendU32BE(buf, bytesLen(data))
+    layout.ByteBufAppendBytes(buf, data)
+
+fn BackendDriverCacheAppendFixed32(buf: var layout.ByteBuf,
+                                     value: layout.FixedBytes32) =
+    layout.ByteBufAppendBytes(buf, layout.FixedBytes32ToBytes(value))
+
+fn BackendDriverCacheHashText(text: str): layout.FixedBytes32 =
+    return hash256.sha256Fixed(layout.ByteSpanFromBytes(bytesFromString(text)))
+
+fn BackendDriverCacheSourceFileCid(pathRaw: str): Result[layout.FixedBytes32] =
+    let path = chengpath.PathTrim(pathRaw)
+    if len(path) <= 0:
+        return Err[layout.FixedBytes32](" backend driver system-link-exec cache: empty source path")
+    if !chengpath.PathFileExists(path):
+        return Err[layout.FixedBytes32](" backend driver system-link-exec cache: missing source path: " + path)
+    return Ok[layout.FixedBytes32](BackendDriverCacheHashText(chengpath.ReadTextFile("", path)))
+
+fn BackendDriverCacheCodegenCid(rootDir: str): Result[layout.FixedBytes32] =
+    return BackendDriverCacheSourceFileCid(chengpath.PathAbsolute(rootDir, "bootstrap/cheng_seed.c"))
+
+fn BackendDriverCacheResolveTargetCc(targetTriple: str): Result[str] =
+    if targetTriple == "wasm32-unknown-unknown":
+        return Ok[str]("wasm32-internal-primary-writer")
+    if strings.StrContains(targetTriple, "android") ||
+       strings.StrContains(targetTriple, "ohos"):
+        return Err[str](" backend driver system-link-exec cache: target cc resolver not available in driver: " + targetTriple)
+    let cc = os.GetEnv("CC")
+    if len(cc) > 0:
+        return Ok[str](cc)
+    return Ok[str]("cc")
+
+fn BackendDriverCacheSafeTarget(targetTriple: str): str =
+    var out = ""
+    for i in 0..<len(targetTriple):
+        let ch = targetTriple[i]
+        let digit = ch >= '0' && ch <= '9'
+        let upper = ch >= 'A' && ch <= 'Z'
+        let lower = ch >= 'a' && ch <= 'z'
+        if digit || upper || lower:
+            out = out + chengpath.TextSlice(targetTriple, i, 1)
+        else:
+            out = out + "_"
+    return out
+
+fn BackendDriverSystemLinkExecCacheEnabled(): bool =
+    return BackendDriverTruthyEnv("CHENG_ENABLE_SYSTEM_LINK_EXEC_CACHE") &&
+        !BackendDriverTruthyEnv("CHENG_DISABLE_SYSTEM_LINK_EXEC_CACHE")
+
+fn BackendDriverSystemLinkExecCacheSupported(plan: slplan.SystemLinkPlanStub): bool =
+    if !BackendDriverSystemLinkExecCacheEnabled():
+        return false
+    if slplan.SystemLinkPlanEmitKind(plan) != creq.EmitExe:
+        return false
+    let outputPath = slplan.SystemLinkPlanOutputPath(plan)
+    if len(outputPath) <= 0:
+        return false
+    if BackendDriverTruthyEnv("CHENG_SKIP_SEED_NATIVE_LINK"):
+        return false
+    return true
+
+fn BackendDriverSystemLinkExecNeedMap(plan: slplan.SystemLinkPlanStub): bool =
+    if slplan.SystemLinkPlanEmitKind(plan) != creq.EmitExe:
+        return false
+    return !BackendDriverTruthyEnv("CHENG_SKIP_SEED_LINE_MAP")
+
+fn BackendDriverSystemLinkExecMapPath(outputPath: str): str =
+    return outputPath + ".map"
+
+fn BackendDriverSystemLinkExecCacheKey(rootDir: str,
+                                         plan: slplan.SystemLinkPlanStub,
+                                         sourceBundleCid: layout.FixedBytes32): Result[str] =
+    let codegenRes = BackendDriverCacheCodegenCid(rootDir)
+    if IsErr(codegenRes):
+        return Err[str](Error(codegenRes))
+    let ccRes = BackendDriverCacheResolveTargetCc(slplan.SystemLinkPlanTargetTriple(plan))
+    if IsErr(ccRes):
+        return Err[str](Error(ccRes))
+    var buf = layout.ByteBufInit(65536)
+    BackendDriverCacheAppendText(buf, BackendDriverSystemLinkExecCacheVersion)
+    BackendDriverCacheAppendText(buf, slplan.SystemLinkPlanWorkspaceRoot(plan))
+    BackendDriverCacheAppendText(buf, slplan.SystemLinkPlanPackageRoot(plan))
+    BackendDriverCacheAppendText(buf, slplan.SystemLinkPlanPackageId(plan))
+    BackendDriverCacheAppendText(buf, slplan.SystemLinkPlanTargetTriple(plan))
+    BackendDriverCacheAppendText(buf, slplan.SystemModuleKindText(slplan.SystemLinkPlanModuleKind(plan)))
+    BackendDriverCacheAppendText(buf, creq.CompilerEmitText(slplan.SystemLinkPlanEmitKind(plan)))
+    BackendDriverCacheAppendText(buf, slplan.SystemLinkPlanSymbolVisibility(plan))
+    BackendDriverCacheAppendText(buf, slplan.SystemLinkPlanEntryPath(plan))
+    BackendDriverCacheAppendText(buf, slplan.SystemLinkPlanEntrySymbol(plan))
+    BackendDriverCacheAppendText(buf, Value(ccRes))
+    BackendDriverCacheAppendFixed32(buf, Value(codegenRes))
+    BackendDriverCacheAppendFixed32(buf, sourceBundleCid)
+    BackendDriverCacheAppendU32BE(buf, BackendDriverTruthyEnv("CHENG_SKIP_SEED_LINE_MAP") ? 1 : 0)
+    let runtimeTargets = slplan.SystemLinkPlanRuntimeTargets(plan)
+    BackendDriverCacheAppendU32BE(buf, runtimeTargets.len)
+    for i in 0..<runtimeTargets.len:
+        BackendDriverCacheAppendText(buf, runtimeTargets[i])
+    let providerModules = slplan.SystemLinkPlanProviderModules(plan)
+    BackendDriverCacheAppendU32BE(buf, providerModules.len)
+    for i in 0..<providerModules.len:
+        BackendDriverCacheAppendText(buf, providerModules[i])
+    let sourceClosurePaths = slplan.SystemLinkPlanSourceClosurePaths(plan)
+    BackendDriverCacheAppendU32BE(buf, sourceClosurePaths.len)
+    for i in 0..<sourceClosurePaths.len:
+        let sourceCidRes = BackendDriverCacheSourceFileCid(sourceClosurePaths[i])
+        if IsErr(sourceCidRes):
+            return Err[str](Error(sourceCidRes))
+        BackendDriverCacheAppendText(buf, sourceClosurePaths[i])
+        BackendDriverCacheAppendFixed32(buf, Value(sourceCidRes))
+    let keyCid = hash256.sha256Fixed(layout.ByteBufView(buf))
+    return Ok[str](layout.FixedBytes32Hex(keyCid))
+
+fn BackendDriverSystemLinkExecCacheSourceBundleCid(plan: slplan.SystemLinkPlanStub): Result[layout.FixedBytes32] =
+    let sourceClosurePaths = slplan.SystemLinkPlanSourceClosurePaths(plan)
+    var buf = layout.ByteBufInit(512)
+    BackendDriverCacheAppendText(buf, "cheng.compiler.source_bundle")
+    BackendDriverCacheAppendText(buf, slplan.SystemLinkPlanPackageId(plan))
+    BackendDriverCacheAppendU32BE(buf, sourceClosurePaths.len)
+    for i in 0..<sourceClosurePaths.len:
+        let sourcePath = sourceClosurePaths[i]
+        if !chengpath.PathFileExists(sourcePath):
+            return Err[layout.FixedBytes32](" backend driver system-link-exec cache: missing source path: " + sourcePath)
+        BackendDriverCacheAppendText(buf, sourcePath)
+        BackendDriverCacheAppendText(buf, chengpath.ReadTextFile("", sourcePath))
+    return Ok[layout.FixedBytes32](hash256.sha256Fixed(layout.ByteBufView(buf)))
+
+fn BackendDriverSystemLinkExecCacheDir(rootDir: str,
+                                         plan: slplan.SystemLinkPlanStub): str =
+    let cacheRoot = chengpath.PathAbsolute(rootDir, "artifacts/system_link_exec_cache")
+    return chengpath.PathJoin(cacheRoot,
+                              BackendDriverCacheSafeTarget(slplan.SystemLinkPlanTargetTriple(plan)))
+
+fn BackendDriverSystemLinkExecCacheExePath(rootDir: str,
+                                             plan: slplan.SystemLinkPlanStub,
+                                             key: str): str =
+    return chengpath.PathJoin(BackendDriverSystemLinkExecCacheDir(rootDir, plan), key + ".exe")
+
+fn BackendDriverSystemLinkExecCacheMapPath(rootDir: str,
+                                             plan: slplan.SystemLinkPlanStub,
+                                             key: str): str =
+    return chengpath.PathJoin(BackendDriverSystemLinkExecCacheDir(rootDir, plan), key + ".map")
+
+fn BackendDriverCopyFileBytes(rootDir: str,
+                                sourcePath: str,
+                                outputPath: str): bool =
+    let parent = chengpath.PathParentDir(outputPath)
+    if len(parent) > 0:
+        if !chengpath.MkdirP(rootDir, parent):
+            return false
+    let logPath = outputPath + ".cache_copy.log"
+    let run = hostops.RunProgramLogged(rootDir,
+                                        "backend_driver_system_link_exec_cache_copy",
+                                        "cp",
+                                        ["-f", sourcePath, outputPath],
+                                        [],
+                                        rootDir,
+                                        30,
+                                        logPath)
+    if run.exitCode != 0:
+        return false
+    return chengpath.FileExistsNonEmpty(rootDir, outputPath)
+
+fn BackendDriverChmodExecutable(rootDir: str,
+                                  outputPath: str): bool =
+    let logPath = outputPath + ".cache_chmod.log"
+    let run = hostops.RunProgramLogged(rootDir,
+                                        "backend_driver_system_link_exec_cache_chmod",
+                                        "chmod",
+                                        ["755", outputPath],
+                                        [],
+                                        rootDir,
+                                        30,
+                                        logPath)
+    return run.exitCode == 0
+
+fn BackendDriverSystemLinkExecCacheHitReport(plan: slplan.SystemLinkPlanStub,
+                                               sourceBundleCid: layout.FixedBytes32,
+                                               key: str,
+                                               cacheExePath: str,
+                                               cacheMapPath: str,
+                                               outputPath: str): str =
+    var out = slplan.SystemLinkPlanStubReport(plan)
+    out = out + "\nsource_bundle_cid=" + layout.FixedBytes32Hex(sourceBundleCid)
+    out = out + "\nbackend_driver_system_link_exec_cache_restore=1"
+    out = out + "\nsystem_link_exec_cache_version=" + BackendDriverSystemLinkExecCacheVersion
+    out = out + "\nsystem_link_exec_cache_key=" + key
+    out = out + "\nsystem_link_exec_cache_output=" + cacheExePath
+    out = out + "\nsystem_link_exec_cache_map=" + cacheMapPath
+    out = out + "\nsystem_link_exec_cache_hit_count=1"
+    out = out + "\nsystem_link_exec_cache_miss_count=0"
+    out = out + "\nexec_phase_system_link_exec_cache_lookup_ms=0"
+    out = out + "\nexec_phase_system_link_exec_cache_copy_ms=0"
+    out = out + "\nexec_phase_lowering_plan_ms=0"
+    out = out + "\nexec_phase_primary_object_plan_ms=0"
+    out = out + "\nexec_phase_provider_objects_ms=0"
+    out = out + "\nexec_phase_primary_object_emit_ms=0"
+    out = out + "\nexec_phase_primary_object_asm_compile_ms=0"
+    out = out + "\nexec_phase_native_link_ms=0"
+    out = out + "\nexec_phase_line_map_ms=0"
+    out = out + "\nexec_pipeline_stage=system_link_exec_cache_hit"
+    if len(outputPath) > 0:
+        out = out + "\ndebug_line_map_path=" + BackendDriverSystemLinkExecMapPath(outputPath)
+    return out
+
+fn BackendDriverSystemLinkExecCacheMiss(rootDir: str,
+                                          reason: str): int32 =
+    if BackendDriverTruthyEnv(BackendDriverSystemLinkExecCacheRequireHitEnv):
+        BackendDriverPrintErr("backend driver system-link-exec cache miss: " + reason)
+        return 2
+    return -1
+
+fn BackendDriverTryRestoreSystemLinkExecCache(rootDir: str,
+                                                args: str[]): int32 =
+    if !BackendDriverSystemLinkExecCacheEnabled():
+        return -1
+    let reqRes = creq.CompilerRequestFromArgs(rootDir, args)
+    if IsErr(reqRes):
+        return BackendDriverSystemLinkExecCacheMiss(rootDir, Error(reqRes))
+    var plan: slplan.SystemLinkPlanStub
+    var err = ""
+    if !slplan.BuildSystemLinkPlanStub(rootDir, Value(reqRes), plan, err):
+        return BackendDriverSystemLinkExecCacheMiss(rootDir, err)
+    if !BackendDriverSystemLinkExecCacheSupported(plan):
+        return BackendDriverSystemLinkExecCacheMiss(rootDir, "unsupported request")
+    let sourceBundleRes = BackendDriverSystemLinkExecCacheSourceBundleCid(plan)
+    if IsErr(sourceBundleRes):
+        return BackendDriverSystemLinkExecCacheMiss(rootDir, Error(sourceBundleRes))
+    let keyRes = BackendDriverSystemLinkExecCacheKey(rootDir, plan, Value(sourceBundleRes))
+    if IsErr(keyRes):
+        return BackendDriverSystemLinkExecCacheMiss(rootDir, Error(keyRes))
+    let key = Value(keyRes)
+    let cacheExePath = BackendDriverSystemLinkExecCacheExePath(rootDir, plan, key)
+    let cacheMapPath = BackendDriverSystemLinkExecCacheMapPath(rootDir, plan, key)
+    let outputPath = chengpath.PathAbsolute(rootDir, slplan.SystemLinkPlanOutputPath(plan))
+    let outputMapPath = BackendDriverSystemLinkExecMapPath(outputPath)
+    if !chengpath.FileExistsNonEmpty(rootDir, cacheExePath):
+        var reason = "missing cached exe: " + cacheExePath
+        if BackendDriverTruthyEnv(BackendDriverSystemLinkExecCacheRequireHitEnv):
+            let codegenDebugRes = BackendDriverCacheCodegenCid(rootDir)
+            reason = reason + " key=" + key
+            reason = reason + " source_bundle=" + layout.FixedBytes32Hex(Value(sourceBundleRes))
+            if !IsErr(codegenDebugRes):
+                reason = reason + " codegen=" + layout.FixedBytes32Hex(Value(codegenDebugRes))
+            reason = reason + " package_id=" + slplan.SystemLinkPlanPackageId(plan)
+            reason = reason + " source_paths=" + slplan.SystemLinkPlanListText(slplan.SystemLinkPlanSourceClosurePaths(plan))
+        return BackendDriverSystemLinkExecCacheMiss(rootDir, reason)
+    if BackendDriverSystemLinkExecNeedMap(plan) &&
+       !chengpath.FileExistsNonEmpty(rootDir, cacheMapPath):
+        return BackendDriverSystemLinkExecCacheMiss(rootDir, "missing cached map: " + cacheMapPath)
+    if !BackendDriverCopyFileBytes(rootDir, cacheExePath, outputPath):
+        BackendDriverPrintErr("backend driver system-link-exec cache: failed to copy exe")
+        return 1
+    if !BackendDriverChmodExecutable(rootDir, outputPath):
+        BackendDriverPrintErr("backend driver system-link-exec cache: failed to chmod exe")
+        return 1
+    if BackendDriverSystemLinkExecNeedMap(plan):
+        if !BackendDriverCopyFileBytes(rootDir, cacheMapPath, outputMapPath):
+            BackendDriverPrintErr("backend driver system-link-exec cache: failed to copy map")
+            return 1
+    let req = Value(reqRes)
+    if len(req.reportPath) > 0:
+        let report = BackendDriverSystemLinkExecCacheHitReport(plan,
+                                                               Value(sourceBundleRes),
+                                                               key,
+                                                               cacheExePath,
+                                                               cacheMapPath,
+                                                               outputPath)
+        if !chengpath.WriteTextFile(rootDir, req.reportPath, report):
+            BackendDriverPrintErr("backend driver system-link-exec cache: failed to write report: " + req.reportPath)
+            return 1
+    return 0
+
 fn BackendDriverForward(rootDir: str,
                           cmd: str,
                           args: str[]): int32 =
@@ -766,15 +1583,21 @@ fn BackendDriverForward(rootDir: str,
     let logDir = chengpath.PathAbsolute(rootDir, "artifacts/forward")
     let _ = chengpath.MkdirP(rootDir, logDir)
     let logPath = chengpath.PathAbsolute(rootDir, "artifacts/forward/backend_driver.forward.log")
+    var forwardCmd = cmd
     var forwardArgs: str[]
-    add(forwardArgs, cmd)
+    var forwardEnv: str[]
+    add(forwardEnv, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
+    if cmd == "system-link-exec":
+        forwardCmd = "__seed-system-link-exec"
+        add(forwardEnv, "CHENG_SEED_INTERNAL_SYSTEM_LINK_EXEC=1")
+    add(forwardArgs, forwardCmd)
     for i in 0..<args.len:
         add(forwardArgs, args[i])
     let run = hostops.RunFileLogged(rootDir,
                                       "backend_driver_forward",
                                       stage3Path,
                                       forwardArgs,
-                                      ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                      forwardEnv,
                                       rootDir,
                                       0,
                                       logPath)
@@ -836,11 +1659,17 @@ fn main(argc: int32, argv: str*): int32 =
             return BackendDriverRunSmokes(rootDir)
         if cmd == "run-host-smokes":
             return BackendDriverRunHostSmokes(rootDir, args)
+        if cmd == "run-stage23-libp2p-smokes":
+            return stage23gate.SeedRunStage23Libp2pSmokes(rootDir, args)
+        if cmd == "slice-gate":
+            return BackendDriverSliceGate(rootDir)
         if cmd == "debug-report":
             return BackendDriverRunDebugTextCommand(rootDir, args, cmd)
         if cmd == "print-symbols":
             return BackendDriverRunDebugTextCommand(rootDir, args, cmd)
         if cmd == "print-line-map":
+            return BackendDriverRunDebugTextCommand(rootDir, args, cmd)
+        if cmd == "print-asm":
             return BackendDriverRunDebugTextCommand(rootDir, args, cmd)
         if cmd == "print-object":
             return BackendDriverRunObjectReportCommand(rootDir, args)
@@ -856,10 +1685,60 @@ fn main(argc: int32, argv: str*): int32 =
             return wsgate.WasmSmokeRunBrowserHostWasmCommand(rootDir, args)
         if cmd == "run-wasm-smokes":
             return wsgate.WasmSmokeRunWasmSmokesCommand(rootDir, args)
+        if cmd == "build-browser-host-wasm":
+            return appbuildgate.SeedBuildBrowserHostWasm(rootDir, args)
+        if cmd == "build-linux-nolibc-exe":
+            return BackendDriverBuildLinuxNolibcExe(rootDir)
+        if cmd == "build-zero-exit":
+            return BackendDriverBuildZeroExit(rootDir)
+        if cmd == "build-panic-trace":
+            return BackendDriverBuildPanicTrace(rootDir)
+        if cmd == "build-bounds-trace":
+            return BackendDriverBuildBoundsTrace(rootDir)
+        if cmd == "build-signal-trace":
+            return BackendDriverBuildSignalTrace(rootDir)
+        if cmd == "build-call-chain":
+            return BackendDriverBuildCallChain(rootDir)
+        if cmd == "build-ffi-handle":
+            return BackendDriverBuildFfiHandle(rootDir)
+        if cmd == "build-program-selfhost":
+            return BackendDriverBuildProgramSelfhost(rootDir)
+        if cmd == "build-bft-state-machine":
+            return appbuildgate.SeedBuildBftStateMachine(rootDir)
+        if cmd == "deploy-bft-validator-three-node":
+            return appbuildgate.SeedDeployBftValidatorThreeNode(rootDir)
+        if cmd == "verify-bft-validator-three-node":
+            return appbuildgate.SeedVerifyBftValidatorThreeNode(rootDir)
+        if cmd == "status-bft-validator-three-node":
+            return appbuildgate.SeedStatusBftValidatorThreeNode(rootDir)
+        if cmd == "stop-bft-validator-three-node":
+            return appbuildgate.SeedStopBftValidatorThreeNode(rootDir)
+        if cmd == "bench-bft-validator-three-node":
+            return appbuildgate.SeedBenchBftValidatorThreeNode(rootDir, args)
+        if cmd == "build-rwad-bft-state-machine":
+            return appbuildgate.SeedBuildRwadBftStateMachine(rootDir)
+        if cmd == "run-udp-importc-smoke":
+            return BackendDriverRunUdpImportcSmoke(rootDir, args)
+        if cmd == "run-tcp-twoproc-smoke":
+            return networkgate.SeedRunTcpTwoprocSmoke(rootDir, args)
+        if cmd == "run-quic-twoproc-smoke":
+            return networkgate.SeedRunQuicTwoprocSmoke(rootDir, args)
+        if cmd == "run-tailnet-control-smoke":
+            return networkgate.SeedRunTailnetControlSmoke(rootDir, args)
+        if cmd == "run-fresh-node-selfhost-gate":
+            return networkgate.SeedRunFreshNodeSelfhostGate(rootDir, args)
+        if cmd == "run-migration-gate":
+            return networkgate.SeedRunMigrationGate(rootDir, args)
+        if cmd == "run-browser-webrtc-smokes":
+            return networkgate.SeedRunBrowserWebrtcSmokes(rootDir, args)
+        if cmd == "r2c-react":
+            return r2cgate.SeedR2cReact(rootDir, args)
         if cmd == "verify-export-visibility":
             return evgate.ExportVisibilityGateRun(rootDir)
         if cmd == "verify-export-visibility-parallel":
             return evgate.ExportVisibilityGateRunParallel(rootDir)
+        if cmd == "verify-orphan-guard":
+            return orphangate.SeedOrphanGuardRun(rootDir)
         if cmd == "verify-backend-driver-command-surface":
             return BackendDriverRunBuiltinHostSmoke(rootDir,
                                                      "verify_backend_driver_command_surface",
@@ -874,10 +1753,18 @@ fn main(argc: int32, argv: str*): int32 =
             return BackendDriverVerifyDebugProfile(rootDir)
         if cmd == "verify-debug-tools":
             return BackendDriverVerifyDebugTools(rootDir)
+        if cmd == "verify-debug-runtime":
+            return debugruntimegate.SeedVerifyDebugRuntime(rootDir)
+        if cmd == "verify-diloco":
+            return networkgate.SeedVerifyDiloco(rootDir)
         if cmd == "verify-windows-builtin":
             return crossgate.SeedVerifyWindowsBuiltin(rootDir)
         if cmd == "verify-riscv64-builtin":
             return crossgate.SeedVerifyRiscv64Builtin(rootDir)
         if cmd == "run-cross-target-smokes":
             return crossgate.SeedRunCrossTargetSmokes(rootDir)
+        if cmd == "system-link-exec":
+            let cacheRc = BackendDriverTryRestoreSystemLinkExecCache(rootDir, args)
+            if cacheRc >= 0:
+                return cacheRc
     return BackendDriverForward(rootDir, cmd, args)
