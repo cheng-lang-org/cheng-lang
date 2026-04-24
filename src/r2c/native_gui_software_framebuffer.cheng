@@ -1,0 +1,676 @@
+import std/os
+import std/strings
+import std/strutils as strutil
+
+type
+    NativeSurfaceFrame =
+        width: int32
+        height: int32
+        strideBytes: int32
+        pixelFormat: str
+        pixels: uint8[]
+
+fn fbSlice(text: str,
+           start: int32,
+           length: int32): str =
+    if length <= 0:
+        return ""
+    let total: int32 = strings.Len(text)
+    if start < 0 || start >= total:
+        return ""
+    var take: int32 = length
+    if start + take > total:
+        take = total - start
+    var out: str
+    for i in 0..<take:
+        out = out + strings.CharToStr(text[start + i])
+    return out
+
+fn fbDigitValue(text: str): int32 =
+    if text == "0":
+        return 0
+    elif text == "1":
+        return 1
+    elif text == "2":
+        return 2
+    elif text == "3":
+        return 3
+    elif text == "4":
+        return 4
+    elif text == "5":
+        return 5
+    elif text == "6":
+        return 6
+    elif text == "7":
+        return 7
+    elif text == "8":
+        return 8
+    elif text == "9":
+        return 9
+    return -1
+
+fn fbParsePositiveInt32(raw: str): int32 =
+    let total: int32 = strings.Len(raw)
+    if total <= 0:
+        return 0
+    var out: int32
+    for i in 0..<total:
+        let digit: int32 = fbDigitValue(fbSlice(raw, i, 1))
+        if digit < 0:
+            return -1
+        out = (out * 10) + digit
+    return out
+
+fn fbParseInt32(text: str): int32 =
+    let raw: str = strutil.Strip(text)
+    if strings.Len(raw) <= 0:
+        return 0
+    if raw[0] == '-':
+        let parsed: int32 = fbParsePositiveInt32(fbSlice(raw, 1, strings.Len(raw) - 1))
+        if parsed < 0:
+            return 0
+        return 0 - parsed
+    let parsed: int32 = fbParsePositiveInt32(raw)
+    if parsed < 0:
+        return 0
+    return parsed
+
+fn fbJsonQuote(text: str): str =
+    let quote: str = strings.CharToStr(char(34))
+    var out = quote
+    let total: int32 = strings.Len(text)
+    for i in 0..<total:
+        let ch = text[i]
+        if ch == char(34):
+            out = out + "\\" + quote
+        elif ch == '\\':
+            out = out + "\\\\"
+        else:
+            out = out + strings.CharToStr(ch)
+    out = out + quote
+    return out
+
+fn fbTextFind(text: str,
+              needle: str,
+              startRaw: int32): int32 =
+    let total: int32 = strings.Len(text)
+    let needleLen: int32 = strings.Len(needle)
+    if needleLen <= 0:
+        return startRaw
+    if total < needleLen:
+        return -1
+    var start: int32 = startRaw
+    if start < 0:
+        start = 0
+    if start > total - needleLen:
+        return -1
+    for i in start..(total - needleLen):
+        var matched = true
+        for j in 0..<needleLen:
+            if text[i + j] != needle[j]:
+                matched = false
+                break
+        if matched:
+            return i
+    return -1
+
+fn fbJsonSkipWhitespace(text: str,
+                        startRaw: int32): int32 =
+    var pos: int32 = startRaw
+    if pos < 0:
+        pos = 0
+    let total: int32 = strings.Len(text)
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(32) || ch == char(10) || ch == char(13) || ch == char(9):
+            pos = pos + 1
+        else:
+            return pos
+    return pos
+
+fn fbJsonFindValueStart(text: str,
+                        key: str,
+                        startRaw: int32): int32 =
+    let keyPattern: str = fbJsonQuote(key)
+    let keyPos: int32 = fbTextFind(text, keyPattern, startRaw)
+    if keyPos < 0:
+        return -1
+    var pos: int32 = keyPos + strings.Len(keyPattern)
+    let total: int32 = strings.Len(text)
+    while pos < total:
+        if text[pos] == char(58):
+            return fbJsonSkipWhitespace(text, pos + 1)
+        pos = pos + 1
+    return -1
+
+fn fbJsonReadStringLiteral(text: str,
+                           startRaw: int32,
+                           fallback: str): str =
+    let total: int32 = strings.Len(text)
+    if startRaw < 0 || startRaw >= total || text[startRaw] != char(34):
+        return fallback
+    var out: str
+    var pos: int32 = startRaw + 1
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(34):
+            return out
+        if ch == '\\':
+            if pos + 1 >= total:
+                return fallback
+            out = out + strings.CharToStr(text[pos + 1])
+            pos = pos + 2
+            continue
+        out = out + strings.CharToStr(ch)
+        pos = pos + 1
+    return fallback
+
+fn fbJsonReadStringField(text: str,
+                         key: str,
+                         fallback: str): str =
+    let valueStart: int32 = fbJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    return fbJsonReadStringLiteral(text, valueStart, fallback)
+
+fn fbJsonReadIntField(text: str,
+                      key: str,
+                      fallback: int32): int32 =
+    let valueStart: int32 = fbJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    let total: int32 = strings.Len(text)
+    var endPos: int32 = valueStart
+    if endPos < total && text[endPos] == '-':
+        endPos = endPos + 1
+    var sawDigit = false
+    while endPos < total:
+        if fbDigitValue(fbSlice(text, endPos, 1)) < 0:
+            break
+        sawDigit = true
+        endPos = endPos + 1
+    if !sawDigit:
+        return fallback
+    return fbParseInt32(fbSlice(text, valueStart, endPos - valueStart))
+
+fn fbJsonFindBalancedEnd(text: str,
+                         start: int32,
+                         openCh: char,
+                         closeCh: char): int32 =
+    let total: int32 = strings.Len(text)
+    if start < 0 || start >= total || text[start] != openCh:
+        return -1
+    var depth: int32
+    var inString = false
+    var escaped = false
+    var pos: int32 = start
+    while pos < total:
+        let ch = text[pos]
+        if inString:
+            if escaped:
+                escaped = false
+            elif ch == '\\':
+                escaped = true
+            elif ch == char(34):
+                inString = false
+        else:
+            if ch == char(34):
+                inString = true
+            elif ch == openCh:
+                depth = depth + 1
+            elif ch == closeCh:
+                depth = depth - 1
+                if depth == 0:
+                    return pos
+        pos = pos + 1
+    return -1
+
+fn fbJsonReadArrayFieldRaw(text: str,
+                           key: str,
+                           fallback: str): str =
+    let valueStart: int32 = fbJsonFindValueStart(text, key, 0)
+    if valueStart < 0 || valueStart >= strings.Len(text) || text[valueStart] != char(91):
+        return fallback
+    let endPos: int32 = fbJsonFindBalancedEnd(text, valueStart, char(91), char(93))
+    if endPos < valueStart:
+        return fallback
+    return fbSlice(text, valueStart, endPos - valueStart + 1)
+
+fn fbJsonArrayNextObjectRaw(arrayText: str,
+                            cursor: int32,
+                            itemRaw: var str,
+                            nextPos: var int32): bool =
+    var pos: int32 = fbJsonSkipWhitespace(arrayText, cursor)
+    let total: int32 = strings.Len(arrayText)
+    if pos < total && arrayText[pos] == char(91):
+        pos = fbJsonSkipWhitespace(arrayText, pos + 1)
+    if pos < total && arrayText[pos] == char(44):
+        pos = fbJsonSkipWhitespace(arrayText, pos + 1)
+    if pos >= total || arrayText[pos] == char(93):
+        nextPos = total
+        return false
+    if arrayText[pos] != char(123):
+        nextPos = pos
+        return false
+    let endPos: int32 = fbJsonFindBalancedEnd(arrayText, pos, char(123), char(125))
+    if endPos < pos:
+        nextPos = pos
+        return false
+    itemRaw = fbSlice(arrayText, pos, endPos - pos + 1)
+    nextPos = endPos + 1
+    return true
+
+fn fbAddByte(out: var uint8[],
+             value: int32) =
+    add(out, uint8(value & 255))
+
+fn fbAddU16LE(out: var uint8[],
+              value: int32) =
+    fbAddByte(out, value)
+    fbAddByte(out, value >> 8)
+
+fn fbAddU32BE(out: var uint8[],
+              value: int32) =
+    fbAddByte(out, value >> 24)
+    fbAddByte(out, value >> 16)
+    fbAddByte(out, value >> 8)
+    fbAddByte(out, value)
+
+fn fbAddU32BE64(out: var uint8[],
+                value: int64) =
+    fbAddByte(out, int32((value >> 24) & int64(255)))
+    fbAddByte(out, int32((value >> 16) & int64(255)))
+    fbAddByte(out, int32((value >> 8) & int64(255)))
+    fbAddByte(out, int32(value & int64(255)))
+
+fn fbU32Mask(): int64 =
+    return (int64(0xffff) << 16) | int64(0xffff)
+
+fn fbCrcPolynomial(): int64 =
+    return (int64(0xedb8) << 16) | int64(0x8320)
+
+fn fbCrcUpdate(crcRaw: int64,
+               valueRaw: int32): int64 =
+    var crc: int64 = crcRaw ^ int64(valueRaw & 255)
+    for i in 0..<8:
+        if (crc & int64(1)) != int64(0):
+            crc = (crc >> 1) ^ fbCrcPolynomial()
+        else:
+            crc = crc >> 1
+        crc = crc & fbU32Mask()
+    return crc
+
+fn fbChunkCrc4(kindA: int32,
+               kindB: int32,
+               kindC: int32,
+               kindD: int32,
+               data: uint8[]): int64 =
+    var crc: int64 = fbU32Mask()
+    crc = fbCrcUpdate(crc, kindA)
+    crc = fbCrcUpdate(crc, kindB)
+    crc = fbCrcUpdate(crc, kindC)
+    crc = fbCrcUpdate(crc, kindD)
+    for i in 0..<data.len:
+        crc = fbCrcUpdate(crc, int32(data[i]))
+    return (crc ^ fbU32Mask()) & fbU32Mask()
+
+fn fbAddChunk4(out: var uint8[],
+               kindA: int32,
+               kindB: int32,
+               kindC: int32,
+               kindD: int32,
+               data: uint8[]) =
+    fbAddU32BE(out, data.len)
+    fbAddByte(out, kindA)
+    fbAddByte(out, kindB)
+    fbAddByte(out, kindC)
+    fbAddByte(out, kindD)
+    for i in 0..<data.len:
+        fbAddByte(out, int32(data[i]))
+    fbAddU32BE64(out, fbChunkCrc4(kindA, kindB, kindC, kindD, data))
+
+fn fbAdler32(data: uint8[]): int64 =
+    var s1: int32 = 1
+    var s2: int32
+    for i in 0..<data.len:
+        s1 = (s1 + int32(data[i])) % 65521
+        s2 = (s2 + s1) % 65521
+    return (int64(s2) << 16) | int64(s1)
+
+fn fbBuildRawScanlines(width: int32,
+                       height: int32,
+                       pixels: uint8[],
+                       outRaw: var uint8[]): bool =
+    outRaw = []
+    let expected: int32 = width * height * 4
+    if width <= 0 || height <= 0 || pixels.len < expected:
+        return false
+    for y in 0..<height:
+        fbAddByte(outRaw, 0)
+        let rowStart: int32 = y * width * 4
+        for x in 0..<(width * 4):
+            fbAddByte(outRaw, int32(pixels[rowStart + x]))
+    return true
+
+fn fbBuildStoredZlib(raw: uint8[],
+                     outIdat: var uint8[]) =
+    outIdat = []
+    fbAddByte(outIdat, 0x78)
+    fbAddByte(outIdat, 0x01)
+    var pos: int32
+    while pos < raw.len:
+        var blockLen: int32 = raw.len - pos
+        if blockLen > 65535:
+            blockLen = 65535
+        let finalBlock: bool = pos + blockLen >= raw.len
+        fbAddByte(outIdat, finalBlock ? 1 : 0)
+        fbAddU16LE(outIdat, blockLen)
+        fbAddU16LE(outIdat, 0xffff - blockLen)
+        for i in 0..<blockLen:
+            fbAddByte(outIdat, int32(raw[pos + i]))
+        pos = pos + blockLen
+    fbAddU32BE64(outIdat, fbAdler32(raw))
+
+fn fbWritePngRgba(path: str,
+                  width: int32,
+                  height: int32,
+                  pixels: uint8[]): bool =
+    if width <= 0 || height <= 0 || width > 4096 || height > 4096:
+        return false
+    var ihdr: uint8[]
+    fbAddU32BE(ihdr, width)
+    fbAddU32BE(ihdr, height)
+    fbAddByte(ihdr, 8)
+    fbAddByte(ihdr, 6)
+    fbAddByte(ihdr, 0)
+    fbAddByte(ihdr, 0)
+    fbAddByte(ihdr, 0)
+    var raw: uint8[]
+    if !fbBuildRawScanlines(width, height, pixels, raw):
+        return false
+    var idat: uint8[]
+    fbBuildStoredZlib(raw, idat)
+    var empty: uint8[]
+    var png: uint8[]
+    fbAddByte(png, 137)
+    fbAddByte(png, 80)
+    fbAddByte(png, 78)
+    fbAddByte(png, 71)
+    fbAddByte(png, 13)
+    fbAddByte(png, 10)
+    fbAddByte(png, 26)
+    fbAddByte(png, 10)
+    fbAddChunk4(png, 73, 72, 68, 82, ihdr)
+    fbAddChunk4(png, 73, 68, 65, 84, idat)
+    fbAddChunk4(png, 73, 69, 78, 68, empty)
+    os.WriteFileBytes(path, png)
+    return os.FileExists(path)
+
+fn nativeSurfaceFrameByteCount(frame: NativeSurfaceFrame): int32 =
+    if frame.width <= 0 || frame.height <= 0 || frame.strideBytes <= 0:
+        return 0
+    return frame.height * frame.strideBytes
+
+fn nativeSurfaceFrameManifestText(frame: NativeSurfaceFrame,
+                                  rgbaPath: str,
+                                  renderPlanText: str): str =
+    let commandCount: int32 = fbJsonReadIntField(renderPlanText, "command_count", 0)
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_surface_frame_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"surface_kind\": \"software_rgba_blit_surface\",\n"
+    doc = doc + "  \"frame_format\": \"surface_frame_rgba_v1\",\n"
+    doc = doc + "  \"renderer\": \"cheng.software_raster_rgba_v1\",\n"
+    doc = doc + "  \"pixel_format\": " + fbJsonQuote(frame.pixelFormat) + ",\n"
+    doc = doc + "  \"width\": " + intToStr(frame.width) + ",\n"
+    doc = doc + "  \"height\": " + intToStr(frame.height) + ",\n"
+    doc = doc + "  \"stride_bytes\": " + intToStr(frame.strideBytes) + ",\n"
+    doc = doc + "  \"frame_byte_count\": " + intToStr(nativeSurfaceFrameByteCount(frame)) + ",\n"
+    doc = doc + "  \"frame_path\": " + fbJsonQuote(rgbaPath) + ",\n"
+    doc = doc + "  \"render_plan_command_count\": " + intToStr(commandCount) + ",\n"
+    doc = doc + "  \"android_surface_binding\": \"ANativeWindow_rgba_blit_v1\",\n"
+    doc = doc + "  \"ios_surface_binding\": \"CAMetalLayer_rgba_blit_v1\",\n"
+    doc = doc + "  \"ohos_surface_binding\": \"OHNativeWindow_rgba_blit_v1\"\n"
+    doc = doc + "}\n"
+    return doc
+
+fn fbClamp(value: int32,
+           minValue: int32,
+           maxValue: int32): int32 =
+    if value < minValue:
+        return minValue
+    if value > maxValue:
+        return maxValue
+    return value
+
+fn fbHexDigit(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn fbReadColor(colorText: str,
+               fallbackR: int32,
+               fallbackG: int32,
+               fallbackB: int32,
+               outR: var int32,
+               outG: var int32,
+               outB: var int32) =
+    outR = fallbackR
+    outG = fallbackG
+    outB = fallbackB
+    if strings.Len(colorText) != 7 || colorText[0] != char(35):
+        return
+    let r0: int32 = fbHexDigit(colorText[1])
+    let r1: int32 = fbHexDigit(colorText[2])
+    let g0: int32 = fbHexDigit(colorText[3])
+    let g1: int32 = fbHexDigit(colorText[4])
+    let b0: int32 = fbHexDigit(colorText[5])
+    let b1: int32 = fbHexDigit(colorText[6])
+    if r0 < 0 || r1 < 0 || g0 < 0 || g1 < 0 || b0 < 0 || b1 < 0:
+        return
+    outR = (r0 * 16) + r1
+    outG = (g0 * 16) + g1
+    outB = (b0 * 16) + b1
+
+fn fbSetPixel(pixels: var uint8[],
+              width: int32,
+              height: int32,
+              x: int32,
+              y: int32,
+              r: int32,
+              g: int32,
+              b: int32,
+              a: int32) =
+    if x < 0 || y < 0 || x >= width || y >= height:
+        return
+    let idx: int32 = ((y * width) + x) * 4
+    if idx < 0 || idx + 3 >= pixels.len:
+        return
+    pixels[idx] = uint8(fbClamp(r, 0, 255))
+    pixels[idx + 1] = uint8(fbClamp(g, 0, 255))
+    pixels[idx + 2] = uint8(fbClamp(b, 0, 255))
+    pixels[idx + 3] = uint8(fbClamp(a, 0, 255))
+
+fn fbInsideRoundedRect(px: int32,
+                       py: int32,
+                       x: int32,
+                       y: int32,
+                       w: int32,
+                       h: int32,
+                       radiusRaw: int32): bool =
+    if px < x || py < y || px >= x + w || py >= y + h:
+        return false
+    var radius: int32 = radiusRaw
+    if radius <= 0:
+        return true
+    let maxRadius: int32 = (w < h ? w : h) / 2
+    if radius > maxRadius:
+        radius = maxRadius
+    var dx: int32
+    var dy: int32
+    if px < x + radius:
+        dx = (x + radius) - px
+    elif px >= x + w - radius:
+        dx = px - (x + w - radius - 1)
+    if py < y + radius:
+        dy = (y + radius) - py
+    elif py >= y + h - radius:
+        dy = py - (y + h - radius - 1)
+    if dx <= 0 || dy <= 0:
+        return true
+    return (dx * dx) + (dy * dy) <= radius * radius
+
+fn fbDrawRoundedRect(pixels: var uint8[],
+                     width: int32,
+                     height: int32,
+                     xRaw: int32,
+                     yRaw: int32,
+                     wRaw: int32,
+                     hRaw: int32,
+                     radius: int32,
+                     fillR: int32,
+                     fillG: int32,
+                     fillB: int32,
+                     borderR: int32,
+                     borderG: int32,
+                     borderB: int32,
+                     drawBorder: bool) =
+    if wRaw <= 0 || hRaw <= 0:
+        return
+    let x0: int32 = fbClamp(xRaw, 0, width)
+    let y0: int32 = fbClamp(yRaw, 0, height)
+    let x1: int32 = fbClamp(xRaw + wRaw, 0, width)
+    let y1: int32 = fbClamp(yRaw + hRaw, 0, height)
+    if x0 >= x1 || y0 >= y1:
+        return
+    for py in y0..<y1:
+        for px in x0..<x1:
+            if fbInsideRoundedRect(px, py, xRaw, yRaw, wRaw, hRaw, radius):
+                let borderPixel: bool = drawBorder &&
+                                        !fbInsideRoundedRect(px, py, xRaw + 1, yRaw + 1, wRaw - 2, hRaw - 2, radius - 1)
+                if borderPixel:
+                    fbSetPixel(pixels, width, height, px, py, borderR, borderG, borderB, 255)
+                else:
+                    fbSetPixel(pixels, width, height, px, py, fillR, fillG, fillB, 255)
+
+fn fbDrawBackgroundGradient(pixels: var uint8[],
+                            width: int32,
+                            height: int32,
+                            topColor: str,
+                            bottomColor: str) =
+    var topR: int32
+    var topG: int32
+    var topB: int32
+    var bottomR: int32
+    var bottomG: int32
+    var bottomB: int32
+    fbReadColor(topColor, 242, 247, 253, topR, topG, topB)
+    fbReadColor(bottomColor, 230, 238, 251, bottomR, bottomG, bottomB)
+    let denom: int32 = height > 1 ? height - 1 : 1
+    for y in 0..<height:
+        let r: int32 = topR + ((bottomR - topR) * y) / denom
+        let g: int32 = topG + ((bottomG - topG) * y) / denom
+        let b: int32 = topB + ((bottomB - topB) * y) / denom
+        for x in 0..<width:
+            fbSetPixel(pixels, width, height, x, y, r, g, b, 255)
+
+fn fbDrawCommand(commandRaw: str,
+                 pixels: var uint8[],
+                 width: int32,
+                 height: int32): bool =
+    let commandType: str = fbJsonReadStringField(commandRaw, "type", "")
+    if commandType == "background_gradient":
+        fbDrawBackgroundGradient(pixels,
+                                 width,
+                                 height,
+                                 fbJsonReadStringField(commandRaw, "color_top", "#f2f7fd"),
+                                 fbJsonReadStringField(commandRaw, "color_bottom", "#e6eefb"))
+        return true
+    if commandType == "rounded_panel":
+        let x: int32 = fbJsonReadIntField(commandRaw, "x", 0)
+        let y: int32 = fbJsonReadIntField(commandRaw, "y", 0)
+        let w: int32 = fbJsonReadIntField(commandRaw, "width", width)
+        let h: int32 = fbJsonReadIntField(commandRaw, "height", height)
+        let radius: int32 = fbJsonReadIntField(commandRaw, "corner_radius", 0)
+        var fillR: int32
+        var fillG: int32
+        var fillB: int32
+        var borderR: int32
+        var borderG: int32
+        var borderB: int32
+        var shadowR: int32
+        var shadowG: int32
+        var shadowB: int32
+        fbReadColor(fbJsonReadStringField(commandRaw, "background_color", "#ffffff"), 255, 255, 255, fillR, fillG, fillB)
+        fbReadColor(fbJsonReadStringField(commandRaw, "border_color", "#d5e2f0"), 213, 226, 240, borderR, borderG, borderB)
+        fbReadColor(fbJsonReadStringField(commandRaw, "shadow_color", "#cddaf0"), 205, 218, 240, shadowR, shadowG, shadowB)
+        fbDrawRoundedRect(pixels, width, height, x + 2, y + 5, w, h, radius, shadowR, shadowG, shadowB, shadowR, shadowG, shadowB, false)
+        fbDrawRoundedRect(pixels, width, height, x, y, w, h, radius, fillR, fillG, fillB, borderR, borderG, borderB, true)
+        return true
+    return false
+
+fn NativeSurfaceRenderPlanToFrame(renderPlanText: str,
+                                  outFrame: var NativeSurfaceFrame): bool =
+    let width: int32 = fbJsonReadIntField(renderPlanText, "window_width", 390)
+    let height: int32 = fbJsonReadIntField(renderPlanText, "window_height", 844)
+    if width <= 0 || height <= 0 || width > 4096 || height > 4096:
+        return false
+    let pixelByteCount: int32 = width * height * 4
+    outFrame.width = width
+    outFrame.height = height
+    outFrame.strideBytes = width * 4
+    outFrame.pixelFormat = "rgba8_unpremultiplied"
+    outFrame.pixels = []
+    for i in 0..<pixelByteCount:
+        add(outFrame.pixels, uint8(255))
+    fbDrawBackgroundGradient(outFrame.pixels, width, height, "#f2f7fd", "#e6eefb")
+    let commandsText: str = fbJsonReadArrayFieldRaw(renderPlanText, "commands", "[]")
+    var cursor: int32
+    var nextCursor: int32
+    var commandRaw: str
+    var commandCount: int32
+    while fbJsonArrayNextObjectRaw(commandsText, cursor, commandRaw, nextCursor):
+        cursor = nextCursor
+        if !fbDrawCommand(commandRaw, outFrame.pixels, width, height):
+            return false
+        commandCount = commandCount + 1
+    if commandCount != fbJsonReadIntField(renderPlanText, "command_count", commandCount):
+        return false
+    return true
+
+fn WriteNativeSurfaceFrameRgba(frame: NativeSurfaceFrame,
+                               path: str): bool =
+    let expectedByteCount: int32 = nativeSurfaceFrameByteCount(frame)
+    if expectedByteCount <= 0 || frame.pixels.len != expectedByteCount:
+        return false
+    os.WriteFileBytes(path, frame.pixels)
+    return os.FileExists(path) && os.FileSize(path) == int64(expectedByteCount)
+
+fn WriteNativeRenderPlanRgba(renderPlanText: str,
+                             path: str): bool =
+    var frame: NativeSurfaceFrame
+    if !NativeSurfaceRenderPlanToFrame(renderPlanText, frame):
+        return false
+    return WriteNativeSurfaceFrameRgba(frame, path)
+
+fn WriteNativeRenderPlanSurfaceArtifacts(renderPlanText: str,
+                                         framePath: str,
+                                         manifestPath: str): bool =
+    var frame: NativeSurfaceFrame
+    if !NativeSurfaceRenderPlanToFrame(renderPlanText, frame):
+        return false
+    if !WriteNativeSurfaceFrameRgba(frame, framePath):
+        return false
+    os.WriteFile(manifestPath, nativeSurfaceFrameManifestText(frame, framePath, renderPlanText))
+    return os.FileExists(manifestPath)
+
+fn WriteNativeRenderPlanPng(renderPlanText: str,
+                            path: str): bool =
+    var frame: NativeSurfaceFrame
+    if !NativeSurfaceRenderPlanToFrame(renderPlanText, frame):
+        return false
+    return fbWritePngRgba(path, frame.width, frame.height, frame.pixels)

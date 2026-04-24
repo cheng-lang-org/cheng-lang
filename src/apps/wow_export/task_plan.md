@@ -48,3 +48,9 @@
 - [x] Add strict smoke for Northshire MAID split fileDataID audit chain.
 - [x] Remove local CASC range decode full-block copies for BLTE `normal` blocks.
 - [x] Predecode local `.idx` key prefixes before batch index scans.
+- [x] Add all four Northshire WDT MAID tile non-base resources to audited dependency manifest.
+- [x] Classify MAID dependencies by real format: 16 `adt_split` resources and 12 `blp` resources.
+- [x] Require preview/render/export/tests to audit the 28 WDT MAID resources without fabricating listfile paths.
+- [x] Parse WDT MAID ADT split payload chunks and require preview/render to match real MDDF/MODF/MCNK counts.
+- [x] Parse WDT MAID `MDDF/MODF` placement records and require preview/render to expose real bounds and scale ranges.
+- [x] Treat modern WDT MAID `MDDF/MODF.nameID` as fileDataID and expose unique referenced doodad/world-model counts.

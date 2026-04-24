@@ -25,6 +25,42 @@ type
         wdtModelPlacementCount: int32
         wdtMaidFileDataIDCount: int32
         wdtFirstMaidFileDataID: int32
+        wdtMaidSplitDependencyCount: int32
+        wdtMaidSplitDependenciesReady: bool
+        wdtMaidParsedDependencyCount: int32
+        wdtMaidAdtSplitResourceCount: int32
+        wdtMaidBlpResourceCount: int32
+        wdtMaidAdtSplitChunkCount: int32
+        wdtMaidAdtSplitMapChunkCount: int32
+        wdtMaidDoodadPlacementCount: int32
+        wdtMaidDoodadReferencedFileDataIDCount: int32
+        wdtMaidFirstDoodadReferencedFileDataID: int32
+        wdtMaidDoodadPlacementDependencyCount: int32
+        wdtMaidDoodadPlacementBoundsReady: bool
+        wdtMaidDoodadPlacementMinX1000: int32
+        wdtMaidDoodadPlacementMinY1000: int32
+        wdtMaidDoodadPlacementMinZ1000: int32
+        wdtMaidDoodadPlacementMaxX1000: int32
+        wdtMaidDoodadPlacementMaxY1000: int32
+        wdtMaidDoodadPlacementMaxZ1000: int32
+        wdtMaidDoodadMinScale: int32
+        wdtMaidDoodadMaxScale: int32
+        wdtMaidWorldModelPlacementCount: int32
+        wdtMaidWorldModelReferencedFileDataIDCount: int32
+        wdtMaidFirstWorldModelReferencedFileDataID: int32
+        wdtMaidWorldModelPlacementDependencyCount: int32
+        wdtMaidPlacementDependencyAuditReady: bool
+        wdtMaidPlacementDependencyEncodedBytes: int32
+        wdtMaidWorldModelPlacementBoundsReady: bool
+        wdtMaidWorldModelPlacementMinX1000: int32
+        wdtMaidWorldModelPlacementMinY1000: int32
+        wdtMaidWorldModelPlacementMinZ1000: int32
+        wdtMaidWorldModelPlacementMaxX1000: int32
+        wdtMaidWorldModelPlacementMaxY1000: int32
+        wdtMaidWorldModelPlacementMaxZ1000: int32
+        wdtMaidWorldModelMinScale: int32
+        wdtMaidWorldModelMaxScale: int32
+        wdtMaidDependencyBytes: int32
         adtTileCount: int32
         adtChunkCount: int32
         adtHeightChunkCount: int32
@@ -84,6 +120,219 @@ fn previewApplyChunkedAsset(summary: var PreviewSummary, buf: bytes.ByteBuffer, 
         summary.wmoChunkCount = Value(headerRes).chunkCount
     return Ok[bool](true)
 
+fn previewCheckWdtMaidTileDependencies(summary: var PreviewSummary,
+                                       manifest: northshire.NorthshireManifest,
+                                       buf: bytes.ByteBuffer,
+                                       sourceLabel: str,
+                                       tileX: int32,
+                                       tileY: int32): Result[bool] =
+    let tileRes: Result[asset_formats.WdtMaidTile] =
+        asset_formats.ParseWdtMaidTileFileDataIDs(buf, tileX, tileY)
+    if IsErr(tileRes):
+        return Err[bool](Error(tileRes))
+    let tile: asset_formats.WdtMaidTile = Value(tileRes)
+    if tile.fileDataIDs.len != 8:
+        return Err[bool]("wowExport preview: WDT MAID tile slot count mismatch")
+    var slot: int32 = 1
+    while slot < tile.fileDataIDs.len:
+        let fileDataID: int32 = tile.fileDataIDs[slot]
+        if fileDataID > 0:
+            if !northshire.HasDependencyFileDataID(manifest, sourceLabel, "wdt_maid_split", fileDataID):
+                return Err[bool]("wowExport preview: WDT MAID split dependency is not audited " + strings.IntToStr(fileDataID))
+            summary.wdtMaidSplitDependencyCount = summary.wdtMaidSplitDependencyCount + 1
+        slot = slot + 1
+    return Ok[bool](true)
+
+fn previewInt32ListContains(values: int32[], value: int32): bool =
+    var i: int32
+    while i < values.len:
+        if values[i] == value:
+            return true
+        i = i + 1
+    return false
+
+fn previewMergeUniqueFileDataIDs(source: int32[],
+                                 unique: var int32[],
+                                 firstOut: var int32,
+                                 countOut: var int32): Result[bool] =
+    var i: int32
+    while i < source.len:
+        let fileDataID: int32 = source[i]
+        if fileDataID <= 0:
+            return Err[bool]("wowExport preview: WDT MAID placement fileDataID invalid")
+        if !previewInt32ListContains(unique, fileDataID):
+            add(unique, fileDataID)
+            if unique.len == 1:
+                firstOut = fileDataID
+            countOut = unique.len
+        i = i + 1
+    return Ok[bool](true)
+
+fn previewMergeWdtMaidSplitRecordFacts(summary: var PreviewSummary,
+                                       split: asset_formats.WdtMaidAdtSplitSummary): Result[bool] =
+    if split.doodadPlacementCount > 0:
+        if !split.doodadPlacementPositionBoundsReady:
+            return Err[bool]("wowExport preview: WDT MAID MDDF placement bounds missing")
+        if !summary.wdtMaidDoodadPlacementBoundsReady:
+            summary.wdtMaidDoodadPlacementBoundsReady = true
+            summary.wdtMaidDoodadPlacementMinX1000 = split.minDoodadPlacementX1000
+            summary.wdtMaidDoodadPlacementMaxX1000 = split.maxDoodadPlacementX1000
+            summary.wdtMaidDoodadPlacementMinY1000 = split.minDoodadPlacementY1000
+            summary.wdtMaidDoodadPlacementMaxY1000 = split.maxDoodadPlacementY1000
+            summary.wdtMaidDoodadPlacementMinZ1000 = split.minDoodadPlacementZ1000
+            summary.wdtMaidDoodadPlacementMaxZ1000 = split.maxDoodadPlacementZ1000
+            summary.wdtMaidDoodadMinScale = split.minDoodadScale
+            summary.wdtMaidDoodadMaxScale = split.maxDoodadScale
+        else:
+            if split.minDoodadPlacementX1000 < summary.wdtMaidDoodadPlacementMinX1000:
+                summary.wdtMaidDoodadPlacementMinX1000 = split.minDoodadPlacementX1000
+            if split.maxDoodadPlacementX1000 > summary.wdtMaidDoodadPlacementMaxX1000:
+                summary.wdtMaidDoodadPlacementMaxX1000 = split.maxDoodadPlacementX1000
+            if split.minDoodadPlacementY1000 < summary.wdtMaidDoodadPlacementMinY1000:
+                summary.wdtMaidDoodadPlacementMinY1000 = split.minDoodadPlacementY1000
+            if split.maxDoodadPlacementY1000 > summary.wdtMaidDoodadPlacementMaxY1000:
+                summary.wdtMaidDoodadPlacementMaxY1000 = split.maxDoodadPlacementY1000
+            if split.minDoodadPlacementZ1000 < summary.wdtMaidDoodadPlacementMinZ1000:
+                summary.wdtMaidDoodadPlacementMinZ1000 = split.minDoodadPlacementZ1000
+            if split.maxDoodadPlacementZ1000 > summary.wdtMaidDoodadPlacementMaxZ1000:
+                summary.wdtMaidDoodadPlacementMaxZ1000 = split.maxDoodadPlacementZ1000
+            if split.minDoodadScale < summary.wdtMaidDoodadMinScale:
+                summary.wdtMaidDoodadMinScale = split.minDoodadScale
+            if split.maxDoodadScale > summary.wdtMaidDoodadMaxScale:
+                summary.wdtMaidDoodadMaxScale = split.maxDoodadScale
+    if split.worldModelPlacementCount > 0:
+        if !split.worldModelPlacementPositionBoundsReady:
+            return Err[bool]("wowExport preview: WDT MAID MODF placement bounds missing")
+        if !summary.wdtMaidWorldModelPlacementBoundsReady:
+            summary.wdtMaidWorldModelPlacementBoundsReady = true
+            summary.wdtMaidWorldModelPlacementMinX1000 = split.minWorldModelPlacementX1000
+            summary.wdtMaidWorldModelPlacementMaxX1000 = split.maxWorldModelPlacementX1000
+            summary.wdtMaidWorldModelPlacementMinY1000 = split.minWorldModelPlacementY1000
+            summary.wdtMaidWorldModelPlacementMaxY1000 = split.maxWorldModelPlacementY1000
+            summary.wdtMaidWorldModelPlacementMinZ1000 = split.minWorldModelPlacementZ1000
+            summary.wdtMaidWorldModelPlacementMaxZ1000 = split.maxWorldModelPlacementZ1000
+            summary.wdtMaidWorldModelMinScale = split.minWorldModelScale
+            summary.wdtMaidWorldModelMaxScale = split.maxWorldModelScale
+        else:
+            if split.minWorldModelPlacementX1000 < summary.wdtMaidWorldModelPlacementMinX1000:
+                summary.wdtMaidWorldModelPlacementMinX1000 = split.minWorldModelPlacementX1000
+            if split.maxWorldModelPlacementX1000 > summary.wdtMaidWorldModelPlacementMaxX1000:
+                summary.wdtMaidWorldModelPlacementMaxX1000 = split.maxWorldModelPlacementX1000
+            if split.minWorldModelPlacementY1000 < summary.wdtMaidWorldModelPlacementMinY1000:
+                summary.wdtMaidWorldModelPlacementMinY1000 = split.minWorldModelPlacementY1000
+            if split.maxWorldModelPlacementY1000 > summary.wdtMaidWorldModelPlacementMaxY1000:
+                summary.wdtMaidWorldModelPlacementMaxY1000 = split.maxWorldModelPlacementY1000
+            if split.minWorldModelPlacementZ1000 < summary.wdtMaidWorldModelPlacementMinZ1000:
+                summary.wdtMaidWorldModelPlacementMinZ1000 = split.minWorldModelPlacementZ1000
+            if split.maxWorldModelPlacementZ1000 > summary.wdtMaidWorldModelPlacementMaxZ1000:
+                summary.wdtMaidWorldModelPlacementMaxZ1000 = split.maxWorldModelPlacementZ1000
+            if split.minWorldModelScale < summary.wdtMaidWorldModelMinScale:
+                summary.wdtMaidWorldModelMinScale = split.minWorldModelScale
+            if split.maxWorldModelScale > summary.wdtMaidWorldModelMaxScale:
+                summary.wdtMaidWorldModelMaxScale = split.maxWorldModelScale
+    return Ok[bool](true)
+
+fn previewLoadWdtMaidDependencyAssets(summary: var PreviewSummary,
+                                      manifest: northshire.NorthshireManifest): Result[bool] =
+    var doodadFileDataIDs: int32[]
+    var worldModelFileDataIDs: int32[]
+    var i: int32
+    while i < manifest.auditedDependencies.len:
+        let dep: northshire.NorthshireAuditedDependency = manifest.auditedDependencies[i]
+        if dep.relationKind == "wdt_maid_split":
+            let fileRes: Result[bytes.ByteBuffer] =
+                local_files.ReadLocalFileByEntry(manifest.clientPath,
+                                                dep.archiveIndex,
+                                                dep.offset,
+                                                dep.size)
+            if IsErr(fileRes):
+                return Err[bool]("wowExport preview: WDT MAID dependency load failed " + dep.label + ": " + Error(fileRes))
+            let fileBuf: bytes.ByteBuffer = Value(fileRes)
+            summary.wdtMaidDependencyBytes = summary.wdtMaidDependencyBytes + fileBuf.len
+            let resourceRes: Result[asset_formats.WdtMaidResourceSummary] =
+                asset_formats.ParseWdtMaidResourceSummary(fileBuf)
+            if IsErr(resourceRes):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool](Error(resourceRes))
+            let resource: asset_formats.WdtMaidResourceSummary = Value(resourceRes)
+            if resource.formatKind != dep.formatKind:
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool]("wowExport preview: WDT MAID dependency format mismatch " + dep.label)
+            summary.wdtMaidParsedDependencyCount = summary.wdtMaidParsedDependencyCount + 1
+            if dep.formatKind == "adt_split":
+                let splitRes: Result[asset_formats.WdtMaidAdtSplitSummary] =
+                    asset_formats.ParseWdtMaidAdtSplitSummary(fileBuf)
+                if IsErr(splitRes):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool](Error(splitRes))
+                let split: asset_formats.WdtMaidAdtSplitSummary = Value(splitRes)
+                summary.wdtMaidAdtSplitResourceCount = summary.wdtMaidAdtSplitResourceCount + 1
+                summary.wdtMaidAdtSplitChunkCount =
+                    summary.wdtMaidAdtSplitChunkCount + split.chunkCount
+                summary.wdtMaidAdtSplitMapChunkCount =
+                    summary.wdtMaidAdtSplitMapChunkCount + split.mapChunkCount
+                summary.wdtMaidDoodadPlacementCount =
+                    summary.wdtMaidDoodadPlacementCount + split.doodadPlacementCount
+                summary.wdtMaidWorldModelPlacementCount =
+                    summary.wdtMaidWorldModelPlacementCount + split.worldModelPlacementCount
+                let recordFactsRes: Result[bool] =
+                    previewMergeWdtMaidSplitRecordFacts(summary, split)
+                if IsErr(recordFactsRes):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool](Error(recordFactsRes))
+                let doodadIDsRes: Result[bool] =
+                    previewMergeUniqueFileDataIDs(split.doodadPlacementFileDataIDs,
+                                                  doodadFileDataIDs,
+                                                  summary.wdtMaidFirstDoodadReferencedFileDataID,
+                                                  summary.wdtMaidDoodadReferencedFileDataIDCount)
+                if IsErr(doodadIDsRes):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool](Error(doodadIDsRes))
+                let worldIDsRes: Result[bool] =
+                    previewMergeUniqueFileDataIDs(split.worldModelPlacementFileDataIDs,
+                                                  worldModelFileDataIDs,
+                                                  summary.wdtMaidFirstWorldModelReferencedFileDataID,
+                                                  summary.wdtMaidWorldModelReferencedFileDataIDCount)
+                if IsErr(worldIDsRes):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool](Error(worldIDsRes))
+            elif dep.formatKind == "blp":
+                let blpRes: Result[blp.Blp2Header] = blp.ParseBlp2Header(fileBuf)
+                if IsErr(blpRes):
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool](Error(blpRes))
+                let header: blp.Blp2Header = Value(blpRes)
+                if header.width <= 0 || header.height <= 0:
+                    bytes.FreeByteBuffer(fileBuf)
+                    return Err[bool]("wowExport preview: WDT MAID BLP has invalid dimensions")
+                summary.wdtMaidBlpResourceCount = summary.wdtMaidBlpResourceCount + 1
+            else:
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool]("wowExport preview: unsupported WDT MAID dependency format " + dep.formatKind)
+            bytes.FreeByteBuffer(fileBuf)
+        i = i + 1
+    if summary.wdtMaidParsedDependencyCount !=
+        northshire.CountDependenciesForSource(manifest, "azeroth-wdt", "wdt_maid_split"):
+        return Err[bool]("wowExport preview: WDT MAID parsed dependency count mismatch")
+    let placementAuditRes: Result[northshire.NorthshireMaidPlacementDependencyAuditSummary] =
+        northshire.AuditWdtMaidPlacementReferencesAgainstLocal(manifest,
+                                                              doodadFileDataIDs,
+                                                              worldModelFileDataIDs)
+    if IsErr(placementAuditRes):
+        return Err[bool](Error(placementAuditRes))
+    let placementAudit: northshire.NorthshireMaidPlacementDependencyAuditSummary =
+        Value(placementAuditRes)
+    summary.wdtMaidDoodadPlacementDependencyCount = placementAudit.matchedDoodadDependencyCount
+    summary.wdtMaidWorldModelPlacementDependencyCount = placementAudit.matchedWorldModelDependencyCount
+    summary.wdtMaidPlacementDependencyEncodedBytes =
+        placementAudit.doodadEncodedBytes + placementAudit.worldModelEncodedBytes
+    summary.wdtMaidPlacementDependencyAuditReady =
+        placementAudit.matchedDoodadDependencyCount == summary.wdtMaidDoodadReferencedFileDataIDCount &&
+        placementAudit.matchedWorldModelDependencyCount == summary.wdtMaidWorldModelReferencedFileDataIDCount &&
+        placementAudit.firstDoodadFileDataID == summary.wdtMaidFirstDoodadReferencedFileDataID &&
+        placementAudit.firstWorldModelFileDataID == summary.wdtMaidFirstWorldModelReferencedFileDataID
+    return Ok[bool](true)
+
 fn previewLoadAuditedAssets(summary: var PreviewSummary,
                             manifest: northshire.NorthshireManifest): Result[bool] =
     var i: int32
@@ -105,6 +354,29 @@ fn previewLoadAuditedAssets(summary: var PreviewSummary,
             summary.wdtModelPlacementCount = Value(wdtRes).modelPlacementCount
             summary.wdtMaidFileDataIDCount = Value(wdtRes).maidReferencedFileCount
             summary.wdtFirstMaidFileDataID = Value(wdtRes).firstMaidFileDataID
+            let maid31x48Res: Result[bool] =
+                previewCheckWdtMaidTileDependencies(summary, manifest, fileBuf, file.label, 31, 48)
+            if IsErr(maid31x48Res):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool](Error(maid31x48Res))
+            let maid32x48Res: Result[bool] =
+                previewCheckWdtMaidTileDependencies(summary, manifest, fileBuf, file.label, 32, 48)
+            if IsErr(maid32x48Res):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool](Error(maid32x48Res))
+            let maid31x49Res: Result[bool] =
+                previewCheckWdtMaidTileDependencies(summary, manifest, fileBuf, file.label, 31, 49)
+            if IsErr(maid31x49Res):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool](Error(maid31x49Res))
+            let maid32x49Res: Result[bool] =
+                previewCheckWdtMaidTileDependencies(summary, manifest, fileBuf, file.label, 32, 49)
+            if IsErr(maid32x49Res):
+                bytes.FreeByteBuffer(fileBuf)
+                return Err[bool](Error(maid32x49Res))
+            summary.wdtMaidSplitDependenciesReady =
+                summary.wdtMaidSplitDependencyCount > 0 &&
+                summary.wdtMaidSplitDependencyCount == northshire.CountDependenciesForSource(manifest, file.label, "wdt_maid_split")
             let chunkRes: Result[bool] = previewApplyChunkedAsset(summary, fileBuf, "northshire-wdt")
             bytes.FreeByteBuffer(fileBuf)
             if IsErr(chunkRes):
@@ -270,9 +542,39 @@ fn PreviewNorthshire(frames: int32): Result[PreviewSummary] =
     let loadRes: Result[bool] = previewLoadAuditedAssets(out, manifest)
     if IsErr(loadRes):
         return Err[PreviewSummary](Error(loadRes))
+    let maidDependencyRes: Result[bool] = previewLoadWdtMaidDependencyAssets(out, manifest)
+    if IsErr(maidDependencyRes):
+        return Err[PreviewSummary](Error(maidDependencyRes))
     out.sceneNonEmpty = out.loadedFileCount == out.auditedFileCount &&
         out.wdtActiveTileCount > 0 &&
         out.wdtMaidFileDataIDCount > 0 &&
+        out.wdtMaidSplitDependenciesReady &&
+        out.wdtMaidSplitDependencyCount > 0 &&
+        out.wdtMaidParsedDependencyCount == out.wdtMaidSplitDependencyCount &&
+        out.wdtMaidAdtSplitResourceCount > 0 &&
+        out.wdtMaidBlpResourceCount > 0 &&
+        out.wdtMaidAdtSplitChunkCount > 0 &&
+        out.wdtMaidAdtSplitMapChunkCount > 0 &&
+        out.wdtMaidDoodadPlacementCount > 0 &&
+        out.wdtMaidDoodadReferencedFileDataIDCount > 0 &&
+        out.wdtMaidFirstDoodadReferencedFileDataID > 0 &&
+        out.wdtMaidDoodadPlacementDependencyCount == out.wdtMaidDoodadReferencedFileDataIDCount &&
+        out.wdtMaidDoodadPlacementBoundsReady &&
+        out.wdtMaidDoodadPlacementMaxX1000 > out.wdtMaidDoodadPlacementMinX1000 &&
+        out.wdtMaidDoodadPlacementMaxY1000 > out.wdtMaidDoodadPlacementMinY1000 &&
+        out.wdtMaidDoodadPlacementMaxZ1000 > out.wdtMaidDoodadPlacementMinZ1000 &&
+        out.wdtMaidDoodadMaxScale > 0 &&
+        out.wdtMaidWorldModelPlacementCount > 0 &&
+        out.wdtMaidWorldModelReferencedFileDataIDCount > 0 &&
+        out.wdtMaidFirstWorldModelReferencedFileDataID > 0 &&
+        out.wdtMaidWorldModelPlacementDependencyCount == out.wdtMaidWorldModelReferencedFileDataIDCount &&
+        out.wdtMaidPlacementDependencyAuditReady &&
+        out.wdtMaidPlacementDependencyEncodedBytes > 0 &&
+        out.wdtMaidWorldModelPlacementBoundsReady &&
+        out.wdtMaidWorldModelPlacementMaxX1000 > out.wdtMaidWorldModelPlacementMinX1000 &&
+        out.wdtMaidWorldModelPlacementMaxY1000 > out.wdtMaidWorldModelPlacementMinY1000 &&
+        out.wdtMaidWorldModelPlacementMaxZ1000 > out.wdtMaidWorldModelPlacementMinZ1000 &&
+        out.wdtMaidWorldModelMaxScale > 0 &&
         out.adtTileCount > 0 &&
         out.adtChunkCount > 0 &&
         out.adtHeightChunkCount == out.adtChunkCount &&
@@ -332,6 +634,46 @@ fn PreviewSummaryText(summary: PreviewSummary): str =
     let wdtPlacementText: str = strings.IntToStr(summary.wdtModelPlacementCount)
     let wdtMaidText: str = strings.IntToStr(summary.wdtMaidFileDataIDCount)
     let wdtFirstMaidText: str = strings.IntToStr(summary.wdtFirstMaidFileDataID)
+    let wdtMaidSplitText: str = strings.IntToStr(summary.wdtMaidSplitDependencyCount)
+    let wdtMaidSplitReadyText: str = summary.wdtMaidSplitDependenciesReady ? "ready" : "missing"
+    let wdtMaidParsedText: str = strings.IntToStr(summary.wdtMaidParsedDependencyCount)
+    let wdtMaidAdtSplitText: str = strings.IntToStr(summary.wdtMaidAdtSplitResourceCount)
+    let wdtMaidBlpText: str = strings.IntToStr(summary.wdtMaidBlpResourceCount)
+    let wdtMaidSplitChunkText: str = strings.IntToStr(summary.wdtMaidAdtSplitChunkCount)
+    let wdtMaidSplitMcnkText: str = strings.IntToStr(summary.wdtMaidAdtSplitMapChunkCount)
+    let wdtMaidDoodadText: str = strings.IntToStr(summary.wdtMaidDoodadPlacementCount)
+    let wdtMaidDoodadRefText: str = strings.IntToStr(summary.wdtMaidDoodadReferencedFileDataIDCount)
+    let wdtMaidFirstDoodadRefText: str = strings.IntToStr(summary.wdtMaidFirstDoodadReferencedFileDataID)
+    let wdtMaidDoodadDepText: str = strings.IntToStr(summary.wdtMaidDoodadPlacementDependencyCount)
+    let wdtMaidWorldModelText: str = strings.IntToStr(summary.wdtMaidWorldModelPlacementCount)
+    let wdtMaidWorldModelRefText: str = strings.IntToStr(summary.wdtMaidWorldModelReferencedFileDataIDCount)
+    let wdtMaidFirstWorldModelRefText: str = strings.IntToStr(summary.wdtMaidFirstWorldModelReferencedFileDataID)
+    let wdtMaidWorldModelDepText: str = strings.IntToStr(summary.wdtMaidWorldModelPlacementDependencyCount)
+    let wdtMaidPlacementAuditText: str = summary.wdtMaidPlacementDependencyAuditReady ? "ready" : "missing"
+    let wdtMaidPlacementEncodedBytesText: str = strings.IntToStr(summary.wdtMaidPlacementDependencyEncodedBytes)
+    let wdtMaidDoodadBoundsText: str = summary.wdtMaidDoodadPlacementBoundsReady ? "ready" : "missing"
+    let wdtMaidDoodadSpanXText: str =
+        strings.IntToStr(summary.wdtMaidDoodadPlacementMaxX1000 - summary.wdtMaidDoodadPlacementMinX1000)
+    let wdtMaidDoodadSpanYText: str =
+        strings.IntToStr(summary.wdtMaidDoodadPlacementMaxY1000 - summary.wdtMaidDoodadPlacementMinY1000)
+    let wdtMaidDoodadSpanZText: str =
+        strings.IntToStr(summary.wdtMaidDoodadPlacementMaxZ1000 - summary.wdtMaidDoodadPlacementMinZ1000)
+    let wdtMaidDoodadSpanText: str = Fmt"{wdtMaidDoodadSpanXText},{wdtMaidDoodadSpanYText},{wdtMaidDoodadSpanZText}"
+    let wdtMaidDoodadMinScaleText: str = strings.IntToStr(summary.wdtMaidDoodadMinScale)
+    let wdtMaidDoodadMaxScaleText: str = strings.IntToStr(summary.wdtMaidDoodadMaxScale)
+    let wdtMaidDoodadScaleText: str = Fmt"{wdtMaidDoodadMinScaleText},{wdtMaidDoodadMaxScaleText}"
+    let wdtMaidWorldModelBoundsText: str = summary.wdtMaidWorldModelPlacementBoundsReady ? "ready" : "missing"
+    let wdtMaidWorldModelSpanXText: str =
+        strings.IntToStr(summary.wdtMaidWorldModelPlacementMaxX1000 - summary.wdtMaidWorldModelPlacementMinX1000)
+    let wdtMaidWorldModelSpanYText: str =
+        strings.IntToStr(summary.wdtMaidWorldModelPlacementMaxY1000 - summary.wdtMaidWorldModelPlacementMinY1000)
+    let wdtMaidWorldModelSpanZText: str =
+        strings.IntToStr(summary.wdtMaidWorldModelPlacementMaxZ1000 - summary.wdtMaidWorldModelPlacementMinZ1000)
+    let wdtMaidWorldModelSpanText: str = Fmt"{wdtMaidWorldModelSpanXText},{wdtMaidWorldModelSpanYText},{wdtMaidWorldModelSpanZText}"
+    let wdtMaidWorldModelMinScaleText: str = strings.IntToStr(summary.wdtMaidWorldModelMinScale)
+    let wdtMaidWorldModelMaxScaleText: str = strings.IntToStr(summary.wdtMaidWorldModelMaxScale)
+    let wdtMaidWorldModelScaleText: str = Fmt"{wdtMaidWorldModelMinScaleText},{wdtMaidWorldModelMaxScaleText}"
+    let wdtMaidDependencyBytesText: str = strings.IntToStr(summary.wdtMaidDependencyBytes)
     let adtTileText: str = strings.IntToStr(summary.adtTileCount)
     let adtChunkText: str = strings.IntToStr(summary.adtChunkCount)
     let adtHeightChunkText: str = strings.IntToStr(summary.adtHeightChunkCount)
@@ -399,6 +741,30 @@ fn PreviewSummaryText(summary: PreviewSummary): str =
     out = out + Fmt" wdtModelPlacements={wdtPlacementText}"
     out = out + Fmt" wdtMaidFileIDs={wdtMaidText}"
     out = out + Fmt" wdtFirstMaidFileDataID={wdtFirstMaidText}"
+    out = out + Fmt" wdtMaidSplitDependencies={wdtMaidSplitText}"
+    out = out + Fmt" wdtMaidSplitDependencyAudit={wdtMaidSplitReadyText}"
+    out = out + Fmt" wdtMaidParsedDependencies={wdtMaidParsedText}"
+    out = out + Fmt" wdtMaidAdtSplits={wdtMaidAdtSplitText}"
+    out = out + Fmt" wdtMaidBlps={wdtMaidBlpText}"
+    out = out + Fmt" wdtMaidAdtSplitChunks={wdtMaidSplitChunkText}"
+    out = out + Fmt" wdtMaidAdtSplitMcnks={wdtMaidSplitMcnkText}"
+    out = out + Fmt" wdtMaidDoodadPlacements={wdtMaidDoodadText}"
+    out = out + Fmt" wdtMaidDoodadReferencedFileIDs={wdtMaidDoodadRefText}"
+    out = out + Fmt" wdtMaidFirstDoodadReferencedFileID={wdtMaidFirstDoodadRefText}"
+    out = out + Fmt" wdtMaidDoodadPlacementDependencies={wdtMaidDoodadDepText}"
+    out = out + Fmt" wdtMaidDoodadPlacementBounds={wdtMaidDoodadBoundsText}"
+    out = out + Fmt" wdtMaidDoodadPlacementSpan1000={wdtMaidDoodadSpanText}"
+    out = out + Fmt" wdtMaidDoodadScaleMinMax={wdtMaidDoodadScaleText}"
+    out = out + Fmt" wdtMaidWorldModelPlacements={wdtMaidWorldModelText}"
+    out = out + Fmt" wdtMaidWorldModelReferencedFileIDs={wdtMaidWorldModelRefText}"
+    out = out + Fmt" wdtMaidFirstWorldModelReferencedFileID={wdtMaidFirstWorldModelRefText}"
+    out = out + Fmt" wdtMaidWorldModelPlacementDependencies={wdtMaidWorldModelDepText}"
+    out = out + Fmt" wdtMaidPlacementDependencyAudit={wdtMaidPlacementAuditText}"
+    out = out + Fmt" wdtMaidPlacementDependencyEncodedBytes={wdtMaidPlacementEncodedBytesText}"
+    out = out + Fmt" wdtMaidWorldModelPlacementBounds={wdtMaidWorldModelBoundsText}"
+    out = out + Fmt" wdtMaidWorldModelPlacementSpan1000={wdtMaidWorldModelSpanText}"
+    out = out + Fmt" wdtMaidWorldModelScaleMinMax={wdtMaidWorldModelScaleText}"
+    out = out + Fmt" wdtMaidDependencyBytes={wdtMaidDependencyBytesText}"
     out = out + Fmt" adtTiles={adtTileText}"
     out = out + Fmt" adtChunks={adtChunkText}"
     out = out + Fmt" adtHeightChunks={adtHeightChunkText}"

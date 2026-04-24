@@ -1,13 +1,189 @@
+import std/result
+import std/strings
+import std/strutils as strutil
 import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/system_link_plan as slplan
 import cheng/core/backend/target_matrix as tmat
+
+type
+    DebugToolsProfileCount =
+        key: str
+        count: int32
 
 fn DebugToolsAppendLine(out: var str, key: str, value: str) =
     out = out + key + "=" + value + "\n"
 
 fn DebugToolsAppendHeader(out: var str, header: str) =
     out = out + header + "\n"
+
+fn DebugToolsAppendRawLine(out: var str, line: str) =
+    out = out + line + "\n"
+
+fn DebugToolsReplaceSuffix(path: str, suffix: str, replacement: str): str =
+    if strings.HasSuffix(path, suffix):
+        return strings.SliceBytes(path, 0, len(path) - len(suffix)) + replacement
+    return path + replacement
+
+fn DebugToolsProfileReportPathFromRaw(rawReportPath: str): str =
+    if len(rawReportPath) <= 0:
+        return ""
+    if strings.HasSuffix(rawReportPath, ".raw.txt"):
+        return DebugToolsReplaceSuffix(rawReportPath, ".raw.txt", ".txt")
+    return rawReportPath + ".report.txt"
+
+fn DebugToolsProfileRawPathFromReport(reportPath: str): str =
+    if len(reportPath) <= 0:
+        return ""
+    if strings.HasSuffix(reportPath, ".txt"):
+        return DebugToolsReplaceSuffix(reportPath, ".txt", ".raw.txt")
+    return reportPath + ".raw.txt"
+
+fn DebugToolsCrashReportPathFromRaw(rawLogPath: str): str =
+    if len(rawLogPath) <= 0:
+        return ""
+    if strings.HasSuffix(rawLogPath, ".run.log"):
+        return DebugToolsReplaceSuffix(rawLogPath, ".run.log", ".report.txt")
+    if strings.HasSuffix(rawLogPath, ".raw.txt"):
+        return DebugToolsReplaceSuffix(rawLogPath, ".raw.txt", ".txt")
+    return rawLogPath + ".report.txt"
+
+fn DebugToolsCrashRawLineAllowed(line: str): bool =
+    if len(line) <= 0:
+        return false
+    if strutil.StartsWith(line, "reason="):
+        return true
+    if strutil.StartsWith(line, "regs pc="):
+        return true
+    if strutil.StartsWith(line, "m#"):
+        return true
+    if len(line) > 1 && line[0] == char(35) && line[1] >= '0' && line[1] <= '9':
+        return true
+    if strutil.StartsWith(line, "source_frames="):
+        return true
+    return false
+
+fn DebugToolsCrashReportText(rawText: str): Result[str] =
+    let lines = strutil.Split(rawText, '\n')
+    var headerSeen = false
+    var sawReason = false
+    var sawRegs = false
+    var sawMachine = false
+    var out = ""
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        if len(line) <= 0:
+            continue
+        if !headerSeen:
+            if line != "cheng_crash_raw_v1":
+                continue
+            headerSeen = true
+            DebugToolsAppendRawLine(out, "[cheng] cheng_crash_report_v1")
+            continue
+        if !DebugToolsCrashRawLineAllowed(line):
+            continue
+        DebugToolsAppendRawLine(out, "[cheng] " + line)
+        if strutil.StartsWith(line, "reason="):
+            sawReason = true
+        elif strutil.StartsWith(line, "regs pc="):
+            sawRegs = true
+        elif strutil.StartsWith(line, "m#"):
+            sawMachine = true
+    if !headerSeen || !sawReason || !sawRegs || !sawMachine:
+        return Err[str]("cheng crash report: invalid raw log")
+    return Ok[str](out)
+
+fn DebugToolsProfileCountAdd(items: var DebugToolsProfileCount[],
+                               keyRaw: str) =
+    var key = keyRaw
+    if len(key) <= 0:
+        key = "?"
+    for i in 0..<items.len:
+        if items[i].key == key:
+            items[i].count = items[i].count + 1
+            return
+    add(items, DebugToolsProfileCount(key: key, count: 1))
+
+fn DebugToolsProfileCountBefore(left: DebugToolsProfileCount,
+                                  right: DebugToolsProfileCount): bool =
+    if left.count != right.count:
+        return left.count > right.count
+    return cmp(left.key, right.key) < 0
+
+fn DebugToolsProfileSortCounts(items: var DebugToolsProfileCount[]) =
+    if items.len <= 1:
+        return
+    for i in 0..<items.len:
+        var best = i
+        var j = i + 1
+        while j < items.len:
+            if DebugToolsProfileCountBefore(items[j], items[best]):
+                best = j
+            j = j + 1
+        if best != i:
+            let tmp = items[i]
+            items[i] = items[best]
+            items[best] = tmp
+
+fn DebugToolsProfileAppendTop(out: var str,
+                                prefix: str,
+                                items: DebugToolsProfileCount[]) =
+    var limit = items.len
+    if limit > 8:
+        limit = 8
+    for i in 0..<limit:
+        DebugToolsAppendRawLine(out,
+                                prefix + "[" + intToStr(i) + "]=" +
+                                intToStr(items[i].count) + "|" + items[i].key)
+
+fn DebugToolsProfileReportText(rawText: str): Result[str] =
+    let lines = strutil.Split(rawText, '\n')
+    var headerSeen = false
+    var totalSamples: int32
+    var droppedSamples: int32
+    var sampleCount: int32
+    var functionCounts: DebugToolsProfileCount[]
+    var sourceCounts: DebugToolsProfileCount[]
+    var pcCounts: DebugToolsProfileCount[]
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        if len(line) <= 0:
+            continue
+        if !headerSeen:
+            headerSeen = true
+            if line != "cheng_profile_raw_v1":
+                return Err[str]("cheng profile report: invalid raw header")
+            continue
+        if strutil.StartsWith(line, "total_samples="):
+            totalSamples = int32(strutil.ParseInt(strings.DropPrefix(line, "total_samples=")))
+            continue
+        if strutil.StartsWith(line, "dropped_samples="):
+            droppedSamples = int32(strutil.ParseInt(strings.DropPrefix(line, "dropped_samples=")))
+            continue
+        if !strutil.StartsWith(line, "sample\t"):
+            continue
+        let parts = strutil.Split(line, '\t')
+        if parts.len < 4:
+            continue
+        DebugToolsProfileCountAdd(pcCounts, parts[1])
+        DebugToolsProfileCountAdd(functionCounts, parts[2])
+        DebugToolsProfileCountAdd(sourceCounts, parts[3])
+        sampleCount = sampleCount + 1
+    if !headerSeen:
+        return Err[str]("cheng profile report: invalid raw header")
+    if totalSamples <= 0:
+        totalSamples = sampleCount
+    DebugToolsProfileSortCounts(functionCounts)
+    DebugToolsProfileSortCounts(sourceCounts)
+    DebugToolsProfileSortCounts(pcCounts)
+    var out = ""
+    DebugToolsAppendRawLine(out, "cheng_profile_v1")
+    DebugToolsAppendLine(out, "total_samples", intToStr(totalSamples))
+    DebugToolsAppendLine(out, "dropped_samples", intToStr(droppedSamples))
+    DebugToolsProfileAppendTop(out, "hot_function", functionCounts)
+    DebugToolsProfileAppendTop(out, "hot_source", sourceCounts)
+    DebugToolsProfileAppendTop(out, "hot_pc", pcCounts)
+    return Ok[str](out)
 
 fn DebugToolsSourcePath(linkPlan: slplan.SystemLinkPlanStub): str =
     if len(linkPlan.entryPath) > 0:

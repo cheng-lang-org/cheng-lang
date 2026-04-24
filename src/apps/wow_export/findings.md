@@ -1,5 +1,15 @@
 # wowExport Findings
 
+- Northshire MAID `adt_split` payloads are now parsed as real chunk streams, not only format headers: slot 1 carries `FDDM/MDDF` and `FDOM/MODF` placement tables plus terrain chunks, slot 3 carries `PMAM` plus terrain chunks, while slots 2 and 4 are metadata-style split streams without `KNCM/MCNK`.
+- The four audited Northshire MAID tiles currently provide `2164` ADT split chunks, `2048` `KNCM/MCNK` chunks, `4345` `FDDM/MDDF` doodad placements, and `32` `FDOM/MODF` world model placements; preview/render now fail if these parsed facts disappear.
+- `MDDF` records are parsed at 36-byte stride as nameID, uniqueID, position, rotation, scale and flags. Current Northshire aggregate position span is `1125287,221256,1145929`, with scale range `133..3389`.
+- `MODF` records are parsed at 64-byte stride as nameID, uniqueID, position, rotation, bounds, flags/doodad-set/name-set and scale. Current Northshire aggregate position span is `1133681,61759,899866`, with scale range `1024..1024`.
+- Northshire MAID modern placement `nameID` fields are fileDataIDs, not local path table indexes: `MDDF` aggregates to `222` unique doodad fileDataIDs, first `189929`; `MODF` aggregates to `18` unique world model fileDataIDs, first `108104`.
+- Slot 3 contains `DIDM/DIHM` modern ID chunks, but current Northshire `MDDF/MODF` placement IDs are already direct fileDataIDs; treating them as indexes into `DIDM/DIHM` would be wrong.
+- Northshire WDT `MAID` non-base slots are heterogeneous resources, not 28 identical ADT files: for each audited tile, slots `1..4` decode to `REVM/MVER` chunked split payloads and slots `5..7` decode to `BLP2` textures.
+- The audited dependency table now keeps `relationKind=wdt_maid_split` for the WDT source edge and `formatKind` for the real payload format; this avoids fabricating paths and avoids exporting BLP textures with `.adt` names.
+- Current Northshire dependency surface is `45` pathless resources: `17` WMO `MODI` M2 files plus `28` WDT MAID resources. The MAID resources split into `16` `adt_split` and `12` `blp`.
+- `ParseChunkedHeader` is intentionally not used as a full-file validator for MAID split payloads: real split payloads can have valid `REVM/MVER` prefix while not behaving like the complete ADT chunk stream parser expects.
 - WDT `MAID` 是 tile-local 8-slot split fileDataID 表，不是单个基础 ADT；Northshire 四 tile 的 slot0 是基础 ADT，slot1/2/3 等 split 仍有真实 fileDataID，后续对象/纹理/地表层资源应从这些 split 继续审计。
 - 本地 MAID split 审计慢的根因已经钉住：`CascArchiveDecodeLocalEntryRange` 对 BLTE `0x4e normal` block 走了“读整块 -> 复制整块 decodedBlock -> 再复制目标 range”的路径。encoding page lookup 大量命中 normal block 时会把 CPU 和内存打到不必要的整块拷贝上。
 - 当前修复是严格 range 读取：先读 block flag，若为 `normal` 且 `compSize == decompSize + 1`，直接读取 `blockFileOffset + 1 + blockOffsetInDecoded` 的目标子区间；zlib/encrypted block 仍走完整解码路径，不做降级或猜测。

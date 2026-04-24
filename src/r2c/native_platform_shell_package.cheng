@@ -1,0 +1,363 @@
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/path as chengpath
+
+fn nativePackageSlice(text: str,
+                      start: int32,
+                      length: int32): str =
+    if length <= 0:
+        return ""
+    return chengpath.TextSlice(text, start, length)
+
+fn nativePackageDigitValue(text: str): int32 =
+    if text == "0":
+        return 0
+    elif text == "1":
+        return 1
+    elif text == "2":
+        return 2
+    elif text == "3":
+        return 3
+    elif text == "4":
+        return 4
+    elif text == "5":
+        return 5
+    elif text == "6":
+        return 6
+    elif text == "7":
+        return 7
+    elif text == "8":
+        return 8
+    elif text == "9":
+        return 9
+    return -1
+
+fn nativePackageParsePositiveInt32(raw: str): int32 =
+    let total: int32 = strings.Len(raw)
+    if total <= 0:
+        return 0
+    var out: int32
+    for i in 0..<total:
+        let digit: int32 = nativePackageDigitValue(nativePackageSlice(raw, i, 1))
+        if digit < 0:
+            return -1
+        out = (out * 10) + digit
+    return out
+
+fn nativePackageParseInt32(text: str): int32 =
+    let raw: str = strutil.Strip(text)
+    if strings.Len(raw) <= 0:
+        return 0
+    if raw[0] == '-':
+        let parsed: int32 = nativePackageParsePositiveInt32(nativePackageSlice(raw, 1, strings.Len(raw) - 1))
+        if parsed < 0:
+            return 0
+        return 0 - parsed
+    let parsed: int32 = nativePackageParsePositiveInt32(raw)
+    if parsed < 0:
+        return 0
+    return parsed
+
+fn nativePackageJsonQuote(text: str): str =
+    let quote: str = strings.CharToStr(char(34))
+    var out = quote
+    let total: int32 = strings.Len(text)
+    for i in 0..<total:
+        let ch = text[i]
+        if ch == char(34):
+            out = out + "\\" + quote
+        elif ch == '\\':
+            out = out + "\\\\"
+        elif ch == char(10):
+            out = out + "\\n"
+        elif ch == char(13):
+            out = out + "\\r"
+        elif ch == char(9):
+            out = out + "\\t"
+        else:
+            out = out + strings.CharToStr(ch)
+    out = out + quote
+    return out
+
+fn nativePackageTextFind(text: str,
+                         needle: str,
+                         startRaw: int32): int32 =
+    let total: int32 = strings.Len(text)
+    let needleLen: int32 = strings.Len(needle)
+    if needleLen <= 0:
+        return startRaw
+    if total < needleLen:
+        return -1
+    var start: int32 = startRaw
+    if start < 0:
+        start = 0
+    if start > total - needleLen:
+        return -1
+    for i in start..(total - needleLen):
+        var matched = true
+        for j in 0..<needleLen:
+            if text[i + j] != needle[j]:
+                matched = false
+                break
+        if matched:
+            return i
+    return -1
+
+fn nativePackageJsonSkipWhitespace(text: str,
+                                   startRaw: int32): int32 =
+    var pos: int32 = startRaw
+    if pos < 0:
+        pos = 0
+    let total: int32 = strings.Len(text)
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(32) || ch == char(10) || ch == char(13) || ch == char(9):
+            pos = pos + 1
+        else:
+            return pos
+    return pos
+
+fn nativePackageJsonFindValueStart(text: str,
+                                   key: str,
+                                   startRaw: int32): int32 =
+    let keyPattern: str = nativePackageJsonQuote(key)
+    let keyPos: int32 = nativePackageTextFind(text, keyPattern, startRaw)
+    if keyPos < 0:
+        return -1
+    var pos: int32 = keyPos + strings.Len(keyPattern)
+    let total: int32 = strings.Len(text)
+    while pos < total:
+        if text[pos] == char(58):
+            return nativePackageJsonSkipWhitespace(text, pos + 1)
+        pos = pos + 1
+    return -1
+
+fn nativePackageJsonReadStringLiteral(text: str,
+                                      startRaw: int32,
+                                      fallback: str): str =
+    let total: int32 = strings.Len(text)
+    if startRaw < 0 || startRaw >= total || text[startRaw] != char(34):
+        return fallback
+    var out: str
+    var pos: int32 = startRaw + 1
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(34):
+            return out
+        if ch == '\\':
+            if pos + 1 >= total:
+                return fallback
+            let esc = text[pos + 1]
+            if esc == char(34):
+                out = out + strings.CharToStr(char(34))
+            elif esc == '\\':
+                out = out + "\\"
+            elif esc == 'n':
+                out = out + "\n"
+            elif esc == 'r':
+                out = out + "\r"
+            elif esc == 't':
+                out = out + "\t"
+            else:
+                out = out + strings.CharToStr(esc)
+            pos = pos + 2
+            continue
+        out = out + strings.CharToStr(ch)
+        pos = pos + 1
+    return fallback
+
+fn nativePackageJsonReadStringField(text: str,
+                                    key: str,
+                                    fallback: str): str =
+    let valueStart: int32 = nativePackageJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    return nativePackageJsonReadStringLiteral(text, valueStart, fallback)
+
+fn nativePackageJsonReadIntField(text: str,
+                                 key: str,
+                                 fallback: int32): int32 =
+    let valueStart: int32 = nativePackageJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    let total: int32 = strings.Len(text)
+    var endPos: int32 = valueStart
+    if endPos < total && text[endPos] == '-':
+        endPos = endPos + 1
+    var sawDigit = false
+    while endPos < total:
+        if nativePackageDigitValue(nativePackageSlice(text, endPos, 1)) < 0:
+            break
+        sawDigit = true
+        endPos = endPos + 1
+    if !sawDigit:
+        return fallback
+    return nativePackageParseInt32(nativePackageSlice(text, valueStart, endPos - valueStart))
+
+fn nativePackageHasPureRuntime(planText: str): bool =
+    if !strutil.Contains(planText, "\"node\": false"):
+        return false
+    if !strutil.Contains(planText, "\"react\": false"):
+        return false
+    if !strutil.Contains(planText, "\"webview_business_layer\": false"):
+        return false
+    if !strutil.Contains(planText, "\"business_js\": false"):
+        return false
+    return true
+
+fn nativePackageLaunchPlanValid(planText: str,
+                                platformId: str,
+                                shellKind: str,
+                                surfaceBinding: str,
+                                inputBinding: str): bool =
+    if nativePackageJsonReadStringField(planText, "format", "") != "native_platform_shell_launch_plan_v1":
+        return false
+    if nativePackageJsonReadStringField(planText, "platform", "") != platformId:
+        return false
+    if nativePackageJsonReadStringField(planText, "shell_kind", "") != shellKind:
+        return false
+    if nativePackageJsonReadStringField(planText, "surface_binding", "") != surfaceBinding:
+        return false
+    if nativePackageJsonReadStringField(planText, "input_binding", "") != inputBinding:
+        return false
+    if nativePackageJsonReadStringField(planText, "event_loop", "") != "event_driven_v1":
+        return false
+    if !nativePackageHasPureRuntime(planText):
+        return false
+    let framePath: str = nativePackageJsonReadStringField(planText, "frame_path", "")
+    let frameFormat: str = nativePackageJsonReadStringField(planText, "frame_format", "")
+    let pixelFormat: str = nativePackageJsonReadStringField(planText, "pixel_format", "")
+    let width: int32 = nativePackageJsonReadIntField(planText, "width", 0)
+    let height: int32 = nativePackageJsonReadIntField(planText, "height", 0)
+    let strideBytes: int32 = nativePackageJsonReadIntField(planText, "stride_bytes", 0)
+    let frameByteCount: int32 = nativePackageJsonReadIntField(planText, "frame_byte_count", 0)
+    if strings.Len(framePath) <= 0 || !chengpath.PathFileExists(framePath):
+        return false
+    if frameFormat != "surface_frame_rgba_v1" || pixelFormat != "rgba8_unpremultiplied":
+        return false
+    if width <= 0 || height <= 0 || strideBytes <= 0 || frameByteCount <= 0:
+        return false
+    if strideBytes != width * 4 || frameByteCount != strideBytes * height:
+        return false
+    if chengpath.PathFileSize(framePath) != int64(frameByteCount):
+        return false
+    return true
+
+fn NativePlatformShellPackageManifestValid(manifestText: str): bool =
+    if nativePackageJsonReadStringField(manifestText, "format", "") != "native_platform_shell_package_manifest_v1":
+        return false
+    if nativePackageJsonReadStringField(manifestText, "package_kind", "") != "cheng_generated_native_surface_shell_package_v1":
+        return false
+    if nativePackageJsonReadStringField(manifestText, "event_loop", "") != "event_driven_v1":
+        return false
+    if nativePackageJsonReadIntField(manifestText, "platform_count", 0) != 3:
+        return false
+    if !nativePackageHasPureRuntime(manifestText):
+        return false
+    if !strutil.Contains(manifestText, "\"surface_binding\":\"ANativeWindow_rgba_blit_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"surface_binding\":\"CAMetalLayer_rgba_blit_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"surface_binding\":\"OHNativeWindow_rgba_blit_v1\""):
+        return false
+    return true
+
+fn nativePackageManifestText(androidPath: str,
+                             iosPath: str,
+                             ohosPath: str,
+                             summaryPath: str,
+                             androidText: str,
+                             iosText: str,
+                             ohosText: str): str =
+    let framePath: str = nativePackageJsonReadStringField(androidText, "frame_path", "")
+    let frameFormat: str = nativePackageJsonReadStringField(androidText, "frame_format", "surface_frame_rgba_v1")
+    let pixelFormat: str = nativePackageJsonReadStringField(androidText, "pixel_format", "rgba8_unpremultiplied")
+    let width: int32 = nativePackageJsonReadIntField(androidText, "width", 0)
+    let height: int32 = nativePackageJsonReadIntField(androidText, "height", 0)
+    let strideBytes: int32 = nativePackageJsonReadIntField(androidText, "stride_bytes", 0)
+    let frameByteCount: int32 = nativePackageJsonReadIntField(androidText, "frame_byte_count", 0)
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_package_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_platform_shell_package_v1\",\n"
+    doc = doc + "  \"package_kind\": \"cheng_generated_native_surface_shell_package_v1\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"platform_count\": 3,\n"
+    doc = doc + "  \"frame_path\": " + nativePackageJsonQuote(framePath) + ",\n"
+    doc = doc + "  \"frame_format\": " + nativePackageJsonQuote(frameFormat) + ",\n"
+    doc = doc + "  \"pixel_format\": " + nativePackageJsonQuote(pixelFormat) + ",\n"
+    doc = doc + "  \"width\": " + intToStr(width) + ",\n"
+    doc = doc + "  \"height\": " + intToStr(height) + ",\n"
+    doc = doc + "  \"stride_bytes\": " + intToStr(strideBytes) + ",\n"
+    doc = doc + "  \"frame_byte_count\": " + intToStr(frameByteCount) + ",\n"
+    doc = doc + "  \"android_launch_plan_path\": " + nativePackageJsonQuote(androidPath) + ",\n"
+    doc = doc + "  \"ios_launch_plan_path\": " + nativePackageJsonQuote(iosPath) + ",\n"
+    doc = doc + "  \"ohos_launch_plan_path\": " + nativePackageJsonQuote(ohosPath) + ",\n"
+    doc = doc + "  \"launch_summary_path\": " + nativePackageJsonQuote(summaryPath) + ",\n"
+    doc = doc + "  \"platforms\": [\n"
+    doc = doc + "    {\"id\":\"android\",\"shell_kind\":" + nativePackageJsonQuote(nativePackageJsonReadStringField(androidText, "shell_kind", "")) + ",\"surface_binding\":" + nativePackageJsonQuote(nativePackageJsonReadStringField(androidText, "surface_binding", "")) + ",\"input_binding\":" + nativePackageJsonQuote(nativePackageJsonReadStringField(androidText, "input_binding", "")) + ",\"launch_plan_path\":" + nativePackageJsonQuote(androidPath) + "},\n"
+    doc = doc + "    {\"id\":\"ios\",\"shell_kind\":" + nativePackageJsonQuote(nativePackageJsonReadStringField(iosText, "shell_kind", "")) + ",\"surface_binding\":" + nativePackageJsonQuote(nativePackageJsonReadStringField(iosText, "surface_binding", "")) + ",\"input_binding\":" + nativePackageJsonQuote(nativePackageJsonReadStringField(iosText, "input_binding", "")) + ",\"launch_plan_path\":" + nativePackageJsonQuote(iosPath) + "},\n"
+    doc = doc + "    {\"id\":\"ohos\",\"shell_kind\":" + nativePackageJsonQuote(nativePackageJsonReadStringField(ohosText, "shell_kind", "")) + ",\"surface_binding\":" + nativePackageJsonQuote(nativePackageJsonReadStringField(ohosText, "surface_binding", "")) + ",\"input_binding\":" + nativePackageJsonQuote(nativePackageJsonReadStringField(ohosText, "input_binding", "")) + ",\"launch_plan_path\":" + nativePackageJsonQuote(ohosPath) + "}\n"
+    doc = doc + "  ]\n"
+    doc = doc + "}\n"
+    return doc
+
+fn WriteNativePlatformShellPackageManifest(planDir: str,
+                                           outPath: str): bool =
+    if strings.Len(planDir) <= 0 || !chengpath.PathDirExists(planDir):
+        return false
+    if strings.Len(outPath) <= 0:
+        return false
+    let androidPath: str = chengpath.PathJoin(planDir, "native_platform_shell_android_launch_v1.json")
+    let iosPath: str = chengpath.PathJoin(planDir, "native_platform_shell_ios_launch_v1.json")
+    let ohosPath: str = chengpath.PathJoin(planDir, "native_platform_shell_ohos_launch_v1.json")
+    let summaryPath: str = chengpath.PathJoin(planDir, "native_platform_shell_launch.summary.env")
+    if !chengpath.FileExistsNonEmpty("", androidPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", iosPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", ohosPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", summaryPath):
+        return false
+    let androidText: str = chengpath.ReadTextFile("", androidPath)
+    let iosText: str = chengpath.ReadTextFile("", iosPath)
+    let ohosText: str = chengpath.ReadTextFile("", ohosPath)
+    let summaryText: str = chengpath.ReadTextFile("", summaryPath)
+    if !nativePackageLaunchPlanValid(androidText,
+                                     "android",
+                                     "cheng_generated_android_surface_shell_v1",
+                                     "ANativeWindow_rgba_blit_v1",
+                                     "AInputQueue_event_driven_v1"):
+        return false
+    if !nativePackageLaunchPlanValid(iosText,
+                                     "ios",
+                                     "cheng_generated_ios_surface_shell_v1",
+                                     "CAMetalLayer_rgba_blit_v1",
+                                     "UIKit_touch_event_driven_v1"):
+        return false
+    if !nativePackageLaunchPlanValid(ohosText,
+                                     "ohos",
+                                     "cheng_generated_ohos_surface_shell_v1",
+                                     "OHNativeWindow_rgba_blit_v1",
+                                     "XComponent_event_driven_v1"):
+        return false
+    if !strutil.Contains(summaryText, "format=native_platform_shell_launch_summary_v1"):
+        return false
+    if !strutil.Contains(summaryText, "ready=true"):
+        return false
+    if !strutil.Contains(summaryText, "event_loop=event_driven_v1"):
+        return false
+    let doc: str = nativePackageManifestText(androidPath,
+                                             iosPath,
+                                             ohosPath,
+                                             summaryPath,
+                                             androidText,
+                                             iosText,
+                                             ohosText)
+    if !NativePlatformShellPackageManifestValid(doc):
+        return false
+    if !chengpath.WriteTextFile("", outPath, doc):
+        return false
+    return chengpath.FileExistsNonEmpty("", outPath)

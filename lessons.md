@@ -62,3 +62,12 @@
 - `tools/r2c/experimental` 现在应保持空目录；r2c helper/host 文件若回潮，必须先视为架构违规而不是兼容入口。
 - 不要用裸 `args` 表达式语句消隐 `str[]` 等复合形参；当前后端会把复合数组形参表达式语句判成 unsupported，未用形参直接留空或按真实语义读取。
 - r2c `run-native-gui` 收到显式 `--bundle-path` 时，bundle summary 必须从 bundle 文件所在目录解析；run 输出目录只负责 run report/summary，不能混用两套 artifact 根。
+- r2c native GUI 软件 framebuffer 必须放在 runtime 侧模块；controller 只传 `--screenshot-out` 并验证产物，避免把大栅格/PNG 编码闭包并入巨型 controller。
+- 纯 Cheng 写 PNG chunk type 不要从字符串循环转字节；当前稳定写法是显式 ASCII 数字写 `IHDR/IDAT/IEND` 并在 smoke 里校验文件头，不能只查文件存在和大小。
+- r2c 大入口出现无诊断 `-1` 时先扫其它 Codex/app-server 触发的 `system-link-exec` 长编译并精准停止；并发编译会制造假红和内存风险。
+- 用户明确限定 seed 主线时，不得停止 dapanyouxuan/mobile/r2c/GUI 等非主线后台工作进程；发现并发干扰只能避开或先汇报，不擅自 kill。
+- entry bridge 接 debug/profile runtime hook 时必须按 target provider 能力加条件；Linux nolibc 这类无 native provider 目标不能无条件引用 `cheng_register_line_map_from_argv0` / `cheng_debug_profile_flush_from_argv0`。
+- r2c native GUI 上屏闭环优先落 `surface_frame_rgba_v1` 原始帧 + manifest；Android/iOS/OHOS 壳只消费这个稳定 ABI，smoke 必须校验 RGBA 字节数、route replay manifest 和 event-driven interaction manifest。
+- r2c 平台壳合同放 runtime 产物和 host-run fields；不要继续往 `r2cControllerRunNativeGui` 的大 report 里堆字段，该函数已贴近 stage3 局部临时上限。
+- r2c smoke 的 artifact 目录不能复用 `/tmp` 可执行输出路径；否则 `MkdirP` 会正确失败。稳定命名用 `<smoke>_artifacts` 目录。
+- host smoke、gate smoke、runtime_zero 这类会触发编译的门禁 RSS 默认统一 8GiB；禁止再写 `34359738368` 这种 32GiB 守卫，必须有静态 smoke 防回潮。

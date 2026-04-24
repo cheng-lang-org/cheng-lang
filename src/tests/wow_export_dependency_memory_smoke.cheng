@@ -9,11 +9,11 @@ import cheng/apps/wow_export/manifest/northshire_retail_12_0_5 as northshire
 fn probeDependencyOnce(): int32 =
     let manifest: northshire.NorthshireManifest = northshire.Manifest()
     assert(northshire.ManifestReady(manifest), "wow_export_dependency_memory manifest ready")
-    assert(manifest.auditedDependencyCount == 17, "wow_export_dependency_memory dependency count")
+    assert(manifest.auditedDependencyCount == 45, "wow_export_dependency_memory dependency count")
     let depAuditRes: Result[northshire.NorthshireAuditSummary] =
         northshire.AuditManifestDependenciesAgainstLocal(manifest)
     assert(IsOk(depAuditRes), Error(depAuditRes))
-    assert(Value(depAuditRes).matchedDependencyCount == 17,
+    assert(Value(depAuditRes).matchedDependencyCount == 45,
            "wow_export_dependency_memory matched dependency count")
     var totalFacts: int32 = Value(depAuditRes).matchedDependencyCount
     var i: int32
@@ -23,20 +23,59 @@ fn probeDependencyOnce(): int32 =
             local_files.ReadLocalFileByEntry(manifest.clientPath, dep.archiveIndex, dep.offset, dep.size)
         assert(IsOk(fileRes), Error(fileRes))
         let fileBuf: bytes.ByteBuffer = Value(fileRes)
-        let headerRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(fileBuf)
+        if dep.relationKind == "wmo_modi":
+            let headerRes: Result[asset_formats.M2Header] = asset_formats.ParseM2Header(fileBuf)
+            assert(IsOk(headerRes), Error(headerRes))
+            totalFacts = totalFacts + Value(headerRes).version + Value(headerRes).vertexCount
+        elif dep.relationKind == "wdt_maid_split":
+            let resourceRes: Result[asset_formats.WdtMaidResourceSummary] =
+                asset_formats.ParseWdtMaidResourceSummary(fileBuf)
+            assert(IsOk(resourceRes), Error(resourceRes))
+            assert(Value(resourceRes).formatKind == dep.formatKind,
+                   "wow_export_dependency_memory maid format")
+            totalFacts = totalFacts + Value(resourceRes).version
+            if dep.formatKind == "adt_split":
+                let splitRes: Result[asset_formats.WdtMaidAdtSplitSummary] =
+                    asset_formats.ParseWdtMaidAdtSplitSummary(fileBuf)
+                assert(IsOk(splitRes), Error(splitRes))
+                let split: asset_formats.WdtMaidAdtSplitSummary = Value(splitRes)
+                totalFacts = totalFacts + split.chunkCount +
+                    split.mapChunkCount +
+                    split.doodadPlacementCount +
+                    split.worldModelPlacementCount +
+                    split.doodadPlacementFileDataIDCount +
+                    split.worldModelPlacementFileDataIDCount
+                if split.doodadPlacementCount > 0:
+                    assert(split.doodadPlacementPositionBoundsReady,
+                           "wow_export_dependency_memory maid doodad placement bounds")
+                    totalFacts = totalFacts +
+                        asset_formats.WdtMaidDoodadPlacementSpanX1000(split) +
+                        asset_formats.WdtMaidDoodadPlacementSpanY1000(split) +
+                        asset_formats.WdtMaidDoodadPlacementSpanZ1000(split) +
+                        split.minDoodadScale +
+                        split.maxDoodadScale
+                if split.worldModelPlacementCount > 0:
+                    assert(split.worldModelPlacementPositionBoundsReady,
+                           "wow_export_dependency_memory maid world model placement bounds")
+                    totalFacts = totalFacts +
+                        asset_formats.WdtMaidWorldModelPlacementSpanX1000(split) +
+                        asset_formats.WdtMaidWorldModelPlacementSpanY1000(split) +
+                        asset_formats.WdtMaidWorldModelPlacementSpanZ1000(split) +
+                        split.minWorldModelScale +
+                        split.maxWorldModelScale
+        else:
+            assert(false, "wow_export_dependency_memory unsupported dependency relation")
         bytes.FreeByteBuffer(fileBuf)
-        assert(IsOk(headerRes), Error(headerRes))
-        totalFacts = totalFacts + Value(headerRes).version + Value(headerRes).vertexCount
         i = i + 1
     return totalFacts
 
 fn main(): int32 =
     echo("wow_export_dependency_memory first_probe_start")
-    assert(probeDependencyOnce() > 17, "wow_export_dependency_memory facts")
+    assert(probeDependencyOnce() > 45, "wow_export_dependency_memory facts")
     echo("wow_export_dependency_memory first_probe_ok")
     let warm: int64 = memLiveCount()
     echo("wow_export_dependency_memory second_probe_start")
-    assert(probeDependencyOnce() > 17, "wow_export_dependency_memory facts second")
+    assert(probeDependencyOnce() > 45, "wow_export_dependency_memory facts second")
     echo("wow_export_dependency_memory second_probe_ok")
     let second: int64 = memLiveCount()
     let warmText: str = strings.Int64ToStr(warm)

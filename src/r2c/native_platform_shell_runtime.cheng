@@ -1,0 +1,354 @@
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/path as chengpath
+
+fn platformShellSlice(text: str,
+                      start: int32,
+                      length: int32): str =
+    if length <= 0:
+        return ""
+    return chengpath.TextSlice(text, start, length)
+
+fn platformShellDigitValue(text: str): int32 =
+    if text == "0":
+        return 0
+    elif text == "1":
+        return 1
+    elif text == "2":
+        return 2
+    elif text == "3":
+        return 3
+    elif text == "4":
+        return 4
+    elif text == "5":
+        return 5
+    elif text == "6":
+        return 6
+    elif text == "7":
+        return 7
+    elif text == "8":
+        return 8
+    elif text == "9":
+        return 9
+    return -1
+
+fn platformShellParsePositiveInt32(raw: str): int32 =
+    let total: int32 = strings.Len(raw)
+    if total <= 0:
+        return 0
+    var out: int32
+    for i in 0..<total:
+        let digit: int32 = platformShellDigitValue(platformShellSlice(raw, i, 1))
+        if digit < 0:
+            return -1
+        out = (out * 10) + digit
+    return out
+
+fn platformShellParseInt32(text: str): int32 =
+    let raw: str = strutil.Strip(text)
+    if strings.Len(raw) <= 0:
+        return 0
+    if raw[0] == '-':
+        let parsed: int32 = platformShellParsePositiveInt32(platformShellSlice(raw, 1, strings.Len(raw) - 1))
+        if parsed < 0:
+            return 0
+        return 0 - parsed
+    let parsed: int32 = platformShellParsePositiveInt32(raw)
+    if parsed < 0:
+        return 0
+    return parsed
+
+fn platformShellJsonQuote(text: str): str =
+    let quote: str = strings.CharToStr(char(34))
+    var out = quote
+    let total: int32 = strings.Len(text)
+    for i in 0..<total:
+        let ch = text[i]
+        if ch == char(34):
+            out = out + "\\" + quote
+        elif ch == '\\':
+            out = out + "\\\\"
+        elif ch == char(10):
+            out = out + "\\n"
+        elif ch == char(13):
+            out = out + "\\r"
+        elif ch == char(9):
+            out = out + "\\t"
+        else:
+            out = out + strings.CharToStr(ch)
+    out = out + quote
+    return out
+
+fn platformShellTextFind(text: str,
+                         needle: str,
+                         startRaw: int32): int32 =
+    let total: int32 = strings.Len(text)
+    let needleLen: int32 = strings.Len(needle)
+    if needleLen <= 0:
+        return startRaw
+    if total < needleLen:
+        return -1
+    var start: int32 = startRaw
+    if start < 0:
+        start = 0
+    if start > total - needleLen:
+        return -1
+    for i in start..(total - needleLen):
+        var matched = true
+        for j in 0..<needleLen:
+            if text[i + j] != needle[j]:
+                matched = false
+                break
+        if matched:
+            return i
+    return -1
+
+fn platformShellJsonSkipWhitespace(text: str,
+                                   startRaw: int32): int32 =
+    var pos: int32 = startRaw
+    if pos < 0:
+        pos = 0
+    let total: int32 = strings.Len(text)
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(32) || ch == char(10) || ch == char(13) || ch == char(9):
+            pos = pos + 1
+        else:
+            return pos
+    return pos
+
+fn platformShellJsonFindValueStart(text: str,
+                                   key: str,
+                                   startRaw: int32): int32 =
+    let keyPattern: str = platformShellJsonQuote(key)
+    let keyPos: int32 = platformShellTextFind(text, keyPattern, startRaw)
+    if keyPos < 0:
+        return -1
+    var pos: int32 = keyPos + strings.Len(keyPattern)
+    let total: int32 = strings.Len(text)
+    while pos < total:
+        if text[pos] == char(58):
+            return platformShellJsonSkipWhitespace(text, pos + 1)
+        pos = pos + 1
+    return -1
+
+fn platformShellJsonReadStringLiteral(text: str,
+                                      startRaw: int32,
+                                      fallback: str): str =
+    let total: int32 = strings.Len(text)
+    if startRaw < 0 || startRaw >= total || text[startRaw] != char(34):
+        return fallback
+    var out: str
+    var pos: int32 = startRaw + 1
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(34):
+            return out
+        if ch == '\\':
+            if pos + 1 >= total:
+                return fallback
+            let esc = text[pos + 1]
+            if esc == char(34):
+                out = out + strings.CharToStr(char(34))
+            elif esc == '\\':
+                out = out + "\\"
+            elif esc == 'n':
+                out = out + "\n"
+            elif esc == 'r':
+                out = out + "\r"
+            elif esc == 't':
+                out = out + "\t"
+            else:
+                out = out + strings.CharToStr(esc)
+            pos = pos + 2
+            continue
+        out = out + strings.CharToStr(ch)
+        pos = pos + 1
+    return fallback
+
+fn platformShellJsonReadStringField(text: str,
+                                    key: str,
+                                    fallback: str): str =
+    let valueStart: int32 = platformShellJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    return platformShellJsonReadStringLiteral(text, valueStart, fallback)
+
+fn platformShellJsonReadIntField(text: str,
+                                 key: str,
+                                 fallback: int32): int32 =
+    let valueStart: int32 = platformShellJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    let total: int32 = strings.Len(text)
+    var endPos: int32 = valueStart
+    if endPos < total && text[endPos] == '-':
+        endPos = endPos + 1
+    var sawDigit = false
+    while endPos < total:
+        if platformShellDigitValue(platformShellSlice(text, endPos, 1)) < 0:
+            break
+        sawDigit = true
+        endPos = endPos + 1
+    if !sawDigit:
+        return fallback
+    return platformShellParseInt32(platformShellSlice(text, valueStart, endPos - valueStart))
+
+fn platformShellManifestHasPureRuntime(manifestText: str): bool =
+    if !strutil.Contains(manifestText, "\"node\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"react\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"webview_business_layer\": false"):
+        return false
+    if !strutil.Contains(manifestText, "\"business_js\": false"):
+        return false
+    return true
+
+fn platformShellManifestHasPlatformBindings(manifestText: str): bool =
+    if !strutil.Contains(manifestText, "\"shell_kind\":\"cheng_generated_android_surface_shell_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"surface_binding\":\"ANativeWindow_rgba_blit_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"input_binding\":\"AInputQueue_event_driven_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"shell_kind\":\"cheng_generated_ios_surface_shell_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"surface_binding\":\"CAMetalLayer_rgba_blit_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"input_binding\":\"UIKit_touch_event_driven_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"shell_kind\":\"cheng_generated_ohos_surface_shell_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"surface_binding\":\"OHNativeWindow_rgba_blit_v1\""):
+        return false
+    if !strutil.Contains(manifestText, "\"input_binding\":\"XComponent_event_driven_v1\""):
+        return false
+    return true
+
+fn NativePlatformShellManifestValid(manifestText: str): bool =
+    if platformShellJsonReadStringField(manifestText, "format", "") != "native_platform_shell_manifest_v1":
+        return false
+    if platformShellJsonReadStringField(manifestText, "event_loop", "") != "event_driven_v1":
+        return false
+    if !platformShellManifestHasPureRuntime(manifestText):
+        return false
+    if !platformShellManifestHasPlatformBindings(manifestText):
+        return false
+    let framePath: str = platformShellJsonReadStringField(manifestText, "surface_frame_path", "")
+    let frameFormat: str = platformShellJsonReadStringField(manifestText, "frame_format", "")
+    let pixelFormat: str = platformShellJsonReadStringField(manifestText, "pixel_format", "")
+    let width: int32 = platformShellJsonReadIntField(manifestText, "width", 0)
+    let height: int32 = platformShellJsonReadIntField(manifestText, "height", 0)
+    let strideBytes: int32 = platformShellJsonReadIntField(manifestText, "stride_bytes", 0)
+    let frameByteCount: int32 = platformShellJsonReadIntField(manifestText, "frame_byte_count", 0)
+    if strings.Len(framePath) <= 0 || !chengpath.PathFileExists(framePath):
+        return false
+    if frameFormat != "surface_frame_rgba_v1" || pixelFormat != "rgba8_unpremultiplied":
+        return false
+    if width <= 0 || height <= 0 || strideBytes <= 0 || frameByteCount <= 0:
+        return false
+    if strideBytes != width * 4 || frameByteCount != strideBytes * height:
+        return false
+    if chengpath.PathFileSize(framePath) != int64(frameByteCount):
+        return false
+    return true
+
+fn platformShellLaunchPlanText(manifestPath: str,
+                               manifestText: str,
+                               platformId: str,
+                               shellKind: str,
+                               surfaceBinding: str,
+                               inputBinding: str): str =
+    let framePath: str = platformShellJsonReadStringField(manifestText, "surface_frame_path", "")
+    let frameFormat: str = platformShellJsonReadStringField(manifestText, "frame_format", "surface_frame_rgba_v1")
+    let pixelFormat: str = platformShellJsonReadStringField(manifestText, "pixel_format", "rgba8_unpremultiplied")
+    let width: int32 = platformShellJsonReadIntField(manifestText, "width", 0)
+    let height: int32 = platformShellJsonReadIntField(manifestText, "height", 0)
+    let strideBytes: int32 = platformShellJsonReadIntField(manifestText, "stride_bytes", 0)
+    let frameByteCount: int32 = platformShellJsonReadIntField(manifestText, "frame_byte_count", 0)
+    let routeCount: int32 = platformShellJsonReadIntField(manifestText, "route_count", 0)
+    let activeRoute: str = platformShellJsonReadStringField(manifestText, "active_route_state", "")
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_launch_plan_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"platform\": " + platformShellJsonQuote(platformId) + ",\n"
+    doc = doc + "  \"shell_kind\": " + platformShellJsonQuote(shellKind) + ",\n"
+    doc = doc + "  \"manifest_path\": " + platformShellJsonQuote(manifestPath) + ",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"frame_path\": " + platformShellJsonQuote(framePath) + ",\n"
+    doc = doc + "  \"frame_format\": " + platformShellJsonQuote(frameFormat) + ",\n"
+    doc = doc + "  \"pixel_format\": " + platformShellJsonQuote(pixelFormat) + ",\n"
+    doc = doc + "  \"width\": " + intToStr(width) + ",\n"
+    doc = doc + "  \"height\": " + intToStr(height) + ",\n"
+    doc = doc + "  \"stride_bytes\": " + intToStr(strideBytes) + ",\n"
+    doc = doc + "  \"frame_byte_count\": " + intToStr(frameByteCount) + ",\n"
+    doc = doc + "  \"surface_binding\": " + platformShellJsonQuote(surfaceBinding) + ",\n"
+    doc = doc + "  \"input_binding\": " + platformShellJsonQuote(inputBinding) + ",\n"
+    doc = doc + "  \"blit_contract\": \"rgba8_stride_copy_v1\",\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"route_count\": " + intToStr(routeCount) + ",\n"
+    doc = doc + "  \"active_route_state\": " + platformShellJsonQuote(activeRoute) + "\n"
+    doc = doc + "}\n"
+    return doc
+
+fn platformShellSummaryText(androidPath: str,
+                            iosPath: str,
+                            ohosPath: str): str =
+    var out: str
+    out = out + "format=native_platform_shell_launch_summary_v1\n"
+    out = out + "ready=true\n"
+    out = out + "runtime_purity=node:false,react:false,webview_business_layer:false,business_js:false\n"
+    out = out + "event_loop=event_driven_v1\n"
+    out = out + "android_launch_path=" + androidPath + "\n"
+    out = out + "ios_launch_path=" + iosPath + "\n"
+    out = out + "ohos_launch_path=" + ohosPath + "\n"
+    out = out + "surface_bindings=android:ANativeWindow_rgba_blit_v1,ios:CAMetalLayer_rgba_blit_v1,ohos:OHNativeWindow_rgba_blit_v1\n"
+    return out
+
+fn WriteNativePlatformShellLaunchPlans(manifestPath: str,
+                                       outDir: str): bool =
+    if strings.Len(manifestPath) <= 0 || !chengpath.PathFileExists(manifestPath):
+        return false
+    if strings.Len(outDir) <= 0 || !chengpath.MkdirP("", outDir):
+        return false
+    let manifestText: str = chengpath.ReadTextFile("", manifestPath)
+    if !NativePlatformShellManifestValid(manifestText):
+        return false
+    let androidPath: str = chengpath.PathJoin(outDir, "native_platform_shell_android_launch_v1.json")
+    let iosPath: str = chengpath.PathJoin(outDir, "native_platform_shell_ios_launch_v1.json")
+    let ohosPath: str = chengpath.PathJoin(outDir, "native_platform_shell_ohos_launch_v1.json")
+    let summaryPath: str = chengpath.PathJoin(outDir, "native_platform_shell_launch.summary.env")
+    let androidDoc: str = platformShellLaunchPlanText(manifestPath,
+                                                      manifestText,
+                                                      "android",
+                                                      "cheng_generated_android_surface_shell_v1",
+                                                      "ANativeWindow_rgba_blit_v1",
+                                                      "AInputQueue_event_driven_v1")
+    let iosDoc: str = platformShellLaunchPlanText(manifestPath,
+                                                  manifestText,
+                                                  "ios",
+                                                  "cheng_generated_ios_surface_shell_v1",
+                                                  "CAMetalLayer_rgba_blit_v1",
+                                                  "UIKit_touch_event_driven_v1")
+    let ohosDoc: str = platformShellLaunchPlanText(manifestPath,
+                                                   manifestText,
+                                                   "ohos",
+                                                   "cheng_generated_ohos_surface_shell_v1",
+                                                   "OHNativeWindow_rgba_blit_v1",
+                                                   "XComponent_event_driven_v1")
+    if !chengpath.WriteTextFile("", androidPath, androidDoc):
+        return false
+    if !chengpath.WriteTextFile("", iosPath, iosDoc):
+        return false
+    if !chengpath.WriteTextFile("", ohosPath, ohosDoc):
+        return false
+    if !chengpath.WriteTextFile("", summaryPath, platformShellSummaryText(androidPath, iosPath, ohosPath)):
+        return false
+    if !chengpath.FileExistsNonEmpty("", androidPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", iosPath):
+        return false
+    if !chengpath.FileExistsNonEmpty("", ohosPath):
+        return false
+    return chengpath.FileExistsNonEmpty("", summaryPath)

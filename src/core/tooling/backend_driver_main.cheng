@@ -1,14 +1,26 @@
+import std/result
 import std/cmdline as cmdline
 import std/os
 import std/strings
 import std/system as system
 import std/strutils as strutil
+import cheng/core/backend/line_map as linemap
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/build_plan as buildplan
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/tooling/bootstrap_contracts as contracts
 import cheng/core/tooling/compiler_runtime as crun
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/debug_tools_gate as debuggate
 import cheng/core/tooling/export_visibility_gate as evgate
 import cheng/core/tooling/host_bridge_audit_gate as hbagate
 import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/hotpath_scan as hotscan
+import cheng/core/tooling/object_debug_report as objectreport
 import cheng/core/tooling/path as chengpath
+import cheng/core/tooling/seed_cross_target_gate as crossgate
+import cheng/core/tooling/support_matrix as smatrix
 import cheng/core/tooling/wasm_smoke_gate as wsgate
 
 @importc("get_stdout")
@@ -48,8 +60,8 @@ fn BackendDriverUsage(rootDir: str) =
     BackendDriverPrintLine("usage: cheng <command> [args]")
     BackendDriverPrintLine("core commands: status, print-build-plan, host-bridge-audit, system-link-exec")
     BackendDriverPrintLine("world/proof commands: world-receipt")
-    BackendDriverPrintLine("debug commands: debug-report, print-symbols, print-line-map, print-asm")
-    BackendDriverPrintLine("verify commands: verify-export-visibility, verify-export-visibility-parallel, verify-backend-driver-command-surface, verify-mobile-shell-build-probe, verify-r2c-react-surface, verify-debug-tools")
+    BackendDriverPrintLine("debug commands: debug-report, print-symbols, print-line-map, print-object, print-elf, print-asm, profile-report, crash-report")
+    BackendDriverPrintLine("verify commands: verify-export-visibility, verify-export-visibility-parallel, verify-backend-driver-command-surface, verify-mobile-shell-build-probe, verify-r2c-react-surface, verify-debug-tools, verify-debug-profile, verify-windows-builtin, verify-riscv64-builtin")
     BackendDriverPrintLine("gate commands: run-host-smokes, run-production-regression")
     BackendDriverPrintKeyValue("stage3", BackendDriverStage3Path(rootDir))
 
@@ -98,6 +110,64 @@ fn BackendDriverPrintBuildPlan(rootDir: str,
         return
     let plan: buildplan.BackendBuildPlan = buildplan.BackendBuildPlanBackendDriver(rootDir)
     BackendDriverPrintLine(strutil.Strip(buildplan.BackendBuildPlanReport(plan)))
+
+fn BackendDriverPrintBootstrap(rootDir: str) =
+    let snapshot: contracts.BootstrapSnapshot = contracts.BootstrapSnapshotDefault(rootDir)
+    BackendDriverPrintLine(strutil.Strip(contracts.BootstrapSnapshotReport(snapshot)))
+
+fn BackendDriverScanHotpath(rootDir: str): int32 =
+    let srcDir = chengpath.PathAbsolute(rootDir, "src")
+    if !chengpath.PathDirExists(srcDir):
+        BackendDriverPrintErr("backend driver scan-hotpath: source dir not found: " + srcDir)
+        return 1
+    let hits: hotscan.ForbiddenHit[] = hotscan.ScanForbiddenSourceDir(rootDir, "src")
+    BackendDriverPrintLine(strutil.Strip(hotscan.ForbiddenHitReport(hits)))
+    if hotscan.ForbiddenHitsOk(hits):
+        return 0
+    return 1
+
+fn BackendDriverRunSmokes(rootDir: str): int32 =
+    let stage1Source = contracts.BootstrapStage1SourcePath(rootDir)
+    if !chengpath.FileExistsNonEmpty(rootDir, stage1Source):
+        BackendDriverPrintErr("backend driver run-smokes: missing stage1 source: " + stage1Source)
+        return 1
+    let logDir = chengpath.PathAbsolute(rootDir, "artifacts/gate")
+    if !chengpath.MkdirP(rootDir, logDir):
+        BackendDriverPrintErr("backend driver run-smokes: mkdir failed: " + logDir)
+        return 1
+    var names: str[]
+    add(names, "cheng.stage0")
+    add(names, "cheng.stage1")
+    add(names, "cheng.stage2")
+    add(names, "cheng.stage3")
+    var bins: str[]
+    add(bins, contracts.BootstrapStage0Path(rootDir))
+    add(bins, contracts.BootstrapStage1Path(rootDir))
+    add(bins, contracts.BootstrapStage2Path(rootDir))
+    add(bins, contracts.BootstrapStage3Path(rootDir))
+    for i in 0..<bins.len:
+        let bin = bins[i]
+        if !chengpath.FileExistsNonEmpty(rootDir, bin):
+            BackendDriverPrintErr("backend driver run-smokes: missing bootstrap compiler: " + bin)
+            return 1
+        let logPath = os.JoinPath(logDir, names[i] + ".self-check.log")
+        var args: str[]
+        add(args, "self-check")
+        add(args, "--in:" + stage1Source)
+        let run = hostops.RunFileLogged(rootDir,
+                                          "backend_driver_run_smokes_" + names[i],
+                                          bin,
+                                          args,
+                                          [],
+                                          rootDir,
+                                          120,
+                                          logPath)
+        if !hostops.LoggedRunOk(run):
+            let outputText = strutil.Strip(run.output)
+            if len(outputText) > 0:
+                BackendDriverPrintErr(outputText)
+            return run.exitCode
+    return 0
 
 fn BackendDriverCollectHostSmokeNames(args: str[]): str[] =
     var out: str[]
@@ -165,9 +235,19 @@ fn BackendDriverHostSmokeCompileEnv(): str[] =
     add(out, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
     add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
     add(out, "CHENG_PROGRESS=1")
-    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=34359738368")
+    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
     add(out, "CHENG_COMPILE_TIMEOUT_SEC=420")
     return out
+
+fn BackendDriverRemovePrefixedFiles(dir: str,
+                                      prefix: str) =
+    let names: str[] = os.ListDir(dir)
+    for i in 0..<names.len:
+        let name: str = names[i]
+        if BackendDriverStartsWith(name, prefix):
+            let path: str = os.JoinPath(dir, name)
+            if chengpath.PathFileExists(path):
+                os.RemoveFile(path)
 
 fn BackendDriverHostSmokeRunEnv(smokeName: str,
                                   r2cControllerExe: str): str[] =
@@ -189,6 +269,7 @@ fn BackendDriverCompileR2cReactController(rootDir: str,
     let controllerExe = os.JoinPath(outDir, "r2c_react_controller_shared")
     let controllerCompileLog = controllerExe + ".compile.log"
     let controllerCompileReport = controllerExe + ".report.txt"
+    BackendDriverRemovePrefixedFiles(outDir, "r2c_react_controller_shared")
     if chengpath.PathFileExists(controllerExe):
         os.RemoveFile(controllerExe)
     if chengpath.PathFileExists(controllerExe + ".map"):
@@ -349,6 +430,319 @@ fn BackendDriverRunBuiltinHostSmoke(rootDir: str,
                                       smokeName: str): int32 =
     return BackendDriverRunHostSmokes(rootDir, ["--label:" + label, smokeName])
 
+type
+    BackendDriverDebugPlans =
+        linkPlan: slplan.SystemLinkPlanStub
+        loweringPlan: lower.LoweringPlanStub
+        primaryPlan: pobj.PrimaryObjectPlan
+
+fn BackendDriverWriteOptionalReport(rootDir: str,
+                                      reportPath: str,
+                                      text: str): bool =
+    let trimmedPath = strutil.Strip(reportPath)
+    if len(trimmedPath) <= 0:
+        return true
+    return chengpath.WriteTextFile(rootDir, trimmedPath, text)
+
+fn BackendDriverBuildDebugPlans(rootDir: str,
+                                  args: str[],
+                                  outPlans: var BackendDriverDebugPlans): bool =
+    let reqRes = creq.CompilerRequestFromArgsForCommand(rootDir, args, false)
+    if IsErr(reqRes):
+        BackendDriverPrintErr(Error(reqRes))
+        return false
+    let req = Value(reqRes)
+    var linkPlan: slplan.SystemLinkPlanStub
+    var linkErr = ""
+    if !slplan.BuildSystemLinkPlanStub(rootDir, req, linkPlan, linkErr):
+        BackendDriverPrintErr(linkErr)
+        return false
+    var loweringPlan: lower.LoweringPlanStub
+    var loweringErr = ""
+    if !lower.BuildLoweringPlanStub(linkPlan, loweringPlan, loweringErr):
+        BackendDriverPrintErr(loweringErr)
+        return false
+    let primaryRes = pobj.BuildPrimaryObjectPlan(linkPlan, loweringPlan)
+    if IsErr(primaryRes):
+        BackendDriverPrintErr(Error(primaryRes))
+        return false
+    outPlans.linkPlan = linkPlan
+    outPlans.loweringPlan = loweringPlan
+    outPlans.primaryPlan = Value(primaryRes)
+    return true
+
+fn BackendDriverRunDebugTextCommand(rootDir: str,
+                                      args: str[],
+                                      commandName: str): int32 =
+    var plans: BackendDriverDebugPlans
+    if !BackendDriverBuildDebugPlans(rootDir, args, plans):
+        return 2
+    var report = ""
+    if commandName == "debug-report":
+        report = debuggate.DebugToolsDebugReportText(plans.linkPlan,
+                                                       plans.loweringPlan,
+                                                       plans.primaryPlan)
+    elif commandName == "print-symbols":
+        report = debuggate.DebugToolsSymbolsReportText(plans.linkPlan,
+                                                        plans.loweringPlan,
+                                                        plans.primaryPlan)
+    elif commandName == "print-line-map":
+        report = linemap.LineMapText(plans.linkPlan, plans.loweringPlan)
+    else:
+        BackendDriverPrintErr("backend driver debug: unsupported direct command: " + commandName)
+        return 2
+    let reportPath = creq.CompilerReadFlagOrDefault(args, "--report-out", "")
+    if !BackendDriverWriteOptionalReport(rootDir, reportPath, report + "\n"):
+        BackendDriverPrintErr("backend driver debug: failed to write report: " + reportPath)
+        return 1
+    BackendDriverPrintLine(strutil.Strip(report))
+    return 0
+
+fn BackendDriverRunObjectReportCommand(rootDir: str,
+                                         args: str[]): int32 =
+    let objectPathRaw = creq.CompilerReadFlagOrDefault(args, "--object", "")
+    let objectPath = chengpath.PathAbsolute(rootDir, objectPathRaw)
+    if len(objectPathRaw) <= 0:
+        BackendDriverPrintErr("backend driver print-object: missing --object")
+        return 2
+    if !chengpath.FileExistsNonEmpty(rootDir, objectPath):
+        BackendDriverPrintErr("backend driver print-object: missing object: " + objectPath)
+        return 1
+    let reportRes = objectreport.ObjectDebugReportText(objectPath)
+    if IsErr(reportRes):
+        BackendDriverPrintErr(Error(reportRes))
+        return 1
+    let report = Value(reportRes)
+    let reportPath = creq.CompilerReadFlagOrDefault(args, "--report-out", "")
+    if !BackendDriverWriteOptionalReport(rootDir, reportPath, report + "\n"):
+        BackendDriverPrintErr("backend driver print-object: failed to write report: " + reportPath)
+        return 1
+    BackendDriverPrintLine(strutil.Strip(report))
+    return 0
+
+fn BackendDriverRunProfileReport(rootDir: str,
+                                   args: str[]): int32 =
+    let rawPath = creq.CompilerReadFlagOrDefault(args, "--in", "")
+    if len(rawPath) <= 0:
+        BackendDriverPrintErr("backend driver profile-report: missing --in")
+        return 2
+    if !chengpath.FileExistsNonEmpty(rootDir, rawPath):
+        BackendDriverPrintErr("backend driver profile-report: missing raw profile: " + rawPath)
+        return 1
+    var outPath = creq.CompilerReadFlagOrDefault(args, "--out", "")
+    if len(outPath) <= 0:
+        outPath = debuggate.DebugToolsProfileReportPathFromRaw(rawPath)
+    let reportRes = debuggate.DebugToolsProfileReportText(chengpath.ReadTextFile(rootDir, rawPath))
+    if IsErr(reportRes):
+        BackendDriverPrintErr(Error(reportRes))
+        return 1
+    let report = Value(reportRes)
+    if !chengpath.WriteTextFile(rootDir, outPath, report):
+        BackendDriverPrintErr("backend driver profile-report: failed to write report: " + outPath)
+        return 1
+    BackendDriverPrintLine(strutil.Strip(report))
+    return 0
+
+fn BackendDriverRunCrashReport(rootDir: str,
+                                 args: str[]): int32 =
+    let rawPath = creq.CompilerReadFlagOrDefault(args, "--in", "")
+    if len(rawPath) <= 0:
+        BackendDriverPrintErr("backend driver crash-report: missing --in")
+        return 2
+    if !chengpath.FileExistsNonEmpty(rootDir, rawPath):
+        BackendDriverPrintErr("backend driver crash-report: missing raw log: " + rawPath)
+        return 1
+    var outPath = creq.CompilerReadFlagOrDefault(args, "--out", "")
+    if len(outPath) <= 0:
+        outPath = debuggate.DebugToolsCrashReportPathFromRaw(rawPath)
+    let reportRes = debuggate.DebugToolsCrashReportText(chengpath.ReadTextFile(rootDir, rawPath))
+    if IsErr(reportRes):
+        BackendDriverPrintErr(Error(reportRes))
+        return 1
+    let report = Value(reportRes)
+    if !chengpath.WriteTextFile(rootDir, outPath, report):
+        BackendDriverPrintErr("backend driver crash-report: failed to write report: " + outPath)
+        return 1
+    BackendDriverPrintLine(strutil.Strip(report))
+    return 0
+
+fn BackendDriverProfileRunDefaultOut(rootDir: str,
+                                      sourcePath: str): str =
+    let split = chengpath.PathSplitFile(sourcePath)
+    var name = split.name
+    if len(name) <= 0:
+        name = "profile_run"
+    return os.JoinPath(chengpath.PathAbsolute(rootDir, "artifacts/debug_profile"), name)
+
+fn BackendDriverEnsureParentDir(rootDir: str,
+                                  path: str): bool =
+    let parent = chengpath.PathParentDir(path)
+    if len(parent) <= 0:
+        return true
+    return chengpath.MkdirP(rootDir, parent)
+
+fn BackendDriverRemoveFileIfExists(path: str) =
+    if chengpath.PathFileExists(path):
+        os.RemoveFile(path)
+
+fn BackendDriverRunProfileRun(rootDir: str,
+                                args: str[]): int32 =
+    let sourceRaw = creq.CompilerReadFlagOrDefault(args, "--in", "")
+    let sourceTrim = strutil.Strip(sourceRaw)
+    let sourceLen = len(sourceTrim)
+    if sourceLen <= 0:
+        BackendDriverPrintErr("backend driver profile-run: missing --in")
+        return 1
+    var workspaceRoot = rootDir
+    let rootFlag = strutil.Strip(creq.CompilerReadFlagOrDefault(args, "--root", ""))
+    let rootFlagLen = len(rootFlag)
+    if rootFlagLen > 0:
+        workspaceRoot = chengpath.PathAbsolute(rootDir, rootFlag)
+    let target = strutil.Strip(creq.CompilerReadFlagOrDefault(args, "--target", "arm64-apple-darwin"))
+    if target != "arm64-apple-darwin":
+        BackendDriverPrintErr("backend driver profile-run: local runnable target required: " + target)
+        return 1
+    let emit = strutil.Strip(creq.CompilerReadFlagOrDefault(args, "--emit", "exe"))
+    if len(emit) > 0 && emit != "exe":
+        BackendDriverPrintErr("backend driver profile-run: requires --emit:exe")
+        return 1
+    let sourcePath = chengpath.PathAbsolute(workspaceRoot, sourceRaw)
+    if !chengpath.FileExistsNonEmpty(workspaceRoot, sourcePath):
+        BackendDriverPrintErr("backend driver profile-run: missing source: " + sourcePath)
+        return 1
+    let outFlag = strutil.Strip(creq.CompilerReadFlagOrDefault(args, "--out", ""))
+    var outputPath = ""
+    let outFlagLen = len(outFlag)
+    if outFlagLen > 0:
+        outputPath = chengpath.PathAbsolute(workspaceRoot, outFlag)
+    else:
+        outputPath = BackendDriverProfileRunDefaultOut(workspaceRoot, sourcePath)
+    let reportFlag = strutil.Strip(creq.CompilerReadFlagOrDefault(args, "--report-out", ""))
+    var reportPath = ""
+    let reportFlagLen = len(reportFlag)
+    if reportFlagLen > 0:
+        reportPath = chengpath.PathAbsolute(workspaceRoot, reportFlag)
+    else:
+        reportPath = outputPath + ".profile.txt"
+    let rawReportPath = debuggate.DebugToolsProfileRawPathFromReport(reportPath)
+    let compileLog = outputPath + ".compile.log"
+    let runLog = outputPath + ".run.log"
+    let profileReportLog = outputPath + ".profile-report.log"
+    if !BackendDriverEnsureParentDir(workspaceRoot, outputPath) ||
+       !BackendDriverEnsureParentDir(workspaceRoot, reportPath) ||
+       !BackendDriverEnsureParentDir(workspaceRoot, rawReportPath):
+        BackendDriverPrintErr("backend driver profile-run: failed to create output dirs")
+        return 1
+    BackendDriverRemoveFileIfExists(outputPath)
+    BackendDriverRemoveFileIfExists(outputPath + ".map")
+    BackendDriverRemoveFileIfExists(reportPath)
+    BackendDriverRemoveFileIfExists(rawReportPath)
+    BackendDriverRemoveFileIfExists(compileLog)
+    BackendDriverRemoveFileIfExists(runLog)
+    BackendDriverRemoveFileIfExists(profileReportLog)
+    let compilerPath = chengpath.PathAbsolute(rootDir, "artifacts/backend_driver/cheng")
+    if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        BackendDriverPrintErr("backend driver profile-run: missing compiler: " + compilerPath)
+        return 1
+    var compileArgs: str[]
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, "--root:" + workspaceRoot)
+    add(compileArgs, "--in:" + sourcePath)
+    add(compileArgs, "--emit:exe")
+    add(compileArgs, "--target:arm64-apple-darwin")
+    add(compileArgs, "--out:" + outputPath)
+    let compileRun = hostops.RunFileLogged(rootDir,
+                                             "backend_driver_profile_run_compile",
+                                             compilerPath,
+                                             compileArgs,
+                                             BackendDriverHostSmokeCompileEnv(),
+                                             workspaceRoot,
+                                             420,
+                                             compileLog)
+    if !hostops.LoggedRunOk(compileRun):
+        let outputText = strutil.Strip(compileRun.output)
+        if len(outputText) > 0:
+            BackendDriverPrintErr(outputText)
+        return compileRun.exitCode
+    if !chengpath.FileExistsNonEmpty(workspaceRoot, outputPath):
+        BackendDriverPrintErr("backend driver profile-run: compile missing output: " + outputPath)
+        return 1
+    var runEnv: str[]
+    add(runEnv, "CHENG_PROFILE_ENABLE=1")
+    add(runEnv, "CHENG_PROFILE_RAW_OUT=" + rawReportPath)
+    add(runEnv, "CHENG_PROFILE_HZ=" + creq.CompilerReadFlagOrDefault(args, "--profile-hz", "200"))
+    let profiledRun = hostops.RunFileLogged(rootDir,
+                                             "backend_driver_profile_run_exec",
+                                             outputPath,
+                                             [],
+                                             runEnv,
+                                             workspaceRoot,
+                                             120,
+                                             runLog)
+    if !hostops.LoggedRunOk(profiledRun):
+        let outputText = strutil.Strip(profiledRun.output)
+        if len(outputText) > 0:
+            BackendDriverPrintErr(outputText)
+        return profiledRun.exitCode
+    if !chengpath.FileExistsNonEmpty(workspaceRoot, rawReportPath):
+        BackendDriverPrintErr("backend driver profile-run: missing raw profile report: " + rawReportPath)
+        return 1
+    let rawText = chengpath.ReadTextFile(workspaceRoot, rawReportPath)
+    let reportRes = debuggate.DebugToolsProfileReportText(rawText)
+    if IsErr(reportRes):
+        let _ = chengpath.WriteTextFile(workspaceRoot, profileReportLog, Error(reportRes) + "\n")
+        BackendDriverPrintErr(Error(reportRes))
+        return 1
+    let report = Value(reportRes)
+    if !chengpath.WriteTextFile(workspaceRoot, reportPath, report):
+        BackendDriverPrintErr("backend driver profile-run: failed to write report: " + reportPath)
+        return 1
+    BackendDriverPrintLine(strutil.Strip(report))
+    return 0
+
+fn BackendDriverVerifyDebugProfile(rootDir: str): int32 =
+    let outDir = chengpath.PathAbsolute(rootDir, "artifacts/debug_profile_verify")
+    let src = chengpath.PathAbsolute(rootDir, "src/tests/ordinary_profile_hotspots_fixture.cheng")
+    let outBin = os.JoinPath(outDir, "ordinary_profile_hotspots_fixture")
+    let report = os.JoinPath(outDir, "profile.txt")
+    let rawReport = debuggate.DebugToolsProfileRawPathFromReport(report)
+    var args: str[]
+    add(args, "--root:" + rootDir)
+    add(args, "--in:" + src)
+    add(args, "--emit:exe")
+    add(args, "--target:arm64-apple-darwin")
+    add(args, "--out:" + outBin)
+    add(args, "--report-out:" + report)
+    add(args, "--profile-hz:200")
+    let run = BackendDriverRunProfileRun(rootDir, args)
+    if run != 0:
+        return run
+    if !chengpath.FileExistsNonEmpty(rootDir, rawReport):
+        BackendDriverPrintErr(" debug profile: missing raw report")
+        return 1
+    let rawReportText = chengpath.ReadTextFile(rootDir, rawReport)
+    if !strutil.Contains(rawReportText, "cheng_profile_raw_v1") ||
+       !strutil.Contains(rawReportText, "sample\t0x"):
+        BackendDriverPrintErr(" debug profile: invalid raw report")
+        return 1
+    if !chengpath.FileExistsNonEmpty(rootDir, report):
+        BackendDriverPrintErr(" debug profile: missing report")
+        return 1
+    let reportText = chengpath.ReadTextFile(rootDir, report)
+    if !strutil.Contains(reportText, "cheng_profile_v1") ||
+       !strutil.Contains(reportText, "hot_function[0]=") ||
+       !strutil.Contains(reportText, "hot_pc[0]=") ||
+       !strutil.Contains(reportText, "ordinary_profile_hotspots_fixture.cheng"):
+        BackendDriverPrintErr(" debug profile: invalid report")
+        return 1
+    BackendDriverPrintLine(" debug profile: ok")
+    return 0
+
+fn BackendDriverVerifyDebugTools(rootDir: str): int32 =
+    return BackendDriverRunBuiltinHostSmoke(rootDir,
+                                             "verify_debug_tools",
+                                             "debug_tools_surface_smoke")
+
 fn BackendDriverRunR2cReactSurface(rootDir: str): int32 =
     var smokes: str[]
     add(smokes, "--label:verify_r2c_react_surface")
@@ -428,10 +822,36 @@ fn main(argc: int32, argv: str*): int32 =
         if cmd == "print-build-plan":
             BackendDriverPrintBuildPlan(rootDir, args)
             return 0
+        if cmd == "print-bootstrap":
+            BackendDriverPrintBootstrap(rootDir)
+            return 0
+        if cmd == "support-matrix":
+            BackendDriverPrintLine(strutil.Strip(smatrix.SupportMatrixReport(rootDir)))
+            return 0
+        if cmd == "scan-hotpath":
+            return BackendDriverScanHotpath(rootDir)
         if cmd == "host-bridge-audit":
             return hbagate.HostBridgeAuditGateRun(rootDir)
+        if cmd == "run-smokes":
+            return BackendDriverRunSmokes(rootDir)
         if cmd == "run-host-smokes":
             return BackendDriverRunHostSmokes(rootDir, args)
+        if cmd == "debug-report":
+            return BackendDriverRunDebugTextCommand(rootDir, args, cmd)
+        if cmd == "print-symbols":
+            return BackendDriverRunDebugTextCommand(rootDir, args, cmd)
+        if cmd == "print-line-map":
+            return BackendDriverRunDebugTextCommand(rootDir, args, cmd)
+        if cmd == "print-object":
+            return BackendDriverRunObjectReportCommand(rootDir, args)
+        if cmd == "print-elf":
+            return BackendDriverRunObjectReportCommand(rootDir, args)
+        if cmd == "profile-run":
+            return BackendDriverRunProfileRun(rootDir, args)
+        if cmd == "profile-report":
+            return BackendDriverRunProfileReport(rootDir, args)
+        if cmd == "crash-report":
+            return BackendDriverRunCrashReport(rootDir, args)
         if cmd == "run-browser-host-wasm-smoke":
             return wsgate.WasmSmokeRunBrowserHostWasmCommand(rootDir, args)
         if cmd == "run-wasm-smokes":
@@ -450,4 +870,14 @@ fn main(argc: int32, argv: str*): int32 =
                                                      "mobile_shell_build_probe_smoke")
         if cmd == "verify-r2c-react-surface":
             return BackendDriverRunR2cReactSurface(rootDir)
+        if cmd == "verify-debug-profile":
+            return BackendDriverVerifyDebugProfile(rootDir)
+        if cmd == "verify-debug-tools":
+            return BackendDriverVerifyDebugTools(rootDir)
+        if cmd == "verify-windows-builtin":
+            return crossgate.SeedVerifyWindowsBuiltin(rootDir)
+        if cmd == "verify-riscv64-builtin":
+            return crossgate.SeedVerifyRiscv64Builtin(rootDir)
+        if cmd == "run-cross-target-smokes":
+            return crossgate.SeedRunCrossTargetSmokes(rootDir)
     return BackendDriverForward(rootDir, cmd, args)

@@ -1,8 +1,13 @@
 import std/result
 import std/rawbytes
+import std/os
 import cheng/libp2p/core/types
 import cheng/libp2p/transports/quic_transport
 import cheng/DiLoCo/protocol/wire
+
+const
+    DiLoCoClientFetchLeaseMaxAttempts: int32 = 8
+    DiLoCoClientFetchLeaseRetryDelayMs: int32 = 80
 
 fn DiLoCoClientStartsWith(text: str, prefix: str): bool =
     if prefix.len > text.len:
@@ -62,16 +67,22 @@ fn DiLoCoFetchLeaseRequestNamed(host: str,
                                   port: int32,
                                   serverName: str,
                                   req: wire.DiLoCoFetchLeaseRequest): Result[wire.DiLoCoFetchLeaseResponse] =
-    let responseBytesRes = DiLoCoHostRequestResponseNamed(host,
-                                                            port,
-                                                            serverName,
-                                                            wire.DiLoCoFetchLeaseRequestEncode(req))
+    let requestBytes: Bytes = wire.DiLoCoFetchLeaseRequestEncode(req)
+    var responseBytesRes = DiLoCoHostRequestResponseNamed(host,
+                                                          port,
+                                                          serverName,
+                                                          requestBytes)
     var finalResponseBytesRes = responseBytesRes
-    if IsErr(finalResponseBytesRes) && DiLoCoClientFetchLeaseRetryable(Error(finalResponseBytesRes)):
+    var attempt: int32 = 1
+    while IsErr(finalResponseBytesRes) &&
+          DiLoCoClientFetchLeaseRetryable(Error(finalResponseBytesRes)) &&
+          attempt < DiLoCoClientFetchLeaseMaxAttempts:
+        os.SleepMs(DiLoCoClientFetchLeaseRetryDelayMs)
         finalResponseBytesRes = DiLoCoHostRequestResponseNamed(host,
                                                                port,
                                                                serverName,
-                                                               wire.DiLoCoFetchLeaseRequestEncode(req))
+                                                               requestBytes)
+        attempt = attempt + 1
     if IsErr(finalResponseBytesRes):
         return Err[wire.DiLoCoFetchLeaseResponse](Error(finalResponseBytesRes))
     var out = wire.DiLoCoFetchLeaseResponse()

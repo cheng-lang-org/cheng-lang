@@ -103,35 +103,6 @@ typedef struct {
     char source_path[PATH_MAX];
 } ChengSeedBootstrapContract;
 
-typedef struct {
-    char **items;
-    size_t len;
-    size_t cap;
-} ChengSeedOwnedStringVec;
-
-typedef enum {
-    ChengSeed_FORBIDDEN_SUBSTRING = 0,
-    ChengSeed_FORBIDDEN_LABEL_COLON_STR = 1,
-    ChengSeed_FORBIDDEN_WHOLE_WORD = 2
-} ChengSeedForbiddenPatternKind;
-
-typedef struct {
-    ChengSeedForbiddenPatternKind kind;
-    const char *needle;
-    const char *label;
-} ChengSeedForbiddenPattern;
-
-typedef struct {
-    char *path;
-    const char *label;
-} ChengSeedForbiddenHit;
-
-typedef struct {
-    ChengSeedForbiddenHit *items;
-    size_t len;
-    size_t cap;
-} ChengSeedForbiddenHitVec;
-
 typedef bool (*ChengSeedReadyCheckFn)(const void *ctx);
 
 static bool cheng_seed_quote_is_escaped(const char *text, size_t index);
@@ -209,9 +180,11 @@ static const char *ChengSeed_REMOVED_KEYS_V2[] = {
     "runtime_compiler_runtime_source",
     "runtime_debug_runtime_source",
     "tooling_bootstrap_contract_source",
+    "tooling_hotpath_scan_source",
     "tooling_debug_tools_gate_source",
     "tooling_export_visibility_gate_source",
     "tooling_host_bridge_audit_gate_source",
+    "tooling_seed_cross_target_gate_source",
     "tooling_wasm_binary_audit_source",
     "tooling_wasm_smoke_gate_source",
     "backend_build_plan_source",
@@ -248,9 +221,11 @@ static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "runtime_compiler_runtime_source",
     "runtime_debug_runtime_source",
     "tooling_bootstrap_contract_source",
+    "tooling_hotpath_scan_source",
     "tooling_debug_tools_gate_source",
     "tooling_export_visibility_gate_source",
     "tooling_host_bridge_audit_gate_source",
+    "tooling_seed_cross_target_gate_source",
     "tooling_wasm_binary_audit_source",
     "tooling_wasm_smoke_gate_source",
     "backend_build_plan_source"
@@ -266,7 +241,6 @@ static void cheng_seed_usage(void) {
     puts("  note: non-bootstrap commands are handled by artifacts/backend_driver/cheng");
     puts("  cheng_seed print-contract [--in:<path>]");
     puts("  cheng_seed self-check [--in:<path>]");
-    puts("  cheng_seed status [--contract-in:<path>]");
     puts("  cheng_seed bootstrap-bridge");
     puts("  cheng_seed build-backend-driver");
     puts("  cheng_seed compile-bootstrap --in:<path> --out:<path> [--report-out:<path>]");
@@ -317,71 +291,6 @@ static char *cheng_seed_trim_inplace(char *text) {
 
 static bool cheng_seed_streq(const char *a, const char *b) {
     return strcmp(a, b) == 0;
-}
-
-static void cheng_seed_owned_string_vec_init(ChengSeedOwnedStringVec *vec) {
-    vec->items = NULL;
-    vec->len = 0U;
-    vec->cap = 0U;
-}
-
-static void cheng_seed_owned_string_vec_push_dup(ChengSeedOwnedStringVec *vec, const char *text) {
-    if (vec->len + 1U > vec->cap) {
-        size_t next_cap = vec->cap == 0U ? 16U : vec->cap * 2U;
-        vec->items = (char **)cheng_seed_xrealloc(vec->items, next_cap * sizeof(char *));
-        vec->cap = next_cap;
-    }
-    vec->items[vec->len++] = cheng_seed_strdup(text);
-}
-
-static char *cheng_seed_owned_string_vec_pop(ChengSeedOwnedStringVec *vec) {
-    if (vec->len == 0U) {
-        return NULL;
-    }
-    vec->len -= 1U;
-    return vec->items[vec->len];
-}
-
-static void cheng_seed_owned_string_vec_free(ChengSeedOwnedStringVec *vec) {
-    size_t i;
-    for (i = 0U; i < vec->len; ++i) {
-        free(vec->items[i]);
-    }
-    free(vec->items);
-    vec->items = NULL;
-    vec->len = 0U;
-    vec->cap = 0U;
-}
-
-static void cheng_seed_forbidden_hit_vec_init(ChengSeedForbiddenHitVec *vec) {
-    vec->items = NULL;
-    vec->len = 0U;
-    vec->cap = 0U;
-}
-
-static void cheng_seed_forbidden_hit_vec_push(ChengSeedForbiddenHitVec *vec,
-                                      const char *path,
-                                      const char *label) {
-    if (vec->len + 1U > vec->cap) {
-        size_t next_cap = vec->cap == 0U ? 16U : vec->cap * 2U;
-        vec->items = (ChengSeedForbiddenHit *)cheng_seed_xrealloc(vec->items,
-                                                   next_cap * sizeof(ChengSeedForbiddenHit));
-        vec->cap = next_cap;
-    }
-    vec->items[vec->len].path = cheng_seed_strdup(path);
-    vec->items[vec->len].label = label;
-    vec->len += 1U;
-}
-
-static void cheng_seed_forbidden_hit_vec_free(ChengSeedForbiddenHitVec *vec) {
-    size_t i;
-    for (i = 0U; i < vec->len; ++i) {
-        free(vec->items[i].path);
-    }
-    free(vec->items);
-    vec->items = NULL;
-    vec->len = 0U;
-    vec->cap = 0U;
 }
 
 static bool cheng_seed_has_csv_token(const char *csv, const char *needle) {
@@ -1571,8 +1480,10 @@ typedef struct {
     char tooling_path_source[PATH_MAX];
     char tooling_world_receipt_gate_source[PATH_MAX];
     char tooling_debug_tools_gate_source[PATH_MAX];
+    char tooling_hotpath_scan_source[PATH_MAX];
     char tooling_export_visibility_gate_source[PATH_MAX];
     char tooling_host_bridge_audit_gate_source[PATH_MAX];
+    char tooling_seed_cross_target_gate_source[PATH_MAX];
     char tooling_wasm_binary_audit_source[PATH_MAX];
     char tooling_wasm_smoke_gate_source[PATH_MAX];
     char std_os_host_process_source[PATH_MAX];
@@ -1725,8 +1636,10 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->tooling_path_source, sizeof(paths->tooling_path_source), paths->root, "src/core/tooling/path.cheng");
     cheng_seed_join_path(paths->tooling_world_receipt_gate_source, sizeof(paths->tooling_world_receipt_gate_source), paths->root, "src/core/tooling/world_receipt_gate.cheng");
     cheng_seed_join_path(paths->tooling_debug_tools_gate_source, sizeof(paths->tooling_debug_tools_gate_source), paths->root, "src/core/tooling/debug_tools_gate.cheng");
+    cheng_seed_join_path(paths->tooling_hotpath_scan_source, sizeof(paths->tooling_hotpath_scan_source), paths->root, "src/core/tooling/hotpath_scan.cheng");
     cheng_seed_join_path(paths->tooling_export_visibility_gate_source, sizeof(paths->tooling_export_visibility_gate_source), paths->root, "src/core/tooling/export_visibility_gate.cheng");
     cheng_seed_join_path(paths->tooling_host_bridge_audit_gate_source, sizeof(paths->tooling_host_bridge_audit_gate_source), paths->root, "src/core/tooling/host_bridge_audit_gate.cheng");
+    cheng_seed_join_path(paths->tooling_seed_cross_target_gate_source, sizeof(paths->tooling_seed_cross_target_gate_source), paths->root, "src/core/tooling/seed_cross_target_gate.cheng");
     cheng_seed_join_path(paths->tooling_wasm_binary_audit_source, sizeof(paths->tooling_wasm_binary_audit_source), paths->root, "src/core/tooling/wasm_binary_audit.cheng");
     cheng_seed_join_path(paths->tooling_wasm_smoke_gate_source, sizeof(paths->tooling_wasm_smoke_gate_source), paths->root, "src/core/tooling/wasm_smoke_gate.cheng");
     cheng_seed_join_path(paths->std_os_host_process_source, sizeof(paths->std_os_host_process_source), paths->root, "src/std/os_host_process.cheng");
@@ -1925,7 +1838,7 @@ static bool cheng_seed_bootstrap_artifacts_fresh(const ChengSeedBootstrapPaths *
 }
 
 static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths) {
-    const char *inputs[41];
+    const char *inputs[43];
     char map_path[PATH_MAX];
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
@@ -1975,14 +1888,16 @@ static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths
     inputs[32] = paths->tooling_path_source;
     inputs[33] = paths->tooling_world_receipt_gate_source;
     inputs[34] = paths->tooling_debug_tools_gate_source;
-    inputs[35] = paths->tooling_export_visibility_gate_source;
-    inputs[36] = paths->tooling_host_bridge_audit_gate_source;
-    inputs[37] = paths->tooling_wasm_binary_audit_source;
-    inputs[38] = paths->tooling_wasm_smoke_gate_source;
-    inputs[39] = paths->std_os_host_process_source;
-    inputs[40] = paths->std_os_source;
-    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 41U) &&
-           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 41U);
+    inputs[35] = paths->tooling_hotpath_scan_source;
+    inputs[36] = paths->tooling_export_visibility_gate_source;
+    inputs[37] = paths->tooling_host_bridge_audit_gate_source;
+    inputs[38] = paths->tooling_seed_cross_target_gate_source;
+    inputs[39] = paths->tooling_wasm_binary_audit_source;
+    inputs[40] = paths->tooling_wasm_smoke_gate_source;
+    inputs[41] = paths->std_os_host_process_source;
+    inputs[42] = paths->std_os_source;
+    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 43U) &&
+           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 43U);
 }
 
 static int cheng_seed_cmd_bootstrap_bridge(int argc, char **argv);
@@ -47175,14 +47090,31 @@ static void cheng_seed_append_entry_bridge_with_module_inits(const ChengSeedSyst
                                                      const char *end_label) {
     size_t i;
     char setcmd_symbol[PATH_MAX];
+    char line_map_symbol[PATH_MAX];
+    char profile_flush_symbol[PATH_MAX];
+    bool use_debug_runtime_hooks = cheng_seed_target_requires_native_provider_modules(plan->target_triple);
     cheng_seed_copy_target_symbol_name(plan, "__cheng_setCmdLine", setcmd_symbol, sizeof(setcmd_symbol));
+    cheng_seed_copy_target_symbol_name(plan,
+                               "cheng_register_line_map_from_argv0",
+                               line_map_symbol,
+                               sizeof(line_map_symbol));
+    cheng_seed_copy_target_symbol_name(plan,
+                               "cheng_debug_profile_flush_from_argv0",
+                               profile_flush_symbol,
+                               sizeof(profile_flush_symbol));
     cheng_seed_text_appendf(out, cap,
                     ".globl %s\n"
-                    ".extern %s\n"
-                    "%s:\n",
+                    ".extern %s\n",
                     bridge_symbol,
-                    setcmd_symbol,
-                    bridge_symbol);
+                    setcmd_symbol);
+    if (use_debug_runtime_hooks) {
+        cheng_seed_text_appendf(out, cap,
+                        ".extern %s\n"
+                        ".extern %s\n",
+                        line_map_symbol,
+                        profile_flush_symbol);
+    }
+    cheng_seed_text_appendf(out, cap, "%s:\n", bridge_symbol);
     if (cheng_seed_target_is_linux_x86_64(plan->target_triple)) {
         cheng_seed_text_append(out, cap,
                        "  subq $24, %rsp\n"
@@ -47196,8 +47128,22 @@ static void cheng_seed_append_entry_bridge_with_module_inits(const ChengSeedSyst
     }
     if (cheng_seed_target_is_linux_x86_64(plan->target_triple)) {
         cheng_seed_text_appendf(out, cap, "  call %s\n", setcmd_symbol);
+        if (use_debug_runtime_hooks) {
+            cheng_seed_text_appendf(out, cap,
+                            "  movq 8(%%rsp), %%rdi\n"
+                            "  movq 0(%%rdi), %%rdi\n"
+                            "  call %s\n",
+                            line_map_symbol);
+        }
     } else {
         cheng_seed_text_appendf(out, cap, "  bl %s\n", setcmd_symbol);
+        if (use_debug_runtime_hooks) {
+            cheng_seed_text_appendf(out, cap,
+                            "  ldr x1, [sp, #8]\n"
+                            "  ldr x0, [x1]\n"
+                            "  bl %s\n",
+                            line_map_symbol);
+        }
     }
     if (module_init_count > 0U) {
         if (!cheng_seed_target_is_linux_x86_64(plan->target_triple)) {
@@ -47213,29 +47159,69 @@ static void cheng_seed_append_entry_bridge_with_module_inits(const ChengSeedSyst
         }
     }
     if (cheng_seed_target_is_linux_x86_64(plan->target_triple)) {
-        cheng_seed_text_appendf(out, cap,
-                        "  movq 0(%%rsp), %%rdi\n"
-                        "  movq 8(%%rsp), %%rsi\n"
-                        "  call %s\n"
-                        "  addq $24, %%rsp\n"
-                        "%s"
-                        "  ret\n"
-                        "%s:\n",
-                        entry_symbol,
-                        entry_returns_void ? "  xorl %eax, %eax\n" : "",
-                        end_label);
+        if (use_debug_runtime_hooks) {
+            cheng_seed_text_appendf(out, cap,
+                            "  movq 0(%%rsp), %%rdi\n"
+                            "  movq 8(%%rsp), %%rsi\n"
+                            "  call %s\n"
+                            "  movl %%eax, 16(%%rsp)\n"
+                            "  movq 8(%%rsp), %%rdi\n"
+                            "  movq 0(%%rdi), %%rdi\n"
+                            "  call %s\n"
+                            "  movl 16(%%rsp), %%eax\n"
+                            "  addq $24, %%rsp\n"
+                            "%s"
+                            "  ret\n"
+                            "%s:\n",
+                            entry_symbol,
+                            profile_flush_symbol,
+                            entry_returns_void ? "  xorl %eax, %eax\n" : "",
+                            end_label);
+        } else {
+            cheng_seed_text_appendf(out, cap,
+                            "  movq 0(%%rsp), %%rdi\n"
+                            "  movq 8(%%rsp), %%rsi\n"
+                            "  call %s\n"
+                            "  addq $24, %%rsp\n"
+                            "%s"
+                            "  ret\n"
+                            "%s:\n",
+                            entry_symbol,
+                            entry_returns_void ? "  xorl %eax, %eax\n" : "",
+                            end_label);
+        }
     } else {
-        cheng_seed_text_appendf(out, cap,
-                        "  ldp x0, x1, [sp]\n"
-                        "  bl %s\n"
-                        "  ldr x30, [sp, #24]\n"
-                        "  add sp, sp, #32\n"
-                        "%s"
-                        "  ret\n"
-                        "%s:\n",
-                        entry_symbol,
-                        entry_returns_void ? "  mov x0, #0\n" : "",
-                        end_label);
+        if (use_debug_runtime_hooks) {
+            cheng_seed_text_appendf(out, cap,
+                            "  ldp x0, x1, [sp]\n"
+                            "  bl %s\n"
+                            "  str w0, [sp, #16]\n"
+                            "  ldr x1, [sp, #8]\n"
+                            "  ldr x0, [x1]\n"
+                            "  bl %s\n"
+                            "  ldr w0, [sp, #16]\n"
+                            "  ldr x30, [sp, #24]\n"
+                            "  add sp, sp, #32\n"
+                            "%s"
+                            "  ret\n"
+                            "%s:\n",
+                            entry_symbol,
+                            profile_flush_symbol,
+                            entry_returns_void ? "  mov x0, #0\n" : "",
+                            end_label);
+        } else {
+            cheng_seed_text_appendf(out, cap,
+                            "  ldp x0, x1, [sp]\n"
+                            "  bl %s\n"
+                            "  ldr x30, [sp, #24]\n"
+                            "  add sp, sp, #32\n"
+                            "%s"
+                            "  ret\n"
+                            "%s:\n",
+                            entry_symbol,
+                            entry_returns_void ? "  mov x0, #0\n" : "",
+                            end_label);
+        }
     }
 }
 
@@ -47590,10 +47576,10 @@ static bool cheng_seed_build_object_plan_stub(const ChengSeedSystemLinkPlanStub 
         cheng_seed_join_path(object_plan->linux_nolibc_startup_source_path,
                      sizeof(object_plan->linux_nolibc_startup_source_path),
                      plan->workspace_root,
-                     "src/core/runtime/cheng_seed_linux_nolibc_aarch64_entry.S");
+                     "src/core/runtime/linux_nolibc_aarch64_entry.S");
         snprintf(object_plan->linux_nolibc_startup_object_path,
                  sizeof(object_plan->linux_nolibc_startup_object_path),
-                 "%s.startup.cheng_seed_linux_nolibc_aarch64_entry.o",
+                 "%s.startup.linux_nolibc_aarch64_entry.o",
                  plan->output_path);
         cheng_seed_plan_add_path(object_plan->link_input_paths,
                          &object_plan->link_input_count,
@@ -63195,223 +63181,17 @@ static int cheng_seed_cmd_compile_bootstrap(int argc, char **argv) {
     return 0;
 }
 
-static int cheng_seed_cmd_status(int argc, char **argv) {
-    ChengSeedBootstrapContract contract;
-    char compiler_entry[PATH_MAX];
-    char manifest_path[PATH_MAX];
-    const char *target;
-    if (!cheng_seed_load_runtime_contract(argc, argv, &contract)) {
-        return 1;
-    }
-    if (!cheng_seed_validate_contract(&contract)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    target = cheng_seed_contract_get(&contract, "target");
-    cheng_seed_resolve_contract_path(&contract, "compiler_entry_source", compiler_entry, sizeof(compiler_entry));
-    puts("cheng");
-    puts("version=cheng.compiler_runtime.v1");
-    puts("execution=argv_control_plane");
-    puts("bootstrap_mode=selfhost");
-    printf("contract_target=%s\n", target);
-    printf("supported_targets=%s\n", cheng_seed_supported_seed_target_csv());
-    printf("target_support=%s\n", cheng_seed_target_support_state(target));
-    printf("target_support_detail=%s\n", cheng_seed_target_support_detail(target));
-    if (cheng_seed_contract_source_value(&contract, "compiler_entry_source") != NULL) {
-        printf("compiler_entry=%s\n", compiler_entry);
-    }
-    if (cheng_seed_contract_manifest_path(&contract, manifest_path, sizeof(manifest_path))) {
-        printf("bootstrap_manifest=%s\n", manifest_path);
-    }
-    if (cheng_seed_contract_get(&contract, "ordinary_command") != NULL) {
-        printf("ordinary_command=%s\n", cheng_seed_contract_get(&contract, "ordinary_command"));
-    }
-    if (cheng_seed_contract_get(&contract, "ordinary_pipeline_state") != NULL) {
-        printf("ordinary_pipeline=%s\n", cheng_seed_contract_get(&contract, "ordinary_pipeline_state"));
-    }
-    cheng_seed_contract_free(&contract);
-    return 0;
-}
-
 static int cheng_seed_try_exec_backend_driver_cli_passthrough(const ChengSeedBootstrapPaths *paths,
                                                       int argc,
                                                       char **argv,
                                                       const char *label,
                                                       bool require_ready);
 
-static int cheng_seed_cmd_print_build_plan(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    ChengSeedBootstrapContract contract;
-    char workspace_root[PATH_MAX];
-    char stage2_path[PATH_MAX];
-    char output_path[PATH_MAX];
-    char resolved[PATH_MAX];
-    const char *target;
-    int passthrough_rc;
-    const char *keys[] = {
-        NULL,
-        "compiler_runtime_source",
-        "compiler_support_matrix_source",
-        "compiler_request_source",
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        "lang_parser_source",
-        "backend_system_link_plan_source",
-        "backend_lowering_plan_source",
-        "backend_primary_object_plan_source",
-        "backend_object_plan_source",
-        "backend_native_link_plan_source",
-        "backend_native_link_exec_source",
-        "backend_system_link_exec_source",
-        "backend_line_map_source",
-        "runtime_core_runtime_source",
-        "runtime_compiler_runtime_source",
-        "runtime_debug_runtime_source",
-        "tooling_bootstrap_contract_source",
-        "tooling_debug_tools_gate_source",
-        "tooling_export_visibility_gate_source",
-        "tooling_host_bridge_audit_gate_source",
-        "tooling_wasm_binary_audit_source",
-        "tooling_wasm_smoke_gate_source",
-        "backend_build_plan_source"
-    };
-    const char *labels[] = {
-        "backend_driver_entry_source",
-        "compiler_runtime_source",
-        "compiler_support_matrix_source",
-        "compiler_request_source",
-        "tooling_source",
-        "tooling_source",
-        "tooling_source",
-        "tooling_source",
-        "tooling_source",
-        "lang_parser_source",
-        "backend_system_link_plan_source",
-        "backend_lowering_plan_source",
-        "backend_primary_object_plan_source",
-        "backend_object_plan_source",
-        "backend_native_link_plan_source",
-        "backend_native_link_exec_source",
-        "backend_system_link_exec_source",
-        "backend_line_map_source",
-        "runtime_core_runtime_source",
-        "runtime_compiler_runtime_source",
-        "runtime_debug_runtime_source",
-        "tooling_source",
-        "tooling_source",
-        "tooling_source",
-        "tooling_source",
-        "tooling_source",
-        "tooling_source",
-        "tooling_source"
-    };
-    const char *manual_paths[] = {
-        "src/core/tooling/backend_driver_main.cheng",
-        NULL,
-        "src/core/tooling/support_matrix.cheng",
-        NULL,
-        "src/core/tooling/compiler_world.cheng",
-        "src/core/tooling/compiler_csg.cheng",
-        "src/core/tooling/compiler_world_libp2p.cheng",
-        "src/core/tooling/compiler_equivalence.cheng",
-        "src/core/tooling/compiler_publish_gate.cheng",
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL
-    };
-    size_t i;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (cheng_seed_backend_driver_handoff_enabled()) {
-        passthrough_rc = cheng_seed_try_exec_backend_driver_cli_passthrough(&paths,
-                                                                    argc,
-                                                                    argv,
-                                                                    "cheng.backend_driver",
-                                                                    true);
-        if (passthrough_rc >= 0) {
-            return passthrough_rc;
-        }
-    }
-    if (!cheng_seed_load_runtime_contract(argc, argv, &contract)) {
-        return 1;
-    }
-    if (!cheng_seed_validate_contract(&contract)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    cheng_seed_contract_workspace_root(&contract, workspace_root, sizeof(workspace_root));
-    cheng_seed_join_path(stage2_path, sizeof(stage2_path), workspace_root, "artifacts/bootstrap/cheng.stage2");
-    cheng_seed_join_path(output_path, sizeof(output_path), workspace_root, "artifacts/backend_driver/cheng");
-    target = cheng_seed_flag_value(argc, argv, "--target");
-    if (target == NULL || *target == '\0') {
-        target = cheng_seed_contract_get(&contract, "target");
-    }
-    printf("target=%s\n", target);
-    printf("supported_targets=%s\n", cheng_seed_supported_seed_target_csv());
-    printf("target_support=%s\n", cheng_seed_target_support_state(target));
-    printf("target_support_detail=%s\n", cheng_seed_target_support_detail(target));
-    puts("linker=system_link");
-    printf("stage2_compiler=%s\n", stage2_path);
-    printf("entry=%s\n", paths.backend_driver_entry_source);
-    printf("output=%s\n", output_path);
-    printf("source[0]=bootstrap_contract_source:%s\n", contract.source_path);
-    for (i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
-        if (manual_paths[i] != NULL) {
-            cheng_seed_join_path(resolved, sizeof(resolved), workspace_root, manual_paths[i]);
-        } else {
-            cheng_seed_resolve_contract_path(&contract, keys[i], resolved, sizeof(resolved));
-        }
-        printf("source[%zu]=%s:%s\n", i + 1U, labels[i], resolved);
-    }
-    cheng_seed_contract_free(&contract);
-    return 0;
-}
-
 static int cheng_seed_cmd_bootstrap_bridge(int argc, char **argv);
 static bool cheng_seed_run_binary_capture_output(char *const argv_local[],
                                          const char *log_path,
                                          int *status_out);
 static bool cheng_seed_status_is_exit_code(int status, int code);
-
-static int cheng_seed_cmd_print_bootstrap(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char *snapshot_text;
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (!cheng_seed_bootstrap_artifacts_ready(&paths)) {
-        if (cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-            return 1;
-        }
-        cheng_seed_bootstrap_paths_init(&paths);
-    }
-    snapshot_text = cheng_seed_read_file(paths.snapshot_path);
-    if (snapshot_text == NULL) {
-        fprintf(stderr, "[cheng_seed] missing bootstrap snapshot: %s\n", paths.snapshot_path);
-        return 1;
-    }
-    fputs(snapshot_text, stdout);
-    free(snapshot_text);
-    return 0;
-}
 
 static int cheng_seed_cmd_bootstrap_bridge(int argc, char **argv) {
     ChengSeedBootstrapPaths paths;
@@ -63695,12 +63475,11 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     unlink(candidate_build_out);
     unlink(candidate_out_map);
     unlink(candidate_build_out_map);
-    reference_compiler = paths.stage3;
-    reference_plan_step = "build-backend-driver reference-stage3";
-    reference_plan_check = true;
+    reference_plan_check = false;
     if (cheng_seed_backend_driver_ready(&paths)) {
         reference_compiler = paths.backend_driver_out;
         reference_plan_step = "build-backend-driver reference-backend-driver";
+        reference_plan_check = true;
     }
 
     cheng_seed_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
@@ -63981,256 +63760,6 @@ done:
     return rc;
 }
 
-static int cheng_seed_cmd_run_smokes(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char log_path[PATH_MAX];
-    char *command;
-    char *quoted_bin;
-    char *quoted_in;
-    const char *bins[4];
-    size_t i;
-    size_t cap = PATH_MAX * 4U;
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (!cheng_seed_bootstrap_artifacts_ready(&paths) && cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        return 1;
-    }
-    bins[0] = paths.stage0;
-    bins[1] = paths.stage1;
-    bins[2] = paths.stage2;
-    bins[3] = paths.stage3;
-    command = (char *)cheng_seed_xmalloc(cap);
-    for (i = 0; i < 4U; ++i) {
-        const char *bin = bins[i];
-        const char *base = strrchr(bin, '/');
-        if (access(bin, X_OK) != 0) {
-            fprintf(stderr, "[cheng_seed] run-smokes missing bootstrap compiler: %s\n", bin);
-            free(command);
-            return 1;
-        }
-        cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate");
-        if (!cheng_seed_mkdir_p(log_path)) {
-            free(command);
-            return 1;
-        }
-        cheng_seed_join_path(log_path, sizeof(log_path), log_path, base != NULL ? base + 1 : bin);
-        strncat(log_path, ".self-check.log", sizeof(log_path) - strlen(log_path) - 1U);
-        quoted_bin = cheng_seed_shell_quote(bin);
-        quoted_in = cheng_seed_shell_quote(paths.stage1_source);
-        snprintf(command, cap, "%s self-check --in:%s", quoted_bin, quoted_in);
-        free(quoted_bin);
-        free(quoted_in);
-        if (!cheng_seed_run_shell_command_logged(command, log_path, "run-smokes self-check")) {
-            free(command);
-            return 1;
-        }
-    }
-    free(command);
-    return 0;
-}
-
-static bool cheng_seed_is_ident_char(int ch) {
-    return isalnum((unsigned char)ch) || ch == '_';
-}
-
-static bool cheng_seed_path_has_named_segment(const char *path, const char *segment) {
-    size_t len = strlen(segment);
-    const char *cursor = path;
-    while ((cursor = strstr(cursor, segment)) != NULL) {
-        bool left_ok = cursor == path || cursor[-1] == '/';
-        bool right_ok = cursor[len] == '\0' || cursor[len] == '/';
-        if (left_ok && right_ok) {
-            return true;
-        }
-        cursor += 1;
-    }
-    return false;
-}
-
-static bool cheng_seed_path_has_tests_segment(const char *path) {
-    return cheng_seed_path_has_named_segment(path, "tests");
-}
-
-static bool cheng_seed_is_cheng_source_path(const char *path) {
-    const char *dot = strrchr(path, '.');
-    return dot != NULL && strcmp(dot, ".cheng") == 0;
-}
-
-static bool cheng_seed_text_contains_whole_word(const char *text, const char *word) {
-    size_t len = strlen(word);
-    const char *cursor = text;
-    while ((cursor = strstr(cursor, word)) != NULL) {
-        bool left_ok = cursor == text || !cheng_seed_is_ident_char((unsigned char)cursor[-1]);
-        bool right_ok = cursor[len] == '\0' || !cheng_seed_is_ident_char((unsigned char)cursor[len]);
-        if (left_ok && right_ok) {
-            return true;
-        }
-        cursor += 1;
-    }
-    return false;
-}
-
-static bool cheng_seed_text_contains_label_colon_str(const char *text, const char *label) {
-    size_t len = strlen(label);
-    const char *cursor = text;
-    while ((cursor = strstr(cursor, label)) != NULL) {
-        const char *probe = cursor + len;
-        if ((cursor == text || !cheng_seed_is_ident_char((unsigned char)cursor[-1])) &&
-            *probe == ':') {
-            probe += 1;
-            while (*probe == ' ' || *probe == '\t' || *probe == '\r' || *probe == '\n') {
-                probe += 1;
-            }
-            if (strncmp(probe, "str", 3U) == 0 &&
-                (probe[3] == '\0' || !cheng_seed_is_ident_char((unsigned char)probe[3]))) {
-                return true;
-            }
-        }
-        cursor += 1;
-    }
-    return false;
-}
-
-static bool cheng_seed_text_contains_forbidden_pattern(const char *text,
-                                               const ChengSeedForbiddenPattern *pattern) {
-    if (pattern->kind == ChengSeed_FORBIDDEN_WHOLE_WORD) {
-        return cheng_seed_text_contains_whole_word(text, pattern->needle);
-    }
-    if (pattern->kind == ChengSeed_FORBIDDEN_LABEL_COLON_STR) {
-        return cheng_seed_text_contains_label_colon_str(text, pattern->needle);
-    }
-    return strstr(text, pattern->needle) != NULL;
-}
-
-static bool cheng_seed_scan_forbidden_source_dir(const char *src_dir,
-                                         ChengSeedForbiddenHitVec *hits) {
-    static const ChengSeedForbiddenPattern patterns[] = {
-        { ChengSeed_FORBIDDEN_SUBSTRING, "local_payload", "local_payload" },
-        { ChengSeed_FORBIDDEN_SUBSTRING, "exec_plan_payload", "exec_plan_payload" },
-        { ChengSeed_FORBIDDEN_SUBSTRING, "entry_bridge", "entry_bridge" },
-        { ChengSeed_FORBIDDEN_SUBSTRING, "payloadText", "payloadText" },
-        { ChengSeed_FORBIDDEN_LABEL_COLON_STR, "runtimeTarget", "runtimeTarget: str" },
-        { ChengSeed_FORBIDDEN_LABEL_COLON_STR, "opName", "opName: str" },
-        { ChengSeed_FORBIDDEN_LABEL_COLON_STR, "kind", "kind: str" },
-        { ChengSeed_FORBIDDEN_WHOLE_WORD, "BigInt", "BigInt" }
-    };
-    ChengSeedOwnedStringVec dirs;
-    char *dir_path;
-    bool ok = true;
-    cheng_seed_owned_string_vec_init(&dirs);
-    cheng_seed_owned_string_vec_push_dup(&dirs, src_dir);
-    while ((dir_path = cheng_seed_owned_string_vec_pop(&dirs)) != NULL) {
-        DIR *dir = opendir(dir_path);
-        if (dir == NULL) {
-            fprintf(stderr, "[cheng_seed] scan-hotpath open failed: %s\n", dir_path);
-            free(dir_path);
-            ok = false;
-            break;
-        }
-        for (;;) {
-            struct dirent *entry = readdir(dir);
-            char child_path[PATH_MAX];
-            struct stat st;
-            size_t i;
-            char *text;
-            if (entry == NULL) {
-                break;
-            }
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                continue;
-            }
-            cheng_seed_join_path(child_path, sizeof(child_path), dir_path, entry->d_name);
-            if (stat(child_path, &st) != 0) {
-                fprintf(stderr, "[cheng_seed] scan-hotpath stat failed: %s\n", child_path);
-                ok = false;
-                break;
-            }
-            if (S_ISDIR(st.st_mode)) {
-                if (!cheng_seed_path_has_tests_segment(child_path)) {
-                    cheng_seed_owned_string_vec_push_dup(&dirs, child_path);
-                }
-                continue;
-            }
-            if (!S_ISREG(st.st_mode) ||
-                cheng_seed_path_has_tests_segment(child_path) ||
-                !cheng_seed_is_cheng_source_path(child_path)) {
-                continue;
-            }
-            text = cheng_seed_read_file(child_path);
-            if (text == NULL) {
-                fprintf(stderr, "[cheng_seed] scan-hotpath read failed: %s\n", child_path);
-                ok = false;
-                break;
-            }
-            for (i = 0U; i < sizeof(patterns) / sizeof(patterns[0]); ++i) {
-                if (cheng_seed_text_contains_forbidden_pattern(text, &patterns[i])) {
-                    cheng_seed_forbidden_hit_vec_push(hits, child_path, patterns[i].label);
-                }
-            }
-            free(text);
-        }
-        closedir(dir);
-        free(dir_path);
-        if (!ok) {
-            break;
-        }
-    }
-    while ((dir_path = cheng_seed_owned_string_vec_pop(&dirs)) != NULL) {
-        free(dir_path);
-    }
-    cheng_seed_owned_string_vec_free(&dirs);
-    return ok;
-}
-
-static int cheng_seed_cmd_scan_hotpath(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    ChengSeedForbiddenHitVec hits;
-    char src_dir[PATH_MAX];
-    char *report;
-    size_t cap;
-    size_t used = 0U;
-    size_t i;
-    char line[PATH_MAX * 2U];
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (paths.root[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] scan-hotpath root detect failed\n");
-        return 1;
-    }
-    cheng_seed_join_path(src_dir, sizeof(src_dir), paths.root, "src");
-    if (access(src_dir, R_OK) != 0) {
-        fprintf(stderr, "[cheng_seed] scan-hotpath source dir not found: %s\n", src_dir);
-        return 1;
-    }
-    cheng_seed_forbidden_hit_vec_init(&hits);
-    if (!cheng_seed_scan_forbidden_source_dir(src_dir, &hits)) {
-        cheng_seed_forbidden_hit_vec_free(&hits);
-        return 1;
-    }
-    if (hits.len == 0U) {
-        cheng_seed_forbidden_hit_vec_free(&hits);
-        puts("cheng scan: ok");
-        return 0;
-    }
-    cap = 256U + hits.len * (PATH_MAX + 96U);
-    report = (char *)cheng_seed_xmalloc(cap);
-    report[0] = '\0';
-    for (i = 0U; i < hits.len; ++i) {
-        snprintf(line,
-                 sizeof(line),
-                 "cheng scan: hit forbidden pattern: %s @ %s",
-                 hits.items[i].label,
-                 hits.items[i].path);
-        cheng_seed_report_append(&report, &cap, &used, line);
-    }
-    fputs(report, stdout);
-    free(report);
-    cheng_seed_forbidden_hit_vec_free(&hits);
-    return 1;
-}
-
 typedef int (*ChengSeedSeedCommandFn)(int argc, char **argv);
 
 static bool cheng_seed_text_contains_substring(const char *text, const char *needle) {
@@ -64271,36 +63800,7 @@ static bool cheng_seed_text_has_line_with_prefix(const char *text, const char *p
     return false;
 }
 
-static bool cheng_seed_text_has_positive_integer_line(const char *text, const char *prefix) {
-    size_t prefix_len = strlen(prefix);
-    const char *cursor = text;
-    if (text == NULL || prefix == NULL) {
-        return false;
-    }
-    while (cursor != NULL && *cursor != '\0') {
-        const char *end = strchr(cursor, '\n');
-        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
-        if (len > prefix_len && strncmp(cursor, prefix, prefix_len) == 0) {
-            size_t i;
-            long long value = 0;
-            bool all_digits = true;
-            for (i = prefix_len; i < len; ++i) {
-                if (cursor[i] < '0' || cursor[i] > '9') {
-                    all_digits = false;
-                    break;
-                }
-                value = value * 10 + (long long)(cursor[i] - '0');
-            }
-            if (all_digits && value > 0) {
-                return true;
-            }
-        }
-        cursor = end != NULL ? end + 1 : NULL;
-    }
-    return false;
-}
-
-static const char *cheng_seed_text_after_marker(const char *text, const char *marker) {
+static const char *CHENG_UNUSED cheng_seed_text_after_marker(const char *text, const char *marker) {
     const char *hit;
     if (text == NULL || marker == NULL) {
         return NULL;
@@ -65138,7 +64638,8 @@ static bool cheng_seed_command_requires_backend_driver_passthrough(const char *c
     if (!cheng_seed_backend_driver_handoff_enabled()) {
         return false;
     }
-    return cheng_seed_streq(cmd, "print-build-plan") ||
+    return cheng_seed_streq(cmd, "status") ||
+           cheng_seed_streq(cmd, "print-build-plan") ||
            cheng_seed_streq(cmd, "scan-hotpath") ||
            cheng_seed_streq(cmd, "print-bootstrap") ||
            cheng_seed_streq(cmd, "run-smokes") ||
@@ -65362,12 +64863,7 @@ static bool cheng_seed_r2c_prepare_controller_bin(ChengSeedBootstrapPaths *paths
 }
 
 static int cheng_seed_cmd_verify_orphan_guard_impl(int argc, char **argv);
-static int cheng_seed_cmd_verify_debug_tools_impl(int argc, char **argv);
 static int cheng_seed_cmd_verify_debug_runtime_impl(int argc, char **argv);
-static int cheng_seed_cmd_verify_debug_profile_impl(int argc, char **argv);
-static int cheng_seed_cmd_verify_windows_builtin_impl(int argc, char **argv);
-static int cheng_seed_cmd_verify_riscv64_builtin_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_cross_target_smokes_impl(int argc, char **argv);
 static int cheng_seed_cmd_run_host_smokes_impl(int argc, char **argv);
 static int cheng_seed_cmd_run_stage23_libp2p_smokes_impl(int argc, char **argv);
 static int cheng_seed_cmd_r2c_react_impl(int argc, char **argv);
@@ -65461,57 +64957,6 @@ static int cheng_seed_invoke_with_fresh_compile_env(ChengSeedSeedCommandFn fn,
                                             int argc,
                                             char **argv);
 
-static int cheng_seed_invoke_command_with_common_flags(ChengSeedSeedCommandFn fn,
-                                               const char *cmd_name,
-                                               const char *contract_path,
-                                               const char *root_path,
-                                               const char *source_path,
-                                               const char *emit,
-                                               const char *target,
-                                               const char *out_path,
-                                               const char *report_path) {
-    char contract_flag[PATH_MAX + 32];
-    char root_flag[PATH_MAX + 16];
-    char in_flag[PATH_MAX + 16];
-    char emit_flag[64];
-    char target_flag[256];
-    char out_flag[PATH_MAX + 16];
-    char report_flag[PATH_MAX + 24];
-    char *argv_local[10];
-    int argc_local = 0;
-    argv_local[argc_local++] = "cheng_seed";
-    argv_local[argc_local++] = (char *)cmd_name;
-    if (contract_path != NULL && contract_path[0] != '\0') {
-        snprintf(contract_flag, sizeof(contract_flag), "--contract-in:%s", contract_path);
-        argv_local[argc_local++] = contract_flag;
-    }
-    if (root_path != NULL && root_path[0] != '\0') {
-        snprintf(root_flag, sizeof(root_flag), "--root:%s", root_path);
-        argv_local[argc_local++] = root_flag;
-    }
-    if (source_path != NULL && source_path[0] != '\0') {
-        snprintf(in_flag, sizeof(in_flag), "--in:%s", source_path);
-        argv_local[argc_local++] = in_flag;
-    }
-    if (emit != NULL && emit[0] != '\0') {
-        snprintf(emit_flag, sizeof(emit_flag), "--emit:%s", emit);
-        argv_local[argc_local++] = emit_flag;
-    }
-    if (target != NULL && target[0] != '\0') {
-        snprintf(target_flag, sizeof(target_flag), "--target:%s", target);
-        argv_local[argc_local++] = target_flag;
-    }
-    if (out_path != NULL && out_path[0] != '\0') {
-        snprintf(out_flag, sizeof(out_flag), "--out:%s", out_path);
-        argv_local[argc_local++] = out_flag;
-    }
-    if (report_path != NULL && report_path[0] != '\0') {
-        snprintf(report_flag, sizeof(report_flag), "--report-out:%s", report_path);
-        argv_local[argc_local++] = report_flag;
-    }
-    return cheng_seed_invoke_with_fresh_compile_env(fn, argc_local, argv_local);
-}
-
 static int cheng_seed_invoke_with_fresh_compile_env(ChengSeedSeedCommandFn fn,
                                             int argc,
                                             char **argv) {
@@ -65570,7 +65015,6 @@ static int cheng_seed_invoke_with_fresh_compile_env(ChengSeedSeedCommandFn fn,
     return rc;
 }
 
-static int cheng_seed_cmd_profile_run(int argc, char **argv);
 static bool cheng_seed_compile_fixture_with_backend_driver_emit_target(const char *compiler_bin,
                                                                const char *root_cheng,
                                                                const char *src_path,
@@ -65579,132 +65023,15 @@ static bool cheng_seed_compile_fixture_with_backend_driver_emit_target(const cha
                                                                const char *out_path,
                                                                const char *log_path,
                                                                const char *report_path);
-static int cheng_seed_cmd_debug_report(int argc, char **argv);
-static int cheng_seed_cmd_print_symbols(int argc, char **argv);
-static int cheng_seed_cmd_print_line_map(int argc, char **argv);
-static int cheng_seed_cmd_print_object(int argc, char **argv);
-static int cheng_seed_cmd_print_elf(int argc, char **argv);
 static int cheng_seed_cmd_print_asm(int argc, char **argv);
 static const char *cheng_seed_host_target_triple(void);
-static int cheng_seed_cmd_profile_report(int argc, char **argv);
-static int cheng_seed_cmd_crash_report(int argc, char **argv);
 static int cheng_seed_cmd_system_link_exec(int argc, char **argv);
-
-static int cheng_seed_invoke_profile_run(const char *contract_path,
-                                 const char *root_path,
-                                 const char *source_path,
-                                 const char *target,
-                                 const char *out_path,
-                                 const char *profile_hz,
-                                 const char *report_path) {
-    char contract_flag[PATH_MAX + 32];
-    char root_flag[PATH_MAX + 16];
-    char in_flag[PATH_MAX + 16];
-    char emit_flag[64];
-    char target_flag[256];
-    char out_flag[PATH_MAX + 16];
-    char hz_flag[64];
-    char report_flag[PATH_MAX + 24];
-    char *argv_local[10];
-    int argc_local = 0;
-    argv_local[argc_local++] = "cheng_seed";
-    argv_local[argc_local++] = "profile-run";
-    if (contract_path != NULL && contract_path[0] != '\0') {
-        snprintf(contract_flag, sizeof(contract_flag), "--contract-in:%s", contract_path);
-        argv_local[argc_local++] = contract_flag;
-    }
-    if (root_path != NULL && root_path[0] != '\0') {
-        snprintf(root_flag, sizeof(root_flag), "--root:%s", root_path);
-        argv_local[argc_local++] = root_flag;
-    }
-    snprintf(in_flag, sizeof(in_flag), "--in:%s", source_path);
-    argv_local[argc_local++] = in_flag;
-    snprintf(emit_flag, sizeof(emit_flag), "--emit:exe");
-    argv_local[argc_local++] = emit_flag;
-    snprintf(target_flag, sizeof(target_flag), "--target:%s", target);
-    argv_local[argc_local++] = target_flag;
-    snprintf(out_flag, sizeof(out_flag), "--out:%s", out_path);
-    argv_local[argc_local++] = out_flag;
-    if (profile_hz != NULL && profile_hz[0] != '\0') {
-        snprintf(hz_flag, sizeof(hz_flag), "--profile-hz:%s", profile_hz);
-        argv_local[argc_local++] = hz_flag;
-    }
-    if (report_path != NULL && report_path[0] != '\0') {
-        snprintf(report_flag, sizeof(report_flag), "--report-out:%s", report_path);
-        argv_local[argc_local++] = report_flag;
-    }
-    return cheng_seed_cmd_profile_run(argc_local, argv_local);
-}
-
-static void cheng_seed_profile_raw_report_path_from_report(const char *report_path,
-                                                   char *out,
-                                                   size_t cap) {
-    size_t len;
-    if (out == NULL || cap == 0U) {
-        return;
-    }
-    out[0] = '\0';
-    if (report_path == NULL || report_path[0] == '\0') {
-        return;
-    }
-    len = strlen(report_path);
-    if (len > 4U && strcmp(report_path + len - 4U, ".txt") == 0) {
-        snprintf(out, cap, "%.*s.raw.txt", (int)(len - 4U), report_path);
-        return;
-    }
-    snprintf(out, cap, "%s.raw.txt", report_path);
-}
-
-static void cheng_seed_profile_log_error(const char *log_path, const char *message) {
-    if (log_path != NULL && log_path[0] != '\0') {
-        cheng_seed_ensure_parent_dir(log_path);
-        cheng_seed_write_text_file(log_path, message);
-    }
-}
+static int cheng_seed_run_backend_driver_cli_child(int argc,
+                                           char **argv,
+                                           const char *label,
+                                           const char *log_rel_path);
 
 static void cheng_seed_profile_trim_line(char *line);
-
-static void cheng_seed_profile_report_path_from_raw(const char *raw_report_path,
-                                            char *out,
-                                            size_t cap) {
-    size_t len;
-    if (out == NULL || cap == 0U) {
-        return;
-    }
-    out[0] = '\0';
-    if (raw_report_path == NULL || raw_report_path[0] == '\0') {
-        return;
-    }
-    len = strlen(raw_report_path);
-    if (len > 8U && strcmp(raw_report_path + len - 8U, ".raw.txt") == 0) {
-        snprintf(out, cap, "%.*s.txt", (int)(len - 8U), raw_report_path);
-        return;
-    }
-    snprintf(out, cap, "%s.report.txt", raw_report_path);
-}
-
-static void cheng_seed_crash_report_path_from_raw(const char *raw_log_path,
-                                          char *out,
-                                          size_t cap) {
-    size_t len;
-    if (out == NULL || cap == 0U) {
-        return;
-    }
-    out[0] = '\0';
-    if (raw_log_path == NULL || raw_log_path[0] == '\0') {
-        return;
-    }
-    len = strlen(raw_log_path);
-    if (len > 8U && strcmp(raw_log_path + len - 8U, ".run.log") == 0) {
-        snprintf(out, cap, "%.*s.report.txt", (int)(len - 8U), raw_log_path);
-        return;
-    }
-    if (len > 8U && strcmp(raw_log_path + len - 8U, ".raw.txt") == 0) {
-        snprintf(out, cap, "%.*s.txt", (int)(len - 8U), raw_log_path);
-        return;
-    }
-    snprintf(out, cap, "%s.report.txt", raw_log_path);
-}
 
 static void cheng_seed_crash_log_error(const char *log_path, const char *message) {
     if (log_path != NULL && log_path[0] != '\0') {
@@ -65796,94 +65123,6 @@ done:
     return ok;
 }
 
-static int cheng_seed_cmd_bootstrap_bridge(int argc, char **argv);
-
-static bool cheng_seed_profile_report_live_compiler_bin(const ChengSeedBootstrapPaths *paths,
-                                                char *out,
-                                                size_t cap) {
-    if (paths == NULL || out == NULL || cap == 0U) {
-        return false;
-    }
-    out[0] = '\0';
-    if (cheng_seed_backend_driver_ready(paths)) {
-        cheng_seed_copy_text(out, cap, paths->backend_driver_out);
-        return true;
-    }
-    if (cheng_seed_bootstrap_artifacts_fresh(paths) && cheng_seed_path_exists_nonempty(paths->stage3)) {
-        cheng_seed_copy_text(out, cap, paths->stage3);
-        return true;
-    }
-    if (cheng_seed_cmd_bootstrap_bridge(0, NULL) == 0) {
-        if (cheng_seed_backend_driver_ready(paths)) {
-            cheng_seed_copy_text(out, cap, paths->backend_driver_out);
-            return true;
-        }
-        if (cheng_seed_bootstrap_artifacts_fresh(paths) && cheng_seed_path_exists_nonempty(paths->stage3)) {
-            cheng_seed_copy_text(out, cap, paths->stage3);
-            return true;
-        }
-    }
-    return false;
-}
-
-typedef struct {
-    char *key;
-    uint32_t count;
-} ChengSeedProfileCount;
-
-static int cheng_seed_profile_count_cmp(const void *left, const void *right) {
-    const ChengSeedProfileCount *a = (const ChengSeedProfileCount *)left;
-    const ChengSeedProfileCount *b = (const ChengSeedProfileCount *)right;
-    if (a->count != b->count) {
-        return a->count < b->count ? 1 : -1;
-    }
-    if (a->key == NULL && b->key == NULL) return 0;
-    if (a->key == NULL) return 1;
-    if (b->key == NULL) return -1;
-    return strcmp(a->key, b->key);
-}
-
-static bool cheng_seed_profile_count_add(ChengSeedProfileCount **items,
-                                 int32_t *len,
-                                 int32_t *cap,
-                                 const char *key) {
-    int32_t i;
-    int32_t next_cap;
-    ChengSeedProfileCount *grown = NULL;
-    const char *safe_key = (key != NULL && key[0] != '\0') ? key : "?";
-    for (i = 0; i < *len; i += 1) {
-        if ((*items)[i].key != NULL && strcmp((*items)[i].key, safe_key) == 0) {
-            (*items)[i].count += 1U;
-            return true;
-        }
-    }
-    if (*len >= *cap) {
-        next_cap = *cap > 0 ? *cap * 2 : 16;
-        grown = (ChengSeedProfileCount *)realloc(*items, (size_t)next_cap * sizeof(ChengSeedProfileCount));
-        if (grown == NULL) {
-            return false;
-        }
-        *items = grown;
-        *cap = next_cap;
-    }
-    (*items)[*len].key = cheng_seed_strdup(safe_key);
-    if ((*items)[*len].key == NULL) {
-        return false;
-    }
-    (*items)[*len].count = 1U;
-    *len += 1;
-    return true;
-}
-
-static void cheng_seed_profile_counts_free(ChengSeedProfileCount *items, int32_t len) {
-    int32_t i;
-    if (items == NULL) return;
-    for (i = 0; i < len; i += 1) {
-        free(items[i].key);
-    }
-    free(items);
-}
-
 static void cheng_seed_profile_trim_line(char *line) {
     size_t len;
     if (line == NULL) return;
@@ -65892,149 +65131,6 @@ static void cheng_seed_profile_trim_line(char *line) {
         line[len - 1U] = '\0';
         len -= 1U;
     }
-}
-
-static bool cheng_seed_profile_report_transform_raw(const char *raw_report_path,
-                                            const char *report_path,
-                                            const char *log_path) {
-    char *raw_text = NULL;
-    char *cursor = NULL;
-    char *line = NULL;
-    bool header_seen = false;
-    int32_t total_samples = 0;
-    int32_t dropped_samples = 0;
-    int32_t sample_count = 0;
-    ChengSeedProfileCount *function_counts = NULL;
-    ChengSeedProfileCount *source_counts = NULL;
-    ChengSeedProfileCount *pc_counts = NULL;
-    int32_t function_len = 0;
-    int32_t source_len = 0;
-    int32_t pc_len = 0;
-    int32_t function_cap = 0;
-    int32_t source_cap = 0;
-    int32_t pc_cap = 0;
-    char *report = NULL;
-    size_t report_cap = 1024U;
-    size_t report_used = 0U;
-    char line_buf[PATH_MAX * 2];
-    bool ok = false;
-    int32_t i;
-    (void)log_path;
-    if (!cheng_seed_path_exists_nonempty(raw_report_path)) {
-        cheng_seed_profile_log_error(log_path, "cheng profile report: missing raw profile\n");
-        return false;
-    }
-    if (!cheng_seed_ensure_parent_dir(report_path) || !cheng_seed_ensure_parent_dir(log_path)) {
-        return false;
-    }
-    raw_text = cheng_seed_read_file(raw_report_path);
-    if (raw_text == NULL) {
-        cheng_seed_profile_log_error(log_path, "cheng profile report: failed to read raw profile\n");
-        goto done;
-    }
-    cursor = raw_text;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        char *rest;
-        char *pc_key;
-        char *function_key;
-        char *source_key;
-        cheng_seed_profile_trim_line(line);
-        if (line[0] == '\0') {
-            continue;
-        }
-        if (!header_seen) {
-            header_seen = true;
-            if (strcmp(line, "cheng_profile_raw_v1") != 0) {
-                cheng_seed_profile_log_error(log_path, "cheng profile report: invalid raw header\n");
-                goto done;
-            }
-            continue;
-        }
-        if (strncmp(line, "total_samples=", 14) == 0) {
-            cheng_seed_parse_i32_text(line + 14, &total_samples);
-            continue;
-        }
-        if (strncmp(line, "dropped_samples=", 16) == 0) {
-            cheng_seed_parse_i32_text(line + 16, &dropped_samples);
-            continue;
-        }
-        if (strncmp(line, "sample\t", 7) != 0) {
-            continue;
-        }
-        rest = line + 7;
-        pc_key = strsep(&rest, "\t");
-        function_key = strsep(&rest, "\t");
-        source_key = strsep(&rest, "\t");
-        if (!cheng_seed_profile_count_add(&pc_counts, &pc_len, &pc_cap, pc_key) ||
-            !cheng_seed_profile_count_add(&function_counts, &function_len, &function_cap, function_key) ||
-            !cheng_seed_profile_count_add(&source_counts, &source_len, &source_cap, source_key)) {
-            cheng_seed_profile_log_error(log_path, "cheng profile report: out of memory while counting samples\n");
-            goto done;
-        }
-        sample_count += 1;
-    }
-    if (!header_seen) {
-        cheng_seed_profile_log_error(log_path, "cheng profile report: invalid raw header\n");
-        goto done;
-    }
-    if (total_samples <= 0) {
-        total_samples = sample_count;
-    }
-    if (function_len > 1) {
-        qsort(function_counts, (size_t)function_len, sizeof(ChengSeedProfileCount), cheng_seed_profile_count_cmp);
-    }
-    if (source_len > 1) {
-        qsort(source_counts, (size_t)source_len, sizeof(ChengSeedProfileCount), cheng_seed_profile_count_cmp);
-    }
-    if (pc_len > 1) {
-        qsort(pc_counts, (size_t)pc_len, sizeof(ChengSeedProfileCount), cheng_seed_profile_count_cmp);
-    }
-    report = (char *)cheng_seed_xmalloc(report_cap);
-    report[0] = '\0';
-    cheng_seed_report_append(&report, &report_cap, &report_used, "cheng_profile_v1");
-    snprintf(line_buf, sizeof(line_buf), "total_samples=%d", total_samples);
-    cheng_seed_report_append(&report, &report_cap, &report_used, line_buf);
-    snprintf(line_buf, sizeof(line_buf), "dropped_samples=%d", dropped_samples);
-    cheng_seed_report_append(&report, &report_cap, &report_used, line_buf);
-    for (i = 0; i < function_len && i < 8; i += 1) {
-        snprintf(line_buf,
-                 sizeof(line_buf),
-                 "hot_function[%d]=%u|%s",
-                 i,
-                 function_counts[i].count,
-                 function_counts[i].key != NULL ? function_counts[i].key : "?");
-        cheng_seed_report_append(&report, &report_cap, &report_used, line_buf);
-    }
-    for (i = 0; i < source_len && i < 8; i += 1) {
-        snprintf(line_buf,
-                 sizeof(line_buf),
-                 "hot_source[%d]=%u|%s",
-                 i,
-                 source_counts[i].count,
-                 source_counts[i].key != NULL ? source_counts[i].key : "?");
-        cheng_seed_report_append(&report, &report_cap, &report_used, line_buf);
-    }
-    for (i = 0; i < pc_len && i < 8; i += 1) {
-        snprintf(line_buf,
-                 sizeof(line_buf),
-                 "hot_pc[%d]=%u|%s",
-                 i,
-                 pc_counts[i].count,
-                 pc_counts[i].key != NULL ? pc_counts[i].key : "?");
-        cheng_seed_report_append(&report, &report_cap, &report_used, line_buf);
-    }
-    if (!cheng_seed_write_text_file(report_path, report)) {
-        cheng_seed_profile_log_error(log_path, "cheng profile report: failed to write report\n");
-        goto done;
-    }
-    ok = true;
-done:
-    free(report);
-    free(raw_text);
-    cheng_seed_profile_counts_free(function_counts, function_len);
-    cheng_seed_profile_counts_free(source_counts, source_len);
-    cheng_seed_profile_counts_free(pc_counts, pc_len);
-    return ok;
 }
 
 static bool cheng_seed_compile_fixture_with_backend_driver_emit_target(const char *compiler_bin,
@@ -66111,10 +65207,19 @@ static int cheng_seed_cmd_verify_tcp_bio_linux_regression_impl(void) {
     return 0;
 }
 
+static int cheng_seed_run_backend_driver_cli_child(int argc,
+                                           char **argv,
+                                           const char *label,
+                                           const char *log_rel_path);
+
 static int cheng_seed_cmd_slice_gate(int argc, char **argv) {
     ChengSeedBootstrapPaths paths;
     char remote_x86_log[PATH_MAX];
     char bft_verify_log[PATH_MAX];
+    char *scan_hotpath_argv[2];
+    char *debug_tools_argv[2];
+    char *debug_profile_argv[2];
+    char *cross_target_argv[2];
     char saved_rwad_bft_linux_artifact[64];
     char saved_rwad_bft_run_self_test[64];
     char *host_fixed_argv[3];
@@ -66135,7 +65240,12 @@ static int cheng_seed_cmd_slice_gate(int argc, char **argv) {
         return 1;
     }
     puts("[cheng gate] hot-path forbidden scan");
-    if (cheng_seed_cmd_scan_hotpath(0, NULL) != 0) {
+    scan_hotpath_argv[0] = "cheng_seed";
+    scan_hotpath_argv[1] = "scan-hotpath";
+    if (cheng_seed_run_backend_driver_cli_child(2,
+                                                scan_hotpath_argv,
+                                                "slice-gate scan-hotpath",
+                                                "artifacts/gate/scan-hotpath.log") != 0) {
         return 1;
     }
     puts("[cheng gate] orphan guard + bootstrap path");
@@ -66159,7 +65269,12 @@ static int cheng_seed_cmd_slice_gate(int argc, char **argv) {
         return 1;
     }
     puts("[cheng gate] debug tools");
-    if (cheng_seed_cmd_verify_debug_tools_impl(0, NULL) != 0) {
+    debug_tools_argv[0] = "cheng_seed";
+    debug_tools_argv[1] = "verify-debug-tools";
+    if (cheng_seed_run_backend_driver_cli_child(2,
+                                                debug_tools_argv,
+                                                "slice-gate verify-debug-tools",
+                                                "artifacts/gate/verify-debug-tools.log") != 0) {
         return 1;
     }
     puts("[cheng gate] debug runtime");
@@ -66167,7 +65282,12 @@ static int cheng_seed_cmd_slice_gate(int argc, char **argv) {
         return 1;
     }
     puts("[cheng gate] debug profile");
-    if (cheng_seed_cmd_verify_debug_profile_impl(0, NULL) != 0) {
+    debug_profile_argv[0] = "cheng_seed";
+    debug_profile_argv[1] = "verify-debug-profile";
+    if (cheng_seed_run_backend_driver_cli_child(2,
+                                                debug_profile_argv,
+                                                "slice-gate verify-debug-profile",
+                                                "artifacts/gate/verify-debug-profile.log") != 0) {
         return 1;
     }
     puts("[cheng gate] call-chain ordinary compile");
@@ -66216,7 +65336,12 @@ static int cheng_seed_cmd_slice_gate(int argc, char **argv) {
         unsetenv("RWAD_BFT_RUN_SELF_TEST");
     }
     puts("[cheng gate] bootstrap subset self-checks");
-    if (cheng_seed_cmd_run_smokes(0, NULL) != 0) {
+    host_full_argv[0] = "cheng_seed";
+    host_full_argv[1] = "run-smokes";
+    if (cheng_seed_run_backend_driver_cli_child(2,
+                                                host_full_argv,
+                                                "slice-gate run-smokes",
+                                                "artifacts/gate/run-smokes.log") != 0) {
         return 1;
     }
     puts("[cheng gate] host fixed256 sha256 smoke");
@@ -66238,7 +65363,12 @@ static int cheng_seed_cmd_slice_gate(int argc, char **argv) {
         return 1;
     }
     puts("[cheng gate] cross-target builtin smokes");
-    if (cheng_seed_cmd_run_cross_target_smokes_impl(0, NULL) != 0) {
+    cross_target_argv[0] = "cheng_seed";
+    cross_target_argv[1] = "run-cross-target-smokes";
+    if (cheng_seed_run_backend_driver_cli_child(2,
+                                                cross_target_argv,
+                                                "slice-gate run-cross-target-smokes",
+                                                "artifacts/gate/run-cross-target-smokes.log") != 0) {
         return 1;
     }
     puts("[cheng gate] cheng host smokes");
@@ -72053,167 +71183,15 @@ static int cheng_seed_cmd_run_tailnet_control_smoke_impl(int argc, char **argv) 
 }
 
 static int cheng_seed_cmd_verify_debug_tools(int argc, char **argv) {
-    return cheng_seed_cmd_verify_debug_tools_impl(argc, argv);
-    ChengSeedBootstrapPaths paths;
-    char out_dir[PATH_MAX];
-    char src_return[PATH_MAX];
-    char src_program_selfhost[PATH_MAX];
-    char src_call_chain[PATH_MAX];
-    char src_windows[PATH_MAX];
-    char linux_obj[PATH_MAX];
-    char host_obj[PATH_MAX];
-    char asm_obj[PATH_MAX];
-    char windows_exe[PATH_MAX];
-    char debug_report[PATH_MAX];
-    char symbols_report[PATH_MAX];
-    char line_map_report[PATH_MAX];
-    char elf_report[PATH_MAX];
-    char elf_alias_report[PATH_MAX];
-    char macho_report[PATH_MAX];
-    char pe_report[PATH_MAX];
-    char asm_report[PATH_MAX];
-    char asm_source_path[PATH_MAX];
-    char *debug_text = NULL;
-    char *symbols_text = NULL;
-    char *line_map_text = NULL;
-    char *elf_text = NULL;
-    char *elf_alias_text = NULL;
-    char *macho_text = NULL;
-    char *pe_text = NULL;
-    char *asm_text = NULL;
-    char *asm_source_text = NULL;
-    int rc = 1;
+    char *debug_tools_argv[2];
     (void)argc;
     (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (!cheng_seed_bootstrap_artifacts_ready(&paths) && cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/debug_tools_verify");
-    cheng_seed_join_path(src_return, sizeof(src_return), paths.root, "tests/cheng/backend/fixtures/return_add.cheng");
-    cheng_seed_join_path(src_program_selfhost, sizeof(src_program_selfhost), paths.root, "src/tests/program_selfhost_smoke.cheng");
-    cheng_seed_join_path(src_call_chain, sizeof(src_call_chain), paths.root, "src/tests/ordinary_call_chain_fixture.cheng");
-    cheng_seed_join_path(src_windows, sizeof(src_windows), paths.root, "tests/cheng/backend/fixtures/hello_importc_puts.cheng");
-    cheng_seed_join_path(linux_obj, sizeof(linux_obj), out_dir, "return_add_linux_aarch64.o");
-    cheng_seed_join_path(host_obj, sizeof(host_obj), out_dir, "return_add_host.o");
-    cheng_seed_join_path(asm_obj, sizeof(asm_obj), out_dir, "ordinary_call_chain_host.o");
-    cheng_seed_join_path(windows_exe, sizeof(windows_exe), out_dir, "hello_importc_puts.exe");
-    cheng_seed_join_path(debug_report, sizeof(debug_report), out_dir, "debug-report.txt");
-    cheng_seed_join_path(symbols_report, sizeof(symbols_report), out_dir, "symbols.txt");
-    cheng_seed_join_path(line_map_report, sizeof(line_map_report), out_dir, "line-map.txt");
-    cheng_seed_join_path(elf_report, sizeof(elf_report), out_dir, "object-elf.txt");
-    cheng_seed_join_path(elf_alias_report, sizeof(elf_alias_report), out_dir, "object-elf-alias.txt");
-    cheng_seed_join_path(macho_report, sizeof(macho_report), out_dir, "object-macho.txt");
-    cheng_seed_join_path(pe_report, sizeof(pe_report), out_dir, "object-pe.txt");
-    cheng_seed_join_path(asm_report, sizeof(asm_report), out_dir, "asm.txt");
-    snprintf(asm_source_path, sizeof(asm_source_path), "%s.s", asm_obj);
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_debug_report,
-                                            "debug-report",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_return,
-                                            "obj",
-                                            "aarch64-unknown-linux-gnu",
-                                            linux_obj,
-                                            debug_report) != 0) {
-        goto cleanup;
-    }
-    debug_text = cheng_seed_read_file(debug_report);
-    if (debug_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools debug-report", debug_text, "cheng_debug_report_v1") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "entry=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "lowering_function_count=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "primary_object_item_count=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "native_linker_program=") ||
-        !cheng_seed_expect_text_contains("verify-debug-tools debug-report", debug_text, src_return)) {
-        goto cleanup;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_print_symbols,
-                                            "print-symbols",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_program_selfhost,
-                                            "obj",
-                                            "arm64-apple-darwin",
-                                            host_obj,
-                                            symbols_report) != 0) {
-        goto cleanup;
-    }
-    symbols_text = cheng_seed_read_file(symbols_report);
-    if (symbols_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools symbols", symbols_text, "cheng_symbols_v1") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "lowering_symbol_count=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "lowering_symbol[0]=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "primary_symbol_count=") ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools symbols", symbols_text, "primary_unsupported_count=0")) {
-        goto cleanup;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_print_line_map,
-                                            "print-line-map",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_return,
-                                            "obj",
-                                            "aarch64-unknown-linux-gnu",
-                                            linux_obj,
-                                            line_map_report) != 0) {
-        goto cleanup;
-    }
-    line_map_text = cheng_seed_read_file(line_map_report);
-    if (line_map_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools line-map", line_map_text, "cheng_line_map_v1") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools line-map", line_map_text, "entry_count=") ||
-        !cheng_seed_expect_text_contains("verify-debug-tools line-map", line_map_text, "entry\t")) {
-        goto cleanup;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_system_link_exec,
-                                            "system-link-exec",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_return,
-                                            "obj",
-                                            "aarch64-unknown-linux-gnu",
-                                            linux_obj,
-                                            NULL) != 0) {
-        goto cleanup;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_system_link_exec,
-                                            "system-link-exec",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_return,
-                                            "obj",
-                                            "arm64-apple-darwin",
-                                            host_obj,
-                                            NULL) != 0) {
-        goto cleanup;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_print_object,
-                                            "print-object",
-                                            NULL,
-                                            NULL,
-                                            NULL,
-                                            NULL,
-                                            NULL,
-                                            NULL,
-                                            elf_report) != 0) {
-        goto cleanup;
-    }
-    /* print-object needs --object; re-run directly */
-cleanup:
-    free(debug_text);
-    free(symbols_text);
-    free(line_map_text);
-    free(elf_text);
-    free(elf_alias_text);
-    free(macho_text);
-    free(pe_text);
-    free(asm_text);
-    free(asm_source_text);
-    return rc;
+    debug_tools_argv[0] = "cheng_seed";
+    debug_tools_argv[1] = "verify-debug-tools";
+    return cheng_seed_run_backend_driver_cli_child(2,
+                                                   debug_tools_argv,
+                                                   "verify-debug-tools",
+                                                   "artifacts/gate/verify-debug-tools.log");
 }
 
 static bool cheng_seed_orphan_ascii_space(char ch) {
@@ -72609,257 +71587,6 @@ cleanup:
     return rc;
 }
 
-static int cheng_seed_cmd_verify_debug_tools_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char out_dir[PATH_MAX];
-    char src_return[PATH_MAX];
-    char src_program_selfhost[PATH_MAX];
-    char src_call_chain[PATH_MAX];
-    char src_windows[PATH_MAX];
-    char linux_obj[PATH_MAX];
-    char host_obj[PATH_MAX];
-    char asm_obj[PATH_MAX];
-    char windows_exe[PATH_MAX];
-    char debug_report[PATH_MAX];
-    char symbols_report[PATH_MAX];
-    char line_map_report[PATH_MAX];
-    char elf_report[PATH_MAX];
-    char elf_alias_report[PATH_MAX];
-    char macho_report[PATH_MAX];
-    char pe_report[PATH_MAX];
-    char asm_report[PATH_MAX];
-    char asm_source_path[PATH_MAX];
-    char object_flag[PATH_MAX + 16];
-    char report_flag[PATH_MAX + 24];
-    char *argv_local[4];
-    char *debug_text = NULL;
-    char *symbols_text = NULL;
-    char *line_map_text = NULL;
-    char *elf_text = NULL;
-    char *elf_alias_text = NULL;
-    char *macho_text = NULL;
-    char *pe_text = NULL;
-    char *asm_text = NULL;
-    char *asm_source_text = NULL;
-    const char *asm_payload = NULL;
-    int rc = 1;
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (!cheng_seed_bootstrap_artifacts_ready(&paths) && cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/debug_tools_verify");
-    cheng_seed_join_path(src_return, sizeof(src_return), paths.root, "tests/cheng/backend/fixtures/return_add.cheng");
-    cheng_seed_join_path(src_program_selfhost, sizeof(src_program_selfhost), paths.root, "src/tests/program_selfhost_smoke.cheng");
-    cheng_seed_join_path(src_call_chain, sizeof(src_call_chain), paths.root, "src/tests/ordinary_call_chain_fixture.cheng");
-    cheng_seed_join_path(src_windows, sizeof(src_windows), paths.root, "tests/cheng/backend/fixtures/hello_importc_puts.cheng");
-    cheng_seed_join_path(linux_obj, sizeof(linux_obj), out_dir, "return_add_linux_aarch64.o");
-    cheng_seed_join_path(host_obj, sizeof(host_obj), out_dir, "return_add_host.o");
-    cheng_seed_join_path(asm_obj, sizeof(asm_obj), out_dir, "ordinary_call_chain_host.o");
-    cheng_seed_join_path(windows_exe, sizeof(windows_exe), out_dir, "hello_importc_puts.exe");
-    cheng_seed_join_path(debug_report, sizeof(debug_report), out_dir, "debug-report.txt");
-    cheng_seed_join_path(symbols_report, sizeof(symbols_report), out_dir, "symbols.txt");
-    cheng_seed_join_path(line_map_report, sizeof(line_map_report), out_dir, "line-map.txt");
-    cheng_seed_join_path(elf_report, sizeof(elf_report), out_dir, "object-elf.txt");
-    cheng_seed_join_path(elf_alias_report, sizeof(elf_alias_report), out_dir, "object-elf-alias.txt");
-    cheng_seed_join_path(macho_report, sizeof(macho_report), out_dir, "object-macho.txt");
-    cheng_seed_join_path(pe_report, sizeof(pe_report), out_dir, "object-pe.txt");
-    cheng_seed_join_path(asm_report, sizeof(asm_report), out_dir, "asm.txt");
-    snprintf(asm_source_path, sizeof(asm_source_path), "%s.s", asm_obj);
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_debug_report,
-                                            "debug-report",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_return,
-                                            "obj",
-                                            "aarch64-unknown-linux-gnu",
-                                            linux_obj,
-                                            debug_report) != 0) {
-        goto cleanup;
-    }
-    debug_text = cheng_seed_read_file(debug_report);
-    if (debug_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools debug-report", debug_text, "cheng_debug_report_v1") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "entry=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "lowering_function_count=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "primary_object_item_count=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "native_linker_program=") ||
-        !cheng_seed_expect_text_contains("verify-debug-tools debug-report", debug_text, src_return)) {
-        goto cleanup;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_print_symbols,
-                                            "print-symbols",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_program_selfhost,
-                                            "obj",
-                                            "arm64-apple-darwin",
-                                            host_obj,
-                                            symbols_report) != 0) {
-        goto cleanup;
-    }
-    symbols_text = cheng_seed_read_file(symbols_report);
-    if (symbols_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools symbols", symbols_text, "cheng_symbols_v1") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "lowering_symbol_count=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "lowering_symbol[0]=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "primary_symbol_count=")) {
-        goto cleanup;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_print_line_map,
-                                            "print-line-map",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_return,
-                                            "obj",
-                                            "aarch64-unknown-linux-gnu",
-                                            linux_obj,
-                                            line_map_report) != 0) {
-        goto cleanup;
-    }
-    line_map_text = cheng_seed_read_file(line_map_report);
-    if (line_map_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools line-map", line_map_text, "cheng_line_map_v1") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools line-map", line_map_text, "entry_count=") ||
-        !cheng_seed_expect_text_contains("verify-debug-tools line-map", line_map_text, "entry\t")) {
-        goto cleanup;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_system_link_exec,
-                                            "system-link-exec",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_return,
-                                            "obj",
-                                            "aarch64-unknown-linux-gnu",
-                                            linux_obj,
-                                            NULL) != 0 ||
-        cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_system_link_exec,
-                                            "system-link-exec",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_return,
-                                            "obj",
-                                            "arm64-apple-darwin",
-                                            host_obj,
-                                            NULL) != 0 ||
-        cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_system_link_exec,
-                                            "system-link-exec",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_windows,
-                                            "exe",
-                                            "aarch64-pc-windows-msvc",
-                                            windows_exe,
-                                            NULL) != 0) {
-        goto cleanup;
-    }
-    argv_local[0] = "cheng_seed";
-    argv_local[1] = "print-object";
-    snprintf(object_flag, sizeof(object_flag), "--object:%s", linux_obj);
-    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", elf_report);
-    argv_local[2] = object_flag;
-    argv_local[3] = report_flag;
-    if (cheng_seed_cmd_print_object(4, argv_local) != 0) {
-        goto cleanup;
-    }
-    elf_text = cheng_seed_read_file(elf_report);
-    if (elf_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools elf", elf_text, "cheng_object_report_v1") ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools elf", elf_text, "format=elf64") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools elf", elf_text, "section_count=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools elf", elf_text, "symbol_count=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools elf", elf_text, "reloc_count=")) {
-        goto cleanup;
-    }
-    argv_local[1] = "print-elf";
-    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", elf_alias_report);
-    argv_local[3] = report_flag;
-    if (cheng_seed_cmd_print_elf(4, argv_local) != 0) {
-        goto cleanup;
-    }
-    elf_alias_text = cheng_seed_read_file(elf_alias_report);
-    if (elf_alias_text == NULL || strcmp(elf_text, elf_alias_text) != 0) {
-        fprintf(stderr, "[cheng_seed] verify-debug-tools print-elf alias drift\n");
-        goto cleanup;
-    }
-    argv_local[1] = "print-object";
-    snprintf(object_flag, sizeof(object_flag), "--object:%s", host_obj);
-    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", macho_report);
-    argv_local[2] = object_flag;
-    argv_local[3] = report_flag;
-    if (cheng_seed_cmd_print_object(4, argv_local) != 0) {
-        goto cleanup;
-    }
-    macho_text = cheng_seed_read_file(macho_report);
-    if (macho_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools macho", macho_text, "cheng_object_report_v1") ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools macho", macho_text, "format=macho64") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools macho", macho_text, "load_command_count=") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools macho", macho_text, "section_count=")) {
-        goto cleanup;
-    }
-    snprintf(object_flag, sizeof(object_flag), "--object:%s", windows_exe);
-    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", pe_report);
-    argv_local[2] = object_flag;
-    argv_local[3] = report_flag;
-    if (cheng_seed_cmd_print_object(4, argv_local) != 0) {
-        goto cleanup;
-    }
-    pe_text = cheng_seed_read_file(pe_report);
-    if (pe_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools pe", pe_text, "cheng_object_report_v1") ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools pe", pe_text, "format=pe/coff") ||
-        !cheng_seed_expect_text_has_prefix("verify-debug-tools pe", pe_text, "import_count=") ||
-        !cheng_seed_expect_text_contains("verify-debug-tools pe", pe_text, "UCRTBASE.dll!puts") ||
-        !cheng_seed_expect_text_contains("verify-debug-tools pe", pe_text, "KERNEL32.dll!ExitProcess")) {
-        goto cleanup;
-    }
-    if (cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_print_asm,
-                                            "print-asm",
-                                            paths.stage1_source,
-                                            paths.root,
-                                            src_call_chain,
-                                            "obj",
-                                            "arm64-apple-darwin",
-                                            asm_obj,
-                                            asm_report) != 0) {
-        goto cleanup;
-    }
-    asm_text = cheng_seed_read_file(asm_report);
-    asm_source_text = cheng_seed_read_file(asm_source_path);
-    asm_payload = cheng_seed_text_after_marker(asm_text, "asm_text_begin\n");
-    if (asm_text == NULL ||
-        asm_source_text == NULL ||
-        asm_payload == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools asm", asm_text, "cheng_asm_report_v1") ||
-        !cheng_seed_expect_text_has_line("verify-debug-tools asm", asm_text, "asm_text_begin") ||
-        !cheng_seed_expect_text_contains("verify-debug-tools asm", asm_payload, ".globl") ||
-        strcmp(asm_payload, asm_source_text) != 0) {
-        fprintf(stderr, "[cheng_seed] verify-debug-tools asm payload mismatch\n");
-        goto cleanup;
-    }
-    if (cheng_seed_cmd_verify_orphan_guard_impl(0, NULL) != 0) {
-        goto cleanup;
-    }
-    puts("cheng debug tools: ok");
-    rc = 0;
-cleanup:
-    free(debug_text);
-    free(symbols_text);
-    free(line_map_text);
-    free(elf_text);
-    free(elf_alias_text);
-    free(macho_text);
-    free(pe_text);
-    free(asm_text);
-    free(asm_source_text);
-    return rc;
-}
-
 static bool cheng_seed_verify_runtime_fixture_output(const char *label,
                                              const char *fixture_path,
                                              const char *run_log_path,
@@ -73184,334 +71911,6 @@ static int cheng_seed_cmd_verify_debug_runtime_impl(int argc, char **argv) {
         return 1;
     }
     puts("cheng debug runtime: ok");
-    return 0;
-}
-
-static int cheng_seed_cmd_verify_debug_profile_impl(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-    ChengSeedBootstrapPaths paths;
-    char out_dir[PATH_MAX];
-    char src[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char report[PATH_MAX];
-    char raw_report[PATH_MAX];
-    char direct_report[PATH_MAX];
-    char direct_log[PATH_MAX];
-    char compiler_bin[PATH_MAX];
-    char in_flag[PATH_MAX + 16];
-    char out_flag[PATH_MAX + 16];
-    char *report_argv[5];
-    char *raw_report_text = NULL;
-    char *report_text = NULL;
-    char *direct_report_text = NULL;
-    int status = 0;
-    int rc = 1;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (!cheng_seed_bootstrap_artifacts_ready(&paths) && cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/debug_profile_verify");
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/tests/ordinary_profile_hotspots_fixture.cheng");
-    cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_profile_hotspots_fixture");
-    cheng_seed_join_path(report, sizeof(report), out_dir, "profile.txt");
-    cheng_seed_join_path(direct_report, sizeof(direct_report), out_dir, "profile.direct.txt");
-    cheng_seed_profile_raw_report_path_from_report(report, raw_report, sizeof(raw_report));
-    snprintf(direct_log, sizeof(direct_log), "%s.profile-report.log", direct_report);
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    if (cheng_seed_invoke_profile_run(paths.stage1_source,
-                              paths.root,
-                              src,
-                              "arm64-apple-darwin",
-                              out_bin,
-                              "200",
-                              report) != 0) {
-        return 1;
-    }
-    report_text = cheng_seed_read_file(report);
-    if (report_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-profile", report_text, "cheng_profile_v1") ||
-        !cheng_seed_text_has_positive_integer_line(report_text, "total_samples=") ||
-        !cheng_seed_expect_text_contains("verify-debug-profile", report_text, "hot_function[0]=") ||
-        !cheng_seed_expect_text_contains("verify-debug-profile", report_text, "hot_function[1]=") ||
-        !cheng_seed_expect_text_contains("verify-debug-profile", report_text, "hot_") ||
-        !cheng_seed_expect_text_contains("verify-debug-profile", report_text, "ordinary_profile_hotspots_fixture.cheng") ||
-        !cheng_seed_expect_text_contains("verify-debug-profile", report_text, "hot_pc[0]=") ||
-        !cheng_seed_expect_text_contains("verify-debug-profile", report_text, "|0x")) {
-        goto cleanup;
-    }
-    raw_report_text = cheng_seed_read_file(raw_report);
-    if (raw_report_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-profile raw", raw_report_text, "cheng_profile_raw_v1") ||
-        !cheng_seed_text_has_positive_integer_line(raw_report_text, "total_samples=") ||
-        !cheng_seed_expect_text_contains("verify-debug-profile raw", raw_report_text, "sample\t0x")) {
-        goto cleanup;
-    }
-    if (!cheng_seed_profile_report_live_compiler_bin(&paths, compiler_bin, sizeof(compiler_bin))) {
-        fprintf(stderr, "[cheng_seed] verify-debug-profile missing live compiler\n");
-        goto cleanup;
-    }
-    snprintf(in_flag, sizeof(in_flag), "--in:%s", raw_report);
-    snprintf(out_flag, sizeof(out_flag), "--out:%s", direct_report);
-    report_argv[0] = compiler_bin;
-    report_argv[1] = "profile-report";
-    report_argv[2] = in_flag;
-    report_argv[3] = out_flag;
-    report_argv[4] = NULL;
-    if (!cheng_seed_run_binary_capture_output(report_argv, direct_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0) ||
-        !cheng_seed_expect_file_exists_nonempty("verify-debug-profile direct report", direct_report)) {
-        goto cleanup;
-    }
-    direct_report_text = cheng_seed_read_file(direct_report);
-    if (direct_report_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-profile direct", direct_report_text, "cheng_profile_v1") ||
-        strcmp(report_text, direct_report_text) != 0) {
-        fprintf(stderr, "[cheng_seed] verify-debug-profile direct report mismatch: %s\n", direct_report);
-        goto cleanup;
-    }
-    puts("cheng debug profile: ok");
-    rc = 0;
-cleanup:
-    free(direct_report_text);
-    free(raw_report_text);
-    free(report_text);
-    return rc;
-}
-
-static bool cheng_seed_verify_builtin_output_common(const char *label,
-                                            const char *out_path,
-                                            const char *report_path,
-                                            const char *expected_linker_program,
-                                            const char *expected_flavor) {
-    char *report_text = cheng_seed_read_file(report_path);
-    bool ok = true;
-    if (!cheng_seed_expect_file_exists_nonempty(label, out_path) || report_text == NULL) {
-        free(report_text);
-        return false;
-    }
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, expected_linker_program);
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, expected_flavor);
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, "native_link_input_count=0");
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, "native_link_missing_reasons=-");
-    free(report_text);
-    return ok;
-}
-
-static bool cheng_seed_build_builtin_fixture_current(const char *contract_path,
-                                             const char *root_path,
-                                             const char *src_path,
-                                             const char *target,
-                                             const char *out_path,
-                                             const char *report_path) {
-    return cheng_seed_invoke_command_with_common_flags(cheng_seed_cmd_system_link_exec,
-                                               "system-link-exec",
-                                               contract_path,
-                                               root_path,
-                                               src_path,
-                                               "exe",
-                                               target,
-                                               out_path,
-                                               report_path) == 0;
-}
-
-static int cheng_seed_cmd_verify_windows_builtin_impl(int argc, char **argv) {
-    static const char *RETURN_FIXTURES[] = {
-        "return_add", "return_call", "return_if_stmt", "return_while_sum",
-        "return_and_expr", "return_bitwise", "return_shift", "return_for_sum",
-        "return_while_break", "return_while_continue", "return_inline_if_and_ternary",
-        "return_call_mixed", "return_float32_arith_chain", "return_float32_roundtrip",
-        "return_float64_ops", "return_float_compare_cast", "return_float_mixed_int_cast",
-        "return_cast_i32",
-        "return_cast_i64"
-    };
-    ChengSeedBootstrapPaths paths;
-    char out_dir[PATH_MAX];
-    char hello_src[PATH_MAX];
-    char hello_out[PATH_MAX];
-    char hello_report[PATH_MAX];
-    char pe_report[PATH_MAX];
-    char object_flag[PATH_MAX + 16];
-    char report_flag[PATH_MAX + 24];
-    char *argv_local[4];
-    char *pe_text = NULL;
-    size_t i;
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (!cheng_seed_bootstrap_artifacts_ready(&paths) && cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/windows_builtin_verify");
-    cheng_seed_join_path(hello_src, sizeof(hello_src), paths.root, "tests/cheng/backend/fixtures/hello_importc_puts.cheng");
-    cheng_seed_join_path(hello_out, sizeof(hello_out), out_dir, "hello_importc_puts.exe");
-    cheng_seed_join_path(hello_report, sizeof(hello_report), out_dir, "hello_importc_puts.report");
-    cheng_seed_join_path(pe_report, sizeof(pe_report), out_dir, "object-pe.txt");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_build_builtin_fixture_current(paths.stage1_source,
-                                          paths.root,
-                                          hello_src,
-                                          "aarch64-pc-windows-msvc",
-                                          hello_out,
-                                          hello_report) ||
-        !cheng_seed_verify_builtin_output_common("verify-windows-builtin hello",
-                                         hello_out,
-                                         hello_report,
-                                         "native_linker_program=internal_pe_consteval_linker",
-                                         "native_linker_flavor=pe_aarch64_consteval_internal")) {
-        return 1;
-    }
-    argv_local[0] = "cheng_seed";
-    argv_local[1] = "print-object";
-    snprintf(object_flag, sizeof(object_flag), "--object:%s", hello_out);
-    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", pe_report);
-    argv_local[2] = object_flag;
-    argv_local[3] = report_flag;
-    if (cheng_seed_cmd_print_object(4, argv_local) != 0) {
-        return 1;
-    }
-    pe_text = cheng_seed_read_file(pe_report);
-    if (pe_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-windows-builtin", pe_text, "format=pe/coff") ||
-        !cheng_seed_expect_text_contains("verify-windows-builtin", pe_text, "UCRTBASE.dll!puts") ||
-        !cheng_seed_expect_text_contains("verify-windows-builtin", pe_text, "KERNEL32.dll!ExitProcess")) {
-        free(pe_text);
-        return 1;
-    }
-    free(pe_text);
-    for (i = 0U; i < sizeof(RETURN_FIXTURES) / sizeof(RETURN_FIXTURES[0]); ++i) {
-        char src[PATH_MAX];
-        char out_path[PATH_MAX];
-        char report_path[PATH_MAX];
-        cheng_seed_join_path(src, sizeof(src), paths.root, "tests/cheng/backend/fixtures");
-        cheng_seed_join_path(src, sizeof(src), src, RETURN_FIXTURES[i]);
-        strncat(src, ".cheng", sizeof(src) - strlen(src) - 1U);
-        cheng_seed_join_path(out_path, sizeof(out_path), out_dir, RETURN_FIXTURES[i]);
-        strncat(out_path, ".exe", sizeof(out_path) - strlen(out_path) - 1U);
-        cheng_seed_join_path(report_path, sizeof(report_path), out_dir, RETURN_FIXTURES[i]);
-        strncat(report_path, ".report", sizeof(report_path) - strlen(report_path) - 1U);
-        if (!cheng_seed_build_builtin_fixture_current(paths.stage1_source,
-                                              paths.root,
-                                              src,
-                                              "aarch64-pc-windows-msvc",
-                                              out_path,
-                                              report_path) ||
-            !cheng_seed_verify_builtin_output_common("verify-windows-builtin fixture",
-                                             out_path,
-                                             report_path,
-                                             "native_linker_program=internal_pe_consteval_linker",
-                                             "native_linker_flavor=pe_aarch64_consteval_internal")) {
-            return 1;
-        }
-    }
-    puts("verify_windows_builtin_linker ok");
-    return 0;
-}
-
-static int cheng_seed_cmd_verify_riscv64_builtin_impl(int argc, char **argv) {
-    static const char *RETURN_FIXTURES[] = {
-        "return_add", "return_call", "return_if_stmt", "return_while_sum",
-        "return_and_expr", "return_bitwise", "return_shift", "return_for_sum",
-        "return_while_break", "return_while_continue", "return_inline_if_and_ternary",
-        "return_call_mixed", "return_float32_arith_chain", "return_float32_roundtrip",
-        "return_float64_ops", "return_float_compare_cast", "return_float_mixed_int_cast",
-        "return_cast_i32",
-        "return_cast_i64"
-    };
-    ChengSeedBootstrapPaths paths;
-    char out_dir[PATH_MAX];
-    char hello_src[PATH_MAX];
-    char hello_out[PATH_MAX];
-    char hello_report[PATH_MAX];
-    char elf_report[PATH_MAX];
-    char object_flag[PATH_MAX + 16];
-    char report_flag[PATH_MAX + 24];
-    char *argv_local[4];
-    char *elf_text = NULL;
-    size_t i;
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (!cheng_seed_bootstrap_artifacts_ready(&paths) && cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/riscv64_builtin_verify");
-    cheng_seed_join_path(hello_src, sizeof(hello_src), paths.root, "tests/cheng/backend/fixtures/hello_puts.cheng");
-    cheng_seed_join_path(hello_out, sizeof(hello_out), out_dir, "hello_puts");
-    cheng_seed_join_path(hello_report, sizeof(hello_report), out_dir, "hello_puts.report");
-    cheng_seed_join_path(elf_report, sizeof(elf_report), out_dir, "object-elf.txt");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_build_builtin_fixture_current(paths.stage1_source,
-                                          paths.root,
-                                          hello_src,
-                                          "riscv64-unknown-linux-gnu",
-                                          hello_out,
-                                          hello_report) ||
-        !cheng_seed_verify_builtin_output_common("verify-riscv64-builtin hello",
-                                         hello_out,
-                                         hello_report,
-                                         "native_linker_program=internal_elf_consteval_linker",
-                                         "native_linker_flavor=elf_riscv64_consteval_internal")) {
-        return 1;
-    }
-    argv_local[0] = "cheng_seed";
-    argv_local[1] = "print-object";
-    snprintf(object_flag, sizeof(object_flag), "--object:%s", hello_out);
-    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", elf_report);
-    argv_local[2] = object_flag;
-    argv_local[3] = report_flag;
-    if (cheng_seed_cmd_print_object(4, argv_local) != 0) {
-        return 1;
-    }
-    elf_text = cheng_seed_read_file(elf_report);
-    if (elf_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-riscv64-builtin", elf_text, "format=elf64") ||
-        !cheng_seed_expect_text_has_line("verify-riscv64-builtin", elf_text, "elf_type=exec") ||
-        !cheng_seed_expect_text_contains("verify-riscv64-builtin", elf_text, "machine=243")) {
-        free(elf_text);
-        return 1;
-    }
-    free(elf_text);
-    for (i = 0U; i < sizeof(RETURN_FIXTURES) / sizeof(RETURN_FIXTURES[0]); ++i) {
-        char src[PATH_MAX];
-        char out_path[PATH_MAX];
-        char report_path[PATH_MAX];
-        cheng_seed_join_path(src, sizeof(src), paths.root, "tests/cheng/backend/fixtures");
-        cheng_seed_join_path(src, sizeof(src), src, RETURN_FIXTURES[i]);
-        strncat(src, ".cheng", sizeof(src) - strlen(src) - 1U);
-        cheng_seed_join_path(out_path, sizeof(out_path), out_dir, RETURN_FIXTURES[i]);
-        cheng_seed_join_path(report_path, sizeof(report_path), out_dir, RETURN_FIXTURES[i]);
-        strncat(report_path, ".report", sizeof(report_path) - strlen(report_path) - 1U);
-        if (!cheng_seed_build_builtin_fixture_current(paths.stage1_source,
-                                              paths.root,
-                                              src,
-                                              "riscv64-unknown-linux-gnu",
-                                              out_path,
-                                              report_path) ||
-            !cheng_seed_verify_builtin_output_common("verify-riscv64-builtin fixture",
-                                             out_path,
-                                             report_path,
-                                             "native_linker_program=internal_elf_consteval_linker",
-                                             "native_linker_flavor=elf_riscv64_consteval_internal")) {
-            return 1;
-        }
-    }
-    puts("verify_riscv64_builtin_linker ok");
-    return 0;
-}
-
-static int cheng_seed_cmd_run_cross_target_smokes_impl(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-    if (cheng_seed_cmd_verify_windows_builtin_impl(0, NULL) != 0) {
-        return 1;
-    }
-    if (cheng_seed_cmd_verify_riscv64_builtin_impl(0, NULL) != 0) {
-        return 1;
-    }
-    puts("run_windows_riscv_builtin_smokes ok");
     return 0;
 }
 
@@ -74143,7 +72542,12 @@ static int cheng_seed_cmd_run_production_regression_impl(int argc, char **argv) 
     if (rc != 0) {
         return rc;
     }
-    rc = cheng_seed_cmd_run_cross_target_smokes_impl(argc, argv);
+    surface_argv[0] = (char *)argv0;
+    surface_argv[1] = (char *)"run-cross-target-smokes";
+    rc = cheng_seed_run_backend_driver_cli_child(2,
+                                         surface_argv,
+                                         "run-production-regression cross target smokes",
+                                         "artifacts/backend_driver/run_production_regression.cross_target_smokes.log");
     if (rc != 0) {
         return rc;
     }
@@ -74466,7 +72870,7 @@ static bool cheng_seed_write_optional_report_text(const char *report_path,
     return cheng_seed_ensure_parent_dir(report_path) && cheng_seed_write_text_file(report_path, text);
 }
 
-static char *cheng_seed_report_with_header(const char *header,
+static char *CHENG_UNUSED cheng_seed_report_with_header(const char *header,
                                    const char *body) {
     size_t header_len = header != NULL ? strlen(header) : 0U;
     size_t body_len = body != NULL ? strlen(body) : 0U;
@@ -74608,7 +73012,7 @@ static bool cheng_seed_build_exec_context(const ChengSeedBootstrapContract *cont
     return true;
 }
 
-static char *cheng_seed_debug_symbols_report(const ChengSeedSystemLinkPlanStub *plan,
+static char *CHENG_UNUSED cheng_seed_debug_symbols_report(const ChengSeedSystemLinkPlanStub *plan,
                                      const ChengSeedCompilerWorldArtifacts *world,
                                      const ChengSeedLoweringPlanStub *lowering,
                                      const ChengSeedPrimaryObjectPlanStub *primary,
@@ -75348,13 +73752,6 @@ static char *cheng_seed_debug_asm_report(const ChengSeedSystemLinkPlanStub *plan
     return out;
 }
 
-static bool cheng_seed_run_profiled_binary(const char *path) {
-    const char *argv_local[2];
-    argv_local[0] = path;
-    argv_local[1] = NULL;
-    return cheng_seed_run_command_status_argv(1U, argv_local, false, "profiled-program");
-}
-
 typedef struct ChengSeedSeedDebugExecContext {
     ChengSeedBootstrapContract *contract;
     ChengSeedSystemLinkPlanStub *plan;
@@ -75434,110 +73831,6 @@ static bool cheng_seed_debug_exec_context_build(ChengSeedSeedDebugExecContext *c
     return true;
 }
 
-static int cheng_seed_cmd_debug_report(int argc, char **argv) {
-    ChengSeedSeedDebugExecContext ctx;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    char *report;
-    if (!cheng_seed_debug_exec_context_build(&ctx, argc, argv, false, true, true)) {
-        return 1;
-    }
-    report = cheng_seed_system_link_exec_report(ctx.contract,
-                                        ctx.plan,
-                                        ctx.world,
-                                        ctx.lowering,
-                                        ctx.primary,
-                                        ctx.object_plan,
-                                        ctx.native_link);
-    {
-        char *wrapped = cheng_seed_report_with_header("cheng_debug_report_v1", report);
-        free(report);
-        report = wrapped;
-    }
-    if (!cheng_seed_write_optional_report_text(report_path, report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        free(report);
-        cheng_seed_debug_exec_context_release(&ctx);
-        return 1;
-    }
-    fputs(report, stdout);
-    free(report);
-    cheng_seed_debug_exec_context_release(&ctx);
-    return 0;
-}
-
-static int cheng_seed_cmd_print_symbols(int argc, char **argv) {
-    ChengSeedSeedDebugExecContext ctx;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    char *report;
-    if (!cheng_seed_debug_exec_context_build(&ctx, argc, argv, false, false, false)) {
-        return 1;
-    }
-    report = cheng_seed_debug_symbols_report(ctx.plan,
-                                     ctx.world,
-                                     ctx.lowering,
-                                     ctx.primary,
-                                     ctx.object_plan,
-                                     ctx.native_link);
-    if (!cheng_seed_write_optional_report_text(report_path, report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        free(report);
-        cheng_seed_debug_exec_context_release(&ctx);
-        return 1;
-    }
-    fputs(report, stdout);
-    free(report);
-    cheng_seed_debug_exec_context_release(&ctx);
-    return 0;
-}
-
-static int cheng_seed_cmd_print_line_map(int argc, char **argv) {
-    ChengSeedSeedDebugExecContext ctx;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    char *report;
-    if (!cheng_seed_debug_exec_context_build(&ctx, argc, argv, false, false, false)) {
-        return 1;
-    }
-    report = cheng_seed_build_line_map_text(ctx.plan, ctx.lowering);
-    if (!cheng_seed_write_optional_report_text(report_path, report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        free(report);
-        cheng_seed_debug_exec_context_release(&ctx);
-        return 1;
-    }
-    fputs(report, stdout);
-    free(report);
-    cheng_seed_debug_exec_context_release(&ctx);
-    return 0;
-}
-
-static int cheng_seed_cmd_print_object(int argc, char **argv);
-
-static int cheng_seed_cmd_print_elf(int argc, char **argv) {
-    return cheng_seed_cmd_print_object(argc, argv);
-}
-
-static int cheng_seed_cmd_print_object(int argc, char **argv) {
-    const char *object_path = cheng_seed_flag_value(argc, argv, "--object");
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    char *report;
-    if (!object_path || *object_path == '\0') {
-        fprintf(stderr, "[cheng_seed] missing --object:<path>\n");
-        return 1;
-    }
-    report = cheng_seed_debug_object_report(object_path);
-    if (!report) {
-        return 1;
-    }
-    if (!cheng_seed_write_optional_report_text(report_path, report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        free(report);
-        return 1;
-    }
-    fputs(report, stdout);
-    free(report);
-    return 0;
-}
-
 static int cheng_seed_cmd_print_asm(int argc, char **argv) {
     ChengSeedSeedDebugExecContext ctx;
     const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
@@ -75565,199 +73858,6 @@ static int cheng_seed_cmd_print_asm(int argc, char **argv) {
     free(report);
     cheng_seed_debug_exec_context_release(&ctx);
     return 0;
-}
-
-static int cheng_seed_cmd_profile_run(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    const char *source_path = cheng_seed_flag_value(argc, argv, "--in");
-    const char *root_path = cheng_seed_flag_value(argc, argv, "--root");
-    const char *out_flag = cheng_seed_flag_value(argc, argv, "--out");
-    const char *report_flag = cheng_seed_flag_value(argc, argv, "--report-out");
-    const char *profile_hz = cheng_seed_flag_value(argc, argv, "--profile-hz");
-    const char *target = cheng_seed_flag_value(argc, argv, "--target");
-    const char *emit = cheng_seed_flag_value(argc, argv, "--emit");
-    char workspace_root[PATH_MAX];
-    char package_root[PATH_MAX];
-    char package_probe[PATH_MAX];
-    char output_path[PATH_MAX];
-    char report_path[PATH_MAX];
-    char raw_report_path[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char profile_report_log[PATH_MAX];
-    const char *slash;
-    const char *base;
-    size_t stem_len;
-    char *report = NULL;
-    int rc = 1;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (!source_path || *source_path == '\0') {
-        fprintf(stderr, "[cheng_seed] profile-run requires --in:<path>\n");
-        return 1;
-    }
-    if (!target || *target == '\0') {
-        target = "arm64-apple-darwin";
-    }
-    if (!cheng_seed_streq(target, "arm64-apple-darwin")) {
-        fprintf(stderr, "[cheng_seed] profile-run currently requires local runnable target arm64-apple-darwin\n");
-        return 1;
-    }
-    if (emit && *emit != '\0' && !cheng_seed_streq(emit, "exe")) {
-        fprintf(stderr, "[cheng_seed] profile-run requires --emit:exe\n");
-        return 1;
-    }
-    if (root_path && *root_path != '\0') {
-        cheng_seed_copy_text(workspace_root, sizeof(workspace_root), root_path);
-    } else if (paths.root[0] != '\0') {
-        cheng_seed_copy_text(workspace_root, sizeof(workspace_root), paths.root);
-    } else if (!getcwd(workspace_root, sizeof(workspace_root))) {
-        perror("getcwd");
-        return 1;
-    }
-    cheng_seed_copy_text(package_root, sizeof(package_root), workspace_root);
-    cheng_seed_join_path(package_probe, sizeof(package_probe), workspace_root, "src");
-    (void)package_probe;
-    if (out_flag && *out_flag != '\0') {
-        cheng_seed_copy_text(output_path, sizeof(output_path), out_flag);
-    } else {
-        slash = strrchr(source_path, '/');
-        base = slash ? slash + 1 : source_path;
-        stem_len = strlen(base);
-        if (stem_len >= 6U && strcmp(base + stem_len - 6U, ".cheng") == 0) {
-            stem_len -= 6U;
-        }
-        if (stem_len == 0U) {
-            base = "profile_run";
-            stem_len = strlen(base);
-        }
-        cheng_seed_join_path(output_path, sizeof(output_path), workspace_root, "artifacts/debug_profile");
-        strncat(output_path, "/", sizeof(output_path) - strlen(output_path) - 1U);
-        strncat(output_path, base, stem_len);
-        output_path[strlen(output_path)] = '\0';
-    }
-    if (report_flag && *report_flag != '\0') {
-        cheng_seed_copy_text(report_path, sizeof(report_path), report_flag);
-    } else {
-        snprintf(report_path, sizeof(report_path), "%s.profile.txt", output_path);
-    }
-    cheng_seed_profile_raw_report_path_from_report(report_path, raw_report_path, sizeof(raw_report_path));
-    snprintf(compile_log, sizeof(compile_log), "%s.compile.log", output_path);
-    snprintf(profile_report_log, sizeof(profile_report_log), "%s.profile-report.log", output_path);
-    if (!cheng_seed_ensure_parent_dir(output_path) ||
-        !cheng_seed_ensure_parent_dir(report_path) ||
-        !cheng_seed_ensure_parent_dir(raw_report_path)) {
-        return 1;
-    }
-    if (!cheng_seed_ensure_backend_driver_ready(&paths, "profile-run")) {
-        return 1;
-    }
-    if (!cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out,
-                                                     package_root,
-                                                     source_path,
-                                                     output_path,
-                                                     compile_log)) {
-        return 1;
-    }
-    setenv("CHENG_PROFILE_ENABLE", "1", 1);
-    unsetenv("CHENG_PROFILE_OUT");
-    setenv("CHENG_PROFILE_RAW_OUT", raw_report_path, 1);
-    setenv("CHENG_PROFILE_HZ", (profile_hz && *profile_hz != '\0') ? profile_hz : "200", 1);
-    if (!cheng_seed_run_profiled_binary(output_path)) {
-        goto cleanup;
-    }
-    unsetenv("CHENG_PROFILE_ENABLE");
-    unsetenv("CHENG_PROFILE_RAW_OUT");
-    unsetenv("CHENG_PROFILE_OUT");
-    unsetenv("CHENG_PROFILE_HZ");
-    if (!cheng_seed_path_exists_nonempty(raw_report_path)) {
-        fprintf(stderr, "[cheng_seed] missing raw profile report: %s\n", raw_report_path);
-        goto cleanup;
-    }
-    if (!cheng_seed_profile_report_transform_raw(raw_report_path,
-                                         report_path,
-                                         profile_report_log)) {
-        fprintf(stderr, "[cheng_seed] profile report transform failed: %s\n", profile_report_log);
-        goto cleanup;
-    }
-    report = cheng_seed_read_file(report_path);
-    if (!report) {
-        fprintf(stderr, "[cheng_seed] missing profile report: %s\n", report_path);
-        goto cleanup;
-    }
-    fputs(report, stdout);
-    rc = 0;
-cleanup:
-    free(report);
-    return rc;
-}
-
-static int cheng_seed_cmd_profile_report(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    const char *raw_report_path = cheng_seed_flag_value(argc, argv, "--in");
-    const char *out_flag = cheng_seed_flag_value(argc, argv, "--out");
-    char report_path[PATH_MAX];
-    char profile_report_log[PATH_MAX];
-    char *report = NULL;
-    int rc = 1;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (raw_report_path == NULL || raw_report_path[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] profile-report requires --in:<raw-report>\n");
-        return 1;
-    }
-    if (out_flag != NULL && out_flag[0] != '\0') {
-        cheng_seed_copy_text(report_path, sizeof(report_path), out_flag);
-    } else {
-        cheng_seed_profile_report_path_from_raw(raw_report_path, report_path, sizeof(report_path));
-    }
-    snprintf(profile_report_log, sizeof(profile_report_log), "%s.profile-report.log", report_path);
-    if (!cheng_seed_profile_report_transform_raw(raw_report_path,
-                                         report_path,
-                                         profile_report_log)) {
-        fprintf(stderr, "[cheng_seed] profile report transform failed: %s\n", profile_report_log);
-        return 1;
-    }
-    report = cheng_seed_read_file(report_path);
-    if (report == NULL) {
-        fprintf(stderr, "[cheng_seed] missing profile report: %s\n", report_path);
-        return 1;
-    }
-    fputs(report, stdout);
-    rc = 0;
-    free(report);
-    return rc;
-}
-
-static int cheng_seed_cmd_crash_report(int argc, char **argv) {
-    const char *raw_log_path = cheng_seed_flag_value(argc, argv, "--in");
-    const char *out_flag = cheng_seed_flag_value(argc, argv, "--out");
-    char report_path[PATH_MAX];
-    char crash_report_log[PATH_MAX];
-    char *report = NULL;
-    int rc = 1;
-    if (raw_log_path == NULL || raw_log_path[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] crash-report requires --in:<raw-log>\n");
-        return 1;
-    }
-    if (out_flag != NULL && out_flag[0] != '\0') {
-        cheng_seed_copy_text(report_path, sizeof(report_path), out_flag);
-    } else {
-        cheng_seed_crash_report_path_from_raw(raw_log_path, report_path, sizeof(report_path));
-    }
-    snprintf(crash_report_log, sizeof(crash_report_log), "%s.crash-report.log", report_path);
-    if (!cheng_seed_crash_report_transform_raw(raw_log_path,
-                                       report_path,
-                                       crash_report_log)) {
-        fprintf(stderr, "[cheng_seed] crash report transform failed: %s\n", crash_report_log);
-        return 1;
-    }
-    report = cheng_seed_read_file(report_path);
-    if (report == NULL) {
-        fprintf(stderr, "[cheng_seed] missing crash report: %s\n", report_path);
-        return 1;
-    }
-    fputs(report, stdout);
-    rc = 0;
-    free(report);
-    return rc;
 }
 
 static int cheng_seed_cmd_emit_csg(int argc, char **argv) {
@@ -76982,18 +75082,6 @@ int main(int argc, char **argv) {
     if (cheng_seed_streq(argv[1], "self-check")) {
         return cheng_seed_cmd_self_check(argc, argv);
     }
-    if (cheng_seed_streq(argv[1], "status")) {
-        return cheng_seed_cmd_status(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "print-build-plan")) {
-        return cheng_seed_cmd_print_build_plan(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "scan-hotpath")) {
-        return cheng_seed_cmd_scan_hotpath(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "print-bootstrap")) {
-        return cheng_seed_cmd_print_bootstrap(argc, argv);
-    }
     if (cheng_seed_streq(argv[1], "bootstrap-bridge")) {
         return cheng_seed_cmd_bootstrap_bridge(argc, argv);
     }
@@ -77011,41 +75099,14 @@ int main(int argc, char **argv) {
             return passthrough_rc;
         }
     }
-    if (cheng_seed_streq(argv[1], "run-smokes")) {
-        return cheng_seed_cmd_run_smokes(argc, argv);
-    }
     if (cheng_seed_streq(argv[1], "run-production-regression")) {
         return cheng_seed_cmd_run_production_regression_impl(argc, argv);
     }
     if (cheng_seed_streq(argv[1], "slice-gate")) {
         return cheng_seed_cmd_slice_gate(argc, argv);
     }
-    if (cheng_seed_streq(argv[1], "debug-report")) {
-        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_debug_report, argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "print-symbols")) {
-        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_symbols, argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "print-line-map")) {
-        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_line_map, argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "print-object")) {
-        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_object, argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "print-elf")) {
-        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_elf, argc, argv);
-    }
     if (cheng_seed_streq(argv[1], "print-asm")) {
         return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_asm, argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "profile-run")) {
-        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_profile_run, argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "profile-report")) {
-        return cheng_seed_cmd_profile_report(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "crash-report")) {
-        return cheng_seed_cmd_crash_report(argc, argv);
     }
     if (cheng_seed_streq(argv[1], "verify-orphan-guard")) {
         return cheng_seed_cmd_verify_orphan_guard_impl(argc, argv);
@@ -77065,20 +75126,8 @@ int main(int argc, char **argv) {
     if (cheng_seed_streq(argv[1], "verify-debug-runtime")) {
         return cheng_seed_cmd_verify_debug_runtime_impl(argc, argv);
     }
-    if (cheng_seed_streq(argv[1], "verify-debug-profile")) {
-        return cheng_seed_cmd_verify_debug_profile_impl(argc, argv);
-    }
     if (cheng_seed_streq(argv[1], "verify-diloco")) {
         return cheng_seed_cmd_verify_diloco_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-windows-builtin")) {
-        return cheng_seed_cmd_verify_windows_builtin_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-riscv64-builtin")) {
-        return cheng_seed_cmd_verify_riscv64_builtin_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-cross-target-smokes")) {
-        return cheng_seed_cmd_run_cross_target_smokes_impl(argc, argv);
     }
     if (cheng_seed_streq(argv[1], "run-host-smokes")) {
         return cheng_seed_cmd_run_host_smokes_impl(argc, argv);

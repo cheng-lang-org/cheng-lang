@@ -26,6 +26,48 @@ type
         firstFileDataID: int32
         fileDataIDs: int32[]
 
+    WdtMaidResourceSummary =
+        formatKind: str
+        firstMagic: str
+        secondMagic: str
+        version: int32
+
+    WdtMaidAdtSplitSummary =
+        version: int32
+        chunkCount: int32
+        firstDataMagic: str
+        mapChunkCount: int32
+        doodadPlacementCount: int32
+        firstDoodadNameID: int32
+        firstDoodadUniqueID: int32
+        doodadPlacementFileDataIDCount: int32
+        firstDoodadPlacementFileDataID: int32
+        doodadPlacementFileDataIDs: int32[]
+        doodadPlacementPositionBoundsReady: bool
+        minDoodadPlacementX1000: int32
+        minDoodadPlacementY1000: int32
+        minDoodadPlacementZ1000: int32
+        maxDoodadPlacementX1000: int32
+        maxDoodadPlacementY1000: int32
+        maxDoodadPlacementZ1000: int32
+        minDoodadScale: int32
+        maxDoodadScale: int32
+        worldModelPlacementCount: int32
+        firstWorldModelNameID: int32
+        firstWorldModelUniqueID: int32
+        worldModelPlacementFileDataIDCount: int32
+        firstWorldModelPlacementFileDataID: int32
+        worldModelPlacementFileDataIDs: int32[]
+        worldModelPlacementPositionBoundsReady: bool
+        minWorldModelPlacementX1000: int32
+        minWorldModelPlacementY1000: int32
+        minWorldModelPlacementZ1000: int32
+        maxWorldModelPlacementX1000: int32
+        maxWorldModelPlacementY1000: int32
+        maxWorldModelPlacementZ1000: int32
+        minWorldModelScale: int32
+        maxWorldModelScale: int32
+
     WmoRootSummary =
         header: FormatHeader
         materialCount: int32
@@ -116,6 +158,8 @@ const
     adtMcnkBaseZOffset = 112
     adtHeightSamplesPerChunk = 145
     adtMcvTByteCount = 580
+    adtMddfStride = 36
+    adtModfStride = 64
     wmoDoodadSetStride = 32
     wmoDoodadPlacementStride = 40
 
@@ -218,6 +262,15 @@ fn m2F32Scaled1000At(buf: bytes.ByteBuffer, idx: int32): int32 =
         scaled = int64(0) - scaled
     return m2ClampI64ToI32(scaled)
 
+fn finiteF32Scaled1000At(buf: bytes.ByteBuffer, idx: int32, label: str): Result[int32] =
+    if idx < 0 || idx + 4 > buf.len:
+        return Err[int32]("wowExport " + label + ": f32 out of bounds")
+    let bits: int32 = bytes.ReadU32LEAt(buf, idx)
+    let exponentRaw: int32 = (bits >> 23) & 255
+    if exponentRaw == 255:
+        return Err[int32]("wowExport " + label + ": non-finite f32")
+    return Ok[int32](m2F32Scaled1000At(buf, idx))
+
 fn ParseM2GeometrySummary(buf: bytes.ByteBuffer): Result[M2GeometrySummary] =
     let headerRes: Result[M2Header] = ParseM2Header(buf)
     if IsErr(headerRes):
@@ -309,6 +362,232 @@ fn ParseChunkedHeader(buf: bytes.ByteBuffer, label: str): Result[FormatHeader] =
     out.versionOrSize = firstSize
     out.chunkCount = count
     return Ok[FormatHeader](out)
+
+fn ParseWdtMaidResourceSummary(buf: bytes.ByteBuffer): Result[WdtMaidResourceSummary] =
+    if buf.len < 8:
+        return Err[WdtMaidResourceSummary]("wowExport WDT MAID resource: header too small")
+    if m2HasMagic(buf, 0, int32('R'), int32('E'), int32('V'), int32('M')):
+        if buf.len < 12:
+            return Err[WdtMaidResourceSummary]("wowExport WDT MAID split: MVER chunk too small")
+        let mverSize: int32 = bytes.ReadU32LEAt(buf, 4)
+        let version: int32 = bytes.ReadU32LEAt(buf, 8)
+        if mverSize != 4:
+            return Err[WdtMaidResourceSummary]("wowExport WDT MAID split: invalid MVER size")
+        if version != 18:
+            return Err[WdtMaidResourceSummary]("wowExport WDT MAID split: invalid MVER version")
+        var out: WdtMaidResourceSummary
+        out.formatKind = "adt_split"
+        out.firstMagic = "REVM"
+        out.version = version
+        if buf.len >= 16:
+            let secondRes: Result[str] = formatFourCCTextAt(buf, 12)
+            if IsErr(secondRes):
+                return Err[WdtMaidResourceSummary](Error(secondRes))
+            out.secondMagic = Value(secondRes)
+        return Ok[WdtMaidResourceSummary](out)
+    if m2HasMagic(buf, 0, int32('B'), int32('L'), int32('P'), int32('2')):
+        let version: int32 = bytes.ReadU32LEAt(buf, 4)
+        if version <= 0:
+            return Err[WdtMaidResourceSummary]("wowExport WDT MAID BLP: invalid version")
+        var out: WdtMaidResourceSummary
+        out.formatKind = "blp"
+        out.firstMagic = "BLP2"
+        out.version = version
+        return Ok[WdtMaidResourceSummary](out)
+    return Err[WdtMaidResourceSummary]("wowExport WDT MAID resource: unsupported magic")
+
+fn wdtMaidApplyDoodadPlacementRecord(out: var WdtMaidAdtSplitSummary,
+                                     buf: bytes.ByteBuffer,
+                                     rec: int32): Result[bool] =
+    if rec < 0 || rec + adtMddfStride > buf.len:
+        return Err[bool]("wowExport WDT MAID split: MDDF record out of bounds")
+    let nameID: int32 = bytes.ReadU32LEAt(buf, rec)
+    let uniqueID: int32 = bytes.ReadU32LEAt(buf, rec + 4)
+    let xRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 8, "WDT MAID MDDF x")
+    let yRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 12, "WDT MAID MDDF y")
+    let zRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 16, "WDT MAID MDDF z")
+    let rxRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 20, "WDT MAID MDDF rotation x")
+    let ryRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 24, "WDT MAID MDDF rotation y")
+    let rzRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 28, "WDT MAID MDDF rotation z")
+    if IsErr(xRes): return Err[bool](Error(xRes))
+    if IsErr(yRes): return Err[bool](Error(yRes))
+    if IsErr(zRes): return Err[bool](Error(zRes))
+    if IsErr(rxRes): return Err[bool](Error(rxRes))
+    if IsErr(ryRes): return Err[bool](Error(ryRes))
+    if IsErr(rzRes): return Err[bool](Error(rzRes))
+    let scale: int32 = bytes.ReadU16LEAt(buf, rec + 32)
+    if scale <= 0:
+        return Err[bool]("wowExport WDT MAID split: MDDF scale is not positive")
+    let x: int32 = Value(xRes)
+    let y: int32 = Value(yRes)
+    let z: int32 = Value(zRes)
+    if out.doodadPlacementCount == 0:
+        out.firstDoodadNameID = nameID
+        out.firstDoodadUniqueID = uniqueID
+        out.doodadPlacementPositionBoundsReady = true
+        out.minDoodadPlacementX1000 = x
+        out.maxDoodadPlacementX1000 = x
+        out.minDoodadPlacementY1000 = y
+        out.maxDoodadPlacementY1000 = y
+        out.minDoodadPlacementZ1000 = z
+        out.maxDoodadPlacementZ1000 = z
+        out.minDoodadScale = scale
+        out.maxDoodadScale = scale
+    else:
+        if x < out.minDoodadPlacementX1000: out.minDoodadPlacementX1000 = x
+        if x > out.maxDoodadPlacementX1000: out.maxDoodadPlacementX1000 = x
+        if y < out.minDoodadPlacementY1000: out.minDoodadPlacementY1000 = y
+        if y > out.maxDoodadPlacementY1000: out.maxDoodadPlacementY1000 = y
+        if z < out.minDoodadPlacementZ1000: out.minDoodadPlacementZ1000 = z
+        if z > out.maxDoodadPlacementZ1000: out.maxDoodadPlacementZ1000 = z
+        if scale < out.minDoodadScale: out.minDoodadScale = scale
+        if scale > out.maxDoodadScale: out.maxDoodadScale = scale
+    if !int32ListContains(out.doodadPlacementFileDataIDs, nameID):
+        add(out.doodadPlacementFileDataIDs, nameID)
+        if out.doodadPlacementFileDataIDs.len == 1:
+            out.firstDoodadPlacementFileDataID = nameID
+        out.doodadPlacementFileDataIDCount = out.doodadPlacementFileDataIDs.len
+    out.doodadPlacementCount = out.doodadPlacementCount + 1
+    return Ok[bool](true)
+
+fn wdtMaidApplyWorldModelPlacementRecord(out: var WdtMaidAdtSplitSummary,
+                                         buf: bytes.ByteBuffer,
+                                         rec: int32): Result[bool] =
+    if rec < 0 || rec + adtModfStride > buf.len:
+        return Err[bool]("wowExport WDT MAID split: MODF record out of bounds")
+    let nameID: int32 = bytes.ReadU32LEAt(buf, rec)
+    let uniqueID: int32 = bytes.ReadU32LEAt(buf, rec + 4)
+    let xRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 8, "WDT MAID MODF x")
+    let yRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 12, "WDT MAID MODF y")
+    let zRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 16, "WDT MAID MODF z")
+    let rxRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 20, "WDT MAID MODF rotation x")
+    let ryRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 24, "WDT MAID MODF rotation y")
+    let rzRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 28, "WDT MAID MODF rotation z")
+    let minXRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 32, "WDT MAID MODF min x")
+    let minYRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 36, "WDT MAID MODF min y")
+    let minZRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 40, "WDT MAID MODF min z")
+    let maxXRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 44, "WDT MAID MODF max x")
+    let maxYRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 48, "WDT MAID MODF max y")
+    let maxZRes: Result[int32] = finiteF32Scaled1000At(buf, rec + 52, "WDT MAID MODF max z")
+    if IsErr(xRes): return Err[bool](Error(xRes))
+    if IsErr(yRes): return Err[bool](Error(yRes))
+    if IsErr(zRes): return Err[bool](Error(zRes))
+    if IsErr(rxRes): return Err[bool](Error(rxRes))
+    if IsErr(ryRes): return Err[bool](Error(ryRes))
+    if IsErr(rzRes): return Err[bool](Error(rzRes))
+    if IsErr(minXRes): return Err[bool](Error(minXRes))
+    if IsErr(minYRes): return Err[bool](Error(minYRes))
+    if IsErr(minZRes): return Err[bool](Error(minZRes))
+    if IsErr(maxXRes): return Err[bool](Error(maxXRes))
+    if IsErr(maxYRes): return Err[bool](Error(maxYRes))
+    if IsErr(maxZRes): return Err[bool](Error(maxZRes))
+    let scale: int32 = bytes.ReadU16LEAt(buf, rec + 62)
+    if scale <= 0:
+        return Err[bool]("wowExport WDT MAID split: MODF scale is not positive")
+    let x: int32 = Value(xRes)
+    let y: int32 = Value(yRes)
+    let z: int32 = Value(zRes)
+    if out.worldModelPlacementCount == 0:
+        out.firstWorldModelNameID = nameID
+        out.firstWorldModelUniqueID = uniqueID
+        out.worldModelPlacementPositionBoundsReady = true
+        out.minWorldModelPlacementX1000 = x
+        out.maxWorldModelPlacementX1000 = x
+        out.minWorldModelPlacementY1000 = y
+        out.maxWorldModelPlacementY1000 = y
+        out.minWorldModelPlacementZ1000 = z
+        out.maxWorldModelPlacementZ1000 = z
+        out.minWorldModelScale = scale
+        out.maxWorldModelScale = scale
+    else:
+        if x < out.minWorldModelPlacementX1000: out.minWorldModelPlacementX1000 = x
+        if x > out.maxWorldModelPlacementX1000: out.maxWorldModelPlacementX1000 = x
+        if y < out.minWorldModelPlacementY1000: out.minWorldModelPlacementY1000 = y
+        if y > out.maxWorldModelPlacementY1000: out.maxWorldModelPlacementY1000 = y
+        if z < out.minWorldModelPlacementZ1000: out.minWorldModelPlacementZ1000 = z
+        if z > out.maxWorldModelPlacementZ1000: out.maxWorldModelPlacementZ1000 = z
+        if scale < out.minWorldModelScale: out.minWorldModelScale = scale
+        if scale > out.maxWorldModelScale: out.maxWorldModelScale = scale
+    if !int32ListContains(out.worldModelPlacementFileDataIDs, nameID):
+        add(out.worldModelPlacementFileDataIDs, nameID)
+        if out.worldModelPlacementFileDataIDs.len == 1:
+            out.firstWorldModelPlacementFileDataID = nameID
+        out.worldModelPlacementFileDataIDCount = out.worldModelPlacementFileDataIDs.len
+    out.worldModelPlacementCount = out.worldModelPlacementCount + 1
+    return Ok[bool](true)
+
+fn ParseWdtMaidAdtSplitSummary(buf: bytes.ByteBuffer): Result[WdtMaidAdtSplitSummary] =
+    let resourceRes: Result[WdtMaidResourceSummary] = ParseWdtMaidResourceSummary(buf)
+    if IsErr(resourceRes):
+        return Err[WdtMaidAdtSplitSummary](Error(resourceRes))
+    let resource: WdtMaidResourceSummary = Value(resourceRes)
+    if resource.formatKind != "adt_split":
+        return Err[WdtMaidAdtSplitSummary]("wowExport WDT MAID split: resource is not ADT split")
+    var out: WdtMaidAdtSplitSummary
+    out.version = resource.version
+    var pos: int32
+    while pos < buf.len:
+        if pos + 8 > buf.len:
+            return Err[WdtMaidAdtSplitSummary]("wowExport WDT MAID split: truncated chunk header")
+        let magicRes: Result[str] = formatFourCCTextAt(buf, pos)
+        if IsErr(magicRes):
+            return Err[WdtMaidAdtSplitSummary](Error(magicRes))
+        let magic: str = Value(magicRes)
+        let size: int32 = bytes.ReadU32LEAt(buf, pos + 4)
+        let dataPos: int32 = pos + 8
+        if size < 0 || dataPos + size > buf.len:
+            return Err[WdtMaidAdtSplitSummary]("wowExport WDT MAID split: chunk out of bounds")
+        out.chunkCount = out.chunkCount + 1
+        if pos == 0:
+            if magic != "REVM" || size != 4 || bytes.ReadU32LEAt(buf, dataPos) != 18:
+                return Err[WdtMaidAdtSplitSummary]("wowExport WDT MAID split: invalid MVER chunk")
+        else:
+            if strings.Len(out.firstDataMagic) == 0:
+                out.firstDataMagic = magic
+            if magic == "KNCM":
+                out.mapChunkCount = out.mapChunkCount + 1
+            elif magic == "FDDM":
+                if (size % adtMddfStride) != 0:
+                    return Err[WdtMaidAdtSplitSummary]("wowExport WDT MAID split: MDDF chunk size invalid")
+                var i: int32
+                while i < size / adtMddfStride:
+                    let applyRes: Result[bool] =
+                        wdtMaidApplyDoodadPlacementRecord(out, buf, dataPos + i * adtMddfStride)
+                    if IsErr(applyRes):
+                        return Err[WdtMaidAdtSplitSummary](Error(applyRes))
+                    i = i + 1
+            elif magic == "FDOM":
+                if (size % adtModfStride) != 0:
+                    return Err[WdtMaidAdtSplitSummary]("wowExport WDT MAID split: MODF chunk size invalid")
+                var i: int32
+                while i < size / adtModfStride:
+                    let applyRes: Result[bool] =
+                        wdtMaidApplyWorldModelPlacementRecord(out, buf, dataPos + i * adtModfStride)
+                    if IsErr(applyRes):
+                        return Err[WdtMaidAdtSplitSummary](Error(applyRes))
+                    i = i + 1
+        pos = dataPos + size
+    if strings.Len(out.firstDataMagic) == 0:
+        return Err[WdtMaidAdtSplitSummary]("wowExport WDT MAID split: data chunks missing")
+    return Ok[WdtMaidAdtSplitSummary](out)
+
+fn WdtMaidDoodadPlacementSpanX1000(summary: WdtMaidAdtSplitSummary): int32 =
+    return summary.maxDoodadPlacementX1000 - summary.minDoodadPlacementX1000
+
+fn WdtMaidDoodadPlacementSpanY1000(summary: WdtMaidAdtSplitSummary): int32 =
+    return summary.maxDoodadPlacementY1000 - summary.minDoodadPlacementY1000
+
+fn WdtMaidDoodadPlacementSpanZ1000(summary: WdtMaidAdtSplitSummary): int32 =
+    return summary.maxDoodadPlacementZ1000 - summary.minDoodadPlacementZ1000
+
+fn WdtMaidWorldModelPlacementSpanX1000(summary: WdtMaidAdtSplitSummary): int32 =
+    return summary.maxWorldModelPlacementX1000 - summary.minWorldModelPlacementX1000
+
+fn WdtMaidWorldModelPlacementSpanY1000(summary: WdtMaidAdtSplitSummary): int32 =
+    return summary.maxWorldModelPlacementY1000 - summary.minWorldModelPlacementY1000
+
+fn WdtMaidWorldModelPlacementSpanZ1000(summary: WdtMaidAdtSplitSummary): int32 =
+    return summary.maxWorldModelPlacementZ1000 - summary.minWorldModelPlacementZ1000
 
 fn ParseWdtSummary(buf: bytes.ByteBuffer): Result[WdtSummary] =
     let headerRes: Result[FormatHeader] = ParseChunkedHeader(buf, "WDT")

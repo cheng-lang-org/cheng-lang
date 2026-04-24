@@ -1,0 +1,574 @@
+import std/os
+import std/result
+import std/strings
+import std/strformat
+import std/strutils as strutil
+import std/bytes as rawbytes
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+const
+    SeedCrossWindowsTarget = "aarch64-pc-windows-msvc"
+    SeedCrossRiscv64Target = "riscv64-unknown-linux-gnu"
+
+type
+    SeedPeHeaders =
+        isPe: bool
+        headerOff: int32
+        optionalOff: int32
+        optionalSize: int32
+        optionalMagic: int32
+        sectionTableOff: int32
+        sectionCount: int32
+        machine: int32
+        characteristics: int32
+        subsystem: int32
+
+fn SeedCrossPrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn SeedCrossPrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn SeedCrossCompileEnv(): str[] =
+    var out: str[]
+    add(out, "BACKEND_INCREMENTAL=0")
+    add(out, "BACKEND_MULTI_MODULE_CACHE=0")
+    add(out, "CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0")
+    add(out, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
+    add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
+    add(out, "CHENG_PROGRESS=1")
+    add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
+    add(out, "CHENG_COMPILE_TIMEOUT_SEC=420")
+    return out
+
+fn SeedCrossCompilerPath(rootDir: str): str =
+    return chengpath.PathAbsolute(rootDir, "artifacts/backend_driver/cheng")
+
+fn SeedCrossReturnFixtures(): str[] =
+    return [
+        "return_add",
+        "return_call",
+        "return_if_stmt",
+        "return_while_sum",
+        "return_and_expr",
+        "return_bitwise",
+        "return_shift",
+        "return_for_sum",
+        "return_while_break",
+        "return_while_continue",
+        "return_inline_if_and_ternary",
+        "return_call_mixed",
+        "return_float32_arith_chain",
+        "return_float32_roundtrip",
+        "return_float64_ops",
+        "return_float_compare_cast",
+        "return_float_mixed_int_cast",
+        "return_cast_i32",
+        "return_cast_i64"
+    ]
+
+fn SeedCrossRangeFits(buf: rawbytes.ByteBuffer,
+                        offset: int32,
+                        size: int32): bool =
+    if offset < 0 || size < 0:
+        return false
+    if offset > buf.len:
+        return false
+    return size <= buf.len - offset
+
+fn SeedCrossByte(buf: rawbytes.ByteBuffer,
+                   offset: int32): int32 =
+    return rawbytes.BufByteAt(buf, offset)
+
+fn SeedCrossReadU16LE(buf: rawbytes.ByteBuffer,
+                        offset: int32): int32 =
+    if !SeedCrossRangeFits(buf, offset, 2):
+        return -1
+    let b0: int32 = SeedCrossByte(buf, offset)
+    let b1: int32 = SeedCrossByte(buf, offset + 1)
+    return b0 + b1 * 256
+
+fn SeedCrossReadU32LE(buf: rawbytes.ByteBuffer,
+                        offset: int32): int64 =
+    if !SeedCrossRangeFits(buf, offset, 4):
+        return int64(-1)
+    let b0: int64 = int64(SeedCrossByte(buf, offset))
+    let b1: int64 = int64(SeedCrossByte(buf, offset + 1))
+    let b2: int64 = int64(SeedCrossByte(buf, offset + 2))
+    let b3: int64 = int64(SeedCrossByte(buf, offset + 3))
+    return b0 + b1 * int64(256) + b2 * int64(65536) + b3 * int64(16777216)
+
+fn SeedCrossU32ToI32(value: int64): int32 =
+    if value < int64(0) || value > int64(2147483647):
+        return -1
+    return int32(value)
+
+fn SeedCrossAppendLine(out: var str,
+                         line: str) =
+    if len(out) > 0:
+        out = out + "\n"
+    out = out + line
+
+fn SeedCrossHexDigit(value: int32): str =
+    if value < 10:
+        return strings.CharToStr(char(int32('0') + value))
+    return strings.CharToStr(char(int32('a') + value - 10))
+
+fn SeedCrossHexI32(valueRaw: int32): str =
+    if valueRaw <= 0:
+        return "0"
+    var value = valueRaw
+    var digits: str[]
+    while value > 0:
+        add(digits, SeedCrossHexDigit(value % 16))
+        value = value / 16
+    var out = ""
+    var i = digits.len - 1
+    while i >= 0:
+        out = out + digits[i]
+        i = i - 1
+    return out
+
+fn SeedCrossReadAsciiZ(buf: rawbytes.ByteBuffer,
+                         offset: int32,
+                         maxLen: int32): str =
+    if offset < 0 || maxLen <= 0:
+        return ""
+    var out = ""
+    var i: int32
+    while i < maxLen && offset + i < buf.len:
+        let b = SeedCrossByte(buf, offset + i)
+        if b <= 0:
+            break
+        out = out + strings.CharToStr(char(b))
+        i = i + 1
+    return out
+
+fn SeedCrossObjectReportElf(path: str,
+                              buf: rawbytes.ByteBuffer): Result[str] =
+    if !SeedCrossRangeFits(buf, 0, 64):
+        return Err[str]("seed cross target: truncated elf header: " + path)
+    if SeedCrossByte(buf, 0) != 127 ||
+       SeedCrossByte(buf, 1) != 69 ||
+       SeedCrossByte(buf, 2) != 76 ||
+       SeedCrossByte(buf, 3) != 70:
+        return Err[str]("seed cross target: missing elf magic: " + path)
+    if SeedCrossByte(buf, 4) != 2 || SeedCrossByte(buf, 5) != 1:
+        return Err[str]("seed cross target: unsupported elf class or endian: " + path)
+    let fileType = SeedCrossReadU16LE(buf, 16)
+    let machine = SeedCrossReadU16LE(buf, 18)
+    let sectionCount = SeedCrossReadU16LE(buf, 60)
+    var elfType = "unknown"
+    if fileType == 1:
+        elfType = "rel"
+    elif fileType == 2:
+        elfType = "exec"
+    var out = ""
+    SeedCrossAppendLine(out, "cheng_object_report_v1")
+    SeedCrossAppendLine(out, "format=elf64")
+    SeedCrossAppendLine(out, Fmt"path={path}")
+    SeedCrossAppendLine(out, Fmt"elf_type={elfType}")
+    SeedCrossAppendLine(out, Fmt"machine={strings.IntToStr(machine)}")
+    SeedCrossAppendLine(out, Fmt"section_count={strings.IntToStr(sectionCount)}")
+    SeedCrossAppendLine(out, "load_command_count=0")
+    SeedCrossAppendLine(out, "import_count=0")
+    return Ok[str](out)
+
+fn SeedCrossReadPeHeaders(path: str,
+                            buf: rawbytes.ByteBuffer,
+                            headers: var SeedPeHeaders): Result[bool] =
+    if !SeedCrossRangeFits(buf, 0, 2):
+        return Err[bool]("seed cross target: truncated PE/COFF header: " + path)
+    var headerOff: int32
+    var isPe = false
+    if SeedCrossByte(buf, 0) == int32('M') && SeedCrossByte(buf, 1) == int32('Z'):
+        if !SeedCrossRangeFits(buf, 0x3c, 4):
+            return Err[bool]("seed cross target: missing PE header offset: " + path)
+        let peOff = SeedCrossU32ToI32(SeedCrossReadU32LE(buf, 0x3c))
+        if peOff < 0 ||
+           !SeedCrossRangeFits(buf, peOff, 24) ||
+           SeedCrossByte(buf, peOff) != int32('P') ||
+           SeedCrossByte(buf, peOff + 1) != int32('E') ||
+           SeedCrossByte(buf, peOff + 2) != 0 ||
+           SeedCrossByte(buf, peOff + 3) != 0:
+            return Err[bool]("seed cross target: invalid PE signature: " + path)
+        headerOff = peOff + 4
+        isPe = true
+    else:
+        headerOff = 0
+    if !SeedCrossRangeFits(buf, headerOff, 20):
+        return Err[bool]("seed cross target: truncated COFF header: " + path)
+    let sectionCount = SeedCrossReadU16LE(buf, headerOff + 2)
+    let optionalSize = SeedCrossReadU16LE(buf, headerOff + 16)
+    let optionalOff = headerOff + 20
+    let sectionTableOff = optionalOff + optionalSize
+    if sectionCount < 0 || optionalSize < 0 ||
+       !SeedCrossRangeFits(buf, sectionTableOff, sectionCount * 40):
+        return Err[bool]("seed cross target: invalid PE section table: " + path)
+    headers.isPe = isPe
+    headers.headerOff = headerOff
+    headers.optionalOff = optionalOff
+    headers.optionalSize = optionalSize
+    headers.sectionTableOff = sectionTableOff
+    headers.sectionCount = sectionCount
+    headers.machine = SeedCrossReadU16LE(buf, headerOff)
+    headers.characteristics = SeedCrossReadU16LE(buf, headerOff + 18)
+    if isPe && optionalSize >= 70 && SeedCrossRangeFits(buf, optionalOff, optionalSize):
+        headers.optionalMagic = SeedCrossReadU16LE(buf, optionalOff)
+        headers.subsystem = SeedCrossReadU16LE(buf, optionalOff + 68)
+    return Ok[bool](true)
+
+fn SeedCrossPeRvaToFileOffset(buf: rawbytes.ByteBuffer,
+                                headers: SeedPeHeaders,
+                                rva: int64): int32 =
+    if rva <= int64(0):
+        return 0
+    for i in 0..<headers.sectionCount:
+        let base = headers.sectionTableOff + i * 40
+        if !SeedCrossRangeFits(buf, base, 40):
+            return 0
+        let virtualSize = SeedCrossReadU32LE(buf, base + 8)
+        let virtualAddress = SeedCrossReadU32LE(buf, base + 12)
+        let rawSize = SeedCrossReadU32LE(buf, base + 16)
+        let rawPtr = SeedCrossReadU32LE(buf, base + 20)
+        var span = virtualSize
+        if rawSize > span:
+            span = rawSize
+        if rva >= virtualAddress && rva < virtualAddress + span:
+            let off = rawPtr + (rva - virtualAddress)
+            let out = SeedCrossU32ToI32(off)
+            if out > 0 && SeedCrossRangeFits(buf, out, 1):
+                return out
+            return 0
+    return 0
+
+fn SeedCrossPeAppendImports(buf: rawbytes.ByteBuffer,
+                              headers: SeedPeHeaders,
+                              out: var str): int32 =
+    if !headers.isPe ||
+       headers.optionalMagic != 0x20b ||
+       headers.optionalSize < 0x80:
+        return 0
+    let importRva = SeedCrossReadU32LE(buf, headers.optionalOff + 0x78)
+    let importSize = SeedCrossReadU32LE(buf, headers.optionalOff + 0x7c)
+    let importOff = SeedCrossPeRvaToFileOffset(buf, headers, importRva)
+    if importRva <= int64(0) || importSize <= int64(0) || importOff <= 0:
+        return 0
+    let importEnd = int64(importOff) + importSize
+    var descOff = importOff
+    var importCount: int32
+    while int64(descOff + 20) <= importEnd && SeedCrossRangeFits(buf, descOff, 20):
+        let originalFirstThunk = SeedCrossReadU32LE(buf, descOff)
+        let nameRva = SeedCrossReadU32LE(buf, descOff + 12)
+        let firstThunk = SeedCrossReadU32LE(buf, descOff + 16)
+        if originalFirstThunk == int64(0) && nameRva == int64(0) && firstThunk == int64(0):
+            break
+        let nameOff = SeedCrossPeRvaToFileOffset(buf, headers, nameRva)
+        var dllName = "<unknown-dll>"
+        if nameOff > 0:
+            let parsedName = SeedCrossReadAsciiZ(buf, nameOff, 255)
+            if len(parsedName) > 0:
+                dllName = parsedName
+        var thunkRva = originalFirstThunk
+        if thunkRva == int64(0):
+            thunkRva = firstThunk
+        var thunkOff = SeedCrossPeRvaToFileOffset(buf, headers, thunkRva)
+        while thunkOff > 0 && SeedCrossRangeFits(buf, thunkOff, 8):
+            let low = SeedCrossReadU32LE(buf, thunkOff)
+            let high = SeedCrossReadU32LE(buf, thunkOff + 4)
+            if low == int64(0) && high == int64(0):
+                break
+            var importName = ""
+            if high >= int64(2147483648):
+                importName = "ordinal_" + strings.Int64ToStr(low % int64(65536))
+            else:
+                let hintNameOff = SeedCrossPeRvaToFileOffset(buf, headers, low)
+                if hintNameOff > 0 && SeedCrossRangeFits(buf, hintNameOff, 2):
+                    importName = SeedCrossReadAsciiZ(buf, hintNameOff + 2, 255)
+                if len(importName) <= 0:
+                    importName = "<unknown>"
+            SeedCrossAppendLine(out, Fmt"import[{strings.IntToStr(importCount)}]={dllName}!{importName}")
+            importCount = importCount + 1
+            thunkOff = thunkOff + 8
+        descOff = descOff + 20
+    return importCount
+
+fn SeedCrossObjectReportPe(path: str,
+                             buf: rawbytes.ByteBuffer): Result[str] =
+    var headers: SeedPeHeaders
+    let headerRes = SeedCrossReadPeHeaders(path, buf, headers)
+    if IsErr(headerRes):
+        return Err[str](Error(headerRes))
+    var out = ""
+    SeedCrossAppendLine(out, "cheng_object_report_v1")
+    if headers.isPe:
+        SeedCrossAppendLine(out, "format=pe/coff")
+    else:
+        SeedCrossAppendLine(out, "format=coff")
+    SeedCrossAppendLine(out, Fmt"path={path}")
+    SeedCrossAppendLine(out, Fmt"machine=0x{SeedCrossHexI32(headers.machine)}")
+    SeedCrossAppendLine(out, Fmt"characteristics=0x{SeedCrossHexI32(headers.characteristics)}")
+    SeedCrossAppendLine(out, Fmt"optional_magic=0x{SeedCrossHexI32(headers.optionalMagic)}")
+    SeedCrossAppendLine(out, Fmt"subsystem={strings.IntToStr(headers.subsystem)}")
+    SeedCrossAppendLine(out, "load_command_count=0")
+    SeedCrossAppendLine(out, Fmt"section_count={strings.IntToStr(headers.sectionCount)}")
+    SeedCrossAppendLine(out, "symbol_count=0")
+    SeedCrossAppendLine(out, "reloc_count=0")
+    let importCount = SeedCrossPeAppendImports(buf, headers, out)
+    SeedCrossAppendLine(out, Fmt"import_count={strings.IntToStr(importCount)}")
+    return Ok[str](out)
+
+fn SeedCrossObjectReportText(path: str): Result[str] =
+    var buf = rawbytes.ReadFileBytes(path)
+    if buf.len <= 0 || buf.data == nil:
+        return Err[str]("seed cross target: failed to read object: " + path)
+    if buf.len >= 4 &&
+       SeedCrossByte(buf, 0) == 127 &&
+       SeedCrossByte(buf, 1) == 69 &&
+       SeedCrossByte(buf, 2) == 76 &&
+       SeedCrossByte(buf, 3) == 70:
+        let elfRes = SeedCrossObjectReportElf(path, buf)
+        rawbytes.FreeByteBuffer(buf)
+        return elfRes
+    if buf.len >= 2 &&
+       SeedCrossByte(buf, 0) == int32('M') &&
+       SeedCrossByte(buf, 1) == int32('Z'):
+        let peRes = SeedCrossObjectReportPe(path, buf)
+        rawbytes.FreeByteBuffer(buf)
+        return peRes
+    rawbytes.FreeByteBuffer(buf)
+    return Err[str]("seed cross target: unsupported object format: " + path)
+
+fn SeedCrossWriteObjectReport(rootDir: str,
+                                objectPath: str,
+                                reportPath: str): bool =
+    let reportRes = SeedCrossObjectReportText(objectPath)
+    if IsErr(reportRes):
+        SeedCrossPrintErr(Error(reportRes))
+        return false
+    let report = Value(reportRes)
+    if !chengpath.WriteTextFile(rootDir, reportPath, report + "\n"):
+        SeedCrossPrintErr("seed cross target: failed to write object report: " + reportPath)
+        return false
+    return true
+
+fn SeedCrossTextHasLine(text: str,
+                          line: str): bool =
+    if text == line:
+        return true
+    if strings.HasPrefix(text, line + "\n"):
+        return true
+    if strings.HasSuffix(text, "\n" + line):
+        return true
+    return strings.StrContains(text, "\n" + line + "\n")
+
+fn SeedCrossExpectTextContains(label: str,
+                                 text: str,
+                                 needle: str): bool =
+    if strings.StrContains(text, needle):
+        return true
+    SeedCrossPrintErr(Fmt"{label}: missing text: {needle}")
+    return false
+
+fn SeedCrossExpectTextHasLine(label: str,
+                                text: str,
+                                line: str): bool =
+    if SeedCrossTextHasLine(text, line):
+        return true
+    SeedCrossPrintErr(Fmt"{label}: missing line: {line}")
+    return false
+
+fn SeedCrossBuildBuiltinFixtureCurrent(rootDir: str,
+                                         compilerPath: str,
+                                         label: str,
+                                         srcPath: str,
+                                         target: str,
+                                         outPath: str,
+                                         reportPath: str): bool =
+    if !chengpath.FileExistsNonEmpty(rootDir, srcPath):
+        SeedCrossPrintErr(Fmt"{label}: missing source: {srcPath}")
+        return false
+    let parent = chengpath.PathParentDir(outPath)
+    if len(parent) > 0 && !chengpath.MkdirP(rootDir, parent):
+        SeedCrossPrintErr(Fmt"{label}: failed to create output dir: {parent}")
+        return false
+    if chengpath.PathFileExists(outPath):
+        os.RemoveFile(outPath)
+    if chengpath.PathFileExists(reportPath):
+        os.RemoveFile(reportPath)
+    let compileLog = outPath + ".compile.log"
+    if chengpath.PathFileExists(compileLog):
+        os.RemoveFile(compileLog)
+    let run = hostops.RunFileLogged(rootDir,
+                                      label,
+                                      compilerPath,
+                                      [
+                                          "system-link-exec",
+                                          "--root:" + rootDir,
+                                          "--in:" + srcPath,
+                                          "--emit:exe",
+                                          "--target:" + target,
+                                          "--out:" + outPath,
+                                          "--report-out:" + reportPath
+                                      ],
+                                      SeedCrossCompileEnv(),
+                                      rootDir,
+                                      420,
+                                      compileLog)
+    if !hostops.LoggedRunOk(run):
+        let outputText = strutil.Strip(run.output)
+        if len(outputText) > 0:
+            SeedCrossPrintErr(outputText)
+        else:
+            SeedCrossPrintErr(hostops.LoggedRunSummary(run))
+        return false
+    return true
+
+fn SeedCrossVerifyBuiltinOutputCommon(label: str,
+                                        rootDir: str,
+                                        outPath: str,
+                                        reportPath: str,
+                                        expectedLinkerProgram: str,
+                                        expectedFlavor: str): bool =
+    if !chengpath.FileExistsNonEmpty(rootDir, outPath):
+        SeedCrossPrintErr(Fmt"{label}: missing output: {outPath}")
+        return false
+    if !chengpath.FileExistsNonEmpty(rootDir, reportPath):
+        SeedCrossPrintErr(Fmt"{label}: missing report: {reportPath}")
+        return false
+    let reportText = chengpath.ReadTextFile(rootDir, reportPath)
+    var ok = true
+    ok = ok && SeedCrossExpectTextContains(label, reportText, expectedLinkerProgram)
+    ok = ok && SeedCrossExpectTextContains(label, reportText, expectedFlavor)
+    ok = ok && SeedCrossExpectTextContains(label, reportText, "native_link_input_count=0")
+    ok = ok && SeedCrossExpectTextContains(label, reportText, "native_link_missing_reasons=-")
+    return ok
+
+fn SeedCrossRequireCompiler(rootDir: str,
+                              compilerPath: str): bool =
+    if chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        return true
+    SeedCrossPrintErr("seed cross target: missing compiler: " + compilerPath)
+    return false
+
+fn SeedVerifyWindowsBuiltin(rootDir: str): int32 =
+    let root = strutil.Strip(rootDir)
+    let compilerPath = SeedCrossCompilerPath(root)
+    if len(root) <= 0 || !SeedCrossRequireCompiler(root, compilerPath):
+        return 1
+    let outDir = chengpath.PathAbsolute(root, "artifacts/windows_builtin_verify")
+    if !chengpath.MkdirP(root, outDir):
+        SeedCrossPrintErr("verify-windows-builtin: failed to create output dir: " + outDir)
+        return 1
+    let helloSrc = chengpath.PathAbsolute(root, "tests/cheng/backend/fixtures/hello_importc_puts.cheng")
+    let helloOut = os.JoinPath(outDir, "hello_importc_puts.exe")
+    let helloReport = os.JoinPath(outDir, "hello_importc_puts.report")
+    let peReport = os.JoinPath(outDir, "object-pe.txt")
+    if !SeedCrossBuildBuiltinFixtureCurrent(root,
+                                             compilerPath,
+                                             "verify-windows-builtin hello",
+                                             helloSrc,
+                                             SeedCrossWindowsTarget,
+                                             helloOut,
+                                             helloReport) ||
+       !SeedCrossVerifyBuiltinOutputCommon("verify-windows-builtin hello",
+                                            root,
+                                            helloOut,
+                                            helloReport,
+                                            "native_linker_program=internal_pe_consteval_linker",
+                                            "native_linker_flavor=pe_aarch64_consteval_internal") ||
+       !SeedCrossWriteObjectReport(root, helloOut, peReport):
+        return 1
+    let peText = chengpath.ReadTextFile(root, peReport)
+    if !SeedCrossExpectTextHasLine("verify-windows-builtin", peText, "format=pe/coff") ||
+       !SeedCrossExpectTextContains("verify-windows-builtin", peText, "UCRTBASE.dll!puts") ||
+       !SeedCrossExpectTextContains("verify-windows-builtin", peText, "KERNEL32.dll!ExitProcess"):
+        return 1
+    let fixtures = SeedCrossReturnFixtures()
+    for i in 0..<fixtures.len:
+        let fixture = fixtures[i]
+        let src = chengpath.PathAbsolute(root, "tests/cheng/backend/fixtures/" + fixture + ".cheng")
+        let outPath = os.JoinPath(outDir, fixture + ".exe")
+        let reportPath = os.JoinPath(outDir, fixture + ".report")
+        if !SeedCrossBuildBuiltinFixtureCurrent(root,
+                                                 compilerPath,
+                                                 "verify-windows-builtin fixture",
+                                                 src,
+                                                 SeedCrossWindowsTarget,
+                                                 outPath,
+                                                 reportPath) ||
+           !SeedCrossVerifyBuiltinOutputCommon("verify-windows-builtin fixture",
+                                                root,
+                                                outPath,
+                                                reportPath,
+                                                "native_linker_program=internal_pe_consteval_linker",
+                                                "native_linker_flavor=pe_aarch64_consteval_internal"):
+            return 1
+    SeedCrossPrintLine("verify_windows_builtin_linker ok")
+    return 0
+
+fn SeedVerifyRiscv64Builtin(rootDir: str): int32 =
+    let root = strutil.Strip(rootDir)
+    let compilerPath = SeedCrossCompilerPath(root)
+    if len(root) <= 0 || !SeedCrossRequireCompiler(root, compilerPath):
+        return 1
+    let outDir = chengpath.PathAbsolute(root, "artifacts/riscv64_builtin_verify")
+    if !chengpath.MkdirP(root, outDir):
+        SeedCrossPrintErr("verify-riscv64-builtin: failed to create output dir: " + outDir)
+        return 1
+    let helloSrc = chengpath.PathAbsolute(root, "tests/cheng/backend/fixtures/hello_puts.cheng")
+    let helloOut = os.JoinPath(outDir, "hello_puts")
+    let helloReport = os.JoinPath(outDir, "hello_puts.report")
+    let elfReport = os.JoinPath(outDir, "object-elf.txt")
+    if !SeedCrossBuildBuiltinFixtureCurrent(root,
+                                             compilerPath,
+                                             "verify-riscv64-builtin hello",
+                                             helloSrc,
+                                             SeedCrossRiscv64Target,
+                                             helloOut,
+                                             helloReport) ||
+       !SeedCrossVerifyBuiltinOutputCommon("verify-riscv64-builtin hello",
+                                            root,
+                                            helloOut,
+                                            helloReport,
+                                            "native_linker_program=internal_elf_consteval_linker",
+                                            "native_linker_flavor=elf_riscv64_consteval_internal") ||
+       !SeedCrossWriteObjectReport(root, helloOut, elfReport):
+        return 1
+    let elfText = chengpath.ReadTextFile(root, elfReport)
+    if !SeedCrossExpectTextHasLine("verify-riscv64-builtin", elfText, "format=elf64") ||
+       !SeedCrossExpectTextHasLine("verify-riscv64-builtin", elfText, "elf_type=exec") ||
+       !SeedCrossExpectTextContains("verify-riscv64-builtin", elfText, "machine=243"):
+        return 1
+    let fixtures = SeedCrossReturnFixtures()
+    for i in 0..<fixtures.len:
+        let fixture = fixtures[i]
+        let src = chengpath.PathAbsolute(root, "tests/cheng/backend/fixtures/" + fixture + ".cheng")
+        let outPath = os.JoinPath(outDir, fixture)
+        let reportPath = os.JoinPath(outDir, fixture + ".report")
+        if !SeedCrossBuildBuiltinFixtureCurrent(root,
+                                                 compilerPath,
+                                                 "verify-riscv64-builtin fixture",
+                                                 src,
+                                                 SeedCrossRiscv64Target,
+                                                 outPath,
+                                                 reportPath) ||
+           !SeedCrossVerifyBuiltinOutputCommon("verify-riscv64-builtin fixture",
+                                                root,
+                                                outPath,
+                                                reportPath,
+                                                "native_linker_program=internal_elf_consteval_linker",
+                                                "native_linker_flavor=elf_riscv64_consteval_internal"):
+            return 1
+    SeedCrossPrintLine("verify_riscv64_builtin_linker ok")
+    return 0
+
+fn SeedRunCrossTargetSmokes(rootDir: str): int32 =
+    if SeedVerifyWindowsBuiltin(rootDir) != 0:
+        return 1
+    if SeedVerifyRiscv64Builtin(rootDir) != 0:
+        return 1
+    SeedCrossPrintLine("run_windows_riscv_builtin_smokes ok")
+    return 0

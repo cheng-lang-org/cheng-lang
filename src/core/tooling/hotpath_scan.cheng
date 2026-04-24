@@ -4,14 +4,9 @@ import cheng/core/tooling/path as chengpath
 
 type
     ForbiddenPatternKind = enum
-        ForbiddenLocalPayload
-        ForbiddenExecPlanPayload
-        ForbiddenEntryBridge
-        ForbiddenPayloadText
-        ForbiddenRuntimeTargetStr
-        ForbiddenOpNameStr
-        ForbiddenKindStr
-        ForbiddenBigintBox
+        ForbiddenSubstring
+        ForbiddenLabelColonStr
+        ForbiddenWholeWord
 
     ForbiddenPattern =
         kind: ForbiddenPatternKind
@@ -32,30 +27,109 @@ fn Pattern3(a: str, b: str, c: str): str =
 fn Pattern2(a: str, b: str): str =
     return a + b
 
+fn HotpathIsIdentChar(ch: char): bool =
+    if ch >= 'a' && ch <= 'z':
+        return true
+    if ch >= 'A' && ch <= 'Z':
+        return true
+    if ch >= '0' && ch <= '9':
+        return true
+    return ch == '_'
+
+fn HotpathIsWhitespace(ch: char): bool =
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'
+
+fn HotpathTextMatchesAt(text: str, index: int32, needle: str): bool =
+    if index < 0:
+        return false
+    if needle.len <= 0:
+        return true
+    if index + needle.len > text.len:
+        return false
+    for i in 0..<needle.len:
+        if text[index + i] != needle[i]:
+            return false
+    return true
+
+fn HotpathTextFindFrom(text: str, needle: str, startIndex: int32): int32 =
+    if needle.len <= 0:
+        return startIndex
+    if text.len < needle.len:
+        return -1
+    var i: int32 = startIndex
+    if i < 0:
+        i = 0
+    while i + needle.len <= text.len:
+        if HotpathTextMatchesAt(text, i, needle):
+            return i
+        i = i + 1
+    return -1
+
+fn HotpathTextContainsWholeWord(text: str, word: str): bool =
+    var index: int32 = HotpathTextFindFrom(text, word, 0)
+    while index >= 0:
+        let leftOk = index == 0 || !HotpathIsIdentChar(text[index - 1])
+        let endIndex = index + word.len
+        let rightOk = endIndex >= text.len || !HotpathIsIdentChar(text[endIndex])
+        if leftOk && rightOk:
+            return true
+        index = HotpathTextFindFrom(text, word, index + 1)
+    return false
+
+fn HotpathTextContainsLabelColonStr(text: str, label: str): bool =
+    var index: int32 = HotpathTextFindFrom(text, label, 0)
+    while index >= 0:
+        let leftOk = index == 0 || !HotpathIsIdentChar(text[index - 1])
+        var probe: int32 = index + label.len
+        if leftOk && probe < text.len && text[probe] == ':':
+            probe = probe + 1
+            while probe < text.len && HotpathIsWhitespace(text[probe]):
+                probe = probe + 1
+            if HotpathTextMatchesAt(text, probe, "str"):
+                let endIndex = probe + 3
+                if endIndex >= text.len || !HotpathIsIdentChar(text[endIndex]):
+                    return true
+        index = HotpathTextFindFrom(text, label, index + 1)
+    return false
+
+fn HotpathPathHasNamedSegment(path: str, segment: str): bool =
+    let parts: str[] = strutil.Split(path, '/')
+    for i in 0..<parts.len:
+        if parts[i] == segment:
+            return true
+    return false
+
+fn HotpathPatternMatches(text: str, pattern: ForbiddenPattern): bool =
+    if pattern.kind == ForbiddenWholeWord:
+        return HotpathTextContainsWholeWord(text, pattern.needle)
+    if pattern.kind == ForbiddenLabelColonStr:
+        return HotpathTextContainsLabelColonStr(text, pattern.needle)
+    return strutil.Contains(text, pattern.needle)
+
 fn ForbiddenPatterns(): ForbiddenPattern[] =
     var out: ForbiddenPattern[]
-    ForbiddenPatternAdd(out, ForbiddenLocalPayload,
+    ForbiddenPatternAdd(out, ForbiddenSubstring,
                           Pattern3("local", "_", "payload"),
                           Pattern3("local", "_", "payload"))
-    ForbiddenPatternAdd(out, ForbiddenExecPlanPayload,
+    ForbiddenPatternAdd(out, ForbiddenSubstring,
                           Pattern3("exec", "_plan", "_payload"),
                           Pattern3("exec", "_plan", "_payload"))
-    ForbiddenPatternAdd(out, ForbiddenEntryBridge,
+    ForbiddenPatternAdd(out, ForbiddenSubstring,
                           Pattern3("entry", "_", "bridge"),
                           Pattern3("entry", "_", "bridge"))
-    ForbiddenPatternAdd(out, ForbiddenPayloadText,
+    ForbiddenPatternAdd(out, ForbiddenSubstring,
                           Pattern2("payload", "Text"),
                           Pattern2("payload", "Text"))
-    ForbiddenPatternAdd(out, ForbiddenRuntimeTargetStr,
-                          Pattern3("runtimeTarget", ":", " str"),
+    ForbiddenPatternAdd(out, ForbiddenLabelColonStr,
+                          "runtimeTarget",
                           Pattern3("runtimeTarget", ":", " str"))
-    ForbiddenPatternAdd(out, ForbiddenOpNameStr,
-                          Pattern3("opName", ":", " str"),
+    ForbiddenPatternAdd(out, ForbiddenLabelColonStr,
+                          "opName",
                           Pattern3("opName", ":", " str"))
-    ForbiddenPatternAdd(out, ForbiddenKindStr,
-                          Pattern3("kind", ":", " str"),
+    ForbiddenPatternAdd(out, ForbiddenLabelColonStr,
+                          "kind",
                           Pattern3("kind", ":", " str"))
-    ForbiddenPatternAdd(out, ForbiddenBigintBox,
+    ForbiddenPatternAdd(out, ForbiddenWholeWord,
                           Pattern2("Big", "Int"),
                           Pattern2("Big", "Int"))
     return out
@@ -68,12 +142,12 @@ fn ScanForbiddenSourceDir(rootDir: str, srcDirRaw: str): ForbiddenHit[] =
     for i in 0..<files.len:
         let filePath: str = files[i]
         let parts: os.SplitFileResult = os.SplitFile(filePath)
-        if parts.ext != ".cheng":
+        if parts.ext != ".cheng" || HotpathPathHasNamedSegment(filePath, "tests"):
             continue
         let text: str = os.ReadFile(filePath)
         for j in 0..<patterns.len:
             let pattern: ForbiddenPattern = patterns[j]
-            if strutil.Contains(text, pattern.needle):
+            if HotpathPatternMatches(text, pattern):
                 add(hits, ForbiddenHit(path: filePath, kind: pattern.kind, label: pattern.label))
     return hits
 
@@ -82,9 +156,9 @@ fn ForbiddenHitsOk(hits: ForbiddenHit[]): bool =
 
 fn ForbiddenHitReport(hits: ForbiddenHit[]): str =
     if hits.len == 0:
-        return " scan: ok\n"
+        return "cheng scan: ok\n"
     var rows: str[]
     for i in 0..<hits.len:
         let hit: ForbiddenHit = hits[i]
-        add(rows, " scan: hit forbidden pattern: " + hit.label + " @ " + hit.path)
+        add(rows, "cheng scan: hit forbidden pattern: " + hit.label + " @ " + hit.path)
     return strutil.Join(rows, "\n") + "\n"

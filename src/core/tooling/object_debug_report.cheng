@@ -1,0 +1,93 @@
+import std/result
+import std/bytes as rawbytes
+
+fn ObjectDebugAppendLine(out: var str, key: str, value: str) =
+    out = out + key + "=" + value + "\n"
+
+fn ObjectDebugByte(buf: rawbytes.ByteBuffer, idx: int32): int32 =
+    return rawbytes.BufByteAt(buf, idx)
+
+fn ObjectDebugRangeFits(buf: rawbytes.ByteBuffer,
+                          offset: int32,
+                          size: int32): bool =
+    if offset < 0 || size < 0:
+        return false
+    if offset > buf.len:
+        return false
+    return size <= buf.len - offset
+
+fn ObjectDebugU16LE(buf: rawbytes.ByteBuffer, idx: int32): int32 =
+    return rawbytes.ReadU16LEAt(buf, idx)
+
+fn ObjectDebugU32LE(buf: rawbytes.ByteBuffer, idx: int32): int32 =
+    return rawbytes.ReadU32LEAt(buf, idx)
+
+fn ObjectDebugU64LELow(buf: rawbytes.ByteBuffer, idx: int32): int32 =
+    if !ObjectDebugRangeFits(buf, idx, 8):
+        return -1
+    if ObjectDebugU32LE(buf, idx + 4) != 0:
+        return -1
+    return ObjectDebugU32LE(buf, idx)
+
+fn ObjectDebugElfTypeName(fileType: int32): str =
+    if fileType == 1:
+        return "rel"
+    if fileType == 2:
+        return "exec"
+    return "unknown"
+
+fn ObjectDebugElfReport(path: str,
+                          buf: rawbytes.ByteBuffer): Result[str] =
+    if !ObjectDebugRangeFits(buf, 0, 64):
+        return Err[str]("cheng object report: truncated elf header")
+    if ObjectDebugByte(buf, 4) != 2 || ObjectDebugByte(buf, 5) != 1:
+        return Err[str]("cheng object report: unsupported elf class or endian")
+    let fileType = ObjectDebugU16LE(buf, 16)
+    let machine = ObjectDebugU16LE(buf, 18)
+    let sectionOffset = ObjectDebugU64LELow(buf, 40)
+    let sectionEntrySize = ObjectDebugU16LE(buf, 58)
+    let sectionCount = ObjectDebugU16LE(buf, 60)
+    if sectionOffset < 0 || sectionEntrySize < 64 || sectionCount < 0:
+        return Err[str]("cheng object report: invalid elf section table")
+    if !ObjectDebugRangeFits(buf, sectionOffset, sectionEntrySize * sectionCount):
+        return Err[str]("cheng object report: truncated elf section table")
+    var symbolCount: int32
+    var relocCount: int32
+    for i in 0..<sectionCount:
+        let base = sectionOffset + i * sectionEntrySize
+        let sectionType = ObjectDebugU32LE(buf, base + 4)
+        let sectionSize = ObjectDebugU64LELow(buf, base + 32)
+        let entrySize = ObjectDebugU64LELow(buf, base + 56)
+        if sectionSize < 0 || entrySize <= 0:
+            continue
+        if sectionType == 2 || sectionType == 11:
+            symbolCount = symbolCount + sectionSize / entrySize
+        if sectionType == 4 || sectionType == 9:
+            relocCount = relocCount + sectionSize / entrySize
+    var out = ""
+    out = out + "cheng_object_report_v1\n"
+    ObjectDebugAppendLine(out, "format", "elf64")
+    ObjectDebugAppendLine(out, "path", path)
+    ObjectDebugAppendLine(out, "elf_type", ObjectDebugElfTypeName(fileType))
+    ObjectDebugAppendLine(out, "machine", intToStr(machine))
+    ObjectDebugAppendLine(out, "section_count", intToStr(sectionCount))
+    ObjectDebugAppendLine(out, "load_command_count", "0")
+    ObjectDebugAppendLine(out, "symbol_count", intToStr(symbolCount))
+    ObjectDebugAppendLine(out, "reloc_count", intToStr(relocCount))
+    ObjectDebugAppendLine(out, "import_count", "0")
+    return Ok[str](out)
+
+fn ObjectDebugReportText(path: str): Result[str] =
+    var buf = rawbytes.ReadFileBytes(path)
+    if buf.len <= 0 || buf.data == nil:
+        return Err[str]("cheng object report: failed to read object")
+    if buf.len >= 4 &&
+       ObjectDebugByte(buf, 0) == 127 &&
+       ObjectDebugByte(buf, 1) == 69 &&
+       ObjectDebugByte(buf, 2) == 76 &&
+       ObjectDebugByte(buf, 3) == 70:
+        let res = ObjectDebugElfReport(path, buf)
+        rawbytes.FreeByteBuffer(buf)
+        return res
+    rawbytes.FreeByteBuffer(buf)
+    return Err[str]("cheng object report: pure Cheng report currently supports elf64 only")

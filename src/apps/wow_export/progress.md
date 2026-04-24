@@ -4,6 +4,11 @@
 
 最新进展（2026-04-24）：
 
+- WDT MAID 依赖现在不是只校验“存在”：preview/render 会解码全部 `28` 个 pathless MAID payload，严格区分 `16` 个 `adt_split` 和 `12` 个 `blp`，并解析 ADT split chunk 与 placement record 实数。本机 Northshire 合计 `2164` 个 split chunks、`2048` 个 `KNCM/MCNK`、`4345` 个 `FDDM/MDDF` doodad placement、`32` 个 `FDOM/MODF` world model placement，decoded MAID 子集字节数为 `8023142`。
+- `asset_formats.ParseWdtMaidAdtSplitSummary` 已成为严格全文件解析器：首块必须是 `REVM/MVER version=18`，每个 chunk 必须边界合法，`FDDM` 必须按 `36` 字节 stride 整除并逐条读取 nameID/uniqueID/position/rotation/scale，`FDOM` 必须按 `64` 字节 stride 整除并逐条读取 nameID/uniqueID/position/rotation/bounds/scale；BLP MAID 资源仍用 `ParseBlp2Header` 校验真实尺寸。
+- 真实 Northshire split 里没有老式 `MMDX/MMID/MWMO/MWID` 路径表；`MDDF/MODF.nameID` 已按现代 fileDataID 处理。四个 tile 聚合后，MAID doodad placement 引用 `222` 个唯一 fileDataID，首项 `189929`；world model placement 引用 `18` 个唯一 fileDataID，首项 `108104`。
+- 本机 Northshire MAID placement record 实测：`MDDF` position span 为 `1125287,221256,1145929`，scale 范围 `133..3389`；`MODF` position span 为 `1133681,61759,899866`，scale 范围 `1024..1024`。
+- `preview-northshire --frames 1` 现在输出 `wdtMaidParsedDependencies=28 wdtMaidAdtSplits=16 wdtMaidBlps=12 wdtMaidAdtSplitChunks=2164 wdtMaidAdtSplitMcnks=2048 wdtMaidDoodadPlacements=4345 wdtMaidDoodadReferencedFileIDs=222 wdtMaidFirstDoodadReferencedFileID=189929 wdtMaidWorldModelPlacements=32 wdtMaidWorldModelReferencedFileIDs=18 wdtMaidFirstWorldModelReferencedFileID=108104 wdtMaidDependencyBytes=8023142`；`render-northshire --width 320 --height 180 --out ...` 输出同一组 MAID 解析事实并保持 `pixels=212018`。
 - WDT `MAID` 现在可按 tile 坐标严格解析 8 个 split fileDataID slot；新增 `wdt-maid-tile --x --y` CLI。本机 Northshire 四 tile 实测：`31,48 -> 777827,777828,777829,777830,1287882,1293739,1293740,204453`；`32,48 -> 778027,778028,778029,778030,1287884,1293745,1293746,204493`；`31,49 -> 777832,777833,777834,777835,1287916,1293871,1293872,204454`；`32,49 -> 778032,778033,778034,778035,1287918,1293879,1293880,204494`。
 - 已新增 `wow_export_maid_audit_smoke`，钉住 12 个 Northshire MAID split ID 的 root/encoding/index 审计结果，首项 `777828` 和末项 `778035` 的 content key、encoding key、archive、offset、encoded size 都按真实本机数据断言。
 - 纯 Cheng MAID 审计慢的根因不是 Cheng 运行时整体性能，而是 wowExport 自己在 local CASC range 解码里对 BLTE `normal` block 先读整块、复制整块、再切 range；现在 normal block 只读请求 payload 区间，12-ID 审计从约 `46.56s / 277MB peak footprint` 降到 `5.77s / 61604224 peak memory footprint`。
@@ -16,13 +21,13 @@
 - `asset_formats.ParseWmoRootSummary` 已解析 WMO `SDOM/MODS` doodad set 和 `DDOM/MODD` placement；Northshire Abbey 实测 `2` 个 doodad set、`144` 条真实 placement，placement bounds span 为 `74059,71093,34487`。
 - `preview-northshire` 的 scene 判定现在要求 WMO doodad placement 和 bounds；`render-northshire` 会把 144 个真实 WMO doodad placement 作为红色十字叠到主视图。
 - Northshire manifest 现在额外维护 `17` 条 pathless WMO `MODI` 审计依赖：只记录来源 `northshire-abbey-wmo`、关系 `wmo_modi`、fileDataID、content key、encoding key、archive、offset、encoded size，不伪造 listfile path，也不混进 `export-map` 的有路径文件表。
-- `preview-northshire` 现在要求真实 WMO root 的 `17` 个 `MODI` model fileDataID 与这张审计依赖表逐个匹配；本机输出 `auditedDependencies=17 wmoModelFileIDs=17 wmoModelDependencies=17 wmoModelDependencyAudit=ready`。
+- `preview-northshire` 现在要求真实 WMO root 的 `17` 个 `MODI` model fileDataID 与审计依赖表逐个匹配；当前总依赖为 `45`，本机输出 `auditedDependencies=45 wmoModelFileIDs=17 wmoModelDependencies=17 wmoModelDependencyAudit=ready`。
 - WMO doodad 模型链已补齐：`DDOM/MODD` 记录首字段按稀疏 `IDOM/MODI` 槽位解析，不再当路径或紧凑索引；Northshire Abbey 实测 `30` 个 MODI 槽、`144` 条 MODD 摆放全部解析成功，实际被摆放引用的唯一模型为 `15` 个。
 - `preview-northshire` 现在会逐条检查 `MODD -> IDOM -> fileDataID` 得到的 `144` 个摆放模型都存在于 `wmo_modi` 审计依赖表；本机输出 `wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencyAudit=ready`。
 - `AuditManifestDependenciesAgainstLocal` 已走快审计：按 encoding key 查本地 `.idx`，校验 archive/offset/size，再解码 payload 算 MD5 对 content key；不再为了已审计依赖重新扫完整 root。
-- `export-dependencies --out-dir` 已新增：把 17 条 pathless `wmo_modi` 依赖按 `label-fid-fileDataID.m2` 导出，并写 `dependencies.manifest.txt`；不伪造 listfile path，不混入 `export-map`。
+- `export-dependencies --out-dir` 已扩展：导出 `17` 条 pathless `wmo_modi` M2 和 `28` 条 pathless WDT MAID 资源，并写 `dependencies.manifest.txt`；不伪造 listfile path，不混入 `export-map`。
 - `render-northshire` 现在也要求 WMO doodad 模型依赖审计通过后才画 placement marker，并按 `MODD` 的 position/quaternion/scale 实例化真实 M2 顶点；本机输出 `wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencies=17 wmoDoodadModelVertices=31665 pixels=212018`，`wow_export_render_smoke` 峰值内存 `20398416` 字节。
-- `wow_export_dependency_memory_smoke` 已覆盖 17 条 WMO `MODI` 依赖的重复审计和 M2 header 解码；本机 steady delta 为 `1363`。
+- `wow_export_dependency_memory_smoke` 已覆盖 `45` 条依赖的重复审计和格式解码；本机最新 steady delta 为 `15808`。
 - `wow_export_tool_main` 的命令入口已修正为 `ParamCount() < 1` 才显示 usage；`/tmp/wow_export_tool_main manifest` 现在直接输出 manifest 摘要，不再要求额外占位参数。
 - `casc_index.LoadLocalIndexEntry` 不再因为目录路径或悬挂 `ListDir` 结果崩溃；现在会稳定返回真实错误。
 - `std/os.ListDir` 现已在库层修正：目录 listing raw buffer 会在 `ListDir` 内部释放，返回文件名保持 owned 字符串，不再把释放责任和悬挂风险留给业务层。
@@ -57,9 +62,19 @@
 - `preview-northshire` 现在会读取并验证全部 18 个真实资产，scene 非空条件已升级为必须加载 WMO group 几何和 M2 skin/index 数据；本机输出 `wmoGroupAssets=13 wmoGroupVertices=29304 wmoGroupIndices=91689 m2SkinIndices=370 m2SkinTriangleIndices=1302`。
 - `export-map --out-dir` 现在导出 18 个文件、合计 `1922352` 字节；新增的 WMO group 解码 payload 最大为 group 010 的 `290592` 字节，skin payload 为 `5088` 字节。
 - 新增纯 Cheng `render` 模块和 CLI `render-northshire`：生成无压缩 32-bit TGA，主视图来自 13 个真实 WMO group `MOVT` 顶点，右上角 inset 来自真实 M2 顶点，skin 必须解析成功。`render-northshire --out /tmp/wow_export_northshire_render.tga --width 640 --height 360` 输出 `921618` 字节，绘制 `31153` 个真实几何点。
+- Northshire manifest 当前已扩展为 `22` 个有路径审计文件和 `45` 个 pathless 审计依赖；依赖由 `17` 个 WMO `MODI` M2、`16` 个 WDT MAID `adt_split`、`12` 个 WDT MAID `blp` 组成。
+- `preview-northshire` 和 `render-northshire` 现在都要求四个 Northshire WDT tile 的 `28` 个非基础 MAID fileDataID 全部在审计依赖表中命中；缺任意一个会失败，不再只把 MAID 当可选发现结果。
+- `export-dependencies` 现在导出 `45` 个依赖、合计 `8262008` 字节；WMO `MODI` 输出 `.m2`，MAID `adt_split` 输出 `.adt`，MAID `blp` 输出 `.blp`，manifest 行包含 `format=`。
+- 最新 CLI 验证：`/tmp/wow_export_tool_main manifest` 输出 `auditedFiles=22 auditedDependencies=45`；`preview-northshire --frames 1` 输出 `wdtMaidDoodadReferencedFileIDs=222 wdtMaidFirstDoodadReferencedFileID=189929 wdtMaidDoodadPlacementSpan1000=1125287,221256,1145929 wdtMaidWorldModelReferencedFileIDs=18 wdtMaidFirstWorldModelReferencedFileID=108104 wdtMaidWorldModelPlacementSpan1000=1133681,61759,899866`；`render-northshire --width 320 --height 180 --out /tmp/wow_export_render_northshire_320x180_maid_fileids.tga` 输出同一组 MAID fileDataID/record 字段并保持 `pixels=212018`。
 
 验证：
 
+- `artifacts/backend_driver/cheng system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_northshire_mvp_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_northshire_mvp_smoke` 通过，`/tmp/wow_export_northshire_mvp_smoke` 输出 `wdtMaidDoodads=4345 wdtMaidDoodadFileIDs=222 wdtMaidFirstDoodadFileID=189929 wdtMaidWorldModels=32 wdtMaidWorldModelFileIDs=18 wdtMaidFirstWorldModelFileID=108104`。
+- `artifacts/backend_driver/cheng system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_asset_formats_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_asset_formats_smoke` 通过，`/tmp/wow_export_asset_formats_smoke` 通过，覆盖合成 `MDDF/MODF` record 解析。
+- `artifacts/backend_driver/cheng system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_render_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_render_smoke` 通过，`/tmp/wow_export_render_smoke` 通过。
+- `artifacts/backend_driver/cheng system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_dependency_memory_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_dependency_memory_smoke` 通过，`/tmp/wow_export_dependency_memory_smoke` 输出 `steady=17996`。
+- `artifacts/backend_driver/cheng system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_memory_probe_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_memory_probe_smoke` 通过，`/tmp/wow_export_memory_probe_smoke` 输出 `preview_steady=28173`。
+- `artifacts/backend_driver/cheng system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/apps/wow_export/wow_export_tool_main.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_tool_main` 通过；`manifest`、`preview-northshire --frames 1`、`render-northshire --width 320 --height 180 --out /tmp/wow_export_render_northshire_320x180_maid_fileids.tga` 均通过。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_maid_audit_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_maid_audit_smoke` 通过；`/usr/bin/time -l /tmp/wow_export_maid_audit_smoke` 通过，本机观测 `real 5.77s`、`peak memory footprint 61604224`。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_asset_formats_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_asset_formats_smoke` 通过，`/tmp/wow_export_asset_formats_smoke` 通过。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_northshire_mvp_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_northshire_mvp_smoke` 通过，`/tmp/wow_export_northshire_mvp_smoke` 输出 `adtTiles=4 adtChunks=1024 adtHeightSamples=148480`。
@@ -73,10 +88,10 @@
 - `/tmp/wow_export_tool_main preview-northshire --frames 1` 通过，输出 `wmoDoodadPlacements=144 wmoDoodadSpan1000=74059,71093,34487`。
 - `/tmp/wow_export_tool_main render-northshire --out /tmp/wow_export_northshire_render_doodads.tga --width 640 --height 360` 通过，输出 `wmoDoodadPlacements=144 pixels=180353`。
 - `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/wow_export_dependency_memory_smoke.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/wow_export_dependency_memory_smoke` 通过，`/tmp/wow_export_dependency_memory_smoke` 通过。
-- `/tmp/wow_export_tool_main manifest` 通过，输出 `auditedFiles=22 auditedDependencies=17`。
-- `/tmp/wow_export_tool_main preview-northshire --frames 1` 通过，输出 `auditedDependencies=17 wmoModelFileIDs=17 wmoModelDependencies=17 wmoModelDependencyAudit=ready`。
+- `/tmp/wow_export_tool_main manifest` 通过，输出 `auditedFiles=22 auditedDependencies=45`。
+- `/tmp/wow_export_tool_main preview-northshire --frames 1` 通过，输出 `auditedDependencies=45 wdtMaidSplitDependencies=28 wdtMaidSplitDependencyAudit=ready wmoModelDependencies=17 wmoModelDependencyAudit=ready`。
 - `/tmp/wow_export_tool_main preview-northshire --frames 1` 通过，输出 `wmoModelSlots=30 wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencyAudit=ready`。
-- `/tmp/wow_export_tool_main export-dependencies --out-dir /tmp/wow_export_deps_cli.ghsOwy` 通过，输出 `exportedDependencies files=17 bytes=238866`，并写入 `dependencies.manifest.txt`。
+- `/tmp/wow_export_tool_main export-dependencies --out-dir /tmp/wow_export_dependency_bundle_measure` 通过，输出 `exportedDependencies files=45 bytes=8262008`，并写入带 `format=` 的 `dependencies.manifest.txt`。
 - `/tmp/wow_export_tool_main render-northshire --out /tmp/wow_export_northshire_render_modd_modi.tga --width 640 --height 360` 通过，输出 `wmoDoodadPlacements=144 pixels=180353`。
 - `/tmp/wow_export_tool_main render-northshire --out /tmp/wow_export_render_cli.ql4Jmx/northshire.tga --width 640 --height 360` 通过，输出 `wmoDoodadModelPlacements=144 wmoDoodadReferencedModelFileIDs=15 wmoDoodadModelDependencies=17`。
 - `/tmp/wow_export_tool_main export-map --out-dir /tmp/wow_export_map_dependency_current` 通过，仍导出 `22` 个有路径文件、`3346856` 字节；pathless 依赖不伪装成导出路径。

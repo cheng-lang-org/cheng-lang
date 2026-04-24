@@ -2,6 +2,9 @@ import std/cmdline as cmdline
 import std/strings
 import std/strutils as strutil
 import cheng/core/tooling/path as chengpath
+import cheng/r2c/native_gui_software_framebuffer as nativefb
+import cheng/r2c/native_platform_shell_package as shellpackage
+import cheng/r2c/native_platform_shell_runtime as shellruntime
 
 fn nativeGuiRuntimeSlice(text: str,
                          start: int32,
@@ -353,6 +356,138 @@ fn nativeGuiRuntimeRenderPlanDoc(contractText: str,
     doc = doc + "],\"command_count\":2}"
     return doc
 
+fn nativeGuiRuntimeWriteSurfaceArtifacts(renderPlanDoc: str,
+                                         framePath: str,
+                                         manifestPath: str): bool =
+    if strings.Len(framePath) <= 0 || strings.Len(manifestPath) <= 0:
+        return false
+    return nativefb.WriteNativeRenderPlanSurfaceArtifacts(renderPlanDoc, framePath, manifestPath)
+
+fn nativeGuiRuntimeWriteRouteReplayManifest(contractText: str,
+                                            stateDoc: str,
+                                            renderPlanDoc: str,
+                                            routeCatalogPath: str,
+                                            surfaceFramePath: str,
+                                            surfaceManifestPath: str,
+                                            outPath: str): bool =
+    if strings.Len(routeCatalogPath) <= 0 || !chengpath.PathFileExists(routeCatalogPath):
+        return false
+    let routeCatalogText: str = chengpath.ReadTextFile("", routeCatalogPath)
+    if nativeGuiRuntimeJsonReadStringField(routeCatalogText, "format", "") != "cheng_codegen_route_catalog_v1":
+        return false
+    let contractRouteCount: int32 = nativeGuiRuntimeJsonReadIntField(contractText, "route_count", 0)
+    let contractSupportedCount: int32 = nativeGuiRuntimeJsonReadIntField(contractText, "supported_count", 0)
+    let catalogRouteCount: int32 = nativeGuiRuntimeJsonReadIntField(routeCatalogText, "routeCount", 0)
+    let catalogSupportedCount: int32 = nativeGuiRuntimeJsonReadIntField(routeCatalogText, "supportedCount", 0)
+    if catalogRouteCount <= 0 || catalogRouteCount != contractRouteCount || catalogSupportedCount != contractSupportedCount:
+        return false
+    let routeState: str = nativeGuiRuntimeJsonReadStringField(stateDoc, "route_state", "")
+    let entryRouteState: str = nativeGuiRuntimeJsonReadStringField(routeCatalogText, "entryRouteState", "")
+    let commandCount: int32 = nativeGuiRuntimeJsonReadIntField(renderPlanDoc, "command_count", 0)
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_gui_route_replay_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"mode\": \"all_routes_catalog_bound_runtime_replay_v1\",\n"
+    doc = doc + "  \"entry_route_state\": " + nativeGuiRuntimeJsonQuote(entryRouteState) + ",\n"
+    doc = doc + "  \"active_route_state\": " + nativeGuiRuntimeJsonQuote(routeState) + ",\n"
+    doc = doc + "  \"route_count\": " + intToStr(catalogRouteCount) + ",\n"
+    doc = doc + "  \"supported_count\": " + intToStr(catalogSupportedCount) + ",\n"
+    doc = doc + "  \"unsupported_count\": " + intToStr(nativeGuiRuntimeJsonReadIntField(routeCatalogText, "unsupportedCount", 0)) + ",\n"
+    doc = doc + "  \"route_catalog_path\": " + nativeGuiRuntimeJsonQuote(routeCatalogPath) + ",\n"
+    doc = doc + "  \"render_plan_command_count\": " + intToStr(commandCount) + ",\n"
+    doc = doc + "  \"surface_frame_path\": " + nativeGuiRuntimeJsonQuote(surfaceFramePath) + ",\n"
+    doc = doc + "  \"surface_manifest_path\": " + nativeGuiRuntimeJsonQuote(surfaceManifestPath) + "\n"
+    doc = doc + "}\n"
+    return chengpath.WriteTextFile("", outPath, doc)
+
+fn nativeGuiRuntimeWriteInteractionManifest(stateDoc: str,
+                                            outPath: str): bool =
+    let clickCount: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "click_count", 0)
+    let resizeCount: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "resize_count", 0)
+    let scrollCount: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "scroll_count", 0)
+    let focusCount: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "focus_count", 0)
+    let keyCount: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "key_count", 0)
+    let textCount: int32 = nativeGuiRuntimeJsonReadIntField(stateDoc, "text_count", 0)
+    let routeState: str = nativeGuiRuntimeJsonReadStringField(stateDoc, "route_state", "")
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_gui_interaction_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"polling\": false,\n"
+    doc = doc + "  \"route_state\": " + nativeGuiRuntimeJsonQuote(routeState) + ",\n"
+    doc = doc + "  \"supported_events\": [\"click\", \"resize\", \"scroll\", \"focus\", \"text\", \"key\", \"navigate\"],\n"
+    doc = doc + "  \"click_count\": " + intToStr(clickCount) + ",\n"
+    doc = doc + "  \"resize_count\": " + intToStr(resizeCount) + ",\n"
+    doc = doc + "  \"scroll_count\": " + intToStr(scrollCount) + ",\n"
+    doc = doc + "  \"focus_count\": " + intToStr(focusCount) + ",\n"
+    doc = doc + "  \"key_count\": " + intToStr(keyCount) + ",\n"
+    doc = doc + "  \"text_count\": " + intToStr(textCount) + "\n"
+    doc = doc + "}\n"
+    return chengpath.WriteTextFile("", outPath, doc)
+
+fn nativeGuiRuntimeWritePlatformShellManifest(surfaceManifestPath: str,
+                                              routeReplayManifestPath: str,
+                                              interactionManifestPath: str,
+                                              outPath: str): bool =
+    if strings.Len(surfaceManifestPath) <= 0 || !chengpath.PathFileExists(surfaceManifestPath):
+        return false
+    if strings.Len(routeReplayManifestPath) <= 0 || !chengpath.PathFileExists(routeReplayManifestPath):
+        return false
+    if strings.Len(interactionManifestPath) <= 0 || !chengpath.PathFileExists(interactionManifestPath):
+        return false
+    let surfaceText: str = chengpath.ReadTextFile("", surfaceManifestPath)
+    let routeText: str = chengpath.ReadTextFile("", routeReplayManifestPath)
+    let interactionText: str = chengpath.ReadTextFile("", interactionManifestPath)
+    if nativeGuiRuntimeJsonReadStringField(surfaceText, "format", "") != "native_surface_frame_manifest_v1":
+        return false
+    if nativeGuiRuntimeJsonReadStringField(routeText, "format", "") != "native_gui_route_replay_manifest_v1":
+        return false
+    if nativeGuiRuntimeJsonReadStringField(interactionText, "format", "") != "native_gui_interaction_manifest_v1":
+        return false
+    if nativeGuiRuntimeJsonReadStringField(interactionText, "event_loop", "") != "event_driven_v1":
+        return false
+    let framePath: str = nativeGuiRuntimeJsonReadStringField(surfaceText, "frame_path", "")
+    let frameFormat: str = nativeGuiRuntimeJsonReadStringField(surfaceText, "frame_format", "surface_frame_rgba_v1")
+    let pixelFormat: str = nativeGuiRuntimeJsonReadStringField(surfaceText, "pixel_format", "rgba8_unpremultiplied")
+    let width: int32 = nativeGuiRuntimeJsonReadIntField(surfaceText, "width", 0)
+    let height: int32 = nativeGuiRuntimeJsonReadIntField(surfaceText, "height", 0)
+    let strideBytes: int32 = nativeGuiRuntimeJsonReadIntField(surfaceText, "stride_bytes", 0)
+    let frameByteCount: int32 = nativeGuiRuntimeJsonReadIntField(surfaceText, "frame_byte_count", 0)
+    if strings.Len(framePath) <= 0 || !chengpath.PathFileExists(framePath):
+        return false
+    if width <= 0 || height <= 0 || strideBytes <= 0 || frameByteCount <= 0:
+        return false
+    let androidBinding: str = nativeGuiRuntimeJsonReadStringField(surfaceText, "android_surface_binding", "ANativeWindow_rgba_blit_v1")
+    let iosBinding: str = nativeGuiRuntimeJsonReadStringField(surfaceText, "ios_surface_binding", "CAMetalLayer_rgba_blit_v1")
+    let ohosBinding: str = nativeGuiRuntimeJsonReadStringField(surfaceText, "ohos_surface_binding", "OHNativeWindow_rgba_blit_v1")
+    let routeCount: int32 = nativeGuiRuntimeJsonReadIntField(routeText, "route_count", 0)
+    let activeRoute: str = nativeGuiRuntimeJsonReadStringField(routeText, "active_route_state", "")
+    var doc = "{\n"
+    doc = doc + "  \"format\": \"native_platform_shell_manifest_v1\",\n"
+    doc = doc + "  \"ready\": true,\n"
+    doc = doc + "  \"generated_by\": \"cheng.native_gui_runtime_v1\",\n"
+    doc = doc + "  \"runtime_purity\": {\"node\": false, \"react\": false, \"webview_business_layer\": false, \"business_js\": false},\n"
+    doc = doc + "  \"surface_frame_path\": " + nativeGuiRuntimeJsonQuote(framePath) + ",\n"
+    doc = doc + "  \"surface_manifest_path\": " + nativeGuiRuntimeJsonQuote(surfaceManifestPath) + ",\n"
+    doc = doc + "  \"route_replay_manifest_path\": " + nativeGuiRuntimeJsonQuote(routeReplayManifestPath) + ",\n"
+    doc = doc + "  \"interaction_manifest_path\": " + nativeGuiRuntimeJsonQuote(interactionManifestPath) + ",\n"
+    doc = doc + "  \"frame_format\": " + nativeGuiRuntimeJsonQuote(frameFormat) + ",\n"
+    doc = doc + "  \"pixel_format\": " + nativeGuiRuntimeJsonQuote(pixelFormat) + ",\n"
+    doc = doc + "  \"width\": " + intToStr(width) + ",\n"
+    doc = doc + "  \"height\": " + intToStr(height) + ",\n"
+    doc = doc + "  \"stride_bytes\": " + intToStr(strideBytes) + ",\n"
+    doc = doc + "  \"frame_byte_count\": " + intToStr(frameByteCount) + ",\n"
+    doc = doc + "  \"route_count\": " + intToStr(routeCount) + ",\n"
+    doc = doc + "  \"active_route_state\": " + nativeGuiRuntimeJsonQuote(activeRoute) + ",\n"
+    doc = doc + "  \"event_loop\": \"event_driven_v1\",\n"
+    doc = doc + "  \"platforms\": [\n"
+    doc = doc + "    {\"id\":\"android\",\"shell_kind\":\"cheng_generated_android_surface_shell_v1\",\"surface_binding\":" + nativeGuiRuntimeJsonQuote(androidBinding) + ",\"input_binding\":\"AInputQueue_event_driven_v1\",\"blit_contract\":\"rgba8_stride_copy_v1\"},\n"
+    doc = doc + "    {\"id\":\"ios\",\"shell_kind\":\"cheng_generated_ios_surface_shell_v1\",\"surface_binding\":" + nativeGuiRuntimeJsonQuote(iosBinding) + ",\"input_binding\":\"UIKit_touch_event_driven_v1\",\"blit_contract\":\"rgba8_stride_copy_v1\"},\n"
+    doc = doc + "    {\"id\":\"ohos\",\"shell_kind\":\"cheng_generated_ohos_surface_shell_v1\",\"surface_binding\":" + nativeGuiRuntimeJsonQuote(ohosBinding) + ",\"input_binding\":\"XComponent_event_driven_v1\",\"blit_contract\":\"rgba8_stride_copy_v1\"}\n"
+    doc = doc + "  ]\n"
+    doc = doc + "}\n"
+    return chengpath.WriteTextFile("", outPath, doc)
+
 fn NativeGuiRuntimeMain(): int32 =
     let contractPath: str = cmdline.ReadFlagOrDefault("--runtime-contract", "")
     if strings.Len(contractPath) <= 0:
@@ -365,10 +500,65 @@ fn NativeGuiRuntimeMain(): int32 =
         return 4
     let stateDoc: str = nativeGuiRuntimeStateDoc(contractText)
     let renderPlanDoc: str = nativeGuiRuntimeRenderPlanDoc(contractText, stateDoc)
+    let screenshotOut: str = cmdline.ReadFlagOrDefault("--screenshot-out", "")
+    if strings.Len(screenshotOut) > 0:
+        if !nativefb.WriteNativeRenderPlanPng(renderPlanDoc, screenshotOut):
+            return 5
+    let surfaceFrameOut: str = cmdline.ReadFlagOrDefault("--surface-frame-out", "")
+    let surfaceManifestOut: str = cmdline.ReadFlagOrDefault("--surface-manifest-out", "")
+    if (strings.Len(surfaceFrameOut) > 0 && strings.Len(surfaceManifestOut) <= 0) ||
+       (strings.Len(surfaceManifestOut) > 0 && strings.Len(surfaceFrameOut) <= 0):
+        return 6
+    if strings.Len(surfaceFrameOut) > 0:
+        if !nativeGuiRuntimeWriteSurfaceArtifacts(renderPlanDoc, surfaceFrameOut, surfaceManifestOut):
+            return 7
+    let routeReplayManifestOut: str = cmdline.ReadFlagOrDefault("--route-replay-manifest-out", "")
+    let routeCatalogPath: str = cmdline.ReadFlagOrDefault("--route-catalog-path", "")
+    if strings.Len(routeReplayManifestOut) > 0:
+        if !nativeGuiRuntimeWriteRouteReplayManifest(contractText,
+                                                     stateDoc,
+                                                     renderPlanDoc,
+                                                     routeCatalogPath,
+                                                     surfaceFrameOut,
+                                                     surfaceManifestOut,
+                                                     routeReplayManifestOut):
+            return 8
+    let interactionManifestOut: str = cmdline.ReadFlagOrDefault("--interaction-manifest-out", "")
+    if strings.Len(interactionManifestOut) > 0:
+        if !nativeGuiRuntimeWriteInteractionManifest(stateDoc, interactionManifestOut):
+            return 9
+    let platformShellManifestOut: str = cmdline.ReadFlagOrDefault("--platform-shell-manifest-out", "")
+    if strings.Len(platformShellManifestOut) > 0:
+        if !nativeGuiRuntimeWritePlatformShellManifest(surfaceManifestOut,
+                                                       routeReplayManifestOut,
+                                                       interactionManifestOut,
+                                                       platformShellManifestOut):
+            return 10
+    let platformShellPlanDir: str = cmdline.ReadFlagOrDefault("--platform-shell-plan-dir", "")
+    if strings.Len(platformShellPlanDir) > 0:
+        if strings.Len(platformShellManifestOut) <= 0:
+            return 11
+        if !shellruntime.WriteNativePlatformShellLaunchPlans(platformShellManifestOut,
+                                                            platformShellPlanDir):
+            return 12
+    let platformShellPackageManifestOut: str = cmdline.ReadFlagOrDefault("--platform-shell-package-manifest-out", "")
+    if strings.Len(platformShellPackageManifestOut) > 0:
+        if strings.Len(platformShellPlanDir) <= 0:
+            return 13
+        if !shellpackage.WriteNativePlatformShellPackageManifest(platformShellPlanDir,
+                                                                 platformShellPackageManifestOut):
+            return 14
     var doc = "{"
     doc = doc + "\"format\":\"native_gui_runtime_v1\","
     doc = doc + "\"ready\":true,"
     doc = doc + "\"reason\":\"ok\","
+    doc = doc + "\"surface_frame_path\":" + nativeGuiRuntimeJsonQuote(surfaceFrameOut) + ","
+    doc = doc + "\"surface_manifest_path\":" + nativeGuiRuntimeJsonQuote(surfaceManifestOut) + ","
+    doc = doc + "\"route_replay_manifest_path\":" + nativeGuiRuntimeJsonQuote(routeReplayManifestOut) + ","
+    doc = doc + "\"interaction_manifest_path\":" + nativeGuiRuntimeJsonQuote(interactionManifestOut) + ","
+    doc = doc + "\"platform_shell_manifest_path\":" + nativeGuiRuntimeJsonQuote(platformShellManifestOut) + ","
+    doc = doc + "\"platform_shell_plan_dir\":" + nativeGuiRuntimeJsonQuote(platformShellPlanDir) + ","
+    doc = doc + "\"platform_shell_package_manifest_path\":" + nativeGuiRuntimeJsonQuote(platformShellPackageManifestOut) + ","
     doc = doc + "\"state\":" + stateDoc + ","
     doc = doc + "\"render_plan\":" + renderPlanDoc
     doc = doc + "}"
