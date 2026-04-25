@@ -21,6 +21,9 @@ type
         functionWordOffsets: int32[]
         functionWordCounts: int32[]
         functionBodyKinds: str[]
+        functionStatementReturnModes: int32[]
+        functionStatementReturnI32Values: int32[]
+        functionStatementCallCounts: int32[]
         instructionWords: int32[]
         dataLabels: str[]
         dataPayloadTexts: str[]
@@ -35,16 +38,6 @@ type
         missingReasons: str[]
         pipelineStage: str
 
-const
-    PrimaryEntryBridgeWordCount = 17
-    PrimaryLetCallNoargReturnI32ConstPrefix = "let_call_noarg_return_i32_const_"
-    PrimaryLetCallNoargReturnResultI32Kind = "let_call_noarg_return_result_i32"
-    PrimaryLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind = "let_call_noarg_i32_if_result_le_zero_return_zero_else_result_i32"
-    PrimaryLetCallNoargStrReturnLenI32Kind = "let_call_noarg_str_return_len_i32"
-    PrimaryLetCallNoargStrThenCallArg0ReturnI32Const0Kind = "let_call_noarg_str_then_call_arg0_return_i32_const_0"
-    PrimaryStrI32GuardArg0Return0Kind = "str_i32_guard_arg0_return_0"
-    PrimaryI32IfArg0LeZeroConst0Else7BodyKind = "if_arg0_le_zero_return_i32_const_0_else_i32_const_7"
-
 fn PrimaryTargetSymbolName(targetTriple: str,
                              raw: str): str =
     if targetTriple == "arm64-apple-darwin" ||
@@ -54,7 +47,7 @@ fn PrimaryTargetSymbolName(targetTriple: str,
             return raw
         if len(raw) >= 2 && raw[0] == 'L' && raw[1] == '_':
             return raw
-        return Fmt(["_", raw])
+        return Fmt"_{raw}"
     return raw
 
 fn PrimarySanitizeSymbolPart(text: str): str =
@@ -65,9 +58,9 @@ fn PrimarySanitizeSymbolPart(text: str): str =
         let upper = ch >= 'A' && ch <= 'Z'
         let lower = ch >= 'a' && ch <= 'z'
         if digit || upper || lower || ch == '_':
-            out = Fmt([out, strings.SliceBytes(text, i, 1)])
+            out = Fmt"{out}{strings.SliceBytes(text, i, 1)}"
         else:
-            out = Fmt([out, "_"])
+            out = Fmt"{out}_"
     return out
 
 fn PrimarySymbolNameForFunction(targetTriple: str,
@@ -84,7 +77,7 @@ fn PrimarySymbolNameForFunction(targetTriple: str,
                 lineScoped = true
     raw = PrimarySanitizeSymbolPart(raw)
     if lineScoped && signatureLineNumber > 0:
-        raw = Fmt([raw, "__L", strings.IntToStr(signatureLineNumber)])
+        raw = Fmt"{raw}__L{strings.IntToStr(signatureLineNumber)}"
     return PrimaryTargetSymbolName(targetTriple, raw)
 
 fn PrimaryRuntimeEntryBridgeSymbol(linkPlan: slplan.SystemLinkPlanStub): str =
@@ -188,71 +181,114 @@ fn PrimaryIntSeqInit(count: int32,
         add(out, value)
     return out
 
-fn PrimaryIsReturnCallBodyKind(bodyKind: str): bool =
-    return bodyKind == "return_call_noarg_i32" ||
-           bodyKind == "return_call_arg0_i32" ||
-           bodyKind == "return_call_arg0_arg1_i32" ||
-           bodyKind == "return_call_arg0_arg1_arg2_i32"
-
 fn PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind: str): bool =
-    return PrimaryStartsWith(bodyKind, PrimaryLetCallNoargReturnI32ConstPrefix)
+    return PrimaryStartsWith(bodyKind, texpr.BodyKindLetCallNoargReturnI32ConstPrefix)
 
-fn PrimaryIsLetCallNoargReturnResultI32BodyKind(bodyKind: str): bool =
-    return bodyKind == PrimaryLetCallNoargReturnResultI32Kind
+fn PrimaryStatementReturnModeNone(): int32 =
+    return 0
 
-fn PrimaryIsLetCallNoargStrReturnLenI32BodyKind(bodyKind: str): bool =
-    return bodyKind == PrimaryLetCallNoargStrReturnLenI32Kind
+fn PrimaryStatementReturnModeI32Const(): int32 =
+    return 1
 
-fn PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind: str): bool =
-    return bodyKind == PrimaryLetCallNoargStrThenCallArg0ReturnI32Const0Kind
+fn PrimaryStatementReturnModeCallResultI32(): int32 =
+    return 2
 
-fn PrimaryIsCallRelocBodyKind(bodyKind: str): bool =
-    return PrimaryIsReturnCallBodyKind(bodyKind) ||
-           PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind) ||
-           PrimaryIsLetCallNoargReturnResultI32BodyKind(bodyKind) ||
-           bodyKind == PrimaryLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind ||
-           PrimaryIsLetCallNoargStrReturnLenI32BodyKind(bodyKind) ||
-           PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind) ||
-           bodyKind == PrimaryStrI32GuardArg0Return0Kind
+fn PrimaryStatementReturnModeI32GuardResultLeZero(): int32 =
+    return 3
+
+fn PrimaryStatementReturnModeStrLen(): int32 =
+    return 4
+
+fn PrimaryStatementReturnModeStrThenCallReturnI32Const0(): int32 =
+    return 5
+
+fn PrimaryStatementReturnModeStrI32GuardArg0Return0(): int32 =
+    return 6
+
+fn PrimaryStatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32(): int32 =
+    return 7
+
+fn PrimaryStatementSequenceReturnMode(bodyKind: str): int32 =
+    if PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+        return PrimaryStatementReturnModeI32Const()
+    if texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
+        return PrimaryStatementReturnModeCallResultI32()
+    if bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
+        return PrimaryStatementReturnModeI32GuardResultLeZero()
+    if texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
+        return PrimaryStatementReturnModeStrLen()
+    if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+        return PrimaryStatementReturnModeStrThenCallReturnI32Const0()
+    if bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
+        return PrimaryStatementReturnModeStrI32GuardArg0Return0()
+    if bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
+        return PrimaryStatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32()
+    return PrimaryStatementReturnModeNone()
+
+fn PrimaryStatementSequenceI32Value(bodyKind: str): int32 =
+    if PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+        let prefix = texpr.BodyKindLetCallNoargReturnI32ConstPrefix
+        let raw = strings.SliceBytes(bodyKind, len(prefix), len(bodyKind) - len(prefix))
+        return int32(strutil.ParseInt(raw))
+    if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+        return 0
+    return 0
+
+fn PrimaryPlanBodyKind(bodyKind: str): str =
+    if PrimaryStatementSequenceReturnMode(bodyKind) != PrimaryStatementReturnModeNone():
+        return texpr.BodyKindStatementSequence
+    return bodyKind
 
 fn PrimaryFunctionWordCountForBodyKind(bodyKind: str): int32 =
-    if bodyKind == "return_zero_i32":
+    if bodyKind == texpr.BodyKindReturnZeroI32:
         return 2
-    if PrimaryStartsWith(bodyKind, "return_i32_const_"):
+    if PrimaryStartsWith(bodyKind, texpr.BodyKindReturnI32ConstPrefix):
         return 2
-    if PrimaryIsReturnCallBodyKind(bodyKind):
+    if bodyKind == texpr.BodyKindReturnI32Arg0:
+        return 1
+    if bodyKind == texpr.BodyKindReturnI32Arg1 ||
+       bodyKind == texpr.BodyKindReturnI32Arg2 ||
+       bodyKind == texpr.BodyKindReturnI32Arg3:
+        return 2
+    if texpr.TypedExprIsReturnCallBodyKind(bodyKind):
         return 1
     if PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
         return 6
-    if PrimaryIsLetCallNoargReturnResultI32BodyKind(bodyKind):
+    if texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
         return 5
-    if bodyKind == PrimaryLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind:
+    if bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
         return 10
-    if PrimaryIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
+    if texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
         return 12
-    if PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+    if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
         return 9
-    if bodyKind == PrimaryStrI32GuardArg0Return0Kind:
+    if bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
         return 14
-    if bodyKind == "return_str_empty":
-        return 4
-    if bodyKind == PrimaryI32IfArg0LeZeroConst0Else7BodyKind:
-        return 6
-    if bodyKind == "return_f64_mul_args":
-        return 2
-    if bodyKind == "return_i32_add_args":
-        return 2
-    if bodyKind == "return_i32_sub_args":
-        return 2
-    if bodyKind == "return_i32_mul_args":
-        return 2
-    if bodyKind == "return_i32_asr_args":
-        return 2
-    if bodyKind == "return_i32_madd_args":
-        return 2
-    if bodyKind == "str_len_fast_i32":
+    if bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
+        return 18
+    if bodyKind == texpr.BodyKindReturnStrArg0:
         return 7
-    if bodyKind == "main_f64_mul_check_exit":
+    if bodyKind == texpr.BodyKindReturnStrEmpty:
+        return 4
+    if bodyKind == texpr.BodyKindCstringToStrCopy:
+        return 32
+    if bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
+        return 6
+    if bodyKind == texpr.BodyKindReturnF64MulArgs:
+        return 2
+    if bodyKind == texpr.BodyKindReturnI32AddArgs:
+        return 2
+    if bodyKind == texpr.BodyKindReturnI32SubArgs:
+        return 2
+    if bodyKind == texpr.BodyKindReturnI32MulArgs:
+        return 2
+    if bodyKind == texpr.BodyKindReturnI32AsrArgs:
+        return 2
+    if bodyKind == texpr.BodyKindReturnI32MaddArgs:
+        return 2
+    if bodyKind == texpr.BodyKindStrLenFastI32:
+        return 7
+    if bodyKind == texpr.BodyKindMainF64MulCheckExit:
         return 22
     return 0
 
@@ -280,7 +316,11 @@ fn PrimaryObjectMissingLineNumber(lowering: lower.LoweringPlanStub,
                                    irIndex: int32): int32 =
     if irIndex < 0 || irIndex >= lowering.primaryObjectIr.functions.len:
         return 0
-    return lowering.primaryObjectIr.functions[irIndex].bodyLineNumber
+    let irFunction = lowering.primaryObjectIr.functions[irIndex]
+    if irFunction.bodyKind == texpr.BodyKindUnsupported &&
+       irFunction.statements.len > 0:
+        return irFunction.statements[0].lineNumber
+    return irFunction.bodyLineNumber
 
 fn PrimaryTypedIrFunctionIndex(ir: texpr.TypedExprIr,
                                 sourcePath: str,
@@ -299,8 +339,16 @@ fn PrimaryObjectMissingTypedIrKind(lowering: lower.LoweringPlanStub,
     if irIndex < 0 || irIndex >= lowering.primaryObjectIr.functions.len:
         return ""
     let irFunction = lowering.primaryObjectIr.functions[irIndex]
-    if irFunction.bodyKind != "unsupported":
+    if irFunction.bodyKind != texpr.BodyKindUnsupported:
         return ""
+    for stmtIndex in 0..<irFunction.statements.len:
+        let stmt = irFunction.statements[stmtIndex]
+        if stmt.kind == texpr.TypedExprIrStmtLetCall:
+            return "stmt_let_call"
+        if stmt.kind == texpr.TypedExprIrStmtIfCall:
+            return "stmt_if_call"
+        if stmt.kind == texpr.TypedExprIrStmtCall:
+            return "stmt_call"
     let typedIndex = PrimaryTypedIrFunctionIndex(lowering.typedIr,
                                                 irFunction.sourcePath,
                                                 irFunction.functionName)
@@ -313,6 +361,19 @@ fn PrimaryObjectMissingTypedIrKind(lowering: lower.LoweringPlanStub,
     for nodeIndex in typedFunction.nodeStart..<nodeEnd:
         if lowering.typedIr.nodes[nodeIndex].opKind == texpr.TypedExprIrOpLetCall:
             return "stmt_let_call"
+    let stmtStart = typedFunction.statementStart
+    let stmtEnd = stmtStart + typedFunction.statementCount
+    if stmtStart >= 0 && stmtStart < lowering.typedIr.statements.len:
+        var safeStmtEnd = stmtEnd
+        if safeStmtEnd > lowering.typedIr.statements.len:
+            safeStmtEnd = lowering.typedIr.statements.len
+        for stmtIndex in stmtStart..<safeStmtEnd:
+            if lowering.typedIr.statements[stmtIndex].kind == texpr.TypedExprIrStmtLetCall:
+                return "stmt_let_call"
+            if lowering.typedIr.statements[stmtIndex].kind == texpr.TypedExprIrStmtIfCall:
+                return "stmt_if_call"
+            if lowering.typedIr.statements[stmtIndex].kind == texpr.TypedExprIrStmtCall:
+                return "stmt_call"
     return ""
 
 fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
@@ -323,6 +384,9 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     var functionWordOffsets: int32[]
     var functionWordCounts: int32[]
     var functionBodyKinds: str[]
+    var functionStatementReturnModes: int32[]
+    var functionStatementReturnI32Values: int32[]
+    var functionStatementCallCounts: int32[]
     var relocSourceItemIds: int32[]
     var relocWordOffsets: int32[]
     var relocTargetSymbols: str[]
@@ -344,13 +408,21 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     functionWordOffsets = []
     functionWordCounts = []
     functionBodyKinds = []
+    functionStatementReturnModes = []
+    functionStatementReturnI32Values = []
+    functionStatementCallCounts = []
     relocSourceItemIds = []
     relocWordOffsets = []
     relocTargetSymbols = []
     irIndexes = PrimaryIntSeqInit(lowering.functionNames.len, -1)
     wordCounts = PrimaryIntSeqInit(lowering.functionNames.len, 0)
     reachable = PrimaryBoolSeqInit(lowering.functionNames.len, false)
-    let emitObjectRootsAllFunctions = linkPlan.emitKind == creq.EmitObj
+    var exportedFunctionCount: int32
+    if linkPlan.emitKind == creq.EmitObj:
+        for i in 0..<lowering.functionExportedFlags.len:
+            if lowering.functionExportedFlags[i] != 0:
+                exportedFunctionCount = exportedFunctionCount + 1
+    let emitObjectRootsAllFunctions = linkPlan.emitKind == creq.EmitObj && exportedFunctionCount <= 0
     for i in 0..<lowering.functionNames.len:
         let sourcePath = lowering.functionSourcePaths[i]
         let irIndex = PrimaryObjectIrFunctionIndex(lowering.primaryObjectIr,
@@ -361,14 +433,24 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
             signatureLineNumber = lowering.primaryObjectIr.functions[irIndex].signatureLineNumber
             irIndexes[i] = irIndex
             wordCounts[i] = PrimaryFunctionWordCountForBodyKind(lowering.primaryObjectIr.functions[irIndex].bodyKind)
+        var symbolText = lowering.functionSymbolTexts[i]
+        if i < lowering.functionExportedFlags.len &&
+           i < lowering.functionExportSymbolNames.len &&
+           lowering.functionExportedFlags[i] != 0 &&
+           len(lowering.functionExportSymbolNames[i]) > 0:
+            symbolText = lowering.functionExportSymbolNames[i]
         add(allSymbolNames,
             PrimarySymbolNameForFunction(linkPlan.targetTriple,
-                                           lowering.functionSymbolTexts[i],
+                                           symbolText,
                                            signatureLineNumber,
                                            linkPlan.emitKind))
         if i < lowering.functionEntryFlags.len && lowering.functionEntryFlags[i] != 0:
             entryFunctionSymbol = allSymbolNames[allSymbolNames.len - 1]
+        let emitObjectRootExported = linkPlan.emitKind == creq.EmitObj &&
+                                     i < lowering.functionExportedFlags.len &&
+                                     lowering.functionExportedFlags[i] != 0
         if emitObjectRootsAllFunctions ||
+           emitObjectRootExported ||
            (i < lowering.functionEntryFlags.len && lowering.functionEntryFlags[i] != 0):
             reachable[i] = true
             add(frontier, i)
@@ -405,91 +487,43 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                     firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
                 continue
             let bodyKind = irFunction.bodyKind
-            if PrimaryIsCallRelocBodyKind(bodyKind):
-                if !irFunction.callTargetImportc:
-                    let targetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
-                                                                  lowering.functionSourcePaths,
-                                                                  irFunction.callTargetSourcePath,
-                                                                  irFunction.callTarget)
-                    if targetIndex < 0 || targetIndex >= reachable.len:
-                        bodySemanticsMissing = true
-                        if len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[currentIndex]
-                            firstMissingBodyKind = "missing_call_target"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                        continue
-                    if !reachable[targetIndex]:
-                        reachable[targetIndex] = true
-                        add(nextFrontier, targetIndex)
-                if PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind) &&
-                   !irFunction.secondCallTargetImportc:
-                    let secondTargetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
-                                                                       lowering.functionSourcePaths,
-                                                                       irFunction.secondCallTargetSourcePath,
-                                                                       irFunction.secondCallTarget)
-                    if secondTargetIndex < 0 || secondTargetIndex >= reachable.len:
-                        bodySemanticsMissing = true
-                        if len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[currentIndex]
-                            firstMissingBodyKind = "missing_second_call_target"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                        continue
-                    if !reachable[secondTargetIndex]:
-                        reachable[secondTargetIndex] = true
-                        add(nextFrontier, secondTargetIndex)
-                if bodyKind == PrimaryStrI32GuardArg0Return0Kind &&
-                   !irFunction.secondCallTargetImportc:
-                    let secondTargetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
-                                                                       lowering.functionSourcePaths,
-                                                                       irFunction.secondCallTargetSourcePath,
-                                                                       irFunction.secondCallTarget)
-                    if secondTargetIndex < 0 || secondTargetIndex >= reachable.len:
-                        bodySemanticsMissing = true
-                        if len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[currentIndex]
-                            firstMissingBodyKind = "missing_second_call_target"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                        continue
-                    if !reachable[secondTargetIndex]:
-                        reachable[secondTargetIndex] = true
-                        add(nextFrontier, secondTargetIndex)
-                if bodyKind == PrimaryStrI32GuardArg0Return0Kind &&
-                   !irFunction.thirdCallTargetImportc:
-                    let thirdTargetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
+            if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
+               PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+                var callSequenceReady = true
+                if irFunction.callTargets.len <= 0 ||
+                   irFunction.callArgCounts.len != irFunction.callTargets.len ||
+                   irFunction.callTargetSourcePaths.len != irFunction.callTargets.len ||
+                   irFunction.callTargetImportcFlags.len != irFunction.callTargets.len ||
+                   irFunction.callImportcSymbols.len != irFunction.callTargets.len:
+                    callSequenceReady = false
+                    bodySemanticsMissing = true
+                    if len(firstMissingFunction) <= 0:
+                        firstMissingFunction = lowering.functionNames[currentIndex]
+                        firstMissingBodyKind = "missing_call_sequence"
+                        firstMissingTypedIrKind = ""
+                        firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                if callSequenceReady:
+                    for callOrdinal in 0..<irFunction.callTargets.len:
+                        if irFunction.callTargetImportcFlags[callOrdinal]:
+                            continue
+                        let targetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
                                                                       lowering.functionSourcePaths,
-                                                                      irFunction.thirdCallTargetSourcePath,
-                                                                      irFunction.thirdCallTarget)
-                    if thirdTargetIndex < 0 || thirdTargetIndex >= reachable.len:
-                        bodySemanticsMissing = true
-                        if len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[currentIndex]
-                            firstMissingBodyKind = "missing_third_call_target"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                        continue
-                    if !reachable[thirdTargetIndex]:
-                        reachable[thirdTargetIndex] = true
-                        add(nextFrontier, thirdTargetIndex)
-                if bodyKind == PrimaryStrI32GuardArg0Return0Kind &&
-                   !irFunction.fourthCallTargetImportc:
-                    let fourthTargetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
-                                                                       lowering.functionSourcePaths,
-                                                                       irFunction.fourthCallTargetSourcePath,
-                                                                       irFunction.fourthCallTarget)
-                    if fourthTargetIndex < 0 || fourthTargetIndex >= reachable.len:
-                        bodySemanticsMissing = true
-                        if len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[currentIndex]
-                            firstMissingBodyKind = "missing_fourth_call_target"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                        continue
-                    if !reachable[fourthTargetIndex]:
-                        reachable[fourthTargetIndex] = true
-                        add(nextFrontier, fourthTargetIndex)
+                                                                      irFunction.callTargetSourcePaths[callOrdinal],
+                                                                      irFunction.callTargets[callOrdinal])
+                        if targetIndex < 0 || targetIndex >= reachable.len:
+                            callSequenceReady = false
+                            bodySemanticsMissing = true
+                            if len(firstMissingFunction) <= 0:
+                                firstMissingFunction = lowering.functionNames[currentIndex]
+                                firstMissingBodyKind = "missing_call_target"
+                                firstMissingTypedIrKind = ""
+                                firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                            break
+                        if !reachable[targetIndex]:
+                            reachable[targetIndex] = true
+                            add(nextFrontier, targetIndex)
+                if !callSequenceReady:
+                    continue
         frontier = nextFrontier
     if linkPlan.emitKind == creq.EmitExe:
         for i in 0..<lowering.functionNames.len:
@@ -499,16 +533,14 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
             if irIndex < 0 || wordCounts[i] <= 0:
                 continue
             let bodyKind = lowering.primaryObjectIr.functions[irIndex].bodyKind
-            if PrimaryIsCallRelocBodyKind(bodyKind):
+            if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
+               PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
                 continue
             reachable[i] = true
     for i in 0..<lowering.functionNames.len:
         if i >= reachable.len || !reachable[i]:
             continue
-        var targetSymbol = ""
-        var secondTargetSymbol = ""
-        var thirdTargetSymbol = ""
-        var fourthTargetSymbol = ""
+        var targetSymbols: str[]
         let irIndex = irIndexes[i]
         if irIndex < 0:
             bodySemanticsMissing = true
@@ -520,111 +552,58 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
             continue
         let irFunction = lowering.primaryObjectIr.functions[irIndex]
         let bodyKind = irFunction.bodyKind
-        if PrimaryIsCallRelocBodyKind(bodyKind):
-            if irFunction.callTargetImportc:
-                targetSymbol = PrimaryTargetSymbolName(linkPlan.targetTriple,
-                                                       irFunction.callImportcSymbol)
-            else:
-                let targetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
-                                                              lowering.functionSourcePaths,
-                                                              irFunction.callTargetSourcePath,
-                                                              irFunction.callTarget)
-                if targetIndex >= 0 && targetIndex < allSymbolNames.len && targetIndex < reachable.len && reachable[targetIndex]:
-                    targetSymbol = allSymbolNames[targetIndex]
-                else:
-                    bodySemanticsMissing = true
-                    if len(firstMissingFunction) <= 0:
-                        firstMissingFunction = lowering.functionNames[i]
-                        firstMissingBodyKind = "missing_call_target"
-                        firstMissingTypedIrKind = ""
-                        firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                    continue
-            if PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
-                if irFunction.secondCallTargetImportc:
-                    secondTargetSymbol = PrimaryTargetSymbolName(linkPlan.targetTriple,
-                                                                 irFunction.secondCallImportcSymbol)
-                else:
-                    let secondTargetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
-                                                                       lowering.functionSourcePaths,
-                                                                       irFunction.secondCallTargetSourcePath,
-                                                                       irFunction.secondCallTarget)
-                    if secondTargetIndex >= 0 &&
-                       secondTargetIndex < allSymbolNames.len &&
-                       secondTargetIndex < reachable.len &&
-                       reachable[secondTargetIndex]:
-                        secondTargetSymbol = allSymbolNames[secondTargetIndex]
+        if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
+           PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+            var callSequenceReady = true
+            if irFunction.callTargets.len <= 0 ||
+               irFunction.callArgCounts.len != irFunction.callTargets.len ||
+               irFunction.callTargetSourcePaths.len != irFunction.callTargets.len ||
+               irFunction.callTargetImportcFlags.len != irFunction.callTargets.len ||
+               irFunction.callImportcSymbols.len != irFunction.callTargets.len:
+                callSequenceReady = false
+                bodySemanticsMissing = true
+                if len(firstMissingFunction) <= 0:
+                    firstMissingFunction = lowering.functionNames[i]
+                    firstMissingBodyKind = "missing_call_sequence"
+                    firstMissingTypedIrKind = ""
+                    firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+            if callSequenceReady:
+                for callOrdinal in 0..<irFunction.callTargets.len:
+                    var targetSymbol = ""
+                    if irFunction.callTargetImportcFlags[callOrdinal]:
+                        if callOrdinal >= irFunction.callImportcSymbols.len:
+                            callSequenceReady = false
+                            bodySemanticsMissing = true
+                            if len(firstMissingFunction) <= 0:
+                                firstMissingFunction = lowering.functionNames[i]
+                                firstMissingBodyKind = "missing_call_sequence"
+                                firstMissingTypedIrKind = ""
+                                firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                            break
+                        targetSymbol = PrimaryTargetSymbolName(linkPlan.targetTriple,
+                                                               irFunction.callImportcSymbols[callOrdinal])
                     else:
-                        bodySemanticsMissing = true
-                        if len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[i]
-                            firstMissingBodyKind = "missing_second_call_target"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                        continue
-            if bodyKind == PrimaryStrI32GuardArg0Return0Kind:
-                if irFunction.secondCallTargetImportc:
-                    secondTargetSymbol = PrimaryTargetSymbolName(linkPlan.targetTriple,
-                                                                 irFunction.secondCallImportcSymbol)
-                else:
-                    let secondTargetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
-                                                                       lowering.functionSourcePaths,
-                                                                       irFunction.secondCallTargetSourcePath,
-                                                                       irFunction.secondCallTarget)
-                    if secondTargetIndex >= 0 &&
-                       secondTargetIndex < allSymbolNames.len &&
-                       secondTargetIndex < reachable.len &&
-                       reachable[secondTargetIndex]:
-                        secondTargetSymbol = allSymbolNames[secondTargetIndex]
-                    else:
-                        bodySemanticsMissing = true
-                        if len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[i]
-                            firstMissingBodyKind = "missing_second_call_target"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                        continue
-                if irFunction.thirdCallTargetImportc:
-                    thirdTargetSymbol = PrimaryTargetSymbolName(linkPlan.targetTriple,
-                                                                irFunction.thirdCallImportcSymbol)
-                else:
-                    let thirdTargetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
+                        let targetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
                                                                       lowering.functionSourcePaths,
-                                                                      irFunction.thirdCallTargetSourcePath,
-                                                                      irFunction.thirdCallTarget)
-                    if thirdTargetIndex >= 0 &&
-                       thirdTargetIndex < allSymbolNames.len &&
-                       thirdTargetIndex < reachable.len &&
-                       reachable[thirdTargetIndex]:
-                        thirdTargetSymbol = allSymbolNames[thirdTargetIndex]
-                    else:
-                        bodySemanticsMissing = true
-                        if len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[i]
-                            firstMissingBodyKind = "missing_third_call_target"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                        continue
-                if irFunction.fourthCallTargetImportc:
-                    fourthTargetSymbol = PrimaryTargetSymbolName(linkPlan.targetTriple,
-                                                                 irFunction.fourthCallImportcSymbol)
-                else:
-                    let fourthTargetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
-                                                                       lowering.functionSourcePaths,
-                                                                       irFunction.fourthCallTargetSourcePath,
-                                                                       irFunction.fourthCallTarget)
-                    if fourthTargetIndex >= 0 &&
-                       fourthTargetIndex < allSymbolNames.len &&
-                       fourthTargetIndex < reachable.len &&
-                       reachable[fourthTargetIndex]:
-                        fourthTargetSymbol = allSymbolNames[fourthTargetIndex]
-                    else:
-                        bodySemanticsMissing = true
-                        if len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[i]
-                            firstMissingBodyKind = "missing_fourth_call_target"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                        continue
+                                                                      irFunction.callTargetSourcePaths[callOrdinal],
+                                                                      irFunction.callTargets[callOrdinal])
+                        if targetIndex >= 0 &&
+                           targetIndex < allSymbolNames.len &&
+                           targetIndex < reachable.len &&
+                           reachable[targetIndex]:
+                            targetSymbol = allSymbolNames[targetIndex]
+                        else:
+                            callSequenceReady = false
+                            bodySemanticsMissing = true
+                            if len(firstMissingFunction) <= 0:
+                                firstMissingFunction = lowering.functionNames[i]
+                                firstMissingBodyKind = "missing_call_target"
+                                firstMissingTypedIrKind = ""
+                                firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                            break
+                    add(targetSymbols, targetSymbol)
+            if !callSequenceReady:
+                continue
         let wordCount = wordCounts[i]
         if wordCount <= 0:
             bodySemanticsMissing = true
@@ -634,41 +613,84 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                 firstMissingTypedIrKind = PrimaryObjectMissingTypedIrKind(lowering, irIndex)
                 firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
             continue
+        if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
+           PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+            var requiredCallCount = 1
+            if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+                requiredCallCount = 2
+            if bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
+                requiredCallCount = 4
+            if bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
+                requiredCallCount = 5
+            if targetSymbols.len < requiredCallCount:
+                bodySemanticsMissing = true
+                if len(firstMissingFunction) <= 0:
+                    firstMissingFunction = lowering.functionNames[i]
+                    firstMissingBodyKind = "missing_call_sequence"
+                    firstMissingTypedIrKind = ""
+                    firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                continue
         let itemId = int32(100000 + i)
         let wordOffset = totalWordCount
         add(itemIds, itemId)
         add(symbolNames, allSymbolNames[i])
         add(functionWordOffsets, wordOffset)
         add(functionWordCounts, wordCount)
-        add(functionBodyKinds, bodyKind)
-        if PrimaryIsCallRelocBodyKind(bodyKind):
+        add(functionBodyKinds, PrimaryPlanBodyKind(bodyKind))
+        add(functionStatementReturnModes, PrimaryStatementSequenceReturnMode(bodyKind))
+        add(functionStatementReturnI32Values, PrimaryStatementSequenceI32Value(bodyKind))
+        add(functionStatementCallCounts, irFunction.callTargets.len)
+        if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
+           PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
             var relocWordOffset = wordOffset
             if PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind) ||
-               PrimaryIsLetCallNoargReturnResultI32BodyKind(bodyKind) ||
-               bodyKind == PrimaryLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind:
+               texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind) ||
+               bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
                 relocWordOffset = wordOffset + 2
-            elif PrimaryIsLetCallNoargStrReturnLenI32BodyKind(bodyKind) ||
-                 PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+            elif texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind) ||
+                 texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
                 relocWordOffset = wordOffset + 3
-            elif bodyKind == PrimaryStrI32GuardArg0Return0Kind:
+            elif bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
+                relocWordOffset = wordOffset + 3
+            elif bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
                 relocWordOffset = wordOffset + 3
             add(relocSourceItemIds, itemId)
             add(relocWordOffsets, relocWordOffset)
-            add(relocTargetSymbols, targetSymbol)
-            if PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+            add(relocTargetSymbols, targetSymbols[0])
+            if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
                 add(relocSourceItemIds, itemId)
                 add(relocWordOffsets, wordOffset + 5)
-                add(relocTargetSymbols, secondTargetSymbol)
-            if bodyKind == PrimaryStrI32GuardArg0Return0Kind:
+                add(relocTargetSymbols, targetSymbols[1])
+            if bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
                 add(relocSourceItemIds, itemId)
                 add(relocWordOffsets, wordOffset + 5)
-                add(relocTargetSymbols, secondTargetSymbol)
+                add(relocTargetSymbols, targetSymbols[1])
                 add(relocSourceItemIds, itemId)
                 add(relocWordOffsets, wordOffset + 6)
-                add(relocTargetSymbols, thirdTargetSymbol)
+                add(relocTargetSymbols, targetSymbols[2])
                 add(relocSourceItemIds, itemId)
                 add(relocWordOffsets, wordOffset + 10)
-                add(relocTargetSymbols, fourthTargetSymbol)
+                add(relocTargetSymbols, targetSymbols[3])
+            if bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
+                add(relocSourceItemIds, itemId)
+                add(relocWordOffsets, wordOffset + 5)
+                add(relocTargetSymbols, targetSymbols[1])
+                add(relocSourceItemIds, itemId)
+                add(relocWordOffsets, wordOffset + 6)
+                add(relocTargetSymbols, targetSymbols[2])
+                add(relocSourceItemIds, itemId)
+                add(relocWordOffsets, wordOffset + 10)
+                add(relocTargetSymbols, targetSymbols[3])
+                add(relocSourceItemIds, itemId)
+                add(relocWordOffsets, wordOffset + 15)
+                add(relocTargetSymbols, targetSymbols[4])
+        elif bodyKind == texpr.BodyKindCstringToStrCopy:
+            add(relocSourceItemIds, itemId)
+            add(relocWordOffsets, wordOffset + 5)
+            add(relocTargetSymbols, PrimaryTargetSymbolName(linkPlan.targetTriple, "cheng_cstrlen"))
+            add(relocSourceItemIds, itemId)
+            add(relocWordOffsets, wordOffset + 11)
+            add(relocTargetSymbols, PrimaryTargetSymbolName(linkPlan.targetTriple, "driver_c_new_string_copy_n"))
         totalWordCount = totalWordCount + wordCount
     if linkPlan.emitKind == creq.EmitExe &&
        len(linkPlan.entrySymbol) > 0 &&
@@ -677,15 +699,18 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
         add(itemIds, int32(900000 + itemIds.len))
         add(symbolNames, PrimaryRuntimeEntryBridgeSymbol(linkPlan))
         add(functionWordOffsets, totalWordCount)
-        add(functionWordCounts, PrimaryEntryBridgeWordCount)
-        add(functionBodyKinds, "entry_bridge")
-        totalWordCount = totalWordCount + PrimaryEntryBridgeWordCount
+        add(functionWordCounts, texpr.BodyKindEntryBridgeWordCount)
+        add(functionBodyKinds, texpr.BodyKindEntryBridge)
+        add(functionStatementReturnModes, PrimaryStatementReturnModeNone())
+        add(functionStatementReturnI32Values, 0)
+        add(functionStatementCallCounts, 0)
+        totalWordCount = totalWordCount + texpr.BodyKindEntryBridgeWordCount
     plan.targetTriple = linkPlan.targetTriple
     plan.objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
     if linkPlan.emitKind == creq.EmitObj:
         plan.outputPath = linkPlan.outputPath
     else:
-        plan.outputPath = Fmt([linkPlan.outputPath, ".primary.o"])
+        plan.outputPath = Fmt"{linkPlan.outputPath}.primary.o"
     plan.entryPath = linkPlan.entryPath
     plan.entrySymbol = linkPlan.entrySymbol
     plan.entryFunctionSymbol = entryFunctionSymbol
@@ -694,6 +719,9 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     plan.functionWordOffsets = functionWordOffsets
     plan.functionWordCounts = functionWordCounts
     plan.functionBodyKinds = functionBodyKinds
+    plan.functionStatementReturnModes = functionStatementReturnModes
+    plan.functionStatementReturnI32Values = functionStatementReturnI32Values
+    plan.functionStatementCallCounts = functionStatementCallCounts
     plan.instructionWords = []
     for i in 0..<totalWordCount:
         add(plan.instructionWords, 0)
@@ -724,9 +752,12 @@ fn PrimaryObjectPlanIntListText(items: int32[]): str =
     var out = ""
     for i in 0..<items.len:
         if i > 0:
-            out = Fmt([out, ","])
-        out = Fmt([out, strings.IntToStr(items[i])])
+            out = Fmt"{out},"
+        out = Fmt"{out}{strings.IntToStr(items[i])}"
     return out
+
+fn PrimaryObjectPlanAppendLine(out: var str, key: str, value: str) =
+    out = Fmt"{out}{key}={value}\n"
 
 fn PrimaryObjectPlanReport(plan: PrimaryObjectPlan): str =
     var symbolText = "-"
@@ -735,6 +766,12 @@ fn PrimaryObjectPlanReport(plan: PrimaryObjectPlan): str =
     var bodyKindText = "-"
     if plan.functionBodyKinds.len > 0:
         bodyKindText = strutil.Join(plan.functionBodyKinds, ",")
+    var statementReturnModeText = "-"
+    if plan.functionStatementReturnModes.len > 0:
+        statementReturnModeText = PrimaryObjectPlanIntListText(plan.functionStatementReturnModes)
+    var statementCallCountText = "-"
+    if plan.functionStatementCallCounts.len > 0:
+        statementCallCountText = PrimaryObjectPlanIntListText(plan.functionStatementCallCounts)
     var wordOffsetText = "-"
     if plan.functionWordOffsets.len > 0:
         wordOffsetText = PrimaryObjectPlanIntListText(plan.functionWordOffsets)
@@ -751,21 +788,23 @@ fn PrimaryObjectPlanReport(plan: PrimaryObjectPlan): str =
     if len(plan.firstMissingTypedIrKind) > 0:
         firstMissingTypedIrKind = plan.firstMissingTypedIrKind
     var out = ""
-    out = Fmt([out, "primary_object_format=", plan.objectFormat, "\n"])
-    out = Fmt([out, "primary_object_item_count=", strings.IntToStr(plan.itemIds.len), "\n"])
-    out = Fmt([out, "primary_object_reachable_function_count=", strings.IntToStr(plan.reachableFunctionCount), "\n"])
-    out = Fmt([out, "primary_object_symbols=", symbolText, "\n"])
-    out = Fmt([out, "primary_object_body_kinds=", bodyKindText, "\n"])
-    out = Fmt([out, "primary_object_word_offsets=", wordOffsetText, "\n"])
-    out = Fmt([out, "primary_object_word_counts=", wordCountText, "\n"])
-    out = Fmt([out, "primary_object_instruction_word_count=", strings.IntToStr(plan.instructionWords.len), "\n"])
-    out = Fmt([out, "primary_object_data_label_count=", strings.IntToStr(plan.dataLabels.len), "\n"])
-    out = Fmt([out, "primary_object_reloc_count=", strings.IntToStr(plan.relocSourceItemIds.len), "\n"])
-    out = Fmt([out, "primary_object_entry_function_symbol=", plan.entryFunctionSymbol, "\n"])
-    out = Fmt([out, "primary_object_first_missing_function=", firstMissingFunction, "\n"])
-    out = Fmt([out, "primary_object_first_missing_body_kind=", firstMissingBodyKind, "\n"])
-    out = Fmt([out, "primary_object_first_missing_typed_ir_kind=", firstMissingTypedIrKind, "\n"])
-    out = Fmt([out, "primary_object_first_missing_line_number=", strings.IntToStr(plan.firstMissingLineNumber), "\n"])
-    out = Fmt([out, "primary_object_missing_reasons=", slplan.SystemLinkPlanListText(plan.missingReasons), "\n"])
-    out = Fmt([out, "primary_object_pipeline_stage=", plan.pipelineStage])
+    PrimaryObjectPlanAppendLine(out, "primary_object_format", plan.objectFormat)
+    PrimaryObjectPlanAppendLine(out, "primary_object_item_count", strings.IntToStr(plan.itemIds.len))
+    PrimaryObjectPlanAppendLine(out, "primary_object_reachable_function_count", strings.IntToStr(plan.reachableFunctionCount))
+    PrimaryObjectPlanAppendLine(out, "primary_object_symbols", symbolText)
+    PrimaryObjectPlanAppendLine(out, "primary_object_body_kinds", bodyKindText)
+    PrimaryObjectPlanAppendLine(out, "primary_object_statement_return_modes", statementReturnModeText)
+    PrimaryObjectPlanAppendLine(out, "primary_object_statement_call_counts", statementCallCountText)
+    PrimaryObjectPlanAppendLine(out, "primary_object_word_offsets", wordOffsetText)
+    PrimaryObjectPlanAppendLine(out, "primary_object_word_counts", wordCountText)
+    PrimaryObjectPlanAppendLine(out, "primary_object_instruction_word_count", strings.IntToStr(plan.instructionWords.len))
+    PrimaryObjectPlanAppendLine(out, "primary_object_data_label_count", strings.IntToStr(plan.dataLabels.len))
+    PrimaryObjectPlanAppendLine(out, "primary_object_reloc_count", strings.IntToStr(plan.relocSourceItemIds.len))
+    PrimaryObjectPlanAppendLine(out, "primary_object_entry_function_symbol", plan.entryFunctionSymbol)
+    PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_function", firstMissingFunction)
+    PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_body_kind", firstMissingBodyKind)
+    PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_typed_ir_kind", firstMissingTypedIrKind)
+    PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_line_number", strings.IntToStr(plan.firstMissingLineNumber))
+    PrimaryObjectPlanAppendLine(out, "primary_object_missing_reasons", slplan.SystemLinkPlanListText(plan.missingReasons))
+    out = Fmt"{out}primary_object_pipeline_stage={plan.pipelineStage}"
     return out

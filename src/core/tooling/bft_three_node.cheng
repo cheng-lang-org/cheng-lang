@@ -50,15 +50,15 @@ fn GatePrintErr(text: str) =
     os.WriteLine(os.Get_stderr(), text)
 
 fn GatePrintKv(prefix: str, value: str) =
-    GatePrintLine(prefix + value)
+    GatePrintLine(strutil.Join([prefix, value], ""))
 
 fn GateReadFlag(args: str[], key: str, defaultValue: str): str =
     for i in 0..<args.len:
         let arg: str = args[i]
-        if strutil.StartsWith(arg, key + ":"):
-            return strings.DropPrefix(arg, key + ":")
-        if strutil.StartsWith(arg, key + "="):
-            return strings.DropPrefix(arg, key + "=")
+        if strutil.StartsWith(arg, strutil.Join([key, ":"], "")):
+            return strings.DropPrefix(arg, strutil.Join([key, ":"], ""))
+        if strutil.StartsWith(arg, strutil.Join([key, "="], "")):
+            return strings.DropPrefix(arg, strutil.Join([key, "="], ""))
     return defaultValue
 
 fn GateRunFailed(run: hostops.LoggedRun): bool =
@@ -79,12 +79,12 @@ fn GateShellArgv(args: str[]): str =
     var out = ""
     for i in 0..<args.len:
         if i > 0:
-            out = out + " "
-        out = out + os.QuoteShell(args[i])
+            out = strutil.Join([out, " "], "")
+        out = strutil.Join([out, os.QuoteShell(args[i])], "")
     return out
 
 fn GateTextValue(text: str, key: str): str =
-    let prefix = key + "="
+    let prefix = strutil.Join([key, "="], "")
     var start = 0
     while start < len(text):
         var end = start
@@ -149,20 +149,20 @@ fn GateRemoteScriptSafeToken(text: str): str =
         if (ch >= 'a' && ch <= 'z') ||
            (ch >= 'A' && ch <= 'Z') ||
            (ch >= '0' && ch <= '9'):
-            out = out + part
+            out = strutil.Join([out, part], "")
         else:
-            out = out + "_"
+            out = strutil.Join([out, "_"], "")
     if len(out) == 0:
         return "x"
     return out
 
 fn GateRemoteScriptLocalPath(root: str, logPath: str): str =
-    let localPath = chengpath.PathAbsolute(root, logPath + ".remote.sh")
+    let localPath = chengpath.PathAbsolute(root, strutil.Join([logPath, ".remote.sh"], ""))
     let _ = chengpath.MkdirP(root, chengpath.PathParentDir(localPath))
     return localPath
 
 fn GateRemoteScriptPath(label: str): str =
-    return "/tmp/cheng_gate_" + GateRemoteScriptSafeToken(label) + ".sh"
+    return strutil.Join(["/tmp/cheng_gate_", GateRemoteScriptSafeToken(label), ".sh"], "")
 
 fn GateRemoteScpArgv(sshHost: str, localPath: str, remotePath: str): str[] =
     return [
@@ -172,7 +172,7 @@ fn GateRemoteScpArgv(sshHost: str, localPath: str, remotePath: str): str[] =
         "-o", "ServerAliveInterval=5",
         "-o", "ServerAliveCountMax=3",
         localPath,
-        sshHost + ":" + remotePath
+        strutil.Join([sshHost, ":", remotePath], "")
     ]
 
 fn GateRunRemoteShellLogged(root: str,
@@ -182,13 +182,13 @@ fn GateRunRemoteShellLogged(root: str,
                               logPath: str,
                               timeoutSec: int32): hostops.LoggedRun =
     let localScript = GateRemoteScriptLocalPath(root, logPath)
-    let scriptText = "#!/bin/sh\n" + command + "\n"
+    let scriptText = strutil.Join(["#!/bin/sh\n", command, "\n"], "")
     if !chengpath.WriteTextFile(root, localScript, scriptText):
         return hostops.LoggedRunZero(label,
                                        "ssh",
                                        chengpath.PathAbsolute(root, logPath),
                                        1,
-                                       " gate: remote script write failed: " + localScript + "\n")
+                                       strutil.Join([" gate: remote script write failed: ", localScript, "\n"], ""))
     var lastRun = hostops.LoggedRunZero(label, "ssh", logPath, 255, "")
     for attempt in 0..<3:
         let run = hostops.RunProgramLoggedWithInputText(root,
@@ -213,7 +213,7 @@ fn GateRunRemoteShellLogged(root: str,
             return run
         if attempt >= 2 || !GateRemoteTransportRetryable(run.output):
             return run
-        GatePrintLine("[ gate] remote ssh retry " + intToStr(attempt + 1) + " " + label)
+        GatePrintLine(strutil.Join(["[ gate] remote ssh retry ", intToStr(attempt + 1), " ", label], ""))
         os.SleepMs((attempt + 1) * 1000)
     return lastRun
 
@@ -236,17 +236,11 @@ fn GateBftBuildReady(root: str,
                        runSelfTest: str): bool =
     if !os.FileExists(outBin):
         return false
-    var command = "test -x " + os.QuoteShell(outBin) +
-                  " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(outBin) +
-                  " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(outBin)
+    var command = strutil.Join(["test -x ", os.QuoteShell(outBin), " && test ", os.QuoteShell(compiler), " -ot ", os.QuoteShell(outBin), " && test ", os.QuoteShell(src), " -ot ", os.QuoteShell(outBin)], "")
     if runSelfTest != "0":
         if !os.FileExists(runLog):
             return false
-        command = command +
-                  " && test " + os.QuoteShell(outBin) + " -ot " + os.QuoteShell(runLog) +
-                  " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(runLog) +
-                  " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(runLog) +
-                  " && grep -q " + os.QuoteShell(" bft_state_machine self-test ok") + " " + os.QuoteShell(runLog)
+        command = strutil.Join([command, " && test ", os.QuoteShell(outBin), " -ot ", os.QuoteShell(runLog), " && test ", os.QuoteShell(compiler), " -ot ", os.QuoteShell(runLog), " && test ", os.QuoteShell(src), " -ot ", os.QuoteShell(runLog), " && grep -q ", os.QuoteShell(" bft_state_machine self-test ok"), " ", os.QuoteShell(runLog)], "")
     return GateShellCheckOk(root, command)
 
 fn GateBftThreeNodeConfig(root: str): BftThreeNodeDeploy =
@@ -334,7 +328,7 @@ fn GateCompileExe(root: str,
                                        compilerAbs,
                                        logAbs,
                                        1,
-                                       " bft_state_machine: missing compiler: " + compilerAbs + "\n")
+                                       strutil.Join([" bft_state_machine: missing compiler: ", compilerAbs, "\n"], ""))
     let timeoutText = os.GetEnvDefault("CHENG_COMPILE_TIMEOUT_SEC", "300")
     let timeoutSec = int32(strutil.ParseInt(timeoutText))
     let run = hostops.RunFileLogged(root,
@@ -353,7 +347,7 @@ fn GateCompileExe(root: str,
                                       timeoutSec,
                                       logRelPath)
     if hostops.LoggedRunOk(run) && !os.FileExists(outPath):
-        let outputText = run.output + " bft_state_machine: compile missing output: " + outPath + "\n"
+        let outputText = strutil.Join([run.output, " bft_state_machine: compile missing output: ", outPath, "\n"], "")
         let _logged: bool = chengpath.WriteTextFile(root, logAbs, outputText)
         return hostops.LoggedRunZero(label, compilerAbs, logAbs, 1, outputText)
     return run
@@ -374,7 +368,7 @@ fn GateBuildBftStateMachine(root: str,
                               compilerPath: str): int32 =
     let compiler: str = chengpath.PathAbsolute(root, compilerPath)
     if !os.FileExists(compiler):
-        GatePrintErr(" bft_state_machine: missing compiler: " + compiler)
+        GatePrintErr(strutil.Join([" bft_state_machine: missing compiler: ", compiler], ""))
         return 1
     let target: str = os.GetEnvDefault("BFT_STATE_TARGET", "arm64-apple-darwin")
     var defaultOutDir: str = chengpath.PathAbsolute(root, "artifacts/bft_state_machine")
@@ -396,7 +390,7 @@ fn GateBuildBftStateMachine(root: str,
             else:
                 GatePrintLine(" bft_state_machine self-test ok")
         else:
-            GatePrintLine(" bft_state_machine: build ok target=" + target + " out=" + outBin)
+            GatePrintLine(strutil.Join([" bft_state_machine: build ok target=", target, " out=", outBin], ""))
         return 0
     let compileRun = GateCompileExe(root,
                                       "build_bft_state_machine",
@@ -418,7 +412,7 @@ fn GateBuildBftStateMachine(root: str,
         if GateRunFailed(run):
             return run.exitCode
     else:
-        GatePrintLine(" bft_state_machine: build ok target=" + target + " out=" + outBin)
+        GatePrintLine(strutil.Join([" bft_state_machine: build ok target=", target, " out=", outBin], ""))
     return 0
 
 fn GateBftManifestPath(cfg: BftThreeNodeDeploy): str =
@@ -453,15 +447,7 @@ fn GateBftRemoteBuildReadyCommand(repoRoot: str): str =
     let src = os.JoinPath(repoRoot, "src/apps/bft/bft_state_machine_main.cheng")
     let outBin = GateBftRemoteBin(repoRoot)
     let runLog = GateBftRemoteRunLog(repoRoot)
-    return "test -x " + os.QuoteShell(outBin) +
-           " && test -x " + os.QuoteShell(compiler) +
-           " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(outBin) +
-           " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(outBin) +
-           " && test " + os.QuoteShell(outBin) + " -ot " + os.QuoteShell(runLog) +
-           " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(runLog) +
-           " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(runLog) +
-           " && grep -qF " + os.QuoteShell(" bft_state_machine self-test ok") +
-           " " + os.QuoteShell(runLog)
+    return strutil.Join(["test -x ", os.QuoteShell(outBin), " && test -x ", os.QuoteShell(compiler), " && test ", os.QuoteShell(compiler), " -ot ", os.QuoteShell(outBin), " && test ", os.QuoteShell(src), " -ot ", os.QuoteShell(outBin), " && test ", os.QuoteShell(outBin), " -ot ", os.QuoteShell(runLog), " && test ", os.QuoteShell(compiler), " -ot ", os.QuoteShell(runLog), " && test ", os.QuoteShell(src), " -ot ", os.QuoteShell(runLog), " && grep -qF ", os.QuoteShell(" bft_state_machine self-test ok"), " ", os.QuoteShell(runLog)], "")
 
 fn GateBftRemoteStage3FreshCommand(repoRoot: str): str =
     let stage3 = GateBftRemoteStage3(repoRoot)
@@ -473,66 +459,66 @@ fn GateBftRemoteStage3FreshCommand(repoRoot: str): str =
     let compilerRequest = os.JoinPath(repoRoot, "src/core/tooling/compiler_request.cheng")
     let gateMain = os.JoinPath(repoRoot, "src/core/tooling/gate_main.cheng")
     var command = ""
-    command = command + "test -x " + os.QuoteShell(stage3)
-    command = command + " && snapshot=" + os.QuoteShell(snapshot)
-    command = command + " && stage3=" + os.QuoteShell(stage3)
-    command = command + " && if [ -f \"$snapshot\" ]; then"
-    command = command + " fresh=$(grep \"^fresh_input_paths=\" \"$snapshot\" | tail -n 1 | cut -d= -f2-);"
-    command = command + " if [ -n \"$fresh\" ]; then"
-    command = command + " old_ifs=\"$IFS\"; IFS=,; set -- $fresh; IFS=\"$old_ifs\";"
-    command = command + " for input in \"$@\"; do"
-    command = command + " if [ -n \"$input\" ] && ! test \"$input\" -ot \"$stage3\"; then exit 1; fi;"
-    command = command + " done; exit 0; fi; fi"
-    command = command + " && test " + os.QuoteShell(seed) + " -ot \"$stage3\""
-    command = command + " && test " + os.QuoteShell(stage1) + " -ot \"$stage3\""
-    command = command + " && test " + os.QuoteShell(compilerMain) + " -ot \"$stage3\""
-    command = command + " && test " + os.QuoteShell(compilerRuntime) + " -ot \"$stage3\""
-    command = command + " && test " + os.QuoteShell(compilerRequest) + " -ot \"$stage3\""
-    command = command + " && test " + os.QuoteShell(gateMain) + " -ot \"$stage3\""
+    command = strutil.Join([command, "test -x ", os.QuoteShell(stage3)], "")
+    command = strutil.Join([command, " && snapshot=", os.QuoteShell(snapshot)], "")
+    command = strutil.Join([command, " && stage3=", os.QuoteShell(stage3)], "")
+    command = strutil.Join([command, " && if [ -f \"$snapshot\" ]; then"], "")
+    command = strutil.Join([command, " fresh=$(grep \"^fresh_input_paths=\" \"$snapshot\" | tail -n 1 | cut -d= -f2-);"], "")
+    command = strutil.Join([command, " if [ -n \"$fresh\" ]; then"], "")
+    command = strutil.Join([command, " old_ifs=\"$IFS\"; IFS=,; set -- $fresh; IFS=\"$old_ifs\";"], "")
+    command = strutil.Join([command, " for input in \"$@\"; do"], "")
+    command = strutil.Join([command, " if [ -n \"$input\" ] && ! test \"$input\" -ot \"$stage3\"; then exit 1; fi;"], "")
+    command = strutil.Join([command, " done; exit 0; fi; fi"], "")
+    command = strutil.Join([command, " && test ", os.QuoteShell(seed), " -ot \"$stage3\""], "")
+    command = strutil.Join([command, " && test ", os.QuoteShell(stage1), " -ot \"$stage3\""], "")
+    command = strutil.Join([command, " && test ", os.QuoteShell(compilerMain), " -ot \"$stage3\""], "")
+    command = strutil.Join([command, " && test ", os.QuoteShell(compilerRuntime), " -ot \"$stage3\""], "")
+    command = strutil.Join([command, " && test ", os.QuoteShell(compilerRequest), " -ot \"$stage3\""], "")
+    command = strutil.Join([command, " && test ", os.QuoteShell(gateMain), " -ot \"$stage3\""], "")
     return command
 
 fn GateBftRemoteLockedShell(repoRoot: str,
                               innerCommand: str): str =
     var command = ""
-    command = command + "set -eu && cd " + os.QuoteShell(repoRoot)
-    command = command + " && mkdir -p artifacts/gate"
-    command = command + " && lock_dir=artifacts/gate/bft_remote_build.lock"
-    command = command + " && lock_pid=\"$lock_dir/pid\""
-    command = command + " && while ! mkdir \"$lock_dir\" 2>/dev/null; do holder=\"\";"
-    command = command + " if [ -f \"$lock_pid\" ]; then holder=$(cat \"$lock_pid\" 2>/dev/null || true); fi;"
-    command = command + " if [ -z \"$holder\" ] || ! kill -0 \"$holder\" 2>/dev/null; then"
-    command = command + " rm -f \"$lock_pid\" 2>/dev/null || true; rmdir \"$lock_dir\" 2>/dev/null || true; continue;"
-    command = command + " fi; sleep 0.1; done"
-    command = command + " && printf \"%s\\n\" \"$$\" > \"$lock_pid\""
-    command = command + " && trap 'rm -f \"$lock_pid\" 2>/dev/null || true; rmdir \"$lock_dir\" 2>/dev/null || true' EXIT INT TERM"
-    command = command + " && " + innerCommand
+    command = strutil.Join([command, "set -eu && cd ", os.QuoteShell(repoRoot)], "")
+    command = strutil.Join([command, " && mkdir -p artifacts/gate"], "")
+    command = strutil.Join([command, " && lock_dir=artifacts/gate/bft_remote_build.lock"], "")
+    command = strutil.Join([command, " && lock_pid=\"$lock_dir/pid\""], "")
+    command = strutil.Join([command, " && while ! mkdir \"$lock_dir\" 2>/dev/null; do holder=\"\";"], "")
+    command = strutil.Join([command, " if [ -f \"$lock_pid\" ]; then holder=$(cat \"$lock_pid\" 2>/dev/null || true); fi;"], "")
+    command = strutil.Join([command, " if [ -z \"$holder\" ] || ! kill -0 \"$holder\" 2>/dev/null; then"], "")
+    command = strutil.Join([command, " rm -f \"$lock_pid\" 2>/dev/null || true; rmdir \"$lock_dir\" 2>/dev/null || true; continue;"], "")
+    command = strutil.Join([command, " fi; sleep 0.1; done"], "")
+    command = strutil.Join([command, " && printf \"%s\\n\" \"$$\" > \"$lock_pid\""], "")
+    command = strutil.Join([command, " && trap 'rm -f \"$lock_pid\" 2>/dev/null || true; rmdir \"$lock_dir\" 2>/dev/null || true' EXIT INT TERM"], "")
+    command = strutil.Join([command, " && ", innerCommand], "")
     return command
 
 fn GateBftManifestText(cfg: BftThreeNodeDeploy): str =
     var out = ""
-    out = out + "app_id=" + cfg.appId + "\n"
-    out = out + "server_ssh=" + cfg.serverSsh + "\n"
-    out = out + "relay_ssh=" + cfg.relaySsh + "\n"
-    out = out + "server_addr=" + cfg.serverAddress + "\n"
-    out = out + "server_root=" + cfg.serverRepoRoot + "\n"
-    out = out + "relay_root=" + cfg.relayRepoRoot + "\n"
-    out = out + "local_deploy_dir=" + cfg.localDeployDir + "\n"
-    out = out + "remote_deploy_rel=" + cfg.remoteDeployRel + "\n"
-    out = out + "proposal_port=" + intToStr(cfg.proposalPort) + "\n"
-    out = out + "commit_port=" + intToStr(cfg.commitPort) + "\n"
-    out = out + "vote_port=" + intToStr(cfg.votePort) + "\n"
-    out = out + "state_port=" + intToStr(cfg.statePort) + "\n"
-    out = out + "proposer_interval_ms=" + intToStr(cfg.proposerIntervalMs) + "\n"
-    out = out + "follower_interval_ms=" + intToStr(cfg.followerIntervalMs) + "\n"
-    out = out + "proposal_window_ms=" + intToStr(cfg.proposalWindowMs) + "\n"
-    out = out + "vote_window_ms=" + intToStr(cfg.voteWindowMs) + "\n"
-    out = out + "commit_window_ms=" + intToStr(cfg.commitWindowMs) + "\n"
-    out = out + "default_max_txs=" + intToStr(cfg.defaultMaxTxs) + "\n"
-    out = out + "asset_id=" + intToStr(cfg.assetId) + "\n"
-    out = out + "alice_id=" + intToStr(cfg.aliceId) + "\n"
-    out = out + "bob_id=" + intToStr(cfg.bobId) + "\n"
-    out = out + "mint_amount=" + strings.Int64ToStr(cfg.mintAmount) + "\n"
-    out = out + "transfer_amount=" + strings.Int64ToStr(cfg.transferAmount) + "\n"
+    out = strutil.Join([out, "app_id=", cfg.appId, "\n"], "")
+    out = strutil.Join([out, "server_ssh=", cfg.serverSsh, "\n"], "")
+    out = strutil.Join([out, "relay_ssh=", cfg.relaySsh, "\n"], "")
+    out = strutil.Join([out, "server_addr=", cfg.serverAddress, "\n"], "")
+    out = strutil.Join([out, "server_root=", cfg.serverRepoRoot, "\n"], "")
+    out = strutil.Join([out, "relay_root=", cfg.relayRepoRoot, "\n"], "")
+    out = strutil.Join([out, "local_deploy_dir=", cfg.localDeployDir, "\n"], "")
+    out = strutil.Join([out, "remote_deploy_rel=", cfg.remoteDeployRel, "\n"], "")
+    out = strutil.Join([out, "proposal_port=", intToStr(cfg.proposalPort), "\n"], "")
+    out = strutil.Join([out, "commit_port=", intToStr(cfg.commitPort), "\n"], "")
+    out = strutil.Join([out, "vote_port=", intToStr(cfg.votePort), "\n"], "")
+    out = strutil.Join([out, "state_port=", intToStr(cfg.statePort), "\n"], "")
+    out = strutil.Join([out, "proposer_interval_ms=", intToStr(cfg.proposerIntervalMs), "\n"], "")
+    out = strutil.Join([out, "follower_interval_ms=", intToStr(cfg.followerIntervalMs), "\n"], "")
+    out = strutil.Join([out, "proposal_window_ms=", intToStr(cfg.proposalWindowMs), "\n"], "")
+    out = strutil.Join([out, "vote_window_ms=", intToStr(cfg.voteWindowMs), "\n"], "")
+    out = strutil.Join([out, "commit_window_ms=", intToStr(cfg.commitWindowMs), "\n"], "")
+    out = strutil.Join([out, "default_max_txs=", intToStr(cfg.defaultMaxTxs), "\n"], "")
+    out = strutil.Join([out, "asset_id=", intToStr(cfg.assetId), "\n"], "")
+    out = strutil.Join([out, "alice_id=", intToStr(cfg.aliceId), "\n"], "")
+    out = strutil.Join([out, "bob_id=", intToStr(cfg.bobId), "\n"], "")
+    out = strutil.Join([out, "mint_amount=", strings.Int64ToStr(cfg.mintAmount), "\n"], "")
+    out = strutil.Join([out, "transfer_amount=", strings.Int64ToStr(cfg.transferAmount), "\n"], "")
     return out
 
 fn GateBftConfigLoad(root: str): BftThreeNodeDeploy =
@@ -629,39 +615,39 @@ fn GateBftCollectLocalNodeStatus(root: str,
                                    logPrefix: str): Result[BftNodeStatus] =
     let binPath = GateBftLocalBin(root)
     let summaryRun = hostops.RunFileLogged(root,
-                                             nodeName + "_show_state",
+                                             strutil.Join([nodeName, "_show_state"], ""),
                                              binPath,
-                                             ["show-state", "--state:" + statePath],
+                                             ["show-state", strutil.Join(["--state:", statePath], "")],
                                              [],
                                              root,
                                              20,
-                                             logPrefix + ".show.log")
+                                             strutil.Join([logPrefix, ".show.log"], ""))
     if !hostops.LoggedRunOk(summaryRun):
         return Err[BftNodeStatus](summaryRun.output)
     let aliceRun = hostops.RunFileLogged(root,
-                                           nodeName + "_alice_balance",
+                                           strutil.Join([nodeName, "_alice_balance"], ""),
                                            binPath,
                                            ["query-balance",
-                                            "--state:" + statePath,
-                                            "--asset:" + intToStr(cfg.assetId),
-                                            "--account:" + intToStr(cfg.aliceId)],
+                                            strutil.Join(["--state:", statePath], ""),
+                                            strutil.Join(["--asset:", intToStr(cfg.assetId)], ""),
+                                            strutil.Join(["--account:", intToStr(cfg.aliceId)], "")],
                                            [],
                                            root,
                                            20,
-                                           logPrefix + ".alice.log")
+                                           strutil.Join([logPrefix, ".alice.log"], ""))
     if !hostops.LoggedRunOk(aliceRun):
         return Err[BftNodeStatus](aliceRun.output)
     let bobRun = hostops.RunFileLogged(root,
-                                         nodeName + "_bob_balance",
+                                         strutil.Join([nodeName, "_bob_balance"], ""),
                                          binPath,
                                          ["query-balance",
-                                          "--state:" + statePath,
-                                          "--asset:" + intToStr(cfg.assetId),
-                                          "--account:" + intToStr(cfg.bobId)],
+                                          strutil.Join(["--state:", statePath], ""),
+                                          strutil.Join(["--asset:", intToStr(cfg.assetId)], ""),
+                                          strutil.Join(["--account:", intToStr(cfg.bobId)], "")],
                                          [],
                                          root,
                                          20,
-                                         logPrefix + ".bob.log")
+                                         strutil.Join([logPrefix, ".bob.log"], ""))
     if !hostops.LoggedRunOk(bobRun):
         return Err[BftNodeStatus](bobRun.output)
     return Ok[BftNodeStatus](BftNodeStatus(
@@ -684,37 +670,36 @@ fn GateBftCollectRemoteNodeStatus(root: str,
                                     logPrefix: str): Result[BftNodeStatus] =
     let binPath = GateBftRemoteBin(repoRoot)
     let summaryRun = GateRunRemoteShellLogged(root,
-                                                nodeName + "_show_state",
+                                                strutil.Join([nodeName, "_show_state"], ""),
                                                 sshHost,
-                                                "set -eu && " +
-                                                    GateShellArgv([binPath,
+                                                strutil.Join(["set -eu && ", GateShellArgv([binPath,
                                                                      "show-state",
-                                                                     "--state:" + statePath]),
-                                                logPrefix + ".show.log",
+                                                                     strutil.Join(["--state:", statePath], "")])], ""),
+                                                strutil.Join([logPrefix, ".show.log"], ""),
                                                 20)
     if !hostops.LoggedRunOk(summaryRun):
         return Err[BftNodeStatus](summaryRun.output)
     let aliceRun = GateRunRemoteShellLogged(root,
-                                              nodeName + "_alice_balance",
+                                              strutil.Join([nodeName, "_alice_balance"], ""),
                                               sshHost,
-                                              "set -eu && " + GateShellArgv([binPath,
+                                              strutil.Join(["set -eu && ", GateShellArgv([binPath,
                                                                                "query-balance",
-                                                                               "--state:" + statePath,
-                                                                               "--asset:" + intToStr(cfg.assetId),
-                                                                               "--account:" + intToStr(cfg.aliceId)]),
-                                              logPrefix + ".alice.log",
+                                                                               strutil.Join(["--state:", statePath], ""),
+                                                                               strutil.Join(["--asset:", intToStr(cfg.assetId)], ""),
+                                                                               strutil.Join(["--account:", intToStr(cfg.aliceId)], "")])], ""),
+                                              strutil.Join([logPrefix, ".alice.log"], ""),
                                               20)
     if !hostops.LoggedRunOk(aliceRun):
         return Err[BftNodeStatus](aliceRun.output)
     let bobRun = GateRunRemoteShellLogged(root,
-                                            nodeName + "_bob_balance",
+                                            strutil.Join([nodeName, "_bob_balance"], ""),
                                             sshHost,
-                                            "set -eu && " + GateShellArgv([binPath,
+                                            strutil.Join(["set -eu && ", GateShellArgv([binPath,
                                                                              "query-balance",
-                                                                             "--state:" + statePath,
-                                                                             "--asset:" + intToStr(cfg.assetId),
-                                                                             "--account:" + intToStr(cfg.bobId)]),
-                                            logPrefix + ".bob.log",
+                                                                             strutil.Join(["--state:", statePath], ""),
+                                                                             strutil.Join(["--asset:", intToStr(cfg.assetId)], ""),
+                                                                             strutil.Join(["--account:", intToStr(cfg.bobId)], "")])], ""),
+                                            strutil.Join([logPrefix, ".bob.log"], ""),
                                             20)
     if !hostops.LoggedRunOk(bobRun):
         return Err[BftNodeStatus](bobRun.output)
@@ -730,11 +715,11 @@ fn GateBftCollectRemoteNodeStatus(root: str,
     ))
 
 fn GateBftPrintNodeStatus(status: BftNodeStatus) =
-    GatePrintLine("node=" + status.name)
-    GatePrintLine("height=" + status.height)
-    GatePrintLine("app_hash=" + status.appHash)
-    GatePrintLine("alice_balance=" + status.aliceBalance)
-    GatePrintLine("bob_balance=" + status.bobBalance)
+    GatePrintLine(strutil.Join(["node=", status.name], ""))
+    GatePrintLine(strutil.Join(["height=", status.height], ""))
+    GatePrintLine(strutil.Join(["app_hash=", status.appHash], ""))
+    GatePrintLine(strutil.Join(["alice_balance=", status.aliceBalance], ""))
+    GatePrintLine(strutil.Join(["bob_balance=", status.bobBalance], ""))
 
 fn GateBftClusterMatches(serverStatus: BftNodeStatus,
                            relayStatus: BftNodeStatus,
@@ -761,11 +746,11 @@ fn GateBftVerifyReportPath(root: str): str =
 fn GateBftVerifyReportAppendNode(out: var str,
                                    prefix: str,
                                    status: BftNodeStatus) =
-    out = out + prefix + "_name=" + status.name + "\n"
-    out = out + prefix + "_height=" + status.height + "\n"
-    out = out + prefix + "_app_hash=" + status.appHash + "\n"
-    out = out + prefix + "_alice_balance=" + status.aliceBalance + "\n"
-    out = out + prefix + "_bob_balance=" + status.bobBalance + "\n"
+    out = strutil.Join([out, prefix, "_name=", status.name, "\n"], "")
+    out = strutil.Join([out, prefix, "_height=", status.height, "\n"], "")
+    out = strutil.Join([out, prefix, "_app_hash=", status.appHash, "\n"], "")
+    out = strutil.Join([out, prefix, "_alice_balance=", status.aliceBalance, "\n"], "")
+    out = strutil.Join([out, prefix, "_bob_balance=", status.bobBalance, "\n"], "")
 
 fn GateBftVerifyReportText(cfg: BftThreeNodeDeploy,
                              verified: bool,
@@ -776,17 +761,17 @@ fn GateBftVerifyReportText(cfg: BftThreeNodeDeploy,
     let wantAlice = strings.Int64ToStr(cfg.mintAmount - cfg.transferAmount)
     let wantBob = strings.Int64ToStr(cfg.transferAmount)
     var out = ""
-    out = out + "version=cheng.bft_three_node_verify.v1\n"
-    out = out + "app_id=" + cfg.appId + "\n"
-    out = out + "server_ssh=" + cfg.serverSsh + "\n"
-    out = out + "relay_ssh=" + cfg.relaySsh + "\n"
-    out = out + "want_height=" + wantHeight + "\n"
-    out = out + "want_alice_balance=" + wantAlice + "\n"
-    out = out + "want_bob_balance=" + wantBob + "\n"
+    out = strutil.Join([out, "version=cheng.bft_three_node_verify.v1\n"], "")
+    out = strutil.Join([out, "app_id=", cfg.appId, "\n"], "")
+    out = strutil.Join([out, "server_ssh=", cfg.serverSsh, "\n"], "")
+    out = strutil.Join([out, "relay_ssh=", cfg.relaySsh, "\n"], "")
+    out = strutil.Join([out, "want_height=", wantHeight, "\n"], "")
+    out = strutil.Join([out, "want_alice_balance=", wantAlice, "\n"], "")
+    out = strutil.Join([out, "want_bob_balance=", wantBob, "\n"], "")
     GateBftVerifyReportAppendNode(out, "server", serverStatus)
     GateBftVerifyReportAppendNode(out, "relay", relayStatus)
     GateBftVerifyReportAppendNode(out, "local", localStatus)
-    out = out + "verified=" + (verified ? "true" : "false") + "\n"
+    out = strutil.Join([out, "verified=", (verified ? "true" : "false"), "\n"], "")
     return out
 
 fn GateFormatMilli(valueMilli: int64): str =
@@ -794,10 +779,10 @@ fn GateFormatMilli(valueMilli: int64): str =
     let frac = valueMilli % int64(1000)
     var fracText = strings.Int64ToStr(frac)
     if len(fracText) == 1:
-        fracText = "00" + fracText
+        fracText = strutil.Join(["00", fracText], "")
     elif len(fracText) == 2:
-        fracText = "0" + fracText
-    return strings.Int64ToStr(whole) + "." + fracText
+        fracText = strutil.Join(["0", fracText], "")
+    return strutil.Join([strings.Int64ToStr(whole), ".", fracText], "")
 
 fn GateBftDaemonMaxTxs(cfg: BftThreeNodeDeploy,
                          overrideMaxTxs: int32): int32 =
@@ -825,7 +810,7 @@ fn GateBftWaitClusterState(root: str,
                                                          cfg.serverSsh,
                                                          cfg.serverRepoRoot,
                                                          os.JoinPath(serverDir, "server.state"),
-                                                         logPrefix + "_server")
+                                                         strutil.Join([logPrefix, "_server"], ""))
         if IsErr(serverRes):
             os.SleepMs(200)
             continue
@@ -835,7 +820,7 @@ fn GateBftWaitClusterState(root: str,
                                                         cfg.relaySsh,
                                                         cfg.relayRepoRoot,
                                                         os.JoinPath(relayDir, "relay.state"),
-                                                        logPrefix + "_relay")
+                                                        strutil.Join([logPrefix, "_relay"], ""))
         if IsErr(relayRes):
             os.SleepMs(200)
             continue
@@ -843,7 +828,7 @@ fn GateBftWaitClusterState(root: str,
                                                        cfg,
                                                        "local",
                                                        os.JoinPath(localDir, "local.state"),
-                                                       logPrefix + "_local")
+                                                       strutil.Join([logPrefix, "_local"], ""))
         if IsErr(localRes):
             os.SleepMs(200)
             continue
@@ -874,18 +859,18 @@ fn GateBftBenchAppendWaveReport(reportText: var str,
     var i: int32
     while i < waveElapsedMs.len:
         let waveIndexText = intToStr(i + 1)
-        let waveElapsedLine = "wave_" + waveIndexText + "_elapsed_ms=" + strings.Int64ToStr(waveElapsedMs[i])
+        let waveElapsedLine = strutil.Join(["wave_", waveIndexText, "_elapsed_ms=", strings.Int64ToStr(waveElapsedMs[i])], "")
         GatePrintLine(waveElapsedLine)
-        reportText = reportText + waveElapsedLine + "\n"
-        let waveTpsLine = "wave_" + waveIndexText + "_tps=" + GateFormatMilli(waveTpsMilli[i])
+        reportText = strutil.Join([reportText, waveElapsedLine, "\n"], "")
+        let waveTpsLine = strutil.Join(["wave_", waveIndexText, "_tps=", GateFormatMilli(waveTpsMilli[i])], "")
         GatePrintLine(waveTpsLine)
-        reportText = reportText + waveTpsLine + "\n"
-        let waveBlockLine = "wave_" + waveIndexText + "_block_count=" + strings.Int64ToStr(waveBlockCounts[i])
+        reportText = strutil.Join([reportText, waveTpsLine, "\n"], "")
+        let waveBlockLine = strutil.Join(["wave_", waveIndexText, "_block_count=", strings.Int64ToStr(waveBlockCounts[i])], "")
         GatePrintLine(waveBlockLine)
-        reportText = reportText + waveBlockLine + "\n"
-        let waveRestartLine = "wave_" + waveIndexText + "_restarted=" + (waveRestarted[i] ? "true" : "false")
+        reportText = strutil.Join([reportText, waveBlockLine, "\n"], "")
+        let waveRestartLine = strutil.Join(["wave_", waveIndexText, "_restarted=", (waveRestarted[i] ? "true" : "false")], "")
         GatePrintLine(waveRestartLine)
-        reportText = reportText + waveRestartLine + "\n"
+        reportText = strutil.Join([reportText, waveRestartLine, "\n"], "")
         i = i + 1
 
 fn GateBftInitCommand(binPath: str,
@@ -895,9 +880,9 @@ fn GateBftInitCommand(binPath: str,
     var argv: str[]
     add(argv, binPath)
     add(argv, "init")
-    add(argv, "--state:" + statePath)
-    add(argv, "--app-id:" + appId)
-    add(argv, "--validator-slot:" + intToStr(validatorSlot))
+    add(argv, strutil.Join(["--state:", statePath], ""))
+    add(argv, strutil.Join(["--app-id:", appId], ""))
+    add(argv, strutil.Join(["--validator-slot:", intToStr(validatorSlot)], ""))
     add(argv, "--force")
     return GateShellArgv(argv)
 
@@ -909,10 +894,10 @@ fn GateBftSubmitMintCommand(binPath: str,
     var argv: str[]
     add(argv, binPath)
     add(argv, "submit-mint")
-    add(argv, "--queue:" + queuePath)
-    add(argv, "--asset:" + intToStr(assetId))
-    add(argv, "--account:" + intToStr(accountId))
-    add(argv, "--amount:" + strings.Int64ToStr(amount))
+    add(argv, strutil.Join(["--queue:", queuePath], ""))
+    add(argv, strutil.Join(["--asset:", intToStr(assetId)], ""))
+    add(argv, strutil.Join(["--account:", intToStr(accountId)], ""))
+    add(argv, strutil.Join(["--amount:", strings.Int64ToStr(amount)], ""))
     return GateShellArgv(argv)
 
 fn GateBftSubmitTransferCommand(binPath: str,
@@ -924,11 +909,11 @@ fn GateBftSubmitTransferCommand(binPath: str,
     var argv: str[]
     add(argv, binPath)
     add(argv, "submit-transfer")
-    add(argv, "--queue:" + queuePath)
-    add(argv, "--asset:" + intToStr(assetId))
-    add(argv, "--from:" + intToStr(fromId))
-    add(argv, "--to:" + intToStr(toId))
-    add(argv, "--amount:" + strings.Int64ToStr(amount))
+    add(argv, strutil.Join(["--queue:", queuePath], ""))
+    add(argv, strutil.Join(["--asset:", intToStr(assetId)], ""))
+    add(argv, strutil.Join(["--from:", intToStr(fromId)], ""))
+    add(argv, strutil.Join(["--to:", intToStr(toId)], ""))
+    add(argv, strutil.Join(["--amount:", strings.Int64ToStr(amount)], ""))
     return GateShellArgv(argv)
 
 fn GateBftSubmitTransferSeriesCommand(binPath: str,
@@ -941,12 +926,12 @@ fn GateBftSubmitTransferSeriesCommand(binPath: str,
     var argv: str[]
     add(argv, binPath)
     add(argv, "submit-transfer-series")
-    add(argv, "--queue:" + queuePath)
-    add(argv, "--asset:" + intToStr(assetId))
-    add(argv, "--from:" + intToStr(fromId))
-    add(argv, "--to:" + intToStr(toId))
-    add(argv, "--amount:" + strings.Int64ToStr(amount))
-    add(argv, "--count:" + intToStr(count))
+    add(argv, strutil.Join(["--queue:", queuePath], ""))
+    add(argv, strutil.Join(["--asset:", intToStr(assetId)], ""))
+    add(argv, strutil.Join(["--from:", intToStr(fromId)], ""))
+    add(argv, strutil.Join(["--to:", intToStr(toId)], ""))
+    add(argv, strutil.Join(["--amount:", strings.Int64ToStr(amount)], ""))
+    add(argv, strutil.Join(["--count:", intToStr(count)], ""))
     return GateShellArgv(argv)
 
 fn GateBftProbeProposalCommand(binPath: str,
@@ -955,8 +940,8 @@ fn GateBftProbeProposalCommand(binPath: str,
     var argv: str[]
     add(argv, binPath)
     add(argv, "probe-proposal")
-    add(argv, "--host:" + host)
-    add(argv, "--port:" + intToStr(port))
+    add(argv, strutil.Join(["--host:", host], ""))
+    add(argv, strutil.Join(["--port:", intToStr(port)], ""))
     add(argv, "--attempts:3")
     add(argv, "--interval-ms:100")
     add(argv, "--handshake-only:1")
@@ -972,25 +957,25 @@ fn GateBftServerProposerShell(binPath: str,
                                 useSetsid: bool): str =
     var args: str[]
     add(args, "validator-proposer-daemon")
-    add(args, "--state:" + os.JoinPath(serverDir, "server.state"))
-    add(args, "--queue:" + os.JoinPath(serverDir, "server.queue"))
+    add(args, strutil.Join(["--state:", os.JoinPath(serverDir, "server.state")], ""))
+    add(args, strutil.Join(["--queue:", os.JoinPath(serverDir, "server.queue")], ""))
     add(args, "--proposal-host:0.0.0.0")
-    add(args, "--proposal-port:" + intToStr(cfg.proposalPort))
+    add(args, strutil.Join(["--proposal-port:", intToStr(cfg.proposalPort)], ""))
     add(args, "--vote-host:0.0.0.0")
-    add(args, "--vote-port:" + intToStr(cfg.votePort))
+    add(args, strutil.Join(["--vote-port:", intToStr(cfg.votePort)], ""))
     add(args, "--commit-host:0.0.0.0")
-    add(args, "--commit-port:" + intToStr(cfg.commitPort))
-    add(args, "--proposal-file:" + os.JoinPath(serverDir, "server.proposal.hex"))
-    add(args, "--commit-file:" + os.JoinPath(serverDir, "server.commit.hex"))
-    add(args, "--state-sync-file:" + os.JoinPath(serverDir, "server.machine.hex"))
-    add(args, "--proposal-ready-path:" + os.JoinPath(serverDir, "server.proposal.ready"))
-    add(args, "--vote-ready-path:" + os.JoinPath(serverDir, "server.vote.ready"))
-    add(args, "--commit-ready-path:" + os.JoinPath(serverDir, "server.commit.ready"))
-    add(args, "--interval-ms:" + intToStr(cfg.proposerIntervalMs))
-    add(args, "--proposal-window-ms:" + intToStr(cfg.proposalWindowMs))
-    add(args, "--vote-window-ms:" + intToStr(cfg.voteWindowMs))
-    add(args, "--commit-window-ms:" + intToStr(cfg.commitWindowMs))
-    add(args, "--max-txs:" + intToStr(GateBftDaemonMaxTxs(cfg, maxTxsOverride)))
+    add(args, strutil.Join(["--commit-port:", intToStr(cfg.commitPort)], ""))
+    add(args, strutil.Join(["--proposal-file:", os.JoinPath(serverDir, "server.proposal.hex")], ""))
+    add(args, strutil.Join(["--commit-file:", os.JoinPath(serverDir, "server.commit.hex")], ""))
+    add(args, strutil.Join(["--state-sync-file:", os.JoinPath(serverDir, "server.machine.hex")], ""))
+    add(args, strutil.Join(["--proposal-ready-path:", os.JoinPath(serverDir, "server.proposal.ready")], ""))
+    add(args, strutil.Join(["--vote-ready-path:", os.JoinPath(serverDir, "server.vote.ready")], ""))
+    add(args, strutil.Join(["--commit-ready-path:", os.JoinPath(serverDir, "server.commit.ready")], ""))
+    add(args, strutil.Join(["--interval-ms:", intToStr(cfg.proposerIntervalMs)], ""))
+    add(args, strutil.Join(["--proposal-window-ms:", intToStr(cfg.proposalWindowMs)], ""))
+    add(args, strutil.Join(["--vote-window-ms:", intToStr(cfg.voteWindowMs)], ""))
+    add(args, strutil.Join(["--commit-window-ms:", intToStr(cfg.commitWindowMs)], ""))
+    add(args, strutil.Join(["--max-txs:", intToStr(GateBftDaemonMaxTxs(cfg, maxTxsOverride))], ""))
     return GateBftStartDetachedShell(binPath, args, pidPath, logPath, readyPath, useSetsid)
 
 fn GateBftServerStateShell(binPath: str,
@@ -1001,10 +986,10 @@ fn GateBftServerStateShell(binPath: str,
                              useSetsid: bool): str =
     var args: str[]
     add(args, "state-serve-daemon")
-    add(args, "--file:" + os.JoinPath(serverDir, "server.machine.hex"))
+    add(args, strutil.Join(["--file:", os.JoinPath(serverDir, "server.machine.hex")], ""))
     add(args, "--host:0.0.0.0")
-    add(args, "--port:" + intToStr(cfg.statePort))
-    add(args, "--interval-ms:" + intToStr(cfg.followerIntervalMs))
+    add(args, strutil.Join(["--port:", intToStr(cfg.statePort)], ""))
+    add(args, strutil.Join(["--interval-ms:", intToStr(cfg.followerIntervalMs)], ""))
     return GateBftStartDetachedShell(binPath, args, pidPath, logPath, "", useSetsid)
 
 fn GateBftFollowerShell(binPath: str,
@@ -1015,16 +1000,16 @@ fn GateBftFollowerShell(binPath: str,
                           useSetsid: bool): str =
     var args: str[]
     add(args, "validator-follower-daemon")
-    add(args, "--state:" + statePath)
-    add(args, "--proposal-host:" + cfg.serverAddress)
-    add(args, "--proposal-port:" + intToStr(cfg.proposalPort))
-    add(args, "--vote-host:" + cfg.serverAddress)
-    add(args, "--vote-port:" + intToStr(cfg.votePort))
-    add(args, "--commit-host:" + cfg.serverAddress)
-    add(args, "--commit-port:" + intToStr(cfg.commitPort))
-    add(args, "--sync-host:" + cfg.serverAddress)
-    add(args, "--sync-port:" + intToStr(cfg.statePort))
-    add(args, "--interval-ms:" + intToStr(cfg.followerIntervalMs))
+    add(args, strutil.Join(["--state:", statePath], ""))
+    add(args, strutil.Join(["--proposal-host:", cfg.serverAddress], ""))
+    add(args, strutil.Join(["--proposal-port:", intToStr(cfg.proposalPort)], ""))
+    add(args, strutil.Join(["--vote-host:", cfg.serverAddress], ""))
+    add(args, strutil.Join(["--vote-port:", intToStr(cfg.votePort)], ""))
+    add(args, strutil.Join(["--commit-host:", cfg.serverAddress], ""))
+    add(args, strutil.Join(["--commit-port:", intToStr(cfg.commitPort)], ""))
+    add(args, strutil.Join(["--sync-host:", cfg.serverAddress], ""))
+    add(args, strutil.Join(["--sync-port:", intToStr(cfg.statePort)], ""))
+    add(args, strutil.Join(["--interval-ms:", intToStr(cfg.followerIntervalMs)], ""))
     return GateBftStartDetachedShell(binPath, args, pidPath, logPath, "", useSetsid)
 
 fn GateBftServerInitShell(serverDir: str,
@@ -1042,21 +1027,21 @@ fn GateBftServerInitShell(serverDir: str,
     let proposalHex = os.JoinPath(serverDir, "server.proposal.hex")
     let commitHex = os.JoinPath(serverDir, "server.commit.hex")
     let votesPath = os.JoinPath(serverDir, "server.votes")
-    var out = "set -eu && mkdir -p " + os.QuoteShell(serverDir)
-    out = out + " && rm -f " + os.QuoteShell(proposalReady)
-    out = out + " " + os.QuoteShell(commitReady)
-    out = out + " " + os.QuoteShell(voteReady)
-    out = out + " " + os.QuoteShell(stateReady)
-    out = out + " " + os.QuoteShell(voteLock)
-    out = out + " " + os.QuoteShell(queueCursor)
-    out = out + " " + os.QuoteShell(machineHex)
-    out = out + " " + os.QuoteShell(statePid)
-    out = out + " && rm -rf " + os.QuoteShell(snapshotDir)
-    out = out + " && : > " + os.QuoteShell(queuePath)
-    out = out + " && : > " + os.QuoteShell(proposalHex)
-    out = out + " && : > " + os.QuoteShell(commitHex)
-    out = out + " && : > " + os.QuoteShell(votesPath)
-    out = out + " && " + initCommand
+    var out = strutil.Join(["set -eu && mkdir -p ", os.QuoteShell(serverDir)], "")
+    out = strutil.Join([out, " && rm -f ", os.QuoteShell(proposalReady)], "")
+    out = strutil.Join([out, " ", os.QuoteShell(commitReady)], "")
+    out = strutil.Join([out, " ", os.QuoteShell(voteReady)], "")
+    out = strutil.Join([out, " ", os.QuoteShell(stateReady)], "")
+    out = strutil.Join([out, " ", os.QuoteShell(voteLock)], "")
+    out = strutil.Join([out, " ", os.QuoteShell(queueCursor)], "")
+    out = strutil.Join([out, " ", os.QuoteShell(machineHex)], "")
+    out = strutil.Join([out, " ", os.QuoteShell(statePid)], "")
+    out = strutil.Join([out, " && rm -rf ", os.QuoteShell(snapshotDir)], "")
+    out = strutil.Join([out, " && : > ", os.QuoteShell(queuePath)], "")
+    out = strutil.Join([out, " && : > ", os.QuoteShell(proposalHex)], "")
+    out = strutil.Join([out, " && : > ", os.QuoteShell(commitHex)], "")
+    out = strutil.Join([out, " && : > ", os.QuoteShell(votesPath)], "")
+    out = strutil.Join([out, " && ", initCommand], "")
     return out
 
 fn GateBftBenchStartServer(root: str,
@@ -1078,7 +1063,7 @@ fn GateBftBenchStartServer(root: str,
                                                  "bft_bench_start_server_proposer",
                                                  cfg.serverSsh,
                                                  proposerShell,
-                                                 logPrefix + ".server_proposer.log",
+                                                 strutil.Join([logPrefix, ".server_proposer.log"], ""),
                                                  30)
     if GateRunFailed(proposerRun):
         return proposerRun.exitCode
@@ -1092,7 +1077,7 @@ fn GateBftBenchStartServer(root: str,
                                               "bft_bench_start_server_state",
                                               cfg.serverSsh,
                                               stateShell,
-                                              logPrefix + ".server_state.log",
+                                              strutil.Join([logPrefix, ".server_state.log"], ""),
                                               30)
     if GateRunFailed(stateRun):
         return stateRun.exitCode
@@ -1102,7 +1087,7 @@ fn GateBftBenchStartServer(root: str,
     let probeRun = GateRunShellLogged(root,
                                         "bft_bench_probe_server_proposal",
                                         probeCommand,
-                                        logPrefix + ".server_probe.log",
+                                        strutil.Join([logPrefix, ".server_probe.log"], ""),
                                         30)
     if GateRunFailed(probeRun):
         return probeRun.exitCode
@@ -1123,7 +1108,7 @@ fn GateBftBenchStartRelay(root: str,
                                               "bft_bench_start_relay_follower",
                                               cfg.relaySsh,
                                               relayShell,
-                                              logPrefix + ".relay_start.log",
+                                              strutil.Join([logPrefix, ".relay_start.log"], ""),
                                               30)
     if GateRunFailed(relayRun):
         return relayRun.exitCode
@@ -1143,7 +1128,7 @@ fn GateBftBenchStartLocal(root: str,
     let localRun = GateRunShellLogged(root,
                                         "bft_bench_start_local_follower",
                                         localShell,
-                                        logPrefix + ".local_start.log",
+                                        strutil.Join([logPrefix, ".local_start.log"], ""),
                                         30)
     if GateRunFailed(localRun):
         return localRun.exitCode
@@ -1171,12 +1156,10 @@ fn GateBftBenchRestartNode(root: str,
                                                      os.JoinPath(serverDir, "server_proposer.pid"),
                                                      os.JoinPath(serverDir, "server_state.pid")
                                                  ], [
-                                                     "[v]alidator-proposer-daemon --state:" +
-                                                         os.JoinPath(serverDir, "server.state"),
-                                                     "[s]tate-serve-daemon --file:" +
-                                                         os.JoinPath(serverDir, "server.machine.hex")
+                                                     strutil.Join(["[v]alidator-proposer-daemon --state:", os.JoinPath(serverDir, "server.state")], ""),
+                                                     strutil.Join(["[s]tate-serve-daemon --file:", os.JoinPath(serverDir, "server.machine.hex")], "")
                                                  ]),
-                                                 logPrefix + ".server_stop.log",
+                                                 strutil.Join([logPrefix, ".server_stop.log"], ""),
                                                  30)
         if GateRunFailed(stopRun):
             return stopRun.exitCode
@@ -1194,10 +1177,9 @@ fn GateBftBenchRestartNode(root: str,
                                                  cfg.relaySsh,
                                                  GateBftStopShell([os.JoinPath(relayDir, "relay_follower.pid")],
                                                                     [
-                                                                        "[v]alidator-follower-daemon --state:" +
-                                                                            os.JoinPath(relayDir, "relay.state")
+                                                                        strutil.Join(["[v]alidator-follower-daemon --state:", os.JoinPath(relayDir, "relay.state")], "")
                                                                     ]),
-                                                 logPrefix + ".relay_stop.log",
+                                                 strutil.Join([logPrefix, ".relay_stop.log"], ""),
                                                  30)
         if GateRunFailed(stopRun):
             return stopRun.exitCode
@@ -1208,16 +1190,15 @@ fn GateBftBenchRestartNode(root: str,
                                            "bft_bench_restart_local_stop",
                                            GateBftStopShell([os.JoinPath(localDir, "local_follower.pid")],
                                                               [
-                                                                  "[v]alidator-follower-daemon --state:" +
-                                                                      os.JoinPath(localDir, "local.state")
+                                                                  strutil.Join(["[v]alidator-follower-daemon --state:", os.JoinPath(localDir, "local.state")], "")
                                                               ]),
-                                           logPrefix + ".local_stop.log",
+                                           strutil.Join([logPrefix, ".local_stop.log"], ""),
                                            30)
         if GateRunFailed(stopRun):
             return stopRun.exitCode
         os.SleepMs(restartPauseMs)
         return GateBftBenchStartLocal(root, cfg, localDir, localBin, logPrefix)
-    GatePrintErr(" bft bench: invalid restart node: " + restartNode)
+    GatePrintErr(strutil.Join([" bft bench: invalid restart node: ", restartNode], ""))
     return 1
 
 fn GateBftBenchReportText(cfg: BftThreeNodeDeploy,
@@ -1243,49 +1224,40 @@ fn GateBftBenchReportText(cfg: BftThreeNodeDeploy,
                             finalServer: BftNodeStatus,
                             out: var str) =
     out = ""
-    out = out + "version=cheng.bft_three_node_bench.v2\n"
-    out = out + "app_id=" + cfg.appId + "\n"
-    out = out + "tx_count_per_wave=" + strings.Int64ToStr(txCountPerWave) + "\n"
-    out = out + "wave_count=" + intToStr(waveCount) + "\n"
-    out = out + "transfer_amount=" + strings.Int64ToStr(transferAmount) + "\n"
-    out = out + "max_txs_per_block=" + intToStr(maxTxsPerBlock) + "\n"
-    out = out + "restart_node=" + restartNode + "\n"
-    out = out + "restart_wave=" + intToStr(restartWave) + "\n"
-    out = out + "restart_pause_ms=" + intToStr(restartPauseMs) + "\n"
-    out = out + "tx_count=" + strings.Int64ToStr(totalTxCount) + "\n"
-    out = out + "tx_wire_bytes=" + strings.Int64ToStr(txWireBytes) + "\n"
-    out = out + "committed_bytes=" + strings.Int64ToStr(committedBytes) + "\n"
-    out = out + "block_count=" + strings.Int64ToStr(blockCount) + "\n"
-    out = out + "elapsed_ms=" + strings.Int64ToStr(elapsedMs) + "\n"
-    out = out + "tps=" + GateFormatMilli(tpsMilli) + "\n"
-    out = out + "throughput_bytes_per_sec=" + strings.Int64ToStr(bytesPerSec) + "\n"
-    out = out + "throughput_kib_per_sec=" + GateFormatMilli(kibPerSecMilli) + "\n"
-    out = out + "final_height=" + finalServer.height + "\n"
-    out = out + "app_hash=" + finalServer.appHash + "\n"
-    out = out + "alice_balance=" + finalServer.aliceBalance + "\n"
-    out = out + "bob_balance=" + finalServer.bobBalance + "\n"
+    out = strutil.Join([out, "version=cheng.bft_three_node_bench.v2\n"], "")
+    out = strutil.Join([out, "app_id=", cfg.appId, "\n"], "")
+    out = strutil.Join([out, "tx_count_per_wave=", strings.Int64ToStr(txCountPerWave), "\n"], "")
+    out = strutil.Join([out, "wave_count=", intToStr(waveCount), "\n"], "")
+    out = strutil.Join([out, "transfer_amount=", strings.Int64ToStr(transferAmount), "\n"], "")
+    out = strutil.Join([out, "max_txs_per_block=", intToStr(maxTxsPerBlock), "\n"], "")
+    out = strutil.Join([out, "restart_node=", restartNode, "\n"], "")
+    out = strutil.Join([out, "restart_wave=", intToStr(restartWave), "\n"], "")
+    out = strutil.Join([out, "restart_pause_ms=", intToStr(restartPauseMs), "\n"], "")
+    out = strutil.Join([out, "tx_count=", strings.Int64ToStr(totalTxCount), "\n"], "")
+    out = strutil.Join([out, "tx_wire_bytes=", strings.Int64ToStr(txWireBytes), "\n"], "")
+    out = strutil.Join([out, "committed_bytes=", strings.Int64ToStr(committedBytes), "\n"], "")
+    out = strutil.Join([out, "block_count=", strings.Int64ToStr(blockCount), "\n"], "")
+    out = strutil.Join([out, "elapsed_ms=", strings.Int64ToStr(elapsedMs), "\n"], "")
+    out = strutil.Join([out, "tps=", GateFormatMilli(tpsMilli), "\n"], "")
+    out = strutil.Join([out, "throughput_bytes_per_sec=", strings.Int64ToStr(bytesPerSec), "\n"], "")
+    out = strutil.Join([out, "throughput_kib_per_sec=", GateFormatMilli(kibPerSecMilli), "\n"], "")
+    out = strutil.Join([out, "final_height=", finalServer.height, "\n"], "")
+    out = strutil.Join([out, "app_hash=", finalServer.appHash, "\n"], "")
+    out = strutil.Join([out, "alice_balance=", finalServer.aliceBalance, "\n"], "")
+    out = strutil.Join([out, "bob_balance=", finalServer.bobBalance, "\n"], "")
     for i in 0..<waveElapsed.len:
         let waveIndex = intToStr(i + 1)
-        out = out + "wave_" + waveIndex + "_elapsed_ms=" + strings.Int64ToStr(waveElapsed[i]) + "\n"
-        out = out + "wave_" + waveIndex + "_tps=" + GateFormatMilli(waveTps[i]) + "\n"
-        out = out + "wave_" + waveIndex + "_block_count=" + strings.Int64ToStr(waveBlocks[i]) + "\n"
-        out = out + "wave_" + waveIndex + "_restarted=" + (waveRestarted[i] ? "true" : "false") + "\n"
+        out = strutil.Join([out, "wave_", waveIndex, "_elapsed_ms=", strings.Int64ToStr(waveElapsed[i]), "\n"], "")
+        out = strutil.Join([out, "wave_", waveIndex, "_tps=", GateFormatMilli(waveTps[i]), "\n"], "")
+        out = strutil.Join([out, "wave_", waveIndex, "_block_count=", strings.Int64ToStr(waveBlocks[i]), "\n"], "")
+        out = strutil.Join([out, "wave_", waveIndex, "_restarted=", (waveRestarted[i] ? "true" : "false"), "\n"], "")
 fn GateBftStopShell(pidPaths: str[], killPatterns: str[]): str =
     var out = "set -u"
     for i in 0..<pidPaths.len:
         let pidPath = pidPaths[i]
-        out = out +
-            " ; if [ -f " + os.QuoteShell(pidPath) + " ]; then" +
-            " pid=$(cat " + os.QuoteShell(pidPath) + ");" +
-            " if [ -n \"$pid\" ]; then" +
-            " kill \"$pid\" >/dev/null 2>&1 || true;" +
-            " sleep 1;" +
-            " kill -9 \"$pid\" >/dev/null 2>&1 || true;" +
-            " fi;" +
-            " rm -f " + os.QuoteShell(pidPath) + ";" +
-            " fi"
+        out = strutil.Join([out, " ; if [ -f ", os.QuoteShell(pidPath), " ]; then", " pid=$(cat ", os.QuoteShell(pidPath), ");", " if [ -n \"$pid\" ]; then", " kill \"$pid\" >/dev/null 2>&1 || true;", " sleep 1;", " kill -9 \"$pid\" >/dev/null 2>&1 || true;", " fi;", " rm -f ", os.QuoteShell(pidPath), ";", " fi"], "")
     for i in 0..<killPatterns.len:
-        out = out + " ; pkill -f -- " + os.QuoteShell(killPatterns[i]) + " >/dev/null 2>&1 || true"
+        out = strutil.Join([out, " ; pkill -f -- ", os.QuoteShell(killPatterns[i]), " >/dev/null 2>&1 || true"], "")
     return out
 
 fn GateBftStartDetachedShell(binPath: str,
@@ -1294,34 +1266,30 @@ fn GateBftStartDetachedShell(binPath: str,
                                logPath: str,
                                readyPath: str,
                                useSetsid: bool): str =
-    var out = "set -eu && mkdir -p " + os.QuoteShell(chengpath.PathParentDir(logPath))
+    var out = strutil.Join(["set -eu && mkdir -p ", os.QuoteShell(chengpath.PathParentDir(logPath))], "")
     var binArgv: str[]
     add(binArgv, binPath)
-    var inner = "echo $$ > " + os.QuoteShell(pidPath) +
-        " && exec " + GateShellArgv(binArgv) +
-        " " + GateShellArgv(args)
-    inner = inner + " > " + os.QuoteShell(logPath) + " 2>&1 < /dev/null"
+    var inner = strutil.Join(["echo $$ > ", os.QuoteShell(pidPath), " && exec ", GateShellArgv(binArgv), " ", GateShellArgv(args)], "")
+    inner = strutil.Join([inner, " > ", os.QuoteShell(logPath), " 2>&1 < /dev/null"], "")
     if len(readyPath) > 0:
-        out = out + " && rm -f " + os.QuoteShell(readyPath)
-    out = out + " && rm -f " + os.QuoteShell(pidPath)
+        out = strutil.Join([out, " && rm -f ", os.QuoteShell(readyPath)], "")
+    out = strutil.Join([out, " && rm -f ", os.QuoteShell(pidPath)], "")
     if useSetsid:
-        out = out + " && setsid -f sh -lc " + os.QuoteShell(inner)
+        out = strutil.Join([out, " && setsid -f sh -lc ", os.QuoteShell(inner)], "")
     else:
-        out = out + " && sh -lc " + os.QuoteShell(inner) + " &"
-    out = out +
-        " && i=0 && while [ ! -f " + os.QuoteShell(pidPath) +
-        " ] && [ \"$i\" -lt 50 ]; do i=$((i + 1)); sleep 0.1; done"
-    out = out + " && test -f " + os.QuoteShell(pidPath)
+        out = strutil.Join([out, " && sh -lc ", os.QuoteShell(inner), " &"], "")
+    out = strutil.Join([out, " && i=0 && while [ ! -f ", os.QuoteShell(pidPath), " ] && [ \"$i\" -lt 50 ]; do i=$((i + 1)); sleep 0.1; done"], "")
+    out = strutil.Join([out, " && test -f ", os.QuoteShell(pidPath)], "")
     return out
 
 fn GateBftWaitReadyShell(paths: str[], timeoutSec: int32): str =
-    var out = "set -eu && i=0 && while [ \"$i\" -lt " + intToStr(timeoutSec * 10) + " ]; do"
+    var out = strutil.Join(["set -eu && i=0 && while [ \"$i\" -lt ", intToStr(timeoutSec * 10), " ]; do"], "")
     var checks = ""
     for i in 0..<paths.len:
         if i > 0:
-            checks = checks + " && "
-        checks = checks + "[ -f " + os.QuoteShell(paths[i]) + " ]"
-    out = out + " if " + checks + "; then exit 0; fi; i=$((i + 1)); sleep 0.1; done; exit 1"
+            checks = strutil.Join([checks, " && "], "")
+        checks = strutil.Join([checks, "[ -f ", os.QuoteShell(paths[i]), " ]"], "")
+    out = strutil.Join([out, " if ", checks, "; then exit 0; fi; i=$((i + 1)); sleep 0.1; done; exit 1"], "")
     return out
 
 fn GateBftSyncRemoteRepo(root: str,
@@ -1331,8 +1299,8 @@ fn GateBftSyncRemoteRepo(root: str,
     let ensureRun = GateRunRemoteShellLogged(root,
                                                "bft_remote_repo_mkdir",
                                                sshHost,
-                                               "set -eu && mkdir -p " + os.QuoteShell(remoteRoot),
-                                               logPath + ".mkdir.log",
+                                               strutil.Join(["set -eu && mkdir -p ", os.QuoteShell(remoteRoot)], ""),
+                                               strutil.Join([logPath, ".mkdir.log"], ""),
                                                20)
     if GateRunFailed(ensureRun):
         return ensureRun.exitCode
@@ -1349,8 +1317,8 @@ fn GateBftSyncRemoteRepo(root: str,
                                               "--exclude", "artifacts",
                                               "--exclude", "chengcache",
                                               "--exclude", "node_modules",
-                                              root + "/",
-                                              sshHost + ":" + remoteRoot + "/"],
+                                              strutil.Join([root, "/"], ""),
+                                              strutil.Join([sshHost, ":", remoteRoot, "/"], "")],
                                              [],
                                              root,
                                              0,
@@ -1360,7 +1328,7 @@ fn GateBftSyncRemoteRepo(root: str,
             return 0
         if attempt >= 2 || !GateRemoteTransportRetryable(run.output):
             return run.exitCode
-        GatePrintLine("[ gate] remote rsync retry " + intToStr(attempt + 1) + " " + sshHost)
+        GatePrintLine(strutil.Join(["[ gate] remote rsync retry ", intToStr(attempt + 1), " ", sshHost], ""))
         os.SleepMs((attempt + 1) * 1000)
     return lastRun.exitCode
 
@@ -1371,24 +1339,22 @@ fn GateBftBuildRemote(root: str,
     let readyRun = GateRunRemoteShellLogged(root,
                                               "bft_remote_ready",
                                               sshHost,
-                                              "set -eu && " + GateBftRemoteBuildReadyCommand(remoteRoot),
-                                              logPath + ".ready.log",
+                                              strutil.Join(["set -eu && ", GateBftRemoteBuildReadyCommand(remoteRoot)], ""),
+                                              strutil.Join([logPath, ".ready.log"], ""),
                                               30)
     if !GateRunFailed(readyRun):
-        GatePrintLine("[ gate] remote bft reuse " + sshHost)
+        GatePrintLine(strutil.Join(["[ gate] remote bft reuse ", sshHost], ""))
         return 0
     let stage3FreshRun = GateRunRemoteShellLogged(root,
                                                     "bft_remote_stage3_fresh",
                                                     sshHost,
-                                                    "set -eu && " + GateBftRemoteStage3FreshCommand(remoteRoot),
-                                                    logPath + ".stage3.log",
+                                                    strutil.Join(["set -eu && ", GateBftRemoteStage3FreshCommand(remoteRoot)], ""),
+                                                    strutil.Join([logPath, ".stage3.log"], ""),
                                                     30)
     if !GateRunFailed(stage3FreshRun):
         let incrementalCommand = GateBftRemoteLockedShell(
             remoteRoot,
-            "BFT_STATE_TARGET=x86_64-unknown-linux-gnu" +
-            " BFT_STATE_RUN_SELF_TEST=1" +
-            " artifacts/bootstrap/cheng.stage3 build-bft-state-machine")
+            strutil.Join(["BFT_STATE_TARGET=x86_64-unknown-linux-gnu", " BFT_STATE_RUN_SELF_TEST=1", " artifacts/bootstrap/cheng.stage3 build-bft-state-machine"], ""))
         let incrementalRun = GateRunRemoteShellLogged(root,
                                                         "bft_remote_build_incremental",
                                                         sshHost,
@@ -1397,23 +1363,15 @@ fn GateBftBuildRemote(root: str,
                                                         900)
         if GateRunFailed(incrementalRun):
             return incrementalRun.exitCode
-        GatePrintLine("[ gate] remote bft incremental " + sshHost)
+        GatePrintLine(strutil.Join(["[ gate] remote bft incremental ", sshHost], ""))
         return 0
     let fullCommand = GateBftRemoteLockedShell(
         remoteRoot,
-        "mkdir -p artifacts/bootstrap" +
-        " && cc -std=c11 -O2 -Wall -Wextra -pedantic" +
-        " bootstrap/cheng_seed.c -o artifacts/bootstrap/cheng.stage0" +
-        " && CHENG_ROOT=" + os.QuoteShell(remoteRoot) +
-        " CHENG_TARGET=x86_64-unknown-linux-gnu" +
-        " artifacts/bootstrap/cheng.stage0 bootstrap-bridge >/dev/null" +
-        " && BFT_STATE_TARGET=x86_64-unknown-linux-gnu" +
-        " BFT_STATE_RUN_SELF_TEST=1" +
-        " artifacts/bootstrap/cheng.stage3 build-bft-state-machine")
+        strutil.Join(["mkdir -p artifacts/bootstrap", " && cc -std=c11 -O2 -Wall -Wextra -pedantic", " bootstrap/cheng_seed.c -o artifacts/bootstrap/cheng.stage0", " && CHENG_ROOT=", os.QuoteShell(remoteRoot), " CHENG_TARGET=x86_64-unknown-linux-gnu", " artifacts/bootstrap/cheng.stage0 bootstrap-bridge >/dev/null", " && BFT_STATE_TARGET=x86_64-unknown-linux-gnu", " BFT_STATE_RUN_SELF_TEST=1", " artifacts/bootstrap/cheng.stage3 build-bft-state-machine"], ""))
     let run = GateRunRemoteShellLogged(root, "bft_remote_build", sshHost, fullCommand, logPath, 900)
     if GateRunFailed(run):
         return run.exitCode
-    GatePrintLine("[ gate] remote bft rebuild " + sshHost)
+    GatePrintLine(strutil.Join(["[ gate] remote bft rebuild ", sshHost], ""))
     return 0
 
 fn GateStatusBftValidatorThreeNode(root: str): int32 =
@@ -1471,10 +1429,8 @@ fn GateStopBftValidatorThreeNode(root: str): int32 =
                                                    os.JoinPath(serverDir, "server_proposer.pid"),
                                                    os.JoinPath(serverDir, "server_state.pid")
                                                ], [
-                                                   "[v]alidator-proposer-daemon --state:" +
-                                                       os.JoinPath(serverDir, "server.state"),
-                                                   "[s]tate-serve-daemon --file:" +
-                                                       os.JoinPath(serverDir, "server.machine.hex")
+                                                   strutil.Join(["[v]alidator-proposer-daemon --state:", os.JoinPath(serverDir, "server.state")], ""),
+                                                   strutil.Join(["[s]tate-serve-daemon --file:", os.JoinPath(serverDir, "server.machine.hex")], "")
                                                ]),
                                                "artifacts/gate/bft_stop_server.log",
                                                30)
@@ -1485,8 +1441,7 @@ fn GateStopBftValidatorThreeNode(root: str): int32 =
                                               cfg.relaySsh,
                                               GateBftStopShell([os.JoinPath(relayDir, "relay_follower.pid")],
                                                                  [
-                                                                     "[v]alidator-follower-daemon --state:" +
-                                                                         os.JoinPath(relayDir, "relay.state")
+                                                                     strutil.Join(["[v]alidator-follower-daemon --state:", os.JoinPath(relayDir, "relay.state")], "")
                                                                  ]),
                                               "artifacts/gate/bft_stop_relay.log",
                                               30)
@@ -1496,8 +1451,7 @@ fn GateStopBftValidatorThreeNode(root: str): int32 =
                                         "bft_stop_local",
                                         GateBftStopShell([os.JoinPath(localDir, "local_follower.pid")],
                                                            [
-                                                               "[v]alidator-follower-daemon --state:" +
-                                                                   os.JoinPath(localDir, "local.state")
+                                                               strutil.Join(["[v]alidator-follower-daemon --state:", os.JoinPath(localDir, "local.state")], "")
                                                            ]),
                                         "artifacts/gate/bft_stop_local.log",
                                         30)
@@ -1512,8 +1466,7 @@ fn GateBftEnsureNoUe(root: str,
                        context: str): bool =
     let run = GateRunShellLogged(root,
                                    label,
-                                   "ps -Ao pid=,ppid=,state=,etime=,command= |" +
-                                       " awk '$2==1 && $3 ~ /^U/ && $5 ~ /bft_state_machine/'",
+                                   strutil.Join(["ps -Ao pid=,ppid=,state=,etime=,command= |", " awk '$2==1 && $3 ~ /^U/ && $5 ~ /bft_state_machine/'"], ""),
                                    logPath,
                                    10)
     if GateRunFailed(run):
@@ -1585,8 +1538,7 @@ fn GateDeployBftValidatorThreeNode(root: str,
     let relayInit = GateRunRemoteShellLogged(root,
                                                "bft_init_relay",
                                                cfg.relaySsh,
-                                               "set -eu && mkdir -p " + os.QuoteShell(relayDir) +
-                                               " && " + relayInitCommand,
+                                               strutil.Join(["set -eu && mkdir -p ", os.QuoteShell(relayDir), " && ", relayInitCommand], ""),
                                                "artifacts/gate/bft_init_relay.log",
                                                30)
     if GateRunFailed(relayInit):
@@ -1597,8 +1549,7 @@ fn GateDeployBftValidatorThreeNode(root: str,
                                                 3)
     let localInit = GateRunShellLogged(root,
                                          "bft_init_local",
-                                         "set -eu && mkdir -p " + os.QuoteShell(localDir) +
-                                         " && " + localInitCommand,
+                                         strutil.Join(["set -eu && mkdir -p ", os.QuoteShell(localDir), " && ", localInitCommand], ""),
                                          "artifacts/gate/bft_init_local.log",
                                          30)
     if GateRunFailed(localInit):
@@ -1618,7 +1569,7 @@ fn GateDeployBftValidatorThreeNode(root: str,
     let queueRun = GateRunRemoteShellLogged(root,
                                               "bft_seed_queue",
                                               cfg.serverSsh,
-                                              "set -eu && " + seedMintCommand + " && " + seedTransferCommand,
+                                              strutil.Join(["set -eu && ", seedMintCommand, " && ", seedTransferCommand], ""),
                                               "artifacts/gate/bft_seed_queue.log",
                                               30)
     if GateRunFailed(queueRun):
@@ -1656,18 +1607,11 @@ fn GateDeployBftValidatorThreeNode(root: str,
     let serverReadyRun = GateRunRemoteShellLogged(root,
                                                     "bft_wait_server_ready",
                                                     cfg.serverSsh,
-                                                    "set -eu && i=0 && while { [ ! -f " +
-                                                        os.QuoteShell(os.JoinPath(serverDir,
-                                                                                  "server.proposal.ready")) +
-                                                        " ] || [ ! -f " +
-                                                        os.QuoteShell(os.JoinPath(serverDir,
-                                                                                  "server.vote.ready")) +
-                                                        " ]; } && [ \"$i\" -lt 200 ]; do i=$((i + 1)); sleep 0.05; done && test -f " +
-                                                        os.QuoteShell(os.JoinPath(serverDir,
-                                                                                  "server.proposal.ready")) +
-                                                        " && test -f " +
-                                                        os.QuoteShell(os.JoinPath(serverDir,
-                                                                                  "server.vote.ready")),
+                                                    strutil.Join(["set -eu && i=0 && while { [ ! -f ", os.QuoteShell(os.JoinPath(serverDir,
+                                                                                  "server.proposal.ready")), " ] || [ ! -f ", os.QuoteShell(os.JoinPath(serverDir,
+                                                                                  "server.vote.ready")), " ]; } && [ \"$i\" -lt 200 ]; do i=$((i + 1)); sleep 0.05; done && test -f ", os.QuoteShell(os.JoinPath(serverDir,
+                                                                                  "server.proposal.ready")), " && test -f ", os.QuoteShell(os.JoinPath(serverDir,
+                                                                                  "server.vote.ready"))], ""),
                                                     "artifacts/gate/bft_wait_server_ready.log",
                                                     30)
     if GateRunFailed(serverReadyRun):
@@ -1829,7 +1773,7 @@ fn GateVerifyBftValidatorThreeNode(root: str,
                                                relayStatus,
                                                localStatus)
     if !chengpath.WriteTextFile(root, reportPath, reportText):
-        GatePrintErr(" bft verify: failed to write report: " + reportPath)
+        GatePrintErr(strutil.Join([" bft verify: failed to write report: ", reportPath], ""))
         let _ = GateStopBftValidatorThreeNode(root)
         return 1
     let stopCode = GateStopBftValidatorThreeNode(root)
@@ -1857,7 +1801,7 @@ fn GateVerifyBftValidatorThreeNode(root: str,
         GatePrintErr(" bft verify: stop failed after verification")
         return stopCode
     GatePrintLine(" bft verify ok")
-    GatePrintLine("report=" + reportPath)
+    GatePrintLine(strutil.Join(["report=", reportPath], ""))
     return 0
 
 fn GateBenchBftValidatorThreeNode(root: str,
@@ -1928,7 +1872,7 @@ fn GateBenchBftValidatorThreeNode(root: str,
         let topupRun = GateRunRemoteShellLogged(root,
                                                   "bft_bench_topup",
                                                   cfg.serverSsh,
-                                                  "set -eu && " + topupCommand,
+                                                  strutil.Join(["set -eu && ", topupCommand], ""),
                                                   "artifacts/gate/bft_bench_topup.log",
                                                   30)
         if GateRunFailed(topupRun):
@@ -1968,7 +1912,7 @@ fn GateBenchBftValidatorThreeNode(root: str,
     for wave in 0..<waveCount:
         let waveIndex = wave + 1
         let waveStart = monotimes.GetMonoTime()
-        let wavePrefix = "artifacts/gate/bft_bench_wave_" + intToStr(waveIndex)
+        let wavePrefix = strutil.Join(["artifacts/gate/bft_bench_wave_", intToStr(waveIndex)], "")
         let submitSeriesCommand = GateBftSubmitTransferSeriesCommand(serverBin,
                                                                        os.JoinPath(serverDir,
                                                                                    "server.queue"),
@@ -1978,10 +1922,10 @@ fn GateBenchBftValidatorThreeNode(root: str,
                                                                        transferAmount,
                                                                        txCount)
         let queueRun = GateRunRemoteShellLogged(root,
-                                                  "bft_bench_submit_series_wave_" + intToStr(waveIndex),
+                                                  strutil.Join(["bft_bench_submit_series_wave_", intToStr(waveIndex)], ""),
                                                   cfg.serverSsh,
-                                                  "set -eu && " + submitSeriesCommand,
-                                                  wavePrefix + ".submit.log",
+                                                  strutil.Join(["set -eu && ", submitSeriesCommand], ""),
+                                                  strutil.Join([wavePrefix, ".submit.log"], ""),
                                                   30)
         if GateRunFailed(queueRun):
             return queueRun.exitCode
@@ -2014,7 +1958,7 @@ fn GateBenchBftValidatorThreeNode(root: str,
                                          restartNode,
                                          maxTxsPerBlock,
                                          restartPauseMs,
-                                         wavePrefix + ".restart") != 0:
+                                         strutil.Join([wavePrefix, ".restart"], "")) != 0:
                 return 1
             restarted = true
         if !GateBftWaitClusterState(root,
@@ -2025,12 +1969,12 @@ fn GateBenchBftValidatorThreeNode(root: str,
                                       strings.Int64ToStr(expectedHeight),
                                       strings.Int64ToStr(expectedAlice),
                                       strings.Int64ToStr(expectedBob),
-                                      wavePrefix + ".wait",
+                                      strutil.Join([wavePrefix, ".wait"], ""),
                                       finalServer,
                                       finalRelay,
                                       finalLocal):
             GatePrintErr(" bft bench: benchmark transactions did not converge")
-            GatePrintErr("wave=" + intToStr(waveIndex))
+            GatePrintErr(strutil.Join(["wave=", intToStr(waveIndex)], ""))
             return 1
         let waveElapsedNs: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime()) - monotimes.MonoTimeNs(waveStart)
         var waveElapsed = waveElapsedNs / int64(1000000)
@@ -2055,27 +1999,27 @@ fn GateBenchBftValidatorThreeNode(root: str,
         return 1
     let reportPath = GateBftBenchReportPath(root)
     var reportText = ""
-    reportText = reportText + "version=cheng.bft_three_node_bench.v2\n"
-    reportText = reportText + "app_id=" + cfg.appId + "\n"
-    reportText = reportText + "tx_count_per_wave=" + strings.Int64ToStr(int64(txCount)) + "\n"
-    reportText = reportText + "wave_count=" + intToStr(waveCount) + "\n"
-    reportText = reportText + "transfer_amount=" + strings.Int64ToStr(transferAmount) + "\n"
-    reportText = reportText + "max_txs_per_block=" + intToStr(maxTxsPerBlock) + "\n"
-    reportText = reportText + "restart_node=" + restartNode + "\n"
-    reportText = reportText + "restart_wave=" + intToStr(restartWave) + "\n"
-    reportText = reportText + "restart_pause_ms=" + intToStr(restartPauseMs) + "\n"
-    reportText = reportText + "tx_count=" + strings.Int64ToStr(totalQueuedCount) + "\n"
-    reportText = reportText + "tx_wire_bytes=" + strings.Int64ToStr(txWireBytes) + "\n"
-    reportText = reportText + "committed_bytes=" + strings.Int64ToStr(totalQueuedBytes) + "\n"
-    reportText = reportText + "block_count=" + strings.Int64ToStr(totalBlocks) + "\n"
-    reportText = reportText + "elapsed_ms=" + strings.Int64ToStr(elapsedMs) + "\n"
-    reportText = reportText + "tps=" + GateFormatMilli(tpsMilli) + "\n"
-    reportText = reportText + "throughput_bytes_per_sec=" + strings.Int64ToStr(bytesPerSec) + "\n"
-    reportText = reportText + "throughput_kib_per_sec=" + GateFormatMilli(kibPerSecMilli) + "\n"
-    reportText = reportText + "final_height=" + finalServer.height + "\n"
-    reportText = reportText + "app_hash=" + finalServer.appHash + "\n"
-    reportText = reportText + "alice_balance=" + finalServer.aliceBalance + "\n"
-    reportText = reportText + "bob_balance=" + finalServer.bobBalance + "\n"
+    reportText = strutil.Join([reportText, "version=cheng.bft_three_node_bench.v2\n"], "")
+    reportText = strutil.Join([reportText, "app_id=", cfg.appId, "\n"], "")
+    reportText = strutil.Join([reportText, "tx_count_per_wave=", strings.Int64ToStr(int64(txCount)), "\n"], "")
+    reportText = strutil.Join([reportText, "wave_count=", intToStr(waveCount), "\n"], "")
+    reportText = strutil.Join([reportText, "transfer_amount=", strings.Int64ToStr(transferAmount), "\n"], "")
+    reportText = strutil.Join([reportText, "max_txs_per_block=", intToStr(maxTxsPerBlock), "\n"], "")
+    reportText = strutil.Join([reportText, "restart_node=", restartNode, "\n"], "")
+    reportText = strutil.Join([reportText, "restart_wave=", intToStr(restartWave), "\n"], "")
+    reportText = strutil.Join([reportText, "restart_pause_ms=", intToStr(restartPauseMs), "\n"], "")
+    reportText = strutil.Join([reportText, "tx_count=", strings.Int64ToStr(totalQueuedCount), "\n"], "")
+    reportText = strutil.Join([reportText, "tx_wire_bytes=", strings.Int64ToStr(txWireBytes), "\n"], "")
+    reportText = strutil.Join([reportText, "committed_bytes=", strings.Int64ToStr(totalQueuedBytes), "\n"], "")
+    reportText = strutil.Join([reportText, "block_count=", strings.Int64ToStr(totalBlocks), "\n"], "")
+    reportText = strutil.Join([reportText, "elapsed_ms=", strings.Int64ToStr(elapsedMs), "\n"], "")
+    reportText = strutil.Join([reportText, "tps=", GateFormatMilli(tpsMilli), "\n"], "")
+    reportText = strutil.Join([reportText, "throughput_bytes_per_sec=", strings.Int64ToStr(bytesPerSec), "\n"], "")
+    reportText = strutil.Join([reportText, "throughput_kib_per_sec=", GateFormatMilli(kibPerSecMilli), "\n"], "")
+    reportText = strutil.Join([reportText, "final_height=", finalServer.height, "\n"], "")
+    reportText = strutil.Join([reportText, "app_hash=", finalServer.appHash, "\n"], "")
+    reportText = strutil.Join([reportText, "alice_balance=", finalServer.aliceBalance, "\n"], "")
+    reportText = strutil.Join([reportText, "bob_balance=", finalServer.bobBalance, "\n"], "")
     GatePrintKv("tx_count_per_wave=", strings.Int64ToStr(int64(txCount)))
     GatePrintKv("wave_count=", intToStr(waveCount))
     GatePrintKv("restart_node=", restartNode)
@@ -2099,7 +2043,7 @@ fn GateBenchBftValidatorThreeNode(root: str,
                                    waveBlockCounts,
                                    waveRestarted)
     if !chengpath.WriteTextFile(root, reportPath, reportText):
-        let writeErr = " bft bench: failed to write report: " + reportPath
+        let writeErr = strutil.Join([" bft bench: failed to write report: ", reportPath], "")
         GatePrintErr(writeErr)
         return 1
     GatePrintKv("report=", reportPath)

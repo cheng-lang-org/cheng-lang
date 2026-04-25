@@ -6,6 +6,7 @@ import std/rawmem_support
 import std/system
 import cheng/core/tooling/path as chengpath
 import cheng/core/tooling/root_discovery as rootdisco
+import std/strutils as strutil
 
 type
     ParsedSourceKind = enum
@@ -1258,7 +1259,7 @@ fn ParserManifestValue(manifestTextRaw: str,
     let key = chengpath.PathTrim(keyRaw)
     if manifestText == "" || key == "":
         return ""
-    let prefix = key + " = "
+    let prefix = strutil.Join([key, " = "], "")
     let lines = ParserSplitChar(manifestText, '\n')
     for i in 0..<lines.len:
         let line = ParserTrimmedLineWithoutComment(lines[i])
@@ -1630,8 +1631,10 @@ fn ParserRejectSpaceCallIfStrict(lineRaw: str,
             continue
         let next = lineRaw[argStart]
         if ParserStrictAtomStart(next):
-            err = "Space call syntax is removed in the elegant syntax profile; use f(x) at line " +
-                  intToStr(lineNumber) + " near " + callName
+            err = strutil.Join(["Space call syntax is removed in the elegant syntax profile; use f(x) at line ",
+                                intToStr(lineNumber),
+                                " near ",
+                                callName], "")
             return true
     return false
 
@@ -2482,25 +2485,36 @@ fn ParserResolveUnqualifiedTypeProfileIndex(currentProfile: NormalizedExprCallPr
 
 fn ParserDefaultInitRemovedDefaultError(exprRaw: str): str =
     let expr = chengpath.PathTrim(exprRaw)
-    return "[cheng_seed] default[T] removed expr=" + expr + "; use T() for object/tuple, typed implicit init or literals for T[]/T[N], and new(T) for ref object"
+    return strutil.Join(["[cheng_seed] default[T] removed expr=",
+                         expr,
+                         "; use T() for object/tuple, typed implicit init or literals for T[]/T[N], and new(T) for ref object"], "")
 
 fn ParserDefaultInitScalarError(typeRaw: str): str =
     let typeText = chengpath.PathTrim(typeRaw)
-    return "[cheng_seed] simple type T() unsupported expr=" + typeText + "(); simple types use typed implicit init"
+    return strutil.Join(["[cheng_seed] simple type T() unsupported expr=",
+                         typeText,
+                         "(); simple types use typed implicit init"], "")
 
 fn ParserDefaultInitSeqOrFixedError(typeRaw: str): str =
     let typeText = chengpath.PathTrim(typeRaw)
-    return "[cheng_seed] seq/fixed-array T() unsupported expr=" + typeText + "(); use typed implicit init or literals"
+    return strutil.Join(["[cheng_seed] seq/fixed-array T() unsupported expr=",
+                         typeText,
+                         "(); use typed implicit init or literals"], "")
 
 fn ParserDefaultInitRefObjectError(typeRaw: str): str =
     let typeText = chengpath.PathTrim(typeRaw)
-    return "[cheng_seed] ref object T() unsupported expr=" + typeText + "(); use new(T)"
+    return strutil.Join(["[cheng_seed] ref object T() unsupported expr=",
+                         typeText,
+                         "(); use new(T)"], "")
 
 fn ParserRedundantExplicitDefaultError(typeRaw: str,
                                          exprRaw: str): str =
     let typeText = chengpath.PathTrim(typeRaw)
     let exprText = chengpath.PathTrim(exprRaw)
-    return "[cheng_seed] redundant explicit default init; omit initializer type=" + typeText + " expr=" + exprText
+    return strutil.Join(["[cheng_seed] redundant explicit default init; omit initializer type=",
+                         typeText,
+                         " expr=",
+                         exprText], "")
 
 fn ParserCompactText(textRaw: str): str =
     var out = ""
@@ -2508,7 +2522,7 @@ fn ParserCompactText(textRaw: str): str =
         let ch = textRaw[i]
         if ParserIsInlineSpace(ch):
             continue
-        out = out + chengpath.TextSlice(textRaw, i, 1)
+        out = strutil.Join([out, chengpath.TextSlice(textRaw, i, 1)], "")
     return out
 
 fn ParserFindTopLevelAssignmentEq(textRaw: str): int32 =
@@ -2711,7 +2725,7 @@ fn ParserExprMatchesImplicitDefault(currentProfile: NormalizedExprCallProfile,
         return true
     let compactType = ParserCompactText(typeText)
     let compactExpr = ParserCompactText(exprText)
-    if compactType != "" && compactExpr == compactType + "()":
+    if compactType != "" && compactExpr == strutil.Join([compactType, "()"], ""):
         var typeErr = ""
         return ParserDefaultInitTypeStatus(currentProfile, profiles, typeText, typeErr) > 0
     return false
@@ -3991,6 +4005,9 @@ fn ParserAppendMemberCallExprsLine(sourcePath: str,
                 var reasonText = NormalizedExprCallReasonUnknownQualifiedTarget
                 if shadowReason != NormalizedExprCallReasonNone:
                     reasonText = shadowReason
+                var unresolvedSurfaceKind = NormalizedExprSurfaceCallMember
+                if ParserProfileHasImportQualifier(currentProfile, qualifierText):
+                    unresolvedSurfaceKind = NormalizedExprSurfaceCallExternal
                 var callArgsText = ""
                 var callArgCount: int32
                 var endColumnNumber: int32 = -1
@@ -4005,7 +4022,7 @@ fn ParserAppendMemberCallExprsLine(sourcePath: str,
                                                 lineNumber,
                                                 start + 1,
                                                 dottedCallName,
-                                                NormalizedExprSurfaceCallMember,
+                                                unresolvedSurfaceKind,
                                                 false,
                                                 reasonText,
                                                 qualifierText,
@@ -5341,6 +5358,8 @@ fn ParserMatchKnownCallSurfaceTextKeysPtr(callLookup: ParserTextLookup*,
                                         qualifiedCallName,
                                         qualifiedCallNameKey):
         return qualifiedCallName
+    if dottedCallName != callName:
+        return ""
     if ParserTextLookupContainsKeyPtr(callLookup, callName, callNameKey):
         return callName
     return ""
@@ -5647,9 +5666,23 @@ fn ParserMatchKnownCallSurfaceTextKeys(callLookup: ParserTextLookup,
                                      qualifiedCallName,
                                      qualifiedCallNameKey):
         return qualifiedCallName
+    if dottedCallName != callName:
+        return ""
     if ParserTextLookupContainsKey(callLookup, callName, callNameKey):
         return callName
     return ""
+
+fn ParserProfileHasImportQualifier(profile: NormalizedExprCallProfile,
+                                     qualifierRaw: str): bool =
+    let qualifier = ParserIdentPrefix(chengpath.PathTrim(qualifierRaw))
+    if qualifier == "":
+        return false
+    for i in 0..<profile.importEdges.len:
+        if !profile.importEdges[i].resolved:
+            continue
+        if profile.importEdges[i].qualifier == qualifier:
+            return true
+    return false
 
 fn ParserStringSeqContainsExact(items: str[], target: str): bool =
     for i in 0..<items.len:
@@ -6766,6 +6799,9 @@ fn ParseOrdinarySourceStubWithExternalPackageRoots(packageRootRaw: str,
     let profileIndexLookup = ParserSourcePathIndexLookupBuild(sourceProfiles)
     ParserBindImportEdgeTargetProfileIndices(sourceProfiles, profileIndexLookup)
     for i in 0..<sourceProfiles.len:
+        if os.GetEnv("CHENG_TRACE_PARSE_SOURCE") == "1":
+            let tracePath = sourceProfiles[i].sourcePath
+            echo(strutil.Join(["parse_source ", tracePath], ""))
         var sourceExprLayer = NormalizedExprLayer()
         var sourceExternalCallNames: str[]
         ParserCollectExternalCallNames(sourceProfiles,

@@ -10,6 +10,7 @@ import cheng/apps/wow_export/md5 as md5
 import cheng/apps/wow_export/salsa20 as salsa20
 import cheng/apps/wow_export/tact_keys as tact_keys
 import cheng/apps/wow_export/zlib_inflate as zlib_inflate
+import std/strutils as strutil
 
 type
     BlteBlock =
@@ -108,7 +109,7 @@ fn ParseBlteHeader(buf: bytes.ByteBuffer, expectedHash: str, verifyHash: bool): 
         else:
             hashCheck = md5.Md5ByteBufferHex(buf)
         if hashCheck != expectedHash:
-            return Err[BlteHeader]("wowExport BLTE: MD5 mismatch expected=" + expectedHash + " got=" + hashCheck)
+            return Err[BlteHeader](strutil.Join(["wowExport BLTE: MD5 mismatch expected=", expectedHash, " got=", hashCheck], ""))
 
     var blockCount: int32 = 1
     var dataStart: int32 = 8
@@ -209,7 +210,7 @@ fn BlockKindText(flag: int32): str =
         return "normal"
     if flag == 0x5a:
         return "zlib"
-    return "unknown-" + strings.IntToStr(flag)
+    return strutil.Join(["unknown-", strings.IntToStr(flag)], "")
 
 fn VerifyFirstBlockHash(buf: bytes.ByteBuffer, header: BlteHeader): Result[bool] =
     return VerifyBlockHash(buf, header, 0)
@@ -222,7 +223,7 @@ fn VerifyBlockHash(buf: bytes.ByteBuffer, header: BlteHeader, blockIndex: int32)
         return Ok[bool](true)
     let blockHash: str = md5.Md5ByteBufferSliceHex(buf, header.dataStart + block.fileOffset, block.compSize)
     if blockHash != block.hash:
-        return Err[bool]("wowExport BLTE: block MD5 mismatch expected=" + block.hash + " got=" + blockHash)
+        return Err[bool](strutil.Join(["wowExport BLTE: block MD5 mismatch expected=", block.hash, " got=", blockHash], ""))
     return Ok[bool](true)
 
 fn VerifyBlockPayloadHash(block: bytes.ByteBuffer, expectedHash: str): Result[bool] =
@@ -230,7 +231,7 @@ fn VerifyBlockPayloadHash(block: bytes.ByteBuffer, expectedHash: str): Result[bo
         return Ok[bool](true)
     let blockHash: str = md5.Md5ByteBufferHex(block)
     if blockHash != expectedHash:
-        return Err[bool]("wowExport BLTE: block MD5 mismatch expected=" + expectedHash + " got=" + blockHash)
+        return Err[bool](strutil.Join(["wowExport BLTE: block MD5 mismatch expected=", expectedHash, " got=", blockHash], ""))
     return Ok[bool](true)
 
 fn FirstBlockPayload(buf: bytes.ByteBuffer, header: BlteHeader): Result[bytes.ByteBuffer] =
@@ -251,13 +252,13 @@ fn DecodeNormalBlockPayload(block: bytes.ByteBuffer, expectedSize: int32): Resul
     if flag == 0x45:
         return Err[bytes.ByteBuffer]("wowExport BLTE: Salsa20 key required for encrypted block")
     if flag != 0x4e:
-        return Err[bytes.ByteBuffer]("wowExport BLTE: unsupported block kind " + BlockKindText(flag))
+        return Err[bytes.ByteBuffer](strutil.Join(["wowExport BLTE: unsupported block kind ", BlockKindText(flag)], ""))
     let outRes: Result[bytes.ByteBuffer] = CopyByteBufferSlice(block, 1, block.len - 1)
     if IsErr(outRes):
         return outRes
     let out: bytes.ByteBuffer = Value(outRes)
     if expectedSize >= 0 && out.len != expectedSize:
-        return Err[bytes.ByteBuffer]("wowExport BLTE: normal block size mismatch expected=" + strings.IntToStr(expectedSize) + " got=" + strings.IntToStr(out.len))
+        return Err[bytes.ByteBuffer](strutil.Join(["wowExport BLTE: normal block size mismatch expected=", strings.IntToStr(expectedSize), " got=", strings.IntToStr(out.len)], ""))
     return Ok[bytes.ByteBuffer](out)
 
 fn DecodeBlockPayloadWithKey(block: bytes.ByteBuffer,
@@ -312,7 +313,7 @@ fn blteDecryptEncryptedBlockPayload(block: bytes.ByteBuffer,
     let keyNameSize: int32 = bytes.BufByteAt(block, pos)
     pos = pos + 1
     if keyNameSize != 8:
-        return Err[bytes.ByteBuffer]("wowExport BLTE: unexpected keyNameSize=" + strings.IntToStr(keyNameSize))
+        return Err[bytes.ByteBuffer](strutil.Join(["wowExport BLTE: unexpected keyNameSize=", strings.IntToStr(keyNameSize)], ""))
     if pos + keyNameSize > block.len:
         return Err[bytes.ByteBuffer]("wowExport BLTE: encrypted block truncated key name")
     var keyName: str
@@ -327,7 +328,7 @@ fn blteDecryptEncryptedBlockPayload(block: bytes.ByteBuffer,
     let ivSize: int32 = bytes.BufByteAt(block, pos)
     pos = pos + 1
     if (ivSize != 4 && ivSize != 8) || ivSize > 8:
-        return Err[bytes.ByteBuffer]("wowExport BLTE: unexpected ivSize=" + strings.IntToStr(ivSize))
+        return Err[bytes.ByteBuffer](strutil.Join(["wowExport BLTE: unexpected ivSize=", strings.IntToStr(ivSize)], ""))
     if pos + ivSize >= block.len:
         return Err[bytes.ByteBuffer]("wowExport BLTE: encrypted block truncated IV or type")
     var nonce: rawbytes.Bytes = rawbytes.BytesAlloc(8)
@@ -343,7 +344,7 @@ fn blteDecryptEncryptedBlockPayload(block: bytes.ByteBuffer,
     pos = pos + 1
     if encryptType != BlteEncTypeSalsa20:
         rawbytes.BytesFree(nonce)
-        return Err[bytes.ByteBuffer]("wowExport BLTE: unexpected encryption type=" + strings.IntToStr(encryptType))
+        return Err[bytes.ByteBuffer](strutil.Join(["wowExport BLTE: unexpected encryption type=", strings.IntToStr(encryptType)], ""))
     var keyHex: str = keyHexRaw
     if useKeyTable:
         let keyRes: Result[str] = tact_keys.FindTactKey(keyTable, keyName)
@@ -353,7 +354,7 @@ fn blteDecryptEncryptedBlockPayload(block: bytes.ByteBuffer,
         keyHex = Value(keyRes)
     if strings.Len(keyHex) == 0:
         rawbytes.BytesFree(nonce)
-        return Err[bytes.ByteBuffer]("wowExport BLTE: missing Salsa20 key keyName=" + keyName)
+        return Err[bytes.ByteBuffer](strutil.Join(["wowExport BLTE: missing Salsa20 key keyName=", keyName], ""))
     let encryptedRes: Result[rawbytes.Bytes] = ByteBufferSliceToRaw(block, pos, block.len - pos)
     if IsErr(encryptedRes):
         rawbytes.BytesFree(nonce)

@@ -38,6 +38,12 @@ fn BackendDriverParamCountBridge(): int32
 @importc("__cheng_rt_paramStr")
 fn BackendDriverParamStrRawBridge(i: int32): cstring
 
+@importc("cheng_backend_driver_root")
+fn BackendDriverRoot(): str
+
+@importc("cheng_backend_driver_ensure_root_env")
+fn BackendDriverEnsureRootEnv(rootDir: str)
+
 fn BackendDriverPrintLine(text: str) =
     os.WriteLine(BackendDriverStdoutBridge(), text)
 
@@ -54,12 +60,6 @@ fn BackendDriverTruthyEnv(name: str): bool =
     let raw = os.GetEnv(name)
     return len(raw) > 0 && raw != "0" && raw != "false"
 
-fn BackendDriverRoot(): str =
-    let envRoot = strutil.Strip(os.GetEnv("CHENG_ROOT"))
-    if len(envRoot) > 0:
-        return envRoot
-    return os.GetCurrentDir()
-
 fn BackendDriverStage3Path(rootDir: str): str =
     return chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage3")
 
@@ -71,11 +71,6 @@ fn BackendDriverUsage(rootDir: str) =
     BackendDriverPrintLine("verify commands: verify-orphan-guard, verify-export-visibility, verify-export-visibility-parallel, verify-backend-driver-command-surface, verify-mobile-shell-build-probe, verify-r2c-react-surface, verify-debug-tools, verify-debug-runtime, verify-debug-profile, verify-windows-builtin, verify-riscv64-builtin")
     BackendDriverPrintLine("gate commands: run-host-smokes, run-stage23-libp2p-smokes, run-production-regression, slice-gate")
     BackendDriverPrintKeyValue("stage3", BackendDriverStage3Path(rootDir))
-
-fn BackendDriverEnsureRootEnv(rootDir: str) =
-    let rootEnvRaw = strutil.Strip(os.GetEnv("CHENG_ROOT"))
-    if rootEnvRaw == "":
-        os.SetEnv("CHENG_ROOT", rootDir)
 
 fn BackendDriverCollectArgsFrom(startIndex: int32,
                                   count: int32): str[] =
@@ -100,9 +95,9 @@ fn BackendDriverReadFlag(args: str[],
         let arg = args[i]
         if arg == key && i + 1 < args.len:
             return args[i + 1]
-        if BackendDriverStartsWith(arg, Fmt([key, ":"])):
+        if BackendDriverStartsWith(arg, strutil.Join([key, ":"], "")):
             return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
-        if BackendDriverStartsWith(arg, Fmt([key, "="])):
+        if BackendDriverStartsWith(arg, strutil.Join([key, "="], "")):
             return strings.SliceBytes(arg, len(key) + 1, len(arg) - len(key) - 1)
     return defaultValue
 
@@ -126,11 +121,11 @@ fn BackendDriverScanHotpath(rootDir: str): int32 =
 fn BackendDriverRunSmokes(rootDir: str): int32 =
     let stage1Source = contracts.BootstrapStage1SourcePath(rootDir)
     if !chengpath.FileExistsNonEmpty(rootDir, stage1Source):
-        BackendDriverPrintErr("backend driver run-smokes: missing stage1 source: " + stage1Source)
+        BackendDriverPrintErr(strutil.Join(["backend driver run-smokes: missing stage1 source: ", stage1Source], ""))
         return 1
     let logDir = chengpath.PathAbsolute(rootDir, "artifacts/gate")
     if !chengpath.MkdirP(rootDir, logDir):
-        BackendDriverPrintErr("backend driver run-smokes: mkdir failed: " + logDir)
+        BackendDriverPrintErr(strutil.Join(["backend driver run-smokes: mkdir failed: ", logDir], ""))
         return 1
     var names: str[]
     add(names, "cheng.stage0")
@@ -145,14 +140,14 @@ fn BackendDriverRunSmokes(rootDir: str): int32 =
     for i in 0..<bins.len:
         let bin = bins[i]
         if !chengpath.FileExistsNonEmpty(rootDir, bin):
-            BackendDriverPrintErr("backend driver run-smokes: missing bootstrap compiler: " + bin)
+            BackendDriverPrintErr(strutil.Join(["backend driver run-smokes: missing bootstrap compiler: ", bin], ""))
             return 1
-        let logPath = os.JoinPath(logDir, names[i] + ".self-check.log")
+        let logPath = os.JoinPath(logDir, strutil.Join([names[i], ".self-check.log"], ""))
         var args: str[]
         add(args, "self-check")
-        add(args, "--in:" + stage1Source)
+        add(args, strutil.Join(["--in:", stage1Source], ""))
         let run = hostops.RunFileLogged(rootDir,
-                                          "backend_driver_run_smokes_" + names[i],
+                                          strutil.Join(["backend_driver_run_smokes_", names[i]], ""),
                                           bin,
                                           args,
                                           [],
@@ -256,7 +251,7 @@ fn BackendDriverHostSmokeRunEnv(smokeName: str,
         add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
         add(out, "CHENG_COMPILE_TIMEOUT_SEC=420")
         if len(r2cControllerExe) > 0:
-            add(out, "R2C_REACT_CONTROLLER_EXE=" + r2cControllerExe)
+            add(out, strutil.Join(["R2C_REACT_CONTROLLER_EXE=", r2cControllerExe], ""))
         else:
             add(out, "R2C_REACT_ALLOW_CONTROLLER_COMPILE=1")
     return out
@@ -266,25 +261,25 @@ fn BackendDriverCompileR2cReactController(rootDir: str,
                                            outDir: str): str =
     let controllerSource = chengpath.PathAbsolute(rootDir, "src/r2c/r2c_react.cheng")
     let controllerExe = os.JoinPath(outDir, "r2c_react_controller_shared")
-    let controllerCompileLog = controllerExe + ".compile.log"
-    let controllerCompileReport = controllerExe + ".report.txt"
+    let controllerCompileLog = strutil.Join([controllerExe, ".compile.log"], "")
+    let controllerCompileReport = strutil.Join([controllerExe, ".report.txt"], "")
     BackendDriverRemovePrefixedFiles(outDir, "r2c_react_controller_shared")
     if chengpath.PathFileExists(controllerExe):
         os.RemoveFile(controllerExe)
-    if chengpath.PathFileExists(controllerExe + ".map"):
-        os.RemoveFile(controllerExe + ".map")
+    if chengpath.PathFileExists(strutil.Join([controllerExe, ".map"], "")):
+        os.RemoveFile(strutil.Join([controllerExe, ".map"], ""))
     if chengpath.PathFileExists(controllerCompileLog):
         os.RemoveFile(controllerCompileLog)
     if chengpath.PathFileExists(controllerCompileReport):
         os.RemoveFile(controllerCompileReport)
     var controllerCompileArgs: str[]
     add(controllerCompileArgs, "system-link-exec")
-    add(controllerCompileArgs, "--root:" + rootDir)
-    add(controllerCompileArgs, "--in:" + controllerSource)
+    add(controllerCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(controllerCompileArgs, strutil.Join(["--in:", controllerSource], ""))
     add(controllerCompileArgs, "--emit:exe")
     add(controllerCompileArgs, "--target:arm64-apple-darwin")
-    add(controllerCompileArgs, "--out:" + controllerExe)
-    add(controllerCompileArgs, "--report-out:" + controllerCompileReport)
+    add(controllerCompileArgs, strutil.Join(["--out:", controllerExe], ""))
+    add(controllerCompileArgs, strutil.Join(["--report-out:", controllerCompileReport], ""))
     let controllerCompileRun = hostops.RunFileLogged(rootDir,
                                                        "backend_driver_r2c_controller_shared_compile",
                                                        compilerPath,
@@ -299,10 +294,10 @@ fn BackendDriverCompileR2cReactController(rootDir: str,
             BackendDriverPrintErr(outputText)
         return ""
     if !chengpath.FileExistsNonEmpty(rootDir, controllerExe):
-        BackendDriverPrintErr("backend driver r2c controller: compile missing output: " + controllerExe)
+        BackendDriverPrintErr(strutil.Join(["backend driver r2c controller: compile missing output: ", controllerExe], ""))
         return ""
     if !chengpath.FileExistsNonEmpty(rootDir, controllerCompileReport):
-        BackendDriverPrintErr("backend driver r2c controller: compile missing report: " + controllerCompileReport)
+        BackendDriverPrintErr(strutil.Join(["backend driver r2c controller: compile missing report: ", controllerCompileReport], ""))
         return ""
     return controllerExe
 
@@ -313,7 +308,7 @@ fn BackendDriverResolveR2cReactController(rootDir: str,
     if len(explicitRaw) > 0:
         let explicitPath = chengpath.PathAbsolute(rootDir, explicitRaw)
         if !chengpath.FileExistsNonEmpty(rootDir, explicitPath):
-            BackendDriverPrintErr("backend driver r2c controller: missing R2C_REACT_CONTROLLER_EXE: " + explicitPath)
+            BackendDriverPrintErr(strutil.Join(["backend driver r2c controller: missing R2C_REACT_CONTROLLER_EXE: ", explicitPath], ""))
             return ""
         return explicitPath
     return BackendDriverCompileR2cReactController(rootDir, compilerPath, outDir)
@@ -329,7 +324,7 @@ fn BackendDriverExpectContains(label: str,
                                 needle: str): bool =
     if strings.StrContains(text, needle):
         return true
-    BackendDriverPrintErr(Fmt([label, ": missing marker: ", needle]))
+    BackendDriverPrintErr(strutil.Join([label, ": missing marker: ", needle], ""))
     return false
 
 fn BackendDriverExpectNotContains(label: str,
@@ -337,13 +332,13 @@ fn BackendDriverExpectNotContains(label: str,
                                    needle: str): bool =
     if !strings.StrContains(text, needle):
         return true
-    BackendDriverPrintErr(Fmt([label, ": forbidden marker: ", needle]))
+    BackendDriverPrintErr(strutil.Join([label, ": forbidden marker: ", needle], ""))
     return false
 
 fn BackendDriverAssertNoSeedHiddenSurface(label: str,
                                            text: str): bool =
-    let hiddenCommand = Fmt(["__seed-system", "-link-exec"])
-    let hiddenEnv = Fmt(["CHENG_SEED_INTERNAL", "_SYSTEM_LINK_EXEC"])
+    let hiddenCommand = strutil.Join(["__seed-system", "-link-exec"], "")
+    let hiddenEnv = strutil.Join(["CHENG_SEED_INTERNAL", "_SYSTEM_LINK_EXEC"], "")
     if !BackendDriverExpectNotContains(label, text, hiddenCommand):
         return false
     if !BackendDriverExpectNotContains(label, text, hiddenEnv):
@@ -360,26 +355,26 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
                                             label: str): int32 =
     let src = chengpath.PathAbsolute(rootDir, "src/tests/ordinary_zero_exit_fixture.cheng")
     let outBin = os.JoinPath(outDir, "direct_object_writer_smoke")
-    let reportPath = Fmt([outBin, ".report.txt"])
-    let compileLog = Fmt([outBin, ".compile.log"])
-    let runLog = Fmt([outBin, ".run.log"])
+    let reportPath = strutil.Join([outBin, ".report.txt"], "")
+    let compileLog = strutil.Join([outBin, ".compile.log"], "")
+    let runLog = strutil.Join([outBin, ".run.log"], "")
     BackendDriverRemoveFileIfPresent(outBin)
-    BackendDriverRemoveFileIfPresent(Fmt([outBin, ".map"]))
+    BackendDriverRemoveFileIfPresent(strutil.Join([outBin, ".map"], ""))
     BackendDriverRemoveFileIfPresent(reportPath)
     BackendDriverRemoveFileIfPresent(compileLog)
     BackendDriverRemoveFileIfPresent(runLog)
     var compileArgs: str[]
     add(compileArgs, "system-link-exec")
-    add(compileArgs, Fmt(["--root:", rootDir]))
-    add(compileArgs, Fmt(["--in:", src]))
+    add(compileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(compileArgs, strutil.Join(["--in:", src], ""))
     add(compileArgs, "--emit:exe")
     add(compileArgs, "--target:arm64-apple-darwin")
-    add(compileArgs, Fmt(["--out:", outBin]))
-    add(compileArgs, Fmt(["--report-out:", reportPath]))
+    add(compileArgs, strutil.Join(["--out:", outBin], ""))
+    add(compileArgs, strutil.Join(["--report-out:", reportPath], ""))
     var compileEnv = BackendDriverHostSmokeCompileEnv()
     add(compileEnv, "CHENG_REQUIRE_PURE_SYSTEM_LINK_EXEC=1")
     let compileRun = hostops.RunFileLogged(rootDir,
-                                             Fmt(["backend_driver_direct_object_writer_compile_", label]),
+                                             strutil.Join(["backend_driver_direct_object_writer_compile_", label], ""),
                                              compilerPath,
                                              compileArgs,
                                              compileEnv,
@@ -392,10 +387,10 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return compileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, outBin):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing exe: ", outBin]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing exe: ", outBin], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, reportPath):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing report: ", reportPath]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing report: ", reportPath], ""))
         return 1
     let reportText = chengpath.ReadTextFile("", reportPath)
     if !BackendDriverExpectContains("direct object writer smoke", reportText, "system_link_exec_runtime_execute=1"):
@@ -412,11 +407,11 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let f64Src = chengpath.PathAbsolute(rootDir, "src/tests/float64_mul_direct_object_smoke.cheng")
     let f64Obj = os.JoinPath(outDir, "float64_mul_direct_object_smoke.o")
-    let f64Report = Fmt([f64Obj, ".report.txt"])
-    let f64CompileLog = Fmt([f64Obj, ".host.log"])
-    let f64Asm = Fmt([f64Obj, ".s"])
-    let f64ObjectCompileLog = Fmt([f64Obj, ".compile.log"])
-    let f64OtoolLog = Fmt([f64Obj, ".otool.log"])
+    let f64Report = strutil.Join([f64Obj, ".report.txt"], "")
+    let f64CompileLog = strutil.Join([f64Obj, ".host.log"], "")
+    let f64Asm = strutil.Join([f64Obj, ".s"], "")
+    let f64ObjectCompileLog = strutil.Join([f64Obj, ".compile.log"], "")
+    let f64OtoolLog = strutil.Join([f64Obj, ".otool.log"], "")
     BackendDriverRemoveFileIfPresent(f64Obj)
     BackendDriverRemoveFileIfPresent(f64Report)
     BackendDriverRemoveFileIfPresent(f64CompileLog)
@@ -425,14 +420,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(f64OtoolLog)
     var f64CompileArgs: str[]
     add(f64CompileArgs, "system-link-exec")
-    add(f64CompileArgs, Fmt(["--root:", rootDir]))
-    add(f64CompileArgs, Fmt(["--in:", f64Src]))
+    add(f64CompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(f64CompileArgs, strutil.Join(["--in:", f64Src], ""))
     add(f64CompileArgs, "--emit:obj")
     add(f64CompileArgs, "--target:arm64-apple-darwin")
-    add(f64CompileArgs, Fmt(["--out:", f64Obj]))
-    add(f64CompileArgs, Fmt(["--report-out:", f64Report]))
+    add(f64CompileArgs, strutil.Join(["--out:", f64Obj], ""))
+    add(f64CompileArgs, strutil.Join(["--report-out:", f64Report], ""))
     let f64CompileRun = hostops.RunFileLogged(rootDir,
-                                               Fmt(["backend_driver_direct_object_f64_compile_", label]),
+                                               strutil.Join(["backend_driver_direct_object_f64_compile_", label], ""),
                                                compilerPath,
                                                f64CompileArgs,
                                                compileEnv,
@@ -445,16 +440,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return f64CompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, f64Obj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing f64 object: ", f64Obj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing f64 object: ", f64Obj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, f64Report):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing f64 report: ", f64Report]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing f64 report: ", f64Report], ""))
         return 1
     if chengpath.PathFileExists(f64Asm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected f64 asm: ", f64Asm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected f64 asm: ", f64Asm], ""))
         return 1
     if chengpath.PathFileExists(f64ObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected f64 asm compile log: ", f64ObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected f64 asm compile log: ", f64ObjectCompileLog], ""))
         return 1
     let f64ReportText = chengpath.ReadTextFile("", f64Report)
     if !BackendDriverExpectContains("direct object writer f64 smoke", f64ReportText, "system_link_exec_runtime_execute=1"):
@@ -474,7 +469,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer f64 smoke", f64ReportText, "direct_object_reloc_count=0"):
         return 1
     let f64OtoolRun = hostops.RunProgramLogged(rootDir,
-                                               Fmt(["backend_driver_direct_object_f64_otool_", label]),
+                                               strutil.Join(["backend_driver_direct_object_f64_otool_", label], ""),
                                                "otool",
                                                ["-tV", f64Obj],
                                                [],
@@ -490,11 +485,11 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let i32AddSrc = chengpath.PathAbsolute(rootDir, "src/tests/int32_add_direct_object_smoke.cheng")
     let i32AddObj = os.JoinPath(outDir, "int32_add_direct_object_smoke.o")
-    let i32AddReport = Fmt([i32AddObj, ".report.txt"])
-    let i32AddCompileLog = Fmt([i32AddObj, ".host.log"])
-    let i32AddAsm = Fmt([i32AddObj, ".s"])
-    let i32AddObjectCompileLog = Fmt([i32AddObj, ".compile.log"])
-    let i32AddOtoolLog = Fmt([i32AddObj, ".otool.log"])
+    let i32AddReport = strutil.Join([i32AddObj, ".report.txt"], "")
+    let i32AddCompileLog = strutil.Join([i32AddObj, ".host.log"], "")
+    let i32AddAsm = strutil.Join([i32AddObj, ".s"], "")
+    let i32AddObjectCompileLog = strutil.Join([i32AddObj, ".compile.log"], "")
+    let i32AddOtoolLog = strutil.Join([i32AddObj, ".otool.log"], "")
     BackendDriverRemoveFileIfPresent(i32AddObj)
     BackendDriverRemoveFileIfPresent(i32AddReport)
     BackendDriverRemoveFileIfPresent(i32AddCompileLog)
@@ -503,14 +498,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(i32AddOtoolLog)
     var i32AddCompileArgs: str[]
     add(i32AddCompileArgs, "system-link-exec")
-    add(i32AddCompileArgs, Fmt(["--root:", rootDir]))
-    add(i32AddCompileArgs, Fmt(["--in:", i32AddSrc]))
+    add(i32AddCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(i32AddCompileArgs, strutil.Join(["--in:", i32AddSrc], ""))
     add(i32AddCompileArgs, "--emit:obj")
     add(i32AddCompileArgs, "--target:arm64-apple-darwin")
-    add(i32AddCompileArgs, Fmt(["--out:", i32AddObj]))
-    add(i32AddCompileArgs, Fmt(["--report-out:", i32AddReport]))
+    add(i32AddCompileArgs, strutil.Join(["--out:", i32AddObj], ""))
+    add(i32AddCompileArgs, strutil.Join(["--report-out:", i32AddReport], ""))
     let i32AddCompileRun = hostops.RunFileLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_i32_add_compile_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_i32_add_compile_", label], ""),
                                                   compilerPath,
                                                   i32AddCompileArgs,
                                                   compileEnv,
@@ -523,16 +518,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return i32AddCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, i32AddObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 add object: ", i32AddObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 add object: ", i32AddObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, i32AddReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 add report: ", i32AddReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 add report: ", i32AddReport], ""))
         return 1
     if chengpath.PathFileExists(i32AddAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 add asm: ", i32AddAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 add asm: ", i32AddAsm], ""))
         return 1
     if chengpath.PathFileExists(i32AddObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 add asm compile log: ", i32AddObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 add asm compile log: ", i32AddObjectCompileLog], ""))
         return 1
     let i32AddReportText = chengpath.ReadTextFile("", i32AddReport)
     if !BackendDriverExpectContains("direct object writer i32 add smoke", i32AddReportText, "system_link_exec_runtime_execute=1"):
@@ -544,7 +539,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer i32 add smoke", i32AddReportText, "direct_object_reloc_count=0"):
         return 1
     let i32AddOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_i32_add_otool_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_i32_add_otool_", label], ""),
                                                   "otool",
                                                   ["-tV", i32AddObj],
                                                   [],
@@ -560,11 +555,11 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let i32SubSrc = chengpath.PathAbsolute(rootDir, "src/tests/int32_sub_direct_object_smoke.cheng")
     let i32SubObj = os.JoinPath(outDir, "int32_sub_direct_object_smoke.o")
-    let i32SubReport = Fmt([i32SubObj, ".report.txt"])
-    let i32SubCompileLog = Fmt([i32SubObj, ".host.log"])
-    let i32SubAsm = Fmt([i32SubObj, ".s"])
-    let i32SubObjectCompileLog = Fmt([i32SubObj, ".compile.log"])
-    let i32SubOtoolLog = Fmt([i32SubObj, ".otool.log"])
+    let i32SubReport = strutil.Join([i32SubObj, ".report.txt"], "")
+    let i32SubCompileLog = strutil.Join([i32SubObj, ".host.log"], "")
+    let i32SubAsm = strutil.Join([i32SubObj, ".s"], "")
+    let i32SubObjectCompileLog = strutil.Join([i32SubObj, ".compile.log"], "")
+    let i32SubOtoolLog = strutil.Join([i32SubObj, ".otool.log"], "")
     BackendDriverRemoveFileIfPresent(i32SubObj)
     BackendDriverRemoveFileIfPresent(i32SubReport)
     BackendDriverRemoveFileIfPresent(i32SubCompileLog)
@@ -573,14 +568,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(i32SubOtoolLog)
     var i32SubCompileArgs: str[]
     add(i32SubCompileArgs, "system-link-exec")
-    add(i32SubCompileArgs, Fmt(["--root:", rootDir]))
-    add(i32SubCompileArgs, Fmt(["--in:", i32SubSrc]))
+    add(i32SubCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(i32SubCompileArgs, strutil.Join(["--in:", i32SubSrc], ""))
     add(i32SubCompileArgs, "--emit:obj")
     add(i32SubCompileArgs, "--target:arm64-apple-darwin")
-    add(i32SubCompileArgs, Fmt(["--out:", i32SubObj]))
-    add(i32SubCompileArgs, Fmt(["--report-out:", i32SubReport]))
+    add(i32SubCompileArgs, strutil.Join(["--out:", i32SubObj], ""))
+    add(i32SubCompileArgs, strutil.Join(["--report-out:", i32SubReport], ""))
     let i32SubCompileRun = hostops.RunFileLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_i32_sub_compile_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_i32_sub_compile_", label], ""),
                                                   compilerPath,
                                                   i32SubCompileArgs,
                                                   compileEnv,
@@ -593,16 +588,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return i32SubCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, i32SubObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 sub object: ", i32SubObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 sub object: ", i32SubObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, i32SubReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 sub report: ", i32SubReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 sub report: ", i32SubReport], ""))
         return 1
     if chengpath.PathFileExists(i32SubAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 sub asm: ", i32SubAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 sub asm: ", i32SubAsm], ""))
         return 1
     if chengpath.PathFileExists(i32SubObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 sub asm compile log: ", i32SubObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 sub asm compile log: ", i32SubObjectCompileLog], ""))
         return 1
     let i32SubReportText = chengpath.ReadTextFile("", i32SubReport)
     if !BackendDriverExpectContains("direct object writer i32 sub smoke", i32SubReportText, "system_link_exec_runtime_execute=1"):
@@ -614,7 +609,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer i32 sub smoke", i32SubReportText, "direct_object_reloc_count=0"):
         return 1
     let i32SubOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_i32_sub_otool_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_i32_sub_otool_", label], ""),
                                                   "otool",
                                                   ["-tV", i32SubObj],
                                                   [],
@@ -630,11 +625,11 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let i32MulSrc = chengpath.PathAbsolute(rootDir, "src/tests/int32_mul_direct_object_smoke.cheng")
     let i32MulObj = os.JoinPath(outDir, "int32_mul_direct_object_smoke.o")
-    let i32MulReport = Fmt([i32MulObj, ".report.txt"])
-    let i32MulCompileLog = Fmt([i32MulObj, ".host.log"])
-    let i32MulAsm = Fmt([i32MulObj, ".s"])
-    let i32MulObjectCompileLog = Fmt([i32MulObj, ".compile.log"])
-    let i32MulOtoolLog = Fmt([i32MulObj, ".otool.log"])
+    let i32MulReport = strutil.Join([i32MulObj, ".report.txt"], "")
+    let i32MulCompileLog = strutil.Join([i32MulObj, ".host.log"], "")
+    let i32MulAsm = strutil.Join([i32MulObj, ".s"], "")
+    let i32MulObjectCompileLog = strutil.Join([i32MulObj, ".compile.log"], "")
+    let i32MulOtoolLog = strutil.Join([i32MulObj, ".otool.log"], "")
     BackendDriverRemoveFileIfPresent(i32MulObj)
     BackendDriverRemoveFileIfPresent(i32MulReport)
     BackendDriverRemoveFileIfPresent(i32MulCompileLog)
@@ -643,14 +638,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(i32MulOtoolLog)
     var i32MulCompileArgs: str[]
     add(i32MulCompileArgs, "system-link-exec")
-    add(i32MulCompileArgs, Fmt(["--root:", rootDir]))
-    add(i32MulCompileArgs, Fmt(["--in:", i32MulSrc]))
+    add(i32MulCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(i32MulCompileArgs, strutil.Join(["--in:", i32MulSrc], ""))
     add(i32MulCompileArgs, "--emit:obj")
     add(i32MulCompileArgs, "--target:arm64-apple-darwin")
-    add(i32MulCompileArgs, Fmt(["--out:", i32MulObj]))
-    add(i32MulCompileArgs, Fmt(["--report-out:", i32MulReport]))
+    add(i32MulCompileArgs, strutil.Join(["--out:", i32MulObj], ""))
+    add(i32MulCompileArgs, strutil.Join(["--report-out:", i32MulReport], ""))
     let i32MulCompileRun = hostops.RunFileLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_i32_mul_compile_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_i32_mul_compile_", label], ""),
                                                   compilerPath,
                                                   i32MulCompileArgs,
                                                   compileEnv,
@@ -663,16 +658,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return i32MulCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, i32MulObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 mul object: ", i32MulObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 mul object: ", i32MulObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, i32MulReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 mul report: ", i32MulReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 mul report: ", i32MulReport], ""))
         return 1
     if chengpath.PathFileExists(i32MulAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 mul asm: ", i32MulAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 mul asm: ", i32MulAsm], ""))
         return 1
     if chengpath.PathFileExists(i32MulObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 mul asm compile log: ", i32MulObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 mul asm compile log: ", i32MulObjectCompileLog], ""))
         return 1
     let i32MulReportText = chengpath.ReadTextFile("", i32MulReport)
     if !BackendDriverExpectContains("direct object writer i32 mul smoke", i32MulReportText, "system_link_exec_runtime_execute=1"):
@@ -684,7 +679,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer i32 mul smoke", i32MulReportText, "direct_object_reloc_count=0"):
         return 1
     let i32MulOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_i32_mul_otool_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_i32_mul_otool_", label], ""),
                                                   "otool",
                                                   ["-tV", i32MulObj],
                                                   [],
@@ -700,11 +695,11 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let i32AsrSrc = chengpath.PathAbsolute(rootDir, "src/tests/int32_asr_direct_object_smoke.cheng")
     let i32AsrObj = os.JoinPath(outDir, "int32_asr_direct_object_smoke.o")
-    let i32AsrReport = Fmt([i32AsrObj, ".report.txt"])
-    let i32AsrCompileLog = Fmt([i32AsrObj, ".host.log"])
-    let i32AsrAsm = Fmt([i32AsrObj, ".s"])
-    let i32AsrObjectCompileLog = Fmt([i32AsrObj, ".compile.log"])
-    let i32AsrOtoolLog = Fmt([i32AsrObj, ".otool.log"])
+    let i32AsrReport = strutil.Join([i32AsrObj, ".report.txt"], "")
+    let i32AsrCompileLog = strutil.Join([i32AsrObj, ".host.log"], "")
+    let i32AsrAsm = strutil.Join([i32AsrObj, ".s"], "")
+    let i32AsrObjectCompileLog = strutil.Join([i32AsrObj, ".compile.log"], "")
+    let i32AsrOtoolLog = strutil.Join([i32AsrObj, ".otool.log"], "")
     BackendDriverRemoveFileIfPresent(i32AsrObj)
     BackendDriverRemoveFileIfPresent(i32AsrReport)
     BackendDriverRemoveFileIfPresent(i32AsrCompileLog)
@@ -713,14 +708,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(i32AsrOtoolLog)
     var i32AsrCompileArgs: str[]
     add(i32AsrCompileArgs, "system-link-exec")
-    add(i32AsrCompileArgs, Fmt(["--root:", rootDir]))
-    add(i32AsrCompileArgs, Fmt(["--in:", i32AsrSrc]))
+    add(i32AsrCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(i32AsrCompileArgs, strutil.Join(["--in:", i32AsrSrc], ""))
     add(i32AsrCompileArgs, "--emit:obj")
     add(i32AsrCompileArgs, "--target:arm64-apple-darwin")
-    add(i32AsrCompileArgs, Fmt(["--out:", i32AsrObj]))
-    add(i32AsrCompileArgs, Fmt(["--report-out:", i32AsrReport]))
+    add(i32AsrCompileArgs, strutil.Join(["--out:", i32AsrObj], ""))
+    add(i32AsrCompileArgs, strutil.Join(["--report-out:", i32AsrReport], ""))
     let i32AsrCompileRun = hostops.RunFileLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_i32_asr_compile_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_i32_asr_compile_", label], ""),
                                                   compilerPath,
                                                   i32AsrCompileArgs,
                                                   compileEnv,
@@ -733,16 +728,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return i32AsrCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, i32AsrObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 asr object: ", i32AsrObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 asr object: ", i32AsrObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, i32AsrReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 asr report: ", i32AsrReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 asr report: ", i32AsrReport], ""))
         return 1
     if chengpath.PathFileExists(i32AsrAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 asr asm: ", i32AsrAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 asr asm: ", i32AsrAsm], ""))
         return 1
     if chengpath.PathFileExists(i32AsrObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 asr asm compile log: ", i32AsrObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 asr asm compile log: ", i32AsrObjectCompileLog], ""))
         return 1
     let i32AsrReportText = chengpath.ReadTextFile("", i32AsrReport)
     if !BackendDriverExpectContains("direct object writer i32 asr smoke", i32AsrReportText, "system_link_exec_runtime_execute=1"):
@@ -762,7 +757,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer i32 asr smoke", i32AsrReportText, "direct_object_reloc_count=0"):
         return 1
     let i32AsrOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_i32_asr_otool_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_i32_asr_otool_", label], ""),
                                                   "otool",
                                                   ["-tV", i32AsrObj],
                                                   [],
@@ -778,11 +773,11 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let i32IfSrc = chengpath.PathAbsolute(rootDir, "src/tests/int32_if_le_zero_direct_object_smoke.cheng")
     let i32IfObj = os.JoinPath(outDir, "int32_if_le_zero_direct_object_smoke.o")
-    let i32IfReport = Fmt([i32IfObj, ".report.txt"])
-    let i32IfCompileLog = Fmt([i32IfObj, ".host.log"])
-    let i32IfAsm = Fmt([i32IfObj, ".s"])
-    let i32IfObjectCompileLog = Fmt([i32IfObj, ".compile.log"])
-    let i32IfOtoolLog = Fmt([i32IfObj, ".otool.log"])
+    let i32IfReport = strutil.Join([i32IfObj, ".report.txt"], "")
+    let i32IfCompileLog = strutil.Join([i32IfObj, ".host.log"], "")
+    let i32IfAsm = strutil.Join([i32IfObj, ".s"], "")
+    let i32IfObjectCompileLog = strutil.Join([i32IfObj, ".compile.log"], "")
+    let i32IfOtoolLog = strutil.Join([i32IfObj, ".otool.log"], "")
     BackendDriverRemoveFileIfPresent(i32IfObj)
     BackendDriverRemoveFileIfPresent(i32IfReport)
     BackendDriverRemoveFileIfPresent(i32IfCompileLog)
@@ -791,14 +786,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(i32IfOtoolLog)
     var i32IfCompileArgs: str[]
     add(i32IfCompileArgs, "system-link-exec")
-    add(i32IfCompileArgs, Fmt(["--root:", rootDir]))
-    add(i32IfCompileArgs, Fmt(["--in:", i32IfSrc]))
+    add(i32IfCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(i32IfCompileArgs, strutil.Join(["--in:", i32IfSrc], ""))
     add(i32IfCompileArgs, "--emit:obj")
     add(i32IfCompileArgs, "--target:arm64-apple-darwin")
-    add(i32IfCompileArgs, Fmt(["--out:", i32IfObj]))
-    add(i32IfCompileArgs, Fmt(["--report-out:", i32IfReport]))
+    add(i32IfCompileArgs, strutil.Join(["--out:", i32IfObj], ""))
+    add(i32IfCompileArgs, strutil.Join(["--report-out:", i32IfReport], ""))
     let i32IfCompileRun = hostops.RunFileLogged(rootDir,
-                                                 Fmt(["backend_driver_direct_object_i32_if_compile_", label]),
+                                                 strutil.Join(["backend_driver_direct_object_i32_if_compile_", label], ""),
                                                  compilerPath,
                                                  i32IfCompileArgs,
                                                  compileEnv,
@@ -811,16 +806,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return i32IfCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, i32IfObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 if object: ", i32IfObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 if object: ", i32IfObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, i32IfReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 if report: ", i32IfReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 if report: ", i32IfReport], ""))
         return 1
     if chengpath.PathFileExists(i32IfAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 if asm: ", i32IfAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 if asm: ", i32IfAsm], ""))
         return 1
     if chengpath.PathFileExists(i32IfObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 if asm compile log: ", i32IfObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 if asm compile log: ", i32IfObjectCompileLog], ""))
         return 1
     let i32IfReportText = chengpath.ReadTextFile("", i32IfReport)
     if !BackendDriverExpectContains("direct object writer i32 if smoke", i32IfReportText, "system_link_exec_runtime_execute=1"):
@@ -836,7 +831,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer i32 if smoke", i32IfReportText, "direct_object_reloc_count=0"):
         return 1
     let i32IfOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                 Fmt(["backend_driver_direct_object_i32_if_otool_", label]),
+                                                 strutil.Join(["backend_driver_direct_object_i32_if_otool_", label], ""),
                                                  "otool",
                                                  ["-tV", i32IfObj],
                                                  [],
@@ -854,12 +849,12 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let letResultSrc = chengpath.PathAbsolute(rootDir, "src/tests/let_call_return_result_direct_object_smoke.cheng")
     let letResultObj = os.JoinPath(outDir, "let_call_return_result_direct_object_smoke.o")
-    let letResultReport = Fmt([letResultObj, ".report.txt"])
-    let letResultCompileLog = Fmt([letResultObj, ".host.log"])
-    let letResultAsm = Fmt([letResultObj, ".s"])
-    let letResultObjectCompileLog = Fmt([letResultObj, ".compile.log"])
-    let letResultOtoolLog = Fmt([letResultObj, ".otool.log"])
-    let letResultRelocLog = Fmt([letResultObj, ".reloc.log"])
+    let letResultReport = strutil.Join([letResultObj, ".report.txt"], "")
+    let letResultCompileLog = strutil.Join([letResultObj, ".host.log"], "")
+    let letResultAsm = strutil.Join([letResultObj, ".s"], "")
+    let letResultObjectCompileLog = strutil.Join([letResultObj, ".compile.log"], "")
+    let letResultOtoolLog = strutil.Join([letResultObj, ".otool.log"], "")
+    let letResultRelocLog = strutil.Join([letResultObj, ".reloc.log"], "")
     BackendDriverRemoveFileIfPresent(letResultObj)
     BackendDriverRemoveFileIfPresent(letResultReport)
     BackendDriverRemoveFileIfPresent(letResultCompileLog)
@@ -869,14 +864,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(letResultRelocLog)
     var letResultCompileArgs: str[]
     add(letResultCompileArgs, "system-link-exec")
-    add(letResultCompileArgs, Fmt(["--root:", rootDir]))
-    add(letResultCompileArgs, Fmt(["--in:", letResultSrc]))
+    add(letResultCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(letResultCompileArgs, strutil.Join(["--in:", letResultSrc], ""))
     add(letResultCompileArgs, "--emit:obj")
     add(letResultCompileArgs, "--target:arm64-apple-darwin")
-    add(letResultCompileArgs, Fmt(["--out:", letResultObj]))
-    add(letResultCompileArgs, Fmt(["--report-out:", letResultReport]))
+    add(letResultCompileArgs, strutil.Join(["--out:", letResultObj], ""))
+    add(letResultCompileArgs, strutil.Join(["--report-out:", letResultReport], ""))
     let letResultCompileRun = hostops.RunFileLogged(rootDir,
-                                                     Fmt(["backend_driver_direct_object_let_result_compile_", label]),
+                                                     strutil.Join(["backend_driver_direct_object_let_result_compile_", label], ""),
                                                      compilerPath,
                                                      letResultCompileArgs,
                                                      compileEnv,
@@ -889,16 +884,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return letResultCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, letResultObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing let-call result object: ", letResultObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing let-call result object: ", letResultObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, letResultReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing let-call result report: ", letResultReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing let-call result report: ", letResultReport], ""))
         return 1
     if chengpath.PathFileExists(letResultAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected let-call result asm: ", letResultAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected let-call result asm: ", letResultAsm], ""))
         return 1
     if chengpath.PathFileExists(letResultObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected let-call result asm compile log: ", letResultObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected let-call result asm compile log: ", letResultObjectCompileLog], ""))
         return 1
     let letResultReportText = chengpath.ReadTextFile("", letResultReport)
     if !BackendDriverExpectContains("direct object writer let-call result smoke", letResultReportText, "system_link_exec_runtime_execute=1"):
@@ -909,14 +904,18 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     if !BackendDriverExpectContains("direct object writer let-call result smoke", letResultReportText, "primary_object_ir_body_kinds=return_i32_const_7,let_call_noarg_return_result_i32"):
         return 1
-    if !BackendDriverExpectContains("direct object writer let-call result smoke", letResultReportText, "primary_object_body_kinds=return_i32_const_7,let_call_noarg_return_result_i32"):
+    if !BackendDriverExpectContains("direct object writer let-call result smoke", letResultReportText, "primary_object_body_kinds=return_i32_const_7,statement_sequence"):
+        return 1
+    if !BackendDriverExpectContains("direct object writer let-call result smoke", letResultReportText, "primary_object_statement_return_modes=0,2"):
+        return 1
+    if !BackendDriverExpectContains("direct object writer let-call result smoke", letResultReportText, "primary_object_statement_call_counts=0,1"):
         return 1
     if !BackendDriverExpectContains("direct object writer let-call result smoke", letResultReportText, "primary_object_direct=1"):
         return 1
     if !BackendDriverExpectContains("direct object writer let-call result smoke", letResultReportText, "direct_object_reloc_count=1"):
         return 1
     let letResultOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                     Fmt(["backend_driver_direct_object_let_result_otool_", label]),
+                                                     strutil.Join(["backend_driver_direct_object_let_result_otool_", label], ""),
                                                      "otool",
                                                      ["-tV", letResultObj],
                                                      [],
@@ -931,7 +930,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer let-call result otool", letResultOtoolRun.output, "ret"):
         return 1
     let letResultRelocRun = hostops.RunProgramLogged(rootDir,
-                                                     Fmt(["backend_driver_direct_object_let_result_reloc_", label]),
+                                                     strutil.Join(["backend_driver_direct_object_let_result_reloc_", label], ""),
                                                      "otool",
                                                      ["-r", "-v", letResultObj],
                                                      [],
@@ -947,12 +946,12 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let strLenSrc = chengpath.PathAbsolute(rootDir, "src/tests/str_call_return_len_direct_object_smoke.cheng")
     let strLenObj = os.JoinPath(outDir, "str_call_return_len_direct_object_smoke.o")
-    let strLenReport = Fmt([strLenObj, ".report.txt"])
-    let strLenCompileLog = Fmt([strLenObj, ".host.log"])
-    let strLenAsm = Fmt([strLenObj, ".s"])
-    let strLenObjectCompileLog = Fmt([strLenObj, ".compile.log"])
-    let strLenOtoolLog = Fmt([strLenObj, ".otool.log"])
-    let strLenRelocLog = Fmt([strLenObj, ".reloc.log"])
+    let strLenReport = strutil.Join([strLenObj, ".report.txt"], "")
+    let strLenCompileLog = strutil.Join([strLenObj, ".host.log"], "")
+    let strLenAsm = strutil.Join([strLenObj, ".s"], "")
+    let strLenObjectCompileLog = strutil.Join([strLenObj, ".compile.log"], "")
+    let strLenOtoolLog = strutil.Join([strLenObj, ".otool.log"], "")
+    let strLenRelocLog = strutil.Join([strLenObj, ".reloc.log"], "")
     BackendDriverRemoveFileIfPresent(strLenObj)
     BackendDriverRemoveFileIfPresent(strLenReport)
     BackendDriverRemoveFileIfPresent(strLenCompileLog)
@@ -962,14 +961,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(strLenRelocLog)
     var strLenCompileArgs: str[]
     add(strLenCompileArgs, "system-link-exec")
-    add(strLenCompileArgs, Fmt(["--root:", rootDir]))
-    add(strLenCompileArgs, Fmt(["--in:", strLenSrc]))
+    add(strLenCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(strLenCompileArgs, strutil.Join(["--in:", strLenSrc], ""))
     add(strLenCompileArgs, "--emit:obj")
     add(strLenCompileArgs, "--target:arm64-apple-darwin")
-    add(strLenCompileArgs, Fmt(["--out:", strLenObj]))
-    add(strLenCompileArgs, Fmt(["--report-out:", strLenReport]))
+    add(strLenCompileArgs, strutil.Join(["--out:", strLenObj], ""))
+    add(strLenCompileArgs, strutil.Join(["--report-out:", strLenReport], ""))
     let strLenCompileRun = hostops.RunFileLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_str_call_len_compile_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_str_call_len_compile_", label], ""),
                                                   compilerPath,
                                                   strLenCompileArgs,
                                                   compileEnv,
@@ -982,16 +981,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return strLenCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, strLenObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing str call len object: ", strLenObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing str call len object: ", strLenObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, strLenReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing str call len report: ", strLenReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing str call len report: ", strLenReport], ""))
         return 1
     if chengpath.PathFileExists(strLenAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected str call len asm: ", strLenAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected str call len asm: ", strLenAsm], ""))
         return 1
     if chengpath.PathFileExists(strLenObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected str call len asm compile log: ", strLenObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected str call len asm compile log: ", strLenObjectCompileLog], ""))
         return 1
     let strLenReportText = chengpath.ReadTextFile("", strLenReport)
     if !BackendDriverExpectContains("direct object writer str call len smoke", strLenReportText, "system_link_exec_runtime_execute=1"):
@@ -1004,14 +1003,18 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     if !BackendDriverExpectContains("direct object writer str call len smoke", strLenReportText, "primary_object_ir_body_kinds=return_str_empty,let_call_noarg_str_return_len_i32"):
         return 1
-    if !BackendDriverExpectContains("direct object writer str call len smoke", strLenReportText, "primary_object_body_kinds=return_str_empty,let_call_noarg_str_return_len_i32"):
+    if !BackendDriverExpectContains("direct object writer str call len smoke", strLenReportText, "primary_object_body_kinds=return_str_empty,statement_sequence"):
+        return 1
+    if !BackendDriverExpectContains("direct object writer str call len smoke", strLenReportText, "primary_object_statement_return_modes=0,4"):
+        return 1
+    if !BackendDriverExpectContains("direct object writer str call len smoke", strLenReportText, "primary_object_statement_call_counts=0,1"):
         return 1
     if !BackendDriverExpectContains("direct object writer str call len smoke", strLenReportText, "primary_object_direct=1"):
         return 1
     if !BackendDriverExpectContains("direct object writer str call len smoke", strLenReportText, "direct_object_reloc_count=1"):
         return 1
     let strLenOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_str_call_len_otool_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_str_call_len_otool_", label], ""),
                                                   "otool",
                                                   ["-tV", strLenObj],
                                                   [],
@@ -1028,7 +1031,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer str call len otool", strLenOtoolRun.output, "str"):
         return 1
     let strLenRelocRun = hostops.RunProgramLogged(rootDir,
-                                                  Fmt(["backend_driver_direct_object_str_call_len_reloc_", label]),
+                                                  strutil.Join(["backend_driver_direct_object_str_call_len_reloc_", label], ""),
                                                   "otool",
                                                   ["-rv", strLenObj],
                                                   [],
@@ -1044,12 +1047,12 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let strThenSrc = chengpath.PathAbsolute(rootDir, "src/tests/str_then_call_arg0_direct_object_smoke.cheng")
     let strThenObj = os.JoinPath(outDir, "str_then_call_arg0_direct_object_smoke.o")
-    let strThenReport = Fmt([strThenObj, ".report.txt"])
-    let strThenCompileLog = Fmt([strThenObj, ".host.log"])
-    let strThenAsm = Fmt([strThenObj, ".s"])
-    let strThenObjectCompileLog = Fmt([strThenObj, ".compile.log"])
-    let strThenOtoolLog = Fmt([strThenObj, ".otool.log"])
-    let strThenRelocLog = Fmt([strThenObj, ".reloc.log"])
+    let strThenReport = strutil.Join([strThenObj, ".report.txt"], "")
+    let strThenCompileLog = strutil.Join([strThenObj, ".host.log"], "")
+    let strThenAsm = strutil.Join([strThenObj, ".s"], "")
+    let strThenObjectCompileLog = strutil.Join([strThenObj, ".compile.log"], "")
+    let strThenOtoolLog = strutil.Join([strThenObj, ".otool.log"], "")
+    let strThenRelocLog = strutil.Join([strThenObj, ".reloc.log"], "")
     BackendDriverRemoveFileIfPresent(strThenObj)
     BackendDriverRemoveFileIfPresent(strThenReport)
     BackendDriverRemoveFileIfPresent(strThenCompileLog)
@@ -1059,14 +1062,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(strThenRelocLog)
     var strThenCompileArgs: str[]
     add(strThenCompileArgs, "system-link-exec")
-    add(strThenCompileArgs, Fmt(["--root:", rootDir]))
-    add(strThenCompileArgs, Fmt(["--in:", strThenSrc]))
+    add(strThenCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(strThenCompileArgs, strutil.Join(["--in:", strThenSrc], ""))
     add(strThenCompileArgs, "--emit:obj")
     add(strThenCompileArgs, "--target:arm64-apple-darwin")
-    add(strThenCompileArgs, Fmt(["--out:", strThenObj]))
-    add(strThenCompileArgs, Fmt(["--report-out:", strThenReport]))
+    add(strThenCompileArgs, strutil.Join(["--out:", strThenObj], ""))
+    add(strThenCompileArgs, strutil.Join(["--report-out:", strThenReport], ""))
     let strThenCompileRun = hostops.RunFileLogged(rootDir,
-                                                   Fmt(["backend_driver_direct_object_str_then_call_arg0_compile_", label]),
+                                                   strutil.Join(["backend_driver_direct_object_str_then_call_arg0_compile_", label], ""),
                                                    compilerPath,
                                                    strThenCompileArgs,
                                                    compileEnv,
@@ -1079,16 +1082,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return strThenCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, strThenObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing str then call arg0 object: ", strThenObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing str then call arg0 object: ", strThenObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, strThenReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing str then call arg0 report: ", strThenReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing str then call arg0 report: ", strThenReport], ""))
         return 1
     if chengpath.PathFileExists(strThenAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected str then call arg0 asm: ", strThenAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected str then call arg0 asm: ", strThenAsm], ""))
         return 1
     if chengpath.PathFileExists(strThenObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected str then call arg0 asm compile log: ", strThenObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected str then call arg0 asm compile log: ", strThenObjectCompileLog], ""))
         return 1
     let strThenReportText = chengpath.ReadTextFile("", strThenReport)
     if !BackendDriverExpectContains("direct object writer str then call arg0 smoke", strThenReportText, "system_link_exec_runtime_execute=1"):
@@ -1099,7 +1102,11 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     if !BackendDriverExpectContains("direct object writer str then call arg0 smoke", strThenReportText, "primary_object_ir_body_kinds=return_str_empty,return_zero_i32,let_call_noarg_str_then_call_arg0_return_i32_const_0"):
         return 1
-    if !BackendDriverExpectContains("direct object writer str then call arg0 smoke", strThenReportText, "primary_object_body_kinds=return_str_empty,return_zero_i32,let_call_noarg_str_then_call_arg0_return_i32_const_0"):
+    if !BackendDriverExpectContains("direct object writer str then call arg0 smoke", strThenReportText, "primary_object_body_kinds=return_str_empty,return_zero_i32,statement_sequence"):
+        return 1
+    if !BackendDriverExpectContains("direct object writer str then call arg0 smoke", strThenReportText, "primary_object_statement_return_modes=0,0,5"):
+        return 1
+    if !BackendDriverExpectContains("direct object writer str then call arg0 smoke", strThenReportText, "primary_object_statement_call_counts=0,0,2"):
         return 1
     if !BackendDriverExpectContains("direct object writer str then call arg0 smoke", strThenReportText, "primary_object_word_counts=4,2,9"):
         return 1
@@ -1108,7 +1115,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer str then call arg0 smoke", strThenReportText, "direct_object_reloc_count=2"):
         return 1
     let strThenOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                   Fmt(["backend_driver_direct_object_str_then_call_arg0_otool_", label]),
+                                                   strutil.Join(["backend_driver_direct_object_str_then_call_arg0_otool_", label], ""),
                                                    "otool",
                                                    ["-tV", strThenObj],
                                                    [],
@@ -1125,7 +1132,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer str then call arg0 otool", strThenOtoolRun.output, "sp"):
         return 1
     let strThenRelocRun = hostops.RunProgramLogged(rootDir,
-                                                   Fmt(["backend_driver_direct_object_str_then_call_arg0_reloc_", label]),
+                                                   strutil.Join(["backend_driver_direct_object_str_then_call_arg0_reloc_", label], ""),
                                                    "otool",
                                                    ["-rv", strThenObj],
                                                    [],
@@ -1143,10 +1150,10 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let strThenInferredSrc = chengpath.PathAbsolute(rootDir, "src/tests/str_then_call_arg0_inferred_direct_object_smoke.cheng")
     let strThenInferredObj = os.JoinPath(outDir, "str_then_call_arg0_inferred_direct_object_smoke.o")
-    let strThenInferredReport = Fmt([strThenInferredObj, ".report.txt"])
-    let strThenInferredCompileLog = Fmt([strThenInferredObj, ".host.log"])
-    let strThenInferredAsm = Fmt([strThenInferredObj, ".s"])
-    let strThenInferredObjectCompileLog = Fmt([strThenInferredObj, ".compile.log"])
+    let strThenInferredReport = strutil.Join([strThenInferredObj, ".report.txt"], "")
+    let strThenInferredCompileLog = strutil.Join([strThenInferredObj, ".host.log"], "")
+    let strThenInferredAsm = strutil.Join([strThenInferredObj, ".s"], "")
+    let strThenInferredObjectCompileLog = strutil.Join([strThenInferredObj, ".compile.log"], "")
     BackendDriverRemoveFileIfPresent(strThenInferredObj)
     BackendDriverRemoveFileIfPresent(strThenInferredReport)
     BackendDriverRemoveFileIfPresent(strThenInferredCompileLog)
@@ -1154,14 +1161,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(strThenInferredObjectCompileLog)
     var strThenInferredCompileArgs: str[]
     add(strThenInferredCompileArgs, "system-link-exec")
-    add(strThenInferredCompileArgs, Fmt(["--root:", rootDir]))
-    add(strThenInferredCompileArgs, Fmt(["--in:", strThenInferredSrc]))
+    add(strThenInferredCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(strThenInferredCompileArgs, strutil.Join(["--in:", strThenInferredSrc], ""))
     add(strThenInferredCompileArgs, "--emit:obj")
     add(strThenInferredCompileArgs, "--target:arm64-apple-darwin")
-    add(strThenInferredCompileArgs, Fmt(["--out:", strThenInferredObj]))
-    add(strThenInferredCompileArgs, Fmt(["--report-out:", strThenInferredReport]))
+    add(strThenInferredCompileArgs, strutil.Join(["--out:", strThenInferredObj], ""))
+    add(strThenInferredCompileArgs, strutil.Join(["--report-out:", strThenInferredReport], ""))
     let strThenInferredCompileRun = hostops.RunFileLogged(rootDir,
-                                                          Fmt(["backend_driver_direct_object_str_then_call_arg0_inferred_compile_", label]),
+                                                          strutil.Join(["backend_driver_direct_object_str_then_call_arg0_inferred_compile_", label], ""),
                                                           compilerPath,
                                                           strThenInferredCompileArgs,
                                                           compileEnv,
@@ -1174,21 +1181,23 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return strThenInferredCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, strThenInferredObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing inferred str then call arg0 object: ", strThenInferredObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing inferred str then call arg0 object: ", strThenInferredObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, strThenInferredReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing inferred str then call arg0 report: ", strThenInferredReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing inferred str then call arg0 report: ", strThenInferredReport], ""))
         return 1
     if chengpath.PathFileExists(strThenInferredAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected inferred str then call arg0 asm: ", strThenInferredAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected inferred str then call arg0 asm: ", strThenInferredAsm], ""))
         return 1
     if chengpath.PathFileExists(strThenInferredObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected inferred str then call arg0 asm compile log: ", strThenInferredObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected inferred str then call arg0 asm compile log: ", strThenInferredObjectCompileLog], ""))
         return 1
     let strThenInferredReportText = chengpath.ReadTextFile("", strThenInferredReport)
     if !BackendDriverExpectContains("direct object writer inferred str then call arg0 smoke", strThenInferredReportText, "typed_ir_let_call_str_then_call_arg0_return_i32_const_0_count=1"):
         return 1
     if !BackendDriverExpectContains("direct object writer inferred str then call arg0 smoke", strThenInferredReportText, "primary_object_ir_body_kinds=return_str_empty,return_zero_i32,let_call_noarg_str_then_call_arg0_return_i32_const_0"):
+        return 1
+    if !BackendDriverExpectContains("direct object writer inferred str then call arg0 smoke", strThenInferredReportText, "primary_object_body_kinds=return_str_empty,return_zero_i32,statement_sequence"):
         return 1
     if !BackendDriverExpectContains("direct object writer inferred str then call arg0 smoke", strThenInferredReportText, "primary_object_direct=1"):
         return 1
@@ -1196,12 +1205,12 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let guardSrc = chengpath.PathAbsolute(rootDir, "src/tests/let_call_i32_guard_direct_object_smoke.cheng")
     let guardObj = os.JoinPath(outDir, "let_call_i32_guard_direct_object_smoke.o")
-    let guardReport = Fmt([guardObj, ".report.txt"])
-    let guardCompileLog = Fmt([guardObj, ".host.log"])
-    let guardAsm = Fmt([guardObj, ".s"])
-    let guardObjectCompileLog = Fmt([guardObj, ".compile.log"])
-    let guardOtoolLog = Fmt([guardObj, ".otool.log"])
-    let guardRelocLog = Fmt([guardObj, ".reloc.log"])
+    let guardReport = strutil.Join([guardObj, ".report.txt"], "")
+    let guardCompileLog = strutil.Join([guardObj, ".host.log"], "")
+    let guardAsm = strutil.Join([guardObj, ".s"], "")
+    let guardObjectCompileLog = strutil.Join([guardObj, ".compile.log"], "")
+    let guardOtoolLog = strutil.Join([guardObj, ".otool.log"], "")
+    let guardRelocLog = strutil.Join([guardObj, ".reloc.log"], "")
     BackendDriverRemoveFileIfPresent(guardObj)
     BackendDriverRemoveFileIfPresent(guardReport)
     BackendDriverRemoveFileIfPresent(guardCompileLog)
@@ -1211,14 +1220,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(guardRelocLog)
     var guardCompileArgs: str[]
     add(guardCompileArgs, "system-link-exec")
-    add(guardCompileArgs, Fmt(["--root:", rootDir]))
-    add(guardCompileArgs, Fmt(["--in:", guardSrc]))
+    add(guardCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(guardCompileArgs, strutil.Join(["--in:", guardSrc], ""))
     add(guardCompileArgs, "--emit:obj")
     add(guardCompileArgs, "--target:arm64-apple-darwin")
-    add(guardCompileArgs, Fmt(["--out:", guardObj]))
-    add(guardCompileArgs, Fmt(["--report-out:", guardReport]))
+    add(guardCompileArgs, strutil.Join(["--out:", guardObj], ""))
+    add(guardCompileArgs, strutil.Join(["--report-out:", guardReport], ""))
     let guardCompileRun = hostops.RunFileLogged(rootDir,
-                                                Fmt(["backend_driver_direct_object_let_guard_compile_", label]),
+                                                strutil.Join(["backend_driver_direct_object_let_guard_compile_", label], ""),
                                                 compilerPath,
                                                 guardCompileArgs,
                                                 compileEnv,
@@ -1231,16 +1240,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return guardCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, guardObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing let-call guarded result object: ", guardObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing let-call guarded result object: ", guardObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, guardReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing let-call guarded result report: ", guardReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing let-call guarded result report: ", guardReport], ""))
         return 1
     if chengpath.PathFileExists(guardAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected let-call guarded result asm: ", guardAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected let-call guarded result asm: ", guardAsm], ""))
         return 1
     if chengpath.PathFileExists(guardObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected let-call guarded result asm compile log: ", guardObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected let-call guarded result asm compile log: ", guardObjectCompileLog], ""))
         return 1
     let guardReportText = chengpath.ReadTextFile("", guardReport)
     if !BackendDriverExpectContains("direct object writer let-call guarded result smoke", guardReportText, "system_link_exec_runtime_execute=1"):
@@ -1251,7 +1260,11 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     if !BackendDriverExpectContains("direct object writer let-call guarded result smoke", guardReportText, "primary_object_ir_body_kinds=return_i32_const_7,let_call_noarg_i32_if_result_le_zero_return_zero_else_result_i32"):
         return 1
-    if !BackendDriverExpectContains("direct object writer let-call guarded result smoke", guardReportText, "primary_object_body_kinds=return_i32_const_7,let_call_noarg_i32_if_result_le_zero_return_zero_else_result_i32"):
+    if !BackendDriverExpectContains("direct object writer let-call guarded result smoke", guardReportText, "primary_object_body_kinds=return_i32_const_7,statement_sequence"):
+        return 1
+    if !BackendDriverExpectContains("direct object writer let-call guarded result smoke", guardReportText, "primary_object_statement_return_modes=0,3"):
+        return 1
+    if !BackendDriverExpectContains("direct object writer let-call guarded result smoke", guardReportText, "primary_object_statement_call_counts=0,1"):
         return 1
     if !BackendDriverExpectContains("direct object writer let-call guarded result smoke", guardReportText, "primary_object_word_counts=2,10"):
         return 1
@@ -1260,7 +1273,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer let-call guarded result smoke", guardReportText, "direct_object_reloc_count=1"):
         return 1
     let guardOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                 Fmt(["backend_driver_direct_object_let_guard_otool_", label]),
+                                                 strutil.Join(["backend_driver_direct_object_let_guard_otool_", label], ""),
                                                  "otool",
                                                  ["-tV", guardObj],
                                                  [],
@@ -1279,7 +1292,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer let-call guarded result otool", guardOtoolRun.output, "ret"):
         return 1
     let guardRelocRun = hostops.RunProgramLogged(rootDir,
-                                                 Fmt(["backend_driver_direct_object_let_guard_reloc_", label]),
+                                                 strutil.Join(["backend_driver_direct_object_let_guard_reloc_", label], ""),
                                                  "otool",
                                                  ["-rv", guardObj],
                                                  [],
@@ -1295,11 +1308,11 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let i32MaddSrc = chengpath.PathAbsolute(rootDir, "src/tests/int32_madd_direct_object_smoke.cheng")
     let i32MaddObj = os.JoinPath(outDir, "int32_madd_direct_object_smoke.o")
-    let i32MaddReport = Fmt([i32MaddObj, ".report.txt"])
-    let i32MaddCompileLog = Fmt([i32MaddObj, ".host.log"])
-    let i32MaddAsm = Fmt([i32MaddObj, ".s"])
-    let i32MaddObjectCompileLog = Fmt([i32MaddObj, ".compile.log"])
-    let i32MaddOtoolLog = Fmt([i32MaddObj, ".otool.log"])
+    let i32MaddReport = strutil.Join([i32MaddObj, ".report.txt"], "")
+    let i32MaddCompileLog = strutil.Join([i32MaddObj, ".host.log"], "")
+    let i32MaddAsm = strutil.Join([i32MaddObj, ".s"], "")
+    let i32MaddObjectCompileLog = strutil.Join([i32MaddObj, ".compile.log"], "")
+    let i32MaddOtoolLog = strutil.Join([i32MaddObj, ".otool.log"], "")
     BackendDriverRemoveFileIfPresent(i32MaddObj)
     BackendDriverRemoveFileIfPresent(i32MaddReport)
     BackendDriverRemoveFileIfPresent(i32MaddCompileLog)
@@ -1308,14 +1321,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(i32MaddOtoolLog)
     var i32MaddCompileArgs: str[]
     add(i32MaddCompileArgs, "system-link-exec")
-    add(i32MaddCompileArgs, Fmt(["--root:", rootDir]))
-    add(i32MaddCompileArgs, Fmt(["--in:", i32MaddSrc]))
+    add(i32MaddCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(i32MaddCompileArgs, strutil.Join(["--in:", i32MaddSrc], ""))
     add(i32MaddCompileArgs, "--emit:obj")
     add(i32MaddCompileArgs, "--target:arm64-apple-darwin")
-    add(i32MaddCompileArgs, Fmt(["--out:", i32MaddObj]))
-    add(i32MaddCompileArgs, Fmt(["--report-out:", i32MaddReport]))
+    add(i32MaddCompileArgs, strutil.Join(["--out:", i32MaddObj], ""))
+    add(i32MaddCompileArgs, strutil.Join(["--report-out:", i32MaddReport], ""))
     let i32MaddCompileRun = hostops.RunFileLogged(rootDir,
-                                                   Fmt(["backend_driver_direct_object_i32_madd_compile_", label]),
+                                                   strutil.Join(["backend_driver_direct_object_i32_madd_compile_", label], ""),
                                                    compilerPath,
                                                    i32MaddCompileArgs,
                                                    compileEnv,
@@ -1328,16 +1341,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return i32MaddCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, i32MaddObj):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 madd object: ", i32MaddObj]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 madd object: ", i32MaddObj], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, i32MaddReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing i32 madd report: ", i32MaddReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing i32 madd report: ", i32MaddReport], ""))
         return 1
     if chengpath.PathFileExists(i32MaddAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 madd asm: ", i32MaddAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 madd asm: ", i32MaddAsm], ""))
         return 1
     if chengpath.PathFileExists(i32MaddObjectCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected i32 madd asm compile log: ", i32MaddObjectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected i32 madd asm compile log: ", i32MaddObjectCompileLog], ""))
         return 1
     let i32MaddReportText = chengpath.ReadTextFile("", i32MaddReport)
     if !BackendDriverExpectContains("direct object writer i32 madd smoke", i32MaddReportText, "system_link_exec_runtime_execute=1"):
@@ -1357,7 +1370,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer i32 madd smoke", i32MaddReportText, "direct_object_reloc_count=0"):
         return 1
     let i32MaddOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                   Fmt(["backend_driver_direct_object_i32_madd_otool_", label]),
+                                                   strutil.Join(["backend_driver_direct_object_i32_madd_otool_", label], ""),
                                                    "otool",
                                                    ["-tV", i32MaddObj],
                                                    [],
@@ -1375,16 +1388,16 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         return 1
     let callChainSrc = chengpath.PathAbsolute(rootDir, "src/tests/int32_const_return_direct_fixture.cheng")
     let callChainOut = os.JoinPath(outDir, "int32_const_return_direct_fixture")
-    let callChainPrimaryObject = Fmt([callChainOut, ".primary.o"])
-    let callChainReport = Fmt([callChainOut, ".report.txt"])
-    let callChainCompileLog = Fmt([callChainOut, ".compile.log"])
-    let callChainPrimaryAsm = Fmt([callChainPrimaryObject, ".s"])
-    let callChainPrimaryCompileLog = Fmt([callChainPrimaryObject, ".compile.log"])
-    let callChainOtoolLog = Fmt([callChainPrimaryObject, ".otool.log"])
-    let callChainRunLog = Fmt([callChainOut, ".run.log"])
+    let callChainPrimaryObject = strutil.Join([callChainOut, ".primary.o"], "")
+    let callChainReport = strutil.Join([callChainOut, ".report.txt"], "")
+    let callChainCompileLog = strutil.Join([callChainOut, ".compile.log"], "")
+    let callChainPrimaryAsm = strutil.Join([callChainPrimaryObject, ".s"], "")
+    let callChainPrimaryCompileLog = strutil.Join([callChainPrimaryObject, ".compile.log"], "")
+    let callChainOtoolLog = strutil.Join([callChainPrimaryObject, ".otool.log"], "")
+    let callChainRunLog = strutil.Join([callChainOut, ".run.log"], "")
     BackendDriverRemoveFileIfPresent(callChainOut)
     BackendDriverRemoveFileIfPresent(callChainPrimaryObject)
-    BackendDriverRemoveFileIfPresent(Fmt([callChainOut, ".map"]))
+    BackendDriverRemoveFileIfPresent(strutil.Join([callChainOut, ".map"], ""))
     BackendDriverRemoveFileIfPresent(callChainReport)
     BackendDriverRemoveFileIfPresent(callChainCompileLog)
     BackendDriverRemoveFileIfPresent(callChainPrimaryAsm)
@@ -1393,14 +1406,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(callChainRunLog)
     var callChainCompileArgs: str[]
     add(callChainCompileArgs, "system-link-exec")
-    add(callChainCompileArgs, Fmt(["--root:", rootDir]))
-    add(callChainCompileArgs, Fmt(["--in:", callChainSrc]))
+    add(callChainCompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(callChainCompileArgs, strutil.Join(["--in:", callChainSrc], ""))
     add(callChainCompileArgs, "--emit:exe")
     add(callChainCompileArgs, "--target:arm64-apple-darwin")
-    add(callChainCompileArgs, Fmt(["--out:", callChainOut]))
-    add(callChainCompileArgs, Fmt(["--report-out:", callChainReport]))
+    add(callChainCompileArgs, strutil.Join(["--out:", callChainOut], ""))
+    add(callChainCompileArgs, strutil.Join(["--report-out:", callChainReport], ""))
     let callChainCompileRun = hostops.RunFileLogged(rootDir,
-                                                     Fmt(["backend_driver_direct_object_call_chain_compile_", label]),
+                                                     strutil.Join(["backend_driver_direct_object_call_chain_compile_", label], ""),
                                                      compilerPath,
                                                      callChainCompileArgs,
                                                      compileEnv,
@@ -1413,19 +1426,19 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return callChainCompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, callChainOut):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing call chain exe: ", callChainOut]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing call chain exe: ", callChainOut], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, callChainPrimaryObject):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing call chain primary object: ", callChainPrimaryObject]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing call chain primary object: ", callChainPrimaryObject], ""))
         return 1
     if chengpath.PathFileExists(callChainPrimaryAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected call chain asm: ", callChainPrimaryAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected call chain asm: ", callChainPrimaryAsm], ""))
         return 1
     if chengpath.PathFileExists(callChainPrimaryCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected call chain asm compile log: ", callChainPrimaryCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected call chain asm compile log: ", callChainPrimaryCompileLog], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, callChainReport):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing call chain report: ", callChainReport]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing call chain report: ", callChainReport], ""))
         return 1
     let callChainReportText = chengpath.ReadTextFile("", callChainReport)
     if !BackendDriverExpectContains("direct object writer call chain smoke", callChainReportText, "system_link_exec_runtime_execute=1"):
@@ -1443,7 +1456,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer call chain smoke", callChainReportText, "provider_object_count=0"):
         return 1
     let callChainOtoolRun = hostops.RunProgramLogged(rootDir,
-                                                     Fmt(["backend_driver_direct_object_call_chain_otool_", label]),
+                                                     strutil.Join(["backend_driver_direct_object_call_chain_otool_", label], ""),
                                                      "otool",
                                                      ["-r", "-v", callChainPrimaryObject],
                                                      [],
@@ -1456,7 +1469,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer call chain otool", callChainOtoolRun.output, "BR26"):
         return 1
     let callChainRun = hostops.RunFileLogged(rootDir,
-                                             Fmt(["backend_driver_direct_object_call_chain_run_", label]),
+                                             strutil.Join(["backend_driver_direct_object_call_chain_run_", label], ""),
                                              callChainOut,
                                              [],
                                              [],
@@ -1467,20 +1480,20 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
         let outputText = strutil.Strip(callChainRun.output)
         if len(outputText) > 0:
             BackendDriverPrintErr(outputText)
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: call chain rc=", strings.IntToStr(callChainRun.exitCode)]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: call chain rc=", strings.IntToStr(callChainRun.exitCode)], ""))
         return 1
     let deadF64Src = chengpath.PathAbsolute(rootDir, "src/tests/zero_exit_with_f64_dead_function_fixture.cheng")
     let deadF64Out = os.JoinPath(outDir, "zero_exit_with_f64_dead_function_fixture")
-    let deadF64PrimaryObject = Fmt([deadF64Out, ".primary.o"])
-    let deadF64Report = Fmt([deadF64Out, ".report.txt"])
-    let deadF64CompileLog = Fmt([deadF64Out, ".compile.log"])
-    let deadF64PrimaryAsm = Fmt([deadF64PrimaryObject, ".s"])
-    let deadF64PrimaryCompileLog = Fmt([deadF64PrimaryObject, ".compile.log"])
-    let deadF64OtoolLog = Fmt([deadF64PrimaryObject, ".otool.log"])
-    let deadF64RunLog = Fmt([deadF64Out, ".run.log"])
+    let deadF64PrimaryObject = strutil.Join([deadF64Out, ".primary.o"], "")
+    let deadF64Report = strutil.Join([deadF64Out, ".report.txt"], "")
+    let deadF64CompileLog = strutil.Join([deadF64Out, ".compile.log"], "")
+    let deadF64PrimaryAsm = strutil.Join([deadF64PrimaryObject, ".s"], "")
+    let deadF64PrimaryCompileLog = strutil.Join([deadF64PrimaryObject, ".compile.log"], "")
+    let deadF64OtoolLog = strutil.Join([deadF64PrimaryObject, ".otool.log"], "")
+    let deadF64RunLog = strutil.Join([deadF64Out, ".run.log"], "")
     BackendDriverRemoveFileIfPresent(deadF64Out)
     BackendDriverRemoveFileIfPresent(deadF64PrimaryObject)
-    BackendDriverRemoveFileIfPresent(Fmt([deadF64Out, ".map"]))
+    BackendDriverRemoveFileIfPresent(strutil.Join([deadF64Out, ".map"], ""))
     BackendDriverRemoveFileIfPresent(deadF64Report)
     BackendDriverRemoveFileIfPresent(deadF64CompileLog)
     BackendDriverRemoveFileIfPresent(deadF64PrimaryAsm)
@@ -1489,14 +1502,14 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(deadF64RunLog)
     var deadF64CompileArgs: str[]
     add(deadF64CompileArgs, "system-link-exec")
-    add(deadF64CompileArgs, Fmt(["--root:", rootDir]))
-    add(deadF64CompileArgs, Fmt(["--in:", deadF64Src]))
+    add(deadF64CompileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(deadF64CompileArgs, strutil.Join(["--in:", deadF64Src], ""))
     add(deadF64CompileArgs, "--emit:exe")
     add(deadF64CompileArgs, "--target:arm64-apple-darwin")
-    add(deadF64CompileArgs, Fmt(["--out:", deadF64Out]))
-    add(deadF64CompileArgs, Fmt(["--report-out:", deadF64Report]))
+    add(deadF64CompileArgs, strutil.Join(["--out:", deadF64Out], ""))
+    add(deadF64CompileArgs, strutil.Join(["--report-out:", deadF64Report], ""))
     let deadF64CompileRun = hostops.RunFileLogged(rootDir,
-                                                   Fmt(["backend_driver_direct_object_dead_f64_compile_", label]),
+                                                   strutil.Join(["backend_driver_direct_object_dead_f64_compile_", label], ""),
                                                    compilerPath,
                                                    deadF64CompileArgs,
                                                    compileEnv,
@@ -1509,19 +1522,19 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return deadF64CompileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, deadF64Out):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing dead f64 exe: ", deadF64Out]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing dead f64 exe: ", deadF64Out], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, deadF64PrimaryObject):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing dead f64 primary object: ", deadF64PrimaryObject]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing dead f64 primary object: ", deadF64PrimaryObject], ""))
         return 1
     if chengpath.PathFileExists(deadF64PrimaryAsm):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected dead f64 asm: ", deadF64PrimaryAsm]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected dead f64 asm: ", deadF64PrimaryAsm], ""))
         return 1
     if chengpath.PathFileExists(deadF64PrimaryCompileLog):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: unexpected dead f64 asm compile log: ", deadF64PrimaryCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: unexpected dead f64 asm compile log: ", deadF64PrimaryCompileLog], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, deadF64Report):
-        BackendDriverPrintErr(Fmt(["direct object writer smoke: missing dead f64 report: ", deadF64Report]))
+        BackendDriverPrintErr(strutil.Join(["direct object writer smoke: missing dead f64 report: ", deadF64Report], ""))
         return 1
     let deadF64ReportText = chengpath.ReadTextFile("", deadF64Report)
     if !BackendDriverExpectContains("direct object writer dead f64 smoke", deadF64ReportText, "system_link_exec_runtime_execute=1"):
@@ -1537,7 +1550,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer dead f64 smoke", deadF64ReportText, "direct_object_symbol_count=3"):
         return 1
     let deadF64OtoolRun = hostops.RunProgramLogged(rootDir,
-                                                   Fmt(["backend_driver_direct_object_dead_f64_otool_", label]),
+                                                   strutil.Join(["backend_driver_direct_object_dead_f64_otool_", label], ""),
                                                    "otool",
                                                    ["-tV", deadF64PrimaryObject],
                                                    [],
@@ -1552,7 +1565,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
     if !BackendDriverExpectContains("direct object writer dead f64 otool", deadF64OtoolRun.output, "d0, d0, d1"):
         return 1
     let deadF64Run = hostops.RunFileLogged(rootDir,
-                                           Fmt(["backend_driver_direct_object_dead_f64_run_", label]),
+                                           strutil.Join(["backend_driver_direct_object_dead_f64_run_", label], ""),
                                            deadF64Out,
                                            [],
                                            [],
@@ -1565,7 +1578,7 @@ fn BackendDriverRunDirectObjectWriterSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return deadF64Run.exitCode
     let run = hostops.RunFileLogged(rootDir,
-                                      Fmt(["backend_driver_direct_object_writer_run_", label]),
+                                      strutil.Join(["backend_driver_direct_object_writer_run_", label], ""),
                                       outBin,
                                       [],
                                       [],
@@ -1586,11 +1599,11 @@ fn BackendDriverRunFloat64DirectObjectSmoke(rootDir: str,
                                              label: str): int32 =
     let src = chengpath.PathAbsolute(rootDir, "src/tests/float64_mul_direct_object_smoke.cheng")
     let objPath = os.JoinPath(outDir, "float64_mul_direct_object_smoke.o")
-    let reportPath = Fmt([objPath, ".report.txt"])
-    let hostLog = Fmt([objPath, ".host.log"])
-    let asmPath = Fmt([objPath, ".s"])
-    let objectCompileLog = Fmt([objPath, ".compile.log"])
-    let otoolLog = Fmt([objPath, ".otool.log"])
+    let reportPath = strutil.Join([objPath, ".report.txt"], "")
+    let hostLog = strutil.Join([objPath, ".host.log"], "")
+    let asmPath = strutil.Join([objPath, ".s"], "")
+    let objectCompileLog = strutil.Join([objPath, ".compile.log"], "")
+    let otoolLog = strutil.Join([objPath, ".otool.log"], "")
     BackendDriverRemoveFileIfPresent(objPath)
     BackendDriverRemoveFileIfPresent(reportPath)
     BackendDriverRemoveFileIfPresent(hostLog)
@@ -1599,16 +1612,16 @@ fn BackendDriverRunFloat64DirectObjectSmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(otoolLog)
     var compileArgs: str[]
     add(compileArgs, "system-link-exec")
-    add(compileArgs, Fmt(["--root:", rootDir]))
-    add(compileArgs, Fmt(["--in:", src]))
+    add(compileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(compileArgs, strutil.Join(["--in:", src], ""))
     add(compileArgs, "--emit:obj")
     add(compileArgs, "--target:arm64-apple-darwin")
-    add(compileArgs, Fmt(["--out:", objPath]))
-    add(compileArgs, Fmt(["--report-out:", reportPath]))
+    add(compileArgs, strutil.Join(["--out:", objPath], ""))
+    add(compileArgs, strutil.Join(["--report-out:", reportPath], ""))
     var compileEnv = BackendDriverHostSmokeCompileEnv()
     add(compileEnv, "CHENG_REQUIRE_PURE_SYSTEM_LINK_EXEC=1")
     let compileRun = hostops.RunFileLogged(rootDir,
-                                            Fmt(["backend_driver_float64_direct_object_compile_", label]),
+                                            strutil.Join(["backend_driver_float64_direct_object_compile_", label], ""),
                                             compilerPath,
                                             compileArgs,
                                             compileEnv,
@@ -1621,16 +1634,16 @@ fn BackendDriverRunFloat64DirectObjectSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return compileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, objPath):
-        BackendDriverPrintErr(Fmt(["float64 direct object smoke: missing object: ", objPath]))
+        BackendDriverPrintErr(strutil.Join(["float64 direct object smoke: missing object: ", objPath], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, reportPath):
-        BackendDriverPrintErr(Fmt(["float64 direct object smoke: missing report: ", reportPath]))
+        BackendDriverPrintErr(strutil.Join(["float64 direct object smoke: missing report: ", reportPath], ""))
         return 1
     if chengpath.PathFileExists(asmPath):
-        BackendDriverPrintErr(Fmt(["float64 direct object smoke: unexpected asm: ", asmPath]))
+        BackendDriverPrintErr(strutil.Join(["float64 direct object smoke: unexpected asm: ", asmPath], ""))
         return 1
     if chengpath.PathFileExists(objectCompileLog):
-        BackendDriverPrintErr(Fmt(["float64 direct object smoke: unexpected asm compile log: ", objectCompileLog]))
+        BackendDriverPrintErr(strutil.Join(["float64 direct object smoke: unexpected asm compile log: ", objectCompileLog], ""))
         return 1
     let reportText = chengpath.ReadTextFile("", reportPath)
     if !BackendDriverExpectContains("float64 direct object smoke", reportText, "system_link_exec_runtime_execute=1"):
@@ -1642,7 +1655,7 @@ fn BackendDriverRunFloat64DirectObjectSmoke(rootDir: str,
     if !BackendDriverExpectContains("float64 direct object smoke", reportText, "direct_object_reloc_count=0"):
         return 1
     let otoolRun = hostops.RunProgramLogged(rootDir,
-                                            Fmt(["backend_driver_float64_direct_object_otool_", label]),
+                                            strutil.Join(["backend_driver_float64_direct_object_otool_", label], ""),
                                             "otool",
                                             ["-tV", objPath],
                                             [],
@@ -1665,19 +1678,19 @@ fn BackendDriverRunSeedMinimizationBoundarySmoke(rootDir: str,
                                                   label: str): int32 =
     let stage3 = BackendDriverStage3Path(rootDir)
     if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
-        BackendDriverPrintErr(Fmt(["seed minimization boundary: missing backend driver: ", compilerPath]))
+        BackendDriverPrintErr(strutil.Join(["seed minimization boundary: missing backend driver: ", compilerPath], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, stage3):
-        BackendDriverPrintErr(Fmt(["seed minimization boundary: missing stage3: ", stage3]))
+        BackendDriverPrintErr(strutil.Join(["seed minimization boundary: missing stage3: ", stage3], ""))
         return 1
     let smokeDir = os.JoinPath(outDir, "seed_minimization_boundary_smoke_artifacts")
     if !chengpath.MkdirP(rootDir, smokeDir):
-        BackendDriverPrintErr(Fmt(["seed minimization boundary: mkdir failed: ", smokeDir]))
+        BackendDriverPrintErr(strutil.Join(["seed minimization boundary: mkdir failed: ", smokeDir], ""))
         return 1
     let helpLog = os.JoinPath(smokeDir, "help.log")
     BackendDriverRemoveFileIfPresent(helpLog)
     let helpRun = hostops.RunFileLogged(rootDir,
-                                         Fmt(["seed_minimization_boundary_help_", label]),
+                                         strutil.Join(["seed_minimization_boundary_help_", label], ""),
                                          compilerPath,
                                          ["help"],
                                          [],
@@ -1717,7 +1730,7 @@ fn BackendDriverRunSeedMinimizationBoundarySmoke(rootDir: str,
     let contractLog = os.JoinPath(smokeDir, "seed_print_contract.log")
     BackendDriverRemoveFileIfPresent(contractLog)
     let contractRun = hostops.RunFileLogged(rootDir,
-                                             Fmt(["seed_minimization_boundary_contract_", label]),
+                                             strutil.Join(["seed_minimization_boundary_contract_", label], ""),
                                              stage3,
                                              ["print-contract"],
                                              [],
@@ -1736,11 +1749,11 @@ fn BackendDriverRunSeedMinimizationBoundarySmoke(rootDir: str,
                                        "supported_commands=print-contract,self-check,compile-bootstrap,bootstrap-bridge,status"):
         return 1
 
-    let hiddenCommand = Fmt(["__seed-system", "-link-exec"])
+    let hiddenCommand = strutil.Join(["__seed-system", "-link-exec"], "")
     let hiddenLog = os.JoinPath(smokeDir, "hidden_system_link_exec.log")
     BackendDriverRemoveFileIfPresent(hiddenLog)
     let hiddenRun = hostops.RunFileLogged(rootDir,
-                                           Fmt(["seed_minimization_boundary_hidden_", label]),
+                                           strutil.Join(["seed_minimization_boundary_hidden_", label], ""),
                                            stage3,
                                            [hiddenCommand],
                                            ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
@@ -1752,12 +1765,12 @@ fn BackendDriverRunSeedMinimizationBoundarySmoke(rootDir: str,
         return 1
     if !BackendDriverExpectContains("seed minimization boundary hidden command",
                                     hiddenRun.output,
-                                    Fmt(["[cheng_seed] unknown command: ", hiddenCommand])):
+                                    strutil.Join(["[cheng_seed] unknown command: ", hiddenCommand], "")):
         return 1
     let noHandoffLog = os.JoinPath(smokeDir, "no_handoff_non_bootstrap.log")
     BackendDriverRemoveFileIfPresent(noHandoffLog)
     let noHandoffRun = hostops.RunFileLogged(rootDir,
-                                              Fmt(["seed_minimization_boundary_no_handoff_", label]),
+                                              strutil.Join(["seed_minimization_boundary_no_handoff_", label], ""),
                                               stage3,
                                               ["print-asm"],
                                               ["CHENG_NO_BACKEND_DRIVER_HANDOFF=1"],
@@ -1772,17 +1785,17 @@ fn BackendDriverRunSeedMinimizationBoundarySmoke(rootDir: str,
                                     "non-bootstrap command requires backend driver handoff: print-asm"):
         return 1
 
-    let nonce = Fmt([strings.Int64ToStr(os.Time()), "_", strings.Int64ToStr(hostops.HostOpsCurrentPid())])
+    let nonce = strutil.Join([strings.Int64ToStr(os.Time()), "_", strings.Int64ToStr(hostops.HostOpsCurrentPid())], "")
     let cacheSource = chengpath.PathAbsolute(rootDir,
-                                             Fmt(["src/tests/backend_driver_cache_restore_fixture_",
+                                             strutil.Join(["src/tests/backend_driver_cache_restore_fixture_",
                                                   nonce,
-                                                  ".cheng"]))
+                                                  ".cheng"], ""))
     BackendDriverRemoveFileIfPresent(cacheSource)
     if !chengpath.WriteTextFile(rootDir, cacheSource, "fn main(): int32 =\n    return 0\n"):
         BackendDriverPrintErr("seed minimization boundary: failed to write cache fixture")
         return 1
     let cacheOut = os.JoinPath(smokeDir, "backend_driver_cache_restore_zero")
-    let cacheMap = Fmt([cacheOut, ".map"])
+    let cacheMap = strutil.Join([cacheOut, ".map"], "")
     let cachePrimeReport = os.JoinPath(smokeDir, "backend_driver_cache_restore.prime.report.txt")
     let cachePrimeLog = os.JoinPath(smokeDir, "backend_driver_cache_restore.prime.log")
     let cacheRestoreReport = os.JoinPath(smokeDir, "backend_driver_cache_restore.report.txt")
@@ -1794,15 +1807,15 @@ fn BackendDriverRunSeedMinimizationBoundarySmoke(rootDir: str,
 
     var cacheArgs: str[]
     add(cacheArgs, "system-link-exec")
-    add(cacheArgs, Fmt(["--root:", rootDir]))
-    add(cacheArgs, Fmt(["--in:", cacheSource]))
+    add(cacheArgs, strutil.Join(["--root:", rootDir], ""))
+    add(cacheArgs, strutil.Join(["--in:", cacheSource], ""))
     add(cacheArgs, "--emit:exe")
     add(cacheArgs, "--target:arm64-apple-darwin")
-    add(cacheArgs, Fmt(["--out:", cacheOut]))
+    add(cacheArgs, strutil.Join(["--out:", cacheOut], ""))
     var cachePrimeArgs = cacheArgs
-    add(cachePrimeArgs, Fmt(["--report-out:", cachePrimeReport]))
+    add(cachePrimeArgs, strutil.Join(["--report-out:", cachePrimeReport], ""))
     let cachePrimeRun = hostops.RunFileLogged(rootDir,
-                                               Fmt(["seed_minimization_boundary_cache_prime_", label]),
+                                               strutil.Join(["seed_minimization_boundary_cache_prime_", label], ""),
                                                compilerPath,
                                                cachePrimeArgs,
                                                [
@@ -1839,9 +1852,9 @@ fn BackendDriverRunSeedMinimizationBoundarySmoke(rootDir: str,
     BackendDriverRemoveFileIfPresent(cacheOut)
     BackendDriverRemoveFileIfPresent(cacheMap)
     var cacheRestoreArgs = cacheArgs
-    add(cacheRestoreArgs, Fmt(["--report-out:", cacheRestoreReport]))
+    add(cacheRestoreArgs, strutil.Join(["--report-out:", cacheRestoreReport], ""))
     let cacheRestoreRun = hostops.RunFileLogged(rootDir,
-                                                 Fmt(["seed_minimization_boundary_cache_restore_", label]),
+                                                 strutil.Join(["seed_minimization_boundary_cache_restore_", label], ""),
                                                  compilerPath,
                                                  cacheRestoreArgs,
                                                  [
@@ -1867,7 +1880,7 @@ fn BackendDriverRunSeedMinimizationBoundarySmoke(rootDir: str,
         return 1
     let cacheRunLog = os.JoinPath(smokeDir, "backend_driver_cache_restore.run.log")
     let cacheRun = hostops.RunFileLogged(rootDir,
-                                          Fmt(["seed_minimization_boundary_cache_run_", label]),
+                                          strutil.Join(["seed_minimization_boundary_cache_run_", label], ""),
                                           cacheOut,
                                           [],
                                           [],
@@ -1887,16 +1900,16 @@ fn BackendDriverRunCommandSurfaceSmoke(rootDir: str,
                                         outDir: str,
                                         label: str): int32 =
     if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
-        BackendDriverPrintErr(Fmt(["backend driver command surface: missing backend driver: ", compilerPath]))
+        BackendDriverPrintErr(strutil.Join(["backend driver command surface: missing backend driver: ", compilerPath], ""))
         return 1
     let smokeDir = os.JoinPath(outDir, "backend_driver_command_surface_smoke_artifacts")
     if !chengpath.MkdirP(rootDir, smokeDir):
-        BackendDriverPrintErr(Fmt(["backend driver command surface: mkdir failed: ", smokeDir]))
+        BackendDriverPrintErr(strutil.Join(["backend driver command surface: mkdir failed: ", smokeDir], ""))
         return 1
     let helpLog = os.JoinPath(smokeDir, "help.log")
     BackendDriverRemoveFileIfPresent(helpLog)
     let helpRun = hostops.RunFileLogged(rootDir,
-                                         Fmt(["backend_driver_surface_help_", label]),
+                                         strutil.Join(["backend_driver_surface_help_", label], ""),
                                          compilerPath,
                                          ["help"],
                                          [],
@@ -1921,7 +1934,7 @@ fn BackendDriverRunCommandSurfaceSmoke(rootDir: str,
     let statusLog = os.JoinPath(smokeDir, "status.log")
     BackendDriverRemoveFileIfPresent(statusLog)
     let statusRun = hostops.RunFileLogged(rootDir,
-                                           Fmt(["backend_driver_surface_status_", label]),
+                                           strutil.Join(["backend_driver_surface_status_", label], ""),
                                            compilerPath,
                                            ["status"],
                                            [],
@@ -1981,30 +1994,30 @@ fn BackendDriverRunOneHostSmoke(rootDir: str,
         return BackendDriverRunCommandSurfaceSmoke(rootDir, compilerPath, outDir, label)
     if smokeName == "build_plan_report_smoke":
         return BackendDriverRunBuildPlanReportSmoke(rootDir)
-    let src = chengpath.PathAbsolute(rootDir, "src/tests/" + smokeName + ".cheng")
+    let src = chengpath.PathAbsolute(rootDir, strutil.Join(["src/tests/", smokeName, ".cheng"], ""))
     if !chengpath.FileExistsNonEmpty(rootDir, src):
-        BackendDriverPrintErr("backend driver host smokes: missing source: " + src)
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: missing source: ", src], ""))
         return 1
     let outBin = os.JoinPath(outDir, smokeName)
-    let compileLog = outBin + ".compile.log"
-    let runLog = outBin + ".run.log"
+    let compileLog = strutil.Join([outBin, ".compile.log"], "")
+    let runLog = strutil.Join([outBin, ".run.log"], "")
     if chengpath.PathFileExists(outBin):
         os.RemoveFile(outBin)
-    if chengpath.PathFileExists(outBin + ".map"):
-        os.RemoveFile(outBin + ".map")
+    if chengpath.PathFileExists(strutil.Join([outBin, ".map"], "")):
+        os.RemoveFile(strutil.Join([outBin, ".map"], ""))
     if chengpath.PathFileExists(compileLog):
         os.RemoveFile(compileLog)
     if chengpath.PathFileExists(runLog):
         os.RemoveFile(runLog)
     var compileArgs: str[]
     add(compileArgs, "system-link-exec")
-    add(compileArgs, "--root:" + rootDir)
-    add(compileArgs, "--in:" + src)
+    add(compileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(compileArgs, strutil.Join(["--in:", src], ""))
     add(compileArgs, "--emit:exe")
     add(compileArgs, "--target:arm64-apple-darwin")
-    add(compileArgs, "--out:" + outBin)
+    add(compileArgs, strutil.Join(["--out:", outBin], ""))
     let compileRun = hostops.RunFileLogged(rootDir,
-                                             "backend_driver_host_smoke_compile_" + label + "_" + smokeName,
+                                             strutil.Join(["backend_driver_host_smoke_compile_", label, "_", smokeName], ""),
                                              compilerPath,
                                              compileArgs,
                                              BackendDriverHostSmokeCompileEnv(),
@@ -2017,10 +2030,10 @@ fn BackendDriverRunOneHostSmoke(rootDir: str,
             BackendDriverPrintErr(outputText)
         return compileRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, outBin):
-        BackendDriverPrintErr("backend driver host smokes: compile missing output: " + outBin)
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: compile missing output: ", outBin], ""))
         return 1
     let run = hostops.RunFileLogged(rootDir,
-                                      "backend_driver_host_smoke_run_" + label + "_" + smokeName,
+                                      strutil.Join(["backend_driver_host_smoke_run_", label, "_", smokeName], ""),
                                       outBin,
                                       [],
                                       BackendDriverHostSmokeRunEnv(smokeName, r2cControllerExe),
@@ -2046,7 +2059,7 @@ fn BackendDriverRunHostSmokesWithR2cController(rootDir: str,
         return 2
     let compilerPath = BackendDriverHostSmokeCompiler(rootDir, args)
     if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
-        BackendDriverPrintErr("backend driver host smokes: missing compiler: " + compilerPath)
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: missing compiler: ", compilerPath], ""))
         return 1
     let tests = BackendDriverCollectHostSmokeNames(args)
     if tests.len <= 0:
@@ -2056,7 +2069,7 @@ fn BackendDriverRunHostSmokesWithR2cController(rootDir: str,
     if label != "host":
         outDir = os.JoinPath(outDir, label)
     if !chengpath.MkdirP(rootDir, outDir):
-        BackendDriverPrintErr("backend driver host smokes: mkdir failed: " + outDir)
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: mkdir failed: ", outDir], ""))
         return 1
     var effectiveR2cControllerExe = r2cControllerExe
     if len(effectiveR2cControllerExe) <= 0 && BackendDriverHostSmokesNeedR2cController(tests):
@@ -2077,7 +2090,7 @@ fn BackendDriverRunHostSmokes(rootDir: str, args: str[]): int32 =
 fn BackendDriverRunBuiltinHostSmoke(rootDir: str,
                                       label: str,
                                       smokeName: str): int32 =
-    return BackendDriverRunHostSmokes(rootDir, ["--label:" + label, smokeName])
+    return BackendDriverRunHostSmokes(rootDir, [strutil.Join(["--label:", label], ""), smokeName])
 
 type
     BackendDriverDebugPlans =
@@ -2146,11 +2159,11 @@ fn BackendDriverRunDebugTextCommand(rootDir: str,
             return 1
         report = Value(asmReport)
     else:
-        BackendDriverPrintErr("backend driver debug: unsupported direct command: " + commandName)
+        BackendDriverPrintErr(strutil.Join(["backend driver debug: unsupported direct command: ", commandName], ""))
         return 2
     let reportPath = creq.CompilerReadFlagOrDefault(args, "--report-out", "")
-    if !BackendDriverWriteOptionalReport(rootDir, reportPath, report + "\n"):
-        BackendDriverPrintErr("backend driver debug: failed to write report: " + reportPath)
+    if !BackendDriverWriteOptionalReport(rootDir, reportPath, strutil.Join([report, "\n"], "")):
+        BackendDriverPrintErr(strutil.Join(["backend driver debug: failed to write report: ", reportPath], ""))
         return 1
     BackendDriverPrintLine(strutil.Strip(report))
     return 0
@@ -2163,7 +2176,7 @@ fn BackendDriverRunObjectReportCommand(rootDir: str,
         BackendDriverPrintErr("backend driver print-object: missing --object")
         return 2
     if !chengpath.FileExistsNonEmpty(rootDir, objectPath):
-        BackendDriverPrintErr("backend driver print-object: missing object: " + objectPath)
+        BackendDriverPrintErr(strutil.Join(["backend driver print-object: missing object: ", objectPath], ""))
         return 1
     let reportRes = objectreport.ObjectDebugReportText(objectPath)
     if IsErr(reportRes):
@@ -2171,8 +2184,8 @@ fn BackendDriverRunObjectReportCommand(rootDir: str,
         return 1
     let report = Value(reportRes)
     let reportPath = creq.CompilerReadFlagOrDefault(args, "--report-out", "")
-    if !BackendDriverWriteOptionalReport(rootDir, reportPath, report + "\n"):
-        BackendDriverPrintErr("backend driver print-object: failed to write report: " + reportPath)
+    if !BackendDriverWriteOptionalReport(rootDir, reportPath, strutil.Join([report, "\n"], "")):
+        BackendDriverPrintErr(strutil.Join(["backend driver print-object: failed to write report: ", reportPath], ""))
         return 1
     BackendDriverPrintLine(strutil.Strip(report))
     return 0
@@ -2184,7 +2197,7 @@ fn BackendDriverRunProfileReport(rootDir: str,
         BackendDriverPrintErr("backend driver profile-report: missing --in")
         return 2
     if !chengpath.FileExistsNonEmpty(rootDir, rawPath):
-        BackendDriverPrintErr("backend driver profile-report: missing raw profile: " + rawPath)
+        BackendDriverPrintErr(strutil.Join(["backend driver profile-report: missing raw profile: ", rawPath], ""))
         return 1
     var outPath = creq.CompilerReadFlagOrDefault(args, "--out", "")
     if len(outPath) <= 0:
@@ -2195,7 +2208,7 @@ fn BackendDriverRunProfileReport(rootDir: str,
         return 1
     let report = Value(reportRes)
     if !chengpath.WriteTextFile(rootDir, outPath, report):
-        BackendDriverPrintErr("backend driver profile-report: failed to write report: " + outPath)
+        BackendDriverPrintErr(strutil.Join(["backend driver profile-report: failed to write report: ", outPath], ""))
         return 1
     BackendDriverPrintLine(strutil.Strip(report))
     return 0
@@ -2207,7 +2220,7 @@ fn BackendDriverRunCrashReport(rootDir: str,
         BackendDriverPrintErr("backend driver crash-report: missing --in")
         return 2
     if !chengpath.FileExistsNonEmpty(rootDir, rawPath):
-        BackendDriverPrintErr("backend driver crash-report: missing raw log: " + rawPath)
+        BackendDriverPrintErr(strutil.Join(["backend driver crash-report: missing raw log: ", rawPath], ""))
         return 1
     var outPath = creq.CompilerReadFlagOrDefault(args, "--out", "")
     if len(outPath) <= 0:
@@ -2218,7 +2231,7 @@ fn BackendDriverRunCrashReport(rootDir: str,
         return 1
     let report = Value(reportRes)
     if !chengpath.WriteTextFile(rootDir, outPath, report):
-        BackendDriverPrintErr("backend driver crash-report: failed to write report: " + outPath)
+        BackendDriverPrintErr(strutil.Join(["backend driver crash-report: failed to write report: ", outPath], ""))
         return 1
     BackendDriverPrintLine(strutil.Strip(report))
     return 0
@@ -2256,40 +2269,40 @@ fn BackendDriverBuildLinuxNolibcExe(rootDir: str): int32 =
     if target == "arm64-unknown-linux-gnu":
         target = "aarch64-unknown-linux-gnu"
     if target != "aarch64-unknown-linux-gnu":
-        BackendDriverPrintErr(" linux exe: unsupported target=" + targetRaw)
+        BackendDriverPrintErr(strutil.Join([" linux exe: unsupported target=", targetRaw], ""))
         return 1
     let compilerRaw = strutil.Strip(os.GetEnvDefault("CHENG_LINUX_EXE_COMPILER", "artifacts/backend_driver/cheng"))
     let compilerPath = chengpath.PathAbsolute(rootDir, compilerRaw)
     if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
-        BackendDriverPrintErr(" linux exe: missing compiler: " + compilerPath)
+        BackendDriverPrintErr(strutil.Join([" linux exe: missing compiler: ", compilerPath], ""))
         return 1
     let sourcePath = chengpath.PathAbsolute(rootDir, sourceRaw)
     let outPath = chengpath.PathAbsolute(rootDir, outRaw)
     let reportRaw = strutil.Strip(os.GetEnvDefault("CHENG_LINUX_EXE_REPORT", ""))
-    let compileLog = outPath + ".compile.log"
+    let compileLog = strutil.Join([outPath, ".compile.log"], "")
     if !chengpath.FileExistsNonEmpty(rootDir, sourcePath):
-        BackendDriverPrintErr(" linux exe: missing source: " + sourcePath)
+        BackendDriverPrintErr(strutil.Join([" linux exe: missing source: ", sourcePath], ""))
         return 1
     if !BackendDriverEnsureParentDir(rootDir, outPath):
-        BackendDriverPrintErr(" linux exe: failed to create output dir: " + outPath)
+        BackendDriverPrintErr(strutil.Join([" linux exe: failed to create output dir: ", outPath], ""))
         return 1
     if len(reportRaw) > 0:
         let reportPath = chengpath.PathAbsolute(rootDir, reportRaw)
         if !BackendDriverEnsureParentDir(rootDir, reportPath):
-            BackendDriverPrintErr(" linux exe: failed to create report dir: " + reportPath)
+            BackendDriverPrintErr(strutil.Join([" linux exe: failed to create report dir: ", reportPath], ""))
             return 1
     BackendDriverRemoveFileIfExists(outPath)
-    BackendDriverRemoveFileIfExists(outPath + ".map")
+    BackendDriverRemoveFileIfExists(strutil.Join([outPath, ".map"], ""))
     BackendDriverRemoveFileIfExists(compileLog)
     var compileArgs: str[]
     add(compileArgs, "system-link-exec")
-    add(compileArgs, "--root:" + rootDir)
-    add(compileArgs, "--in:" + sourcePath)
+    add(compileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(compileArgs, strutil.Join(["--in:", sourcePath], ""))
     add(compileArgs, "--emit:exe")
-    add(compileArgs, "--target:" + target)
-    add(compileArgs, "--out:" + outPath)
+    add(compileArgs, strutil.Join(["--target:", target], ""))
+    add(compileArgs, strutil.Join(["--out:", outPath], ""))
     if len(reportRaw) > 0:
-        add(compileArgs, "--report-out:" + chengpath.PathAbsolute(rootDir, reportRaw))
+        add(compileArgs, strutil.Join(["--report-out:", chengpath.PathAbsolute(rootDir, reportRaw)], ""))
     let run = hostops.RunFileLogged(rootDir,
                                       "backend_driver_linux_nolibc_exe",
                                       compilerPath,
@@ -2307,9 +2320,9 @@ fn BackendDriverBuildLinuxNolibcExe(rootDir: str): int32 =
     if !hostops.LoggedRunOk(run):
         return run.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, outPath):
-        BackendDriverPrintErr(" linux exe: missing output: " + outPath)
+        BackendDriverPrintErr(strutil.Join([" linux exe: missing output: ", outPath], ""))
         return 1
-    BackendDriverPrintLine("cheng linux exe: build ok target=" + target + " out=" + outPath)
+    BackendDriverPrintLine(strutil.Join(["cheng linux exe: build ok target=", target, " out=", outPath], ""))
     return 0
 
 fn BackendDriverSelfCompiler(rootDir: str): str =
@@ -2329,7 +2342,7 @@ fn BackendDriverRequireOutput(text: str,
                                 label: str): bool =
     if strutil.Contains(text, needle):
         return true
-    BackendDriverPrintErr(label + ": missing output: " + needle)
+    BackendDriverPrintErr(strutil.Join([label, ": missing output: ", needle], ""))
     return false
 
 fn BackendDriverCompileDarwinExe(rootDir: str,
@@ -2351,27 +2364,27 @@ fn BackendDriverCompileDarwinExeWithCompiler(rootDir: str,
                                    outputPath: str,
                                    compileLog: str): int32 =
     if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
-        BackendDriverPrintErr(label + ": missing compiler: " + compilerPath)
+        BackendDriverPrintErr(strutil.Join([label, ": missing compiler: ", compilerPath], ""))
         return 1
     if !chengpath.FileExistsNonEmpty(rootDir, sourcePath):
-        BackendDriverPrintErr(label + ": missing source: " + sourcePath)
+        BackendDriverPrintErr(strutil.Join([label, ": missing source: ", sourcePath], ""))
         return 1
     if !BackendDriverEnsureParentDir(rootDir, outputPath) ||
        !BackendDriverEnsureParentDir(rootDir, compileLog):
-        BackendDriverPrintErr(label + ": failed to create output dirs")
+        BackendDriverPrintErr(strutil.Join([label, ": failed to create output dirs"], ""))
         return 1
     BackendDriverRemoveFileIfExists(outputPath)
-    BackendDriverRemoveFileIfExists(outputPath + ".map")
+    BackendDriverRemoveFileIfExists(strutil.Join([outputPath, ".map"], ""))
     BackendDriverRemoveFileIfExists(compileLog)
     var compileArgs: str[]
     add(compileArgs, "system-link-exec")
-    add(compileArgs, "--root:" + rootDir)
-    add(compileArgs, "--in:" + sourcePath)
+    add(compileArgs, strutil.Join(["--root:", rootDir], ""))
+    add(compileArgs, strutil.Join(["--in:", sourcePath], ""))
     add(compileArgs, "--emit:exe")
     add(compileArgs, "--target:arm64-apple-darwin")
-    add(compileArgs, "--out:" + outputPath)
+    add(compileArgs, strutil.Join(["--out:", outputPath], ""))
     let run = hostops.RunFileLogged(rootDir,
-                                      label + "_compile",
+                                      strutil.Join([label, "_compile"], ""),
                                       compilerPath,
                                       compileArgs,
                                       BackendDriverHostSmokeCompileEnv(),
@@ -2387,7 +2400,7 @@ fn BackendDriverCompileDarwinExeWithCompiler(rootDir: str,
     if !hostops.LoggedRunOk(run):
         return run.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, outputPath):
-        BackendDriverPrintErr(label + ": missing output: " + outputPath)
+        BackendDriverPrintErr(strutil.Join([label, ": missing output: ", outputPath], ""))
         return 1
     return 0
 
@@ -2398,7 +2411,7 @@ fn BackendDriverRunCompiled(rootDir: str,
                               expectSuccess: bool): hostops.LoggedRun =
     BackendDriverRemoveFileIfExists(runLog)
     let run = hostops.RunFileLogged(rootDir,
-                                      label + "_run",
+                                      strutil.Join([label, "_run"], ""),
                                       outputPath,
                                       [],
                                       [],
@@ -2427,8 +2440,8 @@ fn BackendDriverBuildRunSuccessFixture(rootDir: str,
     let outDir = chengpath.PathAbsolute(rootDir, artifactDirRel)
     let sourcePath = chengpath.PathAbsolute(rootDir, sourceRel)
     let outputPath = os.JoinPath(outDir, outputName)
-    let compileLog = os.JoinPath(outDir, outputName + ".compile.log")
-    let runLog = os.JoinPath(outDir, outputName + ".run.log")
+    let compileLog = os.JoinPath(outDir, strutil.Join([outputName, ".compile.log"], ""))
+    let runLog = os.JoinPath(outDir, strutil.Join([outputName, ".run.log"], ""))
     let compileRc = BackendDriverCompileDarwinExe(rootDir,
                                                    commandName,
                                                    sourcePath,
@@ -2437,7 +2450,7 @@ fn BackendDriverBuildRunSuccessFixture(rootDir: str,
     if compileRc != 0:
         return compileRc
     if commandName == "build-zero-exit" &&
-       !chengpath.FileExistsNonEmpty(rootDir, outputPath + ".map"):
+       !chengpath.FileExistsNonEmpty(rootDir, strutil.Join([outputPath, ".map"], "")):
         BackendDriverPrintErr("zero-exit: missing line-map")
         return 1
     let run = BackendDriverRunCompiled(rootDir,
@@ -2481,10 +2494,10 @@ fn BackendDriverBuildCrashTrace(rootDir: str,
     let outDir = chengpath.PathAbsolute(rootDir, artifactDirRel)
     let sourcePath = chengpath.PathAbsolute(rootDir, sourceRel)
     let outputPath = os.JoinPath(outDir, outputName)
-    let reportPath = os.JoinPath(outDir, outputName + ".report.txt")
-    let compileLog = os.JoinPath(outDir, outputName + ".compile.log")
-    let runLog = os.JoinPath(outDir, outputName + ".run.log")
-    let reportLog = os.JoinPath(outDir, outputName + ".crash-report.log")
+    let reportPath = os.JoinPath(outDir, strutil.Join([outputName, ".report.txt"], ""))
+    let compileLog = os.JoinPath(outDir, strutil.Join([outputName, ".compile.log"], ""))
+    let runLog = os.JoinPath(outDir, strutil.Join([outputName, ".run.log"], ""))
+    let reportLog = os.JoinPath(outDir, strutil.Join([outputName, ".crash-report.log"], ""))
     let compileRc = BackendDriverCompileDarwinExe(rootDir,
                                                    commandName,
                                                    sourcePath,
@@ -2492,8 +2505,8 @@ fn BackendDriverBuildCrashTrace(rootDir: str,
                                                    compileLog)
     if compileRc != 0:
         return compileRc
-    if !chengpath.FileExistsNonEmpty(rootDir, outputPath + ".map"):
-        BackendDriverPrintErr(commandName + ": missing line-map")
+    if !chengpath.FileExistsNonEmpty(rootDir, strutil.Join([outputPath, ".map"], "")):
+        BackendDriverPrintErr(strutil.Join([commandName, ": missing line-map"], ""))
         return 1
     BackendDriverRemoveFileIfExists(reportPath)
     BackendDriverRemoveFileIfExists(reportLog)
@@ -2503,15 +2516,15 @@ fn BackendDriverBuildCrashTrace(rootDir: str,
                                         runLog,
                                         false)
     if hostops.LoggedRunOk(run):
-        BackendDriverPrintErr(commandName + ": expected non-zero exit")
+        BackendDriverPrintErr(strutil.Join([commandName, ": expected non-zero exit"], ""))
         return 1
     let reportRun = hostops.RunFileLogged(rootDir,
-                                           commandName + "_crash_report",
+                                           strutil.Join([commandName, "_crash_report"], ""),
                                            compilerPath,
                                            [
                                                "crash-report",
-                                               "--in:" + run.logPath,
-                                               "--out:" + reportPath
+                                               strutil.Join(["--in:", run.logPath], ""),
+                                               strutil.Join(["--out:", reportPath], "")
                                            ],
                                            [],
                                            rootDir,
@@ -2523,16 +2536,16 @@ fn BackendDriverBuildCrashTrace(rootDir: str,
             BackendDriverPrintErr(outputText)
         return reportRun.exitCode
     if !chengpath.FileExistsNonEmpty(rootDir, reportPath):
-        BackendDriverPrintErr(commandName + ": missing report")
+        BackendDriverPrintErr(strutil.Join([commandName, ": missing report"], ""))
         return 1
     let reportText = chengpath.ReadTextFile(rootDir, reportPath)
     if !BackendDriverRequireOutput(run.output, requiredRuntimeText, commandName) ||
        !BackendDriverRequireOutput(run.output, "cheng_crash_raw_v1", commandName) ||
        !BackendDriverRequireOutput(run.output, requiredReasonText, commandName) ||
-       !BackendDriverRequireOutput(run.output, outputName + ".cheng:", commandName) ||
+       !BackendDriverRequireOutput(run.output, strutil.Join([outputName, ".cheng:"], ""), commandName) ||
        !BackendDriverRequireOutput(reportText, "[cheng] cheng_crash_report_v1", commandName) ||
-       !BackendDriverRequireOutput(reportText, "[cheng] " + requiredReasonText, commandName) ||
-       !BackendDriverRequireOutput(reportText, outputName + ".cheng:", commandName):
+       !BackendDriverRequireOutput(reportText, strutil.Join(["[cheng] ", requiredReasonText], ""), commandName) ||
+       !BackendDriverRequireOutput(reportText, strutil.Join([outputName, ".cheng:"], ""), commandName):
         return 1
     BackendDriverPrintLine(strutil.Strip(reportText))
     return 0
@@ -2576,11 +2589,11 @@ fn BackendDriverRunFfiHandleTrap(rootDir: str,
                                         runLog,
                                         false)
     if hostops.LoggedRunOk(run):
-        BackendDriverPrintErr(label + ": expected non-zero exit")
+        BackendDriverPrintErr(strutil.Join([label, ": expected non-zero exit"], ""))
         return 1
     if !BackendDriverRequireOutput(run.output, "ffi handle invalid", label) ||
        !BackendDriverRequireOutput(run.output, "reason=ffi_handle", label) ||
-       !BackendDriverRequireOutput(run.output, sourceName + ".cheng:", label):
+       !BackendDriverRequireOutput(run.output, strutil.Join([sourceName, ".cheng:"], ""), label):
         return 1
     if requireDetailStale &&
        !BackendDriverRequireOutput(run.output, "detail=stale", label):
@@ -2621,10 +2634,10 @@ fn BackendDriverBuildFfiHandle(rootDir: str): int32 =
                                                            os.JoinPath(outDir, "ffi_handle_generation_stale_trap_smoke.compile.log"))
     if staleReuseCompile != 0:
         return staleReuseCompile
-    if !chengpath.FileExistsNonEmpty(rootDir, okBin + ".map") ||
-       !chengpath.FileExistsNonEmpty(rootDir, reuseBin + ".map") ||
-       !chengpath.FileExistsNonEmpty(rootDir, trapBin + ".map") ||
-       !chengpath.FileExistsNonEmpty(rootDir, staleReuseBin + ".map"):
+    if !chengpath.FileExistsNonEmpty(rootDir, strutil.Join([okBin, ".map"], "")) ||
+       !chengpath.FileExistsNonEmpty(rootDir, strutil.Join([reuseBin, ".map"], "")) ||
+       !chengpath.FileExistsNonEmpty(rootDir, strutil.Join([trapBin, ".map"], "")) ||
+       !chengpath.FileExistsNonEmpty(rootDir, strutil.Join([staleReuseBin, ".map"], "")):
         BackendDriverPrintErr("ffi-handle: missing line-map")
         return 1
     let okRun = BackendDriverRunCompiled(rootDir,
@@ -2662,19 +2675,19 @@ fn BackendDriverRunUdpImportcSmoke(rootDir: str,
     let label = BackendDriverHostSmokeLabel(args)
     let outDir = chengpath.PathAbsolute(rootDir, "artifacts/udp_importc")
     let sourcePath = chengpath.PathAbsolute(rootDir, "src/tests/udp_importc_smoke.cheng")
-    let outputPath = os.JoinPath(outDir, "udp_importc_smoke." + label)
+    let outputPath = os.JoinPath(outDir, strutil.Join(["udp_importc_smoke.", label], ""))
     let compileRc = BackendDriverCompileDarwinExeWithCompiler(rootDir,
-                                                               "run-udp-importc-smoke-" + label,
+                                                               strutil.Join(["run-udp-importc-smoke-", label], ""),
                                                                compilerPath,
                                                                sourcePath,
                                                                outputPath,
-                                                               os.JoinPath(outDir, "udp_importc_smoke." + label + ".compile.log"))
+                                                               os.JoinPath(outDir, strutil.Join(["udp_importc_smoke.", label, ".compile.log"], "")))
     if compileRc != 0:
         return compileRc
     let run = BackendDriverRunCompiled(rootDir,
-                                        "run-udp-importc-smoke-" + label,
+                                        strutil.Join(["run-udp-importc-smoke-", label], ""),
                                         outputPath,
-                                        os.JoinPath(outDir, "udp_importc_smoke." + label + ".run.log"),
+                                        os.JoinPath(outDir, strutil.Join(["udp_importc_smoke.", label, ".run.log"], "")),
                                         true)
     if !hostops.LoggedRunOk(run):
         return run.exitCode
@@ -2697,7 +2710,7 @@ fn BackendDriverRunProfileRun(rootDir: str,
         workspaceRoot = chengpath.PathAbsolute(rootDir, rootFlag)
     let target = strutil.Strip(creq.CompilerReadFlagOrDefault(args, "--target", "arm64-apple-darwin"))
     if target != "arm64-apple-darwin":
-        BackendDriverPrintErr("backend driver profile-run: local runnable target required: " + target)
+        BackendDriverPrintErr(strutil.Join(["backend driver profile-run: local runnable target required: ", target], ""))
         return 1
     let emit = strutil.Strip(creq.CompilerReadFlagOrDefault(args, "--emit", "exe"))
     if len(emit) > 0 && emit != "exe":
@@ -2705,7 +2718,7 @@ fn BackendDriverRunProfileRun(rootDir: str,
         return 1
     let sourcePath = chengpath.PathAbsolute(workspaceRoot, sourceRaw)
     if !chengpath.FileExistsNonEmpty(workspaceRoot, sourcePath):
-        BackendDriverPrintErr("backend driver profile-run: missing source: " + sourcePath)
+        BackendDriverPrintErr(strutil.Join(["backend driver profile-run: missing source: ", sourcePath], ""))
         return 1
     let outFlag = strutil.Strip(creq.CompilerReadFlagOrDefault(args, "--out", ""))
     var outputPath = ""
@@ -2720,18 +2733,18 @@ fn BackendDriverRunProfileRun(rootDir: str,
     if reportFlagLen > 0:
         reportPath = chengpath.PathAbsolute(workspaceRoot, reportFlag)
     else:
-        reportPath = outputPath + ".profile.txt"
+        reportPath = strutil.Join([outputPath, ".profile.txt"], "")
     let rawReportPath = debuggate.DebugToolsProfileRawPathFromReport(reportPath)
-    let compileLog = outputPath + ".compile.log"
-    let runLog = outputPath + ".run.log"
-    let profileReportLog = outputPath + ".profile-report.log"
+    let compileLog = strutil.Join([outputPath, ".compile.log"], "")
+    let runLog = strutil.Join([outputPath, ".run.log"], "")
+    let profileReportLog = strutil.Join([outputPath, ".profile-report.log"], "")
     if !BackendDriverEnsureParentDir(workspaceRoot, outputPath) ||
        !BackendDriverEnsureParentDir(workspaceRoot, reportPath) ||
        !BackendDriverEnsureParentDir(workspaceRoot, rawReportPath):
         BackendDriverPrintErr("backend driver profile-run: failed to create output dirs")
         return 1
     BackendDriverRemoveFileIfExists(outputPath)
-    BackendDriverRemoveFileIfExists(outputPath + ".map")
+    BackendDriverRemoveFileIfExists(strutil.Join([outputPath, ".map"], ""))
     BackendDriverRemoveFileIfExists(reportPath)
     BackendDriverRemoveFileIfExists(rawReportPath)
     BackendDriverRemoveFileIfExists(compileLog)
@@ -2739,15 +2752,15 @@ fn BackendDriverRunProfileRun(rootDir: str,
     BackendDriverRemoveFileIfExists(profileReportLog)
     let compilerPath = chengpath.PathAbsolute(rootDir, "artifacts/backend_driver/cheng")
     if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
-        BackendDriverPrintErr("backend driver profile-run: missing compiler: " + compilerPath)
+        BackendDriverPrintErr(strutil.Join(["backend driver profile-run: missing compiler: ", compilerPath], ""))
         return 1
     var compileArgs: str[]
     add(compileArgs, "system-link-exec")
-    add(compileArgs, "--root:" + workspaceRoot)
-    add(compileArgs, "--in:" + sourcePath)
+    add(compileArgs, strutil.Join(["--root:", workspaceRoot], ""))
+    add(compileArgs, strutil.Join(["--in:", sourcePath], ""))
     add(compileArgs, "--emit:exe")
     add(compileArgs, "--target:arm64-apple-darwin")
-    add(compileArgs, "--out:" + outputPath)
+    add(compileArgs, strutil.Join(["--out:", outputPath], ""))
     let compileRun = hostops.RunFileLogged(rootDir,
                                              "backend_driver_profile_run_compile",
                                              compilerPath,
@@ -2762,12 +2775,12 @@ fn BackendDriverRunProfileRun(rootDir: str,
             BackendDriverPrintErr(outputText)
         return compileRun.exitCode
     if !chengpath.FileExistsNonEmpty(workspaceRoot, outputPath):
-        BackendDriverPrintErr("backend driver profile-run: compile missing output: " + outputPath)
+        BackendDriverPrintErr(strutil.Join(["backend driver profile-run: compile missing output: ", outputPath], ""))
         return 1
     var runEnv: str[]
     add(runEnv, "CHENG_PROFILE_ENABLE=1")
-    add(runEnv, "CHENG_PROFILE_RAW_OUT=" + rawReportPath)
-    add(runEnv, "CHENG_PROFILE_HZ=" + creq.CompilerReadFlagOrDefault(args, "--profile-hz", "200"))
+    add(runEnv, strutil.Join(["CHENG_PROFILE_RAW_OUT=", rawReportPath], ""))
+    add(runEnv, strutil.Join(["CHENG_PROFILE_HZ=", creq.CompilerReadFlagOrDefault(args, "--profile-hz", "200")], ""))
     let profiledRun = hostops.RunFileLogged(rootDir,
                                              "backend_driver_profile_run_exec",
                                              outputPath,
@@ -2782,17 +2795,17 @@ fn BackendDriverRunProfileRun(rootDir: str,
             BackendDriverPrintErr(outputText)
         return profiledRun.exitCode
     if !chengpath.FileExistsNonEmpty(workspaceRoot, rawReportPath):
-        BackendDriverPrintErr("backend driver profile-run: missing raw profile report: " + rawReportPath)
+        BackendDriverPrintErr(strutil.Join(["backend driver profile-run: missing raw profile report: ", rawReportPath], ""))
         return 1
     let rawText = chengpath.ReadTextFile(workspaceRoot, rawReportPath)
     let reportRes = debuggate.DebugToolsProfileReportText(rawText)
     if IsErr(reportRes):
-        let _ = chengpath.WriteTextFile(workspaceRoot, profileReportLog, Error(reportRes) + "\n")
+        let _ = chengpath.WriteTextFile(workspaceRoot, profileReportLog, strutil.Join([Error(reportRes), "\n"], ""))
         BackendDriverPrintErr(Error(reportRes))
         return 1
     let report = Value(reportRes)
     if !chengpath.WriteTextFile(workspaceRoot, reportPath, report):
-        BackendDriverPrintErr("backend driver profile-run: failed to write report: " + reportPath)
+        BackendDriverPrintErr(strutil.Join(["backend driver profile-run: failed to write report: ", reportPath], ""))
         return 1
     BackendDriverPrintLine(strutil.Strip(report))
     return 0
@@ -2804,12 +2817,12 @@ fn BackendDriverVerifyDebugProfile(rootDir: str): int32 =
     let report = os.JoinPath(outDir, "profile.txt")
     let rawReport = debuggate.DebugToolsProfileRawPathFromReport(report)
     var args: str[]
-    add(args, "--root:" + rootDir)
-    add(args, "--in:" + src)
+    add(args, strutil.Join(["--root:", rootDir], ""))
+    add(args, strutil.Join(["--in:", src], ""))
     add(args, "--emit:exe")
     add(args, "--target:arm64-apple-darwin")
-    add(args, "--out:" + outBin)
-    add(args, "--report-out:" + report)
+    add(args, strutil.Join(["--out:", outBin], ""))
+    add(args, strutil.Join(["--report-out:", report], ""))
     add(args, "--profile-hz:200")
     let run = BackendDriverRunProfileRun(rootDir, args)
     if run != 0:
@@ -2884,7 +2897,7 @@ fn BackendDriverCacheSourceFileCid(pathRaw: str): Result[layout.FixedBytes32] =
     if len(path) <= 0:
         return Err[layout.FixedBytes32](" backend driver system-link-exec cache: empty source path")
     if !chengpath.PathFileExists(path):
-        return Err[layout.FixedBytes32](" backend driver system-link-exec cache: missing source path: " + path)
+        return Err[layout.FixedBytes32](Fmt" backend driver system-link-exec cache: missing source path: {path}")
     return Ok[layout.FixedBytes32](BackendDriverCacheHashText(chengpath.ReadTextFile("", path)))
 
 fn BackendDriverCacheAppendSourceFile(buf: var layout.ByteBuf,
@@ -2956,7 +2969,7 @@ fn BackendDriverCacheResolveTargetCc(targetTriple: str): Result[str] =
         return Ok[str]("wasm32-internal-primary-writer")
     if strings.StrContains(targetTriple, "android") ||
        strings.StrContains(targetTriple, "ohos"):
-        return Err[str](" backend driver system-link-exec cache: target cc resolver not available in driver: " + targetTriple)
+        return Err[str](Fmt" backend driver system-link-exec cache: target cc resolver not available in driver: {targetTriple}")
     let cc = os.GetEnv("CC")
     if len(cc) > 0:
         return Ok[str](cc)
@@ -2970,9 +2983,9 @@ fn BackendDriverCacheSafeTarget(targetTriple: str): str =
         let upper = ch >= 'A' && ch <= 'Z'
         let lower = ch >= 'a' && ch <= 'z'
         if digit || upper || lower:
-            out = out + chengpath.TextSlice(targetTriple, i, 1)
+            out = Fmt"{out}{chengpath.TextSlice(targetTriple, i, 1)}"
         else:
-            out = out + "_"
+            out = Fmt"{out}_"
     return out
 
 fn BackendDriverSystemLinkExecCacheEnabled(): bool =
@@ -2997,7 +3010,7 @@ fn BackendDriverSystemLinkExecNeedMap(plan: slplan.SystemLinkPlanStub): bool =
     return !BackendDriverTruthyEnv("CHENG_SKIP_SEED_LINE_MAP")
 
 fn BackendDriverSystemLinkExecMapPath(outputPath: str): str =
-    return outputPath + ".map"
+    return Fmt"{outputPath}.map"
 
 fn BackendDriverSystemLinkExecCacheKey(rootDir: str,
                                          plan: slplan.SystemLinkPlanStub,
@@ -3051,7 +3064,7 @@ fn BackendDriverSystemLinkExecCacheSourceBundleCid(plan: slplan.SystemLinkPlanSt
     for i in 0..<sourceClosurePaths.len:
         let sourcePath = sourceClosurePaths[i]
         if !chengpath.PathFileExists(sourcePath):
-            return Err[layout.FixedBytes32](" backend driver system-link-exec cache: missing source path: " + sourcePath)
+            return Err[layout.FixedBytes32](Fmt" backend driver system-link-exec cache: missing source path: {sourcePath}")
         BackendDriverCacheAppendText(buf, sourcePath)
         BackendDriverCacheAppendText(buf, chengpath.ReadTextFile("", sourcePath))
     return Ok[layout.FixedBytes32](hash256.sha256Fixed(layout.ByteBufView(buf)))
@@ -3065,12 +3078,12 @@ fn BackendDriverSystemLinkExecCacheDir(rootDir: str,
 fn BackendDriverSystemLinkExecCacheExePath(rootDir: str,
                                              plan: slplan.SystemLinkPlanStub,
                                              key: str): str =
-    return chengpath.PathJoin(BackendDriverSystemLinkExecCacheDir(rootDir, plan), key + ".exe")
+    return chengpath.PathJoin(BackendDriverSystemLinkExecCacheDir(rootDir, plan), Fmt"{key}.exe")
 
 fn BackendDriverSystemLinkExecCacheMapPath(rootDir: str,
                                              plan: slplan.SystemLinkPlanStub,
                                              key: str): str =
-    return chengpath.PathJoin(BackendDriverSystemLinkExecCacheDir(rootDir, plan), key + ".map")
+    return chengpath.PathJoin(BackendDriverSystemLinkExecCacheDir(rootDir, plan), Fmt"{key}.map")
 
 fn BackendDriverCopyFileBytes(rootDir: str,
                                 sourcePath: str,
@@ -3089,7 +3102,7 @@ fn BackendDriverCopyFileBytes(rootDir: str,
 
 fn BackendDriverChmodExecutable(rootDir: str,
                                   outputPath: str): bool =
-    let logPath = outputPath + ".cache_chmod.log"
+    let logPath = Fmt"{outputPath}.cache_chmod.log"
     let run = hostops.RunProgramLogged(rootDir,
                                         "backend_driver_system_link_exec_cache_chmod",
                                         "chmod",
@@ -3107,32 +3120,32 @@ fn BackendDriverSystemLinkExecCacheHitReport(plan: slplan.SystemLinkPlanStub,
                                                cacheMapPath: str,
                                                outputPath: str): str =
     var out = slplan.SystemLinkPlanStubReport(plan)
-    out = out + "\nsource_bundle_cid=" + layout.FixedBytes32Hex(sourceBundleCid)
-    out = out + "\nbackend_driver_system_link_exec_cache_restore=1"
-    out = out + "\nsystem_link_exec_cache_version=" + BackendDriverSystemLinkExecCacheVersion
-    out = out + "\nsystem_link_exec_cache_key=" + key
-    out = out + "\nsystem_link_exec_cache_output=" + cacheExePath
-    out = out + "\nsystem_link_exec_cache_map=" + cacheMapPath
-    out = out + "\nsystem_link_exec_cache_hit_count=1"
-    out = out + "\nsystem_link_exec_cache_miss_count=0"
-    out = out + "\nexec_phase_system_link_exec_cache_lookup_ms=0"
-    out = out + "\nexec_phase_system_link_exec_cache_copy_ms=0"
-    out = out + "\nexec_phase_lowering_plan_ms=0"
-    out = out + "\nexec_phase_primary_object_plan_ms=0"
-    out = out + "\nexec_phase_provider_objects_ms=0"
-    out = out + "\nexec_phase_primary_object_emit_ms=0"
-    out = out + "\nexec_phase_primary_object_asm_compile_ms=0"
-    out = out + "\nexec_phase_native_link_ms=0"
-    out = out + "\nexec_phase_line_map_ms=0"
-    out = out + "\nexec_pipeline_stage=system_link_exec_cache_hit"
+    out = Fmt"{out}\nsource_bundle_cid={layout.FixedBytes32Hex(sourceBundleCid)}"
+    out = Fmt"{out}\nbackend_driver_system_link_exec_cache_restore=1"
+    out = Fmt"{out}\nsystem_link_exec_cache_version={BackendDriverSystemLinkExecCacheVersion}"
+    out = Fmt"{out}\nsystem_link_exec_cache_key={key}"
+    out = Fmt"{out}\nsystem_link_exec_cache_output={cacheExePath}"
+    out = Fmt"{out}\nsystem_link_exec_cache_map={cacheMapPath}"
+    out = Fmt"{out}\nsystem_link_exec_cache_hit_count=1"
+    out = Fmt"{out}\nsystem_link_exec_cache_miss_count=0"
+    out = Fmt"{out}\nexec_phase_system_link_exec_cache_lookup_ms=0"
+    out = Fmt"{out}\nexec_phase_system_link_exec_cache_copy_ms=0"
+    out = Fmt"{out}\nexec_phase_lowering_plan_ms=0"
+    out = Fmt"{out}\nexec_phase_primary_object_plan_ms=0"
+    out = Fmt"{out}\nexec_phase_provider_objects_ms=0"
+    out = Fmt"{out}\nexec_phase_primary_object_emit_ms=0"
+    out = Fmt"{out}\nexec_phase_primary_object_asm_compile_ms=0"
+    out = Fmt"{out}\nexec_phase_native_link_ms=0"
+    out = Fmt"{out}\nexec_phase_line_map_ms=0"
+    out = Fmt"{out}\nexec_pipeline_stage=system_link_exec_cache_hit"
     if len(outputPath) > 0:
-        out = out + "\ndebug_line_map_path=" + BackendDriverSystemLinkExecMapPath(outputPath)
+        out = Fmt"{out}\ndebug_line_map_path={BackendDriverSystemLinkExecMapPath(outputPath)}"
     return out
 
 fn BackendDriverSystemLinkExecCacheMiss(rootDir: str,
                                           reason: str): int32 =
     if BackendDriverTruthyEnv(BackendDriverSystemLinkExecCacheRequireHitEnv):
-        BackendDriverPrintErr("backend driver system-link-exec cache miss: " + reason)
+        BackendDriverPrintErr(Fmt"backend driver system-link-exec cache miss: {reason}")
         return 2
     return -1
 
@@ -3168,19 +3181,19 @@ fn BackendDriverTryRestoreSystemLinkExecCache(rootDir: str,
     let outputPath = chengpath.PathAbsolute(rootDir, slplan.SystemLinkPlanOutputPath(plan))
     let outputMapPath = BackendDriverSystemLinkExecMapPath(outputPath)
     if !chengpath.FileExistsNonEmpty(rootDir, cacheExePath):
-        var reason = "missing cached exe: " + cacheExePath
+        var reason = Fmt"missing cached exe: {cacheExePath}"
         if BackendDriverTruthyEnv(BackendDriverSystemLinkExecCacheRequireHitEnv):
             let codegenDebugRes = BackendDriverCacheCodegenCid(rootDir)
-            reason = reason + " key=" + key
-            reason = reason + " source_bundle=" + layout.FixedBytes32Hex(Value(sourceBundleRes))
+            reason = Fmt"{reason} key={key}"
+            reason = Fmt"{reason} source_bundle={layout.FixedBytes32Hex(Value(sourceBundleRes))}"
             if !IsErr(codegenDebugRes):
-                reason = reason + " codegen=" + layout.FixedBytes32Hex(Value(codegenDebugRes))
-            reason = reason + " package_id=" + slplan.SystemLinkPlanPackageId(plan)
-            reason = reason + " source_paths=" + slplan.SystemLinkPlanListText(slplan.SystemLinkPlanSourceClosurePaths(plan))
+                reason = Fmt"{reason} codegen={layout.FixedBytes32Hex(Value(codegenDebugRes))}"
+            reason = Fmt"{reason} package_id={slplan.SystemLinkPlanPackageId(plan)}"
+            reason = Fmt"{reason} source_paths={slplan.SystemLinkPlanListText(slplan.SystemLinkPlanSourceClosurePaths(plan))}"
         return BackendDriverSystemLinkExecCacheMiss(rootDir, reason)
     if BackendDriverSystemLinkExecNeedMap(plan) &&
        !chengpath.FileExistsNonEmpty(rootDir, cacheMapPath):
-        return BackendDriverSystemLinkExecCacheMiss(rootDir, "missing cached map: " + cacheMapPath)
+        return BackendDriverSystemLinkExecCacheMiss(rootDir, Fmt"missing cached map: {cacheMapPath}")
     if !BackendDriverCopyFileBytes(rootDir, cacheExePath, outputPath):
         BackendDriverPrintErr("backend driver system-link-exec cache: failed to copy exe")
         return 1
@@ -3199,7 +3212,7 @@ fn BackendDriverTryRestoreSystemLinkExecCache(rootDir: str,
                                                                cacheMapPath,
                                                                outputPath)
         if !chengpath.WriteTextFile(rootDir, req.reportPath, report):
-            BackendDriverPrintErr("backend driver system-link-exec cache: failed to write report: " + req.reportPath)
+            BackendDriverPrintErr(Fmt"backend driver system-link-exec cache: failed to write report: {req.reportPath}")
             return 1
     return 0
 
@@ -3209,23 +3222,23 @@ fn BackendDriverStoreSystemLinkExecCache(rootDir: str,
         return true
     let reqRes = creq.CompilerRequestFromArgs(rootDir, args)
     if IsErr(reqRes):
-        BackendDriverPrintErr("backend driver system-link-exec cache store: " + Error(reqRes))
+        BackendDriverPrintErr(Fmt"backend driver system-link-exec cache store: {Error(reqRes)}")
         return false
     var plan: slplan.SystemLinkPlanStub
     var err = ""
     let req = BackendDriverRequestWithAbsoluteSourcePath(rootDir, Value(reqRes))
     if !slplan.BuildSystemLinkPlanStub(rootDir, req, plan, err):
-        BackendDriverPrintErr("backend driver system-link-exec cache store: " + err)
+        BackendDriverPrintErr(Fmt"backend driver system-link-exec cache store: {err}")
         return false
     if !BackendDriverSystemLinkExecCacheSupported(plan):
         return true
     let sourceBundleRes = BackendDriverSystemLinkExecCacheSourceBundleCid(plan)
     if IsErr(sourceBundleRes):
-        BackendDriverPrintErr("backend driver system-link-exec cache store: " + Error(sourceBundleRes))
+        BackendDriverPrintErr(Fmt"backend driver system-link-exec cache store: {Error(sourceBundleRes)}")
         return false
     let keyRes = BackendDriverSystemLinkExecCacheKey(rootDir, plan, Value(sourceBundleRes))
     if IsErr(keyRes):
-        BackendDriverPrintErr("backend driver system-link-exec cache store: " + Error(keyRes))
+        BackendDriverPrintErr(Fmt"backend driver system-link-exec cache store: {Error(keyRes)}")
         return false
     let key = Value(keyRes)
     let outputPath = chengpath.PathAbsolute(rootDir, slplan.SystemLinkPlanOutputPath(plan))
@@ -3234,30 +3247,30 @@ fn BackendDriverStoreSystemLinkExecCache(rootDir: str,
     let cacheExePath = BackendDriverSystemLinkExecCacheExePath(rootDir, plan, key)
     let cacheMapPath = BackendDriverSystemLinkExecCacheMapPath(rootDir, plan, key)
     if !chengpath.MkdirP(rootDir, cacheDir):
-        BackendDriverPrintErr("backend driver system-link-exec cache store: failed to create cache dir: " + cacheDir)
+        BackendDriverPrintErr(Fmt"backend driver system-link-exec cache store: failed to create cache dir: {cacheDir}")
         return false
     if !chengpath.FileExistsNonEmpty(rootDir, outputPath):
-        BackendDriverPrintErr("backend driver system-link-exec cache store: missing output: " + outputPath)
+        BackendDriverPrintErr(Fmt"backend driver system-link-exec cache store: missing output: {outputPath}")
         return false
     if !BackendDriverCopyFileBytes(rootDir, outputPath, cacheExePath):
-        BackendDriverPrintErr("backend driver system-link-exec cache store: failed to copy exe: " + cacheExePath)
+        BackendDriverPrintErr(Fmt"backend driver system-link-exec cache store: failed to copy exe: {cacheExePath}")
         return false
     if BackendDriverSystemLinkExecNeedMap(plan):
         if !chengpath.FileExistsNonEmpty(rootDir, outputMapPath):
-            BackendDriverPrintErr("backend driver system-link-exec cache store: missing map: " + outputMapPath)
+            BackendDriverPrintErr(Fmt"backend driver system-link-exec cache store: missing map: {outputMapPath}")
             return false
         if !BackendDriverCopyFileBytes(rootDir, outputMapPath, cacheMapPath):
-            BackendDriverPrintErr("backend driver system-link-exec cache store: failed to copy map: " + cacheMapPath)
+            BackendDriverPrintErr(Fmt"backend driver system-link-exec cache store: failed to copy map: {cacheMapPath}")
             return false
     if len(req.reportPath) > 0 && chengpath.PathFileExists(req.reportPath):
         var report = chengpath.ReadTextFile("", req.reportPath)
-        report = report + "\nbackend_driver_system_link_exec_cache_store=1"
-        report = report + "\nsystem_link_exec_cache_version=" + BackendDriverSystemLinkExecCacheVersion
-        report = report + "\nsystem_link_exec_cache_key=" + key
-        report = report + "\nsystem_link_exec_cache_output=" + cacheExePath
-        report = report + "\nsystem_link_exec_cache_map=" + cacheMapPath
+        report = Fmt"{report}\nbackend_driver_system_link_exec_cache_store=1"
+        report = Fmt"{report}\nsystem_link_exec_cache_version={BackendDriverSystemLinkExecCacheVersion}"
+        report = Fmt"{report}\nsystem_link_exec_cache_key={key}"
+        report = Fmt"{report}\nsystem_link_exec_cache_output={cacheExePath}"
+        report = Fmt"{report}\nsystem_link_exec_cache_map={cacheMapPath}"
         if !chengpath.WriteTextFile(rootDir, req.reportPath, report):
-            BackendDriverPrintErr("backend driver system-link-exec cache store: failed to update report: " + req.reportPath)
+            BackendDriverPrintErr(Fmt"backend driver system-link-exec cache store: failed to update report: {req.reportPath}")
             return false
     return true
 
@@ -3270,13 +3283,20 @@ fn BackendDriverWritePureSystemLinkExecReport(rootDir: str,
                                                 runtimeReport: str): bool =
     if len(reportPath) <= 0:
         return true
+    let tracePath = strutil.Strip(os.GetEnv("CHENG_SYSTEM_LINK_EXEC_REPORT_TRACE"))
+    if len(tracePath) > 0:
+        let _ = chengpath.WriteTextFile(rootDir, tracePath, "before_plan_report")
     if !BackendDriverEnsureParentDir(rootDir, reportPath):
         return false
     var report = sexec.SystemLinkExecPlanReport(plan)
+    if len(tracePath) > 0:
+        let _ = chengpath.WriteTextFile(rootDir, tracePath, "after_plan_report")
     if len(runtimeReport) > 0:
         if len(report) > 0 && report[len(report) - 1] != '\n':
-            report = Fmt([report, "\n"])
-        report = Fmt([report, runtimeReport])
+            report = Fmt"{report}\n"
+        report = Fmt"{report}{runtimeReport}"
+    if len(tracePath) > 0:
+        let _ = chengpath.WriteTextFile(rootDir, tracePath, "before_write_report")
     return chengpath.WriteTextFile(rootDir, reportPath, report)
 
 fn BackendDriverPureSystemLinkExecUnsupported(rootDir: str,
@@ -3304,34 +3324,25 @@ fn BackendDriverTryRunPureSystemLinkExec(rootDir: str,
         return BackendDriverPureSystemLinkExecUnsupported(rootDir, Error(planRes))
     let plan = Value(planRes)
     if !sexec.SystemLinkExecPlanReady(plan):
-        BackendDriverPrintErr(Fmt(["backend driver pure system-link-exec: system missing=",
-                                   slplan.SystemLinkPlanListText(plan.systemLinkPlan.missingReasons)]))
-        BackendDriverPrintErr(Fmt(["backend driver pure system-link-exec: lowering missing=",
-                                   slplan.SystemLinkPlanListText(plan.loweringPlan.missingReasons)]))
-        BackendDriverPrintErr(Fmt(["backend driver pure system-link-exec: primary missing=",
-                                   slplan.SystemLinkPlanListText(plan.primaryObjectPlan.missingReasons)]))
-        BackendDriverPrintErr(Fmt(["backend driver pure system-link-exec: primary first_missing_function=",
-                                   plan.primaryObjectPlan.firstMissingFunction]))
-        BackendDriverPrintErr(Fmt(["backend driver pure system-link-exec: primary first_missing_body_kind=",
-                                   plan.primaryObjectPlan.firstMissingBodyKind]))
-        BackendDriverPrintErr(Fmt(["backend driver pure system-link-exec: primary first_missing_typed_ir_kind=",
-                                   plan.primaryObjectPlan.firstMissingTypedIrKind]))
-        BackendDriverPrintErr(Fmt(["backend driver pure system-link-exec: primary first_missing_line_number=",
-                                   intToStr(plan.primaryObjectPlan.firstMissingLineNumber)]))
-        BackendDriverPrintErr(Fmt(["backend driver pure system-link-exec: object missing=",
-                                   slplan.SystemLinkPlanListText(plan.objectPlan.missingReasons)]))
-        BackendDriverPrintErr(Fmt(["backend driver pure system-link-exec: native missing=",
-                                   slplan.SystemLinkPlanListText(plan.nativeLinkPlan.missingReasons)]))
+        BackendDriverPrintErr(Fmt"backend driver pure system-link-exec: system missing={slplan.SystemLinkPlanListText(plan.systemLinkPlan.missingReasons)}")
+        BackendDriverPrintErr(Fmt"backend driver pure system-link-exec: lowering missing={slplan.SystemLinkPlanListText(plan.loweringPlan.missingReasons)}")
+        BackendDriverPrintErr(Fmt"backend driver pure system-link-exec: primary missing={slplan.SystemLinkPlanListText(plan.primaryObjectPlan.missingReasons)}")
+        BackendDriverPrintErr(Fmt"backend driver pure system-link-exec: primary first_missing_function={plan.primaryObjectPlan.firstMissingFunction}")
+        BackendDriverPrintErr(Fmt"backend driver pure system-link-exec: primary first_missing_body_kind={plan.primaryObjectPlan.firstMissingBodyKind}")
+        BackendDriverPrintErr(Fmt"backend driver pure system-link-exec: primary first_missing_typed_ir_kind={plan.primaryObjectPlan.firstMissingTypedIrKind}")
+        BackendDriverPrintErr(Fmt"backend driver pure system-link-exec: primary first_missing_line_number={intToStr(plan.primaryObjectPlan.firstMissingLineNumber)}")
+        BackendDriverPrintErr(Fmt"backend driver pure system-link-exec: object missing={slplan.SystemLinkPlanListText(plan.objectPlan.missingReasons)}")
+        BackendDriverPrintErr(Fmt"backend driver pure system-link-exec: native missing={slplan.SystemLinkPlanListText(plan.nativeLinkPlan.missingReasons)}")
         let _ = BackendDriverWritePureSystemLinkExecReport(rootDir,
                                                            req.reportPath,
                                                            plan,
                                                            "system_link_exec_runtime_execute=0")
-        return BackendDriverPureSystemLinkExecUnsupported(rootDir,
-                                                         "backend driver pure system-link-exec: plan not ready")
+        BackendDriverPrintErr("backend driver pure system-link-exec: plan not ready")
+        return 2
     let browserBridgeObjectPath = sexec.SystemLinkExecBrowserBridgeObjectPath(plan)
     if len(browserBridgeObjectPath) > 0:
-        return BackendDriverPureSystemLinkExecUnsupported(rootDir,
-                                                         "backend driver pure system-link-exec: browser bridge object not yet in pure runtime")
+        BackendDriverPrintErr("backend driver pure system-link-exec: browser bridge object not yet in pure runtime")
+        return 2
     let providerCompilerPath: str = BackendDriverCurrentExecutablePath(rootDir)
     let execRes = sexecrt.SystemLinkExecRuntimeExecutePlanWithCompiler(rootDir,
                                                                        plan,
@@ -3340,13 +3351,12 @@ fn BackendDriverTryRunPureSystemLinkExec(rootDir: str,
         let _ = BackendDriverWritePureSystemLinkExecReport(rootDir,
                                                            req.reportPath,
                                                            plan,
-                                                           Fmt(["system_link_exec_runtime_execute=error\n",
-                                                                Error(execRes)]))
+                                                           Fmt"system_link_exec_runtime_execute=error\n{Error(execRes)}")
         BackendDriverPrintErr(Error(execRes))
         return 2
     let runtimeReport = sexecrt.SystemLinkExecRuntimeResultReport(Value(execRes))
     if !BackendDriverWritePureSystemLinkExecReport(rootDir, req.reportPath, plan, runtimeReport):
-        BackendDriverPrintErr(Fmt(["backend driver pure system-link-exec: failed to write report: ", req.reportPath]))
+        BackendDriverPrintErr(Fmt"backend driver pure system-link-exec: failed to write report: {req.reportPath}")
         return 1
     return 0
 
@@ -3393,13 +3403,8 @@ fn BackendDriverStatus(rootDir: str) =
     BackendDriverPrintKeyValue("ordinary_pipeline", contract.ordinaryPipelineState)
     BackendDriverPrintKeyValue("stage3", BackendDriverStage3Path(rootDir))
 
-fn BackendDriverMain(): int32 =
-    let rootDir = BackendDriverRoot()
-    BackendDriverEnsureRootEnv(rootDir)
-    let count = BackendDriverParamCountBridge()
-    if count <= 0:
-        BackendDriverUsage(rootDir)
-        return 0
+fn BackendDriverMainDispatch(rootDir: str,
+                              count: int32): int32 =
     let cmd = BackendDriverParamStr(1)
     let args = BackendDriverCollectArgsFrom(2, count)
     if len(cmd) > 0:
@@ -3530,19 +3535,20 @@ fn BackendDriverMain(): int32 =
         if cmd == "run-cross-target-smokes":
             return BackendDriverForward(rootDir, cmd, args)
         if cmd == "system-link-exec":
-            let cacheRc = BackendDriverTryRestoreSystemLinkExecCache(rootDir, args)
-            if cacheRc >= 0:
-                return cacheRc
             let pureRc = BackendDriverTryRunPureSystemLinkExec(rootDir, args)
-            if pureRc >= 0:
-                if pureRc == 0 && !BackendDriverStoreSystemLinkExecCache(rootDir, args):
-                    return 1
-                return pureRc
-            let forwardRc = BackendDriverForward(rootDir, cmd, args)
-            if forwardRc == 0 && !BackendDriverStoreSystemLinkExecCache(rootDir, args):
+            if pureRc == 0 && !BackendDriverStoreSystemLinkExecCache(rootDir, args):
                 return 1
-            return forwardRc
+            return pureRc
     return BackendDriverForward(rootDir, cmd, args)
+
+fn BackendDriverMain(): int32 =
+    let rootDir = BackendDriverRoot()
+    BackendDriverEnsureRootEnv(rootDir)
+    let count = BackendDriverParamCountBridge()
+    if count <= 0:
+        BackendDriverUsage(rootDir)
+        return 0
+    return BackendDriverMainDispatch(rootDir, count)
 
 fn main(argc: int32, argv: str*): int32 =
     return BackendDriverMain()

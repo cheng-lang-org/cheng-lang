@@ -44,10 +44,10 @@
 - 当前 Cheng 复合实参 ABI 仍是“callee 直接借 caller frame 里的 call temp 地址”；这类 call temp 不能在调用返回后立刻 release/zero，必须等 caller 函数 epilogue 和普通 local 一起回收，否则会提前打断仍然活着的 borrow。
 - 用户明确要求“从 seed 迁到纯 Cheng 最小 seed”时，优先迁走 `std` 语义和 runtime shim；不要因为自举方便继续把 `Fmt/$` 一类库行为补进 `cheng_seed.c`。
 - `$` 的公开表面只保留直接写法：简单值支持 `$box`，复杂表达式支持 `$(expr)`；不要再把反引号 `` `$` `` 当用户语法往前推，纯 Cheng 前端负责降糖，seed 只保留兼容。
-- Cheng 字符串输出统一用 `Fmt`，但大 CLI/test 闭包里不要写单个超长 `Fmt`；稳定写法是多个小 `Fmt"..."` 片段用 `out = Fmt([out, part])` 增量组合后再 `echo`。
+- Cheng 字符串输出只保留 Nim 风格 `Fmt"..."`；大 CLI/test 闭包里不要写单个超长模板，稳定写法是多个小 `Fmt"{out}..."` 片段增量组合后再 `echo`。
 - 多个 `artifacts/bootstrap/cheng.stage3 system-link-exec` 编译应支持并行；若并发出现无诊断 `-1`，优先修共享输出、cache 或 artifact 冲突，不能用全局串行掩盖。
 - wowExport 处理 CDN root/BLTE/zlib 时不要先全量解码再扫表；真实 root 会放大到 49MB encoded / 65MB decoded，必须按 BLTE block range 解码、批量 root lookup，并用 bit-buffer + 小型 Huffman fast table 控制时间和内存。
-- wowExport CLI 可见的摘要函数要保持非常简单；优先用小段 `Fmt"..."`，并逐步 `out = Fmt([out, part])`，不要把整行摘要写成单个巨大 `Fmt` 或一条 return。
+- wowExport CLI 可见的摘要函数要保持非常简单；优先用小段 `Fmt"..."`，并逐步 `out = Fmt"{out}{part}"`，不要把整行摘要写成单个巨大 `Fmt` 或一条 return。
 - 发现 `runtime_zero` / `run-browser-host-wasm-smoke` 外部门禁派生长进程链时，先按 label 精准停止并清空进程表，再继续 r2c GUI；不要让这类门禁和 r2c/native GUI 验证并行。
 - r2c GUI smoke 不要每条都现场重编 `src/r2c/r2c_react.cheng` 单体 controller；该入口已足够大，安全做法是复用已存在的 Cheng stage3 `r2c-react` 控制面，并把 per-smoke 编译限制在小 smoke 自身。
 - 砍 r2c native GUI Node helper 时必须同时覆盖 `native-gui-bundle`、`compile` 和 `status` 三个命令面，并扫掉 `node_payload_helper` 这类旧字段名；否则单命令通过但整体状态仍会暴露旧 Node 路径。
@@ -77,7 +77,7 @@
 - r2c 平台壳合同放 runtime 产物和 host-run fields；不要继续往 `r2cControllerRunNativeGui` 的大 report 里堆字段，该函数已贴近 stage3 局部临时上限。
 - r2c smoke 的 artifact 目录不能复用 `/tmp` 可执行输出路径；否则 `MkdirP` 会正确失败。稳定命名用 `<smoke>_artifacts` 目录。
 - host smoke、gate smoke、runtime_zero 这类会触发编译的门禁 RSS 默认统一 8GiB；禁止再写 `34359738368` 这种 32GiB 守卫，必须有静态 smoke 防回潮。
-- Cheng 字符串拼接操作符 `+` 已禁用移除；新增 Cheng 代码必须用 `Fmt"..."`、`Fmt(...)` 或 `Lines(...)` 组合字符串，只把 `+` 用于数值加法。
+- Cheng 字符串拼接操作符 `+` 已禁用移除；新增 Cheng 代码必须用 Nim 风格 `Fmt"..."`、`std/strutils.Join(...)` 或 `Lines(...)` 组合字符串，只把 `+` 用于数值加法，不再新增 `Fmt(parts)`。
 - Cheng 自增/自减计数循环必须写成 `for ... in range`；`while` 只用于非计数型条件循环。
 - 当前 `primary_object_emit` 仍是 `.s` 文本生成再 `cc -c` 产 `.o`；不要把它描述成直接机器 object writer，真正直写 `.o` 必须走 Mach-O/ELF/COFF object writer 主线。
 - backend driver ready freshness 必须跟 `print-build-plan` 的真实 source list 同步；新增 direct object writer 这类 backend 源时，漏进 freshness 会让 `build-backend-driver` 快路径误判 ready。
@@ -116,3 +116,9 @@
 - 无显式类型 `let value = Call()` 的 ABI 类型只能从 typed call fact 进入 lowering；源码里有没有 `: str` 不能作为 primary/object 层的语义依据。
 - 放宽 typed_expr 的 let-call 形状识别时，所有带类型含义的 body kind 都必须在 lowering 处复查 `typeText`，否则会把 inferred/untyped 源码误映射成错误 ABI。
 - 未经端到端验证的更大 statement 切片不能留在 active path 里；即使主线 fixture 不触发，backend driver 自举闭包也会编到 helper/report/predicate，必须先删掉或完整证明后再开放。
+- let-call 复合 body kind 不能放进 leaf body kind 推导里“算出来再返回 unsupported”；leaf 推导只认无 call target 的纯叶子形状，带目标解析的形状必须在 lowering 主流程一次性填 body kind 和 call targets。
+- typed IR 已证明的 statement 形状优先驱动 lowering；`TypedExprFact.typeText` 对 call expr 不稳定，不能作为复合 call-chain ABI 的二次判据。短期最小切片可用 typed 形状行号解析 callee，长期要把 call 序列做成 typed IR 数组而不是 first/second/third/fourth 字段。
+- `str_i32_guard_arg0_return_0` 只是 `str` sret local + int32 guard + 4 call reloc 的最小 witness；它不能代表 `BackendDriverMain` 已完成。`build-backend-driver --require-rebuild` 仍会卡在完整 `BackendDriverMain` 第 3397 行的 `stmt_let_call`，下一步必须做真 statement/CFG lowering。
+- primary object 从四个硬编码 call 槽迁移时，先让 `PrimaryObjectIrFunction` 同步产出 call sequence 数组，并让 plan 的 reachability/target symbol 解析消费数组；旧槽只能做 writer 兼容，不能继续作为扩展方向。
+- 纯 Cheng 自举主线不能继续用源码行字符串扫描扩展 statement 支持；`BackendDriverMain` 的下一步必须消费 parser/typed facts/NormalizedExpr 的结构化 statement/CFG IR。
+- Typed statement IR 构建不能按每个函数扫描全量 facts；必须按 source 分组并用函数行号游标推进，否则 `build-backend-driver` 的 `lowering_plan` 会从约 50 秒退化到 130 秒级。

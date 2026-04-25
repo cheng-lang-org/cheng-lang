@@ -7,6 +7,7 @@ import cheng/libp2p/core/multistream
 import cheng/libp2p/core/types
 import cheng/libp2p/protocols/webrtc_signal as signal
 import cheng/core/runtime/tcp_bridge_abi as tcpabi
+import std/strutils as strutil
 
 @importc("cheng_buffer_handle_len_bridge")
 fn Libp2pWebrtcBufferHandleLenBridge(handle: uint64): int32
@@ -124,43 +125,39 @@ fn Libp2pWebrtcAddrText(addr: types.Libp2pMultiaddr): str =
     if len(addr.raw) > 0:
         return addr.raw
     var out: str = "/ip4/"
-    out = out + addr.host
-    out = out + "/udp/"
-    out = out + intToStr(addr.port)
-    out = out + "/webrtc-direct"
+    out = strutil.Join([out, addr.host], "")
+    out = strutil.Join([out, "/udp/"], "")
+    out = strutil.Join([out, intToStr(addr.port)], "")
+    out = strutil.Join([out, "/webrtc-direct"], "")
     return out
 
 fn Libp2pWebrtcTransportSessionId(addr: types.Libp2pMultiaddr,
                                     label: str): layout.FixedBytes32 =
-    let sessionText = "cheng.libp2p.webrtc.session\n" + Libp2pWebrtcAddrText(addr) + "\n" + label
+    let sessionText = strutil.Join(["cheng.libp2p.webrtc.session\n", Libp2pWebrtcAddrText(addr), "\n", label], "")
     return hash256.sha256Fixed(layout.ByteSpanFromBytes(bytesFromString(sessionText)))
 
 fn Libp2pWebrtcOfferSdp(addr: types.Libp2pMultiaddr,
                           label: str): str =
-    return "v=0\no=- 1 1 IN IP4 " + addr.host + "\n" +
-           "m=application " + intToStr(addr.port) + " UDP/DTLS/SCTP webrtc-datachannel\n" +
-           "a=dcmap:0 label=" + label
+    return strutil.Join(["v=0\no=- 1 1 IN IP4 ", addr.host, "\n", "m=application ", intToStr(addr.port), " UDP/DTLS/SCTP webrtc-datachannel\n", "a=dcmap:0 label=", label], "")
 
 fn Libp2pWebrtcAnswerSdp(sessionId: layout.FixedBytes32,
                            label: str): str =
     let payload = signal.Libp2pWebrtcSignalEncode(signal.Libp2pWebrtcSignalMakeOffer(sessionId, label))
-    return "v=0\no=- 2 2 IN IP4 127.0.0.1\n" +
-           "a=answer-bytes=" + intToStr(bytesLen(payload)) + "\n" +
-           "a=dcmap:0 label=" + label
+    return strutil.Join(["v=0\no=- 2 2 IN IP4 127.0.0.1\n", "a=answer-bytes=", intToStr(bytesLen(payload)), "\n", "a=dcmap:0 label=", label], "")
 
 fn Libp2pWebrtcCandidateText(addr: types.Libp2pMultiaddr,
                                relayOnly: bool,
                                side: str): str =
     var out = "candidate:1 1 udp 2130706431 "
-    out = out + addr.host
-    out = out + " "
-    out = out + intToStr(addr.port)
+    out = strutil.Join([out, addr.host], "")
+    out = strutil.Join([out, " "], "")
+    out = strutil.Join([out, intToStr(addr.port)], "")
     if relayOnly:
-        out = out + " typ relay generation 0 ufrag "
-        out = out + side
+        out = strutil.Join([out, " typ relay generation 0 ufrag "], "")
+        out = strutil.Join([out, side], "")
         return out
-    out = out + " typ host generation 0 ufrag "
-    out = out + side
+    out = strutil.Join([out, " typ host generation 0 ufrag "], "")
+    out = strutil.Join([out, side], "")
     return out
 
 fn Libp2pWebrtcTransportSignalPolicy(cfg: Libp2pWebrtcTransportConfig,
@@ -333,19 +330,19 @@ fn Libp2pWebrtcLoopbackRequestResponse(protocol: types.Libp2pProtocolId,
     var pair: Libp2pWebrtcLoopbackPair
     let openRes = Libp2pWebrtcLoopbackOpenInto(pair, cfg, remoteAddr)
     if IsErr(openRes):
-        return Err[bool](" libp2p webrtc: open: " + ErrorText(openRes))
+        return Err[bool](strutil.Join([" libp2p webrtc: open: ", ErrorText(openRes)], ""))
     let selectRes = Libp2pWebrtcLoopbackSelectProtocol(pair, protocol)
     if IsErr(selectRes):
         Libp2pWebrtcLoopbackClose(pair)
-        return Err[bool](" libp2p webrtc: select: " + ErrorText(selectRes))
+        return Err[bool](strutil.Join([" libp2p webrtc: select: ", ErrorText(selectRes)], ""))
     let requestWriteRes = Libp2pWebrtcLoopbackWriteClient(pair, requestPayload)
     if IsErr(requestWriteRes):
         Libp2pWebrtcLoopbackClose(pair)
-        return Err[bool](" libp2p webrtc: request write: " + ErrorText(requestWriteRes))
+        return Err[bool](strutil.Join([" libp2p webrtc: request write: ", ErrorText(requestWriteRes)], ""))
     let requestReadRes = Libp2pWebrtcLoopbackReadServer(pair, bytesLen(requestPayload))
     if IsErr(requestReadRes):
         Libp2pWebrtcLoopbackClose(pair)
-        return Err[bool](" libp2p webrtc: request read: " + ErrorText(requestReadRes))
+        return Err[bool](strutil.Join([" libp2p webrtc: request read: ", ErrorText(requestReadRes)], ""))
     let serverPayload = Value(requestReadRes)
     if bytesLen(serverPayload) != bytesLen(requestPayload):
         Libp2pWebrtcLoopbackClose(pair)
@@ -353,11 +350,11 @@ fn Libp2pWebrtcLoopbackRequestResponse(protocol: types.Libp2pProtocolId,
     let responseWriteRes = Libp2pWebrtcLoopbackWriteServer(pair, responsePayload)
     if IsErr(responseWriteRes):
         Libp2pWebrtcLoopbackClose(pair)
-        return Err[bool](" libp2p webrtc: response write: " + ErrorText(responseWriteRes))
+        return Err[bool](strutil.Join([" libp2p webrtc: response write: ", ErrorText(responseWriteRes)], ""))
     let responseReadRes = Libp2pWebrtcLoopbackReadClient(pair, bytesLen(responsePayload))
     Libp2pWebrtcLoopbackClose(pair)
     if IsErr(responseReadRes):
-        return Err[bool](" libp2p webrtc: response read: " + ErrorText(responseReadRes))
+        return Err[bool](strutil.Join([" libp2p webrtc: response read: ", ErrorText(responseReadRes)], ""))
     Libp2pWebrtcLoopbackRequestResponseCount = Libp2pWebrtcLoopbackRequestResponseCount + 1
     Libp2pWebrtcRememberStats(pair.signalSession.sessionId,
                                 protocol,
@@ -373,7 +370,7 @@ fn Libp2pWebrtcNativeRequestResponse(protocol: types.Libp2pProtocolId,
     var session: signal.Libp2pWebrtcSignalSession
     let applyRes = signal.Libp2pWebrtcSignalTranscriptApply(session, signalWire)
     if IsErr(applyRes):
-        return Err[bool](" libp2p webrtc: signal transcript: " + ErrorText(applyRes))
+        return Err[bool](strutil.Join([" libp2p webrtc: signal transcript: ", ErrorText(applyRes)], ""))
     if !signal.Libp2pWebrtcSignalSessionReady(session):
         return Err[bool](" libp2p webrtc: signal session not ready")
     let selectBytes = multistream.Libp2pMultistreamSelectBytes(protocol)
@@ -432,7 +429,7 @@ fn Libp2pWebrtcBrowserSessionOpenInto(out: var Libp2pWebrtcBrowserSession,
     if IsErr(applyRes):
         let closeOk = cheng_webrtc_browser_session_close_simple_bridge(handle)
         closeOk
-        return Err[bool](" libp2p webrtc browser: signal transcript: " + ErrorText(applyRes))
+        return Err[bool](strutil.Join([" libp2p webrtc browser: signal transcript: ", ErrorText(applyRes)], ""))
     if !signal.Libp2pWebrtcSignalSessionReady(session):
         let closeOk = cheng_webrtc_browser_session_close_simple_bridge(handle)
         closeOk

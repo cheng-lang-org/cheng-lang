@@ -6,6 +6,8 @@ import cheng/core/backend/object_buffer as obuf
 import cheng/core/backend/object_symbols as osym
 import cheng/core/backend/object_relocs as orel
 import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/lang/typed_expr as texpr
+import std/strutils as strutil
 
 type
     DirectObjectEmitResult =
@@ -16,34 +18,23 @@ type
         directObjectLayoutMs: int64
         directObjectEmitMs: int64
 
-const
-    DirectObjectEmitEntryBridgeWordCount = 17
-    DirectObjectEmitReturnI32ConstPrefix = "return_i32_const_"
-    DirectObjectEmitLetCallNoargReturnI32ConstPrefix = "let_call_noarg_return_i32_const_"
-    DirectObjectEmitLetCallNoargReturnResultI32Kind = "let_call_noarg_return_result_i32"
-    DirectObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind = "let_call_noarg_i32_if_result_le_zero_return_zero_else_result_i32"
-    DirectObjectEmitLetCallNoargStrReturnLenI32Kind = "let_call_noarg_str_return_len_i32"
-    DirectObjectEmitLetCallNoargStrThenCallArg0ReturnI32Const0Kind = "let_call_noarg_str_then_call_arg0_return_i32_const_0"
-    DirectObjectEmitStrI32GuardArg0Return0Kind = "str_i32_guard_arg0_return_0"
-    DirectObjectEmitReturnI32ConstMax = 65535
-
 fn DirectObjectEmitParseReturnI32ConstBodyKind(bodyKind: str): Result[int32] =
-    let prefix = DirectObjectEmitReturnI32ConstPrefix
+    let prefix = texpr.BodyKindReturnI32ConstPrefix
     if len(bodyKind) <= len(prefix):
-        return Err[int32](Fmt([" direct object emit: unsupported return_i32_const body kind: ", bodyKind]))
-    let maxBeforeDigit = DirectObjectEmitReturnI32ConstMax / 10
-    let maxLastDigit = DirectObjectEmitReturnI32ConstMax % 10
+        return Err[int32](strutil.Join([" direct object emit: unsupported return_i32_const body kind: ", bodyKind], ""))
+    let maxBeforeDigit = texpr.BodyKindReturnI32ConstMax / 10
+    let maxLastDigit = texpr.BodyKindReturnI32ConstMax % 10
     for i in 0..<len(prefix):
         if bodyKind[i] != prefix[i]:
-            return Err[int32](Fmt([" direct object emit: unsupported body kind: ", bodyKind]))
+            return Err[int32](strutil.Join([" direct object emit: unsupported body kind: ", bodyKind], ""))
     var value: int32
     for i in len(prefix)..<len(bodyKind):
         let ch = bodyKind[i]
         if ch < '0' || ch > '9':
-            return Err[int32](Fmt([" direct object emit: invalid return_i32_const immediate: ", bodyKind]))
+            return Err[int32](strutil.Join([" direct object emit: invalid return_i32_const immediate: ", bodyKind], ""))
         let digit = int32(ch) - int32('0')
         if value > maxBeforeDigit || (value == maxBeforeDigit && digit > maxLastDigit):
-            return Err[int32](Fmt([" direct object emit: return_i32_const immediate out of range: ", bodyKind]))
+            return Err[int32](strutil.Join([" direct object emit: return_i32_const immediate out of range: ", bodyKind], ""))
         value = value * 10 + digit
     return Ok[int32](value)
 
@@ -51,100 +42,99 @@ fn DirectObjectEmitIsReturnI32ConstBodyKind(bodyKind: str): bool =
     return IsOk(DirectObjectEmitParseReturnI32ConstBodyKind(bodyKind))
 
 fn DirectObjectEmitParseLetCallNoargReturnI32ConstBodyKind(bodyKind: str): Result[int32] =
-    let prefix = DirectObjectEmitLetCallNoargReturnI32ConstPrefix
+    let prefix = texpr.BodyKindLetCallNoargReturnI32ConstPrefix
     if len(bodyKind) <= len(prefix):
-        return Err[int32](Fmt([" direct object emit: unsupported let_call_noarg_return_i32_const body kind: ", bodyKind]))
-    let maxBeforeDigit = DirectObjectEmitReturnI32ConstMax / 10
-    let maxLastDigit = DirectObjectEmitReturnI32ConstMax % 10
+        return Err[int32](strutil.Join([" direct object emit: unsupported let_call_noarg_return_i32_const body kind: ", bodyKind], ""))
+    let maxBeforeDigit = texpr.BodyKindReturnI32ConstMax / 10
+    let maxLastDigit = texpr.BodyKindReturnI32ConstMax % 10
     for i in 0..<len(prefix):
         if bodyKind[i] != prefix[i]:
-            return Err[int32](Fmt([" direct object emit: unsupported body kind: ", bodyKind]))
+            return Err[int32](strutil.Join([" direct object emit: unsupported body kind: ", bodyKind], ""))
     var value: int32
     for i in len(prefix)..<len(bodyKind):
         let ch = bodyKind[i]
         if ch < '0' || ch > '9':
-            return Err[int32](Fmt([" direct object emit: invalid let-call immediate: ", bodyKind]))
+            return Err[int32](strutil.Join([" direct object emit: invalid let-call immediate: ", bodyKind], ""))
         let digit = int32(ch) - int32('0')
         if value > maxBeforeDigit || (value == maxBeforeDigit && digit > maxLastDigit):
-            return Err[int32](Fmt([" direct object emit: let-call immediate out of range: ", bodyKind]))
+            return Err[int32](strutil.Join([" direct object emit: let-call immediate out of range: ", bodyKind], ""))
         value = value * 10 + digit
     return Ok[int32](value)
 
 fn DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind: str): bool =
     return IsOk(DirectObjectEmitParseLetCallNoargReturnI32ConstBodyKind(bodyKind))
 
-fn DirectObjectEmitIsLetCallNoargReturnResultI32BodyKind(bodyKind: str): bool =
-    return bodyKind == DirectObjectEmitLetCallNoargReturnResultI32Kind
-
-fn DirectObjectEmitIsLetCallNoargStrReturnLenI32BodyKind(bodyKind: str): bool =
-    return bodyKind == DirectObjectEmitLetCallNoargStrReturnLenI32Kind
-
-fn DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind: str): bool =
-    return bodyKind == DirectObjectEmitLetCallNoargStrThenCallArg0ReturnI32Const0Kind
-
 fn DirectObjectEmitTargetSupported(plan: pobj.PrimaryObjectPlan): bool =
     return plan.targetTriple == "arm64-apple-darwin" && plan.objectFormat == "macho"
 
 fn DirectObjectEmitExpectedWordsForBodyKind(bodyKind: str): int32 =
-    if bodyKind == "return_zero_i32":
+    if bodyKind == texpr.BodyKindReturnZeroI32:
         return 2
     if DirectObjectEmitIsReturnI32ConstBodyKind(bodyKind):
         return 2
-    if bodyKind == "return_call_noarg_i32" ||
-       bodyKind == "return_call_arg0_i32" ||
-       bodyKind == "return_call_arg0_arg1_i32" ||
-       bodyKind == "return_call_arg0_arg1_arg2_i32":
+    if bodyKind == texpr.BodyKindReturnI32Arg0:
+        return 1
+    if bodyKind == texpr.BodyKindReturnI32Arg1 ||
+       bodyKind == texpr.BodyKindReturnI32Arg2 ||
+       bodyKind == texpr.BodyKindReturnI32Arg3:
+        return 2
+    if bodyKind == texpr.BodyKindReturnCallNoargI32 ||
+       bodyKind == texpr.BodyKindReturnCallArg0I32 ||
+       bodyKind == texpr.BodyKindReturnCallArg0Arg1I32 ||
+       bodyKind == texpr.BodyKindReturnCallArg0Arg1Arg2I32:
         return 1
     if DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
         return 6
-    if DirectObjectEmitIsLetCallNoargReturnResultI32BodyKind(bodyKind):
+    if texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
         return 5
-    if bodyKind == DirectObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind:
+    if bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
         return 10
-    if DirectObjectEmitIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
+    if texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
         return 12
-    if DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+    if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
         return 9
-    if bodyKind == DirectObjectEmitStrI32GuardArg0Return0Kind:
+    if bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
         return 14
-    if bodyKind == "return_str_empty":
-        return 4
-    if bodyKind == "return_f64_mul_args":
-        return 2
-    if bodyKind == "return_i32_add_args":
-        return 2
-    if bodyKind == "return_i32_sub_args":
-        return 2
-    if bodyKind == "return_i32_mul_args":
-        return 2
-    if bodyKind == "return_i32_asr_args":
-        return 2
-    if bodyKind == "return_i32_madd_args":
-        return 2
-    if bodyKind == pobj.PrimaryI32IfArg0LeZeroConst0Else7BodyKind:
-        return 6
-    if bodyKind == "str_len_fast_i32":
+    if bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
+        return 18
+    if bodyKind == texpr.BodyKindReturnStrArg0:
         return 7
-    if bodyKind == "main_f64_mul_check_exit":
+    if bodyKind == texpr.BodyKindReturnStrEmpty:
+        return 4
+    if bodyKind == texpr.BodyKindCstringToStrCopy:
+        return 32
+    if bodyKind == texpr.BodyKindReturnF64MulArgs:
+        return 2
+    if bodyKind == texpr.BodyKindReturnI32AddArgs:
+        return 2
+    if bodyKind == texpr.BodyKindReturnI32SubArgs:
+        return 2
+    if bodyKind == texpr.BodyKindReturnI32MulArgs:
+        return 2
+    if bodyKind == texpr.BodyKindReturnI32AsrArgs:
+        return 2
+    if bodyKind == texpr.BodyKindReturnI32MaddArgs:
+        return 2
+    if bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
+        return 6
+    if bodyKind == texpr.BodyKindStrLenFastI32:
+        return 7
+    if bodyKind == texpr.BodyKindMainF64MulCheckExit:
         return 22
-    if bodyKind == "entry_bridge":
-        return DirectObjectEmitEntryBridgeWordCount
+    if bodyKind == texpr.BodyKindEntryBridge:
+        return texpr.BodyKindEntryBridgeWordCount
     return 0
 
-fn DirectObjectEmitIsReturnCallBodyKind(bodyKind: str): bool =
-    return bodyKind == "return_call_noarg_i32" ||
-           bodyKind == "return_call_arg0_i32" ||
-           bodyKind == "return_call_arg0_arg1_i32" ||
-           bodyKind == "return_call_arg0_arg1_arg2_i32"
-
-fn DirectObjectEmitIsCallRelocBodyKind(bodyKind: str): bool =
-    return DirectObjectEmitIsReturnCallBodyKind(bodyKind) ||
-           DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind) ||
-           DirectObjectEmitIsLetCallNoargReturnResultI32BodyKind(bodyKind) ||
-           bodyKind == DirectObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind ||
-           DirectObjectEmitIsLetCallNoargStrReturnLenI32BodyKind(bodyKind) ||
-           DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind) ||
-           bodyKind == DirectObjectEmitStrI32GuardArg0Return0Kind
+fn DirectObjectEmitExpectedWordsForPlanFunction(plan: pobj.PrimaryObjectPlan,
+                                                 functionIndex: int32): int32 =
+    if functionIndex < 0 || functionIndex >= plan.functionBodyKinds.len:
+        return 0
+    let bodyKind = plan.functionBodyKinds[functionIndex]
+    if bodyKind == texpr.BodyKindStatementSequence:
+        if functionIndex >= plan.functionWordCounts.len:
+            return 0
+        return plan.functionWordCounts[functionIndex]
+    return DirectObjectEmitExpectedWordsForBodyKind(bodyKind)
 
 fn DirectObjectEmitRelocTargetForItem(plan: pobj.PrimaryObjectPlan,
                                        itemId: int32): str =
@@ -183,7 +173,7 @@ fn DirectObjectEmitEntryBridgeTargetSymbol(plan: pobj.PrimaryObjectPlan): str =
 
 fn DirectObjectEmitEntryBridgeIndex(plan: pobj.PrimaryObjectPlan): int32 =
     for i in 0..<plan.functionBodyKinds.len:
-        if plan.functionBodyKinds[i] == "entry_bridge":
+        if plan.functionBodyKinds[i] == texpr.BodyKindEntryBridge:
             return i
     return -1
 
@@ -227,17 +217,18 @@ fn DirectObjectEmitStandaloneWrapperByteSize(plan: pobj.PrimaryObjectPlan,
     if !DirectObjectEmitStandaloneNeedsMainWrapper(plan):
         return int64(0)
     let entryBodyKind = DirectObjectEmitStandaloneEntryBodyKind(plan, functionLimit)
-    if entryBodyKind == "main_f64_mul_check_exit":
+    if entryBodyKind == texpr.BodyKindMainF64MulCheckExit:
         return int64(88)
-    if entryBodyKind == "return_call_noarg_i32" ||
+    if entryBodyKind == texpr.BodyKindReturnCallNoargI32 ||
        DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(entryBodyKind) ||
-       DirectObjectEmitIsLetCallNoargReturnResultI32BodyKind(entryBodyKind) ||
-       entryBodyKind == DirectObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind ||
-       DirectObjectEmitIsLetCallNoargStrReturnLenI32BodyKind(entryBodyKind) ||
-       DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) ||
-       entryBodyKind == DirectObjectEmitStrI32GuardArg0Return0Kind:
+       texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(entryBodyKind) ||
+       entryBodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32 ||
+       texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(entryBodyKind) ||
+       texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) ||
+       entryBodyKind == texpr.BodyKindStatementSequence ||
+       entryBodyKind == texpr.BodyKindStrI32GuardArg0Return0:
         return int64(4)
-    if entryBodyKind == "return_zero_i32":
+    if entryBodyKind == texpr.BodyKindReturnZeroI32:
         return int64(8)
     if DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind):
         return int64(8)
@@ -247,6 +238,21 @@ fn DirectObjectEmitWriteReturnI32Const(text: var obuf.ObjectBuffer,
                                        imm: int32) =
     let movWord = uint64(0x52800000) | (uint64(imm) << uint64(5))
     obuf.ObjectBufferWriteU32LE(text, movWord)
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+
+fn DirectObjectEmitWriteReturnI32Arg0(text: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+
+fn DirectObjectEmitWriteReturnI32Arg1(text: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x2a0103e0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+
+fn DirectObjectEmitWriteReturnI32Arg2(text: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x2a0203e0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+
+fn DirectObjectEmitWriteReturnI32Arg3(text: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x2a0303e0))
     obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
 
 fn DirectObjectEmitWriteLetCallNoargReturnI32Const(text: var obuf.ObjectBuffer,
@@ -284,6 +290,49 @@ fn DirectObjectEmitWriteReturnStrEmpty(text: var obuf.ObjectBuffer) =
     obuf.ObjectBufferWriteU32LE(text, uint64(0xf900091f))
     obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
 
+fn DirectObjectEmitWriteReturnStrArg0(text: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf9400009))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf940040a))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf940080b))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf9000109))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf900050a))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf900090b))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+
+fn DirectObjectEmitWriteCstringToStrCopy(text: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xb4000380))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xa9bd7bfd))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x910003fd))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf9000be8))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf9000fe0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x7100001f))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x540001ed))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xb90023e0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x2a0003e1))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf9400fe0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xb4000140))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf9400be8))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xb94023e9))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf9000100))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf900051f))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xb9000909))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x5280002a))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xb900110a))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xa8c37bfd))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf9400be8))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf900011f))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf900051f))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf900091f))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xa8c37bfd))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf900011f))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf900051f))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf900091f))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+
 fn DirectObjectEmitWriteLetCallNoargStrReturnLenI32(text: var obuf.ObjectBuffer) =
     obuf.ObjectBufferWriteU32LE(text, uint64(0xa9bd7bfd))
     obuf.ObjectBufferWriteU32LE(text, uint64(0x910003fd))
@@ -306,6 +355,42 @@ fn DirectObjectEmitWriteLetCallNoargStrThenCallArg0ReturnI32Const0(text: var obu
     obuf.ObjectBufferWriteU32LE(text, uint64(0x910043e0))
     obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
     obuf.ObjectBufferWriteU32LE(text, uint64(0x52800000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xa8c37bfd))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+
+fn DirectObjectEmitWriteStrI32GuardArg0Return0(text: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xa9bd7bfd))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x910003fd))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x910043e8))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x910043e0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x7100001f))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x5400006c))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x910043e0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x52800000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xa8c37bfd))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+
+fn DirectObjectEmitWriteStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32(text: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xa9bd7bfd))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x910003fd))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x910043e8))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x910043e0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x7100001f))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x540000ac))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x910043e0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x52800000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x14000004))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x2a0003e1))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x910043e0))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
     obuf.ObjectBufferWriteU32LE(text, uint64(0xa8c37bfd))
     obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
 
@@ -366,6 +451,108 @@ fn DirectObjectEmitWriteF64MulCheckExit(text: var obuf.ObjectBuffer) =
     obuf.ObjectBufferWriteU32LE(text, uint64(0x52800020))
     obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
 
+fn DirectObjectEmitWriteStatementSequenceBody(text: var obuf.ObjectBuffer,
+                                               plan: pobj.PrimaryObjectPlan,
+                                               functionIndex: int32) =
+    if functionIndex < 0 || functionIndex >= plan.functionStatementReturnModes.len:
+        return
+    let mode = plan.functionStatementReturnModes[functionIndex]
+    if mode == pobj.PrimaryStatementReturnModeI32Const():
+        var imm: int32
+        if functionIndex < plan.functionStatementReturnI32Values.len:
+            imm = plan.functionStatementReturnI32Values[functionIndex]
+        DirectObjectEmitWriteLetCallNoargReturnI32Const(text, imm)
+    elif mode == pobj.PrimaryStatementReturnModeCallResultI32():
+        DirectObjectEmitWriteLetCallNoargReturnResultI32(text)
+    elif mode == pobj.PrimaryStatementReturnModeI32GuardResultLeZero():
+        DirectObjectEmitWriteLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32(text)
+    elif mode == pobj.PrimaryStatementReturnModeStrLen():
+        DirectObjectEmitWriteLetCallNoargStrReturnLenI32(text)
+    elif mode == pobj.PrimaryStatementReturnModeStrThenCallReturnI32Const0():
+        DirectObjectEmitWriteLetCallNoargStrThenCallArg0ReturnI32Const0(text)
+    elif mode == pobj.PrimaryStatementReturnModeStrI32GuardArg0Return0():
+        DirectObjectEmitWriteStrI32GuardArg0Return0(text)
+    elif mode == pobj.PrimaryStatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32():
+        DirectObjectEmitWriteStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32(text)
+
+fn DirectObjectEmitWriteBodyKind(text: var obuf.ObjectBuffer, bodyKind: str) =
+    if bodyKind == texpr.BodyKindReturnZeroI32:
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x52800000))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+    elif DirectObjectEmitIsReturnI32ConstBodyKind(bodyKind):
+        DirectObjectEmitWriteReturnI32Const(text, Value(DirectObjectEmitParseReturnI32ConstBodyKind(bodyKind)))
+    elif bodyKind == texpr.BodyKindReturnI32Arg0:
+        DirectObjectEmitWriteReturnI32Arg0(text)
+    elif bodyKind == texpr.BodyKindReturnI32Arg1:
+        DirectObjectEmitWriteReturnI32Arg1(text)
+    elif bodyKind == texpr.BodyKindReturnI32Arg2:
+        DirectObjectEmitWriteReturnI32Arg2(text)
+    elif bodyKind == texpr.BodyKindReturnI32Arg3:
+        DirectObjectEmitWriteReturnI32Arg3(text)
+    elif texpr.TypedExprIsReturnCallBodyKind(bodyKind):
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x14000000))
+    elif DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+        DirectObjectEmitWriteLetCallNoargReturnI32Const(text,
+                                                        Value(DirectObjectEmitParseLetCallNoargReturnI32ConstBodyKind(bodyKind)))
+    elif texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
+        DirectObjectEmitWriteLetCallNoargReturnResultI32(text)
+    elif bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
+        DirectObjectEmitWriteLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32(text)
+    elif texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
+        DirectObjectEmitWriteLetCallNoargStrReturnLenI32(text)
+    elif texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+        DirectObjectEmitWriteLetCallNoargStrThenCallArg0ReturnI32Const0(text)
+    elif bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
+        DirectObjectEmitWriteStrI32GuardArg0Return0(text)
+    elif bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
+        DirectObjectEmitWriteStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32(text)
+    elif bodyKind == texpr.BodyKindReturnStrArg0:
+        DirectObjectEmitWriteReturnStrArg0(text)
+    elif bodyKind == texpr.BodyKindReturnStrEmpty:
+        DirectObjectEmitWriteReturnStrEmpty(text)
+    elif bodyKind == texpr.BodyKindCstringToStrCopy:
+        DirectObjectEmitWriteCstringToStrCopy(text)
+    elif bodyKind == texpr.BodyKindReturnF64MulArgs:
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x1e610800))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+    elif bodyKind == texpr.BodyKindReturnI32AddArgs:
+        DirectObjectEmitWriteI32AddArgs(text)
+    elif bodyKind == texpr.BodyKindReturnI32SubArgs:
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x4b010000))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+    elif bodyKind == texpr.BodyKindReturnI32MulArgs:
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x1b017c00))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+    elif bodyKind == texpr.BodyKindReturnI32AsrArgs:
+        DirectObjectEmitWriteI32AsrArgs(text)
+    elif bodyKind == texpr.BodyKindReturnI32MaddArgs:
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x1b010800))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+    elif bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
+        DirectObjectEmitWriteI32IfArg0LeZeroConstElse(text, 0, 7)
+    elif bodyKind == texpr.BodyKindStrLenFastI32:
+        DirectObjectEmitWriteStrLenFast(text)
+    elif bodyKind == texpr.BodyKindMainF64MulCheckExit:
+        DirectObjectEmitWriteF64MulCheckExit(text)
+    elif bodyKind == texpr.BodyKindEntryBridge:
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xd10083ff))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xa90007e0))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xf9000ffe))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xf94007e1))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xf9400020))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xa94007e0))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xb90013e0))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xf94007e1))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xf9400020))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xb94013e0))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xf9400ffe))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0x910083ff))
+        obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+
 fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
     if !DirectObjectEmitTargetSupported(plan):
         return false
@@ -389,15 +576,17 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
     if entryIndex < 0:
         return false
     let entryBodyKind = plan.functionBodyKinds[entryIndex]
-    if entryBodyKind != "return_zero_i32" &&
+    if entryBodyKind != texpr.BodyKindReturnZeroI32 &&
        !DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) &&
-       entryBodyKind != "return_call_noarg_i32" &&
+       entryBodyKind != texpr.BodyKindReturnCallNoargI32 &&
        !DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(entryBodyKind) &&
-       !DirectObjectEmitIsLetCallNoargReturnResultI32BodyKind(entryBodyKind) &&
-       entryBodyKind != DirectObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind &&
-       !DirectObjectEmitIsLetCallNoargStrReturnLenI32BodyKind(entryBodyKind) &&
-       !DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) &&
-       entryBodyKind != "main_f64_mul_check_exit":
+       !texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(entryBodyKind) &&
+       entryBodyKind != texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32 &&
+       !texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(entryBodyKind) &&
+       !texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) &&
+       entryBodyKind != texpr.BodyKindStatementSequence &&
+       entryBodyKind != texpr.BodyKindStrI32GuardArg0Return0 &&
+       entryBodyKind != texpr.BodyKindMainF64MulCheckExit:
         return false
     if DirectObjectEmitStandaloneNeedsMainWrapper(plan) &&
        DirectObjectEmitStandaloneWrapperByteSize(plan, functionLimit) <= int64(0):
@@ -405,17 +594,17 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
     for i in 0..<plan.functionBodyKinds.len:
         let bodyKind = plan.functionBodyKinds[i]
         if i >= functionLimit:
-            if bodyKind != "entry_bridge":
+            if bodyKind != texpr.BodyKindEntryBridge:
                 return false
             if i != plan.functionBodyKinds.len - 1:
                 return false
-            if plan.functionWordCounts[i] != DirectObjectEmitEntryBridgeWordCount:
+            if plan.functionWordCounts[i] != texpr.BodyKindEntryBridgeWordCount:
                 return false
             continue
         if len(plan.symbolNames[i]) <= 0:
             return false
-        let expectedWords = DirectObjectEmitExpectedWordsForBodyKind(bodyKind)
-        if expectedWords <= 0 || bodyKind == "entry_bridge":
+        let expectedWords = DirectObjectEmitExpectedWordsForPlanFunction(plan, i)
+        if expectedWords <= 0 || bodyKind == texpr.BodyKindEntryBridge:
             return false
         if plan.functionWordCounts[i] != expectedWords:
             return false
@@ -427,13 +616,36 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
             let expectedOffset = plan.functionWordOffsets[previousIndex] + plan.functionWordCounts[previousIndex]
             if plan.functionWordOffsets[i] != expectedOffset:
                 return false
-        if DirectObjectEmitIsCallRelocBodyKind(bodyKind):
+        var requiredStatementCallCount: int32
+        if bodyKind == texpr.BodyKindStatementSequence && i < plan.functionStatementCallCounts.len:
+            requiredStatementCallCount = plan.functionStatementCallCounts[i]
+        if bodyKind == texpr.BodyKindStatementSequence ||
+           texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
+           DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
             let targetSymbol = DirectObjectEmitRelocTargetForItem(plan, plan.itemIds[i])
             if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, targetSymbol):
                 return false
-            if DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+            if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind) ||
+               requiredStatementCallCount > 1:
                 let secondTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 1)
                 if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, secondTargetSymbol):
+                    return false
+            if bodyKind == texpr.BodyKindStrI32GuardArg0Return0 ||
+               requiredStatementCallCount > 2:
+                let secondTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 1)
+                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, secondTargetSymbol):
+                    return false
+                let thirdTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 2)
+                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, thirdTargetSymbol):
+                    return false
+            if bodyKind == texpr.BodyKindStrI32GuardArg0Return0 ||
+               requiredStatementCallCount > 3:
+                let fourthTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 3)
+                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, fourthTargetSymbol):
+                    return false
+            if requiredStatementCallCount > 4:
+                let fifthTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 4)
+                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, fifthTargetSymbol):
                     return false
     return true
 
@@ -443,14 +655,16 @@ fn DirectObjectEmitStandaloneText(plan: pobj.PrimaryObjectPlan): rawbytes.Bytes 
     var text = obuf.ObjectBufferInit(int32(wrapperByteSize) + plan.instructionWords.len * 4 + 16)
     let entryBodyKind = DirectObjectEmitStandaloneEntryBodyKind(plan, functionLimit)
     if DirectObjectEmitStandaloneNeedsMainWrapper(plan):
-        if entryBodyKind == "main_f64_mul_check_exit":
+        if entryBodyKind == texpr.BodyKindMainF64MulCheckExit:
             DirectObjectEmitWriteF64MulCheckExit(text)
-        elif entryBodyKind == "return_call_noarg_i32" ||
+        elif entryBodyKind == texpr.BodyKindReturnCallNoargI32 ||
              DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(entryBodyKind) ||
-             DirectObjectEmitIsLetCallNoargReturnResultI32BodyKind(entryBodyKind) ||
-             entryBodyKind == DirectObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind ||
-             DirectObjectEmitIsLetCallNoargStrReturnLenI32BodyKind(entryBodyKind) ||
-             DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind):
+             texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(entryBodyKind) ||
+             entryBodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32 ||
+             texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(entryBodyKind) ||
+             texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) ||
+             entryBodyKind == texpr.BodyKindStatementSequence ||
+             entryBodyKind == texpr.BodyKindStrI32GuardArg0Return0:
             obuf.ObjectBufferWriteU32LE(text, uint64(0x14000000))
         elif DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind):
             DirectObjectEmitWriteReturnI32Const(text, Value(DirectObjectEmitParseReturnI32ConstBodyKind(entryBodyKind)))
@@ -458,49 +672,10 @@ fn DirectObjectEmitStandaloneText(plan: pobj.PrimaryObjectPlan): rawbytes.Bytes 
             obuf.ObjectBufferWriteU32LE(text, uint64(0x52800000))
             obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
     for i in 0..<functionLimit:
-        let bodyKind = plan.functionBodyKinds[i]
-        if bodyKind == "return_zero_i32":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x52800000))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
-        elif DirectObjectEmitIsReturnI32ConstBodyKind(bodyKind):
-            DirectObjectEmitWriteReturnI32Const(text, Value(DirectObjectEmitParseReturnI32ConstBodyKind(bodyKind)))
-        elif DirectObjectEmitIsReturnCallBodyKind(bodyKind):
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x14000000))
-        elif DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
-            DirectObjectEmitWriteLetCallNoargReturnI32Const(text,
-                                                            Value(DirectObjectEmitParseLetCallNoargReturnI32ConstBodyKind(bodyKind)))
-        elif DirectObjectEmitIsLetCallNoargReturnResultI32BodyKind(bodyKind):
-            DirectObjectEmitWriteLetCallNoargReturnResultI32(text)
-        elif bodyKind == DirectObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind:
-            DirectObjectEmitWriteLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32(text)
-        elif DirectObjectEmitIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
-            DirectObjectEmitWriteLetCallNoargStrReturnLenI32(text)
-        elif DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
-            DirectObjectEmitWriteLetCallNoargStrThenCallArg0ReturnI32Const0(text)
-        elif bodyKind == "return_str_empty":
-            DirectObjectEmitWriteReturnStrEmpty(text)
-        elif bodyKind == "return_f64_mul_args":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x1e610800))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
-        elif bodyKind == "return_i32_add_args":
-            DirectObjectEmitWriteI32AddArgs(text)
-        elif bodyKind == "return_i32_sub_args":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x4b010000))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
-        elif bodyKind == "return_i32_mul_args":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x1b017c00))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
-        elif bodyKind == "return_i32_asr_args":
-            DirectObjectEmitWriteI32AsrArgs(text)
-        elif bodyKind == "return_i32_madd_args":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x1b010800))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
-        elif bodyKind == pobj.PrimaryI32IfArg0LeZeroConst0Else7BodyKind:
-            DirectObjectEmitWriteI32IfArg0LeZeroConstElse(text, 0, 7)
-        elif bodyKind == "str_len_fast_i32":
-            DirectObjectEmitWriteStrLenFast(text)
-        elif bodyKind == "main_f64_mul_check_exit":
-            DirectObjectEmitWriteF64MulCheckExit(text)
+        if plan.functionBodyKinds[i] == texpr.BodyKindStatementSequence:
+            DirectObjectEmitWriteStatementSequenceBody(text, plan, i)
+        else:
+            DirectObjectEmitWriteBodyKind(text, plan.functionBodyKinds[i])
     return obuf.ObjectBufferToBytes(text)
 
 fn DirectObjectEmitStandaloneSymbols(plan: pobj.PrimaryObjectPlan): osym.ObjectSymbolTable =
@@ -535,12 +710,14 @@ fn DirectObjectEmitStandaloneRelocs(plan: pobj.PrimaryObjectPlan,
     var baseByteOffset: int64
     if DirectObjectEmitStandaloneNeedsMainWrapper(plan):
         baseByteOffset = DirectObjectEmitStandaloneWrapperByteSize(plan, functionLimit)
-        if entryBodyKind == "return_call_noarg_i32" ||
+        if entryBodyKind == texpr.BodyKindReturnCallNoargI32 ||
            DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(entryBodyKind) ||
-           DirectObjectEmitIsLetCallNoargReturnResultI32BodyKind(entryBodyKind) ||
-           entryBodyKind == DirectObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind ||
-           DirectObjectEmitIsLetCallNoargStrReturnLenI32BodyKind(entryBodyKind) ||
-           DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind):
+           texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(entryBodyKind) ||
+           entryBodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32 ||
+           texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(entryBodyKind) ||
+           texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) ||
+           entryBodyKind == texpr.BodyKindStatementSequence ||
+           entryBodyKind == texpr.BodyKindStrI32GuardArg0Return0:
             DirectObjectEmitAddBranchReloc(relocs,
                                            symbols,
                                            int64(0),
@@ -585,12 +762,12 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
     if DirectObjectEmitCanStandaloneMain(plan):
         return Ok[bool](true)
     if !DirectObjectEmitTargetSupported(plan):
-        return Err[bool](Fmt([" direct object emit: unsupported target: ", plan.targetTriple]))
+        return Err[bool](strutil.Join([" direct object emit: unsupported target: ", plan.targetTriple], ""))
     if len(plan.outputPath) <= 0:
         return Err[bool](" direct object emit: missing output path")
     if plan.missingReasons.len > 0:
-        return Err[bool](Fmt([" direct object emit: plan has missing reasons: ",
-                              pobj.PrimaryObjectPlanReport(plan)]))
+        return Err[bool](strutil.Join([" direct object emit: plan has missing reasons: ",
+                              pobj.PrimaryObjectPlanReport(plan)], ""))
     if plan.functionBodyKinds.len <= 0:
         return Err[bool](" direct object emit: missing function body kind")
     let functionLimit = DirectObjectEmitRealFunctionLimit(plan)
@@ -598,20 +775,22 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
     if entryIndex < 0:
         return Err[bool](" direct object emit: standalone missing entry function")
     let entryBodyKind = plan.functionBodyKinds[entryIndex]
-    if entryBodyKind != "return_zero_i32" &&
+    if entryBodyKind != texpr.BodyKindReturnZeroI32 &&
        !DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) &&
-       entryBodyKind != "return_call_noarg_i32" &&
+       entryBodyKind != texpr.BodyKindReturnCallNoargI32 &&
        !DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(entryBodyKind) &&
-       !DirectObjectEmitIsLetCallNoargReturnResultI32BodyKind(entryBodyKind) &&
-       entryBodyKind != DirectObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind &&
-       !DirectObjectEmitIsLetCallNoargStrReturnLenI32BodyKind(entryBodyKind) &&
-       !DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) &&
-       entryBodyKind != "main_f64_mul_check_exit":
+       !texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(entryBodyKind) &&
+       entryBodyKind != texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32 &&
+       !texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(entryBodyKind) &&
+       !texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) &&
+       entryBodyKind != texpr.BodyKindStatementSequence &&
+       entryBodyKind != texpr.BodyKindStrI32GuardArg0Return0 &&
+       entryBodyKind != texpr.BodyKindMainF64MulCheckExit:
         return Err[bool](" direct object emit: standalone entry must be direct-provider-free")
     for i in 0..<functionLimit:
         let bodyKind = plan.functionBodyKinds[i]
-        if DirectObjectEmitExpectedWordsForBodyKind(bodyKind) <= 0 || bodyKind == "entry_bridge":
-            return Err[bool](Fmt([" direct object emit: standalone unsupported body kind: ", bodyKind]))
+        if DirectObjectEmitExpectedWordsForPlanFunction(plan, i) <= 0 || bodyKind == texpr.BodyKindEntryBridge:
+            return Err[bool](strutil.Join([" direct object emit: standalone unsupported body kind: ", bodyKind], ""))
     return Err[bool](" direct object emit: standalone object requires unsupported codegen")
 
 fn DirectObjectEmitValidateStandaloneMain(plan: pobj.PrimaryObjectPlan): Result[bool] =
@@ -638,7 +817,7 @@ fn DirectObjectEmitCanPlanObject(plan: pobj.PrimaryObjectPlan): bool =
         if len(plan.symbolNames[i]) <= 0:
             return false
         let bodyKind = plan.functionBodyKinds[i]
-        let expectedWords = DirectObjectEmitExpectedWordsForBodyKind(bodyKind)
+        let expectedWords = DirectObjectEmitExpectedWordsForPlanFunction(plan, i)
         if expectedWords <= 0:
             return false
         if plan.functionWordCounts[i] != expectedWords:
@@ -651,15 +830,38 @@ fn DirectObjectEmitCanPlanObject(plan: pobj.PrimaryObjectPlan): bool =
             let expectedOffset = plan.functionWordOffsets[previousIndex] + plan.functionWordCounts[previousIndex]
             if plan.functionWordOffsets[i] != expectedOffset:
                 return false
-        if DirectObjectEmitIsCallRelocBodyKind(bodyKind):
+        var requiredStatementCallCount: int32
+        if bodyKind == texpr.BodyKindStatementSequence && i < plan.functionStatementCallCounts.len:
+            requiredStatementCallCount = plan.functionStatementCallCounts[i]
+        if bodyKind == texpr.BodyKindStatementSequence ||
+           texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
+           DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
             let targetSymbol = DirectObjectEmitRelocTargetForItem(plan, plan.itemIds[i])
             if len(targetSymbol) <= 0:
                 return false
-            if DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+            if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind) ||
+               requiredStatementCallCount > 1:
                 let secondTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 1)
                 if len(secondTargetSymbol) <= 0:
                     return false
-        if bodyKind == "entry_bridge":
+            if bodyKind == texpr.BodyKindStrI32GuardArg0Return0 ||
+               requiredStatementCallCount > 2:
+                let secondTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 1)
+                if len(secondTargetSymbol) <= 0:
+                    return false
+                let thirdTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 2)
+                if len(thirdTargetSymbol) <= 0:
+                    return false
+            if bodyKind == texpr.BodyKindStrI32GuardArg0Return0 ||
+               requiredStatementCallCount > 3:
+                let fourthTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 3)
+                if len(fourthTargetSymbol) <= 0:
+                    return false
+            if requiredStatementCallCount > 4:
+                let fifthTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 4)
+                if len(fifthTargetSymbol) <= 0:
+                    return false
+        if bodyKind == texpr.BodyKindEntryBridge:
             if i != plan.functionBodyKinds.len - 1:
                 return false
             let entryTargetSymbol = DirectObjectEmitEntryBridgeTargetSymbol(plan)
@@ -671,7 +873,7 @@ fn DirectObjectEmitCanReturnZeroObject(plan: pobj.PrimaryObjectPlan): bool =
     if !DirectObjectEmitCanPlanObject(plan):
         return false
     for i in 0..<plan.functionBodyKinds.len:
-        if plan.functionBodyKinds[i] != "return_zero_i32":
+        if plan.functionBodyKinds[i] != texpr.BodyKindReturnZeroI32:
             return false
     return true
 
@@ -679,12 +881,12 @@ fn DirectObjectEmitValidatePlanObject(plan: pobj.PrimaryObjectPlan): Result[bool
     if DirectObjectEmitCanPlanObject(plan):
         return Ok[bool](true)
     if !DirectObjectEmitTargetSupported(plan):
-        return Err[bool](Fmt([" direct object emit: unsupported target: ", plan.targetTriple]))
+        return Err[bool](strutil.Join([" direct object emit: unsupported target: ", plan.targetTriple], ""))
     if len(plan.outputPath) <= 0:
         return Err[bool](" direct object emit: missing output path")
     if plan.missingReasons.len > 0:
-        return Err[bool](Fmt([" direct object emit: plan has missing reasons: ",
-                              pobj.PrimaryObjectPlanReport(plan)]))
+        return Err[bool](strutil.Join([" direct object emit: plan has missing reasons: ",
+                              pobj.PrimaryObjectPlanReport(plan)], ""))
     if plan.symbolNames.len <= 0:
         return Err[bool](" direct object emit: missing symbols")
     return Err[bool](" direct object emit: object requires unsupported codegen")
@@ -712,67 +914,10 @@ fn DirectObjectEmitReturnZeroSymbols(symbolNames: str[]): osym.ObjectSymbolTable
 fn DirectObjectEmitPlanText(plan: pobj.PrimaryObjectPlan): rawbytes.Bytes =
     var text = obuf.ObjectBufferInit(plan.functionWordCounts.len * 8 + 16)
     for i in 0..<plan.functionBodyKinds.len:
-        let bodyKind = plan.functionBodyKinds[i]
-        if bodyKind == "return_zero_i32":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x52800000))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
-        elif DirectObjectEmitIsReturnI32ConstBodyKind(bodyKind):
-            DirectObjectEmitWriteReturnI32Const(text, Value(DirectObjectEmitParseReturnI32ConstBodyKind(bodyKind)))
-        elif DirectObjectEmitIsReturnCallBodyKind(bodyKind):
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x14000000))
-        elif DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
-            DirectObjectEmitWriteLetCallNoargReturnI32Const(text,
-                                                            Value(DirectObjectEmitParseLetCallNoargReturnI32ConstBodyKind(bodyKind)))
-        elif DirectObjectEmitIsLetCallNoargReturnResultI32BodyKind(bodyKind):
-            DirectObjectEmitWriteLetCallNoargReturnResultI32(text)
-        elif bodyKind == DirectObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind:
-            DirectObjectEmitWriteLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32(text)
-        elif DirectObjectEmitIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
-            DirectObjectEmitWriteLetCallNoargStrReturnLenI32(text)
-        elif DirectObjectEmitIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
-            DirectObjectEmitWriteLetCallNoargStrThenCallArg0ReturnI32Const0(text)
-        elif bodyKind == "return_str_empty":
-            DirectObjectEmitWriteReturnStrEmpty(text)
-        elif bodyKind == "return_f64_mul_args":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x1e610800))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
-        elif bodyKind == "return_i32_add_args":
-            DirectObjectEmitWriteI32AddArgs(text)
-        elif bodyKind == "return_i32_sub_args":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x4b010000))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
-        elif bodyKind == "return_i32_mul_args":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x1b017c00))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
-        elif bodyKind == "return_i32_asr_args":
-            DirectObjectEmitWriteI32AsrArgs(text)
-        elif bodyKind == "return_i32_madd_args":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x1b010800))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
-        elif bodyKind == pobj.PrimaryI32IfArg0LeZeroConst0Else7BodyKind:
-            DirectObjectEmitWriteI32IfArg0LeZeroConstElse(text, 0, 7)
-        elif bodyKind == "str_len_fast_i32":
-            DirectObjectEmitWriteStrLenFast(text)
-        elif bodyKind == "main_f64_mul_check_exit":
-            DirectObjectEmitWriteF64MulCheckExit(text)
-        elif bodyKind == "entry_bridge":
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd10083ff))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xa90007e0))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xf9000ffe))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xf94007e1))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xf9400020))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xa94007e0))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xb90013e0))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xf94007e1))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xf9400020))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xb94013e0))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xf9400ffe))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0x910083ff))
-            obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+        if plan.functionBodyKinds[i] == texpr.BodyKindStatementSequence:
+            DirectObjectEmitWriteStatementSequenceBody(text, plan, i)
+        else:
+            DirectObjectEmitWriteBodyKind(text, plan.functionBodyKinds[i])
     return obuf.ObjectBufferToBytes(text)
 
 fn DirectObjectEmitPlanSymbols(plan: pobj.PrimaryObjectPlan): osym.ObjectSymbolTable =
@@ -787,7 +932,7 @@ fn DirectObjectEmitPlanSymbols(plan: pobj.PrimaryObjectPlan): osym.ObjectSymbolT
                                              size,
                                              true)
     for i in 0..<plan.functionBodyKinds.len:
-        if plan.functionBodyKinds[i] == "entry_bridge":
+        if plan.functionBodyKinds[i] == texpr.BodyKindEntryBridge:
             let _ = osym.ObjectSymbolsAddUndefined(symbols,
                                                    DirectObjectEmitEntryBridgeSetCmdLineSymbol(plan),
                                                    true)
@@ -830,7 +975,7 @@ fn DirectObjectEmitPlanRelocs(plan: pobj.PrimaryObjectPlan,
                                        int64(plan.relocWordOffsets[relocIndex] * 4),
                                        plan.relocTargetSymbols[relocIndex])
     for i in 0..<plan.functionBodyKinds.len:
-        if plan.functionBodyKinds[i] == "entry_bridge":
+        if plan.functionBodyKinds[i] == texpr.BodyKindEntryBridge:
             let baseByteOffset = plan.functionWordOffsets[i] * 4
             DirectObjectEmitAddBranchReloc(relocs,
                                            symbols,

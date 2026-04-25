@@ -7,6 +7,7 @@ import std/times
 import cheng/codex/core/store
 import cheng/codex/core/text as textutil
 import cheng/codex/protocol/types
+import std/strutils as strutil
 
 fn codexNowUnix(): int64 =
     return times.EpochTimeSeconds()
@@ -16,7 +17,7 @@ fn codexNowMonoNs(): int64 =
     return monotimes.MonoTimeNs(mono)
 
 fn codexSessionId(): str =
-    return "codex-" + strings.Int64ToStr(codexNowUnix()) + "-" + strings.Int64ToStr(codexNowMonoNs())
+    return strutil.Join(["codex-", strings.Int64ToStr(codexNowUnix()), "-", strings.Int64ToStr(codexNowMonoNs())], "")
 
 fn codexDefaultTitle(promptText: str, commandText: str, sessionId: str): str =
     let promptTitle = textutil.codexTitleFromText(promptText)
@@ -56,8 +57,8 @@ fn codexAssistantSummary(exitCode: int32, outputText: str): str =
             return "command ok rc=0"
         return "command ok rc=0 (no output)"
     if textutil.codexTextNonEmpty(outputText):
-        return "command failed rc=" + intToStr(exitCode)
-    return "command failed rc=" + intToStr(exitCode) + " (no output)"
+        return strutil.Join(["command failed rc=", intToStr(exitCode)], "")
+    return strutil.Join(["command failed rc=", intToStr(exitCode), " (no output)"], "")
 
 fn codexAppendTurn(session: var types.CodexSession,
                    promptText: str,
@@ -91,11 +92,10 @@ fn codexShellCapture(commandText: str, cwd: str, outOutput: var str, outExitCode
                                             outExitCode)
 
 fn codexSandboxProfilePathText(path: str): str =
-    return "\"" + path + "\""
+    return strutil.Join(["\"", path, "\""], "")
 
 fn codexSandboxAllowWriteRule(path: str): str =
-    return "(allow file-read* file-test-existence file-write* (subpath " +
-        codexSandboxProfilePathText(path) + "))\n"
+    return strutil.Join(["(allow file-read* file-test-existence file-write* (subpath ", codexSandboxProfilePathText(path), "))\n"], "")
 
 fn codexSandboxProfileText(writableRoot: str): str =
     var parts: str[]
@@ -111,7 +111,7 @@ fn codexSandboxProfileText(writableRoot: str): str =
     add(parts, "(allow file-read* file-write* (subpath \"/private/var/tmp\"))\n")
     if textutil.codexTextNonEmpty(writableRoot):
         add(parts, codexSandboxAllowWriteRule(writableRoot))
-    return Fmt(parts)
+    return strutil.Join(parts, "")
 
 fn codexSandboxWritableRoot(cwd: str, writableRoot: str): str =
     if !textutil.codexTextNonEmpty(writableRoot):
@@ -175,12 +175,12 @@ fn codexSessionHistoryText(session: types.CodexSession, maxTurns: int32): str =
             if len(turn.outputText) <= 0 || turn.outputText[len(turn.outputText) - 1] != '\n':
                 add(parts, "\n")
         add(parts, Fmt"{turn.assistantText}\n")
-    return Fmt(parts)
+    return strutil.Join(parts, "")
 
 fn codexApplyPatch(cwd: str, patchPath: str): Result[types.CodexExecResult] =
     if !textutil.codexTextNonEmpty(patchPath):
         return Err[types.CodexExecResult]("codex apply: missing --patch")
-    let command = "git apply " + os.QuoteShell(patchPath)
+    let command = strutil.Join(["git apply ", os.QuoteShell(patchPath)], "")
     var out: types.CodexExecResult
     codexShellCapture(command, cwd, out.outputText, out.exitCode)
     out.ok = out.exitCode == 0
@@ -197,8 +197,7 @@ fn codexRunInSandbox(cwd: str, writableRoot: str, commandText: str): Result[type
     if textutil.codexTextNonEmpty(cwd):
         actualCwd = cwd
     let writeRoot = codexSandboxWritableRoot(actualCwd, writableRoot)
-    let profilePath = "/tmp/codex-sandbox-" + strings.Int64ToStr(codexNowUnix()) + "-" +
-        strings.Int64ToStr(codexNowMonoNs()) + ".sb"
+    let profilePath = strutil.Join(["/tmp/codex-sandbox-", strings.Int64ToStr(codexNowUnix()), "-", strings.Int64ToStr(codexNowMonoNs()), ".sb"], "")
     if !store.codexStoreWriteText(profilePath, codexSandboxProfileText(writeRoot)):
         return Err[types.CodexExecResult]("codex sandbox: failed to write profile")
     var out: types.CodexExecResult

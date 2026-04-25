@@ -3,6 +3,7 @@ import std/rawbytes
 import std/strformat
 import cheng/core/tooling/path as chengpath
 import cheng/core/lang/parser
+import std/strutils as strutil
 
 type
     TypedExprAbiClass = enum
@@ -77,6 +78,7 @@ type
     TypedExprIrOpKind = enum
         TypedExprIrOpUnsupported
         TypedExprIrOpParamRef
+        TypedExprIrOpReturnStrArg0
         TypedExprIrOpI32Const
         TypedExprIrOpI32Add
         TypedExprIrOpI32Sub
@@ -94,6 +96,13 @@ type
         TypedExprIrOpLetCallStrReturnLenI32
         TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0
         TypedExprIrOpStrI32GuardArg0Return0
+        TypedExprIrOpCstringToStrCopy
+
+    TypedExprIrStatementKind = enum
+        TypedExprIrStmtUnsupported
+        TypedExprIrStmtLetCall
+        TypedExprIrStmtIfCall
+        TypedExprIrStmtCall
 
     TypedExprArgPassKind = enum
         TypedExprArgPassValue
@@ -154,6 +163,8 @@ type
         abiClass: TypedExprAbiClass
         valueKind: TypedExprValueKind
         placeKind: TypedExprPlaceKind
+        hasSink: bool
+        sinkPlaceKind: TypedExprPlaceKind
         loweringMode: TypedExprLoweringMode
         callKind: TypedExprCallKind
         typeCallKind: TypedExprTypeCallKind
@@ -228,19 +239,41 @@ type
         operand2NodeIndex: int32
         literalText: str
 
+    TypedExprIrStatement =
+        sourcePath: str
+        functionName: str
+        statementIndex: int32
+        lineNumber: int32
+        columnNumber: int32
+        exprId: str
+        kind: TypedExprIrStatementKind
+        bindingName: str
+        resultType: str
+        callTarget: str
+        callTargetSourcePath: str
+        callTargetImportc: bool
+        callArgCount: int32
+        callArgsText: str
+        loweringMode: TypedExprLoweringMode
+        returnKind: TypedExprReturnKind
+
     TypedExprIrFunction =
         sourcePath: str
         functionName: str
         signatureLineNumber: int32
+        endLineNumber: int32
         bodyLineNumber: int32
         returnType: str
         returnExpr: str
+        statementStart: int32
+        statementCount: int32
         nodeStart: int32
         nodeCount: int32
         returnNodeIndex: int32
 
     TypedExprIr =
         functions: TypedExprIrFunction[]
+        statements: TypedExprIrStatement[]
         nodes: TypedExprIrNode[]
 
     TypedExprFunctionScope =
@@ -290,6 +323,72 @@ type
         hasSink: bool
         returnRoot: bool
         functionReturnType: str
+
+const
+    BodyKindReturnZeroI32 = "return_zero_i32"
+    BodyKindReturnI32ConstPrefix = "return_i32_const_"
+    BodyKindReturnI32Arg0 = "return_i32_arg0"
+    BodyKindReturnI32Arg1 = "return_i32_arg1"
+    BodyKindReturnI32Arg2 = "return_i32_arg2"
+    BodyKindReturnI32Arg3 = "return_i32_arg3"
+    BodyKindReturnI32AddArgs = "return_i32_add_args"
+    BodyKindReturnI32SubArgs = "return_i32_sub_args"
+    BodyKindReturnI32MulArgs = "return_i32_mul_args"
+    BodyKindReturnI32AsrArgs = "return_i32_asr_args"
+    BodyKindReturnI32MaddArgs = "return_i32_madd_args"
+    BodyKindReturnF64MulArgs = "return_f64_mul_args"
+    BodyKindStrLenFastI32 = "str_len_fast_i32"
+    BodyKindReturnStrArg0 = "return_str_arg0"
+    BodyKindReturnStrEmpty = "return_str_empty"
+    BodyKindMainF64MulCheckExit = "main_f64_mul_check_exit"
+    BodyKindReturnCallNoargI32 = "return_call_noarg_i32"
+    BodyKindReturnCallArg0I32 = "return_call_arg0_i32"
+    BodyKindReturnCallArg0Arg1I32 = "return_call_arg0_arg1_i32"
+    BodyKindReturnCallArg0Arg1Arg2I32 = "return_call_arg0_arg1_arg2_i32"
+    BodyKindEntryBridge = "entry_bridge"
+    BodyKindStatementSequence = "statement_sequence"
+    BodyKindUnsupported = "unsupported"
+    BodyKindLetCallReturnI32ConstPrefix = "let_call_return_i32_const_"
+    BodyKindLetCallReturnI32ConstPrefixLen = 26
+    BodyKindLetCallNoargReturnI32ConstPrefix = "let_call_noarg_return_i32_const_"
+    BodyKindLetCallReturnResultI32 = "let_call_return_result_i32"
+    BodyKindLetCallNoargReturnResultI32 = "let_call_noarg_return_result_i32"
+    BodyKindLetCallI32IfResultLeZeroReturnZeroElseResultI32 = "let_call_i32_if_result_le_zero_return_zero_else_result_i32"
+    BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32 = "let_call_noarg_i32_if_result_le_zero_return_zero_else_result_i32"
+    BodyKindLetCallReturnStrLenI32 = "let_call_return_str_len_i32"
+    BodyKindLetCallNoargStrReturnLenI32 = "let_call_noarg_str_return_len_i32"
+    BodyKindLetCallStrThenCallArg0ReturnI32Const0 = "let_call_str_then_call_arg0_return_i32_const_0"
+    BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0 = "let_call_noarg_str_then_call_arg0_return_i32_const_0"
+    BodyKindStrI32GuardArg0Return0 = "str_i32_guard_arg0_return_0"
+    BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32 = "str_i32_guard_arg0_else_call_arg0_arg1_return_result_i32"
+    BodyKindCstringToStrCopy = "cstring_to_str_copy"
+    BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7 = "if_arg0_le_zero_return_i32_const_0_else_i32_const_7"
+    BodyKindReturnI32ConstMax = 65535
+    BodyKindEntryBridgeWordCount = 17
+
+fn TypedExprIsReturnCallBodyKind(bodyKind: str): bool =
+    return bodyKind == BodyKindReturnCallNoargI32 ||
+           bodyKind == BodyKindReturnCallArg0I32 ||
+           bodyKind == BodyKindReturnCallArg0Arg1I32 ||
+           bodyKind == BodyKindReturnCallArg0Arg1Arg2I32
+
+fn TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind: str): bool =
+    return bodyKind == BodyKindLetCallNoargReturnResultI32
+
+fn TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind: str): bool =
+    return bodyKind == BodyKindLetCallNoargStrReturnLenI32
+
+fn TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind: str): bool =
+    return bodyKind == BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0
+
+fn TypedExprIsCallRelocBodyKind(bodyKind: str): bool =
+    return TypedExprIsReturnCallBodyKind(bodyKind) ||
+           TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind) ||
+           bodyKind == BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32 ||
+           TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind) ||
+           TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind) ||
+           bodyKind == BodyKindStrI32GuardArg0Return0 ||
+           bodyKind == BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32
 
 fn TypedExprAbiClassText(abiClass: TypedExprAbiClass): str =
     if abiClass == TypedExprAbiScalar:
@@ -534,6 +633,8 @@ fn TypedExprReturnOpKindText(kind: TypedExprReturnOpKind): str =
 fn TypedExprIrOpKindText(kind: TypedExprIrOpKind): str =
     if kind == TypedExprIrOpParamRef:
         return "param_ref"
+    if kind == TypedExprIrOpReturnStrArg0:
+        return "return_str_arg0"
     if kind == TypedExprIrOpI32Const:
         return "i32_const"
     if kind == TypedExprIrOpI32Add:
@@ -568,6 +669,17 @@ fn TypedExprIrOpKindText(kind: TypedExprIrOpKind): str =
         return "let_call_str_then_call_arg0_return_i32_const_0"
     if kind == TypedExprIrOpStrI32GuardArg0Return0:
         return "str_i32_guard_arg0_return_0"
+    if kind == TypedExprIrOpCstringToStrCopy:
+        return "cstring_to_str_copy"
+    return "unsupported"
+
+fn TypedExprIrStatementKindText(kind: TypedExprIrStatementKind): str =
+    if kind == TypedExprIrStmtLetCall:
+        return "let_call"
+    if kind == TypedExprIrStmtIfCall:
+        return "if_call"
+    if kind == TypedExprIrStmtCall:
+        return "call"
     return "unsupported"
 
 fn TypedExprReturnOpKindFromIrOp(kind: TypedExprIrOpKind): TypedExprReturnOpKind =
@@ -602,14 +714,37 @@ fn TypedExprIrNodeClone(node: TypedExprIrNode): TypedExprIrNode =
     out.literalText = node.literalText
     return out
 
+fn TypedExprIrStatementClone(stmt: TypedExprIrStatement): TypedExprIrStatement =
+    var out: TypedExprIrStatement
+    out.sourcePath = stmt.sourcePath
+    out.functionName = stmt.functionName
+    out.statementIndex = stmt.statementIndex
+    out.lineNumber = stmt.lineNumber
+    out.columnNumber = stmt.columnNumber
+    out.exprId = stmt.exprId
+    out.kind = stmt.kind
+    out.bindingName = stmt.bindingName
+    out.resultType = stmt.resultType
+    out.callTarget = stmt.callTarget
+    out.callTargetSourcePath = stmt.callTargetSourcePath
+    out.callTargetImportc = stmt.callTargetImportc
+    out.callArgCount = stmt.callArgCount
+    out.callArgsText = stmt.callArgsText
+    out.loweringMode = stmt.loweringMode
+    out.returnKind = stmt.returnKind
+    return out
+
 fn TypedExprIrFunctionClone(fnIr: TypedExprIrFunction): TypedExprIrFunction =
     var out: TypedExprIrFunction
     out.sourcePath = fnIr.sourcePath
     out.functionName = fnIr.functionName
     out.signatureLineNumber = fnIr.signatureLineNumber
+    out.endLineNumber = fnIr.endLineNumber
     out.bodyLineNumber = fnIr.bodyLineNumber
     out.returnType = fnIr.returnType
     out.returnExpr = fnIr.returnExpr
+    out.statementStart = fnIr.statementStart
+    out.statementCount = fnIr.statementCount
     out.nodeStart = fnIr.nodeStart
     out.nodeCount = fnIr.nodeCount
     out.returnNodeIndex = fnIr.returnNodeIndex
@@ -619,6 +754,8 @@ fn TypedExprIrClone(ir: TypedExprIr): TypedExprIr =
     var out: TypedExprIr
     for i in 0..<ir.functions.len:
         add(out.functions, TypedExprIrFunctionClone(ir.functions[i]))
+    for i in 0..<ir.statements.len:
+        add(out.statements, TypedExprIrStatementClone(ir.statements[i]))
     for i in 0..<ir.nodes.len:
         add(out.nodes, TypedExprIrNodeClone(ir.nodes[i]))
     return out
@@ -660,8 +797,8 @@ fn TypedExprReturnOpFactsKindListText(facts: TypedExprReturnOpFact[]): str =
     var out = ""
     for i in 0..<facts.len:
         if i > 0:
-            out = Fmt([out, ","])
-        out = Fmt([out, TypedExprReturnOpKindText(facts[i].opKind)])
+            out = strutil.Join([out, ","], "")
+        out = strutil.Join([out, TypedExprReturnOpKindText(facts[i].opKind)], "")
     return out
 
 fn TypedExprIrCountOpKind(ir: TypedExprIr,
@@ -669,6 +806,14 @@ fn TypedExprIrCountOpKind(ir: TypedExprIr,
     var count: int32
     for i in 0..<ir.nodes.len:
         if ir.nodes[i].opKind == kind:
+            count = count + 1
+    return count
+
+fn TypedExprIrCountStatementKind(ir: TypedExprIr,
+                                  kind: TypedExprIrStatementKind): int32 =
+    var count: int32
+    for i in 0..<ir.statements.len:
+        if ir.statements[i].kind == kind:
             count = count + 1
     return count
 
@@ -693,8 +838,8 @@ fn TypedExprIrReturnKindListText(ir: TypedExprIr): str =
         if kind == TypedExprIrOpUnsupported || kind == TypedExprIrOpParamRef:
             continue
         if len(out) > 0:
-            out = Fmt([out, ","])
-        out = Fmt([out, TypedExprIrOpKindText(kind)])
+            out = strutil.Join([out, ","], "")
+        out = strutil.Join([out, TypedExprIrOpKindText(kind)], "")
     if len(out) <= 0:
         return "-"
     return out
@@ -776,6 +921,8 @@ fn TypedExprFactClone(fact: TypedExprFact): TypedExprFact =
     out.abiClass = fact.abiClass
     out.valueKind = fact.valueKind
     out.placeKind = fact.placeKind
+    out.hasSink = fact.hasSink
+    out.sinkPlaceKind = fact.sinkPlaceKind
     out.loweringMode = fact.loweringMode
     out.callKind = fact.callKind
     out.typeCallKind = fact.typeCallKind
@@ -834,6 +981,10 @@ fn TypedExprFactEqual(lhs: TypedExprFact,
     if lhs.valueKind != rhs.valueKind:
         return false
     if lhs.placeKind != rhs.placeKind:
+        return false
+    if lhs.hasSink != rhs.hasSink:
+        return false
+    if lhs.sinkPlaceKind != rhs.sinkPlaceKind:
         return false
     if lhs.loweringMode != rhs.loweringMode:
         return false
@@ -1112,32 +1263,32 @@ fn TypedExprFactValidateTypeCallMaterialize(fact: TypedExprFact,
         return true
     if fact.kind != parser.NormalizedExprDefaultInit &&
        fact.kind != parser.NormalizedExprConstructor:
-        err = " typed expr: type-call fact kind drift at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        err = strutil.Join([" typed expr: type-call fact kind drift at ", fact.sourcePath, ":", intToStr(fact.lineNumber)], "")
         return false
     if fact.callKind != TypedExprCallNone:
-        err = " typed expr: type-call fact leaked ordinary call kind at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        err = strutil.Join([" typed expr: type-call fact leaked ordinary call kind at ", fact.sourcePath, ":", intToStr(fact.lineNumber)], "")
         return false
     if !TypedExprTypeTextIsConcrete(fact.typeText):
-        err = " typed expr: type-call fact missing concrete type at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        err = strutil.Join([" typed expr: type-call fact missing concrete type at ", fact.sourcePath, ":", intToStr(fact.lineNumber)], "")
         return false
     if fact.abiClass != TypedExprAbiComposite ||
        fact.valueKind != TypedExprValueComposite:
-        err = " typed expr: type-call fact must materialize composite at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        err = strutil.Join([" typed expr: type-call fact must materialize composite at ", fact.sourcePath, ":", intToStr(fact.lineNumber)], "")
         return false
     if fact.placeKind == TypedExprPlaceCallResult:
-        err = " typed expr: type-call fact cannot use call-result place at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        err = strutil.Join([" typed expr: type-call fact cannot use call-result place at ", fact.sourcePath, ":", intToStr(fact.lineNumber)], "")
         return false
     if fact.loweringMode != TypedExprLowerLocalAddress &&
        fact.loweringMode != TypedExprLowerSret:
-        err = " typed expr: type-call fact missing address lowering at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        err = strutil.Join([" typed expr: type-call fact missing address lowering at ", fact.sourcePath, ":", intToStr(fact.lineNumber)], "")
         return false
     if fact.loweringMode == TypedExprLowerLocalAddress &&
        fact.returnKind != TypedExprReturnCompositeLocal:
-        err = " typed expr: type-call fact local-address return drift at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        err = strutil.Join([" typed expr: type-call fact local-address return drift at ", fact.sourcePath, ":", intToStr(fact.lineNumber)], "")
         return false
     if fact.loweringMode == TypedExprLowerSret &&
        fact.returnKind != TypedExprReturnSret:
-        err = " typed expr: type-call fact sret return drift at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        err = strutil.Join([" typed expr: type-call fact sret return drift at ", fact.sourcePath, ":", intToStr(fact.lineNumber)], "")
         return false
     err = ""
     return true
@@ -1225,8 +1376,8 @@ fn TypedExprSourcesSharePackage(leftSourcePath: str,
         return false
     if leftPackageId != "cheng":
         return true
-    let leftSrcPrefix = Fmt([chengpath.PathJoin(leftRoot, "src"), "/"])
-    let rightSrcPrefix = Fmt([chengpath.PathJoin(rightRoot, "src"), "/"])
+    let leftSrcPrefix = strutil.Join([chengpath.PathJoin(leftRoot, "src"), "/"], "")
+    let rightSrcPrefix = strutil.Join([chengpath.PathJoin(rightRoot, "src"), "/"], "")
     if !chengpath.TextStartsWith(leftSourcePath, leftSrcPrefix):
         return false
     if !chengpath.TextStartsWith(rightSourcePath, rightSrcPrefix):
@@ -1278,27 +1429,27 @@ fn TypedExprFactsValidateCallResolution(exprLayer: parser.NormalizedExprLayer,
                fact.callTarget != "" ||
                fact.callTargetSourcePath != "" ||
                fact.callTargetImportc:
-                err = " typed expr: non-call fact leaked call resolution at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                err = strutil.Join([" typed expr: non-call fact leaked call resolution at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
                 return false
             if fact.typeCallKind != expectedTypeCallKind:
-                err = " typed expr: non-call fact leaked type-call drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                err = strutil.Join([" typed expr: non-call fact leaked type-call drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
                 return false
             if expectedTypeCallKind != TypedExprTypeCallNone:
                 if fact.callPrefixStyle != expr.callPrefixStyle ||
                    fact.callArgCount != expr.callArgCount ||
                    fact.callArgsText != expr.callArgsText:
-                    err = " typed expr: type-call fact args drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                    err = strutil.Join([" typed expr: type-call fact args drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
                     return false
                 if !TypedExprFactValidateTypeCallMaterialize(fact, err):
                     return false
             elif fact.callPrefixStyle ||
                  fact.callArgCount != 0 ||
                  fact.callArgsText != "":
-                err = " typed expr: non-call fact leaked call args at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                err = strutil.Join([" typed expr: non-call fact leaked call args at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
                 return false
             continue
         if fact.typeCallKind != TypedExprTypeCallNone:
-            err = " typed expr: call fact leaked type-call kind at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call fact leaked type-call kind at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         let surfaceKind = TypedExprSurfaceCallKindFromParser(expr.callSurfaceKind)
         let resolved = expr.callResolved
@@ -1309,44 +1460,44 @@ fn TypedExprFactsValidateCallResolution(exprLayer: parser.NormalizedExprLayer,
         let targetSourcePath = expr.callTargetSourcePath
         let targetImportc = expr.callTargetImportc
         if fact.surfaceCallKind != surfaceKind:
-            err = " typed expr: call surface kind drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call surface kind drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callResolved != resolved:
-            err = " typed expr: call resolved drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call resolved drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callReason != reason:
-            err = " typed expr: call reason drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call reason drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callQualifier != qualifier:
-            err = " typed expr: call qualifier drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call qualifier drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callCallee != callee:
-            err = " typed expr: call callee drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call callee drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callTarget != target:
-            err = " typed expr: call target drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call target drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callTargetSourcePath != targetSourcePath:
-            err = " typed expr: call target source drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call target source drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callTargetImportc != targetImportc:
-            err = " typed expr: call importc drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call importc drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callPrefixStyle != expr.callPrefixStyle:
-            err = " typed expr: call prefix style drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call prefix style drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callArgCount != expr.callArgCount:
-            err = " typed expr: call arg count drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call arg count drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callArgsText != expr.callArgsText:
-            err = " typed expr: call args text drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: call args text drift at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callResolved:
             if fact.callReason != TypedExprCallReasonNone:
-                err = " typed expr: resolved call keeps unknown reason at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                err = strutil.Join([" typed expr: resolved call keeps unknown reason at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
                 return false
             if fact.callTargetSourcePath == "":
-                err = " typed expr: resolved call missing target source at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                err = strutil.Join([" typed expr: resolved call missing target source at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
                 return false
             if fact.surfaceCallKind == TypedExprSurfaceCallExternal:
                 let symbolExported = TypedExprSymbolExportedByCase(fact.callCallee)
@@ -1354,41 +1505,39 @@ fn TypedExprFactsValidateCallResolution(exprLayer: parser.NormalizedExprLayer,
                     let samePackage = TypedExprSourcesSharePackage(expr.sourcePath,
                                                                     fact.callTargetSourcePath)
                     if !samePackage:
-                        err = Fmt([" typed expr: imported private symbol '",
+                        err = strutil.Join([" typed expr: imported private symbol '",
                                    fact.callCallee,
-                                   "' is not exported"])
+                                   "' is not exported"], "")
                         return false
             if fact.typeText == "" || fact.typeText == "unknown" || fact.typeText == "call_expr":
-                err = " typed expr: resolved call missing concrete type at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                err = strutil.Join([" typed expr: resolved call missing concrete type at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
                 return false
             if !TypedExprTypeIsGenericPlaceholder(fact.typeText) &&
                (fact.abiClass == TypedExprAbiPolymorphic ||
                 fact.loweringMode == TypedExprLowerDeferred ||
                 fact.returnKind == TypedExprReturnDeferred):
-                err = " typed expr: resolved call fell back to deferred at " +
-                      expr.sourcePath + ":" + intToStr(expr.lineNumber) +
-                      " target=" + fact.callTarget +
-                      " type=" + fact.typeText +
-                      " abi=" + TypedExprAbiClassText(fact.abiClass) +
-                      " lower=" + TypedExprLoweringModeText(fact.loweringMode) +
-                      " return=" + TypedExprReturnKindText(fact.returnKind) +
-                      " target_source=" + fact.callTargetSourcePath
+                err = strutil.Join([" typed expr: resolved call fell back to deferred at ", expr.sourcePath, ":", intToStr(expr.lineNumber), " target=", fact.callTarget, " type=", fact.typeText, " abi=", TypedExprAbiClassText(fact.abiClass), " lower=", TypedExprLoweringModeText(fact.loweringMode), " return=", TypedExprReturnKindText(fact.returnKind), " target_source=", fact.callTargetSourcePath], "")
                 return false
             if fact.callTargetImportc &&
                fact.abiClass == TypedExprAbiComposite &&
                (fact.loweringMode != TypedExprLowerImportBuffer ||
                 fact.returnKind != TypedExprReturnImportBuffer):
-                err = " typed expr: imported composite call missing import buffer at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                err = strutil.Join([" typed expr: imported composite call missing import buffer at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
                 return false
             continue
         if fact.callReason == TypedExprCallReasonNone:
-            err = " typed expr: unresolved call missing reason at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: unresolved call missing reason at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callTargetSourcePath != "":
-            err = " typed expr: unresolved call keeps target source at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: unresolved call keeps target source at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
             return false
         if fact.callTargetImportc:
-            err = " typed expr: unresolved call keeps importc target at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            err = strutil.Join([" typed expr: unresolved call keeps importc target at ", expr.sourcePath, ":", intToStr(expr.lineNumber)], "")
+            return false
+        if fact.surfaceCallKind == TypedExprSurfaceCallExternal &&
+           fact.callQualifier != "" &&
+           !TypedExprSymbolExportedByCase(fact.callCallee):
+            err = Fmt" typed expr: unknown_qualified_target:{fact.callQualifier}:{fact.callCallee}"
             return false
     err = ""
     return true
@@ -1564,51 +1713,51 @@ fn TypedExprLoweringRuleShapeEqual(lhs: TypedExprLoweringRule,
 
 fn TypedExprLoweringRuleKey(rule: TypedExprLoweringRule): str =
     var out = ""
-    out = out + "type=" + TypedExprNormalizeTypeText(rule.typeText)
-    out = out + ";abi=" + TypedExprAbiClassText(rule.abiClass)
-    out = out + ";value=" + TypedExprValueKindText(rule.valueKind)
-    out = out + ";place=" + TypedExprPlaceKindText(rule.placeKind)
-    out = out + ";lower=" + TypedExprLoweringModeText(rule.loweringMode)
-    out = out + ";call=" + TypedExprCallKindText(rule.callKind)
-    out = out + ";type_call=" + TypedExprTypeCallKindText(rule.typeCallKind)
-    out = out + ";return=" + TypedExprReturnKindText(rule.returnKind)
-    out = Fmt([out, ";return_root=", rule.returnRoot ? "1" : "0"])
-    out = out + ";arg=" + TypedExprArgPassKindText(rule.argPassKind)
-    out = out + ";result=" + TypedExprResultPassKindText(rule.resultPassKind)
-    out = out + ";materialize=" + TypedExprMaterializeKindText(rule.materializeKind)
-    out = out + ";copy=" + TypedExprCopyKindText(rule.copyKind)
-    out = out + ";import=" + TypedExprImportKindText(rule.importKind)
+    out = strutil.Join([out, "type=", TypedExprNormalizeTypeText(rule.typeText)], "")
+    out = strutil.Join([out, ";abi=", TypedExprAbiClassText(rule.abiClass)], "")
+    out = strutil.Join([out, ";value=", TypedExprValueKindText(rule.valueKind)], "")
+    out = strutil.Join([out, ";place=", TypedExprPlaceKindText(rule.placeKind)], "")
+    out = strutil.Join([out, ";lower=", TypedExprLoweringModeText(rule.loweringMode)], "")
+    out = strutil.Join([out, ";call=", TypedExprCallKindText(rule.callKind)], "")
+    out = strutil.Join([out, ";type_call=", TypedExprTypeCallKindText(rule.typeCallKind)], "")
+    out = strutil.Join([out, ";return=", TypedExprReturnKindText(rule.returnKind)], "")
+    out = strutil.Join([out, ";return_root=", rule.returnRoot ? "1" : "0"], "")
+    out = strutil.Join([out, ";arg=", TypedExprArgPassKindText(rule.argPassKind)], "")
+    out = strutil.Join([out, ";result=", TypedExprResultPassKindText(rule.resultPassKind)], "")
+    out = strutil.Join([out, ";materialize=", TypedExprMaterializeKindText(rule.materializeKind)], "")
+    out = strutil.Join([out, ";copy=", TypedExprCopyKindText(rule.copyKind)], "")
+    out = strutil.Join([out, ";import=", TypedExprImportKindText(rule.importKind)], "")
     return out
 
 fn TypedExprLoweringRuleEntryText(rule: TypedExprLoweringRule): str =
     var out = ""
     let callReasonText = TypedExprCallReasonText(rule.callReason)
-    out = out + "source=" + rule.sourcePath
-    out = out + ";line=" + intToStr(rule.lineNumber)
-    out = out + ";column=" + intToStr(rule.columnNumber)
-    out = out + ";expr=" + rule.exprId
-    out = out + ";surface_call=" + TypedExprSurfaceCallKindText(rule.surfaceCallKind)
-    out = out + ";type_call=" + TypedExprTypeCallKindText(rule.typeCallKind)
-    out = out + ";resolved=" + (if rule.callResolved: "1" else: "0")
+    out = strutil.Join([out, "source=", rule.sourcePath], "")
+    out = strutil.Join([out, ";line=", intToStr(rule.lineNumber)], "")
+    out = strutil.Join([out, ";column=", intToStr(rule.columnNumber)], "")
+    out = strutil.Join([out, ";expr=", rule.exprId], "")
+    out = strutil.Join([out, ";surface_call=", TypedExprSurfaceCallKindText(rule.surfaceCallKind)], "")
+    out = strutil.Join([out, ";type_call=", TypedExprTypeCallKindText(rule.typeCallKind)], "")
+    out = strutil.Join([out, ";resolved=", (if rule.callResolved: "1" else: "0")], "")
     if callReasonText != "":
-        out = out + ";reason=" + callReasonText
+        out = strutil.Join([out, ";reason=", callReasonText], "")
     if rule.callQualifier != "":
-        out = out + ";qualifier=" + rule.callQualifier
+        out = strutil.Join([out, ";qualifier=", rule.callQualifier], "")
     if rule.callCallee != "":
-        out = out + ";callee=" + rule.callCallee
+        out = strutil.Join([out, ";callee=", rule.callCallee], "")
     if rule.callTarget != "":
-        out = out + ";target=" + rule.callTarget
+        out = strutil.Join([out, ";target=", rule.callTarget], "")
     if rule.callTargetSourcePath != "":
-        out = out + ";target_source=" + rule.callTargetSourcePath
+        out = strutil.Join([out, ";target_source=", rule.callTargetSourcePath], "")
     if rule.callTargetImportc:
-        out = out + ";target_importc=1"
+        out = strutil.Join([out, ";target_importc=1"], "")
     if rule.callPrefixStyle:
-        out = out + ";prefix_style=1"
+        out = strutil.Join([out, ";prefix_style=1"], "")
     if rule.callArgCount > 0:
-        out = out + ";arg_count=" + intToStr(rule.callArgCount)
+        out = strutil.Join([out, ";arg_count=", intToStr(rule.callArgCount)], "")
     if rule.returnRoot:
-        out = Fmt([out, ";return_root=1"])
-    out = out + ";key=" + TypedExprLoweringRuleKey(rule)
+        out = strutil.Join([out, ";return_root=1"], "")
+    out = strutil.Join([out, ";key=", TypedExprLoweringRuleKey(rule)], "")
     return out
 
 fn TypedExprLoweringRulesEqual(lhs: TypedExprLoweringRule[],
@@ -1710,7 +1859,7 @@ fn TypedExprLoweringRuleReturnRootCount(rules: TypedExprLoweringRule[]): int32 =
 fn TypedExprReportAppendLine(out: var str,
                               key: str,
                               value: str) =
-    out = out + key + "=" + value + "\n"
+    out = strutil.Join([out, key, "=", value, "\n"], "")
 
 fn TypedExprFactsReportText(facts: TypedExprFact[]): str =
     var out = ""
@@ -1777,9 +1926,14 @@ fn TypedExprReturnOpFactsReportText(facts: TypedExprReturnOpFact[]): str =
 fn TypedExprIrReportText(ir: TypedExprIr): str =
     var out = ""
     TypedExprReportAppendLine(out, "typed_ir_function_count", intToStr(ir.functions.len))
+    TypedExprReportAppendLine(out, "typed_ir_statement_count", intToStr(ir.statements.len))
+    TypedExprReportAppendLine(out, "typed_ir_let_call_statement_count", intToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtLetCall)))
+    TypedExprReportAppendLine(out, "typed_ir_if_call_statement_count", intToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtIfCall)))
+    TypedExprReportAppendLine(out, "typed_ir_call_statement_count", intToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtCall)))
     TypedExprReportAppendLine(out, "typed_ir_node_count", intToStr(ir.nodes.len))
     TypedExprReportAppendLine(out, "typed_ir_return_kinds", TypedExprIrReturnKindListText(ir))
     TypedExprReportAppendLine(out, "typed_ir_param_ref_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpParamRef)))
+    TypedExprReportAppendLine(out, "typed_ir_return_str_arg0_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpReturnStrArg0)))
     TypedExprReportAppendLine(out, "typed_ir_i32_const_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpI32Const)))
     TypedExprReportAppendLine(out, "typed_ir_i32_add_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpI32Add)))
     TypedExprReportAppendLine(out, "typed_ir_i32_sub_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpI32Sub)))
@@ -1797,6 +1951,7 @@ fn TypedExprIrReportText(ir: TypedExprIr): str =
     TypedExprReportAppendLine(out, "typed_ir_let_call_str_return_len_i32_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpLetCallStrReturnLenI32)))
     TypedExprReportAppendLine(out, "typed_ir_let_call_str_then_call_arg0_return_i32_const_0_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0)))
     TypedExprReportAppendLine(out, "typed_ir_str_i32_guard_arg0_return_0_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpStrI32GuardArg0Return0)))
+    TypedExprReportAppendLine(out, "typed_ir_cstring_to_str_copy_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpCstringToStrCopy)))
     TypedExprReportAppendLine(out, "typed_ir_return_i32_const_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Const)))
     TypedExprReportAppendLine(out, "typed_ir_return_i32_add_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Add)))
     TypedExprReportAppendLine(out, "typed_ir_return_i32_sub_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Sub)))
@@ -1806,12 +1961,14 @@ fn TypedExprIrReportText(ir: TypedExprIr): str =
     TypedExprReportAppendLine(out, "typed_ir_return_i32_if_arg0_le_zero_const_else_const_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32IfArg0LeZeroConstElseConst)))
     TypedExprReportAppendLine(out, "typed_ir_return_f64_mul_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpF64Mul)))
     TypedExprReportAppendLine(out, "typed_ir_return_str_len_fast_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpStrLenFast)))
+    TypedExprReportAppendLine(out, "typed_ir_function_return_str_arg0_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpReturnStrArg0)))
     TypedExprReportAppendLine(out, "typed_ir_return_let_call_result_i32_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpLetCallResultI32)))
     TypedExprReportAppendLine(out, "typed_ir_return_let_call_i32_if_result_le_zero_return_zero_else_result_i32_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpLetCallI32IfResultLeZeroReturnZeroElseResultI32)))
     TypedExprReportAppendLine(out, "typed_ir_return_str_empty_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpStrEmptyReturn)))
     TypedExprReportAppendLine(out, "typed_ir_return_let_call_str_return_len_i32_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpLetCallStrReturnLenI32)))
     TypedExprReportAppendLine(out, "typed_ir_return_let_call_str_then_call_arg0_return_i32_const_0_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0)))
     TypedExprReportAppendLine(out, "typed_ir_return_str_i32_guard_arg0_return_0_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpStrI32GuardArg0Return0)))
+    TypedExprReportAppendLine(out, "typed_ir_return_cstring_to_str_copy_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpCstringToStrCopy)))
     return out
 
 fn TypedExprLoweringRulesReportText(rules: TypedExprLoweringRule[]): str =
@@ -1840,14 +1997,14 @@ fn TypedExprLoweringRulesReportText(rules: TypedExprLoweringRule[]): str =
     TypedExprReportAppendLine(out, "lowering_rule_type_call_constructor_count", intToStr(TypedExprLoweringRuleCountTypeCallKind(rules, TypedExprTypeCallConstructor)))
     TypedExprReportAppendLine(out, "lowering_rule_return_root_count", intToStr(TypedExprLoweringRuleReturnRootCount(rules)))
     for i in 0..<rules.len:
-        TypedExprReportAppendLine(out, "lowering_rule_entry[" + intToStr(i) + "]", TypedExprLoweringRuleEntryText(rules[i]))
+        TypedExprReportAppendLine(out, strutil.Join(["lowering_rule_entry[", intToStr(i), "]"], ""), TypedExprLoweringRuleEntryText(rules[i]))
     return out
 
 fn TypedExprReportText(facts: TypedExprFact[],
                          rules: TypedExprLoweringRule[]): str =
     let factsText = TypedExprFactsReportText(facts)
     let rulesText = TypedExprLoweringRulesReportText(rules)
-    return factsText + rulesText
+    return strutil.Join([factsText, rulesText], "")
 
 fn TypedExprLoweringRuleValidateTypeCallMaterialize(rule: TypedExprLoweringRule,
                                                       err: var str): bool =
@@ -1924,14 +2081,7 @@ fn TypedExprLoweringRulesValidate(rules: TypedExprLoweringRule[],
                (rule.surfaceCallKind == TypedExprSurfaceCallExternal ||
                 rule.surfaceCallKind == TypedExprSurfaceCallMember):
                 if parser.ParserFindText(rule.callTarget, ".") >= 0:
-                    err = " typed expr: qualified call rule missing qualifier: target=" +
-                          rule.callTarget +
-                          " callee=" +
-                          rule.callCallee +
-                          " source=" +
-                          rule.sourcePath +
-                          " expr=" +
-                          rule.exprId
+                    err = strutil.Join([" typed expr: qualified call rule missing qualifier: target=", rule.callTarget, " callee=", rule.callCallee, " source=", rule.sourcePath, " expr=", rule.exprId], "")
                     return false
             if rule.callCallee == "" || rule.callTarget == "":
                 err = " typed expr: call rule missing callee or target"
@@ -2262,6 +2412,36 @@ fn TypedExprParseFunctionReturnType(lineRaw: str): str =
     if eqPos >= 0:
         return TypedExprNormalizeTypeText(chengpath.TextSlice(tail, 0, eqPos))
     return TypedExprNormalizeTypeText(tail)
+
+fn TypedExprFunctionDeclHeaderText(lines: str[],
+                                    lineIndex: int32): str =
+    if lineIndex <= 0 || lineIndex > lines.len:
+        return ""
+    var header = chengpath.PathTrim(lines[lineIndex - 1])
+    var parenDepth: int32
+    for i in 0..<header.len:
+        if header[i] == '(':
+            parenDepth = parenDepth + 1
+        elif header[i] == ')':
+            parenDepth = parenDepth - 1
+    if parenDepth <= 0:
+        return header
+    for i in lineIndex..<lines.len:
+        let lineRaw = lines[i]
+        let trimmed = chengpath.PathTrim(lineRaw)
+        if len(trimmed) <= 0:
+            continue
+        if !parser.ParserHasLeadingIndent(lineRaw):
+            break
+        header = Fmt"{header} {trimmed}"
+        for j in 0..<trimmed.len:
+            if trimmed[j] == '(':
+                parenDepth = parenDepth + 1
+            elif trimmed[j] == ')':
+                parenDepth = parenDepth - 1
+        if parenDepth <= 0:
+            break
+    return header
 
 fn TypedExprBodyTextAfterEquals(lineRaw: str): str =
     let eqPos = TypedExprFindTopLevelTextToken(lineRaw, "=")
@@ -2746,7 +2926,7 @@ fn TypedExprFunctionBodyIsI32LetCallThenIfResultLeZeroReturnZeroElseBinding(ctx:
     let firstBinding = TypedExprLetCallBindingNameFromBody(bodyLines[0])
     if firstBinding == "":
         return false
-    if bodyLines[1] != Fmt(["if ", firstBinding, " <= 0:"]):
+    if bodyLines[1] != strutil.Join(["if ", firstBinding, " <= 0:"], ""):
         return false
     if TypedExprReturnConstTextFromLine(bodyLines[2]) != "0":
         return false
@@ -2894,7 +3074,7 @@ fn TypedExprFunctionBodyIsStrI32GuardArg0ReturnZero(ctx: TypedExprSourceContext,
     let countBinding = TypedExprLetCallBindingNameFromBody(bodyLines[2])
     if countBinding == "":
         return false
-    if bodyLines[3] != Fmt(["if ", countBinding, " <= 0:"]):
+    if bodyLines[3] != strutil.Join(["if ", countBinding, " <= 0:"], ""):
         return false
     if !TypedExprCallStatementUsesBindingArg0(bodyLines[4], firstBinding):
         return false
@@ -2907,6 +3087,43 @@ fn TypedExprFunctionBodyIsStrI32GuardArg0ReturnZero(ctx: TypedExprSourceContext,
     guardCallLineNumber = bodyLineNumbers[4]
     returnLineNumber = bodyLineNumbers[6]
     bindingName = firstBinding
+    return true
+
+fn TypedExprFunctionBodyIsCstringToStrCopy(ctx: TypedExprSourceContext,
+                                            scope: TypedExprFunctionScope,
+                                            params: TypedExprParam[],
+                                            returnLineNumber: var int32): bool =
+    returnLineNumber = 0
+    if scope.returnType != "str":
+        return false
+    if params.len != 1 || params[0].typeText != "cstring":
+        return false
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    var bodyLines: str[]
+    var bodyLineNumbers: int32[]
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        add(bodyLines, bodyTrim)
+        add(bodyLineNumbers, i + 1)
+    let copyReturn = strutil.Join(["return system.strFromCStringCopy(", params[0].name, ")"], "")
+    if bodyLines.len == 1 && bodyLines[0] == copyReturn:
+        returnLineNumber = bodyLineNumbers[0]
+        return true
+    if bodyLines.len != 3:
+        return false
+    if bodyLines[0] != strutil.Join(["if ptr(", params[0].name, ") == nil:"], ""):
+        return false
+    if bodyLines[1] != "return \"\"":
+        return false
+    if bodyLines[2] != copyReturn:
+        return false
+    returnLineNumber = bodyLineNumbers[2]
     return true
 
 fn TypedExprIrAddLetCallNode(ir: var TypedExprIr,
@@ -2972,6 +3189,23 @@ fn TypedExprIrAddStrEmptyReturnNode(ir: var TypedExprIr,
                                 -1,
                                 -1)
 
+fn TypedExprIrAddReturnStrArg0Node(ir: var TypedExprIr,
+                                    sourcePath: str,
+                                    functionName: str,
+                                    lineNumber: int32,
+                                    paramNodeIndex: int32,
+                                    paramName: str): int32 =
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                lineNumber,
+                                TypedExprIrOpReturnStrArg0,
+                                "str",
+                                paramName,
+                                paramNodeIndex,
+                                -1,
+                                -1)
+
 fn TypedExprIrAddLetCallStrReturnLenI32Node(ir: var TypedExprIr,
                                              sourcePath: str,
                                              functionName: str,
@@ -3024,6 +3258,23 @@ fn TypedExprIrAddStrI32GuardArg0Return0Node(ir: var TypedExprIr,
                                 countCallLineNumber,
                                 guardCallLineNumber)
 
+fn TypedExprIrAddCstringToStrCopyNode(ir: var TypedExprIr,
+                                       sourcePath: str,
+                                       functionName: str,
+                                       lineNumber: int32,
+                                       paramNodeIndex: int32,
+                                       paramName: str): int32 =
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                lineNumber,
+                                TypedExprIrOpCstringToStrCopy,
+                                "str",
+                                paramName,
+                                paramNodeIndex,
+                                -1,
+                                -1)
+
 fn TypedExprReturnConstTextFromLine(lineRaw: str): str =
     let exprText = TypedExprReturnExprFromBody(lineRaw)
     if TypedExprIrIsI32ConstLiteral(exprText):
@@ -3058,7 +3309,7 @@ fn TypedExprFunctionBodyIsI32IfArg0LeZeroConstElseConst(ctx: TypedExprSourceCont
         add(bodyLineNumbers, i + 1)
     if bodyLines.len != 3:
         return false
-    if bodyLines[0] != Fmt(["if ", params[0].name, " <= 0:"]):
+    if bodyLines[0] != strutil.Join(["if ", params[0].name, " <= 0:"], ""):
         return false
     let thenText = TypedExprReturnConstTextFromLine(bodyLines[1])
     let elseText = TypedExprReturnConstTextFromLine(bodyLines[2])
@@ -3087,7 +3338,7 @@ fn TypedExprIrAddI32IfArg0LeZeroConstElseConstNode(ir: var TypedExprIr,
     node.operand0NodeIndex = paramNodeIndex
     node.operand1NodeIndex = -1
     node.operand2NodeIndex = -1
-    node.literalText = Fmt([thenConstText, ",", elseConstText])
+    node.literalText = strutil.Join([thenConstText, ",", elseConstText], "")
     return TypedExprIrAddNode(ir, node)
 
 fn TypedExprIrAddBinaryIfMatches(ir: var TypedExprIr,
@@ -3362,6 +3613,34 @@ fn TypedExprIrBuildReturnNode(ir: var TypedExprIr,
                                     paramNodeIndices[0],
                                     -1,
                                     -1)
+    if scope.returnType == "str" &&
+       params.len == 1 &&
+       params[0].typeText == "str" &&
+       returnExpr == params[0].name:
+        return TypedExprIrAddReturnStrArg0Node(ir,
+                                               ctx.sourcePath,
+                                               scope.name,
+                                               bodyLineNumber,
+                                               paramNodeIndices[0],
+                                               params[0].name)
+    if scope.returnType == "int32":
+        let returnParamIndex = TypedExprIrParamNodeIndex(params,
+                                                         paramNodeIndices,
+                                                         returnExpr)
+        if returnParamIndex >= 0 && returnParamIndex < ir.nodes.len:
+            if ir.nodes[returnParamIndex].resultType == "int32":
+                return returnParamIndex
+    var cstringCopyLineNumber: int32
+    if TypedExprFunctionBodyIsCstringToStrCopy(ctx,
+                                               scope,
+                                               params,
+                                               cstringCopyLineNumber):
+        return TypedExprIrAddCstringToStrCopyNode(ir,
+                                                  ctx.sourcePath,
+                                                  scope.name,
+                                                  cstringCopyLineNumber,
+                                                  paramNodeIndices[0],
+                                                  params[0].name)
     var strEmptyReturnLineNumber: int32
     if TypedExprFunctionBodyIsStrEmptyReturn(ctx,
                                              scope,
@@ -3867,11 +4146,14 @@ fn TypedExprFirstExprColumnAfter(ctx: TypedExprSourceContext,
     if lineNumber <= 0 || lineNumber > ctx.exprLineColumns.len:
         return -1
     let lineColumns = ctx.exprLineColumns[lineNumber - 1].columns
+    var bestColumn: int32 = -1
     for i in 0..<lineColumns.len:
         let exprColumnNumber = lineColumns[i]
-        if exprColumnNumber >= minColumn:
-            return exprColumnNumber
-    return -1
+        if exprColumnNumber < minColumn:
+            continue
+        if bestColumn < 0 || exprColumnNumber < bestColumn:
+            bestColumn = exprColumnNumber
+    return bestColumn
 
 fn TypedExprLineHasRootReturn(lineRaw: str,
                                 ctx: TypedExprSourceContext,
@@ -4119,6 +4401,8 @@ fn TypedExprBuildFact(ctx: TypedExprSourceContext,
     let sink = TypedExprSinkForExpr(ctx, expr)
     let scopeIndex = TypedExprScopeIndexForLine(ctx.scopes, expr.lineNumber)
     let sourceResultType = TypedExprInferredResultInputType(ctx, scopeIndex, expr)
+    fact.hasSink = sink.hasSink
+    fact.sinkPlaceKind = sink.sinkPlaceKind
     fact.returnRoot = sink.returnRoot
     if expr.kind == parser.NormalizedExprRange:
         TypedExprApplyResolvedType(fact, ctx, sourceContexts, "range", sink, false)
@@ -4327,10 +4611,11 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
         let decl = decls[i]
         if decl.importc:
             if decl.lineIndex > 0 && decl.lineIndex <= ctx.lines.len:
+                let declHeader = TypedExprFunctionDeclHeaderText(ctx.lines, decl.lineIndex)
                 var importcFn: TypedExprImportcFunction
                 importcFn.sourcePath = source.sourcePath
                 importcFn.name = decl.name
-                importcFn.returnType = TypedExprParseFunctionReturnType(ctx.lines[decl.lineIndex - 1])
+                importcFn.returnType = TypedExprParseFunctionReturnType(declHeader)
                 add(ctx.importcFunctions, importcFn)
             continue
         if decl.lineIndex <= 0 || decl.lineIndex > ctx.lines.len:
@@ -4343,9 +4628,10 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
             scope.endLine = decls[i + 1].lineIndex - 1
         else:
             scope.endLine = ctx.lines.len
-        scope.returnType = TypedExprParseFunctionReturnType(ctx.lines[decl.lineIndex - 1])
+        let declHeader = TypedExprFunctionDeclHeaderText(ctx.lines, decl.lineIndex)
+        scope.returnType = TypedExprParseFunctionReturnType(declHeader)
         add(ctx.scopes, scope)
-        TypedExprAppendParamBindings(ctx.bindings, scope, ctx.lines[decl.lineIndex - 1])
+        TypedExprAppendParamBindings(ctx.bindings, scope, declHeader)
     for i in 0..<ctx.lines.len:
         var bindingName = ""
         var bindingType = ""
@@ -4414,16 +4700,174 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
     err = ""
     return true
 
+fn TypedExprIrAddCallStatement(ir: var TypedExprIr,
+                                scope: TypedExprFunctionScope,
+                                fact: TypedExprFact,
+                                kind: TypedExprIrStatementKind,
+                                bindingName: str,
+                                resultType: str): int32 =
+    var stmt: TypedExprIrStatement
+    stmt.sourcePath = fact.sourcePath
+    stmt.functionName = scope.name
+    stmt.statementIndex = ir.statements.len
+    stmt.lineNumber = fact.lineNumber
+    stmt.columnNumber = fact.columnNumber
+    stmt.exprId = fact.exprId
+    stmt.kind = kind
+    stmt.bindingName = bindingName
+    stmt.resultType = resultType
+    stmt.callTarget = fact.callTarget
+    stmt.callTargetSourcePath = fact.callTargetSourcePath
+    stmt.callTargetImportc = fact.callTargetImportc
+    stmt.callArgCount = fact.callArgCount
+    stmt.callArgsText = fact.callArgsText
+    stmt.loweringMode = fact.loweringMode
+    stmt.returnKind = fact.returnKind
+    add(ir.statements, stmt)
+    return stmt.statementIndex
+
+fn TypedExprIrAppendStatementsForScope(ir: var TypedExprIr,
+                                        ctx: TypedExprSourceContext,
+                                        scope: TypedExprFunctionScope,
+                                        facts: TypedExprFact[],
+                                        startIndex: int32) =
+    let scopeSourcePath = parser.ParserNormalizePath(scope.sourcePath)
+    var currentLineNumber: int32 = -1
+    var currentLineHasIf = false
+    var currentLineBindingName = ""
+    var currentLineBindingType = ""
+    var currentLineBindingRootColumn: int32 = -1
+    var currentLineBindingRhsStartColumn: int32 = -1
+    for i in 0..<facts.len:
+        if i < startIndex:
+            continue
+        if parser.ParserNormalizePath(facts[i].sourcePath) != scopeSourcePath:
+            continue
+        if facts[i].lineNumber <= scope.startLine || facts[i].lineNumber > scope.endLine:
+            if facts[i].lineNumber > scope.endLine:
+                break
+            continue
+        if facts[i].lineNumber != currentLineNumber:
+            currentLineNumber = facts[i].lineNumber
+            currentLineHasIf = false
+            currentLineBindingName = ""
+            currentLineBindingType = ""
+            currentLineBindingRootColumn = -1
+            currentLineBindingRhsStartColumn = -1
+            let lineRaw = TypedExprSourceLine(ctx, currentLineNumber)
+            let trimmedLine = chengpath.PathTrim(lineRaw)
+            var isBindingLine = false
+            if parser.ParserStartsWith(trimmedLine, "let "):
+                isBindingLine = true
+            elif parser.ParserStartsWith(trimmedLine, "var "):
+                isBindingLine = true
+            elif parser.ParserStartsWith(trimmedLine, "const "):
+                isBindingLine = true
+            if isBindingLine:
+                currentLineBindingName = TypedExprLetCallBindingNameFromBody(trimmedLine)
+                var bindingName = ""
+                var bindingType = ""
+                var bindingRhsColumn: int32 = -1
+                if TypedExprParseBindingLine(lineRaw, bindingName, bindingType, bindingRhsColumn):
+                    currentLineBindingName = bindingName
+                    currentLineBindingType = bindingType
+                let eqPos = TypedExprFindTopLevelTextToken(lineRaw, "=")
+                if eqPos >= 0:
+                    var rhsStartColumn = eqPos + 2
+                    for column in rhsStartColumn..lineRaw.len:
+                        if parser.ParserIsInlineSpace(lineRaw[column - 1]):
+                            rhsStartColumn = column + 1
+                        else:
+                            rhsStartColumn = column
+                            break
+                    currentLineBindingRhsStartColumn = rhsStartColumn
+            for j in i..<facts.len:
+                if parser.ParserNormalizePath(facts[j].sourcePath) != scopeSourcePath:
+                    continue
+                if facts[j].lineNumber != currentLineNumber:
+                    if facts[j].lineNumber > currentLineNumber:
+                        break
+                    continue
+                if facts[j].kind == parser.NormalizedExprIf:
+                    currentLineHasIf = true
+                    break
+                if currentLineBindingRhsStartColumn > 0 &&
+                   facts[j].kind == parser.NormalizedExprCall &&
+                   facts[j].columnNumber >= currentLineBindingRhsStartColumn:
+                    if currentLineBindingRootColumn < 0 ||
+                       facts[j].columnNumber < currentLineBindingRootColumn:
+                        currentLineBindingRootColumn = facts[j].columnNumber
+        if facts[i].kind != parser.NormalizedExprCall:
+            continue
+        if !facts[i].callResolved || facts[i].callTarget == "":
+            continue
+        var statementKind = TypedExprIrStmtCall
+        if facts[i].hasSink &&
+           (facts[i].sinkPlaceKind == TypedExprPlaceLocal ||
+            facts[i].sinkPlaceKind == TypedExprPlaceGlobal):
+            statementKind = TypedExprIrStmtLetCall
+        elif currentLineBindingRootColumn == facts[i].columnNumber:
+            statementKind = TypedExprIrStmtLetCall
+        elif currentLineHasIf:
+            statementKind = TypedExprIrStmtIfCall
+        var statementBindingName = ""
+        if statementKind == TypedExprIrStmtLetCall:
+            statementBindingName = currentLineBindingName
+        var statementResultType = facts[i].typeText
+        if statementKind == TypedExprIrStmtLetCall && len(currentLineBindingType) > 0:
+            statementResultType = currentLineBindingType
+        if len(statementResultType) <= 0:
+            statementResultType = TypedExprLookupLocalFunctionReturnType(ctx, facts[i].callTarget)
+        let _ = TypedExprIrAddCallStatement(ir,
+                                            scope,
+                                            facts[i],
+                                            statementKind,
+                                            statementBindingName,
+                                            statementResultType)
+
+fn TypedExprIrFirstBindingCallFactIndex(scope: TypedExprFunctionScope,
+                                         facts: TypedExprFact[],
+                                         lineNumber: int32,
+                                         startIndex: int32): int32 =
+    if lineNumber <= 0:
+        return -1
+    let scopeSourcePath = parser.ParserNormalizePath(scope.sourcePath)
+    for i in 0..<facts.len:
+        if i < startIndex:
+            continue
+        if parser.ParserNormalizePath(facts[i].sourcePath) != scopeSourcePath:
+            continue
+        if facts[i].lineNumber != lineNumber:
+            if facts[i].lineNumber > lineNumber:
+                break
+            continue
+        if facts[i].kind != parser.NormalizedExprCall:
+            continue
+        if !facts[i].callResolved || facts[i].callTarget == "":
+            continue
+        if !facts[i].hasSink:
+            continue
+        if facts[i].sinkPlaceKind != TypedExprPlaceLocal &&
+           facts[i].sinkPlaceKind != TypedExprPlaceGlobal:
+            continue
+        return i
+    return -1
+
 fn TypedExprBuildIrForScope(ctx: TypedExprSourceContext,
                              scope: TypedExprFunctionScope,
+                             facts: TypedExprFact[],
+                             factStartIndex: int32,
                              ir: var TypedExprIr) =
     let nodeStart = ir.nodes.len
+    let statementStart = ir.statements.len
     var fnIr: TypedExprIrFunction
     fnIr.sourcePath = ctx.sourcePath
     fnIr.functionName = scope.name
     fnIr.signatureLineNumber = scope.startLine
+    fnIr.endLineNumber = scope.endLine
     fnIr.returnType = scope.returnType
     fnIr.nodeStart = nodeStart
+    fnIr.statementStart = statementStart
     fnIr.returnNodeIndex = -1
     if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
         add(ir.functions, fnIr)
@@ -4432,7 +4876,7 @@ fn TypedExprBuildIrForScope(ctx: TypedExprSourceContext,
     let bodyText = TypedExprFunctionBodyLine(ctx, scope, bodyLineNumber)
     var returnExpr = TypedExprReturnExprFromBody(bodyText)
     var returnLineNumber = bodyLineNumber
-    let params = TypedExprFunctionParams(ctx.lines[scope.startLine - 1])
+    let params = TypedExprFunctionParams(TypedExprFunctionDeclHeaderText(ctx.lines, scope.startLine))
     var paramNodeIndices: int32[]
     TypedExprIrAddParamNodes(ir,
                              ctx.sourcePath,
@@ -4440,12 +4884,17 @@ fn TypedExprBuildIrForScope(ctx: TypedExprSourceContext,
                              scope.startLine,
                              params,
                              paramNodeIndices)
-    if TypedExprIrBodyTextIsLetCall(bodyText):
+    TypedExprIrAppendStatementsForScope(ir, ctx, scope, facts, factStartIndex)
+    let firstBindingCallFactIndex: int32 = TypedExprIrFirstBindingCallFactIndex(scope,
+                                                                                facts,
+                                                                                bodyLineNumber,
+                                                                                factStartIndex)
+    if firstBindingCallFactIndex >= 0:
         let _ = TypedExprIrAddLetCallNode(ir,
                                           ctx.sourcePath,
                                           scope.name,
                                           bodyLineNumber,
-                                          bodyText)
+                                          facts[firstBindingCallFactIndex].exprId)
         var letCallReturnLineNumber: int32
         var letCallReturnExpr = ""
         if TypedExprFunctionBodyIsI32LetCallThenReturnConst(ctx,
@@ -4464,23 +4913,35 @@ fn TypedExprBuildIrForScope(ctx: TypedExprSourceContext,
     fnIr.bodyLineNumber = bodyLineNumber
     fnIr.returnExpr = returnExpr
     fnIr.returnNodeIndex = returnNodeIndex
+    fnIr.statementCount = ir.statements.len - statementStart
     fnIr.nodeCount = ir.nodes.len - nodeStart
     add(ir.functions, fnIr)
 
-fn TypedExprBuildIr(sourceTexts: TypedExprSourceText[],
-                     ir: var TypedExprIr,
-                     err: var str): bool =
+fn TypedExprBuildIrWithFacts(sourceTexts: TypedExprSourceText[],
+                              facts: TypedExprFact[],
+                              ir: var TypedExprIr,
+                              err: var str): bool =
     var out: TypedExprIr
     for i in 0..<sourceTexts.len:
         var ctx: TypedExprSourceContext
         if !TypedExprBuildSourceContext(sourceTexts[i], ctx, err):
             err = " typed expr: build typed ir source context failed"
             return false
+        let sourceFacts = TypedExprFactsForSource(facts, ctx.sourcePath)
+        var factCursor: int32
         for j in 0..<ctx.scopes.len:
-            TypedExprBuildIrForScope(ctx, ctx.scopes[j], out)
+            while factCursor < sourceFacts.len && sourceFacts[factCursor].lineNumber <= ctx.scopes[j].startLine:
+                factCursor = factCursor + 1
+            TypedExprBuildIrForScope(ctx, ctx.scopes[j], sourceFacts, factCursor, out)
     ir = out
     err = ""
     return true
+
+fn TypedExprBuildIr(sourceTexts: TypedExprSourceText[],
+                     ir: var TypedExprIr,
+                     err: var str): bool =
+    var emptyFacts: TypedExprFact[]
+    return TypedExprBuildIrWithFacts(sourceTexts, emptyFacts, ir, err)
 
 fn TypedExprReturnOpFactFromIrFunction(ir: TypedExprIr,
                                         fnIr: TypedExprIrFunction): TypedExprReturnOpFact =

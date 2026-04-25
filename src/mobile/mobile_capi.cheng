@@ -15,37 +15,10 @@ import cheng/std/bytes_layout as layout
 import cheng/std/crypto/hash256
 import cheng/apps/bio/bio_same_person as bio
 import cheng/apps/bio/bio_did_chain_node as bio_did
+import cheng/mobile/mobile_capi_bridge_internal as bridge
 
-@importc("cheng_buffer_handle_from_raw_bridge")
-fn cheng_buffer_handle_from_raw_bridge(data: ptr, n: int32): uint64
-@importc("cheng_sha256_hex_bridge")
-fn cheng_sha256_hex_bridge(text: str): str
-@importc("cheng_mobile_host_emit_log")
-fn cheng_mobile_host_emit_log(message: str)
-@importc("cheng_mobile_host_moq_request_path_bridge")
-fn cheng_mobile_host_moq_request_path_bridge(): ptr
-@importc("cheng_mobile_host_moq_blob_bridge")
-fn cheng_mobile_host_moq_blob_bridge(): ptr
-@importc("cheng_mobile_host_moq_blob_len_bridge")
-fn cheng_mobile_host_moq_blob_len_bridge(): int32
-@importc("cheng_mobile_host_moq_request_wire_bridge")
-fn cheng_mobile_host_moq_request_wire_bridge(): ptr
-@importc("cheng_mobile_host_moq_request_wire_len_bridge")
-fn cheng_mobile_host_moq_request_wire_len_bridge(): int32
-@importc("malloc")
-fn c_malloc(size: int64): ptr
-@importc("free")
-fn c_free(p: ptr)
-@importc("cheng_fopen")
-fn cheng_fopen(filename, mode: cstring): ptr
-@importc("cheng_fclose")
-fn cheng_fclose(stream: ptr): int32
-@importc("cheng_fwrite")
-fn cheng_fwrite(buf: ptr, size: int64, n: int64, stream: ptr): int32
-@importc("cheng_os_fopen_mode_bridge")
-fn cheng_os_fopen_mode_bridge(path: str, mode: str): ptr
 fn MobileCapiEmitLog(message: str) =
-    cheng_mobile_host_emit_log(message)
+    bridge.InternalMobileBridgeEmitLog(message)
 
 @exportc("MobileCapiPeerIdFromSeed")
 fn MobileCapiPeerIdFromSeed(seed: str): str =
@@ -88,12 +61,9 @@ fn MobileCapiDialableAddr(addrText: str, peerText: str): str =
     let peer = MobileCapiPeerIdNormalize(peerText)
     if len(peer) <= 0:
         return ""
-    if strContains(base, "/p2p/") || strContains(base, "/ipfs/"):
+    if strings.StrContains(base, "/p2p/") || strings.StrContains(base, "/ipfs/"):
         return base
-    var out = base
-    out = out + "/p2p/"
-    out = out + peer
-    return out
+    return Fmt"{base}/p2p/{peer}"
 
 fn MobileCapiBioDidCapture(requestId: str,
                              feature32Hex: str,
@@ -130,7 +100,7 @@ fn MobileCapiDecodeWireText(text: str): Result[str] =
     return Ok[str](decoded)
 
 fn MobileCapiWireFindValue(wire: str, key: str): Result[str] =
-    let prefix = key + "="
+    let prefix = Fmt"{key}="
     var lineStart: int32
     let n = strings.Len(wire)
     while lineStart < n:
@@ -145,7 +115,7 @@ fn MobileCapiWireFindValue(wire: str, key: str): Result[str] =
         if strutils.StartsWith(line, prefix):
             return Ok[str](strutils.SliceStr(line, strings.Len(prefix), strings.Len(line) - 1))
         lineStart = lineEnd + 1
-    return Err[str](" mobile capi: missing wire field " + key)
+    return Err[str](Fmt" mobile capi: missing wire field {key}")
 
 fn MobileCapiWireDecodedValue(wire: str, key: str): Result[str] =
     let rawRes = MobileCapiWireFindValue(wire, key)
@@ -167,7 +137,7 @@ fn MobileCapiTextBufferHandle(text: str): uint64 =
     if textLen <= 0 || rawData == nil:
         return uint64(0)
     MobileCapiEmitLog("mobile_moq:text_buffer_handle_before_bridge")
-    let handle = cheng_buffer_handle_from_raw_bridge(rawData, textLen)
+    let handle = bridge.InternalMobileBridgeBufferHandle(rawData, textLen)
     MobileCapiEmitLog("mobile_moq:text_buffer_handle_after_bridge")
     return handle
 
@@ -183,35 +153,21 @@ fn MobileCapiBytesBufferHandle(payload: Bytes): uint64 =
         bytesSet(snapshot, i, bytesGet(payload, i))
         i = i + 1
     let snapshotData = snapshot.data
-    let handle = cheng_buffer_handle_from_raw_bridge(snapshotData, payloadLen)
+    let handle = bridge.InternalMobileBridgeBufferHandle(snapshotData, payloadLen)
     bytesFree(snapshot)
     return handle
 
-fn MobileCapiTextCString(text: str): ptr =
-    let textLen = len(text)
-    let raw = c_malloc(int64(textLen + 1))
-    if raw == nil:
-        return nil
-    var out = bytesView(raw, textLen + 1)
-    for i in 0..<textLen:
-        bytesSet(out, i, int32(text[i]) & 255)
-    bytesSet(out, textLen, 0)
-    return raw
+fn mobileCapiTextCString(text: str): ptr =
+    return bridge.InternalMobileBridgeTextCString(text)
 
-@exportc("MobileCapiStringFree")
-fn MobileCapiStringFree(text: ptr) =
-    c_free(text)
+fn mobileCapiStringFree(text: ptr) =
+    bridge.InternalMobileBridgeStringFree(text)
 
-fn MobileCapiCopyRawText(raw: ptr): str =
-    if raw == nil:
-        return ""
-    let out = strFromCStringCopy(cstring(raw))
-    return out
+fn mobileCapiCopyRawText(raw: ptr): str =
+    return bridge.InternalMobileBridgeCopyRawText(raw)
 
-fn MobileCapiCopyRawTextLen(raw: ptr, textLen: int32): str =
-    if raw == nil || textLen <= 0:
-        return ""
-    return bytesToString(bytesView(raw, textLen))
+fn mobileCapiCopyRawTextLen(raw: ptr, textLen: int32): str =
+    return bridge.InternalMobileBridgeCopyRawTextLen(raw, textLen)
 
 type MobileMoqDroplet = object
     objectIndex: int32
@@ -275,14 +231,14 @@ fn MobileCapiByteBufAppendText(buf: var layout.ByteBuf, text: str) =
         return
     layout.ByteBufAppendBytes(buf, bytesFromString(text))
 
-fn MobileCapiWireBufAppendRaw(buf: var layout.ByteBuf, key: str, value: str) =
+fn mobileCapiWireBufAppendRaw(buf: var layout.ByteBuf, key: str, value: str) =
     MobileCapiByteBufAppendText(buf, key)
     layout.ByteBufAppendByte(buf, int32('='))
     MobileCapiByteBufAppendText(buf, value)
     layout.ByteBufAppendByte(buf, int32('\n'))
 
 fn MobileCapiWireBufAppendInt(buf: var layout.ByteBuf, key: str, value: int32) =
-    MobileCapiWireBufAppendRaw(buf, key, strings.IntToStr(value))
+    mobileCapiWireBufAppendRaw(buf, key, strings.IntToStr(value))
 
 fn MobileCapiWireRow(key: str, value: str): str =
     var buf = layout.ByteBufInit(len(key) + len(value) + 1)
@@ -420,33 +376,13 @@ fn MobileCapiIndexedFieldKey(groupName: str,
     return bytesToString(layout.ByteBufToBytes(buf))
 
 fn MobileCapiWriteBytesFile(path: str, payload: Bytes): Result[bool] =
-    let outFile = cheng_os_fopen_mode_bridge(path, "wb")
-    if outFile == nil:
-        return Err[bool]("moq_fountain_write_open_failed")
-    let payloadLen = bytesLen(payload)
-    if payloadLen > 0:
-        let wrote: int32 = cheng_fwrite(payload.data, 1, payloadLen, outFile)
-        if wrote != payloadLen:
-            cheng_fclose(outFile)
-            return Err[bool]("moq_fountain_write_failed")
-    cheng_fclose(outFile)
-    return Ok[bool](true)
+    return bridge.InternalMobileBridgeWriteBytesFile(path, payload)
 
 fn MobileCapiAppendBytesFile(path: str, payload: Bytes): Result[bool] =
-    let outFile = cheng_os_fopen_mode_bridge(path, "ab")
-    if outFile == nil:
-        return Err[bool]("moq_fountain_append_open_failed")
-    let payloadLen = bytesLen(payload)
-    if payloadLen > 0:
-        let wrote: int32 = cheng_fwrite(payload.data, 1, payloadLen, outFile)
-        if wrote != payloadLen:
-            cheng_fclose(outFile)
-            return Err[bool]("moq_fountain_append_failed")
-    cheng_fclose(outFile)
-    return Ok[bool](true)
+    return bridge.InternalMobileBridgeAppendBytesFile(path, payload)
 
 fn MobileCapiWriteTraceLine(path: str, line: str): Result[bool] =
-    MobileCapiAppendBytesFile(path, bytesFromString(line + "\n"))
+    MobileCapiAppendBytesFile(path, bytesFromString(Fmt"{line}\n"))
 
 fn MobileCapiMaybeWriteTraceLine(path: str, line: str) =
     if len(path) <= 0:
@@ -606,16 +542,16 @@ fn MobileCapiMoqBuildPersistWireCore(result: moq.MoqFountainBuildResult,
     var objectRow: int32
     while objectRow < result.objects.len:
         let item = result.objects[objectRow]
-        let prefix = "object." + strings.IntToStr(objectRow) + "."
-        add(rows, MobileCapiWireRowInt(prefix + "object_index", item.objectIndex))
-        add(rows, MobileCapiWireRowInt(prefix + "source_block_bytes", item.sourceBlockBytes))
-        add(rows, MobileCapiWireRowInt(prefix + "repair_droplet_count", item.repairDropletCount))
+        let prefix = Fmt"object.{strings.IntToStr(objectRow)}."
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}object_index", item.objectIndex))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}source_block_bytes", item.sourceBlockBytes))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}repair_droplet_count", item.repairDropletCount))
         objectRow = objectRow + 1
     add(rows, MobileCapiWireRowInt("droplet_count", result.droplets.len))
     var dropletRow: int32
     while dropletRow < result.droplets.len:
         let droplet = result.droplets[dropletRow]
-        let prefix = "droplet." + strings.IntToStr(dropletRow) + "."
+        let prefix = Fmt"droplet.{strings.IntToStr(dropletRow)}."
         let dropletPath = MobileCapiPathJoinStemSuffix(outputDir,
                                                          fileNameStem,
                                                          MobileCapiDropletFileSuffix(droplet.objectIndex,
@@ -623,13 +559,13 @@ fn MobileCapiMoqBuildPersistWireCore(result: moq.MoqFountainBuildResult,
         let dropletWriteRes = MobileCapiWriteBytesFile(dropletPath, droplet.payload)
         if IsErr(dropletWriteRes):
             return Err[str](Error(dropletWriteRes))
-        add(rows, MobileCapiWireRowInt(prefix + "object_index", droplet.objectIndex))
-        add(rows, MobileCapiWireRowInt(prefix + "droplet_index", droplet.dropletIndex))
-        add(rows, MobileCapiWireRow(prefix + "key", droplet.key))
-        add(rows, MobileCapiWireRow(prefix + "peer_id", droplet.peerId))
-        add(rows, MobileCapiWireRow(prefix + "cid", droplet.cid))
-        add(rows, MobileCapiWireRow(prefix + "block_indexes", MobileCapiJoinIntCsv(droplet.blockIndexes)))
-        add(rows, MobileCapiWireRow(prefix + "path", dropletPath))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}object_index", droplet.objectIndex))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}droplet_index", droplet.dropletIndex))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}key", droplet.key))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}peer_id", droplet.peerId))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}cid", droplet.cid))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}block_indexes", MobileCapiJoinIntCsv(droplet.blockIndexes)))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}path", dropletPath))
         dropletRow = dropletRow + 1
     return MobileCapiWireRowsResult(rows, "moq_fountain_empty_persist_wire_core")
 
@@ -670,17 +606,17 @@ fn MobileCapiMoqPersistWire(requestWire: str,
     add(extraRows, MobileCapiWireRow("rebuild_template_path", rebuildPath))
     var dropletRow: int32
     while dropletRow < dropletCount:
-        let prefix = "droplet." + strings.IntToStr(dropletRow) + "."
-        let objectIndexRes = moq.MoqFountainParseInt32Wire(requestWire, prefix + "object_index")
+        let prefix = Fmt"droplet.{strings.IntToStr(dropletRow)}."
+        let objectIndexRes = moq.MoqFountainParseInt32Wire(requestWire, Fmt"{prefix}object_index")
         if IsErr(objectIndexRes):
             return Err[str](Error(objectIndexRes))
-        let dropletIndexRes = moq.MoqFountainParseInt32Wire(requestWire, prefix + "droplet_index")
+        let dropletIndexRes = moq.MoqFountainParseInt32Wire(requestWire, Fmt"{prefix}droplet_index")
         if IsErr(dropletIndexRes):
             return Err[str](Error(dropletIndexRes))
-        let kindRes = moq.MoqFountainWireFindValue(requestWire, prefix + "kind")
+        let kindRes = moq.MoqFountainWireFindValue(requestWire, Fmt"{prefix}kind")
         if IsErr(kindRes):
             return Err[str](Error(kindRes))
-        let payloadHexRes = moq.MoqFountainWireFindValue(requestWire, prefix + "payload_hex")
+        let payloadHexRes = moq.MoqFountainWireFindValue(requestWire, Fmt"{prefix}payload_hex")
         if IsErr(payloadHexRes):
             return Err[str](Error(payloadHexRes))
         let payloadRes = moq.MoqFountainBytesFromHex(Value(payloadHexRes))
@@ -694,7 +630,7 @@ fn MobileCapiMoqPersistWire(requestWire: str,
         let dropletWriteRes = MobileCapiWriteBytesFile(dropletPath, Value(payloadRes))
         if IsErr(dropletWriteRes):
             return Err[str](Error(dropletWriteRes))
-        add(extraRows, MobileCapiWireRow(prefix + "path", dropletPath))
+        add(extraRows, MobileCapiWireRow(Fmt"{prefix}path", dropletPath))
         dropletRow = dropletRow + 1
     return MobileCapiWireMergeRows(requestWire, extraRows, "moq_fountain_empty_persist_wire")
 
@@ -728,32 +664,32 @@ fn MobileCapiMoqBuildHandleWire(result: var MobileMoqBuildResult): str =
     var objectRow: int32
     while objectRow < result.objects.len:
         let item = result.objects[objectRow]
-        let prefix = "object." + strings.IntToStr(objectRow) + "."
-        add(rows, MobileCapiWireRowInt(prefix + "object_index", item.objectIndex))
-        add(rows, MobileCapiWireRow(prefix + "group_id", item.groupId))
-        add(rows, MobileCapiWireRow(prefix + "object_id", item.objectId))
-        add(rows, MobileCapiWireRowInt(prefix + "priority", item.priority))
-        add(rows, MobileCapiWireRowInt(prefix + "byte_offset", item.byteOffset))
-        add(rows, MobileCapiWireRowInt(prefix + "byte_length", item.byteLength))
-        add(rows, MobileCapiWireRow(prefix + "object_cid", item.objectCid))
-        add(rows, MobileCapiWireRowInt(prefix + "source_block_bytes", item.sourceBlockBytes))
-        add(rows, MobileCapiWireRowInt(prefix + "source_block_count", item.sourceBlockCount))
-        add(rows, MobileCapiWireRowInt(prefix + "repair_droplet_count", item.repairDropletCount))
+        let prefix = Fmt"object.{strings.IntToStr(objectRow)}."
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}object_index", item.objectIndex))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}group_id", item.groupId))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}object_id", item.objectId))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}priority", item.priority))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}byte_offset", item.byteOffset))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}byte_length", item.byteLength))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}object_cid", item.objectCid))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}source_block_bytes", item.sourceBlockBytes))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}source_block_count", item.sourceBlockCount))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}repair_droplet_count", item.repairDropletCount))
         objectRow = objectRow + 1
     add(rows, MobileCapiWireRowInt("droplet_count", result.droplets.len))
     var dropletRow: int32
     while dropletRow < result.droplets.len:
         let droplet = result.droplets[dropletRow]
-        let prefix = "droplet." + strings.IntToStr(dropletRow) + "."
-        add(rows, MobileCapiWireRowInt(prefix + "object_index", droplet.objectIndex))
-        add(rows, MobileCapiWireRowInt(prefix + "droplet_index", droplet.dropletIndex))
-        add(rows, MobileCapiWireRow(prefix + "kind", MobileCapiMoqDropletKindText(droplet.kindCode)))
-        add(rows, MobileCapiWireRow(prefix + "key", droplet.key))
-        add(rows, MobileCapiWireRow(prefix + "peer_id", droplet.peerId))
-        add(rows, MobileCapiWireRow(prefix + "cid", droplet.cid))
-        add(rows, MobileCapiWireRowInt(prefix + "degree", droplet.degree))
-        add(rows, MobileCapiWireRow(prefix + "block_indexes", MobileCapiJoinIntCsv(droplet.blockIndexes)))
-        add(rows, MobileCapiWireRowUint64(prefix + "handle", MobileCapiBytesBufferHandle(droplet.payload)))
+        let prefix = Fmt"droplet.{strings.IntToStr(dropletRow)}."
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}object_index", droplet.objectIndex))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}droplet_index", droplet.dropletIndex))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}kind", MobileCapiMoqDropletKindText(droplet.kindCode)))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}key", droplet.key))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}peer_id", droplet.peerId))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}cid", droplet.cid))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}degree", droplet.degree))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}block_indexes", MobileCapiJoinIntCsv(droplet.blockIndexes)))
+        add(rows, MobileCapiWireRowUint64(Fmt"{prefix}handle", MobileCapiBytesBufferHandle(droplet.payload)))
         dropletRow = dropletRow + 1
     let outRes = MobileCapiWireRowsResult(rows, "moq_fountain_empty_build_handle_wire")
     if IsErr(outRes):
@@ -930,25 +866,25 @@ fn MobileCapiEscapeJsonText(text: str): str =
         let ch = text[i]
         let code = int32(ch)
         if code == 92:
-            out = out + "\\\\"
+            out = Fmt"{out}\\\\"
         elif code == 34:
-            out = out + "\\\""
+            out = Fmt"{out}\\\""
         elif code == 8:
-            out = out + "\\b"
+            out = Fmt"{out}\\b"
         elif code == 12:
-            out = out + "\\f"
+            out = Fmt"{out}\\f"
         elif code == 10:
-            out = out + "\\n"
+            out = Fmt"{out}\\n"
         elif code == 13:
-            out = out + "\\r"
+            out = Fmt"{out}\\r"
         elif code == 9:
-            out = out + "\\t"
+            out = Fmt"{out}\\t"
         else:
-            out = out + strings.charToStr(ch)
+            out = Fmt"{out}{strings.charToStr(ch)}"
     return out
 
 fn MobileCapiQuoteJsonTextBridge(text: str): str =
-    return "\"" + MobileCapiEscapeJsonText(text) + "\""
+    return Fmt"\"{MobileCapiEscapeJsonText(text)}\""
 
 fn MobileCapiStrformatFmtBridge(parts: str[]): str =
     return strutils.Join(parts, "")
@@ -973,7 +909,7 @@ fn MobileCapiJoinIntJson(values: int32[]): str =
     rows = []
     for i in 0..<values.len:
         add(rows, strings.IntToStr(values[i]))
-    return "[" + strutils.Join(rows, ",") + "]"
+    return Fmt"[{strutils.Join(rows, ",")}]"
 
 fn MobileCapiContainsInt(values: int32[], want: int32): bool =
     for i in 0..<values.len:
@@ -996,7 +932,7 @@ fn MobileCapiSortInts(values0: int32[]): int32[] =
     return values
 
 fn MobileCapiHashSeed(text: str): int32 =
-    let digestHex = cheng_sha256_hex_bridge(text)
+    let digestHex = bridge.InternalMobileBridgeSha256Hex(text)
     if len(digestHex) < 8:
         return 1
     var out: int32
@@ -1015,15 +951,15 @@ fn MobileCapiMoqDropletJson(droplet: MobileMoqDroplet): str =
     let kindText = MobileCapiMoqDropletKindText(droplet.kindCode)
     var rows: str[]
     rows = []
-    add(rows, Fmt(["\"objectIndex\":", strings.IntToStr(droplet.objectIndex)]))
-    add(rows, Fmt(["\"dropletIndex\":", strings.IntToStr(droplet.dropletIndex)]))
-    add(rows, Fmt(["\"kind\":", MobileCapiJsonQuote(kindText)]))
-    add(rows, Fmt(["\"key\":", MobileCapiJsonQuote(droplet.key)]))
-    add(rows, Fmt(["\"peerId\":", MobileCapiJsonQuote(droplet.peerId)]))
-    add(rows, Fmt(["\"cid\":", MobileCapiJsonQuote(droplet.cid)]))
-    add(rows, Fmt(["\"degree\":", strings.IntToStr(droplet.degree)]))
-    add(rows, Fmt(["\"blockIndexes\":", MobileCapiJoinIntJson(droplet.blockIndexes)]))
-    return Fmt(["{", strutils.Join(rows, ","), "}"])
+    add(rows, Fmt"\"objectIndex\":{strings.IntToStr(droplet.objectIndex)}")
+    add(rows, Fmt"\"dropletIndex\":{strings.IntToStr(droplet.dropletIndex)}")
+    add(rows, Fmt"\"kind\":{MobileCapiJsonQuote(kindText)}")
+    add(rows, Fmt"\"key\":{MobileCapiJsonQuote(droplet.key)}")
+    add(rows, Fmt"\"peerId\":{MobileCapiJsonQuote(droplet.peerId)}")
+    add(rows, Fmt"\"cid\":{MobileCapiJsonQuote(droplet.cid)}")
+    add(rows, Fmt"\"degree\":{strings.IntToStr(droplet.degree)}")
+    add(rows, Fmt"\"blockIndexes\":{MobileCapiJoinIntJson(droplet.blockIndexes)}")
+    return Fmt"{{{strutils.Join(rows, ",")}}}"
 
 fn MobileCapiMoqDropletsJson(droplets: MobileMoqDroplet[]): str =
     var rows: str[]
@@ -1037,18 +973,18 @@ fn MobileCapiMoqDropletsJson(droplets: MobileMoqDroplet[]): str =
 fn MobileCapiMoqObjectJson(item: MobileMoqObject): str =
     var rows: str[]
     rows = []
-    add(rows, Fmt(["\"objectIndex\":", strings.IntToStr(item.objectIndex)]))
-    add(rows, Fmt(["\"groupId\":", MobileCapiJsonQuote(item.groupId)]))
-    add(rows, Fmt(["\"objectId\":", MobileCapiJsonQuote(item.objectId)]))
-    add(rows, Fmt(["\"priority\":", strings.IntToStr(item.priority)]))
-    add(rows, Fmt(["\"byteOffset\":", strings.IntToStr(item.byteOffset)]))
-    add(rows, Fmt(["\"byteLength\":", strings.IntToStr(item.byteLength)]))
-    add(rows, Fmt(["\"objectCid\":", MobileCapiJsonQuote(item.objectCid)]))
-    add(rows, Fmt(["\"sourceBlockBytes\":", strings.IntToStr(item.sourceBlockBytes)]))
-    add(rows, Fmt(["\"sourceBlockCount\":", strings.IntToStr(item.sourceBlockCount)]))
-    add(rows, Fmt(["\"repairDropletCount\":", strings.IntToStr(item.repairDropletCount)]))
-    add(rows, Fmt(["\"droplets\":[", MobileCapiMoqDropletsJson(item.droplets), "]"]))
-    return Fmt(["{", strutils.Join(rows, ","), "}"])
+    add(rows, Fmt"\"objectIndex\":{strings.IntToStr(item.objectIndex)}")
+    add(rows, Fmt"\"groupId\":{MobileCapiJsonQuote(item.groupId)}")
+    add(rows, Fmt"\"objectId\":{MobileCapiJsonQuote(item.objectId)}")
+    add(rows, Fmt"\"priority\":{strings.IntToStr(item.priority)}")
+    add(rows, Fmt"\"byteOffset\":{strings.IntToStr(item.byteOffset)}")
+    add(rows, Fmt"\"byteLength\":{strings.IntToStr(item.byteLength)}")
+    add(rows, Fmt"\"objectCid\":{MobileCapiJsonQuote(item.objectCid)}")
+    add(rows, Fmt"\"sourceBlockBytes\":{strings.IntToStr(item.sourceBlockBytes)}")
+    add(rows, Fmt"\"sourceBlockCount\":{strings.IntToStr(item.sourceBlockCount)}")
+    add(rows, Fmt"\"repairDropletCount\":{strings.IntToStr(item.repairDropletCount)}")
+    add(rows, Fmt"\"droplets\":[{MobileCapiMoqDropletsJson(item.droplets)}]")
+    return Fmt"{{{strutils.Join(rows, ",")}}}"
 
 fn MobileCapiParseInt32Text(text: str): int32 =
     return int32(strutils.ParseInt(text))
@@ -1100,7 +1036,7 @@ fn MobileCapiMoqBuildObject(objectBytes: Bytes,
         add(indexes, blockIndex)
         let peerId = peers[(objectIndex + blockIndex) % peers.len]
         let payload = blocks[blockIndex]
-        let key = "moqdrop-" + bundleCid + "-o" + strings.IntToStr(objectIndex) + "-s" + strings.IntToStr(blockIndex)
+        let key = Fmt"moqdrop-{bundleCid}-o{strings.IntToStr(objectIndex)}-s{strings.IntToStr(blockIndex)}"
         let droplet = MobileMoqDroplet(
             objectIndex: objectIndex,
             dropletIndex: blockIndex,
@@ -1119,9 +1055,9 @@ fn MobileCapiMoqBuildObject(objectBytes: Bytes,
     while repairIndex < repairDropletCount:
         var degreeBase: int32 = 1
         if sourceBlockCount > 1:
-            let seedText = bundleCid + "|o" + strings.IntToStr(objectIndex) + "|r" + strings.IntToStr(repairIndex)
+            let seedText = Fmt"{bundleCid}|o{strings.IntToStr(objectIndex)}|r{strings.IntToStr(repairIndex)}"
             degreeBase = 2 + MobileCapiPositiveMod(MobileCapiHashSeed(seedText), sourceBlockCount - 1)
-        let repairSeed = bundleCid + "|repair|" + strings.IntToStr(objectIndex) + "|" + strings.IntToStr(repairIndex)
+        let repairSeed = Fmt"{bundleCid}|repair|{strings.IntToStr(objectIndex)}|{strings.IntToStr(repairIndex)}"
         let blockIndexes = MobileCapiChooseUniqueBlockIndexes(
             sourceBlockCount,
             degreeBase,
@@ -1136,7 +1072,7 @@ fn MobileCapiMoqBuildObject(objectBytes: Bytes,
             blockPick = blockPick + 1
         let dropletIndex = sourceBlockCount + repairIndex
         let peerId = peers[(objectIndex + dropletIndex) % peers.len]
-        let key = "moqdrop-" + bundleCid + "-o" + strings.IntToStr(objectIndex) + "-r" + strings.IntToStr(repairIndex)
+        let key = Fmt"moqdrop-{bundleCid}-o{strings.IntToStr(objectIndex)}-r{strings.IntToStr(repairIndex)}"
         let droplet = MobileMoqDroplet(
             objectIndex: objectIndex,
             dropletIndex: dropletIndex,
@@ -1154,7 +1090,7 @@ fn MobileCapiMoqBuildObject(objectBytes: Bytes,
     let objectOut = MobileMoqObject(
         objectIndex: objectIndex,
         groupId: bundleCid,
-        objectId: "object-" + strings.IntToStr(objectIndex),
+        objectId: Fmt"object-{strings.IntToStr(objectIndex)}",
         priority: objectIndex,
         byteOffset: byteOffset,
         byteLength: objectByteLen,
@@ -1242,17 +1178,17 @@ fn MobileCapiMoqBuildCatalogJson(ownerPeerId: str,
     add(rows, "\"version\":1")
     add(rows, "\"transport\":\"native_media_rpc\"")
     add(rows, "\"fountainLayout\":\"lt_xor_v1\"")
-    add(rows, Fmt(["\"ownerPeerId\":", MobileCapiJsonQuote(ownerPeerId)]))
-    add(rows, Fmt(["\"mimeType\":", MobileCapiJsonQuote(mimeType)]))
-    add(rows, Fmt(["\"blobCid\":", MobileCapiJsonQuote(blobCid)]))
-    add(rows, Fmt(["\"blobByteLen\":", strings.IntToStr(blobByteLen)]))
-    add(rows, Fmt(["\"trackId\":", MobileCapiJsonQuote("track:" + bundleCid)]))
-    add(rows, Fmt(["\"bundleCid\":", MobileCapiJsonQuote(bundleCid)]))
-    add(rows, Fmt(["\"objectTargetBytes\":", strings.IntToStr(objectTargetBytes)]))
-    add(rows, Fmt(["\"sourceBlockBytes\":", strings.IntToStr(sourceBlockBytes)]))
-    add(rows, Fmt(["\"objectCount\":", strings.IntToStr(objects.len)]))
-    add(rows, Fmt(["\"objects\":[", strutils.Join(objectRows, ","), "]"]))
-    return Fmt(["{", strutils.Join(rows, ","), "}"])
+    add(rows, strutils.Join(["\"ownerPeerId\":", MobileCapiJsonQuote(ownerPeerId)], ""))
+    add(rows, strutils.Join(["\"mimeType\":", MobileCapiJsonQuote(mimeType)], ""))
+    add(rows, strutils.Join(["\"blobCid\":", MobileCapiJsonQuote(blobCid)], ""))
+    add(rows, strutils.Join(["\"blobByteLen\":", strings.IntToStr(blobByteLen)], ""))
+    add(rows, strutils.Join(["\"trackId\":", MobileCapiJsonQuote(Fmt"track:{bundleCid}")], ""))
+    add(rows, strutils.Join(["\"bundleCid\":", MobileCapiJsonQuote(bundleCid)], ""))
+    add(rows, strutils.Join(["\"objectTargetBytes\":", strings.IntToStr(objectTargetBytes)], ""))
+    add(rows, strutils.Join(["\"sourceBlockBytes\":", strings.IntToStr(sourceBlockBytes)], ""))
+    add(rows, strutils.Join(["\"objectCount\":", strings.IntToStr(objects.len)], ""))
+    add(rows, strutils.Join(["\"objects\":[", strutils.Join(objectRows, ","), "]"], ""))
+    return strutils.Join(["{", strutils.Join(rows, ","), "}"], "")
 
 fn MobileCapiMoqBuildBundleSeed(ownerPeerId: str,
                                   blobCid: str,
@@ -1261,13 +1197,7 @@ fn MobileCapiMoqBuildBundleSeed(ownerPeerId: str,
                                   objectTargetBytes: int32,
                                   sourceBlockBytes: int32,
                                   repairDropletCount: int32): str =
-    return ownerPeerId + "|" +
-        blobCid + "|" +
-        mimeType + "|" +
-        MobileCapiJoinCsv(peers) + "|" +
-        strings.IntToStr(objectTargetBytes) + "|" +
-        strings.IntToStr(sourceBlockBytes) + "|" +
-        strings.IntToStr(repairDropletCount)
+    return Fmt"{ownerPeerId}|{blobCid}|{mimeType}|{MobileCapiJoinCsv(peers)}|{strings.IntToStr(objectTargetBytes)}|{strings.IntToStr(sourceBlockBytes)}|{strings.IntToStr(repairDropletCount)}"
 
 fn MobileCapiMoqRebuildTemplateWire(objects: MobileMoqObject[],
                                       droplets: MobileMoqDroplet[],
@@ -1282,23 +1212,23 @@ fn MobileCapiMoqRebuildTemplateWire(objects: MobileMoqObject[],
     var objectRow: int32
     while objectRow < objects.len:
         let item = objects[objectRow]
-        let prefix = "object." + strings.IntToStr(objectRow) + "."
-        add(rows, MobileCapiWireRowInt(prefix + "object_index", item.objectIndex))
-        add(rows, MobileCapiWireRowInt(prefix + "byte_length", item.byteLength))
-        add(rows, MobileCapiWireRowInt(prefix + "source_block_bytes", item.sourceBlockBytes))
-        add(rows, MobileCapiWireRowInt(prefix + "source_block_count", item.sourceBlockCount))
-        add(rows, MobileCapiWireRow(prefix + "object_cid", item.objectCid))
+        let prefix = Fmt"object.{strings.IntToStr(objectRow)}."
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}object_index", item.objectIndex))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}byte_length", item.byteLength))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}source_block_bytes", item.sourceBlockBytes))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}source_block_count", item.sourceBlockCount))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}object_cid", item.objectCid))
         objectRow = objectRow + 1
     var dropletRow: int32
     while dropletRow < droplets.len:
         let item = droplets[dropletRow]
-        let prefix = "droplet." + strings.IntToStr(dropletRow) + "."
-        add(rows, MobileCapiWireRowInt(prefix + "object_index", item.objectIndex))
-        add(rows, MobileCapiWireRowInt(prefix + "droplet_index", item.dropletIndex))
-        add(rows, MobileCapiWireRow(prefix + "key", item.key))
-        add(rows, MobileCapiWireRow(prefix + "peer_id", item.peerId))
-        add(rows, MobileCapiWireRow(prefix + "cid", item.cid))
-        add(rows, MobileCapiWireRow(prefix + "block_indexes", MobileCapiJoinIntCsv(item.blockIndexes)))
+        let prefix = Fmt"droplet.{strings.IntToStr(dropletRow)}."
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}object_index", item.objectIndex))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}droplet_index", item.dropletIndex))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}key", item.key))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}peer_id", item.peerId))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}cid", item.cid))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}block_indexes", MobileCapiJoinIntCsv(item.blockIndexes)))
         dropletRow = dropletRow + 1
     return MobileCapiWireRowsText(rows)
 
@@ -1326,32 +1256,32 @@ fn MobileCapiMoqBuildResultToWire(result: MobileMoqBuildResult): str =
     var objectRow: int32
     while objectRow < result.objects.len:
         let item = result.objects[objectRow]
-        let prefix = "object." + strings.IntToStr(objectRow) + "."
-        add(rows, MobileCapiWireRowInt(prefix + "object_index", item.objectIndex))
-        add(rows, MobileCapiWireRow(prefix + "group_id", item.groupId))
-        add(rows, MobileCapiWireRow(prefix + "object_id", item.objectId))
-        add(rows, MobileCapiWireRowInt(prefix + "priority", item.priority))
-        add(rows, MobileCapiWireRowInt(prefix + "byte_offset", item.byteOffset))
-        add(rows, MobileCapiWireRowInt(prefix + "byte_length", item.byteLength))
-        add(rows, MobileCapiWireRow(prefix + "object_cid", item.objectCid))
-        add(rows, MobileCapiWireRowInt(prefix + "source_block_bytes", item.sourceBlockBytes))
-        add(rows, MobileCapiWireRowInt(prefix + "source_block_count", item.sourceBlockCount))
-        add(rows, MobileCapiWireRowInt(prefix + "repair_droplet_count", item.repairDropletCount))
+        let prefix = Fmt"object.{strings.IntToStr(objectRow)}."
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}object_index", item.objectIndex))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}group_id", item.groupId))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}object_id", item.objectId))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}priority", item.priority))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}byte_offset", item.byteOffset))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}byte_length", item.byteLength))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}object_cid", item.objectCid))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}source_block_bytes", item.sourceBlockBytes))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}source_block_count", item.sourceBlockCount))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}repair_droplet_count", item.repairDropletCount))
         objectRow = objectRow + 1
     add(rows, MobileCapiWireRowInt("droplet_count", result.droplets.len))
     var dropletRow: int32
     while dropletRow < result.droplets.len:
         let item = result.droplets[dropletRow]
-        let prefix = "droplet." + strings.IntToStr(dropletRow) + "."
-        add(rows, MobileCapiWireRowInt(prefix + "object_index", item.objectIndex))
-        add(rows, MobileCapiWireRowInt(prefix + "droplet_index", item.dropletIndex))
-        add(rows, MobileCapiWireRow(prefix + "kind", MobileCapiMoqDropletKindText(item.kindCode)))
-        add(rows, MobileCapiWireRow(prefix + "key", item.key))
-        add(rows, MobileCapiWireRow(prefix + "peer_id", item.peerId))
-        add(rows, MobileCapiWireRow(prefix + "cid", item.cid))
-        add(rows, MobileCapiWireRowInt(prefix + "degree", item.degree))
-        add(rows, MobileCapiWireRow(prefix + "block_indexes", MobileCapiJoinIntCsv(item.blockIndexes)))
-        add(rows, MobileCapiWireRow(prefix + "payload_hex", bytesToHex(item.payload)))
+        let prefix = Fmt"droplet.{strings.IntToStr(dropletRow)}."
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}object_index", item.objectIndex))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}droplet_index", item.dropletIndex))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}kind", MobileCapiMoqDropletKindText(item.kindCode)))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}key", item.key))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}peer_id", item.peerId))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}cid", item.cid))
+        add(rows, MobileCapiWireRowInt(Fmt"{prefix}degree", item.degree))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}block_indexes", MobileCapiJoinIntCsv(item.blockIndexes)))
+        add(rows, MobileCapiWireRow(Fmt"{prefix}payload_hex", bytesToHex(item.payload)))
         dropletRow = dropletRow + 1
     return MobileCapiWireRowsText(rows)
 
@@ -1483,20 +1413,20 @@ fn MobileCapiMoqBuildResultFromCore(item: moq.MoqFountainBuildResult): MobileMoq
     )
 
 fn MobileCapiMoqSourceDropletKey(bundleCid: str, objectIndex: int32, dropletIndex: int32): str =
-    return Fmt(["moqdrop-",
+    return strutils.Join(["moqdrop-",
                 bundleCid,
                 "-o",
                 strings.IntToStr(objectIndex),
                 "-s",
-                strings.IntToStr(dropletIndex)])
+                strings.IntToStr(dropletIndex)], "")
 
 fn MobileCapiMoqRepairDropletKey(bundleCid: str, objectIndex: int32, repairIndex: int32): str =
-    return Fmt(["moqdrop-",
+    return strutils.Join(["moqdrop-",
                 bundleCid,
                 "-o",
                 strings.IntToStr(objectIndex),
                 "-r",
-                strings.IntToStr(repairIndex)])
+                strings.IntToStr(repairIndex)], "")
 
 fn MobileCapiMoqHydratedCoreResult(base: MobileMoqBuildResult,
                                      blobBytes: Bytes,
@@ -1541,7 +1471,7 @@ fn MobileCapiMoqHydratedCoreResult(base: MobileMoqBuildResult,
     var objectRow: int32
     while objectRow < out.objects.len:
         out.objects[objectRow].groupId = bundleCid
-        out.objects[objectRow].objectId = Fmt(["object-", strings.IntToStr(out.objects[objectRow].objectIndex)])
+        out.objects[objectRow].objectId = strutils.Join(["object-", strings.IntToStr(out.objects[objectRow].objectIndex)], "")
         objectRow = objectRow + 1
 
     var dropletRow: int32
@@ -1581,7 +1511,7 @@ fn MobileCapiMoqHydratedCoreResult(base: MobileMoqBuildResult,
     let catalogPayload = bytesFromString(catalogText)
     if bytesLen(catalogPayload) <= 0:
         return Err[MobileMoqBuildResult]("moq_fountain_empty_catalog_payload")
-    out.catalogKey = Fmt(["moqcatalog-", bundleCid])
+    out.catalogKey = strutils.Join(["moqcatalog-", bundleCid], "")
     out.catalogCid = MobileCapiSha256HexBytes(catalogPayload)
     out.catalogSizeBytes = bytesLen(catalogPayload)
     out.catalogPayloadText = catalogText
@@ -1594,7 +1524,7 @@ fn MobileCapiMoqHydratedCoreResult(base: MobileMoqBuildResult,
     let rebuildTemplatePayload = bytesFromString(rebuildTemplateText)
     if bytesLen(rebuildTemplatePayload) <= 0:
         return Err[MobileMoqBuildResult]("moq_fountain_empty_rebuild_template")
-    out.rebuildTemplateKey = Fmt(["moqrebuild-", bundleCid])
+    out.rebuildTemplateKey = strutils.Join(["moqrebuild-", bundleCid], "")
     out.rebuildTemplateCid = MobileCapiSha256HexBytes(rebuildTemplatePayload)
     out.rebuildTemplateSizeBytes = bytesLen(rebuildTemplatePayload)
     out.rebuildTemplatePayloadText = rebuildTemplateText
@@ -1646,7 +1576,7 @@ fn MobileCapiMoqBuildResolved(blobBytes: Bytes,
     let traceEnabled = len(tracePath) > 0
     if traceEnabled:
         MobileCapiMaybeWriteTraceLine(tracePath, "build:enter")
-        MobileCapiMaybeWriteTraceLine(tracePath, "build:blob_len=" + strings.IntToStr(bytesLen(blobBytes)))
+        MobileCapiMaybeWriteTraceLine(tracePath, Fmt"build:blob_len={strings.IntToStr(bytesLen(blobBytes))}")
     if bytesLen(blobBytes) <= 0:
         if traceEnabled:
             MobileCapiMaybeWriteTraceLine(tracePath, "build:error=moq_fountain_empty_blob")
@@ -1666,7 +1596,7 @@ fn MobileCapiMoqBuildResolved(blobBytes: Bytes,
     MobileCapiEmitLog("mobile_moq:build_after_core")
     if IsErr(buildRes):
         if traceEnabled:
-            MobileCapiMaybeWriteTraceLine(tracePath, "build:error=" + Error(buildRes))
+            MobileCapiMaybeWriteTraceLine(tracePath, Fmt"build:error={Error(buildRes)}")
         return Err[MobileMoqBuildResult](Error(buildRes))
     let coreBuild = Value(buildRes)
     var coreObjects: MobileMoqObject[]
@@ -1758,18 +1688,17 @@ fn MobileCapiMoqBuildResolved(blobBytes: Bytes,
                                                        repairDropletCount0)
     if IsErr(hydrateRes):
         if traceEnabled:
-            MobileCapiMaybeWriteTraceLine(tracePath, "build:error=" + Error(hydrateRes))
+            MobileCapiMaybeWriteTraceLine(tracePath, Fmt"build:error={Error(hydrateRes)}")
         return Err[MobileMoqBuildResult](Error(hydrateRes))
     let out = Value(hydrateRes)
     MobileCapiEmitLog("mobile_moq:build_ok")
     if traceEnabled:
-        MobileCapiMaybeWriteTraceLine(tracePath, "build:blob_cid=" + out.blobCid)
-        MobileCapiMaybeWriteTraceLine(tracePath, "build:bundle_cid=" + out.bundleCid)
+        MobileCapiMaybeWriteTraceLine(tracePath, Fmt"build:blob_cid={out.blobCid}")
+        MobileCapiMaybeWriteTraceLine(tracePath, Fmt"build:bundle_cid={out.bundleCid}")
         MobileCapiMaybeWriteTraceLine(tracePath,
-                                        "build:objects_done count=" + strings.IntToStr(out.objects.len) +
-                                            " droplets=" + strings.IntToStr(out.droplets.len))
-        MobileCapiMaybeWriteTraceLine(tracePath, "build:catalog_bytes=" + strings.IntToStr(bytesLen(out.catalogPayload)))
-        MobileCapiMaybeWriteTraceLine(tracePath, "build:rebuild_template_bytes=" + strings.IntToStr(bytesLen(out.rebuildTemplatePayload)))
+                                        Fmt"build:objects_done count={strings.IntToStr(out.objects.len)} droplets={strings.IntToStr(out.droplets.len)}")
+        MobileCapiMaybeWriteTraceLine(tracePath, Fmt"build:catalog_bytes={strings.IntToStr(bytesLen(out.catalogPayload))}")
+        MobileCapiMaybeWriteTraceLine(tracePath, Fmt"build:rebuild_template_bytes={strings.IntToStr(bytesLen(out.rebuildTemplatePayload))}")
         MobileCapiMaybeWriteTraceLine(tracePath, "build:ok")
     return Ok[MobileMoqBuildResult](out)
 
@@ -1834,8 +1763,113 @@ fn MobileCapiMoqFountainBuild(blobText: str,
         return MobileCapiMoqError(Error(buildOk))
     return MobileCapiMoqBuildResultToWire(buildRes)
 
-@exportc("MobileCapiMoqFountainBuildRaw")
-fn MobileCapiMoqFountainBuildRaw(blobPtr: ptr,
+@exportc("MobileCapiMoqFountainBuildRequest")
+fn MobileCapiMoqFountainBuildRequest(blobText: str,
+                                       requestWire: str): str =
+    let blobBytes = bytesFromString(blobText)
+    if bytesLen(blobBytes) <= 0:
+        return MobileCapiMoqError("moq_fountain_empty_blob")
+    let ownerPeerIdRes = moq.MoqFountainWireFindValue(requestWire, "owner_peer_id")
+    if IsErr(ownerPeerIdRes):
+        return MobileCapiMoqError(Error(ownerPeerIdRes))
+    let remotePeersCsvRes = moq.MoqFountainWireFindValue(requestWire, "remote_peers_csv")
+    if IsErr(remotePeersCsvRes):
+        return MobileCapiMoqError(Error(remotePeersCsvRes))
+    let mimeTypeRes = moq.MoqFountainWireFindValue(requestWire, "mime_type")
+    if IsErr(mimeTypeRes):
+        return MobileCapiMoqError(Error(mimeTypeRes))
+    let objectTargetBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "object_target_bytes")
+    if IsErr(objectTargetBytesRes):
+        return MobileCapiMoqError(Error(objectTargetBytesRes))
+    let sourceBlockBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "source_block_bytes")
+    if IsErr(sourceBlockBytesRes):
+        return MobileCapiMoqError(Error(sourceBlockBytesRes))
+    let repairDropletCountRes = moq.MoqFountainParseInt32Wire(requestWire, "repair_droplet_count")
+    if IsErr(repairDropletCountRes):
+        return MobileCapiMoqError(Error(repairDropletCountRes))
+    var buildRes: MobileMoqBuildResult
+    let buildOk = MobileCapiMoqBuild(buildRes,
+                                       blobBytes,
+                                       Value(ownerPeerIdRes),
+                                       Value(remotePeersCsvRes),
+                                       Value(mimeTypeRes),
+                                       Value(objectTargetBytesRes),
+                                       Value(sourceBlockBytesRes),
+                                       Value(repairDropletCountRes))
+    if IsErr(buildOk):
+        return MobileCapiMoqError(Error(buildOk))
+    return MobileCapiMoqBuildResultToWire(buildRes)
+
+@exportc("MobileCapiMoqFountainBuildPersist")
+fn MobileCapiMoqFountainBuildPersist(blobText: str,
+                                       ownerPeerId: str,
+                                       remotePeersCsv: str,
+                                       mimeType0: str,
+                                       objectTargetBytes0: int32,
+                                       sourceBlockBytes0: int32,
+                                       repairDropletCount0: int32,
+                                       outputDir: str,
+                                       fileNameStem: str): str =
+    let blobBytes = bytesFromString(blobText)
+    if bytesLen(blobBytes) <= 0:
+        return MobileCapiMoqError("moq_fountain_empty_blob")
+    let persistRes = MobileCapiMoqBuildPersistDirect(blobBytes,
+                                                       ownerPeerId,
+                                                       remotePeersCsv,
+                                                       mimeType0,
+                                                       objectTargetBytes0,
+                                                       sourceBlockBytes0,
+                                                       repairDropletCount0,
+                                                       outputDir,
+                                                       fileNameStem)
+    if IsErr(persistRes):
+        return MobileCapiMoqError(Error(persistRes))
+    return Value(persistRes)
+
+@exportc("MobileCapiMoqFountainBuildPersistRequest")
+fn MobileCapiMoqFountainBuildPersistRequest(blobText: str,
+                                               requestWire: str): str =
+    let blobBytes = bytesFromString(blobText)
+    if bytesLen(blobBytes) <= 0:
+        return MobileCapiMoqError("moq_fountain_empty_blob")
+    let ownerPeerIdRes = moq.MoqFountainWireFindValue(requestWire, "owner_peer_id")
+    if IsErr(ownerPeerIdRes):
+        return MobileCapiMoqError(Error(ownerPeerIdRes))
+    let remotePeersCsvRes = moq.MoqFountainWireFindValue(requestWire, "remote_peers_csv")
+    if IsErr(remotePeersCsvRes):
+        return MobileCapiMoqError(Error(remotePeersCsvRes))
+    let mimeTypeRes = moq.MoqFountainWireFindValue(requestWire, "mime_type")
+    if IsErr(mimeTypeRes):
+        return MobileCapiMoqError(Error(mimeTypeRes))
+    let objectTargetBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "object_target_bytes")
+    if IsErr(objectTargetBytesRes):
+        return MobileCapiMoqError(Error(objectTargetBytesRes))
+    let sourceBlockBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "source_block_bytes")
+    if IsErr(sourceBlockBytesRes):
+        return MobileCapiMoqError(Error(sourceBlockBytesRes))
+    let repairDropletCountRes = moq.MoqFountainParseInt32Wire(requestWire, "repair_droplet_count")
+    if IsErr(repairDropletCountRes):
+        return MobileCapiMoqError(Error(repairDropletCountRes))
+    let outputDirRes = moq.MoqFountainWireFindValue(requestWire, "output_dir")
+    if IsErr(outputDirRes):
+        return MobileCapiMoqError(Error(outputDirRes))
+    let fileNameStemRes = moq.MoqFountainWireFindValue(requestWire, "file_name_stem")
+    if IsErr(fileNameStemRes):
+        return MobileCapiMoqError(Error(fileNameStemRes))
+    let persistRes = MobileCapiMoqBuildPersistDirect(blobBytes,
+                                                       Value(ownerPeerIdRes),
+                                                       Value(remotePeersCsvRes),
+                                                       Value(mimeTypeRes),
+                                                       Value(objectTargetBytesRes),
+                                                       Value(sourceBlockBytesRes),
+                                                       Value(repairDropletCountRes),
+                                                       Value(outputDirRes),
+                                                       Value(fileNameStemRes))
+    if IsErr(persistRes):
+        return MobileCapiMoqError(Error(persistRes))
+    return Value(persistRes)
+
+fn mobileCapiMoqFountainBuildRaw(blobPtr: ptr,
                                    blobLen: int32,
                                    ownerPeerIdRaw: ptr,
                                    remotePeersCsvRaw: ptr,
@@ -1845,9 +1879,9 @@ fn MobileCapiMoqFountainBuildRaw(blobPtr: ptr,
                                    repairDropletCount0: int32): str =
     if blobPtr == nil || blobLen <= 0:
         return MobileCapiMoqError("moq_fountain_empty_blob")
-    let ownerPeerId = MobileCapiCopyRawText(ownerPeerIdRaw)
-    let remotePeersCsv = MobileCapiCopyRawText(remotePeersCsvRaw)
-    let mimeType0 = MobileCapiCopyRawText(mimeType0Raw)
+    let ownerPeerId = mobileCapiCopyRawText(ownerPeerIdRaw)
+    let remotePeersCsv = mobileCapiCopyRawText(remotePeersCsvRaw)
+    let mimeType0 = mobileCapiCopyRawText(mimeType0Raw)
     var buildRes: MobileMoqBuildResult
     let buildOk = MobileCapiMoqBuild(buildRes,
                                        bytesView(blobPtr, blobLen),
@@ -1861,8 +1895,7 @@ fn MobileCapiMoqFountainBuildRaw(blobPtr: ptr,
         return MobileCapiMoqError(Error(buildOk))
     return MobileCapiMoqBuildResultToWire(buildRes)
 
-@exportc("MobileCapiMoqFountainBuildCStringRaw")
-fn MobileCapiMoqFountainBuildCStringRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildCStringRaw(blobPtr: ptr,
                                           blobLen: int32,
                                           ownerPeerIdRaw: ptr,
                                           remotePeersCsvRaw: ptr,
@@ -1870,7 +1903,7 @@ fn MobileCapiMoqFountainBuildCStringRaw(blobPtr: ptr,
                                           objectTargetBytes0: int32,
                                           sourceBlockBytes0: int32,
                                           repairDropletCount0: int32): ptr =
-    let out = MobileCapiMoqFountainBuildRaw(blobPtr,
+    let out = mobileCapiMoqFountainBuildRaw(blobPtr,
                                               blobLen,
                                               ownerPeerIdRaw,
                                               remotePeersCsvRaw,
@@ -1878,10 +1911,9 @@ fn MobileCapiMoqFountainBuildCStringRaw(blobPtr: ptr,
                                               objectTargetBytes0,
                                               sourceBlockBytes0,
                                               repairDropletCount0)
-    return MobileCapiTextCString(out)
+    return mobileCapiTextCString(out)
 
-@exportc("MobileCapiMoqFountainBuildHandleWireRaw")
-fn MobileCapiMoqFountainBuildHandleWireRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildHandleWireRaw(blobPtr: ptr,
                                              blobLen: int32,
                                              ownerPeerIdRaw: ptr,
                                              remotePeersCsvRaw: ptr,
@@ -1892,9 +1924,9 @@ fn MobileCapiMoqFountainBuildHandleWireRaw(blobPtr: ptr,
     if blobPtr == nil || blobLen <= 0:
         return MobileCapiMoqError("moq_fountain_empty_blob")
     MobileCapiEmitLog("mobile_moq:handle_wire_raw_enter")
-    let ownerPeerId = MobileCapiCopyRawText(ownerPeerIdRaw)
-    let remotePeersCsv = MobileCapiCopyRawText(remotePeersCsvRaw)
-    let mimeType0 = MobileCapiCopyRawText(mimeType0Raw)
+    let ownerPeerId = mobileCapiCopyRawText(ownerPeerIdRaw)
+    let remotePeersCsv = mobileCapiCopyRawText(remotePeersCsvRaw)
+    let mimeType0 = mobileCapiCopyRawText(mimeType0Raw)
     MobileCapiEmitLog("mobile_moq:handle_wire_raw_before_build")
     var buildRes: MobileMoqBuildResult
     let buildOk = MobileCapiMoqBuild(buildRes,
@@ -1912,8 +1944,7 @@ fn MobileCapiMoqFountainBuildHandleWireRaw(blobPtr: ptr,
     MobileCapiEmitLog("mobile_moq:handle_wire_raw_ok")
     return MobileCapiMoqBuildHandleWire(buildRes)
 
-@exportc("MobileCapiMoqFountainBuildHandleWireCStringRaw")
-fn MobileCapiMoqFountainBuildHandleWireCStringRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildHandleWireCStringRaw(blobPtr: ptr,
                                                     blobLen: int32,
                                                     ownerPeerIdRaw: ptr,
                                                     remotePeersCsvRaw: ptr,
@@ -1922,7 +1953,7 @@ fn MobileCapiMoqFountainBuildHandleWireCStringRaw(blobPtr: ptr,
                                                     sourceBlockBytes0: int32,
                                                     repairDropletCount0: int32): ptr =
     MobileCapiEmitLog("mobile_moq:handle_wire_cstring_enter")
-    let out = MobileCapiMoqFountainBuildHandleWireRaw(blobPtr,
+    let out = mobileCapiMoqFountainBuildHandleWireRaw(blobPtr,
                                                         blobLen,
                                                         ownerPeerIdRaw,
                                                         remotePeersCsvRaw,
@@ -1931,35 +1962,34 @@ fn MobileCapiMoqFountainBuildHandleWireCStringRaw(blobPtr: ptr,
                                                         sourceBlockBytes0,
                                                         repairDropletCount0)
     MobileCapiEmitLog("mobile_moq:handle_wire_cstring_after_raw")
-    return MobileCapiTextCString(out)
+    return mobileCapiTextCString(out)
 
-@exportc("MobileCapiMoqFountainBuildHandleWireRequestCStringRaw")
-fn MobileCapiMoqFountainBuildHandleWireRequestCStringRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildHandleWireRequestCStringRaw(blobPtr: ptr,
                                                            blobLen: int32,
                                                            requestWireRaw: ptr,
                                                            requestWireLen: int32): ptr =
     MobileCapiEmitLog("mobile_moq:handle_wire_request_enter")
     if blobPtr == nil || blobLen <= 0:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
-    let requestWire = MobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
+    let requestWire = mobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
     let ownerPeerIdRes = moq.MoqFountainWireFindValue(requestWire, "owner_peer_id")
     if IsErr(ownerPeerIdRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(ownerPeerIdRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(ownerPeerIdRes)))
     let remotePeersCsvRes = moq.MoqFountainWireFindValue(requestWire, "remote_peers_csv")
     if IsErr(remotePeersCsvRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(remotePeersCsvRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(remotePeersCsvRes)))
     let mimeTypeRes = moq.MoqFountainWireFindValue(requestWire, "mime_type")
     if IsErr(mimeTypeRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(mimeTypeRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(mimeTypeRes)))
     let objectTargetBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "object_target_bytes")
     if IsErr(objectTargetBytesRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(objectTargetBytesRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(objectTargetBytesRes)))
     let sourceBlockBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "source_block_bytes")
     if IsErr(sourceBlockBytesRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(sourceBlockBytesRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(sourceBlockBytesRes)))
     let repairDropletCountRes = moq.MoqFountainParseInt32Wire(requestWire, "repair_droplet_count")
     if IsErr(repairDropletCountRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(repairDropletCountRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(repairDropletCountRes)))
     MobileCapiEmitLog("mobile_moq:handle_wire_request_before_build")
     var buildRes: MobileMoqBuildResult
     let buildOk = MobileCapiMoqBuild(buildRes,
@@ -1972,19 +2002,18 @@ fn MobileCapiMoqFountainBuildHandleWireRequestCStringRaw(blobPtr: ptr,
                                        Value(repairDropletCountRes))
     MobileCapiEmitLog("mobile_moq:handle_wire_request_after_build")
     if IsErr(buildOk):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(buildOk)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(buildOk)))
     let out = MobileCapiMoqBuildHandleWire(buildRes)
-    return MobileCapiTextCString(out)
+    return mobileCapiTextCString(out)
 
-@exportc("MobileCapiMoqFountainBuildHandleWireRequestHandleRaw")
-fn MobileCapiMoqFountainBuildHandleWireRequestHandleRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildHandleWireRequestHandleRaw(blobPtr: ptr,
                                                           blobLen: int32,
                                                           requestWireRaw: ptr,
                                                           requestWireLen: int32): uint64 =
     MobileCapiEmitLog("mobile_moq:handle_wire_request_handle_enter")
     if blobPtr == nil || blobLen <= 0:
         return MobileCapiTextBufferHandle(MobileCapiMoqError("moq_fountain_empty_blob"))
-    let requestWire = MobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
+    let requestWire = mobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
     let ownerPeerIdRes = moq.MoqFountainWireFindValue(requestWire, "owner_peer_id")
     if IsErr(ownerPeerIdRes):
         return MobileCapiTextBufferHandle(MobileCapiMoqError(Error(ownerPeerIdRes)))
@@ -2019,8 +2048,7 @@ fn MobileCapiMoqFountainBuildHandleWireRequestHandleRaw(blobPtr: ptr,
     let out = MobileCapiMoqBuildHandleWire(buildRes)
     return MobileCapiTextBufferHandle(out)
 
-@exportc("MobileCapiMoqFountainBuildRequestRaw")
-fn MobileCapiMoqFountainBuildRequestRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildRequestRaw(blobPtr: ptr,
                                           blobLen: int32,
                                           requestWireRaw: ptr,
                                           requestWireLen: int32): str =
@@ -2028,7 +2056,7 @@ fn MobileCapiMoqFountainBuildRequestRaw(blobPtr: ptr,
     if blobPtr == nil || blobLen <= 0:
         return MobileCapiMoqError("moq_fountain_empty_blob")
     MobileCapiEmitLog("mobile_moq:build_request_before_copy")
-    let requestWire = MobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
+    let requestWire = mobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
     MobileCapiEmitLog("mobile_moq:build_request_after_copy")
     let ownerPeerIdRes = moq.MoqFountainWireFindValue(requestWire, "owner_peer_id")
     MobileCapiEmitLog("mobile_moq:build_request_after_owner")
@@ -2069,15 +2097,14 @@ fn MobileCapiMoqFountainBuildRequestRaw(blobPtr: ptr,
         return MobileCapiMoqError(Error(buildOk))
     return MobileCapiMoqBuildResultToWire(buildRes)
 
-@exportc("MobileCapiMoqFountainBuildRequestCStringRaw")
-fn MobileCapiMoqFountainBuildRequestCStringRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildRequestCStringRaw(blobPtr: ptr,
                                                  blobLen: int32,
                                                  requestWireRaw: ptr,
                                                  requestWireLen: int32): ptr =
-    let out = MobileCapiMoqFountainBuildRequestRaw(blobPtr, blobLen, requestWireRaw, requestWireLen)
-    return MobileCapiTextCString(out)
+    let out = mobileCapiMoqFountainBuildRequestRaw(blobPtr, blobLen, requestWireRaw, requestWireLen)
+    return mobileCapiTextCString(out)
 
-fn MobileCapiMoqBuildPersistFill(out: var str,
+fn mobileCapiMoqBuildPersistFill(out: var str,
                                    blobPtr: ptr,
                                    blobLen: int32,
                                    ownerPeerIdRaw: ptr,
@@ -2090,11 +2117,11 @@ fn MobileCapiMoqBuildPersistFill(out: var str,
                                    fileNameStemRaw: ptr): Result[bool] =
     if blobPtr == nil || blobLen <= 0:
         return Err[bool]("moq_fountain_empty_blob")
-    let ownerPeerId = MobileCapiCopyRawText(ownerPeerIdRaw)
-    let remotePeersCsv = MobileCapiCopyRawText(remotePeersCsvRaw)
-    let mimeType0 = MobileCapiCopyRawText(mimeType0Raw)
-    let outputDir = MobileCapiCopyRawText(outputDirRaw)
-    let fileNameStem = MobileCapiCopyRawText(fileNameStemRaw)
+    let ownerPeerId = mobileCapiCopyRawText(ownerPeerIdRaw)
+    let remotePeersCsv = mobileCapiCopyRawText(remotePeersCsvRaw)
+    let mimeType0 = mobileCapiCopyRawText(mimeType0Raw)
+    let outputDir = mobileCapiCopyRawText(outputDirRaw)
+    let fileNameStem = mobileCapiCopyRawText(fileNameStemRaw)
     if len(outputDir) <= 0:
         return Err[bool]("moq_fountain_missing_output_dir")
     if len(fileNameStem) <= 0:
@@ -2115,8 +2142,7 @@ fn MobileCapiMoqBuildPersistFill(out: var str,
     out = Value(wireRes)
     return Ok[bool](true)
 
-@exportc("MobileCapiMoqFountainBuildPersistRaw")
-fn MobileCapiMoqFountainBuildPersistRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildPersistRaw(blobPtr: ptr,
                                           blobLen: int32,
                                           ownerPeerIdRaw: ptr,
                                           remotePeersCsvRaw: ptr,
@@ -2127,7 +2153,7 @@ fn MobileCapiMoqFountainBuildPersistRaw(blobPtr: ptr,
                                           outputDirRaw: ptr,
                                           fileNameStemRaw: ptr): str =
     var out = ""
-    let fillRes = MobileCapiMoqBuildPersistFill(out,
+    let fillRes = mobileCapiMoqBuildPersistFill(out,
                                                   blobPtr,
                                                   blobLen,
                                                   ownerPeerIdRaw,
@@ -2142,8 +2168,7 @@ fn MobileCapiMoqFountainBuildPersistRaw(blobPtr: ptr,
         return MobileCapiMoqError(Error(fillRes))
     return out
 
-@exportc("MobileCapiMoqFountainBuildPersistCStringRaw")
-fn MobileCapiMoqFountainBuildPersistCStringRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildPersistCStringRaw(blobPtr: ptr,
                                                  blobLen: int32,
                                                  ownerPeerIdRaw: ptr,
                                                  remotePeersCsvRaw: ptr,
@@ -2154,7 +2179,7 @@ fn MobileCapiMoqFountainBuildPersistCStringRaw(blobPtr: ptr,
                                                  outputDirRaw: ptr,
                                                  fileNameStemRaw: ptr): ptr =
     var out = ""
-    let fillRes = MobileCapiMoqBuildPersistFill(out,
+    let fillRes = mobileCapiMoqBuildPersistFill(out,
                                                   blobPtr,
                                                   blobLen,
                                                   ownerPeerIdRaw,
@@ -2166,11 +2191,10 @@ fn MobileCapiMoqFountainBuildPersistCStringRaw(blobPtr: ptr,
                                                   outputDirRaw,
                                                   fileNameStemRaw)
     if IsErr(fillRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(fillRes)))
-    return MobileCapiTextCString(out)
+        return mobileCapiTextCString(MobileCapiMoqError(Error(fillRes)))
+    return mobileCapiTextCString(out)
 
-@exportc("MobileCapiMoqFountainBuildPersistHandleRaw")
-fn MobileCapiMoqFountainBuildPersistHandleRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildPersistHandleRaw(blobPtr: ptr,
                                                 blobLen: int32,
                                                 ownerPeerIdRaw: ptr,
                                                 remotePeersCsvRaw: ptr,
@@ -2181,7 +2205,7 @@ fn MobileCapiMoqFountainBuildPersistHandleRaw(blobPtr: ptr,
                                                 outputDirRaw: ptr,
                                                 fileNameStemRaw: ptr): uint64 =
     var out = ""
-    let fillRes = MobileCapiMoqBuildPersistFill(out,
+    let fillRes = mobileCapiMoqBuildPersistFill(out,
                                                   blobPtr,
                                                   blobLen,
                                                   ownerPeerIdRaw,
@@ -2196,14 +2220,13 @@ fn MobileCapiMoqFountainBuildPersistHandleRaw(blobPtr: ptr,
         return MobileCapiTextBufferHandle(MobileCapiMoqError(Error(fillRes)))
     return MobileCapiTextBufferHandle(out)
 
-@exportc("MobileCapiMoqFountainPersistWireRaw")
-fn MobileCapiMoqFountainPersistWireRaw(requestWireRaw: ptr,
+fn mobileCapiMoqFountainPersistWireRaw(requestWireRaw: ptr,
                                          outputDirRaw: ptr,
                                          fileNameStemRaw: ptr): str =
     MobileCapiEmitLog("mobile_moq:persist_wire_raw_enter")
-    let requestWire = MobileCapiCopyRawText(requestWireRaw)
-    let outputDir = MobileCapiCopyRawText(outputDirRaw)
-    let fileNameStem = MobileCapiCopyRawText(fileNameStemRaw)
+    let requestWire = mobileCapiCopyRawText(requestWireRaw)
+    let outputDir = mobileCapiCopyRawText(outputDirRaw)
+    let fileNameStem = mobileCapiCopyRawText(fileNameStemRaw)
     if len(requestWire) <= 0:
         return MobileCapiMoqError("moq_fountain_missing_build_wire")
     let persistRes = MobileCapiMoqPersistWire(requestWire, outputDir, fileNameStem)
@@ -2213,36 +2236,33 @@ fn MobileCapiMoqFountainPersistWireRaw(requestWireRaw: ptr,
     MobileCapiEmitLog("mobile_moq:persist_wire_raw_ok")
     return Value(persistRes)
 
-@exportc("MobileCapiMoqFountainPersistWireCStringRaw")
-fn MobileCapiMoqFountainPersistWireCStringRaw(requestWireRaw: ptr,
+fn mobileCapiMoqFountainPersistWireCStringRaw(requestWireRaw: ptr,
                                                 outputDirRaw: ptr,
                                                 fileNameStemRaw: ptr): ptr =
     MobileCapiEmitLog("mobile_moq:persist_wire_cstring_enter")
-    let out = MobileCapiMoqFountainPersistWireRaw(requestWireRaw, outputDirRaw, fileNameStemRaw)
+    let out = mobileCapiMoqFountainPersistWireRaw(requestWireRaw, outputDirRaw, fileNameStemRaw)
     MobileCapiEmitLog("mobile_moq:persist_wire_cstring_after_raw")
-    return MobileCapiTextCString(out)
+    return mobileCapiTextCString(out)
 
-@exportc("MobileCapiMoqFountainPersistWireRequestCStringRaw")
-fn MobileCapiMoqFountainPersistWireRequestCStringRaw(buildWireRaw: ptr,
+fn mobileCapiMoqFountainPersistWireRequestCStringRaw(buildWireRaw: ptr,
                                                        buildWireLen: int32,
                                                        requestWireRaw: ptr,
                                                        requestWireLen: int32): ptr =
     MobileCapiEmitLog("mobile_moq:persist_wire_request_enter")
-    let buildWire = MobileCapiCopyRawTextLen(buildWireRaw, buildWireLen)
-    let requestWire = MobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
+    let buildWire = mobileCapiCopyRawTextLen(buildWireRaw, buildWireLen)
+    let requestWire = mobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
     let outputDirRes = moq.MoqFountainWireFindValue(requestWire, "output_dir")
     if IsErr(outputDirRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(outputDirRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(outputDirRes)))
     let fileNameStemRes = moq.MoqFountainWireFindValue(requestWire, "file_name_stem")
     if IsErr(fileNameStemRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(fileNameStemRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(fileNameStemRes)))
     let persistRes = MobileCapiMoqPersistWire(buildWire, Value(outputDirRes), Value(fileNameStemRes))
     if IsErr(persistRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(persistRes)))
-    return MobileCapiTextCString(Value(persistRes))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(persistRes)))
+    return mobileCapiTextCString(Value(persistRes))
 
-@exportc("MobileCapiMoqFountainBuildPersistRequestHandleRaw")
-fn MobileCapiMoqFountainBuildPersistRequestHandleRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildPersistRequestHandleRaw(blobPtr: ptr,
                                                        blobLen: int32,
                                                        requestWireRaw: ptr,
                                                        requestWireLen: int32): uint64 =
@@ -2250,7 +2270,7 @@ fn MobileCapiMoqFountainBuildPersistRequestHandleRaw(blobPtr: ptr,
     if blobPtr == nil || blobLen <= 0:
         return MobileCapiTextBufferHandle(MobileCapiMoqError("moq_fountain_empty_blob"))
     MobileCapiEmitLog("mobile_moq:build_persist_request_handle_before_copy_request_wire")
-    let requestWire = MobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
+    let requestWire = mobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
     MobileCapiEmitLog("mobile_moq:build_persist_request_handle_after_copy_request_wire")
     let ownerPeerIdRes = moq.MoqFountainWireFindValue(requestWire, "owner_peer_id")
     MobileCapiEmitLog("mobile_moq:build_persist_request_handle_after_owner_peer_id")
@@ -2301,39 +2321,38 @@ fn MobileCapiMoqFountainBuildPersistRequestHandleRaw(blobPtr: ptr,
     MobileCapiEmitLog("mobile_moq:build_persist_request_handle_before_result_handle")
     return MobileCapiTextBufferHandle(Value(persistRes))
 
-@exportc("MobileCapiMoqFountainBuildPersistRequestCStringRaw")
-fn MobileCapiMoqFountainBuildPersistRequestCStringRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildPersistRequestCStringRaw(blobPtr: ptr,
                                                         blobLen: int32,
                                                         requestWireRaw: ptr,
                                                         requestWireLen: int32): ptr =
     MobileCapiEmitLog("mobile_moq:build_persist_request_cstring_enter")
     if blobPtr == nil || blobLen <= 0:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
-    let requestWire = MobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
+    let requestWire = mobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
     let ownerPeerIdRes = moq.MoqFountainWireFindValue(requestWire, "owner_peer_id")
     if IsErr(ownerPeerIdRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(ownerPeerIdRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(ownerPeerIdRes)))
     let remotePeersCsvRes = moq.MoqFountainWireFindValue(requestWire, "remote_peers_csv")
     if IsErr(remotePeersCsvRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(remotePeersCsvRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(remotePeersCsvRes)))
     let mimeTypeRes = moq.MoqFountainWireFindValue(requestWire, "mime_type")
     if IsErr(mimeTypeRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(mimeTypeRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(mimeTypeRes)))
     let objectTargetBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "object_target_bytes")
     if IsErr(objectTargetBytesRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(objectTargetBytesRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(objectTargetBytesRes)))
     let sourceBlockBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "source_block_bytes")
     if IsErr(sourceBlockBytesRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(sourceBlockBytesRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(sourceBlockBytesRes)))
     let repairDropletCountRes = moq.MoqFountainParseInt32Wire(requestWire, "repair_droplet_count")
     if IsErr(repairDropletCountRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(repairDropletCountRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(repairDropletCountRes)))
     let outputDirRes = moq.MoqFountainWireFindValue(requestWire, "output_dir")
     if IsErr(outputDirRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(outputDirRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(outputDirRes)))
     let fileNameStemRes = moq.MoqFountainWireFindValue(requestWire, "file_name_stem")
     if IsErr(fileNameStemRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(fileNameStemRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(fileNameStemRes)))
     let persistRes = MobileCapiMoqBuildPersistDirect(bytesView(blobPtr, blobLen),
                                                        Value(ownerPeerIdRes),
                                                        Value(remotePeersCsvRes),
@@ -2344,40 +2363,39 @@ fn MobileCapiMoqFountainBuildPersistRequestCStringRaw(blobPtr: ptr,
                                                        Value(outputDirRes),
                                                        Value(fileNameStemRes))
     if IsErr(persistRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(persistRes)))
-    return MobileCapiTextCString(Value(persistRes))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(persistRes)))
+    return mobileCapiTextCString(Value(persistRes))
 
-@exportc("MobileCapiMoqFountainBuildPersistRequestCStringCstrRaw")
-fn MobileCapiMoqFountainBuildPersistRequestCStringCstrRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildPersistRequestCStringCstrRaw(blobPtr: ptr,
                                                             blobLen: int32,
                                                             requestWireRaw: ptr): ptr =
     if blobPtr == nil || blobLen <= 0:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
-    let requestWire = MobileCapiCopyRawText(requestWireRaw)
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
+    let requestWire = mobileCapiCopyRawText(requestWireRaw)
     let ownerPeerIdRes = moq.MoqFountainWireFindValue(requestWire, "owner_peer_id")
     if IsErr(ownerPeerIdRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(ownerPeerIdRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(ownerPeerIdRes)))
     let remotePeersCsvRes = moq.MoqFountainWireFindValue(requestWire, "remote_peers_csv")
     if IsErr(remotePeersCsvRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(remotePeersCsvRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(remotePeersCsvRes)))
     let mimeTypeRes = moq.MoqFountainWireFindValue(requestWire, "mime_type")
     if IsErr(mimeTypeRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(mimeTypeRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(mimeTypeRes)))
     let objectTargetBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "object_target_bytes")
     if IsErr(objectTargetBytesRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(objectTargetBytesRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(objectTargetBytesRes)))
     let sourceBlockBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "source_block_bytes")
     if IsErr(sourceBlockBytesRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(sourceBlockBytesRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(sourceBlockBytesRes)))
     let repairDropletCountRes = moq.MoqFountainParseInt32Wire(requestWire, "repair_droplet_count")
     if IsErr(repairDropletCountRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(repairDropletCountRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(repairDropletCountRes)))
     let outputDirRes = moq.MoqFountainWireFindValue(requestWire, "output_dir")
     if IsErr(outputDirRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(outputDirRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(outputDirRes)))
     let fileNameStemRes = moq.MoqFountainWireFindValue(requestWire, "file_name_stem")
     if IsErr(fileNameStemRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(fileNameStemRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(fileNameStemRes)))
     let persistRes = MobileCapiMoqBuildPersistDirect(bytesView(blobPtr, blobLen),
                                                        Value(ownerPeerIdRes),
                                                        Value(remotePeersCsvRes),
@@ -2388,50 +2406,49 @@ fn MobileCapiMoqFountainBuildPersistRequestCStringCstrRaw(blobPtr: ptr,
                                                        Value(outputDirRes),
                                                        Value(fileNameStemRes))
     if IsErr(persistRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(persistRes)))
-    return MobileCapiTextCString(Value(persistRes))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(persistRes)))
+    return mobileCapiTextCString(Value(persistRes))
 
-@exportc("MobileCapiMoqFountainBuildPersistFileCStringRaw")
-fn MobileCapiMoqFountainBuildPersistFileCStringRaw(blobPathRaw: ptr,
+fn mobileCapiMoqFountainBuildPersistFileCStringRaw(blobPathRaw: ptr,
                                                      requestWireRaw: ptr): ptr =
     if blobPathRaw == nil:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_blob_path"))
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_blob_path"))
     if requestWireRaw == nil:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_request_wire"))
-    let blobPath = MobileCapiCopyRawText(blobPathRaw)
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_request_wire"))
+    let blobPath = mobileCapiCopyRawText(blobPathRaw)
     if len(blobPath) <= 0:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_blob_path"))
-    let requestWire = MobileCapiCopyRawText(requestWireRaw)
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_blob_path"))
+    let requestWire = mobileCapiCopyRawText(requestWireRaw)
     if len(requestWire) <= 0:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_request_wire"))
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_request_wire"))
     let blobText = os.ReadFile(blobPath)
     let blobBytes = bytesFromString(blobText)
     if bytesLen(blobBytes) <= 0:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
     let ownerPeerIdRes = moq.MoqFountainWireFindValue(requestWire, "owner_peer_id")
     if IsErr(ownerPeerIdRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(ownerPeerIdRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(ownerPeerIdRes)))
     let remotePeersCsvRes = moq.MoqFountainWireFindValue(requestWire, "remote_peers_csv")
     if IsErr(remotePeersCsvRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(remotePeersCsvRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(remotePeersCsvRes)))
     let mimeTypeRes = moq.MoqFountainWireFindValue(requestWire, "mime_type")
     if IsErr(mimeTypeRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(mimeTypeRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(mimeTypeRes)))
     let objectTargetBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "object_target_bytes")
     if IsErr(objectTargetBytesRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(objectTargetBytesRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(objectTargetBytesRes)))
     let sourceBlockBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "source_block_bytes")
     if IsErr(sourceBlockBytesRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(sourceBlockBytesRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(sourceBlockBytesRes)))
     let repairDropletCountRes = moq.MoqFountainParseInt32Wire(requestWire, "repair_droplet_count")
     if IsErr(repairDropletCountRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(repairDropletCountRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(repairDropletCountRes)))
     let outputDirRes = moq.MoqFountainWireFindValue(requestWire, "output_dir")
     if IsErr(outputDirRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(outputDirRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(outputDirRes)))
     let fileNameStemRes = moq.MoqFountainWireFindValue(requestWire, "file_name_stem")
     if IsErr(fileNameStemRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(fileNameStemRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(fileNameStemRes)))
     let persistRes = MobileCapiMoqBuildPersistDirect(blobBytes,
                                                        Value(ownerPeerIdRes),
                                                        Value(remotePeersCsvRes),
@@ -2442,50 +2459,49 @@ fn MobileCapiMoqFountainBuildPersistFileCStringRaw(blobPathRaw: ptr,
                                                        Value(outputDirRes),
                                                        Value(fileNameStemRes))
     if IsErr(persistRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(persistRes)))
-    return MobileCapiTextCString(Value(persistRes))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(persistRes)))
+    return mobileCapiTextCString(Value(persistRes))
 
-@exportc("MobileCapiMoqFountainBuildPersistRequestFileCStringRaw")
-fn MobileCapiMoqFountainBuildPersistRequestFileCStringRaw(requestPathRaw: ptr): ptr =
+fn mobileCapiMoqFountainBuildPersistRequestFileCStringRaw(requestPathRaw: ptr): ptr =
     if requestPathRaw == nil:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_request_path"))
-    let requestPath = MobileCapiCopyRawText(requestPathRaw)
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_request_path"))
+    let requestPath = mobileCapiCopyRawText(requestPathRaw)
     if len(requestPath) <= 0:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_request_path"))
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_request_path"))
     let requestWire = os.ReadFile(requestPath)
     if len(requestWire) <= 0:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_request_wire"))
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_missing_request_wire"))
     let blobPathRes = moq.MoqFountainWireFindValue(requestWire, "blob_path")
     if IsErr(blobPathRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(blobPathRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(blobPathRes)))
     let blobText = os.ReadFile(Value(blobPathRes))
     let blobBytes = bytesFromString(blobText)
     if bytesLen(blobBytes) <= 0:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
     let ownerPeerIdRes = moq.MoqFountainWireFindValue(requestWire, "owner_peer_id")
     if IsErr(ownerPeerIdRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(ownerPeerIdRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(ownerPeerIdRes)))
     let remotePeersCsvRes = moq.MoqFountainWireFindValue(requestWire, "remote_peers_csv")
     if IsErr(remotePeersCsvRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(remotePeersCsvRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(remotePeersCsvRes)))
     let mimeTypeRes = moq.MoqFountainWireFindValue(requestWire, "mime_type")
     if IsErr(mimeTypeRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(mimeTypeRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(mimeTypeRes)))
     let objectTargetBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "object_target_bytes")
     if IsErr(objectTargetBytesRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(objectTargetBytesRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(objectTargetBytesRes)))
     let sourceBlockBytesRes = moq.MoqFountainParseInt32Wire(requestWire, "source_block_bytes")
     if IsErr(sourceBlockBytesRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(sourceBlockBytesRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(sourceBlockBytesRes)))
     let repairDropletCountRes = moq.MoqFountainParseInt32Wire(requestWire, "repair_droplet_count")
     if IsErr(repairDropletCountRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(repairDropletCountRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(repairDropletCountRes)))
     let outputDirRes = moq.MoqFountainWireFindValue(requestWire, "output_dir")
     if IsErr(outputDirRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(outputDirRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(outputDirRes)))
     let fileNameStemRes = moq.MoqFountainWireFindValue(requestWire, "file_name_stem")
     if IsErr(fileNameStemRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(fileNameStemRes)))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(fileNameStemRes)))
     let persistRes = MobileCapiMoqBuildPersistDirect(blobBytes,
                                                        Value(ownerPeerIdRes),
                                                        Value(remotePeersCsvRes),
@@ -2496,29 +2512,26 @@ fn MobileCapiMoqFountainBuildPersistRequestFileCStringRaw(requestPathRaw: ptr): 
                                                        Value(outputDirRes),
                                                        Value(fileNameStemRes))
     if IsErr(persistRes):
-        return MobileCapiTextCString(MobileCapiMoqError(Error(persistRes)))
-    return MobileCapiTextCString(Value(persistRes))
+        return mobileCapiTextCString(MobileCapiMoqError(Error(persistRes)))
+    return mobileCapiTextCString(Value(persistRes))
 
-@exportc("MobileCapiMoqFountainBuildPersistRequestFileBlobCStringRaw")
-fn MobileCapiMoqFountainBuildPersistRequestFileBlobCStringRaw(blobPtr: ptr,
+fn mobileCapiMoqFountainBuildPersistRequestFileBlobCStringRaw(blobPtr: ptr,
                                                                 blobLen: int32,
                                                                 requestPathRaw: ptr): ptr =
     if blobPtr == nil || blobLen <= 0:
-        return MobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
-    return MobileCapiMoqFountainBuildPersistRequestFileCStringRaw(requestPathRaw)
+        return mobileCapiTextCString(MobileCapiMoqError("moq_fountain_empty_blob"))
+    return mobileCapiMoqFountainBuildPersistRequestFileCStringRaw(requestPathRaw)
 
-@exportc("MobileCapiMoqFountainBuildPersistRequestStagedCStringRaw")
-fn MobileCapiMoqFountainBuildPersistRequestStagedCStringRaw(): ptr =
-    let requestPathRaw = cheng_mobile_host_moq_request_path_bridge()
-    return MobileCapiMoqFountainBuildPersistRequestFileCStringRaw(requestPathRaw)
+fn mobileCapiMoqFountainBuildPersistRequestStagedCStringRaw(): ptr =
+    let requestPathRaw = bridge.InternalMobileBridgeHostMoqRequestPathRaw()
+    return mobileCapiMoqFountainBuildPersistRequestFileCStringRaw(requestPathRaw)
 
-@exportc("MobileCapiMoqFountainBuildPersistStagedCStringRaw")
-fn MobileCapiMoqFountainBuildPersistStagedCStringRaw(): ptr =
-    let blobRaw = cheng_mobile_host_moq_blob_bridge()
-    let blobLen = cheng_mobile_host_moq_blob_len_bridge()
-    let requestWireRaw = cheng_mobile_host_moq_request_wire_bridge()
-    let requestWireLen = cheng_mobile_host_moq_request_wire_len_bridge()
-    return MobileCapiMoqFountainBuildPersistRequestCStringRaw(blobRaw, blobLen, requestWireRaw, requestWireLen)
+fn mobileCapiMoqFountainBuildPersistStagedCStringRaw(): ptr =
+    let blobRaw = bridge.InternalMobileBridgeHostMoqBlobRaw()
+    let blobLen = bridge.InternalMobileBridgeHostMoqBlobLen()
+    let requestWireRaw = bridge.InternalMobileBridgeHostMoqRequestWireRaw()
+    let requestWireLen = bridge.InternalMobileBridgeHostMoqRequestWireLen()
+    return mobileCapiMoqFountainBuildPersistRequestCStringRaw(blobRaw, blobLen, requestWireRaw, requestWireLen)
 
 fn MobileCapiMoqDecodeBlockIndexes(csv: str): int32[] =
     let parts = MobileCapiSplitCsv(csv)
@@ -2589,24 +2602,15 @@ fn MobileCapiMoqFountainRebuild(requestWire: str): str =
         return MobileCapiMoqError(Error(rebuiltRes))
     let rebuilt = Value(rebuiltRes)
     let rebuiltBlob = rebuilt.blob
-    let rebuiltBlobLen: int32 = rebuiltBlob.len
-    let rebuiltBlobData: ptr = rebuiltBlob.data
-    let outFile = cheng_fopen(strToCStringTemp(outputPath), "wb")
-    if outFile == nil:
-        return MobileCapiMoqError("moq_fountain_write_open_failed")
-    if rebuiltBlobLen > 0:
-        let wrote: int32 = cheng_fwrite(rebuiltBlobData, 1, rebuiltBlobLen, outFile)
-        if wrote != rebuiltBlobLen:
-            cheng_fclose(outFile)
-            return MobileCapiMoqError("moq_fountain_write_failed")
-    cheng_fclose(outFile)
+    let writeRes = bridge.InternalMobileBridgeWriteBytesPath(outputPath, rebuiltBlob)
+    if IsErr(writeRes):
+        return MobileCapiMoqError(Error(writeRes))
     return moq.MoqFountainRebuildResultToWire(outputPath, rebuilt)
 
-@exportc("MobileCapiMoqFountainRebuildCStringRaw")
-fn MobileCapiMoqFountainRebuildCStringRaw(requestWireRaw: ptr): ptr =
-    let requestWire = MobileCapiCopyRawText(requestWireRaw)
+fn mobileCapiMoqFountainRebuildCStringRaw(requestWireRaw: ptr): ptr =
+    let requestWire = mobileCapiCopyRawText(requestWireRaw)
     let out = MobileCapiMoqFountainRebuild(requestWire)
-    return MobileCapiTextCString(out)
+    return mobileCapiTextCString(out)
 
 fn MobileCapiBioDidProvisionJson(didText: str,
                                    rootSeed: str,
@@ -2661,7 +2665,7 @@ fn MobileCapiBioDidImportRequestWire(latestBundleText: str,
                                                          deviceLabel,
                                                          sensorId,
                                                          hardwareAttestation)
-    out = out + createWire
+    out = strutils.Join([out, createWire], "")
     return out
 
 fn MobileCapiBioDidCreate(requestId: str,
@@ -2826,19 +2830,19 @@ fn MobileCapiBioDidCreateWireHandle(requestWire: str): uint64 =
     let handle = MobileCapiTextBufferHandle(out)
     return handle
 
-fn MobileCapiBioDidCreateWireCString(requestWire: str): ptr =
+fn mobileCapiBioDidCreateWireCString(requestWire: str): ptr =
     let out = MobileCapiBioDidCreateWire(requestWire)
-    let ctext = MobileCapiTextCString(out)
+    let ctext = mobileCapiTextCString(out)
     return ctext
 
-fn MobileCapiBioDidCreateWireHandleRaw(requestWireRaw: ptr): uint64 =
-    let requestWire = MobileCapiCopyRawText(requestWireRaw)
+fn mobileCapiBioDidCreateWireHandleRaw(requestWireRaw: ptr): uint64 =
+    let requestWire = mobileCapiCopyRawText(requestWireRaw)
     let handle = MobileCapiBioDidCreateWireHandle(requestWire)
     return handle
 
-fn MobileCapiBioDidCreateWireCStringRaw(requestWireRaw: ptr): ptr =
-    let requestWire = MobileCapiCopyRawText(requestWireRaw)
-    let ctext = MobileCapiBioDidCreateWireCString(requestWire)
+fn mobileCapiBioDidCreateWireCStringRaw(requestWireRaw: ptr): ptr =
+    let requestWire = mobileCapiCopyRawText(requestWireRaw)
+    let ctext = mobileCapiBioDidCreateWireCString(requestWire)
     return ctext
 
 fn MobileCapiBioDidCreateHandle(requestId: str,
@@ -2856,7 +2860,7 @@ fn MobileCapiBioDidCreateHandle(requestId: str,
     let handle = MobileCapiTextBufferHandle(out)
     return handle
 
-fn MobileCapiBioDidCreateCString(requestId: str,
+fn mobileCapiBioDidCreateCString(requestId: str,
                                    feature32Hex: str,
                                    deviceBindingSeed: str,
                                    deviceLabel: str,
@@ -2868,21 +2872,21 @@ fn MobileCapiBioDidCreateCString(requestId: str,
                                        deviceLabel,
                                        sensorId,
                                        hardwareAttestation)
-    let ctext = MobileCapiTextCString(out)
+    let ctext = mobileCapiTextCString(out)
     return ctext
 
-fn MobileCapiBioDidCreateHandleRaw(requestIdRaw: ptr,
+fn mobileCapiBioDidCreateHandleRaw(requestIdRaw: ptr,
                                      feature32HexRaw: ptr,
                                      deviceBindingSeedRaw: ptr,
                                      deviceLabelRaw: ptr,
                                      sensorIdRaw: ptr,
                                      hardwareAttestationRaw: ptr): uint64 =
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
     let handle = MobileCapiBioDidCreateHandle(requestId,
                                                 feature32Hex,
                                                 deviceBindingSeed,
@@ -2891,19 +2895,19 @@ fn MobileCapiBioDidCreateHandleRaw(requestIdRaw: ptr,
                                                 hardwareAttestation)
     return handle
 
-fn MobileCapiBioDidCreateCStringRaw(requestIdRaw: ptr,
+fn mobileCapiBioDidCreateCStringRaw(requestIdRaw: ptr,
                                       feature32HexRaw: ptr,
                                       deviceBindingSeedRaw: ptr,
                                       deviceLabelRaw: ptr,
                                       sensorIdRaw: ptr,
                                       hardwareAttestationRaw: ptr): ptr =
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
-    let ctext = MobileCapiBioDidCreateCString(requestId,
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
+    let ctext = mobileCapiBioDidCreateCString(requestId,
                                                 feature32Hex,
                                                 deviceBindingSeed,
                                                 deviceLabel,
@@ -2911,18 +2915,18 @@ fn MobileCapiBioDidCreateCStringRaw(requestIdRaw: ptr,
                                                 hardwareAttestation)
     return ctext
 
-fn MobileCapiBioDidCreateIdentityFieldsCStringRaw(requestIdRaw: ptr,
+fn mobileCapiBioDidCreateIdentityFieldsCStringRaw(requestIdRaw: ptr,
                                                     feature32HexRaw: ptr,
                                                     deviceBindingSeedRaw: ptr,
                                                     deviceLabelRaw: ptr,
                                                     sensorIdRaw: ptr,
                                                     hardwareAttestationRaw: ptr): ptr =
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
     let captureRes = MobileCapiBioDidCapture(requestId,
                                                feature32Hex,
                                                deviceBindingSeed,
@@ -2930,30 +2934,30 @@ fn MobileCapiBioDidCreateIdentityFieldsCStringRaw(requestIdRaw: ptr,
                                                sensorId,
                                                hardwareAttestation)
     if IsErr(captureRes):
-        return MobileCapiTextCString("")
+        return mobileCapiTextCString("")
     let createRes = bio_did.BioDidCreateBundleWithHardwareCapture(Value(captureRes),
                                                                     times.EpochTimeSeconds())
     if IsErr(createRes):
-        return MobileCapiTextCString("")
+        return mobileCapiTextCString("")
     let outcome = Value(createRes)
     var out = ""
     out = did.DidStoreAppendLine(out, "did", outcome.document.did)
     out = did.DidStoreAppendLine(out, "rootSeed", outcome.identity.rootSeed)
     out = did.DidStoreAppendLine(out, "deviceSeed", outcome.identity.deviceSeed)
-    return MobileCapiTextCString(out)
+    return mobileCapiTextCString(out)
 
-fn MobileCapiBioDidCreateBundleCStringRaw(requestIdRaw: ptr,
+fn mobileCapiBioDidCreateBundleCStringRaw(requestIdRaw: ptr,
                                             feature32HexRaw: ptr,
                                             deviceBindingSeedRaw: ptr,
                                             deviceLabelRaw: ptr,
                                             sensorIdRaw: ptr,
                                             hardwareAttestationRaw: ptr): ptr =
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
     let captureRes = MobileCapiBioDidCapture(requestId,
                                                feature32Hex,
                                                deviceBindingSeed,
@@ -2961,11 +2965,11 @@ fn MobileCapiBioDidCreateBundleCStringRaw(requestIdRaw: ptr,
                                                sensorId,
                                                hardwareAttestation)
     if IsErr(captureRes):
-        return MobileCapiTextCString("")
+        return mobileCapiTextCString("")
     let createRes = bio_did.BioDidCreateBundleWithHardwareCapture(Value(captureRes),
                                                                     times.EpochTimeSeconds())
     if IsErr(createRes):
-        return MobileCapiTextCString("")
+        return mobileCapiTextCString("")
     let outcome = Value(createRes)
     let devicePeerIdText = peer_id.Libp2pPeerIdText(outcome.bundle.devicePeerId)
     let bundleSeqText = strings.IntToStr(outcome.bundle.bundleSeq)
@@ -3011,26 +3015,26 @@ fn MobileCapiBioDidCreateBundleCStringRaw(requestIdRaw: ptr,
     bundleText = did.DidStoreAppendLine(bundleText, "hardware_attestation_text", did.DidStoreEncodeText(outcome.bundle.hardware.attestationText))
     bundleText = did.DidStoreAppendLine(bundleText, "hardware_attestation_cid", hardwareAttestationCidText)
     bundleText = did.DidStoreAppendLine(bundleText, "hardware_binding_cid", hardwareBindingCidText)
-    return MobileCapiTextCString(bundleText)
+    return mobileCapiTextCString(bundleText)
 
-fn MobileCapiBioDidDiagOkCString(stage: str): ptr =
+fn mobileCapiBioDidDiagOkCString(stage: str): ptr =
     var out = ""
     out = did.DidStoreAppendLine(out, "ok", "1")
     out = did.DidStoreAppendLine(out, "stage", stage)
-    return MobileCapiTextCString(out)
+    return mobileCapiTextCString(out)
 
-fn MobileCapiBioDidCreateDiagCaptureCStringRaw(requestIdRaw: ptr,
+fn mobileCapiBioDidCreateDiagCaptureCStringRaw(requestIdRaw: ptr,
                                                  feature32HexRaw: ptr,
                                                  deviceBindingSeedRaw: ptr,
                                                  deviceLabelRaw: ptr,
                                                  sensorIdRaw: ptr,
                                                  hardwareAttestationRaw: ptr): ptr =
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
     let captureRes = MobileCapiBioDidCapture(requestId,
                                                feature32Hex,
                                                deviceBindingSeed,
@@ -3038,21 +3042,21 @@ fn MobileCapiBioDidCreateDiagCaptureCStringRaw(requestIdRaw: ptr,
                                                sensorId,
                                                hardwareAttestation)
     if IsErr(captureRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
-    return MobileCapiBioDidDiagOkCString("capture")
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
+    return mobileCapiBioDidDiagOkCString("capture")
 
-fn MobileCapiBioDidCreateDiagEnrollCStringRaw(requestIdRaw: ptr,
+fn mobileCapiBioDidCreateDiagEnrollCStringRaw(requestIdRaw: ptr,
                                                 feature32HexRaw: ptr,
                                                 deviceBindingSeedRaw: ptr,
                                                 deviceLabelRaw: ptr,
                                                 sensorIdRaw: ptr,
                                                 hardwareAttestationRaw: ptr): ptr =
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
     let captureRes = MobileCapiBioDidCapture(requestId,
                                                feature32Hex,
                                                deviceBindingSeed,
@@ -3060,28 +3064,28 @@ fn MobileCapiBioDidCreateDiagEnrollCStringRaw(requestIdRaw: ptr,
                                                sensorId,
                                                hardwareAttestation)
     if IsErr(captureRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
     let capture = Value(captureRes)
     let attestationOk = bio_did.BioDidCaptureAttestationValidate(capture, "create")
     if IsErr(attestationOk):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(attestationOk)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(attestationOk)))
     let recordRes = bio.BioEnroll(capture.feature32)
     if IsErr(recordRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(recordRes)))
-    return MobileCapiBioDidDiagOkCString("enroll")
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(recordRes)))
+    return mobileCapiBioDidDiagOkCString("enroll")
 
-fn MobileCapiBioDidCreateDiagRecoverCStringRaw(requestIdRaw: ptr,
+fn mobileCapiBioDidCreateDiagRecoverCStringRaw(requestIdRaw: ptr,
                                                  feature32HexRaw: ptr,
                                                  deviceBindingSeedRaw: ptr,
                                                  deviceLabelRaw: ptr,
                                                  sensorIdRaw: ptr,
                                                  hardwareAttestationRaw: ptr): ptr =
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
     let captureRes = MobileCapiBioDidCapture(requestId,
                                                feature32Hex,
                                                deviceBindingSeed,
@@ -3089,31 +3093,31 @@ fn MobileCapiBioDidCreateDiagRecoverCStringRaw(requestIdRaw: ptr,
                                                sensorId,
                                                hardwareAttestation)
     if IsErr(captureRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
     let capture = Value(captureRes)
     let attestationOk = bio_did.BioDidCaptureAttestationValidate(capture, "create")
     if IsErr(attestationOk):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(attestationOk)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(attestationOk)))
     let recordRes = bio.BioEnroll(capture.feature32)
     if IsErr(recordRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(recordRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(recordRes)))
     let rootSecretRes = bio.BioRecoverRoot(capture.feature32, Value(recordRes).helper)
     if IsErr(rootSecretRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(rootSecretRes)))
-    return MobileCapiBioDidDiagOkCString("recover")
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(rootSecretRes)))
+    return mobileCapiBioDidDiagOkCString("recover")
 
-fn MobileCapiBioDidCreateDiagIdentityCStringRaw(requestIdRaw: ptr,
+fn mobileCapiBioDidCreateDiagIdentityCStringRaw(requestIdRaw: ptr,
                                                   feature32HexRaw: ptr,
                                                   deviceBindingSeedRaw: ptr,
                                                   deviceLabelRaw: ptr,
                                                   sensorIdRaw: ptr,
                                                   hardwareAttestationRaw: ptr): ptr =
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
     let captureRes = MobileCapiBioDidCapture(requestId,
                                                feature32Hex,
                                                deviceBindingSeed,
@@ -3121,17 +3125,17 @@ fn MobileCapiBioDidCreateDiagIdentityCStringRaw(requestIdRaw: ptr,
                                                sensorId,
                                                hardwareAttestation)
     if IsErr(captureRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
     let capture = Value(captureRes)
     let attestationOk = bio_did.BioDidCaptureAttestationValidate(capture, "create")
     if IsErr(attestationOk):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(attestationOk)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(attestationOk)))
     let recordRes = bio.BioEnroll(capture.feature32)
     if IsErr(recordRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(recordRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(recordRes)))
     let rootSecretRes = bio.BioRecoverRoot(capture.feature32, Value(recordRes).helper)
     if IsErr(rootSecretRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(rootSecretRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(rootSecretRes)))
     let rootSecret = Value(rootSecretRes)
     let rootSeed = bio_did.BioDidRootSeedFromRootSecret(rootSecret)
     let deviceSeed = bio_did.BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
@@ -3139,21 +3143,21 @@ fn MobileCapiBioDidCreateDiagIdentityCStringRaw(requestIdRaw: ptr,
     var document: did.DidDocument
     let documentRes = did.DidIdentityDocumentFill(document, identity)
     if IsErr(documentRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(documentRes)))
-    return MobileCapiBioDidDiagOkCString("identity")
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(documentRes)))
+    return mobileCapiBioDidDiagOkCString("identity")
 
-fn MobileCapiBioDidCreateDiagAssertionCStringRaw(requestIdRaw: ptr,
+fn mobileCapiBioDidCreateDiagAssertionCStringRaw(requestIdRaw: ptr,
                                                    feature32HexRaw: ptr,
                                                    deviceBindingSeedRaw: ptr,
                                                    deviceLabelRaw: ptr,
                                                    sensorIdRaw: ptr,
                                                    hardwareAttestationRaw: ptr): ptr =
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
     let captureRes = MobileCapiBioDidCapture(requestId,
                                                feature32Hex,
                                                deviceBindingSeed,
@@ -3161,18 +3165,18 @@ fn MobileCapiBioDidCreateDiagAssertionCStringRaw(requestIdRaw: ptr,
                                                sensorId,
                                                hardwareAttestation)
     if IsErr(captureRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
     let capture = Value(captureRes)
     let attestationOk = bio_did.BioDidCaptureAttestationValidate(capture, "create")
     if IsErr(attestationOk):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(attestationOk)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(attestationOk)))
     let recordRes = bio.BioEnroll(capture.feature32)
     if IsErr(recordRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(recordRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(recordRes)))
     let record = Value(recordRes)
     let rootSecretRes = bio.BioRecoverRoot(capture.feature32, record.helper)
     if IsErr(rootSecretRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(rootSecretRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(rootSecretRes)))
     let rootSecret = Value(rootSecretRes)
     let rootSeed = bio_did.BioDidRootSeedFromRootSecret(rootSecret)
     let deviceSeed = bio_did.BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
@@ -3180,7 +3184,7 @@ fn MobileCapiBioDidCreateDiagAssertionCStringRaw(requestIdRaw: ptr,
     var document: did.DidDocument
     let documentRes = did.DidIdentityDocumentFill(document, identity)
     if IsErr(documentRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(documentRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(documentRes)))
     let bundleSeq = 1
     let challengeNonce = bio_did.BioDidChallengeNonce("create",
                                                         document.did,
@@ -3197,21 +3201,21 @@ fn MobileCapiBioDidCreateDiagAssertionCStringRaw(requestIdRaw: ptr,
                                                            times.EpochTimeSeconds())
     let assertionRes = bio.BioProve(capture.feature32, record, challengeNonce)
     if IsErr(assertionRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(assertionRes)))
-    return MobileCapiBioDidDiagOkCString("assertion")
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(assertionRes)))
+    return mobileCapiBioDidDiagOkCString("assertion")
 
-fn MobileCapiBioDidCreateDiagBundleCStringRaw(requestIdRaw: ptr,
+fn mobileCapiBioDidCreateDiagBundleCStringRaw(requestIdRaw: ptr,
                                                 feature32HexRaw: ptr,
                                                 deviceBindingSeedRaw: ptr,
                                                 deviceLabelRaw: ptr,
                                                 sensorIdRaw: ptr,
                                                 hardwareAttestationRaw: ptr): ptr =
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
     let captureRes = MobileCapiBioDidCapture(requestId,
                                                feature32Hex,
                                                deviceBindingSeed,
@@ -3219,18 +3223,18 @@ fn MobileCapiBioDidCreateDiagBundleCStringRaw(requestIdRaw: ptr,
                                                sensorId,
                                                hardwareAttestation)
     if IsErr(captureRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(captureRes)))
     let capture = Value(captureRes)
     let attestationOk = bio_did.BioDidCaptureAttestationValidate(capture, "create")
     if IsErr(attestationOk):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(attestationOk)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(attestationOk)))
     let recordRes = bio.BioEnroll(capture.feature32)
     if IsErr(recordRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(recordRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(recordRes)))
     let record = Value(recordRes)
     let rootSecretRes = bio.BioRecoverRoot(capture.feature32, record.helper)
     if IsErr(rootSecretRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(rootSecretRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(rootSecretRes)))
     let rootSecret = Value(rootSecretRes)
     let rootSeed = bio_did.BioDidRootSeedFromRootSecret(rootSecret)
     let deviceSeed = bio_did.BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
@@ -3238,7 +3242,7 @@ fn MobileCapiBioDidCreateDiagBundleCStringRaw(requestIdRaw: ptr,
     var document: did.DidDocument
     let documentRes = did.DidIdentityDocumentFill(document, identity)
     if IsErr(documentRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(documentRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(documentRes)))
     let bundleSeq = 1
     let challengeNonce = bio_did.BioDidChallengeNonce("create",
                                                         document.did,
@@ -3255,7 +3259,7 @@ fn MobileCapiBioDidCreateDiagBundleCStringRaw(requestIdRaw: ptr,
                                                            times.EpochTimeSeconds())
     let assertionRes = bio.BioProve(capture.feature32, record, challengeNonce)
     if IsErr(assertionRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(assertionRes)))
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(assertionRes)))
     let bundleRes = bio_did.BioDidChainBundleMake("create",
                                                     bundleSeq,
                                                     document,
@@ -3264,8 +3268,8 @@ fn MobileCapiBioDidCreateDiagBundleCStringRaw(requestIdRaw: ptr,
                                                     Value(assertionRes),
                                                     hardware)
     if IsErr(bundleRes):
-        return MobileCapiTextCString(MobileCapiBioDidErrorJson(Error(bundleRes)))
-    return MobileCapiBioDidDiagOkCString("bundle")
+        return mobileCapiTextCString(MobileCapiBioDidErrorJson(Error(bundleRes)))
+    return mobileCapiBioDidDiagOkCString("bundle")
 
 fn MobileCapiBioDidImport(latestBundleText: str,
                             requestId: str,
@@ -3388,19 +3392,19 @@ fn MobileCapiBioDidImportWireHandle(requestWire: str): uint64 =
     let handle = MobileCapiTextBufferHandle(out)
     return handle
 
-fn MobileCapiBioDidImportWireCString(requestWire: str): ptr =
+fn mobileCapiBioDidImportWireCString(requestWire: str): ptr =
     let out = MobileCapiBioDidImportWire(requestWire)
-    let ctext = MobileCapiTextCString(out)
+    let ctext = mobileCapiTextCString(out)
     return ctext
 
-fn MobileCapiBioDidImportWireHandleRaw(requestWireRaw: ptr): uint64 =
-    let requestWire = MobileCapiCopyRawText(requestWireRaw)
+fn mobileCapiBioDidImportWireHandleRaw(requestWireRaw: ptr): uint64 =
+    let requestWire = mobileCapiCopyRawText(requestWireRaw)
     let handle = MobileCapiBioDidImportWireHandle(requestWire)
     return handle
 
-fn MobileCapiBioDidImportWireCStringRaw(requestWireRaw: ptr): ptr =
-    let requestWire = MobileCapiCopyRawText(requestWireRaw)
-    let ctext = MobileCapiBioDidImportWireCString(requestWire)
+fn mobileCapiBioDidImportWireCStringRaw(requestWireRaw: ptr): ptr =
+    let requestWire = mobileCapiCopyRawText(requestWireRaw)
+    let ctext = mobileCapiBioDidImportWireCString(requestWire)
     return ctext
 
 fn MobileCapiBioDidImportHandle(latestBundleText: str,
@@ -3420,7 +3424,7 @@ fn MobileCapiBioDidImportHandle(latestBundleText: str,
     let handle = MobileCapiTextBufferHandle(out)
     return handle
 
-fn MobileCapiBioDidImportCString(latestBundleText: str,
+fn mobileCapiBioDidImportCString(latestBundleText: str,
                                    requestId: str,
                                    feature32Hex: str,
                                    deviceBindingSeed: str,
@@ -3434,23 +3438,23 @@ fn MobileCapiBioDidImportCString(latestBundleText: str,
                                        deviceLabel,
                                        sensorId,
                                        hardwareAttestation)
-    let ctext = MobileCapiTextCString(out)
+    let ctext = mobileCapiTextCString(out)
     return ctext
 
-fn MobileCapiBioDidImportHandleRaw(latestBundleTextRaw: ptr,
+fn mobileCapiBioDidImportHandleRaw(latestBundleTextRaw: ptr,
                                      requestIdRaw: ptr,
                                      feature32HexRaw: ptr,
                                      deviceBindingSeedRaw: ptr,
                                      deviceLabelRaw: ptr,
                                      sensorIdRaw: ptr,
                                      hardwareAttestationRaw: ptr): uint64 =
-    let latestBundleText = MobileCapiCopyRawText(latestBundleTextRaw)
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
+    let latestBundleText = mobileCapiCopyRawText(latestBundleTextRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
     let handle = MobileCapiBioDidImportHandle(latestBundleText,
                                                 requestId,
                                                 feature32Hex,
@@ -3460,21 +3464,21 @@ fn MobileCapiBioDidImportHandleRaw(latestBundleTextRaw: ptr,
                                                 hardwareAttestation)
     return handle
 
-fn MobileCapiBioDidImportCStringRaw(latestBundleTextRaw: ptr,
+fn mobileCapiBioDidImportCStringRaw(latestBundleTextRaw: ptr,
                                       requestIdRaw: ptr,
                                       feature32HexRaw: ptr,
                                       deviceBindingSeedRaw: ptr,
                                       deviceLabelRaw: ptr,
                                       sensorIdRaw: ptr,
                                       hardwareAttestationRaw: ptr): ptr =
-    let latestBundleText = MobileCapiCopyRawText(latestBundleTextRaw)
-    let requestId = MobileCapiCopyRawText(requestIdRaw)
-    let feature32Hex = MobileCapiCopyRawText(feature32HexRaw)
-    let deviceBindingSeed = MobileCapiCopyRawText(deviceBindingSeedRaw)
-    let deviceLabel = MobileCapiCopyRawText(deviceLabelRaw)
-    let sensorId = MobileCapiCopyRawText(sensorIdRaw)
-    let hardwareAttestation = MobileCapiCopyRawText(hardwareAttestationRaw)
-    let ctext = MobileCapiBioDidImportCString(latestBundleText,
+    let latestBundleText = mobileCapiCopyRawText(latestBundleTextRaw)
+    let requestId = mobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = mobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = mobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = mobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = mobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = mobileCapiCopyRawText(hardwareAttestationRaw)
+    let ctext = mobileCapiBioDidImportCString(latestBundleText,
                                                 requestId,
                                                 feature32Hex,
                                                 deviceBindingSeed,

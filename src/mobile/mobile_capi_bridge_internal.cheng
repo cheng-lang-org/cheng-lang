@@ -1,0 +1,126 @@
+import std/result
+import std/rawbytes
+import std/system
+
+@importc("cheng_buffer_handle_from_raw_bridge")
+fn cheng_buffer_handle_from_raw_bridge(data: ptr, n: int32): uint64
+@importc("cheng_sha256_hex_bridge")
+fn cheng_sha256_hex_bridge(text: str): str
+@importc("cheng_mobile_host_emit_log")
+fn cheng_mobile_host_emit_log(message: str)
+@importc("cheng_mobile_host_moq_request_path_bridge")
+fn cheng_mobile_host_moq_request_path_bridge(): ptr
+@importc("cheng_mobile_host_moq_blob_bridge")
+fn cheng_mobile_host_moq_blob_bridge(): ptr
+@importc("cheng_mobile_host_moq_blob_len_bridge")
+fn cheng_mobile_host_moq_blob_len_bridge(): int32
+@importc("cheng_mobile_host_moq_request_wire_bridge")
+fn cheng_mobile_host_moq_request_wire_bridge(): ptr
+@importc("cheng_mobile_host_moq_request_wire_len_bridge")
+fn cheng_mobile_host_moq_request_wire_len_bridge(): int32
+@importc("malloc")
+fn c_malloc(size: int64): ptr
+@importc("free")
+fn c_free(p: ptr)
+@importc("cheng_fopen")
+fn cheng_fopen(filename, mode: cstring): ptr
+@importc("cheng_fclose")
+fn cheng_fclose(stream: ptr): int32
+@importc("cheng_fwrite")
+fn cheng_fwrite(buf: ptr, size: int64, n: int64, stream: ptr): int32
+@importc("cheng_os_fopen_mode_bridge")
+fn cheng_os_fopen_mode_bridge(path: str, mode: str): ptr
+
+fn InternalMobileBridgeEmitLog(message: str) =
+    cheng_mobile_host_emit_log(message)
+
+fn InternalMobileBridgeSha256Hex(text: str): str =
+    return cheng_sha256_hex_bridge(text)
+
+fn InternalMobileBridgeBufferHandle(data: ptr, n: int32): uint64 =
+    if data == nil || n <= 0:
+        return uint64(0)
+    return cheng_buffer_handle_from_raw_bridge(data, n)
+
+fn InternalMobileBridgeTextCString(text: str): ptr =
+    let textLen = len(text)
+    let raw = c_malloc(int64(textLen + 1))
+    if raw == nil:
+        return nil
+    var out = bytesView(raw, textLen + 1)
+    for i in 0..<textLen:
+        bytesSet(out, i, int32(text[i]) & 255)
+    bytesSet(out, textLen, 0)
+    return raw
+
+fn InternalMobileBridgeStringFree(text: ptr) =
+    c_free(text)
+
+fn InternalMobileBridgeCopyRawText(raw: ptr): str =
+    if raw == nil:
+        return ""
+    return strFromCStringCopy(cstring(raw))
+
+fn InternalMobileBridgeCopyRawTextLen(raw: ptr, textLen: int32): str =
+    if raw == nil || textLen <= 0:
+        return ""
+    return bytesToString(bytesView(raw, textLen))
+
+fn InternalMobileBridgeWriteBytesFileMode(path: str,
+                                       payload: Bytes,
+                                       mode: str,
+                                       openError: str,
+                                       writeError: str): Result[bool] =
+    let outFile = cheng_os_fopen_mode_bridge(path, mode)
+    if outFile == nil:
+        return Err[bool](openError)
+    let payloadLen = bytesLen(payload)
+    if payloadLen > 0:
+        let wrote: int32 = cheng_fwrite(payload.data, 1, payloadLen, outFile)
+        if wrote != payloadLen:
+            cheng_fclose(outFile)
+            return Err[bool](writeError)
+    cheng_fclose(outFile)
+    return Ok[bool](true)
+
+fn InternalMobileBridgeWriteBytesFile(path: str, payload: Bytes): Result[bool] =
+    return InternalMobileBridgeWriteBytesFileMode(path,
+                                              payload,
+                                              "wb",
+                                              "moq_fountain_write_open_failed",
+                                              "moq_fountain_write_failed")
+
+fn InternalMobileBridgeAppendBytesFile(path: str, payload: Bytes): Result[bool] =
+    return InternalMobileBridgeWriteBytesFileMode(path,
+                                              payload,
+                                              "ab",
+                                              "moq_fountain_append_open_failed",
+                                              "moq_fountain_append_failed")
+
+fn InternalMobileBridgeWriteBytesPath(path: str, payload: Bytes): Result[bool] =
+    let outFile = cheng_fopen(strToCStringTemp(path), "wb")
+    if outFile == nil:
+        return Err[bool]("moq_fountain_write_open_failed")
+    let payloadLen = bytesLen(payload)
+    if payloadLen > 0:
+        let wrote: int32 = cheng_fwrite(payload.data, 1, payloadLen, outFile)
+        if wrote != payloadLen:
+            cheng_fclose(outFile)
+            return Err[bool]("moq_fountain_write_failed")
+    cheng_fclose(outFile)
+    return Ok[bool](true)
+
+fn InternalMobileBridgeHostMoqRequestPathRaw(): ptr =
+    return cheng_mobile_host_moq_request_path_bridge()
+
+fn InternalMobileBridgeHostMoqBlobRaw(): ptr =
+    return cheng_mobile_host_moq_blob_bridge()
+
+fn InternalMobileBridgeHostMoqBlobLen(): int32 =
+    return cheng_mobile_host_moq_blob_len_bridge()
+
+fn InternalMobileBridgeHostMoqRequestWireRaw(): ptr =
+    return cheng_mobile_host_moq_request_wire_bridge()
+
+fn InternalMobileBridgeHostMoqRequestWireLen(): int32 =
+    return cheng_mobile_host_moq_request_wire_len_bridge()

@@ -4,6 +4,7 @@ import std/bytes as filebytes
 import std/rawbytes
 import cheng/moq/moq_fountain as moq
 import cheng/mobile/mobile_capi as capi
+import std/strutils as strutil
 
 fn usage(): int32 =
     echo("usage: mobile_moq_fountain_build_probe <core|raw|request|persist> <sample-path> [remote-peers-csv] [output-dir] [file-stem]")
@@ -23,16 +24,15 @@ fn runSelfSmoke(): int32 =
     assert(len(out.bundleCid) > 0, "mobile_moq probe: self bundle")
     assert(out.objectCount > 0, "mobile_moq probe: self object count")
     assert(out.droplets.len > 0, "mobile_moq probe: self droplets")
-    let wire = capi.MobileCapiMoqFountainBuildRaw(sample.data,
-                                                    sample.len,
-                                                    "peer-android",
-                                                    "peer-harmony",
-                                                    "video/mp4",
-                                                    64,
-                                                    16,
-                                                    2)
-    assert(len(wire) > 0, "mobile_moq probe: self raw wire")
-    assert(strContains(wire, "ok=1"), "mobile_moq probe: self raw ok")
+    let wire = capi.MobileCapiMoqFountainBuild(bytesToString(sample),
+                                                 "peer-android",
+                                                 "peer-harmony",
+                                                 "video/mp4",
+                                                 64,
+                                                 16,
+                                                 2)
+    assert(len(wire) > 0, "mobile_moq probe: self public wire")
+    assert(strContains(wire, "ok=1"), "mobile_moq probe: self public ok")
     echo(" mobile_moq_fountain_build_probe ok")
     return 0
 
@@ -45,8 +45,9 @@ fn main(argc: int32, argv: str*): int32 =
     let remotePeersCsv = if cmdline.ParamCount() >= 4: cmdline.ParamStr(3) else: "peer-harmony"
     let buf = filebytes.ReadFileBytes(samplePath)
     assert(buf.data != nil && buf.len > 0, "mobile_moq probe: sample bytes")
+    let blobText = bytesToString(bytesView(buf.data, buf.len))
     echo("probe:sample_loaded")
-    echo("probe:sample_len=" + intToStr(buf.len))
+    echo(strutil.Join(["probe:sample_len=", intToStr(buf.len)], ""))
     if mode == "core":
         let buildRes = moq.MoqFountainBuild(bytesView(buf.data, buf.len),
                                             "peer-android",
@@ -58,22 +59,21 @@ fn main(argc: int32, argv: str*): int32 =
         assert(IsOk(buildRes), "mobile_moq probe: core build")
         let out = Value(buildRes)
         echo("probe:core_ok")
-        echo("probe:bundle=" + out.bundleCid)
-        echo("probe:objects=" + intToStr(out.objectCount))
-        echo("probe:droplets=" + intToStr(out.droplets.len))
+        echo(strutil.Join(["probe:bundle=", out.bundleCid], ""))
+        echo(strutil.Join(["probe:objects=", intToStr(out.objectCount)], ""))
+        echo(strutil.Join(["probe:droplets=", intToStr(out.droplets.len)], ""))
         return 0
     if mode == "raw":
-        let wire = capi.MobileCapiMoqFountainBuildRaw(buf.data,
-                                                        buf.len,
-                                                        "peer-android",
-                                                        remotePeersCsv,
-                                                        "video/mp4",
-                                                        512 * 1024,
-                                                        128 * 1024,
-                                                        2)
-        assert(len(wire) > 0, "mobile_moq probe: raw wire")
+        let wire = capi.MobileCapiMoqFountainBuild(blobText,
+                                                     "peer-android",
+                                                     remotePeersCsv,
+                                                     "video/mp4",
+                                                     512 * 1024,
+                                                     128 * 1024,
+                                                     2)
+        assert(len(wire) > 0, "mobile_moq probe: public wire")
         echo("probe:raw_ok")
-        echo("probe:wire_len=" + intToStr(len(wire)))
+        echo(strutil.Join(["probe:wire_len=", intToStr(len(wire))], ""))
         if strContains(wire, "ok=1"):
             echo("probe:wire_ok=1")
         else:
@@ -82,21 +82,18 @@ fn main(argc: int32, argv: str*): int32 =
     if mode == "request":
         echo("probe:request_begin")
         var requestWire = ""
-        requestWire = requestWire + "owner_peer_id=peer-android\n"
-        requestWire = requestWire + "remote_peers_csv=" + remotePeersCsv + "\n"
-        requestWire = requestWire + "mime_type=video/mp4\n"
-        requestWire = requestWire + "object_target_bytes=524288\n"
-        requestWire = requestWire + "source_block_bytes=131072\n"
-        requestWire = requestWire + "repair_droplet_count=2\n"
+        requestWire = strutil.Join([requestWire, "owner_peer_id=peer-android\n"], "")
+        requestWire = strutil.Join([requestWire, "remote_peers_csv=", remotePeersCsv, "\n"], "")
+        requestWire = strutil.Join([requestWire, "mime_type=video/mp4\n"], "")
+        requestWire = strutil.Join([requestWire, "object_target_bytes=524288\n"], "")
+        requestWire = strutil.Join([requestWire, "source_block_bytes=131072\n"], "")
+        requestWire = strutil.Join([requestWire, "repair_droplet_count=2\n"], "")
         echo("probe:request_wire_built")
-        let wire = capi.MobileCapiMoqFountainBuildRequestRaw(buf.data,
-                                                               buf.len,
-                                                               strDataPtr(requestWire),
-                                                               len(requestWire))
+        let wire = capi.MobileCapiMoqFountainBuildRequest(blobText, requestWire)
         echo("probe:request_call_returned")
         assert(len(wire) > 0, "mobile_moq probe: request wire")
         echo("probe:request_ok")
-        echo("probe:wire_len=" + intToStr(len(wire)))
+        echo(strutil.Join(["probe:wire_len=", intToStr(len(wire))], ""))
         if strContains(wire, "ok=1"):
             echo("probe:wire_ok=1")
         else:
@@ -105,19 +102,18 @@ fn main(argc: int32, argv: str*): int32 =
     if mode == "persist":
         let outputDir = if cmdline.ParamCount() >= 5: cmdline.ParamStr(4) else: "/tmp"
         let fileStem = if cmdline.ParamCount() >= 6: cmdline.ParamStr(5) else: "mobile-moq-probe"
-        let wire = capi.MobileCapiMoqFountainBuildPersistRaw(buf.data,
-                                                               buf.len,
-                                                               "peer-android",
-                                                               remotePeersCsv,
-                                                               "video/mp4",
-                                                               512 * 1024,
-                                                               128 * 1024,
-                                                               2,
-                                                               outputDir,
-                                                               fileStem)
+        let wire = capi.MobileCapiMoqFountainBuildPersist(blobText,
+                                                            "peer-android",
+                                                            remotePeersCsv,
+                                                            "video/mp4",
+                                                            512 * 1024,
+                                                            128 * 1024,
+                                                            2,
+                                                            outputDir,
+                                                            fileStem)
         assert(len(wire) > 0, "mobile_moq probe: persist wire")
         echo("probe:persist_ok")
-        echo("probe:wire_len=" + intToStr(len(wire)))
+        echo(strutil.Join(["probe:wire_len=", intToStr(len(wire))], ""))
         if strContains(wire, "ok=1"):
             echo("probe:wire_ok=1")
         else:
