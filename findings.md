@@ -38,3 +38,44 @@
 - driver 转发 stage3 时若让 C seed 跳过 `.map`，必须由 driver 接管 `line_map` 与最终 `build done` 进度；否则用户看到的实时进度会先完成、后补写 sidecar。
 - `verify-debug-tools` 不是纯文本检查，它会调用 host smoke gate 编译运行 `debug_tools_surface_smoke`；调它时按 `run-host-smokes` 处理，不能和其他编译门禁并行。
 - arm64 seed backend 的嵌套调用保值不能把 `x0` 暂存到裸 `call_arg_base`；那块是外层参数区，内层 ORC/字符串比较一旦借用它就会把外层实参覆盖。保值必须走按 `call_depth` 隔离的 `call_dest_spill`。
+- direct object writer 只能接声明过的真实 codegen 形状；当前已把 standalone zero-exit、return-zero `emit:obj`、return-call BR26 relocation `emit:obj`、二参 f64 乘法对象函数、最小 f64 乘法退出码 exe 接成真实 Mach-O 对象写入。assert/echo/数组这类主体不能通过“忽略语义后返回 0”伪装支持，必须等 primary object plan 有真实语义 lowering 后再打开。
+- C seed 最小化后，cache key 不能再只哈希 `bootstrap/cheng_seed.c`；provider object cache 和 system-link-exec cache 都必须把纯 Cheng codegen/direct object writer 模块纳入 key，否则会命中旧二进制产物。
+- seed 最小化应先收活命令面再删物理死代码；`CHENG_NO_BACKEND_DRIVER_HANDOFF=1` 只能保留自举核心命令，非自举命令硬失败，隐藏 `__*` 命令继续按 unknown 处理。
+- `build-backend-driver` 的 ready 判定不能只看旧 source set；它必须覆盖 `print-build-plan` 中的实际 backend driver source list，否则 direct object writer 源码改动会被快路径漏掉。
+- float64 不能靠“函数体不识别就返回 0”来过门禁；纯 Cheng direct object 只应为已严格识别的 ABI/语义形状开机器码。当前 `float64_mul_backend_smoke` 只覆盖最小真实 `1.5 * 2.0 == 3.0` 退出码语义；`assert/array/echo` 版仍必须等真实 lowering 完成后再恢复。
+- stage1 bootstrap contract 也属于 C seed 最小化边界；C seed 支持命令集合改成 `build-backend-driver` 后，`bootstrap/stage1_bootstrap.cheng` 不能继续留旧 `status`，否则 stage0/stage1 self-check 会在 bootstrap-bridge 前失败。
+- 手工 `cc bootstrap/cheng_seed.c -o artifacts/bootstrap/cheng.stage0` 只能生成无嵌入合同的临时 seed；正式刷新 stage0 必须再用 `compile-bootstrap --in:bootstrap/stage1_bootstrap.cheng` 生成带 `CHENG_EMBEDDED_CONTRACT_TEXT` 的 wrapper，否则 `print-contract`/`bootstrap-bridge` 会因缺合同或旧命令集合失败。
+- `build-backend-driver` 启动前不能把“查进程”和“启动构建”放在同一个并行 tool call 里；检查与启动必须串行，否则会和已有构建抢跑，虽然安装锁能保护最终 rename，但会浪费一次长编译。
+- standalone no-runtime exe 不能丢符号：入口为 provider-free 严格 codegen 形状时可以直写 `_main`，但其它已有严格 direct codegen 的真实函数必须一起写进对象；return-call 只能指向同一对象内已定义符号，否则必须拒绝，不能生成带悬空本地 helper 的对象。
+- 非 standalone exe 的 direct primary object 不能先于 provider object materializer 迁移打开；entry bridge 会拉 runtime provider objects，当前纯 provider 编译对 `core_runtime_provider_darwin` 仍可能 `plan not ready`，正确边界是 hard-fail 而不是回退或半开。
+- standalone no-runtime direct exe 的 call-chain wrapper 只应接受 provider-free 的 `return_call_noarg_i32` 入口；`arg0/arg0_arg1` 入口不能直接拿 OS `main(argc, argv)` 寄存器伪装 Cheng 参数 ABI。
+- `otool -r` 默认只打印 relocation 数字 type；需要验证 arm64 branch relocation 名称时必须用 `otool -rv`，输出会显示 `BR26` 和目标符号。
+- `return_i32_const_N` 要在 primary object plan 和 direct object writer 两侧同时登记；只让 writer 识别会让 smoke 报告期待的 body kind 永远进不来。
+- 二参算术 body kind 不能只落 direct writer：`return_i32_add_args` 必须同时更新 `primary_object_plan`、`primary_object_emit` 文本汇编 fallback 和 `direct_object_emit` 直写 object，否则自举或非 direct 对象路径会在 plan/emit 之间断链。
+- 旧 zero-exit 报告名只适合早期 `return 0` 形状；一旦 direct entry 支持 `return_i32_const_N` 和 call-chain，报告字段必须描述“无 runtime/provider 的 direct entry”，不能继续用 zero-exit 语义名。
+- primary object plan 识别函数体时应先归一化“可选 return 前缀”，再做常量、二参算术、call-chain 匹配；否则同一语义的表达式体会被误判为 plan not ready。
+- 在 backend driver 自举闭包里给大 emit 函数新增小 helper 不是免费的；如果 helper 还没被当前 primary-object 能力覆盖，调用点会先报 `scalar call resolve failed` / `composite call expr unresolved`。严格指令分支优先在既有 emit 函数内直接写指令字或汇编片段。
+- `seed_minimization_boundary_smoke` 的 cache prime/restore 必须用同一个稳定 backend driver 二进制；若中间撞上后台 `build-backend-driver` 原子替换，会表现为 prime report 已 store 一个 key、restore 立刻按另一个 codegen/source key 查 miss。先确认无活动构建并重跑，不要把这种假红当 cache 算法回退。
+- `build-backend-driver` 从 2.5 分钟涨到 3.5 分钟的主因不是 assembler 或写文件，而是 C seed 同一批 scalar 函数体 codegen 做了两遍：`primary_object_plan` 先生成并缓存 `scalar_function_texts`，`primary_object_emit` 又重新跑 `cheng_seed_try_emit_scalar_function`。emit 必须复用 plan 缓存，不能重复生成。
+- backend driver 的核心闭包之前把 cross-target/debug-runtime/network/orphan/r2c/stage23-libp2p/wasm gate 都编进主入口；这些不是最小 seed 主线，直接增加 source closure、CSG、lowering 和 primary plan 成本。主入口应只保留核心命令实现，领域 gate 走显式 stage3 转发。
+- 当前 pure direct object writer 的 add/sub/mul/asr/madd/f64-mul 已改由 `typed_expr` 生成 `TypedExprReturnOpFact`，`lowering_plan` 承载并上报，`primary_object_plan` 只消费 typed facts；这只是第一阶段 typed fact，下一步仍应把二元/乘加表达式做成通用 Typed IR/Low-UIR 节点，文本汇编只保留调试输出。
+- `TypedExprIr -> PrimaryObjectIR` 已落地到 primary object plan，源码重扫和字符串猜 body kind 已从 primary object 主链移除；当前能稳定覆盖 i32 const/call/add/sub/mul/asr/madd、f64 mul 和最小 f64 退出码。
+- Darwin arm64 直写 Mach-O `.o` 主路径已能由报告和 `otool` 证明：`primary_object_direct=1`、`direct_object_reloc_count=0/BR26`、`fmul/add/sub/mul/asr/madd` 指令真实存在；`.s` 仍只应作为 fallback/debug 输出保留。
+- backend driver 全量纯 self build 的剩余硬阻塞不是 provider cache，也不是 export visibility，而是 `backend_driver_main::main`/命令分发仍缺真实 codegen，导致 `primary_object_body_semantics_missing`。按 Let it crash 口径，应继续补 Low-UIR 控制流和调用约定，不能用返回 0、stub main、C seed fallback 或 unsupported 函数静默省略来冒充通过。
+- `--emit:obj` 没有入口语义，primary object root 必须是源内全部函数；`--emit:exe` 才能只从入口函数做可达闭包。把两者混用会让 f64/i32 对象函数被清空成 `primary_object_items_missing`。
+- 可达闭包不能用动态 pending `while`；用最多 `function_count` 轮的 frontier `for ... in range` 即可保证终止、去重和确定性。
+- plan-not-ready 必须报告首个不可发射函数和 body kind；只打印 `primary_object_body_semantics_missing` 会让 backend driver self-build 卡点反复回到人工 grep。
+- lowering 不能用同一行有 resolved call 就生成 `return_call_*`；必须消费 typed fact 的 `returnRoot`，否则 `let rootDir = BackendDriverRoot()` 会被误当 `return BackendDriverRoot()`，把 blocker 错报到被调用函数。
+- 给 backend driver 自举闭包新增小 helper 仍可能先被当前 primary-object 能力卡住；本轮 `TypedExprLineHasInlineFunctionBodyRoot` 已内联回 `TypedExprSinkForExpr`，后续新增结构化 fact 优先复用既有函数体或先补 helper 的真实 codegen。
+- backend driver 自举闭包里不要把源码文本字段塞进 `PrimaryObjectIrFunction` 这类会从 `LoweringBuildPrimaryObjectIr` 返回的复合对象；当前 aggregate return/codegen 还没完全覆盖，诊断应先用行号和 side table，源码文本以后从 report 旁路派生。
+- 找调用表达式的开括号不能用 `TypedExprFindTopLevelTextToken(text, "(")`；该 helper 会先增加括号深度，找 `(` 会失败。需要直接找开括号，再用 matching paren 验证 RHS 覆盖范围。
+- `PrimaryObjectIR.bodyKind` 是机器码合同，不是诊断通道；`stmt_let_call` 这类 typed statement blocker 应写进 `primary_object_first_missing_typed_ir_kind`，只有 direct writer 和 asm fallback 都实现后才允许新增 body kind。
+- arm64 非叶子函数只要发出 `bl`，就必须保存恢复 `x30`；`bl; mov; ret` 会把 LR 留在函数内部，表现为可执行文件挂住而不是链接错误。最小稳定形态先用 `stp x29,x30,[sp,#-16]!` / `ldp x29,x30,[sp],#16`，再优化成更短序言。
+- object 文件反汇编里未重定位的 branch 可能显示成自跳；判断 branch 目标必须结合 `otool -rv` 和最终 linked executable 的 `otool -tV`，并实际运行退出码，不能只看 `.o` 的占位反汇编。
+- 在 backend driver 闭包里新增 helper 函数前，必须先证明 helper 自身能被当前 primary object 编译；否则逻辑本身正确也可能让 `build-backend-driver` 卡在 helper 的 `stmt_if/stmt_let` 形状。
+- 标量 call result 后接 guard 分支可以先不落栈：Darwin arm64 `bl` 返回的 `w0` 直接参与 `cmp w0,#0`，`b.gt` 跳到保留结果的 epilogue；then 分支写 `w0=0` 后恢复 LR 返回。该形状的 BR26 relocation 仍在非叶子序言后的第 2 个 word。
+- 复合 `str` sret local 后续作为实参传递时，caller 必须把 24 字节 local 放在自己的栈帧里跨语句保活：第一次 call 用 `x8` 指向该 local，第二次 call 用 `x0` 传同一地址；不能把 `str` 结果当标量返回，也不能在 call 后释放或清零 call temp。
+- typed IR 已经证明多 statement 精确形状时，lowering 应直接消费结构化 resolved call facts。`callArgCount` 或 line 匹配字段过窄时，只能在 typed facts 内按语义顺序收窄，不能回头让 primary object plan 重读源码、扫字符串或猜函数体。
+- 单个函数内多次 `bl` 的 relocation 应由 `PrimaryObjectPlan.relocWordOffsets` 和 `relocTargetSymbols` 统一表达；direct object writer 只消费 plan 的 offset/symbol 数组，不应再按 body kind 重新推导 branch word offset。
+- 无显式类型的 `let value = Call()` 不能靠源码冒号判断 ABI；typed_expr 可以只承认 let-call 语句形状，lowering 必须用 typed call fact 的 `typeText` 证明 `str`/`int32` 后再下发对应 PrimaryObjectIR body kind。
+- `let-call str then arg0` 这类名字里带类型的 body kind 必须在 lowering 处校验首个 call 返回类型；否则 untyped let-call 形状放宽后会把非 `str` 调用误编成 sret/local 机器码。

@@ -1,64 +1,15 @@
 import std/result
+import std/strformat
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/tooling/path as chengpath
-import cheng/core/lang/parser
 import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/system_link_plan as slplan
 
-type
-    LineMapSourceCacheEntry =
-        sourcePath: str
-        lines: str[]
-        decls: parser.NormalizedFunctionDecl[]
-        ok: bool
-
 fn LineMapPathForOutput(outputPath: str): str =
     if len(outputPath) <= 0:
         return ""
-    return outputPath + ".map"
-
-fn LineMapSourceCacheIndex(entries: LineMapSourceCacheEntry[],
-                             sourcePath: str): int32 =
-    for i in 0..<entries.len:
-        if entries[i].sourcePath == sourcePath:
-            return i
-    return -1
-
-fn LineMapSourceCacheEnsure(entries: var LineMapSourceCacheEntry[],
-                              sourcePath: str): int32 =
-    let existing = LineMapSourceCacheIndex(entries, sourcePath)
-    if existing >= 0:
-        return existing
-    let sourceText = chengpath.ReadTextFile("", sourcePath)
-    var decls: parser.NormalizedFunctionDecl[]
-    var declErr = ""
-    var entry: LineMapSourceCacheEntry
-    entry.sourcePath = sourcePath
-    entry.lines = pobj.PrimarySplitLines(sourceText)
-    entry.ok = parser.ParserReadNormalizedFunctionDecls(sourceText, decls, declErr)
-    entry.decls = decls
-    add(entries, entry)
-    return entries.len - 1
-
-fn LineMapBodyLastLine(lines: str[],
-                         declLineIndex: int32,
-                         bodyFirstLine: int32): int32 =
-    if declLineIndex <= 0 || bodyFirstLine <= 0:
-        return 0
-    if bodyFirstLine == declLineIndex:
-        return declLineIndex
-    var last = bodyFirstLine
-    let startIndex = bodyFirstLine - 1
-    for i in startIndex..<lines.len:
-        let raw = lines[i]
-        let trimmed = chengpath.PathTrim(raw)
-        if len(trimmed) <= 0:
-            continue
-        if !parser.ParserHasLeadingIndent(raw):
-            break
-        last = i + 1
-    return last
+    return Fmt([outputPath, ".map"])
 
 fn LineMapFindEntryFunctionIndex(lowering: lower.LoweringPlanStub): int32 =
     for i in 0..<lowering.functionEntryFlags.len:
@@ -68,81 +19,49 @@ fn LineMapFindEntryFunctionIndex(lowering: lower.LoweringPlanStub): int32 =
 
 fn LineMapLoweredFunctionEntryText(linkPlan: slplan.SystemLinkPlanStub,
                                      lowering: lower.LoweringPlanStub,
-                                     index: int32,
-                                     cache: var LineMapSourceCacheEntry[]): str =
-    let sourcePath = lowering.functionSourcePaths[index]
-    let cacheIndex = LineMapSourceCacheEnsure(cache, sourcePath)
-    let sourceEntry = cache[cacheIndex]
-    var declLineIndex: int32
-    var bodyFirstLine: int32
-    var bodyLastLine: int32
-    if sourceEntry.ok:
-        declLineIndex = pobj.PrimaryFindDeclLineIndex(sourceEntry.decls,
-                                                       lowering.functionNames[index])
-        let _bodyText = pobj.PrimaryFunctionBodyLine(sourceEntry.lines,
-                                                      declLineIndex,
-                                                      bodyFirstLine)
-        bodyLastLine = LineMapBodyLastLine(sourceEntry.lines,
-                                           declLineIndex,
-                                           bodyFirstLine)
-    let symbol = pobj.PrimarySymbolNameForFunction(linkPlan.targetTriple,
-                                                    lowering.functionSymbolTexts[index],
-                                                    declLineIndex,
-                                                    linkPlan.emitKind)
-    return "entry\t" + symbol +
-           "\t" + lowering.functionNames[index] +
-           "\t" + sourcePath +
-           "\t" + intToStr(declLineIndex) +
-           "\t" + intToStr(bodyFirstLine) +
-           "\t" + intToStr(bodyLastLine)
+                                     index: int32): str =
+    return Fmt(["entry\t",
+                pobj.PrimarySymbolNameForFunction(linkPlan.targetTriple,
+                                                  lowering.functionSymbolTexts[index],
+                                                  lowering.primaryObjectIr.functions[index].signatureLineNumber,
+                                                  linkPlan.emitKind),
+                "\t", lowering.functionNames[index],
+                "\t", lowering.functionSourcePaths[index],
+                "\t", intToStr(lowering.primaryObjectIr.functions[index].signatureLineNumber),
+                "\t", intToStr(lowering.primaryObjectIr.functions[index].bodyLineNumber),
+                "\t", intToStr(lowering.primaryObjectIr.functions[index].bodyLineNumber)])
 
 fn LineMapRuntimeBridgeEntryText(linkPlan: slplan.SystemLinkPlanStub,
                                    lowering: lower.LoweringPlanStub,
-                                   entryIndex: int32,
-                                   cache: var LineMapSourceCacheEntry[]): str =
-    let sourcePath = lowering.functionSourcePaths[entryIndex]
-    let cacheIndex = LineMapSourceCacheEnsure(cache, sourcePath)
-    let sourceEntry = cache[cacheIndex]
-    var declLineIndex: int32
-    var bodyFirstLine: int32
-    var bodyLastLine: int32
-    if sourceEntry.ok:
-        declLineIndex = pobj.PrimaryFindDeclLineIndex(sourceEntry.decls,
-                                                       lowering.functionNames[entryIndex])
-        let _bodyText = pobj.PrimaryFunctionBodyLine(sourceEntry.lines,
-                                                      declLineIndex,
-                                                      bodyFirstLine)
-        bodyLastLine = LineMapBodyLastLine(sourceEntry.lines,
-                                           declLineIndex,
-                                           bodyFirstLine)
-    return "entry\t" + pobj.PrimaryRuntimeEntryBridgeSymbol(linkPlan) +
-           "\t" + lowering.functionNames[entryIndex] +
-           "\t" + sourcePath +
-           "\t" + intToStr(declLineIndex) +
-           "\t" + intToStr(bodyFirstLine) +
-           "\t" + intToStr(bodyLastLine)
+                                   entryIndex: int32): str =
+    return Fmt(["entry\t", pobj.PrimaryRuntimeEntryBridgeSymbol(linkPlan),
+                "\t", lowering.functionNames[entryIndex],
+                "\t", lowering.functionSourcePaths[entryIndex],
+                "\t", intToStr(lowering.primaryObjectIr.functions[entryIndex].signatureLineNumber),
+                "\t", intToStr(lowering.primaryObjectIr.functions[entryIndex].bodyLineNumber),
+                "\t", intToStr(lowering.primaryObjectIr.functions[entryIndex].bodyLineNumber)])
 
 fn LineMapText(linkPlan: slplan.SystemLinkPlanStub,
                  lowering: lower.LoweringPlanStub): str =
-    var cache: LineMapSourceCacheEntry[]
     let entryIndex = LineMapFindEntryFunctionIndex(lowering)
     var entryCount = lowering.functionNames.len
     if entryIndex >= 0:
         entryCount = entryCount + 1
-    var out = "cheng_line_map_v1\n"
-    out = out + "entry_count=" + intToStr(entryCount) + "\n"
+    var out = Lines(["cheng_line_map_v1",
+                     Fmt(["entry_count=", intToStr(entryCount)])])
+    out = Fmt([out, "\n"])
     for i in 0..<lowering.functionNames.len:
-        out = out + LineMapLoweredFunctionEntryText(linkPlan,
-                                                     lowering,
-                                                     i,
-                                                     cache)
-        out = out + "\n"
-    if entryIndex >= 0:
-        out = out + LineMapRuntimeBridgeEntryText(linkPlan,
+        out = Fmt([out,
+                   LineMapLoweredFunctionEntryText(linkPlan,
                                                    lowering,
-                                                   entryIndex,
-                                                   cache)
-        out = out + "\n"
+                                                   i),
+                   "\n"])
+    if entryIndex >= 0:
+        out = Fmt([out,
+                   LineMapRuntimeBridgeEntryText(linkPlan,
+                                                lowering,
+                                                entryIndex),
+                   "\n"])
     return out
 
 fn WriteExecutableLineMap(rootDir: str,
@@ -155,5 +74,5 @@ fn WriteExecutableLineMap(rootDir: str,
         return Ok[str]("")
     let text = LineMapText(linkPlan, lowering)
     if !chengpath.WriteTextFile(rootDir, path, text):
-        return Err[str](" compiler: failed to write line-map: " + path)
+        return Err[str](Fmt([" compiler: failed to write line-map: ", path]))
     return Ok[str](path)

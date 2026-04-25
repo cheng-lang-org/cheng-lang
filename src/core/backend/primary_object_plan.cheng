@@ -1,12 +1,12 @@
 import std/strings
 import std/strutils as strutil
+import std/strformat
 import std/result
 import cheng/core/tooling/compiler_request as creq
-import cheng/core/tooling/path as chengpath
 import cheng/core/backend/system_link_plan as slplan
 import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/target_matrix as tmat
-import cheng/core/lang/parser
+import cheng/core/lang/typed_expr as texpr
 
 type
     PrimaryObjectPlan =
@@ -15,6 +15,7 @@ type
         outputPath: str
         entryPath: str
         entrySymbol: str
+        entryFunctionSymbol: str
         itemIds: int32[]
         symbolNames: str[]
         functionWordOffsets: int32[]
@@ -26,21 +27,33 @@ type
         relocSourceItemIds: int32[]
         relocWordOffsets: int32[]
         relocTargetSymbols: str[]
+        reachableFunctionCount: int32
+        firstMissingFunction: str
+        firstMissingBodyKind: str
+        firstMissingTypedIrKind: str
+        firstMissingLineNumber: int32
         missingReasons: str[]
         pipelineStage: str
 
-    PrimarySourceCacheEntry =
-        sourcePath: str
-        lines: str[]
-        decls: parser.NormalizedFunctionDecl[]
-        ok: bool
+const
+    PrimaryEntryBridgeWordCount = 17
+    PrimaryLetCallNoargReturnI32ConstPrefix = "let_call_noarg_return_i32_const_"
+    PrimaryLetCallNoargReturnResultI32Kind = "let_call_noarg_return_result_i32"
+    PrimaryLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind = "let_call_noarg_i32_if_result_le_zero_return_zero_else_result_i32"
+    PrimaryLetCallNoargStrReturnLenI32Kind = "let_call_noarg_str_return_len_i32"
+    PrimaryLetCallNoargStrThenCallArg0ReturnI32Const0Kind = "let_call_noarg_str_then_call_arg0_return_i32_const_0"
+    PrimaryI32IfArg0LeZeroConst0Else7BodyKind = "if_arg0_le_zero_return_i32_const_0_else_i32_const_7"
 
 fn PrimaryTargetSymbolName(targetTriple: str,
                              raw: str): str =
     if targetTriple == "arm64-apple-darwin" ||
        targetTriple == "aarch64-apple-ios" ||
        targetTriple == "arm64-apple-ios":
-        return "_" + raw
+        if len(raw) > 0 && raw[0] == '_':
+            return raw
+        if len(raw) >= 2 && raw[0] == 'L' && raw[1] == '_':
+            return raw
+        return Fmt(["_", raw])
     return raw
 
 fn PrimarySanitizeSymbolPart(text: str): str =
@@ -51,9 +64,9 @@ fn PrimarySanitizeSymbolPart(text: str): str =
         let upper = ch >= 'A' && ch <= 'Z'
         let lower = ch >= 'a' && ch <= 'z'
         if digit || upper || lower || ch == '_':
-            out = out + strings.SliceBytes(text, i, 1)
+            out = Fmt([out, strings.SliceBytes(text, i, 1)])
         else:
-            out = out + "_"
+            out = Fmt([out, "_"])
     return out
 
 fn PrimarySymbolNameForFunction(targetTriple: str,
@@ -61,11 +74,16 @@ fn PrimarySymbolNameForFunction(targetTriple: str,
                                   signatureLineNumber: int32,
                                   emitKind: creq.CompilerEmit): str =
     var raw = symbolText
+    var lineScoped = false
     if len(raw) == 0:
         raw = "cheng_primary_unnamed"
+    if len(raw) >= 2:
+        for i in 0..<(len(raw) - 1):
+            if raw[i] == ':' && raw[i + 1] == ':':
+                lineScoped = true
     raw = PrimarySanitizeSymbolPart(raw)
-    if signatureLineNumber > 0:
-        raw = raw + "__L" + intToStr(signatureLineNumber)
+    if lineScoped && signatureLineNumber > 0:
+        raw = Fmt([raw, "__L", strings.IntToStr(signatureLineNumber)])
     return PrimaryTargetSymbolName(targetTriple, raw)
 
 fn PrimaryRuntimeEntryBridgeSymbol(linkPlan: slplan.SystemLinkPlanStub): str =
@@ -74,160 +92,165 @@ fn PrimaryRuntimeEntryBridgeSymbol(linkPlan: slplan.SystemLinkPlanStub): str =
         raw = "cheng_tooling_argv_entry"
     return PrimaryTargetSymbolName(linkPlan.targetTriple, raw)
 
-fn PrimarySplitLines(text: str): str[] =
-    var out: str[]
-    var start = 0
-    let n = len(text)
-    var i = 0
-    while i <= n:
-        var lineEnd = false
-        if i == n:
-            lineEnd = true
-        elif text[i] == '\n':
-            lineEnd = true
-        if !lineEnd:
-            i = i + 1
-            continue
-        add(out, strings.SliceBytes(text, start, i - start))
-        start = i + 1
-        i = i + 1
-    return out
+fn PrimaryStartsWith(text: str,
+                      prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
 
-fn PrimaryFindDeclLineIndex(decls: parser.NormalizedFunctionDecl[],
-                              functionName: str): int32 =
-    for i in 0..<decls.len:
-        if decls[i].name == functionName:
-            return decls[i].lineIndex
+fn PrimaryFunctionTailName(functionName: str): str =
     var tailStart = 0
-    var j = 0
-    while j + 1 < len(functionName):
-        if functionName[j] == ':' && functionName[j + 1] == ':':
-            tailStart = j + 2
-            j = j + 2
-            continue
-        j = j + 1
+    if len(functionName) >= 2:
+        for j in 0..<(len(functionName) - 1):
+            if functionName[j] == ':' && functionName[j + 1] == ':':
+                tailStart = j + 2
     if tailStart > 0 && tailStart < len(functionName):
-        let tailName = strings.SliceBytes(functionName, tailStart, len(functionName) - tailStart)
-        for i in 0..<decls.len:
-            if decls[i].name == tailName:
-                return decls[i].lineIndex
-    return 0
+        return strings.SliceBytes(functionName, tailStart, len(functionName) - tailStart)
+    return functionName
 
-fn PrimarySourceCacheIndex(entries: PrimarySourceCacheEntry[],
-                             sourcePath: str): int32 =
-    for i in 0..<entries.len:
-        if entries[i].sourcePath == sourcePath:
+fn PrimaryCallTargetTailName(targetText: str): str =
+    var tailStart = 0
+    for i in 0..<len(targetText):
+        if targetText[i] == '.':
+            tailStart = i + 1
+    if len(targetText) >= 2:
+        for j in 0..<(len(targetText) - 1):
+            if targetText[j] == ':' && targetText[j + 1] == ':':
+                tailStart = j + 2
+    if tailStart > 0 && tailStart < len(targetText):
+        return strings.SliceBytes(targetText, tailStart, len(targetText) - tailStart)
+    return targetText
+
+fn PrimaryObjectIrFunctionIndex(ir: lower.PrimaryObjectIr,
+                                  sourcePath: str,
+                                  functionName: str): int32 =
+    let tailName = PrimaryFunctionTailName(functionName)
+    for i in 0..<ir.functions.len:
+        if ir.functions[i].sourcePath != sourcePath:
+            continue
+        if ir.functions[i].functionName == functionName ||
+           ir.functions[i].functionName == tailName:
             return i
     return -1
 
-fn PrimarySourceCacheEnsure(entries: var PrimarySourceCacheEntry[],
-                              sourcePath: str): int32 =
-    let existing = PrimarySourceCacheIndex(entries, sourcePath)
-    if existing >= 0:
-        return existing
-    let sourceText = chengpath.ReadTextFile("", sourcePath)
-    var decls: parser.NormalizedFunctionDecl[]
-    var declErr = ""
-    var entry: PrimarySourceCacheEntry
-    entry.sourcePath = sourcePath
-    entry.lines = PrimarySplitLines(sourceText)
-    entry.ok = parser.ParserReadNormalizedFunctionDecls(sourceText, decls, declErr)
-    entry.decls = decls
-    add(entries, entry)
-    return entries.len - 1
-
-fn PrimaryBodyTextAfterEquals(lineRaw: str): str =
-    for i in 0..<len(lineRaw):
-        if lineRaw[i] != '=':
-            continue
-        return chengpath.PathTrim(strings.SliceBytes(lineRaw, i + 1, len(lineRaw) - i - 1))
-    return ""
-
-fn PrimaryFunctionBodyLine(lines: str[],
-                             declLineIndex: int32,
-                             bodyLineNumber: var int32): str =
-    bodyLineNumber = 0
-    if declLineIndex <= 0 || declLineIndex > lines.len:
-        return ""
-    let declLine = lines[declLineIndex - 1]
-    let inlineBody = PrimaryBodyTextAfterEquals(declLine)
-    if len(inlineBody) > 0:
-        bodyLineNumber = declLineIndex
-        return inlineBody
-    for i in declLineIndex..<lines.len:
-        let bodyRaw = lines[i]
-        let bodyTrim = chengpath.PathTrim(bodyRaw)
-        if len(bodyTrim) <= 0:
-            continue
-        if !parser.ParserHasLeadingIndent(bodyRaw):
-            break
-        bodyLineNumber = i + 1
-        return bodyTrim
-    return ""
-
-fn PrimaryFindResolvedCallIndex(lowering: lower.LoweringPlanStub,
-                                  sourcePath: str,
-                                  lineNumber: int32): int32 =
-    if lineNumber <= 0:
-        return -1
-    var insideTargetSource = false
-    for i in 0..<lowering.typedExprFacts.len:
-        let factSourcePath = lowering.typedExprFacts[i].sourcePath
-        if factSourcePath != sourcePath:
-            if insideTargetSource:
-                break
-            continue
-        insideTargetSource = true
-        let factLineNumber = lowering.typedExprFacts[i].lineNumber
-        if factLineNumber != lineNumber:
-            if factLineNumber > lineNumber:
-                break
-            continue
-        if !lowering.typedExprFacts[i].callResolved:
-            continue
-        if lowering.typedExprFacts[i].callTargetImportc:
-            continue
-        if len(lowering.typedExprFacts[i].callTarget) <= 0:
-            continue
-        return i
-    return -1
-
 fn PrimaryFunctionTargetSymbol(functionSymbolTexts: str[],
+                                 functionSourcePaths: str[],
                                  allSymbolNames: str[],
+                                 targetSourcePath: str,
                                  targetText: str): str =
     for i in 0..<functionSymbolTexts.len:
         if functionSymbolTexts[i] == targetText:
             return allSymbolNames[i]
+    let targetTail = PrimaryCallTargetTailName(targetText)
+    for i in 0..<functionSymbolTexts.len:
+        if i >= functionSourcePaths.len:
+            continue
+        if functionSourcePaths[i] != targetSourcePath:
+            continue
+        if i >= allSymbolNames.len:
+            continue
+        if PrimaryFunctionTailName(functionSymbolTexts[i]) == targetTail:
+            return allSymbolNames[i]
     return ""
 
-fn PrimaryFunctionBodyKind(bodyText: str,
-                            callArgCount: int32,
-                            targetSymbol: str): str =
-    let trimmed = chengpath.PathTrim(bodyText)
-    if trimmed == "return 0" || trimmed == "0":
-        return "return_zero_i32"
-    if len(targetSymbol) <= 0:
-        return "unsupported"
-    if callArgCount == 0:
-        return "return_call_noarg_i32"
-    if callArgCount == 1:
-        return "return_call_arg0_i32"
-    return "unsupported"
+fn PrimaryFunctionTargetIndex(functionSymbolTexts: str[],
+                               functionSourcePaths: str[],
+                               targetSourcePath: str,
+                               targetText: str): int32 =
+    for i in 0..<functionSymbolTexts.len:
+        if functionSymbolTexts[i] == targetText:
+            return i
+    let targetTail = PrimaryCallTargetTailName(targetText)
+    for i in 0..<functionSymbolTexts.len:
+        if i >= functionSourcePaths.len:
+            continue
+        if functionSourcePaths[i] != targetSourcePath:
+            continue
+        if PrimaryFunctionTailName(functionSymbolTexts[i]) == targetTail:
+            return i
+    return -1
+
+fn PrimaryBoolSeqInit(count: int32,
+                       value: bool): bool[] =
+    var out: bool[]
+    for _ in 0..<count:
+        add(out, value)
+    return out
+
+fn PrimaryIntSeqInit(count: int32,
+                      value: int32): int32[] =
+    var out: int32[]
+    for _ in 0..<count:
+        add(out, value)
+    return out
+
+fn PrimaryIsReturnCallBodyKind(bodyKind: str): bool =
+    return bodyKind == "return_call_noarg_i32" ||
+           bodyKind == "return_call_arg0_i32" ||
+           bodyKind == "return_call_arg0_arg1_i32" ||
+           bodyKind == "return_call_arg0_arg1_arg2_i32"
+
+fn PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind: str): bool =
+    return PrimaryStartsWith(bodyKind, PrimaryLetCallNoargReturnI32ConstPrefix)
+
+fn PrimaryIsLetCallNoargReturnResultI32BodyKind(bodyKind: str): bool =
+    return bodyKind == PrimaryLetCallNoargReturnResultI32Kind
+
+fn PrimaryIsLetCallNoargStrReturnLenI32BodyKind(bodyKind: str): bool =
+    return bodyKind == PrimaryLetCallNoargStrReturnLenI32Kind
+
+fn PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind: str): bool =
+    return bodyKind == PrimaryLetCallNoargStrThenCallArg0ReturnI32Const0Kind
+
+fn PrimaryIsCallRelocBodyKind(bodyKind: str): bool =
+    return PrimaryIsReturnCallBodyKind(bodyKind) ||
+           PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind) ||
+           PrimaryIsLetCallNoargReturnResultI32BodyKind(bodyKind) ||
+           bodyKind == PrimaryLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind ||
+           PrimaryIsLetCallNoargStrReturnLenI32BodyKind(bodyKind) ||
+           PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind)
 
 fn PrimaryFunctionWordCountForBodyKind(bodyKind: str): int32 =
     if bodyKind == "return_zero_i32":
         return 2
-    if bodyKind == "return_call_noarg_i32":
-        return 1
-    if bodyKind == "return_call_arg0_i32":
+    if PrimaryStartsWith(bodyKind, "return_i32_const_"):
         return 2
+    if PrimaryIsReturnCallBodyKind(bodyKind):
+        return 1
+    if PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+        return 6
+    if PrimaryIsLetCallNoargReturnResultI32BodyKind(bodyKind):
+        return 5
+    if bodyKind == PrimaryLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind:
+        return 10
+    if PrimaryIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
+        return 12
+    if PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+        return 9
+    if bodyKind == "return_str_empty":
+        return 4
+    if bodyKind == PrimaryI32IfArg0LeZeroConst0Else7BodyKind:
+        return 6
+    if bodyKind == "return_f64_mul_args":
+        return 2
+    if bodyKind == "return_i32_add_args":
+        return 2
+    if bodyKind == "return_i32_sub_args":
+        return 2
+    if bodyKind == "return_i32_mul_args":
+        return 2
+    if bodyKind == "return_i32_asr_args":
+        return 2
+    if bodyKind == "return_i32_madd_args":
+        return 2
+    if bodyKind == "str_len_fast_i32":
+        return 7
+    if bodyKind == "main_f64_mul_check_exit":
+        return 22
     return 0
-
-fn PrimaryFunctionWordCount(bodyText: str,
-                              callArgCount: int32,
-                              targetSymbol: str): int32 =
-    let bodyKind = PrimaryFunctionBodyKind(bodyText, callArgCount, targetSymbol)
-    return PrimaryFunctionWordCountForBodyKind(bodyKind)
 
 fn PrimaryObjectMissingReasons(linkPlan: slplan.SystemLinkPlanStub,
                                  lowering: lower.LoweringPlanStub,
@@ -249,91 +272,292 @@ fn PrimaryObjectMissingReasons(linkPlan: slplan.SystemLinkPlanStub,
         add(missing, "primary_object_entry_symbol_missing")
     return missing
 
+fn PrimaryObjectMissingLineNumber(lowering: lower.LoweringPlanStub,
+                                   irIndex: int32): int32 =
+    if irIndex < 0 || irIndex >= lowering.primaryObjectIr.functions.len:
+        return 0
+    return lowering.primaryObjectIr.functions[irIndex].bodyLineNumber
+
+fn PrimaryTypedIrFunctionIndex(ir: texpr.TypedExprIr,
+                                sourcePath: str,
+                                functionName: str): int32 =
+    let tailName = PrimaryFunctionTailName(functionName)
+    for i in 0..<ir.functions.len:
+        if ir.functions[i].sourcePath != sourcePath:
+            continue
+        if ir.functions[i].functionName == functionName ||
+           ir.functions[i].functionName == tailName:
+            return i
+    return -1
+
+fn PrimaryObjectMissingTypedIrKind(lowering: lower.LoweringPlanStub,
+                                    irIndex: int32): str =
+    if irIndex < 0 || irIndex >= lowering.primaryObjectIr.functions.len:
+        return ""
+    let irFunction = lowering.primaryObjectIr.functions[irIndex]
+    if irFunction.bodyKind != "unsupported":
+        return ""
+    let typedIndex = PrimaryTypedIrFunctionIndex(lowering.typedIr,
+                                                irFunction.sourcePath,
+                                                irFunction.functionName)
+    if typedIndex < 0 || typedIndex >= lowering.typedIr.functions.len:
+        return ""
+    let typedFunction = lowering.typedIr.functions[typedIndex]
+    var nodeEnd = typedFunction.nodeStart + typedFunction.nodeCount
+    if nodeEnd > lowering.typedIr.nodes.len:
+        nodeEnd = lowering.typedIr.nodes.len
+    for nodeIndex in typedFunction.nodeStart..<nodeEnd:
+        if lowering.typedIr.nodes[nodeIndex].opKind == texpr.TypedExprIrOpLetCall:
+            return "stmt_let_call"
+    return ""
+
 fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                             lowering: lower.LoweringPlanStub): Result[PrimaryObjectPlan] =
-    var sourceCache: PrimarySourceCacheEntry[]
     var allSymbolNames: str[]
-    var declLineIndices: int32[]
-    var bodyTexts: str[]
-    var bodyLineNumbers: int32[]
     var itemIds: int32[]
     var symbolNames: str[]
     var functionWordOffsets: int32[]
     var functionWordCounts: int32[]
     var functionBodyKinds: str[]
+    var relocSourceItemIds: int32[]
+    var relocWordOffsets: int32[]
+    var relocTargetSymbols: str[]
     var plan: PrimaryObjectPlan
     var totalWordCount: int32
+    var entryFunctionSymbol = ""
     var bodySemanticsMissing = false
+    var firstMissingFunction = ""
+    var firstMissingBodyKind = ""
+    var firstMissingTypedIrKind = ""
+    var firstMissingLineNumber: int32
+    var irIndexes: int32[]
+    var wordCounts: int32[]
+    var reachable: bool[]
+    var frontier: int32[]
     allSymbolNames = []
-    declLineIndices = []
-    bodyTexts = []
-    bodyLineNumbers = []
     itemIds = []
     symbolNames = []
     functionWordOffsets = []
     functionWordCounts = []
     functionBodyKinds = []
+    relocSourceItemIds = []
+    relocWordOffsets = []
+    relocTargetSymbols = []
+    irIndexes = PrimaryIntSeqInit(lowering.functionNames.len, -1)
+    wordCounts = PrimaryIntSeqInit(lowering.functionNames.len, 0)
+    reachable = PrimaryBoolSeqInit(lowering.functionNames.len, false)
+    let emitObjectRootsAllFunctions = linkPlan.emitKind == creq.EmitObj
     for i in 0..<lowering.functionNames.len:
         let sourcePath = lowering.functionSourcePaths[i]
-        let cacheIndex = PrimarySourceCacheEnsure(sourceCache, sourcePath)
-        let sourceEntry = sourceCache[cacheIndex]
-        var declLineIndex: int32
-        var bodyLineNumber: int32
-        var bodyText = ""
-        if !sourceEntry.ok:
-            bodySemanticsMissing = true
-        else:
-            declLineIndex = PrimaryFindDeclLineIndex(sourceEntry.decls, lowering.functionNames[i])
-            bodyText = PrimaryFunctionBodyLine(sourceEntry.lines, declLineIndex, bodyLineNumber)
-            if declLineIndex <= 0 || len(bodyText) <= 0:
-                bodySemanticsMissing = true
-        add(declLineIndices, declLineIndex)
-        add(bodyTexts, bodyText)
-        add(bodyLineNumbers, bodyLineNumber)
+        let irIndex = PrimaryObjectIrFunctionIndex(lowering.primaryObjectIr,
+                                                   sourcePath,
+                                                   lowering.functionNames[i])
+        var signatureLineNumber: int32
+        if irIndex >= 0:
+            signatureLineNumber = lowering.primaryObjectIr.functions[irIndex].signatureLineNumber
+            irIndexes[i] = irIndex
+            wordCounts[i] = PrimaryFunctionWordCountForBodyKind(lowering.primaryObjectIr.functions[irIndex].bodyKind)
         add(allSymbolNames,
             PrimarySymbolNameForFunction(linkPlan.targetTriple,
                                            lowering.functionSymbolTexts[i],
-                                           declLineIndex,
+                                           signatureLineNumber,
                                            linkPlan.emitKind))
+        if i < lowering.functionEntryFlags.len && lowering.functionEntryFlags[i] != 0:
+            entryFunctionSymbol = allSymbolNames[allSymbolNames.len - 1]
+        if emitObjectRootsAllFunctions ||
+           (i < lowering.functionEntryFlags.len && lowering.functionEntryFlags[i] != 0):
+            reachable[i] = true
+            add(frontier, i)
+    for _ in 0..<lowering.functionNames.len:
+        var nextFrontier: int32[]
+        for frontierIndex in 0..<frontier.len:
+            let currentIndex = frontier[frontierIndex]
+            if currentIndex < 0 || currentIndex >= lowering.functionNames.len:
+                continue
+            let irIndex = irIndexes[currentIndex]
+            if irIndex < 0:
+                bodySemanticsMissing = true
+                if len(firstMissingFunction) <= 0:
+                    firstMissingFunction = lowering.functionNames[currentIndex]
+                    firstMissingBodyKind = "missing_primary_object_ir"
+                    firstMissingTypedIrKind = ""
+                    firstMissingLineNumber = 0
+                continue
+            if wordCounts[currentIndex] <= 0:
+                bodySemanticsMissing = true
+                if len(firstMissingFunction) <= 0:
+                    firstMissingFunction = lowering.functionNames[currentIndex]
+                    firstMissingBodyKind = lowering.primaryObjectIr.functions[irIndex].bodyKind
+                    firstMissingTypedIrKind = PrimaryObjectMissingTypedIrKind(lowering, irIndex)
+                    firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                continue
+            let irFunction = lowering.primaryObjectIr.functions[irIndex]
+            if irFunction.signatureLineNumber <= 0:
+                bodySemanticsMissing = true
+                if len(firstMissingFunction) <= 0:
+                    firstMissingFunction = lowering.functionNames[currentIndex]
+                    firstMissingBodyKind = irFunction.bodyKind
+                    firstMissingTypedIrKind = PrimaryObjectMissingTypedIrKind(lowering, irIndex)
+                    firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                continue
+            let bodyKind = irFunction.bodyKind
+            if PrimaryIsCallRelocBodyKind(bodyKind):
+                if !irFunction.callTargetImportc:
+                    let targetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
+                                                                  lowering.functionSourcePaths,
+                                                                  irFunction.callTargetSourcePath,
+                                                                  irFunction.callTarget)
+                    if targetIndex < 0 || targetIndex >= reachable.len:
+                        bodySemanticsMissing = true
+                        if len(firstMissingFunction) <= 0:
+                            firstMissingFunction = lowering.functionNames[currentIndex]
+                            firstMissingBodyKind = "missing_call_target"
+                            firstMissingTypedIrKind = ""
+                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                        continue
+                    if !reachable[targetIndex]:
+                        reachable[targetIndex] = true
+                        add(nextFrontier, targetIndex)
+                if PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind) &&
+                   !irFunction.secondCallTargetImportc:
+                    let secondTargetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
+                                                                       lowering.functionSourcePaths,
+                                                                       irFunction.secondCallTargetSourcePath,
+                                                                       irFunction.secondCallTarget)
+                    if secondTargetIndex < 0 || secondTargetIndex >= reachable.len:
+                        bodySemanticsMissing = true
+                        if len(firstMissingFunction) <= 0:
+                            firstMissingFunction = lowering.functionNames[currentIndex]
+                            firstMissingBodyKind = "missing_second_call_target"
+                            firstMissingTypedIrKind = ""
+                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                        continue
+                    if !reachable[secondTargetIndex]:
+                        reachable[secondTargetIndex] = true
+                        add(nextFrontier, secondTargetIndex)
+        frontier = nextFrontier
+    if linkPlan.emitKind == creq.EmitExe:
+        for i in 0..<lowering.functionNames.len:
+            if i >= reachable.len || reachable[i]:
+                continue
+            let irIndex = irIndexes[i]
+            if irIndex < 0 || wordCounts[i] <= 0:
+                continue
+            let bodyKind = lowering.primaryObjectIr.functions[irIndex].bodyKind
+            if PrimaryIsCallRelocBodyKind(bodyKind):
+                continue
+            reachable[i] = true
     for i in 0..<lowering.functionNames.len:
-        let bodyText = bodyTexts[i]
-        let bodyLineNumber = bodyLineNumbers[i]
-        let sourcePath = lowering.functionSourcePaths[i]
-        let callIndex = PrimaryFindResolvedCallIndex(lowering, sourcePath, bodyLineNumber)
+        if i >= reachable.len || !reachable[i]:
+            continue
         var targetSymbol = ""
-        var callArgCount = -1
-        if callIndex >= 0:
-            let fact = lowering.typedExprFacts[callIndex]
-            callArgCount = fact.callArgCount
-            targetSymbol = PrimaryFunctionTargetSymbol(lowering.functionSymbolTexts,
-                                                         allSymbolNames,
-                                                         fact.callTarget)
-        let bodyKind = PrimaryFunctionBodyKind(bodyText, callArgCount, targetSymbol)
-        let wordCount = PrimaryFunctionWordCountForBodyKind(bodyKind)
+        var secondTargetSymbol = ""
+        var thirdTargetSymbol = ""
+        var fourthTargetSymbol = ""
+        let irIndex = irIndexes[i]
+        if irIndex < 0:
+            bodySemanticsMissing = true
+            if len(firstMissingFunction) <= 0:
+                firstMissingFunction = lowering.functionNames[i]
+                firstMissingBodyKind = "missing_primary_object_ir"
+                firstMissingTypedIrKind = ""
+                firstMissingLineNumber = 0
+            continue
+        let irFunction = lowering.primaryObjectIr.functions[irIndex]
+        let bodyKind = irFunction.bodyKind
+        if PrimaryIsCallRelocBodyKind(bodyKind):
+            if irFunction.callTargetImportc:
+                targetSymbol = PrimaryTargetSymbolName(linkPlan.targetTriple,
+                                                       irFunction.callImportcSymbol)
+            else:
+                let targetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
+                                                              lowering.functionSourcePaths,
+                                                              irFunction.callTargetSourcePath,
+                                                              irFunction.callTarget)
+                if targetIndex >= 0 && targetIndex < allSymbolNames.len && targetIndex < reachable.len && reachable[targetIndex]:
+                    targetSymbol = allSymbolNames[targetIndex]
+                else:
+                    bodySemanticsMissing = true
+                    if len(firstMissingFunction) <= 0:
+                        firstMissingFunction = lowering.functionNames[i]
+                        firstMissingBodyKind = "missing_call_target"
+                        firstMissingTypedIrKind = ""
+                        firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                    continue
+            if PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+                if irFunction.secondCallTargetImportc:
+                    secondTargetSymbol = PrimaryTargetSymbolName(linkPlan.targetTriple,
+                                                                 irFunction.secondCallImportcSymbol)
+                else:
+                    let secondTargetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
+                                                                       lowering.functionSourcePaths,
+                                                                       irFunction.secondCallTargetSourcePath,
+                                                                       irFunction.secondCallTarget)
+                    if secondTargetIndex >= 0 &&
+                       secondTargetIndex < allSymbolNames.len &&
+                       secondTargetIndex < reachable.len &&
+                       reachable[secondTargetIndex]:
+                        secondTargetSymbol = allSymbolNames[secondTargetIndex]
+                    else:
+                        bodySemanticsMissing = true
+                        if len(firstMissingFunction) <= 0:
+                            firstMissingFunction = lowering.functionNames[i]
+                            firstMissingBodyKind = "missing_second_call_target"
+                            firstMissingTypedIrKind = ""
+                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                        continue
+        let wordCount = wordCounts[i]
         if wordCount <= 0:
             bodySemanticsMissing = true
+            if len(firstMissingFunction) <= 0:
+                firstMissingFunction = lowering.functionNames[i]
+                firstMissingBodyKind = bodyKind
+                firstMissingTypedIrKind = PrimaryObjectMissingTypedIrKind(lowering, irIndex)
+                firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
             continue
-        add(itemIds, int32(100000 + i))
+        let itemId = int32(100000 + i)
+        let wordOffset = totalWordCount
+        add(itemIds, itemId)
         add(symbolNames, allSymbolNames[i])
-        add(functionWordOffsets, totalWordCount)
+        add(functionWordOffsets, wordOffset)
         add(functionWordCounts, wordCount)
         add(functionBodyKinds, bodyKind)
+        if PrimaryIsCallRelocBodyKind(bodyKind):
+            var relocWordOffset = wordOffset
+            if PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind) ||
+               PrimaryIsLetCallNoargReturnResultI32BodyKind(bodyKind) ||
+               bodyKind == PrimaryLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind:
+                relocWordOffset = wordOffset + 2
+            elif PrimaryIsLetCallNoargStrReturnLenI32BodyKind(bodyKind) ||
+                 PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+                relocWordOffset = wordOffset + 3
+            add(relocSourceItemIds, itemId)
+            add(relocWordOffsets, relocWordOffset)
+            add(relocTargetSymbols, targetSymbol)
+            if PrimaryIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+                add(relocSourceItemIds, itemId)
+                add(relocWordOffsets, wordOffset + 5)
+                add(relocTargetSymbols, secondTargetSymbol)
         totalWordCount = totalWordCount + wordCount
-    if linkPlan.emitKind == creq.EmitExe && len(linkPlan.entrySymbol) > 0 && itemIds.len > 0:
+    if linkPlan.emitKind == creq.EmitExe &&
+       len(linkPlan.entrySymbol) > 0 &&
+       len(entryFunctionSymbol) > 0 &&
+       itemIds.len > 0:
         add(itemIds, int32(900000 + itemIds.len))
         add(symbolNames, PrimaryRuntimeEntryBridgeSymbol(linkPlan))
         add(functionWordOffsets, totalWordCount)
-        add(functionWordCounts, 1)
+        add(functionWordCounts, PrimaryEntryBridgeWordCount)
         add(functionBodyKinds, "entry_bridge")
-        totalWordCount = totalWordCount + 1
+        totalWordCount = totalWordCount + PrimaryEntryBridgeWordCount
     plan.targetTriple = linkPlan.targetTriple
     plan.objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
     if linkPlan.emitKind == creq.EmitObj:
         plan.outputPath = linkPlan.outputPath
     else:
-        plan.outputPath = linkPlan.outputPath + ".primary.o"
+        plan.outputPath = Fmt([linkPlan.outputPath, ".primary.o"])
     plan.entryPath = linkPlan.entryPath
     plan.entrySymbol = linkPlan.entrySymbol
+    plan.entryFunctionSymbol = entryFunctionSymbol
     plan.itemIds = itemIds
     plan.symbolNames = symbolNames
     plan.functionWordOffsets = functionWordOffsets
@@ -344,9 +568,17 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
         add(plan.instructionWords, 0)
     plan.dataLabels = []
     plan.dataPayloadTexts = []
-    plan.relocSourceItemIds = []
-    plan.relocWordOffsets = []
-    plan.relocTargetSymbols = []
+    plan.relocSourceItemIds = relocSourceItemIds
+    plan.relocWordOffsets = relocWordOffsets
+    plan.relocTargetSymbols = relocTargetSymbols
+    plan.reachableFunctionCount = 0
+    for i in 0..<reachable.len:
+        if reachable[i]:
+            plan.reachableFunctionCount = plan.reachableFunctionCount + 1
+    plan.firstMissingFunction = firstMissingFunction
+    plan.firstMissingBodyKind = firstMissingBodyKind
+    plan.firstMissingTypedIrKind = firstMissingTypedIrKind
+    plan.firstMissingLineNumber = firstMissingLineNumber
     plan.missingReasons = PrimaryObjectMissingReasons(linkPlan,
                                                         lowering,
                                                         itemIds,
@@ -355,17 +587,54 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     plan.pipelineStage = "lowering_plan_to_primary_object_plan"
     return Ok[PrimaryObjectPlan](plan)
 
+fn PrimaryObjectPlanIntListText(items: int32[]): str =
+    if items.len <= 0:
+        return "-"
+    var out = ""
+    for i in 0..<items.len:
+        if i > 0:
+            out = Fmt([out, ","])
+        out = Fmt([out, strings.IntToStr(items[i])])
+    return out
+
 fn PrimaryObjectPlanReport(plan: PrimaryObjectPlan): str =
     var symbolText = "-"
     if plan.symbolNames.len > 0:
         symbolText = strutil.Join(plan.symbolNames, ",")
+    var bodyKindText = "-"
+    if plan.functionBodyKinds.len > 0:
+        bodyKindText = strutil.Join(plan.functionBodyKinds, ",")
+    var wordOffsetText = "-"
+    if plan.functionWordOffsets.len > 0:
+        wordOffsetText = PrimaryObjectPlanIntListText(plan.functionWordOffsets)
+    var wordCountText = "-"
+    if plan.functionWordCounts.len > 0:
+        wordCountText = PrimaryObjectPlanIntListText(plan.functionWordCounts)
+    var firstMissingFunction = "-"
+    if len(plan.firstMissingFunction) > 0:
+        firstMissingFunction = plan.firstMissingFunction
+    var firstMissingBodyKind = "-"
+    if len(plan.firstMissingBodyKind) > 0:
+        firstMissingBodyKind = plan.firstMissingBodyKind
+    var firstMissingTypedIrKind = "-"
+    if len(plan.firstMissingTypedIrKind) > 0:
+        firstMissingTypedIrKind = plan.firstMissingTypedIrKind
     var out = ""
-    out = out + "primary_object_format=" + plan.objectFormat + "\n"
-    out = out + "primary_object_item_count=" + intToStr(plan.itemIds.len) + "\n"
-    out = out + "primary_object_symbols=" + symbolText + "\n"
-    out = out + "primary_object_instruction_word_count=" + intToStr(plan.instructionWords.len) + "\n"
-    out = out + "primary_object_data_label_count=" + intToStr(plan.dataLabels.len) + "\n"
-    out = out + "primary_object_reloc_count=" + intToStr(plan.relocSourceItemIds.len) + "\n"
-    out = out + "primary_object_missing_reasons=" + slplan.SystemLinkPlanListText(plan.missingReasons) + "\n"
-    out = out + "primary_object_pipeline_stage=" + plan.pipelineStage
+    out = Fmt([out, "primary_object_format=", plan.objectFormat, "\n"])
+    out = Fmt([out, "primary_object_item_count=", strings.IntToStr(plan.itemIds.len), "\n"])
+    out = Fmt([out, "primary_object_reachable_function_count=", strings.IntToStr(plan.reachableFunctionCount), "\n"])
+    out = Fmt([out, "primary_object_symbols=", symbolText, "\n"])
+    out = Fmt([out, "primary_object_body_kinds=", bodyKindText, "\n"])
+    out = Fmt([out, "primary_object_word_offsets=", wordOffsetText, "\n"])
+    out = Fmt([out, "primary_object_word_counts=", wordCountText, "\n"])
+    out = Fmt([out, "primary_object_instruction_word_count=", strings.IntToStr(plan.instructionWords.len), "\n"])
+    out = Fmt([out, "primary_object_data_label_count=", strings.IntToStr(plan.dataLabels.len), "\n"])
+    out = Fmt([out, "primary_object_reloc_count=", strings.IntToStr(plan.relocSourceItemIds.len), "\n"])
+    out = Fmt([out, "primary_object_entry_function_symbol=", plan.entryFunctionSymbol, "\n"])
+    out = Fmt([out, "primary_object_first_missing_function=", firstMissingFunction, "\n"])
+    out = Fmt([out, "primary_object_first_missing_body_kind=", firstMissingBodyKind, "\n"])
+    out = Fmt([out, "primary_object_first_missing_typed_ir_kind=", firstMissingTypedIrKind, "\n"])
+    out = Fmt([out, "primary_object_first_missing_line_number=", strings.IntToStr(plan.firstMissingLineNumber), "\n"])
+    out = Fmt([out, "primary_object_missing_reasons=", slplan.SystemLinkPlanListText(plan.missingReasons), "\n"])
+    out = Fmt([out, "primary_object_pipeline_stage=", plan.pipelineStage])
     return out

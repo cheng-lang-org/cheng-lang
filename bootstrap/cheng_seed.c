@@ -61,7 +61,7 @@ extern char **environ;
 #define CHENG_EMBEDDED_CONTRACT_TEXT ""
 #endif
 
-#define CHENG_MAX_FIELDS 40
+#define CHENG_MAX_FIELDS 64
 #define CHENG_MAX_CALL_ARGS 32
 #define CHENG_CALL_ARG_REGS 8
 #define CHENG_CALL_ARG_SPILL_STRIDE ((CHENG_MAX_CALL_ARGS + 4) * 8)
@@ -118,10 +118,6 @@ static bool cheng_seed_expand_strformat_fmt_expr(const char *expr_text,
                                          size_t error_cap);
 static char *cheng_seed_debug_object_report(const char *path);
 static bool cheng_seed_backend_driver_handoff_enabled(void);
-static int cheng_seed_cmd_verify_backend_driver_command_surface_impl(int argc, char **argv);
-static int cheng_seed_cmd_verify_mobile_shell_build_probe_impl(int argc, char **argv);
-static int cheng_seed_cmd_verify_r2c_react_surface_impl(int argc, char **argv);
-static const char *cheng_seed_host_target_triple(void);
 static bool cheng_seed_path_exists_nonempty(const char *path);
 static bool cheng_seed_package_manifest_exists(const char *dir);
 static void cheng_seed_find_shared_cheng_root(const char *package_root, char *out, size_t cap);
@@ -172,6 +168,11 @@ static const char *ChengSeed_REMOVED_KEYS_V2[] = {
     "backend_lowering_plan_source",
     "backend_primary_object_plan_source",
     "backend_primary_object_emit_source",
+    "backend_direct_object_emit_source",
+    "backend_object_buffer_source",
+    "backend_object_symbols_source",
+    "backend_object_relocs_source",
+    "backend_macho_object_writer_source",
     "backend_object_plan_source",
     "backend_native_link_plan_source",
     "backend_native_link_exec_source",
@@ -201,13 +202,12 @@ static const char *ChengSeed_SUPPORTED_COMMANDS_V2[] = {
     "self-check",
     "compile-bootstrap",
     "bootstrap-bridge",
-    "status"
+    "build-backend-driver"
 };
 
 static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "compiler_entry_source",
     "compiler_runtime_source",
-    "compiler_support_matrix_source",
     "compiler_request_source",
     "tooling_gate_source",
     "lang_parser_source",
@@ -215,6 +215,11 @@ static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "backend_lowering_plan_source",
     "backend_primary_object_plan_source",
     "backend_primary_object_emit_source",
+    "backend_direct_object_emit_source",
+    "backend_object_buffer_source",
+    "backend_object_symbols_source",
+    "backend_object_relocs_source",
+    "backend_macho_object_writer_source",
     "backend_object_plan_source",
     "backend_native_link_plan_source",
     "backend_native_link_exec_source",
@@ -225,13 +230,8 @@ static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "runtime_compiler_runtime_source",
     "runtime_debug_runtime_source",
     "tooling_bootstrap_contract_source",
-    "tooling_hotpath_scan_source",
     "tooling_debug_tools_gate_source",
     "tooling_export_visibility_gate_source",
-    "tooling_host_bridge_audit_gate_source",
-    "tooling_seed_cross_target_gate_source",
-    "tooling_wasm_binary_audit_source",
-    "tooling_wasm_smoke_gate_source",
     "backend_build_plan_source"
 };
 
@@ -246,7 +246,7 @@ static void cheng_seed_usage(void) {
     puts("  cheng_seed print-contract [--in:<path>]");
     puts("  cheng_seed self-check [--in:<path>]");
     puts("  cheng_seed bootstrap-bridge");
-    puts("  cheng_seed build-backend-driver");
+    puts("  cheng_seed build-backend-driver [--require-rebuild]");
     puts("  cheng_seed compile-bootstrap --in:<path> --out:<path> [--report-out:<path>]");
 }
 
@@ -474,19 +474,6 @@ static void cheng_seed_cid_fill_hex(ChengSeedCid32 *cid) {
     cid->hex[CHENG_CID_HEX_LEN] = '\0';
 }
 
-static int cheng_seed_hex_value(char ch) {
-    if (ch >= '0' && ch <= '9') {
-        return (int)(ch - '0');
-    }
-    if (ch >= 'a' && ch <= 'f') {
-        return (int)(10 + (ch - 'a'));
-    }
-    if (ch >= 'A' && ch <= 'F') {
-        return (int)(10 + (ch - 'A'));
-    }
-    return -1;
-}
-
 static ChengSeedCid32 cheng_seed_cid_zero(void) {
     ChengSeedCid32 out;
     memset(&out, 0, sizeof(out));
@@ -560,28 +547,6 @@ static void cheng_seed_bytebuf_append_cid(ChengSeedByteBuf *buf, ChengSeedCid32 
 
 static ChengSeedCid32 cheng_seed_cid_from_bytebuf(const ChengSeedByteBuf *buf) {
     return cheng_seed_cid_from_bytes(buf->data, buf->len);
-}
-
-static bool cheng_seed_cid_equal(ChengSeedCid32 left, ChengSeedCid32 right) {
-    return memcmp(left.bytes, right.bytes, sizeof(left.bytes)) == 0;
-}
-
-static bool cheng_seed_cid_from_hex_text(const char *text, ChengSeedCid32 *out) {
-    size_t i;
-    if (!text || strlen(text) != CHENG_CID_HEX_LEN) {
-        return false;
-    }
-    memset(out, 0, sizeof(*out));
-    for (i = 0U; i < 32U; ++i) {
-        int high = cheng_seed_hex_value(text[i * 2U]);
-        int low = cheng_seed_hex_value(text[i * 2U + 1U]);
-        if (high < 0 || low < 0) {
-            return false;
-        }
-        out->bytes[i] = (uint8_t)((high << 4) | low);
-    }
-    cheng_seed_cid_fill_hex(out);
-    return true;
 }
 
 static void cheng_seed_bytebuf_free(ChengSeedByteBuf *buf) {
@@ -1465,6 +1430,11 @@ typedef struct {
     char backend_lowering_plan_source[PATH_MAX];
     char backend_primary_object_plan_source[PATH_MAX];
     char backend_primary_object_emit_source[PATH_MAX];
+    char backend_direct_object_emit_source[PATH_MAX];
+    char backend_object_buffer_source[PATH_MAX];
+    char backend_object_symbols_source[PATH_MAX];
+    char backend_object_relocs_source[PATH_MAX];
+    char backend_macho_object_writer_source[PATH_MAX];
     char backend_object_plan_source[PATH_MAX];
     char backend_native_link_plan_source[PATH_MAX];
     char backend_native_link_exec_source[PATH_MAX];
@@ -1486,12 +1456,8 @@ typedef struct {
     char tooling_path_source[PATH_MAX];
     char tooling_world_receipt_gate_source[PATH_MAX];
     char tooling_debug_tools_gate_source[PATH_MAX];
-    char tooling_hotpath_scan_source[PATH_MAX];
     char tooling_export_visibility_gate_source[PATH_MAX];
-    char tooling_host_bridge_audit_gate_source[PATH_MAX];
-    char tooling_seed_cross_target_gate_source[PATH_MAX];
-    char tooling_wasm_binary_audit_source[PATH_MAX];
-    char tooling_wasm_smoke_gate_source[PATH_MAX];
+    char tooling_object_debug_report_source[PATH_MAX];
     char std_os_host_process_source[PATH_MAX];
     char std_os_source[PATH_MAX];
     char backend_build_plan_source[PATH_MAX];
@@ -1522,10 +1488,6 @@ static void cheng_seed_contract_workspace_root(const ChengSeedBootstrapContract 
 static bool cheng_seed_path_is_executable(const char *path);
 
 static const char *cheng_seed_bootstrap_stage1_source_relpath(void) {
-    return "bootstrap/stage1_bootstrap.cheng";
-}
-
-static const char *cheng_seed_bootstrap_stage1_source_relpath_from_cheng_root(void) {
     return "bootstrap/stage1_bootstrap.cheng";
 }
 
@@ -1623,6 +1585,11 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->backend_lowering_plan_source, sizeof(paths->backend_lowering_plan_source), paths->root, "src/core/backend/lowering_plan.cheng");
     cheng_seed_join_path(paths->backend_primary_object_plan_source, sizeof(paths->backend_primary_object_plan_source), paths->root, "src/core/backend/primary_object_plan.cheng");
     cheng_seed_join_path(paths->backend_primary_object_emit_source, sizeof(paths->backend_primary_object_emit_source), paths->root, "src/core/backend/primary_object_emit.cheng");
+    cheng_seed_join_path(paths->backend_direct_object_emit_source, sizeof(paths->backend_direct_object_emit_source), paths->root, "src/core/backend/direct_object_emit.cheng");
+    cheng_seed_join_path(paths->backend_object_buffer_source, sizeof(paths->backend_object_buffer_source), paths->root, "src/core/backend/object_buffer.cheng");
+    cheng_seed_join_path(paths->backend_object_symbols_source, sizeof(paths->backend_object_symbols_source), paths->root, "src/core/backend/object_symbols.cheng");
+    cheng_seed_join_path(paths->backend_object_relocs_source, sizeof(paths->backend_object_relocs_source), paths->root, "src/core/backend/object_relocs.cheng");
+    cheng_seed_join_path(paths->backend_macho_object_writer_source, sizeof(paths->backend_macho_object_writer_source), paths->root, "src/core/backend/macho_object_writer.cheng");
     cheng_seed_join_path(paths->backend_object_plan_source, sizeof(paths->backend_object_plan_source), paths->root, "src/core/backend/object_plan.cheng");
     cheng_seed_join_path(paths->backend_native_link_plan_source, sizeof(paths->backend_native_link_plan_source), paths->root, "src/core/backend/native_link_plan.cheng");
     cheng_seed_join_path(paths->backend_native_link_exec_source, sizeof(paths->backend_native_link_exec_source), paths->root, "src/core/backend/native_link_exec.cheng");
@@ -1644,12 +1611,8 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->tooling_path_source, sizeof(paths->tooling_path_source), paths->root, "src/core/tooling/path.cheng");
     cheng_seed_join_path(paths->tooling_world_receipt_gate_source, sizeof(paths->tooling_world_receipt_gate_source), paths->root, "src/core/tooling/world_receipt_gate.cheng");
     cheng_seed_join_path(paths->tooling_debug_tools_gate_source, sizeof(paths->tooling_debug_tools_gate_source), paths->root, "src/core/tooling/debug_tools_gate.cheng");
-    cheng_seed_join_path(paths->tooling_hotpath_scan_source, sizeof(paths->tooling_hotpath_scan_source), paths->root, "src/core/tooling/hotpath_scan.cheng");
     cheng_seed_join_path(paths->tooling_export_visibility_gate_source, sizeof(paths->tooling_export_visibility_gate_source), paths->root, "src/core/tooling/export_visibility_gate.cheng");
-    cheng_seed_join_path(paths->tooling_host_bridge_audit_gate_source, sizeof(paths->tooling_host_bridge_audit_gate_source), paths->root, "src/core/tooling/host_bridge_audit_gate.cheng");
-    cheng_seed_join_path(paths->tooling_seed_cross_target_gate_source, sizeof(paths->tooling_seed_cross_target_gate_source), paths->root, "src/core/tooling/seed_cross_target_gate.cheng");
-    cheng_seed_join_path(paths->tooling_wasm_binary_audit_source, sizeof(paths->tooling_wasm_binary_audit_source), paths->root, "src/core/tooling/wasm_binary_audit.cheng");
-    cheng_seed_join_path(paths->tooling_wasm_smoke_gate_source, sizeof(paths->tooling_wasm_smoke_gate_source), paths->root, "src/core/tooling/wasm_smoke_gate.cheng");
+    cheng_seed_join_path(paths->tooling_object_debug_report_source, sizeof(paths->tooling_object_debug_report_source), paths->root, "src/core/tooling/object_debug_report.cheng");
     cheng_seed_join_path(paths->std_os_host_process_source, sizeof(paths->std_os_host_process_source), paths->root, "src/std/os_host_process.cheng");
     cheng_seed_join_path(paths->std_os_source, sizeof(paths->std_os_source), paths->root, "src/std/os.cheng");
     cheng_seed_join_path(paths->backend_build_plan_source, sizeof(paths->backend_build_plan_source), paths->root, "src/core/backend/build_plan.cheng");
@@ -1846,7 +1809,7 @@ static bool cheng_seed_bootstrap_artifacts_fresh(const ChengSeedBootstrapPaths *
 }
 
 static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths) {
-    const char *inputs[45];
+    const char *inputs[46];
     char map_path[PATH_MAX];
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
@@ -1877,41 +1840,58 @@ static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths
     inputs[13] = paths->backend_lowering_plan_source;
     inputs[14] = paths->backend_primary_object_plan_source;
     inputs[15] = paths->backend_primary_object_emit_source;
-    inputs[16] = paths->backend_object_plan_source;
-    inputs[17] = paths->backend_native_link_plan_source;
-    inputs[18] = paths->backend_native_link_exec_source;
-    inputs[19] = paths->backend_system_link_exec_source;
-    inputs[20] = paths->backend_system_link_exec_runtime_source;
-    inputs[21] = paths->backend_line_map_source;
-    inputs[22] = paths->runtime_core_runtime_source;
-    inputs[23] = paths->runtime_compiler_runtime_source;
-    inputs[24] = paths->runtime_debug_runtime_source;
-    inputs[25] = paths->tooling_bootstrap_contract_source;
-    inputs[26] = paths->backend_build_plan_source;
-    inputs[27] = paths->runtime_core_provider_source;
-    inputs[28] = paths->runtime_compiler_program_provider_source;
-    inputs[29] = paths->runtime_compiler_tooling_provider_source;
-    inputs[30] = paths->runtime_program_support_provider_source;
-    inputs[31] = paths->runtime_program_support_host_provider_source;
-    inputs[32] = paths->runtime_debug_provider_source;
-    inputs[33] = paths->tooling_host_ops_source;
-    inputs[34] = paths->tooling_path_source;
-    inputs[35] = paths->tooling_world_receipt_gate_source;
-    inputs[36] = paths->tooling_debug_tools_gate_source;
-    inputs[37] = paths->tooling_hotpath_scan_source;
-    inputs[38] = paths->tooling_export_visibility_gate_source;
-    inputs[39] = paths->tooling_host_bridge_audit_gate_source;
-    inputs[40] = paths->tooling_seed_cross_target_gate_source;
-    inputs[41] = paths->tooling_wasm_binary_audit_source;
-    inputs[42] = paths->tooling_wasm_smoke_gate_source;
-    inputs[43] = paths->std_os_host_process_source;
-    inputs[44] = paths->std_os_source;
-    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 45U) &&
-           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 45U);
+    inputs[16] = paths->backend_direct_object_emit_source;
+    inputs[17] = paths->backend_object_buffer_source;
+    inputs[18] = paths->backend_object_symbols_source;
+    inputs[19] = paths->backend_object_relocs_source;
+    inputs[20] = paths->backend_macho_object_writer_source;
+    inputs[21] = paths->backend_object_plan_source;
+    inputs[22] = paths->backend_native_link_plan_source;
+    inputs[23] = paths->backend_native_link_exec_source;
+    inputs[24] = paths->backend_system_link_exec_source;
+    inputs[25] = paths->backend_system_link_exec_runtime_source;
+    inputs[26] = paths->backend_line_map_source;
+    inputs[27] = paths->runtime_core_runtime_source;
+    inputs[28] = paths->runtime_compiler_runtime_source;
+    inputs[29] = paths->runtime_debug_runtime_source;
+    inputs[30] = paths->tooling_bootstrap_contract_source;
+    inputs[31] = paths->backend_build_plan_source;
+    inputs[32] = paths->runtime_core_provider_source;
+    inputs[33] = paths->runtime_compiler_program_provider_source;
+    inputs[34] = paths->runtime_compiler_tooling_provider_source;
+    inputs[35] = paths->runtime_program_support_provider_source;
+    inputs[36] = paths->runtime_program_support_host_provider_source;
+    inputs[37] = paths->runtime_debug_provider_source;
+    inputs[38] = paths->tooling_host_ops_source;
+    inputs[39] = paths->tooling_path_source;
+    inputs[40] = paths->tooling_world_receipt_gate_source;
+    inputs[41] = paths->tooling_debug_tools_gate_source;
+    inputs[42] = paths->tooling_export_visibility_gate_source;
+    inputs[43] = paths->tooling_object_debug_report_source;
+    inputs[44] = paths->std_os_host_process_source;
+    inputs[45] = paths->std_os_source;
+    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 46U) &&
+           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 46U);
+}
+
+static bool cheng_seed_backend_driver_available_for_build(const ChengSeedBootstrapPaths *paths) {
+    char map_path[PATH_MAX];
+    if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
+        return false;
+    }
+    snprintf(map_path, sizeof(map_path), "%s.map", paths->backend_driver_out);
+    if (access(map_path, R_OK) != 0) {
+        return false;
+    }
+    if (!cheng_seed_bootstrap_artifacts_fresh(paths)) {
+        return false;
+    }
+    return cheng_seed_backend_driver_forbidden_identity_marker(paths->backend_driver_out) == NULL;
 }
 
 static int cheng_seed_cmd_bootstrap_bridge(int argc, char **argv);
 static int cheng_seed_cmd_build_backend_driver(int argc, char **argv);
+static int cheng_seed_cmd_system_link_exec(int argc, char **argv);
 
 static bool cheng_seed_ensure_backend_driver_ready(ChengSeedBootstrapPaths *paths,
                                            const char *context) {
@@ -2040,10 +2020,6 @@ static void cheng_seed_release_pid_lock(const char *lock_path, bool *held_io) {
 
 static bool cheng_seed_bootstrap_ready_check(const void *ctx) {
     return cheng_seed_bootstrap_artifacts_fresh((const ChengSeedBootstrapPaths *)ctx);
-}
-
-static bool cheng_seed_backend_driver_ready_check(const void *ctx) {
-    return cheng_seed_backend_driver_ready((const ChengSeedBootstrapPaths *)ctx);
 }
 
 static bool cheng_seed_file_text_equal(const char *left_path, const char *right_path) {
@@ -2728,23 +2704,140 @@ fail:
     return false;
 }
 
-static bool cheng_seed_run_command_logged_argv_quiet(size_t arg_count,
-                                             const char **args,
-                                             const char *log_path,
-                                             const char *label) {
-    pid_t pid;
+typedef int (*ChengSeedInternalCommandFn)(int argc, char **argv);
+
+static bool cheng_seed_run_internal_command_logged_argv_live(ChengSeedInternalCommandFn fn,
+                                                     size_t arg_count,
+                                                     const char **args,
+                                                     const char *log_path,
+                                                     const char *label) {
+    char **exec_argv = NULL;
+    int pipe_fds[2] = { -1, -1 };
+    int flags;
+    pid_t pid = -1;
     int status = 0;
-    if (arg_count == 0U || args == NULL) {
+    bool running = true;
+    bool pipe_open = true;
+    FILE *log = NULL;
+    char buffer[8192];
+    char progress_line[1024];
+    size_t progress_len = 0U;
+    size_t i;
+    if (fn == NULL || arg_count == 0U || args == NULL || log_path == NULL || log_path[0] == '\0') {
+        fprintf(stderr, "[cheng_seed] %s missing internal argv/log\n", label);
         return false;
     }
-    (void)label;
-    if (!cheng_seed_spawn_logged_argv(arg_count, args, log_path, true, true, false, &pid)) {
+    if (arg_count > (size_t)INT_MAX) {
+        fprintf(stderr, "[cheng_seed] %s internal argv too large\n", label);
         return false;
     }
-    if (!cheng_seed_waitpid_nointr(pid, &status)) {
+    if (!cheng_seed_ensure_parent_dir(log_path)) {
         return false;
     }
-    return status == 0;
+    log = fopen(log_path, "wb");
+    if (log == NULL) {
+        perror("fopen");
+        return false;
+    }
+    exec_argv = (char **)cheng_seed_xmalloc(sizeof(char *) * (arg_count + 1U));
+    for (i = 0U; i < arg_count; ++i) {
+        exec_argv[i] = (char *)args[i];
+    }
+    exec_argv[arg_count] = NULL;
+    if (pipe(pipe_fds) != 0) {
+        perror("pipe");
+        goto fail;
+    }
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        goto fail;
+    }
+    if (pid == 0) {
+        int rc;
+        close(pipe_fds[0]);
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0 ||
+            dup2(pipe_fds[1], STDERR_FILENO) < 0) {
+            _exit(127);
+        }
+        if (pipe_fds[1] != STDOUT_FILENO && pipe_fds[1] != STDERR_FILENO) {
+            close(pipe_fds[1]);
+        }
+        rc = fn((int)arg_count, exec_argv);
+        fflush(NULL);
+        if (rc < 0) {
+            rc = 1;
+        }
+        if (rc > 255) {
+            rc = 255;
+        }
+        _exit(rc);
+    }
+    close(pipe_fds[1]);
+    pipe_fds[1] = -1;
+    flags = fcntl(pipe_fds[0], F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(pipe_fds[0], F_SETFL, flags | O_NONBLOCK);
+    }
+    while (running || pipe_open) {
+        ssize_t n = read(pipe_fds[0], buffer, sizeof(buffer));
+        if (n > 0) {
+            fwrite(buffer, 1U, (size_t)n, log);
+            fflush(log);
+            cheng_seed_echo_progress_chunk(buffer,
+                                   (size_t)n,
+                                   progress_line,
+                                   sizeof(progress_line),
+                                   &progress_len);
+            continue;
+        }
+        if (n == 0) {
+            pipe_open = false;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            pipe_open = false;
+        }
+        if (running) {
+            pid_t wait_rc = waitpid(pid, &status, WNOHANG);
+            if (wait_rc == pid) {
+                running = false;
+            } else if (wait_rc < 0 && errno != EINTR) {
+                running = false;
+                status = 127 << 8;
+            }
+        }
+        if (running || pipe_open) {
+            usleep(20000U);
+        }
+    }
+    if (progress_len > 0U) {
+        cheng_seed_echo_progress_line(progress_line, progress_len);
+    }
+    fclose(log);
+    log = NULL;
+    if (pipe_fds[0] >= 0) {
+        close(pipe_fds[0]);
+    }
+    free(exec_argv);
+    if (!cheng_seed_status_is_exit_code(status, 0)) {
+        cheng_seed_report_child_status(label, status, log_path);
+        return false;
+    }
+    return true;
+fail:
+    if (pid > 0) {
+        kill(pid, SIGTERM);
+    }
+    if (pipe_fds[0] >= 0) {
+        close(pipe_fds[0]);
+    }
+    if (pipe_fds[1] >= 0) {
+        close(pipe_fds[1]);
+    }
+    if (log != NULL) {
+        fclose(log);
+    }
+    free(exec_argv);
+    return false;
 }
 
 static bool cheng_seed_run_command_logged_argv_with_input_file(size_t arg_count,
@@ -2896,6 +2989,18 @@ static const char *cheng_seed_flag_value(int argc, char **argv, const char *flag
         }
     }
     return NULL;
+}
+
+static bool cheng_seed_flag_present(int argc, char **argv, const char *flag) {
+    size_t flag_len = strlen(flag);
+    int i;
+    for (i = 2; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (strncmp(arg, flag, flag_len) == 0 && arg[flag_len] == '\0') {
+            return true;
+        }
+    }
+    return false;
 }
 
 #define CHENG_MAX_PLAN_PATHS 256
@@ -6328,9 +6433,6 @@ static bool cheng_seed_build_compiler_world_artifacts_with_overrides(const Cheng
                                                              const ChengSeedCompilerSourceOverride *overrides,
                                                              size_t override_count,
                                                              ChengSeedCompilerWorldArtifacts *out);
-static bool cheng_seed_write_world_bundle_text(const char *prefix,
-                                       const char *suffix,
-                                       const char *text);
 static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract *contract,
                                         const char *package_root,
                                         const char *source_path,
@@ -6338,10 +6440,6 @@ static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract
                                         const char *out_path,
                                         const ChengSeedPlanPath *suppressed_export_symbols,
                                         size_t suppressed_export_symbol_count);
-static bool cheng_seed_compiler_equivalence_inputs_ready(int argc,
-                                                 char **argv,
-                                                 bool required,
-                                                 bool *enabled_out);
 static void cheng_seed_primary_symbol_name(const ChengSeedSystemLinkPlanStub *plan,
                                    const ChengSeedLoweredFunctionStub *function,
                                    char *out,
@@ -7608,6 +7706,195 @@ static bool cheng_seed_scalar_type_is_unsigned(const char *type_text) {
            strcmp(canonical, "uint16") == 0 ||
            strcmp(canonical, "uint32") == 0 ||
            strcmp(canonical, "uint64") == 0;
+}
+
+static bool cheng_seed_scalar_type_is_float(const char *type_text) {
+    const char *canonical = cheng_seed_canonical_scalar_type_name(type_text);
+    return strcmp(canonical, "float") == 0 ||
+           strcmp(canonical, "float32") == 0 ||
+           strcmp(canonical, "float64") == 0;
+}
+
+static const char *cheng_seed_x64_float_compare_suffix(const char *op) {
+    if (strcmp(op, "==") == 0) return "e";
+    if (strcmp(op, "!=") == 0) return "ne";
+    if (strcmp(op, "<") == 0) return "b";
+    if (strcmp(op, "<=") == 0) return "be";
+    if (strcmp(op, ">") == 0) return "a";
+    if (strcmp(op, ">=") == 0) return "ae";
+    return NULL;
+}
+
+static const char *cheng_seed_float_compare_cond(const char *op) {
+    if (strcmp(op, "==") == 0) return "eq";
+    if (strcmp(op, "!=") == 0) return "ne";
+    if (strcmp(op, "<") == 0) return "lt";
+    if (strcmp(op, "<=") == 0) return "le";
+    if (strcmp(op, ">") == 0) return "gt";
+    if (strcmp(op, ">=") == 0) return "ge";
+    return NULL;
+}
+
+static bool cheng_seed_emit_float_binary_arithmetic(char *out,
+                                            size_t cap,
+                                            const char *op,
+                                            bool single_precision,
+                                            int target_reg) {
+    const char *x64_op = NULL;
+    const char *arm_op = NULL;
+    if (strcmp(op, "+") == 0) {
+        x64_op = single_precision ? "addss" : "addsd";
+        arm_op = "fadd";
+    } else if (strcmp(op, "-") == 0) {
+        x64_op = single_precision ? "subss" : "subsd";
+        arm_op = "fsub";
+    } else if (strcmp(op, "*") == 0) {
+        x64_op = single_precision ? "mulss" : "mulsd";
+        arm_op = "fmul";
+    } else if (strcmp(op, "/") == 0) {
+        x64_op = single_precision ? "divss" : "divsd";
+        arm_op = "fdiv";
+    } else {
+        return false;
+    }
+    if (cheng_seed_active_target_is_linux_x86_64()) {
+        if (single_precision) {
+            cheng_seed_text_appendf(out, cap,
+                            "  movd %s, %%xmm15\n"
+                            "  movd %s, %%xmm14\n"
+                            "  %s %%xmm14, %%xmm15\n"
+                            "  movd %%xmm15, %s\n",
+                            cheng_seed_x64_dreg_name(target_reg),
+                            cheng_seed_x64_dreg_name(target_reg + 1),
+                            x64_op,
+                            cheng_seed_x64_dreg_name(target_reg));
+        } else {
+            cheng_seed_text_appendf(out, cap,
+                            "  movq %s, %%xmm15\n"
+                            "  movq %s, %%xmm14\n"
+                            "  %s %%xmm14, %%xmm15\n"
+                            "  movq %%xmm15, %s\n",
+                            cheng_seed_x64_qreg_name(target_reg),
+                            cheng_seed_x64_qreg_name(target_reg + 1),
+                            x64_op,
+                            cheng_seed_x64_qreg_name(target_reg));
+        }
+        return true;
+    }
+    if (single_precision) {
+        cheng_seed_text_appendf(out, cap,
+                        "  fmov s16, w%d\n"
+                        "  fmov s17, w%d\n"
+                        "  %s s16, s16, s17\n"
+                        "  fmov w%d, s16\n",
+                        target_reg,
+                        target_reg + 1,
+                        arm_op,
+                        target_reg);
+    } else {
+        cheng_seed_text_appendf(out, cap,
+                        "  fmov d16, x%d\n"
+                        "  fmov d17, x%d\n"
+                        "  %s d16, d16, d17\n"
+                        "  fmov x%d, d16\n",
+                        target_reg,
+                        target_reg + 1,
+                        arm_op,
+                        target_reg);
+    }
+    return true;
+}
+
+static bool cheng_seed_emit_float_compare(char *out,
+                                  size_t cap,
+                                  const char *op,
+                                  bool single_precision,
+                                  int target_reg) {
+    const char *x64_suffix = cheng_seed_x64_float_compare_suffix(op);
+    const char *arm_cond = cheng_seed_float_compare_cond(op);
+    int scratch_reg = target_reg == 16 ? 17 : 16;
+    if (x64_suffix == NULL || arm_cond == NULL) {
+        return false;
+    }
+    if (cheng_seed_active_target_is_linux_x86_64()) {
+        if (single_precision) {
+            cheng_seed_text_appendf(out, cap,
+                            "  movd %s, %%xmm15\n"
+                            "  movd %s, %%xmm14\n"
+                            "  ucomiss %%xmm14, %%xmm15\n",
+                            cheng_seed_x64_dreg_name(target_reg),
+                            cheng_seed_x64_dreg_name(target_reg + 1));
+        } else {
+            cheng_seed_text_appendf(out, cap,
+                            "  movq %s, %%xmm15\n"
+                            "  movq %s, %%xmm14\n"
+                            "  ucomisd %%xmm14, %%xmm15\n",
+                            cheng_seed_x64_qreg_name(target_reg),
+                            cheng_seed_x64_qreg_name(target_reg + 1));
+        }
+        cheng_seed_text_appendf(out, cap,
+                        "  movl $0, %s\n"
+                        "  movl $0, %s\n"
+                        "  set%s %s\n",
+                        cheng_seed_x64_dreg_name(target_reg),
+                        cheng_seed_x64_dreg_name(scratch_reg),
+                        x64_suffix,
+                        cheng_seed_x64_breg_name(target_reg));
+        if (strcmp(op, "!=") == 0) {
+            cheng_seed_text_appendf(out, cap,
+                            "  setp %s\n"
+                            "  orb %s, %s\n",
+                            cheng_seed_x64_breg_name(scratch_reg),
+                            cheng_seed_x64_breg_name(scratch_reg),
+                            cheng_seed_x64_breg_name(target_reg));
+        } else {
+            cheng_seed_text_appendf(out, cap,
+                            "  setnp %s\n"
+                            "  andb %s, %s\n",
+                            cheng_seed_x64_breg_name(scratch_reg),
+                            cheng_seed_x64_breg_name(scratch_reg),
+                            cheng_seed_x64_breg_name(target_reg));
+        }
+        return true;
+    }
+    scratch_reg = target_reg == 14 ? 15 : 14;
+    if (single_precision) {
+        cheng_seed_text_appendf(out, cap,
+                        "  fmov s16, w%d\n"
+                        "  fmov s17, w%d\n"
+                        "  fcmp s16, s17\n",
+                        target_reg,
+                        target_reg + 1);
+    } else {
+        cheng_seed_text_appendf(out, cap,
+                        "  fmov d16, x%d\n"
+                        "  fmov d17, x%d\n"
+                        "  fcmp d16, d17\n",
+                        target_reg,
+                        target_reg + 1);
+    }
+    cheng_seed_text_appendf(out, cap,
+                    "  cset w%d, %s\n",
+                    target_reg,
+                    arm_cond);
+    if (strcmp(op, "!=") == 0) {
+        cheng_seed_text_appendf(out, cap,
+                        "  cset w%d, vs\n"
+                        "  orr w%d, w%d, w%d\n",
+                        scratch_reg,
+                        target_reg,
+                        target_reg,
+                        scratch_reg);
+    } else {
+        cheng_seed_text_appendf(out, cap,
+                        "  cset w%d, vc\n"
+                        "  and w%d, w%d, w%d\n",
+                        scratch_reg,
+                        target_reg,
+                        target_reg,
+                        scratch_reg);
+    }
+    return true;
 }
 
 static bool cheng_seed_text_case_equal(const char *lhs, const char *rhs) {
@@ -32902,7 +33189,12 @@ static bool cheng_seed_codegen_binary_expr_scalar(const ChengSeedSystemLinkPlanS
     char right[4096];
     char left_type[256];
     char left_abi[32];
+    char right_type[256];
+    char right_abi[32];
+    char normalized_left_type[256];
+    char normalized_right_type[256];
     bool left_is_unsigned = false;
+    bool float_arithmetic = false;
     if (op_index < 0) {
         return false;
     }
@@ -32924,7 +33216,44 @@ static bool cheng_seed_codegen_binary_expr_scalar(const ChengSeedSystemLinkPlanS
                             sizeof(left_abi))) {
         return false;
     }
+    if (!cheng_seed_infer_expr_type(plan,
+                            lowering,
+                            current_function,
+                            aliases,
+                            alias_count,
+                            locals,
+                            local_count,
+                            right,
+                            right_type,
+                            sizeof(right_type),
+                            right_abi,
+                            sizeof(right_abi))) {
+        return false;
+    }
+    snprintf(normalized_left_type, sizeof(normalized_left_type), "%s", left_type);
+    snprintf(normalized_right_type, sizeof(normalized_right_type), "%s", right_type);
+    cheng_seed_normalize_type_text(lowering,
+                           current_function->owner_module_path,
+                           aliases,
+                           alias_count,
+                           left_type,
+                           normalized_left_type,
+                           sizeof(normalized_left_type));
+    cheng_seed_normalize_type_text(lowering,
+                           current_function->owner_module_path,
+                           aliases,
+                           alias_count,
+                           right_type,
+                           normalized_right_type,
+                           sizeof(normalized_right_type));
     left_is_unsigned = cheng_seed_scalar_type_is_unsigned(left_type);
+    float_arithmetic =
+        (cheng_seed_scalar_type_is_float(normalized_left_type) ||
+         cheng_seed_scalar_type_is_float(normalized_right_type)) &&
+        (strcmp(op, "+") == 0 ||
+         strcmp(op, "-") == 0 ||
+         strcmp(op, "*") == 0 ||
+         strcmp(op, "/") == 0);
     if (!cheng_seed_codegen_expr_scalar(plan,
                                 lowering,
                                 current_function,
@@ -32973,6 +33302,13 @@ static bool cheng_seed_codegen_binary_expr_scalar(const ChengSeedSystemLinkPlanS
                               call_depth,
                               target_reg,
                               expected_abi);
+    if (float_arithmetic) {
+        return cheng_seed_emit_float_binary_arithmetic(out,
+                                               cap,
+                                               op,
+                                               strcmp(expected_abi, "i32") == 0,
+                                               target_reg);
+    }
     if (cheng_seed_active_target_is_linux_x86_64()) {
         const bool wide = strcmp(expected_abi, "i64") == 0 || strcmp(expected_abi, "ptr") == 0;
         int work_reg = target_reg;
@@ -33618,6 +33954,78 @@ static bool cheng_seed_codegen_compare_expr_scalar(const ChengSeedSystemLinkPlan
                                          target_reg,
                                          "i32");
         return true;
+    }
+    if (cheng_seed_scalar_type_is_float(normalized_left_type) ||
+        cheng_seed_scalar_type_is_float(normalized_right_type)) {
+        compare_abi =
+            (strcmp(left_abi, "i32") == 0 || strcmp(right_abi, "i32") == 0) ? "i32" : "i64";
+        if (!cheng_seed_codegen_expr_scalar(plan,
+                                    lowering,
+                                    current_function,
+                                    aliases,
+                                    alias_count,
+                                    locals,
+                                    local_count,
+                                    left,
+                                    compare_abi,
+                                    target_reg,
+                                    call_arg_base,
+                                    string_temp_base,
+                                    string_temp_stride,
+                                    call_depth + 1,
+                                    out,
+                                    cap)) {
+            fprintf(stderr,
+                    "[cheng_seed] float compare codegen lhs failed function=%s expr=%s lhs=%s rhs=%s compare_abi=%s\n",
+                    current_function->symbol_text,
+                    expr_text,
+                    left,
+                    right,
+                    compare_abi);
+            return false;
+        }
+        cheng_seed_emit_binary_spill_store(out,
+                                   cap,
+                                   call_arg_base,
+                                   call_depth,
+                                   compare_abi,
+                                   target_reg);
+        if (!cheng_seed_codegen_expr_scalar(plan,
+                                    lowering,
+                                    current_function,
+                                    aliases,
+                                    alias_count,
+                                    locals,
+                                    local_count,
+                                    right,
+                                    compare_abi,
+                                    target_reg + 1,
+                                    call_arg_base,
+                                    string_temp_base,
+                                    string_temp_stride,
+                                    call_depth + 1,
+                                    out,
+                                    cap)) {
+            fprintf(stderr,
+                    "[cheng_seed] float compare codegen rhs failed function=%s expr=%s lhs=%s rhs=%s compare_abi=%s\n",
+                    current_function->symbol_text,
+                    expr_text,
+                    left,
+                    right,
+                    compare_abi);
+            return false;
+        }
+        cheng_seed_emit_binary_spill_load(out,
+                                  cap,
+                                  call_arg_base,
+                                  call_depth,
+                                  target_reg,
+                                  compare_abi);
+        return cheng_seed_emit_float_compare(out,
+                                     cap,
+                                     op,
+                                     strcmp(compare_abi, "i32") == 0,
+                                     target_reg);
     }
     if (strcmp(left_abi, "ptr") == 0 && strcmp(right_abi, "ptr") == 0) {
         compare_abi = "ptr";
@@ -47312,6 +47720,8 @@ static bool cheng_seed_build_primary_object_plan_stub(const ChengSeedSystemLinkP
     size_t i;
     const ChengSeedLoweredFunctionStub *entry_function;
     ChengSeedConstEntryProgram consteval_entry;
+    char *scratch = NULL;
+    char *cstring_scratch = NULL;
     cheng_seed_primary_object_plan_stub_dispose(primary);
     memset(primary, 0, sizeof(*primary));
     memset(&consteval_entry, 0, sizeof(consteval_entry));
@@ -47411,6 +47821,8 @@ static bool cheng_seed_build_primary_object_plan_stub(const ChengSeedSystemLinkP
         }
         return true;
     }
+    scratch = (char *)cheng_seed_xmalloc(ChengSeed_SCALAR_EMIT_SCRATCH_CAP);
+    cstring_scratch = (char *)cheng_seed_xmalloc(ChengSeed_SCALAR_EMIT_SCRATCH_CAP);
     for (i = 0; i < lowering->function_count && i < CHENG_MAX_PLAN_FUNCTIONS; ++i) {
         if (cheng_seed_function_has_unbound_generics(lowering, &lowering->functions[i]) ||
             cheng_seed_function_has_obvious_template_text(&lowering->functions[i])) {
@@ -47467,13 +47879,13 @@ static bool cheng_seed_build_primary_object_plan_stub(const ChengSeedSystemLinkP
             }
         } else {
             size_t instruction_words = 0U;
-            char *scratch = (char *)cheng_seed_xmalloc(ChengSeed_SCALAR_EMIT_SCRATCH_CAP);
-            char *cstring_scratch = (char *)cheng_seed_xmalloc(ChengSeed_SCALAR_EMIT_SCRATCH_CAP);
             ChengSeedPrimaryTextBuilder scalar_builder;
             ChengSeedPrimaryTextBuilder cstring_builder;
             ChengSeedPrimaryTextBuilder *previous_builder;
             ChengSeedPrimaryTextBuilder *previous_cstring_builder;
             bool scalar_ok;
+            scratch[0] = '\0';
+            cstring_scratch[0] = '\0';
             cheng_seed_primary_text_builder_init(&scalar_builder, scratch, ChengSeed_SCALAR_EMIT_SCRATCH_CAP);
             cheng_seed_primary_text_builder_init(&cstring_builder, cstring_scratch, ChengSeed_SCALAR_EMIT_SCRATCH_CAP);
             previous_cstring_builder = cheng_seed_cstring_literal_pool_push(&cstring_builder);
@@ -47498,11 +47910,11 @@ static bool cheng_seed_build_primary_object_plan_stub(const ChengSeedSystemLinkP
                 cheng_seed_primary_add_unsupported(primary, &lowering->functions[i]);
                 cheng_seed_primary_add_reason(primary, "primary_object_body_semantics_missing");
             }
-            free(cstring_scratch);
-            free(scratch);
         }
         primary->item_count += 1U;
     }
+    free(cstring_scratch);
+    free(scratch);
     if (entry_function && cheng_seed_streq(plan->emit_kind, "exe")) {
         if (primary->item_count < CHENG_MAX_PLAN_FUNCTIONS) {
             primary->item_ids[primary->item_count] = (int32_t)(900000 + (int32_t)primary->item_count);
@@ -56993,45 +57405,41 @@ static bool cheng_seed_materialize_primary_object_internal(const ChengSeedSystem
         if (strcmp(lowering->functions[i].body_kind, "return_zero_i32") != 0 &&
             strcmp(lowering->functions[i].body_kind, "return_call_noarg_i32") != 0 &&
             strcmp(lowering->functions[i].body_kind, "return_call_arg0_i32") != 0) {
-            char *scalar_chunk = (char *)cheng_seed_xmalloc(ChengSeed_SCALAR_EMIT_SCRATCH_CAP);
-            char *scalar_cstring_chunk = (char *)cheng_seed_xmalloc(ChengSeed_SCALAR_EMIT_SCRATCH_CAP);
-            ChengSeedPrimaryTextBuilder scalar_builder;
-            ChengSeedPrimaryTextBuilder scalar_cstring_builder;
-            ChengSeedPrimaryTextBuilder *previous_builder;
-            ChengSeedPrimaryTextBuilder *previous_scalar_cstring_builder;
-            bool scalar_ok;
-            cheng_seed_primary_text_builder_init(&scalar_builder, scalar_chunk, ChengSeed_SCALAR_EMIT_SCRATCH_CAP);
-            cheng_seed_primary_text_builder_init(&scalar_cstring_builder,
-                                         scalar_cstring_chunk,
-                                         ChengSeed_SCALAR_EMIT_SCRATCH_CAP);
-            previous_scalar_cstring_builder = cheng_seed_cstring_literal_pool_push(&scalar_cstring_builder);
-            previous_builder = cheng_seed_primary_text_builder_push(&scalar_builder);
-            scalar_ok = cheng_seed_try_emit_scalar_function(plan,
-                                                    lowering,
-                                                    &lowering->functions[i],
-                                                    scalar_chunk,
-                                                    ChengSeed_SCALAR_EMIT_SCRATCH_CAP,
-                                                    NULL);
-            cheng_seed_primary_text_builder_pop(previous_builder);
-            cheng_seed_cstring_literal_pool_pop(previous_scalar_cstring_builder);
-            if (!scalar_ok) {
+            if (i >= CHENG_MAX_PLAN_FUNCTIONS ||
+                primary->scalar_function_texts[i] == NULL ||
+                primary->scalar_function_text_lens[i] == 0U) {
+                fprintf(stderr,
+                        "[cheng_seed] primary object cached scalar text missing function=%s body=%s source=%s\n",
+                        lowering->functions[i].symbol_text,
+                        lowering->functions[i].body_kind,
+                        lowering->functions[i].source_path);
                 cheng_seed_cstring_literal_pool_pop(previous_cstring_builder);
-                free(scalar_cstring_chunk);
-                free(scalar_chunk);
                 free(cstring_text);
                 free(text);
                 free(module_init_symbols);
                 return false;
             }
-            cheng_seed_primary_text_builder_append_n(&builder, scalar_chunk, scalar_builder.len);
+            cheng_seed_primary_text_builder_append_n(&builder,
+                                             primary->scalar_function_texts[i],
+                                             primary->scalar_function_text_lens[i]);
             cheng_seed_primary_text_builder_appendf(&builder, "%s:\n", end_label);
-            if (scalar_cstring_builder.len > 0U) {
+            if (primary->scalar_function_cstring_text_lens[i] > 0U) {
+                if (primary->scalar_function_cstring_texts[i] == NULL) {
+                    fprintf(stderr,
+                            "[cheng_seed] primary object cached cstring text missing function=%s body=%s source=%s\n",
+                            lowering->functions[i].symbol_text,
+                            lowering->functions[i].body_kind,
+                            lowering->functions[i].source_path);
+                    cheng_seed_cstring_literal_pool_pop(previous_cstring_builder);
+                    free(cstring_text);
+                    free(text);
+                    free(module_init_symbols);
+                    return false;
+                }
                 cheng_seed_primary_text_builder_append_n(&cstring_builder,
-                                                 scalar_cstring_chunk,
-                                                 scalar_cstring_builder.len);
+                                                 primary->scalar_function_cstring_texts[i],
+                                                 primary->scalar_function_cstring_text_lens[i]);
             }
-            free(scalar_cstring_chunk);
-            free(scalar_chunk);
             continue;
         }
         cheng_seed_primary_symbol_name(plan,
@@ -57229,12 +57637,6 @@ static bool cheng_seed_materialize_primary_object_internal(const ChengSeedSystem
                     cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms));
     free(module_init_symbols);
     return i != 0U;
-}
-
-static bool cheng_seed_materialize_primary_asm_only(const ChengSeedSystemLinkPlanStub *plan,
-                                            const ChengSeedLoweringPlanStub *lowering,
-                                            const ChengSeedPrimaryObjectPlanStub *primary) {
-    return cheng_seed_materialize_primary_object_internal(plan, lowering, primary, false, NULL);
 }
 
 static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract *contract,
@@ -57737,6 +58139,7 @@ static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract
     char target_flag[256];
     char out_flag[PATH_MAX + 16];
     char log_path[PATH_MAX];
+    char self_path[PATH_MAX];
     const char *argv_local[8];
     size_t argc_local = 0U;
     (void)suppressed_export_symbols;
@@ -57778,6 +58181,18 @@ static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract
     argv_local[argc_local++] = "--emit:obj";
     argv_local[argc_local++] = target_flag;
     argv_local[argc_local++] = out_flag;
+    self_path[0] = '\0';
+    if (cheng_seed_resolve_self_path(self_path, sizeof(self_path)) &&
+        cheng_seed_streq(self_path, compiler_path)) {
+        if (!cheng_seed_run_internal_command_logged_argv_live(cheng_seed_cmd_system_link_exec,
+                                                      argc_local,
+                                                      argv_local,
+                                                      log_path,
+                                                      "cheng object materialize")) {
+            return false;
+        }
+        return cheng_seed_path_exists_nonempty(out_path);
+    }
     if (!cheng_seed_run_command_logged_argv(argc_local,
                                     argv_local,
                                     log_path,
@@ -60234,26 +60649,6 @@ static void cheng_seed_compiler_source_module_path(const ChengSeedSystemLinkPlan
                                   cap);
 }
 
-static bool cheng_seed_compiler_source_bundle_cid_from_texts(const char *package_id,
-                                                     const ChengSeedPlanPath *source_paths,
-                                                     char *const *texts,
-                                                     size_t source_count,
-                                                     ChengSeedCid32 *out) {
-    ChengSeedByteBuf buf;
-    size_t i;
-    cheng_seed_bytebuf_init(&buf, 512U);
-    cheng_seed_bytebuf_append_text(&buf, "cheng.compiler.source_bundle");
-    cheng_seed_bytebuf_append_text(&buf, package_id);
-    cheng_seed_bytebuf_append_u32_be(&buf, (uint32_t)source_count);
-    for (i = 0U; i < source_count; ++i) {
-        cheng_seed_bytebuf_append_text(&buf, source_paths[i].text);
-        cheng_seed_bytebuf_append_text(&buf, texts[i] ? texts[i] : "");
-    }
-    *out = cheng_seed_cid_from_bytebuf(&buf);
-    cheng_seed_bytebuf_free(&buf);
-    return true;
-}
-
 static bool cheng_seed_compiler_source_bundle_cid_with_overrides(const ChengSeedSystemLinkPlanStub *plan,
                                                          const ChengSeedCompilerSourceOverride *overrides,
                                                          size_t override_count,
@@ -60530,1390 +60925,6 @@ static bool cheng_seed_trimmed_file_equals(const char *path, const char *expecte
     return ok;
 }
 
-static bool cheng_seed_report_line_value(const char *text,
-                                 const char *key,
-                                 char *out,
-                                 size_t out_cap) {
-    char *copy;
-    char *cursor;
-    char *line;
-    if (!text) {
-        out[0] = '\0';
-        return false;
-    }
-    copy = cheng_seed_strdup(text);
-    cursor = copy;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        char *eq;
-        char *line_key;
-        char *line_value;
-        line = cheng_seed_trim_inplace(line);
-        if (*line == '\0') {
-            continue;
-        }
-        eq = strchr(line, '=');
-        if (!eq) {
-            continue;
-        }
-        *eq = '\0';
-        line_key = cheng_seed_trim_inplace(line);
-        line_value = cheng_seed_trim_inplace(eq + 1);
-        if (!cheng_seed_streq(line_key, key)) {
-            continue;
-        }
-        cheng_seed_copy_text(out, out_cap, line_value);
-        free(copy);
-        return true;
-    }
-    free(copy);
-    out[0] = '\0';
-    return false;
-}
-
-static bool cheng_seed_parse_i32_text(const char *text, int32_t *out) {
-    char *end = NULL;
-    long value;
-    if (!text || *text == '\0') {
-        return false;
-    }
-    value = strtol(text, &end, 10);
-    if (!end || *cheng_seed_trim_inplace(end) != '\0') {
-        return false;
-    }
-    *out = (int32_t)value;
-    return true;
-}
-
-static bool cheng_seed_report_collect_prefixed_values(const char *text,
-                                              const char *prefix,
-                                              ChengSeedPlanPath *items,
-                                              size_t *count,
-                                              size_t cap) {
-    char *copy;
-    char *cursor;
-    char *line;
-    *count = 0U;
-    if (!text) {
-        return false;
-    }
-    copy = cheng_seed_strdup(text);
-    cursor = copy;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        char *eq;
-        char *value;
-        line = cheng_seed_trim_inplace(line);
-        if (!cheng_seed_startswith(line, prefix)) {
-            continue;
-        }
-        eq = strchr(line, '=');
-        if (!eq) {
-            free(copy);
-            return false;
-        }
-        value = cheng_seed_trim_inplace(eq + 1);
-        if (*count >= cap) {
-            free(copy);
-            return false;
-        }
-        cheng_seed_copy_text(items[*count].text, sizeof(items[*count].text), value);
-        *count += 1U;
-    }
-    free(copy);
-    return true;
-}
-
-static bool cheng_seed_report_values_equal(const ChengSeedPlanPath *left,
-                                   size_t left_count,
-                                   const ChengSeedPlanPath *right,
-                                   size_t right_count) {
-    size_t i;
-    if (left_count != right_count) {
-        return false;
-    }
-    for (i = 0U; i < left_count; ++i) {
-        if (!cheng_seed_streq(left[i].text, right[i].text)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool cheng_seed_compiler_equivalence_graph_compare_reports(const char *baseline_text,
-                                                          const char *migrated_text,
-                                                          ChengSeedCid32 *baseline_cid,
-                                                          ChengSeedCid32 *migrated_cid,
-                                                          int32_t *out_equivalent) {
-    char value[CHENG_CID_HEX_CAP];
-    if ((!cheng_seed_report_line_value(baseline_text, "canonical_graph_cid", value, sizeof(value)) &&
-         !cheng_seed_report_line_value(baseline_text, "graph_cid", value, sizeof(value))) ||
-        !cheng_seed_cid_from_hex_text(value, baseline_cid)) {
-        fprintf(stderr, "cheng compiler equivalence: invalid baseline graph_cid\n");
-        return false;
-    }
-    if ((!cheng_seed_report_line_value(migrated_text, "canonical_graph_cid", value, sizeof(value)) &&
-         !cheng_seed_report_line_value(migrated_text, "graph_cid", value, sizeof(value))) ||
-        !cheng_seed_cid_from_hex_text(value, migrated_cid)) {
-        fprintf(stderr, "cheng compiler equivalence: invalid migrated graph_cid\n");
-        return false;
-    }
-    *out_equivalent = cheng_seed_cid_equal(*baseline_cid, *migrated_cid) ? 1 : 0;
-    return true;
-}
-
-static bool cheng_seed_compiler_equivalence_surface_compare_reports(const char *baseline_text,
-                                                            const char *migrated_text,
-                                                            ChengSeedCid32 *baseline_cid,
-                                                            ChengSeedCid32 *migrated_cid,
-                                                            int32_t *out_compatible) {
-    char base_package[PATH_MAX];
-    char next_package[PATH_MAX];
-    char count_text[64];
-    char cid_text[CHENG_CID_HEX_CAP];
-    int32_t base_count = 0;
-    int32_t next_count = 0;
-    ChengSeedPlanPath base_exports[CHENG_MAX_TYPE_FIELDS];
-    ChengSeedPlanPath next_exports[CHENG_MAX_TYPE_FIELDS];
-    size_t base_export_count = 0U;
-    size_t next_export_count = 0U;
-    if (!cheng_seed_report_line_value(baseline_text, "package_id", base_package, sizeof(base_package)) ||
-        !cheng_seed_report_line_value(migrated_text, "package_id", next_package, sizeof(next_package))) {
-        fprintf(stderr, "cheng compiler equivalence: surface package_id missing\n");
-        return false;
-    }
-    if (!cheng_seed_report_line_value(baseline_text, "surface_cid", cid_text, sizeof(cid_text)) ||
-        !cheng_seed_cid_from_hex_text(cid_text, baseline_cid)) {
-        fprintf(stderr, "cheng compiler equivalence: invalid baseline surface_cid\n");
-        return false;
-    }
-    if (!cheng_seed_report_line_value(migrated_text, "surface_cid", cid_text, sizeof(cid_text)) ||
-        !cheng_seed_cid_from_hex_text(cid_text, migrated_cid)) {
-        fprintf(stderr, "cheng compiler equivalence: invalid migrated surface_cid\n");
-        return false;
-    }
-    if (!cheng_seed_report_line_value(baseline_text, "exported_count", count_text, sizeof(count_text)) ||
-        !cheng_seed_parse_i32_text(count_text, &base_count)) {
-        fprintf(stderr, "cheng compiler equivalence: invalid baseline exported_count\n");
-        return false;
-    }
-    if (!cheng_seed_report_line_value(migrated_text, "exported_count", count_text, sizeof(count_text)) ||
-        !cheng_seed_parse_i32_text(count_text, &next_count)) {
-        fprintf(stderr, "cheng compiler equivalence: invalid migrated exported_count\n");
-        return false;
-    }
-    if (!cheng_seed_report_collect_prefixed_values(baseline_text, "export[", base_exports, &base_export_count, CHENG_MAX_TYPE_FIELDS) ||
-        !cheng_seed_report_collect_prefixed_values(migrated_text, "export[", next_exports, &next_export_count, CHENG_MAX_TYPE_FIELDS)) {
-        fprintf(stderr, "cheng compiler equivalence: malformed export rows\n");
-        return false;
-    }
-    *out_compatible = (cheng_seed_streq(base_package, next_package) &&
-                       base_count == next_count &&
-                       (size_t)base_count == base_export_count &&
-                       (size_t)next_count == next_export_count &&
-                       cheng_seed_report_values_equal(base_exports, base_export_count, next_exports, next_export_count)) ? 1 : 0;
-    return true;
-}
-
-static bool cheng_seed_compiler_equivalence_receipt_compare_reports(const char *baseline_text,
-                                                            const char *migrated_text,
-                                                            ChengSeedCid32 *baseline_cid,
-                                                            ChengSeedCid32 *migrated_cid,
-                                                            char *target_out,
-                                                            size_t target_cap,
-                                                            int32_t *out_equivalent) {
-    char base_csg[CHENG_CID_HEX_CAP];
-    char next_csg[CHENG_CID_HEX_CAP];
-    char base_digest[CHENG_CID_HEX_CAP];
-    char next_digest[CHENG_CID_HEX_CAP];
-    char base_stage[128];
-    char next_stage[128];
-    char base_target[128];
-    char next_target[128];
-    ChengSeedCid32 base_csg_cid;
-    ChengSeedCid32 next_csg_cid;
-    ChengSeedCid32 base_digest_cid;
-    ChengSeedCid32 next_digest_cid;
-    ChengSeedPlanPath base_providers[CHENG_MAX_CALL_ARGS];
-    ChengSeedPlanPath next_providers[CHENG_MAX_CALL_ARGS];
-    size_t base_provider_count = 0U;
-    size_t next_provider_count = 0U;
-    char value[CHENG_CID_HEX_CAP];
-    if (!cheng_seed_report_line_value(baseline_text, "receipt_cid", value, sizeof(value)) ||
-        !cheng_seed_cid_from_hex_text(value, baseline_cid)) {
-        fprintf(stderr, "cheng compiler equivalence: invalid baseline receipt_cid\n");
-        return false;
-    }
-    if (!cheng_seed_report_line_value(migrated_text, "receipt_cid", value, sizeof(value)) ||
-        !cheng_seed_cid_from_hex_text(value, migrated_cid)) {
-        fprintf(stderr, "cheng compiler equivalence: invalid migrated receipt_cid\n");
-        return false;
-    }
-    if ((!cheng_seed_report_line_value(baseline_text, "canonical_compiler_csg_cid", base_csg, sizeof(base_csg)) &&
-         !cheng_seed_report_line_value(baseline_text, "compiler_csg_cid", base_csg, sizeof(base_csg))) ||
-        (!cheng_seed_report_line_value(migrated_text, "canonical_compiler_csg_cid", next_csg, sizeof(next_csg)) &&
-         !cheng_seed_report_line_value(migrated_text, "compiler_csg_cid", next_csg, sizeof(next_csg))) ||
-        !cheng_seed_cid_from_hex_text(base_csg, &base_csg_cid) ||
-        !cheng_seed_cid_from_hex_text(next_csg, &next_csg_cid)) {
-        fprintf(stderr, "cheng compiler equivalence: invalid compiler_csg_cid\n");
-        return false;
-    }
-    if ((!cheng_seed_report_line_value(baseline_text, "canonical_output_digest", base_digest, sizeof(base_digest)) &&
-         !cheng_seed_report_line_value(baseline_text, "output_digest", base_digest, sizeof(base_digest))) ||
-        (!cheng_seed_report_line_value(migrated_text, "canonical_output_digest", next_digest, sizeof(next_digest)) &&
-         !cheng_seed_report_line_value(migrated_text, "output_digest", next_digest, sizeof(next_digest))) ||
-        !cheng_seed_cid_from_hex_text(base_digest, &base_digest_cid) ||
-        !cheng_seed_cid_from_hex_text(next_digest, &next_digest_cid)) {
-        fprintf(stderr, "cheng compiler equivalence: invalid output_digest\n");
-        return false;
-    }
-    if (!cheng_seed_report_line_value(baseline_text, "bootstrap_stage", base_stage, sizeof(base_stage)) ||
-        !cheng_seed_report_line_value(migrated_text, "bootstrap_stage", next_stage, sizeof(next_stage)) ||
-        !cheng_seed_report_line_value(baseline_text, "target", base_target, sizeof(base_target)) ||
-        !cheng_seed_report_line_value(migrated_text, "target", next_target, sizeof(next_target))) {
-        fprintf(stderr, "cheng compiler equivalence: receipt fields missing\n");
-        return false;
-    }
-    if (!cheng_seed_report_collect_prefixed_values(baseline_text, "runtime_provider[", base_providers, &base_provider_count, CHENG_MAX_CALL_ARGS) ||
-        !cheng_seed_report_collect_prefixed_values(migrated_text, "runtime_provider[", next_providers, &next_provider_count, CHENG_MAX_CALL_ARGS)) {
-        fprintf(stderr, "cheng compiler equivalence: malformed runtime_provider rows\n");
-        return false;
-    }
-    cheng_seed_copy_text(target_out, target_cap, next_target);
-    *out_equivalent = (cheng_seed_cid_equal(base_csg_cid, next_csg_cid) &&
-                       cheng_seed_streq(base_target, next_target) &&
-                       cheng_seed_cid_equal(base_digest_cid, next_digest_cid) &&
-                       cheng_seed_streq(base_stage, next_stage) &&
-                       cheng_seed_report_values_equal(base_providers, base_provider_count, next_providers, next_provider_count)) ? 1 : 0;
-    return true;
-}
-
-static const char *cheng_seed_compiler_equivalence_kind(int32_t graph_equivalent,
-                                                int32_t export_surface_compatible,
-                                                int32_t compile_receipt_equivalent) {
-    if (graph_equivalent != 0 &&
-        export_surface_compatible != 0 &&
-        compile_receipt_equivalent != 0) {
-        return "canonical_semantic_identity";
-    }
-    return "incompatible";
-}
-
-static bool cheng_seed_compiler_equivalence_proof_make(const char *package_id,
-                                               const char *channel_raw,
-                                               ChengSeedCid32 baseline_graph_cid,
-                                               ChengSeedCid32 migrated_graph_cid,
-                                               ChengSeedCid32 baseline_surface_cid,
-                                               ChengSeedCid32 migrated_surface_cid,
-                                               ChengSeedCid32 baseline_receipt_cid,
-                                               ChengSeedCid32 migrated_receipt_cid,
-                                               const char *target_triple,
-                                               int32_t graph_equivalent,
-                                               int32_t export_surface_compatible,
-                                               int32_t compile_receipt_equivalent,
-                                               ChengSeedCompilerEquivalenceProof *out) {
-    ChengSeedByteBuf buf;
-    const char *equivalence_kind;
-    if (!cheng_seed_compiler_normalize_channel(channel_raw, out->channel, sizeof(out->channel))) {
-        return false;
-    }
-    equivalence_kind = cheng_seed_compiler_equivalence_kind(graph_equivalent,
-                                                    export_surface_compatible,
-                                                    compile_receipt_equivalent);
-    cheng_seed_copy_text(out->package_id, sizeof(out->package_id), package_id);
-    out->baseline_graph_cid = baseline_graph_cid;
-    out->migrated_graph_cid = migrated_graph_cid;
-    out->baseline_surface_cid = baseline_surface_cid;
-    out->migrated_surface_cid = migrated_surface_cid;
-    out->baseline_receipt_cid = baseline_receipt_cid;
-    out->migrated_receipt_cid = migrated_receipt_cid;
-    cheng_seed_copy_text(out->target_triple, sizeof(out->target_triple), target_triple);
-    out->graph_equivalent = graph_equivalent;
-    out->export_surface_compatible = export_surface_compatible;
-    out->compile_receipt_equivalent = compile_receipt_equivalent;
-    cheng_seed_copy_text(out->equivalence_kind, sizeof(out->equivalence_kind), equivalence_kind);
-    cheng_seed_bytebuf_init(&buf, 256U);
-    cheng_seed_bytebuf_append_text(&buf, "cheng.compiler.equivalence_proof");
-    cheng_seed_bytebuf_append_text(&buf, package_id);
-    cheng_seed_bytebuf_append_text(&buf, out->channel);
-    cheng_seed_bytebuf_append_cid(&buf, baseline_graph_cid);
-    cheng_seed_bytebuf_append_cid(&buf, migrated_graph_cid);
-    cheng_seed_bytebuf_append_cid(&buf, baseline_surface_cid);
-    cheng_seed_bytebuf_append_cid(&buf, migrated_surface_cid);
-    cheng_seed_bytebuf_append_cid(&buf, baseline_receipt_cid);
-    cheng_seed_bytebuf_append_cid(&buf, migrated_receipt_cid);
-    cheng_seed_bytebuf_append_text(&buf, target_triple);
-    cheng_seed_bytebuf_append_u32_be(&buf, (uint32_t)graph_equivalent);
-    cheng_seed_bytebuf_append_u32_be(&buf, (uint32_t)export_surface_compatible);
-    cheng_seed_bytebuf_append_u32_be(&buf, (uint32_t)compile_receipt_equivalent);
-    cheng_seed_bytebuf_append_text(&buf, out->equivalence_kind);
-    out->proof_cid = cheng_seed_cid_from_bytebuf(&buf);
-    cheng_seed_bytebuf_free(&buf);
-    return true;
-}
-
-static bool cheng_seed_compiler_equivalence_passed(const ChengSeedCompilerEquivalenceProof *proof) {
-    return proof->graph_equivalent != 0 &&
-           proof->export_surface_compatible != 0 &&
-           proof->compile_receipt_equivalent != 0 &&
-           cheng_seed_streq(proof->equivalence_kind, "canonical_semantic_identity");
-}
-
-static char *cheng_seed_compiler_equivalence_proof_report(const ChengSeedCompilerEquivalenceProof *proof) {
-    char *out = (char *)cheng_seed_xmalloc(4096U);
-    snprintf(out,
-             4096U,
-             "version=1\npackage_id=%s\nchannel=%s\nbaseline_graph_cid=%s\nmigrated_graph_cid=%s\nbaseline_surface_cid=%s\nmigrated_surface_cid=%s\nbaseline_receipt_cid=%s\nmigrated_receipt_cid=%s\ntarget=%s\ngraph_equivalent=%d\nexport_surface_compatible=%d\ncompile_receipt_equivalent=%d\nequivalence_kind=%s\nproof_cid=%s",
-             proof->package_id,
-             proof->channel,
-             proof->baseline_graph_cid.hex,
-             proof->migrated_graph_cid.hex,
-             proof->baseline_surface_cid.hex,
-             proof->migrated_surface_cid.hex,
-             proof->baseline_receipt_cid.hex,
-             proof->migrated_receipt_cid.hex,
-             proof->target_triple,
-             proof->graph_equivalent,
-             proof->export_surface_compatible,
-             proof->compile_receipt_equivalent,
-             proof->equivalence_kind,
-             proof->proof_cid.hex);
-    return out;
-}
-
-static bool cheng_seed_compiler_publish_decision_make(const char *channel_raw,
-                                              ChengSeedCid32 world_head_cid,
-                                              bool equivalence_checked,
-                                              const ChengSeedCompilerEquivalenceProof *proof,
-                                              ChengSeedCompilerPublishDecision *out) {
-    int32_t stable_gate_required;
-    if (!cheng_seed_compiler_normalize_channel(channel_raw, out->channel, sizeof(out->channel))) {
-        return false;
-    }
-    stable_gate_required = cheng_seed_streq(out->channel, "stable") ? 1 : 0;
-    out->stable_gate_required = stable_gate_required;
-    out->equivalence_checked = equivalence_checked ? 1 : 0;
-    out->equivalence_passed = (equivalence_checked && cheng_seed_compiler_equivalence_passed(proof)) ? 1 : 0;
-    out->publish_allowed = stable_gate_required != 0 ? out->equivalence_passed : 1;
-    out->world_head_cid = world_head_cid;
-    out->proof_cid = equivalence_checked ? proof->proof_cid : cheng_seed_cid_zero();
-    return true;
-}
-
-static char *cheng_seed_compiler_publish_decision_report(const ChengSeedCompilerPublishDecision *decision) {
-    char *out = (char *)cheng_seed_xmalloc(2048U);
-    snprintf(out,
-             2048U,
-             "version=1\nchannel=%s\nstable_gate_required=%d\nequivalence_checked=%d\nequivalence_passed=%d\npublish_allowed=%d\nworld_head_cid=%s\nproof_cid=%s",
-             decision->channel,
-             decision->stable_gate_required,
-             decision->equivalence_checked,
-             decision->equivalence_passed,
-             decision->publish_allowed,
-             decision->world_head_cid.hex,
-             decision->proof_cid.hex);
-    return out;
-}
-
-static bool cheng_seed_compiler_equivalence_inputs_ready(int argc,
-                                                 char **argv,
-                                                 bool required,
-                                                 bool *enabled_out) {
-    const char *baseline_csg = cheng_seed_flag_value(argc, argv, "--baseline-csg");
-    const char *baseline_surface = cheng_seed_flag_value(argc, argv, "--baseline-surface");
-    const char *baseline_receipt = cheng_seed_flag_value(argc, argv, "--baseline-receipt");
-    bool any_provided = (baseline_csg && *baseline_csg != '\0') ||
-                        (baseline_surface && *baseline_surface != '\0') ||
-                        (baseline_receipt && *baseline_receipt != '\0');
-    bool all_provided = (baseline_csg && *baseline_csg != '\0') &&
-                        (baseline_surface && *baseline_surface != '\0') &&
-                        (baseline_receipt && *baseline_receipt != '\0');
-    if (any_provided && !all_provided) {
-        fprintf(stderr, "cheng compiler equivalence: require --baseline-csg --baseline-surface --baseline-receipt together\n");
-        return false;
-    }
-    if (required && !all_provided) {
-        fprintf(stderr, "cheng compiler equivalence: missing --baseline-csg/--baseline-surface/--baseline-receipt\n");
-        return false;
-    }
-    *enabled_out = all_provided;
-    return true;
-}
-
-static bool cheng_seed_compiler_equivalence_proof_from_args(const ChengSeedSystemLinkPlanStub *plan,
-                                                    const ChengSeedCompilerWorldArtifacts *world,
-                                                    int argc,
-                                                    char **argv,
-                                                    ChengSeedCompilerEquivalenceProof *out) {
-    const char *baseline_csg_path = cheng_seed_flag_value(argc, argv, "--baseline-csg");
-    const char *baseline_surface_path = cheng_seed_flag_value(argc, argv, "--baseline-surface");
-    const char *baseline_receipt_path = cheng_seed_flag_value(argc, argv, "--baseline-receipt");
-    char *baseline_csg_text;
-    char *baseline_surface_text;
-    char *baseline_receipt_text;
-    ChengSeedCid32 baseline_graph_cid;
-    ChengSeedCid32 migrated_graph_cid;
-    ChengSeedCid32 baseline_surface_cid;
-    ChengSeedCid32 migrated_surface_cid;
-    ChengSeedCid32 baseline_receipt_cid;
-    ChengSeedCid32 migrated_receipt_cid;
-    char target_triple[128];
-    int32_t graph_equivalent = 0;
-    int32_t export_surface_compatible = 0;
-    int32_t compile_receipt_equivalent = 0;
-    bool ok = false;
-    baseline_csg_text = cheng_seed_read_file(baseline_csg_path);
-    baseline_surface_text = cheng_seed_read_file(baseline_surface_path);
-    baseline_receipt_text = cheng_seed_read_file(baseline_receipt_path);
-    if (!baseline_csg_text || !baseline_surface_text || !baseline_receipt_text) {
-        fprintf(stderr, "cheng compiler equivalence: failed to read baseline reports\n");
-        goto cleanup;
-    }
-    if (!cheng_seed_compiler_equivalence_graph_compare_reports(baseline_csg_text,
-                                                       world->csg_report,
-                                                       &baseline_graph_cid,
-                                                       &migrated_graph_cid,
-                                                       &graph_equivalent)) {
-        goto cleanup;
-    }
-    if (!cheng_seed_compiler_equivalence_surface_compare_reports(baseline_surface_text,
-                                                         world->surface_report,
-                                                         &baseline_surface_cid,
-                                                         &migrated_surface_cid,
-                                                         &export_surface_compatible)) {
-        goto cleanup;
-    }
-    if (!cheng_seed_compiler_equivalence_receipt_compare_reports(baseline_receipt_text,
-                                                         world->receipt_report,
-                                                         &baseline_receipt_cid,
-                                                         &migrated_receipt_cid,
-                                                         target_triple,
-                                                         sizeof(target_triple),
-                                                         &compile_receipt_equivalent)) {
-        goto cleanup;
-    }
-    ok = cheng_seed_compiler_equivalence_proof_make(plan->package_id,
-                                            world->channel,
-                                            baseline_graph_cid,
-                                            migrated_graph_cid,
-                                            baseline_surface_cid,
-                                            migrated_surface_cid,
-                                            baseline_receipt_cid,
-                                            migrated_receipt_cid,
-                                            target_triple,
-                                            graph_equivalent,
-                                            export_surface_compatible,
-                                            compile_receipt_equivalent,
-                                            out);
-cleanup:
-    free(baseline_csg_text);
-    free(baseline_surface_text);
-    free(baseline_receipt_text);
-    return ok;
-}
-
-static char *cheng_seed_compiler_publish_summary(const char *bundle_prefix,
-                                         const char *proof_mode,
-                                         const ChengSeedCompilerWorldArtifacts *world,
-                                         const ChengSeedCompilerPublishDecision *decision) {
-    char *out = (char *)cheng_seed_xmalloc(2304U);
-    snprintf(out,
-             2304U,
-             "bundle_prefix=%s\nchannel=%s\nworld_head_cid=%s\ncsg_root_cid=%s\nsurface_cid=%s\nreceipt_cid=%s\nproof_mode=%s\nequivalence_checked=%d\nequivalence_passed=%d\npublish_allowed=%d\nproof_cid=%s",
-             bundle_prefix,
-             world->channel,
-             world->world_head_cid.hex,
-             world->graph_cid.hex,
-             world->surface_cid.hex,
-             world->receipt_cid.hex,
-             proof_mode && *proof_mode != '\0' ? proof_mode : "-",
-             decision->equivalence_checked,
-             decision->equivalence_passed,
-             decision->publish_allowed,
-             decision->proof_cid.hex);
-    return out;
-}
-
-static void cheng_seed_compiler_legacy_units_free(ChengSeedCompilerLegacySourceUnit *units,
-                                          size_t unit_count) {
-    size_t i;
-    for (i = 0U; i < unit_count; ++i) {
-        free(units[i].legacy_text);
-        free(units[i].migrated_text);
-        units[i].legacy_text = NULL;
-        units[i].migrated_text = NULL;
-    }
-}
-
-static char *cheng_seed_text_dup_range(const char *text,
-                               size_t start,
-                               size_t len) {
-    char *out = (char *)cheng_seed_xmalloc(len + 1U);
-    memcpy(out, text + start, len);
-    out[len] = '\0';
-    return out;
-}
-
-static void cheng_seed_text_builder_append_n(char **out,
-                                     size_t *cap,
-                                     size_t *used,
-                                     const char *text,
-                                     size_t len) {
-    while (*used + len + 1U >= *cap) {
-        *cap *= 2U;
-        *out = (char *)realloc(*out, *cap);
-        if (!*out) {
-            fprintf(stderr, "[cheng_seed] out of memory while building migration text\n");
-            exit(1);
-        }
-    }
-    memcpy(*out + *used, text, len);
-    *used += len;
-    (*out)[*used] = '\0';
-}
-
-static void cheng_seed_text_builder_append(char **out,
-                                   size_t *cap,
-                                   size_t *used,
-                                   const char *text) {
-    cheng_seed_text_builder_append_n(out, cap, used, text, strlen(text));
-}
-
-static void cheng_seed_text_builder_append_char(char **out,
-                                        size_t *cap,
-                                        size_t *used,
-                                        char ch) {
-    cheng_seed_text_builder_append_n(out, cap, used, &ch, 1U);
-}
-
-static char *cheng_seed_text_replace_all(const char *text,
-                                 const char *needle,
-                                 const char *replacement) {
-    size_t text_len = strlen(text);
-    size_t needle_len = strlen(needle);
-    size_t replacement_len = strlen(replacement);
-    size_t cap = text_len + 64U;
-    size_t used = 0U;
-    size_t i = 0U;
-    char *out = (char *)cheng_seed_xmalloc(cap);
-    out[0] = '\0';
-    if (needle_len == 0U) {
-        cheng_seed_copy_text(out, cap, text);
-        return out;
-    }
-    while (i < text_len) {
-        if (i + needle_len <= text_len &&
-            strncmp(text + i, needle, needle_len) == 0) {
-            cheng_seed_text_builder_append_n(&out, &cap, &used, replacement, replacement_len);
-            i += needle_len;
-            continue;
-        }
-        cheng_seed_text_builder_append_char(&out, &cap, &used, text[i]);
-        i += 1U;
-    }
-    return out;
-}
-
-static size_t cheng_seed_compiler_legacy_line_indent_len(const char *raw_line) {
-    size_t i = 0U;
-    while (raw_line[i] == ' ' || raw_line[i] == '\t') {
-        i += 1U;
-    }
-    return i;
-}
-
-static int32_t cheng_seed_compiler_legacy_find_matching_bracket(const char *text,
-                                                        size_t open_index) {
-    size_t i;
-    int32_t depth = 0;
-    for (i = open_index; text[i] != '\0'; ++i) {
-        if (text[i] == '[') {
-            depth += 1;
-            continue;
-        }
-        if (text[i] == ']') {
-            depth -= 1;
-            if (depth == 0) {
-                return (int32_t)i;
-            }
-        }
-    }
-    return -1;
-}
-
-static int32_t cheng_seed_compiler_legacy_top_level_comma(const char *text) {
-    size_t i;
-    int32_t depth = 0;
-    for (i = 0U; text[i] != '\0'; ++i) {
-        if (text[i] == '[') {
-            depth += 1;
-            continue;
-        }
-        if (text[i] == ']') {
-            depth -= 1;
-            continue;
-        }
-        if (text[i] == ',' && depth == 0) {
-            return (int32_t)i;
-        }
-    }
-    return -1;
-}
-
-static char *cheng_seed_compiler_legacy_rewrite_seq_types(const char *text_raw,
-                                                  int32_t *out_applied_count) {
-    char *text = cheng_seed_strdup(text_raw);
-    size_t i = 0U;
-    *out_applied_count = 0;
-    while (text[i] != '\0') {
-        int32_t close_pos;
-        char *inner;
-        char *inner_trimmed;
-        char *replacement;
-        char *next;
-        size_t replacement_len;
-        size_t prefix_len;
-        size_t suffix_start;
-        if (strncmp(text + i, "seq[", 4) != 0) {
-            i += 1U;
-            continue;
-        }
-        close_pos = cheng_seed_compiler_legacy_find_matching_bracket(text, i + 3U);
-        if (close_pos <= (int32_t)(i + 3U)) {
-            i += 1U;
-            continue;
-        }
-        inner = cheng_seed_text_dup_range(text, i + 4U, (size_t)close_pos - (i + 4U));
-        inner_trimmed = cheng_seed_strdup(cheng_seed_trim_inplace(inner));
-        replacement_len = strlen(inner_trimmed) + 2U;
-        replacement = (char *)cheng_seed_xmalloc(replacement_len + 1U);
-        snprintf(replacement, replacement_len + 1U, "%s[]", inner_trimmed);
-        prefix_len = i;
-        suffix_start = (size_t)close_pos + 1U;
-        next = (char *)cheng_seed_xmalloc(prefix_len + replacement_len + strlen(text + suffix_start) + 1U);
-        memcpy(next, text, prefix_len);
-        memcpy(next + prefix_len, replacement, replacement_len);
-        strcpy(next + prefix_len + replacement_len, text + suffix_start);
-        free(text);
-        free(inner);
-        free(inner_trimmed);
-        free(replacement);
-        text = next;
-        *out_applied_count += 1;
-        i = prefix_len + replacement_len;
-    }
-    return text;
-}
-
-static char *cheng_seed_compiler_legacy_rewrite_array_types(const char *text_raw,
-                                                    int32_t *out_applied_count) {
-    char *text = cheng_seed_strdup(text_raw);
-    size_t i = 0U;
-    *out_applied_count = 0;
-    while (text[i] != '\0') {
-        int32_t close_pos;
-        char *inner;
-        int32_t comma_pos;
-        char *elem;
-        char *elem_trimmed;
-        char *len_text;
-        char *len_trimmed;
-        char *replacement;
-        char *next;
-        size_t replacement_len;
-        size_t prefix_len;
-        size_t suffix_start;
-        if (strncmp(text + i, "array[", 6) != 0) {
-            i += 1U;
-            continue;
-        }
-        close_pos = cheng_seed_compiler_legacy_find_matching_bracket(text, i + 5U);
-        if (close_pos <= (int32_t)(i + 5U)) {
-            i += 1U;
-            continue;
-        }
-        inner = cheng_seed_text_dup_range(text, i + 6U, (size_t)close_pos - (i + 6U));
-        comma_pos = cheng_seed_compiler_legacy_top_level_comma(inner);
-        if (comma_pos <= 0) {
-            free(inner);
-            i += 1U;
-            continue;
-        }
-        elem = cheng_seed_text_dup_range(inner, 0U, (size_t)comma_pos);
-        elem_trimmed = cheng_seed_strdup(cheng_seed_trim_inplace(elem));
-        len_text = cheng_seed_text_dup_range(inner, (size_t)comma_pos + 1U, strlen(inner) - ((size_t)comma_pos + 1U));
-        len_trimmed = cheng_seed_strdup(cheng_seed_trim_inplace(len_text));
-        replacement_len = strlen(elem_trimmed) + strlen(len_trimmed) + 2U;
-        replacement = (char *)cheng_seed_xmalloc(replacement_len + 1U);
-        snprintf(replacement, replacement_len + 1U, "%s[%s]", elem_trimmed, len_trimmed);
-        prefix_len = i;
-        suffix_start = (size_t)close_pos + 1U;
-        next = (char *)cheng_seed_xmalloc(prefix_len + replacement_len + strlen(text + suffix_start) + 1U);
-        memcpy(next, text, prefix_len);
-        memcpy(next + prefix_len, replacement, replacement_len);
-        strcpy(next + prefix_len + replacement_len, text + suffix_start);
-        free(text);
-        free(inner);
-        free(elem);
-        free(elem_trimmed);
-        free(len_text);
-        free(len_trimmed);
-        free(replacement);
-        text = next;
-        *out_applied_count += 1;
-        i = prefix_len + replacement_len;
-    }
-    return text;
-}
-
-static char *cheng_seed_compiler_legacy_normalize_text(const char *text_raw,
-                                               ChengSeedPlanPath *applied_rules,
-                                               size_t *applied_rule_len,
-                                               int32_t *out_applied_count) {
-    char *text;
-    char *next;
-    int32_t seq_applied = 0;
-    int32_t array_applied = 0;
-    char *owned;
-    char *cursor;
-    char *line;
-    size_t cap = strlen(text_raw) + 128U;
-    size_t used = 0U;
-    char *out = (char *)cheng_seed_xmalloc(cap);
-    *applied_rule_len = 0U;
-    *out_applied_count = 0;
-    out[0] = '\0';
-    text = cheng_seed_text_replace_all(text_raw, "else if", "elif");
-    if (!cheng_seed_streq(text, text_raw)) {
-        cheng_seed_plan_path_add_unique(applied_rules, applied_rule_len, CHENG_MAX_PLAN_PATHS, "else_if_to_elif");
-        *out_applied_count += 1;
-    }
-    next = cheng_seed_text_replace_all(text, "@[]", "[]");
-    if (!cheng_seed_streq(next, text)) {
-        cheng_seed_plan_path_add_unique(applied_rules, applied_rule_len, CHENG_MAX_PLAN_PATHS, "at_list_to_list");
-        *out_applied_count += 1;
-    }
-    free(text);
-    text = next;
-    next = cheng_seed_compiler_legacy_rewrite_seq_types(text, &seq_applied);
-    if (seq_applied > 0) {
-        cheng_seed_plan_path_add_unique(applied_rules, applied_rule_len, CHENG_MAX_PLAN_PATHS, "seq_type_to_suffix");
-        *out_applied_count += seq_applied;
-    }
-    free(text);
-    text = next;
-    next = cheng_seed_compiler_legacy_rewrite_array_types(text, &array_applied);
-    if (array_applied > 0) {
-        cheng_seed_plan_path_add_unique(applied_rules, applied_rule_len, CHENG_MAX_PLAN_PATHS, "array_type_to_suffix");
-        *out_applied_count += array_applied;
-    }
-    free(text);
-    text = next;
-    owned = text;
-    cursor = owned;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        char *trimmed = cheng_seed_trim_inplace(line);
-        size_t indent_len = cheng_seed_compiler_legacy_line_indent_len(line);
-        if (used > 0U) {
-            cheng_seed_text_builder_append_char(&out, &cap, &used, '\n');
-        }
-        if (cheng_seed_startswith(trimmed, "proc ")) {
-            cheng_seed_plan_path_add_unique(applied_rules, applied_rule_len, CHENG_MAX_PLAN_PATHS, "proc_to_fn");
-            *out_applied_count += 1;
-            cheng_seed_text_builder_append_n(&out, &cap, &used, line, indent_len);
-            cheng_seed_text_builder_append(&out, &cap, &used, "fn ");
-            cheng_seed_text_builder_append(&out, &cap, &used, trimmed + strlen("proc "));
-            continue;
-        }
-        if (cheng_seed_startswith(trimmed, "method ")) {
-            cheng_seed_plan_path_add_unique(applied_rules, applied_rule_len, CHENG_MAX_PLAN_PATHS, "method_to_fn");
-            *out_applied_count += 1;
-            cheng_seed_text_builder_append_n(&out, &cap, &used, line, indent_len);
-            cheng_seed_text_builder_append(&out, &cap, &used, "fn ");
-            cheng_seed_text_builder_append(&out, &cap, &used, trimmed + strlen("method "));
-            continue;
-        }
-        if (cheng_seed_startswith(trimmed, "converter ")) {
-            cheng_seed_plan_path_add_unique(applied_rules, applied_rule_len, CHENG_MAX_PLAN_PATHS, "converter_to_fn");
-            *out_applied_count += 1;
-            cheng_seed_text_builder_append_n(&out, &cap, &used, line, indent_len);
-            cheng_seed_text_builder_append(&out, &cap, &used, "fn ");
-            cheng_seed_text_builder_append(&out, &cap, &used, trimmed + strlen("converter "));
-            continue;
-        }
-        cheng_seed_text_builder_append(&out, &cap, &used, line);
-    }
-    free(text);
-    return out;
-}
-
-static bool cheng_seed_compiler_import_edge_add_unique(ChengSeedPlanImportEdge *edges,
-                                               size_t *edge_len,
-                                               size_t edge_cap,
-                                               const ChengSeedPlanImportEdge *edge) {
-    size_t i;
-    for (i = 0U; i < *edge_len; ++i) {
-        if (cheng_seed_streq(edges[i].owner_module_path, edge->owner_module_path) &&
-            cheng_seed_streq(edges[i].target_module_path, edge->target_module_path) &&
-            cheng_seed_streq(edges[i].target_source_path, edge->target_source_path) &&
-            edges[i].resolved == edge->resolved) {
-            return true;
-        }
-    }
-    if (*edge_len >= edge_cap) {
-        return false;
-    }
-    edges[*edge_len] = *edge;
-    *edge_len += 1U;
-    return true;
-}
-
-static void cheng_seed_compiler_merge_applied_rules(ChengSeedPlanPath *dst,
-                                            size_t *dst_len,
-                                            const ChengSeedPlanPath *src,
-                                            size_t src_len) {
-    size_t i;
-    for (i = 0U; i < src_len; ++i) {
-        cheng_seed_plan_path_add_unique(dst, dst_len, CHENG_MAX_PLAN_PATHS, src[i].text);
-    }
-}
-
-static bool cheng_seed_compiler_legacy_collect_closure(const char *workspace_root,
-                                               const char *package_root,
-                                               const char *package_id,
-                                               const char *source_path,
-                                               const char *entry_module_override,
-                                               ChengSeedPlanPath *seen,
-                                               size_t *seen_len,
-                                               ChengSeedCompilerLegacySourceUnit *units,
-                                               size_t *unit_count,
-                                               ChengSeedPlanPath *owner_modules,
-                                               size_t *owner_module_count,
-                                               ChengSeedPlanImportEdge *import_edges,
-                                               size_t *import_edge_count,
-                                               size_t *unresolved_import_count,
-                                               ChengSeedPlanPath *applied_rules,
-                                               size_t *applied_rule_len,
-                                               int32_t *applied_rule_count) {
-    char module_path[PATH_MAX];
-    char *legacy_text;
-    char *migrated_text;
-    ChengSeedPlanPath local_rules[CHENG_MAX_PLAN_PATHS];
-    size_t local_rule_len = 0U;
-    int32_t local_rule_count = 0;
-    ChengSeedPlanImportEdge edges[CHENG_MAX_PLAN_PATHS];
-    size_t edge_len = 0U;
-    size_t i;
-    bool is_entry = (*seen_len == 0U);
-    if (cheng_seed_plan_paths_contains(seen, *seen_len, source_path)) {
-        return true;
-    }
-    if (!cheng_seed_path_exists_nonempty(source_path)) {
-        fprintf(stderr, "cheng compiler migration: missing legacy source: %s\n", source_path);
-        return false;
-    }
-    if (*seen_len >= CHENG_MAX_PLAN_PATHS || *unit_count >= CHENG_MAX_PLAN_PATHS) {
-        fprintf(stderr, "cheng compiler migration: source closure too large\n");
-        return false;
-    }
-    legacy_text = cheng_seed_read_file(source_path);
-    if (!legacy_text) {
-        return false;
-    }
-    migrated_text = cheng_seed_compiler_legacy_normalize_text(legacy_text,
-                                                      local_rules,
-                                                      &local_rule_len,
-                                                      &local_rule_count);
-    cheng_seed_source_path_to_module_path(workspace_root,
-                                  package_root,
-                                  package_id,
-                                  source_path,
-                                  module_path,
-                                  sizeof(module_path));
-    if (is_entry && entry_module_override && *entry_module_override != '\0') {
-        cheng_seed_copy_text(module_path, sizeof(module_path), entry_module_override);
-    }
-    cheng_seed_plan_add_path(seen, seen_len, CHENG_MAX_PLAN_PATHS, source_path);
-    cheng_seed_copy_text(units[*unit_count].source_path, sizeof(units[*unit_count].source_path), source_path);
-    cheng_seed_copy_text(units[*unit_count].module_path, sizeof(units[*unit_count].module_path), module_path);
-    units[*unit_count].legacy_text = legacy_text;
-    units[*unit_count].migrated_text = migrated_text;
-    *unit_count += 1U;
-    cheng_seed_plan_path_add_unique(owner_modules, owner_module_count, 8U, module_path);
-    cheng_seed_compiler_merge_applied_rules(applied_rules, applied_rule_len, local_rules, local_rule_len);
-    *applied_rule_count += local_rule_count;
-    if (!cheng_seed_parse_import_edges(workspace_root,
-                               package_root,
-                               package_id,
-                               module_path,
-                               migrated_text,
-                               edges,
-                               &edge_len,
-                               CHENG_MAX_PLAN_PATHS)) {
-        fprintf(stderr, "cheng compiler migration: malformed import in %s\n", source_path);
-        return false;
-    }
-    for (i = 0U; i < edge_len; ++i) {
-        if (!cheng_seed_compiler_import_edge_add_unique(import_edges,
-                                                import_edge_count,
-                                                CHENG_MAX_PLAN_PATHS,
-                                                &edges[i])) {
-            fprintf(stderr, "cheng compiler migration: import edge overflow\n");
-            return false;
-        }
-        if (!edges[i].resolved) {
-            *unresolved_import_count += 1U;
-            continue;
-        }
-        if (!cheng_seed_compiler_legacy_collect_closure(workspace_root,
-                                                package_root,
-                                                package_id,
-                                                edges[i].target_source_path,
-                                                "",
-                                                seen,
-                                                seen_len,
-                                                units,
-                                                unit_count,
-                                                owner_modules,
-                                                owner_module_count,
-                                                import_edges,
-                                                import_edge_count,
-                                                unresolved_import_count,
-                                                applied_rules,
-                                                applied_rule_len,
-                                                applied_rule_count)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool cheng_seed_compiler_legacy_build_plan(const ChengSeedBootstrapContract *contract,
-                                          int argc,
-                                          char **argv,
-                                          const char *package_root,
-                                          const char *package_id,
-                                          const ChengSeedCompilerLegacySourceUnit *units,
-                                          size_t unit_count,
-                                          const ChengSeedPlanPath *owner_modules,
-                                          size_t owner_module_count,
-                                          const ChengSeedPlanImportEdge *import_edges,
-                                          size_t import_edge_count,
-                                          size_t unresolved_import_count,
-                                          ChengSeedSystemLinkPlanStub *out) {
-    const char *target = cheng_seed_flag_value(argc, argv, "--target");
-    const char *emit = cheng_seed_flag_value(argc, argv, "--emit");
-    const char *out_path = cheng_seed_flag_value(argc, argv, "--out");
-    const char *slash;
-    char last_component[PATH_MAX];
-    size_t i;
-    char compiler_entry[PATH_MAX];
-    char workspace_root[PATH_MAX];
-    memset(out, 0, sizeof(*out));
-    if (unit_count <= 0U) {
-        return false;
-    }
-    if (!target || *target == '\0') {
-        target = cheng_seed_contract_get(contract, "target");
-    }
-    if (!emit || *emit == '\0') {
-        emit = "exe";
-    }
-    if (!cheng_seed_streq(emit, "exe") &&
-        !cheng_seed_streq(emit, "shared") &&
-        !cheng_seed_streq(emit, "obj")) {
-        fprintf(stderr, "cheng compiler migration: unsupported --emit (only exe/shared/obj)\n");
-        return false;
-    }
-    cheng_seed_workspace_root_from_package_root(package_root, workspace_root, sizeof(workspace_root));
-    cheng_seed_copy_text(out->workspace_root, sizeof(out->workspace_root), workspace_root);
-    cheng_seed_copy_text(out->package_root, sizeof(out->package_root), package_root);
-    cheng_seed_copy_text(out->package_id, sizeof(out->package_id), package_id);
-    cheng_seed_copy_text(out->entry_path, sizeof(out->entry_path), units[0].source_path);
-    cheng_seed_copy_text(out->output_path, sizeof(out->output_path), out_path ? out_path : "");
-    cheng_seed_copy_text(out->target_triple, sizeof(out->target_triple), target ? target : "arm64-apple-darwin");
-    cheng_seed_copy_text(out->emit_kind, sizeof(out->emit_kind), emit);
-    slash = strrchr(units[0].source_path, '/');
-    snprintf(last_component, sizeof(last_component), "%s", slash ? slash + 1 : units[0].source_path);
-    cheng_seed_strip_ext(last_component);
-    cheng_seed_copy_text(out->module_stem, sizeof(out->module_stem), last_component);
-    cheng_seed_copy_text(out->module_kind,
-                 sizeof(out->module_kind),
-                 cheng_seed_streq(units[0].module_path, "cheng/core/tooling/compiler_main") ?
-                    "compiler_control_plane" :
-                    "ordinary_program");
-    out->has_compiler_top_level = cheng_seed_source_has_top_level(units[0].migrated_text);
-    out->main_function_present = cheng_seed_source_has_main(units[0].migrated_text);
-    if (cheng_seed_source_has_legacy_func_alias(units[0].migrated_text)) {
-        cheng_seed_plan_add_reason(out, "legacy_func_alias_unsupported");
-    }
-    if (out->main_function_present) {
-        cheng_seed_copy_text(out->entry_symbol, sizeof(out->entry_symbol), "main");
-    }
-    for (i = 0U; i < unit_count; ++i) {
-        cheng_seed_plan_add_path(out->source_closure_paths,
-                         &out->source_closure_count,
-                         CHENG_MAX_PLAN_PATHS,
-                         units[i].source_path);
-    }
-    for (i = 0U; i < owner_module_count; ++i) {
-        cheng_seed_plan_add_path(out->owner_modules,
-                         &out->owner_module_count,
-                         8U,
-                         owner_modules[i].text);
-    }
-    for (i = 0U; i < import_edge_count && i < CHENG_MAX_PLAN_PATHS; ++i) {
-        out->import_edges[i] = import_edges[i];
-    }
-    out->import_edge_count = import_edge_count;
-    out->unresolved_import_count = unresolved_import_count;
-    cheng_seed_populate_runtime_requirements(out);
-    if (out->source_closure_count <= 0U) {
-        cheng_seed_plan_add_reason(out, "source_closure_missing");
-    }
-    if (out->unresolved_import_count > 0U) {
-        cheng_seed_plan_add_reason(out, "source_closure_unresolved_imports");
-    }
-    if (!out->has_compiler_top_level) {
-        cheng_seed_plan_add_reason(out, "compiler_top_level_missing");
-    }
-    if (cheng_seed_streq(out->emit_kind, "exe") && out->entry_symbol[0] == '\0') {
-        cheng_seed_plan_add_reason(out, "program_entry_symbol_missing");
-    }
-    if (cheng_seed_streq(out->emit_kind, "exe") && out->runtime_target_count <= 0U) {
-        cheng_seed_plan_add_reason(out, "runtime_targets_not_lowered");
-    }
-    if (cheng_seed_streq(out->emit_kind, "exe") &&
-        cheng_seed_target_requires_native_provider_modules(out->target_triple) &&
-        out->provider_module_count <= 0U) {
-        cheng_seed_plan_add_reason(out, "runtime_provider_modules_not_selected");
-    }
-    cheng_seed_resolve_contract_path(contract, "compiler_entry_source", compiler_entry, sizeof(compiler_entry));
-    (void)compiler_entry;
-    return true;
-}
-
-static bool cheng_seed_compiler_legacy_build(int argc,
-                                     char **argv,
-                                     const ChengSeedBootstrapContract *contract,
-                                     const char *package_id_hint,
-                                     const char *entry_module_override,
-                                     const char *channel_override,
-                                     ChengSeedSystemLinkPlanStub *plan_out,
-                                     ChengSeedCompilerLegacyMigration *migration,
-                                     ChengSeedCompilerWorldArtifacts *world) {
-    const char *legacy_source_path = cheng_seed_flag_value(argc, argv, "--legacy-in");
-    const char *package_root_flag = cheng_seed_flag_value(argc, argv, "--root");
-    const char *channel = channel_override;
-    char package_root[PATH_MAX];
-    char workspace_root[PATH_MAX];
-    char package_id[PATH_MAX];
-    ChengSeedPlanPath seen[CHENG_MAX_PLAN_PATHS];
-    size_t seen_len = 0U;
-    ChengSeedCompilerLegacySourceUnit units[CHENG_MAX_PLAN_PATHS];
-    size_t unit_count = 0U;
-    ChengSeedPlanPath owner_modules[8];
-    size_t owner_module_count = 0U;
-    ChengSeedPlanImportEdge import_edges[CHENG_MAX_PLAN_PATHS];
-    size_t import_edge_count = 0U;
-    size_t unresolved_import_count = 0U;
-    ChengSeedPlanPath applied_rules[CHENG_MAX_PLAN_PATHS];
-    size_t applied_rule_len = 0U;
-    int32_t applied_rule_count = 0;
-    ChengSeedSystemLinkPlanStub plan;
-    ChengSeedCompilerSourceOverride overrides[CHENG_MAX_PLAN_PATHS];
-    size_t i;
-    char *legacy_texts[CHENG_MAX_PLAN_PATHS];
-    char *migrated_texts[CHENG_MAX_PLAN_PATHS];
-    ChengSeedCid32 legacy_source_bundle_cid;
-    ChengSeedCid32 migrated_source_bundle_cid;
-    ChengSeedByteBuf mig_buf;
-    if (!legacy_source_path || *legacy_source_path == '\0') {
-        fprintf(stderr, "cheng compiler migration: missing --legacy-in\n");
-        return false;
-    }
-    memset(units, 0, sizeof(units));
-    memset(migration, 0, sizeof(*migration));
-    memset(world, 0, sizeof(*world));
-    cheng_seed_resolve_effective_package_root(contract,
-                                      package_root_flag,
-                                      legacy_source_path,
-                                      package_root,
-                                      sizeof(package_root));
-    cheng_seed_workspace_root_from_package_root(package_root, workspace_root, sizeof(workspace_root));
-    if (package_id_hint && *package_id_hint != '\0') {
-        cheng_seed_copy_text(package_id, sizeof(package_id), package_id_hint);
-    } else {
-        cheng_seed_package_id_from_root(package_root, package_id, sizeof(package_id));
-    }
-    if (!cheng_seed_compiler_legacy_collect_closure(workspace_root,
-                                            package_root,
-                                            package_id,
-                                            legacy_source_path,
-                                            entry_module_override ? entry_module_override : "",
-                                            seen,
-                                            &seen_len,
-                                            units,
-                                            &unit_count,
-                                            owner_modules,
-                                            &owner_module_count,
-                                            import_edges,
-                                            &import_edge_count,
-                                            &unresolved_import_count,
-                                            applied_rules,
-                                            &applied_rule_len,
-                                            &applied_rule_count)) {
-        cheng_seed_compiler_legacy_units_free(units, unit_count);
-        return false;
-    }
-    for (i = 0U; i < unit_count; ++i) {
-        legacy_texts[i] = units[i].legacy_text;
-        migrated_texts[i] = units[i].migrated_text;
-        snprintf(overrides[i].source_path, sizeof(overrides[i].source_path), "%s", units[i].source_path);
-        snprintf(overrides[i].module_path, sizeof(overrides[i].module_path), "%s", units[i].module_path);
-        overrides[i].text = units[i].migrated_text;
-    }
-    if (!cheng_seed_compiler_source_bundle_cid_from_texts(package_id,
-                                                  seen,
-                                                  legacy_texts,
-                                                  unit_count,
-                                                  &legacy_source_bundle_cid) ||
-        !cheng_seed_compiler_source_bundle_cid_from_texts(package_id,
-                                                  seen,
-                                                  migrated_texts,
-                                                  unit_count,
-                                                  &migrated_source_bundle_cid)) {
-        fprintf(stderr, "cheng compiler migration: failed to hash legacy bundle\n");
-        cheng_seed_compiler_legacy_units_free(units, unit_count);
-        return false;
-    }
-    if (!cheng_seed_compiler_legacy_build_plan(contract,
-                                       argc,
-                                       argv,
-                                       package_root,
-                                       package_id,
-                                       units,
-                                       unit_count,
-                                       owner_modules,
-                                       owner_module_count,
-                                       import_edges,
-                                       import_edge_count,
-                                       unresolved_import_count,
-                                       &plan)) {
-        cheng_seed_compiler_legacy_units_free(units, unit_count);
-        return false;
-    }
-    if (!channel || *channel == '\0') {
-        channel = cheng_seed_flag_value(argc, argv, "--channel");
-    }
-    if (!cheng_seed_build_compiler_world_artifacts_with_overrides(&plan,
-                                                          channel ? channel : "",
-                                                          "",
-                                                          "",
-                                                          "",
-                                                          overrides,
-                                                          unit_count,
-                                                          world)) {
-        cheng_seed_compiler_legacy_units_free(units, unit_count);
-        return false;
-    }
-    cheng_seed_copy_text(migration->package_id, sizeof(migration->package_id), package_id);
-    cheng_seed_copy_text(migration->entry_source_path, sizeof(migration->entry_source_path), legacy_source_path);
-    cheng_seed_copy_text(migration->entry_module_path, sizeof(migration->entry_module_path), units[0].module_path);
-    migration->unit_count = unit_count;
-    migration->applied_rule_count = applied_rule_count;
-    for (i = 0U; i < applied_rule_len; ++i) {
-        snprintf(migration->applied_rules[i].text, sizeof(migration->applied_rules[i].text), "%s", applied_rules[i].text);
-    }
-    migration->legacy_source_bundle_cid = legacy_source_bundle_cid;
-    migration->migrated_source_bundle_cid = migrated_source_bundle_cid;
-    cheng_seed_bytebuf_init(&mig_buf, 256U);
-    cheng_seed_bytebuf_append_text(&mig_buf, "cheng.compiler.legacy_migration");
-    cheng_seed_bytebuf_append_text(&mig_buf, package_id);
-    cheng_seed_bytebuf_append_text(&mig_buf, legacy_source_path);
-    cheng_seed_bytebuf_append_cid(&mig_buf, legacy_source_bundle_cid);
-    cheng_seed_bytebuf_append_cid(&mig_buf, migrated_source_bundle_cid);
-    cheng_seed_bytebuf_append_cid(&mig_buf, world->canonical_graph_cid);
-    cheng_seed_bytebuf_append_cid(&mig_buf, world->surface_cid);
-    cheng_seed_bytebuf_append_u32_be(&mig_buf, (uint32_t)applied_rule_len);
-    for (i = 0U; i < applied_rule_len; ++i) {
-        cheng_seed_bytebuf_append_text(&mig_buf, applied_rules[i].text);
-    }
-    migration->migration_cid = cheng_seed_cid_from_bytebuf(&mig_buf);
-    cheng_seed_bytebuf_free(&mig_buf);
-    if (plan_out) {
-        *plan_out = plan;
-    }
-    cheng_seed_compiler_legacy_units_free(units, unit_count);
-    return true;
-}
-
-static char *cheng_seed_compiler_legacy_migration_report(const ChengSeedCompilerLegacyMigration *migration,
-                                                 const ChengSeedCompilerWorldArtifacts *world) {
-    size_t cap = 4096U + migration->unit_count * PATH_MAX;
-    size_t used = 0U;
-    size_t i;
-    char *out = (char *)cheng_seed_xmalloc(cap);
-    char line[PATH_MAX * 2];
-    out[0] = '\0';
-    cheng_seed_report_append(&out, &cap, &used, "version=1");
-    snprintf(line, sizeof(line), "package_id=%s", migration->package_id);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    snprintf(line, sizeof(line), "entry_source_path=%s", migration->entry_source_path);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    snprintf(line, sizeof(line), "entry_module_path=%s", migration->entry_module_path);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    snprintf(line, sizeof(line), "unit_count=%zu", migration->unit_count);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    snprintf(line, sizeof(line), "applied_rule_count=%d", migration->applied_rule_count);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    snprintf(line, sizeof(line), "legacy_source_bundle_cid=%s", migration->legacy_source_bundle_cid.hex);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    snprintf(line, sizeof(line), "migrated_source_bundle_cid=%s", migration->migrated_source_bundle_cid.hex);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    snprintf(line, sizeof(line), "canonical_graph_cid=%s", world->canonical_graph_cid.hex);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    snprintf(line, sizeof(line), "graph_cid=%s", world->graph_cid.hex);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    snprintf(line, sizeof(line), "surface_cid=%s", world->surface_cid.hex);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    snprintf(line, sizeof(line), "migration_cid=%s", migration->migration_cid.hex);
-    cheng_seed_report_append(&out, &cap, &used, line);
-    for (i = 0U; i < CHENG_MAX_PLAN_PATHS; ++i) {
-        if (migration->applied_rules[i].text[0] == '\0') {
-            continue;
-        }
-        snprintf(line, sizeof(line), "applied_rule[%zu]=%s", i, migration->applied_rules[i].text);
-        cheng_seed_report_append(&out, &cap, &used, line);
-    }
-    return out;
-}
-
-static bool cheng_seed_compiler_write_legacy_artifacts(const char *prefix,
-                                               const char *migration_report,
-                                               const char *csg_report,
-                                               const char *surface_report,
-                                               const char *receipt_report) {
-    if (!prefix || *prefix == '\0') {
-        return true;
-    }
-    return cheng_seed_write_world_bundle_text(prefix, ".migration.txt", migration_report) &&
-           cheng_seed_write_world_bundle_text(prefix, ".migration.csg.txt", csg_report) &&
-           cheng_seed_write_world_bundle_text(prefix, ".migration.surface.txt", surface_report) &&
-           cheng_seed_write_world_bundle_text(prefix, ".migration.receipt.txt", receipt_report);
-}
-
-static bool cheng_seed_compiler_migration_receipt_report(const ChengSeedCompilerWorldArtifacts *baseline_world,
-                                                 const ChengSeedSystemLinkPlanStub *plan,
-                                                 const ChengSeedCompilerWorldArtifacts *migration_world,
-                                                 const char *bootstrap_stage,
-                                                 ChengSeedCid32 *receipt_cid_out,
-                                                 char **report_out) {
-    ChengSeedCid32 output_digest_cid = cheng_seed_compiler_output_digest_cid(plan, migration_world->graph_cid);
-    ChengSeedCid32 canonical_output_digest_cid = cheng_seed_compiler_output_digest_cid(plan, migration_world->canonical_graph_cid);
-    ChengSeedCid32 receipt_cid = cheng_seed_compiler_receipt_cid(baseline_world->world_head_cid,
-                                                  migration_world->graph_cid,
-                                                  migration_world->canonical_graph_cid,
-                                                  plan,
-                                                  output_digest_cid,
-                                                  bootstrap_stage ? bootstrap_stage : "stage3_local",
-                                                  canonical_output_digest_cid);
-    *receipt_cid_out = receipt_cid;
-    *report_out = cheng_seed_compiler_receipt_report(baseline_world->world_head_cid,
-                                             migration_world->graph_cid,
-                                             migration_world->canonical_graph_cid,
-                                             plan,
-                                             output_digest_cid,
-                                             bootstrap_stage ? bootstrap_stage : "stage3_local",
-                                             canonical_output_digest_cid,
-                                             receipt_cid);
-    return true;
-}
-
-static bool cheng_seed_compiler_migration_proof_from_reports(const ChengSeedSystemLinkPlanStub *plan,
-                                                     const ChengSeedCompilerWorldArtifacts *baseline_world,
-                                                     const ChengSeedCompilerWorldArtifacts *migration_world,
-                                                     ChengSeedCompilerEquivalenceProof *out,
-                                                     char **migration_receipt_report_out) {
-    ChengSeedCid32 baseline_graph_cid;
-    ChengSeedCid32 migrated_graph_cid;
-    ChengSeedCid32 baseline_surface_cid;
-    ChengSeedCid32 migrated_surface_cid;
-    ChengSeedCid32 baseline_receipt_cid;
-    ChengSeedCid32 migrated_receipt_cid;
-    char target_triple[128];
-    int32_t graph_equivalent = 0;
-    int32_t export_surface_compatible = 0;
-    int32_t compile_receipt_equivalent = 0;
-    if (!cheng_seed_compiler_migration_receipt_report(baseline_world,
-                                              plan,
-                                              migration_world,
-                                              "stage3_local",
-                                              &migrated_receipt_cid,
-                                              migration_receipt_report_out)) {
-        return false;
-    }
-    if (!cheng_seed_compiler_equivalence_graph_compare_reports(baseline_world->csg_report,
-                                                       migration_world->csg_report,
-                                                       &baseline_graph_cid,
-                                                       &migrated_graph_cid,
-                                                       &graph_equivalent)) {
-        return false;
-    }
-    if (!cheng_seed_compiler_equivalence_surface_compare_reports(baseline_world->surface_report,
-                                                         migration_world->surface_report,
-                                                         &baseline_surface_cid,
-                                                         &migrated_surface_cid,
-                                                         &export_surface_compatible)) {
-        return false;
-    }
-    if (!cheng_seed_compiler_equivalence_receipt_compare_reports(baseline_world->receipt_report,
-                                                         *migration_receipt_report_out,
-                                                         &baseline_receipt_cid,
-                                                         &migrated_receipt_cid,
-                                                         target_triple,
-                                                         sizeof(target_triple),
-                                                         &compile_receipt_equivalent)) {
-        return false;
-    }
-    return cheng_seed_compiler_equivalence_proof_make(plan->package_id,
-                                              baseline_world->channel,
-                                              baseline_graph_cid,
-                                              migrated_graph_cid,
-                                              baseline_surface_cid,
-                                              migrated_surface_cid,
-                                              baseline_receipt_cid,
-                                              migrated_receipt_cid,
-                                              target_triple,
-                                              graph_equivalent,
-                                              export_surface_compatible,
-                                              compile_receipt_equivalent,
-                                              out);
-}
-
-static bool cheng_seed_compiler_proof_mode_from_args(int argc,
-                                             char **argv,
-                                             bool required,
-                                             bool *enabled_out,
-                                             char *mode_out,
-                                             size_t mode_cap) {
-    bool equivalence_enabled = false;
-    bool migration_enabled = false;
-    const char *legacy_in = cheng_seed_flag_value(argc, argv, "--legacy-in");
-    if (!cheng_seed_compiler_equivalence_inputs_ready(argc, argv, false, &equivalence_enabled)) {
-        return false;
-    }
-    migration_enabled = legacy_in && *legacy_in != '\0';
-    if (equivalence_enabled && migration_enabled) {
-        fprintf(stderr, "cheng compiler proof: choose either --legacy-in or --baseline-csg/--baseline-surface/--baseline-receipt\n");
-        return false;
-    }
-    if (required && !equivalence_enabled && !migration_enabled) {
-        fprintf(stderr, "cheng compiler proof: stable requires --legacy-in or --baseline-csg/--baseline-surface/--baseline-receipt\n");
-        return false;
-    }
-    *enabled_out = equivalence_enabled || migration_enabled;
-    cheng_seed_copy_text(mode_out, mode_cap, migration_enabled ? "migration" : (equivalence_enabled ? "equivalence" : ""));
-    return true;
-}
 
 static bool cheng_seed_build_compiler_world_artifacts_with_overrides(const ChengSeedSystemLinkPlanStub *plan,
                                                              const char *channel_raw,
@@ -62772,7 +61783,7 @@ static char *cheng_seed_system_link_plan_report(const ChengSeedBootstrapContract
     cheng_seed_report_append(&out, &cap, &used, "parser_source_kind=ordinary_cheng_source");
     snprintf(line, sizeof(line), "build_entry=%s", compiler_entry);
     cheng_seed_report_append(&out, &cap, &used, line);
-    cheng_seed_report_append(&out, &cap, &used, "build_source_unit_count=31");
+    cheng_seed_report_append(&out, &cap, &used, "build_source_unit_count=33");
     cheng_seed_report_append(&out, &cap, &used, "link_mode=system_link");
     cheng_seed_report_append(&out, &cap, &used, "pipeline_stage=parser_to_system_link_plan");
     return out;
@@ -63380,12 +62391,18 @@ static void cheng_seed_restore_env_value(const char *key,
 static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     ChengSeedBootstrapPaths paths;
     char lock_path[PATH_MAX];
+    char build_root[PATH_MAX];
+    char build_dir[PATH_MAX];
+    char build_name[64];
     char log_path[PATH_MAX];
     char report_path[PATH_MAX];
     char compile_report_path[PATH_MAX];
     char status_log[PATH_MAX];
     char plan_log[PATH_MAX];
     char reference_plan_log[PATH_MAX];
+    char verify_export_dir[PATH_MAX];
+    char verify_export_log[PATH_MAX];
+    char verify_export_parallel_log[PATH_MAX];
     char package_root[PATH_MAX];
     char smoke_src[PATH_MAX];
     char smoke_bin[PATH_MAX];
@@ -63411,13 +62428,18 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     char saved_progress[64];
     char saved_process_max_rss[64];
     char saved_backend_driver_handoff[64];
+    char saved_verify_export_dir[PATH_MAX];
     char *run_argv[2];
     char *report_text = NULL;
     const char *target;
+    const char *compile_compiler;
     const char *reference_compiler;
     const char *reference_plan_step;
+    bool backend_driver_ready_now;
+    bool compile_with_backend_driver;
     bool reference_plan_check;
     bool default_target_request;
+    bool require_rebuild;
     bool lock_held = false;
     bool build_env_pushed = false;
     bool had_incremental = false;
@@ -63428,17 +62450,25 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     bool had_progress = false;
     bool had_process_max_rss = false;
     bool had_backend_driver_handoff = false;
+    bool had_verify_export_dir = false;
     int rc = 1;
     int status = 0;
     cheng_seed_bootstrap_paths_init(&paths);
+    build_root[0] = '\0';
+    build_dir[0] = '\0';
+    build_name[0] = '\0';
     candidate_out[0] = '\0';
     candidate_build_out[0] = '\0';
     backend_driver_map[0] = '\0';
     candidate_out_map[0] = '\0';
     candidate_build_out_map[0] = '\0';
     reference_compiler = NULL;
+    compile_compiler = NULL;
     reference_plan_step = "";
+    backend_driver_ready_now = false;
+    compile_with_backend_driver = false;
     reference_plan_check = false;
+    require_rebuild = cheng_seed_flag_present(argc, argv, "--require-rebuild");
     target = cheng_seed_flag_value(argc, argv, "--target");
     if (target == NULL || *target == '\0') {
         target = paths.target;
@@ -63448,36 +62478,37 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
         return 1;
     }
     cheng_seed_join_path(lock_path, sizeof(lock_path), paths.root, "artifacts/backend_driver/.build_backend_driver.lock");
-    if (!cheng_seed_acquire_pid_lock(lock_path, &lock_held, cheng_seed_backend_driver_ready_check, &paths, "build-backend-driver")) {
-        return 1;
-    }
-    if (default_target_request && cheng_seed_backend_driver_ready(&paths)) {
+    backend_driver_ready_now = cheng_seed_backend_driver_ready(&paths);
+    if (default_target_request && backend_driver_ready_now && !require_rebuild) {
         rc = 0;
         goto done;
     }
     if (!cheng_seed_bootstrap_artifacts_fresh(&paths) && cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
         goto done;
     }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/backend_driver/build_backend_driver.log");
+    cheng_seed_join_path(build_root, sizeof(build_root), paths.root, "artifacts/backend_driver/builds");
+    snprintf(build_name, sizeof(build_name), "pid-%ld", (long)getpid());
+    cheng_seed_join_path(build_dir, sizeof(build_dir), build_root, build_name);
+    if (!cheng_seed_mkdir_p(build_dir)) {
+        goto done;
+    }
+    cheng_seed_join_path(log_path, sizeof(log_path), build_dir, "build_backend_driver.log");
     cheng_seed_join_path(report_path, sizeof(report_path), paths.root, "artifacts/backend_driver/build_backend_driver.report.txt");
-    cheng_seed_join_path(compile_report_path, sizeof(compile_report_path), paths.root, "artifacts/backend_driver/build_backend_driver.compile.report.txt");
-    cheng_seed_join_path(status_log, sizeof(status_log), paths.root, "artifacts/backend_driver/build_backend_driver.status.txt");
-    cheng_seed_join_path(plan_log, sizeof(plan_log), paths.root, "artifacts/backend_driver/build_backend_driver.plan.txt");
-    cheng_seed_join_path(reference_plan_log,
-                 sizeof(reference_plan_log),
-                 paths.root,
-                 "artifacts/backend_driver/reference_backend_driver.plan.txt");
+    cheng_seed_join_path(compile_report_path, sizeof(compile_report_path), build_dir, "build_backend_driver.compile.report.txt");
+    cheng_seed_join_path(status_log, sizeof(status_log), build_dir, "build_backend_driver.status.txt");
+    cheng_seed_join_path(plan_log, sizeof(plan_log), build_dir, "build_backend_driver.plan.txt");
+    cheng_seed_join_path(reference_plan_log, sizeof(reference_plan_log), build_dir, "reference_backend_driver.plan.txt");
+    cheng_seed_join_path(verify_export_dir, sizeof(verify_export_dir), build_dir, "verify_export_visibility");
+    cheng_seed_join_path(verify_export_log, sizeof(verify_export_log), build_dir, "build_backend_driver.verify_export_visibility.txt");
+    cheng_seed_join_path(verify_export_parallel_log, sizeof(verify_export_parallel_log), build_dir, "build_backend_driver.verify_export_visibility_parallel.txt");
     cheng_seed_copy_text(package_root, sizeof(package_root), paths.root);
     cheng_seed_join_path(smoke_src, sizeof(smoke_src), paths.root, "src/tests/ordinary_zero_exit_fixture.cheng");
-    cheng_seed_join_path(smoke_bin, sizeof(smoke_bin), paths.root, "artifacts/backend_driver/ordinary_zero_exit_fixture.selftest");
+    cheng_seed_join_path(smoke_bin, sizeof(smoke_bin), build_dir, "ordinary_zero_exit_fixture.selftest");
     snprintf(smoke_report_path, sizeof(smoke_report_path), "%s.report.txt", smoke_bin);
-    cheng_seed_join_path(smoke_compile_log, sizeof(smoke_compile_log), paths.root, "artifacts/backend_driver/ordinary_zero_exit_fixture.selftest.compile.log");
-    cheng_seed_join_path(smoke_run_log, sizeof(smoke_run_log), paths.root, "artifacts/backend_driver/ordinary_zero_exit_fixture.selftest.run.log");
-    snprintf(candidate_out, sizeof(candidate_out), "%s.next", paths.backend_driver_out);
-    cheng_seed_join_path(candidate_build_out,
-                 sizeof(candidate_build_out),
-                 paths.root,
-                 "artifacts/backend_driver/cheng.build_candidate");
+    snprintf(smoke_compile_log, sizeof(smoke_compile_log), "%s.compile.log", smoke_bin);
+    snprintf(smoke_run_log, sizeof(smoke_run_log), "%s.run.log", smoke_bin);
+    cheng_seed_join_path(candidate_out, sizeof(candidate_out), build_dir, "cheng.next");
+    cheng_seed_join_path(candidate_build_out, sizeof(candidate_build_out), build_dir, "cheng.build_candidate");
     snprintf(backend_driver_map, sizeof(backend_driver_map), "%s.map", paths.backend_driver_out);
     snprintf(candidate_out_map, sizeof(candidate_out_map), "%s.map", candidate_out);
     snprintf(candidate_build_out_map, sizeof(candidate_build_out_map), "%s.map", candidate_build_out);
@@ -63485,12 +62516,18 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     unlink(candidate_build_out);
     unlink(candidate_out_map);
     unlink(candidate_build_out_map);
+    backend_driver_ready_now = cheng_seed_backend_driver_ready(&paths);
     reference_plan_check = false;
-    if (cheng_seed_backend_driver_ready(&paths)) {
+    if (backend_driver_ready_now) {
         reference_compiler = paths.backend_driver_out;
         reference_plan_step = "build-backend-driver reference-backend-driver";
         reference_plan_check = true;
     }
+    compile_with_backend_driver = cheng_seed_backend_driver_available_for_build(&paths);
+    if (cheng_seed_progress_truthy(getenv("CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED"))) {
+        compile_with_backend_driver = false;
+    }
+    compile_compiler = compile_with_backend_driver ? paths.backend_driver_out : paths.stage3;
 
     cheng_seed_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
     cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_module_cache, sizeof(saved_multi_module_cache), &had_multi_module_cache);
@@ -63500,6 +62537,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     cheng_seed_save_env_value("CHENG_PROGRESS", saved_progress, sizeof(saved_progress), &had_progress);
     cheng_seed_save_env_value("CHENG_PROCESS_MAX_RSS_BYTES", saved_process_max_rss, sizeof(saved_process_max_rss), &had_process_max_rss);
     cheng_seed_save_env_value("CHENG_NO_BACKEND_DRIVER_HANDOFF", saved_backend_driver_handoff, sizeof(saved_backend_driver_handoff), &had_backend_driver_handoff);
+    cheng_seed_save_env_value("CHENG_VERIFY_EXPORT_VISIBILITY_DIR", saved_verify_export_dir, sizeof(saved_verify_export_dir), &had_verify_export_dir);
     setenv("BACKEND_INCREMENTAL", "0", 1);
     setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
     setenv("CHENG_DISABLE_PRIMARY_OBJECT_CACHE", "1", 1);
@@ -63508,6 +62546,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     setenv("CHENG_PROGRESS", "1", 1);
     setenv("CHENG_PROCESS_MAX_RSS_BYTES", cheng_seed_build_backend_driver_max_rss_bytes_text(), 1);
     setenv("CHENG_NO_BACKEND_DRIVER_HANDOFF", "1", 1);
+    setenv("CHENG_VERIFY_EXPORT_VISIBILITY_DIR", verify_export_dir, 1);
     build_env_pushed = true;
 
     snprintf(root_flag, sizeof(root_flag), "--root:%s", package_root);
@@ -63516,18 +62555,58 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     snprintf(candidate_flag, sizeof(candidate_flag), "--out:%s", candidate_build_out);
     snprintf(report_flag, sizeof(report_flag), "--report-out:%s", compile_report_path);
     unlink(compile_report_path);
-    if (!cheng_seed_run_command_logged_argv_live(8U,
-                                    (const char *[8]){ paths.stage3,
-                                                       "system-link-exec",
-                                                       root_flag,
-                                                       in_flag,
-                                                       "--emit:exe",
-                                                       target_flag,
-                                                       candidate_flag,
-                                                       report_flag },
-                                    log_path,
-                                    "build-backend-driver compile")) {
-        goto done;
+    if (compile_with_backend_driver) {
+        if (!cheng_seed_run_command_logged_argv_live(8U,
+                                            (const char *[8]){ compile_compiler,
+                                                               "system-link-exec",
+                                                               root_flag,
+                                                               in_flag,
+                                                               "--emit:exe",
+                                                               target_flag,
+                                                               candidate_flag,
+                                                               report_flag },
+                                            log_path,
+                                            "build-backend-driver compile-pure-cheng-driver")) {
+            goto done;
+        }
+    } else {
+        if (!cheng_seed_run_internal_command_logged_argv_live(cheng_seed_cmd_system_link_exec,
+                                                      8U,
+                                                      (const char *[8]){ compile_compiler,
+                                                                         "system-link-exec",
+                                                                         root_flag,
+                                                                         in_flag,
+                                                                         "--emit:exe",
+                                                                         target_flag,
+                                                                         candidate_flag,
+                                                                         report_flag },
+                                                      log_path,
+                                                      "build-backend-driver compile-c-seed-bootstrap")) {
+            goto done;
+        }
+    }
+    if (compile_with_backend_driver && access(compile_report_path, R_OK) != 0) {
+        report_text = (char *)cheng_seed_xmalloc(4096U);
+        snprintf(report_text,
+                 4096U,
+                 "compile_report_kind=minimal_seed_receipt\n"
+                 "compile_report_reason=defer_full_report_until_candidate_driver\n"
+                 "target=%s\n"
+                 "current_compiler=%s\n"
+                 "compiler_executor=pure_cheng_backend_driver\n"
+                 "materialized_source=%s\n"
+                 "candidate_output=%s\n",
+                 target,
+                 compile_compiler,
+                 paths.backend_driver_entry_source,
+                 candidate_build_out);
+        if (!cheng_seed_write_text_file(compile_report_path, report_text)) {
+            fprintf(stderr, "[cheng_seed] build-backend-driver failed to write minimal compile report: %s\n",
+                    compile_report_path);
+            goto done;
+        }
+        free(report_text);
+        report_text = NULL;
     }
     if (access(candidate_build_out, X_OK) != 0) {
         fprintf(stderr, "[cheng_seed] build-backend-driver missing candidate output: %s\n", candidate_build_out);
@@ -63566,11 +62645,13 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
              4096U,
              "target=%s\n"
              "current_compiler=%s\n"
+             "compiler_executor=%s\n"
              "materialized_source=%s\n"
              "candidate_output=%s\n"
              "compile_report=%s\n",
              target,
-             paths.stage3,
+             compile_compiler,
+             compile_with_backend_driver ? "pure_cheng_backend_driver" : "c_seed_bootstrap_internal",
              paths.backend_driver_entry_source,
              candidate_build_out,
              compile_report_path);
@@ -63588,18 +62669,17 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
         goto done;
     }
 
-    {
-        char verify_export_log[PATH_MAX];
-        cheng_seed_join_path(verify_export_log,
-                     sizeof(verify_export_log),
-                     paths.root,
-                     "artifacts/backend_driver/build_backend_driver.verify_export_visibility.txt");
-        if (!cheng_seed_run_command_logged_argv_live(2U,
-                                        (const char *[2]){ candidate_out, "verify-export-visibility" },
-                                        verify_export_log,
-                                        "build-backend-driver verify-export-visibility")) {
-            goto done;
-        }
+    if (!cheng_seed_run_command_logged_argv_live(2U,
+                                    (const char *[2]){ candidate_out, "verify-export-visibility" },
+                                    verify_export_log,
+                                    "build-backend-driver verify-export-visibility")) {
+        goto done;
+    }
+    if (!cheng_seed_run_command_logged_argv_live(2U,
+                                    (const char *[2]){ candidate_out, "verify-export-visibility-parallel" },
+                                    verify_export_parallel_log,
+                                    "build-backend-driver candidate verify-export-visibility-parallel")) {
+        goto done;
     }
 
     if (!cheng_seed_run_command_logged_argv_live(3U,
@@ -63659,6 +62739,9 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
         fprintf(stderr, "[cheng_seed] build-backend-driver zero-exit smoke failed log=%s\n", smoke_run_log);
         goto done;
     }
+    if (!cheng_seed_acquire_pid_lock(lock_path, &lock_held, NULL, NULL, "build-backend-driver install")) {
+        goto done;
+    }
     if (rename(candidate_out, paths.backend_driver_out) != 0) {
         perror("rename");
         fprintf(stderr, "[cheng_seed] build-backend-driver failed to install candidate: %s\n",
@@ -63670,19 +62753,6 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
         fprintf(stderr, "[cheng_seed] build-backend-driver failed to install candidate map: %s\n",
                 backend_driver_map);
         goto done;
-    }
-    {
-        char verify_export_parallel_log[PATH_MAX];
-        cheng_seed_join_path(verify_export_parallel_log,
-                     sizeof(verify_export_parallel_log),
-                     paths.root,
-                     "artifacts/backend_driver/build_backend_driver.verify_export_visibility_parallel.txt");
-        if (!cheng_seed_run_command_logged_argv_live(2U,
-                                        (const char *[2]){ paths.backend_driver_out, "verify-export-visibility-parallel" },
-                                        verify_export_parallel_log,
-                                        "build-backend-driver installed verify-export-visibility-parallel")) {
-            goto done;
-        }
     }
 
     report_text = (char *)cheng_seed_xmalloc(12288U);
@@ -63703,6 +62773,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
              "candidate_output=%s\n"
              "output=%s\n"
              "status_log=%s\n"
+             "verify_export_visibility_log=%s\n"
              "verify_export_visibility_parallel_log=%s\n"
              "plan_log=%s\n"
              "reference_plan_log=%s\n"
@@ -63725,7 +62796,8 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
              candidate_build_out,
              paths.backend_driver_out,
              status_log,
-             "artifacts/backend_driver/build_backend_driver.verify_export_visibility_parallel.txt",
+             verify_export_log,
+             verify_export_parallel_log,
              plan_log,
              reference_plan_log,
              log_path,
@@ -63750,6 +62822,7 @@ done:
         cheng_seed_restore_env_value("CHENG_PROCESS_MAX_RSS_BYTES", saved_process_max_rss, had_process_max_rss);
         cheng_seed_restore_env_value("CHENG_PROGRESS", saved_progress, had_progress);
         cheng_seed_restore_env_value("CHENG_NO_BACKEND_DRIVER_HANDOFF", saved_backend_driver_handoff, had_backend_driver_handoff);
+        cheng_seed_restore_env_value("CHENG_VERIFY_EXPORT_VISIBILITY_DIR", saved_verify_export_dir, had_verify_export_dir);
     }
     if (rc != 0 && candidate_out[0] != '\0') {
         unlink(candidate_out);
@@ -63770,44 +62843,9 @@ done:
     return rc;
 }
 
-typedef int (*ChengSeedSeedCommandFn)(int argc, char **argv);
 
 static bool cheng_seed_text_contains_substring(const char *text, const char *needle) {
     return text != NULL && needle != NULL && strstr(text, needle) != NULL;
-}
-
-static bool cheng_seed_text_has_line(const char *text, const char *line) {
-    size_t want_len = strlen(line);
-    const char *cursor = text;
-    if (text == NULL || line == NULL) {
-        return false;
-    }
-    while (cursor != NULL && *cursor != '\0') {
-        const char *end = strchr(cursor, '\n');
-        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
-        if (len == want_len && strncmp(cursor, line, want_len) == 0) {
-            return true;
-        }
-        cursor = end != NULL ? end + 1 : NULL;
-    }
-    return false;
-}
-
-static bool cheng_seed_text_has_line_with_prefix(const char *text, const char *prefix) {
-    size_t prefix_len = strlen(prefix);
-    const char *cursor = text;
-    if (text == NULL || prefix == NULL) {
-        return false;
-    }
-    while (cursor != NULL && *cursor != '\0') {
-        const char *end = strchr(cursor, '\n');
-        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
-        if (len >= prefix_len && strncmp(cursor, prefix, prefix_len) == 0) {
-            return true;
-        }
-        cursor = end != NULL ? end + 1 : NULL;
-    }
-    return false;
 }
 
 static const char *CHENG_UNUSED cheng_seed_text_after_marker(const char *text, const char *marker) {
@@ -63820,38 +62858,6 @@ static const char *CHENG_UNUSED cheng_seed_text_after_marker(const char *text, c
         return NULL;
     }
     return hit + strlen(marker);
-}
-
-static bool cheng_seed_expect_text_has_line(const char *label, const char *text, const char *line) {
-    if (cheng_seed_text_has_line(text, line)) {
-        return true;
-    }
-    fprintf(stderr, "[cheng_seed] %s missing line: %s\n", label, line);
-    return false;
-}
-
-static bool cheng_seed_expect_text_has_prefix(const char *label, const char *text, const char *prefix) {
-    if (cheng_seed_text_has_line_with_prefix(text, prefix)) {
-        return true;
-    }
-    fprintf(stderr, "[cheng_seed] %s missing line prefix: %s\n", label, prefix);
-    return false;
-}
-
-static bool cheng_seed_expect_text_contains(const char *label, const char *text, const char *needle) {
-    if (cheng_seed_text_contains_substring(text, needle)) {
-        return true;
-    }
-    fprintf(stderr, "[cheng_seed] %s missing text: %s\n", label, needle);
-    return false;
-}
-
-static bool cheng_seed_expect_text_not_contains(const char *label, const char *text, const char *needle) {
-    if (!cheng_seed_text_contains_substring(text, needle)) {
-        return true;
-    }
-    fprintf(stderr, "[cheng_seed] %s unexpected text: %s\n", label, needle);
-    return false;
 }
 
 static bool cheng_seed_text_line_value(const char *text,
@@ -63883,14 +62889,6 @@ static bool cheng_seed_text_line_value(const char *text,
         }
         cursor = end != NULL ? end + 1 : NULL;
     }
-    return false;
-}
-
-static bool cheng_seed_expect_file_exists_nonempty(const char *label, const char *path) {
-    if (cheng_seed_path_exists_nonempty(path)) {
-        return true;
-    }
-    fprintf(stderr, "[cheng_seed] %s missing file: %s\n", label, path);
     return false;
 }
 
@@ -63947,21 +62945,6 @@ static bool cheng_seed_report_symbol_line_is_export(const char *line) {
     }
     if (cheng_seed_text_contains_substring(line, "|bind=1|") &&
         !cheng_seed_text_contains_substring(line, "|shndx=0|")) {
-        return true;
-    }
-    return false;
-}
-
-static bool cheng_seed_report_symbol_line_is_undefined(const char *line) {
-    if (line == NULL || !cheng_seed_startswith(line, "symbol[")) {
-        return false;
-    }
-    if (cheng_seed_text_contains_substring(line, "|type=0x1|") &&
-        cheng_seed_text_contains_substring(line, "|sect=0|")) {
-        return true;
-    }
-    if (cheng_seed_text_contains_substring(line, "|bind=1|") &&
-        cheng_seed_text_contains_substring(line, "|shndx=0|")) {
         return true;
     }
     return false;
@@ -64040,160 +63023,6 @@ static bool CHENG_UNUSED cheng_seed_expect_object_export_whitelist(const char *l
     return ok;
 }
 
-static bool cheng_seed_expect_object_export_contract(const char *label,
-                                             const char *object_path,
-                                             const char *const *public_exports,
-                                             size_t public_export_count,
-                                             const char *internal_prefix) {
-    char *report = NULL;
-    const char *cursor;
-    bool *seen = NULL;
-    bool ok = true;
-    size_t export_count = 0U;
-    size_t i;
-    report = cheng_seed_debug_object_report(object_path);
-    if (report == NULL) {
-        fprintf(stderr, "[cheng_seed] %s failed to inspect object: %s\n", label, object_path);
-        return false;
-    }
-    seen = (bool *)cheng_seed_xmalloc(sizeof(bool) * public_export_count);
-    memset(seen, 0, sizeof(bool) * public_export_count);
-    cursor = report;
-    while (cursor != NULL && *cursor != '\0') {
-        const char *end = strchr(cursor, '\n');
-        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
-        char line[PATH_MAX * 2];
-        size_t copy_len = len < sizeof(line) - 1U ? len : sizeof(line) - 1U;
-        memcpy(line, cursor, copy_len);
-        line[copy_len] = '\0';
-        if (cheng_seed_report_symbol_line_is_export(line)) {
-            char raw_name[PATH_MAX];
-            char normalized[PATH_MAX];
-            bool matched_public = false;
-            if (!cheng_seed_report_extract_symbol_name(line, raw_name, sizeof(raw_name))) {
-                fprintf(stderr, "[cheng_seed] %s malformed symbol line: %s\n", label, line);
-                ok = false;
-                break;
-            }
-            cheng_seed_normalize_report_symbol_name(raw_name, normalized, sizeof(normalized));
-            for (i = 0U; i < public_export_count; ++i) {
-                if (strcmp(normalized, public_exports[i]) == 0) {
-                    if (seen[i]) {
-                        fprintf(stderr, "[cheng_seed] %s duplicate export: %s\n", label, normalized);
-                        ok = false;
-                    }
-                    seen[i] = true;
-                    matched_public = true;
-                    break;
-                }
-            }
-            if (!matched_public &&
-                !(internal_prefix != NULL && internal_prefix[0] != '\0' &&
-                  cheng_seed_startswith(normalized, internal_prefix))) {
-                fprintf(stderr, "[cheng_seed] %s unexpected export: %s (%s)\n", label, normalized, object_path);
-                ok = false;
-            }
-            export_count += 1U;
-        }
-        cursor = end != NULL ? end + 1 : NULL;
-    }
-    if (ok && export_count < public_export_count) {
-        fprintf(stderr,
-                "[cheng_seed] %s export count too small: expected_at_least=%zu actual=%zu\n",
-                label,
-                public_export_count,
-                export_count);
-        ok = false;
-    }
-    for (i = 0U; i < public_export_count; ++i) {
-        if (!seen[i]) {
-            fprintf(stderr, "[cheng_seed] %s missing export: %s\n", label, public_exports[i]);
-            ok = false;
-        }
-    }
-    free(seen);
-    free(report);
-    return ok;
-}
-
-static bool cheng_seed_expect_object_undefined_whitelist(const char *label,
-                                                 const char *object_path,
-                                                 const char *const *allowed,
-                                                 size_t allowed_count) {
-    char *report = NULL;
-    const char *cursor;
-    bool *seen = NULL;
-    bool ok = true;
-    size_t undefined_count = 0U;
-    size_t i;
-    report = cheng_seed_debug_object_report(object_path);
-    if (report == NULL) {
-        fprintf(stderr, "[cheng_seed] %s failed to inspect object: %s\n", label, object_path);
-        return false;
-    }
-    seen = (bool *)cheng_seed_xmalloc(sizeof(bool) * allowed_count);
-    memset(seen, 0, sizeof(bool) * allowed_count);
-    cursor = report;
-    while (cursor != NULL && *cursor != '\0') {
-        const char *end = strchr(cursor, '\n');
-        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
-        char line[PATH_MAX * 2];
-        size_t copy_len = len < sizeof(line) - 1U ? len : sizeof(line) - 1U;
-        memcpy(line, cursor, copy_len);
-        line[copy_len] = '\0';
-        if (cheng_seed_report_symbol_line_is_undefined(line)) {
-            char raw_name[PATH_MAX];
-            bool matched = false;
-            if (!cheng_seed_report_extract_symbol_name(line, raw_name, sizeof(raw_name))) {
-                fprintf(stderr, "[cheng_seed] %s malformed symbol line: %s\n", label, line);
-                ok = false;
-                break;
-            }
-            for (i = 0U; i < allowed_count; ++i) {
-                if (strcmp(raw_name, allowed[i]) == 0) {
-                    if (seen[i]) {
-                        fprintf(stderr,
-                                "[cheng_seed] %s duplicate undefined symbol: %s\n",
-                                label,
-                                raw_name);
-                        ok = false;
-                    }
-                    seen[i] = true;
-                    matched = true;
-                    break;
-                }
-            }
-            if (!matched) {
-                fprintf(stderr,
-                        "[cheng_seed] %s unexpected undefined symbol: %s (%s)\n",
-                        label,
-                        raw_name,
-                        object_path);
-                ok = false;
-            }
-            undefined_count += 1U;
-        }
-        cursor = end != NULL ? end + 1 : NULL;
-    }
-    if (ok && undefined_count != allowed_count) {
-        fprintf(stderr,
-                "[cheng_seed] %s undefined symbol count mismatch: expected=%zu actual=%zu\n",
-                label,
-                allowed_count,
-                undefined_count);
-        ok = false;
-    }
-    for (i = 0U; i < allowed_count; ++i) {
-        if (!seen[i]) {
-            fprintf(stderr, "[cheng_seed] %s missing undefined symbol: %s\n", label, allowed[i]);
-            ok = false;
-        }
-    }
-    free(seen);
-    free(report);
-    return ok;
-}
-
 static bool cheng_seed_run_binary_capture_output(char *const argv_local[],
                                          const char *log_path,
                                          int *status_out) {
@@ -64229,146 +63058,6 @@ static bool cheng_seed_run_binary_capture_output(char *const argv_local[],
         *status_out = status;
     }
     return true;
-}
-
-static bool cheng_seed_spawn_binary_capture_output(char *const argv_local[],
-                                           const char *log_path,
-                                           pid_t *pid_out) {
-    size_t arg_count;
-    if (pid_out != NULL) {
-        *pid_out = -1;
-    }
-    if (argv_local == NULL || argv_local[0] == NULL || access(argv_local[0], X_OK) != 0) {
-        cheng_seed_write_spawn_error_log(log_path, argv_local != NULL ? argv_local[0] : "", ENOENT);
-        return false;
-    }
-    if (!cheng_seed_ensure_parent_dir(log_path)) {
-        return false;
-    }
-    arg_count = cheng_seed_argv_count(argv_local);
-    if (arg_count == 0U) {
-        return false;
-    }
-    return cheng_seed_spawn_logged_argv(arg_count, (const char **)argv_local, log_path, false, false, false, pid_out);
-}
-
-static bool cheng_seed_spawn_binary_detached_logged(char *const argv_local[],
-                                            const char *log_path,
-                                            const char *pid_path,
-                                            pid_t *pid_out) {
-    pid_t pid = -1;
-    int status = 0;
-    size_t arg_count;
-    char pid_text[64];
-    if (pid_out != NULL) {
-        *pid_out = -1;
-    }
-    if (argv_local == NULL || argv_local[0] == NULL || access(argv_local[0], X_OK) != 0) {
-        cheng_seed_write_spawn_error_log(log_path, argv_local != NULL ? argv_local[0] : "", ENOENT);
-        return false;
-    }
-    if (!cheng_seed_ensure_parent_dir(log_path) ||
-        !cheng_seed_ensure_parent_dir(pid_path)) {
-        return false;
-    }
-    arg_count = cheng_seed_argv_count(argv_local);
-    if (arg_count == 0U ||
-        !cheng_seed_spawn_logged_argv(arg_count, (const char **)argv_local, log_path, false, true, true, &pid)) {
-        return false;
-    }
-    snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)pid);
-    if (!cheng_seed_write_text_file(pid_path, pid_text)) {
-        kill(pid, SIGTERM);
-        if (!cheng_seed_waitpid_nointr(pid, &status) && errno != ECHILD) {
-            perror("waitpid");
-        }
-        return false;
-    }
-    if (pid_out != NULL) {
-        *pid_out = pid;
-    }
-    return true;
-}
-
-static void cheng_seed_kill_and_wait_pid(pid_t *pid_io) {
-    int status = 0;
-    if (pid_io == NULL || *pid_io <= 0) {
-        return;
-    }
-    kill(*pid_io, SIGTERM);
-    if (!cheng_seed_waitpid_nointr_silent(*pid_io, &status) && errno == ECHILD) {
-        status = 0;
-    }
-    *pid_io = -1;
-}
-
-static bool cheng_seed_wait_pid_success(pid_t *pid_io,
-                                const char *label,
-                                const char *log_path) {
-    int status = 0;
-    if (pid_io == NULL || *pid_io <= 0) {
-        return false;
-    }
-    if (!cheng_seed_waitpid_nointr_silent(*pid_io, &status)) {
-        perror("waitpid");
-        return false;
-    }
-    *pid_io = -1;
-    if (cheng_seed_status_is_exit_code(status, 0)) {
-        return true;
-    }
-    fprintf(stderr, "[cheng_seed] %s failed log=%s status=%d\n", label, log_path, status);
-    return false;
-}
-
-static bool cheng_seed_process_alive(pid_t pid) {
-    if (pid <= 0) {
-        return false;
-    }
-    if (kill(pid, 0) == 0 || errno == EPERM) {
-        return true;
-    }
-    return false;
-}
-
-static bool cheng_seed_read_trimmed_file_text(const char *path,
-                                      char *out,
-                                      size_t out_cap) {
-    char *text = cheng_seed_read_file(path);
-    char *trimmed;
-    if (text == NULL) {
-        return false;
-    }
-    trimmed = cheng_seed_trim_inplace(text);
-    if (*trimmed == '\0') {
-        free(text);
-        return false;
-    }
-    cheng_seed_copy_text(out, out_cap, trimmed);
-    free(text);
-    return true;
-}
-
-static bool cheng_seed_wait_ready_port_file(const char *label,
-                                    const char *ready_path,
-                                    pid_t pid,
-                                    int timeout_ms,
-                                    char *port_out,
-                                    size_t port_cap) {
-    int ticks = timeout_ms / 50;
-    int i;
-    for (i = 0; i < ticks; ++i) {
-        if (cheng_seed_path_exists_nonempty(ready_path) &&
-            cheng_seed_read_trimmed_file_text(ready_path, port_out, port_cap)) {
-            return true;
-        }
-        if (!cheng_seed_process_alive(pid)) {
-            break;
-        }
-        usleep(50000);
-    }
-    fprintf(stderr, "[cheng_seed] %s ready-file timeout: %s\n", label, ready_path);
-    return false;
 }
 
 static bool cheng_seed_status_is_exit_code(int status, int code) {
@@ -64538,15 +63227,6 @@ static bool CHENG_UNUSED cheng_seed_run_script_args_with_env(const char *root,
     return ok;
 }
 
-static bool cheng_seed_compile_host_fixture_with_backend_driver(const char *compiler_bin,
-                                                        const char *root_cheng,
-                                                        const char *src_path,
-                                                        const char *out_bin,
-                                                        const char *log_path);
-static bool cheng_seed_leaf_prepare_backend_driver(ChengSeedBootstrapPaths *paths,
-                                           char *root_cheng,
-                                           size_t root_cheng_cap);
-static const char *cheng_seed_host_target_triple(void);
 
 static int cheng_seed_exec_binary_passthrough_with_env(const char *path,
                                                size_t arg_count,
@@ -64765,1006 +63445,10 @@ static int cheng_seed_require_backend_driver_cli_passthrough(const char *cmd,
     return rc;
 }
 
-static bool cheng_seed_r2c_prepare_controller_bin(ChengSeedBootstrapPaths *paths,
-                                          char *out_bin,
-                                          size_t out_bin_cap) {
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char controller_source[PATH_MAX];
-    char controller_impl_source[PATH_MAX];
-    char path_source[PATH_MAX];
-    char program_argv_source[PATH_MAX];
-    char core_runtime_source[PATH_MAX];
-    char debug_runtime_source[PATH_MAX];
-    char program_support_source[PATH_MAX];
-    const char *inputs[8];
-    if (paths == NULL || out_bin == NULL || out_bin_cap == 0U) {
-        return false;
-    }
-    cheng_seed_bootstrap_paths_init(paths);
-    if (!cheng_seed_bootstrap_artifacts_fresh(paths) &&
-        cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        return false;
-    }
-    if (access(paths->stage3, X_OK) != 0) {
-        fprintf(stderr,
-                "[cheng_seed] missing stage3 compiler for r2c controller: %s\n",
-                paths->stage3);
-        return false;
-    }
-    cheng_seed_copy_text(root_cheng, sizeof(root_cheng), paths->root);
-    cheng_seed_join_path(out_dir,
-                 sizeof(out_dir),
-                 paths->root,
-                 "artifacts/r2c_react_controller");
-    cheng_seed_join_path(out_bin, out_bin_cap, out_dir, "cheng");
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "build.compile.log");
-    cheng_seed_join_path(controller_source,
-                 sizeof(controller_source),
-                 paths->root,
-                 "src/r2c/r2c_react.cheng");
-    cheng_seed_join_path(controller_impl_source,
-                 sizeof(controller_impl_source),
-                 paths->root,
-                 "src/r2c/r2c_react_controller_main.cheng");
-    cheng_seed_join_path(path_source,
-                 sizeof(path_source),
-                 paths->root,
-                 "src/core/tooling/path.cheng");
-    cheng_seed_join_path(program_argv_source,
-                 sizeof(program_argv_source),
-                 paths->root,
-                 "src/core/runtime/compiler_runtime_program_entry_provider.cheng");
-#if defined(__APPLE__)
-        cheng_seed_join_path(core_runtime_source,
-                     sizeof(core_runtime_source),
-                     paths->root,
-                     "src/core/runtime/core_runtime_provider_darwin.cheng");
-#else
-        cheng_seed_join_path(core_runtime_source,
-                     sizeof(core_runtime_source),
-                     paths->root,
-                     "src/core/runtime/core_runtime_provider_linux.cheng");
-#endif
-    cheng_seed_join_path(debug_runtime_source,
-                 sizeof(debug_runtime_source),
-                 paths->root,
-                 "src/core/runtime/debug_runtime_stub.cheng");
-    cheng_seed_join_path(program_support_source,
-                 sizeof(program_support_source),
-                 paths->root,
-                 "src/core/runtime/program_support_backend.cheng");
-    inputs[0] = paths->stage3;
-    inputs[1] = controller_source;
-    inputs[2] = controller_impl_source;
-    inputs[3] = path_source;
-    inputs[4] = program_argv_source;
-    inputs[5] = core_runtime_source;
-    inputs[6] = debug_runtime_source;
-    inputs[7] = program_support_source;
-    if (access(out_bin, X_OK) == 0 &&
-        cheng_seed_output_is_fresh_against_inputs(out_bin, inputs, 8U)) {
-        return true;
-    }
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        fprintf(stderr,
-                "[cheng_seed] failed to create r2c controller out-dir: %s\n",
-                out_dir);
-        return false;
-    }
-    if (!cheng_seed_compile_host_fixture_with_backend_driver(paths->stage3,
-                                                     root_cheng,
-                                                     controller_source,
-                                                     out_bin,
-                                                     compile_log)) {
-        fprintf(stderr,
-                "[cheng_seed] failed to compile r2c controller log=%s\n",
-                compile_log);
-        return false;
-    }
-    if (access(out_bin, X_OK) != 0) {
-        fprintf(stderr,
-                "[cheng_seed] missing r2c controller binary: %s\n",
-                out_bin);
-        return false;
-    }
-    return true;
-}
 
-static int cheng_seed_cmd_verify_orphan_guard_impl(int argc, char **argv);
-static int cheng_seed_cmd_verify_debug_runtime_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_host_smokes_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_stage23_libp2p_smokes_impl(int argc, char **argv);
-static int cheng_seed_cmd_r2c_react_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_zero_exit_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_panic_trace_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_bounds_trace_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_signal_trace_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_call_chain_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_ffi_handle_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_program_selfhost_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_bft_state_machine_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_browser_host_wasm_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_chain_node_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_rwad_bft_state_machine_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_chain_node_linux_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_linux_nolibc_exe_impl(int argc, char **argv);
-static int cheng_seed_cmd_build_rwad_bft_linux_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_linux_object_smokes_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_tcp_twoproc_smoke_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_quic_twoproc_smoke_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_udp_importc_smoke_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_wasm_smokes_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_browser_host_wasm_smoke_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_chain_node_cli_smoke_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_chain_node_process_smoke_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_chain_node_three_node_smoke_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_tailnet_control_smoke_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_fresh_node_selfhost_gate_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_migration_gate_impl(int argc, char **argv);
-static int cheng_seed_cmd_run_browser_webrtc_smokes_impl(int argc, char **argv);
-static bool cheng_seed_verify_runtime_fixture_output(const char *label,
-                                             const char *fixture_path,
-                                             const char *run_log_path,
-                                             const char *report_path,
-                                             const char *message_substring,
-                                             const char *reason_line,
-                                             bool require_signal_fields);
-static const char *cheng_seed_leaf_resolve_compiler_bin(int argc,
-                                                char **argv,
-                                                const char *env_primary,
-                                                const char *env_fallback,
-                                                const char *default_bin);
-static bool cheng_seed_leaf_expect_compiler(const char *label,
-                                    const char *compiler_bin);
-static size_t cheng_seed_collect_smoke_positionals(int argc,
-                                           char **argv,
-                                           const char **out,
-                                           size_t cap);
-static bool cheng_seed_run_fixture_smoke_direct(const char *suite_label,
-                                        const char *compile_label,
-                                        const char *compiler_bin,
-                                        const char *root,
-                                        const char *root_cheng,
-                                        const char *smoke_name,
-                                        const char *out_bin);
 
-static int cheng_seed_cmd_r2c_react_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    const char *controller_label = "cheng.stage3";
-    char controller_bin[PATH_MAX];
-    const char **args;
-    size_t arg_count;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (paths.root[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] r2c-react root detect failed\n");
-        return 1;
-    }
-    if (strstr(argv[0] != NULL ? argv[0] : "", "/backend_driver/") != NULL) {
-        controller_label = "cheng.backend_driver";
-    }
-    if (!cheng_seed_r2c_prepare_controller_bin(&paths, controller_bin, sizeof(controller_bin))) {
-        return 1;
-    }
-    setenv("CHENG_ROOT", paths.root, 1);
-    arg_count = argc > 2 ? (size_t)(argc - 2) : 0U;
-    args = (const char **)cheng_seed_xmalloc(sizeof(char *) * arg_count);
-    if (argc > 2) {
-        int i;
-        for (i = 2; i < argc; ++i) {
-            args[(size_t)(i - 2)] = argv[i] != NULL ? argv[i] : "";
-        }
-    }
-    return cheng_seed_exec_binary_passthrough_with_env(controller_bin,
-                                               arg_count,
-                                               args,
-                                               "R2C_REACT_CONTROLLER",
-                                               controller_label);
-}
 
-static int cheng_seed_invoke_with_fresh_compile_env(ChengSeedSeedCommandFn fn,
-                                            int argc,
-                                            char **argv);
-
-static int cheng_seed_invoke_with_fresh_compile_env(ChengSeedSeedCommandFn fn,
-                                            int argc,
-                                            char **argv) {
-    char saved_incremental[64];
-    char saved_multi_module_cache[64];
-    char saved_primary_object_cache[64];
-    char saved_quick_stamp_cache[64];
-    char saved_quick_shared_cache[64];
-    bool had_incremental = false;
-    bool had_multi_module_cache = false;
-    bool had_primary_object_cache = false;
-    bool had_quick_stamp_cache = false;
-    bool had_quick_shared_cache = false;
-    int rc;
-    cheng_seed_save_env_value("BACKEND_INCREMENTAL",
-                              saved_incremental,
-                              sizeof(saved_incremental),
-                              &had_incremental);
-    cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE",
-                              saved_multi_module_cache,
-                              sizeof(saved_multi_module_cache),
-                              &had_multi_module_cache);
-    cheng_seed_save_env_value("CHENG_DISABLE_PRIMARY_OBJECT_CACHE",
-                              saved_primary_object_cache,
-                              sizeof(saved_primary_object_cache),
-                              &had_primary_object_cache);
-    cheng_seed_save_env_value("BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE",
-                              saved_quick_stamp_cache,
-                              sizeof(saved_quick_stamp_cache),
-                              &had_quick_stamp_cache);
-    cheng_seed_save_env_value("BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE",
-                              saved_quick_shared_cache,
-                              sizeof(saved_quick_shared_cache),
-                              &had_quick_shared_cache);
-    setenv("BACKEND_INCREMENTAL", "0", 1);
-    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
-    setenv("CHENG_DISABLE_PRIMARY_OBJECT_CACHE", "1", 1);
-    setenv("BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE", "0", 1);
-    setenv("BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE", "0", 1);
-    rc = fn(argc, argv);
-    cheng_seed_restore_env_value("BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE",
-                                 saved_quick_shared_cache,
-                                 had_quick_shared_cache);
-    cheng_seed_restore_env_value("BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE",
-                                 saved_quick_stamp_cache,
-                                 had_quick_stamp_cache);
-    cheng_seed_restore_env_value("CHENG_DISABLE_PRIMARY_OBJECT_CACHE",
-                                 saved_primary_object_cache,
-                                 had_primary_object_cache);
-    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE",
-                                 saved_multi_module_cache,
-                                 had_multi_module_cache);
-    cheng_seed_restore_env_value("BACKEND_INCREMENTAL",
-                                 saved_incremental,
-                                 had_incremental);
-    return rc;
-}
-
-static bool cheng_seed_compile_fixture_with_backend_driver_emit_target(const char *compiler_bin,
-                                                               const char *root_cheng,
-                                                               const char *src_path,
-                                                               const char *emit_kind,
-                                                               const char *target,
-                                                               const char *out_path,
-                                                               const char *log_path,
-                                                               const char *report_path);
-static int cheng_seed_cmd_print_asm(int argc, char **argv);
-static const char *cheng_seed_host_target_triple(void);
 static int cheng_seed_cmd_system_link_exec(int argc, char **argv);
-static int cheng_seed_run_backend_driver_cli_child(int argc,
-                                           char **argv,
-                                           const char *label,
-                                           const char *log_rel_path);
-
-static void cheng_seed_profile_trim_line(char *line);
-
-static void cheng_seed_crash_log_error(const char *log_path, const char *message) {
-    if (log_path != NULL && log_path[0] != '\0') {
-        cheng_seed_ensure_parent_dir(log_path);
-        cheng_seed_write_text_file(log_path, message);
-    }
-}
-
-static bool cheng_seed_crash_report_raw_line_allowed(const char *line) {
-    if (line == NULL || line[0] == '\0') {
-        return false;
-    }
-    if (strncmp(line, "reason=", 7) == 0) return true;
-    if (strncmp(line, "regs pc=", 8) == 0) return true;
-    if (strncmp(line, "m#", 2) == 0) return true;
-    if (line[0] == '#' && line[1] >= '0' && line[1] <= '9') return true;
-    if (strncmp(line, "source_frames=", 14) == 0) return true;
-    return false;
-}
-
-static bool cheng_seed_crash_report_transform_raw(const char *raw_log_path,
-                                          const char *report_path,
-                                          const char *log_path) {
-    char *raw_text = NULL;
-    char *cursor = NULL;
-    char *line = NULL;
-    char *report = NULL;
-    size_t report_cap = 1024U;
-    size_t report_used = 0U;
-    char line_buf[PATH_MAX * 2];
-    bool header_seen = false;
-    bool saw_reason = false;
-    bool saw_regs = false;
-    bool saw_machine = false;
-    bool ok = false;
-    if (!cheng_seed_path_exists_nonempty(raw_log_path)) {
-        cheng_seed_crash_log_error(log_path, "cheng crash report: missing raw log\n");
-        return false;
-    }
-    if (!cheng_seed_ensure_parent_dir(report_path) || !cheng_seed_ensure_parent_dir(log_path)) {
-        return false;
-    }
-    raw_text = cheng_seed_read_file(raw_log_path);
-    if (raw_text == NULL) {
-        cheng_seed_crash_log_error(log_path, "cheng crash report: failed to read raw log\n");
-        goto done;
-    }
-    report = (char *)cheng_seed_xmalloc(report_cap);
-    report[0] = '\0';
-    cursor = raw_text;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        cheng_seed_profile_trim_line(line);
-        if (line[0] == '\0') {
-            continue;
-        }
-        if (!header_seen) {
-            if (strcmp(line, "cheng_crash_raw_v1") != 0) {
-                continue;
-            }
-            header_seen = true;
-            cheng_seed_report_append(&report, &report_cap, &report_used, "[cheng] cheng_crash_report_v1");
-            continue;
-        }
-        if (!cheng_seed_crash_report_raw_line_allowed(line)) {
-            continue;
-        }
-        snprintf(line_buf, sizeof(line_buf), "[cheng] %s", line);
-        cheng_seed_report_append(&report, &report_cap, &report_used, line_buf);
-        if (strncmp(line, "reason=", 7) == 0) {
-            saw_reason = true;
-        } else if (strncmp(line, "regs pc=", 8) == 0) {
-            saw_regs = true;
-        } else if (strncmp(line, "m#", 2) == 0) {
-            saw_machine = true;
-        }
-    }
-    if (!header_seen || !saw_reason || !saw_regs || !saw_machine) {
-        cheng_seed_crash_log_error(log_path, "cheng crash report: invalid raw log\n");
-        goto done;
-    }
-    if (!cheng_seed_write_text_file(report_path, report)) {
-        cheng_seed_crash_log_error(log_path, "cheng crash report: failed to write report\n");
-        goto done;
-    }
-    ok = true;
-done:
-    free(report);
-    free(raw_text);
-    return ok;
-}
-
-static void cheng_seed_profile_trim_line(char *line) {
-    size_t len;
-    if (line == NULL) return;
-    len = strlen(line);
-    while (len > 0U && (line[len - 1U] == '\r' || line[len - 1U] == '\n')) {
-        line[len - 1U] = '\0';
-        len -= 1U;
-    }
-}
-
-static bool cheng_seed_compile_fixture_with_backend_driver_emit_target(const char *compiler_bin,
-                                                               const char *root_cheng,
-                                                               const char *src_path,
-                                                               const char *emit_kind,
-                                                               const char *target,
-                                                               const char *out_path,
-                                                               const char *log_path,
-                                                               const char *report_path) {
-    char contract_path[PATH_MAX];
-    char root_arg[PATH_MAX + 32];
-    char contract_arg[PATH_MAX + 32];
-    char in_arg[PATH_MAX + 32];
-    char emit_arg[128];
-    char target_arg[256];
-    char out_arg[PATH_MAX + 32];
-    char report_arg[PATH_MAX + 32];
-    const char *args[9];
-    size_t arg_count = 0U;
-    bool ok;
-    cheng_seed_join_path(contract_path, sizeof(contract_path), root_cheng, cheng_seed_bootstrap_stage1_source_relpath_from_cheng_root());
-    snprintf(root_arg, sizeof(root_arg), "--root:%s", root_cheng);
-    snprintf(contract_arg, sizeof(contract_arg), "--contract-in:%s", contract_path);
-    snprintf(in_arg, sizeof(in_arg), "--in:%s", src_path);
-    snprintf(emit_arg, sizeof(emit_arg), "--emit:%s", emit_kind);
-    snprintf(target_arg, sizeof(target_arg), "--target:%s", target);
-    snprintf(out_arg, sizeof(out_arg), "--out:%s", out_path);
-    args[arg_count++] = compiler_bin;
-    args[arg_count++] = "system-link-exec";
-    args[arg_count++] = root_arg;
-    args[arg_count++] = contract_arg;
-    args[arg_count++] = in_arg;
-    args[arg_count++] = emit_arg;
-    args[arg_count++] = target_arg;
-    args[arg_count++] = out_arg;
-    if (report_path != NULL && report_path[0] != '\0') {
-        snprintf(report_arg, sizeof(report_arg), "--report-out:%s", report_path);
-        args[arg_count++] = report_arg;
-    }
-    ok = cheng_seed_run_command_logged_argv(arg_count, args, log_path, "ordinary fixture compile");
-    if (ok && !cheng_seed_path_exists_nonempty(out_path)) {
-        fprintf(stderr, "[cheng_seed] ordinary fixture compile missing output: %s\n", out_path);
-        ok = false;
-    }
-    return ok;
-}
-
-static bool cheng_seed_compile_fixture_with_backend_driver_target(const char *compiler_bin,
-                                                          const char *root_cheng,
-                                                          const char *src_path,
-                                                          const char *target,
-                                                          const char *out_bin,
-                                                          const char *log_path) {
-    return cheng_seed_compile_fixture_with_backend_driver_emit_target(compiler_bin,
-                                                              root_cheng,
-                                                              src_path,
-                                                              "exe",
-                                                              target,
-                                                              out_bin,
-                                                              log_path,
-                                                              NULL);
-}
-
-static int cheng_seed_cmd_verify_tcp_bio_linux_regression_impl(void) {
-    char *bio_same_person_argv[3];
-    puts("[cheng gate] tcp/bio/linux early regression: bio_same_person_smoke");
-    bio_same_person_argv[0] = "cheng_seed";
-    bio_same_person_argv[1] = "run-host-smokes";
-    bio_same_person_argv[2] = "bio_same_person_smoke";
-    if (cheng_seed_cmd_run_host_smokes_impl(3, bio_same_person_argv) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int cheng_seed_run_backend_driver_cli_child(int argc,
-                                           char **argv,
-                                           const char *label,
-                                           const char *log_rel_path);
-
-static int cheng_seed_cmd_slice_gate(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char remote_x86_log[PATH_MAX];
-    char bft_verify_log[PATH_MAX];
-    char *scan_hotpath_argv[2];
-    char *debug_tools_argv[2];
-    char *debug_profile_argv[2];
-    char *cross_target_argv[2];
-    char saved_rwad_bft_linux_artifact[64];
-    char saved_rwad_bft_run_self_test[64];
-    char *host_fixed_argv[3];
-    char *host_default_argv[3];
-    char *host_full_argv[2];
-    char *remote_x86_argv[3];
-    char *bft_verify_argv[3];
-    char *stage23_full_argv[2];
-    int status = 0;
-    const char *saved_env;
-    bool had_rwad_bft_linux_artifact = false;
-    bool had_rwad_bft_run_self_test = false;
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (paths.root[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] slice-gate root detect failed\n");
-        return 1;
-    }
-    puts("[cheng gate] hot-path forbidden scan");
-    scan_hotpath_argv[0] = "cheng_seed";
-    scan_hotpath_argv[1] = "scan-hotpath";
-    if (cheng_seed_run_backend_driver_cli_child(2,
-                                                scan_hotpath_argv,
-                                                "slice-gate scan-hotpath",
-                                                "artifacts/gate/scan-hotpath.log") != 0) {
-        return 1;
-    }
-    puts("[cheng gate] orphan guard + bootstrap path");
-    if (cheng_seed_cmd_verify_orphan_guard_impl(0, NULL) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] zero-exit ordinary compile");
-    if (cheng_seed_cmd_build_zero_exit_impl(0, NULL) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] panic-trace ordinary compile");
-    if (cheng_seed_cmd_build_panic_trace_impl(0, NULL) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] bounds-trace ordinary compile");
-    if (cheng_seed_cmd_build_bounds_trace_impl(0, NULL) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] signal-trace ordinary compile");
-    if (cheng_seed_cmd_build_signal_trace_impl(0, NULL) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] debug tools");
-    debug_tools_argv[0] = "cheng_seed";
-    debug_tools_argv[1] = "verify-debug-tools";
-    if (cheng_seed_run_backend_driver_cli_child(2,
-                                                debug_tools_argv,
-                                                "slice-gate verify-debug-tools",
-                                                "artifacts/gate/verify-debug-tools.log") != 0) {
-        return 1;
-    }
-    puts("[cheng gate] debug runtime");
-    if (cheng_seed_cmd_verify_debug_runtime_impl(0, NULL) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] debug profile");
-    debug_profile_argv[0] = "cheng_seed";
-    debug_profile_argv[1] = "verify-debug-profile";
-    if (cheng_seed_run_backend_driver_cli_child(2,
-                                                debug_profile_argv,
-                                                "slice-gate verify-debug-profile",
-                                                "artifacts/gate/verify-debug-profile.log") != 0) {
-        return 1;
-    }
-    puts("[cheng gate] call-chain ordinary compile");
-    if (cheng_seed_cmd_build_call_chain_impl(0, NULL) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] ffi-handle ordinary compile");
-    if (cheng_seed_cmd_build_ffi_handle_impl(0, NULL) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] program-selfhost");
-    if (cheng_seed_cmd_build_program_selfhost_impl(0, NULL) != 0) {
-        return 1;
-    }
-    if (cheng_seed_cmd_verify_tcp_bio_linux_regression_impl() != 0) {
-        return 1;
-    }
-    puts("[cheng gate] linux aarch64 object smokes");
-    if (cheng_seed_cmd_run_linux_object_smokes_impl(0, NULL) != 0) {
-        return 1;
-    }
-    saved_env = getenv("RWAD_BFT_LINUX_ARTIFACT");
-    if (saved_env != NULL && saved_env[0] != '\0') {
-        had_rwad_bft_linux_artifact = true;
-        cheng_seed_copy_text(saved_rwad_bft_linux_artifact, sizeof(saved_rwad_bft_linux_artifact), saved_env);
-    }
-    saved_env = getenv("RWAD_BFT_RUN_SELF_TEST");
-    if (saved_env != NULL && saved_env[0] != '\0') {
-        had_rwad_bft_run_self_test = true;
-        cheng_seed_copy_text(saved_rwad_bft_run_self_test, sizeof(saved_rwad_bft_run_self_test), saved_env);
-    }
-    setenv("RWAD_BFT_LINUX_ARTIFACT", "exe", 1);
-    setenv("RWAD_BFT_RUN_SELF_TEST", "0", 1);
-    puts("[cheng gate] rwad_bft linux exe");
-    if (cheng_seed_cmd_build_rwad_bft_linux_impl(0, NULL) != 0) {
-        return 1;
-    }
-    if (had_rwad_bft_linux_artifact) {
-        setenv("RWAD_BFT_LINUX_ARTIFACT", saved_rwad_bft_linux_artifact, 1);
-    } else {
-        unsetenv("RWAD_BFT_LINUX_ARTIFACT");
-    }
-    if (had_rwad_bft_run_self_test) {
-        setenv("RWAD_BFT_RUN_SELF_TEST", saved_rwad_bft_run_self_test, 1);
-    } else {
-        unsetenv("RWAD_BFT_RUN_SELF_TEST");
-    }
-    puts("[cheng gate] bootstrap subset self-checks");
-    host_full_argv[0] = "cheng_seed";
-    host_full_argv[1] = "run-smokes";
-    if (cheng_seed_run_backend_driver_cli_child(2,
-                                                host_full_argv,
-                                                "slice-gate run-smokes",
-                                                "artifacts/gate/run-smokes.log") != 0) {
-        return 1;
-    }
-    puts("[cheng gate] host fixed256 sha256 smoke");
-    host_fixed_argv[0] = "cheng_seed";
-    host_fixed_argv[1] = "run-host-smokes";
-    host_fixed_argv[2] = "fixed256_sha256_smoke";
-    if (cheng_seed_cmd_run_host_smokes_impl(3, host_fixed_argv) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] host default-init literals smoke");
-    host_default_argv[0] = "cheng_seed";
-    host_default_argv[1] = "run-host-smokes";
-    host_default_argv[2] = "default_init_literals_smoke";
-    if (cheng_seed_cmd_run_host_smokes_impl(3, host_default_argv) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] backend_driver command surface");
-    if (cheng_seed_cmd_verify_backend_driver_command_surface_impl(0, NULL) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] cross-target builtin smokes");
-    cross_target_argv[0] = "cheng_seed";
-    cross_target_argv[1] = "run-cross-target-smokes";
-    if (cheng_seed_run_backend_driver_cli_child(2,
-                                                cross_target_argv,
-                                                "slice-gate run-cross-target-smokes",
-                                                "artifacts/gate/run-cross-target-smokes.log") != 0) {
-        return 1;
-    }
-    puts("[cheng gate] cheng host smokes");
-    host_full_argv[0] = "cheng_seed";
-    host_full_argv[1] = "run-host-smokes";
-    if (cheng_seed_cmd_run_host_smokes_impl(2, host_full_argv) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] stage2/stage3 libp2p smokes");
-    stage23_full_argv[0] = "cheng_seed";
-    stage23_full_argv[1] = "run-stage23-libp2p-smokes";
-    if (cheng_seed_cmd_run_stage23_libp2p_smokes_impl(2, stage23_full_argv) != 0) {
-        return 1;
-    }
-    puts("[cheng gate] remote x86 linux release gate");
-    cheng_seed_join_path(remote_x86_log, sizeof(remote_x86_log), paths.root, "artifacts/gate/verify_x86_linux_remote.log");
-    remote_x86_argv[0] = paths.backend_driver_out;
-    remote_x86_argv[1] = (char *)"verify-x86-linux-remote";
-    remote_x86_argv[2] = NULL;
-    if (!cheng_seed_run_binary_capture_output(remote_x86_argv, remote_x86_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] slice-gate remote x86 release gate failed log=%s\n", remote_x86_log);
-        return 1;
-    }
-    puts("[cheng gate] bft three-node verify");
-    cheng_seed_join_path(bft_verify_log,
-                 sizeof(bft_verify_log),
-                 paths.root,
-                 "artifacts/gate/verify_bft_validator_three_node.log");
-    bft_verify_argv[0] = paths.backend_driver_out;
-    bft_verify_argv[1] = (char *)"verify-bft-validator-three-node";
-    bft_verify_argv[2] = NULL;
-    if (!cheng_seed_run_binary_capture_output(bft_verify_argv, bft_verify_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] slice-gate bft three-node verify failed log=%s\n", bft_verify_log);
-        return 1;
-    }
-    puts("[cheng gate] ok");
-    return 0;
-}
-
-static bool cheng_seed_compile_host_fixture_with_backend_driver(const char *compiler_bin,
-                                                        const char *root_cheng,
-                                                        const char *src_path,
-                                                        const char *out_bin,
-                                                        const char *log_path) {
-    ChengSeedBootstrapPaths paths;
-    const char *resolved_compiler = compiler_bin;
-    const char *host_target = NULL;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (resolved_compiler != NULL &&
-        resolved_compiler[0] != '\0') {
-        if (strcmp(resolved_compiler, paths.backend_driver_out) == 0 &&
-            access(resolved_compiler, X_OK) != 0) {
-            if (!cheng_seed_backend_driver_ready(&paths) &&
-                cheng_seed_cmd_build_backend_driver(0, NULL) != 0) {
-                return false;
-            }
-            resolved_compiler = paths.backend_driver_out;
-        } else if ((strcmp(resolved_compiler, paths.stage0) == 0 ||
-                    strcmp(resolved_compiler, paths.stage1) == 0 ||
-                    strcmp(resolved_compiler, paths.stage2) == 0 ||
-                    strcmp(resolved_compiler, paths.stage3) == 0) &&
-                   access(resolved_compiler, X_OK) != 0) {
-            if (!cheng_seed_bootstrap_artifacts_fresh(&paths) &&
-                cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-                return false;
-            }
-        }
-    }
-    if (resolved_compiler == NULL || resolved_compiler[0] == '\0' || access(resolved_compiler, X_OK) != 0) {
-        fprintf(stderr, "[cheng_seed] missing compiler during fixture compile: %s\n",
-                resolved_compiler != NULL ? resolved_compiler : "");
-        return false;
-    }
-    host_target = cheng_seed_host_target_triple();
-    if (host_target == NULL || host_target[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] host fixture compile unsupported host target\n");
-        return false;
-    }
-    return cheng_seed_compile_fixture_with_backend_driver_target(resolved_compiler,
-                                                         root_cheng,
-                                                         src_path,
-                                                         host_target,
-                                                         out_bin,
-                                                         log_path);
-}
-
-static bool cheng_seed_leaf_prepare_backend_driver(ChengSeedBootstrapPaths *paths,
-                                           char *root_cheng,
-                                           size_t root_cheng_cap) {
-    cheng_seed_bootstrap_paths_init(paths);
-    if (!cheng_seed_ensure_backend_driver_ready(paths, "leaf-prepare-backend-driver")) {
-        return false;
-    }
-    cheng_seed_copy_text(root_cheng, root_cheng_cap, paths->root);
-    return true;
-}
-
-static bool cheng_seed_dump_file_stdout(const char *path) {
-    char *text = cheng_seed_read_file(path);
-    if (text == NULL) {
-        fprintf(stderr, "[cheng_seed] missing output log: %s\n", path);
-        return false;
-    }
-    fputs(text, stdout);
-    free(text);
-    return true;
-}
-
-static int cheng_seed_run_backend_driver_cli_child(int argc,
-                                           char **argv,
-                                           const char *label,
-                                           const char *log_rel_path) {
-    ChengSeedBootstrapPaths paths;
-    const char **args;
-    char saved_controller[256];
-    bool had_controller = false;
-    bool ok;
-    int i;
-    (void)log_rel_path;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (argc < 2 || argv == NULL) {
-        fprintf(stderr, "[cheng_seed] %s missing backend driver argv\n", label);
-        return 1;
-    }
-    if (!cheng_seed_ensure_backend_driver_ready(&paths, label)) {
-        return 1;
-    }
-    args = (const char **)cheng_seed_xmalloc(sizeof(char *) * (size_t)argc);
-    args[0] = paths.backend_driver_out;
-    for (i = 1; i < argc; ++i) {
-        args[i] = argv[i] != NULL ? argv[i] : "";
-    }
-    cheng_seed_save_env_value("CHENG_CONTROLLER", saved_controller, sizeof(saved_controller), &had_controller);
-    setenv("CHENG_CONTROLLER", "cheng.backend_driver", 1);
-    ok = cheng_seed_run_command_status_argv((size_t)argc, args, false, label);
-    cheng_seed_restore_env_value("CHENG_CONTROLLER", saved_controller, had_controller);
-    free(args);
-    return ok ? 0 : 1;
-}
-
-static bool cheng_seed_expect_line_map_text(const char *label,
-                                    const char *line_map_path,
-                                    const char *fixture_substring,
-                                    bool require_header) {
-    char *text = cheng_seed_read_file(line_map_path);
-    bool ok = true;
-    if (text == NULL) {
-        fprintf(stderr, "[cheng_seed] %s missing line-map: %s\n", label, line_map_path);
-        return false;
-    }
-    if (require_header) {
-        ok = ok && cheng_seed_expect_text_has_line(label, text, "cheng_line_map_v1");
-    }
-    if (fixture_substring != NULL && fixture_substring[0] != '\0') {
-        ok = ok && cheng_seed_expect_text_contains(label, text, fixture_substring);
-    }
-    free(text);
-    return ok;
-}
-
-static const char *cheng_seed_host_target_triple(void) {
-#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-    return "arm64-apple-darwin";
-#elif defined(__linux__) && defined(__x86_64__)
-    return "x86_64-unknown-linux-gnu";
-#elif defined(__linux__) && (defined(__aarch64__) || defined(__arm64__))
-    return "aarch64-unknown-linux-gnu";
-#else
-    return "";
-#endif
-}
-
-static int cheng_seed_cmd_build_zero_exit_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char src[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char line_map[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char *run_argv[2];
-    int status = 0;
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/zero_exit");
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/tests/ordinary_zero_exit_fixture.cheng");
-    cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_zero_exit_fixture");
-    snprintf(line_map, sizeof(line_map), "%s.map", out_bin);
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_zero_exit_fixture.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "ordinary_zero_exit_fixture.run.log");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_cheng, src, out_bin, compile_log) ||
-        !cheng_seed_expect_file_exists_nonempty("build-zero-exit line-map", line_map)) {
-        return 1;
-    }
-    run_argv[0] = out_bin;
-    run_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] build-zero-exit expected success log=%s\n", run_log);
-        return 1;
-    }
-    return cheng_seed_dump_file_stdout(run_log) ? 0 : 1;
-}
-
-static int cheng_seed_cmd_build_call_chain_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char src[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char *run_argv[2];
-    int status = 0;
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/call_chain");
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/tests/ordinary_call_chain_fixture.cheng");
-    cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_call_chain_fixture");
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_call_chain_fixture.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "ordinary_call_chain_fixture.run.log");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_cheng, src, out_bin, compile_log)) {
-        return 1;
-    }
-    run_argv[0] = out_bin;
-    run_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] build-call-chain expected success log=%s\n", run_log);
-        return 1;
-    }
-    return cheng_seed_dump_file_stdout(run_log) ? 0 : 1;
-}
-
-static int cheng_seed_cmd_build_program_selfhost_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char src[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char *run_argv[2];
-    int status = 0;
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/program_selfhost");
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/tests/program_selfhost_smoke.cheng");
-    cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, "program_selfhost_smoke");
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "program_selfhost_smoke.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "program_selfhost_smoke.run.log");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_cheng, src, out_bin, compile_log)) {
-        return 1;
-    }
-    run_argv[0] = out_bin;
-    run_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] build-program-selfhost expected success log=%s\n", run_log);
-        return 1;
-    }
-    return cheng_seed_dump_file_stdout(run_log) ? 0 : 1;
-}
-
-static int cheng_seed_cmd_build_bft_state_machine_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char src[PATH_MAX];
-    char default_out_dir[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char target_buf[256];
-    const char *compiler_bin;
-    const char *target = getenv("BFT_STATE_TARGET");
-    const char *out_dir_env = getenv("BFT_STATE_OUT_DIR");
-    const char *out_bin_env = getenv("BFT_STATE_OUT_BIN");
-    const char *run_self_test_env = getenv("BFT_STATE_RUN_SELF_TEST");
-    const char *host_target = cheng_seed_host_target_triple();
-    char *run_argv[5];
-    char *run_text = NULL;
-    int status = 0;
-    bool run_self_test = false;
-    const char *build_inputs[2];
-    const char *run_inputs[3];
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_BFT_COMPILER",
-                                                NULL,
-                                                paths.backend_driver_out);
-    if (!cheng_seed_leaf_expect_compiler("build-bft-state-machine", compiler_bin)) {
-        return 1;
-    }
-    if (target == NULL || target[0] == '\0') {
-        target = "arm64-apple-darwin";
-    }
-    cheng_seed_copy_text(target_buf, sizeof(target_buf), target);
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/apps/bft/bft_state_machine_main.cheng");
-    cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/bft_state_machine");
-    if (!cheng_seed_streq(target_buf, "arm64-apple-darwin")) {
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
-    }
-    if (out_dir_env != NULL && out_dir_env[0] != '\0') {
-        cheng_seed_copy_text(out_dir, sizeof(out_dir), out_dir_env);
-    } else {
-        cheng_seed_copy_text(out_dir, sizeof(out_dir), default_out_dir);
-    }
-    if (out_bin_env != NULL && out_bin_env[0] != '\0') {
-        cheng_seed_copy_text(out_bin, sizeof(out_bin), out_bin_env);
-    } else {
-        cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, "bft_state_machine");
-    }
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "bft_state_machine.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "bft_state_machine.self-test.log");
-    if (run_self_test_env != NULL && run_self_test_env[0] != '\0' && !cheng_seed_streq(run_self_test_env, "auto")) {
-        run_self_test = !cheng_seed_streq(run_self_test_env, "0");
-    } else {
-        run_self_test = host_target[0] != '\0' && cheng_seed_streq(target_buf, host_target);
-    }
-    build_inputs[0] = compiler_bin;
-    build_inputs[1] = src;
-    if (access(out_bin, X_OK) == 0 &&
-        cheng_seed_output_is_fresh_against_inputs(out_bin, build_inputs, 2U)) {
-        if (!run_self_test) {
-            printf("cheng bft_state_machine: build ok target=%s out=%s\n", target_buf, out_bin);
-            return 0;
-        }
-        run_inputs[0] = compiler_bin;
-        run_inputs[1] = src;
-        run_inputs[2] = out_bin;
-        if (access(run_log, R_OK) == 0 &&
-            cheng_seed_output_is_fresh_against_inputs(run_log, run_inputs, 3U)) {
-            run_text = cheng_seed_read_file(run_log);
-            if (run_text != NULL && strstr(run_text, "cheng bft_state_machine self-test ok") != NULL) {
-                fputs(run_text, stdout);
-                free(run_text);
-                return 0;
-            }
-            free(run_text);
-        }
-    }
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_ensure_parent_dir(out_bin) ||
-        !cheng_seed_compile_fixture_with_backend_driver_target(compiler_bin,
-                                                       root_cheng,
-                                                       src,
-                                                       target_buf,
-                                                       out_bin,
-                                                       compile_log) ||
-        access(out_bin, X_OK) != 0) {
-        fprintf(stderr, "[cheng_seed] build-bft-state-machine missing output: %s\n", out_bin);
-        return 1;
-    }
-    if (!run_self_test) {
-        printf("cheng bft_state_machine: build ok target=%s out=%s\n", target_buf, out_bin);
-        return 0;
-    }
-    run_argv[0] = out_bin;
-    run_argv[1] = "self-test";
-    run_argv[2] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] build-bft-state-machine self-test failed log=%s\n", run_log);
-        return 1;
-    }
-    return cheng_seed_dump_file_stdout(run_log) ? 0 : 1;
-}
 
 typedef struct {
     char local_deploy_dir[PATH_MAX];
@@ -65790,338 +63474,6 @@ typedef struct {
     long long mint_amount;
     long long transfer_amount;
 } ChengSeedBftDeployConfig;
-
-static void cheng_seed_bft_expected_baseline(const ChengSeedBftDeployConfig *cfg,
-                                     char *height_out,
-                                     size_t height_cap,
-                                     char *alice_out,
-                                     size_t alice_cap,
-                                     char *bob_out,
-                                     size_t bob_cap);
-
-static void cheng_seed_bft_config_init(const ChengSeedBootstrapPaths *paths,
-                               ChengSeedBftDeployConfig *cfg) {
-    const char *value;
-    memset(cfg, 0, sizeof(*cfg));
-    cheng_seed_join_path(cfg->local_deploy_dir,
-                 sizeof(cfg->local_deploy_dir),
-                 paths->root,
-                 "artifacts/bft_validator_deploy");
-    value = getenv("CHENG_BFT_SERVER_ROOT");
-    snprintf(cfg->server_root,
-             sizeof(cfg->server_root),
-             "%s",
-             value != NULL && value[0] != '\0' ? value : "/root/cheng-lang-deploy");
-    value = getenv("CHENG_BFT_RELAY_ROOT");
-    snprintf(cfg->relay_root,
-             sizeof(cfg->relay_root),
-             "%s",
-             value != NULL && value[0] != '\0' ? value : "/root/cheng-lang-deploy");
-    value = getenv("CHENG_BFT_SERVER_SSH");
-    snprintf(cfg->server_ssh,
-             sizeof(cfg->server_ssh),
-             "%s",
-             value != NULL && value[0] != '\0' ? value : "root@64.176.84.12");
-    value = getenv("CHENG_BFT_RELAY_SSH");
-    snprintf(cfg->relay_ssh,
-             sizeof(cfg->relay_ssh),
-             "%s",
-             value != NULL && value[0] != '\0' ? value : "dmit");
-    value = getenv("CHENG_BFT_SERVER_ADDR");
-    snprintf(cfg->server_addr,
-             sizeof(cfg->server_addr),
-             "%s",
-             value != NULL && value[0] != '\0' ? value : "64.176.84.12");
-    value = getenv("CHENG_BFT_APP_ID");
-    snprintf(cfg->app_id,
-             sizeof(cfg->app_id),
-             "%s",
-             value != NULL && value[0] != '\0' ? value : "cheng-bft-live-20260415");
-    value = getenv("CHENG_BFT_PROPOSAL_PORT");
-    cfg->proposal_port = value != NULL && value[0] != '\0' ? atoi(value) : 42061;
-    value = getenv("CHENG_BFT_COMMIT_PORT");
-    cfg->commit_port = value != NULL && value[0] != '\0' ? atoi(value) : 42062;
-    value = getenv("CHENG_BFT_VOTE_PORT");
-    cfg->vote_port = value != NULL && value[0] != '\0' ? atoi(value) : 42063;
-    value = getenv("CHENG_BFT_STATE_PORT");
-    cfg->state_port = value != NULL && value[0] != '\0' ? atoi(value) : 42064;
-    value = getenv("CHENG_BFT_PROPOSER_INTERVAL_MS");
-    cfg->proposer_interval_ms = value != NULL && value[0] != '\0' ? atoi(value) : 20;
-    value = getenv("CHENG_BFT_FOLLOWER_INTERVAL_MS");
-    cfg->follower_interval_ms = value != NULL && value[0] != '\0' ? atoi(value) : 20;
-    value = getenv("CHENG_BFT_PROPOSAL_WINDOW_MS");
-    cfg->proposal_window_ms = value != NULL && value[0] != '\0' ? atoi(value) : 1000;
-    value = getenv("CHENG_BFT_VOTE_WINDOW_MS");
-    cfg->vote_window_ms = value != NULL && value[0] != '\0' ? atoi(value) : 1000;
-    value = getenv("CHENG_BFT_COMMIT_WINDOW_MS");
-    cfg->commit_window_ms = value != NULL && value[0] != '\0' ? atoi(value) : 1000;
-    value = getenv("CHENG_BFT_DEFAULT_MAX_TXS");
-    cfg->default_max_txs = value != NULL && value[0] != '\0' ? atoi(value) : 128;
-    value = getenv("CHENG_BFT_ASSET_ID");
-    cfg->asset_id = value != NULL && value[0] != '\0' ? atoi(value) : 7;
-    value = getenv("CHENG_BFT_ALICE_ID");
-    cfg->alice_id = value != NULL && value[0] != '\0' ? atoi(value) : 1001;
-    value = getenv("CHENG_BFT_BOB_ID");
-    cfg->bob_id = value != NULL && value[0] != '\0' ? atoi(value) : 2002;
-    value = getenv("CHENG_BFT_MINT_AMOUNT");
-    cfg->mint_amount = value != NULL && value[0] != '\0' ? atoll(value) : 100LL;
-    value = getenv("CHENG_BFT_TRANSFER_AMOUNT");
-    cfg->transfer_amount = value != NULL && value[0] != '\0' ? atoll(value) : 33LL;
-}
-
-static void cheng_seed_bft_remote_deploy_dir(const char *repo_root,
-                                     char *out,
-                                     size_t cap) {
-    cheng_seed_join_path(out, cap, repo_root, "artifacts/bft_validator_deploy");
-}
-
-static void cheng_seed_bft_remote_bin(const char *repo_root,
-                              char *out,
-                              size_t cap) {
-    char temp[PATH_MAX];
-    cheng_seed_join_path(temp, sizeof(temp), repo_root, "artifacts/bft_state_machine");
-    cheng_seed_join_path(temp, sizeof(temp), temp, "x86_64-unknown-linux-gnu");
-    cheng_seed_join_path(out, cap, temp, "bft_state_machine");
-}
-
-static void cheng_seed_bft_local_bin(const ChengSeedBootstrapPaths *paths,
-                             char *out,
-                             size_t cap) {
-    char temp[PATH_MAX];
-    cheng_seed_join_path(temp, sizeof(temp), paths->root, "artifacts/bft_state_machine");
-    cheng_seed_join_path(out, cap, temp, "bft_state_machine");
-}
-
-static void cheng_seed_bft_remote_run_log(const char *repo_root,
-                                  char *out,
-                                  size_t cap) {
-    char out_dir[PATH_MAX];
-    cheng_seed_join_path(out_dir,
-                 sizeof(out_dir),
-                 repo_root,
-                 "artifacts/bft_state_machine/x86_64-unknown-linux-gnu");
-    cheng_seed_join_path(out, cap, out_dir, "bft_state_machine.self-test.log");
-}
-
-static void cheng_seed_bft_remote_backend_driver(const char *repo_root,
-                                         char *out,
-                                         size_t cap) {
-    char temp[PATH_MAX];
-    cheng_seed_join_path(temp, sizeof(temp), repo_root, "artifacts/backend_driver");
-    cheng_seed_join_path(out, cap, temp, "cheng");
-}
-
-static void cheng_seed_bft_remote_stage3(const char *repo_root,
-                                 char *out,
-                                 size_t cap) {
-    char temp[PATH_MAX];
-    cheng_seed_join_path(temp, sizeof(temp), repo_root, "artifacts/bootstrap");
-    cheng_seed_join_path(out, cap, temp, "cheng.stage3");
-}
-
-static void cheng_seed_bft_remote_snapshot(const char *repo_root,
-                                   char *out,
-                                   size_t cap) {
-    char temp[PATH_MAX];
-    cheng_seed_join_path(temp, sizeof(temp), repo_root, "artifacts/bootstrap");
-    cheng_seed_join_path(out, cap, temp, "bootstrap_snapshot.txt");
-}
-
-static char *cheng_seed_bft_remote_build_ready_shell(const char *repo_root) {
-    char compiler[PATH_MAX];
-    char src[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char run_log[PATH_MAX];
-    char *quoted_compiler = NULL;
-    char *quoted_src = NULL;
-    char *quoted_out_bin = NULL;
-    char *quoted_run_log = NULL;
-    char *command = NULL;
-    size_t cap;
-    cheng_seed_bft_remote_backend_driver(repo_root, compiler, sizeof(compiler));
-    cheng_seed_join_path(src, sizeof(src), repo_root, "src/apps/bft/bft_state_machine_main.cheng");
-    cheng_seed_bft_remote_bin(repo_root, out_bin, sizeof(out_bin));
-    cheng_seed_bft_remote_run_log(repo_root, run_log, sizeof(run_log));
-    quoted_compiler = cheng_seed_shell_quote(compiler);
-    quoted_src = cheng_seed_shell_quote(src);
-    quoted_out_bin = cheng_seed_shell_quote(out_bin);
-    quoted_run_log = cheng_seed_shell_quote(run_log);
-    cap = strlen(quoted_compiler) * 3U +
-          strlen(quoted_src) * 2U +
-          strlen(quoted_out_bin) * 3U +
-          strlen(quoted_run_log) * 4U +
-          256U;
-    command = (char *)cheng_seed_xmalloc(cap);
-    snprintf(command,
-             cap,
-             "test -x %s && test -x %s && test %s -ot %s && test %s -ot %s && test %s -ot %s && test %s -ot %s && test %s -ot %s && grep -qF %s %s",
-             quoted_out_bin,
-             quoted_compiler,
-             quoted_compiler,
-             quoted_out_bin,
-             quoted_src,
-             quoted_out_bin,
-             quoted_out_bin,
-             quoted_run_log,
-             quoted_compiler,
-             quoted_run_log,
-             quoted_src,
-             quoted_run_log,
-             "\"cheng bft_state_machine self-test ok\"",
-             quoted_run_log);
-    free(quoted_compiler);
-    free(quoted_src);
-    free(quoted_out_bin);
-    free(quoted_run_log);
-    return command;
-}
-
-static char *cheng_seed_bft_remote_stage3_fresh_shell(const char *repo_root) {
-    char stage3[PATH_MAX];
-    char snapshot[PATH_MAX];
-    char seed[PATH_MAX];
-    char stage1[PATH_MAX];
-    char compiler_main[PATH_MAX];
-    char compiler_runtime[PATH_MAX];
-    char compiler_request[PATH_MAX];
-    char gate_main[PATH_MAX];
-    char *quoted_stage3 = NULL;
-    char *quoted_snapshot = NULL;
-    char *quoted_seed = NULL;
-    char *quoted_stage1 = NULL;
-    char *quoted_compiler_main = NULL;
-    char *quoted_compiler_runtime = NULL;
-    char *quoted_compiler_request = NULL;
-    char *quoted_gate_main = NULL;
-    char *command = NULL;
-    size_t cap;
-    cheng_seed_bft_remote_stage3(repo_root, stage3, sizeof(stage3));
-    cheng_seed_bft_remote_snapshot(repo_root, snapshot, sizeof(snapshot));
-    cheng_seed_join_path(seed, sizeof(seed), repo_root, "bootstrap/cheng_seed.c");
-    cheng_seed_join_path(stage1, sizeof(stage1), repo_root, cheng_seed_bootstrap_stage1_source_relpath());
-    cheng_seed_join_path(compiler_main, sizeof(compiler_main), repo_root, "src/core/tooling/compiler_main.cheng");
-    cheng_seed_join_path(compiler_runtime, sizeof(compiler_runtime), repo_root, "src/core/tooling/compiler_runtime.cheng");
-    cheng_seed_join_path(compiler_request, sizeof(compiler_request), repo_root, "src/core/tooling/compiler_request.cheng");
-    cheng_seed_join_path(gate_main, sizeof(gate_main), repo_root, "src/core/tooling/gate_main.cheng");
-    quoted_stage3 = cheng_seed_shell_quote(stage3);
-    quoted_snapshot = cheng_seed_shell_quote(snapshot);
-    quoted_seed = cheng_seed_shell_quote(seed);
-    quoted_stage1 = cheng_seed_shell_quote(stage1);
-    quoted_compiler_main = cheng_seed_shell_quote(compiler_main);
-    quoted_compiler_runtime = cheng_seed_shell_quote(compiler_runtime);
-    quoted_compiler_request = cheng_seed_shell_quote(compiler_request);
-    quoted_gate_main = cheng_seed_shell_quote(gate_main);
-    cap = strlen(quoted_stage3) * 7U +
-          strlen(quoted_snapshot) +
-          strlen(quoted_seed) +
-          strlen(quoted_stage1) +
-          strlen(quoted_compiler_main) +
-          strlen(quoted_compiler_runtime) +
-          strlen(quoted_compiler_request) +
-          strlen(quoted_gate_main) +
-          640U;
-    command = (char *)cheng_seed_xmalloc(cap);
-    snprintf(command,
-             cap,
-             "test -x %s && snapshot=%s && stage3=%s && if [ -f \"$snapshot\" ]; then fresh=$(grep \"^fresh_input_paths=\" \"$snapshot\" | tail -n 1 | cut -d= -f2-); if [ -n \"$fresh\" ]; then old_ifs=\"$IFS\"; IFS=,; set -- $fresh; IFS=\"$old_ifs\"; for input in \"$@\"; do if [ -n \"$input\" ] && ! test \"$input\" -ot \"$stage3\"; then exit 1; fi; done; exit 0; fi; fi && test %s -ot \"$stage3\" && test %s -ot \"$stage3\" && test %s -ot \"$stage3\" && test %s -ot \"$stage3\" && test %s -ot \"$stage3\" && test %s -ot \"$stage3\"",
-             quoted_stage3,
-             quoted_snapshot,
-             quoted_stage3,
-             quoted_seed,
-             quoted_stage1,
-             quoted_compiler_main,
-             quoted_compiler_runtime,
-             quoted_compiler_request,
-             quoted_gate_main);
-    free(quoted_stage3);
-    free(quoted_snapshot);
-    free(quoted_seed);
-    free(quoted_stage1);
-    free(quoted_compiler_main);
-    free(quoted_compiler_runtime);
-    free(quoted_compiler_request);
-    free(quoted_gate_main);
-    return command;
-}
-
-static char *cheng_seed_bft_remote_locked_shell(const char *repo_root,
-                                        const char *inner_command) {
-    char *quoted_root = NULL;
-    char *command = NULL;
-    size_t cap;
-    quoted_root = cheng_seed_shell_quote(repo_root);
-    cap = strlen(quoted_root) + strlen(inner_command) + 768U;
-    command = (char *)cheng_seed_xmalloc(cap);
-    snprintf(command,
-             cap,
-             "set -eu && cd %s && mkdir -p artifacts/gate && lock_dir=artifacts/gate/bft_remote_build.lock && lock_pid=\"$lock_dir/pid\" && while ! mkdir \"$lock_dir\" 2>/dev/null; do holder=\"\"; if [ -f \"$lock_pid\" ]; then holder=$(cat \"$lock_pid\" 2>/dev/null || true); fi; if [ -z \"$holder\" ] || ! kill -0 \"$holder\" 2>/dev/null; then rm -f \"$lock_pid\" 2>/dev/null || true; rmdir \"$lock_dir\" 2>/dev/null || true; continue; fi; sleep 0.1; done && printf \"%%s\\n\" \"$$\" > \"$lock_pid\" && trap \"rm -f \\\"$lock_pid\\\" 2>/dev/null || true; rmdir \\\"$lock_dir\\\" 2>/dev/null || true\" EXIT INT TERM && %s",
-             quoted_root,
-             inner_command);
-    free(quoted_root);
-    return command;
-}
-
-static bool cheng_seed_bft_write_manifest(const ChengSeedBftDeployConfig *cfg) {
-    char manifest[PATH_MAX];
-    char text[2048];
-    cheng_seed_join_path(manifest, sizeof(manifest), cfg->local_deploy_dir, "deploy.env");
-    if (!cheng_seed_mkdir_p(cfg->local_deploy_dir)) {
-        return false;
-    }
-    snprintf(text,
-             sizeof(text),
-             "app_id=%s\n"
-             "server_ssh=%s\n"
-             "relay_ssh=%s\n"
-             "server_addr=%s\n"
-             "server_root=%s\n"
-             "relay_root=%s\n"
-             "local_deploy_dir=%s\n"
-             "proposal_port=%d\n"
-             "commit_port=%d\n"
-             "vote_port=%d\n"
-             "state_port=%d\n"
-             "proposer_interval_ms=%d\n"
-             "follower_interval_ms=%d\n"
-             "proposal_window_ms=%d\n"
-             "vote_window_ms=%d\n"
-             "commit_window_ms=%d\n"
-             "default_max_txs=%d\n"
-             "asset_id=%d\n"
-             "alice_id=%d\n"
-             "bob_id=%d\n"
-             "mint_amount=%lld\n"
-             "transfer_amount=%lld\n",
-             cfg->app_id,
-             cfg->server_ssh,
-             cfg->relay_ssh,
-             cfg->server_addr,
-             cfg->server_root,
-             cfg->relay_root,
-             cfg->local_deploy_dir,
-             cfg->proposal_port,
-             cfg->commit_port,
-             cfg->vote_port,
-             cfg->state_port,
-             cfg->proposer_interval_ms,
-             cfg->follower_interval_ms,
-             cfg->proposal_window_ms,
-             cfg->vote_window_ms,
-             cfg->commit_window_ms,
-             cfg->default_max_txs,
-             cfg->asset_id,
-             cfg->alice_id,
-             cfg->bob_id,
-             cfg->mint_amount,
-             cfg->transfer_amount);
-    return cheng_seed_write_text_file(manifest, text);
-}
-
-static bool cheng_seed_bft_run_local_shell(const char *command,
-                                   const char *log_path,
-                                   const char *label) {
-    return cheng_seed_run_shell_command_logged(command, log_path, label);
-}
 
 static bool cheng_seed_bft_remote_retryable_log(const char *log_path) {
     char *text = cheng_seed_read_file(log_path);
@@ -66204,583 +63556,6 @@ static bool cheng_seed_bft_run_remote_shell(const char *ssh_host,
     return ok;
 }
 
-static bool cheng_seed_bft_run_remote_shell_quiet(const char *ssh_host,
-                                          const char *command,
-                                          const char *log_path,
-                                          const char *label) {
-    char safe_label[128];
-    char local_script[PATH_MAX];
-    char *script_text;
-    const char *ssh_argv[13];
-    bool ok = false;
-    size_t attempt;
-    size_t i;
-    if (ssh_host == NULL || ssh_host[0] == '\0' ||
-        command == NULL ||
-        log_path == NULL || log_path[0] == '\0' ||
-        label == NULL || label[0] == '\0') {
-        return false;
-    }
-    for (i = 0U; label[i] != '\0' && i + 1U < sizeof(safe_label); ++i) {
-        unsigned char ch = (unsigned char)label[i];
-        if (isalnum(ch)) {
-            safe_label[i] = (char)ch;
-        } else {
-            safe_label[i] = '_';
-        }
-    }
-    if (i == 0U) {
-        safe_label[i++] = 'x';
-    }
-    safe_label[i] = '\0';
-    snprintf(local_script, sizeof(local_script), "%s.remote.sh", log_path);
-    script_text = (char *)cheng_seed_xmalloc(strlen(command) + 12U);
-    snprintf(script_text, strlen(command) + 12U, "#!/bin/sh\n%s\n", command);
-    if (!cheng_seed_ensure_parent_dir(local_script) || !cheng_seed_write_text_file(local_script, script_text)) {
-        free(script_text);
-        return false;
-    }
-    free(script_text);
-    ssh_argv[0] = "ssh";
-    ssh_argv[1] = "-T";
-    ssh_argv[2] = "-o";
-    ssh_argv[3] = "BatchMode=yes";
-    ssh_argv[4] = "-o";
-    ssh_argv[5] = "ConnectTimeout=20";
-    ssh_argv[6] = "-o";
-    ssh_argv[7] = "ServerAliveInterval=5";
-    ssh_argv[8] = "-o";
-    ssh_argv[9] = "ServerAliveCountMax=3";
-    ssh_argv[10] = ssh_host;
-    ssh_argv[11] = "sh";
-    ssh_argv[12] = NULL;
-    for (attempt = 0U; attempt < 3U; ++attempt) {
-        ok = cheng_seed_run_command_logged_argv_with_input_file(12U,
-                                                        ssh_argv,
-                                                        local_script,
-                                                        log_path,
-                                                        label,
-                                                        true);
-        if (ok || attempt + 1U >= 3U || !cheng_seed_bft_remote_retryable_log(log_path)) {
-            break;
-        }
-        fprintf(stdout, "[cheng gate] remote ssh retry %zu %s\n", attempt + 1U, label);
-        usleep((useconds_t)((attempt + 1U) * 1000000U));
-    }
-    return ok;
-}
-
-static bool cheng_seed_bft_run_local_argv(const char **args,
-                                  size_t arg_count,
-                                  const char *log_path,
-                                  const char *label) {
-    return cheng_seed_run_command_logged_argv(arg_count, args, log_path, label);
-}
-
-static bool cheng_seed_bft_run_local_argv_quiet(const char **args,
-                                        size_t arg_count,
-                                        const char *log_path,
-                                        const char *label) {
-    return cheng_seed_run_command_logged_argv_quiet(arg_count, args, log_path, label);
-}
-
-static bool cheng_seed_bft_run_remote_argv(const char *ssh_host,
-                                   const char **args,
-                                   size_t arg_count,
-                                   const char *log_path,
-                                   const char *label) {
-    const char *argv_remote[28];
-    size_t i;
-    bool ok = false;
-    size_t attempt;
-    if (arg_count + 12U >= sizeof(argv_remote) / sizeof(argv_remote[0])) {
-        fprintf(stderr, "[cheng_seed] %s argv overflow\n", label);
-        return false;
-    }
-    argv_remote[0] = "ssh";
-    argv_remote[1] = "-n";
-    argv_remote[2] = "-o";
-    argv_remote[3] = "BatchMode=yes";
-    argv_remote[4] = "-o";
-    argv_remote[5] = "ConnectTimeout=20";
-    argv_remote[6] = "-o";
-    argv_remote[7] = "ServerAliveInterval=5";
-    argv_remote[8] = "-o";
-    argv_remote[9] = "ServerAliveCountMax=3";
-    argv_remote[10] = ssh_host;
-    for (i = 0U; i < arg_count; ++i) {
-        argv_remote[i + 11U] = args[i];
-    }
-    argv_remote[arg_count + 11U] = NULL;
-    for (attempt = 0U; attempt < 3U; ++attempt) {
-        ok = cheng_seed_run_command_logged_argv(arg_count + 11U, argv_remote, log_path, label);
-        if (ok || attempt + 1U >= 3U || !cheng_seed_bft_remote_retryable_log(log_path)) {
-            break;
-        }
-        fprintf(stdout, "[cheng gate] remote ssh retry %zu %s\n", attempt + 1U, label);
-        usleep((useconds_t)((attempt + 1U) * 1000000U));
-    }
-    return ok;
-}
-
-static bool cheng_seed_bft_run_remote_argv_quiet(const char *ssh_host,
-                                         const char **args,
-                                         size_t arg_count,
-                                         const char *log_path,
-                                         const char *label) {
-    const char *argv_remote[28];
-    size_t i;
-    bool ok = false;
-    size_t attempt;
-    if (arg_count + 12U >= sizeof(argv_remote) / sizeof(argv_remote[0])) {
-        return false;
-    }
-    argv_remote[0] = "ssh";
-    argv_remote[1] = "-n";
-    argv_remote[2] = "-o";
-    argv_remote[3] = "BatchMode=yes";
-    argv_remote[4] = "-o";
-    argv_remote[5] = "ConnectTimeout=20";
-    argv_remote[6] = "-o";
-    argv_remote[7] = "ServerAliveInterval=5";
-    argv_remote[8] = "-o";
-    argv_remote[9] = "ServerAliveCountMax=3";
-    argv_remote[10] = ssh_host;
-    for (i = 0U; i < arg_count; ++i) {
-        argv_remote[i + 11U] = args[i];
-    }
-    argv_remote[arg_count + 11U] = NULL;
-    for (attempt = 0U; attempt < 3U; ++attempt) {
-        ok = cheng_seed_run_command_logged_argv_quiet(arg_count + 11U, argv_remote, log_path, label);
-        if (ok || attempt + 1U >= 3U || !cheng_seed_bft_remote_retryable_log(log_path)) {
-            break;
-        }
-        fprintf(stdout, "[cheng gate] remote ssh retry %zu %s\n", attempt + 1U, label);
-        usleep((useconds_t)((attempt + 1U) * 1000000U));
-    }
-    return ok;
-}
-
-static bool cheng_seed_bft_rsync_repo(const char *root,
-                              const char *ssh_host,
-                              const char *remote_root,
-                              const char *log_path) {
-    const char *argv_rsync[20];
-    char src[PATH_MAX];
-    char dst[PATH_MAX + 256];
-    char remote_shell[256];
-    bool ok = false;
-    size_t attempt;
-    snprintf(src, sizeof(src), "%s/", root);
-    snprintf(dst, sizeof(dst), "%s:%s/", ssh_host, remote_root);
-    snprintf(remote_shell,
-             sizeof(remote_shell),
-             "ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=5 -o ServerAliveCountMax=3");
-    argv_rsync[0] = "rsync";
-    argv_rsync[1] = "-az";
-    argv_rsync[2] = "-e";
-    argv_rsync[3] = remote_shell;
-    argv_rsync[4] = "--delete";
-    argv_rsync[5] = "--exclude";
-    argv_rsync[6] = ".git";
-    argv_rsync[7] = "--exclude";
-    argv_rsync[8] = "artifacts";
-    argv_rsync[9] = "--exclude";
-    argv_rsync[10] = "chengcache";
-    argv_rsync[11] = "--exclude";
-    argv_rsync[12] = "node_modules";
-    argv_rsync[13] = src;
-    argv_rsync[14] = dst;
-    argv_rsync[15] = NULL;
-    for (attempt = 0U; attempt < 3U; ++attempt) {
-        ok = cheng_seed_run_command_logged_argv(15U, argv_rsync, log_path, "bft_rsync");
-        if (ok || attempt + 1U >= 3U || !cheng_seed_bft_remote_retryable_log(log_path)) {
-            break;
-        }
-        fprintf(stdout, "[cheng gate] remote rsync retry %zu %s\n", attempt + 1U, ssh_host);
-        usleep((useconds_t)((attempt + 1U) * 1000000U));
-    }
-    return ok;
-}
-
-static bool cheng_seed_bft_build_remote_x86_state_machine(const char *ssh_host,
-                                                  const char *remote_root,
-                                                  const char *log_path,
-                                                  const char *label) {
-    char remote_seed_source[PATH_MAX];
-    char remote_seed_runner[PATH_MAX];
-    char remote_stage3[PATH_MAX];
-    char ready_log[PATH_MAX];
-    char stage3_log[PATH_MAX];
-    char *quoted_seed_source = NULL;
-    char *quoted_seed_runner = NULL;
-    char *quoted_remote_root = NULL;
-    char *quoted_remote_stage3 = NULL;
-    char *ready_command = NULL;
-    char *stage3_fresh_command = NULL;
-    char *incremental_inner = NULL;
-    char *incremental_command = NULL;
-    char *full_inner = NULL;
-    char *command = NULL;
-    size_t cap;
-    bool ok;
-    if (ssh_host == NULL || ssh_host[0] == '\0' ||
-        remote_root == NULL || remote_root[0] == '\0' ||
-        log_path == NULL || log_path[0] == '\0' ||
-        label == NULL || label[0] == '\0') {
-        return false;
-    }
-    cheng_seed_join_path(remote_seed_source, sizeof(remote_seed_source), remote_root, "bootstrap/cheng_seed.c");
-    cheng_seed_join_path(remote_seed_runner, sizeof(remote_seed_runner), remote_root, "artifacts/gate/cheng.remote_seed_runner");
-    cheng_seed_join_path(remote_stage3, sizeof(remote_stage3), remote_root, "artifacts/bootstrap/cheng.stage3");
-    snprintf(ready_log, sizeof(ready_log), "%s.ready.log", log_path);
-    snprintf(stage3_log, sizeof(stage3_log), "%s.stage3.log", log_path);
-    quoted_seed_source = cheng_seed_shell_quote(remote_seed_source);
-    quoted_seed_runner = cheng_seed_shell_quote(remote_seed_runner);
-    quoted_remote_root = cheng_seed_shell_quote(remote_root);
-    quoted_remote_stage3 = cheng_seed_shell_quote(remote_stage3);
-    ready_command = cheng_seed_bft_remote_build_ready_shell(remote_root);
-    ok = cheng_seed_bft_run_remote_shell_quiet(ssh_host, ready_command, ready_log, "bft_remote_ready");
-    free(ready_command);
-    if (ok) {
-        fprintf(stdout, "[cheng gate] remote bft reuse %s\n", ssh_host);
-        free(quoted_seed_source);
-        free(quoted_seed_runner);
-        free(quoted_remote_root);
-        free(quoted_remote_stage3);
-        return true;
-    }
-    stage3_fresh_command = cheng_seed_bft_remote_stage3_fresh_shell(remote_root);
-    ok = cheng_seed_bft_run_remote_shell_quiet(ssh_host,
-                                       stage3_fresh_command,
-                                       stage3_log,
-                                       "bft_remote_stage3_fresh");
-    free(stage3_fresh_command);
-    if (ok) {
-        cap = strlen(quoted_remote_stage3) + 256U;
-        incremental_inner = (char *)cheng_seed_xmalloc(cap);
-        snprintf(incremental_inner,
-                 cap,
-                 "BFT_STATE_TARGET=x86_64-unknown-linux-gnu BFT_STATE_RUN_SELF_TEST=1 %s build-bft-state-machine",
-                 quoted_remote_stage3);
-        incremental_command = cheng_seed_bft_remote_locked_shell(remote_root, incremental_inner);
-        free(incremental_inner);
-        ok = cheng_seed_bft_run_remote_shell(ssh_host, incremental_command, log_path, label);
-        free(incremental_command);
-        if (ok) {
-            fprintf(stdout, "[cheng gate] remote bft incremental %s\n", ssh_host);
-        }
-        free(quoted_seed_source);
-        free(quoted_seed_runner);
-        free(quoted_remote_root);
-        free(quoted_remote_stage3);
-        return ok;
-    }
-    cap = strlen(quoted_seed_source) +
-          strlen(quoted_seed_runner) * 2U +
-          strlen(quoted_remote_root) +
-          strlen(quoted_remote_stage3) +
-          512U;
-    full_inner = (char *)cheng_seed_xmalloc(cap);
-    snprintf(full_inner,
-             cap,
-             "mkdir -p artifacts/bootstrap && cc -std=c11 -O2 -Wall -Wextra -pedantic %s -o %s && CHENG_ROOT=%s CHENG_TARGET=x86_64-unknown-linux-gnu %s bootstrap-bridge >/dev/null && BFT_STATE_TARGET=x86_64-unknown-linux-gnu BFT_STATE_RUN_SELF_TEST=1 %s build-bft-state-machine",
-             quoted_seed_source,
-             quoted_seed_runner,
-             quoted_remote_root,
-             quoted_seed_runner,
-             quoted_remote_stage3);
-    command = cheng_seed_bft_remote_locked_shell(remote_root, full_inner);
-    free(full_inner);
-    ok = cheng_seed_bft_run_remote_shell(ssh_host, command, log_path, label);
-    free(command);
-    free(quoted_seed_source);
-    free(quoted_seed_runner);
-    free(quoted_remote_root);
-    free(quoted_remote_stage3);
-    if (ok) {
-        fprintf(stdout, "[cheng gate] remote bft rebuild %s\n", ssh_host);
-    }
-    return ok;
-}
-
-static bool cheng_seed_bft_copy_remote_file_via_local_scp(const char *src_ssh,
-                                                  const char *src_path,
-                                                  const char *dst_ssh,
-                                                  const char *dst_path,
-                                                  const char *log_path,
-                                                  const char *label) {
-    const char *argv_scp[7];
-    char src[PATH_MAX + 256];
-    char dst[PATH_MAX + 256];
-    if (src_ssh == NULL || src_ssh[0] == '\0' ||
-        src_path == NULL || src_path[0] == '\0' ||
-        dst_ssh == NULL || dst_ssh[0] == '\0' ||
-        dst_path == NULL || dst_path[0] == '\0' ||
-        log_path == NULL || log_path[0] == '\0' ||
-        label == NULL || label[0] == '\0') {
-        return false;
-    }
-    snprintf(src, sizeof(src), "%s:%s", src_ssh, src_path);
-    snprintf(dst, sizeof(dst), "%s:%s", dst_ssh, dst_path);
-    argv_scp[0] = "scp";
-    argv_scp[1] = "-3";
-    argv_scp[2] = "-q";
-    argv_scp[3] = "-B";
-    argv_scp[4] = src;
-    argv_scp[5] = dst;
-    argv_scp[6] = NULL;
-    return cheng_seed_run_command_logged_argv(6U, argv_scp, log_path, label);
-}
-
-static bool cheng_seed_bft_remote_allow_udp_port(const char *ssh_host,
-                                         int port,
-                                         const char *log_path,
-                                         const char *label) {
-    char command[4096];
-    if (ssh_host == NULL || ssh_host[0] == '\0' ||
-        port <= 0 ||
-        log_path == NULL || log_path[0] == '\0' ||
-        label == NULL || label[0] == '\0') {
-        return false;
-    }
-    snprintf(command,
-             sizeof(command),
-             "set -eu && port=%d && if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then ufw allow \"$port/udp\" >/dev/null 2>&1 || ufw allow \"$port/udp\"; exit 0; fi && if command -v iptables >/dev/null 2>&1; then if ! iptables -C INPUT -p udp --dport \"$port\" -j ACCEPT >/dev/null 2>&1; then iptables -I INPUT -p udp --dport \"$port\" -j ACCEPT; fi; exit 0; fi && if command -v nft >/dev/null 2>&1 && nft list table inet filter >/dev/null 2>&1; then if ! nft list ruleset 2>/dev/null | grep -q \"udp dport $port accept\"; then nft add rule inet filter input udp dport \"$port\" accept; fi; exit 0; fi && exit 0",
-             port);
-    return cheng_seed_bft_run_remote_shell(ssh_host, command, log_path, label);
-}
-
-static bool cheng_seed_bft_collect_local_status(const char *bin_path,
-                                        const char *state_path,
-                                        const ChengSeedBftDeployConfig *cfg,
-                                        bool quiet_failures,
-                                        const char *summary_log,
-                                        char *height_out,
-                                        size_t height_cap,
-                                        char *hash_out,
-                                        size_t hash_cap,
-                                        char *alice_out,
-                                        size_t alice_cap,
-                                        char *bob_out,
-                                        size_t bob_cap) {
-    const char *summary_argv[7];
-    char asset_arg[64];
-    char account_a_arg[64];
-    char account_b_arg[64];
-    char state_arg[PATH_MAX + 32];
-    char *summary_text;
-    snprintf(state_arg, sizeof(state_arg), "--state:%s", state_path);
-    snprintf(asset_arg, sizeof(asset_arg), "--asset:%d", cfg->asset_id);
-    snprintf(account_a_arg, sizeof(account_a_arg), "--account-a:%d", cfg->alice_id);
-    snprintf(account_b_arg, sizeof(account_b_arg), "--account-b:%d", cfg->bob_id);
-    summary_argv[0] = bin_path;
-    summary_argv[1] = "query-summary";
-    summary_argv[2] = state_arg;
-    summary_argv[3] = asset_arg;
-    summary_argv[4] = account_a_arg;
-    summary_argv[5] = account_b_arg;
-    summary_argv[6] = NULL;
-    if ((!quiet_failures
-             ? !cheng_seed_bft_run_local_argv(summary_argv, 6U, summary_log, "bft_local_summary")
-             : !cheng_seed_bft_run_local_argv_quiet(summary_argv, 6U, summary_log, "bft_local_summary"))) {
-        return false;
-    }
-    summary_text = cheng_seed_read_file(summary_log);
-    if (summary_text == NULL) {
-        free(summary_text);
-        return false;
-    }
-    cheng_seed_text_line_value(summary_text, "height", height_out, height_cap);
-    cheng_seed_text_line_value(summary_text, "app_hash", hash_out, hash_cap);
-    cheng_seed_text_line_value(summary_text, "balance_a", alice_out, alice_cap);
-    cheng_seed_text_line_value(summary_text, "balance_b", bob_out, bob_cap);
-    free(summary_text);
-    return height_out[0] != '\0' &&
-           hash_out[0] != '\0' &&
-           alice_out[0] != '\0' &&
-           bob_out[0] != '\0';
-}
-
-static bool cheng_seed_bft_collect_remote_status(const char *ssh_host,
-                                         const char *bin_path,
-                                         const char *state_path,
-                                         const ChengSeedBftDeployConfig *cfg,
-                                         bool quiet_failures,
-                                         const char *summary_log,
-                                         char *height_out,
-                                         size_t height_cap,
-                                         char *hash_out,
-                                         size_t hash_cap,
-                                         char *alice_out,
-                                         size_t alice_cap,
-                                         char *bob_out,
-                                         size_t bob_cap) {
-    const char *summary_args[7];
-    char asset_arg[64];
-    char account_a_arg[64];
-    char account_b_arg[64];
-    char state_arg[PATH_MAX + 32];
-    char *summary_text;
-    bool have_cached = height_out != NULL && height_cap > 0U &&
-                       hash_out != NULL && hash_cap > 0U &&
-                       alice_out != NULL && alice_cap > 0U &&
-                       bob_out != NULL && bob_cap > 0U &&
-                       height_out[0] != '\0' &&
-                       hash_out[0] != '\0' &&
-                       alice_out[0] != '\0' &&
-                       bob_out[0] != '\0';
-    snprintf(state_arg, sizeof(state_arg), "--state:%s", state_path);
-    snprintf(asset_arg, sizeof(asset_arg), "--asset:%d", cfg->asset_id);
-    snprintf(account_a_arg, sizeof(account_a_arg), "--account-a:%d", cfg->alice_id);
-    snprintf(account_b_arg, sizeof(account_b_arg), "--account-b:%d", cfg->bob_id);
-    summary_args[0] = bin_path;
-    summary_args[1] = "query-summary";
-    summary_args[2] = state_arg;
-    summary_args[3] = asset_arg;
-    summary_args[4] = account_a_arg;
-    summary_args[5] = account_b_arg;
-    summary_args[6] = NULL;
-    if ((!quiet_failures
-             ? !cheng_seed_bft_run_remote_argv(ssh_host, summary_args, 6U, summary_log, "bft_remote_summary")
-             : !cheng_seed_bft_run_remote_argv_quiet(ssh_host, summary_args, 6U, summary_log, "bft_remote_summary"))) {
-        if (quiet_failures && have_cached && cheng_seed_bft_remote_retryable_log(summary_log)) {
-            return true;
-        }
-        return false;
-    }
-    summary_text = cheng_seed_read_file(summary_log);
-    if (summary_text == NULL) {
-        free(summary_text);
-        return false;
-    }
-    cheng_seed_text_line_value(summary_text, "height", height_out, height_cap);
-    cheng_seed_text_line_value(summary_text, "app_hash", hash_out, hash_cap);
-    cheng_seed_text_line_value(summary_text, "balance_a", alice_out, alice_cap);
-    cheng_seed_text_line_value(summary_text, "balance_b", bob_out, bob_cap);
-    free(summary_text);
-    return height_out[0] != '\0' &&
-           hash_out[0] != '\0' &&
-           alice_out[0] != '\0' &&
-           bob_out[0] != '\0';
-}
-
-static void cheng_seed_bft_print_status_line(const char *name,
-                                     const char *height,
-                                     const char *hash,
-                                     const char *alice,
-                                     const char *bob) {
-    printf("node=%s\n", name);
-    printf("height=%s\n", height);
-    printf("app_hash=%s\n", hash);
-    printf("alice_balance=%s\n", alice);
-    printf("bob_balance=%s\n", bob);
-}
-
-static bool cheng_seed_bft_cluster_matches_values(const char *want_height,
-                                          const char *want_alice,
-                                          const char *want_bob,
-                                          const char *server_height,
-                                          const char *server_hash,
-                                          const char *server_alice,
-                                          const char *server_bob,
-                                          const char *relay_height,
-                                          const char *relay_hash,
-                                          const char *relay_alice,
-                                          const char *relay_bob,
-                                          const char *local_height,
-                                          const char *local_hash,
-                                          const char *local_alice,
-                                          const char *local_bob) {
-    return want_height != NULL &&
-           want_alice != NULL &&
-           want_bob != NULL &&
-           server_height != NULL &&
-           server_hash != NULL &&
-           server_alice != NULL &&
-           server_bob != NULL &&
-           relay_height != NULL &&
-           relay_hash != NULL &&
-           relay_alice != NULL &&
-           relay_bob != NULL &&
-           local_height != NULL &&
-           local_hash != NULL &&
-           local_alice != NULL &&
-           local_bob != NULL &&
-           strcmp(server_height, want_height) == 0 &&
-           strcmp(relay_height, want_height) == 0 &&
-           strcmp(local_height, want_height) == 0 &&
-           server_hash[0] != '\0' &&
-           strcmp(server_hash, relay_hash) == 0 &&
-           strcmp(server_hash, local_hash) == 0 &&
-           strcmp(server_alice, want_alice) == 0 &&
-           strcmp(relay_alice, want_alice) == 0 &&
-           strcmp(local_alice, want_alice) == 0 &&
-           strcmp(server_bob, want_bob) == 0 &&
-           strcmp(relay_bob, want_bob) == 0 &&
-           strcmp(local_bob, want_bob) == 0;
-}
-
-static void cheng_seed_bft_expected_baseline(const ChengSeedBftDeployConfig *cfg,
-                                     char *height_out,
-                                     size_t height_cap,
-                                     char *alice_out,
-                                     size_t alice_cap,
-                                     char *bob_out,
-                                     size_t bob_cap);
-
-static bool cheng_seed_bft_write_verify_report(const char *report_path,
-                                       const ChengSeedBftDeployConfig *cfg,
-                                       bool verified,
-                                       const char *server_height,
-                                       const char *server_hash,
-                                       const char *server_alice,
-                                       const char *server_bob,
-                                       const char *relay_height,
-                                       const char *relay_hash,
-                                       const char *relay_alice,
-                                       const char *relay_bob,
-                                       const char *local_height,
-                                       const char *local_hash,
-                                       const char *local_alice,
-                                       const char *local_bob) {
-    char want_height[64];
-    char want_alice[64];
-    char want_bob[64];
-    char text[4096];
-    cheng_seed_bft_expected_baseline(cfg,
-                             want_height,
-                             sizeof(want_height),
-                             want_alice,
-                             sizeof(want_alice),
-                             want_bob,
-                             sizeof(want_bob));
-    text[0] = '\0';
-    cheng_seed_text_appendf(text, sizeof(text), "version=cheng.bft_three_node_verify.v1\n");
-    cheng_seed_text_appendf(text, sizeof(text), "app_id=%s\n", cfg != NULL ? cfg->app_id : "");
-    cheng_seed_text_appendf(text, sizeof(text), "server_ssh=%s\n", cfg != NULL ? cfg->server_ssh : "");
-    cheng_seed_text_appendf(text, sizeof(text), "relay_ssh=%s\n", cfg != NULL ? cfg->relay_ssh : "");
-    cheng_seed_text_appendf(text, sizeof(text), "want_height=%s\n", want_height);
-    cheng_seed_text_appendf(text, sizeof(text), "want_alice_balance=%s\n", want_alice);
-    cheng_seed_text_appendf(text, sizeof(text), "want_bob_balance=%s\n", want_bob);
-    cheng_seed_text_appendf(text, sizeof(text), "server_name=server\nserver_height=%s\nserver_app_hash=%s\nserver_alice_balance=%s\nserver_bob_balance=%s\n",
-                    server_height != NULL ? server_height : "",
-                    server_hash != NULL ? server_hash : "",
-                    server_alice != NULL ? server_alice : "",
-                    server_bob != NULL ? server_bob : "");
-    cheng_seed_text_appendf(text, sizeof(text), "relay_name=relay\nrelay_height=%s\nrelay_app_hash=%s\nrelay_alice_balance=%s\nrelay_bob_balance=%s\n",
-                    relay_height != NULL ? relay_height : "",
-                    relay_hash != NULL ? relay_hash : "",
-                    relay_alice != NULL ? relay_alice : "",
-                    relay_bob != NULL ? relay_bob : "");
-    cheng_seed_text_appendf(text, sizeof(text), "local_name=local\nlocal_height=%s\nlocal_app_hash=%s\nlocal_alice_balance=%s\nlocal_bob_balance=%s\n",
-                    local_height != NULL ? local_height : "",
-                    local_hash != NULL ? local_hash : "",
-                    local_alice != NULL ? local_alice : "",
-                    local_bob != NULL ? local_bob : "");
-    cheng_seed_text_appendf(text, sizeof(text), "verified=%s\n", verified ? "true" : "false");
-    return cheng_seed_write_text_file(report_path, text);
-}
 
 static long long cheng_seed_bft_monotime_ms(void) {
     struct timespec ts;
@@ -66831,6053 +63606,6 @@ static bool CHENG_UNUSED cheng_seed_bft_remote_state_mtime_ms(const char *ssh_ho
     *out_ms = atoll(value_buf);
     free(text);
     return *out_ms > 0LL;
-}
-
-static void cheng_seed_bft_format_milli(long long value_milli,
-                                char *out,
-                                size_t cap) {
-    long long whole = value_milli / 1000LL;
-    long long frac = value_milli % 1000LL;
-    if (frac < 0) {
-        frac = -frac;
-    }
-    snprintf(out, cap, "%lld.%03lld", whole, frac);
-}
-
-static bool cheng_seed_bft_wait_cluster_state(const ChengSeedBftDeployConfig *cfg,
-                                      const char *server_bin,
-                                      const char *relay_bin,
-                                      const char *local_bin,
-                                      const char *server_state,
-                                      const char *relay_state,
-                                      const char *local_state,
-                                      const char *log_prefix,
-                                      const char *want_height,
-                                      const char *want_alice,
-                                      const char *want_bob,
-                                      char *server_height,
-                                      size_t server_height_cap,
-                                      char *server_hash,
-                                      size_t server_hash_cap,
-                                      char *server_alice,
-                                      size_t server_alice_cap,
-                                      char *server_bob,
-                                      size_t server_bob_cap,
-                                      char *relay_height,
-                                      size_t relay_height_cap,
-                                      char *relay_hash,
-                                      size_t relay_hash_cap,
-                                      char *relay_alice,
-                                      size_t relay_alice_cap,
-                                      char *relay_bob,
-                                      size_t relay_bob_cap,
-                                      char *local_height,
-                                      size_t local_height_cap,
-                                      char *local_hash,
-                                      size_t local_hash_cap,
-                                      char *local_alice,
-                                      size_t local_alice_cap,
-                                      char *local_bob,
-                                      size_t local_bob_cap) {
-    size_t attempt;
-    char server_summary_log[PATH_MAX];
-    char relay_summary_log[PATH_MAX];
-    char local_summary_log[PATH_MAX];
-    if (server_height != NULL && server_height_cap > 0U) {
-        server_height[0] = '\0';
-    }
-    if (server_hash != NULL && server_hash_cap > 0U) {
-        server_hash[0] = '\0';
-    }
-    if (server_alice != NULL && server_alice_cap > 0U) {
-        server_alice[0] = '\0';
-    }
-    if (server_bob != NULL && server_bob_cap > 0U) {
-        server_bob[0] = '\0';
-    }
-    if (relay_height != NULL && relay_height_cap > 0U) {
-        relay_height[0] = '\0';
-    }
-    if (relay_hash != NULL && relay_hash_cap > 0U) {
-        relay_hash[0] = '\0';
-    }
-    if (relay_alice != NULL && relay_alice_cap > 0U) {
-        relay_alice[0] = '\0';
-    }
-    if (relay_bob != NULL && relay_bob_cap > 0U) {
-        relay_bob[0] = '\0';
-    }
-    if (local_height != NULL && local_height_cap > 0U) {
-        local_height[0] = '\0';
-    }
-    if (local_hash != NULL && local_hash_cap > 0U) {
-        local_hash[0] = '\0';
-    }
-    if (local_alice != NULL && local_alice_cap > 0U) {
-        local_alice[0] = '\0';
-    }
-    if (local_bob != NULL && local_bob_cap > 0U) {
-        local_bob[0] = '\0';
-    }
-    snprintf(server_summary_log, sizeof(server_summary_log), "%s.server.summary.log", log_prefix);
-    snprintf(relay_summary_log, sizeof(relay_summary_log), "%s.relay.summary.log", log_prefix);
-    snprintf(local_summary_log, sizeof(local_summary_log), "%s.local.summary.log", log_prefix);
-    for (attempt = 0U; attempt < 300U; ++attempt) {
-        if (cheng_seed_bft_collect_remote_status(cfg->server_ssh,
-                                         server_bin,
-                                         server_state,
-                                         cfg,
-                                         true,
-                                         server_summary_log,
-                                         server_height,
-                                         server_height_cap,
-                                         server_hash,
-                                         server_hash_cap,
-                                         server_alice,
-                                         server_alice_cap,
-                                         server_bob,
-                                         server_bob_cap) &&
-            cheng_seed_bft_collect_remote_status(cfg->relay_ssh,
-                                         relay_bin,
-                                         relay_state,
-                                         cfg,
-                                         true,
-                                         relay_summary_log,
-                                         relay_height,
-                                         relay_height_cap,
-                                         relay_hash,
-                                         relay_hash_cap,
-                                         relay_alice,
-                                         relay_alice_cap,
-                                         relay_bob,
-                                         relay_bob_cap) &&
-            cheng_seed_bft_collect_local_status(local_bin,
-                                        local_state,
-                                        cfg,
-                                        true,
-                                        local_summary_log,
-                                        local_height,
-                                        local_height_cap,
-                                        local_hash,
-                                        local_hash_cap,
-                                        local_alice,
-                                        local_alice_cap,
-                                        local_bob,
-                                        local_bob_cap) &&
-            strcmp(server_height, want_height) == 0 &&
-            strcmp(relay_height, want_height) == 0 &&
-            strcmp(local_height, want_height) == 0 &&
-            server_hash[0] != '\0' &&
-            strcmp(server_hash, relay_hash) == 0 &&
-            strcmp(server_hash, local_hash) == 0 &&
-            strcmp(server_alice, want_alice) == 0 &&
-            strcmp(relay_alice, want_alice) == 0 &&
-            strcmp(local_alice, want_alice) == 0 &&
-            strcmp(server_bob, want_bob) == 0 &&
-            strcmp(relay_bob, want_bob) == 0 &&
-            strcmp(local_bob, want_bob) == 0) {
-            return true;
-        }
-        usleep(200000);
-    }
-    return false;
-}
-
-static void cheng_seed_bft_expected_baseline(const ChengSeedBftDeployConfig *cfg,
-                                     char *height_out,
-                                     size_t height_cap,
-                                     char *alice_out,
-                                     size_t alice_cap,
-                                     char *bob_out,
-                                     size_t bob_cap) {
-    long long want_alice = 0LL;
-    long long want_bob = 0LL;
-    if (height_out != NULL && height_cap > 0U) {
-        snprintf(height_out, height_cap, "1");
-    }
-    if (cfg != NULL) {
-        want_alice = cfg->mint_amount - cfg->transfer_amount;
-        want_bob = cfg->transfer_amount;
-    }
-    if (alice_out != NULL && alice_cap > 0U) {
-        snprintf(alice_out, alice_cap, "%lld", want_alice);
-    }
-    if (bob_out != NULL && bob_cap > 0U) {
-        snprintf(bob_out, bob_cap, "%lld", want_bob);
-    }
-}
-
-static bool cheng_seed_bft_wait_cluster_baseline(const ChengSeedBftDeployConfig *cfg,
-                                         const char *server_bin,
-                                         const char *relay_bin,
-                                         const char *local_bin,
-                                         const char *server_state,
-                                         const char *relay_state,
-                                         const char *local_state,
-                                         const char *log_prefix,
-                                         char *server_height,
-                                         size_t server_height_cap,
-                                         char *server_hash,
-                                         size_t server_hash_cap,
-                                         char *server_alice,
-                                         size_t server_alice_cap,
-                                         char *server_bob,
-                                         size_t server_bob_cap,
-                                         char *relay_height,
-                                         size_t relay_height_cap,
-                                         char *relay_hash,
-                                         size_t relay_hash_cap,
-                                         char *relay_alice,
-                                         size_t relay_alice_cap,
-                                         char *relay_bob,
-                                         size_t relay_bob_cap,
-                                         char *local_height,
-                                         size_t local_height_cap,
-                                         char *local_hash,
-                                         size_t local_hash_cap,
-                                         char *local_alice,
-                                         size_t local_alice_cap,
-                                         char *local_bob,
-                                         size_t local_bob_cap) {
-    char want_height[64];
-    char want_alice[64];
-    char want_bob[64];
-    cheng_seed_bft_expected_baseline(cfg,
-                             want_height,
-                             sizeof(want_height),
-                             want_alice,
-                             sizeof(want_alice),
-                             want_bob,
-                             sizeof(want_bob));
-    return cheng_seed_bft_wait_cluster_state(cfg,
-                                     server_bin,
-                                     relay_bin,
-                                     local_bin,
-                                     server_state,
-                                     relay_state,
-                                     local_state,
-                                     log_prefix,
-                                     want_height,
-                                     want_alice,
-                                     want_bob,
-                                     server_height,
-                                     server_height_cap,
-                                     server_hash,
-                                     server_hash_cap,
-                                     server_alice,
-                                     server_alice_cap,
-                                     server_bob,
-                                     server_bob_cap,
-                                     relay_height,
-                                     relay_height_cap,
-                                     relay_hash,
-                                     relay_hash_cap,
-                                     relay_alice,
-                                     relay_alice_cap,
-                                     relay_bob,
-                                     relay_bob_cap,
-                                     local_height,
-                                     local_height_cap,
-                                     local_hash,
-                                     local_hash_cap,
-                                     local_alice,
-                                     local_alice_cap,
-                                     local_bob,
-                                     local_bob_cap);
-}
-
-static int cheng_seed_cmd_stop_bft_validator_three_node_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    ChengSeedBftDeployConfig cfg;
-    char server_dir[PATH_MAX];
-    char relay_dir[PATH_MAX];
-    char local_follower_pid[PATH_MAX];
-    char server_log[PATH_MAX];
-    char relay_log[PATH_MAX];
-    char local_log[PATH_MAX];
-    char command[4096];
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    cheng_seed_bft_config_init(&paths, &cfg);
-    cheng_seed_bft_remote_deploy_dir(cfg.server_root, server_dir, sizeof(server_dir));
-    cheng_seed_bft_remote_deploy_dir(cfg.relay_root, relay_dir, sizeof(relay_dir));
-    cheng_seed_join_path(local_follower_pid, sizeof(local_follower_pid), cfg.local_deploy_dir, "local_follower.pid");
-    cheng_seed_join_path(server_log, sizeof(server_log), paths.root, "artifacts/gate/bft_stop_server.log");
-    cheng_seed_join_path(relay_log, sizeof(relay_log), paths.root, "artifacts/gate/bft_stop_relay.log");
-    cheng_seed_join_path(local_log, sizeof(local_log), paths.root, "artifacts/gate/bft_stop_local.log");
-    snprintf(command,
-             sizeof(command),
-             "set -u ; for pid in %s/server_proposal.pid %s/server_commit.pid %s/server_vote.pid %s/server_state.pid %s/server_proposer.pid; do if [ -f \"$pid\" ]; then p=$(cat \"$pid\"); if [ -n \"$p\" ]; then kill \"$p\" >/dev/null 2>&1 || true; sleep 1; kill -9 \"$p\" >/dev/null 2>&1 || true; fi; rm -f \"$pid\"; fi; done ; pkill -f -- \"[p]roposal-serve-daemon --file:%s/server.proposal.hex\" >/dev/null 2>&1 || true ; pkill -f -- \"[c]ommit-serve-daemon --file:%s/server.commit.hex\" >/dev/null 2>&1 || true ; pkill -f -- \"[s]tate-serve-daemon --file:%s/server.machine.hex\" >/dev/null 2>&1 || true ; pkill -f -- \"[v]ote-capture-daemon --file:%s/server.votes\" >/dev/null 2>&1 || true ; pkill -f -- \"[v]alidator-proposer-daemon --state:%s/server.state\" >/dev/null 2>&1 || true",
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir);
-    if (!cheng_seed_bft_run_remote_shell(cfg.server_ssh, command, server_log, "bft_stop_server")) {
-        return 1;
-    }
-    snprintf(command,
-             sizeof(command),
-             "set -u ; pid=%s/relay_follower.pid; if [ -f \"$pid\" ]; then p=$(cat \"$pid\"); if [ -n \"$p\" ]; then kill \"$p\" >/dev/null 2>&1 || true; sleep 1; kill -9 \"$p\" >/dev/null 2>&1 || true; fi; rm -f \"$pid\"; fi ; pkill -f -- \"[v]alidator-follower-daemon --state:%s/relay.state\" >/dev/null 2>&1 || true",
-             relay_dir,
-             relay_dir);
-    if (!cheng_seed_bft_run_remote_shell(cfg.relay_ssh, command, relay_log, "bft_stop_relay")) {
-        return 1;
-    }
-    snprintf(command,
-             sizeof(command),
-             "set -u ; pid=%s; if [ -f \"$pid\" ]; then p=$(cat \"$pid\"); if [ -n \"$p\" ]; then kill \"$p\" >/dev/null 2>&1 || true; sleep 1; kill -9 \"$p\" >/dev/null 2>&1 || true; fi; rm -f \"$pid\"; fi ; pkill -f -- \"[v]alidator-follower-daemon --state:%s/local.state\" >/dev/null 2>&1 || true",
-             local_follower_pid,
-             cfg.local_deploy_dir);
-    if (!cheng_seed_bft_run_local_shell(command, local_log, "bft_stop_local")) {
-        return 1;
-    }
-    puts("cheng bft deploy: stopped");
-    return 0;
-}
-
-static void cheng_seed_bft_bench_report_path(const char *root,
-                                     char *out,
-                                     size_t cap) {
-    if (root == NULL || root[0] == '\0' || out == NULL || cap == 0U) {
-        return;
-    }
-    cheng_seed_join_path(out, cap, root, "artifacts/gate/bench_bft_validator_three_node.report.txt");
-}
-
-static bool cheng_seed_bft_bench_restart_target_valid(const char *target) {
-    return target != NULL &&
-           (strcmp(target, "none") == 0 ||
-            strcmp(target, "server") == 0 ||
-            strcmp(target, "relay") == 0 ||
-            strcmp(target, "local") == 0);
-}
-
-static bool cheng_seed_bft_bench_start_server(const char *root,
-                                      const ChengSeedBftDeployConfig *cfg,
-                                      const char *server_dir,
-                                      const char *server_bin,
-                                      const char *local_bin,
-                                      int max_txs_per_block,
-                                      const char *log_rel_prefix) {
-    char rel_log[PATH_MAX];
-    char log_path[PATH_MAX];
-    char command[16384];
-    char probe_cmd[PATH_MAX + 256];
-    if (root == NULL || root[0] == '\0' ||
-        cfg == NULL ||
-        server_dir == NULL || server_dir[0] == '\0' ||
-        server_bin == NULL || server_bin[0] == '\0' ||
-        local_bin == NULL || local_bin[0] == '\0' ||
-        log_rel_prefix == NULL || log_rel_prefix[0] == '\0' ||
-        max_txs_per_block <= 0) {
-        return false;
-    }
-    snprintf(rel_log, sizeof(rel_log), "%s.server_start.log", log_rel_prefix);
-    cheng_seed_join_path(log_path, sizeof(log_path), root, rel_log);
-    command[0] = '\0';
-    cheng_seed_text_appendf(command,
-                    sizeof(command),
-                    "set -eu && rm -f %s/server.proposal.ready %s/server.commit.ready %s/server.vote.ready %s/server.state.ready %s/server_proposer.pid %s/server_state.pid",
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir);
-    cheng_seed_text_appendf(command,
-                    sizeof(command),
-                    " && setsid -f sh -lc 'echo $$ > %s/server_proposer.pid && exec %s validator-proposer-daemon --state:%s/server.state --queue:%s/server.queue --proposal-host:0.0.0.0 --proposal-port:%d --vote-host:0.0.0.0 --vote-port:%d --commit-host:0.0.0.0 --commit-port:%d --proposal-file:%s/server.proposal.hex --commit-file:%s/server.commit.hex --state-sync-file:%s/server.machine.hex --proposal-ready-path:%s/server.proposal.ready --vote-ready-path:%s/server.vote.ready --commit-ready-path:%s/server.commit.ready --interval-ms:%d --proposal-window-ms:%d --vote-window-ms:%d --commit-window-ms:%d --max-txs:%d > %s/server.proposer.log 2>&1 < /dev/null'",
-                    server_dir,
-                    server_bin,
-                    server_dir,
-                    server_dir,
-                    cfg->proposal_port,
-                    cfg->vote_port,
-                    cfg->commit_port,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    cfg->proposer_interval_ms,
-                    cfg->proposal_window_ms,
-                    cfg->vote_window_ms,
-                    cfg->commit_window_ms,
-                    max_txs_per_block,
-                    server_dir);
-    cheng_seed_text_appendf(command,
-                    sizeof(command),
-                    " && setsid -f sh -lc 'echo $$ > %s/server_state.pid && exec %s state-serve-daemon --file:%s/server.machine.hex --host:0.0.0.0 --port:%d --interval-ms:%d > %s/server.state.log 2>&1 < /dev/null'",
-                    server_dir,
-                    server_bin,
-                    server_dir,
-                    cfg->state_port,
-                    cfg->follower_interval_ms,
-                    server_dir);
-    cheng_seed_text_appendf(command,
-                    sizeof(command),
-                    " && i=0 && while { [ ! -f %s/server_proposer.pid ] || [ ! -f %s/server_state.pid ]; } && [ \"$i\" -lt 50 ]; do i=$((i + 1)); sleep 0.1; done && test -f %s/server_proposer.pid && test -f %s/server_state.pid",
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir);
-    if (!cheng_seed_bft_run_remote_shell(cfg->server_ssh, command, log_path, "bft_bench_start_server")) {
-        return false;
-    }
-    snprintf(rel_log, sizeof(rel_log), "%s.server_probe.log", log_rel_prefix);
-    cheng_seed_join_path(log_path, sizeof(log_path), root, rel_log);
-    snprintf(probe_cmd,
-             sizeof(probe_cmd),
-             "set -eu && %s probe-proposal --host:%s --port:%d --attempts:3 --interval-ms:100 --handshake-only:1",
-             local_bin,
-             cfg->server_addr,
-             cfg->proposal_port);
-    return cheng_seed_bft_run_local_shell(probe_cmd, log_path, "bft_bench_start_server_probe");
-}
-
-static bool cheng_seed_bft_bench_start_relay(const char *root,
-                                     const ChengSeedBftDeployConfig *cfg,
-                                     const char *relay_dir,
-                                     const char *relay_bin,
-                                     const char *log_rel_prefix) {
-    char rel_log[PATH_MAX];
-    char log_path[PATH_MAX];
-    char command[8192];
-    if (root == NULL || root[0] == '\0' ||
-        cfg == NULL ||
-        relay_dir == NULL || relay_dir[0] == '\0' ||
-        relay_bin == NULL || relay_bin[0] == '\0' ||
-        log_rel_prefix == NULL || log_rel_prefix[0] == '\0') {
-        return false;
-    }
-    snprintf(rel_log, sizeof(rel_log), "%s.relay_start.log", log_rel_prefix);
-    cheng_seed_join_path(log_path, sizeof(log_path), root, rel_log);
-    snprintf(command,
-             sizeof(command),
-             "set -eu && rm -f %s/relay_follower.pid && setsid -f sh -lc 'echo $$ > %s/relay_follower.pid && exec %s validator-follower-daemon --state:%s/relay.state --proposal-host:%s --proposal-port:%d --vote-host:%s --vote-port:%d --commit-host:%s --commit-port:%d --sync-host:%s --sync-port:%d --interval-ms:%d > %s/relay.follower.log 2>&1 < /dev/null' && i=0 && while [ ! -f %s/relay_follower.pid ] && [ \"$i\" -lt 50 ]; do i=$((i + 1)); sleep 0.1; done && test -f %s/relay_follower.pid",
-             relay_dir,
-             relay_dir,
-             relay_bin,
-             relay_dir,
-             cfg->server_addr,
-             cfg->proposal_port,
-             cfg->server_addr,
-             cfg->vote_port,
-             cfg->server_addr,
-             cfg->commit_port,
-             cfg->server_addr,
-             cfg->state_port,
-             cfg->follower_interval_ms,
-             relay_dir,
-             relay_dir,
-             relay_dir);
-    return cheng_seed_bft_run_remote_shell(cfg->relay_ssh, command, log_path, "bft_bench_start_relay");
-}
-
-static bool cheng_seed_bft_bench_start_local(const char *root,
-                                     const ChengSeedBftDeployConfig *cfg,
-                                     const char *local_dir,
-                                     const char *local_bin,
-                                     const char *log_rel_prefix) {
-    char rel_log[PATH_MAX];
-    char log_path[PATH_MAX];
-    char command[8192];
-    if (root == NULL || root[0] == '\0' ||
-        cfg == NULL ||
-        local_dir == NULL || local_dir[0] == '\0' ||
-        local_bin == NULL || local_bin[0] == '\0' ||
-        log_rel_prefix == NULL || log_rel_prefix[0] == '\0') {
-        return false;
-    }
-    snprintf(rel_log, sizeof(rel_log), "%s.local_start.log", log_rel_prefix);
-    cheng_seed_join_path(log_path, sizeof(log_path), root, rel_log);
-    snprintf(command,
-             sizeof(command),
-             "set -eu && rm -f %s/local_follower.pid && setsid -f sh -lc 'echo $$ > %s/local_follower.pid && exec %s validator-follower-daemon --state:%s/local.state --proposal-host:%s --proposal-port:%d --vote-host:%s --vote-port:%d --commit-host:%s --commit-port:%d --sync-host:%s --sync-port:%d --interval-ms:%d > %s/local.follower.log 2>&1 < /dev/null' && i=0 && while [ ! -f %s/local_follower.pid ] && [ \"$i\" -lt 50 ]; do i=$((i + 1)); sleep 0.1; done && test -f %s/local_follower.pid",
-             local_dir,
-             local_dir,
-             local_bin,
-             local_dir,
-             cfg->server_addr,
-             cfg->proposal_port,
-             cfg->server_addr,
-             cfg->vote_port,
-             cfg->server_addr,
-             cfg->commit_port,
-             cfg->server_addr,
-             cfg->state_port,
-             cfg->follower_interval_ms,
-             local_dir,
-             local_dir,
-             local_dir);
-    return cheng_seed_bft_run_local_shell(command, log_path, "bft_bench_start_local");
-}
-
-static bool cheng_seed_bft_bench_restart_node(const char *root,
-                                      const ChengSeedBftDeployConfig *cfg,
-                                      const char *server_dir,
-                                      const char *relay_dir,
-                                      const char *local_dir,
-                                      const char *server_bin,
-                                      const char *relay_bin,
-                                      const char *local_bin,
-                                      const char *restart_node,
-                                      int restart_pause_ms,
-                                      int max_txs_per_block,
-                                      const char *log_rel_prefix) {
-    char rel_log[PATH_MAX];
-    char log_path[PATH_MAX];
-    char command[8192];
-    if (!cheng_seed_bft_bench_restart_target_valid(restart_node)) {
-        return false;
-    }
-    if (strcmp(restart_node, "none") == 0) {
-        return true;
-    }
-    if (root == NULL || root[0] == '\0' ||
-        cfg == NULL ||
-        log_rel_prefix == NULL || log_rel_prefix[0] == '\0') {
-        return false;
-    }
-    if (strcmp(restart_node, "server") == 0) {
-        snprintf(rel_log, sizeof(rel_log), "%s.server_stop.log", log_rel_prefix);
-        cheng_seed_join_path(log_path, sizeof(log_path), root, rel_log);
-        snprintf(command,
-                 sizeof(command),
-                 "set -u ; for pid in %s/server_proposer.pid %s/server_state.pid; do if [ -f \"$pid\" ]; then p=$(cat \"$pid\"); if [ -n \"$p\" ]; then kill \"$p\" >/dev/null 2>&1 || true; sleep 1; kill -9 \"$p\" >/dev/null 2>&1 || true; fi; rm -f \"$pid\"; fi; done ; pkill -f -- \"[v]alidator-proposer-daemon --state:%s/server.state\" >/dev/null 2>&1 || true ; pkill -f -- \"[s]tate-serve-daemon --file:%s/server.machine.hex\" >/dev/null 2>&1 || true",
-                 server_dir,
-                 server_dir,
-                 server_dir,
-                 server_dir);
-        if (!cheng_seed_bft_run_remote_shell(cfg->server_ssh, command, log_path, "bft_bench_restart_server_stop")) {
-            return false;
-        }
-        if (restart_pause_ms > 0) {
-            usleep((useconds_t)restart_pause_ms * 1000U);
-        }
-        return cheng_seed_bft_bench_start_server(root,
-                                         cfg,
-                                         server_dir,
-                                         server_bin,
-                                         local_bin,
-                                         max_txs_per_block,
-                                         log_rel_prefix);
-    }
-    if (strcmp(restart_node, "relay") == 0) {
-        snprintf(rel_log, sizeof(rel_log), "%s.relay_stop.log", log_rel_prefix);
-        cheng_seed_join_path(log_path, sizeof(log_path), root, rel_log);
-        snprintf(command,
-                 sizeof(command),
-                 "set -u ; pid=%s/relay_follower.pid; if [ -f \"$pid\" ]; then p=$(cat \"$pid\"); if [ -n \"$p\" ]; then kill \"$p\" >/dev/null 2>&1 || true; sleep 1; kill -9 \"$p\" >/dev/null 2>&1 || true; fi; rm -f \"$pid\"; fi ; pkill -f -- \"[v]alidator-follower-daemon --state:%s/relay.state\" >/dev/null 2>&1 || true",
-                 relay_dir,
-                 relay_dir);
-        if (!cheng_seed_bft_run_remote_shell(cfg->relay_ssh, command, log_path, "bft_bench_restart_relay_stop")) {
-            return false;
-        }
-        if (restart_pause_ms > 0) {
-            usleep((useconds_t)restart_pause_ms * 1000U);
-        }
-        return cheng_seed_bft_bench_start_relay(root, cfg, relay_dir, relay_bin, log_rel_prefix);
-    }
-    snprintf(rel_log, sizeof(rel_log), "%s.local_stop.log", log_rel_prefix);
-    cheng_seed_join_path(log_path, sizeof(log_path), root, rel_log);
-    snprintf(command,
-             sizeof(command),
-             "set -u ; pid=%s/local_follower.pid; if [ -f \"$pid\" ]; then p=$(cat \"$pid\"); if [ -n \"$p\" ]; then kill \"$p\" >/dev/null 2>&1 || true; sleep 1; kill -9 \"$p\" >/dev/null 2>&1 || true; fi; rm -f \"$pid\"; fi ; pkill -f -- \"[v]alidator-follower-daemon --state:%s/local.state\" >/dev/null 2>&1 || true",
-             local_dir,
-             local_dir);
-    if (!cheng_seed_bft_run_local_shell(command, log_path, "bft_bench_restart_local_stop")) {
-        return false;
-    }
-    if (restart_pause_ms > 0) {
-        usleep((useconds_t)restart_pause_ms * 1000U);
-    }
-    return cheng_seed_bft_bench_start_local(root, cfg, local_dir, local_bin, log_rel_prefix);
-}
-
-static bool cheng_seed_bft_write_bench_report(const char *report_path,
-                                      const ChengSeedBftDeployConfig *cfg,
-                                      long long tx_count_per_wave,
-                                      int wave_count,
-                                      long long transfer_amount,
-                                      int max_txs_per_block,
-                                      const char *restart_node,
-                                      int restart_wave,
-                                      int restart_pause_ms,
-                                      long long total_tx_count,
-                                      long long tx_wire_bytes,
-                                      long long committed_bytes,
-                                      long long block_count,
-                                      long long elapsed_ms,
-                                      long long tps_milli,
-                                      long long bytes_per_sec,
-                                      long long kib_per_sec_milli,
-                                      const long long *wave_elapsed_ms,
-                                      const long long *wave_tps_milli,
-                                      const long long *wave_block_counts,
-                                      const bool *wave_restarted,
-                                      const char *final_height,
-                                      const char *final_hash,
-                                      const char *final_alice,
-                                      const char *final_bob) {
-    char tps_text[64];
-    char kib_text[64];
-    char *text = NULL;
-    size_t cap;
-    int i;
-    if (report_path == NULL || report_path[0] == '\0' ||
-        cfg == NULL ||
-        restart_node == NULL ||
-        final_height == NULL ||
-        final_hash == NULL ||
-        final_alice == NULL ||
-        final_bob == NULL ||
-        wave_count < 0) {
-        return false;
-    }
-    cap = 4096U + (size_t)(wave_count > 0 ? wave_count : 0) * 256U;
-    text = (char *)calloc(cap, 1U);
-    if (text == NULL) {
-        return false;
-    }
-    cheng_seed_bft_format_milli(tps_milli, tps_text, sizeof(tps_text));
-    cheng_seed_bft_format_milli(kib_per_sec_milli, kib_text, sizeof(kib_text));
-    cheng_seed_text_appendf(text, cap, "version=cheng.bft_three_node_bench.v2\n");
-    cheng_seed_text_appendf(text, cap, "app_id=%s\n", cfg->app_id);
-    cheng_seed_text_appendf(text, cap, "tx_count_per_wave=%lld\n", tx_count_per_wave);
-    cheng_seed_text_appendf(text, cap, "wave_count=%d\n", wave_count);
-    cheng_seed_text_appendf(text, cap, "transfer_amount=%lld\n", transfer_amount);
-    cheng_seed_text_appendf(text, cap, "max_txs_per_block=%d\n", max_txs_per_block);
-    cheng_seed_text_appendf(text, cap, "restart_node=%s\n", restart_node);
-    cheng_seed_text_appendf(text, cap, "restart_wave=%d\n", restart_wave);
-    cheng_seed_text_appendf(text, cap, "restart_pause_ms=%d\n", restart_pause_ms);
-    cheng_seed_text_appendf(text, cap, "tx_count=%lld\n", total_tx_count);
-    cheng_seed_text_appendf(text, cap, "tx_wire_bytes=%lld\n", tx_wire_bytes);
-    cheng_seed_text_appendf(text, cap, "committed_bytes=%lld\n", committed_bytes);
-    cheng_seed_text_appendf(text, cap, "block_count=%lld\n", block_count);
-    cheng_seed_text_appendf(text, cap, "elapsed_ms=%lld\n", elapsed_ms);
-    cheng_seed_text_appendf(text, cap, "tps=%s\n", tps_text);
-    cheng_seed_text_appendf(text, cap, "throughput_bytes_per_sec=%lld\n", bytes_per_sec);
-    cheng_seed_text_appendf(text, cap, "throughput_kib_per_sec=%s\n", kib_text);
-    cheng_seed_text_appendf(text, cap, "final_height=%s\n", final_height);
-    cheng_seed_text_appendf(text, cap, "app_hash=%s\n", final_hash);
-    cheng_seed_text_appendf(text, cap, "alice_balance=%s\n", final_alice);
-    cheng_seed_text_appendf(text, cap, "bob_balance=%s\n", final_bob);
-    for (i = 0; i < wave_count; ++i) {
-        char wave_tps_text[64];
-        cheng_seed_bft_format_milli(wave_tps_milli[i], wave_tps_text, sizeof(wave_tps_text));
-        cheng_seed_text_appendf(text, cap, "wave_%d_elapsed_ms=%lld\n", i + 1, wave_elapsed_ms[i]);
-        cheng_seed_text_appendf(text, cap, "wave_%d_tps=%s\n", i + 1, wave_tps_text);
-        cheng_seed_text_appendf(text, cap, "wave_%d_block_count=%lld\n", i + 1, wave_block_counts[i]);
-        cheng_seed_text_appendf(text, cap, "wave_%d_restarted=%s\n", i + 1, wave_restarted[i] ? "true" : "false");
-    }
-    if (!cheng_seed_ensure_parent_dir(report_path) || !cheng_seed_write_text_file(report_path, text)) {
-        free(text);
-        return false;
-    }
-    free(text);
-    return true;
-}
-
-static int cheng_seed_cmd_status_bft_validator_three_node_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    ChengSeedBftDeployConfig cfg;
-    char server_dir[PATH_MAX];
-    char relay_dir[PATH_MAX];
-    char server_state[PATH_MAX];
-    char relay_state[PATH_MAX];
-    char local_state[PATH_MAX];
-    char server_bin[PATH_MAX];
-    char relay_bin[PATH_MAX];
-    char local_bin[PATH_MAX];
-    char server_height[128];
-    char server_hash[128];
-    char server_alice[128];
-    char server_bob[128];
-    char relay_height[128];
-    char relay_hash[128];
-    char relay_alice[128];
-    char relay_bob[128];
-    char local_height[128];
-    char local_hash[128];
-    char local_alice[128];
-    char local_bob[128];
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    cheng_seed_bft_config_init(&paths, &cfg);
-    cheng_seed_bft_remote_deploy_dir(cfg.server_root, server_dir, sizeof(server_dir));
-    cheng_seed_bft_remote_deploy_dir(cfg.relay_root, relay_dir, sizeof(relay_dir));
-    cheng_seed_join_path(server_state, sizeof(server_state), server_dir, "server.state");
-    cheng_seed_join_path(relay_state, sizeof(relay_state), relay_dir, "relay.state");
-    cheng_seed_join_path(local_state, sizeof(local_state), cfg.local_deploy_dir, "local.state");
-    cheng_seed_bft_remote_bin(cfg.server_root, server_bin, sizeof(server_bin));
-    cheng_seed_bft_remote_bin(cfg.relay_root, relay_bin, sizeof(relay_bin));
-    cheng_seed_bft_local_bin(&paths, local_bin, sizeof(local_bin));
-    if (!cheng_seed_bft_collect_remote_status(cfg.server_ssh,
-                                      server_bin,
-                                      server_state,
-                                      &cfg,
-                                      false,
-                                      "artifacts/gate/bft_server_status.summary.log",
-                                      server_height,
-                                      sizeof(server_height),
-                                      server_hash,
-                                      sizeof(server_hash),
-                                      server_alice,
-                                      sizeof(server_alice),
-                                      server_bob,
-                                      sizeof(server_bob))) {
-        fprintf(stderr, "[cheng_seed] status-bft-validator-three-node server failed\n");
-        return 1;
-    }
-    if (!cheng_seed_bft_collect_remote_status(cfg.relay_ssh,
-                                      relay_bin,
-                                      relay_state,
-                                      &cfg,
-                                      false,
-                                      "artifacts/gate/bft_relay_status.summary.log",
-                                      relay_height,
-                                      sizeof(relay_height),
-                                      relay_hash,
-                                      sizeof(relay_hash),
-                                      relay_alice,
-                                      sizeof(relay_alice),
-                                      relay_bob,
-                                      sizeof(relay_bob))) {
-        fprintf(stderr, "[cheng_seed] status-bft-validator-three-node relay failed\n");
-        return 1;
-    }
-    if (!cheng_seed_bft_collect_local_status(local_bin,
-                                     local_state,
-                                     &cfg,
-                                     false,
-                                     "artifacts/gate/bft_local_status.summary.log",
-                                     local_height,
-                                     sizeof(local_height),
-                                     local_hash,
-                                     sizeof(local_hash),
-                                     local_alice,
-                                     sizeof(local_alice),
-                                     local_bob,
-                                     sizeof(local_bob))) {
-        fprintf(stderr, "[cheng_seed] status-bft-validator-three-node local failed\n");
-        return 1;
-    }
-    cheng_seed_bft_print_status_line("server", server_height, server_hash, server_alice, server_bob);
-    puts("---");
-    cheng_seed_bft_print_status_line("relay", relay_height, relay_hash, relay_alice, relay_bob);
-    puts("---");
-    cheng_seed_bft_print_status_line("local", local_height, local_hash, local_alice, local_bob);
-    return 0;
-}
-
-static int cheng_seed_cmd_deploy_bft_validator_three_node_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    ChengSeedBftDeployConfig cfg;
-    char server_dir[PATH_MAX];
-    char relay_dir[PATH_MAX];
-    char server_state[PATH_MAX];
-    char relay_state[PATH_MAX];
-    char local_state[PATH_MAX];
-    char local_bin[PATH_MAX];
-    char server_bin[PATH_MAX];
-    char relay_bin[PATH_MAX];
-    char log_path[PATH_MAX];
-    char command[16384];
-    char server_height[128];
-    char server_hash[128];
-    char server_alice[128];
-    char server_bob[128];
-    char relay_height[128];
-    char relay_hash[128];
-    char relay_alice[128];
-    char relay_bob[128];
-    char local_height[128];
-    char local_hash[128];
-    char local_alice[128];
-    char local_bob[128];
-    char local_follower_pid[PATH_MAX];
-    char local_follower_log[PATH_MAX];
-    char local_state_arg[PATH_MAX + 32];
-    char local_proposal_host_arg[128];
-    char local_proposal_port_arg[64];
-    char local_vote_host_arg[128];
-    char local_vote_port_arg[64];
-    char local_commit_host_arg[128];
-    char local_commit_port_arg[64];
-    char local_sync_host_arg[128];
-    char local_sync_port_arg[64];
-    char local_interval_arg[64];
-    char local_start_note[256];
-    char saved_bft_self_test[32];
-    pid_t local_pid = -1;
-    bool had_saved_bft_self_test = false;
-    char *local_follower_argv[13];
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    cheng_seed_bft_config_init(&paths, &cfg);
-    cheng_seed_bft_remote_deploy_dir(cfg.server_root, server_dir, sizeof(server_dir));
-    cheng_seed_bft_remote_deploy_dir(cfg.relay_root, relay_dir, sizeof(relay_dir));
-    cheng_seed_join_path(server_state, sizeof(server_state), server_dir, "server.state");
-    cheng_seed_join_path(relay_state, sizeof(relay_state), relay_dir, "relay.state");
-    cheng_seed_join_path(local_state, sizeof(local_state), cfg.local_deploy_dir, "local.state");
-    cheng_seed_join_path(local_follower_pid, sizeof(local_follower_pid), cfg.local_deploy_dir, "local_follower.pid");
-    cheng_seed_join_path(local_follower_log, sizeof(local_follower_log), cfg.local_deploy_dir, "local.follower.log");
-    cheng_seed_bft_remote_bin(cfg.server_root, server_bin, sizeof(server_bin));
-    cheng_seed_bft_remote_bin(cfg.relay_root, relay_bin, sizeof(relay_bin));
-    cheng_seed_bft_local_bin(&paths, local_bin, sizeof(local_bin));
-    if (!cheng_seed_bft_write_manifest(&cfg)) {
-        fprintf(stderr, "[cheng_seed] deploy-bft-validator-three-node failed to write manifest\n");
-        return 1;
-    }
-    if (cheng_seed_cmd_stop_bft_validator_three_node_impl(argc, argv) != 0) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_sync_server.mkdir.log");
-    snprintf(command, sizeof(command), "set -eu && mkdir -p %s", cfg.server_root);
-    if (!cheng_seed_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_sync_server_mkdir")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_sync_server.log");
-    if (!cheng_seed_bft_rsync_repo(paths.root, cfg.server_ssh, cfg.server_root, log_path)) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_sync_relay.mkdir.log");
-    snprintf(command, sizeof(command), "set -eu && mkdir -p %s", cfg.relay_root);
-    if (!cheng_seed_bft_run_remote_shell(cfg.relay_ssh, command, log_path, "bft_sync_relay_mkdir")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_sync_relay.log");
-    if (!cheng_seed_bft_rsync_repo(paths.root, cfg.relay_ssh, cfg.relay_root, log_path)) {
-        return 1;
-    }
-    cheng_seed_save_env_value("BFT_STATE_RUN_SELF_TEST",
-                      saved_bft_self_test,
-                      sizeof(saved_bft_self_test),
-                      &had_saved_bft_self_test);
-    setenv("BFT_STATE_RUN_SELF_TEST", "0", 1);
-    if (cheng_seed_cmd_build_bft_state_machine_impl(argc, argv) != 0) {
-        cheng_seed_restore_env_value("BFT_STATE_RUN_SELF_TEST", saved_bft_self_test, had_saved_bft_self_test);
-        return 1;
-    }
-    cheng_seed_restore_env_value("BFT_STATE_RUN_SELF_TEST", saved_bft_self_test, had_saved_bft_self_test);
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_build_relay.log");
-    if (!cheng_seed_bft_build_remote_x86_state_machine(cfg.relay_ssh,
-                                               cfg.relay_root,
-                                               log_path,
-                                               "bft_build_relay")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_prepare_server_bin_dir.log");
-    snprintf(command,
-             sizeof(command),
-             "set -eu && mkdir -p %s/artifacts/bft_state_machine/x86_64-unknown-linux-gnu",
-             cfg.server_root);
-    if (!cheng_seed_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_prepare_server_bin_dir")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_copy_server_bin.log");
-    if (!cheng_seed_bft_copy_remote_file_via_local_scp(cfg.relay_ssh,
-                                               relay_bin,
-                                               cfg.server_ssh,
-                                               server_bin,
-                                               log_path,
-                                               "bft_copy_server_bin")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_open_server_proposal_udp.log");
-    if (!cheng_seed_bft_remote_allow_udp_port(cfg.server_ssh,
-                                      cfg.proposal_port,
-                                      log_path,
-                                      "bft_open_server_proposal_udp")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_open_server_vote_udp.log");
-    if (!cheng_seed_bft_remote_allow_udp_port(cfg.server_ssh,
-                                      cfg.vote_port,
-                                      log_path,
-                                      "bft_open_server_vote_udp")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_open_server_commit_udp.log");
-    if (!cheng_seed_bft_remote_allow_udp_port(cfg.server_ssh,
-                                      cfg.commit_port,
-                                      log_path,
-                                      "bft_open_server_commit_udp")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_open_server_state_udp.log");
-    if (!cheng_seed_bft_remote_allow_udp_port(cfg.server_ssh,
-                                      cfg.state_port,
-                                      log_path,
-                                      "bft_open_server_state_udp")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_init_server.log");
-    snprintf(command,
-             sizeof(command),
-             "set -eu && mkdir -p %s && rm -f %s/server.proposal.ready %s/server.commit.ready %s/server.vote.ready %s/server.state.ready %s/server.state.vote_lock %s/server.queue.cursor %s/server.machine.hex %s/server_state.pid && rm -rf %s/server.machine.hex.snapshots && : > %s/server.queue && : > %s/server.proposal.hex && : > %s/server.commit.hex && : > %s/server.votes && %s init --state:%s/server.state --app-id:%s --validator-slot:1 --force",
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir,
-             server_bin,
-             server_dir,
-             cfg.app_id);
-    if (!cheng_seed_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_init_server")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_init_relay.log");
-    snprintf(command,
-             sizeof(command),
-             "set -eu && mkdir -p %s && rm -f %s/relay.state.vote_lock && %s init --state:%s/relay.state --app-id:%s --validator-slot:2 --force",
-             relay_dir,
-             relay_dir,
-             relay_bin,
-             relay_dir,
-             cfg.app_id);
-    if (!cheng_seed_bft_run_remote_shell(cfg.relay_ssh, command, log_path, "bft_init_relay")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_init_local.log");
-    snprintf(command,
-             sizeof(command),
-             "set -eu && mkdir -p %s && rm -f %s.vote_lock && %s init --state:%s --app-id:%s --validator-slot:3 --force",
-             cfg.local_deploy_dir,
-             local_state,
-             local_bin,
-             local_state,
-             cfg.app_id);
-    if (!cheng_seed_bft_run_local_shell(command, log_path, "bft_init_local")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_seed_queue.log");
-    snprintf(command,
-             sizeof(command),
-             "set -eu && %s submit-mint --queue:%s/server.queue --asset:%d --account:%d --amount:%lld && %s submit-transfer --queue:%s/server.queue --asset:%d --from:%d --to:%d --amount:%lld",
-             server_bin,
-             server_dir,
-             cfg.asset_id,
-             cfg.alice_id,
-             cfg.mint_amount,
-             server_bin,
-             server_dir,
-             cfg.asset_id,
-             cfg.alice_id,
-             cfg.bob_id,
-             cfg.transfer_amount);
-    if (!cheng_seed_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_seed_queue")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_start_server_proposer.log");
-    command[0] = '\0';
-    cheng_seed_text_appendf(command,
-                    sizeof(command),
-                    "set -eu && rm -f %s/server.proposal.ready %s/server.commit.ready %s/server.vote.ready %s/server.state.ready %s/server_proposal.pid %s/server_commit.pid %s/server_vote.pid %s/server_proposer.pid %s/server_state.pid",
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir);
-    cheng_seed_text_appendf(command,
-                    sizeof(command),
-                    " && setsid -f sh -lc 'echo $$ > %s/server_proposer.pid && exec %s validator-proposer-daemon --state:%s/server.state --queue:%s/server.queue --proposal-host:0.0.0.0 --proposal-port:%d --vote-host:0.0.0.0 --vote-port:%d --commit-host:0.0.0.0 --commit-port:%d --proposal-file:%s/server.proposal.hex --commit-file:%s/server.commit.hex --state-sync-file:%s/server.machine.hex --proposal-ready-path:%s/server.proposal.ready --vote-ready-path:%s/server.vote.ready --commit-ready-path:%s/server.commit.ready --interval-ms:%d --proposal-window-ms:%d --vote-window-ms:%d --commit-window-ms:%d --max-txs:%d > %s/server.proposer.log 2>&1 < /dev/null'",
-                    server_dir,
-                    server_bin,
-                    server_dir,
-                    server_dir,
-                    cfg.proposal_port,
-                    cfg.vote_port,
-                    cfg.commit_port,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    cfg.proposer_interval_ms,
-                    cfg.proposal_window_ms,
-                    cfg.vote_window_ms,
-                    cfg.commit_window_ms,
-                    (getenv("CHENG_BFT_MAX_TXS") != NULL && getenv("CHENG_BFT_MAX_TXS")[0] != '\0') ? atoi(getenv("CHENG_BFT_MAX_TXS")) : cfg.default_max_txs,
-                    server_dir);
-    cheng_seed_text_appendf(command,
-                    sizeof(command),
-                    " && setsid -f sh -lc 'echo $$ > %s/server_state.pid && exec %s state-serve-daemon --file:%s/server.machine.hex --host:0.0.0.0 --port:%d --interval-ms:%d > %s/server.state.log 2>&1 < /dev/null'",
-                    server_dir,
-                    server_bin,
-                    server_dir,
-                    cfg.state_port,
-                    cfg.follower_interval_ms,
-                    server_dir);
-    cheng_seed_text_appendf(command,
-                    sizeof(command),
-                    " && i=0 && while { [ ! -f %s/server_proposer.pid ] || [ ! -f %s/server_state.pid ]; } && [ \"$i\" -lt 50 ]; do i=$((i + 1)); sleep 0.1; done && test -f %s/server_proposer.pid && test -f %s/server_state.pid",
-                    server_dir,
-                    server_dir,
-                    server_dir,
-                    server_dir);
-    if (!cheng_seed_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_start_server_proposer")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_wait_server_ready.log");
-    snprintf(command,
-             sizeof(command),
-             "set -eu && i=0 && while { [ ! -f %s/server.proposal.ready ] || [ ! -f %s/server.vote.ready ]; } && [ \"$i\" -lt 200 ]; do i=$((i + 1)); sleep 0.05; done && test -f %s/server.proposal.ready && test -f %s/server.vote.ready",
-             server_dir,
-             server_dir,
-             server_dir,
-             server_dir);
-    if (!cheng_seed_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_wait_server_ready")) {
-        (void)cheng_seed_cmd_stop_bft_validator_three_node_impl(argc, argv);
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_start_relay_follower.log");
-    snprintf(command,
-             sizeof(command),
-             "set -eu && rm -f %s/relay_follower.pid && setsid -f sh -lc 'echo $$ > %s/relay_follower.pid && exec %s validator-follower-daemon --state:%s/relay.state --proposal-host:%s --proposal-port:%d --vote-host:%s --vote-port:%d --commit-host:%s --commit-port:%d --sync-host:%s --sync-port:%d --interval-ms:%d > %s/relay.follower.log 2>&1 < /dev/null' && i=0 && while [ ! -f %s/relay_follower.pid ] && [ \"$i\" -lt 50 ]; do i=$((i + 1)); sleep 0.1; done && test -f %s/relay_follower.pid",
-             relay_dir,
-             relay_dir,
-             relay_bin,
-             relay_dir,
-             cfg.server_addr,
-             cfg.proposal_port,
-             cfg.server_addr,
-             cfg.vote_port,
-             cfg.server_addr,
-             cfg.commit_port,
-             cfg.server_addr,
-             cfg.state_port,
-             cfg.follower_interval_ms,
-             relay_dir,
-             relay_dir,
-             relay_dir);
-    if (!cheng_seed_bft_run_remote_shell(cfg.relay_ssh, command, log_path, "bft_start_relay_follower")) {
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_start_local_follower.log");
-    unlink(local_follower_pid);
-    snprintf(local_state_arg, sizeof(local_state_arg), "--state:%s", local_state);
-    snprintf(local_proposal_host_arg, sizeof(local_proposal_host_arg), "--proposal-host:%s", cfg.server_addr);
-    snprintf(local_proposal_port_arg, sizeof(local_proposal_port_arg), "--proposal-port:%d", cfg.proposal_port);
-    snprintf(local_vote_host_arg, sizeof(local_vote_host_arg), "--vote-host:%s", cfg.server_addr);
-    snprintf(local_vote_port_arg, sizeof(local_vote_port_arg), "--vote-port:%d", cfg.vote_port);
-    snprintf(local_commit_host_arg, sizeof(local_commit_host_arg), "--commit-host:%s", cfg.server_addr);
-    snprintf(local_commit_port_arg, sizeof(local_commit_port_arg), "--commit-port:%d", cfg.commit_port);
-    snprintf(local_sync_host_arg, sizeof(local_sync_host_arg), "--sync-host:%s", cfg.server_addr);
-    snprintf(local_sync_port_arg, sizeof(local_sync_port_arg), "--sync-port:%d", cfg.state_port);
-    snprintf(local_interval_arg, sizeof(local_interval_arg), "--interval-ms:%d", cfg.follower_interval_ms);
-    local_follower_argv[0] = local_bin;
-    local_follower_argv[1] = "validator-follower-daemon";
-    local_follower_argv[2] = local_state_arg;
-    local_follower_argv[3] = local_proposal_host_arg;
-    local_follower_argv[4] = local_proposal_port_arg;
-    local_follower_argv[5] = local_vote_host_arg;
-    local_follower_argv[6] = local_vote_port_arg;
-    local_follower_argv[7] = local_commit_host_arg;
-    local_follower_argv[8] = local_commit_port_arg;
-    local_follower_argv[9] = local_sync_host_arg;
-    local_follower_argv[10] = local_sync_port_arg;
-    local_follower_argv[11] = local_interval_arg;
-    local_follower_argv[12] = NULL;
-    if (!cheng_seed_spawn_binary_detached_logged(local_follower_argv,
-                                         local_follower_log,
-                                         local_follower_pid,
-                                         &local_pid)) {
-        fprintf(stderr, "[cheng_seed] bft_start_local_follower spawn failed log=%s pid=%s\n",
-                local_follower_log,
-                local_follower_pid);
-        return 1;
-    }
-    {
-        int spin;
-        bool alive = false;
-        for (spin = 0; spin < 50; ++spin) {
-            if (cheng_seed_process_alive(local_pid)) {
-                alive = true;
-                break;
-            }
-            usleep(100000);
-        }
-        if (!alive) {
-            fprintf(stderr, "[cheng_seed] bft_start_local_follower died pid=%ld log=%s\n",
-                    (long)local_pid,
-                    local_follower_log);
-            return 1;
-        }
-    }
-    snprintf(local_start_note,
-             sizeof(local_start_note),
-             "pid=%ld\nlog=%s\n",
-             (long)local_pid,
-             local_follower_log);
-    if (!cheng_seed_write_text_file(log_path, local_start_note)) {
-        return 1;
-    }
-    if (!cheng_seed_bft_wait_cluster_baseline(&cfg,
-                                      server_bin,
-                                      relay_bin,
-                                      local_bin,
-                                      server_state,
-                                      relay_state,
-                                      local_state,
-                                      "artifacts/gate/bft_wait_baseline",
-                                      server_height,
-                                      sizeof(server_height),
-                                      server_hash,
-                                      sizeof(server_hash),
-                                      server_alice,
-                                      sizeof(server_alice),
-                                      server_bob,
-                                      sizeof(server_bob),
-                                      relay_height,
-                                      sizeof(relay_height),
-                                      relay_hash,
-                                      sizeof(relay_hash),
-                                      relay_alice,
-                                      sizeof(relay_alice),
-                                      relay_bob,
-                                      sizeof(relay_bob),
-                                      local_height,
-                                      sizeof(local_height),
-                                      local_hash,
-                                      sizeof(local_hash),
-                                      local_alice,
-                                      sizeof(local_alice),
-                                      local_bob,
-                                      sizeof(local_bob))) {
-        fprintf(stderr, "[cheng_seed] deploy-bft-validator-three-node did not converge\n");
-        return 1;
-    }
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_ue_check.log");
-    snprintf(command,
-             sizeof(command),
-             "ps -Ao pid=,ppid=,state=,etime=,command= | awk '$2==1 && $3 ~ /^U/ && $5 ~ /bft_state_machine/'");
-    if (!cheng_seed_bft_run_local_shell(command, log_path, "bft_ue_check")) {
-        return 1;
-    }
-    {
-        char *ue_text = cheng_seed_read_file(log_path);
-        if (ue_text != NULL && ue_text[0] != '\0') {
-            fprintf(stderr, "[cheng_seed] deploy-bft-validator-three-node unexpected UE process\n%s", ue_text);
-            free(ue_text);
-            return 1;
-        }
-        free(ue_text);
-    }
-    cheng_seed_bft_print_status_line("server", server_height, server_hash, server_alice, server_bob);
-    puts("---");
-    cheng_seed_bft_print_status_line("relay", relay_height, relay_hash, relay_alice, relay_bob);
-    puts("---");
-    cheng_seed_bft_print_status_line("local", local_height, local_hash, local_alice, local_bob);
-    return 0;
-}
-
-static int cheng_seed_cmd_verify_bft_validator_three_node_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    ChengSeedBftDeployConfig cfg;
-    char server_dir[PATH_MAX];
-    char relay_dir[PATH_MAX];
-    char server_state[PATH_MAX];
-    char relay_state[PATH_MAX];
-    char local_state[PATH_MAX];
-    char report_path[PATH_MAX];
-    char server_bin[PATH_MAX];
-    char relay_bin[PATH_MAX];
-    char local_bin[PATH_MAX];
-    char want_height[64];
-    char want_alice[64];
-    char want_bob[64];
-    char server_height[128] = {0};
-    char server_hash[128] = {0};
-    char server_alice[128] = {0};
-    char server_bob[128] = {0};
-    char relay_height[128] = {0};
-    char relay_hash[128] = {0};
-    char relay_alice[128] = {0};
-    char relay_bob[128] = {0};
-    char local_height[128] = {0};
-    char local_hash[128] = {0};
-    char local_alice[128] = {0};
-    char local_bob[128] = {0};
-    bool server_ok = false;
-    bool relay_ok = false;
-    bool local_ok = false;
-    bool verified = false;
-    int stop_rc = 0;
-    cheng_seed_bootstrap_paths_init(&paths);
-    cheng_seed_bft_config_init(&paths, &cfg);
-    cheng_seed_bft_remote_deploy_dir(cfg.server_root, server_dir, sizeof(server_dir));
-    cheng_seed_bft_remote_deploy_dir(cfg.relay_root, relay_dir, sizeof(relay_dir));
-    cheng_seed_join_path(server_state, sizeof(server_state), server_dir, "server.state");
-    cheng_seed_join_path(relay_state, sizeof(relay_state), relay_dir, "relay.state");
-    cheng_seed_join_path(local_state, sizeof(local_state), cfg.local_deploy_dir, "local.state");
-    cheng_seed_join_path(report_path,
-                 sizeof(report_path),
-                 paths.root,
-                 "artifacts/gate/verify_bft_validator_three_node.report.txt");
-    if (cheng_seed_cmd_deploy_bft_validator_three_node_impl(argc, argv) != 0) {
-        (void)cheng_seed_cmd_stop_bft_validator_three_node_impl(argc, argv);
-        return 1;
-    }
-    cheng_seed_bft_remote_bin(cfg.server_root, server_bin, sizeof(server_bin));
-    cheng_seed_bft_remote_bin(cfg.relay_root, relay_bin, sizeof(relay_bin));
-    cheng_seed_bft_local_bin(&paths, local_bin, sizeof(local_bin));
-    server_ok = cheng_seed_bft_collect_remote_status(cfg.server_ssh,
-                                             server_bin,
-                                             server_state,
-                                             &cfg,
-                                             false,
-                                             "artifacts/gate/bft_verify_server.summary.log",
-                                             server_height,
-                                             sizeof(server_height),
-                                             server_hash,
-                                             sizeof(server_hash),
-                                             server_alice,
-                                             sizeof(server_alice),
-                                             server_bob,
-                                             sizeof(server_bob));
-    relay_ok = cheng_seed_bft_collect_remote_status(cfg.relay_ssh,
-                                            relay_bin,
-                                            relay_state,
-                                            &cfg,
-                                            false,
-                                            "artifacts/gate/bft_verify_relay.summary.log",
-                                            relay_height,
-                                            sizeof(relay_height),
-                                            relay_hash,
-                                            sizeof(relay_hash),
-                                            relay_alice,
-                                            sizeof(relay_alice),
-                                            relay_bob,
-                                            sizeof(relay_bob));
-    local_ok = cheng_seed_bft_collect_local_status(local_bin,
-                                           local_state,
-                                           &cfg,
-                                           false,
-                                           "artifacts/gate/bft_verify_local.summary.log",
-                                           local_height,
-                                           sizeof(local_height),
-                                           local_hash,
-                                           sizeof(local_hash),
-                                           local_alice,
-                                           sizeof(local_alice),
-                                           local_bob,
-                                           sizeof(local_bob));
-    cheng_seed_bft_expected_baseline(&cfg,
-                             want_height,
-                             sizeof(want_height),
-                             want_alice,
-                             sizeof(want_alice),
-                             want_bob,
-                             sizeof(want_bob));
-    verified = server_ok &&
-               relay_ok &&
-               local_ok &&
-               cheng_seed_bft_cluster_matches_values(want_height,
-                                             want_alice,
-                                             want_bob,
-                                             server_height,
-                                             server_hash,
-                                             server_alice,
-                                             server_bob,
-                                             relay_height,
-                                             relay_hash,
-                                             relay_alice,
-                                             relay_bob,
-                                             local_height,
-                                             local_hash,
-                                             local_alice,
-                                             local_bob);
-    if (!cheng_seed_bft_write_verify_report(report_path,
-                                    &cfg,
-                                    verified,
-                                    server_height,
-                                    server_hash,
-                                    server_alice,
-                                    server_bob,
-                                    relay_height,
-                                    relay_hash,
-                                    relay_alice,
-                                    relay_bob,
-                                    local_height,
-                                    local_hash,
-                                    local_alice,
-                                    local_bob)) {
-        fprintf(stderr, "[cheng_seed] verify-bft-validator-three-node failed to write report\n");
-        (void)cheng_seed_cmd_stop_bft_validator_three_node_impl(argc, argv);
-        return 1;
-    }
-    stop_rc = cheng_seed_cmd_stop_bft_validator_three_node_impl(argc, argv);
-    if (!server_ok) {
-        fprintf(stderr, "[cheng_seed] verify-bft-validator-three-node server status failed\n");
-        return 1;
-    }
-    if (!relay_ok) {
-        fprintf(stderr, "[cheng_seed] verify-bft-validator-three-node relay status failed\n");
-        return 1;
-    }
-    if (!local_ok) {
-        fprintf(stderr, "[cheng_seed] verify-bft-validator-three-node local status failed\n");
-        return 1;
-    }
-    if (!verified) {
-        fprintf(stderr, "[cheng_seed] verify-bft-validator-three-node cluster drifted\n");
-        cheng_seed_bft_print_status_line("server", server_height, server_hash, server_alice, server_bob);
-        puts("---");
-        cheng_seed_bft_print_status_line("relay", relay_height, relay_hash, relay_alice, relay_bob);
-        puts("---");
-        cheng_seed_bft_print_status_line("local", local_height, local_hash, local_alice, local_bob);
-        return 1;
-    }
-    if (stop_rc != 0) {
-        fprintf(stderr, "[cheng_seed] verify-bft-validator-three-node stop failed\n");
-        return stop_rc;
-    }
-    puts("cheng bft verify ok");
-    printf("report=%s\n", report_path);
-    return 0;
-}
-
-static int cheng_seed_cmd_bench_bft_validator_three_node_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    ChengSeedBftDeployConfig cfg;
-    const char *tx_count_text = cheng_seed_flag_value(argc, argv, "--tx-count");
-    const char *wave_count_text = cheng_seed_flag_value(argc, argv, "--wave-count");
-    const char *transfer_amount_text = cheng_seed_flag_value(argc, argv, "--transfer-amount");
-    const char *max_txs_text = cheng_seed_flag_value(argc, argv, "--max-txs-per-block");
-    const char *restart_node_text = cheng_seed_flag_value(argc, argv, "--restart-node");
-    const char *restart_wave_text = cheng_seed_flag_value(argc, argv, "--restart-wave");
-    const char *restart_pause_ms_text = cheng_seed_flag_value(argc, argv, "--restart-pause-ms");
-    int tx_count = tx_count_text != NULL && tx_count_text[0] != '\0' ? atoi(tx_count_text) : 256;
-    int wave_count = wave_count_text != NULL && wave_count_text[0] != '\0' ? atoi(wave_count_text) : 1;
-    long long transfer_amount = transfer_amount_text != NULL && transfer_amount_text[0] != '\0' ? atoll(transfer_amount_text) : 1LL;
-    int max_txs_per_block = max_txs_text != NULL && max_txs_text[0] != '\0' ? atoi(max_txs_text) : tx_count;
-    char restart_node[32];
-    int restart_pause_ms = restart_pause_ms_text != NULL && restart_pause_ms_text[0] != '\0' ? atoi(restart_pause_ms_text) : 1000;
-    int restart_wave;
-    char saved_max_txs_env[32];
-    bool had_saved_max_txs_env = false;
-    char server_dir[PATH_MAX];
-    char relay_dir[PATH_MAX];
-    char report_path[PATH_MAX];
-    char server_state[PATH_MAX];
-    char relay_state[PATH_MAX];
-    char local_state[PATH_MAX];
-    char server_bin[PATH_MAX];
-    char relay_bin[PATH_MAX];
-    char local_bin[PATH_MAX];
-    char log_path[PATH_MAX];
-    char log_rel[PATH_MAX];
-    char command[16384];
-    char server_height[128];
-    char server_hash[128];
-    char server_alice[128];
-    char server_bob[128];
-    char relay_height[128];
-    char relay_hash[128];
-    char relay_alice[128];
-    char relay_bob[128];
-    char local_height[128];
-    char local_hash[128];
-    char local_alice[128];
-    char local_bob[128];
-    char final_tps_text[64];
-    char final_kib_text[64];
-    char queued_count_buf[64];
-    char queued_bytes_buf[64];
-    char tx_wire_bytes_buf[64];
-    long long *wave_elapsed_ms = NULL;
-    long long *wave_tps_milli = NULL;
-    long long *wave_block_counts = NULL;
-    bool *wave_restarted = NULL;
-    char tps_text[64];
-    char kib_text[64];
-    char *bench_text = NULL;
-    char *ue_text = NULL;
-    long long base_height;
-    long long base_alice;
-    long long base_bob;
-    long long required_amount_per_wave;
-    long long total_required_amount;
-    long long total_queued_count = 0LL;
-    long long total_queued_bytes = 0LL;
-    long long tx_wire_bytes = 0LL;
-    long long total_blocks = 0LL;
-    long long expected_height;
-    long long expected_alice;
-    long long expected_bob;
-    long long bench_start_ms;
-    long long elapsed_ms;
-    long long tps_milli;
-    long long bytes_per_sec;
-    long long kib_per_sec_milli;
-    long long topup_amount;
-    int wave_index;
-    int rc = 1;
-    cheng_seed_trim_copy_text(restart_node_text != NULL ? restart_node_text : "none",
-                      restart_node,
-                      sizeof(restart_node));
-    if (restart_node[0] == '\0') {
-        snprintf(restart_node, sizeof(restart_node), "none");
-    }
-    restart_wave = restart_wave_text != NULL && restart_wave_text[0] != '\0' ?
-        atoi(restart_wave_text) :
-        (wave_count >= 2 ? 2 : 1);
-    if (tx_count <= 0 || wave_count <= 0 || transfer_amount <= 0LL || max_txs_per_block <= 0 || restart_pause_ms < 0) {
-        fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node requires positive --tx-count --wave-count --transfer-amount --max-txs-per-block and non-negative --restart-pause-ms\n");
-        return 1;
-    }
-    if (!cheng_seed_bft_bench_restart_target_valid(restart_node)) {
-        fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node requires --restart-node none|server|relay|local\n");
-        return 1;
-    }
-    if (strcmp(restart_node, "none") == 0) {
-        restart_wave = 0;
-    } else if (restart_wave <= 0 || restart_wave > wave_count) {
-        fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node requires --restart-wave within 1..wave-count when restart is enabled\n");
-        return 1;
-    }
-    wave_elapsed_ms = (long long *)calloc((size_t)wave_count, sizeof(long long));
-    wave_tps_milli = (long long *)calloc((size_t)wave_count, sizeof(long long));
-    wave_block_counts = (long long *)calloc((size_t)wave_count, sizeof(long long));
-    wave_restarted = (bool *)calloc((size_t)wave_count, sizeof(bool));
-    if (wave_elapsed_ms == NULL ||
-        wave_tps_milli == NULL ||
-        wave_block_counts == NULL ||
-        wave_restarted == NULL) {
-        fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node failed to allocate wave stats\n");
-        goto cleanup;
-    }
-    {
-        const char *saved_max_txs_env_ptr = getenv("CHENG_BFT_MAX_TXS");
-        if (saved_max_txs_env_ptr != NULL && saved_max_txs_env_ptr[0] != '\0') {
-            snprintf(saved_max_txs_env, sizeof(saved_max_txs_env), "%s", saved_max_txs_env_ptr);
-            had_saved_max_txs_env = true;
-        }
-        char max_txs_env[32];
-        snprintf(max_txs_env, sizeof(max_txs_env), "%d", max_txs_per_block);
-        setenv("CHENG_BFT_MAX_TXS", max_txs_env, 1);
-    }
-    if (cheng_seed_cmd_deploy_bft_validator_three_node_impl(argc, argv) != 0) {
-        if (had_saved_max_txs_env) {
-            setenv("CHENG_BFT_MAX_TXS", saved_max_txs_env, 1);
-        } else {
-            unsetenv("CHENG_BFT_MAX_TXS");
-        }
-        goto cleanup;
-    }
-    if (had_saved_max_txs_env) {
-        setenv("CHENG_BFT_MAX_TXS", saved_max_txs_env, 1);
-    } else {
-        unsetenv("CHENG_BFT_MAX_TXS");
-    }
-    cheng_seed_bootstrap_paths_init(&paths);
-    cheng_seed_bft_config_init(&paths, &cfg);
-    cheng_seed_bft_remote_deploy_dir(cfg.server_root, server_dir, sizeof(server_dir));
-    cheng_seed_bft_remote_deploy_dir(cfg.relay_root, relay_dir, sizeof(relay_dir));
-    cheng_seed_bft_bench_report_path(paths.root, report_path, sizeof(report_path));
-    cheng_seed_join_path(server_state, sizeof(server_state), server_dir, "server.state");
-    cheng_seed_join_path(relay_state, sizeof(relay_state), relay_dir, "relay.state");
-    cheng_seed_join_path(local_state, sizeof(local_state), cfg.local_deploy_dir, "local.state");
-    cheng_seed_bft_remote_bin(cfg.server_root, server_bin, sizeof(server_bin));
-    cheng_seed_bft_remote_bin(cfg.relay_root, relay_bin, sizeof(relay_bin));
-    cheng_seed_bft_local_bin(&paths, local_bin, sizeof(local_bin));
-    if (!cheng_seed_bft_wait_cluster_baseline(&cfg,
-                                      server_bin,
-                                      relay_bin,
-                                      local_bin,
-                                      server_state,
-                                      relay_state,
-                                      local_state,
-                                      "artifacts/gate/bft_bench_bootstrap_wait",
-                                      server_height,
-                                      sizeof(server_height),
-                                      server_hash,
-                                      sizeof(server_hash),
-                                      server_alice,
-                                      sizeof(server_alice),
-                                      server_bob,
-                                      sizeof(server_bob),
-                                      relay_height,
-                                      sizeof(relay_height),
-                                      relay_hash,
-                                      sizeof(relay_hash),
-                                      relay_alice,
-                                      sizeof(relay_alice),
-                                      relay_bob,
-                                      sizeof(relay_bob),
-                                      local_height,
-                                      sizeof(local_height),
-                                      local_hash,
-                                      sizeof(local_hash),
-                                      local_alice,
-                                      sizeof(local_alice),
-                                      local_bob,
-                                      sizeof(local_bob))) {
-        fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node baseline wait failed\n");
-        goto cleanup;
-    }
-    base_height = atoll(server_height);
-    base_alice = atoll(server_alice);
-    base_bob = atoll(server_bob);
-    required_amount_per_wave = (long long)tx_count * transfer_amount;
-    total_required_amount = (long long)tx_count * (long long)wave_count * transfer_amount;
-    if (base_alice < total_required_amount) {
-        topup_amount = total_required_amount - base_alice + transfer_amount;
-        cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_bench_topup.log");
-        snprintf(command,
-                 sizeof(command),
-                 "set -eu && %s submit-mint --queue:%s/server.queue --asset:%d --account:%d --amount:%lld",
-                 server_bin,
-                 server_dir,
-                 cfg.asset_id,
-                 cfg.alice_id,
-                 topup_amount);
-        if (!cheng_seed_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_bench_topup")) {
-            goto cleanup;
-        }
-        base_height += 1LL;
-        base_alice += topup_amount;
-        snprintf(tps_text, sizeof(tps_text), "%lld", base_height);
-        snprintf(kib_text, sizeof(kib_text), "%lld", base_alice);
-        snprintf(queued_count_buf, sizeof(queued_count_buf), "%lld", base_bob);
-        if (!cheng_seed_bft_wait_cluster_state(&cfg,
-                                       server_bin,
-                                       relay_bin,
-                                       local_bin,
-                                       server_state,
-                                       relay_state,
-                                       local_state,
-                                       "artifacts/gate/bft_bench_topup_wait",
-                                       tps_text,
-                                       kib_text,
-                                       queued_count_buf,
-                                       server_height,
-                                       sizeof(server_height),
-                                       server_hash,
-                                       sizeof(server_hash),
-                                       server_alice,
-                                       sizeof(server_alice),
-                                       server_bob,
-                                       sizeof(server_bob),
-                                       relay_height,
-                                       sizeof(relay_height),
-                                       relay_hash,
-                                       sizeof(relay_hash),
-                                       relay_alice,
-                                       sizeof(relay_alice),
-                                       relay_bob,
-                                       sizeof(relay_bob),
-                                       local_height,
-                                       sizeof(local_height),
-                                       local_hash,
-                                       sizeof(local_hash),
-                                       local_alice,
-                                       sizeof(local_alice),
-                                       local_bob,
-                                       sizeof(local_bob))) {
-            fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node topup did not converge\n");
-            goto cleanup;
-        }
-    }
-    expected_height = base_height;
-    expected_alice = base_alice;
-    expected_bob = base_bob;
-    bench_start_ms = cheng_seed_bft_monotime_ms();
-    for (wave_index = 0; wave_index < wave_count; ++wave_index) {
-        long long wave_start_ms;
-        long long wave_queued_count;
-        long long wave_queued_bytes;
-        long long wave_tx_wire_bytes;
-        long long blocks_needed;
-        snprintf(log_rel, sizeof(log_rel), "artifacts/gate/bft_bench_wave_%d.submit.log", wave_index + 1);
-        cheng_seed_join_path(log_path, sizeof(log_path), paths.root, log_rel);
-        wave_start_ms = cheng_seed_bft_monotime_ms();
-        snprintf(command,
-                 sizeof(command),
-                 "set -eu && %s submit-transfer-series --queue:%s/server.queue --asset:%d --from:%d --to:%d --amount:%lld --count:%d",
-                 server_bin,
-                 server_dir,
-                 cfg.asset_id,
-                 cfg.alice_id,
-                 cfg.bob_id,
-                 transfer_amount,
-                 tx_count);
-        if (!cheng_seed_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_bench_submit_series")) {
-            goto cleanup;
-        }
-        free(bench_text);
-        bench_text = cheng_seed_read_file(log_path);
-        if (bench_text == NULL ||
-            !cheng_seed_text_line_value(bench_text, "queued_count", queued_count_buf, sizeof(queued_count_buf)) ||
-            !cheng_seed_text_line_value(bench_text, "queued_bytes", queued_bytes_buf, sizeof(queued_bytes_buf)) ||
-            !cheng_seed_text_line_value(bench_text, "tx_wire_bytes", tx_wire_bytes_buf, sizeof(tx_wire_bytes_buf))) {
-            fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node failed to parse submit series report\n");
-            goto cleanup;
-        }
-        wave_queued_count = atoll(queued_count_buf);
-        wave_queued_bytes = atoll(queued_bytes_buf);
-        wave_tx_wire_bytes = atoll(tx_wire_bytes_buf);
-        free(bench_text);
-        bench_text = NULL;
-        if (wave_queued_count != (long long)tx_count || wave_queued_bytes <= 0LL || wave_tx_wire_bytes <= 0LL) {
-            fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node invalid submit series report\n");
-            goto cleanup;
-        }
-        if (tx_wire_bytes <= 0LL) {
-            tx_wire_bytes = wave_tx_wire_bytes;
-        }
-        blocks_needed = ((long long)tx_count + (long long)max_txs_per_block - 1LL) / (long long)max_txs_per_block;
-        total_queued_count += wave_queued_count;
-        total_queued_bytes += wave_queued_bytes;
-        total_blocks += blocks_needed;
-        expected_height += blocks_needed;
-        expected_alice -= required_amount_per_wave;
-        expected_bob += required_amount_per_wave;
-        if (strcmp(restart_node, "none") != 0 && wave_index + 1 == restart_wave) {
-            snprintf(log_rel, sizeof(log_rel), "artifacts/gate/bft_bench_wave_%d.restart", wave_index + 1);
-            if (!cheng_seed_bft_bench_restart_node(paths.root,
-                                           &cfg,
-                                           server_dir,
-                                           relay_dir,
-                                           cfg.local_deploy_dir,
-                                           server_bin,
-                                           relay_bin,
-                                           local_bin,
-                                           restart_node,
-                                           restart_pause_ms,
-                                           max_txs_per_block,
-                                           log_rel)) {
-                fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node restart failed\n");
-                goto cleanup;
-            }
-            wave_restarted[wave_index] = true;
-        }
-        snprintf(tps_text, sizeof(tps_text), "%lld", expected_height);
-        snprintf(kib_text, sizeof(kib_text), "%lld", expected_alice);
-        snprintf(queued_count_buf, sizeof(queued_count_buf), "%lld", expected_bob);
-        snprintf(log_rel, sizeof(log_rel), "artifacts/gate/bft_bench_wave_%d.wait", wave_index + 1);
-        if (!cheng_seed_bft_wait_cluster_state(&cfg,
-                                       server_bin,
-                                       relay_bin,
-                                       local_bin,
-                                       server_state,
-                                       relay_state,
-                                       local_state,
-                                       log_rel,
-                                       tps_text,
-                                       kib_text,
-                                       queued_count_buf,
-                                       server_height,
-                                       sizeof(server_height),
-                                       server_hash,
-                                       sizeof(server_hash),
-                                       server_alice,
-                                       sizeof(server_alice),
-                                       server_bob,
-                                       sizeof(server_bob),
-                                       relay_height,
-                                       sizeof(relay_height),
-                                       relay_hash,
-                                       sizeof(relay_hash),
-                                       relay_alice,
-                                       sizeof(relay_alice),
-                                       relay_bob,
-                                       sizeof(relay_bob),
-                                       local_height,
-                                       sizeof(local_height),
-                                       local_hash,
-                                       sizeof(local_hash),
-                                       local_alice,
-                                       sizeof(local_alice),
-                                       local_bob,
-                                       sizeof(local_bob))) {
-            fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node did not converge\n");
-            goto cleanup;
-        }
-        wave_elapsed_ms[wave_index] = cheng_seed_bft_monotime_ms() - wave_start_ms;
-        if (wave_elapsed_ms[wave_index] <= 0LL) {
-            wave_elapsed_ms[wave_index] = 1LL;
-        }
-        wave_tps_milli[wave_index] = wave_queued_count * 1000000LL / wave_elapsed_ms[wave_index];
-        wave_block_counts[wave_index] = blocks_needed;
-    }
-    elapsed_ms = cheng_seed_bft_monotime_ms() - bench_start_ms;
-    if (elapsed_ms <= 0LL) {
-        elapsed_ms = 1LL;
-    }
-    tps_milli = total_queued_count * 1000000LL / elapsed_ms;
-    bytes_per_sec = total_queued_bytes * 1000LL / elapsed_ms;
-    kib_per_sec_milli = total_queued_bytes * 1000000LL / (elapsed_ms * 1024LL);
-    cheng_seed_bft_format_milli(tps_milli, final_tps_text, sizeof(final_tps_text));
-    cheng_seed_bft_format_milli(kib_per_sec_milli, final_kib_text, sizeof(final_kib_text));
-    cheng_seed_join_path(log_path, sizeof(log_path), paths.root, "artifacts/gate/bft_bench_ue_check.log");
-    snprintf(command,
-             sizeof(command),
-             "ps -Ao pid=,ppid=,state=,etime=,command= | awk '$2==1 && $3 ~ /^U/ && $5 ~ /bft_state_machine/'");
-    if (!cheng_seed_bft_run_local_shell(command, log_path, "bft_bench_ue_check")) {
-        goto cleanup;
-    }
-    ue_text = cheng_seed_read_file(log_path);
-    if (ue_text != NULL && ue_text[0] != '\0') {
-        fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node unexpected UE process\n%s", ue_text);
-        goto cleanup;
-    }
-    if (!cheng_seed_bft_write_bench_report(report_path,
-                                   &cfg,
-                                   (long long)tx_count,
-                                   wave_count,
-                                   transfer_amount,
-                                   max_txs_per_block,
-                                   restart_node,
-                                   restart_wave,
-                                   restart_pause_ms,
-                                   total_queued_count,
-                                   tx_wire_bytes,
-                                   total_queued_bytes,
-                                   total_blocks,
-                                   elapsed_ms,
-                                   tps_milli,
-                                   bytes_per_sec,
-                                   kib_per_sec_milli,
-                                   wave_elapsed_ms,
-                                   wave_tps_milli,
-                                   wave_block_counts,
-                                   wave_restarted,
-                                   server_height,
-                                   server_hash,
-                                   server_alice,
-                                   server_bob)) {
-        fprintf(stderr, "[cheng_seed] bench-bft-validator-three-node failed to write report\n");
-        goto cleanup;
-    }
-    printf("tx_count_per_wave=%d\n", tx_count);
-    printf("wave_count=%d\n", wave_count);
-    printf("restart_node=%s\n", restart_node);
-    printf("restart_wave=%d\n", restart_wave);
-    printf("restart_pause_ms=%d\n", restart_pause_ms);
-    printf("tx_count=%lld\n", total_queued_count);
-    printf("tx_wire_bytes=%lld\n", tx_wire_bytes);
-    printf("committed_bytes=%lld\n", total_queued_bytes);
-    printf("block_count=%lld\n", total_blocks);
-    printf("elapsed_ms=%lld\n", elapsed_ms);
-    printf("tps=%s\n", final_tps_text);
-    printf("throughput_bytes_per_sec=%lld\n", bytes_per_sec);
-    printf("throughput_kib_per_sec=%s\n", final_kib_text);
-    printf("final_height=%s\n", server_height);
-    printf("app_hash=%s\n", server_hash);
-    printf("alice_balance=%s\n", server_alice);
-    printf("bob_balance=%s\n", server_bob);
-    for (wave_index = 0; wave_index < wave_count; ++wave_index) {
-        cheng_seed_bft_format_milli(wave_tps_milli[wave_index], tps_text, sizeof(tps_text));
-        printf("wave_%d_elapsed_ms=%lld\n", wave_index + 1, wave_elapsed_ms[wave_index]);
-        printf("wave_%d_tps=%s\n", wave_index + 1, tps_text);
-        printf("wave_%d_block_count=%lld\n", wave_index + 1, wave_block_counts[wave_index]);
-        printf("wave_%d_restarted=%s\n", wave_index + 1, wave_restarted[wave_index] ? "true" : "false");
-    }
-    printf("report=%s\n", report_path);
-    rc = 0;
-cleanup:
-    free(bench_text);
-    free(ue_text);
-    free(wave_elapsed_ms);
-    free(wave_tps_milli);
-    free(wave_block_counts);
-    free(wave_restarted);
-    return rc;
-}
-
-static int cheng_seed_cmd_build_panic_trace_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char src[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char line_map[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char report_path[PATH_MAX];
-    char report_log[PATH_MAX];
-    char *report_text = NULL;
-    char *run_argv[2];
-    int status = 0;
-    int rc = 1;
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/panic_trace");
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/tests/ordinary_panic_fixture.cheng");
-    cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_panic_fixture");
-    snprintf(line_map, sizeof(line_map), "%s.map", out_bin);
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_panic_fixture.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "ordinary_panic_fixture.run.log");
-    cheng_seed_join_path(report_path, sizeof(report_path), out_dir, "ordinary_panic_fixture.report.txt");
-    snprintf(report_log, sizeof(report_log), "%s.crash-report.log", report_path);
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_cheng, src, out_bin, compile_log) ||
-        !cheng_seed_expect_file_exists_nonempty("build-panic-trace line-map", line_map) ||
-        !cheng_seed_expect_line_map_text("build-panic-trace line-map", line_map, "ordinary_panic_fixture.cheng", true)) {
-        return 1;
-    }
-    run_argv[0] = out_bin;
-    run_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        cheng_seed_status_is_exit_code(status, 0)) {
-        return 1;
-    }
-    if (!cheng_seed_crash_report_transform_raw(run_log, report_path, report_log)) {
-        return 1;
-    }
-    if (!cheng_seed_verify_runtime_fixture_output("build-panic-trace",
-                                          src,
-                                          run_log,
-                                          report_path,
-                                          "cheng panic fixture",
-                                          "reason=panic mode=backtrace",
-                                          false)) {
-        return 1;
-    }
-    report_text = cheng_seed_read_file(report_path);
-    if (report_text == NULL) {
-        return 1;
-    }
-    fputs(report_text, stdout);
-    rc = 0;
-    free(report_text);
-    return rc;
-}
-
-static int cheng_seed_cmd_build_bounds_trace_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char src[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char line_map[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char report_path[PATH_MAX];
-    char report_log[PATH_MAX];
-    char *run_argv[2];
-    char *report_text = NULL;
-    int status = 0;
-    int rc = 1;
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/bounds_trace");
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/tests/ordinary_bounds_trace_fixture.cheng");
-    cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_bounds_trace_fixture");
-    snprintf(line_map, sizeof(line_map), "%s.map", out_bin);
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_bounds_trace_fixture.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "ordinary_bounds_trace_fixture.run.log");
-    cheng_seed_join_path(report_path, sizeof(report_path), out_dir, "ordinary_bounds_trace_fixture.report.txt");
-    snprintf(report_log, sizeof(report_log), "%s.crash-report.log", report_path);
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_cheng, src, out_bin, compile_log) ||
-        !cheng_seed_expect_file_exists_nonempty("build-bounds-trace line-map", line_map)) {
-        return 1;
-    }
-    run_argv[0] = out_bin;
-    run_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        cheng_seed_status_is_exit_code(status, 0)) {
-        return 1;
-    }
-    if (!cheng_seed_crash_report_transform_raw(run_log, report_path, report_log)) {
-        return 1;
-    }
-    if (!cheng_seed_verify_runtime_fixture_output("build-bounds-trace",
-                                          src,
-                                          run_log,
-                                          report_path,
-                                          "[cheng] bounds check failed: idx=1 len=1",
-                                          "reason=bounds mode=backtrace",
-                                          false)) {
-        return 1;
-    }
-    report_text = cheng_seed_read_file(report_path);
-    if (report_text == NULL) {
-        return 1;
-    }
-    fputs(report_text, stdout);
-    rc = 0;
-    free(report_text);
-    return rc;
-}
-
-static int cheng_seed_cmd_build_signal_trace_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char src[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char line_map[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char report_path[PATH_MAX];
-    char report_log[PATH_MAX];
-    char *report_text = NULL;
-    char *run_argv[2];
-    int status = 0;
-    int rc = 1;
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/signal_trace");
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/tests/ordinary_signal_trace_fixture.cheng");
-    cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_signal_trace_fixture");
-    snprintf(line_map, sizeof(line_map), "%s.map", out_bin);
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_signal_trace_fixture.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "ordinary_signal_trace_fixture.run.log");
-    cheng_seed_join_path(report_path, sizeof(report_path), out_dir, "ordinary_signal_trace_fixture.report.txt");
-    snprintf(report_log, sizeof(report_log), "%s.crash-report.log", report_path);
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_cheng, src, out_bin, compile_log) ||
-        !cheng_seed_expect_file_exists_nonempty("build-signal-trace line-map", line_map)) {
-        return 1;
-    }
-    run_argv[0] = out_bin;
-    run_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        cheng_seed_status_is_exit_code(status, 0)) {
-        return 1;
-    }
-    if (!cheng_seed_crash_report_transform_raw(run_log, report_path, report_log)) {
-        return 1;
-    }
-    if (!cheng_seed_verify_runtime_fixture_output("build-signal-trace",
-                                          src,
-                                          run_log,
-                                          report_path,
-                                          "cheng_crash_raw_v1",
-                                          "reason=signal mode=signal",
-                                          true)) {
-        return 1;
-    }
-    report_text = cheng_seed_read_file(report_path);
-    if (report_text == NULL) {
-        return 1;
-    }
-    fputs(report_text, stdout);
-    rc = 0;
-    free(report_text);
-    return rc;
-}
-
-static int cheng_seed_cmd_build_ffi_handle_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char ok_src[PATH_MAX];
-    char trap_src[PATH_MAX];
-    char ok_bin[PATH_MAX];
-    char trap_bin[PATH_MAX];
-    char ok_line_map[PATH_MAX];
-    char trap_line_map[PATH_MAX];
-    char ok_compile_log[PATH_MAX];
-    char trap_compile_log[PATH_MAX];
-    char ok_run_log[PATH_MAX];
-    char trap_run_log[PATH_MAX];
-    char *ok_argv[2];
-    char *trap_argv[2];
-    char *trap_text = NULL;
-    int status = 0;
-    int rc = 1;
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/ffi_handle");
-    cheng_seed_join_path(ok_src, sizeof(ok_src), paths.root, "src/tests/ffi_handle_smoke.cheng");
-    cheng_seed_join_path(trap_src, sizeof(trap_src), paths.root, "src/tests/ffi_handle_stale_trap_smoke.cheng");
-    cheng_seed_join_path(ok_bin, sizeof(ok_bin), out_dir, "ffi_handle_smoke");
-    cheng_seed_join_path(trap_bin, sizeof(trap_bin), out_dir, "ffi_handle_stale_trap_smoke");
-    snprintf(ok_line_map, sizeof(ok_line_map), "%s.map", ok_bin);
-    snprintf(trap_line_map, sizeof(trap_line_map), "%s.map", trap_bin);
-    cheng_seed_join_path(ok_compile_log, sizeof(ok_compile_log), out_dir, "ffi_handle_smoke.compile.log");
-    cheng_seed_join_path(trap_compile_log, sizeof(trap_compile_log), out_dir, "ffi_handle_stale_trap_smoke.compile.log");
-    cheng_seed_join_path(ok_run_log, sizeof(ok_run_log), out_dir, "ffi_handle_smoke.run.log");
-    cheng_seed_join_path(trap_run_log, sizeof(trap_run_log), out_dir, "ffi_handle_stale_trap_smoke.run.log");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_cheng, ok_src, ok_bin, ok_compile_log) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_cheng, trap_src, trap_bin, trap_compile_log) ||
-        !cheng_seed_expect_file_exists_nonempty("build-ffi-handle ok line-map", ok_line_map) ||
-        !cheng_seed_expect_file_exists_nonempty("build-ffi-handle trap line-map", trap_line_map)) {
-        return 1;
-    }
-    ok_argv[0] = ok_bin;
-    ok_argv[1] = NULL;
-    trap_argv[0] = trap_bin;
-    trap_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(ok_argv, ok_run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] build-ffi-handle expected success log=%s\n", ok_run_log);
-        return 1;
-    }
-    if (!cheng_seed_run_binary_capture_output(trap_argv, trap_run_log, &status) ||
-        cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] build-ffi-handle expected trap log=%s\n", trap_run_log);
-        return 1;
-    }
-    trap_text = cheng_seed_read_file(trap_run_log);
-    if (trap_text == NULL ||
-        !cheng_seed_expect_text_contains("build-ffi-handle", trap_text, "[cheng] ffi handle invalid: op=resolve_ptr detail=released handle=") ||
-        !(cheng_seed_text_contains_substring(trap_text, "[cheng] reason=ffi_handle mode=backtrace") ||
-          cheng_seed_text_contains_substring(trap_text, "[cheng-crash-trace] reason=ffi_handle")) ||
-        !cheng_seed_expect_text_contains("build-ffi-handle", trap_text, "ffi_handle_stale_trap_smoke.cheng:")) {
-        free(trap_text);
-        return 1;
-    }
-    free(trap_text);
-    if (!cheng_seed_dump_file_stdout(ok_run_log) || !cheng_seed_dump_file_stdout(trap_run_log)) {
-        return 1;
-    }
-    rc = 0;
-    return rc;
-}
-
-static int cheng_seed_cmd_build_browser_host_wasm_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char src[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char out_path[PATH_MAX];
-    char compile_log[PATH_MAX];
-    const char *compiler_bin;
-    const char *positionals[2];
-    size_t positional_count = 0U;
-    const char *out_env = getenv("CHENG_BROWSER_HOST_WASM_OUT");
-    const char *compiler_env = getenv("CHENG_WASM_COMPILER");
-    cheng_seed_bootstrap_paths_init(&paths);
-    cheng_seed_copy_text(root_cheng, sizeof(root_cheng), paths.root);
-    if (compiler_env == NULL || compiler_env[0] == '\0') {
-        if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-            return 1;
-        }
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_WASM_COMPILER",
-                                                NULL,
-                                                paths.backend_driver_out);
-    if (!cheng_seed_leaf_expect_compiler("build-browser-host-wasm", compiler_bin)) {
-        return 1;
-    }
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/libp2p/browser/browser_host_wasm_probe.cheng");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/browser_host_wasm");
-    positional_count = cheng_seed_collect_smoke_positionals(argc, argv, positionals, sizeof(positionals) / sizeof(positionals[0]));
-    if (out_env != NULL && out_env[0] != '\0') {
-        if (cheng_seed_const_os_is_absolute(out_env)) {
-            cheng_seed_copy_text(out_path, sizeof(out_path), out_env);
-        } else {
-            cheng_seed_join_path(out_path, sizeof(out_path), paths.root, out_env);
-        }
-    } else if (positional_count > 0U && positionals[0][0] != '\0') {
-        if (cheng_seed_const_os_is_absolute(positionals[0])) {
-            cheng_seed_copy_text(out_path, sizeof(out_path), positionals[0]);
-        } else {
-            cheng_seed_join_path(out_path, sizeof(out_path), paths.root, positionals[0]);
-        }
-    } else {
-        cheng_seed_join_path(out_path, sizeof(out_path), out_dir, "cheng_browser_host_abi.wasm");
-    }
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "cheng_browser_host_abi.compile.log");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_ensure_parent_dir(out_path) ||
-        !cheng_seed_compile_fixture_with_backend_driver_emit_target(compiler_bin,
-                                                            root_cheng,
-                                                            src,
-                                                            "shared",
-                                                            "wasm32-unknown-unknown",
-                                                            out_path,
-                                                            compile_log,
-                                                            NULL) ||
-        !cheng_seed_expect_file_exists_nonempty("build-browser-host-wasm output", out_path)) {
-        return 1;
-    }
-    printf("cheng browser host wasm: build ok out=%s\n", out_path);
-    return 0;
-}
-
-static int cheng_seed_cmd_build_chain_node_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char src[PATH_MAX];
-    char default_out_dir[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char target_buf[256];
-    char *run_argv[5];
-    const char *target = getenv("CHAIN_NODE_TARGET");
-    const char *out_dir_env = getenv("CHAIN_NODE_OUT_DIR");
-    const char *out_bin_env = getenv("CHAIN_NODE_OUT_BIN");
-    const char *run_self_test_env = getenv("CHAIN_NODE_RUN_SELF_TEST");
-    const char *host_target = cheng_seed_host_target_triple();
-    int status = 0;
-    bool run_self_test = false;
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    if (target == NULL || target[0] == '\0') {
-        target = "arm64-apple-darwin";
-    }
-    cheng_seed_copy_text(target_buf, sizeof(target_buf), target);
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/apps/chain_node/cheng_node_main.cheng");
-    cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/cheng_node_main");
-    if (!cheng_seed_streq(target_buf, "arm64-apple-darwin")) {
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
-    }
-    if (out_dir_env != NULL && out_dir_env[0] != '\0') {
-        cheng_seed_copy_text(out_dir, sizeof(out_dir), out_dir_env);
-    } else {
-        cheng_seed_copy_text(out_dir, sizeof(out_dir), default_out_dir);
-    }
-    if (out_bin_env != NULL && out_bin_env[0] != '\0') {
-        cheng_seed_copy_text(out_bin, sizeof(out_bin), out_bin_env);
-    } else {
-        cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, "cheng_node_main");
-    }
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "cheng_node_main.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "cheng_node_main.self-test.log");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_fixture_with_backend_driver_target(paths.backend_driver_out, root_cheng, src, target_buf, out_bin, compile_log) ||
-        access(out_bin, X_OK) != 0) {
-        fprintf(stderr, "[cheng_seed] build-chain-node missing output: %s\n", out_bin);
-        return 1;
-    }
-    if (run_self_test_env != NULL && run_self_test_env[0] != '\0' && !cheng_seed_streq(run_self_test_env, "auto")) {
-        run_self_test = !cheng_seed_streq(run_self_test_env, "0");
-    } else {
-        run_self_test = host_target[0] != '\0' && cheng_seed_streq(target_buf, host_target);
-    }
-    if (!run_self_test) {
-        printf("cheng chain_node: build ok target=%s out=%s\n", target_buf, out_bin);
-        return 0;
-    }
-    run_argv[0] = out_bin;
-    run_argv[1] = "chain";
-    run_argv[2] = "self";
-    run_argv[3] = "test";
-    run_argv[4] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] build-chain-node self-test failed log=%s\n", run_log);
-        return 1;
-    }
-    return cheng_seed_dump_file_stdout(run_log) ? 0 : 1;
-}
-
-static int cheng_seed_cmd_build_rwad_bft_state_machine_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char src[PATH_MAX];
-    char default_out_dir[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char target_buf[256];
-    const char *compiler_bin;
-    const char *target = getenv("RWAD_BFT_TARGET");
-    const char *out_dir_env = getenv("RWAD_BFT_OUT_DIR");
-    const char *out_bin_env = getenv("RWAD_BFT_OUT_BIN");
-    const char *run_self_test_env = getenv("RWAD_BFT_RUN_SELF_TEST");
-    const char *host_target = cheng_seed_host_target_triple();
-    bool run_self_test = false;
-    char *run_argv[5];
-    int status = 0;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_RWAD_COMPILER",
-                                                NULL,
-                                                paths.backend_driver_out);
-    if (!cheng_seed_leaf_expect_compiler("build-rwad-bft-state-machine", compiler_bin)) {
-        return 1;
-    }
-    if (target == NULL || target[0] == '\0') {
-        target = "arm64-apple-darwin";
-    }
-    cheng_seed_copy_text(target_buf, sizeof(target_buf), target);
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/apps/rwad/rwad_bft_state_machine_main.cheng");
-    cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/rwad_bft_state_machine");
-    if (!cheng_seed_streq(target_buf, "arm64-apple-darwin")) {
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
-    }
-    if (out_dir_env != NULL && out_dir_env[0] != '\0') {
-        cheng_seed_copy_text(out_dir, sizeof(out_dir), out_dir_env);
-    } else {
-        cheng_seed_copy_text(out_dir, sizeof(out_dir), default_out_dir);
-    }
-    if (out_bin_env != NULL && out_bin_env[0] != '\0') {
-        cheng_seed_copy_text(out_bin, sizeof(out_bin), out_bin_env);
-    } else {
-        cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, "rwad_bft_state_machine");
-    }
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, "rwad_bft_state_machine.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "rwad_bft_state_machine.self-test.log");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_ensure_parent_dir(out_bin) ||
-        !cheng_seed_compile_fixture_with_backend_driver_target(compiler_bin,
-                                                       root_cheng,
-                                                       src,
-                                                       target_buf,
-                                                       out_bin,
-                                                       compile_log) ||
-        access(out_bin, X_OK) != 0) {
-        fprintf(stderr, "[cheng_seed] build-rwad-bft-state-machine missing output: %s\n", out_bin);
-        return 1;
-    }
-    if (run_self_test_env != NULL && run_self_test_env[0] != '\0' && !cheng_seed_streq(run_self_test_env, "auto")) {
-        run_self_test = !cheng_seed_streq(run_self_test_env, "0");
-    } else {
-        run_self_test = host_target[0] != '\0' && cheng_seed_streq(target_buf, host_target);
-    }
-    if (!run_self_test) {
-        printf("cheng rwad_bft_state_machine: build ok target=%s out=%s\n", target_buf, out_bin);
-        return 0;
-    }
-    run_argv[0] = out_bin;
-    run_argv[1] = "self-test";
-    run_argv[2] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] build-rwad-bft-state-machine self-test failed log=%s\n", run_log);
-        return 1;
-    }
-    return cheng_seed_dump_file_stdout(run_log) ? 0 : 1;
-}
-
-static bool cheng_seed_text_is_decimal_digits(const char *text) {
-    size_t i;
-    if (text == NULL || text[0] == '\0') {
-        return false;
-    }
-    for (i = 0; text[i] != '\0'; ++i) {
-        if (text[i] < '0' || text[i] > '9') {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool cheng_seed_expect_linux_aarch64_object_report(const char *label,
-                                                  const char *path) {
-    char *text = cheng_seed_debug_object_report(path);
-    bool ok = true;
-    if (text == NULL) {
-        fprintf(stderr, "[cheng_seed] %s object report missing: %s\n", label, path);
-        return false;
-    }
-    ok = ok && cheng_seed_expect_text_has_line(label, text, "cheng_object_report_v1");
-    ok = ok && cheng_seed_expect_text_has_line(label, text, "format=elf64");
-    ok = ok && cheng_seed_expect_text_has_line(label, text, "machine=183");
-    ok = ok && cheng_seed_expect_text_has_prefix(label, text, "section_count=");
-    ok = ok && cheng_seed_expect_text_has_prefix(label, text, "symbol_count=");
-    free(text);
-    return ok;
-}
-
-static bool cheng_seed_expect_linux_x86_64_object_report(const char *label,
-                                                 const char *path) {
-    char *text = cheng_seed_debug_object_report(path);
-    bool ok = true;
-    if (text == NULL) {
-        fprintf(stderr, "[cheng_seed] %s object report missing: %s\n", label, path);
-        return false;
-    }
-    ok = ok && cheng_seed_expect_text_has_line(label, text, "cheng_object_report_v1");
-    ok = ok && cheng_seed_expect_text_has_line(label, text, "format=elf64");
-    ok = ok && cheng_seed_expect_text_has_line(label, text, "machine=62");
-    ok = ok && cheng_seed_expect_text_has_prefix(label, text, "section_count=");
-    ok = ok && cheng_seed_expect_text_has_prefix(label, text, "symbol_count=");
-    free(text);
-    return ok;
-}
-
-static int cheng_seed_cmd_build_chain_node_linux_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char src[PATH_MAX];
-    char default_out_dir[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char out_path[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char target_buf[256];
-    const char *compiler_bin;
-    const char *compiler_env = getenv("CHENG_CHAIN_NODE_COMPILER");
-    const char *target = getenv("CHAIN_NODE_TARGET");
-    const char *artifact_kind = getenv("CHAIN_NODE_LINUX_ARTIFACT");
-    const char *out_dir_env = getenv("CHAIN_NODE_OUT_DIR");
-    const char *out_bin_env = getenv("CHAIN_NODE_OUT_BIN");
-    const char *run_self_test_env = getenv("CHAIN_NODE_RUN_SELF_TEST");
-    const char *host_target = cheng_seed_host_target_triple();
-    bool want_exe = false;
-    bool run_self_test = false;
-    char *run_argv[5];
-    int status = 0;
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = (compiler_env != NULL && compiler_env[0] != '\0') ? compiler_env : paths.backend_driver_out;
-    if (access(compiler_bin, X_OK) != 0) {
-        fprintf(stderr, "[cheng_seed] build-chain-node-linux missing compiler: %s\n", compiler_bin);
-        return 1;
-    }
-    if (target == NULL || target[0] == '\0') {
-        target = "aarch64-unknown-linux-gnu";
-    }
-    if (cheng_seed_streq(target, "arm64-unknown-linux-gnu")) {
-        target = "aarch64-unknown-linux-gnu";
-    }
-    if (!cheng_seed_streq(target, "aarch64-unknown-linux-gnu") &&
-        !cheng_seed_streq(target, "x86_64-unknown-linux-gnu")) {
-        fprintf(stderr, "cheng chain_node linux: unsupported target=%s\n", target);
-        fprintf(stderr,
-                "cheng chain_node linux: supported linux targets are aarch64-unknown-linux-gnu and x86_64-unknown-linux-gnu\n");
-        return 1;
-    }
-    cheng_seed_copy_text(target_buf, sizeof(target_buf), target);
-    if (artifact_kind != NULL && artifact_kind[0] != '\0') {
-        if (cheng_seed_streq(artifact_kind, "exe")) {
-            want_exe = true;
-        } else if (!cheng_seed_streq(artifact_kind, "obj")) {
-            fprintf(stderr, "cheng chain_node linux: unsupported artifact kind=%s\n", artifact_kind);
-            return 1;
-        }
-    }
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/apps/chain_node/cheng_node_main.cheng");
-    if (want_exe) {
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/cheng_node_main");
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
-    } else {
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/cheng_node_main_obj");
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
-    }
-    if (out_dir_env != NULL && out_dir_env[0] != '\0') {
-        cheng_seed_copy_text(out_dir, sizeof(out_dir), out_dir_env);
-    } else {
-        cheng_seed_copy_text(out_dir, sizeof(out_dir), default_out_dir);
-    }
-    if (out_bin_env != NULL && out_bin_env[0] != '\0') {
-        cheng_seed_copy_text(out_path, sizeof(out_path), out_bin_env);
-    } else {
-        cheng_seed_join_path(out_path, sizeof(out_path), out_dir, want_exe ? "cheng_node_main" : "cheng_node_main.o");
-    }
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, want_exe ? "cheng_node_main.compile.log" : "cheng_node_main.obj.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "cheng_node_main.self-test.log");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_fixture_with_backend_driver_emit_target(compiler_bin,
-                                                            root_cheng,
-                                                            src,
-                                                            want_exe ? "exe" : "obj",
-                                                            target_buf,
-                                                            out_path,
-                                                            compile_log,
-                                                            NULL) ||
-        !cheng_seed_expect_file_exists_nonempty("build-chain-node-linux output", out_path)) {
-        return 1;
-    }
-    if (!want_exe) {
-        if ((cheng_seed_streq(target_buf, "aarch64-unknown-linux-gnu") &&
-             !cheng_seed_expect_linux_aarch64_object_report("build-chain-node-linux", out_path)) ||
-            (cheng_seed_streq(target_buf, "x86_64-unknown-linux-gnu") &&
-             !cheng_seed_expect_linux_x86_64_object_report("build-chain-node-linux", out_path))) {
-            return 1;
-        }
-        printf("cheng chain_node linux obj: build ok target=%s out=%s\n", target_buf, out_path);
-        return 0;
-    }
-    if (run_self_test_env != NULL && run_self_test_env[0] != '\0' && !cheng_seed_streq(run_self_test_env, "auto")) {
-        run_self_test = !cheng_seed_streq(run_self_test_env, "0");
-    } else {
-        run_self_test = host_target[0] != '\0' && cheng_seed_streq(target_buf, host_target);
-    }
-    if (!run_self_test) {
-        printf("cheng chain_node linux: build ok target=%s out=%s\n", target_buf, out_path);
-        return 0;
-    }
-    run_argv[0] = out_path;
-    run_argv[1] = "chain";
-    run_argv[2] = "self";
-    run_argv[3] = "test";
-    run_argv[4] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] build-chain-node-linux self-test failed log=%s\n", run_log);
-        return 1;
-    }
-    return cheng_seed_dump_file_stdout(run_log) ? 0 : 1;
-}
-
-static int cheng_seed_cmd_build_linux_nolibc_exe_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char src_path[PATH_MAX];
-    char out_path[PATH_MAX];
-    char report_path[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char target_buf[256];
-    const char *compiler_bin;
-    const char *target = getenv("CHENG_LINUX_EXE_TARGET");
-    const char *source_env = getenv("CHENG_LINUX_EXE_SOURCE");
-    const char *out_env = getenv("CHENG_LINUX_EXE_OUT");
-    const char *report_env = getenv("CHENG_LINUX_EXE_REPORT");
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_LINUX_EXE_COMPILER",
-                                                NULL,
-                                                paths.backend_driver_out);
-    if (!cheng_seed_leaf_expect_compiler("build-linux-nolibc-exe", compiler_bin)) {
-        return 1;
-    }
-    if (source_env == NULL || source_env[0] == '\0') {
-        fprintf(stderr, "cheng linux exe: missing CHENG_LINUX_EXE_SOURCE\n");
-        return 1;
-    }
-    if (out_env == NULL || out_env[0] == '\0') {
-        fprintf(stderr, "cheng linux exe: missing CHENG_LINUX_EXE_OUT\n");
-        return 1;
-    }
-    if (target == NULL || target[0] == '\0') {
-        target = "aarch64-unknown-linux-gnu";
-    }
-    if (cheng_seed_streq(target, "arm64-unknown-linux-gnu")) {
-        target = "aarch64-unknown-linux-gnu";
-    }
-    if (!cheng_seed_streq(target, "aarch64-unknown-linux-gnu")) {
-        fprintf(stderr, "cheng linux exe: unsupported target=%s\n", target);
-        return 1;
-    }
-    cheng_seed_copy_text(target_buf, sizeof(target_buf), target);
-    if (cheng_seed_const_os_is_absolute(source_env)) {
-        cheng_seed_copy_text(src_path, sizeof(src_path), source_env);
-    } else {
-        cheng_seed_join_path(src_path, sizeof(src_path), paths.root, source_env);
-    }
-    if (cheng_seed_const_os_is_absolute(out_env)) {
-        cheng_seed_copy_text(out_path, sizeof(out_path), out_env);
-    } else {
-        cheng_seed_join_path(out_path, sizeof(out_path), paths.root, out_env);
-    }
-    if (report_env != NULL && report_env[0] != '\0') {
-        if (cheng_seed_const_os_is_absolute(report_env)) {
-            cheng_seed_copy_text(report_path, sizeof(report_path), report_env);
-        } else {
-            cheng_seed_join_path(report_path, sizeof(report_path), paths.root, report_env);
-        }
-    } else {
-        report_path[0] = '\0';
-    }
-    snprintf(compile_log, sizeof(compile_log), "%s.compile.log", out_path);
-    if (!cheng_seed_ensure_parent_dir(out_path) ||
-        (report_path[0] != '\0' && !cheng_seed_ensure_parent_dir(report_path)) ||
-        !cheng_seed_compile_fixture_with_backend_driver_emit_target(compiler_bin,
-                                                            root_cheng,
-                                                            src_path,
-                                                            "exe",
-                                                            target_buf,
-                                                            out_path,
-                                                            compile_log,
-                                                            report_path[0] != '\0' ? report_path : NULL) ||
-        !cheng_seed_expect_file_exists_nonempty("build-linux-nolibc-exe output", out_path)) {
-        return 1;
-    }
-    printf("cheng linux exe: build ok target=%s out=%s\n", target_buf, out_path);
-    return 0;
-}
-
-static int cheng_seed_cmd_build_rwad_bft_linux_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char src[PATH_MAX];
-    char default_out_dir[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char out_path[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char target_buf[256];
-    const char *compiler_bin;
-    const char *compiler_env = getenv("CHENG_RWAD_BFT_COMPILER");
-    const char *target = getenv("RWAD_BFT_TARGET");
-    const char *artifact_kind = getenv("RWAD_BFT_LINUX_ARTIFACT");
-    const char *out_dir_env = getenv("RWAD_BFT_OUT_DIR");
-    const char *out_bin_env = getenv("RWAD_BFT_OUT_BIN");
-    const char *run_self_test_env = getenv("RWAD_BFT_RUN_SELF_TEST");
-    const char *host_target = cheng_seed_host_target_triple();
-    bool want_exe = false;
-    bool run_self_test = false;
-    char *run_argv[3];
-    int status = 0;
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = (compiler_env != NULL && compiler_env[0] != '\0') ? compiler_env : paths.backend_driver_out;
-    if (access(compiler_bin, X_OK) != 0) {
-        fprintf(stderr, "[cheng_seed] build-rwad-bft-linux missing compiler: %s\n", compiler_bin);
-        return 1;
-    }
-    if (target == NULL || target[0] == '\0') {
-        target = "aarch64-unknown-linux-gnu";
-    }
-    if (cheng_seed_streq(target, "arm64-unknown-linux-gnu")) {
-        target = "aarch64-unknown-linux-gnu";
-    }
-    if (!cheng_seed_streq(target, "aarch64-unknown-linux-gnu") &&
-        !cheng_seed_streq(target, "x86_64-unknown-linux-gnu")) {
-        fprintf(stderr, "cheng rwad_bft_state_machine linux: unsupported target=%s\n", target);
-        fprintf(stderr,
-                "cheng rwad_bft_state_machine linux: supported linux targets are aarch64-unknown-linux-gnu and x86_64-unknown-linux-gnu\n");
-        return 1;
-    }
-    cheng_seed_copy_text(target_buf, sizeof(target_buf), target);
-    if (artifact_kind != NULL && artifact_kind[0] != '\0') {
-        if (cheng_seed_streq(artifact_kind, "exe")) {
-            want_exe = true;
-        } else if (!cheng_seed_streq(artifact_kind, "obj")) {
-            fprintf(stderr, "cheng rwad_bft_state_machine linux: unsupported artifact kind=%s\n", artifact_kind);
-            return 1;
-        }
-    }
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/apps/rwad/rwad_bft_state_machine_main.cheng");
-    if (want_exe) {
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/rwad_bft_state_machine");
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
-    } else {
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/rwad_bft_state_machine_obj");
-        cheng_seed_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
-    }
-    if (out_dir_env != NULL && out_dir_env[0] != '\0') {
-        cheng_seed_copy_text(out_dir, sizeof(out_dir), out_dir_env);
-    } else {
-        cheng_seed_copy_text(out_dir, sizeof(out_dir), default_out_dir);
-    }
-    if (out_bin_env != NULL && out_bin_env[0] != '\0') {
-        cheng_seed_copy_text(out_path, sizeof(out_path), out_bin_env);
-    } else {
-        cheng_seed_join_path(out_path, sizeof(out_path), out_dir, want_exe ? "rwad_bft_state_machine" : "rwad_bft_state_machine.o");
-    }
-    cheng_seed_join_path(compile_log, sizeof(compile_log), out_dir, want_exe ? "rwad_bft_state_machine.compile.log" : "rwad_bft_state_machine.obj.compile.log");
-    cheng_seed_join_path(run_log, sizeof(run_log), out_dir, "rwad_bft_state_machine.self-test.log");
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_fixture_with_backend_driver_emit_target(compiler_bin,
-                                                            root_cheng,
-                                                            src,
-                                                            want_exe ? "exe" : "obj",
-                                                            target_buf,
-                                                            out_path,
-                                                            compile_log,
-                                                            NULL) ||
-        !cheng_seed_expect_file_exists_nonempty("build-rwad-bft-linux output", out_path)) {
-        return 1;
-    }
-    if (!want_exe) {
-        if ((cheng_seed_streq(target_buf, "aarch64-unknown-linux-gnu") &&
-             !cheng_seed_expect_linux_aarch64_object_report("build-rwad-bft-linux", out_path)) ||
-            (cheng_seed_streq(target_buf, "x86_64-unknown-linux-gnu") &&
-             !cheng_seed_expect_linux_x86_64_object_report("build-rwad-bft-linux", out_path))) {
-            return 1;
-        }
-        printf("cheng rwad_bft_state_machine linux obj: build ok target=%s out=%s\n", target_buf, out_path);
-        return 0;
-    }
-    if (run_self_test_env != NULL && run_self_test_env[0] != '\0' && !cheng_seed_streq(run_self_test_env, "auto")) {
-        run_self_test = !cheng_seed_streq(run_self_test_env, "0");
-    } else {
-        run_self_test = host_target[0] != '\0' && cheng_seed_streq(target_buf, host_target);
-    }
-    if (!run_self_test) {
-        printf("cheng rwad_bft_state_machine linux: build ok target=%s out=%s\n", target_buf, out_path);
-        return 0;
-    }
-    run_argv[0] = out_path;
-    run_argv[1] = "self-test";
-    run_argv[2] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] build-rwad-bft-linux self-test failed log=%s\n", run_log);
-        return 1;
-    }
-    return cheng_seed_dump_file_stdout(run_log) ? 0 : 1;
-}
-
-static int cheng_seed_cmd_run_linux_object_smokes_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char rwad_src[PATH_MAX];
-    char rwad_out_dir[PATH_MAX];
-    char rwad_obj[PATH_MAX];
-    char rwad_log[PATH_MAX];
-    const char *target = "aarch64-unknown-linux-gnu";
-    (void)argc;
-    (void)argv;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    cheng_seed_join_path(rwad_src, sizeof(rwad_src), paths.root, "src/apps/rwad/rwad_bft_state_machine_main.cheng");
-    cheng_seed_join_path(rwad_out_dir, sizeof(rwad_out_dir), paths.root, "artifacts/rwad_bft_state_machine_obj/aarch64-unknown-linux-gnu");
-    cheng_seed_join_path(rwad_obj, sizeof(rwad_obj), rwad_out_dir, "rwad_bft_state_machine.o");
-    cheng_seed_join_path(rwad_log, sizeof(rwad_log), rwad_out_dir, "rwad_bft_state_machine.compile.log");
-    if (!cheng_seed_mkdir_p(rwad_out_dir) ||
-        !cheng_seed_compile_fixture_with_backend_driver_emit_target(paths.backend_driver_out,
-                                                            root_cheng,
-                                                            rwad_src,
-                                                            "obj",
-                                                            target,
-                                                            rwad_obj,
-                                                            rwad_log,
-                                                            NULL) ||
-        !cheng_seed_expect_file_exists_nonempty("run-linux-object-smokes rwad_bft", rwad_obj) ||
-        !cheng_seed_expect_linux_aarch64_object_report("run-linux-object-smokes rwad_bft", rwad_obj)) {
-        return 1;
-    }
-    puts("cheng linux object smokes: ok");
-    return 0;
-}
-
-static const char *cheng_seed_leaf_resolve_compiler_bin(int argc,
-                                                char **argv,
-                                                const char *env_primary,
-                                                const char *env_fallback,
-                                                const char *default_bin) {
-    const char *flag = cheng_seed_flag_value(argc, argv, "--compiler");
-    const char *value;
-    if (flag != NULL && flag[0] != '\0') {
-        return flag;
-    }
-    value = env_primary != NULL ? getenv(env_primary) : NULL;
-    if (value != NULL && value[0] != '\0') {
-        return value;
-    }
-    value = env_fallback != NULL ? getenv(env_fallback) : NULL;
-    if (value != NULL && value[0] != '\0') {
-        return value;
-    }
-    return default_bin;
-}
-
-static const char *cheng_seed_leaf_resolve_label(int argc,
-                                         char **argv,
-                                         const char *env_key,
-                                         const char *default_label) {
-    const char *flag = cheng_seed_flag_value(argc, argv, "--label");
-    const char *value;
-    if (flag != NULL && flag[0] != '\0') {
-        return flag;
-    }
-    value = env_key != NULL ? getenv(env_key) : NULL;
-    if (value != NULL && value[0] != '\0') {
-        return value;
-    }
-    return default_label;
-}
-
-static bool cheng_seed_leaf_expect_compiler(const char *label,
-                                    const char *compiler_bin) {
-    ChengSeedBootstrapPaths paths;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (compiler_bin != NULL && compiler_bin[0] != '\0') {
-        if (strcmp(compiler_bin, paths.backend_driver_out) == 0 &&
-            access(compiler_bin, X_OK) != 0) {
-            if (!cheng_seed_backend_driver_ready(&paths) &&
-                cheng_seed_cmd_build_backend_driver(0, NULL) != 0) {
-                fprintf(stderr, "[cheng_seed] %s failed to rebuild backend driver: %s\n",
-                        label,
-                        compiler_bin);
-                return false;
-            }
-        } else if ((strcmp(compiler_bin, paths.stage0) == 0 ||
-                    strcmp(compiler_bin, paths.stage1) == 0 ||
-                    strcmp(compiler_bin, paths.stage2) == 0 ||
-                    strcmp(compiler_bin, paths.stage3) == 0) &&
-                   access(compiler_bin, X_OK) != 0) {
-            if (!cheng_seed_bootstrap_artifacts_fresh(&paths) &&
-                cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-                fprintf(stderr, "[cheng_seed] %s failed to rebuild bootstrap compiler: %s\n",
-                        label,
-                        compiler_bin);
-                return false;
-            }
-        }
-    }
-    if (compiler_bin != NULL && compiler_bin[0] != '\0' && access(compiler_bin, X_OK) == 0) {
-        return true;
-    }
-    fprintf(stderr, "[cheng_seed] %s missing compiler: %s\n",
-            label,
-            compiler_bin != NULL ? compiler_bin : "");
-    return false;
-}
-
-static bool cheng_seed_run_compiler_command_logged(const char *compiler_bin,
-                                           size_t extra_arg_count,
-                                           const char **extra_args,
-                                           const char *log_path,
-                                           const char *label) {
-    const char **args;
-    size_t i;
-    bool ok;
-    args = (const char **)cheng_seed_xmalloc(sizeof(char *) * (extra_arg_count + 1U));
-    args[0] = compiler_bin;
-    for (i = 0U; i < extra_arg_count; ++i) {
-        args[i + 1U] = extra_args[i];
-    }
-    ok = cheng_seed_run_command_logged_argv(extra_arg_count + 1U, args, log_path, label);
-    free(args);
-    return ok;
-}
-
-static int cheng_seed_cmd_run_tcp_twoproc_smoke_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char server_src[PATH_MAX];
-    char client_src[PATH_MAX];
-    char server_bin[PATH_MAX];
-    char client_bin[PATH_MAX];
-    char server_log[PATH_MAX];
-    char client_log[PATH_MAX];
-    char ready_path[PATH_MAX];
-    char port_text[64];
-    const char *compiler_bin;
-    const char *label;
-    char *server_argv[4];
-    char *client_argv[3];
-    char ready_arg[PATH_MAX + 32];
-    char port_arg[128];
-    pid_t server_pid = -1;
-    int status = 0;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_SMOKE_COMPILER",
-                                                NULL,
-                                                paths.backend_driver_out);
-    label = cheng_seed_leaf_resolve_label(argc, argv, "CHENG_SMOKE_LABEL", "host");
-    if (!cheng_seed_leaf_expect_compiler("run-tcp-twoproc-smoke", compiler_bin)) {
-        return 1;
-    }
-    cheng_seed_join_path(server_src, sizeof(server_src), paths.root, "src/tests/libp2p_tcp_twoproc_server_smoke.cheng");
-    cheng_seed_join_path(client_src, sizeof(client_src), paths.root, "src/tests/libp2p_tcp_twoproc_client_smoke.cheng");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/tcp_twoproc");
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    snprintf(server_bin, sizeof(server_bin), "%s/libp2p_tcp_twoproc_server.%s", out_dir, label);
-    snprintf(client_bin, sizeof(client_bin), "%s/libp2p_tcp_twoproc_client.%s", out_dir, label);
-    snprintf(server_log, sizeof(server_log), "%s/libp2p_tcp_twoproc_server.%s.run.log", out_dir, label);
-    snprintf(client_log, sizeof(client_log), "%s/libp2p_tcp_twoproc_client.%s.run.log", out_dir, label);
-    snprintf(ready_path, sizeof(ready_path), "%s/libp2p_tcp_twoproc_server.%s.ready", out_dir, label);
-    unlink(ready_path);
-    if (!cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, server_src, server_bin, server_log) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, client_src, client_bin, client_log)) {
-        return 1;
-    }
-    snprintf(ready_arg, sizeof(ready_arg), "--ready-path:%s", ready_path);
-    server_argv[0] = server_bin;
-    server_argv[1] = "--port:0";
-    server_argv[2] = ready_arg;
-    server_argv[3] = NULL;
-    if (!cheng_seed_spawn_binary_capture_output(server_argv, server_log, &server_pid) ||
-        !cheng_seed_wait_ready_port_file("run-tcp-twoproc-smoke server", ready_path, server_pid, 20000, port_text, sizeof(port_text)) ||
-        !cheng_seed_text_is_decimal_digits(port_text)) {
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    snprintf(port_arg, sizeof(port_arg), "--port:%s", port_text);
-    client_argv[0] = client_bin;
-    client_argv[1] = port_arg;
-    client_argv[2] = NULL;
-    if (!cheng_seed_run_binary_capture_output(client_argv, client_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0) ||
-        !cheng_seed_wait_pid_success(&server_pid, "run-tcp-twoproc-smoke server", server_log)) {
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    if (!cheng_seed_dump_file_stdout(server_log) || !cheng_seed_dump_file_stdout(client_log)) {
-        return 1;
-    }
-    printf("cheng libp2p_tcp_twoproc_smoke ok (%s)\n", label);
-    return 0;
-}
-
-static int cheng_seed_cmd_run_quic_twoproc_smoke_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char server_src[PATH_MAX];
-    char client_src[PATH_MAX];
-    char server_bin[PATH_MAX];
-    char client_bin[PATH_MAX];
-    char server_log[PATH_MAX];
-    char client_log[PATH_MAX];
-    char ready_path[PATH_MAX];
-    char port_text[64];
-    const char *compiler_bin;
-    const char *label;
-    char *server_argv[4];
-    char *client_argv[3];
-    char ready_arg[PATH_MAX + 32];
-    char port_arg[128];
-    pid_t server_pid = -1;
-    int status = 0;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_SMOKE_COMPILER",
-                                                NULL,
-                                                paths.backend_driver_out);
-    label = cheng_seed_leaf_resolve_label(argc, argv, "CHENG_SMOKE_LABEL", "host");
-    if (!cheng_seed_leaf_expect_compiler("run-quic-twoproc-smoke", compiler_bin)) {
-        return 1;
-    }
-    cheng_seed_join_path(server_src, sizeof(server_src), paths.root, "src/tests/libp2p_quic_twoproc_server_smoke.cheng");
-    cheng_seed_join_path(client_src, sizeof(client_src), paths.root, "src/tests/libp2p_quic_twoproc_client_smoke.cheng");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/quic_twoproc");
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    snprintf(server_bin, sizeof(server_bin), "%s/libp2p_quic_twoproc_server.%s", out_dir, label);
-    snprintf(client_bin, sizeof(client_bin), "%s/libp2p_quic_twoproc_client.%s", out_dir, label);
-    snprintf(server_log, sizeof(server_log), "%s/libp2p_quic_twoproc_server.%s.run.log", out_dir, label);
-    snprintf(client_log, sizeof(client_log), "%s/libp2p_quic_twoproc_client.%s.run.log", out_dir, label);
-    snprintf(ready_path, sizeof(ready_path), "%s/libp2p_quic_twoproc_server.%s.ready", out_dir, label);
-    unlink(ready_path);
-    if (!cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, server_src, server_bin, server_log) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, client_src, client_bin, client_log)) {
-        return 1;
-    }
-    snprintf(ready_arg, sizeof(ready_arg), "--ready-path:%s", ready_path);
-    server_argv[0] = server_bin;
-    server_argv[1] = "--port:0";
-    server_argv[2] = ready_arg;
-    server_argv[3] = NULL;
-    if (!cheng_seed_spawn_binary_capture_output(server_argv, server_log, &server_pid) ||
-        !cheng_seed_wait_ready_port_file("run-quic-twoproc-smoke server", ready_path, server_pid, 20000, port_text, sizeof(port_text)) ||
-        !cheng_seed_text_is_decimal_digits(port_text)) {
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    snprintf(port_arg, sizeof(port_arg), "--port:%s", port_text);
-    client_argv[0] = client_bin;
-    client_argv[1] = port_arg;
-    client_argv[2] = NULL;
-    if (!cheng_seed_run_binary_capture_output(client_argv, client_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0) ||
-        !cheng_seed_wait_pid_success(&server_pid, "run-quic-twoproc-smoke server", server_log)) {
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    if (!cheng_seed_dump_file_stdout(server_log) || !cheng_seed_dump_file_stdout(client_log)) {
-        return 1;
-    }
-    printf("cheng libp2p_quic_twoproc_smoke ok (%s)\n", label);
-    return 0;
-}
-
-static bool cheng_seed_run_diloco_fixture_direct(const char *suite_label,
-                                         const char *compile_label,
-                                         const char *compiler_bin,
-                                         const char *root_diloco,
-                                         const char *src,
-                                         const char *out_bin) {
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char line_map[PATH_MAX];
-    char *run_argv[2];
-    int status = 0;
-    if (access(src, R_OK) != 0) {
-        fprintf(stderr, "%s: missing source: %s\n", suite_label, src);
-        return false;
-    }
-    snprintf(compile_log, sizeof(compile_log), "%s.compile.log", out_bin);
-    snprintf(run_log, sizeof(run_log), "%s.run.log", out_bin);
-    snprintf(line_map, sizeof(line_map), "%s.map", out_bin);
-    unlink(out_bin);
-    unlink(compile_log);
-    unlink(run_log);
-    unlink(line_map);
-    printf("[%s] compile %s\n", suite_label, compile_label);
-    fflush(stdout);
-    if (!cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_diloco, src, out_bin, compile_log)) {
-        fprintf(stderr, "%s: compile failed: %s\n", suite_label, compile_label);
-        return false;
-    }
-    printf("[%s] run %s\n", suite_label, compile_label);
-    fflush(stdout);
-    run_argv[0] = (char *)out_bin;
-    run_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "%s: run failed: %s\n", suite_label, compile_label);
-        return false;
-    }
-    return cheng_seed_dump_file_stdout(run_log);
-}
-
-static int cheng_seed_run_diloco_quic_twoproc_direct(const char *compiler_bin,
-                                             const char *label,
-                                             const char *root,
-                                             const char *root_diloco) {
-    char out_dir[PATH_MAX];
-    char server_src[PATH_MAX];
-    char client_src[PATH_MAX];
-    char server_bin[PATH_MAX];
-    char client_bin[PATH_MAX];
-    char server_compile_log[PATH_MAX];
-    char client_compile_log[PATH_MAX];
-    char server_log[PATH_MAX];
-    char client_log[PATH_MAX];
-    char ready_path[PATH_MAX];
-    char port_text[64];
-    char *server_argv[4];
-    char *client_argv[3];
-    char ready_arg[PATH_MAX + 32];
-    char port_arg[128];
-    pid_t server_pid = -1;
-    int status = 0;
-    cheng_seed_join_path(server_src, sizeof(server_src), root_diloco, "src/tests/diloco_quic_twoproc_server_smoke.cheng");
-    cheng_seed_join_path(client_src, sizeof(client_src), root_diloco, "src/tests/diloco_quic_twoproc_client_smoke.cheng");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), root, "artifacts/diloco");
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    snprintf(server_bin, sizeof(server_bin), "%s/diloco_quic_twoproc_server.%s", out_dir, label);
-    snprintf(client_bin, sizeof(client_bin), "%s/diloco_quic_twoproc_client.%s", out_dir, label);
-    snprintf(server_compile_log, sizeof(server_compile_log), "%s/diloco_quic_twoproc_server.%s.compile.log", out_dir, label);
-    snprintf(client_compile_log, sizeof(client_compile_log), "%s/diloco_quic_twoproc_client.%s.compile.log", out_dir, label);
-    snprintf(server_log, sizeof(server_log), "%s/diloco_quic_twoproc_server.%s.run.log", out_dir, label);
-    snprintf(client_log, sizeof(client_log), "%s/diloco_quic_twoproc_client.%s.run.log", out_dir, label);
-    snprintf(ready_path, sizeof(ready_path), "%s/diloco_quic_twoproc_server.%s.ready", out_dir, label);
-    unlink(server_compile_log);
-    unlink(client_compile_log);
-    unlink(ready_path);
-    unlink(server_log);
-    unlink(client_log);
-    printf("[cheng verify-diloco] compile diloco_quic_twoproc_server.%s\n", label);
-    fflush(stdout);
-    if (!cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_diloco, server_src, server_bin, server_compile_log)) {
-        fprintf(stderr, "cheng verify-diloco: compile failed: diloco_quic_twoproc_server.%s\n", label);
-        cheng_seed_dump_file_stdout(server_compile_log);
-        return 1;
-    }
-    printf("[cheng verify-diloco] compile diloco_quic_twoproc_client.%s\n", label);
-    fflush(stdout);
-    if (!cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_diloco, client_src, client_bin, client_compile_log)) {
-        fprintf(stderr, "cheng verify-diloco: compile failed: diloco_quic_twoproc_client.%s\n", label);
-        cheng_seed_dump_file_stdout(client_compile_log);
-        return 1;
-    }
-    snprintf(ready_arg, sizeof(ready_arg), "--ready-path:%s", ready_path);
-    server_argv[0] = server_bin;
-    server_argv[1] = "--port:0";
-    server_argv[2] = ready_arg;
-    server_argv[3] = NULL;
-    printf("[cheng verify-diloco] run diloco_quic_twoproc_server.%s\n", label);
-    fflush(stdout);
-    if (!cheng_seed_spawn_binary_capture_output(server_argv, server_log, &server_pid) ||
-        !cheng_seed_wait_ready_port_file("verify-diloco server", ready_path, server_pid, 20000, port_text, sizeof(port_text)) ||
-        !cheng_seed_text_is_decimal_digits(port_text)) {
-        cheng_seed_dump_file_stdout(server_log);
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    snprintf(port_arg, sizeof(port_arg), "--port:%s", port_text);
-    client_argv[0] = client_bin;
-    client_argv[1] = port_arg;
-    client_argv[2] = NULL;
-    printf("[cheng verify-diloco] run diloco_quic_twoproc_client.%s\n", label);
-    fflush(stdout);
-    if (!cheng_seed_run_binary_capture_output(client_argv, client_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0) ||
-        !cheng_seed_wait_pid_success(&server_pid, "verify-diloco server", server_log)) {
-        cheng_seed_dump_file_stdout(server_log);
-        cheng_seed_dump_file_stdout(client_log);
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    if (!cheng_seed_dump_file_stdout(server_log) || !cheng_seed_dump_file_stdout(client_log)) {
-        return 1;
-    }
-    printf("cheng diloco_quic_twoproc_smoke ok (%s)\n", label);
-    return 0;
-}
-
-static int cheng_seed_verify_diloco_stage(const char *compiler_bin,
-                                  const char *label,
-                                  const char *root,
-                                  const char *root_diloco) {
-    char out_dir[PATH_MAX];
-    char state_src[PATH_MAX];
-    char wire_src[PATH_MAX];
-    char state_bin[PATH_MAX];
-    char wire_bin[PATH_MAX];
-    char state_label[256];
-    char wire_label[256];
-    cheng_seed_join_path(out_dir, sizeof(out_dir), root, "artifacts/diloco");
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    cheng_seed_join_path(state_src, sizeof(state_src), root_diloco, "src/tests/diloco_state_smoke.cheng");
-    cheng_seed_join_path(wire_src, sizeof(wire_src), root_diloco, "src/tests/diloco_wire_smoke.cheng");
-    snprintf(state_bin, sizeof(state_bin), "%s/diloco_state_smoke.%s", out_dir, label);
-    snprintf(wire_bin, sizeof(wire_bin), "%s/diloco_wire_smoke.%s", out_dir, label);
-    snprintf(state_label, sizeof(state_label), "diloco_state_smoke.%s", label);
-    snprintf(wire_label, sizeof(wire_label), "diloco_wire_smoke.%s", label);
-    printf("[cheng verify-diloco] stage begin (%s)\n", label);
-    fflush(stdout);
-    if (!cheng_seed_run_diloco_fixture_direct("cheng verify-diloco",
-                                      state_label,
-                                      compiler_bin,
-                                      root_diloco,
-                                      state_src,
-                                      state_bin)) {
-        return 1;
-    }
-    if (!cheng_seed_run_diloco_fixture_direct("cheng verify-diloco",
-                                      wire_label,
-                                      compiler_bin,
-                                      root_diloco,
-                                      wire_src,
-                                      wire_bin)) {
-        return 1;
-    }
-    if (cheng_seed_run_diloco_quic_twoproc_direct(compiler_bin, label, root, root_diloco) != 0) {
-        return 1;
-    }
-    printf("[cheng verify-diloco] stage ok (%s)\n", label);
-    fflush(stdout);
-    return 0;
-}
-
-static int cheng_seed_cmd_verify_diloco_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_diloco[PATH_MAX];
-    char package_manifest[PATH_MAX];
-    char saved_incremental[64];
-    char saved_multi_cache[64];
-    bool had_incremental = false;
-    bool had_multi_cache = false;
-    int rc;
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (paths.root[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] verify-diloco root detect failed\n");
-        return 1;
-    }
-    snprintf(root_diloco, sizeof(root_diloco), "%s", paths.root);
-    cheng_seed_join_path(package_manifest, sizeof(package_manifest), root_diloco, "cheng-package.toml");
-    if (access(package_manifest, R_OK) != 0) {
-        fprintf(stderr, "[cheng_seed] verify-diloco missing package root: %s\n", root_diloco);
-        return 1;
-    }
-    if (!cheng_seed_leaf_expect_compiler("verify-diloco host", paths.stage3)) {
-        return 1;
-    }
-    if ((rc = cheng_seed_verify_diloco_stage(paths.stage3, "host", paths.root, root_diloco)) != 0) {
-        return rc;
-    }
-    if (!cheng_seed_leaf_expect_compiler("verify-diloco stage2", paths.stage2) ||
-        !cheng_seed_leaf_expect_compiler("verify-diloco stage3", paths.stage3)) {
-        return 1;
-    }
-    cheng_seed_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
-    cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
-    setenv("BACKEND_INCREMENTAL", "0", 1);
-    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
-    rc = cheng_seed_verify_diloco_stage(paths.stage2, "stage2", paths.root, root_diloco);
-    if (rc == 0) {
-        rc = cheng_seed_verify_diloco_stage(paths.stage3, "stage3", paths.root, root_diloco);
-    }
-    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-    if (rc != 0) {
-        return rc;
-    }
-    puts("cheng verify-diloco ok");
-    return 0;
-}
-
-static int cheng_seed_cmd_run_udp_importc_smoke_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char src[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char *run_argv[2];
-    const char *compiler_bin;
-    const char *label;
-    int status = 0;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_SMOKE_COMPILER",
-                                                NULL,
-                                                paths.backend_driver_out);
-    label = cheng_seed_leaf_resolve_label(argc, argv, "CHENG_SMOKE_LABEL", "host");
-    if (!cheng_seed_leaf_expect_compiler("run-udp-importc-smoke", compiler_bin)) {
-        return 1;
-    }
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/tests/udp_importc_smoke.cheng");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/udp_importc");
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    snprintf(out_bin, sizeof(out_bin), "%s/udp_importc_smoke.%s", out_dir, label);
-    snprintf(compile_log, sizeof(compile_log), "%s/udp_importc_smoke.%s.compile.log", out_dir, label);
-    snprintf(run_log, sizeof(run_log), "%s/udp_importc_smoke.%s.run.log", out_dir, label);
-    if (!cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, src, out_bin, compile_log)) {
-        return 1;
-    }
-    run_argv[0] = out_bin;
-    run_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] run-udp-importc-smoke failed log=%s\n", run_log);
-        return 1;
-    }
-    return cheng_seed_dump_file_stdout(run_log) ? 0 : 1;
-}
-
-static int cheng_seed_cmd_run_wasm_smokes_impl(int argc, char **argv) {
-    return cheng_seed_require_backend_driver_cli_passthrough("run-wasm-smokes", argc, argv);
-}
-
-static int cheng_seed_cmd_run_browser_host_wasm_smoke_impl(int argc, char **argv) {
-    return cheng_seed_require_backend_driver_cli_passthrough("run-browser-host-wasm-smoke", argc, argv);
-}
-
-static int cheng_seed_cmd_run_fresh_node_selfhost_gate_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char src[PATH_MAX];
-    char sync_prefix[PATH_MAX];
-    char fresh_prefix[PATH_MAX];
-    char sync_log[PATH_MAX];
-    char fresh_log[PATH_MAX];
-    const char *compiler_bin;
-    const char *label;
-    const char *sync_args[7];
-    const char *fresh_args[10];
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_FRESH_NODE_COMPILER",
-                                                "CHENG_SMOKE_COMPILER",
-                                                paths.backend_driver_out);
-    label = cheng_seed_leaf_resolve_label(argc, argv, "CHENG_FRESH_NODE_LABEL", "host");
-    if (!cheng_seed_leaf_expect_compiler("run-fresh-node-selfhost-gate", compiler_bin)) {
-        return 1;
-    }
-    cheng_seed_join_path(src, sizeof(src), paths.root, "src/tests/program_selfhost_smoke.cheng");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/fresh_node_gate");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), out_dir, label);
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    cheng_seed_join_path(sync_prefix, sizeof(sync_prefix), out_dir, "program_selfhost_smoke.sync");
-    cheng_seed_join_path(fresh_prefix, sizeof(fresh_prefix), out_dir, "program_selfhost_smoke.fresh");
-    cheng_seed_join_path(sync_log, sizeof(sync_log), out_dir, "world_sync.log");
-    cheng_seed_join_path(fresh_log, sizeof(fresh_log), out_dir, "fresh_node.log");
-    {
-        const char *sync_args_full[6];
-        char root_flag[PATH_MAX + 16];
-        char in_flag[PATH_MAX + 16];
-        char out_flag[PATH_MAX + 16];
-        size_t i;
-        snprintf(root_flag, sizeof(root_flag), "--root:%s", root_cheng);
-        snprintf(in_flag, sizeof(in_flag), "--in:%s", src);
-        sync_args[0] = "world-sync";
-        sync_args[1] = root_flag;
-        sync_args[2] = in_flag;
-        sync_args[3] = "--target:arm64-apple-darwin";
-        sync_args[4] = "--channel:stable";
-        for (i = 0U; i < 5U; ++i) {
-            sync_args_full[i] = sync_args[i];
-        }
-        snprintf(out_flag, sizeof(out_flag), "--out:%s", sync_prefix);
-        sync_args_full[5] = out_flag;
-        if (!cheng_seed_run_compiler_command_logged(compiler_bin, 6U, sync_args_full, sync_log, "run-fresh-node-selfhost-gate world-sync")) {
-            return 1;
-        }
-    }
-    {
-        char world_report[PATH_MAX];
-        char compiler_snapshot[PATH_MAX];
-        char std_snapshot[PATH_MAX];
-        char runtime_snapshot[PATH_MAX];
-        char csg_report[PATH_MAX];
-        char surface_report[PATH_MAX];
-        char receipt_report[PATH_MAX];
-        char lock_report[PATH_MAX];
-        snprintf(world_report, sizeof(world_report), "%s.world.txt", sync_prefix);
-        snprintf(compiler_snapshot, sizeof(compiler_snapshot), "%s.compiler.snapshot.txt", sync_prefix);
-        snprintf(std_snapshot, sizeof(std_snapshot), "%s.std.snapshot.txt", sync_prefix);
-        snprintf(runtime_snapshot, sizeof(runtime_snapshot), "%s.runtime.snapshot.txt", sync_prefix);
-        snprintf(csg_report, sizeof(csg_report), "%s.csg.txt", sync_prefix);
-        snprintf(surface_report, sizeof(surface_report), "%s.surface.txt", sync_prefix);
-        snprintf(receipt_report, sizeof(receipt_report), "%s.receipt.txt", sync_prefix);
-        snprintf(lock_report, sizeof(lock_report), "%s.lock.toml", sync_prefix);
-        if (!cheng_seed_expect_file_exists_nonempty("run-fresh-node-selfhost-gate world report", world_report) ||
-            !cheng_seed_expect_file_exists_nonempty("run-fresh-node-selfhost-gate compiler snapshot", compiler_snapshot) ||
-            !cheng_seed_expect_file_exists_nonempty("run-fresh-node-selfhost-gate std snapshot", std_snapshot) ||
-            !cheng_seed_expect_file_exists_nonempty("run-fresh-node-selfhost-gate runtime snapshot", runtime_snapshot) ||
-            !cheng_seed_expect_file_exists_nonempty("run-fresh-node-selfhost-gate csg", csg_report) ||
-            !cheng_seed_expect_file_exists_nonempty("run-fresh-node-selfhost-gate surface", surface_report) ||
-            !cheng_seed_expect_file_exists_nonempty("run-fresh-node-selfhost-gate receipt", receipt_report) ||
-            !cheng_seed_expect_file_exists_nonempty("run-fresh-node-selfhost-gate lock", lock_report)) {
-            return 1;
-        }
-    }
-    {
-        char baseline_csg[PATH_MAX + 24];
-        char baseline_surface[PATH_MAX + 28];
-        char baseline_receipt[PATH_MAX + 28];
-        char root_flag[PATH_MAX + 16];
-        char in_flag[PATH_MAX + 16];
-        const char *fresh_args_full[9];
-        char out_flag[PATH_MAX + 16];
-        size_t i;
-        snprintf(baseline_csg, sizeof(baseline_csg), "--baseline-csg:%s.csg.txt", sync_prefix);
-        snprintf(baseline_surface, sizeof(baseline_surface), "--baseline-surface:%s.surface.txt", sync_prefix);
-        snprintf(baseline_receipt, sizeof(baseline_receipt), "--baseline-receipt:%s.receipt.txt", sync_prefix);
-        snprintf(root_flag, sizeof(root_flag), "--root:%s", root_cheng);
-        snprintf(in_flag, sizeof(in_flag), "--in:%s", src);
-        fresh_args[0] = "fresh-node-selfhost";
-        fresh_args[1] = root_flag;
-        fresh_args[2] = in_flag;
-        fresh_args[3] = "--target:arm64-apple-darwin";
-        fresh_args[4] = "--channel:stable";
-        fresh_args[5] = baseline_csg;
-        fresh_args[6] = baseline_surface;
-        fresh_args[7] = baseline_receipt;
-        for (i = 0U; i < 8U; ++i) {
-            fresh_args_full[i] = fresh_args[i];
-        }
-        snprintf(out_flag, sizeof(out_flag), "--out:%s", fresh_prefix);
-        fresh_args_full[8] = out_flag;
-        if (!cheng_seed_run_compiler_command_logged(compiler_bin, 9U, fresh_args_full, fresh_log, "run-fresh-node-selfhost-gate fresh-node-selfhost")) {
-            return 1;
-        }
-    }
-    {
-        char *fresh_text = cheng_seed_read_file(fresh_log);
-        char fresh_report[PATH_MAX];
-        if (fresh_text == NULL ||
-            !cheng_seed_expect_text_has_line("run-fresh-node-selfhost-gate", fresh_text, "equivalence_passed=1") ||
-            !cheng_seed_expect_text_has_line("run-fresh-node-selfhost-gate", fresh_text, "publish_allowed=1") ||
-            !cheng_seed_expect_text_has_line("run-fresh-node-selfhost-gate", fresh_text, "receipt_equivalent=1") ||
-            !cheng_seed_expect_text_has_line("run-fresh-node-selfhost-gate", fresh_text, "receipt_cid_match=1")) {
-            free(fresh_text);
-            return 1;
-        }
-        free(fresh_text);
-        snprintf(fresh_report, sizeof(fresh_report), "%s.fresh.txt", fresh_prefix);
-        if (!cheng_seed_expect_file_exists_nonempty("run-fresh-node-selfhost-gate fresh report", fresh_report)) {
-            return 1;
-        }
-    }
-    if (!cheng_seed_dump_file_stdout(sync_log) || !cheng_seed_dump_file_stdout(fresh_log)) {
-        return 1;
-    }
-    printf("cheng fresh-node selfhost gate ok (%s)\n", label);
-    return 0;
-}
-
-static int cheng_seed_cmd_run_migration_gate_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char current_src[PATH_MAX];
-    char legacy_src[PATH_MAX];
-    char migrate_prefix[PATH_MAX];
-    char proof_prefix[PATH_MAX];
-    char blocked_prefix[PATH_MAX];
-    char publish_prefix[PATH_MAX];
-    char migrate_log[PATH_MAX];
-    char prove_log[PATH_MAX];
-    char blocked_log[PATH_MAX];
-    char publish_log[PATH_MAX];
-    const char *compiler_bin;
-    const char *label;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_MIGRATION_COMPILER",
-                                                "CHENG_SMOKE_COMPILER",
-                                                paths.backend_driver_out);
-    label = cheng_seed_leaf_resolve_label(argc, argv, "CHENG_MIGRATION_LABEL", "host");
-    if (!cheng_seed_leaf_expect_compiler("run-migration-gate", compiler_bin)) {
-        return 1;
-    }
-    cheng_seed_join_path(current_src, sizeof(current_src), paths.root, "src/tests/compiler_migration_fixture.cheng");
-    cheng_seed_join_path(legacy_src, sizeof(legacy_src), paths.root, "testdata/compiler_migration/compiler_migration_fixture_legacy.cheng");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/migration_gate");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), out_dir, label);
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    cheng_seed_join_path(migrate_prefix, sizeof(migrate_prefix), out_dir, "compiler_migration_fixture.migrate");
-    cheng_seed_join_path(proof_prefix, sizeof(proof_prefix), out_dir, "compiler_migration_fixture.prove");
-    cheng_seed_join_path(blocked_prefix, sizeof(blocked_prefix), out_dir, "compiler_migration_fixture.blocked");
-    cheng_seed_join_path(publish_prefix, sizeof(publish_prefix), out_dir, "compiler_migration_fixture.publish");
-    cheng_seed_join_path(migrate_log, sizeof(migrate_log), out_dir, "migrate_csg.log");
-    cheng_seed_join_path(prove_log, sizeof(prove_log), out_dir, "prove_migration.log");
-    cheng_seed_join_path(blocked_log, sizeof(blocked_log), out_dir, "publish_blocked.log");
-    cheng_seed_join_path(publish_log, sizeof(publish_log), out_dir, "publish_migration.log");
-    {
-        char out_flag[PATH_MAX + 16];
-        snprintf(out_flag, sizeof(out_flag), "--out:%s", migrate_prefix);
-        {
-            char root_flag[PATH_MAX + 16];
-            char in_flag[PATH_MAX + 16];
-            char legacy_flag[PATH_MAX + 16];
-            snprintf(root_flag, sizeof(root_flag), "--root:%s", root_cheng);
-            snprintf(in_flag, sizeof(in_flag), "--in:%s", current_src);
-            snprintf(legacy_flag, sizeof(legacy_flag), "--legacy-in:%s", legacy_src);
-            if (!cheng_seed_run_compiler_command_logged(compiler_bin,
-                                                5U,
-                                                (const char *[5]){ "migrate-csg", root_flag, in_flag, legacy_flag, out_flag },
-                                                migrate_log,
-                                                "run-migration-gate migrate-csg")) {
-                return 1;
-            }
-        }
-    }
-    {
-        char *text = cheng_seed_read_file(migrate_log);
-        char path_buf[PATH_MAX];
-        if (text == NULL || !cheng_seed_expect_text_contains("run-migration-gate migrate", text, "canonical_graph_cid=")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        snprintf(path_buf, sizeof(path_buf), "%s.migration.txt", migrate_prefix);
-        if (!cheng_seed_expect_file_exists_nonempty("run-migration-gate migration report", path_buf)) {
-            return 1;
-        }
-        snprintf(path_buf, sizeof(path_buf), "%s.migration.csg.txt", migrate_prefix);
-        if (!cheng_seed_expect_file_exists_nonempty("run-migration-gate migration csg", path_buf)) {
-            return 1;
-        }
-        snprintf(path_buf, sizeof(path_buf), "%s.migration.surface.txt", migrate_prefix);
-        if (!cheng_seed_expect_file_exists_nonempty("run-migration-gate migration surface", path_buf)) {
-            return 1;
-        }
-        snprintf(path_buf, sizeof(path_buf), "%s.migration.receipt.txt", migrate_prefix);
-        if (!cheng_seed_expect_file_exists_nonempty("run-migration-gate migration receipt", path_buf)) {
-            return 1;
-        }
-    }
-    {
-        char out_flag[PATH_MAX + 16];
-        snprintf(out_flag, sizeof(out_flag), "--out:%s", proof_prefix);
-        {
-            char root_flag[PATH_MAX + 16];
-            char in_flag[PATH_MAX + 16];
-            char legacy_flag[PATH_MAX + 16];
-            snprintf(root_flag, sizeof(root_flag), "--root:%s", root_cheng);
-            snprintf(in_flag, sizeof(in_flag), "--in:%s", current_src);
-            snprintf(legacy_flag, sizeof(legacy_flag), "--legacy-in:%s", legacy_src);
-            if (!cheng_seed_run_compiler_command_logged(compiler_bin,
-                                                7U,
-                                                (const char *[7]){ "prove-migration", root_flag, in_flag, legacy_flag, "--target:arm64-apple-darwin", "--channel:stable", out_flag },
-                                                prove_log,
-                                                "run-migration-gate prove-migration")) {
-                return 1;
-            }
-        }
-    }
-    {
-        char *text = cheng_seed_read_file(prove_log);
-        char path_buf[PATH_MAX];
-        if (text == NULL ||
-            !cheng_seed_expect_text_has_line("run-migration-gate prove", text, "equivalence_kind=canonical_semantic_identity") ||
-            !cheng_seed_expect_text_has_line("run-migration-gate prove", text, "graph_equivalent=1") ||
-            !cheng_seed_expect_text_has_line("run-migration-gate prove", text, "export_surface_compatible=1") ||
-            !cheng_seed_expect_text_has_line("run-migration-gate prove", text, "compile_receipt_equivalent=1")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        snprintf(path_buf, sizeof(path_buf), "%s.proof.txt", proof_prefix);
-        if (!cheng_seed_expect_file_exists_nonempty("run-migration-gate proof", path_buf)) {
-            return 1;
-        }
-    }
-    {
-        char out_flag[PATH_MAX + 16];
-        snprintf(out_flag, sizeof(out_flag), "--out:%s", blocked_prefix);
-        {
-            char root_flag[PATH_MAX + 16];
-            char in_flag[PATH_MAX + 16];
-            snprintf(root_flag, sizeof(root_flag), "--root:%s", root_cheng);
-            snprintf(in_flag, sizeof(in_flag), "--in:%s", current_src);
-            if (!cheng_seed_run_command_logged_argv_quiet(7U,
-                                                  (const char *[7]){ compiler_bin, "publish-world", root_flag, in_flag, "--target:arm64-apple-darwin", out_flag, "--channel:stable" },
-                                                  blocked_log,
-                                                  "run-migration-gate publish-blocked")) {
-                char *blocked_text = cheng_seed_read_file(blocked_log);
-                bool ok = blocked_text != NULL &&
-                          (cheng_seed_text_contains_substring(blocked_text, "stable requires") ||
-                           cheng_seed_text_contains_substring(blocked_text, "publish blocked") ||
-                           cheng_seed_text_contains_substring(blocked_text, "missing --baseline"));
-                free(blocked_text);
-                if (!ok) {
-                    return 1;
-                }
-            } else {
-                fprintf(stderr, "[cheng_seed] run-migration-gate stable publish unexpectedly passed\n");
-                return 1;
-            }
-        }
-    }
-    {
-        char out_flag[PATH_MAX + 16];
-        snprintf(out_flag, sizeof(out_flag), "--out:%s", publish_prefix);
-        {
-            char root_flag[PATH_MAX + 16];
-            char in_flag[PATH_MAX + 16];
-            char legacy_flag[PATH_MAX + 16];
-            snprintf(root_flag, sizeof(root_flag), "--root:%s", root_cheng);
-            snprintf(in_flag, sizeof(in_flag), "--in:%s", current_src);
-            snprintf(legacy_flag, sizeof(legacy_flag), "--legacy-in:%s", legacy_src);
-            if (!cheng_seed_run_compiler_command_logged(compiler_bin,
-                                                8U,
-                                                (const char *[8]){ "publish-world", root_flag, in_flag, legacy_flag, "--target:arm64-apple-darwin", out_flag, "--channel:stable" },
-                                                publish_log,
-                                                "run-migration-gate publish-world")) {
-                return 1;
-            }
-        }
-    }
-    {
-        char *text = cheng_seed_read_file(publish_log);
-        char path_buf[PATH_MAX];
-        if (text == NULL ||
-            !cheng_seed_expect_text_has_line("run-migration-gate publish", text, "proof_mode=migration") ||
-            !cheng_seed_expect_text_has_line("run-migration-gate publish", text, "equivalence_passed=1") ||
-            !cheng_seed_expect_text_has_line("run-migration-gate publish", text, "publish_allowed=1")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        snprintf(path_buf, sizeof(path_buf), "%s.publish.txt", publish_prefix);
-        if (!cheng_seed_expect_file_exists_nonempty("run-migration-gate publish proof", path_buf)) {
-            return 1;
-        }
-    }
-    if (!cheng_seed_dump_file_stdout(migrate_log) ||
-        !cheng_seed_dump_file_stdout(prove_log) ||
-        !cheng_seed_dump_file_stdout(blocked_log) ||
-        !cheng_seed_dump_file_stdout(publish_log)) {
-        return 1;
-    }
-    printf("cheng migration gate ok (%s)\n", label);
-    return 0;
-}
-
-static int cheng_seed_cmd_run_browser_webrtc_smokes_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char browser_dir[PATH_MAX];
-    char npm_log[PATH_MAX];
-    char playwright_log[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char src[PATH_MAX];
-    char compile_label[PATH_MAX];
-    const char *host_compiler;
-    const char *tests[32];
-    size_t test_count;
-    size_t i;
-    bool had_incremental = false;
-    bool had_multi_cache = false;
-    char saved_incremental[64];
-    char saved_multi_cache[64];
-    int status = 0;
-    static const char *DEFAULT_TESTS[] = {
-        "webrtc_signal_stream_smoke",
-        "webrtc_datachannel_browser_smoke",
-        "webrtc_browser_content_smoke",
-        "libp2p_webrtc_sync_smoke",
-        "webrtc_browser_pubsub_smoke",
-        "webrtc_browser_light_node_smoke",
-        "browser_sdk_smoke"
-    };
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    if (!cheng_seed_bootstrap_artifacts_fresh(&paths) && cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        return 1;
-    }
-    host_compiler = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                 argv,
-                                                 "CHENG_SMOKE_COMPILER",
-                                                 NULL,
-                                                 paths.backend_driver_out);
-    if (!cheng_seed_leaf_expect_compiler("run-browser-webrtc-smokes host", host_compiler) ||
-        !cheng_seed_leaf_expect_compiler("run-browser-webrtc-smokes stage2", paths.stage2) ||
-        !cheng_seed_leaf_expect_compiler("run-browser-webrtc-smokes stage3", paths.stage3)) {
-        return 1;
-    }
-    cheng_seed_join_path(browser_dir, sizeof(browser_dir), paths.root, "tools/browser_webrtc");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/browser_webrtc");
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    cheng_seed_join_path(npm_log, sizeof(npm_log), out_dir, "npm_install.log");
-    cheng_seed_join_path(playwright_log, sizeof(playwright_log), out_dir, "playwright_install.log");
-    {
-        char playwright_dir[PATH_MAX];
-        char *quoted_browser_dir;
-        char *command;
-        cheng_seed_join_path(playwright_dir, sizeof(playwright_dir), browser_dir, "node_modules/playwright");
-        if (access(playwright_dir, R_OK) != 0) {
-            quoted_browser_dir = cheng_seed_shell_quote(browser_dir);
-            command = (char *)cheng_seed_xmalloc(strlen(quoted_browser_dir) + 96U);
-            snprintf(command, strlen(quoted_browser_dir) + 96U, "cd %s && npm install --no-fund --no-audit", quoted_browser_dir);
-            free(quoted_browser_dir);
-            if (!cheng_seed_run_shell_command_logged(command, npm_log, "run-browser-webrtc-smokes npm-install")) {
-                free(command);
-                return 1;
-            }
-            free(command);
-        }
-        quoted_browser_dir = cheng_seed_shell_quote(browser_dir);
-        command = (char *)cheng_seed_xmalloc(strlen(quoted_browser_dir) + 96U);
-        snprintf(command, strlen(quoted_browser_dir) + 96U, "cd %s && npx playwright install chromium", quoted_browser_dir);
-        free(quoted_browser_dir);
-        if (!cheng_seed_run_shell_command_logged(command, playwright_log, "run-browser-webrtc-smokes playwright-install")) {
-            free(command);
-            return 1;
-        }
-        free(command);
-    }
-    test_count = cheng_seed_collect_smoke_positionals(argc, argv, tests, sizeof(tests) / sizeof(tests[0]));
-    if (test_count == 0U) {
-        for (i = 0U; i < sizeof(DEFAULT_TESTS) / sizeof(DEFAULT_TESTS[0]); ++i) {
-            tests[i] = DEFAULT_TESTS[i];
-        }
-        test_count = sizeof(DEFAULT_TESTS) / sizeof(DEFAULT_TESTS[0]);
-    }
-    cheng_seed_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
-    cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
-    setenv("BACKEND_INCREMENTAL", "0", 1);
-    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
-    for (i = 0U; i < test_count; ++i) {
-        snprintf(src, sizeof(src), "%s/src/tests/%s.cheng", paths.root, tests[i]);
-        snprintf(out_bin, sizeof(out_bin), "%s/%s.host", out_dir, tests[i]);
-        snprintf(compile_log, sizeof(compile_log), "%s/%s.host.compile.log", out_dir, tests[i]);
-        snprintf(run_log, sizeof(run_log), "%s/%s.host.run.log", out_dir, tests[i]);
-        if (!cheng_seed_compile_host_fixture_with_backend_driver(host_compiler, root_cheng, src, out_bin, compile_log)) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-        {
-            char *run_argv[2];
-            run_argv[0] = out_bin;
-            run_argv[1] = NULL;
-            if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) || !cheng_seed_status_is_exit_code(status, 0)) {
-                cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                return 1;
-            }
-        }
-        if (!cheng_seed_dump_file_stdout(run_log)) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-        snprintf(out_bin, sizeof(out_bin), "%s/%s.stage2", out_dir, tests[i]);
-        snprintf(compile_label, sizeof(compile_label), "stage2 %s", tests[i]);
-        if (!cheng_seed_run_fixture_smoke_direct("run-browser-webrtc-smokes", compile_label, paths.stage2, paths.root, root_cheng, tests[i], out_bin)) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-        snprintf(out_bin, sizeof(out_bin), "%s/%s.stage3", out_dir, tests[i]);
-        snprintf(compile_label, sizeof(compile_label), "stage3 %s", tests[i]);
-        if (!cheng_seed_run_fixture_smoke_direct("run-browser-webrtc-smokes", compile_label, paths.stage3, paths.root, root_cheng, tests[i], out_bin)) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-    }
-    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-    puts("cheng browser webrtc smokes: ok");
-    return 0;
-}
-
-static int cheng_seed_cmd_run_chain_node_cli_smoke_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_root[PATH_MAX];
-    char tmp_template[PATH_MAX];
-    char *tmpdir;
-    char bin[PATH_MAX];
-    char build_log[PATH_MAX];
-    char server_state[PATH_MAX];
-    char client_state[PATH_MAX];
-    char ready_path[PATH_MAX];
-    char server_log[PATH_MAX];
-    char sync_log[PATH_MAX];
-    char init_log[PATH_MAX];
-    char mint_log[PATH_MAX];
-    char transfer_log[PATH_MAX];
-    char balance_a_log[PATH_MAX];
-    char balance_b_log[PATH_MAX];
-    char show_log[PATH_MAX];
-    char snapshot_log[PATH_MAX];
-    char client_balance_a_log[PATH_MAX];
-    char client_balance_b_log[PATH_MAX];
-    char client_show_log[PATH_MAX];
-    char server_port[64];
-    const char *compiler_bin;
-    const char *label;
-    char saved_compiler[PATH_MAX];
-    char saved_out_dir[PATH_MAX];
-    char saved_self_test[32];
-    bool had_compiler = false;
-    bool had_out_dir = false;
-    bool had_self_test = false;
-    pid_t server_pid = -1;
-    int status = 0;
-    char *daemon_argv[9];
-    char *sync_argv[12];
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_CHAIN_NODE_COMPILER",
-                                                "CHENG_SMOKE_COMPILER",
-                                                paths.backend_driver_out);
-    label = cheng_seed_leaf_resolve_label(argc, argv, "CHENG_CHAIN_NODE_LABEL", "host");
-    if (!cheng_seed_leaf_expect_compiler("run-chain-node-cli-smoke", compiler_bin)) {
-        return 1;
-    }
-    cheng_seed_join_path(out_root, sizeof(out_root), paths.root, "artifacts/chain_node_cli");
-    cheng_seed_join_path(out_root, sizeof(out_root), out_root, label);
-    if (!cheng_seed_mkdir_p(out_root)) {
-        return 1;
-    }
-    cheng_seed_join_path(bin, sizeof(bin), out_root, "cheng_node_main");
-    cheng_seed_join_path(build_log, sizeof(build_log), out_root, "cheng_node_main.compile.log");
-    cheng_seed_save_env_value("CHENG_CHAIN_NODE_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
-    cheng_seed_save_env_value("CHAIN_NODE_OUT_DIR", saved_out_dir, sizeof(saved_out_dir), &had_out_dir);
-    cheng_seed_save_env_value("CHAIN_NODE_RUN_SELF_TEST", saved_self_test, sizeof(saved_self_test), &had_self_test);
-    setenv("CHENG_CHAIN_NODE_COMPILER", compiler_bin, 1);
-    setenv("CHAIN_NODE_OUT_DIR", out_root, 1);
-    setenv("CHAIN_NODE_RUN_SELF_TEST", "0", 1);
-    if (cheng_seed_cmd_build_chain_node_impl(0, NULL) != 0) {
-        cheng_seed_restore_env_value("CHENG_CHAIN_NODE_COMPILER", saved_compiler, had_compiler);
-        cheng_seed_restore_env_value("CHAIN_NODE_OUT_DIR", saved_out_dir, had_out_dir);
-        cheng_seed_restore_env_value("CHAIN_NODE_RUN_SELF_TEST", saved_self_test, had_self_test);
-        return 1;
-    }
-    cheng_seed_restore_env_value("CHENG_CHAIN_NODE_COMPILER", saved_compiler, had_compiler);
-    cheng_seed_restore_env_value("CHAIN_NODE_OUT_DIR", saved_out_dir, had_out_dir);
-    cheng_seed_restore_env_value("CHAIN_NODE_RUN_SELF_TEST", saved_self_test, had_self_test);
-    if (!cheng_seed_leaf_expect_compiler("run-chain-node-cli-smoke binary", bin)) {
-        return 1;
-    }
-    snprintf(tmp_template, sizeof(tmp_template), "%s/tmp.XXXXXX", out_root);
-    tmpdir = mkdtemp(tmp_template);
-    if (tmpdir == NULL) {
-        fprintf(stderr, "[cheng_seed] run-chain-node-cli-smoke mkdtemp failed\n");
-        return 1;
-    }
-    snprintf(server_state, sizeof(server_state), "%s/server.state", tmpdir);
-    snprintf(client_state, sizeof(client_state), "%s/client.state", tmpdir);
-    snprintf(ready_path, sizeof(ready_path), "%s/server.ready", tmpdir);
-    snprintf(server_log, sizeof(server_log), "%s/server.log", tmpdir);
-    snprintf(sync_log, sizeof(sync_log), "%s/sync.log", tmpdir);
-    snprintf(init_log, sizeof(init_log), "%s/init.log", tmpdir);
-    snprintf(mint_log, sizeof(mint_log), "%s/mint.log", tmpdir);
-    snprintf(transfer_log, sizeof(transfer_log), "%s/transfer.log", tmpdir);
-    snprintf(balance_a_log, sizeof(balance_a_log), "%s/balance_a.log", tmpdir);
-    snprintf(balance_b_log, sizeof(balance_b_log), "%s/balance_b.log", tmpdir);
-    snprintf(show_log, sizeof(show_log), "%s/show.log", tmpdir);
-    snprintf(snapshot_log, sizeof(snapshot_log), "%s/snapshot.log", tmpdir);
-    snprintf(client_balance_a_log, sizeof(client_balance_a_log), "%s/client_balance_a.log", tmpdir);
-    snprintf(client_balance_b_log, sizeof(client_balance_b_log), "%s/client_balance_b.log", tmpdir);
-    snprintf(client_show_log, sizeof(client_show_log), "%s/client_show.log", tmpdir);
-    {
-        char state_arg[PATH_MAX + 16];
-        snprintf(state_arg, sizeof(state_arg), "--state:%s", server_state);
-        if (!cheng_seed_run_command_logged_argv(6U,
-                                        (const char *[6]){ bin, "chain", "init", state_arg, "--node-id:node-a", "--address-seed:chain-node-a" },
-                                        init_log,
-                                        "run-chain-node-cli-smoke init") ||
-            !cheng_seed_run_command_logged_argv(7U,
-                                        (const char *[7]){ bin, "chain", "mint", state_arg, "--asset:7", "--account:1001", "--amount:100" },
-                                        mint_log,
-                                        "run-chain-node-cli-smoke mint") ||
-            !cheng_seed_run_command_logged_argv(8U,
-                                        (const char *[8]){ bin, "chain", "transfer", state_arg, "--asset:7", "--from:1001", "--to:2002", "--amount:40" },
-                                        transfer_log,
-                                        "run-chain-node-cli-smoke transfer")) {
-            return 1;
-        }
-        if (!cheng_seed_run_command_logged_argv(6U,
-                                        (const char *[6]){ bin, "chain", "balance", state_arg, "--asset:7", "--account:1001" },
-                                        balance_a_log,
-                                        "run-chain-node-cli-smoke balance-a") ||
-            !cheng_seed_run_command_logged_argv(6U,
-                                        (const char *[6]){ bin, "chain", "balance", state_arg, "--asset:7", "--account:2002" },
-                                        balance_b_log,
-                                        "run-chain-node-cli-smoke balance-b") ||
-            !cheng_seed_run_command_logged_argv(5U,
-                                        (const char *[5]){ bin, "chain", "state", "show", state_arg },
-                                        show_log,
-                                        "run-chain-node-cli-smoke show") ||
-            !cheng_seed_run_command_logged_argv(5U,
-                                        (const char *[5]){ bin, "chain", "snapshot", "dump", state_arg },
-                                        snapshot_log,
-                                        "run-chain-node-cli-smoke snapshot")) {
-            return 1;
-        }
-    }
-    {
-        char state_arg[PATH_MAX + 16];
-        char ready_arg[PATH_MAX + 24];
-        snprintf(state_arg, sizeof(state_arg), "--state:%s", server_state);
-        snprintf(ready_arg, sizeof(ready_arg), "--ready-path:%s", ready_path);
-        daemon_argv[0] = bin;
-        daemon_argv[1] = "chain";
-        daemon_argv[2] = "daemon";
-        daemon_argv[3] = "serve";
-        daemon_argv[4] = state_arg;
-        daemon_argv[5] = "--port:0";
-        daemon_argv[6] = ready_arg;
-        daemon_argv[7] = "--max-serve-count:1";
-        daemon_argv[8] = NULL;
-        if (!cheng_seed_spawn_binary_capture_output(daemon_argv, server_log, &server_pid) ||
-            !cheng_seed_wait_ready_port_file("run-chain-node-cli-smoke daemon", ready_path, server_pid, 20000, server_port, sizeof(server_port)) ||
-            !cheng_seed_text_is_decimal_digits(server_port)) {
-            cheng_seed_kill_and_wait_pid(&server_pid);
-            return 1;
-        }
-    }
-    {
-        char state_arg[PATH_MAX + 16];
-        char port_arg[128];
-        snprintf(state_arg, sizeof(state_arg), "--state:%s", client_state);
-        snprintf(port_arg, sizeof(port_arg), "--port:%s", server_port);
-        sync_argv[0] = bin;
-        sync_argv[1] = "chain";
-        sync_argv[2] = "daemon";
-        sync_argv[3] = "sync";
-        sync_argv[4] = state_arg;
-        sync_argv[5] = "--node-id:node-b";
-        sync_argv[6] = "--address-seed:chain-node-b";
-        sync_argv[7] = "--host:127.0.0.1";
-        sync_argv[8] = port_arg;
-        sync_argv[9] = "--max-sync-count:1";
-        sync_argv[10] = "--interval-ms:10";
-        sync_argv[11] = NULL;
-        if (!cheng_seed_run_binary_capture_output(sync_argv, sync_log, &status) ||
-            !cheng_seed_status_is_exit_code(status, 0) ||
-            !cheng_seed_wait_pid_success(&server_pid, "run-chain-node-cli-smoke daemon", server_log)) {
-            cheng_seed_kill_and_wait_pid(&server_pid);
-            return 1;
-        }
-    }
-    {
-        char state_arg[PATH_MAX + 16];
-        snprintf(state_arg, sizeof(state_arg), "--state:%s", client_state);
-        if (!cheng_seed_run_command_logged_argv(6U,
-                                        (const char *[6]){ bin, "chain", "balance", state_arg, "--asset:7", "--account:1001" },
-                                        client_balance_a_log,
-                                        "run-chain-node-cli-smoke client-balance-a") ||
-            !cheng_seed_run_command_logged_argv(6U,
-                                        (const char *[6]){ bin, "chain", "balance", state_arg, "--asset:7", "--account:2002" },
-                                        client_balance_b_log,
-                                        "run-chain-node-cli-smoke client-balance-b") ||
-            !cheng_seed_run_command_logged_argv(5U,
-                                        (const char *[5]){ bin, "chain", "state", "show", state_arg },
-                                        client_show_log,
-                                        "run-chain-node-cli-smoke client-show")) {
-            return 1;
-        }
-    }
-    {
-        char *text = cheng_seed_read_file(init_log);
-        if (text == NULL || !cheng_seed_expect_text_contains("run-chain-node-cli-smoke init", text, "node_id=node-a")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        text = cheng_seed_read_file(balance_a_log);
-        if (text == NULL || !cheng_seed_expect_text_contains("run-chain-node-cli-smoke balance-a", text, "balance=60")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        text = cheng_seed_read_file(balance_b_log);
-        if (text == NULL || !cheng_seed_expect_text_contains("run-chain-node-cli-smoke balance-b", text, "balance=40")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        text = cheng_seed_read_file(show_log);
-        if (text == NULL || !cheng_seed_expect_text_contains("run-chain-node-cli-smoke show", text, "node_id=node-a")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        text = cheng_seed_read_file(snapshot_log);
-        if (text == NULL || !cheng_seed_expect_text_contains("run-chain-node-cli-smoke snapshot", text, "payload_hex=")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        text = cheng_seed_read_file(sync_log);
-        if (text == NULL || !cheng_seed_expect_text_contains("run-chain-node-cli-smoke sync", text, "changed=1")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        text = cheng_seed_read_file(client_balance_a_log);
-        if (text == NULL || !cheng_seed_expect_text_contains("run-chain-node-cli-smoke client-balance-a", text, "balance=60")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        text = cheng_seed_read_file(client_balance_b_log);
-        if (text == NULL || !cheng_seed_expect_text_contains("run-chain-node-cli-smoke client-balance-b", text, "balance=40")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-        text = cheng_seed_read_file(client_show_log);
-        if (text == NULL || !cheng_seed_expect_text_contains("run-chain-node-cli-smoke client-show", text, "node_id=node-b")) {
-            free(text);
-            return 1;
-        }
-        free(text);
-    }
-    if (!cheng_seed_dump_file_stdout(init_log) ||
-        !cheng_seed_dump_file_stdout(mint_log) ||
-        !cheng_seed_dump_file_stdout(transfer_log) ||
-        !cheng_seed_dump_file_stdout(balance_a_log) ||
-        !cheng_seed_dump_file_stdout(balance_b_log) ||
-        !cheng_seed_dump_file_stdout(show_log) ||
-        !cheng_seed_dump_file_stdout(snapshot_log) ||
-        !cheng_seed_dump_file_stdout(server_log) ||
-        !cheng_seed_dump_file_stdout(sync_log) ||
-        !cheng_seed_dump_file_stdout(client_balance_a_log) ||
-        !cheng_seed_dump_file_stdout(client_balance_b_log) ||
-        !cheng_seed_dump_file_stdout(client_show_log)) {
-        return 1;
-    }
-    printf("cheng chain_node cli smoke ok (%s)\n", label);
-    return 0;
-}
-
-static int cheng_seed_cmd_run_chain_node_process_smoke_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char server_src[PATH_MAX];
-    char client_src[PATH_MAX];
-    char server_bin[PATH_MAX];
-    char client_bin[PATH_MAX];
-    char server_log[PATH_MAX];
-    char client_log[PATH_MAX];
-    char ready_path[PATH_MAX];
-    char port_text[64];
-    const char *compiler_bin;
-    const char *label;
-    char *server_argv[4];
-    char *client_argv[3];
-    char ready_arg[PATH_MAX + 32];
-    char client_port_arg[128];
-    pid_t server_pid = -1;
-    int status = 0;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_CHAIN_NODE_COMPILER",
-                                                "CHENG_SMOKE_COMPILER",
-                                                paths.backend_driver_out);
-    label = cheng_seed_leaf_resolve_label(argc, argv, "CHENG_CHAIN_NODE_LABEL", "host");
-    if (!cheng_seed_leaf_expect_compiler("run-chain-node-process-smoke", compiler_bin)) {
-        return 1;
-    }
-    cheng_seed_join_path(server_src, sizeof(server_src), paths.root, "src/tests/chain_node_process_server_smoke.cheng");
-    cheng_seed_join_path(client_src, sizeof(client_src), paths.root, "src/tests/chain_node_process_client_smoke.cheng");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/chain_node_process");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), out_dir, label);
-    cheng_seed_join_path(server_bin, sizeof(server_bin), out_dir, "chain_node_process_server");
-    cheng_seed_join_path(client_bin, sizeof(client_bin), out_dir, "chain_node_process_client");
-    cheng_seed_join_path(server_log, sizeof(server_log), out_dir, "server.log");
-    cheng_seed_join_path(client_log, sizeof(client_log), out_dir, "client.log");
-    cheng_seed_join_path(ready_path, sizeof(ready_path), out_dir, "server.ready");
-    unlink(ready_path);
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, server_src, server_bin, server_log) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, client_src, client_bin, client_log)) {
-        return 1;
-    }
-    snprintf(ready_arg, sizeof(ready_arg), "--ready-path:%s", ready_path);
-    server_argv[0] = server_bin;
-    server_argv[1] = "--port:0";
-    server_argv[2] = ready_arg;
-    server_argv[3] = NULL;
-    if (!cheng_seed_spawn_binary_capture_output(server_argv, server_log, &server_pid) ||
-        !cheng_seed_wait_ready_port_file("run-chain-node-process-smoke", ready_path, server_pid, 20000, port_text, sizeof(port_text)) ||
-        !cheng_seed_text_is_decimal_digits(port_text)) {
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    snprintf(client_port_arg, sizeof(client_port_arg), "--port:%s", port_text);
-    client_argv[0] = client_bin;
-    client_argv[1] = client_port_arg;
-    client_argv[2] = NULL;
-    if (!cheng_seed_run_binary_capture_output(client_argv, client_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0) ||
-        !cheng_seed_wait_pid_success(&server_pid, "run-chain-node-process-smoke server", server_log)) {
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    if (!cheng_seed_dump_file_stdout(server_log) || !cheng_seed_dump_file_stdout(client_log)) {
-        return 1;
-    }
-    printf("cheng chain_node process smoke ok (%s)\n", label);
-    return 0;
-}
-
-static int cheng_seed_cmd_run_chain_node_three_node_smoke_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char server_src[PATH_MAX];
-    char relay_src[PATH_MAX];
-    char client_src[PATH_MAX];
-    char server_bin[PATH_MAX];
-    char relay_bin[PATH_MAX];
-    char client_bin[PATH_MAX];
-    char server_log[PATH_MAX];
-    char relay_log[PATH_MAX];
-    char client_log[PATH_MAX];
-    char server_ready[PATH_MAX];
-    char relay_ready[PATH_MAX];
-    char server_port[64];
-    char relay_port[64];
-    const char *compiler_bin;
-    const char *label;
-    char *server_argv[4];
-    char *relay_argv[5];
-    char *client_argv[3];
-    char server_ready_arg[PATH_MAX + 32];
-    char relay_ready_arg[PATH_MAX + 32];
-    char upstream_arg[128];
-    char relay_port_arg[128];
-    pid_t server_pid = -1;
-    pid_t relay_pid = -1;
-    int status = 0;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_CHAIN_NODE_COMPILER",
-                                                "CHENG_SMOKE_COMPILER",
-                                                paths.backend_driver_out);
-    label = cheng_seed_leaf_resolve_label(argc, argv, "CHENG_CHAIN_NODE_LABEL", "host");
-    if (!cheng_seed_leaf_expect_compiler("run-chain-node-three-node-smoke", compiler_bin)) {
-        return 1;
-    }
-    cheng_seed_join_path(server_src, sizeof(server_src), paths.root, "src/tests/chain_node_process_server_smoke.cheng");
-    cheng_seed_join_path(relay_src, sizeof(relay_src), paths.root, "src/tests/chain_node_process_relay_smoke.cheng");
-    cheng_seed_join_path(client_src, sizeof(client_src), paths.root, "src/tests/chain_node_process_client_smoke.cheng");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/chain_node_three_node");
-    cheng_seed_join_path(out_dir, sizeof(out_dir), out_dir, label);
-    cheng_seed_join_path(server_bin, sizeof(server_bin), out_dir, "chain_node_process_server");
-    cheng_seed_join_path(relay_bin, sizeof(relay_bin), out_dir, "chain_node_process_relay");
-    cheng_seed_join_path(client_bin, sizeof(client_bin), out_dir, "chain_node_process_client");
-    cheng_seed_join_path(server_log, sizeof(server_log), out_dir, "server.log");
-    cheng_seed_join_path(relay_log, sizeof(relay_log), out_dir, "relay.log");
-    cheng_seed_join_path(client_log, sizeof(client_log), out_dir, "client.log");
-    cheng_seed_join_path(server_ready, sizeof(server_ready), out_dir, "server.ready");
-    cheng_seed_join_path(relay_ready, sizeof(relay_ready), out_dir, "relay.ready");
-    unlink(server_ready);
-    unlink(relay_ready);
-    if (!cheng_seed_mkdir_p(out_dir) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, server_src, server_bin, server_log) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, relay_src, relay_bin, relay_log) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, client_src, client_bin, client_log)) {
-        return 1;
-    }
-    snprintf(server_ready_arg, sizeof(server_ready_arg), "--ready-path:%s", server_ready);
-    server_argv[0] = server_bin;
-    server_argv[1] = "--port:0";
-    server_argv[2] = server_ready_arg;
-    server_argv[3] = NULL;
-    if (!cheng_seed_spawn_binary_capture_output(server_argv, server_log, &server_pid) ||
-        !cheng_seed_wait_ready_port_file("run-chain-node-three-node-smoke server", server_ready, server_pid, 20000, server_port, sizeof(server_port)) ||
-        !cheng_seed_text_is_decimal_digits(server_port)) {
-        cheng_seed_kill_and_wait_pid(&relay_pid);
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    snprintf(upstream_arg, sizeof(upstream_arg), "--upstream-port:%s", server_port);
-    snprintf(relay_ready_arg, sizeof(relay_ready_arg), "--ready-path:%s", relay_ready);
-    relay_argv[0] = relay_bin;
-    relay_argv[1] = upstream_arg;
-    relay_argv[2] = "--port:0";
-    relay_argv[3] = relay_ready_arg;
-    relay_argv[4] = NULL;
-    if (!cheng_seed_spawn_binary_capture_output(relay_argv, relay_log, &relay_pid) ||
-        !cheng_seed_wait_ready_port_file("run-chain-node-three-node-smoke relay", relay_ready, relay_pid, 20000, relay_port, sizeof(relay_port)) ||
-        !cheng_seed_text_is_decimal_digits(relay_port)) {
-        cheng_seed_kill_and_wait_pid(&relay_pid);
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    snprintf(relay_port_arg, sizeof(relay_port_arg), "--port:%s", relay_port);
-    client_argv[0] = client_bin;
-    client_argv[1] = relay_port_arg;
-    client_argv[2] = NULL;
-    if (!cheng_seed_run_binary_capture_output(client_argv, client_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0) ||
-        !cheng_seed_wait_pid_success(&relay_pid, "run-chain-node-three-node-smoke relay", relay_log) ||
-        !cheng_seed_wait_pid_success(&server_pid, "run-chain-node-three-node-smoke server", server_log)) {
-        cheng_seed_kill_and_wait_pid(&relay_pid);
-        cheng_seed_kill_and_wait_pid(&server_pid);
-        return 1;
-    }
-    if (!cheng_seed_dump_file_stdout(server_log) ||
-        !cheng_seed_dump_file_stdout(relay_log) ||
-        !cheng_seed_dump_file_stdout(client_log)) {
-        return 1;
-    }
-    printf("cheng chain_node three-node smoke ok (%s)\n", label);
-    return 0;
-}
-
-static int cheng_seed_cmd_run_tailnet_control_smoke_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char probe_dir[PATH_MAX];
-    char probe_port_log[PATH_MAX];
-    char probe_ready_log[PATH_MAX];
-    char probe_log[PATH_MAX];
-    char baseline_src[PATH_MAX];
-    char core_smoke_src[PATH_MAX];
-    char core_src[PATH_MAX];
-    char baseline_bin[PATH_MAX];
-    char core_smoke_bin[PATH_MAX];
-    char core_bin[PATH_MAX];
-    char baseline_compile_log[PATH_MAX];
-    char core_smoke_compile_log[PATH_MAX];
-    char core_compile_log[PATH_MAX];
-    char baseline_run_log[PATH_MAX];
-    char core_smoke_run_log[PATH_MAX];
-    char configure_log[PATH_MAX];
-    char listen_log[PATH_MAX];
-    char dial_log[PATH_MAX];
-    char probe_port[64];
-    char control_probe_endpoint[PATH_MAX];
-    char relay_probe_endpoint[PATH_MAX];
-    const char *compiler_bin;
-    const char *label;
-    char *probe_argv[10];
-    pid_t probe_pid = -1;
-    int rc = 1;
-    if (!cheng_seed_leaf_prepare_backend_driver(&paths, root_cheng, sizeof(root_cheng))) {
-        return 1;
-    }
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_TAILNET_COMPILER",
-                                                "CHENG_SMOKE_COMPILER",
-                                                paths.backend_driver_out);
-    label = cheng_seed_leaf_resolve_label(argc, argv, "CHENG_TAILNET_LABEL", "host");
-    if (!cheng_seed_leaf_expect_compiler("run-tailnet-control-smoke", compiler_bin)) {
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/tailnet_control");
-    cheng_seed_join_path(probe_dir, sizeof(probe_dir), paths.root, "testdata/tailnet");
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    snprintf(probe_port_log, sizeof(probe_port_log), "%s/tailnet_probe_port.%s.log", out_dir, label);
-    snprintf(probe_ready_log, sizeof(probe_ready_log), "%s/tailnet_probe_ready.%s.log", out_dir, label);
-    snprintf(probe_log, sizeof(probe_log), "%s/tailnet_probe_server.%s.log", out_dir, label);
-    if (!cheng_seed_run_command_logged_argv(4U,
-                                    (const char *[4]){
-                                        "/usr/bin/env",
-                                        "python3",
-                                        "-c",
-                                        "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1]); s.close()"
-                                    },
-                                    probe_port_log,
-                                    "run-tailnet-control-smoke pick-port") ||
-        !cheng_seed_read_trimmed_file_text(probe_port_log, probe_port, sizeof(probe_port)) ||
-        !cheng_seed_text_is_decimal_digits(probe_port)) {
-        return 1;
-    }
-    probe_argv[0] = "/usr/bin/env";
-    probe_argv[1] = "python3";
-    probe_argv[2] = "-m";
-    probe_argv[3] = "http.server";
-    probe_argv[4] = probe_port;
-    probe_argv[5] = "--bind";
-    probe_argv[6] = "127.0.0.1";
-    probe_argv[7] = "--directory";
-    probe_argv[8] = probe_dir;
-    probe_argv[9] = NULL;
-    if (!cheng_seed_spawn_binary_capture_output(probe_argv, probe_log, &probe_pid)) {
-        return 1;
-    }
-    snprintf(control_probe_endpoint, sizeof(control_probe_endpoint), "http://127.0.0.1:%s/headscale_control_ready.json", probe_port);
-    snprintf(relay_probe_endpoint, sizeof(relay_probe_endpoint), "http://127.0.0.1:%s/derp_ready.json", probe_port);
-    if (!cheng_seed_run_command_logged_argv(5U,
-                                    (const char *[5]){
-                                        "/usr/bin/env",
-                                        "python3",
-                                        "-c",
-                                        "import sys, time, urllib.request\nurl = sys.argv[1]\nfor _ in range(50):\n    try:\n        with urllib.request.urlopen(url, timeout=0.2) as resp:\n            if resp.status == 200:\n                raise SystemExit(0)\n    except Exception:\n        time.sleep(0.1)\nraise SystemExit(1)\n",
-                                        control_probe_endpoint
-                                    },
-                                    probe_ready_log,
-                                    "run-tailnet-control-smoke wait-probe")) {
-        cheng_seed_kill_and_wait_pid(&probe_pid);
-        return 1;
-    }
-    cheng_seed_join_path(baseline_src, sizeof(baseline_src), paths.root, "src/tests/libp2p_tailnet_transport_smoke.cheng");
-    cheng_seed_join_path(core_smoke_src, sizeof(core_smoke_src), paths.root, "src/tests/tailnet_control_core_smoke.cheng");
-    cheng_seed_join_path(core_src, sizeof(core_src), paths.root, "src/apps/tailnet/tailnet_control_core.cheng");
-    snprintf(baseline_bin, sizeof(baseline_bin), "%s/libp2p_tailnet_transport_smoke.%s", out_dir, label);
-    snprintf(core_smoke_bin, sizeof(core_smoke_bin), "%s/tailnet_control_core_smoke.%s", out_dir, label);
-    snprintf(core_bin, sizeof(core_bin), "%s/tailnet_control_core.%s", out_dir, label);
-    snprintf(baseline_compile_log, sizeof(baseline_compile_log), "%s/libp2p_tailnet_transport_smoke.%s.compile.log", out_dir, label);
-    snprintf(core_smoke_compile_log, sizeof(core_smoke_compile_log), "%s/tailnet_control_core_smoke.%s.compile.log", out_dir, label);
-    snprintf(core_compile_log, sizeof(core_compile_log), "%s/tailnet_control_core.%s.compile.log", out_dir, label);
-    snprintf(baseline_run_log, sizeof(baseline_run_log), "%s/libp2p_tailnet_transport_smoke.%s.run.log", out_dir, label);
-    snprintf(core_smoke_run_log, sizeof(core_smoke_run_log), "%s/tailnet_control_core_smoke.%s.run.log", out_dir, label);
-    snprintf(configure_log, sizeof(configure_log), "%s/tailnet_control_configure.%s.run.log", out_dir, label);
-    snprintf(listen_log, sizeof(listen_log), "%s/tailnet_control_listen.%s.run.log", out_dir, label);
-    snprintf(dial_log, sizeof(dial_log), "%s/tailnet_control_dial.%s.run.log", out_dir, label);
-    if (!cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, baseline_src, baseline_bin, baseline_compile_log) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, core_smoke_src, core_smoke_bin, core_smoke_compile_log) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, core_src, core_bin, core_compile_log)) {
-        cheng_seed_kill_and_wait_pid(&probe_pid);
-        return 1;
-    }
-    if (!cheng_seed_run_command_logged_argv(1U, (const char *[1]){ baseline_bin }, baseline_run_log, "run-tailnet-control-smoke baseline") ||
-        !cheng_seed_run_command_logged_argv(1U, (const char *[1]){ core_smoke_bin }, core_smoke_run_log, "run-tailnet-control-smoke decode")) {
-        cheng_seed_kill_and_wait_pid(&probe_pid);
-        return 1;
-    }
-    {
-        const char *configure_args[] = {
-            core_bin, "--command", "configure", "--provider-headscale", "1",
-            "--control-url", "https://headscale.example",
-            "--control-endpoint", "https://headscale.example/control",
-            "--relay-endpoint", "https://derp.sfo.example:443",
-            "--control-probe-endpoint", control_probe_endpoint,
-            "--relay-probe-endpoint", relay_probe_endpoint,
-            "--namespace", "infra",
-            "--noise-public-key", "noise-pub-cli",
-            "--derp-region-code", "sfo",
-            "--derp-region-name", "SanFrancisco",
-            "--derp-hostname", "derp.sfo.example",
-            "--synthetic-ipv4", "100.64.0.44",
-            "--synthetic-ipv6", "fd7a:115c:a1e0::44",
-            "--local-peer-id", "tailnet-control-test",
-            "--exact-routing", "1",
-            "--provider-ready", "1",
-            "--proxy-ready", "1"
-        };
-        const char *listen_args[] = {
-            core_bin, "--command", "listen", "--provider-headscale", "1",
-            "--control-url", "https://headscale.example",
-            "--control-endpoint", "https://headscale.example/control",
-            "--relay-endpoint", "https://derp.sfo.example:443",
-            "--control-probe-endpoint", control_probe_endpoint,
-            "--relay-probe-endpoint", relay_probe_endpoint,
-            "--namespace", "infra",
-            "--noise-public-key", "noise-pub-cli",
-            "--derp-region-code", "sfo",
-            "--derp-region-name", "SanFrancisco",
-            "--derp-hostname", "derp.sfo.example",
-            "--synthetic-ipv4", "100.64.0.44",
-            "--synthetic-ipv6", "fd7a:115c:a1e0::44",
-            "--local-peer-id", "tailnet-control-test",
-            "--exact-routing", "1",
-            "--provider-ready", "1",
-            "--proxy-ready", "1",
-            "--host", "127.0.0.1",
-            "--port", "7101",
-            "--transport", "tcp"
-        };
-        const char *dial_args[] = {
-            core_bin, "--command", "dial-plan", "--provider-headscale", "1",
-            "--control-url", "https://headscale.example",
-            "--control-endpoint", "https://headscale.example/control",
-            "--relay-endpoint", "https://derp.sfo.example:443",
-            "--control-probe-endpoint", control_probe_endpoint,
-            "--relay-probe-endpoint", relay_probe_endpoint,
-            "--namespace", "infra",
-            "--noise-public-key", "noise-pub-cli",
-            "--derp-region-code", "sfo",
-            "--derp-region-name", "SanFrancisco",
-            "--derp-hostname", "derp.sfo.example",
-            "--synthetic-ipv4", "100.64.0.44",
-            "--synthetic-ipv6", "fd7a:115c:a1e0::44",
-            "--local-peer-id", "tailnet-control-test",
-            "--exact-routing", "1",
-            "--provider-ready", "1",
-            "--proxy-ready", "1",
-            "--derp-healthy", "1",
-            "--bootstrap-listen-count", "1",
-            "--bootstrap-listen-raw-0", "/ip4/127.0.0.1/tcp/7101",
-            "--bootstrap-peer-count", "1",
-            "--bootstrap-peer-id-0", "peer-direct",
-            "--bootstrap-peer-remote-tailnet-ip-0", "100.64.0.88",
-            "--bootstrap-peer-direct-reachable-0", "1",
-            "--bootstrap-peer-relay-allowed-0", "1",
-            "--bootstrap-peer-relay-only-0", "0",
-            "--bootstrap-peer-derp-region-code-0", "sfo",
-            "--bootstrap-peer-signed-preface-0", "test-preface",
-            "--bootstrap-peer-bound-addr-text-0", "/ip4/127.0.0.1/tcp/7101",
-            "--bootstrap-peer-last-path-0", "direct",
-            "--bootstrap-peer-last-error-0", "",
-            "--peer-id", "peer-direct",
-            "--addr", "/ip4/100.64.0.44/tcp/7101"
-        };
-        if (!cheng_seed_run_command_logged_argv(sizeof(configure_args) / sizeof(configure_args[0]),
-                                        configure_args,
-                                        configure_log,
-                                        "run-tailnet-control-smoke configure") ||
-            !cheng_seed_run_command_logged_argv(sizeof(listen_args) / sizeof(listen_args[0]),
-                                        listen_args,
-                                        listen_log,
-                                        "run-tailnet-control-smoke listen") ||
-            !cheng_seed_run_command_logged_argv(sizeof(dial_args) / sizeof(dial_args[0]),
-                                        dial_args,
-                                        dial_log,
-                                        "run-tailnet-control-smoke dial")) {
-            cheng_seed_kill_and_wait_pid(&probe_pid);
-            return 1;
-        }
-    }
-    {
-        char *text = cheng_seed_read_file(configure_log);
-        if (text == NULL ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke configure", text, "configured=1") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke configure", text, "providerKind=headscale") ||
-            !cheng_seed_expect_text_contains("run-tailnet-control-smoke configure", text, control_probe_endpoint) ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke configure", text, "controlPlane=headscale") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke configure", text, "providerReady=1") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke configure", text, "proxyListenersReady=1") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke configure", text, "providerRuntimeActive=1")) {
-            free(text);
-            cheng_seed_kill_and_wait_pid(&probe_pid);
-            return 1;
-        }
-        free(text);
-        text = cheng_seed_read_file(listen_log);
-        if (text == NULL ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke listen", text, "publishedAddr=/ip4/100.64.0.44/tcp/7101") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke listen", text, "listener.0.raw=/ip4/127.0.0.1/tcp/7101") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke listen", text, "providerKind=headscale") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke listen", text, "tailnetDerpMapSummary=headscale/infra@https://headscale.example#sfo/derp.sfo.example") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke listen", text, "providerRuntimeActive=1")) {
-            free(text);
-            cheng_seed_kill_and_wait_pid(&probe_pid);
-            return 1;
-        }
-        free(text);
-        text = cheng_seed_read_file(dial_log);
-        if (text == NULL ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke dial", text, "dial.pathKind=direct") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke dial", text, "dial.routeText=/ip4/127.0.0.1/tcp/7101") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke dial", text, "sessionCount=1") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke dial", text, "relayHealthy=1") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke dial", text, "startupStage=derp-ready") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke dial", text, "tailnetDerpMapSummary=headscale/infra@https://headscale.example#sfo/derp.sfo.example") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke dial", text, "peer.0.lastPath=direct") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke dial", text, "providerRuntimeActive=1") ||
-            !cheng_seed_expect_text_has_line("run-tailnet-control-smoke dial", text, "providerRuntimeCommands=3")) {
-            free(text);
-            cheng_seed_kill_and_wait_pid(&probe_pid);
-            return 1;
-        }
-        free(text);
-    }
-    if (!cheng_seed_dump_file_stdout(baseline_run_log) ||
-        !cheng_seed_dump_file_stdout(core_smoke_run_log) ||
-        !cheng_seed_dump_file_stdout(configure_log) ||
-        !cheng_seed_dump_file_stdout(listen_log) ||
-        !cheng_seed_dump_file_stdout(dial_log)) {
-        cheng_seed_kill_and_wait_pid(&probe_pid);
-        return 1;
-    }
-    rc = 0;
-    printf("cheng tailnet_control_smoke ok (%s)\n", label);
-    cheng_seed_kill_and_wait_pid(&probe_pid);
-    return rc;
-}
-
-static int cheng_seed_cmd_verify_debug_tools(int argc, char **argv) {
-    char *debug_tools_argv[2];
-    (void)argc;
-    (void)argv;
-    debug_tools_argv[0] = "cheng_seed";
-    debug_tools_argv[1] = "verify-debug-tools";
-    return cheng_seed_run_backend_driver_cli_child(2,
-                                                   debug_tools_argv,
-                                                   "verify-debug-tools",
-                                                   "artifacts/gate/verify-debug-tools.log");
-}
-
-static bool cheng_seed_orphan_ascii_space(char ch) {
-    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
-}
-
-static bool cheng_seed_append_text_piece(char **buffer,
-                                 size_t *len,
-                                 size_t *cap,
-                                 const char *text,
-                                 size_t text_len) {
-    char *grown;
-    size_t need;
-    size_t new_cap;
-    if (buffer == NULL || len == NULL || cap == NULL) {
-        return false;
-    }
-    need = *len + text_len + 1U;
-    if (need > *cap) {
-        new_cap = (*cap > 0U) ? *cap : 64U;
-        while (new_cap < need) {
-            new_cap *= 2U;
-        }
-        grown = (char *)realloc(*buffer, new_cap);
-        if (grown == NULL) {
-            free(*buffer);
-            *buffer = NULL;
-            *len = 0U;
-            *cap = 0U;
-            return false;
-        }
-        *buffer = grown;
-        *cap = new_cap;
-    }
-    if (text_len > 0U) {
-        memcpy(*buffer + *len, text, text_len);
-    }
-    *len += text_len;
-    (*buffer)[*len] = '\0';
-    return true;
-}
-
-static char *cheng_seed_normalize_orphan_snapshot_text(const char *text) {
-    char *out;
-    size_t out_len = 0U;
-    size_t out_cap = 1U;
-    const char *cursor;
-    if (text == NULL) {
-        return NULL;
-    }
-    out = (char *)malloc(out_cap);
-    if (out == NULL) {
-        return NULL;
-    }
-    out[0] = '\0';
-    cursor = text;
-    while (*cursor != '\0') {
-        const char *line_start = cursor;
-        const char *line_end;
-        const char *scan;
-        const char *pid_start;
-        const char *pid_end;
-        int skip;
-        bool ok = true;
-        while (*cursor != '\0' && *cursor != '\n' && *cursor != '\r') {
-            cursor++;
-        }
-        line_end = cursor;
-        while (line_start < line_end && cheng_seed_orphan_ascii_space(*line_start)) {
-            line_start++;
-        }
-        while (line_end > line_start && cheng_seed_orphan_ascii_space(line_end[-1])) {
-            line_end--;
-        }
-        if (line_end > line_start) {
-            scan = line_start;
-            pid_start = scan;
-            while (scan < line_end && !cheng_seed_orphan_ascii_space(*scan)) {
-                scan++;
-            }
-            pid_end = scan;
-            if (pid_end > pid_start) {
-                for (skip = 0; skip < 3; ++skip) {
-                    const char *field_start;
-                    while (scan < line_end && cheng_seed_orphan_ascii_space(*scan)) {
-                        scan++;
-                    }
-                    field_start = scan;
-                    while (scan < line_end && !cheng_seed_orphan_ascii_space(*scan)) {
-                        scan++;
-                    }
-                    if (scan <= field_start) {
-                        ok = false;
-                        break;
-                    }
-                }
-                while (scan < line_end && cheng_seed_orphan_ascii_space(*scan)) {
-                    scan++;
-                }
-                if (ok &&
-                    scan < line_end &&
-                    cheng_seed_append_text_piece(&out, &out_len, &out_cap, pid_start, (size_t)(pid_end - pid_start)) &&
-                    cheng_seed_append_text_piece(&out, &out_len, &out_cap, "|", 1U) &&
-                    cheng_seed_append_text_piece(&out, &out_len, &out_cap, scan, (size_t)(line_end - scan)) &&
-                    cheng_seed_append_text_piece(&out, &out_len, &out_cap, "\n", 1U)) {
-                    /* normalized line appended */
-                } else if (ok) {
-                    return NULL;
-                }
-            }
-        }
-        while (*cursor == '\n' || *cursor == '\r') {
-            cursor++;
-        }
-    }
-    return out;
-}
-
-static bool cheng_seed_text_has_exact_line(const char *text,
-                                   const char *line,
-                                   size_t line_len) {
-    const char *cursor;
-    if (text == NULL || line == NULL) {
-        return false;
-    }
-    cursor = text;
-    while (*cursor != '\0') {
-        const char *start = cursor;
-        const char *end;
-        while (*cursor != '\0' && *cursor != '\n' && *cursor != '\r') {
-            cursor++;
-        }
-        end = cursor;
-        if ((size_t)(end - start) == line_len && memcmp(start, line, line_len) == 0) {
-            return true;
-        }
-        while (*cursor == '\n' || *cursor == '\r') {
-            cursor++;
-        }
-    }
-    return false;
-}
-
-static bool cheng_seed_print_new_orphan_lines(const char *before_text,
-                                      const char *after_text) {
-    const char *cursor;
-    bool found = false;
-    if (after_text == NULL) {
-        return false;
-    }
-    cursor = after_text;
-    while (*cursor != '\0') {
-        const char *start = cursor;
-        const char *end;
-        while (*cursor != '\0' && *cursor != '\n' && *cursor != '\r') {
-            cursor++;
-        }
-        end = cursor;
-        if (end > start && !cheng_seed_text_has_exact_line(before_text, start, (size_t)(end - start))) {
-            fprintf(stderr, "%.*s\n", (int)(end - start), start);
-            found = true;
-        }
-        while (*cursor == '\n' || *cursor == '\r') {
-            cursor++;
-        }
-    }
-    return found;
-}
-
-static bool cheng_seed_has_new_orphan_lines(const char *before_text,
-                                    const char *after_text) {
-    const char *cursor;
-    if (after_text == NULL) {
-        return false;
-    }
-    cursor = after_text;
-    while (*cursor != '\0') {
-        const char *start = cursor;
-        const char *end;
-        while (*cursor != '\0' && *cursor != '\n' && *cursor != '\r') {
-            cursor++;
-        }
-        end = cursor;
-        if (end > start && !cheng_seed_text_has_exact_line(before_text, start, (size_t)(end - start))) {
-            return true;
-        }
-        while (*cursor == '\n' || *cursor == '\r') {
-            cursor++;
-        }
-    }
-    return false;
-}
-
-static char *cheng_seed_read_cheng_orphan_snapshot_text(const char *root,
-                                                const char *log_path) {
-    char command[PATH_MAX * 4];
-    char *quoted_root;
-    char *argv_local[4];
-    int status = 0;
-    if (root == NULL || root[0] == '\0') {
-        return NULL;
-    }
-    quoted_root = cheng_seed_shell_quote(root);
-    if (quoted_root == NULL) {
-        return NULL;
-    }
-    snprintf(command,
-             sizeof(command),
-             "ps -Ao pid=,ppid=,state=,etime=,command= | "
-             "awk -v root=%s '$2==1 && $3 ~ /^U/ && index($0, root) > 0'",
-             quoted_root);
-    free(quoted_root);
-    argv_local[0] = (char *)"/bin/sh";
-    argv_local[1] = (char *)"-lc";
-    argv_local[2] = command;
-    argv_local[3] = NULL;
-    if (!cheng_seed_run_binary_capture_output(argv_local, log_path, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_seed] verify-orphan-guard snapshot failed log=%s\n", log_path);
-        return NULL;
-    }
-    return cheng_seed_read_file(log_path);
-}
-
-static int cheng_seed_cmd_verify_orphan_guard_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char tooling_dir[PATH_MAX];
-    char before_log[PATH_MAX];
-    char after_log[PATH_MAX];
-    DIR *dir;
-    struct dirent *entry;
-    char *before_snapshot = NULL;
-    char *after_snapshot = NULL;
-    char *before_normalized = NULL;
-    char *after_normalized = NULL;
-    int rc = 1;
-    static const char *banned_entries[] = {
-        "guarded_exec.py",
-        "orphan_guard_run.sh",
-        "failfast_parallel.sh",
-        "bootstrap_bridge.sh",
-        "build_bft_state_machine.sh",
-        "build_backend_driver.sh",
-        "build_bounds_trace.sh",
-        "build_browser_host_wasm.sh",
-        "browser_host_wasm_runner.js",
-        "build_call_chain.sh",
-        "build_chain_node_linux_obj.sh",
-        "build_chain_node_linux.sh",
-        "build_chain_node.sh",
-        "build_ffi_handle.sh",
-        "build_linux_nolibc_exe.sh",
-        "build_panic_trace.sh",
-        "build_program_selfhost.sh",
-        "build_rwad_bft_state_machine_linux_obj.sh",
-        "build_rwad_bft_state_machine_linux.sh",
-        "build_rwad_bft_state_machine.sh",
-        "build_signal_trace.sh",
-        "build_twoway_search_smoke.sh",
-        "build_zero_exit.sh",
-        "cheng_tooling_repo_dispatch.sh",
-        "cheng.sh",
-        "compare_bench.sh",
-        "profile_run.sh",
-        "r2c_react_fresh_clean_gate.sh",
-        "run_slice_gate.sh",
-        "run_browser_host_wasm_smoke.sh",
-        "run_browser_webrtc_smokes.sh",
-        "run_chain_node_cli_smoke.sh",
-        "run_chain_node_process_smoke.sh",
-        "run_chain_node_three_node_smoke.sh",
-        "run_compile_exe.sh",
-        "run_fresh_node_selfhost_gate.sh",
-        "run_host_smokes.sh",
-        "run_linux_object_smokes.sh",
-        "run_migration_gate.sh",
-        "run_single_smoke.sh",
-        "run_stage23_libp2p_smokes.sh",
-        "run_tailnet_control_smoke.sh",
-        "run_tcp_twoproc_smoke.sh",
-        "run_quic_twoproc_smoke.sh",
-        "run_udp_importc_smoke.sh",
-        "run_wasm_smokes.sh",
-        "run_windows_riscv_builtin_smokes.sh",
-        "scan_forbidden_hotpath.sh",
-        "verify_debug_profile.sh",
-        "verify_debug_runtime.sh",
-        "verify_debug_tools.sh",
-        "verify_orphan_guard.sh",
-        "verify_riscv64_builtin_linker.sh",
-        "verify_windows_builtin_linker.sh"
-    };
-    size_t i;
-    cheng_seed_bootstrap_paths_init(&paths);
-    (void)argc;
-    (void)argv;
-    if (paths.root[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] verify-orphan-guard root detect failed\n");
-        return 1;
-    }
-    cheng_seed_join_path(tooling_dir, sizeof(tooling_dir), paths.root, "tools");
-    dir = opendir(tooling_dir);
-    if (dir == NULL) {
-        fprintf(stderr, "[cheng_seed] verify-orphan-guard open failed: %s\n", tooling_dir);
-        return 1;
-    }
-    while ((entry = readdir(dir)) != NULL) {
-        char child_path[PATH_MAX];
-        struct stat st;
-        const char *name = entry->d_name;
-        const char *ext = strrchr(name, '.');
-        char *text;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
-            continue;
-        }
-        for (i = 0U; i < sizeof(banned_entries) / sizeof(banned_entries[0]); ++i) {
-            if (strcmp(name, banned_entries[i]) == 0) {
-                fprintf(stderr, "verify_orphan_guard: banned tooling entry name: %s/%s\n", tooling_dir, name);
-                closedir(dir);
-                return 1;
-            }
-        }
-        if (ext != NULL && strcmp(ext, ".sh") == 0) {
-            cheng_seed_join_path(child_path, sizeof(child_path), tooling_dir, name);
-            fprintf(stderr, "verify_orphan_guard: shell tooling entry not allowed: %s\n", child_path);
-            closedir(dir);
-            return 1;
-        }
-        if (ext == NULL || strcmp(ext, ".py") != 0) {
-            continue;
-        }
-        cheng_seed_join_path(child_path, sizeof(child_path), tooling_dir, name);
-        if (stat(child_path, &st) != 0) {
-            fprintf(stderr, "[cheng_seed] verify-orphan-guard stat failed: %s\n", child_path);
-            closedir(dir);
-            return 1;
-        }
-        if (!S_ISREG(st.st_mode)) {
-            continue;
-        }
-        text = cheng_seed_read_file(child_path);
-        if (text == NULL) {
-            fprintf(stderr, "[cheng_seed] verify-orphan-guard read failed: %s\n", child_path);
-            closedir(dir);
-            return 1;
-        }
-        for (i = 0U; i < sizeof(banned_entries) / sizeof(banned_entries[0]); ++i) {
-            if (strstr(text, banned_entries[i]) != NULL) {
-                fprintf(stderr, "verify_orphan_guard: banned direct process guard ref in %s\n", child_path);
-                free(text);
-                closedir(dir);
-                return 1;
-            }
-        }
-        free(text);
-    }
-    closedir(dir);
-    dir = NULL;
-    cheng_seed_join_path(before_log, sizeof(before_log), paths.root, "artifacts/gate/orphan_guard_before.log");
-    cheng_seed_join_path(after_log, sizeof(after_log), paths.root, "artifacts/gate/orphan_guard_after.log");
-    before_snapshot = cheng_seed_read_cheng_orphan_snapshot_text(paths.root, before_log);
-    if (before_snapshot == NULL) {
-        goto cleanup;
-    }
-    if (!cheng_seed_ensure_backend_driver_ready(&paths, "verify-orphan-guard")) {
-        goto cleanup;
-    }
-    after_snapshot = cheng_seed_read_cheng_orphan_snapshot_text(paths.root, after_log);
-    if (after_snapshot == NULL) {
-        goto cleanup;
-    }
-    before_normalized = cheng_seed_normalize_orphan_snapshot_text(before_snapshot);
-    after_normalized = cheng_seed_normalize_orphan_snapshot_text(after_snapshot);
-    if (before_normalized == NULL || after_normalized == NULL) {
-        goto cleanup;
-    }
-    if (cheng_seed_has_new_orphan_lines(before_normalized, after_normalized)) {
-        fprintf(stderr,
-                "[cheng_seed] verify-orphan-guard new Cheng U/UE process leaked after bootstrap/build\n");
-        cheng_seed_print_new_orphan_lines(before_normalized, after_normalized);
-        goto cleanup;
-    }
-    rc = 0;
-    puts("verify_orphan_guard ok");
-cleanup:
-    if (dir != NULL) {
-        closedir(dir);
-    }
-    free(before_snapshot);
-    free(after_snapshot);
-    free(before_normalized);
-    free(after_normalized);
-    return rc;
-}
-
-static bool cheng_seed_verify_runtime_fixture_output(const char *label,
-                                             const char *fixture_path,
-                                             const char *run_log_path,
-                                             const char *report_path,
-                                             const char *message_substring,
-                                             const char *reason_line,
-                                             bool require_signal_fields) {
-    char *run_text = cheng_seed_read_file(run_log_path);
-    char *report_text = cheng_seed_read_file(report_path);
-    char prefixed_reason[512];
-    bool ok = true;
-    if (run_text == NULL) {
-        fprintf(stderr, "[cheng_seed] %s missing run log: %s\n", label, run_log_path);
-        free(report_text);
-        return false;
-    }
-    if (report_text == NULL) {
-        fprintf(stderr, "[cheng_seed] %s missing report: %s\n", label, report_path);
-        free(run_text);
-        return false;
-    }
-    snprintf(prefixed_reason, sizeof(prefixed_reason), "[cheng] %s", reason_line);
-    ok = ok && cheng_seed_expect_text_contains(label, run_text, message_substring);
-    ok = ok && cheng_seed_expect_text_has_line(label, run_text, "cheng_crash_raw_v1");
-    ok = ok && cheng_seed_expect_text_has_line(label, run_text, reason_line);
-    ok = ok && cheng_seed_expect_text_contains(label, run_text, "regs pc=0x");
-    ok = ok && cheng_seed_expect_text_contains(label, run_text, " fp=0x");
-    ok = ok && cheng_seed_expect_text_contains(label, run_text, " sp=0x");
-    ok = ok && cheng_seed_expect_text_contains(label, run_text, " lr=0x");
-    if (require_signal_fields) {
-        ok = ok && cheng_seed_expect_text_contains(label, run_text, " sig=");
-        ok = ok && cheng_seed_expect_text_contains(label, run_text, " fault=0x");
-    }
-    ok = ok && cheng_seed_expect_text_contains(label, run_text, "m#");
-    ok = ok && cheng_seed_expect_text_contains(label, run_text, "#");
-    ok = ok && cheng_seed_expect_text_contains(label, run_text, fixture_path);
-    ok = ok && cheng_seed_expect_text_has_line(label, report_text, "[cheng] cheng_crash_report_v1");
-    ok = ok && cheng_seed_expect_text_has_line(label, report_text, prefixed_reason);
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, "[cheng] regs pc=0x");
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, " fp=0x");
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, " sp=0x");
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, " lr=0x");
-    if (require_signal_fields) {
-        ok = ok && cheng_seed_expect_text_contains(label, report_text, " sig=");
-        ok = ok && cheng_seed_expect_text_contains(label, report_text, " fault=0x");
-    }
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, "[cheng] m#");
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, "[cheng] #");
-    ok = ok && cheng_seed_expect_text_contains(label, report_text, fixture_path);
-    free(run_text);
-    free(report_text);
-    return ok;
-}
-
-static int cheng_seed_cmd_verify_debug_runtime_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char src_panic[PATH_MAX];
-    char src_bounds[PATH_MAX];
-    char src_signal[PATH_MAX];
-    char panic_bin[PATH_MAX];
-    char bounds_bin[PATH_MAX];
-    char signal_bin[PATH_MAX];
-    char linux_bin[PATH_MAX];
-    char panic_compile_log[PATH_MAX];
-    char bounds_compile_log[PATH_MAX];
-    char signal_compile_log[PATH_MAX];
-    char panic_run_log[PATH_MAX];
-    char bounds_run_log[PATH_MAX];
-    char signal_run_log[PATH_MAX];
-    char panic_report[PATH_MAX];
-    char panic_crash_report[PATH_MAX];
-    char bounds_crash_report[PATH_MAX];
-    char signal_crash_report[PATH_MAX];
-    char panic_crash_report_log[PATH_MAX];
-    char bounds_crash_report_log[PATH_MAX];
-    char signal_crash_report_log[PATH_MAX];
-    char linux_compile_log[PATH_MAX];
-    char linux_report[PATH_MAX];
-    char panic_line_map[PATH_MAX];
-    char bounds_line_map[PATH_MAX];
-    char signal_line_map[PATH_MAX];
-    char direct_debug_source[PATH_MAX];
-    char linux_runtime_source[PATH_MAX];
-    char legacy_runtime_native_dir[PATH_MAX];
-    char panic_debug_provider_object[PATH_MAX];
-    char linux_runtime_object[PATH_MAX];
-    char *panic_argv[2];
-    char *bounds_argv[2];
-    char *signal_argv[2];
-    char *bounds_log_text = NULL;
-    char *direct_debug_source_text = NULL;
-    char *linux_report_text = NULL;
-    char *panic_report_text = NULL;
-    const char *host_target = NULL;
-    const char *const *allowed_debug_runtime_undefined = NULL;
-    size_t allowed_debug_runtime_undefined_count = 0U;
-    const char *linux_target = "aarch64-unknown-linux-gnu";
-    const char *debug_runtime_internal_export_prefix = "cheng_runtime_debug_runtime_stub__";
-    static const char *const allowed_debug_runtime_exports[] = {
-        "cheng_crash_trace_enabled",
-        "cheng_crash_trace_mark",
-        "cheng_crash_trace_set_phase",
-        "cheng_dump_backtrace_if_enabled",
-        "cheng_force_segv",
-        "cheng_debug_profile_flush_from_argv0",
-        "cheng_native_dump_backtrace_and_exit",
-        "cheng_native_register_line_map_from_argv0"
-    };
-    static const char *const allowed_debug_runtime_undefined_darwin[] = {
-        "_cheng_bounds_check",
-        "_cheng_host_exit_runtime",
-        "_cheng_host_fclose",
-        "_cheng_host_fflush",
-        "_cheng_host_fgets",
-        "_cheng_host_fopen",
-        "_cheng_host_fwrite",
-        "_cheng_host_getenv",
-        "_cheng_host_puts_runtime"
-    };
-    static const char *const allowed_linux_runtime_undefined[] = {
-        "__cheng_linux_syscall1",
-        "__cheng_linux_syscall2",
-        "__cheng_linux_syscall3",
-        "__cheng_linux_syscall4",
-        "__cheng_linux_syscall5",
-        "__cheng_linux_syscall6"
-    };
-    int status = 0;
-    (void)argc;
-    (void)argv;
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (!cheng_seed_ensure_backend_driver_ready(&paths, "verify-debug-runtime")) {
-        return 1;
-    }
-    cheng_seed_copy_text(root_cheng, sizeof(root_cheng), paths.root);
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/debug_runtime_verify");
-    cheng_seed_join_path(src_panic, sizeof(src_panic), paths.root, "src/tests/ordinary_panic_fixture.cheng");
-    cheng_seed_join_path(src_bounds, sizeof(src_bounds), paths.root, "src/tests/ordinary_bounds_trace_fixture.cheng");
-    cheng_seed_join_path(src_signal, sizeof(src_signal), paths.root, "src/tests/ordinary_signal_trace_fixture.cheng");
-    cheng_seed_join_path(direct_debug_source, sizeof(direct_debug_source), paths.root, "src/core/runtime/debug_runtime_stub.cheng");
-    cheng_seed_join_path(linux_runtime_source,
-                 sizeof(linux_runtime_source),
-                 paths.root,
-                 "src/std/system_helpers_backend_nolibc_linux_aarch64.cheng");
-    cheng_seed_join_path(legacy_runtime_native_dir,
-                 sizeof(legacy_runtime_native_dir),
-                 paths.root,
-                 "runtime/native");
-    cheng_seed_join_path(panic_bin, sizeof(panic_bin), out_dir, "ordinary_panic_fixture");
-    cheng_seed_join_path(bounds_bin, sizeof(bounds_bin), out_dir, "ordinary_bounds_trace_fixture");
-    cheng_seed_join_path(signal_bin, sizeof(signal_bin), out_dir, "ordinary_signal_trace_fixture");
-    cheng_seed_join_path(linux_bin, sizeof(linux_bin), out_dir, "ordinary_panic_fixture_linux");
-    cheng_seed_join_path(panic_compile_log, sizeof(panic_compile_log), out_dir, "ordinary_panic_fixture.compile.log");
-    cheng_seed_join_path(linux_compile_log, sizeof(linux_compile_log), out_dir, "ordinary_panic_fixture_linux.compile.log");
-    cheng_seed_join_path(bounds_compile_log, sizeof(bounds_compile_log), out_dir, "ordinary_bounds_trace_fixture.compile.log");
-    cheng_seed_join_path(signal_compile_log, sizeof(signal_compile_log), out_dir, "ordinary_signal_trace_fixture.compile.log");
-    cheng_seed_join_path(panic_run_log, sizeof(panic_run_log), out_dir, "ordinary_panic_fixture.run.log");
-    cheng_seed_join_path(bounds_run_log, sizeof(bounds_run_log), out_dir, "ordinary_bounds_trace_fixture.run.log");
-    cheng_seed_join_path(signal_run_log, sizeof(signal_run_log), out_dir, "ordinary_signal_trace_fixture.run.log");
-    cheng_seed_join_path(panic_report, sizeof(panic_report), out_dir, "ordinary_panic_fixture.report.txt");
-    cheng_seed_join_path(panic_crash_report, sizeof(panic_crash_report), out_dir, "ordinary_panic_fixture.crash.txt");
-    cheng_seed_join_path(bounds_crash_report, sizeof(bounds_crash_report), out_dir, "ordinary_bounds_trace_fixture.crash.txt");
-    cheng_seed_join_path(signal_crash_report, sizeof(signal_crash_report), out_dir, "ordinary_signal_trace_fixture.crash.txt");
-    snprintf(panic_crash_report_log, sizeof(panic_crash_report_log), "%s.crash-report.log", panic_crash_report);
-    snprintf(bounds_crash_report_log, sizeof(bounds_crash_report_log), "%s.crash-report.log", bounds_crash_report);
-    snprintf(signal_crash_report_log, sizeof(signal_crash_report_log), "%s.crash-report.log", signal_crash_report);
-    cheng_seed_join_path(linux_report, sizeof(linux_report), out_dir, "ordinary_panic_fixture_linux.report.txt");
-    snprintf(panic_line_map, sizeof(panic_line_map), "%s.map", panic_bin);
-    snprintf(bounds_line_map, sizeof(bounds_line_map), "%s.map", bounds_bin);
-    snprintf(signal_line_map, sizeof(signal_line_map), "%s.map", signal_bin);
-    snprintf(panic_debug_provider_object,
-             sizeof(panic_debug_provider_object),
-             "%s.provider.runtime_debug_runtime.o",
-             panic_bin);
-    snprintf(linux_runtime_object,
-             sizeof(linux_runtime_object),
-             "%s.runtime.system_helpers_backend_nolibc_linux_aarch64.o",
-             linux_bin);
-    host_target = cheng_seed_host_target_triple();
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    if (!cheng_seed_expect_file_exists_nonempty("verify-debug-runtime direct source", direct_debug_source)) {
-        return 1;
-    }
-    direct_debug_source_text = cheng_seed_read_file(direct_debug_source);
-    if (direct_debug_source_text == NULL ||
-        !cheng_seed_expect_text_contains("verify-debug-runtime direct source",
-                                 direct_debug_source_text,
-                                 "@exportc(\"cheng_native_dump_backtrace_and_exit\")") ||
-        !cheng_seed_expect_text_contains("verify-debug-runtime direct source",
-                                 direct_debug_source_text,
-                                 "@exportc(\"cheng_force_segv\")") ||
-        !cheng_seed_expect_text_contains("verify-debug-runtime direct source",
-                                 direct_debug_source_text,
-                                 "@exportc(\"cheng_debug_profile_flush_from_argv0\")")) {
-        free(direct_debug_source_text);
-        return 1;
-    }
-    free(direct_debug_source_text);
-    if (host_target == NULL || host_target[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] verify-debug-runtime unsupported host target\n");
-        return 1;
-    }
-    if (cheng_seed_text_contains_substring(host_target, "-apple-darwin")) {
-        allowed_debug_runtime_undefined = allowed_debug_runtime_undefined_darwin;
-        allowed_debug_runtime_undefined_count =
-            sizeof(allowed_debug_runtime_undefined_darwin) / sizeof(allowed_debug_runtime_undefined_darwin[0]);
-    } else {
-        fprintf(stderr,
-                "[cheng_seed] verify-debug-runtime undefined whitelist unsupported host target: %s\n",
-                host_target);
-        return 1;
-    }
-    if (!cheng_seed_compile_fixture_with_backend_driver_emit_target(paths.backend_driver_out,
-                                                            root_cheng,
-                                                            src_panic,
-                                                            "exe",
-                                                            host_target,
-                                                            panic_bin,
-                                                            panic_compile_log,
-                                                            panic_report) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_cheng, src_bounds, bounds_bin, bounds_compile_log) ||
-        !cheng_seed_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_cheng, src_signal, signal_bin, signal_compile_log) ||
-        !cheng_seed_compile_fixture_with_backend_driver_emit_target(paths.backend_driver_out,
-                                                            root_cheng,
-                                                            src_panic,
-                                                            "exe",
-                                                            linux_target,
-                                                            linux_bin,
-                                                            linux_compile_log,
-                                                            linux_report) ||
-        !cheng_seed_expect_file_exists_nonempty("verify-debug-runtime panic report", panic_report) ||
-        !cheng_seed_expect_file_exists_nonempty("verify-debug-runtime panic provider object", panic_debug_provider_object) ||
-        !cheng_seed_expect_file_exists_nonempty("verify-debug-runtime linux report", linux_report) ||
-        !cheng_seed_expect_file_exists_nonempty("verify-debug-runtime linux runtime object", linux_runtime_object) ||
-        !cheng_seed_expect_file_exists_nonempty("verify-debug-runtime panic line-map", panic_line_map) ||
-        !cheng_seed_expect_file_exists_nonempty("verify-debug-runtime bounds line-map", bounds_line_map) ||
-        !cheng_seed_expect_file_exists_nonempty("verify-debug-runtime signal line-map", signal_line_map)) {
-        return 1;
-    }
-    panic_report_text = cheng_seed_read_file(panic_report);
-    if (panic_report_text == NULL ||
-        !cheng_seed_expect_text_contains("verify-debug-runtime panic report", panic_report_text, "provider_source_paths=") ||
-        !cheng_seed_expect_text_contains("verify-debug-runtime panic report", panic_report_text, direct_debug_source) ||
-        !cheng_seed_expect_text_not_contains("verify-debug-runtime panic report", panic_report_text, legacy_runtime_native_dir) ||
-        !cheng_seed_expect_text_contains("verify-debug-runtime panic report", panic_report_text, panic_debug_provider_object) ||
-        !cheng_seed_expect_object_export_contract("verify-debug-runtime provider exports",
-                                          panic_debug_provider_object,
-                                          allowed_debug_runtime_exports,
-                                          sizeof(allowed_debug_runtime_exports) / sizeof(allowed_debug_runtime_exports[0]),
-                                          debug_runtime_internal_export_prefix) ||
-        !cheng_seed_expect_object_undefined_whitelist("verify-debug-runtime provider undefined",
-                                              panic_debug_provider_object,
-                                              allowed_debug_runtime_undefined,
-                                              allowed_debug_runtime_undefined_count)) {
-        free(panic_report_text);
-        return 1;
-    }
-    free(panic_report_text);
-    linux_report_text = cheng_seed_read_file(linux_report);
-    if (linux_report_text == NULL ||
-        !cheng_seed_expect_text_has_line("verify-debug-runtime linux report", linux_report_text, "linux_nolibc_support_enabled=1") ||
-        !cheng_seed_expect_text_contains("verify-debug-runtime linux report", linux_report_text, linux_runtime_source) ||
-        !cheng_seed_expect_text_not_contains("verify-debug-runtime linux report", linux_report_text, legacy_runtime_native_dir) ||
-        !cheng_seed_expect_text_contains("verify-debug-runtime linux report", linux_report_text, linux_runtime_object) ||
-        !cheng_seed_expect_object_undefined_whitelist("verify-debug-runtime linux runtime undefined",
-                                              linux_runtime_object,
-                                              allowed_linux_runtime_undefined,
-                                              sizeof(allowed_linux_runtime_undefined) /
-                                                  sizeof(allowed_linux_runtime_undefined[0]))) {
-        free(linux_report_text);
-        return 1;
-    }
-    free(linux_report_text);
-    panic_argv[0] = panic_bin;
-    panic_argv[1] = NULL;
-    bounds_argv[0] = bounds_bin;
-    bounds_argv[1] = NULL;
-    signal_argv[0] = signal_bin;
-    signal_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(panic_argv, panic_run_log, &status) || cheng_seed_status_is_exit_code(status, 0) ||
-        !cheng_seed_crash_report_transform_raw(panic_run_log, panic_crash_report, panic_crash_report_log) ||
-        !cheng_seed_verify_runtime_fixture_output("verify-debug-runtime panic",
-                                          src_panic,
-                                          panic_run_log,
-                                          panic_crash_report,
-                                          "cheng panic fixture",
-                                          "reason=panic mode=backtrace",
-                                          false)) {
-        return 1;
-    }
-    if (!cheng_seed_run_binary_capture_output(bounds_argv, bounds_run_log, &status) || cheng_seed_status_is_exit_code(status, 0) ||
-        !cheng_seed_crash_report_transform_raw(bounds_run_log, bounds_crash_report, bounds_crash_report_log) ||
-        !cheng_seed_verify_runtime_fixture_output("verify-debug-runtime bounds",
-                                          src_bounds,
-                                          bounds_run_log,
-                                          bounds_crash_report,
-                                          "[cheng] bounds check failed: idx=1 len=1",
-                                          "reason=bounds mode=backtrace",
-                                          false)) {
-        return 1;
-    }
-    bounds_log_text = cheng_seed_read_file(bounds_run_log);
-    if (bounds_log_text == NULL ||
-        !cheng_seed_expect_text_contains("verify-debug-runtime bounds", bounds_log_text, "ordinary_bounds_trace_fixture")) {
-        free(bounds_log_text);
-        return 1;
-    }
-    free(bounds_log_text);
-    if (!cheng_seed_run_binary_capture_output(signal_argv, signal_run_log, &status) || cheng_seed_status_is_exit_code(status, 0) ||
-        !cheng_seed_crash_report_transform_raw(signal_run_log, signal_crash_report, signal_crash_report_log) ||
-        !cheng_seed_verify_runtime_fixture_output("verify-debug-runtime signal",
-                                          src_signal,
-                                          signal_run_log,
-                                          signal_crash_report,
-                                          "cheng_crash_raw_v1",
-                                          "reason=signal mode=signal",
-                                          true)) {
-        return 1;
-    }
-    puts("cheng debug runtime: ok");
-    return 0;
-}
-
-static size_t cheng_seed_collect_smoke_positionals(int argc,
-                                           char **argv,
-                                           const char **out,
-                                           size_t cap) {
-    size_t count = 0U;
-    int i;
-    for (i = 2; i < argc && count < cap; ++i) {
-        const char *arg = argv[i];
-        if (arg == NULL || arg[0] == '\0') {
-            continue;
-        }
-        if (strncmp(arg, "--", 2U) == 0) {
-            if ((strcmp(arg, "--compiler") == 0 ||
-                 strcmp(arg, "--tail-only") == 0 ||
-                 strcmp(arg, "--label") == 0) &&
-                (i + 1) < argc) {
-                i += 1;
-            }
-            continue;
-        }
-        out[count++] = arg;
-    }
-    return count;
-}
-
-static bool cheng_seed_run_fixture_smoke_direct(const char *suite_label,
-                                        const char *compile_label,
-                                        const char *compiler_bin,
-                                        const char *root,
-                                        const char *root_cheng,
-                                        const char *smoke_name,
-                                        const char *out_bin) {
-    char src[PATH_MAX];
-    char compile_log[PATH_MAX];
-    char run_log[PATH_MAX];
-    char line_map[PATH_MAX];
-    char *run_argv[2];
-    int status = 0;
-    cheng_seed_join_path(src, sizeof(src), root, "src/tests");
-    cheng_seed_join_path(src, sizeof(src), src, smoke_name);
-    strncat(src, ".cheng", sizeof(src) - strlen(src) - 1U);
-    snprintf(compile_log, sizeof(compile_log), "%s.compile.log", out_bin);
-    snprintf(run_log, sizeof(run_log), "%s.run.log", out_bin);
-    snprintf(line_map, sizeof(line_map), "%s.map", out_bin);
-    unlink(out_bin);
-    unlink(compile_log);
-    unlink(run_log);
-    unlink(line_map);
-    printf("[%s] compile %s\n", suite_label, compile_label);
-    if (!cheng_seed_compile_host_fixture_with_backend_driver(compiler_bin, root_cheng, src, out_bin, compile_log)) {
-        fprintf(stderr, "%s: compile failed: %s\n", suite_label, compile_label);
-        return false;
-    }
-    printf("[%s] run %s\n", suite_label, compile_label);
-    run_argv[0] = (char *)out_bin;
-    run_argv[1] = NULL;
-    if (!cheng_seed_run_binary_capture_output(run_argv, run_log, &status) ||
-        !cheng_seed_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "%s: run failed: %s\n", suite_label, compile_label);
-        return false;
-    }
-    return cheng_seed_dump_file_stdout(run_log);
-}
-
-static int cheng_seed_run_chain_node_process_smoke_with_env(const char *compiler_bin,
-                                                    const char *label,
-                                                    bool stage23_env) {
-    char saved_compiler[PATH_MAX];
-    char saved_label[256];
-    char saved_incremental[64];
-    char saved_multi_cache[64];
-    bool had_compiler = false;
-    bool had_label = false;
-    bool had_incremental = false;
-    bool had_multi_cache = false;
-    int rc;
-    cheng_seed_save_env_value("CHENG_CHAIN_NODE_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
-    cheng_seed_save_env_value("CHENG_CHAIN_NODE_LABEL", saved_label, sizeof(saved_label), &had_label);
-    setenv("CHENG_CHAIN_NODE_COMPILER", compiler_bin, 1);
-    setenv("CHENG_CHAIN_NODE_LABEL", label, 1);
-    if (stage23_env) {
-        cheng_seed_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
-        cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
-        setenv("BACKEND_INCREMENTAL", "0", 1);
-        setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
-    }
-    rc = cheng_seed_cmd_run_chain_node_process_smoke_impl(0, NULL);
-    if (stage23_env) {
-        cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-        cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-    }
-    cheng_seed_restore_env_value("CHENG_CHAIN_NODE_COMPILER", saved_compiler, had_compiler);
-    cheng_seed_restore_env_value("CHENG_CHAIN_NODE_LABEL", saved_label, had_label);
-    return rc;
-}
-
-static int cheng_seed_run_chain_node_three_node_smoke_with_env(const char *compiler_bin,
-                                                       const char *label,
-                                                       bool stage23_env) {
-    char saved_compiler[PATH_MAX];
-    char saved_label[256];
-    char saved_incremental[64];
-    char saved_multi_cache[64];
-    bool had_compiler = false;
-    bool had_label = false;
-    bool had_incremental = false;
-    bool had_multi_cache = false;
-    int rc;
-    cheng_seed_save_env_value("CHENG_CHAIN_NODE_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
-    cheng_seed_save_env_value("CHENG_CHAIN_NODE_LABEL", saved_label, sizeof(saved_label), &had_label);
-    setenv("CHENG_CHAIN_NODE_COMPILER", compiler_bin, 1);
-    setenv("CHENG_CHAIN_NODE_LABEL", label, 1);
-    if (stage23_env) {
-        cheng_seed_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
-        cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
-        setenv("BACKEND_INCREMENTAL", "0", 1);
-        setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
-    }
-    rc = cheng_seed_cmd_run_chain_node_three_node_smoke_impl(0, NULL);
-    if (stage23_env) {
-        cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-        cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-    }
-    cheng_seed_restore_env_value("CHENG_CHAIN_NODE_COMPILER", saved_compiler, had_compiler);
-    cheng_seed_restore_env_value("CHENG_CHAIN_NODE_LABEL", saved_label, had_label);
-    return rc;
-}
-
-static int cheng_seed_run_host_leaf_command(const char *leaf_id,
-                                    const char *compiler_bin,
-                                    const char *label) {
-    char compiler_flag[PATH_MAX + 16];
-    char label_flag[256];
-    char *argv_local[4];
-    snprintf(compiler_flag, sizeof(compiler_flag), "--compiler:%s", compiler_bin);
-    snprintf(label_flag, sizeof(label_flag), "--label:%s", label);
-    argv_local[0] = (char *)"cheng_seed";
-    argv_local[2] = compiler_flag;
-    argv_local[3] = label_flag;
-    if (strcmp(leaf_id, "wasm") == 0) {
-        argv_local[1] = (char *)"run-wasm-smokes";
-        return cheng_seed_cmd_run_wasm_smokes_impl(4, argv_local);
-    }
-    if (strcmp(leaf_id, "browser_host_wasm") == 0) {
-        argv_local[1] = (char *)"run-browser-host-wasm-smoke";
-        return cheng_seed_cmd_run_browser_host_wasm_smoke_impl(4, argv_local);
-    }
-    if (strcmp(leaf_id, "tcp_twoproc") == 0) {
-        argv_local[1] = (char *)"run-tcp-twoproc-smoke";
-        return cheng_seed_cmd_run_tcp_twoproc_smoke_impl(4, argv_local);
-    }
-    if (strcmp(leaf_id, "quic_twoproc") == 0) {
-        argv_local[1] = (char *)"run-quic-twoproc-smoke";
-        return cheng_seed_cmd_run_quic_twoproc_smoke_impl(4, argv_local);
-    }
-    if (strcmp(leaf_id, "udp_importc") == 0) {
-        argv_local[1] = (char *)"run-udp-importc-smoke";
-        return cheng_seed_cmd_run_udp_importc_smoke_impl(4, argv_local);
-    }
-    if (strcmp(leaf_id, "chain_node_cli") == 0) {
-        argv_local[1] = (char *)"run-chain-node-cli-smoke";
-        return cheng_seed_cmd_run_chain_node_cli_smoke_impl(4, argv_local);
-    }
-    if (strcmp(leaf_id, "tailnet_control") == 0) {
-        argv_local[1] = (char *)"run-tailnet-control-smoke";
-        return cheng_seed_cmd_run_tailnet_control_smoke_impl(4, argv_local);
-    }
-    if (strcmp(leaf_id, "fresh_node_selfhost") == 0) {
-        argv_local[1] = (char *)"run-fresh-node-selfhost-gate";
-        return cheng_seed_cmd_run_fresh_node_selfhost_gate_impl(4, argv_local);
-    }
-    if (strcmp(leaf_id, "migration") == 0) {
-        argv_local[1] = (char *)"run-migration-gate";
-        return cheng_seed_cmd_run_migration_gate_impl(4, argv_local);
-    }
-    return 1;
-}
-
-static int cheng_seed_run_stage23_leaf_command(const char *leaf_id,
-                                       const char *compiler_bin,
-                                       const char *label) {
-    char saved_incremental[64];
-    char saved_multi_cache[64];
-    bool had_incremental = false;
-    bool had_multi_cache = false;
-    int rc;
-    cheng_seed_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
-    cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
-    setenv("BACKEND_INCREMENTAL", "0", 1);
-    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
-    rc = cheng_seed_run_host_leaf_command(leaf_id, compiler_bin, label);
-    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-    return rc;
-}
-
-static int cheng_seed_run_stage23_browser_webrtc_script(const char *root,
-                                                const char *compiler_bin,
-                                                size_t positional_count,
-                                                const char **positionals) {
-    char saved_compiler[PATH_MAX];
-    char saved_incremental[64];
-    char saved_multi_cache[64];
-    bool had_compiler = false;
-    bool had_incremental = false;
-    bool had_multi_cache = false;
-    char **argv_local;
-    size_t i;
-    int rc;
-    (void)root;
-    cheng_seed_save_env_value("CHENG_SMOKE_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
-    cheng_seed_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
-    cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
-    setenv("CHENG_SMOKE_COMPILER", compiler_bin, 1);
-    setenv("BACKEND_INCREMENTAL", "0", 1);
-    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
-    argv_local = (char **)cheng_seed_xmalloc(sizeof(char *) * (positional_count + 3U));
-    argv_local[0] = (char *)"cheng_seed";
-    argv_local[1] = (char *)"run-browser-webrtc-smokes";
-    for (i = 0U; i < positional_count; ++i) {
-        argv_local[i + 2U] = (char *)(positionals[i] != NULL ? positionals[i] : "");
-    }
-    argv_local[positional_count + 2U] = NULL;
-    rc = cheng_seed_cmd_run_browser_webrtc_smokes_impl((int)(positional_count + 2U), argv_local);
-    free(argv_local);
-    cheng_seed_restore_env_value("CHENG_SMOKE_COMPILER", saved_compiler, had_compiler);
-    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-    return rc;
-}
-
-static void cheng_seed_stage23_progress(const char *label, const char *name) {
-    printf("[cheng_seed] stage23 %s %s\n", label ? label : "-", name ? name : "-");
-    fflush(stdout);
-}
-
-static int cheng_seed_cmd_run_host_smokes_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char saved_incremental[64];
-    char saved_multi_cache[64];
-    bool had_incremental = false;
-    bool had_multi_cache = false;
-    const char *compiler_bin;
-    const char *label;
-    const char *tail_only;
-    const char *positionals[256];
-    size_t positional_count;
-    size_t i;
-    bool run_tail = true;
-    bool stage23_env = false;
-    static const char *const DEFAULT_SMOKES[] = {
-        "ref10_ashr_smoke",
-        "fixed256_curve25519_smoke",
-        "fixedbytes32_seq_index_smoke",
-        "compiler_runtime_smoke",
-        "stage3_command_surface_smoke",
-        "stage3_system_link_exec_handoff_smoke",
-        "artifact_isolation_audit_smoke",
-        "backend_driver_command_surface_smoke",
-        "build_backend_driver_report_smoke",
-        "backend_driver_candidate_output_smoke",
-        "seed_abi_descriptor_contract_smoke",
-        "bootstrap_contract_v2_only_negative_smoke",
-        "perf_memory_gate_contract_smoke",
-        "runtime_link_input_surface_smoke",
-        "runtime_zero_c_surface_smoke",
-        "composite_default_init_smoke",
-        "composite_call_regression_smoke",
-        "large_dispatch_callee_smoke",
-        "composite_default_init_negative_smoke",
-        "if_enum_composite_return_smoke",
-        "out_param_writeback_smoke",
-        "nested_out_param_writeback_smoke",
-        "out_param_direct_call_writeback_smoke",
-        "var_out_param_writeback_probe",
-        "consensus_event_varparam_roundtrip_smoke",
-        "latest_snapshot_port_preserves_live_str_smoke",
-        "list_literal_nested_call_depth_smoke",
-        "libp2p_quic_twoproc_server_pre_quic_smoke",
-        "export_visibility_smoke",
-        "cheng_skill_consistency_smoke",
-        "dev_hotpatch_100ms_scope_contract_smoke",
-        "json_bracket_assign_smoke",
-        "strings_char_to_str_smoke",
-        "vpn_proxy_cli_smoke",
-        "vpn_proxy_config_smoke",
-        "vpn_proxy_json_smoke",
-        "vpn_proxy_listen_smoke",
-        "vpn_proxy_main_hysteria2_smoke",
-        "vpn_proxy_hysteria2_session_smoke",
-        "vpn_proxy_hysteria2_tcp_stream_smoke",
-        "vpn_proxy_udp_fragment_guard_smoke",
-        "vpn_proxy_tcp_control_bytes_smoke",
-        "vpn_proxy_end_to_end_smoke",
-        "vpn_proxy_udp_end_to_end_smoke",
-        "vpn_proxy_routing_smoke",
-        "vpn_proxy_socks_smoke",
-        "quic_stream_fin_smoke",
-        "qpack_min_smoke",
-        "http3_frame_smoke",
-        "hysteria2_protocol_smoke",
-        "os_dir_exists_smoke",
-        "os_file_exists_smoke",
-        "os_file_size_smoke",
-        "os_get_current_dir_smoke",
-        "os_rename_file_smoke",
-        "os_remove_dir_smoke",
-        "os_walk_dir_smoke",
-        "str_concat_lowering_smoke",
-        "strformat_fmt_lowering_smoke",
-        "strformat_fmt_smoke",
-        "strformat_fmt_negative_smoke",
-        "global_fixed_array_composite_smoke",
-        "multiline_header_indent_smoke",
-        "rwad_serial_state_machine_smoke",
-        "rwad_bft_state_machine_smoke",
-        "parser_path_smoke",
-        "call_hir_matrix_smoke",
-        "compiler_pipeline_smoke",
-        "lowering_plan_smoke",
-        "browser_content_codec_rule_schema_smoke",
-        "browser_content_codec_codegen_smoke",
-        "browser_host_probe_rule_schema_smoke",
-        "browser_host_probe_codegen_smoke",
-        "browser_host_probe_abi_rule_smoke",
-        "browser_host_probe_bridge_plan_report_smoke",
-        "browser_abi_rule_smoke",
-        "browser_bridge_object_plan_smoke",
-        "browser_bridge_artifact_write_smoke",
-        "browser_bridge_compiler_object_surface_smoke",
-        "browser_bridge_link_input_surface_smoke",
-        "compiler_equivalence_smoke",
-        "compiler_publish_smoke",
-        "bft_three_replica_smoke",
-        "primary_object_plan_smoke",
-        "object_native_link_plan_smoke",
-        "build_backend_driver_report_smoke",
-        "perf_memory_gate_contract_smoke",
-        "bytebuf_view_smoke",
-        "bytebuf_len_probe_smoke",
-        "bytes_layout_copy_smoke",
-        "bytes_view_orc_registry_smoke",
-        "bytes_param_helper_smoke",
-        "bytes_buffer_handle_copy_smoke",
-        "bytes_buffer_handle_snapshot_smoke",
-        "bytes_parent_copy_orc_smoke",
-        "bytes_overwrite_orc_smoke",
-        "ffi_handle_generation_reuse_smoke",
-        "wrapper_result_forward_varparam_smoke",
-        "wrapper_rebuild_result_forward_varparam_smoke",
-        "ffi_handle_smoke",
-        "program_selfhost_smoke",
-        "csg_smoke",
-        "consensus_smoke",
-        "bft_finalize_summary_smoke",
-        "bft_state_machine_smoke",
-        "oracle_plane_smoke",
-        "oracle_bft_state_machine_smoke",
-        "oracle_bft_three_replica_smoke",
-        "oracle_runtime_host_smoke",
-        "overlay_contracts_smoke",
-        "pubsub_smoke",
-        "dag_mempool_smoke",
-        "plumtree_smoke",
-        "erasure_swarm_smoke",
-        "pin_plane_smoke",
-        "pin_scheduler_smoke",
-        "pin_runtime_host_smoke",
-        "pin_runtime_quic_smoke",
-        "content_codec_smoke",
-        "content_runtime_smoke",
-        "bio_reed_solomon_smoke",
-        "bio_same_person_smoke",
-        "bio_did_mobile_biometric_smoke",
-        "native_client_hello_wire_smoke",
-        "msquic_bindtext_expr_smoke",
-        "protocol_validation_smoke",
-        "platform_release_validation_smoke",
-        "congestion_validation_smoke",
-        "msquic_platform_smoke",
-        "quic_tls_transport_ecdsa_smoke",
-        "quic_transport_loopback_smoke",
-        "quic_transport_sequential_accept_smoke",
-        "libp2p_quic_tls_smoke",
-        "quic_feature_matrix_smoke",
-        "quic_multistream_smoke",
-        "quic_multistream_smoke",
-        "quic_close_order_smoke",
-        "bft_daemon_quic_close_order_smoke",
-        "libp2p_tailnet_policy_smoke",
-        "libp2p_tailnet_visibility_smoke",
-        "libp2p_tailnet_transport_smoke",
-        "libp2p_tailnet_derp_smoke",
-        "libp2p_resource_smoke",
-        "perf_memory_contract_smoke",
-        "libp2p_scheduler_smoke",
-        "libp2p_quic_tls_smoke",
-        "quic_feature_matrix_smoke",
-        "quic_multistream_smoke",
-        "quic_close_order_smoke",
-        "bft_daemon_quic_close_order_smoke",
-        "tailnet_control_core_smoke",
-        "tailnet_train_island_smoke",
-        "webrtc_signal_codec_smoke",
-        "webrtc_signal_session_smoke",
-        "webrtc_turn_fallback_smoke",
-        "libp2p_webrtc_sync_smoke",
-        "content_quic_smoke",
-        "webrtc_datachannel_content_smoke",
-        "content_stub_smoke",
-        "libp2p_protocols_smoke",
-        "location_proof_smoke",
-        "chain_codec_binary_smoke",
-        "anti_entropy_smoke",
-        "anti_entropy_signature_fields_smoke",
-        "lsmr_types_smoke",
-        "lsmr_locality_storage_smoke",
-        "lsmr_bagua_prefix_tree_smoke",
-        "udp_importc_smoke",
-        "mobile_bridge_smoke",
-        "mobile_sdk_smoke",
-        "did_identity_smoke",
-        "unimaker_edge_agent_smoke",
-        "unimaker_edge_agent_sync_smoke",
-        "unimaker_edge_agent_recovery_smoke"
-    };
-    if (cheng_seed_backend_driver_handoff_enabled()) {
-        return cheng_seed_require_backend_driver_cli_passthrough("run-host-smokes", argc, argv);
-    }
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (paths.root[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] run-host-smokes root detect failed\n");
-        return 1;
-    }
-    if (!cheng_seed_bootstrap_artifacts_fresh(&paths) &&
-        cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        return 1;
-    }
-    cheng_seed_copy_text(root_cheng, sizeof(root_cheng), paths.root);
-    compiler_bin = cheng_seed_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_SMOKE_COMPILER",
-                                                NULL,
-                                                paths.stage3);
-    label = cheng_seed_leaf_resolve_label(argc, argv, "CHENG_SMOKE_LABEL", "host");
-    if (!cheng_seed_leaf_expect_compiler("run-host-smokes", compiler_bin)) {
-        return 1;
-    }
-    if (strcmp(compiler_bin, paths.stage2) == 0 ||
-        strcmp(compiler_bin, paths.stage3) == 0) {
-        stage23_env = true;
-    }
-    tail_only = cheng_seed_flag_value(argc, argv, "--tail-only");
-    positional_count = cheng_seed_collect_smoke_positionals(argc,
-                                                    argv,
-                                                    positionals,
-                                                    sizeof(positionals) / sizeof(positionals[0]));
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/hostrun");
-    if (label != NULL && label[0] != '\0' && strcmp(label, "host") != 0) {
-        cheng_seed_join_path(out_dir, sizeof(out_dir), out_dir, label);
-    }
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        return 1;
-    }
-    if (tail_only != NULL && tail_only[0] != '\0') {
-        if (strcmp(tail_only, "chain_node_process") == 0) {
-            return cheng_seed_run_chain_node_process_smoke_with_env(compiler_bin, label, stage23_env);
-        }
-        if (strcmp(tail_only, "chain_node_three_node") == 0) {
-            return cheng_seed_run_chain_node_three_node_smoke_with_env(compiler_bin, label, stage23_env);
-        }
-        if (strcmp(tail_only, "chain_node_resilience") == 0) {
-            fprintf(stderr, "[cheng_seed] run-host-smokes direct path does not support --tail-only: %s\n",
-                    tail_only);
-            return 1;
-        }
-        if (stage23_env) {
-            return cheng_seed_run_stage23_leaf_command(tail_only, compiler_bin, label);
-        }
-        return cheng_seed_run_host_leaf_command(tail_only, compiler_bin, label);
-    }
-    if (stage23_env) {
-        cheng_seed_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
-        cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
-        setenv("BACKEND_INCREMENTAL", "0", 1);
-        setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
-    }
-    if (positional_count > 0U) {
-        run_tail = false;
-        for (i = 0U; i < positional_count; ++i) {
-            cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, positionals[i]);
-            if (!cheng_seed_run_fixture_smoke_direct("cheng host smokes",
-                                             positionals[i],
-                                             compiler_bin,
-                                             paths.root,
-                                             root_cheng,
-                                             positionals[i],
-                                             out_bin)) {
-                if (stage23_env) {
-                    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                }
-                return 1;
-            }
-            if (strcmp(positionals[i], "chain_node_libp2p_smoke") == 0) {
-                if ((stage23_env
-                         ? cheng_seed_run_stage23_leaf_command("tcp_twoproc", compiler_bin, label)
-                         : cheng_seed_run_host_leaf_command("tcp_twoproc", compiler_bin, label)) != 0) {
-                    if (stage23_env) {
-                        cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                        cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    }
-                    return 1;
-                }
-            }
-            if (strcmp(positionals[i], "libp2p_quic_tls_smoke") == 0) {
-                if ((stage23_env
-                         ? cheng_seed_run_stage23_leaf_command("quic_twoproc", compiler_bin, label)
-                         : cheng_seed_run_host_leaf_command("quic_twoproc", compiler_bin, label)) != 0) {
-                    if (stage23_env) {
-                        cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                        cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    }
-                    return 1;
-                }
-            }
-        }
-    } else {
-        for (i = 0U; i < sizeof(DEFAULT_SMOKES) / sizeof(DEFAULT_SMOKES[0]); ++i) {
-            cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, DEFAULT_SMOKES[i]);
-            if (!cheng_seed_run_fixture_smoke_direct("cheng host smokes",
-                                             DEFAULT_SMOKES[i],
-                                             compiler_bin,
-                                             paths.root,
-                                             root_cheng,
-                                             DEFAULT_SMOKES[i],
-                                             out_bin)) {
-                if (stage23_env) {
-                    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                }
-                return 1;
-            }
-            if (strcmp(DEFAULT_SMOKES[i], "libp2p_quic_tls_smoke") == 0) {
-                if ((stage23_env
-                         ? cheng_seed_run_stage23_leaf_command("quic_twoproc", compiler_bin, label)
-                         : cheng_seed_run_host_leaf_command("quic_twoproc", compiler_bin, label)) != 0) {
-                    if (stage23_env) {
-                        cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                        cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    }
-                    return 1;
-                }
-            }
-        }
-    }
-    if (run_tail) {
-        if ((stage23_env
-                 ? cheng_seed_run_stage23_leaf_command("tailnet_control", compiler_bin, label)
-                 : cheng_seed_run_host_leaf_command("tailnet_control", compiler_bin, label)) != 0 ||
-            (stage23_env
-                 ? cheng_seed_run_stage23_leaf_command("fresh_node_selfhost", compiler_bin, label)
-                 : cheng_seed_run_host_leaf_command("fresh_node_selfhost", compiler_bin, label)) != 0 ||
-            (stage23_env
-                 ? cheng_seed_run_stage23_leaf_command("migration", compiler_bin, label)
-                 : cheng_seed_run_host_leaf_command("migration", compiler_bin, label)) != 0) {
-            if (stage23_env) {
-                cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            }
-            return 1;
-        }
-    }
-    if (stage23_env) {
-        cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-        cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-    }
-    puts("cheng host smokes: ok");
-    return 0;
-}
-
-static int cheng_seed_cmd_run_production_regression_impl(int argc, char **argv) {
-    char *surface_argv[16];
-    const char *argv0 = "cheng_seed";
-    int rc;
-    (void)argc;
-    if (argv != NULL && argv[0] != NULL && argv[0][0] != '\0') {
-        argv0 = argv[0];
-    }
-    rc = cheng_seed_cmd_build_backend_driver(argc, argv);
-    if (rc != 0) {
-        return rc;
-    }
-    surface_argv[0] = (char *)argv0;
-    surface_argv[1] = (char *)"run-host-smokes";
-    surface_argv[2] = (char *)"stage3_command_surface_smoke";
-    surface_argv[3] = (char *)"backend_driver_command_surface_smoke";
-    surface_argv[4] = (char *)"build_backend_driver_report_smoke";
-    surface_argv[5] = (char *)"perf_memory_gate_contract_smoke";
-    surface_argv[6] = (char *)"perf_memory_contract_smoke";
-    surface_argv[7] = (char *)"cheng_skill_consistency_smoke";
-    surface_argv[8] = (char *)"dev_hotpatch_100ms_scope_contract_smoke";
-    surface_argv[9] = (char *)"explicit_default_init_positive_smoke";
-    surface_argv[10] = (char *)"explicit_default_init_negative_smoke";
-    surface_argv[11] = (char *)"explicit_default_init_gate_smoke";
-    surface_argv[12] = (char *)"composite_zero_helper_gate_smoke";
-    surface_argv[13] = (char *)"latest_snapshot_port_preserves_live_str_smoke";
-    surface_argv[14] = (char *)"list_literal_nested_call_depth_smoke";
-    surface_argv[15] = (char *)"libp2p_quic_twoproc_server_pre_quic_smoke";
-    rc = cheng_seed_run_backend_driver_cli_child(16,
-                                         surface_argv,
-                                         "run-production-regression host smokes",
-                                         "artifacts/backend_driver/run_production_regression.host_smokes.log");
-    if (rc != 0) {
-        return rc;
-    }
-    surface_argv[0] = (char *)argv0;
-    surface_argv[1] = (char *)"verify-r2c-react-surface";
-    rc = cheng_seed_run_backend_driver_cli_child(2,
-                                         surface_argv,
-                                         "run-production-regression r2c-react surface",
-                                         "artifacts/backend_driver/run_production_regression.r2c_react_surface.log");
-    if (rc != 0) {
-        return rc;
-    }
-    surface_argv[0] = (char *)argv0;
-    surface_argv[1] = (char *)"run-cross-target-smokes";
-    rc = cheng_seed_run_backend_driver_cli_child(2,
-                                         surface_argv,
-                                         "run-production-regression cross target smokes",
-                                         "artifacts/backend_driver/run_production_regression.cross_target_smokes.log");
-    if (rc != 0) {
-        return rc;
-    }
-    rc = cheng_seed_cmd_run_stage23_libp2p_smokes_impl(argc, argv);
-    if (rc != 0) {
-        return rc;
-    }
-    printf("[cheng_seed] run-production-regression ok\n");
-    return 0;
-}
-
-static int cheng_seed_cmd_verify_backend_driver_command_surface_impl(int argc, char **argv) {
-    return cheng_seed_require_backend_driver_cli_passthrough("verify-backend-driver-command-surface", argc, argv);
-}
-
-static int cheng_seed_cmd_verify_mobile_shell_build_probe_impl(int argc, char **argv) {
-    return cheng_seed_require_backend_driver_cli_passthrough("verify-mobile-shell-build-probe", argc, argv);
-}
-
-static int cheng_seed_cmd_verify_r2c_react_surface_impl(int argc, char **argv) {
-    return cheng_seed_require_backend_driver_cli_passthrough("verify-r2c-react-surface", argc, argv);
-}
-
-static int cheng_seed_cmd_run_stage23_libp2p_smokes_impl(int argc, char **argv) {
-    ChengSeedBootstrapPaths paths;
-    char root_cheng[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char out_bin[PATH_MAX];
-    char compile_label[PATH_MAX];
-    const char *tail_only;
-    const char *positionals[256];
-    size_t positional_count;
-    size_t i;
-    char saved_incremental[64];
-    char saved_multi_cache[64];
-    bool had_incremental = false;
-    bool had_multi_cache = false;
-    bool run_tail = true;
-    static const char *DEFAULT_SMOKES[] = {
-        "fixed256_curve25519_smoke",
-        "compiler_runtime_smoke",
-        "compiler_pipeline_smoke",
-        "lowering_plan_smoke",
-        "lowering_matrix_smoke",
-        "compiler_equivalence_smoke",
-        "compiler_publish_smoke",
-        "bft_three_replica_smoke",
-        "primary_object_plan_smoke",
-        "object_native_link_plan_smoke",
-        "program_selfhost_smoke",
-        "libp2p_core_smoke",
-        "libp2p_multiaddr_parse_boundary_smoke",
-        "libp2p_host_smoke",
-        "libp2p_tailnet_policy_smoke",
-        "libp2p_tailnet_visibility_smoke",
-        "libp2p_tailnet_transport_smoke",
-        "libp2p_tailnet_derp_smoke",
-        "libp2p_resource_smoke",
-        "libp2p_scheduler_smoke",
-        "libp2p_quic_tls_smoke",
-        "quic_feature_matrix_smoke",
-        "quic_close_order_smoke",
-        "bft_daemon_quic_close_order_smoke",
-        "tailnet_control_core_smoke",
-        "tailnet_train_island_smoke",
-        "webrtc_signal_codec_smoke",
-        "webrtc_signal_session_smoke",
-        "webrtc_turn_fallback_smoke",
-        "libp2p_webrtc_sync_smoke",
-        "libp2p_tcp_smoke",
-        "libp2p_overlay_smoke",
-        "libp2p_protocols_smoke",
-        "chain_codec_binary_smoke",
-        "location_proof_smoke",
-        "anti_entropy_smoke",
-        "anti_entropy_signature_fields_smoke",
-        "lsmr_types_smoke",
-        "lsmr_locality_storage_smoke",
-        "lsmr_bagua_prefix_tree_smoke",
-        "overlay_contracts_smoke",
-        "pubsub_smoke",
-        "dag_mempool_smoke",
-        "plumtree_smoke",
-        "erasure_swarm_smoke",
-        "pin_plane_smoke",
-        "pin_scheduler_smoke",
-        "content_codec_smoke",
-        "content_runtime_smoke",
-        "content_stub_smoke",
-        "mobile_bridge_smoke",
-        "mobile_sdk_smoke",
-        "did_identity_smoke"
-    };
-    cheng_seed_bootstrap_paths_init(&paths);
-    if (paths.root[0] == '\0') {
-        fprintf(stderr, "[cheng_seed] run-stage23-libp2p-smokes root detect failed\n");
-        return 1;
-    }
-    if (!cheng_seed_bootstrap_artifacts_fresh(&paths) && cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        return 1;
-    }
-    cheng_seed_copy_text(root_cheng, sizeof(root_cheng), paths.root);
-    if (access(paths.stage2, X_OK) != 0 || access(paths.stage3, X_OK) != 0) {
-        fprintf(stderr, "[cheng_seed] run-stage23-libp2p-smokes missing bootstrap compiler\n");
-        return 1;
-    }
-    tail_only = cheng_seed_flag_value(argc, argv, "--tail-only");
-    positional_count = cheng_seed_collect_smoke_positionals(argc, argv, positionals, sizeof(positionals) / sizeof(positionals[0]));
-    if (positional_count > 0U) {
-        run_tail = false;
-    }
-    cheng_seed_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
-    cheng_seed_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
-    setenv("BACKEND_INCREMENTAL", "0", 1);
-    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
-    if (tail_only != NULL && tail_only[0] != '\0') {
-        if (strcmp(tail_only, "browser_webrtc") == 0) {
-            int rc = cheng_seed_run_stage23_browser_webrtc_script(paths.root, paths.stage3, positional_count, positionals);
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return rc;
-        }
-        fprintf(stderr, "[cheng_seed] run-stage23-libp2p-smokes unknown --tail-only: %s\n", tail_only);
-        cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-        cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-        return 1;
-    }
-    cheng_seed_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/stage23_libp2p");
-    if (!cheng_seed_mkdir_p(out_dir)) {
-        cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-        cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-        return 1;
-    }
-    if (positional_count > 0U) {
-        for (i = 0U; i < positional_count; ++i) {
-            cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, positionals[i]);
-            strncat(out_bin, ".stage2", sizeof(out_bin) - strlen(out_bin) - 1U);
-            snprintf(compile_label, sizeof(compile_label), "stage2 %s", positionals[i]);
-            cheng_seed_stage23_progress("stage2", positionals[i]);
-            if (!cheng_seed_run_fixture_smoke_direct("cheng stage2/stage3 libp2p",
-                                             compile_label,
-                                             paths.stage2,
-                                             paths.root,
-                                             root_cheng,
-                                             positionals[i],
-                                             out_bin)) {
-                cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                return 1;
-            }
-            if (strcmp(positionals[i], "libp2p_tcp_smoke") == 0) {
-                cheng_seed_stage23_progress("stage2", "tcp_twoproc");
-                if (cheng_seed_run_stage23_leaf_command("tcp_twoproc", paths.stage2, "stage2") != 0) {
-                    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    return 1;
-                }
-            }
-            if (strcmp(positionals[i], "libp2p_quic_tls_smoke") == 0) {
-                cheng_seed_stage23_progress("stage2", "quic_twoproc");
-                if (cheng_seed_run_stage23_leaf_command("quic_twoproc", paths.stage2, "stage2") != 0) {
-                    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    return 1;
-                }
-            }
-            cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, positionals[i]);
-            strncat(out_bin, ".stage3", sizeof(out_bin) - strlen(out_bin) - 1U);
-            snprintf(compile_label, sizeof(compile_label), "stage3 %s", positionals[i]);
-            cheng_seed_stage23_progress("stage3", positionals[i]);
-            if (!cheng_seed_run_fixture_smoke_direct("cheng stage2/stage3 libp2p",
-                                             compile_label,
-                                             paths.stage3,
-                                             paths.root,
-                                             root_cheng,
-                                             positionals[i],
-                                             out_bin)) {
-                cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                return 1;
-            }
-            if (strcmp(positionals[i], "libp2p_tcp_smoke") == 0) {
-                cheng_seed_stage23_progress("stage3", "tcp_twoproc");
-                if (cheng_seed_run_stage23_leaf_command("tcp_twoproc", paths.stage3, "stage3") != 0) {
-                    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    return 1;
-                }
-            }
-            if (strcmp(positionals[i], "libp2p_quic_tls_smoke") == 0) {
-                cheng_seed_stage23_progress("stage3", "quic_twoproc");
-                if (cheng_seed_run_stage23_leaf_command("quic_twoproc", paths.stage3, "stage3") != 0) {
-                    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    return 1;
-                }
-            }
-        }
-    } else {
-        for (i = 0U; i < sizeof(DEFAULT_SMOKES) / sizeof(DEFAULT_SMOKES[0]); ++i) {
-            cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, DEFAULT_SMOKES[i]);
-            strncat(out_bin, ".stage2", sizeof(out_bin) - strlen(out_bin) - 1U);
-            snprintf(compile_label, sizeof(compile_label), "stage2 %s", DEFAULT_SMOKES[i]);
-            cheng_seed_stage23_progress("stage2", DEFAULT_SMOKES[i]);
-            if (!cheng_seed_run_fixture_smoke_direct("cheng stage2/stage3 libp2p",
-                                             compile_label,
-                                             paths.stage2,
-                                             paths.root,
-                                             root_cheng,
-                                             DEFAULT_SMOKES[i],
-                                             out_bin)) {
-                cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                return 1;
-            }
-            if (strcmp(DEFAULT_SMOKES[i], "libp2p_tcp_smoke") == 0) {
-                cheng_seed_stage23_progress("stage2", "tcp_twoproc");
-                if (cheng_seed_run_stage23_leaf_command("tcp_twoproc", paths.stage2, "stage2") != 0) {
-                    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    return 1;
-                }
-            }
-            if (strcmp(DEFAULT_SMOKES[i], "libp2p_quic_tls_smoke") == 0) {
-                cheng_seed_stage23_progress("stage2", "quic_twoproc");
-                if (cheng_seed_run_stage23_leaf_command("quic_twoproc", paths.stage2, "stage2") != 0) {
-                    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    return 1;
-                }
-            }
-            cheng_seed_join_path(out_bin, sizeof(out_bin), out_dir, DEFAULT_SMOKES[i]);
-            strncat(out_bin, ".stage3", sizeof(out_bin) - strlen(out_bin) - 1U);
-            snprintf(compile_label, sizeof(compile_label), "stage3 %s", DEFAULT_SMOKES[i]);
-            cheng_seed_stage23_progress("stage3", DEFAULT_SMOKES[i]);
-            if (!cheng_seed_run_fixture_smoke_direct("cheng stage2/stage3 libp2p",
-                                             compile_label,
-                                             paths.stage3,
-                                             paths.root,
-                                             root_cheng,
-                                             DEFAULT_SMOKES[i],
-                                             out_bin)) {
-                cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                return 1;
-            }
-            if (strcmp(DEFAULT_SMOKES[i], "libp2p_tcp_smoke") == 0) {
-                cheng_seed_stage23_progress("stage3", "tcp_twoproc");
-                if (cheng_seed_run_stage23_leaf_command("tcp_twoproc", paths.stage3, "stage3") != 0) {
-                    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    return 1;
-                }
-            }
-            if (strcmp(DEFAULT_SMOKES[i], "libp2p_quic_tls_smoke") == 0) {
-                cheng_seed_stage23_progress("stage3", "quic_twoproc");
-                if (cheng_seed_run_stage23_leaf_command("quic_twoproc", paths.stage3, "stage3") != 0) {
-                    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-                    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-                    return 1;
-                }
-            }
-        }
-    }
-    if (run_tail) {
-        cheng_seed_stage23_progress("tail", "tailnet_control stage2");
-        if (cheng_seed_run_stage23_leaf_command("tailnet_control", paths.stage2, "stage2") != 0) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-        cheng_seed_stage23_progress("tail", "tailnet_control stage3");
-        if (cheng_seed_run_stage23_leaf_command("tailnet_control", paths.stage3, "stage3") != 0) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-        cheng_seed_stage23_progress("tail", "fresh_node_selfhost stage2");
-        if (cheng_seed_run_stage23_leaf_command("fresh_node_selfhost", paths.stage2, "stage2") != 0) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-        cheng_seed_stage23_progress("tail", "fresh_node_selfhost stage3");
-        if (cheng_seed_run_stage23_leaf_command("fresh_node_selfhost", paths.stage3, "stage3") != 0) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-        cheng_seed_stage23_progress("tail", "migration stage2");
-        if (cheng_seed_run_stage23_leaf_command("migration", paths.stage2, "stage2") != 0) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-        cheng_seed_stage23_progress("tail", "migration stage3");
-        if (cheng_seed_run_stage23_leaf_command("migration", paths.stage3, "stage3") != 0) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-        cheng_seed_stage23_progress("tail", "browser_webrtc stage3");
-        if (cheng_seed_run_stage23_browser_webrtc_script(paths.root, paths.stage3, 0U, NULL) != 0) {
-            cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-            cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-            return 1;
-        }
-    }
-    cheng_seed_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
-    cheng_seed_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
-    puts("cheng stage2/stage3 libp2p: ok");
-    return 0;
-}
-
-static bool cheng_seed_write_optional_report_text(const char *report_path,
-                                          const char *text) {
-    if (!report_path || *report_path == '\0') {
-        return true;
-    }
-    return cheng_seed_ensure_parent_dir(report_path) && cheng_seed_write_text_file(report_path, text);
 }
 
 static char *CHENG_UNUSED cheng_seed_report_with_header(const char *header,
@@ -73736,32 +64464,6 @@ static char *cheng_seed_debug_object_report(const char *path) {
     return NULL;
 }
 
-static char *cheng_seed_debug_asm_report(const ChengSeedSystemLinkPlanStub *plan,
-                                 const ChengSeedPrimaryObjectPlanStub *primary) {
-    char asm_path[PATH_MAX];
-    char *asm_text;
-    size_t cap;
-    size_t len;
-    char *out;
-    snprintf(asm_path, sizeof(asm_path), "%s.s", primary->output_path);
-    asm_text = cheng_seed_read_file(asm_path);
-    if (!asm_text) {
-        return NULL;
-    }
-    len = strlen(asm_text);
-    cap = len + PATH_MAX * 2U + 256U;
-    out = (char *)cheng_seed_xmalloc(cap);
-    snprintf(out,
-             cap,
-             "cheng_asm_report_v1\npath=%s\ntarget=%s\nemit=%s\nasm_text_begin\n%s",
-             asm_path,
-             plan->target_triple,
-             plan->emit_kind,
-             asm_text);
-    free(asm_text);
-    return out;
-}
-
 typedef struct ChengSeedSeedDebugExecContext {
     ChengSeedBootstrapContract *contract;
     ChengSeedSystemLinkPlanStub *plan;
@@ -73772,995 +64474,11 @@ typedef struct ChengSeedSeedDebugExecContext {
     ChengSeedNativeLinkPlanStub *native_link;
 } ChengSeedSeedDebugExecContext;
 
-static void cheng_seed_debug_exec_context_init(ChengSeedSeedDebugExecContext *ctx) {
-    memset(ctx, 0, sizeof(*ctx));
-}
 
-static void cheng_seed_debug_exec_context_release(ChengSeedSeedDebugExecContext *ctx) {
-    if (ctx == NULL) {
-        return;
-    }
-    free(ctx->lowering);
-    if (ctx->world != NULL) {
-        cheng_seed_compiler_world_artifacts_free(ctx->world);
-        free(ctx->world);
-    }
-    if (ctx->contract != NULL) {
-        cheng_seed_contract_free(ctx->contract);
-        free(ctx->contract);
-    }
-    free(ctx->native_link);
-    free(ctx->object_plan);
-    cheng_seed_primary_object_plan_stub_free(ctx->primary);
-    free(ctx->plan);
-    memset(ctx, 0, sizeof(*ctx));
-}
 
-static bool cheng_seed_debug_exec_context_build(ChengSeedSeedDebugExecContext *ctx,
-                                             int argc,
-                                             char **argv,
-                                             bool require_output,
-                                             bool enable_baseline_surface_check,
-                                             bool include_native_link) {
-    (void)include_native_link;
-    cheng_seed_debug_exec_context_init(ctx);
-    ctx->contract = (ChengSeedBootstrapContract *)cheng_seed_xmalloc(sizeof(*ctx->contract));
-    ctx->plan = (ChengSeedSystemLinkPlanStub *)cheng_seed_xmalloc(sizeof(*ctx->plan));
-    ctx->world = (ChengSeedCompilerWorldArtifacts *)cheng_seed_xmalloc(sizeof(*ctx->world));
-    ctx->primary = (ChengSeedPrimaryObjectPlanStub *)cheng_seed_xmalloc(sizeof(*ctx->primary));
-    ctx->object_plan = (ChengSeedObjectPlanStub *)cheng_seed_xmalloc(sizeof(*ctx->object_plan));
-    ctx->native_link = (ChengSeedNativeLinkPlanStub *)cheng_seed_xmalloc(sizeof(*ctx->native_link));
-    memset(ctx->contract, 0, sizeof(*ctx->contract));
-    memset(ctx->plan, 0, sizeof(*ctx->plan));
-    memset(ctx->world, 0, sizeof(*ctx->world));
-    memset(ctx->primary, 0, sizeof(*ctx->primary));
-    memset(ctx->object_plan, 0, sizeof(*ctx->object_plan));
-    memset(ctx->native_link, 0, sizeof(*ctx->native_link));
-    if (!cheng_seed_load_runtime_contract(argc, argv, ctx->contract)) {
-        cheng_seed_debug_exec_context_release(ctx);
-        return false;
-    }
-    if (!cheng_seed_validate_contract(ctx->contract)) {
-        cheng_seed_debug_exec_context_release(ctx);
-        return false;
-    }
-    if (!cheng_seed_build_exec_context(ctx->contract,
-                               argc,
-                               argv,
-                               require_output,
-                               enable_baseline_surface_check,
-                               ctx->plan,
-                               ctx->world,
-                               &ctx->lowering,
-                               ctx->primary,
-                               ctx->object_plan,
-                               ctx->native_link)) {
-        cheng_seed_debug_exec_context_release(ctx);
-        return false;
-    }
-    return true;
-}
 
-static int cheng_seed_cmd_print_asm(int argc, char **argv) {
-    ChengSeedSeedDebugExecContext ctx;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    char *report;
-    if (!cheng_seed_debug_exec_context_build(&ctx, argc, argv, false, false, false)) {
-        return 1;
-    }
-    if (ctx.primary->missing_reason_count > 0U ||
-        !cheng_seed_materialize_primary_asm_only(ctx.plan, ctx.lowering, ctx.primary)) {
-        cheng_seed_debug_exec_context_release(&ctx);
-        return 1;
-    }
-    report = cheng_seed_debug_asm_report(ctx.plan, ctx.primary);
-    if (!report) {
-        cheng_seed_debug_exec_context_release(&ctx);
-        return 1;
-    }
-    if (!cheng_seed_write_optional_report_text(report_path, report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        free(report);
-        cheng_seed_debug_exec_context_release(&ctx);
-        return 1;
-    }
-    fputs(report, stdout);
-    free(report);
-    cheng_seed_debug_exec_context_release(&ctx);
-    return 0;
-}
 
-static int cheng_seed_cmd_emit_csg(int argc, char **argv) {
-    ChengSeedBootstrapContract contract;
-    ChengSeedSystemLinkPlanStub plan;
-    ChengSeedCompilerWorldArtifacts world;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    if (!cheng_seed_load_runtime_contract(argc, argv, &contract)) {
-        return 1;
-    }
-    if (!cheng_seed_validate_contract(&contract)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_system_link_plan_stub(&contract, argc, argv, false, &plan)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_compiler_world_artifacts(&plan,
-                                           cheng_seed_flag_value(argc, argv, "--channel") ? cheng_seed_flag_value(argc, argv, "--channel") : "",
-                                           "",
-                                           "",
-                                           "",
-                                           &world)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_write_optional_report_text(report_path, world.csg_report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        cheng_seed_compiler_world_artifacts_free(&world);
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    fputs(world.csg_report, stdout);
-    cheng_seed_compiler_world_artifacts_free(&world);
-    cheng_seed_contract_free(&contract);
-    return 0;
-}
 
-static int cheng_seed_cmd_migrate_csg(int argc, char **argv) {
-    ChengSeedBootstrapContract contract;
-    ChengSeedCompilerLegacyMigration migration;
-    ChengSeedCompilerWorldArtifacts migration_world;
-    ChengSeedSystemLinkPlanStub migration_plan;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    const char *prefix = cheng_seed_flag_value(argc, argv, "--out");
-    const char *current_source_path = cheng_seed_flag_value(argc, argv, "--in");
-    const char *package_root_flag = cheng_seed_flag_value(argc, argv, "--root");
-    char package_root[PATH_MAX];
-    char workspace_root[PATH_MAX];
-    char package_id[PATH_MAX];
-    char entry_module_override[PATH_MAX];
-    ChengSeedCompilerWorldArtifacts baseline_world;
-    char *migration_report = NULL;
-    char *migration_receipt_report = NULL;
-    int rc = 1;
-    memset(&migration, 0, sizeof(migration));
-    memset(&migration_world, 0, sizeof(migration_world));
-    memset(&migration_plan, 0, sizeof(migration_plan));
-    memset(&baseline_world, 0, sizeof(baseline_world));
-    entry_module_override[0] = '\0';
-    if (!cheng_seed_load_runtime_contract(argc, argv, &contract)) {
-        return 1;
-    }
-    if (!cheng_seed_validate_contract(&contract)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    cheng_seed_resolve_effective_package_root(&contract,
-                                      package_root_flag,
-                                      current_source_path,
-                                      package_root,
-                                      sizeof(package_root));
-    cheng_seed_workspace_root_from_package_root(package_root, workspace_root, sizeof(workspace_root));
-    cheng_seed_package_id_from_root(package_root, package_id, sizeof(package_id));
-    if (current_source_path && *current_source_path != '\0') {
-        cheng_seed_source_path_to_module_path(workspace_root,
-                                      package_root,
-                                      package_id,
-                                      current_source_path,
-                                      entry_module_override,
-                                      sizeof(entry_module_override));
-    }
-    if (!cheng_seed_compiler_legacy_build(argc,
-                                  argv,
-                                  &contract,
-                                  package_id,
-                                  entry_module_override,
-                                  cheng_seed_flag_value(argc, argv, "--channel"),
-                                  &migration_plan,
-                                  &migration,
-                                  &migration_world)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    baseline_world.world_head_cid = cheng_seed_cid_zero();
-    if (!cheng_seed_compiler_migration_receipt_report(&baseline_world,
-                                              &migration_plan,
-                                              &migration_world,
-                                              "legacy_migration",
-                                              &baseline_world.receipt_cid,
-                                              &migration_receipt_report)) {
-        goto cleanup;
-    }
-    migration_report = cheng_seed_compiler_legacy_migration_report(&migration, &migration_world);
-    if (!cheng_seed_compiler_write_legacy_artifacts(prefix ? prefix : "",
-                                            migration_report,
-                                            migration_world.csg_report,
-                                            migration_world.surface_report,
-                                            migration_receipt_report)) {
-        fprintf(stderr, "cheng compiler migration: failed to write migration artifacts: %s\n",
-                prefix ? prefix : "");
-        goto cleanup;
-    }
-    if (!cheng_seed_write_optional_report_text(report_path, migration_report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        goto cleanup;
-    }
-    fputs(migration_report, stdout);
-    rc = 0;
-cleanup:
-    free(migration_report);
-    free(migration_receipt_report);
-    cheng_seed_compiler_world_artifacts_free(&migration_world);
-    cheng_seed_contract_free(&contract);
-    return rc;
-}
-
-static int cheng_seed_cmd_verify_world(int argc, char **argv) {
-    ChengSeedSeedDebugExecContext ctx;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    char *report;
-    if (!cheng_seed_debug_exec_context_build(&ctx, argc, argv, false, true, true)) {
-        return 1;
-    }
-    report = cheng_seed_system_link_exec_report(ctx.contract,
-                                        ctx.plan,
-                                        ctx.world,
-                                        ctx.lowering,
-                                        ctx.primary,
-                                        ctx.object_plan,
-                                        ctx.native_link);
-    if (!cheng_seed_write_optional_report_text(report_path, report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        free(report);
-        cheng_seed_debug_exec_context_release(&ctx);
-        return 1;
-    }
-    fputs(report, stdout);
-    free(report);
-    cheng_seed_debug_exec_context_release(&ctx);
-    return 0;
-}
-
-static bool cheng_seed_write_world_bundle_text(const char *prefix,
-                                       const char *suffix,
-                                       const char *text) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s%s", prefix, suffix);
-    return cheng_seed_ensure_parent_dir(path) && cheng_seed_write_text_file(path, text);
-}
-
-static int cheng_seed_cmd_world_sync(int argc, char **argv) {
-    ChengSeedBootstrapContract contract;
-    ChengSeedSystemLinkPlanStub plan;
-    ChengSeedCompilerWorldArtifacts world;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    char summary[2048];
-    if (!cheng_seed_load_runtime_contract(argc, argv, &contract)) {
-        return 1;
-    }
-    if (!cheng_seed_validate_contract(&contract)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_system_link_plan_stub(&contract, argc, argv, true, &plan)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_compiler_world_artifacts(&plan,
-                                           cheng_seed_flag_value(argc, argv, "--channel") ? cheng_seed_flag_value(argc, argv, "--channel") : "",
-                                           cheng_seed_flag_value(argc, argv, "--world-head") ? cheng_seed_flag_value(argc, argv, "--world-head") : "",
-                                           cheng_seed_flag_value(argc, argv, "--lock") ? cheng_seed_flag_value(argc, argv, "--lock") : "",
-                                           cheng_seed_flag_value(argc, argv, "--baseline-surface") ? cheng_seed_flag_value(argc, argv, "--baseline-surface") : "",
-                                           &world)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_write_world_bundle_text(plan.output_path, ".world.txt", world.world_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".compiler.snapshot.txt", world.compiler_snapshot_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".std.snapshot.txt", world.std_snapshot_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".runtime.snapshot.txt", world.runtime_snapshot_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".csg.txt", world.csg_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".surface.txt", world.surface_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".receipt.txt", world.receipt_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".lock.toml", world.lock_text)) {
-        fprintf(stderr, "cheng compiler: failed to materialize world bundle: %s\n", plan.output_path);
-        cheng_seed_compiler_world_artifacts_free(&world);
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    snprintf(summary,
-             sizeof(summary),
-             "bundle_prefix=%s\nworld_head_cid=%s\ncsg_root_cid=%s\nsurface_cid=%s\nreceipt_cid=%s\n",
-             plan.output_path,
-             world.world_head_cid.hex,
-             world.graph_cid.hex,
-             world.surface_cid.hex,
-             world.receipt_cid.hex);
-    if (!cheng_seed_write_optional_report_text(report_path, summary)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        cheng_seed_compiler_world_artifacts_free(&world);
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    fputs(summary, stdout);
-    cheng_seed_compiler_world_artifacts_free(&world);
-    cheng_seed_contract_free(&contract);
-    return 0;
-}
-
-static int cheng_seed_cmd_prove_equivalence(int argc, char **argv) {
-    ChengSeedBootstrapContract contract;
-    ChengSeedSystemLinkPlanStub plan;
-    ChengSeedCompilerWorldArtifacts world;
-    ChengSeedCompilerEquivalenceProof proof;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    bool enabled = false;
-    char *report;
-    if (!cheng_seed_load_runtime_contract(argc, argv, &contract)) {
-        return 1;
-    }
-    if (!cheng_seed_validate_contract(&contract)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_compiler_equivalence_inputs_ready(argc, argv, true, &enabled) || !enabled) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_system_link_plan_stub(&contract, argc, argv, false, &plan)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_compiler_world_artifacts(&plan,
-                                           cheng_seed_flag_value(argc, argv, "--channel") ? cheng_seed_flag_value(argc, argv, "--channel") : "",
-                                           cheng_seed_flag_value(argc, argv, "--world-head") ? cheng_seed_flag_value(argc, argv, "--world-head") : "",
-                                           cheng_seed_flag_value(argc, argv, "--lock") ? cheng_seed_flag_value(argc, argv, "--lock") : "",
-                                           "",
-                                           &world)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_compiler_equivalence_proof_from_args(&plan, &world, argc, argv, &proof)) {
-        cheng_seed_compiler_world_artifacts_free(&world);
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    report = cheng_seed_compiler_equivalence_proof_report(&proof);
-    if (!cheng_seed_write_optional_report_text(report_path, report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        free(report);
-        cheng_seed_compiler_world_artifacts_free(&world);
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    fputs(report, stdout);
-    free(report);
-    cheng_seed_compiler_world_artifacts_free(&world);
-    cheng_seed_contract_free(&contract);
-    return 0;
-}
-
-static int cheng_seed_cmd_prove_migration(int argc, char **argv) {
-    ChengSeedBootstrapContract contract;
-    ChengSeedSystemLinkPlanStub plan;
-    ChengSeedCompilerWorldArtifacts world;
-    ChengSeedCompilerLegacyMigration migration;
-    ChengSeedCompilerWorldArtifacts migration_world;
-    ChengSeedCompilerEquivalenceProof proof;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    const char *prefix = cheng_seed_flag_value(argc, argv, "--out");
-    char entry_module_override[PATH_MAX];
-    char *migration_report = NULL;
-    char *migration_receipt_report = NULL;
-    char *proof_report = NULL;
-    char *combined_report = NULL;
-    int rc = 1;
-    memset(&world, 0, sizeof(world));
-    memset(&migration, 0, sizeof(migration));
-    memset(&migration_world, 0, sizeof(migration_world));
-    entry_module_override[0] = '\0';
-    if (!cheng_seed_load_runtime_contract(argc, argv, &contract)) {
-        return 1;
-    }
-    if (!cheng_seed_validate_contract(&contract)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_flag_value(argc, argv, "--legacy-in")) {
-        fprintf(stderr, "cheng compiler migration: missing --legacy-in\n");
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_system_link_plan_stub(&contract, argc, argv, false, &plan)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_compiler_world_artifacts(&plan,
-                                           cheng_seed_flag_value(argc, argv, "--channel") ? cheng_seed_flag_value(argc, argv, "--channel") : "",
-                                           cheng_seed_flag_value(argc, argv, "--world-head") ? cheng_seed_flag_value(argc, argv, "--world-head") : "",
-                                           cheng_seed_flag_value(argc, argv, "--lock") ? cheng_seed_flag_value(argc, argv, "--lock") : "",
-                                           "",
-                                           &world)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    cheng_seed_source_path_to_module_path(plan.workspace_root,
-                                  plan.package_root,
-                                  plan.package_id,
-                                  plan.entry_path,
-                                  entry_module_override,
-                                  sizeof(entry_module_override));
-    if (!cheng_seed_compiler_legacy_build(argc,
-                                  argv,
-                                  &contract,
-                                  plan.package_id,
-                                  entry_module_override,
-                                  world.channel,
-                                  NULL,
-                                  &migration,
-                                  &migration_world)) {
-        cheng_seed_compiler_world_artifacts_free(&world);
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_compiler_migration_proof_from_reports(&plan,
-                                                  &world,
-                                                  &migration_world,
-                                                  &proof,
-                                                  &migration_receipt_report)) {
-        goto cleanup;
-    }
-    migration_report = cheng_seed_compiler_legacy_migration_report(&migration, &migration_world);
-    if (!cheng_seed_compiler_write_legacy_artifacts(prefix ? prefix : "",
-                                            migration_report,
-                                            migration_world.csg_report,
-                                            migration_world.surface_report,
-                                            migration_receipt_report)) {
-        fprintf(stderr, "cheng compiler migration: failed to write migration artifacts: %s\n",
-                prefix ? prefix : "");
-        goto cleanup;
-    }
-    proof_report = cheng_seed_compiler_equivalence_proof_report(&proof);
-    if (prefix && *prefix != '\0' && !cheng_seed_write_world_bundle_text(prefix, ".proof.txt", proof_report)) {
-        fprintf(stderr, "cheng compiler: failed to write proof: %s.proof.txt\n", prefix);
-        goto cleanup;
-    }
-    {
-        size_t combined_len = strlen(migration_report) + 1U + strlen(proof_report) + 1U;
-        combined_report = (char *)cheng_seed_xmalloc(combined_len);
-        snprintf(combined_report, combined_len, "%s\n%s", migration_report, proof_report);
-    }
-    if (!cheng_seed_write_optional_report_text(report_path, combined_report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        goto cleanup;
-    }
-    fputs(combined_report, stdout);
-    rc = 0;
-cleanup:
-    free(combined_report);
-    free(proof_report);
-    free(migration_report);
-    free(migration_receipt_report);
-    cheng_seed_compiler_world_artifacts_free(&migration_world);
-    cheng_seed_compiler_world_artifacts_free(&world);
-    cheng_seed_contract_free(&contract);
-    return rc;
-}
-
-static int cheng_seed_cmd_publish_world(int argc, char **argv) {
-    ChengSeedBootstrapContract contract;
-    ChengSeedSystemLinkPlanStub plan;
-    ChengSeedCompilerWorldArtifacts world;
-    ChengSeedCompilerLegacyMigration migration;
-    ChengSeedCompilerWorldArtifacts migration_world;
-    ChengSeedCompilerEquivalenceProof proof;
-    ChengSeedCompilerPublishDecision decision;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    char proof_mode[32];
-    bool proof_enabled = false;
-    char entry_module_override[PATH_MAX];
-    char *migration_report = NULL;
-    char *migration_receipt_report = NULL;
-    char *proof_report = NULL;
-    char *decision_report = NULL;
-    char *summary = NULL;
-    int rc = 1;
-    memset(&world, 0, sizeof(world));
-    memset(&migration, 0, sizeof(migration));
-    memset(&migration_world, 0, sizeof(migration_world));
-    proof_mode[0] = '\0';
-    entry_module_override[0] = '\0';
-    if (!cheng_seed_load_runtime_contract(argc, argv, &contract)) {
-        return 1;
-    }
-    if (!cheng_seed_validate_contract(&contract)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_system_link_plan_stub(&contract, argc, argv, true, &plan)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_compiler_world_artifacts(&plan,
-                                           cheng_seed_flag_value(argc, argv, "--channel") ? cheng_seed_flag_value(argc, argv, "--channel") : "",
-                                           cheng_seed_flag_value(argc, argv, "--world-head") ? cheng_seed_flag_value(argc, argv, "--world-head") : "",
-                                           cheng_seed_flag_value(argc, argv, "--lock") ? cheng_seed_flag_value(argc, argv, "--lock") : "",
-                                           "",
-                                           &world)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_compiler_proof_mode_from_args(argc,
-                                          argv,
-                                          cheng_seed_streq(world.channel, "stable"),
-                                          &proof_enabled,
-                                          proof_mode,
-                                          sizeof(proof_mode))) {
-        goto cleanup;
-    }
-    memset(&proof, 0, sizeof(proof));
-    proof.proof_cid = cheng_seed_cid_zero();
-    if (proof_enabled) {
-        if (cheng_seed_streq(proof_mode, "migration")) {
-            cheng_seed_source_path_to_module_path(plan.workspace_root,
-                                          plan.package_root,
-                                          plan.package_id,
-                                          plan.entry_path,
-                                          entry_module_override,
-                                          sizeof(entry_module_override));
-            if (!cheng_seed_compiler_legacy_build(argc,
-                                          argv,
-                                          &contract,
-                                          plan.package_id,
-                                          entry_module_override,
-                                          world.channel,
-                                          NULL,
-                                          &migration,
-                                          &migration_world) ||
-                !cheng_seed_compiler_migration_proof_from_reports(&plan,
-                                                          &world,
-                                                          &migration_world,
-                                                          &proof,
-                                                          &migration_receipt_report)) {
-                goto cleanup;
-            }
-            migration_report = cheng_seed_compiler_legacy_migration_report(&migration, &migration_world);
-            if (!cheng_seed_compiler_write_legacy_artifacts(plan.output_path,
-                                                    migration_report,
-                                                    migration_world.csg_report,
-                                                    migration_world.surface_report,
-                                                    migration_receipt_report)) {
-                fprintf(stderr, "cheng compiler migration: failed to write migration artifacts: %s\n", plan.output_path);
-                goto cleanup;
-            }
-        } else if (!cheng_seed_compiler_equivalence_proof_from_args(&plan, &world, argc, argv, &proof)) {
-            goto cleanup;
-        }
-        proof_report = cheng_seed_compiler_equivalence_proof_report(&proof);
-    }
-    if (!cheng_seed_compiler_publish_decision_make(world.channel,
-                                           world.world_head_cid,
-                                           proof_enabled,
-                                           &proof,
-                                           &decision)) {
-        goto cleanup;
-    }
-    decision_report = cheng_seed_compiler_publish_decision_report(&decision);
-    if (decision.publish_allowed == 0) {
-        if (!cheng_seed_write_optional_report_text(report_path, decision_report)) {
-            fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-            goto cleanup;
-        }
-        fprintf(stderr, "cheng compiler: publish blocked by canonical equivalence gate\n");
-        fputs(decision_report, stderr);
-        fputc('\n', stderr);
-        if (proof_report) {
-            if (migration_report) {
-                fputs(migration_report, stderr);
-                fputc('\n', stderr);
-            }
-            fputs(proof_report, stderr);
-            fputc('\n', stderr);
-        }
-        rc = 2;
-        goto cleanup;
-    }
-    if (!cheng_seed_write_world_bundle_text(plan.output_path, ".world.txt", world.world_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".compiler.snapshot.txt", world.compiler_snapshot_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".std.snapshot.txt", world.std_snapshot_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".runtime.snapshot.txt", world.runtime_snapshot_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".csg.txt", world.csg_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".surface.txt", world.surface_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".receipt.txt", world.receipt_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".lock.toml", world.lock_text)) {
-        fprintf(stderr, "cheng compiler: failed to materialize world bundle: %s\n", plan.output_path);
-        goto cleanup;
-    }
-    if (proof_report && !cheng_seed_write_world_bundle_text(plan.output_path, ".proof.txt", proof_report)) {
-        fprintf(stderr, "cheng compiler: failed to write proof: %s.proof.txt\n", plan.output_path);
-        goto cleanup;
-    }
-    if (!cheng_seed_write_world_bundle_text(plan.output_path, ".publish.txt", decision_report)) {
-        fprintf(stderr, "cheng compiler: failed to write publish gate report: %s.publish.txt\n", plan.output_path);
-        goto cleanup;
-    }
-    summary = cheng_seed_compiler_publish_summary(plan.output_path, proof_mode, &world, &decision);
-    if (!cheng_seed_write_optional_report_text(report_path, summary)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        goto cleanup;
-    }
-    fputs(summary, stdout);
-    rc = 0;
-cleanup:
-    free(summary);
-    free(decision_report);
-    free(proof_report);
-    free(migration_report);
-    free(migration_receipt_report);
-    cheng_seed_compiler_world_artifacts_free(&migration_world);
-    cheng_seed_compiler_world_artifacts_free(&world);
-    cheng_seed_contract_free(&contract);
-    return rc;
-}
-
-static int cheng_seed_cmd_fresh_node_selfhost(int argc, char **argv) {
-    ChengSeedBootstrapContract contract;
-    ChengSeedSystemLinkPlanStub plan;
-    ChengSeedCompilerWorldArtifacts world;
-    ChengSeedCompilerWorldArtifacts fresh_world;
-    ChengSeedCompilerLegacyMigration migration;
-    ChengSeedCompilerWorldArtifacts migration_world;
-    ChengSeedCompilerEquivalenceProof proof;
-    ChengSeedCompilerPublishDecision decision;
-    ChengSeedCid32 baseline_receipt_cid;
-    ChengSeedCid32 fresh_receipt_cid;
-    int32_t compile_receipt_equivalent = 0;
-    char target_triple[128];
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    char proof_mode[32];
-    bool proof_enabled = false;
-    char entry_module_override[PATH_MAX];
-    char *migration_report = NULL;
-    char *migration_receipt_report = NULL;
-    char *proof_report = NULL;
-    char *decision_report = NULL;
-    char *publish_summary = NULL;
-    char *fresh_report = NULL;
-    char *summary = NULL;
-    int rc = 1;
-    memset(&world, 0, sizeof(world));
-    memset(&fresh_world, 0, sizeof(fresh_world));
-    memset(&migration, 0, sizeof(migration));
-    memset(&migration_world, 0, sizeof(migration_world));
-    proof_mode[0] = '\0';
-    entry_module_override[0] = '\0';
-    if (!cheng_seed_load_runtime_contract(argc, argv, &contract)) {
-        return 1;
-    }
-    if (!cheng_seed_validate_contract(&contract)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_system_link_plan_stub(&contract, argc, argv, true, &plan)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_build_compiler_world_artifacts(&plan,
-                                           cheng_seed_flag_value(argc, argv, "--channel") ? cheng_seed_flag_value(argc, argv, "--channel") : "",
-                                           cheng_seed_flag_value(argc, argv, "--world-head") ? cheng_seed_flag_value(argc, argv, "--world-head") : "",
-                                           cheng_seed_flag_value(argc, argv, "--lock") ? cheng_seed_flag_value(argc, argv, "--lock") : "",
-                                           "",
-                                           &world)) {
-        cheng_seed_contract_free(&contract);
-        return 1;
-    }
-    if (!cheng_seed_compiler_proof_mode_from_args(argc,
-                                          argv,
-                                          cheng_seed_streq(world.channel, "stable"),
-                                          &proof_enabled,
-                                          proof_mode,
-                                          sizeof(proof_mode))) {
-        goto cleanup;
-    }
-    memset(&proof, 0, sizeof(proof));
-    proof.proof_cid = cheng_seed_cid_zero();
-    if (proof_enabled) {
-        if (cheng_seed_streq(proof_mode, "migration")) {
-            cheng_seed_source_path_to_module_path(plan.workspace_root,
-                                          plan.package_root,
-                                          plan.package_id,
-                                          plan.entry_path,
-                                          entry_module_override,
-                                          sizeof(entry_module_override));
-            if (!cheng_seed_compiler_legacy_build(argc,
-                                          argv,
-                                          &contract,
-                                          plan.package_id,
-                                          entry_module_override,
-                                          world.channel,
-                                          NULL,
-                                          &migration,
-                                          &migration_world) ||
-                !cheng_seed_compiler_migration_proof_from_reports(&plan,
-                                                          &world,
-                                                          &migration_world,
-                                                          &proof,
-                                                          &migration_receipt_report)) {
-                goto cleanup;
-            }
-            migration_report = cheng_seed_compiler_legacy_migration_report(&migration, &migration_world);
-            if (!cheng_seed_compiler_write_legacy_artifacts(plan.output_path,
-                                                    migration_report,
-                                                    migration_world.csg_report,
-                                                    migration_world.surface_report,
-                                                    migration_receipt_report)) {
-                fprintf(stderr, "cheng compiler migration: failed to write migration artifacts: %s\n", plan.output_path);
-                goto cleanup;
-            }
-        } else if (!cheng_seed_compiler_equivalence_proof_from_args(&plan, &world, argc, argv, &proof)) {
-            goto cleanup;
-        }
-        proof_report = cheng_seed_compiler_equivalence_proof_report(&proof);
-    }
-    if (!cheng_seed_compiler_publish_decision_make(world.channel,
-                                           world.world_head_cid,
-                                           proof_enabled,
-                                           &proof,
-                                           &decision)) {
-        goto cleanup;
-    }
-    decision_report = cheng_seed_compiler_publish_decision_report(&decision);
-    if (decision.publish_allowed == 0) {
-        if (!cheng_seed_write_optional_report_text(report_path, decision_report)) {
-            fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-            goto cleanup;
-        }
-        fprintf(stderr, "cheng compiler: publish blocked by canonical equivalence gate\n");
-        fputs(decision_report, stderr);
-        fputc('\n', stderr);
-        if (proof_report) {
-            if (migration_report) {
-                fputs(migration_report, stderr);
-                fputc('\n', stderr);
-            }
-            fputs(proof_report, stderr);
-            fputc('\n', stderr);
-        }
-        rc = 2;
-        goto cleanup;
-    }
-    if (!cheng_seed_write_world_bundle_text(plan.output_path, ".world.txt", world.world_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".compiler.snapshot.txt", world.compiler_snapshot_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".std.snapshot.txt", world.std_snapshot_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".runtime.snapshot.txt", world.runtime_snapshot_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".csg.txt", world.csg_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".surface.txt", world.surface_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".receipt.txt", world.receipt_report) ||
-        !cheng_seed_write_world_bundle_text(plan.output_path, ".lock.toml", world.lock_text)) {
-        fprintf(stderr, "cheng compiler: failed to materialize world bundle: %s\n", plan.output_path);
-        goto cleanup;
-    }
-    if (proof_report && !cheng_seed_write_world_bundle_text(plan.output_path, ".proof.txt", proof_report)) {
-        fprintf(stderr, "cheng compiler: failed to write proof: %s.proof.txt\n", plan.output_path);
-        goto cleanup;
-    }
-    if (!cheng_seed_write_world_bundle_text(plan.output_path, ".publish.txt", decision_report)) {
-        fprintf(stderr, "cheng compiler: failed to write publish gate report: %s.publish.txt\n", plan.output_path);
-        goto cleanup;
-    }
-    if (!cheng_seed_build_compiler_world_artifacts(&plan,
-                                           world.channel,
-                                           world.world_head_cid.hex,
-                                           "",
-                                           "",
-                                           &fresh_world)) {
-        goto cleanup;
-    }
-    if (!cheng_seed_compiler_equivalence_receipt_compare_reports(world.receipt_report,
-                                                         fresh_world.receipt_report,
-                                                         &baseline_receipt_cid,
-                                                         &fresh_receipt_cid,
-                                                         target_triple,
-                                                         sizeof(target_triple),
-                                                         &compile_receipt_equivalent)) {
-        goto cleanup;
-    }
-    if (compile_receipt_equivalent == 0) {
-        fprintf(stderr, "cheng compiler world libp2p: fresh rebuild receipt drift\n");
-        goto cleanup;
-    }
-    if (!cheng_seed_cid_equal(baseline_receipt_cid, fresh_receipt_cid)) {
-        fprintf(stderr, "cheng compiler world libp2p: fresh rebuild receipt cid mismatch\n");
-        goto cleanup;
-    }
-    {
-        size_t cap = 2048U;
-        size_t used = 0U;
-        char *out = (char *)cheng_seed_xmalloc(cap);
-        char line[256];
-        out[0] = '\0';
-        cheng_seed_report_append(&out, &cap, &used, "seed_entries=7");
-        cheng_seed_report_append(&out, &cap, &used, "fresh_entries=7");
-        cheng_seed_report_append(&out, &cap, &used, "published_heads=1");
-        cheng_seed_report_append(&out, &cap, &used, "synced_entries=7");
-        snprintf(line, sizeof(line), "world_head_cid=%s", world.world_head_cid.hex);
-        cheng_seed_report_append(&out, &cap, &used, line);
-        snprintf(line, sizeof(line), "seed_receipt_cid=%s", world.receipt_cid.hex);
-        cheng_seed_report_append(&out, &cap, &used, line);
-        snprintf(line, sizeof(line), "synced_receipt_cid=%s", world.receipt_cid.hex);
-        cheng_seed_report_append(&out, &cap, &used, line);
-        snprintf(line, sizeof(line), "fresh_receipt_cid=%s", fresh_world.receipt_cid.hex);
-        cheng_seed_report_append(&out, &cap, &used, line);
-        cheng_seed_report_append(&out, &cap, &used, "receipt_equivalent=1");
-        cheng_seed_report_append(&out, &cap, &used, "receipt_cid_match=1");
-        fresh_report = out;
-    }
-    if (!cheng_seed_write_world_bundle_text(plan.output_path, ".fresh.txt", fresh_report)) {
-        fprintf(stderr, "cheng compiler: failed to write fresh-node report: %s.fresh.txt\n", plan.output_path);
-        goto cleanup;
-    }
-    publish_summary = cheng_seed_compiler_publish_summary(plan.output_path, proof_mode, &world, &decision);
-    {
-        size_t summary_len = strlen(publish_summary);
-        size_t fresh_len = strlen(fresh_report);
-        summary = (char *)cheng_seed_xmalloc(summary_len + fresh_len + 2U);
-        snprintf(summary, summary_len + fresh_len + 2U, "%s\n%s", publish_summary, fresh_report);
-    }
-    if (!cheng_seed_write_optional_report_text(report_path, summary)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        goto cleanup;
-    }
-    fputs(summary, stdout);
-    rc = 0;
-cleanup:
-    free(summary);
-    free(publish_summary);
-    free(fresh_report);
-    free(decision_report);
-    free(proof_report);
-    free(migration_report);
-    free(migration_receipt_report);
-    cheng_seed_compiler_world_artifacts_free(&migration_world);
-    cheng_seed_compiler_world_artifacts_free(&fresh_world);
-    cheng_seed_compiler_world_artifacts_free(&world);
-    cheng_seed_contract_free(&contract);
-    return rc;
-}
-
-static int cheng_seed_cmd_selfhost_build(int argc, char **argv) {
-    ChengSeedSeedDebugExecContext ctx;
-    const char *report_path = cheng_seed_flag_value(argc, argv, "--report-out");
-    char *report;
-    int rc = 2;
-    bool pipeline_ready;
-    long long phase_start_ms;
-    long long phase_end_ms;
-    bool link_ok;
-    if (!cheng_seed_debug_exec_context_build(&ctx, argc, argv, true, true, true)) {
-        return 1;
-    }
-    if (!cheng_seed_streq(ctx.plan->emit_kind, "obj") &&
-        ctx.object_plan->missing_reason_count <= 0U &&
-        ctx.object_plan->linux_nolibc_support_enabled) {
-        phase_start_ms = cheng_seed_bft_monotime_ms();
-        if (!cheng_seed_materialize_linux_nolibc_support_objects(ctx.contract, ctx.plan, ctx.object_plan)) {
-            phase_end_ms = cheng_seed_bft_monotime_ms();
-            ctx.world->exec_phase_linux_nolibc_objects_ms = cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms);
-            cheng_seed_debug_exec_context_release(&ctx);
-            return 1;
-        }
-        phase_end_ms = cheng_seed_bft_monotime_ms();
-        ctx.world->exec_phase_linux_nolibc_objects_ms = cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms);
-    }
-    if (!cheng_seed_streq(ctx.plan->emit_kind, "obj") &&
-        ctx.native_link->missing_reason_count <= 0U &&
-        ctx.object_plan->provider_source_count > 0U) {
-        phase_start_ms = cheng_seed_bft_monotime_ms();
-        if (!cheng_seed_materialize_provider_objects(ctx.contract, ctx.plan, ctx.object_plan, ctx.world)) {
-            phase_end_ms = cheng_seed_bft_monotime_ms();
-            ctx.world->exec_phase_provider_objects_ms = cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms);
-            cheng_seed_debug_exec_context_release(&ctx);
-            return 1;
-        }
-        phase_end_ms = cheng_seed_bft_monotime_ms();
-        ctx.world->exec_phase_provider_objects_ms = cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms);
-    }
-    if (ctx.primary->missing_reason_count <= 0U) {
-        phase_start_ms = cheng_seed_bft_monotime_ms();
-        if (!cheng_seed_materialize_primary_object_cached(ctx.plan, ctx.lowering, ctx.primary, ctx.world)) {
-            phase_end_ms = cheng_seed_bft_monotime_ms();
-            ctx.world->exec_phase_primary_object_emit_ms = cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms);
-            cheng_seed_debug_exec_context_release(&ctx);
-            return 1;
-        }
-        phase_end_ms = cheng_seed_bft_monotime_ms();
-        ctx.world->exec_phase_primary_object_emit_ms = cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms);
-    }
-    report = cheng_seed_system_link_exec_report(ctx.contract,
-                                        ctx.plan,
-                                        ctx.world,
-                                        ctx.lowering,
-                                        ctx.primary,
-                                        ctx.object_plan,
-                                        ctx.native_link);
-    if (!cheng_seed_write_optional_report_text(report_path, report)) {
-        fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-        free(report);
-        cheng_seed_debug_exec_context_release(&ctx);
-        return 1;
-    }
-    if (cheng_seed_streq(ctx.plan->emit_kind, "obj")) {
-        if (ctx.primary->missing_reason_count > 0U) {
-            fprintf(stderr, "cheng compiler: selfhost primary object machine code not emitted\n");
-            fputs(report, stderr);
-            free(report);
-            cheng_seed_debug_exec_context_release(&ctx);
-            return 2;
-        }
-        fputs(report, stderr);
-        free(report);
-        cheng_seed_debug_exec_context_release(&ctx);
-        return 0;
-    }
-    pipeline_ready = ctx.plan->missing_reason_count <= 0U &&
-                     ctx.lowering->missing_reason_count <= 0U &&
-                     ctx.primary->missing_reason_count <= 0U &&
-                     ctx.object_plan->missing_reason_count <= 0U &&
-                     ctx.native_link->missing_reason_count <= 0U;
-    if (ctx.primary->missing_reason_count > 0U) {
-        fprintf(stderr, "cheng compiler: selfhost primary object machine code not emitted\n");
-    } else if (!pipeline_ready) {
-        fprintf(stderr, "cheng compiler: selfhost build blocked\n");
-    } else {
-        phase_start_ms = cheng_seed_bft_monotime_ms();
-        if (cheng_seed_streq(ctx.plan->emit_kind, "shared")) {
-            link_ok = cheng_seed_link_native_shared_library(ctx.native_link, ctx.plan->output_path);
-        } else {
-            link_ok = cheng_seed_link_native_executable(ctx.native_link, ctx.plan->output_path);
-        }
-        phase_end_ms = cheng_seed_bft_monotime_ms();
-        ctx.world->exec_phase_native_link_ms = cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms);
-        if (!link_ok) {
-            free(report);
-            cheng_seed_debug_exec_context_release(&ctx);
-            return 1;
-        }
-        if (cheng_seed_streq(ctx.plan->emit_kind, "exe")) {
-            phase_start_ms = cheng_seed_bft_monotime_ms();
-            if (!cheng_seed_write_executable_line_map(ctx.plan, ctx.lowering)) {
-                phase_end_ms = cheng_seed_bft_monotime_ms();
-                ctx.world->exec_phase_line_map_ms = cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms);
-                free(report);
-                cheng_seed_debug_exec_context_release(&ctx);
-                return 1;
-            }
-            phase_end_ms = cheng_seed_bft_monotime_ms();
-            ctx.world->exec_phase_line_map_ms = cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms);
-        }
-        rc = 0;
-    }
-    if (rc == 0) {
-        free(report);
-        report = cheng_seed_system_link_exec_report(ctx.contract,
-                                            ctx.plan,
-                                            ctx.world,
-                                            ctx.lowering,
-                                            ctx.primary,
-                                            ctx.object_plan,
-                                            ctx.native_link);
-        if (!cheng_seed_write_optional_report_text(report_path, report)) {
-            fprintf(stderr, "cheng compiler: failed to write report: %s\n", report_path);
-            free(report);
-            cheng_seed_debug_exec_context_release(&ctx);
-            return 1;
-        }
-    }
-    fputs(report, stderr);
-    free(report);
-    cheng_seed_debug_exec_context_release(&ctx);
-    return rc;
-}
 
 static int cheng_seed_cmd_system_link_exec(int argc, char **argv) {
     ChengSeedBootstrapContract contract;
@@ -75098,6 +64816,28 @@ int main(int argc, char **argv) {
     if (cheng_seed_streq(argv[1], "build-backend-driver")) {
         return cheng_seed_cmd_build_backend_driver(argc, argv);
     }
+    if (cheng_seed_streq(argv[1], "compile-bootstrap")) {
+        return cheng_seed_cmd_compile_bootstrap(argc, argv);
+    }
+    if ((cheng_seed_streq(argv[1], "--help") ||
+         cheng_seed_streq(argv[1], "-h") ||
+         cheng_seed_streq(argv[1], "help")) &&
+        !cheng_seed_backend_driver_handoff_enabled()) {
+        cheng_seed_usage();
+        return 0;
+    }
+    if (cheng_seed_startswith(argv[1], "__")) {
+        fprintf(stderr, "[cheng_seed] unknown command: %s\n", argv[1]);
+        cheng_seed_usage();
+        return 2;
+    }
+    if (!cheng_seed_backend_driver_handoff_enabled()) {
+        fprintf(stderr,
+                "[cheng_seed] non-bootstrap command requires backend driver handoff: %s\n",
+                argv[1]);
+        cheng_seed_usage();
+        return 2;
+    }
     if (cheng_seed_command_prefers_backend_driver_passthrough(argv[1])) {
         cheng_seed_bootstrap_paths_init(&paths);
         passthrough_rc = cheng_seed_try_exec_backend_driver_cli_passthrough(&paths,
@@ -75108,178 +64848,10 @@ int main(int argc, char **argv) {
         if (passthrough_rc >= 0) {
             return passthrough_rc;
         }
-    }
-    if (cheng_seed_streq(argv[1], "run-production-regression")) {
-        return cheng_seed_cmd_run_production_regression_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "slice-gate")) {
-        return cheng_seed_cmd_slice_gate(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "print-asm")) {
-        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_print_asm, argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-orphan-guard")) {
-        return cheng_seed_cmd_verify_orphan_guard_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-backend-driver-command-surface")) {
-        return cheng_seed_cmd_verify_backend_driver_command_surface_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-mobile-shell-build-probe")) {
-        return cheng_seed_cmd_verify_mobile_shell_build_probe_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-r2c-react-surface")) {
-        return cheng_seed_cmd_verify_r2c_react_surface_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-debug-tools")) {
-        return cheng_seed_cmd_verify_debug_tools(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-debug-runtime")) {
-        return cheng_seed_cmd_verify_debug_runtime_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-diloco")) {
-        return cheng_seed_cmd_verify_diloco_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-host-smokes")) {
-        return cheng_seed_cmd_run_host_smokes_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-stage23-libp2p-smokes")) {
-        return cheng_seed_cmd_run_stage23_libp2p_smokes_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "r2c-react")) {
-        return cheng_seed_cmd_r2c_react_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-zero-exit")) {
-        return cheng_seed_cmd_build_zero_exit_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-panic-trace")) {
-        return cheng_seed_cmd_build_panic_trace_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-bounds-trace")) {
-        return cheng_seed_cmd_build_bounds_trace_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-signal-trace")) {
-        return cheng_seed_cmd_build_signal_trace_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-call-chain")) {
-        return cheng_seed_cmd_build_call_chain_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-ffi-handle")) {
-        return cheng_seed_cmd_build_ffi_handle_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-program-selfhost")) {
-        return cheng_seed_cmd_build_program_selfhost_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-bft-state-machine")) {
-        return cheng_seed_cmd_build_bft_state_machine_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "deploy-bft-validator-three-node")) {
-        return cheng_seed_cmd_deploy_bft_validator_three_node_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-bft-validator-three-node")) {
-        return cheng_seed_cmd_verify_bft_validator_three_node_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "status-bft-validator-three-node")) {
-        return cheng_seed_cmd_status_bft_validator_three_node_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "stop-bft-validator-three-node")) {
-        return cheng_seed_cmd_stop_bft_validator_three_node_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "bench-bft-validator-three-node")) {
-        return cheng_seed_cmd_bench_bft_validator_three_node_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-browser-host-wasm")) {
-        return cheng_seed_cmd_build_browser_host_wasm_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-chain-node")) {
-        return cheng_seed_cmd_build_chain_node_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-rwad-bft-state-machine")) {
-        return cheng_seed_cmd_build_rwad_bft_state_machine_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-chain-node-linux")) {
-        return cheng_seed_cmd_build_chain_node_linux_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-linux-nolibc-exe")) {
-        return cheng_seed_cmd_build_linux_nolibc_exe_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "build-rwad-bft-linux")) {
-        return cheng_seed_cmd_build_rwad_bft_linux_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-linux-object-smokes")) {
-        return cheng_seed_cmd_run_linux_object_smokes_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-tcp-twoproc-smoke")) {
-        return cheng_seed_cmd_run_tcp_twoproc_smoke_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-quic-twoproc-smoke")) {
-        return cheng_seed_cmd_run_quic_twoproc_smoke_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-udp-importc-smoke")) {
-        return cheng_seed_cmd_run_udp_importc_smoke_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-wasm-smokes")) {
-        return cheng_seed_cmd_run_wasm_smokes_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-browser-host-wasm-smoke")) {
-        return cheng_seed_cmd_run_browser_host_wasm_smoke_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-chain-node-cli-smoke")) {
-        return cheng_seed_cmd_run_chain_node_cli_smoke_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-chain-node-process-smoke")) {
-        return cheng_seed_cmd_run_chain_node_process_smoke_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-chain-node-three-node-smoke")) {
-        return cheng_seed_cmd_run_chain_node_three_node_smoke_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-tailnet-control-smoke")) {
-        return cheng_seed_cmd_run_tailnet_control_smoke_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-fresh-node-selfhost-gate")) {
-        return cheng_seed_cmd_run_fresh_node_selfhost_gate_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-migration-gate")) {
-        return cheng_seed_cmd_run_migration_gate_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "run-browser-webrtc-smokes")) {
-        return cheng_seed_cmd_run_browser_webrtc_smokes_impl(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "emit-csg")) {
-        return cheng_seed_cmd_emit_csg(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "migrate-csg")) {
-        return cheng_seed_cmd_migrate_csg(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "verify-world")) {
-        return cheng_seed_cmd_verify_world(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "world-sync")) {
-        return cheng_seed_cmd_world_sync(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "prove-equivalence")) {
-        return cheng_seed_cmd_prove_equivalence(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "prove-migration")) {
-        return cheng_seed_cmd_prove_migration(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "publish-world")) {
-        return cheng_seed_cmd_publish_world(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "fresh-node-selfhost")) {
-        return cheng_seed_cmd_fresh_node_selfhost(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "selfhost-build")) {
-        return cheng_seed_cmd_selfhost_build(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "system-link-exec")) {
-        return cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_system_link_exec, argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "compile-bootstrap")) {
-        return cheng_seed_cmd_compile_bootstrap(argc, argv);
-    }
-    if (cheng_seed_streq(argv[1], "--help") || cheng_seed_streq(argv[1], "-h") || cheng_seed_streq(argv[1], "help")) {
-        cheng_seed_usage();
-        return 0;
+        fprintf(stderr,
+                "[cheng_seed] backend driver handoff unavailable for command: %s\n",
+                argv[1]);
+        return 2;
     }
     fprintf(stderr, "[cheng_seed] unknown command: %s\n", argv[1]);
     cheng_seed_usage();

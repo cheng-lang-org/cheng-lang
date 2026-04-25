@@ -1,0 +1,128 @@
+import std/result
+import std/rawbytes
+import std/rawmem_support
+
+type
+    ObjectBuffer =
+        storage: Bytes
+        len: int32
+        cap: int32
+
+fn ObjectBufferInit(cap0: int32): ObjectBuffer =
+    var cap = cap0
+    if cap < 64:
+        cap = 64
+    var out: ObjectBuffer
+    let storage = bytesAlloc(cap)
+    out.storage.data = storage.data
+    out.storage.len = storage.len
+    out.cap = cap
+    return out
+
+fn ObjectBufferLen(buf: ObjectBuffer): int32 =
+    return buf.len
+
+fn ObjectBufferCap(buf: ObjectBuffer): int32 =
+    return buf.cap
+
+fn ObjectBufferOffset(buf: ObjectBuffer): int32 =
+    return buf.len
+
+fn ObjectBufferEnsure(buf: var ObjectBuffer, extra: int32) =
+    if extra <= 0:
+        return
+    let need = buf.len + extra
+    if need <= buf.cap:
+        return
+    var nextCap = buf.cap
+    if nextCap < 64:
+        nextCap = 64
+    for _ in 0..<32:
+        if nextCap >= need:
+            break
+        nextCap = nextCap * 2
+    if nextCap < need:
+        nextCap = need
+    let nextStorage = bytesAlloc(nextCap)
+    if buf.len > 0:
+        rawmem_support.RawmemCopy(nextStorage.data, buf.storage.data, buf.len)
+    buf.storage.data = nextStorage.data
+    buf.storage.len = nextStorage.len
+    buf.cap = nextCap
+
+fn ObjectBufferWriteU8(buf: var ObjectBuffer, value: int32) =
+    ObjectBufferEnsure(buf, 1)
+    bytesSet(buf.storage, buf.len, value & 255)
+    buf.len = buf.len + 1
+
+fn ObjectBufferWriteU16LE(buf: var ObjectBuffer, value: uint64) =
+    ObjectBufferEnsure(buf, 2)
+    bytesSet(buf.storage, buf.len, int32(value & uint64(255)))
+    bytesSet(buf.storage, buf.len + 1, int32((value >> uint64(8)) & uint64(255)))
+    buf.len = buf.len + 2
+
+fn ObjectBufferWriteU32LE(buf: var ObjectBuffer, value: uint64) =
+    ObjectBufferEnsure(buf, 4)
+    for i in 0..<4:
+        let shift = uint64(i * 8)
+        bytesSet(buf.storage, buf.len + i, int32((value >> shift) & uint64(255)))
+    buf.len = buf.len + 4
+
+fn ObjectBufferWriteU64LE(buf: var ObjectBuffer, value: uint64) =
+    ObjectBufferEnsure(buf, 8)
+    for i in 0..<8:
+        let shift = uint64(i * 8)
+        bytesSet(buf.storage, buf.len + i, int32((value >> shift) & uint64(255)))
+    buf.len = buf.len + 8
+
+fn ObjectBufferWriteBytes(buf: var ObjectBuffer, data: Bytes) =
+    let n = bytesLen(data)
+    if n <= 0:
+        return
+    ObjectBufferEnsure(buf, n)
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(buf.storage.data, buf.len), data.data, n)
+    buf.len = buf.len + n
+
+fn ObjectBufferWriteZeros(buf: var ObjectBuffer, count: int32) =
+    if count <= 0:
+        return
+    ObjectBufferEnsure(buf, count)
+    for i in 0..<count:
+        bytesSet(buf.storage, buf.len + i, 0)
+    buf.len = buf.len + count
+
+fn ObjectBufferAlign(buf: var ObjectBuffer, align: int32, fill: int32) =
+    if align <= 1:
+        return
+    let mask = align - 1
+    let aligned = (buf.len + mask) & (0 - align)
+    let pad = aligned - buf.len
+    if pad <= 0:
+        return
+    ObjectBufferEnsure(buf, pad)
+    for i in 0..<pad:
+        bytesSet(buf.storage, buf.len + i, fill & 255)
+    buf.len = buf.len + pad
+
+fn ObjectBufferPatchU32LE(buf: var ObjectBuffer, offset: int32, value: uint64): Result[bool] =
+    if offset < 0 || offset + 4 > buf.len:
+        return Err[bool](" object buffer: patch u32 out of range")
+    for i in 0..<4:
+        let shift = uint64(i * 8)
+        bytesSet(buf.storage, offset + i, int32((value >> shift) & uint64(255)))
+    return Ok[bool](true)
+
+fn ObjectBufferPatchU64LE(buf: var ObjectBuffer, offset: int32, value: uint64): Result[bool] =
+    if offset < 0 || offset + 8 > buf.len:
+        return Err[bool](" object buffer: patch u64 out of range")
+    for i in 0..<8:
+        let shift = uint64(i * 8)
+        bytesSet(buf.storage, offset + i, int32((value >> shift) & uint64(255)))
+    return Ok[bool](true)
+
+fn ObjectBufferToBytes(buf: ObjectBuffer): Bytes =
+    if buf.len <= 0:
+        return emptyBytes()
+    let out = bytesAlloc(buf.len)
+    rawmem_support.RawmemCopy(out.data, buf.storage.data, buf.len)
+    return out

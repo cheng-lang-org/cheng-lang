@@ -1,15 +1,16 @@
 import std/os
 import std/strings
+import std/strformat
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/path as chengpath
 
 fn assertNoSeedHiddenSurface(label: str, text: str) =
-    let hiddenCommand = "__seed-system" + "-link-exec"
-    let hiddenEnv = "CHENG_SEED_INTERNAL" + "_SYSTEM_LINK_EXEC"
+    let hiddenCommand = Fmt(["__seed-system", "-link-exec"])
+    let hiddenEnv = Fmt(["CHENG_SEED_INTERNAL", "_SYSTEM_LINK_EXEC"])
     assert(!strings.StrContains(text, hiddenCommand),
-           label + " hidden command")
+           Fmt([label, " hidden command"]))
     assert(!strings.StrContains(text, hiddenEnv),
-           label + " hidden env")
+           Fmt([label, " hidden env"]))
 
 fn main(): int32 =
     let root = os.GetCurrentDir()
@@ -76,11 +77,13 @@ fn main(): int32 =
                               compilerMainText)
     assertNoSeedHiddenSurface("seed minimization boundary: c seed source excludes seed hidden surface",
                               seedText)
+    assert(!strings.StrContains(seedText, "cheng_seed_invoke_with_fresh_compile_env(cheng_seed_cmd_system_link_exec"),
+           "seed minimization boundary: c seed excludes public system-link-exec fallback")
 
     let hiddenSystemLinkLog = chengpath.PathJoin(outDir, "hidden_system_link_exec.log")
     if chengpath.PathFileExists(hiddenSystemLinkLog):
         os.RemoveFile(hiddenSystemLinkLog)
-    let hiddenCommand = "__seed-system" + "-link-exec"
+    let hiddenCommand = Fmt(["__seed-system", "-link-exec"])
     let hiddenSystemLinkRun = hostops.RunFileLogged(root,
                                                      "seed_minimization_boundary_hidden_system_link_exec",
                                                      stage3,
@@ -91,15 +94,16 @@ fn main(): int32 =
                                                      hiddenSystemLinkLog)
     assert(hiddenSystemLinkRun.exitCode == 2,
            "seed minimization boundary: hidden system-link-exec rc")
-    assert(strings.StrContains(hiddenSystemLinkRun.output, "[cheng_seed] unknown command: " + hiddenCommand),
+    let hiddenSystemLinkLogText = chengpath.ReadTextFile(root, hiddenSystemLinkLog)
+    assert(strings.StrContains(hiddenSystemLinkLogText, Fmt(["[cheng_seed] unknown command: ", hiddenCommand])),
            "seed minimization boundary: hidden system-link-exec output")
 
-    let cacheSourceNonce = strings.Int64ToStr(os.Time()) + "_" + strings.Int64ToStr(hostops.HostOpsCurrentPid())
-    let cacheSource = chengpath.PathJoin(outDir, "backend_driver_cache_restore_fixture_" + cacheSourceNonce + ".cheng")
+    let cacheSourceNonce = Fmt([strings.Int64ToStr(os.Time()), "_", strings.Int64ToStr(hostops.HostOpsCurrentPid())])
+    let cacheSource = chengpath.PathJoin(outDir, Fmt(["backend_driver_cache_restore_fixture_", cacheSourceNonce, ".cheng"]))
     assert(chengpath.WriteTextFile(root, cacheSource, "fn main(): int32 =\n    return 0\n"),
            "seed minimization boundary: write cache fixture")
     let cacheOut = chengpath.PathJoin(outDir, "backend_driver_cache_restore_zero")
-    let cacheMap = cacheOut + ".map"
+    let cacheMap = Fmt([cacheOut, ".map"])
     let cachePrimeReport = chengpath.PathJoin(outDir, "backend_driver_cache_restore.prime.report.txt")
     let cachePrimeLog = chengpath.PathJoin(outDir, "backend_driver_cache_restore.prime.log")
     let cacheRestoreReport = chengpath.PathJoin(outDir, "backend_driver_cache_restore.report.txt")
@@ -114,13 +118,13 @@ fn main(): int32 =
         os.RemoveFile(cacheRestoreReport)
     var cacheArgs: str[]
     add(cacheArgs, "system-link-exec")
-    add(cacheArgs, "--root:" + root)
-    add(cacheArgs, "--in:" + cacheSource)
+    add(cacheArgs, Fmt(["--root:", root]))
+    add(cacheArgs, Fmt(["--in:", cacheSource]))
     add(cacheArgs, "--emit:exe")
     add(cacheArgs, "--target:arm64-apple-darwin")
-    add(cacheArgs, "--out:" + cacheOut)
+    add(cacheArgs, Fmt(["--out:", cacheOut]))
     var cachePrimeArgs = cacheArgs
-    add(cachePrimeArgs, "--report-out:" + cachePrimeReport)
+    add(cachePrimeArgs, Fmt(["--report-out:", cachePrimeReport]))
     let cachePrimeRun = hostops.RunFileLogged(root,
                                                "seed_minimization_boundary_cache_prime",
                                                driver,
@@ -143,8 +147,12 @@ fn main(): int32 =
     let cachePrimeReportText = chengpath.ReadTextFile("", cachePrimeReport)
     assert(strings.StrContains(cachePrimeReportText, "system_link_exec_runtime_execute=1"),
            "seed minimization boundary: cache prime pure runtime marker")
-    assert(strings.StrContains(cachePrimeReportText, "system_link_exec_runtime_standalone_zero_exit=1"),
+    assert(strings.StrContains(cachePrimeReportText, "system_link_exec_runtime_standalone_direct_entry=1"),
            "seed minimization boundary: cache prime standalone marker")
+    assert(strings.StrContains(cachePrimeReportText, "primary_object_direct=1"),
+           "seed minimization boundary: cache prime direct object marker")
+    assert(strings.StrContains(cachePrimeReportText, "direct_object_bytes="),
+           "seed minimization boundary: cache prime direct object bytes")
     assert(strings.StrContains(cachePrimeReportText, "backend_driver_system_link_exec_cache_store=1"),
            "seed minimization boundary: cache store pure driver marker")
     assert(!strings.StrContains(cachePrimeReportText, "backend_driver_system_link_exec_cache_restore=1"),
@@ -152,7 +160,7 @@ fn main(): int32 =
     os.RemoveFile(cacheOut)
     os.RemoveFile(cacheMap)
     var cacheRestoreArgs = cacheArgs
-    add(cacheRestoreArgs, "--report-out:" + cacheRestoreReport)
+    add(cacheRestoreArgs, Fmt(["--report-out:", cacheRestoreReport]))
     let cacheRestoreRun = hostops.RunFileLogged(root,
                                                  "seed_minimization_boundary_cache_restore",
                                                  driver,

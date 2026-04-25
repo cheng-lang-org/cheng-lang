@@ -1,0 +1,219 @@
+import std/result
+import std/rawbytes as rawbytes
+import std/strformat
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/object_buffer as obuf
+import cheng/core/backend/object_symbols as osym
+import cheng/core/backend/object_relocs as orel
+
+const
+    MachOHeaderSize = 32
+    MachOSegmentCommandSize = 72
+    MachOSection64Size = 80
+    MachOSymtabCommandSize = 24
+    MachONlist64Size = 16
+    MachOLoadCommandSegment64 = 0x19
+    MachOLoadCommandSymtab = 0x2
+    MachORelocArm64Unsigned = 0
+    MachORelocArm64Branch26 = 2
+
+type
+    MachOObjectWriterResult =
+        objectPath: str
+        bytesWritten: int32
+        symbolCount: int32
+        relocCount: int32
+
+fn MachOAlign(value: int32, align: int32): int32 =
+    if align <= 1:
+        return value
+    let mask = align - 1
+    return (value + mask) & (0 - align)
+
+fn MachOWritePaddedAscii(buf: var obuf.ObjectBuffer,
+                          text: str,
+                          width: int32) =
+    for i in 0..<width:
+        if i < len(text):
+            obuf.ObjectBufferWriteU8(buf, int32(text[i]) & 255)
+        else:
+            obuf.ObjectBufferWriteU8(buf, 0)
+
+fn MachOWriteCString(buf: var obuf.ObjectBuffer,
+                      text: str) =
+    for i in 0..<len(text):
+        obuf.ObjectBufferWriteU8(buf, int32(text[i]) & 255)
+    obuf.ObjectBufferWriteU8(buf, 0)
+
+fn MachOWriteTextSectionCommand(buf: var obuf.ObjectBuffer,
+                                 textOffset: int32,
+                                 textSize: int32,
+                                 relocOffset: int32,
+                                 relocCount: int32) =
+    MachOWritePaddedAscii(buf, "__text", 16)
+    MachOWritePaddedAscii(buf, "__TEXT", 16)
+    obuf.ObjectBufferWriteU64LE(buf, uint64(0))
+    obuf.ObjectBufferWriteU64LE(buf, uint64(textSize))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(textOffset))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(2))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(relocOffset))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(relocCount))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(0x80000400))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(0))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(0))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(0))
+
+fn MachOWriteNlist64(buf: var obuf.ObjectBuffer,
+                      strIndex: int32,
+                      symbol: osym.ObjectSymbol) =
+    obuf.ObjectBufferWriteU32LE(buf, uint64(strIndex))
+    if symbol.undefined:
+        var undefinedType = 0
+        if symbol.global:
+            undefinedType = 1
+        obuf.ObjectBufferWriteU8(buf, undefinedType)
+        obuf.ObjectBufferWriteU8(buf, 0)
+        obuf.ObjectBufferWriteU16LE(buf, uint64(0))
+        obuf.ObjectBufferWriteU64LE(buf, uint64(0))
+        return
+    var ntype = 14
+    if symbol.global:
+        ntype = 15
+    obuf.ObjectBufferWriteU8(buf, ntype)
+    obuf.ObjectBufferWriteU8(buf, symbol.sectionIndex + 1)
+    obuf.ObjectBufferWriteU16LE(buf, uint64(0))
+    obuf.ObjectBufferWriteU64LE(buf, uint64(symbol.offset))
+
+fn MachORelocType(kind: orel.ObjectRelocKind): Result[int32] =
+    if kind == orel.ObjectRelocAbs32 ||
+       kind == orel.ObjectRelocAbs64:
+        return Ok[int32](MachORelocArm64Unsigned)
+    if kind == orel.ObjectRelocBranch26:
+        return Ok[int32](MachORelocArm64Branch26)
+    return Err[int32](" macho object writer: unsupported relocation kind")
+
+fn MachORelocLength(kind: orel.ObjectRelocKind): Result[int32] =
+    if kind == orel.ObjectRelocAbs32 ||
+       kind == orel.ObjectRelocBranch26:
+        return Ok[int32](2)
+    if kind == orel.ObjectRelocAbs64:
+        return Ok[int32](3)
+    return Err[int32](" macho object writer: unsupported relocation length")
+
+fn MachOWriteRelocation(buf: var obuf.ObjectBuffer,
+                         reloc: orel.ObjectReloc,
+                         symbolCount: int32): Result[bool] =
+    if reloc.sectionIndex != 0:
+        return Err[bool](" macho object writer: unsupported relocation section")
+    if reloc.offset < int64(0) || reloc.offset > int64(2147483647):
+        return Err[bool](" macho object writer: relocation offset out of range")
+    if reloc.symbolIndex < 0 || reloc.symbolIndex >= symbolCount:
+        return Err[bool](" macho object writer: relocation symbol out of range")
+    if reloc.addend != int64(0):
+        return Err[bool](" macho object writer: relocation addend not supported")
+    let typeRes = MachORelocType(reloc.kind)
+    if IsErr(typeRes):
+        return Err[bool](Error(typeRes))
+    let lengthRes = MachORelocLength(reloc.kind)
+    if IsErr(lengthRes):
+        return Err[bool](Error(lengthRes))
+    var word = reloc.symbolIndex & 0x00ffffff
+    if reloc.pcRelative:
+        word = word | (1 << 24)
+    word = word | ((Value(lengthRes) & 3) << 25)
+    word = word | (1 << 27)
+    word = word | ((Value(typeRes) & 15) << 28)
+    obuf.ObjectBufferWriteU32LE(buf, uint64(reloc.offset))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(word))
+    return Ok[bool](true)
+
+fn MachOTextObjectBytes(text: rawbytes.Bytes,
+                         symbols: osym.ObjectSymbolTable,
+                         relocs: orel.ObjectRelocTable): Result[rawbytes.Bytes] =
+    let relocCount = orel.ObjectRelocsCount(relocs)
+    let symbolCount = osym.ObjectSymbolsCount(symbols)
+    if symbolCount <= 0:
+        return Err[rawbytes.Bytes](" macho object writer: missing symbols")
+    let segmentSize = MachOSegmentCommandSize + MachOSection64Size
+    let loadCommandBytes = segmentSize + MachOSymtabCommandSize
+    let textOffset = MachOHeaderSize + loadCommandBytes
+    let textSize = rawbytes.bytesLen(text)
+    var relocOffset = 0
+    var symoff = MachOAlign(textOffset + textSize, 8)
+    if relocCount > 0:
+        relocOffset = MachOAlign(textOffset + textSize, 8)
+        symoff = MachOAlign(relocOffset + relocCount * 8, 8)
+    let stroff = symoff + symbolCount * MachONlist64Size
+    var strtab = obuf.ObjectBufferInit(128)
+    var strOffsets: int32[]
+    obuf.ObjectBufferWriteU8(strtab, 0)
+    for i in 0..<symbolCount:
+        let symbol = osym.ObjectSymbolsAt(symbols, i)
+        add(strOffsets, obuf.ObjectBufferOffset(strtab))
+        MachOWriteCString(strtab, symbol.name)
+    let strsize = obuf.ObjectBufferLen(strtab)
+
+    var out = obuf.ObjectBufferInit(stroff + strsize + 64)
+    obuf.ObjectBufferWriteU32LE(out, uint64(0xfeedfacf))
+    obuf.ObjectBufferWriteU32LE(out, uint64(0x0100000c))
+    obuf.ObjectBufferWriteU32LE(out, uint64(0))
+    obuf.ObjectBufferWriteU32LE(out, uint64(1))
+    obuf.ObjectBufferWriteU32LE(out, uint64(2))
+    obuf.ObjectBufferWriteU32LE(out, uint64(loadCommandBytes))
+    obuf.ObjectBufferWriteU32LE(out, uint64(0))
+    obuf.ObjectBufferWriteU32LE(out, uint64(0))
+
+    let segmentCommand = uint64(MachOLoadCommandSegment64)
+    let segmentCommandSize = uint64(segmentSize)
+    obuf.ObjectBufferWriteU32LE(out, segmentCommand)
+    obuf.ObjectBufferWriteU32LE(out, segmentCommandSize)
+    MachOWritePaddedAscii(out, "", 16)
+    obuf.ObjectBufferWriteU64LE(out, uint64(0))
+    obuf.ObjectBufferWriteU64LE(out, uint64(textSize))
+    obuf.ObjectBufferWriteU64LE(out, uint64(textOffset))
+    obuf.ObjectBufferWriteU64LE(out, uint64(textSize))
+    obuf.ObjectBufferWriteU32LE(out, uint64(7))
+    obuf.ObjectBufferWriteU32LE(out, uint64(7))
+    obuf.ObjectBufferWriteU32LE(out, uint64(1))
+    obuf.ObjectBufferWriteU32LE(out, uint64(0))
+    MachOWriteTextSectionCommand(out, textOffset, textSize, relocOffset, relocCount)
+
+    let symtabCommand = uint64(MachOLoadCommandSymtab)
+    let symtabCommandSize = uint64(MachOSymtabCommandSize)
+    obuf.ObjectBufferWriteU32LE(out, symtabCommand)
+    obuf.ObjectBufferWriteU32LE(out, symtabCommandSize)
+    obuf.ObjectBufferWriteU32LE(out, uint64(symoff))
+    obuf.ObjectBufferWriteU32LE(out, uint64(symbolCount))
+    obuf.ObjectBufferWriteU32LE(out, uint64(stroff))
+    obuf.ObjectBufferWriteU32LE(out, uint64(strsize))
+
+    obuf.ObjectBufferWriteBytes(out, text)
+    obuf.ObjectBufferAlign(out, 8, 0)
+    for i in 0..<relocCount:
+        let relocRes = MachOWriteRelocation(out, orel.ObjectRelocsAt(relocs, i), symbolCount)
+        if IsErr(relocRes):
+            return Err[rawbytes.Bytes](Error(relocRes))
+    obuf.ObjectBufferAlign(out, 8, 0)
+    for i in 0..<symbolCount:
+        MachOWriteNlist64(out, strOffsets[i], osym.ObjectSymbolsAt(symbols, i))
+    obuf.ObjectBufferWriteBytes(out, obuf.ObjectBufferToBytes(strtab))
+    return Ok[rawbytes.Bytes](obuf.ObjectBufferToBytes(out))
+
+fn MachOTextObjectWrite(rootDir: str,
+                         outputPath: str,
+                         text: rawbytes.Bytes,
+                         symbols: osym.ObjectSymbolTable,
+                         relocs: orel.ObjectRelocTable): Result[MachOObjectWriterResult] =
+    let bytesRes = MachOTextObjectBytes(text, symbols, relocs)
+    if IsErr(bytesRes):
+        return Err[MachOObjectWriterResult](Error(bytesRes))
+    let bytes = Value(bytesRes)
+    let payload = rawbytes.bytesToString(bytes)
+    if !chengpath.WriteTextFile(rootDir, outputPath, payload):
+        return Err[MachOObjectWriterResult](Fmt([" macho object writer: failed to write object: ", outputPath]))
+    var out: MachOObjectWriterResult
+    out.objectPath = outputPath
+    out.bytesWritten = rawbytes.bytesLen(bytes)
+    out.symbolCount = osym.ObjectSymbolsCount(symbols)
+    out.relocCount = orel.ObjectRelocsCount(relocs)
+    return Ok[MachOObjectWriterResult](out)

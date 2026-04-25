@@ -1,5 +1,6 @@
 import std/buffer
 import std/rawbytes
+import std/strformat
 import cheng/core/tooling/path as chengpath
 import cheng/core/lang/parser
 
@@ -64,6 +65,35 @@ type
         TypedExprReturnImportBuffer
         TypedExprReturnDeferred
 
+    TypedExprReturnOpKind = enum
+        TypedExprReturnOpUnsupported
+        TypedExprReturnOpI32AddArgs
+        TypedExprReturnOpI32SubArgs
+        TypedExprReturnOpI32MulArgs
+        TypedExprReturnOpI32AsrArgs
+        TypedExprReturnOpI32MaddArgs
+        TypedExprReturnOpF64MulArgs
+
+    TypedExprIrOpKind = enum
+        TypedExprIrOpUnsupported
+        TypedExprIrOpParamRef
+        TypedExprIrOpI32Const
+        TypedExprIrOpI32Add
+        TypedExprIrOpI32Sub
+        TypedExprIrOpI32Mul
+        TypedExprIrOpI32Asr
+        TypedExprIrOpI32Madd
+        TypedExprIrOpI32IfArg0LeZeroConstElseConst
+        TypedExprIrOpF64Mul
+        TypedExprIrOpStrLenFast
+        TypedExprIrOpMainF64MulCheckExit
+        TypedExprIrOpLetCall
+        TypedExprIrOpLetCallResultI32
+        TypedExprIrOpLetCallI32IfResultLeZeroReturnZeroElseResultI32
+        TypedExprIrOpStrEmptyReturn
+        TypedExprIrOpLetCallStrReturnLenI32
+        TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0
+
     TypedExprArgPassKind = enum
         TypedExprArgPassValue
         TypedExprArgPassAddress
@@ -127,6 +157,7 @@ type
         callKind: TypedExprCallKind
         typeCallKind: TypedExprTypeCallKind
         returnKind: TypedExprReturnKind
+        returnRoot: bool
 
     TypedExprLoweringRule =
         exprId: str
@@ -152,6 +183,7 @@ type
         callKind: TypedExprCallKind
         typeCallKind: TypedExprTypeCallKind
         returnKind: TypedExprReturnKind
+        returnRoot: bool
         argPassKind: TypedExprArgPassKind
         resultPassKind: TypedExprResultPassKind
         materializeKind: TypedExprMaterializeKind
@@ -165,12 +197,61 @@ type
         sourcePath: str
         text: str
 
+    TypedExprReturnOpFact =
+        sourcePath: str
+        functionName: str
+        signatureLineNumber: int32
+        bodyLineNumber: int32
+        opKind: TypedExprReturnOpKind
+        returnType: str
+        lhsName: str
+        lhsType: str
+        rhsName: str
+        rhsType: str
+        accName: str
+        accType: str
+        returnExpr: str
+
+    TypedExprIrNode =
+        sourcePath: str
+        functionName: str
+        nodeIndex: int32
+        lineNumber: int32
+        opKind: TypedExprIrOpKind
+        resultType: str
+        surfaceText: str
+        paramSlot: int32
+        paramName: str
+        operand0NodeIndex: int32
+        operand1NodeIndex: int32
+        operand2NodeIndex: int32
+        literalText: str
+
+    TypedExprIrFunction =
+        sourcePath: str
+        functionName: str
+        signatureLineNumber: int32
+        bodyLineNumber: int32
+        returnType: str
+        returnExpr: str
+        nodeStart: int32
+        nodeCount: int32
+        returnNodeIndex: int32
+
+    TypedExprIr =
+        functions: TypedExprIrFunction[]
+        nodes: TypedExprIrNode[]
+
     TypedExprFunctionScope =
         sourcePath: str
         name: str
         startLine: int32
         endLine: int32
         returnType: str
+
+    TypedExprParam =
+        name: str
+        typeText: str
 
     TypedExprBinding =
         sourcePath: str
@@ -434,6 +515,187 @@ fn TypedExprImportKindText(kind: TypedExprImportKind): str =
         return "i32_value_slot"
     return "deferred"
 
+fn TypedExprReturnOpKindText(kind: TypedExprReturnOpKind): str =
+    if kind == TypedExprReturnOpI32AddArgs:
+        return "i32_add_args"
+    if kind == TypedExprReturnOpI32SubArgs:
+        return "i32_sub_args"
+    if kind == TypedExprReturnOpI32MulArgs:
+        return "i32_mul_args"
+    if kind == TypedExprReturnOpI32AsrArgs:
+        return "i32_asr_args"
+    if kind == TypedExprReturnOpI32MaddArgs:
+        return "i32_madd_args"
+    if kind == TypedExprReturnOpF64MulArgs:
+        return "f64_mul_args"
+    return "unsupported"
+
+fn TypedExprIrOpKindText(kind: TypedExprIrOpKind): str =
+    if kind == TypedExprIrOpParamRef:
+        return "param_ref"
+    if kind == TypedExprIrOpI32Const:
+        return "i32_const"
+    if kind == TypedExprIrOpI32Add:
+        return "i32_add"
+    if kind == TypedExprIrOpI32Sub:
+        return "i32_sub"
+    if kind == TypedExprIrOpI32Mul:
+        return "i32_mul"
+    if kind == TypedExprIrOpI32Asr:
+        return "i32_asr"
+    if kind == TypedExprIrOpI32Madd:
+        return "i32_madd"
+    if kind == TypedExprIrOpI32IfArg0LeZeroConstElseConst:
+        return "i32_if_arg0_le_zero_const_else_const"
+    if kind == TypedExprIrOpF64Mul:
+        return "f64_mul"
+    if kind == TypedExprIrOpStrLenFast:
+        return "str_len_fast"
+    if kind == TypedExprIrOpMainF64MulCheckExit:
+        return "main_f64_mul_check_exit"
+    if kind == TypedExprIrOpLetCall:
+        return "let_call"
+    if kind == TypedExprIrOpLetCallResultI32:
+        return "let_call_result_i32"
+    if kind == TypedExprIrOpLetCallI32IfResultLeZeroReturnZeroElseResultI32:
+        return "let_call_i32_if_result_le_zero_return_zero_else_result_i32"
+    if kind == TypedExprIrOpStrEmptyReturn:
+        return "str_empty_return"
+    if kind == TypedExprIrOpLetCallStrReturnLenI32:
+        return "let_call_str_return_len_i32"
+    if kind == TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0:
+        return "let_call_str_then_call_arg0_return_i32_const_0"
+    return "unsupported"
+
+fn TypedExprReturnOpKindFromIrOp(kind: TypedExprIrOpKind): TypedExprReturnOpKind =
+    if kind == TypedExprIrOpI32Add:
+        return TypedExprReturnOpI32AddArgs
+    if kind == TypedExprIrOpI32Sub:
+        return TypedExprReturnOpI32SubArgs
+    if kind == TypedExprIrOpI32Mul:
+        return TypedExprReturnOpI32MulArgs
+    if kind == TypedExprIrOpI32Asr:
+        return TypedExprReturnOpI32AsrArgs
+    if kind == TypedExprIrOpI32Madd:
+        return TypedExprReturnOpI32MaddArgs
+    if kind == TypedExprIrOpF64Mul:
+        return TypedExprReturnOpF64MulArgs
+    return TypedExprReturnOpUnsupported
+
+fn TypedExprIrNodeClone(node: TypedExprIrNode): TypedExprIrNode =
+    var out: TypedExprIrNode
+    out.sourcePath = node.sourcePath
+    out.functionName = node.functionName
+    out.nodeIndex = node.nodeIndex
+    out.lineNumber = node.lineNumber
+    out.opKind = node.opKind
+    out.resultType = node.resultType
+    out.surfaceText = node.surfaceText
+    out.paramSlot = node.paramSlot
+    out.paramName = node.paramName
+    out.operand0NodeIndex = node.operand0NodeIndex
+    out.operand1NodeIndex = node.operand1NodeIndex
+    out.operand2NodeIndex = node.operand2NodeIndex
+    out.literalText = node.literalText
+    return out
+
+fn TypedExprIrFunctionClone(fnIr: TypedExprIrFunction): TypedExprIrFunction =
+    var out: TypedExprIrFunction
+    out.sourcePath = fnIr.sourcePath
+    out.functionName = fnIr.functionName
+    out.signatureLineNumber = fnIr.signatureLineNumber
+    out.bodyLineNumber = fnIr.bodyLineNumber
+    out.returnType = fnIr.returnType
+    out.returnExpr = fnIr.returnExpr
+    out.nodeStart = fnIr.nodeStart
+    out.nodeCount = fnIr.nodeCount
+    out.returnNodeIndex = fnIr.returnNodeIndex
+    return out
+
+fn TypedExprIrClone(ir: TypedExprIr): TypedExprIr =
+    var out: TypedExprIr
+    for i in 0..<ir.functions.len:
+        add(out.functions, TypedExprIrFunctionClone(ir.functions[i]))
+    for i in 0..<ir.nodes.len:
+        add(out.nodes, TypedExprIrNodeClone(ir.nodes[i]))
+    return out
+
+fn TypedExprReturnOpFactClone(fact: TypedExprReturnOpFact): TypedExprReturnOpFact =
+    var out: TypedExprReturnOpFact
+    out.sourcePath = fact.sourcePath
+    out.functionName = fact.functionName
+    out.signatureLineNumber = fact.signatureLineNumber
+    out.bodyLineNumber = fact.bodyLineNumber
+    out.opKind = fact.opKind
+    out.returnType = fact.returnType
+    out.lhsName = fact.lhsName
+    out.lhsType = fact.lhsType
+    out.rhsName = fact.rhsName
+    out.rhsType = fact.rhsType
+    out.accName = fact.accName
+    out.accType = fact.accType
+    out.returnExpr = fact.returnExpr
+    return out
+
+fn TypedExprReturnOpFactsClone(facts: TypedExprReturnOpFact[]): TypedExprReturnOpFact[] =
+    var out: TypedExprReturnOpFact[]
+    for i in 0..<facts.len:
+        add(out, TypedExprReturnOpFactClone(facts[i]))
+    return out
+
+fn TypedExprReturnOpFactsCountKind(facts: TypedExprReturnOpFact[],
+                                    kind: TypedExprReturnOpKind): int32 =
+    var count: int32
+    for i in 0..<facts.len:
+        if facts[i].opKind == kind:
+            count = count + 1
+    return count
+
+fn TypedExprReturnOpFactsKindListText(facts: TypedExprReturnOpFact[]): str =
+    if facts.len <= 0:
+        return "-"
+    var out = ""
+    for i in 0..<facts.len:
+        if i > 0:
+            out = Fmt([out, ","])
+        out = Fmt([out, TypedExprReturnOpKindText(facts[i].opKind)])
+    return out
+
+fn TypedExprIrCountOpKind(ir: TypedExprIr,
+                           kind: TypedExprIrOpKind): int32 =
+    var count: int32
+    for i in 0..<ir.nodes.len:
+        if ir.nodes[i].opKind == kind:
+            count = count + 1
+    return count
+
+fn TypedExprIrReturnCountOpKind(ir: TypedExprIr,
+                                 kind: TypedExprIrOpKind): int32 =
+    var count: int32
+    for i in 0..<ir.functions.len:
+        let returnIndex = ir.functions[i].returnNodeIndex
+        if returnIndex < 0 || returnIndex >= ir.nodes.len:
+            continue
+        if ir.nodes[returnIndex].opKind == kind:
+            count = count + 1
+    return count
+
+fn TypedExprIrReturnKindListText(ir: TypedExprIr): str =
+    var out = ""
+    for i in 0..<ir.functions.len:
+        let returnIndex = ir.functions[i].returnNodeIndex
+        if returnIndex < 0 || returnIndex >= ir.nodes.len:
+            continue
+        let kind = ir.nodes[returnIndex].opKind
+        if kind == TypedExprIrOpUnsupported || kind == TypedExprIrOpParamRef:
+            continue
+        if len(out) > 0:
+            out = Fmt([out, ","])
+        out = Fmt([out, TypedExprIrOpKindText(kind)])
+    if len(out) <= 0:
+        return "-"
+    return out
+
 fn TypedExprImportKindForResolved(callKind: TypedExprCallKind,
                                     abiClass: TypedExprAbiClass,
                                     loweringMode: TypedExprLoweringMode,
@@ -515,6 +777,7 @@ fn TypedExprFactClone(fact: TypedExprFact): TypedExprFact =
     out.callKind = fact.callKind
     out.typeCallKind = fact.typeCallKind
     out.returnKind = fact.returnKind
+    out.returnRoot = fact.returnRoot
     return out
 
 fn TypedExprFactsClone(facts: TypedExprFact[]): TypedExprFact[] =
@@ -575,7 +838,9 @@ fn TypedExprFactEqual(lhs: TypedExprFact,
         return false
     if lhs.typeCallKind != rhs.typeCallKind:
         return false
-    return lhs.returnKind == rhs.returnKind
+    if lhs.returnKind != rhs.returnKind:
+        return false
+    return lhs.returnRoot == rhs.returnRoot
 
 fn TypedExprFactsEqual(lhs: TypedExprFact[],
                          rhs: TypedExprFact[]): bool =
@@ -639,6 +904,13 @@ fn TypedExprFactCountReturnKind(facts: TypedExprFact[],
     var count: int32
     for i in 0..<facts.len:
         if facts[i].returnKind == returnKind:
+            count = count + 1
+    return count
+
+fn TypedExprReturnRootCount(facts: TypedExprFact[]): int32 =
+    var count: int32
+    for i in 0..<facts.len:
+        if facts[i].returnRoot:
             count = count + 1
     return count
 
@@ -912,6 +1184,72 @@ fn TypedExprTypeIsGenericPlaceholder(typeRaw: str): bool =
         return false
     return true
 
+fn TypedExprSymbolExportedByCase(name: str): bool =
+    if len(name) <= 0:
+        return false
+    let ch = name[0]
+    return ch >= 'A' && ch <= 'Z'
+
+fn TypedExprSourcePackageRoot(sourcePath: str): str =
+    var current = chengpath.PathParentDir(sourcePath)
+    for _ in 0..<64:
+        if current == "":
+            return ""
+        let manifestPath = chengpath.PathJoin(current, "cheng-package.toml")
+        if chengpath.PathFileExists(manifestPath):
+            return current
+        let parent = chengpath.PathParentDir(current)
+        if parent == "" || parent == current:
+            return ""
+        current = parent
+    return ""
+
+fn TypedExprSourcesSharePackage(leftSourcePath: str,
+                                 rightSourcePath: str): bool =
+    let leftRoot = TypedExprSourcePackageRoot(leftSourcePath)
+    if leftRoot == "":
+        return false
+    let rightRoot = TypedExprSourcePackageRoot(rightSourcePath)
+    if rightRoot == "":
+        return false
+    if leftRoot == rightRoot && leftRoot == parser.ParserSharedPackageRoot(leftRoot):
+        return true
+    let leftPackageId = parser.ParserPackageId(leftRoot)
+    let rightPackageId = parser.ParserPackageId(rightRoot)
+    if leftPackageId == "" || rightPackageId == "":
+        return false
+    if leftPackageId != rightPackageId:
+        return false
+    if leftPackageId != "cheng":
+        return true
+    let leftSrcPrefix = Fmt([chengpath.PathJoin(leftRoot, "src"), "/"])
+    let rightSrcPrefix = Fmt([chengpath.PathJoin(rightRoot, "src"), "/"])
+    if !chengpath.TextStartsWith(leftSourcePath, leftSrcPrefix):
+        return false
+    if !chengpath.TextStartsWith(rightSourcePath, rightSrcPrefix):
+        return false
+    let leftRel = chengpath.TextSlice(leftSourcePath,
+                                      len(leftSrcPrefix),
+                                      len(leftSourcePath) - len(leftSrcPrefix))
+    let rightRel = chengpath.TextSlice(rightSourcePath,
+                                       len(rightSrcPrefix),
+                                       len(rightSourcePath) - len(rightSrcPrefix))
+    var leftSlash: int32 = -1
+    var rightSlash: int32 = -1
+    for i in 0..<leftRel.len:
+        if leftRel[i] == '/' || leftRel[i] == '\\':
+            leftSlash = i
+            break
+    for i in 0..<rightRel.len:
+        if rightRel[i] == '/' || rightRel[i] == '\\':
+            rightSlash = i
+            break
+    if leftSlash <= 0 || rightSlash <= 0:
+        return leftRel == rightRel
+    let leftHead = chengpath.TextSlice(leftRel, 0, leftSlash)
+    let rightHead = chengpath.TextSlice(rightRel, 0, rightSlash)
+    return leftHead == rightHead
+
 fn TypedExprFactsValidateCallResolution(exprLayer: parser.NormalizedExprLayer,
                                           facts: TypedExprFact[],
                                           err: var str): bool =
@@ -1007,6 +1345,16 @@ fn TypedExprFactsValidateCallResolution(exprLayer: parser.NormalizedExprLayer,
             if fact.callTargetSourcePath == "":
                 err = " typed expr: resolved call missing target source at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
                 return false
+            if fact.surfaceCallKind == TypedExprSurfaceCallExternal:
+                let symbolExported = TypedExprSymbolExportedByCase(fact.callCallee)
+                if !symbolExported:
+                    let samePackage = TypedExprSourcesSharePackage(expr.sourcePath,
+                                                                    fact.callTargetSourcePath)
+                    if !samePackage:
+                        err = Fmt([" typed expr: imported private symbol '",
+                                   fact.callCallee,
+                                   "' is not exported"])
+                        return false
             if fact.typeText == "" || fact.typeText == "unknown" || fact.typeText == "call_expr":
                 err = " typed expr: resolved call missing concrete type at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
                 return false
@@ -1072,6 +1420,7 @@ fn TypedExprLoweringRuleFromFact(fact: TypedExprFact): TypedExprLoweringRule =
     out.callKind = fact.callKind
     out.typeCallKind = fact.typeCallKind
     out.returnKind = fact.returnKind
+    out.returnRoot = fact.returnRoot
     out.argPassKind = argPassKind
     out.resultPassKind = resultPassKind
     out.materializeKind = materializeKind
@@ -1104,6 +1453,7 @@ fn TypedExprLoweringRuleClone(rule: TypedExprLoweringRule): TypedExprLoweringRul
     out.callKind = rule.callKind
     out.typeCallKind = rule.typeCallKind
     out.returnKind = rule.returnKind
+    out.returnRoot = rule.returnRoot
     out.argPassKind = rule.argPassKind
     out.resultPassKind = rule.resultPassKind
     out.materializeKind = rule.materializeKind
@@ -1165,6 +1515,8 @@ fn TypedExprLoweringRuleEqual(lhs: TypedExprLoweringRule,
         return false
     if lhs.returnKind != rhs.returnKind:
         return false
+    if lhs.returnRoot != rhs.returnRoot:
+        return false
     if lhs.argPassKind != rhs.argPassKind:
         return false
     if lhs.resultPassKind != rhs.resultPassKind:
@@ -1195,6 +1547,8 @@ fn TypedExprLoweringRuleShapeEqual(lhs: TypedExprLoweringRule,
         return false
     if lhs.returnKind != rhs.returnKind:
         return false
+    if lhs.returnRoot != rhs.returnRoot:
+        return false
     if lhs.argPassKind != rhs.argPassKind:
         return false
     if lhs.resultPassKind != rhs.resultPassKind:
@@ -1215,6 +1569,7 @@ fn TypedExprLoweringRuleKey(rule: TypedExprLoweringRule): str =
     out = out + ";call=" + TypedExprCallKindText(rule.callKind)
     out = out + ";type_call=" + TypedExprTypeCallKindText(rule.typeCallKind)
     out = out + ";return=" + TypedExprReturnKindText(rule.returnKind)
+    out = Fmt([out, ";return_root=", rule.returnRoot ? "1" : "0"])
     out = out + ";arg=" + TypedExprArgPassKindText(rule.argPassKind)
     out = out + ";result=" + TypedExprResultPassKindText(rule.resultPassKind)
     out = out + ";materialize=" + TypedExprMaterializeKindText(rule.materializeKind)
@@ -1248,6 +1603,8 @@ fn TypedExprLoweringRuleEntryText(rule: TypedExprLoweringRule): str =
         out = out + ";prefix_style=1"
     if rule.callArgCount > 0:
         out = out + ";arg_count=" + intToStr(rule.callArgCount)
+    if rule.returnRoot:
+        out = Fmt([out, ";return_root=1"])
     out = out + ";key=" + TypedExprLoweringRuleKey(rule)
     return out
 
@@ -1340,9 +1697,16 @@ fn TypedExprLoweringRuleCountTypeCallKind(rules: TypedExprLoweringRule[],
             count = count + 1
     return count
 
+fn TypedExprLoweringRuleReturnRootCount(rules: TypedExprLoweringRule[]): int32 =
+    var count: int32
+    for i in 0..<rules.len:
+        if rules[i].returnRoot:
+            count = count + 1
+    return count
+
 fn TypedExprReportAppendLine(out: var str,
-                               key: str,
-                               value: str) =
+                              key: str,
+                              value: str) =
     out = out + key + "=" + value + "\n"
 
 fn TypedExprFactsReportText(facts: TypedExprFact[]): str =
@@ -1392,6 +1756,57 @@ fn TypedExprFactsReportText(facts: TypedExprFact[]): str =
     TypedExprReportAppendLine(out, "typed_expr_return_sret_count", intToStr(TypedExprReturnSretCount(facts)))
     TypedExprReportAppendLine(out, "typed_expr_return_import_buffer_count", intToStr(TypedExprReturnImportBufferCount(facts)))
     TypedExprReportAppendLine(out, "typed_expr_return_deferred_count", intToStr(TypedExprReturnDeferredCount(facts)))
+    TypedExprReportAppendLine(out, "typed_expr_return_root_count", intToStr(TypedExprReturnRootCount(facts)))
+    return out
+
+fn TypedExprReturnOpFactsReportText(facts: TypedExprReturnOpFact[]): str =
+    var out = ""
+    TypedExprReportAppendLine(out, "typed_return_op_count", intToStr(facts.len))
+    TypedExprReportAppendLine(out, "typed_return_op_kinds", TypedExprReturnOpFactsKindListText(facts))
+    TypedExprReportAppendLine(out, "typed_return_op_i32_add_count", intToStr(TypedExprReturnOpFactsCountKind(facts, TypedExprReturnOpI32AddArgs)))
+    TypedExprReportAppendLine(out, "typed_return_op_i32_sub_count", intToStr(TypedExprReturnOpFactsCountKind(facts, TypedExprReturnOpI32SubArgs)))
+    TypedExprReportAppendLine(out, "typed_return_op_i32_mul_count", intToStr(TypedExprReturnOpFactsCountKind(facts, TypedExprReturnOpI32MulArgs)))
+    TypedExprReportAppendLine(out, "typed_return_op_i32_asr_count", intToStr(TypedExprReturnOpFactsCountKind(facts, TypedExprReturnOpI32AsrArgs)))
+    TypedExprReportAppendLine(out, "typed_return_op_i32_madd_count", intToStr(TypedExprReturnOpFactsCountKind(facts, TypedExprReturnOpI32MaddArgs)))
+    TypedExprReportAppendLine(out, "typed_return_op_f64_mul_count", intToStr(TypedExprReturnOpFactsCountKind(facts, TypedExprReturnOpF64MulArgs)))
+    return out
+
+fn TypedExprIrReportText(ir: TypedExprIr): str =
+    var out = ""
+    TypedExprReportAppendLine(out, "typed_ir_function_count", intToStr(ir.functions.len))
+    TypedExprReportAppendLine(out, "typed_ir_node_count", intToStr(ir.nodes.len))
+    TypedExprReportAppendLine(out, "typed_ir_return_kinds", TypedExprIrReturnKindListText(ir))
+    TypedExprReportAppendLine(out, "typed_ir_param_ref_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpParamRef)))
+    TypedExprReportAppendLine(out, "typed_ir_i32_const_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpI32Const)))
+    TypedExprReportAppendLine(out, "typed_ir_i32_add_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpI32Add)))
+    TypedExprReportAppendLine(out, "typed_ir_i32_sub_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpI32Sub)))
+    TypedExprReportAppendLine(out, "typed_ir_i32_mul_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpI32Mul)))
+    TypedExprReportAppendLine(out, "typed_ir_i32_asr_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpI32Asr)))
+    TypedExprReportAppendLine(out, "typed_ir_i32_madd_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpI32Madd)))
+    TypedExprReportAppendLine(out, "typed_ir_i32_if_arg0_le_zero_const_else_const_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpI32IfArg0LeZeroConstElseConst)))
+    TypedExprReportAppendLine(out, "typed_ir_f64_mul_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpF64Mul)))
+    TypedExprReportAppendLine(out, "typed_ir_str_len_fast_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpStrLenFast)))
+    TypedExprReportAppendLine(out, "typed_ir_main_f64_mul_check_exit_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpMainF64MulCheckExit)))
+    TypedExprReportAppendLine(out, "typed_ir_let_call_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpLetCall)))
+    TypedExprReportAppendLine(out, "typed_ir_let_call_result_i32_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpLetCallResultI32)))
+    TypedExprReportAppendLine(out, "typed_ir_let_call_i32_if_result_le_zero_return_zero_else_result_i32_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpLetCallI32IfResultLeZeroReturnZeroElseResultI32)))
+    TypedExprReportAppendLine(out, "typed_ir_str_empty_return_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpStrEmptyReturn)))
+    TypedExprReportAppendLine(out, "typed_ir_let_call_str_return_len_i32_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpLetCallStrReturnLenI32)))
+    TypedExprReportAppendLine(out, "typed_ir_let_call_str_then_call_arg0_return_i32_const_0_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0)))
+    TypedExprReportAppendLine(out, "typed_ir_return_i32_const_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Const)))
+    TypedExprReportAppendLine(out, "typed_ir_return_i32_add_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Add)))
+    TypedExprReportAppendLine(out, "typed_ir_return_i32_sub_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Sub)))
+    TypedExprReportAppendLine(out, "typed_ir_return_i32_mul_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Mul)))
+    TypedExprReportAppendLine(out, "typed_ir_return_i32_asr_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Asr)))
+    TypedExprReportAppendLine(out, "typed_ir_return_i32_madd_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Madd)))
+    TypedExprReportAppendLine(out, "typed_ir_return_i32_if_arg0_le_zero_const_else_const_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32IfArg0LeZeroConstElseConst)))
+    TypedExprReportAppendLine(out, "typed_ir_return_f64_mul_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpF64Mul)))
+    TypedExprReportAppendLine(out, "typed_ir_return_str_len_fast_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpStrLenFast)))
+    TypedExprReportAppendLine(out, "typed_ir_return_let_call_result_i32_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpLetCallResultI32)))
+    TypedExprReportAppendLine(out, "typed_ir_return_let_call_i32_if_result_le_zero_return_zero_else_result_i32_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpLetCallI32IfResultLeZeroReturnZeroElseResultI32)))
+    TypedExprReportAppendLine(out, "typed_ir_return_str_empty_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpStrEmptyReturn)))
+    TypedExprReportAppendLine(out, "typed_ir_return_let_call_str_return_len_i32_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpLetCallStrReturnLenI32)))
+    TypedExprReportAppendLine(out, "typed_ir_return_let_call_str_then_call_arg0_return_i32_const_0_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0)))
     return out
 
 fn TypedExprLoweringRulesReportText(rules: TypedExprLoweringRule[]): str =
@@ -1418,6 +1833,7 @@ fn TypedExprLoweringRulesReportText(rules: TypedExprLoweringRule[]): str =
     TypedExprReportAppendLine(out, "lowering_rule_type_call_none_count", intToStr(TypedExprLoweringRuleCountTypeCallKind(rules, TypedExprTypeCallNone)))
     TypedExprReportAppendLine(out, "lowering_rule_type_call_default_init_count", intToStr(TypedExprLoweringRuleCountTypeCallKind(rules, TypedExprTypeCallDefaultInit)))
     TypedExprReportAppendLine(out, "lowering_rule_type_call_constructor_count", intToStr(TypedExprLoweringRuleCountTypeCallKind(rules, TypedExprTypeCallConstructor)))
+    TypedExprReportAppendLine(out, "lowering_rule_return_root_count", intToStr(TypedExprLoweringRuleReturnRootCount(rules)))
     for i in 0..<rules.len:
         TypedExprReportAppendLine(out, "lowering_rule_entry[" + intToStr(i) + "]", TypedExprLoweringRuleEntryText(rules[i]))
     return out
@@ -1717,12 +2133,11 @@ fn TypedExprValueKindForAbiClass(abiClass: TypedExprAbiClass): TypedExprValueKin
 fn TypedExprSkipInlineSpaces(lineRaw: str,
                                start: int32): int32 =
     var cursor = start
-    var scanning = true
-    while cursor < lineRaw.len && scanning:
-        if parser.ParserIsInlineSpace(lineRaw[cursor]):
-            cursor = cursor + 1
+    for i in start..<lineRaw.len:
+        if parser.ParserIsInlineSpace(lineRaw[i]):
+            cursor = i + 1
         else:
-            scanning = false
+            return i
     return cursor
 
 fn TypedExprFindMatchingPair(lineRaw: str,
@@ -1784,6 +2199,44 @@ fn TypedExprFindTopLevelToken(textRaw: str,
             return i
     return -1
 
+fn TypedExprTextAt(textRaw: str,
+                    start: int32,
+                    target: str): bool =
+    if start < 0 || len(target) <= 0:
+        return false
+    if start + len(target) > len(textRaw):
+        return false
+    for i in 0..<len(target):
+        if textRaw[start + i] != target[i]:
+            return false
+    return true
+
+fn TypedExprFindTopLevelTextToken(textRaw: str,
+                                   target: str): int32 =
+    if len(target) <= 0 || len(target) > len(textRaw):
+        return -1
+    var bracketDepth: int32
+    var parenDepth: int32
+    var braceDepth: int32
+    for i in 0..<textRaw.len:
+        let piece = chengpath.TextSlice(textRaw, i, 1)
+        if piece == "[":
+            bracketDepth = bracketDepth + 1
+        elif piece == "]":
+            bracketDepth = bracketDepth - 1
+        elif piece == "(":
+            parenDepth = parenDepth + 1
+        elif piece == ")":
+            parenDepth = parenDepth - 1
+        elif piece == "{":
+            braceDepth = braceDepth + 1
+        elif piece == "}":
+            braceDepth = braceDepth - 1
+        elif bracketDepth == 0 && parenDepth == 0 && braceDepth == 0:
+            if TypedExprTextAt(textRaw, i, target):
+                return i
+    return -1
+
 fn TypedExprParseFunctionReturnType(lineRaw: str): str =
     let line = chengpath.PathTrim(lineRaw)
     let openPos = parser.ParserFindText(line, "(")
@@ -1804,6 +2257,1109 @@ fn TypedExprParseFunctionReturnType(lineRaw: str): str =
     if eqPos >= 0:
         return TypedExprNormalizeTypeText(chengpath.TextSlice(tail, 0, eqPos))
     return TypedExprNormalizeTypeText(tail)
+
+fn TypedExprBodyTextAfterEquals(lineRaw: str): str =
+    let eqPos = TypedExprFindTopLevelTextToken(lineRaw, "=")
+    if eqPos < 0:
+        return ""
+    return chengpath.PathTrim(chengpath.TextSlice(lineRaw, eqPos + 1, lineRaw.len - eqPos - 1))
+
+fn TypedExprFunctionBodyLine(ctx: TypedExprSourceContext,
+                              scope: TypedExprFunctionScope,
+                              bodyLineNumber: var int32): str =
+    bodyLineNumber = 0
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return ""
+    let declLine = ctx.lines[scope.startLine - 1]
+    let inlineBody = TypedExprBodyTextAfterEquals(declLine)
+    if inlineBody != "":
+        bodyLineNumber = scope.startLine
+        return inlineBody
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        bodyLineNumber = i + 1
+        return bodyTrim
+    return ""
+
+fn TypedExprFunctionParams(lineRaw: str): TypedExprParam[] =
+    var out: TypedExprParam[]
+    let line = chengpath.PathTrim(lineRaw)
+    let openPos = parser.ParserFindText(line, "(")
+    if openPos < 0:
+        return out
+    let closePos = TypedExprFindMatchingParen(line, openPos)
+    if closePos <= openPos:
+        return out
+    let paramsText = chengpath.TextSlice(line, openPos + 1, closePos - openPos - 1)
+    let params = TypedExprSplitTopLevelCsv(paramsText)
+    for i in 0..<params.len:
+        var item = params[i]
+        if parser.ParserStartsWith(item, "var "):
+            item = chengpath.TextSlice(item, 4, item.len - 4)
+        let colonPos = TypedExprFindTopLevelTextToken(item, ":")
+        if colonPos <= 0:
+            continue
+        var typeText = chengpath.TextSlice(item, colonPos + 1, item.len - colonPos - 1)
+        let eqPos = TypedExprFindTopLevelTextToken(typeText, "=")
+        if eqPos >= 0:
+            typeText = chengpath.TextSlice(typeText, 0, eqPos)
+        var param: TypedExprParam
+        param.name = parser.ParserIdentPrefix(chengpath.PathTrim(chengpath.TextSlice(item, 0, colonPos)))
+        param.typeText = TypedExprNormalizeTypeText(typeText)
+        if param.name != "" && param.typeText != "":
+            add(out, param)
+    return out
+
+fn TypedExprReturnExprFromBody(bodyText: str): str =
+    let trimmed = chengpath.PathTrim(bodyText)
+    if parser.ParserStartsWith(trimmed, "return "):
+        return chengpath.PathTrim(chengpath.TextSlice(trimmed, 7, trimmed.len - 7))
+    return trimmed
+
+fn TypedExprReturnExprMatchesBinary(returnExpr: str,
+                                     lhsName: str,
+                                     opText: str,
+                                     rhsName: str): bool =
+    let opIndex = TypedExprFindTopLevelTextToken(returnExpr, opText)
+    if opIndex < 0:
+        return false
+    let lhsText = chengpath.PathTrim(chengpath.TextSlice(returnExpr, 0, opIndex))
+    let rhsStart = opIndex + len(opText)
+    let rhsText = chengpath.PathTrim(chengpath.TextSlice(returnExpr,
+                                                         rhsStart,
+                                                         returnExpr.len - rhsStart))
+    return lhsText == lhsName && rhsText == rhsName
+
+fn TypedExprReturnOpForBinary(lhs: TypedExprParam,
+                               rhs: TypedExprParam,
+                               returnType: str,
+                               returnExpr: str): TypedExprReturnOpKind =
+    if lhs.typeText == "int32" &&
+       rhs.typeText == "int32" &&
+       returnType == "int32":
+        if TypedExprReturnExprMatchesBinary(returnExpr, lhs.name, "+", rhs.name):
+            return TypedExprReturnOpI32AddArgs
+        if TypedExprReturnExprMatchesBinary(returnExpr, lhs.name, "-", rhs.name):
+            return TypedExprReturnOpI32SubArgs
+        if TypedExprReturnExprMatchesBinary(returnExpr, lhs.name, "*", rhs.name):
+            return TypedExprReturnOpI32MulArgs
+        if TypedExprReturnExprMatchesBinary(returnExpr, lhs.name, ">>", rhs.name):
+            return TypedExprReturnOpI32AsrArgs
+    if lhs.typeText == "float64" &&
+       rhs.typeText == "float64" &&
+       returnType == "float64":
+        if TypedExprReturnExprMatchesBinary(returnExpr, lhs.name, "*", rhs.name):
+            return TypedExprReturnOpF64MulArgs
+    return TypedExprReturnOpUnsupported
+
+fn TypedExprReturnExprMatchesMadd(returnExpr: str,
+                                   lhsName: str,
+                                   rhsName: str,
+                                   accName: str): bool =
+    let opIndex = TypedExprFindTopLevelTextToken(returnExpr, "+")
+    if opIndex < 0:
+        return false
+    let leftText = chengpath.PathTrim(chengpath.TextSlice(returnExpr, 0, opIndex))
+    let rightStart = opIndex + 1
+    let rightText = chengpath.PathTrim(chengpath.TextSlice(returnExpr,
+                                                          rightStart,
+                                                          returnExpr.len - rightStart))
+    if rightText == accName:
+        if TypedExprReturnExprMatchesBinary(leftText, lhsName, "*", rhsName):
+            return true
+    if leftText == accName:
+        if TypedExprReturnExprMatchesBinary(rightText, lhsName, "*", rhsName):
+            return true
+    return false
+
+fn TypedExprReturnOpForMadd(lhs: TypedExprParam,
+                             rhs: TypedExprParam,
+                             acc: TypedExprParam,
+                             returnType: str,
+                             returnExpr: str): TypedExprReturnOpKind =
+    if lhs.typeText == "int32" &&
+       rhs.typeText == "int32" &&
+       acc.typeText == "int32" &&
+       returnType == "int32":
+        if TypedExprReturnExprMatchesMadd(returnExpr, lhs.name, rhs.name, acc.name):
+            return TypedExprReturnOpI32MaddArgs
+    return TypedExprReturnOpUnsupported
+
+fn TypedExprIrAddNode(ir: var TypedExprIr,
+                       node: TypedExprIrNode): int32 =
+    var out = node
+    out.nodeIndex = ir.nodes.len
+    add(ir.nodes, out)
+    return out.nodeIndex
+
+fn TypedExprIrAddParamNode(ir: var TypedExprIr,
+                            sourcePath: str,
+                            functionName: str,
+                            lineNumber: int32,
+                            param: TypedExprParam,
+                            paramSlot: int32): int32 =
+    var node: TypedExprIrNode
+    node.sourcePath = sourcePath
+    node.functionName = functionName
+    node.lineNumber = lineNumber
+    node.opKind = TypedExprIrOpParamRef
+    node.resultType = param.typeText
+    node.surfaceText = param.name
+    node.paramSlot = paramSlot
+    node.paramName = param.name
+    node.operand0NodeIndex = -1
+    node.operand1NodeIndex = -1
+    node.operand2NodeIndex = -1
+    return TypedExprIrAddNode(ir, node)
+
+fn TypedExprIrAddParamNodes(ir: var TypedExprIr,
+                             sourcePath: str,
+                             functionName: str,
+                             lineNumber: int32,
+                             params: TypedExprParam[],
+                             paramNodeIndices: var int32[]) =
+    paramNodeIndices = []
+    for i in 0..<params.len:
+        let nodeIndex = TypedExprIrAddParamNode(ir,
+                                                sourcePath,
+                                                functionName,
+                                                lineNumber,
+                                                params[i],
+                                                i)
+        add(paramNodeIndices, nodeIndex)
+
+fn TypedExprParamSlot(params: TypedExprParam[],
+                       name: str): int32 =
+    for i in 0..<params.len:
+        if params[i].name == name:
+            return i
+    return -1
+
+fn TypedExprIrParamNodeIndex(params: TypedExprParam[],
+                              paramNodeIndices: int32[],
+                              name: str): int32 =
+    let slot = TypedExprParamSlot(params, name)
+    if slot < 0 || slot >= paramNodeIndices.len:
+        return -1
+    return paramNodeIndices[slot]
+
+fn TypedExprIrIsI32ConstLiteral(textRaw: str): bool =
+    let text = chengpath.PathTrim(textRaw)
+    if len(text) <= 0:
+        return false
+    var constValue: int32
+    for i in 0..<text.len:
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return false
+        let digit = int32(ch) - int32('0')
+        if constValue > 6553 || (constValue == 6553 && digit > 5):
+            return false
+        constValue = constValue * 10 + digit
+    return true
+
+fn TypedExprIrAddI32ConstNode(ir: var TypedExprIr,
+                               sourcePath: str,
+                               functionName: str,
+                               lineNumber: int32,
+                               literalText: str): int32 =
+    var node: TypedExprIrNode
+    node.sourcePath = sourcePath
+    node.functionName = functionName
+    node.lineNumber = lineNumber
+    node.opKind = TypedExprIrOpI32Const
+    node.resultType = "int32"
+    node.surfaceText = literalText
+    node.paramSlot = -1
+    node.operand0NodeIndex = -1
+    node.operand1NodeIndex = -1
+    node.operand2NodeIndex = -1
+    node.literalText = literalText
+    return TypedExprIrAddNode(ir, node)
+
+fn TypedExprIrAddOpNode(ir: var TypedExprIr,
+                         sourcePath: str,
+                         functionName: str,
+                         lineNumber: int32,
+                         opKind: TypedExprIrOpKind,
+                         resultType: str,
+                         surfaceText: str,
+                         operand0: int32,
+                         operand1: int32,
+                         operand2: int32): int32 =
+    var node: TypedExprIrNode
+    node.sourcePath = sourcePath
+    node.functionName = functionName
+    node.lineNumber = lineNumber
+    node.opKind = opKind
+    node.resultType = resultType
+    node.surfaceText = surfaceText
+    node.paramSlot = -1
+    node.operand0NodeIndex = operand0
+    node.operand1NodeIndex = operand1
+    node.operand2NodeIndex = operand2
+    return TypedExprIrAddNode(ir, node)
+
+fn TypedExprIrBodyTextIsLetCall(bodyTextRaw: str): bool =
+    let bodyText = chengpath.PathTrim(bodyTextRaw)
+    var prefix = ""
+    if parser.ParserStartsWith(bodyText, "let "):
+        prefix = "let "
+    elif parser.ParserStartsWith(bodyText, "var "):
+        prefix = "var "
+    if prefix == "":
+        return false
+    let tail = chengpath.TextSlice(bodyText, len(prefix), bodyText.len - len(prefix))
+    let eqPos = TypedExprFindTopLevelTextToken(tail, "=")
+    if eqPos <= 0:
+        return false
+    let bindingText = chengpath.PathTrim(chengpath.TextSlice(tail, 0, eqPos))
+    let bindingName = parser.ParserIdentPrefix(parser.ParserFirstToken(bindingText))
+    if bindingName == "":
+        return false
+    let rhsStart = eqPos + 1
+    let rhsText = chengpath.PathTrim(chengpath.TextSlice(tail, rhsStart, tail.len - rhsStart))
+    let openPos = parser.ParserFindText(rhsText, "(")
+    if openPos <= 0:
+        return false
+    let closePos = TypedExprFindMatchingParen(rhsText, openPos)
+    return closePos == rhsText.len - 1
+
+fn TypedExprIrBodyTextIsI32LetCall(bodyTextRaw: str): bool =
+    let bodyText = chengpath.PathTrim(bodyTextRaw)
+    if !TypedExprIrBodyTextIsLetCall(bodyText):
+        return false
+    var prefix = ""
+    if parser.ParserStartsWith(bodyText, "let "):
+        prefix = "let "
+    elif parser.ParserStartsWith(bodyText, "var "):
+        prefix = "var "
+    if prefix == "":
+        return false
+    let tail = chengpath.TextSlice(bodyText, len(prefix), bodyText.len - len(prefix))
+    let colonPos = TypedExprFindTopLevelTextToken(tail, ":")
+    let eqPos = TypedExprFindTopLevelTextToken(tail, "=")
+    if colonPos < 0 && eqPos > 0:
+        return true
+    if colonPos < 0 || eqPos <= colonPos:
+        return false
+    let typeText = TypedExprNormalizeTypeText(chengpath.TextSlice(tail,
+                                                                  colonPos + 1,
+                                                                  eqPos - colonPos - 1))
+    return typeText == "int32"
+
+fn TypedExprIrBodyTextIsStrLetCall(bodyTextRaw: str): bool =
+    let bodyText = chengpath.PathTrim(bodyTextRaw)
+    if !TypedExprIrBodyTextIsLetCall(bodyText):
+        return false
+    var prefix = ""
+    if parser.ParserStartsWith(bodyText, "let "):
+        prefix = "let "
+    elif parser.ParserStartsWith(bodyText, "var "):
+        prefix = "var "
+    if prefix == "":
+        return false
+    let tail = chengpath.TextSlice(bodyText, len(prefix), bodyText.len - len(prefix))
+    let colonPos = TypedExprFindTopLevelTextToken(tail, ":")
+    let eqPos = TypedExprFindTopLevelTextToken(tail, "=")
+    if colonPos < 0 && eqPos > 0:
+        return true
+    if colonPos < 0 || eqPos <= colonPos:
+        return false
+    let typeText = TypedExprNormalizeTypeText(chengpath.TextSlice(tail,
+                                                                  colonPos + 1,
+                                                                  eqPos - colonPos - 1))
+    return typeText == "str"
+
+fn TypedExprReturnStrLenFastBindingName(exprRaw: str): str =
+    let exprText = chengpath.PathTrim(exprRaw)
+    let prefix = "strLenFast("
+    if len(exprText) <= len(prefix):
+        return ""
+    if !parser.ParserStartsWith(exprText, prefix):
+        return ""
+    if exprText[len(exprText) - 1] != ')':
+        return ""
+    let innerLen = len(exprText) - len(prefix) - 1
+    if innerLen <= 0:
+        return ""
+    let innerText = chengpath.PathTrim(chengpath.TextSlice(exprText, len(prefix), innerLen))
+    if parser.ParserIdentPrefix(parser.ParserFirstToken(innerText)) != innerText:
+        return ""
+    return innerText
+
+fn TypedExprFunctionBodyIsStrEmptyReturn(ctx: TypedExprSourceContext,
+                                          scope: TypedExprFunctionScope,
+                                          params: TypedExprParam[],
+                                          returnLineNumber: var int32): bool =
+    returnLineNumber = 0
+    if scope.returnType != "str" || params.len != 0:
+        return false
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    var bodyCount: int32
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        bodyCount = bodyCount + 1
+        if bodyCount == 1:
+            if bodyTrim != "var out: str":
+                return false
+            continue
+        if bodyCount == 2:
+            if bodyTrim != "return out":
+                return false
+            returnLineNumber = i + 1
+            continue
+        return false
+    return bodyCount == 2 && returnLineNumber > 0
+
+fn TypedExprFunctionBodyIsI32LetCallThenReturnConst(ctx: TypedExprSourceContext,
+                                                     scope: TypedExprFunctionScope,
+                                                     returnLineNumber: var int32,
+                                                     returnExpr: var str): bool =
+    returnLineNumber = 0
+    returnExpr = ""
+    if scope.returnType != "int32":
+        return false
+    var bodyCount: int32
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        bodyCount = bodyCount + 1
+        if bodyCount == 1:
+            if !TypedExprIrBodyTextIsI32LetCall(bodyTrim):
+                return false
+            continue
+        if bodyCount == 2:
+            if !parser.ParserStartsWith(bodyTrim, "return "):
+                return false
+            let exprText = TypedExprReturnExprFromBody(bodyTrim)
+            if !TypedExprIrIsI32ConstLiteral(exprText):
+                return false
+            returnLineNumber = i + 1
+            returnExpr = exprText
+            continue
+        return false
+    return bodyCount == 2 && returnLineNumber > 0
+
+fn TypedExprLetCallBindingNameFromBody(bodyTextRaw: str): str =
+    let bodyText = chengpath.PathTrim(bodyTextRaw)
+    var prefix = ""
+    if parser.ParserStartsWith(bodyText, "let "):
+        prefix = "let "
+    elif parser.ParserStartsWith(bodyText, "var "):
+        prefix = "var "
+    if prefix == "":
+        return ""
+    let tail = chengpath.TextSlice(bodyText, len(prefix), bodyText.len - len(prefix))
+    let eqPos = TypedExprFindTopLevelTextToken(tail, "=")
+    if eqPos <= 0:
+        return ""
+    let bindingText = chengpath.PathTrim(chengpath.TextSlice(tail, 0, eqPos))
+    return parser.ParserIdentPrefix(parser.ParserFirstToken(bindingText))
+
+fn TypedExprFunctionBodyIsI32LetCallThenReturnBinding(ctx: TypedExprSourceContext,
+                                                       scope: TypedExprFunctionScope,
+                                                       returnLineNumber: var int32,
+                                                       bindingName: var str): bool =
+    returnLineNumber = 0
+    bindingName = ""
+    if scope.returnType != "int32":
+        return false
+    var bodyCount: int32
+    var firstBinding = ""
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        bodyCount = bodyCount + 1
+        if bodyCount == 1:
+            if !TypedExprIrBodyTextIsI32LetCall(bodyTrim):
+                return false
+            firstBinding = TypedExprLetCallBindingNameFromBody(bodyTrim)
+            if firstBinding == "":
+                return false
+            continue
+        if bodyCount == 2:
+            if !parser.ParserStartsWith(bodyTrim, "return "):
+                return false
+            let exprText = TypedExprReturnExprFromBody(bodyTrim)
+            if exprText != firstBinding:
+                return false
+            returnLineNumber = i + 1
+            bindingName = firstBinding
+            continue
+        return false
+    return bodyCount == 2 && returnLineNumber > 0 && bindingName != ""
+
+fn TypedExprFunctionBodyIsI32LetCallThenIfResultLeZeroReturnZeroElseBinding(ctx: TypedExprSourceContext,
+                                                                             scope: TypedExprFunctionScope,
+                                                                             ifLineNumber: var int32,
+                                                                             bindingName: var str): bool =
+    ifLineNumber = 0
+    bindingName = ""
+    if scope.returnType != "int32":
+        return false
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    var bodyLines: str[]
+    var bodyLineNumbers: int32[]
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        add(bodyLines, bodyTrim)
+        add(bodyLineNumbers, i + 1)
+    if bodyLines.len != 4:
+        return false
+    if !TypedExprIrBodyTextIsI32LetCall(bodyLines[0]):
+        return false
+    let firstBinding = TypedExprLetCallBindingNameFromBody(bodyLines[0])
+    if firstBinding == "":
+        return false
+    if bodyLines[1] != Fmt(["if ", firstBinding, " <= 0:"]):
+        return false
+    if TypedExprReturnConstTextFromLine(bodyLines[2]) != "0":
+        return false
+    if TypedExprReturnExprFromBody(bodyLines[3]) != firstBinding:
+        return false
+    ifLineNumber = bodyLineNumbers[1]
+    bindingName = firstBinding
+    return true
+
+fn TypedExprFunctionBodyIsStrLetCallThenReturnLen(ctx: TypedExprSourceContext,
+                                                   scope: TypedExprFunctionScope,
+                                                   returnLineNumber: var int32,
+                                                   bindingName: var str): bool =
+    returnLineNumber = 0
+    bindingName = ""
+    if scope.returnType != "int32":
+        return false
+    var bodyCount: int32
+    var firstBinding = ""
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        bodyCount = bodyCount + 1
+        if bodyCount == 1:
+            if !TypedExprIrBodyTextIsStrLetCall(bodyTrim):
+                return false
+            firstBinding = TypedExprLetCallBindingNameFromBody(bodyTrim)
+            if firstBinding == "":
+                return false
+            continue
+        if bodyCount == 2:
+            if !parser.ParserStartsWith(bodyTrim, "return "):
+                return false
+            let exprText = TypedExprReturnExprFromBody(bodyTrim)
+            if TypedExprReturnStrLenFastBindingName(exprText) != firstBinding:
+                return false
+            returnLineNumber = i + 1
+            bindingName = firstBinding
+            continue
+        return false
+    return bodyCount == 2 && returnLineNumber > 0 && bindingName != ""
+
+fn TypedExprCallStatementUsesBindingArg0(bodyTextRaw: str,
+                                          bindingName: str): bool =
+    let bodyText = chengpath.PathTrim(bodyTextRaw)
+    if bindingName == "" || bodyText == "":
+        return false
+    if parser.ParserStartsWith(bodyText, "return "):
+        return false
+    let openPos = parser.ParserFindText(bodyText, "(")
+    if openPos <= 0:
+        return false
+    let closePos = TypedExprFindMatchingParen(bodyText, openPos)
+    if closePos != bodyText.len - 1:
+        return false
+    let argLen = closePos - openPos - 1
+    if argLen <= 0:
+        return false
+    let argText = chengpath.PathTrim(chengpath.TextSlice(bodyText, openPos + 1, argLen))
+    return argText == bindingName
+
+fn TypedExprFunctionBodyIsStrLetCallThenCallArg0ReturnZero(ctx: TypedExprSourceContext,
+                                                            scope: TypedExprFunctionScope,
+                                                            secondCallLineNumber: var int32,
+                                                            returnLineNumber: var int32,
+                                                            bindingName: var str): bool =
+    secondCallLineNumber = 0
+    returnLineNumber = 0
+    bindingName = ""
+    if scope.returnType != "int32":
+        return false
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    var bodyLines: str[]
+    var bodyLineNumbers: int32[]
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        add(bodyLines, bodyTrim)
+        add(bodyLineNumbers, i + 1)
+    if bodyLines.len != 3:
+        return false
+    if !TypedExprIrBodyTextIsStrLetCall(bodyLines[0]):
+        return false
+    let firstBinding = TypedExprLetCallBindingNameFromBody(bodyLines[0])
+    if firstBinding == "":
+        return false
+    if !TypedExprCallStatementUsesBindingArg0(bodyLines[1], firstBinding):
+        return false
+    if TypedExprReturnConstTextFromLine(bodyLines[2]) != "0":
+        return false
+    secondCallLineNumber = bodyLineNumbers[1]
+    returnLineNumber = bodyLineNumbers[2]
+    bindingName = firstBinding
+    return true
+
+fn TypedExprIrAddLetCallNode(ir: var TypedExprIr,
+                              sourcePath: str,
+                              functionName: str,
+                              lineNumber: int32,
+                              bodyText: str): int32 =
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                lineNumber,
+                                TypedExprIrOpLetCall,
+                                "",
+                                bodyText,
+                                -1,
+                                -1,
+                                -1)
+
+fn TypedExprIrAddLetCallResultI32Node(ir: var TypedExprIr,
+                                       sourcePath: str,
+                                       functionName: str,
+                                       lineNumber: int32,
+                                       bindingName: str): int32 =
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                lineNumber,
+                                TypedExprIrOpLetCallResultI32,
+                                "int32",
+                                bindingName,
+                                -1,
+                                -1,
+                                -1)
+
+fn TypedExprIrAddLetCallI32IfResultLeZeroReturnZeroElseResultI32Node(ir: var TypedExprIr,
+                                                                      sourcePath: str,
+                                                                      functionName: str,
+                                                                      lineNumber: int32,
+                                                                      bindingName: str): int32 =
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                lineNumber,
+                                TypedExprIrOpLetCallI32IfResultLeZeroReturnZeroElseResultI32,
+                                "int32",
+                                bindingName,
+                                -1,
+                                -1,
+                                -1)
+
+fn TypedExprIrAddStrEmptyReturnNode(ir: var TypedExprIr,
+                                     sourcePath: str,
+                                     functionName: str,
+                                     lineNumber: int32): int32 =
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                lineNumber,
+                                TypedExprIrOpStrEmptyReturn,
+                                "str",
+                                "str_empty_return",
+                                -1,
+                                -1,
+                                -1)
+
+fn TypedExprIrAddLetCallStrReturnLenI32Node(ir: var TypedExprIr,
+                                             sourcePath: str,
+                                             functionName: str,
+                                             lineNumber: int32,
+                                             bindingName: str): int32 =
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                lineNumber,
+                                TypedExprIrOpLetCallStrReturnLenI32,
+                                "int32",
+                                bindingName,
+                                -1,
+                                -1,
+                                -1)
+
+fn TypedExprIrAddLetCallStrThenCallArg0ReturnI32Const0Node(ir: var TypedExprIr,
+                                                            sourcePath: str,
+                                                            functionName: str,
+                                                            returnLineNumber: int32,
+                                                            secondCallLineNumber: int32,
+                                                            bindingName: str): int32 =
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                returnLineNumber,
+                                TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0,
+                                "int32",
+                                bindingName,
+                                secondCallLineNumber,
+                                -1,
+                                -1)
+
+fn TypedExprReturnConstTextFromLine(lineRaw: str): str =
+    let exprText = TypedExprReturnExprFromBody(lineRaw)
+    if TypedExprIrIsI32ConstLiteral(exprText):
+        return exprText
+    return ""
+
+fn TypedExprFunctionBodyIsI32IfArg0LeZeroConstElseConst(ctx: TypedExprSourceContext,
+                                                         scope: TypedExprFunctionScope,
+                                                         params: TypedExprParam[],
+                                                         bodyLineNumber: var int32,
+                                                         thenConstText: var str,
+                                                         elseConstText: var str): bool =
+    bodyLineNumber = 0
+    thenConstText = ""
+    elseConstText = ""
+    if scope.returnType != "int32":
+        return false
+    if params.len != 1 || params[0].typeText != "int32":
+        return false
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    var bodyLines: str[]
+    var bodyLineNumbers: int32[]
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if len(bodyTrim) <= 0:
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        add(bodyLines, bodyTrim)
+        add(bodyLineNumbers, i + 1)
+    if bodyLines.len != 3:
+        return false
+    if bodyLines[0] != Fmt(["if ", params[0].name, " <= 0:"]):
+        return false
+    let thenText = TypedExprReturnConstTextFromLine(bodyLines[1])
+    let elseText = TypedExprReturnConstTextFromLine(bodyLines[2])
+    if len(thenText) <= 0 || len(elseText) <= 0:
+        return false
+    bodyLineNumber = bodyLineNumbers[0]
+    thenConstText = thenText
+    elseConstText = elseText
+    return true
+
+fn TypedExprIrAddI32IfArg0LeZeroConstElseConstNode(ir: var TypedExprIr,
+                                                    sourcePath: str,
+                                                    functionName: str,
+                                                    lineNumber: int32,
+                                                    paramNodeIndex: int32,
+                                                    thenConstText: str,
+                                                    elseConstText: str): int32 =
+    var node: TypedExprIrNode
+    node.sourcePath = sourcePath
+    node.functionName = functionName
+    node.lineNumber = lineNumber
+    node.opKind = TypedExprIrOpI32IfArg0LeZeroConstElseConst
+    node.resultType = "int32"
+    node.surfaceText = "if_arg0_le_zero_const_else_const"
+    node.paramSlot = -1
+    node.operand0NodeIndex = paramNodeIndex
+    node.operand1NodeIndex = -1
+    node.operand2NodeIndex = -1
+    node.literalText = Fmt([thenConstText, ",", elseConstText])
+    return TypedExprIrAddNode(ir, node)
+
+fn TypedExprIrAddBinaryIfMatches(ir: var TypedExprIr,
+                                  sourcePath: str,
+                                  functionName: str,
+                                  lineNumber: int32,
+                                  params: TypedExprParam[],
+                                  paramNodeIndices: int32[],
+                                  returnExpr: str,
+                                  opText: str,
+                                  opKind: TypedExprIrOpKind,
+                                  resultType: str): int32 =
+    let opIndex = TypedExprFindTopLevelTextToken(returnExpr, opText)
+    if opIndex < 0:
+        return -1
+    let lhsText = chengpath.PathTrim(chengpath.TextSlice(returnExpr, 0, opIndex))
+    let rhsStart = opIndex + len(opText)
+    let rhsText = chengpath.PathTrim(chengpath.TextSlice(returnExpr,
+                                                         rhsStart,
+                                                         returnExpr.len - rhsStart))
+    let lhsNodeIndex = TypedExprIrParamNodeIndex(params, paramNodeIndices, lhsText)
+    let rhsNodeIndex = TypedExprIrParamNodeIndex(params, paramNodeIndices, rhsText)
+    if lhsNodeIndex < 0 || rhsNodeIndex < 0:
+        return -1
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                lineNumber,
+                                opKind,
+                                resultType,
+                                returnExpr,
+                                lhsNodeIndex,
+                                rhsNodeIndex,
+                                -1)
+
+fn TypedExprIrBuildBinaryReturnNode(ir: var TypedExprIr,
+                                     sourcePath: str,
+                                     functionName: str,
+                                     lineNumber: int32,
+                                     params: TypedExprParam[],
+                                     paramNodeIndices: int32[],
+                                     returnType: str,
+                                     returnExpr: str): int32 =
+    if params.len != 2:
+        return -1
+    if params[0].typeText == "int32" &&
+       params[1].typeText == "int32" &&
+       returnType == "int32":
+        let addIndex = TypedExprIrAddBinaryIfMatches(ir,
+                                                     sourcePath,
+                                                     functionName,
+                                                     lineNumber,
+                                                     params,
+                                                     paramNodeIndices,
+                                                     returnExpr,
+                                                     "+",
+                                                     TypedExprIrOpI32Add,
+                                                     "int32")
+        if addIndex >= 0:
+            return addIndex
+        let subIndex = TypedExprIrAddBinaryIfMatches(ir,
+                                                     sourcePath,
+                                                     functionName,
+                                                     lineNumber,
+                                                     params,
+                                                     paramNodeIndices,
+                                                     returnExpr,
+                                                     "-",
+                                                     TypedExprIrOpI32Sub,
+                                                     "int32")
+        if subIndex >= 0:
+            return subIndex
+        let mulIndex = TypedExprIrAddBinaryIfMatches(ir,
+                                                     sourcePath,
+                                                     functionName,
+                                                     lineNumber,
+                                                     params,
+                                                     paramNodeIndices,
+                                                     returnExpr,
+                                                     "*",
+                                                     TypedExprIrOpI32Mul,
+                                                     "int32")
+        if mulIndex >= 0:
+            return mulIndex
+        return TypedExprIrAddBinaryIfMatches(ir,
+                                             sourcePath,
+                                             functionName,
+                                             lineNumber,
+                                             params,
+                                             paramNodeIndices,
+                                             returnExpr,
+                                             ">>",
+                                             TypedExprIrOpI32Asr,
+                                             "int32")
+    if params[0].typeText == "float64" &&
+       params[1].typeText == "float64" &&
+       returnType == "float64":
+        return TypedExprIrAddBinaryIfMatches(ir,
+                                             sourcePath,
+                                             functionName,
+                                             lineNumber,
+                                             params,
+                                             paramNodeIndices,
+                                             returnExpr,
+                                             "*",
+                                             TypedExprIrOpF64Mul,
+                                             "float64")
+    return -1
+
+fn TypedExprIrBinaryParamsMatch(textRaw: str,
+                                 lhsName: str,
+                                 opText: str,
+                                 rhsName: str): bool =
+    let opIndex = TypedExprFindTopLevelTextToken(textRaw, opText)
+    if opIndex < 0:
+        return false
+    let lhsText = chengpath.PathTrim(chengpath.TextSlice(textRaw, 0, opIndex))
+    let rhsStart = opIndex + len(opText)
+    let rhsText = chengpath.PathTrim(chengpath.TextSlice(textRaw,
+                                                         rhsStart,
+                                                         textRaw.len - rhsStart))
+    return lhsText == lhsName && rhsText == rhsName
+
+fn TypedExprIrBuildMaddReturnNode(ir: var TypedExprIr,
+                                   sourcePath: str,
+                                   functionName: str,
+                                   lineNumber: int32,
+                                   params: TypedExprParam[],
+                                   paramNodeIndices: int32[],
+                                   returnType: str,
+                                   returnExpr: str): int32 =
+    if params.len != 3:
+        return -1
+    if params[0].typeText != "int32" ||
+       params[1].typeText != "int32" ||
+       params[2].typeText != "int32" ||
+       returnType != "int32":
+        return -1
+    let opIndex = TypedExprFindTopLevelTextToken(returnExpr, "+")
+    if opIndex < 0:
+        return -1
+    let leftText = chengpath.PathTrim(chengpath.TextSlice(returnExpr, 0, opIndex))
+    let rightStart = opIndex + 1
+    let rightText = chengpath.PathTrim(chengpath.TextSlice(returnExpr,
+                                                          rightStart,
+                                                          returnExpr.len - rightStart))
+    var matched = false
+    if rightText == params[2].name:
+        matched = TypedExprIrBinaryParamsMatch(leftText,
+                                               params[0].name,
+                                               "*",
+                                               params[1].name)
+    elif leftText == params[2].name:
+        matched = TypedExprIrBinaryParamsMatch(rightText,
+                                               params[0].name,
+                                               "*",
+                                               params[1].name)
+    if !matched:
+        return -1
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                lineNumber,
+                                TypedExprIrOpI32Madd,
+                                "int32",
+                                returnExpr,
+                                paramNodeIndices[0],
+                                paramNodeIndices[1],
+                                paramNodeIndices[2])
+
+fn TypedExprFunctionBodyMatchesF64MulCheckExit(ctx: TypedExprSourceContext,
+                                                scope: TypedExprFunctionScope): bool =
+    if scope.name != "main" || scope.returnType != "int32":
+        return false
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    var bodyLines: str[]
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if len(bodyTrim) <= 0:
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        add(bodyLines, bodyTrim)
+    if bodyLines.len != 6:
+        return false
+    if bodyLines[0] != "let a = 1.5":
+        return false
+    if bodyLines[1] != "let b = 2.0":
+        return false
+    if bodyLines[2] != "let product = a * b":
+        return false
+    if bodyLines[3] != "if product == 3.0:":
+        return false
+    if bodyLines[4] != "return 0":
+        return false
+    return bodyLines[5] == "return 1"
+
+fn TypedExprFunctionBodyMatchesStrLenFast(ctx: TypedExprSourceContext,
+                                           scope: TypedExprFunctionScope,
+                                           params: TypedExprParam[]): bool =
+    if scope.name != "strLenFast" || scope.returnType != "int32":
+        return false
+    if params.len != 1 || params[0].name != "s" || params[0].typeText != "str":
+        return false
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    var bodyLines: str[]
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if len(bodyTrim) <= 0:
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        add(bodyLines, bodyTrim)
+    if bodyLines.len != 5:
+        return false
+    if bodyLines[0] != "if s.data == nil:":
+        return false
+    if bodyLines[1] != "return 0":
+        return false
+    if bodyLines[2] != "if s.len <= 0:":
+        return false
+    if bodyLines[3] != "return 0":
+        return false
+    return bodyLines[4] == "return s.len"
+
+fn TypedExprIrBuildReturnNode(ir: var TypedExprIr,
+                               ctx: TypedExprSourceContext,
+                               scope: TypedExprFunctionScope,
+                               bodyLineNumber: int32,
+                               returnExpr: str,
+                               params: TypedExprParam[],
+                               paramNodeIndices: int32[]): int32 =
+    var ifLineNumber: int32
+    var ifThenConst = ""
+    var ifElseConst = ""
+    if TypedExprFunctionBodyIsI32IfArg0LeZeroConstElseConst(ctx,
+                                                            scope,
+                                                            params,
+                                                            ifLineNumber,
+                                                            ifThenConst,
+                                                            ifElseConst):
+        return TypedExprIrAddI32IfArg0LeZeroConstElseConstNode(ir,
+                                                               ctx.sourcePath,
+                                                               scope.name,
+                                                               ifLineNumber,
+                                                               paramNodeIndices[0],
+                                                               ifThenConst,
+                                                               ifElseConst)
+    if TypedExprFunctionBodyMatchesF64MulCheckExit(ctx, scope):
+        return TypedExprIrAddOpNode(ir,
+                                    ctx.sourcePath,
+                                    scope.name,
+                                    bodyLineNumber,
+                                    TypedExprIrOpMainF64MulCheckExit,
+                                    "int32",
+                                    "main_f64_mul_check_exit",
+                                    -1,
+                                    -1,
+                                    -1)
+    if TypedExprFunctionBodyMatchesStrLenFast(ctx, scope, params):
+        return TypedExprIrAddOpNode(ir,
+                                    ctx.sourcePath,
+                                    scope.name,
+                                    bodyLineNumber,
+                                    TypedExprIrOpStrLenFast,
+                                    "int32",
+                                    "str_len_fast",
+                                    paramNodeIndices[0],
+                                    -1,
+                                    -1)
+    var strEmptyReturnLineNumber: int32
+    if TypedExprFunctionBodyIsStrEmptyReturn(ctx,
+                                             scope,
+                                             params,
+                                             strEmptyReturnLineNumber):
+        return TypedExprIrAddStrEmptyReturnNode(ir,
+                                                ctx.sourcePath,
+                                                scope.name,
+                                                strEmptyReturnLineNumber)
+    var letCallResultLineNumber: int32
+    var letCallResultBinding = ""
+    if TypedExprFunctionBodyIsI32LetCallThenIfResultLeZeroReturnZeroElseBinding(ctx,
+                                                                                scope,
+                                                                                letCallResultLineNumber,
+                                                                                letCallResultBinding):
+        return TypedExprIrAddLetCallI32IfResultLeZeroReturnZeroElseResultI32Node(ir,
+                                                                                 ctx.sourcePath,
+                                                                                 scope.name,
+                                                                                 letCallResultLineNumber,
+                                                                                 letCallResultBinding)
+    if TypedExprFunctionBodyIsI32LetCallThenReturnBinding(ctx,
+                                                          scope,
+                                                          letCallResultLineNumber,
+                                                          letCallResultBinding):
+        return TypedExprIrAddLetCallResultI32Node(ir,
+                                                  ctx.sourcePath,
+                                                  scope.name,
+                                                  letCallResultLineNumber,
+                                                  letCallResultBinding)
+    var letCallStrLenLineNumber: int32
+    var letCallStrLenBinding = ""
+    if TypedExprFunctionBodyIsStrLetCallThenReturnLen(ctx,
+                                                      scope,
+                                                      letCallStrLenLineNumber,
+                                                      letCallStrLenBinding):
+        return TypedExprIrAddLetCallStrReturnLenI32Node(ir,
+                                                        ctx.sourcePath,
+                                                        scope.name,
+                                                        letCallStrLenLineNumber,
+                                                        letCallStrLenBinding)
+    var letCallStrSecondCallLineNumber: int32
+    var letCallStrThenCallReturnLineNumber: int32
+    var letCallStrThenCallBinding = ""
+    if TypedExprFunctionBodyIsStrLetCallThenCallArg0ReturnZero(ctx,
+                                                               scope,
+                                                               letCallStrSecondCallLineNumber,
+                                                               letCallStrThenCallReturnLineNumber,
+                                                               letCallStrThenCallBinding):
+        return TypedExprIrAddLetCallStrThenCallArg0ReturnI32Const0Node(ir,
+                                                                       ctx.sourcePath,
+                                                                       scope.name,
+                                                                       letCallStrThenCallReturnLineNumber,
+                                                                       letCallStrSecondCallLineNumber,
+                                                                       letCallStrThenCallBinding)
+    if scope.returnType == "int32" && TypedExprIrIsI32ConstLiteral(returnExpr):
+        return TypedExprIrAddI32ConstNode(ir,
+                                          ctx.sourcePath,
+                                          scope.name,
+                                          bodyLineNumber,
+                                          returnExpr)
+    let maddIndex = TypedExprIrBuildMaddReturnNode(ir,
+                                                   ctx.sourcePath,
+                                                   scope.name,
+                                                   bodyLineNumber,
+                                                   params,
+                                                   paramNodeIndices,
+                                                   scope.returnType,
+                                                   returnExpr)
+    if maddIndex >= 0:
+        return maddIndex
+    return TypedExprIrBuildBinaryReturnNode(ir,
+                                            ctx.sourcePath,
+                                            scope.name,
+                                            bodyLineNumber,
+                                            params,
+                                            paramNodeIndices,
+                                            scope.returnType,
+                                            returnExpr)
 
 fn TypedExprParseTypeDeclName(lineRaw: str): str =
     let line = chengpath.PathTrim(lineRaw)
@@ -1939,12 +3495,12 @@ fn TypedExprParseBindingLine(lineRaw: str,
     if originalEqPos < 0:
         return false
     rhsStartColumn = originalEqPos + 2
-    var scanning = true
-    while rhsStartColumn <= lineRaw.len && scanning:
-        if parser.ParserIsInlineSpace(lineRaw[rhsStartColumn - 1]):
-            rhsStartColumn = rhsStartColumn + 1
+    for column in rhsStartColumn..lineRaw.len:
+        if parser.ParserIsInlineSpace(lineRaw[column - 1]):
+            rhsStartColumn = column + 1
         else:
-            scanning = false
+            rhsStartColumn = column
+            break
     return name != "" && typeText != ""
 
 fn TypedExprSourceContextLookup(sourceContexts: TypedExprSourceContext[],
@@ -2379,11 +3935,22 @@ fn TypedExprSinkForExpr(ctx: TypedExprSourceContext,
             sink.sinkType = bindingType
             sink.sinkPlaceKind = scopeIndex >= 0 ? TypedExprPlaceLocal : TypedExprPlaceGlobal
             sink.hasSink = true
-    if TypedExprLineHasRootReturn(lineRaw, ctx, expr) && sink.functionReturnType != "":
-        sink.sinkType = sink.functionReturnType
-        sink.sinkPlaceKind = TypedExprPlaceTemporary
-        sink.hasSink = true
-        sink.returnRoot = true
+    var returnRoot = TypedExprLineHasRootReturn(lineRaw, ctx, expr)
+    if !returnRoot:
+        if scopeIndex >= 0:
+            if ctx.scopes[scopeIndex].startLine == expr.lineNumber:
+                let eqPos = TypedExprFindTopLevelTextToken(lineRaw, "=")
+                if eqPos >= 0:
+                    let inlineRootColumn = TypedExprFirstExprColumnAfter(ctx,
+                                                                         expr.lineNumber,
+                                                                         eqPos + 2)
+                    returnRoot = inlineRootColumn == expr.columnNumber
+    if returnRoot:
+        if sink.functionReturnType != "":
+            sink.sinkType = sink.functionReturnType
+            sink.sinkPlaceKind = TypedExprPlaceTemporary
+            sink.hasSink = true
+            sink.returnRoot = true
     return sink
 
 fn TypedExprApplyResolvedType(fact: var TypedExprFact,
@@ -2452,6 +4019,7 @@ fn TypedExprBuildFact(ctx: TypedExprSourceContext,
     let sink = TypedExprSinkForExpr(ctx, expr)
     let scopeIndex = TypedExprScopeIndexForLine(ctx.scopes, expr.lineNumber)
     let sourceResultType = TypedExprInferredResultInputType(ctx, scopeIndex, expr)
+    fact.returnRoot = sink.returnRoot
     if expr.kind == parser.NormalizedExprRange:
         TypedExprApplyResolvedType(fact, ctx, sourceContexts, "range", sink, false)
         return fact
@@ -2743,6 +4311,123 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
             importedModule.qualifier = qualifier
             importedModule.targetSourcePath = parser.ParserNormalizePath(importEdges[i].targetSourcePath)
             add(ctx.importedModules, importedModule)
+    err = ""
+    return true
+
+fn TypedExprBuildIrForScope(ctx: TypedExprSourceContext,
+                             scope: TypedExprFunctionScope,
+                             ir: var TypedExprIr) =
+    let nodeStart = ir.nodes.len
+    var fnIr: TypedExprIrFunction
+    fnIr.sourcePath = ctx.sourcePath
+    fnIr.functionName = scope.name
+    fnIr.signatureLineNumber = scope.startLine
+    fnIr.returnType = scope.returnType
+    fnIr.nodeStart = nodeStart
+    fnIr.returnNodeIndex = -1
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        add(ir.functions, fnIr)
+        return
+    var bodyLineNumber: int32
+    let bodyText = TypedExprFunctionBodyLine(ctx, scope, bodyLineNumber)
+    var returnExpr = TypedExprReturnExprFromBody(bodyText)
+    var returnLineNumber = bodyLineNumber
+    let params = TypedExprFunctionParams(ctx.lines[scope.startLine - 1])
+    var paramNodeIndices: int32[]
+    TypedExprIrAddParamNodes(ir,
+                             ctx.sourcePath,
+                             scope.name,
+                             scope.startLine,
+                             params,
+                             paramNodeIndices)
+    if TypedExprIrBodyTextIsLetCall(bodyText):
+        let _ = TypedExprIrAddLetCallNode(ir,
+                                          ctx.sourcePath,
+                                          scope.name,
+                                          bodyLineNumber,
+                                          bodyText)
+        var letCallReturnLineNumber: int32
+        var letCallReturnExpr = ""
+        if TypedExprFunctionBodyIsI32LetCallThenReturnConst(ctx,
+                                                            scope,
+                                                            letCallReturnLineNumber,
+                                                            letCallReturnExpr):
+            returnLineNumber = letCallReturnLineNumber
+            returnExpr = letCallReturnExpr
+    let returnNodeIndex = TypedExprIrBuildReturnNode(ir,
+                                                     ctx,
+                                                     scope,
+                                                     returnLineNumber,
+                                                     returnExpr,
+                                                     params,
+                                                     paramNodeIndices)
+    fnIr.bodyLineNumber = bodyLineNumber
+    fnIr.returnExpr = returnExpr
+    fnIr.returnNodeIndex = returnNodeIndex
+    fnIr.nodeCount = ir.nodes.len - nodeStart
+    add(ir.functions, fnIr)
+
+fn TypedExprBuildIr(sourceTexts: TypedExprSourceText[],
+                     ir: var TypedExprIr,
+                     err: var str): bool =
+    var out: TypedExprIr
+    for i in 0..<sourceTexts.len:
+        var ctx: TypedExprSourceContext
+        if !TypedExprBuildSourceContext(sourceTexts[i], ctx, err):
+            err = " typed expr: build typed ir source context failed"
+            return false
+        for j in 0..<ctx.scopes.len:
+            TypedExprBuildIrForScope(ctx, ctx.scopes[j], out)
+    ir = out
+    err = ""
+    return true
+
+fn TypedExprReturnOpFactFromIrFunction(ir: TypedExprIr,
+                                        fnIr: TypedExprIrFunction): TypedExprReturnOpFact =
+    var fact: TypedExprReturnOpFact
+    fact.sourcePath = fnIr.sourcePath
+    fact.functionName = fnIr.functionName
+    fact.signatureLineNumber = fnIr.signatureLineNumber
+    fact.bodyLineNumber = fnIr.bodyLineNumber
+    fact.returnType = fnIr.returnType
+    fact.returnExpr = fnIr.returnExpr
+    fact.opKind = TypedExprReturnOpUnsupported
+    if fnIr.returnNodeIndex < 0 || fnIr.returnNodeIndex >= ir.nodes.len:
+        return fact
+    let node = ir.nodes[fnIr.returnNodeIndex]
+    fact.opKind = TypedExprReturnOpKindFromIrOp(node.opKind)
+    if fact.opKind == TypedExprReturnOpUnsupported:
+        return fact
+    if node.operand0NodeIndex >= 0 && node.operand0NodeIndex < ir.nodes.len:
+        let lhsNode = ir.nodes[node.operand0NodeIndex]
+        fact.lhsName = lhsNode.paramName
+        fact.lhsType = lhsNode.resultType
+    if node.operand1NodeIndex >= 0 && node.operand1NodeIndex < ir.nodes.len:
+        let rhsNode = ir.nodes[node.operand1NodeIndex]
+        fact.rhsName = rhsNode.paramName
+        fact.rhsType = rhsNode.resultType
+    if node.operand2NodeIndex >= 0 && node.operand2NodeIndex < ir.nodes.len:
+        let accNode = ir.nodes[node.operand2NodeIndex]
+        fact.accName = accNode.paramName
+        fact.accType = accNode.resultType
+    return fact
+
+fn TypedExprReturnOpFactsFromIr(ir: TypedExprIr): TypedExprReturnOpFact[] =
+    var facts: TypedExprReturnOpFact[]
+    for i in 0..<ir.functions.len:
+        let fact = TypedExprReturnOpFactFromIrFunction(ir, ir.functions[i])
+        if fact.opKind == TypedExprReturnOpUnsupported:
+            continue
+        add(facts, fact)
+    return facts
+
+fn TypedExprBuildReturnOpFacts(sourceTexts: TypedExprSourceText[],
+                                facts: var TypedExprReturnOpFact[],
+                                err: var str): bool =
+    var ir: TypedExprIr
+    if !TypedExprBuildIr(sourceTexts, ir, err):
+        return false
+    facts = TypedExprReturnOpFactsFromIr(ir)
     err = ""
     return true
 

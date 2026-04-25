@@ -1,7 +1,7 @@
 # Lessons
 
 - 开始新任务先扫当前入口、源码根和活动 artifact，不要继承历史路径假设。
-- `build-backend-driver` 与 `run-host-smokes` 不要并行跑；它们共享 driver 产物，容易制造假红。
+- `build-backend-driver` 编译期可以并行；只有最终安装/原子替换阶段需要排队。`run-host-smokes` 仍要避开正在替换的 driver 产物，避免制造假红。
 - `chain_node`、GUI、mobile、r2c 属于应用或领域链路；只有明确要求时才进入核心编译门禁。
 - `build-backend-driver`、`slice-gate`、`run-host-smokes`、`stage2/stage3` 默认门禁只覆盖编译器核心和必要平台链路；`chain_node` 只能作为显式命令运行。
 - 改 bootstrap seed 后先重建 `artifacts/bootstrap/cheng.stage0`，再跑 `bootstrap-bridge`。
@@ -11,11 +11,15 @@
 - `build-backend-driver` 的候选编译必须强制 `BACKEND_INCREMENTAL=0`、`BACKEND_MULTI_MODULE_CACHE=0`、`CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1`；driver 自举不能吃陈旧 primary object。
 - `artifacts/backend_driver/cheng` 缺失时不要用 `artifacts/bootstrap/cheng.stage3 run-host-smokes` 自救；这会触发旧路径自动重建 backend_driver。先停残留进程，恢复已有候选入口；单个 smoke 验证走 `CHENG_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/bootstrap/cheng.stage3 system-link-exec --root:<root> --in:<smoke>`。
 - 批量去旧版本前缀时，旧导出壳不能直接改成同名转发；同名同签名自递归会让重载选择歧义并表现为 `primary_object_body_semantics_missing`。
-- 启动任何 `backend_driver_main.cheng` 自托管编译前必须先扫 `cheng.stage3 system-link-exec`、`build-backend-driver`、`/tmp/backend_driver_*`、`lldb -- ... backend_driver_main`；发现同类进程先精准停止，禁止并发长编译和空等。
+- 启动 `build-backend-driver` 前只需要阻塞另一个 `build-backend-driver` 或最终安装锁；普通 `system-link-exec` / provider object 编译必须能并发，不能把全局等待当修复。
+- `build-backend-driver` 的 pid 私有 build 目录已经隔离；可与普通编译并行，但两个 backend-driver 构建仍只能在最终安装 `artifacts/backend_driver/cheng(.map)` 时串行。
+- `build-backend-driver` 的安装锁只能覆盖最终 `rename` 原子替换；候选验证必须在私有 build dir 内提前完成，不能把 post-install smoke 包进锁里。
 - 跨模块 helper 不要复用同一个大写导出名；例如 `CompilerWorldLineValue` 只能有一个公开定义，其他模块必须用小写私有唯一名，否则 primary object 会生成重复全局符号。
 - `artifacts/bootstrap/cheng.stage3 system-link-exec` 是 C seed 路径；需要防内存暴涨时，除了 Cheng 版 host_ops/system_link_exec，还必须同步加 `bootstrap/cheng_seed.c` 级资源守卫。
 - `stage3 build-backend-driver` 也是 C seed 长路径；必须由 seed 默认注入 `CHENG_PROGRESS=1`、8GiB `CHENG_PROCESS_MAX_RSS_BYTES`，并实时透出 `compile_progress`，不能只等最后日志/report。
 - provider object materialize 选择当前编译器时，self executable 可执行即可作为当前编译器；freshness 检查只适合备用 stage 路径，不能阻断正在运行的 self。
+- backend driver 候选自检里的 provider `--emit:obj` 必须使用当前候选可执行文件，不能绑死已安装 `artifacts/backend_driver/cheng`；已安装 driver 可能还是旧版本或只覆盖 exe 快路径。
+- backend driver 的 `system-link-exec` 不支持时必须在 Cheng 侧硬失败；转发到 C seed 只会得到 `unknown command: system-link-exec`，不能当兜底。
 - parser 自举链路里避免写转义单引号字符字面量；需要匹配 quote/comment 字符时用 `char(34)`、`char(39)`、`char(35)` 这类明确码点。
 - 去前缀清理不只扫失败入口文件，要扫该 smoke 的完整 source closure；同名自递归函数壳和 `Foo: T = Foo` 自引用常量壳都会污染后续编译链路。
 - seed 最小化不要一次导入整套 `gate_main.cheng` 到 backend driver；先拆轻量 Cheng 控制面模块，否则 primary object plan 容易被超大 gate 入口打爆。
@@ -40,10 +44,10 @@
 - 当前 Cheng 复合实参 ABI 仍是“callee 直接借 caller frame 里的 call temp 地址”；这类 call temp 不能在调用返回后立刻 release/zero，必须等 caller 函数 epilogue 和普通 local 一起回收，否则会提前打断仍然活着的 borrow。
 - 用户明确要求“从 seed 迁到纯 Cheng 最小 seed”时，优先迁走 `std` 语义和 runtime shim；不要因为自举方便继续把 `Fmt/$` 一类库行为补进 `cheng_seed.c`。
 - `$` 的公开表面只保留直接写法：简单值支持 `$box`，复杂表达式支持 `$(expr)`；不要再把反引号 `` `$` `` 当用户语法往前推，纯 Cheng 前端负责降糖，seed 只保留兼容。
-- Cheng 字符串输出优先用 `Fmt`，但大 CLI/test 闭包里不要写单个超长 `Fmt` 或超长拼接表达式；稳定写法是多个小 `Fmt"..."` 片段增量 append 到局部变量后再 `echo`。
-- 多个 `artifacts/bootstrap/cheng.stage3 system-link-exec` 编译不要并行跑；同一轮里并发编译会出现无诊断 `-1` 假红，相关 smoke 必须串行验证。
+- Cheng 字符串输出统一用 `Fmt`，但大 CLI/test 闭包里不要写单个超长 `Fmt`；稳定写法是多个小 `Fmt"..."` 片段用 `out = Fmt([out, part])` 增量组合后再 `echo`。
+- 多个 `artifacts/bootstrap/cheng.stage3 system-link-exec` 编译应支持并行；若并发出现无诊断 `-1`，优先修共享输出、cache 或 artifact 冲突，不能用全局串行掩盖。
 - wowExport 处理 CDN root/BLTE/zlib 时不要先全量解码再扫表；真实 root 会放大到 49MB encoded / 65MB decoded，必须按 BLTE block range 解码、批量 root lookup，并用 bit-buffer + 小型 Huffman fast table 控制时间和内存。
-- wowExport CLI 可见的摘要函数要保持非常简单；优先用小段 `Fmt"..."`，并逐步 `out = out + part`，不要把整行摘要写成单个巨大 `Fmt`、巨大拼接表达式或一条 return。
+- wowExport CLI 可见的摘要函数要保持非常简单；优先用小段 `Fmt"..."`，并逐步 `out = Fmt([out, part])`，不要把整行摘要写成单个巨大 `Fmt` 或一条 return。
 - 发现 `runtime_zero` / `run-browser-host-wasm-smoke` 外部门禁派生长进程链时，先按 label 精准停止并清空进程表，再继续 r2c GUI；不要让这类门禁和 r2c/native GUI 验证并行。
 - r2c GUI smoke 不要每条都现场重编 `src/r2c/r2c_react.cheng` 单体 controller；该入口已足够大，安全做法是复用已存在的 Cheng stage3 `r2c-react` 控制面，并把 per-smoke 编译限制在小 smoke 自身。
 - 砍 r2c native GUI Node helper 时必须同时覆盖 `native-gui-bundle`、`compile` 和 `status` 三个命令面，并扫掉 `node_payload_helper` 这类旧字段名；否则单命令通过但整体状态仍会暴露旧 Node 路径。
@@ -73,3 +77,42 @@
 - r2c 平台壳合同放 runtime 产物和 host-run fields；不要继续往 `r2cControllerRunNativeGui` 的大 report 里堆字段，该函数已贴近 stage3 局部临时上限。
 - r2c smoke 的 artifact 目录不能复用 `/tmp` 可执行输出路径；否则 `MkdirP` 会正确失败。稳定命名用 `<smoke>_artifacts` 目录。
 - host smoke、gate smoke、runtime_zero 这类会触发编译的门禁 RSS 默认统一 8GiB；禁止再写 `34359738368` 这种 32GiB 守卫，必须有静态 smoke 防回潮。
+- Cheng 字符串拼接操作符 `+` 已禁用移除；新增 Cheng 代码必须用 `Fmt"..."`、`Fmt(...)` 或 `Lines(...)` 组合字符串，只把 `+` 用于数值加法。
+- Cheng 自增/自减计数循环必须写成 `for ... in range`；`while` 只用于非计数型条件循环。
+- 当前 `primary_object_emit` 仍是 `.s` 文本生成再 `cc -c` 产 `.o`；不要把它描述成直接机器 object writer，真正直写 `.o` 必须走 Mach-O/ELF/COFF object writer 主线。
+- backend driver ready freshness 必须跟 `print-build-plan` 的真实 source list 同步；新增 direct object writer 这类 backend 源时，漏进 freshness 会让 `build-backend-driver` 快路径误判 ready。
+- 手工 `cc bootstrap/cheng_seed.c -o artifacts/bootstrap/cheng.stage0` 只适合临时语法验证；正式 stage0 必须用 `compile-bootstrap --in:bootstrap/stage1_bootstrap.cheng` 生成嵌入合同的 wrapper 后再 `bootstrap-bridge`。
+- `build-backend-driver` 的进程检查和启动不能放进同一个并行 tool call；先确认没有活动构建，再启动，否则会多跑一个候选编译，最终安装虽有锁但浪费时间。
+- direct standalone no-runtime exe 不能静默丢真实函数：入口为 provider-free 严格 codegen 形状时可写 `_main`，但所有已有严格 codegen 的真实函数都必须进同一个 Mach-O；return-call 只能指向同对象内已定义符号，不能生成带悬空本地 helper 的对象。
+- 非 standalone direct exe 需要 entry bridge 和 runtime provider objects；provider object materializer 没迁完前不要打开这条 runtime 主线，否则会卡在 provider 纯编译 `plan not ready`，正确做法是硬失败并保留报告。
+- provider object 的 partial direct 不能只因某些 wrapper body 可识别就放行；如果 wrapper branch 到未发射的本地 helper，静态对象会带未解析符号，必须拒绝或先做按 reloc 需求裁剪/完整 provider materializer。
+- `run-host-smokes` 会共用 `artifacts/hostrun` 下的 smoke artifact；同名或相邻 smoke 不要并行跑，否则 `otool`/report 可能读到被另一条 smoke 重写的对象，制造假失败。
+- `float64_mul_backend_smoke` 的最小可接受口径是机器码里真实出现并执行 `fmul/fcmp`，用退出码表达结果；不能恢复成只 `return 0` 的空壳，也不能把 assert/array/echo 版在未完成 lowering 时塞回核心门禁。
+- backend driver 自举的 primary-object plan 会把新 helper 函数纳入闭包；不要为了小布尔判断新增多分支 `if` helper，否则会变成 `stmt_if` unsupported 并让纯链路硬失败。优先在已有大函数中内联严格条件，或先补 primary-object 对该函数形状的真实 codegen。
+- 验证 Mach-O arm64 branch relocation 名称用 `otool -rv`，不是 `otool -r`；后者只打印数字 type，烟测会误判。
+- 新 direct body kind 必须先让 `primary_object_plan` 产出，再让 direct writer/asm fallback 消费；只改 writer 等于永远没有输入，烟测会卡在 body kind 不匹配。
+- 新增算术 direct body kind 时同时保留文本汇编 fallback；自举或 `emit:obj` 非直写路径仍会消费同一 plan，不能让 `primary_object_emit` 落后于 direct writer。
+- standalone direct report 名称必须描述 provider-free direct entry 形状，不能绑定早期 `return 0` 语义；支持 `return_i32_const_N` 后要同步改报告字段、smoke 断言和记录文档，不保留旧 zero-exit token。
+- primary object body kind 推导要先把 `return expr` 和表达式体 `= expr` 归一成同一表达式，再匹配常量、二参算术和 call-chain；否则 fixture 换成更小的表达式体就会退回 `plan not ready`。
+- 在 backend driver 自举闭包的大 emit 函数里，不要为了单条指令新建尚未被当前 primary-object 能力证明的小 helper；先在既有分支内直接发机器字或 asm 文本，等 helper 形状本身可稳定 codegen 后再抽。
+- `primary_object_plan` 已经生成并缓存 scalar 函数汇编文本时，后续 `primary_object_emit` 必须直接复用缓存；不要再二次调用同一个 scalar codegen，否则 `build-backend-driver` 会白白多跑 70 秒级函数体生成。
+- seed cache prime/restore smoke 必须避开 backend driver 替换窗口；同一轮 prime/store 和 restore 若跨了不同 driver 产物，会出现 cache key 立刻不一致的假红，先扫 `build-backend-driver` 进程并确认稳定产物。
+- 若源码修改发生在一个旧 `build-backend-driver` 已经启动之后，旧构建结束时间可能晚于源码 mtime，ready freshness 会误判安装产物 fresh；这种竞态后必须 `touch` 入口或相关源再强制重建一次。
+- 最小 seed 主线的 backend driver 不应直接 import 领域 gate；保留命令面时用 stage3 显式转发，避免 cross-target/r2c/network/wasm 等非主线源码进入自举闭包。
+- primary object 的 `bodyKind` 是 codegen 合同，不是诊断标签；`stmt_*`、`return_expr` 这类未实现语义不能写入 `bodyKind`，否则 `build-backend-driver` 会把未实现语义当成应编译语义后硬失败。
+- seed 最小化的下一段必须是真 statement/control-flow/scalar call codegen；只给 `BackendDriverMain` 加特殊识别或把普通语句标成 supported 都是伪完成。
+- `--emit:exe` 的执行语义 root 应从入口做 call 闭包，但 direct object 仍要保留已严格 codegen 的无调用 leaf 函数；这样既不让 unsupported 死代码污染 exe 编译，也不让 dead-f64 这类已支持机器码从对象中消失。
+- backend driver 自举闭包里新增 body-kind 解析 helper 前，必须先证明 helper 自身能被 primary object 编译；未证明前只开放精确最小 body kind 或把解析放在已支持的大函数内，否则 helper 会成为新的 `stmt_let`/`stmt_if` blocker。
+- C seed 当前对嵌套 statement 里的某些标量表达式仍有限制；例如 `len(prefix_const)` 放进嵌套 let 会让候选编译失败。最小 seed 主线先用显式常量合同保持可自举，泛化要等纯 Cheng scalar expr codegen 接管。
+- arm64 direct writer 只要函数体发出 `bl` 就是非叶子函数，必须保存恢复 `x30`；否则 `ret` 会回到函数内部形成挂起。验证时同时看最终 executable `otool -tV`、object `otool -rv` 和实际退出码。
+- `let value: int32 = Helper(); return value` 只能解决标量 call result；`let rootDir = BackendDriverRoot()` 这类 `str`/复合返回还需要 composite local/call-result ABI，不能用 int32 body kind 或特殊 main 伪装完成。
+- Darwin arm64 的 `str` 这类复合返回必须用隐藏 sret 地址 `x8`；caller 的 call-result local 需要在栈上按 16 字节对齐保活，callee 只写目标地址，不能把复合值塞进 `x0`。
+- 在 Mach-O direct writer 尚未支持数据段前，最小 `str` ABI 切片优先用零值 `str` 和 `strLenFast` 布局读取验证 sret/local，不要用字符串字面量把数据 section/reloc 混进同一切片。
+- `BackendDriverMain` 当前不再是单个 `str` sret ABI 问题；真正下一步是函数内多 statement 调度：复合 local 跨语句存活、同一函数多个 `bl`/BR26 reloc、把 `str` local 地址作为后续 call 实参。
+- `let value: int32 = Call(); if value <= 0: return 0; return value` 这类标量 guard 切片可以保留 call result 在 `w0`，只分支选择是否覆盖为 0；不要为了这个最小形状先引入未证明的 local slot helper。
+- `str` local 后续作为 arg0 传给第二个 call 的最小稳定形态是 caller 栈上 24 字节 local：`add x8, sp, #16; bl first; add x0, sp, #16; bl second`，两条 BR26 relocation 分别落在函数 word offset `+3` 和 `+5`。
+- typed IR 若已证明多 statement 精确形状，lowering 要消费 typed facts 的调用顺序和目标；`primary_object_plan` 不能再回读源码或用 body kind 诊断字段猜语义。
+- direct Mach-O writer 写 relocation 时应消费 `primary_object_plan` 产出的 `relocWordOffsets/relocTargetSymbols`，不要在 writer 里按 body kind 重新计算 branch 位置。
+- 无显式类型 `let value = Call()` 的 ABI 类型只能从 typed call fact 进入 lowering；源码里有没有 `: str` 不能作为 primary/object 层的语义依据。
+- 放宽 typed_expr 的 let-call 形状识别时，所有带类型含义的 body kind 都必须在 lowering 处复查 `typeText`，否则会把 inferred/untyped 源码误映射成错误 ABI。
+- 未经端到端验证的更大 statement 切片不能留在 active path 里；即使主线 fixture 不触发，backend driver 自举闭包也会编到 helper/report/predicate，必须先删掉或完整证明后再开放。

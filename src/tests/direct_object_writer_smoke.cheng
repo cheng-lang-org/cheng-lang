@@ -1,0 +1,136 @@
+import std/result
+import std/os
+import std/rawbytes
+import std/strings
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/object_debug_report as objdebug
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/direct_object_emit as direct
+import cheng/core/backend/object_buffer as obuf
+import cheng/core/backend/object_symbols as osym
+import cheng/core/backend/object_relocs as orel
+import cheng/core/backend/primary_object_plan as pobj
+
+fn assertByte(data: Bytes, index: int32, expected: int32, message: str) =
+    assert(bytesGet(data, index) == expected, message)
+
+fn main(): int32 =
+    var buf = obuf.ObjectBufferInit(2)
+    obuf.ObjectBufferWriteU8(buf, 18)
+    obuf.ObjectBufferWriteU16LE(buf, uint64(0x3456))
+    let patchOffset = obuf.ObjectBufferOffset(buf)
+    obuf.ObjectBufferWriteU32LE(buf, uint64(0))
+    obuf.ObjectBufferAlign(buf, 8, 0)
+    obuf.ObjectBufferWriteU64LE(buf, uint64(0x0102030405060708))
+    let patchRes = obuf.ObjectBufferPatchU32LE(buf, patchOffset, uint64(0x11223344))
+    assert(IsOk(patchRes), " direct object writer smoke: patch u32")
+
+    let data = obuf.ObjectBufferToBytes(buf)
+    assert(bytesLen(data) == 16, " direct object writer smoke: buffer len")
+    assertByte(data, 0, 18, " direct object writer smoke: u8")
+    assertByte(data, 1, 86, " direct object writer smoke: u16 lo")
+    assertByte(data, 2, 52, " direct object writer smoke: u16 hi")
+    assertByte(data, 3, 68, " direct object writer smoke: patch b0")
+    assertByte(data, 4, 51, " direct object writer smoke: patch b1")
+    assertByte(data, 5, 34, " direct object writer smoke: patch b2")
+    assertByte(data, 6, 17, " direct object writer smoke: patch b3")
+    assertByte(data, 7, 0, " direct object writer smoke: align")
+    assertByte(data, 8, 8, " direct object writer smoke: u64 b0")
+    assertByte(data, 15, 1, " direct object writer smoke: u64 b7")
+
+    var symbols = osym.ObjectSymbolsInit()
+    let mainIndex = osym.ObjectSymbolsAddDefined(symbols, "_main", 0, int64(0), int64(16), true)
+    let putsIndex = osym.ObjectSymbolsAddUndefined(symbols, "_puts", true)
+    assert(mainIndex == 0, " direct object writer smoke: main symbol index")
+    assert(putsIndex == 1, " direct object writer smoke: extern symbol index")
+    assert(osym.ObjectSymbolsCount(symbols) == 2, " direct object writer smoke: symbol count")
+    assert(osym.ObjectSymbolsHas(symbols, "_main"), " direct object writer smoke: has main")
+    assert(osym.ObjectSymbolsAt(symbols, putsIndex).undefined, " direct object writer smoke: puts undefined")
+
+    var relocs = orel.ObjectRelocsInit()
+    let relocIndex = orel.ObjectRelocsAdd(relocs,
+                                          0,
+                                          int64(4),
+                                          putsIndex,
+                                          orel.ObjectRelocBranch26,
+                                          int64(0),
+                                          true)
+    assert(relocIndex == 0, " direct object writer smoke: reloc index")
+    assert(orel.ObjectRelocsCount(relocs) == 1, " direct object writer smoke: reloc count")
+    assert(orel.ObjectRelocsCountForSection(relocs, 0) == 1, " direct object writer smoke: reloc section count")
+    assert(orel.ObjectRelocsAt(relocs, 0).pcRelative, " direct object writer smoke: reloc pc relative")
+
+    let root = os.GetCurrentDir()
+    let outDir = chengpath.PathAbsolute(root, "artifacts/direct_object_writer_smoke")
+    assert(chengpath.MkdirP(root, outDir), " direct object writer smoke: mkdir")
+    let objectPath = chengpath.PathJoin(outDir, "return_zero_direct.o")
+    let exePath = chengpath.PathJoin(outDir, "return_zero_direct")
+    let linkLog = chengpath.PathJoin(outDir, "return_zero_direct.link.log")
+    let runLog = chengpath.PathJoin(outDir, "return_zero_direct.run.log")
+    var directSymbols: str[]
+    add(directSymbols, "_main")
+    let directRes = direct.DirectObjectEmitReturnZeroObject(root,
+                                                            objectPath,
+                                                            directSymbols)
+    assert(IsOk(directRes), " direct object writer smoke: direct object write")
+    assert(chengpath.FileExistsNonEmpty(root, objectPath), " direct object writer smoke: object exists")
+    let reportRes = objdebug.ObjectDebugReportText(objectPath)
+    assert(IsOk(reportRes), " direct object writer smoke: object report")
+    let report = Value(reportRes)
+    assert(strings.StrContains(report, "format=macho64"), " direct object writer smoke: macho report")
+    assert(strings.StrContains(report, "macho_type=relocatable"), " direct object writer smoke: relocatable")
+    assert(strings.StrContains(report, "section_count=1"), " direct object writer smoke: section count")
+    assert(strings.StrContains(report, "symbol_count=1"), " direct object writer smoke: symbol count")
+    assert(strings.StrContains(report, "reloc_count=0"), " direct object writer smoke: reloc count")
+    let link = hostops.RunProgramLogged(root,
+                                        "direct_object_writer_link",
+                                        "cc",
+                                        ["-arch", "arm64", objectPath, "-o", exePath],
+                                        [],
+                                        root,
+                                        0,
+                                        linkLog)
+    assert(link.exitCode == 0, " direct object writer smoke: link rc")
+    assert(chengpath.FileExistsNonEmpty(root, exePath), " direct object writer smoke: exe exists")
+    let run = hostops.RunFileLogged(root,
+                                    "direct_object_writer_run",
+                                    exePath,
+                                    [],
+                                    [],
+                                    root,
+                                    30,
+                                    runLog)
+    assert(run.exitCode == 0, " direct object writer smoke: run rc")
+
+    let f64ObjectPath = chengpath.PathJoin(outDir, "f64_mul_direct.o")
+    let f64OtoolLog = chengpath.PathJoin(outDir, "f64_mul_direct.otool.log")
+    var f64Plan: pobj.PrimaryObjectPlan
+    f64Plan.targetTriple = "arm64-apple-darwin"
+    f64Plan.objectFormat = "macho"
+    f64Plan.outputPath = f64ObjectPath
+    add(f64Plan.itemIds, int32(1))
+    add(f64Plan.symbolNames, "_cheng_direct_f64_mul")
+    add(f64Plan.functionWordOffsets, int32(0))
+    add(f64Plan.functionWordCounts, int32(2))
+    add(f64Plan.functionBodyKinds, "return_f64_mul_args")
+    add(f64Plan.instructionWords, int32(0))
+    add(f64Plan.instructionWords, int32(0))
+    let f64Res = direct.DirectObjectEmitPlanObject(root, f64Plan)
+    assert(IsOk(f64Res), " direct object writer smoke: f64 direct object write")
+    let f64Write = Value(f64Res)
+    assert(f64Write.relocCount == 0, " direct object writer smoke: f64 reloc count")
+    assert(chengpath.FileExistsNonEmpty(root, f64ObjectPath), " direct object writer smoke: f64 object exists")
+    let f64Disasm = hostops.RunProgramLogged(root,
+                                             "direct_object_writer_f64_otool",
+                                             "otool",
+                                             ["-tV", f64ObjectPath],
+                                             [],
+                                             root,
+                                             0,
+                                             f64OtoolLog)
+    assert(f64Disasm.exitCode == 0, " direct object writer smoke: f64 otool rc")
+    assert(strings.StrContains(f64Disasm.output, "fmul"), " direct object writer smoke: f64 fmul")
+    assert(strings.StrContains(f64Disasm.output, "d0, d0, d1"), " direct object writer smoke: f64 operands")
+
+    echo("direct_object_writer_smoke ok")
+    return 0

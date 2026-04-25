@@ -3,6 +3,7 @@ import std/monotimes
 import std/os
 import std/result
 import std/strings
+import std/strformat
 import std/strutils as strutil
 import cheng/std/bytes_layout as layout
 import cheng/core/tooling/bootstrap_contracts as contracts
@@ -929,9 +930,9 @@ fn CompilerAppendPrivateImportDiagnostic(out: var str[],
     let memberName = strutil.Strip(memberNameRaw)
     if memberName == "" || CompilerIdentifierExportedByCase(memberName):
         return
-    let diagnostic = " compiler: imported private symbol '" +
-                     memberName +
-                     "' is not exported; use uppercase initial"
+    let diagnostic = Fmt([" compiler: imported private symbol '",
+                          memberName,
+                          "' is not exported; use uppercase initial"])
     if !parser.ParserStringSeqContainsExact(out, diagnostic):
         add(out, diagnostic)
 
@@ -1060,7 +1061,7 @@ fn CompilerScanProfilePrivateAliasUses(profile: parser.NormalizedExprCallProfile
 fn CompilerSystemLinkExecPrivateImportDiagnostics(plan: sexec.SystemLinkExecPlan): str[] =
     var out: str[]
     let linkPlan = plan.systemLinkPlan
-    if linkPlan.unresolvedImportCount <= 0:
+    if linkPlan.unresolvedImportCount <= 0 && linkPlan.exprLayer.exprs.len <= 0:
         return out
     if linkPlan.exprLayer.exprs.len <= 0:
         CompilerScanSourcePrivateImportDiagnostics(linkPlan, out)
@@ -1146,7 +1147,10 @@ fn CompilerTryRunPureSystemLinkExec(rootDir: str,
     let browserBridgeObjectPath = sexec.SystemLinkExecBrowserBridgeObjectPath(plan)
     if len(browserBridgeObjectPath) > 0:
         return CompilerPureSystemLinkExecUnsupported(" compiler pure system-link-exec: browser bridge object not yet in pure runtime")
-    let execRes = sexecrt.SystemLinkExecRuntimeExecutePlan(rootDir, plan)
+    let providerCompilerPath: str = CompilerCurrentExecutablePath(rootDir)
+    let execRes = sexecrt.SystemLinkExecRuntimeExecutePlanWithCompiler(rootDir,
+                                                                       plan,
+                                                                       providerCompilerPath)
     if IsErr(execRes):
         return CompilerPureSystemLinkExecUnsupported(Error(execRes))
     let runtimeReport = sexecrt.SystemLinkExecRuntimeResultReport(Value(execRes))
@@ -2876,9 +2880,16 @@ fn CompilerBuildSystemPlan(rootDir: str,
                                                               creq.CompilerBaselineSurfacePathFromArgs(args),
                                                               creq.CompilerChannelFromArgs(args))
 
+fn CompilerRequestWithAbsoluteSourcePath(rootDir: str,
+                                          req: creq.CompilerRequest): creq.CompilerRequest =
+    var out = req
+    out.sourcePath = chengpath.PathAbsolute(rootDir, req.sourcePath)
+    return out
+
 fn CompilerRunSystemLinkExec(rootDir: str,
                                req: var creq.CompilerRequest,
                                args: str[]): int32 =
+    req = CompilerRequestWithAbsoluteSourcePath(rootDir, req)
     let planRes: Result[sexec.SystemLinkExecPlan] = CompilerBuildSystemPlan(rootDir, req, args)
     if IsErr(planRes):
         CompilerPrintErr(Error(planRes))
@@ -2889,6 +2900,14 @@ fn CompilerRunSystemLinkExec(rootDir: str,
     var bridgeReport = ""
     if len(req.reportPath) > 0:
         bridgeReport = CompilerSystemLinkExecBridgeMergeReport(plan)
+    let privateImportDiagnostics = CompilerSystemLinkExecPrivateImportDiagnostics(plan)
+    if privateImportDiagnostics.len > 0:
+        if !CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
+            CompilerPrintErr(Fmt([" compiler: failed to write report: ", req.reportPath]))
+            return 2
+        for i in 0..<privateImportDiagnostics.len:
+            CompilerPrintErr(privateImportDiagnostics[i])
+        return 2
     CompilerProgressEmit(rootDir, progressText, "execute", "begin")
     CompilerProgressEmit(rootDir, progressText, "browser_bridge_prepare", "begin")
     if !CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
@@ -2950,9 +2969,8 @@ fn CompilerRunSystemLinkExec(rootDir: str,
             CompilerProgressEmit(rootDir, progressText, "execute", "done")
             return 0
     let summary = CompilerSystemLinkExecSummary(plan)
-    let privateImportDiagnostics = CompilerSystemLinkExecPrivateImportDiagnostics(plan)
     if !CompilerWriteSystemLinkExecFullReport(rootDir, req.reportPath, plan):
-        CompilerPrintErr(" compiler: failed to write report: " + req.reportPath)
+        CompilerPrintErr(Fmt([" compiler: failed to write report: ", req.reportPath]))
         return 2
     if sexec.SystemLinkExecPlanReady(plan):
         CompilerPrintErr(" compiler: missing live Cheng bridge for system-link-exec")

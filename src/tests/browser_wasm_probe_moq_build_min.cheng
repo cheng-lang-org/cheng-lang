@@ -4,9 +4,6 @@ import std/strings as strings
 import std/strutils
 import cheng/moq/moq_fountain as moq
 
-type SeqBox = object
-    items: str[]
-
 type PrefixSeqBox = object
     ownerPeerId: str
     mimeType: str
@@ -600,19 +597,19 @@ fn moqBuildLongBlobPeersAfterObjectFirstLen(): int32 =
         return -2
     return peers[0].len
 
-fn buildSeqBox(): SeqBox =
+fn buildSeqBox(): str[] =
     var items: str[]
     items = []
     add(items, "peer-a")
     add(items, "peer-b")
-    return SeqBox(items: items)
+    return items
 
-fn buildPrefixSeqBox(): PrefixSeqBox =
+fn buildPrefixSeqBox(): Result[PrefixSeqBox] =
     var items: str[]
     items = []
     add(items, "peer-a")
     add(items, "peer-b")
-    return PrefixSeqBox(
+    return Ok[PrefixSeqBox](PrefixSeqBox(
         ownerPeerId: "owner",
         mimeType: "video/mp4",
         bundleCid: "bundle",
@@ -623,9 +620,9 @@ fn buildPrefixSeqBox(): PrefixSeqBox =
         sourceBlockBytes: 4,
         objectCount: 1,
         remoteAckPeerIds: items
-    )
+    ))
 
-fn buildTrailingSeqBox(): TrailingSeqBox =
+fn buildTrailingSeqBox(): Result[TrailingSeqBox] =
     var peers: str[]
     peers = []
     add(peers, "peer-a")
@@ -636,7 +633,7 @@ fn buildTrailingSeqBox(): TrailingSeqBox =
     var droplets: str[]
     droplets = []
     add(droplets, "drop-a")
-    return TrailingSeqBox(
+    return Ok[TrailingSeqBox](TrailingSeqBox(
         ownerPeerId: "owner",
         mimeType: "video/mp4",
         bundleCid: "bundle",
@@ -649,9 +646,9 @@ fn buildTrailingSeqBox(): TrailingSeqBox =
         remoteAckPeerIds: peers,
         objects: objects,
         droplets: droplets
-    )
+    ))
 
-fn buildManualActualResult(): moq.MoqFountainBuildResult =
+fn buildManualActualResult(): Result[moq.MoqFountainBuildResult] =
     var peers: str[]
     peers = []
     add(peers, "peer-a")
@@ -692,7 +689,7 @@ fn buildManualActualResult(): moq.MoqFountainBuildResult =
     var allDroplets: moq.MoqFountainDroplet[]
     allDroplets = []
     add(allDroplets, droplet)
-    return moq.MoqFountainBuildResult(
+    return Ok[moq.MoqFountainBuildResult](moq.MoqFountainBuildResult(
         ownerPeerId: "owner",
         mimeType: "video/mp4",
         bundleCid: "bundle",
@@ -708,15 +705,15 @@ fn buildManualActualResult(): moq.MoqFountainBuildResult =
         remoteAckPeerIds: peers,
         objects: objects,
         droplets: allDroplets
-    )
+    ))
 
-fn buildNormalizedActualResult(): moq.MoqFountainBuildResult =
+fn buildNormalizedActualResult(): Result[moq.MoqFountainBuildResult] =
     let peers = moq.MoqFountainNormalizePeerCsv("peer-a,peer-b")
     var objects: moq.MoqFountainObject[]
     objects = []
     var allDroplets: moq.MoqFountainDroplet[]
     allDroplets = []
-    return moq.MoqFountainBuildResult(
+    return Ok[moq.MoqFountainBuildResult](moq.MoqFountainBuildResult(
         ownerPeerId: "owner",
         mimeType: "video/mp4",
         bundleCid: "bundle",
@@ -732,11 +729,11 @@ fn buildNormalizedActualResult(): moq.MoqFountainBuildResult =
         remoteAckPeerIds: peers,
         objects: objects,
         droplets: allDroplets
-    )
+    ))
 
-fn buildNormalizedPrefixSeqBox(): PrefixSeqBox =
+fn buildNormalizedPrefixSeqBox(): Result[PrefixSeqBox] =
     let items = moq.MoqFountainNormalizePeerCsv("peer-a,peer-b")
-    return PrefixSeqBox(
+    return Ok[PrefixSeqBox](PrefixSeqBox(
         ownerPeerId: "owner",
         mimeType: "video/mp4",
         bundleCid: "bundle",
@@ -747,7 +744,7 @@ fn buildNormalizedPrefixSeqBox(): PrefixSeqBox =
         sourceBlockBytes: 4,
         objectCount: 1,
         remoteAckPeerIds: items
-    )
+    ))
 
 fn buildLoopActualResult(): Result[moq.MoqFountainBuildResult] =
     let peers = moq.MoqFountainNormalizePeerCsv("peer-a,peer-b")
@@ -819,20 +816,23 @@ fn localMapTrimParts(parts: str[]): str[] =
 
 @exportc("moqLocalSeqBoxCount")
 fn moqLocalSeqBoxCount(): int32 =
-    let box = buildSeqBox()
-    return box.items.len
+    let items = buildSeqBox()
+    return items.len
 
 @exportc("moqResultSeqBoxCount")
 fn moqResultSeqBoxCount(): int32 =
-    let res = Ok[SeqBox](buildSeqBox())
+    let res = Ok[str[]](buildSeqBox())
     if IsErr(res):
         return -1
-    let box = Value(res)
-    return box.items.len
+    let items = Value(res)
+    return items.len
 
 @exportc("moqLocalPrefixSeqBoxCount")
 fn moqLocalPrefixSeqBoxCount(): int32 =
-    let box = buildPrefixSeqBox()
+    let boxRes = buildPrefixSeqBox()
+    if IsErr(boxRes):
+        return -1
+    let box = Value(boxRes)
     return box.remoteAckPeerIds.len
 
 @exportc("moqInlinePrefixSeqBoxCount")
@@ -857,7 +857,7 @@ fn moqInlinePrefixSeqBoxCount(): int32 =
 
 @exportc("moqResultPrefixSeqBoxCount")
 fn moqResultPrefixSeqBoxCount(): int32 =
-    let res = Ok[PrefixSeqBox](buildPrefixSeqBox())
+    let res = buildPrefixSeqBox()
     if IsErr(res):
         return -1
     let box = Value(res)
@@ -893,12 +893,15 @@ fn moqInlineTrailingSeqBoxCount(): int32 =
 
 @exportc("moqLocalTrailingSeqBoxCount")
 fn moqLocalTrailingSeqBoxCount(): int32 =
-    let box = buildTrailingSeqBox()
+    let boxRes = buildTrailingSeqBox()
+    if IsErr(boxRes):
+        return -1
+    let box = Value(boxRes)
     return box.remoteAckPeerIds.len
 
 @exportc("moqResultTrailingSeqBoxCount")
 fn moqResultTrailingSeqBoxCount(): int32 =
-    let res = Ok[TrailingSeqBox](buildTrailingSeqBox())
+    let res = buildTrailingSeqBox()
     if IsErr(res):
         return -1
     let box = Value(res)
@@ -906,12 +909,15 @@ fn moqResultTrailingSeqBoxCount(): int32 =
 
 @exportc("moqLocalManualActualRemoteAckCount")
 fn moqLocalManualActualRemoteAckCount(): int32 =
-    let built = buildManualActualResult()
+    let builtRes = buildManualActualResult()
+    if IsErr(builtRes):
+        return -1
+    let built = Value(builtRes)
     return built.remoteAckPeerIds.len
 
 @exportc("moqResultManualActualRemoteAckCount")
 fn moqResultManualActualRemoteAckCount(): int32 =
-    let res = Ok[moq.MoqFountainBuildResult](buildManualActualResult())
+    let res = buildManualActualResult()
     if IsErr(res):
         return -1
     let built = Value(res)
@@ -919,17 +925,26 @@ fn moqResultManualActualRemoteAckCount(): int32 =
 
 @exportc("moqLocalManualActualObjectCount")
 fn moqLocalManualActualObjectCount(): int32 =
-    let built = buildManualActualResult()
+    let builtRes = buildManualActualResult()
+    if IsErr(builtRes):
+        return -1
+    let built = Value(builtRes)
     return built.objects.len
 
 @exportc("moqLocalManualActualDropletCount")
 fn moqLocalManualActualDropletCount(): int32 =
-    let built = buildManualActualResult()
+    let builtRes = buildManualActualResult()
+    if IsErr(builtRes):
+        return -1
+    let built = Value(builtRes)
     return built.droplets.len
 
 @exportc("moqLocalNormalizedActualRemoteAckCount")
 fn moqLocalNormalizedActualRemoteAckCount(): int32 =
-    let built = buildNormalizedActualResult()
+    let builtRes = buildNormalizedActualResult()
+    if IsErr(builtRes):
+        return -1
+    let built = Value(builtRes)
     return built.remoteAckPeerIds.len
 
 @exportc("moqNormalizePeerCsvCount")
@@ -958,7 +973,10 @@ fn moqNormalizePeerCsvSecondLen(): int32 =
 
 @exportc("moqLocalNormalizedPrefixSeqBoxCount")
 fn moqLocalNormalizedPrefixSeqBoxCount(): int32 =
-    let built = buildNormalizedPrefixSeqBox()
+    let builtRes = buildNormalizedPrefixSeqBox()
+    if IsErr(builtRes):
+        return -1
+    let built = Value(builtRes)
     return built.remoteAckPeerIds.len
 
 @exportc("moqLocalNormalizeHardcodedCount")
