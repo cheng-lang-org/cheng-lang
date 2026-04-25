@@ -1,0 +1,96 @@
+import std/result
+import std/os
+import std/strformat
+import cheng/core/backend/system_link_exec as sexec
+import cheng/core/backend/system_link_exec_runtime as sexecrt
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/path as chengpath
+
+fn BackendDriverPureDispatchPrintErr(text: str) =
+    os.WriteLine(os.GetStderr(), text)
+
+fn BackendDriverPureDispatchRequestWithAbsoluteSourcePath(rootDir: str,
+                                                           req: creq.CompilerRequest): creq.CompilerRequest =
+    let sourceAbs = chengpath.PathAbsolute(rootDir, creq.CompilerRequestSourcePath(req))
+    return creq.CompilerRequestWithBrowserBridgeObject(creq.CompilerRequestWithSymbolVisibility(creq.CompilerRequestNew(
+        creq.CompilerRequestRootDir(req),
+        sourceAbs,
+        creq.CompilerRequestOutputPath(req),
+        creq.CompilerRequestTargetTriple(req),
+        creq.CompilerRequestEmitKind(req),
+        creq.CompilerRequestReportPath(req)
+    ),
+    creq.CompilerRequestSymbolVisibility(req)),
+    creq.CompilerRequestBrowserBridgeObjectPath(req))
+
+fn BackendDriverPureDispatchEnsureParentDir(rootDir: str,
+                                             pathRaw: str): bool =
+    let parent = chengpath.PathParentDir(chengpath.PathAbsolute(rootDir, pathRaw))
+    if len(parent) <= 0:
+        return true
+    return chengpath.MkdirP(rootDir, parent)
+
+fn BackendDriverPureDispatchWriteReport(rootDir: str,
+                                         reportPath: str,
+                                         plan: sexec.SystemLinkExecPlan,
+                                         runtimeReport: str): bool =
+    if len(reportPath) <= 0:
+        return true
+    if !BackendDriverPureDispatchEnsureParentDir(rootDir, reportPath):
+        return false
+    var report = sexec.SystemLinkExecPlanReport(plan)
+    if len(runtimeReport) > 0:
+        if len(report) > 0 && report[len(report) - 1] != '\n':
+            report = Fmt"{report}\n"
+        report = Fmt"{report}{runtimeReport}"
+    return chengpath.WriteTextFile(rootDir, reportPath, report)
+
+fn BackendDriverPureDispatchUnsupported(reason: str): int32 =
+    BackendDriverPureDispatchPrintErr(reason)
+    return 2
+
+fn BackendDriverPureDispatchRun(rootDir: str): int32 =
+    let reqRes = creq.CompilerRequestFromCmdline(rootDir)
+    if IsErr(reqRes):
+        return BackendDriverPureDispatchUnsupported(Error(reqRes))
+    let req = BackendDriverPureDispatchRequestWithAbsoluteSourcePath(rootDir, Value(reqRes))
+    let planRes = sexec.BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
+                                                                    req,
+                                                                    creq.CompilerWorldHeadFromCmdline(),
+                                                                    creq.CompilerLockPathFromCmdline(),
+                                                                    creq.CompilerBaselineSurfacePathFromCmdline(),
+                                                                    creq.CompilerChannelFromCmdline())
+    if IsErr(planRes):
+        return BackendDriverPureDispatchUnsupported(Error(planRes))
+    let plan = Value(planRes)
+    if !sexec.SystemLinkExecPlanReady(plan):
+        BackendDriverPureDispatchPrintErr(Fmt"backend driver pure system-link-exec: system missing={slplan.SystemLinkPlanListText(plan.systemLinkPlan.missingReasons)}")
+        BackendDriverPureDispatchPrintErr(Fmt"backend driver pure system-link-exec: lowering missing={slplan.SystemLinkPlanListText(plan.loweringPlan.missingReasons)}")
+        BackendDriverPureDispatchPrintErr(Fmt"backend driver pure system-link-exec: primary missing={slplan.SystemLinkPlanListText(plan.primaryObjectPlan.missingReasons)}")
+        BackendDriverPureDispatchPrintErr(Fmt"backend driver pure system-link-exec: primary first_missing_function={plan.primaryObjectPlan.firstMissingFunction}")
+        BackendDriverPureDispatchPrintErr(Fmt"backend driver pure system-link-exec: primary first_missing_body_kind={plan.primaryObjectPlan.firstMissingBodyKind}")
+        BackendDriverPureDispatchPrintErr(Fmt"backend driver pure system-link-exec: primary first_missing_typed_ir_kind={plan.primaryObjectPlan.firstMissingTypedIrKind}")
+        BackendDriverPureDispatchPrintErr(Fmt"backend driver pure system-link-exec: primary first_missing_line_number={intToStr(plan.primaryObjectPlan.firstMissingLineNumber)}")
+        BackendDriverPureDispatchPrintErr(Fmt"backend driver pure system-link-exec: object missing={slplan.SystemLinkPlanListText(plan.objectPlan.missingReasons)}")
+        BackendDriverPureDispatchPrintErr(Fmt"backend driver pure system-link-exec: native missing={slplan.SystemLinkPlanListText(plan.nativeLinkPlan.missingReasons)}")
+        let _ = BackendDriverPureDispatchWriteReport(rootDir,
+                                                     creq.CompilerRequestReportPath(req),
+                                                     plan,
+                                                     "system_link_exec_runtime_execute=0")
+        BackendDriverPureDispatchPrintErr("backend driver pure system-link-exec: plan not ready")
+        return 2
+    let browserBridgeObjectPath = sexec.SystemLinkExecBrowserBridgeObjectPath(plan)
+    if len(browserBridgeObjectPath) > 0:
+        return BackendDriverPureDispatchUnsupported("backend driver pure system-link-exec: browser bridge object not yet in pure runtime")
+    let execRes = sexecrt.SystemLinkExecRuntimeExecutePlanWithCompiler(rootDir, plan, "")
+    if IsErr(execRes):
+        let _ = BackendDriverPureDispatchWriteReport(rootDir,
+                                                     creq.CompilerRequestReportPath(req),
+                                                     plan,
+                                                     Fmt"system_link_exec_runtime_execute=error\n{Error(execRes)}")
+        return BackendDriverPureDispatchUnsupported(Error(execRes))
+    let runtimeReport = sexecrt.SystemLinkExecRuntimeResultReport(Value(execRes))
+    if !BackendDriverPureDispatchWriteReport(rootDir, creq.CompilerRequestReportPath(req), plan, runtimeReport):
+        return BackendDriverPureDispatchUnsupported(Fmt"backend driver pure system-link-exec: failed to write report: {creq.CompilerRequestReportPath(req)}")
+    return 0

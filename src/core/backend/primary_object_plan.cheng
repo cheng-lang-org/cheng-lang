@@ -185,28 +185,28 @@ fn PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind: str): bool =
     return PrimaryStartsWith(bodyKind, texpr.BodyKindLetCallNoargReturnI32ConstPrefix)
 
 fn PrimaryStatementReturnModeNone(): int32 =
-    return 0
+    return texpr.StatementReturnModeNone
 
 fn PrimaryStatementReturnModeI32Const(): int32 =
-    return 1
+    return texpr.StatementReturnModeI32Const
 
 fn PrimaryStatementReturnModeCallResultI32(): int32 =
-    return 2
+    return texpr.StatementReturnModeCallResultI32
 
 fn PrimaryStatementReturnModeI32GuardResultLeZero(): int32 =
-    return 3
+    return texpr.StatementReturnModeI32GuardResultLeZero
 
 fn PrimaryStatementReturnModeStrLen(): int32 =
-    return 4
+    return texpr.StatementReturnModeStrLen
 
 fn PrimaryStatementReturnModeStrThenCallReturnI32Const0(): int32 =
-    return 5
+    return texpr.StatementReturnModeStrThenCallReturnI32Const0
 
 fn PrimaryStatementReturnModeStrI32GuardArg0Return0(): int32 =
-    return 6
+    return texpr.StatementReturnModeStrI32GuardArg0Return0
 
 fn PrimaryStatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32(): int32 =
-    return 7
+    return texpr.StatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32
 
 fn PrimaryStatementSequenceReturnMode(bodyKind: str): int32 =
     if PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
@@ -233,6 +233,57 @@ fn PrimaryStatementSequenceI32Value(bodyKind: str): int32 =
     if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
         return 0
     return 0
+
+fn PrimaryStatementSequenceWordCount(mode: int32): int32 =
+    if mode == PrimaryStatementReturnModeI32Const():
+        return 6
+    if mode == PrimaryStatementReturnModeCallResultI32():
+        return 5
+    if mode == PrimaryStatementReturnModeI32GuardResultLeZero():
+        return 10
+    if mode == PrimaryStatementReturnModeStrLen():
+        return 12
+    if mode == PrimaryStatementReturnModeStrThenCallReturnI32Const0():
+        return 9
+    if mode == PrimaryStatementReturnModeStrI32GuardArg0Return0():
+        return 14
+    if mode == PrimaryStatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32():
+        return 18
+    return 0
+
+fn PrimaryStatementSequenceRequiredCallCount(mode: int32): int32 =
+    if mode == PrimaryStatementReturnModeI32Const() ||
+       mode == PrimaryStatementReturnModeCallResultI32() ||
+       mode == PrimaryStatementReturnModeI32GuardResultLeZero() ||
+       mode == PrimaryStatementReturnModeStrLen():
+        return 1
+    if mode == PrimaryStatementReturnModeStrThenCallReturnI32Const0():
+        return 2
+    if mode == PrimaryStatementReturnModeStrI32GuardArg0Return0():
+        return 4
+    if mode == PrimaryStatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32():
+        return 5
+    return 0
+
+fn PrimaryBodyRequiresCallSequence(bodyKind: str,
+                                   statementMode: int32): bool =
+    if bodyKind == texpr.BodyKindStatementSequence:
+        return PrimaryStatementSequenceRequiredCallCount(statementMode) > 0
+    return texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
+           PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind)
+
+fn PrimaryStatementSequenceFirstRelocWordOffset(wordOffset: int32,
+                                                 mode: int32): int32 =
+    if mode == PrimaryStatementReturnModeI32Const() ||
+       mode == PrimaryStatementReturnModeCallResultI32() ||
+       mode == PrimaryStatementReturnModeI32GuardResultLeZero():
+        return wordOffset + 2
+    if mode == PrimaryStatementReturnModeStrLen() ||
+       mode == PrimaryStatementReturnModeStrThenCallReturnI32Const0() ||
+       mode == PrimaryStatementReturnModeStrI32GuardArg0Return0() ||
+       mode == PrimaryStatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32():
+        return wordOffset + 3
+    return wordOffset
 
 fn PrimaryPlanBodyKind(bodyKind: str): str =
     if PrimaryStatementSequenceReturnMode(bodyKind) != PrimaryStatementReturnModeNone():
@@ -432,7 +483,10 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
         if irIndex >= 0:
             signatureLineNumber = lowering.primaryObjectIr.functions[irIndex].signatureLineNumber
             irIndexes[i] = irIndex
-            wordCounts[i] = PrimaryFunctionWordCountForBodyKind(lowering.primaryObjectIr.functions[irIndex].bodyKind)
+            if lowering.primaryObjectIr.functions[irIndex].bodyKind == texpr.BodyKindStatementSequence:
+                wordCounts[i] = PrimaryStatementSequenceWordCount(lowering.primaryObjectIr.functions[irIndex].statementReturnMode)
+            else:
+                wordCounts[i] = PrimaryFunctionWordCountForBodyKind(lowering.primaryObjectIr.functions[irIndex].bodyKind)
         var symbolText = lowering.functionSymbolTexts[i]
         if i < lowering.functionExportedFlags.len &&
            i < lowering.functionExportSymbolNames.len &&
@@ -487,8 +541,8 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                     firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
                 continue
             let bodyKind = irFunction.bodyKind
-            if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
-               PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+            let statementMode = irFunction.statementReturnMode
+            if PrimaryBodyRequiresCallSequence(bodyKind, statementMode):
                 var callSequenceReady = true
                 if irFunction.callTargets.len <= 0 ||
                    irFunction.callArgCounts.len != irFunction.callTargets.len ||
@@ -533,8 +587,8 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
             if irIndex < 0 || wordCounts[i] <= 0:
                 continue
             let bodyKind = lowering.primaryObjectIr.functions[irIndex].bodyKind
-            if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
-               PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+            if PrimaryBodyRequiresCallSequence(bodyKind,
+                                               lowering.primaryObjectIr.functions[irIndex].statementReturnMode):
                 continue
             reachable[i] = true
     for i in 0..<lowering.functionNames.len:
@@ -552,8 +606,8 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
             continue
         let irFunction = lowering.primaryObjectIr.functions[irIndex]
         let bodyKind = irFunction.bodyKind
-        if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
-           PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+        let statementMode = irFunction.statementReturnMode
+        if PrimaryBodyRequiresCallSequence(bodyKind, statementMode):
             var callSequenceReady = true
             if irFunction.callTargets.len <= 0 ||
                irFunction.callArgCounts.len != irFunction.callTargets.len ||
@@ -613,15 +667,16 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                 firstMissingTypedIrKind = PrimaryObjectMissingTypedIrKind(lowering, irIndex)
                 firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
             continue
-        if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
-           PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
-            var requiredCallCount = 1
-            if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
-                requiredCallCount = 2
-            if bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
-                requiredCallCount = 4
-            if bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
-                requiredCallCount = 5
+        if PrimaryBodyRequiresCallSequence(bodyKind, statementMode):
+            var requiredCallCount = PrimaryStatementSequenceRequiredCallCount(statementMode)
+            if requiredCallCount <= 0:
+                requiredCallCount = 1
+                if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+                    requiredCallCount = 2
+                if bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
+                    requiredCallCount = 4
+                if bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
+                    requiredCallCount = 5
             if targetSymbols.len < requiredCallCount:
                 bodySemanticsMissing = true
                 if len(firstMissingFunction) <= 0:
@@ -632,36 +687,45 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                 continue
         let itemId = int32(100000 + i)
         let wordOffset = totalWordCount
+        var planStatementMode = PrimaryStatementSequenceReturnMode(bodyKind)
+        var planStatementI32Value = PrimaryStatementSequenceI32Value(bodyKind)
+        if bodyKind == texpr.BodyKindStatementSequence:
+            planStatementMode = statementMode
+            planStatementI32Value = irFunction.statementReturnI32Value
         add(itemIds, itemId)
         add(symbolNames, allSymbolNames[i])
         add(functionWordOffsets, wordOffset)
         add(functionWordCounts, wordCount)
         add(functionBodyKinds, PrimaryPlanBodyKind(bodyKind))
-        add(functionStatementReturnModes, PrimaryStatementSequenceReturnMode(bodyKind))
-        add(functionStatementReturnI32Values, PrimaryStatementSequenceI32Value(bodyKind))
+        add(functionStatementReturnModes, planStatementMode)
+        add(functionStatementReturnI32Values, planStatementI32Value)
         add(functionStatementCallCounts, irFunction.callTargets.len)
-        if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
-           PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+        if PrimaryBodyRequiresCallSequence(bodyKind, planStatementMode):
             var relocWordOffset = wordOffset
-            if PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind) ||
-               texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind) ||
-               bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
-                relocWordOffset = wordOffset + 2
-            elif texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind) ||
-                 texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
-                relocWordOffset = wordOffset + 3
-            elif bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
-                relocWordOffset = wordOffset + 3
-            elif bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
-                relocWordOffset = wordOffset + 3
+            if bodyKind == texpr.BodyKindStatementSequence:
+                relocWordOffset = PrimaryStatementSequenceFirstRelocWordOffset(wordOffset, planStatementMode)
+            else:
+                if PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind) ||
+                   texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind) ||
+                   bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
+                    relocWordOffset = wordOffset + 2
+                elif texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind) ||
+                     texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+                    relocWordOffset = wordOffset + 3
+                elif bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
+                    relocWordOffset = wordOffset + 3
+                elif bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
+                    relocWordOffset = wordOffset + 3
             add(relocSourceItemIds, itemId)
             add(relocWordOffsets, relocWordOffset)
             add(relocTargetSymbols, targetSymbols[0])
-            if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+            if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind) ||
+               planStatementMode == PrimaryStatementReturnModeStrThenCallReturnI32Const0():
                 add(relocSourceItemIds, itemId)
                 add(relocWordOffsets, wordOffset + 5)
                 add(relocTargetSymbols, targetSymbols[1])
-            if bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
+            if bodyKind == texpr.BodyKindStrI32GuardArg0Return0 ||
+               planStatementMode == PrimaryStatementReturnModeStrI32GuardArg0Return0():
                 add(relocSourceItemIds, itemId)
                 add(relocWordOffsets, wordOffset + 5)
                 add(relocTargetSymbols, targetSymbols[1])
@@ -671,7 +735,8 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                 add(relocSourceItemIds, itemId)
                 add(relocWordOffsets, wordOffset + 10)
                 add(relocTargetSymbols, targetSymbols[3])
-            if bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
+            if bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32 ||
+               planStatementMode == PrimaryStatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32():
                 add(relocSourceItemIds, itemId)
                 add(relocWordOffsets, wordOffset + 5)
                 add(relocTargetSymbols, targetSymbols[1])

@@ -1,5 +1,6 @@
 import std/result
 import std/strformat
+import std/strutils as strutil
 import cheng/std/bytes_layout as layout
 import cheng/core/tooling/path as chengpath
 import cheng/core/tooling/compiler_world as cworld
@@ -32,6 +33,8 @@ type
         signatureLineNumber: int32
         bodyLineNumber: int32
         bodyKind: str
+        statementReturnMode: int32
+        statementReturnI32Value: int32
         statementCount: int32
         statements: PrimaryObjectIrStatement[]
         callTargetCount: int32
@@ -269,6 +272,13 @@ fn LoweringPrimaryObjectIrBodyKindForCallArgCount(callArgCount: int32): str =
         return texpr.BodyKindReturnCallArg0Arg1Arg2I32
     return texpr.BodyKindUnsupported
 
+fn LoweringSetStatementSequenceReturn(fnIr: var PrimaryObjectIrFunction,
+                                       mode: int32,
+                                       i32Value: int32) =
+    fnIr.bodyKind = texpr.BodyKindStatementSequence
+    fnIr.statementReturnMode = mode
+    fnIr.statementReturnI32Value = i32Value
+
 fn LoweringFunctionDeclLine(sourceTexts: texpr.TypedExprSourceText[],
                              sourcePath: str,
                              functionName: str): str =
@@ -450,7 +460,8 @@ fn LoweringAppendPrimaryObjectIrCallTarget(fnIr: var PrimaryObjectIrFunction,
 
 fn LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr: var PrimaryObjectIrFunction,
                                                            sourceTexts: texpr.TypedExprSourceText[]) =
-    if fnIr.bodyKind != texpr.BodyKindStrI32GuardArg0Return0:
+    if fnIr.bodyKind != texpr.BodyKindStatementSequence ||
+       fnIr.statementReturnMode != texpr.StatementReturnModeStrI32GuardArg0Return0:
         return
     if fnIr.callTargets.len > 0:
         return
@@ -526,7 +537,9 @@ fn LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr: var PrimaryO
         return
     if fifthArgs[0] != firstName || fifthArgs[1] != thirdName:
         return
-    fnIr.bodyKind = texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32
+    LoweringSetStatementSequenceReturn(fnIr,
+                                       texpr.StatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32,
+                                       0)
     LoweringAppendPrimaryObjectIrCallTarget(fnIr, first, sourceTexts)
     LoweringAppendPrimaryObjectIrCallTarget(fnIr, second, sourceTexts)
     LoweringAppendPrimaryObjectIrCallTarget(fnIr, third, sourceTexts)
@@ -712,7 +725,9 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                             add(fnIr.callTargetSourcePaths, fourthFact.callTargetSourcePath)
                                             add(fnIr.callTargetImportcFlags, fourthFact.callTargetImportc)
                                             add(fnIr.callImportcSymbols, fourthImportcSymbol)
-                                            fnIr.bodyKind = texpr.BodyKindStrI32GuardArg0Return0
+                                            LoweringSetStatementSequenceReturn(fnIr,
+                                                                               texpr.StatementReturnModeStrI32GuardArg0Return0,
+                                                                               0)
                         elif letCallReturnKind == texpr.BodyKindLetCallStrThenCallArg0ReturnI32Const0:
                             let typedFn = plan.typedIr.functions[typedFnIndex]
                             if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
@@ -761,7 +776,9 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                         add(fnIr.callTargetSourcePaths, secondFact.callTargetSourcePath)
                                         add(fnIr.callTargetImportcFlags, secondFact.callTargetImportc)
                                         add(fnIr.callImportcSymbols, secondImportcSymbol)
-                                        fnIr.bodyKind = texpr.BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0
+                                        LoweringSetStatementSequenceReturn(fnIr,
+                                                                           texpr.StatementReturnModeStrThenCallReturnI32Const0,
+                                                                           0)
                         elif fact.callArgCount == 0:
                             let factType = texpr.TypedExprNormalizeTypeText(fact.typeText)
                             if factType == "int32":
@@ -771,14 +788,20 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                                                                      fact.callTargetSourcePath,
                                                                                      fact.callTarget)
                                 if letCallReturnKind == texpr.BodyKindLetCallReturnResultI32:
-                                    fnIr.bodyKind = texpr.BodyKindLetCallNoargReturnResultI32
+                                    LoweringSetStatementSequenceReturn(fnIr,
+                                                                       texpr.StatementReturnModeCallResultI32,
+                                                                       0)
                                 elif letCallReturnKind == texpr.BodyKindLetCallI32IfResultLeZeroReturnZeroElseResultI32:
-                                    fnIr.bodyKind = texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32
+                                    LoweringSetStatementSequenceReturn(fnIr,
+                                                                       texpr.StatementReturnModeI32GuardResultLeZero,
+                                                                       0)
                                 elif chengpath.TextStartsWith(letCallReturnKind, texpr.BodyKindLetCallReturnI32ConstPrefix):
                                     let literalText = chengpath.TextSlice(letCallReturnKind,
                                                                           letCallReturnLiteralStart,
                                                                           len(letCallReturnKind) - letCallReturnLiteralStart)
-                                    fnIr.bodyKind = Fmt"{texpr.BodyKindLetCallNoargReturnI32ConstPrefix}{literalText}"
+                                    LoweringSetStatementSequenceReturn(fnIr,
+                                                                       texpr.StatementReturnModeI32Const,
+                                                                       int32(strutil.ParseInt(literalText)))
                                 if fnIr.bodyKind != texpr.BodyKindUnsupported:
                                     add(fnIr.callArgCounts, fact.callArgCount)
                                     add(fnIr.callTargets, fact.callTarget)
@@ -797,7 +820,9 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                     add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
                                     add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
                                     add(fnIr.callImportcSymbols, firstImportcSymbol)
-                                    fnIr.bodyKind = texpr.BodyKindLetCallNoargStrReturnLenI32
+                                    LoweringSetStatementSequenceReturn(fnIr,
+                                                                       texpr.StatementReturnModeStrLen,
+                                                                       0)
         if hasLetCall && fnIr.bodyKind == texpr.BodyKindUnsupported && leafBodyKind != texpr.BodyKindUnsupported:
             fnIr.bodyKind = leafBodyKind
         if fnIr.bodyKind == texpr.BodyKindUnsupported && typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
@@ -878,7 +903,9 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                             add(fnIr.callTargetSourcePaths, secondFact.callTargetSourcePath)
                             add(fnIr.callTargetImportcFlags, secondFact.callTargetImportc)
                             add(fnIr.callImportcSymbols, secondImportcSymbol)
-                            fnIr.bodyKind = texpr.BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0
+                            LoweringSetStatementSequenceReturn(fnIr,
+                                                               texpr.StatementReturnModeStrThenCallReturnI32Const0,
+                                                               0)
         if fnIr.bodyKind == texpr.BodyKindUnsupported:
             LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr, sourceTexts)
         LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr, sourceTexts)
@@ -962,6 +989,14 @@ fn LoweringPrimaryObjectIrCountBodyKind(ir: PrimaryObjectIr,
             count = count + 1
     return count
 
+fn LoweringPrimaryObjectIrCountStatementReturnMode(ir: PrimaryObjectIr,
+                                                    mode: int32): int32 =
+    var count: int32
+    for i in 0..<ir.functions.len:
+        if ir.functions[i].statementReturnMode == mode:
+            count = count + 1
+    return count
+
 fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     var out = ""
     var callSequenceCounts = ""
@@ -971,6 +1006,8 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     var statementSequenceTargets = ""
     var statementSequenceBindings = ""
     var statementSequenceResultTypes = ""
+    var statementReturnModes = ""
+    var statementReturnI32Values = ""
     for i in 0..<ir.functions.len:
         if i > 0:
             callSequenceCounts = Fmt"{callSequenceCounts},"
@@ -980,6 +1017,8 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
             statementSequenceTargets = Fmt"{statementSequenceTargets},"
             statementSequenceBindings = Fmt"{statementSequenceBindings},"
             statementSequenceResultTypes = Fmt"{statementSequenceResultTypes},"
+            statementReturnModes = Fmt"{statementReturnModes},"
+            statementReturnI32Values = Fmt"{statementReturnI32Values},"
         let targetCount: int32 = ir.functions[i].callTargets.len
         callSequenceCounts = Fmt"{callSequenceCounts}{intToStr(targetCount)}"
         if targetCount <= 0:
@@ -997,6 +1036,8 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
             callSequenceTargets = Fmt"{callSequenceTargets}{sequenceText}"
         let stmtCount: int32 = ir.functions[i].statements.len
         statementSequenceCounts = Fmt"{statementSequenceCounts}{intToStr(stmtCount)}"
+        statementReturnModes = Fmt"{statementReturnModes}{intToStr(ir.functions[i].statementReturnMode)}"
+        statementReturnI32Values = Fmt"{statementReturnI32Values}{intToStr(ir.functions[i].statementReturnI32Value)}"
         if stmtCount <= 0:
             statementSequenceKinds = Fmt"{statementSequenceKinds}-"
             statementSequenceTargets = Fmt"{statementSequenceTargets}-"
@@ -1071,6 +1112,8 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     LoweringAppendLine(out, "primary_object_ir_statement_sequence_targets", statementSequenceTargets)
     LoweringAppendLine(out, "primary_object_ir_statement_sequence_bindings", statementSequenceBindings)
     LoweringAppendLine(out, "primary_object_ir_statement_sequence_result_types", statementSequenceResultTypes)
+    LoweringAppendLine(out, "primary_object_ir_statement_return_modes", statementReturnModes)
+    LoweringAppendLine(out, "primary_object_ir_statement_return_i32_values", statementReturnI32Values)
     LoweringAppendLine(out, "primary_object_ir_return_zero_i32_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnZeroI32)))
     LoweringAppendLine(out, "primary_object_ir_return_i32_add_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32AddArgs)))
     LoweringAppendLine(out, "primary_object_ir_return_i32_sub_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32SubArgs)))
@@ -1081,10 +1124,10 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     LoweringAppendLine(out, "primary_object_ir_str_len_fast_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindStrLenFastI32)))
     LoweringAppendLine(out, "primary_object_ir_return_str_arg0_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnStrArg0)))
     LoweringAppendLine(out, "primary_object_ir_return_str_empty_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnStrEmpty)))
-    LoweringAppendLine(out, "primary_object_ir_let_call_noarg_i32_if_result_le_zero_return_zero_else_result_i32_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32)))
-    LoweringAppendLine(out, "primary_object_ir_let_call_noarg_str_return_len_i32_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindLetCallNoargStrReturnLenI32)))
-    LoweringAppendLine(out, "primary_object_ir_let_call_noarg_str_then_call_arg0_return_i32_const_0_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0)))
-    LoweringAppendLine(out, "primary_object_ir_str_i32_guard_arg0_return_0_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindStrI32GuardArg0Return0)))
+    LoweringAppendLine(out, "primary_object_ir_statement_return_i32_guard_result_le_zero_count", intToStr(LoweringPrimaryObjectIrCountStatementReturnMode(ir, texpr.StatementReturnModeI32GuardResultLeZero)))
+    LoweringAppendLine(out, "primary_object_ir_statement_return_str_len_count", intToStr(LoweringPrimaryObjectIrCountStatementReturnMode(ir, texpr.StatementReturnModeStrLen)))
+    LoweringAppendLine(out, "primary_object_ir_statement_return_str_then_call_i32_const_0_count", intToStr(LoweringPrimaryObjectIrCountStatementReturnMode(ir, texpr.StatementReturnModeStrThenCallReturnI32Const0)))
+    LoweringAppendLine(out, "primary_object_ir_statement_return_str_i32_guard_arg0_return_0_count", intToStr(LoweringPrimaryObjectIrCountStatementReturnMode(ir, texpr.StatementReturnModeStrI32GuardArg0Return0)))
     LoweringAppendLine(out, "primary_object_ir_cstring_to_str_copy_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindCstringToStrCopy)))
     LoweringAppendLine(out, "primary_object_ir_main_f64_mul_check_exit_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindMainF64MulCheckExit)))
     return out

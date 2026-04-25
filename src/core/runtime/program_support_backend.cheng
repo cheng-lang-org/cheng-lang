@@ -64,10 +64,6 @@ fn libc_fflush(stream: ptr): int32
 fn libc_fgetc(stream: ptr): int32
 @importc("cheng_host_getcwd")
 fn libc_getcwd(buf: ptr, size: int64): ptr
-@importc("cheng_host_getenv")
-fn libc_getenv(name: ptr): ptr
-@importc("cheng_host_setenv")
-fn libc_setenv(name: ptr, value: ptr, overwrite: int32): int32
 @importc("cheng_host_getentropy")
 fn libc_getentropy(buf: ptr, size: int32): int32
 @importc("cheng_host_usleep")
@@ -820,67 +816,6 @@ fn cheng_getcwd(): ptr =
         return cheng_getcwd_buf
     *(UInt8Ptr(cheng_ptr_plus(cheng_getcwd_buf, 4095))) = uint8(0)
     return cheng_getcwd_buf
-
-fn cheng_backend_driver_root_strip_char(ch: uint8): bool =
-    if ch == uint8(32):
-        return true
-    if ch == uint8(9):
-        return true
-    if ch == uint8(10):
-        return true
-    if ch == uint8(13):
-        return true
-    return false
-
-fn cheng_backend_driver_root_strip_cstring(raw: ptr): str =
-    let n = cheng_cstrlen_raw(raw)
-    if raw == nil || n <= 0:
-        return cheng_str_empty()
-    var start: int32
-    var stop = n - 1
-    while start <= stop:
-        let ch = *(UInt8Ptr(cheng_ptr_plus(raw, start)))
-        if !cheng_backend_driver_root_strip_char(ch):
-            break
-        start = start + 1
-    while stop >= start:
-        let ch = *(UInt8Ptr(cheng_ptr_plus(raw, stop)))
-        if !cheng_backend_driver_root_strip_char(ch):
-            break
-        stop = stop - 1
-    if stop < start:
-        return cheng_str_empty()
-    let outLen = stop - start + 1
-    if start == 0 && outLen == n:
-        return cheng_str_view(raw, n)
-    return cheng_str_copy(cheng_ptr_plus(raw, start), outLen)
-
-@exportc("cheng_backend_driver_root")
-fn cheng_backend_driver_root_export(): str =
-    let envRoot = cheng_backend_driver_root_strip_cstring(libc_getenv("CHENG_ROOT"))
-    if cheng_str_len(envRoot) > 0:
-        return envRoot
-    let cwd = cheng_getcwd()
-    return cheng_str_copy(cwd, cheng_cstrlen_raw(cwd))
-
-@exportc("cheng_backend_driver_ensure_root_env")
-fn cheng_backend_driver_ensure_root_env_export(rootDir: str) =
-    let envRoot = cheng_backend_driver_root_strip_cstring(libc_getenv("CHENG_ROOT"))
-    if cheng_str_len(envRoot) > 0:
-        return
-    if !cheng_probably_valid_str_bridge(rootDir):
-        return
-    if cheng_str_len(rootDir) <= 0:
-        return
-    var valueRaw = rootDir.data
-    var copied: ptr
-    if rootDir.flags != chengStrFlagOwned:
-        copied = cheng_string_copy(rootDir.data, rootDir.len)
-        valueRaw = copied
-    if valueRaw != nil:
-        let _ = libc_setenv("CHENG_ROOT", valueRaw, 1)
-    if copied != nil:
-        cheng_free_export(copied)
 
 fn cheng_system_entropy_fill(dst: ptr, len: int32): int32 =
     if dst == nil || len <= 0:
