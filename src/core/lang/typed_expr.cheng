@@ -93,6 +93,7 @@ type
         TypedExprIrOpStrEmptyReturn
         TypedExprIrOpLetCallStrReturnLenI32
         TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0
+        TypedExprIrOpStrI32GuardArg0Return0
 
     TypedExprArgPassKind = enum
         TypedExprArgPassValue
@@ -565,6 +566,8 @@ fn TypedExprIrOpKindText(kind: TypedExprIrOpKind): str =
         return "let_call_str_return_len_i32"
     if kind == TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0:
         return "let_call_str_then_call_arg0_return_i32_const_0"
+    if kind == TypedExprIrOpStrI32GuardArg0Return0:
+        return "str_i32_guard_arg0_return_0"
     return "unsupported"
 
 fn TypedExprReturnOpKindFromIrOp(kind: TypedExprIrOpKind): TypedExprReturnOpKind =
@@ -1793,6 +1796,7 @@ fn TypedExprIrReportText(ir: TypedExprIr): str =
     TypedExprReportAppendLine(out, "typed_ir_str_empty_return_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpStrEmptyReturn)))
     TypedExprReportAppendLine(out, "typed_ir_let_call_str_return_len_i32_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpLetCallStrReturnLenI32)))
     TypedExprReportAppendLine(out, "typed_ir_let_call_str_then_call_arg0_return_i32_const_0_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0)))
+    TypedExprReportAppendLine(out, "typed_ir_str_i32_guard_arg0_return_0_count", intToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpStrI32GuardArg0Return0)))
     TypedExprReportAppendLine(out, "typed_ir_return_i32_const_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Const)))
     TypedExprReportAppendLine(out, "typed_ir_return_i32_add_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Add)))
     TypedExprReportAppendLine(out, "typed_ir_return_i32_sub_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpI32Sub)))
@@ -1807,6 +1811,7 @@ fn TypedExprIrReportText(ir: TypedExprIr): str =
     TypedExprReportAppendLine(out, "typed_ir_return_str_empty_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpStrEmptyReturn)))
     TypedExprReportAppendLine(out, "typed_ir_return_let_call_str_return_len_i32_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpLetCallStrReturnLenI32)))
     TypedExprReportAppendLine(out, "typed_ir_return_let_call_str_then_call_arg0_return_i32_const_0_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0)))
+    TypedExprReportAppendLine(out, "typed_ir_return_str_i32_guard_arg0_return_0_count", intToStr(TypedExprIrReturnCountOpKind(ir, TypedExprIrOpStrI32GuardArg0Return0)))
     return out
 
 fn TypedExprLoweringRulesReportText(rules: TypedExprLoweringRule[]): str =
@@ -2848,6 +2853,62 @@ fn TypedExprFunctionBodyIsStrLetCallThenCallArg0ReturnZero(ctx: TypedExprSourceC
     bindingName = firstBinding
     return true
 
+fn TypedExprFunctionBodyIsStrI32GuardArg0ReturnZero(ctx: TypedExprSourceContext,
+                                                     scope: TypedExprFunctionScope,
+                                                     secondCallLineNumber: var int32,
+                                                     countCallLineNumber: var int32,
+                                                     guardCallLineNumber: var int32,
+                                                     returnLineNumber: var int32,
+                                                     bindingName: var str): bool =
+    secondCallLineNumber = 0
+    countCallLineNumber = 0
+    guardCallLineNumber = 0
+    returnLineNumber = 0
+    bindingName = ""
+    if scope.returnType != "int32":
+        return false
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        return false
+    var bodyLines: str[]
+    var bodyLineNumbers: int32[]
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        add(bodyLines, bodyTrim)
+        add(bodyLineNumbers, i + 1)
+    if bodyLines.len != 7:
+        return false
+    if !TypedExprIrBodyTextIsStrLetCall(bodyLines[0]):
+        return false
+    let firstBinding = TypedExprLetCallBindingNameFromBody(bodyLines[0])
+    if firstBinding == "":
+        return false
+    if !TypedExprCallStatementUsesBindingArg0(bodyLines[1], firstBinding):
+        return false
+    if !TypedExprIrBodyTextIsI32LetCall(bodyLines[2]):
+        return false
+    let countBinding = TypedExprLetCallBindingNameFromBody(bodyLines[2])
+    if countBinding == "":
+        return false
+    if bodyLines[3] != Fmt(["if ", countBinding, " <= 0:"]):
+        return false
+    if !TypedExprCallStatementUsesBindingArg0(bodyLines[4], firstBinding):
+        return false
+    if TypedExprReturnConstTextFromLine(bodyLines[5]) != "0":
+        return false
+    if TypedExprReturnConstTextFromLine(bodyLines[6]) != "0":
+        return false
+    secondCallLineNumber = bodyLineNumbers[1]
+    countCallLineNumber = bodyLineNumbers[2]
+    guardCallLineNumber = bodyLineNumbers[4]
+    returnLineNumber = bodyLineNumbers[6]
+    bindingName = firstBinding
+    return true
+
 fn TypedExprIrAddLetCallNode(ir: var TypedExprIr,
                               sourcePath: str,
                               functionName: str,
@@ -2943,6 +3004,25 @@ fn TypedExprIrAddLetCallStrThenCallArg0ReturnI32Const0Node(ir: var TypedExprIr,
                                 secondCallLineNumber,
                                 -1,
                                 -1)
+
+fn TypedExprIrAddStrI32GuardArg0Return0Node(ir: var TypedExprIr,
+                                             sourcePath: str,
+                                             functionName: str,
+                                             returnLineNumber: int32,
+                                             secondCallLineNumber: int32,
+                                             countCallLineNumber: int32,
+                                             guardCallLineNumber: int32,
+                                             bindingName: str): int32 =
+    return TypedExprIrAddOpNode(ir,
+                                sourcePath,
+                                functionName,
+                                returnLineNumber,
+                                TypedExprIrOpStrI32GuardArg0Return0,
+                                "int32",
+                                bindingName,
+                                secondCallLineNumber,
+                                countCallLineNumber,
+                                guardCallLineNumber)
 
 fn TypedExprReturnConstTextFromLine(lineRaw: str): str =
     let exprText = TypedExprReturnExprFromBody(lineRaw)
@@ -3336,6 +3416,26 @@ fn TypedExprIrBuildReturnNode(ir: var TypedExprIr,
                                                                        letCallStrThenCallReturnLineNumber,
                                                                        letCallStrSecondCallLineNumber,
                                                                        letCallStrThenCallBinding)
+    var strI32SecondCallLineNumber: int32
+    var strI32CountCallLineNumber: int32
+    var strI32GuardCallLineNumber: int32
+    var strI32ReturnLineNumber: int32
+    var strI32Binding = ""
+    if TypedExprFunctionBodyIsStrI32GuardArg0ReturnZero(ctx,
+                                                        scope,
+                                                        strI32SecondCallLineNumber,
+                                                        strI32CountCallLineNumber,
+                                                        strI32GuardCallLineNumber,
+                                                        strI32ReturnLineNumber,
+                                                        strI32Binding):
+        return TypedExprIrAddStrI32GuardArg0Return0Node(ir,
+                                                        ctx.sourcePath,
+                                                        scope.name,
+                                                        strI32ReturnLineNumber,
+                                                        strI32SecondCallLineNumber,
+                                                        strI32CountCallLineNumber,
+                                                        strI32GuardCallLineNumber,
+                                                        strI32Binding)
     if scope.returnType == "int32" && TypedExprIrIsI32ConstLiteral(returnExpr):
         return TypedExprIrAddI32ConstNode(ir,
                                           ctx.sourcePath,

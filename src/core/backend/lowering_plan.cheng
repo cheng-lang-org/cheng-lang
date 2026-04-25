@@ -77,6 +77,7 @@ const
     LoweringLetCallNoargStrReturnLenI32Kind = "let_call_noarg_str_return_len_i32"
     LoweringLetCallStrThenCallArg0ReturnI32Const0Kind = "let_call_str_then_call_arg0_return_i32_const_0"
     LoweringLetCallNoargStrThenCallArg0ReturnI32Const0Kind = "let_call_noarg_str_then_call_arg0_return_i32_const_0"
+    LoweringStrI32GuardArg0Return0Kind = "str_i32_guard_arg0_return_0"
 
 fn LoweringCallConvInternal(): int32 =
     return 1
@@ -153,6 +154,8 @@ fn LoweringPrimaryObjectIrBodyKindFromTypedIrOp(node: texpr.TypedExprIrNode): st
         return "str_len_fast_i32"
     if node.opKind == texpr.TypedExprIrOpStrEmptyReturn:
         return "return_str_empty"
+    if node.opKind == texpr.TypedExprIrOpStrI32GuardArg0Return0:
+        return LoweringStrI32GuardArg0Return0Kind
     if node.opKind == texpr.TypedExprIrOpMainF64MulCheckExit:
         return "main_f64_mul_check_exit"
     return "unsupported"
@@ -191,18 +194,30 @@ fn LoweringPrimaryObjectIrLetCallReturnBodyKind(ir: texpr.TypedExprIr,
     if fnIr.returnNodeIndex < 0 || fnIr.returnNodeIndex >= ir.nodes.len:
         return "unsupported"
     let returnNode = ir.nodes[fnIr.returnNodeIndex]
-    if !LoweringTypedIrFunctionHasOpKind(ir, fnIndex, texpr.TypedExprIrOpLetCall):
-        return "unsupported"
     if returnNode.opKind == texpr.TypedExprIrOpI32Const:
+        if !LoweringTypedIrFunctionHasOpKind(ir, fnIndex, texpr.TypedExprIrOpLetCall):
+            return "unsupported"
         return Fmt([LoweringLetCallReturnI32ConstPrefix, returnNode.literalText])
     if returnNode.opKind == texpr.TypedExprIrOpLetCallResultI32:
+        if !LoweringTypedIrFunctionHasOpKind(ir, fnIndex, texpr.TypedExprIrOpLetCall):
+            return "unsupported"
         return LoweringLetCallReturnResultI32Kind
     if returnNode.opKind == texpr.TypedExprIrOpLetCallI32IfResultLeZeroReturnZeroElseResultI32:
+        if !LoweringTypedIrFunctionHasOpKind(ir, fnIndex, texpr.TypedExprIrOpLetCall):
+            return "unsupported"
         return LoweringLetCallI32IfResultLeZeroReturnZeroElseResultI32Kind
     if returnNode.opKind == texpr.TypedExprIrOpLetCallStrReturnLenI32:
+        if !LoweringTypedIrFunctionHasOpKind(ir, fnIndex, texpr.TypedExprIrOpLetCall):
+            return "unsupported"
         return LoweringLetCallReturnStrLenI32Kind
     if returnNode.opKind == texpr.TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0:
+        if !LoweringTypedIrFunctionHasOpKind(ir, fnIndex, texpr.TypedExprIrOpLetCall):
+            return "unsupported"
         return LoweringLetCallStrThenCallArg0ReturnI32Const0Kind
+    if returnNode.opKind == texpr.TypedExprIrOpStrI32GuardArg0Return0:
+        if !LoweringTypedIrFunctionHasOpKind(ir, fnIndex, texpr.TypedExprIrOpLetCall):
+            return "unsupported"
+        return LoweringStrI32GuardArg0Return0Kind
     return "unsupported"
 
 fn LoweringPrimaryObjectIrBodyKindFromTypedIr(ir: texpr.TypedExprIr,
@@ -342,30 +357,6 @@ fn LoweringSourceLineAt(sourceTexts: texpr.TypedExprSourceText[],
             return chengpath.PathTrim(lines[lineIndex])
     return ""
 
-fn LoweringLineCallName(lineRaw: str): str =
-    let line = chengpath.PathTrim(lineRaw)
-    var openIndex = -1
-    for i in 0..<len(line):
-        if line[i] == '(':
-            openIndex = i
-            break
-    if openIndex <= 0:
-        return ""
-    var nameStart = openIndex
-    for offset in 0..<openIndex:
-        let j = openIndex - 1 - offset
-        let ch = line[j]
-        let digit = ch >= '0' && ch <= '9'
-        let upper = ch >= 'A' && ch <= 'Z'
-        let lower = ch >= 'a' && ch <= 'z'
-        if digit || upper || lower || ch == '_':
-            nameStart = j
-        else:
-            break
-    if nameStart >= openIndex:
-        return ""
-    return chengpath.TextSlice(line, nameStart, openIndex - nameStart)
-
 fn LoweringAnnotationQuotedValue(lineRaw: str,
                                   annotationName: str): str =
     let trimmed = chengpath.PathTrim(lineRaw)
@@ -482,7 +473,70 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                         fnIr.bodyKind = LoweringPrimaryObjectIrBodyKindForCallArgCount(fact.callArgCount)
                 else:
                     if letCallReturnKind != "unsupported":
-                        if letCallReturnKind == LoweringLetCallStrThenCallArg0ReturnI32Const0Kind:
+                        if letCallReturnKind == LoweringStrI32GuardArg0Return0Kind:
+                            if typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
+                                let typedFn = plan.typedIr.functions[typedFnIndex]
+                                if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
+                                    let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
+                                    let secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                                           sourcePath,
+                                                                                           returnNode.operand0NodeIndex)
+                                    let thirdCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                                          sourcePath,
+                                                                                          returnNode.operand1NodeIndex)
+                                    let fourthCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                                           sourcePath,
+                                                                                           returnNode.operand2NodeIndex)
+                                    if secondCallIndex >= 0 && thirdCallIndex >= 0 && fourthCallIndex >= 0:
+                                        let secondFact = plan.typedExprFacts[secondCallIndex]
+                                        let thirdFact = plan.typedExprFacts[thirdCallIndex]
+                                        let fourthFact = plan.typedExprFacts[fourthCallIndex]
+                                        let secondArgText = chengpath.PathTrim(secondFact.callArgsText)
+                                        let fourthArgText = chengpath.PathTrim(fourthFact.callArgsText)
+                                        let firstFactType = texpr.TypedExprNormalizeTypeText(fact.typeText)
+                                        let thirdFactType = texpr.TypedExprNormalizeTypeText(thirdFact.typeText)
+                                        if firstFactType == "str" &&
+                                           thirdFactType == "int32" &&
+                                           fact.callArgCount == 0 &&
+                                           secondFact.callArgCount == 1 &&
+                                           thirdFact.callArgCount == 0 &&
+                                           fourthFact.callArgCount == 1 &&
+                                           secondArgText == returnNode.surfaceText &&
+                                           fourthArgText == returnNode.surfaceText:
+                                            fnIr.callArgCount = 0
+                                            fnIr.callTarget = fact.callTarget
+                                            fnIr.callTargetSourcePath = fact.callTargetSourcePath
+                                            fnIr.callTargetImportc = fact.callTargetImportc
+                                            if fact.callTargetImportc:
+                                                fnIr.callImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                                     fact.callTargetSourcePath,
+                                                                                                     fact.callTarget)
+                                            fnIr.secondCallArgCount = 1
+                                            fnIr.secondCallTarget = secondFact.callTarget
+                                            fnIr.secondCallTargetSourcePath = secondFact.callTargetSourcePath
+                                            fnIr.secondCallTargetImportc = secondFact.callTargetImportc
+                                            if secondFact.callTargetImportc:
+                                                fnIr.secondCallImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                                           secondFact.callTargetSourcePath,
+                                                                                                           secondFact.callTarget)
+                                            fnIr.thirdCallArgCount = 0
+                                            fnIr.thirdCallTarget = thirdFact.callTarget
+                                            fnIr.thirdCallTargetSourcePath = thirdFact.callTargetSourcePath
+                                            fnIr.thirdCallTargetImportc = thirdFact.callTargetImportc
+                                            if thirdFact.callTargetImportc:
+                                                fnIr.thirdCallImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                                          thirdFact.callTargetSourcePath,
+                                                                                                          thirdFact.callTarget)
+                                            fnIr.fourthCallArgCount = 1
+                                            fnIr.fourthCallTarget = fourthFact.callTarget
+                                            fnIr.fourthCallTargetSourcePath = fourthFact.callTargetSourcePath
+                                            fnIr.fourthCallTargetImportc = fourthFact.callTargetImportc
+                                            if fourthFact.callTargetImportc:
+                                                fnIr.fourthCallImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                                           fourthFact.callTargetSourcePath,
+                                                                                                           fourthFact.callTarget)
+                                            fnIr.bodyKind = LoweringStrI32GuardArg0Return0Kind
+                        elif letCallReturnKind == LoweringLetCallStrThenCallArg0ReturnI32Const0Kind:
                             let typedFn = plan.typedIr.functions[typedFnIndex]
                             if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
                                 let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
@@ -562,40 +616,6 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
             let typedFn = plan.typedIr.functions[typedFnIndex]
             if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
                 let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                if returnNode.opKind == texpr.TypedExprIrOpStrI32GuardArg0Return0:
-                    let firstTarget = LoweringLineCallName(LoweringSourceLineAt(sourceTexts,
-                                                                                sourcePath,
-                                                                                bodyLineNumber))
-                    let secondTarget = LoweringLineCallName(LoweringSourceLineAt(sourceTexts,
-                                                                                 sourcePath,
-                                                                                 returnNode.operand0NodeIndex))
-                    let countTarget = LoweringLineCallName(LoweringSourceLineAt(sourceTexts,
-                                                                                sourcePath,
-                                                                                returnNode.operand1NodeIndex))
-                    let guardTarget = LoweringLineCallName(LoweringSourceLineAt(sourceTexts,
-                                                                                sourcePath,
-                                                                                returnNode.operand2NodeIndex))
-                    if firstTarget != "":
-                        if secondTarget != "":
-                            if countTarget != "":
-                                if guardTarget != "":
-                                    fnIr.callArgCount = 0
-                                    fnIr.callTarget = firstTarget
-                                    fnIr.callTargetSourcePath = sourcePath
-                                    fnIr.callTargetImportc = false
-                                    fnIr.secondCallArgCount = 1
-                                    fnIr.secondCallTarget = secondTarget
-                                    fnIr.secondCallTargetSourcePath = sourcePath
-                                    fnIr.secondCallTargetImportc = false
-                                    fnIr.thirdCallArgCount = 0
-                                    fnIr.thirdCallTarget = countTarget
-                                    fnIr.thirdCallTargetSourcePath = sourcePath
-                                    fnIr.thirdCallTargetImportc = false
-                                    fnIr.fourthCallArgCount = 1
-                                    fnIr.fourthCallTarget = guardTarget
-                                    fnIr.fourthCallTargetSourcePath = sourcePath
-                                    fnIr.fourthCallTargetImportc = false
-                                    fnIr.bodyKind = LoweringStrI32GuardArg0Return0Kind
                 if returnNode.opKind == texpr.TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0:
                     var functionEndLine: int32
                     for fnScanIndex in 0..<plan.typedIr.functions.len:
@@ -768,6 +788,7 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     LoweringAppendLine(out, "primary_object_ir_let_call_noarg_i32_if_result_le_zero_return_zero_else_result_i32_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, LoweringLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32Kind)))
     LoweringAppendLine(out, "primary_object_ir_let_call_noarg_str_return_len_i32_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, LoweringLetCallNoargStrReturnLenI32Kind)))
     LoweringAppendLine(out, "primary_object_ir_let_call_noarg_str_then_call_arg0_return_i32_const_0_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, LoweringLetCallNoargStrThenCallArg0ReturnI32Const0Kind)))
+    LoweringAppendLine(out, "primary_object_ir_str_i32_guard_arg0_return_0_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, LoweringStrI32GuardArg0Return0Kind)))
     LoweringAppendLine(out, "primary_object_ir_main_f64_mul_check_exit_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, "main_f64_mul_check_exit")))
     return out
 
