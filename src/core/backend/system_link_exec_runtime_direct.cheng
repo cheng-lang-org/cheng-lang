@@ -1,0 +1,572 @@
+import std/result
+import std/os
+import std/cmdline as cmdline
+import std/strings
+import std/strformat
+import std/strutils as strutil
+import cheng/core/tooling/bootstrap_contracts as contracts
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/line_map as linemap
+import cheng/core/backend/native_link_exec as nlink
+import cheng/core/backend/native_link_plan as nplan
+import cheng/core/backend/object_plan as objplan
+import cheng/core/backend/direct_object_emit as direct
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/backend/system_link_plan as slplan
+
+@importc("cheng_monotime_ns")
+fn SystemLinkExecRuntimeDirectMonoTimeNsBridge(): int64
+
+type
+    SystemLinkExecRuntimeDirectPlan =
+        systemLinkPlan: slplan.SystemLinkPlanStub
+        loweringPlan: lower.LoweringPlanStub
+        primaryObjectPlan: pobj.PrimaryObjectPlan
+        objectPlan: objplan.ObjectPlanStub
+        nativeLinkPlan: nplan.NativeLinkPlanStub
+
+    SystemLinkExecRuntimeDirectResult =
+        providerCompilerPath: str
+        primaryObjectPath: str
+        providerObjectPaths: str[]
+        providerCompileLogPaths: str[]
+        nativeLinkLogPath: str
+        lineMapPath: str
+        primaryObjectNs: int64
+        providerObjectsNs: int64
+        nativeLinkNs: int64
+        lineMapNs: int64
+        standaloneDirectEntry: bool
+        directObjectBytes: int32
+        directObjectSymbolCount: int32
+        directObjectRelocCount: int32
+
+fn SystemLinkExecRuntimeDirectNowNs(): int64 =
+    return SystemLinkExecRuntimeDirectMonoTimeNsBridge()
+
+fn SystemLinkExecRuntimeDirectCurrentExecutablePath(rootDir: str): str =
+    let raw = strutil.Strip(cmdline.ProgramName())
+    if len(raw) <= 0:
+        return ""
+    let resolved = hostops.ResolveProgram(rootDir, raw)
+    if len(resolved) > 0:
+        return resolved
+    return chengpath.PathAbsolute(rootDir, raw)
+
+fn SystemLinkExecRuntimeDirectResolveProviderCompiler(rootDir: str,
+                                                       requestedCompilerPath: str): Result[str] =
+    let requested = strutil.Strip(requestedCompilerPath)
+    if len(requested) > 0:
+        let absolute = chengpath.PathAbsolute(rootDir, requested)
+        if chengpath.FileExistsNonEmpty(rootDir, absolute):
+            return Ok[str](absolute)
+        return Err[str](Fmt" system link exec direct runtime: missing provider compiler: {absolute}")
+    let current = SystemLinkExecRuntimeDirectCurrentExecutablePath(rootDir)
+    if len(current) > 0 && chengpath.FileExistsNonEmpty(rootDir, current):
+        return Ok[str](current)
+    let stage3 = contracts.BootstrapStage3Path(rootDir)
+    if chengpath.FileExistsNonEmpty(rootDir, stage3):
+        return Ok[str](stage3)
+    return Err[str](" system link exec direct runtime: missing provider compiler/current stage3")
+
+fn SystemLinkExecRuntimeDirectReasonsError(label: str, reasons: str[]): str =
+    return Fmt" system link exec direct runtime: {label}: missing_count={intToStr(reasons.len)}"
+
+fn SystemLinkExecRuntimeDirectValidateProviderPlan(plan: SystemLinkExecRuntimeDirectPlan): Result[bool] =
+    if plan.objectPlan.providerSourcePaths.len != plan.objectPlan.providerObjectPaths.len:
+        return Err[bool](" system link exec direct runtime: provider source/object count mismatch")
+    if plan.objectPlan.providerModules.len != plan.objectPlan.providerSourcePaths.len:
+        return Err[bool](" system link exec direct runtime: provider module/source count mismatch")
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeDirectValidateExecutablePlan(rootDir: str,
+                                                     plan: SystemLinkExecRuntimeDirectPlan): Result[bool] =
+    if plan.systemLinkPlan.missingReasons.len > 0:
+        return Err[bool](SystemLinkExecRuntimeDirectReasonsError("system link plan blocked",
+                                                                 plan.systemLinkPlan.missingReasons))
+    if plan.loweringPlan.missingReasons.len > 0:
+        return Err[bool](SystemLinkExecRuntimeDirectReasonsError("lowering plan blocked",
+                                                                 plan.loweringPlan.missingReasons))
+    if plan.primaryObjectPlan.missingReasons.len > 0:
+        return Err[bool](SystemLinkExecRuntimeDirectReasonsError("primary object plan blocked",
+                                                                 plan.primaryObjectPlan.missingReasons))
+    if plan.objectPlan.missingReasons.len > 0:
+        return Err[bool](SystemLinkExecRuntimeDirectReasonsError("object plan blocked",
+                                                                 plan.objectPlan.missingReasons))
+    if plan.nativeLinkPlan.missingReasons.len > 0:
+        return Err[bool](SystemLinkExecRuntimeDirectReasonsError("native link plan blocked",
+                                                                 plan.nativeLinkPlan.missingReasons))
+    let providerRes = SystemLinkExecRuntimeDirectValidateProviderPlan(plan)
+    if IsErr(providerRes):
+        return providerRes
+    if len(plan.objectPlan.browserBridgeObjectPath) > 0 &&
+       !chengpath.FileExistsNonEmpty(rootDir, plan.objectPlan.browserBridgeObjectPath):
+        return Err[bool](Fmt" system link exec direct runtime: browser bridge object not materialized: {plan.objectPlan.browserBridgeObjectPath}")
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeDirectAddUniqueText(out: var str[], value: str) =
+    if len(value) <= 0:
+        return
+    for i in 0..<out.len:
+        if out[i] == value:
+            return
+    add(out, value)
+
+fn SystemLinkExecRuntimeDirectPlanHasProviderModule(plan: SystemLinkExecRuntimeDirectPlan,
+                                                     modulePath: str): bool =
+    for i in 0..<plan.objectPlan.providerModules.len:
+        if plan.objectPlan.providerModules[i] == modulePath:
+            return true
+    return false
+
+fn SystemLinkExecRuntimeDirectPlanRelocNeedsSymbol(plan: SystemLinkExecRuntimeDirectPlan,
+                                                    rawSymbol: str): bool =
+    let targetSymbol = pobj.PrimaryTargetSymbolName(plan.systemLinkPlan.targetTriple, rawSymbol)
+    for i in 0..<plan.primaryObjectPlan.relocTargetSymbols.len:
+        let symbol = plan.primaryObjectPlan.relocTargetSymbols[i]
+        if symbol == rawSymbol || symbol == targetSymbol:
+            return true
+    return false
+
+fn SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan: SystemLinkExecRuntimeDirectPlan,
+                                                          out: var str[],
+                                                          rawSymbol: str) =
+    if SystemLinkExecRuntimeDirectPlanRelocNeedsSymbol(plan, rawSymbol):
+        SystemLinkExecRuntimeDirectAddUniqueText(out, rawSymbol)
+
+fn SystemLinkExecRuntimeDirectAddCoreRuntimeRoots(plan: SystemLinkExecRuntimeDirectPlan,
+                                                   out: var str[]) =
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "core_runtime_stub_trace")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_errno_code_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_af_inet_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_af_inet6_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_sock_stream_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_sock_dgram_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_ipproto_ip_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_sol_socket_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_so_reuseaddr_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_so_broadcast_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_msg_waitall_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_sockaddr_use_len_field_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_system_cpu_logical_cores_value_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_system_memory_total_bytes_value_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_system_memory_available_bytes_value_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_system_disk_total_bytes_value_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_native_system_disk_available_bytes_value_bridge")
+    SystemLinkExecRuntimeDirectAddCoreRuntimeRootIfNeeded(plan, out, "cheng_mobile_biometric_fingerprint_authorize_bridge_native")
+
+fn SystemLinkExecRuntimeDirectAddBackendDriverDispatchProgramSupportRoots(out: var str[]) =
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "__cheng_rt_paramCount")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "__cheng_rt_paramStr")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "__cheng_rt_paramStrCopy")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "__cheng_rt_paramStrCopyBridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "__cheng_rt_paramStrCopyBridgeInto")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "alloc")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "copyMem")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "setMem")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "ptr_add")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "store_ptr")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "load_ptr")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "store_int32")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "load_int32")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_malloc")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_free")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_mem_retain")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_mem_release")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_bounds_check")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_seq_set_grow")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_rawmem_write_i8")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_cstrlen")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_ptr_size")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_new_string")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_new_string_copy_n")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_str_to_cstring_temp_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_seq_string_elem_bytes_compat")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_seq_string_register_compat")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_seq_string_buffer_register_compat")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_str_from_utf8_copy_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_str_eq_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_str_eq_raw_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_cli_param1_eq_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "paramCount")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "paramStr")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_read_flag_or_default_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_read_flag_value_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_read_int32_flag_or_default_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_str_concat_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_i32_to_str")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_i64_to_str")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_u64_to_str")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_str_strip_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_strformat_fmt_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_strformat_lines_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_os_is_absolute_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_os_join_path_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_panic_cstring_and_exit")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_rawbytes_get_at")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_rawbytes_set_at")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "c_iometer_call")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fwrite")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fclose")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fread")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_getcwd")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_exec_cmd_capture")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_exec_cmd_last_exit_code")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_exec_cmd_status")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_exec_file_pipe_spawn_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_exec_file_pipe_spawn_bridge_last_read_fd")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_exec_file_pipe_spawn_bridge_last_write_fd")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_exec_file_pipe_spawn_bridge_last_pid_i32")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fd_read_wait_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fd_read_wait_bridge_last_eof")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_pty_close_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_pty_wait_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_pty_wait_bridge_last_exit_code")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "get_stderr")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "get_stdout")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "get_stdout")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_get_current_dir_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_read_file_all")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_read_file_all_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_read_file_all_bridge_into")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_str_slice_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_os_file_exists_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_os_dir_exists_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_os_file_size_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_os_fopen_mode_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fopen")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fclose")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fread")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fwrite")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fflush")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fgetc")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_read_file_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_create_dir_all_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "driver_c_write_text_file_bridge")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_mkdir1")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_epoch_time_seconds")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_monotime_ns")
+
+fn SystemLinkExecRuntimeDirectAddBackendDriverHostRuntimeRoots(out: var str[]) =
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_chdir_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_clock_gettime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_close")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_closedir")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_creat_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_dup2_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_execvp")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_exit_immediate_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_exit_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fclose")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fcntl")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fdopen")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fflush")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fgetc")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fgets")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fopen")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fork_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_free")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fread")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fseek")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_ftell")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_fwrite")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_getcwd")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_getentropy")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_getenv")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_grantpt_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_ioctl_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_list_dir")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_malloc")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_mkdir")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_open_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_opendir")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_pipe_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_poll")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_posix_openpt_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_ptsname_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_puts_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_read_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_realloc")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_setenv")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_setpgid_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_setsid_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_stat")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_statfs")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_strerror")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_sysconf")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_time")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_unlockpt_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_usleep")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_waitpid_runtime")
+    SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_host_write_runtime")
+
+fn SystemLinkExecRuntimeDirectProviderExportRoots(plan: SystemLinkExecRuntimeDirectPlan,
+                                                   providerModule: str): str[] =
+    var out: str[]
+    if providerModule == "runtime/compiler_runtime":
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "main")
+        return out
+    if providerModule == "runtime/backend_driver_dispatch":
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_backend_driver_dispatch")
+        return out
+    if providerModule == "runtime/program_support":
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "__cheng_setCmdLine")
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_register_line_map_from_argv0")
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fopen")
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fclose")
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fread")
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fwrite")
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fflush")
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_fgetc")
+        if SystemLinkExecRuntimeDirectPlanHasProviderModule(plan, "runtime/backend_driver_dispatch"):
+            SystemLinkExecRuntimeDirectAddBackendDriverDispatchProgramSupportRoots(out)
+        for i in 0..<plan.primaryObjectPlan.relocTargetSymbols.len:
+            let symbol = plan.primaryObjectPlan.relocTargetSymbols[i]
+            if symbol == pobj.PrimaryTargetSymbolName(plan.systemLinkPlan.targetTriple, "cheng_backend_driver_dispatch"):
+                continue
+            if symbol == pobj.PrimaryTargetSymbolName(plan.systemLinkPlan.targetTriple, "cheng_debug_profile_flush_from_argv0"):
+                continue
+            SystemLinkExecRuntimeDirectAddUniqueText(out, symbol)
+        return out
+    if providerModule == "runtime/debug_runtime":
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_debug_profile_flush_from_argv0")
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_native_register_line_map_from_argv0")
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_native_dump_backtrace_and_exit")
+        return out
+    if providerModule == "runtime/core_runtime":
+        SystemLinkExecRuntimeDirectAddCoreRuntimeRoots(plan, out)
+        return out
+    if providerModule == "runtime/program_support_host_runtime":
+        SystemLinkExecRuntimeDirectAddUniqueText(out, "cheng_program_support_host_trace")
+        if SystemLinkExecRuntimeDirectPlanHasProviderModule(plan, "runtime/backend_driver_dispatch"):
+            SystemLinkExecRuntimeDirectAddBackendDriverHostRuntimeRoots(out)
+        return out
+    return out
+
+fn SystemLinkExecRuntimeDirectProviderCompileArgs(plan: SystemLinkExecRuntimeDirectPlan,
+                                                   providerModule: str,
+                                                   sourcePath: str,
+                                                   objectPath: str): str[] =
+    var argv: str[]
+    let reportPath = Fmt"{objectPath}.report.txt"
+    add(argv, "system-link-exec")
+    add(argv, Fmt"--root:{plan.systemLinkPlan.packageRoot}")
+    add(argv, Fmt"--in:{sourcePath}")
+    add(argv, "--emit:obj")
+    add(argv, Fmt"--target:{plan.systemLinkPlan.targetTriple}")
+    add(argv, Fmt"--out:{objectPath}")
+    add(argv, Fmt"--report-out:{reportPath}")
+    let exportRoots = SystemLinkExecRuntimeDirectProviderExportRoots(plan, providerModule)
+    if exportRoots.len > 0:
+        add(argv, "--symbol-visibility:internal")
+        let rootText = strutil.Join(exportRoots, ",")
+        add(argv, Fmt"--export-roots:{rootText}")
+    return argv
+
+fn SystemLinkExecRuntimeDirectRecordObject(rootDir: str,
+                                            startNs: int64,
+                                            object: direct.DirectObjectEmitResult,
+                                            result: var SystemLinkExecRuntimeDirectResult): Result[bool] =
+    result.primaryObjectNs = SystemLinkExecRuntimeDirectNowNs() - startNs
+    result.primaryObjectPath = object.objectPath
+    result.directObjectBytes = object.bytesWritten
+    result.directObjectSymbolCount = object.symbolCount
+    result.directObjectRelocCount = object.relocCount
+    if !chengpath.FileExistsNonEmpty(rootDir, object.objectPath):
+        return Err[bool](Fmt" system link exec direct runtime: primary object missing after direct emit: {object.objectPath}")
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeDirectMaterializePrimaryObject(rootDir: str,
+                                                        plan: pobj.PrimaryObjectPlan,
+                                                        result: var SystemLinkExecRuntimeDirectResult): Result[bool] =
+    let startNs = SystemLinkExecRuntimeDirectNowNs()
+    if !direct.DirectObjectEmitCanPlanObject(plan):
+        return Err[bool](" system link exec direct runtime: primary object plan is not direct-object ready")
+    let directRes: Result[direct.DirectObjectEmitResult] = direct.DirectObjectEmitPlanObject(rootDir, plan)
+    if IsErr(directRes):
+        result.primaryObjectNs = SystemLinkExecRuntimeDirectNowNs() - startNs
+        return Err[bool](Error(directRes))
+    return SystemLinkExecRuntimeDirectRecordObject(rootDir,
+                                                   startNs,
+                                                   Value(directRes),
+                                                   result)
+
+fn SystemLinkExecRuntimeDirectMaterializeStandaloneObject(rootDir: str,
+                                                           plan: pobj.PrimaryObjectPlan,
+                                                           result: var SystemLinkExecRuntimeDirectResult): Result[bool] =
+    let startNs = SystemLinkExecRuntimeDirectNowNs()
+    let directRes: Result[direct.DirectObjectEmitResult] = direct.DirectObjectEmitStandaloneMain(rootDir, plan)
+    if IsErr(directRes):
+        result.primaryObjectNs = SystemLinkExecRuntimeDirectNowNs() - startNs
+        return Err[bool](Error(directRes))
+    result.standaloneDirectEntry = true
+    return SystemLinkExecRuntimeDirectRecordObject(rootDir,
+                                                   startNs,
+                                                   Value(directRes),
+                                                   result)
+
+fn SystemLinkExecRuntimeDirectCompileProviderObject(rootDir: str,
+                                                     compilerPath: str,
+                                                     plan: SystemLinkExecRuntimeDirectPlan,
+                                                     sourcePath: str,
+                                                     objectPath: str,
+                                                     index: int32): Result[hostops.LoggedRun] =
+    let parent = chengpath.PathParentDir(objectPath)
+    if len(parent) > 0 && !chengpath.MkdirP(rootDir, parent):
+        return Err[hostops.LoggedRun](Fmt" system link exec direct runtime: failed to create provider object dir: {parent}")
+    let objectAbs = chengpath.PathAbsolute(rootDir, objectPath)
+    if os.FileExists(objectAbs):
+        let _ = os.RemoveFile(objectAbs)
+    let logPath = Fmt"{objectPath}.compile.log"
+    let logAbs = chengpath.PathAbsolute(rootDir, logPath)
+    if os.FileExists(logAbs):
+        let _ = os.RemoveFile(logAbs)
+    var providerModule = ""
+    if index >= 0 && index < plan.objectPlan.providerModules.len:
+        providerModule = plan.objectPlan.providerModules[index]
+    let argv = SystemLinkExecRuntimeDirectProviderCompileArgs(plan, providerModule, sourcePath, objectPath)
+    let run = hostops.RunFileLogged(rootDir,
+                                    Fmt"system_link_exec_direct_provider_{strings.IntToStr(index)}",
+                                    compilerPath,
+                                    argv,
+                                    [],
+                                    rootDir,
+                                    0,
+                                    logPath)
+    if run.exitCode != 0:
+        return Err[hostops.LoggedRun](Fmt" system link exec direct runtime: provider compile failed rc={strings.IntToStr(run.exitCode)} source={sourcePath} log={run.logPath}\n{run.output}")
+    if !chengpath.FileExistsNonEmpty(rootDir, objectPath):
+        return Err[hostops.LoggedRun](Fmt" system link exec direct runtime: provider object missing after compile: {objectPath}")
+    return Ok[hostops.LoggedRun](run)
+
+fn SystemLinkExecRuntimeDirectMaterializeProviderObjects(rootDir: str,
+                                                          compilerPath: str,
+                                                          plan: SystemLinkExecRuntimeDirectPlan,
+                                                          result: var SystemLinkExecRuntimeDirectResult): Result[bool] =
+    let startNs = SystemLinkExecRuntimeDirectNowNs()
+    for i in 0..<plan.objectPlan.providerSourcePaths.len:
+        let sourcePath = plan.objectPlan.providerSourcePaths[i]
+        let objectPath = plan.objectPlan.providerObjectPaths[i]
+        var providerModule = ""
+        if i >= 0 && i < plan.objectPlan.providerModules.len:
+            providerModule = plan.objectPlan.providerModules[i]
+        let runRes = SystemLinkExecRuntimeDirectCompileProviderObject(rootDir,
+                                                                      compilerPath,
+                                                                      plan,
+                                                                      sourcePath,
+                                                                      objectPath,
+                                                                      i)
+        if IsErr(runRes):
+            result.providerObjectsNs = SystemLinkExecRuntimeDirectNowNs() - startNs
+            return Err[bool](Error(runRes))
+        let run = Value(runRes)
+        add(result.providerObjectPaths, objectPath)
+        add(result.providerCompileLogPaths, run.logPath)
+    result.providerObjectsNs = SystemLinkExecRuntimeDirectNowNs() - startNs
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeDirectRunNativeLink(rootDir: str,
+                                             plan: SystemLinkExecRuntimeDirectPlan,
+                                             nativePlan: nplan.NativeLinkPlanStub,
+                                             result: var SystemLinkExecRuntimeDirectResult): Result[bool] =
+    let startNs = SystemLinkExecRuntimeDirectNowNs()
+    let logPath = Fmt"{plan.systemLinkPlan.outputPath}.native_link.log"
+    let outputAbs = chengpath.PathAbsolute(rootDir, plan.systemLinkPlan.outputPath)
+    if len(outputAbs) > 0 && os.FileExists(outputAbs):
+        let _ = os.RemoveFile(outputAbs)
+    let run = nlink.NativeLinkExecRunLogged(rootDir,
+                                            "system_link_exec_direct_native_link",
+                                            nativePlan,
+                                            logPath)
+    result.nativeLinkLogPath = run.logPath
+    result.nativeLinkNs = SystemLinkExecRuntimeDirectNowNs() - startNs
+    if run.exitCode != 0:
+        return Err[bool](Fmt" system link exec direct runtime: native link failed rc={strings.IntToStr(run.exitCode)} log={run.logPath}\n{run.output}")
+    if !chengpath.FileExistsNonEmpty(rootDir, plan.systemLinkPlan.outputPath):
+        return Err[bool](Fmt" system link exec direct runtime: native output missing after link: {plan.systemLinkPlan.outputPath}")
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeDirectWriteLineMap(rootDir: str,
+                                            plan: SystemLinkExecRuntimeDirectPlan,
+                                            result: var SystemLinkExecRuntimeDirectResult): Result[bool] =
+    let startNs = SystemLinkExecRuntimeDirectNowNs()
+    let lineMapRes = linemap.WriteExecutableLineMap(rootDir,
+                                                    plan.systemLinkPlan,
+                                                    plan.loweringPlan)
+    result.lineMapNs = SystemLinkExecRuntimeDirectNowNs() - startNs
+    if IsErr(lineMapRes):
+        return Err[bool](Error(lineMapRes))
+    result.lineMapPath = Value(lineMapRes)
+    if plan.systemLinkPlan.emitKind == creq.EmitExe &&
+       len(result.lineMapPath) > 0 &&
+       !chengpath.FileExistsNonEmpty(rootDir, result.lineMapPath):
+        return Err[bool](Fmt" system link exec direct runtime: line-map missing after write: {result.lineMapPath}")
+    return Ok[bool](true)
+
+fn SystemLinkExecRuntimeDirectStandaloneNativePlan(plan: SystemLinkExecRuntimeDirectPlan,
+                                                    primaryObjectPath: str): nplan.NativeLinkPlanStub =
+    var out: nplan.NativeLinkPlanStub
+    var linkInputs: str[]
+    add(linkInputs, primaryObjectPath)
+    out.targetTriple = plan.systemLinkPlan.targetTriple
+    out.emitKind = creq.EmitExe
+    out.outputPath = plan.systemLinkPlan.outputPath
+    out.linkerProgram = "cc"
+    out.linkerFlavor = "ld64"
+    out.outputKind = nplan.NativeOutputExecutable
+    out.entrySymbol = "main"
+    out.primaryObjectPath = primaryObjectPath
+    out.browserBridgeObjectPath = ""
+    out.linkInputPaths = linkInputs
+    out.missingReasons = []
+    out.pipelineStage = "standalone_primary_object_to_native_link_plan"
+    return out
+
+fn SystemLinkExecRuntimeDirectExecutePlanWithCompiler(rootDir: str,
+                                                       plan: SystemLinkExecRuntimeDirectPlan,
+                                                       requestedProviderCompilerPath: str): Result[SystemLinkExecRuntimeDirectResult] =
+    var result: SystemLinkExecRuntimeDirectResult
+    var standaloneMain = false
+    if plan.systemLinkPlan.emitKind == creq.EmitExe:
+        standaloneMain = direct.DirectObjectEmitCanStandaloneMain(plan.primaryObjectPlan)
+    var primaryRes: Result[bool]
+    if standaloneMain:
+        primaryRes = SystemLinkExecRuntimeDirectMaterializeStandaloneObject(rootDir,
+                                                                            plan.primaryObjectPlan,
+                                                                            result)
+    else:
+        primaryRes = SystemLinkExecRuntimeDirectMaterializePrimaryObject(rootDir,
+                                                                         plan.primaryObjectPlan,
+                                                                         result)
+    if IsErr(primaryRes):
+        return Err[SystemLinkExecRuntimeDirectResult](Error(primaryRes))
+    if plan.systemLinkPlan.emitKind == creq.EmitObj:
+        return Ok[SystemLinkExecRuntimeDirectResult](result)
+    let validRes = SystemLinkExecRuntimeDirectValidateExecutablePlan(rootDir, plan)
+    if IsErr(validRes):
+        return Err[SystemLinkExecRuntimeDirectResult](Error(validRes))
+    if !standaloneMain && plan.objectPlan.providerSourcePaths.len > 0:
+        let compilerRes = SystemLinkExecRuntimeDirectResolveProviderCompiler(rootDir, requestedProviderCompilerPath)
+        if IsErr(compilerRes):
+            return Err[SystemLinkExecRuntimeDirectResult](Error(compilerRes))
+        result.providerCompilerPath = Value(compilerRes)
+        let providerRes = SystemLinkExecRuntimeDirectMaterializeProviderObjects(rootDir,
+                                                                                result.providerCompilerPath,
+                                                                                plan,
+                                                                                result)
+        if IsErr(providerRes):
+            return Err[SystemLinkExecRuntimeDirectResult](Error(providerRes))
+    var nativePlan = plan.nativeLinkPlan
+    if standaloneMain:
+        nativePlan = SystemLinkExecRuntimeDirectStandaloneNativePlan(plan, result.primaryObjectPath)
+    let nativeRes = SystemLinkExecRuntimeDirectRunNativeLink(rootDir, plan, nativePlan, result)
+    if IsErr(nativeRes):
+        return Err[SystemLinkExecRuntimeDirectResult](Error(nativeRes))
+    if plan.systemLinkPlan.emitKind == creq.EmitExe:
+        let lineMapRes = SystemLinkExecRuntimeDirectWriteLineMap(rootDir, plan, result)
+        if IsErr(lineMapRes):
+            return Err[SystemLinkExecRuntimeDirectResult](Error(lineMapRes))
+    return Ok[SystemLinkExecRuntimeDirectResult](result)

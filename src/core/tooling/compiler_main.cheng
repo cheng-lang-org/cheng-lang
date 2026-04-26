@@ -44,9 +44,7 @@ fn CompilerPrintErr(text: str) =
     os.WriteLine(CompilerStderrBridge(), text)
 
 fn CompilerConcat3(left: str, middle: str, right: str): str =
-    var out = left + middle
-    out = out + right
-    return out
+    return strutil.Join([left, middle, right], "")
 
 fn CompilerPathSetAdd(out: var str[],
                         pathRaw: str) =
@@ -518,7 +516,7 @@ fn CompilerProgressAppendEnabled(): bool =
 
 fn CompilerProgressLine(phase: str,
                           status: str): str =
-    return "compile_progress phase=" + phase + " status=" + status
+    return Fmt"compile_progress phase={phase} status={status}"
 
 fn CompilerProgressSyncExisting(progressPath: str,
                                   progressText: var str) =
@@ -1155,7 +1153,7 @@ fn CompilerTryRunPureSystemLinkExec(rootDir: str,
         return CompilerPureSystemLinkExecUnsupported(Error(execRes))
     let runtimeReport = sexecrt.SystemLinkExecRuntimeResultReport(Value(execRes))
     if !CompilerWriteSystemLinkExecRuntimeReport(rootDir, req.reportPath, plan, runtimeReport):
-        CompilerPrintErr(" compiler: failed to write pure system-link-exec report: " + req.reportPath)
+        CompilerPrintErr(Fmt" compiler: failed to write pure system-link-exec report: {req.reportPath}")
         return 2
     return 0
 
@@ -2284,15 +2282,15 @@ fn CompilerRunCommandLogged(rootDir: str,
                               command: str,
                               logPath: str,
                               context: str): bool =
-    let fullCommand = command + " > " + CompilerQuoteShell(logPath) + " 2>&1"
-    let rc = os.ExecCmdStatus(fullCommand, rootDir)
+    let fullCommand = strutil.Join([command, " > ", CompilerQuoteShell(logPath), " 2>&1"], "")
+    let rc = os.ExecShellCmdStatus(fullCommand, rootDir)
     if rc == 0:
         return true
     let output = strutil.Strip(chengpath.ReadTextFile("", logPath))
     if len(output) > 0:
         CompilerPrintErr(output)
     else:
-        CompilerPrintErr(" compiler: " + context + " failed")
+        CompilerPrintErr(strutil.Join([" compiler: ", context, " failed"], ""))
     return false
 
 fn CompilerRunFileEnvLogged(rootDir: str,
@@ -2791,23 +2789,67 @@ fn CompilerTextContainsAll(text: str,
             return false
     return true
 
+fn CompilerBuildPlanCoreLine(line: str): bool =
+    if strutil.StartsWith(line, "target="):
+        return true
+    if strutil.StartsWith(line, "linker="):
+        return true
+    if strutil.StartsWith(line, "stage2_compiler="):
+        return true
+    if strutil.StartsWith(line, "entry="):
+        return true
+    if strutil.StartsWith(line, "output="):
+        return true
+    if strutil.StartsWith(line, "source["):
+        return true
+    return false
+
+fn CompilerBuildPlanCoreText(text: str): str =
+    let lines = strutil.Split(text, '\n')
+    var out: str[]
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        if CompilerBuildPlanCoreLine(line):
+            add(out, line)
+    return strutil.Join(out, "\n")
+
 fn CompilerRemovePathTree(path: str): bool =
     if !chengpath.PathNonEmpty(path):
         return true
-    let command = "rm -rf " + CompilerQuoteShell(path)
-    return os.ExecCmdStatus(command, "") == 0
+    if os.FileExists(path):
+        return os.RemoveFile(path)
+    if !os.DirExists(path):
+        return true
+    let entries = os.WalkDir(path)
+    for i in 0..<entries.len:
+        let entry = os.WalkDirEntry(entries, i)
+        let child = os.WalkDirEntryPath(entry)
+        let kind = os.WalkDirEntryKind(entry)
+        if kind == os.PcDir || kind == os.PcLinkToDir:
+            if !CompilerRemovePathTree(child):
+                return false
+        elif kind == os.PcFile || kind == os.PcLinkToFile:
+            if !os.RemoveFile(child):
+                return false
+    os.RemoveDir(path)
+    return !os.DirExists(path)
 
 fn CompilerCleanHostrunArtifacts(rootDir: str,
                                    smokeNames: str[]): bool =
     let hostrunDir = chengpath.PathAbsolute(rootDir, "artifacts/hostrun")
     if !os.DirExists(hostrunDir):
         return true
-    var command = "rm -rf"
-    for i in 0..<smokeNames.len:
-        command = command + " "
-        command = command + CompilerQuoteShell(hostrunDir + "/" + smokeNames[i])
-        command = command + "*"
-    return os.ExecCmdStatus(command, "") == 0
+    let entries = os.WalkDir(hostrunDir)
+    for i in 0..<entries.len:
+        let entry = os.WalkDirEntry(entries, i)
+        let child = os.WalkDirEntryPath(entry)
+        let leaf = os.ExtractFilename(child)
+        for j in 0..<smokeNames.len:
+            if strutil.StartsWith(leaf, smokeNames[j]):
+                if !CompilerRemovePathTree(child):
+                    return false
+                break
+    return true
 
 fn CompilerRequestFromRuntimeFlags(workspaceRoot: str,
                                      requireOutput: bool): Result[creq.CompilerRequest] =
@@ -3467,24 +3509,9 @@ fn CompilerBackendDriverDefaultMaxRssBytesText(): str =
     return "8589934592"
 
 fn CompilerBuildBackendDriverMaxRssBytesText(): str =
-    let buildRaw: str = strutil.Strip(os.GetEnv("CHENG_BUILD_BACKEND_DRIVER_MAX_RSS_BYTES"))
-    if len(buildRaw) > 0:
-        return buildRaw
-    let processRaw: str = strutil.Strip(os.GetEnv("CHENG_PROCESS_MAX_RSS_BYTES"))
-    if len(processRaw) > 0:
-        return processRaw
     return CompilerBackendDriverDefaultMaxRssBytesText()
 
 fn CompilerFollowWorldMaxRssBytesText(): str =
-    let followRaw: str = strutil.Strip(os.GetEnv("CHENG_FOLLOW_WORLD_MAX_RSS_BYTES"))
-    if len(followRaw) > 0:
-        return followRaw
-    let buildRaw: str = strutil.Strip(os.GetEnv("CHENG_BUILD_BACKEND_DRIVER_MAX_RSS_BYTES"))
-    if len(buildRaw) > 0:
-        return buildRaw
-    let processRaw: str = strutil.Strip(os.GetEnv("CHENG_PROCESS_MAX_RSS_BYTES"))
-    if len(processRaw) > 0:
-        return processRaw
     return CompilerBackendDriverDefaultMaxRssBytesText()
 
 fn CompilerBuildBackendDriverCompileLogText(targetTriple: str,
@@ -3611,7 +3638,7 @@ fn CompilerBuildBackendDriver(rootDir: str): int32 =
     let noHandoffEnv: str[] = [
         "CHENG_NO_BACKEND_DRIVER_HANDOFF=1",
         "CHENG_PROGRESS=1",
-        "CHENG_PROCESS_MAX_RSS_BYTES=" + buildMaxRssBytesText,
+        strutil.Join(["CHENG_PROCESS_MAX_RSS_BYTES=", buildMaxRssBytesText], ""),
         "BACKEND_INCREMENTAL=0",
         "BACKEND_MULTI_MODULE_CACHE=0",
         "CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1",
@@ -3884,24 +3911,11 @@ fn CompilerBuildBackendDriver(rootDir: str): int32 =
         if !CompilerTextContainsAll(resolvedReferencePlanText, ["target=" + targetTriple]):
             CompilerPrintErr(" compiler: reference build plan target mismatch")
             return 2
-        let planCorePattern = "^(target=|linker=|stage2_compiler=|entry=|output=|source\\[)"
-        var planCompareCommand = "grep -E "
-        planCompareCommand = planCompareCommand + CompilerQuoteShell(planCorePattern)
-        planCompareCommand = planCompareCommand + " "
-        planCompareCommand = planCompareCommand + CompilerQuoteShell(planLogPath)
-        planCompareCommand = planCompareCommand + " > "
-        planCompareCommand = planCompareCommand + CompilerQuoteShell(planCorePath)
-        planCompareCommand = planCompareCommand + " && grep -E "
-        planCompareCommand = planCompareCommand + CompilerQuoteShell(planCorePattern)
-        planCompareCommand = planCompareCommand + " "
-        planCompareCommand = planCompareCommand + CompilerQuoteShell(referencePlanLogPath)
-        planCompareCommand = planCompareCommand + " > "
-        planCompareCommand = planCompareCommand + CompilerQuoteShell(referencePlanCorePath)
-        planCompareCommand = planCompareCommand + " && cmp -s "
-        planCompareCommand = planCompareCommand + CompilerQuoteShell(planCorePath)
-        planCompareCommand = planCompareCommand + " "
-        planCompareCommand = planCompareCommand + CompilerQuoteShell(referencePlanCorePath)
-        if os.ExecCmdStatus(planCompareCommand, rootDir) != 0:
+        let planCoreText = CompilerBuildPlanCoreText(chengpath.ReadTextFile("", planLogPath))
+        let referencePlanCoreText = CompilerBuildPlanCoreText(chengpath.ReadTextFile("", referencePlanLogPath))
+        let _planCoreWritten = chengpath.WriteTextFile(rootDir, planCorePath, strutil.Join([planCoreText, "\n"], ""))
+        let _referencePlanCoreWritten = chengpath.WriteTextFile(rootDir, referencePlanCorePath, strutil.Join([referencePlanCoreText, "\n"], ""))
+        if planCoreText != referencePlanCoreText:
             CompilerPrintErr(" compiler: backend driver build plan drift vs current compiler")
             return 2
         referencePlanCheck = "ok"
@@ -4043,15 +4057,17 @@ fn CompilerBootstrapTarget(rootDir: str): str =
 
 fn CompilerBootstrapLog(rootDir: str,
                           name: str): str =
-    return chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/" + name)
+    return chengpath.PathAbsolute(rootDir, strutil.Join(["artifacts/bootstrap/", name], ""))
 
 fn CompilerPathNewerThan(rootDir: str,
                            leftPath: str,
                            rightPath: str): bool =
     if !chengpath.PathFileExists(leftPath):
         return false
-    let command = "test " + CompilerQuoteShell(leftPath) + " -nt " + CompilerQuoteShell(rightPath)
-    return os.ExecCmdStatus(command, rootDir) == 0
+    if !chengpath.PathFileExists(rightPath):
+        return true
+    let _rootDir = rootDir
+    return os.FileMtime(leftPath) > os.FileMtime(rightPath)
 
 fn CompilerBootstrapEnvText(rootDir: str,
                               snapshot: contracts.BootstrapSnapshot): str =
@@ -5872,39 +5888,91 @@ fn CompilerBridgeRewriteLine(lineRaw: str): str =
         cursor = candidate + 1
     return out
 
-fn CompilerBridgeRewriteSourceText(text: str): str =
+fn CompilerBridgeRewriteSourceTextChecked(text: str,
+                                            rewrittenOut: var str,
+                                            err: var str): bool =
+    var normalizedText = ""
+    if !parser.ParserRewriteMultilineStringSourceText(text, normalizedText, err):
+        return false
     var out = ""
     var start: int32
     var i: int32
-    while i <= text.len:
+    while i <= normalizedText.len:
         var atLineEnd = false
-        if i == text.len:
+        if i == normalizedText.len:
             atLineEnd = true
-        elif text[i] == '\n':
+        elif normalizedText[i] == '\n':
             atLineEnd = true
         if !atLineEnd:
             i = i + 1
             continue
-        let lineRaw = strings.SliceBytes(text, start, i - start)
+        let lineRaw = strings.SliceBytes(normalizedText, start, i - start)
         out = out + CompilerBridgeRewriteLine(lineRaw)
-        if i < text.len:
+        if i < normalizedText.len:
             out = out + "\n"
         start = i + 1
         i = i + 1
+    rewrittenOut = out
+    err = ""
+    return true
+
+fn CompilerBridgeRewriteSourceText(text: str): str =
+    var out = ""
+    var err = ""
+    if !CompilerBridgeRewriteSourceTextChecked(text, out, err):
+        return text
     return out
 
 fn CompilerBridgeSourceNeedsRewrite(text: str): bool =
-    return CompilerBridgeRewriteSourceText(text) != text
+    if parser.ParserSourceHasMultilineString(text):
+        return true
+    var out = ""
+    var err = ""
+    if !CompilerBridgeRewriteSourceTextChecked(text, out, err):
+        return true
+    return out != text
+
+fn CompilerBridgeCopyTextFile(srcPath: str,
+                                destPath: str): bool =
+    let parts = os.SplitFile(destPath)
+    if len(parts.dir) > 0 && !chengpath.MkdirP(chengpath.PathCurrentDir(), parts.dir):
+        return false
+    if !chengpath.PathFileExists(srcPath):
+        return false
+    os.WriteFile(destPath, os.ReadFile(srcPath))
+    return chengpath.PathFileExists(destPath)
+
+fn CompilerBridgeCopyTextTree(srcDir: str,
+                                destDir: str): bool =
+    if !chengpath.MkdirP(chengpath.PathCurrentDir(), destDir):
+        return false
+    let entries = os.WalkDir(srcDir)
+    for i in 0..<entries.len:
+        let entry = os.WalkDirEntry(entries, i)
+        let child = os.WalkDirEntryPath(entry)
+        let kind = os.WalkDirEntryKind(entry)
+        let destChild = os.JoinPath(destDir, os.ExtractFilename(child))
+        if kind == os.PcDir || kind == os.PcLinkToDir:
+            if !CompilerBridgeCopyTextTree(child, destChild):
+                return false
+        elif kind == os.PcFile || kind == os.PcLinkToFile:
+            if !CompilerBridgeCopyTextFile(child, destChild):
+                return false
+    return true
 
 fn CompilerBridgeStageCopyRequired(rootDir: str,
                                      srcPath: str,
                                      destDir: str,
                                      logRel: str,
                                      context: str): Result[bool] =
-    let command = "cp -R " + CompilerQuoteShell(srcPath) + " " + CompilerQuoteShell(destDir)
-    if CompilerRunCommandLogged(rootDir, command, chengpath.PathAbsolute(rootDir, logRel), context):
+    let _logPath = chengpath.PathAbsolute(rootDir, logRel)
+    let leaf = os.ExtractFilename(srcPath)
+    let destPath = os.JoinPath(destDir, leaf)
+    if os.DirExists(srcPath) && CompilerBridgeCopyTextTree(srcPath, destPath):
         return Ok[bool](true)
-    return Err[bool](" compiler: " + context + " failed: " + srcPath)
+    if os.FileExists(srcPath) && CompilerBridgeCopyTextFile(srcPath, destPath):
+        return Ok[bool](true)
+    return Err[bool](strutil.Join([" compiler: ", context, " failed: ", srcPath], ""))
 
 fn CompilerBridgeStageCopyOptional(rootDir: str,
                                      srcPath: str,
@@ -5927,7 +5995,10 @@ fn CompilerBridgeRewriteStagedTree(rootDir: str,
         let sourceText = chengpath.ReadTextFile("", path)
         if len(sourceText) <= 0:
             continue
-        let rewritten = CompilerBridgeRewriteSourceText(sourceText)
+        var rewritten = ""
+        var rewriteErr = ""
+        if !CompilerBridgeRewriteSourceTextChecked(sourceText, rewritten, rewriteErr):
+            return Err[bool](CompilerConcat3(" compiler: ", rewriteErr, ""))
         if rewritten == sourceText:
             continue
         if !chengpath.WriteTextFile("", path, rewritten):
@@ -6126,7 +6197,7 @@ fn CompilerFollowWorldInstallBackendDriver(rootDir: str,
     let followGuardEnv: str[] = [
         "CHENG_NO_BACKEND_DRIVER_HANDOFF=1",
         "CHENG_PROGRESS=1",
-        "CHENG_PROCESS_MAX_RSS_BYTES=" + followMaxRssBytesText,
+        strutil.Join(["CHENG_PROCESS_MAX_RSS_BYTES=", followMaxRssBytesText], ""),
         "BACKEND_INCREMENTAL=0",
         "BACKEND_MULTI_MODULE_CACHE=0",
         "CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1",
@@ -6658,22 +6729,18 @@ fn CompilerCompileTimeoutSec(): int32 =
 fn CompilerCommandText(filePath: str,
                          argv: str[],
                          envOverrides: str[]): str =
-    var out = ""
+    var parts: str[]
     if envOverrides.len > 0:
-        out = "env"
+        add(parts, "env")
         for i in 0..<envOverrides.len:
             let envText = envOverrides[i]
             if len(envText) > 0:
-                out = out + " "
-                out = out + CompilerQuoteShell(envText)
+                add(parts, CompilerQuoteShell(envText))
     if len(filePath) > 0:
-        if len(out) > 0:
-            out = out + " "
-        out = out + CompilerQuoteShell(filePath)
+        add(parts, CompilerQuoteShell(filePath))
     for i in 0..<argv.len:
-        out = out + " "
-        out = out + CompilerQuoteShell(argv[i])
-    return out
+        add(parts, CompilerQuoteShell(argv[i]))
+    return strutil.Join(parts, " ")
 
 fn CompilerRunCommandCaptureLogged(rootDir: str,
                                      label: str,
@@ -6681,8 +6748,8 @@ fn CompilerRunCommandCaptureLogged(rootDir: str,
                                      command: str,
                                      logPath: str): hostops.LoggedRun =
     let _ = CompilerEnsureFileParentDir(rootDir, logPath)
-    let fullCommand = command + " > " + CompilerQuoteShell(logPath) + " 2>&1"
-    let exitCode = os.ExecCmdStatus(fullCommand, rootDir)
+    let fullCommand = strutil.Join([command, " > ", CompilerQuoteShell(logPath), " 2>&1"], "")
+    let exitCode = os.ExecShellCmdStatus(fullCommand, rootDir)
     let outputText = chengpath.ReadTextFile("", logPath)
     let _logged = chengpath.WriteTextFile(rootDir, logPath, outputText)
     return hostops.LoggedRunZero(label, filePath, logPath, exitCode, outputText)

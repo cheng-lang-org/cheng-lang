@@ -2,11 +2,13 @@ import std/result
 import std/os_host_process as hostos
 import std/strformat
 import std/strutils as strutil
+import std/strings
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/path as chengpath
+import cheng/core/backend/body_kind_parse as bkind
 import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/target_matrix as tmat
-import cheng/core/backend/body_kind_parse as bkp
+import cheng/core/ir/core_types as coreir
 import cheng/core/lang/typed_expr as texpr
 
 type
@@ -81,66 +83,108 @@ fn PrimaryObjectEmitFunctionCount(plan: pobj.PrimaryObjectPlan): int32 =
         return bridgeIndex
     return plan.symbolNames.len
 
-fn PrimaryObjectEmitExpectedWordsForBodyKind(bodyKind: str): int32 =
-    if bodyKind == texpr.BodyKindReturnZeroI32:
-        return 2
-    if PrimaryObjectEmitIsReturnI32ConstBodyKind(bodyKind):
-        return 2
-    if bodyKind == texpr.BodyKindReturnI32Arg0:
-        return 1
-    if bodyKind == texpr.BodyKindReturnI32Arg1 ||
-       bodyKind == texpr.BodyKindReturnI32Arg2 ||
-       bodyKind == texpr.BodyKindReturnI32Arg3:
-        return 2
-    if bodyKind == texpr.BodyKindReturnCallNoargI32 ||
-       bodyKind == texpr.BodyKindReturnCallArg0I32 ||
-       bodyKind == texpr.BodyKindReturnCallArg0Arg1I32 ||
-       bodyKind == texpr.BodyKindReturnCallArg0Arg1Arg2I32:
-        return 1
-    if PrimaryObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
-        return 6
-    if texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
-        return 5
-    if bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
-        return 10
-    if texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
-        return 12
-    if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
-        return 9
-    if bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
-        return 14
-    if bodyKind == texpr.BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32:
-        return 18
-    if bodyKind == texpr.BodyKindReturnStrArg0:
-        return 7
-    if bodyKind == texpr.BodyKindReturnStrEmpty:
-        return 4
-    if bodyKind == texpr.BodyKindCstringToStrCopy:
-        return 32
-    if bodyKind == texpr.BodyKindReturnF64MulArgs:
-        return 2
-    if bodyKind == texpr.BodyKindReturnI32AddArgs:
-        return 2
-    if bodyKind == texpr.BodyKindReturnI32SubArgs:
-        return 2
-    if bodyKind == texpr.BodyKindReturnI32MulArgs:
-        return 2
-    if bodyKind == texpr.BodyKindReturnI32AsrArgs:
-        return 2
-    if bodyKind == texpr.BodyKindReturnI32MaddArgs:
-        return 2
-    if bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
-        return 6
-    if bodyKind == texpr.BodyKindStrLenFastI32:
-        return 7
-    if bodyKind == texpr.BodyKindMainF64MulCheckExit:
-        return 22
+fn PrimaryObjectEmitParseSuffixI32(bodyKind: str,
+                                    prefix: str): int32 =
+    var value: int32
+    for i in prefix.len..<bodyKind.len:
+        let ch = bodyKind[i]
+        if ch < '0' || ch > '9':
+            return 0
+        value = value * 10 + int32(ch) - int32('0')
+    return value
+
+fn PrimaryObjectEmitIsReturnI32ConstBodyKind(bodyKind: str): bool =
+    return strutil.StartsWith(bodyKind, texpr.BodyKindReturnI32ConstPrefix)
+
+fn PrimaryObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind: str): bool =
+    return strutil.StartsWith(bodyKind, texpr.BodyKindLetCallNoargReturnI32ConstPrefix)
+
+fn PrimaryObjectEmitPayloadByteCount(payloadText: str): int32 =
+    let zeroPrefix = "zero:"
+    if strutil.StartsWith(payloadText, zeroPrefix):
+        let raw = strings.SliceBytes(payloadText, len(zeroPrefix), len(payloadText) - len(zeroPrefix))
+        return int32(strutil.ParseInt(raw))
+    let cstringPrefix = "cstring:"
+    if strutil.StartsWith(payloadText, cstringPrefix):
+        let raw = strings.SliceBytes(payloadText, len(cstringPrefix), len(payloadText) - len(cstringPrefix))
+        var count: int32 = 1
+        var escaped = false
+        for i in 0..<len(raw):
+            if escaped:
+                escaped = false
+                count = count + 1
+            elif raw[i] == char(92):
+                escaped = true
+            else:
+                count = count + 1
+        if escaped:
+            count = count + 1
+        return count
     return 0
+
+fn PrimaryObjectEmitCStringPayloadByte(raw: str,
+                                        index: int32): int32 =
+    if index < 0 || index >= len(raw):
+        return 0
+    let ch = raw[index]
+    if ch == 'n':
+        return 10
+    if ch == 'r':
+        return 13
+    if ch == 't':
+        return 9
+    if ch == '0':
+        return 0
+    return int32(ch)
+
+fn PrimaryObjectEmitCStringPayloadByteList(payloadText: str): str =
+    let prefix = "cstring:"
+    if !strutil.StartsWith(payloadText, prefix):
+        return "0"
+    let raw = strings.SliceBytes(payloadText, len(prefix), len(payloadText) - len(prefix))
+    var parts: str[]
+    var escaped = false
+    for i in 0..<len(raw):
+        if escaped:
+            add(parts, intToStr(PrimaryObjectEmitCStringPayloadByte(raw, i)))
+            escaped = false
+        elif raw[i] == char(92):
+            escaped = true
+        else:
+            add(parts, intToStr(int32(raw[i])))
+    if escaped:
+        add(parts, intToStr(int32(char(92))))
+    add(parts, "0")
+    return strutil.Join(parts, ", ")
+
+fn PrimaryObjectEmitDataLabelByTail(plan: pobj.PrimaryObjectPlan,
+                                     tail: str): str =
+    for i in 0..<plan.dataLabels.len:
+        let label = plan.dataLabels[i]
+        if len(label) < len(tail):
+            continue
+        let start = len(label) - len(tail)
+        var matches = true
+        for j in 0..<len(tail):
+            if label[start + j] != tail[j]:
+                matches = false
+                break
+        if matches:
+            return label
+    return ""
+
+fn PrimaryObjectEmitExpectedWordsForBodyKind(bodyKind: str): int32 =
+    return bkind.BodyKindExpectedWordCount(bodyKind)
 
 fn PrimaryObjectEmitExpectedWordsForPlanFunction(plan: pobj.PrimaryObjectPlan,
                                                   functionIndex: int32): int32 =
     if functionIndex < 0 || functionIndex >= plan.functionBodyKinds.len:
         return 0
+    if functionIndex < plan.functionBodyIRs.len &&
+       plan.functionBodyIRs[functionIndex].ops.len == 4:
+        if functionIndex >= plan.functionWordCounts.len:
+            return 0
+        return plan.functionWordCounts[functionIndex]
     let bodyKind = plan.functionBodyKinds[functionIndex]
     if bodyKind == texpr.BodyKindStatementSequence:
         if functionIndex >= plan.functionWordCounts.len:
@@ -183,17 +227,14 @@ fn PrimaryObjectEmitValidateReturnZeroShape(plan: pobj.PrimaryObjectPlan): Resul
             return Err[bool](" primary object emit: empty function symbol")
         if i >= plan.functionBodyKinds.len:
             return Err[bool](" primary object emit: missing function body kind")
-        let bodyKind = plan.functionBodyKinds[i]
-        let expectedFunctionWords = PrimaryObjectEmitExpectedWordsForPlanFunction(plan, i)
-        if expectedFunctionWords <= 0:
-            return Err[bool](strutil.Join([" primary object emit: unsupported function body kind kind=",
-                                  bodyKind,
-                                  " index=",
-                                  intToStr(i),
-                                  " bridge_index=",
-                                  intToStr(bridgeIndex)], ""))
-        if plan.functionWordCounts[i] != expectedFunctionWords:
+        if plan.functionWordCounts[i] <= 0:
             return Err[bool](Fmt" primary object emit: unsupported function word count: {intToStr(plan.functionWordCounts[i])}")
+        if plan.functionWordOffsets[i] < 0:
+            return Err[bool](" primary object emit: negative function word offset")
+        if plan.functionWordOffsets[i] + plan.functionWordCounts[i] > plan.instructionWords.len:
+            return Err[bool](" primary object emit: function instruction words missing")
+        if i == 0 && plan.functionWordOffsets[i] != 0:
+            return Err[bool](" primary object emit: first function word offset mismatch")
         if i > 0:
             let previousIndex = i - 1
             let expectedOffset = plan.functionWordOffsets[previousIndex] + plan.functionWordCounts[previousIndex]
@@ -234,15 +275,14 @@ fn PrimaryObjectEmitValidateObjectShape(plan: pobj.PrimaryObjectPlan): Result[bo
     for i in 0..<plan.symbolNames.len:
         if len(plan.symbolNames[i]) <= 0:
             return Err[bool](" primary object emit: object plan empty function symbol")
-        let bodyKind = plan.functionBodyKinds[i]
-        let expectedFunctionWords = PrimaryObjectEmitExpectedWordsForPlanFunction(plan, i)
-        if expectedFunctionWords <= 0:
-            return Err[bool](strutil.Join([" primary object emit: object plan unsupported function body kind kind=",
-                                  bodyKind,
-                                  " index=",
-                                  intToStr(i)], ""))
-        if plan.functionWordCounts[i] != expectedFunctionWords:
+        if plan.functionWordCounts[i] <= 0:
             return Err[bool](Fmt" primary object emit: object plan unsupported function word count: {intToStr(plan.functionWordCounts[i])}")
+        if plan.functionWordOffsets[i] < 0:
+            return Err[bool](" primary object emit: object plan negative function word offset")
+        if plan.functionWordOffsets[i] + plan.functionWordCounts[i] > plan.instructionWords.len:
+            return Err[bool](" primary object emit: object plan instruction words missing")
+        if i == 0 && plan.functionWordOffsets[i] != 0:
+            return Err[bool](" primary object emit: object plan first function word offset mismatch")
         if i > 0:
             let previousIndex = i - 1
             let expectedOffset = plan.functionWordOffsets[previousIndex] + plan.functionWordCounts[previousIndex]
@@ -540,6 +580,106 @@ fn PrimaryObjectEmitSymbolInPlan(plan: pobj.PrimaryObjectPlan,
             return true
     return false
 
+fn PrimaryObjectEmitCstringLiteralCallCount(plan: pobj.PrimaryObjectPlan,
+                                             functionIndex: int32): int32 =
+    if functionIndex >= 0 && functionIndex < plan.functionBodyIRs.len:
+        let bodyIR = plan.functionBodyIRs[functionIndex]
+        if pobj.PrimaryBodyIrStatementReturnMode(bodyIR) == pobj.PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0():
+            return bodyIR.callSequence.len
+    if functionIndex >= 0 &&
+       functionIndex < plan.functionStatementReturnModes.len &&
+       plan.functionStatementReturnModes[functionIndex] == pobj.PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0() &&
+       functionIndex < plan.functionStatementCallCounts.len:
+        return plan.functionStatementCallCounts[functionIndex]
+    return 0
+
+fn PrimaryObjectEmitHasData(plan: pobj.PrimaryObjectPlan): bool =
+    return plan.dataLabels.len > 0
+
+fn PrimaryObjectEmitBackendDriverCommandDispatchWordAsm(plan: pobj.PrimaryObjectPlan,
+                                                         functionIndex: int32,
+                                                         localWordIndex: int32): str =
+    if functionIndex < 0 || functionIndex >= plan.functionWordOffsets.len:
+        return "  .long 0\n"
+    let wordIndex = plan.functionWordOffsets[functionIndex] + localWordIndex
+    if wordIndex < 0 || wordIndex >= plan.instructionWords.len:
+        return "  .long 0\n"
+    return Fmt"  .long {intToStr(plan.instructionWords[wordIndex])}\n"
+
+fn PrimaryObjectEmitBackendDriverCommandDispatchFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                             functionIndex: int32,
+                                                             ordinal: int32): Result[str] =
+    if functionIndex < 0 || functionIndex >= plan.symbolNames.len:
+        return Err[str](" primary object emit: missing backend driver command dispatch symbol")
+    let helpTarget = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let statusTarget = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
+    let printTarget = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 2)
+    let verifyTarget = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 3)
+    let parallelTarget = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 4)
+    let systemTarget = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 5)
+    if !PrimaryObjectEmitSymbolInPlan(plan, helpTarget) ||
+       !PrimaryObjectEmitSymbolInPlan(plan, statusTarget) ||
+       !PrimaryObjectEmitSymbolInPlan(plan, printTarget) ||
+       !PrimaryObjectEmitSymbolInPlan(plan, verifyTarget) ||
+       !PrimaryObjectEmitSymbolInPlan(plan, parallelTarget) ||
+       !PrimaryObjectEmitSymbolInPlan(plan, systemTarget):
+        return Err[str](" primary object emit: missing backend driver command dispatch target")
+    let symbolName = plan.symbolNames[functionIndex]
+    let labelOrdinal = intToStr(ordinal)
+    var chunks: str[]
+    add(chunks, Fmt".globl {symbolName}\n")
+    add(chunks, Fmt"{symbolName}:\n")
+    for wordIndex in 0..<144:
+        if wordIndex == 131:
+            add(chunks, Fmt"  bl {helpTarget}\n")
+        elif wordIndex == 133:
+            add(chunks, Fmt"  bl {statusTarget}\n")
+        elif wordIndex == 135:
+            add(chunks, Fmt"  bl {printTarget}\n")
+        elif wordIndex == 137:
+            add(chunks, Fmt"  bl {verifyTarget}\n")
+        elif wordIndex == 139:
+            add(chunks, Fmt"  bl {parallelTarget}\n")
+        elif wordIndex == 141:
+            add(chunks, Fmt"  bl {systemTarget}\n")
+        else:
+            add(chunks, PrimaryObjectEmitBackendDriverCommandDispatchWordAsm(plan,
+                                                                             functionIndex,
+                                                                             wordIndex))
+    add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+    return Ok[str](strutil.Join(chunks, ""))
+
+fn PrimaryObjectEmitResultRequestDispatchFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                      functionIndex: int32,
+                                                      ordinal: int32): Result[str] =
+    if functionIndex < 0 || functionIndex >= plan.symbolNames.len:
+        return Err[str](" primary object emit: missing result request dispatch symbol")
+    let dispatchTarget = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let unsupportedTarget = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
+    if len(dispatchTarget) <= 0 ||
+       len(unsupportedTarget) <= 0:
+        return Err[str](" primary object emit: missing result request dispatch target")
+    let symbolName = plan.symbolNames[functionIndex]
+    let labelOrdinal = intToStr(ordinal)
+    var chunks: str[]
+    add(chunks, Fmt".globl {symbolName}\n")
+    if !PrimaryObjectEmitSymbolInPlan(plan, dispatchTarget):
+        add(chunks, Fmt".extern {dispatchTarget}\n")
+    if !PrimaryObjectEmitSymbolInPlan(plan, unsupportedTarget):
+        add(chunks, Fmt".extern {unsupportedTarget}\n")
+    add(chunks, Fmt"{symbolName}:\n")
+    for wordIndex in 0..<12:
+        if wordIndex == 5:
+            add(chunks, Fmt"  bl {dispatchTarget}\n")
+        elif wordIndex == 9:
+            add(chunks, Fmt"  bl {unsupportedTarget}\n")
+        else:
+            add(chunks, PrimaryObjectEmitBackendDriverCommandDispatchWordAsm(plan,
+                                                                             functionIndex,
+                                                                             wordIndex))
+    add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+    return Ok[str](strutil.Join(chunks, ""))
+
 fn PrimaryObjectEmitReturnCallFunctionAsm(plan: pobj.PrimaryObjectPlan,
                                            functionIndex: int32,
                                            ordinal: int32): Result[str] =
@@ -553,6 +693,8 @@ fn PrimaryObjectEmitReturnCallFunctionAsm(plan: pobj.PrimaryObjectPlan,
     if !PrimaryObjectEmitSymbolInPlan(plan, targetSymbol):
         out = strutil.Join([out, Fmt".extern {targetSymbol}\n"], "")
     out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    if plan.functionBodyKinds[functionIndex] == texpr.BodyKindReturnCallArg0TruePassthrough:
+        out = strutil.Join([out, "  mov w1, #1\n"], "")
     out = strutil.Join([out, Fmt"  b {targetSymbol}\n"], "")
     out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
     return Ok[str](out)
@@ -687,107 +829,66 @@ fn PrimaryObjectEmitLetCallNoargStrThenCallArg0ReturnI32Const0FunctionAsm(plan: 
     out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
     return Ok[str](out)
 
-fn PrimaryObjectEmitStrI32GuardArg0Return0FunctionAsm(plan: pobj.PrimaryObjectPlan,
-                                                       functionIndex: int32,
-                                                       ordinal: int32): Result[str] =
+fn PrimaryObjectEmitStrLetCallThenCallArg0ReturnI32FunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                                functionIndex: int32,
+                                                                ordinal: int32): Result[str] =
     let symbolName = plan.symbolNames[functionIndex]
-    let firstTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let targetSymbol = PrimaryObjectEmitRelocTargetForItem(plan, plan.itemIds[functionIndex])
     let secondTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
-    let thirdTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 2)
-    let fourthTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 3)
-    if len(firstTargetSymbol) <= 0:
-        return Err[str](" primary object emit: missing str guard first target")
+    if len(targetSymbol) <= 0:
+        return Err[str](" primary object emit: missing first let-call str target")
     if len(secondTargetSymbol) <= 0:
-        return Err[str](" primary object emit: missing str guard second target")
-    if len(thirdTargetSymbol) <= 0:
-        return Err[str](" primary object emit: missing str guard count target")
-    if len(fourthTargetSymbol) <= 0:
-        return Err[str](" primary object emit: missing str guard fallback target")
+        return Err[str](" primary object emit: missing second let-call str consumer target")
     let labelOrdinal = intToStr(ordinal)
-    let returnLabel = strutil.Join(["L_cheng_str_i32_guard_return_", labelOrdinal], "")
     var out = ""
     out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
-    if !PrimaryObjectEmitSymbolInPlan(plan, firstTargetSymbol):
-        out = strutil.Join([out, Fmt".extern {firstTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, targetSymbol):
+        out = strutil.Join([out, Fmt".extern {targetSymbol}\n"], "")
     if !PrimaryObjectEmitSymbolInPlan(plan, secondTargetSymbol):
         out = strutil.Join([out, Fmt".extern {secondTargetSymbol}\n"], "")
-    if !PrimaryObjectEmitSymbolInPlan(plan, thirdTargetSymbol):
-        out = strutil.Join([out, Fmt".extern {thirdTargetSymbol}\n"], "")
-    if !PrimaryObjectEmitSymbolInPlan(plan, fourthTargetSymbol):
-        out = strutil.Join([out, Fmt".extern {fourthTargetSymbol}\n"], "")
     out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
     out = strutil.Join([out, "  stp x29, x30, [sp, #-48]!\n"], "")
     out = strutil.Join([out, "  mov x29, sp\n"], "")
     out = strutil.Join([out, "  add x8, sp, #16\n"], "")
-    out = strutil.Join([out, Fmt"  bl {firstTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"  bl {targetSymbol}\n"], "")
     out = strutil.Join([out, "  add x0, sp, #16\n"], "")
     out = strutil.Join([out, Fmt"  bl {secondTargetSymbol}\n"], "")
-    out = strutil.Join([out, Fmt"  bl {thirdTargetSymbol}\n"], "")
-    out = strutil.Join([out, "  cmp w0, #0\n"], "")
-    out = strutil.Join([out, Fmt"  b.gt {returnLabel}\n"], "")
-    out = strutil.Join([out, "  add x0, sp, #16\n"], "")
-    out = strutil.Join([out, Fmt"  bl {fourthTargetSymbol}\n"], "")
-    out = strutil.Join([out, Fmt"{returnLabel}:\n"], "")
-    out = strutil.Join([out, "  mov w0, #0\n"], "")
     out = strutil.Join([out, "  ldp x29, x30, [sp], #48\n"], "")
     out = strutil.Join([out, "  ret\n"], "")
     out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
     return Ok[str](out)
 
-fn PrimaryObjectEmitStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32FunctionAsm(plan: pobj.PrimaryObjectPlan,
-                                                                               functionIndex: int32,
-                                                                               ordinal: int32): Result[str] =
+fn PrimaryObjectEmitCstringLiteralCallsReturnI32Const0FunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                                   functionIndex: int32,
+                                                                   ordinal: int32,
+                                                                   callCount: int32): Result[str] =
+    if functionIndex < 0 || functionIndex >= plan.symbolNames.len:
+        return Err[str](" primary object emit: missing cstring literal call symbol")
     let symbolName = plan.symbolNames[functionIndex]
-    let firstTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
-    let secondTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
-    let thirdTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 2)
-    let fourthTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 3)
-    let fifthTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 4)
-    if len(firstTargetSymbol) <= 0:
-        return Err[str](" primary object emit: missing str guard dispatch first target")
-    if len(secondTargetSymbol) <= 0:
-        return Err[str](" primary object emit: missing str guard dispatch second target")
-    if len(thirdTargetSymbol) <= 0:
-        return Err[str](" primary object emit: missing str guard dispatch count target")
-    if len(fourthTargetSymbol) <= 0:
-        return Err[str](" primary object emit: missing str guard dispatch fallback target")
-    if len(fifthTargetSymbol) <= 0:
-        return Err[str](" primary object emit: missing str guard dispatch else target")
     let labelOrdinal = intToStr(ordinal)
-    let dispatchLabel = strutil.Join(["L_cheng_str_i32_guard_dispatch_", labelOrdinal], "")
-    let epilogueLabel = strutil.Join(["L_cheng_str_i32_guard_dispatch_epilogue_", labelOrdinal], "")
     var out = ""
     out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
-    if !PrimaryObjectEmitSymbolInPlan(plan, firstTargetSymbol):
-        out = strutil.Join([out, Fmt".extern {firstTargetSymbol}\n"], "")
-    if !PrimaryObjectEmitSymbolInPlan(plan, secondTargetSymbol):
-        out = strutil.Join([out, Fmt".extern {secondTargetSymbol}\n"], "")
-    if !PrimaryObjectEmitSymbolInPlan(plan, thirdTargetSymbol):
-        out = strutil.Join([out, Fmt".extern {thirdTargetSymbol}\n"], "")
-    if !PrimaryObjectEmitSymbolInPlan(plan, fourthTargetSymbol):
-        out = strutil.Join([out, Fmt".extern {fourthTargetSymbol}\n"], "")
-    if !PrimaryObjectEmitSymbolInPlan(plan, fifthTargetSymbol):
-        out = strutil.Join([out, Fmt".extern {fifthTargetSymbol}\n"], "")
+    for callOrdinal in 0..<callCount:
+        let targetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan,
+                                                                      plan.itemIds[functionIndex],
+                                                                      callOrdinal)
+        if len(targetSymbol) <= 0:
+            return Err[str](" primary object emit: missing cstring literal call target")
+        if !PrimaryObjectEmitSymbolInPlan(plan, targetSymbol):
+            out = strutil.Join([out, Fmt".extern {targetSymbol}\n"], "")
     out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
-    out = strutil.Join([out, "  stp x29, x30, [sp, #-48]!\n"], "")
+    out = strutil.Join([out, "  stp x29, x30, [sp, #-16]!\n"], "")
     out = strutil.Join([out, "  mov x29, sp\n"], "")
-    out = strutil.Join([out, "  add x8, sp, #16\n"], "")
-    out = strutil.Join([out, Fmt"  bl {firstTargetSymbol}\n"], "")
-    out = strutil.Join([out, "  add x0, sp, #16\n"], "")
-    out = strutil.Join([out, Fmt"  bl {secondTargetSymbol}\n"], "")
-    out = strutil.Join([out, Fmt"  bl {thirdTargetSymbol}\n"], "")
-    out = strutil.Join([out, "  cmp w0, #0\n"], "")
-    out = strutil.Join([out, Fmt"  b.gt {dispatchLabel}\n"], "")
-    out = strutil.Join([out, "  add x0, sp, #16\n"], "")
-    out = strutil.Join([out, Fmt"  bl {fourthTargetSymbol}\n"], "")
+    for callOrdinal in 0..<callCount:
+        let targetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan,
+                                                                      plan.itemIds[functionIndex],
+                                                                      callOrdinal)
+        let literalLabel = pobj.PrimaryCStringLiteralDataLabel(symbolName, callOrdinal)
+        out = strutil.Join([out, Fmt"  adrp x0, {literalLabel}@PAGE\n"], "")
+        out = strutil.Join([out, Fmt"  add x0, x0, {literalLabel}@PAGEOFF\n"], "")
+        out = strutil.Join([out, Fmt"  bl {targetSymbol}\n"], "")
     out = strutil.Join([out, "  mov w0, #0\n"], "")
-    out = strutil.Join([out, Fmt"  b {epilogueLabel}\n"], "")
-    out = strutil.Join([out, Fmt"{dispatchLabel}:\n"], "")
-    out = strutil.Join([out, "  mov w1, w0\n"], "")
-    out = strutil.Join([out, "  add x0, sp, #16\n"], "")
-    out = strutil.Join([out, Fmt"  bl {fifthTargetSymbol}\n"], "")
-    out = strutil.Join([out, Fmt"{epilogueLabel}:\n"], "")
-    out = strutil.Join([out, "  ldp x29, x30, [sp], #48\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #16\n"], "")
     out = strutil.Join([out, "  ret\n"], "")
     out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
     return Ok[str](out)
@@ -797,11 +898,19 @@ fn PrimaryObjectEmitStatementSequenceFunctionAsm(plan: pobj.PrimaryObjectPlan,
                                                   ordinal: int32): Result[str] =
     if functionIndex < 0 || functionIndex >= plan.functionStatementReturnModes.len:
         return Err[str](" primary object emit: missing statement sequence return mode")
-    let mode = plan.functionStatementReturnModes[functionIndex]
+    var mode = plan.functionStatementReturnModes[functionIndex]
+    var imm: int32
+    if functionIndex < plan.functionStatementReturnI32Values.len:
+        imm = plan.functionStatementReturnI32Values[functionIndex]
+    if functionIndex < plan.functionBodyIRs.len:
+        let bodyIR = plan.functionBodyIRs[functionIndex]
+        if bodyIR.ops.len > 0:
+            let returnOp = bodyIR.ops[bodyIR.ops.len - 1]
+            if returnOp.kind == coreir.BodyOpReturnTag && returnOp.operands.len > 0:
+                mode = returnOp.operands[0]
+                if returnOp.operands.len > 1:
+                    imm = returnOp.operands[1]
     if mode == pobj.PrimaryStatementReturnModeI32Const():
-        var imm: int32
-        if functionIndex < plan.functionStatementReturnI32Values.len:
-            imm = plan.functionStatementReturnI32Values[functionIndex]
         return PrimaryObjectEmitLetCallNoargReturnI32ConstFunctionAsm(plan, functionIndex, ordinal, imm)
     if mode == pobj.PrimaryStatementReturnModeCallResultI32():
         return PrimaryObjectEmitLetCallNoargReturnResultI32FunctionAsm(plan, functionIndex, ordinal)
@@ -813,13 +922,445 @@ fn PrimaryObjectEmitStatementSequenceFunctionAsm(plan: pobj.PrimaryObjectPlan,
         return PrimaryObjectEmitLetCallNoargStrReturnLenI32FunctionAsm(plan, functionIndex, ordinal)
     if mode == pobj.PrimaryStatementReturnModeStrThenCallReturnI32Const0():
         return PrimaryObjectEmitLetCallNoargStrThenCallArg0ReturnI32Const0FunctionAsm(plan, functionIndex, ordinal)
-    if mode == pobj.PrimaryStatementReturnModeStrI32GuardArg0Return0():
-        return PrimaryObjectEmitStrI32GuardArg0Return0FunctionAsm(plan, functionIndex, ordinal)
-    if mode == pobj.PrimaryStatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32():
-        return PrimaryObjectEmitStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32FunctionAsm(plan,
-                                                                                          functionIndex,
-                                                                                          ordinal)
+    if mode == pobj.PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0():
+        var callCount: int32
+        if functionIndex < plan.functionStatementCallCounts.len:
+            callCount = plan.functionStatementCallCounts[functionIndex]
+        if functionIndex < plan.functionBodyIRs.len:
+            let bodyIR = plan.functionBodyIRs[functionIndex]
+            if pobj.PrimaryBodyIrStatementReturnMode(bodyIR) == mode:
+                callCount = bodyIR.callSequence.len
+        return PrimaryObjectEmitCstringLiteralCallsReturnI32Const0FunctionAsm(plan,
+                                                                              functionIndex,
+                                                                              ordinal,
+                                                                              callCount)
     return Err[str](" primary object emit: unsupported statement sequence return mode")
+
+fn PrimaryObjectEmitI32TwoCallGuardFirstReturnFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                           functionIndex: int32,
+                                                           ordinal: int32): Result[str] =
+    let symbolName = plan.symbolNames[functionIndex]
+    let firstTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let secondTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
+    if len(firstTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing first i32 two-call target")
+    if len(secondTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing second i32 two-call target")
+    let labelOrdinal = intToStr(ordinal)
+    let firstReturnLabel = Fmt"L_cheng_body_ir_i32_two_call_return_first_{labelOrdinal}"
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, firstTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {firstTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, secondTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {secondTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, "  stp x29, x30, [sp, #-32]!\n"], "")
+    out = strutil.Join([out, "  mov x29, sp\n"], "")
+    out = strutil.Join([out, Fmt"  bl {firstTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  str w0, [sp, #16]\n"], "")
+    out = strutil.Join([out, Fmt"  bl {secondTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  cmp w0, #0\n"], "")
+    out = strutil.Join([out, Fmt"  b.gt {firstReturnLabel}\n"], "")
+    out = strutil.Join([out, "  mov w0, #0\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #32\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"{firstReturnLabel}:\n"], "")
+    out = strutil.Join([out, "  ldr w0, [sp, #16]\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #32\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitI32GuardThenCommandReturnFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                          functionIndex: int32,
+                                                          ordinal: int32): Result[str] =
+    let symbolName = plan.symbolNames[functionIndex]
+    let countTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let commandTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
+    if len(countTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing i32 guard count target")
+    if len(commandTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing i32 guard command target")
+    let labelOrdinal = intToStr(ordinal)
+    let commandLabel = Fmt"L_cheng_body_ir_i32_guard_command_{labelOrdinal}"
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, countTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {countTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, commandTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {commandTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, "  stp x29, x30, [sp, #-16]!\n"], "")
+    out = strutil.Join([out, "  mov x29, sp\n"], "")
+    out = strutil.Join([out, Fmt"  bl {countTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  cmp w0, #0\n"], "")
+    out = strutil.Join([out, Fmt"  b.gt {commandLabel}\n"], "")
+    out = strutil.Join([out, "  mov w0, #0\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #16\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"{commandLabel}:\n"], "")
+    out = strutil.Join([out, Fmt"  bl {commandTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #16\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitI32LetCallThenReturnCallArg0FunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                             functionIndex: int32,
+                                                             ordinal: int32): Result[str] =
+    let symbolName = plan.symbolNames[functionIndex]
+    let firstTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let secondTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
+    if len(firstTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing i32 arg0 chain first target")
+    if len(secondTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing i32 arg0 chain second target")
+    let labelOrdinal = intToStr(ordinal)
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, firstTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {firstTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, secondTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {secondTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, "  stp x29, x30, [sp, #-16]!\n"], "")
+    out = strutil.Join([out, "  mov x29, sp\n"], "")
+    out = strutil.Join([out, Fmt"  bl {firstTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"  bl {secondTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #16\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitArg0I32LetCallThenReturnCallArg0Arg1FunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                                      functionIndex: int32,
+                                                                      ordinal: int32): Result[str] =
+    let symbolName = plan.symbolNames[functionIndex]
+    let firstTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let secondTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
+    if len(firstTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing arg0 i32 chain first target")
+    if len(secondTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing arg0 i32 chain second target")
+    let labelOrdinal = intToStr(ordinal)
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, firstTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {firstTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, secondTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {secondTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, "  stp x29, x30, [sp, #-32]!\n"], "")
+    out = strutil.Join([out, "  mov x29, sp\n"], "")
+    out = strutil.Join([out, "  str x0, [sp, #16]\n"], "")
+    out = strutil.Join([out, Fmt"  bl {firstTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  mov w1, w0\n"], "")
+    out = strutil.Join([out, "  ldr x0, [sp, #16]\n"], "")
+    out = strutil.Join([out, Fmt"  bl {secondTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #32\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitArg0AggregateCallThenReturnCallArg0Arg1FunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                                        functionIndex: int32,
+                                                                        ordinal: int32): Result[str] =
+    let symbolName = plan.symbolNames[functionIndex]
+    let firstTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let secondTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
+    if len(firstTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing arg0 aggregate chain first target")
+    if len(secondTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing arg0 aggregate chain second target")
+    let labelOrdinal = intToStr(ordinal)
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, firstTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {firstTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, secondTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {secondTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, "  stp x29, x30, [sp, #-256]!\n"], "")
+    out = strutil.Join([out, "  mov x29, sp\n"], "")
+    out = strutil.Join([out, "  str x0, [sp, #248]\n"], "")
+    out = strutil.Join([out, "  add x8, sp, #16\n"], "")
+    out = strutil.Join([out, Fmt"  bl {firstTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  ldr x0, [sp, #248]\n"], "")
+    out = strutil.Join([out, "  add x1, sp, #16\n"], "")
+    out = strutil.Join([out, Fmt"  bl {secondTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #256\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitStrCallConstThenCallArg0ReturnI32FunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                                  functionIndex: int32,
+                                                                  ordinal: int32): Result[str] =
+    let symbolName = plan.symbolNames[functionIndex]
+    let firstTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let secondTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
+    if len(firstTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing str const arg chain first target")
+    if len(secondTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing str const arg chain second target")
+    let labelOrdinal = intToStr(ordinal)
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, firstTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {firstTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, secondTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {secondTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, "  stp x29, x30, [sp, #-48]!\n"], "")
+    out = strutil.Join([out, "  mov x29, sp\n"], "")
+    out = strutil.Join([out, "  add x8, sp, #16\n"], "")
+    out = strutil.Join([out, "  mov w0, #1\n"], "")
+    out = strutil.Join([out, Fmt"  bl {firstTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  add x0, sp, #16\n"], "")
+    out = strutil.Join([out, Fmt"  bl {secondTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #48\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitStrI32GuardCallArg0ThenDispatchReturnI32FunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                                         functionIndex: int32,
+                                                                         ordinal: int32): Result[str] =
+    let symbolName = plan.symbolNames[functionIndex]
+    let strTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let useTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
+    let countTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 2)
+    let guardUseTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 3)
+    let dispatchTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 4)
+    if len(strTargetSymbol) <= 0 ||
+       len(useTargetSymbol) <= 0 ||
+       len(countTargetSymbol) <= 0 ||
+       len(guardUseTargetSymbol) <= 0 ||
+       len(dispatchTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing str i32 guard dispatch target")
+    let labelOrdinal = intToStr(ordinal)
+    let dispatchLabel = Fmt"L_cheng_body_ir_str_i32_guard_dispatch_{labelOrdinal}"
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, strTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {strTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, useTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {useTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, countTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {countTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, guardUseTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {guardUseTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, dispatchTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {dispatchTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, "  stp x29, x30, [sp, #-48]!\n"], "")
+    out = strutil.Join([out, "  mov x29, sp\n"], "")
+    out = strutil.Join([out, "  add x8, sp, #16\n"], "")
+    out = strutil.Join([out, Fmt"  bl {strTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  add x0, sp, #16\n"], "")
+    out = strutil.Join([out, Fmt"  bl {useTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"  bl {countTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  cmp w0, #0\n"], "")
+    out = strutil.Join([out, Fmt"  b.gt {dispatchLabel}\n"], "")
+    out = strutil.Join([out, "  add x0, sp, #16\n"], "")
+    out = strutil.Join([out, Fmt"  bl {guardUseTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  mov w0, #0\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #48\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"{dispatchLabel}:\n"], "")
+    out = strutil.Join([out, "  mov w1, w0\n"], "")
+    out = strutil.Join([out, "  add x0, sp, #16\n"], "")
+    out = strutil.Join([out, Fmt"  bl {dispatchTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #48\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitI32GuardHelpThenCommandReturnFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                              functionIndex: int32,
+                                                              ordinal: int32): Result[str] =
+    let symbolName = plan.symbolNames[functionIndex]
+    let countTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    let helpTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 1)
+    let commandTargetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 2)
+    if len(countTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing i32 guard help count target")
+    if len(helpTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing i32 guard help target")
+    if len(commandTargetSymbol) <= 0:
+        return Err[str](" primary object emit: missing i32 guard help command target")
+    let labelOrdinal = intToStr(ordinal)
+    let commandLabel = Fmt"L_cheng_body_ir_i32_guard_help_command_{labelOrdinal}"
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, countTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {countTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, helpTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {helpTargetSymbol}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, commandTargetSymbol):
+        out = strutil.Join([out, Fmt".extern {commandTargetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, "  stp x29, x30, [sp, #-16]!\n"], "")
+    out = strutil.Join([out, "  mov x29, sp\n"], "")
+    out = strutil.Join([out, Fmt"  bl {countTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  cmp w0, #0\n"], "")
+    out = strutil.Join([out, Fmt"  b.gt {commandLabel}\n"], "")
+    out = strutil.Join([out, Fmt"  bl {helpTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #16\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"{commandLabel}:\n"], "")
+    out = strutil.Join([out, Fmt"  bl {commandTargetSymbol}\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #16\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitLeafBodyIRFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                           functionIndex: int32,
+                                           ordinal: int32): Result[str] =
+    if functionIndex < 0 ||
+       functionIndex >= plan.functionBodyIRs.len ||
+       functionIndex >= plan.symbolNames.len:
+        return Err[str](" primary object emit: missing body ir function")
+    let bodyIR = plan.functionBodyIRs[functionIndex]
+    let symbolName = plan.symbolNames[functionIndex]
+    if bodyIR.ops.len == 1:
+        let returnOp = bodyIR.ops[0]
+        if returnOp.kind != coreir.BodyOpReturnTag:
+            return Err[str](" primary object emit: body ir leaf unsupported")
+        if returnOp.operands.len < 3:
+            return Err[str](" primary object emit: body ir return operands missing")
+        if returnOp.operands[0] != coreir.LocalI32Tag:
+            return Err[str](" primary object emit: body ir return type unsupported")
+        if returnOp.operands[1] != int32(texpr.TypedExprIrOpParamRef):
+            return Err[str](" primary object emit: body ir return source unsupported")
+        let paramSlot = returnOp.operands[2]
+        if paramSlot == 0:
+            return Ok[str](PrimaryObjectEmitReturnI32Arg0FunctionAsm(symbolName, ordinal))
+        if paramSlot == 1:
+            return Ok[str](PrimaryObjectEmitReturnI32Arg1FunctionAsm(symbolName, ordinal))
+        if paramSlot == 2:
+            return Ok[str](PrimaryObjectEmitReturnI32Arg2FunctionAsm(symbolName, ordinal))
+        if paramSlot == 3:
+            return Ok[str](PrimaryObjectEmitReturnI32Arg3FunctionAsm(symbolName, ordinal))
+        return Err[str](" primary object emit: body ir return param unsupported")
+    if bodyIR.ops.len == 3:
+        if pobj.PrimaryBodyIrIsStrCallConstThenCallArg0ReturnI32(bodyIR):
+            return PrimaryObjectEmitStrCallConstThenCallArg0ReturnI32FunctionAsm(plan, functionIndex, ordinal)
+        if pobj.PrimaryBodyIrIsStrLetCallThenCallArg0ReturnI32(bodyIR):
+            return PrimaryObjectEmitStrLetCallThenCallArg0ReturnI32FunctionAsm(plan, functionIndex, ordinal)
+        if pobj.PrimaryBodyIrIsArg0I32LetCallThenReturnCallArg0Arg1(bodyIR):
+            return PrimaryObjectEmitArg0I32LetCallThenReturnCallArg0Arg1FunctionAsm(plan, functionIndex, ordinal)
+        if pobj.PrimaryBodyIrIsArg0AggregateCallThenReturnCallArg0Arg1(bodyIR):
+            return PrimaryObjectEmitArg0AggregateCallThenReturnCallArg0Arg1FunctionAsm(plan, functionIndex, ordinal)
+        if pobj.PrimaryBodyIrIsI32LetCallThenReturnCallArg0(bodyIR):
+            return PrimaryObjectEmitI32LetCallThenReturnCallArg0FunctionAsm(plan, functionIndex, ordinal)
+        return Err[str](" primary object emit: body ir call chain unsupported")
+    if bodyIR.ops.len == 4:
+        if pobj.PrimaryBodyIrIsI32TwoCallGuardFirstReturn(bodyIR):
+            return PrimaryObjectEmitI32TwoCallGuardFirstReturnFunctionAsm(plan, functionIndex, ordinal)
+        if pobj.PrimaryBodyIrIsI32GuardThenCommandReturn(bodyIR):
+            return PrimaryObjectEmitI32GuardThenCommandReturnFunctionAsm(plan, functionIndex, ordinal)
+        if pobj.PrimaryBodyIrIsI32GuardHelpThenCommandReturn(bodyIR):
+            return PrimaryObjectEmitI32GuardHelpThenCommandReturnFunctionAsm(plan, functionIndex, ordinal)
+        if bodyIR.callSequence.len != 1:
+            return Err[str](" primary object emit: body ir pointer guard call missing")
+        let callOp = bodyIR.ops[0]
+        let branchOp = bodyIR.ops[1]
+        let loadOp = bodyIR.ops[2]
+        let returnOp = bodyIR.ops[3]
+        if callOp.kind != coreir.BodyOpCallTag ||
+           branchOp.kind != coreir.BodyOpBranchTag ||
+           loadOp.kind != coreir.BodyOpLoadLocalTag ||
+           returnOp.kind != coreir.BodyOpReturnTag:
+            return Err[str](" primary object emit: body ir pointer guard unsupported")
+        if branchOp.operands.len < 3 ||
+           loadOp.operands.len < 3 ||
+           returnOp.operands.len < 1:
+            return Err[str](" primary object emit: body ir pointer guard operands missing")
+        let resultSlot = bodyIR.callSequence[0].resultSlot
+        if branchOp.operands[0] != coreir.BodyBranchIfLocalNilReturnI32ConstTag ||
+           branchOp.operands[1] != resultSlot ||
+           branchOp.operands[2] != 0 ||
+           loadOp.operands[0] != coreir.BodyLoadLocalPtrDerefI32Tag ||
+           loadOp.operands[1] != resultSlot ||
+           loadOp.operands[2] != coreir.LocalI32Tag ||
+           returnOp.target != resultSlot ||
+           returnOp.operands[0] != coreir.LocalI32Tag:
+            return Err[str](" primary object emit: body ir pointer guard shape mismatch")
+        let targetSymbol = PrimaryObjectEmitRelocTargetForItem(plan, plan.itemIds[functionIndex])
+        if len(targetSymbol) <= 0:
+            return Err[str](" primary object emit: missing pointer guard target")
+        let labelOrdinal = intToStr(ordinal)
+        let zeroLabel = Fmt"L_cheng_body_ir_ptr_nil_zero_{labelOrdinal}"
+        var out = ""
+        out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+        if !PrimaryObjectEmitSymbolInPlan(plan, targetSymbol):
+            out = strutil.Join([out, Fmt".extern {targetSymbol}\n"], "")
+        out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+        out = strutil.Join([out, "  stp x29, x30, [sp, #-16]!\n"], "")
+        out = strutil.Join([out, "  mov x29, sp\n"], "")
+        out = strutil.Join([out, Fmt"  bl {targetSymbol}\n"], "")
+        out = strutil.Join([out, Fmt"  cbz x0, {zeroLabel}\n"], "")
+        out = strutil.Join([out, "  ldr w0, [x0]\n"], "")
+        out = strutil.Join([out, "  ldp x29, x30, [sp], #16\n"], "")
+        out = strutil.Join([out, "  ret\n"], "")
+        out = strutil.Join([out, Fmt"{zeroLabel}:\n"], "")
+        out = strutil.Join([out, "  mov w0, #0\n"], "")
+        out = strutil.Join([out, "  ldp x29, x30, [sp], #16\n"], "")
+        out = strutil.Join([out, "  ret\n"], "")
+        out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+        return Ok[str](out)
+    if bodyIR.ops.len == 7:
+        if pobj.PrimaryBodyIrIsStrI32GuardCallArg0ThenDispatchReturnI32(bodyIR):
+            return PrimaryObjectEmitStrI32GuardCallArg0ThenDispatchReturnI32FunctionAsm(plan, functionIndex, ordinal)
+        return Err[str](" primary object emit: body ir str i32 guard dispatch unsupported")
+    if bodyIR.ops.len != 2:
+        return Err[str](" primary object emit: body ir leaf op count unsupported")
+    let firstOp = bodyIR.ops[0]
+    let returnOp = bodyIR.ops[1]
+    if returnOp.kind != coreir.BodyOpReturnTag:
+        return Err[str](" primary object emit: body ir leaf missing return")
+    if returnOp.target != firstOp.target:
+        return Err[str](" primary object emit: body ir return target mismatch")
+    if firstOp.kind == coreir.BodyOpLoadConstTag:
+        if firstOp.operands.len < 2:
+            return Err[str](" primary object emit: body ir const operands missing")
+        if firstOp.operands[0] != coreir.LocalI32Tag:
+            return Err[str](" primary object emit: body ir const type unsupported")
+        return Ok[str](PrimaryObjectEmitReturnI32ConstFunctionAsm(symbolName,
+                                                                  ordinal,
+                                                                  firstOp.operands[1]))
+    if firstOp.kind != coreir.BodyOpBinOpTag:
+        return Err[str](" primary object emit: body ir leaf op unsupported")
+    if firstOp.operands.len < 2:
+        return Err[str](" primary object emit: body ir bin operands missing")
+    let localType = firstOp.operands[0]
+    let opKind = firstOp.operands[1]
+    if localType == coreir.LocalF64Tag &&
+       opKind == int32(texpr.TypedExprIrOpF64Mul):
+        return Ok[str](PrimaryObjectEmitF64MulArgsFunctionAsm(symbolName, ordinal))
+    if localType != coreir.LocalI32Tag:
+        return Err[str](" primary object emit: body ir bin type unsupported")
+    if opKind == int32(texpr.TypedExprIrOpI32Add):
+        return Ok[str](PrimaryObjectEmitI32AddArgsFunctionAsm(symbolName, ordinal))
+    if opKind == int32(texpr.TypedExprIrOpI32Sub):
+        return Ok[str](PrimaryObjectEmitI32SubArgsFunctionAsm(symbolName, ordinal))
+    if opKind == int32(texpr.TypedExprIrOpI32Mul):
+        return Ok[str](PrimaryObjectEmitI32MulArgsFunctionAsm(symbolName, ordinal))
+    if opKind == int32(texpr.TypedExprIrOpI32Asr):
+        return Ok[str](PrimaryObjectEmitI32AsrArgsFunctionAsm(symbolName, ordinal))
+    if opKind == int32(texpr.TypedExprIrOpI32Madd):
+        let labelOrdinal = intToStr(ordinal)
+        var out = ""
+        out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+        out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+        out = strutil.Join([out, "  madd w0, w0, w1, w2\n"], "")
+        out = strutil.Join([out, "  ret\n"], "")
+        out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+        return Ok[str](out)
+    return Err[str](" primary object emit: body ir bin op unsupported")
 
 fn PrimaryObjectEmitEntryBridgeAsm(plan: pobj.PrimaryObjectPlan,
                                     bridgeSymbol: str,
@@ -855,7 +1396,249 @@ fn PrimaryObjectEmitEntryBridgeAsm(plan: pobj.PrimaryObjectPlan,
     out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
     return out
 
+fn PrimaryObjectEmitRuntimeSetCmdLineFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                  functionIndex: int32,
+                                                  ordinal: int32): Result[str] =
+    if functionIndex < 0 || functionIndex >= plan.symbolNames.len:
+        return Err[str](" primary object emit: missing runtime set command line symbol")
+    let argcSymbol = PrimaryObjectEmitDataLabelByTail(plan, "__cheng_saved_argc")
+    let argvSymbol = PrimaryObjectEmitDataLabelByTail(plan, "__cheng_saved_argv")
+    if len(argcSymbol) <= 0 || len(argvSymbol) <= 0:
+        return Err[str](" primary object emit: runtime set command line globals missing")
+    let symbolName = plan.symbolNames[functionIndex]
+    let labelOrdinal = intToStr(ordinal)
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, Fmt"  adrp x16, {argcSymbol}@PAGE\n"], "")
+    out = strutil.Join([out, Fmt"  add x16, x16, {argcSymbol}@PAGEOFF\n"], "")
+    out = strutil.Join([out, "  str w0, [x16]\n"], "")
+    out = strutil.Join([out, Fmt"  adrp x16, {argvSymbol}@PAGE\n"], "")
+    out = strutil.Join([out, Fmt"  add x16, x16, {argvSymbol}@PAGEOFF\n"], "")
+    out = strutil.Join([out, "  str x1, [x16]\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitDataLabelExact(plan: pobj.PrimaryObjectPlan,
+                                    label: str): str =
+    for i in 0..<plan.dataLabels.len:
+        if plan.dataLabels[i] == label:
+            return plan.dataLabels[i]
+    return ""
+
+fn PrimaryObjectEmitRelocTargetAtWordOffset(plan: pobj.PrimaryObjectPlan,
+                                             wordOffset: int32): str =
+    for i in 0..<plan.relocWordOffsets.len:
+        if plan.relocWordOffsets[i] != wordOffset:
+            continue
+        if i < plan.relocTargetSymbols.len:
+            return plan.relocTargetSymbols[i]
+        return ""
+    return ""
+
+fn PrimaryObjectEmitFunctionLooksEntryBridgeWords(plan: pobj.PrimaryObjectPlan,
+                                                   functionIndex: int32): bool =
+    if len(plan.entryFunctionSymbol) <= 0:
+        return false
+    if functionIndex < 0 ||
+       functionIndex >= plan.functionWordOffsets.len ||
+       functionIndex >= plan.functionWordCounts.len:
+        return false
+    if plan.functionWordCounts[functionIndex] != texpr.BodyKindEntryBridgeWordCount:
+        return false
+    let wordOffset = plan.functionWordOffsets[functionIndex]
+    if wordOffset + 16 >= plan.instructionWords.len:
+        return false
+    return plan.instructionWords[wordOffset] == -788495361 &&
+           plan.instructionWords[wordOffset + 3] == -1811939328 &&
+           plan.instructionWords[wordOffset + 6] == -1811939328 &&
+           plan.instructionWords[wordOffset + 8] == -1811939328 &&
+           plan.instructionWords[wordOffset + 12] == -1811939328 &&
+           plan.instructionWords[wordOffset + 16] == -698416192
+
+fn PrimaryObjectEmitEntryBridgeTargetSymbol(plan: pobj.PrimaryObjectPlan): str =
+    if len(plan.entryFunctionSymbol) > 0:
+        return plan.entryFunctionSymbol
+    if plan.symbolNames.len > 0:
+        return plan.symbolNames[0]
+    return ""
+
+fn PrimaryObjectEmitEntryBridgeRelocTargetAtLocalWord(plan: pobj.PrimaryObjectPlan,
+                                                       functionIndex: int32,
+                                                       localWordIndex: int32): str =
+    if !PrimaryObjectEmitFunctionLooksEntryBridgeWords(plan, functionIndex):
+        return ""
+    if localWordIndex == 3:
+        return pobj.PrimaryTargetSymbolName(plan.targetTriple, "__cheng_setCmdLine")
+    if localWordIndex == 6:
+        return pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_register_line_map_from_argv0")
+    if localWordIndex == 8:
+        return PrimaryObjectEmitEntryBridgeTargetSymbol(plan)
+    if localWordIndex == 12:
+        return pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_debug_profile_flush_from_argv0")
+    return ""
+
+fn PrimaryObjectEmitPlanBranchTarget(plan: pobj.PrimaryObjectPlan,
+                                      functionIndex: int32,
+                                      localWordIndex: int32): str =
+    let wordOffset = plan.functionWordOffsets[functionIndex] + localWordIndex
+    let target = PrimaryObjectEmitRelocTargetAtWordOffset(plan, wordOffset)
+    if len(target) > 0:
+        return target
+    return PrimaryObjectEmitEntryBridgeRelocTargetAtLocalWord(plan, functionIndex, localWordIndex)
+
+fn PrimaryObjectEmitPlanDataPairAsm(plan: pobj.PrimaryObjectPlan,
+                                     functionIndex: int32,
+                                     localWordIndex: int32,
+                                     cstringOrdinal: var int32,
+                                     runtimePairOrdinal: var int32): Result[str] =
+    if functionIndex < 0 ||
+       functionIndex >= plan.symbolNames.len ||
+       functionIndex >= plan.functionWordOffsets.len ||
+       functionIndex >= plan.functionWordCounts.len:
+        return Err[str](" primary object emit: malformed data pair function")
+    if localWordIndex + 1 >= plan.functionWordCounts[functionIndex]:
+        return Ok[str]("")
+    let wordOffset = plan.functionWordOffsets[functionIndex] + localWordIndex
+    if wordOffset + 1 >= plan.instructionWords.len:
+        return Err[str](" primary object emit: data pair instruction words missing")
+    let word = plan.instructionWords[wordOffset]
+    let nextWord = plan.instructionWords[wordOffset + 1]
+    if word == -1879048192 && nextWord == -1862270976:
+        let literalLabel = PrimaryObjectEmitDataLabelExact(plan,
+                                                           pobj.PrimaryCStringLiteralDataLabel(plan.symbolNames[functionIndex],
+                                                                                               cstringOrdinal))
+        if len(literalLabel) <= 0:
+            return Err[str](" primary object emit: missing cstring data label")
+        cstringOrdinal = cstringOrdinal + 1
+        return Ok[str](Fmt"  adrp x0, {literalLabel}@PAGE\n  add x0, x0, {literalLabel}@PAGEOFF\n")
+    if word == -1879048176 && nextWord == -1862270448:
+        var dataLabel = ""
+        if runtimePairOrdinal == 0:
+            dataLabel = PrimaryObjectEmitDataLabelByTail(plan, "__cheng_saved_argc")
+        elif runtimePairOrdinal == 1:
+            dataLabel = PrimaryObjectEmitDataLabelByTail(plan, "__cheng_saved_argv")
+        if len(dataLabel) <= 0:
+            return Err[str](" primary object emit: missing runtime data label")
+        runtimePairOrdinal = runtimePairOrdinal + 1
+        return Ok[str](Fmt"  adrp x16, {dataLabel}@PAGE\n  add x16, x16, {dataLabel}@PAGEOFF\n")
+    return Ok[str]("")
+
+fn PrimaryObjectEmitPlanInstructionWordAsm(plan: pobj.PrimaryObjectPlan,
+                                            functionIndex: int32,
+                                            localWordIndex: int32): Result[str] =
+    let wordOffset = plan.functionWordOffsets[functionIndex] + localWordIndex
+    if wordOffset < 0 || wordOffset >= plan.instructionWords.len:
+        return Err[str](" primary object emit: instruction word missing")
+    let word = plan.instructionWords[wordOffset]
+    let target = PrimaryObjectEmitPlanBranchTarget(plan, functionIndex, localWordIndex)
+    if len(target) > 0:
+        if word == -1811939328:
+            return Ok[str](Fmt"  bl {target}\n")
+        if word == 335544320:
+            return Ok[str](Fmt"  b {target}\n")
+        return Err[str](" primary object emit: branch reloc word mismatch")
+    if word == -1811939328 || word == 335544320:
+        return Err[str](" primary object emit: branch instruction missing reloc target")
+    return Ok[str](Fmt"  .long {intToStr(word)}\n")
+
+fn PrimaryObjectEmitPlanFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                     functionIndex: int32): Result[str] =
+    if functionIndex < 0 ||
+       functionIndex >= plan.symbolNames.len ||
+       functionIndex >= plan.functionWordCounts.len:
+        return Err[str](" primary object emit: missing plan function")
+    var chunks: str[]
+    add(chunks, Fmt".globl {plan.symbolNames[functionIndex]}\n")
+    add(chunks, Fmt"{plan.symbolNames[functionIndex]}:\n")
+    var skipNext = false
+    var cstringOrdinal: int32
+    var runtimePairOrdinal: int32
+    for localWordIndex in 0..<plan.functionWordCounts[functionIndex]:
+        if skipNext:
+            skipNext = false
+            continue
+        let dataPairRes = PrimaryObjectEmitPlanDataPairAsm(plan,
+                                                           functionIndex,
+                                                           localWordIndex,
+                                                           cstringOrdinal,
+                                                           runtimePairOrdinal)
+        if IsErr(dataPairRes):
+            return dataPairRes
+        let dataPair = Value(dataPairRes)
+        if len(dataPair) > 0:
+            add(chunks, dataPair)
+            skipNext = true
+            continue
+        let wordRes = PrimaryObjectEmitPlanInstructionWordAsm(plan, functionIndex, localWordIndex)
+        if IsErr(wordRes):
+            return wordRes
+        add(chunks, Value(wordRes))
+    add(chunks, Fmt"L_cheng_embedded_line_map_end_{intToStr(functionIndex)}:\n")
+    return Ok[str](strutil.Join(chunks, ""))
+
+fn PrimaryObjectEmitPlanExternAsm(plan: pobj.PrimaryObjectPlan): str =
+    var chunks: str[]
+    for i in 0..<plan.relocTargetSymbols.len:
+        if len(plan.relocTargetSymbols[i]) <= 0:
+            continue
+        if !PrimaryObjectEmitSymbolInPlan(plan, plan.relocTargetSymbols[i]):
+            add(chunks, Fmt".extern {plan.relocTargetSymbols[i]}\n")
+    for i in 0..<plan.symbolNames.len:
+        if !PrimaryObjectEmitFunctionLooksEntryBridgeWords(plan, i):
+            continue
+        let setCmdLine = pobj.PrimaryTargetSymbolName(plan.targetTriple, "__cheng_setCmdLine")
+        let lineMap = pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_register_line_map_from_argv0")
+        let profileFlush = pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_debug_profile_flush_from_argv0")
+        if !PrimaryObjectEmitSymbolInPlan(plan, setCmdLine):
+            add(chunks, Fmt".extern {setCmdLine}\n")
+        if !PrimaryObjectEmitSymbolInPlan(plan, lineMap):
+            add(chunks, Fmt".extern {lineMap}\n")
+        if !PrimaryObjectEmitSymbolInPlan(plan, PrimaryObjectEmitEntryBridgeTargetSymbol(plan)):
+            add(chunks, Fmt".extern {PrimaryObjectEmitEntryBridgeTargetSymbol(plan)}\n")
+        if !PrimaryObjectEmitSymbolInPlan(plan, profileFlush):
+            add(chunks, Fmt".extern {profileFlush}\n")
+    return strutil.Join(chunks, "")
+
+fn PrimaryObjectEmitPlanAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
+    let validRes = PrimaryObjectEmitValidateObjectShape(plan)
+    if IsErr(validRes):
+        return Err[str](Error(validRes))
+    var chunks: str[]
+    add(chunks, ".text\n.p2align 2\n")
+    add(chunks, PrimaryObjectEmitPlanExternAsm(plan))
+    for i in 0..<plan.symbolNames.len:
+        let functionAsmRes = PrimaryObjectEmitPlanFunctionAsm(plan, i)
+        if IsErr(functionAsmRes):
+            return functionAsmRes
+        add(chunks, Value(functionAsmRes))
+    add(chunks, PrimaryObjectEmitDataAsm(plan))
+    if plan.objectFormat == "macho":
+        add(chunks, ".subsections_via_symbols\n")
+    return Ok[str](strutil.Join(chunks, ""))
+
+fn PrimaryObjectEmitDataAsm(plan: pobj.PrimaryObjectPlan): str =
+    if !PrimaryObjectEmitHasData(plan):
+        return ""
+    var chunks: str[]
+    add(chunks, ".data\n")
+    for i in 0..<plan.dataLabels.len:
+        var count: int32
+        if i < plan.dataPayloadTexts.len:
+            count = PrimaryObjectEmitPayloadByteCount(plan.dataPayloadTexts[i])
+        if count <= 0:
+            count = 1
+        add(chunks, ".p2align 3\n")
+        add(chunks, Fmt"{plan.dataLabels[i]}:\n")
+        if i < plan.dataPayloadTexts.len && strutil.StartsWith(plan.dataPayloadTexts[i], "cstring:"):
+            add(chunks, Fmt"  .byte {PrimaryObjectEmitCStringPayloadByteList(plan.dataPayloadTexts[i])}\n")
+        else:
+            add(chunks, Fmt"  .space {intToStr(count)}\n")
+    return strutil.Join(chunks, "")
+
 fn PrimaryObjectEmitObjectAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
+    return PrimaryObjectEmitPlanAsmText(plan)
     let validRes = PrimaryObjectEmitValidateObjectShape(plan)
     if !IsOk(validRes):
         return Err[str](Error(validRes))
@@ -863,10 +1646,15 @@ fn PrimaryObjectEmitObjectAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
     add(chunks, ".text\n.p2align 2\n")
     for i in 0..<plan.symbolNames.len:
         let bodyKind = plan.functionBodyKinds[i]
+        if i < plan.functionBodyIRs.len:
+            let bodyIrAsmRes = PrimaryObjectEmitLeafBodyIRFunctionAsm(plan, i, i)
+            if IsOk(bodyIrAsmRes):
+                add(chunks, Value(bodyIrAsmRes))
+                continue
         if bodyKind == texpr.BodyKindReturnZeroI32:
             add(chunks, PrimaryObjectEmitReturnZeroFunctionAsm(plan.symbolNames[i], i))
         elif PrimaryObjectEmitIsReturnI32ConstBodyKind(bodyKind):
-            let imm = Value(PrimaryObjectEmitParseReturnI32ConstBodyKind(bodyKind))
+            let imm = PrimaryObjectEmitParseSuffixI32(bodyKind, texpr.BodyKindReturnI32ConstPrefix)
             add(chunks, PrimaryObjectEmitReturnI32ConstFunctionAsm(plan.symbolNames[i], i, imm))
         elif bodyKind == texpr.BodyKindReturnI32Arg0:
             add(chunks, PrimaryObjectEmitReturnI32Arg0FunctionAsm(plan.symbolNames[i], i))
@@ -893,105 +1681,19 @@ fn PrimaryObjectEmitObjectAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
             add(chunks, "  madd w0, w0, w1, w2\n")
             add(chunks, "  ret\n")
             add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
-        elif bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
-            add(chunks, PrimaryObjectEmitI32IfArg0LeZeroConstElseFunctionAsm(plan.symbolNames[i], i, 0, 7))
-        elif bodyKind == texpr.BodyKindStrLenFastI32:
-            add(chunks, PrimaryObjectEmitStrLenFastFunctionAsm(plan.symbolNames[i], i))
-        elif bodyKind == texpr.BodyKindReturnStrEmpty:
-            add(chunks, PrimaryObjectEmitReturnStrEmptyFunctionAsm(plan.symbolNames[i], i))
-        elif bodyKind == texpr.BodyKindReturnStrArg0:
-            add(chunks, PrimaryObjectEmitReturnStrArg0FunctionAsm(plan.symbolNames[i], i))
-        elif bodyKind == texpr.BodyKindCstringToStrCopy:
-            let cstringAsmRes = PrimaryObjectEmitCstringToStrCopyFunctionAsm(plan, i, i)
-            if IsErr(cstringAsmRes):
-                return Err[str](Error(cstringAsmRes))
-            add(chunks, Value(cstringAsmRes))
-        elif bodyKind == texpr.BodyKindMainF64MulCheckExit:
-            add(chunks, PrimaryObjectEmitF64MulCheckExitFunctionAsm(plan.symbolNames[i], i))
-        elif bodyKind == texpr.BodyKindStatementSequence:
-            let callAsmRes = PrimaryObjectEmitStatementSequenceFunctionAsm(plan, i, i)
-            if IsErr(callAsmRes):
-                return Err[str](Error(callAsmRes))
-            add(chunks, Value(callAsmRes))
-        elif PrimaryObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
-            let imm = Value(PrimaryObjectEmitParseLetCallNoargReturnI32ConstBodyKind(bodyKind))
-            let callAsmRes = PrimaryObjectEmitLetCallNoargReturnI32ConstFunctionAsm(plan, i, i, imm)
-            if IsErr(callAsmRes):
-                return Err[str](Error(callAsmRes))
-            add(chunks, Value(callAsmRes))
-        elif texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
-            let callAsmRes = PrimaryObjectEmitLetCallNoargReturnResultI32FunctionAsm(plan, i, i)
-            if IsErr(callAsmRes):
-                return Err[str](Error(callAsmRes))
-            add(chunks, Value(callAsmRes))
-        elif bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
-            let callAsmRes = PrimaryObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32FunctionAsm(plan, i, i)
-            if IsErr(callAsmRes):
-                return Err[str](Error(callAsmRes))
-            add(chunks, Value(callAsmRes))
-        elif texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
-            let callAsmRes = PrimaryObjectEmitLetCallNoargStrReturnLenI32FunctionAsm(plan, i, i)
-            if IsErr(callAsmRes):
-                return Err[str](Error(callAsmRes))
-            add(chunks, Value(callAsmRes))
-        elif texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
-            let callAsmRes = PrimaryObjectEmitLetCallNoargStrThenCallArg0ReturnI32Const0FunctionAsm(plan, i, i)
-            if IsErr(callAsmRes):
-                return Err[str](Error(callAsmRes))
-            add(chunks, Value(callAsmRes))
-        elif bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
-            let callAsmRes = PrimaryObjectEmitStrI32GuardArg0Return0FunctionAsm(plan, i, i)
-            if IsErr(callAsmRes):
-                return Err[str](Error(callAsmRes))
-            add(chunks, Value(callAsmRes))
-        elif texpr.TypedExprIsReturnCallBodyKind(bodyKind):
-            let callAsmRes = PrimaryObjectEmitReturnCallFunctionAsm(plan, i, i)
-            if IsErr(callAsmRes):
-                return Err[str](Error(callAsmRes))
-            add(chunks, Value(callAsmRes))
-        else:
-            return Err[str](" primary object emit: object plan unsupported function body kind")
-    if plan.objectFormat == "macho":
-        add(chunks, ".subsections_via_symbols\n")
-    return Ok[str](strutil.Join(chunks, ""))
-
-fn PrimaryObjectEmitAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
-    let validRes = PrimaryObjectEmitValidateReturnZeroShape(plan)
-    if !IsOk(validRes):
-        return Err[str](Error(validRes))
-    var bridgeIndex = PrimaryObjectEmitEntryBridgeIndex(plan)
-    if bridgeIndex < 1 && plan.functionBodyKinds.len == 2:
-        if plan.functionBodyKinds[0] == texpr.BodyKindReturnZeroI32 ||
-           PrimaryObjectEmitIsReturnI32ConstBodyKind(plan.functionBodyKinds[0]):
-            if plan.functionBodyKinds[1] == texpr.BodyKindEntryBridge:
-                bridgeIndex = 1
-    var functionLimit = plan.symbolNames.len
-    if bridgeIndex >= 0:
-        functionLimit = bridgeIndex
-    var chunks: str[]
-    add(chunks, ".text\n.p2align 2\n")
-    for i in 0..<functionLimit:
-        let bodyKind = plan.functionBodyKinds[i]
-        if bodyKind == texpr.BodyKindReturnZeroI32:
-            add(chunks, PrimaryObjectEmitReturnZeroFunctionAsm(plan.symbolNames[i], i))
-        elif PrimaryObjectEmitIsReturnI32ConstBodyKind(bodyKind):
-            let imm = Value(PrimaryObjectEmitParseReturnI32ConstBodyKind(bodyKind))
-            add(chunks, PrimaryObjectEmitReturnI32ConstFunctionAsm(plan.symbolNames[i], i, imm))
-        elif bodyKind == texpr.BodyKindReturnF64MulArgs:
-            add(chunks, PrimaryObjectEmitF64MulArgsFunctionAsm(plan.symbolNames[i], i))
-        elif bodyKind == texpr.BodyKindReturnI32AddArgs:
-            add(chunks, PrimaryObjectEmitI32AddArgsFunctionAsm(plan.symbolNames[i], i))
-        elif bodyKind == texpr.BodyKindReturnI32SubArgs:
-            add(chunks, PrimaryObjectEmitI32SubArgsFunctionAsm(plan.symbolNames[i], i))
-        elif bodyKind == texpr.BodyKindReturnI32MulArgs:
-            add(chunks, PrimaryObjectEmitI32MulArgsFunctionAsm(plan.symbolNames[i], i))
-        elif bodyKind == texpr.BodyKindReturnI32AsrArgs:
-            add(chunks, PrimaryObjectEmitI32AsrArgsFunctionAsm(plan.symbolNames[i], i))
-        elif bodyKind == texpr.BodyKindReturnI32MaddArgs:
+        elif bodyKind == texpr.BodyKindReturnU64Arg0AndConst4NotZero:
             let labelOrdinal = intToStr(i)
             add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
             add(chunks, Fmt"{plan.symbolNames[i]}:\n")
-            add(chunks, "  madd w0, w0, w1, w2\n")
+            add(chunks, "  tst x0, #4\n")
+            add(chunks, "  cset w0, ne\n")
+            add(chunks, "  ret\n")
+            add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+        elif bodyKind == texpr.BodyKindReturnU64Arg0OrConst4:
+            let labelOrdinal = intToStr(i)
+            add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
+            add(chunks, Fmt"{plan.symbolNames[i]}:\n")
+            add(chunks, "  orr x0, x0, #4\n")
             add(chunks, "  ret\n")
             add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
         elif bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
@@ -1040,8 +1742,136 @@ fn PrimaryObjectEmitAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
             if IsErr(callAsmRes):
                 return Err[str](Error(callAsmRes))
             add(chunks, Value(callAsmRes))
-        elif bodyKind == texpr.BodyKindStrI32GuardArg0Return0:
-            let callAsmRes = PrimaryObjectEmitStrI32GuardArg0Return0FunctionAsm(plan, i, i)
+        elif texpr.TypedExprIsReturnCallBodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitReturnCallFunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif bodyKind == texpr.BodyKindRuntimeSetCmdLine:
+            let setCmdRes = PrimaryObjectEmitRuntimeSetCmdLineFunctionAsm(plan, i, i)
+            if IsErr(setCmdRes):
+                return Err[str](Error(setCmdRes))
+            add(chunks, Value(setCmdRes))
+        elif bodyKind == texpr.BodyKindBackendDriverCommandDispatch:
+            let dispatchRes = PrimaryObjectEmitBackendDriverCommandDispatchFunctionAsm(plan, i, i)
+            if IsErr(dispatchRes):
+                return Err[str](Error(dispatchRes))
+            add(chunks, Value(dispatchRes))
+        elif bodyKind == texpr.BodyKindResultRequestDispatch:
+            let resultDispatchRes = PrimaryObjectEmitResultRequestDispatchFunctionAsm(plan, i, i)
+            if IsErr(resultDispatchRes):
+                return Err[str](Error(resultDispatchRes))
+            add(chunks, Value(resultDispatchRes))
+        else:
+            return Err[str](" primary object emit: object plan unsupported function body kind")
+    add(chunks, PrimaryObjectEmitDataAsm(plan))
+    if plan.objectFormat == "macho":
+        add(chunks, ".subsections_via_symbols\n")
+    return Ok[str](strutil.Join(chunks, ""))
+
+fn PrimaryObjectEmitAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
+    return PrimaryObjectEmitPlanAsmText(plan)
+    let validRes = PrimaryObjectEmitValidateReturnZeroShape(plan)
+    if !IsOk(validRes):
+        return Err[str](Error(validRes))
+    var bridgeIndex = PrimaryObjectEmitEntryBridgeIndex(plan)
+    if bridgeIndex < 1 && plan.functionBodyKinds.len == 2:
+        if plan.functionBodyKinds[0] == texpr.BodyKindReturnZeroI32 ||
+           PrimaryObjectEmitIsReturnI32ConstBodyKind(plan.functionBodyKinds[0]):
+            if plan.functionBodyKinds[1] == texpr.BodyKindEntryBridge:
+                bridgeIndex = 1
+    var functionLimit = plan.symbolNames.len
+    if bridgeIndex >= 0:
+        functionLimit = bridgeIndex
+    var chunks: str[]
+    add(chunks, ".text\n.p2align 2\n")
+    for i in 0..<functionLimit:
+        let bodyKind = plan.functionBodyKinds[i]
+        if i < plan.functionBodyIRs.len:
+            let bodyIrAsmRes = PrimaryObjectEmitLeafBodyIRFunctionAsm(plan, i, i)
+            if IsOk(bodyIrAsmRes):
+                add(chunks, Value(bodyIrAsmRes))
+                continue
+        if bodyKind == texpr.BodyKindReturnZeroI32:
+            add(chunks, PrimaryObjectEmitReturnZeroFunctionAsm(plan.symbolNames[i], i))
+        elif PrimaryObjectEmitIsReturnI32ConstBodyKind(bodyKind):
+            let imm = PrimaryObjectEmitParseSuffixI32(bodyKind, texpr.BodyKindReturnI32ConstPrefix)
+            add(chunks, PrimaryObjectEmitReturnI32ConstFunctionAsm(plan.symbolNames[i], i, imm))
+        elif bodyKind == texpr.BodyKindReturnF64MulArgs:
+            add(chunks, PrimaryObjectEmitF64MulArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32AddArgs:
+            add(chunks, PrimaryObjectEmitI32AddArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32SubArgs:
+            add(chunks, PrimaryObjectEmitI32SubArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32MulArgs:
+            add(chunks, PrimaryObjectEmitI32MulArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32AsrArgs:
+            add(chunks, PrimaryObjectEmitI32AsrArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32MaddArgs:
+            let labelOrdinal = intToStr(i)
+            add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
+            add(chunks, Fmt"{plan.symbolNames[i]}:\n")
+            add(chunks, "  madd w0, w0, w1, w2\n")
+            add(chunks, "  ret\n")
+            add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+        elif bodyKind == texpr.BodyKindReturnU64Arg0AndConst4NotZero:
+            let labelOrdinal = intToStr(i)
+            add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
+            add(chunks, Fmt"{plan.symbolNames[i]}:\n")
+            add(chunks, "  tst x0, #4\n")
+            add(chunks, "  cset w0, ne\n")
+            add(chunks, "  ret\n")
+            add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+        elif bodyKind == texpr.BodyKindReturnU64Arg0OrConst4:
+            let labelOrdinal = intToStr(i)
+            add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
+            add(chunks, Fmt"{plan.symbolNames[i]}:\n")
+            add(chunks, "  orr x0, x0, #4\n")
+            add(chunks, "  ret\n")
+            add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+        elif bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
+            add(chunks, PrimaryObjectEmitI32IfArg0LeZeroConstElseFunctionAsm(plan.symbolNames[i], i, 0, 7))
+        elif bodyKind == texpr.BodyKindStrLenFastI32:
+            add(chunks, PrimaryObjectEmitStrLenFastFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnStrEmpty:
+            add(chunks, PrimaryObjectEmitReturnStrEmptyFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnStrArg0:
+            add(chunks, PrimaryObjectEmitReturnStrArg0FunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindCstringToStrCopy:
+            let cstringAsmRes = PrimaryObjectEmitCstringToStrCopyFunctionAsm(plan, i, i)
+            if IsErr(cstringAsmRes):
+                return Err[str](Error(cstringAsmRes))
+            add(chunks, Value(cstringAsmRes))
+        elif bodyKind == texpr.BodyKindMainF64MulCheckExit:
+            add(chunks, PrimaryObjectEmitF64MulCheckExitFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindStatementSequence:
+            let callAsmRes = PrimaryObjectEmitStatementSequenceFunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif PrimaryObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+            let imm = Value(PrimaryObjectEmitParseLetCallNoargReturnI32ConstBodyKind(bodyKind))
+            let callAsmRes = PrimaryObjectEmitLetCallNoargReturnI32ConstFunctionAsm(plan, i, i, imm)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitLetCallNoargReturnResultI32FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
+            let callAsmRes = PrimaryObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitLetCallNoargStrReturnLenI32FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitLetCallNoargStrThenCallArg0ReturnI32Const0FunctionAsm(plan, i, i)
             if IsErr(callAsmRes):
                 return Err[str](Error(callAsmRes))
             add(chunks, Value(callAsmRes))
@@ -1050,6 +1880,21 @@ fn PrimaryObjectEmitAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
             if IsErr(callAsmRes):
                 return Err[str](Error(callAsmRes))
             add(chunks, Value(callAsmRes))
+        elif bodyKind == texpr.BodyKindRuntimeSetCmdLine:
+            let setCmdRes = PrimaryObjectEmitRuntimeSetCmdLineFunctionAsm(plan, i, i)
+            if IsErr(setCmdRes):
+                return Err[str](Error(setCmdRes))
+            add(chunks, Value(setCmdRes))
+        elif bodyKind == texpr.BodyKindBackendDriverCommandDispatch:
+            let dispatchRes = PrimaryObjectEmitBackendDriverCommandDispatchFunctionAsm(plan, i, i)
+            if IsErr(dispatchRes):
+                return Err[str](Error(dispatchRes))
+            add(chunks, Value(dispatchRes))
+        elif bodyKind == texpr.BodyKindResultRequestDispatch:
+            let resultDispatchRes = PrimaryObjectEmitResultRequestDispatchFunctionAsm(plan, i, i)
+            if IsErr(resultDispatchRes):
+                return Err[str](Error(resultDispatchRes))
+            add(chunks, Value(resultDispatchRes))
         else:
             return Err[str](" primary object emit: unsupported function body kind")
     if bridgeIndex >= 0:
@@ -1061,6 +1906,7 @@ fn PrimaryObjectEmitAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
                                                         entryTargetSymbol,
                                                         bridgeIndex)
         add(chunks, bridgeAsm)
+    add(chunks, PrimaryObjectEmitDataAsm(plan))
     if plan.objectFormat == "macho":
         add(chunks, ".subsections_via_symbols\n")
     return Ok[str](strutil.Join(chunks, ""))
@@ -1183,7 +2029,7 @@ fn PrimaryObjectEmitStandaloneMainAsmText(plan: pobj.PrimaryObjectPlan): Result[
     let entryBodyKind = PrimaryObjectEmitStandaloneEntryBodyKind(plan)
     var imm: int32
     if PrimaryObjectEmitIsReturnI32ConstBodyKind(entryBodyKind):
-        imm = Value(PrimaryObjectEmitParseReturnI32ConstBodyKind(entryBodyKind))
+        imm = PrimaryObjectEmitParseSuffixI32(entryBodyKind, texpr.BodyKindReturnI32ConstPrefix)
     var mainSymbol = "main"
     if plan.objectFormat == "macho":
         mainSymbol = "_main"

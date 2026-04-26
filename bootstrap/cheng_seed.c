@@ -164,6 +164,7 @@ static const char *ChengSeed_REMOVED_KEYS_V2[] = {
     "compiler_request_source",
     "tooling_gate_source",
     "lang_parser_source",
+    "lang_typed_expr_source",
     "backend_system_link_plan_source",
     "backend_lowering_plan_source",
     "backend_primary_object_plan_source",
@@ -211,6 +212,7 @@ static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "compiler_request_source",
     "tooling_gate_source",
     "lang_parser_source",
+    "lang_typed_expr_source",
     "backend_system_link_plan_source",
     "backend_lowering_plan_source",
     "backend_primary_object_plan_source",
@@ -1140,6 +1142,10 @@ static const char *cheng_seed_build_backend_driver_max_rss_bytes_text(void) {
     if (raw != NULL && raw[0] != '\0') {
         return raw;
     }
+    raw = getenv("CHENG_MAX_RSS_BYTES");
+    if (raw != NULL && raw[0] != '\0') {
+        return raw;
+    }
     return CHENG_SEED_DEFAULT_BACKEND_DRIVER_MAX_RSS_BYTES;
 }
 
@@ -1194,6 +1200,109 @@ static void cheng_seed_resource_guard_check(void) {
              (long long)max_rss_bytes);
     cheng_seed_progress_write_direct(line);
     exit(125);
+}
+
+static long long cheng_seed_monotime_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0LL;
+    }
+    return (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000L);
+}
+
+static int64_t cheng_seed_process_group_rss_bytes(pid_t pgid) {
+    char line[128];
+    FILE *pipe_file;
+    int64_t total_kb = 0;
+    if (pgid <= 0) {
+        return -1;
+    }
+    pipe_file = popen("/bin/ps -axo pgid=,rss=", "r");
+    if (pipe_file == NULL) {
+        return -1;
+    }
+    while (fgets(line, sizeof(line), pipe_file) != NULL) {
+        char *cursor = line;
+        char *end = NULL;
+        long long line_pgid = 0;
+        long long line_kb = 0;
+        while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+            cursor += 1;
+        }
+        errno = 0;
+        line_pgid = strtoll(cursor, &end, 10);
+        if (errno != 0 || end == cursor) {
+            continue;
+        }
+        cursor = end;
+        while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+            cursor += 1;
+        }
+        errno = 0;
+        line_kb = strtoll(cursor, &end, 10);
+        if (errno == 0 &&
+            end != cursor &&
+            line_pgid == (long long)pgid &&
+            line_kb > 0) {
+            total_kb += (int64_t)line_kb;
+        }
+    }
+    (void)pclose(pipe_file);
+    if (total_kb <= 0) {
+        return -1;
+    }
+    return total_kb * 1024LL;
+}
+
+static void cheng_seed_kill_process_group(pid_t pgid, int signal_number) {
+    if (pgid <= 0) {
+        return;
+    }
+    if (kill(-pgid, signal_number) != 0) {
+        (void)kill(pgid, signal_number);
+    }
+}
+
+static void cheng_seed_write_resource_guard_line(FILE *log,
+                                                 int64_t rss_bytes,
+                                                 int64_t max_rss_bytes) {
+    char line[256];
+    snprintf(line,
+             sizeof(line),
+             "compile_progress phase=resource_guard status=rss_limit_exceeded rss_bytes=%lld limit_bytes=%lld\n",
+             (long long)rss_bytes,
+             (long long)max_rss_bytes);
+    fputs(line, stderr);
+    fflush(stderr);
+    if (log != NULL) {
+        fputs(line, log);
+        fflush(log);
+    }
+}
+
+static bool cheng_seed_rss_guard_trace_enabled(void) {
+    const char *raw = getenv("CHENG_RSS_GUARD_TRACE");
+    return raw != NULL && raw[0] != '\0' && strcmp(raw, "0") != 0 && strcmp(raw, "false") != 0;
+}
+
+static void cheng_seed_write_resource_guard_sample(FILE *log,
+                                                   int64_t rss_bytes,
+                                                   int64_t max_rss_bytes) {
+    char line[256];
+    if (!cheng_seed_rss_guard_trace_enabled()) {
+        return;
+    }
+    snprintf(line,
+             sizeof(line),
+             "compile_progress phase=resource_guard status=sample rss_bytes=%lld limit_bytes=%lld\n",
+             (long long)rss_bytes,
+             (long long)max_rss_bytes);
+    fputs(line, stderr);
+    fflush(stderr);
+    if (log != NULL) {
+        fputs(line, log);
+        fflush(log);
+    }
 }
 
 static void cheng_seed_progress_emit(const char *phase, const char *status) {
@@ -1426,6 +1535,7 @@ typedef struct {
     char compiler_equivalence_source[PATH_MAX];
     char compiler_publish_gate_source[PATH_MAX];
     char lang_parser_source[PATH_MAX];
+    char lang_typed_expr_source[PATH_MAX];
     char backend_system_link_plan_source[PATH_MAX];
     char backend_lowering_plan_source[PATH_MAX];
     char backend_primary_object_plan_source[PATH_MAX];
@@ -1440,6 +1550,7 @@ typedef struct {
     char backend_native_link_exec_source[PATH_MAX];
     char backend_system_link_exec_source[PATH_MAX];
     char backend_system_link_exec_runtime_source[PATH_MAX];
+    char backend_system_link_exec_runtime_direct_source[PATH_MAX];
     char backend_line_map_source[PATH_MAX];
     char runtime_core_runtime_source[PATH_MAX];
     char runtime_compiler_runtime_source[PATH_MAX];
@@ -1451,6 +1562,7 @@ typedef struct {
     char runtime_program_support_provider_source[PATH_MAX];
     char runtime_program_support_host_provider_source[PATH_MAX];
     char tooling_gate_source[PATH_MAX];
+    char tooling_backend_driver_dispatch_min_source[PATH_MAX];
     char tooling_bootstrap_contract_source[PATH_MAX];
     char tooling_host_ops_source[PATH_MAX];
     char tooling_path_source[PATH_MAX];
@@ -1572,7 +1684,7 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
         cheng_seed_join_path(paths->stage1_source, sizeof(paths->stage1_source), paths->root, cheng_seed_bootstrap_stage1_source_relpath());
     }
     cheng_seed_join_path(paths->compiler_entry_source, sizeof(paths->compiler_entry_source), paths->root, "src/core/tooling/compiler_main.cheng");
-    cheng_seed_join_path(paths->backend_driver_entry_source, sizeof(paths->backend_driver_entry_source), paths->root, "src/core/tooling/backend_driver_main.cheng");
+    cheng_seed_join_path(paths->backend_driver_entry_source, sizeof(paths->backend_driver_entry_source), paths->root, "src/core/tooling/backend_driver_dispatch_min.cheng");
     cheng_seed_join_path(paths->compiler_runtime_source, sizeof(paths->compiler_runtime_source), paths->root, "src/core/tooling/compiler_runtime.cheng");
     cheng_seed_join_path(paths->compiler_request_source, sizeof(paths->compiler_request_source), paths->root, "src/core/tooling/compiler_request.cheng");
     cheng_seed_join_path(paths->compiler_world_source, sizeof(paths->compiler_world_source), paths->root, "src/core/tooling/compiler_world.cheng");
@@ -1581,6 +1693,7 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->compiler_equivalence_source, sizeof(paths->compiler_equivalence_source), paths->root, "src/core/tooling/compiler_equivalence.cheng");
     cheng_seed_join_path(paths->compiler_publish_gate_source, sizeof(paths->compiler_publish_gate_source), paths->root, "src/core/tooling/compiler_publish_gate.cheng");
     cheng_seed_join_path(paths->lang_parser_source, sizeof(paths->lang_parser_source), paths->root, "src/core/lang/parser.cheng");
+    cheng_seed_join_path(paths->lang_typed_expr_source, sizeof(paths->lang_typed_expr_source), paths->root, "src/core/lang/typed_expr.cheng");
     cheng_seed_join_path(paths->backend_system_link_plan_source, sizeof(paths->backend_system_link_plan_source), paths->root, "src/core/backend/system_link_plan.cheng");
     cheng_seed_join_path(paths->backend_lowering_plan_source, sizeof(paths->backend_lowering_plan_source), paths->root, "src/core/backend/lowering_plan.cheng");
     cheng_seed_join_path(paths->backend_primary_object_plan_source, sizeof(paths->backend_primary_object_plan_source), paths->root, "src/core/backend/primary_object_plan.cheng");
@@ -1595,6 +1708,7 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->backend_native_link_exec_source, sizeof(paths->backend_native_link_exec_source), paths->root, "src/core/backend/native_link_exec.cheng");
     cheng_seed_join_path(paths->backend_system_link_exec_source, sizeof(paths->backend_system_link_exec_source), paths->root, "src/core/backend/system_link_exec.cheng");
     cheng_seed_join_path(paths->backend_system_link_exec_runtime_source, sizeof(paths->backend_system_link_exec_runtime_source), paths->root, "src/core/backend/system_link_exec_runtime.cheng");
+    cheng_seed_join_path(paths->backend_system_link_exec_runtime_direct_source, sizeof(paths->backend_system_link_exec_runtime_direct_source), paths->root, "src/core/backend/system_link_exec_runtime_direct.cheng");
     cheng_seed_join_path(paths->backend_line_map_source, sizeof(paths->backend_line_map_source), paths->root, "src/core/backend/line_map.cheng");
     cheng_seed_join_path(paths->runtime_core_runtime_source, sizeof(paths->runtime_core_runtime_source), paths->root, "src/core/runtime/core_runtime.cheng");
     cheng_seed_join_path(paths->runtime_compiler_runtime_source, sizeof(paths->runtime_compiler_runtime_source), paths->root, "src/core/runtime/compiler_runtime.cheng");
@@ -1606,6 +1720,7 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->runtime_program_support_provider_source, sizeof(paths->runtime_program_support_provider_source), paths->root, "src/core/runtime/program_support_backend.cheng");
     cheng_seed_join_path(paths->runtime_program_support_host_provider_source, sizeof(paths->runtime_program_support_host_provider_source), paths->root, "src/core/runtime/program_support_host_runtime.cheng");
     cheng_seed_join_path(paths->tooling_gate_source, sizeof(paths->tooling_gate_source), paths->root, "src/core/tooling/gate_main.cheng");
+    cheng_seed_join_path(paths->tooling_backend_driver_dispatch_min_source, sizeof(paths->tooling_backend_driver_dispatch_min_source), paths->root, "src/core/tooling/backend_driver_dispatch_min.cheng");
     cheng_seed_join_path(paths->tooling_bootstrap_contract_source, sizeof(paths->tooling_bootstrap_contract_source), paths->root, "src/core/tooling/bootstrap_contracts.cheng");
     cheng_seed_join_path(paths->tooling_host_ops_source, sizeof(paths->tooling_host_ops_source), paths->root, "src/core/tooling/host_ops.cheng");
     cheng_seed_join_path(paths->tooling_path_source, sizeof(paths->tooling_path_source), paths->root, "src/core/tooling/path.cheng");
@@ -1809,7 +1924,7 @@ static bool cheng_seed_bootstrap_artifacts_fresh(const ChengSeedBootstrapPaths *
 }
 
 static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths) {
-    const char *inputs[46];
+    const char *inputs[49];
     char map_path[PATH_MAX];
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
@@ -1836,42 +1951,45 @@ static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths
     inputs[9] = paths->compiler_equivalence_source;
     inputs[10] = paths->compiler_publish_gate_source;
     inputs[11] = paths->lang_parser_source;
-    inputs[12] = paths->backend_system_link_plan_source;
-    inputs[13] = paths->backend_lowering_plan_source;
-    inputs[14] = paths->backend_primary_object_plan_source;
-    inputs[15] = paths->backend_primary_object_emit_source;
-    inputs[16] = paths->backend_direct_object_emit_source;
-    inputs[17] = paths->backend_object_buffer_source;
-    inputs[18] = paths->backend_object_symbols_source;
-    inputs[19] = paths->backend_object_relocs_source;
-    inputs[20] = paths->backend_macho_object_writer_source;
-    inputs[21] = paths->backend_object_plan_source;
-    inputs[22] = paths->backend_native_link_plan_source;
-    inputs[23] = paths->backend_native_link_exec_source;
-    inputs[24] = paths->backend_system_link_exec_source;
-    inputs[25] = paths->backend_system_link_exec_runtime_source;
-    inputs[26] = paths->backend_line_map_source;
-    inputs[27] = paths->runtime_core_runtime_source;
-    inputs[28] = paths->runtime_compiler_runtime_source;
-    inputs[29] = paths->runtime_debug_runtime_source;
-    inputs[30] = paths->tooling_bootstrap_contract_source;
-    inputs[31] = paths->backend_build_plan_source;
-    inputs[32] = paths->runtime_core_provider_source;
-    inputs[33] = paths->runtime_compiler_program_provider_source;
-    inputs[34] = paths->runtime_compiler_tooling_provider_source;
-    inputs[35] = paths->runtime_program_support_provider_source;
-    inputs[36] = paths->runtime_program_support_host_provider_source;
-    inputs[37] = paths->runtime_debug_provider_source;
-    inputs[38] = paths->tooling_host_ops_source;
-    inputs[39] = paths->tooling_path_source;
-    inputs[40] = paths->tooling_world_receipt_gate_source;
-    inputs[41] = paths->tooling_debug_tools_gate_source;
-    inputs[42] = paths->tooling_export_visibility_gate_source;
-    inputs[43] = paths->tooling_object_debug_report_source;
-    inputs[44] = paths->std_os_host_process_source;
-    inputs[45] = paths->std_os_source;
-    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 46U) &&
-           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 46U);
+    inputs[12] = paths->lang_typed_expr_source;
+    inputs[13] = paths->backend_system_link_plan_source;
+    inputs[14] = paths->backend_lowering_plan_source;
+    inputs[15] = paths->backend_primary_object_plan_source;
+    inputs[16] = paths->backend_primary_object_emit_source;
+    inputs[17] = paths->backend_direct_object_emit_source;
+    inputs[18] = paths->backend_object_buffer_source;
+    inputs[19] = paths->backend_object_symbols_source;
+    inputs[20] = paths->backend_object_relocs_source;
+    inputs[21] = paths->backend_macho_object_writer_source;
+    inputs[22] = paths->backend_object_plan_source;
+    inputs[23] = paths->backend_native_link_plan_source;
+    inputs[24] = paths->backend_native_link_exec_source;
+    inputs[25] = paths->backend_system_link_exec_source;
+    inputs[26] = paths->backend_system_link_exec_runtime_source;
+    inputs[27] = paths->backend_system_link_exec_runtime_direct_source;
+    inputs[28] = paths->backend_line_map_source;
+    inputs[29] = paths->runtime_core_runtime_source;
+    inputs[30] = paths->runtime_compiler_runtime_source;
+    inputs[31] = paths->runtime_debug_runtime_source;
+    inputs[32] = paths->tooling_backend_driver_dispatch_min_source;
+    inputs[33] = paths->tooling_bootstrap_contract_source;
+    inputs[34] = paths->backend_build_plan_source;
+    inputs[35] = paths->runtime_core_provider_source;
+    inputs[36] = paths->runtime_compiler_program_provider_source;
+    inputs[37] = paths->runtime_compiler_tooling_provider_source;
+    inputs[38] = paths->runtime_program_support_provider_source;
+    inputs[39] = paths->runtime_program_support_host_provider_source;
+    inputs[40] = paths->runtime_debug_provider_source;
+    inputs[41] = paths->tooling_host_ops_source;
+    inputs[42] = paths->tooling_path_source;
+    inputs[43] = paths->tooling_world_receipt_gate_source;
+    inputs[44] = paths->tooling_debug_tools_gate_source;
+    inputs[45] = paths->tooling_export_visibility_gate_source;
+    inputs[46] = paths->tooling_object_debug_report_source;
+    inputs[47] = paths->std_os_host_process_source;
+    inputs[48] = paths->std_os_source;
+    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 49U) &&
+           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 49U);
 }
 
 static bool cheng_seed_backend_driver_available_for_build(const ChengSeedBootstrapPaths *paths) {
@@ -1892,43 +2010,6 @@ static bool cheng_seed_backend_driver_available_for_build(const ChengSeedBootstr
 static int cheng_seed_cmd_bootstrap_bridge(int argc, char **argv);
 static int cheng_seed_cmd_build_backend_driver(int argc, char **argv);
 static int cheng_seed_cmd_system_link_exec(int argc, char **argv);
-
-static bool cheng_seed_ensure_backend_driver_ready(ChengSeedBootstrapPaths *paths,
-                                           const char *context) {
-    if (paths == NULL) {
-        return false;
-    }
-    if (!cheng_seed_bootstrap_artifacts_fresh(paths) &&
-        cheng_seed_cmd_bootstrap_bridge(0, NULL) != 0) {
-        if (context != NULL && context[0] != '\0') {
-            fprintf(stderr,
-                    "[cheng_seed] %s bootstrap-bridge failed\n",
-                    context);
-        }
-        return false;
-    }
-    if (cheng_seed_backend_driver_ready(paths)) {
-        return true;
-    }
-    if (cheng_seed_cmd_build_backend_driver(0, NULL) != 0) {
-        if (context != NULL && context[0] != '\0') {
-            fprintf(stderr,
-                    "[cheng_seed] %s build-backend-driver failed\n",
-                    context);
-        }
-        return false;
-    }
-    if (access(paths->backend_driver_out, X_OK) != 0) {
-        if (context != NULL && context[0] != '\0') {
-            fprintf(stderr,
-                    "[cheng_seed] %s missing backend driver: %s\n",
-                    context,
-                    paths->backend_driver_out);
-        }
-        return false;
-    }
-    return true;
-}
 
 static bool cheng_seed_lock_holder_alive(const char *lock_path, bool *alive_out) {
     char pid_text[64];
@@ -2579,7 +2660,9 @@ static bool cheng_seed_run_command_logged_argv_live(size_t arg_count,
                                             const char *label) {
     char **exec_argv = NULL;
     posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
     bool actions_ready = false;
+    bool attr_ready = false;
     int pipe_fds[2] = { -1, -1 };
     int flags;
     int spawn_rc;
@@ -2587,6 +2670,12 @@ static bool cheng_seed_run_command_logged_argv_live(size_t arg_count,
     int status = 0;
     bool running = true;
     bool pipe_open = true;
+    bool rss_invalid = false;
+    int64_t max_rss_bytes = cheng_seed_configured_max_rss_bytes(&rss_invalid);
+    bool memory_exceeded = false;
+    bool term_sent = false;
+    long long term_sent_ms = 0LL;
+    long long next_rss_check_ms = 0LL;
     FILE *log = NULL;
     char buffer[8192];
     char progress_line[1024];
@@ -2594,6 +2683,10 @@ static bool cheng_seed_run_command_logged_argv_live(size_t arg_count,
     size_t i;
     if (arg_count == 0U || args == NULL || log_path == NULL || log_path[0] == '\0') {
         fprintf(stderr, "[cheng_seed] %s missing argv/log\n", label);
+        return false;
+    }
+    if (rss_invalid || max_rss_bytes < 0) {
+        fprintf(stderr, "[cheng_seed] %s invalid CHENG_PROCESS_MAX_RSS_BYTES\n", label);
         return false;
     }
     if (!cheng_seed_ensure_parent_dir(log_path)) {
@@ -2617,6 +2710,14 @@ static bool cheng_seed_run_command_logged_argv_live(size_t arg_count,
         goto fail;
     }
     actions_ready = true;
+    if (posix_spawnattr_init(&attr) != 0) {
+        goto fail;
+    }
+    attr_ready = true;
+    if (posix_spawnattr_setpgroup(&attr, 0) != 0 ||
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP) != 0) {
+        goto fail;
+    }
     if (posix_spawn_file_actions_addclose(&actions, pipe_fds[0]) != 0 ||
         posix_spawn_file_actions_adddup2(&actions, pipe_fds[1], STDOUT_FILENO) != 0 ||
         posix_spawn_file_actions_adddup2(&actions, pipe_fds[1], STDERR_FILENO) != 0 ||
@@ -2625,7 +2726,7 @@ static bool cheng_seed_run_command_logged_argv_live(size_t arg_count,
          posix_spawn_file_actions_addclose(&actions, pipe_fds[1]) != 0)) {
         goto fail;
     }
-    spawn_rc = posix_spawnp(&pid, exec_argv[0], &actions, NULL, exec_argv, environ);
+    spawn_rc = posix_spawnp(&pid, exec_argv[0], &actions, &attr, exec_argv, environ);
     if (spawn_rc != 0) {
         errno = spawn_rc;
         perror("posix_spawnp");
@@ -2638,6 +2739,29 @@ static bool cheng_seed_run_command_logged_argv_live(size_t arg_count,
         (void)fcntl(pipe_fds[0], F_SETFL, flags | O_NONBLOCK);
     }
     while (running || pipe_open) {
+        if (running && max_rss_bytes > 0) {
+            long long now_ms = cheng_seed_monotime_ms();
+            if (now_ms == 0LL || now_ms >= next_rss_check_ms) {
+                int64_t rss_bytes = cheng_seed_process_group_rss_bytes(pid);
+                next_rss_check_ms = now_ms + 500LL;
+                cheng_seed_write_resource_guard_sample(log, rss_bytes, max_rss_bytes);
+                if (rss_bytes > max_rss_bytes) {
+                    memory_exceeded = true;
+                    cheng_seed_write_resource_guard_line(log, rss_bytes, max_rss_bytes);
+                    if (!term_sent) {
+                        cheng_seed_kill_process_group(pid, SIGTERM);
+                        term_sent = true;
+                        term_sent_ms = now_ms;
+                    } else if (now_ms == 0LL || now_ms - term_sent_ms >= 500LL) {
+                        cheng_seed_kill_process_group(pid, SIGKILL);
+                    }
+                } else if (memory_exceeded &&
+                           term_sent &&
+                           (now_ms == 0LL || now_ms - term_sent_ms >= 500LL)) {
+                    cheng_seed_kill_process_group(pid, SIGKILL);
+                }
+            }
+        }
         ssize_t n = read(pipe_fds[0], buffer, sizeof(buffer));
         if (n > 0) {
             fwrite(buffer, 1U, (size_t)n, log);
@@ -2678,7 +2802,13 @@ static bool cheng_seed_run_command_logged_argv_live(size_t arg_count,
     if (actions_ready) {
         posix_spawn_file_actions_destroy(&actions);
     }
+    if (attr_ready) {
+        posix_spawnattr_destroy(&attr);
+    }
     free(exec_argv);
+    if (memory_exceeded) {
+        status = 125 << 8;
+    }
     if (!cheng_seed_status_is_exit_code(status, 0)) {
         cheng_seed_report_child_status(label, status, log_path);
         return false;
@@ -2686,7 +2816,7 @@ static bool cheng_seed_run_command_logged_argv_live(size_t arg_count,
     return true;
 fail:
     if (pid > 0) {
-        kill(pid, SIGTERM);
+        cheng_seed_kill_process_group(pid, SIGTERM);
     }
     if (pipe_fds[0] >= 0) {
         close(pipe_fds[0]);
@@ -2696,6 +2826,9 @@ fail:
     }
     if (actions_ready) {
         posix_spawn_file_actions_destroy(&actions);
+    }
+    if (attr_ready) {
+        posix_spawnattr_destroy(&attr);
     }
     if (log != NULL) {
         fclose(log);
@@ -2718,6 +2851,12 @@ static bool cheng_seed_run_internal_command_logged_argv_live(ChengSeedInternalCo
     int status = 0;
     bool running = true;
     bool pipe_open = true;
+    bool rss_invalid = false;
+    int64_t max_rss_bytes = cheng_seed_configured_max_rss_bytes(&rss_invalid);
+    bool memory_exceeded = false;
+    bool term_sent = false;
+    long long term_sent_ms = 0LL;
+    long long next_rss_check_ms = 0LL;
     FILE *log = NULL;
     char buffer[8192];
     char progress_line[1024];
@@ -2725,6 +2864,10 @@ static bool cheng_seed_run_internal_command_logged_argv_live(ChengSeedInternalCo
     size_t i;
     if (fn == NULL || arg_count == 0U || args == NULL || log_path == NULL || log_path[0] == '\0') {
         fprintf(stderr, "[cheng_seed] %s missing internal argv/log\n", label);
+        return false;
+    }
+    if (rss_invalid || max_rss_bytes < 0) {
+        fprintf(stderr, "[cheng_seed] %s invalid CHENG_PROCESS_MAX_RSS_BYTES\n", label);
         return false;
     }
     if (arg_count > (size_t)INT_MAX) {
@@ -2755,6 +2898,7 @@ static bool cheng_seed_run_internal_command_logged_argv_live(ChengSeedInternalCo
     }
     if (pid == 0) {
         int rc;
+        (void)setpgid(0, 0);
         close(pipe_fds[0]);
         if (dup2(pipe_fds[1], STDOUT_FILENO) < 0 ||
             dup2(pipe_fds[1], STDERR_FILENO) < 0) {
@@ -2773,6 +2917,7 @@ static bool cheng_seed_run_internal_command_logged_argv_live(ChengSeedInternalCo
         }
         _exit(rc);
     }
+    (void)setpgid(pid, pid);
     close(pipe_fds[1]);
     pipe_fds[1] = -1;
     flags = fcntl(pipe_fds[0], F_GETFL, 0);
@@ -2780,6 +2925,29 @@ static bool cheng_seed_run_internal_command_logged_argv_live(ChengSeedInternalCo
         (void)fcntl(pipe_fds[0], F_SETFL, flags | O_NONBLOCK);
     }
     while (running || pipe_open) {
+        if (running && max_rss_bytes > 0) {
+            long long now_ms = cheng_seed_monotime_ms();
+            if (now_ms == 0LL || now_ms >= next_rss_check_ms) {
+                int64_t rss_bytes = cheng_seed_process_group_rss_bytes(pid);
+                next_rss_check_ms = now_ms + 500LL;
+                cheng_seed_write_resource_guard_sample(log, rss_bytes, max_rss_bytes);
+                if (rss_bytes > max_rss_bytes) {
+                    memory_exceeded = true;
+                    cheng_seed_write_resource_guard_line(log, rss_bytes, max_rss_bytes);
+                    if (!term_sent) {
+                        cheng_seed_kill_process_group(pid, SIGTERM);
+                        term_sent = true;
+                        term_sent_ms = now_ms;
+                    } else if (now_ms == 0LL || now_ms - term_sent_ms >= 500LL) {
+                        cheng_seed_kill_process_group(pid, SIGKILL);
+                    }
+                } else if (memory_exceeded &&
+                           term_sent &&
+                           (now_ms == 0LL || now_ms - term_sent_ms >= 500LL)) {
+                    cheng_seed_kill_process_group(pid, SIGKILL);
+                }
+            }
+        }
         ssize_t n = read(pipe_fds[0], buffer, sizeof(buffer));
         if (n > 0) {
             fwrite(buffer, 1U, (size_t)n, log);
@@ -2818,6 +2986,9 @@ static bool cheng_seed_run_internal_command_logged_argv_live(ChengSeedInternalCo
         close(pipe_fds[0]);
     }
     free(exec_argv);
+    if (memory_exceeded) {
+        status = 125 << 8;
+    }
     if (!cheng_seed_status_is_exit_code(status, 0)) {
         cheng_seed_report_child_status(label, status, log_path);
         return false;
@@ -2825,7 +2996,7 @@ static bool cheng_seed_run_internal_command_logged_argv_live(ChengSeedInternalCo
     return true;
 fail:
     if (pid > 0) {
-        kill(pid, SIGTERM);
+        cheng_seed_kill_process_group(pid, SIGTERM);
     }
     if (pipe_fds[0] >= 0) {
         close(pipe_fds[0]);
@@ -3007,6 +3178,7 @@ static bool cheng_seed_flag_present(int argc, char **argv, const char *flag) {
 #define CHENG_MAX_PLAN_REASONS 16
 #define CHENG_MAX_RUNTIME_TARGETS 8
 #define CHENG_MAX_PROVIDER_MODULES 8
+#define CHENG_MAX_EXPORT_ROOTS 160
 #define CHENG_MAX_PLAN_FUNCTIONS 8192
 #define CHENG_MAX_SOURCE_LINES 16384
 #define CHENG_MAX_IMPORT_ALIASES 128
@@ -3023,7 +3195,7 @@ static bool cheng_seed_flag_present(int argc, char **argv, const char *flag) {
 #define CHENG_MAX_ASM_LOCALS 1024
 #define CHENG_MAX_TYPE_TEXT 512
 #define CHENG_MAX_DEFAULT_EXPR 4096
-#define CHENG_PROVIDER_OBJECT_CACHE_VERSION "provider-object-cache-v5"
+#define CHENG_PROVIDER_OBJECT_CACHE_VERSION "provider-object-cache-v8"
 #define CHENG_PRIMARY_OBJECT_CACHE_VERSION "primary-object-cache-v1"
 
 typedef struct {
@@ -3038,6 +3210,10 @@ static void cheng_seed_plan_path_add_unique(ChengSeedPlanPath *items,
                                     size_t *len,
                                     size_t cap,
                                     const char *text);
+static bool cheng_seed_plan_path_add_unique_checked(ChengSeedPlanPath *items,
+                                            size_t *len,
+                                            size_t cap,
+                                            const char *text);
 static bool cheng_seed_startswith(const char *text, const char *prefix);
 static bool cheng_seed_load_source_lines(const char *source_path,
                                  char ***lines_out,
@@ -3102,6 +3278,8 @@ typedef struct {
     char module_kind[64];
     char emit_kind[32];
     char symbol_visibility[32];
+    size_t export_root_count;
+    ChengSeedPlanPath export_roots[CHENG_MAX_EXPORT_ROOTS];
     char entry_symbol[64];
     size_t runtime_target_count;
     ChengSeedPlanPath runtime_targets[CHENG_MAX_RUNTIME_TARGETS];
@@ -6439,7 +6617,9 @@ static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract
                                         const char *target_triple,
                                         const char *out_path,
                                         const ChengSeedPlanPath *suppressed_export_symbols,
-                                        size_t suppressed_export_symbol_count);
+                                        size_t suppressed_export_symbol_count,
+                                        const ChengSeedPlanPath *export_root_symbols,
+                                        size_t export_root_symbol_count);
 static void cheng_seed_primary_symbol_name(const ChengSeedSystemLinkPlanStub *plan,
                                    const ChengSeedLoweredFunctionStub *function,
                                    char *out,
@@ -15311,6 +15491,21 @@ static void cheng_seed_plan_add_path(ChengSeedPlanPath *items, size_t *len, size
     *len += 1U;
 }
 
+static bool cheng_seed_plan_add_path_checked(ChengSeedPlanPath *items,
+                                     size_t *len,
+                                     size_t cap,
+                                     const char *path) {
+    if (items == NULL || len == NULL || path == NULL || path[0] == '\0') {
+        return true;
+    }
+    if (*len >= cap) {
+        return false;
+    }
+    snprintf(items[*len].text, sizeof(items[*len].text), "%s", path);
+    *len += 1U;
+    return true;
+}
+
 static bool cheng_seed_plan_import_edge_exists(const ChengSeedSystemLinkPlanStub *plan,
                                        const ChengSeedPlanImportEdge *edge) {
     size_t i;
@@ -15362,6 +15557,12 @@ static void cheng_seed_populate_runtime_requirements(ChengSeedSystemLinkPlanStub
                      &plan->provider_module_count,
                      CHENG_MAX_PROVIDER_MODULES,
                      "runtime/debug_runtime");
+    if (cheng_seed_streq(plan->module_stem, "backend_driver_main")) {
+        cheng_seed_plan_add_path(plan->provider_modules,
+                         &plan->provider_module_count,
+                         CHENG_MAX_PROVIDER_MODULES,
+                         "runtime/backend_driver_dispatch");
+    }
     cheng_seed_plan_add_path(plan->provider_modules,
                      &plan->provider_module_count,
                      CHENG_MAX_PROVIDER_MODULES,
@@ -15370,6 +15571,26 @@ static void cheng_seed_populate_runtime_requirements(ChengSeedSystemLinkPlanStub
                      &plan->provider_module_count,
                      CHENG_MAX_PROVIDER_MODULES,
                      "runtime/program_support_host_runtime");
+}
+
+static bool cheng_seed_plan_has_provider_module(const ChengSeedSystemLinkPlanStub *plan,
+                                                const char *module_path) {
+    size_t i;
+    if (plan == NULL || module_path == NULL) {
+        return false;
+    }
+    for (i = 0; i < plan->provider_module_count; ++i) {
+        if (cheng_seed_streq(plan->provider_modules[i].text, module_path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cheng_seed_plan_uses_backend_driver_dispatch(const ChengSeedSystemLinkPlanStub *plan) {
+    return plan != NULL &&
+           cheng_seed_streq(plan->module_stem, "backend_driver_main") &&
+           cheng_seed_plan_has_provider_module(plan, "runtime/backend_driver_dispatch");
 }
 
 static void cheng_seed_source_path_to_module_path(const char *workspace_root,
@@ -19843,6 +20064,31 @@ static bool cheng_seed_lowered_function_is_entry_export_root(const ChengSeedSyst
     return function->export_symbol_name[0] != '\0';
 }
 
+static bool cheng_seed_lowered_function_matches_export_root(const ChengSeedSystemLinkPlanStub *plan,
+                                                    const ChengSeedLoweredFunctionStub *function,
+                                                    const char *root_symbol) {
+    char target_export_symbol[PATH_MAX];
+    if (plan == NULL || function == NULL || root_symbol == NULL || root_symbol[0] == '\0') {
+        return false;
+    }
+    if (function->export_symbol_name[0] != '\0') {
+        if (cheng_seed_streq(function->export_symbol_name, root_symbol)) {
+            return true;
+        }
+        cheng_seed_copy_target_symbol_name(plan,
+                                   function->export_symbol_name,
+                                   target_export_symbol,
+                                   sizeof(target_export_symbol));
+        if (cheng_seed_streq(target_export_symbol, root_symbol)) {
+            return true;
+        }
+    }
+    if (function->symbol_text[0] != '\0' && cheng_seed_streq(function->symbol_text, root_symbol)) {
+        return true;
+    }
+    return false;
+}
+
 static void cheng_seed_prune_lowering_to_reachable(const ChengSeedSystemLinkPlanStub *plan,
                                            ChengSeedLoweringPlanStub *lowering) {
     int32_t queue[CHENG_MAX_PLAN_FUNCTIONS];
@@ -19855,15 +20101,38 @@ static void cheng_seed_prune_lowering_to_reachable(const ChengSeedSystemLinkPlan
     bool seeded_export_roots = false;
     bool entry_has_explicit_exports = cheng_seed_lowering_entry_has_explicit_exports(plan, lowering);
     bool seed_entry_export_roots = false;
+    bool seed_explicit_export_roots = plan != NULL &&
+                                      plan->export_root_count > 0U &&
+                                      cheng_seed_streq(plan->emit_kind, "obj");
     old_function_count = lowering->function_count;
     for (i = 0; i < old_function_count; ++i) {
         lowering->functions[i].reachable = false;
-        if (lowering->functions[i].is_entry) {
+        if (!seed_explicit_export_roots && lowering->functions[i].is_entry) {
             cheng_seed_mark_reachable_with_overload_group(lowering, (int32_t)i, queue, &queue_tail);
             saw_entry = true;
         }
     }
+    if (seed_explicit_export_roots) {
+        size_t root_index;
+        for (root_index = 0U; root_index < plan->export_root_count; ++root_index) {
+            for (i = 0; i < old_function_count; ++i) {
+                if (!cheng_seed_lowered_function_matches_export_root(plan,
+                                                              &lowering->functions[i],
+                                                              plan->export_roots[root_index].text)) {
+                    continue;
+                }
+                if (!lowering->functions[i].reachable) {
+                    cheng_seed_mark_reachable_with_overload_group(lowering,
+                                                          (int32_t)i,
+                                                          queue,
+                                                          &queue_tail);
+                }
+                seeded_export_roots = true;
+            }
+        }
+    }
     seed_entry_export_roots =
+        !seed_explicit_export_roots &&
         plan->entry_path[0] != '\0' &&
         (cheng_seed_streq(plan->emit_kind, "shared") ||
          cheng_seed_streq(plan->emit_kind, "obj") ||
@@ -24879,6 +25148,10 @@ static bool cheng_seed_function_has_unbound_generics(const ChengSeedLoweringPlan
     size_t i;
     if (!lowering || !function || function->generic_binding_count > 0U) {
         return false;
+    }
+    if (strchr(function->function_name, '[') != NULL ||
+        strchr(function->symbol_text, '[') != NULL) {
+        return true;
     }
     if (cheng_seed_type_text_contains_function_placeholder(lowering,
                                                    function->owner_module_path,
@@ -47682,6 +47955,13 @@ static void cheng_seed_provider_source_for_module(const ChengSeedSystemLinkPlanS
                      "src/core/runtime/debug_runtime_stub.cheng");
         return;
     }
+    if (cheng_seed_streq(module_path, "runtime/backend_driver_dispatch")) {
+        cheng_seed_join_path(out,
+                     cap,
+                     plan->workspace_root,
+                     "src/core/runtime/backend_driver_dispatch_provider.cheng");
+        return;
+    }
     if (cheng_seed_streq(module_path, "runtime/program_support")) {
         cheng_seed_join_path(out, cap, plan->workspace_root, "src/core/runtime/program_support_backend.cheng");
         return;
@@ -47691,6 +47971,285 @@ static void cheng_seed_provider_source_for_module(const ChengSeedSystemLinkPlanS
         return;
     }
     out[0] = '\0';
+}
+
+static bool cheng_seed_provider_export_root_list(ChengSeedPlanPath *out,
+                                                 size_t *count,
+                                                 size_t cap,
+                                                 const char *const *symbols,
+                                                 size_t symbol_count);
+
+static bool cheng_seed_provider_export_roots_for_module(const ChengSeedSystemLinkPlanStub *plan,
+                                                const char *module_path,
+                                                ChengSeedPlanPath *out,
+                                                size_t *count,
+                                                size_t cap) {
+    if (out == NULL || count == NULL || module_path == NULL) {
+        return false;
+    }
+    *count = 0U;
+    if (cheng_seed_streq(module_path, "runtime/compiler_runtime")) {
+        return cheng_seed_plan_path_add_unique_checked(out, count, cap, "main");
+    }
+    if (cheng_seed_streq(module_path, "runtime/backend_driver_dispatch")) {
+        return cheng_seed_plan_path_add_unique_checked(out, count, cap, "cheng_backend_driver_dispatch");
+    }
+    if (cheng_seed_streq(module_path, "runtime/core_runtime")) {
+        static const char *const roots[] = {
+            "core_runtime_stub_trace",
+            "cheng_native_errno_code_bridge",
+            "cheng_native_af_inet_bridge",
+            "cheng_native_af_inet6_bridge",
+            "cheng_native_sock_stream_bridge",
+            "cheng_native_sock_dgram_bridge",
+            "cheng_native_ipproto_ip_bridge",
+            "cheng_native_sol_socket_bridge",
+            "cheng_native_so_reuseaddr_bridge",
+            "cheng_native_so_broadcast_bridge",
+            "cheng_native_msg_waitall_bridge",
+            "cheng_native_sockaddr_use_len_field_bridge"
+        };
+        if (!cheng_seed_provider_export_root_list(out,
+                                                  count,
+                                                  cap,
+                                                  roots,
+                                                  sizeof(roots) / sizeof(roots[0]))) {
+            return false;
+        }
+        if (cheng_seed_plan_uses_backend_driver_dispatch(plan)) {
+            return cheng_seed_plan_path_add_unique_checked(out,
+                                                           count,
+                                                           cap,
+                                                           "cheng_native_system_cpu_logical_cores_value_bridge") &&
+                   cheng_seed_plan_path_add_unique_checked(out,
+                                                           count,
+                                                           cap,
+                                                           "cheng_native_system_memory_total_bytes_value_bridge") &&
+                   cheng_seed_plan_path_add_unique_checked(out,
+                                                           count,
+                                                           cap,
+                                                           "cheng_native_system_memory_available_bytes_value_bridge") &&
+                   cheng_seed_plan_path_add_unique_checked(out,
+                                                           count,
+                                                           cap,
+                                                           "cheng_native_system_disk_total_bytes_value_bridge") &&
+                   cheng_seed_plan_path_add_unique_checked(out,
+                                                           count,
+                                                           cap,
+                                                           "cheng_native_system_disk_available_bytes_value_bridge") &&
+                   cheng_seed_plan_path_add_unique_checked(out,
+                                                           count,
+                                                           cap,
+                                                           "cheng_mobile_biometric_fingerprint_authorize_bridge_native");
+        }
+        return true;
+    }
+    if (cheng_seed_streq(module_path, "runtime/debug_runtime")) {
+        return cheng_seed_plan_path_add_unique_checked(out, count, cap, "cheng_native_register_line_map_from_argv0") &&
+               cheng_seed_plan_path_add_unique_checked(out, count, cap, "cheng_debug_profile_flush_from_argv0") &&
+               cheng_seed_plan_path_add_unique_checked(out, count, cap, "cheng_native_dump_backtrace_and_exit");
+    }
+    if (cheng_seed_streq(module_path, "runtime/program_support")) {
+        static const char *const roots[] = {
+            "__cheng_setCmdLine",
+            "__cheng_rt_paramCount",
+            "__cheng_rt_paramStr",
+            "__cheng_rt_paramStrCopy",
+            "__cheng_rt_paramStrCopyBridge",
+            "__cheng_rt_paramStrCopyBridgeInto",
+            "alloc",
+            "c_iometer_call",
+            "cheng_bounds_check",
+            "cheng_cstrlen",
+            "cheng_epoch_time_seconds",
+            "cheng_exec_cmd_capture",
+            "cheng_exec_cmd_last_exit_code",
+            "cheng_exec_cmd_status",
+            "cheng_fclose",
+            "cheng_fd_read_wait_bridge",
+            "cheng_fd_read_wait_bridge_last_eof",
+            "cheng_fread",
+            "cheng_free",
+            "cheng_fwrite",
+            "cheng_getcwd",
+            "cheng_host_exec_file_pipe_spawn_bridge",
+            "cheng_host_exec_file_pipe_spawn_bridge_last_pid_i32",
+            "cheng_host_exec_file_pipe_spawn_bridge_last_read_fd",
+            "cheng_host_exec_file_pipe_spawn_bridge_last_write_fd",
+            "cheng_malloc",
+            "cheng_mem_release",
+            "cheng_mem_retain",
+            "cheng_mkdir1",
+            "cheng_monotime_ns",
+            "cheng_os_dir_exists_bridge",
+            "cheng_os_file_exists_bridge",
+            "cheng_os_file_size_bridge",
+            "cheng_os_fopen_mode_bridge",
+            "cheng_os_is_absolute_bridge",
+            "cheng_os_join_path_bridge",
+            "cheng_panic_cstring_and_exit",
+            "cheng_ptr_size",
+            "cheng_pty_close_bridge",
+            "cheng_pty_wait_bridge",
+            "cheng_pty_wait_bridge_last_exit_code",
+            "cheng_rawbytes_get_at",
+            "cheng_rawbytes_set_at",
+            "cheng_rawmem_write_i8",
+            "cheng_register_line_map_from_argv0",
+            "cheng_seq_set_grow",
+            "cheng_seq_string_buffer_register_compat",
+            "cheng_seq_string_elem_bytes_compat",
+            "cheng_seq_string_register_compat",
+            "cheng_str_to_cstring_temp_bridge",
+            "cheng_strformat_fmt_bridge",
+            "cheng_strformat_lines_bridge",
+            "copyMem",
+            "driver_c_cli_param1_eq_bridge",
+            "driver_c_create_dir_all_bridge",
+            "driver_c_get_current_dir_bridge",
+            "driver_c_i32_to_str",
+            "driver_c_i64_to_str",
+            "driver_c_new_string",
+            "driver_c_new_string_copy_n",
+            "driver_c_read_flag_or_default_bridge",
+            "driver_c_read_flag_value_bridge",
+            "driver_c_read_file_all",
+            "driver_c_read_file_all_bridge",
+            "driver_c_read_file_all_bridge_into",
+            "driver_c_read_int32_flag_or_default_bridge",
+            "driver_c_str_concat_bridge",
+            "driver_c_str_eq_bridge",
+            "driver_c_str_eq_raw_bridge",
+            "driver_c_str_from_utf8_copy_bridge",
+            "driver_c_str_slice_bridge",
+            "driver_c_u64_to_str",
+            "driver_c_write_text_file_bridge",
+            "get_stderr",
+            "get_stdout",
+            "load_int32",
+            "load_ptr",
+            "paramCount",
+            "paramStr",
+            "ptr_add",
+            "setMem",
+            "store_int32",
+            "store_ptr"
+        };
+        return cheng_seed_provider_export_root_list(out,
+                                                    count,
+                                                    cap,
+                                                    roots,
+                                                    sizeof(roots) / sizeof(roots[0]));
+    }
+    if (cheng_seed_streq(module_path, "runtime/program_support_host_runtime")) {
+        static const char *const roots[] = {
+            "cheng_program_support_host_trace",
+            "cheng_host_chdir_runtime",
+            "cheng_host_clock_gettime",
+            "cheng_host_close",
+            "cheng_host_closedir",
+            "cheng_host_creat_runtime",
+            "cheng_host_dup2_runtime",
+            "cheng_host_execvp",
+            "cheng_host_exit_immediate_runtime",
+            "cheng_host_exit_runtime",
+            "cheng_host_fclose",
+            "cheng_host_fcntl",
+            "cheng_host_fdopen",
+            "cheng_host_fflush",
+            "cheng_host_fgetc",
+            "cheng_host_fgets",
+            "cheng_host_fopen",
+            "cheng_host_fork_runtime",
+            "cheng_host_free",
+            "cheng_host_fread",
+            "cheng_host_fseek",
+            "cheng_host_ftell",
+            "cheng_host_fwrite",
+            "cheng_host_getcwd",
+            "cheng_host_getentropy",
+            "cheng_host_getenv",
+            "cheng_host_grantpt_runtime",
+            "cheng_host_ioctl_runtime",
+            "cheng_host_list_dir",
+            "cheng_host_malloc",
+            "cheng_host_mkdir",
+            "cheng_host_open_runtime",
+            "cheng_host_opendir",
+            "cheng_host_pipe_runtime",
+            "cheng_host_poll",
+            "cheng_host_posix_openpt_runtime",
+            "cheng_host_ptsname_runtime",
+            "cheng_host_puts_runtime",
+            "cheng_host_read_runtime",
+            "cheng_host_realloc",
+            "cheng_host_setenv",
+            "cheng_host_setpgid_runtime",
+            "cheng_host_setsid_runtime",
+            "cheng_host_stat",
+            "cheng_host_statfs",
+            "cheng_host_strerror",
+            "cheng_host_sysconf",
+            "cheng_host_time",
+            "cheng_host_unlockpt_runtime",
+            "cheng_host_usleep",
+            "cheng_host_waitpid_runtime",
+            "cheng_host_write_runtime"
+        };
+        return cheng_seed_provider_export_root_list(out,
+                                                    count,
+                                                    cap,
+                                                    roots,
+                                                    sizeof(roots) / sizeof(roots[0]));
+    }
+    return true;
+}
+
+static bool cheng_seed_provider_export_root_list(ChengSeedPlanPath *out,
+                                                 size_t *count,
+                                                 size_t cap,
+                                                 const char *const *symbols,
+                                                 size_t symbol_count) {
+    size_t i;
+    if (out == NULL || count == NULL || symbols == NULL) {
+        return false;
+    }
+    for (i = 0U; i < symbol_count; ++i) {
+        if (!cheng_seed_plan_path_add_unique_checked(out, count, cap, symbols[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool cheng_seed_build_export_roots_flag(const ChengSeedPlanPath *roots,
+                                       size_t root_count,
+                                       char *out,
+                                       size_t cap) {
+    size_t used;
+    size_t i;
+    int written;
+    if (out == NULL || cap == 0U) {
+        return false;
+    }
+    out[0] = '\0';
+    if (root_count == 0U) {
+        return true;
+    }
+    written = snprintf(out, cap, "--export-roots:");
+    if (written <= 0 || (size_t)written >= cap) {
+        return false;
+    }
+    used = (size_t)written;
+    for (i = 0U; i < root_count; ++i) {
+        const char *sep = i == 0U ? "" : ",";
+        written = snprintf(out + used, cap - used, "%s%s", sep, roots[i].text);
+        if (written <= 0 || (size_t)written >= cap - used) {
+            return false;
+        }
+        used += (size_t)written;
+    }
+    return true;
 }
 
 static bool CHENG_UNUSED cheng_seed_body_kind_is_simple_object_compatible(const char *body_kind) {
@@ -47768,6 +48327,23 @@ static bool cheng_seed_build_primary_object_plan_stub(const ChengSeedSystemLinkP
             cheng_seed_primary_add_reason(primary, "primary_object_entry_symbol_missing");
         }
         return true;
+    }
+    if (cheng_seed_streq(plan->emit_kind, "obj") && plan->export_root_count > 0U) {
+        size_t root_index;
+        for (root_index = 0U; root_index < plan->export_root_count; ++root_index) {
+            bool found_root = false;
+            for (i = 0U; i < lowering->function_count; ++i) {
+                if (cheng_seed_lowered_function_matches_export_root(plan,
+                                                             &lowering->functions[i],
+                                                             plan->export_roots[root_index].text)) {
+                    found_root = true;
+                    break;
+                }
+            }
+            if (!found_root) {
+                cheng_seed_primary_add_reason(primary, "primary_object_export_root_missing");
+            }
+        }
     }
     entry_function = cheng_seed_find_entry_lowered_function(lowering);
     if (entry_function &&
@@ -57079,6 +57655,7 @@ static bool cheng_seed_materialize_primary_object_internal(const ChengSeedSystem
     ChengSeedPrimaryTextBuilder builder;
     ChengSeedPrimaryTextBuilder cstring_builder;
     ChengSeedPrimaryTextBuilder *previous_cstring_builder = NULL;
+    bool skip_primary_module_state = cheng_seed_plan_uses_backend_driver_dispatch(plan);
     long long phase_start_ms;
     long long phase_end_ms;
     if (primary->missing_reason_count > 0U) {
@@ -57116,17 +57693,19 @@ static bool cheng_seed_materialize_primary_object_internal(const ChengSeedSystem
         cheng_seed_primary_text_builder_init(&cstring_builder, cstring_text, cap);
         previous_cstring_builder = cheng_seed_cstring_literal_pool_push(&cstring_builder);
         phase_start_ms = cheng_seed_bft_monotime_ms();
-        for (i = 0; i < plan->source_closure_count; ++i) {
-            if (!cheng_seed_append_module_global_storage(plan,
-                                                 lowering,
-                                                 plan->source_closure_paths[i].text,
-                                                 text,
-                                                 cap)) {
-                cheng_seed_cstring_literal_pool_pop(previous_cstring_builder);
-                free(cstring_text);
-                free(text);
-                free(module_init_symbols);
-                return false;
+        if (!skip_primary_module_state) {
+            for (i = 0; i < plan->source_closure_count; ++i) {
+                if (!cheng_seed_append_module_global_storage(plan,
+                                                     lowering,
+                                                     plan->source_closure_paths[i].text,
+                                                     text,
+                                                     cap)) {
+                    cheng_seed_cstring_literal_pool_pop(previous_cstring_builder);
+                    free(cstring_text);
+                    free(text);
+                    free(module_init_symbols);
+                    return false;
+                }
             }
         }
         cheng_seed_primary_text_builder_refresh(&builder);
@@ -57154,24 +57733,26 @@ static bool cheng_seed_materialize_primary_object_internal(const ChengSeedSystem
         cheng_seed_add_phase_ms(world != NULL ? &world->exec_phase_primary_object_function_emit_ms : NULL,
                         cheng_seed_phase_elapsed_ms(phase_start_ms, phase_end_ms));
         phase_start_ms = cheng_seed_bft_monotime_ms();
-        for (i = 0; i < plan->source_closure_count; ++i) {
-            bool emitted_init = false;
-            if (!cheng_seed_append_module_global_init_function(plan,
-                                                       lowering,
-                                                       plan->source_closure_paths[i].text,
-                                                       module_init_symbols[module_init_count],
-                                                       sizeof(module_init_symbols[module_init_count]),
-                                                       text,
-                                                       cap,
-                                                       &emitted_init)) {
-                cheng_seed_cstring_literal_pool_pop(previous_cstring_builder);
-                free(cstring_text);
-                free(text);
-                free(module_init_symbols);
-                return false;
-            }
-            if (emitted_init) {
-                module_init_count += 1U;
+        if (!skip_primary_module_state) {
+            for (i = 0; i < plan->source_closure_count; ++i) {
+                bool emitted_init = false;
+                if (!cheng_seed_append_module_global_init_function(plan,
+                                                           lowering,
+                                                           plan->source_closure_paths[i].text,
+                                                           module_init_symbols[module_init_count],
+                                                           sizeof(module_init_symbols[module_init_count]),
+                                                           text,
+                                                           cap,
+                                                           &emitted_init)) {
+                    cheng_seed_cstring_literal_pool_pop(previous_cstring_builder);
+                    free(cstring_text);
+                    free(text);
+                    free(module_init_symbols);
+                    return false;
+                }
+                if (emitted_init) {
+                    module_init_count += 1U;
+                }
             }
         }
         cheng_seed_primary_text_builder_refresh(&builder);
@@ -57348,17 +57929,19 @@ static bool cheng_seed_materialize_primary_object_internal(const ChengSeedSystem
     cheng_seed_primary_text_builder_init(&cstring_builder, cstring_text, cap);
     previous_cstring_builder = cheng_seed_cstring_literal_pool_push(&cstring_builder);
     phase_start_ms = cheng_seed_bft_monotime_ms();
-    for (i = 0; i < plan->source_closure_count; ++i) {
-        if (!cheng_seed_append_module_global_storage(plan,
-                                             lowering,
-                                             plan->source_closure_paths[i].text,
-                                             text,
-                                             cap)) {
-            cheng_seed_cstring_literal_pool_pop(previous_cstring_builder);
-            free(cstring_text);
-            free(text);
-            free(module_init_symbols);
-            return false;
+    if (!skip_primary_module_state) {
+        for (i = 0; i < plan->source_closure_count; ++i) {
+            if (!cheng_seed_append_module_global_storage(plan,
+                                                 lowering,
+                                                 plan->source_closure_paths[i].text,
+                                                 text,
+                                                 cap)) {
+                cheng_seed_cstring_literal_pool_pop(previous_cstring_builder);
+                free(cstring_text);
+                free(text);
+                free(module_init_symbols);
+                return false;
+            }
         }
     }
     cheng_seed_primary_text_builder_refresh(&builder);
@@ -57368,24 +57951,26 @@ static bool cheng_seed_materialize_primary_object_internal(const ChengSeedSystem
     cheng_seed_primary_text_builder_append(&builder, ".text\n");
     cheng_seed_primary_text_builder_append(&builder, ".p2align 2\n");
     phase_start_ms = cheng_seed_bft_monotime_ms();
-    for (i = 0; i < plan->source_closure_count; ++i) {
-        bool emitted_init = false;
-        if (!cheng_seed_append_module_global_init_function(plan,
-                                                   lowering,
-                                                   plan->source_closure_paths[i].text,
-                                                   module_init_symbols[module_init_count],
-                                                   sizeof(module_init_symbols[module_init_count]),
-                                                   text,
-                                                   cap,
-                                                   &emitted_init)) {
-            cheng_seed_cstring_literal_pool_pop(previous_cstring_builder);
-            free(cstring_text);
-            free(text);
-            free(module_init_symbols);
-            return false;
-        }
-        if (emitted_init) {
-            module_init_count += 1U;
+    if (!skip_primary_module_state) {
+        for (i = 0; i < plan->source_closure_count; ++i) {
+            bool emitted_init = false;
+            if (!cheng_seed_append_module_global_init_function(plan,
+                                                       lowering,
+                                                       plan->source_closure_paths[i].text,
+                                                       module_init_symbols[module_init_count],
+                                                       sizeof(module_init_symbols[module_init_count]),
+                                                       text,
+                                                       cap,
+                                                       &emitted_init)) {
+                cheng_seed_cstring_literal_pool_pop(previous_cstring_builder);
+                free(cstring_text);
+                free(text);
+                free(module_init_symbols);
+                return false;
+            }
+            if (emitted_init) {
+                module_init_count += 1U;
+            }
         }
     }
     cheng_seed_primary_text_builder_refresh(&builder);
@@ -57645,7 +58230,9 @@ static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract
                                         const char *target_triple,
                                         const char *out_path,
                                         const ChengSeedPlanPath *suppressed_export_symbols,
-                                        size_t suppressed_export_symbol_count);
+                                        size_t suppressed_export_symbol_count,
+                                        const ChengSeedPlanPath *export_root_symbols,
+                                        size_t export_root_symbol_count);
 
 static void cheng_seed_add_phase_ms(long long *field, long long elapsed_ms) {
     if (field != NULL && elapsed_ms >= 0LL) {
@@ -57686,9 +58273,12 @@ static bool cheng_seed_provider_codegen_cid(ChengSeedCid32 *out) {
 }
 
 static bool cheng_seed_provider_object_cache_key(const ChengSeedSystemLinkPlanStub *plan,
+                                         const char *provider_module,
                                          const char *source_path,
                                          const ChengSeedPlanPath *suppressed_export_symbols,
                                          size_t suppressed_export_symbol_count,
+                                         const ChengSeedPlanPath *export_root_symbols,
+                                         size_t export_root_symbol_count,
                                          char *key_out,
                                          size_t key_cap) {
     ChengSeedCid32 source_cid;
@@ -57712,6 +58302,7 @@ static bool cheng_seed_provider_object_cache_key(const ChengSeedSystemLinkPlanSt
     }
     cheng_seed_bytebuf_init(&buf, 1024U);
     cheng_seed_bytebuf_append_text(&buf, CHENG_PROVIDER_OBJECT_CACHE_VERSION);
+    cheng_seed_bytebuf_append_text(&buf, provider_module != NULL ? provider_module : "");
     cheng_seed_bytebuf_append_text(&buf, source_path);
     cheng_seed_bytebuf_append_text(&buf, plan->workspace_root);
     cheng_seed_bytebuf_append_text(&buf, plan->package_root);
@@ -57726,6 +58317,10 @@ static bool cheng_seed_provider_object_cache_key(const ChengSeedSystemLinkPlanSt
     for (i = 0U; i < suppressed_export_symbol_count; ++i) {
         cheng_seed_bytebuf_append_text(&buf, suppressed_export_symbols[i].text);
     }
+    cheng_seed_bytebuf_append_u32_be(&buf, (uint32_t)export_root_symbol_count);
+    for (i = 0U; i < export_root_symbol_count; ++i) {
+        cheng_seed_bytebuf_append_text(&buf, export_root_symbols[i].text);
+    }
     key_cid = cheng_seed_cid_from_bytebuf(&buf);
     cheng_seed_copy_text(key_out, key_cap, key_cid.hex);
     cheng_seed_bytebuf_free(&buf);
@@ -57733,9 +58328,12 @@ static bool cheng_seed_provider_object_cache_key(const ChengSeedSystemLinkPlanSt
 }
 
 static bool cheng_seed_provider_object_cache_path(const ChengSeedSystemLinkPlanStub *plan,
+                                          const char *provider_module,
                                           const char *source_path,
                                           const ChengSeedPlanPath *suppressed_export_symbols,
                                           size_t suppressed_export_symbol_count,
+                                          const ChengSeedPlanPath *export_root_symbols,
+                                          size_t export_root_symbol_count,
                                           char *key_out,
                                           size_t key_cap,
                                           char *path_out,
@@ -57743,9 +58341,12 @@ static bool cheng_seed_provider_object_cache_path(const ChengSeedSystemLinkPlanS
     char target_safe[PATH_MAX];
     int written;
     if (!cheng_seed_provider_object_cache_key(plan,
+                                      provider_module,
                                       source_path,
                                       suppressed_export_symbols,
                                       suppressed_export_symbol_count,
+                                      export_root_symbols,
+                                      export_root_symbol_count,
                                       key_out,
                                       key_cap)) {
         return false;
@@ -57762,10 +58363,13 @@ static bool cheng_seed_provider_object_cache_path(const ChengSeedSystemLinkPlanS
 
 static bool cheng_seed_materialize_provider_object_cached(const ChengSeedBootstrapContract *contract,
                                                   const ChengSeedSystemLinkPlanStub *plan,
+                                                  const char *provider_module,
                                                   const char *source_path,
                                                   const char *out_path,
                                                   const ChengSeedPlanPath *suppressed_export_symbols,
                                                   size_t suppressed_export_symbol_count,
+                                                  const ChengSeedPlanPath *export_root_symbols,
+                                                  size_t export_root_symbol_count,
                                                   ChengSeedCompilerWorldArtifacts *world) {
     char cache_key[CHENG_CID_HEX_CAP];
     char cache_path[PATH_MAX];
@@ -57780,9 +58384,12 @@ static bool cheng_seed_materialize_provider_object_cached(const ChengSeedBootstr
     }
     phase_start_ms = cheng_seed_bft_monotime_ms();
     if (!cheng_seed_provider_object_cache_path(plan,
+                                       provider_module,
                                        source_path,
                                        suppressed_export_symbols,
                                        suppressed_export_symbol_count,
+                                       export_root_symbols,
+                                       export_root_symbol_count,
                                        cache_key,
                                        sizeof(cache_key),
                                        cache_path,
@@ -57824,7 +58431,9 @@ static bool cheng_seed_materialize_provider_object_cached(const ChengSeedBootstr
                                          plan->target_triple,
                                          out_path,
                                          suppressed_export_symbols,
-                                         suppressed_export_symbol_count);
+                                         suppressed_export_symbol_count,
+                                         export_root_symbols,
+                                         export_root_symbol_count);
     } else {
         ok = cheng_seed_compile_c_object(plan->target_triple,
                                  plan->emit_kind,
@@ -57929,6 +58538,10 @@ static bool cheng_seed_primary_object_cache_key(const ChengSeedSystemLinkPlanStu
     cheng_seed_bytebuf_append_text(&buf, plan->module_kind);
     cheng_seed_bytebuf_append_text(&buf, plan->emit_kind);
     cheng_seed_bytebuf_append_text(&buf, plan->symbol_visibility);
+    cheng_seed_bytebuf_append_u32_be(&buf, (uint32_t)plan->export_root_count);
+    for (i = 0U; i < plan->export_root_count; ++i) {
+        cheng_seed_bytebuf_append_text(&buf, plan->export_roots[i].text);
+    }
     cheng_seed_bytebuf_append_text(&buf, plan->entry_path);
     cheng_seed_bytebuf_append_text(&buf, plan->entry_symbol);
     cheng_seed_bytebuf_append_text(&buf, cc);
@@ -58096,12 +58709,26 @@ static bool cheng_seed_materialize_provider_objects(const ChengSeedBootstrapCont
     }
     for (i = 0; i < object_plan->provider_source_count; ++i) {
         const char *source_path = object_plan->provider_source_paths[i].text;
+        const char *provider_module = i < plan->provider_module_count ? plan->provider_modules[i].text : "";
+        ChengSeedPlanPath provider_export_roots[CHENG_MAX_EXPORT_ROOTS];
+        size_t provider_export_root_count = 0U;
+        if (!cheng_seed_provider_export_roots_for_module(plan,
+                                                 provider_module,
+                                                 provider_export_roots,
+                                                 &provider_export_root_count,
+                                                 CHENG_MAX_EXPORT_ROOTS)) {
+            free(suppressed_export_symbols);
+            return false;
+        }
         if (!cheng_seed_materialize_provider_object_cached(contract,
                                                    plan,
+                                                   provider_module,
                                                    source_path,
                                                    object_plan->provider_object_paths[i].text,
                                                    suppressed_export_symbols,
                                                    suppressed_export_symbol_count,
+                                                   provider_export_roots,
+                                                   provider_export_root_count,
                                                    world)) {
             free(suppressed_export_symbols);
             return false;
@@ -58130,7 +58757,9 @@ static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract
                                         const char *target_triple,
                                         const char *out_path,
                                         const ChengSeedPlanPath *suppressed_export_symbols,
-                                        size_t suppressed_export_symbol_count) {
+                                        size_t suppressed_export_symbol_count,
+                                        const ChengSeedPlanPath *export_root_symbols,
+                                        size_t export_root_symbol_count) {
     ChengSeedBootstrapPaths paths;
     char contract_flag[PATH_MAX + 32];
     char compiler_path[PATH_MAX];
@@ -58138,9 +58767,10 @@ static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract
     char in_flag[PATH_MAX + 16];
     char target_flag[256];
     char out_flag[PATH_MAX + 16];
+    char export_roots_flag[PATH_MAX * 2];
     char log_path[PATH_MAX];
     char self_path[PATH_MAX];
-    const char *argv_local[8];
+    const char *argv_local[10];
     size_t argc_local = 0U;
     (void)suppressed_export_symbols;
     (void)suppressed_export_symbol_count;
@@ -58167,6 +58797,12 @@ static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract
     snprintf(in_flag, sizeof(in_flag), "--in:%s", source_path);
     snprintf(target_flag, sizeof(target_flag), "--target:%s", target_triple);
     snprintf(out_flag, sizeof(out_flag), "--out:%s", out_path);
+    if (!cheng_seed_build_export_roots_flag(export_root_symbols,
+                                    export_root_symbol_count,
+                                    export_roots_flag,
+                                    sizeof(export_roots_flag))) {
+        return false;
+    }
     snprintf(log_path, sizeof(log_path), "%s.compile.log", out_path);
     unlink(out_path);
     unlink(log_path);
@@ -58181,6 +58817,10 @@ static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract
     argv_local[argc_local++] = "--emit:obj";
     argv_local[argc_local++] = target_flag;
     argv_local[argc_local++] = out_flag;
+    if (export_root_symbol_count > 0U) {
+        argv_local[argc_local++] = "--symbol-visibility:internal";
+        argv_local[argc_local++] = export_roots_flag;
+    }
     self_path[0] = '\0';
     if (cheng_seed_resolve_self_path(self_path, sizeof(self_path)) &&
         cheng_seed_streq(self_path, compiler_path)) {
@@ -58264,6 +58904,8 @@ static bool cheng_seed_materialize_linux_nolibc_support_objects(const ChengSeedB
                                      object_plan->linux_nolibc_runtime_source_path,
                                      plan->target_triple,
                                      object_plan->linux_nolibc_runtime_object_path,
+                                     NULL,
+                                     0U,
                                      NULL,
                                      0U)) {
         return false;
@@ -60016,6 +60658,86 @@ static bool cheng_seed_collect_source_closure(ChengSeedSystemLinkPlanStub *plan,
     return true;
 }
 
+static bool cheng_seed_parse_export_root_csv(const char *text,
+                                     ChengSeedPlanPath *out,
+                                     size_t *count,
+                                     size_t cap) {
+    char *owned;
+    char *cursor;
+    char *token;
+    if (text == NULL || text[0] == '\0') {
+        return true;
+    }
+    owned = cheng_seed_strdup(text);
+    cursor = owned;
+    while ((token = strsep(&cursor, ",")) != NULL) {
+        char *trimmed = cheng_seed_trim_inplace(token);
+        if (trimmed[0] == '\0') {
+            continue;
+        }
+        if (!cheng_seed_plan_path_add_unique_checked(out, count, cap, trimmed)) {
+            free(owned);
+            return false;
+        }
+    }
+    free(owned);
+    return true;
+}
+
+static bool cheng_seed_read_arg_flag_value(const char *arg,
+                                   const char *next,
+                                   const char *flag,
+                                   const char **value_out,
+                                   bool *consumes_next_out) {
+    size_t flag_len = strlen(flag);
+    if (arg == NULL || strncmp(arg, flag, flag_len) != 0) {
+        return false;
+    }
+    if (arg[flag_len] == ':' || arg[flag_len] == '=') {
+        *value_out = arg + flag_len + 1U;
+        *consumes_next_out = false;
+        return true;
+    }
+    if (arg[flag_len] == '\0' && next != NULL) {
+        *value_out = next;
+        *consumes_next_out = true;
+        return true;
+    }
+    return false;
+}
+
+static bool cheng_seed_parse_export_root_flags(int argc,
+                                       char **argv,
+                                       ChengSeedPlanPath *out,
+                                       size_t *count,
+                                       size_t cap) {
+    int i;
+    const char *roots_csv = cheng_seed_flag_value(argc, argv, "--export-roots");
+    *count = 0U;
+    if (!cheng_seed_parse_export_root_csv(roots_csv, out, count, cap)) {
+        return false;
+    }
+    for (i = 2; i < argc; ++i) {
+        const char *value = NULL;
+        bool consumes_next = false;
+        const char *next = (i + 1) < argc ? argv[i + 1] : NULL;
+        if (!cheng_seed_read_arg_flag_value(argv[i],
+                                    next,
+                                    "--export-root",
+                                    &value,
+                                    &consumes_next)) {
+            continue;
+        }
+        if (!cheng_seed_plan_path_add_unique_checked(out, count, cap, value)) {
+            return false;
+        }
+        if (consumes_next) {
+            i += 1;
+        }
+    }
+    return true;
+}
+
 static bool cheng_seed_build_system_link_plan_stub(const ChengSeedBootstrapContract *contract,
                                            int argc,
                                            char **argv,
@@ -60087,6 +60809,16 @@ static bool cheng_seed_build_system_link_plan_stub(const ChengSeedBootstrapContr
     cheng_seed_copy_text(plan->target_triple, sizeof(plan->target_triple), target);
     cheng_seed_copy_text(plan->emit_kind, sizeof(plan->emit_kind), emit);
     cheng_seed_copy_text(plan->symbol_visibility, sizeof(plan->symbol_visibility), symbol_visibility);
+    if (!cheng_seed_parse_export_root_flags(argc,
+                                    argv,
+                                    plan->export_roots,
+                                    &plan->export_root_count,
+                                    CHENG_MAX_EXPORT_ROOTS)) {
+        fprintf(stderr, "[cheng_seed] too many --export-root symbols\n");
+        free(direct_edges);
+        free(seen);
+        return false;
+    }
     if (plan->extra_link_input_path[0] != '\0' &&
         !cheng_seed_path_exists_nonempty(plan->extra_link_input_path)) {
         fprintf(stderr, "[cheng_seed] explicit link input missing: %s\n", plan->extra_link_input_path);
@@ -60392,6 +61124,19 @@ static void cheng_seed_plan_path_add_unique(ChengSeedPlanPath *items,
         return;
     }
     cheng_seed_plan_add_path(items, len, cap, text);
+}
+
+static bool cheng_seed_plan_path_add_unique_checked(ChengSeedPlanPath *items,
+                                            size_t *len,
+                                            size_t cap,
+                                            const char *text) {
+    if (text == NULL || text[0] == '\0') {
+        return true;
+    }
+    if (cheng_seed_plan_path_find_index(items, *len, text) >= 0) {
+        return true;
+    }
+    return cheng_seed_plan_add_path_checked(items, len, cap, text);
 }
 
 static bool cheng_seed_compiler_symbol_exported(const char *function_name,
@@ -61746,6 +62491,7 @@ static char *cheng_seed_system_link_plan_report(const ChengSeedBootstrapContract
     cheng_seed_report_append(&out, &cap, &used, line);
     snprintf(line, sizeof(line), "symbol_visibility=%s", plan->symbol_visibility[0] != '\0' ? plan->symbol_visibility : "public");
     cheng_seed_report_append(&out, &cap, &used, line);
+    cheng_seed_report_append_csv_paths(&out, &cap, &used, "export_roots", plan->export_roots, plan->export_root_count);
     snprintf(line, sizeof(line), "requested_emit_support=%s",
              cheng_seed_requested_emit_support_state(plan->target_triple, plan->emit_kind));
     cheng_seed_report_append(&out, &cap, &used, line);
@@ -61783,7 +62529,7 @@ static char *cheng_seed_system_link_plan_report(const ChengSeedBootstrapContract
     cheng_seed_report_append(&out, &cap, &used, "parser_source_kind=ordinary_cheng_source");
     snprintf(line, sizeof(line), "build_entry=%s", compiler_entry);
     cheng_seed_report_append(&out, &cap, &used, line);
-    cheng_seed_report_append(&out, &cap, &used, "build_source_unit_count=33");
+    cheng_seed_report_append(&out, &cap, &used, "build_source_unit_count=36");
     cheng_seed_report_append(&out, &cap, &used, "link_mode=system_link");
     cheng_seed_report_append(&out, &cap, &used, "pipeline_stage=parser_to_system_link_plan");
     return out;
@@ -62400,9 +63146,6 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     char status_log[PATH_MAX];
     char plan_log[PATH_MAX];
     char reference_plan_log[PATH_MAX];
-    char verify_export_dir[PATH_MAX];
-    char verify_export_log[PATH_MAX];
-    char verify_export_parallel_log[PATH_MAX];
     char package_root[PATH_MAX];
     char smoke_src[PATH_MAX];
     char smoke_bin[PATH_MAX];
@@ -62428,7 +63171,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     char saved_progress[64];
     char saved_process_max_rss[64];
     char saved_backend_driver_handoff[64];
-    char saved_verify_export_dir[PATH_MAX];
+    char saved_parent_rss_guard[64];
     char *run_argv[2];
     char *report_text = NULL;
     const char *target;
@@ -62450,7 +63193,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     bool had_progress = false;
     bool had_process_max_rss = false;
     bool had_backend_driver_handoff = false;
-    bool had_verify_export_dir = false;
+    bool had_parent_rss_guard = false;
     int rc = 1;
     int status = 0;
     cheng_seed_bootstrap_paths_init(&paths);
@@ -62498,9 +63241,6 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     cheng_seed_join_path(status_log, sizeof(status_log), build_dir, "build_backend_driver.status.txt");
     cheng_seed_join_path(plan_log, sizeof(plan_log), build_dir, "build_backend_driver.plan.txt");
     cheng_seed_join_path(reference_plan_log, sizeof(reference_plan_log), build_dir, "reference_backend_driver.plan.txt");
-    cheng_seed_join_path(verify_export_dir, sizeof(verify_export_dir), build_dir, "verify_export_visibility");
-    cheng_seed_join_path(verify_export_log, sizeof(verify_export_log), build_dir, "build_backend_driver.verify_export_visibility.txt");
-    cheng_seed_join_path(verify_export_parallel_log, sizeof(verify_export_parallel_log), build_dir, "build_backend_driver.verify_export_visibility_parallel.txt");
     cheng_seed_copy_text(package_root, sizeof(package_root), paths.root);
     cheng_seed_join_path(smoke_src, sizeof(smoke_src), paths.root, "src/tests/ordinary_zero_exit_fixture.cheng");
     cheng_seed_join_path(smoke_bin, sizeof(smoke_bin), build_dir, "ordinary_zero_exit_fixture.selftest");
@@ -62537,7 +63277,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     cheng_seed_save_env_value("CHENG_PROGRESS", saved_progress, sizeof(saved_progress), &had_progress);
     cheng_seed_save_env_value("CHENG_PROCESS_MAX_RSS_BYTES", saved_process_max_rss, sizeof(saved_process_max_rss), &had_process_max_rss);
     cheng_seed_save_env_value("CHENG_NO_BACKEND_DRIVER_HANDOFF", saved_backend_driver_handoff, sizeof(saved_backend_driver_handoff), &had_backend_driver_handoff);
-    cheng_seed_save_env_value("CHENG_VERIFY_EXPORT_VISIBILITY_DIR", saved_verify_export_dir, sizeof(saved_verify_export_dir), &had_verify_export_dir);
+    cheng_seed_save_env_value("CHENG_PARENT_RSS_GUARD", saved_parent_rss_guard, sizeof(saved_parent_rss_guard), &had_parent_rss_guard);
     setenv("BACKEND_INCREMENTAL", "0", 1);
     setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
     setenv("CHENG_DISABLE_PRIMARY_OBJECT_CACHE", "1", 1);
@@ -62546,7 +63286,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     setenv("CHENG_PROGRESS", "1", 1);
     setenv("CHENG_PROCESS_MAX_RSS_BYTES", cheng_seed_build_backend_driver_max_rss_bytes_text(), 1);
     setenv("CHENG_NO_BACKEND_DRIVER_HANDOFF", "1", 1);
-    setenv("CHENG_VERIFY_EXPORT_VISIBILITY_DIR", verify_export_dir, 1);
+    setenv("CHENG_PARENT_RSS_GUARD", "1", 1);
     build_env_pushed = true;
 
     snprintf(root_flag, sizeof(root_flag), "--root:%s", package_root);
@@ -62669,19 +63409,6 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
         goto done;
     }
 
-    if (!cheng_seed_run_command_logged_argv_live(2U,
-                                    (const char *[2]){ candidate_out, "verify-export-visibility" },
-                                    verify_export_log,
-                                    "build-backend-driver verify-export-visibility")) {
-        goto done;
-    }
-    if (!cheng_seed_run_command_logged_argv_live(2U,
-                                    (const char *[2]){ candidate_out, "verify-export-visibility-parallel" },
-                                    verify_export_parallel_log,
-                                    "build-backend-driver candidate verify-export-visibility-parallel")) {
-        goto done;
-    }
-
     if (!cheng_seed_run_command_logged_argv_live(3U,
                                     (const char *[3]){ candidate_out, "print-build-plan", target_flag },
                                     plan_log,
@@ -62711,6 +63438,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     snprintf(out_flag, sizeof(out_flag), "--out:%s", smoke_bin);
     snprintf(report_flag, sizeof(report_flag), "--report-out:%s", smoke_report_path);
     unlink(smoke_report_path);
+    setenv("CHENG_PROCESS_MAX_RSS_BYTES", "1073741824", 1);
     if (!cheng_seed_run_command_logged_argv_live(8U,
                                     (const char *[8]){ candidate_out,
                                                        "system-link-exec",
@@ -62724,6 +63452,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
                                     "build-backend-driver zero-exit compile")) {
         goto done;
     }
+    setenv("CHENG_PROCESS_MAX_RSS_BYTES", cheng_seed_build_backend_driver_max_rss_bytes_text(), 1);
     if (access(smoke_bin, X_OK) != 0) {
         fprintf(stderr, "[cheng_seed] build-backend-driver zero-exit smoke missing output: %s\n", smoke_bin);
         goto done;
@@ -62773,8 +63502,6 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
              "candidate_output=%s\n"
              "output=%s\n"
              "status_log=%s\n"
-             "verify_export_visibility_log=%s\n"
-             "verify_export_visibility_parallel_log=%s\n"
              "plan_log=%s\n"
              "reference_plan_log=%s\n"
              "log=%s\n"
@@ -62796,8 +63523,6 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
              candidate_build_out,
              paths.backend_driver_out,
              status_log,
-             verify_export_log,
-             verify_export_parallel_log,
              plan_log,
              reference_plan_log,
              log_path,
@@ -62822,7 +63547,7 @@ done:
         cheng_seed_restore_env_value("CHENG_PROCESS_MAX_RSS_BYTES", saved_process_max_rss, had_process_max_rss);
         cheng_seed_restore_env_value("CHENG_PROGRESS", saved_progress, had_progress);
         cheng_seed_restore_env_value("CHENG_NO_BACKEND_DRIVER_HANDOFF", saved_backend_driver_handoff, had_backend_driver_handoff);
-        cheng_seed_restore_env_value("CHENG_VERIFY_EXPORT_VISIBILITY_DIR", saved_verify_export_dir, had_verify_export_dir);
+        cheng_seed_restore_env_value("CHENG_PARENT_RSS_GUARD", saved_parent_rss_guard, had_parent_rss_guard);
     }
     if (rc != 0 && candidate_out[0] != '\0') {
         unlink(candidate_out);
@@ -63270,7 +63995,6 @@ static int cheng_seed_try_exec_backend_driver_cli_passthrough(const ChengSeedBoo
     if (paths == NULL ||
         argc < 2 ||
         argv == NULL ||
-        !cheng_seed_bootstrap_artifacts_fresh(paths) ||
         !cheng_seed_path_is_executable(paths->backend_driver_out)) {
         return -1;
     }
@@ -63423,26 +64147,20 @@ static int cheng_seed_require_backend_driver_cli_passthrough(const char *cmd,
                                                      int argc,
                                                      char **argv) {
     ChengSeedBootstrapPaths paths;
-    const char **args;
-    size_t arg_count;
-    size_t i;
     int rc;
     cheng_seed_bootstrap_paths_init(&paths);
-    if (!cheng_seed_ensure_backend_driver_ready(&paths, cmd)) {
-        return 1;
+    rc = cheng_seed_try_exec_backend_driver_cli_passthrough(&paths,
+                                                            argc,
+                                                            argv,
+                                                            "cheng.backend_driver",
+                                                            false);
+    if (rc >= 0) {
+        return rc;
     }
-    arg_count = argc > 1 ? (size_t)(argc - 1) : 0U;
-    args = (const char **)cheng_seed_xmalloc(sizeof(char *) * arg_count);
-    for (i = 1U; i < (size_t)argc; ++i) {
-        args[i - 1U] = argv[i] != NULL ? argv[i] : "";
-    }
-    rc = cheng_seed_exec_binary_passthrough_with_env(paths.backend_driver_out,
-                                             arg_count,
-                                             args,
-                                             "CHENG_CONTROLLER",
-                                             "cheng.backend_driver");
-    free(args);
-    return rc;
+    fprintf(stderr,
+            "[cheng_seed] backend driver handoff unavailable for command: %s; run build-backend-driver explicitly\n",
+            cmd != NULL && cmd[0] != '\0' ? cmd : "(unknown)");
+    return 2;
 }
 
 
@@ -64844,7 +65562,7 @@ int main(int argc, char **argv) {
                                                                     argc,
                                                                     argv,
                                                                     "cheng.backend_driver",
-                                                                    true);
+                                                                    false);
         if (passthrough_rc >= 0) {
             return passthrough_rc;
         }

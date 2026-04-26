@@ -1,4 +1,7 @@
 import std/strutils as strutil
+import std/buffer
+import std/rawbytes
+import std/rawbytes
 type
     BrowserAbiInputKind = enum
         BrowserAbiInputNone
@@ -531,33 +534,21 @@ fn BrowserAbiBridgeEmitLine(spec: BrowserAbiBridgeSpec): str =
                 "|out_buffer=",
                 BrowserAbiOutBufferKindText(spec.outBufferKind)], "")
 
-fn BrowserAbiBridgeManifestAppendLine(out: var str,
-                                        line: str) =
-    if len(out) > 0:
-        out = strutil.Join([out, "\n"], "")
-    out = strutil.Join([out, line], "")
-
 fn BrowserAbiBridgeManifestText(specs: BrowserAbiBridgeSpec[]): str =
-    var out = ""
-    var header = ""
-    header = strutil.Join([header, "format=browser_abi_bridge_manifest_v1"], "")
-    BrowserAbiBridgeManifestAppendLine(out, header)
-    var countLine = ""
-    countLine = strutil.Join([countLine, "bridge_count="], "")
-    countLine = strutil.Join([countLine, intToStr(specs.len)], "")
-    BrowserAbiBridgeManifestAppendLine(out, countLine)
-    var uniqueLine = ""
-    uniqueLine = strutil.Join([uniqueLine, "bridge_unique_key_count="], "")
-    uniqueLine = strutil.Join([uniqueLine, intToStr(BrowserAbiBridgeSpecUniqueKeyCount(specs))], "")
-    BrowserAbiBridgeManifestAppendLine(out, uniqueLine)
+    var buf = newByteBuffer()
+    buf.AppendBytes("format=browser_abi_bridge_manifest_v1")
+    buf.AppendBytes("\n")
+    buf.AppendBytes(strutil.Join(["bridge_count=", intToStr(specs.len)], ""))
+    buf.AppendBytes("\n")
+    buf.AppendBytes(strutil.Join(["bridge_unique_key_count=",
+                                 intToStr(BrowserAbiBridgeSpecUniqueKeyCount(specs))], ""))
     for i in 0..<specs.len:
-        var line = ""
-        line = strutil.Join([line, "bridge["], "")
-        line = strutil.Join([line, intToStr(i)], "")
-        line = strutil.Join([line, "]="], "")
-        line = strutil.Join([line, BrowserAbiBridgeEmitLine(specs[i])], "")
-        BrowserAbiBridgeManifestAppendLine(out, line)
-    return out
+        buf.AppendBytes("\n")
+        buf.AppendBytes(strutil.Join(["bridge[",
+                                     intToStr(i),
+                                     "]=",
+                                     BrowserAbiBridgeEmitLine(specs[i])], ""))
+    return rawbytes.bytesToString(buf.ToBytes())
 
 fn BrowserAbiBridgeManifestTextFromRules(rules: BrowserAbiRule[]): str =
     let specs = BrowserAbiBridgeSpecsFromRules(rules)
@@ -709,12 +700,6 @@ fn BrowserAbiBridgePlanManifestFormat(): str =
 
 fn BrowserAbiBridgeSourceFormat(): str =
     return "browser_abi_bridge_source_v1"
-
-fn BrowserAbiBridgeSourceAppendLine(out: var str,
-                                      line: str) =
-    if len(out) > 0:
-        out = strutil.Join([out, "\n"], "")
-    out = strutil.Join([out, line], "")
 
 fn BrowserAbiBridgeSourceAppendUnique(lines: var str[],
                                         line: str) =
@@ -953,12 +938,10 @@ fn BrowserAbiBridgeSourceFunctionText(plan: BrowserAbiBridgePlan): str =
     return ""
 
 fn BrowserAbiBridgeSourceText(plans: BrowserAbiBridgePlan[]): str =
-    var out = ""
+    var lines: str[]
     let sharedImports = BrowserAbiBridgeSourceSharedImportLines()
     for i in 0..<sharedImports.len:
-        if len(out) > 0:
-            out = strutil.Join([out, "\n"], "")
-        out = strutil.Join([out, sharedImports[i]], "")
+        add(lines, sharedImports[i])
     var scalarImports: str[]
     for i in 0..<plans.len:
         if plans[i].bridgeStage != BrowserAbiBridgeStageScalarCall:
@@ -966,42 +949,30 @@ fn BrowserAbiBridgeSourceText(plans: BrowserAbiBridgePlan[]): str =
         let importLine = BrowserAbiBridgeSourceScalarImportLine(plans[i])
         BrowserAbiBridgeSourceAppendUnique(scalarImports, importLine)
     for i in 0..<scalarImports.len:
-        if len(out) > 0:
-            out = strutil.Join([out, "\n"], "")
-        out = strutil.Join([out, scalarImports[i]], "")
-    out = strutil.Join([out, "\n\n"], "")
-    out = strutil.Join([out, "fn BrowserBridgeGeneratedSourceFormat(): str =\n"], "")
-    out = strutil.Join([out, "    return \""], "")
-    out = strutil.Join([out, BrowserAbiBridgeSourceFormat()], "")
-    out = strutil.Join([out, "\""], "")
+        add(lines, scalarImports[i])
+    add(lines, "")
+    add(lines, strutil.Join(["fn BrowserBridgeGeneratedSourceFormat(): str =\n",
+                             "    return \"",
+                             BrowserAbiBridgeSourceFormat(),
+                             "\""], ""))
     for i in 0..<plans.len:
         let fnText = BrowserAbiBridgeSourceFunctionText(plans[i])
-        out = strutil.Join([out, "\n\n"], "")
-        out = strutil.Join([out, fnText], "")
-    return out
+        add(lines, "")
+        add(lines, fnText)
+    return strutil.Join(lines, "\n")
 
 fn BrowserAbiBridgePlanManifestText(plans: BrowserAbiBridgePlan[]): str =
-    var out = ""
-    var header = ""
-    header = strutil.Join([header, "format="], "")
-    header = strutil.Join([header, BrowserAbiBridgePlanManifestFormat()], "")
-    BrowserAbiBridgeManifestAppendLine(out, header)
-    var countLine = ""
-    countLine = strutil.Join([countLine, "bridge_count="], "")
-    countLine = strutil.Join([countLine, intToStr(plans.len)], "")
-    BrowserAbiBridgeManifestAppendLine(out, countLine)
-    var uniqueLine = ""
-    uniqueLine = strutil.Join([uniqueLine, "bridge_unique_key_count="], "")
-    uniqueLine = strutil.Join([uniqueLine, intToStr(BrowserAbiBridgePlanUniqueKeyCount(plans))], "")
-    BrowserAbiBridgeManifestAppendLine(out, uniqueLine)
+    var buf = newByteBuffer()
+    buf.AppendBytes(strutil.Join(["format=", BrowserAbiBridgePlanManifestFormat()], ""))
+    buf.AppendBytes("\n")
+    buf.AppendBytes(strutil.Join(["bridge_count=", intToStr(plans.len)], ""))
+    buf.AppendBytes("\n")
+    buf.AppendBytes(strutil.Join(["bridge_unique_key_count=",
+                                 intToStr(BrowserAbiBridgePlanUniqueKeyCount(plans))], ""))
     for i in 0..<plans.len:
-        var line = ""
-        line = strutil.Join([line, "bridge["], "")
-        line = strutil.Join([line, intToStr(i)], "")
-        line = strutil.Join([line, "]="], "")
-        line = strutil.Join([line, plans[i].emitLine], "")
-        BrowserAbiBridgeManifestAppendLine(out, line)
-    return out
+        buf.AppendBytes("\n")
+        buf.AppendBytes(strutil.Join(["bridge[", intToStr(i), "]=", plans[i].emitLine], ""))
+    return rawbytes.bytesToString(buf.ToBytes())
 
 fn BrowserAbiBridgePlanManifestTextFromRules(rules: BrowserAbiRule[]): str =
     let plans = BrowserAbiBridgePlansFromRules(rules)

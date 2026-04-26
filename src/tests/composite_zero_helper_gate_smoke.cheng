@@ -1,10 +1,62 @@
 import std/os
+import std/strings
 import std/strutils as strutil
 
+fn compositeGateLineLooksLikeZeroHelper(line: str): bool =
+    let trimmed = strutil.Strip(line)
+    if !strutil.StartsWith(trimmed, "fn "):
+        return false
+    let openParen = compositeGateFindChar(trimmed, '(', 3)
+    if openParen < 0:
+        return false
+    let namePart = strutil.Strip(strings.SliceBytes(trimmed, 3, openParen - 3))
+    if !strings.HasSuffix(namePart, "Zero"):
+        return false
+    if !strutil.Contains(trimmed, "):"):
+        return false
+    return true
+
+fn compositeGateFindChar(text: str, needle: char, start: int32): int32 =
+    let n = len(text)
+    for i in start..<n:
+        if text[i] == needle:
+            return i
+    return -1
+
+fn compositeGateSkipException(path: str, line: str): bool =
+    let trimmed = strutil.Strip(line)
+    if path == "src/tests/composite_zero_helper_gate_smoke.cheng":
+        return true
+    if path == "src/std/crypto/bigint.cheng" && trimmed == "fn bigZero(): BigInt =$":
+        return true
+    if path == "src/tests/call_hir_args_fixture.cheng" && trimmed == "fn callZero(): str =$":
+        return true
+    if path == "src/tests/wasm_importc_noarg_i32_smoke.cheng" && trimmed == "fn chengTestZero(): int32$":
+        return true
+    return false
+
+fn compositeGateScanFile(path: str, out: var str[]) =
+    if !strings.HasSuffix(path, ".cheng"):
+        return
+    let text = os.ReadFile(path)
+    let lines = strutil.Split(text, '\n')
+    for i in 0..<lines.len:
+        let line = lines[i]
+        if compositeGateLineLooksLikeZeroHelper(line) && !compositeGateSkipException(path, line):
+            add(out, strutil.Join([path, ":", strings.IntToStr(i + 1), ":", line], ""))
+
+fn compositeGateScanRoot(root: str, out: var str[]) =
+    if !os.DirExists(root):
+        return
+    let paths = os.WalkDirRec(root)
+    for i in 0..<paths.len:
+        compositeGateScanFile(paths[i], out)
+
 fn main(): int32 =
-    let command =
-        strutil.Join(["(rg -n 'fn\\s+[A-Za-z_][A-Za-z0-9_]*Zero\\s*\\(\\)\\s*:' src codex/src --glob '*.cheng' || true)", " | grep -v '^src/tests/composite_zero_helper_gate_smoke.cheng:'", " | grep -v '^src/std/crypto/bigint.cheng:73:fn bigZero(): BigInt =$'", " | grep -v '^src/tests/call_hir_args_fixture.cheng:6:fn callZero(): str =$'", " | grep -v '^src/tests/wasm_importc_noarg_i32_smoke.cheng:2:fn chengTestZero(): int32$'", " || true"], "")
-    let output = strutil.Strip(os.ExecCmdResultOutput(os.ExecCmdEx(command, uint64(1), "")))
+    var findings: str[]
+    compositeGateScanRoot("src", findings)
+    compositeGateScanRoot("codex/src", findings)
+    let output = strutil.Strip(strutil.Join(findings, "\n"))
     assert(output == "",
            strutil.Join(["composite no-arg Zero helper forbidden; use implicit init, T(), or new(T)\n", output], ""))
     echo(" composite_zero_helper_gate_smoke ok")

@@ -1,10 +1,163 @@
 import std/os
+import std/strings
 import std/strutils as strutil
 
+fn explicitGateFindChar(text: str, needle: char, start: int32): int32 =
+    let n = len(text)
+    for i in start..<n:
+        if text[i] == needle:
+            return i
+    return -1
+
+fn explicitGateIndentOf(line: str): int32 =
+    let n = len(line)
+    var count: int32
+    for i in 0..<n:
+        let ch = line[i]
+        if ch == ' ' || ch == '\t':
+            count = count + 1
+        else:
+            break
+    return count
+
+fn explicitGateCompact(text: str): str =
+    var parts: str[]
+    let n = len(text)
+    for i in 0..<n:
+        let ch = text[i]
+        if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r':
+            add(parts, strings.CharToStr(ch))
+    return strutil.Join(parts, "")
+
+fn explicitGateIsIntType(typeText: str): bool =
+    let t = strutil.Strip(typeText)
+    if t == "int8" || t == "uint8":
+        return true
+    if t == "int16" || t == "uint16":
+        return true
+    if t == "int32" || t == "uint32":
+        return true
+    if t == "int64" || t == "uint64":
+        return true
+    if t == "int" || t == "uint":
+        return true
+    return false
+
+fn explicitGateIsFloatType(typeText: str): bool =
+    let t = strutil.Strip(typeText)
+    if t == "float" || t == "float32" || t == "float64":
+        return true
+    return false
+
+fn explicitGateIsStrType(typeText: str): bool =
+    let t = strutil.Strip(typeText)
+    return t == "str" || t == "cstring"
+
+fn explicitGateIsSeqType(typeText: str): bool =
+    let t = explicitGateCompact(typeText)
+    return strings.HasSuffix(t, "[]")
+
+fn explicitGateIsFixedArrayType(typeText: str): bool =
+    let t = explicitGateCompact(typeText)
+    if !strings.HasSuffix(t, "]"):
+        return false
+    let open = explicitGateFindChar(t, '[', 0)
+    if open < 0:
+        return false
+    let n = len(t)
+    if open + 1 >= n - 1:
+        return false
+    for i in (open + 1)..<n - 1:
+        let ch = t[i]
+        if ch < '0' || ch > '9':
+            return false
+    return true
+
+fn explicitGateDefaultExprMatches(typeText: str, exprText: str): bool =
+    let t = strutil.Strip(typeText)
+    let e = strutil.Strip(exprText)
+    if t == "bool" && e == "false":
+        return true
+    if explicitGateIsIntType(t) && e == "0":
+        return true
+    if explicitGateIsFloatType(t) && (e == "0" || e == "0.0"):
+        return true
+    if explicitGateIsStrType(t) && e == "\"\"":
+        return true
+    if (explicitGateIsSeqType(t) || explicitGateIsFixedArrayType(t)) && e == "[]":
+        return true
+    let compactType = explicitGateCompact(t)
+    let compactExpr = explicitGateCompact(e)
+    if compactExpr == strutil.Join([compactType, "()"], ""):
+        return true
+    return false
+
+fn explicitGateLineDefaultInit(line: str, inTypeBlock: bool): bool =
+    let trimmed = strutil.Strip(line)
+    if len(trimmed) <= 0 || strutil.StartsWith(trimmed, "#"):
+        return false
+    var checkLine = false
+    if strutil.StartsWith(trimmed, "let ") || strutil.StartsWith(trimmed, "var "):
+        checkLine = true
+    if inTypeBlock:
+        checkLine = true
+    if !checkLine:
+        return false
+    let colon = explicitGateFindChar(trimmed, ':', 0)
+    let eq = explicitGateFindChar(trimmed, '=', 0)
+    if colon < 0 || eq < 0 || eq <= colon:
+        return false
+    let beforeColon = strutil.Strip(strings.SliceBytes(trimmed, 0, colon))
+    if len(beforeColon) <= 0:
+        return false
+    if strutil.StartsWith(beforeColon, "fn "):
+        return false
+    let typeText = strings.SliceBytes(trimmed, colon + 1, eq - colon - 1)
+    let exprText = strings.SliceBytes(trimmed, eq + 1, len(trimmed) - eq - 1)
+    return explicitGateDefaultExprMatches(typeText, exprText)
+
+fn explicitGateSkipException(path: str, line: str): bool =
+    let trimmed = strutil.Strip(line)
+    if path == "src/tests/explicit_default_init_gate_smoke.cheng":
+        return true
+    if strutil.StartsWith(path, "src/tests/explicit_default_init_negative_"):
+        return true
+    if path == "src/backend/uir/uir_instance_cache.cheng" &&
+       trimmed == "let c: UirInstanceCache = UirInstanceCache()":
+        return true
+    return false
+
+fn explicitGateScanFile(path: str, out: var str[]) =
+    if !strings.HasSuffix(path, ".cheng"):
+        return
+    let text = os.ReadFile(path)
+    let lines = strutil.Split(text, '\n')
+    var inTypeBlock = false
+    var typeIndent: int32 = -1
+    for i in 0..<lines.len:
+        let line = lines[i]
+        let trimmed = strutil.Strip(line)
+        if inTypeBlock && len(trimmed) > 0 && !strutil.StartsWith(trimmed, "#") &&
+           explicitGateIndentOf(line) <= typeIndent:
+            inTypeBlock = false
+        if trimmed == "type":
+            inTypeBlock = true
+            typeIndent = explicitGateIndentOf(line)
+        elif explicitGateLineDefaultInit(line, inTypeBlock) && !explicitGateSkipException(path, line):
+            add(out, strutil.Join([path, ":", strings.IntToStr(i + 1), ":", line], ""))
+
+fn explicitGateScanRoot(root: str, out: var str[]) =
+    if !os.DirExists(root):
+        return
+    let paths = os.WalkDirRec(root)
+    for i in 0..<paths.len:
+        explicitGateScanFile(paths[i], out)
+
 fn main(): int32 =
-    let command =
-        strutil.Join(["((rg --files src codex/src --glob '*.cheng' || true)", " | xargs perl -ne '", "BEGIN { $current_file = \"\"; $line_no = 0; $in_type = 0; $type_indent = -1; } ", "sub trim { my ($s) = @_; $s =~ s/^\\s+//; $s =~ s/\\s+$//; return $s; } ", "sub compact { my ($s) = @_; $s =~ s/\\s+//g; return $s; } ", "sub indent_of { my ($s) = @_; $s =~ /^([ \\t]*)/; return length($1); } ", "sub is_int_type { my ($t) = @_; return $t =~ /^(int8|uint8|int16|uint16|int32|uint32|int64|uint64|int|uint)$/; } ", "sub is_float_type { my ($t) = @_; return $t =~ /^(float|float32|float64)$/; } ", "sub is_str_type { my ($t) = @_; return $t eq \"str\" || $t eq \"cstring\"; } ", "sub is_seq_type { my ($t) = @_; return $t =~ /\\[\\]$/; } ", "sub is_fixed_type { my ($t) = @_; return $t =~ /\\[[0-9]+\\]$/; } ", "sub default_expr_matches { my ($type, $expr) = @_; $type = trim($type); $expr = trim($expr); my $ct = compact($type); my $ce = compact($expr); return 1 if $type eq \"bool\" && $expr eq \"false\"; return 1 if is_int_type($type) && $expr eq \"0\"; return 1 if is_float_type($type) && ($expr eq \"0\" || $expr eq \"0.0\"); return 1 if is_str_type($type) && $expr eq qq{\"\"}; return 1 if (is_seq_type($type) || is_fixed_type($type)) && $expr eq \"[]\"; return 1 if $ce eq $ct . \"()\"; return 0; } ", "if ($ARGV ne $current_file) { $current_file = $ARGV; $line_no = 0; $in_type = 0; $type_indent = -1; } ", "++$line_no; chomp; my $line = $_; my $trimmed = trim($line); ", "if ($in_type && $trimmed ne \"\" && $trimmed !~ /^#/ && indent_of($line) <= $type_indent) { $in_type = 0; } ", "if ($trimmed eq \"type\") { $in_type = 1; $type_indent = indent_of($line); next; } ", "if ($trimmed =~ /^(?:let|var)\\s+[A-Za-z_][A-Za-z0-9_]*\\s*:\\s*([^=]+)\\s*=\\s*(.+)$/ && default_expr_matches($1, $2)) { print qq{$ARGV:$line_no:$line\\n}; } ", "if ($in_type && $trimmed =~ /^[A-Za-z_][A-Za-z0-9_]*\\s*:\\s*([^=]+)\\s*=\\s*(.+)$/ && default_expr_matches($1, $2)) { print qq{$ARGV:$line_no:$line\\n}; }'", " | grep -v '^src/tests/explicit_default_init_gate_smoke.cheng:'", " | grep -v '^src/tests/explicit_default_init_negative_'", " | grep -v '^src/backend/uir/uir_instance_cache.cheng:13:    let c: UirInstanceCache = UirInstanceCache()$'", " | sort -u || true)"], "")
-    let output = strutil.Strip(os.ExecCmdResultOutput(os.ExecCmdEx(command, uint64(1), "")))
+    var findings: str[]
+    explicitGateScanRoot("src", findings)
+    explicitGateScanRoot("codex/src", findings)
+    let output = strutil.Strip(strutil.Join(findings, "\n"))
     assert(output == "",
            strutil.Join(["redundant explicit default init forbidden; use typed implicit init or a non-redundant constructor/literal\n", output], ""))
     echo(" explicit_default_init_gate_smoke ok")

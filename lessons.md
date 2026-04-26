@@ -77,6 +77,7 @@
 - r2c 平台壳合同放 runtime 产物和 host-run fields；不要继续往 `r2cControllerRunNativeGui` 的大 report 里堆字段，该函数已贴近 stage3 局部临时上限。
 - r2c smoke 的 artifact 目录不能复用 `/tmp` 可执行输出路径；否则 `MkdirP` 会正确失败。稳定命名用 `<smoke>_artifacts` 目录。
 - host smoke、gate smoke、runtime_zero 这类会触发编译的门禁 RSS 默认统一 8GiB；禁止再写 `34359738368` 这种 32GiB 守卫，必须有静态 smoke 防回潮。
+- `build-backend-driver` 自举构建的 RSS 上限不能继承外部 `CHENG_PROCESS_MAX_RSS_BYTES` 或 build/follow override；主线固定 8GiB，避免用户环境把长编译放大到 32GiB。
 - Cheng 字符串拼接操作符 `+` 已禁用移除；新增 Cheng 代码必须用 Nim 风格 `Fmt"..."`、`std/strutils.Join(...)` 或 `Lines(...)` 组合字符串，只把 `+` 用于数值加法，不再新增 `Fmt(parts)`。
 - Cheng 自增/自减计数循环必须写成 `for ... in range`；`while` 只用于非计数型条件循环。
 - 当前 `primary_object_emit` 仍是 `.s` 文本生成再 `cc -c` 产 `.o`；不要把它描述成直接机器 object writer，真正直写 `.o` 必须走 Mach-O/ELF/COFF object writer 主线。
@@ -122,3 +123,44 @@
 - primary object 从四个硬编码 call 槽迁移时，先让 `PrimaryObjectIrFunction` 同步产出 call sequence 数组，并让 plan 的 reachability/target symbol 解析消费数组；旧槽只能做 writer 兼容，不能继续作为扩展方向。
 - 纯 Cheng 自举主线不能继续用源码行字符串扫描扩展 statement 支持；`BackendDriverMain` 的下一步必须消费 parser/typed facts/NormalizedExpr 的结构化 statement/CFG IR。
 - Typed statement IR 构建不能按每个函数扫描全量 facts；必须按 source 分组并用函数行号游标推进，否则 `build-backend-driver` 的 `lowering_plan` 会从约 50 秒退化到 130 秒级。
+- 生成 JSON 文件时必须优先使用 `std/json` 对象构建后 `Stringify`，不能用 `Fmt` 或 `strutils.Join` 手写大段 JSON；`Fmt"""..."""` 只用于代码、配置文本和说明文这类非结构化模板。
+- 多行模板要生成 Kotlin/ArkTS/TS 等非 Cheng `import` 行时，用局部 `importKw` 插值输出，源码模板正文不要保留行首 `import `；当前闭包扫描链路仍可能读到模板正文并误报 unresolved import。
+- 把 JSON/KV 嵌进 C/ObjC/C++ 宿主源码时，必须先生成真正的 C string literal 转义；只在两端包双引号会让 JSON 内部双引号和换行打坏生成源码。
+- `verify-export-visibility` 和 `verify-export-visibility-parallel` 默认共用 `artifacts/forward/verify_export_visibility`；验证安装后 driver 时必须串行或改成隔离 artifact 目录，否则会互相覆盖 native 输出制造假红。
+- 最小 seed 主线下，public `stage3 system-link-exec/status/print-build-plan` 只做 backend driver handoff，不再隐式 `bootstrap-bridge` 或 `build-backend-driver`；`CHENG_NO_BACKEND_DRIVER_HANDOFF=1` 只给内部自举路径用，用户命令面应硬失败而不是回落 C seed。
+- direct writer 改为消费 `PrimaryObjectPlan.instructionWords` 后，primary plan 必须同步写真实机器字；零填充会生成看似合法但含 `udf` 的 Mach-O，并在 BR26 relocation 链接时失败。
+- standalone direct 不能只用 zero-exit smoke 验证；必须覆盖非零 call-chain relocation、实际退出码和 `otool -rv`，同时用 f64 object 验证 `fmul` 指令形态。
+- 刷新 `stage0/stage2/stage3` 后不要立刻跑普通 `build-backend-driver --require-rebuild` 验证纯 self build；ready 会因新 stage artifact 失效而触发纯 Cheng 重编。先用 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 刷新最小 driver，再跑普通 ready/status；纯 self rebuild 必须先有 RSS 子进程组守卫和明确用户确认。
+- C seed 调外部/内部 live 子进程时必须监控子进程组 RSS，不只看 seed 自身 peak RSS；超出 `CHENG_PROCESS_MAX_RSS_BYTES` 要写 `rss_limit_exceeded`、杀进程组并以 125 硬失败。
+- `build-backend-driver` 的默认 8GiB 只能是缺省值，不能覆盖调用方显式传入的 `CHENG_PROCESS_MAX_RSS_BYTES`/`CHENG_MAX_RSS_BYTES`；专用 `CHENG_BUILD_BACKEND_DRIVER_MAX_RSS_BYTES` 优先级最高，方便单独压测构建链路。
+- `BuildLoweringPlanStub` 标记 entry 函数时必须比较规范化后的绝对 source path，不能用原始字符串相等；候选 driver 的绝对/相对路径表面不同会直接丢 entry，随后表现为 `lowering_entry_function_missing`。
+- 最小 backend driver 暴露的 verify 命令不能留成 “outside min seed closure”；要么在 min closure 内做真实检查，要么从 help/命令面删除。实现 fixture 源码模板时继续用 `importKw` 拼出 `import`，避免闭包扫描误读字符串正文。
+- 直接运行 `artifacts/backend_driver/cheng system-link-exec` 做 pure self-build 探针时，`CHENG_PROCESS_MAX_RSS_BYTES` 必须由 driver 自身守卫；低上限探针要在 64MiB 量级退出 125，否则立刻修守卫，不再长跑。
+- 最小 backend driver 直接调用 `BuildSystemLinkPlanStub/BuildLoweringPlanStub/BuildPrimaryObjectPlan` 时也必须有自身 RSS 守卫；外层 C seed 子进程组守卫只能保护构建期，不能保护已安装 min driver 的普通 `system-link-exec`。
+- 当前 stage0/stage2/stage3/backend_driver 都已收口到最小 driver 命令面，`run-host-smokes` 不能再作为默认验证入口；主线验证优先用 min closure 内置 verify 命令、direct fixture 和明确的低 RSS 退出码探针。
+- Darwin 当前运行面不能把 `setrlimit(RLIMIT_AS)` 当成 min driver 内存硬限；它会让候选 `status` 直接失败。长 phase 内部防爆必须在 parser/lowering/primary 的大循环里做结构化 guard check。
+- `backend_driver_dispatch_min.cheng` 仍是未跟踪自举入口时，改完必须先跑 `artifacts/backend_driver/cheng help` 或源码 `rg` 确认命令面没有被旧内容覆盖；否则可能重新装回 “outside min seed closure” 这类旧 stub。
+- 资源守卫不能靠 `/bin/ps` 子进程读取自身 RSS，也不能把 `ProcessResourceGuardCheck`/progress guard 留成 no-op；Darwin 主线用纯 Cheng `@importc("getrusage")` 直读 `ru_maxrss`，RSS 不可得时硬失败。
+- 启动 pure self-build 探针前必须先扫同路径 `system-link-exec` 进程和 report 路径；同一个 `/tmp/cheng-pure-driver-self.report.txt` 上并发两个探针会叠加到 13GiB 以上，还会互相覆盖报告。发现重复时只停自己新开的那一个。
+- `cstring` 字面量 importc call sequence 直写 Mach-O 时，text 里必须有 BR26 call reloc，data 里必须有对应 cstring label、NUL 结尾 payload，以及 PAGE21/PAGEOFF12 reloc；standalone writer 一旦有 data label 必须走 text+data object writer，不能继续写纯 text 对象。
+- 已经向 BodyIR 追加 Return op 的 lowering helper 不要再设置旧 `statementReturnMode`；否则通用 lowering 会再追加一次 Return，造成双 return 或 seed 编译缺口。
+- `DirectObjectEmitCanStandaloneMain` 这类 direct writer validation 必须保持 seed 可编译的线性检查；语义合法性由 typed/lowering/primary plan 证明，不能在 writer 里补嵌套扫描式后验校验。
+- `BuildPrimaryObjectPlan` 这种纯自举大函数里不要长期保留临时 `str[]` call target 序列；relocation 目标应按 `callOrdinal` 直接从 `callSequence` 解析并立即写入 plan，减少复合 seq 局部互踩风险。
+- 新增 body-kind/lowering helper 后必须接入 `LoweringBuildPrimaryObjectIr` 主流程；`BackendDriverDispatchMinRootFromCmdline` 已有专用 body kind 但未调用时，pure self-build 仍会报第 192 行 `stmt_let_call`。
+- `str` let-call 后接 `return Call(local)` 的 ABI 判定必须信 typed statement 的 `resultType`/local slot 类型，不要信 call fact 的 `typeText`；无显式类型 `let rootDir = ...` 时 fact 类型可能为空。
+- 当前最小 driver pure self-build 已越过 root/入口包装，最新真实 blocker 是 `BackendDriverDispatchMinRunSystemLinkExecWithRequest` 第 453 行 `stmt_call`；下一步是函数内错误分支、普通 call statement、Result 解包和 var out-param 的结构化 CFG lowering。
+- TypedExpr/Lowering 热路径必须借用 source contexts、facts 和 IR；按 source 克隆 `TypedExprFact[]` 会把最小 driver pure self-probe 推到 8GiB 边界，稳定做法是用 source fact 起止区间和行号游标扫描。
+- 最小 driver 的 `return Callee(args...)` 透传壳应降成 return-call passthrough/tail branch；不要给 BodyIR 再追加 CallResultI32 return，否则 primary 会把它误当 statement sequence，生成多余 prologue/ret，运行时慢于 C。
+- `BuildLoweringPlanStub` 不能再调用会重建 facts/行列索引的 `TypedExprBuildFacts`；最小自举主线必须复用 parser/typed layer 已有结构化 IR，避免 lowering 阶段重新扫源码导致 RSS 放大。
+- typed IR builder 里不要在同一个可变调用表达式同时传 `contexts[i]`、`contexts` 和 `contexts[i].scopes[j]`；先落 `ctx`/`scope` 局部，避免 self-host bounds/alias 误编译。
+- `std/os` 写文件不能只调用一次 `fwrite` 或无返回值 C bridge；必须循环处理 partial write，并检查 `fflush/fclose`，失败即硬失败。
+- `std/sync` 的阻塞锁函数只能在 CAS 成功后返回受保护值；失败分支里返回会让锁形同虚设。
+- manifest/source 文本生成不要在循环里不断把累计 `out` 重新 Join；先收集 `str[]` 行或片段，最后一次 `Join`，避免 O(n²) 分配。
+- shell 字符串执行必须在 API 名称或选项里显式写出 eval；默认进程 API 走 `std/os_host_process ExecFile*` 的 argv wire，旧 `ExecCmd*`/`PipeSpawn` 入口只能 hard-fail 或显式 Shell 名称。
+- 路径遍历不要在底层 `std/os` primitive 里启发式拦截；提供 rooted path API 拒绝绝对路径和 `..` 段，上层不可信相对路径统一走 rooted API。
+- 表查询 API 不能只给零值返回；保留兼容 `TableGet` 时必须同时提供 `TableTryGet(..., out)` 来区分 missing 和真实零值。
+- 浮点文本解析只保留一个语义入口；JSON 解析应复用 `std/parseutils`，指数缩放用指数平方法，避免线性 `pow10`。
+- mobile/internal bridge 写文件和 std/os 同口径：循环处理 partial write，并把 flush/close 失败作为写入失败返回。
+- gate smoke 不应靠 `rg/perl/grep/cp/rm` 这类外部脚本拼 shell；能用 Cheng 的 `WalkDir/ReadFile/WriteFile` 表达的检查必须纯 Cheng 实现。
+- freshness 比较不要 shell 出 `test -nt`；用文件存在性和 `FileMtime` 明确表达，右侧产物缺失时直接视为需要重建。
+- build-plan 对比不要 shell 出 `grep/cmp`；按合同 key 过滤行后直接比较文本，并把过滤结果作为 sidecar 写出。

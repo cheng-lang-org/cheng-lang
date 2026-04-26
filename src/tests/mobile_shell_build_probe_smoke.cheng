@@ -1,21 +1,75 @@
 import std/os
 import std/strings
+import std/strutils as strutil
 import cheng/core/tooling/path as chengpath
 import cheng/core/tooling/mobile_shell_codegen as mshell
-import std/strutils as strutil
+
+fn MobileShellAssertExportcNoPtr(sourceText: str) =
+    let lines = strutil.Split(sourceText, '\n')
+    for i in 0..<lines.len:
+        if !strings.StrContains(lines[i], "@exportc("):
+            continue
+        var signature = ""
+        for j in (i + 1)..<lines.len:
+            let trimmed = chengpath.PathTrim(lines[j])
+            if len(trimmed) <= 0:
+                continue
+            signature = strutil.Join([signature, " ", trimmed], "")
+            if strings.StrContains(trimmed, "="):
+                break
+            if j - i > 8:
+                break
+        assert(!strings.StrContains(signature, " ptr"),
+               " mobile_shell_build_probe_smoke: exportc ptr surface")
+        assert(!strings.StrContains(signature, ":ptr"),
+               " mobile_shell_build_probe_smoke: exportc ptr compact surface")
+        assert(!strings.StrContains(signature, "):ptr"),
+               " mobile_shell_build_probe_smoke: exportc ptr return surface")
+
+fn MobileShellAssertMobileCapiBridgeSurface(root: str) =
+    let mobileCapiPath = "src/mobile/mobile_capi.cheng"
+    let mobileCapiText = chengpath.ReadTextFile(root, mobileCapiPath)
+    assert(len(mobileCapiText) > 0,
+           " mobile_shell_build_probe_smoke: mobile capi source")
+    MobileShellAssertExportcNoPtr(mobileCapiText)
+    assert(!strings.StrContains(mobileCapiText, "fn mobileCapiTextCString"),
+           " mobile_shell_build_probe_smoke: local text cstring wrapper removed")
+    assert(!strings.StrContains(mobileCapiText, "fn mobileCapiCopyRawText"),
+           " mobile_shell_build_probe_smoke: local raw copy wrapper removed")
+    assert(!strings.StrContains(mobileCapiText, "mobileCapiTextCString("),
+           " mobile_shell_build_probe_smoke: local text cstring calls removed")
+    assert(!strings.StrContains(mobileCapiText, "mobileCapiCopyRawText("),
+           " mobile_shell_build_probe_smoke: local raw copy calls removed")
+    assert(!strings.StrContains(mobileCapiText, "mobileCapiCopyRawTextLen("),
+           " mobile_shell_build_probe_smoke: local raw copy len calls removed")
+    assert(strings.StrContains(mobileCapiText, "bridge.InternalMobileBridgeTextCString"),
+           " mobile_shell_build_probe_smoke: internal bridge text cstring")
+    assert(strings.StrContains(mobileCapiText, "bridge.InternalMobileBridgeCopyRawText"),
+           " mobile_shell_build_probe_smoke: internal bridge raw copy")
+    assert(strings.StrContains(mobileCapiText, "bridge.InternalMobileBridgeBufferHandleCopy(rawData, textLen)"),
+           " mobile_shell_build_probe_smoke: text buffer handle copy bridge")
+    assert(strings.StrContains(mobileCapiText, "bridge.InternalMobileBridgeBufferHandleCopy(payloadData, payloadLen)"),
+           " mobile_shell_build_probe_smoke: bytes buffer handle copy bridge")
+    assert(!strings.StrContains(mobileCapiText, "bytesFree(snapshot)"),
+           " mobile_shell_build_probe_smoke: no freed snapshot handle")
+    assert(!strings.StrContains(mobileCapiText, "while i < payloadLen"),
+           " mobile_shell_build_probe_smoke: no payload while copy")
+    assert(!strings.StrContains(mobileCapiText, "InternalMobileBridgeBufferHandle(snapshotData"),
+           " mobile_shell_build_probe_smoke: no raw snapshot handle")
 
 fn main(): int32 =
     let root: str = os.GetCurrentDir()
+    MobileShellAssertMobileCapiBridgeSurface(root)
     let outDir: str = chengpath.PathAbsolute(root, "artifacts/mobile_shell_build_probe_smoke")
     assert(chengpath.MkdirP(root, outDir), " mobile_shell_build_probe_smoke: mkdir")
     var output: str
     var errorText: str
     let rc: int32 = mshell.MobileShellRun(root,
-                                           [
-                                               "build-probe",
-                                               "--platform:none",
-                                               strutil.Join(["--out-dir:", outDir], "")
-                                           ],
+                                               [
+                                                   "build-probe",
+                                                   "--platform:none",
+                                                   Fmt"--out-dir:{outDir}"
+                                               ],
                                            output,
                                            errorText)
     assert(rc == 0, " mobile_shell_build_probe_smoke: verify rc")

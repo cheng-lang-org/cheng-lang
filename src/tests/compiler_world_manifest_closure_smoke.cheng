@@ -1,5 +1,6 @@
 import std/os
 import std/result
+import std/strings
 import std/strutils as strutil
 import cheng/std/bytes_layout as layout
 import cheng/core/tooling/path as chengpath
@@ -59,6 +60,48 @@ fn compilerWorldPrintPlanDrift(left: sexec.SystemLinkExecPlan,
     compilerWorldPrintSnapshotPair("std", left.localUniverse.stdSnapshot, right.localUniverse.stdSnapshot)
     compilerWorldPrintSnapshotPair("runtime", left.localUniverse.runtimeSnapshot, right.localUniverse.runtimeSnapshot)
 
+fn compilerWorldRemoveTree(path: str): bool =
+    if os.FileExists(path):
+        return os.RemoveFile(path)
+    if !os.DirExists(path):
+        return true
+    let entries = os.WalkDir(path)
+    for i in 0..<entries.len:
+        let entry = os.WalkDirEntry(entries, i)
+        let child = os.WalkDirEntryPath(entry)
+        let kind = os.WalkDirEntryKind(entry)
+        if kind == os.PcDir || kind == os.PcLinkToDir:
+            if !compilerWorldRemoveTree(child):
+                return false
+        elif kind == os.PcFile || kind == os.PcLinkToFile:
+            if !os.RemoveFile(child):
+                return false
+    os.RemoveDir(path)
+    return !os.DirExists(path)
+
+fn compilerWorldCopyTextFile(src: str, dest: str): bool =
+    let destParts = os.SplitFile(dest)
+    if len(destParts.dir) > 0 && !chengpath.MkdirP(chengpath.PathCurrentDir(), destParts.dir):
+        return false
+    os.WriteFile(dest, os.ReadFile(src))
+    return os.FileExists(dest)
+
+fn compilerWorldCopyTextTree(srcRoot: str, destRoot: str): bool =
+    if !chengpath.MkdirP(chengpath.PathCurrentDir(), destRoot):
+        return false
+    let files = os.WalkDirRec(srcRoot)
+    let rootLen = len(srcRoot)
+    for i in 0..<files.len:
+        let src = files[i]
+        var relStart = rootLen
+        if relStart < len(src) && src[relStart] == '/':
+            relStart = relStart + 1
+        let rel = strings.SliceBytes(src, relStart, len(src) - relStart)
+        let dest = os.JoinPath(destRoot, rel)
+        if !compilerWorldCopyTextFile(src, dest):
+            return false
+    return true
+
 fn main(): int32 =
     let workspaceRoot = chengpath.PathCurrentDir()
     let packageRoot = workspaceRoot
@@ -103,13 +146,14 @@ fn main(): int32 =
     let frozenSourcePath = chengpath.PathJoin(frozenPackageRoot, "src/tests/program_selfhost_smoke.cheng")
     let frozenOutputPath = chengpath.PathJoin(workspaceRoot, "artifacts/compiler_world_manifest_closure/program_selfhost_smoke.frozen")
     let frozenStdRoot = chengpath.PathJoin(frozenWorkspaceRoot, "src")
-    assert(os.ExecCmdStatus(strutil.Join(["rm -rf ", os.QuoteShell(frozenWorkspaceRoot)], ""), "") == 0,
+    assert(compilerWorldRemoveTree(frozenWorkspaceRoot),
            " compiler world manifest closure: clear frozen root")
     assert(chengpath.MkdirP(workspaceRoot, frozenWorkspaceRoot),
            " compiler world manifest closure: mkdir frozen root")
-    assert(os.ExecCmdStatus(strutil.Join(["cp ", os.QuoteShell(chengpath.PathJoin(packageRoot, "cheng-package.toml")), " ", os.QuoteShell(chengpath.PathJoin(frozenPackageRoot, "cheng-package.toml"))], ""), "") == 0,
+    assert(compilerWorldCopyTextFile(chengpath.PathJoin(packageRoot, "cheng-package.toml"),
+                                     chengpath.PathJoin(frozenPackageRoot, "cheng-package.toml")),
            " compiler world manifest closure: copy frozen manifest")
-    assert(os.ExecCmdStatus(strutil.Join(["cp -R ", os.QuoteShell(chengpath.PathJoin(workspaceRoot, "src")), " ", os.QuoteShell(frozenWorkspaceRoot)], ""), "") == 0,
+    assert(compilerWorldCopyTextTree(chengpath.PathJoin(workspaceRoot, "src"), frozenStdRoot),
                            " compiler world manifest closure: copy frozen shared src")
     assert(chengpath.PathDirExists(frozenStdRoot),
            " compiler world manifest closure: frozen shared src exists")

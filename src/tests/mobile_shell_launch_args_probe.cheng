@@ -1,71 +1,96 @@
 import std/monotimes
 import std/os
 import std/strings
+import std/json as json
 import cheng/core/tooling/mobile_shell_codegen as mshell
 import cheng/core/tooling/path as chengpath
-import std/strutils as strutil
 
-fn probeQuote(text: str): str =
-    return strutil.Join(["\"", text, "\""], "")
+fn probeCStringLiteral(text: str): str =
+    var out: str = "\""
+    var i: int32
+    while i < len(text):
+        let ch: char = text[i]
+        let code: int32 = int32(ch)
+        if code == 92:
+            out = Fmt"{out}\\\\"
+        elif code == 34:
+            out = Fmt"{out}\\\""
+        elif code == 10:
+            out = Fmt"{out}\\n"
+        elif code == 13:
+            out = Fmt"{out}\\r"
+        elif code == 9:
+            out = Fmt"{out}\\t"
+        else:
+            let piece: str = strings.CharToStr(ch)
+            out = Fmt"{out}{piece}"
+        i = i + 1
+    return Fmt"{out}\""
 
 fn probeLaunchArgsKv(routeState: str): str =
-    var text: str
-    text = strutil.Join([text, "gate_mode=android-semantic-visual-1to1"], "")
-    text = strutil.Join([text, ";truth_mode=strict"], "")
-    text = strutil.Join([text, ";route_state=", routeState], "")
-    text = strutil.Join([text, ";route_lock=1"], "")
-    text = strutil.Join([text, ";runtime_mode=r2c_native_gui_v1"], "")
-    text = strutil.Join([text, ";runtime_manifest=runtime/mobile_shell_runtime_contract_v1.json"], "")
-    text = strutil.Join([text, ";runtime_contract_payload=runtime/mobile_shell_runtime_contract_payload.json"], "")
-    text = strutil.Join([text, ";runtime_bundle_payload=runtime/mobile_shell_runtime_bundle_payload.json"], "")
-    return text
+    return Fmt"gate_mode=android-semantic-visual-1to1;truth_mode=strict;route_state={routeState};route_lock=1;runtime_mode=r2c_native_gui_v1;runtime_manifest=runtime/mobile_shell_runtime_contract_v1.json;runtime_contract_payload=runtime/mobile_shell_runtime_contract_payload.json;runtime_bundle_payload=runtime/mobile_shell_runtime_bundle_payload.json"
 
 fn probeLaunchArgsJson(routeState: str): str =
-    var text: str = "{\n"
-    text = strutil.Join([text, "  \"format\": \"mobile_shell_launch_args_v1\",\n"], "")
-    text = strutil.Join([text, "  \"gate_mode\": \"android-semantic-visual-1to1\",\n"], "")
-    text = strutil.Join([text, "  \"truth_mode\": \"strict\",\n"], "")
-    text = strutil.Join([text, "  \"route_state\": \"", routeState, "\",\n"], "")
-    text = strutil.Join([text, "  \"route_lock\": true,\n"], "")
-    text = strutil.Join([text, "  \"runtime_mode\": \"r2c_native_gui_v1\",\n"], "")
-    text = strutil.Join([text, "  \"runtime_manifest\": \"runtime/mobile_shell_runtime_contract_v1.json\",\n"], "")
-    text = strutil.Join([text, "  \"runtime_contract_payload\": \"runtime/mobile_shell_runtime_contract_payload.json\",\n"], "")
-    text = strutil.Join([text, "  \"runtime_bundle_payload\": \"runtime/mobile_shell_runtime_bundle_payload.json\"\n"], "")
-    text = strutil.Join([text, "}\n"], "")
-    return text
+    var doc: json.JsonNode = json.NewJObject()
+    json.JsonSetFieldStr(doc, "format", "mobile_shell_launch_args_v1")
+    json.JsonSetFieldStr(doc, "gate_mode", "android-semantic-visual-1to1")
+    json.JsonSetFieldStr(doc, "truth_mode", "strict")
+    json.JsonSetFieldStr(doc, "route_state", routeState)
+    json.JsonSetFieldBool(doc, "route_lock", true)
+    json.JsonSetFieldStr(doc, "runtime_mode", "r2c_native_gui_v1")
+    json.JsonSetFieldStr(doc, "runtime_manifest", "runtime/mobile_shell_runtime_contract_v1.json")
+    json.JsonSetFieldStr(doc, "runtime_contract_payload", "runtime/mobile_shell_runtime_contract_payload.json")
+    json.JsonSetFieldStr(doc, "runtime_bundle_payload", "runtime/mobile_shell_runtime_bundle_payload.json")
+    let rendered: str = json.Stringify(doc)
+    return Fmt"{rendered}\n"
 
 fn probeAndroidAugmentedHostSource(opts: var mshell.MobileShellOptions,
                                    kv: str,
-                                   json: str): str =
-    var text: str = mshell.MobileShellAndroidHostSource(opts)
-    text = strutil.Join([text, "\n/* probe launch args begin */\n"], "")
-    text = strutil.Join([text, "typedef void (*cheng_mobile_host_runtime_set_launch_args_fn)(const char*, const char*);\n"], "")
-    text = strutil.Join([text, "static const char* kChengLaunchArgsKv = ", probeQuote(kv), ";\n"], "")
-    text = strutil.Join([text, "static const char* kChengLaunchArgsJson = ", probeQuote(json), ";\n"], "")
-    text = strutil.Join([text, "/* probe launch args end */\n"], "")
-    return text
+                                   jsonText: str): str =
+    let text: str = mshell.MobileShellAndroidHostSource(opts)
+    let kvQuote: str = probeCStringLiteral(kv)
+    let jsonQuote: str = probeCStringLiteral(jsonText)
+    return Fmt"""
+    {text}
+    /* probe launch args begin */
+    typedef void (*cheng_mobile_host_runtime_set_launch_args_fn)(const char*, const char*);
+    static const char* kChengLaunchArgsKv = {kvQuote};
+    static const char* kChengLaunchArgsJson = {jsonQuote};
+    /* probe launch args end */
+
+    """
 
 fn probeIosAugmentedHostSource(opts: var mshell.MobileShellOptions,
                                kv: str,
-                               json: str): str =
-    var text: str = mshell.MobileShellIosViewControllerImpl(opts)
-    text = strutil.Join([text, "\n/* probe launch args begin */\n"], "")
-    text = strutil.Join([text, "typedef void (*cheng_mobile_host_runtime_set_launch_args_fn)(const char*, const char*);\n"], "")
-    text = strutil.Join([text, "static const char* kChengLaunchArgsKv = ", probeQuote(kv), ";\n"], "")
-    text = strutil.Join([text, "static const char* kChengLaunchArgsJson = ", probeQuote(json), ";\n"], "")
-    text = strutil.Join([text, "/* probe launch args end */\n"], "")
-    return text
+                               jsonText: str): str =
+    let text: str = mshell.MobileShellIosViewControllerImpl(opts)
+    let kvQuote: str = probeCStringLiteral(kv)
+    let jsonQuote: str = probeCStringLiteral(jsonText)
+    return Fmt"""
+    {text}
+    /* probe launch args begin */
+    typedef void (*cheng_mobile_host_runtime_set_launch_args_fn)(const char*, const char*);
+    static const char* kChengLaunchArgsKv = {kvQuote};
+    static const char* kChengLaunchArgsJson = {jsonQuote};
+    /* probe launch args end */
+
+    """
 
 fn probeHarmonyAugmentedHostSource(opts: var mshell.MobileShellOptions,
                                    kv: str,
-                                   json: str): str =
-    var text: str = mshell.MobileShellHarmonyHostSource(opts)
-    text = strutil.Join([text, "\n/* probe launch args begin */\n"], "")
-    text = strutil.Join([text, "typedef void (*cheng_mobile_host_runtime_set_launch_args_fn)(const char*, const char*);\n"], "")
-    text = strutil.Join([text, "static const char* kChengLaunchArgsKv = ", probeQuote(kv), ";\n"], "")
-    text = strutil.Join([text, "static const char* kChengLaunchArgsJson = ", probeQuote(json), ";\n"], "")
-    text = strutil.Join([text, "/* probe launch args end */\n"], "")
-    return text
+                                   jsonText: str): str =
+    let text: str = mshell.MobileShellHarmonyHostSource(opts)
+    let kvQuote: str = probeCStringLiteral(kv)
+    let jsonQuote: str = probeCStringLiteral(jsonText)
+    return Fmt"""
+    {text}
+    /* probe launch args begin */
+    typedef void (*cheng_mobile_host_runtime_set_launch_args_fn)(const char*, const char*);
+    static const char* kChengLaunchArgsKv = {kvQuote};
+    static const char* kChengLaunchArgsJson = {jsonQuote};
+    /* probe launch args end */
+
+    """
 
 fn writeProbeFile(path: str, text: str) =
     os.WriteFile(path, text)
@@ -73,7 +98,7 @@ fn writeProbeFile(path: str, text: str) =
 fn main(): int32 =
     let root: str = os.GetCurrentDir()
     let stamp: str = int64ToStr(monotimes.MonoTimeNs(monotimes.GetMonoTime()))
-    let outDir: str = strutil.Join(["/tmp/cheng_mobile_shell_launch_args_probe_", stamp], "")
+    let outDir: str = Fmt"/tmp/cheng_mobile_shell_launch_args_probe_{stamp}"
     assert(chengpath.MkdirP(root, outDir), "mobile shell launch args probe: mkdir")
     var opts: mshell.MobileShellOptions = mshell.MobileShellDefaultOptions(root)
     opts.outDir = outDir
@@ -83,14 +108,14 @@ fn main(): int32 =
     opts.runtimeMode = "r2c_native_gui_v1"
     opts.routeState = "home_default"
     let kv: str = probeLaunchArgsKv(opts.routeState)
-    let json: str = probeLaunchArgsJson(opts.routeState)
+    let jsonText: str = probeLaunchArgsJson(opts.routeState)
     assert(strings.StrContains(kv, "route_state=home_default"),
            "mobile shell launch args probe: kv route")
-    assert(strings.StrContains(json, "\"route_state\": \"home_default\""),
+    assert(strings.StrContains(jsonText, "\"route_state\":\"home_default\""),
            "mobile shell launch args probe: json route")
-    let androidText: str = probeAndroidAugmentedHostSource(opts, kv, json)
-    let iosText: str = probeIosAugmentedHostSource(opts, kv, json)
-    let harmonyText: str = probeHarmonyAugmentedHostSource(opts, kv, json)
+    let androidText: str = probeAndroidAugmentedHostSource(opts, kv, jsonText)
+    let iosText: str = probeIosAugmentedHostSource(opts, kv, jsonText)
+    let harmonyText: str = probeHarmonyAugmentedHostSource(opts, kv, jsonText)
     assert(strings.StrContains(androidText, "kChengLaunchArgsKv"),
            "mobile shell launch args probe: android launch args symbol")
     assert(strings.StrContains(iosText, "kChengLaunchArgsJson"),
@@ -98,7 +123,7 @@ fn main(): int32 =
     assert(strings.StrContains(harmonyText, "route_state=home_default"),
            "mobile shell launch args probe: harmony route text")
     writeProbeFile(os.JoinPath(outDir, "launch_args.kv.txt"), kv)
-    writeProbeFile(os.JoinPath(outDir, "launch_args.json"), json)
+    writeProbeFile(os.JoinPath(outDir, "launch_args.json"), jsonText)
     writeProbeFile(os.JoinPath(outDir, "android_host_with_launch_args.c"), androidText)
     writeProbeFile(os.JoinPath(outDir, "ios_host_with_launch_args.m"), iosText)
     writeProbeFile(os.JoinPath(outDir, "harmony_host_with_launch_args.cpp"), harmonyText)

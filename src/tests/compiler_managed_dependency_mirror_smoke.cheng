@@ -21,6 +21,25 @@ fn compilerManagedMirrorSmokePortBase(label: str): int32 =
         acc = (acc + (int32(label[i]) & 255)) % 200
     return 6761 + (acc * 2)
 
+fn compilerManagedMirrorRemoveTree(path: str): bool =
+    if os.FileExists(path):
+        return os.RemoveFile(path)
+    if !os.DirExists(path):
+        return true
+    let entries = os.WalkDir(path)
+    for i in 0..<entries.len:
+        let entry = os.WalkDirEntry(entries, i)
+        let child = os.WalkDirEntryPath(entry)
+        let kind = os.WalkDirEntryKind(entry)
+        if kind == os.PcDir || kind == os.PcLinkToDir:
+            if !compilerManagedMirrorRemoveTree(child):
+                return false
+        elif kind == os.PcFile || kind == os.PcLinkToFile:
+            if !os.RemoveFile(child):
+                return false
+    os.RemoveDir(path)
+    return !os.DirExists(path)
+
 fn main(): int32 =
     let root = chengpath.PathCurrentDir()
     let outDir = "artifacts/compiler_managed_dependency_mirror"
@@ -114,7 +133,7 @@ fn main(): int32 =
     assert(IsOk(bundlesRes), " managed mirror smoke: collect mirror bundles")
     let bundles = Value(bundlesRes)
     assert(bundles.len == 1, " managed mirror smoke: bundle count")
-    assert(os.ExecCmdStatus(strutil.Join(["rm -rf ", os.QuoteShell(mirrorRoot)], ""), "") == 0,
+    assert(compilerManagedMirrorRemoveTree(mirrorRoot),
            " managed mirror smoke: remove local mirror")
     let missingMirrorPlanRes = sexec.BuildSystemLinkExecPlanWithWorldAndChannel(root,
                                                                                   req,
@@ -185,7 +204,7 @@ fn main(): int32 =
                                                                                    "",
                                                                                    "stable")
     assert(IsOk(offlineRebuildPlanRes), " managed mirror smoke: rebuilt after offline bundle materialize")
-    assert(os.ExecCmdStatus(strutil.Join(["rm -rf ", os.QuoteShell(mirrorRoot)], ""), "") == 0,
+    assert(compilerManagedMirrorRemoveTree(mirrorRoot),
            " managed mirror smoke: remove offline-restored mirror")
     let smokeLabel: str = os.GetEnvDefault("CHENG_SMOKE_LABEL", "host")
     let portBase: int32 = compilerManagedMirrorSmokePortBase(smokeLabel)

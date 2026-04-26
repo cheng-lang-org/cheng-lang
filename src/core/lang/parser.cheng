@@ -5,7 +5,6 @@ import std/rawbytes
 import std/rawmem_support
 import std/system
 import cheng/core/tooling/path as chengpath
-import cheng/core/tooling/root_discovery as rootdisco
 import std/strutils as strutil
 
 type
@@ -388,10 +387,10 @@ fn NormalizedExprLookupInit(minCap: int32): NormalizedExprLookup =
     var cap: int32 = 32
     while cap < minCap:
         cap = cap * 2
-    var i: int32
-    while i < cap:
+    for i in 0..<cap:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
         add(lookup.slots, 0)
-        i = i + 1
     return lookup
 
 fn NormalizedExprLookupDetailKind(kind: NormalizedExprKind,
@@ -476,13 +475,14 @@ fn NormalizedExprLookupSlotForKey(lookup: NormalizedExprLookup,
 fn NormalizedExprLookupRehash(lookup: var NormalizedExprLookup,
                                 newCap: int32) =
     var slots: int32[]
-    var i: int32
-    while i < newCap:
+    for i in 0..<newCap:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
         add(slots, 0)
-        i = i + 1
     lookup.slots = slots
-    var bucketIndex: int32
-    while bucketIndex < lookup.buckets.len:
+    for bucketIndex in 0..<lookup.buckets.len:
+        if bucketIndex % 4096 == 0:
+            os.ProcessResourceGuardCheck()
         let bucket = lookup.buckets[bucketIndex]
         var key: NormalizedExprLookupKey
         key.sourcePathLen = bucket.sourcePathLen
@@ -498,7 +498,6 @@ fn NormalizedExprLookupRehash(lookup: var NormalizedExprLookup,
         let slot = NormalizedExprLookupSlotForKey(lookup, key)
         if slot >= 0:
             lookup.slots[slot] = bucketIndex + 1
-        bucketIndex = bucketIndex + 1
 
 fn NormalizedExprLookupGrow(lookup: var NormalizedExprLookup) =
     var nextCap: int32 = lookup.slots.len * 2
@@ -687,6 +686,166 @@ fn ParserConcat4(a: str, b: str, c: str, d: str): str =
 
 fn ParserOwnedText(text: str): str =
     return newStringCopy(strDataPtr(text), strLenFast(text))
+
+fn ParserLineWithoutTrailingCr(lineRaw: str): str =
+    if lineRaw.len <= 0:
+        return lineRaw
+    if int32(lineRaw[lineRaw.len - 1]) == 13:
+        return ParserTextSliceFast(lineRaw, 0, lineRaw.len - 1)
+    return lineRaw
+
+fn ParserOnlyInlineSpaces(text: str,
+                            startRaw: int32,
+                            stopRaw: int32): bool =
+    var start = startRaw
+    if start < 0:
+        start = 0
+    var stop = stopRaw
+    if stop > text.len:
+        stop = text.len
+    if stop < start:
+        return false
+    var i = start
+    while i < stop:
+        if !ParserIsInlineSpace(text[i]):
+            return false
+        i = i + 1
+    return true
+
+fn ParserFindMultilineStringOpenOnLine(lineRaw: str): int32 =
+    var inString = false
+    var inChar = false
+    var i: int32
+    while i < lineRaw.len:
+        let ch = lineRaw[i]
+        if !inString && !inChar && ch == char(35):
+            return -1
+        if !inChar && ch == char(34) && !ParserQuoteIsEscaped(lineRaw, i):
+            if !inString &&
+               i + 2 < lineRaw.len &&
+               lineRaw[i + 1] == char(34) &&
+               lineRaw[i + 2] == char(34):
+                return i
+            inString = !inString
+            i = i + 1
+            continue
+        if !inString && ch == char(39) && !ParserQuoteIsEscaped(lineRaw, i):
+            inChar = !inChar
+            i = i + 1
+            continue
+        i = i + 1
+    return -1
+
+fn ParserLineIsMultilineStringClose(lineRaw: str,
+                                      indentOut: var str): bool =
+    indentOut = ""
+    var start: int32
+    var stop: int32
+    if !ParserTrimmedLineRange(lineRaw, start, stop):
+        return false
+    if stop - start != 3:
+        return false
+    if !ParserTextRangeEquals(lineRaw, start, 3, "\"\"\""):
+        return false
+    indentOut = ParserTextSliceFast(lineRaw, 0, start)
+    return true
+
+fn ParserAppendShortStringEscaped(out: var buffer.ByteBuffer,
+                                    text: str) =
+    for i in 0..<text.len:
+        let ch = text[i]
+        if ch == char(34):
+            buffer.appendByte(out, 92)
+            buffer.appendByte(out, 34)
+        elif ch == '\\':
+            buffer.appendByte(out, 92)
+            buffer.appendByte(out, 92)
+        elif int32(ch) == 10:
+            buffer.appendByte(out, 92)
+            buffer.appendByte(out, 110)
+        elif int32(ch) == 13:
+            buffer.appendByte(out, 92)
+            buffer.appendByte(out, 110)
+        elif int32(ch) == 9:
+            buffer.appendByte(out, 92)
+            buffer.appendByte(out, 116)
+        else:
+            buffer.AppendBytes(out, ParserTextSliceFast(text, i, 1))
+
+fn ParserRewriteMultilineStringSourceText(textRaw: str,
+                                            rewrittenOut: var str,
+                                            err: var str): bool =
+    let lines = ParserSplitChar(textRaw, '\n')
+    var out = buffer.NewByteBuffer()
+    var i: int32
+    while i < lines.len:
+        let line = ParserLineWithoutTrailingCr(lines[i])
+        let openPos = ParserFindMultilineStringOpenOnLine(line)
+        if openPos < 0:
+            buffer.AppendBytes(out, line)
+            if i + 1 < lines.len:
+                buffer.appendByte(out, 10)
+            i = i + 1
+            continue
+        if !ParserOnlyInlineSpaces(line, openPos + 3, line.len):
+            err = ParserConcat3("multiline string opener must be followed by a newline at line ",
+                                intToStr(i + 1),
+                                "")
+            return false
+        var closeIndex = i + 1
+        var closeIndent = ""
+        var foundClose = false
+        while closeIndex < lines.len:
+            let closeLine = ParserLineWithoutTrailingCr(lines[closeIndex])
+            if ParserLineIsMultilineStringClose(closeLine, closeIndent):
+                foundClose = true
+                break
+            closeIndex = closeIndex + 1
+        if !foundClose:
+            err = ParserConcat3("unterminated multiline string starting at line ",
+                                intToStr(i + 1),
+                                "")
+            return false
+        buffer.AppendBytes(out, ParserTextSliceFast(line, 0, openPos))
+        buffer.appendByte(out, 34)
+        var bodyIndex = i + 1
+        while bodyIndex < closeIndex:
+            let bodyLine = ParserLineWithoutTrailingCr(lines[bodyIndex])
+            var bodyText = ""
+            if ParserHasNonTrimChar(bodyLine):
+                if closeIndent != "" && !ParserTextEqualsAt(bodyLine, 0, closeIndent):
+                    err = ParserConcat3("multiline string body indentation is shallower than closing delimiter at line ",
+                                        intToStr(bodyIndex + 1),
+                                        "")
+                    return false
+                bodyText = ParserTextSliceFast(bodyLine,
+                                                closeIndent.len,
+                                                bodyLine.len - closeIndent.len)
+            ParserAppendShortStringEscaped(out, bodyText)
+            if bodyIndex + 1 < closeIndex:
+                buffer.appendByte(out, 92)
+                buffer.appendByte(out, 110)
+            bodyIndex = bodyIndex + 1
+        buffer.appendByte(out, 34)
+        var newlineCount = closeIndex - i
+        if closeIndex + 1 < lines.len:
+            newlineCount = newlineCount + 1
+        for _ in 0..<newlineCount:
+            buffer.appendByte(out, 10)
+        i = closeIndex + 1
+    rewrittenOut = rawbytes.bytesToString(buffer.ToBytes(out))
+    err = ""
+    return true
+
+fn ParserSourceHasMultilineString(textRaw: str): bool =
+    if textRaw.len < 3:
+        return false
+    for i in 0..<(textRaw.len - 2):
+        if textRaw[i] == char(34) &&
+           textRaw[i + 1] == char(34) &&
+           textRaw[i + 2] == char(34):
+            return true
+    return false
 
 fn ParserWriteTextFast(outPtr: ptr,
                          writePos: var int32,
@@ -4066,7 +4225,12 @@ fn ParserMaxQualifiedCallDepthLines(lines: str[]): int32 =
     return maxDepth
 
 fn ParserMaxQualifiedCallDepth(text: str): int32 =
-    let lines = ParserPrepareCodeLines(ParserSplitChar(text, '\n'))
+    var normalizedText = text
+    if ParserSourceHasMultilineString(text):
+        var err = ""
+        if !ParserRewriteMultilineStringSourceText(text, normalizedText, err):
+            return 0
+    let lines = ParserPrepareCodeLines(ParserSplitChar(normalizedText, '\n'))
     return ParserMaxQualifiedCallDepthLines(lines)
 
 fn ParserAppendComprehensionExprsLine(sourcePath: str,
@@ -4132,6 +4296,10 @@ fn ParserBuildExprCallProfileWithExternalPackageRoots(workspaceRootRaw: str,
     let workspaceRoot = ParserNormalizePath(workspaceRootRaw)
     let packageRoot = ParserNormalizePath(packageRootRaw)
     let sourcePath = ParserNormalizePath(sourcePathRaw)
+    var normalizedText = text
+    if ParserSourceHasMultilineString(text):
+        if !ParserRewriteMultilineStringSourceText(text, normalizedText, err):
+            return false
     if sourcePath == "":
         err = "missing source path"
         return false
@@ -4140,7 +4308,7 @@ fn ParserBuildExprCallProfileWithExternalPackageRoots(workspaceRootRaw: str,
                                                                                      packageRoot,
                                                                                      externalPackageRoots,
                                                                                      sourcePath)
-    profile.text = text
+    profile.text = normalizedText
     profile.lines = []
     profile.decls = []
     profile.typeDecls = []
@@ -4148,7 +4316,7 @@ fn ParserBuildExprCallProfileWithExternalPackageRoots(workspaceRootRaw: str,
     profile.localCallNames = []
     profile.importEdges = []
     profile.maxQualifiedCallDepth = 0
-    let lines = ParserSplitChar(text, '\n')
+    let lines = ParserSplitChar(normalizedText, '\n')
     profile.lines = lines
     let codeLines = ParserPrepareCodeLines(lines)
     if !ParserReadNormalizedFunctionDeclsLines(lines, profile.decls, err):
@@ -4435,6 +4603,8 @@ fn ParserResolveUnqualifiedExternalCallTarget(currentProfile: NormalizedExprCall
     var pendingIndex: int32
     var found: NormalizedExprResolvedCallTarget[]
     while pendingIndex < pending.len:
+        if pendingIndex % 64 == 0:
+            os.ProcessResourceGuardCheck()
         let workingProfileIndex = pending[pendingIndex]
         pendingIndex = pendingIndex + 1
         let workingProfile = profiles[workingProfileIndex]
@@ -4523,6 +4693,8 @@ fn ParserAppendQualifiedCallNamesExact(out: var str[],
         return
     let prefixWithDot = ParserConcat2(prefix, ".")
     for i in 0..<callNames.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let callName = callNames[i]
         if callName == "":
             continue
@@ -4536,6 +4708,8 @@ fn ParserAppendDirectExternalCallNames(out: var str[],
                                          seen: var ParserTextLookup,
                                          callNames: str[]) =
     for i in 0..<callNames.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let callName = callNames[i]
         if callName == "":
             continue
@@ -4547,6 +4721,8 @@ fn ParserAppendVisibleDirectExternalCallNames(out: var str[],
                                                 localLookup: ParserTextLookup,
                                                 importcLookup: ParserTextLookup) =
     for i in 0..<callNames.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let callName = callNames[i]
         if callName == "":
             continue
@@ -4572,10 +4748,10 @@ fn ParserPrepareCodeLines(lines: str[]): str[] =
 fn ParserBoolSeqInit(count: int32,
                        value: bool): bool[] =
     var out: bool[]
-    var i: int32
-    while i < count:
+    for i in 0..<count:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
         add(out, value)
-        i = i + 1
     return out
 
 fn ParserCollectVisibleUnqualifiedExternalCallNamesRecursive(profiles: NormalizedExprCallProfile[],
@@ -4593,6 +4769,8 @@ fn ParserCollectVisibleUnqualifiedExternalCallNamesRecursive(profiles: Normalize
     add(pending, profileIndex)
     var pendingIndex: int32
     while pendingIndex < pending.len:
+        if pendingIndex % 64 == 0:
+            os.ProcessResourceGuardCheck()
         let currentIndex = pending[pendingIndex]
         pendingIndex = pendingIndex + 1
         let current = profiles[currentIndex]
@@ -4636,8 +4814,11 @@ fn ParserCollectResolvedUnqualifiedExternalTargetsRecursive(profiles: Normalized
     var pending: int32[]
     add(pending, profileIndex)
     var pendingIndex: int32
+    os.ProcessResourceGuardCheck()
     var profileCallLookupCache = ParserBuildProfileCallLookupCache(profiles)
     while pendingIndex < pending.len:
+        if pendingIndex % 64 == 0:
+            os.ProcessResourceGuardCheck()
         let currentIndex = pending[pendingIndex]
         pendingIndex = pendingIndex + 1
         let current = profiles[currentIndex]
@@ -4673,15 +4854,16 @@ fn ParserCachedVisibleUnqualifiedExternalCallNames(profiles: NormalizedExprCallP
                                                      profileIndexLookup: ParserSourcePathIndexLookup,
                                                      profileIndex: int32,
                                                      cache: var ParserTextSeqCacheEntry[]): str[] =
-    var i: int32
-    while i < cache.len:
+    for i in 0..<cache.len:
+        if i % 128 == 0:
+            os.ProcessResourceGuardCheck()
         if cache[i].profileIndex == profileIndex:
             return cache[i].items
-        i = i + 1
     var out: str[]
     if profileIndex < 0 || profileIndex >= profiles.len:
         return out
     let rootProfile = profiles[profileIndex]
+    os.ProcessResourceGuardCheck()
     let rootLocalLookup = ParserTextLookupBuildExact(rootProfile.localCallNames)
     let rootImportcLookup = ParserTextLookupBuildExact(rootProfile.importcCallNames)
     var seen: ParserTextLookup
@@ -4707,11 +4889,11 @@ fn ParserCachedQualifiedExternalCallNames(profiles: NormalizedExprCallProfile[],
                                             prefix: str,
                                             visibleNameCache: var ParserTextSeqCacheEntry[],
                                             cache: var ParserQualifiedTextSeqCacheEntry[]): str[] =
-    var i: int32
-    while i < cache.len:
+    for i in 0..<cache.len:
+        if i % 128 == 0:
+            os.ProcessResourceGuardCheck()
         if cache[i].profileIndex == profileIndex && cache[i].prefix == prefix:
             return cache[i].items
-        i = i + 1
     var out: str[]
     if profileIndex < 0 || profileIndex >= profiles.len:
         return out
@@ -4722,6 +4904,7 @@ fn ParserCachedQualifiedExternalCallNames(profiles: NormalizedExprCallProfile[],
                                                                          profileIndexLookup,
                                                                          profileIndex,
                                                                          visibleNameCache)
+    os.ProcessResourceGuardCheck()
     var seen = ParserTextLookupInit(targetProfile.localCallNames.len +
                                       targetProfile.importcCallNames.len +
                                       visibleNames.len + 8)
@@ -4746,10 +4929,13 @@ fn ParserCollectExternalCallNamesRecursive(profiles: NormalizedExprCallProfile[]
                                              qualifiedNameCache: var ParserQualifiedTextSeqCacheEntry[],
                                              seen: var ParserTextLookup,
                                              out: var str[]) =
+    os.ProcessResourceGuardCheck()
     if profileIndex < 0 || profileIndex >= profiles.len:
         return
     let current = profiles[profileIndex]
     for edgeIndex in 0..<current.importEdges.len:
+        if edgeIndex % 64 == 0:
+            os.ProcessResourceGuardCheck()
         if !current.importEdges[edgeIndex].resolved:
             continue
         let targetProfileIndex = current.importEdges[edgeIndex].targetProfileIndex
@@ -4800,6 +4986,7 @@ fn ParserCollectExternalCallNames(profiles: NormalizedExprCallProfile[],
     seen.buckets = []
     seen.totalCount = 0
     var visibleNameCache: ParserTextSeqCacheEntry[]
+    os.ProcessResourceGuardCheck()
     let visibleNames = ParserCachedVisibleUnqualifiedExternalCallNames(profiles,
                                                                          profileIndexLookup,
                                                                          profileIndex,
@@ -4808,6 +4995,7 @@ fn ParserCollectExternalCallNames(profiles: NormalizedExprCallProfile[],
     var qualifiedNameCache: ParserQualifiedTextSeqCacheEntry[]
     var activeProfileFlags: bool[] = ParserBoolSeqInit(profiles.len, false)
     activeProfileFlags[profileIndex] = true
+    os.ProcessResourceGuardCheck()
     ParserCollectExternalCallNamesRecursive(profiles,
                                               profileIndexLookup,
                                               profileIndex,
@@ -4832,6 +5020,10 @@ fn ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRaw:
                                                                     layer: var NormalizedExprLayer,
                                                                     err: var str): bool =
     let sourcePath = ParserNormalizePath(sourcePathRaw)
+    var normalizedText = text
+    if ParserSourceHasMultilineString(text):
+        if !ParserRewriteMultilineStringSourceText(text, normalizedText, err):
+            return false
     if sourcePath == "":
         err = "missing source path"
         return false
@@ -4847,10 +5039,12 @@ fn ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRaw:
     ParserTextLookupAddAllExact(knownCallLookup, externalCallNames)
     ParserTextLookupAddAllExact(knownCallLookup, importcCallNames)
     var profileCallLookupCache = ParserBuildProfileCallLookupCache(profiles)
-    let codeLines = ParserPrepareCodeLines(ParserSplitChar(text, '\n'))
+    let codeLines = ParserPrepareCodeLines(ParserSplitChar(normalizedText, '\n'))
     var inTypeBlock = false
     var typeBlockIndent: int32 = -1
     for i in 0..<codeLines.len:
+        if i % 128 == 0:
+            os.ProcessResourceGuardCheck()
         let line = codeLines[i]
         if !ParserHasNonTrimChar(line):
             continue
@@ -4950,11 +5144,15 @@ fn ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePathRaw: str,
                                                          externalCallNames: str[],
                                                          layer: var NormalizedExprLayer,
                                                          err: var str): bool =
+    var normalizedText = text
+    if ParserSourceHasMultilineString(text):
+        if !ParserRewriteMultilineStringSourceText(text, normalizedText, err):
+            return false
     var currentProfile: NormalizedExprCallProfile
     currentProfile.sourcePath = ParserNormalizePath(sourcePathRaw)
     currentProfile.ownerModulePath = ""
-    currentProfile.text = text
-    currentProfile.lines = ParserSplitChar(text, '\n')
+    currentProfile.text = normalizedText
+    currentProfile.lines = ParserSplitChar(normalizedText, '\n')
     currentProfile.decls = []
     currentProfile.typeDecls = []
     currentProfile.importcCallNames = ParserCloneTextSeq(importcCallNames)
@@ -4966,7 +5164,7 @@ fn ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePathRaw: str,
     var profiles: NormalizedExprCallProfile[]
     let profileIndexLookup = ParserSourcePathIndexLookupBuild(profiles)
     return ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRaw,
-                                                                            text,
+                                                                            normalizedText,
                                                                             importcCallNames,
                                                                             localCallNames,
                                                                             externalCallNames,
@@ -5074,10 +5272,10 @@ fn ParserTextLookupInit(minCap: int32): ParserTextLookup =
     var cap: int32 = 32
     while cap < minCap:
         cap = cap * 2
-    var i: int32
-    while i < cap:
+    for i in 0..<cap:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
         add(lookup.slots, 0)
-        i = i + 1
     return lookup
 
 fn ParserTextLookupHash(keyLen: int32,
@@ -5135,13 +5333,14 @@ fn ParserTextLookupSlotForKey(lookup: ParserTextLookup,
 fn ParserTextLookupRehash(lookup: var ParserTextLookup,
                             newCap: int32) =
     var slots: int32[]
-    var i: int32
-    while i < newCap:
+    for i in 0..<newCap:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
         add(slots, 0)
-        i = i + 1
     lookup.slots = slots
-    var bucketIndex: int32
-    while bucketIndex < lookup.buckets.len:
+    for bucketIndex in 0..<lookup.buckets.len:
+        if bucketIndex % 4096 == 0:
+            os.ProcessResourceGuardCheck()
         let slot = ParserTextLookupSlotForParts(lookup,
                                                   lookup.buckets[bucketIndex].keyLen,
                                                   lookup.buckets[bucketIndex].firstCode,
@@ -5150,7 +5349,6 @@ fn ParserTextLookupRehash(lookup: var ParserTextLookup,
                                                   lookup.buckets[bucketIndex].textHash)
         if slot >= 0:
             lookup.slots[slot] = bucketIndex + 1
-        bucketIndex = bucketIndex + 1
 
 fn ParserTextLookupGrow(lookup: var ParserTextLookup) =
     var nextCap: int32 = lookup.slots.len * 2
@@ -5238,11 +5436,15 @@ fn ParserTextLookupAdd(lookup: var ParserTextLookup,
 fn ParserTextLookupAddAll(lookup: var ParserTextLookup,
                             items: str[]) =
     for i in 0..<items.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         ParserTextLookupAdd(lookup, items[i])
 
 fn ParserTextLookupAddAllExact(lookup: var ParserTextLookup,
                                  items: str[]) =
     for i in 0..<items.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let value = items[i]
         if value == "":
             continue
@@ -5371,10 +5573,10 @@ fn ParserSourcePathIndexLookupInit(minCap: int32): ParserSourcePathIndexLookup =
     var cap: int32 = 32
     while cap < minCap:
         cap = cap * 2
-    var i: int32
-    while i < cap:
+    for i in 0..<cap:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
         add(lookup.slots, 0)
-        i = i + 1
     return lookup
 
 fn ParserSourcePathIndexLookupSlotForParts(lookup: ParserSourcePathIndexLookup,
@@ -5409,13 +5611,14 @@ fn ParserSourcePathIndexLookupSlotForParts(lookup: ParserSourcePathIndexLookup,
 fn ParserSourcePathIndexLookupRehash(lookup: var ParserSourcePathIndexLookup,
                                        newCap: int32) =
     var slots: int32[]
-    var i: int32
-    while i < newCap:
+    for i in 0..<newCap:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
         add(slots, 0)
-        i = i + 1
     lookup.slots = slots
-    var bucketIndex: int32
-    while bucketIndex < lookup.buckets.len:
+    for bucketIndex in 0..<lookup.buckets.len:
+        if bucketIndex % 4096 == 0:
+            os.ProcessResourceGuardCheck()
         let slot = ParserSourcePathIndexLookupSlotForParts(lookup,
                                                              lookup.buckets[bucketIndex].keyLen,
                                                              lookup.buckets[bucketIndex].firstCode,
@@ -5424,7 +5627,6 @@ fn ParserSourcePathIndexLookupRehash(lookup: var ParserSourcePathIndexLookup,
                                                              lookup.buckets[bucketIndex].sourcePathHash)
         if slot >= 0:
             lookup.slots[slot] = bucketIndex + 1
-        bucketIndex = bucketIndex + 1
 
 fn ParserSourcePathIndexLookupGrow(lookup: var ParserSourcePathIndexLookup) =
     var nextCap: int32 = lookup.slots.len * 2
@@ -5507,6 +5709,8 @@ fn ParserSourcePathIndexLookupInsertExact(lookup: var ParserSourcePathIndexLooku
 fn ParserSourcePathIndexLookupBuild(profiles: NormalizedExprCallProfile[]): ParserSourcePathIndexLookup =
     var lookup = ParserSourcePathIndexLookupInit(profiles.len * 2 + 8)
     for i in 0..<profiles.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         ParserSourcePathIndexLookupInsertExact(lookup,
                                                  ParserNormalizePath(profiles[i].sourcePath),
                                                  i)
@@ -5561,20 +5765,20 @@ fn ParserImportEdgeTargetProfileIndex(edge: ImportEdge,
 
 fn ParserBindImportEdgeTargetProfileIndices(profiles: var NormalizedExprCallProfile[],
                                               profileIndexLookup: ParserSourcePathIndexLookup) =
-    var profileIndex: int32
-    while profileIndex < profiles.len:
+    for profileIndex in 0..<profiles.len:
+        if profileIndex % 256 == 0:
+            os.ProcessResourceGuardCheck()
         var profile = profiles[profileIndex]
-        var edgeIndex: int32
-        while edgeIndex < profile.importEdges.len:
+        for edgeIndex in 0..<profile.importEdges.len:
+            if edgeIndex % 256 == 0:
+                os.ProcessResourceGuardCheck()
             var edge = profile.importEdges[edgeIndex]
             edge.targetProfileIndex = -1
             if edge.resolved:
                 edge.targetProfileIndex = ParserProfileIndexLookupForImportEdgeTargetSourcePath(profileIndexLookup,
                                                                                                   edge)
             profile.importEdges[edgeIndex] = edge
-            edgeIndex = edgeIndex + 1
         profiles[profileIndex] = profile
-        profileIndex = profileIndex + 1
 
 fn ParserProfileIndexLookupForSourcePath(lookup: ParserSourcePathIndexLookup,
                                            sourcePathRaw: str): int32 =
@@ -5590,6 +5794,8 @@ fn ParserBuildProfileCallLookups(profile: NormalizedExprCallProfile): ParserProf
 fn ParserBuildProfileCallLookupCache(profiles: NormalizedExprCallProfile[]): ParserProfileCallLookupCacheEntry[] =
     var out: ParserProfileCallLookupCacheEntry[]
     for i in 0..<profiles.len:
+        if i % 16 == 0:
+            os.ProcessResourceGuardCheck()
         add(out, ParserBuildProfileCallLookups(profiles[i]))
     return out
 
@@ -5599,6 +5805,8 @@ fn ParserProfileCallLookupCacheEnsureIndex(profiles: NormalizedExprCallProfile[]
     if profileIndex < 0 || profileIndex >= profiles.len:
         return -1
     while cache.len <= profileIndex:
+        if cache.len % 256 == 0:
+            os.ProcessResourceGuardCheck()
         var empty: ParserProfileCallLookupCacheEntry
         empty.localLookup.slots = []
         empty.localLookup.buckets = []
@@ -5609,6 +5817,7 @@ fn ParserProfileCallLookupCacheEnsureIndex(profiles: NormalizedExprCallProfile[]
         add(cache, empty)
     if cache[profileIndex].localLookup.slots.len <= 0 &&
        cache[profileIndex].importcLookup.slots.len <= 0:
+        os.ProcessResourceGuardCheck()
         cache[profileIndex] = ParserBuildProfileCallLookups(profiles[profileIndex])
     return profileIndex
 
@@ -6029,6 +6238,8 @@ fn ParserReadNormalizedFunctionDeclsLines(lines: str[],
     var pendingImportc = false
     var pendingExplicitExportName: str
     for i in 0..<lines.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let lineRaw = lines[i]
         var lineStart: int32
         var lineStop: int32
@@ -6087,7 +6298,11 @@ fn ParserReadNormalizedFunctionDeclsLines(lines: str[],
 fn ParserReadNormalizedFunctionDecls(textRaw: str,
                                        decls: var NormalizedFunctionDecl[],
                                        err: var str): bool =
-    let lines = ParserSplitChar(textRaw, '\n')
+    var text = textRaw
+    if ParserSourceHasMultilineString(textRaw):
+        if !ParserRewriteMultilineStringSourceText(textRaw, text, err):
+            return false
+    let lines = ParserSplitChar(text, '\n')
     return ParserReadNormalizedFunctionDeclsLines(lines, decls, err)
 
 fn ParserContainsCompilerPrefix(lineRaw: str): bool =
@@ -6162,9 +6377,6 @@ fn ParserSharedPackageRoot(workspaceRootRaw: str): str =
     if envRoot != "":
         if ParserPackageId(envRoot) == "cheng":
             return envRoot
-    let discoveredRoot = ParserNormalizePath(rootdisco.CompilerRootAuto())
-    if discoveredRoot != "" && ParserPackageId(discoveredRoot) == "cheng":
-        return discoveredRoot
     let workspaceRoot = ParserNormalizePath(workspaceRootRaw)
     if workspaceRoot == "":
         return ""
@@ -6179,10 +6391,6 @@ fn ParserSharedBuiltinSourceRoot(workspaceRootRaw: str): str =
     let envRoot = ParserNormalizePath(os.GetEnv("CHENG_ROOT"))
     if envRoot != "":
         return envRoot
-    let discoveredRoot = ParserNormalizePath(rootdisco.CompilerRootAuto())
-    if discoveredRoot != "" &&
-       os.FileExists(chengpath.PathAbsolute(discoveredRoot, "src/std/system.cheng")):
-        return discoveredRoot
     return ParserNormalizePath(workspaceRootRaw)
 
 fn ParserSharedBuiltinModulePathToSourcePath(sharedSourceRootRaw: str,
@@ -6352,9 +6560,13 @@ fn ParserSourcePathToModulePath(workspaceRootRaw: str, packageRootRaw: str, sour
                                                                   sourcePathRaw)
 
 fn ParserHasCompilerTopLevel(textRaw: str): bool =
-    let lines = ParserSplitChar(textRaw, '\n')
-    var decls: NormalizedFunctionDecl[]
+    var text = textRaw
     var err = ""
+    if ParserSourceHasMultilineString(textRaw):
+        if !ParserRewriteMultilineStringSourceText(textRaw, text, err):
+            return false
+    let lines = ParserSplitChar(text, '\n')
+    var decls: NormalizedFunctionDecl[]
     if ParserReadNormalizedFunctionDeclsLines(lines, decls, err):
         if decls.len > 0:
             return true
@@ -6364,9 +6576,13 @@ fn ParserHasCompilerTopLevel(textRaw: str): bool =
     return false
 
 fn ParserMainFunctionPresent(textRaw: str): bool =
-    let lines = ParserSplitChar(textRaw, '\n')
-    var decls: NormalizedFunctionDecl[]
+    var text = textRaw
     var err = ""
+    if ParserSourceHasMultilineString(textRaw):
+        if !ParserRewriteMultilineStringSourceText(textRaw, text, err):
+            return false
+    let lines = ParserSplitChar(text, '\n')
+    var decls: NormalizedFunctionDecl[]
     if !ParserReadNormalizedFunctionDeclsLines(lines, decls, err):
         return false
     for i in 0..<decls.len:
@@ -6510,6 +6726,8 @@ fn ParserReadImportEdgesLinesWithExternalPackageRoots(workspaceRoot: str,
     let packageId: str = ParserPackageId(packageRoot)
     let packagePrefix: str = ParserConcat2(packageId, "/")
     for i in 0..<lines.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let rawLine = lines[i]
         var importTailStart: int32 = -1
         var importTailStop: int32 = -1
@@ -6617,7 +6835,11 @@ fn ParserReadImportEdgesWithExternalPackageRoots(workspaceRoot: str,
                                                    textRaw: str,
                                                    edges: var ImportEdge[],
                                                    err: var str): bool =
-    let lines = ParserSplitChar(textRaw, '\n')
+    var text = textRaw
+    if ParserSourceHasMultilineString(textRaw):
+        if !ParserRewriteMultilineStringSourceText(textRaw, text, err):
+            return false
+    let lines = ParserSplitChar(text, '\n')
     return ParserReadImportEdgesLinesWithExternalPackageRoots(workspaceRoot,
                                                                 packageRoot,
                                                                 externalPackageRoots,
@@ -6694,9 +6916,14 @@ fn ParserCollectClosureWithExternalPackageRoots(workspaceRoot: str,
         add(ordered, sourcePath)
     var scanPos: int32
     while scanPos < ordered.len:
+        os.ProcessResourceGuardCheck()
         let currentSourcePath = ordered[scanPos]
         scanPos = scanPos + 1
-        let text = ParserOwnedText(chengpath.ReadTextFile("", currentSourcePath))
+        let rawText = ParserOwnedText(chengpath.ReadTextFile("", currentSourcePath))
+        var text = rawText
+        if ParserSourceHasMultilineString(rawText):
+            if !ParserRewriteMultilineStringSourceText(rawText, text, err):
+                return false
         let lines = ParserSplitChar(text, '\n')
         let ownerModulePath = ParserSourcePathToModulePathWithExternalPackageRoots(workspaceRoot,
                                                                                      packageRoot,
@@ -6743,46 +6970,16 @@ fn ParserCollectClosure(workspaceRoot: str,
                                                           unresolved,
                                                           err)
 
-fn ParseOrdinarySourceStubWithExternalPackageRoots(packageRootRaw: str,
-                                                     sourcePathRaw: str,
-                                                     externalPackageRoots: ParserExternalPackageRoot[],
-                                                     parsed: var ParsedSourceStub,
-                                                     err: var str): bool =
-    let packageRoot: str = ParserNormalizePath(packageRootRaw)
-    let sourcePath: str = ParserNormalizePath(sourcePathRaw)
-    if sourcePath == "":
-        err = " parser: missing source path"
-        return false
-    if !ParserSourceExists(sourcePath):
-        err = " parser: source file missing"
-        return false
-    let workspaceRoot: str = ParserWorkspaceRoot(packageRoot)
-    let packageId: str = ParserPackageId(packageRoot)
-    let moduleStem: str = ParserFileStem(sourcePath)
-    let rootText: str = ParserOwnedText(chengpath.ReadTextFile("", sourcePath))
-    if rootText == "":
-        err = " parser: failed to read source"
-        return false
-    var rootDecls: NormalizedFunctionDecl[]
-    if !ParserReadNormalizedFunctionDecls(rootText, rootDecls, err):
-        return false
-    var seen: str[]
-    var ordered: str[]
-    var importEdges: ImportEdge[]
-    var exprLayer = NormalizedExprLayer()
-    var unresolved: int32
-    if !ParserCollectClosureWithExternalPackageRoots(workspaceRoot,
-                                                       packageRoot,
-                                                       externalPackageRoots,
-                                                       sourcePath,
-                                                       seen,
-                                                       ordered,
-                                                       importEdges,
-                                                       unresolved,
-                                                       err):
-        return false
+fn ParserReadNormalizedExprLayerForSourceClosureWithExternalPackageRoots(workspaceRoot: str,
+                                                                           packageRoot: str,
+                                                                           externalPackageRoots: ParserExternalPackageRoot[],
+                                                                           ordered: str[],
+                                                                           exprLayer: var NormalizedExprLayer,
+                                                                           err: var str): bool =
+    exprLayer = NormalizedExprLayer()
     var sourceProfiles: NormalizedExprCallProfile[]
     for i in 0..<ordered.len:
+        os.ProcessResourceGuardCheck()
         let sourceText = ParserOwnedText(chengpath.ReadTextFile("", ordered[i]))
         var profile: NormalizedExprCallProfile
         var profileErr = ""
@@ -6799,6 +6996,7 @@ fn ParseOrdinarySourceStubWithExternalPackageRoots(packageRootRaw: str,
     let profileIndexLookup = ParserSourcePathIndexLookupBuild(sourceProfiles)
     ParserBindImportEdgeTargetProfileIndices(sourceProfiles, profileIndexLookup)
     for i in 0..<sourceProfiles.len:
+        os.ProcessResourceGuardCheck()
         if os.GetEnv("CHENG_TRACE_PARSE_SOURCE") == "1":
             let tracePath = sourceProfiles[i].sourcePath
             echo(strutil.Join(["parse_source ", tracePath], ""))
@@ -6821,6 +7019,60 @@ fn ParseOrdinarySourceStubWithExternalPackageRoots(packageRootRaw: str,
             err = ParserConcat4(" parser: ", sourceProfiles[i].sourcePath, ": ", err)
             return false
         NormalizedExprLayerAdd(exprLayer, sourceExprLayer)
+    err = ""
+    return true
+
+fn ParseOrdinarySourceStubCoreWithExternalPackageRoots(packageRootRaw: str,
+                                                        sourcePathRaw: str,
+                                                        externalPackageRoots: ParserExternalPackageRoot[],
+                                                        buildExprLayer: bool,
+                                                        parsed: var ParsedSourceStub,
+                                                        err: var str): bool =
+    let packageRoot: str = ParserNormalizePath(packageRootRaw)
+    let sourcePath: str = ParserNormalizePath(sourcePathRaw)
+    if sourcePath == "":
+        err = " parser: missing source path"
+        return false
+    if !ParserSourceExists(sourcePath):
+        err = " parser: source file missing"
+        return false
+    let workspaceRoot: str = ParserWorkspaceRoot(packageRoot)
+    let packageId: str = ParserPackageId(packageRoot)
+    let moduleStem: str = ParserFileStem(sourcePath)
+    let rawRootText: str = ParserOwnedText(chengpath.ReadTextFile("", sourcePath))
+    var rootText = rawRootText
+    if ParserSourceHasMultilineString(rawRootText):
+        if !ParserRewriteMultilineStringSourceText(rawRootText, rootText, err):
+            return false
+    if rootText == "":
+        err = " parser: failed to read source"
+        return false
+    var rootDecls: NormalizedFunctionDecl[]
+    if !ParserReadNormalizedFunctionDecls(rootText, rootDecls, err):
+        return false
+    var seen: str[]
+    var ordered: str[]
+    var importEdges: ImportEdge[]
+    var unresolved: int32
+    if !ParserCollectClosureWithExternalPackageRoots(workspaceRoot,
+                                                       packageRoot,
+                                                       externalPackageRoots,
+                                                       sourcePath,
+                                                       seen,
+                                                       ordered,
+                                                       importEdges,
+                                                       unresolved,
+                                                       err):
+        return false
+    var exprLayer = NormalizedExprLayer()
+    if buildExprLayer:
+        if !ParserReadNormalizedExprLayerForSourceClosureWithExternalPackageRoots(workspaceRoot,
+                                                                                   packageRoot,
+                                                                                   externalPackageRoots,
+                                                                                   ordered,
+                                                                                   exprLayer,
+                                                                                   err):
+            return false
     var ownerModulePaths: str[]
     for i in 0..<ordered.len:
         ParserAddUniqueText(ownerModulePaths,
@@ -6850,6 +7102,30 @@ fn ParseOrdinarySourceStubWithExternalPackageRoots(packageRootRaw: str,
     parsed.unresolvedImportCount = unresolved
     err = ""
     return true
+
+fn ParseOrdinarySourceHeaderStubWithExternalPackageRoots(packageRootRaw: str,
+                                                          sourcePathRaw: str,
+                                                          externalPackageRoots: ParserExternalPackageRoot[],
+                                                          parsed: var ParsedSourceStub,
+                                                          err: var str): bool =
+    return ParseOrdinarySourceStubCoreWithExternalPackageRoots(packageRootRaw,
+                                                                sourcePathRaw,
+                                                                externalPackageRoots,
+                                                                false,
+                                                                parsed,
+                                                                err)
+
+fn ParseOrdinarySourceStubWithExternalPackageRoots(packageRootRaw: str,
+                                                     sourcePathRaw: str,
+                                                     externalPackageRoots: ParserExternalPackageRoot[],
+                                                     parsed: var ParsedSourceStub,
+                                                     err: var str): bool =
+    return ParseOrdinarySourceStubCoreWithExternalPackageRoots(packageRootRaw,
+                                                                sourcePathRaw,
+                                                                externalPackageRoots,
+                                                                true,
+                                                                parsed,
+                                                                err)
 
 fn ParseOrdinarySourceStub(packageRootRaw: str,
                              sourcePathRaw: str,

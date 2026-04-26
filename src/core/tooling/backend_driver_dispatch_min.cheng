@@ -1,0 +1,633 @@
+import std/result
+import std/cmdline as cmdline
+import std/os
+import std/strings as strings
+import std/strformat
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/backend/direct_object_emit as direct
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/path as chengpath
+
+type
+    BackendDriverDispatchMinTimeval =
+        tv_sec: int64
+        tv_usec: int64
+
+    BackendDriverDispatchMinRusage =
+        ru_utime: BackendDriverDispatchMinTimeval
+        ru_stime: BackendDriverDispatchMinTimeval
+        ru_maxrss: int64
+        ru_ixrss: int64
+        ru_idrss: int64
+        ru_isrss: int64
+        ru_minflt: int64
+        ru_majflt: int64
+        ru_nswap: int64
+        ru_inblock: int64
+        ru_oublock: int64
+        ru_msgsnd: int64
+        ru_msgrcv: int64
+        ru_nsignals: int64
+        ru_nvcsw: int64
+        ru_nivcsw: int64
+
+@importc("getrusage")
+fn BackendDriverDispatchMinGetrusageBridge(who: int32,
+                                           usage: var BackendDriverDispatchMinRusage): int32
+
+@importc("exit")
+fn BackendDriverDispatchMinExitBridge(code: int32)
+
+@importc("puts")
+fn BackendDriverDispatchMinPutsBridge(line: ptr): int32
+
+const
+    BackendDriverDispatchMinProcessMemoryExceeded = 125
+    BackendDriverDispatchMinRusageSelf = 0
+
+fn BackendDriverDispatchMinPrintErr(text: str) =
+    os.WriteLine(os.GetStderr(), text)
+
+fn BackendDriverDispatchMinEnsureParentDir(rootDir: str,
+                                            pathRaw: str): bool =
+    let parent = chengpath.PathParentDir(chengpath.PathAbsolute(rootDir, pathRaw))
+    if len(parent) <= 0:
+        return true
+    return chengpath.MkdirP(rootDir, parent)
+
+fn BackendDriverDispatchMinWriteReport(rootDir: str,
+                                        reportPath: str,
+                                        reportText: str): bool =
+    if len(reportPath) <= 0:
+        return true
+    if !BackendDriverDispatchMinEnsureParentDir(rootDir, reportPath):
+        return false
+    return chengpath.WriteTextFile(rootDir, reportPath, reportText)
+
+fn BackendDriverDispatchMinAppendLine(out: var str,
+                                       line: str) =
+    if len(out) > 0:
+        out = Fmt"{out}\n"
+    out = Fmt"{out}{line}"
+
+fn BackendDriverDispatchMinParseUnsignedInt64(raw: str): int64 =
+    if len(raw) <= 0:
+        return int64(-1)
+    var value: int64
+    var hadDigit = false
+    var trailingSpace = false
+    for i in 0..<len(raw):
+        let ch = raw[i]
+        if ch >= '0' && ch <= '9':
+            if trailingSpace:
+                return int64(-1)
+            value = value * int64(10) + int64(int32(ch) - int32('0'))
+            hadDigit = true
+        elif ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r':
+            if hadDigit:
+                trailingSpace = true
+        else:
+            return int64(-1)
+    if !hadDigit:
+        return int64(-1)
+    return value
+
+fn BackendDriverDispatchMinDefaultMaxRssBytes(): int64 =
+    return int64(8589934592)
+
+fn BackendDriverDispatchMinConfiguredMaxRssBytes(): int64 =
+    let parentGuardRaw = os.GetEnv("CHENG_PARENT_RSS_GUARD")
+    if strings.Len(parentGuardRaw) > 0:
+        return int64(0)
+    var raw = os.GetEnv("CHENG_PROCESS_MAX_RSS_BYTES")
+    if strings.Len(raw) <= 0:
+        raw = os.GetEnv("CHENG_MAX_RSS_BYTES")
+    if strings.Len(raw) <= 0:
+        return BackendDriverDispatchMinDefaultMaxRssBytes()
+    let parsed = BackendDriverDispatchMinParseUnsignedInt64(raw)
+    if parsed <= int64(0):
+        return int64(-1)
+    return parsed
+
+fn BackendDriverDispatchMinCurrentRssBytes(): int64 =
+    var usage: BackendDriverDispatchMinRusage
+    if BackendDriverDispatchMinGetrusageBridge(BackendDriverDispatchMinRusageSelf, usage) != 0:
+        return int64(-1)
+    if usage.ru_maxrss <= int64(0):
+        return int64(-1)
+    return usage.ru_maxrss
+
+fn BackendDriverDispatchMinMemoryLimitExceededLine(rssBytes: int64,
+                                                    maxRssBytes: int64): str =
+    return Fmt"compile_progress phase=resource_guard status=rss_limit_exceeded rss_bytes={rssBytes} limit_bytes={maxRssBytes}"
+
+fn BackendDriverDispatchMinResourceGuardCheckWithMax(maxRssBytes: int64) =
+    if maxRssBytes == int64(0):
+        return
+    if maxRssBytes < int64(0):
+        BackendDriverDispatchMinPrintErr("compile_progress phase=resource_guard status=invalid_max_rss")
+        BackendDriverDispatchMinExitBridge(2)
+    let rssBytes = BackendDriverDispatchMinCurrentRssBytes()
+    if rssBytes <= int64(0):
+        BackendDriverDispatchMinPrintErr("compile_progress phase=resource_guard status=rss_unavailable")
+        BackendDriverDispatchMinExitBridge(2)
+    if rssBytes > maxRssBytes:
+        BackendDriverDispatchMinPrintErr(BackendDriverDispatchMinMemoryLimitExceededLine(rssBytes, maxRssBytes))
+        BackendDriverDispatchMinExitBridge(BackendDriverDispatchMinProcessMemoryExceeded)
+
+fn BackendDriverDispatchMinProgressResourceGuardCheck() =
+    let maxRssBytes = BackendDriverDispatchMinConfiguredMaxRssBytes()
+    BackendDriverDispatchMinResourceGuardCheckWithMax(maxRssBytes)
+
+fn BackendDriverDispatchMinProgressEnabled(): bool =
+    let raw = os.GetEnv("CHENG_PROGRESS")
+    return len(raw) > 0 && raw != "0" && raw != "false"
+
+fn BackendDriverDispatchMinProgress(phase: str,
+                                     status: str) =
+    BackendDriverDispatchMinProgressResourceGuardCheck()
+    if BackendDriverDispatchMinProgressEnabled():
+        os.WriteLine(os.GetStderr(), Fmt"compile_progress phase={phase} status={status}")
+
+fn BackendDriverDispatchMinUnsupported(reason: str): int32 =
+    BackendDriverDispatchMinPrintErr(reason)
+    return 2
+
+fn BackendDriverDispatchMinCollectArgsFrom(startIndex: int32,
+                                            count: int32): str[] =
+    var out: str[]
+    if startIndex <= 0:
+        return out
+    if count < startIndex:
+        return out
+    for i in startIndex..count:
+        add(out, cmdline.ParamStr(i))
+    return out
+
+fn BackendDriverDispatchMinStatus(): int32 =
+    BackendDriverDispatchMinPutsBridge("cheng")
+    BackendDriverDispatchMinPutsBridge("version=cheng.compiler_runtime.v1")
+    BackendDriverDispatchMinPutsBridge("execution=argv_control_plane")
+    BackendDriverDispatchMinPutsBridge("bootstrap_mode=selfhost")
+    BackendDriverDispatchMinPutsBridge("compiler_entry=src/core/tooling/backend_driver_dispatch_min.cheng")
+    BackendDriverDispatchMinPutsBridge("ordinary_command=system-link-exec")
+    BackendDriverDispatchMinPutsBridge("ordinary_pipeline=canonical_csg_verified_primary_object_codegen_ready")
+    BackendDriverDispatchMinPutsBridge("stage3=artifacts/bootstrap/cheng.stage3")
+    return 0
+
+fn BackendDriverDispatchMinStatusFromCmdline(): int32 =
+    return BackendDriverDispatchMinStatus()
+
+fn BackendDriverDispatchMinPrintBuildPlan(): int32 =
+    BackendDriverDispatchMinPutsBridge("target=arm64-apple-darwin")
+    BackendDriverDispatchMinPutsBridge("linker=system_link")
+    BackendDriverDispatchMinPutsBridge("stage2_compiler=artifacts/bootstrap/cheng.stage2")
+    BackendDriverDispatchMinPutsBridge("entry=src/core/tooling/backend_driver_dispatch_min.cheng")
+    BackendDriverDispatchMinPutsBridge("output=artifacts/backend_driver/cheng")
+    BackendDriverDispatchMinPutsBridge("source[0]=backend_driver_entry_source:src/core/tooling/backend_driver_dispatch_min.cheng")
+    BackendDriverDispatchMinPutsBridge("source[1]=backend_system_link_plan_source:src/core/backend/system_link_plan.cheng")
+    BackendDriverDispatchMinPutsBridge("source[2]=backend_lowering_plan_source:src/core/backend/lowering_plan.cheng")
+    BackendDriverDispatchMinPutsBridge("source[3]=backend_primary_object_plan_source:src/core/backend/primary_object_plan.cheng")
+    BackendDriverDispatchMinPutsBridge("source[4]=backend_direct_object_emit_source:src/core/backend/direct_object_emit.cheng")
+    return 0
+
+fn BackendDriverDispatchMinPrintBuildPlanFromCmdline(): int32 =
+    return BackendDriverDispatchMinPrintBuildPlan()
+
+fn BackendDriverDispatchMinPrintBuildPlanCommandFromCmdline(): int32 =
+    return BackendDriverDispatchMinPrintBuildPlanFromCmdline()
+
+fn BackendDriverDispatchMinHelp(): int32 =
+    BackendDriverDispatchMinPutsBridge("usage: cheng <command> [args]")
+    BackendDriverDispatchMinPutsBridge("core commands: status, print-build-plan, system-link-exec")
+    return 0
+
+fn BackendDriverDispatchMinCurrentCompiler(rootDir: str): str =
+    let raw = cmdline.ProgramName()
+    if len(raw) <= 0:
+        return ""
+    return chengpath.PathAbsolute(rootDir, raw)
+
+fn BackendDriverDispatchMinArtifactsDir(rootDir: str): str =
+    let custom = os.GetEnv("CHENG_VERIFY_EXPORT_VISIBILITY_DIR")
+    if len(custom) > 0:
+        return chengpath.PathAbsolute(rootDir, custom)
+    return chengpath.PathAbsolute(rootDir, "artifacts/forward/verify_export_visibility")
+
+fn BackendDriverDispatchMinEnsureDir(rootDir: str,
+                                      dirPath: str): bool =
+    if chengpath.MkdirP(rootDir, dirPath):
+        return true
+    BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: failed to create dir: {dirPath}")
+    return false
+
+fn BackendDriverDispatchMinWriteManifest(rootDir: str,
+                                          packageRoot: str,
+                                          packageId: str,
+                                          modulePrefix: str): bool =
+    let manifestPath = chengpath.PathJoin(packageRoot, "cheng-package.toml")
+    let manifestText = Fmt"package_id = \"{packageId}\"\nmodule_prefix = \"{modulePrefix}\"\n"
+    if chengpath.WriteTextFile(rootDir, manifestPath, manifestText):
+        return true
+    BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: failed to write manifest: {manifestPath}")
+    return false
+
+fn BackendDriverDispatchMinCompileFixture(rootDir: str,
+                                           compilerPath: str,
+                                           packageRoot: str,
+                                           inputPath: str,
+                                           outPath: str,
+                                           logPath: str,
+                                           outOutput: var str): int32 =
+    let reportPath = Fmt"{outPath}.report.txt"
+    let command = Fmt"CHENG_PARENT_RSS_GUARD=1 CHENG_PROGRESS=1 CHENG_PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(packageRoot)} --in:{os.QuoteShell(inputPath)} --emit:exe --target:arm64-apple-darwin --out:{os.QuoteShell(outPath)} --report-out:{os.QuoteShell(reportPath)}"
+    let run = os.ExecShellCmdEx(command, uint64(1), rootDir)
+    outOutput = os.ExecCmdResultOutput(run)
+    let _ = chengpath.WriteTextFile(rootDir, logPath, outOutput)
+    return os.ExecCmdResultExitCode(run)
+
+fn BackendDriverDispatchMinRunExecutable(rootDir: str,
+                                          exePath: str,
+                                          logPath: str): int32 =
+    let command = os.QuoteShell(exePath)
+    let run = os.ExecShellCmdEx(command, uint64(1), rootDir)
+    let _ = chengpath.WriteTextFile(rootDir, logPath, os.ExecCmdResultOutput(run))
+    return os.ExecCmdResultExitCode(run)
+
+fn BackendDriverDispatchMinCheckNegative(rootDir: str,
+                                          label: str,
+                                          exitCode: int32,
+                                          output: str,
+                                          reportPath: str,
+                                          outputNeedle: str,
+                                          reportNeedle: str): bool =
+    if exitCode == 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: verify-export-visibility unexpected success: {label}")
+        return false
+    if chengpath.TextContains(output, outputNeedle):
+        return true
+    let reportText = chengpath.ReadTextFile(rootDir, reportPath)
+    if chengpath.TextContains(reportText, reportNeedle):
+        return true
+    BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: verify-export-visibility missing diagnostic: {label}")
+    return false
+
+fn BackendDriverDispatchMinVerifyExportPositive(rootDir: str,
+                                                 compilerPath: str): bool =
+    let caseDir = chengpath.PathJoin(BackendDriverDispatchMinArtifactsDir(rootDir), "positive_smoke")
+    if !BackendDriverDispatchMinEnsureDir(rootDir, caseDir):
+        return false
+    let srcPath = chengpath.PathAbsolute(rootDir, "src/tests/export_visibility_smoke.cheng")
+    let outPath = chengpath.PathJoin(caseDir, "export_visibility_smoke")
+    let logPath = chengpath.PathJoin(caseDir, "export_visibility_smoke.compile.log")
+    var output = ""
+    let compileCode = BackendDriverDispatchMinCompileFixture(rootDir,
+                                                              compilerPath,
+                                                              rootDir,
+                                                              srcPath,
+                                                              outPath,
+                                                              logPath,
+                                                              output)
+    if compileCode != 0:
+        BackendDriverDispatchMinPrintErr("backend driver direct: verify-export-visibility positive compile failed")
+        return false
+    let runLogPath = chengpath.PathJoin(caseDir, "export_visibility_smoke.run.log")
+    let runCode = BackendDriverDispatchMinRunExecutable(rootDir, outPath, runLogPath)
+    if runCode != 0:
+        BackendDriverDispatchMinPrintErr("backend driver direct: verify-export-visibility positive run failed")
+        return false
+    os.WriteLine(os.Get_stdout(), "verify-export-visibility export smoke ok")
+    return true
+
+fn BackendDriverDispatchMinVerifyPrivateNegative(rootDir: str,
+                                                  compilerPath: str): bool =
+    let caseDir = chengpath.PathJoin(BackendDriverDispatchMinArtifactsDir(rootDir), "private_symbol")
+    let packageRoot = chengpath.PathJoin(caseDir, "workspace")
+    let helperSrcDir = chengpath.PathJoin(packageRoot, "src/private_helper_pkg")
+    let consumerSrcDir = chengpath.PathJoin(packageRoot, "src/private_consumer_pkg")
+    if !BackendDriverDispatchMinEnsureDir(rootDir, helperSrcDir):
+        return false
+    if !BackendDriverDispatchMinEnsureDir(rootDir, consumerSrcDir):
+        return false
+    if !BackendDriverDispatchMinWriteManifest(rootDir,
+                                               packageRoot,
+                                               "pkg://cheng",
+                                               "cheng"):
+        return false
+    let helperSrcPath = chengpath.PathJoin(helperSrcDir, "helper.cheng")
+    let consumerSrcPath = chengpath.PathJoin(consumerSrcDir, "main.cheng")
+    let importKw = "import"
+    let helperSource = "fn privateFn(): int32 =\n    return 1\n\nfn PublicFn(): int32 =\n    return 2\n"
+    let consumerSource = Fmt"{importKw} cheng/private_helper_pkg/helper as helper\n\nfn main(): int32 =\n    let x = helper.privateFn()\n    return x\n"
+    if !chengpath.WriteTextFile(rootDir, helperSrcPath, helperSource):
+        return false
+    if !chengpath.WriteTextFile(rootDir, consumerSrcPath, consumerSource):
+        return false
+    let outPath = chengpath.PathJoin(caseDir, "private_symbol")
+    let logPath = chengpath.PathJoin(caseDir, "private_symbol.compile.log")
+    let reportPath = Fmt"{outPath}.report.txt"
+    var output = ""
+    let exitCode = BackendDriverDispatchMinCompileFixture(rootDir,
+                                                           compilerPath,
+                                                           packageRoot,
+                                                           consumerSrcPath,
+                                                           outPath,
+                                                           logPath,
+                                                           output)
+    if !BackendDriverDispatchMinCheckNegative(rootDir,
+                                               "private symbol",
+                                               exitCode,
+                                               output,
+                                               reportPath,
+                                               "imported private symbol 'privateFn' is not exported",
+                                               "unknown_qualified_target:helper:privateFn"):
+        return false
+    os.WriteLine(os.Get_stdout(), "verify-export-visibility private symbol ok")
+    return true
+
+fn BackendDriverDispatchMinVerifyStrformatCase(rootDir: str,
+                                                compilerPath: str,
+                                                packageRoot: str,
+                                                caseDir: str,
+                                                stem: str,
+                                                sourceText: str,
+                                                outputNeedle: str,
+                                                reportNeedle: str): bool =
+    let srcDir = chengpath.PathJoin(packageRoot, "src")
+    if !BackendDriverDispatchMinEnsureDir(rootDir, srcDir):
+        return false
+    let srcPath = chengpath.PathJoin(srcDir, Fmt"{stem}.cheng")
+    if !chengpath.WriteTextFile(rootDir, srcPath, sourceText):
+        return false
+    let outPath = chengpath.PathJoin(caseDir, stem)
+    let logPath = chengpath.PathJoin(caseDir, Fmt"{stem}.compile.log")
+    let reportPath = Fmt"{outPath}.report.txt"
+    var output = ""
+    let exitCode = BackendDriverDispatchMinCompileFixture(rootDir,
+                                                           compilerPath,
+                                                           packageRoot,
+                                                           srcPath,
+                                                           outPath,
+                                                           logPath,
+                                                           output)
+    return BackendDriverDispatchMinCheckNegative(rootDir,
+                                                  stem,
+                                                  exitCode,
+                                                  output,
+                                                  reportPath,
+                                                  outputNeedle,
+                                                  reportNeedle)
+
+fn BackendDriverDispatchMinVerifyStrformatNegative(rootDir: str,
+                                                    compilerPath: str): bool =
+    let caseDir = chengpath.PathJoin(BackendDriverDispatchMinArtifactsDir(rootDir), "strformat_private")
+    let packageRoot = chengpath.PathJoin(caseDir, "strformat_negative_pkg")
+    if !BackendDriverDispatchMinWriteManifest(rootDir,
+                                               packageRoot,
+                                               "pkg://cheng/strformat_negative_pkg",
+                                               "strformat_negative_pkg"):
+        return false
+    let importKw = "import"
+    let fmtSource = Fmt"{importKw} std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.fmt(\"bad\")\n    echo(text)\n    return 0\n"
+    if !BackendDriverDispatchMinVerifyStrformatCase(rootDir,
+                                                     compilerPath,
+                                                     packageRoot,
+                                                     caseDir,
+                                                     "fmt_private_main",
+                                                     fmtSource,
+                                                     "imported private symbol 'fmt' is not exported",
+                                                     "unknown_qualified_target:strfmt:fmt"):
+        return false
+    let linesSource = Fmt"{importKw} std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.lines(\"bad\")\n    echo(text)\n    return 0\n"
+    if !BackendDriverDispatchMinVerifyStrformatCase(rootDir,
+                                                     compilerPath,
+                                                     packageRoot,
+                                                     caseDir,
+                                                     "lines_private_main",
+                                                     linesSource,
+                                                     "imported private symbol 'lines' is not exported",
+                                                     "unknown_qualified_target:strfmt:lines"):
+        return false
+    os.WriteLine(os.Get_stdout(), "verify-export-visibility strformat ok")
+    return true
+
+fn BackendDriverDispatchMinVerifyExportVisibility(rootDir: str): int32 =
+    let compilerPath = BackendDriverDispatchMinCurrentCompiler(rootDir)
+    if !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct: missing compiler: {compilerPath}")
+    if !BackendDriverDispatchMinVerifyExportPositive(rootDir, compilerPath):
+        return 1
+    if !BackendDriverDispatchMinVerifyPrivateNegative(rootDir, compilerPath):
+        return 1
+    if !BackendDriverDispatchMinVerifyStrformatNegative(rootDir, compilerPath):
+        return 1
+    os.WriteLine(os.Get_stdout(), "verify-export-visibility ok")
+    return 0
+
+fn BackendDriverDispatchMinVerifyExportVisibilityFromCmdline(): int32 =
+    return 2
+
+fn BackendDriverDispatchMinVerifyExportVisibilityParallelFromCmdline(): int32 =
+    return 2
+
+fn BackendDriverDispatchMinRunSystemLinkExecWithRequest(rootDir: str,
+                                                         reqRes: Result[creq.CompilerRequest]): int32 =
+    if IsErr(reqRes):
+        return BackendDriverDispatchMinUnsupported(Error(reqRes))
+    let reqBase = Value(reqRes)
+    return BackendDriverDispatchMinRunSystemLinkExecConcreteRequest(creq.CompilerRequestRootDir(reqBase), reqBase)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcreteRequest(driverRoot: str,
+                                                             reqBase: creq.CompilerRequest): int32 =
+    let reportPath = creq.CompilerRequestReportPath(reqBase)
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err = ""
+    BackendDriverDispatchMinProgress("system_link_plan", "begin")
+    if !slplan.BuildSystemLinkPlanStub(driverRoot, reqBase, linkPlan, err):
+        let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                    reportPath,
+                                                    Fmt"system_link_exec_runtime_execute=error\nerror={err}\n")
+        return BackendDriverDispatchMinUnsupported(err)
+    BackendDriverDispatchMinProgress("system_link_plan", "done")
+    var loweringPlan: lower.LoweringPlanStub
+    BackendDriverDispatchMinProgress("lowering_plan", "begin")
+    if !lower.BuildLoweringPlanStub(linkPlan, loweringPlan, err):
+        let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                    reportPath,
+                                                    Fmt"system_link_exec_runtime_execute=error\nerror={err}\n")
+        return BackendDriverDispatchMinUnsupported(err)
+    BackendDriverDispatchMinProgress("lowering_plan", "done")
+    BackendDriverDispatchMinProgress("primary_object_plan", "begin")
+    let primaryRes = pobj.BuildPrimaryObjectPlan(linkPlan, loweringPlan)
+    if IsErr(primaryRes):
+        let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                    reportPath,
+                                                    Fmt"system_link_exec_runtime_execute=error\nerror={Error(primaryRes)}\n")
+        return BackendDriverDispatchMinUnsupported(Error(primaryRes))
+    let primaryPlan = Value(primaryRes)
+    BackendDriverDispatchMinProgress("primary_object_plan", "done")
+    if linkPlan.missingReasons.len > 0 ||
+       loweringPlan.missingReasons.len > 0 ||
+       primaryPlan.missingReasons.len > 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: system missing count={intToStr(linkPlan.missingReasons.len)}")
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: lowering missing count={intToStr(loweringPlan.missingReasons.len)}")
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: primary missing count={intToStr(primaryPlan.missingReasons.len)}")
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: primary first_missing_function={primaryPlan.firstMissingFunction}")
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: primary first_missing_body_kind={primaryPlan.firstMissingBodyKind}")
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: primary first_missing_typed_ir_kind={primaryPlan.firstMissingTypedIrKind}")
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: primary first_missing_line_number={intToStr(primaryPlan.firstMissingLineNumber)}")
+        var notReadyReport = ""
+        BackendDriverDispatchMinAppendLine(notReadyReport, "system_link_exec_runtime_execute=0")
+        BackendDriverDispatchMinAppendLine(notReadyReport, "error=plan_not_ready")
+        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"system_missing_count={intToStr(linkPlan.missingReasons.len)}")
+        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"lowering_missing_count={intToStr(loweringPlan.missingReasons.len)}")
+        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_missing_count={intToStr(primaryPlan.missingReasons.len)}")
+        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_function={primaryPlan.firstMissingFunction}")
+        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_body_kind={primaryPlan.firstMissingBodyKind}")
+        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_typed_ir_kind={primaryPlan.firstMissingTypedIrKind}")
+        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_line_number={intToStr(primaryPlan.firstMissingLineNumber)}")
+        let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                    reportPath,
+                                                    Fmt"{notReadyReport}\n")
+        BackendDriverDispatchMinPrintErr("backend driver direct system-link-exec: plan not ready")
+        return 2
+    let browserBridgeObjectPath = slplan.SystemLinkPlanBrowserBridgeObjectPath(linkPlan)
+    if len(browserBridgeObjectPath) > 0:
+        return BackendDriverDispatchMinUnsupported("backend driver direct system-link-exec: browser bridge object not yet in direct runtime")
+    if linkPlan.emitKind == creq.EmitObj:
+        if !direct.DirectObjectEmitCanPlanObject(primaryPlan):
+            let validRes = direct.DirectObjectEmitValidatePlanObject(primaryPlan)
+            var reason = "backend driver direct system-link-exec: object direct emit not ready"
+            if IsErr(validRes):
+                reason = Error(validRes)
+            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                        reportPath,
+                                                        Fmt"system_link_exec_runtime_execute=0\nerror={reason}\n")
+            return BackendDriverDispatchMinUnsupported(reason)
+        BackendDriverDispatchMinProgress("direct_object_emit", "begin")
+        let objectRes = direct.DirectObjectEmitPlanObject(driverRoot, primaryPlan)
+        if IsErr(objectRes):
+            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                        reportPath,
+                                                        Fmt"system_link_exec_runtime_execute=error\nerror={Error(objectRes)}\n")
+            return BackendDriverDispatchMinUnsupported(Error(objectRes))
+        let object = Value(objectRes)
+        BackendDriverDispatchMinProgress("direct_object_emit", "done")
+        var objectReport = ""
+        BackendDriverDispatchMinAppendLine(objectReport, "system_link_exec_runtime_execute=1")
+        BackendDriverDispatchMinAppendLine(objectReport, "system_link_exec_runtime_standalone_no_runtime=0")
+        BackendDriverDispatchMinAppendLine(objectReport, "system_link_exec_runtime_standalone_direct_entry=0")
+        BackendDriverDispatchMinAppendLine(objectReport, Fmt"primary_object={object.objectPath}")
+        BackendDriverDispatchMinAppendLine(objectReport, "provider_object_count=0")
+        BackendDriverDispatchMinAppendLine(objectReport, "native_link_log=-")
+        BackendDriverDispatchMinAppendLine(objectReport, "line_map=-")
+        BackendDriverDispatchMinAppendLine(objectReport, "primary_object_direct=1")
+        BackendDriverDispatchMinAppendLine(objectReport, Fmt"direct_object_bytes={intToStr(object.bytesWritten)}")
+        BackendDriverDispatchMinAppendLine(objectReport, Fmt"direct_object_symbol_count={intToStr(object.symbolCount)}")
+        BackendDriverDispatchMinAppendLine(objectReport, Fmt"direct_object_reloc_count={intToStr(object.relocCount)}")
+        if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, objectReport):
+            return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
+        return 0
+    if linkPlan.emitKind == creq.EmitExe:
+        if !direct.DirectObjectEmitCanStandaloneMain(primaryPlan):
+            let validRes = direct.DirectObjectEmitValidateStandaloneMain(primaryPlan)
+            var reason = "backend driver direct system-link-exec: non-standalone runtime path not ready"
+            if IsErr(validRes):
+                reason = Error(validRes)
+            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                        reportPath,
+                                                        Fmt"system_link_exec_runtime_execute=0\nerror={reason}\n")
+            return BackendDriverDispatchMinUnsupported(reason)
+        BackendDriverDispatchMinProgress("direct_object_emit", "begin")
+        let objectRes = direct.DirectObjectEmitStandaloneMain(driverRoot, primaryPlan)
+        if IsErr(objectRes):
+            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                        reportPath,
+                                                        Fmt"system_link_exec_runtime_execute=error\nerror={Error(objectRes)}\n")
+            return BackendDriverDispatchMinUnsupported(Error(objectRes))
+        let object = Value(objectRes)
+        BackendDriverDispatchMinProgress("direct_object_emit", "done")
+        let nativeLinkLogPath = Fmt"{linkPlan.outputPath}.native_link.log"
+        let objectPath = chengpath.PathAbsolute(driverRoot, object.objectPath)
+        let outputPath = chengpath.PathAbsolute(driverRoot, linkPlan.outputPath)
+        let nativeCommand = Fmt"cc -arch arm64 {os.QuoteShell(objectPath)} -o {os.QuoteShell(outputPath)}"
+        BackendDriverDispatchMinProgress("native_link", "begin")
+        let nativeRun = os.ExecShellCmdEx(nativeCommand, uint64(1), driverRoot)
+        BackendDriverDispatchMinProgress("native_link", "done")
+        let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                    nativeLinkLogPath,
+                                                    os.ExecCmdResultOutput(nativeRun))
+        if os.ExecCmdResultExitCode(nativeRun) != 0:
+            let reason = Fmt"backend driver direct system-link-exec: native link failed rc={intToStr(os.ExecCmdResultExitCode(nativeRun))} log={nativeLinkLogPath}"
+            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                        reportPath,
+                                                        Fmt"system_link_exec_runtime_execute=error\nerror={reason}\n")
+            return BackendDriverDispatchMinUnsupported(reason)
+        var exeReport = ""
+        BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_execute=1")
+        BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_no_runtime=1")
+        BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_direct_entry=1")
+        BackendDriverDispatchMinAppendLine(exeReport, Fmt"primary_object={object.objectPath}")
+        BackendDriverDispatchMinAppendLine(exeReport, "provider_object_count=0")
+        BackendDriverDispatchMinAppendLine(exeReport, Fmt"native_link_log={nativeLinkLogPath}")
+        BackendDriverDispatchMinAppendLine(exeReport, "line_map=-")
+        BackendDriverDispatchMinAppendLine(exeReport, "primary_object_direct=1")
+        BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_bytes={intToStr(object.bytesWritten)}")
+        BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_symbol_count={intToStr(object.symbolCount)}")
+        BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_reloc_count={intToStr(object.relocCount)}")
+        if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, exeReport):
+            return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
+        return 0
+    let reason = Fmt"backend driver direct system-link-exec: unsupported emit kind: {creq.CompilerEmitText(linkPlan.emitKind)}"
+    let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                reportPath,
+                                                Fmt"system_link_exec_runtime_execute=0\nerror={reason}\n")
+    return BackendDriverDispatchMinUnsupported(reason)
+
+fn BackendDriverDispatchMinRunSystemLinkExec(rootDir: str,
+                                              args: str[]): int32 =
+    let reqRes: Result[creq.CompilerRequest] = creq.CompilerRequestFromArgs(rootDir, args)
+    return BackendDriverDispatchMinRunSystemLinkExecWithRequest(rootDir, reqRes)
+
+fn BackendDriverDispatchMinRunSystemLinkExecFromCmdlineCount(rootDir: str,
+                                                              count: int32): int32 =
+    let args = BackendDriverDispatchMinCollectArgsFrom(2, count)
+    return BackendDriverDispatchMinRunSystemLinkExec(rootDir, args)
+
+fn BackendDriverDispatchMinRunSystemLinkExecFromCmdline(rootDir: str): int32 =
+    let count = cmdline.ParamCount()
+    return BackendDriverDispatchMinRunSystemLinkExecFromCmdlineCount(rootDir, count)
+
+fn BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline(): int32 =
+    let rootDir = chengpath.PathCurrentDir()
+    return BackendDriverDispatchMinRunSystemLinkExecFromCmdline(rootDir)
+
+fn BackendDriverDispatchMinRunCommandWithCmd(cmd: str): int32 =
+    if cmd == "help" || cmd == "-h" || cmd == "--help":
+        return BackendDriverDispatchMinHelp()
+    if cmd == "status":
+        return BackendDriverDispatchMinStatusFromCmdline()
+    if cmd == "print-build-plan":
+        return BackendDriverDispatchMinPrintBuildPlanCommandFromCmdline()
+    if cmd == "verify-export-visibility":
+        return BackendDriverDispatchMinVerifyExportVisibilityFromCmdline()
+    if cmd == "verify-export-visibility-parallel":
+        return BackendDriverDispatchMinVerifyExportVisibilityParallelFromCmdline()
+    if cmd == "system-link-exec":
+        return BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline()
+    return 2
+
+fn BackendDriverDispatchMinRunCommand(): int32 =
+    let cmd = cmdline.ParamStr(1)
+    return BackendDriverDispatchMinRunCommandWithCmd(cmd)
+
+fn BackendDriverDispatchMinRun(): int32 =
+    let count = cmdline.ParamCount()
+    if count <= 0:
+        return 0
+    return BackendDriverDispatchMinRunCommand()
+
+fn main(argc: int32, argv: str*): int32 =
+    return BackendDriverDispatchMinRun()

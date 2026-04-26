@@ -51,6 +51,29 @@ type
     File = ptr
 
 type
+    OsTimeval =
+        tv_sec: int64
+        tv_usec: int64
+
+    OsRusage =
+        ru_utime: OsTimeval
+        ru_stime: OsTimeval
+        ru_maxrss: int64
+        ru_ixrss: int64
+        ru_idrss: int64
+        ru_isrss: int64
+        ru_minflt: int64
+        ru_majflt: int64
+        ru_nswap: int64
+        ru_inblock: int64
+        ru_oublock: int64
+        ru_msgsnd: int64
+        ru_msgrcv: int64
+        ru_nsignals: int64
+        ru_nvcsw: int64
+        ru_nivcsw: int64
+
+type
     FileMode = enum
         fmRead
         fmWrite
@@ -73,7 +96,8 @@ const osOpenReadOnly: int32 = 0
 const osOpenCreate: int32 = 0x0200
 const osOpenTrunc: int32 = 0x0400
 const osFileMode0644: int32 = 420
-importc fn cheng_fopen(filename, mode: cstring): File
+@importc("cheng_host_fopen")
+fn cheng_fopen(filename, mode: cstring): File
 fn c_fopen(filename, mode: cstring): File =
     let f: File = cheng_fopen(filename, mode)
     return f
@@ -86,7 +110,8 @@ fn c_fread(ptr: ptr, size, n: int64, stream: File): int32 =
 importc fn cheng_fwrite(ptr: ptr, size, n: int64, stream: File): int32
 fn c_fwrite(ptr: ptr, size, n: int64, stream: File): int32 =
     return cheng_fwrite(ptr, size, n, stream)
-importc fn cheng_fflush(stream: File): int32
+@importc("cheng_host_fflush")
+fn cheng_fflush(stream: File): int32
 fn c_fflush(stream: File): int32 =
     return cheng_fflush(stream)
 importc fn cheng_fgetc(stream: File): int32
@@ -144,6 +169,10 @@ importc fn libc_write(fd: int32, data: ptr, n: int64): int64
 @importc("read")
 fn libc_read(fd: int32, data: ptr, n: int64): int64
 importc fn libc_close(fd: int32): int32
+@importc("getrusage")
+fn os_getrusage_bridge(who: int32, usage: var OsRusage): int32
+@importc("exit")
+fn os_exit_bridge(code: int32)
 @importc("cheng_exec_cmd_capture")
 fn cheng_exec_cmd_capture_raw(command: cstring, workingDir: cstring, mergeStderr: int32): cstring
 @importc("cheng_exec_cmd_last_exit_code")
@@ -400,8 +429,7 @@ fn readAll(f: File): str =
     return out
 
 fn write(f: File, s: str) =
-    let wrote: int32 = c_fwrite(strDataPtr(s), 1, strings.Len(s), f)
-    ioMeterReport(ioWrite, int64(wrote))
+    osWriteAllRaw(f, strDataPtr(s), strings.Len(s), "write")
 
 fn writeLine(f: File, s: str) =
     write(f, s)
@@ -533,10 +561,8 @@ fn commandLineParams(): str[] =
     var out: str[]
     if count > 0:
         setLen(out, count)
-        var i: int32 = 1
-        while i <= count:
+        for i in 1..count:
             out[i - 1] = cmdline.ParamStr(i)
-            i = i + 1
     return osReturnStrSeq(out)
 fn quoteShell(value: str): str =
     if len(value) == 0:
@@ -567,9 +593,15 @@ fn joinPath(a: str, b: str): str =
         hasSep = true
     if last == '\\':
         hasSep = true
+    var result: str
     if !hasSep:
-        return strings.ConcatStr(strings.ConcatStr(a, "/"), b)
-    return strings.ConcatStr(a, b)
+        result = strutil.Join([a, "/", b], "")
+    else:
+        result = strutil.Join([a, b], "")
+    # Reject path traversal: "../" segments and trailing ".."
+    if StrContains(result, "/../") || strings.HasSuffix(result, "/.."):
+        return ""
+    return result
 fn `/`(a: str, b: str): str =
     return joinPath(a, b)
 
@@ -702,7 +734,7 @@ fn copyDir(src: str, dest: str) =
     dest
 fn makeWalkDirEntry(kind: PathComponent, path: str): str =
     let kindText: str = strings.IntToStr(int32(kind))
-    return strings.ConcatStr(strings.ConcatStr(kindText, "|"), path)
+    return strutil.Join([kindText, "|", path], "")
 fn listDir(path: str): str[] =
     var out: str[]
     if len(path) == 0 || path[0] == char(0) || !dirExists(path):
@@ -812,6 +844,12 @@ fn getLastModificationTime(path: str): DateTime =
 fn processOptionMask(opt: ProcessOption): uint64 =
     return uint64(1) << uint64(int64(opt))
 
+fn execCommandHasEvalOption(options: uint64): bool =
+    return (options & uint64(4)) != uint64(0)
+
+fn execCommandWithEvalOption(options: uint64): uint64 =
+    return options | uint64(4)
+
 fn execCmdExImpl(command: str, options: uint64, workingDir: str): ExecCmdResult =
     var output0: str
     osSetEmpty(output0)
@@ -836,8 +874,18 @@ fn execCmdExImpl(command: str, options: uint64, workingDir: str): ExecCmdResult 
     out.exitCode = exitCode0
     return out
 fn execCmdEx(command: str, options: uint64, workingDir: str): ExecCmdResult =
+    if !execCommandHasEvalOption(options):
+        panic("std/os ExecCmdEx requires PoEvalCommand; prefer std/os_host_process ExecFile* for argv-safe execution")
     return execCmdExImpl(command, options, workingDir)
+
+fn execShellCmdEx(command: str, options: uint64, workingDir: str): ExecCmdResult =
+    return execCmdExImpl(command, execCommandWithEvalOption(options), workingDir)
+
 fn execCmdStatus(command: str, workingDir: str): int32 =
+    panic("std/os ExecCmdStatus requires explicit shell eval; use ExecShellCmdStatus or std/os_host_process ExecFileStatus")
+    return -1
+
+fn execShellCmdStatus(command: str, workingDir: str): int32 =
     if strings.Len(command) == 0:
         return -1
     return cheng_exec_cmd_status_raw(strToCStringTemp(command),
@@ -846,6 +894,88 @@ fn execCmdResultExitCode(result: ExecCmdResult): int32 =
     return result.exitCode
 fn execCmdResultOutput(result: ExecCmdResult): str =
     return result.output
+
+const osResourceGuardRusageSelf: int32 = 0
+const osResourceGuardMemoryExceeded: int32 = 125
+
+var processResourceGuardConfiguredMaxRssBytesReady: bool
+var processResourceGuardConfiguredMaxRssBytesCached: int64
+
+fn processResourceGuardParseUnsignedInt64(raw: str): int64 =
+    if len(raw) <= 0:
+        return int64(-1)
+    var value: int64
+    var hadDigit = false
+    var trailingSpace = false
+    for i in 0..<len(raw):
+        let ch = raw[i]
+        if ch >= '0' && ch <= '9':
+            if trailingSpace:
+                return int64(-1)
+            value = value * int64(10) + int64(int32(ch) - int32('0'))
+            hadDigit = true
+        elif ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r':
+            if hadDigit:
+                trailingSpace = true
+        else:
+            return int64(-1)
+    if !hadDigit:
+        return int64(-1)
+    return value
+fn processResourceGuardDefaultMaxRssBytes(): int64 =
+    return int64(8589934592)
+fn processResourceGuardConfiguredMaxRssBytes(): int64 =
+    let parentGuardRaw = getEnv("CHENG_PARENT_RSS_GUARD")
+    if len(parentGuardRaw) > 0:
+        return int64(0)
+    var raw = getEnv("CHENG_PROCESS_MAX_RSS_BYTES")
+    if len(raw) <= 0:
+        raw = getEnv("CHENG_MAX_RSS_BYTES")
+    if len(raw) <= 0:
+        return processResourceGuardDefaultMaxRssBytes()
+    if raw == "8589934592":
+        return processResourceGuardDefaultMaxRssBytes()
+    let parsed = processResourceGuardParseUnsignedInt64(raw)
+    if parsed <= int64(0):
+        return int64(-1)
+    return parsed
+fn processResourceGuardConfiguredMaxRssBytesOnce(): int64 =
+    if processResourceGuardConfiguredMaxRssBytesReady:
+        return processResourceGuardConfiguredMaxRssBytesCached
+    let value = processResourceGuardConfiguredMaxRssBytes()
+    processResourceGuardConfiguredMaxRssBytesCached = value
+    processResourceGuardConfiguredMaxRssBytesReady = true
+    return value
+fn processResourceGuardCurrentRssBytes(): int64 =
+    var usage: OsRusage
+    if os_getrusage_bridge(osResourceGuardRusageSelf, usage) != 0:
+        return int64(-1)
+    if usage.ru_maxrss <= int64(0):
+        return int64(-1)
+    return usage.ru_maxrss
+fn processResourceGuardMemoryLimitExceededLine(rssBytes: int64,
+                                                maxRssBytes: int64): str =
+    return strutil.Join(["compile_progress phase=resource_guard status=rss_limit_exceeded rss_bytes=",
+                         strings.Int64ToStr(rssBytes),
+                         " limit_bytes=",
+                         strings.Int64ToStr(maxRssBytes)],
+                         "")
+fn processResourceGuardMemoryUnavailableLine(): str =
+    return "compile_progress phase=resource_guard status=rss_unavailable"
+fn processResourceGuardCheck() =
+    let maxRssBytes = processResourceGuardConfiguredMaxRssBytesOnce()
+    if maxRssBytes == int64(0):
+        return
+    if maxRssBytes < int64(0):
+        writeLine(get_stderr(), "compile_progress phase=resource_guard status=invalid_max_rss")
+        os_exit_bridge(2)
+    let rssBytes = processResourceGuardCurrentRssBytes()
+    if rssBytes <= int64(0):
+        writeLine(get_stderr(), processResourceGuardMemoryUnavailableLine())
+        os_exit_bridge(2)
+    if rssBytes > maxRssBytes:
+        writeLine(get_stderr(), processResourceGuardMemoryLimitExceededLine(rssBytes, maxRssBytes))
+        os_exit_bridge(osResourceGuardMemoryExceeded)
 fn sleepMs(value: int32) =
     if value <= 0:
         return
@@ -938,22 +1068,58 @@ fn readFile(path: str): str =
         ioMeterReport(ioRead, int64(got))
     c_fclose(f)
     return bytesToString(total)
+
+fn osWriteAllRaw(f: File, data: ptr, total: int32, label: str) =
+    if f == nil:
+        panic("os write failed: nil file")
+    if total < 0:
+        panic("os write failed: negative length")
+    if total == 0:
+        return
+    if data == nil:
+        panic("os write failed: nil data")
+    var written: int32
+    while written < total:
+        let chunk: int32 = c_fwrite(system_ptr_add(data, written), 1, total - written, f)
+        if chunk <= 0:
+            panic(label)
+        written = written + chunk
+    ioMeterReport(ioWrite, int64(written))
+
+fn osCloseWrittenFile(f: File) =
+    if c_fflush(f) != 0:
+        let _closeAfterFlushFailure: int32 = c_fclose(f)
+        panic("os write failed: flush")
+    if c_fclose(f) != 0:
+        panic("os write failed: close")
+
 fn writeFile(path: str, content: str) =
     if strings.Len(path) <= 0:
-        return
-    driver_c_write_text_file_bridge(path, content)
-    ioMeterReport(ioWrite, int64(strings.Len(content)))
+        panic("os writeFile: empty path")
+    let filePath: cstring = strToCStringTemp(path)
+    if filePath == nil:
+        panic("os writeFile: invalid path")
+    let f: File = c_fopen(filePath, "wb")
+    if f == nil:
+        panic("os writeFile: open")
+    osWriteAllRaw(f, strDataPtr(content), strings.Len(content), "os writeFile: write")
+    osCloseWrittenFile(f)
 
 fn writeFileBytes(path: str, bytes: uint8[]) =
-    if strings.Len(path) > 0:
-        let filePath: cstring = strToCStringTemp(path)
-        if filePath != nil:
-            let f: File = c_fopen(filePath, "wb")
-            if f != nil:
-                if bytes.buffer != nil && bytes.len > 0:
-                    let wrote: int32 = c_fwrite(bytes.buffer, 1, bytes.len, f)
-                    ioMeterReport(ioWrite, int64(wrote))
-                c_fclose(f)
+    if strings.Len(path) <= 0:
+        panic("os writeFileBytes: empty path")
+    let filePath: cstring = strToCStringTemp(path)
+    if filePath == nil:
+        panic("os writeFileBytes: invalid path")
+    let f: File = c_fopen(filePath, "wb")
+    if f == nil:
+        panic("os writeFileBytes: open")
+    if bytes.len > 0:
+        if bytes.buffer == nil:
+            let _closeAfterNilBuffer: int32 = c_fclose(f)
+            panic("os writeFileBytes: nil data")
+        osWriteAllRaw(f, bytes.buffer, bytes.len, "os writeFileBytes: write")
+    osCloseWrittenFile(f)
 
 # Public export surface follows the language rule: exported names start uppercase.
 fn GetStdin(): File =
@@ -1049,14 +1215,23 @@ fn GetLastModificationTime(path: str): DateTime =
 fn ExecCmdEx(command: str, options: uint64, workingDir: str): ExecCmdResult =
     return execCmdEx(command, options, workingDir)
 
+fn ExecShellCmdEx(command: str, options: uint64, workingDir: str): ExecCmdResult =
+    return execShellCmdEx(command, options, workingDir)
+
 fn ExecCmdStatus(command: str, workingDir: str): int32 =
     return execCmdStatus(command, workingDir)
+
+fn ExecShellCmdStatus(command: str, workingDir: str): int32 =
+    return execShellCmdStatus(command, workingDir)
 
 fn ExecCmdResultExitCode(result: ExecCmdResult): int32 =
     return execCmdResultExitCode(result)
 
 fn ExecCmdResultOutput(result: ExecCmdResult): str =
     return execCmdResultOutput(result)
+
+fn ProcessResourceGuardCheck() =
+    processResourceGuardCheck()
 
 fn SleepMs(value: int32) =
     sleepMs(value)

@@ -28,6 +28,8 @@ fn cheng_fopen(filename, mode: cstring): ptr
 fn cheng_fclose(stream: ptr): int32
 @importc("cheng_fwrite")
 fn cheng_fwrite(buf: ptr, size: int64, n: int64, stream: ptr): int32
+@importc("cheng_fflush")
+fn cheng_fflush(stream: ptr): int32
 @importc("cheng_os_fopen_mode_bridge")
 fn cheng_os_fopen_mode_bridge(path: str, mode: str): ptr
 
@@ -37,7 +39,7 @@ fn InternalMobileBridgeEmitLog(message: str) =
 fn InternalMobileBridgeSha256Hex(text: str): str =
     return cheng_sha256_hex_bridge(text)
 
-fn InternalMobileBridgeBufferHandle(data: ptr, n: int32): uint64 =
+fn InternalMobileBridgeBufferHandleCopy(data: ptr, n: int32): uint64 =
     if data == nil || n <= 0:
         return uint64(0)
     return cheng_buffer_handle_from_raw_bridge(data, n)
@@ -66,6 +68,34 @@ fn InternalMobileBridgeCopyRawTextLen(raw: ptr, textLen: int32): str =
         return ""
     return bytesToString(bytesView(raw, textLen))
 
+fn InternalMobileBridgeCloseWrittenFile(outFile: ptr,
+                                         closeError: str): Result[bool] =
+    if cheng_fflush(outFile) != 0:
+        cheng_fclose(outFile)
+        return Err[bool](closeError)
+    if cheng_fclose(outFile) != 0:
+        return Err[bool](closeError)
+    return Ok[bool](true)
+
+fn InternalMobileBridgeWriteAll(outFile: ptr,
+                                 payload: Bytes,
+                                 writeError: str): Result[bool] =
+    let payloadLen = bytesLen(payload)
+    if payloadLen <= 0:
+        return Ok[bool](true)
+    if payload.data == nil:
+        return Err[bool](writeError)
+    var written: int32
+    while written < payloadLen:
+        let chunk: int32 = cheng_fwrite(system_ptr_add(payload.data, written),
+                                        1,
+                                        int64(payloadLen - written),
+                                        outFile)
+        if chunk <= 0:
+            return Err[bool](writeError)
+        written = written + chunk
+    return Ok[bool](true)
+
 fn InternalMobileBridgeWriteBytesFileMode(path: str,
                                        payload: Bytes,
                                        mode: str,
@@ -74,14 +104,11 @@ fn InternalMobileBridgeWriteBytesFileMode(path: str,
     let outFile = cheng_os_fopen_mode_bridge(path, mode)
     if outFile == nil:
         return Err[bool](openError)
-    let payloadLen = bytesLen(payload)
-    if payloadLen > 0:
-        let wrote: int32 = cheng_fwrite(payload.data, 1, payloadLen, outFile)
-        if wrote != payloadLen:
-            cheng_fclose(outFile)
-            return Err[bool](writeError)
-    cheng_fclose(outFile)
-    return Ok[bool](true)
+    let writeRes = InternalMobileBridgeWriteAll(outFile, payload, writeError)
+    if IsErr(writeRes):
+        cheng_fclose(outFile)
+        return writeRes
+    return InternalMobileBridgeCloseWrittenFile(outFile, writeError)
 
 fn InternalMobileBridgeWriteBytesFile(path: str, payload: Bytes): Result[bool] =
     return InternalMobileBridgeWriteBytesFileMode(path,
@@ -101,14 +128,13 @@ fn InternalMobileBridgeWriteBytesPath(path: str, payload: Bytes): Result[bool] =
     let outFile = cheng_fopen(strToCStringTemp(path), "wb")
     if outFile == nil:
         return Err[bool]("moq_fountain_write_open_failed")
-    let payloadLen = bytesLen(payload)
-    if payloadLen > 0:
-        let wrote: int32 = cheng_fwrite(payload.data, 1, payloadLen, outFile)
-        if wrote != payloadLen:
-            cheng_fclose(outFile)
-            return Err[bool]("moq_fountain_write_failed")
-    cheng_fclose(outFile)
-    return Ok[bool](true)
+    let writeRes = InternalMobileBridgeWriteAll(outFile,
+                                                payload,
+                                                "moq_fountain_write_failed")
+    if IsErr(writeRes):
+        cheng_fclose(outFile)
+        return writeRes
+    return InternalMobileBridgeCloseWrittenFile(outFile, "moq_fountain_write_failed")
 
 fn InternalMobileBridgeHostMoqRequestPathRaw(): ptr =
     return cheng_mobile_host_moq_request_path_bridge()

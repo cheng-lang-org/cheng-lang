@@ -24,6 +24,7 @@ type
         BackendCompilerSupportMatrixSource
         BackendCompilerRequestSource
         BackendLangParserSource
+        BackendLangTypedExprSource
         BackendSystemLinkPlanSource
         BackendLoweringPlanSource
         BackendPrimaryObjectPlanSource
@@ -84,10 +85,10 @@ fn BackendBuildPlanDefaultEntryPath(rootDir: str): str =
     return BackendRootPath(rootDir, "src/core/tooling/compiler_main.cheng")
 
 fn BackendBuildPlanBackendDriverEntryPath(rootDir: str): str =
-    return BackendRootPath(rootDir, "src/core/tooling/backend_driver_main.cheng")
+    return BackendRootPath(rootDir, "src/core/tooling/backend_driver_dispatch_min.cheng")
 
 fn BackendBuildPlanDefaultSourceUnitCount(): int32 =
-    return 33
+    return 36
 
 fn BackendBuildPlanDefaultLinkMode(): str =
     return BackendLinkerText(BackendLinkerSystemLink)
@@ -107,11 +108,10 @@ fn BackendTargetFromTriple(targetTriple: str): BackendTarget =
         return BackendX8664PcWindowsMsvc
     return BackendArm64AppleDarwin
 
-fn BackendBuildPlanDefaultForTarget(rootDir: str, targetTriple: str): BackendBuildPlan =
+fn BackendBuildPlanSharedCompilerSourceUnits(rootDir: str): BackendSourceUnit[] =
     var units: BackendSourceUnit[]
     units = []
     add(units, BackendSourceUnit(role: BackendBootstrapContractSource, path: contracts.BootstrapStage1SourcePath(rootDir)))
-    add(units, BackendSourceUnit(role: BackendCompilerEntrySource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_main.cheng")))
     add(units, BackendSourceUnit(role: BackendCompilerRuntimeSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_runtime.cheng")))
     add(units, BackendSourceUnit(role: BackendCompilerRequestSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_request.cheng")))
     add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_world.cheng")))
@@ -120,6 +120,7 @@ fn BackendBuildPlanDefaultForTarget(rootDir: str, targetTriple: str): BackendBui
     add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_equivalence.cheng")))
     add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_publish_gate.cheng")))
     add(units, BackendSourceUnit(role: BackendLangParserSource, path: BackendRootPath(rootDir, "src/core/lang/parser.cheng")))
+    add(units, BackendSourceUnit(role: BackendLangTypedExprSource, path: BackendRootPath(rootDir, "src/core/lang/typed_expr.cheng")))
     add(units, BackendSourceUnit(role: BackendSystemLinkPlanSource, path: BackendRootPath(rootDir, "src/core/backend/system_link_plan.cheng")))
     add(units, BackendSourceUnit(role: BackendLoweringPlanSource, path: BackendRootPath(rootDir, "src/core/backend/lowering_plan.cheng")))
     add(units, BackendSourceUnit(role: BackendPrimaryObjectPlanSource, path: BackendRootPath(rootDir, "src/core/backend/primary_object_plan.cheng")))
@@ -134,15 +135,27 @@ fn BackendBuildPlanDefaultForTarget(rootDir: str, targetTriple: str): BackendBui
     add(units, BackendSourceUnit(role: BackendNativeLinkExecSource, path: BackendRootPath(rootDir, "src/core/backend/native_link_exec.cheng")))
     add(units, BackendSourceUnit(role: BackendSystemLinkExecSource, path: BackendRootPath(rootDir, "src/core/backend/system_link_exec.cheng")))
     add(units, BackendSourceUnit(role: BackendSystemLinkExecRuntimeSource, path: BackendRootPath(rootDir, "src/core/backend/system_link_exec_runtime.cheng")))
+    add(units, BackendSourceUnit(role: BackendSystemLinkExecRuntimeSource, path: BackendRootPath(rootDir, "src/core/backend/system_link_exec_runtime_direct.cheng")))
     add(units, BackendSourceUnit(role: BackendLineMapSource, path: BackendRootPath(rootDir, "src/core/backend/line_map.cheng")))
     add(units, BackendSourceUnit(role: BackendRuntimeCoreSource, path: BackendRootPath(rootDir, "src/core/runtime/core_runtime.cheng")))
     add(units, BackendSourceUnit(role: BackendRuntimeCompilerSource, path: BackendRootPath(rootDir, "src/core/runtime/compiler_runtime.cheng")))
     add(units, BackendSourceUnit(role: BackendRuntimeDebugSource, path: BackendRootPath(rootDir, "src/core/runtime/debug_runtime.cheng")))
+    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/backend_driver_dispatch_min.cheng")))
     add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/bootstrap_contracts.cheng")))
     add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/debug_tools_gate.cheng")))
     add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/export_visibility_gate.cheng")))
     add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/object_debug_report.cheng")))
     add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/backend/build_plan.cheng")))
+    return units
+
+fn BackendBuildPlanDefaultForTarget(rootDir: str, targetTriple: str): BackendBuildPlan =
+    var units = BackendBuildPlanSharedCompilerSourceUnits(rootDir)
+    # Prepend the compiler entry point
+    var finalUnits: BackendSourceUnit[]
+    finalUnits = []
+    add(finalUnits, BackendSourceUnit(role: BackendCompilerEntrySource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_main.cheng")))
+    for i in 0..<units.len:
+        add(finalUnits, units[i])
     return BackendBuildPlan(
         target: BackendTargetFromTriple(targetTriple),
         targetTriple: targetTriple,
@@ -150,48 +163,19 @@ fn BackendBuildPlanDefaultForTarget(rootDir: str, targetTriple: str): BackendBui
         entryPath: BackendBuildPlanDefaultEntryPath(rootDir),
         outputPath: BackendRootPath(rootDir, "artifacts/backend_driver/cheng"),
         stage2CompilerPath: BackendRootPath(rootDir, "artifacts/bootstrap/cheng.stage2"),
-        sourceUnits: units
+        sourceUnits: finalUnits
     )
 
 fn BackendBuildPlanDefault(rootDir: str): BackendBuildPlan =
     return BackendBuildPlanDefaultForTarget(rootDir, contracts.BootstrapDefaultTarget())
 
 fn BackendBuildPlanBackendDriverForTarget(rootDir: str, targetTriple: str): BackendBuildPlan =
-    var units: BackendSourceUnit[]
-    units = []
-    add(units, BackendSourceUnit(role: BackendBootstrapContractSource, path: contracts.BootstrapStage1SourcePath(rootDir)))
-    add(units, BackendSourceUnit(role: BackendBackendDriverEntrySource, path: BackendBuildPlanBackendDriverEntryPath(rootDir)))
-    add(units, BackendSourceUnit(role: BackendCompilerRuntimeSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_runtime.cheng")))
-    add(units, BackendSourceUnit(role: BackendCompilerRequestSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_request.cheng")))
-    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_world.cheng")))
-    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_csg.cheng")))
-    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_world_libp2p.cheng")))
-    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_equivalence.cheng")))
-    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/compiler_publish_gate.cheng")))
-    add(units, BackendSourceUnit(role: BackendLangParserSource, path: BackendRootPath(rootDir, "src/core/lang/parser.cheng")))
-    add(units, BackendSourceUnit(role: BackendSystemLinkPlanSource, path: BackendRootPath(rootDir, "src/core/backend/system_link_plan.cheng")))
-    add(units, BackendSourceUnit(role: BackendLoweringPlanSource, path: BackendRootPath(rootDir, "src/core/backend/lowering_plan.cheng")))
-    add(units, BackendSourceUnit(role: BackendPrimaryObjectPlanSource, path: BackendRootPath(rootDir, "src/core/backend/primary_object_plan.cheng")))
-    add(units, BackendSourceUnit(role: BackendPrimaryObjectEmitSource, path: BackendRootPath(rootDir, "src/core/backend/primary_object_emit.cheng")))
-    add(units, BackendSourceUnit(role: BackendDirectObjectEmitSource, path: BackendRootPath(rootDir, "src/core/backend/direct_object_emit.cheng")))
-    add(units, BackendSourceUnit(role: BackendObjectBufferSource, path: BackendRootPath(rootDir, "src/core/backend/object_buffer.cheng")))
-    add(units, BackendSourceUnit(role: BackendObjectSymbolsSource, path: BackendRootPath(rootDir, "src/core/backend/object_symbols.cheng")))
-    add(units, BackendSourceUnit(role: BackendObjectRelocsSource, path: BackendRootPath(rootDir, "src/core/backend/object_relocs.cheng")))
-    add(units, BackendSourceUnit(role: BackendMachOObjectWriterSource, path: BackendRootPath(rootDir, "src/core/backend/macho_object_writer.cheng")))
-    add(units, BackendSourceUnit(role: BackendObjectPlanSource, path: BackendRootPath(rootDir, "src/core/backend/object_plan.cheng")))
-    add(units, BackendSourceUnit(role: BackendNativeLinkPlanSource, path: BackendRootPath(rootDir, "src/core/backend/native_link_plan.cheng")))
-    add(units, BackendSourceUnit(role: BackendNativeLinkExecSource, path: BackendRootPath(rootDir, "src/core/backend/native_link_exec.cheng")))
-    add(units, BackendSourceUnit(role: BackendSystemLinkExecSource, path: BackendRootPath(rootDir, "src/core/backend/system_link_exec.cheng")))
-    add(units, BackendSourceUnit(role: BackendSystemLinkExecRuntimeSource, path: BackendRootPath(rootDir, "src/core/backend/system_link_exec_runtime.cheng")))
-    add(units, BackendSourceUnit(role: BackendLineMapSource, path: BackendRootPath(rootDir, "src/core/backend/line_map.cheng")))
-    add(units, BackendSourceUnit(role: BackendRuntimeCoreSource, path: BackendRootPath(rootDir, "src/core/runtime/core_runtime.cheng")))
-    add(units, BackendSourceUnit(role: BackendRuntimeCompilerSource, path: BackendRootPath(rootDir, "src/core/runtime/compiler_runtime.cheng")))
-    add(units, BackendSourceUnit(role: BackendRuntimeDebugSource, path: BackendRootPath(rootDir, "src/core/runtime/debug_runtime.cheng")))
-    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/bootstrap_contracts.cheng")))
-    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/debug_tools_gate.cheng")))
-    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/export_visibility_gate.cheng")))
-    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/tooling/object_debug_report.cheng")))
-    add(units, BackendSourceUnit(role: BackendToolingSource, path: BackendRootPath(rootDir, "src/core/backend/build_plan.cheng")))
+    var units = BackendBuildPlanSharedCompilerSourceUnits(rootDir)
+    var finalUnits: BackendSourceUnit[]
+    finalUnits = []
+    add(finalUnits, BackendSourceUnit(role: BackendBackendDriverEntrySource, path: BackendBuildPlanBackendDriverEntryPath(rootDir)))
+    for i in 0..<units.len:
+        add(finalUnits, units[i])
     return BackendBuildPlan(
         target: BackendTargetFromTriple(targetTriple),
         targetTriple: targetTriple,
@@ -199,7 +183,7 @@ fn BackendBuildPlanBackendDriverForTarget(rootDir: str, targetTriple: str): Back
         entryPath: BackendBuildPlanBackendDriverEntryPath(rootDir),
         outputPath: BackendRootPath(rootDir, "artifacts/backend_driver/cheng"),
         stage2CompilerPath: BackendRootPath(rootDir, "artifacts/bootstrap/cheng.stage2"),
-        sourceUnits: units
+        sourceUnits: finalUnits
     )
 
 fn BackendBuildPlanBackendDriver(rootDir: str): BackendBuildPlan =
@@ -235,6 +219,8 @@ fn BackendSourceRoleText(role: BackendSourceRole): str =
         return "compiler_request_source"
     if role == BackendLangParserSource:
         return "lang_parser_source"
+    if role == BackendLangTypedExprSource:
+        return "lang_typed_expr_source"
     if role == BackendSystemLinkPlanSource:
         return "backend_system_link_plan_source"
     if role == BackendLoweringPlanSource:

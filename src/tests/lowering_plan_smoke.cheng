@@ -6,6 +6,7 @@ import cheng/core/tooling/compiler_world as cworld
 import cheng/core/tooling/compiler_csg as ccsg
 import cheng/core/backend/system_link_plan as slplan
 import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/lang/parser
 import cheng/core/lang/typed_expr as texpr
 import std/strutils as strutil
@@ -109,6 +110,30 @@ fn buildPlan(workspaceRoot: str,
     assert(lower.BuildLoweringPlanStub(linkPlan, plan, err), strutil.Join([" lowering plan: build lowering plan err=", err], ""))
     return plan
 
+fn buildPrimaryReport(workspaceRoot: str,
+                      packageRoot: str,
+                      sourcePath: str,
+                      outputPath: str,
+                      exportRoot: str): str =
+    let req0 = creq.CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.EmitObj,
+        ""
+    )
+    let req = creq.CompilerRequestWithExportRootSymbols(req0, [exportRoot])
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err = ""
+    assert(slplan.BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), " lowering plan: build primary link plan")
+    assert(linkPlan.missingReasons.len == 0, " lowering plan: primary link plan ready")
+    var plan: lower.LoweringPlanStub
+    assert(lower.BuildLoweringPlanStub(linkPlan, plan, err), strutil.Join([" lowering plan: build primary lowering err=", err], ""))
+    let primaryRes = pobj.BuildPrimaryObjectPlan(linkPlan, plan)
+    assert(!IsErr(primaryRes), strutil.Join([" lowering plan: build primary object err=", Error(primaryRes)], ""))
+    return pobj.PrimaryObjectPlanReport(Value(primaryRes))
+
 fn findTypedFact(facts: ccsg.TypedExprFact[],
                  sourcePath: str,
                  lineNumber: int32): ccsg.TypedExprFact =
@@ -147,7 +172,8 @@ fn main(): int32 =
     assert(plan.functionCallConvs[0] == lower.LoweringCallConvInternal(), " lowering plan: callconv")
     assert(plan.typedExprFacts.len == parser.NormalizedExprLayerExprCount(plan.exprLayer),
            " lowering plan: typed expr fact count")
-    assert(plan.loweringRules.len == plan.typedExprFacts.len,
+    let planRules = texpr.TypedExprLoweringRulesFromFacts(plan.typedExprFacts)
+    assert(planRules.len == plan.typedExprFacts.len,
            " lowering plan: lowering rule count")
     assert(plan.typedExprFacts[0].exprId != "", " lowering plan: typed expr id")
     var sawMain = false
@@ -193,6 +219,7 @@ fn main(): int32 =
     assert(texpr.TypedExprFactsEqual(typedCsg.typedExprFacts, typedPlan.typedExprFacts),
            " lowering plan: typed facts match compiler csg")
     let typedCsgRules = texpr.TypedExprLoweringRulesFromFacts(typedCsg.typedExprFacts)
+    let typedPlanRules = texpr.TypedExprLoweringRulesFromFacts(typedPlan.typedExprFacts)
     var loweringErr = ""
     assert(texpr.TypedExprFactsValidateCallResolution(typedCsg.exprLayer, typedCsg.typedExprFacts, loweringErr),
            " lowering plan: typed csg call resolution validate")
@@ -200,15 +227,15 @@ fn main(): int32 =
            " lowering plan: typed plan call resolution validate")
     assert(texpr.TypedExprLoweringRulesValidate(typedCsgRules, loweringErr),
            " lowering plan: typed csg lowering rules validate")
-    assert(texpr.TypedExprLoweringRulesValidate(typedPlan.loweringRules, loweringErr),
+    assert(texpr.TypedExprLoweringRulesValidate(typedPlanRules, loweringErr),
            " lowering plan: typed plan lowering rules validate")
-    assert(texpr.TypedExprLoweringRulesEqual(typedCsgRules, typedPlan.loweringRules),
+    assert(texpr.TypedExprLoweringRulesEqual(typedCsgRules, typedPlanRules),
            " lowering plan: lowering rules match compiler csg")
     let typedPlanReport = lower.LoweringPlanStubReport(typedPlan)
     let typedFixtureFacts = texpr.TypedExprFactsForSource(typedPlan.typedExprFacts, typedFixturePath)
     assert(typedFixtureFacts.len > 0, " lowering plan: typed fixture fact slice")
     assertTypedCallFactsMatchLayer(typedPlan.typedExprFacts, typedPlan.exprLayer, " lowering plan: typed fixture")
-    assert(plan.loweringRules.len == plan.typedExprFacts.len,
+    assert(planRules.len == plan.typedExprFacts.len,
            " lowering plan: typed lowering rule count")
     assert(texpr.TypedExprLoweringRuleUniqueShapeCount(typedCsgRules) > 0,
            " lowering plan: typed lowering rule shape count")
@@ -229,6 +256,24 @@ fn main(): int32 =
            " lowering plan: typed fixture result intrinsic call kind")
     assert(texpr.TypedExprCallProjectionCount(typedFixtureFacts) > 0,
            " lowering plan: typed fixture projection call kind")
+    let resultErrorFact = findTypedFact(typedFixtureFacts, typedFixturePath, 36)
+    assert(resultErrorFact.kind == parser.NormalizedExprResultIntrinsic,
+           " lowering plan: typed fixture result error fact kind")
+    assert(resultErrorFact.callCallee == "Error",
+           " lowering plan: typed fixture result error callee")
+    assert(resultErrorFact.callArgCount == 1,
+           " lowering plan: typed fixture result error arg count")
+    assert(resultErrorFact.callArgsText == "errRes",
+           " lowering plan: typed fixture result error args")
+    let resultIsErrFact = findTypedFact(typedFixtureFacts, typedFixturePath, 39)
+    assert(resultIsErrFact.kind == parser.NormalizedExprResultIntrinsic,
+           " lowering plan: typed fixture result iserr fact kind")
+    assert(resultIsErrFact.callCallee == "IsErr",
+           " lowering plan: typed fixture result iserr callee")
+    assert(resultIsErrFact.callArgCount == 1,
+           " lowering plan: typed fixture result iserr arg count")
+    assert(resultIsErrFact.callArgsText == "errRes",
+           " lowering plan: typed fixture result iserr args")
     assert(parser.NormalizedExprLayerHasConstructorExpr(typedPlan.exprLayer, 60),
            " lowering plan: typed fixture constructor expr")
     let constructorFact = findTypedFact(typedFixtureFacts, typedFixturePath, 60)
@@ -275,13 +320,13 @@ fn main(): int32 =
     assert(stringifyParenFact.typeText == "str",
            " lowering plan: typed fixture stringify paren type")
     var sawConstructorRule = false
-    for i in 0..<typedPlan.loweringRules.len:
-        if typedPlan.loweringRules[i].sourcePath == typedFixturePath &&
-           typedPlan.loweringRules[i].lineNumber == 60 &&
-           typedPlan.loweringRules[i].typeCallKind == texpr.TypedExprTypeCallConstructor:
-            assert(typedPlan.loweringRules[i].callArgCount == 1,
+    for i in 0..<typedPlanRules.len:
+        if typedPlanRules[i].sourcePath == typedFixturePath &&
+           typedPlanRules[i].lineNumber == 60 &&
+           typedPlanRules[i].typeCallKind == texpr.TypedExprTypeCallConstructor:
+            assert(typedPlanRules[i].callArgCount == 1,
                    " lowering plan: typed fixture constructor rule arg count")
-            assert(typedPlan.loweringRules[i].callArgsText == "count: payload.len",
+            assert(typedPlanRules[i].callArgsText == "count: payload.len",
                    " lowering plan: typed fixture constructor rule args text")
             sawConstructorRule = true
     assert(sawConstructorRule, " lowering plan: typed fixture constructor lowering rule")
@@ -367,6 +412,8 @@ fn main(): int32 =
     assert(reportFieldValue(typedPlanReport, "typed_expr_type_call_constructor_count") ==
            intToStr(parser.NormalizedExprLayerConstructorCount(typedPlan.exprLayer)),
            " lowering plan: typed report typed constructor count")
+    assert(reportFieldPositive(typedPlanReport, "typed_ir_result_intrinsic_statement_count"),
+           " lowering plan: typed report result intrinsic statement count")
     assert(reportFieldValue(typedPlanReport, "lowering_rule_type_call_default_init_count") ==
            intToStr(parser.NormalizedExprLayerDefaultInitCount(typedPlan.exprLayer)),
            " lowering plan: typed report lowering default init count")
@@ -416,6 +463,39 @@ fn main(): int32 =
            " lowering plan: typed report rule entry")
     assert(chengpath.TextContains(reportFieldValue(typedPlanReport, "lowering_rule_entry[0]"), "key=type="),
            " lowering plan: typed report rule key text")
+
+    let multiStmtPath: str = chengpath.PathJoin(packageRoot, "src/tests/multi_stmt_call_sequence_unsupported_fixture.cheng")
+    let multiStmtOutputPath: str = chengpath.PathJoin(outDir, "multi_stmt_call_sequence_unsupported_fixture")
+    let multiStmtPlan = buildPlan(workspaceRoot, packageRoot, multiStmtPath, multiStmtOutputPath, creq.EmitExe)
+    let multiStmtReport = lower.LoweringPlanStubReport(multiStmtPlan)
+    assert(chengpath.TextContains(reportFieldValue(multiStmtReport, "primary_object_ir_call_sequence_counts"), "2"),
+           " lowering plan: unsupported multi statement call sequence count")
+    assert(chengpath.TextContains(reportFieldValue(multiStmtReport, "primary_object_ir_body_ir_call_counts"), "2"),
+           " lowering plan: unsupported multi statement body ir call count")
+    assert(chengpath.TextContains(reportFieldValue(multiStmtReport, "primary_object_ir_call_sequence_targets"), "LeftValue"),
+           " lowering plan: unsupported multi statement left call target")
+    assert(chengpath.TextContains(reportFieldValue(multiStmtReport, "primary_object_ir_call_sequence_targets"), "RightValue"),
+           " lowering plan: unsupported multi statement right call target")
+
+    let resultDispatchPath: str = chengpath.PathJoin(packageRoot, "src/tests/result_request_dispatch_fixture.cheng")
+    let resultDispatchOutputPath: str = chengpath.PathJoin(outDir, "result_request_dispatch_fixture")
+    let resultDispatchPlan = buildPlan(workspaceRoot, packageRoot, resultDispatchPath, resultDispatchOutputPath, creq.EmitExe)
+    let resultDispatchReport = lower.LoweringPlanStubReport(resultDispatchPlan)
+    assert(chengpath.TextContains(reportFieldValue(resultDispatchReport, "primary_object_ir_statement_sequence_kinds"), "result_intrinsic"),
+           " lowering plan: result request dispatch typed statement")
+    let resultDispatchPrimaryReport = buildPrimaryReport(workspaceRoot,
+                                                         packageRoot,
+                                                         resultDispatchPath,
+                                                         resultDispatchOutputPath,
+                                                         "BackendDriverDispatchMinRunSystemLinkExecWithRequest")
+    assert(chengpath.TextContains(reportFieldValue(resultDispatchPrimaryReport, "primary_object_body_kinds"), texpr.BodyKindResultRequestDispatch),
+           " lowering plan: result request dispatch primary body kind")
+    assert(chengpath.TextContains(reportFieldValue(resultDispatchPrimaryReport, "primary_object_statement_call_counts"), "2"),
+           " lowering plan: result request dispatch primary call count")
+    assert(chengpath.TextContains(reportFieldValue(resultDispatchPrimaryReport, "primary_object_reloc_target_symbols"), "BackendDriverDispatchMinRunSystemLinkExecConcreteRequest"),
+           " lowering plan: result request dispatch concrete target")
+    assert(chengpath.TextContains(reportFieldValue(resultDispatchPrimaryReport, "primary_object_reloc_target_symbols"), "BackendDriverDispatchMinUnsupported"),
+           " lowering plan: result request dispatch unsupported target")
 
     echo(" lowering_plan_smoke ok")
     return 0

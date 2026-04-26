@@ -1,0 +1,97 @@
+import std/os
+import std/result
+import std/rawbytes as rawbytes
+import cheng/core/backend/macho_object_writer as macho
+import cheng/core/backend/object_buffer as obuf
+import cheng/core/backend/object_symbols as osym
+import cheng/core/backend/object_relocs as orel
+
+fn SmokeU32LE(data: rawbytes.Bytes, offset: int32): int32 =
+    return rawbytes.bytesGet(data, offset) |
+           (rawbytes.bytesGet(data, offset + 1) << 8) |
+           (rawbytes.bytesGet(data, offset + 2) << 16) |
+           (rawbytes.bytesGet(data, offset + 3) << 24)
+
+fn SmokeRelocInfoByte(data: rawbytes.Bytes, relocOffset: int32, index: int32): int32 =
+    return rawbytes.bytesGet(data, relocOffset + index * 8 + 7)
+
+fn main(): int32 =
+    var text = obuf.ObjectBufferInit(32)
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x90000010))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x91000210))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xb9000200))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x90000010))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x91000210))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xf9000201))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+    let textBytes = obuf.ObjectBufferToBytes(text)
+
+    var data = obuf.ObjectBufferInit(16)
+    obuf.ObjectBufferWriteZeros(data, 16)
+    let dataBytes = obuf.ObjectBufferToBytes(data)
+
+    var symbols = osym.ObjectSymbolsInit()
+    let fnIndex = osym.ObjectSymbolsAddDefined(symbols,
+                                               "_cheng_macho_text_data_smoke____cheng_setCmdLine",
+                                               0,
+                                               int64(0),
+                                               int64(rawbytes.bytesLen(textBytes)),
+                                               true)
+    let argcIndex = osym.ObjectSymbolsAddDefined(symbols,
+                                                 "_cheng_macho_text_data_smoke__cheng_saved_argc",
+                                                 1,
+                                                 int64(0),
+                                                 int64(4),
+                                                 false)
+    let argvIndex = osym.ObjectSymbolsAddDefined(symbols,
+                                                 "_cheng_macho_text_data_smoke__cheng_saved_argv",
+                                                 1,
+                                                 int64(8),
+                                                 int64(8),
+                                                 false)
+    assert(fnIndex == 0, " macho text data writer smoke: function symbol")
+    assert(argcIndex == 1, " macho text data writer smoke: argc symbol")
+    assert(argvIndex == 2, " macho text data writer smoke: argv symbol")
+
+    var relocs = orel.ObjectRelocsInit()
+    let _ = orel.ObjectRelocsAdd(relocs, 0, int64(0), argcIndex, orel.ObjectRelocPage21, int64(0), true)
+    let _ = orel.ObjectRelocsAdd(relocs, 0, int64(4), argcIndex, orel.ObjectRelocPageOff12, int64(0), false)
+    let _ = orel.ObjectRelocsAdd(relocs, 0, int64(12), argvIndex, orel.ObjectRelocPage21, int64(0), true)
+    let _ = orel.ObjectRelocsAdd(relocs, 0, int64(16), argvIndex, orel.ObjectRelocPageOff12, int64(0), false)
+
+    let bytesRes = macho.MachOTextDataObjectBytes(textBytes, dataBytes, symbols, relocs)
+    assert(IsOk(bytesRes), " macho text data writer smoke: bytes")
+    let objectBytes = Value(bytesRes)
+    assert(rawbytes.bytesLen(objectBytes) > rawbytes.bytesLen(textBytes) + rawbytes.bytesLen(dataBytes),
+           " macho text data writer smoke: object size")
+    assert(SmokeU32LE(objectBytes, 16) == 2, " macho text data writer smoke: load command count")
+    let textSectionOffset = 32 + 72
+    let dataSectionOffset = textSectionOffset + 80
+    let relocOffset = SmokeU32LE(objectBytes, textSectionOffset + 56)
+    let relocCount = SmokeU32LE(objectBytes, textSectionOffset + 60)
+    assert(SmokeU32LE(objectBytes, dataSectionOffset + 48) > SmokeU32LE(objectBytes, textSectionOffset + 48),
+           " macho text data writer smoke: data section after text")
+    assert(relocCount == 4, " macho text data writer smoke: reloc count")
+    assert(SmokeRelocInfoByte(objectBytes, relocOffset, 0) == 61,
+           " macho text data writer smoke: page21 reloc info")
+    assert(SmokeRelocInfoByte(objectBytes, relocOffset, 1) == 76,
+           " macho text data writer smoke: pageoff12 reloc info")
+    assert(SmokeRelocInfoByte(objectBytes, relocOffset, 2) == 61,
+           " macho text data writer smoke: argv page21 reloc info")
+    assert(SmokeRelocInfoByte(objectBytes, relocOffset, 3) == 76,
+           " macho text data writer smoke: argv pageoff12 reloc info")
+
+    let writeRes = macho.MachOTextDataObjectWrite(os.GetCurrentDir(),
+                                                  "/tmp/macho_text_data_writer_smoke.o",
+                                                  textBytes,
+                                                  dataBytes,
+                                                  symbols,
+                                                  relocs)
+    assert(IsOk(writeRes), " macho text data writer smoke: write")
+    let write = Value(writeRes)
+    assert(write.symbolCount == 3, " macho text data writer smoke: write symbol count")
+    assert(write.relocCount == 4, " macho text data writer smoke: write reloc count")
+    assert(write.bytesWritten == rawbytes.bytesLen(objectBytes),
+           " macho text data writer smoke: write byte count")
+    echo("macho_text_data_writer_smoke ok")
+    return 0

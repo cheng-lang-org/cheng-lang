@@ -3,6 +3,7 @@ import std/system
 import std/strings
 import std/strutils
 import std/rawmem_support
+import std/parseutils
 
 @importc("cheng_seq_set_grow")
 fn json_cheng_seq_set_grow(seqPtr: ptr, idx: int32, elemSize: int32): ptr
@@ -42,6 +43,13 @@ type
         success: bool
         value: JsonNode
         message: str
+
+    JsonParserState =
+        content: str
+        pos: int32
+        len: int32
+        error: bool
+        errorMsg: str
 
 fn newJsonNode(kind: JsonNodeKind): JsonNode =
     var node: JsonNode
@@ -413,6 +421,13 @@ fn jsonHexNibble(value: int32): char =
         return char(int32('0') + value)
     return char(int32('a') + (value - 10))
 
+// NOTE: jsonEscapedCharLen and jsonEscapedLen compute the length of an escaped
+// string in a first pass, then jsonWriteEscapedContent writes the escaped
+// content in a second pass. This is O(2N). If performance on large strings
+// becomes an issue, an alternative would be to write directly into a growable
+// buffer in a single pass (avoiding the pre-measurement). The two-pass design
+// is kept here because it integrates cleanly with the pre-allocation pattern
+// used by stringify() and avoids dynamic reallocation overhead.
 fn jsonEscapedCharLen(ch: char): int32 =
     let chCode: int32 = int32(ch)
     if chCode == 92:
@@ -439,7 +454,11 @@ fn jsonEscapedLen(value: str): int32 =
 fn jsonQuotedLen(value: str): int32 =
     return jsonEscapedLen(value) + 2
 
-fn jsonStringifiedLen(node: JsonNode): int32 =
+// Depth-limited recursive length computation. When depth exceeds 256, returns
+// 5 (the length of "\"...\"" in the truncated output) to prevent stack overflow.
+fn jsonStringifiedLenDepth(node: JsonNode, depth: int32): int32 =
+    if depth > 256:
+        return 5
     if node.kind == JNull:
         return 4
     if node.kind == JBool:
@@ -455,14 +474,66 @@ fn jsonStringifiedLen(node: JsonNode): int32 =
         for i in 0..<node.a.len:
             if i > 0:
                 total = total + 1
-            total = total + jsonStringifiedLen(node.a[i])
+            total = total + jsonStringifiedLenDepth(node.a[i], depth + 1)
         return total
     if node.kind == JObject:
         var total: int32 = 2
         for i in 0..<node.okeys.len:
             if i > 0:
                 total = total + 1
-            total = strutils.Join([total, jsonQuotedLen(node.okeys[i]), 1, jsonStringifiedLen(node.ovalues[i])], "")
+            total = total + jsonQuotedLen(node.okeys[i]) + 1 + jsonStringifiedLenDepth(node.ovalues[i], depth + 1)
+        return total
+    return 4
+
+fn jsonStringifiedLen(node: JsonNode): int32 =
+    return jsonStringifiedLenDepth(node, 0)
+
+// Compute pretty-printed length with indentation.
+fn jsonPrettyStringifiedLenDepth(node: JsonNode, indentCount: int32, depth: int32): int32 =
+    if depth > 256:
+        return 5
+    if node.kind == JNull:
+        return 4
+    if node.kind == JBool:
+        return node.b ? 4 : 5
+    if node.kind == JInt:
+        return strings.Len(int64ToStr(node.i))
+    if node.kind == JFloat:
+        return strings.Len(strutils.FormatFloat(node.f))
+    if node.kind == JString:
+        return jsonQuotedLen(node.s)
+    if node.kind == JArray:
+        if node.a.len == 0:
+            return 2
+        var total: int32 = 2
+        // [ + newline
+        total = total + 1
+        for i in 0..<node.a.len:
+            if i > 0:
+                // , + newline
+                total = total + 2
+            // indent for this element
+            total = total + indentCount * (depth + 1)
+            total = total + jsonPrettyStringifiedLenDepth(node.a[i], indentCount, depth + 1)
+        // newline + indent + ]
+        total = total + 1 + indentCount * depth
+        return total
+    if node.kind == JObject:
+        if node.okeys.len == 0:
+            return 2
+        var total: int32 = 2
+        // { + newline
+        total = total + 1
+        for i in 0..<node.okeys.len:
+            if i > 0:
+                // , + newline
+                total = total + 2
+            // indent for this entry
+            total = total + indentCount * (depth + 1)
+            total = total + jsonQuotedLen(node.okeys[i]) + 2  // ": "
+            total = total + jsonPrettyStringifiedLenDepth(node.ovalues[i], indentCount, depth + 1)
+        // newline + indent + }
+        total = total + 1 + indentCount * depth
         return total
     return 4
 
@@ -492,8 +563,7 @@ fn jsonWriteUnicodeEscape(out: str, pos: var int32, chCode: int32) =
 fn jsonWriteEscapedContent(out: str, pos: var int32, value: str) =
     let n: int32 = strings.Len(value)
     var runStart: int32
-    var i: int32
-    while i < n:
+    for i in range(n):
         let ch: char = value[i]
         let chCode: int32 = int32(ch)
         var escaped: bool
@@ -514,7 +584,6 @@ fn jsonWriteEscapedContent(out: str, pos: var int32, value: str) =
             else:
                 jsonWriteUnicodeEscape(out, pos, chCode)
             runStart = i + 1
-        i = i + 1
     jsonWriteSlice(out, pos, value, runStart, n - runStart)
 
 fn jsonWriteQuoted(out: str, pos: var int32, value: str) =
@@ -522,7 +591,18 @@ fn jsonWriteQuoted(out: str, pos: var int32, value: str) =
     jsonWriteEscapedContent(out, pos, value)
     jsonWriteByte(out, pos, 34)
 
-fn jsonWriteNode(out: str, pos: var int32, node: JsonNode) =
+// Write indentation spaces: indentCount * depth spaces.
+fn jsonWriteIndent(out: str, pos: var int32, indentCount: int32, depth: int32) =
+    let total: int32 = indentCount * depth
+    for i in range(total):
+        jsonWriteByte(out, pos, 32)
+
+// Depth-limited recursive JSON writer. When depth exceeds 256, writes "..."
+// as a truncation marker and returns to prevent stack overflow.
+fn jsonWriteNodeDepth(out: str, pos: var int32, node: JsonNode, depth: int32) =
+    if depth > 256:
+        jsonWriteLiteral(out, pos, "\"...\"")
+        return
     if node.kind == JNull:
         jsonWriteLiteral(out, pos, "null")
         return
@@ -546,7 +626,7 @@ fn jsonWriteNode(out: str, pos: var int32, node: JsonNode) =
         for i in 0..<node.a.len:
             if i > 0:
                 jsonWriteByte(out, pos, 44)
-            jsonWriteNode(out, pos, node.a[i])
+            jsonWriteNodeDepth(out, pos, node.a[i], depth + 1)
         jsonWriteByte(out, pos, 93)
         return
     if node.kind == JObject:
@@ -556,10 +636,13 @@ fn jsonWriteNode(out: str, pos: var int32, node: JsonNode) =
                 jsonWriteByte(out, pos, 44)
             jsonWriteQuoted(out, pos, node.okeys[i])
             jsonWriteByte(out, pos, 58)
-            jsonWriteNode(out, pos, node.ovalues[i])
+            jsonWriteNodeDepth(out, pos, node.ovalues[i], depth + 1)
         jsonWriteByte(out, pos, 125)
         return
     jsonWriteLiteral(out, pos, "null")
+
+fn jsonWriteNode(out: str, pos: var int32, node: JsonNode) =
+    jsonWriteNodeDepth(out, pos, node, 0)
 
 fn stringify(node: JsonNode): str =
     let total: int32 = jsonStringifiedLen(node)
@@ -579,9 +662,72 @@ fn escapeJsonString(value: str): str =
     assert(pos == total, "std/json escape length mismatch")
     return out
 
+// Pretty-print a JSON node with indentation.
+fn jsonWriteNodePrettyDepth(out: str, pos: var int32, node: JsonNode, indentCount: int32, depth: int32) =
+    if depth > 256:
+        jsonWriteLiteral(out, pos, "\"...\"")
+        return
+    if node.kind == JNull:
+        jsonWriteLiteral(out, pos, "null")
+        return
+    if node.kind == JBool:
+        if node.b:
+            jsonWriteLiteral(out, pos, "true")
+        else:
+            jsonWriteLiteral(out, pos, "false")
+        return
+    if node.kind == JInt:
+        jsonWriteLiteral(out, pos, int64ToStr(node.i))
+        return
+    if node.kind == JFloat:
+        jsonWriteLiteral(out, pos, strutils.FormatFloat(node.f))
+        return
+    if node.kind == JString:
+        jsonWriteQuoted(out, pos, node.s)
+        return
+    if node.kind == JArray:
+        if node.a.len == 0:
+            jsonWriteLiteral(out, pos, "[]")
+            return
+        jsonWriteByte(out, pos, 91)
+        jsonWriteByte(out, pos, 10)
+        for i in 0..<node.a.len:
+            if i > 0:
+                jsonWriteByte(out, pos, 44)
+                jsonWriteByte(out, pos, 10)
+            jsonWriteIndent(out, pos, indentCount, depth + 1)
+            jsonWriteNodePrettyDepth(out, pos, node.a[i], indentCount, depth + 1)
+        jsonWriteByte(out, pos, 10)
+        jsonWriteIndent(out, pos, indentCount, depth)
+        jsonWriteByte(out, pos, 93)
+        return
+    if node.kind == JObject:
+        if node.okeys.len == 0:
+            jsonWriteLiteral(out, pos, "{}")
+            return
+        jsonWriteByte(out, pos, 123)
+        jsonWriteByte(out, pos, 10)
+        for i in 0..<node.okeys.len:
+            if i > 0:
+                jsonWriteByte(out, pos, 44)
+                jsonWriteByte(out, pos, 10)
+            jsonWriteIndent(out, pos, indentCount, depth + 1)
+            jsonWriteQuoted(out, pos, node.okeys[i])
+            jsonWriteLiteral(out, pos, ": ")
+            jsonWriteNodePrettyDepth(out, pos, node.ovalues[i], indentCount, depth + 1)
+        jsonWriteByte(out, pos, 10)
+        jsonWriteIndent(out, pos, indentCount, depth)
+        jsonWriteByte(out, pos, 125)
+        return
+    jsonWriteLiteral(out, pos, "null")
+
 fn pretty(node: JsonNode, indent: int): str =
-    indent
-    return stringify(node)
+    let total: int32 = jsonPrettyStringifiedLenDepth(node, int32(indent), 0)
+    let out: str = newStringAlloc(total)
+    var pos: int32
+    jsonWriteNodePrettyDepth(out, pos, node, int32(indent), 0)
+    assert(pos == total, "std/json pretty length mismatch")
+    return out
 
 fn toPretty(node: JsonNode, indent: int): str =
     return pretty(node, indent)
@@ -592,20 +738,355 @@ fn toJsonString(node: JsonNode): str =
 fn `$`(node: JsonNode): str =
     return stringify(node)
 
-fn parseJson(content: str): JsonNode =
-    content
+// ---------------------------------------------------------------------------
+// JSON Parser
+// ---------------------------------------------------------------------------
+
+fn jsonParserSkipWhitespace(state: var JsonParserState) =
+    while state.pos < state.len:
+        let ch: char = state.content[state.pos]
+        if ch == char(32) || ch == char(10) || ch == char(13) || ch == char(9):
+            state.pos = state.pos + 1
+        else:
+            break
+
+fn jsonParserPeek(state: var JsonParserState): char =
+    if state.pos < state.len:
+        return state.content[state.pos]
+    return char(0)
+
+fn jsonParserNext(state: var JsonParserState): char =
+    let ch: char = jsonParserPeek(state)
+    state.pos = state.pos + 1
+    return ch
+
+fn jsonParserSetError(state: var JsonParserState, msg: str) =
+    state.error = true
+    state.errorMsg = msg
+
+// Read a string (unescaped) from the parser state. Assumes state.pos is at
+// the opening double-quote. Returns the unescaped string, or sets error.
+fn jsonParseRawString(state: var JsonParserState): str =
+    if jsonParserPeek(state) != char(34):
+        jsonParserSetError(state, "expected opening quote for string")
+        return ""
+    state.pos = state.pos + 1  // skip opening "
+    // First pass: compute unescaped length and find closing quote.
+    var unescapedLen: int32
+    var scanPos: int32 = state.pos
+    var foundClose: bool
+    while scanPos < state.len:
+        let ch: char = state.content[scanPos]
+        if ch == char(34):
+            foundClose = true
+            break
+        if ch == char(92):
+            scanPos = scanPos + 1
+            if scanPos >= state.len:
+                jsonParserSetError(state, "unexpected end of input in string escape")
+                return ""
+            let esc: char = state.content[scanPos]
+            if esc == char(117):
+                scanPos = scanPos + 4  // skip 4 hex digits
+        unescapedLen = unescapedLen + 1
+        scanPos = scanPos + 1
+    if !foundClose:
+        jsonParserSetError(state, "unterminated string")
+        return ""
+    // Second pass: build unescaped string.
+    let out: str = newStringAlloc(unescapedLen)
+    var outPos: int32
+    while state.pos < scanPos:
+        let ch: char = state.content[state.pos]
+        if ch == char(92):
+            state.pos = state.pos + 1
+            let esc: char = state.content[state.pos]
+            if esc == char(34):
+                jsonWriteByte(out, outPos, 34)
+            elif esc == char(92):
+                jsonWriteByte(out, outPos, 92)
+            elif esc == char(47):
+                jsonWriteByte(out, outPos, 47)
+            elif esc == char(98):
+                jsonWriteByte(out, outPos, 8)
+            elif esc == char(102):
+                jsonWriteByte(out, outPos, 12)
+            elif esc == char(110):
+                jsonWriteByte(out, outPos, 10)
+            elif esc == char(114):
+                jsonWriteByte(out, outPos, 13)
+            elif esc == char(116):
+                jsonWriteByte(out, outPos, 9)
+            elif esc == char(117):
+                state.pos = state.pos + 1
+                var hexVal: int32
+                for k in 0..<4:
+                    let hexCh: char = state.content[state.pos]
+                    state.pos = state.pos + 1
+                    var digitVal: int32
+                    if hexCh >= char(48) && hexCh <= char(57):
+                        digitVal = int32(hexCh) - 48
+                    elif hexCh >= char(65) && hexCh <= char(70):
+                        digitVal = int32(hexCh) - 55
+                    elif hexCh >= char(97) && hexCh <= char(102):
+                        digitVal = int32(hexCh) - 87
+                    else:
+                        jsonParserSetError(state, "invalid hex digit in unicode escape")
+                        return ""
+                    hexVal = (hexVal << 4) | digitVal
+                state.pos = state.pos - 1  // loop will increment past the last hex digit
+                if hexVal <= 127:
+                    jsonWriteByte(out, outPos, hexVal)
+                else:
+                    // Non-ASCII: store raw; caller can handle or ignore.
+                    // For a minimal parser, encode as UTF-8-like single byte
+                    // or just store the low byte for simplicity.
+                    jsonWriteByte(out, outPos, hexVal & 255)
+            else:
+                jsonParserSetError(state, "invalid escape sequence")
+                return ""
+        else:
+            jsonWriteByte(out, outPos, int32(ch))
+        state.pos = state.pos + 1
+    state.pos = scanPos + 1  // skip closing "
+    return out
+
+fn jsonParseValue(state: var JsonParserState): JsonNode
+
+fn jsonParseArray(state: var JsonParserState): JsonNode =
+    // state.pos is at opening '['
+    state.pos = state.pos + 1
+    var node: JsonNode = newJArray()
+    jsonParserSkipWhitespace(state)
+    if jsonParserPeek(state) != char(93):
+        while true:
+            let item: JsonNode = jsonParseValue(state)
+            if state.error:
+                return jsonNil()
+            jsonAddNode(node, item)
+            jsonParserSkipWhitespace(state)
+            if jsonParserPeek(state) == char(93):
+                break
+            if jsonParserPeek(state) != char(44):
+                jsonParserSetError(state, "expected , or ] in array")
+                return jsonNil()
+            state.pos = state.pos + 1  // skip ,
+            jsonParserSkipWhitespace(state)
+    state.pos = state.pos + 1  // skip ]
+    return node
+
+fn jsonParseObject(state: var JsonParserState): JsonNode =
+    // state.pos is at opening '{'
+    state.pos = state.pos + 1
+    var node: JsonNode = newJObject()
+    jsonParserSkipWhitespace(state)
+    if jsonParserPeek(state) != char(125):
+        while true:
+            jsonParserSkipWhitespace(state)
+            let key: str = jsonParseRawString(state)
+            if state.error:
+                return jsonNil()
+            jsonParserSkipWhitespace(state)
+            if jsonParserPeek(state) != char(58):
+                jsonParserSetError(state, "expected : in object")
+                return jsonNil()
+            state.pos = state.pos + 1  // skip :
+            jsonParserSkipWhitespace(state)
+            let value: JsonNode = jsonParseValue(state)
+            if state.error:
+                return jsonNil()
+            jsonSetField(node, key, value)
+            jsonParserSkipWhitespace(state)
+            if jsonParserPeek(state) == char(125):
+                break
+            if jsonParserPeek(state) != char(44):
+                jsonParserSetError(state, "expected , or } in object")
+                return jsonNil()
+            state.pos = state.pos + 1  // skip ,
+    state.pos = state.pos + 1  // skip }
+    return node
+
+fn jsonParseValue(state: var JsonParserState): JsonNode =
+    jsonParserSkipWhitespace(state)
+    let ch: char = jsonParserPeek(state)
+    if ch == char(0):
+        jsonParserSetError(state, "unexpected end of input")
+        return jsonNil()
+    // String
+    if ch == char(34):
+        let value: str = jsonParseRawString(state)
+        if state.error:
+            return jsonNil()
+        return newJString(value)
+    // Number: leading digit or minus
+    if (ch >= char(48) && ch <= char(57)) || ch == char(45):
+        var start: int32 = state.pos
+        if ch == char(45):
+            state.pos = state.pos + 1
+        // Integer part (digits)
+        var hasDigits: bool
+        while state.pos < state.len:
+            let d: char = state.content[state.pos]
+            if d >= char(48) && d <= char(57):
+                hasDigits = true
+                state.pos = state.pos + 1
+            else:
+                break
+        if !hasDigits:
+            jsonParserSetError(state, "expected digits in number")
+            return jsonNil()
+        var isFloat: bool
+        // Fractional part
+        if state.pos < state.len && state.content[state.pos] == char(46):
+            isFloat = true
+            state.pos = state.pos + 1
+            var hasFrac: bool
+            while state.pos < state.len:
+                let d: char = state.content[state.pos]
+                if d >= char(48) && d <= char(57):
+                    hasFrac = true
+                    state.pos = state.pos + 1
+                else:
+                    break
+            if !hasFrac:
+                jsonParserSetError(state, "expected digits after decimal point")
+                return jsonNil()
+        // Exponent part
+        if state.pos < state.len && (state.content[state.pos] == char(101) || state.content[state.pos] == char(69)):
+            isFloat = true
+            state.pos = state.pos + 1
+            if state.pos < state.len && (state.content[state.pos] == char(43) || state.content[state.pos] == char(45)):
+                state.pos = state.pos + 1
+            var hasExp: bool
+            while state.pos < state.len:
+                let d: char = state.content[state.pos]
+                if d >= char(48) && d <= char(57):
+                    hasExp = true
+                    state.pos = state.pos + 1
+                else:
+                    break
+            if !hasExp:
+                jsonParserSetError(state, "expected digits in exponent")
+                return jsonNil()
+        // Extract the number substring and parse.
+        let numStr: str = jsonSubstring(state.content, start, state.pos)
+        if isFloat:
+            let f: float64 = jsonParseFloat(numStr)
+            return newJFloat(f)
+        else:
+            let i: int64 = jsonParseInt(numStr)
+            return newJInt(i)
+    // true
+    if ch == char(116):
+        if state.pos + 4 <= state.len:
+            let sub: str = jsonSubstring(state.content, state.pos, state.pos + 4)
+            if sub == "true":
+                state.pos = state.pos + 4
+                return newJBool(true)
+        jsonParserSetError(state, "expected true")
+        return jsonNil()
+    // false
+    if ch == char(102):
+        if state.pos + 5 <= state.len:
+            let sub: str = jsonSubstring(state.content, state.pos, state.pos + 5)
+            if sub == "false":
+                state.pos = state.pos + 5
+                return newJBool(false)
+        jsonParserSetError(state, "expected false")
+        return jsonNil()
+    // null
+    if ch == char(110):
+        if state.pos + 4 <= state.len:
+            let sub: str = jsonSubstring(state.content, state.pos, state.pos + 4)
+            if sub == "null":
+                state.pos = state.pos + 4
+                return newJNull()
+        jsonParserSetError(state, "expected null")
+        return jsonNil()
+    // Array
+    if ch == char(91):
+        return jsonParseArray(state)
+    // Object
+    if ch == char(123):
+        return jsonParseObject(state)
+    jsonParserSetError(state, "unexpected character")
     return jsonNil()
+
+// Create a substring from content[start..end) (end exclusive).
+fn jsonSubstring(content: str, start: int32, end: int32): str =
+    let count: int32 = end - start
+    if count <= 0:
+        return ""
+    let out: str = newStringAlloc(count)
+    var outPos: int32
+    jsonWriteSlice(out, outPos, content, start, count)
+    return out
+
+// Parse an integer from a decimal string (no validation; assumes valid input).
+fn jsonParseInt(value: str): int64 =
+    var result: int64
+    var neg: bool
+    let n: int32 = strings.Len(value)
+    if n > 0 && value[0] == char(45):
+        neg = true
+        for i in range(1, n):
+            result = result * 10 + int64(int32(value[i]) - 48)
+    else:
+        for i in range(n):
+            result = result * 10 + int64(int32(value[i]) - 48)
+    if neg:
+        return -result
+    return result
+
+fn jsonParseFloat(value: str): float64 =
+    var out: parseutils.BiggestFloat
+    let parsed = parseutils.ParseBiggestFloat(value, out)
+    if parsed <= 0:
+        return 0.0
+    return out
+
+fn parseJson(content: str): JsonNode =
+    var state: JsonParserState
+    state.content = content
+    state.pos = 0
+    state.len = strings.Len(content)
+    state.error = false
+    state.errorMsg = ""
+    let result: JsonNode = jsonParseValue(state)
+    if state.error:
+        return jsonNil()
+    jsonParserSkipWhitespace(state)
+    if state.pos != state.len:
+        // Trailing content after the top-level value.
+        return jsonNil()
+    return result
 
 fn parseJsonNode(content: str): JsonNode =
-    content
-    return jsonNil()
+    return parseJson(content)
 
 fn parseJsonSafe(content: str): JsonParseResult =
-    content
+    var state: JsonParserState
+    state.content = content
+    state.pos = 0
+    state.len = strings.Len(content)
+    state.error = false
+    state.errorMsg = ""
+    let result: JsonNode = jsonParseValue(state)
     var out: JsonParseResult
-    out.success = false
-    out.value = jsonNil()
-    out.message = "json parsing not implemented in bootstrap"
+    if state.error:
+        out.success = false
+        out.value = jsonNil()
+        out.message = state.errorMsg
+        return out
+    jsonParserSkipWhitespace(state)
+    if state.pos != state.len:
+        out.success = false
+        out.value = jsonNil()
+        out.message = "trailing content after json value"
+        return out
+    out.success = true
+    out.value = result
+    out.message = ""
     return out
 
 fn jsonField(key: str, value: JsonNode): CompatJsonPair =
