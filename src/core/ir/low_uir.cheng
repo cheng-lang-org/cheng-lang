@@ -1,0 +1,260 @@
+-- Low-UIR: flat statement-sequence IR with body kind / call sequence for
+-- straight-line multi-call functions.  Phase 1 covers no branches, no loops.
+
+import std/strformat
+import cheng/core/lang/typed_expr as texpr
+import cheng/core/ir/core_types as coreir
+import cheng/core/tooling/path as chengpath
+
+type
+    LowUirBuildResult = enum
+        LowUirBuildOk
+        LowUirBuildNoStatements
+        LowUirBuildUnsupportedStmtKind
+        LowUirBuildUnsupportedReturn
+        LowUirBuildMissingCallTarget
+        LowUirBuildArgSlotFailed
+
+    LowUirStatement =
+        kind: texpr.TypedExprIrStatementKind
+        callTarget: str
+        callArgsText: str
+        bindingName: str
+        resultType: str
+        returnRoot: bool
+
+fn lowUirAlignInt32(value: int32, align: int32): int32 =
+    if align <= 1:
+        return value
+    let rem = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn lowUirLocalTypeKind(typeTextRaw: str): int32 =
+    let typeText = texpr.TypedExprNormalizeTypeText(typeTextRaw)
+    if typeText == "int32" || typeText == "bool":
+        return coreir.LocalI32Tag
+    if typeText == "float64":
+        return coreir.LocalF64Tag
+    if typeText == "str":
+        return coreir.LocalStrTag
+    if typeText == "cstring":
+        return coreir.LocalPtrTag
+    if chengpath.TextContains(typeText, "[]"):
+        return coreir.LocalAggregateTag
+    if chengpath.TextContains(typeText, "Result["):
+        return coreir.LocalAggregateTag
+    if !texpr.TypedExprTypeTextIsConcrete(typeText):
+        return coreir.LocalAggregateTag
+    return coreir.LocalInvalidTag
+
+fn lowUirLocalTypeSizeBytes(typeTextRaw: str,
+                             typeKind: int32): int32 =
+    let typeText = texpr.TypedExprNormalizeTypeText(typeTextRaw)
+    if typeKind == coreir.LocalI32Tag:
+        return 4
+    if typeKind == coreir.LocalF64Tag:
+        return 8
+    if typeKind == coreir.LocalStrTag:
+        return 24
+    if typeKind == coreir.LocalPtrTag:
+        return 8
+    if typeKind == coreir.LocalAggregateTag:
+        if chengpath.TextContains(typeText, "Result"):
+            return 40
+        if chengpath.TextContains(typeText, "[]"):
+            return 16
+        return 24
+    return 0
+
+fn lowUirLocalTypeAlignBytes(typeKind: int32): int32 =
+    if typeKind == coreir.LocalI32Tag:
+        return 4
+    if typeKind == coreir.LocalF64Tag:
+        return 8
+    if typeKind == coreir.LocalStrTag:
+        return 8
+    if typeKind == coreir.LocalPtrTag:
+        return 8
+    if typeKind == coreir.LocalAggregateTag:
+        return 16
+    return 1
+
+fn lowUirBodyIrNextLocalOffset(bodyIR: coreir.BodyIR,
+                                alignBytes: int32): int32 =
+    var nextOffset: int32 = 16
+    for i in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[i]
+        var slotSize = slot.sizeBytes
+        if slotSize <= 0:
+            if slot.typeKind == coreir.LocalI32Tag:
+                slotSize = 4
+            elif slot.typeKind == coreir.LocalF64Tag:
+                slotSize = 8
+            elif slot.typeKind == coreir.LocalStrTag:
+                slotSize = 24
+            elif slot.typeKind == coreir.LocalPtrTag:
+                slotSize = 8
+            elif slot.typeKind == coreir.LocalAggregateTag:
+                slotSize = slot.sizeBytes
+        let slotEnd = slot.stackOffset + slotSize
+        if slotEnd > nextOffset:
+            nextOffset = slotEnd
+    return lowUirAlignInt32(nextOffset, alignBytes)
+
+fn lowUirLocalSlotIndex(bodyIR: coreir.BodyIR,
+                         name: str): int32 =
+    for i in 0..<bodyIR.localSlots.len:
+        if bodyIR.localSlots[i].name == name:
+            return bodyIR.localSlots[i].id
+    return -1
+
+fn lowUirEnsureLocalSlot(bodyIR: var coreir.BodyIR,
+                          name: str,
+                          typeTextRaw: str): int32 =
+    if len(name) <= 0:
+        return -1
+    let existing = lowUirLocalSlotIndex(bodyIR, name)
+    if existing >= 0:
+        return existing
+    let typeKind = lowUirLocalTypeKind(typeTextRaw)
+    if typeKind == coreir.LocalInvalidTag:
+        return -1
+    let sizeBytes = lowUirLocalTypeSizeBytes(typeTextRaw, typeKind)
+    if sizeBytes <= 0:
+        return -1
+    let alignBytes = lowUirLocalTypeAlignBytes(typeKind)
+    var slot: coreir.LocalSlot
+    slot.id = bodyIR.localSlots.len
+    slot.name = name
+    slot.typeKind = typeKind
+    slot.sizeBytes = sizeBytes
+    slot.alignBytes = alignBytes
+    slot.stackOffset = lowUirBodyIrNextLocalOffset(bodyIR, alignBytes)
+    add(bodyIR.localSlots, slot)
+    return slot.id
+
+fn lowUirCallArgSlot(bodyIR: coreir.BodyIR,
+                      argName: str,
+                      paramSlots: int32[],
+                      paramNames: str[]): int32 =
+    if len(argName) <= 0:
+        return -1
+    let localSlot = lowUirLocalSlotIndex(bodyIR, argName)
+    if localSlot >= 0:
+        return localSlot
+    for pi in 0..<paramNames.len:
+        if paramNames[pi] == argName && pi < paramSlots.len:
+            return 0 - paramSlots[pi] - 1
+    return -1
+
+--- Build a BodyIR from a PrimaryObjectIrFunction whose statements are
+--- call/call-let sequence. Each statement must have kind StmtLetCall or StmtCall.
+--- At least one statement must be marked returnRoot.
+fn lowUirBuildFromStatements(bodyIR: var coreir.BodyIR,
+                              stmts: LowUirStatement[],
+                              stmtCount: int32,
+                              paramSlots: int32[],
+                              paramNames: str[]): LowUirBuildResult =
+    if stmtCount <= 0:
+        return LowUirBuildNoStatements
+
+    var hasReturnStmt = false
+    for stmtIndex in 0..<stmtCount:
+        let stmt = stmts[stmtIndex]
+
+        if stmt.kind != texpr.TypedExprIrStmtLetCall &&
+           stmt.kind != texpr.TypedExprIrStmtCall:
+            return LowUirBuildUnsupportedStmtKind
+
+        if len(stmt.callTarget) <= 0:
+            return LowUirBuildMissingCallTarget
+
+        -- Determine result slot name.
+        var resultSlotName = ""
+        if stmt.kind == texpr.TypedExprIrStmtLetCall && len(stmt.bindingName) > 0:
+            resultSlotName = stmt.bindingName
+        else:
+            resultSlotName = Fmt"__low_{stmtIndex}"
+
+        -- Ensure local slot for the result.
+        let resultSlot = lowUirEnsureLocalSlot(bodyIR,
+                                               resultSlotName,
+                                               stmt.resultType)
+
+        -- Build arg slots from the statement.
+        var argSlots: int32[]
+        let args = texpr.TypedExprSplitTopLevelCsv(stmt.callArgsText)
+        for argIndex in 0..<args.len:
+            let slot = lowUirCallArgSlot(bodyIR,
+                                        args[argIndex],
+                                        paramSlots,
+                                        paramNames)
+            if slot < 0:
+                return LowUirBuildArgSlotFailed
+            add(argSlots, slot)
+
+        -- Append call op.
+        let callOrdinal = bodyIR.callSequence.len
+        var bodyCall: coreir.CallOp
+        bodyCall.targetSymbol = stmt.callTarget
+        bodyCall.argSlots = argSlots
+        bodyCall.resultSlot = resultSlot
+        bodyCall.relocWordOffset = -1
+        add(bodyIR.callSequence, bodyCall)
+
+        var op: coreir.BodyOp
+        op.kind = coreir.BodyOpCallTag
+        add(op.operands, callOrdinal)
+        op.target = resultSlot
+        add(bodyIR.ops, op)
+
+        if stmt.returnRoot:
+            hasReturnStmt = true
+
+    if !hasReturnStmt:
+        return LowUirBuildUnsupportedReturn
+
+    -- Add return op based on last call's result type.
+    let lastCallSlot = bodyIR.ops[len(bodyIR.ops) - 1].target
+    var returnOp: coreir.BodyOp
+    returnOp.kind = coreir.BodyOpReturnTag
+    if lastCallSlot >= 0 && lastCallSlot < bodyIR.localSlots.len:
+        returnOp.target = lastCallSlot
+        add(returnOp.operands, bodyIR.localSlots[lastCallSlot].typeKind)
+    else:
+        returnOp.target = -1
+        add(returnOp.operands, coreir.LocalI32Tag)
+    add(bodyIR.ops, returnOp)
+
+    return LowUirBuildOk
+
+--- Try to build a generic BodyIR from backend-adapted LowUirStatement records.
+--- The backend lowering layer owns adapting its richer statement records into
+--- this dependency-free IR shape.
+fn lowUirTryBuildFromStatements(bodyIR: var coreir.BodyIR,
+                                 stmts: LowUirStatement[],
+                                 stmtCount: int32,
+                                 paramSlots: int32[],
+                                 paramNames: str[]): LowUirBuildResult =
+    if stmtCount <= 0:
+        return LowUirBuildNoStatements
+
+    var hasCall = false
+    for stmtIndex in 0..<stmtCount:
+        if stmtIndex >= stmts.len:
+            return LowUirBuildNoStatements
+        if stmts[stmtIndex].kind == texpr.TypedExprIrStmtLetCall ||
+           stmts[stmtIndex].kind == texpr.TypedExprIrStmtCall:
+            hasCall = true
+            break
+    if !hasCall:
+        return LowUirBuildNoStatements
+
+    bodyIR = coreir.BodyIR()
+    return lowUirBuildFromStatements(bodyIR,
+                                     stmts,
+                                     stmtCount,
+                                     paramSlots,
+                                     paramNames)

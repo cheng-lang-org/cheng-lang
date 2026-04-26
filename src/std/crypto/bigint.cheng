@@ -80,12 +80,13 @@ fn bigIsOdd(a: BigInt): bool =
     return a.count > 0 && (bigWordToU64(a.limbs[0]) & 1) != 0
 
 fn bigNormalize(a: var BigInt) =
-    var i: int32 = a.count - 1
-    while i >= 0:
-        if a.limbs[i] != 0:
-            a.count = i + 1
-            return
-        i = i - 1
+    let iStart3 = a.count - 1
+    if iStart3 >= 0:
+        for iOffset3 in 0..iStart3:
+            let i = iStart3 - iOffset3
+            if a.limbs[i] != 0:
+                a.count = i + 1
+                return
     a.count = 0
 
 fn bigFromInt(value: int64): BigInt =
@@ -94,7 +95,12 @@ fn bigFromInt(value: int64): BigInt =
     var out: BigInt
     var bits: uint64 = uint64(value)
     var i: int32
-    while bits != uint64(0):
+    var nBits: int32
+    var tmp: uint64 = bits
+    while tmp != uint64(0):
+        tmp = tmp >> uint64(bigIntWordBits)
+        nBits = nBits + 1
+    for _ in range(nBits):
         out.limbs[i] = bigWordFromBitsU64(bits)
         bits = bits >> uint64(bigIntWordBits)
         i = i + 1
@@ -105,9 +111,8 @@ fn bigCopy(a: BigInt): BigInt =
     var out: BigInt
     out.count = a.count
     var i: int32
-    while i < a.count:
+    for i in i..<a.count:
         out.limbs[i] = a.limbs[i]
-        i = i + 1
     return out
 
 fn bigCmp(a: BigInt, b: BigInt): int32 =
@@ -115,15 +120,16 @@ fn bigCmp(a: BigInt, b: BigInt): int32 =
         return -1
     if a.count > b.count:
         return 1
-    var i: int32 = a.count - 1
-    while i >= 0:
-        let av: int64 = bigWordToU64(a.limbs[i])
-        let bv: int64 = bigWordToU64(b.limbs[i])
-        if av < bv:
-            return -1
-        if av > bv:
-            return 1
-        i = i - 1
+    let iStart2 = a.count - 1
+    if iStart2 >= 0:
+        for iOffset2 in 0..iStart2:
+            let i = iStart2 - iOffset2
+            let av: int64 = bigWordToU64(a.limbs[i])
+            let bv: int64 = bigWordToU64(b.limbs[i])
+            if av < bv:
+                return -1
+            if av > bv:
+                return 1
     return 0
 
 fn bigAdd(a: BigInt, b: BigInt): Result[BigInt] =
@@ -133,7 +139,7 @@ fn bigAdd(a: BigInt, b: BigInt): Result[BigInt] =
         maxCount = b.count
     var carry: int64
     var i: int32
-    while i < maxCount:
+    for i in i..<maxCount:
         var av: int64
         if i < a.count:
             av = bigWordToU64(a.limbs[i])
@@ -144,7 +150,6 @@ fn bigAdd(a: BigInt, b: BigInt): Result[BigInt] =
         let sumWord: int32 = bigWordFromU64(sum)
         out.limbs[i] = sumWord
         carry = sum >> bigIntWordBits
-        i = i + 1
     if carry != 0:
         if maxCount >= maxBigIntLimbs:
             return Err[BigInt]("bigint: add overflow")
@@ -162,7 +167,7 @@ fn bigSub(a: BigInt, b: BigInt): Result[BigInt] =
     out.count = a.count
     var borrow: int64
     var i: int32
-    while i < a.count:
+    for i in i..<a.count:
         let av: int64 = bigWordToU64(a.limbs[i])
         var bv: int64
         if i < b.count:
@@ -174,7 +179,6 @@ fn bigSub(a: BigInt, b: BigInt): Result[BigInt] =
             borrow = 1
         else:
             borrow = 0
-        i = i + 1
     bigNormalize(out)
     return Ok[BigInt](out)
 
@@ -199,7 +203,7 @@ fn bigShiftLeft1(a: BigInt): Result[BigInt] =
     var carry: int32
     var srcIdx: int32 = inLen - 1
     var dstIdx: int32 = outLen - 1
-    while srcIdx >= 0:
+    for _ in range(inLen):
         let cur: int32 = bytesGet(inBytes, srcIdx)
         let shifted: int32 = ((cur << 1) & 0xff) | carry
         carry = (cur >> 7) & 1
@@ -218,11 +222,10 @@ fn bigShiftRight1(a: BigInt): BigInt =
     let outBytes: Bytes = bytesAlloc(inLen)
     var carry: int32
     var i: int32
-    while i < inLen:
+    for i in i..<inLen:
         let cur: int32 = bytesGet(inBytes, i)
         bytesSet(outBytes, i, (cur >> 1) | (carry << 7))
         carry = cur & 1
-        i = i + 1
     return Value(bigFromBytes(outBytes))
 
 fn bigBitLen(a: BigInt): int32 =
@@ -230,11 +233,12 @@ fn bigBitLen(a: BigInt): int32 =
         return 0
     var v: int64 = bigWordToU64(a.limbs[a.count - 1])
     var bits: int32 = (a.count - 1) * bigIntWordBits
-    var i: int32
-    while v > 0:
-        v = v >> 1
-        i = i + 1
-    return bits + i
+    var nBits: int32
+    var vTmp: int64 = v
+    while vTmp > 0:
+        vTmp = vTmp >> 1
+        nBits = nBits + 1
+    return bits + nBits
 
 fn bigGetBit(a: BigInt, idx: int32): int32 =
     if idx < 0:
@@ -255,21 +259,18 @@ fn bigFromBytes(data: Bytes): Result[BigInt] =
         return Err[BigInt]("bigint: input too large")
     var out: BigInt
     out.count = limbCount
-    var i: int32
-    while i < limbCount:
+    for i in range(limbCount):
         let start: int32 = n - (i + 1) * 4
         var acc: int64
         var j: int32
-        while j < 4:
+        for j in j..<4:
             let idx: int32 = start + j
             acc = acc << 8
             if idx >= 0 && idx < n:
                 acc = acc | int64(bytesGet(data, idx))
-            j = j + 1
         let accWord: int32 = bigWordFromU64(acc)
         out.limbs[i] = accWord
-        i = i + 1
-    bigNormalize(out)
+        bigNormalize(out)
     return Ok[BigInt](out)
 
 fn bigToBytes(a: BigInt, minLen: int32): Bytes =
@@ -281,7 +282,7 @@ fn bigToBytes(a: BigInt, minLen: int32): Bytes =
     let outLen: int32 = if minLen > rawLen: minLen else: rawLen
     let out: Bytes = bytesAlloc(outLen)
     var i: int32
-    while i < outLen:
+    for i in i..<outLen:
         let byteIdx: int32 = outLen - 1 - i
         let bitIdx: int32 = i * 8
         let limbIdx: int32 = bitIdx / bigIntWordBits
@@ -292,7 +293,6 @@ fn bigToBytes(a: BigInt, minLen: int32): Bytes =
         if shift > 24 && limbIdx + 1 < a.count:
             v = v | (bigWordToU64(a.limbs[limbIdx + 1]) << (bigIntWordBits - shift))
         bytesSet(out, byteIdx, int32(v & 0xff))
-        i = i + 1
     return out
 
 fn bigHalfDigitCount(a: BigInt): int32 =
@@ -514,12 +514,11 @@ fn bigMul(a: BigInt, b: BigInt): Result[BigInt] =
         return Err[BigInt]("bigint: mul half-digit overflow")
     let outHalfDigits: Bytes = bytesAlloc(outHalfMax * 2)
     var out: BigInt
-    var i: int32
-    while i < aHalfCount:
+    for i in range(aHalfCount):
         let av: uint64 = bigGetHalfDigit(a, i)
         var carry: uint64 = uint64(0)
         var j: int32
-        while j < bHalfCount:
+        for j in j..<bHalfCount:
             let idx: int32 = i + j
             let bv: uint64 = bigGetHalfDigit(b, j)
             let cur: uint64 = bigHalfDigitScratchGet(outHalfDigits, idx)
@@ -527,7 +526,6 @@ fn bigMul(a: BigInt, b: BigInt): Result[BigInt] =
             let sum: uint64 = prod + cur + carry
             bigHalfDigitScratchSet(outHalfDigits, idx, bigLowHalfBitsU64(sum))
             carry = sum >> uint64(16)
-            j = j + 1
         var carryIdx: int32 = i + bHalfCount
         while carry != uint64(0):
             if carryIdx >= outHalfMax:
@@ -537,10 +535,9 @@ fn bigMul(a: BigInt, b: BigInt): Result[BigInt] =
             bigHalfDigitScratchSet(outHalfDigits, carryIdx, bigLowHalfBitsU64(sum))
             carry = sum >> uint64(16)
             carryIdx = carryIdx + 1
-        i = i + 1
     out.count = (outHalfMax + 1) / 2
     var outIdx: int32
-    while outIdx < out.count:
+    for outIdx in outIdx..<out.count:
         let lo: uint64 = bigHalfDigitScratchGet(outHalfDigits, outIdx * 2)
         let hiIdx: int32 = outIdx * 2 + 1
         var hi: uint64 = uint64(0)
@@ -548,7 +545,6 @@ fn bigMul(a: BigInt, b: BigInt): Result[BigInt] =
             hi = bigHalfDigitScratchGet(outHalfDigits, hiIdx)
         let outWord: int32 = bigWordFromBitsU64(lo | (hi << uint64(16)))
         out.limbs[outIdx] = outWord
-        outIdx = outIdx + 1
     bigNormalize(out)
     return Ok[BigInt](out)
 
@@ -557,23 +553,24 @@ fn bigMod(a: BigInt, m: BigInt): Result[BigInt] =
         return Err[BigInt]("bigint: % by zero")
     var rem: BigInt = bigZero()
     let totalBits: int32 = bigBitLen(a)
-    var i: int32 = totalBits - 1
-    while i >= 0:
-        let shiftRes: Result[BigInt] = bigShiftLeft1(rem)
-        if IsErr(shiftRes):
-            return Err[BigInt](Error(shiftRes))
-        rem = Value(shiftRes)
-        if bigGetBit(a, i) != 0:
-            let addRes: Result[BigInt] = bigAddInt(rem, 1)
-            if IsErr(addRes):
-                return Err[BigInt](Error(addRes))
-            rem = Value(addRes)
-        if bigCmp(rem, m) >= 0:
-            let subRes: Result[BigInt] = bigSub(rem, m)
-            if IsErr(subRes):
-                return Err[BigInt](Error(subRes))
-            rem = Value(subRes)
-        i = i - 1
+    let iStart = totalBits - 1
+    if iStart >= 0:
+        for iOffset in 0..iStart:
+            let i = iStart - iOffset
+            let shiftRes: Result[BigInt] = bigShiftLeft1(rem)
+            if IsErr(shiftRes):
+                return Err[BigInt](Error(shiftRes))
+            rem = Value(shiftRes)
+            if bigGetBit(a, i) != 0:
+                let addRes: Result[BigInt] = bigAddInt(rem, 1)
+                if IsErr(addRes):
+                    return Err[BigInt](Error(addRes))
+                rem = Value(addRes)
+            if bigCmp(rem, m) >= 0:
+                let subRes: Result[BigInt] = bigSub(rem, m)
+                if IsErr(subRes):
+                    return Err[BigInt](Error(subRes))
+                rem = Value(subRes)
     return Ok[BigInt](rem)
 
 fn bigModAdd(a: BigInt, b: BigInt, m: BigInt): Result[BigInt] =

@@ -1,10 +1,10 @@
-import std/strutils as strutil
 # std/os (minimal, pure Cheng)
 import std/cmdline as cmdline
 import std/buffer
 import std/seqs
 import std/system
 import std/strings
+import std/strformat
 import std/times
 import std/rawbytes
 import std/rawmem_support
@@ -534,8 +534,8 @@ fn fileMtime(path: str): int64 =
     return cheng_file_mtime(strToCStringTemp(path))
 fn fileSize(path: str): int64 =
     return cheng_os_file_size_bridge(path)
-fn getCurrentDir(): str =
-    return strFromCStringCopy(cheng_getcwd_raw())
+@importc("driver_c_get_current_dir_bridge")
+fn getCurrentDir(): str
 fn removeFile(path: str): bool =
     c_remove(strToCStringTemp(path)) == 0
 fn renameFile(oldPath: str, newPath: str): bool =
@@ -571,10 +571,10 @@ fn quoteShell(value: str): str =
     for i in 0..<len(value):
         let part = strings.SliceBytes(value, i, 1)
         if part == "'":
-            out = strutil.Join([out, "'\"'\"'"], "")
+            out = Fmt"{out}'\"'\"'"
         else:
-            out = strutil.Join([out, part], "")
-    out = strutil.Join([out, "'"], "")
+            out = Fmt"{out}{part}"
+    out = Fmt"{out}'"
     return out
 
 fn joinPath(a: str, b: str): str =
@@ -595,9 +595,9 @@ fn joinPath(a: str, b: str): str =
         hasSep = true
     var result: str
     if !hasSep:
-        result = strutil.Join([a, "/", b], "")
+        result = Fmt"{a}/{b}"
     else:
-        result = strutil.Join([a, b], "")
+        result = Fmt"{a}{b}"
     # Reject path traversal: "../" segments and trailing ".."
     if StrContains(result, "/../") || strings.HasSuffix(result, "/.."):
         return ""
@@ -734,7 +734,7 @@ fn copyDir(src: str, dest: str) =
     dest
 fn makeWalkDirEntry(kind: PathComponent, path: str): str =
     let kindText: str = strings.IntToStr(int32(kind))
-    return strutil.Join([kindText, "|", path], "")
+    return Fmt"{kindText}|{path}"
 fn listDir(path: str): str[] =
     var out: str[]
     if len(path) == 0 || path[0] == char(0) || !dirExists(path):
@@ -955,11 +955,7 @@ fn processResourceGuardCurrentRssBytes(): int64 =
     return usage.ru_maxrss
 fn processResourceGuardMemoryLimitExceededLine(rssBytes: int64,
                                                 maxRssBytes: int64): str =
-    return strutil.Join(["compile_progress phase=resource_guard status=rss_limit_exceeded rss_bytes=",
-                         strings.Int64ToStr(rssBytes),
-                         " limit_bytes=",
-                         strings.Int64ToStr(maxRssBytes)],
-                         "")
+    return Fmt"compile_progress phase=resource_guard status=rss_limit_exceeded rss_bytes={strings.Int64ToStr(rssBytes)} limit_bytes={strings.Int64ToStr(maxRssBytes)}"
 fn processResourceGuardMemoryUnavailableLine(): str =
     return "compile_progress phase=resource_guard status=rss_unavailable"
 fn processResourceGuardCheck() =
@@ -1011,7 +1007,7 @@ fn readFileSizedInto(path: str, size: int32, out: var str): bool =
 
 fn readFileInto(path: str, out: var str): bool =
     if osDebugFileReadEnabled():
-        osDebugFileRead(strutil.Join(["readFileInto path=", path], ""))
+        osDebugFileRead(Fmt"readFileInto path={path}")
     let knownSize64: int64 = fileSize(path)
     if knownSize64 >= 0 && knownSize64 <= int64(0x7fffffff):
         let sizedOk: bool = readFileSizedInto(path, int32(knownSize64), out)

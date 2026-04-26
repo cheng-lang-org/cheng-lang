@@ -80,6 +80,8 @@
 - `build-backend-driver` 自举构建的 RSS 上限不能继承外部 `CHENG_PROCESS_MAX_RSS_BYTES` 或 build/follow override；主线固定 8GiB，避免用户环境把长编译放大到 32GiB。
 - Cheng 字符串拼接操作符 `+` 已禁用移除；新增 Cheng 代码必须用 Nim 风格 `Fmt"..."`、`std/strutils.Join(...)` 或 `Lines(...)` 组合字符串，只把 `+` 用于数值加法，不再新增 `Fmt(parts)`。
 - Cheng 自增/自减计数循环必须写成 `for ... in range`；`while` 只用于非计数型条件循环。
+- `for i in range(end)` / `range(start, end)` 是稳定计数循环表面；seed/driver 必须在 for-header 解析层降成排他区间，不允许改标准库源码绕过。
+- `for item in xs` 是数组/seq 迭代表面；编译器应降成隐藏 index loop 并在循环体前绑定 `item = xs[index]`，不能要求用户手写下标循环。
 - 当前 `primary_object_emit` 仍是 `.s` 文本生成再 `cc -c` 产 `.o`；不要把它描述成直接机器 object writer，真正直写 `.o` 必须走 Mach-O/ELF/COFF object writer 主线。
 - backend driver ready freshness 必须跟 `print-build-plan` 的真实 source list 同步；新增 direct object writer 这类 backend 源时，漏进 freshness 会让 `build-backend-driver` 快路径误判 ready。
 - 手工 `cc bootstrap/cheng_seed.c -o artifacts/bootstrap/cheng.stage0` 只适合临时语法验证；正式 stage0 必须用 `compile-bootstrap --in:bootstrap/stage1_bootstrap.cheng` 生成嵌入合同的 wrapper 后再 `bootstrap-bridge`。
@@ -106,6 +108,7 @@
 - backend driver 自举闭包里新增 body-kind 解析 helper 前，必须先证明 helper 自身能被 primary object 编译；未证明前只开放精确最小 body kind 或把解析放在已支持的大函数内，否则 helper 会成为新的 `stmt_let`/`stmt_if` blocker。
 - C seed 当前对嵌套 statement 里的某些标量表达式仍有限制；例如 `len(prefix_const)` 放进嵌套 let 会让候选编译失败。最小 seed 主线先用显式常量合同保持可自举，泛化要等纯 Cheng scalar expr codegen 接管。
 - arm64 direct writer 只要函数体发出 `bl` 就是非叶子函数，必须保存恢复 `x30`；否则 `ret` 会回到函数内部形成挂起。验证时同时看最终 executable `otool -tV`、object `otool -rv` 和实际退出码。
+- 通用 BodyIR 写 ARM64 prologue/epilogue/load/store 不能继续用大负数机器字公式直拼；必须走 `PrimaryArm64Frame*` / `PrimaryArm64OffsetWord` 这类逐步编码 helper，并用 `otool -tV` 验证真实助记符。
 - `let value: int32 = Helper(); return value` 只能解决标量 call result；`let rootDir = BackendDriverRoot()` 这类 `str`/复合返回还需要 composite local/call-result ABI，不能用 int32 body kind 或特殊 main 伪装完成。
 - Darwin arm64 的 `str` 这类复合返回必须用隐藏 sret 地址 `x8`；caller 的 call-result local 需要在栈上按 16 字节对齐保活，callee 只写目标地址，不能把复合值塞进 `x0`。
 - 在 Mach-O direct writer 尚未支持数据段前，最小 `str` ABI 切片优先用零值 `str` 和 `strLenFast` 布局读取验证 sret/local，不要用字符串字面量把数据 section/reloc 混进同一切片。
@@ -164,3 +167,16 @@
 - gate smoke 不应靠 `rg/perl/grep/cp/rm` 这类外部脚本拼 shell；能用 Cheng 的 `WalkDir/ReadFile/WriteFile` 表达的检查必须纯 Cheng 实现。
 - freshness 比较不要 shell 出 `test -nt`；用文件存在性和 `FileMtime` 明确表达，右侧产物缺失时直接视为需要重建。
 - build-plan 对比不要 shell 出 `grep/cmp`；按合同 key 过滤行后直接比较文本，并把过滤结果作为 sidecar 写出。
+- backend driver 自举闭包里不要为了数组填充抽 `var T[]` out-param helper；当前 C seed/primary 对这类 helper 调用解析脆弱，优先在已证明的入口内线性填充，等通用 statement/CFG codegen 接管后再抽公共函数。
+- typed/source context 热路径不能对每个 source 无条件跑多行字符串重写；无 `"""` 时必须直接返回原文，避免 buffer 逐字节 append 把 pure self-probe 推到多 GiB 内存。
+- min driver 的 `system-link-exec` 进度 phase 必须按真实调用栈拆分；`BuildCompilerCsg` 不能藏在 lowering phase 里，否则 CSG/parser 崩溃会被误报成 lowering 无诊断退出。
+- direct object reloc 不能全量扫描 `instructionWords` 猜 adrp/add 模式；必须从 primary plan 的 body kind、call ordinal 和 data label 合同直接生成 relocation，否则 tiny selftest 也会在自举二进制里 CPU 空转。
+- backend driver lowering 新 helper 不能调用 parser 高层工具来取行或规范路径；这会把 parser/std 复杂函数重新拉进自举闭包。热路径需要局部最小实现，只依赖已在 primary 覆盖里的基础函数。
+- 纯 Cheng 自举遇到 `stmt_let_call`/`stmt_call`/复合局部缺口时，不能继续靠新增 importc bridge 或 body kind 扩展主线；正确方向是 Low-UIR/BodyIR 基本块化，第一阶段用栈槽作为权威状态，暂不上 Phi 和完整寄存器分配。
+- `buffer.AppendBytes(buf, str)` 这类重载在当前 selfhost lowering 下可能误选 Bytes 重载；自举热路径要用唯一名字的文本追加入口，长期必须修 typed call target 驱动的重载解析。
+- return-call passthrough 不能只设置 bodyKind；primary object plan 的 reachability/reloc 已统一看 callSequence，lowering 必须同步写 callSequence 和旧 call target 数组。
+- BodyIR direct writer 生成 ARM64 栈访问指令时，不要在自举热路径用 `offset * 1024` 叠大负数常量；当前编译器可能把这类运行时编码误编译成坏寄存器字段，稳定做法是用小 encoder 按 scale 线性累加并用 `otool -tV` 加实际退出码验证。
+- `core/ir` 层不能导入 `core/backend` 的 lowering 类型；Low-UIR 必须保持依赖无环，backend 只负责把自身 statement record 适配成 IR 输入。
+- BodyIR direct writer 生成 ARM64 动态寄存器字段时，不要写 `baseWord + argIndex`；当前自举链可能把字段反向打坏成 `wzr/x30`。用小步进 register encoder，并用 2 个以上实参的 `otool -tV` 验证。
+- Darwin arm64 第 9 个及以后调用实参必须在 call 前临时 `sub sp` 写入 outgoing stack arg area，call 后立刻 `add sp`；读取 caller frame 的局部/保存参数要用稳定的 `x29` 基址，不能用已下调的 `sp`。
+- pure self-build 报 `body_ir_call_ops_...` 且函数包含错误分支/早返回时，不能靠扩大帧或当直线 call sequence 放行；下一段必须 lowering 成 guard/return CFG，否则会无条件执行失败分支。

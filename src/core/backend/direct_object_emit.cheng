@@ -67,13 +67,11 @@ fn DirectObjectEmitDataSectionAddr(plan: pobj.PrimaryObjectPlan): int32 =
 
 fn DirectObjectEmitParsePositiveI32(text: str): int32 =
     var value: int32
-    var i: int32
-    while i < len(text):
+    for i in 0..<len(text):
         let ch = text[i]
         if ch < '0' || ch > '9':
             return value
         value = value * 10 + int32(ch) - int32('0')
-        i = i + 1
     return value
 
 fn DirectObjectEmitPayloadByteCount(payloadText: str): int32 =
@@ -322,6 +320,9 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
        plan.symbolNames.len != plan.functionWordOffsets.len ||
        plan.symbolNames.len != plan.itemIds.len:
         return false
+    if plan.relocTargetSymbols.len != plan.relocSourceItemIds.len ||
+       plan.relocTargetSymbols.len != plan.relocWordOffsets.len:
+        return false
     let functionLimit = DirectObjectEmitRealFunctionLimit(plan)
     if functionLimit <= 0:
         return false
@@ -329,6 +330,13 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
     if entryIndex < 0:
         return false
     let entryBodyKind = plan.functionBodyKinds[entryIndex]
+    var entryBodyIrReady = false
+    if entryIndex < plan.functionBodyIRs.len:
+        let entryBodyIR = plan.functionBodyIRs[entryIndex]
+        entryBodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnInt32(entryBodyIR) ||
+                           pobj.PrimaryBodyIrIsCallSequenceReturnI32Const(entryBodyIR) ||
+                           pobj.PrimaryBodyIrIsCallSequenceReturnStr(entryBodyIR) ||
+                           pobj.PrimaryBodyIrIsCallSequenceReturnAggregate(entryBodyIR)
     if entryBodyKind != texpr.BodyKindReturnZeroI32 &&
        !DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindReturnCallNoargI32 &&
@@ -339,7 +347,8 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
        !texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindResultRequestDispatch &&
        entryBodyKind != texpr.BodyKindStatementSequence &&
-       entryBodyKind != texpr.BodyKindMainF64MulCheckExit:
+       entryBodyKind != texpr.BodyKindMainF64MulCheckExit &&
+       !entryBodyIrReady:
         return false
     if DirectObjectEmitStandaloneNeedsMainWrapper(plan) &&
        DirectObjectEmitStandaloneWrapperByteSize(plan, functionLimit) <= int64(0):
@@ -376,35 +385,24 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
         let cstringCallCount = DirectObjectEmitCstringLiteralCallCount(plan, i)
         if cstringCallCount > 0:
             continue
-        if bodyKind == texpr.BodyKindStatementSequence ||
+        var bodyIrReady = false
+        if i < plan.functionBodyIRs.len:
+            let bodyIR = plan.functionBodyIRs[i]
+            bodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnInt32(bodyIR) ||
+                          pobj.PrimaryBodyIrIsCallSequenceReturnI32Const(bodyIR) ||
+                          pobj.PrimaryBodyIrIsCallSequenceReturnStr(bodyIR) ||
+                          pobj.PrimaryBodyIrIsCallSequenceReturnAggregate(bodyIR)
+        if bodyIrReady ||
+           bodyKind == texpr.BodyKindStatementSequence ||
            texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
            DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
-            let targetSymbol = DirectObjectEmitRelocTargetForItem(plan, plan.itemIds[i])
-            if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, targetSymbol):
-                return false
-            if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind) ||
-               requiredStatementCallCount > 1:
-                let secondTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 1)
-                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, secondTargetSymbol):
-                    return false
-            if requiredStatementCallCount > 2:
-                let secondTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 1)
-                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, secondTargetSymbol):
-                    return false
-                let thirdTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 2)
-                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, thirdTargetSymbol):
-                    return false
-            if requiredStatementCallCount > 3:
-                let fourthTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 3)
-                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, fourthTargetSymbol):
-                    return false
-            if requiredStatementCallCount > 4:
-                let fifthTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 4)
-                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, fifthTargetSymbol):
-                    return false
-            if requiredStatementCallCount > 5:
-                let sixthTargetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], 5)
-                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, sixthTargetSymbol):
+            if bodyIrReady && i < plan.functionBodyIRs.len:
+                requiredStatementCallCount = plan.functionBodyIRs[i].callSequence.len
+            if requiredStatementCallCount <= 0:
+                requiredStatementCallCount = 1
+            for callOrdinal in 0..<requiredStatementCallCount:
+                let targetSymbol = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[i], callOrdinal)
+                if !DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, targetSymbol):
                     return false
     return true
 
@@ -482,27 +480,15 @@ fn DirectObjectEmitStandaloneRelocs(plan: pobj.PrimaryObjectPlan,
             continue
         let functionByteOffset = int64(plan.functionWordOffsets[i] * 4)
         for callOrdinal in 0..<cstringCallCount:
-            let literalSymbol = DirectObjectEmitCStringLiteralDataLabel(plan.symbolNames[i], callOrdinal)
-            let literalIndex = osym.ObjectSymbolsFind(symbols, literalSymbol)
-            if literalIndex < 0:
-                continue
+            let literalSymbol = DirectObjectEmitDataLabelExact(plan,
+                                                               DirectObjectEmitCStringLiteralDataLabel(plan.symbolNames[i],
+                                                                                                       callOrdinal))
             let callByteOffset = functionByteOffset + int64((2 + callOrdinal * 3) * 4)
-            DirectObjectEmitRequireIndex(orel.ObjectRelocsAdd(relocs,
-                                                              0,
-                                                              callByteOffset,
-                                                              literalIndex,
-                                                              orel.ObjectRelocPage21,
-                                                              int64(0),
-                                                              true),
-                                         "direct object emit: add cstring page reloc")
-            DirectObjectEmitRequireIndex(orel.ObjectRelocsAdd(relocs,
-                                                              0,
-                                                              callByteOffset + int64(4),
-                                                              literalIndex,
-                                                              orel.ObjectRelocPageOff12,
-                                                              int64(0),
-                                                              false),
-                                         "direct object emit: add cstring pageoff reloc")
+            DirectObjectEmitAddPageRelocPair(relocs,
+                                             symbols,
+                                             callByteOffset,
+                                             literalSymbol,
+                                             "direct object emit: add cstring page reloc")
     return relocs
 
 fn DirectObjectEmitWriteStandaloneMain(rootDir: str,
@@ -535,7 +521,7 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
     if len(plan.outputPath) <= 0:
         return Err[bool](" direct object emit: missing output path")
     if plan.missingReasons.len > 0:
-        return Err[bool](Fmt" direct object emit: plan has missing reasons: {pobj.PrimaryObjectPlanReport(plan)}")
+        return Err[bool](" direct object emit: plan has missing reasons")
     if plan.functionBodyKinds.len <= 0:
         return Err[bool](" direct object emit: missing function body kind")
     let functionLimit = DirectObjectEmitRealFunctionLimit(plan)
@@ -543,6 +529,13 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
     if entryIndex < 0:
         return Err[bool](" direct object emit: standalone missing entry function")
     let entryBodyKind = plan.functionBodyKinds[entryIndex]
+    var entryBodyIrReady = false
+    if entryIndex < plan.functionBodyIRs.len:
+        let entryBodyIR = plan.functionBodyIRs[entryIndex]
+        entryBodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnInt32(entryBodyIR) ||
+                           pobj.PrimaryBodyIrIsCallSequenceReturnI32Const(entryBodyIR) ||
+                           pobj.PrimaryBodyIrIsCallSequenceReturnStr(entryBodyIR) ||
+                           pobj.PrimaryBodyIrIsCallSequenceReturnAggregate(entryBodyIR)
     if entryBodyKind != texpr.BodyKindReturnZeroI32 &&
        !DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindReturnCallNoargI32 &&
@@ -553,7 +546,8 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
        !texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindResultRequestDispatch &&
        entryBodyKind != texpr.BodyKindStatementSequence &&
-       entryBodyKind != texpr.BodyKindMainF64MulCheckExit:
+       entryBodyKind != texpr.BodyKindMainF64MulCheckExit &&
+       !entryBodyIrReady:
         return Err[bool](" direct object emit: standalone entry must be direct-provider-free")
     for i in 0..<functionLimit:
         let bodyKind = plan.functionBodyKinds[i]
@@ -590,7 +584,7 @@ fn DirectObjectEmitValidatePlanObject(plan: pobj.PrimaryObjectPlan): Result[bool
     if len(plan.outputPath) <= 0:
         return Err[bool](" direct object emit: missing output path")
     if plan.missingReasons.len > 0:
-        return Err[bool](Fmt" direct object emit: plan has missing reasons: {pobj.PrimaryObjectPlanReport(plan)}")
+        return Err[bool](" direct object emit: plan has missing reasons")
     if plan.symbolNames.len <= 0:
         return Err[bool](" direct object emit: missing symbols")
     return Err[bool](" direct object emit: object requires unsupported codegen")
@@ -754,30 +748,29 @@ fn DirectObjectEmitPlanRelocs(plan: pobj.PrimaryObjectPlan,
     for i in 0..<plan.symbolNames.len:
         if i >= plan.functionWordOffsets.len || i >= plan.functionWordCounts.len:
             continue
-        let baseWordOffset = plan.functionWordOffsets[i]
-        var cstringOrdinal: int32
-        var runtimeDataOrdinal: int32
-        for localWordIndex in 0..<plan.functionWordCounts[i]:
-            let wordOffset = baseWordOffset + localWordIndex
-            let byteOffset = int64(wordOffset * 4)
-            if DirectObjectEmitIsCstringAddressPair(plan, wordOffset):
-                let literalSymbol = DirectObjectEmitDataLabelExact(plan,
-                                                                   DirectObjectEmitCStringLiteralDataLabel(plan.symbolNames[i],
-                                                                                                           cstringOrdinal))
-                DirectObjectEmitAddPageRelocPair(relocs,
-                                                 symbols,
-                                                 byteOffset,
-                                                 literalSymbol,
-                                                 "direct object emit: add plan cstring page reloc")
-                cstringOrdinal = cstringOrdinal + 1
-            elif DirectObjectEmitIsRuntimeDataAddressPair(plan, wordOffset):
-                let dataSymbol = DirectObjectEmitRuntimeDataLabelForOrdinal(plan, runtimeDataOrdinal)
-                DirectObjectEmitAddPageRelocPair(relocs,
-                                                 symbols,
-                                                 byteOffset,
-                                                 dataSymbol,
-                                                 "direct object emit: add plan runtime data page reloc")
-                runtimeDataOrdinal = runtimeDataOrdinal + 1
+        let functionByteOffset = int64(plan.functionWordOffsets[i] * 4)
+        let cstringCallCount = DirectObjectEmitCstringLiteralCallCount(plan, i)
+        for callOrdinal in 0..<cstringCallCount:
+            let literalSymbol = DirectObjectEmitDataLabelExact(plan,
+                                                               DirectObjectEmitCStringLiteralDataLabel(plan.symbolNames[i],
+                                                                                                       callOrdinal))
+            let callByteOffset = functionByteOffset + int64((2 + callOrdinal * 3) * 4)
+            DirectObjectEmitAddPageRelocPair(relocs,
+                                             symbols,
+                                             callByteOffset,
+                                             literalSymbol,
+                                             "direct object emit: add plan cstring page reloc")
+        if plan.functionBodyKinds[i] == texpr.BodyKindRuntimeSetCmdLine:
+            DirectObjectEmitAddPageRelocPair(relocs,
+                                             symbols,
+                                             functionByteOffset,
+                                             DirectObjectEmitRuntimeDataLabelForOrdinal(plan, 0),
+                                             "direct object emit: add plan argc page reloc")
+            DirectObjectEmitAddPageRelocPair(relocs,
+                                             symbols,
+                                             functionByteOffset + int64(12),
+                                             DirectObjectEmitRuntimeDataLabelForOrdinal(plan, 1),
+                                             "direct object emit: add plan argv page reloc")
         if DirectObjectEmitFunctionLooksEntryBridgeWords(plan, i):
             let baseByteOffset = plan.functionWordOffsets[i] * 4
             DirectObjectEmitAddBranchReloc(relocs,

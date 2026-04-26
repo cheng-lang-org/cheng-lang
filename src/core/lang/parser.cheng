@@ -657,31 +657,31 @@ fn NormalizedExprLayerAppendExisting(layer: var NormalizedExprLayer,
 fn ParserConcat2(a: str, b: str): str =
     var buf = buffer.NewByteBuffer()
     if a != "":
-        buffer.AppendBytes(buf, a)
+        buffer.AppendText(buf, a)
     if b != "":
-        buffer.AppendBytes(buf, b)
+        buffer.AppendText(buf, b)
     return rawbytes.bytesToString(buffer.ToBytes(buf))
 
 fn ParserConcat3(a: str, b: str, c: str): str =
     var buf = buffer.NewByteBuffer()
     if a != "":
-        buffer.AppendBytes(buf, a)
+        buffer.AppendText(buf, a)
     if b != "":
-        buffer.AppendBytes(buf, b)
+        buffer.AppendText(buf, b)
     if c != "":
-        buffer.AppendBytes(buf, c)
+        buffer.AppendText(buf, c)
     return rawbytes.bytesToString(buffer.ToBytes(buf))
 
 fn ParserConcat4(a: str, b: str, c: str, d: str): str =
     var buf = buffer.NewByteBuffer()
     if a != "":
-        buffer.AppendBytes(buf, a)
+        buffer.AppendText(buf, a)
     if b != "":
-        buffer.AppendBytes(buf, b)
+        buffer.AppendText(buf, b)
     if c != "":
-        buffer.AppendBytes(buf, c)
+        buffer.AppendText(buf, c)
     if d != "":
-        buffer.AppendBytes(buf, d)
+        buffer.AppendText(buf, d)
     return rawbytes.bytesToString(buffer.ToBytes(buf))
 
 fn ParserOwnedText(text: str): str =
@@ -705,18 +705,16 @@ fn ParserOnlyInlineSpaces(text: str,
         stop = text.len
     if stop < start:
         return false
-    var i = start
-    while i < stop:
+    for i in start..<stop:
         if !ParserIsInlineSpace(text[i]):
             return false
-        i = i + 1
     return true
 
 fn ParserFindMultilineStringOpenOnLine(lineRaw: str): int32 =
     var inString = false
     var inChar = false
     var i: int32
-    while i < lineRaw.len:
+    for i in i..<lineRaw.len:
         let ch = lineRaw[i]
         if !inString && !inChar && ch == char(35):
             return -1
@@ -727,13 +725,10 @@ fn ParserFindMultilineStringOpenOnLine(lineRaw: str): int32 =
                lineRaw[i + 2] == char(34):
                 return i
             inString = !inString
-            i = i + 1
             continue
         if !inString && ch == char(39) && !ParserQuoteIsEscaped(lineRaw, i):
             inChar = !inChar
-            i = i + 1
             continue
-        i = i + 1
     return -1
 
 fn ParserLineIsMultilineStringClose(lineRaw: str,
@@ -770,11 +765,15 @@ fn ParserAppendShortStringEscaped(out: var buffer.ByteBuffer,
             buffer.appendByte(out, 92)
             buffer.appendByte(out, 116)
         else:
-            buffer.AppendBytes(out, ParserTextSliceFast(text, i, 1))
+            buffer.AppendText(out, ParserTextSliceFast(text, i, 1))
 
 fn ParserRewriteMultilineStringSourceText(textRaw: str,
                                             rewrittenOut: var str,
                                             err: var str): bool =
+    if !ParserSourceHasMultilineString(textRaw):
+        rewrittenOut = textRaw
+        err = ""
+        return true
     let lines = ParserSplitChar(textRaw, '\n')
     var out = buffer.NewByteBuffer()
     var i: int32
@@ -782,15 +781,13 @@ fn ParserRewriteMultilineStringSourceText(textRaw: str,
         let line = ParserLineWithoutTrailingCr(lines[i])
         let openPos = ParserFindMultilineStringOpenOnLine(line)
         if openPos < 0:
-            buffer.AppendBytes(out, line)
+            buffer.AppendText(out, line)
             if i + 1 < lines.len:
                 buffer.appendByte(out, 10)
             i = i + 1
             continue
         if !ParserOnlyInlineSpaces(line, openPos + 3, line.len):
-            err = ParserConcat3("multiline string opener must be followed by a newline at line ",
-                                intToStr(i + 1),
-                                "")
+            err = Fmt"multiline string opener must be followed by a newline at line {i + 1}"
             return false
         var closeIndex = i + 1
         var closeIndent = ""
@@ -802,21 +799,16 @@ fn ParserRewriteMultilineStringSourceText(textRaw: str,
                 break
             closeIndex = closeIndex + 1
         if !foundClose:
-            err = ParserConcat3("unterminated multiline string starting at line ",
-                                intToStr(i + 1),
-                                "")
+            err = Fmt"unterminated multiline string starting at line {i + 1}"
             return false
-        buffer.AppendBytes(out, ParserTextSliceFast(line, 0, openPos))
+        buffer.AppendText(out, ParserTextSliceFast(line, 0, openPos))
         buffer.appendByte(out, 34)
-        var bodyIndex = i + 1
-        while bodyIndex < closeIndex:
+        for bodyIndex in i + 1..<closeIndex:
             let bodyLine = ParserLineWithoutTrailingCr(lines[bodyIndex])
             var bodyText = ""
             if ParserHasNonTrimChar(bodyLine):
                 if closeIndent != "" && !ParserTextEqualsAt(bodyLine, 0, closeIndent):
-                    err = ParserConcat3("multiline string body indentation is shallower than closing delimiter at line ",
-                                        intToStr(bodyIndex + 1),
-                                        "")
+                    err = Fmt"multiline string body indentation is shallower than closing delimiter at line {bodyIndex + 1}"
                     return false
                 bodyText = ParserTextSliceFast(bodyLine,
                                                 closeIndent.len,
@@ -825,7 +817,6 @@ fn ParserRewriteMultilineStringSourceText(textRaw: str,
             if bodyIndex + 1 < closeIndex:
                 buffer.appendByte(out, 92)
                 buffer.appendByte(out, 110)
-            bodyIndex = bodyIndex + 1
         buffer.appendByte(out, 34)
         var newlineCount = closeIndex - i
         if closeIndex + 1 < lines.len:
@@ -869,10 +860,10 @@ fn NormalizedExprMakeId(sourcePath: str,
                           columnNumber: int32,
                           kind: NormalizedExprKind,
                           detailKind: NormalizedExprDetailKind): str =
-    let lineText: str = intToStr(lineNumber)
-    let columnText: str = intToStr(columnNumber)
-    let kindText: str = intToStr(NormalizedExprKindCode(kind))
-    let detailCodeText: str = intToStr(NormalizedExprDetailKindCode(detailKind))
+    let lineText: str = Fmt"{lineNumber}"
+    let columnText: str = Fmt"{columnNumber}"
+    let kindText: str = Fmt"{NormalizedExprKindCode(kind)}"
+    let detailCodeText: str = Fmt"{NormalizedExprDetailKindCode(detailKind)}"
     let totalLen = sourcePath.len + lineText.len + columnText.len + kindText.len + detailCodeText.len + 4
     if totalLen <= 0:
         return ""
@@ -909,13 +900,13 @@ fn NormalizedExprMakeCallLikeId(sourcePath: str,
                                   callArgsText: str): str =
     let callSurfaceKindText = ParserCallSurfaceKindText(callSurfaceKind)
     let callReasonText = ParserCallReasonText(callReason)
-    let lineText: str = intToStr(lineNumber)
-    let columnText: str = intToStr(columnNumber)
-    let kindText: str = intToStr(NormalizedExprKindCode(kind))
+    let lineText: str = Fmt"{lineNumber}"
+    let columnText: str = Fmt"{columnNumber}"
+    let kindText: str = Fmt"{NormalizedExprKindCode(kind)}"
     let resolvedText = if callResolved: "1" else: "0"
     let targetImportcText = if callTargetImportc: "1" else: "0"
     let prefixStyleText = if callPrefixStyle: "1" else: "0"
-    let argCountText: str = intToStr(callArgCount)
+    let argCountText: str = Fmt"{callArgCount}"
     let normalizedTargetSourcePath = ParserNormalizePath(callTargetSourcePath)
     let totalLen = sourcePath.len +
                    lineText.len +
@@ -1427,11 +1418,9 @@ fn ParserManifestValue(manifestTextRaw: str,
         let valueStart = prefix.len
         if valueStart >= line.len || line[valueStart] != '"':
             continue
-        var valueStop = valueStart + 1
-        while valueStop < line.len:
+        for valueStop in valueStart + 1..<line.len:
             if line[valueStop] == '"':
                 return ParserTextSliceFast(line, valueStart + 1, valueStop - valueStart - 1)
-            valueStop = valueStop + 1
     return ""
 
 fn ParserSharedRoot(packageRootRaw: str): str =
@@ -1680,11 +1669,9 @@ fn ParserDottedQualifierDepth(lineRaw: str,
 
 fn ParserNextNonSpaceChar(lineRaw: str,
                             start: int32): char =
-    var cursor = start
-    while cursor < lineRaw.len:
+    for cursor in start..<lineRaw.len:
         if !ParserIsInlineSpace(lineRaw[cursor]):
             return lineRaw[cursor]
-        cursor = cursor + 1
     return char(0)
 
 fn ParserSkipInlineSpaces(lineRaw: str,
@@ -1790,10 +1777,7 @@ fn ParserRejectSpaceCallIfStrict(lineRaw: str,
             continue
         let next = lineRaw[argStart]
         if ParserStrictAtomStart(next):
-            err = strutil.Join(["Space call syntax is removed in the elegant syntax profile; use f(x) at line ",
-                                intToStr(lineNumber),
-                                " near ",
-                                callName], "")
+            err = Fmt"Space call syntax is removed in the elegant syntax profile; use f(x) at line {lineNumber} near {callName}"
             return true
     return false
 
@@ -1914,51 +1898,42 @@ fn ParserParseRangeExprAt(lineRaw: str,
     bracketDepth = 0
     braceDepth = 0
     i = opPos + opLen
-    while i < lineRaw.len:
+    for i in i..<lineRaw.len:
         let ch = lineRaw[i]
         if !inChar && ch == '"' && !ParserQuoteIsEscaped(lineRaw, i):
             inString = !inString
-            i = i + 1
             continue
         if !inString && ch == '\'' && !ParserQuoteIsEscaped(lineRaw, i):
             inChar = !inChar
-            i = i + 1
             continue
         if inString || inChar:
-            i = i + 1
             continue
         if ch == '(':
             parenDepth = parenDepth + 1
-            i = i + 1
             continue
         if ch == ')':
             if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0:
                 segmentStop = i
                 break
             parenDepth = parenDepth - 1
-            i = i + 1
             continue
         if ch == '[':
             bracketDepth = bracketDepth + 1
-            i = i + 1
             continue
         if ch == ']':
             if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0:
                 segmentStop = i
                 break
             bracketDepth = bracketDepth - 1
-            i = i + 1
             continue
         if ch == '{':
             braceDepth = braceDepth + 1
-            i = i + 1
             continue
         if ch == '}':
             if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0:
                 segmentStop = i
                 break
             braceDepth = braceDepth - 1
-            i = i + 1
             continue
         if parenDepth == 0 &&
            bracketDepth == 0 &&
@@ -1966,7 +1941,6 @@ fn ParserParseRangeExprAt(lineRaw: str,
            (ch == ',' || ch == ':'):
             segmentStop = i
             break
-        i = i + 1
     let rangeText = chengpath.PathTrim(ParserTextSliceFast(lineRaw, segmentStart, segmentStop - segmentStart))
     return ParserParseRangeExpr(rangeText, startExprOut, endExprOut, endInclusiveOut)
 
@@ -1997,15 +1971,13 @@ fn ParserParseFmtExprAt(lineRaw: str,
         return false
     let nextChar = lineRaw[cursor]
     if nextChar == '"':
-        var closePos = cursor + 1
-        while closePos < lineRaw.len:
+        for closePos in cursor + 1..<lineRaw.len:
             if lineRaw[closePos] == '"' && !ParserQuoteIsEscaped(lineRaw, closePos):
                 modeOut = "fmt_literal"
                 literalOut = ParserTextSliceFast(lineRaw, cursor + 1, closePos - cursor - 1)
                 argTextOut = ParserTextSliceFast(lineRaw, cursor, closePos - cursor + 1)
                 endColumnOut = closePos + 1
                 return true
-            closePos = closePos + 1
         return false
     if nextChar == '(':
         let closePos = ParserFindMatchingParen(lineRaw, cursor)
@@ -3121,12 +3093,12 @@ fn ParserAppendDefaultInitExprsLine(sourcePath: str,
         if calleeStop < 0:
             i = closePos + 1
             continue
-        var calleeStart = calleeStop
-        while calleeStart >= 0:
-            if !ParserIsTypeExprChar(lineRaw[calleeStart]):
+        var calleeStart = 0
+        for calleeOffset in 0..calleeStop:
+            let calleeScan = calleeStop - calleeOffset
+            if !ParserIsTypeExprChar(lineRaw[calleeScan]):
+                calleeStart = calleeScan + 1
                 break
-            calleeStart = calleeStart - 1
-        calleeStart = calleeStart + 1
         if calleeStart > calleeStop || ParserPreviousTokenIsDeclKeyword(lineRaw, calleeStart):
             i = closePos + 1
             continue
@@ -3186,12 +3158,12 @@ fn ParserAppendConstructorExprsLine(sourcePath: str,
         if calleeStop < 0:
             i = closePos + 1
             continue
-        var calleeStart = calleeStop
-        while calleeStart >= 0:
-            if !ParserIsTypeExprChar(lineRaw[calleeStart]):
+        var calleeStart = 0
+        for calleeOffset2 in 0..calleeStop:
+            let calleeScan2 = calleeStop - calleeOffset2
+            if !ParserIsTypeExprChar(lineRaw[calleeScan2]):
+                calleeStart = calleeScan2 + 1
                 break
-            calleeStart = calleeStart - 1
-        calleeStart = calleeStart + 1
         if calleeStart > calleeStop || ParserPreviousTokenIsDeclKeyword(lineRaw, calleeStart):
             i = closePos + 1
             continue
@@ -3397,15 +3369,17 @@ fn ParserQuoteIsEscaped(textRaw: str,
                           indexRaw: int32): bool =
     var index = indexRaw - 1
     var slashCount: int32
-    while index >= 0:
-        if textRaw[index] != '\\':
-            break
-        slashCount = slashCount + 1
-        index = index - 1
+    let indexStart = index
+    if indexStart >= 0:
+        for indexOffset in 0..(indexStart - 0):
+            index = indexStart - indexOffset
+            if textRaw[index] != '\\':
+                break
+            slashCount = slashCount + 1
     return slashCount % 2 == 1
 
 fn ParserCountTopLevelArgs(textRaw: str): int32 =
-    var trimmedWhole = chengpath.PathTrim(textRaw)
+    let trimmedWhole = chengpath.PathTrim(textRaw)
     if trimmedWhole == "":
         return 0
     var inString = false
@@ -3658,8 +3632,7 @@ fn ParserFunctionParamsContainBindingExact(lineRaw: str,
     var depthParen: int32
     var depthBracket: int32
     var depthBrace: int32
-    var i = itemStart
-    while i <= closePos:
+    for i in itemStart..closePos:
         var itemStop = i
         var endItem = false
         if i >= closePos:
@@ -3704,7 +3677,6 @@ fn ParserFunctionParamsContainBindingExact(lineRaw: str,
                 if matched:
                     return true
             itemStart = i + 1
-        i = i + 1
     return false
 
 fn ParserFunctionParamsContainBindingTextRange(lineRaw: str,
@@ -3729,8 +3701,7 @@ fn ParserFunctionParamsContainBindingTextRange(lineRaw: str,
     var depthParen: int32
     var depthBracket: int32
     var depthBrace: int32
-    var i = itemStart
-    while i <= closePos:
+    for i in itemStart..closePos:
         var itemStop = i
         var endItem = false
         if i >= closePos:
@@ -3775,7 +3746,6 @@ fn ParserFunctionParamsContainBindingTextRange(lineRaw: str,
                 if matched:
                     return true
             itemStart = i + 1
-        i = i + 1
     return false
 
 fn ParserScopeHasVisibleBinding(profile: NormalizedExprCallProfile,
@@ -5222,18 +5192,16 @@ fn ParserStringSeqContains(items: str[], targetRaw: str): bool =
 fn ParserTextLookupDotCount(text: str): int32 =
     var count: int32
     var i: int32
-    while i < text.len:
+    for i in i..<text.len:
         if text[i] == '.':
             count = count + 1
-        i = i + 1
     return count
 
 fn ParserTextLookupContentHash(text: str): int32 =
     var h: int32
     var i: int32
-    while i < text.len:
+    for i in i..<text.len:
         h = h * 131 + int32(text[i])
-        i = i + 1
     if h < 0:
         h = -h
     return h
@@ -5252,12 +5220,11 @@ fn ParserTextLookupKeyExact(text: str): ParserTextLookupKey =
     var dotCount: int32
     var h: int32
     var i: int32
-    while i < text.len:
+    for i in i..<text.len:
         let ch = text[i]
         if ch == '.':
             dotCount = dotCount + 1
         h = h * 131 + int32(ch)
-        i = i + 1
     if h < 0:
         h = -h
     key.dotCount = dotCount
@@ -5988,8 +5955,8 @@ fn ParserJoinSlash(items: str[]): str =
         if items[i] == "":
             continue
         if wrote:
-            buffer.AppendBytes(out, slash)
-        buffer.AppendBytes(out, items[i])
+            buffer.AppendText(out, slash)
+        buffer.AppendText(out, items[i])
         wrote = true
     return rawbytes.bytesToString(buffer.ToBytes(out))
 
@@ -6355,8 +6322,8 @@ fn ParserModulePathTailExact(modulePath: str, skipCount: int32): str =
             continue
         if pieceIndex >= skipCount && cursor > start:
             if wrote:
-                buffer.AppendBytes(out, slash)
-            buffer.AppendBytes(out, ParserTextSliceFast(modulePath, start, cursor - start))
+                buffer.AppendText(out, slash)
+            buffer.AppendText(out, ParserTextSliceFast(modulePath, start, cursor - start))
             wrote = true
         pieceIndex = pieceIndex + 1
         start = cursor + 1

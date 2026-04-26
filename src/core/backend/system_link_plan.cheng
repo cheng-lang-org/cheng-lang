@@ -1,5 +1,5 @@
 import std/result
-import std/strutils as strutil
+import std/strformat
 import cheng/std/bytes_layout as layout
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/tooling/compiler_runtime as crun
@@ -57,14 +57,14 @@ fn SystemLinkPlanListText(items: str[]): str =
     var out = ""
     for i in 0..<items.len:
         if len(out) > 0:
-            out = strutil.Join([out, ","], "")
-        out = strutil.Join([out, items[i]], "")
+            out = Fmt"{out},"
+        out = Fmt"{out}{items[i]}"
     return out
 
 fn SystemLinkPlanAppendLine(out: var str, key: str, value: str) =
     if len(out) > 0:
-        out = strutil.Join([out, "\n"], "")
-    out = strutil.Join([out, key, "=", value], "")
+        out = Fmt"{out}\n"
+    out = Fmt"{out}{key}={value}"
 
 fn SystemLinkPlanDeriveModuleKind(parsed: parser.ParsedSourceStub): SystemModuleKind =
     for i in 0..<parsed.ownerModulePaths.len:
@@ -206,16 +206,18 @@ fn SystemLinkPlanMissingReasons(parsed: parser.ParsedSourceStub,
         add(missing, "runtime_provider_modules_not_selected")
     return missing
 
-fn BuildSystemLinkPlanStubWithExternalPackageRoots(rootDir: str,
-                                                     req: creq.CompilerRequest,
-                                                     externalPackageRoots: parser.ParserExternalPackageRoot[],
-                                                     plan: var SystemLinkPlanStub,
-                                                     err: var str): bool =
-    let requestPackageRoot = creq.CompilerRequestRootDir(req)
-    let requestSourcePath = chengpath.PathAbsolute(rootDir, creq.CompilerRequestSourcePath(req))
-    let requestOutputPath = creq.CompilerRequestOutputPath(req)
-    let requestTargetTriple = creq.CompilerRequestTargetTriple(req)
-    let requestEmitKind = creq.CompilerRequestEmitKind(req)
+fn BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir: str,
+                                                              requestPackageRoot: str,
+                                                              requestSourcePathRaw: str,
+                                                              requestOutputPath: str,
+                                                              requestTargetTriple: str,
+                                                              requestEmitKind: creq.CompilerEmit,
+                                                              requestSymbolVisibility: str,
+                                                              requestBrowserBridgeObjectPath: str,
+                                                              externalPackageRoots: parser.ParserExternalPackageRoot[],
+                                                              plan: var SystemLinkPlanStub,
+                                                              err: var str): bool =
+    let requestSourcePath = chengpath.PathAbsolute(rootDir, requestSourcePathRaw)
     var parsed: parser.ParsedSourceStub
     if !parser.ParseOrdinarySourceStubWithExternalPackageRoots(requestPackageRoot,
                                                                  requestSourcePath,
@@ -255,8 +257,8 @@ fn BuildSystemLinkPlanStubWithExternalPackageRoots(rootDir: str,
     plan.outputPath = requestOutputPath
     plan.targetTriple = requestTargetTriple
     plan.emitKind = requestEmitKind
-    plan.symbolVisibility = creq.CompilerRequestSymbolVisibility(req)
-    plan.browserBridgeObjectPath = creq.CompilerRequestBrowserBridgeObjectPath(req)
+    plan.symbolVisibility = requestSymbolVisibility
+    plan.browserBridgeObjectPath = requestBrowserBridgeObjectPath
     plan.packageRoot = parsed.packageRoot
     plan.externalPackageRoots = parser.ParserExternalPackageRootsClone(externalPackageRoots)
     plan.workspaceRoot = parsed.workspaceRoot
@@ -286,6 +288,46 @@ fn BuildSystemLinkPlanStubWithExternalPackageRoots(rootDir: str,
     err = ""
     return true
 
+fn BuildSystemLinkPlanStubWithFields(rootDir: str,
+                                       requestPackageRoot: str,
+                                       requestSourcePathRaw: str,
+                                       requestOutputPath: str,
+                                       requestTargetTriple: str,
+                                       requestEmitKind: creq.CompilerEmit,
+                                       requestSymbolVisibility: str,
+                                       requestBrowserBridgeObjectPath: str,
+                                       plan: var SystemLinkPlanStub,
+                                       err: var str): bool =
+    var externalPackageRoots: parser.ParserExternalPackageRoot[]
+    return BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir,
+                                                                    requestPackageRoot,
+                                                                    requestSourcePathRaw,
+                                                                    requestOutputPath,
+                                                                    requestTargetTriple,
+                                                                    requestEmitKind,
+                                                                    requestSymbolVisibility,
+                                                                    requestBrowserBridgeObjectPath,
+                                                                    externalPackageRoots,
+                                                                    plan,
+                                                                    err)
+
+fn BuildSystemLinkPlanStubWithExternalPackageRoots(rootDir: str,
+                                                     req: creq.CompilerRequest,
+                                                     externalPackageRoots: parser.ParserExternalPackageRoot[],
+                                                     plan: var SystemLinkPlanStub,
+                                                     err: var str): bool =
+    return BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir,
+                                                                    creq.CompilerRequestRootDir(req),
+                                                                    creq.CompilerRequestSourcePath(req),
+                                                                    creq.CompilerRequestOutputPath(req),
+                                                                    creq.CompilerRequestTargetTriple(req),
+                                                                    creq.CompilerRequestEmitKind(req),
+                                                                    creq.CompilerRequestSymbolVisibility(req),
+                                                                    creq.CompilerRequestBrowserBridgeObjectPath(req),
+                                                                    externalPackageRoots,
+                                                                    plan,
+                                                                    err)
+
 fn BuildSystemLinkPlanStub(rootDir: str,
                              req: creq.CompilerRequest,
                              plan: var SystemLinkPlanStub,
@@ -314,12 +356,12 @@ fn SystemLinkPlanStubReport(plan: SystemLinkPlanStub): str =
     let moduleKind = SystemLinkPlanModuleKind(plan)
     let moduleKindText = SystemModuleKindText(moduleKind)
     let sourceClosurePaths = SystemLinkPlanSourceClosurePaths(plan)
-    let sourceClosureCount = intToStr(sourceClosurePaths.len)
+    let sourceClosureCount = IntToStr(sourceClosurePaths.len)
     let sourceClosureList = SystemLinkPlanListText(sourceClosurePaths)
     let ownerModulePaths = SystemLinkPlanOwnerModulePaths(plan)
     let ownerModuleList = SystemLinkPlanListText(ownerModulePaths)
-    let importEdgeCount = intToStr(SystemLinkPlanImportEdgeCount(plan))
-    let unresolvedImportCount = intToStr(SystemLinkPlanUnresolvedImportCount(plan))
+    let importEdgeCount = IntToStr(SystemLinkPlanImportEdgeCount(plan))
+    let unresolvedImportCount = IntToStr(SystemLinkPlanUnresolvedImportCount(plan))
     let exprLayer = SystemLinkPlanExprLayer(plan)
     var hasCompilerTopLevel = "0"
     if SystemLinkPlanHasCompilerTopLevel(plan):
@@ -338,7 +380,7 @@ fn SystemLinkPlanStubReport(plan: SystemLinkPlanStub): str =
     let parserSourceKind = SystemLinkPlanParserSourceKind(plan)
     let parserSourceKindText = SystemLinkPlanParserSourceKindText(parserSourceKind)
     let buildEntry = SystemLinkPlanBuildEntryPath(plan)
-    let buildSourceUnitCount = intToStr(SystemLinkPlanBuildSourceUnitCount(plan))
+    let buildSourceUnitCount = IntToStr(SystemLinkPlanBuildSourceUnitCount(plan))
     let linkMode = SystemLinkPlanLinkMode(plan)
     let pipelineStage = SystemLinkPlanPipelineStage(plan)
     if len(entrySymbol) <= 0:
@@ -359,17 +401,17 @@ fn SystemLinkPlanStubReport(plan: SystemLinkPlanStub): str =
     SystemLinkPlanAppendLine(out, "owner_modules", ownerModuleList)
     SystemLinkPlanAppendLine(out, "import_edge_count", importEdgeCount)
     SystemLinkPlanAppendLine(out, "unresolved_import_count", unresolvedImportCount)
-    SystemLinkPlanAppendLine(out, "expr_surface_source_count", intToStr(exprLayer.sourceCount))
-    SystemLinkPlanAppendLine(out, "expr_surface_expr_count", intToStr(parser.NormalizedExprLayerExprCount(exprLayer)))
-    SystemLinkPlanAppendLine(out, "expr_surface_if_count", intToStr(parser.NormalizedExprLayerIfCount(exprLayer)))
-    SystemLinkPlanAppendLine(out, "expr_surface_range_count", intToStr(parser.NormalizedExprLayerRangeCount(exprLayer)))
-    SystemLinkPlanAppendLine(out, "expr_surface_comprehension_count", intToStr(parser.NormalizedExprLayerComprehensionCount(exprLayer)))
-    SystemLinkPlanAppendLine(out, "expr_surface_fmt_count", intToStr(parser.NormalizedExprLayerStrFormatCount(exprLayer)))
-    SystemLinkPlanAppendLine(out, "expr_surface_result_intrinsic_count", intToStr(parser.NormalizedExprLayerResultIntrinsicCount(exprLayer)))
-    SystemLinkPlanAppendLine(out, "expr_surface_try_count", intToStr(parser.NormalizedExprLayerTryCount(exprLayer)))
-    SystemLinkPlanAppendLine(out, "expr_surface_default_init_count", intToStr(parser.NormalizedExprLayerDefaultInitCount(exprLayer)))
-    SystemLinkPlanAppendLine(out, "expr_surface_constructor_count", intToStr(parser.NormalizedExprLayerConstructorCount(exprLayer)))
-    SystemLinkPlanAppendLine(out, "expr_surface_question_residual_count", intToStr(exprLayer.questionResidualCount))
+    SystemLinkPlanAppendLine(out, "expr_surface_source_count", IntToStr(exprLayer.sourceCount))
+    SystemLinkPlanAppendLine(out, "expr_surface_expr_count", IntToStr(parser.NormalizedExprLayerExprCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_if_count", IntToStr(parser.NormalizedExprLayerIfCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_range_count", IntToStr(parser.NormalizedExprLayerRangeCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_comprehension_count", IntToStr(parser.NormalizedExprLayerComprehensionCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_fmt_count", IntToStr(parser.NormalizedExprLayerStrFormatCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_result_intrinsic_count", IntToStr(parser.NormalizedExprLayerResultIntrinsicCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_try_count", IntToStr(parser.NormalizedExprLayerTryCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_default_init_count", IntToStr(parser.NormalizedExprLayerDefaultInitCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_constructor_count", IntToStr(parser.NormalizedExprLayerConstructorCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_question_residual_count", IntToStr(exprLayer.questionResidualCount))
     SystemLinkPlanAppendLine(out, "has_compiler_top_level", hasCompilerTopLevel)
     SystemLinkPlanAppendLine(out, "main_function_present", mainFunctionPresent)
     SystemLinkPlanAppendLine(out, "runtime_targets", runtimeTargetList)

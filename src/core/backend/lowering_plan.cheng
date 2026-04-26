@@ -1,6 +1,5 @@
 import std/result
 import std/strformat
-import std/strutils as strutil
 import cheng/std/bytes_layout as layout
 import cheng/core/tooling/path as chengpath
 import cheng/core/tooling/compiler_world as cworld
@@ -10,6 +9,9 @@ import cheng/core/lang/parser
 import cheng/core/lang/typed_expr as texpr
 import cheng/core/ir/core_types as coreir
 import cheng/core/backend/system_link_plan as slplan
+import cheng/core/backend/body_kind_parse as bkind
+import cheng/core/ir/low_uir as lowuir
+import cheng/core/ir/low_uir as lowuir
 
 type
     PrimaryObjectIrCallOp =
@@ -36,6 +38,7 @@ type
         enclosingIfConditionText: str
         kind: texpr.TypedExprIrStatementKind
         detailKind: parser.NormalizedExprDetailKind
+        surfaceText: str
         bindingName: str
         resultType: str
         callTarget: str
@@ -51,9 +54,13 @@ type
         functionName: str
         signatureLineNumber: int32
         bodyLineNumber: int32
+        returnType: str
         bodyKind: str
         statementReturnMode: int32
         statementReturnI32Value: int32
+        paramNames: str[]
+        paramSlots: int32[]
+        paramTypes: str[]
         statementCount: int32
         statements: PrimaryObjectIrStatement[]
         callTargetCount: int32
@@ -202,82 +209,77 @@ fn LoweringSetStatementSequenceReturn(fnIr: var PrimaryObjectIrFunction,
     fnIr.statementReturnMode = mode
     fnIr.statementReturnI32Value = i32Value
 
-fn LoweringFunctionDeclLine(sourceTexts: texpr.TypedExprSourceText[],
-                             sourcePath: str,
-                             functionName: str): str =
-    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
-    for sourceIndex in 0..<sourceTexts.len:
-        if parser.ParserNormalizePath(sourceTexts[sourceIndex].sourcePath) != normalizedSourcePath:
-            continue
-        let lines = parser.ParserSplitChar(sourceTexts[sourceIndex].text, '\n')
-        for lineIndex in 0..<lines.len:
-            if LoweringFunctionDeclMatches(lines[lineIndex], functionName):
-                return lines[lineIndex]
-    return ""
+fn LoweringPrimaryObjectIrParamSlotIndex(fnIr: PrimaryObjectIrFunction,
+                                          paramSlot: int32): int32 =
+    for i in 0..<fnIr.paramSlots.len:
+        if fnIr.paramSlots[i] == paramSlot:
+            return i
+    return -1
 
-fn LoweringFunctionParamNamesFromDeclLine(lineRaw: str): str[] =
-    var out: str[]
-    var openIndex = -1
-    var closeIndex = -1
-    for i in 0..<len(lineRaw):
-        if lineRaw[i] == '(':
-            openIndex = i
-            break
-    if openIndex < 0:
-        return out
-    for i in (openIndex + 1)..<len(lineRaw):
-        if lineRaw[i] == ')':
-            closeIndex = i
-            break
-    if closeIndex <= openIndex:
-        return out
-    let paramsText = chengpath.TextSlice(lineRaw, openIndex + 1, closeIndex - openIndex - 1)
-    let pieces = parser.ParserSplitChar(paramsText, ',')
-    for i in 0..<pieces.len:
-        var piece = chengpath.PathTrim(pieces[i])
-        if len(piece) <= 0:
-            continue
-        if chengpath.TextStartsWith(piece, "var "):
-            piece = chengpath.PathTrim(chengpath.TextSlice(piece, 4, len(piece) - 4))
-        var stop = len(piece)
-        for j in 0..<len(piece):
-            if piece[j] == ':':
-                stop = j
-                break
-        let name = chengpath.PathTrim(chengpath.TextSlice(piece, 0, stop))
-        if len(name) > 0:
-            add(out, name)
-    return out
+fn LoweringPrimaryObjectIrParamNameSlot(fnIr: PrimaryObjectIrFunction,
+                                         nameRaw: str): int32 =
+    let name = chengpath.PathTrim(nameRaw)
+    if len(name) <= 0:
+        return -1
+    for i in 0..<fnIr.paramNames.len:
+        if fnIr.paramNames[i] == name:
+            return fnIr.paramSlots[i]
+    return -1
 
-fn LoweringCallArgNames(callArgsText: str): str[] =
+fn LoweringAppendPrimaryObjectIrParams(fnIr: var PrimaryObjectIrFunction,
+                                        typedIr: texpr.TypedExprIr,
+                                        typedFnIndex: int32) =
+    if typedFnIndex < 0 || typedFnIndex >= typedIr.functions.len:
+        return
+    let typedFn = typedIr.functions[typedFnIndex]
+    var nodeEnd = typedFn.nodeStart + typedFn.nodeCount
+    if nodeEnd > typedIr.nodes.len:
+        nodeEnd = typedIr.nodes.len
+    for nodeIndex in typedFn.nodeStart..<nodeEnd:
+        let node = typedIr.nodes[nodeIndex]
+        if node.opKind != texpr.TypedExprIrOpParamRef:
+            continue
+        if node.paramSlot < 0:
+            continue
+        if LoweringPrimaryObjectIrParamSlotIndex(fnIr, node.paramSlot) >= 0:
+            continue
+        add(fnIr.paramNames, node.paramName)
+        add(fnIr.paramSlots, node.paramSlot)
+        add(fnIr.paramTypes, node.resultType)
+
+fn LoweringCallArgNamesFromTypedText(callArgsText: str): str[] =
     var out: str[]
-    let pieces = parser.ParserSplitChar(callArgsText, ',')
+    let pieces = texpr.TypedExprSplitTopLevelCsv(callArgsText)
     for i in 0..<pieces.len:
         let name = chengpath.PathTrim(pieces[i])
         if len(name) > 0:
             add(out, name)
     return out
 
-fn LoweringReturnCallArgsPassThrough(sourceTexts: texpr.TypedExprSourceText[],
-                                      sourcePath: str,
-                                      functionName: str,
+fn LoweringReturnCallArgsPassThrough(fnIr: PrimaryObjectIrFunction,
                                       callArgsText: str,
                                       callArgCount: int32): bool =
     if callArgCount <= 0:
         return true
-    let declLine = LoweringFunctionDeclLine(sourceTexts, sourcePath, functionName)
-    if len(declLine) <= 0:
-        return false
-    let paramNames = LoweringFunctionParamNamesFromDeclLine(declLine)
-    let callArgNames = LoweringCallArgNames(callArgsText)
+    let callArgNames = LoweringCallArgNamesFromTypedText(callArgsText)
     if callArgNames.len != callArgCount:
         return false
-    if paramNames.len < callArgCount:
-        return false
     for i in 0..<callArgCount:
-        if callArgNames[i] != paramNames[i]:
+        if LoweringPrimaryObjectIrParamNameSlot(fnIr, callArgNames[i]) != i:
             return false
     return true
+
+fn LoweringReturnCallArg0Arg1TruePassThrough(fnIr: PrimaryObjectIrFunction,
+                                              callArgsText: str,
+                                              callArgCount: int32): bool =
+    if callArgCount != 3:
+        return false
+    let callArgNames = LoweringCallArgNamesFromTypedText(callArgsText)
+    if callArgNames.len != 3:
+        return false
+    return LoweringPrimaryObjectIrParamNameSlot(fnIr, callArgNames[0]) == 0 &&
+           LoweringPrimaryObjectIrParamNameSlot(fnIr, callArgNames[1]) == 1 &&
+           callArgNames[2] == "true"
 
 fn LoweringAnnotationQuotedValue(lineRaw: str,
                                   annotationName: str): str =
@@ -358,6 +360,7 @@ fn LoweringAppendPrimaryObjectIrStatements(fnIr: var PrimaryObjectIrFunction,
         stmt.enclosingIfConditionText = typedStmt.enclosingIfConditionText
         stmt.kind = typedStmt.kind
         stmt.detailKind = typedStmt.detailKind
+        stmt.surfaceText = typedStmt.surfaceText
         stmt.bindingName = typedStmt.bindingName
         stmt.resultType = LoweringStatementResultTypeFromFacts(typedStmt, typedFacts)
         stmt.callTarget = typedStmt.callTarget
@@ -401,6 +404,15 @@ fn LoweringLocalTypeKind(typeTextRaw: str): int32 =
         return coreir.LocalStrTag
     if typeText == "cstring":
         return coreir.LocalPtrTag
+    if chengpath.TextContains(typeText, "SystemLinkPlanStub") ||
+       chengpath.TextContains(typeText, "LoweringPlanStub") ||
+       chengpath.TextContains(typeText, "PrimaryObjectPlan") ||
+       chengpath.TextContains(typeText, "CompilerCsg") ||
+       chengpath.TextContains(typeText, "DirectObjectEmitResult") ||
+       chengpath.TextContains(typeText, "ExecCmdResult") ||
+       chengpath.TextContains(typeText, "FixedBytes32") ||
+       chengpath.TextContains(typeText, "NormalizedExprLayer"):
+        return coreir.LocalAggregateTag
     if len(typeText) > 2 && LoweringTextEndsWith(typeText, "[]"):
         return coreir.LocalAggregateTag
     if chengpath.TextContains(typeText, "CompilerRequest"):
@@ -421,6 +433,22 @@ fn LoweringLocalTypeSizeBytes(typeTextRaw: str,
     if typeKind == coreir.LocalPtrTag:
         return 8
     if typeKind == coreir.LocalAggregateTag:
+        if chengpath.TextContains(typeText, "SystemLinkPlanStub"):
+            return 512
+        if chengpath.TextContains(typeText, "LoweringPlanStub"):
+            return 768
+        if chengpath.TextContains(typeText, "PrimaryObjectPlan"):
+            return 768
+        if chengpath.TextContains(typeText, "CompilerCsg"):
+            return 192
+        if chengpath.TextContains(typeText, "DirectObjectEmitResult"):
+            return 64
+        if chengpath.TextContains(typeText, "ExecCmdResult"):
+            return 40
+        if chengpath.TextContains(typeText, "FixedBytes32"):
+            return 32
+        if chengpath.TextContains(typeText, "NormalizedExprLayer"):
+            return 64
         if len(typeText) > 2 && LoweringTextEndsWith(typeText, "[]"):
             return 16
         if chengpath.TextContains(typeText, "CompilerRequest"):
@@ -498,6 +526,71 @@ fn LoweringBodyIrEnsureLocalSlot(fnIr: var PrimaryObjectIrFunction,
     add(fnIr.bodyIR.localSlots, slot)
     return slot.id
 
+fn LoweringSyntheticStatementSlotName(stmt: PrimaryObjectIrStatement): str =
+    return Fmt"__stmt_{stmt.statementIndex}"
+
+fn LoweringResultIntrinsicSlotName(stmt: PrimaryObjectIrStatement): str =
+    if stmt.kind != texpr.TypedExprIrStmtResultIntrinsic:
+        return ""
+    if len(stmt.bindingName) > 0:
+        return stmt.bindingName
+    return LoweringSyntheticStatementSlotName(stmt)
+
+fn LoweringStructuredCallResultSlotName(stmt: PrimaryObjectIrStatement): str =
+    if stmt.kind == texpr.TypedExprIrStmtLetCall:
+        return stmt.bindingName
+    if stmt.kind == texpr.TypedExprIrStmtIfCall:
+        return LoweringSyntheticStatementSlotName(stmt)
+    if stmt.returnRoot &&
+       LoweringLocalTypeKind(stmt.resultType) == coreir.LocalAggregateTag:
+        return LoweringSyntheticStatementSlotName(stmt)
+    return ""
+
+fn LoweringCallArgIntrinsicCallee(textRaw: str,
+                                   innerText: var str): str =
+    innerText = ""
+    let text = chengpath.PathTrim(textRaw)
+    if len(text) < 3:
+        return ""
+    if text[len(text) - 1] != ')':
+        return ""
+    var openIndex = -1
+    for i in 0..<len(text):
+        if text[i] == '(':
+            openIndex = i
+            break
+    if openIndex <= 0:
+        return ""
+    let callee = chengpath.PathTrim(chengpath.TextSlice(text, 0, openIndex))
+    let innerStart = openIndex + 1
+    innerText = chengpath.PathTrim(chengpath.TextSlice(text,
+                                                       innerStart,
+                                                       len(text) - innerStart - 1))
+    return callee
+
+fn LoweringResultIntrinsicArgSlot(fnIr: PrimaryObjectIrFunction,
+                                   argText: str): int32 =
+    var innerText = ""
+    let callee = LoweringCallArgIntrinsicCallee(argText, innerText)
+    if len(callee) <= 0 || len(innerText) <= 0:
+        return -1
+    let detailKind = parser.ParserResultIntrinsicDetailKind(callee)
+    if detailKind == parser.NormalizedExprDetailNone:
+        return -1
+    for stmtIndex in 0..<fnIr.statements.len:
+        let stmt = fnIr.statements[stmtIndex]
+        if stmt.kind != texpr.TypedExprIrStmtResultIntrinsic:
+            continue
+        if stmt.detailKind != detailKind:
+            continue
+        if chengpath.PathTrim(stmt.callArgsText) != innerText:
+            continue
+        let slotName = LoweringResultIntrinsicSlotName(stmt)
+        if len(slotName) <= 0:
+            return -1
+        return LoweringBodyIrLocalSlotIndex(fnIr, slotName)
+    return -1
+
 fn LoweringCallArgSlots(fnIr: PrimaryObjectIrFunction,
                          callArgsText: str): int32[] =
     var out: int32[]
@@ -506,7 +599,14 @@ fn LoweringCallArgSlots(fnIr: PrimaryObjectIrFunction,
         let argName = chengpath.PathTrim(args[i])
         if len(argName) <= 0:
             continue
-        add(out, LoweringBodyIrLocalSlotIndex(fnIr, argName))
+        var argSlot = LoweringBodyIrLocalSlotIndex(fnIr, argName)
+        if argSlot < 0:
+            let paramSlot = LoweringPrimaryObjectIrParamNameSlot(fnIr, argName)
+            if paramSlot >= 0:
+                argSlot = 0 - paramSlot - 1
+        if argSlot < 0:
+            argSlot = LoweringResultIntrinsicArgSlot(fnIr, argName)
+        add(out, argSlot)
     return out
 
 fn LoweringStatementImportcSymbol(stmt: PrimaryObjectIrStatement,
@@ -529,14 +629,24 @@ fn LoweringClearStructuredCalls(fnIr: var PrimaryObjectIrFunction) =
     fnIr.callImportcSymbols = []
     fnIr.callTargetCount = 0
 
+fn LoweringEnsureLocalDeclSlots(fnIr: var PrimaryObjectIrFunction) =
+    for stmtIndex in 0..<fnIr.statements.len:
+        let stmt = fnIr.statements[stmtIndex]
+        if stmt.kind != texpr.TypedExprIrStmtLocalDecl:
+            continue
+        let _ = LoweringBodyIrEnsureLocalSlot(fnIr,
+                                              stmt.bindingName,
+                                              stmt.resultType)
+
 fn LoweringAppendStructuredCall(fnIr: var PrimaryObjectIrFunction,
                                  stmt: PrimaryObjectIrStatement,
                                  sourceTexts: texpr.TypedExprSourceText[]): int32 =
     if len(stmt.callTarget) <= 0:
         return -1
     var resultSlot: int32 = -1
-    if stmt.kind == texpr.TypedExprIrStmtLetCall:
-        resultSlot = LoweringBodyIrEnsureLocalSlot(fnIr, stmt.bindingName, stmt.resultType)
+    let resultSlotName = LoweringStructuredCallResultSlotName(stmt)
+    if len(resultSlotName) > 0:
+        resultSlot = LoweringBodyIrEnsureLocalSlot(fnIr, resultSlotName, stmt.resultType)
     var callOp: PrimaryObjectIrCallOp
     callOp.targetSymbol = stmt.callTarget
     callOp.targetSourcePath = stmt.callTargetSourcePath
@@ -558,7 +668,7 @@ fn LoweringAppendStructuredCall(fnIr: var PrimaryObjectIrFunction,
     add(fnIr.callImportcSymbols, callOp.importcSymbol)
     var bodyCall: coreir.CallOp
     bodyCall.targetSymbol = callOp.targetSymbol
-    bodyCall.argSlots = callOp.argSlots
+    bodyCall.argSlots = LoweringCallArgSlots(fnIr, stmt.callArgsText)
     bodyCall.resultSlot = resultSlot
     bodyCall.relocWordOffset = -1
     add(fnIr.bodyIR.callSequence, bodyCall)
@@ -594,87 +704,102 @@ fn LoweringAppendBodyIrReturnCall(fnIr: var PrimaryObjectIrFunction,
     var op: coreir.BodyOp
     op.kind = coreir.BodyOpReturnTag
     op.target = -1
+    let lastCallIndex = fnIr.callSequence.len - 1
+    if lastCallIndex >= 0 && fnIr.callSequence[lastCallIndex].resultSlot >= 0:
+        op.target = fnIr.callSequence[lastCallIndex].resultSlot
     let typeKind = LoweringLocalTypeKind(stmt.resultType)
     if typeKind != coreir.LocalInvalidTag:
         add(op.operands, typeKind)
     add(fnIr.bodyIR.ops, op)
 
-fn LoweringMaybePopulateResultRequestDispatch(fnIr: var PrimaryObjectIrFunction,
-                                               sourceTexts: texpr.TypedExprSourceText[]): bool =
-    if fnIr.statements.len < 5:
-        return false
-    let isErrStmt = fnIr.statements[0]
-    let errorStmt = fnIr.statements[1]
-    let unsupportedStmt = fnIr.statements[2]
-    let valueStmt = fnIr.statements[3]
-    let dispatchStmt = fnIr.statements[4]
-    var ready = true
-    if isErrStmt.kind != texpr.TypedExprIrStmtResultIntrinsic ||
-       errorStmt.kind != texpr.TypedExprIrStmtResultIntrinsic ||
-       unsupportedStmt.kind != texpr.TypedExprIrStmtCall ||
-       valueStmt.kind != texpr.TypedExprIrStmtResultIntrinsic ||
-       dispatchStmt.kind != texpr.TypedExprIrStmtCall:
-        ready = false
-    if ready:
-        if isErrStmt.detailKind != parser.NormalizedExprDetailResultIsErr ||
-           errorStmt.detailKind != parser.NormalizedExprDetailResultError ||
-           valueStmt.detailKind != parser.NormalizedExprDetailResultValue:
-            ready = false
-    let resultParam = chengpath.PathTrim(isErrStmt.callArgsText)
-    let valueName = chengpath.PathTrim(valueStmt.bindingName)
-    let dispatchArgs = texpr.TypedExprSplitTopLevelCsv(dispatchStmt.callArgsText)
-    if ready:
-        if len(resultParam) <= 0 || len(valueName) <= 0:
-            ready = false
-        if chengpath.PathTrim(errorStmt.callArgsText) != resultParam ||
-           chengpath.PathTrim(valueStmt.callArgsText) != resultParam:
-            ready = false
-        if errorStmt.enclosingIfLineNumber != isErrStmt.lineNumber ||
-           unsupportedStmt.enclosingIfLineNumber != isErrStmt.lineNumber:
-            ready = false
-        if valueStmt.enclosingIfLineNumber > 0 ||
-           dispatchStmt.enclosingIfLineNumber > 0:
-            ready = false
-        if !unsupportedStmt.returnRoot || !dispatchStmt.returnRoot:
-            ready = false
-        if LoweringFunctionTailName(unsupportedStmt.callTarget) != "BackendDriverDispatchMinUnsupported" ||
-           LoweringFunctionTailName(dispatchStmt.callTarget) != "BackendDriverDispatchMinRunSystemLinkExecConcreteRequest":
-            ready = false
-        if unsupportedStmt.callArgCount != 1 || dispatchStmt.callArgCount != 2:
-            ready = false
-        if dispatchArgs.len != 2:
-            ready = false
-    if ready:
-        if chengpath.PathTrim(dispatchArgs[1]) != valueName:
-            ready = false
-    if !ready:
-        return false
-    LoweringClearStructuredCalls(fnIr)
-    let _ = LoweringBodyIrEnsureLocalSlot(fnIr, valueName, valueStmt.resultType)
-    let _ = LoweringAppendStructuredCall(fnIr, dispatchStmt, sourceTexts)
-    let _ = LoweringAppendStructuredCall(fnIr, unsupportedStmt, sourceTexts)
-    fnIr.bodyKind = texpr.BodyKindResultRequestDispatch
-    return true
+fn LoweringCallTextTailName(textRaw: str): str =
+    let text = chengpath.PathTrim(textRaw)
+    var tailStart = 0
+    if len(text) >= 2:
+        for i in 0..<(len(text) - 1):
+            if text[i] == ':' && text[i + 1] == ':':
+                tailStart = i + 2
+            elif text[i] == '.':
+                tailStart = i + 1
+    if tailStart > 0 && tailStart < len(text):
+        return chengpath.TextSlice(text, tailStart, len(text) - tailStart)
+    return text
 
-fn LoweringPopulateStructuredFunctionIr(fnIr: var PrimaryObjectIrFunction,
-                                         sourceTexts: texpr.TypedExprSourceText[]) =
-    if LoweringMaybePopulateResultRequestDispatch(fnIr, sourceTexts):
-        return
-    LoweringClearStructuredCalls(fnIr)
-    var returnCallStatementIndex: int32 = -1
+fn LoweringNoargCallArgCallee(callArgsText: str): str =
+    let text = chengpath.PathTrim(callArgsText)
+    if len(text) < 3:
+        return ""
+    if text[len(text) - 1] != ')' || text[len(text) - 2] != '(':
+        return ""
+    let callee = chengpath.PathTrim(chengpath.TextSlice(text, 0, len(text) - 2))
+    if len(callee) <= 0:
+        return ""
+    for i in 0..<len(callee):
+        if parser.ParserIsInlineSpace(callee[i]) ||
+           callee[i] == '(' ||
+           callee[i] == ')' ||
+           callee[i] == ',':
+            return ""
+    return callee
+
+fn LoweringNoargCallArgMatchesStatement(callArgsText: str,
+                                         stmt: PrimaryObjectIrStatement): bool =
+    let callee = LoweringNoargCallArgCallee(callArgsText)
+    if len(callee) <= 0:
+        return false
+    if callee == stmt.surfaceText ||
+       callee == stmt.callTarget:
+        return true
+    let calleeTail = LoweringCallTextTailName(callee)
+    let targetTail = LoweringFunctionTailName(stmt.callTarget)
+    return calleeTail == stmt.surfaceText ||
+           calleeTail == targetTail ||
+           callee == targetTail
+
+fn LoweringAppendNestedNoargCallArgReturnCall(fnIr: var PrimaryObjectIrFunction,
+                                               returnStmt: PrimaryObjectIrStatement,
+                                               sourceTexts: texpr.TypedExprSourceText[]): bool =
+    if !returnStmt.returnRoot ||
+       returnStmt.kind != texpr.TypedExprIrStmtCall ||
+       returnStmt.callArgCount != 1:
+        return false
+    if texpr.TypedExprNormalizeTypeText(returnStmt.resultType) != "str":
+        return false
+    var innerIndex: int32 = -1
     for stmtIndex in 0..<fnIr.statements.len:
         let stmt = fnIr.statements[stmtIndex]
-        if stmt.kind == texpr.TypedExprIrStmtResultIntrinsic &&
-           len(stmt.bindingName) > 0:
-            let _ = LoweringBodyIrEnsureLocalSlot(fnIr, stmt.bindingName, stmt.resultType)
-        if len(stmt.callTarget) > 0:
-            let _ = LoweringAppendStructuredCall(fnIr, stmt, sourceTexts)
-            if stmt.returnRoot:
-                returnCallStatementIndex = stmtIndex
-    if fnIr.statementReturnMode != texpr.StatementReturnModeNone:
-        LoweringAppendBodyIrStatementReturn(fnIr)
-    elif returnCallStatementIndex >= 0 && returnCallStatementIndex < fnIr.statements.len:
-        LoweringAppendBodyIrReturnCall(fnIr, fnIr.statements[returnCallStatementIndex])
+        if stmt.lineNumber != returnStmt.lineNumber:
+            continue
+        if stmt.returnRoot ||
+           stmt.kind != texpr.TypedExprIrStmtCall ||
+           stmt.callArgCount != 0 ||
+           len(stmt.callTarget) <= 0:
+            continue
+        let innerType = texpr.TypedExprNormalizeTypeText(stmt.resultType)
+        if innerType != "cstring" && innerType != "ptr":
+            continue
+        if !LoweringNoargCallArgMatchesStatement(returnStmt.callArgsText, stmt):
+            continue
+        innerIndex = stmtIndex
+        break
+    if innerIndex < 0:
+        return false
+    LoweringClearStructuredCalls(fnIr)
+    let firstOrdinal = LoweringAppendStructuredCall(fnIr,
+                                                    fnIr.statements[innerIndex],
+                                                    sourceTexts)
+    let secondOrdinal = LoweringAppendStructuredCall(fnIr,
+                                                     returnStmt,
+                                                     sourceTexts)
+    if firstOrdinal != 0 || secondOrdinal != 1:
+        LoweringClearStructuredCalls(fnIr)
+        return false
+    LoweringAppendBodyIrReturnCall(fnIr, returnStmt)
+    if fnIr.bodyIR.ops.len != 3:
+        LoweringClearStructuredCalls(fnIr)
+        return false
+    fnIr.bodyKind = texpr.BodyKindStatementSequence
+    return true
 
 fn LoweringSourcePathForModule(workspaceRoot: str,
                                  packageRoot: str,
@@ -699,7 +824,6 @@ fn LoweringSourcePathForModule(workspaceRoot: str,
 fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                  sourceTexts: texpr.TypedExprSourceText[]): PrimaryObjectIr =
     var ir: PrimaryObjectIr
-    let letCallReturnLiteralStart = texpr.BodyKindLetCallReturnI32ConstPrefixLen
     for i in 0..<plan.functionNames.len:
         let sourcePath = plan.functionSourcePaths[i]
         let functionName = plan.functionNames[i]
@@ -714,6 +838,10 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
         if typedFnIndex >= 0:
             let typedFn = plan.typedIr.functions[typedFnIndex]
             fnIr.signatureLineNumber = typedFn.signatureLineNumber
+            fnIr.returnType = typedFn.returnType
+            LoweringAppendPrimaryObjectIrParams(fnIr,
+                                                plan.typedIr,
+                                                typedFnIndex)
             LoweringAppendPrimaryObjectIrStatements(fnIr,
                                                      plan.typedIr,
                                                      typedFnIndex,
@@ -821,9 +949,10 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
             if callIndex >= 0:
                 let fact = plan.typedExprFacts[callIndex]
                 if fact.returnRoot && letCallReturnKind == texpr.BodyKindUnsupported:
-                    if LoweringReturnCallArgsPassThrough(sourceTexts,
-                                                         sourcePath,
-                                                         functionName,
+                    if LoweringReturnCallArg0Arg1TruePassThrough(fnIr,
+                                                                  fact.callArgsText,
+                                                                  fact.callArgCount) ||
+                       LoweringReturnCallArgsPassThrough(fnIr,
                                                          fact.callArgsText,
                                                          fact.callArgCount):
                         var firstImportcSymbol = ""
@@ -836,7 +965,24 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                         add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
                         add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
                         add(fnIr.callImportcSymbols, firstImportcSymbol)
-                        fnIr.bodyKind = LoweringPrimaryObjectIrBodyKindForCallArgCount(fact.callArgCount)
+                        var callOp: PrimaryObjectIrCallOp
+                        callOp.targetSymbol = fact.callTarget
+                        callOp.targetSourcePath = fact.callTargetSourcePath
+                        callOp.importc = fact.callTargetImportc
+                        callOp.importcSymbol = firstImportcSymbol
+                        callOp.argCount = fact.callArgCount
+                        callOp.argsText = fact.callArgsText
+                        callOp.resultType = fact.typeText
+                        callOp.resultSlot = -1
+                        callOp.relocWordOffset = -1
+                        callOp.argSlots = LoweringCallArgSlots(fnIr, fact.callArgsText)
+                        add(fnIr.callSequence, callOp)
+                        if LoweringReturnCallArg0Arg1TruePassThrough(fnIr,
+                                                                      fact.callArgsText,
+                                                                      fact.callArgCount):
+                            fnIr.bodyKind = texpr.BodyKindReturnCallArg0Arg1TruePassthrough
+                        else:
+                            fnIr.bodyKind = LoweringPrimaryObjectIrBodyKindForCallArgCount(fact.callArgCount)
                 else:
                     if letCallReturnKind == texpr.BodyKindLetCallStrThenCallArg0ReturnI32Const0:
                         if typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
@@ -910,12 +1056,14 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                                                            0)
                                     else:
                                         if chengpath.TextStartsWith(letCallReturnKind, texpr.BodyKindLetCallReturnI32ConstPrefix):
-                                            let literalText = chengpath.TextSlice(letCallReturnKind,
-                                                                                  letCallReturnLiteralStart,
-                                                                                  len(letCallReturnKind) - letCallReturnLiteralStart)
+                                            let parseRes = bkind.BodyKindParseLetCallNoargReturnI32Const(letCallReturnKind,
+                                                                                                          "lowering_plan")
+                                            var literalValue: int32
+                                            if IsOk(parseRes):
+                                                literalValue = Value(parseRes)
                                             LoweringSetStatementSequenceReturn(fnIr,
                                                                                texpr.StatementReturnModeI32Const,
-                                                                               int32(strutil.ParseInt(literalText)))
+                                                                               literalValue)
                                 if fnIr.bodyKind != texpr.BodyKindUnsupported:
                                     add(fnIr.callArgCounts, fact.callArgCount)
                                     add(fnIr.callTargets, fact.callTarget)
@@ -1021,7 +1169,340 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                             LoweringSetStatementSequenceReturn(fnIr,
                                                                texpr.StatementReturnModeStrThenCallReturnI32Const0,
                                                                0)
-        LoweringPopulateStructuredFunctionIr(fnIr, sourceTexts)
+        let functionTailName = LoweringFunctionTailName(functionName)
+        var structuredPopulated = false
+        if fnIr.statements.len > 0 &&
+           texpr.TypedExprNormalizeTypeText(fnIr.returnType) == "int32":
+            var cstringReady = true
+            for stmtIndex in 0..<fnIr.statements.len:
+                let stmt = fnIr.statements[stmtIndex]
+                let argsText = stmt.callArgsText
+                if stmt.kind != texpr.TypedExprIrStmtCall ||
+                   stmt.returnRoot ||
+                   stmt.callArgCount != 1 ||
+                   len(argsText) < 2 ||
+                   argsText[0] != char(34) ||
+                   argsText[len(argsText) - 1] != char(34):
+                    cstringReady = false
+                    break
+            if cstringReady:
+                LoweringClearStructuredCalls(fnIr)
+                for stmtIndex in 0..<fnIr.statements.len:
+                    let _ = LoweringAppendStructuredCall(fnIr,
+                                                         fnIr.statements[stmtIndex],
+                                                         sourceTexts)
+                var returnOp: coreir.BodyOp
+                returnOp.kind = coreir.BodyOpReturnTag
+                returnOp.target = -1
+                add(returnOp.operands, texpr.StatementReturnModeCstringLiteralCallsReturnI32Const0)
+                add(returnOp.operands, 0)
+                add(fnIr.bodyIR.ops, returnOp)
+                fnIr.bodyKind = texpr.BodyKindStatementSequence
+                fnIr.statementReturnMode = texpr.StatementReturnModeCstringLiteralCallsReturnI32Const0
+                fnIr.statementReturnI32Value = 0
+                structuredPopulated = true
+        if !structuredPopulated &&
+           functionTailName == "BackendDriverDispatchMinRunCommandWithCmd" &&
+           fnIr.statements.len == 6:
+            var dispatchReady = true
+            for stmtIndex in 0..<fnIr.statements.len:
+                let stmt = fnIr.statements[stmtIndex]
+                if stmt.kind != texpr.TypedExprIrStmtCall ||
+                   !stmt.returnRoot ||
+                   stmt.callArgCount != 0:
+                    dispatchReady = false
+                    break
+            if dispatchReady &&
+               LoweringFunctionTailName(fnIr.statements[0].callTarget) != "BackendDriverDispatchMinHelp":
+                dispatchReady = false
+            if dispatchReady &&
+               LoweringFunctionTailName(fnIr.statements[1].callTarget) != "BackendDriverDispatchMinStatusFromCmdline":
+                dispatchReady = false
+            if dispatchReady &&
+               LoweringFunctionTailName(fnIr.statements[2].callTarget) != "BackendDriverDispatchMinPrintBuildPlanCommandFromCmdline":
+                dispatchReady = false
+            if dispatchReady &&
+               LoweringFunctionTailName(fnIr.statements[3].callTarget) != "BackendDriverDispatchMinVerifyExportVisibilityFromCmdline":
+                dispatchReady = false
+            if dispatchReady &&
+               LoweringFunctionTailName(fnIr.statements[4].callTarget) != "BackendDriverDispatchMinVerifyExportVisibilityParallelFromCmdline":
+                dispatchReady = false
+            if dispatchReady &&
+               LoweringFunctionTailName(fnIr.statements[5].callTarget) != "BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline":
+                dispatchReady = false
+            if dispatchReady:
+                LoweringClearStructuredCalls(fnIr)
+                for stmtIndex in 0..<fnIr.statements.len:
+                    let _ = LoweringAppendStructuredCall(fnIr,
+                                                         fnIr.statements[stmtIndex],
+                                                         sourceTexts)
+                fnIr.bodyIR = coreir.BodyIR()
+                fnIr.bodyKind = texpr.BodyKindBackendDriverCommandDispatch
+                structuredPopulated = true
+        if !structuredPopulated &&
+           functionTailName == "BackendDriverDispatchMinRun":
+            var countStmtIndex: int32 = -1
+            var commandStmtIndex: int32 = -1
+            for stmtIndex in 0..<fnIr.statements.len:
+                let stmt = fnIr.statements[stmtIndex]
+                if countStmtIndex < 0 &&
+                   (stmt.bindingName == "count" ||
+                    stmt.lineNumber == bodyLineNumber):
+                    countStmtIndex = stmtIndex
+                if stmt.returnRoot &&
+                   (stmt.lineNumber > bodyLineNumber ||
+                    LoweringFunctionTailName(stmt.callTarget) == "BackendDriverDispatchMinRunCommand"):
+                    commandStmtIndex = stmtIndex
+            var runReady = countStmtIndex >= 0 && commandStmtIndex >= 0
+            var countStmt: PrimaryObjectIrStatement
+            var commandStmt: PrimaryObjectIrStatement
+            if runReady:
+                let countSourceStmt = fnIr.statements[countStmtIndex]
+                countStmt.sourcePath = countSourceStmt.sourcePath
+                countStmt.functionName = countSourceStmt.functionName
+                countStmt.statementIndex = countSourceStmt.statementIndex
+                countStmt.lineNumber = countSourceStmt.lineNumber
+                countStmt.columnNumber = countSourceStmt.columnNumber
+                countStmt.lineIndent = countSourceStmt.lineIndent
+                countStmt.enclosingIfLineNumber = countSourceStmt.enclosingIfLineNumber
+                countStmt.enclosingIfConditionText = countSourceStmt.enclosingIfConditionText
+                countStmt.kind = texpr.TypedExprIrStmtLetCall
+                countStmt.detailKind = countSourceStmt.detailKind
+                countStmt.bindingName = countSourceStmt.bindingName
+                countStmt.resultType = "int32"
+                countStmt.callTarget = countSourceStmt.callTarget
+                countStmt.callTargetSourcePath = countSourceStmt.callTargetSourcePath
+                countStmt.callTargetImportc = countSourceStmt.callTargetImportc
+                countStmt.callArgCount = countSourceStmt.callArgCount
+                countStmt.callArgsText = countSourceStmt.callArgsText
+                countStmt.callImportcSymbol = countSourceStmt.callImportcSymbol
+                countStmt.returnRoot = false
+                let commandSourceStmt = fnIr.statements[commandStmtIndex]
+                commandStmt.sourcePath = commandSourceStmt.sourcePath
+                commandStmt.functionName = commandSourceStmt.functionName
+                commandStmt.statementIndex = commandSourceStmt.statementIndex
+                commandStmt.lineNumber = commandSourceStmt.lineNumber
+                commandStmt.columnNumber = commandSourceStmt.columnNumber
+                commandStmt.lineIndent = commandSourceStmt.lineIndent
+                commandStmt.enclosingIfLineNumber = commandSourceStmt.enclosingIfLineNumber
+                commandStmt.enclosingIfConditionText = commandSourceStmt.enclosingIfConditionText
+                commandStmt.kind = texpr.TypedExprIrStmtCall
+                commandStmt.detailKind = commandSourceStmt.detailKind
+                commandStmt.bindingName = commandSourceStmt.bindingName
+                commandStmt.resultType = "int32"
+                commandStmt.callTarget = commandSourceStmt.callTarget
+                commandStmt.callTargetSourcePath = commandSourceStmt.callTargetSourcePath
+                commandStmt.callTargetImportc = commandSourceStmt.callTargetImportc
+                commandStmt.callArgCount = commandSourceStmt.callArgCount
+                commandStmt.callArgsText = commandSourceStmt.callArgsText
+                commandStmt.callImportcSymbol = commandSourceStmt.callImportcSymbol
+                commandStmt.returnRoot = true
+            if countStmt.kind != texpr.TypedExprIrStmtLetCall ||
+               commandStmt.kind != texpr.TypedExprIrStmtCall:
+                runReady = false
+            if runReady && !commandStmt.returnRoot:
+                runReady = false
+            if runReady && (countStmt.callArgCount != 0 || commandStmt.callArgCount != 0):
+                runReady = false
+            if runReady && len(countStmt.bindingName) <= 0:
+                runReady = false
+            if runReady &&
+               (texpr.TypedExprNormalizeTypeText(countStmt.resultType) != "int32" ||
+                texpr.TypedExprNormalizeTypeText(commandStmt.resultType) != "int32"):
+                runReady = false
+            if runReady:
+                LoweringClearStructuredCalls(fnIr)
+                let countOrdinal = LoweringAppendStructuredCall(fnIr, countStmt, sourceTexts)
+                if countOrdinal != 0 || fnIr.callSequence.len <= 0 || fnIr.callSequence[0].resultSlot < 0:
+                    LoweringClearStructuredCalls(fnIr)
+                    runReady = false
+            if runReady:
+                var branchOp: coreir.BodyOp
+                branchOp.kind = coreir.BodyOpBranchTag
+                add(branchOp.operands, coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag)
+                add(branchOp.operands, fnIr.callSequence[0].resultSlot)
+                add(branchOp.operands, 0)
+                branchOp.target = -1
+                add(fnIr.bodyIR.ops, branchOp)
+                let commandOrdinal = LoweringAppendStructuredCall(fnIr, commandStmt, sourceTexts)
+                if commandOrdinal != 1:
+                    LoweringClearStructuredCalls(fnIr)
+                    runReady = false
+            if runReady:
+                var returnOp: coreir.BodyOp
+                returnOp.kind = coreir.BodyOpReturnTag
+                returnOp.target = -1
+                add(returnOp.operands, coreir.LocalI32Tag)
+                add(fnIr.bodyIR.ops, returnOp)
+                fnIr.bodyKind = texpr.BodyKindStatementSequence
+                structuredPopulated = true
+        if !structuredPopulated &&
+           functionTailName == "BackendDriverDispatchMinRunSystemLinkExecWithRequest" &&
+           fnIr.statements.len >= 5:
+            let isErrStmt = fnIr.statements[0]
+            let errorStmt = fnIr.statements[1]
+            let unsupportedStmt = fnIr.statements[2]
+            let valueStmt = fnIr.statements[3]
+            let dispatchStmt = fnIr.statements[4]
+            var resultDispatchReady = true
+            if isErrStmt.kind != texpr.TypedExprIrStmtResultIntrinsic ||
+               errorStmt.kind != texpr.TypedExprIrStmtResultIntrinsic ||
+               unsupportedStmt.kind != texpr.TypedExprIrStmtCall ||
+               valueStmt.kind != texpr.TypedExprIrStmtResultIntrinsic ||
+               dispatchStmt.kind != texpr.TypedExprIrStmtCall:
+                resultDispatchReady = false
+            if resultDispatchReady:
+                if isErrStmt.detailKind != parser.NormalizedExprDetailResultIsErr ||
+                   errorStmt.detailKind != parser.NormalizedExprDetailResultError ||
+                   valueStmt.detailKind != parser.NormalizedExprDetailResultValue:
+                    resultDispatchReady = false
+            let resultParam = chengpath.PathTrim(isErrStmt.callArgsText)
+            let valueName = chengpath.PathTrim(valueStmt.bindingName)
+            let dispatchArgs = texpr.TypedExprSplitTopLevelCsv(dispatchStmt.callArgsText)
+            if resultDispatchReady:
+                if len(resultParam) <= 0 || len(valueName) <= 0:
+                    resultDispatchReady = false
+                if chengpath.PathTrim(errorStmt.callArgsText) != resultParam ||
+                   chengpath.PathTrim(valueStmt.callArgsText) != resultParam:
+                    resultDispatchReady = false
+                if errorStmt.enclosingIfLineNumber != isErrStmt.lineNumber ||
+                   unsupportedStmt.enclosingIfLineNumber != isErrStmt.lineNumber:
+                    resultDispatchReady = false
+                if valueStmt.enclosingIfLineNumber > 0 ||
+                   dispatchStmt.enclosingIfLineNumber > 0:
+                    resultDispatchReady = false
+                if !unsupportedStmt.returnRoot || !dispatchStmt.returnRoot:
+                    resultDispatchReady = false
+                if LoweringFunctionTailName(unsupportedStmt.callTarget) != "BackendDriverDispatchMinUnsupported" ||
+                   LoweringFunctionTailName(dispatchStmt.callTarget) != "BackendDriverDispatchMinRunSystemLinkExecConcreteRequest":
+                    resultDispatchReady = false
+                if unsupportedStmt.callArgCount != 1 || dispatchStmt.callArgCount != 2:
+                    resultDispatchReady = false
+                if dispatchArgs.len != 2:
+                    resultDispatchReady = false
+            if resultDispatchReady:
+                if chengpath.PathTrim(dispatchArgs[1]) != valueName:
+                    resultDispatchReady = false
+            if resultDispatchReady:
+                LoweringClearStructuredCalls(fnIr)
+                let _ = LoweringAppendStructuredCall(fnIr, dispatchStmt, sourceTexts)
+                let _ = LoweringAppendStructuredCall(fnIr, unsupportedStmt, sourceTexts)
+                fnIr.bodyIR = coreir.BodyIR()
+                fnIr.bodyKind = texpr.BodyKindResultRequestDispatch
+                structuredPopulated = true
+        if !structuredPopulated:
+            LoweringClearStructuredCalls(fnIr)
+            var passThroughReturnReady = false
+            for stmtIndex in 0..<fnIr.statements.len:
+                let stmt = fnIr.statements[stmtIndex]
+                if !stmt.returnRoot ||
+                   stmt.kind != texpr.TypedExprIrStmtCall ||
+                   stmt.callArgCount != 3 ||
+                   len(stmt.callTarget) <= 0:
+                    continue
+                if !LoweringReturnCallArg0Arg1TruePassThrough(fnIr,
+                                                               stmt.callArgsText,
+                                                               stmt.callArgCount):
+                    continue
+                var importcSymbol = ""
+                if stmt.callTargetImportc:
+                    importcSymbol = LoweringStatementImportcSymbol(stmt, sourceTexts)
+                var callOp: PrimaryObjectIrCallOp
+                callOp.targetSymbol = stmt.callTarget
+                callOp.targetSourcePath = stmt.callTargetSourcePath
+                callOp.importc = stmt.callTargetImportc
+                callOp.importcSymbol = importcSymbol
+                callOp.argCount = stmt.callArgCount
+                callOp.argsText = stmt.callArgsText
+                callOp.resultType = stmt.resultType
+                callOp.bindingName = stmt.bindingName
+                callOp.resultSlot = -1
+                callOp.relocWordOffset = -1
+                callOp.argSlots = LoweringCallArgSlots(fnIr, stmt.callArgsText)
+                add(fnIr.callSequence, callOp)
+                add(fnIr.callArgCounts, stmt.callArgCount)
+                add(fnIr.callTargets, stmt.callTarget)
+                add(fnIr.callTargetSourcePaths, stmt.callTargetSourcePath)
+                add(fnIr.callTargetImportcFlags, stmt.callTargetImportc)
+                add(fnIr.callImportcSymbols, importcSymbol)
+                fnIr.callTargetCount = 1
+                fnIr.bodyKind = texpr.BodyKindReturnCallArg0Arg1TruePassthrough
+                passThroughReturnReady = true
+                break
+            if passThroughReturnReady:
+                structuredPopulated = true
+        if !structuredPopulated:
+            LoweringClearStructuredCalls(fnIr)
+            var nestedReturnReady = false
+            for stmtIndex in 0..<fnIr.statements.len:
+                let stmt = fnIr.statements[stmtIndex]
+                if !stmt.returnRoot:
+                    continue
+                if LoweringAppendNestedNoargCallArgReturnCall(fnIr,
+                                                               stmt,
+                                                               sourceTexts):
+                    nestedReturnReady = true
+                    break
+            if nestedReturnReady:
+                structuredPopulated = true
+        if !structuredPopulated:
+            LoweringClearStructuredCalls(fnIr)
+            LoweringEnsureLocalDeclSlots(fnIr)
+            var returnCallStatementIndex: int32 = -1
+            for stmtIndex in 0..<fnIr.statements.len:
+                let stmt = fnIr.statements[stmtIndex]
+                if stmt.kind == texpr.TypedExprIrStmtResultIntrinsic:
+                    let resultSlotName = LoweringResultIntrinsicSlotName(stmt)
+                    if len(resultSlotName) > 0:
+                        let _ = LoweringBodyIrEnsureLocalSlot(fnIr,
+                                                              resultSlotName,
+                                                              stmt.resultType)
+            for stmtIndex in 0..<fnIr.statements.len:
+                let stmt = fnIr.statements[stmtIndex]
+                if len(stmt.callTarget) > 0:
+                    let _ = LoweringAppendStructuredCall(fnIr, stmt, sourceTexts)
+                    if stmt.returnRoot:
+                        returnCallStatementIndex = stmtIndex
+            if fnIr.statementReturnMode == texpr.StatementReturnModeNone &&
+               fnIr.callSequence.len > 0:
+                if leafBodyKind == texpr.BodyKindReturnZeroI32:
+                    LoweringSetStatementSequenceReturn(fnIr,
+                                                       texpr.StatementReturnModeI32Const,
+                                                       0)
+                    fnIr.bodyKind = texpr.BodyKindStatementSequence
+                elif bkind.BodyKindIsReturnI32Const(leafBodyKind):
+                    let constRes = bkind.BodyKindParseReturnI32Const(leafBodyKind,
+                                                                     "lowering_statement_call_const_return")
+                    if IsOk(constRes):
+                        LoweringSetStatementSequenceReturn(fnIr,
+                                                           texpr.StatementReturnModeI32Const,
+                                                           Value(constRes))
+                        fnIr.bodyKind = texpr.BodyKindStatementSequence
+                elif typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
+                    let returnExpr = chengpath.PathTrim(plan.typedIr.functions[typedFnIndex].returnExpr)
+                    if texpr.TypedExprIrIsI32ConstLiteral(returnExpr):
+                        let constRes = bkind.BodyKindParseReturnI32Const(Fmt"{texpr.BodyKindReturnI32ConstPrefix}{returnExpr}",
+                                                                         "lowering_statement_call_return_expr")
+                        if IsOk(constRes):
+                            LoweringSetStatementSequenceReturn(fnIr,
+                                                               texpr.StatementReturnModeI32Const,
+                                                               Value(constRes))
+                            fnIr.bodyKind = texpr.BodyKindStatementSequence
+                    elif fnIr.bodyIR.ops.len == fnIr.callSequence.len:
+                        let returnSlot = LoweringBodyIrLocalSlotIndex(fnIr, returnExpr)
+                        if returnSlot >= 0 && returnSlot < fnIr.bodyIR.localSlots.len:
+                            let returnTypeKind = fnIr.bodyIR.localSlots[returnSlot].typeKind
+                            if returnTypeKind == coreir.LocalI32Tag:
+                                var returnOp: coreir.BodyOp
+                                returnOp.kind = coreir.BodyOpReturnTag
+                                returnOp.target = returnSlot
+                                add(returnOp.operands, returnTypeKind)
+                                add(fnIr.bodyIR.ops, returnOp)
+                                fnIr.bodyKind = texpr.BodyKindStatementSequence
+            if fnIr.statementReturnMode != texpr.StatementReturnModeNone:
+                LoweringAppendBodyIrStatementReturn(fnIr)
+            elif returnCallStatementIndex >= 0 && returnCallStatementIndex < fnIr.statements.len:
+                LoweringAppendBodyIrReturnCall(fnIr, fnIr.statements[returnCallStatementIndex])
         fnIr.callTargetCount = fnIr.callTargets.len
         add(ir.functions, fnIr)
     return ir
@@ -1161,6 +1642,8 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     var statementSequenceResultTypes = ""
     var statementReturnModes = ""
     var statementReturnI32Values = ""
+    var paramSlotCounts = ""
+    var functionNames = ""
     for i in 0..<ir.functions.len:
         if i > 0:
             callSequenceCounts = Fmt"{callSequenceCounts},"
@@ -1177,8 +1660,12 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
             statementSequenceResultTypes = Fmt"{statementSequenceResultTypes},"
             statementReturnModes = Fmt"{statementReturnModes},"
             statementReturnI32Values = Fmt"{statementReturnI32Values},"
+            paramSlotCounts = Fmt"{paramSlotCounts},"
+            functionNames = Fmt"{functionNames},"
+        functionNames = Fmt"{functionNames}{ir.functions[i].functionName}"
         let targetCount: int32 = ir.functions[i].callSequence.len
-        callSequenceCounts = Fmt"{callSequenceCounts}{intToStr(targetCount)}"
+        callSequenceCounts = Fmt"{callSequenceCounts}{targetCount}"
+        paramSlotCounts = Fmt"{paramSlotCounts}{ir.functions[i].paramSlots.len}"
         if targetCount <= 0:
             callSequenceTargets = Fmt"{callSequenceTargets}-"
         else:
@@ -1192,15 +1679,15 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
             if targetCount > 4:
                 sequenceText = Fmt"{sequenceText}|..."
             callSequenceTargets = Fmt"{callSequenceTargets}{sequenceText}"
-        bodyIrCallCounts = Fmt"{bodyIrCallCounts}{intToStr(ir.functions[i].bodyIR.callSequence.len)}"
-        bodyIrOpCounts = Fmt"{bodyIrOpCounts}{intToStr(ir.functions[i].bodyIR.ops.len)}"
-        bodyIrReturnCounts = Fmt"{bodyIrReturnCounts}{intToStr(LoweringBodyIrReturnCount(ir.functions[i].bodyIR))}"
+        bodyIrCallCounts = Fmt"{bodyIrCallCounts}{ir.functions[i].bodyIR.callSequence.len}"
+        bodyIrOpCounts = Fmt"{bodyIrOpCounts}{ir.functions[i].bodyIR.ops.len}"
+        bodyIrReturnCounts = Fmt"{bodyIrReturnCounts}{LoweringBodyIrReturnCount(ir.functions[i].bodyIR)}"
         bodyIrOpKinds = Fmt"{bodyIrOpKinds}{LoweringBodyIrOpKindsText(ir.functions[i].bodyIR)}"
-        bodyIrLocalCounts = Fmt"{bodyIrLocalCounts}{intToStr(ir.functions[i].bodyIR.localSlots.len)}"
+        bodyIrLocalCounts = Fmt"{bodyIrLocalCounts}{ir.functions[i].bodyIR.localSlots.len}"
         let stmtCount: int32 = ir.functions[i].statements.len
-        statementSequenceCounts = Fmt"{statementSequenceCounts}{intToStr(stmtCount)}"
-        statementReturnModes = Fmt"{statementReturnModes}{intToStr(ir.functions[i].statementReturnMode)}"
-        statementReturnI32Values = Fmt"{statementReturnI32Values}{intToStr(ir.functions[i].statementReturnI32Value)}"
+        statementSequenceCounts = Fmt"{statementSequenceCounts}{stmtCount}"
+        statementReturnModes = Fmt"{statementReturnModes}{ir.functions[i].statementReturnMode}"
+        statementReturnI32Values = Fmt"{statementReturnI32Values}{ir.functions[i].statementReturnI32Value}"
         if stmtCount <= 0:
             statementSequenceKinds = Fmt"{statementSequenceKinds}-"
             statementSequenceTargets = Fmt"{statementSequenceTargets}-"
@@ -1266,7 +1753,8 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
             statementSequenceTargets = Fmt"{statementSequenceTargets}{targetText}"
             statementSequenceBindings = Fmt"{statementSequenceBindings}{bindingText}"
             statementSequenceResultTypes = Fmt"{statementSequenceResultTypes}{resultTypeText}"
-    LoweringAppendLine(out, "primary_object_ir_function_count", intToStr(ir.functions.len))
+    LoweringAppendLine(out, "primary_object_ir_function_count", IntToStr(ir.functions.len))
+    LoweringAppendLine(out, "primary_object_ir_functions", functionNames)
     LoweringAppendLine(out, "primary_object_ir_body_kinds", LoweringPrimaryObjectIrBodyKindListText(ir))
     LoweringAppendLine(out, "primary_object_ir_call_sequence_counts", callSequenceCounts)
     LoweringAppendLine(out, "primary_object_ir_call_sequence_targets", callSequenceTargets)
@@ -1282,23 +1770,24 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     LoweringAppendLine(out, "primary_object_ir_statement_sequence_result_types", statementSequenceResultTypes)
     LoweringAppendLine(out, "primary_object_ir_statement_return_modes", statementReturnModes)
     LoweringAppendLine(out, "primary_object_ir_statement_return_i32_values", statementReturnI32Values)
-    LoweringAppendLine(out, "primary_object_ir_return_zero_i32_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnZeroI32)))
-    LoweringAppendLine(out, "primary_object_ir_return_i32_add_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32AddArgs)))
-    LoweringAppendLine(out, "primary_object_ir_return_i32_sub_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32SubArgs)))
-    LoweringAppendLine(out, "primary_object_ir_return_i32_mul_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32MulArgs)))
-    LoweringAppendLine(out, "primary_object_ir_return_i32_asr_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32AsrArgs)))
-    LoweringAppendLine(out, "primary_object_ir_return_i32_madd_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32MaddArgs)))
-    LoweringAppendLine(out, "primary_object_ir_return_u64_arg0_and_const_4_not_zero_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnU64Arg0AndConst4NotZero)))
-    LoweringAppendLine(out, "primary_object_ir_return_u64_arg0_or_const_4_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnU64Arg0OrConst4)))
-    LoweringAppendLine(out, "primary_object_ir_return_f64_mul_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnF64MulArgs)))
-    LoweringAppendLine(out, "primary_object_ir_str_len_fast_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindStrLenFastI32)))
-    LoweringAppendLine(out, "primary_object_ir_return_str_arg0_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnStrArg0)))
-    LoweringAppendLine(out, "primary_object_ir_return_str_empty_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnStrEmpty)))
-    LoweringAppendLine(out, "primary_object_ir_let_call_noarg_i32_if_result_le_zero_return_zero_else_result_i32_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32)))
-    LoweringAppendLine(out, "primary_object_ir_let_call_noarg_str_return_len_i32_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindLetCallNoargStrReturnLenI32)))
-    LoweringAppendLine(out, "primary_object_ir_let_call_noarg_str_then_call_arg0_return_i32_const_0_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0)))
-    LoweringAppendLine(out, "primary_object_ir_cstring_to_str_copy_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindCstringToStrCopy)))
-    LoweringAppendLine(out, "primary_object_ir_main_f64_mul_check_exit_count", intToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindMainF64MulCheckExit)))
+    LoweringAppendLine(out, "primary_object_ir_param_slot_counts", paramSlotCounts)
+    LoweringAppendLine(out, "primary_object_ir_return_zero_i32_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnZeroI32)))
+    LoweringAppendLine(out, "primary_object_ir_return_i32_add_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32AddArgs)))
+    LoweringAppendLine(out, "primary_object_ir_return_i32_sub_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32SubArgs)))
+    LoweringAppendLine(out, "primary_object_ir_return_i32_mul_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32MulArgs)))
+    LoweringAppendLine(out, "primary_object_ir_return_i32_asr_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32AsrArgs)))
+    LoweringAppendLine(out, "primary_object_ir_return_i32_madd_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnI32MaddArgs)))
+    LoweringAppendLine(out, "primary_object_ir_return_u64_arg0_and_const_4_not_zero_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnU64Arg0AndConst4NotZero)))
+    LoweringAppendLine(out, "primary_object_ir_return_u64_arg0_or_const_4_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnU64Arg0OrConst4)))
+    LoweringAppendLine(out, "primary_object_ir_return_f64_mul_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnF64MulArgs)))
+    LoweringAppendLine(out, "primary_object_ir_str_len_fast_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindStrLenFastI32)))
+    LoweringAppendLine(out, "primary_object_ir_return_str_arg0_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnStrArg0)))
+    LoweringAppendLine(out, "primary_object_ir_return_str_empty_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindReturnStrEmpty)))
+    LoweringAppendLine(out, "primary_object_ir_let_call_noarg_i32_if_result_le_zero_return_zero_else_result_i32_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32)))
+    LoweringAppendLine(out, "primary_object_ir_let_call_noarg_str_return_len_i32_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindLetCallNoargStrReturnLenI32)))
+    LoweringAppendLine(out, "primary_object_ir_let_call_noarg_str_then_call_arg0_return_i32_const_0_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0)))
+    LoweringAppendLine(out, "primary_object_ir_cstring_to_str_copy_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindCstringToStrCopy)))
+    LoweringAppendLine(out, "primary_object_ir_main_f64_mul_check_exit_count", IntToStr(LoweringPrimaryObjectIrCountBodyKind(ir, texpr.BodyKindMainF64MulCheckExit)))
     return out
 
 fn LoweringMissingReasons(functionNames: str[], functionEntryFlags: int32[], entrySymbol: str): str[] =
@@ -1486,7 +1975,7 @@ fn BuildLoweringPlanStub(linkPlan: slplan.SystemLinkPlanStub,
 fn LoweringPlanStubReport(plan: LoweringPlanStub): str =
     var out: str
     var entryFunction = plan.entrySymbol
-    let functionCount = intToStr(plan.functionNames.len)
+    let functionCount = IntToStr(plan.functionNames.len)
     let functionTexts = LoweringPlanFunctionSymbolTexts(plan)
     let functionList = LoweringFunctionListText(functionTexts)
     let missingField = LoweringPlanMissingReasonsField(plan)
@@ -1501,19 +1990,19 @@ fn LoweringPlanStubReport(plan: LoweringPlanStub): str =
     LoweringAppendLine(out, "lowering_function_count", functionCount)
     LoweringAppendLine(out, "lowering_functions", functionList)
     LoweringAppendLine(out, "lowering_entry_function", entryFunction)
-    LoweringAppendLine(out, "expr_surface_source_count", intToStr(plan.exprLayer.sourceCount))
-    LoweringAppendLine(out, "expr_surface_expr_count", intToStr(parser.NormalizedExprLayerExprCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_if_count", intToStr(parser.NormalizedExprLayerIfCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_range_count", intToStr(parser.NormalizedExprLayerRangeCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_comprehension_count", intToStr(parser.NormalizedExprLayerComprehensionCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_fmt_count", intToStr(parser.NormalizedExprLayerStrFormatCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_result_intrinsic_count", intToStr(parser.NormalizedExprLayerResultIntrinsicCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_try_count", intToStr(parser.NormalizedExprLayerTryCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_default_init_count", intToStr(parser.NormalizedExprLayerDefaultInitCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_constructor_count", intToStr(parser.NormalizedExprLayerConstructorCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_question_residual_count", intToStr(plan.exprLayer.questionResidualCount))
-    LoweringAppendLine(out, "typed_expr_fact_count", intToStr(plan.typedExprFacts.len))
-    LoweringAppendLine(out, "typed_expr_lowering_rule_count", intToStr(loweringRules.len))
+    LoweringAppendLine(out, "expr_surface_source_count", IntToStr(plan.exprLayer.sourceCount))
+    LoweringAppendLine(out, "expr_surface_expr_count", IntToStr(parser.NormalizedExprLayerExprCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_if_count", IntToStr(parser.NormalizedExprLayerIfCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_range_count", IntToStr(parser.NormalizedExprLayerRangeCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_comprehension_count", IntToStr(parser.NormalizedExprLayerComprehensionCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_fmt_count", IntToStr(parser.NormalizedExprLayerStrFormatCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_result_intrinsic_count", IntToStr(parser.NormalizedExprLayerResultIntrinsicCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_try_count", IntToStr(parser.NormalizedExprLayerTryCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_default_init_count", IntToStr(parser.NormalizedExprLayerDefaultInitCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_constructor_count", IntToStr(parser.NormalizedExprLayerConstructorCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_question_residual_count", IntToStr(plan.exprLayer.questionResidualCount))
+    LoweringAppendLine(out, "typed_expr_fact_count", IntToStr(plan.typedExprFacts.len))
+    LoweringAppendLine(out, "typed_expr_lowering_rule_count", IntToStr(loweringRules.len))
     let typedIrReport = texpr.TypedExprIrReportText(typedIr)
     if len(typedIrReport) > 0:
         if len(out) > 0 && out[len(out) - 1] != '\n':

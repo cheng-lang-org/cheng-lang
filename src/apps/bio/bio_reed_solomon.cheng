@@ -19,10 +19,8 @@ type
         data: uint8[1024]
 
 fn BioGf256Matrix32Clear(matrix: var BioGf256Matrix32) =
-    var idx: int32
-    while idx < 1024:
+    for idx in range(1024):
         matrix.data[idx] = uint8(0)
-        idx = idx + 1
 
 fn BioMessage16FromBytes(data: Bytes): Result[BioMessage16] =
     if bytesLen(data) != BioRsMessageBytes:
@@ -41,20 +39,22 @@ fn BioMessage16ToBytes(value: BioMessage16): Bytes =
 fn BioGf256PolyDegree(coeffs: layout.FixedBytes32, coeffCount: int32): int32 =
     if coeffCount <= 0:
         return -1
-    var i: int32 = coeffCount - 1
-    while i >= 0:
-        if (int32(coeffs.data[i]) & 255) != 0:
-            return i
-        i = i - 1
+    let iStart2 = coeffCount - 1
+    if iStart2 >= 0:
+        for iOffset2 in 0..iStart2:
+            let i = iStart2 - iOffset2
+            if (int32(coeffs.data[i]) & 255) != 0:
+                return i
     return -1
 
 fn BioMessage16PolyEval(coeffs: BioMessage16, x: int32): int32 =
     var acc: int32
-    var i: int32 = BioRsMessageBytes - 1
-    while i >= 0:
-        acc = gf256.gf256Mul(acc, x)
-        acc = gf256.gf256Add(acc, int32(coeffs.data[i]) & 255)
-        i = i - 1
+    let iStart = BioRsMessageBytes - 1
+    if iStart >= 0:
+        for iOffset in 0..iStart:
+            let i = iStart - iOffset
+            acc = gf256.gf256Mul(acc, x)
+            acc = gf256.gf256Add(acc, int32(coeffs.data[i]) & 255)
     return acc & 255
 
 fn BioGf256SwapFixed32(values: var layout.FixedBytes32, left: int32, right: int32) =
@@ -76,12 +76,10 @@ fn BioGf256MatrixSet(matrix: var BioGf256Matrix32, row: int32, col: int32, value
 fn BioGf256SwapRows(matrix: var BioGf256Matrix32, left: int32, right: int32) =
     if left == right:
         return
-    var col: int32
-    while col < 32:
+    for col in range(32):
         let temp = BioGf256MatrixGet(matrix, left, col)
         BioGf256MatrixSet(matrix, left, col, BioGf256MatrixGet(matrix, right, col))
         BioGf256MatrixSet(matrix, right, col, temp)
-        col = col + 1
 
 fn BioGf256SolveLinear(rows: BioGf256Matrix32,
                          rhs: layout.FixedBytes32,
@@ -89,22 +87,19 @@ fn BioGf256SolveLinear(rows: BioGf256Matrix32,
     if size <= 0 || size > 32:
         return Err[layout.FixedBytes32](" bio rs: invalid linear size")
     var rowsWork: BioGf256Matrix32
-    var copyIdx: int32
-    var row: int32
-    while copyIdx < 1024:
+    for copyIdx in range(1024):
         rowsWork.data[copyIdx] = rows.data[copyIdx]
-        copyIdx = copyIdx + 1
     var rhsWork: layout.FixedBytes32 = rhs
     var pivotRow: int32
     var col: int32
-    while col < size:
+    for col in range(size):
+
         var pivot: int32 = -1
         row = pivotRow
-        while row < size:
+        for row in row..<size:
             if BioGf256MatrixGet(rowsWork, row, col) != 0:
                 pivot = row
                 break
-            row = row + 1
         row = size
         while pivot < 0 && row < 32:
             if BioGf256MatrixGet(rowsWork, row, col) != 0:
@@ -121,13 +116,13 @@ fn BioGf256SolveLinear(rows: BioGf256Matrix32,
             return Err[layout.FixedBytes32](Error(pivotInvRes))
         let pivotInv = Value(pivotInvRes)
         var j: int32 = col
-        while j < size:
+        for j in j..<size:
             let scaled = gf256.gf256Mul(BioGf256MatrixGet(rowsWork, pivotRow, j), pivotInv)
             BioGf256MatrixSet(rowsWork, pivotRow, j, scaled)
-            j = j + 1
         rhsWork.data[pivotRow] = uint8(gf256.gf256Mul(int32(rhsWork.data[pivotRow]) & 255, pivotInv))
         row = 0
-        while row < size:
+        for row in range(size):
+
             if row == pivotRow:
                 row = row + 1
                 continue
@@ -136,40 +131,38 @@ fn BioGf256SolveLinear(rows: BioGf256Matrix32,
                 row = row + 1
                 continue
             j = col
-            while j < size:
+            for j in j..<size:
                 let pivotValue = BioGf256MatrixGet(rowsWork, pivotRow, j)
                 let rowValue = BioGf256MatrixGet(rowsWork, row, j)
                 let reduced = gf256.gf256Add(rowValue, gf256.gf256Mul(factor, pivotValue))
                 BioGf256MatrixSet(rowsWork, row, j, reduced)
-                j = j + 1
             let rhsReduced = gf256.gf256Add(int32(rhsWork.data[row]) & 255,
                                             gf256.gf256Mul(factor, int32(rhsWork.data[pivotRow]) & 255))
             rhsWork.data[row] = uint8(rhsReduced)
             row = row + 1
         row = size
-        while row < 32:
+        for row in range(32):
+
             let factor = BioGf256MatrixGet(rowsWork, row, col)
             if factor != 0:
                 j = col
-                while j < size:
+                for j in j..<size:
                     let pivotValue = BioGf256MatrixGet(rowsWork, pivotRow, j)
                     let rowValue = BioGf256MatrixGet(rowsWork, row, j)
                     let reduced = gf256.gf256Add(rowValue, gf256.gf256Mul(factor, pivotValue))
                     BioGf256MatrixSet(rowsWork, row, j, reduced)
-                    j = j + 1
                 let rhsReduced = gf256.gf256Add(int32(rhsWork.data[row]) & 255,
                                                 gf256.gf256Mul(factor, int32(rhsWork.data[pivotRow]) & 255))
                 rhsWork.data[row] = uint8(rhsReduced)
-            row = row + 1
+
         if BioGf256MatrixGet(rowsWork, pivotRow, col) != 1:
             return Err[layout.FixedBytes32](" bio rs: pivot normalization failed")
         pivotRow = pivotRow + 1
-        col = col + 1
+
     row = pivotRow
-    while row < 32:
+    for row in row..<32:
         if (int32(rhsWork.data[row]) & 255) != 0:
             return Err[layout.FixedBytes32](" bio rs: inconsistent linear system")
-        row = row + 1
     return Ok[layout.FixedBytes32](rhsWork)
 
 fn BioGf256PolyDivideMonic(dividend: layout.FixedBytes32,
@@ -232,18 +225,16 @@ fn BioRsBuildBerlekampWelchSystem(received: layout.FixedBytes32,
         let y = int32(received.data[row]) & 255
         var xPow: int32 = 1
         var j: int32
-        while j < qCount:
+        for j in j..<qCount:
             BioGf256MatrixSet(outRows, row, j, xPow)
             xPow = gf256.gf256Mul(xPow, x)
-            j = j + 1
         xPow = 1
         j = 0
-        while j < errorCount:
+        for j in j..<errorCount:
             BioGf256MatrixSet(outRows, row, qCount + j, gf256.gf256Mul(y, xPow))
             xPow = gf256.gf256Mul(xPow, x)
-            j = j + 1
         outRhs.data[row] = uint8(gf256.gf256Mul(y, xPow))
-        row = row + 1
+
 
 fn BioRsTryDecode32x16(received: layout.FixedBytes32, errorCount: int32): Result[BioMessage16] =
     var rows: BioGf256Matrix32
@@ -259,14 +250,12 @@ fn BioRsTryDecode32x16(received: layout.FixedBytes32, errorCount: int32): Result
     let qCount = 16 + errorCount
     var qCoeffs: layout.FixedBytes32
     var i: int32
-    while i < qCount:
+    for i in i..<qCount:
         qCoeffs.data[i] = solution.data[i]
-        i = i + 1
     var eCoeffs: layout.FixedBytes32
     i = 0
-    while i < errorCount:
+    for i in i..<errorCount:
         eCoeffs.data[i] = solution.data[qCount + i]
-        i = i + 1
     eCoeffs.data[errorCount] = uint8(1)
     var quotient: BioMessage16
     var remainder: layout.FixedBytes32
@@ -288,9 +277,8 @@ fn BioRsTryDecode32x16(received: layout.FixedBytes32, errorCount: int32): Result
 
 fn BioRsDecode32x16(received: layout.FixedBytes32): Result[BioMessage16] =
     var errorCount: int32
-    while errorCount <= 8:
+    for errorCount in errorCount..<= 8:
         let decodeRes = BioRsTryDecode32x16(received, errorCount)
         if IsOk(decodeRes):
             return Ok[BioMessage16](Value(decodeRes))
-        errorCount = errorCount + 1
     return Err[BioMessage16](" bio rs: decode failed")
