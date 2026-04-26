@@ -1,0 +1,634 @@
+import std/result
+import std/bytes as bytes
+import std/rawbytes
+import std/rawmem_support
+import std/strformat
+
+const
+    machoMagic64 = 4277009103
+    machoCpuTypeArm64 = 16777228
+    machoFileTypeObject = 1
+    machoLoadCommandSegment64 = 25
+    machoLoadCommandSymtab = 2
+    machoHeader64Size = 32
+    machoSegment64Size = 72
+    machoSection64Size = 80
+    machoSymtabCommandSize = 24
+    machoNlist64Size = 16
+    machoInt32Max = 2147483647
+    machoU32Max = 4294967295
+    machoSectionTypeMask = 255
+    machoSectionTypeZerofill = 1
+    machoNTypeMask = 0x0E
+    machoNUndef = 0
+    machoNSect = 0x0E
+    machoRelocArm64Unsigned = 0
+    machoRelocArm64Branch26 = 2
+    machoRelocArm64Page21 = 3
+    machoRelocArm64PageOff12 = 4
+    machoRelocArm64GotLoadPage21 = 5
+    machoRelocArm64GotLoadPageOff12 = 6
+    machoRelocArm64Addend = 10
+
+type
+    MachOObjectLoadCommand =
+        cmd: int64
+        cmdsize: int32
+        offset: int32
+
+    MachOObjectReloc =
+        addr: int32
+        symbolIndex: int32
+        pcRelative: bool
+        length: int32
+        externReloc: bool
+        relocType: int32
+
+    MachOObjectSection =
+        segname: str
+        sectname: str
+        addr: int64
+        size: int64
+        offset: int32
+        alignPow2: int32
+        reloff: int32
+        nreloc: int32
+        flags: int64
+        data: rawbytes.Bytes
+        relocs: MachOObjectReloc[]
+        isZerofill: bool
+
+    MachOObjectSymbol =
+        name: str
+        nType: int32
+        nSect: int32
+        nDesc: int32
+        nValue: int64
+
+    MachOObjectFile =
+        pathHint: str
+        cpuType: int64
+        cpuSubtype: int64
+        fileType: int64
+        ncmds: int32
+        sizeofcmds: int32
+        flags: int64
+        loadCommands: MachOObjectLoadCommand[]
+        sections: MachOObjectSection[]
+        symbols: MachOObjectSymbol[]
+
+fn machoFreeSection(section: var MachOObjectSection) =
+    rawbytes.BytesFree(section.data)
+    section.data = rawbytes.emptyBytes()
+    section.relocs = []
+
+fn machoFreeParsedObject(obj: var MachOObjectFile) =
+    for i in 0..<obj.sections.len:
+        var section = obj.sections[i]
+        machoFreeSection(section)
+        obj.sections[i] = section
+    obj.loadCommands = []
+    obj.sections = []
+    obj.symbols = []
+
+fn machoFailObject(obj: var MachOObjectFile, message: str): Result[MachOObjectFile] =
+    machoFreeParsedObject(obj)
+    return Err[MachOObjectFile](message)
+
+fn machoFailSection(section: var MachOObjectSection, message: str): Result[bool] =
+    machoFreeSection(section)
+    return Err[bool](message)
+
+fn machoRangeFits(buf: bytes.ByteBuffer, offset: int32, size: int32): bool =
+    if offset < 0 || size < 0:
+        return false
+    if offset > buf.len:
+        return false
+    return size <= buf.len - offset
+
+fn machoRangeFitsI64(buf: bytes.ByteBuffer, offset: int64, size: int64): bool =
+    if offset < int64(0) || size < int64(0):
+        return false
+    if offset > int64(buf.len):
+        return false
+    return size <= int64(buf.len) - offset
+
+fn machoBytesRangeFits(data: rawbytes.Bytes, offset: int32, size: int32): bool =
+    if offset < 0 || size < 0:
+        return false
+    let n: int32 = rawbytes.bytesLen(data)
+    if offset > n:
+        return false
+    return size <= n - offset
+
+fn machoBufU8At(buf: bytes.ByteBuffer, off: int32): int32 =
+    return bytes.BufByteAt(buf, off) & 255
+
+fn machoBufU16At(buf: bytes.ByteBuffer, off: int32): int32 =
+    return bytes.ReadU16LEAt(buf, off) & 0xFFFF
+
+fn machoBufU32At(buf: bytes.ByteBuffer, off: int32): int64 =
+    let raw: int32 = bytes.ReadU32LEAt(buf, off)
+    if raw < 0:
+        return int64(raw) + int64(4294967296)
+    return int64(raw)
+
+fn machoBufU64At(buf: bytes.ByteBuffer, off: int32): int64 =
+    let lo: int64 = machoBufU32At(buf, off)
+    let hi: int64 = machoBufU32At(buf, off + 4)
+    if hi > int64(2147483647):
+        return int64(-1)
+    return lo | (hi << 32)
+
+fn machoByteBufferFromBytes(data: rawbytes.Bytes): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    out.len = rawbytes.bytesLen(data)
+    out.data = data.data
+    return out
+
+fn machoCopyStringFromBuffer(buf: bytes.ByteBuffer, off: int32, count: int32): str =
+    if count <= 0:
+        return ""
+    return newStringCopy(rawmem_support.RawmemPtrAdd(buf.data, off), count)
+
+fn machoReadFixedStr16(buf: bytes.ByteBuffer, off: int32): str =
+    var count: int32
+    for i in 0..<16:
+        if bytes.BufByteAt(buf, off + i) == 0:
+            return machoCopyStringFromBuffer(buf, off, count)
+        count = count + 1
+    return machoCopyStringFromBuffer(buf, off, 16)
+
+fn machoReadCStringAtBounded(buf: bytes.ByteBuffer,
+                              off: int64,
+                              endOff: int64,
+                              pathHint: str): Result[str] =
+    if off > machoInt32Max || endOff > machoInt32Max:
+        return Err[str](Fmt" macho object linker: string table offset out of range: {pathHint}")
+    if endOff > int64(buf.len) || off > endOff:
+        return Err[str](Fmt" macho object linker: string table truncated: {pathHint}")
+    let off32: int32 = int32(off)
+    let end32: int32 = int32(endOff)
+    var count: int32
+    for pos in off32..<end32:
+        if bytes.BufByteAt(buf, pos) == 0:
+            return Ok[str](machoCopyStringFromBuffer(buf, off32, count))
+        count = count + 1
+    return Err[str](Fmt" macho object linker: unterminated string table entry: {pathHint}")
+
+fn machoCopyBytesFromBuffer(buf: bytes.ByteBuffer,
+                             off: int64,
+                             size: int64,
+                             pathHint: str): Result[rawbytes.Bytes] =
+    if size == int64(0):
+        return Ok[rawbytes.Bytes](rawbytes.emptyBytes())
+    if size > machoInt32Max || off > machoInt32Max:
+        return Err[rawbytes.Bytes](Fmt" macho object linker: section too large: {pathHint}")
+    if !machoRangeFitsI64(buf, off, size):
+        return Err[rawbytes.Bytes](Fmt" macho object linker: section data truncated: {pathHint}")
+    let off32: int32 = int32(off)
+    let n: int32 = int32(size)
+    var out: rawbytes.Bytes = rawbytes.bytesAlloc(n)
+    if rawbytes.bytesLen(out) != n:
+        rawbytes.BytesFree(out)
+        return Err[rawbytes.Bytes](Fmt" macho object linker: section data alloc failed: {pathHint}")
+    for i in 0..<n:
+        rawbytes.bytesSet(out, i, bytes.BufByteAt(buf, off32 + i))
+    return Ok[rawbytes.Bytes](out)
+
+fn machoReadU32LEFromBytes(data: rawbytes.Bytes, off: int32): Result[int64] =
+    if !machoBytesRangeFits(data, off, 4):
+        return Err[int64](" macho object linker: read u32 out of range")
+    let b0: int64 = int64(rawbytes.bytesGet(data, off) & 255)
+    let b1: int64 = int64(rawbytes.bytesGet(data, off + 1) & 255)
+    let b2: int64 = int64(rawbytes.bytesGet(data, off + 2) & 255)
+    let b3: int64 = int64(rawbytes.bytesGet(data, off + 3) & 255)
+    return Ok[int64](b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
+fn machoWriteU32LEToBytes(data: var rawbytes.Bytes,
+                           off: int32,
+                           value: int64): Result[bool] =
+    if !machoBytesRangeFits(data, off, 4):
+        return Err[bool](" macho object linker: write u32 out of range")
+    if value < int64(0) || value > machoU32Max:
+        return Err[bool](" macho object linker: write u32 value out of range")
+    rawbytes.bytesSet(data, off, int32(value & int64(255)))
+    rawbytes.bytesSet(data, off + 1, int32((value >> 8) & int64(255)))
+    rawbytes.bytesSet(data, off + 2, int32((value >> 16) & int64(255)))
+    rawbytes.bytesSet(data, off + 3, int32((value >> 24) & int64(255)))
+    return Ok[bool](true)
+
+fn machoI64ToU32(value: int64, label: str): Result[int64] =
+    if value < int64(0) || value > int64(4294967295):
+        return Err[int64](Fmt" macho object linker: {label} u32 value out of range")
+    return Ok[int64](value)
+
+fn MachOReadU32LE(data: rawbytes.Bytes, off: int32): Result[int64] =
+    let res = machoReadU32LEFromBytes(data, off)
+    if IsErr(res):
+        return Err[int64](Error(res))
+    return res
+
+fn MachOWriteU32LE(data: var rawbytes.Bytes, off: int32, value: int64): Result[bool] =
+    let wordRes = machoI64ToU32(value, "write")
+    if IsErr(wordRes):
+        return Err[bool](Error(wordRes))
+    return machoWriteU32LEToBytes(data, off, Value(wordRes))
+
+fn machoRelocTypeKnown(relocType: int32): bool =
+    return relocType == machoRelocArm64Unsigned ||
+           relocType == machoRelocArm64Branch26 ||
+           relocType == machoRelocArm64Page21 ||
+           relocType == machoRelocArm64PageOff12 ||
+           relocType == machoRelocArm64GotLoadPage21 ||
+           relocType == machoRelocArm64GotLoadPageOff12 ||
+           relocType == machoRelocArm64Addend
+
+fn machoRelocLengthSupported(reloc: MachOObjectReloc): bool =
+    if reloc.relocType == machoRelocArm64Unsigned:
+        return reloc.length == 2 || reloc.length == 3
+    return reloc.length == 2
+
+fn machoRelocPcRelativeSupported(reloc: MachOObjectReloc): bool =
+    if reloc.relocType == machoRelocArm64Branch26 ||
+       reloc.relocType == machoRelocArm64Page21 ||
+       reloc.relocType == machoRelocArm64GotLoadPage21:
+        return reloc.pcRelative
+    return !reloc.pcRelative
+
+fn machoRelocPatchByteSize(reloc: MachOObjectReloc): int64 =
+    if reloc.length == 0:
+        return int64(1)
+    if reloc.length == 1:
+        return int64(2)
+    if reloc.length == 2:
+        return int64(4)
+    return int64(8)
+
+fn machoValidateRelocEncoding(section: MachOObjectSection,
+                               reloc: MachOObjectReloc,
+                               pathHint: str): Result[bool] =
+    if !machoRelocTypeKnown(reloc.relocType):
+        return Err[bool](Fmt" macho object linker: unsupported arm64 relocation type {reloc.relocType}: {pathHint}")
+    if !machoRelocLengthSupported(reloc):
+        return Err[bool](Fmt" macho object linker: unsupported relocation length {reloc.length}: {pathHint}")
+    if !machoRelocPcRelativeSupported(reloc):
+        return Err[bool](Fmt" macho object linker: unsupported relocation pcrel flag: {pathHint}")
+    if reloc.addr < 0:
+        return Err[bool](Fmt" macho object linker: negative relocation address: {pathHint}")
+    if section.size < int64(0):
+        return Err[bool](Fmt" macho object linker: negative section size: {pathHint}")
+    let sectionSize: int64 = section.size
+    let byteSize: int64 = machoRelocPatchByteSize(reloc)
+    let addr: int64 = int64(reloc.addr)
+    if addr > sectionSize || byteSize > sectionSize - addr:
+        return Err[bool](Fmt" macho object linker: relocation address out of section: {pathHint}")
+    if reloc.relocType == machoRelocArm64Addend:
+        if reloc.externReloc:
+            return Err[bool](Fmt" macho object linker: external addend relocation unsupported: {pathHint}")
+        return Ok[bool](true)
+    return Ok[bool](true)
+
+fn machoValidateSymbol(symbol: MachOObjectSymbol,
+                        sectionCount: int32,
+                        pathHint: str): Result[bool] =
+    let kind: int32 = symbol.nType & machoNTypeMask
+    if kind == machoNSect:
+        if symbol.nSect == 0 || symbol.nSect > sectionCount:
+            return Err[bool](Fmt" macho object linker: symbol section out of range: {pathHint}")
+        return Ok[bool](true)
+    if kind == machoNUndef:
+        return Ok[bool](true)
+    return Err[bool](Fmt" macho object linker: unsupported symbol type: {pathHint}")
+
+fn machoValidateRelocSymbolRefs(obj: MachOObjectFile): Result[bool] =
+    for si in 0..<obj.sections.len:
+        let section = obj.sections[si]
+        for ri in 0..<section.relocs.len:
+            let reloc = section.relocs[ri]
+            if reloc.relocType == machoRelocArm64Addend:
+                continue
+            if reloc.externReloc:
+                if reloc.symbolIndex < 0 || reloc.symbolIndex >= obj.symbols.len:
+                    return Err[bool](Fmt" macho object linker: external relocation symbol out of range: {obj.pathHint}")
+            else:
+                if reloc.symbolIndex <= 0 || reloc.symbolIndex > obj.sections.len:
+                    return Err[bool](Fmt" macho object linker: local relocation section out of range: {obj.pathHint}")
+    return Ok[bool](true)
+
+fn machoParseSegment64(pathHint: str,
+                        buf: bytes.ByteBuffer,
+                        cmdOff: int32,
+                        cmdsize: int32,
+                        out: var MachOObjectFile): Result[bool] =
+    if cmdsize < machoSegment64Size:
+        return Err[bool](Fmt" macho object linker: invalid LC_SEGMENT_64 size: {pathHint}")
+    let segname = machoReadFixedStr16(buf, cmdOff + 8)
+    let nsectsRaw: int64 = machoBufU32At(buf, cmdOff + 64)
+    if nsectsRaw > int64(4096):
+        return Err[bool](Fmt" macho object linker: too many sections: {pathHint}")
+    let nsects: int32 = int32(nsectsRaw)
+    if nsects > (cmdsize - machoSegment64Size) / machoSection64Size:
+        return Err[bool](Fmt" macho object linker: truncated section table: {pathHint}")
+    var sectOff: int32 = cmdOff + machoSegment64Size
+    for _ in 0..<nsects:
+        if !machoRangeFits(buf, sectOff, machoSection64Size):
+            return Err[bool](Fmt" macho object linker: truncated section command: {pathHint}")
+        var section: MachOObjectSection
+        section.sectname = machoReadFixedStr16(buf, sectOff)
+        section.segname = machoReadFixedStr16(buf, sectOff + 16)
+        if len(section.segname) == 0:
+            section.segname = segname
+        let sectionAddrRaw: int64 = machoBufU64At(buf, sectOff + 32)
+        let sectionSizeRaw: int64 = machoBufU64At(buf, sectOff + 40)
+        let sectionOffsetRaw: int64 = machoBufU32At(buf, sectOff + 48)
+        let sectionAlignRaw: int64 = machoBufU32At(buf, sectOff + 52)
+        let sectionReloffRaw: int64 = machoBufU32At(buf, sectOff + 56)
+        let sectionNrelocRaw: int64 = machoBufU32At(buf, sectOff + 60)
+        let sectionFlagsRaw: int64 = machoBufU32At(buf, sectOff + 64)
+        if sectionAddrRaw < int64(0) ||
+           sectionSizeRaw < int64(0) ||
+           sectionOffsetRaw > machoInt32Max ||
+           sectionAlignRaw > machoInt32Max ||
+           sectionReloffRaw > machoInt32Max ||
+           sectionNrelocRaw > machoInt32Max:
+            return Err[bool](Fmt" macho object linker: section field out of range: {pathHint}")
+        section.addr = sectionAddrRaw
+        section.size = sectionSizeRaw
+        section.offset = int32(sectionOffsetRaw)
+        section.alignPow2 = int32(sectionAlignRaw)
+        section.reloff = int32(sectionReloffRaw)
+        section.nreloc = int32(sectionNrelocRaw)
+        section.flags = sectionFlagsRaw
+        section.isZerofill = (sectionFlagsRaw & machoSectionTypeMask) == machoSectionTypeZerofill
+        if section.size > int64(0) && !section.isZerofill:
+            let dataRes = machoCopyBytesFromBuffer(buf, int64(section.offset), section.size, pathHint)
+            if IsErr(dataRes):
+                return Err[bool](Error(dataRes))
+            section.data = Value(dataRes)
+        if section.nreloc > 0:
+            if section.nreloc > 1048576:
+                return machoFailSection(section, Fmt" macho object linker: too many relocations: {pathHint}")
+            let relocBytes: int64 = int64(section.nreloc) * int64(8)
+            if !machoRangeFitsI64(buf, int64(section.reloff), relocBytes):
+                return machoFailSection(section, Fmt" macho object linker: relocation table truncated: {pathHint}")
+            let relocCount: int32 = section.nreloc
+            for ri in 0..<relocCount:
+                let roff64: int64 = int64(section.reloff) + int64(ri) * int64(8)
+                let roff: int32 = int32(roff64)
+                let rAddrRaw: int64 = machoBufU32At(buf, roff)
+                if (rAddrRaw & int64(0x80000000)) != int64(0):
+                    return machoFailSection(section, Fmt" macho object linker: scattered relocation unsupported: {pathHint}")
+                let rInfo: int64 = machoBufU32At(buf, roff + 4)
+                var reloc: MachOObjectReloc
+                reloc.addr = int32(rAddrRaw)
+                reloc.symbolIndex = int32(rInfo & int64(0x00FFFFFF))
+                reloc.pcRelative = ((rInfo >> 24) & int64(1)) != int64(0)
+                reloc.length = int32((rInfo >> 25) & int64(3))
+                reloc.externReloc = ((rInfo >> 27) & int64(1)) != int64(0)
+                reloc.relocType = int32((rInfo >> 28) & int64(15))
+                let relocRes = machoValidateRelocEncoding(section, reloc, pathHint)
+                if IsErr(relocRes):
+                    return machoFailSection(section, Error(relocRes))
+                add(section.relocs, reloc)
+        add(out.sections, section)
+        sectOff = sectOff + machoSection64Size
+    return Ok[bool](true)
+
+fn machoParseObjectBuffer(pathHint: str, inBuf: bytes.ByteBuffer): Result[MachOObjectFile] =
+    var out: MachOObjectFile
+    out.pathHint = pathHint
+    if inBuf.data == nil || inBuf.len <= 0:
+        return Err[MachOObjectFile](Fmt" macho object linker: empty object: {pathHint}")
+    if !machoRangeFits(inBuf, 0, machoHeader64Size):
+        return Err[MachOObjectFile](Fmt" macho object linker: truncated mach header: {pathHint}")
+    let magic: int64 = machoBufU32At(inBuf, 0)
+    if magic != machoMagic64:
+        return Err[MachOObjectFile](Fmt" macho object linker: invalid Mach-O magic: {pathHint}")
+    out.cpuType = machoBufU32At(inBuf, 4)
+    if out.cpuType != machoCpuTypeArm64:
+        return Err[MachOObjectFile](Fmt" macho object linker: expected arm64 Mach-O object: {pathHint}")
+    out.cpuSubtype = machoBufU32At(inBuf, 8)
+    out.fileType = machoBufU32At(inBuf, 12)
+    if out.fileType != machoFileTypeObject:
+        return Err[MachOObjectFile](Fmt" macho object linker: expected MH_OBJECT input: {pathHint}")
+    let ncmdsRaw: int64 = machoBufU32At(inBuf, 16)
+    let sizeofcmdsRaw: int64 = machoBufU32At(inBuf, 20)
+    if ncmdsRaw > int64(4096) || sizeofcmdsRaw > machoInt32Max:
+        return Err[MachOObjectFile](Fmt" macho object linker: invalid load command header: {pathHint}")
+    out.ncmds = int32(ncmdsRaw)
+    out.sizeofcmds = int32(sizeofcmdsRaw)
+    out.flags = machoBufU32At(inBuf, 24)
+    if !machoRangeFits(inBuf, machoHeader64Size, out.sizeofcmds):
+        return Err[MachOObjectFile](Fmt" macho object linker: truncated load command region: {pathHint}")
+
+    var symoff: int64
+    var nsyms: int64
+    var stroff: int64
+    var strsize: int64
+    var seenSymtab: bool
+    var cmdOff: int32 = machoHeader64Size
+    for _ in 0..<out.ncmds:
+        if !machoRangeFits(inBuf, cmdOff, 8):
+            return machoFailObject(out, Fmt" macho object linker: truncated load command: {pathHint}")
+        let cmd: int64 = machoBufU32At(inBuf, cmdOff)
+        let cmdsizeRaw: int64 = machoBufU32At(inBuf, cmdOff + 4)
+        if cmdsizeRaw > machoInt32Max:
+            return machoFailObject(out, Fmt" macho object linker: load command too large: {pathHint}")
+        let cmdsize: int32 = int32(cmdsizeRaw)
+        if cmdsize < 8 || (cmdsize % 8) != 0 || !machoRangeFits(inBuf, cmdOff, cmdsize):
+            return machoFailObject(out, Fmt" macho object linker: invalid load command size: {pathHint}")
+        add(out.loadCommands, MachOObjectLoadCommand(cmd: cmd, cmdsize: cmdsize, offset: cmdOff))
+        if cmd == machoLoadCommandSegment64:
+            let segRes = machoParseSegment64(pathHint, inBuf, cmdOff, cmdsize, out)
+            if IsErr(segRes):
+                return machoFailObject(out, Error(segRes))
+        elif cmd == machoLoadCommandSymtab:
+            if cmdsize < machoSymtabCommandSize:
+                return machoFailObject(out, Fmt" macho object linker: invalid LC_SYMTAB size: {pathHint}")
+            symoff = machoBufU32At(inBuf, cmdOff + 8)
+            nsyms = machoBufU32At(inBuf, cmdOff + 12)
+            stroff = machoBufU32At(inBuf, cmdOff + 16)
+            strsize = machoBufU32At(inBuf, cmdOff + 20)
+            seenSymtab = true
+        cmdOff = cmdOff + cmdsize
+    if cmdOff != machoHeader64Size + out.sizeofcmds:
+        return machoFailObject(out, Fmt" macho object linker: load command size mismatch: {pathHint}")
+    if !seenSymtab:
+        return machoFailObject(out, Fmt" macho object linker: missing LC_SYMTAB: {pathHint}")
+    if nsyms == int64(0):
+        return machoFailObject(out, Fmt" macho object linker: empty symbol table unsupported: {pathHint}")
+    if nsyms > int64(1048576) || strsize == int64(0) ||
+       symoff > machoInt32Max || stroff > machoInt32Max || strsize > machoInt32Max:
+        return machoFailObject(out, Fmt" macho object linker: invalid symbol table: {pathHint}")
+    let symBytes: int64 = nsyms * int64(machoNlist64Size)
+    if !machoRangeFitsI64(inBuf, symoff, symBytes):
+        return machoFailObject(out, Fmt" macho object linker: symbol table truncated: {pathHint}")
+    if !machoRangeFitsI64(inBuf, stroff, strsize):
+        return machoFailObject(out, Fmt" macho object linker: string table truncated: {pathHint}")
+
+    let symbolCount: int32 = int32(nsyms)
+    for si in 0..<symbolCount:
+        let off64: int64 = symoff + int64(si) * int64(machoNlist64Size)
+        let off: int32 = int32(off64)
+        let nameOffset: int64 = machoBufU32At(inBuf, off)
+        var symbol: MachOObjectSymbol
+        symbol.nType = machoBufU8At(inBuf, off + 4)
+        symbol.nSect = machoBufU8At(inBuf, off + 5)
+        symbol.nDesc = machoBufU16At(inBuf, off + 6)
+        let symbolValueRaw: int64 = machoBufU64At(inBuf, off + 8)
+        if symbolValueRaw < int64(0):
+            return machoFailObject(out, Fmt" macho object linker: symbol value out of range: {pathHint}")
+        symbol.nValue = symbolValueRaw
+        if nameOffset == int64(0):
+            symbol.name = ""
+        else:
+            if nameOffset >= strsize:
+                return machoFailObject(out, Fmt" macho object linker: symbol name offset out of range: {pathHint}")
+            let nameRes = machoReadCStringAtBounded(inBuf,
+                                                    stroff + nameOffset,
+                                                    stroff + strsize,
+                                                    pathHint)
+            if IsErr(nameRes):
+                return machoFailObject(out, Error(nameRes))
+            symbol.name = Value(nameRes)
+        let symRes = machoValidateSymbol(symbol, out.sections.len, pathHint)
+        if IsErr(symRes):
+            return machoFailObject(out, Error(symRes))
+        add(out.symbols, symbol)
+
+    let relocRefsRes = machoValidateRelocSymbolRefs(out)
+    if IsErr(relocRefsRes):
+        return machoFailObject(out, Error(relocRefsRes))
+    return Ok[MachOObjectFile](out)
+
+fn MachOObjectParseBytes(pathHint: str, objectBytes: rawbytes.Bytes): Result[MachOObjectFile] =
+    return machoParseObjectBuffer(pathHint, machoByteBufferFromBytes(objectBytes))
+
+fn MachOObjectParseFile(path: str): Result[MachOObjectFile] =
+    var inBuf: bytes.ByteBuffer = bytes.ReadFileBytes(path)
+    if inBuf.data == nil || inBuf.len <= 0:
+        return Err[MachOObjectFile](Fmt" macho object linker: failed to read object: {path}")
+    let res = machoParseObjectBuffer(path, inBuf)
+    bytes.FreeByteBuffer(inBuf)
+    return res
+
+fn MachOObjectFree(obj: var MachOObjectFile) =
+    machoFreeParsedObject(obj)
+
+fn machoPatchBl(word0: int64, fromAddr: int64, toAddr: int64): Result[int64] =
+    let deltaBytes: int64 = toAddr - fromAddr
+    if deltaBytes % int64(4) != int64(0):
+        return Err[int64](" macho object linker: bl target misaligned")
+    let deltaWords: int64 = deltaBytes / int64(4)
+    if deltaWords < int64(-33554432) || deltaWords > int64(33554431):
+        return Err[int64](" macho object linker: bl target out of range")
+    let imm26: int64 = deltaWords & int64(0x03FFFFFF)
+    return Ok[int64]((word0 & int64(0xFC000000)) | imm26)
+
+fn machoPatchAdrp(word0: int64, instrAddr: int64, symAddr: int64): Result[int64] =
+    let instrPage: int64 = (instrAddr / int64(4096)) * int64(4096)
+    let symPage: int64 = (symAddr / int64(4096)) * int64(4096)
+    let deltaPages: int64 = (symPage - instrPage) / int64(4096)
+    if deltaPages < int64(-1048576) || deltaPages > int64(1048575):
+        return Err[int64](" macho object linker: adrp target out of range")
+    let imm21: int64 = deltaPages & int64(0x1FFFFF)
+    let immlo: int64 = imm21 & int64(3)
+    let immhi: int64 = (imm21 >> 2) & int64(0x7FFFF)
+    let mask: int64 = (int64(3) << 29) | (int64(0x7FFFF) << 5)
+    return Ok[int64]((word0 & (machoU32Max ^ mask)) | (immlo << 29) | (immhi << 5))
+
+fn machoPatchAddImm12(word0: int64, imm12: int64): int64 =
+    let mask: int64 = int64(0xFFF) << 10
+    return (word0 & (machoU32Max ^ mask)) | ((imm12 & int64(0xFFF)) << 10)
+
+fn machoIsLoadStoreUnsignedImm(word0: int64): bool =
+    return (word0 & int64(0x3B000000)) == int64(0x39000000)
+
+fn machoPatchPageOff12(word0: int64, pageOff: int64): Result[int64] =
+    let immBytes: int64 = pageOff & int64(0xFFF)
+    if machoIsLoadStoreUnsignedImm(word0):
+        let sizeLog2: int64 = (word0 >> 30) & int64(3)
+        let scale: int64 = int64(1) << sizeLog2
+        if (immBytes % scale) != int64(0):
+            return Err[int64](" macho object linker: pageoff load/store alignment mismatch")
+        let scaled: int64 = immBytes / scale
+        if scaled > int64(0xFFF):
+            return Err[int64](" macho object linker: pageoff load/store imm out of range")
+        let mask: int64 = int64(0xFFF) << 10
+        return Ok[int64]((word0 & (machoU32Max ^ mask)) | (scaled << 10))
+    return Ok[int64](machoPatchAddImm12(word0, immBytes))
+
+fn MachOPatchBl(word0: int64, fromAddr: int64, toAddr: int64): Result[int64] =
+    let wordRes = machoI64ToU32(word0, "bl word")
+    if IsErr(wordRes):
+        return Err[int64](Error(wordRes))
+    if fromAddr < int64(0) || toAddr < int64(0):
+        return Err[int64](" macho object linker: bl address out of range")
+    let patchedRes = machoPatchBl(Value(wordRes), fromAddr, toAddr)
+    if IsErr(patchedRes):
+        return Err[int64](Error(patchedRes))
+    return patchedRes
+
+fn MachOPatchAdrp(word0: int64, instrAddr: int64, symAddr: int64): Result[int64] =
+    let wordRes = machoI64ToU32(word0, "adrp word")
+    if IsErr(wordRes):
+        return Err[int64](Error(wordRes))
+    if instrAddr < int64(0) || symAddr < int64(0):
+        return Err[int64](" macho object linker: adrp address out of range")
+    let patchedRes = machoPatchAdrp(Value(wordRes), instrAddr, symAddr)
+    if IsErr(patchedRes):
+        return Err[int64](Error(patchedRes))
+    return patchedRes
+
+fn MachOPatchPageOff12(word0: int64, pageOff: int64): Result[int64] =
+    let wordRes = machoI64ToU32(word0, "pageoff word")
+    if IsErr(wordRes):
+        return Err[int64](Error(wordRes))
+    if pageOff < int64(0):
+        return Err[int64](" macho object linker: pageoff out of range")
+    let patchedRes = machoPatchPageOff12(Value(wordRes), pageOff)
+    if IsErr(patchedRes):
+        return Err[int64](Error(patchedRes))
+    return patchedRes
+
+fn MachOPatchBlInBytes(data: var rawbytes.Bytes,
+                        offset: int32,
+                        fromAddr: int64,
+                        toAddr: int64): Result[bool] =
+    if fromAddr < int64(0) || toAddr < int64(0):
+        return Err[bool](" macho object linker: bl address out of range")
+    let wordRes = machoReadU32LEFromBytes(data, offset)
+    if IsErr(wordRes):
+        return Err[bool](Error(wordRes))
+    let patchedRes = machoPatchBl(Value(wordRes), fromAddr, toAddr)
+    if IsErr(patchedRes):
+        return Err[bool](Error(patchedRes))
+    return machoWriteU32LEToBytes(data, offset, Value(patchedRes))
+
+fn MachOPatchAdrpInBytes(data: var rawbytes.Bytes,
+                          offset: int32,
+                          instrAddr: int64,
+                          symAddr: int64): Result[bool] =
+    if instrAddr < int64(0) || symAddr < int64(0):
+        return Err[bool](" macho object linker: adrp address out of range")
+    let wordRes = machoReadU32LEFromBytes(data, offset)
+    if IsErr(wordRes):
+        return Err[bool](Error(wordRes))
+    let patchedRes = machoPatchAdrp(Value(wordRes), instrAddr, symAddr)
+    if IsErr(patchedRes):
+        return Err[bool](Error(patchedRes))
+    return machoWriteU32LEToBytes(data, offset, Value(patchedRes))
+
+fn MachOPatchPageOff12InBytes(data: var rawbytes.Bytes,
+                               offset: int32,
+                               pageOff: int64): Result[bool] =
+    if pageOff < int64(0):
+        return Err[bool](" macho object linker: pageoff out of range")
+    let wordRes = machoReadU32LEFromBytes(data, offset)
+    if IsErr(wordRes):
+        return Err[bool](Error(wordRes))
+    let patchedRes = machoPatchPageOff12(Value(wordRes), pageOff)
+    if IsErr(patchedRes):
+        return Err[bool](Error(patchedRes))
+    return machoWriteU32LEToBytes(data, offset, Value(patchedRes))

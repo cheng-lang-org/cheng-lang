@@ -22,9 +22,42 @@ type
 fn DirectObjectEmitTargetSupported(plan: pobj.PrimaryObjectPlan): bool =
     return plan.targetTriple == "arm64-apple-darwin" && plan.objectFormat == "macho"
 
+fn DirectObjectEmitWriteObject(rootDir: str,
+                               plan: pobj.PrimaryObjectPlan,
+                               text: rawbytes.Bytes,
+                               data: rawbytes.Bytes,
+                               symbols: osym.ObjectSymbolTable,
+                               relocs: orel.ObjectRelocTable): Result[DirectObjectEmitResult] =
+    let writeRes = macho.MachOTextDataObjectWrite(rootDir, plan.outputPath, text, data, symbols, relocs)
+    if IsErr(writeRes):
+        return Err[DirectObjectEmitResult](Error(writeRes))
+    let write = Value(writeRes)
+    var out: DirectObjectEmitResult
+    out.objectPath = write.objectPath
+    out.bytesWritten = write.bytesWritten
+    out.symbolCount = write.symbolCount
+    out.relocCount = write.relocCount
+    return Ok[DirectObjectEmitResult](out)
+
+fn DirectObjectEmitWriteObjectTextOnly(rootDir: str,
+                                        plan: pobj.PrimaryObjectPlan,
+                                        text: rawbytes.Bytes,
+                                        symbols: osym.ObjectSymbolTable,
+                                        relocs: orel.ObjectRelocTable): Result[DirectObjectEmitResult] =
+    let writeRes = macho.MachOTextObjectWrite(rootDir, plan.outputPath, text, symbols, relocs)
+    if IsErr(writeRes):
+        return Err[DirectObjectEmitResult](Error(writeRes))
+    let write = Value(writeRes)
+    var out: DirectObjectEmitResult
+    out.objectPath = write.objectPath
+    out.bytesWritten = write.bytesWritten
+    out.symbolCount = write.symbolCount
+    out.relocCount = write.relocCount
+    return Ok[DirectObjectEmitResult](out)
+
 fn DirectObjectEmitRequireIndex(index: int32, label: str) =
     if index < 0:
-        assert(false, label)
+        Assert(false, label)
 
 fn DirectObjectEmitIsReturnI32ConstBodyKind(bodyKind: str): bool =
     return chengpath.TextStartsWith(bodyKind, texpr.BodyKindReturnI32ConstPrefix)
@@ -67,7 +100,7 @@ fn DirectObjectEmitDataSectionAddr(plan: pobj.PrimaryObjectPlan): int32 =
 
 fn DirectObjectEmitParsePositiveI32(text: str): int32 =
     var value: int32
-    for i in 0..<len(text):
+    for i in 0..<Len(text):
         let ch = text[i]
         if ch < '0' || ch > '9':
             return value
@@ -77,14 +110,14 @@ fn DirectObjectEmitParsePositiveI32(text: str): int32 =
 fn DirectObjectEmitPayloadByteCount(payloadText: str): int32 =
     let zeroPrefix = "zero:"
     if chengpath.TextStartsWith(payloadText, zeroPrefix):
-        let raw = strings.SliceBytes(payloadText, len(zeroPrefix), len(payloadText) - len(zeroPrefix))
+        let raw = strings.SliceBytes(payloadText, Len(zeroPrefix), Len(payloadText) - Len(zeroPrefix))
         return DirectObjectEmitParsePositiveI32(raw)
     let cstringPrefix = "cstring:"
     if chengpath.TextStartsWith(payloadText, cstringPrefix):
-        let raw = strings.SliceBytes(payloadText, len(cstringPrefix), len(payloadText) - len(cstringPrefix))
+        let raw = strings.SliceBytes(payloadText, Len(cstringPrefix), Len(payloadText) - Len(cstringPrefix))
         var count: int32 = 1
         var escaped = false
-        for i in 0..<len(raw):
+        for i in 0..<Len(raw):
             if escaped:
                 escaped = false
                 count = count + 1
@@ -99,7 +132,7 @@ fn DirectObjectEmitPayloadByteCount(payloadText: str): int32 =
 
 fn DirectObjectEmitCStringPayloadByte(raw: str,
                                        index: int32): int32 =
-    if index < 0 || index >= len(raw):
+    if index < 0 || index >= Len(raw):
         return 0
     let ch = raw[index]
     if ch == 'n':
@@ -117,9 +150,9 @@ fn DirectObjectEmitWriteCStringPayload(data: var obuf.ObjectBuffer,
     let prefix = "cstring:"
     if !chengpath.TextStartsWith(payloadText, prefix):
         return
-    let raw = strings.SliceBytes(payloadText, len(prefix), len(payloadText) - len(prefix))
+    let raw = strings.SliceBytes(payloadText, Len(prefix), Len(payloadText) - Len(prefix))
     var escaped = false
-    for i in 0..<len(raw):
+    for i in 0..<Len(raw):
         if escaped:
             obuf.ObjectBufferWriteU8(data, DirectObjectEmitCStringPayloadByte(raw, i))
             escaped = false
@@ -148,11 +181,11 @@ fn DirectObjectEmitDataLabelByTail(plan: pobj.PrimaryObjectPlan,
                                     tail: str): str =
     for i in 0..<plan.dataLabels.len:
         let label = plan.dataLabels[i]
-        if len(label) < len(tail):
+        if Len(label) < Len(tail):
             continue
-        let start = len(label) - len(tail)
+        let start = Len(label) - Len(tail)
         var matches = true
-        for j in 0..<len(tail):
+        for j in 0..<Len(tail):
             if label[start + j] != tail[j]:
                 matches = false
                 break
@@ -169,7 +202,7 @@ fn DirectObjectEmitDataLabelExact(plan: pobj.PrimaryObjectPlan,
 
 fn DirectObjectEmitFunctionLooksEntryBridgeWords(plan: pobj.PrimaryObjectPlan,
                                                   functionIndex: int32): bool =
-    if len(plan.entryFunctionSymbol) <= 0:
+    if Len(plan.entryFunctionSymbol) <= 0:
         return false
     if functionIndex < 0 ||
        functionIndex >= plan.functionWordOffsets.len ||
@@ -232,7 +265,7 @@ fn DirectObjectEmitEntryBridgeProfileFlushSymbol(plan: pobj.PrimaryObjectPlan): 
     return pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_debug_profile_flush_from_argv0")
 
 fn DirectObjectEmitEntryBridgeTargetSymbol(plan: pobj.PrimaryObjectPlan): str =
-    if len(plan.entryFunctionSymbol) > 0:
+    if Len(plan.entryFunctionSymbol) > 0:
         return plan.entryFunctionSymbol
     if plan.symbolNames.len > 0:
         return plan.symbolNames[0]
@@ -252,7 +285,7 @@ fn DirectObjectEmitRealFunctionLimit(plan: pobj.PrimaryObjectPlan): int32 =
 
 fn DirectObjectEmitEntryFunctionIndex(plan: pobj.PrimaryObjectPlan,
                                        functionLimit: int32): int32 =
-    if len(plan.entryFunctionSymbol) <= 0:
+    if Len(plan.entryFunctionSymbol) <= 0:
         return -1
     for i in 0..<functionLimit:
         if plan.symbolNames[i] == plan.entryFunctionSymbol:
@@ -262,7 +295,7 @@ fn DirectObjectEmitEntryFunctionIndex(plan: pobj.PrimaryObjectPlan,
 fn DirectObjectEmitSymbolInRealFunctions(plan: pobj.PrimaryObjectPlan,
                                           functionLimit: int32,
                                           symbolName: str): bool =
-    if len(symbolName) <= 0:
+    if Len(symbolName) <= 0:
         return false
     for i in 0..<functionLimit:
         if plan.symbolNames[i] == symbolName:
@@ -307,7 +340,7 @@ fn DirectObjectEmitStandaloneDataSectionAddr(plan: pobj.PrimaryObjectPlan): int3
 fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
     if !DirectObjectEmitTargetSupported(plan):
         return false
-    if len(plan.outputPath) <= 0:
+    if Len(plan.outputPath) <= 0:
         return false
     if plan.missingReasons.len > 0:
         return false
@@ -333,10 +366,7 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
     var entryBodyIrReady = false
     if entryIndex < plan.functionBodyIRs.len:
         let entryBodyIR = plan.functionBodyIRs[entryIndex]
-        entryBodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnInt32(entryBodyIR) ||
-                           pobj.PrimaryBodyIrIsCallSequenceReturnI32Const(entryBodyIR) ||
-                           pobj.PrimaryBodyIrIsCallSequenceReturnStr(entryBodyIR) ||
-                           pobj.PrimaryBodyIrIsCallSequenceReturnAggregate(entryBodyIR)
+        entryBodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnSupported(entryBodyIR)
     if entryBodyKind != texpr.BodyKindReturnZeroI32 &&
        !DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindReturnCallNoargI32 &&
@@ -350,9 +380,10 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
        entryBodyKind != texpr.BodyKindMainF64MulCheckExit &&
        !entryBodyIrReady:
         return false
-    if DirectObjectEmitStandaloneNeedsMainWrapper(plan) &&
-       DirectObjectEmitStandaloneWrapperByteSize(plan, functionLimit) <= int64(0):
-        return false
+    if DirectObjectEmitStandaloneNeedsMainWrapper(plan):
+        let wrapperSize = DirectObjectEmitStandaloneWrapperByteSize(plan, functionLimit)
+        if wrapperSize <= int64(0):
+            return false
     for i in 0..<plan.functionBodyKinds.len:
         let bodyKind = plan.functionBodyKinds[i]
         if i >= functionLimit:
@@ -363,7 +394,7 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
             if plan.functionWordCounts[i] != texpr.BodyKindEntryBridgeWordCount:
                 return false
             continue
-        if len(plan.symbolNames[i]) <= 0:
+        if Len(plan.symbolNames[i]) <= 0:
             return false
         let expectedWords = DirectObjectEmitExpectedWordsForPlanFunction(plan, i)
         if expectedWords <= 0 ||
@@ -388,10 +419,7 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
         var bodyIrReady = false
         if i < plan.functionBodyIRs.len:
             let bodyIR = plan.functionBodyIRs[i]
-            bodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnInt32(bodyIR) ||
-                          pobj.PrimaryBodyIrIsCallSequenceReturnI32Const(bodyIR) ||
-                          pobj.PrimaryBodyIrIsCallSequenceReturnStr(bodyIR) ||
-                          pobj.PrimaryBodyIrIsCallSequenceReturnAggregate(bodyIR)
+            bodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnSupported(bodyIR)
         if bodyIrReady ||
            bodyKind == texpr.BodyKindStatementSequence ||
            texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
@@ -446,7 +474,7 @@ fn DirectObjectEmitStandaloneSymbols(plan: pobj.PrimaryObjectPlan): osym.ObjectS
                                      "direct object emit: add data symbol")
         dataOffset = dataOffset + payloadSize
     for i in 0..<plan.relocTargetSymbols.len:
-        if len(plan.relocTargetSymbols[i]) <= 0:
+        if Len(plan.relocTargetSymbols[i]) <= 0:
             continue
         if DirectObjectEmitSymbolInRealFunctions(plan, functionLimit, plan.relocTargetSymbols[i]):
             continue
@@ -497,12 +525,7 @@ fn DirectObjectEmitWriteStandaloneMain(rootDir: str,
     let data = DirectObjectEmitPlanData(plan, DirectObjectEmitRealFunctionLimit(plan))
     let symbols = DirectObjectEmitStandaloneSymbols(plan)
     let relocs = DirectObjectEmitStandaloneRelocs(plan, symbols)
-    let writeRes = macho.MachOTextDataObjectWrite(rootDir,
-                                                  plan.outputPath,
-                                                  text,
-                                                  data,
-                                                  symbols,
-                                                  relocs)
+    let writeRes = DirectObjectEmitWriteObject(rootDir, plan, text, data, symbols, relocs)
     if IsErr(writeRes):
         return Err[DirectObjectEmitResult](Error(writeRes))
     let write = Value(writeRes)
@@ -518,7 +541,7 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
         return Ok[bool](true)
     if !DirectObjectEmitTargetSupported(plan):
         return Err[bool](Fmt" direct object emit: unsupported target: {plan.targetTriple}")
-    if len(plan.outputPath) <= 0:
+    if Len(plan.outputPath) <= 0:
         return Err[bool](" direct object emit: missing output path")
     if plan.missingReasons.len > 0:
         return Err[bool](" direct object emit: plan has missing reasons")
@@ -532,10 +555,7 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
     var entryBodyIrReady = false
     if entryIndex < plan.functionBodyIRs.len:
         let entryBodyIR = plan.functionBodyIRs[entryIndex]
-        entryBodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnInt32(entryBodyIR) ||
-                           pobj.PrimaryBodyIrIsCallSequenceReturnI32Const(entryBodyIR) ||
-                           pobj.PrimaryBodyIrIsCallSequenceReturnStr(entryBodyIR) ||
-                           pobj.PrimaryBodyIrIsCallSequenceReturnAggregate(entryBodyIR)
+        entryBodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnSupported(entryBodyIR)
     if entryBodyKind != texpr.BodyKindReturnZeroI32 &&
        !DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindReturnCallNoargI32 &&
@@ -565,7 +585,7 @@ fn DirectObjectEmitValidateStandaloneMain(plan: pobj.PrimaryObjectPlan): Result[
 fn DirectObjectEmitCanPlanObject(plan: pobj.PrimaryObjectPlan): bool =
     return plan.objectFormat == "macho" &&
            plan.instructionWords.len > 0 &&
-           len(plan.outputPath) > 0 &&
+           Len(plan.outputPath) > 0 &&
            plan.missingReasons.len <= 0
 
 fn DirectObjectEmitCanReturnZeroObject(plan: pobj.PrimaryObjectPlan): bool =
@@ -581,7 +601,7 @@ fn DirectObjectEmitValidatePlanObject(plan: pobj.PrimaryObjectPlan): Result[bool
         return Ok[bool](true)
     if !DirectObjectEmitTargetSupported(plan):
         return Err[bool](Fmt" direct object emit: unsupported target: {plan.targetTriple}")
-    if len(plan.outputPath) <= 0:
+    if Len(plan.outputPath) <= 0:
         return Err[bool](" direct object emit: missing output path")
     if plan.missingReasons.len > 0:
         return Err[bool](" direct object emit: plan has missing reasons")
@@ -592,8 +612,8 @@ fn DirectObjectEmitValidatePlanObject(plan: pobj.PrimaryObjectPlan): Result[bool
 fn DirectObjectEmitReturnZeroText(symbolNames: str[]): rawbytes.Bytes =
     var text = obuf.ObjectBufferInit(symbolNames.len * 8 + 16)
     for _ in 0..<symbolNames.len:
-        obuf.ObjectBufferWriteU32LE(text, uint64(0x52800000))  ; MOVZ W0, #0
-        obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))  ; RET
+        obuf.ObjectBufferWriteU32LE(text, Uint64(0x52800000))  ; MOVZ W0, #0
+        obuf.ObjectBufferWriteU32LE(text, Uint64(0xd65f03c0))  ; RET
     return obuf.ObjectBufferToBytes(text)
 
 fn DirectObjectEmitReturnZeroSymbols(symbolNames: str[]): osym.ObjectSymbolTable =
@@ -679,7 +699,7 @@ fn DirectObjectEmitPlanSymbols(plan: pobj.PrimaryObjectPlan): osym.ObjectSymbolT
                                                                         true),
                                          "direct object emit: add entry profile symbol")
     for i in 0..<plan.relocTargetSymbols.len:
-        if len(plan.relocTargetSymbols[i]) > 0:
+        if Len(plan.relocTargetSymbols[i]) > 0:
             DirectObjectEmitRequireIndex(osym.ObjectSymbolsAddUndefined(symbols,
                                                                         plan.relocTargetSymbols[i],
                                                                         true),
@@ -708,7 +728,7 @@ fn DirectObjectEmitAddPageRelocPair(relocs: var orel.ObjectRelocTable,
                                      label: str) =
     let targetIndex = osym.ObjectSymbolsFind(symbols, targetSymbol)
     if targetIndex < 0:
-        assert(false, label)
+        Assert(false, label)
         return
     DirectObjectEmitRequireIndex(orel.ObjectRelocsAdd(relocs,
                                                       0,
@@ -823,12 +843,7 @@ fn DirectObjectEmitPlanObject(rootDir: str,
     let data = DirectObjectEmitPlanData(plan, plan.functionBodyKinds.len)
     let symbols = DirectObjectEmitPlanSymbols(plan)
     let relocs = DirectObjectEmitPlanRelocs(plan, symbols)
-    let writeRes = macho.MachOTextDataObjectWrite(rootDir,
-                                                  plan.outputPath,
-                                                  text,
-                                                  data,
-                                                  symbols,
-                                                  relocs)
+    let writeRes = DirectObjectEmitWriteObject(rootDir, plan, text, data, symbols, relocs)
     if IsErr(writeRes):
         return Err[DirectObjectEmitResult](Error(writeRes))
     let write = Value(writeRes)

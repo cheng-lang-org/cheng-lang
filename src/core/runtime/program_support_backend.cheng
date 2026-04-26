@@ -8,6 +8,10 @@ fn c_free(p: ptr)
 fn c_puts_runtime(text: ptr): int32
 @importc("cheng_host_exit_runtime")
 fn c_exit_runtime(code: int32)
+@importc("cheng_host_getenv")
+fn libc_getenv_runtime(name: ptr): ptr
+@importc("getrusage")
+fn libc_getrusage_runtime(who: int32, usage: var ChengRuntimeRusage): int32
 @importc("cheng_native_register_line_map_from_argv0")
 fn native_cheng_register_line_map_from_argv0_runtime(argv0: ptr)
 @importc("cheng_native_errno_code_bridge")
@@ -235,6 +239,26 @@ type
     DarwinTimespec =
         tv_sec: int64
         tv_nsec: int64
+    ChengRuntimeRusageTimeval =
+        tv_sec: int64
+        tv_usec: int64
+    ChengRuntimeRusage =
+        ru_utime: ChengRuntimeRusageTimeval
+        ru_stime: ChengRuntimeRusageTimeval
+        ru_maxrss: int64
+        ru_ixrss: int64
+        ru_idrss: int64
+        ru_isrss: int64
+        ru_minflt: int64
+        ru_majflt: int64
+        ru_nswap: int64
+        ru_inblock: int64
+        ru_oublock: int64
+        ru_msgsnd: int64
+        ru_msgrcv: int64
+        ru_nsignals: int64
+        ru_nvcsw: int64
+        ru_nivcsw: int64
     DarwinStat =
         st_dev: int32
         st_mode: uint16
@@ -787,6 +811,114 @@ fn cheng_stderr_write_cstr(text: ptr) =
 fn cheng_stderr_write_line_cstr(text: ptr) =
     cheng_stderr_write_cstr(text)
     cheng_stderr_write_cstr("\n")
+
+fn cheng_stderr_write_line_str_return2(text: str): int32 =
+    let n: int32 = cheng_str_len(text)
+    let data: ptr = cheng_str_data(text)
+    if data != nil && n > 0:
+        let ignoredText = cheng_fwrite(data, 1, int64(n), get_stderr())
+    let ignoredNewline = cheng_fwrite("\n", 1, int64(1), get_stderr())
+    return 2
+
+fn driver_c_raw_env_truthy(name: ptr): bool =
+    let raw: ptr = libc_getenv_runtime(name)
+    if raw == nil:
+        return false
+    let n: int32 = cheng_cstrlen_raw(raw)
+    if n <= 0:
+        return false
+    if n == 1 && *(UInt8Ptr(raw)) == uint8(int32('0')):
+        return false
+    if n == 5 && cheng_bytes_compare(raw, "false", 5) == 0:
+        return false
+    return true
+
+fn driver_c_progress_parse_unsigned_i64(raw: ptr): int64 =
+    if raw == nil:
+        return int64(-1)
+    let n: int32 = cheng_cstrlen_raw(raw)
+    if n <= 0:
+        return int64(-1)
+    var value: int64
+    var hadDigit = false
+    var trailingSpace = false
+    for i in 0..<n:
+        let ch: uint8 = *(UInt8Ptr(cheng_ptr_plus(raw, i)))
+        if ch >= uint8(int32('0')) && ch <= uint8(int32('9')):
+            if trailingSpace:
+                return int64(-1)
+            value = value * int64(10) + int64(int32(ch) - int32('0'))
+            hadDigit = true
+        elif int32(ch) == 32 || int32(ch) == 10 || int32(ch) == 9 || int32(ch) == 13:
+            if hadDigit:
+                trailingSpace = true
+        else:
+            return int64(-1)
+    if !hadDigit:
+        return int64(-1)
+    return value
+
+fn driver_c_progress_default_max_rss_bytes(): int64 =
+    return int64(8589934592)
+
+fn driver_c_progress_configured_max_rss_bytes(): int64 =
+    if driver_c_raw_env_truthy("CHENG_PARENT_RSS_GUARD"):
+        return int64(0)
+    var raw: ptr = libc_getenv_runtime("CHENG_PROCESS_MAX_RSS_BYTES")
+    if raw == nil || cheng_cstrlen_raw(raw) <= 0:
+        raw = libc_getenv_runtime("CHENG_MAX_RSS_BYTES")
+    if raw == nil || cheng_cstrlen_raw(raw) <= 0:
+        return driver_c_progress_default_max_rss_bytes()
+    let parsed: int64 = driver_c_progress_parse_unsigned_i64(raw)
+    if parsed <= int64(0):
+        return int64(-1)
+    return parsed
+
+fn driver_c_progress_current_rss_bytes(): int64 =
+    var usage: ChengRuntimeRusage
+    if libc_getrusage_runtime(0, usage) != 0:
+        return int64(-1)
+    if usage.ru_maxrss <= int64(0):
+        return int64(-1)
+    return usage.ru_maxrss
+
+fn driver_c_progress_write_limit_exceeded(rssBytes: int64,
+                                           maxRssBytes: int64) =
+    let rssText: ptr = driver_c_i64_to_str_export(rssBytes)
+    let maxText: ptr = driver_c_i64_to_str_export(maxRssBytes)
+    let p0: ptr = cheng_raw_concat_export("compile_progress phase=resource_guard status=rss_limit_exceeded rss_bytes=", rssText)
+    let p1: ptr = cheng_raw_concat_export(p0, " limit_bytes=")
+    let line: ptr = cheng_raw_concat_export(p1, maxText)
+    cheng_stderr_write_line_cstr(line)
+    cheng_free_export(rssText)
+    cheng_free_export(maxText)
+    cheng_free_export(p0)
+    cheng_free_export(p1)
+    cheng_free_export(line)
+
+fn driver_c_progress_resource_guard_check() =
+    let maxRssBytes: int64 = driver_c_progress_configured_max_rss_bytes()
+    if maxRssBytes == int64(0):
+        return
+    if maxRssBytes < int64(0):
+        cheng_stderr_write_line_cstr("compile_progress phase=resource_guard status=invalid_max_rss")
+        c_exit_runtime(2)
+    let rssBytes: int64 = driver_c_progress_current_rss_bytes()
+    if rssBytes <= int64(0):
+        cheng_stderr_write_line_cstr("compile_progress phase=resource_guard status=rss_unavailable")
+        c_exit_runtime(2)
+    if rssBytes > maxRssBytes:
+        driver_c_progress_write_limit_exceeded(rssBytes, maxRssBytes)
+        c_exit_runtime(125)
+
+fn driver_c_progress_line(phase: str,
+                           status: str): str =
+    let p0: str = driver_c_str_concat_bridge_export("compile_progress phase=", phase)
+    let p1: str = driver_c_str_concat_bridge_export(p0, " status=")
+    let line: str = driver_c_str_concat_bridge_export(p1, status)
+    cheng_str_release_owned(p0)
+    cheng_str_release_owned(p1)
+    return line
 
 fn cheng_bounds_failure_message(len: int32, idx: int32): ptr =
     let idxText: ptr = driver_c_i32_to_str_export(idx)
@@ -2578,6 +2710,19 @@ fn driver_c_str_eq_bridge_export(a: str, b: str): int32 =
         return 1
     return cheng_bytes_equal(cheng_str_data(a), cheng_str_data(b), lenA) ? 1 : 0
 
+@exportc("driver_c_stderr_line_return2_bridge")
+fn driver_c_stderr_line_return2_bridge_export(text: str): int32 =
+    return cheng_stderr_write_line_str_return2(text)
+
+@exportc("driver_c_progress_bridge")
+fn driver_c_progress_bridge_export(phase: str, status: str): int32 =
+    driver_c_progress_resource_guard_check()
+    if driver_c_raw_env_truthy("CHENG_PROGRESS"):
+        let line: str = driver_c_progress_line(phase, status)
+        let ignoredProgressWrite = cheng_stderr_write_line_str_return2(line)
+        cheng_str_release_owned(line)
+    return 0
+
 fn cheng_runtime_param_count(): int32 =
     if cheng_saved_argc > 0 && cheng_saved_argv != nil:
         return cheng_saved_argc
@@ -2709,6 +2854,11 @@ fn driver_c_collect_args_from_bridge_export(startIndex: int32,
         cheng_exec_program_seq_add(out, cheng_runtime_param_str(i))
     return out
 
+@exportc("driver_c_collect_args_after_command_bridge")
+fn driver_c_collect_args_after_command_bridge_export(): str[] =
+    let count = paramCount_export()
+    return driver_c_collect_args_from_bridge_export(2, count)
+
 @exportc("driver_c_cli_param1_eq_bridge")
 fn driver_c_cli_param1_eq_bridge_export(expected: str): bool =
     if cheng_runtime_param_count() <= 1:
@@ -2716,6 +2866,12 @@ fn driver_c_cli_param1_eq_bridge_export(expected: str): bool =
     let arg1 = cheng_runtime_param_str(1)
     let eq = driver_c_str_eq_bridge_export(arg1, expected)
     return eq != 0
+
+@exportc("driver_c_cli_param1_bridge")
+fn driver_c_cli_param1_bridge_export(): str =
+    if cheng_runtime_param_count() <= 1:
+        return cheng_str_empty()
+    return cheng_runtime_param_str(1)
 
 @exportc("driver_c_read_flag_or_default_bridge")
 fn driver_c_read_flag_or_default_bridge_export(key: str, defaultValue: str): str =

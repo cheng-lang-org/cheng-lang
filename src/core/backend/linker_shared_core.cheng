@@ -1,0 +1,76 @@
+# Shared linker helpers for Darwin/Linux self-linkers.
+# Keep this module small and dependency-free so stage0/stage1 can reuse it.
+import std/os
+import std/strformat
+
+fn linkerCoreAlignUp(value: uint64, align: uint64): uint64 =
+    if align <= 1:
+        return value
+    let rem: uint64 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn linkerCoreStrContains(hay: str, needle: str): bool =
+    let n: int32 = len(hay)
+    let m: int32 = len(needle)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(hay[i + j] == needle[j]):
+                break
+        if j == m:
+            return true
+    return false
+
+fn linkerCoreTargetIsAndroid(target: str): bool =
+    if len(target) == 0:
+        return false
+    return linkerCoreStrContains(target, "android")
+
+fn linkerCoreTargetIsLinux(target: str): bool =
+    if len(target) == 0:
+        return false
+    if linkerCoreTargetIsAndroid(target):
+        return false
+    return linkerCoreStrContains(target, "linux")
+
+fn linkerCoreTargetIsDarwin(target: str): bool =
+    if len(target) == 0:
+        return false
+    return linkerCoreStrContains(target, "darwin") || linkerCoreStrContains(target, "apple")
+
+fn linkerCoreBuildTmpOutputPath(outputPath: str): str =
+    if len(outputPath) == 0:
+        return ""
+    return Fmt"{outputPath}.tmp"
+
+fn linkerCorePathExists(path: str): bool =
+    if len(path) == 0:
+        return false
+    return os.FileExists(path)
+
+fn linkerCoreWriteFileAtomic(outputPath: str, data: uint8[]): bool =
+    if len(outputPath) == 0:
+        return false
+    let tmpPath: str = linkerCoreBuildTmpOutputPath(outputPath)
+    if len(tmpPath) == 0:
+        return false
+    # ATOM-08 output transaction: write tmp then rename to publish final artifact.
+    if linkerCorePathExists(tmpPath):
+        os.Remove(tmpPath)
+    os.WriteFile(tmpPath, stringFromBytes(data.data, data.len))
+    if !linkerCorePathExists(tmpPath):
+        return false
+    if os.Rename(tmpPath, outputPath):
+        return true
+    # Windows rename may fail when destination exists; fallback remove+rename.
+    if linkerCorePathExists(outputPath):
+        os.Remove(outputPath)
+        if os.Rename(tmpPath, outputPath):
+            return true
+    os.Remove(tmpPath)
+    return false

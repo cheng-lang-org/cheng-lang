@@ -2,7 +2,6 @@ import std/result
 import std/strutils as strutil
 import cheng/std/bytes_layout as layout
 import cheng/std/crypto/hash256
-import cheng/chain/lsmr_types as lt
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/tooling/compiler_runtime as crun
 import cheng/core/tooling/path as chengpath
@@ -337,10 +336,19 @@ fn CompilerLegacyMigrationClone(migration: CompilerLegacyMigration): CompilerLeg
     out.migrationCid = migration.migrationCid
     return out
 
+fn CompilerCsgAppendU32BE(buf: var layout.ByteBuf, value: int64) =
+    layout.ByteBufAppendByte(buf, (value >> 24) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 16) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 8) & 255)
+    layout.ByteBufAppendByte(buf, value & 255)
+
+fn CompilerCsgAppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
+    layout.ByteBufAppendBytes(buf, layout.FixedBytes32ToBytes(value))
+
 fn CompilerCsgAppendText(buf: var layout.ByteBuf, text: str) =
-    lt.AppendU32BE(buf, len(text))
-    for i in 0..<len(text):
-        layout.ByteBufAppendByte(buf, int32(text[i]) & 255)
+    CompilerCsgAppendU32BE(buf, text.len)
+    for i in 0..<text.len:
+        layout.ByteBufAppendByte(buf, text[i])
 
 fn CompilerCsgExprDetailText(kind: parser.NormalizedExprKind,
                                detailKind: parser.NormalizedExprDetailKind): str =
@@ -438,7 +446,7 @@ fn CompilerCsgAppendExprCompatDetail(buf: var layout.ByteBuf,
 
 fn CompilerCsgBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
     let data = layout.ByteBufToBytes(buf)
-    return hash256.sha256Fixed(layout.ByteSpanFromBytes(data))
+    return hash256.Sha256Fixed(layout.ByteSpanFromBytes(data))
 
 fn CompilerCsgExprCompatDetailStable(workspaceRoot: str,
                                        packageRoot: str,
@@ -448,7 +456,7 @@ fn CompilerCsgExprCompatDetailStable(workspaceRoot: str,
     if expr.kind != parser.NormalizedExprCall:
         return CompilerCsgExprDetailText(expr.kind, expr.detailKind)
     var stableTargetSourcePath = ""
-    if len(expr.callTargetSourcePath) > 0:
+    if expr.callTargetSourcePath.len > 0:
         stableTargetSourcePath = CompilerCsgSourceModulePath(workspaceRoot,
                                                                packageRoot,
                                                                externalPackageRoots,
@@ -469,9 +477,9 @@ fn CompilerCsgAppendExprLayerStable(buf: var layout.ByteBuf,
                                       externalPackageRoots: parser.ParserExternalPackageRoot[],
                                       overrides: CompilerCsgSourceText[],
                                       layer: parser.NormalizedExprLayer) =
-    lt.AppendU32BE(buf, layer.sourceCount)
-    lt.AppendU32BE(buf, layer.exprs.len)
-    lt.AppendU32BE(buf, layer.questionResidualCount)
+    CompilerCsgAppendU32BE(buf, layer.sourceCount)
+    CompilerCsgAppendU32BE(buf, layer.exprs.len)
+    CompilerCsgAppendU32BE(buf, layer.questionResidualCount)
     for i in 0..<layer.exprs.len:
         let expr = layer.exprs[i]
         let callResolvedText = if expr.callResolved: "1" else: "0"
@@ -484,17 +492,17 @@ fn CompilerCsgAppendExprLayerStable(buf: var layout.ByteBuf,
                                                              overrides,
                                                              expr.sourcePath)
         var stableTargetSourcePath = ""
-        if len(expr.callTargetSourcePath) > 0:
+        if expr.callTargetSourcePath.len > 0:
             stableTargetSourcePath = CompilerCsgSourceModulePath(workspaceRoot,
                                                                    packageRoot,
                                                                    externalPackageRoots,
                                                                    overrides,
                                                                    expr.callTargetSourcePath)
         CompilerCsgAppendText(buf, stableSourcePath)
-        lt.AppendU32BE(buf, expr.lineNumber)
-        lt.AppendU32BE(buf, expr.columnNumber)
-        lt.AppendU32BE(buf, expr.endLineNumber)
-        lt.AppendU32BE(buf, expr.endColumnNumber)
+        CompilerCsgAppendU32BE(buf, expr.lineNumber)
+        CompilerCsgAppendU32BE(buf, expr.columnNumber)
+        CompilerCsgAppendU32BE(buf, expr.endLineNumber)
+        CompilerCsgAppendU32BE(buf, expr.endColumnNumber)
         CompilerCsgAppendText(buf, parser.NormalizedExprKindText(expr.kind))
         CompilerCsgAppendText(buf,
                                 CompilerCsgExprCompatDetailStable(workspaceRoot,
@@ -512,7 +520,7 @@ fn CompilerCsgAppendExprLayerStable(buf: var layout.ByteBuf,
         CompilerCsgAppendText(buf, stableTargetSourcePath)
         CompilerCsgAppendText(buf, callTargetImportcText)
         CompilerCsgAppendText(buf, callPrefixStyleText)
-        lt.AppendU32BE(buf, expr.callArgCount)
+        CompilerCsgAppendU32BE(buf, expr.callArgCount)
         CompilerCsgAppendText(buf, expr.callArgsText)
 
 fn CompilerCsgAppendTypedExprFactsStable(buf: var layout.ByteBuf,
@@ -521,7 +529,7 @@ fn CompilerCsgAppendTypedExprFactsStable(buf: var layout.ByteBuf,
                                            externalPackageRoots: parser.ParserExternalPackageRoot[],
                                            overrides: CompilerCsgSourceText[],
                                            facts: TypedExprFact[]) =
-    lt.AppendU32BE(buf, facts.len)
+    CompilerCsgAppendU32BE(buf, facts.len)
     for i in 0..<facts.len:
         let fact = facts[i]
         let callResolvedText = if fact.callResolved: "1" else: "0"
@@ -534,17 +542,17 @@ fn CompilerCsgAppendTypedExprFactsStable(buf: var layout.ByteBuf,
                                                              overrides,
                                                              fact.sourcePath)
         var stableTargetSourcePath = ""
-        if len(fact.callTargetSourcePath) > 0:
+        if fact.callTargetSourcePath.len > 0:
             stableTargetSourcePath = CompilerCsgSourceModulePath(workspaceRoot,
                                                                    packageRoot,
                                                                    externalPackageRoots,
                                                                    overrides,
                                                                    fact.callTargetSourcePath)
         CompilerCsgAppendText(buf, stableSourcePath)
-        lt.AppendU32BE(buf, fact.lineNumber)
-        lt.AppendU32BE(buf, fact.columnNumber)
-        lt.AppendU32BE(buf, fact.endLineNumber)
-        lt.AppendU32BE(buf, fact.endColumnNumber)
+        CompilerCsgAppendU32BE(buf, fact.lineNumber)
+        CompilerCsgAppendU32BE(buf, fact.columnNumber)
+        CompilerCsgAppendU32BE(buf, fact.endLineNumber)
+        CompilerCsgAppendU32BE(buf, fact.endColumnNumber)
         CompilerCsgAppendText(buf, parser.NormalizedExprKindText(fact.kind))
         CompilerCsgAppendText(buf, texpr.TypedExprSurfaceCallKindText(fact.surfaceCallKind))
         CompilerCsgAppendText(buf, callResolvedText)
@@ -555,7 +563,7 @@ fn CompilerCsgAppendTypedExprFactsStable(buf: var layout.ByteBuf,
         CompilerCsgAppendText(buf, stableTargetSourcePath)
         CompilerCsgAppendText(buf, callTargetImportcText)
         CompilerCsgAppendText(buf, callPrefixStyleText)
-        lt.AppendU32BE(buf, fact.callArgCount)
+        CompilerCsgAppendU32BE(buf, fact.callArgCount)
         CompilerCsgAppendText(buf, fact.callArgsText)
         CompilerCsgAppendText(buf, fact.typeText)
         CompilerCsgAppendText(buf, texpr.TypedExprAbiClassText(fact.abiClass))
@@ -580,17 +588,17 @@ fn CompilerCsgHashNode(nodeKind: int32,
                          exportSymbolName: str): layout.FixedBytes32 =
     var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerCsgAppendText(buf, "cheng.compiler.csg.node")
-    lt.AppendU32BE(buf, nodeKind)
-    lt.AppendU32BE(buf, ownerNodeId)
+    CompilerCsgAppendU32BE(buf, nodeKind)
+    CompilerCsgAppendU32BE(buf, ownerNodeId)
     CompilerCsgAppendText(buf, modulePath)
     CompilerCsgAppendText(buf, symbolText)
     CompilerCsgAppendText(buf, factText)
-    lt.AppendU32BE(buf, resultLayoutKind)
-    lt.AppendU32BE(buf, effectKind)
-    lt.AppendU32BE(buf, capabilityKind)
-    lt.AppendU32BE(buf, callConv)
-    lt.AppendU32BE(buf, entryFlag)
-    lt.AppendU32BE(buf, exportedFlag)
+    CompilerCsgAppendU32BE(buf, resultLayoutKind)
+    CompilerCsgAppendU32BE(buf, effectKind)
+    CompilerCsgAppendU32BE(buf, capabilityKind)
+    CompilerCsgAppendU32BE(buf, callConv)
+    CompilerCsgAppendU32BE(buf, entryFlag)
+    CompilerCsgAppendU32BE(buf, exportedFlag)
     CompilerCsgAppendText(buf, exportSymbolName)
     return CompilerCsgBufCid(buf)
 
@@ -599,9 +607,9 @@ fn CompilerCsgHashEdge(fromNodeId: int32,
                          edgeKind: int32): layout.FixedBytes32 =
     var buf: layout.ByteBuf = layout.ByteBufInit(96)
     CompilerCsgAppendText(buf, "cheng.compiler.csg.edge")
-    lt.AppendU32BE(buf, fromNodeId)
-    lt.AppendU32BE(buf, toNodeId)
-    lt.AppendU32BE(buf, edgeKind)
+    CompilerCsgAppendU32BE(buf, fromNodeId)
+    CompilerCsgAppendU32BE(buf, toNodeId)
+    CompilerCsgAppendU32BE(buf, edgeKind)
     return CompilerCsgBufCid(buf)
 
 fn CompilerCsgGraphCid(packageId: str,
@@ -617,7 +625,7 @@ fn CompilerCsgGraphCid(packageId: str,
     var buf: layout.ByteBuf = layout.ByteBufInit(512)
     CompilerCsgAppendText(buf, "cheng.compiler.csg.graph")
     CompilerCsgAppendText(buf, packageId)
-    lt.AppendFixed32(buf, sourceBundleCid)
+    CompilerCsgAppendFixed32(buf, sourceBundleCid)
     CompilerCsgAppendExprLayerStable(buf,
                                        workspaceRoot,
                                        packageRoot,
@@ -630,31 +638,31 @@ fn CompilerCsgGraphCid(packageId: str,
                                             externalPackageRoots,
                                             overrides,
                                             typedExprFacts)
-    lt.AppendU32BE(buf, nodes.len)
+    CompilerCsgAppendU32BE(buf, nodes.len)
     for i in 0..<nodes.len:
         let node = nodes[i]
-        lt.AppendU32BE(buf, node.nodeId)
-        lt.AppendU32BE(buf, node.nodeKind)
-        lt.AppendU32BE(buf, node.ownerNodeId)
+        CompilerCsgAppendU32BE(buf, node.nodeId)
+        CompilerCsgAppendU32BE(buf, node.nodeKind)
+        CompilerCsgAppendU32BE(buf, node.ownerNodeId)
         CompilerCsgAppendText(buf, node.modulePath)
         CompilerCsgAppendText(buf, node.symbolText)
         CompilerCsgAppendText(buf, node.factText)
-        lt.AppendU32BE(buf, node.resultLayoutKind)
-        lt.AppendU32BE(buf, node.effectKind)
-        lt.AppendU32BE(buf, node.capabilityKind)
-        lt.AppendU32BE(buf, node.callConv)
-        lt.AppendU32BE(buf, node.entryFlag)
-        lt.AppendU32BE(buf, node.exportedFlag)
+        CompilerCsgAppendU32BE(buf, node.resultLayoutKind)
+        CompilerCsgAppendU32BE(buf, node.effectKind)
+        CompilerCsgAppendU32BE(buf, node.capabilityKind)
+        CompilerCsgAppendU32BE(buf, node.callConv)
+        CompilerCsgAppendU32BE(buf, node.entryFlag)
+        CompilerCsgAppendU32BE(buf, node.exportedFlag)
         CompilerCsgAppendText(buf, node.exportSymbolName)
-        lt.AppendFixed32(buf, node.factCid)
-    lt.AppendU32BE(buf, edges.len)
+        CompilerCsgAppendFixed32(buf, node.factCid)
+    CompilerCsgAppendU32BE(buf, edges.len)
     for i in 0..<edges.len:
         let edge = edges[i]
-        lt.AppendU32BE(buf, edge.edgeId)
-        lt.AppendU32BE(buf, edge.fromNodeId)
-        lt.AppendU32BE(buf, edge.toNodeId)
-        lt.AppendU32BE(buf, edge.edgeKind)
-        lt.AppendFixed32(buf, edge.edgeCid)
+        CompilerCsgAppendU32BE(buf, edge.edgeId)
+        CompilerCsgAppendU32BE(buf, edge.fromNodeId)
+        CompilerCsgAppendU32BE(buf, edge.toNodeId)
+        CompilerCsgAppendU32BE(buf, edge.edgeKind)
+        CompilerCsgAppendFixed32(buf, edge.edgeCid)
     return CompilerCsgBufCid(buf)
 
 fn CompilerCsgCanonicalGraphCid(packageId: str,
@@ -677,31 +685,31 @@ fn CompilerCsgCanonicalGraphCid(packageId: str,
     let _ = overrides
     let _ = exprLayer
     let _ = typedExprFacts
-    lt.AppendU32BE(buf, nodes.len)
+    CompilerCsgAppendU32BE(buf, nodes.len)
     for i in 0..<nodes.len:
         let node = nodes[i]
-        lt.AppendU32BE(buf, node.nodeId)
-        lt.AppendU32BE(buf, node.nodeKind)
-        lt.AppendU32BE(buf, node.ownerNodeId)
+        CompilerCsgAppendU32BE(buf, node.nodeId)
+        CompilerCsgAppendU32BE(buf, node.nodeKind)
+        CompilerCsgAppendU32BE(buf, node.ownerNodeId)
         CompilerCsgAppendText(buf, node.modulePath)
         CompilerCsgAppendText(buf, node.symbolText)
         CompilerCsgAppendText(buf, node.factText)
-        lt.AppendU32BE(buf, node.resultLayoutKind)
-        lt.AppendU32BE(buf, node.effectKind)
-        lt.AppendU32BE(buf, node.capabilityKind)
-        lt.AppendU32BE(buf, node.callConv)
-        lt.AppendU32BE(buf, node.entryFlag)
-        lt.AppendU32BE(buf, node.exportedFlag)
+        CompilerCsgAppendU32BE(buf, node.resultLayoutKind)
+        CompilerCsgAppendU32BE(buf, node.effectKind)
+        CompilerCsgAppendU32BE(buf, node.capabilityKind)
+        CompilerCsgAppendU32BE(buf, node.callConv)
+        CompilerCsgAppendU32BE(buf, node.entryFlag)
+        CompilerCsgAppendU32BE(buf, node.exportedFlag)
         CompilerCsgAppendText(buf, node.exportSymbolName)
-        lt.AppendFixed32(buf, node.factCid)
-    lt.AppendU32BE(buf, edges.len)
+        CompilerCsgAppendFixed32(buf, node.factCid)
+    CompilerCsgAppendU32BE(buf, edges.len)
     for i in 0..<edges.len:
         let edge = edges[i]
-        lt.AppendU32BE(buf, edge.edgeId)
-        lt.AppendU32BE(buf, edge.fromNodeId)
-        lt.AppendU32BE(buf, edge.toNodeId)
-        lt.AppendU32BE(buf, edge.edgeKind)
-        lt.AppendFixed32(buf, edge.edgeCid)
+        CompilerCsgAppendU32BE(buf, edge.edgeId)
+        CompilerCsgAppendU32BE(buf, edge.fromNodeId)
+        CompilerCsgAppendU32BE(buf, edge.toNodeId)
+        CompilerCsgAppendU32BE(buf, edge.edgeKind)
+        CompilerCsgAppendFixed32(buf, edge.edgeCid)
     return CompilerCsgBufCid(buf)
 
 fn CompilerCsgAddUnique(items: var str[],
@@ -715,8 +723,8 @@ fn CompilerCsgStrLess(left: str,
                         right: str): bool =
     if left == right:
         return false
-    let leftLen = len(left)
-    let rightLen = len(right)
+    let leftLen = left.len
+    let rightLen = right.len
     let sharedLen = leftLen < rightLen ? leftLen : rightLen
     for i in 0..<sharedLen:
         if left[i] == right[i]:
@@ -799,7 +807,7 @@ fn CompilerCsgModuleNodeId(nodes: CompilerCsgNode[],
 fn CompilerCsgSymbolExported(functionName: str,
                                entryFlag: int32): bool =
     let _ = entryFlag
-    if len(functionName) <= 0:
+    if functionName.len <= 0:
         return false
     let ch = functionName[0]
     return ch >= 'A' && ch <= 'Z'
@@ -823,9 +831,9 @@ fn CompilerCsgFindText(text: str,
 fn CompilerCsgTargetExportName(symbolText: str,
                                  explicitExportName: str,
                                  functionName: str): str =
-    if len(explicitExportName) > 0:
+    if explicitExportName.len > 0:
         return explicitExportName
-    if len(functionName) > 0:
+    if functionName.len > 0:
         return functionName
     let suffixPos = CompilerCsgFindText(symbolText, "::")
     if suffixPos < 0:
@@ -839,13 +847,13 @@ fn CompilerCsgShouldExportSymbol(emitKind: creq.CompilerEmit,
                                    functionName: str,
                                    entryFlag: int32): bool =
     if emitKind != creq.EmitShared && emitKind != creq.EmitObj:
-        if len(explicitExportName) > 0:
+        if explicitExportName.len > 0:
             return true
         return CompilerCsgSymbolExported(functionName, entryFlag)
     if !entrySourceFlag:
         return false
     if entryHasExplicitExports:
-        return len(explicitExportName) > 0
+        return explicitExportName.len > 0
     return true
 
 fn CompilerCsgSourceTextLookup(overrides: CompilerCsgSourceText[],
@@ -866,7 +874,7 @@ fn CompilerCsgSourceModulePath(workspaceRoot: str,
     for i in 0..<overrides.len:
         if overrides[i].sourcePath != sourcePath:
             continue
-        if len(overrides[i].modulePath) > 0:
+        if overrides[i].modulePath.len > 0:
             return overrides[i].modulePath
     return parser.ParserSourcePathToModulePathWithExternalPackageRoots(workspaceRoot,
                                                                          packageRoot,
@@ -1006,11 +1014,11 @@ fn CompilerBrowserAbiBridgePlansForSource(linkPlan: slplan.SystemLinkPlanStub,
 
 fn CompilerLegacyLineIndentAt(rawLine: str,
                                 stop: int32): str =
-    let n = len(rawLine)
+    let n = rawLine.len
     if stop >= n:
         return rawLine
     for i in stop..<n:
-        let code = int32(rawLine[i])
+        let code = Int32(rawLine[i])
         if code == 32 || code == 9:
             continue
         return chengpath.TextSlice(rawLine, 0, i)
@@ -1026,10 +1034,10 @@ fn CompilerLegacyFindMatchingBracket(text: str,
 fn CompilerLegacyFindMatchingBracketStep(text: str,
                                            index: int32,
                                            depth: int32): int32 =
-    let n = len(text)
+    let n = text.len
     var currentDepth = depth
     for i in index..<n:
-        let code = int32(text[i])
+        let code = Int32(text[i])
         if code == 91:
             currentDepth = currentDepth + 1
             continue
@@ -1046,10 +1054,10 @@ fn CompilerLegacyTopLevelComma(text: str): int32 =
 fn CompilerLegacyTopLevelCommaStep(text: str,
                                      index: int32,
                                      depth: int32): int32 =
-    let n = len(text)
+    let n = text.len
     var currentDepth = depth
     for i in index..<n:
-        let code = int32(text[i])
+        let code = Int32(text[i])
         if code == 91:
             currentDepth = currentDepth + 1
             continue
@@ -1065,8 +1073,8 @@ fn CompilerLegacyRewriteSeqTypes(textRaw: str,
     var text = textRaw
     outAppliedCount = 0
     var i = 0
-    while i < len(text):
-        if i + 4 > len(text):
+    while i < text.len:
+        if i + 4 > text.len:
             break
         if chengpath.TextSlice(text, i, 4) != "seq[":
             i = i + 1
@@ -1078,12 +1086,12 @@ fn CompilerLegacyRewriteSeqTypes(textRaw: str,
         let inner = chengpath.TextSlice(text, i + 4, closePos - (i + 4))
         let replacement = strutil.Join([strutil.Strip(inner), "[]"], "")
         let prefix = chengpath.TextSlice(text, 0, i)
-        let suffix = chengpath.TextSlice(text, closePos + 1, len(text) - (closePos + 1))
+        let suffix = chengpath.TextSlice(text, closePos + 1, text.len - (closePos + 1))
         var rewritten = strutil.Join([prefix, replacement], "")
         rewritten = strutil.Join([rewritten, suffix], "")
         text = rewritten
         outAppliedCount = outAppliedCount + 1
-        i = i + len(replacement)
+        i = i + replacement.len
     return text
 
 fn CompilerLegacyRewriteArrayTypes(textRaw: str,
@@ -1091,8 +1099,8 @@ fn CompilerLegacyRewriteArrayTypes(textRaw: str,
     var text = textRaw
     outAppliedCount = 0
     var i = 0
-    while i < len(text):
-        if i + 6 > len(text):
+    while i < text.len:
+        if i + 6 > text.len:
             break
         if chengpath.TextSlice(text, i, 6) != "array[":
             i = i + 1
@@ -1107,15 +1115,15 @@ fn CompilerLegacyRewriteArrayTypes(textRaw: str,
             i = i + 1
             continue
         let elemText = strutil.Strip(chengpath.TextSlice(inner, 0, commaPos))
-        let lenText = strutil.Strip(chengpath.TextSlice(inner, commaPos + 1, len(inner) - (commaPos + 1)))
+        let lenText = strutil.Strip(chengpath.TextSlice(inner, commaPos + 1, inner.len - (commaPos + 1)))
         let replacement = strutil.Join([elemText, "[", lenText, "]"], "")
         let prefix = chengpath.TextSlice(text, 0, i)
-        let suffix = chengpath.TextSlice(text, closePos + 1, len(text) - (closePos + 1))
+        let suffix = chengpath.TextSlice(text, closePos + 1, text.len - (closePos + 1))
         var rewritten = strutil.Join([prefix, replacement], "")
         rewritten = strutil.Join([rewritten, suffix], "")
         text = rewritten
         outAppliedCount = outAppliedCount + 1
-        i = i + len(replacement)
+        i = i + replacement.len
     return text
 
 fn CompilerLegacyNormalizeText(textRaw: str,
@@ -1153,15 +1161,15 @@ fn CompilerLegacyNormalizeText(textRaw: str,
         if chengpath.TextStartsWith(trimmed, "proc "):
             CompilerCsgAddUnique(outAppliedRules, "proc_to_fn")
             outAppliedCount = outAppliedCount + 1
-            line = strutil.Join([indent, "fn ", chengpath.TextSlice(trimmed, len("proc "), len(trimmed) - len("proc "))], "")
+            line = strutil.Join([indent, "fn ", chengpath.TextSlice(trimmed, 5, trimmed.len - 5)], "")
         elif chengpath.TextStartsWith(trimmed, "method "):
             CompilerCsgAddUnique(outAppliedRules, "method_to_fn")
             outAppliedCount = outAppliedCount + 1
-            line = strutil.Join([indent, "fn ", chengpath.TextSlice(trimmed, len("method "), len(trimmed) - len("method "))], "")
+            line = strutil.Join([indent, "fn ", chengpath.TextSlice(trimmed, 7, trimmed.len - 7)], "")
         elif chengpath.TextStartsWith(trimmed, "converter "):
             CompilerCsgAddUnique(outAppliedRules, "converter_to_fn")
             outAppliedCount = outAppliedCount + 1
-            line = strutil.Join([indent, "fn ", chengpath.TextSlice(trimmed, len("converter "), len(trimmed) - len("converter "))], "")
+            line = strutil.Join([indent, "fn ", chengpath.TextSlice(trimmed, 10, trimmed.len - 10)], "")
         if i > 0:
             out = strutil.Join([out, "\n"], "")
         out = strutil.Join([out, line], "")
@@ -1216,7 +1224,7 @@ fn CompilerLegacyCollectClosure(workspaceRoot: str,
     var localAppliedCount = 0
     let migratedText = CompilerLegacyNormalizeText(legacyText, localRules, localAppliedCount)
     var modulePath = parser.ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
-    if len(entryModulePathOverride) > 0:
+    if entryModulePathOverride.len > 0:
         if sourcePath == seen[0]:
             modulePath = entryModulePathOverride
     var unit: CompilerLegacySourceUnit
@@ -1351,7 +1359,7 @@ fn BuildCompilerLegacyMigration(workspaceRoot: str,
         add(legacyTexts, units[i].legacyText)
         add(migratedModulePaths, units[i].modulePath)
         add(migratedTexts, units[i].migratedText)
-    let packageId = len(packageIdHint) > 0 ? packageIdHint : CompilerLegacyPackageId(units[0].modulePath)
+    let packageId = packageIdHint.len > 0 ? packageIdHint : CompilerLegacyPackageId(units[0].modulePath)
     let legacyBundleRes = cworld.CompilerWorldSourceBundleCidFromModuleTexts(packageId,
                                                                                legacyModulePaths,
                                                                                legacyTexts)
@@ -1389,11 +1397,11 @@ fn BuildCompilerLegacyMigration(workspaceRoot: str,
     CompilerCsgAppendText(migBuf, "cheng.compiler.legacy_migration")
     CompilerCsgAppendText(migBuf, packageId)
     CompilerCsgAppendText(migBuf, entrySourcePath)
-    lt.AppendFixed32(migBuf, Value(legacyBundleRes))
-    lt.AppendFixed32(migBuf, Value(migratedBundleRes))
-    lt.AppendFixed32(migBuf, csg.canonicalGraphCid)
-    lt.AppendFixed32(migBuf, surface.surfaceCid)
-    lt.AppendU32BE(migBuf, appliedRules.len)
+    CompilerCsgAppendFixed32(migBuf, Value(legacyBundleRes))
+    CompilerCsgAppendFixed32(migBuf, Value(migratedBundleRes))
+    CompilerCsgAppendFixed32(migBuf, csg.canonicalGraphCid)
+    CompilerCsgAppendFixed32(migBuf, surface.surfaceCid)
+    CompilerCsgAppendU32BE(migBuf, appliedRules.len)
     for i in 0..<appliedRules.len:
         CompilerCsgAppendText(migBuf, appliedRules[i])
     var out: CompilerLegacyMigration
@@ -1544,17 +1552,17 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
     packageNode.exportSymbolName = ""
     var packageBuf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerCsgAppendText(packageBuf, "cheng.compiler.csg.node")
-    lt.AppendU32BE(packageBuf, packageNode.nodeKind)
-    lt.AppendU32BE(packageBuf, packageNode.ownerNodeId)
+    CompilerCsgAppendU32BE(packageBuf, packageNode.nodeKind)
+    CompilerCsgAppendU32BE(packageBuf, packageNode.ownerNodeId)
     CompilerCsgAppendText(packageBuf, packageNode.modulePath)
     CompilerCsgAppendText(packageBuf, packageNode.symbolText)
     CompilerCsgAppendText(packageBuf, packageNode.factText)
-    lt.AppendU32BE(packageBuf, packageNode.resultLayoutKind)
-    lt.AppendU32BE(packageBuf, packageNode.effectKind)
-    lt.AppendU32BE(packageBuf, packageNode.capabilityKind)
-    lt.AppendU32BE(packageBuf, packageNode.callConv)
-    lt.AppendU32BE(packageBuf, packageNode.entryFlag)
-    lt.AppendU32BE(packageBuf, packageNode.exportedFlag)
+    CompilerCsgAppendU32BE(packageBuf, packageNode.resultLayoutKind)
+    CompilerCsgAppendU32BE(packageBuf, packageNode.effectKind)
+    CompilerCsgAppendU32BE(packageBuf, packageNode.capabilityKind)
+    CompilerCsgAppendU32BE(packageBuf, packageNode.callConv)
+    CompilerCsgAppendU32BE(packageBuf, packageNode.entryFlag)
+    CompilerCsgAppendU32BE(packageBuf, packageNode.exportedFlag)
     CompilerCsgAppendText(packageBuf, packageNode.exportSymbolName)
     packageNode.factCid = CompilerCsgBufCid(packageBuf)
     add(nodes, packageNode)
@@ -1576,17 +1584,17 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
         moduleNode.exportSymbolName = ""
         var moduleBuf: layout.ByteBuf = layout.ByteBufInit(256)
         CompilerCsgAppendText(moduleBuf, "cheng.compiler.csg.node")
-        lt.AppendU32BE(moduleBuf, moduleNode.nodeKind)
-        lt.AppendU32BE(moduleBuf, moduleNode.ownerNodeId)
+        CompilerCsgAppendU32BE(moduleBuf, moduleNode.nodeKind)
+        CompilerCsgAppendU32BE(moduleBuf, moduleNode.ownerNodeId)
         CompilerCsgAppendText(moduleBuf, moduleNode.modulePath)
         CompilerCsgAppendText(moduleBuf, moduleNode.symbolText)
         CompilerCsgAppendText(moduleBuf, moduleNode.factText)
-        lt.AppendU32BE(moduleBuf, moduleNode.resultLayoutKind)
-        lt.AppendU32BE(moduleBuf, moduleNode.effectKind)
-        lt.AppendU32BE(moduleBuf, moduleNode.capabilityKind)
-        lt.AppendU32BE(moduleBuf, moduleNode.callConv)
-        lt.AppendU32BE(moduleBuf, moduleNode.entryFlag)
-        lt.AppendU32BE(moduleBuf, moduleNode.exportedFlag)
+        CompilerCsgAppendU32BE(moduleBuf, moduleNode.resultLayoutKind)
+        CompilerCsgAppendU32BE(moduleBuf, moduleNode.effectKind)
+        CompilerCsgAppendU32BE(moduleBuf, moduleNode.capabilityKind)
+        CompilerCsgAppendU32BE(moduleBuf, moduleNode.callConv)
+        CompilerCsgAppendU32BE(moduleBuf, moduleNode.entryFlag)
+        CompilerCsgAppendU32BE(moduleBuf, moduleNode.exportedFlag)
         CompilerCsgAppendText(moduleBuf, moduleNode.exportSymbolName)
         moduleNode.factCid = CompilerCsgBufCid(moduleBuf)
         add(nodes, moduleNode)
@@ -1681,7 +1689,7 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
             for scanIndex in 0..<decls.len:
                 if decls[scanIndex].importc:
                     continue
-                if len(decls[scanIndex].explicitExportName) > 0:
+                if decls[scanIndex].explicitExportName.len > 0:
                     entryHasExplicitExports = true
                     break
         for declIndex in 0..<decls.len:
@@ -1733,17 +1741,17 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
             symbolNode.exportSymbolName = exportSymbolName
             var symbolBuf: layout.ByteBuf = layout.ByteBufInit(256)
             CompilerCsgAppendText(symbolBuf, "cheng.compiler.csg.node")
-            lt.AppendU32BE(symbolBuf, symbolNode.nodeKind)
-            lt.AppendU32BE(symbolBuf, symbolNode.ownerNodeId)
+            CompilerCsgAppendU32BE(symbolBuf, symbolNode.nodeKind)
+            CompilerCsgAppendU32BE(symbolBuf, symbolNode.ownerNodeId)
             CompilerCsgAppendText(symbolBuf, symbolNode.modulePath)
             CompilerCsgAppendText(symbolBuf, symbolNode.symbolText)
             CompilerCsgAppendText(symbolBuf, symbolNode.factText)
-            lt.AppendU32BE(symbolBuf, symbolNode.resultLayoutKind)
-            lt.AppendU32BE(symbolBuf, symbolNode.effectKind)
-            lt.AppendU32BE(symbolBuf, symbolNode.capabilityKind)
-            lt.AppendU32BE(symbolBuf, symbolNode.callConv)
-            lt.AppendU32BE(symbolBuf, symbolNode.entryFlag)
-            lt.AppendU32BE(symbolBuf, symbolNode.exportedFlag)
+            CompilerCsgAppendU32BE(symbolBuf, symbolNode.resultLayoutKind)
+            CompilerCsgAppendU32BE(symbolBuf, symbolNode.effectKind)
+            CompilerCsgAppendU32BE(symbolBuf, symbolNode.capabilityKind)
+            CompilerCsgAppendU32BE(symbolBuf, symbolNode.callConv)
+            CompilerCsgAppendU32BE(symbolBuf, symbolNode.entryFlag)
+            CompilerCsgAppendU32BE(symbolBuf, symbolNode.exportedFlag)
             CompilerCsgAppendText(symbolBuf, symbolNode.exportSymbolName)
             symbolNode.factCid = CompilerCsgBufCid(symbolBuf)
             add(nodes, symbolNode)
@@ -1765,17 +1773,17 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
             layoutNode.exportSymbolName = ""
             var layoutBuf: layout.ByteBuf = layout.ByteBufInit(256)
             CompilerCsgAppendText(layoutBuf, "cheng.compiler.csg.node")
-            lt.AppendU32BE(layoutBuf, layoutNode.nodeKind)
-            lt.AppendU32BE(layoutBuf, layoutNode.ownerNodeId)
+            CompilerCsgAppendU32BE(layoutBuf, layoutNode.nodeKind)
+            CompilerCsgAppendU32BE(layoutBuf, layoutNode.ownerNodeId)
             CompilerCsgAppendText(layoutBuf, layoutNode.modulePath)
             CompilerCsgAppendText(layoutBuf, layoutNode.symbolText)
             CompilerCsgAppendText(layoutBuf, layoutNode.factText)
-            lt.AppendU32BE(layoutBuf, layoutNode.resultLayoutKind)
-            lt.AppendU32BE(layoutBuf, layoutNode.effectKind)
-            lt.AppendU32BE(layoutBuf, layoutNode.capabilityKind)
-            lt.AppendU32BE(layoutBuf, layoutNode.callConv)
-            lt.AppendU32BE(layoutBuf, layoutNode.entryFlag)
-            lt.AppendU32BE(layoutBuf, layoutNode.exportedFlag)
+            CompilerCsgAppendU32BE(layoutBuf, layoutNode.resultLayoutKind)
+            CompilerCsgAppendU32BE(layoutBuf, layoutNode.effectKind)
+            CompilerCsgAppendU32BE(layoutBuf, layoutNode.capabilityKind)
+            CompilerCsgAppendU32BE(layoutBuf, layoutNode.callConv)
+            CompilerCsgAppendU32BE(layoutBuf, layoutNode.entryFlag)
+            CompilerCsgAppendU32BE(layoutBuf, layoutNode.exportedFlag)
             CompilerCsgAppendText(layoutBuf, layoutNode.exportSymbolName)
             layoutNode.factCid = CompilerCsgBufCid(layoutBuf)
             add(nodes, layoutNode)
@@ -1796,17 +1804,17 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
             effectNode.exportSymbolName = ""
             var effectBuf: layout.ByteBuf = layout.ByteBufInit(256)
             CompilerCsgAppendText(effectBuf, "cheng.compiler.csg.node")
-            lt.AppendU32BE(effectBuf, effectNode.nodeKind)
-            lt.AppendU32BE(effectBuf, effectNode.ownerNodeId)
+            CompilerCsgAppendU32BE(effectBuf, effectNode.nodeKind)
+            CompilerCsgAppendU32BE(effectBuf, effectNode.ownerNodeId)
             CompilerCsgAppendText(effectBuf, effectNode.modulePath)
             CompilerCsgAppendText(effectBuf, effectNode.symbolText)
             CompilerCsgAppendText(effectBuf, effectNode.factText)
-            lt.AppendU32BE(effectBuf, effectNode.resultLayoutKind)
-            lt.AppendU32BE(effectBuf, effectNode.effectKind)
-            lt.AppendU32BE(effectBuf, effectNode.capabilityKind)
-            lt.AppendU32BE(effectBuf, effectNode.callConv)
-            lt.AppendU32BE(effectBuf, effectNode.entryFlag)
-            lt.AppendU32BE(effectBuf, effectNode.exportedFlag)
+            CompilerCsgAppendU32BE(effectBuf, effectNode.resultLayoutKind)
+            CompilerCsgAppendU32BE(effectBuf, effectNode.effectKind)
+            CompilerCsgAppendU32BE(effectBuf, effectNode.capabilityKind)
+            CompilerCsgAppendU32BE(effectBuf, effectNode.callConv)
+            CompilerCsgAppendU32BE(effectBuf, effectNode.entryFlag)
+            CompilerCsgAppendU32BE(effectBuf, effectNode.exportedFlag)
             CompilerCsgAppendText(effectBuf, effectNode.exportSymbolName)
             effectNode.factCid = CompilerCsgBufCid(effectBuf)
             add(nodes, effectNode)
@@ -1827,17 +1835,17 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
             capabilityNode.exportSymbolName = ""
             var capabilityBuf: layout.ByteBuf = layout.ByteBufInit(256)
             CompilerCsgAppendText(capabilityBuf, "cheng.compiler.csg.node")
-            lt.AppendU32BE(capabilityBuf, capabilityNode.nodeKind)
-            lt.AppendU32BE(capabilityBuf, capabilityNode.ownerNodeId)
+            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.nodeKind)
+            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.ownerNodeId)
             CompilerCsgAppendText(capabilityBuf, capabilityNode.modulePath)
             CompilerCsgAppendText(capabilityBuf, capabilityNode.symbolText)
             CompilerCsgAppendText(capabilityBuf, capabilityNode.factText)
-            lt.AppendU32BE(capabilityBuf, capabilityNode.resultLayoutKind)
-            lt.AppendU32BE(capabilityBuf, capabilityNode.effectKind)
-            lt.AppendU32BE(capabilityBuf, capabilityNode.capabilityKind)
-            lt.AppendU32BE(capabilityBuf, capabilityNode.callConv)
-            lt.AppendU32BE(capabilityBuf, capabilityNode.entryFlag)
-            lt.AppendU32BE(capabilityBuf, capabilityNode.exportedFlag)
+            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.resultLayoutKind)
+            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.effectKind)
+            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.capabilityKind)
+            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.callConv)
+            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.entryFlag)
+            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.exportedFlag)
             CompilerCsgAppendText(capabilityBuf, capabilityNode.exportSymbolName)
             capabilityNode.factCid = CompilerCsgBufCid(capabilityBuf)
             add(nodes, capabilityNode)
@@ -1914,13 +1922,13 @@ fn CompilerExportSurfaceFromCsg(csg: CompilerCsg): CsgExportSurface =
     var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerCsgAppendText(buf, "cheng.compiler.export_surface")
     CompilerCsgAppendText(buf, out.packageId)
-    lt.AppendU32BE(buf, out.exportedSymbolCount)
+    CompilerCsgAppendU32BE(buf, out.exportedSymbolCount)
     for i in 0..<out.exportedSymbols.len:
         CompilerCsgAppendText(buf, out.exportedSymbols[i])
         CompilerCsgAppendText(buf, out.exportedTargetNames[i])
-        lt.AppendU32BE(buf, out.exportedLayouts[i])
-        lt.AppendU32BE(buf, out.exportedEffects[i])
-        lt.AppendU32BE(buf, out.exportedCapabilities[i])
+        CompilerCsgAppendU32BE(buf, out.exportedLayouts[i])
+        CompilerCsgAppendU32BE(buf, out.exportedEffects[i])
+        CompilerCsgAppendU32BE(buf, out.exportedCapabilities[i])
     out.surfaceCid = CompilerCsgBufCid(buf)
     return out
 
@@ -1953,14 +1961,14 @@ fn CompileReceiptMake(worldHeadCid: layout.FixedBytes32,
                         runtimeProviderSet: str[]): CompileReceipt =
     var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerCsgAppendText(buf, "cheng.compiler.compile_receipt")
-    lt.AppendFixed32(buf, worldHeadCid)
-    lt.AppendFixed32(buf, compilerCsgCid)
-    lt.AppendFixed32(buf, canonicalCompilerCsgCid)
+    CompilerCsgAppendFixed32(buf, worldHeadCid)
+    CompilerCsgAppendFixed32(buf, compilerCsgCid)
+    CompilerCsgAppendFixed32(buf, canonicalCompilerCsgCid)
     CompilerCsgAppendText(buf, targetTriple)
-    lt.AppendFixed32(buf, outputDigest)
-    lt.AppendFixed32(buf, canonicalOutputDigest)
+    CompilerCsgAppendFixed32(buf, outputDigest)
+    CompilerCsgAppendFixed32(buf, canonicalOutputDigest)
     CompilerCsgAppendText(buf, bootstrapStage)
-    lt.AppendU32BE(buf, runtimeProviderSet.len)
+    CompilerCsgAppendU32BE(buf, runtimeProviderSet.len)
     for i in 0..<runtimeProviderSet.len:
         CompilerCsgAppendText(buf, runtimeProviderSet[i])
     var out: CompileReceipt
@@ -1984,8 +1992,8 @@ fn CompileOutputDigest(outputPath: str,
     CompilerCsgAppendText(buf, "cheng.compiler.output_digest")
     let _ = outputPath
     CompilerCsgAppendText(buf, targetTriple)
-    lt.AppendFixed32(buf, csgCid)
-    lt.AppendU32BE(buf, providerModules.len)
+    CompilerCsgAppendFixed32(buf, csgCid)
+    CompilerCsgAppendU32BE(buf, providerModules.len)
     for i in 0..<providerModules.len:
         CompilerCsgAppendText(buf, providerModules[i])
     return CompilerCsgBufCid(buf)
@@ -2096,12 +2104,12 @@ fn CompilerCsgParseUintText(text: str,
     outOk = false
     if text.len <= 0:
         return 0
-    var value = int32(0)
+    var value = Int32(0)
     for i in 0..<text.len:
         let ch = text[i]
         if ch < '0' || ch > '9':
             return 0
-        value = value * 10 + (int32(ch) - int32('0'))
+        value = value * 10 + (Int32(ch) - Int32('0'))
     outOk = true
     return value
 
@@ -2109,7 +2117,7 @@ fn CompilerExportSurfaceFromReportText(text: str,
                                          out: var CsgExportSurface): Result[bool] =
     let packageId = compilerCsgLineValue(text, "package_id")
     let countText = compilerCsgLineValue(text, "exported_count")
-    if len(countText) <= 0:
+    if countText.len <= 0:
         return Err[bool](" compiler csg: exported_count missing")
     var countOk = false
     let exportedCount = CompilerCsgParseUintText(countText, countOk)
@@ -2198,13 +2206,13 @@ fn CompilerExportSurfaceFromReportText(text: str,
 
 fn CompilerCsgGraphCidFromReportText(text: str): Result[layout.FixedBytes32] =
     let raw = compilerCsgLineValue(text, "graph_cid")
-    if len(raw) <= 0:
+    if raw.len <= 0:
         return Err[layout.FixedBytes32](" compiler csg: graph_cid missing")
     return layout.FixedBytes32FromHex(raw)
 
 fn CompilerCsgCanonicalGraphCidFromReportText(text: str): Result[layout.FixedBytes32] =
     let raw = compilerCsgLineValue(text, "canonical_graph_cid")
-    if len(raw) > 0:
+    if raw.len > 0:
         return layout.FixedBytes32FromHex(raw)
     return CompilerCsgGraphCidFromReportText(text)
 
@@ -2241,7 +2249,7 @@ fn CompileReceiptFromReportText(text: str,
         return Err[bool](" compiler csg: invalid compiler_csg_cid")
     let canonicalCsgRaw = compilerCsgLineValue(text, "canonical_compiler_csg_cid")
     var canonicalCsgRes: Result[layout.FixedBytes32]
-    if len(canonicalCsgRaw) > 0:
+    if canonicalCsgRaw.len > 0:
         canonicalCsgRes = layout.FixedBytes32FromHex(canonicalCsgRaw)
     else:
         canonicalCsgRes = layout.FixedBytes32FromHex(compilerCsgLineValue(text, "compiler_csg_cid"))
@@ -2252,7 +2260,7 @@ fn CompileReceiptFromReportText(text: str,
         return Err[bool](" compiler csg: invalid output_digest")
     let canonicalDigestRaw = compilerCsgLineValue(text, "canonical_output_digest")
     var canonicalDigestRes: Result[layout.FixedBytes32]
-    if len(canonicalDigestRaw) > 0:
+    if canonicalDigestRaw.len > 0:
         canonicalDigestRes = layout.FixedBytes32FromHex(canonicalDigestRaw)
     else:
         canonicalDigestRes = layout.FixedBytes32FromHex(compilerCsgLineValue(text, "output_digest"))
@@ -2320,7 +2328,7 @@ fn compilerCsgLineValue(text: str, key: str): str =
         let line = strutil.Strip(lineRaw)
         var matchedPrefix = false
         if line.len > key.len:
-            if int32(line[key.len]) == 61:
+            if Int32(line[key.len]) == 61:
                 matchedPrefix = true
         if !matchedPrefix:
             continue

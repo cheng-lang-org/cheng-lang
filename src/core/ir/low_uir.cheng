@@ -14,6 +14,7 @@ type
         LowUirBuildUnsupportedReturn
         LowUirBuildMissingCallTarget
         LowUirBuildArgSlotFailed
+        LowUirBuildResultSlotFailed
 
     LowUirStatement =
         kind: texpr.TypedExprIrStatementKind
@@ -22,6 +23,9 @@ type
         bindingName: str
         resultType: str
         returnRoot: bool
+
+fn lowUirMissingArgSlot(): int32 =
+    return 0 - 2147483647
 
 fn lowUirAlignInt32(value: int32, align: int32): int32 =
     if align <= 1:
@@ -41,9 +45,19 @@ fn lowUirLocalTypeKind(typeTextRaw: str): int32 =
         return coreir.LocalStrTag
     if typeText == "cstring":
         return coreir.LocalPtrTag
+    if chengpath.TextContains(typeText, "SystemLinkPlanStub") ||
+       chengpath.TextContains(typeText, "LoweringPlanStub") ||
+       chengpath.TextContains(typeText, "PrimaryObjectPlan") ||
+       chengpath.TextContains(typeText, "CompilerCsg") ||
+       chengpath.TextContains(typeText, "DirectObjectEmitResult") ||
+       chengpath.TextContains(typeText, "ExecCmdResult") ||
+       chengpath.TextContains(typeText, "FixedBytes32") ||
+       chengpath.TextContains(typeText, "NormalizedExprLayer") ||
+       chengpath.TextContains(typeText, "CompilerRequest"):
+        return coreir.LocalAggregateTag
     if chengpath.TextContains(typeText, "[]"):
         return coreir.LocalAggregateTag
-    if chengpath.TextContains(typeText, "Result["):
+    if chengpath.TextStartsWith(typeText, "Result["):
         return coreir.LocalAggregateTag
     if !texpr.TypedExprTypeTextIsConcrete(typeText):
         return coreir.LocalAggregateTag
@@ -61,7 +75,25 @@ fn lowUirLocalTypeSizeBytes(typeTextRaw: str,
     if typeKind == coreir.LocalPtrTag:
         return 8
     if typeKind == coreir.LocalAggregateTag:
-        if chengpath.TextContains(typeText, "Result"):
+        if chengpath.TextContains(typeText, "SystemLinkPlanStub"):
+            return 512
+        if chengpath.TextContains(typeText, "LoweringPlanStub"):
+            return 768
+        if chengpath.TextContains(typeText, "PrimaryObjectPlan"):
+            return 768
+        if chengpath.TextContains(typeText, "CompilerCsg"):
+            return 192
+        if chengpath.TextContains(typeText, "DirectObjectEmitResult"):
+            return 64
+        if chengpath.TextContains(typeText, "ExecCmdResult"):
+            return 40
+        if chengpath.TextContains(typeText, "FixedBytes32"):
+            return 32
+        if chengpath.TextContains(typeText, "NormalizedExprLayer"):
+            return 64
+        if chengpath.TextContains(typeText, "CompilerRequest"):
+            return 232
+        if chengpath.TextStartsWith(typeText, "Result["):
             return 40
         if chengpath.TextContains(typeText, "[]"):
             return 16
@@ -113,7 +145,7 @@ fn lowUirLocalSlotIndex(bodyIR: coreir.BodyIR,
 fn lowUirEnsureLocalSlot(bodyIR: var coreir.BodyIR,
                           name: str,
                           typeTextRaw: str): int32 =
-    if len(name) <= 0:
+    if name.len <= 0:
         return -1
     let existing = lowUirLocalSlotIndex(bodyIR, name)
     if existing >= 0:
@@ -139,51 +171,58 @@ fn lowUirCallArgSlot(bodyIR: coreir.BodyIR,
                       argName: str,
                       paramSlots: int32[],
                       paramNames: str[]): int32 =
-    if len(argName) <= 0:
-        return -1
-    let localSlot = lowUirLocalSlotIndex(bodyIR, argName)
+    let name = chengpath.PathTrim(argName)
+    if name.len <= 0:
+        return lowUirMissingArgSlot()
+    let localSlot = lowUirLocalSlotIndex(bodyIR, name)
     if localSlot >= 0:
         return localSlot
     for pi in 0..<paramNames.len:
-        if paramNames[pi] == argName && pi < paramSlots.len:
+        if paramNames[pi] == name && pi < paramSlots.len:
             return 0 - paramSlots[pi] - 1
-    return -1
+    return lowUirMissingArgSlot()
 
---- Build a BodyIR from a PrimaryObjectIrFunction whose statements are
---- call/call-let sequence. Each statement must have kind StmtLetCall or StmtCall.
---- At least one statement must be marked returnRoot.
-fn lowUirBuildFromStatements(bodyIR: var coreir.BodyIR,
-                              stmts: LowUirStatement[],
-                              stmtCount: int32,
-                              paramSlots: int32[],
-                              paramNames: str[]): LowUirBuildResult =
+fn lowUirCallResultSlotName(stmt: LowUirStatement,
+                             stmtIndex: int32): str =
+    if stmt.kind == texpr.TypedExprIrStmtLetCall:
+        return chengpath.PathTrim(stmt.bindingName)
+    if stmt.kind == texpr.TypedExprIrStmtCall:
+        let resultKind = lowUirLocalTypeKind(stmt.resultType)
+        if stmt.returnRoot ||
+           resultKind == coreir.LocalStrTag ||
+           resultKind == coreir.LocalAggregateTag:
+            return Fmt"__low_ret_{stmtIndex}"
+    return ""
+
+fn lowUirAppendCallStatements(bodyIR: var coreir.BodyIR,
+                               stmts: LowUirStatement[],
+                               stmtCount: int32,
+                               paramSlots: int32[],
+                               paramNames: str[]): LowUirBuildResult =
     if stmtCount <= 0:
         return LowUirBuildNoStatements
 
-    var hasReturnStmt = false
     for stmtIndex in 0..<stmtCount:
+        if stmtIndex >= stmts.len:
+            return LowUirBuildNoStatements
         let stmt = stmts[stmtIndex]
 
         if stmt.kind != texpr.TypedExprIrStmtLetCall &&
            stmt.kind != texpr.TypedExprIrStmtCall:
             return LowUirBuildUnsupportedStmtKind
 
-        if len(stmt.callTarget) <= 0:
+        if stmt.callTarget.len <= 0:
             return LowUirBuildMissingCallTarget
 
-        -- Determine result slot name.
-        var resultSlotName = ""
-        if stmt.kind == texpr.TypedExprIrStmtLetCall && len(stmt.bindingName) > 0:
-            resultSlotName = stmt.bindingName
-        else:
-            resultSlotName = Fmt"__low_{stmtIndex}"
-
-        -- Ensure local slot for the result.
-        let resultSlot = lowUirEnsureLocalSlot(bodyIR,
+        var resultSlot: int32 = -1
+        let resultSlotName = lowUirCallResultSlotName(stmt, stmtIndex)
+        if resultSlotName.len > 0:
+            resultSlot = lowUirEnsureLocalSlot(bodyIR,
                                                resultSlotName,
                                                stmt.resultType)
+            if resultSlot < 0:
+                return LowUirBuildResultSlotFailed
 
-        -- Build arg slots from the statement.
         var argSlots: int32[]
         let args = texpr.TypedExprSplitTopLevelCsv(stmt.callArgsText)
         for argIndex in 0..<args.len:
@@ -191,11 +230,10 @@ fn lowUirBuildFromStatements(bodyIR: var coreir.BodyIR,
                                         args[argIndex],
                                         paramSlots,
                                         paramNames)
-            if slot < 0:
+            if slot == lowUirMissingArgSlot():
                 return LowUirBuildArgSlotFailed
             add(argSlots, slot)
 
-        -- Append call op.
         let callOrdinal = bodyIR.callSequence.len
         var bodyCall: coreir.CallOp
         bodyCall.targetSymbol = stmt.callTarget
@@ -210,34 +248,55 @@ fn lowUirBuildFromStatements(bodyIR: var coreir.BodyIR,
         op.target = resultSlot
         add(bodyIR.ops, op)
 
-        if stmt.returnRoot:
-            hasReturnStmt = true
-
-    if !hasReturnStmt:
-        return LowUirBuildUnsupportedReturn
-
-    -- Add return op based on last call's result type.
-    let lastCallSlot = bodyIR.ops[len(bodyIR.ops) - 1].target
-    var returnOp: coreir.BodyOp
-    returnOp.kind = coreir.BodyOpReturnTag
-    if lastCallSlot >= 0 && lastCallSlot < bodyIR.localSlots.len:
-        returnOp.target = lastCallSlot
-        add(returnOp.operands, bodyIR.localSlots[lastCallSlot].typeKind)
-    else:
-        returnOp.target = -1
-        add(returnOp.operands, coreir.LocalI32Tag)
-    add(bodyIR.ops, returnOp)
-
     return LowUirBuildOk
 
---- Try to build a generic BodyIR from backend-adapted LowUirStatement records.
---- The backend lowering layer owns adapting its richer statement records into
---- this dependency-free IR shape.
-fn lowUirTryBuildFromStatements(bodyIR: var coreir.BodyIR,
-                                 stmts: LowUirStatement[],
-                                 stmtCount: int32,
-                                 paramSlots: int32[],
-                                 paramNames: str[]): LowUirBuildResult =
+fn lowUirAppendReturn(bodyIR: var coreir.BodyIR,
+                       returnSlot: int32,
+                       returnTypeRaw: str): LowUirBuildResult =
+    var typeKind = lowUirLocalTypeKind(returnTypeRaw)
+    if returnSlot >= 0 && returnSlot < bodyIR.localSlots.len:
+        typeKind = bodyIR.localSlots[returnSlot].typeKind
+    if typeKind == coreir.LocalInvalidTag:
+        return LowUirBuildUnsupportedReturn
+    var returnOp: coreir.BodyOp
+    returnOp.kind = coreir.BodyOpReturnTag
+    returnOp.target = returnSlot
+    add(returnOp.operands, typeKind)
+    add(bodyIR.ops, returnOp)
+    return LowUirBuildOk
+
+fn lowUirBuildFromStatements(bodyIR: var coreir.BodyIR,
+                              stmts: LowUirStatement[],
+                              stmtCount: int32,
+                              paramSlots: int32[],
+                              paramNames: str[]): LowUirBuildResult =
+    let callRes = lowUirAppendCallStatements(bodyIR,
+                                             stmts,
+                                             stmtCount,
+                                             paramSlots,
+                                             paramNames)
+    if callRes != LowUirBuildOk:
+        return callRes
+    var returnSlot: int32 = -1
+    var returnType = ""
+    var hasReturnStmt = false
+    for stmtIndex in 0..<stmtCount:
+        let stmt = stmts[stmtIndex]
+        if !stmt.returnRoot:
+            continue
+        hasReturnStmt = true
+        if stmtIndex >= 0 && stmtIndex < bodyIR.callSequence.len:
+            returnSlot = bodyIR.callSequence[stmtIndex].resultSlot
+        returnType = stmt.resultType
+    if !hasReturnStmt:
+        return LowUirBuildUnsupportedReturn
+    return lowUirAppendReturn(bodyIR, returnSlot, returnType)
+
+fn lowUirTryBuildCallsFromStatements(bodyIR: var coreir.BodyIR,
+                                      stmts: LowUirStatement[],
+                                      stmtCount: int32,
+                                      paramSlots: int32[],
+                                      paramNames: str[]): LowUirBuildResult =
     if stmtCount <= 0:
         return LowUirBuildNoStatements
 
@@ -253,8 +312,45 @@ fn lowUirTryBuildFromStatements(bodyIR: var coreir.BodyIR,
         return LowUirBuildNoStatements
 
     bodyIR = coreir.BodyIR()
+    return lowUirAppendCallStatements(bodyIR,
+                                      stmts,
+                                      stmtCount,
+                                      paramSlots,
+                                      paramNames)
+
+fn lowUirTryBuildFromStatements(bodyIR: var coreir.BodyIR,
+                                 stmts: LowUirStatement[],
+                                 stmtCount: int32,
+                                 paramSlots: int32[],
+                                 paramNames: str[]): LowUirBuildResult =
+    if stmtCount <= 0:
+        return LowUirBuildNoStatements
+
+    bodyIR = coreir.BodyIR()
     return lowUirBuildFromStatements(bodyIR,
                                      stmts,
                                      stmtCount,
                                      paramSlots,
                                      paramNames)
+
+fn LowUirTryBuildCallsFromStatements(bodyIR: var coreir.BodyIR,
+                                      stmts: LowUirStatement[],
+                                      stmtCount: int32,
+                                      paramSlots: int32[],
+                                      paramNames: str[]): LowUirBuildResult =
+    return lowUirTryBuildCallsFromStatements(bodyIR,
+                                             stmts,
+                                             stmtCount,
+                                             paramSlots,
+                                             paramNames)
+
+fn LowUirTryBuildFromStatements(bodyIR: var coreir.BodyIR,
+                                 stmts: LowUirStatement[],
+                                 stmtCount: int32,
+                                 paramSlots: int32[],
+                                 paramNames: str[]): LowUirBuildResult =
+    return lowUirTryBuildFromStatements(bodyIR,
+                                        stmts,
+                                        stmtCount,
+                                        paramSlots,
+                                        paramNames)

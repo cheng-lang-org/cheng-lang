@@ -1,0 +1,110 @@
+# backend future fixture: Mach-O object linker parser/patch smoke body.
+# current blocker: active min driver cannot compile this Result/assert-heavy test shape yet.
+
+import std/result
+import std/rawbytes
+import cheng/core/backend/macho_object_linker as molink
+import cheng/core/backend/macho_object_writer as macho
+import cheng/core/backend/object_buffer as obuf
+import cheng/core/backend/object_symbols as osym
+import cheng/core/backend/object_relocs as orel
+
+fn smokePatchWord(data: rawbytes.Bytes, offset: int32): int64 =
+    let wordRes = molink.MachOReadU32LE(data, offset)
+    assert(IsOk(wordRes), " macho object linker smoke: read patched word")
+    return Value(wordRes)
+
+fn main(): int32 =
+    let fixturePath = "tests/cheng/backend/fixtures/return_add.o"
+    var fixtureRes = molink.MachOObjectParseFile(fixturePath)
+    assert(IsOk(fixtureRes), " macho object linker smoke: parse fixture")
+    var fixtureObj = Value(fixtureRes)
+    assert(fixtureObj.cpuType == int64(0x0100000C), " macho object linker smoke: fixture arm64")
+    assert(fixtureObj.fileType == int64(1), " macho object linker smoke: fixture object")
+    assert(fixtureObj.loadCommands.len == 4, " macho object linker smoke: fixture load commands")
+    assert(fixtureObj.sections.len == 1, " macho object linker smoke: fixture sections")
+    assert(fixtureObj.symbols.len == 1, " macho object linker smoke: fixture symbols")
+    assert(fixtureObj.sections[0].sectname == "__text", " macho object linker smoke: fixture text section")
+    molink.MachOObjectFree(fixtureObj)
+
+    var text = obuf.ObjectBufferInit(32)
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x94000000))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x90000010))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0x91000210))
+    obuf.ObjectBufferWriteU32LE(text, uint64(0xd65f03c0))
+    let textBytes = obuf.ObjectBufferToBytes(text)
+
+    var data = obuf.ObjectBufferInit(16)
+    obuf.ObjectBufferWriteZeros(data, 16)
+    let dataBytes = obuf.ObjectBufferToBytes(data)
+
+    var symbols = osym.ObjectSymbolsInit()
+    let mainIndex = osym.ObjectSymbolsAddDefined(symbols,
+                                                 "_macho_object_linker_smoke_main",
+                                                 0,
+                                                 int64(0),
+                                                 int64(rawbytes.bytesLen(textBytes)),
+                                                 true)
+    let calleeIndex = osym.ObjectSymbolsAddDefined(symbols,
+                                                   "_macho_object_linker_smoke_callee",
+                                                   0,
+                                                   int64(12),
+                                                   int64(4),
+                                                   true)
+    let dataIndex = osym.ObjectSymbolsAddDefined(symbols,
+                                                 "_macho_object_linker_smoke_data",
+                                                 1,
+                                                 int64(0),
+                                                 int64(16),
+                                                 false)
+    assert(mainIndex == 0, " macho object linker smoke: main symbol index")
+    assert(calleeIndex == 1, " macho object linker smoke: callee symbol index")
+    assert(dataIndex == 2, " macho object linker smoke: data symbol index")
+
+    var relocs = orel.ObjectRelocsInit()
+    let _ = orel.ObjectRelocsAdd(relocs, 0, int64(0), calleeIndex, orel.ObjectRelocBranch26, int64(0), true)
+    let _ = orel.ObjectRelocsAdd(relocs, 0, int64(4), dataIndex, orel.ObjectRelocPage21, int64(0), true)
+    let _ = orel.ObjectRelocsAdd(relocs, 0, int64(8), dataIndex, orel.ObjectRelocPageOff12, int64(0), false)
+
+    let objectBytesRes = macho.MachOTextDataObjectBytes(textBytes, dataBytes, symbols, relocs)
+    assert(IsOk(objectBytesRes), " macho object linker smoke: generate object")
+    var objectBytes = Value(objectBytesRes)
+    var objectRes = molink.MachOObjectParseBytes("<generated>", objectBytes)
+    assert(IsOk(objectRes), " macho object linker smoke: parse generated")
+    var objectFile = Value(objectRes)
+    assert(objectFile.loadCommands.len == 2, " macho object linker smoke: generated load command count")
+    assert(objectFile.sections.len == 2, " macho object linker smoke: generated section count")
+    assert(objectFile.symbols.len == 3, " macho object linker smoke: generated symbol count")
+    assert(objectFile.sections[0].relocs.len == 3, " macho object linker smoke: generated reloc count")
+    assert(objectFile.sections[0].relocs[0].relocType == 2, " macho object linker smoke: branch reloc")
+    assert(objectFile.sections[0].relocs[1].relocType == 3, " macho object linker smoke: page reloc")
+    assert(objectFile.sections[0].relocs[2].relocType == 4, " macho object linker smoke: pageoff reloc")
+
+    var patchBytes = rawbytes.bytesAlloc(12)
+    let writeBlRes = molink.MachOWriteU32LE(patchBytes, 0, int64(2483027968))
+    let writeAdrpRes = molink.MachOWriteU32LE(patchBytes, 4, int64(2415919120))
+    let writeAddRes = molink.MachOWriteU32LE(patchBytes, 8, int64(2432696320))
+    assert(IsOk(writeBlRes), " macho object linker smoke: write bl")
+    assert(IsOk(writeAdrpRes), " macho object linker smoke: write adrp")
+    assert(IsOk(writeAddRes), " macho object linker smoke: write add")
+    let blPatchRes = molink.MachOPatchBlInBytes(patchBytes, 0, int64(0), int64(16))
+    let adrpPatchRes = molink.MachOPatchAdrpInBytes(patchBytes, 4, int64(0x1000), int64(0x5000))
+    let addPatchRes = molink.MachOPatchPageOff12InBytes(patchBytes, 8, int64(0x120))
+    assert(IsOk(blPatchRes), " macho object linker smoke: patch bl")
+    assert(IsOk(adrpPatchRes), " macho object linker smoke: patch adrp")
+    assert(IsOk(addPatchRes), " macho object linker smoke: patch pageoff add")
+    assert(smokePatchWord(patchBytes, 0) == int64(2483027972), " macho object linker smoke: patched bl word")
+    assert(smokePatchWord(patchBytes, 4) == int64(2415919152), " macho object linker smoke: patched adrp word")
+    assert(smokePatchWord(patchBytes, 8) == int64(2432991232), " macho object linker smoke: patched pageoff word")
+    let badPatchRes = molink.MachOPatchBlInBytes(patchBytes, 0, int64(0), int64(2))
+    assert(IsErr(badPatchRes), " macho object linker smoke: bad bl hard fails")
+    let badReadRes = molink.MachOReadU32LE(patchBytes, 10)
+    assert(IsErr(badReadRes), " macho object linker smoke: out of range read hard fails")
+
+    molink.MachOObjectFree(objectFile)
+    rawbytes.BytesFree(patchBytes)
+    rawbytes.BytesFree(objectBytes)
+    rawbytes.BytesFree(dataBytes)
+    rawbytes.BytesFree(textBytes)
+    echo("macho_object_linker_smoke ok")
+    return 0

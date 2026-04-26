@@ -180,3 +180,4 @@
 - BodyIR direct writer 生成 ARM64 动态寄存器字段时，不要写 `baseWord + argIndex`；当前自举链可能把字段反向打坏成 `wzr/x30`。用小步进 register encoder，并用 2 个以上实参的 `otool -tV` 验证。
 - Darwin arm64 第 9 个及以后调用实参必须在 call 前临时 `sub sp` 写入 outgoing stack arg area，call 后立刻 `add sp`；读取 caller frame 的局部/保存参数要用稳定的 `x29` 基址，不能用已下调的 `sp`。
 - pure self-build 报 `body_ir_call_ops_...` 且函数包含错误分支/早返回时，不能靠扩大帧或当直线 call sequence 放行；下一段必须 lowering 成 guard/return CFG，否则会无条件执行失败分支。
+- 未跟踪文件也要先确认归属；不是自己明确创建或被用户指定处理的文件，不能删除、重命名或重写。误删后先原样恢复，再继续自己的范围。

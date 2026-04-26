@@ -1326,6 +1326,15 @@ fn cheng_fwrite(buf: ptr, size: int64, n: int64, stream: ptr): int32 =
 
 fn cheng_fwrite_i32(buf: ptr, size: int32, n: int32, stream: ptr): int32 =
     return cheng_fwrite(buf, int64(size), int64(n), stream)
+
+fn cheng_stderr_write_line_str_return2(text: str): int32 =
+    let n: int32 = cheng_runtime_str_len(text)
+    let data: ptr = cheng_runtime_str_data(text)
+    if data != nil && n > 0:
+        let ignoredText = cheng_fwrite(data, int64(1), int64(n), get_stderr())
+    let ignoredNewline = cheng_fwrite("\n", int64(1), int64(1), get_stderr())
+    return 2
+
 fn cheng_fflush(stream: ptr): int32 =
     stream
     return 0
@@ -1939,6 +1948,35 @@ fn cheng_runtime_str_dispose(value: var str) =
     if value.flags == chengStrFlagOwned && value.data != nil:
         chengFreeCompat(value.data)
     value = cheng_runtime_str_empty()
+
+fn cheng_exec_program_seq_add(out: var str[], value: str) =
+    let seqPtr: ptr = &out
+    let hdr: ChengSeqHeaderPtr = ChengSeqHeaderPtr(seqPtr)
+    let slot: ptr = cheng_seq_set_grow(seqPtr, hdr->len, int32(sizeof(str)))
+    store_str_export(slot, value)
+
+fn driver_c_raw_env_truthy(name: ptr): bool =
+    let raw: ptr = cheng_getenv_export(name)
+    if raw == nil:
+        return false
+    let n: int32 = cheng_strlen_runtime(raw)
+    if n <= 0:
+        return false
+    if n == 1 && *(UInt8Ptr(raw)) == uint8(int32('0')):
+        return false
+    if n == 5 && cheng_runtime_bytes_equal(raw, "false", 5):
+        return false
+    return true
+
+fn driver_c_progress_line(phase: str,
+                           status: str): str =
+    var p0: str = driver_c_str_concat_bridge_export("compile_progress phase=", phase)
+    var p1: str = driver_c_str_concat_bridge_export(p0, " status=")
+    let line: str = driver_c_str_concat_bridge_export(p1, status)
+    cheng_runtime_str_dispose(p0)
+    cheng_runtime_str_dispose(p1)
+    return line
+
 @exportc("cheng_tcp_bridge_str_dispose_bridge")
 fn cheng_tcp_bridge_str_dispose_bridge_export(value: var str) =
     cheng_runtime_str_dispose(value)
@@ -2408,6 +2446,22 @@ fn driver_c_cli_param1_eq_bridge_export(expected: str): bool =
         return true
     return false
 
+@exportc("driver_c_cli_param1_bridge")
+fn driver_c_cli_param1_bridge_export(): str =
+    if paramCount() <= 1:
+        return cheng_runtime_str_empty()
+    return paramStr(1)
+
+@exportc("driver_c_collect_args_after_command_bridge")
+fn driver_c_collect_args_after_command_bridge_export(): str[] =
+    var out: str[]
+    let count: int32 = paramCount_export()
+    if count < 2:
+        return out
+    for i in 2..count:
+        cheng_exec_program_seq_add(out, paramStr(i))
+    return out
+
 @exportc("driver_c_read_flag_or_default_bridge")
 fn driver_c_read_flag_or_default_bridge_export(key: str, defaultValue: str): str =
     let defaultData: ptr = cheng_runtime_str_data(defaultValue)
@@ -2676,6 +2730,18 @@ fn driver_c_str_eq_bridge_export(a: str, b: str): int32 =
     if lenA <= 0:
         return 1
     return cheng_runtime_bytes_equal(cheng_runtime_str_data(a), cheng_runtime_str_data(b), lenA) ? 1 : 0
+
+@exportc("driver_c_stderr_line_return2_bridge")
+fn driver_c_stderr_line_return2_bridge_export(text: str): int32 =
+    return cheng_stderr_write_line_str_return2(text)
+
+@exportc("driver_c_progress_bridge")
+fn driver_c_progress_bridge_export(phase: str, status: str): int32 =
+    if driver_c_raw_env_truthy("CHENG_PROGRESS"):
+        var line: str = driver_c_progress_line(phase, status)
+        let ignoredProgressWrite = cheng_stderr_write_line_str_return2(line)
+        cheng_runtime_str_dispose(line)
+    return 0
 
 @exportc("__cheng_str_concat")
 fn cheng_runtime_raw_concat_export(a: ptr, b: ptr): ptr =

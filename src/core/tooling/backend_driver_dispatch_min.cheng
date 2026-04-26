@@ -44,24 +44,31 @@ fn BackendDriverDispatchMinExitBridge(code: int32)
 @importc("puts")
 fn BackendDriverDispatchMinPutsBridge(line: ptr): int32
 
+@importc("driver_c_stderr_line_return2_bridge")
+fn BackendDriverDispatchMinStderrLineBridge(text: str): int32
+
+@importc("driver_c_progress_bridge")
+fn BackendDriverDispatchMinProgressBridge(phase: str,
+                                           status: str): int32
+
 const
     BackendDriverDispatchMinProcessMemoryExceeded = 125
     BackendDriverDispatchMinRusageSelf = 0
 
-fn BackendDriverDispatchMinPrintErr(text: str) =
-    os.WriteLine(os.GetStderr(), text)
+fn BackendDriverDispatchMinPrintErr(text: str): int32 =
+    return BackendDriverDispatchMinStderrLineBridge(text)
 
 fn BackendDriverDispatchMinEnsureParentDir(rootDir: str,
                                             pathRaw: str): bool =
     let parent = chengpath.PathParentDir(chengpath.PathAbsolute(rootDir, pathRaw))
-    if len(parent) <= 0:
+    if Len(parent) <= 0:
         return true
     return chengpath.MkdirP(rootDir, parent)
 
 fn BackendDriverDispatchMinWriteReport(rootDir: str,
                                         reportPath: str,
                                         reportText: str): bool =
-    if len(reportPath) <= 0:
+    if Len(reportPath) <= 0:
         return true
     if !BackendDriverDispatchMinEnsureParentDir(rootDir, reportPath):
         return false
@@ -69,55 +76,55 @@ fn BackendDriverDispatchMinWriteReport(rootDir: str,
 
 fn BackendDriverDispatchMinAppendLine(out: var str,
                                        line: str) =
-    if len(out) > 0:
+    if Len(out) > 0:
         out = Fmt"{out}\n"
     out = Fmt"{out}{line}"
 
 fn BackendDriverDispatchMinParseUnsignedInt64(raw: str): int64 =
-    if len(raw) <= 0:
-        return int64(-1)
+    if Len(raw) <= 0:
+        return Int64(-1)
     var value: int64
     var hadDigit = false
     var trailingSpace = false
-    for i in 0..<len(raw):
+    for i in 0..<Len(raw):
         let ch = raw[i]
         if ch >= '0' && ch <= '9':
             if trailingSpace:
-                return int64(-1)
-            value = value * int64(10) + int64(int32(ch) - int32('0'))
+                return Int64(-1)
+            value = value * Int64(10) + Int64(Int32(ch) - Int32('0'))
             hadDigit = true
         elif ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r':
             if hadDigit:
                 trailingSpace = true
         else:
-            return int64(-1)
+            return Int64(-1)
     if !hadDigit:
-        return int64(-1)
+        return Int64(-1)
     return value
 
 fn BackendDriverDispatchMinDefaultMaxRssBytes(): int64 =
-    return int64(8589934592)
+    return Int64(8589934592)
 
 fn BackendDriverDispatchMinConfiguredMaxRssBytes(): int64 =
     let parentGuardRaw = os.GetEnv("CHENG_PARENT_RSS_GUARD")
     if strings.Len(parentGuardRaw) > 0:
-        return int64(0)
+        return Int64(0)
     var raw = os.GetEnv("CHENG_PROCESS_MAX_RSS_BYTES")
     if strings.Len(raw) <= 0:
         raw = os.GetEnv("CHENG_MAX_RSS_BYTES")
     if strings.Len(raw) <= 0:
         return BackendDriverDispatchMinDefaultMaxRssBytes()
     let parsed = BackendDriverDispatchMinParseUnsignedInt64(raw)
-    if parsed <= int64(0):
-        return int64(-1)
+    if parsed <= Int64(0):
+        return Int64(-1)
     return parsed
 
 fn BackendDriverDispatchMinCurrentRssBytes(): int64 =
     var usage: BackendDriverDispatchMinRusage
     if BackendDriverDispatchMinGetrusageBridge(BackendDriverDispatchMinRusageSelf, usage) != 0:
-        return int64(-1)
-    if usage.ru_maxrss <= int64(0):
-        return int64(-1)
+        return Int64(-1)
+    if usage.ru_maxrss <= Int64(0):
+        return Int64(-1)
     return usage.ru_maxrss
 
 fn BackendDriverDispatchMinMemoryLimitExceededLine(rssBytes: int64,
@@ -125,13 +132,13 @@ fn BackendDriverDispatchMinMemoryLimitExceededLine(rssBytes: int64,
     return Fmt"compile_progress phase=resource_guard status=rss_limit_exceeded rss_bytes={rssBytes} limit_bytes={maxRssBytes}"
 
 fn BackendDriverDispatchMinResourceGuardCheckWithMax(maxRssBytes: int64) =
-    if maxRssBytes == int64(0):
+    if maxRssBytes == Int64(0):
         return
-    if maxRssBytes < int64(0):
+    if maxRssBytes < Int64(0):
         BackendDriverDispatchMinPrintErr("compile_progress phase=resource_guard status=invalid_max_rss")
         BackendDriverDispatchMinExitBridge(2)
     let rssBytes = BackendDriverDispatchMinCurrentRssBytes()
-    if rssBytes <= int64(0):
+    if rssBytes <= Int64(0):
         BackendDriverDispatchMinPrintErr("compile_progress phase=resource_guard status=rss_unavailable")
         BackendDriverDispatchMinExitBridge(2)
     if rssBytes > maxRssBytes:
@@ -144,21 +151,30 @@ fn BackendDriverDispatchMinProgressResourceGuardCheck() =
 
 fn BackendDriverDispatchMinProgressEnabled(): bool =
     let raw = os.GetEnv("CHENG_PROGRESS")
-    return len(raw) > 0 && raw != "0" && raw != "false"
+    return Len(raw) > 0 && raw != "0" && raw != "false"
 
 fn BackendDriverDispatchMinProgress(phase: str,
-                                     status: str) =
-    BackendDriverDispatchMinProgressResourceGuardCheck()
-    if BackendDriverDispatchMinProgressEnabled():
-        os.WriteLine(os.GetStderr(), Fmt"compile_progress phase={phase} status={status}")
+                                     status: str): int32 =
+    return BackendDriverDispatchMinProgressBridge(phase, status)
 
 fn BackendDriverDispatchMinUnsupported(reason: str): int32 =
-    BackendDriverDispatchMinPrintErr(reason)
-    return 2
+    return BackendDriverDispatchMinPrintErr(reason)
 
 @importc("driver_c_collect_args_from_bridge")
 fn BackendDriverDispatchMinCollectArgsFrom(startIndex: int32,
-                                            count: int32): str[]
+                                           count: int32): str[]
+
+@importc("driver_c_collect_args_after_command_bridge")
+fn BackendDriverDispatchMinCollectArgsAfterCommandBridge(): str[]
+
+@importc("driver_c_cli_param1_bridge")
+fn BackendDriverDispatchMinCliParam1Bridge(): str
+
+@importc("driver_c_get_current_dir_bridge")
+fn BackendDriverDispatchMinCurrentDirBridge(): str
+
+@importc("paramCount")
+fn BackendDriverDispatchMinParamCountBridge(): int32
 
 fn BackendDriverDispatchMinStatus(): int32 =
     BackendDriverDispatchMinPutsBridge("cheng")
@@ -172,7 +188,15 @@ fn BackendDriverDispatchMinStatus(): int32 =
     return 0
 
 fn BackendDriverDispatchMinStatusFromCmdline(): int32 =
-    return BackendDriverDispatchMinStatus()
+    BackendDriverDispatchMinPutsBridge("cheng")
+    BackendDriverDispatchMinPutsBridge("version=cheng.compiler_runtime.v1")
+    BackendDriverDispatchMinPutsBridge("execution=argv_control_plane")
+    BackendDriverDispatchMinPutsBridge("bootstrap_mode=selfhost")
+    BackendDriverDispatchMinPutsBridge("compiler_entry=src/core/tooling/backend_driver_dispatch_min.cheng")
+    BackendDriverDispatchMinPutsBridge("ordinary_command=system-link-exec")
+    BackendDriverDispatchMinPutsBridge("ordinary_pipeline=canonical_csg_verified_primary_object_codegen_ready")
+    BackendDriverDispatchMinPutsBridge("stage3=artifacts/bootstrap/cheng.stage3")
+    return 0
 
 fn BackendDriverDispatchMinPrintBuildPlan(): int32 =
     BackendDriverDispatchMinPutsBridge("target=arm64-apple-darwin")
@@ -191,7 +215,17 @@ fn BackendDriverDispatchMinPrintBuildPlanFromCmdline(): int32 =
     return BackendDriverDispatchMinPrintBuildPlan()
 
 fn BackendDriverDispatchMinPrintBuildPlanCommandFromCmdline(): int32 =
-    return BackendDriverDispatchMinPrintBuildPlanFromCmdline()
+    BackendDriverDispatchMinPutsBridge("target=arm64-apple-darwin")
+    BackendDriverDispatchMinPutsBridge("linker=system_link")
+    BackendDriverDispatchMinPutsBridge("stage2_compiler=artifacts/bootstrap/cheng.stage2")
+    BackendDriverDispatchMinPutsBridge("entry=src/core/tooling/backend_driver_dispatch_min.cheng")
+    BackendDriverDispatchMinPutsBridge("output=artifacts/backend_driver/cheng")
+    BackendDriverDispatchMinPutsBridge("source[0]=backend_driver_entry_source:src/core/tooling/backend_driver_dispatch_min.cheng")
+    BackendDriverDispatchMinPutsBridge("source[1]=backend_system_link_plan_source:src/core/backend/system_link_plan.cheng")
+    BackendDriverDispatchMinPutsBridge("source[2]=backend_lowering_plan_source:src/core/backend/lowering_plan.cheng")
+    BackendDriverDispatchMinPutsBridge("source[3]=backend_primary_object_plan_source:src/core/backend/primary_object_plan.cheng")
+    BackendDriverDispatchMinPutsBridge("source[4]=backend_direct_object_emit_source:src/core/backend/direct_object_emit.cheng")
+    return 0
 
 fn BackendDriverDispatchMinHelp(): int32 =
     BackendDriverDispatchMinPutsBridge("usage: cheng <command> [args]")
@@ -200,13 +234,13 @@ fn BackendDriverDispatchMinHelp(): int32 =
 
 fn BackendDriverDispatchMinCurrentCompiler(rootDir: str): str =
     let raw = cmdline.ProgramName()
-    if len(raw) <= 0:
+    if Len(raw) <= 0:
         return ""
     return chengpath.PathAbsolute(rootDir, raw)
 
 fn BackendDriverDispatchMinArtifactsDir(rootDir: str): str =
     let custom = os.GetEnv("CHENG_VERIFY_EXPORT_VISIBILITY_DIR")
-    if len(custom) > 0:
+    if Len(custom) > 0:
         return chengpath.PathAbsolute(rootDir, custom)
     return chengpath.PathAbsolute(rootDir, "artifacts/forward/verify_export_visibility")
 
@@ -237,7 +271,7 @@ fn BackendDriverDispatchMinCompileFixture(rootDir: str,
                                            outOutput: var str): int32 =
     let reportPath = Fmt"{outPath}.report.txt"
     let command = Fmt"CHENG_PARENT_RSS_GUARD=1 CHENG_PROGRESS=1 CHENG_PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(packageRoot)} --in:{os.QuoteShell(inputPath)} --emit:exe --target:arm64-apple-darwin --out:{os.QuoteShell(outPath)} --report-out:{os.QuoteShell(reportPath)}"
-    let run = os.ExecShellCmdEx(command, uint64(1), rootDir)
+    let run = os.ExecShellCmdEx(command, UInt64(1), rootDir)
     outOutput = os.ExecCmdResultOutput(run)
     let _ = chengpath.WriteTextFile(rootDir, logPath, outOutput)
     return os.ExecCmdResultExitCode(run)
@@ -246,7 +280,7 @@ fn BackendDriverDispatchMinRunExecutable(rootDir: str,
                                           exePath: str,
                                           logPath: str): int32 =
     let command = os.QuoteShell(exePath)
-    let run = os.ExecShellCmdEx(command, uint64(1), rootDir)
+    let run = os.ExecShellCmdEx(command, UInt64(1), rootDir)
     let _ = chengpath.WriteTextFile(rootDir, logPath, os.ExecCmdResultOutput(run))
     return os.ExecCmdResultExitCode(run)
 
@@ -473,7 +507,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteFields(driverRoot: str,
         return BackendDriverDispatchMinUnsupported(err)
     BackendDriverDispatchMinProgress("system_link_plan", "done")
     BackendDriverDispatchMinProgress("compiler_csg", "begin")
-    let sourceBundleRes = slplan.SystemLinkPlanSourceBundleCid(linkPlan)
+    let sourceBundleRes = linkPlan.sourceBundleCid
     if IsErr(sourceBundleRes):
         let sourceBundleErr = Error(sourceBundleRes)
         let _ = BackendDriverDispatchMinWriteReport(driverRoot,
@@ -525,7 +559,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteFields(driverRoot: str,
         BackendDriverDispatchMinPrintErr("backend driver direct system-link-exec: plan not ready")
         return 2
     let planBrowserBridgeObjectPath = slplan.SystemLinkPlanBrowserBridgeObjectPath(linkPlan)
-    if len(planBrowserBridgeObjectPath) > 0:
+    if Len(planBrowserBridgeObjectPath) > 0:
         return BackendDriverDispatchMinUnsupported("backend driver direct system-link-exec: browser bridge object not yet in direct runtime")
     if linkPlan.emitKind == creq.EmitObj:
         if !direct.DirectObjectEmitCanPlanObject(primaryPlan):
@@ -585,7 +619,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteFields(driverRoot: str,
         let outputPath = chengpath.PathAbsolute(driverRoot, linkPlan.outputPath)
         let nativeCommand = Fmt"cc -arch arm64 {os.QuoteShell(objectPath)} -o {os.QuoteShell(outputPath)}"
         BackendDriverDispatchMinProgress("native_link", "begin")
-        let nativeRun = os.ExecShellCmdEx(nativeCommand, uint64(1), driverRoot)
+        let nativeRun = os.ExecShellCmdEx(nativeCommand, UInt64(1), driverRoot)
         BackendDriverDispatchMinProgress("native_link", "done")
         let _ = BackendDriverDispatchMinWriteReport(driverRoot,
                                                     nativeLinkLogPath,
@@ -635,7 +669,7 @@ fn BackendDriverDispatchMinReadFlagOrDefault(args: str[],
 fn BackendDriverDispatchMinReadEmitKind(raw: str,
                                          emitKind: var creq.CompilerEmit,
                                          err: var str): bool =
-    if len(raw) <= 0 || raw == "exe":
+    if Len(raw) <= 0 || raw == "exe":
         emitKind = creq.EmitExe
         err = ""
         return true
@@ -653,7 +687,7 @@ fn BackendDriverDispatchMinReadEmitKind(raw: str,
 fn BackendDriverDispatchMinReadSymbolVisibility(raw: str,
                                                   visibility: var str,
                                                   err: var str): bool =
-    if len(raw) <= 0 || raw == "public":
+    if Len(raw) <= 0 || raw == "public":
         visibility = "public"
         err = ""
         return true
@@ -667,18 +701,18 @@ fn BackendDriverDispatchMinReadSymbolVisibility(raw: str,
 fn BackendDriverDispatchMinRunSystemLinkExec(rootDir: str,
                                               args: str[]): int32 =
     let sourcePath = BackendDriverDispatchMinReadFlagOrDefault(args, "--in", "")
-    if len(sourcePath) <= 0:
+    if Len(sourcePath) <= 0:
         return BackendDriverDispatchMinUnsupported(" compiler: missing --in")
     var packageRoot = BackendDriverDispatchMinReadFlagOrDefault(args, "--root", "")
-    if len(packageRoot) <= 0:
+    if Len(packageRoot) <= 0:
         packageRoot = rootDir
     else:
         packageRoot = chengpath.PathAbsolute(rootDir, packageRoot)
     let outputPath = BackendDriverDispatchMinReadFlagOrDefault(args, "--out", "")
-    if len(outputPath) <= 0:
+    if Len(outputPath) <= 0:
         return BackendDriverDispatchMinUnsupported(" compiler: missing --out")
     var targetTriple = BackendDriverDispatchMinReadFlagOrDefault(args, "--target", "")
-    if len(targetTriple) <= 0:
+    if Len(targetTriple) <= 0:
         targetTriple = "arm64-apple-darwin"
     let emitKind = creq.EmitExe
     let symbolVisibility = "public"
@@ -700,11 +734,11 @@ fn BackendDriverDispatchMinRunSystemLinkExecFromCmdlineCount(rootDir: str,
     return BackendDriverDispatchMinRunSystemLinkExec(rootDir, args)
 
 fn BackendDriverDispatchMinRunSystemLinkExecFromCmdline(rootDir: str): int32 =
-    let count = cmdline.ParamCount()
-    return BackendDriverDispatchMinRunSystemLinkExecFromCmdlineCount(rootDir, count)
+    let args: str[] = BackendDriverDispatchMinCollectArgsAfterCommandBridge()
+    return BackendDriverDispatchMinRunSystemLinkExec(rootDir, args)
 
 fn BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline(): int32 =
-    let rootDir = chengpath.PathCurrentDir()
+    let rootDir: str = BackendDriverDispatchMinCurrentDirBridge()
     return BackendDriverDispatchMinRunSystemLinkExecFromCmdline(rootDir)
 
 fn BackendDriverDispatchMinRunCommandWithCmd(cmd: str): int32 =
@@ -723,14 +757,15 @@ fn BackendDriverDispatchMinRunCommandWithCmd(cmd: str): int32 =
     return 2
 
 fn BackendDriverDispatchMinRunCommand(): int32 =
-    let cmd = cmdline.ParamStr(1)
+    let cmd: str = BackendDriverDispatchMinCliParam1Bridge()
     return BackendDriverDispatchMinRunCommandWithCmd(cmd)
 
 fn BackendDriverDispatchMinRun(): int32 =
-    let count = cmdline.ParamCount()
+    let count: int32 = BackendDriverDispatchMinParamCountBridge()
     if count <= 0:
         return 0
     return BackendDriverDispatchMinRunCommand()
 
 fn main(argc: int32, argv: str*): int32 =
-    return BackendDriverDispatchMinRun()
+    let code: int32 = BackendDriverDispatchMinRun()
+    return code

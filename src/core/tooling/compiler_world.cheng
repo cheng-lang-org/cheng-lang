@@ -3,7 +3,6 @@ import std/system as system
 import std/strutils as strutil
 import cheng/std/bytes_layout as layout
 import cheng/std/crypto/hash256
-import cheng/chain/lsmr_types as lt
 import cheng/core/tooling/path as chengpath
 import cheng/core/lang/parser
 
@@ -81,7 +80,7 @@ fn CompilerWorldOwnText(text: str): str =
 
 fn CompilerWorldNormalizeChannel(raw: str): Result[str] =
     let channel = strutil.Strip(raw)
-    if len(channel) <= 0:
+    if channel.len <= 0:
         return Ok[str](CompilerWorldDefaultChannel())
     if channel != "stable":
         if channel != "edge":
@@ -90,7 +89,7 @@ fn CompilerWorldNormalizeChannel(raw: str): Result[str] =
 
 fn CompilerManagedMirrorKey(text: str): str =
     var out = ""
-    for i in 0..<len(text):
+    for i in 0..<text.len:
         let ch = text[i]
         let digit = ch >= '0' && ch <= '9'
         let upper = ch >= 'A' && ch <= 'Z'
@@ -99,7 +98,7 @@ fn CompilerManagedMirrorKey(text: str): str =
             out = strutil.Join([out, chengpath.TextSlice(text, i, 1)], "")
         else:
             out = strutil.Join([out, "_"], "")
-    if len(out) <= 0:
+    if out.len <= 0:
         return "pkg"
     return out
 
@@ -118,24 +117,30 @@ fn CompilerManagedMirrorRoot(rootDir: str,
                                                             packageId,
                                                             migrationProofCid))
 
+fn CompilerWorldAppendU32BE(buf: var layout.ByteBuf, value: int64) =
+    layout.ByteBufAppendByte(buf, (value >> 24) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 16) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 8) & 255)
+    layout.ByteBufAppendByte(buf, value & 255)
+
 fn CompilerWorldAppendText(buf: var layout.ByteBuf, text: str) =
-    lt.AppendU32BE(buf, len(text))
-    for i in 0..<len(text):
-        layout.ByteBufAppendByte(buf, int32(text[i]) & 255)
+    CompilerWorldAppendU32BE(buf, text.len)
+    for i in 0..<text.len:
+        layout.ByteBufAppendByte(buf, text[i])
 
 fn CompilerWorldAppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
-    lt.AppendFixed32(buf, value)
+    layout.ByteBufAppendBytes(buf, layout.FixedBytes32ToBytes(value))
 
 fn CompilerWorldBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
     let data = layout.ByteBufToBytes(buf)
-    return hash256.sha256Fixed(layout.ByteSpanFromBytes(data))
+    return hash256.Sha256Fixed(layout.ByteSpanFromBytes(data))
 
 fn CompilerWorldStrLess(left: str,
                           right: str): bool =
     if left == right:
         return false
-    let leftLen = len(left)
-    let rightLen = len(right)
+    let leftLen = left.len
+    let rightLen = right.len
     let sharedLen = leftLen < rightLen ? leftLen : rightLen
     for i in 0..<sharedLen:
         if left[i] == right[i]:
@@ -176,7 +181,7 @@ fn CompilerWorldSortPathTextPairs(paths: var str[],
 fn CompilerWorldHashText(tag: str, values: str[]): layout.FixedBytes32 =
     var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerWorldAppendText(buf, tag)
-    lt.AppendU32BE(buf, values.len)
+    CompilerWorldAppendU32BE(buf, values.len)
     for i in 0..<values.len:
         CompilerWorldAppendText(buf, values[i])
     return CompilerWorldBufCid(buf)
@@ -235,7 +240,7 @@ fn CompilerWorldHashUniverseManifest(channel: str,
     var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerWorldAppendText(buf, "cheng.compiler.universe_manifest")
     CompilerWorldAppendText(buf, channel)
-    lt.AppendU32BE(buf, ordered.len)
+    CompilerWorldAppendU32BE(buf, ordered.len)
     for i in 0..<ordered.len:
         CompilerWorldAppendText(buf, ordered[i].packageId)
         CompilerWorldAppendFixed32(buf, ordered[i].snapshotCid)
@@ -319,7 +324,7 @@ fn CompilerWorldHashHead(universeId: str,
     CompilerWorldAppendText(buf, "cheng.compiler.world_head")
     CompilerWorldAppendText(buf, universeId)
     CompilerWorldAppendText(buf, channel)
-    lt.AppendU32BE(buf, headEpoch)
+    CompilerWorldAppendU32BE(buf, headEpoch)
     CompilerWorldAppendFixed32(buf, prevHeadCid)
     CompilerWorldAppendFixed32(buf, manifestRootCid)
     CompilerWorldAppendFixed32(buf, csgRootCid)
@@ -330,9 +335,9 @@ fn CompilerWorldHashHead(universeId: str,
     return CompilerWorldBufCid(buf)
 
 fn CompilerWorldOwnedBytesFromText(text: str): Bytes =
-    var buf: layout.ByteBuf = layout.ByteBufInit(len(text) + 16)
-    for i in 0..<len(text):
-        layout.ByteBufAppendByte(buf, int32(text[i]) & 255)
+    var buf: layout.ByteBuf = layout.ByteBufInit(text.len + 16)
+    for i in 0..<text.len:
+        layout.ByteBufAppendByte(buf, text[i])
     return layout.ByteBufToBytes(buf)
 
 fn CompilerWorldSourceBundleCid(packageId: str,
@@ -344,7 +349,7 @@ fn CompilerWorldSourceBundleCid(packageId: str,
     var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerWorldAppendText(buf, "cheng.compiler.source_bundle")
     CompilerWorldAppendText(buf, packageId)
-    lt.AppendU32BE(buf, orderedPaths.len)
+    CompilerWorldAppendU32BE(buf, orderedPaths.len)
     for i in 0..<orderedPaths.len:
         let sourcePath = orderedPaths[i]
         CompilerWorldAppendText(buf, sourcePath)
@@ -370,7 +375,7 @@ fn CompilerWorldSourceBundleCidFromIdentityTexts(packageId: str,
     var buf: layout.ByteBuf = layout.ByteBufInit(256)
     CompilerWorldAppendText(buf, "cheng.compiler.source_bundle")
     CompilerWorldAppendText(buf, packageId)
-    lt.AppendU32BE(buf, orderedPaths.len)
+    CompilerWorldAppendU32BE(buf, orderedPaths.len)
     for i in 0..<orderedPaths.len:
         CompilerWorldAppendText(buf, orderedPaths[i])
         CompilerWorldAppendText(buf, orderedTexts[i])
@@ -484,7 +489,7 @@ fn CompilerWorldHeadMake(channel: str,
     CompilerWorldAppendText(buf, "cheng.compiler.world_head")
     CompilerWorldAppendText(buf, universeId)
     CompilerWorldAppendText(buf, channelOwned)
-    lt.AppendU32BE(buf, headEpoch)
+    CompilerWorldAppendU32BE(buf, headEpoch)
     CompilerWorldAppendFixed32(buf, prevHeadCid)
     CompilerWorldAppendFixed32(buf, manifestRootCid)
     CompilerWorldAppendFixed32(buf, csgRootCid)
@@ -639,9 +644,9 @@ fn CompilerLocalUniverseBuild(sourceBundleCid: layout.FixedBytes32,
 
 fn CompilerWorldQuotedValue(text: str): str =
     let value = strutil.Strip(text)
-    if len(value) < 2:
+    if value.len < 2:
         return value
-    return chengpath.TextSlice(value, 1, len(value) - 2)
+    return chengpath.TextSlice(value, 1, value.len - 2)
 
 fn CompilerWorldLineValue(text: str, key: str): str =
     let lines = strutil.Split(text, '\n')
@@ -649,7 +654,7 @@ fn CompilerWorldLineValue(text: str, key: str): str =
         let line = strutil.Strip(lines[i])
         var plainMatch = false
         if line.len > key.len:
-            if int32(line[key.len]) == 61:
+            if line[key.len] == '=':
                 plainMatch = true
         if plainMatch:
             for j in 0..<key.len:
@@ -657,13 +662,13 @@ fn CompilerWorldLineValue(text: str, key: str): str =
                     plainMatch = false
                     break
         if plainMatch:
-            let rawValue = chengpath.TextSlice(line, key.len + 1, len(line) - (key.len + 1))
+            let rawValue = chengpath.TextSlice(line, key.len + 1, line.len - (key.len + 1))
             return strutil.Strip(rawValue)
         var quotedMatch = false
         if line.len > key.len + 2:
-            if int32(line[key.len]) == 32:
-                if int32(line[key.len + 1]) == 61:
-                    if int32(line[key.len + 2]) == 32:
+            if line[key.len] == ' ':
+                if line[key.len + 1] == '=':
+                    if line[key.len + 2] == ' ':
                         quotedMatch = true
         if quotedMatch:
             for j in 0..<key.len:
@@ -671,13 +676,13 @@ fn CompilerWorldLineValue(text: str, key: str): str =
                     quotedMatch = false
                     break
         if quotedMatch:
-            let rawValue = chengpath.TextSlice(line, key.len + 3, len(line) - (key.len + 3))
+            let rawValue = chengpath.TextSlice(line, key.len + 3, line.len - (key.len + 3))
             return CompilerWorldQuotedValue(rawValue)
     return ""
 
 fn CompilerWorldFixed32Value(text: str, key: str): Result[layout.FixedBytes32] =
     let value = CompilerWorldLineValue(text, key)
-    if len(value) <= 0:
+    if value.len <= 0:
         return Err[layout.FixedBytes32](strutil.Join([" compiler world: missing key: ", key], ""))
     let valueRes = layout.FixedBytes32FromHex(value)
     if IsErr(valueRes):
@@ -686,9 +691,9 @@ fn CompilerWorldFixed32Value(text: str, key: str): Result[layout.FixedBytes32] =
 
 fn CompilerWorldInt32Value(text: str, key: str): Result[int32] =
     let value = CompilerWorldLineValue(text, key)
-    if len(value) <= 0:
+    if value.len <= 0:
         return Err[int32](strutil.Join([" compiler world: missing key: ", key], ""))
-    return Ok[int32](int32(parseInt(value)))
+    return Ok[int32](parseInt(value))
 
 fn CompilerUniverseManifestReport(manifest: CompilerUniverseManifest): str =
     var out = ""
@@ -719,7 +724,7 @@ fn CompilerUniverseManifestFromReportText(text: str,
     for i in 0..<entryCount:
         let prefix = strutil.Join(["entry[", IntToStr(i), "]."], "")
         let packageId = CompilerWorldLineValue(text, strutil.Join([prefix, "package_id"], ""))
-        if len(packageId) <= 0:
+        if packageId.len <= 0:
             return Err[bool](" compiler world: manifest entry package_id missing")
         let snapshotRes = CompilerWorldFixed32Value(text, strutil.Join([prefix, "snapshot_cid"], ""))
         if IsErr(snapshotRes):
@@ -729,7 +734,7 @@ fn CompilerUniverseManifestFromReportText(text: str,
             return Err[bool](Error(syntaxRes))
         let proofValue = CompilerWorldLineValue(text, strutil.Join([prefix, "migration_proof_cid"], ""))
         var proofCid = layout.FixedBytes32()
-        if len(proofValue) > 0:
+        if proofValue.len > 0:
             let proofRes = layout.FixedBytes32FromHex(proofValue)
             if IsErr(proofRes):
                 return Err[bool](" compiler world: invalid manifest migration proof cid")
@@ -757,7 +762,7 @@ fn CompilerLockSnapshotFromText(text: str,
         return Err[CompilerLockSnapshot](Error(worldHeadRes))
     let manifestRootValue = CompilerWorldLineValue(text, "manifest_root_cid")
     var manifestRootCid = layout.FixedBytes32()
-    if len(manifestRootValue) > 0:
+    if manifestRootValue.len > 0:
         let manifestRootRes = layout.FixedBytes32FromHex(manifestRootValue)
         if IsErr(manifestRootRes):
             return Err[CompilerLockSnapshot](" compiler world: invalid lock manifest_root_cid")
@@ -773,14 +778,14 @@ fn CompilerLockSnapshotFromText(text: str,
         return Err[CompilerLockSnapshot](Error(runtimeRes))
     let entryCountValue = CompilerWorldLineValue(text, "entry_count")
     var entryCount = 0
-    if len(entryCountValue) > 0:
-        entryCount = int32(parseInt(entryCountValue))
+    if entryCountValue.len > 0:
+        entryCount = parseInt(entryCountValue)
     var entries: CompilerUniverseManifestEntry[]
     if entryCount > 0:
         for i in 0..<entryCount:
             let prefix = strutil.Join(["entry[", IntToStr(i), "]."], "")
             let packageId = CompilerWorldLineValue(text, strutil.Join([prefix, "package_id"], ""))
-            if len(packageId) <= 0:
+            if packageId.len <= 0:
                 return Err[CompilerLockSnapshot](" compiler world: lock entry package_id missing")
             let snapshotRes = CompilerWorldFixed32Value(text, strutil.Join([prefix, "snapshot_cid"], ""))
             if IsErr(snapshotRes):
@@ -790,7 +795,7 @@ fn CompilerLockSnapshotFromText(text: str,
                 return Err[CompilerLockSnapshot](Error(syntaxRes))
             let proofValue = CompilerWorldLineValue(text, strutil.Join([prefix, "migration_proof_cid"], ""))
             var proofCid = layout.FixedBytes32()
-            if len(proofValue) > 0:
+            if proofValue.len > 0:
                 let proofRes = layout.FixedBytes32FromHex(proofValue)
                 if IsErr(proofRes):
                     return Err[CompilerLockSnapshot](" compiler world: invalid lock migration proof cid")
@@ -861,7 +866,7 @@ fn CompilerWorldVerifyLock(universe: CompilerLocalUniverse,
 fn CompilerWorldHeadMatchesHex(head: CompilerWorldHead,
                                  rawHex: str): Result[bool] =
     let value = strutil.Strip(rawHex)
-    if len(value) <= 0:
+    if value.len <= 0:
         return Ok[bool](true)
     let headRes = layout.FixedBytes32FromHex(value)
     if IsErr(headRes):
@@ -891,7 +896,7 @@ fn CompilerPackageSnapshotReport(snapshot: CompilerPackageSnapshot): str =
 fn CompilerPackageSnapshotFromReportText(text: str,
                                            out: var CompilerPackageSnapshot): Result[bool] =
     let packageId = CompilerWorldLineValue(text, "package_id")
-    if len(packageId) <= 0:
+    if packageId.len <= 0:
         return Err[bool](" compiler world: report package_id missing")
     let channelRes = CompilerWorldNormalizeChannel(CompilerWorldLineValue(text, "channel"))
     if IsErr(channelRes):
@@ -907,7 +912,7 @@ fn CompilerPackageSnapshotFromReportText(text: str,
         return Err[bool](Error(exportRes))
     let syntaxValue = CompilerWorldLineValue(text, "syntax_surface_cid")
     var syntaxSurfaceCid = layout.FixedBytes32()
-    if len(syntaxValue) > 0:
+    if syntaxValue.len > 0:
         let syntaxRes = layout.FixedBytes32FromHex(syntaxValue)
         if IsErr(syntaxRes):
             return Err[bool](" compiler world: invalid syntax surface cid")
@@ -916,35 +921,35 @@ fn CompilerPackageSnapshotFromReportText(text: str,
         syntaxSurfaceCid = CompilerWorldDefaultSyntaxSurfaceCid(packageId, Value(channelRes), Value(exportRes))
     let migrationRulesValue = CompilerWorldLineValue(text, "migration_rules_cid")
     var migrationRulesCid = layout.FixedBytes32()
-    if len(migrationRulesValue) > 0:
+    if migrationRulesValue.len > 0:
         let rulesRes = layout.FixedBytes32FromHex(migrationRulesValue)
         if IsErr(rulesRes):
             return Err[bool](" compiler world: invalid migration rules cid")
         migrationRulesCid = Value(rulesRes)
     let baselineSnapshotValue = CompilerWorldLineValue(text, "baseline_snapshot_cid")
     var baselineSnapshotCid = layout.FixedBytes32()
-    if len(baselineSnapshotValue) > 0:
+    if baselineSnapshotValue.len > 0:
         let baselineSnapshotRes = layout.FixedBytes32FromHex(baselineSnapshotValue)
         if IsErr(baselineSnapshotRes):
             return Err[bool](" compiler world: invalid baseline snapshot cid")
         baselineSnapshotCid = Value(baselineSnapshotRes)
     let baselineWorldValue = CompilerWorldLineValue(text, "baseline_world_head_cid")
     var baselineWorldCid = layout.FixedBytes32()
-    if len(baselineWorldValue) > 0:
+    if baselineWorldValue.len > 0:
         let baselineWorldRes = layout.FixedBytes32FromHex(baselineWorldValue)
         if IsErr(baselineWorldRes):
             return Err[bool](" compiler world: invalid baseline world head cid")
         baselineWorldCid = Value(baselineWorldRes)
     let depsManifestValue = CompilerWorldLineValue(text, "deps_manifest_cid")
     var depsManifestCid = layout.FixedBytes32()
-    if len(depsManifestValue) > 0:
+    if depsManifestValue.len > 0:
         let depsManifestRes = layout.FixedBytes32FromHex(depsManifestValue)
         if IsErr(depsManifestRes):
             return Err[bool](" compiler world: invalid deps manifest cid")
         depsManifestCid = Value(depsManifestRes)
     let migrationProofValue = CompilerWorldLineValue(text, "migration_proof_cid")
     var migrationProofCid = layout.FixedBytes32()
-    if len(migrationProofValue) > 0:
+    if migrationProofValue.len > 0:
         let migrationProofRes = layout.FixedBytes32FromHex(migrationProofValue)
         if IsErr(migrationProofRes):
             return Err[bool](" compiler world: invalid migration proof cid")
@@ -988,7 +993,7 @@ fn CompilerWorldHeadReport(head: CompilerWorldHead): str =
 fn CompilerWorldHeadFromReportText(text: str,
                                      out: var CompilerWorldHead): Result[bool] =
     let headEpochText = CompilerWorldLineValue(text, "head_epoch")
-    if len(headEpochText) <= 0:
+    if headEpochText.len <= 0:
         return Err[bool](" compiler world: report head_epoch missing")
     let prevHeadRes = CompilerWorldFixed32Value(text, "prev_head_cid")
     if IsErr(prevHeadRes):
@@ -1014,7 +1019,7 @@ fn CompilerWorldHeadFromReportText(text: str,
     out.version = 1
     out.universeId = CompilerWorldLineValue(text, "universe_id")
     out.channel = CompilerWorldLineValue(text, "channel")
-    out.headEpoch = int32(parseInt(headEpochText))
+    out.headEpoch = parseInt(headEpochText)
     out.prevHeadCid = Value(prevHeadRes)
     out.manifestRootCid = Value(manifestRes)
     out.csgRootCid = Value(csgRes)
