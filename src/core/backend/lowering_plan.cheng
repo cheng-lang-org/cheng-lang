@@ -736,6 +736,10 @@ fn LoweringFunctionCanUseLowUirCalls(fnIr: PrimaryObjectIrFunction): bool =
     var callCount: int32
     for stmtIndex in 0..<fnIr.statements.len:
         let stmt = fnIr.statements[stmtIndex]
+        if stmt.kind == texpr.TypedExprIrStmtReturn:
+            continue
+        if stmt.kind == texpr.TypedExprIrStmtAssign:
+            continue
         if !LoweringStatementIsLowUirCall(stmt):
             return false
         callCount = callCount + 1
@@ -820,6 +824,8 @@ fn LoweringLowUirStatements(fnIr: PrimaryObjectIrFunction,
     var out: lowuir.LowUirStatement[]
     for stmtIndex in 0..<fnIr.statements.len:
         let stmt = fnIr.statements[stmtIndex]
+        if !LoweringStatementIsLowUirCall(stmt):
+            continue
         let statementReturns = stmt.returnRoot ||
                                LoweringReturnExprMatchesCallStatement(returnExprRaw, stmt)
         var resultType = stmt.resultType
@@ -1188,6 +1194,127 @@ fn LoweringPopulateBodyIrBlocksTerms(fnIr: var PrimaryObjectIrFunction) =
     if !LoweringPopulateBodyIrLinearBlocksTerms(fnIr, returnOpIndex):
         fnIr.bodyIR.blocks = []
         fnIr.bodyIR.terms = []
+
+fn LoweringBodyTermI32ConstReturn(term: coreir.BodyTerm,
+                                   value: var int32): bool =
+    if term.kind != coreir.BodyTermReturnTag:
+        return false
+    if term.resultSlot >= 0:
+        return false
+    if term.operands.len < 2:
+        return false
+    if term.operands[0] != texpr.StatementReturnModeI32Const:
+        return false
+    value = term.operands[1]
+    return true
+
+fn LoweringBodyTermReturnOp(bodyIR: coreir.BodyIR,
+                             term: coreir.BodyTerm,
+                             op: var coreir.BodyOp): bool =
+    if term.kind != coreir.BodyTermReturnTag:
+        return false
+    op = coreir.BodyOp()
+    op.kind = coreir.BodyOpReturnTag
+    op.target = term.resultSlot
+    for i in 0..<term.operands.len:
+        add(op.operands, term.operands[i])
+    if op.operands.len > 0:
+        return true
+    if term.resultSlot >= 0 && term.resultSlot < bodyIR.localSlots.len:
+        add(op.operands, bodyIR.localSlots[term.resultSlot].typeKind)
+        return true
+    return false
+
+fn LoweringOptimizeBodyIrFlattenBlocks(bodyIR: coreir.BodyIR): coreir.BodyIR =
+    if bodyIR.blocks.len <= 0 || bodyIR.terms.len <= 0:
+        return bodyIR
+    var out = bodyIR
+    out.ops = []
+    out.blocks = []
+    out.terms = []
+    var currentBlock: int32
+    for _ in 0..<bodyIR.blocks.len:
+        if currentBlock < 0 || currentBlock >= bodyIR.blocks.len:
+            return bodyIR
+        let block = bodyIR.blocks[currentBlock]
+        if block.opStart < 0 ||
+           block.opCount < 0 ||
+           block.opStart + block.opCount > bodyIR.ops.len ||
+           block.termIndex < 0 ||
+           block.termIndex >= bodyIR.terms.len:
+            return bodyIR
+        for opIndex in block.opStart..<(block.opStart + block.opCount):
+            let op = bodyIR.ops[opIndex]
+            if op.kind != coreir.BodyOpCallTag:
+                return bodyIR
+            add(out.ops, op)
+        let term = bodyIR.terms[block.termIndex]
+        if term.kind == coreir.BodyTermReturnTag:
+            var returnOp: coreir.BodyOp
+            if !LoweringBodyTermReturnOp(bodyIR, term, returnOp):
+                return bodyIR
+            add(out.ops, returnOp)
+            return out
+        if term.kind == coreir.BodyTermBrTag:
+            if term.trueBlock < 0 || term.trueBlock == currentBlock:
+                return bodyIR
+            currentBlock = term.trueBlock
+            continue
+        if term.kind == coreir.BodyTermCbrTag:
+            if term.conditionKind != coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag:
+                return bodyIR
+            if term.trueBlock < 0 ||
+               term.trueBlock >= bodyIR.blocks.len ||
+               term.falseBlock < 0 ||
+               term.falseBlock >= bodyIR.blocks.len:
+                return bodyIR
+            let trueBlock = bodyIR.blocks[term.trueBlock]
+            if trueBlock.opCount != 0 ||
+               trueBlock.termIndex < 0 ||
+               trueBlock.termIndex >= bodyIR.terms.len:
+                return bodyIR
+            var returnValue: int32
+            if !LoweringBodyTermI32ConstReturn(bodyIR.terms[trueBlock.termIndex],
+                                               returnValue):
+                return bodyIR
+            var guardSlot = term.lhsSlot
+            if guardSlot < 0:
+                guardSlot = term.resultSlot
+            if guardSlot < 0 || guardSlot >= bodyIR.localSlots.len:
+                return bodyIR
+            var branchOp: coreir.BodyOp
+            branchOp.kind = coreir.BodyOpBranchTag
+            branchOp.target = -1
+            add(branchOp.operands, coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag)
+            add(branchOp.operands, guardSlot)
+            add(branchOp.operands, returnValue)
+            add(out.ops, branchOp)
+            if term.falseBlock == currentBlock:
+                return bodyIR
+            currentBlock = term.falseBlock
+            continue
+        return bodyIR
+    return bodyIR
+
+fn LoweringOptimizeBodyIrTrimAfterReturn(bodyIR: coreir.BodyIR): coreir.BodyIR =
+    if bodyIR.blocks.len > 0 || bodyIR.terms.len > 0:
+        return bodyIR
+    var returnIndex: int32 = -1
+    for i in 0..<bodyIR.ops.len:
+        if bodyIR.ops[i].kind == coreir.BodyOpReturnTag:
+            returnIndex = i
+            break
+    if returnIndex < 0 || returnIndex + 1 >= bodyIR.ops.len:
+        return bodyIR
+    var out = bodyIR
+    out.ops = []
+    for i in 0..<(returnIndex + 1):
+        add(out.ops, bodyIR.ops[i])
+    return out
+
+fn LoweringOptimizeBodyIr(bodyIR: coreir.BodyIR): coreir.BodyIR =
+    let flattened = LoweringOptimizeBodyIrFlattenBlocks(bodyIR)
+    return LoweringOptimizeBodyIrTrimAfterReturn(flattened)
 
 fn LoweringAppendBodyIrStatementReturn(fnIr: var PrimaryObjectIrFunction) =
     if fnIr.statementReturnMode == texpr.StatementReturnModeNone:
@@ -2173,6 +2300,7 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                 LoweringAppendBodyIrStatementReturn(fnIr)
             elif returnCallStatementIndex >= 0 && returnCallStatementIndex < fnIr.statements.len:
                 LoweringAppendBodyIrReturnCall(fnIr, fnIr.statements[returnCallStatementIndex])
+        fnIr.bodyIR = LoweringOptimizeBodyIr(fnIr.bodyIR)
         fnIr.callTargetCount = fnIr.callTargets.len
         add(ir.functions, fnIr)
     return ir
@@ -2670,6 +2798,8 @@ fn LoweringPlanStubReport(plan: LoweringPlanStub): str =
     LoweringAppendLine(out, "expr_surface_try_count", IntToStr(parser.NormalizedExprLayerTryCount(plan.exprLayer)))
     LoweringAppendLine(out, "expr_surface_default_init_count", IntToStr(parser.NormalizedExprLayerDefaultInitCount(plan.exprLayer)))
     LoweringAppendLine(out, "expr_surface_constructor_count", IntToStr(parser.NormalizedExprLayerConstructorCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_return_count", IntToStr(parser.NormalizedExprLayerReturnCount(plan.exprLayer)))
+    LoweringAppendLine(out, "expr_surface_assign_count", IntToStr(parser.NormalizedExprLayerAssignCount(plan.exprLayer)))
     LoweringAppendLine(out, "expr_surface_question_residual_count", IntToStr(plan.exprLayer.questionResidualCount))
     LoweringAppendLine(out, "typed_expr_fact_count", IntToStr(plan.typedExprFacts.len))
     LoweringAppendLine(out, "typed_expr_lowering_rule_count", IntToStr(loweringRules.len))

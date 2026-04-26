@@ -1,0 +1,255 @@
+import std/result
+import std/rawbytes as rawbytes
+import std/strformat
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/object_buffer as obuf
+import cheng/core/backend/object_symbols as osym
+import cheng/core/backend/object_relocs as orel
+
+const
+    IMAGE_FILE_MACHINE_AMD64 = uint64(0x8664)
+    IMAGE_SYM_CLASS_EXTERNAL = uint64(2)
+    IMAGE_SYM_CLASS_STATIC = uint64(3)
+    IMAGE_SYM_TYPE_FUNCTION = uint64(0x20)
+
+    IMAGE_SCN_CNT_CODE = uint64(0x00000020)
+    IMAGE_SCN_CNT_INITIALIZED_DATA = uint64(0x00000040)
+    IMAGE_SCN_MEM_EXECUTE = uint64(0x20000000)
+    IMAGE_SCN_MEM_READ = uint64(0x40000000)
+    IMAGE_SCN_MEM_WRITE = uint64(0x80000000)
+    IMAGE_SCN_ALIGN_4BYTES = uint64(0x00300000)
+    IMAGE_SCN_ALIGN_8BYTES = uint64(0x00400000)
+    IMAGE_SCN_ALIGN_16BYTES = uint64(0x00500000)
+
+    IMAGE_REL_AMD64_ADDR64 = uint64(1)
+    IMAGE_REL_AMD64_ADDR32 = uint64(2)
+    IMAGE_REL_AMD64_REL32 = uint64(4)
+    IMAGE_REL_AMD64_REL32_1 = uint64(11)
+
+    COFF_HDR_SIZE = 20
+    COFF_SECTION_HDR_SIZE = 40
+    COFF_SYM_SIZE = 18
+    COFF_RELOC_SIZE = 10
+
+type
+    CoffX64WriterResult =
+        objectPath: str
+        bytesWritten: int32
+        symbolCount: int32
+        relocCount: int32
+
+fn coffAlign(value: int32, align: int32): int32 =
+    if align <= 1:
+        return value
+    let mask = align - 1
+    return (value + mask) & (0 - align)
+
+fn coffSectionAlignFlag(pow2: int32): uint64 =
+    if pow2 <= 0:
+        return IMAGE_SCN_ALIGN_4BYTES
+    if pow2 == 1:
+        return IMAGE_SCN_ALIGN_4BYTES
+    if pow2 == 2:
+        return IMAGE_SCN_ALIGN_4BYTES
+    if pow2 == 3:
+        return IMAGE_SCN_ALIGN_8BYTES
+    return IMAGE_SCN_ALIGN_16BYTES
+
+fn coffWriteCString(buf: var obuf.ObjectBuffer, text: str) =
+    for i in 0..<len(text):
+        obuf.ObjectBufferWriteU8(buf, int32(text[i]) & 255)
+    obuf.ObjectBufferWriteU8(buf, 0)
+
+fn coffWriteFixedStr8(buf: var obuf.ObjectBuffer, text: str) =
+    for i in 0..<8:
+        if i < len(text):
+            obuf.ObjectBufferWriteU8(buf, int32(text[i]) & 255)
+        else:
+            obuf.ObjectBufferWriteU8(buf, 0)
+
+fn coffX64RelocType(kind: orel.ObjectRelocKind): Result[uint64] =
+    if kind == orel.ObjectRelocAbs64:
+        return Ok[uint64](IMAGE_REL_AMD64_ADDR64)
+    if kind == orel.ObjectRelocAbs32:
+        return Ok[uint64](IMAGE_REL_AMD64_ADDR32)
+    return Err[uint64](" coff x86_64 object writer: unsupported relocation kind")
+
+fn coffWriteSym(buf: var obuf.ObjectBuffer,
+                nameOff: int32,
+                value: uint32,
+                sectionIndex: int32,
+                storageClass: uint64,
+                auxCount: int32) =
+    obuf.ObjectBufferWriteU32LE(buf, uint64(nameOff))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(value))
+    var sect = int32(0)
+    if sectionIndex >= 0:
+        sect = sectionIndex + 1
+    obuf.ObjectBufferWriteU16LE(buf, uint64(sect))
+    obuf.ObjectBufferWriteU16LE(buf, uint64(0))
+    obuf.ObjectBufferWriteU8(buf, int32(storageClass))
+    obuf.ObjectBufferWriteU8(buf, auxCount)
+
+fn coffWriteReloc(buf: var obuf.ObjectBuffer,
+                  offset: int64,
+                  symbolIndex: int32,
+                  rtype: uint64) =
+    obuf.ObjectBufferWriteU32LE(buf, uint64(offset))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(symbolIndex))
+    obuf.ObjectBufferWriteU16LE(buf, rtype)
+
+fn CoffX64TextObjectBytes(text: rawbytes.Bytes,
+                           symbols: osym.ObjectSymbolTable,
+                           relocs: orel.ObjectRelocTable): Result[rawbytes.Bytes] =
+    var emptyData = rawbytes.emptyBytes()
+    return coffX64Build(text, emptyData, symbols, relocs)
+
+fn CoffX64TextDataObjectBytes(text: rawbytes.Bytes,
+                               data: rawbytes.Bytes,
+                               symbols: osym.ObjectSymbolTable,
+                               relocs: orel.ObjectRelocTable): Result[rawbytes.Bytes] =
+    return coffX64Build(text, data, symbols, relocs)
+
+fn coffX64Build(text: rawbytes.Bytes,
+                data: rawbytes.Bytes,
+                symbols: osym.ObjectSymbolTable,
+                relocs: orel.ObjectRelocTable): Result[rawbytes.Bytes] =
+    let relocCount = orel.ObjectRelocsCount(relocs)
+    let symbolCount = osym.ObjectSymbolsCount(symbols)
+    if symbolCount <= 0:
+        return Err[rawbytes.Bytes](" coff x86_64 object writer: missing symbols")
+
+    let textSize = int64(rawbytes.bytesLen(text))
+    let dataSize = int64(rawbytes.bytesLen(data))
+    let hasData = dataSize > int64(0)
+
+    var nsects = int32(2)
+    if hasData:
+        nsects = nsects + 1
+
+    var strtab = obuf.ObjectBufferInit(256)
+    obuf.ObjectBufferWriteU32LE(strtab, uint64(4))
+    var symNameOffs: int32[]
+    for i in 0..<symbolCount:
+        let name = osym.ObjectSymbolsAt(symbols, i).name
+        if len(name) <= 8:
+            add(symNameOffs, int32(0))
+        else:
+            add(symNameOffs, obuf.ObjectBufferOffset(strtab))
+            coffWriteCString(strtab, name)
+    let strtabSize = obuf.ObjectBufferLen(strtab)
+
+    let symtabSize = symbolCount * COFF_SYM_SIZE
+    let relocTableSize = relocCount * COFF_RELOC_SIZE
+    let textOff = COFF_HDR_SIZE
+    let dataOff = coffAlign(int32(textOff) + int32(textSize), int32(8))
+    let relocOff = coffAlign(dataOff + int32(dataSize), int32(8))
+    let symOff = relocOff + relocTableSize
+    let strOff = symOff + symtabSize
+
+    var out = obuf.ObjectBufferInit(strOff + strtabSize + 64)
+
+    obuf.ObjectBufferWriteU16LE(out, IMAGE_FILE_MACHINE_AMD64)
+    obuf.ObjectBufferWriteU16LE(out, uint64(nsects))
+    obuf.ObjectBufferWriteU32LE(out, uint64(0))
+    obuf.ObjectBufferWriteU32LE(out, uint64(symOff))
+    obuf.ObjectBufferWriteU32LE(out, uint64(symbolCount))
+    obuf.ObjectBufferWriteU16LE(out, uint64(0))
+    obuf.ObjectBufferWriteU16LE(out, uint64(0))
+
+    coffWriteFixedStr8(out, ".text")
+    obuf.ObjectBufferWriteU32LE(out, uint64(0))
+    obuf.ObjectBufferWriteU32LE(out, uint64(0))
+    obuf.ObjectBufferWriteU32LE(out, uint64(textSize))
+    obuf.ObjectBufferWriteU32LE(out, uint64(textOff))
+    obuf.ObjectBufferWriteU32LE(out, uint64(relocOff))
+    obuf.ObjectBufferWriteU32LE(out, uint64(0))
+    obuf.ObjectBufferWriteU16LE(out, uint64(relocCount))
+    obuf.ObjectBufferWriteU16LE(out, uint64(0))
+    obuf.ObjectBufferWriteU32LE(out, IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | coffSectionAlignFlag(2))
+
+    if hasData:
+        coffWriteFixedStr8(out, ".data")
+        obuf.ObjectBufferWriteU32LE(out, uint64(0))
+        obuf.ObjectBufferWriteU32LE(out, uint64(0))
+        obuf.ObjectBufferWriteU32LE(out, uint64(dataSize))
+        obuf.ObjectBufferWriteU32LE(out, uint64(dataOff))
+        obuf.ObjectBufferWriteU32LE(out, uint64(0))
+        obuf.ObjectBufferWriteU32LE(out, uint64(0))
+        obuf.ObjectBufferWriteU16LE(out, uint64(0))
+        obuf.ObjectBufferWriteU16LE(out, uint64(0))
+        obuf.ObjectBufferWriteU32LE(out, IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | coffSectionAlignFlag(3))
+
+    obuf.ObjectBufferWriteBytes(out, text)
+
+    if hasData:
+        obuf.ObjectBufferAlign(out, int32(8), 0)
+        obuf.ObjectBufferWriteBytes(out, data)
+
+    obuf.ObjectBufferAlign(out, int32(8), 0)
+    for i in 0..<relocCount:
+        let reloc = orel.ObjectRelocsAt(relocs, i)
+        let typeRes = coffX64RelocType(reloc.kind)
+        if IsErr(typeRes):
+            return Err[rawbytes.Bytes](Error(typeRes))
+        coffWriteReloc(out, reloc.offset, reloc.symbolIndex, Value(typeRes))
+
+    obuf.ObjectBufferAlign(out, int32(8), 0)
+    for i in 0..<symbolCount:
+        let sym = osym.ObjectSymbolsAt(symbols, i)
+        var storageClass = IMAGE_SYM_CLASS_STATIC
+        if sym.global:
+            storageClass = IMAGE_SYM_CLASS_EXTERNAL
+        var sectIndex = int32(-1)
+        if !sym.undefined:
+            if sym.sectionIndex == 0:
+                sectIndex = int32(0)
+            elif hasData && sym.sectionIndex == 1:
+                sectIndex = int32(1)
+        coffWriteSym(out, symNameOffs[i], uint32(sym.offset), sectIndex, storageClass, int32(0))
+
+    obuf.ObjectBufferAlign(out, int32(1), 0)
+    obuf.ObjectBufferWriteBytes(out, obuf.ObjectBufferToBytes(strtab))
+
+    return Ok[rawbytes.Bytes](obuf.ObjectBufferToBytes(out))
+
+fn coffX64WriteResult(rootDir: str,
+                      outputPath: str,
+                      text: rawbytes.Bytes,
+                      data: rawbytes.Bytes,
+                      symbols: osym.ObjectSymbolTable,
+                      relocs: orel.ObjectRelocTable): Result[CoffX64WriterResult] =
+    let dataSize = rawbytes.bytesLen(data)
+    var bytesRes: Result[rawbytes.Bytes]
+    if dataSize > 0:
+        bytesRes = CoffX64TextDataObjectBytes(text, data, symbols, relocs)
+    else:
+        bytesRes = CoffX64TextObjectBytes(text, symbols, relocs)
+    if IsErr(bytesRes):
+        return Err[CoffX64WriterResult](Error(bytesRes))
+    let bytes = Value(bytesRes)
+    let payload = rawbytes.bytesToString(bytes)
+    if !chengpath.WriteTextFile(rootDir, outputPath, payload):
+        return Err[CoffX64WriterResult](Fmt" coff x86_64 object writer: failed to write object: {outputPath}")
+    var out: CoffX64WriterResult
+    out.objectPath = outputPath
+    out.bytesWritten = rawbytes.bytesLen(bytes)
+    out.symbolCount = osym.ObjectSymbolsCount(symbols)
+    out.relocCount = orel.ObjectRelocsCount(relocs)
+    return Ok[CoffX64WriterResult](out)
+
+fn CoffX64TextObjectWrite(rootDir: str,
+                           outputPath: str,
+                           text: rawbytes.Bytes,
+                           symbols: osym.ObjectSymbolTable,
+                           relocs: orel.ObjectRelocTable): Result[CoffX64WriterResult] =
+    var emptyData = rawbytes.emptyBytes()
+    return coffX64WriteResult(rootDir, outputPath, text, emptyData, symbols, relocs)
+
+fn CoffX64TextDataObjectWrite(rootDir: str,
+                               outputPath: str,
+                               text: rawbytes.Bytes,
+                               data: rawbytes.Bytes,
+                               symbols: osym.ObjectSymbolTable,
+                               relocs: orel.ObjectRelocTable): Result[CoffX64WriterResult] =
+    return coffX64WriteResult(rootDir, outputPath, text, data, symbols, relocs)

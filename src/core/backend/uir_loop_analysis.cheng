@@ -1,0 +1,102 @@
+# UIR loop analysis: deterministic back-edge based loop discovery.
+import backend/uir/uir_types
+import std/seqs
+
+type
+    UirLoopSpan =
+        funcIndex: int32
+        headerBlock: int32
+        latchBlock: int32
+
+    UirLoopInfo =
+        loopCount: int32
+        reducibleCount: int32
+        backEdgeCount: int32
+        spans: UirLoopSpan[]
+
+fn uirLoopSpanAppend(info: var UirLoopInfo, span: UirLoopSpan) =
+    let idx: int32 = info.spans.len
+    let needLen: int32 = idx + 1
+    if info.spans.buffer == nil || info.spans.cap < needLen:
+        cheng__seqGrowToRaw(&info.spans.buffer, &info.spans.cap, needLen, int32(sizeof UirLoopSpan))
+    info.spans.len = needLen
+    info.spans[idx] = span
+
+fn uirLoopSpanExists(spans: UirLoopSpan[], funcIndex: int32, headerBlock: int32, latchBlock: int32): bool =
+    for i in 0..<spans.len:
+        let s: UirLoopSpan = spans[i]
+        if s.funcIndex == funcIndex && s.headerBlock == headerBlock && s.latchBlock == latchBlock:
+            return true
+    return false
+
+fn uirLoopFindBlockByLabel(func: UirCoreFunc, label: str): int32 =
+    if (!uirCoreFuncIdValid(func)) || len(label) == 0:
+        return int32(-1)
+    let blockCount: int32 = uirCoreFuncBlocksLen(func)
+    for bi in 0..<blockCount:
+        let blk: UirBlockId = uirCoreFuncBlockAt(func, bi)
+        if (!uirCoreBlockIdValid(blk)):
+            continue
+        if uirStrCmp(uirCoreBlockLabelOf(blk), label) == 0:
+            return bi
+    return int32(-1)
+
+fn uirLoopRecordBackEdge(info: var UirLoopInfo, funcIndex: int32, latchBlock: int32, headerBlock: int32) =
+    if latchBlock < 0 || headerBlock < 0:
+        return
+    if headerBlock > latchBlock:
+        return
+    info.backEdgeCount = info.backEdgeCount + 1
+    if uirLoopSpanExists(info.spans, funcIndex, headerBlock, latchBlock):
+        return
+    var span: UirLoopSpan
+    span.funcIndex = funcIndex
+    span.headerBlock = headerBlock
+    span.latchBlock = latchBlock
+    uirLoopSpanAppend(info, span)
+    info.loopCount = info.loopCount + 1
+    info.reducibleCount = info.reducibleCount + 1
+
+fn uirLoopInfoHasLoopInFunc(info: UirLoopInfo, funcIndex: int32): bool =
+    for i in 0..<info.spans.len:
+        if info.spans[i].funcIndex == funcIndex:
+            return true
+    return false
+
+fn uirLoopInfoBlockIsInLoopWindow(info: UirLoopInfo, funcIndex: int32, blockIndex: int32): bool =
+    for i in 0..<info.spans.len:
+        let s: UirLoopSpan = info.spans[i]
+        if s.funcIndex != funcIndex:
+            continue
+        if blockIndex >= s.headerBlock && blockIndex <= s.latchBlock:
+            return true
+    return false
+
+fn uirAnalyzeLoops(module: UirModule): UirLoopInfo =
+    var info: UirLoopInfo
+    info.loopCount = 0
+    info.reducibleCount = 0
+    info.backEdgeCount = 0
+    info.spans = []
+    if module == nil:
+        return info
+    for fi in 0..<uirModuleFuncsLen(module):
+        let funcView: UirFunc = uirModuleFuncAt(module, fi)
+        if funcView == nil || uirFuncIsExtern(funcView):
+            continue
+        let func: UirCoreFunc = funcView
+        let blockCount: int32 = uirCoreFuncBlocksLen(func)
+        for bi in 0..<blockCount:
+            let blk: UirBlockId = uirCoreFuncBlockAt(func, bi)
+            if blk <= 0:
+                continue
+            let term: UirCoreTerm = uirCoreBlockTermOf(blk)
+            if uirCoreTermKindOf(term) == mtBr:
+                let dst: int32 = uirLoopFindBlockByLabel(func, uirCoreTermTargetOf(term))
+                uirLoopRecordBackEdge(info, fi, bi, dst)
+            elif uirCoreTermKindOf(term) == mtCbr:
+                let dstTrue: int32 = uirLoopFindBlockByLabel(func, uirCoreTermTargetTrueOf(term))
+                let dstFalse: int32 = uirLoopFindBlockByLabel(func, uirCoreTermTargetFalseOf(term))
+                uirLoopRecordBackEdge(info, fi, bi, dstTrue)
+                uirLoopRecordBackEdge(info, fi, bi, dstFalse)
+    return info

@@ -108,6 +108,12 @@ type
         TypedExprIrStmtIfCall
         TypedExprIrStmtCall
         TypedExprIrStmtResultIntrinsic
+        TypedExprIrStmtReturn
+        TypedExprIrStmtAssign
+        TypedExprIrStmtIf
+        TypedExprIrStmtElif
+        TypedExprIrStmtElse
+        TypedExprIrStmtFor
 
     TypedExprArgPassKind = enum
         TypedExprArgPassValue
@@ -723,6 +729,18 @@ fn TypedExprIrStatementKindText(kind: TypedExprIrStatementKind): str =
         return "call"
     if kind == TypedExprIrStmtResultIntrinsic:
         return "result_intrinsic"
+    if kind == TypedExprIrStmtReturn:
+        return "return"
+    if kind == TypedExprIrStmtAssign:
+        return "assign"
+    if kind == TypedExprIrStmtIf:
+        return "if"
+    if kind == TypedExprIrStmtElif:
+        return "elif"
+    if kind == TypedExprIrStmtElse:
+        return "else"
+    if kind == TypedExprIrStmtFor:
+        return "for"
     return "unsupported"
 
 fn TypedExprReturnOpKindFromIrOp(kind: TypedExprIrOpKind): TypedExprReturnOpKind =
@@ -941,7 +959,7 @@ fn TypedExprBuiltinTypeCallResult(expr: parser.NormalizedExpr): str =
     if callee == "new" && expr.callArgCount == 1:
         let typeText = TypedExprNormalizeTypeText(expr.callArgsText)
         if typeText != "":
-            return typeText
+            return Fmt"ref{typeText}"
     return ""
 
 fn TypedExprExprIsBuiltinCall(expr: parser.NormalizedExpr): bool =
@@ -1652,14 +1670,7 @@ fn TypedExprFactsValidateCallResolution(exprLayer: var parser.NormalizedExprLaye
                     let samePackage = TypedExprSourcesSharePackage(expr.sourcePath,
                                                                     fact.callTargetSourcePath)
                     if !samePackage:
-                        err = strutil.Join([" typed expr: imported private symbol '",
-                                   fact.callCallee,
-                                   "' is not exported at ",
-                                   expr.sourcePath,
-                                   ":",
-                                   IntToStr(expr.lineNumber),
-                                   " target_source=",
-                                   fact.callTargetSourcePath], "")
+                        err = Fmt" typed expr: imported private symbol '{fact.callCallee}' is not exported at {expr.sourcePath}:{expr.lineNumber} target_source={fact.callTargetSourcePath}"
                         return false
             if fact.typeText == "" || fact.typeText == "unknown" || fact.typeText == "call_expr":
                 err = Fmt" typed expr: resolved call missing concrete type at {expr.sourcePath}:{expr.lineNumber}"
@@ -2092,6 +2103,12 @@ fn TypedExprIrReportText(ir: var TypedExprIr): str =
     TypedExprReportAppendLine(out, "typed_ir_if_call_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtIfCall)))
     TypedExprReportAppendLine(out, "typed_ir_call_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtCall)))
     TypedExprReportAppendLine(out, "typed_ir_result_intrinsic_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtResultIntrinsic)))
+    TypedExprReportAppendLine(out, "typed_ir_return_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtReturn)))
+    TypedExprReportAppendLine(out, "typed_ir_assign_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtAssign)))
+    TypedExprReportAppendLine(out, "typed_ir_if_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtIf)))
+    TypedExprReportAppendLine(out, "typed_ir_elif_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtElif)))
+    TypedExprReportAppendLine(out, "typed_ir_else_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtElse)))
+    TypedExprReportAppendLine(out, "typed_ir_for_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtFor)))
     TypedExprReportAppendLine(out, "typed_ir_node_count", IntToStr(ir.nodes.len))
     TypedExprReportAppendLine(out, "typed_ir_return_kinds", TypedExprIrReturnKindListText(ir))
     TypedExprReportAppendLine(out, "typed_ir_param_ref_count", IntToStr(TypedExprIrCountOpKind(ir, TypedExprIrOpParamRef)))
@@ -2458,6 +2475,8 @@ fn TypedExprTypeIsPointerLike(typeRaw: str): bool =
     if typeText == "cstring":
         return true
     if typeText == "ptr":
+        return true
+    if parser.ParserStartsWith(typeText, "ref"):
         return true
     return parser.ParserStartsWith(typeText, "ptr[") || parser.ParserStartsWith(typeText, "Pointer[")
 
@@ -5383,6 +5402,166 @@ fn TypedExprResultIntrinsicTypeFromExpr(ctx: var TypedExprSourceContext,
         return innerType
     return "result_projection"
 
+fn TypedExprAssignLhsRootName(lhsRaw: str): str =
+    let lhs = chengpath.PathTrim(lhsRaw)
+    if lhs == "":
+        return ""
+    let dotPos = parser.ParserFindText(lhs, ".")
+    if dotPos > 0:
+        return parser.ParserIdentPrefix(chengpath.TextSlice(lhs, 0, dotPos))
+    return parser.ParserIdentPrefix(lhs)
+
+fn TypedExprAssignFieldName(lhsRaw: str): str =
+    let lhs = chengpath.PathTrim(lhsRaw)
+    let dotPos = parser.ParserFindText(lhs, ".")
+    if dotPos < 0 || dotPos + 1 >= lhs.len:
+        return ""
+    return parser.ParserIdentPrefix(chengpath.TextSlice(lhs,
+                                                       dotPos + 1,
+                                                       lhs.len - dotPos - 1))
+
+fn TypedExprAssignFieldType(rootTypeRaw: str,
+                             fieldNameRaw: str): str =
+    let rootType = TypedExprNormalizeTypeText(rootTypeRaw)
+    let fieldName = parser.ParserIdentPrefix(chengpath.PathTrim(fieldNameRaw))
+    if fieldName == "":
+        return ""
+    if fieldName == "len":
+        return "int32"
+    if rootType == "Bytes" || rootType == "rawbytes.Bytes":
+        if fieldName == "data":
+            return "ptr"
+        if fieldName == "len":
+            return "int32"
+    if parser.ParserStartsWith(rootType, "Result["):
+        if fieldName == "ok":
+            return "bool"
+        if fieldName == "value":
+            return TypedExprResultSuccessType(rootType)
+        if fieldName == "error":
+            return "str"
+    return ""
+
+fn TypedExprAssignStatementType(ctx: var TypedExprSourceContext,
+                                 scope: TypedExprFunctionScope,
+                                 lineNumber: int32,
+                                 lhsRaw: str): str =
+    let rootName = TypedExprAssignLhsRootName(lhsRaw)
+    if rootName == "":
+        return ""
+    let scopeIndex = TypedExprScopeIndexForLine(ctx.scopes, lineNumber)
+    let rootType = TypedExprLookupBindingType(ctx, scopeIndex, lineNumber, rootName)
+    let fieldName = TypedExprAssignFieldName(lhsRaw)
+    if fieldName == "":
+        return rootType
+    let fieldType = TypedExprAssignFieldType(rootType, fieldName)
+    if fieldType != "":
+       return fieldType
+    return ""
+
+fn TypedExprControlStatementKindFromExpr(expr: parser.NormalizedExpr): TypedExprIrStatementKind =
+    if expr.kind == parser.NormalizedExprIfStmt:
+        return TypedExprIrStmtIf
+    if expr.kind == parser.NormalizedExprElifStmt:
+        return TypedExprIrStmtElif
+    if expr.kind == parser.NormalizedExprElseStmt:
+        return TypedExprIrStmtElse
+    if expr.kind == parser.NormalizedExprForStmt:
+        return TypedExprIrStmtFor
+    return TypedExprIrStmtUnsupported
+
+fn TypedExprForBindingNameFromHeader(headerRaw: str): str =
+    let header = chengpath.PathTrim(headerRaw)
+    let inPos = parser.ParserFindText(header, " in ")
+    if inPos <= 0:
+        return ""
+    return parser.ParserIdentPrefix(chengpath.PathTrim(chengpath.TextSlice(header,
+                                                                           0,
+                                                                           inPos)))
+
+fn TypedExprIrAddControlStatementFromExpr(ir: var TypedExprIr,
+                                           scope: TypedExprFunctionScope,
+                                           expr: parser.NormalizedExpr,
+                                           lineIndent: int32,
+                                           enclosingIfLineNumber: int32,
+                                           enclosingIfConditionText: str): int32 =
+    let statementKind = TypedExprControlStatementKindFromExpr(expr)
+    if statementKind == TypedExprIrStmtUnsupported:
+        return -1
+    var stmt: TypedExprIrStatement
+    stmt.sourcePath = expr.sourcePath
+    stmt.functionName = scope.name
+    stmt.statementIndex = ir.statements.len
+    stmt.lineNumber = expr.lineNumber
+    stmt.columnNumber = expr.columnNumber
+    stmt.lineIndent = lineIndent
+    stmt.enclosingIfLineNumber = enclosingIfLineNumber
+    stmt.enclosingIfConditionText = enclosingIfConditionText
+    stmt.exprId = expr.exprId
+    stmt.kind = statementKind
+    stmt.callKind = TypedExprCallNone
+    stmt.detailKind = expr.detailKind
+    stmt.surfaceText = chengpath.PathTrim(expr.surfaceText)
+    stmt.bindingName = ""
+    if statementKind == TypedExprIrStmtFor:
+        stmt.bindingName = TypedExprForBindingNameFromHeader(stmt.surfaceText)
+    stmt.resultType = ""
+    if statementKind == TypedExprIrStmtIf ||
+       statementKind == TypedExprIrStmtElif:
+        stmt.resultType = "bool"
+    elif statementKind == TypedExprIrStmtFor:
+        stmt.resultType = "range"
+    stmt.callTarget = ""
+    stmt.callTargetSourcePath = ""
+    stmt.callTargetImportc = false
+    stmt.callArgCount = 0
+    stmt.callArgsText = ""
+    stmt.loweringMode = TypedExprLowerDeferred
+    stmt.returnKind = TypedExprReturnDeferred
+    stmt.returnRoot = false
+    add(ir.statements, stmt)
+    return stmt.statementIndex
+
+fn TypedExprIrAddAssignStatementFromExpr(ir: var TypedExprIr,
+                                          ctx: var TypedExprSourceContext,
+                                          scope: TypedExprFunctionScope,
+                                          expr: parser.NormalizedExpr,
+                                          lineIndent: int32,
+                                          enclosingIfLineNumber: int32,
+                                          enclosingIfConditionText: str): int32 =
+    let lhsText = chengpath.PathTrim(expr.surfaceText)
+    let rhsText = chengpath.PathTrim(expr.callArgsText)
+    if lhsText == "" || rhsText == "":
+        return -1
+    var stmt: TypedExprIrStatement
+    stmt.sourcePath = expr.sourcePath
+    stmt.functionName = scope.name
+    stmt.statementIndex = ir.statements.len
+    stmt.lineNumber = expr.lineNumber
+    stmt.columnNumber = expr.columnNumber
+    stmt.lineIndent = lineIndent
+    stmt.enclosingIfLineNumber = enclosingIfLineNumber
+    stmt.enclosingIfConditionText = enclosingIfConditionText
+    stmt.exprId = expr.exprId
+    stmt.kind = TypedExprIrStmtAssign
+    stmt.callKind = TypedExprCallNone
+    stmt.detailKind = expr.detailKind
+    stmt.surfaceText = rhsText
+    stmt.bindingName = lhsText
+    stmt.resultType = TypedExprAssignStatementType(ctx, scope, expr.lineNumber, lhsText)
+    if stmt.resultType == "":
+        stmt.resultType = "unknown"
+    stmt.callTarget = ""
+    stmt.callTargetSourcePath = ""
+    stmt.callTargetImportc = false
+    stmt.callArgCount = 0
+    stmt.callArgsText = ""
+    stmt.loweringMode = TypedExprLowerLocalAddress
+    stmt.returnKind = TypedExprReturnDeferred
+    stmt.returnRoot = false
+    add(ir.statements, stmt)
+    return stmt.statementIndex
+
 fn TypedExprIrAddCallStatementFromExpr(ir: var TypedExprIr,
                                         ctx: var TypedExprSourceContext,
                                         sourceContexts: var TypedExprSourceContext[],
@@ -5541,6 +5720,29 @@ fn TypedExprIrAppendStatementsForScopeFromExprLayer(ir: var TypedExprIr,
                         currentLineReturnRootColumn = lineExpr.columnNumber
         let isResultIntrinsic = expr.kind == parser.NormalizedExprResultIntrinsic
         let isNormalCall = expr.kind == parser.NormalizedExprCall
+        if expr.kind == parser.NormalizedExprReturn:
+            let _ = TypedExprIrAddCallStatementFromExpr(ir,
+                                                        ctx,
+                                                        sourceContexts,
+                                                        scope,
+                                                        expr,
+                                                        TypedExprIrStmtReturn,
+                                                        "",
+                                                        scope.returnType,
+                                                        currentLineIndent,
+                                                        currentLineEnclosingIfLineNumber,
+                                                        currentLineEnclosingIfConditionText,
+                                                        true)
+            continue
+        if expr.kind == parser.NormalizedExprAssign:
+            let _ = TypedExprIrAddAssignStatementFromExpr(ir,
+                                                          ctx,
+                                                          scope,
+                                                          expr,
+                                                          currentLineIndent,
+                                                          currentLineEnclosingIfLineNumber,
+                                                          currentLineEnclosingIfConditionText)
+            continue
         if !isNormalCall && !isResultIntrinsic:
             continue
         if isNormalCall && TypedExprExprIsBuiltinStringifyCall(expr):

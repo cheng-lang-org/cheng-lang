@@ -6596,6 +6596,8 @@ static bool cheng_seed_select_visible_overloaded_function_symbol(const ChengSeed
                                                          char *out,
                                                          size_t cap);
 static bool cheng_seed_is_intrinsic_call_name(const char *name);
+static void cheng_seed_canonicalize_builtin_call_name(char *callee, size_t cap);
+static bool cheng_seed_type_text_is_bytes_builtin(const char *type_text);
 static bool cheng_seed_is_intrinsic_module_call(const char *module_path, const char *function_name);
 static const ChengSeedLoweredFunctionStub *cheng_seed_find_entry_lowered_function(const ChengSeedLoweringPlanStub *lowering);
 static bool cheng_seed_function_has_unbound_generics(const ChengSeedLoweringPlanStub *lowering,
@@ -13668,6 +13670,7 @@ static bool cheng_seed_const_eval_expr(const ChengSeedLoweringPlanStub *lowering
         size_t i;
         args = (char (*)[4096])cheng_seed_xmalloc(sizeof(*args) * 32U);
         if (cheng_seed_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, 32U)) {
+            cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
             if (strcmp(callee, "new") == 0 && arg_count == 1U && current_function != NULL) {
                 bool ok = cheng_seed_const_value_set_implicit_default(lowering,
                                                               current_function,
@@ -16428,8 +16431,11 @@ static bool cheng_seed_function_name_visible_from_module(const char *owner_modul
 static bool cheng_seed_is_intrinsic_call_name(const char *name) {
     static const char *NAMES[] = {
         "assert",
+        "Assert",
         "echo",
         "len",
+        "Len",
+        "BytesLen",
         "IsOk",
         "IsErr",
         "Value",
@@ -16437,22 +16443,37 @@ static bool cheng_seed_is_intrinsic_call_name(const char *name) {
         "ErrorText",
         "ErrorInfoOf",
         "int",
+        "Int",
         "int8",
+        "Int8",
         "int16",
+        "Int16",
         "int32",
+        "Int32",
         "int64",
+        "Int64",
         "uint8",
+        "UInt8",
         "uint16",
+        "UInt16",
         "uint32",
+        "UInt32",
         "uint64",
+        "UInt64",
         "bool",
+        "Bool",
         "char",
+        "Char",
         "float",
         "float32",
+        "Float32",
         "float64",
+        "Float64",
         "str",
         "cstring",
+        "CString",
         "ptr",
+        "Ptr",
         "new"
     };
     size_t i;
@@ -16535,10 +16556,119 @@ static bool cheng_seed_is_builtin_statement_call_name(const char *callee) {
     }
     return strcmp(callee, "add") == 0 ||
            strcmp(callee, "assert") == 0 ||
+           strcmp(callee, "Assert") == 0 ||
            strcmp(callee, "echo") == 0 ||
            strcmp(callee, "panic") == 0 ||
            strcmp(callee, "system.panic") == 0 ||
+           strcmp(callee, "system.Assert") == 0 ||
            strcmp(callee, "store") == 0;
+}
+
+static const char *cheng_seed_call_leaf_name(const char *callee) {
+    const char *leaf;
+    const char *dot;
+    const char *scan;
+    const char *scope_leaf = NULL;
+    if (callee == NULL) {
+        return "";
+    }
+    leaf = callee;
+    dot = strrchr(callee, '.');
+    if (dot != NULL && dot[1] != '\0') {
+        leaf = dot + 1;
+    }
+    scan = callee;
+    while ((scan = strstr(scan, "::")) != NULL) {
+        if (scan[2] != '\0') {
+            scope_leaf = scan + 2;
+        }
+        scan += 2;
+    }
+    if (scope_leaf != NULL && scope_leaf > leaf) {
+        leaf = scope_leaf;
+    }
+    return leaf;
+}
+
+static const char *cheng_seed_builtin_call_canonical_name(const char *callee) {
+    const char *leaf = cheng_seed_call_leaf_name(callee);
+    if (strcmp(leaf, "Len") == 0 || strcmp(leaf, "BytesLen") == 0) {
+        return "len";
+    }
+    if (strcmp(leaf, "Int") == 0) {
+        return "int";
+    }
+    if (strcmp(leaf, "Int8") == 0) {
+        return "int8";
+    }
+    if (strcmp(leaf, "UInt8") == 0) {
+        return "uint8";
+    }
+    if (strcmp(leaf, "Int16") == 0) {
+        return "int16";
+    }
+    if (strcmp(leaf, "UInt16") == 0) {
+        return "uint16";
+    }
+    if (strcmp(leaf, "Int32") == 0) {
+        return "int32";
+    }
+    if (strcmp(leaf, "UInt32") == 0) {
+        return "uint32";
+    }
+    if (strcmp(leaf, "Int64") == 0) {
+        return "int64";
+    }
+    if (strcmp(leaf, "UInt64") == 0) {
+        return "uint64";
+    }
+    if (strcmp(leaf, "Char") == 0) {
+        return "char";
+    }
+    if (strcmp(leaf, "Bool") == 0) {
+        return "bool";
+    }
+    if (strcmp(leaf, "Ptr") == 0) {
+        return "ptr";
+    }
+    if (strcmp(leaf, "CString") == 0) {
+        return "cstring";
+    }
+    if (strcmp(leaf, "Float32") == 0) {
+        return "float32";
+    }
+    if (strcmp(leaf, "Float64") == 0) {
+        return "float64";
+    }
+    if (strcmp(leaf, "Assert") == 0) {
+        return "assert";
+    }
+    return callee;
+}
+
+static void cheng_seed_canonicalize_builtin_call_name(char *callee, size_t cap) {
+    const char *canonical;
+    if (callee == NULL || cap == 0U || callee[0] == '\0') {
+        return;
+    }
+    canonical = cheng_seed_builtin_call_canonical_name(callee);
+    if (canonical != callee) {
+        snprintf(callee, cap, "%s", canonical);
+    }
+}
+
+static bool cheng_seed_type_text_is_bytes_builtin(const char *type_text) {
+    const char *leaf;
+    if (type_text == NULL) {
+        return false;
+    }
+    if (strcmp(type_text, "Bytes") == 0 ||
+        strcmp(type_text, "std/rawbytes::Bytes") == 0 ||
+        strcmp(type_text, "cheng/std/rawbytes::Bytes") == 0) {
+        return true;
+    }
+    leaf = cheng_seed_call_leaf_name(type_text);
+    return strcmp(leaf, "Bytes") == 0;
 }
 
 static void cheng_seed_lowered_function_add_callee(ChengSeedLoweredFunctionStub *function,
@@ -28839,7 +28969,7 @@ static bool cheng_seed_resolve_field_meta_impl(const ChengSeedLoweringPlanStub *
                                           field_offset_out,
                                           depth + 1U);
     }
-    if (strcmp(normalized_type, "Bytes") == 0) {
+    if (cheng_seed_type_text_is_bytes_builtin(normalized_type)) {
         if (strcmp(field_name, "data") == 0) {
             snprintf(field_type_out, field_type_cap, "%s", "ptr");
             snprintf(field_abi_out, field_abi_cap, "%s", "ptr");
@@ -29747,7 +29877,7 @@ static bool cheng_seed_emit_index_access_address(const ChengSeedSystemLinkPlanSt
     if (local_index >= 0) {
         if (!cheng_seed_expr_materializes_to_address(locals[local_index].type_text,
                                              locals[local_index].abi_class) &&
-            strcmp(normalized_base_type, "Bytes") != 0 &&
+            !cheng_seed_type_text_is_bytes_builtin(normalized_base_type) &&
             strcmp(normalized_base_type, "str") != 0) {
             return false;
         }
@@ -30027,7 +30157,7 @@ static bool cheng_seed_infer_lvalue_expr_type(const ChengSeedSystemLinkPlanStub 
                                 sizeof(normalized_base_type))) {
         return false;
     }
-    if (strcmp(normalized_base_type, "Bytes") == 0) {
+    if (cheng_seed_type_text_is_bytes_builtin(normalized_base_type)) {
         snprintf(field_type_out, field_type_cap, "%s", "int32");
         snprintf(field_abi_out, field_abi_cap, "%s", "i32");
         return true;
@@ -30705,6 +30835,7 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
                                                   NULL)) {
             return false;
         }
+        cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
         if (!cheng_seed_classify_type_call_surface(lowering,
                                            current_function->owner_module_path,
                                            aliases,
@@ -31675,6 +31806,7 @@ static bool cheng_seed_infer_call_expr_type_from_args(const ChengSeedSystemLinkP
                                               NULL)) {
         return false;
     }
+    cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
     result_kind =
         cheng_seed_resolve_result_intrinsic_kind(lowering,
                                          current_function->owner_module_path,
@@ -31865,7 +31997,7 @@ static bool cheng_seed_infer_call_expr_type_from_args(const ChengSeedSystemLinkP
             return false;
         }
         if (strcmp(arg_type, "str") != 0 &&
-            strcmp(arg_type, "Bytes") != 0 &&
+            !cheng_seed_type_text_is_bytes_builtin(arg_type) &&
             !(strlen(arg_type) > 2U && strcmp(arg_type + strlen(arg_type) - 2U, "[]") == 0)) {
             return false;
         }
@@ -32519,7 +32651,7 @@ static bool cheng_seed_infer_expr_type_impl(const ChengSeedSystemLinkPlanStub *p
                                     sizeof(normalized_base_type))) {
             return false;
         }
-        if (strcmp(normalized_base_type, "Bytes") == 0) {
+        if (cheng_seed_type_text_is_bytes_builtin(normalized_base_type)) {
             snprintf(type_out, type_cap, "%s", "int32");
             snprintf(abi_out, abi_cap, "%s", "i32");
             return true;
@@ -32736,7 +32868,7 @@ static bool cheng_seed_try_prepare_index_assignment_call_state(const ChengSeedSy
                                base_type,
                                normalized_base_type,
                                sizeof(normalized_base_type)) &&
-        (strcmp(normalized_base_type, "Bytes") == 0 ||
+        (cheng_seed_type_text_is_bytes_builtin(normalized_base_type) ||
          strcmp(normalized_base_type, "str") == 0 ||
          (strlen(normalized_base_type) > 2U &&
           strcmp(normalized_base_type + strlen(normalized_base_type) - 2U, "[]") == 0) ||
@@ -32877,7 +33009,7 @@ static bool cheng_seed_try_prepare_index_access_call_state(const ChengSeedSystem
                                base_type,
                                normalized_base_type,
                                sizeof(normalized_base_type)) &&
-        (strcmp(normalized_base_type, "Bytes") == 0 ||
+        (cheng_seed_type_text_is_bytes_builtin(normalized_base_type) ||
          strcmp(normalized_base_type, "str") == 0 ||
          (strlen(normalized_base_type) > 2U &&
           strcmp(normalized_base_type + strlen(normalized_base_type) - 2U, "[]") == 0) ||
@@ -34602,7 +34734,7 @@ static bool cheng_seed_codegen_intrinsic_len_expr(const ChengSeedSystemLinkPlanS
         return false;
     }
     if (strcmp(arg_type, "str") != 0 &&
-        strcmp(arg_type, "Bytes") != 0 &&
+        !cheng_seed_type_text_is_bytes_builtin(arg_type) &&
         !(strlen(arg_type) > 2U && strcmp(arg_type + strlen(arg_type) - 2U, "[]") == 0)) {
         return false;
     }
@@ -34632,7 +34764,7 @@ static bool cheng_seed_codegen_intrinsic_len_expr(const ChengSeedSystemLinkPlanS
     {
         const char *len_source_type = field_type[0] != '\0' ? field_type : arg_type;
         int32_t offset = 0;
-        if (strcmp(len_source_type, "str") == 0 || strcmp(len_source_type, "Bytes") == 0) {
+        if (strcmp(len_source_type, "str") == 0 || cheng_seed_type_text_is_bytes_builtin(len_source_type)) {
             offset = 8;
         } else if (strlen(len_source_type) > 2U &&
                    strcmp(len_source_type + strlen(len_source_type) - 2U, "[]") == 0) {
@@ -35191,7 +35323,7 @@ static bool cheng_seed_codegen_expr_scalar(const ChengSeedSystemLinkPlanStub *pl
                 cheng_seed_expr_materializes_to_address(field_type, field_abi)) {
                 return false;
             }
-            if (strcmp(base_type, "Bytes") == 0 ||
+            if (cheng_seed_type_text_is_bytes_builtin(base_type) ||
                 strcmp(base_type, "str") == 0 ||
                 strcmp(field_type, "char") == 0) {
                 cheng_seed_emit_load_scalar_from_address(out, cap, 15, 0, "u8", target_reg);
@@ -35289,6 +35421,7 @@ static bool cheng_seed_codegen_expr_scalar(const ChengSeedSystemLinkPlanStub *pl
         size_t arg_count = 0U;
         char (*args)[4096] = cheng_seed_alloc_call_arg_scratch();
         if (cheng_seed_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_MAX_CALL_ARGS)) {
+        cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
         ChengSeedResultIntrinsicKind result_kind =
             cheng_seed_resolve_result_intrinsic_kind(lowering,
                                              current_function->owner_module_path,
@@ -35640,6 +35773,7 @@ static bool cheng_seed_codegen_expr_scalar(const ChengSeedSystemLinkPlanStub *pl
         free(args);
     }
     if (cheng_seed_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
+        cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
         ChengSeedResultIntrinsicKind result_kind =
             cheng_seed_resolve_result_intrinsic_kind(lowering,
                                              current_function->owner_module_path,
@@ -38382,7 +38516,7 @@ static bool cheng_seed_try_codegen_index_assignment_call(const ChengSeedSystemLi
                                 base_type,
                                 normalized_base_type,
                                 sizeof(normalized_base_type)) &&
-         (strcmp(normalized_base_type, "Bytes") == 0 ||
+         (cheng_seed_type_text_is_bytes_builtin(normalized_base_type) ||
           strcmp(normalized_base_type, "str") == 0 ||
           (strlen(normalized_base_type) > 2U &&
            strcmp(normalized_base_type + strlen(normalized_base_type) - 2U, "[]") == 0) ||
@@ -38597,7 +38731,7 @@ static bool cheng_seed_type_needs_bytes_orc_lifecycle(const ChengSeedLoweringPla
     if (strcmp(normalized_type, "str") == 0) {
         return true;
     }
-    if (strcmp(normalized_type, "Bytes") == 0) {
+    if (cheng_seed_type_text_is_bytes_builtin(normalized_type)) {
         /* Runtime-side owning-block registry makes borrowed Bytes views a
          * no-op at retain/release time while still closing the ORC loop for
          * bytesAlloc-owned payloads. */
@@ -38774,7 +38908,7 @@ static bool cheng_seed_emit_bytes_orc_lifecycle_at_address(const ChengSeedSystem
         cheng_seed_text_appendf(out, cap, "%s:\n", skip_label);
         return true;
     }
-    if (strcmp(normalized_type, "Bytes") == 0) {
+    if (cheng_seed_type_text_is_bytes_builtin(normalized_type)) {
         cheng_seed_emit_load_scalar_from_address(out, cap, addr_reg, 0, "ptr", 9);
         return cheng_seed_emit_bytes_orc_ptr_call_if_non_nil(plan,
                                                      retain ? "cheng_mem_retain" : "cheng_mem_release",
@@ -41891,6 +42025,7 @@ static bool cheng_seed_try_emit_builtin_statement(const ChengSeedSystemLinkPlanS
     arg_text[0] = '\0';
     *handled_out = false;
     if (cheng_seed_parse_call_text(call_text, callee, sizeof(callee), args, &arg_count, CHENG_MAX_CALL_ARGS)) {
+        cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
         ok = cheng_seed_try_emit_builtin_statement_impl(plan,
                                                 lowering,
                                                 current_function,
@@ -41914,6 +42049,7 @@ static bool cheng_seed_try_emit_builtin_statement(const ChengSeedSystemLinkPlanS
                                                sizeof(callee),
                                                arg_text,
                                                sizeof(arg_text))) {
+        cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
         snprintf(args[0], sizeof(args[0]), "%s", arg_text);
         ok = cheng_seed_try_emit_builtin_statement_impl(plan,
                                                 lowering,
@@ -48450,7 +48586,9 @@ static bool cheng_seed_provider_export_roots_for_module(const ChengSeedSystemLin
             "cheng_strformat_lines_bridge",
             "cheng_strutils_join_bridge",
             "copyMem",
+            "driver_c_cli_param1_bridge",
             "driver_c_cli_param1_eq_bridge",
+            "driver_c_collect_args_after_command_bridge",
             "driver_c_collect_args_from_bridge",
             "driver_c_create_dir_all_bridge",
             "driver_c_get_current_dir_bridge",
@@ -48469,6 +48607,8 @@ static bool cheng_seed_provider_export_roots_for_module(const ChengSeedSystemLin
             "driver_c_str_eq_raw_bridge",
             "driver_c_str_from_utf8_copy_bridge",
             "driver_c_str_slice_bridge",
+            "driver_c_progress_bridge",
+            "driver_c_stderr_line_return2_bridge",
             "driver_c_u64_to_str",
             "driver_c_write_text_file_bridge",
             "get_stderr",
@@ -51609,7 +51749,7 @@ static bool cheng_seed_resolve_index_expr_meta_common(const ChengSeedSystemLinkP
                                 normalized_base_type_cap)) {
         return false;
     }
-    if (strcmp(normalized_base_type_out, "Bytes") == 0) {
+    if (cheng_seed_type_text_is_bytes_builtin(normalized_base_type_out)) {
         snprintf(elem_type_out, elem_type_cap, "%s", "int32");
         snprintf(elem_abi_out, elem_abi_cap, "%s", "i32");
         *elem_size_out = 1;
@@ -54048,6 +54188,7 @@ static bool cheng_seed_wasm_analyze_expr(const ChengSeedSystemLinkPlanStub *plan
         size_t arg_count = 0U;
         bool parsed = cheng_seed_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_MAX_CALL_ARGS);
         if (parsed) {
+            cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
             ChengSeedResultIntrinsicKind result_kind =
                 cheng_seed_resolve_result_intrinsic_kind(lowering,
                                                  function->owner_module_path,
@@ -54212,6 +54353,7 @@ static bool cheng_seed_wasm_analyze_expr(const ChengSeedSystemLinkPlanStub *plan
         free(args);
     }
     if (cheng_seed_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
+        cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
         {
             ChengSeedResultIntrinsicKind result_kind =
                 cheng_seed_resolve_result_intrinsic_kind(lowering,
@@ -55418,7 +55560,7 @@ static bool cheng_seed_wasm_emit_expr(const ChengSeedSystemLinkPlanStub *plan,
         if (cheng_seed_expr_materializes_to_address(field_type, field_abi)) {
             return true;
         }
-        if (strcmp(normalized_base_type, "Bytes") == 0 ||
+        if (cheng_seed_type_text_is_bytes_builtin(normalized_base_type) ||
             strcmp(normalized_base_type, "str") == 0 ||
             strcmp(field_type, "char") == 0) {
             return cheng_seed_wasm_emit_field_access_from_base(body, "u8", 0);
@@ -55430,6 +55572,7 @@ static bool cheng_seed_wasm_emit_expr(const ChengSeedSystemLinkPlanStub *plan,
         size_t arg_count = 0U;
         bool parsed = cheng_seed_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_MAX_CALL_ARGS);
         if (parsed) {
+            cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
             ChengSeedResultIntrinsicKind result_kind =
                 cheng_seed_resolve_result_intrinsic_kind(lowering,
                                                  function->owner_module_path,
@@ -55540,6 +55683,7 @@ static bool cheng_seed_wasm_emit_expr(const ChengSeedSystemLinkPlanStub *plan,
         free(args);
     }
     if (cheng_seed_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
+        cheng_seed_canonicalize_builtin_call_name(callee, sizeof(callee));
         ChengSeedResultIntrinsicKind result_kind =
             cheng_seed_resolve_result_intrinsic_kind(lowering,
                                              function->owner_module_path,

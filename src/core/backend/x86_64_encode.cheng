@@ -1,0 +1,340 @@
+import std/result
+
+# x86_64 general-purpose register codes (3-bit encoding)
+const X64_RAX = 0
+const X64_RCX = 1
+const X64_RDX = 2
+const X64_RBX = 3
+const X64_RSP = 4
+const X64_RBP = 5
+const X64_RSI = 6
+const X64_RDI = 7
+const X64_R8 = 8
+const X64_R9 = 9
+const X64_R10 = 10
+const X64_R11 = 11
+const X64_R12 = 12
+const X64_R13 = 13
+const X64_R14 = 14
+const X64_R15 = 15
+
+# Condition codes for Jcc/SETcc/CMOVcc
+const X64_CC_O = 0
+const X64_CC_NO = 1
+const X64_CC_B = 2
+const X64_CC_AE = 3
+const X64_CC_E = 4
+const X64_CC_NE = 5
+const X64_CC_BE = 6
+const X64_CC_A = 7
+const X64_CC_S = 8
+const X64_CC_NS = 9
+const X64_CC_L = 12
+const X64_CC_GE = 13
+const X64_CC_LE = 14
+const X64_CC_G = 15
+
+# Condition codes for Jcc (short form): 70-7F
+fn x64JccShortOpcodes(): uint8[] =
+    var arr: uint8[]
+    arr.len = 16
+    arr[0] = 0x70
+    arr[1] = 0x71
+    arr[2] = 0x72
+    arr[3] = 0x73
+    arr[4] = 0x74
+    arr[5] = 0x75
+    arr[6] = 0x76
+    arr[7] = 0x77
+    arr[8] = 0x78
+    arr[9] = 0x79
+    arr[10] = 0x7A
+    arr[11] = 0x7B
+    arr[12] = 0x7C
+    arr[13] = 0x7D
+    arr[14] = 0x7E
+    arr[15] = 0x7F
+    return arr
+
+fn x64ModRM(mod: int32, reg: int32, rm: int32): uint8 =
+    return uint8(((mod & 3) << 6) | ((reg & 7) << 3) | (rm & 7))
+
+fn x64SIB(scale: int32, index: int32, base: int32): uint8 =
+    return uint8(((scale & 3) << 6) | ((index & 7) << 3) | (base & 7))
+
+fn x64EmitU8(out: var uint8[], v: uint8) =
+    add(out, v)
+
+fn x64EmitU32LE(out: var uint8[], v: uint32) =
+    add(out, uint8(v & 0xFF))
+    add(out, uint8((v >> 8) & 0xFF))
+    add(out, uint8((v >> 16) & 0xFF))
+    add(out, uint8((v >> 24) & 0xFF))
+
+fn x64EmitRex(out: var uint8[], w: bool, rBit: bool, xBit: bool, bBit: bool, force: bool) =
+    let need = force || w || rBit || xBit || bBit
+    if !need:
+        return
+    var byteVal: uint8 = 0x40
+    if w:
+        byteVal = byteVal | 8
+    if rBit:
+        byteVal = byteVal | 4
+    if xBit:
+        byteVal = byteVal | 2
+    if bBit:
+        byteVal = byteVal | 1
+    x64EmitU8(out, byteVal)
+
+fn x64RegRequiresRex(reg: int32): bool =
+    return reg >= 8 && reg <= 15
+
+fn x64RegRexB(reg: int32): bool =
+    return x64RegRequiresRex(reg)
+
+fn x64RegRexR(reg: int32): bool =
+    return x64RegRequiresRex(reg)
+
+fn x64EmitOpEx(out: var uint8[], opcode: uint8, rm: int32, regOp: int32, modBits: int32, w: bool) =
+    let rBit = x64RegRexR(regOp)
+    let bBit = x64RegRexB(rm)
+    x64EmitRex(out, w, rBit, false, bBit, false)
+    x64EmitU8(out, opcode)
+    x64EmitU8(out, x64ModRM(modBits, regOp & 7, rm & 7))
+
+fn x64EmitOpRR(out: var uint8[], opcode: uint8, rd: int32, rs: int32, w: bool) =
+    let rBit = x64RegRexR(rd)
+    let bBit = x64RegRexB(rs)
+    x64EmitRex(out, w, rBit, false, bBit, false)
+    x64EmitU8(out, opcode)
+    x64EmitU8(out, x64ModRM(3, rd & 7, rs & 7))
+
+fn x64EmitMovRegReg(out: var uint8[], rd: int32, rs: int32, w: bool) =
+    x64EmitOpRR(out, 0x89, rd, rs, w)
+
+fn x64EmitMovImm(out: var uint8[], rd: int32, imm: int64) =
+    if imm >= int64(-2147483648) && imm <= int64(2147483647):
+        let w = (imm < int64(-128) || imm > int64(127)) && (imm < int64(-2147483648) || imm > int64(2147483647)) == false
+        if !w:
+            let rBit = x64RegRexR(rd)
+            x64EmitRex(out, false, rBit, false, false, rBit)
+            x64EmitU8(out, uint8(0xB8 + (rd & 7)))
+            x64EmitU32LE(out, uint32(int32(imm)))
+        else:
+            let rBit = x64RegRexR(rd)
+            x64EmitRex(out, true, rBit, false, false, true)
+            x64EmitU8(out, uint8(0xB8 + (rd & 7)))
+            x64EmitU32LE(out, uint32(int32(imm)))
+    else:
+        let rBit = x64RegRexR(rd)
+        x64EmitRex(out, true, rBit, false, false, true)
+        x64EmitU8(out, uint8(0xB8 + (rd & 7)))
+        x64EmitU32LE(out, uint32(uint64(imm) & 0xFFFFFFFF))
+        x64EmitU32LE(out, uint32((uint64(imm) >> 32) & 0xFFFFFFFF))
+
+fn x64EmitAddRR(out: var uint8[], rd: int32, rs: int32, w: bool) =
+    x64EmitOpRR(out, 0x01, rd, rs, w)
+
+fn x64EmitSubRR(out: var uint8[], rd: int32, rs: int32, w: bool) =
+    x64EmitOpRR(out, 0x29, rd, rs, w)
+
+fn x64EmitAndRR(out: var uint8[], rd: int32, rs: int32, w: bool) =
+    x64EmitOpRR(out, 0x21, rd, rs, w)
+
+fn x64EmitOrRR(out: var uint8[], rd: int32, rs: int32, w: bool) =
+    x64EmitOpRR(out, 0x09, rd, rs, w)
+
+fn x64EmitXorRR(out: var uint8[], rd: int32, rs: int32, w: bool) =
+    x64EmitOpRR(out, 0x31, rd, rs, w)
+
+fn x64EmitCmpRR(out: var uint8[], rd: int32, rs: int32, w: bool) =
+    x64EmitOpRR(out, 0x39, rd, rs, w)
+
+fn x64EmitImulRR(out: var uint8[], rd: int32, rs: int32, w: bool) =
+    let rBit = x64RegRexR(rd)
+    let bBit = x64RegRexB(rs)
+    x64EmitRex(out, w, rBit, false, bBit, false)
+    x64EmitU8(out, 0x0F)
+    x64EmitU8(out, 0xAF)
+    x64EmitU8(out, x64ModRM(3, rd & 7, rs & 7))
+
+fn x64EmitShiftRR(out: var uint8[], subop: int32, rd: int32, rs: int32, w: bool) =
+    let rBit = x64RegRexR(rs)
+    let bBit = x64RegRexB(rd)
+    x64EmitRex(out, w, rBit, false, bBit, false)
+    x64EmitU8(out, 0xD3)
+    x64EmitU8(out, x64ModRM(3, subop & 7, rd & 7))
+
+fn x64EmitXorEdxEdx(out: var uint8[]) =
+    x64EmitU8(out, 0x31)
+    x64EmitU8(out, 0xD2)
+
+fn x64EmitCdq(out: var uint8[]) =
+    x64EmitU8(out, 0x99)
+
+fn x64EmitCqo(out: var uint8[]) =
+    x64EmitRex(out, true, false, false, false, true)
+    x64EmitU8(out, 0x99)
+
+fn x64EmitDivRR(out: var uint8[], isSigned: bool, is64: bool, rm: int32) =
+    let bBit = x64RegRexB(rm)
+    x64EmitRex(out, is64, false, false, bBit, false)
+    if isSigned:
+        x64EmitU8(out, 0xF7)
+        x64EmitU8(out, x64ModRM(3, 7, rm & 7))
+    else:
+        x64EmitU8(out, 0xF7)
+        x64EmitU8(out, x64ModRM(3, 6, rm & 7))
+
+fn x64EmitMovsxd(out: var uint8[], rd: int32, rs: int32) =
+    let rBit = x64RegRexR(rd)
+    let bBit = x64RegRexB(rs)
+    x64EmitRex(out, true, rBit, false, bBit, false)
+    x64EmitU8(out, 0x63)
+    x64EmitU8(out, x64ModRM(3, rd & 7, rs & 7))
+
+fn x64EmitSubRspImm32(out: var uint8[], imm: int64) =
+    x64EmitRex(out, true, false, false, false, true)
+    x64EmitU8(out, 0x81)
+    x64EmitU8(out, x64ModRM(3, 5, X64_RSP))
+    x64EmitU32LE(out, uint32(int32(imm)))
+
+fn x64EmitAddRspImm32(out: var uint8[], imm: int64) =
+    x64EmitRex(out, true, false, false, false, true)
+    x64EmitU8(out, 0x81)
+    x64EmitU8(out, x64ModRM(3, 0, X64_RSP))
+    x64EmitU32LE(out, uint32(int32(imm)))
+
+fn x64EmitStore(out: var uint8[], rd: int32, base: int32, offset: int64, w: bool) =
+    let rBit = x64RegRexR(rd)
+    let bBit = x64RegRexB(base)
+    x64EmitRex(out, w, rBit, false, bBit, false)
+    x64EmitU8(out, 0x89)
+    if base == X64_RSP || base == X64_R12:
+        x64EmitU8(out, x64ModRM(2, rd & 7, X64_RSP))
+        x64EmitU8(out, x64SIB(0, X64_RSP, X64_RSP))
+    else:
+        x64EmitU8(out, x64ModRM(2, rd & 7, base & 7))
+    x64EmitU32LE(out, uint32(int32(offset)))
+
+fn x64EmitLoad(out: var uint8[], rd: int32, base: int32, offset: int64, w: bool) =
+    let rBit = x64RegRexR(rd)
+    let bBit = x64RegRexB(base)
+    x64EmitRex(out, w, rBit, false, bBit, false)
+    x64EmitU8(out, 0x8B)
+    if base == X64_RSP || base == X64_R12:
+        x64EmitU8(out, x64ModRM(2, rd & 7, X64_RSP))
+        x64EmitU8(out, x64SIB(0, X64_RSP, X64_RSP))
+    else:
+        x64EmitU8(out, x64ModRM(2, rd & 7, base & 7))
+    x64EmitU32LE(out, uint32(int32(offset)))
+
+fn x64EmitStore8(out: var uint8[], rd: int32, base: int32, offset: int64) =
+    let rBit = x64RegRexR(rd)
+    let bBit = x64RegRexB(base)
+    x64EmitRex(out, false, rBit, false, bBit, bBit)
+    x64EmitU8(out, 0x88)
+    if base == X64_RSP || base == X64_R12:
+        x64EmitU8(out, x64ModRM(2, rd & 7, X64_RSP))
+        x64EmitU8(out, x64SIB(0, X64_RSP, X64_RSP))
+    else:
+        x64EmitU8(out, x64ModRM(2, rd & 7, base & 7))
+    x64EmitU32LE(out, uint32(int32(offset)))
+
+fn x64EmitLoad8(out: var uint8[], rd: int32, base: int32, offset: int64, isSigned: bool) =
+    let rBit = x64RegRexR(rd)
+    let bBit = x64RegRexB(base)
+    x64EmitRex(out, false, rBit, false, bBit, bBit)
+    x64EmitU8(out, 0x0F)
+    if isSigned:
+        x64EmitU8(out, 0xBE)
+    else:
+        x64EmitU8(out, 0xB6)
+    if base == X64_RSP || base == X64_R12:
+        x64EmitU8(out, x64ModRM(2, rd & 7, X64_RSP))
+        x64EmitU8(out, x64SIB(0, X64_RSP, X64_RSP))
+    else:
+        x64EmitU8(out, x64ModRM(2, rd & 7, base & 7))
+    x64EmitU32LE(out, uint32(int32(offset)))
+
+fn x64EmitStore16(out: var uint8[], rd: int32, base: int32, offset: int64) =
+    let rBit = x64RegRexR(rd)
+    let bBit = x64RegRexB(base)
+    x64EmitRex(out, false, rBit, false, bBit, bBit)
+    x64EmitU8(out, 0x66)
+    x64EmitU8(out, 0x89)
+    if base == X64_RSP || base == X64_R12:
+        x64EmitU8(out, x64ModRM(2, rd & 7, X64_RSP))
+        x64EmitU8(out, x64SIB(0, X64_RSP, X64_RSP))
+    else:
+        x64EmitU8(out, x64ModRM(2, rd & 7, base & 7))
+    x64EmitU32LE(out, uint32(int32(offset)))
+
+fn x64EmitLoad16(out: var uint8[], rd: int32, base: int32, offset: int64, isSigned: bool) =
+    let rBit = x64RegRexR(rd)
+    let bBit = x64RegRexB(base)
+    x64EmitRex(out, false, rBit, false, bBit, bBit)
+    x64EmitU8(out, 0x66)
+    x64EmitU8(out, 0x0F)
+    if isSigned:
+        x64EmitU8(out, 0xBF)
+    else:
+        x64EmitU8(out, 0xB7)
+    if base == X64_RSP || base == X64_R12:
+        x64EmitU8(out, x64ModRM(2, rd & 7, X64_RSP))
+        x64EmitU8(out, x64SIB(0, X64_RSP, X64_RSP))
+    else:
+        x64EmitU8(out, x64ModRM(2, rd & 7, base & 7))
+    x64EmitU32LE(out, uint32(int32(offset)))
+
+fn x64EmitLeaRipRel32(out: var uint8[], rd: int32) =
+    let rBit = x64RegRexR(rd)
+    x64EmitRex(out, true, rBit, false, false, rBit)
+    x64EmitU8(out, 0x8D)
+    x64EmitU8(out, x64ModRM(0, rd & 7, 5))
+    x64EmitU32LE(out, 0)
+
+fn x64EmitCallRel32(out: var uint8[]) =
+    x64EmitU8(out, 0xE8)
+    x64EmitU32LE(out, 0)
+
+fn x64EmitJmpRel32(out: var uint8[]) =
+    x64EmitU8(out, 0xE9)
+    x64EmitU32LE(out, 0)
+
+fn x64EmitJccRel32(out: var uint8[], cc: int32) =
+    x64EmitU8(out, 0x0F)
+    x64EmitU8(out, uint8(0x80 + (cc & 15)))
+    x64EmitU32LE(out, 0)
+
+fn x64EmitCallReg(out: var uint8[], reg: int32) =
+    let bBit = x64RegRexB(reg)
+    x64EmitRex(out, true, false, false, bBit, bBit)
+    x64EmitU8(out, 0xFF)
+    x64EmitU8(out, x64ModRM(3, 2, reg & 7))
+
+fn x64EmitRet(out: var uint8[]) =
+    x64EmitU8(out, 0xC3)
+
+fn x64EmitNop(out: var uint8[], count: int32) =
+    for i in 0..<count:
+        x64EmitU8(out, 0x90)
+
+fn x64LoadImm32Count(v: int32): int32 =
+    return 1
+
+fn x64LoadImm64Count(v: int64): int32 =
+    if v >= int64(-2147483648) && v <= int64(2147483647):
+        return 1
+    return 2
+
+fn x64MovImmWordCount(is64: bool, imm: int64): int32 =
+    if !is64:
+        return 1
+    if imm >= int64(-2147483648) && imm <= int64(2147483647):
+        return 1
+    return 2
+
+fn x64AlignPad(out: var uint8[], align: int32, fillByte: int32) =
+    while out.len % align != 0:
+        x64EmitU8(out, uint8(fillByte & 0xFF))

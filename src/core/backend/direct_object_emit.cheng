@@ -57,7 +57,7 @@ fn DirectObjectEmitWriteObjectTextOnly(rootDir: str,
 
 fn DirectObjectEmitRequireIndex(index: int32, label: str) =
     if index < 0:
-        Assert(false, label)
+        assert(false, label)
 
 fn DirectObjectEmitIsReturnI32ConstBodyKind(bodyKind: str): bool =
     return chengpath.TextStartsWith(bodyKind, texpr.BodyKindReturnI32ConstPrefix)
@@ -82,6 +82,260 @@ fn DirectObjectEmitParseSuffixI32(bodyKind: str,
             return 0
         value = value * 10 + int32(ch) - int32('0')
     return value
+
+fn DirectObjectEmitWasmTargetSupported(plan: pobj.PrimaryObjectPlan): bool =
+    return plan.targetTriple == "wasm32-unknown-unknown" && plan.objectFormat == "wasm"
+
+fn DirectObjectEmitWasmWriteUleb(buf: var obuf.ObjectBuffer,
+                                  valueRaw: int32) =
+    var value = valueRaw
+    if value < 0:
+        value = 0
+    while true:
+        var byteValue = value & 127
+        value = value >> 7
+        if value != 0:
+            byteValue = byteValue | 128
+            obuf.ObjectBufferWriteU8(buf, byteValue)
+        else:
+            obuf.ObjectBufferWriteU8(buf, byteValue)
+            break
+
+fn DirectObjectEmitWasmWriteSlebI32(buf: var obuf.ObjectBuffer,
+                                     valueRaw: int32) =
+    var value = valueRaw
+    while true:
+        var byteValue = value & 127
+        value = value >> 7
+        let signSet = (byteValue & 64) != 0
+        let done = (value == 0 && !signSet) || (value == -1 && signSet)
+        if !done:
+            byteValue = byteValue | 128
+        obuf.ObjectBufferWriteU8(buf, byteValue)
+        if done:
+            break
+
+fn DirectObjectEmitWasmWriteName(buf: var obuf.ObjectBuffer,
+                                  name: str) =
+    DirectObjectEmitWasmWriteUleb(buf, Len(name))
+    for i in 0..<Len(name):
+        obuf.ObjectBufferWriteU8(buf, int32(name[i]) & 255)
+
+fn DirectObjectEmitWasmWriteSection(out: var obuf.ObjectBuffer,
+                                     sectionId: int32,
+                                     payload: rawbytes.Bytes) =
+    obuf.ObjectBufferWriteU8(out, sectionId)
+    DirectObjectEmitWasmWriteUleb(out, rawbytes.BytesLen(payload))
+    obuf.ObjectBufferWriteBytes(out, payload)
+
+fn DirectObjectEmitWasmStringIndex(items: str[],
+                                    value: str): int32 =
+    for i in 0..<items.len:
+        if items[i] == value:
+            return i
+    return -1
+
+fn DirectObjectEmitWasmRealFunctionIndex(plan: pobj.PrimaryObjectPlan,
+                                          functionLimit: int32,
+                                          symbolName: str): int32 =
+    if Len(symbolName) <= 0:
+        return -1
+    for i in 0..<functionLimit:
+        if plan.symbolNames[i] == symbolName:
+            return i
+    return -1
+
+fn DirectObjectEmitWasmCollectImportSymbols(plan: pobj.PrimaryObjectPlan,
+                                             functionLimit: int32): str[] =
+    var imports: str[]
+    for functionIndex in 0..<functionLimit:
+        if functionIndex >= plan.itemIds.len:
+            continue
+        let itemId = plan.itemIds[functionIndex]
+        for relocIndex in 0..<plan.relocSourceItemIds.len:
+            if plan.relocSourceItemIds[relocIndex] != itemId:
+                continue
+            let targetSymbol = plan.relocTargetSymbols[relocIndex]
+            if Len(targetSymbol) <= 0:
+                continue
+            if DirectObjectEmitWasmRealFunctionIndex(plan, functionLimit, targetSymbol) >= 0:
+                continue
+            if DirectObjectEmitWasmStringIndex(imports, targetSymbol) < 0:
+                add(imports, targetSymbol)
+    return imports
+
+fn DirectObjectEmitWasmFunctionIndex(plan: pobj.PrimaryObjectPlan,
+                                      functionLimit: int32,
+                                      importSymbols: str[],
+                                      targetSymbol: str): int32 =
+    let importIndex = DirectObjectEmitWasmStringIndex(importSymbols, targetSymbol)
+    if importIndex >= 0:
+        return importIndex
+    let functionIndex = DirectObjectEmitWasmRealFunctionIndex(plan, functionLimit, targetSymbol)
+    if functionIndex >= 0:
+        return importSymbols.len + functionIndex
+    return -1
+
+fn DirectObjectEmitWasmFunctionReturnI32Const(plan: pobj.PrimaryObjectPlan,
+                                               functionIndex: int32,
+                                               outValue: var int32): bool =
+    if functionIndex < 0 || functionIndex >= plan.functionBodyKinds.len:
+        return false
+    if functionIndex < plan.functionStatementCallCounts.len &&
+       plan.functionStatementCallCounts[functionIndex] != 0:
+        return false
+    if functionIndex < plan.functionBodyIRs.len &&
+       plan.functionBodyIRs[functionIndex].callSequence.len != 0:
+        return false
+    let bodyKind = plan.functionBodyKinds[functionIndex]
+    if bodyKind == texpr.BodyKindReturnZeroI32:
+        outValue = 0
+        return true
+    if DirectObjectEmitIsReturnI32ConstBodyKind(bodyKind):
+        outValue = DirectObjectEmitParseSuffixI32(bodyKind, texpr.BodyKindReturnI32ConstPrefix)
+        return true
+    if bodyKind == texpr.BodyKindStatementSequence &&
+       functionIndex < plan.functionStatementReturnModes.len &&
+       functionIndex < plan.functionStatementReturnI32Values.len &&
+       plan.functionStatementReturnModes[functionIndex] == pobj.PrimaryStatementReturnModeI32Const():
+        outValue = plan.functionStatementReturnI32Values[functionIndex]
+        return true
+    return false
+
+fn DirectObjectEmitWasmFunctionSingleNoargCallTarget(plan: pobj.PrimaryObjectPlan,
+                                                      functionIndex: int32,
+                                                      outTarget: var str): bool =
+    outTarget = ""
+    if functionIndex < 0 ||
+       functionIndex >= plan.functionBodyKinds.len ||
+       functionIndex >= plan.itemIds.len:
+        return false
+    var callCount: int32
+    if functionIndex < plan.functionStatementCallCounts.len:
+        callCount = plan.functionStatementCallCounts[functionIndex]
+    if functionIndex < plan.functionBodyIRs.len &&
+       plan.functionBodyIRs[functionIndex].callSequence.len > 0:
+        let bodyIR = plan.functionBodyIRs[functionIndex]
+        if !pobj.PrimaryBodyIrIsCallSequenceReturnInt32(bodyIR):
+            return false
+        if bodyIR.callSequence.len != 1:
+            return false
+        if bodyIR.callSequence[0].argSlots.len != 0:
+            return false
+        outTarget = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+        return Len(outTarget) > 0
+    let bodyKind = plan.functionBodyKinds[functionIndex]
+    var noargCallResult = bodyKind == texpr.BodyKindReturnCallNoargI32 ||
+                          bodyKind == texpr.BodyKindReturnCallNoargPassthrough ||
+                          texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind)
+    if bodyKind == texpr.BodyKindStatementSequence &&
+       functionIndex < plan.functionStatementReturnModes.len &&
+       plan.functionStatementReturnModes[functionIndex] == pobj.PrimaryStatementReturnModeCallResultI32():
+        noargCallResult = true
+    if !noargCallResult:
+        return false
+    if callCount > 1:
+        return false
+    outTarget = DirectObjectEmitRelocTargetForItemOrdinal(plan, plan.itemIds[functionIndex], 0)
+    return Len(outTarget) > 0
+
+fn DirectObjectEmitWasmFunctionSupported(plan: pobj.PrimaryObjectPlan,
+                                          functionLimit: int32,
+                                          importSymbols: str[],
+                                          functionIndex: int32): bool =
+    var returnValue: int32
+    if DirectObjectEmitWasmFunctionReturnI32Const(plan, functionIndex, returnValue):
+        return true
+    var targetSymbol = ""
+    if DirectObjectEmitWasmFunctionSingleNoargCallTarget(plan, functionIndex, targetSymbol):
+        return DirectObjectEmitWasmFunctionIndex(plan, functionLimit, importSymbols, targetSymbol) >= 0
+    return false
+
+fn DirectObjectEmitWasmWriteHeader(out: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(out, 0)
+    obuf.ObjectBufferWriteU8(out, int32('a'))
+    obuf.ObjectBufferWriteU8(out, int32('s'))
+    obuf.ObjectBufferWriteU8(out, int32('m'))
+    obuf.ObjectBufferWriteU8(out, 1)
+    obuf.ObjectBufferWriteU8(out, 0)
+    obuf.ObjectBufferWriteU8(out, 0)
+    obuf.ObjectBufferWriteU8(out, 0)
+
+fn DirectObjectEmitWasmFunctionBodyBytes(plan: pobj.PrimaryObjectPlan,
+                                          functionLimit: int32,
+                                          importSymbols: str[],
+                                          functionIndex: int32): Result[rawbytes.Bytes] =
+    var body = obuf.ObjectBufferInit(16)
+    DirectObjectEmitWasmWriteUleb(body, 0)
+    var returnValue: int32
+    if DirectObjectEmitWasmFunctionReturnI32Const(plan, functionIndex, returnValue):
+        obuf.ObjectBufferWriteU8(body, 65)
+        DirectObjectEmitWasmWriteSlebI32(body, returnValue)
+        obuf.ObjectBufferWriteU8(body, 11)
+        return Ok[rawbytes.Bytes](obuf.ObjectBufferToBytes(body))
+    var targetSymbol = ""
+    if DirectObjectEmitWasmFunctionSingleNoargCallTarget(plan, functionIndex, targetSymbol):
+        let targetIndex = DirectObjectEmitWasmFunctionIndex(plan, functionLimit, importSymbols, targetSymbol)
+        if targetIndex < 0:
+            return Err[rawbytes.Bytes](" direct wasm emit: missing call target")
+        obuf.ObjectBufferWriteU8(body, 16)
+        DirectObjectEmitWasmWriteUleb(body, targetIndex)
+        obuf.ObjectBufferWriteU8(body, 11)
+        return Ok[rawbytes.Bytes](obuf.ObjectBufferToBytes(body))
+    return Err[rawbytes.Bytes](" direct wasm emit: unsupported wasm function body")
+
+fn DirectObjectEmitWasmPlanModuleBytes(plan: pobj.PrimaryObjectPlan,
+                                        functionLimit: int32,
+                                        entryIndex: int32,
+                                        importSymbols: str[]): Result[rawbytes.Bytes] =
+    var out = obuf.ObjectBufferInit(256)
+    DirectObjectEmitWasmWriteHeader(out)
+
+    var typeSection = obuf.ObjectBufferInit(16)
+    DirectObjectEmitWasmWriteUleb(typeSection, 1)
+    obuf.ObjectBufferWriteU8(typeSection, 96)
+    DirectObjectEmitWasmWriteUleb(typeSection, 0)
+    DirectObjectEmitWasmWriteUleb(typeSection, 1)
+    obuf.ObjectBufferWriteU8(typeSection, 127)
+    DirectObjectEmitWasmWriteSection(out, 1, obuf.ObjectBufferToBytes(typeSection))
+
+    if importSymbols.len > 0:
+        var importSection = obuf.ObjectBufferInit(64)
+        DirectObjectEmitWasmWriteUleb(importSection, importSymbols.len)
+        for i in 0..<importSymbols.len:
+            DirectObjectEmitWasmWriteName(importSection, "env")
+            DirectObjectEmitWasmWriteName(importSection, importSymbols[i])
+            obuf.ObjectBufferWriteU8(importSection, 0)
+            DirectObjectEmitWasmWriteUleb(importSection, 0)
+        DirectObjectEmitWasmWriteSection(out, 2, obuf.ObjectBufferToBytes(importSection))
+
+    var functionSection = obuf.ObjectBufferInit(16)
+    DirectObjectEmitWasmWriteUleb(functionSection, functionLimit)
+    for _ in 0..<functionLimit:
+        DirectObjectEmitWasmWriteUleb(functionSection, 0)
+    DirectObjectEmitWasmWriteSection(out, 3, obuf.ObjectBufferToBytes(functionSection))
+
+    var exportSection = obuf.ObjectBufferInit(32)
+    DirectObjectEmitWasmWriteUleb(exportSection, 1)
+    DirectObjectEmitWasmWriteName(exportSection, "main")
+    obuf.ObjectBufferWriteU8(exportSection, 0)
+    DirectObjectEmitWasmWriteUleb(exportSection, importSymbols.len + entryIndex)
+    DirectObjectEmitWasmWriteSection(out, 7, obuf.ObjectBufferToBytes(exportSection))
+
+    var codeSection = obuf.ObjectBufferInit(64)
+    DirectObjectEmitWasmWriteUleb(codeSection, functionLimit)
+    for functionIndex in 0..<functionLimit:
+        let bodyRes = DirectObjectEmitWasmFunctionBodyBytes(plan,
+                                                            functionLimit,
+                                                            importSymbols,
+                                                            functionIndex)
+        if IsErr(bodyRes):
+            return Err[rawbytes.Bytes](Error(bodyRes))
+        let bodyBytes = Value(bodyRes)
+        DirectObjectEmitWasmWriteUleb(codeSection, rawbytes.BytesLen(bodyBytes))
+        obuf.ObjectBufferWriteBytes(codeSection, bodyBytes)
+    DirectObjectEmitWasmWriteSection(out, 10, obuf.ObjectBufferToBytes(codeSection))
+    return Ok[rawbytes.Bytes](obuf.ObjectBufferToBytes(out))
 
 fn DirectObjectEmitAlign(value: int32,
                          align: int32): int32 =
@@ -434,6 +688,69 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
                     return false
     return true
 
+fn DirectObjectEmitValidateWasmMainModule(plan: pobj.PrimaryObjectPlan,
+                                           outputPath: str): Result[bool] =
+    if !DirectObjectEmitWasmTargetSupported(plan):
+        return Err[bool](" direct wasm emit: unsupported target")
+    if Len(outputPath) <= 0:
+        return Err[bool](" direct wasm emit: missing output path")
+    if plan.missingReasons.len > 0:
+        return Err[bool](" direct wasm emit: primary object plan has missing reasons")
+    if plan.symbolNames.len != plan.functionBodyKinds.len ||
+       plan.symbolNames.len != plan.functionWordCounts.len ||
+       plan.symbolNames.len != plan.functionWordOffsets.len ||
+       plan.symbolNames.len != plan.itemIds.len:
+        return Err[bool](" direct wasm emit: malformed primary object plan")
+    if plan.relocTargetSymbols.len != plan.relocSourceItemIds.len ||
+       plan.relocTargetSymbols.len != plan.relocWordOffsets.len:
+        return Err[bool](" direct wasm emit: malformed relocation plan")
+    let functionLimit = DirectObjectEmitRealFunctionLimit(plan)
+    if functionLimit <= 0:
+        return Err[bool](" direct wasm emit: empty function plan")
+    let entryIndex = DirectObjectEmitEntryFunctionIndex(plan, functionLimit)
+    if entryIndex < 0:
+        return Err[bool](" direct wasm emit: missing entry function")
+    for i in functionLimit..<plan.functionBodyKinds.len:
+        if plan.functionBodyKinds[i] != texpr.BodyKindEntryBridge:
+            return Err[bool](" direct wasm emit: unsupported trailing function")
+    let importSymbols = DirectObjectEmitWasmCollectImportSymbols(plan, functionLimit)
+    for functionIndex in 0..<functionLimit:
+        if Len(plan.symbolNames[functionIndex]) <= 0:
+            return Err[bool](" direct wasm emit: missing function symbol")
+        if !DirectObjectEmitWasmFunctionSupported(plan, functionLimit, importSymbols, functionIndex):
+            return Err[bool](" direct wasm emit: only noarg i32 const/call functions are supported")
+    return Ok[bool](true)
+
+fn DirectObjectEmitCanWasmMainModule(plan: pobj.PrimaryObjectPlan,
+                                      outputPath: str): bool =
+    return IsOk(DirectObjectEmitValidateWasmMainModule(plan, outputPath))
+
+fn DirectObjectEmitWasmMainModule(rootDir: str,
+                                   plan: pobj.PrimaryObjectPlan,
+                                   outputPath: str): Result[DirectObjectEmitResult] =
+    let validRes = DirectObjectEmitValidateWasmMainModule(plan, outputPath)
+    if IsErr(validRes):
+        return Err[DirectObjectEmitResult](Error(validRes))
+    let functionLimit = DirectObjectEmitRealFunctionLimit(plan)
+    let entryIndex = DirectObjectEmitEntryFunctionIndex(plan, functionLimit)
+    let importSymbols = DirectObjectEmitWasmCollectImportSymbols(plan, functionLimit)
+    let bytesRes = DirectObjectEmitWasmPlanModuleBytes(plan,
+                                                       functionLimit,
+                                                       entryIndex,
+                                                       importSymbols)
+    if IsErr(bytesRes):
+        return Err[DirectObjectEmitResult](Error(bytesRes))
+    let bytes = Value(bytesRes)
+    let payload = rawbytes.BytesToString(bytes)
+    if !chengpath.WriteTextFile(rootDir, outputPath, payload):
+        return Err[DirectObjectEmitResult](Fmt" direct wasm emit: failed to write wasm module: {outputPath}")
+    var out: DirectObjectEmitResult
+    out.objectPath = outputPath
+    out.bytesWritten = rawbytes.BytesLen(bytes)
+    out.symbolCount = functionLimit + importSymbols.len
+    out.relocCount = 0
+    return Ok[DirectObjectEmitResult](out)
+
 fn DirectObjectEmitStandaloneText(plan: pobj.PrimaryObjectPlan): rawbytes.Bytes =
     return DirectObjectEmitPlanText(plan)
 
@@ -728,7 +1045,7 @@ fn DirectObjectEmitAddPageRelocPair(relocs: var orel.ObjectRelocTable,
                                      label: str) =
     let targetIndex = osym.ObjectSymbolsFind(symbols, targetSymbol)
     if targetIndex < 0:
-        Assert(false, label)
+        assert(false, label)
         return
     DirectObjectEmitRequireIndex(orel.ObjectRelocsAdd(relocs,
                                                       0,

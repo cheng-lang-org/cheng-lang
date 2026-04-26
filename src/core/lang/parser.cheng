@@ -40,6 +40,12 @@ type
         NormalizedExprTry
         NormalizedExprDefaultInit
         NormalizedExprConstructor
+        NormalizedExprReturn
+        NormalizedExprAssign
+        NormalizedExprIfStmt
+        NormalizedExprElifStmt
+        NormalizedExprElseStmt
+        NormalizedExprForStmt
 
     NormalizedExprDetailKind = enum
         NormalizedExprDetailNone
@@ -258,6 +264,18 @@ fn NormalizedExprKindText(kind: NormalizedExprKind): str =
         return "DefaultInitExpr"
     if kind == NormalizedExprConstructor:
         return "ConstructorExpr"
+    if kind == NormalizedExprReturn:
+        return "ReturnStmt"
+    if kind == NormalizedExprAssign:
+        return "AssignStmt"
+    if kind == NormalizedExprIfStmt:
+        return "IfStmt"
+    if kind == NormalizedExprElifStmt:
+        return "ElifStmt"
+    if kind == NormalizedExprElseStmt:
+        return "ElseStmt"
+    if kind == NormalizedExprForStmt:
+        return "ForStmt"
     return "UnknownExpr"
 
 fn NormalizedExprDetailKindCode(detailKind: NormalizedExprDetailKind): int32 =
@@ -368,6 +386,18 @@ fn NormalizedExprKindCode(kind: NormalizedExprKind): int32 =
         return 8
     if kind == NormalizedExprConstructor:
         return 9
+    if kind == NormalizedExprReturn:
+        return 10
+    if kind == NormalizedExprAssign:
+        return 11
+    if kind == NormalizedExprIfStmt:
+        return 12
+    if kind == NormalizedExprElifStmt:
+        return 13
+    if kind == NormalizedExprElseStmt:
+        return 14
+    if kind == NormalizedExprForStmt:
+        return 15
     return 0
 
 fn NormalizedExprLookupTextFirstCode(text: str): int32 =
@@ -1136,6 +1166,55 @@ fn NormalizedExprLayerAppendConstructor(layer: var NormalizedExprLayer,
     add(layer.exprs, expr)
     NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
 
+fn NormalizedExprLayerAppendAssign(layer: var NormalizedExprLayer,
+                                    sourcePath: str,
+                                    lineNumber: int32,
+                                    columnNumber: int32,
+                                    lhsText: str,
+                                    rhsText: str,
+                                    endColumnNumberRaw: int32) =
+    var expr: NormalizedExpr
+    expr.exprId = NormalizedExprMakeCallLikeId(sourcePath,
+                                                 lineNumber,
+                                                 columnNumber,
+                                                 NormalizedExprAssign,
+                                                 NormalizedExprSurfaceCallNone,
+                                                 false,
+                                                 NormalizedExprCallReasonNone,
+                                                 "",
+                                                 "",
+                                                 "",
+                                                 "",
+                                                 false,
+                                                 false,
+                                                 2,
+                                                 rhsText)
+    expr.sourcePath = sourcePath
+    expr.lineNumber = lineNumber
+    expr.columnNumber = columnNumber
+    expr.endLineNumber = lineNumber
+    expr.endColumnNumber = NormalizedExprEndColumn(columnNumber, lhsText)
+    if endColumnNumberRaw >= expr.endColumnNumber:
+        expr.endColumnNumber = endColumnNumberRaw
+    expr.kind = NormalizedExprAssign
+    expr.detailKind = NormalizedExprDetailNone
+    expr.surfaceText = lhsText
+    expr.callSurfaceKind = NormalizedExprSurfaceCallNone
+    expr.callResolved = false
+    expr.callReason = NormalizedExprCallReasonNone
+    expr.callQualifier = ""
+    expr.callCallee = ""
+    expr.callTarget = ""
+    expr.callTargetSourcePath = ""
+    expr.callTargetImportc = false
+    expr.callPrefixStyle = false
+    expr.callArgCount = 2
+    expr.callArgsText = rhsText
+    if NormalizedExprLayerContainsExpr(layer, expr):
+        return
+    add(layer.exprs, expr)
+    NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
+
 fn NormalizedExprLayerAdd(total: var NormalizedExprLayer,
                             delta: NormalizedExprLayer) =
     total.sourceCount = total.sourceCount + delta.sourceCount
@@ -1177,6 +1256,24 @@ fn NormalizedExprLayerDefaultInitCount(layer: NormalizedExprLayer): int32 =
 
 fn NormalizedExprLayerConstructorCount(layer: NormalizedExprLayer): int32 =
     return NormalizedExprLayerCountKind(layer, NormalizedExprConstructor)
+
+fn NormalizedExprLayerReturnCount(layer: NormalizedExprLayer): int32 =
+    return NormalizedExprLayerCountKind(layer, NormalizedExprReturn)
+
+fn NormalizedExprLayerAssignCount(layer: NormalizedExprLayer): int32 =
+    return NormalizedExprLayerCountKind(layer, NormalizedExprAssign)
+
+fn NormalizedExprLayerIfStmtCount(layer: NormalizedExprLayer): int32 =
+    return NormalizedExprLayerCountKind(layer, NormalizedExprIfStmt)
+
+fn NormalizedExprLayerElifStmtCount(layer: NormalizedExprLayer): int32 =
+    return NormalizedExprLayerCountKind(layer, NormalizedExprElifStmt)
+
+fn NormalizedExprLayerElseStmtCount(layer: NormalizedExprLayer): int32 =
+    return NormalizedExprLayerCountKind(layer, NormalizedExprElseStmt)
+
+fn NormalizedExprLayerForStmtCount(layer: NormalizedExprLayer): int32 =
+    return NormalizedExprLayerCountKind(layer, NormalizedExprForStmt)
 
 fn NormalizedExprLayerCallCount(layer: NormalizedExprLayer): int32 =
     return NormalizedExprLayerCountKind(layer, NormalizedExprCall)
@@ -2210,6 +2307,179 @@ fn ParserAppendSimpleSurfaceExprsLine(sourcePath: str,
                                         ParserResultIntrinsicDetailKind(ident),
                                         ident)
         i = stop
+
+fn ParserPreviousNonSpaceChar(lineRaw: str,
+                                stopExclusive: int32): char =
+    if stopExclusive <= 0:
+        return Char(0)
+    var cursor = stopExclusive
+    while cursor > 0:
+        let prevPos = cursor - 1
+        if !ParserIsInlineSpace(lineRaw[prevPos]):
+            return lineRaw[prevPos]
+        cursor = prevPos
+    return Char(0)
+
+fn ParserAppendReturnStmtExprsLine(sourcePath: str,
+                                    lineNumber: int32,
+                                    lineRaw: str,
+                                    layer: var NormalizedExprLayer) =
+    var i: int32
+    var inString = false
+    var inChar = false
+    while i < lineRaw.len:
+        let ch = lineRaw[i]
+        if !inChar && ch == '"' && !ParserQuoteIsEscaped(lineRaw, i):
+            inString = !inString
+            i = i + 1
+            continue
+        if !inString && ch == Char(39) && !ParserQuoteIsEscaped(lineRaw, i):
+            inChar = !inChar
+            i = i + 1
+            continue
+        if inString || inChar:
+            i = i + 1
+            continue
+        if ch == Char(35):
+            return
+        if !ParserIsIdentChar(ch):
+            i = i + 1
+            continue
+        if i > 0:
+            if ParserIsIdentChar(lineRaw[i - 1]):
+                i = i + 1
+                continue
+        var stop = i + 1
+        while stop < lineRaw.len:
+            if !ParserIsIdentChar(lineRaw[stop]):
+                break
+            stop = stop + 1
+        let ident = ParserTextSliceFast(lineRaw, i, stop - i)
+        if ident == "return":
+            let prev = ParserPreviousNonSpaceChar(lineRaw, i)
+            if prev == Char(0) || prev == ':' || prev == ';':
+                let exprText = chengpath.PathTrim(ParserTextSliceFast(lineRaw,
+                                                                       stop,
+                                                                       lineRaw.len - stop))
+                NormalizedExprLayerAppendSpan(layer,
+                                               sourcePath,
+                                               lineNumber,
+                                               i + 1,
+                                               NormalizedExprReturn,
+                                               NormalizedExprDetailNone,
+                                               exprText,
+                                               lineRaw.len)
+        i = stop
+
+fn ParserLineStartsWithStatementKeyword(lineRaw: str,
+                                          keyword: str): bool =
+    let trimmed = chengpath.PathTrim(lineRaw)
+    if trimmed == keyword:
+        return true
+    return ParserStartsWith(trimmed, Fmt"{keyword} ")
+
+fn ParserLineIsAssignmentStmtCandidate(lineRaw: str): bool =
+    if !ParserHasNonTrimChar(lineRaw):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "let"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "var"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "const"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "fn"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "type"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "import"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "if"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "elif"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "else"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "for"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "while"):
+        return false
+    if ParserLineStartsWithStatementKeyword(lineRaw, "return"):
+        return false
+    return ParserFindTopLevelAssignmentEq(lineRaw) >= 0
+
+fn ParserAppendAssignStmtExprsLine(sourcePath: str,
+                                    lineNumber: int32,
+                                    lineRaw: str,
+                                    layer: var NormalizedExprLayer) =
+    if !ParserLineIsAssignmentStmtCandidate(lineRaw):
+        return
+    let eqPos = ParserFindTopLevelAssignmentEq(lineRaw)
+    if eqPos < 0:
+        return
+    let lhsText = chengpath.PathTrim(ParserTextSliceFast(lineRaw, 0, eqPos))
+    let rhsText = chengpath.PathTrim(ParserTextSliceFast(lineRaw,
+                                                         eqPos + 1,
+                                                         lineRaw.len - eqPos - 1))
+    if lhsText == "" || rhsText == "":
+        return
+    NormalizedExprLayerAppendAssign(layer,
+                                    sourcePath,
+                                    lineNumber,
+                                    eqPos + 1,
+                                    lhsText,
+                                    rhsText,
+                                    lineRaw.len)
+
+fn ParserAppendControlStmtExprsLine(sourcePath: str,
+                                     lineNumber: int32,
+                                     lineRaw: str,
+                                     layer: var NormalizedExprLayer) =
+    let lineNoComment = ParserStripLineComment(lineRaw)
+    let trimmed = chengpath.PathTrim(lineNoComment)
+    if trimmed == "":
+        return
+    var kind = NormalizedExprIfStmt
+    var keyword = ""
+    var payloadStart: int32
+    if ParserStartsWith(trimmed, "if "):
+        kind = NormalizedExprIfStmt
+        keyword = "if"
+        payloadStart = 3
+    elif ParserStartsWith(trimmed, "elif "):
+        kind = NormalizedExprElifStmt
+        keyword = "elif"
+        payloadStart = 5
+    elif trimmed == "else:" || trimmed == "else":
+        kind = NormalizedExprElseStmt
+        keyword = "else"
+        payloadStart = 4
+    elif ParserStartsWith(trimmed, "for "):
+        kind = NormalizedExprForStmt
+        keyword = "for"
+        payloadStart = 4
+    else:
+        return
+    let keywordPos = ParserFindText(lineRaw, keyword)
+    if keywordPos < 0:
+        return
+    var payload = ""
+    if kind != NormalizedExprElseStmt:
+        let colonPos = ParserFindTopLevelToken(trimmed, ":")
+        if colonPos <= payloadStart:
+            return
+        payload = chengpath.PathTrim(ParserTextSliceFast(trimmed,
+                                                         payloadStart,
+                                                         colonPos - payloadStart))
+        if payload == "":
+            return
+    NormalizedExprLayerAppendSpan(layer,
+                                   sourcePath,
+                                   lineNumber,
+                                   keywordPos + 1,
+                                   kind,
+                                   NormalizedExprDetailNone,
+                                   payload,
+                                   lineRaw.len)
 
 fn ParserAppendFmtExprsLine(sourcePath: str,
                               lineNumber: int32,
@@ -5046,6 +5316,9 @@ fn ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRaw:
                                              true,
                                              true,
                                              layer)
+        ParserAppendReturnStmtExprsLine(sourcePath, lineNumber, line, layer)
+        ParserAppendAssignStmtExprsLine(sourcePath, lineNumber, line, layer)
+        ParserAppendControlStmtExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendRangeExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendComprehensionExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendFmtExprsLine(sourcePath, lineNumber, line, layer)

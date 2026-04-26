@@ -561,6 +561,47 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteFields(driverRoot: str,
     let planBrowserBridgeObjectPath = slplan.SystemLinkPlanBrowserBridgeObjectPath(linkPlan)
     if Len(planBrowserBridgeObjectPath) > 0:
         return BackendDriverDispatchMinUnsupported("backend driver direct system-link-exec: browser bridge object not yet in direct runtime")
+    if linkPlan.targetTriple == "wasm32-unknown-unknown":
+        if linkPlan.emitKind != creq.EmitExe:
+            let reason = Fmt"backend driver direct system-link-exec: unsupported wasm emit kind: {creq.CompilerEmitText(linkPlan.emitKind)}"
+            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                        reportPath,
+                                                        Fmt"system_link_exec_runtime_execute=0\nerror={reason}\n")
+            return BackendDriverDispatchMinUnsupported(reason)
+        if !direct.DirectObjectEmitCanWasmMainModule(primaryPlan, linkPlan.outputPath):
+            let validRes = direct.DirectObjectEmitValidateWasmMainModule(primaryPlan, linkPlan.outputPath)
+            var reason = "backend driver direct system-link-exec: wasm direct emit not ready"
+            if IsErr(validRes):
+                reason = Error(validRes)
+            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                        reportPath,
+                                                        Fmt"system_link_exec_runtime_execute=0\nerror={reason}\n")
+            return BackendDriverDispatchMinUnsupported(reason)
+        BackendDriverDispatchMinProgress("direct_wasm_emit", "begin")
+        let wasmRes = direct.DirectObjectEmitWasmMainModule(driverRoot, primaryPlan, linkPlan.outputPath)
+        if IsErr(wasmRes):
+            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                        reportPath,
+                                                        Fmt"system_link_exec_runtime_execute=error\nerror={Error(wasmRes)}\n")
+            return BackendDriverDispatchMinUnsupported(Error(wasmRes))
+        let wasm = Value(wasmRes)
+        BackendDriverDispatchMinProgress("direct_wasm_emit", "done")
+        var wasmReport = ""
+        BackendDriverDispatchMinAppendLine(wasmReport, "system_link_exec_runtime_execute=1")
+        BackendDriverDispatchMinAppendLine(wasmReport, "system_link_exec_runtime_wasm_direct=1")
+        BackendDriverDispatchMinAppendLine(wasmReport, "system_link_exec_runtime_standalone_no_runtime=1")
+        BackendDriverDispatchMinAppendLine(wasmReport, Fmt"primary_object={wasm.objectPath}")
+        BackendDriverDispatchMinAppendLine(wasmReport, "primary_object_format=wasm")
+        BackendDriverDispatchMinAppendLine(wasmReport, "provider_object_count=0")
+        BackendDriverDispatchMinAppendLine(wasmReport, "native_link_log=-")
+        BackendDriverDispatchMinAppendLine(wasmReport, "line_map=-")
+        BackendDriverDispatchMinAppendLine(wasmReport, "primary_object_direct=1")
+        BackendDriverDispatchMinAppendLine(wasmReport, Fmt"direct_object_bytes={wasm.bytesWritten}")
+        BackendDriverDispatchMinAppendLine(wasmReport, Fmt"direct_object_symbol_count={wasm.symbolCount}")
+        BackendDriverDispatchMinAppendLine(wasmReport, Fmt"direct_object_reloc_count={wasm.relocCount}")
+        if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, wasmReport):
+            return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
+        return 0
     if linkPlan.emitKind == creq.EmitObj:
         if !direct.DirectObjectEmitCanPlanObject(primaryPlan):
             let validRes = direct.DirectObjectEmitValidatePlanObject(primaryPlan)
@@ -618,8 +659,9 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteFields(driverRoot: str,
         let objectPath = chengpath.PathAbsolute(driverRoot, object.objectPath)
         let outputPath = chengpath.PathAbsolute(driverRoot, linkPlan.outputPath)
         let nativeCommand = Fmt"cc -arch arm64 {os.QuoteShell(objectPath)} -o {os.QuoteShell(outputPath)}"
+        let nativeOptions: uint64 = 1
         BackendDriverDispatchMinProgress("native_link", "begin")
-        let nativeRun = os.ExecShellCmdEx(nativeCommand, UInt64(1), driverRoot)
+        let nativeRun = os.ExecShellCmdEx(nativeCommand, nativeOptions, driverRoot)
         BackendDriverDispatchMinProgress("native_link", "done")
         let _ = BackendDriverDispatchMinWriteReport(driverRoot,
                                                     nativeLinkLogPath,
@@ -714,8 +756,16 @@ fn BackendDriverDispatchMinRunSystemLinkExec(rootDir: str,
     var targetTriple = BackendDriverDispatchMinReadFlagOrDefault(args, "--target", "")
     if Len(targetTriple) <= 0:
         targetTriple = "arm64-apple-darwin"
-    let emitKind = creq.EmitExe
-    let symbolVisibility = "public"
+    var emitKind: creq.CompilerEmit
+    var emitErr = ""
+    let emitRaw = BackendDriverDispatchMinReadFlagOrDefault(args, "--emit", "exe")
+    if !BackendDriverDispatchMinReadEmitKind(emitRaw, emitKind, emitErr):
+        return BackendDriverDispatchMinUnsupported(emitErr)
+    var symbolVisibility = ""
+    var visibilityErr = ""
+    let visibilityRaw = BackendDriverDispatchMinReadFlagOrDefault(args, "--symbol-visibility", "public")
+    if !BackendDriverDispatchMinReadSymbolVisibility(visibilityRaw, symbolVisibility, visibilityErr):
+        return BackendDriverDispatchMinUnsupported(visibilityErr)
     let reportPath = BackendDriverDispatchMinReadFlagOrDefault(args, "--report-out", "")
     let browserBridgeObjectPath = BackendDriverDispatchMinReadFlagOrDefault(args, "--browser-bridge-object", "")
     return BackendDriverDispatchMinRunSystemLinkExecConcreteFields(rootDir,

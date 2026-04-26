@@ -1,0 +1,347 @@
+import std/result
+import std/rawbytes as rawbytes
+import std/strformat
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/object_buffer as obuf
+import cheng/core/backend/object_symbols as osym
+import cheng/core/backend/object_relocs as orel
+
+const
+    ELFCLASS64 = uint64(2)
+    ELFDATA2LSB = uint64(1)
+    EV_CURRENT = uint64(1)
+    EM_RISCV = uint64(243)
+    ET_REL = uint64(1)
+
+    SHT_NULL = uint64(0)
+    SHT_PROGBITS = uint64(1)
+    SHT_SYMTAB = uint64(2)
+    SHT_STRTAB = uint64(3)
+    SHT_RELA = uint64(4)
+    SHT_NOBITS = uint64(8)
+
+    SHF_WRITE = uint64(0x1)
+    SHF_ALLOC = uint64(0x2)
+    SHF_EXECINSTR = uint64(0x4)
+
+    STB_LOCAL = uint64(0)
+    STB_GLOBAL = uint64(1)
+    STT_NOTYPE = uint64(0)
+    STT_FUNC = uint64(2)
+
+    # RISC-V 64-bit relocation types
+    R_RISCV_CALL = uint64(18)
+    R_RISCV_PCREL_HI20 = uint64(23)
+    R_RISCV_PCREL_LO12_I = uint64(24)
+
+    ELF_HDR_SIZE = 64
+    ELF_SHDR_SIZE = 64
+    ELF_SYM_SIZE = 24
+    ELF_RELA_SIZE = 24
+
+type
+    ElfRiscv64WriterResult =
+        objectPath: str
+        bytesWritten: int32
+        symbolCount: int32
+        relocCount: int32
+
+fn elfAlign(value: int32, align: int32): int32 =
+    if align <= 1:
+        return value
+    let mask = align - 1
+    return (value + mask) & (0 - align)
+
+fn elfWriteCString(buf: var obuf.ObjectBuffer,
+                   text: str) =
+    for i in 0..<len(text):
+        obuf.ObjectBufferWriteU8(buf, int32(text[i]) & 255)
+    obuf.ObjectBufferWriteU8(buf, 0)
+
+fn elfWriteShdr(buf: var obuf.ObjectBuffer,
+                nameOff: int32,
+                shType: uint64,
+                flags: uint64,
+                shOffset: int64,
+                shSize: int64,
+                link: int32,
+                info: int32,
+                addralign: int64,
+                entsize: int64) =
+    obuf.ObjectBufferWriteU32LE(buf, uint64(nameOff))
+    obuf.ObjectBufferWriteU32LE(buf, shType)
+    obuf.ObjectBufferWriteU64LE(buf, flags)
+    obuf.ObjectBufferWriteU64LE(buf, uint64(0))
+    obuf.ObjectBufferWriteU64LE(buf, uint64(shOffset))
+    obuf.ObjectBufferWriteU64LE(buf, uint64(shSize))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(link))
+    obuf.ObjectBufferWriteU32LE(buf, uint64(info))
+    obuf.ObjectBufferWriteU64LE(buf, uint64(addralign))
+    obuf.ObjectBufferWriteU64LE(buf, uint64(entsize))
+
+fn elfRiscv64RelocType(kind: orel.ObjectRelocKind): Result[uint64] =
+    # RISC-V64 does not use Abs64; Abs32 and Branch26 both map to R_RISCV_CALL.
+    # Page21 / PageOff12 map to the standard PC-relative HI20 / LO12_I pair.
+    if kind == orel.ObjectRelocAbs64:
+        return Err[uint64](" elf riscv64 object writer: R_RISCV_CALL does not map to ABS64")
+    if kind == orel.ObjectRelocAbs32:
+        return Ok[uint64](R_RISCV_CALL)
+    if kind == orel.ObjectRelocBranch26:
+        return Ok[uint64](R_RISCV_CALL)
+    if kind == orel.ObjectRelocPage21:
+        return Ok[uint64](R_RISCV_PCREL_HI20)
+    if kind == orel.ObjectRelocPageOff12:
+        return Ok[uint64](R_RISCV_PCREL_LO12_I)
+    return Err[uint64](" elf riscv64 object writer: unsupported relocation kind")
+
+fn elfWriteSym(buf: var obuf.ObjectBuffer,
+               nameOff: int32,
+               info: uint64,
+               shndx: int32,
+               value: int64,
+               size: int64) =
+    obuf.ObjectBufferWriteU32LE(buf, uint64(nameOff))
+    obuf.ObjectBufferWriteU8(buf, int32(info & uint64(255)))
+    obuf.ObjectBufferWriteU8(buf, int32((info >> 8) & uint64(255)))
+    obuf.ObjectBufferWriteU16LE(buf, uint64(shndx))
+    obuf.ObjectBufferWriteU64LE(buf, uint64(value))
+    obuf.ObjectBufferWriteU64LE(buf, uint64(size))
+
+fn elfWriteRela(buf: var obuf.ObjectBuffer,
+                offset: int64,
+                info: uint64,
+                addend: int64) =
+    obuf.ObjectBufferWriteU64LE(buf, uint64(offset))
+    obuf.ObjectBufferWriteU64LE(buf, info)
+    obuf.ObjectBufferWriteU64LE(buf, uint64(addend))
+
+fn ElfRiscv64TextObjectBytes(text: rawbytes.Bytes,
+                               symbols: osym.ObjectSymbolTable,
+                               relocs: orel.ObjectRelocTable): Result[rawbytes.Bytes] =
+    var emptyData = rawbytes.emptyBytes()
+    return elfRiscv64Build(text, emptyData, symbols, relocs)
+
+fn ElfRiscv64TextDataObjectBytes(text: rawbytes.Bytes,
+                                   data: rawbytes.Bytes,
+                                   symbols: osym.ObjectSymbolTable,
+                                   relocs: orel.ObjectRelocTable): Result[rawbytes.Bytes] =
+    return elfRiscv64Build(text, data, symbols, relocs)
+
+fn elfRiscv64Build(text: rawbytes.Bytes,
+                    data: rawbytes.Bytes,
+                    symbols: osym.ObjectSymbolTable,
+                    relocs: orel.ObjectRelocTable): Result[rawbytes.Bytes] =
+    let relocCount = orel.ObjectRelocsCount(relocs)
+    let symbolCount = osym.ObjectSymbolsCount(symbols)
+    if symbolCount <= 0:
+        return Err[rawbytes.Bytes](" elf riscv64 object writer: missing symbols")
+
+    let textSize = int64(rawbytes.bytesLen(text))
+    let dataSize = int64(rawbytes.bytesLen(data))
+    let hasData = dataSize > int64(0)
+
+    # Section indices: 0=null, 1=.text, 2=.data(opt), 3/4=.rela.text(opt), N-2=.symtab, N-1=.strtab, N=.shstrtab
+    var shnum = int32(4)
+    let textShndx = int32(1)
+    var dataShndx = int32(0)
+    var relaShndx = int32(0)
+    if hasData:
+        dataShndx = int32(2)
+        shnum = shnum + 1
+    if relocCount > 0:
+        relaShndx = shnum - 2
+        shnum = shnum + 1
+    let symtabShndx = shnum - 2
+    let strtabShndx = shnum - 1
+
+    # Build strtab (symbol names)
+    var strtab = obuf.ObjectBufferInit(256)
+    obuf.ObjectBufferWriteU8(strtab, 0)
+    var symNameOffs: int32[]
+    for i in 0..<symbolCount:
+        add(symNameOffs, obuf.ObjectBufferOffset(strtab))
+        elfWriteCString(strtab, osym.ObjectSymbolsAt(symbols, i).name)
+
+    # Build shstrtab (section names)
+    var shstrtab = obuf.ObjectBufferInit(128)
+    obuf.ObjectBufferWriteU8(shstrtab, 0)
+    var shNameOffs: int32[]
+    add(shNameOffs, obuf.ObjectBufferOffset(shstrtab))
+    obuf.ObjectBufferWriteU8(shstrtab, 0)
+    add(shNameOffs, obuf.ObjectBufferOffset(shstrtab))
+    elfWriteCString(shstrtab, ".text")
+    if hasData:
+        add(shNameOffs, obuf.ObjectBufferOffset(shstrtab))
+        elfWriteCString(shstrtab, ".data")
+    if relocCount > 0:
+        add(shNameOffs, obuf.ObjectBufferOffset(shstrtab))
+        elfWriteCString(shstrtab, ".rela.text")
+    add(shNameOffs, obuf.ObjectBufferOffset(shstrtab))
+    elfWriteCString(shstrtab, ".symtab")
+    add(shNameOffs, obuf.ObjectBufferOffset(shstrtab))
+    elfWriteCString(shstrtab, ".strtab")
+    add(shNameOffs, obuf.ObjectBufferOffset(shstrtab))
+    elfWriteCString(shstrtab, ".shstrtab")
+
+    # Layout
+    let textOff = int64(ELF_HDR_SIZE)
+    let dataOff = elfAlign(int32(textOff + textSize), int32(8))
+    let relaOff = elfAlign(int32(int64(dataOff) + dataSize), int32(8))
+    let symOff = elfAlign(int32(relaOff) + relocCount * ELF_RELA_SIZE, int32(8))
+    let strOff = int64(symOff) + int64(symbolCount + 1) * int64(ELF_SYM_SIZE)
+    let shstrOff = strOff + int64(obuf.ObjectBufferLen(strtab))
+    let shdrOff = elfAlign(int32(shstrOff) + obuf.ObjectBufferLen(shstrtab), int32(8))
+
+    var out = obuf.ObjectBufferInit(int32(shdrOff) + shnum * ELF_SHDR_SIZE + 64)
+
+    # ELF header
+    obuf.ObjectBufferWriteU8(out, int32(0x7F))
+    obuf.ObjectBufferWriteU8(out, int32(69))
+    obuf.ObjectBufferWriteU8(out, int32(76))
+    obuf.ObjectBufferWriteU8(out, int32(70))
+    obuf.ObjectBufferWriteU8(out, int32(ELFCLASS64))
+    obuf.ObjectBufferWriteU8(out, int32(ELFDATA2LSB))
+    obuf.ObjectBufferWriteU8(out, int32(EV_CURRENT))
+    obuf.ObjectBufferWriteU8(out, int32(0))
+    obuf.ObjectBufferWriteU8(out, int32(0))
+    obuf.ObjectBufferWriteU64LE(out, uint64(0))
+    obuf.ObjectBufferWriteU16LE(out, ET_REL)
+    obuf.ObjectBufferWriteU16LE(out, EM_RISCV)
+    obuf.ObjectBufferWriteU32LE(out, EV_CURRENT)
+    obuf.ObjectBufferWriteU64LE(out, uint64(0))
+    obuf.ObjectBufferWriteU64LE(out, uint64(0))
+    obuf.ObjectBufferWriteU32LE(out, uint64(0))
+    obuf.ObjectBufferWriteU16LE(out, uint64(ELF_HDR_SIZE))
+    obuf.ObjectBufferWriteU16LE(out, uint64(ELF_SHDR_SIZE))
+    obuf.ObjectBufferWriteU16LE(out, uint64(shnum))
+    obuf.ObjectBufferWriteU16LE(out, uint64(shnum - 1))
+
+    # .text
+    obuf.ObjectBufferWriteBytes(out, text)
+
+    # .data (optional)
+    if hasData:
+        obuf.ObjectBufferAlign(out, int32(8), 0)
+        obuf.ObjectBufferWriteBytes(out, data)
+
+    # .rela.text (optional)
+    if relocCount > 0:
+        obuf.ObjectBufferAlign(out, int32(8), 0)
+        for i in 0..<relocCount:
+            let reloc = orel.ObjectRelocsAt(relocs, i)
+            let typeRes = elfRiscv64RelocType(reloc.kind)
+            if IsErr(typeRes):
+                return Err[rawbytes.Bytes](Error(typeRes))
+            let rType = Value(typeRes)
+            let rSym = uint64(reloc.symbolIndex)
+            let info = (rSym << 32) | rType
+            elfWriteRela(out, reloc.offset, info, reloc.addend)
+
+    # .symtab
+    obuf.ObjectBufferAlign(out, int32(8), 0)
+    elfWriteSym(out, int32(0), uint64(0), int32(0), int64(0), int64(0))
+    for i in 0..<symbolCount:
+        let sym = osym.ObjectSymbolsAt(symbols, i)
+        var bind = STB_LOCAL
+        var stType = STT_NOTYPE
+        var shndx = int32(0)
+        if sym.undefined:
+            shndx = int32(0)
+        else:
+            stType = STT_FUNC
+            if sym.sectionIndex == 0:
+                shndx = textShndx
+            elif hasData && sym.sectionIndex == 1:
+                shndx = dataShndx
+            else:
+                shndx = textShndx
+        if sym.global:
+            bind = STB_GLOBAL
+        let info = (bind << 4) | stType
+        elfWriteSym(out, symNameOffs[i], info, shndx, sym.offset, sym.size)
+
+    # .strtab
+    obuf.ObjectBufferAlign(out, int32(1), 0)
+    obuf.ObjectBufferWriteBytes(out, obuf.ObjectBufferToBytes(strtab))
+
+    # .shstrtab
+    obuf.ObjectBufferAlign(out, int32(1), 0)
+    obuf.ObjectBufferWriteBytes(out, obuf.ObjectBufferToBytes(shstrtab))
+
+    # Section headers (place last)
+    obuf.ObjectBufferAlign(out, int32(8), 0)
+    # SHT_NULL
+    elfWriteShdr(out, shNameOffs[0], SHT_NULL, uint64(0),
+                 int64(0), int64(0), int32(0), int32(0), int64(0), int64(0))
+    # .text
+    elfWriteShdr(out, shNameOffs[1], SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
+                 textOff, textSize, int32(0), int32(0), int64(4), int64(0))
+    # .data (optional)
+    var nextNameIdx = int32(2)
+    if hasData:
+        elfWriteShdr(out, shNameOffs[nextNameIdx], SHT_PROGBITS, SHF_ALLOC | SHF_WRITE,
+                     int64(dataOff), dataSize, int32(0), int32(0), int64(8), int64(0))
+        nextNameIdx = nextNameIdx + 1
+    # .rela.text (optional)
+    if relocCount > 0:
+        elfWriteShdr(out, shNameOffs[nextNameIdx], SHT_RELA, uint64(0),
+                     relaOff, int64(relocCount * ELF_RELA_SIZE),
+                     int32(symtabShndx), textShndx, int64(8), int64(ELF_RELA_SIZE))
+        nextNameIdx = nextNameIdx + 1
+    # .symtab
+    elfWriteShdr(out, shNameOffs[nextNameIdx], SHT_SYMTAB, uint64(0),
+                 symOff, int64(symbolCount + 1) * int64(ELF_SYM_SIZE),
+                 int32(strtabShndx), int32(1), int64(8), int64(ELF_SYM_SIZE))
+    nextNameIdx = nextNameIdx + 1
+    # .strtab
+    elfWriteShdr(out, shNameOffs[nextNameIdx], SHT_STRTAB, uint64(0),
+                 strOff, int64(obuf.ObjectBufferLen(strtab)),
+                 int32(0), int32(0), int64(1), int64(0))
+    nextNameIdx = nextNameIdx + 1
+    # .shstrtab
+    elfWriteShdr(out, shNameOffs[nextNameIdx], SHT_STRTAB, uint64(0),
+                 shstrOff, int64(obuf.ObjectBufferLen(shstrtab)),
+                 int32(0), int32(0), int64(1), int64(0))
+
+    return Ok[rawbytes.Bytes](obuf.ObjectBufferToBytes(out))
+
+fn elfRiscv64WriteResult(rootDir: str,
+                          outputPath: str,
+                          text: rawbytes.Bytes,
+                          data: rawbytes.Bytes,
+                          symbols: osym.ObjectSymbolTable,
+                          relocs: orel.ObjectRelocTable): Result[ElfRiscv64WriterResult] =
+    let dataSize = rawbytes.bytesLen(data)
+    var bytesRes: Result[rawbytes.Bytes]
+    if dataSize > 0:
+        bytesRes = ElfRiscv64TextDataObjectBytes(text, data, symbols, relocs)
+    else:
+        bytesRes = ElfRiscv64TextObjectBytes(text, symbols, relocs)
+    if IsErr(bytesRes):
+        return Err[ElfRiscv64WriterResult](Error(bytesRes))
+    let bytes = Value(bytesRes)
+    let payload = rawbytes.bytesToString(bytes)
+    if !chengpath.WriteTextFile(rootDir, outputPath, payload):
+        return Err[ElfRiscv64WriterResult](Fmt" elf riscv64 object writer: failed to write object: {outputPath}")
+    var out: ElfRiscv64WriterResult
+    out.objectPath = outputPath
+    out.bytesWritten = rawbytes.bytesLen(bytes)
+    out.symbolCount = osym.ObjectSymbolsCount(symbols)
+    out.relocCount = orel.ObjectRelocsCount(relocs)
+    return Ok[ElfRiscv64WriterResult](out)
+
+fn ElfRiscv64TextObjectWrite(rootDir: str,
+                               outputPath: str,
+                               text: rawbytes.Bytes,
+                               symbols: osym.ObjectSymbolTable,
+                               relocs: orel.ObjectRelocTable): Result[ElfRiscv64WriterResult] =
+    var emptyData = rawbytes.emptyBytes()
+    return elfRiscv64WriteResult(rootDir, outputPath, text, emptyData, symbols, relocs)
+
+fn ElfRiscv64TextDataObjectWrite(rootDir: str,
+                                   outputPath: str,
+                                   text: rawbytes.Bytes,
+                                   data: rawbytes.Bytes,
+                                   symbols: osym.ObjectSymbolTable,
+                                   relocs: orel.ObjectRelocTable): Result[ElfRiscv64WriterResult] =
+    return elfRiscv64WriteResult(rootDir, outputPath, text, data, symbols, relocs)
