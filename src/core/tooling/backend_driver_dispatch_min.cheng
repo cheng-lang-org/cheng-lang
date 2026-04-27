@@ -7,6 +7,7 @@ import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/direct_object_emit as direct
 import cheng/core/backend/system_link_plan as slplan
+import cheng/core/tooling/compiler_csg as ccsg
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/tooling/path as chengpath
 
@@ -42,6 +43,11 @@ fn BackendDriverDispatchMinExitBridge(code: int32)
 
 @importc("puts")
 fn BackendDriverDispatchMinPutsBridge(line: ptr): int32
+
+@importc("driver_c_write_error_report_bridge")
+fn BackendDriverDispatchMinWriteErrorReportBridge(rootDir: str,
+                                                   reportPath: str,
+                                                   reason: str): int32
 
 const
     BackendDriverDispatchMinProcessMemoryExceeded = 125
@@ -441,61 +447,239 @@ fn BackendDriverDispatchMinRunSystemLinkExecWithRequest(rootDir: str,
 
 fn BackendDriverDispatchMinRunSystemLinkExecConcreteRequest(rootDir: str,
                                                              reqBase: creq.CompilerRequest): int32 =
-    let driverRoot = creq.CompilerRequestRootDir(reqBase)
+    let packageRoot = creq.CompilerRequestRootDir(reqBase)
+    let sourcePath = creq.CompilerRequestSourcePath(reqBase)
+    let outputPath = creq.CompilerRequestOutputPath(reqBase)
+    let targetTriple = creq.CompilerRequestTargetTriple(reqBase)
+    let emitKind = creq.CompilerRequestEmitKind(reqBase)
+    let reportPath = creq.CompilerRequestReportPath(reqBase)
+    let symbolVisibility = creq.CompilerRequestSymbolVisibility(reqBase)
+    let browserBridgeObjectPath = creq.CompilerRequestBrowserBridgeObjectPath(reqBase)
+    return BackendDriverDispatchMinRunSystemLinkExecConcreteFields(rootDir,
+                                                                   packageRoot,
+                                                                   sourcePath,
+                                                                   outputPath,
+                                                                   targetTriple,
+                                                                   emitKind,
+                                                                   reportPath,
+                                                                   symbolVisibility,
+                                                                   browserBridgeObjectPath)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcreteFields(driverRoot: str,
+                                                            packageRoot: str,
+                                                            sourcePath: str,
+                                                            outputPath: str,
+                                                            targetTriple: str,
+                                                            emitKind: creq.CompilerEmit,
+                                                            reportPath: str,
+                                                            symbolVisibility: str,
+                                                            browserBridgeObjectPath: str): int32 =
     var linkPlan: slplan.SystemLinkPlanStub
-    var err = ""
+    var err: str
     BackendDriverDispatchMinProgress("system_link_plan", "begin")
-    if !slplan.BuildSystemLinkPlanStub(driverRoot, reqBase, linkPlan, err):
-        let _ = BackendDriverDispatchMinWriteReport(driverRoot,
-                                                    creq.CompilerRequestReportPath(reqBase),
-                                                    Fmt"system_link_exec_runtime_execute=error\nerror={err}\n")
+    if !slplan.BuildSystemLinkPlanStubWithFields(driverRoot,
+                                                  packageRoot,
+                                                  sourcePath,
+                                                  outputPath,
+                                                  targetTriple,
+                                                  emitKind,
+                                                  symbolVisibility,
+                                                  browserBridgeObjectPath,
+                                                  linkPlan,
+                                                  err):
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                               reportPath,
+                                                               err)
         return BackendDriverDispatchMinUnsupported(err)
     BackendDriverDispatchMinProgress("system_link_plan", "done")
+    BackendDriverDispatchMinProgress("compiler_csg", "begin")
+    return BackendDriverDispatchMinRunSystemLinkExecConcretePlan(driverRoot,
+                                                                 reportPath,
+                                                                 linkPlan)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcretePlan(driverRoot: str,
+                                                          reportPath: str,
+                                                          linkPlan: slplan.SystemLinkPlanStub): int32 =
+    return BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterSourceBundle(driverRoot,
+                                                                                  reportPath,
+                                                                                  linkPlan)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterSourceBundle(driverRoot: str,
+                                                                           reportPath: str,
+                                                                           linkPlan: slplan.SystemLinkPlanStub): int32 =
+    let sourceBundleCid = slplan.SystemLinkPlanSourceBundleCidValue(linkPlan)
+    var csg: ccsg.CompilerCsg
+    var csgErr: str
+    if !ccsg.BuildCompilerCsgInto(linkPlan, sourceBundleCid, csg, csgErr):
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                               reportPath,
+                                                               csgErr)
+        return BackendDriverDispatchMinUnsupported(csgErr)
+    return BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterCsg(driverRoot,
+                                                                         reportPath,
+                                                                         linkPlan,
+                                                                         csg)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterCsg(driverRoot: str,
+                                                                  reportPath: str,
+                                                                  linkPlan: slplan.SystemLinkPlanStub,
+                                                                  csg: var ccsg.CompilerCsg): int32 =
+    var err: str
+    BackendDriverDispatchMinProgress("compiler_csg", "done")
     var loweringPlan: lower.LoweringPlanStub
     BackendDriverDispatchMinProgress("lowering_plan", "begin")
-    if !lower.BuildLoweringPlanStub(linkPlan, loweringPlan, err):
-        let _ = BackendDriverDispatchMinWriteReport(driverRoot,
-                                                    creq.CompilerRequestReportPath(reqBase),
-                                                    Fmt"system_link_exec_runtime_execute=error\nerror={err}\n")
+    if !lower.BuildLoweringPlanStubFromCompilerCsg(linkPlan, csg, loweringPlan, err):
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                               reportPath,
+                                                               err)
         return BackendDriverDispatchMinUnsupported(err)
+    return BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterLowering(driverRoot,
+                                                                              reportPath,
+                                                                              linkPlan,
+                                                                              loweringPlan)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterLowering(driverRoot: str,
+                                                                       reportPath: str,
+                                                                       linkPlan: slplan.SystemLinkPlanStub,
+                                                                       loweringPlan: var lower.LoweringPlanStub): int32 =
     BackendDriverDispatchMinProgress("lowering_plan", "done")
     BackendDriverDispatchMinProgress("primary_object_plan", "begin")
-    let primaryRes = pobj.BuildPrimaryObjectPlan(linkPlan, loweringPlan)
-    if IsErr(primaryRes):
-        let _ = BackendDriverDispatchMinWriteReport(driverRoot,
-                                                    creq.CompilerRequestReportPath(reqBase),
-                                                    Fmt"system_link_exec_runtime_execute=error\nerror={Error(primaryRes)}\n")
-        return BackendDriverDispatchMinUnsupported(Error(primaryRes))
-    let primaryPlan = Value(primaryRes)
+    let primaryPlan = pobj.BuildPrimaryObjectPlan(linkPlan, loweringPlan)
     BackendDriverDispatchMinProgress("primary_object_plan", "done")
-    if linkPlan.missingReasons.len > 0 ||
-       loweringPlan.missingReasons.len > 0 ||
-       primaryPlan.missingReasons.len > 0:
-        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: system missing count={intToStr(linkPlan.missingReasons.len)}")
-        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: lowering missing count={intToStr(loweringPlan.missingReasons.len)}")
-        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: primary missing count={intToStr(primaryPlan.missingReasons.len)}")
-        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: primary first_missing_function={primaryPlan.firstMissingFunction}")
-        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: primary first_missing_body_kind={primaryPlan.firstMissingBodyKind}")
-        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: primary first_missing_typed_ir_kind={primaryPlan.firstMissingTypedIrKind}")
-        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct system-link-exec: primary first_missing_line_number={intToStr(primaryPlan.firstMissingLineNumber)}")
-        var notReadyReport = ""
-        BackendDriverDispatchMinAppendLine(notReadyReport, "system_link_exec_runtime_execute=0")
-        BackendDriverDispatchMinAppendLine(notReadyReport, "error=plan_not_ready")
-        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"system_missing_count={intToStr(linkPlan.missingReasons.len)}")
-        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"lowering_missing_count={intToStr(loweringPlan.missingReasons.len)}")
-        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_missing_count={intToStr(primaryPlan.missingReasons.len)}")
-        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_function={primaryPlan.firstMissingFunction}")
-        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_body_kind={primaryPlan.firstMissingBodyKind}")
-        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_typed_ir_kind={primaryPlan.firstMissingTypedIrKind}")
-        BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_line_number={intToStr(primaryPlan.firstMissingLineNumber)}")
-        let _ = BackendDriverDispatchMinWriteReport(driverRoot,
-                                                    creq.CompilerRequestReportPath(reqBase),
-                                                    Fmt"{notReadyReport}\n")
-        BackendDriverDispatchMinPrintErr("backend driver direct system-link-exec: plan not ready")
-        return 2
-    let browserBridgeObjectPath = slplan.SystemLinkPlanBrowserBridgeObjectPath(linkPlan)
-    if len(browserBridgeObjectPath) > 0:
+    return BackendDriverDispatchMinRunSystemLinkExecConcretePlanCheckSystemReady(driverRoot,
+                                                                                 reportPath,
+                                                                                 linkPlan,
+                                                                                 loweringPlan,
+                                                                                 primaryPlan)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanNotReady(driverRoot: str,
+                                                                  reportPath: str,
+                                                                  linkPlan: slplan.SystemLinkPlanStub,
+                                                                  loweringPlan: lower.LoweringPlanStub,
+                                                                  primaryPlan: pobj.PrimaryObjectPlan): int32 =
+    var notReadyReport = ""
+    BackendDriverDispatchMinAppendLine(notReadyReport, "system_link_exec_runtime_execute=0")
+    BackendDriverDispatchMinAppendLine(notReadyReport, "error=plan_not_ready")
+    BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"system_missing_count={intToStr(linkPlan.missingReasons.len)}")
+    BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"lowering_missing_count={intToStr(loweringPlan.missingReasons.len)}")
+    BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_missing_count={intToStr(primaryPlan.missingReasons.len)}")
+    BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_function={primaryPlan.firstMissingFunction}")
+    BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_body_kind={primaryPlan.firstMissingBodyKind}")
+    BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_typed_ir_kind={primaryPlan.firstMissingTypedIrKind}")
+    BackendDriverDispatchMinAppendLine(notReadyReport, Fmt"primary_first_missing_line_number={intToStr(primaryPlan.firstMissingLineNumber)}")
+    let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                reportPath,
+                                                Fmt"{notReadyReport}\n")
+    BackendDriverDispatchMinPrintErr("backend driver direct system-link-exec: plan not ready")
+    return 2
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanCheckSystemReady(driverRoot: str,
+                                                                          reportPath: str,
+                                                                          linkPlan: slplan.SystemLinkPlanStub,
+                                                                          loweringPlan: lower.LoweringPlanStub,
+                                                                          primaryPlan: pobj.PrimaryObjectPlan): int32 =
+    if linkPlan.missingReasons.len > 0:
+        return BackendDriverDispatchMinRunSystemLinkExecConcretePlanNotReady(driverRoot,
+                                                                             reportPath,
+                                                                             linkPlan,
+                                                                             loweringPlan,
+                                                                             primaryPlan)
+    return BackendDriverDispatchMinRunSystemLinkExecConcretePlanCheckLoweringReady(driverRoot,
+                                                                                   reportPath,
+                                                                                   linkPlan,
+                                                                                   loweringPlan,
+                                                                                   primaryPlan)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanCheckLoweringReady(driverRoot: str,
+                                                                            reportPath: str,
+                                                                            linkPlan: slplan.SystemLinkPlanStub,
+                                                                            loweringPlan: lower.LoweringPlanStub,
+                                                                            primaryPlan: pobj.PrimaryObjectPlan): int32 =
+    if loweringPlan.missingReasons.len > 0:
+        return BackendDriverDispatchMinRunSystemLinkExecConcretePlanNotReady(driverRoot,
+                                                                             reportPath,
+                                                                             linkPlan,
+                                                                             loweringPlan,
+                                                                             primaryPlan)
+    return BackendDriverDispatchMinRunSystemLinkExecConcretePlanCheckPrimaryReady(driverRoot,
+                                                                                  reportPath,
+                                                                                  linkPlan,
+                                                                                  loweringPlan,
+                                                                                  primaryPlan)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanCheckPrimaryReady(driverRoot: str,
+                                                                           reportPath: str,
+                                                                           linkPlan: slplan.SystemLinkPlanStub,
+                                                                           loweringPlan: lower.LoweringPlanStub,
+                                                                           primaryPlan: pobj.PrimaryObjectPlan): int32 =
+    if primaryPlan.missingReasons.len > 0:
+        return BackendDriverDispatchMinRunSystemLinkExecConcretePlanNotReady(driverRoot,
+                                                                             reportPath,
+                                                                             linkPlan,
+                                                                             loweringPlan,
+                                                                             primaryPlan)
+    return BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterReady(driverRoot,
+                                                                           reportPath,
+                                                                           linkPlan,
+                                                                           primaryPlan)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterReady(driverRoot: str,
+                                                                    reportPath: str,
+                                                                    linkPlan: slplan.SystemLinkPlanStub,
+                                                                    primaryPlan: pobj.PrimaryObjectPlan): int32 =
+    let planBrowserBridgeObjectPath = slplan.SystemLinkPlanBrowserBridgeObjectPath(linkPlan)
+    if len(planBrowserBridgeObjectPath) > 0:
         return BackendDriverDispatchMinUnsupported("backend driver direct system-link-exec: browser bridge object not yet in direct runtime")
+    return BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterBrowserReady(driverRoot,
+                                                                                  reportPath,
+                                                                                  linkPlan,
+                                                                                  primaryPlan)
+
+fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterBrowserReady(driverRoot: str,
+                                                                           reportPath: str,
+                                                                           linkPlan: slplan.SystemLinkPlanStub,
+                                                                           primaryPlan: pobj.PrimaryObjectPlan): int32 =
+    if linkPlan.targetTriple == "wasm32-unknown-unknown":
+        if linkPlan.emitKind != creq.EmitExe:
+            let reason = Fmt"backend driver direct system-link-exec: unsupported wasm emit kind: {creq.CompilerEmitText(linkPlan.emitKind)}"
+            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                        reportPath,
+                                                        Fmt"system_link_exec_runtime_execute=0\nerror={reason}\n")
+            return BackendDriverDispatchMinUnsupported(reason)
+        if !direct.DirectObjectEmitCanWasmMainModule(primaryPlan, linkPlan.outputPath):
+            let validRes = direct.DirectObjectEmitValidateWasmMainModule(primaryPlan, linkPlan.outputPath)
+            var reason = "backend driver direct system-link-exec: wasm direct emit not ready"
+            if IsErr(validRes):
+                reason = Error(validRes)
+            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
+                                                        reportPath,
+                                                        Fmt"system_link_exec_runtime_execute=0\nerror={reason}\n")
+            return BackendDriverDispatchMinUnsupported(reason)
+        BackendDriverDispatchMinProgress("direct_wasm_emit", "begin")
+        let wasmRes = direct.DirectObjectEmitWasmMainModule(driverRoot, primaryPlan, linkPlan.outputPath)
+        if IsErr(wasmRes):
+            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                                   reportPath,
+                                                                   Error(wasmRes))
+            return BackendDriverDispatchMinUnsupported(Error(wasmRes))
+        let wasm = Value(wasmRes)
+        BackendDriverDispatchMinProgress("direct_wasm_emit", "done")
+        var wasmReport = ""
+        BackendDriverDispatchMinAppendLine(wasmReport, "system_link_exec_runtime_execute=1")
+        BackendDriverDispatchMinAppendLine(wasmReport, "system_link_exec_runtime_wasm_direct=1")
+        BackendDriverDispatchMinAppendLine(wasmReport, "system_link_exec_runtime_standalone_no_runtime=1")
+        BackendDriverDispatchMinAppendLine(wasmReport, Fmt"primary_object={wasm.objectPath}")
+        BackendDriverDispatchMinAppendLine(wasmReport, "primary_object_format=wasm")
+        BackendDriverDispatchMinAppendLine(wasmReport, "provider_object_count=0")
+        BackendDriverDispatchMinAppendLine(wasmReport, "native_link_log=-")
+        BackendDriverDispatchMinAppendLine(wasmReport, "line_map=-")
+        BackendDriverDispatchMinAppendLine(wasmReport, "primary_object_direct=1")
+        BackendDriverDispatchMinAppendLine(wasmReport, Fmt"direct_object_bytes={intToStr(wasm.bytesWritten)}")
+        BackendDriverDispatchMinAppendLine(wasmReport, Fmt"direct_object_symbol_count={intToStr(wasm.symbolCount)}")
+        BackendDriverDispatchMinAppendLine(wasmReport, Fmt"direct_object_reloc_count={intToStr(wasm.relocCount)}")
+        if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, wasmReport):
+            return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
+        return 0
     if linkPlan.emitKind == creq.EmitObj:
         if !direct.DirectObjectEmitCanPlanObject(primaryPlan):
             let validRes = direct.DirectObjectEmitValidatePlanObject(primaryPlan)
@@ -503,15 +687,15 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteRequest(rootDir: str,
             if IsErr(validRes):
                 reason = Error(validRes)
             let _ = BackendDriverDispatchMinWriteReport(driverRoot,
-                                                        creq.CompilerRequestReportPath(reqBase),
+                                                        reportPath,
                                                         Fmt"system_link_exec_runtime_execute=0\nerror={reason}\n")
             return BackendDriverDispatchMinUnsupported(reason)
         BackendDriverDispatchMinProgress("direct_object_emit", "begin")
         let objectRes = direct.DirectObjectEmitPlanObject(driverRoot, primaryPlan)
         if IsErr(objectRes):
-            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
-                                                        creq.CompilerRequestReportPath(reqBase),
-                                                        Fmt"system_link_exec_runtime_execute=error\nerror={Error(objectRes)}\n")
+            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                                   reportPath,
+                                                                   Error(objectRes))
             return BackendDriverDispatchMinUnsupported(Error(objectRes))
         let object = Value(objectRes)
         BackendDriverDispatchMinProgress("direct_object_emit", "done")
@@ -527,8 +711,8 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteRequest(rootDir: str,
         BackendDriverDispatchMinAppendLine(objectReport, Fmt"direct_object_bytes={intToStr(object.bytesWritten)}")
         BackendDriverDispatchMinAppendLine(objectReport, Fmt"direct_object_symbol_count={intToStr(object.symbolCount)}")
         BackendDriverDispatchMinAppendLine(objectReport, Fmt"direct_object_reloc_count={intToStr(object.relocCount)}")
-        if !BackendDriverDispatchMinWriteReport(driverRoot, creq.CompilerRequestReportPath(reqBase), objectReport):
-            return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {creq.CompilerRequestReportPath(reqBase)}")
+        if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, objectReport):
+            return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
         return 0
     if linkPlan.emitKind == creq.EmitExe:
         if !direct.DirectObjectEmitCanStandaloneMain(primaryPlan):
@@ -537,15 +721,15 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteRequest(rootDir: str,
             if IsErr(validRes):
                 reason = Error(validRes)
             let _ = BackendDriverDispatchMinWriteReport(driverRoot,
-                                                        creq.CompilerRequestReportPath(reqBase),
+                                                        reportPath,
                                                         Fmt"system_link_exec_runtime_execute=0\nerror={reason}\n")
             return BackendDriverDispatchMinUnsupported(reason)
         BackendDriverDispatchMinProgress("direct_object_emit", "begin")
         let objectRes = direct.DirectObjectEmitStandaloneMain(driverRoot, primaryPlan)
         if IsErr(objectRes):
-            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
-                                                        creq.CompilerRequestReportPath(reqBase),
-                                                        Fmt"system_link_exec_runtime_execute=error\nerror={Error(objectRes)}\n")
+            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                                   reportPath,
+                                                                   Error(objectRes))
             return BackendDriverDispatchMinUnsupported(Error(objectRes))
         let object = Value(objectRes)
         BackendDriverDispatchMinProgress("direct_object_emit", "done")
@@ -561,9 +745,9 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteRequest(rootDir: str,
                                                     os.ExecCmdResultOutput(nativeRun))
         if os.ExecCmdResultExitCode(nativeRun) != 0:
             let reason = Fmt"backend driver direct system-link-exec: native link failed rc={intToStr(os.ExecCmdResultExitCode(nativeRun))} log={nativeLinkLogPath}"
-            let _ = BackendDriverDispatchMinWriteReport(driverRoot,
-                                                        creq.CompilerRequestReportPath(reqBase),
-                                                        Fmt"system_link_exec_runtime_execute=error\nerror={reason}\n")
+            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                                   reportPath,
+                                                                   reason)
             return BackendDriverDispatchMinUnsupported(reason)
         var exeReport = ""
         BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_execute=1")
@@ -577,23 +761,25 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteRequest(rootDir: str,
         BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_bytes={intToStr(object.bytesWritten)}")
         BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_symbol_count={intToStr(object.symbolCount)}")
         BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_reloc_count={intToStr(object.relocCount)}")
-        if !BackendDriverDispatchMinWriteReport(driverRoot, creq.CompilerRequestReportPath(reqBase), exeReport):
-            return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {creq.CompilerRequestReportPath(reqBase)}")
+        if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, exeReport):
+            return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
         return 0
     let reason = Fmt"backend driver direct system-link-exec: unsupported emit kind: {creq.CompilerEmitText(linkPlan.emitKind)}"
     let _ = BackendDriverDispatchMinWriteReport(driverRoot,
-                                                creq.CompilerRequestReportPath(reqBase),
+                                                reportPath,
                                                 Fmt"system_link_exec_runtime_execute=0\nerror={reason}\n")
     return BackendDriverDispatchMinUnsupported(reason)
 
 fn BackendDriverDispatchMinRunSystemLinkExec(rootDir: str,
                                               args: str[]): int32 =
     let reqRes = creq.CompilerRequestFromArgs(rootDir, args)
-    return BackendDriverDispatchMinRunSystemLinkExecWithRequest(rootDir, reqRes)
+    let code: int32 = BackendDriverDispatchMinRunSystemLinkExecWithRequest(rootDir, reqRes)
+    return code
 
 fn BackendDriverDispatchMinRunSystemLinkExecFromCmdline(rootDir: str): int32 =
-    let reqRes = creq.CompilerRequestFromCmdline(rootDir)
-    return BackendDriverDispatchMinRunSystemLinkExecWithRequest(rootDir, reqRes)
+    let code: int32 = BackendDriverDispatchMinRunSystemLinkExecWithRequest(rootDir,
+                                                                           creq.CompilerRequestFromCmdline(rootDir))
+    return code
 
 fn BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline(): int32 =
     let rootDir = chengpath.PathCurrentDir()

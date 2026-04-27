@@ -1,5 +1,8 @@
 # Lessons
 
+- 2026-04-27: `runtime/native` 是遗留 C runtime 源目录；新增运行时桥必须先落到 `src/core/runtime/*provider*.cheng` 纯 Cheng provider，并同步 direct runtime export roots，不能继续扩展 C 源。
+- 2026-04-27: 顶层 `runtime/` 目录属于旧 C/头文件 runtime surface；纯 Cheng 主线只保留 `src/core/runtime` provider 和 `src/runtime` Cheng 包源码，顶层目录回潮要由 compiler runtime audit 硬报。
+- 2026-04-27: RSS 守卫里的 process-group 语义必须按进程组求和；不能用单 pid RSS bridge 替代，否则会低估编译器子进程内存。
 - 2026-04-27: 纯 Cheng 自举任务不能把 C seed forced build 当完成依据；C seed 最多用于刷新引导候选，最终能力必须由 `artifacts/backend_driver/cheng` pure self `system-link-exec` 证明。
 - 2026-04-27: system link plan 不能用嵌套三目表达式替换关键分支来“移动” first missing；当前 build-backend-driver 会退到 `stmt_let` primary 缺口并失败，应从 lowering/primary 正式补能力。
 - 2026-04-27: backend driver 12GiB 自举诊断期不要把大函数里的小分支随手抽成 helper；新增可达函数会放大 lowering 闭包和 RSS，必须先证明能降低内存峰值。

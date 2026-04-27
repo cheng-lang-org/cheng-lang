@@ -214,11 +214,13 @@ static const char *ChengSeed_SUPPORTED_COMMANDS_V2[] = {
 static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "compiler_entry_source",
     "compiler_runtime_source",
+    "compiler_support_matrix_source",
     "compiler_request_source",
     "tooling_gate_source",
     "lang_parser_source",
     "lang_typed_expr_source",
     "core_ir_types_source",
+    "core_ir_type_abi_source",
     "core_ir_low_uir_source",
     "core_ir_body_ir_loop_source",
     "core_ir_body_ir_noalias_source",
@@ -241,9 +243,14 @@ static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "runtime_core_runtime_source",
     "runtime_compiler_runtime_source",
     "runtime_debug_runtime_source",
+    "runtime_program_support_get_env_provider_source",
     "tooling_bootstrap_contract_source",
+    "tooling_hotpath_scan_source",
     "tooling_debug_tools_gate_source",
     "tooling_export_visibility_gate_source",
+    "tooling_host_bridge_audit_gate_source",
+    "tooling_host_smoke_gate_source",
+    "tooling_object_debug_report_source",
     "backend_build_plan_source"
 };
 
