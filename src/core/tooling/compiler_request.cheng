@@ -3,7 +3,6 @@ import std/result
 import std/strings
 import std/strformat
 import std/strutils as strutil
-import cheng/core/tooling/bootstrap_contracts as contracts
 import cheng/core/tooling/path as chengpath
 
 type
@@ -21,6 +20,7 @@ type
         reportPath: str
         symbolVisibility: str
         browserBridgeObjectPath: str
+        exportRootSymbols: str[]
 
 fn CompilerSymbolVisibilityPublic(): str =
     return "public"
@@ -28,15 +28,19 @@ fn CompilerSymbolVisibilityPublic(): str =
 fn CompilerSymbolVisibilityInternal(): str =
     return "internal"
 
+fn CompilerStringOk(value: str): Result[str] =
+    return Ok[str](value)
+
 fn CompilerSymbolVisibilityFromText(raw: str): Result[str] =
     let trimmed = strutil.Strip(raw)
     if Len(trimmed) <= 0:
-        return Ok[str](CompilerSymbolVisibilityPublic())
+        return CompilerStringOk(CompilerSymbolVisibilityPublic())
     if trimmed == CompilerSymbolVisibilityPublic():
-        return Ok[str](trimmed)
+        return CompilerStringOk(trimmed)
     if trimmed == CompilerSymbolVisibilityInternal():
-        return Ok[str](trimmed)
-    return Err[str](Fmt" compiler: unsupported --symbol-visibility: {trimmed}")
+        return CompilerStringOk(trimmed)
+    let message = Fmt" compiler: unsupported --symbol-visibility: {trimmed}"
+    return Err[str](message)
 
 fn CompilerRequestNew(rootDir: str,
                         sourcePath: str,
@@ -44,6 +48,7 @@ fn CompilerRequestNew(rootDir: str,
                         targetTriple: str,
                         emitKind: CompilerEmit,
                         reportPath: str): CompilerRequest =
+    let symbolVisibility = CompilerSymbolVisibilityPublic()
     return CompilerRequest(
         rootDir: rootDir,
         sourcePath: sourcePath,
@@ -51,8 +56,9 @@ fn CompilerRequestNew(rootDir: str,
         targetTriple: targetTriple,
         emitKind: emitKind,
         reportPath: reportPath,
-        symbolVisibility: CompilerSymbolVisibilityPublic(),
-        browserBridgeObjectPath: ""
+        symbolVisibility: symbolVisibility,
+        browserBridgeObjectPath: "",
+        exportRootSymbols: []
     )
 
 fn CompilerRequestWithSymbolVisibility(req: CompilerRequest,
@@ -65,6 +71,28 @@ fn CompilerRequestWithBrowserBridgeObject(req: CompilerRequest,
                                             browserBridgeObjectPath: str): CompilerRequest =
     var out = req
     out.browserBridgeObjectPath = strutil.Strip(browserBridgeObjectPath)
+    return out
+
+fn CompilerRequestWithExportRootSymbols(req: CompilerRequest,
+                                          roots: str[]): CompilerRequest =
+    var out = req
+    out.exportRootSymbols = []
+    for i in 0..<roots.len:
+        let root = strutil.Strip(roots[i])
+        if Len(root) > 0:
+            add(out.exportRootSymbols, root)
+    return out
+
+fn CompilerExportRootSymbolsFromText(raw: str): str[] =
+    var out: str[]
+    let trimmed = strutil.Strip(raw)
+    if Len(trimmed) <= 0:
+        return out
+    let parts = strutil.Split(trimmed, ',')
+    for i in 0..<parts.len:
+        let item = strutil.Strip(parts[i])
+        if Len(item) > 0:
+            add(out, item)
     return out
 
 fn CompilerRequestSourcePath(req: CompilerRequest): str =
@@ -90,6 +118,9 @@ fn CompilerRequestSymbolVisibility(req: CompilerRequest): str =
 
 fn CompilerRequestBrowserBridgeObjectPath(req: CompilerRequest): str =
     return req.browserBridgeObjectPath
+
+fn CompilerRequestExportRootSymbols(req: CompilerRequest): str[] =
+    return req.exportRootSymbols
 
 fn CompilerReadFlagOrDefault(args: str[],
                                key: str,
@@ -127,6 +158,15 @@ fn CompilerReadEnvPair(primaryKey: str,
     if Len(aliasKey) > 0:
         return os.GetEnv(aliasKey)
     return ""
+
+fn CompilerDefaultTargetTriple(): str =
+    let chengTarget = os.GetEnv("CHENG_TARGET")
+    if Len(chengTarget) > 0:
+        return chengTarget
+    let backendTarget = os.GetEnv("BACKEND_TARGET")
+    if Len(backendTarget) > 0:
+        return backendTarget
+    return "arm64-apple-darwin"
 
 fn CompilerTextStartsWith(text: str,
                             prefix: str): bool =
@@ -211,6 +251,7 @@ fn CompilerLegacyBackendCompatAllowedFlag(arg: str): bool =
        CompilerFlagMatches(arg, "--target") ||
        CompilerFlagMatches(arg, "--browser-bridge-object") ||
        CompilerFlagMatches(arg, "--symbol-visibility") ||
+       CompilerFlagMatches(arg, "--export-roots") ||
        CompilerFlagMatches(arg, "--report-out") ||
        CompilerFlagMatches(arg, "--report"):
         return true
@@ -249,17 +290,24 @@ fn CompilerEmitText(kind: CompilerEmit): str =
         return "shared"
     return "unknown"
 
+fn CompilerEmitOk(value: CompilerEmit): Result[CompilerEmit] =
+    return Ok[CompilerEmit](value)
+
 fn CompilerEmitFromText(raw: str): Result[CompilerEmit] =
     if raw == "exe":
-        return Ok[CompilerEmit](EmitExe)
+        return CompilerEmitOk(EmitExe)
     if raw == "obj":
-        return Ok[CompilerEmit](EmitObj)
+        return CompilerEmitOk(EmitObj)
     if raw == "shared":
-        return Ok[CompilerEmit](EmitShared)
-    return Err[CompilerEmit](Fmt" compiler: unsupported --emit: {raw}")
+        return CompilerEmitOk(EmitShared)
+    let message = Fmt" compiler: unsupported --emit: {raw}"
+    return Err[CompilerEmit](message)
 
 fn CompilerDefaultPackageRoot(workspaceRoot: str): str =
     return workspaceRoot
+
+fn CompilerStringIdentity(value: str): str =
+    return value
 
 fn CompilerPathIsWithinDir(pathRaw: str,
                              dirRaw: str): bool =
@@ -306,15 +354,15 @@ fn CompilerResolvePackageRoot(workspaceRoot: str,
                                 packageRootRaw: str): str =
     let packageRoot = chengpath.PathAbsolute(workspaceRoot, packageRootRaw)
     if Len(packageRoot) <= 0:
-        return packageRoot
+        return CompilerStringIdentity(packageRoot)
     let baseRoot = packageRoot
     let sourcePath = chengpath.PathAbsolute(workspaceRoot, sourcePathRaw)
     if Len(sourcePath) <= 0 || !CompilerPathIsWithinDir(sourcePath, baseRoot):
-        return baseRoot
+        return CompilerStringIdentity(baseRoot)
     let nearestPackageRoot = CompilerFindNearestPackageRoot(baseRoot, sourcePath)
     if Len(nearestPackageRoot) > 0:
-        return nearestPackageRoot
-    return baseRoot
+        return CompilerStringIdentity(nearestPackageRoot)
+    return CompilerStringIdentity(baseRoot)
 
 fn CompilerWorldHeadFromArgs(args: str[]): str =
     return CompilerReadFlagOrDefault(args, "--world-head", "")
@@ -340,6 +388,9 @@ fn CompilerChannelFromArgs(args: str[]): str =
         return channel
     return "stable"
 
+fn CompilerRequestOk(value: CompilerRequest): Result[CompilerRequest] =
+    return Ok[CompilerRequest](value)
+
 fn CompilerRequestFromArgsForCommand(workspaceRoot: str,
                                        args: str[],
                                        requireOutput: bool): Result[CompilerRequest] =
@@ -355,7 +406,7 @@ fn CompilerRequestFromArgsForCommand(workspaceRoot: str,
         return Err[CompilerRequest](" compiler: missing --out")
     var targetTriple = CompilerReadFlagOrDefault(args, "--target", "")
     if Len(targetTriple) <= 0:
-        targetTriple = contracts.BootstrapDefaultTarget()
+        targetTriple = CompilerDefaultTargetTriple()
     var emitText = CompilerReadFlagOrDefault(args, "--emit", "")
     if Len(emitText) <= 0:
         emitText = "exe"
@@ -369,16 +420,20 @@ fn CompilerRequestFromArgsForCommand(workspaceRoot: str,
     if IsErr(symbolVisibilityRes):
         return Err[CompilerRequest](Error(symbolVisibilityRes))
     let browserBridgeObjectPath = CompilerReadFlagOrDefault(args, "--browser-bridge-object", "")
-    return Ok[CompilerRequest](CompilerRequestWithBrowserBridgeObject(CompilerRequestWithSymbolVisibility(CompilerRequestNew(
+    let exportRootsText = CompilerReadFlagOrDefault(args, "--export-roots", "")
+    let baseRequest = CompilerRequestNew(
         packageRoot,
         sourcePath,
         outputPath,
         targetTriple,
         Value(emitKindRes),
         reportPath
-    ),
-    Value(symbolVisibilityRes)),
-    browserBridgeObjectPath))
+    )
+    let visibleRequest = CompilerRequestWithSymbolVisibility(baseRequest, Value(symbolVisibilityRes))
+    let bridgeRequest = CompilerRequestWithBrowserBridgeObject(visibleRequest, browserBridgeObjectPath)
+    let request = CompilerRequestWithExportRootSymbols(bridgeRequest,
+                                                       CompilerExportRootSymbolsFromText(exportRootsText))
+    return CompilerRequestOk(request)
 
 fn CompilerRequestFromArgs(workspaceRoot: str,
                              args: str[]): Result[CompilerRequest] =
@@ -392,6 +447,7 @@ fn CompilerLegacyBackendCompatRequest(workspaceRoot: str,
     var emitText = ""
     var targetTriple = ""
     var reportPath = ""
+    var exportRootsText = ""
     var i = 0
     while i < args.len:
         let arg = args[i]
@@ -402,7 +458,8 @@ fn CompilerLegacyBackendCompatRequest(workspaceRoot: str,
         var nextIndex = i
         if CompilerReadArgFlagValue(args, i, "--in", value, nextIndex):
             if Len(sourcePath) > 0:
-                return Err[CompilerRequest](Fmt"[backend_driver_exec] multiple input paths are not supported: {value}")
+                let message = Fmt"[backend_driver_exec] multiple input paths are not supported: {value}"
+                return Err[CompilerRequest](message)
             sourcePath = value
             i = nextIndex + 1
             continue
@@ -434,13 +491,19 @@ fn CompilerLegacyBackendCompatRequest(workspaceRoot: str,
             reportPath = value
             i = nextIndex + 1
             continue
+        if CompilerReadArgFlagValue(args, i, "--export-roots", value, nextIndex):
+            exportRootsText = value
+            i = nextIndex + 1
+            continue
         if CompilerTextStartsWith(arg, "--"):
             if CompilerLegacyBackendCompatAllowedFlag(arg):
                 i = i + 1
                 continue
-            return Err[CompilerRequest](Fmt"[backend_driver_exec] unsupported legacy flag after old backend_driver removal: {arg}")
+            let message = Fmt"[backend_driver_exec] unsupported legacy flag after old backend_driver removal: {arg}"
+            return Err[CompilerRequest](message)
         if Len(sourcePath) > 0:
-            return Err[CompilerRequest](Fmt"[backend_driver_exec] multiple input paths are not supported: {arg}")
+            let message = Fmt"[backend_driver_exec] multiple input paths are not supported: {arg}"
+            return Err[CompilerRequest](message)
         sourcePath = arg
         i = i + 1
     if Len(sourcePath) <= 0:
@@ -468,7 +531,7 @@ fn CompilerLegacyBackendCompatRequest(workspaceRoot: str,
     if Len(targetTriple) <= 0:
         targetTriple = envTargetTriple
     if Len(targetTriple) <= 0 || targetTriple == "auto":
-        targetTriple = contracts.BootstrapDefaultTarget()
+        targetTriple = CompilerDefaultTargetTriple()
     let envReportPath = CompilerReadEnvPair("BACKEND_REPORT_OUT", "CHENG_BACKEND_REPORT_OUT")
     if Len(reportPath) <= 0:
         reportPath = envReportPath
@@ -478,14 +541,17 @@ fn CompilerLegacyBackendCompatRequest(workspaceRoot: str,
     if IsErr(symbolVisibilityRes):
         return Err[CompilerRequest](Error(symbolVisibilityRes))
     let browserBridgeObjectPath = CompilerReadFlagOrDefault(args, "--browser-bridge-object", "")
-    return Ok[CompilerRequest](CompilerRequestWithBrowserBridgeObject(CompilerRequestWithSymbolVisibility(CompilerRequestNew(packageRoot,
-                                                     sourcePath,
-                                                     outputPath,
-                                                     targetTriple,
-                                                     Value(emitKindRes),
-                                                     reportPath),
-                                                     Value(symbolVisibilityRes)),
-                                                     browserBridgeObjectPath))
+    let baseRequest = CompilerRequestNew(packageRoot,
+                                         sourcePath,
+                                         outputPath,
+                                         targetTriple,
+                                         Value(emitKindRes),
+                                         reportPath)
+    let visibleRequest = CompilerRequestWithSymbolVisibility(baseRequest, Value(symbolVisibilityRes))
+    let bridgeRequest = CompilerRequestWithBrowserBridgeObject(visibleRequest, browserBridgeObjectPath)
+    let request = CompilerRequestWithExportRootSymbols(bridgeRequest,
+                                                       CompilerExportRootSymbolsFromText(exportRootsText))
+    return CompilerRequestOk(request)
 
 fn CompilerSystemLinkCompatArgs(req: CompilerRequest): str[] =
     var out: str[]
@@ -500,4 +566,7 @@ fn CompilerSystemLinkCompatArgs(req: CompilerRequest): str[] =
         add(out, Fmt"--browser-bridge-object:{req.browserBridgeObjectPath}")
     if req.symbolVisibility == CompilerSymbolVisibilityInternal():
         add(out, Fmt"--symbol-visibility:{req.symbolVisibility}")
+    if req.exportRootSymbols.len > 0:
+        let rootText = strutil.Join(req.exportRootSymbols, ",")
+        add(out, Fmt"--export-roots:{rootText}")
     return out

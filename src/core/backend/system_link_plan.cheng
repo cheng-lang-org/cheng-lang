@@ -21,6 +21,7 @@ type
         emitKind: creq.CompilerEmit
         symbolVisibility: str
         browserBridgeObjectPath: str
+        exportRootSymbols: str[]
         packageRoot: str
         externalPackageRoots: parser.ParserExternalPackageRoot[]
         workspaceRoot: str
@@ -153,8 +154,7 @@ fn SystemLinkPlanSourceClosurePaths(plan: SystemLinkPlanStub): str[] =
     return plan.sourceClosurePaths
 
 fn SystemLinkPlanExportRootSymbols(plan: SystemLinkPlanStub): str[] =
-    var roots: str[]
-    return roots
+    return plan.exportRootSymbols
 
 fn SystemLinkPlanSourceBundleCid(plan: SystemLinkPlanStub): Result[layout.FixedBytes32] =
     return plan.sourceBundleCid
@@ -261,6 +261,7 @@ fn BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir: str,
     plan.emitKind = requestEmitKind
     plan.symbolVisibility = requestSymbolVisibility
     plan.browserBridgeObjectPath = requestBrowserBridgeObjectPath
+    plan.exportRootSymbols = []
     plan.packageRoot = parsed.packageRoot
     plan.externalPackageRoots = parser.ParserExternalPackageRootsClone(externalPackageRoots)
     plan.workspaceRoot = parsed.workspaceRoot
@@ -319,17 +320,20 @@ fn BuildSystemLinkPlanStubWithExternalPackageRoots(rootDir: str,
                                                      externalPackageRoots: parser.ParserExternalPackageRoot[],
                                                      plan: var SystemLinkPlanStub,
                                                      err: var str): bool =
-    return BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir,
-                                                                    creq.CompilerRequestRootDir(req),
-                                                                    creq.CompilerRequestSourcePath(req),
-                                                                    creq.CompilerRequestOutputPath(req),
-                                                                    creq.CompilerRequestTargetTriple(req),
-                                                                    creq.CompilerRequestEmitKind(req),
-                                                                    creq.CompilerRequestSymbolVisibility(req),
-                                                                    creq.CompilerRequestBrowserBridgeObjectPath(req),
-                                                                    externalPackageRoots,
-                                                                    plan,
-                                                                    err)
+    let ok = BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir,
+                                                                      creq.CompilerRequestRootDir(req),
+                                                                      creq.CompilerRequestSourcePath(req),
+                                                                      creq.CompilerRequestOutputPath(req),
+                                                                      creq.CompilerRequestTargetTriple(req),
+                                                                      creq.CompilerRequestEmitKind(req),
+                                                                      creq.CompilerRequestSymbolVisibility(req),
+                                                                      creq.CompilerRequestBrowserBridgeObjectPath(req),
+                                                                      externalPackageRoots,
+                                                                      plan,
+                                                                      err)
+    if ok:
+        plan.exportRootSymbols = creq.CompilerRequestExportRootSymbols(req)
+    return ok
 
 fn BuildSystemLinkPlanStub(rootDir: str,
                              req: creq.CompilerRequest,
@@ -376,6 +380,8 @@ fn SystemLinkPlanStubReport(plan: SystemLinkPlanStub): str =
     let runtimeTargetList = SystemLinkPlanListText(runtimeTargets)
     let providerModules = SystemLinkPlanProviderModules(plan)
     let providerModuleList = SystemLinkPlanListText(providerModules)
+    let exportRoots = SystemLinkPlanExportRootSymbols(plan)
+    let exportRootList = SystemLinkPlanListText(exportRoots)
     var entrySymbol = SystemLinkPlanEntrySymbol(plan)
     let missingField = SystemLinkPlanMissingReasonsField(plan)
     let missingReasons = SystemLinkPlanListText(missingField)
@@ -416,11 +422,16 @@ fn SystemLinkPlanStubReport(plan: SystemLinkPlanStub): str =
     SystemLinkPlanAppendLine(out, "expr_surface_constructor_count", IntToStr(parser.NormalizedExprLayerConstructorCount(exprLayer)))
     SystemLinkPlanAppendLine(out, "expr_surface_return_count", IntToStr(parser.NormalizedExprLayerReturnCount(exprLayer)))
     SystemLinkPlanAppendLine(out, "expr_surface_assign_count", IntToStr(parser.NormalizedExprLayerAssignCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_if_stmt_count", IntToStr(parser.NormalizedExprLayerIfStmtCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_elif_stmt_count", IntToStr(parser.NormalizedExprLayerElifStmtCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_else_stmt_count", IntToStr(parser.NormalizedExprLayerElseStmtCount(exprLayer)))
+    SystemLinkPlanAppendLine(out, "expr_surface_for_stmt_count", IntToStr(parser.NormalizedExprLayerForStmtCount(exprLayer)))
     SystemLinkPlanAppendLine(out, "expr_surface_question_residual_count", IntToStr(exprLayer.questionResidualCount))
     SystemLinkPlanAppendLine(out, "has_compiler_top_level", hasCompilerTopLevel)
     SystemLinkPlanAppendLine(out, "main_function_present", mainFunctionPresent)
     SystemLinkPlanAppendLine(out, "runtime_targets", runtimeTargetList)
     SystemLinkPlanAppendLine(out, "provider_modules", providerModuleList)
+    SystemLinkPlanAppendLine(out, "export_roots", exportRootList)
     SystemLinkPlanAppendLine(out, "entry_symbol", entrySymbol)
     SystemLinkPlanAppendLine(out, "missing_reasons", missingReasons)
     SystemLinkPlanAppendLine(out, "parser_syntax", parserSyntax)

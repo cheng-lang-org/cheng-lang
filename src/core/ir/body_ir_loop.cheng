@@ -1,0 +1,65 @@
+import cheng/core/ir/core_types as coreir
+
+type
+    BodyIrLoopSpan =
+        headerBlock: int32
+        latchBlock: int32
+
+    BodyIrLoopInfo =
+        loopCount: int32
+        reducibleCount: int32
+        backEdgeCount: int32
+        spans: BodyIrLoopSpan[]
+
+fn BodyIrLoopSpanExists(spans: BodyIrLoopSpan[],
+                         headerBlock: int32,
+                         latchBlock: int32): bool =
+    for i in 0..<spans.len:
+        let span = spans[i]
+        if span.headerBlock == headerBlock &&
+           span.latchBlock == latchBlock:
+            return true
+    return false
+
+fn BodyIrRecordBackEdge(info: var BodyIrLoopInfo,
+                         latchBlock: int32,
+                         headerBlock: int32) =
+    if latchBlock < 0 || headerBlock < 0:
+        return
+    if headerBlock > latchBlock:
+        return
+    info.backEdgeCount = info.backEdgeCount + 1
+    if BodyIrLoopSpanExists(info.spans, headerBlock, latchBlock):
+        return
+    var span: BodyIrLoopSpan
+    span.headerBlock = headerBlock
+    span.latchBlock = latchBlock
+    add(info.spans, span)
+    info.loopCount = info.loopCount + 1
+    info.reducibleCount = info.reducibleCount + 1
+
+fn BodyIrAnalyzeLoops(bodyIR: coreir.BodyIR): BodyIrLoopInfo =
+    var info: BodyIrLoopInfo
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        if block.termIndex < 0 || block.termIndex >= bodyIR.terms.len:
+            continue
+        let term = bodyIR.terms[block.termIndex]
+        if term.kind == coreir.BodyTermBrTag:
+            BodyIrRecordBackEdge(info, blockIndex, term.trueBlock)
+        elif term.kind == coreir.BodyTermCbrTag:
+            BodyIrRecordBackEdge(info, blockIndex, term.trueBlock)
+            BodyIrRecordBackEdge(info, blockIndex, term.falseBlock)
+    return info
+
+fn BodyIrLoopInfoHasLoop(info: BodyIrLoopInfo): bool =
+    return info.loopCount > 0
+
+fn BodyIrLoopInfoBlockIsInLoopWindow(info: BodyIrLoopInfo,
+                                      blockIndex: int32): bool =
+    for i in 0..<info.spans.len:
+        let span = info.spans[i]
+        if blockIndex >= span.headerBlock &&
+           blockIndex <= span.latchBlock:
+            return true
+    return false

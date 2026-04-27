@@ -7,7 +7,18 @@ import cheng/core/backend/native_link_plan as nplan
 import std/strutils as strutil
 
 fn NativeLinkExecTargetSupported(targetTriple: str): bool =
-    return targetTriple == "arm64-apple-darwin"
+    return targetTriple == "arm64-apple-darwin" ||
+           targetTriple == "aarch64-unknown-linux-gnu" ||
+           targetTriple == "arm64-unknown-linux-gnu" ||
+           targetTriple == "aarch64-linux-android" ||
+           targetTriple == "riscv64-unknown-linux-gnu" ||
+           targetTriple == "aarch64-pc-windows-msvc" ||
+           targetTriple == "arm64-pc-windows-msvc"
+
+fn NativeLinkExecIsSelfLinker(targetTriple: str, linkerFlavor: str): bool =
+    return linkerFlavor == "elf_aarch64_nolibc_internal" ||
+           linkerFlavor == "elf_riscv64_builtin" ||
+           linkerFlavor == "coff_pe_builtin"
 
 fn NativeLinkExecOutputModeText(plan: nplan.NativeLinkPlanStub): Result[str] =
     if plan.emitKind == creq.EmitExe && plan.outputKind == nplan.NativeOutputExecutable:
@@ -30,10 +41,11 @@ fn NativeLinkExecValidatePlan(plan: nplan.NativeLinkPlanStub): Result[str] =
     let outputModeRes = NativeLinkExecOutputModeText(plan)
     if !IsOk(outputModeRes):
         return Err[str](Error(outputModeRes))
-    for i in 0..<plan.linkInputPaths.len:
-        let inputPath = plan.linkInputPaths[i]
-        if !chengpath.PathFileExists(inputPath):
-            return Err[str](strutil.Join([" native link exec: missing input file: ", inputPath], ""))
+    if !NativeLinkExecIsSelfLinker(plan.targetTriple, plan.linkerFlavor):
+        for i in 0..<plan.linkInputPaths.len:
+            let inputPath = plan.linkInputPaths[i]
+            if !chengpath.PathFileExists(inputPath):
+                return Err[str](strutil.Join([" native link exec: missing input file: ", inputPath], ""))
     return Ok[str](Value(outputModeRes))
 
 fn NativeLinkExecArgv(plan: nplan.NativeLinkPlanStub): Result[str[]] =
@@ -57,10 +69,50 @@ fn NativeLinkExecCommandText(plan: nplan.NativeLinkPlanStub): Result[str] =
         return Err[str](Error(argvRes))
     return Ok[str](hostos.OsHostProcessCommandText(plan.linkerProgram, Value(argvRes), []))
 
-fn NativeLinkExecRunLogged(rootDir: str,
-                            label: str,
-                            plan: nplan.NativeLinkPlanStub,
-                            logPath: str): hostops.LoggedRun =
+fn NativeLinkExecRunSelfLinker(rootDir: str,
+                                label: str,
+                                plan: nplan.NativeLinkPlanStub,
+                                logPath: str): hostops.LoggedRun =
+    let linkerFlavor = plan.linkerFlavor
+    if linkerFlavor == "elf_aarch64_nolibc_internal":
+        import cheng/core/backend/elf_object_linker
+        let linkRes = elf_object_linker.ElfLinkExeAarch64(plan.linkInputPaths, plan.outputPath, plan.targetTriple)
+        if !IsOk[bool](linkRes):
+            let outputText = strutil.Join([Error(linkRes), "\n"], "")
+            let _logged = chengpath.WriteTextFile(rootDir, logPath, outputText)
+            return hostops.LoggedRunZero(label, plan.linkerProgram, chengpath.PathAbsolute(rootDir, logPath), 1, outputText)
+        let outputText = strutil.Join([plan.outputPath, " OK\n"], "")
+        let _logged = chengpath.WriteTextFile(rootDir, logPath, outputText)
+        return hostops.LoggedRunZero(label, plan.linkerProgram, chengpath.PathAbsolute(rootDir, logPath), 0, outputText)
+    elif linkerFlavor == "coff_pe_builtin":
+        import cheng/core/backend/coff_object_linker
+        let linkRes = coff_object_linker.CoffLinkExeAarch64(plan.linkInputPaths, plan.outputPath)
+        if !IsOk[bool](linkRes):
+            let outputText = strutil.Join([Error(linkRes), "\n"], "")
+            let _logged = chengpath.WriteTextFile(rootDir, logPath, outputText)
+            return hostops.LoggedRunZero(label, plan.linkerProgram, chengpath.PathAbsolute(rootDir, logPath), 1, outputText)
+        let outputText = strutil.Join([plan.outputPath, " OK\n"], "")
+        let _logged = chengpath.WriteTextFile(rootDir, logPath, outputText)
+        return hostops.LoggedRunZero(label, plan.linkerProgram, chengpath.PathAbsolute(rootDir, logPath), 0, outputText)
+    elif linkerFlavor == "elf_riscv64_builtin":
+        import cheng/core/backend/elf_riscv64_linker
+        let linkRes = elf_riscv64_linker.ElfRiscv64LinkExe(plan.linkInputPaths, plan.outputPath, plan.targetTriple)
+        if !IsOk[bool](linkRes):
+            let outputText = strutil.Join([Error(linkRes), "\n"], "")
+            let _logged = chengpath.WriteTextFile(rootDir, logPath, outputText)
+            return hostops.LoggedRunZero(label, plan.linkerProgram, chengpath.PathAbsolute(rootDir, logPath), 1, outputText)
+        let outputText = strutil.Join([plan.outputPath, " OK\n"], "")
+        let _logged = chengpath.WriteTextFile(rootDir, logPath, outputText)
+        return hostops.LoggedRunZero(label, plan.linkerProgram, chengpath.PathAbsolute(rootDir, logPath), 0, outputText)
+    else:
+        let outputText = strutil.Join([" native link exec: unknown self-linker flavor: ", linkerFlavor, "\n"], "")
+        let _logged = chengpath.WriteTextFile(rootDir, logPath, outputText)
+        return hostops.LoggedRunZero(label, plan.linkerProgram, chengpath.PathAbsolute(rootDir, logPath), 2, outputText)
+
+fn NativeLinkExecRunSystemLinker(rootDir: str,
+                                  label: str,
+                                  plan: nplan.NativeLinkPlanStub,
+                                  logPath: str): hostops.LoggedRun =
     let argvRes = NativeLinkExecArgv(plan)
     if !IsOk(argvRes):
         let outputText = strutil.Join([Error(argvRes), "\n"], "")
@@ -74,3 +126,11 @@ fn NativeLinkExecRunLogged(rootDir: str,
                                      rootDir,
                                      0,
                                      logPath)
+
+fn NativeLinkExecRunLogged(rootDir: str,
+                            label: str,
+                            plan: nplan.NativeLinkPlanStub,
+                            logPath: str): hostops.LoggedRun =
+    if NativeLinkExecIsSelfLinker(plan.targetTriple, plan.linkerFlavor):
+        return NativeLinkExecRunSelfLinker(rootDir, label, plan, logPath)
+    return NativeLinkExecRunSystemLinker(rootDir, label, plan, logPath)

@@ -684,6 +684,236 @@ fn PrimaryObjectEmitResultRequestDispatchFunctionAsm(plan: pobj.PrimaryObjectPla
     add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
     return Ok[str](strutil.Join(chunks, ""))
 
+fn PrimaryObjectEmitCfgBlockLabel(ordinal: int32,
+                                   blockIndex: int32): str =
+    return Fmt"L_cheng_body_ir_cfg_{IntToStr(ordinal)}_{IntToStr(blockIndex)}"
+
+fn PrimaryObjectEmitStackAddrAsm(reg: int32,
+                                  offset: int32): str =
+    if offset == 0:
+        return Fmt"  mov x{IntToStr(reg)}, sp\n"
+    return Fmt"  add x{IntToStr(reg)}, sp, #{IntToStr(offset)}\n"
+
+fn PrimaryObjectEmitLoadSlotToRegAsm(bodyIR: coreir.BodyIR,
+                                      slotIndex: int32,
+                                      reg: int32,
+                                      frameBytes: int32,
+                                      paramSaveOffset: int32,
+                                      paramSaveCount: int32): Result[str] =
+    if slotIndex >= 0:
+        if slotIndex >= bodyIR.localSlots.len:
+            return Err[str](" primary object emit: cfg arg local slot out of range")
+        let slot = bodyIR.localSlots[slotIndex]
+        if slot.typeKind == coreir.LocalI32Tag:
+            return Ok[str](Fmt"  ldr w{IntToStr(reg)}, [sp, #{IntToStr(slot.stackOffset)}]\n")
+        if slot.typeKind == coreir.LocalPtrTag:
+            return Ok[str](Fmt"  ldr x{IntToStr(reg)}, [sp, #{IntToStr(slot.stackOffset)}]\n")
+        if slot.typeKind == coreir.LocalStrTag ||
+           slot.typeKind == coreir.LocalAggregateTag:
+            return Ok[str](PrimaryObjectEmitStackAddrAsm(reg, slot.stackOffset))
+        return Err[str](" primary object emit: cfg arg local slot type unsupported")
+    let paramSlot = 0 - slotIndex - 1
+    if paramSlot < 0:
+        return Err[str](" primary object emit: cfg arg param slot invalid")
+    var paramOffset = pobj.PrimaryIncomingParamStackOffset(frameBytes, paramSlot)
+    if paramSlot < 8:
+        if paramSlot >= paramSaveCount:
+            return Err[str](" primary object emit: cfg arg param not saved")
+        paramOffset = paramSaveOffset + paramSlot * 8
+    if paramOffset < 0:
+        return Err[str](" primary object emit: cfg arg param offset invalid")
+    return Ok[str](Fmt"  ldr x{IntToStr(reg)}, [sp, #{IntToStr(paramOffset)}]\n")
+
+fn PrimaryObjectEmitCfgCallAsm(plan: pobj.PrimaryObjectPlan,
+                                bodyIR: coreir.BodyIR,
+                                functionIndex: int32,
+                                callOrdinal: int32,
+                                frameBytes: int32,
+                                paramSaveOffset: int32,
+                                paramSaveCount: int32): Result[str] =
+    if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
+        return Err[str](" primary object emit: cfg call ordinal out of range")
+    let callOp = bodyIR.callSequence[callOrdinal]
+    let targetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan,
+                                                                  plan.itemIds[functionIndex],
+                                                                  callOrdinal)
+    if len(targetSymbol) <= 0:
+        return Err[str](" primary object emit: cfg call target missing")
+    var chunks: str[]
+    let stackArgBytes = pobj.PrimaryCallOpStackArgBytes(callOp)
+    if stackArgBytes > 0:
+        add(chunks, Fmt"  sub sp, sp, #{IntToStr(stackArgBytes)}\n")
+    let registerArgCount = pobj.PrimaryCallOpRegisterArgCount(callOp)
+    for argIndex in 0..<registerArgCount:
+        let loadRes = PrimaryObjectEmitLoadSlotToRegAsm(bodyIR,
+                                                        callOp.argSlots[argIndex],
+                                                        argIndex,
+                                                        frameBytes,
+                                                        paramSaveOffset,
+                                                        paramSaveCount)
+        if IsErr(loadRes):
+            return Err[str](Error(loadRes))
+        add(chunks, Value(loadRes))
+    if stackArgBytes > 0:
+        for stackArgIndex in 0..<pobj.PrimaryCallOpStackArgCount(callOp):
+            let argIndex = stackArgIndex + 8
+            if argIndex >= callOp.argSlots.len:
+                return Err[str](" primary object emit: cfg stack arg index invalid")
+            let loadRes = PrimaryObjectEmitLoadSlotToRegAsm(bodyIR,
+                                                            callOp.argSlots[argIndex],
+                                                            16,
+                                                            frameBytes,
+                                                            paramSaveOffset,
+                                                            paramSaveCount)
+            if IsErr(loadRes):
+                return Err[str](Error(loadRes))
+            add(chunks, Value(loadRes))
+            add(chunks, Fmt"  str x16, [sp, #{IntToStr(stackArgIndex * 8)}]\n")
+        if stackArgBytes % 16 != 0:
+            return Err[str](" primary object emit: cfg stack arg alignment invalid")
+    if callOp.resultSlot >= 0:
+        if callOp.resultSlot >= bodyIR.localSlots.len:
+            return Err[str](" primary object emit: cfg result slot out of range")
+        let resultSlot = bodyIR.localSlots[callOp.resultSlot]
+        if resultSlot.typeKind == coreir.LocalStrTag ||
+           resultSlot.typeKind == coreir.LocalAggregateTag:
+            add(chunks, PrimaryObjectEmitStackAddrAsm(8, resultSlot.stackOffset))
+    add(chunks, Fmt"  bl {targetSymbol}\n")
+    if stackArgBytes > 0:
+        add(chunks, Fmt"  add sp, sp, #{IntToStr(stackArgBytes)}\n")
+    if callOp.resultSlot >= 0:
+        let resultSlot = bodyIR.localSlots[callOp.resultSlot]
+        if resultSlot.typeKind == coreir.LocalI32Tag:
+            add(chunks, Fmt"  str w0, [sp, #{IntToStr(resultSlot.stackOffset)}]\n")
+        elif resultSlot.typeKind == coreir.LocalPtrTag:
+            add(chunks, Fmt"  str x0, [sp, #{IntToStr(resultSlot.stackOffset)}]\n")
+    return Ok[str](strutil.Join(chunks, ""))
+
+fn PrimaryObjectEmitCfgEpilogueAsm(frameBytes: int32): str =
+    var out = ""
+    out = strutil.Join([out, "  ldp x29, x30, [sp]\n"], "")
+    out = strutil.Join([out, Fmt"  add sp, sp, #{IntToStr(frameBytes)}\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    return out
+
+fn PrimaryObjectEmitCfgReturnAsm(bodyIR: coreir.BodyIR,
+                                  term: coreir.BodyTerm,
+                                  frameBytes: int32): Result[str] =
+    var out = ""
+    if term.operands.len >= 2 &&
+       term.operands[0] == pobj.PrimaryStatementReturnModeI32Const():
+        out = strutil.Join([out, Fmt"  mov w0, #{IntToStr(term.operands[1])}\n"], "")
+    elif term.resultSlot >= 0 && term.resultSlot < bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[term.resultSlot]
+        if slot.typeKind != coreir.LocalI32Tag:
+            return Err[str](" primary object emit: cfg return slot type unsupported")
+        out = strutil.Join([out, Fmt"  ldr w0, [sp, #{IntToStr(slot.stackOffset)}]\n"], "")
+    else:
+        return Err[str](" primary object emit: cfg return unsupported")
+    out = strutil.Join([out, PrimaryObjectEmitCfgEpilogueAsm(frameBytes)], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitCfgTermAsm(bodyIR: coreir.BodyIR,
+                                term: coreir.BodyTerm,
+                                frameBytes: int32,
+                                ordinal: int32): Result[str] =
+    if term.kind == coreir.BodyTermReturnTag:
+        return PrimaryObjectEmitCfgReturnAsm(bodyIR, term, frameBytes)
+    if term.kind == coreir.BodyTermBrTag:
+        return Ok[str](Fmt"  b {PrimaryObjectEmitCfgBlockLabel(ordinal, term.trueBlock)}\n")
+    if term.kind != coreir.BodyTermCbrTag:
+        return Err[str](" primary object emit: cfg term unsupported")
+    var slotIndex = term.lhsSlot
+    if slotIndex < 0:
+        slotIndex = term.resultSlot
+    if slotIndex < 0 || slotIndex >= bodyIR.localSlots.len:
+        return Err[str](" primary object emit: cfg condition slot invalid")
+    let slot = bodyIR.localSlots[slotIndex]
+    if slot.typeKind != coreir.LocalI32Tag:
+        return Err[str](" primary object emit: cfg condition slot type unsupported")
+    let trueLabel = PrimaryObjectEmitCfgBlockLabel(ordinal, term.trueBlock)
+    let falseLabel = PrimaryObjectEmitCfgBlockLabel(ordinal, term.falseBlock)
+    var out = Fmt"  ldr w9, [sp, #{IntToStr(slot.stackOffset)}]\n"
+    if term.conditionKind == coreir.BodyCondLocalZeroTag:
+        out = strutil.Join([out, Fmt"  cbz w9, {trueLabel}\n"], "")
+    elif term.conditionKind == coreir.BodyCondLocalNonZeroTag:
+        out = strutil.Join([out, Fmt"  cbnz w9, {trueLabel}\n"], "")
+    elif term.conditionKind == coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag:
+        out = strutil.Join([out, "  cmp w9, #0\n"], "")
+        out = strutil.Join([out, Fmt"  b.le {trueLabel}\n"], "")
+    else:
+        return Err[str](" primary object emit: cfg condition unsupported")
+    out = strutil.Join([out, Fmt"  b {falseLabel}\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitCallCfgReturnInt32FunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                   functionIndex: int32,
+                                                   ordinal: int32): Result[str] =
+    if functionIndex < 0 ||
+       functionIndex >= plan.symbolNames.len ||
+       functionIndex >= plan.functionBodyIRs.len:
+        return Err[str](" primary object emit: missing cfg function")
+    let bodyIR = plan.functionBodyIRs[functionIndex]
+    if !pobj.PrimaryBodyIrIsCallCfgReturnInt32(bodyIR):
+        return Err[str](" primary object emit: cfg shape unsupported")
+    var localFrameBytes = pobj.PrimaryBodyIrStackByteCount(bodyIR)
+    if localFrameBytes < 16:
+        localFrameBytes = 16
+    let paramSaveCount = pobj.PrimaryBodyIrParamSaveCount(bodyIR)
+    if paramSaveCount < 0:
+        return Err[str](" primary object emit: cfg param save unsupported")
+    let paramSaveOffset = localFrameBytes
+    var frameBytes = localFrameBytes
+    if paramSaveCount > 0:
+        frameBytes = pobj.PrimaryAlignStackBytes(frameBytes + paramSaveCount * 8, 16)
+    if frameBytes <= 0 || frameBytes > 4095:
+        return Err[str](" primary object emit: cfg frame unsupported")
+    let symbolName = plan.symbolNames[functionIndex]
+    var chunks: str[]
+    add(chunks, Fmt".globl {symbolName}\n")
+    for callOrdinal in 0..<bodyIR.callSequence.len:
+        let targetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan,
+                                                                      plan.itemIds[functionIndex],
+                                                                      callOrdinal)
+        if len(targetSymbol) <= 0:
+            return Err[str](" primary object emit: cfg target missing")
+        if !PrimaryObjectEmitSymbolInPlan(plan, targetSymbol):
+            add(chunks, Fmt".extern {targetSymbol}\n")
+    add(chunks, Fmt"{symbolName}:\n")
+    add(chunks, Fmt"  sub sp, sp, #{IntToStr(frameBytes)}\n")
+    add(chunks, "  stp x29, x30, [sp]\n")
+    add(chunks, "  mov x29, sp\n")
+    for paramIndex in 0..<paramSaveCount:
+        add(chunks, Fmt"  str x{IntToStr(paramIndex)}, [sp, #{IntToStr(paramSaveOffset + paramIndex * 8)}]\n")
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        add(chunks, Fmt"{PrimaryObjectEmitCfgBlockLabel(ordinal, blockIndex)}:\n")
+        for opIndex in block.opStart..<(block.opStart + block.opCount):
+            let op = bodyIR.ops[opIndex]
+            if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
+                return Err[str](" primary object emit: cfg op unsupported")
+            let callAsmRes = PrimaryObjectEmitCfgCallAsm(plan,
+                                                         bodyIR,
+                                                         functionIndex,
+                                                         op.operands[0],
+                                                         frameBytes,
+                                                         paramSaveOffset,
+                                                         paramSaveCount)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        if block.termIndex < 0 || block.termIndex >= bodyIR.terms.len:
+            return Err[str](" primary object emit: cfg term missing")
+        let termAsmRes = PrimaryObjectEmitCfgTermAsm(bodyIR,
+                                                     bodyIR.terms[block.termIndex],
+                                                     frameBytes,
+                                                     ordinal)
+        if IsErr(termAsmRes):
+            return Err[str](Error(termAsmRes))
+        add(chunks, Value(termAsmRes))
+    add(chunks, Fmt"L_cheng_embedded_line_map_end_{IntToStr(ordinal)}:\n")
+    return Ok[str](strutil.Join(chunks, ""))
+
 fn PrimaryObjectEmitReturnCallFunctionAsm(plan: pobj.PrimaryObjectPlan,
                                            functionIndex: int32,
                                            ordinal: int32): Result[str] =
@@ -1231,6 +1461,14 @@ fn PrimaryObjectEmitLeafBodyIRFunctionAsm(plan: pobj.PrimaryObjectPlan,
         return Err[str](" primary object emit: missing body ir function")
     let bodyIR = plan.functionBodyIRs[functionIndex]
     let symbolName = plan.symbolNames[functionIndex]
+    if pobj.PrimaryBodyIrIsCallCfgReturnInt32(bodyIR):
+        return PrimaryObjectEmitCallCfgReturnInt32FunctionAsm(plan,
+                                                              functionIndex,
+                                                              ordinal)
+    if pobj.PrimaryBodyIrIsResultRequestDispatch(bodyIR):
+        return PrimaryObjectEmitResultRequestDispatchFunctionAsm(plan,
+                                                                 functionIndex,
+                                                                 ordinal)
     if bodyIR.ops.len == 1:
         let returnOp = bodyIR.ops[0]
         if returnOp.kind != coreir.BodyOpReturnTag:
@@ -1555,6 +1793,11 @@ fn PrimaryObjectEmitPlanFunctionAsm(plan: pobj.PrimaryObjectPlan,
        functionIndex >= plan.symbolNames.len ||
        functionIndex >= plan.functionWordCounts.len:
         return Err[str](" primary object emit: missing plan function")
+    if functionIndex < plan.functionBodyIRs.len &&
+       pobj.PrimaryBodyIrIsCallCfgReturnInt32(plan.functionBodyIRs[functionIndex]):
+        return PrimaryObjectEmitCallCfgReturnInt32FunctionAsm(plan,
+                                                              functionIndex,
+                                                              functionIndex)
     var chunks: str[]
     add(chunks, Fmt".globl {plan.symbolNames[functionIndex]}\n")
     add(chunks, Fmt"{plan.symbolNames[functionIndex]}:\n")

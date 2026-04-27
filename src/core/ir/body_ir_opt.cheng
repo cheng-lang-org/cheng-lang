@@ -1,0 +1,388 @@
+import cheng/core/ir/core_types as coreir
+import cheng/core/lang/typed_expr as texpr
+
+fn BodyIrBoolSeqInit(count: int32,
+                      value: bool): bool[] =
+    var out: bool[]
+    for _ in 0..<count:
+        add(out, value)
+    return out
+
+fn BodyIrIntSeqInit(count: int32,
+                     value: int32): int32[] =
+    var out: int32[]
+    for _ in 0..<count:
+        add(out, value)
+    return out
+
+fn BodyIrLocalValid(bodyIR: coreir.BodyIR,
+                     slot: int32): bool =
+    return slot >= 0 && slot < bodyIR.localSlots.len
+
+fn BodyIrTermI32ConstReturn(term: coreir.BodyTerm,
+                             value: var int32): bool =
+    if term.kind != coreir.BodyTermReturnTag:
+        return false
+    if term.resultSlot >= 0:
+        return false
+    if term.operands.len < 2:
+        return false
+    if term.operands[0] != texpr.StatementReturnModeI32Const:
+        return false
+    value = term.operands[1]
+    return true
+
+fn BodyIrTermReturnOp(bodyIR: coreir.BodyIR,
+                       term: coreir.BodyTerm,
+                       op: var coreir.BodyOp): bool =
+    if term.kind != coreir.BodyTermReturnTag:
+        return false
+    op = coreir.BodyOp()
+    op.kind = coreir.BodyOpReturnTag
+    op.target = term.resultSlot
+    for i in 0..<term.operands.len:
+        add(op.operands, term.operands[i])
+    if op.operands.len > 0:
+        return true
+    if BodyIrLocalValid(bodyIR, term.resultSlot):
+        add(op.operands, bodyIR.localSlots[term.resultSlot].typeKind)
+        return true
+    return false
+
+fn BodyIrEntryBlockIndex(bodyIR: coreir.BodyIR): int32 =
+    var fallback = -1
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        if block.opStart != 0:
+            continue
+        if fallback < 0:
+            fallback = blockIndex
+        if block.termIndex < 0 || block.termIndex >= bodyIR.terms.len:
+            continue
+        let term = bodyIR.terms[block.termIndex]
+        if term.kind == coreir.BodyTermCbrTag ||
+           term.kind == coreir.BodyTermBrTag:
+            return blockIndex
+    if fallback >= 0:
+        return fallback
+    return 0
+
+fn BodyIrMergeLinearBlocks(bodyIR: coreir.BodyIR): coreir.BodyIR =
+    if bodyIR.blocks.len <= 0 || bodyIR.terms.len <= 0:
+        return bodyIR
+    var visited = BodyIrBoolSeqInit(bodyIR.blocks.len, false)
+    var out = bodyIR
+    out.ops = []
+    out.blocks = []
+    out.terms = []
+    var currentBlock = BodyIrEntryBlockIndex(bodyIR)
+    for _ in 0..<bodyIR.blocks.len:
+        if currentBlock < 0 || currentBlock >= bodyIR.blocks.len:
+            return bodyIR
+        if visited[currentBlock]:
+            return bodyIR
+        visited[currentBlock] = true
+        let block = bodyIR.blocks[currentBlock]
+        if block.opStart < 0 ||
+           block.opCount < 0 ||
+           block.opStart + block.opCount > bodyIR.ops.len ||
+           block.termIndex < 0 ||
+           block.termIndex >= bodyIR.terms.len:
+            return bodyIR
+        for opIndex in block.opStart..<(block.opStart + block.opCount):
+            add(out.ops, bodyIR.ops[opIndex])
+        let term = bodyIR.terms[block.termIndex]
+        if term.kind == coreir.BodyTermReturnTag:
+            var returnOp: coreir.BodyOp
+            if !BodyIrTermReturnOp(bodyIR, term, returnOp):
+                return bodyIR
+            add(out.ops, returnOp)
+            return out
+        if term.kind == coreir.BodyTermBrTag:
+            if term.trueBlock < 0 || term.trueBlock == currentBlock:
+                return bodyIR
+            currentBlock = term.trueBlock
+            continue
+        if term.kind == coreir.BodyTermCbrTag:
+            if term.conditionKind != coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag:
+                return bodyIR
+            if term.trueBlock < 0 ||
+               term.trueBlock >= bodyIR.blocks.len ||
+               term.falseBlock < 0 ||
+               term.falseBlock >= bodyIR.blocks.len:
+                return bodyIR
+            let trueBlock = bodyIR.blocks[term.trueBlock]
+            if trueBlock.opCount != 0 ||
+               trueBlock.termIndex < 0 ||
+               trueBlock.termIndex >= bodyIR.terms.len:
+                return bodyIR
+            var returnValue: int32
+            if !BodyIrTermI32ConstReturn(bodyIR.terms[trueBlock.termIndex],
+                                         returnValue):
+                return bodyIR
+            var guardSlot = term.lhsSlot
+            if guardSlot < 0:
+                guardSlot = term.resultSlot
+            if !BodyIrLocalValid(bodyIR, guardSlot):
+                return bodyIR
+            var branchOp: coreir.BodyOp
+            branchOp.kind = coreir.BodyOpBranchTag
+            branchOp.target = -1
+            add(branchOp.operands, coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag)
+            add(branchOp.operands, guardSlot)
+            add(branchOp.operands, returnValue)
+            add(out.ops, branchOp)
+            if term.falseBlock == currentBlock:
+                return bodyIR
+            currentBlock = term.falseBlock
+            continue
+        return bodyIR
+    return bodyIR
+
+fn BodyIrTrimAfterReturn(bodyIR: coreir.BodyIR): coreir.BodyIR =
+    if bodyIR.blocks.len > 0 || bodyIR.terms.len > 0:
+        return bodyIR
+    var returnIndex = -1
+    for i in 0..<bodyIR.ops.len:
+        if bodyIR.ops[i].kind == coreir.BodyOpReturnTag:
+            returnIndex = i
+            break
+    if returnIndex < 0 || returnIndex + 1 >= bodyIR.ops.len:
+        return bodyIR
+    var out = bodyIR
+    out.ops = []
+    for i in 0..<(returnIndex + 1):
+        add(out.ops, bodyIR.ops[i])
+    return out
+
+fn BodyIrInvalidateConsts(valid: var bool[]) =
+    for i in 0..<valid.len:
+        valid[i] = false
+
+fn BodyIrMakeI32ConstOp(target: int32,
+                         value: int32): coreir.BodyOp =
+    var out: coreir.BodyOp
+    out.kind = coreir.BodyOpLoadConstTag
+    out.target = target
+    add(out.operands, coreir.LocalI32Tag)
+    add(out.operands, value)
+    return out
+
+fn BodyIrFoldI32BinOp(opKind: int32,
+                       lhs: int32,
+                       rhs: int32,
+                       value: var int32): bool =
+    if opKind == int32(texpr.TypedExprIrOpI32Add):
+        value = lhs + rhs
+        return true
+    if opKind == int32(texpr.TypedExprIrOpI32Sub):
+        value = lhs - rhs
+        return true
+    if opKind == int32(texpr.TypedExprIrOpI32Mul):
+        value = lhs * rhs
+        return true
+    return false
+
+fn BodyIrFoldI32CmpOp(condKind: int32,
+                       lhs: int32,
+                       rhs: int32,
+                       value: var int32): bool =
+    var result = false
+    if condKind == coreir.BodyCondI32EqTag:
+        result = lhs == rhs
+    elif condKind == coreir.BodyCondI32NeTag:
+        result = lhs != rhs
+    elif condKind == coreir.BodyCondI32LtTag:
+        result = lhs < rhs
+    elif condKind == coreir.BodyCondI32LeTag:
+        result = lhs <= rhs
+    elif condKind == coreir.BodyCondI32GtTag:
+        result = lhs > rhs
+    elif condKind == coreir.BodyCondI32GeTag:
+        result = lhs >= rhs
+    else:
+        return false
+    value = result ? 1 : 0
+    return true
+
+fn BodyIrFoldConstants(bodyIR: coreir.BodyIR): coreir.BodyIR =
+    if bodyIR.blocks.len > 0 || bodyIR.terms.len > 0:
+        return bodyIR
+    if bodyIR.localSlots.len <= 0 || bodyIR.ops.len <= 0:
+        return bodyIR
+    var out = bodyIR
+    out.ops = []
+    var constValid = BodyIrBoolSeqInit(bodyIR.localSlots.len, false)
+    var constValues = BodyIrIntSeqInit(bodyIR.localSlots.len, 0)
+    for opIndex in 0..<bodyIR.ops.len:
+        var op = bodyIR.ops[opIndex]
+        if op.kind == coreir.BodyOpCallTag:
+            BodyIrInvalidateConsts(constValid)
+            if BodyIrLocalValid(bodyIR, op.target):
+                constValid[op.target] = false
+            add(out.ops, op)
+            continue
+        if op.kind == coreir.BodyOpLoadConstTag &&
+           op.operands.len >= 2 &&
+           op.operands[0] == coreir.LocalI32Tag &&
+           BodyIrLocalValid(bodyIR, op.target):
+            constValid[op.target] = true
+            constValues[op.target] = op.operands[1]
+            add(out.ops, op)
+            continue
+        if op.kind == coreir.BodyOpCopyLocalTag &&
+           op.operands.len >= 1 &&
+           BodyIrLocalValid(bodyIR, op.target) &&
+           BodyIrLocalValid(bodyIR, op.operands[0]) &&
+           constValid[op.operands[0]]:
+            op = BodyIrMakeI32ConstOp(op.target, constValues[op.operands[0]])
+            constValid[op.target] = true
+            constValues[op.target] = op.operands[1]
+            add(out.ops, op)
+            continue
+        if op.kind == coreir.BodyOpBinOpTag &&
+           op.operands.len >= 4 &&
+           op.operands[0] == coreir.LocalI32Tag &&
+           BodyIrLocalValid(bodyIR, op.target) &&
+           BodyIrLocalValid(bodyIR, op.operands[2]) &&
+           BodyIrLocalValid(bodyIR, op.operands[3]) &&
+           constValid[op.operands[2]] &&
+           constValid[op.operands[3]]:
+            var foldedValue: int32
+            if BodyIrFoldI32BinOp(op.operands[1],
+                                  constValues[op.operands[2]],
+                                  constValues[op.operands[3]],
+                                  foldedValue):
+                op = BodyIrMakeI32ConstOp(op.target, foldedValue)
+                constValid[op.target] = true
+                constValues[op.target] = foldedValue
+                add(out.ops, op)
+                continue
+        if op.kind == coreir.BodyOpCmpTag &&
+           op.operands.len >= 3 &&
+           BodyIrLocalValid(bodyIR, op.target) &&
+           BodyIrLocalValid(bodyIR, op.operands[1]) &&
+           BodyIrLocalValid(bodyIR, op.operands[2]) &&
+           constValid[op.operands[1]] &&
+           constValid[op.operands[2]]:
+            var cmpValue: int32
+            if BodyIrFoldI32CmpOp(op.operands[0],
+                                  constValues[op.operands[1]],
+                                  constValues[op.operands[2]],
+                                  cmpValue):
+                op = BodyIrMakeI32ConstOp(op.target, cmpValue)
+                constValid[op.target] = true
+                constValues[op.target] = cmpValue
+                add(out.ops, op)
+                continue
+        if BodyIrLocalValid(bodyIR, op.target):
+            constValid[op.target] = false
+        add(out.ops, op)
+    return out
+
+fn BodyIrMarkLocal(live: var bool[],
+                    slot: int32) =
+    if slot >= 0 && slot < live.len:
+        live[slot] = true
+
+fn BodyIrKillLocal(live: var bool[],
+                    slot: int32) =
+    if slot >= 0 && slot < live.len:
+        live[slot] = false
+
+fn BodyIrMarkCallArgs(bodyIR: coreir.BodyIR,
+                       op: coreir.BodyOp,
+                       live: var bool[]) =
+    if op.operands.len <= 0:
+        return
+    let ordinal = op.operands[0]
+    if ordinal < 0 || ordinal >= bodyIR.callSequence.len:
+        return
+    let callOp = bodyIR.callSequence[ordinal]
+    for i in 0..<callOp.argSlots.len:
+        BodyIrMarkLocal(live, callOp.argSlots[i])
+
+fn BodyIrMarkOpUses(bodyIR: coreir.BodyIR,
+                     op: coreir.BodyOp,
+                     live: var bool[]) =
+    if op.kind == coreir.BodyOpReturnTag:
+        BodyIrMarkLocal(live, op.target)
+        return
+    if op.kind == coreir.BodyOpBranchTag:
+        if op.operands.len >= 2:
+            BodyIrMarkLocal(live, op.operands[1])
+        return
+    if op.kind == coreir.BodyOpCallTag:
+        BodyIrMarkCallArgs(bodyIR, op, live)
+        return
+    if op.kind == coreir.BodyOpLoadLocalTag:
+        if op.operands.len >= 3 &&
+           op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag:
+            BodyIrMarkLocal(live, op.operands[1])
+        elif op.operands.len >= 1:
+            BodyIrMarkLocal(live, op.operands[0])
+        return
+    if op.kind == coreir.BodyOpStoreLocalTag ||
+       op.kind == coreir.BodyOpCopyLocalTag:
+        if op.operands.len >= 1:
+            BodyIrMarkLocal(live, op.operands[0])
+        return
+    if op.kind == coreir.BodyOpBinOpTag:
+        for i in 2..<op.operands.len:
+            BodyIrMarkLocal(live, op.operands[i])
+        return
+    if op.kind == coreir.BodyOpCmpTag:
+        for i in 1..<op.operands.len:
+            BodyIrMarkLocal(live, op.operands[i])
+
+fn BodyIrPureLocalWrite(op: coreir.BodyOp): bool =
+    return op.kind == coreir.BodyOpLoadConstTag ||
+           op.kind == coreir.BodyOpBinOpTag ||
+           op.kind == coreir.BodyOpCmpTag ||
+           (op.kind == coreir.BodyOpLoadLocalTag &&
+            !(op.operands.len >= 3 &&
+              op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag)) ||
+           op.kind == coreir.BodyOpStoreLocalTag ||
+           op.kind == coreir.BodyOpCopyLocalTag
+
+fn BodyIrEliminateDeadOps(bodyIR: coreir.BodyIR): coreir.BodyIR =
+    if bodyIR.blocks.len > 0 || bodyIR.terms.len > 0:
+        return bodyIR
+    if bodyIR.localSlots.len <= 0 || bodyIR.ops.len <= 0:
+        return bodyIR
+    var live = BodyIrBoolSeqInit(bodyIR.localSlots.len, false)
+    var keep = BodyIrBoolSeqInit(bodyIR.ops.len, false)
+    for offset in 0..<bodyIR.ops.len:
+        let opIndex = bodyIR.ops.len - 1 - offset
+        let op = bodyIR.ops[opIndex]
+        if op.kind == coreir.BodyOpCallTag:
+            keep[opIndex] = true
+            BodyIrKillLocal(live, op.target)
+            BodyIrMarkOpUses(bodyIR, op, live)
+            continue
+        if op.kind == coreir.BodyOpReturnTag ||
+           op.kind == coreir.BodyOpBranchTag:
+            keep[opIndex] = true
+            BodyIrMarkOpUses(bodyIR, op, live)
+            continue
+        if BodyIrPureLocalWrite(op) && BodyIrLocalValid(bodyIR, op.target):
+            if live[op.target]:
+                keep[opIndex] = true
+                BodyIrKillLocal(live, op.target)
+                BodyIrMarkOpUses(bodyIR, op, live)
+            continue
+        keep[opIndex] = true
+        BodyIrKillLocal(live, op.target)
+        BodyIrMarkOpUses(bodyIR, op, live)
+    var out = bodyIR
+    out.ops = []
+    for opIndex in 0..<bodyIR.ops.len:
+        if keep[opIndex]:
+            add(out.ops, bodyIR.ops[opIndex])
+    return out
+
+fn BodyIrOptimizeSimple(bodyIR: coreir.BodyIR): coreir.BodyIR =
+    let merged = BodyIrMergeLinearBlocks(bodyIR)
+    let folded = BodyIrFoldConstants(merged)
+    let dce = BodyIrEliminateDeadOps(folded)
+    return BodyIrTrimAfterReturn(dce)

@@ -1,5 +1,22 @@
 # Lessons
 
+- 2026-04-27: Cheng runtime provider 新增独立 provider 源文件时，必须同步 provider module 列表、source 映射、export roots、C seed freshness 和 provider cache 版本；不能只把文件放进 `src/core/runtime`。
+- 2026-04-27: runtime provider export roots 只能登记当前 C seed export surface 能看到且真实需要的符号；未使用的 default bridge 这类符号会让 provider 对象生成变成 `primary_object_export_root_missing`。
+- 2026-04-27: `backend_driver_dispatch_min` 不能直接调用 `std/os.GetEnv` 做进度、RSS 守卫或诊断目录选择；这些必须收口到 runtime provider bridge，否则候选主对象会重新依赖 `driver_c_get_env_bridge`。
+- 2026-04-27: runtime provider 里保存 C 字符串调用结果时用 `cstring`，不要用裸 `ptr` 局部；当前 direct writer 对 `cstring` 会正确 spill/reload，裸 `ptr` 可能生成从空 frame slot 取参的坏机器码。
+- 2026-04-27: 还没证明 branch codegen 的 runtime provider 不能写 `if raw == nil: return ...` 这类导出桥；当前 direct object 可能生成无条件直线调用，分支语义会丢，必须先用 `otool -tV` 验证。
+- 2026-04-27: get-env provider 保持直线调用时，空 C 字符串防漏必须落在通用 `driver_c_str_from_utf8_copy_bridge`；`raw == nil || n <= 0` 直接返回空 `str`，避免 `cheng_str_copy(nil, 0)` 分配后丢弃。
+- 2026-04-27: lowering 通用 fallback 只能处理已证明的线性函数；函数含 `if/elif/else/for` 或嵌套 if 标记时，不能拼直线 call BodyIR，必须硬暴露具体控制流缺口。
+- 2026-04-27: `BackendDriverDispatchMinRunCommandWithCmd` 的专用 dispatch lowering 不能假设 typed statements 只有 return-call；当前 typed IR 会保留 if 壳，必须按 return-call 收集并校验目标顺序。
+- 2026-04-27: backend driver 命令参数解析不要在 min driver 里复制一套 if 链；应复用 `CompilerRequestFromArgs`，再走已证明的 Result request dispatch lowering。
+- 2026-04-27: 函数级并行不能先接裸线程草稿；先把 primary codegen 改成纯数据 task plan + jobs=1 确定性执行，输出不变后再替换 ws executor。
+- 2026-04-27: primary 函数任务只能保存函数索引和标量元数据，不能把 `BodyIR` 复制进每个 task；pure self-build 会直接顶到 8GiB RSS。
+- 2026-04-27: backend driver 新增被 `lowering_plan` import 的 core IR 源文件时，必须同步 `build_plan`、bootstrap manifest、C seed freshness 和 min driver `print-build-plan`；否则源码变化不会触发重建。
+- 2026-04-27: lowering 对线性函数不能只依赖 typed function `returnExpr`；当函数没有顶层控制流且只有一个 top-level return 时，应从 return statement 取表达式，否则 str wrapper 会退成“call ops 无 return”。
+- 2026-04-27: lowering/primary 处理 guard CFG 时不能默认 `blocks[0]` 是入口；如果 true/false block 先追加，必须按 `opStart=0` 的分支块定位 entry，否则会把函数误压成单独 `return 0`。
+- 2026-04-27: Android/OHOS direct object 不能把完整 `elf_object_writer` 直接 import 进 backend driver；该闭包含复合 Result/ELF writer 语义，会让自举失败。必须用可自举的最小 ELF 生成路径或先补正式 codegen。
+- 2026-04-27: 移动 shim 跨模块调用标准库时不能用小写私有符号；`system-link-exec` typed expr 会在对象生成前拒绝 `std/system.strFromCStringCopy`、`std/strings.charToStr`、`std/rawbytes.bytesAlloc` 这类私有导入，必须改公开大写 API 或显式 `@importc`。
+- 2026-04-27: AArch64 primary object call-sequence 已支持 `ptr/cstring` 局部返回时，要同时更新 body kind 识别、word count、reloc offset 和 `x0` 8 字节 load；只保存 ptr call result 不够。
 - 开始新任务先扫当前入口、源码根和活动 artifact，不要继承历史路径假设。
 - `build-backend-driver` 编译期可以并行；只有最终安装/原子替换阶段需要排队。`run-host-smokes` 仍要避开正在替换的 driver 产物，避免制造假红。
 - `chain_node`、GUI、mobile、r2c 属于应用或领域链路；只有明确要求时才进入核心编译门禁。
@@ -177,7 +194,10 @@
 - return-call passthrough 不能只设置 bodyKind；primary object plan 的 reachability/reloc 已统一看 callSequence，lowering 必须同步写 callSequence 和旧 call target 数组。
 - BodyIR direct writer 生成 ARM64 栈访问指令时，不要在自举热路径用 `offset * 1024` 叠大负数常量；当前编译器可能把这类运行时编码误编译成坏寄存器字段，稳定做法是用小 encoder 按 scale 线性累加并用 `otool -tV` 加实际退出码验证。
 - `core/ir` 层不能导入 `core/backend` 的 lowering 类型；Low-UIR 必须保持依赖无环，backend 只负责把自身 statement record 适配成 IR 输入。
+- backend driver cmdline 热路径不要先构造 `str[]` 再在主对象里循环解析；纯自举主路径应使用 runtime provider 的参数读取 bridge，把主对象保持为直线 call sequence。
+- runtime provider bridge 一旦被当前 stage2/stage3 记录为 export root，删除或只改主路径不用都会导致 `primary_object_export_root_missing`；要等 bootstrap 编译器刷新后再裁掉 root/实现。
 - BodyIR direct writer 生成 ARM64 动态寄存器字段时，不要写 `baseWord + argIndex`；当前自举链可能把字段反向打坏成 `wzr/x30`。用小步进 register encoder，并用 2 个以上实参的 `otool -tV` 验证。
 - Darwin arm64 第 9 个及以后调用实参必须在 call 前临时 `sub sp` 写入 outgoing stack arg area，call 后立刻 `add sp`；读取 caller frame 的局部/保存参数要用稳定的 `x29` 基址，不能用已下调的 `sp`。
 - pure self-build 报 `body_ir_call_ops_...` 且函数包含错误分支/早返回时，不能靠扩大帧或当直线 call sequence 放行；下一段必须 lowering 成 guard/return CFG，否则会无条件执行失败分支。
 - 未跟踪文件也要先确认归属；不是自己明确创建或被用户指定处理的文件，不能删除、重命名或重写。误删后先原样恢复，再继续自己的范围。
+- 外部并行编译/构建不属于当前验证链路时，不要等待；只确认是否争用同一安装产物或同一报告路径，自己的命令照跑，真实冲突交给工具链硬失败暴露。

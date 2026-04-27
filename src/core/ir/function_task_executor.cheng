@@ -1,0 +1,48 @@
+# Function task executor: serial (jobs=1) deterministic execution.
+# Phase 2: serial runner only. Work-stealing comes later.
+# Contract: BACKEND_JOBS=1 output MUST be bit-identical to old inline serial code.
+
+import cheng/core/ir/core_types as coreir
+import cheng/core/ir/function_task as ftask
+
+type
+    FunctionTaskWorker =
+        task: ftask.FunctionTask
+
+fn FunctionTaskExecuteBodyIr(task: ftask.FunctionTask): ftask.FunctionTaskResult =
+    var result = ftask.FunctionTaskResultEmpty(task.funcIndex)
+    result.outputKind = ftask.FunctionTaskResultKindBodyIr()
+    result.bodyIR = task.extra.bodyIR
+    return result
+
+fn FunctionTaskExecuteOne(task: ftask.FunctionTask): ftask.FunctionTaskResult =
+    return FunctionTaskExecuteBodyIr(task)
+
+fn FunctionTaskExecuteSerial(plan: ftask.FunctionTaskPlan): ftask.FunctionTaskResult[] =
+    var results: ftask.FunctionTaskResult[]
+    for ti in 0..<plan.tasks.len:
+        let result = FunctionTaskExecuteOne(plan.tasks[ti])
+        results.append(result)
+    return results
+
+fn FunctionTaskMergeResults(results: ftask.FunctionTaskResult[],
+                             snapshot: ftask.FunctionSharedSnapshot): ftask.FunctionTaskMergeReport =
+    var report = ftask.FunctionTaskMergeReportNew()
+    report.schedule = ftask.FunctionTaskScheduleSerial
+    report.jobCount = 1
+    report.taskCount = results.len
+    for ri in 0..<results.len:
+        let result = results[ri]
+        if ftask.FunctionTaskResultHasError(result):
+            ftask.FunctionTaskMergeReportSetError(report, result.diags[0])
+    return report
+
+fn FunctionTaskPlanBuildReportText(report: ftask.FunctionTaskMergeReport): str =
+    var out = ""
+    out = Fmt"{out}function_task_schedule={report.schedule}"
+    out = Fmt"{out}\nfunction_task_job_count={report.jobCount}"
+    out = Fmt"{out}\nfunction_task_count={report.taskCount}"
+    out = Fmt"{out}\nfunction_task_error_count={report.errorCount}"
+    if report.firstError.len > 0:
+        out = Fmt"{out}\nfunction_task_first_error={report.firstError}"
+    return out

@@ -165,6 +165,11 @@ static const char *ChengSeed_REMOVED_KEYS_V2[] = {
     "tooling_gate_source",
     "lang_parser_source",
     "lang_typed_expr_source",
+    "core_ir_types_source",
+    "core_ir_low_uir_source",
+    "core_ir_body_ir_loop_source",
+    "core_ir_body_ir_noalias_source",
+    "core_ir_body_ir_opt_source",
     "backend_system_link_plan_source",
     "backend_lowering_plan_source",
     "backend_primary_object_plan_source",
@@ -213,6 +218,11 @@ static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
     "tooling_gate_source",
     "lang_parser_source",
     "lang_typed_expr_source",
+    "core_ir_types_source",
+    "core_ir_low_uir_source",
+    "core_ir_body_ir_loop_source",
+    "core_ir_body_ir_noalias_source",
+    "core_ir_body_ir_opt_source",
     "backend_system_link_plan_source",
     "backend_lowering_plan_source",
     "backend_primary_object_plan_source",
@@ -1560,9 +1570,15 @@ typedef struct {
     char runtime_compiler_tooling_provider_source[PATH_MAX];
     char runtime_debug_provider_source[PATH_MAX];
     char runtime_program_support_provider_source[PATH_MAX];
+    char runtime_program_support_get_env_provider_source[PATH_MAX];
     char runtime_program_support_host_provider_source[PATH_MAX];
     char tooling_gate_source[PATH_MAX];
     char tooling_backend_driver_dispatch_min_source[PATH_MAX];
+    char core_ir_types_source[PATH_MAX];
+    char core_ir_low_uir_source[PATH_MAX];
+    char core_ir_body_ir_loop_source[PATH_MAX];
+    char core_ir_body_ir_noalias_source[PATH_MAX];
+    char core_ir_body_ir_opt_source[PATH_MAX];
     char tooling_bootstrap_contract_source[PATH_MAX];
     char tooling_host_ops_source[PATH_MAX];
     char tooling_path_source[PATH_MAX];
@@ -1694,6 +1710,11 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->compiler_publish_gate_source, sizeof(paths->compiler_publish_gate_source), paths->root, "src/core/tooling/compiler_publish_gate.cheng");
     cheng_seed_join_path(paths->lang_parser_source, sizeof(paths->lang_parser_source), paths->root, "src/core/lang/parser.cheng");
     cheng_seed_join_path(paths->lang_typed_expr_source, sizeof(paths->lang_typed_expr_source), paths->root, "src/core/lang/typed_expr.cheng");
+    cheng_seed_join_path(paths->core_ir_types_source, sizeof(paths->core_ir_types_source), paths->root, "src/core/ir/core_types.cheng");
+    cheng_seed_join_path(paths->core_ir_low_uir_source, sizeof(paths->core_ir_low_uir_source), paths->root, "src/core/ir/low_uir.cheng");
+    cheng_seed_join_path(paths->core_ir_body_ir_loop_source, sizeof(paths->core_ir_body_ir_loop_source), paths->root, "src/core/ir/body_ir_loop.cheng");
+    cheng_seed_join_path(paths->core_ir_body_ir_noalias_source, sizeof(paths->core_ir_body_ir_noalias_source), paths->root, "src/core/ir/body_ir_noalias.cheng");
+    cheng_seed_join_path(paths->core_ir_body_ir_opt_source, sizeof(paths->core_ir_body_ir_opt_source), paths->root, "src/core/ir/body_ir_opt.cheng");
     cheng_seed_join_path(paths->backend_system_link_plan_source, sizeof(paths->backend_system_link_plan_source), paths->root, "src/core/backend/system_link_plan.cheng");
     cheng_seed_join_path(paths->backend_lowering_plan_source, sizeof(paths->backend_lowering_plan_source), paths->root, "src/core/backend/lowering_plan.cheng");
     cheng_seed_join_path(paths->backend_primary_object_plan_source, sizeof(paths->backend_primary_object_plan_source), paths->root, "src/core/backend/primary_object_plan.cheng");
@@ -1718,6 +1739,7 @@ static void cheng_seed_bootstrap_paths_init(ChengSeedBootstrapPaths *paths) {
     cheng_seed_join_path(paths->runtime_compiler_tooling_provider_source, sizeof(paths->runtime_compiler_tooling_provider_source), paths->root, "src/core/runtime/compiler_runtime_tooling_entry_provider.cheng");
     cheng_seed_join_path(paths->runtime_debug_provider_source, sizeof(paths->runtime_debug_provider_source), paths->root, "src/core/runtime/debug_runtime_stub.cheng");
     cheng_seed_join_path(paths->runtime_program_support_provider_source, sizeof(paths->runtime_program_support_provider_source), paths->root, "src/core/runtime/program_support_backend.cheng");
+    cheng_seed_join_path(paths->runtime_program_support_get_env_provider_source, sizeof(paths->runtime_program_support_get_env_provider_source), paths->root, "src/core/runtime/program_support_get_env_bridge.cheng");
     cheng_seed_join_path(paths->runtime_program_support_host_provider_source, sizeof(paths->runtime_program_support_host_provider_source), paths->root, "src/core/runtime/program_support_host_runtime.cheng");
     cheng_seed_join_path(paths->tooling_gate_source, sizeof(paths->tooling_gate_source), paths->root, "src/core/tooling/gate_main.cheng");
     cheng_seed_join_path(paths->tooling_backend_driver_dispatch_min_source, sizeof(paths->tooling_backend_driver_dispatch_min_source), paths->root, "src/core/tooling/backend_driver_dispatch_min.cheng");
@@ -1924,7 +1946,7 @@ static bool cheng_seed_bootstrap_artifacts_fresh(const ChengSeedBootstrapPaths *
 }
 
 static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths) {
-    const char *inputs[49];
+    const char *inputs[55];
     char map_path[PATH_MAX];
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
@@ -1952,44 +1974,50 @@ static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths
     inputs[10] = paths->compiler_publish_gate_source;
     inputs[11] = paths->lang_parser_source;
     inputs[12] = paths->lang_typed_expr_source;
-    inputs[13] = paths->backend_system_link_plan_source;
-    inputs[14] = paths->backend_lowering_plan_source;
-    inputs[15] = paths->backend_primary_object_plan_source;
-    inputs[16] = paths->backend_primary_object_emit_source;
-    inputs[17] = paths->backend_direct_object_emit_source;
-    inputs[18] = paths->backend_object_buffer_source;
-    inputs[19] = paths->backend_object_symbols_source;
-    inputs[20] = paths->backend_object_relocs_source;
-    inputs[21] = paths->backend_macho_object_writer_source;
-    inputs[22] = paths->backend_object_plan_source;
-    inputs[23] = paths->backend_native_link_plan_source;
-    inputs[24] = paths->backend_native_link_exec_source;
-    inputs[25] = paths->backend_system_link_exec_source;
-    inputs[26] = paths->backend_system_link_exec_runtime_source;
-    inputs[27] = paths->backend_system_link_exec_runtime_direct_source;
-    inputs[28] = paths->backend_line_map_source;
-    inputs[29] = paths->runtime_core_runtime_source;
-    inputs[30] = paths->runtime_compiler_runtime_source;
-    inputs[31] = paths->runtime_debug_runtime_source;
-    inputs[32] = paths->tooling_backend_driver_dispatch_min_source;
-    inputs[33] = paths->tooling_bootstrap_contract_source;
-    inputs[34] = paths->backend_build_plan_source;
-    inputs[35] = paths->runtime_core_provider_source;
-    inputs[36] = paths->runtime_compiler_program_provider_source;
-    inputs[37] = paths->runtime_compiler_tooling_provider_source;
-    inputs[38] = paths->runtime_program_support_provider_source;
-    inputs[39] = paths->runtime_program_support_host_provider_source;
-    inputs[40] = paths->runtime_debug_provider_source;
-    inputs[41] = paths->tooling_host_ops_source;
-    inputs[42] = paths->tooling_path_source;
-    inputs[43] = paths->tooling_world_receipt_gate_source;
-    inputs[44] = paths->tooling_debug_tools_gate_source;
-    inputs[45] = paths->tooling_export_visibility_gate_source;
-    inputs[46] = paths->tooling_object_debug_report_source;
-    inputs[47] = paths->std_os_host_process_source;
-    inputs[48] = paths->std_os_source;
-    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 49U) &&
-           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 49U);
+    inputs[13] = paths->core_ir_types_source;
+    inputs[14] = paths->core_ir_low_uir_source;
+    inputs[15] = paths->core_ir_body_ir_loop_source;
+    inputs[16] = paths->core_ir_body_ir_noalias_source;
+    inputs[17] = paths->core_ir_body_ir_opt_source;
+    inputs[18] = paths->backend_system_link_plan_source;
+    inputs[19] = paths->backend_lowering_plan_source;
+    inputs[20] = paths->backend_primary_object_plan_source;
+    inputs[21] = paths->backend_primary_object_emit_source;
+    inputs[22] = paths->backend_direct_object_emit_source;
+    inputs[23] = paths->backend_object_buffer_source;
+    inputs[24] = paths->backend_object_symbols_source;
+    inputs[25] = paths->backend_object_relocs_source;
+    inputs[26] = paths->backend_macho_object_writer_source;
+    inputs[27] = paths->backend_object_plan_source;
+    inputs[28] = paths->backend_native_link_plan_source;
+    inputs[29] = paths->backend_native_link_exec_source;
+    inputs[30] = paths->backend_system_link_exec_source;
+    inputs[31] = paths->backend_system_link_exec_runtime_source;
+    inputs[32] = paths->backend_system_link_exec_runtime_direct_source;
+    inputs[33] = paths->backend_line_map_source;
+    inputs[34] = paths->runtime_core_runtime_source;
+    inputs[35] = paths->runtime_compiler_runtime_source;
+    inputs[36] = paths->runtime_debug_runtime_source;
+    inputs[37] = paths->tooling_backend_driver_dispatch_min_source;
+    inputs[38] = paths->tooling_bootstrap_contract_source;
+    inputs[39] = paths->backend_build_plan_source;
+    inputs[40] = paths->runtime_core_provider_source;
+    inputs[41] = paths->runtime_compiler_program_provider_source;
+    inputs[42] = paths->runtime_compiler_tooling_provider_source;
+    inputs[43] = paths->runtime_program_support_provider_source;
+    inputs[44] = paths->runtime_program_support_get_env_provider_source;
+    inputs[45] = paths->runtime_program_support_host_provider_source;
+    inputs[46] = paths->runtime_debug_provider_source;
+    inputs[47] = paths->tooling_host_ops_source;
+    inputs[48] = paths->tooling_path_source;
+    inputs[49] = paths->tooling_world_receipt_gate_source;
+    inputs[50] = paths->tooling_debug_tools_gate_source;
+    inputs[51] = paths->tooling_export_visibility_gate_source;
+    inputs[52] = paths->tooling_object_debug_report_source;
+    inputs[53] = paths->std_os_host_process_source;
+    inputs[54] = paths->std_os_source;
+    return cheng_seed_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 55U) &&
+           cheng_seed_output_is_fresh_against_inputs(map_path, inputs, 55U);
 }
 
 static bool cheng_seed_backend_driver_available_for_build(const ChengSeedBootstrapPaths *paths) {
@@ -3195,7 +3223,7 @@ static bool cheng_seed_flag_present(int argc, char **argv, const char *flag) {
 #define CHENG_MAX_ASM_LOCALS 1024
 #define CHENG_MAX_TYPE_TEXT 512
 #define CHENG_MAX_DEFAULT_EXPR 4096
-#define CHENG_PROVIDER_OBJECT_CACHE_VERSION "provider-object-cache-v8"
+#define CHENG_PROVIDER_OBJECT_CACHE_VERSION "provider-object-cache-v11"
 #define CHENG_PRIMARY_OBJECT_CACHE_VERSION "primary-object-cache-v1"
 
 typedef struct {
@@ -15580,6 +15608,10 @@ static void cheng_seed_populate_runtime_requirements(ChengSeedSystemLinkPlanStub
                      &plan->provider_module_count,
                      CHENG_MAX_PROVIDER_MODULES,
                      "runtime/program_support");
+    cheng_seed_plan_add_path(plan->provider_modules,
+                     &plan->provider_module_count,
+                     CHENG_MAX_PROVIDER_MODULES,
+                     "runtime/program_support_get_env_bridge");
     cheng_seed_plan_add_path(plan->provider_modules,
                      &plan->provider_module_count,
                      CHENG_MAX_PROVIDER_MODULES,
@@ -48446,6 +48478,10 @@ static void cheng_seed_provider_source_for_module(const ChengSeedSystemLinkPlanS
         cheng_seed_join_path(out, cap, plan->workspace_root, "src/core/runtime/program_support_backend.cheng");
         return;
     }
+    if (cheng_seed_streq(module_path, "runtime/program_support_get_env_bridge")) {
+        cheng_seed_join_path(out, cap, plan->workspace_root, "src/core/runtime/program_support_get_env_bridge.cheng");
+        return;
+    }
     if (cheng_seed_streq(module_path, "runtime/program_support_host_runtime")) {
         cheng_seed_join_path(out, cap, plan->workspace_root, "src/core/runtime/program_support_host_runtime.cheng");
         return;
@@ -48621,6 +48657,16 @@ static bool cheng_seed_provider_export_roots_for_module(const ChengSeedSystemLin
             "setMem",
             "store_int32",
             "store_ptr"
+        };
+        return cheng_seed_provider_export_root_list(out,
+                                                    count,
+                                                    cap,
+                                                    roots,
+                                                    sizeof(roots) / sizeof(roots[0]));
+    }
+    if (cheng_seed_streq(module_path, "runtime/program_support_get_env_bridge")) {
+        static const char *const roots[] = {
+            "driver_c_get_env_bridge"
         };
         return cheng_seed_provider_export_root_list(out,
                                                     count,
@@ -63074,7 +63120,7 @@ static char *cheng_seed_system_link_plan_report(const ChengSeedBootstrapContract
     cheng_seed_report_append(&out, &cap, &used, "parser_source_kind=ordinary_cheng_source");
     snprintf(line, sizeof(line), "build_entry=%s", compiler_entry);
     cheng_seed_report_append(&out, &cap, &used, line);
-    cheng_seed_report_append(&out, &cap, &used, "build_source_unit_count=36");
+    cheng_seed_report_append(&out, &cap, &used, "build_source_unit_count=41");
     cheng_seed_report_append(&out, &cap, &used, "link_mode=system_link");
     cheng_seed_report_append(&out, &cap, &used, "pipeline_stage=parser_to_system_link_plan");
     return out;
