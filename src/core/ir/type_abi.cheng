@@ -1,0 +1,109 @@
+import cheng/core/ir/core_types as coreir
+import cheng/core/backend/target_matrix as tmat
+
+fn TypeAbiTargetKnown(targetTriple: str): bool =
+    return tmat.TargetIsDarwinArm64(targetTriple) ||
+           tmat.TargetIsLinuxX8664(targetTriple) ||
+           tmat.TargetIsLinuxAarch64(targetTriple) ||
+           tmat.TargetIsAndroidAarch64(targetTriple) ||
+           tmat.TargetIsOhosAarch64(targetTriple) ||
+           tmat.TargetIsLinuxRiscv64(targetTriple) ||
+           tmat.TargetIsWindows(targetTriple) ||
+           tmat.TargetIsWasm(targetTriple)
+
+fn TargetPointerSize(targetTriple: str): int32 =
+    if tmat.TargetIsWasm(targetTriple):
+        return 4
+    if TypeAbiTargetKnown(targetTriple):
+        return 8
+    return 0
+
+fn TargetPointerAlign(targetTriple: str): int32 =
+    return TargetPointerSize(targetTriple)
+
+fn TargetScalarRegisterCount(targetTriple: str): int32 =
+    if tmat.TargetIsDarwinArm64(targetTriple) ||
+       tmat.TargetIsLinuxAarch64(targetTriple) ||
+       tmat.TargetIsAndroidAarch64(targetTriple) ||
+       tmat.TargetIsOhosAarch64(targetTriple) ||
+       tmat.TargetIsLinuxRiscv64(targetTriple):
+        return 8
+    if tmat.TargetIsLinuxX8664(targetTriple):
+        return 6
+    if tmat.TargetIsWindows(targetTriple):
+        return 4
+    if tmat.TargetIsWasm(targetTriple):
+        return 0
+    return 0
+
+fn TargetTypeSize(targetTriple: str, layoutKind: coreir.LayoutKind): int32 =
+    if !TypeAbiTargetKnown(targetTriple):
+        return 0
+    if layoutKind == coreir.LayoutVoid:
+        return 0
+    if layoutKind == coreir.LayoutI1 ||
+       layoutKind == coreir.LayoutI8:
+        return 1
+    if layoutKind == coreir.LayoutI16:
+        return 2
+    if layoutKind == coreir.LayoutI32:
+        return 4
+    if layoutKind == coreir.LayoutI64:
+        return 8
+    if layoutKind == coreir.LayoutPointer:
+        return TargetPointerSize(targetTriple)
+    return 0
+
+fn TargetTypeAlign(targetTriple: str, layoutKind: coreir.LayoutKind): int32 =
+    if !TypeAbiTargetKnown(targetTriple):
+        return 0
+    if layoutKind == coreir.LayoutVoid:
+        return 1
+    if layoutKind == coreir.LayoutI1 ||
+       layoutKind == coreir.LayoutI8:
+        return 1
+    if layoutKind == coreir.LayoutI16:
+        return 2
+    if layoutKind == coreir.LayoutI32:
+        return 4
+    if layoutKind == coreir.LayoutI64:
+        return 8
+    if layoutKind == coreir.LayoutPointer:
+        return TargetPointerAlign(targetTriple)
+    return 0
+
+fn ClassifyAbi(targetTriple: str, layout: coreir.TypeLayout): coreir.AbiClass =
+    if !TypeAbiTargetKnown(targetTriple):
+        return coreir.AbiNone
+    if layout.kind == coreir.LayoutVoid:
+        return coreir.AbiNone
+    if layout.kind == coreir.LayoutPointer:
+        return coreir.AbiPointer
+    if layout.kind == coreir.LayoutI1 ||
+       layout.kind == coreir.LayoutI8 ||
+       layout.kind == coreir.LayoutI16 ||
+       layout.kind == coreir.LayoutI32 ||
+       layout.kind == coreir.LayoutI64:
+        return coreir.AbiScalar
+    if layout.kind == coreir.LayoutFixedBytes ||
+       layout.kind == coreir.LayoutArray ||
+       layout.kind == coreir.LayoutRecord:
+        return coreir.AbiAggregate
+    return coreir.AbiNone
+
+fn LowerType(targetTriple: str, layout: coreir.TypeLayout): coreir.TypeLayout =
+    if !TypeAbiTargetKnown(targetTriple):
+        return coreir.TypeLayoutInvalid()
+    var out = layout
+    if out.kind != coreir.LayoutFixedBytes &&
+       out.kind != coreir.LayoutArray &&
+       out.kind != coreir.LayoutRecord:
+        out.size = TargetTypeSize(targetTriple, out.kind)
+        out.align = TargetTypeAlign(targetTriple, out.kind)
+    elif out.align <= 0:
+        out.align = 1
+    out.abiClass = ClassifyAbi(targetTriple, out)
+    out.isTriviallyMoveable = true
+    if out.kind == coreir.LayoutInvalid:
+        out.isTriviallyMoveable = false
+    return out

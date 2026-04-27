@@ -48646,6 +48646,7 @@ static bool cheng_seed_provider_export_roots_for_module(const ChengSeedSystemLin
             "driver_c_progress_bridge",
             "driver_c_stderr_line_return2_bridge",
             "driver_c_u64_to_str",
+            "driver_c_write_error_report_bridge",
             "driver_c_write_text_file_bridge",
             "get_stderr",
             "get_stdout",

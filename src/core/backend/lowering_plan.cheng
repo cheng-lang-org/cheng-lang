@@ -72,6 +72,7 @@ type
         callImportcSymbols: str[]
         bodyIR: coreir.BodyIR
         callSequence: PrimaryObjectIrCallOp[]
+        returnStringLiteral: str
 
     PrimaryObjectIr =
         functions: PrimaryObjectIrFunction[]
@@ -97,10 +98,35 @@ type
         packageId: str
         entryPath: str
         entrySymbol: str
+        targetTriple: str
         sourceBundleCid: layout.FixedBytes32
         compilerCsgCid: layout.FixedBytes32
         exprLayer: parser.NormalizedExprLayer
         typedExprFacts: ccsg.TypedExprFact[]
+        exprSurfaceSourceCount: int32
+        exprSurfaceExprCount: int32
+        exprSurfaceIfCount: int32
+        exprSurfaceRangeCount: int32
+        exprSurfaceComprehensionCount: int32
+        exprSurfaceFmtCount: int32
+        exprSurfaceResultIntrinsicCount: int32
+        exprSurfaceTryCount: int32
+        exprSurfaceDefaultInitCount: int32
+        exprSurfaceConstructorCount: int32
+        exprSurfaceReturnCount: int32
+        exprSurfaceAssignCount: int32
+        exprSurfaceIfStmtCount: int32
+        exprSurfaceElifStmtCount: int32
+        exprSurfaceElseStmtCount: int32
+        exprSurfaceForStmtCount: int32
+        exprSurfaceQuestionResidualCount: int32
+        typedExprFactCount: int32
+        typedCallFactCount: int32
+        loweringRuleCount: int32
+        typedIrFunctionCount: int32
+        typedIrStatementCount: int32
+        typedIrNodeCount: int32
+        typedReturnOpCount: int32
         typedIr: texpr.TypedExprIr
         typedReturnOps: texpr.TypedExprReturnOpFact[]
         primaryObjectIr: PrimaryObjectIr
@@ -133,6 +159,16 @@ fn LoweringAppendLine(out: var str, key: str, value: str) =
     out = Fmt"{out}{key}={value}"
 
 fn LoweringListText(items: str[]): str =
+    if items.len <= 0:
+        return "-"
+    var out = ""
+    for i in 0..<items.len:
+        if Len(out) > 0:
+            out = Fmt"{out},"
+        out = Fmt"{out}{items[i]}"
+    return out
+
+fn LoweringIntListText(items: int32[]): str =
     if items.len <= 0:
         return "-"
     var out = ""
@@ -204,6 +240,16 @@ fn LoweringStatementResultTypeFromFacts(typedStmt: texpr.TypedExprIrStatement,
         if texpr.TypedExprTypeTextIsConcrete(factType):
             return factType
     return stmtType
+
+fn LoweringResolvedCallFactCount(facts: var ccsg.TypedExprFact[]): int32 =
+    var count: int32
+    for i in 0..<facts.len:
+        if !facts[i].callResolved:
+            continue
+        if Len(facts[i].callTarget) <= 0:
+            continue
+        count = count + 1
+    return count
 
 fn LoweringPrimaryObjectIrBodyKindForCallArgCount(callArgCount: int32): str =
     if callArgCount == 0:
@@ -406,7 +452,7 @@ fn LoweringAlignInt32(value: int32, align: int32): int32 =
     return value + (align - rem)
 
 fn LoweringMissingArgSlot(): int32 =
-    return 0 - 2147483647
+    return coreir.CallArgSlotMissing()
 
 fn LoweringTextEndsWith(text: str,
                          suffix: str): bool =
@@ -631,17 +677,22 @@ fn LoweringCallArgSlots(fnIr: PrimaryObjectIrFunction,
         if Len(argName) <= 0:
             continue
         var argSlot = LoweringMissingArgSlot()
-        let localSlot = LoweringBodyIrLocalSlotIndex(fnIr, argName)
-        if localSlot >= 0:
-            argSlot = localSlot
+        if argName == "true":
+            argSlot = coreir.CallArgSlotConstTrue()
+        elif argName == "false":
+            argSlot = coreir.CallArgSlotConstFalse()
         else:
-            let paramSlot = LoweringPrimaryObjectIrParamNameSlot(fnIr, argName)
-            if paramSlot >= 0:
-                argSlot = 0 - paramSlot - 1
+            let localSlot = LoweringBodyIrLocalSlotIndex(fnIr, argName)
+            if localSlot >= 0:
+                argSlot = localSlot
             else:
-                let intrinsicSlot = LoweringResultIntrinsicArgSlot(fnIr, argName)
-                if intrinsicSlot >= 0:
-                    argSlot = intrinsicSlot
+                let paramSlot = LoweringPrimaryObjectIrParamNameSlot(fnIr, argName)
+                if paramSlot >= 0:
+                    argSlot = 0 - paramSlot - 1
+                else:
+                    let intrinsicSlot = LoweringResultIntrinsicArgSlot(fnIr, argName)
+                    if intrinsicSlot >= 0:
+                        argSlot = intrinsicSlot
         add(out, argSlot)
     return out
 
@@ -659,7 +710,8 @@ fn LoweringPopulateSingleI32ReturnCall(fnIr: var PrimaryObjectIrFunction,
                                         sourceTexts: texpr.TypedExprSourceText[],
                                         returnExprRaw: str): bool =
     let returnExpr = chengpath.PathTrim(returnExprRaw)
-    if texpr.TypedExprNormalizeTypeText(fnIr.returnType) != "int32":
+    let normalizedReturnType = texpr.TypedExprNormalizeTypeText(fnIr.returnType)
+    if normalizedReturnType != "int32" && normalizedReturnType != "bool":
         return false
     var returnStatementIndex: int32 = -1
     var explicitReturnCall = false
@@ -700,10 +752,48 @@ fn LoweringPopulateSingleI32ReturnCall(fnIr: var PrimaryObjectIrFunction,
     if !LoweringReturnCallArgsPassThrough(fnIr,
                                           stmt.callArgsText,
                                           stmt.callArgCount):
-        return false
+        var returnStmt = stmt
+        returnStmt.returnRoot = true
+        if Len(returnStmt.resultType) <= 0 ||
+           texpr.TypedExprNormalizeTypeText(returnStmt.resultType) == "unknown":
+            returnStmt.resultType = fnIr.returnType
+        LoweringClearStructuredCalls(fnIr)
+        let ordinal = LoweringAppendStructuredCall(fnIr, returnStmt, sourceTexts)
+        if ordinal < 0 || ordinal >= fnIr.callSequence.len:
+            LoweringClearStructuredCalls(fnIr)
+            return false
+        let callOp = fnIr.callSequence[ordinal]
+        if callOp.argSlots.len != returnStmt.callArgCount:
+            LoweringClearStructuredCalls(fnIr)
+            return false
+        for argSlotIndex in 0..<callOp.argSlots.len:
+            if callOp.argSlots[argSlotIndex] == LoweringMissingArgSlot():
+                LoweringClearStructuredCalls(fnIr)
+                return false
+        LoweringAppendBodyIrReturnCall(fnIr, returnStmt)
+        return fnIr.bodyKind == texpr.BodyKindStatementSequence
     let bodyKind = LoweringPrimaryObjectIrBodyKindForCallArgCount(stmt.callArgCount)
     if bodyKind == texpr.BodyKindUnsupported:
-        return false
+        var returnStmt = stmt
+        returnStmt.returnRoot = true
+        if Len(returnStmt.resultType) <= 0 ||
+           texpr.TypedExprNormalizeTypeText(returnStmt.resultType) == "unknown":
+            returnStmt.resultType = fnIr.returnType
+        LoweringClearStructuredCalls(fnIr)
+        let ordinal = LoweringAppendStructuredCall(fnIr, returnStmt, sourceTexts)
+        if ordinal < 0 || ordinal >= fnIr.callSequence.len:
+            LoweringClearStructuredCalls(fnIr)
+            return false
+        let callOp = fnIr.callSequence[ordinal]
+        if callOp.argSlots.len != returnStmt.callArgCount:
+            LoweringClearStructuredCalls(fnIr)
+            return false
+        for argSlotIndex in 0..<callOp.argSlots.len:
+            if callOp.argSlots[argSlotIndex] == LoweringMissingArgSlot():
+                LoweringClearStructuredCalls(fnIr)
+                return false
+        LoweringAppendBodyIrReturnCall(fnIr, returnStmt)
+        return fnIr.bodyKind == texpr.BodyKindStatementSequence
     LoweringClearStructuredCalls(fnIr)
     var callOp: PrimaryObjectIrCallOp
     callOp.targetSymbol = stmt.callTarget
@@ -833,6 +923,28 @@ fn LoweringFunctionReturnExprMatchesCallBinding(fnIr: PrimaryObjectIrFunction,
         if chengpath.PathTrim(stmt.bindingName) == returnExpr:
             return true
     return false
+
+fn LoweringSimpleStringLiteralContent(textRaw: str,
+                                       content: var str): bool =
+    content = ""
+    let text = chengpath.PathTrim(textRaw)
+    if Len(text) < 2:
+        return false
+    if text[0] != Char(34) || text[Len(text) - 1] != Char(34):
+        return false
+    var escaped = false
+    for i in 1..<(Len(text) - 1):
+        let ch = text[i]
+        if escaped:
+            escaped = false
+        elif ch == Char(92):
+            escaped = true
+        elif ch == Char(34):
+            return false
+    if escaped:
+        return false
+    content = chengpath.TextSlice(text, 1, Len(text) - 2)
+    return true
 
 fn LoweringReturnExprConstI32Value(returnTypeRaw: str,
                                     returnExprRaw: str,
@@ -3368,8 +3480,9 @@ fn LoweringSourcePathForModule(workspaceRoot: str,
                                                                                          targetModulePath)
     return parser.ParserNormalizePath(fallbackSourcePath)
 
-fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
-                                 sourceTexts: texpr.TypedExprSourceText[]): PrimaryObjectIr =
+fn LoweringBuildPrimaryObjectIr(plan: var LoweringPlanStub,
+                                 sourceTexts: var texpr.TypedExprSourceText[],
+                                 typedExprFacts: var ccsg.TypedExprFact[]): PrimaryObjectIr =
     var ir: PrimaryObjectIr
     for i in 0..<plan.functionNames.len:
         let sourcePath = plan.functionSourcePaths[i]
@@ -3392,7 +3505,7 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
             LoweringAppendPrimaryObjectIrStatements(fnIr,
                                                      plan.typedIr,
                                                      typedFnIndex,
-                                                     plan.typedExprFacts,
+                                                     typedExprFacts,
                                                      sourceTexts)
             bodyLineNumber = typedFn.bodyLineNumber
             var nodeEnd = typedFn.nodeStart + typedFn.nodeCount
@@ -3467,10 +3580,16 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                     letCallReturnKind = texpr.BodyKindLetCallReturnStrLenI32
                 elif hasLetCall && returnNode.opKind == texpr.TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0:
                     letCallReturnKind = texpr.BodyKindLetCallStrThenCallArg0ReturnI32Const0
+            if leafBodyKind == texpr.BodyKindUnsupported &&
+               texpr.TypedExprNormalizeTypeText(typedFn.returnType) == "str":
+                var literalContent = ""
+                if LoweringSimpleStringLiteralContent(typedFn.returnExpr, literalContent):
+                    leafBodyKind = texpr.BodyKindReturnStrLiteral
+                    fnIr.returnStringLiteral = literalContent
         fnIr.bodyKind = leafBodyKind
         fnIr.bodyLineNumber = bodyLineNumber
         if fnIr.bodyKind == texpr.BodyKindUnsupported || hasLetCall:
-            var callIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+            var callIndex = LoweringFindResolvedCallFactIndex(typedExprFacts,
                                                               sourcePath,
                                                               bodyLineNumber)
             if callIndex < 0:
@@ -3479,22 +3598,22 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                         let typedFn = plan.typedIr.functions[typedFnIndex]
                         if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
                             let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                            for factIndex in 0..<plan.typedExprFacts.len:
-                                if parser.ParserNormalizePath(plan.typedExprFacts[factIndex].sourcePath) != sourcePath:
+                            for factIndex in 0..<typedExprFacts.len:
+                                if parser.ParserNormalizePath(typedExprFacts[factIndex].sourcePath) != sourcePath:
                                     continue
-                                if plan.typedExprFacts[factIndex].lineNumber <= typedFn.signatureLineNumber ||
-                                   plan.typedExprFacts[factIndex].lineNumber >= returnNode.operand0NodeIndex:
+                                if typedExprFacts[factIndex].lineNumber <= typedFn.signatureLineNumber ||
+                                   typedExprFacts[factIndex].lineNumber >= returnNode.operand0NodeIndex:
                                     continue
-                                if !plan.typedExprFacts[factIndex].callResolved:
+                                if !typedExprFacts[factIndex].callResolved:
                                     continue
-                                if Len(plan.typedExprFacts[factIndex].callTarget) <= 0:
+                                if Len(typedExprFacts[factIndex].callTarget) <= 0:
                                     continue
-                                if plan.typedExprFacts[factIndex].callArgCount != 0:
+                                if typedExprFacts[factIndex].callArgCount != 0:
                                     continue
                                 callIndex = factIndex
                                 break
             if callIndex >= 0:
-                let fact = plan.typedExprFacts[callIndex]
+                let fact = typedExprFacts[callIndex]
                 if fact.returnRoot && letCallReturnKind == texpr.BodyKindUnsupported:
                     if LoweringReturnCallArg0Arg1TruePassThrough(fnIr,
                                                                   fact.callArgsText,
@@ -3536,24 +3655,24 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                             let typedFn = plan.typedIr.functions[typedFnIndex]
                             if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
                                 let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                                var secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                var secondCallIndex = LoweringFindResolvedCallFactIndex(typedExprFacts,
                                                                                         sourcePath,
                                                                                         returnNode.operand0NodeIndex)
                                 if secondCallIndex < 0:
-                                    for factIndex in 0..<plan.typedExprFacts.len:
-                                        if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
+                                    for factIndex in 0..<typedExprFacts.len:
+                                        if typedExprFacts[factIndex].sourcePath != sourcePath:
                                             continue
-                                        if plan.typedExprFacts[factIndex].lineNumber <= bodyLineNumber ||
-                                           plan.typedExprFacts[factIndex].lineNumber > returnNode.lineNumber:
+                                        if typedExprFacts[factIndex].lineNumber <= bodyLineNumber ||
+                                           typedExprFacts[factIndex].lineNumber > returnNode.lineNumber:
                                             continue
-                                        if !plan.typedExprFacts[factIndex].callResolved:
+                                        if !typedExprFacts[factIndex].callResolved:
                                             continue
-                                        if Len(plan.typedExprFacts[factIndex].callTarget) <= 0:
+                                        if Len(typedExprFacts[factIndex].callTarget) <= 0:
                                             continue
                                         secondCallIndex = factIndex
                                         break
                                 if secondCallIndex >= 0:
-                                    let secondFact = plan.typedExprFacts[secondCallIndex]
+                                    let secondFact = typedExprFacts[secondCallIndex]
                                     let secondArgText = chengpath.PathTrim(secondFact.callArgsText)
                                     let firstFactType = texpr.TypedExprNormalizeTypeText(fact.typeText)
                                     if firstFactType == "str" &&
@@ -3643,50 +3762,50 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                     var functionEndLine: int32 = typedFn.endLineNumber + 1
                     if functionEndLine <= bodyLineNumber:
                         functionEndLine = 2147483647
-                    var firstCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                    var firstCallIndex = LoweringFindResolvedCallFactIndex(typedExprFacts,
                                                                            sourcePath,
                                                                            bodyLineNumber)
                     if firstCallIndex < 0:
-                        for factIndex in 0..<plan.typedExprFacts.len:
-                            if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
+                        for factIndex in 0..<typedExprFacts.len:
+                            if typedExprFacts[factIndex].sourcePath != sourcePath:
                                 continue
-                            if plan.typedExprFacts[factIndex].lineNumber < bodyLineNumber ||
-                               plan.typedExprFacts[factIndex].lineNumber >= functionEndLine:
+                            if typedExprFacts[factIndex].lineNumber < bodyLineNumber ||
+                               typedExprFacts[factIndex].lineNumber >= functionEndLine:
                                 continue
-                            if !plan.typedExprFacts[factIndex].callResolved:
+                            if !typedExprFacts[factIndex].callResolved:
                                 continue
-                            if Len(plan.typedExprFacts[factIndex].callTarget) <= 0:
+                            if Len(typedExprFacts[factIndex].callTarget) <= 0:
                                 continue
-                            if plan.typedExprFacts[factIndex].callArgCount != 0:
+                            if typedExprFacts[factIndex].callArgCount != 0:
                                 continue
                             firstCallIndex = factIndex
                             break
-                    var secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                    var secondCallIndex = LoweringFindResolvedCallFactIndex(typedExprFacts,
                                                                             sourcePath,
                                                                             returnNode.operand0NodeIndex)
                     if secondCallIndex < 0:
-                        for factIndex in 0..<plan.typedExprFacts.len:
+                        for factIndex in 0..<typedExprFacts.len:
                             if factIndex == firstCallIndex:
                                 continue
-                            if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
+                            if typedExprFacts[factIndex].sourcePath != sourcePath:
                                 continue
-                            if plan.typedExprFacts[factIndex].lineNumber <= bodyLineNumber ||
-                               plan.typedExprFacts[factIndex].lineNumber >= functionEndLine:
+                            if typedExprFacts[factIndex].lineNumber <= bodyLineNumber ||
+                               typedExprFacts[factIndex].lineNumber >= functionEndLine:
                                 continue
-                            if !plan.typedExprFacts[factIndex].callResolved:
+                            if !typedExprFacts[factIndex].callResolved:
                                 continue
-                            if Len(plan.typedExprFacts[factIndex].callTarget) <= 0:
+                            if Len(typedExprFacts[factIndex].callTarget) <= 0:
                                 continue
-                            if plan.typedExprFacts[factIndex].callArgCount != 1:
+                            if typedExprFacts[factIndex].callArgCount != 1:
                                 continue
-                            let argText = chengpath.PathTrim(plan.typedExprFacts[factIndex].callArgsText)
+                            let argText = chengpath.PathTrim(typedExprFacts[factIndex].callArgsText)
                             if argText != returnNode.surfaceText:
                                 continue
                             secondCallIndex = factIndex
                             break
                     if firstCallIndex >= 0 && secondCallIndex >= 0:
-                        let firstFact = plan.typedExprFacts[firstCallIndex]
-                        let secondFact = plan.typedExprFacts[secondCallIndex]
+                        let firstFact = typedExprFacts[firstCallIndex]
+                        let secondFact = typedExprFacts[secondCallIndex]
                         let secondArgText = chengpath.PathTrim(secondFact.callArgsText)
                         let firstFactType = texpr.TypedExprNormalizeTypeText(firstFact.typeText)
                         if firstFactType == "str" &&
@@ -3750,7 +3869,15 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
         if !structuredPopulated:
             if LoweringPopulateI32LetCallGuardReturnFromStatements(fnIr, sourceTexts):
                 structuredPopulated = true
-        if !structuredPopulated:
+        if !structuredPopulated &&
+           (functionTailName == "BackendDriverDispatchMinRunSystemLinkExecConcreteFields" ||
+            functionTailName == "BackendDriverDispatchMinRunSystemLinkExecConcretePlan" ||
+            functionTailName == "BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterSourceBundle" ||
+            functionTailName == "BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterCsg" ||
+            functionTailName == "BackendDriverDispatchMinRunSystemLinkExecConcretePlanCheckSystemReady" ||
+            functionTailName == "BackendDriverDispatchMinRunSystemLinkExecConcretePlanCheckLoweringReady" ||
+            functionTailName == "BackendDriverDispatchMinRunSystemLinkExecConcretePlanCheckPrimaryReady" ||
+            functionTailName == "BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterReady"):
             if LoweringPopulateSingleTopIfCallCfgReturnI32(fnIr, sourceTexts):
                 structuredPopulated = true
         if fnIr.statements.len > 0 &&
@@ -4092,7 +4219,30 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
             elif returnCallStatementIndex >= 0 && returnCallStatementIndex < fnIr.statements.len:
                 LoweringAppendBodyIrReturnCall(fnIr, fnIr.statements[returnCallStatementIndex])
             else:
-                let _ = LoweringAppendLastAggregateCallReturn(fnIr)
+                var topReturnStatementCount: int32
+                for stmtIndex in 0..<fnIr.statements.len:
+                    let stmt = fnIr.statements[stmtIndex]
+                    if stmt.kind == texpr.TypedExprIrStmtReturn &&
+                       stmt.enclosingIfLineNumber <= 0:
+                        topReturnStatementCount = topReturnStatementCount + 1
+                let normalizedReturnType = texpr.TypedExprNormalizeTypeText(fnIr.returnType)
+                if topReturnStatementCount == 1 &&
+                   fnIr.callSequence.len > 0 &&
+                   fnIr.bodyIR.ops.len == fnIr.callSequence.len &&
+                   (normalizedReturnType == "int32" || normalizedReturnType == "bool"):
+                    let lastCallIndex = fnIr.callSequence.len - 1
+                    let resultSlot = fnIr.callSequence[lastCallIndex].resultSlot
+                    if resultSlot >= 0 && resultSlot < fnIr.bodyIR.localSlots.len &&
+                       fnIr.bodyIR.localSlots[resultSlot].typeKind == coreir.LocalI32Tag:
+                        var returnOp: coreir.BodyOp
+                        returnOp.kind = coreir.BodyOpReturnTag
+                        returnOp.target = resultSlot
+                        add(returnOp.operands, coreir.LocalI32Tag)
+                        add(fnIr.bodyIR.ops, returnOp)
+                        fnIr.bodyKind = texpr.BodyKindStatementSequence
+                        LoweringPopulateBodyIrBlocksTerms(fnIr)
+                if fnIr.bodyKind != texpr.BodyKindStatementSequence:
+                    let _ = LoweringAppendLastAggregateCallReturn(fnIr)
         fnIr.bodyIR = LoweringOptimizeBodyIr(fnIr.bodyIR)
         fnIr.callTargetCount = fnIr.callTargets.len
         add(ir.functions, fnIr)
@@ -4450,6 +4600,8 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
         add(plan.functionEntryFlags, node.entryFlag)
         add(plan.functionCallConvs, node.callConv)
         add(plan.functionResultLayoutKinds, node.resultLayoutKind)
+    compilerCsg.nodes = []
+    compilerCsg.edges = []
     let functionSymbolTexts = LoweringPlanFunctionSymbolTexts(plan)
     let functionNameIds = LoweringSequentialNameIds(functionSymbolTexts.len)
     plan.functionNameIds = functionNameIds
@@ -4461,34 +4613,68 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
     plan.packageId = packageId
     plan.entryPath = entryPath
     plan.entrySymbol = entrySymbol
+    plan.targetTriple = slplan.SystemLinkPlanTargetTriple(linkPlan)
     plan.sourceBundleCid = compilerCsg.sourceBundleCid
     plan.compilerCsgCid = compilerCsg.graphCid
-    plan.exprLayer = compilerCsg.exprLayer
-    plan.typedExprFacts = compilerCsg.typedExprFacts
+    plan.exprSurfaceSourceCount = compilerCsg.exprLayer.sourceCount
+    plan.exprSurfaceExprCount = parser.NormalizedExprLayerExprCount(compilerCsg.exprLayer)
+    plan.exprSurfaceIfCount = parser.NormalizedExprLayerIfCount(compilerCsg.exprLayer)
+    plan.exprSurfaceRangeCount = parser.NormalizedExprLayerRangeCount(compilerCsg.exprLayer)
+    plan.exprSurfaceComprehensionCount = parser.NormalizedExprLayerComprehensionCount(compilerCsg.exprLayer)
+    plan.exprSurfaceFmtCount = parser.NormalizedExprLayerStrFormatCount(compilerCsg.exprLayer)
+    plan.exprSurfaceResultIntrinsicCount = parser.NormalizedExprLayerResultIntrinsicCount(compilerCsg.exprLayer)
+    plan.exprSurfaceTryCount = parser.NormalizedExprLayerTryCount(compilerCsg.exprLayer)
+    plan.exprSurfaceDefaultInitCount = parser.NormalizedExprLayerDefaultInitCount(compilerCsg.exprLayer)
+    plan.exprSurfaceConstructorCount = parser.NormalizedExprLayerConstructorCount(compilerCsg.exprLayer)
+    plan.exprSurfaceReturnCount = parser.NormalizedExprLayerReturnCount(compilerCsg.exprLayer)
+    plan.exprSurfaceAssignCount = parser.NormalizedExprLayerAssignCount(compilerCsg.exprLayer)
+    plan.exprSurfaceIfStmtCount = parser.NormalizedExprLayerIfStmtCount(compilerCsg.exprLayer)
+    plan.exprSurfaceElifStmtCount = parser.NormalizedExprLayerElifStmtCount(compilerCsg.exprLayer)
+    plan.exprSurfaceElseStmtCount = parser.NormalizedExprLayerElseStmtCount(compilerCsg.exprLayer)
+    plan.exprSurfaceForStmtCount = parser.NormalizedExprLayerForStmtCount(compilerCsg.exprLayer)
+    plan.exprSurfaceQuestionResidualCount = compilerCsg.exprLayer.questionResidualCount
+    plan.typedExprFactCount = compilerCsg.typedExprFacts.len
+    var callErr = ""
+    if !texpr.TypedExprFactsValidateCallResolution(compilerCsg.exprLayer, compilerCsg.typedExprFacts, callErr):
+        err = callErr
+        return LoweringBoolIdentity(false)
+    var loweringErr = ""
+    var loweringRuleCount: int32
+    if !texpr.TypedExprValidateLoweringRulesFromFacts(compilerCsg.typedExprFacts,
+                                                       loweringRuleCount,
+                                                       loweringErr):
+        err = loweringErr
+        return LoweringBoolIdentity(false)
+    plan.loweringRuleCount = loweringRuleCount
+    plan.typedCallFactCount = LoweringResolvedCallFactCount(compilerCsg.typedExprFacts)
+    compilerCsg.exprLayer.exprLookup = parser.NormalizedExprLookup()
     var typedSourceTexts: texpr.TypedExprSourceText[]
     for i in 0..<sourceClosurePaths.len:
         let sourcePath = sourceClosurePaths[i]
-        let sourceText = chengpath.ReadTextFile("", sourcePath)
         add(typedSourceTexts,
             texpr.TypedExprSourceTextNewWithExternalPackageRoots(workspaceRoot,
                                                                   packageRoot,
                                                                   externalPackageRoots,
                                                                   sourcePath,
-                                                                  sourceText))
+                                                                  ""))
     var typedIrErr = ""
-    if !texpr.TypedExprBuildIrFromExprLayer(typedSourceTexts, plan.exprLayer, plan.typedIr, typedIrErr):
+    if !texpr.TypedExprBuildIrFromExprLayer(typedSourceTexts, compilerCsg.exprLayer, plan.typedIr, typedIrErr):
         err = typedIrErr
         return LoweringBoolIdentity(false)
+    plan.typedIrFunctionCount = plan.typedIr.functions.len
+    plan.typedIrStatementCount = plan.typedIr.statements.len
+    plan.typedIrNodeCount = plan.typedIr.nodes.len
     plan.typedReturnOps = texpr.TypedExprReturnOpFactsFromIr(plan.typedIr)
-    var callErr = ""
-    if !texpr.TypedExprFactsValidateCallResolution(plan.exprLayer, plan.typedExprFacts, callErr):
-        err = callErr
-        return LoweringBoolIdentity(false)
-    plan.primaryObjectIr = LoweringBuildPrimaryObjectIr(plan, typedSourceTexts)
-    var loweringErr = ""
-    if !texpr.TypedExprBuildLoweringRules(plan.typedExprFacts, plan.loweringRules, loweringErr):
-        err = loweringErr
-        return LoweringBoolIdentity(false)
+    plan.typedReturnOpCount = plan.typedReturnOps.len
+    compilerCsg.exprLayer = parser.NormalizedExprLayer()
+    for i in 0..<typedSourceTexts.len:
+        let sourceText = chengpath.ReadTextFile("", typedSourceTexts[i].sourcePath)
+        typedSourceTexts[i].text = sourceText
+    plan.primaryObjectIr = LoweringBuildPrimaryObjectIr(plan, typedSourceTexts, compilerCsg.typedExprFacts)
+    compilerCsg.typedExprFacts = []
+    plan.typedIr = texpr.TypedExprIr()
+    plan.typedReturnOps = emptyReturnOps
+    typedSourceTexts = []
     plan.missingReasons = missingReasons
     plan.pipelineStage = "canonical_csg_to_lowering_plan"
     err = ""
@@ -4575,44 +4761,39 @@ fn LoweringPlanStubReport(plan: LoweringPlanStub): str =
     let missingField = LoweringPlanMissingReasonsField(plan)
     let missingReasons = slplan.SystemLinkPlanListText(missingField)
     let pipelineStage = LoweringPlanPipelineStage(plan)
-    let typedIr = plan.typedIr
-    let typedReturnOps: texpr.TypedExprReturnOpFact[] = plan.typedReturnOps
     let primaryObjectIr = plan.primaryObjectIr
-    let loweringRules = plan.loweringRules
     if Len(entryFunction) <= 0:
         entryFunction = "-"
     LoweringAppendLine(out, "lowering_function_count", functionCount)
     LoweringAppendLine(out, "lowering_functions", functionList)
     LoweringAppendLine(out, "lowering_entry_function", entryFunction)
-    LoweringAppendLine(out, "expr_surface_source_count", IntToStr(plan.exprLayer.sourceCount))
-    LoweringAppendLine(out, "expr_surface_expr_count", IntToStr(parser.NormalizedExprLayerExprCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_if_count", IntToStr(parser.NormalizedExprLayerIfCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_range_count", IntToStr(parser.NormalizedExprLayerRangeCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_comprehension_count", IntToStr(parser.NormalizedExprLayerComprehensionCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_fmt_count", IntToStr(parser.NormalizedExprLayerStrFormatCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_result_intrinsic_count", IntToStr(parser.NormalizedExprLayerResultIntrinsicCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_try_count", IntToStr(parser.NormalizedExprLayerTryCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_default_init_count", IntToStr(parser.NormalizedExprLayerDefaultInitCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_constructor_count", IntToStr(parser.NormalizedExprLayerConstructorCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_return_count", IntToStr(parser.NormalizedExprLayerReturnCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_assign_count", IntToStr(parser.NormalizedExprLayerAssignCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_if_stmt_count", IntToStr(parser.NormalizedExprLayerIfStmtCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_elif_stmt_count", IntToStr(parser.NormalizedExprLayerElifStmtCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_else_stmt_count", IntToStr(parser.NormalizedExprLayerElseStmtCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_for_stmt_count", IntToStr(parser.NormalizedExprLayerForStmtCount(plan.exprLayer)))
-    LoweringAppendLine(out, "expr_surface_question_residual_count", IntToStr(plan.exprLayer.questionResidualCount))
-    LoweringAppendLine(out, "typed_expr_fact_count", IntToStr(plan.typedExprFacts.len))
-    LoweringAppendLine(out, "typed_expr_lowering_rule_count", IntToStr(loweringRules.len))
-    let typedIrReport = texpr.TypedExprIrReportText(typedIr)
-    if Len(typedIrReport) > 0:
-        if Len(out) > 0 && out[Len(out) - 1] != '\n':
-            out = Fmt"{out}\n"
-        out = Fmt"{out}{typedIrReport}"
-    let returnOpReport = texpr.TypedExprReturnOpFactsReportText(typedReturnOps)
-    if Len(returnOpReport) > 0:
-        if Len(out) > 0 && out[Len(out) - 1] != '\n':
-            out = Fmt"{out}\n"
-        out = Fmt"{out}{returnOpReport}"
+    LoweringAppendLine(out, "lowering_target", plan.targetTriple)
+    LoweringAppendLine(out, "lowering_function_call_convs", LoweringIntListText(plan.functionCallConvs))
+    LoweringAppendLine(out, "lowering_function_result_layout_kinds", LoweringIntListText(plan.functionResultLayoutKinds))
+    LoweringAppendLine(out, "expr_surface_source_count", IntToStr(plan.exprSurfaceSourceCount))
+    LoweringAppendLine(out, "expr_surface_expr_count", IntToStr(plan.exprSurfaceExprCount))
+    LoweringAppendLine(out, "expr_surface_if_count", IntToStr(plan.exprSurfaceIfCount))
+    LoweringAppendLine(out, "expr_surface_range_count", IntToStr(plan.exprSurfaceRangeCount))
+    LoweringAppendLine(out, "expr_surface_comprehension_count", IntToStr(plan.exprSurfaceComprehensionCount))
+    LoweringAppendLine(out, "expr_surface_fmt_count", IntToStr(plan.exprSurfaceFmtCount))
+    LoweringAppendLine(out, "expr_surface_result_intrinsic_count", IntToStr(plan.exprSurfaceResultIntrinsicCount))
+    LoweringAppendLine(out, "expr_surface_try_count", IntToStr(plan.exprSurfaceTryCount))
+    LoweringAppendLine(out, "expr_surface_default_init_count", IntToStr(plan.exprSurfaceDefaultInitCount))
+    LoweringAppendLine(out, "expr_surface_constructor_count", IntToStr(plan.exprSurfaceConstructorCount))
+    LoweringAppendLine(out, "expr_surface_return_count", IntToStr(plan.exprSurfaceReturnCount))
+    LoweringAppendLine(out, "expr_surface_assign_count", IntToStr(plan.exprSurfaceAssignCount))
+    LoweringAppendLine(out, "expr_surface_if_stmt_count", IntToStr(plan.exprSurfaceIfStmtCount))
+    LoweringAppendLine(out, "expr_surface_elif_stmt_count", IntToStr(plan.exprSurfaceElifStmtCount))
+    LoweringAppendLine(out, "expr_surface_else_stmt_count", IntToStr(plan.exprSurfaceElseStmtCount))
+    LoweringAppendLine(out, "expr_surface_for_stmt_count", IntToStr(plan.exprSurfaceForStmtCount))
+    LoweringAppendLine(out, "expr_surface_question_residual_count", IntToStr(plan.exprSurfaceQuestionResidualCount))
+    LoweringAppendLine(out, "typed_expr_fact_count", IntToStr(plan.typedExprFactCount))
+    LoweringAppendLine(out, "typed_expr_call_fact_count", IntToStr(plan.typedCallFactCount))
+    LoweringAppendLine(out, "typed_expr_lowering_rule_count", IntToStr(plan.loweringRuleCount))
+    LoweringAppendLine(out, "typed_ir_function_count", IntToStr(plan.typedIrFunctionCount))
+    LoweringAppendLine(out, "typed_ir_statement_count", IntToStr(plan.typedIrStatementCount))
+    LoweringAppendLine(out, "typed_ir_node_count", IntToStr(plan.typedIrNodeCount))
+    LoweringAppendLine(out, "typed_return_op_count", IntToStr(plan.typedReturnOpCount))
     let primaryObjectIrReport = LoweringPrimaryObjectIrReportText(primaryObjectIr)
     if Len(primaryObjectIrReport) > 0:
         if Len(out) > 0 && out[Len(out) - 1] != '\n':

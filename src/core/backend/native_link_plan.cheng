@@ -1,4 +1,7 @@
 import cheng/core/tooling/compiler_request as creq
+import cheng/core/backend/object_plan as oplan
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/backend/target_matrix as tmat
 
 type
     NativeOutputKind = enum
@@ -9,6 +12,7 @@ type
         targetTriple: str
         emitKind: creq.CompilerEmit
         outputPath: str
+        objectFormat: str
         linkerProgram: str
         linkerFlavor: str
         outputKind: NativeOutputKind
@@ -18,3 +22,49 @@ type
         linkInputPaths: str[]
         missingReasons: str[]
         pipelineStage: str
+
+fn BuildNativeLinkPlan(linkPlan: slplan.SystemLinkPlanStub,
+                        objectPlan: oplan.ObjectPlanStub): NativeLinkPlanStub =
+    var out: NativeLinkPlanStub
+    var missing: str[]
+    let objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
+    let linkerFlavor = tmat.TargetLinkerFlavor(linkPlan.targetTriple)
+    let linkerProgram = tmat.TargetLinkerProgram(linkPlan.targetTriple)
+    var outputKind = NativeOutputArtifact
+    if linkPlan.emitKind == creq.EmitExe:
+        outputKind = NativeOutputExecutable
+    if linkPlan.missingReasons.len > 0:
+        add(missing, "system_link_plan_not_ready_for_native_link")
+    if objectPlan.missingReasons.len > 0:
+        add(missing, "object_plan_not_ready_for_native_link")
+    if objectPlan.linkInputPaths.len <= 0:
+        add(missing, "native_link_inputs_missing")
+    if len(linkPlan.outputPath) <= 0:
+        add(missing, "native_link_output_missing")
+    if linkPlan.emitKind == creq.EmitExe && len(linkPlan.entrySymbol) <= 0:
+        add(missing, "native_link_entry_symbol_missing")
+    if objectFormat == "unknown":
+        add(missing, "native_link_object_format_unknown")
+    if objectFormat == "wasm":
+        add(missing, "native_link_not_applicable_for_wasm")
+    if len(linkerProgram) <= 0:
+        add(missing, "native_linker_program_missing")
+    if len(linkerFlavor) <= 0:
+        add(missing, "native_linker_flavor_missing")
+    if tmat.TargetRequiresNativeProviderModules(linkPlan.targetTriple) &&
+       linkPlan.providerModules.len <= 0:
+        add(missing, "native_link_provider_modules_missing")
+    out.targetTriple = linkPlan.targetTriple
+    out.emitKind = linkPlan.emitKind
+    out.outputPath = linkPlan.outputPath
+    out.objectFormat = objectFormat
+    out.linkerProgram = linkerProgram
+    out.linkerFlavor = linkerFlavor
+    out.outputKind = outputKind
+    out.entrySymbol = linkPlan.entrySymbol
+    out.primaryObjectPath = objectPlan.primaryObjectPath
+    out.browserBridgeObjectPath = objectPlan.browserBridgeObjectPath
+    out.linkInputPaths = objectPlan.linkInputPaths
+    out.missingReasons = missing
+    out.pipelineStage = "object_plan_to_native_link_plan"
+    return out

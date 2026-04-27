@@ -120,6 +120,9 @@ fn PrimaryCStringLiteralDataLabel(functionSymbol: str,
                                   callOrdinal: int32): str =
     return Fmt"{functionSymbol}__cstring_{callOrdinal}"
 
+fn PrimaryReturnStrLiteralDataLabel(functionSymbol: str): str =
+    return Fmt"{functionSymbol}__return_str_literal"
+
 fn PrimarySimpleStringLiteralContent(argsText: str,
                                      content: var str): bool =
     content = ""
@@ -637,8 +640,7 @@ fn PrimaryBodyIrCbrConditionSupported(term: coreir.BodyTerm,
     if term.kind != coreir.BodyTermCbrTag:
         return false
     if term.conditionKind != coreir.BodyCondLocalNonZeroTag &&
-       term.conditionKind != coreir.BodyCondLocalZeroTag &&
-       term.conditionKind != coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag:
+       term.conditionKind != coreir.BodyCondLocalZeroTag:
         return false
     var slotIndex = term.lhsSlot
     if slotIndex < 0:
@@ -681,11 +683,20 @@ fn PrimaryBodyIrIsCallCfgReturnInt32(bodyIR: coreir.BodyIR): bool =
         elif term.kind == coreir.BodyTermBrTag:
             if term.trueBlock < 0 || term.trueBlock >= bodyIR.blocks.len:
                 return false
+            if term.trueBlock <= blockIndex:
+                return false
         elif term.kind == coreir.BodyTermCbrTag:
             if !PrimaryBodyIrCbrConditionSupported(term, bodyIR):
                 return false
             if term.trueBlock < 0 || term.trueBlock >= bodyIR.blocks.len ||
                term.falseBlock < 0 || term.falseBlock >= bodyIR.blocks.len:
+                return false
+            let nextBlock = blockIndex + 1
+            if nextBlock >= bodyIR.blocks.len:
+                return false
+            if term.trueBlock == term.falseBlock:
+                return false
+            if term.trueBlock != nextBlock && term.falseBlock != nextBlock:
                 return false
         else:
             return false
@@ -1238,11 +1249,51 @@ fn PrimaryCallOpStackPostCallWordCount(callOp: coreir.CallOp): int32 =
         return 0
     return 1
 
+fn PrimaryCallArgSlotIsConst(slotIndex: int32): bool =
+    return coreir.CallArgSlotIsConst(slotIndex)
+
+fn PrimaryCallArgConstMovWord(slotIndex: int32,
+                               registerIndex: int32): int32 =
+    if !PrimaryCallArgSlotIsConst(slotIndex):
+        return 0
+    return PrimaryArm64RegisterWord(PrimaryMovI32ConstWord(coreir.CallArgSlotConstI32Value(slotIndex)),
+                                   registerIndex)
+
+fn PrimaryBodyIrCallOpWordCount(bodyIR: coreir.BodyIR,
+                                 callOp: coreir.CallOp): int32 =
+    var wordCount = PrimaryCallOpRegisterArgCount(callOp)
+    if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
+        let resultSlot = bodyIR.localSlots[callOp.resultSlot]
+        if resultSlot.typeKind == coreir.LocalStrTag ||
+           resultSlot.typeKind == coreir.LocalAggregateTag:
+            wordCount = wordCount + 1
+    wordCount = wordCount + PrimaryCallOpStackPreCallWordCount(callOp)
+    wordCount = wordCount + 1
+    wordCount = wordCount + PrimaryCallOpStackPostCallWordCount(callOp)
+    if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
+        let resultSlot = bodyIR.localSlots[callOp.resultSlot]
+        if resultSlot.typeKind == coreir.LocalI32Tag ||
+           resultSlot.typeKind == coreir.LocalPtrTag:
+            wordCount = wordCount + 1
+    return wordCount
+
+fn PrimaryBodyIrTermWordCount(term: coreir.BodyTerm,
+                               epilogueWordCount: int32): int32 =
+    if term.kind == coreir.BodyTermReturnTag:
+        return epilogueWordCount + 2
+    if term.kind == coreir.BodyTermBrTag:
+        return 1
+    if term.kind == coreir.BodyTermCbrTag:
+        return 3
+    return 0
+
 fn PrimaryBodyIrParamSaveCount(bodyIR: coreir.BodyIR): int32 =
     var paramSaveCount: int32
     for callOrdinal in 0..<bodyIR.callSequence.len:
         let callOp = bodyIR.callSequence[callOrdinal]
         for argIndex in 0..<callOp.argSlots.len:
+            if PrimaryCallArgSlotIsConst(callOp.argSlots[argIndex]):
+                continue
             if callOp.argSlots[argIndex] < 0:
                 let paramSlot = 0 - callOp.argSlots[argIndex] - 1
                 if paramSlot < 0:
@@ -1262,6 +1313,8 @@ fn PrimaryBodyIrIncomingParamOffsetsSupported(bodyIR: coreir.BodyIR,
     for callOrdinal in 0..<bodyIR.callSequence.len:
         let callOp = bodyIR.callSequence[callOrdinal]
         for argIndex in 0..<callOp.argSlots.len:
+            if PrimaryCallArgSlotIsConst(callOp.argSlots[argIndex]):
+                continue
             if callOp.argSlots[argIndex] < 0:
                 let paramSlot = 0 - callOp.argSlots[argIndex] - 1
                 if paramSlot >= 8:
@@ -1461,31 +1514,20 @@ fn PrimaryBodyIrCallCfgReturnInt32WordCount(bodyIR: coreir.BodyIR): int32 =
     if !PrimaryBodyIrIncomingParamOffsetsSupported(bodyIR, frameBytes):
         return 0
     var wordCount = prologueWordCount + paramSaveCount
-    for opIndex in 0..<bodyIR.ops.len:
-        let op = bodyIR.ops[opIndex]
-        let callOp = bodyIR.callSequence[op.operands[0]]
-        wordCount = wordCount + PrimaryCallOpRegisterArgCount(callOp)
-        if callOp.resultSlot >= 0:
-            let resultSlot = bodyIR.localSlots[callOp.resultSlot]
-            if resultSlot.typeKind == coreir.LocalStrTag ||
-               resultSlot.typeKind == coreir.LocalAggregateTag:
-                wordCount = wordCount + 1
-        wordCount = wordCount + PrimaryCallOpStackPreCallWordCount(callOp)
-        wordCount = wordCount + 1
-        wordCount = wordCount + PrimaryCallOpStackPostCallWordCount(callOp)
-        if callOp.resultSlot >= 0:
-            let resultSlot = bodyIR.localSlots[callOp.resultSlot]
-            if resultSlot.typeKind == coreir.LocalI32Tag ||
-               resultSlot.typeKind == coreir.LocalPtrTag:
-                wordCount = wordCount + 1
-    for termIndex in 0..<bodyIR.terms.len:
-        let term = bodyIR.terms[termIndex]
-        if term.kind == coreir.BodyTermReturnTag:
-            wordCount = wordCount + epilogueWordCount + 2
-        elif term.kind == coreir.BodyTermBrTag:
-            wordCount = wordCount + 1
-        elif term.kind == coreir.BodyTermCbrTag:
-            wordCount = wordCount + 3
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        for localOpIndex in 0..<block.opCount:
+            let opIndex = block.opStart + localOpIndex
+            let op = bodyIR.ops[opIndex]
+            if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
+                return 0
+            let callOrdinal = op.operands[0]
+            if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
+                return 0
+            let callOp = bodyIR.callSequence[callOrdinal]
+            wordCount = wordCount + PrimaryBodyIrCallOpWordCount(bodyIR, callOp)
+        let term = bodyIR.terms[block.termIndex]
+        wordCount = wordCount + PrimaryBodyIrTermWordCount(term, epilogueWordCount)
     return wordCount
 
 fn PrimaryBodyIrWordCount(bodyIR: coreir.BodyIR): int32 =
@@ -1762,6 +1804,36 @@ fn PrimaryBodyIrCallSequenceReturnInt32RelocWordOffset(bodyIR: coreir.BodyIR,
                 localWordIndex = localWordIndex + 1
     return -1
 
+fn PrimaryBodyIrCallCfgBlockLocalWordOffset(bodyIR: coreir.BodyIR,
+                                             targetBlockIndex: int32,
+                                             prologueWordCount: int32,
+                                             paramSaveCount: int32,
+                                             epilogueWordCount: int32): int32 =
+    if targetBlockIndex < 0 || targetBlockIndex >= bodyIR.blocks.len:
+        return -1
+    var localWordIndex = prologueWordCount + paramSaveCount
+    for blockIndex in 0..<targetBlockIndex:
+        let block = bodyIR.blocks[blockIndex]
+        if block.opStart < 0 ||
+           block.opCount < 0 ||
+           block.opStart + block.opCount > bodyIR.ops.len ||
+           block.termIndex < 0 ||
+           block.termIndex >= bodyIR.terms.len:
+            return -1
+        for localOpIndex in 0..<block.opCount:
+            let opIndex = block.opStart + localOpIndex
+            let op = bodyIR.ops[opIndex]
+            if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
+                return -1
+            let currentCallOrdinal = op.operands[0]
+            if currentCallOrdinal < 0 || currentCallOrdinal >= bodyIR.callSequence.len:
+                return -1
+            let callOp = bodyIR.callSequence[currentCallOrdinal]
+            localWordIndex = localWordIndex + PrimaryBodyIrCallOpWordCount(bodyIR, callOp)
+        let term = bodyIR.terms[block.termIndex]
+        localWordIndex = localWordIndex + PrimaryBodyIrTermWordCount(term, epilogueWordCount)
+    return localWordIndex
+
 fn PrimaryBodyIrRelocWordOffset(bodyIR: coreir.BodyIR,
                                  wordOffset: int32,
                                  callOrdinal: int32): int32 =
@@ -1777,33 +1849,45 @@ fn PrimaryBodyIrRelocWordOffset(bodyIR: coreir.BodyIR,
         if paramSaveCount > 0:
             frameBytes = PrimaryAlignStackBytes(frameBytes + paramSaveCount * 8, 16)
         let prologueWordCount = PrimaryArm64FramePrologueWordCount(frameBytes)
-        if prologueWordCount <= 0:
+        let epilogueWordCount = PrimaryArm64FrameEpilogueWordCount(frameBytes)
+        if prologueWordCount <= 0 || epilogueWordCount <= 0:
             return -1
         var localWordIndex = prologueWordCount + paramSaveCount
-        for opIndex in 0..<bodyIR.ops.len:
-            let op = bodyIR.ops[opIndex]
-            if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
+        for blockIndex in 0..<bodyIR.blocks.len:
+            let block = bodyIR.blocks[blockIndex]
+            if block.opStart < 0 ||
+               block.opCount < 0 ||
+               block.opStart + block.opCount > bodyIR.ops.len ||
+               block.termIndex < 0 ||
+               block.termIndex >= bodyIR.terms.len:
                 return -1
-            let currentCallOrdinal = op.operands[0]
-            if currentCallOrdinal < 0 || currentCallOrdinal >= bodyIR.callSequence.len:
-                return -1
-            let callOp = bodyIR.callSequence[currentCallOrdinal]
-            localWordIndex = localWordIndex + PrimaryCallOpRegisterArgCount(callOp)
-            if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
-                let resultSlot = bodyIR.localSlots[callOp.resultSlot]
-                if resultSlot.typeKind == coreir.LocalStrTag ||
-                   resultSlot.typeKind == coreir.LocalAggregateTag:
-                    localWordIndex = localWordIndex + 1
-            localWordIndex = localWordIndex + PrimaryCallOpStackPreCallWordCount(callOp)
-            if currentCallOrdinal == callOrdinal:
-                return wordOffset + localWordIndex
-            localWordIndex = localWordIndex + 1
-            localWordIndex = localWordIndex + PrimaryCallOpStackPostCallWordCount(callOp)
-            if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
-                let resultSlot = bodyIR.localSlots[callOp.resultSlot]
-                if resultSlot.typeKind == coreir.LocalI32Tag ||
-                   resultSlot.typeKind == coreir.LocalPtrTag:
-                    localWordIndex = localWordIndex + 1
+            for localOpIndex in 0..<block.opCount:
+                let opIndex = block.opStart + localOpIndex
+                let op = bodyIR.ops[opIndex]
+                if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
+                    return -1
+                let currentCallOrdinal = op.operands[0]
+                if currentCallOrdinal < 0 || currentCallOrdinal >= bodyIR.callSequence.len:
+                    return -1
+                let callOp = bodyIR.callSequence[currentCallOrdinal]
+                localWordIndex = localWordIndex + PrimaryCallOpRegisterArgCount(callOp)
+                if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
+                    let resultSlot = bodyIR.localSlots[callOp.resultSlot]
+                    if resultSlot.typeKind == coreir.LocalStrTag ||
+                       resultSlot.typeKind == coreir.LocalAggregateTag:
+                        localWordIndex = localWordIndex + 1
+                localWordIndex = localWordIndex + PrimaryCallOpStackPreCallWordCount(callOp)
+                if currentCallOrdinal == callOrdinal:
+                    return wordOffset + localWordIndex
+                localWordIndex = localWordIndex + 1
+                localWordIndex = localWordIndex + PrimaryCallOpStackPostCallWordCount(callOp)
+                if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
+                    let resultSlot = bodyIR.localSlots[callOp.resultSlot]
+                    if resultSlot.typeKind == coreir.LocalI32Tag ||
+                       resultSlot.typeKind == coreir.LocalPtrTag:
+                        localWordIndex = localWordIndex + 1
+            let term = bodyIR.terms[block.termIndex]
+            localWordIndex = localWordIndex + PrimaryBodyIrTermWordCount(term, epilogueWordCount)
         return -1
     if PrimaryBodyIrIsResultRequestDispatch(bodyIR):
         if callOrdinal == 0:
@@ -2211,6 +2295,20 @@ fn PrimaryFillReturnStrArg0(words: var int32[],
     PrimarySetInstructionWord(words, wordOffset + 4, -117439222)
     PrimarySetInstructionWord(words, wordOffset + 5, -117438197)
     PrimarySetInstructionWord(words, wordOffset + 6, -698416192)
+
+fn PrimaryFillReturnStrLiteral(words: var int32[],
+                                wordOffset: int32,
+                                literalLen: int32) =
+    PrimarySetInstructionWord(words, wordOffset + 0, PrimaryArm64FrameStpWord(32))
+    PrimarySetInstructionWord(words, wordOffset + 1, -1862269955)
+    PrimarySetInstructionWord(words, wordOffset + 2, -1879048192)
+    PrimarySetInstructionWord(words, wordOffset + 3, -1862270976)
+    PrimarySetInstructionWord(words,
+                              wordOffset + 4,
+                              PrimaryArm64RegisterWord(PrimaryMovI32ConstWord(literalLen), 1))
+    PrimarySetInstructionWord(words, wordOffset + 5, -1811939328)
+    PrimarySetInstructionWord(words, wordOffset + 6, PrimaryArm64FrameLdpWord(32))
+    PrimarySetInstructionWord(words, wordOffset + 7, -698416192)
 
 fn PrimaryFillLetCallNoargStrReturnLenI32(words: var int32[],
                                            wordOffset: int32) =
@@ -2628,6 +2726,19 @@ fn PrimaryArm64BCondGtWord(instructionDelta: int32): int32 =
         return 0
     return word
 
+fn PrimaryArm64BWord(instructionDelta: int32): int32 =
+    if instructionDelta <= 0 || instructionDelta > 67108863:
+        return 0
+    return 335544320 + instructionDelta
+
+fn PrimaryArm64BCondWord(instructionDelta: int32,
+                          conditionCode: int32): int32 =
+    if instructionDelta <= 0 || instructionDelta > 262143:
+        return 0
+    if conditionCode < 0 || conditionCode > 15:
+        return 0
+    return 1409286144 + conditionCode + instructionDelta * 32
+
 fn PrimaryArm64SpSubWord(offsetBytes: int32): int32 =
     return PrimaryArm64OffsetWord(-788528129, offsetBytes, 1, 4095)
 
@@ -2655,6 +2766,443 @@ fn PrimaryFillArm64FrameEpilogue(words: var int32[],
                                   emitIndex,
                                   frameAddWord)
         emitIndex = emitIndex + 1
+
+fn PrimaryFillBodyIrCallOp(words: var int32[],
+                            emitIndex: var int32,
+                            bodyIR: coreir.BodyIR,
+                            callOp: coreir.CallOp,
+                            frameBytes: int32,
+                            paramSaveCount: int32,
+                            paramSaveOffset: int32) =
+    let registerArgCount = PrimaryCallOpRegisterArgCount(callOp)
+    for argIndex in 0..<registerArgCount:
+        let slotIndex = callOp.argSlots[argIndex]
+        if PrimaryCallArgSlotIsConst(slotIndex):
+            let constMovWord = PrimaryCallArgConstMovWord(slotIndex, argIndex)
+            if constMovWord == 0:
+                return
+            PrimarySetInstructionWord(words,
+                                      emitIndex,
+                                      constMovWord)
+            emitIndex = emitIndex + 1
+        elif slotIndex >= 0 && slotIndex < bodyIR.localSlots.len:
+            let slot = bodyIR.localSlots[slotIndex]
+            if slot.typeKind == coreir.LocalI32Tag:
+                let loadBaseWord = PrimaryArm64RegisterWord(-1186987104,
+                                                            argIndex)
+                if loadBaseWord == 0:
+                    return
+                let loadWord = PrimaryArm64OffsetWord(loadBaseWord,
+                                                      slot.stackOffset,
+                                                      4,
+                                                      4095)
+                if loadWord == 0:
+                    return
+                PrimarySetInstructionWord(words,
+                                          emitIndex,
+                                          loadWord)
+            elif slot.typeKind == coreir.LocalPtrTag:
+                let loadBaseWord = PrimaryArm64RegisterWord(-113245280,
+                                                            argIndex)
+                if loadBaseWord == 0:
+                    return
+                let loadWord = PrimaryArm64OffsetWord(loadBaseWord,
+                                                      slot.stackOffset,
+                                                      8,
+                                                      4095)
+                if loadWord == 0:
+                    return
+                PrimarySetInstructionWord(words,
+                                          emitIndex,
+                                          loadWord)
+            else:
+                let addrBaseWord = PrimaryArm64RegisterWord(-1862270048,
+                                                            argIndex)
+                if addrBaseWord == 0:
+                    return
+                let addrWord = PrimaryArm64OffsetWord(addrBaseWord,
+                                                      slot.stackOffset,
+                                                      1,
+                                                      4095)
+                if addrWord == 0:
+                    return
+                PrimarySetInstructionWord(words,
+                                          emitIndex,
+                                          addrWord)
+            emitIndex = emitIndex + 1
+        elif slotIndex < 0:
+            let paramSlot = 0 - slotIndex - 1
+            if paramSlot < 0:
+                return
+            var paramOffset = PrimaryIncomingParamStackOffset(frameBytes,
+                                                              paramSlot)
+            if paramSlot < 8:
+                if paramSlot >= paramSaveCount:
+                    return
+                paramOffset = paramSaveOffset + paramSlot * 8
+            if paramOffset < 0:
+                return
+            let loadParamBaseWord = PrimaryArm64RegisterWord(-113245280,
+                                                             argIndex)
+            if loadParamBaseWord == 0:
+                return
+            let loadParamWord = PrimaryArm64OffsetWord(loadParamBaseWord,
+                                                       paramOffset,
+                                                       8,
+                                                       4095)
+            if loadParamWord == 0:
+                return
+            PrimarySetInstructionWord(words,
+                                      emitIndex,
+                                      loadParamWord)
+            emitIndex = emitIndex + 1
+    if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
+        let resultSlot = bodyIR.localSlots[callOp.resultSlot]
+        if resultSlot.typeKind == coreir.LocalStrTag ||
+           resultSlot.typeKind == coreir.LocalAggregateTag:
+            let resultSretWord = PrimaryArm64OffsetWord(-1862270040,
+                                                        resultSlot.stackOffset,
+                                                        1,
+                                                        4095)
+            if resultSretWord == 0:
+                return
+            PrimarySetInstructionWord(words,
+                                      emitIndex,
+                                      resultSretWord)
+            emitIndex = emitIndex + 1
+    let stackArgCount = PrimaryCallOpStackArgCount(callOp)
+    let stackArgBytes = PrimaryCallOpStackArgBytes(callOp)
+    if stackArgCount > 0:
+        let subSpWord = PrimaryArm64SpSubWord(stackArgBytes)
+        if subSpWord == 0:
+            return
+        PrimarySetInstructionWord(words,
+                                  emitIndex,
+                                  subSpWord)
+        emitIndex = emitIndex + 1
+        for stackArgIndex in 0..<stackArgCount:
+            let argIndex = stackArgIndex + 8
+            if argIndex >= callOp.argSlots.len:
+                return
+            let slotIndex = callOp.argSlots[argIndex]
+            if PrimaryCallArgSlotIsConst(slotIndex):
+                let constMovWord = PrimaryCallArgConstMovWord(slotIndex, 16)
+                if constMovWord == 0:
+                    return
+                PrimarySetInstructionWord(words,
+                                          emitIndex,
+                                          constMovWord)
+                emitIndex = emitIndex + 1
+            elif slotIndex >= 0 && slotIndex < bodyIR.localSlots.len:
+                let slot = bodyIR.localSlots[slotIndex]
+                if slot.typeKind == coreir.LocalI32Tag:
+                    let loadStackArgWord = PrimaryArm64OffsetWord(-1186987088,
+                                                                  slot.stackOffset,
+                                                                  4,
+                                                                  4095)
+                    if loadStackArgWord == 0:
+                        return
+                    PrimarySetInstructionWord(words,
+                                              emitIndex,
+                                              loadStackArgWord)
+                elif slot.typeKind == coreir.LocalPtrTag:
+                    let loadStackArgWord = PrimaryArm64OffsetWord(-113245264,
+                                                                  slot.stackOffset,
+                                                                  8,
+                                                                  4095)
+                    if loadStackArgWord == 0:
+                        return
+                    PrimarySetInstructionWord(words,
+                                              emitIndex,
+                                              loadStackArgWord)
+                else:
+                    let addrStackArgWord = PrimaryArm64OffsetWord(-1862270032,
+                                                                  slot.stackOffset,
+                                                                  1,
+                                                                  4095)
+                    if addrStackArgWord == 0:
+                        return
+                    PrimarySetInstructionWord(words,
+                                              emitIndex,
+                                              addrStackArgWord)
+                emitIndex = emitIndex + 1
+            elif slotIndex < 0:
+                let paramSlot = 0 - slotIndex - 1
+                if paramSlot < 0:
+                    return
+                var paramOffset = PrimaryIncomingParamStackOffset(frameBytes,
+                                                                  paramSlot)
+                if paramSlot < 8:
+                    if paramSlot >= paramSaveCount:
+                        return
+                    paramOffset = paramSaveOffset + paramSlot * 8
+                if paramOffset < 0:
+                    return
+                let loadStackParamWord = PrimaryArm64OffsetWord(-113245264,
+                                                                paramOffset,
+                                                                8,
+                                                                4095)
+                if loadStackParamWord == 0:
+                    return
+                PrimarySetInstructionWord(words,
+                                          emitIndex,
+                                          loadStackParamWord)
+                emitIndex = emitIndex + 1
+            else:
+                return
+            let stackStoreWord = PrimaryArm64OffsetWord(-117439504,
+                                                        stackArgIndex * 8,
+                                                        8,
+                                                        4095)
+            if stackStoreWord == 0:
+                return
+            PrimarySetInstructionWord(words,
+                                      emitIndex,
+                                      stackStoreWord)
+            emitIndex = emitIndex + 1
+    PrimarySetInstructionWord(words, emitIndex, -1811939328)
+    emitIndex = emitIndex + 1
+    if stackArgCount > 0:
+        let addSpWord = PrimaryArm64SpAddWord(stackArgBytes)
+        if addSpWord == 0:
+            return
+        PrimarySetInstructionWord(words,
+                                  emitIndex,
+                                  addSpWord)
+        emitIndex = emitIndex + 1
+    if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
+        let resultSlot = bodyIR.localSlots[callOp.resultSlot]
+        if resultSlot.typeKind == coreir.LocalI32Tag:
+            let storeWord = PrimaryArm64OffsetWord(-1191181408,
+                                                   resultSlot.stackOffset,
+                                                   4,
+                                                   4095)
+            if storeWord == 0:
+                return
+            PrimarySetInstructionWord(words,
+                                      emitIndex,
+                                      storeWord)
+            emitIndex = emitIndex + 1
+        elif resultSlot.typeKind == coreir.LocalPtrTag:
+            let storeWord = PrimaryArm64OffsetWord(-117439584,
+                                                   resultSlot.stackOffset,
+                                                   8,
+                                                   4095)
+            if storeWord == 0:
+                return
+            PrimarySetInstructionWord(words,
+                                      emitIndex,
+                                      storeWord)
+            emitIndex = emitIndex + 1
+
+fn PrimaryFillCallCfgReturnInt32Term(words: var int32[],
+                                      emitIndex: var int32,
+                                      bodyIR: coreir.BodyIR,
+                                      term: coreir.BodyTerm,
+                                      frameBytes: int32) =
+    var returnsConst = false
+    var constValue: int32
+    if term.operands.len >= 2 &&
+       term.operands[0] == PrimaryStatementReturnModeI32Const():
+        returnsConst = true
+        constValue = term.operands[1]
+    if returnsConst:
+        PrimarySetInstructionWord(words,
+                                  emitIndex,
+                                  PrimaryMovI32ConstWord(constValue))
+        emitIndex = emitIndex + 1
+    else:
+        let returnSlotIndex = term.resultSlot
+        if returnSlotIndex < 0 || returnSlotIndex >= bodyIR.localSlots.len:
+            return
+        let returnSlot = bodyIR.localSlots[returnSlotIndex]
+        if returnSlot.typeKind != coreir.LocalI32Tag:
+            return
+        let returnLoadWord = PrimaryArm64OffsetWord(-1186987104,
+                                                    returnSlot.stackOffset,
+                                                    4,
+                                                    4095)
+        if returnLoadWord == 0:
+            return
+        PrimarySetInstructionWord(words,
+                                  emitIndex,
+                                  returnLoadWord)
+        emitIndex = emitIndex + 1
+    PrimaryFillArm64FrameEpilogue(words, emitIndex, frameBytes)
+    PrimarySetInstructionWord(words, emitIndex, -698416192)
+    emitIndex = emitIndex + 1
+
+fn PrimaryFillCallCfgReturnInt32(words: var int32[],
+                                  wordOffset: int32,
+                                  bodyIR: coreir.BodyIR) =
+    if !PrimaryBodyIrIsCallCfgReturnInt32(bodyIR):
+        return
+    var frameBytes = PrimaryBodyIrStackByteCount(bodyIR)
+    if frameBytes < 16:
+        frameBytes = 16
+    let paramSaveCount = PrimaryBodyIrParamSaveCount(bodyIR)
+    if paramSaveCount < 0:
+        return
+    var paramSaveOffset = frameBytes
+    if paramSaveCount > 0:
+        frameBytes = PrimaryAlignStackBytes(frameBytes + paramSaveCount * 8, 16)
+    if !PrimaryBodyIrIncomingParamOffsetsSupported(bodyIR, frameBytes):
+        return
+    let prologueWordCount = PrimaryArm64FramePrologueWordCount(frameBytes)
+    let epilogueWordCount = PrimaryArm64FrameEpilogueWordCount(frameBytes)
+    if prologueWordCount <= 0 || epilogueWordCount <= 0:
+        return
+    var emitIndex = wordOffset
+    if frameBytes <= 512:
+        let frameStpWord = PrimaryArm64FrameStpWord(frameBytes)
+        if frameStpWord == 0:
+            return
+        PrimarySetInstructionWord(words,
+                                  emitIndex,
+                                  frameStpWord)
+        emitIndex = emitIndex + 1
+    else:
+        let frameSubWord = PrimaryArm64SpSubWord(frameBytes)
+        if frameSubWord == 0:
+            return
+        PrimarySetInstructionWord(words,
+                                  emitIndex,
+                                  frameSubWord)
+        emitIndex = emitIndex + 1
+        PrimarySetInstructionWord(words, emitIndex, -1459586051)
+        emitIndex = emitIndex + 1
+    PrimarySetInstructionWord(words, emitIndex, -1862269955)
+    emitIndex = emitIndex + 1
+    for paramIndex in 0..<paramSaveCount:
+        let saveOffset = paramSaveOffset + paramIndex * 8
+        let saveBaseWord = PrimaryArm64RegisterWord(-117439584,
+                                                    paramIndex)
+        if saveBaseWord == 0:
+            return
+        let saveWord = PrimaryArm64OffsetWord(saveBaseWord,
+                                              saveOffset,
+                                              8,
+                                              4095)
+        if saveWord == 0:
+            return
+        PrimarySetInstructionWord(words,
+                                  emitIndex,
+                                  saveWord)
+        emitIndex = emitIndex + 1
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let expectedLocalOffset = PrimaryBodyIrCallCfgBlockLocalWordOffset(bodyIR,
+                                                                           blockIndex,
+                                                                           prologueWordCount,
+                                                                           paramSaveCount,
+                                                                           epilogueWordCount)
+        if expectedLocalOffset < 0 || emitIndex != wordOffset + expectedLocalOffset:
+            return
+        let block = bodyIR.blocks[blockIndex]
+        for localOpIndex in 0..<block.opCount:
+            let opIndex = block.opStart + localOpIndex
+            if opIndex < 0 || opIndex >= bodyIR.ops.len:
+                return
+            let op = bodyIR.ops[opIndex]
+            if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
+                return
+            let callOrdinal = op.operands[0]
+            if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
+                return
+            let callOp = bodyIR.callSequence[callOrdinal]
+            let beforeCallEmitIndex = emitIndex
+            PrimaryFillBodyIrCallOp(words,
+                                    emitIndex,
+                                    bodyIR,
+                                    callOp,
+                                    frameBytes,
+                                    paramSaveCount,
+                                    paramSaveOffset)
+            let expectedAfterCall = beforeCallEmitIndex + PrimaryBodyIrCallOpWordCount(bodyIR, callOp)
+            if emitIndex != expectedAfterCall:
+                return
+        if block.termIndex < 0 || block.termIndex >= bodyIR.terms.len:
+            return
+        let term = bodyIR.terms[block.termIndex]
+        if term.kind == coreir.BodyTermReturnTag:
+            let beforeReturnEmitIndex = emitIndex
+            PrimaryFillCallCfgReturnInt32Term(words,
+                                              emitIndex,
+                                              bodyIR,
+                                              term,
+                                              frameBytes)
+            if emitIndex != beforeReturnEmitIndex + epilogueWordCount + 2:
+                return
+        elif term.kind == coreir.BodyTermBrTag:
+            let targetLocalOffset = PrimaryBodyIrCallCfgBlockLocalWordOffset(bodyIR,
+                                                                             term.trueBlock,
+                                                                             prologueWordCount,
+                                                                             paramSaveCount,
+                                                                             epilogueWordCount)
+            if targetLocalOffset < 0:
+                return
+            let branchDelta = wordOffset + targetLocalOffset - emitIndex
+            let branchWord = PrimaryArm64BWord(branchDelta)
+            if branchWord == 0:
+                return
+            PrimarySetInstructionWord(words, emitIndex, branchWord)
+            emitIndex = emitIndex + 1
+        elif term.kind == coreir.BodyTermCbrTag:
+            var guardSlotIndex = term.lhsSlot
+            if guardSlotIndex < 0:
+                guardSlotIndex = term.resultSlot
+            if guardSlotIndex < 0 || guardSlotIndex >= bodyIR.localSlots.len:
+                return
+            let guardSlot = bodyIR.localSlots[guardSlotIndex]
+            if guardSlot.typeKind != coreir.LocalI32Tag:
+                return
+            let guardLoadBaseWord = PrimaryArm64RegisterWord(-1186987104, 9)
+            if guardLoadBaseWord == 0:
+                return
+            let guardLoadWord = PrimaryArm64OffsetWord(guardLoadBaseWord,
+                                                       guardSlot.stackOffset,
+                                                       4,
+                                                       4095)
+            if guardLoadWord == 0:
+                return
+            PrimarySetInstructionWord(words, emitIndex, guardLoadWord)
+            emitIndex = emitIndex + 1
+            let cmpWord = PrimaryArm64CmpWRegZeroWord(9)
+            if cmpWord == 0:
+                return
+            PrimarySetInstructionWord(words, emitIndex, cmpWord)
+            emitIndex = emitIndex + 1
+            let nextBlock = blockIndex + 1
+            var branchTargetBlock: int32 = -1
+            var conditionCode: int32 = -1
+            if term.trueBlock == nextBlock:
+                branchTargetBlock = term.falseBlock
+                if term.conditionKind == coreir.BodyCondLocalNonZeroTag:
+                    conditionCode = 0
+                elif term.conditionKind == coreir.BodyCondLocalZeroTag:
+                    conditionCode = 1
+            elif term.falseBlock == nextBlock:
+                branchTargetBlock = term.trueBlock
+                if term.conditionKind == coreir.BodyCondLocalNonZeroTag:
+                    conditionCode = 1
+                elif term.conditionKind == coreir.BodyCondLocalZeroTag:
+                    conditionCode = 0
+            if branchTargetBlock < 0 || conditionCode < 0:
+                return
+            let targetLocalOffset = PrimaryBodyIrCallCfgBlockLocalWordOffset(bodyIR,
+                                                                             branchTargetBlock,
+                                                                             prologueWordCount,
+                                                                             paramSaveCount,
+                                                                             epilogueWordCount)
+            if targetLocalOffset < 0:
+                return
+            let branchDelta = wordOffset + targetLocalOffset - emitIndex
+            let branchWord = PrimaryArm64BCondWord(branchDelta, conditionCode)
+            if branchWord == 0:
+                return
+            PrimarySetInstructionWord(words, emitIndex, branchWord)
+            emitIndex = emitIndex + 1
+        else:
+            return
 
 fn PrimaryFillCallSequenceReturnBodyIr(words: var int32[],
                                         wordOffset: int32,
@@ -2741,7 +3289,15 @@ fn PrimaryFillCallSequenceReturnBodyIr(words: var int32[],
         let registerArgCount = PrimaryCallOpRegisterArgCount(callOp)
         for argIndex in 0..<registerArgCount:
             let slotIndex = callOp.argSlots[argIndex]
-            if slotIndex >= 0 && slotIndex < bodyIR.localSlots.len:
+            if PrimaryCallArgSlotIsConst(slotIndex):
+                let constMovWord = PrimaryCallArgConstMovWord(slotIndex, argIndex)
+                if constMovWord == 0:
+                    return
+                PrimarySetInstructionWord(words,
+                                          emitIndex,
+                                          constMovWord)
+                emitIndex = emitIndex + 1
+            elif slotIndex >= 0 && slotIndex < bodyIR.localSlots.len:
                 let slot = bodyIR.localSlots[slotIndex]
                 if slot.typeKind == coreir.LocalI32Tag:
                     let loadBaseWord = PrimaryArm64RegisterWord(-1186987104,
@@ -2855,7 +3411,15 @@ fn PrimaryFillCallSequenceReturnBodyIr(words: var int32[],
                 if argIndex >= callOp.argSlots.len:
                     return
                 let slotIndex = callOp.argSlots[argIndex]
-                if slotIndex >= 0 && slotIndex < bodyIR.localSlots.len:
+                if PrimaryCallArgSlotIsConst(slotIndex):
+                    let constMovWord = PrimaryCallArgConstMovWord(slotIndex, 16)
+                    if constMovWord == 0:
+                        return
+                    PrimarySetInstructionWord(words,
+                                              emitIndex,
+                                              constMovWord)
+                    emitIndex = emitIndex + 1
+                elif slotIndex >= 0 && slotIndex < bodyIR.localSlots.len:
                     let slot = bodyIR.localSlots[slotIndex]
                     if slot.typeKind == coreir.LocalI32Tag:
                         let loadStackArgWord = PrimaryArm64OffsetWord(-1186987088,
@@ -3123,12 +3687,6 @@ fn PrimaryFillCallSequenceGuardReturnBodyIr(words: var int32[],
                                   wordOffset + i + branchExtraWordCount,
                                   tempWords[i])
 
-fn PrimaryFillCallCfgReturnInt32Placeholder(words: var int32[],
-                                             wordOffset: int32,
-                                             wordCount: int32) =
-    for i in 0..<wordCount:
-        PrimarySetInstructionWord(words, wordOffset + i, -698416192)
-
 fn PrimaryFillBackendDriverCommandDispatch(words: var int32[],
                                              wordOffset: int32) =
     PrimarySetInstructionWord(words, wordOffset + 0, -1447134211)
@@ -3304,190 +3862,6 @@ fn PrimaryBuildFunctionCodegenTaskPlan(functionBodyKinds: str[],
             task.statementCallCount = functionStatementCallCounts[i]
         add(plan.tasks, task)
     return plan
-
-fn PrimaryExecuteFunctionCodegenTask(words: var int32[],
-                                      task: PrimaryFunctionCodegenTask,
-                                      bodyIR: coreir.BodyIR) =
-    if task.wordCount <= 0:
-        return
-    let wordOffset = task.wordOffset
-    let bodyKind = task.bodyKind
-    let statementMode = task.statementMode
-    let statementI32Value = task.statementI32Value
-    let bodyIrStatementMode = PrimaryBodyIrStatementReturnMode(bodyIR)
-    if PrimaryBodyIrIsCallCfgReturnInt32(bodyIR):
-        PrimaryFillCallCfgReturnInt32Placeholder(words,
-                                                 wordOffset,
-                                                 task.wordCount)
-    elif PrimaryBodyIrIsResultRequestDispatch(bodyIR):
-        PrimaryFillResultRequestDispatch(words, wordOffset)
-    elif PrimaryBodyIrIsCallSequenceGuardReturnInt32(bodyIR):
-        PrimaryFillCallSequenceGuardReturnBodyIr(words,
-                                                 wordOffset,
-                                                 bodyIR)
-    elif PrimaryBodyIrIsCallSequenceReturnStr(bodyIR) ||
-         PrimaryBodyIrIsCallSequenceReturnAggregate(bodyIR):
-        PrimaryFillCallSequenceReturnBodyIr(words,
-                                            wordOffset,
-                                            bodyIR)
-    elif PrimaryBodyIrIsCallSequenceReturnInt32(bodyIR) ||
-         PrimaryBodyIrIsCallSequenceReturnPtr(bodyIR) ||
-         PrimaryBodyIrIsCallSequenceReturnI32Const(bodyIR):
-        PrimaryFillCallSequenceReturnBodyIr(words,
-                                            wordOffset,
-                                            bodyIR)
-    elif bodyIrStatementMode == PrimaryStatementReturnModeI32Const():
-        PrimaryFillLetCallNoargReturnI32Const(words,
-                                              wordOffset,
-                                              PrimaryBodyIrStatementI32Value(bodyIR))
-    elif bodyIrStatementMode == PrimaryStatementReturnModeCallResultI32():
-        PrimaryFillLetCallNoargReturnResultI32(words, wordOffset)
-    elif bodyIrStatementMode == PrimaryStatementReturnModeI32GuardResultLeZero():
-        PrimaryFillLetCallNoargGuardResultI32(words, wordOffset)
-    elif bodyIrStatementMode == PrimaryStatementReturnModeStrLen():
-        PrimaryFillLetCallNoargStrReturnLenI32(words, wordOffset)
-    elif bodyIrStatementMode == PrimaryStatementReturnModeStrThenCallReturnI32Const0():
-        PrimaryFillLetCallNoargStrThenCallArg0ReturnI32Const0(words, wordOffset)
-    elif bodyIrStatementMode == PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0():
-        PrimaryFillCstringLiteralCallsReturnI32Const0(words,
-                                                      wordOffset,
-                                                      bodyIR.callSequence.len)
-    elif PrimaryBodyIrIsI32TwoCallGuardFirstReturn(bodyIR):
-        PrimaryFillI32TwoCallGuardFirstReturn(words, wordOffset)
-    elif PrimaryBodyIrIsI32GuardThenCommandReturn(bodyIR):
-        PrimaryFillI32GuardThenCommandReturn(words, wordOffset)
-    elif PrimaryBodyIrIsStrCallConstThenCallArg0ReturnI32(bodyIR):
-        PrimaryFillStrCallConstThenCallArg0ReturnI32(words, wordOffset)
-    elif PrimaryBodyIrIsStrI32GuardCallArg0ThenDispatchReturnI32(bodyIR):
-        PrimaryFillStrI32GuardCallArg0ThenDispatchReturnI32(words, wordOffset)
-    elif PrimaryBodyIrIsI32LetCallThenReturnCallArg0(bodyIR):
-        PrimaryFillI32LetCallThenReturnCallArg0(words, wordOffset)
-    elif PrimaryBodyIrIsArg0I32LetCallThenReturnCallArg0Arg1(bodyIR):
-        PrimaryFillArg0I32LetCallThenReturnCallArg0Arg1(words, wordOffset)
-    elif PrimaryBodyIrIsArg0AggregateCallThenReturnCallArg0Arg1(bodyIR):
-        PrimaryFillArg0AggregateCallThenReturnCallArg0Arg1(words, wordOffset)
-    elif PrimaryBodyIrIsArg0SeqCallThenReturnCallArg0Arg1(bodyIR):
-        PrimaryFillArg0SeqCallThenReturnCallArg0Arg1(words, wordOffset)
-    elif PrimaryBodyIrIsStrLetCallThenCallArg0ReturnI32(bodyIR):
-        PrimaryFillStrLetCallThenCallArg0ReturnI32(words, wordOffset)
-    elif PrimaryBodyIrIsI32GuardHelpThenCommandReturn(bodyIR):
-        PrimaryFillI32GuardHelpThenCommandReturn(words, wordOffset)
-    elif PrimaryBodyIrIsPtrNilGuardDerefReturn(bodyIR):
-        PrimaryFillPtrNilGuardDerefReturn(words, wordOffset)
-    elif bodyKind == texpr.BodyKindStatementSequence:
-        if statementMode == PrimaryStatementReturnModeI32Const():
-            PrimaryFillLetCallNoargReturnI32Const(words, wordOffset, statementI32Value)
-        elif statementMode == PrimaryStatementReturnModeCallResultI32():
-            PrimaryFillLetCallNoargReturnResultI32(words, wordOffset)
-        elif statementMode == PrimaryStatementReturnModeI32GuardResultLeZero():
-            PrimaryFillLetCallNoargGuardResultI32(words, wordOffset)
-        elif statementMode == PrimaryStatementReturnModeStrLen():
-            PrimaryFillLetCallNoargStrReturnLenI32(words, wordOffset)
-        elif statementMode == PrimaryStatementReturnModeStrThenCallReturnI32Const0():
-            PrimaryFillLetCallNoargStrThenCallArg0ReturnI32Const0(words, wordOffset)
-        elif statementMode == PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0():
-            PrimaryFillCstringLiteralCallsReturnI32Const0(words,
-                                                          wordOffset,
-                                                          task.statementCallCount)
-    elif bodyKind == texpr.BodyKindEntryBridge:
-        PrimaryFillEntryBridge(words, wordOffset)
-    elif bodyKind == texpr.BodyKindReturnZeroI32:
-        PrimaryFillReturnI32Const(words, wordOffset, 0)
-    elif chengpath.TextStartsWith(bodyKind, texpr.BodyKindReturnI32ConstPrefix):
-        PrimaryFillReturnI32Const(words,
-                                  wordOffset,
-                                  PrimaryStatementSequenceI32Value(bodyKind))
-    elif bodyKind == texpr.BodyKindReturnI32Arg0:
-        PrimarySetInstructionWord(words, wordOffset, -698416192)
-    elif bodyKind == texpr.BodyKindReturnI32Arg1:
-        PrimarySetInstructionWord(words, wordOffset, 704709600)
-        PrimarySetInstructionWord(words, wordOffset + 1, -698416192)
-    elif bodyKind == texpr.BodyKindReturnI32Arg2:
-        PrimarySetInstructionWord(words, wordOffset, 704775136)
-        PrimarySetInstructionWord(words, wordOffset + 1, -698416192)
-    elif bodyKind == texpr.BodyKindReturnI32Arg3:
-        PrimarySetInstructionWord(words, wordOffset, 704840672)
-        PrimarySetInstructionWord(words, wordOffset + 1, -698416192)
-    elif bodyKind == texpr.BodyKindReturnCallArg0TruePassthrough:
-        PrimarySetInstructionWord(words, wordOffset, 1384120353)
-        PrimarySetInstructionWord(words, wordOffset + 1, 335544320)
-    elif bodyKind == texpr.BodyKindReturnCallArg0Arg1TruePassthrough:
-        PrimarySetInstructionWord(words, wordOffset, 1384120354)
-        PrimarySetInstructionWord(words, wordOffset + 1, 335544320)
-    elif texpr.TypedExprIsReturnCallBodyKind(bodyKind):
-        PrimarySetInstructionWord(words, wordOffset, 335544320)
-    elif PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
-        PrimaryFillLetCallNoargReturnI32Const(words,
-                                              wordOffset,
-                                              PrimaryStatementSequenceI32Value(bodyKind))
-    elif texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
-        PrimaryFillLetCallNoargReturnResultI32(words, wordOffset)
-    elif bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
-        PrimaryFillLetCallNoargGuardResultI32(words, wordOffset)
-    elif texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
-        PrimaryFillLetCallNoargStrReturnLenI32(words, wordOffset)
-    elif texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
-        PrimaryFillLetCallNoargStrThenCallArg0ReturnI32Const0(words, wordOffset)
-    elif bodyKind == texpr.BodyKindReturnStrArg0:
-        PrimaryFillReturnStrArg0(words, wordOffset)
-    elif bodyKind == texpr.BodyKindReturnStrEmpty:
-        PrimaryFillReturnStrEmpty(words, wordOffset)
-    elif bodyKind == texpr.BodyKindCstringToStrCopy:
-        PrimaryFillCstringToStrCopy(words, wordOffset)
-    elif bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
-        PrimarySetInstructionWord(words, wordOffset, 1895825439)
-        PrimarySetInstructionWord(words, wordOffset + 1, 1409286252)
-        PrimaryFillReturnI32Const(words, wordOffset + 2, 0)
-        PrimaryFillReturnI32Const(words, wordOffset + 4, 7)
-    elif bodyKind == texpr.BodyKindReturnF64MulArgs:
-        PrimarySetInstructionWord(words, wordOffset, 509675520)
-        PrimarySetInstructionWord(words, wordOffset + 1, -698416192)
-    elif bodyKind == texpr.BodyKindReturnI32AddArgs:
-        PrimarySetInstructionWord(words, wordOffset, 184614912)
-        PrimarySetInstructionWord(words, wordOffset + 1, -698416192)
-    elif bodyKind == texpr.BodyKindReturnI32SubArgs:
-        PrimarySetInstructionWord(words, wordOffset, 1258356736)
-        PrimarySetInstructionWord(words, wordOffset + 1, -698416192)
-    elif bodyKind == texpr.BodyKindReturnI32MulArgs:
-        PrimarySetInstructionWord(words, wordOffset, 453082112)
-        PrimarySetInstructionWord(words, wordOffset + 1, -698416192)
-    elif bodyKind == texpr.BodyKindReturnI32AsrArgs:
-        PrimarySetInstructionWord(words, wordOffset, 448866304)
-        PrimarySetInstructionWord(words, wordOffset + 1, -698416192)
-    elif bodyKind == texpr.BodyKindReturnI32MaddArgs:
-        PrimarySetInstructionWord(words, wordOffset, 453052416)
-        PrimarySetInstructionWord(words, wordOffset + 1, -698416192)
-    elif bodyKind == texpr.BodyKindReturnU64Arg0AndConst4NotZero:
-        PrimarySetInstructionWord(words, wordOffset, -226619361)
-        PrimarySetInstructionWord(words, wordOffset + 1, 446629856)
-        PrimarySetInstructionWord(words, wordOffset + 2, -698416192)
-    elif bodyKind == texpr.BodyKindReturnU64Arg0OrConst4:
-        PrimarySetInstructionWord(words, wordOffset, -1300365312)
-        PrimarySetInstructionWord(words, wordOffset + 1, -698416192)
-    elif bodyKind == texpr.BodyKindStrLenFastI32:
-        PrimaryFillStrLenFast(words, wordOffset)
-    elif bodyKind == texpr.BodyKindMainF64MulCheckExit:
-        PrimaryFillMainF64MulCheckExit(words, wordOffset)
-    elif bodyKind == texpr.BodyKindRuntimeSetCmdLine:
-        PrimaryFillRuntimeSetCmdLine(words, wordOffset)
-    elif bodyKind == texpr.BodyKindBackendDriverRootFromCmdline:
-        PrimaryFillBackendDriverRootFromCmdline(words, wordOffset)
-    elif bodyKind == texpr.BodyKindBackendDriverCommandDispatch:
-        PrimaryFillBackendDriverCommandDispatch(words, wordOffset)
-    elif bodyKind == texpr.BodyKindResultRequestDispatch:
-        PrimaryFillResultRequestDispatch(words, wordOffset)
-
-fn PrimaryExecuteFunctionCodegenTaskPlanSerial(words: var int32[],
-                                                taskPlan: PrimaryFunctionCodegenTaskPlan,
-                                                functionBodyIRs: coreir.BodyIR[]) =
-    for taskIndex in 0..<taskPlan.tasks.len:
-        if taskIndex % 64 == 0:
-            os.ProcessResourceGuardCheck()
-        let task = taskPlan.tasks[taskIndex]
-        var bodyIR = coreir.BodyIR()
-        if task.functionIndex >= 0 && task.functionIndex < functionBodyIRs.len:
-            bodyIR = functionBodyIRs[task.functionIndex]
-        PrimaryExecuteFunctionCodegenTask(words, task, bodyIR)
 
 fn PrimaryObjectMissingReasons(linkPlan: slplan.SystemLinkPlanStub,
                                  lowering: lower.LoweringPlanStub,
@@ -4072,6 +4446,18 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                 if !PrimaryStringSeqHas(plan.dataLabels, literalLabel):
                     add(plan.dataLabels, literalLabel)
                     add(plan.dataPayloadTexts, Fmt"cstring:{literalContent}")
+        if bodyKind == texpr.BodyKindReturnStrLiteral:
+            if Len(irFunction.returnStringLiteral) > 65535:
+                bodySemanticsMissing = true
+                if Len(firstMissingFunction) <= 0:
+                    firstMissingFunction = lowering.functionNames[i]
+                    firstMissingBodyKind = "return_str_literal_too_large"
+                    firstMissingTypedIrKind = ""
+                    firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+            let literalLabel = PrimaryReturnStrLiteralDataLabel(allSymbolNames[i])
+            if !PrimaryStringSeqHas(plan.dataLabels, literalLabel):
+                add(plan.dataLabels, literalLabel)
+                add(plan.dataPayloadTexts, Fmt"cstring:{irFunction.returnStringLiteral}")
         if PrimaryBodyRequiresCallSequence(bodyKind, planStatementMode) || bodyIrRequiresCalls:
             var relocCallCount = PrimaryStatementSequenceRequiredCallCount(planStatementMode)
             if bodyIrRequiresCalls:
@@ -4128,6 +4514,11 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
             add(relocSourceItemIds, itemId)
             add(relocWordOffsets, wordOffset + 11)
             add(relocTargetSymbols, PrimaryTargetSymbolName(linkPlan.targetTriple, "driver_c_new_string_copy_n"))
+        elif bodyKind == texpr.BodyKindReturnStrLiteral:
+            add(relocSourceItemIds, itemId)
+            add(relocWordOffsets, wordOffset + 5)
+            add(relocTargetSymbols, PrimaryTargetSymbolName(linkPlan.targetTriple,
+                                                            "driver_c_str_from_utf8_copy_bridge"))
         add(functionBodyIRs, irFunction.bodyIR)
         totalWordCount = totalWordCount + wordCount
     if linkPlan.emitKind == creq.EmitExe &&
@@ -4177,9 +4568,188 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                                                               functionStatementCallCounts,
                                                               functionWordOffsets,
                                                               functionWordCounts)
-    PrimaryExecuteFunctionCodegenTaskPlanSerial(instructionWords,
-                                                functionTaskPlan,
-                                                functionBodyIRs)
+    for taskIndex in 0..<functionTaskPlan.tasks.len:
+        if taskIndex % 64 == 0:
+            os.ProcessResourceGuardCheck()
+        let task = functionTaskPlan.tasks[taskIndex]
+        if task.wordCount <= 0:
+            continue
+        let wordOffset = task.wordOffset
+        let bodyKind = task.bodyKind
+        let statementMode = task.statementMode
+        let statementI32Value = task.statementI32Value
+        var bodyIR = coreir.BodyIR()
+        if task.functionIndex >= 0 && task.functionIndex < functionBodyIRs.len:
+            bodyIR = functionBodyIRs[task.functionIndex]
+        let bodyIrStatementMode = PrimaryBodyIrStatementReturnMode(bodyIR)
+        if PrimaryBodyIrIsCallCfgReturnInt32(bodyIR):
+            PrimaryFillCallCfgReturnInt32(instructionWords,
+                                          wordOffset,
+                                          bodyIR)
+        elif PrimaryBodyIrIsResultRequestDispatch(bodyIR):
+            PrimaryFillResultRequestDispatch(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsCallSequenceGuardReturnInt32(bodyIR):
+            PrimaryFillCallSequenceGuardReturnBodyIr(instructionWords,
+                                                     wordOffset,
+                                                     bodyIR)
+        elif PrimaryBodyIrIsCallSequenceReturnStr(bodyIR) ||
+             PrimaryBodyIrIsCallSequenceReturnAggregate(bodyIR):
+            PrimaryFillCallSequenceReturnBodyIr(instructionWords,
+                                                wordOffset,
+                                                bodyIR)
+        elif PrimaryBodyIrIsCallSequenceReturnInt32(bodyIR) ||
+             PrimaryBodyIrIsCallSequenceReturnPtr(bodyIR) ||
+             PrimaryBodyIrIsCallSequenceReturnI32Const(bodyIR):
+            PrimaryFillCallSequenceReturnBodyIr(instructionWords,
+                                                wordOffset,
+                                                bodyIR)
+        elif bodyIrStatementMode == PrimaryStatementReturnModeI32Const():
+            PrimaryFillLetCallNoargReturnI32Const(instructionWords,
+                                                  wordOffset,
+                                                  PrimaryBodyIrStatementI32Value(bodyIR))
+        elif bodyIrStatementMode == PrimaryStatementReturnModeCallResultI32():
+            PrimaryFillLetCallNoargReturnResultI32(instructionWords, wordOffset)
+        elif bodyIrStatementMode == PrimaryStatementReturnModeI32GuardResultLeZero():
+            PrimaryFillLetCallNoargGuardResultI32(instructionWords, wordOffset)
+        elif bodyIrStatementMode == PrimaryStatementReturnModeStrLen():
+            PrimaryFillLetCallNoargStrReturnLenI32(instructionWords, wordOffset)
+        elif bodyIrStatementMode == PrimaryStatementReturnModeStrThenCallReturnI32Const0():
+            PrimaryFillLetCallNoargStrThenCallArg0ReturnI32Const0(instructionWords, wordOffset)
+        elif bodyIrStatementMode == PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0():
+            PrimaryFillCstringLiteralCallsReturnI32Const0(instructionWords,
+                                                          wordOffset,
+                                                          bodyIR.callSequence.len)
+        elif PrimaryBodyIrIsI32TwoCallGuardFirstReturn(bodyIR):
+            PrimaryFillI32TwoCallGuardFirstReturn(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsI32GuardThenCommandReturn(bodyIR):
+            PrimaryFillI32GuardThenCommandReturn(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsStrCallConstThenCallArg0ReturnI32(bodyIR):
+            PrimaryFillStrCallConstThenCallArg0ReturnI32(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsStrI32GuardCallArg0ThenDispatchReturnI32(bodyIR):
+            PrimaryFillStrI32GuardCallArg0ThenDispatchReturnI32(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsI32LetCallThenReturnCallArg0(bodyIR):
+            PrimaryFillI32LetCallThenReturnCallArg0(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsArg0I32LetCallThenReturnCallArg0Arg1(bodyIR):
+            PrimaryFillArg0I32LetCallThenReturnCallArg0Arg1(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsArg0AggregateCallThenReturnCallArg0Arg1(bodyIR):
+            PrimaryFillArg0AggregateCallThenReturnCallArg0Arg1(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsArg0SeqCallThenReturnCallArg0Arg1(bodyIR):
+            PrimaryFillArg0SeqCallThenReturnCallArg0Arg1(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsStrLetCallThenCallArg0ReturnI32(bodyIR):
+            PrimaryFillStrLetCallThenCallArg0ReturnI32(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsI32GuardHelpThenCommandReturn(bodyIR):
+            PrimaryFillI32GuardHelpThenCommandReturn(instructionWords, wordOffset)
+        elif PrimaryBodyIrIsPtrNilGuardDerefReturn(bodyIR):
+            PrimaryFillPtrNilGuardDerefReturn(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindStatementSequence:
+            if statementMode == PrimaryStatementReturnModeI32Const():
+                PrimaryFillLetCallNoargReturnI32Const(instructionWords,
+                                                      wordOffset,
+                                                      statementI32Value)
+            elif statementMode == PrimaryStatementReturnModeCallResultI32():
+                PrimaryFillLetCallNoargReturnResultI32(instructionWords, wordOffset)
+            elif statementMode == PrimaryStatementReturnModeI32GuardResultLeZero():
+                PrimaryFillLetCallNoargGuardResultI32(instructionWords, wordOffset)
+            elif statementMode == PrimaryStatementReturnModeStrLen():
+                PrimaryFillLetCallNoargStrReturnLenI32(instructionWords, wordOffset)
+            elif statementMode == PrimaryStatementReturnModeStrThenCallReturnI32Const0():
+                PrimaryFillLetCallNoargStrThenCallArg0ReturnI32Const0(instructionWords, wordOffset)
+            elif statementMode == PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0():
+                PrimaryFillCstringLiteralCallsReturnI32Const0(instructionWords,
+                                                              wordOffset,
+                                                              task.statementCallCount)
+        elif bodyKind == texpr.BodyKindEntryBridge:
+            PrimaryFillEntryBridge(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindReturnZeroI32:
+            PrimaryFillReturnI32Const(instructionWords, wordOffset, 0)
+        elif chengpath.TextStartsWith(bodyKind, texpr.BodyKindReturnI32ConstPrefix):
+            PrimaryFillReturnI32Const(instructionWords,
+                                      wordOffset,
+                                      PrimaryStatementSequenceI32Value(bodyKind))
+        elif bodyKind == texpr.BodyKindReturnI32Arg0:
+            PrimarySetInstructionWord(instructionWords, wordOffset, -698416192)
+        elif bodyKind == texpr.BodyKindReturnI32Arg1:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 704709600)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, -698416192)
+        elif bodyKind == texpr.BodyKindReturnI32Arg2:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 704775136)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, -698416192)
+        elif bodyKind == texpr.BodyKindReturnI32Arg3:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 704840672)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, -698416192)
+        elif bodyKind == texpr.BodyKindReturnCallArg0TruePassthrough:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 1384120353)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, 335544320)
+        elif bodyKind == texpr.BodyKindReturnCallArg0Arg1TruePassthrough:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 1384120354)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, 335544320)
+        elif texpr.TypedExprIsReturnCallBodyKind(bodyKind):
+            PrimarySetInstructionWord(instructionWords, wordOffset, 335544320)
+        elif PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+            PrimaryFillLetCallNoargReturnI32Const(instructionWords,
+                                                  wordOffset,
+                                                  PrimaryStatementSequenceI32Value(bodyKind))
+        elif texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
+            PrimaryFillLetCallNoargReturnResultI32(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
+            PrimaryFillLetCallNoargGuardResultI32(instructionWords, wordOffset)
+        elif texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
+            PrimaryFillLetCallNoargStrReturnLenI32(instructionWords, wordOffset)
+        elif texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+            PrimaryFillLetCallNoargStrThenCallArg0ReturnI32Const0(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindReturnStrArg0:
+            PrimaryFillReturnStrArg0(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindReturnStrEmpty:
+            PrimaryFillReturnStrEmpty(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindReturnStrLiteral:
+            let irFunction = lowering.primaryObjectIr.functions[irIndex]
+            PrimaryFillReturnStrLiteral(instructionWords,
+                                        wordOffset,
+                                        Len(irFunction.returnStringLiteral))
+        elif bodyKind == texpr.BodyKindCstringToStrCopy:
+            PrimaryFillCstringToStrCopy(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 1895825439)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, 1409286252)
+            PrimaryFillReturnI32Const(instructionWords, wordOffset + 2, 0)
+            PrimaryFillReturnI32Const(instructionWords, wordOffset + 4, 7)
+        elif bodyKind == texpr.BodyKindReturnF64MulArgs:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 509675520)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, -698416192)
+        elif bodyKind == texpr.BodyKindReturnI32AddArgs:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 184614912)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, -698416192)
+        elif bodyKind == texpr.BodyKindReturnI32SubArgs:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 1258356736)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, -698416192)
+        elif bodyKind == texpr.BodyKindReturnI32MulArgs:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 453082112)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, -698416192)
+        elif bodyKind == texpr.BodyKindReturnI32AsrArgs:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 448866304)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, -698416192)
+        elif bodyKind == texpr.BodyKindReturnI32MaddArgs:
+            PrimarySetInstructionWord(instructionWords, wordOffset, 453052416)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, -698416192)
+        elif bodyKind == texpr.BodyKindReturnU64Arg0AndConst4NotZero:
+            PrimarySetInstructionWord(instructionWords, wordOffset, -226619361)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, 446629856)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 2, -698416192)
+        elif bodyKind == texpr.BodyKindReturnU64Arg0OrConst4:
+            PrimarySetInstructionWord(instructionWords, wordOffset, -1300365312)
+            PrimarySetInstructionWord(instructionWords, wordOffset + 1, -698416192)
+        elif bodyKind == texpr.BodyKindStrLenFastI32:
+            PrimaryFillStrLenFast(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindMainF64MulCheckExit:
+            PrimaryFillMainF64MulCheckExit(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindRuntimeSetCmdLine:
+            PrimaryFillRuntimeSetCmdLine(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindBackendDriverRootFromCmdline:
+            PrimaryFillBackendDriverRootFromCmdline(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindBackendDriverCommandDispatch:
+            PrimaryFillBackendDriverCommandDispatch(instructionWords, wordOffset)
+        elif bodyKind == texpr.BodyKindResultRequestDispatch:
+            PrimaryFillResultRequestDispatch(instructionWords, wordOffset)
     plan.functionTaskSchedule = functionTaskPlan.schedule
     plan.functionTaskJobCount = functionTaskPlan.jobCount
     plan.functionTaskCount = functionTaskPlan.tasks.len

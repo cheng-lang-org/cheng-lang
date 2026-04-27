@@ -470,6 +470,44 @@ fn PrimaryObjectEmitReturnStrArg0FunctionAsm(symbolName: str, ordinal: int32): s
     out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
     return out
 
+fn PrimaryObjectEmitReturnStrLiteralFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                 functionIndex: int32,
+                                                 ordinal: int32): Result[str] =
+    if functionIndex < 0 || functionIndex >= plan.symbolNames.len:
+        return Err[str](" primary object emit: missing return str literal symbol")
+    let symbolName = plan.symbolNames[functionIndex]
+    let targetSymbol = PrimaryObjectEmitRelocTargetForItemOrdinal(plan,
+                                                                  plan.itemIds[functionIndex],
+                                                                  0)
+    if len(targetSymbol) <= 0:
+        return Err[str](" primary object emit: missing return str literal runtime target")
+    let literalLabel = pobj.PrimaryReturnStrLiteralDataLabel(symbolName)
+    var literalLen: int32 = -1
+    for i in 0..<plan.dataLabels.len:
+        if plan.dataLabels[i] != literalLabel:
+            continue
+        if i < plan.dataPayloadTexts.len:
+            literalLen = PrimaryObjectEmitPayloadByteCount(plan.dataPayloadTexts[i]) - 1
+        break
+    if literalLen < 0:
+        return Err[str](" primary object emit: missing return str literal data label")
+    let labelOrdinal = IntToStr(ordinal)
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    if !PrimaryObjectEmitSymbolInPlan(plan, targetSymbol):
+        out = strutil.Join([out, Fmt".extern {targetSymbol}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, "  stp x29, x30, [sp, #-32]!\n"], "")
+    out = strutil.Join([out, "  mov x29, sp\n"], "")
+    out = strutil.Join([out, Fmt"  adrp x0, {literalLabel}@PAGE\n"], "")
+    out = strutil.Join([out, Fmt"  add x0, x0, {literalLabel}@PAGEOFF\n"], "")
+    out = strutil.Join([out, Fmt"  mov w1, #{IntToStr(literalLen)}\n"], "")
+    out = strutil.Join([out, Fmt"  bl {targetSymbol}\n"], "")
+    out = strutil.Join([out, "  ldp x29, x30, [sp], #32\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
 fn PrimaryObjectEmitCstringToStrCopyFunctionAsm(plan: pobj.PrimaryObjectPlan,
                                                  functionIndex: int32,
                                                  ordinal: int32): Result[str] =
@@ -1953,6 +1991,11 @@ fn PrimaryObjectEmitObjectAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
             add(chunks, PrimaryObjectEmitReturnStrEmptyFunctionAsm(plan.symbolNames[i], i))
         elif bodyKind == texpr.BodyKindReturnStrArg0:
             add(chunks, PrimaryObjectEmitReturnStrArg0FunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnStrLiteral:
+            let literalAsmRes = PrimaryObjectEmitReturnStrLiteralFunctionAsm(plan, i, i)
+            if IsErr(literalAsmRes):
+                return Err[str](Error(literalAsmRes))
+            add(chunks, Value(literalAsmRes))
         elif bodyKind == texpr.BodyKindCstringToStrCopy:
             let cstringAsmRes = PrimaryObjectEmitCstringToStrCopyFunctionAsm(plan, i, i)
             if IsErr(cstringAsmRes):
@@ -2086,6 +2129,11 @@ fn PrimaryObjectEmitAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
             add(chunks, PrimaryObjectEmitReturnStrEmptyFunctionAsm(plan.symbolNames[i], i))
         elif bodyKind == texpr.BodyKindReturnStrArg0:
             add(chunks, PrimaryObjectEmitReturnStrArg0FunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnStrLiteral:
+            let literalAsmRes = PrimaryObjectEmitReturnStrLiteralFunctionAsm(plan, i, i)
+            if IsErr(literalAsmRes):
+                return Err[str](Error(literalAsmRes))
+            add(chunks, Value(literalAsmRes))
         elif bodyKind == texpr.BodyKindCstringToStrCopy:
             let cstringAsmRes = PrimaryObjectEmitCstringToStrCopyFunctionAsm(plan, i, i)
             if IsErr(cstringAsmRes):

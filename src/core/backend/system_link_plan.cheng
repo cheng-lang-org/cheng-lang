@@ -2,7 +2,6 @@ import std/result
 import std/strformat
 import cheng/std/bytes_layout as layout
 import cheng/core/tooling/compiler_request as creq
-import cheng/core/tooling/compiler_runtime as crun
 import cheng/core/tooling/compiler_world as cworld
 import cheng/core/tooling/path as chengpath
 import cheng/core/lang/parser as parser
@@ -29,6 +28,7 @@ type
         moduleStem: str
         moduleKind: SystemModuleKind
         sourceBundleCid: Result[layout.FixedBytes32]
+        sourceBundleCidValue: layout.FixedBytes32
         sourceClosurePaths: str[]
         ownerModulePaths: str[]
         importEdges: parser.ImportEdge[]
@@ -67,22 +67,6 @@ fn SystemLinkPlanAppendLine(out: var str, key: str, value: str) =
     if Len(out) > 0:
         out = Fmt"{out}\n"
     out = Fmt"{out}{key}={value}"
-
-fn SystemLinkPlanDeriveModuleKind(parsed: parser.ParsedSourceStub): SystemModuleKind =
-    for i in 0..<parsed.ownerModulePaths.len:
-        if parsed.ownerModulePaths[i] == "cheng/core/tooling/compiler_main":
-            return SystemCompilerControlPlane
-    return SystemOrdinaryProgram
-
-fn SystemLinkPlanDeriveEntrySymbol(parsed: parser.ParsedSourceStub, emitKind: creq.CompilerEmit): str =
-    if emitKind == creq.EmitExe && parsed.mainFunctionPresent:
-        return "main"
-    return ""
-
-fn SystemLinkPlanDeriveExecutionTrack(moduleKind: SystemModuleKind): crun.CompilerExecutionTrack =
-    if moduleKind == SystemCompilerControlPlane:
-        return crun.CompilerTrackTooling
-    return crun.CompilerTrackProgram
 
 fn SystemLinkPlanWorkspaceRoot(plan: SystemLinkPlanStub): str =
     return plan.workspaceRoot
@@ -159,6 +143,9 @@ fn SystemLinkPlanExportRootSymbols(plan: SystemLinkPlanStub): str[] =
 fn SystemLinkPlanSourceBundleCid(plan: SystemLinkPlanStub): Result[layout.FixedBytes32] =
     return plan.sourceBundleCid
 
+fn SystemLinkPlanSourceBundleCidValue(plan: SystemLinkPlanStub): layout.FixedBytes32 =
+    return plan.sourceBundleCidValue
+
 fn SystemLinkPlanMissingReasonsField(plan: SystemLinkPlanStub): str[] =
     return plan.missingReasons
 
@@ -222,24 +209,21 @@ fn BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir: str,
                                                                  parsed,
                                                                  err):
         return false
-    var toolingTrack = false
-    for i in 0..<parsed.ownerModulePaths.len:
-        if parsed.ownerModulePaths[i] == "cheng/core/tooling/compiler_main":
-            toolingTrack = true
+    let compilerMainSourcePath = chengpath.PathAbsolute(rootDir,
+                                                        "src/core/tooling/compiler_main.cheng")
+    let toolingTrack = requestSourcePath == compilerMainSourcePath
+    let moduleKind = toolingTrack ? SystemCompilerControlPlane : SystemOrdinaryProgram
     var runtimeTargets: str[]
     var providerModules: str[]
-    if requestTargetTriple == "wasm32-unknown-unknown":
-        add(runtimeTargets, "runtime/compiler.program_wasm_entry")
-    elif toolingTrack:
-        add(runtimeTargets, crun.CompilerToolingArgvRuntimeTarget())
-    else:
-        add(runtimeTargets, crun.CompilerProgramArgvRuntimeTarget())
-    if tmat.TargetRequiresNativeProviderModules(requestTargetTriple):
-        if toolingTrack:
-            crun.RuntimeProviderModulesForTrack(crun.CompilerTrackTooling, providerModules)
-        else:
-            crun.RuntimeProviderModulesForTrack(crun.CompilerTrackProgram, providerModules)
-    let entrySymbol = SystemLinkPlanDeriveEntrySymbol(parsed, requestEmitKind)
+    let runtimeTarget = requestTargetTriple == "wasm32-unknown-unknown" ? "runtime/compiler.program_wasm_entry" : (toolingTrack ? "runtime/compiler.tooling_argv_entry" : "runtime/compiler.program_argv_entry")
+    add(runtimeTargets, runtimeTarget)
+    add(providerModules, "runtime/compiler_runtime")
+    add(providerModules, "runtime/core_runtime")
+    add(providerModules, "runtime/debug_runtime")
+    add(providerModules, "runtime/program_support")
+    add(providerModules, "runtime/program_support_get_env_bridge")
+    add(providerModules, "runtime/program_support_host_runtime")
+    let entrySymbol = requestEmitKind == creq.EmitExe && parsed.mainFunctionPresent ? "main" : ""
     var missing = SystemLinkPlanMissingReasons(parsed,
                                                  requestEmitKind,
                                                  requestTargetTriple,
@@ -255,6 +239,7 @@ fn BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir: str,
                                                                                        parsed.packageRoot,
                                                                                        externalPackageRoots,
                                                                                        parsed.orderedClosureSourcePaths)
+    let sourceBundleCidValue = Value(sourceBundleCid)
     plan.entryPath = requestSourcePath
     plan.outputPath = requestOutputPath
     plan.targetTriple = requestTargetTriple
@@ -267,10 +252,9 @@ fn BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir: str,
     plan.workspaceRoot = parsed.workspaceRoot
     plan.packageId = parsed.packageId
     plan.moduleStem = parsed.moduleStem
-    plan.moduleKind = SystemOrdinaryProgram
-    if toolingTrack:
-        plan.moduleKind = SystemCompilerControlPlane
+    plan.moduleKind = moduleKind
     plan.sourceBundleCid = sourceBundleCid
+    plan.sourceBundleCidValue = sourceBundleCidValue
     plan.sourceClosurePaths = parsed.orderedClosureSourcePaths
     plan.ownerModulePaths = parsed.ownerModulePaths
     plan.importEdges = parsed.importEdges

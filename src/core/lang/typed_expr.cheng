@@ -360,6 +360,7 @@ const
     BodyKindStrLenFastI32 = "str_len_fast_i32"
     BodyKindReturnStrArg0 = "return_str_arg0"
     BodyKindReturnStrEmpty = "return_str_empty"
+    BodyKindReturnStrLiteral = "return_str_literal"
     BodyKindMainF64MulCheckExit = "main_f64_mul_check_exit"
     BodyKindReturnCallNoargI32 = "return_call_noarg_i32"
     BodyKindReturnCallArg0I32 = "return_call_arg0_i32"
@@ -2368,6 +2369,23 @@ fn TypedExprBuildLoweringRules(facts: var TypedExprFact[],
     err = ""
     return true
 
+fn TypedExprValidateLoweringRulesFromFacts(facts: var TypedExprFact[],
+                                            ruleCount: var int32,
+                                            err: var str): bool =
+    ruleCount = 0
+    var singleRule: TypedExprLoweringRule[]
+    var empty: TypedExprLoweringRule
+    add(singleRule, empty)
+    for i in 0..<facts.len:
+        var reset: TypedExprLoweringRule
+        singleRule[0] = reset
+        TypedExprLoweringRuleFillFromFact(facts[i], singleRule[0])
+        if !TypedExprLoweringRulesValidate(singleRule, err):
+            return false
+        ruleCount = ruleCount + 1
+    err = ""
+    return true
+
 fn TypedExprConcat3(a: str, b: str, c: str): str =
     var buf = buffer.NewByteBuffer()
     if a != "":
@@ -4324,6 +4342,11 @@ fn TypedExprSourceLine(ctx: var TypedExprSourceContext,
         return ""
     return ctx.lines[lineNumber - 1]
 
+fn TypedExprClearSourceContextHeavyFields(ctx: var TypedExprSourceContext) =
+    ctx.lines = []
+    ctx.bindings = []
+    ctx.exprLineColumns = []
+
 fn TypedExprLookupBindingType(ctx: var TypedExprSourceContext,
                                 scopeIndex: int32,
                                 lineNumber: int32,
@@ -6028,7 +6051,7 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
                               facts: var TypedExprFact[],
                               ir: var TypedExprIr,
                               err: var str): bool =
-    var out: TypedExprIr
+    ir = TypedExprIr()
     for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
         var ctx: TypedExprSourceContext
@@ -6052,8 +6075,7 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
                     if facts[factIndex].lineNumber > ctx.scopes[j].startLine:
                         break
                     factCursor = factIndex + 1
-            TypedExprBuildIrForScope(ctx, ctx.scopes[j], facts, factCursor, sourceFactEnd, out)
-    ir = out
+            TypedExprBuildIrForScope(ctx, ctx.scopes[j], facts, factCursor, sourceFactEnd, ir)
     err = ""
     return true
 
@@ -6061,27 +6083,38 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
                                   exprLayer: var parser.NormalizedExprLayer,
                                   ir: var TypedExprIr,
                                   err: var str): bool =
-    var out: TypedExprIr
+    ir = TypedExprIr()
     var contexts: TypedExprSourceContext[]
     for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
+        var sourceForContext = sourceTexts[i]
+        if sourceForContext.text == "" && sourceForContext.sourcePath != "":
+            sourceForContext.text = chengpath.ReadTextFile("", sourceForContext.sourcePath)
         var ctx: TypedExprSourceContext
-        if !TypedExprBuildSourceContext(sourceTexts[i], ctx, err):
+        if !TypedExprBuildSourceContext(sourceForContext, ctx, err):
             err = " typed expr: build typed ir source context failed"
             return false
+        TypedExprClearSourceContextHeavyFields(ctx)
+        sourceTexts[i].text = ""
         add(contexts, ctx)
-    for i in 0..<contexts.len:
+    for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
-        let sourceExprStart = TypedExprExprLayerFirstIndexForSource(exprLayer, contexts[i].sourcePath)
+        var sourceForIr = sourceTexts[i]
+        if sourceForIr.text == "" && sourceForIr.sourcePath != "":
+            sourceForIr.text = chengpath.ReadTextFile("", sourceForIr.sourcePath)
+        var ctxForIr: TypedExprSourceContext
+        if !TypedExprBuildSourceContext(sourceForIr, ctxForIr, err):
+            err = " typed expr: build typed ir source context failed"
+            return false
+        let sourceExprStart = TypedExprExprLayerFirstIndexForSource(exprLayer, ctxForIr.sourcePath)
         var sourceExprEnd: int32
         var exprCursor: int32
         if sourceExprStart >= 0:
-            sourceExprEnd = TypedExprExprLayerEndIndexForSource(exprLayer, contexts[i].sourcePath, sourceExprStart)
+            sourceExprEnd = TypedExprExprLayerEndIndexForSource(exprLayer, ctxForIr.sourcePath, sourceExprStart)
             exprCursor = sourceExprStart
         else:
             sourceExprEnd = 0
             exprCursor = 0
-        var ctxForIr = contexts[i]
         let scopeCount = ctxForIr.scopes.len
         for j in 0..<scopeCount:
             if j % 128 == 0:
@@ -6098,9 +6131,10 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
                                                   exprLayer,
                                                   exprCursor,
                                                   sourceExprEnd,
-                                                  out)
-            contexts[i] = ctxForIr
-    ir = out
+                                                  ir)
+        TypedExprClearSourceContextHeavyFields(ctxForIr)
+        sourceTexts[i].text = ""
+        os.ProcessResourceGuardCheck()
     err = ""
     return true
 
@@ -6184,6 +6218,32 @@ fn TypedExprPopulateSourceExprLineColumns(contexts: var TypedExprSourceContext[]
     err = ""
     return true
 
+fn TypedExprPopulateSourceExprLineColumnsForRange(ctx: var TypedExprSourceContext,
+                                                   exprLayer: var parser.NormalizedExprLayer,
+                                                   startIndex: int32,
+                                                   endIndexRaw: int32,
+                                                   err: var str): bool =
+    var endIndex = endIndexRaw
+    if endIndex < 0 || endIndex > exprLayer.exprs.len:
+        endIndex = exprLayer.exprs.len
+    for i in startIndex..<endIndex:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
+        let expr = exprLayer.exprs[i]
+        if expr.lineNumber <= 0 || expr.lineNumber > ctx.exprLineColumns.len:
+            err = " typed expr: expr line out of range"
+            return false
+        let lineIndex = expr.lineNumber - 1
+        var lineExprColumns = ctx.exprLineColumns[lineIndex]
+        var shouldAppend = true
+        if lineExprColumns.columns.len > 0:
+            shouldAppend = lineExprColumns.columns[lineExprColumns.columns.len - 1] != expr.columnNumber
+        if shouldAppend:
+            add(lineExprColumns.columns, expr.columnNumber)
+            ctx.exprLineColumns[lineIndex] = lineExprColumns
+    err = ""
+    return true
+
 fn TypedExprBuildFacts(sourceTexts: var TypedExprSourceText[],
                          exprLayer: var parser.NormalizedExprLayer,
                          facts: var TypedExprFact[],
@@ -6197,24 +6257,41 @@ fn TypedExprBuildFacts(sourceTexts: var TypedExprSourceText[],
         if !TypedExprBuildSourceContext(sourceTexts[i], ctx, err):
             err = " typed expr: build source context failed"
             return false
-        for lineIndex in 0..<ctx.lines.len:
-            var lineExprColumns: TypedExprLineExprColumns
-            lineExprColumns.columns = []
-            add(ctx.exprLineColumns, lineExprColumns)
+        TypedExprClearSourceContextHeavyFields(ctx)
         add(contexts, ctx)
-    if !TypedExprPopulateSourceExprLineColumns(contexts, exprLayer, err):
-        return false
-    for i in 0..<exprLayer.exprs.len:
-        if i % 256 == 0:
+    var exprIndex: int32
+    while exprIndex < exprLayer.exprs.len:
+        if exprIndex % 256 == 0:
             os.ProcessResourceGuardCheck()
-        let expr = exprLayer.exprs[i]
-        let ctxIndex = TypedExprSourceContextLookup(contexts, expr.sourcePath)
+        let sourcePath = exprLayer.exprs[exprIndex].sourcePath
+        let ctxIndex = TypedExprSourceContextLookup(contexts, sourcePath)
         if ctxIndex < 0:
             err = " typed expr: missing source context"
             return false
-        var ctxForFact = contexts[ctxIndex]
-        add(facts, TypedExprBuildFact(ctxForFact, contexts, expr))
-        contexts[ctxIndex] = ctxForFact
+        var exprEnd = TypedExprExprLayerEndIndexForSource(exprLayer, sourcePath, exprIndex)
+        if exprEnd <= exprIndex:
+            exprEnd = exprIndex + 1
+        var ctxForFact: TypedExprSourceContext
+        if !TypedExprBuildSourceContext(sourceTexts[ctxIndex], ctxForFact, err):
+            err = " typed expr: build source context failed"
+            return false
+        for lineIndex in 0..<ctxForFact.lines.len:
+            var lineExprColumns: TypedExprLineExprColumns
+            lineExprColumns.columns = []
+            add(ctxForFact.exprLineColumns, lineExprColumns)
+        if !TypedExprPopulateSourceExprLineColumnsForRange(ctxForFact,
+                                                           exprLayer,
+                                                           exprIndex,
+                                                           exprEnd,
+                                                           err):
+            return false
+        for factIndex in exprIndex..<exprEnd:
+            if factIndex % 256 == 0:
+                os.ProcessResourceGuardCheck()
+            add(facts, TypedExprBuildFact(ctxForFact, contexts, exprLayer.exprs[factIndex]))
+        TypedExprClearSourceContextHeavyFields(ctxForFact)
+        sourceTexts[ctxIndex].text = ""
+        exprIndex = exprEnd
     var validateErr = ""
     if !TypedExprFactsValidateCallResolution(exprLayer, facts, validateErr):
         err = validateErr

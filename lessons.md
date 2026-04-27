@@ -1,5 +1,17 @@
 # Lessons
 
+- 2026-04-27: 纯 Cheng 自举任务不能把 C seed forced build 当完成依据；C seed 最多用于刷新引导候选，最终能力必须由 `artifacts/backend_driver/cheng` pure self `system-link-exec` 证明。
+- 2026-04-27: system link plan 不能用嵌套三目表达式替换关键分支来“移动” first missing；当前 build-backend-driver 会退到 `stmt_let` primary 缺口并失败，应从 lowering/primary 正式补能力。
+- 2026-04-27: backend driver 12GiB 自举诊断期不要把大函数里的小分支随手抽成 helper；新增可达函数会放大 lowering 闭包和 RSS，必须先证明能降低内存峰值。
+- 2026-04-27: lowering plan 不要常驻完整 TypedExprLoweringRule 数组；当前主链只需要校验和计数，应流式校验，避免 12GiB 诊断期 RSS 峰值被报告数据放大。
+- 2026-04-27: system link plan 的 `sourceBundleCid` 在 plan 构建阶段就应解析成确定值字段；执行阶段不要再围绕 Result 做 readiness guard。
+- 2026-04-27: function_task 串行包装链如果不在 lowering 主链使用，必须同时从 imports、plan 字段、build_plan 和 bootstrap manifest 移除，不能只留死源码。
+- 2026-04-27: CSG raw graph CID 不要在峰值路径再次全量哈希派生 expr/fact 记录；`sourceBundleCid + symbol graph + 派生表计数` 足够绑定源码闭包，重复扫大表会把 pure self peak 推过 8GiB。
+- 2026-04-27: TypedExpr IR 构建必须直接写 out-param；先建局部 `TypedExprIr` 再赋给输出会在 lowering 末尾制造 typedIr 双份同峰。
+- 2026-04-27: lowering 阶段构建 typed IR 时不要预读并长期保存全量 source text；按 sourcePath 懒读、用完清空，后续需要 importc 查询再单独恢复所需文本。
+- 2026-04-27: backend driver 自举新增 CFG lowering 必须先限定到单个已验证入口；全局套用单 if CFG 会把 lowering RSS 推过 8GiB。
+- 2026-04-27: backend driver 错误报告这类返回值被丢弃的 provider bridge 用 `int32` importc 直接调用；不要再包一层 Cheng bool wrapper。
+- 2026-04-27: lowering 主链不要引入未使用的 function task 闭包；串行包装没有生产收益，还会放大 selfhost lowering 内存。
 - 2026-04-27: Cheng runtime provider 新增独立 provider 源文件时，必须同步 provider module 列表、source 映射、export roots、C seed freshness 和 provider cache 版本；不能只把文件放进 `src/core/runtime`。
 - 2026-04-27: runtime provider export roots 只能登记当前 C seed export surface 能看到且真实需要的符号；未使用的 default bridge 这类符号会让 provider 对象生成变成 `primary_object_export_root_missing`。
 - 2026-04-27: `backend_driver_dispatch_min` 不能直接调用 `std/os.GetEnv` 做进度、RSS 守卫或诊断目录选择；这些必须收口到 runtime provider bridge，否则候选主对象会重新依赖 `driver_c_get_env_bridge`。
@@ -11,6 +23,11 @@
 - 2026-04-27: backend driver 命令参数解析不要在 min driver 里复制一套 if 链；应复用 `CompilerRequestFromArgs`，再走已证明的 Result request dispatch lowering。
 - 2026-04-27: 函数级并行不能先接裸线程草稿；先把 primary codegen 改成纯数据 task plan + jobs=1 确定性执行，输出不变后再替换 ws executor。
 - 2026-04-27: primary 函数任务只能保存函数索引和标量元数据，不能把 `BodyIR` 复制进每个 task；pure self-build 会直接顶到 8GiB RSS。
+- 2026-04-27: primary 函数任务计划不要另抽一份巨大 codegen 执行 helper；selfhost lowering 会把闭包再放大一份，稳定做法是先在既有 `BuildPrimaryObjectPlan` 填充链内按 task 顺序执行。
+- 2026-04-27: compiler CSG 的图 CID 不能把完整 expr/fact/node/edge 图拼成一整块 ByteBuf 再哈希；这会在 selfhost 里把大图复制到 8GiB 以上，必须用分记录 CID/流式摘要并在 CSG 内部做 RSS guard。
+- 2026-04-27: min driver 热路径不能用 `Result[CompilerCsg]` 后再 `Value` 取完整大对象；这会把 CSG 复制一份并在 lowering begin 才触发 RSS 超限，必须提供 out-param 构建入口。
+- 2026-04-27: min driver 里返回值被丢弃的 importc 错误报告桥不要声明成 `bool` return-call；当前 primary 标量路径优先用 `int32`，否则会卡在简单 wrapper 的 `stmt_call`。
+- 2026-04-27: lowering plan 不能把 CSG 的 `exprLayer/typedExprFacts` 再复制进自身；报告需要的只保存计数，构建 IR/primary 时借用 CSG 表并及时清空 CSG 大数组。
 - 2026-04-27: backend driver 新增被 `lowering_plan` import 的 core IR 源文件时，必须同步 `build_plan`、bootstrap manifest、C seed freshness 和 min driver `print-build-plan`；否则源码变化不会触发重建。
 - 2026-04-27: lowering 对线性函数不能只依赖 typed function `returnExpr`；当函数没有顶层控制流且只有一个 top-level return 时，应从 return statement 取表达式，否则 str wrapper 会退成“call ops 无 return”。
 - 2026-04-27: lowering/primary 处理 guard CFG 时不能默认 `blocks[0]` 是入口；如果 true/false block 先追加，必须按 `opStart=0` 的分支块定位 entry，否则会把函数误压成单独 `return 0`。
@@ -150,7 +167,7 @@
 - 最小 seed 主线下，public `stage3 system-link-exec/status/print-build-plan` 只做 backend driver handoff，不再隐式 `bootstrap-bridge` 或 `build-backend-driver`；`CHENG_NO_BACKEND_DRIVER_HANDOFF=1` 只给内部自举路径用，用户命令面应硬失败而不是回落 C seed。
 - direct writer 改为消费 `PrimaryObjectPlan.instructionWords` 后，primary plan 必须同步写真实机器字；零填充会生成看似合法但含 `udf` 的 Mach-O，并在 BR26 relocation 链接时失败。
 - standalone direct 不能只用 zero-exit smoke 验证；必须覆盖非零 call-chain relocation、实际退出码和 `otool -rv`，同时用 f64 object 验证 `fmul` 指令形态。
-- 刷新 `stage0/stage2/stage3` 后不要立刻跑普通 `build-backend-driver --require-rebuild` 验证纯 self build；ready 会因新 stage artifact 失效而触发纯 Cheng 重编。先用 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 刷新最小 driver，再跑普通 ready/status；纯 self rebuild 必须先有 RSS 子进程组守卫和明确用户确认。
+- C seed 已排除在纯 Cheng 自举链外；`CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 只能在用户明确要求恢复破损 artifact 时人工使用，不能作为自举进展、验证或默认刷新步骤。
 - C seed 调外部/内部 live 子进程时必须监控子进程组 RSS，不只看 seed 自身 peak RSS；超出 `CHENG_PROCESS_MAX_RSS_BYTES` 要写 `rss_limit_exceeded`、杀进程组并以 125 硬失败。
 - `build-backend-driver` 的默认 8GiB 只能是缺省值，不能覆盖调用方显式传入的 `CHENG_PROCESS_MAX_RSS_BYTES`/`CHENG_MAX_RSS_BYTES`；专用 `CHENG_BUILD_BACKEND_DRIVER_MAX_RSS_BYTES` 优先级最高，方便单独压测构建链路。
 - `BuildLoweringPlanStub` 标记 entry 函数时必须比较规范化后的绝对 source path，不能用原始字符串相等；候选 driver 的绝对/相对路径表面不同会直接丢 entry，随后表现为 `lowering_entry_function_missing`。

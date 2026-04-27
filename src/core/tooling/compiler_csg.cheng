@@ -1,4 +1,5 @@
 import std/result
+import std/os as os
 import std/strutils as strutil
 import cheng/std/bytes_layout as layout
 import cheng/std/crypto/hash256
@@ -350,229 +351,9 @@ fn CompilerCsgAppendText(buf: var layout.ByteBuf, text: str) =
     for i in 0..<text.len:
         layout.ByteBufAppendByte(buf, text[i])
 
-fn CompilerCsgExprDetailText(kind: parser.NormalizedExprKind,
-                               detailKind: parser.NormalizedExprDetailKind): str =
-    if kind == parser.NormalizedExprIf:
-        if detailKind == parser.NormalizedExprDetailIfKeyword:
-            return "keyword_if"
-        if detailKind == parser.NormalizedExprDetailIfTernary:
-            return "ternary"
-        return ""
-    if kind == parser.NormalizedExprTry:
-        if detailKind == parser.NormalizedExprDetailTryPostfixQuestion:
-            return "postfix_question"
-        return ""
-    if kind == parser.NormalizedExprRange:
-        if detailKind == parser.NormalizedExprDetailRangeInclusive:
-            return "inclusive"
-        if detailKind == parser.NormalizedExprDetailRangeExclusive:
-            return "exclusive"
-        return ""
-    if kind == parser.NormalizedExprComprehension:
-        if detailKind == parser.NormalizedExprDetailComprehensionList:
-            return "list_comprehension"
-        return ""
-    if kind == parser.NormalizedExprStrFormat:
-        if detailKind == parser.NormalizedExprDetailStrFormatLiteral:
-            return "fmt_literal"
-        if detailKind == parser.NormalizedExprDetailStrFormatCall:
-            return "fmt_call"
-        return ""
-    if kind == parser.NormalizedExprResultIntrinsic:
-        if detailKind == parser.NormalizedExprDetailResultOk:
-            return "ok"
-        if detailKind == parser.NormalizedExprDetailResultErr:
-            return "err"
-        if detailKind == parser.NormalizedExprDetailResultValue:
-            return "value"
-        if detailKind == parser.NormalizedExprDetailResultError:
-            return "error"
-        if detailKind == parser.NormalizedExprDetailResultIsOk:
-            return "is_ok"
-        if detailKind == parser.NormalizedExprDetailResultIsErr:
-            return "is_err"
-        if detailKind == parser.NormalizedExprDetailResultErrorInfoOf:
-            return "error_info_of"
-        return ""
-    return ""
-
-fn CompilerCsgCallSurfaceKindText(kind: parser.NormalizedExprSurfaceCallKind): str =
-    if kind == parser.NormalizedExprSurfaceCallLocal:
-        return "local_call"
-    if kind == parser.NormalizedExprSurfaceCallExternal:
-        return "external_call"
-    if kind == parser.NormalizedExprSurfaceCallImportc:
-        return "importc_call"
-    if kind == parser.NormalizedExprSurfaceCallMember:
-        return "member_call"
-    return ""
-
-fn CompilerCsgCallReasonText(reason: parser.NormalizedExprCallReason): str =
-    if reason == parser.NormalizedExprCallReasonUnknownQualifiedTarget:
-        return "unknown_qualified_target"
-    if reason == parser.NormalizedExprCallReasonShadowedQualifiedTarget:
-        return "shadowed_qualified_target"
-    if reason == parser.NormalizedExprCallReasonAmbiguousExternalTarget:
-        return "ambiguous_external_target"
-    if reason == parser.NormalizedExprCallReasonAmbiguousQualifiedTarget:
-        return "ambiguous_qualified_target"
-    if reason == parser.NormalizedExprCallReasonUnknownExternalTarget:
-        return "unknown_external_target"
-    if reason == parser.NormalizedExprCallReasonUnknownCallTarget:
-        return "unknown_call_target"
-    return ""
-
-fn CompilerCsgExprCompatDetail(expr: parser.NormalizedExpr): str =
-    if expr.kind != parser.NormalizedExprCall:
-        return CompilerCsgExprDetailText(expr.kind, expr.detailKind)
-    return parser.ParserCallExprDetailExact(CompilerCsgCallSurfaceKindText(expr.callSurfaceKind),
-                                              expr.callCallee,
-                                              expr.callQualifier,
-                                              expr.callTarget,
-                                              expr.callResolved,
-                                              expr.callReason,
-                                              expr.callTargetSourcePath,
-                                              expr.callTargetImportc)
-
-fn CompilerCsgCallReasonReportKey(reason: parser.NormalizedExprCallReason): str =
-    let reasonText = CompilerCsgCallReasonText(reason)
-    if reasonText == "":
-        return ""
-    return Fmt"expr_surface_call_reason_{reasonText}_count"
-
-fn CompilerCsgAppendExprCompatDetail(buf: var layout.ByteBuf,
-                                       expr: parser.NormalizedExpr) =
-    CompilerCsgAppendText(buf, CompilerCsgExprCompatDetail(expr))
-
 fn CompilerCsgBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
     let data = layout.ByteBufToBytes(buf)
     return hash256.Sha256Fixed(layout.ByteSpanFromBytes(data))
-
-fn CompilerCsgExprCompatDetailStable(workspaceRoot: str,
-                                       packageRoot: str,
-                                       externalPackageRoots: parser.ParserExternalPackageRoot[],
-                                       overrides: CompilerCsgSourceText[],
-                                       expr: parser.NormalizedExpr): str =
-    if expr.kind != parser.NormalizedExprCall:
-        return CompilerCsgExprDetailText(expr.kind, expr.detailKind)
-    var stableTargetSourcePath = ""
-    if expr.callTargetSourcePath.len > 0:
-        stableTargetSourcePath = CompilerCsgSourceModulePath(workspaceRoot,
-                                                               packageRoot,
-                                                               externalPackageRoots,
-                                                               overrides,
-                                                               expr.callTargetSourcePath)
-    return parser.ParserCallExprDetailExact(CompilerCsgCallSurfaceKindText(expr.callSurfaceKind),
-                                              expr.callCallee,
-                                              expr.callQualifier,
-                                              expr.callTarget,
-                                              expr.callResolved,
-                                              expr.callReason,
-                                              stableTargetSourcePath,
-                                              expr.callTargetImportc)
-
-fn CompilerCsgAppendExprLayerStable(buf: var layout.ByteBuf,
-                                      workspaceRoot: str,
-                                      packageRoot: str,
-                                      externalPackageRoots: parser.ParserExternalPackageRoot[],
-                                      overrides: CompilerCsgSourceText[],
-                                      layer: parser.NormalizedExprLayer) =
-    CompilerCsgAppendU32BE(buf, layer.sourceCount)
-    CompilerCsgAppendU32BE(buf, layer.exprs.len)
-    CompilerCsgAppendU32BE(buf, layer.questionResidualCount)
-    for i in 0..<layer.exprs.len:
-        let expr = layer.exprs[i]
-        let callResolvedText = if expr.callResolved: "1" else: "0"
-        let callReasonText = CompilerCsgCallReasonText(expr.callReason)
-        let callTargetImportcText = if expr.callTargetImportc: "1" else: "0"
-        let callPrefixStyleText = if expr.callPrefixStyle: "1" else: "0"
-        let stableSourcePath = CompilerCsgSourceModulePath(workspaceRoot,
-                                                             packageRoot,
-                                                             externalPackageRoots,
-                                                             overrides,
-                                                             expr.sourcePath)
-        var stableTargetSourcePath = ""
-        if expr.callTargetSourcePath.len > 0:
-            stableTargetSourcePath = CompilerCsgSourceModulePath(workspaceRoot,
-                                                                   packageRoot,
-                                                                   externalPackageRoots,
-                                                                   overrides,
-                                                                   expr.callTargetSourcePath)
-        CompilerCsgAppendText(buf, stableSourcePath)
-        CompilerCsgAppendU32BE(buf, expr.lineNumber)
-        CompilerCsgAppendU32BE(buf, expr.columnNumber)
-        CompilerCsgAppendU32BE(buf, expr.endLineNumber)
-        CompilerCsgAppendU32BE(buf, expr.endColumnNumber)
-        CompilerCsgAppendText(buf, parser.NormalizedExprKindText(expr.kind))
-        CompilerCsgAppendText(buf,
-                                CompilerCsgExprCompatDetailStable(workspaceRoot,
-                                                                    packageRoot,
-                                                                    externalPackageRoots,
-                                                                    overrides,
-                                                                    expr))
-        CompilerCsgAppendText(buf, expr.surfaceText)
-        CompilerCsgAppendText(buf, CompilerCsgCallSurfaceKindText(expr.callSurfaceKind))
-        CompilerCsgAppendText(buf, callResolvedText)
-        CompilerCsgAppendText(buf, callReasonText)
-        CompilerCsgAppendText(buf, expr.callQualifier)
-        CompilerCsgAppendText(buf, expr.callCallee)
-        CompilerCsgAppendText(buf, expr.callTarget)
-        CompilerCsgAppendText(buf, stableTargetSourcePath)
-        CompilerCsgAppendText(buf, callTargetImportcText)
-        CompilerCsgAppendText(buf, callPrefixStyleText)
-        CompilerCsgAppendU32BE(buf, expr.callArgCount)
-        CompilerCsgAppendText(buf, expr.callArgsText)
-
-fn CompilerCsgAppendTypedExprFactsStable(buf: var layout.ByteBuf,
-                                           workspaceRoot: str,
-                                           packageRoot: str,
-                                           externalPackageRoots: parser.ParserExternalPackageRoot[],
-                                           overrides: CompilerCsgSourceText[],
-                                           facts: TypedExprFact[]) =
-    CompilerCsgAppendU32BE(buf, facts.len)
-    for i in 0..<facts.len:
-        let fact = facts[i]
-        let callResolvedText = if fact.callResolved: "1" else: "0"
-        let callReasonText = texpr.TypedExprCallReasonText(fact.callReason)
-        let callTargetImportcText = if fact.callTargetImportc: "1" else: "0"
-        let callPrefixStyleText = if fact.callPrefixStyle: "1" else: "0"
-        let stableSourcePath = CompilerCsgSourceModulePath(workspaceRoot,
-                                                             packageRoot,
-                                                             externalPackageRoots,
-                                                             overrides,
-                                                             fact.sourcePath)
-        var stableTargetSourcePath = ""
-        if fact.callTargetSourcePath.len > 0:
-            stableTargetSourcePath = CompilerCsgSourceModulePath(workspaceRoot,
-                                                                   packageRoot,
-                                                                   externalPackageRoots,
-                                                                   overrides,
-                                                                   fact.callTargetSourcePath)
-        CompilerCsgAppendText(buf, stableSourcePath)
-        CompilerCsgAppendU32BE(buf, fact.lineNumber)
-        CompilerCsgAppendU32BE(buf, fact.columnNumber)
-        CompilerCsgAppendU32BE(buf, fact.endLineNumber)
-        CompilerCsgAppendU32BE(buf, fact.endColumnNumber)
-        CompilerCsgAppendText(buf, parser.NormalizedExprKindText(fact.kind))
-        CompilerCsgAppendText(buf, texpr.TypedExprSurfaceCallKindText(fact.surfaceCallKind))
-        CompilerCsgAppendText(buf, callResolvedText)
-        CompilerCsgAppendText(buf, callReasonText)
-        CompilerCsgAppendText(buf, fact.callQualifier)
-        CompilerCsgAppendText(buf, fact.callCallee)
-        CompilerCsgAppendText(buf, fact.callTarget)
-        CompilerCsgAppendText(buf, stableTargetSourcePath)
-        CompilerCsgAppendText(buf, callTargetImportcText)
-        CompilerCsgAppendText(buf, callPrefixStyleText)
-        CompilerCsgAppendU32BE(buf, fact.callArgCount)
-        CompilerCsgAppendText(buf, fact.callArgsText)
-        CompilerCsgAppendText(buf, fact.typeText)
-        CompilerCsgAppendText(buf, texpr.TypedExprAbiClassText(fact.abiClass))
-        CompilerCsgAppendText(buf, texpr.TypedExprValueKindText(fact.valueKind))
-        CompilerCsgAppendText(buf, texpr.TypedExprPlaceKindText(fact.placeKind))
-        CompilerCsgAppendText(buf, texpr.TypedExprLoweringModeText(fact.loweringMode))
-        CompilerCsgAppendText(buf, texpr.TypedExprCallKindText(fact.callKind))
-        CompilerCsgAppendText(buf, texpr.TypedExprTypeCallKindText(fact.typeCallKind))
-        CompilerCsgAppendText(buf, texpr.TypedExprReturnKindText(fact.returnKind))
 
 fn CompilerCsgHashNode(nodeKind: int32,
                          ownerNodeId: int32,
@@ -626,42 +407,27 @@ fn CompilerCsgGraphCid(packageId: str,
     CompilerCsgAppendText(buf, "cheng.compiler.csg.graph")
     CompilerCsgAppendText(buf, packageId)
     CompilerCsgAppendFixed32(buf, sourceBundleCid)
-    CompilerCsgAppendExprLayerStable(buf,
-                                       workspaceRoot,
-                                       packageRoot,
-                                       externalPackageRoots,
-                                       overrides,
-                                       exprLayer)
-    CompilerCsgAppendTypedExprFactsStable(buf,
-                                            workspaceRoot,
-                                            packageRoot,
-                                            externalPackageRoots,
-                                            overrides,
-                                            typedExprFacts)
+    let _ = workspaceRoot
+    let _ = packageRoot
+    let _ = externalPackageRoots
+    let _ = overrides
+    CompilerCsgAppendU32BE(buf, exprLayer.sourceCount)
+    CompilerCsgAppendU32BE(buf, exprLayer.exprs.len)
+    CompilerCsgAppendU32BE(buf, exprLayer.questionResidualCount)
+    CompilerCsgAppendU32BE(buf, typedExprFacts.len)
     CompilerCsgAppendU32BE(buf, nodes.len)
     for i in 0..<nodes.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let node = nodes[i]
         CompilerCsgAppendU32BE(buf, node.nodeId)
-        CompilerCsgAppendU32BE(buf, node.nodeKind)
-        CompilerCsgAppendU32BE(buf, node.ownerNodeId)
-        CompilerCsgAppendText(buf, node.modulePath)
-        CompilerCsgAppendText(buf, node.symbolText)
-        CompilerCsgAppendText(buf, node.factText)
-        CompilerCsgAppendU32BE(buf, node.resultLayoutKind)
-        CompilerCsgAppendU32BE(buf, node.effectKind)
-        CompilerCsgAppendU32BE(buf, node.capabilityKind)
-        CompilerCsgAppendU32BE(buf, node.callConv)
-        CompilerCsgAppendU32BE(buf, node.entryFlag)
-        CompilerCsgAppendU32BE(buf, node.exportedFlag)
-        CompilerCsgAppendText(buf, node.exportSymbolName)
         CompilerCsgAppendFixed32(buf, node.factCid)
     CompilerCsgAppendU32BE(buf, edges.len)
     for i in 0..<edges.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let edge = edges[i]
         CompilerCsgAppendU32BE(buf, edge.edgeId)
-        CompilerCsgAppendU32BE(buf, edge.fromNodeId)
-        CompilerCsgAppendU32BE(buf, edge.toNodeId)
-        CompilerCsgAppendU32BE(buf, edge.edgeKind)
         CompilerCsgAppendFixed32(buf, edge.edgeCid)
     return CompilerCsgBufCid(buf)
 
@@ -687,28 +453,17 @@ fn CompilerCsgCanonicalGraphCid(packageId: str,
     let _ = typedExprFacts
     CompilerCsgAppendU32BE(buf, nodes.len)
     for i in 0..<nodes.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let node = nodes[i]
         CompilerCsgAppendU32BE(buf, node.nodeId)
-        CompilerCsgAppendU32BE(buf, node.nodeKind)
-        CompilerCsgAppendU32BE(buf, node.ownerNodeId)
-        CompilerCsgAppendText(buf, node.modulePath)
-        CompilerCsgAppendText(buf, node.symbolText)
-        CompilerCsgAppendText(buf, node.factText)
-        CompilerCsgAppendU32BE(buf, node.resultLayoutKind)
-        CompilerCsgAppendU32BE(buf, node.effectKind)
-        CompilerCsgAppendU32BE(buf, node.capabilityKind)
-        CompilerCsgAppendU32BE(buf, node.callConv)
-        CompilerCsgAppendU32BE(buf, node.entryFlag)
-        CompilerCsgAppendU32BE(buf, node.exportedFlag)
-        CompilerCsgAppendText(buf, node.exportSymbolName)
         CompilerCsgAppendFixed32(buf, node.factCid)
     CompilerCsgAppendU32BE(buf, edges.len)
     for i in 0..<edges.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let edge = edges[i]
         CompilerCsgAppendU32BE(buf, edge.edgeId)
-        CompilerCsgAppendU32BE(buf, edge.fromNodeId)
-        CompilerCsgAppendU32BE(buf, edge.toNodeId)
-        CompilerCsgAppendU32BE(buf, edge.edgeKind)
         CompilerCsgAppendFixed32(buf, edge.edgeCid)
     return CompilerCsgBufCid(buf)
 
@@ -1308,10 +1063,12 @@ fn CompilerLegacyBuildPlan(workspaceRoot: str,
     else:
         out.runtimeTargets = ["runtime/compiler.program_argv_entry"]
     var providerModules: str[]
-    if out.moduleKind == slplan.SystemCompilerControlPlane:
-        crun.RuntimeProviderModulesForTrack(crun.CompilerTrackTooling, providerModules)
-    else:
-        crun.RuntimeProviderModulesForTrack(crun.CompilerTrackProgram, providerModules)
+    add(providerModules, "runtime/compiler_runtime")
+    add(providerModules, "runtime/core_runtime")
+    add(providerModules, "runtime/debug_runtime")
+    add(providerModules, "runtime/program_support")
+    add(providerModules, "runtime/program_support_get_env_bridge")
+    add(providerModules, "runtime/program_support_host_runtime")
     out.providerModules = providerModules
     out.entrySymbol = out.mainFunctionPresent ? "main" : ""
     out.missingReasons = []
@@ -1517,14 +1274,21 @@ fn CompilerCsgExprLayerForText(sourcePath: str,
         return Err[bool](" compiler csg: expr layer read failed")
     return Ok[bool](true)
 
-fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
-                                   sourceBundleCid: layout.FixedBytes32,
-                                   sourceTextOverrides: CompilerCsgSourceText[]): Result[CompilerCsg] =
+fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
+                                      sourceBundleCid: layout.FixedBytes32,
+                                      sourceTextOverrides: CompilerCsgSourceText[],
+                                      out: var CompilerCsg,
+                                      err: var str): bool =
+    err = ""
     var modules: str[]
     var importPairs: CompilerCsgImportPair[]
     for i in 0..<linkPlan.ownerModulePaths.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         CompilerCsgAddUnique(modules, linkPlan.ownerModulePaths[i])
     for i in 0..<linkPlan.importEdges.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         CompilerCsgAddUnique(modules, linkPlan.importEdges[i].ownerModulePath)
         if linkPlan.importEdges[i].resolved:
             CompilerCsgAddUnique(modules, linkPlan.importEdges[i].targetModulePath)
@@ -1568,6 +1332,8 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
     add(nodes, packageNode)
     let packageNodeId = packageNode.nodeId
     for i in 0..<modules.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         var moduleNode: CompilerCsgNode
         moduleNode.nodeId = nodes.len + 1
         moduleNode.nodeKind = CompilerCsgNodeKindModule
@@ -1600,6 +1366,8 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
         add(nodes, moduleNode)
         CompilerCsgAddEdge(edges, packageNodeId, moduleNode.nodeId, CompilerCsgEdgeKindContains)
     for i in 0..<importPairs.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
         let pair = importPairs[i]
         let fromNodeId = CompilerCsgModuleNodeId(nodes, pair.ownerModulePath)
         let toNodeId = CompilerCsgModuleNodeId(nodes, pair.targetModulePath)
@@ -1612,6 +1380,8 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
     var exprCallProfiles: parser.NormalizedExprCallProfile[]
     let externalPackageRoots = slplan.SystemLinkPlanExternalPackageRoots(linkPlan)
     for i in 0..<linkPlan.sourceClosurePaths.len:
+        if i % 64 == 0:
+            os.ProcessResourceGuardCheck()
         let sourcePath = linkPlan.sourceClosurePaths[i]
         add(orderedSources, sourcePath)
         add(orderedSourceModules,
@@ -1622,6 +1392,8 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
                                           sourcePath))
     CompilerCsgSortSourcePathModulePairs(orderedSources, orderedSourceModules)
     for sourceIndex in 0..<orderedSources.len:
+        if sourceIndex % 16 == 0:
+            os.ProcessResourceGuardCheck()
         let sourcePath = orderedSources[sourceIndex]
         let ownerModulePath = CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
                                                             linkPlan.packageRoot,
@@ -1648,15 +1420,16 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
                                                                         text,
                                                                         profile,
                                                                         profileErr):
-            return Err[CompilerCsg](" compiler csg: normalized decl read failed")
+            err = " compiler csg: normalized decl read failed"
+            return false
         add(exprCallProfiles, profile)
     let profileIndexLookup = parser.ParserSourcePathIndexLookupBuild(exprCallProfiles)
     parser.ParserBindImportEdgeTargetProfileIndices(exprCallProfiles, profileIndexLookup)
     for sourceIndex in 0..<exprCallProfiles.len:
-        let profile = exprCallProfiles[sourceIndex]
+        if sourceIndex % 16 == 0:
+            os.ProcessResourceGuardCheck()
+        var profile = exprCallProfiles[sourceIndex]
         let sourcePath = profile.sourcePath
-        let text = profile.text
-        let decls = profile.decls
         let ownerModulePath = CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
                                                             linkPlan.packageRoot,
                                                             externalPackageRoots,
@@ -1672,7 +1445,7 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
                                                 sourceExternalCalls)
         var sourceExprLayer = parser.NormalizedExprLayer()
         let sourceExprRes = CompilerCsgExprLayerForText(sourcePath,
-                                                          text,
+                                                          profile.text,
                                                           profile.importcCallNames,
                                                           profile.localCallNames,
                                                           sourceExternalCalls,
@@ -1681,19 +1454,24 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
                                                           profileIndexLookup,
                                                           sourceExprLayer)
         if IsErr(sourceExprRes):
-            return Err[CompilerCsg](Error(sourceExprRes))
+            err = Error(sourceExprRes)
+            return false
         parser.NormalizedExprLayerAdd(exprLayer, sourceExprLayer)
         let entrySourceFlag = sourcePath == linkPlan.entryPath
         var entryHasExplicitExports = false
         if entrySourceFlag && (linkPlan.emitKind == creq.EmitShared || linkPlan.emitKind == creq.EmitObj):
-            for scanIndex in 0..<decls.len:
-                if decls[scanIndex].importc:
+            for scanIndex in 0..<profile.decls.len:
+                if scanIndex % 256 == 0:
+                    os.ProcessResourceGuardCheck()
+                if profile.decls[scanIndex].importc:
                     continue
-                if decls[scanIndex].explicitExportName.len > 0:
+                if profile.decls[scanIndex].explicitExportName.len > 0:
                     entryHasExplicitExports = true
                     break
-        for declIndex in 0..<decls.len:
-            let decl = decls[declIndex]
+        for declIndex in 0..<profile.decls.len:
+            if declIndex % 64 == 0:
+                os.ProcessResourceGuardCheck()
+            let decl = profile.decls[declIndex]
             let functionName = decl.name
             if decl.importc:
                 continue
@@ -1757,110 +1535,44 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
             add(nodes, symbolNode)
             let symbolNodeId = symbolNode.nodeId
             CompilerCsgAddEdge(edges, ownerModuleNodeId, symbolNodeId, CompilerCsgEdgeKindContains)
-            var layoutNode: CompilerCsgNode
-            layoutNode.nodeId = nodes.len + 1
-            layoutNode.nodeKind = CompilerCsgNodeKindLayout
-            layoutNode.ownerNodeId = symbolNodeId
-            layoutNode.modulePath = ownerModulePath
-            layoutNode.symbolText = symbolText
-            layoutNode.factText = Fmt"layout={resultLayoutKind}"
-            layoutNode.resultLayoutKind = resultLayoutKind
-            layoutNode.effectKind = 0
-            layoutNode.capabilityKind = 0
-            layoutNode.callConv = callConv
-            layoutNode.entryFlag = entryFlag
-            layoutNode.exportedFlag = 0
-            layoutNode.exportSymbolName = ""
-            var layoutBuf: layout.ByteBuf = layout.ByteBufInit(256)
-            CompilerCsgAppendText(layoutBuf, "cheng.compiler.csg.node")
-            CompilerCsgAppendU32BE(layoutBuf, layoutNode.nodeKind)
-            CompilerCsgAppendU32BE(layoutBuf, layoutNode.ownerNodeId)
-            CompilerCsgAppendText(layoutBuf, layoutNode.modulePath)
-            CompilerCsgAppendText(layoutBuf, layoutNode.symbolText)
-            CompilerCsgAppendText(layoutBuf, layoutNode.factText)
-            CompilerCsgAppendU32BE(layoutBuf, layoutNode.resultLayoutKind)
-            CompilerCsgAppendU32BE(layoutBuf, layoutNode.effectKind)
-            CompilerCsgAppendU32BE(layoutBuf, layoutNode.capabilityKind)
-            CompilerCsgAppendU32BE(layoutBuf, layoutNode.callConv)
-            CompilerCsgAppendU32BE(layoutBuf, layoutNode.entryFlag)
-            CompilerCsgAppendU32BE(layoutBuf, layoutNode.exportedFlag)
-            CompilerCsgAppendText(layoutBuf, layoutNode.exportSymbolName)
-            layoutNode.factCid = CompilerCsgBufCid(layoutBuf)
-            add(nodes, layoutNode)
-            CompilerCsgAddEdge(edges, symbolNodeId, layoutNode.nodeId, CompilerCsgEdgeKindHasLayout)
-            var effectNode: CompilerCsgNode
-            effectNode.nodeId = nodes.len + 1
-            effectNode.nodeKind = CompilerCsgNodeKindEffect
-            effectNode.ownerNodeId = symbolNodeId
-            effectNode.modulePath = ownerModulePath
-            effectNode.symbolText = symbolText
-            effectNode.factText = Fmt"effect={effectKind}"
-            effectNode.resultLayoutKind = resultLayoutKind
-            effectNode.effectKind = effectKind
-            effectNode.capabilityKind = 0
-            effectNode.callConv = callConv
-            effectNode.entryFlag = entryFlag
-            effectNode.exportedFlag = 0
-            effectNode.exportSymbolName = ""
-            var effectBuf: layout.ByteBuf = layout.ByteBufInit(256)
-            CompilerCsgAppendText(effectBuf, "cheng.compiler.csg.node")
-            CompilerCsgAppendU32BE(effectBuf, effectNode.nodeKind)
-            CompilerCsgAppendU32BE(effectBuf, effectNode.ownerNodeId)
-            CompilerCsgAppendText(effectBuf, effectNode.modulePath)
-            CompilerCsgAppendText(effectBuf, effectNode.symbolText)
-            CompilerCsgAppendText(effectBuf, effectNode.factText)
-            CompilerCsgAppendU32BE(effectBuf, effectNode.resultLayoutKind)
-            CompilerCsgAppendU32BE(effectBuf, effectNode.effectKind)
-            CompilerCsgAppendU32BE(effectBuf, effectNode.capabilityKind)
-            CompilerCsgAppendU32BE(effectBuf, effectNode.callConv)
-            CompilerCsgAppendU32BE(effectBuf, effectNode.entryFlag)
-            CompilerCsgAppendU32BE(effectBuf, effectNode.exportedFlag)
-            CompilerCsgAppendText(effectBuf, effectNode.exportSymbolName)
-            effectNode.factCid = CompilerCsgBufCid(effectBuf)
-            add(nodes, effectNode)
-            CompilerCsgAddEdge(edges, symbolNodeId, effectNode.nodeId, CompilerCsgEdgeKindHasEffect)
-            var capabilityNode: CompilerCsgNode
-            capabilityNode.nodeId = nodes.len + 1
-            capabilityNode.nodeKind = CompilerCsgNodeKindCapability
-            capabilityNode.ownerNodeId = symbolNodeId
-            capabilityNode.modulePath = ownerModulePath
-            capabilityNode.symbolText = symbolText
-            capabilityNode.factText = Fmt"capability={capabilityKind}"
-            capabilityNode.resultLayoutKind = resultLayoutKind
-            capabilityNode.effectKind = effectKind
-            capabilityNode.capabilityKind = capabilityKind
-            capabilityNode.callConv = callConv
-            capabilityNode.entryFlag = entryFlag
-            capabilityNode.exportedFlag = 0
-            capabilityNode.exportSymbolName = ""
-            var capabilityBuf: layout.ByteBuf = layout.ByteBufInit(256)
-            CompilerCsgAppendText(capabilityBuf, "cheng.compiler.csg.node")
-            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.nodeKind)
-            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.ownerNodeId)
-            CompilerCsgAppendText(capabilityBuf, capabilityNode.modulePath)
-            CompilerCsgAppendText(capabilityBuf, capabilityNode.symbolText)
-            CompilerCsgAppendText(capabilityBuf, capabilityNode.factText)
-            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.resultLayoutKind)
-            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.effectKind)
-            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.capabilityKind)
-            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.callConv)
-            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.entryFlag)
-            CompilerCsgAppendU32BE(capabilityBuf, capabilityNode.exportedFlag)
-            CompilerCsgAppendText(capabilityBuf, capabilityNode.exportSymbolName)
-            capabilityNode.factCid = CompilerCsgBufCid(capabilityBuf)
-            add(nodes, capabilityNode)
-            CompilerCsgAddEdge(edges, symbolNodeId, capabilityNode.nodeId, CompilerCsgEdgeKindHasCapability)
+        profile.text = ""
+        profile.lines = []
+        exprCallProfiles[sourceIndex] = profile
+    exprCallProfiles = []
+    orderedSources = []
+    orderedSourceModules = []
     var typedExprFacts: TypedExprFact[]
     var typedErr = ""
+    os.ProcessResourceGuardCheck()
     if !texpr.TypedExprBuildFacts(typedSourceTexts, exprLayer, typedExprFacts, typedErr):
         if typedErr != "":
-            return Err[CompilerCsg](typedErr)
-        return Err[CompilerCsg](" compiler csg: typed expr build failed")
-    var loweringRules: texpr.TypedExprLoweringRule[]
-    var typedValidateErr = ""
-    if !texpr.TypedExprBuildLoweringRules(typedExprFacts, loweringRules, typedValidateErr):
-        return Err[CompilerCsg](Fmt" compiler csg: {typedValidateErr}")
-    var out: CompilerCsg
+            err = typedErr
+            return false
+        err = " compiler csg: typed expr build failed"
+        return false
+    typedSourceTexts = []
+    os.ProcessResourceGuardCheck()
+    let canonicalGraphCid = CompilerCsgCanonicalGraphCid(linkPlan.packageId,
+                                                          sourceBundleCid,
+                                                          linkPlan.workspaceRoot,
+                                                          linkPlan.packageRoot,
+                                                          externalPackageRoots,
+                                                          sourceTextOverrides,
+                                                          exprLayer,
+                                                          typedExprFacts,
+                                                          nodes,
+                                                          edges)
+    os.ProcessResourceGuardCheck()
+    let graphCid = CompilerCsgGraphCid(linkPlan.packageId,
+                                        sourceBundleCid,
+                                        linkPlan.workspaceRoot,
+                                        linkPlan.packageRoot,
+                                        externalPackageRoots,
+                                        sourceTextOverrides,
+                                        exprLayer,
+                                        typedExprFacts,
+                                        nodes,
+                                        edges)
     out.version = 1
     out.packageId = linkPlan.packageId
     out.sourceBundleCid = sourceBundleCid
@@ -1870,27 +1582,34 @@ fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
     out.edges = edges
     out.nodeCount = nodes.len
     out.edgeCount = edges.len
-    out.canonicalGraphCid = CompilerCsgCanonicalGraphCid(out.packageId,
-                                                           out.sourceBundleCid,
-                                                           linkPlan.workspaceRoot,
-                                                           linkPlan.packageRoot,
-                                                           linkPlan.externalPackageRoots,
-                                                           sourceTextOverrides,
-                                                           out.exprLayer,
-                                                           out.typedExprFacts,
-                                                           out.nodes,
-                                                           out.edges)
-    out.graphCid = CompilerCsgGraphCid(out.packageId,
-                                         out.sourceBundleCid,
-                                         linkPlan.workspaceRoot,
-                                         linkPlan.packageRoot,
-                                         linkPlan.externalPackageRoots,
-                                         sourceTextOverrides,
-                                         out.exprLayer,
-                                         out.typedExprFacts,
-                                         out.nodes,
-                                         out.edges)
+    out.canonicalGraphCid = canonicalGraphCid
+    out.graphCid = graphCid
+    return true
+
+fn BuildCompilerCsgWithOverrides(linkPlan: slplan.SystemLinkPlanStub,
+                                   sourceBundleCid: layout.FixedBytes32,
+                                   sourceTextOverrides: CompilerCsgSourceText[]): Result[CompilerCsg] =
+    var out: CompilerCsg
+    var err = ""
+    if !BuildCompilerCsgWithOverridesInto(linkPlan,
+                                          sourceBundleCid,
+                                          sourceTextOverrides,
+                                          out,
+                                          err):
+        return Err[CompilerCsg](err)
     return Ok[CompilerCsg](out)
+
+fn BuildCompilerCsgInto(linkPlan: slplan.SystemLinkPlanStub,
+                         sourceBundleCid: layout.FixedBytes32,
+                         out: var CompilerCsg,
+                         err: var str): bool =
+    var sourceTextOverrides: CompilerCsgSourceText[]
+    sourceTextOverrides = []
+    return BuildCompilerCsgWithOverridesInto(linkPlan,
+                                             sourceBundleCid,
+                                             sourceTextOverrides,
+                                             out,
+                                             err)
 
 fn BuildCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
                       sourceBundleCid: layout.FixedBytes32): Result[CompilerCsg] =
