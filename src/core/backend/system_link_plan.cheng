@@ -5,7 +5,6 @@ import cheng/core/tooling/compiler_request as creq
 import cheng/core/tooling/compiler_world as cworld
 import cheng/core/tooling/path as chengpath
 import cheng/core/lang/parser as parser
-import cheng/core/backend/build_plan as buildplan
 import cheng/core/backend/target_matrix as tmat
 
 type
@@ -173,22 +172,15 @@ fn SystemLinkPlanMissingReasons(parsed: parser.ParsedSourceStub,
                                   runtimeTargets: str[],
                                   providerModules: str[],
                                   entrySymbol: str): str[] =
-    var missing: str[]
-    if parsed.orderedClosureSourcePaths.len <= 0:
-        add(missing, "source_closure_missing")
-    if parsed.unresolvedImportCount > 0:
-        add(missing, "source_closure_unresolved_imports")
-    if !parsed.hasCompilerTopLevel:
-        add(missing, "compiler_top_level_missing")
-    if emitKind == creq.EmitExe && Len(entrySymbol) <= 0:
-        add(missing, "program_entry_symbol_missing")
-    if emitKind == creq.EmitExe && runtimeTargets.len <= 0:
-        add(missing, "runtime_targets_not_lowered")
-    if emitKind == creq.EmitExe &&
-       tmat.TargetRequiresNativeProviderModules(targetTriple) &&
-       providerModules.len <= 0:
-        add(missing, "runtime_provider_modules_not_selected")
-    return missing
+    let providerMissing = emitKind == creq.EmitExe &&
+                          tmat.TargetRequiresNativeProviderModules(targetTriple) &&
+                          providerModules.len <= 0
+    return parsed.orderedClosureSourcePaths.len <= 0 ? ["source_closure_missing"] :
+           (parsed.unresolvedImportCount > 0 ? ["source_closure_unresolved_imports"] :
+           (!parsed.hasCompilerTopLevel ? ["compiler_top_level_missing"] :
+           (emitKind == creq.EmitExe && Len(entrySymbol) <= 0 ? ["program_entry_symbol_missing"] :
+           (emitKind == creq.EmitExe && runtimeTargets.len <= 0 ? ["runtime_targets_not_lowered"] :
+           (providerMissing ? ["runtime_provider_modules_not_selected"] : [])))))
 
 fn BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir: str,
                                                               requestPackageRoot: str,
@@ -230,10 +222,11 @@ fn BuildSystemLinkPlanStubWithFieldsAndExternalPackageRoots(rootDir: str,
                                                  runtimeTargets,
                                                  providerModules,
                                                  entrySymbol)
-    let linkMode = buildplan.BackendBuildPlanDefaultLinkMode()
-    let buildSourceUnitCount = buildplan.BackendBuildPlanDefaultSourceUnitCount()
-    let parsedWorkspaceRoot = parser.ParsedSourceWorkspaceRoot(parsed)
-    let buildEntryPath = buildplan.BackendBuildPlanDefaultEntryPath(parsedWorkspaceRoot)
+    let linkMode = "system_link"
+    let buildSourceUnitCount = 42
+    let parsedWorkspaceRoot = parsed.workspaceRoot
+    let buildEntryPath = chengpath.PathJoin(parsedWorkspaceRoot,
+                                            "src/core/tooling/compiler_main.cheng")
     let sourceBundleCid = cworld.CompilerWorldSourceBundleCidWithExternalPackageRoots(parsed.packageId,
                                                                                        parsed.workspaceRoot,
                                                                                        parsed.packageRoot,
