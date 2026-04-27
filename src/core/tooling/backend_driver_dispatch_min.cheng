@@ -7,6 +7,7 @@ import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/direct_object_emit as direct
 import cheng/core/backend/system_link_plan as slplan
+import cheng/core/backend/line_map as linemap
 import cheng/core/tooling/compiler_csg as ccsg
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/tooling/path as chengpath
@@ -624,11 +625,13 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanCheckPrimaryReady(driver
     return BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterReady(driverRoot,
                                                                            reportPath,
                                                                            linkPlan,
+                                                                           loweringPlan,
                                                                            primaryPlan)
 
 fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterReady(driverRoot: str,
                                                                     reportPath: str,
                                                                     linkPlan: slplan.SystemLinkPlanStub,
+                                                                    loweringPlan: lower.LoweringPlanStub,
                                                                     primaryPlan: pobj.PrimaryObjectPlan): int32 =
     let planBrowserBridgeObjectPath = slplan.SystemLinkPlanBrowserBridgeObjectPath(linkPlan)
     if len(planBrowserBridgeObjectPath) > 0:
@@ -636,11 +639,13 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterReady(driverRoot: s
     return BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterBrowserReady(driverRoot,
                                                                                   reportPath,
                                                                                   linkPlan,
+                                                                                  loweringPlan,
                                                                                   primaryPlan)
 
 fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterBrowserReady(driverRoot: str,
                                                                            reportPath: str,
                                                                            linkPlan: slplan.SystemLinkPlanStub,
+                                                                           loweringPlan: lower.LoweringPlanStub,
                                                                            primaryPlan: pobj.PrimaryObjectPlan): int32 =
     BackendDriverDispatchMinProgress("direct_object_emit", "begin")
     let objectRes = direct.DirectObjectEmitStandaloneMain(driverRoot, primaryPlan)
@@ -667,6 +672,14 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterBrowserReady(driver
                                                                reportPath,
                                                                reason)
         return BackendDriverDispatchMinUnsupported(reason)
+    let lineMapRes = linemap.WriteExecutableLineMap(driverRoot, linkPlan, loweringPlan)
+    if IsErr(lineMapRes):
+        let reason = Error(lineMapRes)
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                               reportPath,
+                                                               reason)
+        return BackendDriverDispatchMinUnsupported(reason)
+    let lineMapPath = Value(lineMapRes)
     var exeReport = ""
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_execute=1")
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_no_runtime=1")
@@ -674,7 +687,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterBrowserReady(driver
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"primary_object={object.objectPath}")
     BackendDriverDispatchMinAppendLine(exeReport, "provider_object_count=0")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"native_link_log={nativeLinkLogPath}")
-    BackendDriverDispatchMinAppendLine(exeReport, "line_map=-")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"line_map={lineMapPath}")
     BackendDriverDispatchMinAppendLine(exeReport, "primary_object_direct=1")
     if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, exeReport):
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
