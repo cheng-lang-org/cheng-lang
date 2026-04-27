@@ -13,11 +13,29 @@ import cheng/core/lang/typed_expr as texpr
 type
     DirectObjectEmitResult =
         objectPath: str
+        outputKind: str
         bytesWritten: int32
         symbolCount: int32
         relocCount: int32
         directObjectLayoutMs: int64
         directObjectEmitMs: int64
+
+fn DirectObjectEmitOutputKindObject(): str =
+    return "object"
+
+fn DirectObjectEmitOutputKindExecutable(): str =
+    return "executable"
+
+fn DirectObjectEmitZeroMs(): int64 =
+    return int64(0)
+
+fn DirectObjectEmitResultReportText(result: DirectObjectEmitResult): str =
+    var out = Fmt"direct_object_output_kind={result.outputKind}"
+    out = Fmt"{out}\nexec_phase_direct_object_layout_ms={strings.Int64ToStr(result.directObjectLayoutMs)}"
+    out = Fmt"{out}\nexec_phase_direct_object_emit_ms={strings.Int64ToStr(result.directObjectEmitMs)}"
+    out = Fmt"{out}\ndirect_object_bytes={strings.IntToStr(result.bytesWritten)}"
+    out = Fmt"{out}\ndirect_object_reloc_count={strings.IntToStr(result.relocCount)}"
+    return out
 
 fn DirectObjectEmitTargetSupported(plan: pobj.PrimaryObjectPlan): bool =
     if plan.targetTriple == "arm64-apple-darwin" && plan.objectFormat == "macho":
@@ -41,9 +59,11 @@ fn DirectObjectEmitWriteObject(rootDir: str,
     let write = Value(writeRes)
     var out: DirectObjectEmitResult
     out.objectPath = write.objectPath
+    out.outputKind = DirectObjectEmitOutputKindObject()
     out.bytesWritten = write.bytesWritten
     out.symbolCount = write.symbolCount
     out.relocCount = write.relocCount
+    out.directObjectEmitMs = DirectObjectEmitZeroMs()
     return Ok[DirectObjectEmitResult](out)
 
 fn DirectObjectEmitWriteObjectTextOnly(rootDir: str,
@@ -61,14 +81,24 @@ fn DirectObjectEmitWriteObjectTextOnly(rootDir: str,
     let write = Value(writeRes)
     var out: DirectObjectEmitResult
     out.objectPath = write.objectPath
+    out.outputKind = DirectObjectEmitOutputKindObject()
     out.bytesWritten = write.bytesWritten
     out.symbolCount = write.symbolCount
     out.relocCount = write.relocCount
+    out.directObjectEmitMs = DirectObjectEmitZeroMs()
     return Ok[DirectObjectEmitResult](out)
 
 fn DirectObjectEmitRequireIndex(index: int32, label: str) =
     if index < 0:
         assert(false, label)
+
+fn DirectObjectEmitInstructionWordsMaterialized(plan: pobj.PrimaryObjectPlan): bool =
+    if plan.instructionWords.len <= 0:
+        return false
+    for i in 0..<plan.instructionWords.len:
+        if plan.instructionWords[i] == 0:
+            return false
+    return true
 
 fn DirectObjectEmitIsReturnI32ConstBodyKind(bodyKind: str): bool =
     return chengpath.TextStartsWith(bodyKind, texpr.BodyKindReturnI32ConstPrefix)
@@ -605,6 +635,8 @@ fn DirectObjectEmitStandaloneDataSectionAddr(plan: pobj.PrimaryObjectPlan): int3
 fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
     if !DirectObjectEmitTargetSupported(plan):
         return false
+    if !DirectObjectEmitInstructionWordsMaterialized(plan):
+        return false
     if Len(plan.outputPath) <= 0:
         return false
     if plan.missingReasons.len > 0:
@@ -757,9 +789,12 @@ fn DirectObjectEmitWasmMainModule(rootDir: str,
         return Err[DirectObjectEmitResult](Fmt" direct wasm emit: failed to write wasm module: {outputPath}")
     var out: DirectObjectEmitResult
     out.objectPath = outputPath
+    out.outputKind = "wasm_module"
     out.bytesWritten = rawbytes.BytesLen(bytes)
     out.symbolCount = functionLimit + importSymbols.len
     out.relocCount = 0
+    out.directObjectLayoutMs = DirectObjectEmitZeroMs()
+    out.directObjectEmitMs = DirectObjectEmitZeroMs()
     return Ok[DirectObjectEmitResult](out)
 
 fn DirectObjectEmitStandaloneText(plan: pobj.PrimaryObjectPlan): rawbytes.Bytes =
@@ -855,6 +890,53 @@ fn DirectObjectEmitStandaloneRelocs(plan: pobj.PrimaryObjectPlan,
                                              "direct object emit: add return str literal page reloc")
     return relocs
 
+fn DirectObjectEmitStandaloneEntryTextOffset(plan: pobj.PrimaryObjectPlan): int32 =
+    let functionLimit = DirectObjectEmitRealFunctionLimit(plan)
+    let entryIndex = DirectObjectEmitEntryFunctionIndex(plan, functionLimit)
+    if entryIndex < 0 || entryIndex >= plan.functionWordOffsets.len:
+        return -1
+    return plan.functionWordOffsets[entryIndex] * 4
+
+fn DirectObjectEmitValidateStandaloneExecutable(plan: pobj.PrimaryObjectPlan): Result[bool] =
+    let validRes = DirectObjectEmitValidateStandaloneMain(plan)
+    if IsErr(validRes):
+        return Err[bool](Error(validRes))
+    let entryTextOffset = DirectObjectEmitStandaloneEntryTextOffset(plan)
+    if entryTextOffset < 0:
+        return Err[bool](" direct object emit: executable missing entry offset")
+    let functionLimit = DirectObjectEmitRealFunctionLimit(plan)
+    if DirectObjectEmitPlanDataByteCount(plan, functionLimit) > 0:
+        return Err[bool](" direct object emit: executable data segment not implemented")
+    if plan.relocSourceItemIds.len > 0 ||
+       plan.relocWordOffsets.len > 0 ||
+       plan.relocTargetSymbols.len > 0:
+        return Err[bool](" direct object emit: executable relocations not implemented")
+    return Ok[bool](true)
+
+fn DirectObjectEmitStandaloneExecutable(rootDir: str,
+                                         plan: pobj.PrimaryObjectPlan,
+                                         outputPath: str): Result[DirectObjectEmitResult] =
+    let validRes = DirectObjectEmitValidateStandaloneExecutable(plan)
+    if IsErr(validRes):
+        return Err[DirectObjectEmitResult](Error(validRes))
+    if Len(outputPath) <= 0:
+        return Err[DirectObjectEmitResult](" direct object emit: executable missing output path")
+    let text = DirectObjectEmitStandaloneText(plan)
+    let entryTextOffset = DirectObjectEmitStandaloneEntryTextOffset(plan)
+    let writeRes = macho.MachOTextExecutableWrite(rootDir, outputPath, text, entryTextOffset)
+    if IsErr(writeRes):
+        return Err[DirectObjectEmitResult](Error(writeRes))
+    let write = Value(writeRes)
+    var out: DirectObjectEmitResult
+    out.objectPath = write.objectPath
+    out.outputKind = DirectObjectEmitOutputKindExecutable()
+    out.bytesWritten = write.bytesWritten
+    out.symbolCount = write.symbolCount
+    out.relocCount = write.relocCount
+    out.directObjectLayoutMs = DirectObjectEmitZeroMs()
+    out.directObjectEmitMs = DirectObjectEmitZeroMs()
+    return Ok[DirectObjectEmitResult](out)
+
 fn DirectObjectEmitWriteStandaloneMain(rootDir: str,
                                         plan: pobj.PrimaryObjectPlan): Result[DirectObjectEmitResult] =
     let text = DirectObjectEmitStandaloneText(plan)
@@ -867,9 +949,12 @@ fn DirectObjectEmitWriteStandaloneMain(rootDir: str,
     let write = Value(writeRes)
     var out: DirectObjectEmitResult
     out.objectPath = write.objectPath
+    out.outputKind = DirectObjectEmitOutputKindObject()
     out.bytesWritten = write.bytesWritten
     out.symbolCount = write.symbolCount
     out.relocCount = write.relocCount
+    out.directObjectLayoutMs = DirectObjectEmitZeroMs()
+    out.directObjectEmitMs = write.directObjectEmitMs
     return Ok[DirectObjectEmitResult](out)
 
 fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result[bool] =
@@ -877,6 +962,8 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
         return Ok[bool](true)
     if !DirectObjectEmitTargetSupported(plan):
         return Err[bool](Fmt" direct object emit: unsupported target: {plan.targetTriple}")
+    if !DirectObjectEmitInstructionWordsMaterialized(plan):
+        return Err[bool](" direct object emit: missing instruction words")
     if Len(plan.outputPath) <= 0:
         return Err[bool](" direct object emit: missing output path")
     if plan.missingReasons.len > 0:
@@ -920,7 +1007,6 @@ fn DirectObjectEmitValidateStandaloneMain(plan: pobj.PrimaryObjectPlan): Result[
 
 fn DirectObjectEmitCanPlanObject(plan: pobj.PrimaryObjectPlan): bool =
     return plan.objectFormat == "macho" &&
-           plan.instructionWords.len > 0 &&
            Len(plan.outputPath) > 0 &&
            plan.missingReasons.len <= 0
 
@@ -934,6 +1020,21 @@ fn DirectObjectEmitCanReturnZeroObject(plan: pobj.PrimaryObjectPlan): bool =
 
 fn DirectObjectEmitValidatePlanObject(plan: pobj.PrimaryObjectPlan): Result[bool] =
     if DirectObjectEmitCanPlanObject(plan):
+        if !DirectObjectEmitTargetSupported(plan):
+            return Err[bool](Fmt" direct object emit: unsupported target: {plan.targetTriple}")
+        if plan.symbolNames.len != plan.functionBodyKinds.len ||
+           plan.symbolNames.len != plan.functionWordCounts.len ||
+           plan.symbolNames.len != plan.functionWordOffsets.len:
+            return Err[bool](" direct object emit: malformed function symbol/word tables")
+        if !DirectObjectEmitInstructionWordsMaterialized(plan):
+            return Err[bool](" direct object emit: missing instruction words")
+        var requiredWords: int32
+        for i in 0..<plan.functionWordOffsets.len:
+            let endWord = plan.functionWordOffsets[i] + plan.functionWordCounts[i]
+            if endWord > requiredWords:
+                requiredWords = endWord
+        if requiredWords != plan.instructionWords.len:
+            return Err[bool](Fmt" direct object emit: instruction word count mismatch expected={strings.IntToStr(requiredWords)} actual={strings.IntToStr(plan.instructionWords.len)}")
         return Ok[bool](true)
     if !DirectObjectEmitTargetSupported(plan):
         return Err[bool](Fmt" direct object emit: unsupported target: {plan.targetTriple}")
@@ -975,6 +1076,17 @@ fn DirectObjectEmitPlanText(plan: pobj.PrimaryObjectPlan): rawbytes.Bytes =
         obuf.ObjectBufferWriteU8(text, (word >> 16) & 255)
         obuf.ObjectBufferWriteU8(text, (word >> 24) & 255)
     return obuf.ObjectBufferToBytes(text)
+
+fn DirectObjectEmitPlanDataByteCount(plan: pobj.PrimaryObjectPlan,
+                                      functionLimit: int32): int32 =
+    let _ = functionLimit
+    var total: int32
+    for i in 0..<plan.dataLabels.len:
+        var payloadText = ""
+        if i < plan.dataPayloadTexts.len:
+            payloadText = plan.dataPayloadTexts[i]
+        total = total + DirectObjectEmitPayloadByteCount(payloadText)
+    return total
 
 fn DirectObjectEmitPlanData(plan: pobj.PrimaryObjectPlan,
                              functionLimit: int32): rawbytes.Bytes =
@@ -1173,9 +1285,12 @@ fn DirectObjectEmitReturnZeroObject(rootDir: str,
     let write = Value(writeRes)
     var out: DirectObjectEmitResult
     out.objectPath = write.objectPath
+    out.outputKind = DirectObjectEmitOutputKindObject()
     out.bytesWritten = write.bytesWritten
     out.symbolCount = write.symbolCount
     out.relocCount = write.relocCount
+    out.directObjectLayoutMs = DirectObjectEmitZeroMs()
+    out.directObjectEmitMs = DirectObjectEmitZeroMs()
     return Ok[DirectObjectEmitResult](out)
 
 fn DirectObjectEmitPlanObject(rootDir: str,
@@ -1193,9 +1308,12 @@ fn DirectObjectEmitPlanObject(rootDir: str,
     let write = Value(writeRes)
     var out: DirectObjectEmitResult
     out.objectPath = write.objectPath
+    out.outputKind = DirectObjectEmitOutputKindObject()
     out.bytesWritten = write.bytesWritten
     out.symbolCount = write.symbolCount
     out.relocCount = write.relocCount
+    out.directObjectLayoutMs = DirectObjectEmitZeroMs()
+    out.directObjectEmitMs = write.directObjectEmitMs
     return Ok[DirectObjectEmitResult](out)
 
 fn DirectObjectEmitStandaloneMain(rootDir: str,

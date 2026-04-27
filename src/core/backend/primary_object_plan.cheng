@@ -555,6 +555,8 @@ fn PrimaryBodyIrTermReturnsI32Slot(term: coreir.BodyTerm,
         return false
     if term.resultSlot != slotIndex:
         return false
+    if term.operands.len == 0:
+        return true
     return term.operands.len == 1 &&
            term.operands[0] == coreir.LocalI32Tag
 
@@ -652,7 +654,8 @@ fn PrimaryBodyIrTermReturnsI32(term: coreir.BodyTerm,
         if term.resultSlot < 0 || term.resultSlot >= bodyIR.localSlots.len:
             return false
         return bodyIR.localSlots[term.resultSlot].typeKind == coreir.LocalI32Tag
-    return term.operands[0] == PrimaryStatementReturnModeI32Const()
+    return term.operands.len >= 2 &&
+           term.operands[0] == PrimaryStatementReturnModeI32Const()
 
 fn PrimaryBodyIrCbrConditionSupported(term: coreir.BodyTerm,
                                        bodyIR: coreir.BodyIR): bool =
@@ -3879,6 +3882,24 @@ fn PrimaryFillBackendDriverCommandDispatch(words: var int32[],
 fn PrimaryFunctionCodegenTaskPlanSerialJobCount(): int32 =
     return 1
 
+fn PrimaryParseBackendJobs(raw: str): int32 =
+    if Len(raw) <= 0:
+        return 1
+    var value: int32
+    for i in 0..<Len(raw):
+        let ch = raw[i]
+        if ch < '0' || ch > '9':
+            return -1
+        value = value * 10 + int32(ch) - int32('0')
+        if value > 1024:
+            return -1
+    if value <= 0:
+        return -1
+    return value
+
+fn PrimaryRequestedBackendJobs(): int32 =
+    return PrimaryParseBackendJobs(os.GetEnv("BACKEND_JOBS"))
+
 fn PrimaryBuildFunctionCodegenTaskPlan(functionBodyKinds: str[],
                                         functionStatementReturnModes: int32[],
                                         functionStatementReturnI32Values: int32[],
@@ -3886,8 +3907,16 @@ fn PrimaryBuildFunctionCodegenTaskPlan(functionBodyKinds: str[],
                                         functionWordOffsets: int32[],
                                         functionWordCounts: int32[]): PrimaryFunctionCodegenTaskPlan =
     var plan: PrimaryFunctionCodegenTaskPlan
-    plan.schedule = "serial_task_plan"
-    plan.jobCount = PrimaryFunctionCodegenTaskPlanSerialJobCount()
+    let requestedJobs = PrimaryRequestedBackendJobs()
+    if requestedJobs < 0:
+        plan.schedule = "invalid_backend_jobs"
+        plan.jobCount = -1
+    elif requestedJobs == PrimaryFunctionCodegenTaskPlanSerialJobCount():
+        plan.schedule = "serial_task_plan"
+        plan.jobCount = PrimaryFunctionCodegenTaskPlanSerialJobCount()
+    else:
+        plan.schedule = "parallel_requested_unavailable"
+        plan.jobCount = requestedJobs
     for i in 0..<functionBodyKinds.len:
         var task: PrimaryFunctionCodegenTask
         task.functionIndex = i
@@ -4388,7 +4417,11 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
             let bodyKind = lowering.primaryObjectIr.functions[irIndex].bodyKind
             let statementMode = lowering.primaryObjectIr.functions[irIndex].statementReturnMode
             let bodyIrRequiresCalls = PrimaryBodyIrRequiresCallSequence(lowering.primaryObjectIr.functions[irIndex].bodyIR)
-            if PrimaryBodyRequiresCallSequence(bodyKind, statementMode) || bodyIrRequiresCalls:
+            var frontierNeedsCallSequence = bodyIrRequiresCalls
+            if !frontierNeedsCallSequence:
+                if PrimaryBodyRequiresCallSequence(bodyKind, statementMode):
+                    frontierNeedsCallSequence = true
+            if frontierNeedsCallSequence:
                 var callSequenceReady = true
                 if lowering.primaryObjectIr.functions[irIndex].callSequence.len <= 0:
                     callSequenceReady = false
@@ -4475,9 +4508,12 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
             if irIndex < 0 || wordCounts[i] <= 0:
                 continue
             let bodyKind = lowering.primaryObjectIr.functions[irIndex].bodyKind
-            if PrimaryBodyRequiresCallSequence(bodyKind,
-                                               lowering.primaryObjectIr.functions[irIndex].statementReturnMode) ||
-               PrimaryBodyIrRequiresCallSequence(lowering.primaryObjectIr.functions[irIndex].bodyIR):
+            var sweepNeedsCallSequence = PrimaryBodyIrRequiresCallSequence(lowering.primaryObjectIr.functions[irIndex].bodyIR)
+            if !sweepNeedsCallSequence:
+                if PrimaryBodyRequiresCallSequence(bodyKind,
+                                                   lowering.primaryObjectIr.functions[irIndex].statementReturnMode):
+                    sweepNeedsCallSequence = true
+            if sweepNeedsCallSequence:
                 continue
             reachable[i] = true
     for i in 0..<lowering.functionNames.len:
@@ -4497,7 +4533,11 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
         let bodyKind = lowering.primaryObjectIr.functions[irIndex].bodyKind
         let statementMode = lowering.primaryObjectIr.functions[irIndex].statementReturnMode
         let bodyIrRequiresCalls = PrimaryBodyIrRequiresCallSequence(lowering.primaryObjectIr.functions[irIndex].bodyIR)
-        if PrimaryBodyRequiresCallSequence(bodyKind, statementMode) || bodyIrRequiresCalls:
+        var reachableNeedsCallSequence = bodyIrRequiresCalls
+        if !reachableNeedsCallSequence:
+            if PrimaryBodyRequiresCallSequence(bodyKind, statementMode):
+                reachableNeedsCallSequence = true
+        if reachableNeedsCallSequence:
             var callSequenceReady = true
             if lowering.primaryObjectIr.functions[irIndex].callSequence.len <= 0:
                 callSequenceReady = false
@@ -4592,7 +4632,11 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                 firstMissingTypedIrKind = PrimaryObjectMissingTypedIrKind(lowering, irIndex)
                 firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
             continue
-        if PrimaryBodyRequiresCallSequence(bodyKind, statementMode) || bodyIrRequiresCalls:
+        var wordNeedsCallSequence = bodyIrRequiresCalls
+        if !wordNeedsCallSequence:
+            if PrimaryBodyRequiresCallSequence(bodyKind, statementMode):
+                wordNeedsCallSequence = true
+        if wordNeedsCallSequence:
             var requiredCallCount = PrimaryStatementSequenceRequiredCallCount(statementMode)
             if bodyIrRequiresCalls:
                 requiredCallCount = lowering.primaryObjectIr.functions[irIndex].callSequence.len
@@ -4625,6 +4669,32 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
         if bodyIrStatementModeForPlan != PrimaryStatementReturnModeNone():
             planStatementMode = bodyIrStatementModeForPlan
             planStatementI32Value = PrimaryBodyIrStatementI32Value(lowering.primaryObjectIr.functions[irIndex].bodyIR)
+        var planNeedsCallSequence = bodyIrRequiresCalls
+        if !planNeedsCallSequence:
+            if PrimaryBodyRequiresCallSequence(bodyKind, planStatementMode):
+                planNeedsCallSequence = true
+        if planNeedsCallSequence:
+            var planRequiredCallCount = PrimaryStatementSequenceRequiredCallCount(planStatementMode)
+            if bodyIrRequiresCalls:
+                planRequiredCallCount = lowering.primaryObjectIr.functions[irIndex].callSequence.len
+            elif planRequiredCallCount <= 0:
+                planRequiredCallCount = 1
+                if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+                    planRequiredCallCount = 2
+                elif bodyKind == texpr.BodyKindBackendDriverRootFromCmdline:
+                    planRequiredCallCount = 3
+                elif bodyKind == texpr.BodyKindBackendDriverCommandDispatch:
+                    planRequiredCallCount = 6
+                elif bodyKind == texpr.BodyKindResultRequestDispatch:
+                    planRequiredCallCount = 2
+            if lowering.primaryObjectIr.functions[irIndex].callSequence.len < planRequiredCallCount:
+                bodySemanticsMissing = true
+                if Len(firstMissingFunction) <= 0:
+                    firstMissingFunction = lowering.functionNames[i]
+                    firstMissingBodyKind = "missing_call_sequence"
+                    firstMissingTypedIrKind = ""
+                    firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                continue
         add(itemIds, itemId)
         add(symbolNames, allSymbolNames[i])
         add(functionWordOffsets, wordOffset)
@@ -4684,7 +4754,11 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
             if !PrimaryStringSeqHas(plan.dataLabels, literalLabel):
                 add(plan.dataLabels, literalLabel)
                 add(plan.dataPayloadTexts, Fmt"cstring:{lowering.primaryObjectIr.functions[irIndex].returnStringLiteral}")
-        if PrimaryBodyRequiresCallSequence(bodyKind, planStatementMode) || bodyIrRequiresCalls:
+        var relocNeedsCallSequence = bodyIrRequiresCalls
+        if !relocNeedsCallSequence:
+            if PrimaryBodyRequiresCallSequence(bodyKind, planStatementMode):
+                relocNeedsCallSequence = true
+        if relocNeedsCallSequence:
             var relocCallCount = PrimaryStatementSequenceRequiredCallCount(planStatementMode)
             if bodyIrRequiresCalls:
                 relocCallCount = lowering.primaryObjectIr.functions[irIndex].callSequence.len
@@ -4699,6 +4773,14 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                 elif bodyKind == texpr.BodyKindResultRequestDispatch:
                     relocCallCount = 2
             for callOrdinal in 0..<relocCallCount:
+                if callOrdinal >= lowering.primaryObjectIr.functions[irIndex].callSequence.len:
+                    bodySemanticsMissing = true
+                    if Len(firstMissingFunction) <= 0:
+                        firstMissingFunction = lowering.functionNames[i]
+                        firstMissingBodyKind = "missing_call_sequence"
+                        firstMissingTypedIrKind = ""
+                        firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                    break
                 let callOp = lowering.primaryObjectIr.functions[irIndex].callSequence[callOrdinal]
                 var targetSymbol = ""
                 if callOp.importc:
@@ -4795,6 +4877,13 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                                                               functionStatementCallCounts,
                                                               functionWordOffsets,
                                                               functionWordCounts)
+    if functionTaskPlan.jobCount != PrimaryFunctionCodegenTaskPlanSerialJobCount():
+        bodySemanticsMissing = true
+        if Len(firstMissingFunction) <= 0:
+            firstMissingFunction = "BACKEND_JOBS"
+            firstMissingBodyKind = functionTaskPlan.schedule
+            firstMissingTypedIrKind = ""
+            firstMissingLineNumber = 0
     for taskIndex in 0..<functionTaskPlan.tasks.len:
         if taskIndex % 64 == 0:
             os.ProcessResourceGuardCheck()

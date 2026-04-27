@@ -1,5 +1,6 @@
 # Lessons
 
+- 2026-04-27: 纯 Cheng 自举任务中，C seed forced build 只能在 artifact 完全不可用时做一次明确恢复；不能在同一轮修复中反复刷新 backend_driver 来推进问题。后续定位和验收必须只用 `artifacts/backend_driver/cheng system-link-exec` / 纯 `build-backend-driver` 路径。
 - 2026-04-27: `runtime/native` 是遗留 C runtime 源目录；新增运行时桥必须先落到 `src/core/runtime/*provider*.cheng` 纯 Cheng provider，并同步 direct runtime export roots，不能继续扩展 C 源。
 - 2026-04-27: 顶层 `runtime/` 目录属于旧 C/头文件 runtime surface；纯 Cheng 主线只保留 `src/core/runtime` provider 和 `src/runtime` Cheng 包源码，顶层目录回潮要由 compiler runtime audit 硬报。
 - 2026-04-27: RSS 守卫里的 process-group 语义必须按进程组求和；不能用单 pid RSS bridge 替代，否则会低估编译器子进程内存。
