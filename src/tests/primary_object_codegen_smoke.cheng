@@ -206,10 +206,67 @@ fn main(): int32 =
            " primary object codegen smoke: let-call body ir local name")
     assert(letCallIrFunction.bodyIR.localSlots[0].typeKind == ir.LocalI32Tag,
            " primary object codegen smoke: let-call body ir local type")
+    assert(letCallIrFunction.bodyIR.localSlots[0].noAlias,
+           " primary object codegen smoke: let-call body ir local no alias")
     assert(letCallIrFunction.callSequence[0].resultSlot == letCallIrFunction.bodyIR.localSlots[0].id,
            " primary object codegen smoke: let-call call result local")
     assert(!strutil.Contains(strutil.Join(letCallPrimary.functionBodyKinds, ","), "return_call_noarg_i32"),
            " primary object codegen smoke: let-call no false return call")
+    let cfgReq = creq.CompilerRequestNew(
+        rootDir,
+        os.JoinPath(rootDir, "src/tests/cfg_guard_return_direct_object_smoke.cheng"),
+        os.JoinPath(rootDir, "artifacts/zero_exit/cfg_guard_return_direct_object_smoke.o"),
+        "arm64-apple-darwin",
+        creq.EmitObj,
+        ""
+    )
+    var cfgLinkPlan: slplan.SystemLinkPlanStub
+    assert(slplan.BuildSystemLinkPlanStub(rootDir, cfgReq, cfgLinkPlan, err),
+           " primary object codegen smoke: cfg link plan")
+    var cfgLoweringPlan: lower.LoweringPlanStub
+    assert(lower.BuildLoweringPlanStub(cfgLinkPlan, cfgLoweringPlan, err),
+           " primary object codegen smoke: cfg lowering plan")
+    let cfgPrimary = pobj.BuildPrimaryObjectPlan(cfgLinkPlan, cfgLoweringPlan)
+    assert(cfgPrimary.missingReasons.len == 0,
+           " primary object codegen smoke: cfg missing reasons")
+    var cfgIndex = -1
+    for functionIndex in 0..<cfgPrimary.functionBodyIRs.len:
+        if pobj.PrimaryBodyIrIsCallCfgReturnInt32(cfgPrimary.functionBodyIRs[functionIndex]):
+            cfgIndex = functionIndex
+    assert(cfgIndex >= 0,
+           " primary object codegen smoke: cfg function index")
+    let cfgBodyIR = cfgPrimary.functionBodyIRs[cfgIndex]
+    assert(cfgBodyIR.blocks.len == 3,
+           " primary object codegen smoke: cfg block count")
+    assert(cfgBodyIR.terms.len == 3,
+           " primary object codegen smoke: cfg term count")
+    assert(cfgBodyIR.blocks[0].opCount == 1,
+           " primary object codegen smoke: cfg entry op count")
+    assert(cfgBodyIR.terms[cfgBodyIR.blocks[0].termIndex].kind == ir.BodyTermCbrTag,
+           " primary object codegen smoke: cfg entry cbr")
+    assert(cfgBodyIR.terms[cfgBodyIR.blocks[1].termIndex].kind == ir.BodyTermReturnTag,
+           " primary object codegen smoke: cfg true return")
+    assert(cfgBodyIR.terms[cfgBodyIR.blocks[2].termIndex].kind == ir.BodyTermReturnTag,
+           " primary object codegen smoke: cfg false return")
+    assert(cfgBodyIR.localSlots.len == 1,
+           " primary object codegen smoke: cfg local count")
+    assert(cfgBodyIR.localSlots[0].noAlias,
+           " primary object codegen smoke: cfg local no alias")
+    assert(pobj.PrimaryBodyIrWordCount(cfgBodyIR) == cfgPrimary.functionWordCounts[cfgIndex],
+           " primary object codegen smoke: cfg word count")
+    assert(cfgPrimary.relocWordOffsets.len == 1,
+           " primary object codegen smoke: cfg reloc count")
+    assert(cfgPrimary.relocWordOffsets[0] == cfgPrimary.functionWordOffsets[cfgIndex] + 2,
+           " primary object codegen smoke: cfg reloc offset")
+    let cfgAsmRes = pemit.PrimaryObjectEmitObjectAsmText(cfgPrimary)
+    assert(IsOk(cfgAsmRes), " primary object codegen smoke: cfg asm fallback")
+    let cfgAsm = Value(cfgAsmRes)
+    assert(strutil.Contains(cfgAsm, "L_cheng_body_ir_cfg_"),
+           " primary object codegen smoke: cfg asm label")
+    assert(strutil.Contains(cfgAsm, "mov w0, #7"),
+           " primary object codegen smoke: cfg asm true return")
+    assert(strutil.Contains(cfgAsm, "mov w0, #3"),
+           " primary object codegen smoke: cfg asm false return")
     let multiStmtReq = creq.CompilerRequestNew(
         rootDir,
         os.JoinPath(rootDir, "src/tests/multi_stmt_i32_guard_direct_object_smoke.cheng"),
