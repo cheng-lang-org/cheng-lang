@@ -238,7 +238,15 @@
 - pure self-build 报 `body_ir_call_ops_...` 且函数包含错误分支/早返回时，不能靠扩大帧或当直线 call sequence 放行；下一段必须 lowering 成 guard/return CFG，否则会无条件执行失败分支。
 - 未跟踪文件也要先确认归属；不是自己明确创建或被用户指定处理的文件，不能删除、重命名或重写。误删后先原样恢复，再继续自己的范围。
 - 外部并行编译/构建不属于当前验证链路时，不要等待；只确认是否争用同一安装产物或同一报告路径，自己的命令照跑，真实冲突交给工具链硬失败暴露。
+- 自举热路径为避开尚未闭环的字符串比较时，不能用“长度+首字符”这种启发式；必须写 exact char compare，先判长度再逐字符比较，既不复制字符串也不放宽语义。
+- BodyIR 条件分支里 `rhsSlot = -1` 表示和字面量 0 比较；默认 0 是本地槽 0，lowering 若忘记设置会把 `x <= 0` 错降成 `x <= x`。
+- BodyIR 里新增 data side table 或新 op 时，writer 未消费前必须算作语义表面并给出明确 missing kind；不能让 `cstringLiterals`、`BodyOpStrEqLiteralTag` 这类半截链路静默落到 fallback 或 `invalid`。
+- BodyIR CFG 的 predicate、word count、reloc offset、emit 必须消费同一个 op 语义集合；支持 local op 时计数优先走 `PrimaryBodyIrOpWordCount`，不要在 word count 里另复制 call/project 分支后漏掉 local write。
 - pure self 探针长时间停在 `compiler_csg` 时，先用 `sample` 抓当前安装产物的调用栈；本轮证据显示热点在 `ParserLineStartsWithStatementKeyword -> PathTrim/Strip -> NewStringCopy`，应优先改成索引范围比较，避免每行每关键字反复分配。
 - CSG 不是 AST 的替代品，也不能持有整棵 AST 副本；AST/NormalizedExpr/typed facts 只提供 source-local 事实，canonical CSG 只保存跨模块节点、边、CID、可达性和能力摘要。当前 `CompilerCsg` 若暂挂 backend side table，必须把它当可拆的借用式编译上下文，发现热路径复制源码、复制 AST/facts 或按 source 反复重建可见名索引时，先改成共享 cache/索引和 source span 引用。
 - 等价快速自举不能新增一条跳过语义的 `fast/bootstrap` 入口；它必须复用同一个 `system-link-exec` 语义闭包，只减少重复构建、重复读源码、重复建 facts/TypedIR，并用 A 编 B、B 编同入口的纯链路证明。当前安装 driver 若在 primary 阶段 bounds 崩溃，先修通用 caller-saved/reload codegen 或刷新真实纯候选，不能靠改入口形状、cache hit 或热补丁冒充完成。
 - `system_link_exec` 这种大闭包导入 smoke 不适合作为每步短验证；它会把验证重新拖进 `system_link_plan/compiler_csg` 长跑。修改该路径时先跑 `git diff --check`、`status`、小型 direct fixture；需要覆盖源码导入时只在采样或候选刷新窗口跑，且先清理遗留 self-build 进程。
+- 纯 Cheng gate 也不能导入 backend plan/lowering/primary 三层后当短 smoke；这会把每步验证拉回大闭包编译。CFG 每步短验优先跑小 fixture 本体，聚合 gate 只作为候选刷新窗口的重验入口。
+- 直接 import `primary_object_plan` 的合同 smoke 也不是每步短验；即使不 import `primary_object_emit`，当前最小 driver 仍会在 `system_link_plan` 长跑。把这类合同放到候选刷新窗口，小步验证只跑 provider-free direct fixture。
+- 函数级并行不能把单线程队列、协作 `spawn` 或 queue 分配失败后的串行执行称为 work-stealing；`BACKEND_JOBS>1` 在真实 OS worker、真实 atomic CAS 和跨线程 ORC 之前必须硬失败。
+- primary codegen 任务要先产 task-local words，再由主线程按声明序稳定 merge；worker 不能直接抢写共享 `instructionWords` 来绕过确定性合同。

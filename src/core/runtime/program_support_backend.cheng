@@ -306,6 +306,13 @@ type
         relayOnly: bool
         sessionId: ChengFixedBytes32
         signalWire: str
+    ChengTask =
+        fn_ptr: ptr
+        ctx: ptr
+        next: ptr
+    ChengTaskI32 =
+        fn_ptr: ptr
+        ctx: int32
 
 type
     Int32Ptr = int32 *
@@ -316,6 +323,8 @@ type
     ChengSeqHeaderPtr = ChengSeqHeader *
     ChengMemHeaderPtr = ChengMemHeader *
     ChengFfiHandleSlotPtr = ChengFfiHandleSlot *
+    ChengTaskPtr = ChengTask *
+    ChengTaskI32Ptr = ChengTaskI32 *
     ChengTailnetProviderRuntimePtr = ChengTailnetProviderRuntime *
     ChengRelayProviderRuntimePtr = ChengRelayProviderRuntime *
     ChengWebrtcBrowserSessionStatePtr = ChengWebrtcBrowserSessionState *
@@ -336,6 +345,15 @@ var
     cheng_mem_registry_len_pad: int32
     cheng_mem_registry_dead: int32
     cheng_mem_registry_dead_pad: int32
+    cheng_runtime_lock_word: int32
+    cheng_runtime_lock_owner: ptr
+    cheng_runtime_lock_depth: int32
+    cheng_sched_count: int32
+    cheng_sched_count_pad: int32
+    cheng_thread_local_i32_slot0: int32
+    cheng_thread_local_i32_slot1: int32
+    cheng_thread_local_i32_slot2: int32
+    cheng_thread_local_i32_slot3: int32
     cheng_mm_retain_total: int64
     cheng_mm_release_total: int64
     cheng_mm_alloc_total: int64
@@ -378,6 +396,49 @@ var
     cheng_stdio_out: ptr
     cheng_stdio_err: ptr
     cheng_getcwd_buf: ptr
+
+@importc("OSAtomicCompareAndSwap32Barrier")
+fn cheng_os_atomic_cas_i32_runtime(oldValue: int32, newValue: int32, value: ptr): int32
+
+@importc("OSAtomicAdd32Barrier")
+fn cheng_os_atomic_add_i32_runtime(amount: int32, value: ptr): int32
+
+@importc("pthread_self")
+fn cheng_pthread_self_runtime(): ptr
+
+@importc("pthread_create")
+fn cheng_pthread_create_runtime(threadOut: ptr, attr: ptr, startRoutine: ptr, arg: ptr): int32
+
+@importc("pthread_detach")
+fn cheng_pthread_detach_runtime(thread: ptr): int32
+
+@importc("sched_yield")
+fn cheng_sched_yield_runtime(): int32
+
+@importc("__cheng_call_indirect_void")
+fn __cheng_call_indirect_void_runtime(fn_ptr: ptr, ctx: ptr)
+
+@importc("__cheng_call_indirect_i32")
+fn __cheng_call_indirect_i32_runtime(fn_ptr: ptr, ctx: int64, a: int32, b: int32): int32
+
+fn cheng_runtime_lock() =
+    let self = cheng_pthread_self_runtime()
+    if cheng_runtime_lock_owner == self && cheng_runtime_lock_depth > 0:
+        cheng_runtime_lock_depth = cheng_runtime_lock_depth + 1
+        return
+    while cheng_os_atomic_cas_i32_runtime(0, 1, ptr(&cheng_runtime_lock_word)) == 0:
+        let _ = cheng_sched_yield_runtime()
+    cheng_runtime_lock_owner = self
+    cheng_runtime_lock_depth = 1
+
+fn cheng_runtime_unlock() =
+    let self = cheng_pthread_self_runtime()
+    if cheng_runtime_lock_owner != self || cheng_runtime_lock_depth <= 0:
+        return
+    cheng_runtime_lock_depth = cheng_runtime_lock_depth - 1
+    if cheng_runtime_lock_depth == 0:
+        cheng_runtime_lock_owner = nil
+        cheng_os_atomic_cas_i32_runtime(1, 0, ptr(&cheng_runtime_lock_word))
 
 fn cheng_af_inet(): int32 =
     return native_cheng_af_inet_runtime()
@@ -2006,12 +2067,14 @@ fn probe_ensure_capacity(minCap: int32): bool =
 
 @exportc("cheng_malloc")
 fn cheng_malloc_export(size0: int32): ptr =
+    cheng_runtime_lock()
     var size: int32 = size0
     if size <= 0:
         size = 1
     let total: int64 = int64(sizeof(ChengMemHeader)) + int64(size)
     let raw: ptr = c_malloc(total)
     if raw == nil:
+        cheng_runtime_unlock()
         return nil
     let header: ChengMemHeaderPtr = ChengMemHeaderPtr(raw)
     header->rc = 1
@@ -2020,47 +2083,59 @@ fn cheng_malloc_export(size0: int32): ptr =
     let insertOk = cheng_mem_registry_insert(payload)
     if !insertOk:
         c_free(raw)
+        cheng_runtime_unlock()
         return nil
     cheng_bytes_set(payload, 0, size)
     cheng_mm_alloc_total = cheng_mm_alloc_total + 1
     cheng_mm_live_total = cheng_mm_live_total + 1
+    cheng_runtime_unlock()
     return payload
 
 @exportc("cheng_free")
 fn cheng_free_export(p: ptr) =
+    cheng_runtime_lock()
     let header: ChengMemHeaderPtr = cheng_mem_header(p)
     if header == nil:
+        cheng_runtime_unlock()
         return
     cheng_mem_registry_remove(p)
     c_free(ptr(header))
     cheng_mm_free_total = cheng_mm_free_total + 1
     if cheng_mm_live_total > 0:
         cheng_mm_live_total = cheng_mm_live_total - 1
+    cheng_runtime_unlock()
 
 @exportc("cheng_realloc")
 fn cheng_realloc_export(p: ptr, size0: int32): ptr =
+    cheng_runtime_lock()
     if p == nil:
-        return cheng_malloc_export(size0)
+        let freshNil: ptr = cheng_malloc_export(size0)
+        cheng_runtime_unlock()
+        return freshNil
     var size: int32 = size0
     if size <= 0:
         size = 1
     let header: ChengMemHeaderPtr = cheng_mem_header(p)
     if header == nil:
+        cheng_runtime_unlock()
         return nil
     if header->rc > 1:
         let fresh: ptr = cheng_malloc_export(size)
         if fresh == nil:
+            cheng_runtime_unlock()
             return nil
         var copyBytes: int32 = header->size
         if copyBytes > size:
             copyBytes = size
         if copyBytes > 0:
             cheng_bytes_copy(fresh, p, copyBytes)
-        header->rc = header->rc - 1
+        cheng_mem_release_export(p)
+        cheng_runtime_unlock()
         return fresh
     let total: int64 = int64(sizeof(ChengMemHeader)) + int64(size)
     let raw: ptr = c_realloc(ptr(header), total)
     if raw == nil:
+        cheng_runtime_unlock()
         return nil
     let nextHeader: ChengMemHeaderPtr = ChengMemHeaderPtr(raw)
     if size > nextHeader->size:
@@ -2072,31 +2147,38 @@ fn cheng_realloc_export(p: ptr, size0: int32): ptr =
         cheng_mem_registry_remove(p)
         let insertOk = cheng_mem_registry_insert(nextPayload)
         if !insertOk:
+            cheng_runtime_unlock()
             return nil
+    cheng_runtime_unlock()
     return nextPayload
 
 @exportc("cheng_mem_retain")
 fn cheng_mem_retain_export(p: ptr) =
+    cheng_runtime_lock()
     let header: ChengMemHeaderPtr = cheng_mem_header(p)
     if header == nil:
+        cheng_runtime_unlock()
         return
-    header->rc = header->rc + 1
+    header->rc = cheng_os_atomic_add_i32_runtime(1, ptr(&header->rc))
     cheng_mm_retain_total = cheng_mm_retain_total + 1
+    cheng_runtime_unlock()
 
 @exportc("cheng_mem_release")
 fn cheng_mem_release_export(p: ptr) =
+    cheng_runtime_lock()
     let header: ChengMemHeaderPtr = cheng_mem_header(p)
     if header == nil:
+        cheng_runtime_unlock()
         return
-    if header->rc > 0:
-        header->rc = header->rc - 1
+    let rcAfter = cheng_os_atomic_add_i32_runtime(-1, ptr(&header->rc))
     cheng_mm_release_total = cheng_mm_release_total + 1
-    if header->rc <= 0:
+    if rcAfter <= 0:
         cheng_mem_registry_remove(p)
         c_free(ptr(header))
         cheng_mm_free_total = cheng_mm_free_total + 1
         if cheng_mm_live_total > 0:
             cheng_mm_live_total = cheng_mm_live_total - 1
+    cheng_runtime_unlock()
 
 @exportc("cheng_mem_scope_escape")
 fn cheng_mem_scope_escape_export(p: ptr) =
@@ -2108,10 +2190,14 @@ fn cheng_mem_scope_escape_global_export(p: ptr) =
 
 @exportc("cheng_mem_refcount")
 fn cheng_mem_refcount_export(p: ptr): int32 =
+    cheng_runtime_lock()
     let header: ChengMemHeaderPtr = cheng_mem_header(p)
     if header == nil:
+        cheng_runtime_unlock()
         return 0
-    return header->rc
+    let rc = cheng_os_atomic_add_i32_runtime(0, ptr(&header->rc))
+    cheng_runtime_unlock()
+    return rc
 
 @exportc("cheng_mem_retain_atomic")
 fn cheng_mem_retain_atomic_export(p: ptr) =
@@ -2127,28 +2213,177 @@ fn cheng_mem_refcount_atomic_export(p: ptr): int32 =
 
 @exportc("cheng_mm_retain_count")
 fn cheng_mm_retain_count_export(): int64 =
-    return cheng_mm_retain_total
+    cheng_runtime_lock()
+    let count = cheng_mm_retain_total
+    cheng_runtime_unlock()
+    return count
 
 @exportc("cheng_mm_release_count")
 fn cheng_mm_release_count_export(): int64 =
-    return cheng_mm_release_total
+    cheng_runtime_lock()
+    let count = cheng_mm_release_total
+    cheng_runtime_unlock()
+    return count
 
 @exportc("cheng_mm_alloc_count")
 fn cheng_mm_alloc_count_export(): int64 =
-    return cheng_mm_alloc_total
+    cheng_runtime_lock()
+    let count = cheng_mm_alloc_total
+    cheng_runtime_unlock()
+    return count
 
 @exportc("cheng_mm_free_count")
 fn cheng_mm_free_count_export(): int64 =
-    return cheng_mm_free_total
+    cheng_runtime_lock()
+    let count = cheng_mm_free_total
+    cheng_runtime_unlock()
+    return count
 
 @exportc("cheng_mm_live_count")
 fn cheng_mm_live_count_export(): int64 =
-    return cheng_mm_live_total
+    cheng_runtime_lock()
+    let count = cheng_mm_live_total
+    cheng_runtime_unlock()
+    return count
 
 @exportc("cheng_mm_diag_reset")
 fn cheng_mm_diag_reset_export() =
+    cheng_runtime_lock()
     cheng_mm_retain_total = 0
     cheng_mm_release_total = 0
+    cheng_runtime_unlock()
+
+@exportc("cheng_atomic_cas_i32")
+fn cheng_atomic_cas_i32_export(p: ptr, expect: int32, desired: int32): int32 =
+    if p == nil:
+        return 0
+    return cheng_os_atomic_cas_i32_runtime(expect, desired, p)
+
+@exportc("cheng_atomic_store_i32")
+fn cheng_atomic_store_i32_export(p: ptr, val: int32) =
+    if p == nil:
+        return
+    while true:
+        let oldValue = cheng_os_atomic_add_i32_runtime(0, p)
+        if cheng_os_atomic_cas_i32_runtime(oldValue, val, p) != 0:
+            return
+        let _ = cheng_sched_yield_runtime()
+
+@exportc("cheng_atomic_load_i32")
+fn cheng_atomic_load_i32_export(p: ptr): int32 =
+    if p == nil:
+        return 0
+    return cheng_os_atomic_add_i32_runtime(0, p)
+
+fn cheng_thread_entry_runtime(raw: ptr): ptr =
+    if raw == nil:
+        return nil
+    let task: ChengTaskPtr = ChengTaskPtr(raw)
+    let fnPtr: ptr = task->fn_ptr
+    let ctx: ptr = task->ctx
+    c_free(raw)
+    if fnPtr != nil:
+        __cheng_call_indirect_void_runtime(fnPtr, ctx)
+    return nil
+
+fn cheng_thread_entry_i32_runtime(raw: ptr): ptr =
+    if raw == nil:
+        return nil
+    let task: ChengTaskI32Ptr = ChengTaskI32Ptr(raw)
+    let fnPtr: ptr = task->fn_ptr
+    let ctx: int32 = task->ctx
+    c_free(raw)
+    if fnPtr != nil:
+        let _ = __cheng_call_indirect_i32_runtime(fnPtr, int64(ctx), 0, 0)
+    return nil
+
+@exportc("cheng_thread_spawn")
+fn cheng_thread_spawn_export(fnPtr: ptr, ctx: ptr): int32 =
+    if fnPtr == nil:
+        return 0
+    let mem: ptr = c_malloc(int64(sizeof(ChengTask)))
+    if mem == nil:
+        return 0
+    let task: ChengTaskPtr = ChengTaskPtr(mem)
+    task->fn_ptr = fnPtr
+    task->ctx = ctx
+    task->next = nil
+    var thread: ptr
+    let createStatus = cheng_pthread_create_runtime(ptr(&thread), nil, &cheng_thread_entry_runtime, mem)
+    if createStatus != 0:
+        c_free(mem)
+        return 0
+    if cheng_pthread_detach_runtime(thread) != 0:
+        return 0
+    return 1
+
+@exportc("cheng_spawn")
+fn cheng_spawn_export(fnPtr: ptr, ctx: ptr) =
+    if cheng_thread_spawn_export(fnPtr, ctx) == 0:
+        let _ = c_puts_runtime("cheng_thread_spawn_failed")
+        c_exit_runtime(1)
+
+@exportc("cheng_thread_spawn_i32")
+fn cheng_thread_spawn_i32_export(fnPtr: ptr, ctx: int32): int32 =
+    if fnPtr == nil:
+        return 0
+    let mem: ptr = c_malloc(int64(sizeof(ChengTaskI32)))
+    if mem == nil:
+        return 0
+    let task: ChengTaskI32Ptr = ChengTaskI32Ptr(mem)
+    task->fn_ptr = fnPtr
+    task->ctx = ctx
+    var thread: ptr
+    let createStatus = cheng_pthread_create_runtime(ptr(&thread), nil, &cheng_thread_entry_i32_runtime, mem)
+    if createStatus != 0:
+        c_free(mem)
+        return 0
+    if cheng_pthread_detach_runtime(thread) != 0:
+        return 0
+    return 1
+
+@exportc("cheng_thread_parallelism")
+fn cheng_thread_parallelism_export(): int32 =
+    return native_cheng_system_cpu_logical_cores_value_runtime()
+
+@exportc("cheng_thread_yield")
+fn cheng_thread_yield_export() =
+    let _ = cheng_sched_yield_runtime()
+
+@exportc("cheng_sched_pending")
+fn cheng_sched_pending_export(): int32 =
+    return cheng_sched_count
+
+@exportc("cheng_sched_run_once")
+fn cheng_sched_run_once_export(): int32 =
+    return 0
+
+@exportc("cheng_sched_run")
+fn cheng_sched_run_export() =
+    return
+
+@exportc("cheng_thread_local_i32_get")
+fn cheng_thread_local_i32_get_export(slot: int32): int32 =
+    if slot == 0:
+        return cheng_thread_local_i32_slot0
+    if slot == 1:
+        return cheng_thread_local_i32_slot1
+    if slot == 2:
+        return cheng_thread_local_i32_slot2
+    if slot == 3:
+        return cheng_thread_local_i32_slot3
+    return 0
+
+@exportc("cheng_thread_local_i32_set")
+fn cheng_thread_local_i32_set_export(slot: int32, value: int32) =
+    if slot == 0:
+        cheng_thread_local_i32_slot0 = value
+    elif slot == 1:
+        cheng_thread_local_i32_slot1 = value
+    elif slot == 2:
+        cheng_thread_local_i32_slot2 = value
+    elif slot == 3:
+        cheng_thread_local_i32_slot3 = value
 
 @exportc("alloc")
 fn alloc_export(size: int32): ptr =

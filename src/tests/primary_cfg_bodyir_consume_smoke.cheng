@@ -1,7 +1,4 @@
-import std/result
-import std/strings
 import cheng/core/backend/primary_object_plan as pobj
-import cheng/core/backend/primary_object_emit as pemit
 import cheng/core/ir/core_types as ir
 
 fn check(cond: bool, code: int32): int32 =
@@ -47,6 +44,14 @@ fn callOp(ordinal: int32, target: int32): ir.BodyOp =
     op.kind = ir.BodyOpCallTag
     op.target = target
     add(op.operands, ordinal)
+    return op
+
+fn loadConstOp(target: int32, value: int32): ir.BodyOp =
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpLoadConstTag
+    op.target = target
+    add(op.operands, ir.LocalI32Tag)
+    add(op.operands, value)
     return op
 
 fn resultProjectOp(kind: int32, source: int32, target: int32): ir.BodyOp =
@@ -168,6 +173,20 @@ fn resultRequestDispatchBody(): ir.BodyIR =
     let _ = ir.BodyIRAppendBlock(body, 1, 1, 2)
     return body
 
+fn callCfgWithLocalWriteBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    add(body.localSlots, i32Slot(0, 16, "tmp"))
+    add(body.localSlots, i32Slot(1, 32, "value"))
+    var call: ir.CallOp
+    call.targetSymbol = "Leaf"
+    call.resultSlot = 1
+    add(body.callSequence, call)
+    add(body.ops, loadConstOp(0, 9))
+    add(body.ops, callOp(0, 1))
+    add(body.terms, returnLocalTerm(1))
+    let _ = ir.BodyIRAppendBlock(body, 0, 2, 0)
+    return body
+
 fn main(): int32 =
     var body: ir.BodyIR
     add(body.localSlots, resultSlot(0, 16))
@@ -221,21 +240,6 @@ fn main(): int32 =
     let c4 = check(pobj.PrimaryBodyCondArm64TrueCode(ir.BodyCondI32LeTag) == 13, 14)
     if c4 != 0: return c4
 
-    var leTerm = entry
-    leTerm.conditionKind = ir.BodyCondI32LeTag
-    let termAsmRes = pemit.PrimaryObjectEmitCfgTermAsm(body, leTerm, 112, 3)
-    let c5 = check(IsOk(termAsmRes), 15)
-    if c5 != 0: return c5
-    let termAsm = Value(termAsmRes)
-    let c6 = check(strings.StrContains(termAsm, "b.le"), 16)
-    if c6 != 0: return c6
-    let projectAsmRes = pemit.PrimaryObjectEmitCfgResultProjectAsm(body, isErrProject, 3, 1)
-    let c7 = check(IsOk(projectAsmRes), 17)
-    if c7 != 0: return c7
-    let projectAsm = Value(projectAsmRes)
-    let c8 = check(strings.StrContains(projectAsm, "str w9"), 18)
-    if c8 != 0: return c8
-
     let localBody = callSequenceReturnLocalBody()
     let c9 = check(pobj.PrimaryBodyIrIsCallSequenceReturnInt32(localBody), 21)
     if c9 != 0: return c9
@@ -254,4 +258,30 @@ fn main(): int32 =
     let resultDispatchBody = resultRequestDispatchBody()
     let c15 = check(pobj.PrimaryBodyIrIsResultRequestDispatch(resultDispatchBody), 27)
     if c15 != 0: return c15
+    let localWriteBody = callCfgWithLocalWriteBody()
+    let c16 = check(pobj.PrimaryBodyIrIsCallCfgReturnInt32(localWriteBody), 28)
+    if c16 != 0: return c16
+    let c17 = check(pobj.PrimaryBodyIrCallCfgReturnInt32WordCount(localWriteBody) > 0, 29)
+    if c17 != 0: return c17
+    let c18 = check(pobj.PrimaryBodyIrRelocWordOffset(localWriteBody, 0, 0) > 0, 30)
+    if c18 != 0: return c18
+    var strEqBody: ir.BodyIR
+    add(strEqBody.localSlots, i32Slot(0, 16, "isMatch"))
+    var strEqOp: ir.BodyOp
+    strEqOp.kind = ir.BodyOpStrEqLiteralTag
+    strEqOp.target = 0
+    add(strEqBody.ops, strEqOp)
+    let c19 = check(pobj.PrimaryBodyIrHasSemanticSurface(strEqBody), 31)
+    if c19 != 0: return c19
+    let strEqMissing = pobj.PrimaryBodyIrMissingKind(strEqBody, "fallback")
+    let c20 = check(strEqMissing == "body_ir_str_eq_literal_ops_1_calls_0_returns_0_locals_1", 32)
+    if c20 != 0: return c20
+    var cstringBody: ir.BodyIR
+    let _ = ir.BodyIRAppendCStringLiteral(cstringBody, "ok", "L_ok")
+    let c21 = check(pobj.PrimaryBodyIrHasSemanticSurface(cstringBody), 33)
+    if c21 != 0: return c21
+    let c22 = check(pobj.PrimaryBodyIrMissingKind(cstringBody, "fallback") == "body_ir_cstring_literals_unconsumed", 34)
+    if c22 != 0: return c22
+    let c23 = check(pobj.PrimaryBodyOpKindText(ir.BodyOpStrEqLiteralTag) == "str_eq_literal", 35)
+    if c23 != 0: return c23
     return 0

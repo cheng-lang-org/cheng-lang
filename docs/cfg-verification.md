@@ -123,6 +123,10 @@ Compiles all existing fixtures through the pipeline API (from within Cheng):
 - int32_const_return_direct_fixture
 - float64_mul_backend_smoke
 - function_task_contract_smoke
+- cfg_body_ir_contract_smoke
+- cfg_lowering_smoke
+- cfg_multi_stmt_smoke
+- cfg_result_project_smoke
 
 ```sh
 artifacts/backend_driver/cheng system-link-exec \
@@ -139,43 +143,20 @@ artifacts/backend_driver/cheng system-link-exec \
 Expected output: ` cfg_regression_gate_smoke ok`
 Expected exit code: 0
 
-### 6. cfg_regression_gate.sh (Shell Variant)
-
-A shell script that compiles and runs all fixtures, checking exit codes:
-
-```sh
-bash src/tests/cfg_regression_gate.sh
-```
-
-Expected output for each fixture: `PASS <fixture_name>`
-Expected final line: `Results: 8 passed, 0 failed`
-
 ## Running the Full Regression Gate
 
-To run all CFG-related verification smokes:
+Run the pure Cheng regression gate:
 
 ```sh
-# Set root (adjust to your workspace)
 ROOT=/root/cheng-lang
-
-# Run each smoke individually
-for smoke in cfg_body_ir_contract_smoke cfg_lowering_smoke \
-              cfg_multi_stmt_smoke cfg_result_project_smoke \
-              cfg_regression_gate_smoke; do
-  echo "=== $smoke ==="
-  $ROOT/artifacts/backend_driver/cheng system-link-exec \
-    --root:$ROOT \
-    --in:$ROOT/src/tests/${smoke}.cheng \
-    --emit:exe \
-    --target:arm64-apple-darwin \
-    --out:/tmp/$smoke \
-    --report-out:/tmp/$smoke.report.txt
-  /tmp/$smoke
-  echo "exit: $?"
-done
-
-# Run the shell regression gate
-bash $ROOT/src/tests/cfg_regression_gate.sh
+$ROOT/artifacts/backend_driver/cheng system-link-exec \
+  --root:$ROOT \
+  --in:$ROOT/src/tests/cfg_regression_gate_smoke.cheng \
+  --emit:exe \
+  --target:arm64-apple-darwin \
+  --out:/tmp/cfg_regression_gate_smoke \
+  --report-out:/tmp/cfg_regression_gate_smoke.report.txt
+/tmp/cfg_regression_gate_smoke
 ```
 
 ## Report Fields to Verify
@@ -198,3 +179,7 @@ For each smoke, the compilation report should show:
 | `int32_const_return_direct_fixture` | 7 | `return_i32_const_7` |
 | `float64_mul_backend_smoke` | 0 | `return_f64_mul_args` |
 | `function_task_contract_smoke` | 0 | multiple |
+| `cfg_body_ir_contract_smoke` | 0 | BodyIR contract |
+| `cfg_lowering_smoke` | 0 | BodyIR CFG |
+| `cfg_multi_stmt_smoke` | 0 | BodyIR CFG |
+| `cfg_result_project_smoke` | 0 | Result projection CFG |

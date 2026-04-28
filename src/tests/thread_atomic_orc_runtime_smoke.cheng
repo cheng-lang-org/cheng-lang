@@ -1,0 +1,76 @@
+import std/async_rt as async
+import std/atomic
+import std/rawbytes
+import std/system
+import std/thread
+
+var
+    threadAtomicCounter: atomic.I32
+    threadOrcDone: atomic.I32
+    threadOrcRaw: ptr
+
+fn AtomicIncrement(cell: atomic.I32) =
+    var done = false
+    while !done:
+        let current = atomic.LoadI32(cell)
+        done = atomic.CasI32(cell, current, current + 1)
+
+fn ThreadAtomicWorker() =
+    AtomicIncrement(threadAtomicCounter)
+
+fn ThreadOrcWorker() =
+    for _ in 0..<1000:
+        memRetainAtomic(threadOrcRaw)
+        memReleaseAtomic(threadOrcRaw)
+    AtomicIncrement(threadOrcDone)
+
+fn WaitAtomicAtLeast(cell: atomic.I32,
+                     expected: int32): bool =
+    var spins: int32
+    while spins < 20000000:
+        if atomic.LoadI32(cell) >= expected:
+            return true
+        spins = spins + 1
+        thread.Yield()
+    return false
+
+fn main(): int32 =
+    if thread.Parallelism() <= 1:
+        return 11
+
+    threadAtomicCounter = atomic.NewI32(0)
+    threadOrcDone = atomic.NewI32(0)
+    if threadAtomicCounter == nil || threadOrcDone == nil:
+        return 12
+
+    async.spawn(ThreadAtomicWorker)
+    async.spawn(ThreadAtomicWorker)
+    async.spawn(ThreadAtomicWorker)
+    async.spawn(ThreadAtomicWorker)
+    if !WaitAtomicAtLeast(threadAtomicCounter, 4):
+        return 13
+
+    var payload = rawbytes.BytesAlloc(64)
+    threadOrcRaw = payload.data
+    if threadOrcRaw == nil:
+        return 14
+    if memRefCountAtomic(threadOrcRaw) != 1:
+        return 15
+
+    memDiagReset()
+    async.spawn(ThreadOrcWorker)
+    async.spawn(ThreadOrcWorker)
+    async.spawn(ThreadOrcWorker)
+    async.spawn(ThreadOrcWorker)
+    if !WaitAtomicAtLeast(threadOrcDone, 4):
+        return 16
+    if memRefCountAtomic(threadOrcRaw) != 1:
+        return 17
+    if memRetainCount() != int64(4000):
+        return 18
+    if memReleaseCount() != int64(4000):
+        return 19
+
+    memReleaseAtomic(threadOrcRaw)
+    payload = rawbytes.EmptyBytes()
+    return 0

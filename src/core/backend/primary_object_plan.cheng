@@ -67,6 +67,13 @@ type
         jobCount: int32
         tasks: PrimaryFunctionCodegenTask[]
 
+    PrimaryFunctionCodegenTaskResult =
+        functionIndex: int32
+        wordOffset: int32
+        wordCount: int32
+        words: int32[]
+        errorCode: int32
+
 fn PrimaryTargetSymbolName(targetTriple: str,
                              raw: str): str =
     if targetTriple == "arm64-apple-darwin" ||
@@ -333,6 +340,8 @@ fn PrimaryBodyOpKindText(kind: int32): str =
         return "copy_local"
     if kind == coreir.BodyOpResultProjectTag:
         return "result_project"
+    if kind == coreir.BodyOpStrEqLiteralTag:
+        return "str_eq_literal"
     return "invalid"
 
 fn PrimaryBodyIrOpTargetsLocal(bodyIR: coreir.BodyIR,
@@ -370,6 +379,9 @@ fn PrimaryBodyIrProjectOpWordCount(bodyIR: coreir.BodyIR,
                                     op: coreir.BodyOp): int32 =
     if !PrimaryBodyIrProjectOpSupported(bodyIR, op):
         return 0
+    let projectKind = op.operands[0]
+    if projectKind == coreir.BodyResultProjectIsErrTag:
+        return 4
     return 6
 
 fn PrimaryBodyIrHasSemanticSurface(bodyIR: coreir.BodyIR): bool =
@@ -377,7 +389,8 @@ fn PrimaryBodyIrHasSemanticSurface(bodyIR: coreir.BodyIR): bool =
            bodyIR.blocks.len > 0 ||
            bodyIR.terms.len > 0 ||
            bodyIR.localSlots.len > 0 ||
-           bodyIR.callSequence.len > 0
+           bodyIR.callSequence.len > 0 ||
+           bodyIR.cstringLiterals.len > 0
 
 fn PrimaryBodyIrLoadConstOpSupported(bodyIR: coreir.BodyIR,
                                       op: coreir.BodyOp): bool =
@@ -503,6 +516,8 @@ fn PrimaryBodyIrMissingKind(bodyIR: coreir.BodyIR,
             elif bodyIR.ops[i].kind == coreir.BodyOpReturnTag:
                 returnCount = returnCount + 1
         return Fmt"body_ir_{PrimaryBodyOpKindText(bodyIR.ops[0].kind)}_ops_{bodyIR.ops.len}_calls_{callCount}_returns_{returnCount}_locals_{bodyIR.localSlots.len}"
+    if bodyIR.cstringLiterals.len > 0:
+        return "body_ir_cstring_literals_unconsumed"
     if bodyIR.localSlots.len > 0:
         return "body_ir_local_slots_missing_ops"
     return fallback
@@ -845,14 +860,17 @@ fn PrimaryBodyIrCbrConditionSupported(term: coreir.BodyTerm,
         return false
     if bodyIR.localSlots[slotIndex].typeKind != coreir.LocalI32Tag:
         return false
-    return term.conditionKind == coreir.BodyCondLocalNonZeroTag ||
-           term.conditionKind == coreir.BodyCondLocalZeroTag ||
-           term.conditionKind == coreir.BodyCondI32EqTag ||
-           term.conditionKind == coreir.BodyCondI32NeTag ||
-           term.conditionKind == coreir.BodyCondI32LtTag ||
-           term.conditionKind == coreir.BodyCondI32LeTag ||
-           term.conditionKind == coreir.BodyCondI32GtTag ||
-           term.conditionKind == coreir.BodyCondI32GeTag
+    if term.conditionKind == coreir.BodyCondLocalNonZeroTag ||
+       term.conditionKind == coreir.BodyCondLocalZeroTag:
+        return true
+    if term.conditionKind == coreir.BodyCondI32EqTag ||
+       term.conditionKind == coreir.BodyCondI32NeTag ||
+       term.conditionKind == coreir.BodyCondI32LtTag ||
+       term.conditionKind == coreir.BodyCondI32LeTag ||
+       term.conditionKind == coreir.BodyCondI32GtTag ||
+       term.conditionKind == coreir.BodyCondI32GeTag:
+        return term.rhsSlot == -1
+    return false
 
 fn PrimaryBodyIrIsCallCfgReturnInt32(bodyIR: coreir.BodyIR): bool =
     if bodyIR.callSequence.len <= 0 ||
@@ -1904,23 +1922,15 @@ fn PrimaryBodyIrCallCfgReturnInt32WordCount(bodyIR: coreir.BodyIR): int32 =
         for localOpIndex in 0..<block.opCount:
             let opIndex = block.opStart + localOpIndex
             let op = bodyIR.ops[opIndex]
-            if op.kind == coreir.BodyOpCallTag:
-                if op.operands.len < 1:
-                    return 0
-                let callOrdinal = op.operands[0]
-                if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
-                    return 0
-                let callOp = bodyIR.callSequence[callOrdinal]
-                wordCount = wordCount + PrimaryBodyIrCallOpWordCount(bodyIR, callOp)
-            elif op.kind == coreir.BodyOpResultProjectTag:
-                let projectWordCount = PrimaryBodyIrProjectOpWordCount(bodyIR, op)
-                if projectWordCount <= 0:
-                    return 0
-                wordCount = wordCount + projectWordCount
-            else:
+            let opWordCount = PrimaryBodyIrOpWordCount(bodyIR, op)
+            if opWordCount <= 0:
                 return 0
+            wordCount = wordCount + opWordCount
         let term = bodyIR.terms[block.termIndex]
-        wordCount = wordCount + PrimaryBodyIrTermWordCount(term, epilogueWordCount)
+        let termWordCount = PrimaryBodyIrTermWordCount(term, epilogueWordCount)
+        if termWordCount <= 0:
+            return 0
+        wordCount = wordCount + termWordCount
     return wordCount
 
 fn PrimaryBodyIrWordCount(bodyIR: coreir.BodyIR): int32 =
@@ -3593,18 +3603,10 @@ fn PrimaryFillBodyIrResultProjectionOp(words: var int32[],
             return
         PrimarySetInstructionWord(words, emitIndex, cmpWord)
         emitIndex = emitIndex + 1
-        PrimarySetInstructionWord(words,
-                                  emitIndex,
-                                  PrimaryArm64RegisterWord(PrimaryMovI32ConstWord(0), 9))
-        emitIndex = emitIndex + 1
-        let branchWord = PrimaryArm64BCondWord(2, 1)
-        if branchWord == 0:
+        let csetRes = a64.A64EncCset(9, a64.A64CondNE)
+        if IsErr(csetRes):
             return
-        PrimarySetInstructionWord(words, emitIndex, branchWord)
-        emitIndex = emitIndex + 1
-        PrimarySetInstructionWord(words,
-                                  emitIndex,
-                                  PrimaryArm64RegisterWord(PrimaryMovI32ConstWord(1), 9))
+        PrimarySetInstructionWord(words, emitIndex, Value(csetRes))
         emitIndex = emitIndex + 1
         let storeBaseWord = PrimaryArm64RegisterWord(-1191181408, 9)
         if storeBaseWord == 0:
@@ -4639,6 +4641,18 @@ fn PrimaryBuildFunctionCodegenTaskPlan(functionBodyKinds: str[],
         add(plan.tasks, task)
     return plan
 
+fn PrimaryFunctionCodegenTaskResultNew(task: PrimaryFunctionCodegenTask): PrimaryFunctionCodegenTaskResult =
+    var out: PrimaryFunctionCodegenTaskResult
+    out.functionIndex = task.functionIndex
+    out.wordOffset = task.wordOffset
+    out.wordCount = task.wordCount
+    return out
+
+fn PrimaryFunctionCodegenTaskResultSetError(result: var PrimaryFunctionCodegenTaskResult,
+                                             code: int32) =
+    if result.errorCode == 0:
+        result.errorCode = code
+
 fn PrimaryFillFunctionCodegenTaskWords(instructionWords: var int32[],
                                         wordOffset: int32,
                                         bodyKind: str,
@@ -4732,6 +4746,20 @@ fn PrimaryFillFunctionCodegenTaskWords(instructionWords: var int32[],
             PrimaryFillCstringLiteralCallsReturnI32Const0(instructionWords,
                                                           wordOffset,
                                                           statementCallCount)
+        elif statementMode == PrimaryStatementReturnModeNone() &&
+             bodyIR.ops.len > 0 &&
+             bodyIR.callSequence.len > 0:
+            if PrimaryBodyIrIsCallSequenceReturnStr(bodyIR) ||
+               PrimaryBodyIrIsCallSequenceReturnAggregate(bodyIR):
+                PrimaryFillCallSequenceReturnBodyIr(instructionWords,
+                                                    wordOffset,
+                                                    bodyIR)
+            elif PrimaryBodyIrIsCallSequenceReturnInt32(bodyIR) ||
+                 PrimaryBodyIrIsCallSequenceReturnPtr(bodyIR) ||
+                 PrimaryBodyIrIsCallSequenceReturnI32Const(bodyIR):
+                PrimaryFillCallSequenceReturnBodyIr(instructionWords,
+                                                    wordOffset,
+                                                    bodyIR)
     elif bodyKind == texpr.BodyKindEntryBridge:
         PrimaryFillEntryBridge(instructionWords, wordOffset)
     elif bodyKind == texpr.BodyKindReturnZeroI32:
@@ -4823,6 +4851,77 @@ fn PrimaryFillFunctionCodegenTaskWords(instructionWords: var int32[],
         PrimaryFillBackendDriverCommandDispatch(instructionWords, wordOffset)
     elif bodyKind == texpr.BodyKindResultRequestDispatch:
         PrimaryFillResultRequestDispatch(instructionWords, wordOffset)
+
+fn PrimaryExecuteFunctionCodegenTask(task: PrimaryFunctionCodegenTask,
+                                      functionBodyIRs: coreir.BodyIR[],
+                                      functionReturnStringLiteralLens: int32[]): PrimaryFunctionCodegenTaskResult =
+    var result = PrimaryFunctionCodegenTaskResultNew(task)
+    if task.wordCount <= 0:
+        return result
+    if task.wordOffset < 0:
+        PrimaryFunctionCodegenTaskResultSetError(result, 1)
+        return result
+    var bodyIR = coreir.BodyIR()
+    if task.functionIndex >= 0 && task.functionIndex < functionBodyIRs.len:
+        bodyIR = functionBodyIRs[task.functionIndex]
+    else:
+        PrimaryFunctionCodegenTaskResultSetError(result, 2)
+        return result
+    var returnStringLiteralLen: int32
+    if task.functionIndex >= 0 && task.functionIndex < functionReturnStringLiteralLens.len:
+        returnStringLiteralLen = functionReturnStringLiteralLens[task.functionIndex]
+    result.words = PrimaryIntSeqInit(task.wordCount, 0)
+    PrimaryFillFunctionCodegenTaskWords(result.words,
+                                        0,
+                                        task.bodyKind,
+                                        task.statementMode,
+                                        task.statementI32Value,
+                                        task.statementCallCount,
+                                        bodyIR,
+                                        returnStringLiteralLen)
+    return result
+
+fn PrimaryMergeFunctionCodegenTaskResult(instructionWords: var int32[],
+                                          task: PrimaryFunctionCodegenTask,
+                                          result: PrimaryFunctionCodegenTaskResult): bool =
+    if result.errorCode != 0:
+        return false
+    if task.wordCount <= 0:
+        return true
+    if result.functionIndex != task.functionIndex ||
+       result.wordOffset != task.wordOffset ||
+       result.wordCount != task.wordCount:
+        return false
+    if result.words.len != task.wordCount:
+        return false
+    if task.wordOffset < 0 ||
+       task.wordOffset + task.wordCount > instructionWords.len:
+        return false
+    for wi in 0..<task.wordCount:
+        PrimarySetInstructionWord(instructionWords,
+                                  task.wordOffset + wi,
+                                  result.words[wi])
+    return true
+
+fn PrimaryRunFunctionCodegenTasksSerial(instructionWords: var int32[],
+                                         plan: PrimaryFunctionCodegenTaskPlan,
+                                         functionBodyIRs: coreir.BodyIR[],
+                                         functionReturnStringLiteralLens: int32[],
+                                         firstErrorFunctionIndex: var int32): bool =
+    firstErrorFunctionIndex = -1
+    for taskIndex in 0..<plan.tasks.len:
+        if taskIndex % 64 == 0:
+            os.ProcessResourceGuardCheck()
+        let task = plan.tasks[taskIndex]
+        let result = PrimaryExecuteFunctionCodegenTask(task,
+                                                       functionBodyIRs,
+                                                       functionReturnStringLiteralLens)
+        if !PrimaryMergeFunctionCodegenTaskResult(instructionWords,
+                                                   task,
+                                                   result):
+            firstErrorFunctionIndex = task.functionIndex
+            return false
+    return true
 
 fn PrimaryObjectMissingReasons(linkPlan: slplan.SystemLinkPlanStub,
                                  lowering: lower.LoweringPlanStub,
@@ -5054,7 +5153,11 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
             elif PrimaryBodyIrHasSemanticSurface(normalizedBodyIR):
                 wordCounts[i] = 0
             elif lowering.primaryObjectIr.functions[irIndex].bodyKind == texpr.BodyKindStatementSequence:
-                wordCounts[i] = PrimaryStatementSequenceWordCount(lowering.primaryObjectIr.functions[irIndex].statementReturnMode)
+                let stmtMode = lowering.primaryObjectIr.functions[irIndex].statementReturnMode
+                wordCounts[i] = PrimaryStatementSequenceWordCount(stmtMode)
+                if wordCounts[i] <= 0 && stmtMode == PrimaryStatementReturnModeNone():
+                    if PrimaryBodyIrIsGeneralCfg(normalizedBodyIR):
+                        wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(normalizedBodyIR)
             else:
                 wordCounts[i] = PrimaryFunctionWordCountForBodyKind(lowering.primaryObjectIr.functions[irIndex].bodyKind)
         var symbolText = lowering.functionSymbolTexts[i]
@@ -5633,30 +5736,18 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
             firstMissingBodyKind = functionTaskPlan.schedule
             firstMissingTypedIrKind = ""
             firstMissingLineNumber = 0
-    for taskIndex in 0..<functionTaskPlan.tasks.len:
-        if taskIndex % 64 == 0:
-            os.ProcessResourceGuardCheck()
-        let task = functionTaskPlan.tasks[taskIndex]
-        if task.wordCount <= 0:
-            continue
-        let wordOffset = task.wordOffset
-        let bodyKind = task.bodyKind
-        let statementMode = task.statementMode
-        let statementI32Value = task.statementI32Value
-        var bodyIR = coreir.BodyIR()
-        if task.functionIndex >= 0 && task.functionIndex < functionBodyIRs.len:
-            bodyIR = functionBodyIRs[task.functionIndex]
-        var returnStringLiteralLen: int32
-        if task.functionIndex >= 0 && task.functionIndex < functionReturnStringLiteralLens.len:
-            returnStringLiteralLen = functionReturnStringLiteralLens[task.functionIndex]
-        PrimaryFillFunctionCodegenTaskWords(instructionWords,
-                                            wordOffset,
-                                            bodyKind,
-                                            statementMode,
-                                            statementI32Value,
-                                            task.statementCallCount,
-                                            bodyIR,
-                                            returnStringLiteralLen)
+    var firstTaskCodegenErrorFunctionIndex: int32
+    if !PrimaryRunFunctionCodegenTasksSerial(instructionWords,
+                                             functionTaskPlan,
+                                             functionBodyIRs,
+                                             functionReturnStringLiteralLens,
+                                             firstTaskCodegenErrorFunctionIndex):
+        bodySemanticsMissing = true
+        if Len(firstMissingFunction) <= 0:
+            firstMissingFunction = Fmt"function_index:{firstTaskCodegenErrorFunctionIndex}"
+            firstMissingBodyKind = "function_task_codegen_merge_failed"
+            firstMissingTypedIrKind = ""
+            firstMissingLineNumber = 0
     plan.functionTaskSchedule = functionTaskPlan.schedule
     plan.functionTaskJobCount = functionTaskPlan.jobCount
     plan.functionTaskCount = functionTaskPlan.tasks.len

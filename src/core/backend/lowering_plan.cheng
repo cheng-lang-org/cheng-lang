@@ -1064,6 +1064,13 @@ fn LoweringTypedStatementCfgHasCallOrProjection(fnIr: PrimaryObjectIrFunction): 
             return true
     return false
 
+fn LoweringHasTopLevelIfStatement(fnIr: PrimaryObjectIrFunction): bool =
+    for stmtIndex in 0..<fnIr.statements.len:
+        let stmt = fnIr.statements[stmtIndex]
+        if stmt.enclosingIfLineNumber <= 0 && stmt.kind == texpr.TypedExprIrStmtIf:
+            return true
+    return false
+
 fn LoweringPopulateLinearCfg(fnIr: var PrimaryObjectIrFunction,
                               sourceTexts: texpr.TypedExprSourceText[]): bool =
     if !LoweringTopLevelControlFlowSupported(fnIr):
@@ -1086,6 +1093,40 @@ fn LoweringPopulateLinearCfg(fnIr: var PrimaryObjectIrFunction,
     if finalTermIndex < 0:
         LoweringClearCallSequence(fnIr)
         fnIr.bodyKind = "cfg_linear_return_missing"
+        return false
+    let _ = coreir.BodyIRAppendBlock(fnIr.bodyIR,
+                                     0,
+                                     fnIr.bodyIR.ops.len,
+                                     finalTermIndex)
+    fnIr.bodyKind = texpr.BodyKindStatementSequence
+    fnIr.statementReturnMode = texpr.StatementReturnModeNone
+    fnIr.statementReturnI32Value = 0
+    fnIr.callTargetCount = fnIr.callSequence.len
+    return true
+
+fn LoweringBuildGeneralBodyIRFromStatements(fnIr: var PrimaryObjectIrFunction,
+                                             sourceTexts: texpr.TypedExprSourceText[]): bool =
+    if fnIr.bodyKind != texpr.BodyKindUnsupported &&
+       fnIr.bodyKind != texpr.BodyKindStatementSequence:
+        return false
+    if !LoweringTopLevelControlFlowSupported(fnIr):
+        fnIr.bodyKind = "general_cfg_control_unsupported"
+        return false
+    if !LoweringTypedStatementCfgHasCallOrProjection(fnIr):
+        return false
+    let hasTopLevelIf = LoweringHasTopLevelIfStatement(fnIr)
+    if hasTopLevelIf:
+        return false
+    LoweringClearCallSequence(fnIr)
+    LoweringEnsureLocalDeclSlots(fnIr)
+    let finalTermIndex = LoweringAppendCfgCallsUntilReturn(fnIr,
+                                                           sourceTexts,
+                                                           0,
+                                                           false,
+                                                           0)
+    if finalTermIndex < 0:
+        LoweringClearCallSequence(fnIr)
+        fnIr.bodyKind = "general_cfg_return_missing"
         return false
     let _ = coreir.BodyIRAppendBlock(fnIr.bodyIR,
                                      0,
@@ -1171,13 +1212,39 @@ fn LoweringPopulateTopGuardChainCfgReturnI32(fnIr: var PrimaryObjectIrFunction,
                     condSlot = fnIr.callSequence[condOrdinal].resultSlot
                 else:
                     var localName = ""
-                    if !LoweringIfConditionLocalNameAndKind(stmt,
-                                                            localName,
-                                                            conditionKind):
+                    var strLiteralText = ""
+                    let condExpr = LoweringIfConditionExprText(stmt)
+                    if LoweringParseIfConditionStrEq(condExpr, localName, strLiteralText):
+                        let strSlot = LoweringBodyIrLocalSlotIndex(fnIr, localName)
+                        if strSlot < 0:
+                            LoweringClearCallSequence(fnIr)
+                            fnIr.bodyKind = "cfg_condition_str_slot_missing"
+                            return false
+                        let literalIndex = coreir.BodyIRAppendCStringLiteral(fnIr.bodyIR,
+                                                                              strLiteralText,
+                                                                              Fmt".Lstrcmp{fnIr.bodyIR.cstringLiterals.len}")
+                        let resultSlot = LoweringBodyIrEnsureLocalSlot(fnIr,
+                                                                       "__strcmp_result",
+                                                                       "int32")
+                        if resultSlot < 0:
+                            LoweringClearCallSequence(fnIr)
+                            fnIr.bodyKind = "cfg_condition_str_result_slot_missing"
+                            return false
+                        var strEqOp: coreir.BodyOp
+                        strEqOp.kind = coreir.BodyOpStrEqLiteralTag
+                        strEqOp.operands = [strSlot, literalIndex]
+                        strEqOp.target = resultSlot
+                        add(fnIr.bodyIR.ops, strEqOp)
+                        condSlot = resultSlot
+                        conditionKind = coreir.BodyCondLocalZeroTag
+                    elif !LoweringIfConditionLocalNameAndKind(stmt,
+                                                               localName,
+                                                               conditionKind):
                         LoweringClearCallSequence(fnIr)
                         fnIr.bodyKind = "cfg_condition_parse_missing"
                         return false
-                    condSlot = LoweringBodyIrLocalSlotIndex(fnIr, localName)
+                    else:
+                        condSlot = LoweringBodyIrLocalSlotIndex(fnIr, localName)
             if condSlot < 0 || condSlot >= fnIr.bodyIR.localSlots.len:
                 LoweringClearCallSequence(fnIr)
                 fnIr.bodyKind = "cfg_condition_slot_missing"
@@ -1188,6 +1255,7 @@ fn LoweringPopulateTopGuardChainCfgReturnI32(fnIr: var PrimaryObjectIrFunction,
             entryTerm.conditionKind = conditionKind
             entryTerm.resultSlot = condSlot
             entryTerm.lhsSlot = condSlot
+            entryTerm.rhsSlot = -1
             entryTerm.trueBlock = fnIr.bodyIR.blocks.len + 1
             entryTerm.falseBlock = fnIr.bodyIR.blocks.len + 2
             let entryTermIndex = coreir.BodyIRAppendTerm(fnIr.bodyIR, entryTerm)
@@ -1782,7 +1850,6 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                                                    0)
         let dispatchTailName = LoweringFunctionTailName(functionName)
         if dispatchTailName == "BackendDriverDispatchMinRunCommandWithCmd" &&
-           fnIr.bodyKind == texpr.BodyKindUnsupported &&
            LoweringTextEndsWith(sourcePath, "src/core/tooling/backend_driver_dispatch_min.cheng"):
             LoweringClearCallSequence(fnIr)
             var dispatchReady = true
