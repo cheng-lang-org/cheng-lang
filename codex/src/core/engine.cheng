@@ -213,3 +213,309 @@ fn codexRunInSandbox(cwd: str, writableRoot: str, commandText: str): Result[type
     out.ok = out.exitCode == 0
     out.assistantText = codexAssistantSummary(out.exitCode, out.outputText)
     return Ok[types.CodexExecResult](out)
+
+# ---- Tool Dispatch System ----
+
+fn codexToolDispatch(kind: str, input: str, cwd: str, home: str, outResult: var types.CodexExecResult) =
+    outResult = types.CodexExecResult()
+    if kind == "shell":
+        var shellOutput = ""
+        var shellExit = int32(-1)
+        codexShellCapture(input, cwd, shellOutput, shellExit)
+        outResult.outputText = shellOutput
+        outResult.exitCode = shellExit
+        outResult.ok = shellExit == 0
+        outResult.assistantText = codexAssistantSummary(shellExit, shellOutput)
+    elif kind == "apply_patch":
+        let patchRes = codexApplyPatch(cwd, input)
+        if IsOk(patchRes):
+            outResult = Value(patchRes)
+        else:
+            outResult.ok = false
+            outResult.exitCode = -1
+            outResult.outputText = Error(patchRes)
+            outResult.assistantText = "apply_patch failed"
+    elif kind == "sandbox":
+        let sandboxRes = codexRunInSandbox(cwd, "", input)
+        if IsOk(sandboxRes):
+            outResult = Value(sandboxRes)
+        else:
+            outResult.ok = false
+            outResult.exitCode = -1
+            outResult.outputText = Error(sandboxRes)
+            outResult.assistantText = "sandbox failed"
+    elif kind == "read_file":
+        if store.codexStoreFileExists(input):
+            outResult.outputText = os.ReadFile(input)
+            outResult.ok = true
+            outResult.exitCode = 0
+            outResult.assistantText = "read_file ok"
+        else:
+            outResult.ok = false
+            outResult.exitCode = -1
+            outResult.outputText = strutil.Join(["read_file: not found: ", input], "")
+            outResult.assistantText = "read_file failed"
+    elif kind == "write_file":
+        let newlinePos = textutil.codexTextFind(input, '\n')
+        if newlinePos < 0:
+            outResult.ok = false
+            outResult.exitCode = -1
+            outResult.outputText = "write_file: expected path on first line, content on remaining lines"
+            outResult.assistantText = "write_file failed"
+        else:
+            let filePath = textutil.codexTextSlice(input, 0, newlinePos)
+            var content = ""
+            if newlinePos + 1 < len(input):
+                content = textutil.codexTextSlice(input, newlinePos + 1, len(input) - newlinePos - 1)
+            os.WriteFile(filePath, content)
+            outResult.ok = true
+            outResult.exitCode = 0
+            outResult.outputText = strutil.Join(["wrote ", intToStr(len(content)), " bytes to ", filePath], "")
+            outResult.assistantText = "write_file ok"
+    else:
+        outResult.ok = false
+        outResult.exitCode = -1
+        outResult.outputText = strutil.Join(["codex tool dispatch: unknown kind: ", kind], "")
+        outResult.assistantText = "unknown tool kind"
+
+# ---- Turn Driver ----
+
+fn codexTurnDriverRun(session: var types.CodexSession,
+                      turnInput: types.CodexTurnInput,
+                      events: var types.CodexTurnEvent[],
+                      config: types.CodexConfigSnapshot): bool =
+    events = []
+    var promptEvent: types.CodexTurnEvent
+    promptEvent.kind = "prompt"
+    promptEvent.text = turnInput.promptText
+    add(events, promptEvent)
+    var finalExitCode = int32(0)
+    var finalOutput = ""
+    var finalCommand = turnInput.commandText
+    if textutil.codexTextNonEmpty(turnInput.commandText):
+        var callEvent: types.CodexTurnEvent
+        callEvent.kind = "tool_call"
+        callEvent.toolCallId = codexSessionId()
+        callEvent.toolName = "shell"
+        callEvent.toolInput = turnInput.commandText
+        add(events, callEvent)
+        var toolResult: types.CodexExecResult
+        codexToolDispatch("shell", turnInput.commandText, session.cwd, config.home, toolResult)
+        var resultEvent: types.CodexTurnEvent
+        resultEvent.kind = "tool_result"
+        resultEvent.toolCallId = callEvent.toolCallId
+        resultEvent.toolName = "shell"
+        resultEvent.toolOutput = toolResult.outputText
+        resultEvent.exitCode = toolResult.exitCode
+        add(events, resultEvent)
+        finalExitCode = toolResult.exitCode
+        finalOutput = toolResult.outputText
+    var summaryEvent: types.CodexTurnEvent
+    summaryEvent.kind = "summary"
+    summaryEvent.text = codexAssistantSummary(finalExitCode, finalOutput)
+    add(events, summaryEvent)
+    let approved = turnInput.autoApprove || config.autoApprove
+    codexAppendTurn(session, turnInput.promptText, finalCommand, finalOutput, finalExitCode, approved)
+    return finalExitCode == 0
+
+# ---- Config Loading ----
+
+fn codexConfigLoad(home: str): types.CodexConfigSnapshot =
+    var out: types.CodexConfigSnapshot
+    out.home = home
+    out.modelName = "claude-sonnet-4-20250514"
+    out.autoApprove = false
+    out.maxTurns = 20
+    out.shellCommand = "/bin/sh"
+    out.sandboxEnabled = false
+    let configPath = os.JoinPath(home, "config.env")
+    if !store.codexStoreFileExists(configPath):
+        return out
+    let text = store.codexStoreReadText(configPath)
+    if !textutil.codexTextNonEmpty(text):
+        return out
+    let lines = strutil.Split(text, '\n')
+    for i in 0..<lines.len:
+        let line = textutil.codexTextTrim(lines[i])
+        if !textutil.codexTextNonEmpty(line):
+            continue
+        var key = ""
+        var value = ""
+        if !textutil.codexTextSplitFirst(line, '=', key, value):
+            continue
+        if key == "model_name":
+            out.modelName = value
+        elif key == "auto_approve":
+            let _parsed = textutil.codexParseBoolText(value, out.autoApprove)
+            _parsed
+        elif key == "max_turns":
+            let _parsed = textutil.codexParseInt32Text(value, out.maxTurns)
+            _parsed
+        elif key == "shell_command":
+            out.shellCommand = value
+        elif key == "sandbox_enabled":
+            let _parsed = textutil.codexParseBoolText(value, out.sandboxEnabled)
+            _parsed
+        elif key == "skill_names":
+            if textutil.codexTextNonEmpty(value):
+                out.skillNames = strutil.Split(value, ',')
+        elif key == "plugin_names":
+            if textutil.codexTextNonEmpty(value):
+                out.pluginNames = strutil.Split(value, ',')
+        elif key == "mcp_server_names":
+            if textutil.codexTextNonEmpty(value):
+                out.mcpServerNames = strutil.Split(value, ',')
+    return out
+
+fn codexConfigSave(home: str, config: types.CodexConfigSnapshot): bool =
+    var parts: str[]
+    add(parts, strutil.Join(["model_name=", config.modelName, "\n"], ""))
+    add(parts, strutil.Join(["auto_approve=", textutil.codexBoolText(config.autoApprove), "\n"], ""))
+    add(parts, strutil.Join(["max_turns=", intToStr(config.maxTurns), "\n"], ""))
+    add(parts, strutil.Join(["shell_command=", config.shellCommand, "\n"], ""))
+    add(parts, strutil.Join(["sandbox_enabled=", textutil.codexBoolText(config.sandboxEnabled), "\n"], ""))
+    if config.skillNames.len > 0:
+        add(parts, strutil.Join(["skill_names=", strutil.Join(config.skillNames, ","), "\n"], ""))
+    if config.pluginNames.len > 0:
+        add(parts, strutil.Join(["plugin_names=", strutil.Join(config.pluginNames, ","), "\n"], ""))
+    if config.mcpServerNames.len > 0:
+        add(parts, strutil.Join(["mcp_server_names=", strutil.Join(config.mcpServerNames, ","), "\n"], ""))
+    let text = strutil.Join(parts, "")
+    let configPath = os.JoinPath(home, "config.env")
+    return store.codexStoreWriteText(configPath, text)
+
+# ---- Skill Injection ----
+
+fn codexSkillLoadOne(home: str, name: str): Result[types.CodexSkillSpec] =
+    let skillDir = os.JoinPath(os.JoinPath(home, "skills"), name)
+    if !os.DirExists(skillDir):
+        return Err[types.CodexSkillSpec](strutil.Join(["codex skill: directory not found: ", name], ""))
+    let skillFile = os.JoinPath(skillDir, "skill.txt")
+    if !store.codexStoreFileExists(skillFile):
+        return Err[types.CodexSkillSpec](strutil.Join(["codex skill: missing skill.txt: ", name], ""))
+    let promptText = store.codexStoreReadText(skillFile)
+    if !textutil.codexTextNonEmpty(promptText):
+        return Err[types.CodexSkillSpec](strutil.Join(["codex skill: empty skill.txt: ", name], ""))
+    var spec: types.CodexSkillSpec
+    spec.name = name
+    spec.kind = "prompt"
+    spec.path = skillFile
+    spec.config = promptText
+    spec.enabled = true
+    return Ok[types.CodexSkillSpec](spec)
+
+fn codexSkillLoadAll(home: str): types.CodexSkillSpec[] =
+    var out: types.CodexSkillSpec[]
+    let skillsDir = os.JoinPath(home, "skills")
+    if !os.DirExists(skillsDir):
+        return out
+    let entries = os.ListDir(skillsDir)
+    for i in 0..<entries.len:
+        let entryPath = os.JoinPath(skillsDir, entries[i])
+        if !os.DirExists(entryPath):
+            continue
+        let loadRes = codexSkillLoadOne(home, entries[i])
+        if IsOk(loadRes):
+            add(out, Value(loadRes))
+    return out
+
+fn codexSkillResolvePrompt(skill: types.CodexSkillSpec, userPrompt: str): str =
+    if !textutil.codexTextNonEmpty(skill.config):
+        return userPrompt
+    return strutil.Join([skill.config, "\n", userPrompt], "")
+
+# ---- Plugin Discovery ----
+
+fn codexPluginDiscover(home: str): types.CodexPluginSpec[] =
+    let specs = store.codexStoreListPluginSpecs(home)
+    var out: types.CodexPluginSpec[]
+    for i in 0..<specs.len:
+        let spec = specs[i]
+        if textutil.codexTextNonEmpty(spec.path) && !store.codexStoreFileExists(spec.path):
+            continue
+        add(out, spec)
+    return out
+
+fn codexPluginInjectContext(plugins: types.CodexPluginSpec[], context: var str) =
+    if plugins.len <= 0:
+        return
+    var parts: str[]
+    add(parts, context)
+    for i in 0..<plugins.len:
+        let spec = plugins[i]
+        if !spec.enabled:
+            continue
+        add(parts, strutil.Join(["\n[plugin: ", spec.name, "]\n"], ""))
+        if textutil.codexTextNonEmpty(spec.path):
+            let pluginText = store.codexStoreReadText(spec.path)
+            if textutil.codexTextNonEmpty(pluginText):
+                add(parts, pluginText)
+                if pluginText[len(pluginText) - 1] != '\n':
+                    add(parts, "\n")
+    context = strutil.Join(parts, "")
+
+# ---- Approval Decision Engine ----
+
+fn codexApprovalRequestCreate(toolName: str, toolInput: str, reason: str): types.CodexApprovalRequest =
+    var req: types.CodexApprovalRequest
+    req.requestId = codexSessionId()
+    req.toolName = toolName
+    req.toolInput = toolInput
+    req.reason = reason
+    req.createdAt = codexNowUnix()
+    return req
+
+fn codexApprovalDecide(request: types.CodexApprovalRequest, approved: bool): types.CodexApprovalDecision =
+    var decision: types.CodexApprovalDecision
+    decision.requestId = request.requestId
+    decision.approved = approved
+    decision.decidedAt = codexNowUnix()
+    return decision
+
+fn codexApprovalNeeded(toolName: str, config: types.CodexConfigSnapshot): bool =
+    if config.autoApprove:
+        return false
+    if toolName == "read_file":
+        return false
+    return true
+
+# ---- Message History Management ----
+
+fn codexMessageHistoryExport(session: types.CodexSession, maxEvents: int32): types.CodexTurnEvent[] =
+    var out: types.CodexTurnEvent[]
+    let turns = session.turns
+    if turns.len <= 0:
+        return out
+    var start = 0
+    if maxEvents > 0 && turns.len > maxEvents:
+        start = turns.len - maxEvents
+    for i in start..<turns.len:
+        let turn = turns[i]
+        var promptEvent: types.CodexTurnEvent
+        promptEvent.kind = "prompt"
+        promptEvent.text = turn.promptText
+        add(out, promptEvent)
+        if textutil.codexTextNonEmpty(turn.commandText):
+            var callEvent: types.CodexTurnEvent
+            callEvent.kind = "tool_call"
+            callEvent.toolCallId = strutil.Join(["turn-", intToStr(i)], "")
+            callEvent.toolName = "shell"
+            callEvent.toolInput = turn.commandText
+            add(out, callEvent)
+            var resultEvent: types.CodexTurnEvent
+            resultEvent.kind = "tool_result"
+            resultEvent.toolCallId = callEvent.toolCallId
+            resultEvent.toolName = "shell"
+            resultEvent.toolOutput = turn.outputText
+            resultEvent.exitCode = turn.exitCode
+            add(out, resultEvent)
+        var summaryEvent: types.CodexTurnEvent
+        summaryEvent.kind = "summary"
+        summaryEvent.text = turn.assistantText
+        add(out, summaryEvent)
+    return out
+
+fn codexMessageHistoryLastPrompt(session: types.CodexSession): str =
+    if session.turns.len <= 0:
+        return ""
+    return session.turns[session.turns.len - 1].promptText

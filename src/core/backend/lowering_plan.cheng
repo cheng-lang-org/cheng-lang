@@ -111,6 +111,8 @@ fn LoweringLayoutKindInvalid(): int32 =
 fn LoweringLayoutKindI32(): int32 =
     return 5
 
+const LoweringBodyKindGeneralCFG = "general_cfg"
+
 fn LoweringAppendLine(out: var str, key: str, value: str) =
     if len(out) > 0:
         out = Fmt"{out}\n"
@@ -1296,6 +1298,124 @@ fn LoweringPopulateReturnCallBodyIr(fnIr: var PrimaryObjectIrFunction,
     fnIr.callTargetCount = fnIr.callSequence.len
     return true
 
+fn LoweringBuildGeneralCFG(fnIr: var PrimaryObjectIrFunction,
+                            sourceTexts: texpr.TypedExprSourceText[]) =
+    LoweringClearCallSequence(fnIr)
+    LoweringEnsureLocalDeclSlots(fnIr)
+    var topIfCount: int32
+    for stmtIndex in 0..<fnIr.statements.len:
+        let stmt = fnIr.statements[stmtIndex]
+        if stmt.enclosingIfLineNumber <= 0 && stmt.kind == texpr.TypedExprIrStmtIf:
+            topIfCount = topIfCount + 1
+    if topIfCount <= 0:
+        let finalTermIndex = LoweringAppendCfgCallsUntilReturn(fnIr, sourceTexts, 0, false, 0)
+        if finalTermIndex < 0:
+            LoweringClearCallSequence(fnIr)
+            fnIr.bodyKind = "general_cfg_linear_return_missing"
+            return
+        let _ = coreir.BodyIRAppendBlock(fnIr.bodyIR, 0, fnIr.bodyIR.ops.len, finalTermIndex)
+        fnIr.bodyKind = LoweringBodyKindGeneralCFG
+        fnIr.statementReturnMode = texpr.StatementReturnModeNone
+        fnIr.statementReturnI32Value = 0
+        fnIr.callTargetCount = fnIr.callSequence.len
+        return
+    var blockStart: int32
+    var lastGuardLine: int32
+    for stmtIndex in 0..<fnIr.statements.len:
+        let stmt = fnIr.statements[stmtIndex]
+        if stmt.enclosingIfLineNumber > 0:
+            continue
+        if stmt.kind == texpr.TypedExprIrStmtLocalDecl:
+            continue
+        if lastGuardLine > 0 &&
+           stmt.kind == texpr.TypedExprIrStmtIfCall &&
+           stmt.lineNumber == lastGuardLine:
+            continue
+        if lastGuardLine > 0 &&
+           stmt.kind == texpr.TypedExprIrStmtResultIntrinsic &&
+           stmt.lineNumber == lastGuardLine:
+            continue
+        if stmt.kind == texpr.TypedExprIrStmtIf:
+            var condSlot = -1
+            var conditionKind = LoweringIfConditionDefaultKind(stmt)
+            let condResultIndex = LoweringFindIfConditionResultIntrinsicIndex(fnIr, stmt.lineNumber)
+            if condResultIndex >= 0:
+                condSlot = LoweringAppendResultProjectionStatement(fnIr, fnIr.statements[condResultIndex])
+                if condSlot < 0:
+                    LoweringClearCallSequence(fnIr)
+                    fnIr.bodyKind = "general_cfg_cond_project_missing"
+                    return
+            if condSlot < 0:
+                let condIndex = LoweringFindIfConditionCallIndex(fnIr, stmt.lineNumber)
+                if condIndex >= 0:
+                    let condOrdinal = LoweringAppendStructuredCall(fnIr, fnIr.statements[condIndex], sourceTexts)
+                    if condOrdinal < 0:
+                        LoweringClearCallSequence(fnIr)
+                        fnIr.bodyKind = "general_cfg_cond_call_missing"
+                        return
+                    condSlot = fnIr.callSequence[condOrdinal].resultSlot
+                else:
+                    var localName = ""
+                    if !LoweringIfConditionLocalNameAndKind(stmt, localName, conditionKind):
+                        LoweringClearCallSequence(fnIr)
+                        fnIr.bodyKind = "general_cfg_cond_parse_missing"
+                        return
+                    condSlot = LoweringBodyIrLocalSlotIndex(fnIr, localName)
+            if condSlot < 0 || condSlot >= fnIr.bodyIR.localSlots.len:
+                LoweringClearCallSequence(fnIr)
+                fnIr.bodyKind = "general_cfg_cond_slot_missing"
+                return
+            let entryOpCount = fnIr.bodyIR.ops.len - blockStart
+            var entryTerm: coreir.BodyTerm
+            entryTerm.kind = coreir.BodyTermCbrTag
+            entryTerm.conditionKind = conditionKind
+            entryTerm.resultSlot = condSlot
+            entryTerm.lhsSlot = condSlot
+            entryTerm.trueBlock = fnIr.bodyIR.blocks.len + 1
+            entryTerm.falseBlock = fnIr.bodyIR.blocks.len + 2
+            let entryTermIndex = coreir.BodyIRAppendTerm(fnIr.bodyIR, entryTerm)
+            let _ = coreir.BodyIRAppendBlock(fnIr.bodyIR, blockStart, entryOpCount, entryTermIndex)
+            let trueStart = fnIr.bodyIR.ops.len
+            let trueTermIndex = LoweringAppendCfgCallsUntilReturn(fnIr, sourceTexts, stmt.lineNumber, true, stmt.lineNumber)
+            if trueTermIndex < 0:
+                LoweringClearCallSequence(fnIr)
+                fnIr.bodyKind = "general_cfg_true_missing"
+                return
+            let _ = coreir.BodyIRAppendBlock(fnIr.bodyIR, trueStart, fnIr.bodyIR.ops.len - trueStart, trueTermIndex)
+            blockStart = fnIr.bodyIR.ops.len
+            lastGuardLine = stmt.lineNumber
+            continue
+        if stmt.returnRoot:
+            continue
+        if stmt.kind == texpr.TypedExprIrStmtResultIntrinsic:
+            if LoweringAppendResultProjectionStatement(fnIr, stmt) < 0:
+                LoweringClearCallSequence(fnIr)
+                fnIr.bodyKind = "general_cfg_project_missing"
+                return
+            continue
+        if stmt.kind == texpr.TypedExprIrStmtIfCall:
+            continue
+        if len(stmt.callTarget) > 0:
+            let ordinal = LoweringAppendStructuredCall(fnIr, stmt, sourceTexts)
+            if ordinal < 0:
+                LoweringClearCallSequence(fnIr)
+                fnIr.bodyKind = "general_cfg_call_missing"
+                return
+            continue
+        LoweringClearCallSequence(fnIr)
+        fnIr.bodyKind = "general_cfg_stmt_unsupported"
+        return
+    let finalTermIndex = LoweringAppendCfgFinalReturnTerm(fnIr, sourceTexts, lastGuardLine)
+    if finalTermIndex < 0:
+        LoweringClearCallSequence(fnIr)
+        fnIr.bodyKind = "general_cfg_no_return"
+        return
+    let _ = coreir.BodyIRAppendBlock(fnIr.bodyIR, blockStart, fnIr.bodyIR.ops.len - blockStart, finalTermIndex)
+    fnIr.bodyKind = LoweringBodyKindGeneralCFG
+    fnIr.statementReturnMode = texpr.StatementReturnModeNone
+    fnIr.statementReturnI32Value = 0
+    fnIr.callTargetCount = fnIr.callSequence.len
+
 fn LoweringLegacyCallResultType(fnIr: PrimaryObjectIrFunction): str =
     if fnIr.bodyKind == texpr.BodyKindLetCallNoargStrReturnLenI32 ||
        fnIr.bodyKind == texpr.BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0:
@@ -1605,6 +1725,11 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                 elif hasLetCall && returnNode.opKind == texpr.TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0:
                     letCallReturnKind = texpr.BodyKindLetCallStrThenCallArg0ReturnI32Const0
         fnIr.bodyKind = leafBodyKind
+        if fnIr.bodyKind == LoweringBodyKindGeneralCFG:
+            LoweringBuildGeneralCFG(fnIr, sourceTexts)
+            fnIr.callTargetCount = fnIr.callSequence.len
+            add(ir.functions, fnIr)
+            continue
         fnIr.bodyLineNumber = bodyLineNumber
         if LoweringTypedStatementCfgHasCallOrProjection(fnIr):
             var typedStatementCfgReady = false

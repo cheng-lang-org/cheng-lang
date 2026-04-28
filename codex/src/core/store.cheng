@@ -601,3 +601,92 @@ fn codexStoreRemoveMcpServer(home: str, name: str): Result[bool] =
     if !codexStoreWriteText(path, codexStoreMcpServerIndexText(next)):
         return Err[bool](strutil.Join(["codex store: failed to write mcp server index: ", path], ""))
     return Ok[bool](true)
+
+# ---- Config Persistence ----
+
+fn codexStoreReadPlainField(lines: str[], key: str, outValue: var str): bool =
+    return codexStoreFindValue(lines, key, outValue)
+
+fn codexStoreConfigPath(home: str): str =
+    return os.JoinPath(home, "config.env")
+
+fn codexStoreConfigWrite(home: str, config: types.CodexConfigSnapshot): Result[bool] =
+    var out = ""
+    out = codexStoreAppendKv(out, "model_name", config.modelName)
+    out = codexStoreAppendKv(out, "auto_approve", textutil.codexBoolText(config.autoApprove))
+    out = codexStoreAppendKv(out, "max_turns", intToStr(config.maxTurns))
+    out = codexStoreAppendKv(out, "shell_command", config.shellCommand)
+    out = codexStoreAppendKv(out, "sandbox_enabled", textutil.codexBoolText(config.sandboxEnabled))
+    let configPath = codexStoreConfigPath(home)
+    if !codexStoreWriteText(configPath, out):
+        return Err[bool](strutil.Join(["codex store: failed to write config: ", configPath], ""))
+    return Ok[bool](true)
+
+fn codexStoreConfigRead(home: str): Result[types.CodexConfigSnapshot] =
+    var out: types.CodexConfigSnapshot
+    out.modelName = ""
+    out.autoApprove = false
+    out.maxTurns = 256
+    out.shellCommand = "/bin/sh"
+    out.sandboxEnabled = false
+    out.skillNames = []
+    out.pluginNames = []
+    out.mcpServerNames = []
+    let path = codexStoreConfigPath(home)
+    if !codexStoreFileExists(path):
+        return Ok[types.CodexConfigSnapshot](out)
+    let text = codexStoreReadText(path)
+    if !textutil.codexTextNonEmpty(text):
+        return Ok[types.CodexConfigSnapshot](out)
+    let lines = strutil.Split(text, '\n')
+    var raw = ""
+    if codexStoreReadPlainField(lines, "model_name", raw):
+        out.modelName = raw
+    if codexStoreReadPlainField(lines, "auto_approve", raw):
+        textutil.codexParseBoolText(raw, out.autoApprove)
+    if codexStoreReadPlainField(lines, "max_turns", raw):
+        textutil.codexParseInt32Text(raw, out.maxTurns)
+    if codexStoreReadPlainField(lines, "shell_command", raw):
+        out.shellCommand = raw
+    if codexStoreReadPlainField(lines, "sandbox_enabled", raw):
+        textutil.codexParseBoolText(raw, out.sandboxEnabled)
+    return Ok[types.CodexConfigSnapshot](out)
+
+# ---- Skill Storage ----
+
+fn codexStoreSkillsDir(home: str): str =
+    return os.JoinPath(home, "skills")
+
+fn codexStoreSkillDir(home: str, name: str): str =
+    return os.JoinPath(codexStoreSkillsDir(home), name)
+
+fn codexStoreSkillPromptPath(home: str, name: str): str =
+    return os.JoinPath(codexStoreSkillDir(home, name), "skill.txt")
+
+fn codexStoreSkillsIndexPath(home: str): str =
+    return os.JoinPath(codexStoreSkillsDir(home), "skills.index")
+
+fn codexStoreSkillWrite(home: str, name: str, promptText: str): Result[bool] =
+    let skillDir = codexStoreSkillDir(home, name)
+    if !codexStoreEnsureDir(skillDir):
+        return Err[bool](strutil.Join(["codex store: failed to create skill dir: ", skillDir], ""))
+    let promptPath = codexStoreSkillPromptPath(home, name)
+    if !codexStoreWriteText(promptPath, promptText):
+        return Err[bool](strutil.Join(["codex store: failed to write skill prompt: ", promptPath], ""))
+    return codexStoreAddUniqueLine(codexStoreSkillsIndexPath(home), name)
+
+fn codexStoreSkillRead(home: str, name: str): Result[str] =
+    let promptPath = codexStoreSkillPromptPath(home, name)
+    if !codexStoreFileExists(promptPath):
+        return Err[str](strutil.Join(["codex store: skill not found: ", name], ""))
+    let text = codexStoreReadText(promptPath)
+    return Ok[str](text)
+
+fn codexStoreSkillExists(home: str, name: str): bool =
+    return codexStoreFileExists(codexStoreSkillPromptPath(home, name))
+
+fn codexStoreListSkills(home: str): str[] =
+    return codexStoreReadNonEmptyLines(codexStoreSkillsIndexPath(home))
+
+fn codexStoreSkillRemove(home: str, name: str): Result[bool] =
+    return codexStoreRemoveLine(codexStoreSkillsIndexPath(home), name)

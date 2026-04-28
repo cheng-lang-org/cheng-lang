@@ -2,6 +2,7 @@ import std/os
 import std/os_host_process as hostos
 import std/result
 import std/strings
+import std/monotimes
 import std/times
 import cheng/codex/core/argv as argvutil
 import cheng/codex/core/engine
@@ -464,6 +465,213 @@ fn codexLoadResumeTarget(home: str): Result[types.CodexSession] =
         return store.codexStoreLoadLastSession(home)
     return store.codexStoreLoadLastSession(home)
 
+fn codexTuiApprovalPanel(request: types.CodexApprovalRequest): types.CodexApprovalDecision =
+    os.Write(os.Get_stdout(), codexScreenClearText())
+    os.Write(os.Get_stdout(), "+--- APPROVAL REQUIRED ---+\n")
+    os.Write(os.Get_stdout(), strutil.Join(["| tool:  ", request.toolName, "\n"], ""))
+    os.Write(os.Get_stdout(), strutil.Join(["| input: ", request.toolInput, "\n"], ""))
+    if textutil.codexTextNonEmpty(request.reason):
+        os.Write(os.Get_stdout(), strutil.Join(["| reason: ", request.reason, "\n"], ""))
+    os.Write(os.Get_stdout(), "+-------------------------+\n")
+    let answer = codexStdinReadLine("approve [y/N]: ")
+    var decision: types.CodexApprovalDecision
+    if answer == "y" || answer == "Y" || answer == "yes":
+        decision.approved = true
+        decision.reason = "approved by user"
+    else:
+        decision.approved = false
+        decision.reason = "denied by user"
+    return decision
+
+fn codexTuiToolLogRender(events: types.CodexTurnEvent[]) =
+    var hasTools = false
+    for i in 0..<events.len:
+        let ev = events[i]
+        if ev.kind == "tool_call" || ev.kind == "tool_result":
+            hasTools = true
+            break
+    if !hasTools:
+        return
+    os.Write(os.Get_stdout(), "\n--- TOOL RUN LOG ---\n")
+    for i in 0..<events.len:
+        let ev = events[i]
+        if ev.kind == "tool_call":
+            os.Write(os.Get_stdout(), strutil.Join(["[tool_call]  ", ev.toolName, ": ", ev.toolInput, "\n"], ""))
+        elif ev.kind == "tool_result":
+            var displaySummary = ev.toolOutput
+            if len(displaySummary) > 60:
+                displaySummary = textutil.codexTextSlice(displaySummary, 0, 60)
+            os.Write(os.Get_stdout(), strutil.Join(["[tool_result] ", ev.toolName, ": ", displaySummary, " (rc=", intToStr(ev.exitCode), ", ", strings.Int64ToStr(ev.elapsedMs), "ms)\n"], ""))
+    os.Write(os.Get_stdout(), "--------------------\n")
+
+fn codexTuiSessionListRender(home: str): str =
+    let sessions = store.codexStoreListSessions(home)
+    if sessions.len <= 0:
+        return "(no sessions)"
+    var parts: str[]
+    add(parts, "Sessions:")
+    for i in 0..<sessions.len:
+        let s = sessions[i]
+        add(parts, strutil.Join(["  ", s.sessionId, " | ", s.title, " (turns=", intToStr(s.turnCount), ", rc=", intToStr(s.lastExitCode), ")"], ""))
+    add(parts, "")
+    return Lines(parts)
+
+fn codexTuiExitRecoveryCheck(home: str): bool =
+    let lastPath = store.codexLastSessionPath(home)
+    let idText = textutil.codexTextTrim(store.codexStoreReadText(lastPath))
+    if !textutil.codexTextNonEmpty(idText):
+        return false
+    let loadRes = store.codexStoreSessionRead(home, idText)
+    if IsErr(loadRes):
+        return false
+    let session = Value(loadRes)
+    return session.turns.len > 0
+
+fn codexTuiEventLoop(home: str, session: var types.CodexSession, config: types.CodexConfigSnapshot): int32 =
+    var eventBuffer: types.CodexTurnEvent[]
+    while true:
+        codexTuiRender(session)
+        let line = textutil.codexTextTrim(codexStdinReadLine("codex> "))
+        if !textutil.codexTextNonEmpty(line):
+            continue
+        if line == "/quit":
+            let saveQuit = store.codexStoreSessionWrite(home, session)
+            return 0
+        if line == "/sessions":
+            let listText = codexTuiSessionListRender(home)
+            engine.codexAppendTurn(session, "/sessions", "", listText, 0, true)
+            let saveSessions = store.codexStoreSessionWrite(home, session)
+            continue
+        if textutil.codexTextStartsWith(line, "/resume "):
+            let target = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "/resume "))
+            let loadRes = store.codexStoreSessionRead(home, target)
+            if IsErr(loadRes):
+                engine.codexAppendTurn(session, line, "", Error(loadRes), 1, true)
+                let saveErr = store.codexStoreSessionWrite(home, session)
+                continue
+            session = Value(loadRes)
+            eventBuffer = []
+            continue
+        if textutil.codexTextStartsWith(line, "/title "):
+            session.title = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "/title "))
+            session.updatedAt = times.EpochTimeSeconds()
+            let saveTitle = store.codexStoreSessionWrite(home, session)
+            continue
+        if textutil.codexTextStartsWith(line, "/shell ") || textutil.codexTextStartsWith(line, "!"):
+            var commandText = ""
+            if textutil.codexTextStartsWith(line, "/shell "):
+                commandText = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "/shell "))
+            else:
+                commandText = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "!"))
+            if !textutil.codexTextNonEmpty(commandText):
+                continue
+
+            var approvalReq: types.CodexApprovalRequest
+            approvalReq.toolName = "shell"
+            approvalReq.toolInput = commandText
+            approvalReq.reason = "shell execution"
+
+            var approved = false
+            if config.autoApprove:
+                approved = true
+            else:
+                let decision = codexTuiApprovalPanel(approvalReq)
+                approved = decision.approved
+                var appEv: types.CodexTurnEvent
+                appEv.kind = "approval"
+                appEv.toolName = "shell"
+                appEv.toolInput = commandText
+                appEv.details = decision.reason
+                add(eventBuffer, appEv)
+                if eventBuffer.len > config.maxTurns:
+                    var newBuf: types.CodexTurnEvent[]
+                    let startIdx = eventBuffer.len - config.maxTurns
+                    for j in startIdx..<eventBuffer.len:
+                        add(newBuf, eventBuffer[j])
+                    eventBuffer = newBuf
+
+            if !approved:
+                engine.codexAppendTurn(session, line, commandText, "approval denied", 126, false)
+                let saveRes = store.codexStoreSessionWrite(home, session)
+                continue
+
+            let startNs = monotimes.GetMonoTime()
+            let startWall = monotimes.MonoTimeNs(startNs)
+
+            var callEv: types.CodexTurnEvent
+            callEv.kind = "tool_call"
+            callEv.toolName = "shell"
+            callEv.toolInput = commandText
+            add(eventBuffer, callEv)
+            if eventBuffer.len > config.maxTurns:
+                var newBuf: types.CodexTurnEvent[]
+                let startIdx = eventBuffer.len - config.maxTurns
+                for j in startIdx..<eventBuffer.len:
+                    add(newBuf, eventBuffer[j])
+                eventBuffer = newBuf
+
+            var execReq: types.CodexExecRequest
+            execReq.sessionId = session.sessionId
+            execReq.title = session.title
+            execReq.cwd = session.cwd
+            execReq.promptText = line
+            execReq.commandText = commandText
+            execReq.autoApprove = true
+
+            let runRes = engine.codexExecuteShell(home, execReq)
+
+            let endNs = monotimes.GetMonoTime()
+            let endWall = monotimes.MonoTimeNs(endNs)
+            let elapsedNs = endWall - startWall
+            let elapsedMs = elapsedNs / 1000000
+
+            if IsErr(runRes):
+                var errEv: types.CodexTurnEvent
+                errEv.kind = "tool_result"
+                errEv.toolName = "shell"
+                errEv.toolInput = commandText
+                errEv.toolOutput = Error(runRes)
+                errEv.exitCode = 1
+                errEv.elapsedMs = elapsedMs
+                add(eventBuffer, errEv)
+                if eventBuffer.len > config.maxTurns:
+                    var newBuf: types.CodexTurnEvent[]
+                    let startIdx = eventBuffer.len - config.maxTurns
+                    for j in startIdx..<eventBuffer.len:
+                        add(newBuf, eventBuffer[j])
+                    eventBuffer = newBuf
+
+                engine.codexAppendTurn(session, line, commandText, Error(runRes), 1, true)
+                let saveErr = store.codexStoreSessionWrite(home, session)
+            else:
+                let execResult = Value(runRes)
+
+                var resultEv: types.CodexTurnEvent
+                resultEv.kind = "tool_result"
+                resultEv.toolName = "shell"
+                resultEv.toolInput = commandText
+                resultEv.toolOutput = execResult.outputText
+                resultEv.exitCode = execResult.exitCode
+                resultEv.elapsedMs = elapsedMs
+                add(eventBuffer, resultEv)
+                if eventBuffer.len > config.maxTurns:
+                    var newBuf: types.CodexTurnEvent[]
+                    let startIdx = eventBuffer.len - config.maxTurns
+                    for j in startIdx..<eventBuffer.len:
+                        add(newBuf, eventBuffer[j])
+                    eventBuffer = newBuf
+
+                let loadRes = store.codexStoreSessionRead(home, session.sessionId)
+                if IsOk(loadRes):
+                    session = Value(loadRes)
+
+            codexTuiToolLogRender(eventBuffer)
+            continue
+
+        engine.codexAppendTurn(session, line, "", "plain prompt captured", 0, true)
+        let savePlain = store.codexStoreSessionWrite(home, session)
+    return 0
+
 fn codexTuiRun(home: str, createIfMissing: bool): int32 =
     var session: types.CodexSession
     let resumeRes = codexLoadResumeTarget(home)
@@ -478,49 +686,19 @@ fn codexTuiRun(home: str, createIfMissing: bool): int32 =
         if IsErr(saveNew):
             codexPrintErr(Error(saveNew))
             return 1
-    let autoApprove = codexResolveAutoApprove()
-    while true:
-        codexTuiRender(session)
-        let line = textutil.codexTextTrim(codexStdinReadLine("codex> "))
-        if !textutil.codexTextNonEmpty(line):
-            continue
-        if line == "/quit":
-            let saveQuit = store.codexStoreSessionWrite(home, session)
-            return 0
-        if line == "/sessions":
-            engine.codexAppendTurn(session, "/sessions", "", codexSessionListText(home), 0, true)
-            let saveSessions = store.codexStoreSessionWrite(home, session)
-            continue
-        if textutil.codexTextStartsWith(line, "/resume "):
-            let target = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "/resume "))
-            let loadRes = store.codexStoreSessionRead(home, target)
-            if IsErr(loadRes):
-                engine.codexAppendTurn(session, line, "", Error(loadRes), 1, true)
-                let saveErr = store.codexStoreSessionWrite(home, session)
-                continue
-            session = Value(loadRes)
-            continue
-        if textutil.codexTextStartsWith(line, "/title "):
-            session.title = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "/title "))
-            session.updatedAt = times.EpochTimeSeconds()
-            let saveTitle = store.codexStoreSessionWrite(home, session)
-            continue
-        if textutil.codexTextStartsWith(line, "/shell "):
-            let commandText = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "/shell "))
-            codexTuiExec(home, session, commandText, line, autoApprove)
-            continue
-        if textutil.codexTextStartsWith(line, "!"):
-            let commandText = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "!"))
-            codexTuiExec(home, session, commandText, line, autoApprove)
-            continue
-        engine.codexAppendTurn(session,
-                               line,
-                               "",
-                               "plain prompt captured; current Cheng slice executes shell via /shell or !",
-                               0,
-                               true)
-        let savePlain = store.codexStoreSessionWrite(home, session)
-    return 0
+
+    if codexTuiExitRecoveryCheck(home):
+        os.Write(os.Get_stdout(), codexScreenClearText())
+        os.Write(os.Get_stdout(), "--- EXIT RECOVERY ---\n")
+        os.Write(os.Get_stdout(), strutil.Join(["A previous session (", session.sessionId, ") is available.\n"], ""))
+        os.Write(os.Get_stdout(), "Continuing with existing session.\n")
+        os.Write(os.Get_stdout(), "----------------------\n")
+
+    var config: types.CodexConfigSnapshot
+    config.autoApprove = codexResolveAutoApprove()
+    config.maxTurns = 20
+
+    return codexTuiEventLoop(home, session, config)
 
 fn codexResumeCommand(home: str): int32 =
     if codexResumeWantsList():

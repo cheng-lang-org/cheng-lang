@@ -291,10 +291,21 @@ type
         nodeCount: int32
         returnNodeIndex: int32
 
+    # General-purpose statement IR node.
+    # Replaces per-shape bodyKinds with a uniform representation.
+    TypedExprIrStmt =
+        opKind: int32          # one of TypedExprIrOpGeneral* constants
+        resultType: str         # type of the result (for Result projection, carries inner type)
+        operands: int32[]       # indices into function's local/const table
+        sourcePath: str
+        functionName: str
+        lineNumber: int32
+
     TypedExprIr =
         functions: TypedExprIrFunction[]
         statements: TypedExprIrStatement[]
         nodes: TypedExprIrNode[]
+        generalStmts: TypedExprIrStmt[]
 
     TypedExprFunctionScope =
         sourcePath: str
@@ -403,6 +414,22 @@ const
     StatementReturnModeStrLen = 4
     StatementReturnModeStrThenCallReturnI32Const0 = 5
     StatementReturnModeCstringLiteralCallsReturnI32Const0 = 6
+
+    # General IR op constants (statement-level, for BodyKindGeneralCFG).
+    # These replace per-shape TypedExprIrOpKind values for function body representation.
+    TypedExprIrOpGeneralLocalDecl = 100     # let/var binding = expr
+    TypedExprIrOpGeneralCallStmt = 101      # f(...) as statement
+    TypedExprIrOpGeneralReturnCall = 102    # return f(...)
+    TypedExprIrOpGeneralReturnLocal = 103   # return local_variable
+    TypedExprIrOpGeneralReturnConst = 104   # return constant (int, str, bool, etc.)
+    TypedExprIrOpGeneralIfGuard = 105       # if condition: ... (true branch)
+    TypedExprIrOpGeneralElseBranch = 106    # else: ... (false branch)
+    TypedExprIrOpGeneralResultProject = 107 # IsErr(x), Error(x), Value(x)
+    TypedExprIrOpGeneralCallResultId = 108  # reference to result of a previous call
+
+    # General CFG body kind — function body is represented as general statement IR
+    # (not a per-shape legacy body kind).
+    BodyKindGeneralCFG = "general_cfg"
 
 fn TypedExprIsReturnCallBodyKind(bodyKind: str): bool =
     return bodyKind == BodyKindReturnCallNoargI32 ||
@@ -745,6 +772,163 @@ fn TypedExprIrStatementKindText(kind: TypedExprIrStatementKind): str =
     if kind == TypedExprIrStmtFor:
         return "for"
     return "unsupported"
+
+fn TypedExprIrOpGeneralText(op: int32): str =
+    if op == TypedExprIrOpGeneralLocalDecl:
+        return "local_decl"
+    if op == TypedExprIrOpGeneralCallStmt:
+        return "call_stmt"
+    if op == TypedExprIrOpGeneralReturnCall:
+        return "return_call"
+    if op == TypedExprIrOpGeneralReturnLocal:
+        return "return_local"
+    if op == TypedExprIrOpGeneralReturnConst:
+        return "return_const"
+    if op == TypedExprIrOpGeneralIfGuard:
+        return "if_guard"
+    if op == TypedExprIrOpGeneralElseBranch:
+        return "else_branch"
+    if op == TypedExprIrOpGeneralResultProject:
+        return "result_project"
+    if op == TypedExprIrOpGeneralCallResultId:
+        return "call_result_id"
+    return "unknown"
+
+fn TypedExprIrAppendGeneralStmt(ir: var TypedExprIr,
+                                 sourcePath: str,
+                                 functionName: str,
+                                 lineNumber: int32,
+                                 opKind: int32,
+                                 resultType: str,
+                                 operands: int32[]): int32 =
+    var stmt: TypedExprIrStmt
+    stmt.opKind = opKind
+    stmt.resultType = resultType
+    stmt.operands = operands
+    stmt.sourcePath = sourcePath
+    stmt.functionName = functionName
+    stmt.lineNumber = lineNumber
+    add(ir.generalStmts, stmt)
+    return ir.generalStmts.len - 1
+
+fn TypedExprAppendStatementsGeneral(ir: var TypedExprIr,
+                                     ctx: var TypedExprSourceContext,
+                                     scope: TypedExprFunctionScope,
+                                     facts: var TypedExprFact[],
+                                     factStartIndex: int32,
+                                     factEndIndex: int32) =
+    # This function emits general statement IR alongside the legacy per-shape nodes.
+    # It iterates facts for a function scope and emits TypedExprIrStmt entries
+    # into ir.generalStmts using the TypedExprIrOpGeneral* constants.
+    #
+    # For now, this is a minimal implementation. Future lowering code will consume
+    # the generalStmts array (via BodyKindGeneralCFG) instead of per-shape bodyKinds.
+    var cursor = factStartIndex
+    if cursor < 0:
+        cursor = 0
+    var endIndex = factEndIndex
+    if endIndex < 0 || endIndex > facts.len:
+        endIndex = facts.len
+    if cursor >= endIndex:
+        return
+    var currentLineNumber: int32 = -1
+    var currentLineBindingName = ""
+    var currentLineBindingType = ""
+    for i in cursor..<endIndex:
+        if facts[i].lineNumber <= scope.startLine || facts[i].lineNumber > scope.endLine:
+            if facts[i].lineNumber > scope.endLine:
+                break
+            continue
+        if facts[i].lineNumber != currentLineNumber:
+            currentLineNumber = facts[i].lineNumber
+            currentLineBindingName = ""
+            currentLineBindingType = ""
+            let lineRaw = TypedExprSourceLine(ctx, currentLineNumber)
+            let trimmedLine = chengpath.PathTrim(lineRaw)
+            if parser.ParserStartsWith(trimmedLine, "let ") ||
+               parser.ParserStartsWith(trimmedLine, "var ") ||
+               parser.ParserStartsWith(trimmedLine, "const "):
+                currentLineBindingName = TypedExprLetCallBindingNameFromBody(trimmedLine)
+                var bindingName = ""
+                var bindingType = ""
+                var rhsColumn: int32 = -1
+                if TypedExprParseBindingLine(lineRaw, bindingName, bindingType, rhsColumn):
+                    currentLineBindingName = bindingName
+                    currentLineBindingType = TypedExprNormalizeTypeText(bindingType)
+                if Len(currentLineBindingName) > 0:
+                    TypedExprIrAppendGeneralStmt(ir,
+                                                 ctx.sourcePath,
+                                                 scope.name,
+                                                 currentLineNumber,
+                                                 TypedExprIrOpGeneralLocalDecl,
+                                                 currentLineBindingType,
+                                                 [])
+        if facts[i].kind == parser.NormalizedExprReturn:
+            if Len(currentLineBindingName) > 0:
+                TypedExprIrAppendGeneralStmt(ir,
+                                             ctx.sourcePath,
+                                             scope.name,
+                                             facts[i].lineNumber,
+                                             TypedExprIrOpGeneralReturnLocal,
+                                             scope.returnType,
+                                             [])
+            elif facts[i].callKind == TypedExprCallBuiltin ||
+                 facts[i].callTarget == "":
+                TypedExprIrAppendGeneralStmt(ir,
+                                             ctx.sourcePath,
+                                             scope.name,
+                                             facts[i].lineNumber,
+                                             TypedExprIrOpGeneralReturnConst,
+                                             scope.returnType,
+                                             [])
+            else:
+                TypedExprIrAppendGeneralStmt(ir,
+                                             ctx.sourcePath,
+                                             scope.name,
+                                             facts[i].lineNumber,
+                                             TypedExprIrOpGeneralReturnCall,
+                                             scope.returnType,
+                                             [])
+            continue
+        if facts[i].kind == parser.NormalizedExprIfStmt ||
+           facts[i].kind == parser.NormalizedExprElifStmt:
+            TypedExprIrAppendGeneralStmt(ir,
+                                         ctx.sourcePath,
+                                         scope.name,
+                                         facts[i].lineNumber,
+                                         TypedExprIrOpGeneralIfGuard,
+                                         "bool",
+                                         [])
+            continue
+        if facts[i].kind == parser.NormalizedExprElseStmt:
+            TypedExprIrAppendGeneralStmt(ir,
+                                         ctx.sourcePath,
+                                         scope.name,
+                                         facts[i].lineNumber,
+                                         TypedExprIrOpGeneralElseBranch,
+                                         "",
+                                         [])
+            continue
+        if facts[i].kind == parser.NormalizedExprResultIntrinsic:
+            TypedExprIrAppendGeneralStmt(ir,
+                                         ctx.sourcePath,
+                                         scope.name,
+                                         facts[i].lineNumber,
+                                         TypedExprIrOpGeneralResultProject,
+                                         facts[i].typeText,
+                                         [])
+            continue
+        if facts[i].kind == parser.NormalizedExprCall &&
+           facts[i].callResolved &&
+           facts[i].callKind != TypedExprCallBuiltin:
+            TypedExprIrAppendGeneralStmt(ir,
+                                         ctx.sourcePath,
+                                         scope.name,
+                                         facts[i].lineNumber,
+                                         TypedExprIrOpGeneralCallStmt,
+                                         facts[i].typeText,
+                                         [])
+            continue
 
 fn TypedExprReturnOpKindFromIrOp(kind: TypedExprIrOpKind): TypedExprReturnOpKind =
     if kind == TypedExprIrOpI32Add:
@@ -6107,6 +6291,7 @@ fn TypedExprBuildIrForScope(ctx: var TypedExprSourceContext,
                              paramNodeIndices)
     TypedExprIrAppendLocalDeclStatementsForScope(ir, ctx, scope)
     TypedExprIrAppendStatementsForScope(ir, ctx, scope, facts, factStartIndex, factEndIndex)
+    TypedExprAppendStatementsGeneral(ir, ctx, scope, facts, factStartIndex, factEndIndex)
     let firstBindingCallFactIndex: int32 = TypedExprIrFirstBindingCallFactIndex(facts,
                                                                                 bodyLineNumber,
                                                                                 factStartIndex,
