@@ -1,5 +1,13 @@
 import cheng/core/ir/core_types as coreir
 
+type
+    BodyIrNoAliasFinalizeReport =
+        bodyIR: coreir.BodyIR
+        applied: bool
+        localCount: int32
+        forwardRewriteCount: int32
+        dodSoAContractOk: bool
+
 fn BodyIrNoAliasIntSeqInit(count: int32,
                             value: int32): int32[] =
     var out: int32[]
@@ -15,6 +23,23 @@ fn BodyIrNoAliasInvalidateAll(knownSource: var int32[]) =
     for i in 0..<knownSource.len:
         knownSource[i] = -1
 
+fn BodyIrNoAliasInvalidateAliasesOf(slot: int32,
+                                     knownSource: var int32[]) =
+    if slot < 0 || slot >= knownSource.len:
+        return
+    for i in 0..<knownSource.len:
+        if knownSource[i] == slot:
+            knownSource[i] = -1
+
+fn BodyIrNoAliasSetKnownSource(target: int32,
+                                source: int32,
+                                knownSource: var int32[]) =
+    if target < 0 || target >= knownSource.len:
+        return
+    if target != source:
+        BodyIrNoAliasInvalidateAliasesOf(target, knownSource)
+        knownSource[target] = source
+
 fn BodyIrNoAliasResolveSource(knownSource: int32[],
                                slot: int32): int32 =
     if slot < 0 || slot >= knownSource.len:
@@ -27,6 +52,13 @@ fn BodyIrNoAliasIsPtrDerefLoad(op: coreir.BodyOp): bool =
     return op.kind == coreir.BodyOpLoadLocalTag &&
            op.operands.len >= 3 &&
            op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag
+
+fn BodyIrNoAliasLocalCount(bodyIR: coreir.BodyIR): int32 =
+    var count: int32
+    for i in 0..<bodyIR.localSlots.len:
+        if bodyIR.localSlots[i].noAlias:
+            count = count + 1
+    return count
 
 fn BodyIrAnalyzeOwnership(bodyIR: var coreir.BodyIR) =
     if bodyIR.localSlots.len <= 0:
@@ -60,14 +92,134 @@ fn BodyIrAnalyzeOwnership(bodyIR: var coreir.BodyIR) =
                 let srcSlot = op.operands[0]
                 if BodyIrNoAliasLocalValid(bodyIR, srcSlot):
                     refCount[srcSlot] = refCount[srcSlot] + 1
-        elif op.operands.len > 0:
-            for oi in 0..<op.operands.len:
+        elif op.kind == coreir.BodyOpBranchTag:
+            if op.operands.len >= 2 && BodyIrNoAliasLocalValid(bodyIR, op.operands[1]):
+                refCount[op.operands[1]] = refCount[op.operands[1]] + 1
+        elif op.kind == coreir.BodyOpBinOpTag:
+            for oi in 2..<op.operands.len:
                 if BodyIrNoAliasLocalValid(bodyIR, op.operands[oi]):
                     refCount[op.operands[oi]] = refCount[op.operands[oi]] + 1
+        elif op.kind == coreir.BodyOpCmpTag:
+            for oi in 1..<op.operands.len:
+                if BodyIrNoAliasLocalValid(bodyIR, op.operands[oi]):
+                    refCount[op.operands[oi]] = refCount[op.operands[oi]] + 1
+        elif op.kind == coreir.BodyOpResultProjectTag:
+            if op.operands.len >= 2 && BodyIrNoAliasLocalValid(bodyIR, op.operands[1]):
+                refCount[op.operands[1]] = refCount[op.operands[1]] + 1
+        elif op.kind == coreir.BodyOpStrEqLiteralTag:
+            if op.operands.len >= 1 && BodyIrNoAliasLocalValid(bodyIR, op.operands[0]):
+                refCount[op.operands[0]] = refCount[op.operands[0]] + 1
     for si in 0..<bodyIR.localSlots.len:
         bodyIR.localSlots[si].noAlias = refCount[si] <= 1
 
-fn BodyIrNoAliasForwardLocals(bodyIR: coreir.BodyIR): coreir.BodyIR =
+fn BodyIrNoAliasRewriteOperand(op: var coreir.BodyOp,
+                                operandIndex: int32,
+                                knownSource: int32[]) =
+    if operandIndex < 0 || operandIndex >= op.operands.len:
+        return
+    op.operands[operandIndex] = BodyIrNoAliasResolveSource(knownSource,
+                                                           op.operands[operandIndex])
+
+fn BodyIrNoAliasInvalidateTarget(op: coreir.BodyOp,
+                                  knownSource: var int32[]) =
+    if op.target >= 0 && op.target < knownSource.len:
+        BodyIrNoAliasInvalidateAliasesOf(op.target, knownSource)
+        knownSource[op.target] = -1
+
+fn BodyIrNoAliasForwardOp(op: var coreir.BodyOp,
+                           knownSource: var int32[],
+                           allowDropSelfCopy: bool,
+                           dropOp: var bool) =
+    dropOp = false
+    if op.kind == coreir.BodyOpCallTag:
+        BodyIrNoAliasInvalidateAll(knownSource)
+        BodyIrNoAliasInvalidateTarget(op, knownSource)
+        return
+    if op.kind == coreir.BodyOpCopyLocalTag:
+        if op.operands.len > 0:
+            let sourceSlot = BodyIrNoAliasResolveSource(knownSource, op.operands[0])
+            op.operands[0] = sourceSlot
+            BodyIrNoAliasSetKnownSource(op.target, sourceSlot, knownSource)
+            if allowDropSelfCopy && op.target == sourceSlot:
+                dropOp = true
+        else:
+            BodyIrNoAliasInvalidateTarget(op, knownSource)
+        return
+    if op.kind == coreir.BodyOpLoadLocalTag &&
+       !BodyIrNoAliasIsPtrDerefLoad(op):
+        if op.operands.len > 0:
+            let sourceSlot = BodyIrNoAliasResolveSource(knownSource, op.operands[0])
+            op.operands[0] = sourceSlot
+            BodyIrNoAliasSetKnownSource(op.target, sourceSlot, knownSource)
+        else:
+            BodyIrNoAliasInvalidateTarget(op, knownSource)
+        return
+    if op.kind == coreir.BodyOpStoreLocalTag:
+        BodyIrNoAliasRewriteOperand(op, 0, knownSource)
+        BodyIrNoAliasInvalidateTarget(op, knownSource)
+        return
+    if op.kind == coreir.BodyOpReturnTag:
+        if op.target >= 0 && op.target < knownSource.len:
+            op.target = BodyIrNoAliasResolveSource(knownSource, op.target)
+        return
+    if op.kind == coreir.BodyOpBranchTag:
+        BodyIrNoAliasRewriteOperand(op, 1, knownSource)
+        return
+    if op.kind == coreir.BodyOpBinOpTag:
+        for operandIndex in 2..<op.operands.len:
+            BodyIrNoAliasRewriteOperand(op, operandIndex, knownSource)
+        BodyIrNoAliasInvalidateTarget(op, knownSource)
+        return
+    if op.kind == coreir.BodyOpCmpTag:
+        for operandIndex in 1..<op.operands.len:
+            BodyIrNoAliasRewriteOperand(op, operandIndex, knownSource)
+        BodyIrNoAliasInvalidateTarget(op, knownSource)
+        return
+    if op.kind == coreir.BodyOpResultProjectTag:
+        BodyIrNoAliasRewriteOperand(op, 1, knownSource)
+        BodyIrNoAliasInvalidateTarget(op, knownSource)
+        return
+    if op.kind == coreir.BodyOpStrEqLiteralTag:
+        BodyIrNoAliasRewriteOperand(op, 0, knownSource)
+        BodyIrNoAliasInvalidateTarget(op, knownSource)
+        return
+    if op.kind == coreir.BodyOpLoadConstTag:
+        BodyIrNoAliasInvalidateTarget(op, knownSource)
+
+fn BodyIrNoAliasForwardTerm(term: coreir.BodyTerm,
+                             knownSource: int32[]): coreir.BodyTerm =
+    var out = term
+    if out.resultSlot >= 0:
+        out.resultSlot = BodyIrNoAliasResolveSource(knownSource, out.resultSlot)
+    if out.lhsSlot >= 0:
+        out.lhsSlot = BodyIrNoAliasResolveSource(knownSource, out.lhsSlot)
+    if out.rhsSlot >= 0:
+        out.rhsSlot = BodyIrNoAliasResolveSource(knownSource, out.rhsSlot)
+    return out
+
+fn BodyIrNoAliasForwardLocalsInBlocks(bodyIR: coreir.BodyIR): coreir.BodyIR =
+    if bodyIR.blocks.len <= 0 || bodyIR.terms.len <= 0:
+        return bodyIR
+    var out = bodyIR
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        if block.opStart < 0 ||
+           block.opCount < 0 ||
+           block.opStart + block.opCount > bodyIR.ops.len ||
+           block.termIndex < 0 ||
+           block.termIndex >= bodyIR.terms.len:
+            return bodyIR
+        var knownSource = BodyIrNoAliasIntSeqInit(bodyIR.localSlots.len, -1)
+        for opIndex in block.opStart..<(block.opStart + block.opCount):
+            var op = out.ops[opIndex]
+            var dropOp = false
+            BodyIrNoAliasForwardOp(op, knownSource, false, dropOp)
+            out.ops[opIndex] = op
+        out.terms[block.termIndex] = BodyIrNoAliasForwardTerm(out.terms[block.termIndex],
+                                                              knownSource)
+    return out
+
+fn BodyIrNoAliasForwardLocalsLinear(bodyIR: coreir.BodyIR): coreir.BodyIR =
     if bodyIR.blocks.len > 0 || bodyIR.terms.len > 0:
         return bodyIR
     if bodyIR.localSlots.len <= 0 || bodyIR.ops.len <= 0:
@@ -77,46 +229,89 @@ fn BodyIrNoAliasForwardLocals(bodyIR: coreir.BodyIR): coreir.BodyIR =
     var knownSource = BodyIrNoAliasIntSeqInit(bodyIR.localSlots.len, -1)
     for opIndex in 0..<bodyIR.ops.len:
         var op = bodyIR.ops[opIndex]
-        if op.kind == coreir.BodyOpCallTag:
-            BodyIrNoAliasInvalidateAll(knownSource)
-            if BodyIrNoAliasLocalValid(bodyIR, op.target):
-                knownSource[op.target] = -1
-            add(out.ops, op)
+        var dropOp = false
+        BodyIrNoAliasForwardOp(op, knownSource, true, dropOp)
+        if dropOp:
             continue
-        if op.kind == coreir.BodyOpCopyLocalTag:
-            if op.operands.len > 0:
-                let sourceSlot = BodyIrNoAliasResolveSource(knownSource, op.operands[0])
-                op.operands[0] = sourceSlot
-                if BodyIrNoAliasLocalValid(bodyIR, op.target):
-                    knownSource[op.target] = sourceSlot
-                if op.target == sourceSlot:
-                    continue
-            elif BodyIrNoAliasLocalValid(bodyIR, op.target):
-                knownSource[op.target] = -1
-            add(out.ops, op)
-            continue
-        if op.kind == coreir.BodyOpLoadLocalTag &&
-           !BodyIrNoAliasIsPtrDerefLoad(op):
-            if op.operands.len > 0:
-                let sourceSlot = BodyIrNoAliasResolveSource(knownSource, op.operands[0])
-                op.operands[0] = sourceSlot
-                if BodyIrNoAliasLocalValid(bodyIR, op.target):
-                    knownSource[op.target] = sourceSlot
-            elif BodyIrNoAliasLocalValid(bodyIR, op.target):
-                knownSource[op.target] = -1
-            add(out.ops, op)
-            continue
-        if op.kind == coreir.BodyOpStoreLocalTag:
-            if op.operands.len > 0:
-                op.operands[0] = BodyIrNoAliasResolveSource(knownSource, op.operands[0])
-            if BodyIrNoAliasLocalValid(bodyIR, op.target):
-                knownSource[op.target] = -1
-            add(out.ops, op)
-            continue
-        if op.kind == coreir.BodyOpLoadConstTag ||
-           op.kind == coreir.BodyOpBinOpTag ||
-           op.kind == coreir.BodyOpCmpTag:
-            if BodyIrNoAliasLocalValid(bodyIR, op.target):
-                knownSource[op.target] = -1
         add(out.ops, op)
     return out
+
+fn BodyIrNoAliasForwardLocals(bodyIR: coreir.BodyIR): coreir.BodyIR =
+    if bodyIR.blocks.len > 0 || bodyIR.terms.len > 0:
+        return BodyIrNoAliasForwardLocalsInBlocks(bodyIR)
+    return BodyIrNoAliasForwardLocalsLinear(bodyIR)
+
+fn BodyIrNoAliasOpRewriteCount(before: coreir.BodyOp,
+                                after: coreir.BodyOp): int32 =
+    var count: int32
+    if before.target != after.target:
+        count = count + 1
+    if before.operands.len != after.operands.len:
+        count = count + 1
+    var operandLimit = before.operands.len
+    if after.operands.len < operandLimit:
+        operandLimit = after.operands.len
+    for operandIndex in 0..<operandLimit:
+        if before.operands[operandIndex] != after.operands[operandIndex]:
+            count = count + 1
+    return count
+
+fn BodyIrNoAliasTermRewriteCount(before: coreir.BodyTerm,
+                                  after: coreir.BodyTerm): int32 =
+    var count: int32
+    if before.resultSlot != after.resultSlot:
+        count = count + 1
+    if before.lhsSlot != after.lhsSlot:
+        count = count + 1
+    if before.rhsSlot != after.rhsSlot:
+        count = count + 1
+    return count
+
+fn BodyIrNoAliasRewriteCount(before: coreir.BodyIR,
+                              after: coreir.BodyIR): int32 =
+    var count: int32
+    if before.ops.len != after.ops.len:
+        count = count + 1
+    var opLimit = before.ops.len
+    if after.ops.len < opLimit:
+        opLimit = after.ops.len
+    for opIndex in 0..<opLimit:
+        count = count + BodyIrNoAliasOpRewriteCount(before.ops[opIndex],
+                                                    after.ops[opIndex])
+    var termLimit = before.terms.len
+    if after.terms.len < termLimit:
+        termLimit = after.terms.len
+    for termIndex in 0..<termLimit:
+        count = count + BodyIrNoAliasTermRewriteCount(before.terms[termIndex],
+                                                      after.terms[termIndex])
+    return count
+
+fn BodyIrNoAliasHasSurface(bodyIR: coreir.BodyIR): bool =
+    return bodyIR.localSlots.len > 0 ||
+           bodyIR.ops.len > 0 ||
+           bodyIR.blocks.len > 0 ||
+           bodyIR.terms.len > 0 ||
+           bodyIR.callSequence.len > 0
+
+fn BodyIrNoAliasFinalize(bodyIR: coreir.BodyIR): BodyIrNoAliasFinalizeReport =
+    var report: BodyIrNoAliasFinalizeReport
+    report.bodyIR = bodyIR
+    let inputDodReport = coreir.BodyIRDodSoAContractCheck(bodyIR)
+    report.dodSoAContractOk = inputDodReport.ok
+    if !inputDodReport.ok || !BodyIrNoAliasHasSurface(bodyIR):
+        return report
+
+    var analyzed = bodyIR
+    BodyIrAnalyzeOwnership(analyzed)
+    let forwarded = BodyIrNoAliasForwardLocals(analyzed)
+    let outputDodReport = coreir.BodyIRDodSoAContractCheck(forwarded)
+    report.bodyIR = forwarded
+    report.dodSoAContractOk = outputDodReport.ok
+    if !outputDodReport.ok:
+        return report
+
+    report.applied = true
+    report.localCount = BodyIrNoAliasLocalCount(forwarded)
+    report.forwardRewriteCount = BodyIrNoAliasRewriteCount(analyzed,
+                                                           forwarded)
+    return report

@@ -1,3 +1,5 @@
+import std/strformat
+
 type
     NameId = int32
 
@@ -318,6 +320,28 @@ type
         terms: BodyTerm[]
         cstringLiterals: CStringLiteralEntry[]
 
+    BodyIRDodSoAContractReport =
+        ok: bool
+        indexWidthBits: int32
+        independentArrayCount: int32
+        opCount: int32
+        callCount: int32
+        localCount: int32
+        blockCount: int32
+        termCount: int32
+        cstringCount: int32
+        localRefCount: int32
+        blockRefCount: int32
+        termRefCount: int32
+        callRefCount: int32
+        cstringRefCount: int32
+        encodedParamRefCount: int32
+        invalidRefCount: int32
+        pointerKeyCount: int32
+        firstInvalidRefOwner: str
+        firstInvalidRefValue: int32
+        firstInvalidRefLimit: int32
+
     LirFunction = ref
         id: FuncId
         nameId: NameId
@@ -443,3 +467,341 @@ fn BodyIRAppendTerm(bodyIR: var BodyIR, term: BodyTerm): int32 =
     let termIndex = bodyIR.terms.len
     add(bodyIR.terms, term)
     return termIndex
+
+fn bodyIRDodBoolText(value: bool): str =
+    if value:
+        return "1"
+    return "0"
+
+fn bodyIRDodBodyOpKindValid(kind: int32): bool =
+    return kind >= BodyOpLoadConstTag && kind <= BodyOpStrEqLiteralTag
+
+fn bodyIRDodBodyTermKindValid(kind: int32): bool =
+    return kind >= BodyTermReturnTag && kind <= BodyTermCbrTag
+
+fn bodyIRDodMarkInvalid(report: var BodyIRDodSoAContractReport,
+                         owner: str,
+                         value: int32,
+                         limit: int32) =
+    if report.invalidRefCount == 0:
+        report.firstInvalidRefOwner = owner
+        report.firstInvalidRefValue = value
+        report.firstInvalidRefLimit = limit
+    report.invalidRefCount = report.invalidRefCount + 1
+    report.ok = false
+
+fn bodyIRDodCheckLocalRef(report: var BodyIRDodSoAContractReport,
+                           owner: str,
+                           value: int32,
+                           limit: int32) =
+    report.localRefCount = report.localRefCount + 1
+    if value < 0 || value >= limit:
+        bodyIRDodMarkInvalid(report, owner, value, limit)
+
+fn bodyIRDodCheckMaybeLocalRef(report: var BodyIRDodSoAContractReport,
+                                owner: str,
+                                value: int32,
+                                limit: int32) =
+    if value < 0:
+        return
+    bodyIRDodCheckLocalRef(report, owner, value, limit)
+
+fn bodyIRDodCheckCallArgRef(report: var BodyIRDodSoAContractReport,
+                             owner: str,
+                             value: int32,
+                             limit: int32) =
+    if value == CallArgSlotMissing():
+        bodyIRDodMarkInvalid(report, owner, value, limit)
+        return
+    if value < 0:
+        report.encodedParamRefCount = report.encodedParamRefCount + 1
+        return
+    bodyIRDodCheckLocalRef(report, owner, value, limit)
+
+fn bodyIRDodCheckBlockRef(report: var BodyIRDodSoAContractReport,
+                           owner: str,
+                           value: int32,
+                           limit: int32) =
+    report.blockRefCount = report.blockRefCount + 1
+    if value < 0 || value >= limit:
+        bodyIRDodMarkInvalid(report, owner, value, limit)
+
+fn bodyIRDodCheckTermRef(report: var BodyIRDodSoAContractReport,
+                          owner: str,
+                          value: int32,
+                          limit: int32) =
+    report.termRefCount = report.termRefCount + 1
+    if value < 0 || value >= limit:
+        bodyIRDodMarkInvalid(report, owner, value, limit)
+
+fn bodyIRDodCheckCallRef(report: var BodyIRDodSoAContractReport,
+                          owner: str,
+                          value: int32,
+                          limit: int32) =
+    report.callRefCount = report.callRefCount + 1
+    if value < 0 || value >= limit:
+        bodyIRDodMarkInvalid(report, owner, value, limit)
+
+fn bodyIRDodCheckCStringRef(report: var BodyIRDodSoAContractReport,
+                             owner: str,
+                             value: int32,
+                             limit: int32) =
+    report.cstringRefCount = report.cstringRefCount + 1
+    if value < 0 || value >= limit:
+        bodyIRDodMarkInvalid(report, owner, value, limit)
+
+fn bodyIRDodCheckLocalSlots(bodyIR: BodyIR,
+                             report: var BodyIRDodSoAContractReport) =
+    for localIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[localIndex]
+        if slot.id != localIndex:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"localSlots[{localIndex}].id",
+                                 slot.id,
+                                 bodyIR.localSlots.len)
+
+fn bodyIRDodCheckCStringLiterals(bodyIR: BodyIR,
+                                  report: var BodyIRDodSoAContractReport) =
+    for literalIndex in 0..<bodyIR.cstringLiterals.len:
+        let literal = bodyIR.cstringLiterals[literalIndex]
+        if literal.id != literalIndex:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"cstringLiterals[{literalIndex}].id",
+                                 literal.id,
+                                 bodyIR.cstringLiterals.len)
+
+fn bodyIRDodCheckBlocks(bodyIR: BodyIR,
+                         report: var BodyIRDodSoAContractReport) =
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        if block.id != blockIndex:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"blocks[{blockIndex}].id",
+                                 block.id,
+                                 bodyIR.blocks.len)
+        if block.opStart < 0 ||
+           block.opCount < 0 ||
+           block.opStart + block.opCount > bodyIR.ops.len:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"blocks[{blockIndex}].opRange",
+                                 block.opStart,
+                                 bodyIR.ops.len)
+        bodyIRDodCheckTermRef(report,
+                              Fmt"blocks[{blockIndex}].termIndex",
+                              block.termIndex,
+                              bodyIR.terms.len)
+
+fn bodyIRDodCheckTerm(bodyIR: BodyIR,
+                       report: var BodyIRDodSoAContractReport,
+                       termIndex: int32) =
+    let term = bodyIR.terms[termIndex]
+    if !bodyIRDodBodyTermKindValid(term.kind):
+        bodyIRDodMarkInvalid(report,
+                             Fmt"terms[{termIndex}].kind",
+                             term.kind,
+                             BodyTermCbrTag)
+        return
+    bodyIRDodCheckMaybeLocalRef(report,
+                                Fmt"terms[{termIndex}].resultSlot",
+                                term.resultSlot,
+                                bodyIR.localSlots.len)
+    bodyIRDodCheckMaybeLocalRef(report,
+                                Fmt"terms[{termIndex}].lhsSlot",
+                                term.lhsSlot,
+                                bodyIR.localSlots.len)
+    bodyIRDodCheckMaybeLocalRef(report,
+                                Fmt"terms[{termIndex}].rhsSlot",
+                                term.rhsSlot,
+                                bodyIR.localSlots.len)
+    if term.kind == BodyTermBrTag:
+        bodyIRDodCheckBlockRef(report,
+                               Fmt"terms[{termIndex}].trueBlock",
+                               term.trueBlock,
+                               bodyIR.blocks.len)
+    elif term.kind == BodyTermCbrTag:
+        bodyIRDodCheckBlockRef(report,
+                               Fmt"terms[{termIndex}].trueBlock",
+                               term.trueBlock,
+                               bodyIR.blocks.len)
+        bodyIRDodCheckBlockRef(report,
+                               Fmt"terms[{termIndex}].falseBlock",
+                               term.falseBlock,
+                               bodyIR.blocks.len)
+
+fn bodyIRDodCheckTerms(bodyIR: BodyIR,
+                        report: var BodyIRDodSoAContractReport) =
+    for termIndex in 0..<bodyIR.terms.len:
+        bodyIRDodCheckTerm(bodyIR, report, termIndex)
+
+fn bodyIRDodCheckCallSequence(bodyIR: BodyIR,
+                               report: var BodyIRDodSoAContractReport) =
+    for callIndex in 0..<bodyIR.callSequence.len:
+        let callOp = bodyIR.callSequence[callIndex]
+        bodyIRDodCheckMaybeLocalRef(report,
+                                    Fmt"callSequence[{callIndex}].resultSlot",
+                                    callOp.resultSlot,
+                                    bodyIR.localSlots.len)
+        for argIndex in 0..<callOp.argSlots.len:
+            bodyIRDodCheckCallArgRef(report,
+                                     Fmt"callSequence[{callIndex}].argSlots[{argIndex}]",
+                                     callOp.argSlots[argIndex],
+                                     bodyIR.localSlots.len)
+
+fn bodyIRDodCheckOpTarget(bodyIR: BodyIR,
+                           report: var BodyIRDodSoAContractReport,
+                           opIndex: int32,
+                           op: BodyOp) =
+    if op.kind == BodyOpReturnTag ||
+       op.kind == BodyOpBranchTag ||
+       op.kind == BodyOpCallTag:
+        bodyIRDodCheckMaybeLocalRef(report,
+                                    Fmt"ops[{opIndex}].target",
+                                    op.target,
+                                    bodyIR.localSlots.len)
+        return
+    bodyIRDodCheckLocalRef(report,
+                           Fmt"ops[{opIndex}].target",
+                           op.target,
+                           bodyIR.localSlots.len)
+
+fn bodyIRDodCheckOp(bodyIR: BodyIR,
+                     report: var BodyIRDodSoAContractReport,
+                     opIndex: int32) =
+    let op = bodyIR.ops[opIndex]
+    if !bodyIRDodBodyOpKindValid(op.kind):
+        bodyIRDodMarkInvalid(report,
+                             Fmt"ops[{opIndex}].kind",
+                             op.kind,
+                             BodyOpStrEqLiteralTag)
+        return
+    bodyIRDodCheckOpTarget(bodyIR, report, opIndex, op)
+    if op.kind == BodyOpCallTag:
+        if op.operands.len < 1:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"ops[{opIndex}].callOrdinal",
+                                 -1,
+                                 bodyIR.callSequence.len)
+            return
+        bodyIRDodCheckCallRef(report,
+                              Fmt"ops[{opIndex}].callOrdinal",
+                              op.operands[0],
+                              bodyIR.callSequence.len)
+    elif op.kind == BodyOpLoadLocalTag:
+        if op.operands.len >= 3 && op.operands[0] == BodyLoadLocalPtrDerefI32Tag:
+            bodyIRDodCheckLocalRef(report,
+                                   Fmt"ops[{opIndex}].ptrSource",
+                                   op.operands[1],
+                                   bodyIR.localSlots.len)
+        elif op.operands.len >= 1:
+            bodyIRDodCheckLocalRef(report,
+                                   Fmt"ops[{opIndex}].source",
+                                   op.operands[0],
+                                   bodyIR.localSlots.len)
+    elif op.kind == BodyOpStoreLocalTag ||
+         op.kind == BodyOpCopyLocalTag:
+        if op.operands.len < 1:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"ops[{opIndex}].source",
+                                 -1,
+                                 bodyIR.localSlots.len)
+        else:
+            bodyIRDodCheckLocalRef(report,
+                                   Fmt"ops[{opIndex}].source",
+                                   op.operands[0],
+                                   bodyIR.localSlots.len)
+    elif op.kind == BodyOpBinOpTag:
+        for operandIndex in 2..<op.operands.len:
+            bodyIRDodCheckLocalRef(report,
+                                   Fmt"ops[{opIndex}].operands[{operandIndex}]",
+                                   op.operands[operandIndex],
+                                   bodyIR.localSlots.len)
+    elif op.kind == BodyOpCmpTag:
+        for operandIndex in 1..<op.operands.len:
+            bodyIRDodCheckLocalRef(report,
+                                   Fmt"ops[{opIndex}].operands[{operandIndex}]",
+                                   op.operands[operandIndex],
+                                   bodyIR.localSlots.len)
+    elif op.kind == BodyOpBranchTag:
+        if op.operands.len >= 2:
+            bodyIRDodCheckLocalRef(report,
+                                   Fmt"ops[{opIndex}].branchSlot",
+                                   op.operands[1],
+                                   bodyIR.localSlots.len)
+    elif op.kind == BodyOpResultProjectTag:
+        if op.operands.len < 2:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"ops[{opIndex}].projectSource",
+                                 -1,
+                                 bodyIR.localSlots.len)
+        else:
+            bodyIRDodCheckLocalRef(report,
+                                   Fmt"ops[{opIndex}].projectSource",
+                                   op.operands[1],
+                                   bodyIR.localSlots.len)
+    elif op.kind == BodyOpStrEqLiteralTag:
+        if op.operands.len < 2:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"ops[{opIndex}].cstringLiteral",
+                                 -1,
+                                 bodyIR.cstringLiterals.len)
+        else:
+            bodyIRDodCheckLocalRef(report,
+                                   Fmt"ops[{opIndex}].strSlot",
+                                   op.operands[0],
+                                   bodyIR.localSlots.len)
+            bodyIRDodCheckCStringRef(report,
+                                     Fmt"ops[{opIndex}].cstringLiteral",
+                                     op.operands[1],
+                                     bodyIR.cstringLiterals.len)
+
+fn bodyIRDodCheckOps(bodyIR: BodyIR,
+                      report: var BodyIRDodSoAContractReport) =
+    for opIndex in 0..<bodyIR.ops.len:
+        bodyIRDodCheckOp(bodyIR, report, opIndex)
+
+fn BodyIRDodSoAContractCheck(bodyIR: BodyIR): BodyIRDodSoAContractReport =
+    var report: BodyIRDodSoAContractReport
+    report.ok = true
+    report.indexWidthBits = 32
+    report.independentArrayCount = 6
+    report.opCount = bodyIR.ops.len
+    report.callCount = bodyIR.callSequence.len
+    report.localCount = bodyIR.localSlots.len
+    report.blockCount = bodyIR.blocks.len
+    report.termCount = bodyIR.terms.len
+    report.cstringCount = bodyIR.cstringLiterals.len
+    bodyIRDodCheckLocalSlots(bodyIR, report)
+    bodyIRDodCheckCStringLiterals(bodyIR, report)
+    bodyIRDodCheckCallSequence(bodyIR, report)
+    bodyIRDodCheckOps(bodyIR, report)
+    bodyIRDodCheckBlocks(bodyIR, report)
+    bodyIRDodCheckTerms(bodyIR, report)
+    if report.pointerKeyCount != 0:
+        report.ok = false
+    return report
+
+fn BodyIRDodSoAContractReportText(report: BodyIRDodSoAContractReport): str =
+    return Fmt"""
+    body_ir_dod_soa_ok={bodyIRDodBoolText(report.ok)}
+    body_ir_dod_soa_index_width_bits={report.indexWidthBits}
+    body_ir_dod_soa_independent_array_count={report.independentArrayCount}
+    body_ir_dod_soa_arrays=ops,callSequence,localSlots,blocks,terms,cstringLiterals
+    body_ir_dod_soa_op_count={report.opCount}
+    body_ir_dod_soa_call_count={report.callCount}
+    body_ir_dod_soa_local_count={report.localCount}
+    body_ir_dod_soa_block_count={report.blockCount}
+    body_ir_dod_soa_term_count={report.termCount}
+    body_ir_dod_soa_cstring_count={report.cstringCount}
+    body_ir_dod_soa_local_ref_count={report.localRefCount}
+    body_ir_dod_soa_block_ref_count={report.blockRefCount}
+    body_ir_dod_soa_term_ref_count={report.termRefCount}
+    body_ir_dod_soa_call_ref_count={report.callRefCount}
+    body_ir_dod_soa_cstring_ref_count={report.cstringRefCount}
+    body_ir_dod_soa_encoded_param_ref_count={report.encodedParamRefCount}
+    body_ir_dod_soa_invalid_ref_count={report.invalidRefCount}
+    body_ir_dod_soa_pointer_key_count={report.pointerKeyCount}
+    body_ir_dod_soa_no_naked_pointer_key={bodyIRDodBoolText(report.pointerKeyCount == 0)}
+    body_ir_dod_soa_first_invalid_ref_owner={report.firstInvalidRefOwner}
+    body_ir_dod_soa_first_invalid_ref_value={report.firstInvalidRefValue}
+    body_ir_dod_soa_first_invalid_ref_limit={report.firstInvalidRefLimit}
+    """

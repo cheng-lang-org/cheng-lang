@@ -5,11 +5,13 @@ import std/strformat
 import cheng/core/tooling/path as chengpath
 import cheng/core/tooling/host_ops as hostops
 import cheng/core/tooling/bootstrap_contracts as boot
+import cheng/core/tooling/runtime_c_baseline_contract as runtimebase
 
 type
     PerfMemoryThreshold =
         maxElapsedMs: int64
         maxRssBytes: int64
+        maxOutputFileSizeBytes: int64
 
     PerfMemoryExecPhaseSummary =
         systemLinkPlanMs: int64
@@ -62,11 +64,25 @@ type
         elapsedMs: int64
         maxRssBytes: int64
         peakFootprintBytes: int64
+        outputFileSizeBytes: int64
         output: str
+
+    PerfMemoryRuntimeCBaselineContract =
+        ok: bool
+        report: str
 
 fn PerfMemoryThresholdNew(maxElapsedMs: int64,
                             maxRssBytes: int64): PerfMemoryThreshold =
-    return PerfMemoryThreshold(maxElapsedMs: maxElapsedMs, maxRssBytes: maxRssBytes)
+    return PerfMemoryThreshold(maxElapsedMs: maxElapsedMs,
+                                maxRssBytes: maxRssBytes,
+                                maxOutputFileSizeBytes: int64(0))
+
+fn PerfMemoryThresholdWithOutputFileSize(maxElapsedMs: int64,
+                                          maxRssBytes: int64,
+                                          maxOutputFileSizeBytes: int64): PerfMemoryThreshold =
+    return PerfMemoryThreshold(maxElapsedMs: maxElapsedMs,
+                                maxRssBytes: maxRssBytes,
+                                maxOutputFileSizeBytes: maxOutputFileSizeBytes)
 
 fn PerfMemoryExecPhaseSummaryEmpty(): PerfMemoryExecPhaseSummary =
     var out: PerfMemoryExecPhaseSummary
@@ -120,6 +136,7 @@ fn PerfMemoryRunNew(label: str,
                       elapsedMs: int64,
                       maxRssBytes: int64,
                       peakFootprintBytes: int64,
+                      outputFileSizeBytes: int64,
                       output: str): PerfMemoryRun =
     return PerfMemoryRun(label: label,
                            logPath: logPath,
@@ -127,6 +144,7 @@ fn PerfMemoryRunNew(label: str,
                            elapsedMs: elapsedMs,
                            maxRssBytes: maxRssBytes,
                            peakFootprintBytes: peakFootprintBytes,
+                           outputFileSizeBytes: outputFileSizeBytes,
                            output: output)
 
 fn PerfMemoryColdSelfBuildBudgetMs(): int64 =
@@ -548,6 +566,7 @@ fn PerfMemoryMeasureFileRun(root: str,
                               elapsedMs,
                               maxRssBytes,
                               peakFootprintBytes,
+                              int64(-1),
                               logged.output)
 
 fn PerfMemoryCompileExe(root: str,
@@ -577,22 +596,24 @@ fn PerfMemoryCompileExeWithEnv(root: str,
                                  envOverrides: str[],
                                  timeoutSec: int32,
                                  logPath: str): PerfMemoryRun =
-    return PerfMemoryMeasureFileRun(root,
-                                      label,
-                                      compilerPath,
-                                      [
-                                          "system-link-exec",
-                                          PerfMemoryFlag("--root:", root),
-                                          PerfMemoryFlag("--in:", sourcePath),
-                                          "--emit:exe",
-                                          PerfMemoryFlag("--target:", target),
-                                          PerfMemoryFlag("--out:", outputPath),
-                                          PerfMemoryFlag("--report-out:", PerfMemoryCompileReportPath(outputPath))
-                                      ],
-                                      envOverrides,
-                                      root,
-                                      timeoutSec,
-                                      logPath)
+    var sample = PerfMemoryMeasureFileRun(root,
+                                           label,
+                                           compilerPath,
+                                           [
+                                               "system-link-exec",
+                                               PerfMemoryFlag("--root:", root),
+                                               PerfMemoryFlag("--in:", sourcePath),
+                                               "--emit:exe",
+                                               PerfMemoryFlag("--target:", target),
+                                               PerfMemoryFlag("--out:", outputPath),
+                                               PerfMemoryFlag("--report-out:", PerfMemoryCompileReportPath(outputPath))
+                                           ],
+                                           envOverrides,
+                                           root,
+                                           timeoutSec,
+                                           logPath)
+    sample.outputFileSizeBytes = chengpath.PathFileSize(outputPath)
+    return sample
 
 fn PerfMemoryRunBinary(root: str,
                          label: str,
@@ -602,14 +623,23 @@ fn PerfMemoryRunBinary(root: str,
                          workingDir: str,
                          timeoutSec: int32,
                          logPath: str): PerfMemoryRun =
-    return PerfMemoryMeasureFileRun(root,
-                                      label,
-                                      binaryPath,
-                                      argv,
-                                      envOverrides,
-                                      workingDir,
-                                      timeoutSec,
-                                      logPath)
+    var sample = PerfMemoryMeasureFileRun(root,
+                                           label,
+                                           binaryPath,
+                                           argv,
+                                           envOverrides,
+                                           workingDir,
+                                           timeoutSec,
+                                           logPath)
+    sample.outputFileSizeBytes = chengpath.PathFileSize(binaryPath)
+    return sample
+
+fn PerfMemoryOutputFileSizeWithinThreshold(sample: PerfMemoryRun,
+                                            threshold: PerfMemoryThreshold): bool =
+    if threshold.maxOutputFileSizeBytes <= int64(0):
+        return true
+    return sample.outputFileSizeBytes >= int64(0) &&
+           sample.outputFileSizeBytes <= threshold.maxOutputFileSizeBytes
 
 fn PerfMemoryReportRow(sample: PerfMemoryRun,
                          threshold: PerfMemoryThreshold): str =
@@ -623,11 +653,74 @@ fn PerfMemoryReportRow(sample: PerfMemoryRun,
                 strings.Int64ToStr(sample.maxRssBytes),
                 " peak_footprint_bytes=",
                 peakText,
+                " output_file_size_bytes=",
+                strings.Int64ToStr(sample.outputFileSizeBytes),
                 " limit_elapsed_ms=",
                 strings.Int64ToStr(threshold.maxElapsedMs),
                 " limit_max_rss_bytes=",
                 strings.Int64ToStr(threshold.maxRssBytes),
+                " limit_output_file_size_bytes=",
+                strings.Int64ToStr(threshold.maxOutputFileSizeBytes),
                 " exit_code=",
                 strings.IntToStr(sample.exitCode),
                 " log=",
                 sample.logPath], "")
+
+fn PerfMemoryRuntimeCBaselineThresholds(): runtimebase.RuntimeCBaselineThreshold[] =
+    var out: runtimebase.RuntimeCBaselineThreshold[]
+    add(out, runtimebase.RuntimeCBaselineOrcRetainReleaseThreshold())
+    add(out, runtimebase.RuntimeCBaselineAtomicI32AddThreshold())
+    add(out, runtimebase.RuntimeCBaselineThreadSpawnJoinThreshold())
+    add(out, runtimebase.RuntimeCBaselineSliceBoundsLoopThreshold())
+    add(out, runtimebase.RuntimeCBaselineHashLookupThreshold())
+    add(out, runtimebase.RuntimeCBaselineSyscallWriteThreshold())
+    return out
+
+fn PerfMemoryRuntimeCBaselineUnavailableContract(reason: str): PerfMemoryRuntimeCBaselineContract =
+    let thresholds = PerfMemoryRuntimeCBaselineThresholds()
+    var rows: str[]
+    for i in 0..<thresholds.len:
+        add(rows, runtimebase.RuntimeCBaselineUnavailableReport(thresholds[i].caseName, reason))
+    return PerfMemoryRuntimeCBaselineContract(ok: false,
+                                               report: strutil.Join(rows, "\n"))
+
+fn PerfMemoryRuntimeCBaselineSampleFromText(text: str,
+                                             threshold: runtimebase.RuntimeCBaselineThreshold): runtimebase.RuntimeCBaselineSample =
+    let cKey = strutil.Join([threshold.caseName, "_c_ns_per_op"], "")
+    let chengKey = strutil.Join([threshold.caseName, "_cheng_ns_per_op"], "")
+    let cNsPerOp = PerfMemoryParseOutputInt64(text, cKey)
+    let chengNsPerOp = PerfMemoryParseOutputInt64(text, chengKey)
+    return runtimebase.RuntimeCBaselineSampleNew(threshold.caseName,
+                                                 cNsPerOp,
+                                                 chengNsPerOp)
+
+fn PerfMemoryRuntimeCBaselineContractFromText(text: str): PerfMemoryRuntimeCBaselineContract =
+    let thresholds = PerfMemoryRuntimeCBaselineThresholds()
+    var rows: str[]
+    var ok = true
+    for i in 0..<thresholds.len:
+        let threshold = thresholds[i]
+        let sample = PerfMemoryRuntimeCBaselineSampleFromText(text, threshold)
+        if sample.cNsPerOp <= int64(0) || sample.chengNsPerOp < int64(0):
+            add(rows, runtimebase.RuntimeCBaselineUnavailableReport(threshold.caseName,
+                                                                    "missing_real_c_measurement"))
+            ok = false
+        else:
+            add(rows, runtimebase.RuntimeCBaselineReportRow(sample, threshold))
+            if !runtimebase.RuntimeCBaselineSampleOk(sample, threshold):
+                ok = false
+    return PerfMemoryRuntimeCBaselineContract(ok: ok,
+                                               report: strutil.Join(rows, "\n"))
+
+fn PerfMemoryRuntimeCBaselineContractFromFile(root: str,
+                                               reportPathRaw: str): PerfMemoryRuntimeCBaselineContract =
+    let reportPath = strutil.Strip(reportPathRaw)
+    if len(reportPath) <= 0:
+        return PerfMemoryRuntimeCBaselineUnavailableContract("missing_cheng_runtime_c_baseline_report")
+    let absolutePath = chengpath.PathAbsolute(root, reportPath)
+    if !chengpath.PathFileExists(absolutePath):
+        return PerfMemoryRuntimeCBaselineUnavailableContract("missing_cheng_runtime_c_baseline_report")
+    let text = chengpath.ReadTextFile("", absolutePath)
+    if len(strutil.Strip(text)) <= 0:
+        return PerfMemoryRuntimeCBaselineUnavailableContract("empty_cheng_runtime_c_baseline_report")
+    return PerfMemoryRuntimeCBaselineContractFromText(text)

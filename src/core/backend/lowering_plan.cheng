@@ -9,6 +9,7 @@ import cheng/core/lang/intern as langintern
 import cheng/core/lang/parser
 import cheng/core/lang/typed_expr as texpr
 import cheng/core/ir/core_types as coreir
+import cheng/core/ir/body_ir_noalias as bodyalias
 import cheng/core/backend/system_link_plan as slplan
 import cheng/core/backend/body_kind_parse as bkind
 
@@ -69,6 +70,9 @@ type
         callTargetImportcFlags: bool[]
         callImportcSymbols: str[]
         bodyIR: coreir.BodyIR
+        bodyIrNoAliasApplied: bool
+        bodyIrNoAliasLocalCount: int32
+        bodyIrNoAliasForwardRewriteCount: int32
         callSequence: PrimaryObjectIrCallOp[]
         returnStringLiteral: str
 
@@ -226,6 +230,9 @@ fn LoweringReturnCallLocalAlignBytes(typeKind: int32): int32 =
 
 fn LoweringClearCallSequence(fnIr: var PrimaryObjectIrFunction) =
     fnIr.bodyIR = coreir.BodyIR()
+    fnIr.bodyIrNoAliasApplied = false
+    fnIr.bodyIrNoAliasLocalCount = 0
+    fnIr.bodyIrNoAliasForwardRewriteCount = 0
     fnIr.callSequence = []
     fnIr.callArgCounts = []
     fnIr.callTargets = []
@@ -233,6 +240,21 @@ fn LoweringClearCallSequence(fnIr: var PrimaryObjectIrFunction) =
     fnIr.callTargetImportcFlags = []
     fnIr.callImportcSymbols = []
     fnIr.callTargetCount = 0
+
+fn LoweringFinalizeBodyIrNoAlias(fnIr: var PrimaryObjectIrFunction) =
+    fnIr.bodyIrNoAliasApplied = false
+    fnIr.bodyIrNoAliasLocalCount = 0
+    fnIr.bodyIrNoAliasForwardRewriteCount = 0
+    let finalizeReport = bodyalias.BodyIrNoAliasFinalize(fnIr.bodyIR)
+    fnIr.bodyIR = finalizeReport.bodyIR
+    if !finalizeReport.dodSoAContractOk:
+        fnIr.bodyKind = "body_ir_dod_soa_contract_invalid"
+        return
+    if !finalizeReport.applied:
+        return
+    fnIr.bodyIrNoAliasApplied = true
+    fnIr.bodyIrNoAliasLocalCount = finalizeReport.localCount
+    fnIr.bodyIrNoAliasForwardRewriteCount = finalizeReport.forwardRewriteCount
 
 fn LoweringPrimaryObjectIrParamSlotIndex(fnIr: PrimaryObjectIrFunction,
                                           paramSlot: int32): int32 =
@@ -1684,6 +1706,7 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
         if fnIr.bodyKind == LoweringBodyKindGeneralCFG:
             LoweringBuildGeneralCFG(fnIr, sourceTexts)
             fnIr.callTargetCount = fnIr.callSequence.len
+            LoweringFinalizeBodyIrNoAlias(fnIr)
             add(ir.functions, fnIr)
             continue
         fnIr.bodyLineNumber = bodyLineNumber
@@ -2047,6 +2070,7 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
             let _ = LoweringPopulateSingleStatementReturnCall(fnIr, sourceTexts)
         LoweringSyncLegacyCallSequence(fnIr)
         fnIr.callTargetCount = fnIr.callSequence.len
+        LoweringFinalizeBodyIrNoAlias(fnIr)
         add(ir.functions, fnIr)
     return ir
 
@@ -2131,6 +2155,9 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     var callSequenceCounts = ""
     var structuredCallSequenceCounts = ""
     var bodyIrCallSequenceCounts = ""
+    var bodyIrNoAliasAppliedFlags = ""
+    var bodyIrNoAliasLocalCounts = ""
+    var bodyIrNoAliasForwardRewriteCounts = ""
     var callSequenceTargets = ""
     var statementSequenceCounts = ""
     var statementSequenceKinds = ""
@@ -2144,6 +2171,9 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
             callSequenceCounts = Fmt"{callSequenceCounts},"
             structuredCallSequenceCounts = Fmt"{structuredCallSequenceCounts},"
             bodyIrCallSequenceCounts = Fmt"{bodyIrCallSequenceCounts},"
+            bodyIrNoAliasAppliedFlags = Fmt"{bodyIrNoAliasAppliedFlags},"
+            bodyIrNoAliasLocalCounts = Fmt"{bodyIrNoAliasLocalCounts},"
+            bodyIrNoAliasForwardRewriteCounts = Fmt"{bodyIrNoAliasForwardRewriteCounts},"
             callSequenceTargets = Fmt"{callSequenceTargets},"
             statementSequenceCounts = Fmt"{statementSequenceCounts},"
             statementSequenceKinds = Fmt"{statementSequenceKinds},"
@@ -2156,6 +2186,12 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
         callSequenceCounts = Fmt"{callSequenceCounts}{intToStr(targetCount)}"
         structuredCallSequenceCounts = Fmt"{structuredCallSequenceCounts}{intToStr(ir.functions[i].callSequence.len)}"
         bodyIrCallSequenceCounts = Fmt"{bodyIrCallSequenceCounts}{intToStr(ir.functions[i].bodyIR.callSequence.len)}"
+        var noAliasAppliedFlag = "0"
+        if ir.functions[i].bodyIrNoAliasApplied:
+            noAliasAppliedFlag = "1"
+        bodyIrNoAliasAppliedFlags = Fmt"{bodyIrNoAliasAppliedFlags}{noAliasAppliedFlag}"
+        bodyIrNoAliasLocalCounts = Fmt"{bodyIrNoAliasLocalCounts}{intToStr(ir.functions[i].bodyIrNoAliasLocalCount)}"
+        bodyIrNoAliasForwardRewriteCounts = Fmt"{bodyIrNoAliasForwardRewriteCounts}{intToStr(ir.functions[i].bodyIrNoAliasForwardRewriteCount)}"
         if targetCount <= 0:
             callSequenceTargets = Fmt"{callSequenceTargets}-"
         else:
@@ -2245,6 +2281,9 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     LoweringAppendLine(out, "primary_object_ir_structured_call_counts", structuredCallSequenceCounts)
     LoweringAppendLine(out, "primary_object_ir_body_ir_call_sequence_counts", bodyIrCallSequenceCounts)
     LoweringAppendLine(out, "primary_object_ir_body_ir_call_counts", bodyIrCallSequenceCounts)
+    LoweringAppendLine(out, "primary_object_ir_noalias_applied_flags", bodyIrNoAliasAppliedFlags)
+    LoweringAppendLine(out, "primary_object_ir_noalias_local_counts", bodyIrNoAliasLocalCounts)
+    LoweringAppendLine(out, "primary_object_ir_noalias_forward_rewrite_counts", bodyIrNoAliasForwardRewriteCounts)
     LoweringAppendLine(out, "primary_object_ir_call_sequence_targets", callSequenceTargets)
     LoweringAppendLine(out, "primary_object_ir_statement_sequence_counts", statementSequenceCounts)
     LoweringAppendLine(out, "primary_object_ir_statement_sequence_kinds", statementSequenceKinds)

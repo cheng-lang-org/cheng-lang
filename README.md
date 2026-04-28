@@ -362,7 +362,7 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 
 - `bootstrap-bridge`：刷新 `stage0 -> stage3` 自举链
 - `build-backend-driver` / `run-production-regression` / `system-link-exec`：生成并验证当前编译器主线
-  其中 `run-production-regression` 现在固定包含 `dev_hotpatch_100ms_scope_contract_smoke`、`explicit_default_init_positive_smoke`、`explicit_default_init_negative_smoke`、`explicit_default_init_gate_smoke`、`composite_zero_helper_gate_smoke` 和 `verify-r2c-react-surface`
+  其中 `run-production-regression` 现在固定包含 `function_task_contract_smoke`、`function_task_executor_contract_smoke`、`runtime_c_baseline_contract_smoke`、`dev_hotpatch_100ms_scope_contract_smoke`、`explicit_default_init_positive_smoke`、`explicit_default_init_negative_smoke`、`explicit_default_init_gate_smoke`、`composite_zero_helper_gate_smoke` 和 `verify-r2c-react-surface`
 - `run-host-smokes` / `status`：校验闭环和查看当前主线状态
 
 其中 `system-link-exec` 的正式入口仍然优先认 `artifacts/backend_driver/cheng`。如果你直接跑 `artifacts/bootstrap/cheng.stage3 system-link-exec`，在 backend driver fresh/ready 时它现在也会先 handoff 到 backend driver，前端语义口径保持 parser 真源一致。

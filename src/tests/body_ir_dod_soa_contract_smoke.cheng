@@ -1,0 +1,106 @@
+import cheng/core/ir/core_types as ir
+import std/strings
+
+fn check(cond: bool, code: int32): int32 =
+    if cond:
+        return 0
+    return code
+
+fn makeSlot(id: int32,
+             name: str,
+             typeKind: int32,
+             stackOffset: int32,
+             sizeBytes: int32,
+             alignBytes: int32): ir.LocalSlot =
+    var slot: ir.LocalSlot
+    slot.id = id
+    slot.name = name
+    slot.typeKind = typeKind
+    slot.stackOffset = stackOffset
+    slot.sizeBytes = sizeBytes
+    slot.alignBytes = alignBytes
+    slot.noAlias = true
+    return slot
+
+fn buildBody(): ir.BodyIR =
+    var body = ir.BodyIRNew()
+    add(body.localSlots, makeSlot(0, "input", ir.LocalStrTag, 16, 24, 8))
+    add(body.localSlots, makeSlot(1, "result", ir.LocalI32Tag, 40, 4, 4))
+    add(body.localSlots, makeSlot(2, "isMatch", ir.LocalI32Tag, 48, 4, 4))
+
+    let literalIndex = ir.BodyIRAppendCStringLiteral(body, "ok", ".L_dod_ok")
+
+    var call: ir.CallOp
+    call.targetSymbol = "CheckInput"
+    call.resultSlot = 1
+    call.relocWordOffset = -1
+    add(call.argSlots, 0)
+    add(body.callSequence, call)
+
+    var callOp: ir.BodyOp
+    callOp.kind = ir.BodyOpCallTag
+    callOp.target = 1
+    add(callOp.operands, 0)
+    add(body.ops, callOp)
+
+    var strEqOp: ir.BodyOp
+    strEqOp.kind = ir.BodyOpStrEqLiteralTag
+    strEqOp.target = 2
+    add(strEqOp.operands, 0)
+    add(strEqOp.operands, literalIndex)
+    add(body.ops, strEqOp)
+
+    var term: ir.BodyTerm
+    term.kind = ir.BodyTermReturnTag
+    term.resultSlot = 1
+    let termIndex = ir.BodyIRAppendTerm(body, term)
+    let _ = ir.BodyIRAppendBlock(body, 0, body.ops.len, termIndex)
+    return body
+
+fn main(): int32 =
+    let body = buildBody()
+    let report = ir.BodyIRDodSoAContractCheck(body)
+    let text = ir.BodyIRDodSoAContractReportText(report)
+
+    let c1 = check(report.ok, 11)
+    if c1 != 0: return c1
+    let c2 = check(report.indexWidthBits == 32, 12)
+    if c2 != 0: return c2
+    let c3 = check(report.independentArrayCount == 6, 13)
+    if c3 != 0: return c3
+    let c4 = check(report.localCount == 3, 14)
+    if c4 != 0: return c4
+    let c5 = check(report.callCount == 1, 15)
+    if c5 != 0: return c5
+    let c6 = check(report.blockCount == 1, 16)
+    if c6 != 0: return c6
+    let c7 = check(report.termCount == 1, 17)
+    if c7 != 0: return c7
+    let c8 = check(report.cstringCount == 1, 18)
+    if c8 != 0: return c8
+    let c9 = check(report.pointerKeyCount == 0, 19)
+    if c9 != 0: return c9
+    let c10 = check(report.invalidRefCount == 0, 20)
+    if c10 != 0: return c10
+    let c11 = check(strings.StrContains(text, "body_ir_dod_soa_arrays=ops,callSequence,localSlots,blocks,terms,cstringLiterals"), 21)
+    if c11 != 0: return c11
+    let c12 = check(strings.StrContains(text, "body_ir_dod_soa_no_naked_pointer_key=1"), 22)
+    if c12 != 0: return c12
+    let c13 = check(strings.StrContains(text, "body_ir_dod_soa_invalid_ref_count=0"), 23)
+    if c13 != 0: return c13
+
+    var broken = body
+    broken.ops[0].operands = [4]
+    let brokenReport = ir.BodyIRDodSoAContractCheck(broken)
+    let brokenText = ir.BodyIRDodSoAContractReportText(brokenReport)
+    let c14 = check(!brokenReport.ok, 24)
+    if c14 != 0: return c14
+    let c15 = check(brokenReport.invalidRefCount == 1, 25)
+    if c15 != 0: return c15
+    let c16 = check(strings.StrContains(brokenReport.firstInvalidRefOwner, "ops[0].callOrdinal"), 26)
+    if c16 != 0: return c16
+    let c17 = check(strings.StrContains(brokenText, "body_ir_dod_soa_invalid_ref_count=1"), 27)
+    if c17 != 0: return c17
+
+    echo(" body_ir_dod_soa_contract_smoke ok")
+    return 0

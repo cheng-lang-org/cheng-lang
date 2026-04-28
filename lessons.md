@@ -7,9 +7,12 @@
 - 2026-04-28: 编译 `backend_driver_dispatch_min.cheng` 候选时发现 report 仍是 `standalone_no_runtime=1` 且 `status` 返回 2，必须在 min driver 中先硬失败这条坏路径，再补 runtime-entry/provider-object direct 链路。
 - 2026-04-28: 已安装 min driver 的 `system-link-exec` 仍是旧 standalone 执行器时，单纯修改 `backend_driver_dispatch_min.cheng` 源码不会让纯自举自激活；旧执行器会继续产出 18K no-runtime 假候选，真正验收必须由当前运行中的 driver 自身走 runtime-entry/provider-object 链路。
 - 2026-04-28: standalone gate 源码改完后再用旧 artifact 编译 min driver，报告仍是 `standalone_no_runtime=1/provider_object_count=0/line_map=-` 且 candidate `status` rc=2；这类结果只能证明运行 artifact stale，不能当作源码修复失败或纯自举进展。
+- 2026-04-28: runtime 能力 smoke 只要报告 `system_link_exec_runtime_standalone_no_runtime=1` 或 `provider_object_count=0`，就不能证明线程/原子/ORC 真实可用；必须要求 provider 对象真实参与链接，并用 `otool/nm` 确认入口没有被折成 `mov w0,#0; ret` 的假绿。
 - 2026-04-28: 已安装旧 `artifacts/backend_driver/cheng` 不能靠改入口源码形状产出真实命令分发 candidate；三层 wrapper、直接 main 六分支、helper-only 都会落成 `return 2/0` 或旧 standalone，必须刷新可执行 artifact 本身的 lowering/runtime 能力后再自举验证。
 - 2026-04-28: direct writer 主线里 `rawbytes.Bytes` 必须作为确定复合 ABI 类型处理，槽大小 16 字节；如果 typed/lowering 把它留成 polymorphic/deferred，`DirectObjectEmitStandaloneText -> DirectObjectEmitPlanText` 这类返回 Bytes 的函数会先撞 ABI 缺口，不能给函数名做特判。
 - 2026-04-28: min driver 的 not-ready 报告不能在旧 pure artifact 自举前展开复合 plan 字段和多段 Fmt；旧 primary builder 会在 primary 阶段 bounds crash。先保持静态 hard-fail，等新 artifact 带稳定复合字段/CFG 后再打开详细 first-missing 报告。
+- 2026-04-28: 日常 smoke 不能直接 import `lowering_plan`/完整 `compiler_csg` 来验证一个小合同；这会把后端大图拖进测试自身，RSS 轻易超过 512MB。小合同必须先抽到轻量模块，再由重模块消费。
+- 2026-04-28: 三轴性能预算不能只塞进 `perf_memory_gate` 这种重闭包里；时间/RSS/产物大小的合同本体必须在轻量模块里验证，重 perf gate 只负责真实采样和可配置阈值。
 - 2026-04-28: CFG lowering 的 final `return Call(...)` 不能复用上一条 call 的 result slot；必须把 final return call 自身 append 进 `fnIr.callSequence` 和 `fnIr.bodyIR.callSequence`，否则 legacy/BodyIR call 序列会漂移。
 - 2026-04-28: 当前已安装 backend_driver 的 `BuildPrimaryObjectPlan` 机器码存在 caller-saved 活值污染：`for callOrdinal in 0..<callSequence.len` 的循环条件把 `x9` 跨 `bl cheng_bounds_check` 当活值用，编译 `backend_driver_dispatch_min.cheng` 时在 target `main` 的单 call 序列上复现 `idx=1 len=1`。后续 codegen 必须在 bounds check 后从栈/local reload 循环 index，不能依赖 caller-saved 临时寄存器。
 - 2026-04-28: 对旧 artifact 做 `/tmp` 二进制 NOP 热补丁只能用于定位；它既不是源码修复，也不能作为纯 Cheng 自举证明。最终验收仍必须由未热补丁的纯 Cheng 源码产物跑通。

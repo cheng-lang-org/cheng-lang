@@ -103,6 +103,64 @@ fn main(): int32 =
     assert(phases.primaryObjectLineMapAsmBytes == int64(512),
            " perf memory gate contract: primary object line map asm bytes")
 
+    let budgetSample = perfgate.PerfMemoryRunNew("budget_probe",
+                                                 "/tmp/cheng-budget-probe.log",
+                                                 0,
+                                                 int64(10),
+                                                 int64(20),
+                                                 int64(30),
+                                                 int64(4096),
+                                                 "")
+    let budgetThreshold = perfgate.PerfMemoryThresholdWithOutputFileSize(int64(20),
+                                                                          int64(30),
+                                                                          int64(4096))
+    assert(perfgate.PerfMemoryOutputFileSizeWithinThreshold(budgetSample, budgetThreshold),
+           " perf memory gate contract: output size within threshold")
+    let tooSmallThreshold = perfgate.PerfMemoryThresholdWithOutputFileSize(int64(20),
+                                                                            int64(30),
+                                                                            int64(1024))
+    assert(!perfgate.PerfMemoryOutputFileSizeWithinThreshold(budgetSample, tooSmallThreshold),
+           " perf memory gate contract: output size over threshold")
+    let disabledSizeThreshold = perfgate.PerfMemoryThresholdNew(int64(20), int64(30))
+    assert(perfgate.PerfMemoryOutputFileSizeWithinThreshold(budgetSample, disabledSizeThreshold),
+           " perf memory gate contract: output size disabled by default")
+    let budgetRow = perfgate.PerfMemoryReportRow(budgetSample, budgetThreshold)
+    assert(strutil.Contains(budgetRow, "output_file_size_bytes=4096"),
+           " perf memory gate contract: report output size")
+    assert(strutil.Contains(budgetRow, "limit_output_file_size_bytes=4096"),
+           " perf memory gate contract: report output size limit")
+
+    let runtimeBaselineText = """
+    orc_retain_release_c_ns_per_op=100
+    orc_retain_release_cheng_ns_per_op=200
+    atomic_i32_add_c_ns_per_op=100
+    atomic_i32_add_cheng_ns_per_op=150
+    thread_spawn_join_c_ns_per_op=100
+    thread_spawn_join_cheng_ns_per_op=300
+    slice_bounds_loop_c_ns_per_op=100
+    slice_bounds_loop_cheng_ns_per_op=120
+    hash_lookup_c_ns_per_op=100
+    hash_lookup_cheng_ns_per_op=150
+    syscall_write_c_ns_per_op=100
+    syscall_write_cheng_ns_per_op=110
+
+    """
+    let runtimeBaseline = perfgate.PerfMemoryRuntimeCBaselineContractFromText(runtimeBaselineText)
+    assert(runtimeBaseline.ok,
+           " perf memory gate contract: runtime c baseline ok")
+    assert(strutil.Contains(runtimeBaseline.report, "runtime_case_name=orc_retain_release"),
+           " perf memory gate contract: runtime c baseline orc row")
+    assert(strutil.Contains(runtimeBaseline.report, "runtime_perf_ratio_x1000=2000"),
+           " perf memory gate contract: runtime c baseline ratio")
+
+    let runtimeBaselineMissing = perfgate.PerfMemoryRuntimeCBaselineContractFromText("orc_retain_release_c_ns_per_op=100\n")
+    assert(!runtimeBaselineMissing.ok,
+           " perf memory gate contract: runtime c baseline missing fails")
+    assert(strutil.Contains(runtimeBaselineMissing.report, "runtime_c_baseline_hard_fail=1"),
+           " perf memory gate contract: runtime c baseline missing hard fail")
+    assert(strutil.Contains(runtimeBaselineMissing.report, "runtime_c_baseline_reason=missing_real_c_measurement"),
+           " perf memory gate contract: runtime c baseline missing reason")
+
     assert(perfgate.PerfMemoryColdSelfBuildBudgetMs() == int64(80),
            " perf memory gate contract: cold self build budget")
     assert(perfgate.PerfMemoryColdSelfBuildBudgetMultiple(int64(76109)) == int64(951),

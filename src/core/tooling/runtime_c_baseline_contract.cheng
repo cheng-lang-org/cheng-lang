@@ -1,0 +1,84 @@
+import std/strutils as strutil
+import std/strings
+
+type
+    RuntimeCBaselineThreshold =
+        caseName: str
+        maxRatioX1000: int64
+
+    RuntimeCBaselineSample =
+        caseName: str
+        cNsPerOp: int64
+        chengNsPerOp: int64
+        ratioX1000: int64
+
+fn RuntimeCBaselineThresholdNew(caseName: str,
+                                 maxRatioX1000: int64): RuntimeCBaselineThreshold =
+    return RuntimeCBaselineThreshold(caseName: caseName,
+                                     maxRatioX1000: maxRatioX1000)
+
+fn RuntimeCBaselineRatioX1000(cNsPerOp: int64,
+                               chengNsPerOp: int64): int64 =
+    if cNsPerOp <= int64(0) || chengNsPerOp < int64(0):
+        return int64(-1)
+    return (chengNsPerOp * int64(1000) + cNsPerOp - int64(1)) / cNsPerOp
+
+fn RuntimeCBaselineSampleNew(caseName: str,
+                              cNsPerOp: int64,
+                              chengNsPerOp: int64): RuntimeCBaselineSample =
+    return RuntimeCBaselineSample(caseName: caseName,
+                                  cNsPerOp: cNsPerOp,
+                                  chengNsPerOp: chengNsPerOp,
+                                  ratioX1000: RuntimeCBaselineRatioX1000(cNsPerOp, chengNsPerOp))
+
+fn RuntimeCBaselineOrcRetainReleaseThreshold(): RuntimeCBaselineThreshold =
+    return RuntimeCBaselineThresholdNew("orc_retain_release", int64(2000))
+
+fn RuntimeCBaselineAtomicI32AddThreshold(): RuntimeCBaselineThreshold =
+    return RuntimeCBaselineThresholdNew("atomic_i32_add", int64(1500))
+
+fn RuntimeCBaselineThreadSpawnJoinThreshold(): RuntimeCBaselineThreshold =
+    return RuntimeCBaselineThresholdNew("thread_spawn_join", int64(3000))
+
+fn RuntimeCBaselineSliceBoundsLoopThreshold(): RuntimeCBaselineThreshold =
+    return RuntimeCBaselineThresholdNew("slice_bounds_loop", int64(1200))
+
+fn RuntimeCBaselineHashLookupThreshold(): RuntimeCBaselineThreshold =
+    return RuntimeCBaselineThresholdNew("hash_lookup", int64(1500))
+
+fn RuntimeCBaselineSyscallWriteThreshold(): RuntimeCBaselineThreshold =
+    return RuntimeCBaselineThresholdNew("syscall_write", int64(1100))
+
+fn RuntimeCBaselineSampleOk(sample: RuntimeCBaselineSample,
+                             threshold: RuntimeCBaselineThreshold): bool =
+    if sample.ratioX1000 < int64(0):
+        return false
+    if threshold.maxRatioX1000 <= int64(0):
+        return false
+    if sample.caseName != threshold.caseName:
+        return false
+    return sample.ratioX1000 <= threshold.maxRatioX1000
+
+fn RuntimeCBaselineReportRow(sample: RuntimeCBaselineSample,
+                              threshold: RuntimeCBaselineThreshold): str =
+    return strutil.Join(["runtime_baseline=c",
+                         " runtime_case=cheng",
+                         " runtime_case_name=",
+                         sample.caseName,
+                         " c_ns_per_op=",
+                         strings.Int64ToStr(sample.cNsPerOp),
+                         " cheng_ns_per_op=",
+                         strings.Int64ToStr(sample.chengNsPerOp),
+                         " runtime_perf_ratio_x1000=",
+                         strings.Int64ToStr(sample.ratioX1000),
+                         " limit_runtime_perf_ratio_x1000=",
+                         strings.Int64ToStr(threshold.maxRatioX1000)], "")
+
+fn RuntimeCBaselineUnavailableReport(caseName: str,
+                                      reason: str): str =
+    return strutil.Join(["runtime_c_baseline_status=unavailable",
+                         " runtime_c_baseline_hard_fail=1",
+                         " runtime_case_name=",
+                         caseName,
+                         " runtime_c_baseline_reason=",
+                         reason], "")

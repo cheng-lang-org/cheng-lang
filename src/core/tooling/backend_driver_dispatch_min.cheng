@@ -130,6 +130,15 @@ fn BackendDriverDispatchMinAppendResourceReport(out: var str) =
     BackendDriverDispatchMinAppendLine(out, Fmt"report_cpu_us={cpuUs}")
     BackendDriverDispatchMinAppendLine(out, Fmt"report_rss_bytes={rssBytes}")
 
+fn BackendDriverDispatchMinAppendOutputFileSizeReport(out: var str,
+                                                       rootDir: str,
+                                                       outputPath: str) =
+    let outputAbs = chengpath.PathAbsolute(rootDir, outputPath)
+    var outputBytes: int64
+    if chengpath.PathFileExists(outputAbs):
+        outputBytes = chengpath.PathFileSize(outputAbs)
+    BackendDriverDispatchMinAppendLine(out, Fmt"output_file_size_bytes={outputBytes}")
+
 fn BackendDriverDispatchMinAppendPrimaryPlanReport(out: var str,
                                                     primaryPlan: pobj.PrimaryObjectPlan) =
     BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_first_missing_function={primaryPlan.firstMissingFunction}")
@@ -826,8 +835,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteFields(driverRoot: str,
                                                             emitKind: creq.CompilerEmit,
                                                             reportPath: str,
                                                             symbolVisibility: str,
-                                                            browserBridgeObjectPath: str,
-                                                            exportRootSymbols: str[]): int32 =
+                                                            browserBridgeObjectPath: str): int32 =
     var phaseProfile: BackendDriverDispatchMinPhaseProfile
     phaseProfile.totalStartNs = BackendDriverDispatchMinNowNs()
     let systemLinkPlanStartNs = BackendDriverDispatchMinNowNs()
@@ -848,7 +856,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteFields(driverRoot: str,
                                                                reportPath,
                                                                err)
         return BackendDriverDispatchMinUnsupported(err)
-    linkPlan.exportRootSymbols = exportRootSymbols
+    linkPlan.exportRootSymbols = []
     phaseProfile.systemLinkPlanNs = BackendDriverDispatchMinNowNs() - systemLinkPlanStartNs
     BackendDriverDispatchMinProgress("system_link_plan", "done")
     phaseProfile.compilerCsgNs = BackendDriverDispatchMinNowNs()
@@ -1118,6 +1126,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitObj(driverRoot: str, reportPath:
     BackendDriverDispatchMinAppendPrimaryPlanReport(objReport, primaryPlan)
     BackendDriverDispatchMinAppendPhaseReport(objReport, phaseProfile)
     BackendDriverDispatchMinAppendResourceReport(objReport)
+    BackendDriverDispatchMinAppendOutputFileSizeReport(objReport, driverRoot, object.objectPath)
     BackendDriverDispatchMinAppendLine(objReport, direct.DirectObjectEmitResultReportText(object))
     if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, objReport):
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
@@ -1197,6 +1206,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
     BackendDriverDispatchMinAppendPrimaryPlanReport(exeReport, primaryPlan)
     BackendDriverDispatchMinAppendPhaseReport(exeReport, phaseProfile)
     BackendDriverDispatchMinAppendResourceReport(exeReport)
+    BackendDriverDispatchMinAppendOutputFileSizeReport(exeReport, driverRoot, linkPlan.outputPath)
     BackendDriverDispatchMinAppendLine(exeReport, direct.DirectObjectEmitResultReportText(object))
     if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, exeReport):
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
@@ -1231,6 +1241,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot: str, r
     BackendDriverDispatchMinAppendPrimaryPlanReport(exeReport, primaryPlan)
     BackendDriverDispatchMinAppendPhaseReport(exeReport, phaseProfile)
     BackendDriverDispatchMinAppendResourceReport(exeReport)
+    BackendDriverDispatchMinAppendOutputFileSizeReport(exeReport, driverRoot, linkPlan.outputPath)
     if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, exeReport):
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
     return 0
@@ -1243,35 +1254,19 @@ fn BackendDriverDispatchMinRunSystemLinkExecFromCmdline(): int32 =
     let packageRoot = BackendDriverDispatchMinReadFlagOrDefaultBridge("--root", "")
     let sourcePath = BackendDriverDispatchMinReadFlagOrDefaultBridge("--in", "")
     let targetTriple = BackendDriverDispatchMinReadFlagOrDefaultBridge("--target", "arm64-apple-darwin")
-    return BackendDriverDispatchMinRunSystemLinkExecReadOutput(packageRoot, sourcePath, targetTriple)
-
-fn BackendDriverDispatchMinRunSystemLinkExecReadOutput(packageRoot: str, sourcePath: str, targetTriple: str): int32 =
     let outputPath = BackendDriverDispatchMinReadFlagOrDefaultBridge("--out", "")
     let reportPath = BackendDriverDispatchMinReadFlagOrDefaultBridge("--report-out", "")
-    return BackendDriverDispatchMinRunSystemLinkExecReadEmit(packageRoot, sourcePath, targetTriple, outputPath, reportPath)
-
-fn BackendDriverDispatchMinRunSystemLinkExecReadEmit(packageRoot: str, sourcePath: str, targetTriple: str, outputPath: str, reportPath: str): int32 =
     let emitText = BackendDriverDispatchMinReadFlagOrDefaultBridge("--emit", "exe")
     if !BackendDriverDispatchMinEmitTextSupported(emitText):
         return BackendDriverDispatchMinUnsupportedEmitText(packageRoot, reportPath, emitText)
-    return BackendDriverDispatchMinRunSystemLinkExecReadVisibility(packageRoot, sourcePath, targetTriple, outputPath, reportPath, emitText)
-
-fn BackendDriverDispatchMinRunSystemLinkExecReadVisibility(packageRoot: str, sourcePath: str, targetTriple: str, outputPath: str, reportPath: str, emitText: str): int32 =
     let symbolVisibilityRaw = BackendDriverDispatchMinReadFlagOrDefaultBridge("--symbol-visibility", "public")
     if !BackendDriverDispatchMinSymbolVisibilitySupported(symbolVisibilityRaw):
         return BackendDriverDispatchMinUnsupportedSymbolVisibility(packageRoot, reportPath, symbolVisibilityRaw)
     let symbolVisibility = BackendDriverDispatchMinSymbolVisibilityValue(symbolVisibilityRaw)
-    return BackendDriverDispatchMinRunSystemLinkExecReadBrowser(packageRoot, sourcePath, targetTriple, outputPath, reportPath, emitText, symbolVisibility)
-
-fn BackendDriverDispatchMinRunSystemLinkExecReadBrowser(packageRoot: str, sourcePath: str, targetTriple: str, outputPath: str, reportPath: str, emitText: str, symbolVisibility: str): int32 =
     let browserBridgeObjectPath = BackendDriverDispatchMinReadFlagOrDefaultBridge("--browser-bridge-object", "")
     let exportRootsText = BackendDriverDispatchMinReadFlagOrDefaultBridge("--export-roots", "")
     if len(exportRootsText) > 0:
         return BackendDriverDispatchMinUnsupportedExportRoots(packageRoot, reportPath, exportRootsText)
-    return BackendDriverDispatchMinRunSystemLinkExecDispatch(packageRoot, sourcePath, targetTriple, outputPath, reportPath, emitText, symbolVisibility, browserBridgeObjectPath)
-
-fn BackendDriverDispatchMinRunSystemLinkExecDispatch(packageRoot: str, sourcePath: str, targetTriple: str, outputPath: str, reportPath: str, emitText: str, symbolVisibility: str, browserBridgeObjectPath: str): int32 =
-    var exportRootSymbols: str[]
     let emitObj = BackendDriverDispatchMinEmitTextIsObj(emitText)
     if emitObj:
         return BackendDriverDispatchMinRunSystemLinkExecConcreteFields(packageRoot,
@@ -1282,8 +1277,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecDispatch(packageRoot: str, sourcePat
                                                                        creq.EmitObj,
                                                                        reportPath,
                                                                        symbolVisibility,
-                                                                       browserBridgeObjectPath,
-                                                                       exportRootSymbols)
+                                                                       browserBridgeObjectPath)
     let emitShared = BackendDriverDispatchMinEmitTextIsShared(emitText)
     if emitShared:
         return BackendDriverDispatchMinRunSystemLinkExecConcreteFields(packageRoot,
@@ -1294,8 +1288,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecDispatch(packageRoot: str, sourcePat
                                                                        creq.EmitShared,
                                                                        reportPath,
                                                                        symbolVisibility,
-                                                                       browserBridgeObjectPath,
-                                                                       exportRootSymbols)
+                                                                       browserBridgeObjectPath)
     return BackendDriverDispatchMinRunSystemLinkExecConcreteFields(packageRoot,
                                                                    packageRoot,
                                                                    sourcePath,
@@ -1304,8 +1297,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecDispatch(packageRoot: str, sourcePat
                                                                    creq.EmitExe,
                                                                    reportPath,
                                                                    symbolVisibility,
-                                                                   browserBridgeObjectPath,
-                                                                   exportRootSymbols)
+                                                                   browserBridgeObjectPath)
 
 fn BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline(): int32 =
     return BackendDriverDispatchMinRunSystemLinkExecFromCmdline()
@@ -1453,11 +1445,11 @@ fn BackendDriverDispatchMinRunCommandWithCmd(cmd: str): int32 =
         return BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline()
     return 2
 
-fn BackendDriverDispatchMinCommandNameFromCmdline(): str =
-    return cmdline.ParamStr(1)
+fn ParamStr(index: int32): str =
+    return cmdline.ParamStr(index)
 
 fn BackendDriverDispatchMinRunCommand(): int32 =
-    let cmd: str = BackendDriverDispatchMinCommandNameFromCmdline()
+    let cmd = ParamStr(1)
     return BackendDriverDispatchMinRunCommandWithCmd(cmd)
 
 fn BackendDriverDispatchMinRun(): int32 =
