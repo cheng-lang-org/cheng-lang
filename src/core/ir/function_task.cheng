@@ -118,6 +118,21 @@ type
         lastFuncIndex: int32
         lastDeclOrdinal: int32
 
+    UirFnTaskParallelMergeContractReport =
+        ok: bool
+        requestedJobCount: int32
+        effectiveShardCount: int32
+        taskCount: int32
+        mergeOrder: str
+        taskLocalResultOnly: bool
+        sharedInstructionWordsWriteCount: int32
+        taskLocalInstructionWordsPayloadCount: int32
+        instructionWordsMergeOwner: str
+        firstDeclOrdinal: int32
+        lastDeclOrdinal: int32
+        errorCount: int32
+        firstErrorCode: int32
+
     FunctionTask =
         funcIndex: int32
         declOrdinal: int32
@@ -383,6 +398,102 @@ fn UirFnTaskPlanFromSnapshot(snapshot: UirCoreSharedSnapshot,
                                 snapshot.functionOwnerModulePaths[funcIndex])
         UirFnTaskPlanAppend(outPlan, task)
     return true
+
+fn UirFnTaskEquivalent(left: UirFnTask,
+                       right: UirFnTask): bool =
+    return left.funcIndex == right.funcIndex &&
+           left.declOrdinal == right.declOrdinal &&
+           left.sourceSpanStart == right.sourceSpanStart &&
+           left.sourceSpanEnd == right.sourceSpanEnd &&
+           left.costHint == right.costHint &&
+           left.genericEpoch == right.genericEpoch &&
+           left.entryFlag == right.entryFlag &&
+           left.ownerModulePath == right.ownerModulePath
+
+fn UirFnTaskPlanEquivalent(left: UirFnTaskPlan,
+                           right: UirFnTaskPlan): bool =
+    if left.schedule != right.schedule:
+        return false
+    if left.jobCount != right.jobCount:
+        return false
+    if left.tasks.len != right.tasks.len:
+        return false
+    for taskIndex in 0..<left.tasks.len:
+        if !UirFnTaskEquivalent(left.tasks[taskIndex],
+                                right.tasks[taskIndex]):
+            return false
+    return true
+
+fn UirFnTaskParallelShardCount(taskCount: int32,
+                               requestedJobCount: int32): int32 =
+    if requestedJobCount <= 1:
+        return 0
+    if taskCount <= 0:
+        return 0
+    if requestedJobCount < taskCount:
+        return requestedJobCount
+    return taskCount
+
+fn UirFnTaskParallelMergeContractReportNew(): UirFnTaskParallelMergeContractReport =
+    var out: UirFnTaskParallelMergeContractReport
+    out.ok = true
+    out.mergeOrder = "decl_ordinal"
+    out.taskLocalResultOnly = true
+    out.instructionWordsMergeOwner = "main_thread_decl_ordinal"
+    out.firstDeclOrdinal = InvalidFunctionIndex()
+    out.lastDeclOrdinal = InvalidFunctionIndex()
+    out.firstErrorCode = InvalidFunctionIndex()
+    return out
+
+fn UirFnTaskParallelMergeContractSetError(report: var UirFnTaskParallelMergeContractReport,
+                                          code: int32) =
+    report.ok = false
+    report.errorCount = report.errorCount + 1
+    if report.firstErrorCode == InvalidFunctionIndex():
+        report.firstErrorCode = code
+
+fn UirFnTaskParallelMergeContractReportFor(plan: UirFnTaskPlan,
+                                           requestedJobCount: int32): UirFnTaskParallelMergeContractReport =
+    var report = UirFnTaskParallelMergeContractReportNew()
+    report.requestedJobCount = requestedJobCount
+    report.taskCount = plan.tasks.len
+    report.effectiveShardCount = UirFnTaskParallelShardCount(plan.tasks.len,
+                                                             requestedJobCount)
+    if requestedJobCount <= 1:
+        UirFnTaskParallelMergeContractSetError(report, 1)
+    if plan.tasks.len <= 0:
+        UirFnTaskParallelMergeContractSetError(report, 2)
+        return report
+    var previousDeclOrdinal = InvalidFunctionIndex()
+    for taskIndex in 0..<plan.tasks.len:
+        let task = plan.tasks[taskIndex]
+        if task.declOrdinal < 0:
+            UirFnTaskParallelMergeContractSetError(report, 3)
+        elif previousDeclOrdinal != InvalidFunctionIndex() &&
+             task.declOrdinal <= previousDeclOrdinal:
+            UirFnTaskParallelMergeContractSetError(report, 4)
+        if taskIndex == 0:
+            report.firstDeclOrdinal = task.declOrdinal
+        report.lastDeclOrdinal = task.declOrdinal
+        previousDeclOrdinal = task.declOrdinal
+    return report
+
+fn UirFnTaskParallelMergeContractReportText(report: UirFnTaskParallelMergeContractReport): str =
+    var lines: str[]
+    add(lines, Fmt"uir_fn_task_parallel_ok={UirFnTaskBoolText(report.ok)}")
+    add(lines, Fmt"uir_fn_task_parallel_requested_job_count={report.requestedJobCount}")
+    add(lines, Fmt"uir_fn_task_parallel_effective_shard_count={report.effectiveShardCount}")
+    add(lines, Fmt"uir_fn_task_parallel_task_count={report.taskCount}")
+    add(lines, Fmt"uir_fn_task_parallel_merge_order={report.mergeOrder}")
+    add(lines, Fmt"uir_fn_task_parallel_task_local_result_only={UirFnTaskBoolText(report.taskLocalResultOnly)}")
+    add(lines, Fmt"uir_fn_task_parallel_shared_instruction_words_write_count={report.sharedInstructionWordsWriteCount}")
+    add(lines, Fmt"uir_fn_task_parallel_task_local_instruction_words_payload_count={report.taskLocalInstructionWordsPayloadCount}")
+    add(lines, Fmt"uir_fn_task_parallel_instruction_words_merge_owner={report.instructionWordsMergeOwner}")
+    add(lines, Fmt"uir_fn_task_parallel_first_decl_ordinal={report.firstDeclOrdinal}")
+    add(lines, Fmt"uir_fn_task_parallel_last_decl_ordinal={report.lastDeclOrdinal}")
+    add(lines, Fmt"uir_fn_task_parallel_error_count={report.errorCount}")
+    add(lines, Fmt"uir_fn_task_parallel_first_error_code={report.firstErrorCode}")
+    return strutil.Join(lines, "\n")
 
 fn UirFnTaskResultContractReportNew(): UirFnTaskResultContractReport =
     var out: UirFnTaskResultContractReport

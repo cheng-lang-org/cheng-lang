@@ -1,5 +1,6 @@
+import std/strutils as strutil
+import cheng/core/backend/lowering_plan as lower
 import cheng/core/ir/core_types as ir
-import cheng/core/ir/body_ir_noalias as noalias
 
 fn check(cond: bool, code: int32): int32 =
     if cond:
@@ -19,7 +20,7 @@ fn addI32Slot(bodyIR: var ir.BodyIR,
     add(bodyIR.localSlots, slot)
     return slot.id
 
-fn buildBody(): ir.BodyIR =
+fn buildForwardBody(): ir.BodyIR =
     var bodyIR = ir.BodyIRNew()
     let a = addI32Slot(bodyIR, "a")
     let b = addI32Slot(bodyIR, "b")
@@ -44,67 +45,45 @@ fn buildBody(): ir.BodyIR =
     let _ = ir.BodyIRAppendBlock(bodyIR, 0, 2, termIndex)
     return bodyIR
 
-fn buildOverwriteBody(): ir.BodyIR =
-    var bodyIR = ir.BodyIRNew()
-    let a = addI32Slot(bodyIR, "a")
-    let b = addI32Slot(bodyIR, "b")
-    let c = addI32Slot(bodyIR, "c")
-
-    var loadB: ir.BodyOp
-    loadB.kind = ir.BodyOpLoadLocalTag
-    loadB.target = b
-    add(loadB.operands, a)
-    add(bodyIR.ops, loadB)
-
-    var overwriteA: ir.BodyOp
-    overwriteA.kind = ir.BodyOpLoadConstTag
-    overwriteA.target = a
-    add(bodyIR.ops, overwriteA)
-
-    var copyC: ir.BodyOp
-    copyC.kind = ir.BodyOpCopyLocalTag
-    copyC.target = c
-    add(copyC.operands, b)
-    add(bodyIR.ops, copyC)
-
-    var term: ir.BodyTerm
-    term.kind = ir.BodyTermReturnTag
-    term.resultSlot = c
-    let termIndex = ir.BodyIRAppendTerm(bodyIR, term)
-    let _ = ir.BodyIRAppendBlock(bodyIR, 0, 3, termIndex)
-    return bodyIR
-
 fn main(): int32 =
-    let finalized = noalias.BodyIrNoAliasFinalize(buildBody())
+    var fnIr: lower.PrimaryObjectIrFunction
+    fnIr.functionName = "NoAliasActiveFixture"
+    fnIr.bodyKind = "statement_sequence"
+    fnIr.bodyIR = buildForwardBody()
 
-    let c1 = check(finalized.dodSoAContractOk, 11)
+    lower.LoweringFinalizeBodyIrNoAlias(fnIr)
+
+    let c1 = check(fnIr.bodyIrNoAliasApplied, 11)
     if c1 != 0: return c1
-    let c2 = check(finalized.applied, 12)
+    let c2 = check(fnIr.bodyIrNoAliasLocalCount == 2, 12)
     if c2 != 0: return c2
-    let c3 = check(finalized.localCount >= 3, 13)
+    let c3 = check(fnIr.bodyIrNoAliasForwardRewriteCount == 2, 13)
     if c3 != 0: return c3
-    let c4 = check(finalized.forwardRewriteCount >= 2, 14)
+    let c4 = check(fnIr.bodyIR.ops[1].operands[0] == 0, 14)
     if c4 != 0: return c4
-    let c5 = check(finalized.bodyIR.ops[1].operands[0] == 0, 15)
+    let c5 = check(fnIr.bodyIR.terms[0].resultSlot == 0, 15)
     if c5 != 0: return c5
-    let c6 = check(finalized.bodyIR.terms[0].resultSlot == 0, 16)
+
+    var activeIr: lower.PrimaryObjectIr
+    add(activeIr.functions, fnIr)
+    let report = lower.LoweringPrimaryObjectIrReportText(activeIr)
+    let c6 = check(strutil.Contains(report, "primary_object_ir_noalias_applied_flags=1"), 16)
     if c6 != 0: return c6
-
-    let overwriteFinalized = noalias.BodyIrNoAliasFinalize(buildOverwriteBody())
-    let c7 = check(overwriteFinalized.dodSoAContractOk, 17)
+    let c7 = check(strutil.Contains(report, "primary_object_ir_noalias_local_counts=2"), 17)
     if c7 != 0: return c7
-    let c8 = check(overwriteFinalized.bodyIR.ops[2].operands[0] == 1, 18)
+    let c8 = check(strutil.Contains(report, "primary_object_ir_noalias_forward_rewrite_counts=2"), 18)
     if c8 != 0: return c8
-    let c9 = check(overwriteFinalized.bodyIR.terms[0].resultSlot == 1, 19)
-    if c9 != 0: return c9
 
-    var broken = buildBody()
-    broken.terms[0].resultSlot = 99
-    let brokenFinalized = noalias.BodyIrNoAliasFinalize(broken)
-    let c10 = check(!brokenFinalized.dodSoAContractOk, 20)
+    var brokenFn: lower.PrimaryObjectIrFunction
+    brokenFn.functionName = "NoAliasBrokenFixture"
+    brokenFn.bodyKind = "statement_sequence"
+    brokenFn.bodyIR = buildForwardBody()
+    brokenFn.bodyIR.terms[0].resultSlot = 99
+    lower.LoweringFinalizeBodyIrNoAlias(brokenFn)
+    let c9 = check(!brokenFn.bodyIrNoAliasApplied, 19)
+    if c9 != 0: return c9
+    let c10 = check(brokenFn.bodyKind == "body_ir_dod_soa_contract_invalid", 20)
     if c10 != 0: return c10
-    let c11 = check(!brokenFinalized.applied, 21)
-    if c11 != 0: return c11
 
     echo(" body_ir_noalias_active_smoke ok")
     return 0

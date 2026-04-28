@@ -253,3 +253,14 @@
 - 直接 import `primary_object_plan` 的合同 smoke 也不是每步短验；即使不 import `primary_object_emit`，当前最小 driver 仍会在 `system_link_plan` 长跑。把这类合同放到候选刷新窗口，小步验证只跑 provider-free direct fixture。
 - 函数级并行不能把单线程队列、协作 `spawn` 或 queue 分配失败后的串行执行称为 work-stealing；`BACKEND_JOBS>1` 在真实 OS worker、真实 atomic CAS 和跨线程 ORC 之前必须硬失败。
 - primary codegen 任务要先产 task-local words，再由主线程按声明序稳定 merge；worker 不能直接抢写共享 `instructionWords` 来绕过确定性合同。
+- `std/async_rt.spawn[T]` 不能在真实线程入口未闭环时内联执行 `entry(ctx)`；这是假异步，会让线程/ORC smoke 假绿。未支持的泛型 ctx 入口必须 hard-fail，已支持的 concrete ctx 入口必须走 `cheng_spawn`。
+- pthread create 成功后 detach 失败不能向上返回普通失败；线程可能已经持有 ctx，调用方若释放会形成 use-after-free。该路径必须硬退出或进入明确 join 语义，不能静默返回 0。
+- 旧 pure bootstrap 对 `BackendDriverDispatchMinRunCommand -> ParamStr -> RunCommandWithCmd` wrapper 仍会报 `cfg_no_top_if`；继续改入口形状、加本地 ParamStr wrapper 或拆 helper 都不是根治。下一步必须补通用 TypedStmt/BodyIR CFG，让 let-call 后 return-call 这类普通函数不依赖专用 body kind。
+- runtime 能力验证必须同时检查 report 与机器码：`standalone_no_runtime=1`、`provider_object_count=0` 或入口被折成 `mov w0,#0; ret` 任一出现，都只能算旧 driver 假路径，不能证明线程、原子或 ORC 可用。
+- provider-backed executable 不能只给 self entry 走 provider object 链路；只要 `emit=exe` 且 `providerModules.len>0`，dispatch_min 必须进入 provider object 编译和 system link，否则 runtime smoke 会落到 standalone no-runtime 假路径。
+- 线程/原子/ORC smoke 必须同时锁住 success marker、`provider_object_count>0`、禁止 `standalone_no_runtime=1`，并用 `nm -u` 或等价产物检查真实 `_cheng_spawn/_cheng_atomic_*/ORC` 符号；单看进程退出 0 不算证明。
+- 导入 lowering/primary 的合同 smoke 仍是大闭包验证，不能放进每步短验；短验卡在 `lowering_plan` 长窗口时必须中止并清理进程，把它归到候选刷新窗口，而不是等待到分钟级影响效率。
+- typed statement 里 shell `return` 和实际 `return Call(...)` 可能共享同一行；lowering 应按 statement 顺序识别后继 `returnRoot` call 并跳过壳 return，不能写函数名或入口名特判。
+- 修改编译器源码里的 CSG/lowering/typed 热路径不会加速当前正在运行的旧 `artifacts/backend_driver/cheng`；self-probe 的耗时反映的是已安装编译器本体。性能修补必须先通过纯 Cheng 候选产物刷新后，才能用下一轮 A 编 B / B 编同入口衡量。
+- `TypedExprBuildFacts` 不能先构建 source context 又按 source 重建同一个 context；应复用已构建 context，只为当前 source 填 `exprLineColumns`。多行字符串 rewrite、import edge 解析和 binding 扫描都属于 source-local 固定事实，不应在 facts/IR 阶段重复做。
+- 已经有 `ctx.lines` 时不要再把原始 source text 传给 import edge parser；应调用 lines 版本读取 import edges，避免对含多行字符串的 source 再做一次 rewrite 和 split。

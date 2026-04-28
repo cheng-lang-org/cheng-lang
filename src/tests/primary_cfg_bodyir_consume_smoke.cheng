@@ -86,6 +86,13 @@ fn guardReturnConstOp(slot: int32, value: int32): ir.BodyOp =
     add(op.operands, value)
     return op
 
+fn copyLocalOp(source: int32, target: int32): ir.BodyOp =
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpCopyLocalTag
+    op.target = target
+    add(op.operands, source)
+    return op
+
 fn returnConstTerm(value: int32): ir.BodyTerm =
     var term: ir.BodyTerm
     term.kind = ir.BodyTermReturnTag
@@ -100,6 +107,54 @@ fn returnLocalTerm(slot: int32): ir.BodyTerm =
     term.resultSlot = slot
     add(term.operands, ir.LocalI32Tag)
     return term
+
+fn returnCurrentCallTerm(): ir.BodyTerm =
+    var term: ir.BodyTerm
+    term.kind = ir.BodyTermReturnTag
+    term.resultSlot = -1
+    add(term.operands, ir.LocalI32Tag)
+    return term
+
+fn brTerm(targetBlock: int32): ir.BodyTerm =
+    var term: ir.BodyTerm
+    term.kind = ir.BodyTermBrTag
+    term.trueBlock = targetBlock
+    return term
+
+fn cbrLocalRhsTerm(lhsSlot: int32,
+                   rhsSlot: int32,
+                   trueBlock: int32,
+                   falseBlock: int32): ir.BodyTerm =
+    var term: ir.BodyTerm
+    term.kind = ir.BodyTermCbrTag
+    term.conditionKind = ir.BodyCondI32LeTag
+    term.lhsSlot = lhsSlot
+    term.resultSlot = lhsSlot
+    term.rhsSlot = rhsSlot
+    term.trueBlock = trueBlock
+    term.falseBlock = falseBlock
+    return term
+
+fn checkGeneralCfgEmit(body: ir.BodyIR, code: int32): int32 =
+    let wordCount = pobj.PrimaryBodyIrGeneralCfgWordCount(body)
+    if wordCount <= 0:
+        return code
+    var words: int32[]
+    var emitted: int32
+    pobj.PrimaryObjectPlanEmitBodyIR(body, words, emitted)
+    if emitted != wordCount:
+        return code + 1
+    if words.len != wordCount:
+        return code + 2
+    for callOrdinal in 0..<body.callSequence.len:
+        let relocOffset = pobj.PrimaryBodyIrGeneralCfgRelocWordOffset(body, 0, callOrdinal)
+        if relocOffset < 0 || relocOffset >= words.len:
+            return code + 3
+        if relocOffset != pobj.PrimaryBodyIrRelocWordOffset(body, 0, callOrdinal):
+            return code + 4
+        if words[relocOffset] != -1811939328:
+            return code + 5
+    return 0
 
 fn callSequenceReturnLocalBody(): ir.BodyIR =
     var body: ir.BodyIR
@@ -187,6 +242,95 @@ fn callCfgWithLocalWriteBody(): ir.BodyIR =
     let _ = ir.BodyIRAppendBlock(body, 0, 2, 0)
     return body
 
+fn generalCfgLocalCopyReturnBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    add(body.localSlots, i32Slot(0, 16, "tmp"))
+    add(body.localSlots, i32Slot(1, 32, "value"))
+    add(body.localSlots, i32Slot(2, 48, "out"))
+    var call: ir.CallOp
+    call.targetSymbol = "UseValue"
+    call.resultSlot = 2
+    add(call.argSlots, 1)
+    add(body.callSequence, call)
+    add(body.ops, loadConstOp(0, 9))
+    add(body.ops, copyLocalOp(0, 1))
+    add(body.ops, callOp(0, 2))
+    add(body.terms, returnLocalTerm(2))
+    let _ = ir.BodyIRAppendBlock(body, 0, 3, 0)
+    return body
+
+fn generalCfgReturnConstAfterCallBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    add(body.localSlots, i32Slot(0, 16, "ignored"))
+    var call: ir.CallOp
+    call.targetSymbol = "Touch"
+    call.resultSlot = 0
+    add(body.callSequence, call)
+    add(body.ops, callOp(0, 0))
+    add(body.terms, returnConstTerm(17))
+    let _ = ir.BodyIRAppendBlock(body, 0, 1, 0)
+    return body
+
+fn generalCfgReturnCurrentCallBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    var call: ir.CallOp
+    call.targetSymbol = "Leaf"
+    call.resultSlot = -1
+    add(body.callSequence, call)
+    add(body.ops, callOp(0, -1))
+    add(body.terms, returnCurrentCallTerm())
+    let _ = ir.BodyIRAppendBlock(body, 0, 1, 0)
+    return body
+
+fn generalCfgBrReturnBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    add(body.localSlots, i32Slot(0, 16, "value"))
+    add(body.ops, loadConstOp(0, 21))
+    add(body.terms, brTerm(1))
+    add(body.terms, returnLocalTerm(0))
+    let _ = ir.BodyIRAppendBlock(body, 0, 1, 0)
+    let _ = ir.BodyIRAppendBlock(body, 1, 0, 1)
+    return body
+
+fn generalCfgCbrLocalRhsBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    add(body.localSlots, i32Slot(0, 16, "lhs"))
+    add(body.localSlots, i32Slot(1, 32, "rhs"))
+    add(body.localSlots, i32Slot(2, 48, "value"))
+    add(body.ops, loadConstOp(0, 2))
+    add(body.ops, loadConstOp(1, 5))
+    add(body.ops, loadConstOp(2, 44))
+    add(body.terms, cbrLocalRhsTerm(0, 1, 1, 2))
+    add(body.terms, returnLocalTerm(2))
+    add(body.terms, returnConstTerm(8))
+    let _ = ir.BodyIRAppendBlock(body, 0, 3, 0)
+    let _ = ir.BodyIRAppendBlock(body, 3, 0, 1)
+    let _ = ir.BodyIRAppendBlock(body, 3, 0, 2)
+    return body
+
+fn strLetCallThenReturnCallCfgBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    add(body.localSlots, strSlot(0, 16, "cmd"))
+    add(body.localSlots, i32Slot(1, 48, "rc"))
+
+    var paramCall: ir.CallOp
+    paramCall.targetSymbol = "ParamStr"
+    paramCall.resultSlot = 0
+    add(paramCall.argSlots, ir.CallArgSlotConstTrue())
+    add(body.callSequence, paramCall)
+
+    var dispatchCall: ir.CallOp
+    dispatchCall.targetSymbol = "Dispatch"
+    dispatchCall.resultSlot = 1
+    add(dispatchCall.argSlots, 0)
+    add(body.callSequence, dispatchCall)
+
+    add(body.ops, callOp(0, 0))
+    add(body.ops, callOp(1, 1))
+    add(body.terms, returnLocalTerm(1))
+    let _ = ir.BodyIRAppendBlock(body, 0, 2, 0)
+    return body
+
 fn main(): int32 =
     var body: ir.BodyIR
     add(body.localSlots, resultSlot(0, 16))
@@ -237,6 +381,8 @@ fn main(): int32 =
     if c2 != 0: return c2
     let c3 = check(pobj.PrimaryBodyIrWordCount(body) > 0, 13)
     if c3 != 0: return c3
+    let c3b = checkGeneralCfgEmit(body, 70)
+    if c3b != 0: return c3b
     let c4 = check(pobj.PrimaryBodyCondArm64TrueCode(ir.BodyCondI32LeTag) == 13, 14)
     if c4 != 0: return c4
 
@@ -265,6 +411,35 @@ fn main(): int32 =
     if c17 != 0: return c17
     let c18 = check(pobj.PrimaryBodyIrRelocWordOffset(localWriteBody, 0, 0) > 0, 30)
     if c18 != 0: return c18
+    let generalLocalBody = generalCfgLocalCopyReturnBody()
+    let c18f = checkGeneralCfgEmit(generalLocalBody, 41)
+    if c18f != 0: return c18f
+    let generalConstBody = generalCfgReturnConstAfterCallBody()
+    let c18g = checkGeneralCfgEmit(generalConstBody, 50)
+    if c18g != 0: return c18g
+    let generalReturnCallBody = generalCfgReturnCurrentCallBody()
+    let c18h = checkGeneralCfgEmit(generalReturnCallBody, 60)
+    if c18h != 0: return c18h
+    let generalBrBody = generalCfgBrReturnBody()
+    let c18i = checkGeneralCfgEmit(generalBrBody, 90)
+    if c18i != 0: return c18i
+    let generalCbrLocalRhsBody = generalCfgCbrLocalRhsBody()
+    let c18j = checkGeneralCfgEmit(generalCbrLocalRhsBody, 100)
+    if c18j != 0: return c18j
+    let strLetBody = strLetCallThenReturnCallCfgBody()
+    let c18a = check(pobj.PrimaryBodyIrIsCallCfgReturnInt32(strLetBody), 36)
+    if c18a != 0: return c18a
+    let c18b = check(pobj.PrimaryBodyIrWordCount(strLetBody) > 0, 37)
+    if c18b != 0: return c18b
+    let c18c = check(pobj.PrimaryBodyIrRequiresCallSequence(strLetBody), 38)
+    if c18c != 0: return c18c
+    let c18d = check(pobj.PrimaryBodyIrRelocWordOffset(strLetBody, 0, 0) > 0, 39)
+    if c18d != 0: return c18d
+    let c18e = check(pobj.PrimaryBodyIrRelocWordOffset(strLetBody, 0, 1) >
+                     pobj.PrimaryBodyIrRelocWordOffset(strLetBody, 0, 0), 40)
+    if c18e != 0: return c18e
+    let c18k = checkGeneralCfgEmit(strLetBody, 80)
+    if c18k != 0: return c18k
     var strEqBody: ir.BodyIR
     add(strEqBody.localSlots, i32Slot(0, 16, "isMatch"))
     var strEqOp: ir.BodyOp

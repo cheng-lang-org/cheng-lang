@@ -1010,6 +1010,11 @@ fn CompilerCsgShouldExportSymbol(emitKind: creq.CompilerEmit,
 fn CompilerCsgSourceTextLookup(overrides: CompilerCsgSourceText[],
                                  sourcePath: str,
                                  out: var str): bool =
+    for i in 0..<overrides.len:
+        if overrides[i].sourcePath != sourcePath:
+            continue
+        out = overrides[i].text
+        return true
     let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
     for i in 0..<overrides.len:
         let overrideSourcePath = parser.ParserNormalizePath(overrides[i].sourcePath)
@@ -1682,6 +1687,148 @@ fn CompilerCsgExprLayerForText(sourcePath: str,
         return Err[bool](" compiler csg: expr layer read failed")
     return Ok[bool](true)
 
+fn CompilerCsgTextRangeEquals(text: str,
+                               start: int32,
+                               stop: int32,
+                               expected: str): bool =
+    if start < 0 || stop < start || stop > text.len:
+        return false
+    if stop - start != expected.len:
+        return false
+    for i in 0..<expected.len:
+        if text[start + i] != expected[i]:
+            return false
+    return true
+
+fn CompilerCsgTrimmedLineEquals(line: str,
+                                 expected: str): bool =
+    var start: int32
+    var stop: int32
+    if !parser.ParserTrimmedLineRange(line, start, stop):
+        return false
+    return CompilerCsgTextRangeEquals(line, start, stop, expected)
+
+fn CompilerCsgExprLayerForProfile(sourcePath: str,
+                                   importcCallNames: str[],
+                                   localCallNames: str[],
+                                   externalCallNames: str[],
+                                   currentProfile: parser.NormalizedExprCallProfile,
+                                   profiles: parser.NormalizedExprCallProfile[],
+                                   profileIndexLookup: parser.ParserSourcePathIndexLookup,
+                                   layer: var parser.NormalizedExprLayer): Result[bool] =
+    if sourcePath == "":
+        return Err[bool]("missing source path")
+    layer = parser.NormalizedExprLayer()
+    layer.sourceCount = 1
+    var localCallLookup = parser.ParserTextLookupBuildExact(localCallNames)
+    var externalCallLookup = parser.ParserTextLookupBuildExact(externalCallNames)
+    var importcCallLookup = parser.ParserTextLookupBuildExact(importcCallNames)
+    var knownCallLookup = parser.ParserTextLookupInit(localCallNames.len +
+                                                       externalCallNames.len +
+                                                       importcCallNames.len + 8)
+    parser.ParserTextLookupAddAllExact(knownCallLookup, localCallNames)
+    parser.ParserTextLookupAddAllExact(knownCallLookup, externalCallNames)
+    parser.ParserTextLookupAddAllExact(knownCallLookup, importcCallNames)
+    var profileCallLookupCache = parser.ParserBuildProfileCallLookupCache(profiles)
+    var inTypeBlock = false
+    var typeBlockIndent: int32 = -1
+    for i in 0..<currentProfile.lines.len:
+        if i % 128 == 0:
+            os.ProcessResourceGuardCheck()
+        let line = parser.ParserStripLineComment(currentProfile.lines[i])
+        if !parser.ParserHasNonTrimChar(line):
+            continue
+        let lineNumber = i + 1
+        let lineIndent: int32 = parser.ParserLineIndent(line)
+        if inTypeBlock && lineIndent <= typeBlockIndent:
+            inTypeBlock = false
+        if !parser.ParserHasLeadingIndent(line):
+            inTypeBlock = CompilerCsgTrimmedLineEquals(line, "type")
+            if inTypeBlock:
+                typeBlockIndent = lineIndent
+        var redundantType = ""
+        var redundantExpr = ""
+        if parser.ParserFindRedundantExplicitDefaultLine(line,
+                                                          inTypeBlock,
+                                                          currentProfile,
+                                                          profiles,
+                                                          redundantType,
+                                                          redundantExpr):
+            return Err[bool](parser.ParserRedundantExplicitDefaultError(redundantType, redundantExpr))
+        var strictErr = ""
+        if parser.ParserRejectSpaceCallIfStrict(line, lineNumber, knownCallLookup, strictErr):
+            return Err[bool](strictErr)
+        parser.ParserAppendSimpleSurfaceExprsLine(sourcePath,
+                                                   lineNumber,
+                                                   line,
+                                                   true,
+                                                   true,
+                                                   true,
+                                                   layer)
+        parser.ParserAppendReturnStmtExprsLine(sourcePath, lineNumber, line, layer)
+        parser.ParserAppendAssignStmtExprsLine(sourcePath, lineNumber, line, layer)
+        parser.ParserAppendControlStmtExprsLine(sourcePath, lineNumber, line, layer)
+        parser.ParserAppendRangeExprsLine(sourcePath, lineNumber, line, layer)
+        parser.ParserAppendComprehensionExprsLine(sourcePath, lineNumber, line, layer)
+        parser.ParserAppendFmtExprsLine(sourcePath, lineNumber, line, layer)
+        parser.ParserAppendStringifyCallExprsLine(sourcePath,
+                                                   lineNumber,
+                                                   line,
+                                                   layer)
+        var defaultErr = ""
+        if !parser.ParserAppendDefaultInitExprsLine(sourcePath,
+                                                     lineNumber,
+                                                     line,
+                                                     currentProfile,
+                                                     profiles,
+                                                     layer,
+                                                     defaultErr):
+            return Err[bool](defaultErr)
+        parser.ParserAppendConstructorExprsLine(sourcePath,
+                                                 lineNumber,
+                                                 line,
+                                                 currentProfile,
+                                                 profiles,
+                                                 layer)
+        parser.ParserAppendCallExprsLine(sourcePath,
+                                          lineNumber,
+                                          line,
+                                          &localCallLookup,
+                                          parser.NormalizedExprSurfaceCallLocal,
+                                          currentProfile,
+                                          profiles,
+                                          profileIndexLookup,
+                                          profileCallLookupCache,
+                                          layer)
+        parser.ParserAppendCallExprsLine(sourcePath,
+                                          lineNumber,
+                                          line,
+                                          &externalCallLookup,
+                                          parser.NormalizedExprSurfaceCallExternal,
+                                          currentProfile,
+                                          profiles,
+                                          profileIndexLookup,
+                                          profileCallLookupCache,
+                                          layer)
+        parser.ParserAppendCallExprsLine(sourcePath,
+                                          lineNumber,
+                                          line,
+                                          &importcCallLookup,
+                                          parser.NormalizedExprSurfaceCallImportc,
+                                          currentProfile,
+                                          profiles,
+                                          profileIndexLookup,
+                                          profileCallLookupCache,
+                                          layer)
+        parser.ParserAppendMemberCallExprsLine(sourcePath,
+                                                lineNumber,
+                                                line,
+                                                knownCallLookup,
+                                                currentProfile,
+                                                layer)
+    layer.questionResidualCount = 0
+    return Ok[bool](true)
+
 fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
                                       sourceBundleCid: layout.FixedBytes32,
                                       sourceTextOverrides: CompilerCsgSourceText[],
@@ -1862,15 +2009,14 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
                                                       externalQualifiedNameCache,
                                                       sourceExternalCalls)
         var sourceExprLayer = parser.NormalizedExprLayer()
-        let sourceExprRes = CompilerCsgExprLayerForText(sourcePath,
-                                                          profile.text,
-                                                          profile.importcCallNames,
-                                                          profile.localCallNames,
-                                                          sourceExternalCalls,
-                                                          profile,
-                                                          exprCallProfiles,
-                                                          profileIndexLookup,
-                                                          sourceExprLayer)
+        let sourceExprRes = CompilerCsgExprLayerForProfile(sourcePath,
+                                                            profile.importcCallNames,
+                                                            profile.localCallNames,
+                                                            sourceExternalCalls,
+                                                            profile,
+                                                            exprCallProfiles,
+                                                            profileIndexLookup,
+                                                            sourceExprLayer)
         if IsErr(sourceExprRes):
             err = Error(sourceExprRes)
             return false

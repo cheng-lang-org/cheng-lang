@@ -2363,13 +2363,13 @@ fn ParserAppendReturnStmtExprsLine(sourcePath: str,
                                                lineRaw.len)
         i = stop
 
-fn ParserLineStartsWithStatementKeyword(lineRaw: str,
-                                          keyword: str): bool =
-    var start: int32
-    var stop: int32
-    if !ParserTrimmedLineRange(lineRaw, start, stop):
-        return false
+fn ParserLineRangeStartsWithStatementKeyword(lineRaw: str,
+                                               start: int32,
+                                               stop: int32,
+                                               keyword: str): bool =
     let keywordLen = keyword.len
+    if keywordLen <= 0:
+        return false
     let lineLen = stop - start
     if lineLen < keywordLen:
         return false
@@ -2382,6 +2382,32 @@ fn ParserLineStartsWithStatementKeyword(lineRaw: str,
     if ParserIsInlineSpace(nextCh):
         return true
     return nextCh == ':'
+
+fn ParserLineStartsWithStatementKeyword(lineRaw: str,
+                                          keyword: str): bool =
+    var start: int32
+    var stop: int32
+    if !ParserTrimmedCommentRange(lineRaw, start, stop):
+        return false
+    return ParserLineRangeStartsWithStatementKeyword(lineRaw,
+                                                     start,
+                                                     stop,
+                                                     keyword)
+
+fn ParserLineRangeEqualsElseControlKeyword(lineRaw: str,
+                                             start: int32,
+                                             stop: int32): bool =
+    let keyword = "else"
+    let keywordLen = keyword.len
+    let lineLen = stop - start
+    if lineLen != keywordLen && lineLen != keywordLen + 1:
+        return false
+    for i in 0..<keywordLen:
+        if lineRaw[start + i] != keyword[i]:
+            return false
+    if lineLen == keywordLen:
+        return true
+    return lineRaw[start + keywordLen] == ':'
 
 fn ParserLineTokenEquals(lineRaw: str,
                           start: int32,
@@ -2433,6 +2459,70 @@ fn ParserLineIsAssignmentStmtCandidate(lineRaw: str): bool =
         return false
     return ParserFindTopLevelAssignmentEq(lineRaw) >= 0
 
+fn ParserFindTopLevelTokenRange(textRaw: str,
+                                  startRaw: int32,
+                                  stopRaw: int32,
+                                  target: str): int32 =
+    var start = startRaw
+    if start < 0:
+        start = 0
+    var stop = stopRaw
+    if stop > textRaw.len:
+        stop = textRaw.len
+    if target == "" || stop <= start || target.len > stop - start:
+        return -1
+    var inString = false
+    var inChar = false
+    var parenDepth: int32
+    var bracketDepth: int32
+    var braceDepth: int32
+    var i = start
+    while i < stop:
+        let ch = textRaw[i]
+        if !inChar && ch == '"' && !ParserQuoteIsEscaped(textRaw, i):
+            inString = !inString
+            i = i + 1
+            continue
+        if !inString && ch == Char(39) && !ParserQuoteIsEscaped(textRaw, i):
+            inChar = !inChar
+            i = i + 1
+            continue
+        if inString || inChar:
+            i = i + 1
+            continue
+        if ch == '(':
+            parenDepth = parenDepth + 1
+            i = i + 1
+            continue
+        if ch == ')':
+            parenDepth = parenDepth - 1
+            i = i + 1
+            continue
+        if ch == '[':
+            bracketDepth = bracketDepth + 1
+            i = i + 1
+            continue
+        if ch == ']':
+            bracketDepth = bracketDepth - 1
+            i = i + 1
+            continue
+        if ch == '{':
+            braceDepth = braceDepth + 1
+            i = i + 1
+            continue
+        if ch == '}':
+            braceDepth = braceDepth - 1
+            i = i + 1
+            continue
+        if parenDepth == 0 &&
+           bracketDepth == 0 &&
+           braceDepth == 0 &&
+           i + target.len <= stop &&
+           ParserTextEqualsAt(textRaw, i, target):
+            return i
+        i = i + 1
+    return -1
+
 fn ParserAppendAssignStmtExprsLine(sourcePath: str,
                                     lineNumber: int32,
                                     lineRaw: str,
@@ -2460,42 +2550,43 @@ fn ParserAppendControlStmtExprsLine(sourcePath: str,
                                      lineNumber: int32,
                                      lineRaw: str,
                                      layer: var NormalizedExprLayer) =
-    let lineNoComment = ParserStripLineComment(lineRaw)
-    let trimmed = chengpath.PathTrim(lineNoComment)
-    if trimmed == "":
+    var lineStart: int32
+    var lineStop: int32
+    if !ParserTrimmedCommentRange(lineRaw, lineStart, lineStop):
         return
     var kind = NormalizedExprIfStmt
     var keyword = ""
     var payloadStart: int32
-    if ParserStartsWith(trimmed, "if "):
+    if ParserLineRangeStartsWithStatementKeyword(lineRaw, lineStart, lineStop, "if"):
         kind = NormalizedExprIfStmt
         keyword = "if"
-        payloadStart = 3
-    elif ParserStartsWith(trimmed, "elif "):
+        payloadStart = lineStart + 3
+    elif ParserLineRangeStartsWithStatementKeyword(lineRaw, lineStart, lineStop, "elif"):
         kind = NormalizedExprElifStmt
         keyword = "elif"
-        payloadStart = 5
-    elif trimmed == "else:" || trimmed == "else":
+        payloadStart = lineStart + 5
+    elif ParserLineRangeEqualsElseControlKeyword(lineRaw, lineStart, lineStop):
         kind = NormalizedExprElseStmt
         keyword = "else"
-        payloadStart = 4
-    elif ParserStartsWith(trimmed, "for "):
+        payloadStart = lineStart + 4
+    elif ParserLineRangeStartsWithStatementKeyword(lineRaw, lineStart, lineStop, "for"):
         kind = NormalizedExprForStmt
         keyword = "for"
-        payloadStart = 4
+        payloadStart = lineStart + 4
     else:
         return
-    let keywordPos = ParserFindText(lineRaw, keyword)
-    if keywordPos < 0:
-        return
+    let keywordPos = lineStart
     var payload = ""
     if kind != NormalizedExprElseStmt:
-        let colonPos = ParserFindTopLevelToken(trimmed, ":")
+        let colonPos = ParserFindTopLevelTokenRange(lineRaw,
+                                                    lineStart,
+                                                    lineStop,
+                                                    ":")
         if colonPos <= payloadStart:
             return
-        payload = chengpath.PathTrim(ParserTextSliceFast(trimmed,
-                                                         payloadStart,
-                                                         colonPos - payloadStart))
+        payload = ParserTrimmedSliceRange(lineRaw,
+                                          payloadStart,
+                                          colonPos)
         if payload == "":
             return
     NormalizedExprLayerAppendSpan(layer,

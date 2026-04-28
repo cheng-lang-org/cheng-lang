@@ -1,0 +1,172 @@
+import std/os
+import std/parseutils
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+fn pref(prefix: str, value: str): str =
+    return strutil.Join([prefix, value], "")
+
+fn clean(path: str) =
+    if chengpath.PathFileExists(path):
+        os.RemoveFile(path)
+
+fn reportValue(reportText: str, key: str): str =
+    let prefix = pref(key, "=")
+    let lines = strutil.Split(reportText, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        if strutil.StartsWith(line, prefix):
+            return chengpath.TextSlice(line, len(prefix), len(line) - len(prefix))
+    return ""
+
+fn reportPositiveInt(reportText: str, key: str): int32 =
+    let valueText = reportValue(reportText, key)
+    assert(len(valueText) > 0, pref(key, ": report field missing"))
+    var value: int32
+    let parsed = parseutils.ParseInt32(valueText, value)
+    assert(parsed == len(valueText), pref(key, ": report field not int32"))
+    assert(value > 0, pref(key, ": report field must be positive"))
+    return value
+
+fn assertRealRuntimeReport(label: str, reportText: str) =
+    assert(strings.StrContains(reportText, "system_link_exec_runtime_execute=1"),
+           pref(label, ": runtime execute marker"))
+    assert(!strings.StrContains(reportText, "system_link_exec_runtime_standalone_no_runtime=1"),
+           pref(label, ": no standalone no-runtime fake path"))
+    assert(!strings.StrContains(reportText, "system_link_exec_runtime_standalone_direct_entry=1"),
+           pref(label, ": no standalone direct entry fake path"))
+    assert(!strings.StrContains(reportText, "provider_object_count=0"),
+           pref(label, ": provider objects required"))
+    assert(!strings.StrContains(reportText, "line_map=-"),
+           pref(label, ": line map must not be disabled marker"))
+    let providerCount = reportPositiveInt(reportText, "provider_object_count")
+    let objectLinkInputCount = reportPositiveInt(reportText, "object_link_input_count")
+    let nativeLinkInputCount = reportPositiveInt(reportText, "native_link_input_count")
+    assert(objectLinkInputCount > providerCount,
+           pref(label, ": object link inputs must include primary object plus providers"))
+    assert(nativeLinkInputCount == objectLinkInputCount,
+           pref(label, ": native link input count must match object link input count"))
+
+fn assertPrimaryUndefined(root: str,
+                          label: str,
+                          primaryObjectPath: str,
+                          outDir: str,
+                          symbol: str) =
+    let logPath = chengpath.PathJoin(outDir, pref(label, ".nm.log"))
+    let nmRun = hostops.RunProgramLogged(root,
+                                         pref(label, "_nm"),
+                                         "nm",
+                                         ["-u", primaryObjectPath],
+                                         [],
+                                         root,
+                                         30,
+                                         logPath)
+    assert(nmRun.exitCode == 0, pref(label, ": nm rc"))
+    assert(strings.StrContains(nmRun.output, symbol),
+           strutil.Join([label, ": primary object references ", symbol], ""))
+
+fn compileAndRunRuntimeCase(root: str,
+                            driver: str,
+                            target: str,
+                            outDir: str,
+                            label: str,
+                            sourceRel: str,
+                            requiredOutput: str,
+                            requiredSymbols: str[]) =
+    let source = chengpath.PathAbsolute(root, sourceRel)
+    let outBin = chengpath.PathJoin(outDir, label)
+    let reportPath = pref(outBin, ".compile.report.txt")
+    let compileLog = pref(outBin, ".compile.log")
+    let runLog = pref(outBin, ".run.log")
+    clean(outBin)
+    clean(reportPath)
+    clean(compileLog)
+    clean(runLog)
+    let compileRun = hostops.RunFileLogged(root,
+                                           pref(label, "_compile"),
+                                           driver,
+                                           [
+                                               "system-link-exec",
+                                               pref("--root:", root),
+                                               pref("--in:", source),
+                                               "--emit:exe",
+                                               pref("--target:", target),
+                                               pref("--out:", outBin),
+                                               pref("--report-out:", reportPath)
+                                           ],
+                                           [
+                                               "CHENG_REQUIRE_PURE_SYSTEM_LINK_EXEC=1",
+                                               "CHENG_PROGRESS=1",
+                                               "CHENG_PROCESS_MAX_RSS_BYTES=8589934592"
+                                           ],
+                                           root,
+                                           0,
+                                           compileLog)
+    assert(compileRun.exitCode == 0, pref(label, ": compile rc"))
+    assert(chengpath.FileExistsNonEmpty(root, outBin), pref(label, ": exe exists"))
+    assert(chengpath.FileExistsNonEmpty(root, reportPath), pref(label, ": report exists"))
+    let reportText = os.ReadFile(reportPath)
+    assertRealRuntimeReport(label, reportText)
+    let primaryObjectPath = reportValue(reportText, "native_primary_object")
+    assert(len(primaryObjectPath) > 0, pref(label, ": primary object path"))
+    assert(primaryObjectPath != "-", pref(label, ": primary object path must be real"))
+    assert(chengpath.FileExistsNonEmpty(root, primaryObjectPath),
+           pref(label, ": primary object exists"))
+    for i in 0..<requiredSymbols.len:
+        assertPrimaryUndefined(root, label, primaryObjectPath, outDir, requiredSymbols[i])
+    let run = hostops.RunFileLogged(root,
+                                    pref(label, "_run"),
+                                    outBin,
+                                    [],
+                                    [],
+                                    root,
+                                    30,
+                                    runLog)
+    assert(run.exitCode == 0, pref(label, ": runtime rc"))
+    assert(strings.StrContains(run.output, requiredOutput),
+           pref(label, ": runtime output marker"))
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let driver = chengpath.PathAbsolute(root, "artifacts/backend_driver/cheng")
+    let target = os.GetEnvDefault("CHENG_RUNTIME_LINK_TARGET", "arm64-apple-darwin")
+    let outDir = chengpath.PathAbsolute(root, "artifacts/thread_atomic_orc_runtime_gate_smoke")
+    assert(chengpath.FileExistsNonEmpty(root, driver),
+           " thread atomic orc runtime gate: backend driver exists")
+    assert(chengpath.MkdirP(root, outDir),
+           " thread atomic orc runtime gate: mkdir")
+
+    compileAndRunRuntimeCase(root,
+                             driver,
+                             target,
+                             outDir,
+                             "atomic_i32_runtime_real",
+                             "src/tests/atomic_i32_runtime_smoke.cheng",
+                             " atomic_i32_runtime_smoke ok",
+                             ["_cheng_atomic_cas_i32", "_cheng_atomic_load_i32", "_cheng_atomic_store_i32"])
+
+    compileAndRunRuntimeCase(root,
+                             driver,
+                             target,
+                             outDir,
+                             "thread_atomic_orc_runtime_real",
+                             "src/tests/thread_atomic_orc_runtime_smoke.cheng",
+                             " thread_atomic_orc_runtime_smoke ok",
+                             [
+                                 "_cheng_spawn",
+                                 "_cheng_thread_parallelism",
+                                 "_cheng_thread_yield",
+                                 "_cheng_atomic_cas_i32",
+                                 "_cheng_atomic_load_i32",
+                                 "_cheng_mem_retain_atomic",
+                                 "_cheng_mem_release_atomic",
+                                 "_cheng_mem_refcount_atomic",
+                                 "_cheng_mm_diag_reset",
+                                 "_cheng_mm_retain_count",
+                                 "_cheng_mm_release_count"
+                             ])
+
+    echo(" thread_atomic_orc_runtime_gate_smoke ok")
+    return 0

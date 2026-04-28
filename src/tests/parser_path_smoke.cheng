@@ -147,6 +147,121 @@ fn main(): int32 =
     assert(sawNestedExternalTarget, " parser path: saw nested external target")
     assert(sawAliasImportcTarget, " parser path: saw alias importc target")
     assert(sawNestedImportcTarget, " parser path: saw nested importc target")
+
+    let trimmedSliceFixturePath = chengpath.PathJoin(packageRoot, "src/tests/parser_trimmed_slice_fixture.cheng")
+    let trimmedSliceFixtureText = """
+fn main(): int32 =
+    var alpha: int32
+       alpha   =   41
+    if alpha > 0:   return   alpha + 1
+    return    0
+"""
+    var trimmedSliceLayer: parser.NormalizedExprLayer
+    err = ""
+    assert(parser.ParserReadNormalizedExprLayerFromText(trimmedSliceFixturePath,
+                                                        trimmedSliceFixtureText,
+                                                        trimmedSliceLayer,
+                                                        err),
+           " parser path: trimmed slice fixture parses")
+    assert(parser.NormalizedExprLayerAssignCount(trimmedSliceLayer) == 1,
+           " parser path: trimmed assignment count")
+    assert(parser.NormalizedExprLayerReturnCount(trimmedSliceLayer) == 2,
+           " parser path: trimmed return count")
+    var sawTrimmedAssign = false
+    var sawTrimmedIfReturn = false
+    var sawTrimmedReturn = false
+    for i in 0..<trimmedSliceLayer.exprs.len:
+        let expr = trimmedSliceLayer.exprs[i]
+        if expr.sourcePath != trimmedSliceFixturePath:
+            continue
+        if expr.kind == parser.NormalizedExprAssign && expr.lineNumber == 3:
+            assert(expr.surfaceText == "alpha",
+                   " parser path: assignment lhs trimmed slice")
+            assert(expr.callArgsText == "41",
+                   " parser path: assignment rhs trimmed slice")
+            sawTrimmedAssign = true
+        elif expr.kind == parser.NormalizedExprReturn && expr.lineNumber == 4:
+            assert(expr.surfaceText == "alpha + 1",
+                   " parser path: if return trimmed slice")
+            sawTrimmedIfReturn = true
+        elif expr.kind == parser.NormalizedExprReturn && expr.lineNumber == 5:
+            assert(expr.surfaceText == "0",
+                   " parser path: return trimmed slice")
+            sawTrimmedReturn = true
+    assert(sawTrimmedAssign, " parser path: saw trimmed assignment")
+    assert(sawTrimmedIfReturn, " parser path: saw trimmed if return")
+    assert(sawTrimmedReturn, " parser path: saw trimmed return")
+
+    assert(parser.ParserLineStartsWithStatementKeyword("   if alpha > 0:", "if"),
+           " parser path: keyword leading spaces")
+    assert(parser.ParserLineStartsWithStatementKeyword("\tfor item in items:", "for"),
+           " parser path: keyword leading tab")
+    assert(parser.ParserLineStartsWithStatementKeyword("return 0", "return"),
+           " parser path: keyword bare return")
+    assert(parser.ParserLineStartsWithStatementKeyword("if: return 0", "if"),
+           " parser path: keyword colon boundary")
+    assert(!parser.ParserLineStartsWithStatementKeyword("   ifx alpha > 0:", "if"),
+           " parser path: keyword ident boundary false")
+    assert(!parser.ParserLineStartsWithStatementKeyword("format value:", "for"),
+           " parser path: keyword prefix false")
+    assert(!parser.ParserLineStartsWithStatementKeyword("   # if alpha > 0:", "if"),
+           " parser path: keyword comment false")
+
+    let statementKeywordFixturePath = chengpath.PathJoin(packageRoot,
+                                                         "src/tests/parser_statement_keyword_fixture.cheng")
+    let statementKeywordFixtureText = """
+fn main(): int32 =
+       if alpha > 0:
+           return 1
+       ifx alpha > 0:
+           return 2
+       for item in items:
+           return 3
+       format value:
+           return 4
+       else:
+           return 5
+"""
+    var statementKeywordLayer: parser.NormalizedExprLayer
+    err = ""
+    assert(parser.ParserReadNormalizedExprLayerFromText(statementKeywordFixturePath,
+                                                        statementKeywordFixtureText,
+                                                        statementKeywordLayer,
+                                                        err),
+           " parser path: statement keyword fixture parses")
+    assert(parser.NormalizedExprLayerIfStmtCount(statementKeywordLayer) == 1,
+           " parser path: exact if keyword count")
+    assert(parser.NormalizedExprLayerForStmtCount(statementKeywordLayer) == 1,
+           " parser path: exact for keyword count")
+    assert(parser.NormalizedExprLayerElseStmtCount(statementKeywordLayer) == 1,
+           " parser path: exact else keyword count")
+    var sawStatementKeywordIf = false
+    var sawStatementKeywordFor = false
+    var sawStatementKeywordElse = false
+    for i in 0..<statementKeywordLayer.exprs.len:
+        let expr = statementKeywordLayer.exprs[i]
+        if expr.sourcePath != statementKeywordFixturePath:
+            continue
+        if expr.kind == parser.NormalizedExprIfStmt:
+            assert(expr.lineNumber == 2,
+                   " parser path: ifx is not if statement")
+            assert(expr.surfaceText == "alpha > 0",
+                   " parser path: if payload exact")
+            sawStatementKeywordIf = true
+        elif expr.kind == parser.NormalizedExprForStmt:
+            assert(expr.lineNumber == 6,
+                   " parser path: format is not for statement")
+            assert(expr.surfaceText == "item in items",
+                   " parser path: for payload exact")
+            sawStatementKeywordFor = true
+        elif expr.kind == parser.NormalizedExprElseStmt:
+            assert(expr.lineNumber == 10,
+                   " parser path: else exact keyword")
+            sawStatementKeywordElse = true
+    assert(sawStatementKeywordIf, " parser path: saw exact if keyword")
+    assert(sawStatementKeywordFor, " parser path: saw exact for keyword")
+    assert(sawStatementKeywordElse, " parser path: saw exact else keyword")
+
     var oldDefaultParsed: parser.ParsedSourceStub
     err = ""
     assert(!parser.ParseOrdinarySourceStub(packageRoot, oldDefaultPath, oldDefaultParsed, err),
