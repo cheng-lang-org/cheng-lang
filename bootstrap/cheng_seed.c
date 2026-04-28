@@ -845,7 +845,7 @@ static bool cheng_seed_validate_contract_v2(const ChengSeedBootstrapContract *co
         fprintf(stderr, "[cheng_seed] bootstrap compiler_class must be cold_bootstrap\n");
         return false;
     }
-    if (!cheng_seed_streq(cheng_seed_contract_get(contract, "target"), "arm64-apple-darwin")) {
+    if (((!cheng_seed_streq(cheng_seed_contract_get(contract, "target"), "arm64-apple-darwin") && !cheng_seed_streq(cheng_seed_contract_get(contract, "target"), "x86_64-unknown-linux-gnu")) && !cheng_seed_streq(cheng_seed_contract_get(contract, "target"), "x86_64-unknown-linux-gnu"))) {
         fprintf(stderr, "[cheng_seed] bootstrap target must be arm64-apple-darwin\n");
         return false;
     }
@@ -31395,7 +31395,7 @@ static bool cheng_seed_emit_sp_store_reg(char *out,
             cheng_seed_text_appendf(out, cap, "  movb %s, %d(%%rsp)\n", cheng_seed_x64_breg_name(src_reg), offset);
         } else if (strcmp(abi_class, "i16") == 0 ||
                    strcmp(abi_class, "u16") == 0) {
-            cheng_seed_text_appendf(out, cap, "  movw %s, %d(%%rsp)\n", cheng_seed_x64_dreg_name(src_reg), offset);
+            cheng_seed_text_appendf(out, cap, "  movw %s, %d(%%rsp)\n", cheng_seed_x64_hreg_name(src_reg), offset);
         } else if (strcmp(abi_class, "i32") == 0) {
             cheng_seed_text_appendf(out, cap, "  movl %s, %d(%%rsp)\n", cheng_seed_x64_dreg_name(src_reg), offset);
         } else {
