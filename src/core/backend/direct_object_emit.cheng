@@ -2,7 +2,6 @@ import std/result
 import std/rawbytes
 import std/strformat
 import std/strings
-import std/system as system
 import cheng/core/tooling/path as chengpath
 import cheng/core/backend/macho_object_writer as macho
 import cheng/core/backend/object_buffer as obuf
@@ -91,7 +90,7 @@ fn DirectObjectEmitWriteObjectTextOnly(rootDir: str,
 
 fn DirectObjectEmitRequireIndex(index: int32, label: str) =
     if index < 0:
-        system.Assert(false, label)
+        assert(false, label)
 
 fn DirectObjectEmitInstructionWordsMaterialized(plan: pobj.PrimaryObjectPlan): bool =
     if plan.instructionWords.len <= 0:
@@ -612,11 +611,6 @@ fn DirectObjectEmitStandaloneWrapperByteSize(plan: pobj.PrimaryObjectPlan,
                                              functionLimit: int32): int64 =
     if !DirectObjectEmitStandaloneNeedsMainWrapper(plan):
         return int64(0)
-    let entryIndex = DirectObjectEmitEntryFunctionIndex(plan, functionLimit)
-    if entryIndex >= 0 &&
-       entryIndex < plan.functionBodyIRs.len &&
-       pobj.PrimaryBodyIrIsEmissionSupported(plan.functionBodyIRs[entryIndex]):
-        return int64(4)
     let entryBodyKind = DirectObjectEmitStandaloneEntryBodyKind(plan, functionLimit)
     if entryBodyKind == texpr.BodyKindReturnZeroI32 ||
        DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) ||
@@ -669,7 +663,7 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
     var entryBodyIrReady = false
     if entryIndex < plan.functionBodyIRs.len:
         let entryBodyIR = plan.functionBodyIRs[entryIndex]
-        entryBodyIrReady = pobj.PrimaryBodyIrIsEmissionSupported(entryBodyIR)
+        entryBodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnSupported(entryBodyIR)
     if entryBodyKind != texpr.BodyKindReturnZeroI32 &&
        !DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindReturnCallNoargI32 &&
@@ -722,7 +716,7 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
         var bodyIrReady = false
         if i < plan.functionBodyIRs.len:
             let bodyIR = plan.functionBodyIRs[i]
-            bodyIrReady = pobj.PrimaryBodyIrIsEmissionSupported(bodyIR)
+            bodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnSupported(bodyIR)
         if bodyIrReady ||
            bodyKind == texpr.BodyKindStatementSequence ||
            texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
@@ -910,6 +904,13 @@ fn DirectObjectEmitValidateStandaloneExecutable(plan: pobj.PrimaryObjectPlan): R
     let entryTextOffset = DirectObjectEmitStandaloneEntryTextOffset(plan)
     if entryTextOffset < 0:
         return Err[bool](" direct object emit: executable missing entry offset")
+    let functionLimit = DirectObjectEmitRealFunctionLimit(plan)
+    if DirectObjectEmitPlanDataByteCount(plan, functionLimit) > 0:
+        return Err[bool](" direct object emit: executable data segment not implemented")
+    if plan.relocSourceItemIds.len > 0 ||
+       plan.relocWordOffsets.len > 0 ||
+       plan.relocTargetSymbols.len > 0:
+        return Err[bool](" direct object emit: executable relocations not implemented")
     return Ok[bool](true)
 
 fn DirectObjectEmitStandaloneExecutable(rootDir: str,
@@ -921,9 +922,8 @@ fn DirectObjectEmitStandaloneExecutable(rootDir: str,
     if Len(outputPath) <= 0:
         return Err[DirectObjectEmitResult](" direct object emit: executable missing output path")
     let text = DirectObjectEmitStandaloneText(plan)
-    let data = DirectObjectEmitPlanData(plan, DirectObjectEmitRealFunctionLimit(plan))
     let entryTextOffset = DirectObjectEmitStandaloneEntryTextOffset(plan)
-    let writeRes = macho.MachOTextDataExecutableWrite(rootDir, outputPath, text, data, entryTextOffset)
+    let writeRes = macho.MachOTextExecutableWrite(rootDir, outputPath, text, entryTextOffset)
     if IsErr(writeRes):
         return Err[DirectObjectEmitResult](Error(writeRes))
     let write = Value(writeRes)
@@ -978,7 +978,7 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
     var entryBodyIrReady = false
     if entryIndex < plan.functionBodyIRs.len:
         let entryBodyIR = plan.functionBodyIRs[entryIndex]
-        entryBodyIrReady = pobj.PrimaryBodyIrIsEmissionSupported(entryBodyIR)
+        entryBodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnSupported(entryBodyIR)
     if entryBodyKind != texpr.BodyKindReturnZeroI32 &&
        !DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindReturnCallNoargI32 &&
@@ -1176,7 +1176,7 @@ fn DirectObjectEmitAddPageRelocPair(relocs: var orel.ObjectRelocTable,
                                      label: str) =
     let targetIndex = osym.ObjectSymbolsFind(symbols, targetSymbol)
     if targetIndex < 0:
-        system.Assert(false, label)
+        assert(false, label)
         return
     DirectObjectEmitRequireIndex(orel.ObjectRelocsAdd(relocs,
                                                       0,
