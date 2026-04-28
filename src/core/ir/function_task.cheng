@@ -3,8 +3,80 @@
 # No threading, no raw ptr/cast, no C bridge in this module.
 
 import cheng/core/ir/core_types as coreir
+import std/strutils as strutil
 
 type
+    UirFnTask =
+        funcIndex: int32
+        declOrdinal: int32
+        sourceSpanStart: int32
+        sourceSpanEnd: int32
+        costHint: int32
+        genericEpoch: int32
+
+    UirFnTaskResult =
+        funcIndex: int32
+        declOrdinal: int32
+        loweredFuncId: int32
+        machineFuncId: int32
+        objectArtifactId: int32
+        diagIds: int32[]
+        profileCounters: int32[]
+
+    UirCoreSharedSnapshot =
+        functionNames: str[]
+        functionSymbolTexts: str[]
+        functionSourcePaths: str[]
+        functionOwnerModulePaths: str[]
+        functionEntryFlags: int32[]
+        globalSymbolNames: str[]
+        typeLayoutKinds: int32[]
+        objectLayoutKinds: int32[]
+        overloadKeys: str[]
+        importEdges: str[]
+        targetAbiKinds: int32[]
+
+    UirFnTaskPlan =
+        schedule: str
+        jobCount: int32
+        tasks: UirFnTask[]
+
+    UirFnTaskContractReport =
+        schedule: str
+        jobCount: int32
+        taskCount: int32
+        firstFuncIndex: int32
+        firstDeclOrdinal: int32
+        firstSourceSpanStart: int32
+        firstSourceSpanEnd: int32
+        firstCostHint: int32
+        firstGenericEpoch: int32
+
+    UirFnTaskResultContractReport =
+        funcIndex: int32
+        declOrdinal: int32
+        loweredFuncId: int32
+        machineFuncId: int32
+        objectArtifactId: int32
+        diagCount: int32
+        firstDiagId: int32
+        profileCounterCount: int32
+        firstProfileCounter: int32
+
+    UirFnTaskMergeReport =
+        schedule: str
+        jobCount: int32
+        taskCount: int32
+        inputResultCount: int32
+        mergedResultCount: int32
+        errorCount: int32
+        firstErrorCode: int32
+        firstErrorFuncIndex: int32
+        firstFuncIndex: int32
+        firstDeclOrdinal: int32
+        lastFuncIndex: int32
+        lastDeclOrdinal: int32
+
     FunctionTask =
         funcIndex: int32
         declOrdinal: int32
@@ -73,6 +145,241 @@ fn FunctionTaskResultKindBodyIr(): str =
 
 fn FunctionTaskResultKindI32Const(): str =
     return "i32_const"
+
+fn UirFnTaskNew(funcIndex: int32,
+                declOrdinal: int32,
+                sourceSpanStart: int32,
+                sourceSpanEnd: int32,
+                costHint: int32,
+                genericEpoch: int32): UirFnTask =
+    var out: UirFnTask
+    out.funcIndex = funcIndex
+    out.declOrdinal = declOrdinal
+    out.sourceSpanStart = sourceSpanStart
+    out.sourceSpanEnd = sourceSpanEnd
+    out.costHint = costHint
+    out.genericEpoch = genericEpoch
+    return out
+
+fn UirFnTaskResultEmpty(funcIndex: int32,
+                        declOrdinal: int32): UirFnTaskResult =
+    var out: UirFnTaskResult
+    out.funcIndex = funcIndex
+    out.declOrdinal = declOrdinal
+    out.loweredFuncId = InvalidFunctionIndex()
+    out.machineFuncId = InvalidFunctionIndex()
+    out.objectArtifactId = InvalidFunctionIndex()
+    return out
+
+fn UirFnTaskResultAppendDiagId(result: var UirFnTaskResult,
+                               diagId: int32) =
+    add(result.diagIds, diagId)
+
+fn UirFnTaskResultAppendProfileCounter(result: var UirFnTaskResult,
+                                        counter: int32) =
+    add(result.profileCounters, counter)
+
+fn UirFnTaskPlanNew(): UirFnTaskPlan =
+    var out: UirFnTaskPlan
+    out.schedule = FunctionTaskScheduleSerial
+    out.jobCount = 1
+    return out
+
+fn UirFnTaskPlanAppend(plan: var UirFnTaskPlan,
+                       task: UirFnTask) =
+    add(plan.tasks, task)
+
+fn UirFnTaskContractReportNew(): UirFnTaskContractReport =
+    var out: UirFnTaskContractReport
+    out.schedule = FunctionTaskScheduleSerial
+    out.jobCount = 1
+    out.firstFuncIndex = InvalidFunctionIndex()
+    out.firstDeclOrdinal = InvalidFunctionIndex()
+    return out
+
+fn UirFnTaskPlanContractReport(plan: UirFnTaskPlan): UirFnTaskContractReport =
+    var report = UirFnTaskContractReportNew()
+    report.schedule = plan.schedule
+    report.jobCount = plan.jobCount
+    report.taskCount = plan.tasks.len
+    if plan.tasks.len > 0:
+        let task = plan.tasks[0]
+        report.firstFuncIndex = task.funcIndex
+        report.firstDeclOrdinal = task.declOrdinal
+        report.firstSourceSpanStart = task.sourceSpanStart
+        report.firstSourceSpanEnd = task.sourceSpanEnd
+        report.firstCostHint = task.costHint
+        report.firstGenericEpoch = task.genericEpoch
+    return report
+
+fn UirFnTaskPlanReportText(report: UirFnTaskContractReport): str =
+    var lines: str[]
+    add(lines, Fmt"uir_fn_task_schedule={report.schedule}")
+    add(lines, Fmt"uir_fn_task_job_count={report.jobCount}")
+    add(lines, Fmt"uir_fn_task_count={report.taskCount}")
+    add(lines, Fmt"uir_fn_task_first_func_index={report.firstFuncIndex}")
+    add(lines, Fmt"uir_fn_task_first_decl_ordinal={report.firstDeclOrdinal}")
+    add(lines, Fmt"uir_fn_task_first_source_span_start={report.firstSourceSpanStart}")
+    add(lines, Fmt"uir_fn_task_first_source_span_end={report.firstSourceSpanEnd}")
+    add(lines, Fmt"uir_fn_task_first_cost_hint={report.firstCostHint}")
+    add(lines, Fmt"uir_fn_task_first_generic_epoch={report.firstGenericEpoch}")
+    return strutil.Join(lines, "\n")
+
+fn UirFnTaskResultContractReportNew(): UirFnTaskResultContractReport =
+    var out: UirFnTaskResultContractReport
+    out.funcIndex = InvalidFunctionIndex()
+    out.declOrdinal = InvalidFunctionIndex()
+    out.loweredFuncId = InvalidFunctionIndex()
+    out.machineFuncId = InvalidFunctionIndex()
+    out.objectArtifactId = InvalidFunctionIndex()
+    out.firstDiagId = InvalidFunctionIndex()
+    out.firstProfileCounter = InvalidFunctionIndex()
+    return out
+
+fn UirFnTaskResultContractReportFor(result: UirFnTaskResult): UirFnTaskResultContractReport =
+    var report = UirFnTaskResultContractReportNew()
+    report.funcIndex = result.funcIndex
+    report.declOrdinal = result.declOrdinal
+    report.loweredFuncId = result.loweredFuncId
+    report.machineFuncId = result.machineFuncId
+    report.objectArtifactId = result.objectArtifactId
+    report.diagCount = result.diagIds.len
+    if result.diagIds.len > 0:
+        report.firstDiagId = result.diagIds[0]
+    report.profileCounterCount = result.profileCounters.len
+    if result.profileCounters.len > 0:
+        report.firstProfileCounter = result.profileCounters[0]
+    return report
+
+fn UirFnTaskResultReportText(report: UirFnTaskResultContractReport): str =
+    var lines: str[]
+    add(lines, Fmt"uir_fn_task_result_func_index={report.funcIndex}")
+    add(lines, Fmt"uir_fn_task_result_decl_ordinal={report.declOrdinal}")
+    add(lines, Fmt"uir_fn_task_result_lowered_func_id={report.loweredFuncId}")
+    add(lines, Fmt"uir_fn_task_result_machine_func_id={report.machineFuncId}")
+    add(lines, Fmt"uir_fn_task_result_object_artifact_id={report.objectArtifactId}")
+    add(lines, Fmt"uir_fn_task_result_diag_count={report.diagCount}")
+    add(lines, Fmt"uir_fn_task_result_first_diag_id={report.firstDiagId}")
+    add(lines, Fmt"uir_fn_task_result_profile_counter_count={report.profileCounterCount}")
+    add(lines, Fmt"uir_fn_task_result_first_profile_counter={report.firstProfileCounter}")
+    return strutil.Join(lines, "\n")
+
+fn UirFnTaskIntSeqInit(count: int32,
+                       value: int32): int32[] =
+    var out: int32[]
+    if count <= 0:
+        return out
+    for i in 0..<count:
+        add(out, value)
+    return out
+
+fn UirFnTaskMergeReportNew(plan: UirFnTaskPlan,
+                            inputResultCount: int32): UirFnTaskMergeReport =
+    var out: UirFnTaskMergeReport
+    out.schedule = plan.schedule
+    out.jobCount = plan.jobCount
+    out.taskCount = plan.tasks.len
+    out.inputResultCount = inputResultCount
+    out.firstErrorCode = InvalidFunctionIndex()
+    out.firstErrorFuncIndex = InvalidFunctionIndex()
+    out.firstFuncIndex = InvalidFunctionIndex()
+    out.firstDeclOrdinal = InvalidFunctionIndex()
+    out.lastFuncIndex = InvalidFunctionIndex()
+    out.lastDeclOrdinal = InvalidFunctionIndex()
+    return out
+
+fn UirFnTaskMergeReportSetError(report: var UirFnTaskMergeReport,
+                                 code: int32,
+                                 funcIndex: int32) =
+    report.errorCount = report.errorCount + 1
+    if report.firstErrorCode == InvalidFunctionIndex():
+        report.firstErrorCode = code
+        report.firstErrorFuncIndex = funcIndex
+
+fn UirFnTaskPlanMaxFuncIndex(plan: UirFnTaskPlan): int32 =
+    var maxFuncIndex = InvalidFunctionIndex()
+    for i in 0..<plan.tasks.len:
+        let funcIndex = plan.tasks[i].funcIndex
+        if funcIndex > maxFuncIndex:
+            maxFuncIndex = funcIndex
+    return maxFuncIndex
+
+fn UirFnTaskMergeResultsByDeclaration(plan: UirFnTaskPlan,
+                                       results: UirFnTaskResult[],
+                                       merged: var UirFnTaskResult[],
+                                       report: var UirFnTaskMergeReport): bool =
+    merged = []
+    report = UirFnTaskMergeReportNew(plan, results.len)
+    let maxFuncIndex = UirFnTaskPlanMaxFuncIndex(plan)
+    if maxFuncIndex < 0:
+        if results.len > 0:
+            UirFnTaskMergeReportSetError(report, 1, results[0].funcIndex)
+        return report.errorCount == 0
+    var taskIndexByFuncIndex = UirFnTaskIntSeqInit(maxFuncIndex + 1, InvalidFunctionIndex())
+    var resultIndexByFuncIndex = UirFnTaskIntSeqInit(maxFuncIndex + 1, InvalidFunctionIndex())
+    var previousDeclOrdinal = InvalidFunctionIndex()
+    for taskIndex in 0..<plan.tasks.len:
+        let task = plan.tasks[taskIndex]
+        if task.funcIndex < 0 || task.funcIndex > maxFuncIndex:
+            UirFnTaskMergeReportSetError(report, 2, task.funcIndex)
+            continue
+        if taskIndexByFuncIndex[task.funcIndex] != InvalidFunctionIndex():
+            UirFnTaskMergeReportSetError(report, 3, task.funcIndex)
+            continue
+        if previousDeclOrdinal != InvalidFunctionIndex() &&
+           task.declOrdinal <= previousDeclOrdinal:
+            UirFnTaskMergeReportSetError(report, 4, task.funcIndex)
+            continue
+        taskIndexByFuncIndex[task.funcIndex] = taskIndex
+        previousDeclOrdinal = task.declOrdinal
+    for resultIndex in 0..<results.len:
+        let result = results[resultIndex]
+        if result.funcIndex < 0 || result.funcIndex > maxFuncIndex:
+            UirFnTaskMergeReportSetError(report, 5, result.funcIndex)
+            continue
+        if taskIndexByFuncIndex[result.funcIndex] == InvalidFunctionIndex():
+            UirFnTaskMergeReportSetError(report, 6, result.funcIndex)
+            continue
+        if resultIndexByFuncIndex[result.funcIndex] != InvalidFunctionIndex():
+            UirFnTaskMergeReportSetError(report, 7, result.funcIndex)
+            continue
+        resultIndexByFuncIndex[result.funcIndex] = resultIndex
+    if report.errorCount > 0:
+        return false
+    for taskIndex in 0..<plan.tasks.len:
+        let task = plan.tasks[taskIndex]
+        let resultIndex = resultIndexByFuncIndex[task.funcIndex]
+        if resultIndex == InvalidFunctionIndex():
+            UirFnTaskMergeReportSetError(report, 8, task.funcIndex)
+            continue
+        let result = results[resultIndex]
+        if result.declOrdinal != task.declOrdinal:
+            UirFnTaskMergeReportSetError(report, 9, task.funcIndex)
+            continue
+        add(merged, result)
+        if report.mergedResultCount == 0:
+            report.firstFuncIndex = result.funcIndex
+            report.firstDeclOrdinal = result.declOrdinal
+        report.mergedResultCount = report.mergedResultCount + 1
+        report.lastFuncIndex = result.funcIndex
+        report.lastDeclOrdinal = result.declOrdinal
+    return report.errorCount == 0
+
+fn UirFnTaskMergeReportText(report: UirFnTaskMergeReport): str =
+    var lines: str[]
+    add(lines, Fmt"uir_fn_task_merge_schedule={report.schedule}")
+    add(lines, Fmt"uir_fn_task_merge_job_count={report.jobCount}")
+    add(lines, Fmt"uir_fn_task_merge_task_count={report.taskCount}")
+    add(lines, Fmt"uir_fn_task_merge_input_result_count={report.inputResultCount}")
+    add(lines, Fmt"uir_fn_task_merge_result_count={report.mergedResultCount}")
+    add(lines, Fmt"uir_fn_task_merge_error_count={report.errorCount}")
+    add(lines, Fmt"uir_fn_task_merge_first_error_code={report.firstErrorCode}")
+    add(lines, Fmt"uir_fn_task_merge_first_error_func_index={report.firstErrorFuncIndex}")
+    add(lines, Fmt"uir_fn_task_merge_first_func_index={report.firstFuncIndex}")
+    add(lines, Fmt"uir_fn_task_merge_first_decl_ordinal={report.firstDeclOrdinal}")
+    add(lines, Fmt"uir_fn_task_merge_last_func_index={report.lastFuncIndex}")
+    add(lines, Fmt"uir_fn_task_merge_last_decl_ordinal={report.lastDeclOrdinal}")
+    return strutil.Join(lines, "\n")
 
 fn FunctionTaskPlanNew(): FunctionTaskPlan =
     var out: FunctionTaskPlan

@@ -1,0 +1,257 @@
+import std/result
+import std/strings
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/backend/primary_object_emit as pemit
+import cheng/core/ir/core_types as ir
+
+fn check(cond: bool, code: int32): int32 =
+    if cond:
+        return 0
+    return code
+
+fn i32Slot(id: int32, offset: int32, name: str): ir.LocalSlot =
+    var slot: ir.LocalSlot
+    slot.id = id
+    slot.name = name
+    slot.typeKind = ir.LocalI32Tag
+    slot.stackOffset = offset
+    slot.sizeBytes = 4
+    slot.alignBytes = 4
+    slot.noAlias = true
+    return slot
+
+fn resultSlot(id: int32, offset: int32): ir.LocalSlot =
+    var slot: ir.LocalSlot
+    slot.id = id
+    slot.name = "res"
+    slot.typeKind = ir.LocalAggregateTag
+    slot.stackOffset = offset
+    slot.sizeBytes = ir.ResultStrSizeBytes
+    slot.alignBytes = ir.ResultStrAlignBytes
+    slot.noAlias = true
+    return slot
+
+fn strSlot(id: int32, offset: int32, name: str): ir.LocalSlot =
+    var slot: ir.LocalSlot
+    slot.id = id
+    slot.name = name
+    slot.typeKind = ir.LocalStrTag
+    slot.stackOffset = offset
+    slot.sizeBytes = 24
+    slot.alignBytes = 8
+    slot.noAlias = true
+    return slot
+
+fn callOp(ordinal: int32, target: int32): ir.BodyOp =
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpCallTag
+    op.target = target
+    add(op.operands, ordinal)
+    return op
+
+fn resultProjectOp(kind: int32, source: int32, target: int32): ir.BodyOp =
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpResultProjectTag
+    op.target = target
+    add(op.operands, kind)
+    add(op.operands, source)
+    return op
+
+fn returnLocalOp(slot: int32): ir.BodyOp =
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpReturnTag
+    op.target = slot
+    add(op.operands, ir.LocalI32Tag)
+    return op
+
+fn returnConstOp(value: int32): ir.BodyOp =
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpReturnTag
+    op.target = -1
+    add(op.operands, pobj.PrimaryStatementReturnModeI32Const())
+    add(op.operands, value)
+    return op
+
+fn guardReturnConstOp(slot: int32, value: int32): ir.BodyOp =
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpBranchTag
+    op.target = slot
+    add(op.operands, ir.BodyBranchIfLocalLeZeroReturnI32ConstTag)
+    add(op.operands, slot)
+    add(op.operands, value)
+    return op
+
+fn returnConstTerm(value: int32): ir.BodyTerm =
+    var term: ir.BodyTerm
+    term.kind = ir.BodyTermReturnTag
+    term.resultSlot = -1
+    add(term.operands, pobj.PrimaryStatementReturnModeI32Const())
+    add(term.operands, value)
+    return term
+
+fn returnLocalTerm(slot: int32): ir.BodyTerm =
+    var term: ir.BodyTerm
+    term.kind = ir.BodyTermReturnTag
+    term.resultSlot = slot
+    add(term.operands, ir.LocalI32Tag)
+    return term
+
+fn callSequenceReturnLocalBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    add(body.localSlots, i32Slot(0, 16, "value"))
+    var call: ir.CallOp
+    call.targetSymbol = "Leaf"
+    call.resultSlot = 0
+    add(body.callSequence, call)
+    add(body.ops, callOp(0, 0))
+    add(body.ops, returnLocalOp(0))
+    return body
+
+fn callSequenceReturnConstBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    add(body.localSlots, i32Slot(0, 16, "ignored"))
+    var call: ir.CallOp
+    call.targetSymbol = "Touch"
+    call.resultSlot = 0
+    add(body.callSequence, call)
+    add(body.ops, callOp(0, 0))
+    add(body.ops, returnConstOp(17))
+    return body
+
+fn callSequenceGuardReturnBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    add(body.localSlots, i32Slot(0, 16, "count"))
+    add(body.localSlots, i32Slot(1, 32, "finish"))
+    var countCall: ir.CallOp
+    countCall.targetSymbol = "Count"
+    countCall.resultSlot = 0
+    add(body.callSequence, countCall)
+    var finishCall: ir.CallOp
+    finishCall.targetSymbol = "Finish"
+    finishCall.resultSlot = 1
+    add(body.callSequence, finishCall)
+    add(body.ops, callOp(0, 0))
+    add(body.ops, guardReturnConstOp(0, 5))
+    add(body.ops, callOp(1, 1))
+    add(body.ops, returnLocalOp(1))
+    return body
+
+fn resultRequestDispatchBody(): ir.BodyIR =
+    var body: ir.BodyIR
+    add(body.localSlots, i32Slot(0, 16, "dispatch"))
+    add(body.localSlots, i32Slot(1, 32, "unsupported"))
+    var dispatchCall: ir.CallOp
+    dispatchCall.targetSymbol = "Concrete"
+    dispatchCall.resultSlot = 0
+    add(body.callSequence, dispatchCall)
+    var unsupportedCall: ir.CallOp
+    unsupportedCall.targetSymbol = "Unsupported"
+    unsupportedCall.resultSlot = 1
+    add(body.callSequence, unsupportedCall)
+    add(body.ops, callOp(0, 0))
+    add(body.ops, callOp(1, 1))
+    var entryTerm: ir.BodyTerm
+    entryTerm.kind = ir.BodyTermCbrTag
+    entryTerm.conditionKind = ir.BodyCondLocalZeroTag
+    entryTerm.lhsSlot = 0 - 1 - 1
+    entryTerm.resultSlot = 0 - 1 - 1
+    entryTerm.trueBlock = 2
+    entryTerm.falseBlock = 1
+    add(entryTerm.operands, 0)
+    add(entryTerm.operands, 8)
+    add(entryTerm.operands, 208)
+    add(body.terms, entryTerm)
+    add(body.terms, returnLocalTerm(0))
+    add(body.terms, returnLocalTerm(1))
+    let _ = ir.BodyIRAppendBlock(body, 0, 0, 0)
+    let _ = ir.BodyIRAppendBlock(body, 0, 1, 1)
+    let _ = ir.BodyIRAppendBlock(body, 1, 1, 2)
+    return body
+
+fn main(): int32 =
+    var body: ir.BodyIR
+    add(body.localSlots, resultSlot(0, 16))
+    add(body.localSlots, i32Slot(1, 80, "isErr"))
+    add(body.localSlots, i32Slot(2, 96, "value"))
+    add(body.localSlots, strSlot(3, 112, "errText"))
+    add(body.localSlots, strSlot(4, 144, "valueText"))
+
+    var firstCall: ir.CallOp
+    firstCall.targetSymbol = "MakeResult"
+    firstCall.resultSlot = 0
+    add(body.callSequence, firstCall)
+    var secondCall: ir.CallOp
+    secondCall.targetSymbol = "Finish"
+    secondCall.resultSlot = 2
+    add(body.callSequence, secondCall)
+
+    add(body.ops, callOp(0, 0))
+    let isErrProject = resultProjectOp(ir.BodyResultProjectIsErrTag, 0, 1)
+    let errorProject = resultProjectOp(ir.BodyResultProjectErrorStrTag, 0, 3)
+    let valueProject = resultProjectOp(ir.BodyResultProjectValueStrTag, 0, 4)
+    add(body.ops, isErrProject)
+    add(body.ops, errorProject)
+    add(body.ops, valueProject)
+    add(body.ops, callOp(1, 2))
+
+    var entry: ir.BodyTerm
+    entry.kind = ir.BodyTermCbrTag
+    entry.conditionKind = ir.BodyCondLocalNonZeroTag
+    entry.lhsSlot = 1
+    entry.resultSlot = 1
+    entry.trueBlock = 1
+    entry.falseBlock = 2
+    add(body.terms, entry)
+    add(body.terms, returnConstTerm(9))
+    add(body.terms, returnLocalTerm(2))
+    let _ = ir.BodyIRAppendBlock(body, 0, 4, 0)
+    let _ = ir.BodyIRAppendBlock(body, 4, 0, 1)
+    let _ = ir.BodyIRAppendBlock(body, 4, 1, 2)
+
+    let c1 = check(pobj.PrimaryBodyIrProjectOpSupported(body, isErrProject), 11)
+    if c1 != 0: return c1
+    let c1b = check(pobj.PrimaryBodyIrProjectOpSupported(body, errorProject), 19)
+    if c1b != 0: return c1b
+    let c1c = check(pobj.PrimaryBodyIrProjectOpSupported(body, valueProject), 20)
+    if c1c != 0: return c1c
+    let c2 = check(pobj.PrimaryBodyIrIsCallCfgReturnInt32(body), 12)
+    if c2 != 0: return c2
+    let c3 = check(pobj.PrimaryBodyIrWordCount(body) > 0, 13)
+    if c3 != 0: return c3
+    let c4 = check(pobj.PrimaryBodyCondArm64TrueCode(ir.BodyCondI32LeTag) == 13, 14)
+    if c4 != 0: return c4
+
+    var leTerm = entry
+    leTerm.conditionKind = ir.BodyCondI32LeTag
+    let termAsmRes = pemit.PrimaryObjectEmitCfgTermAsm(body, leTerm, 112, 3)
+    let c5 = check(IsOk(termAsmRes), 15)
+    if c5 != 0: return c5
+    let termAsm = Value(termAsmRes)
+    let c6 = check(strings.StrContains(termAsm, "b.le"), 16)
+    if c6 != 0: return c6
+    let projectAsmRes = pemit.PrimaryObjectEmitCfgResultProjectAsm(body, isErrProject, 3, 1)
+    let c7 = check(IsOk(projectAsmRes), 17)
+    if c7 != 0: return c7
+    let projectAsm = Value(projectAsmRes)
+    let c8 = check(strings.StrContains(projectAsm, "str w9"), 18)
+    if c8 != 0: return c8
+
+    let localBody = callSequenceReturnLocalBody()
+    let c9 = check(pobj.PrimaryBodyIrIsCallSequenceReturnInt32(localBody), 21)
+    if c9 != 0: return c9
+    let c10 = check(pobj.PrimaryBodyIrIsCallSequenceReturnSupported(localBody), 22)
+    if c10 != 0: return c10
+    let constBody = callSequenceReturnConstBody()
+    let c11 = check(pobj.PrimaryBodyIrIsCallSequenceReturnI32Const(constBody), 23)
+    if c11 != 0: return c11
+    let c12 = check(pobj.PrimaryBodyIrIsCallSequenceReturnSupported(constBody), 24)
+    if c12 != 0: return c12
+    let guardBody = callSequenceGuardReturnBody()
+    let c13 = check(pobj.PrimaryBodyIrIsCallSequenceGuardReturnInt32(guardBody), 25)
+    if c13 != 0: return c13
+    let c14 = check(pobj.PrimaryBodyIrIsCallSequenceReturnSupported(guardBody), 26)
+    if c14 != 0: return c14
+    let resultDispatchBody = resultRequestDispatchBody()
+    let c15 = check(pobj.PrimaryBodyIrIsResultRequestDispatch(resultDispatchBody), 27)
+    if c15 != 0: return c15
+    return 0

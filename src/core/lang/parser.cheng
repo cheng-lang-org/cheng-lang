@@ -4739,12 +4739,17 @@ fn ParserProfileCallLookupFlagsCached(cache: ParserProfileCallLookupCacheEntry[]
                                         hasLocal: var bool): bool =
     hasImportc = false
     hasLocal = false
-    if name == "" || nameKey.keyLen <= 0:
+    if name == "":
         return false
-    if profileIndex < 0 || profileIndex >= cache.len:
+    if nameKey.keyLen <= 0:
         return false
-    hasImportc = ParserTextLookupContainsKey(cache[profileIndex].importcLookup, name, nameKey)
-    hasLocal = ParserTextLookupContainsKey(cache[profileIndex].localLookup, name, nameKey)
+    if profileIndex < 0:
+        return false
+    if profileIndex >= cache.len:
+        return false
+    let entry = cache[profileIndex]
+    hasImportc = ParserTextLookupContainsKey(entry.importcLookup, name, nameKey)
+    hasLocal = ParserTextLookupContainsKey(entry.localLookup, name, nameKey)
     return true
 
 fn ParserProfileCallLookupFlags(profiles: NormalizedExprCallProfile[],
@@ -4756,13 +4761,16 @@ fn ParserProfileCallLookupFlags(profiles: NormalizedExprCallProfile[],
                                   hasLocal: var bool): bool =
     hasImportc = false
     hasLocal = false
-    if name == "" || nameKey.keyLen <= 0:
+    if name == "":
+        return false
+    if nameKey.keyLen <= 0:
         return false
     let cacheIndex = ParserProfileCallLookupCacheEnsureIndex(profiles, profileIndex, cache)
     if cacheIndex < 0:
         return false
-    hasImportc = ParserTextLookupContainsKey(cache[cacheIndex].importcLookup, name, nameKey)
-    hasLocal = ParserTextLookupContainsKey(cache[cacheIndex].localLookup, name, nameKey)
+    let entry = cache[cacheIndex]
+    hasImportc = ParserTextLookupContainsKey(entry.importcLookup, name, nameKey)
+    hasLocal = ParserTextLookupContainsKey(entry.localLookup, name, nameKey)
     return true
 
 fn ParserImportedTargetProfileIndex(currentProfile: NormalizedExprCallProfile,
@@ -5120,10 +5128,13 @@ fn ParserCachedVisibleUnqualifiedExternalCallNames(profiles: NormalizedExprCallP
     for i in 0..<cache.len:
         if i % 128 == 0:
             os.ProcessResourceGuardCheck()
-        if cache[i].profileIndex == profileIndex:
-            return cache[i].items
+        let entry = cache[i]
+        if entry.profileIndex == profileIndex:
+            return entry.items
     var out: str[]
-    if profileIndex < 0 || profileIndex >= profiles.len:
+    if profileIndex < 0:
+        return out
+    if profileIndex >= profiles.len:
         return out
     let rootProfile = profiles[profileIndex]
     os.ProcessResourceGuardCheck()
@@ -5155,10 +5166,15 @@ fn ParserCachedQualifiedExternalCallNames(profiles: NormalizedExprCallProfile[],
     for i in 0..<cache.len:
         if i % 128 == 0:
             os.ProcessResourceGuardCheck()
-        if cache[i].profileIndex == profileIndex && cache[i].prefix == prefix:
-            return cache[i].items
+        let entry = cache[i]
+        if entry.profileIndex != profileIndex:
+            continue
+        if entry.prefix == prefix:
+            return entry.items
     var out: str[]
-    if profileIndex < 0 || profileIndex >= profiles.len:
+    if profileIndex < 0:
+        return out
+    if profileIndex >= profiles.len:
         return out
     if prefix == "":
         return out
@@ -5193,18 +5209,23 @@ fn ParserCollectExternalCallNamesRecursive(profiles: NormalizedExprCallProfile[]
                                              seen: var ParserTextLookup,
                                              out: var str[]) =
     os.ProcessResourceGuardCheck()
-    if profileIndex < 0 || profileIndex >= profiles.len:
+    if profileIndex < 0:
+        return
+    if profileIndex >= profiles.len:
         return
     let current = profiles[profileIndex]
     for edgeIndex in 0..<current.importEdges.len:
         if edgeIndex % 64 == 0:
             os.ProcessResourceGuardCheck()
-        if !current.importEdges[edgeIndex].resolved:
+        let edge = current.importEdges[edgeIndex]
+        if !edge.resolved:
             continue
-        let targetProfileIndex = current.importEdges[edgeIndex].targetProfileIndex
+        let targetProfileIndex = edge.targetProfileIndex
         if targetProfileIndex < 0:
             continue
-        let qualifier = current.importEdges[edgeIndex].qualifier
+        if targetProfileIndex >= profiles.len:
+            continue
+        let qualifier = edge.qualifier
         if qualifier == "":
             continue
         let nextPrefix = ParserQualifiedCallPrefixExact(prefix, qualifier)
@@ -5240,22 +5261,38 @@ fn ParserCollectExternalCallNames(profiles: NormalizedExprCallProfile[],
                                     profileIndexLookup: ParserSourcePathIndexLookup,
                                     profileIndex: int32,
                                     names: var str[]) =
+    var visibleNameCache: ParserTextSeqCacheEntry[]
+    var qualifiedNameCache: ParserQualifiedTextSeqCacheEntry[]
+    ParserCollectExternalCallNamesCached(profiles,
+                                           profileIndexLookup,
+                                           profileIndex,
+                                           visibleNameCache,
+                                           qualifiedNameCache,
+                                           names)
+
+fn ParserCollectExternalCallNamesCached(profiles: NormalizedExprCallProfile[],
+                                          profileIndexLookup: ParserSourcePathIndexLookup,
+                                          profileIndex: int32,
+                                          visibleNameCache: var ParserTextSeqCacheEntry[],
+                                          qualifiedNameCache: var ParserQualifiedTextSeqCacheEntry[],
+                                          names: var str[]) =
     var out: str[]
-    if profileIndex < 0 || profileIndex >= profiles.len:
+    if profileIndex < 0:
+        names = out
+        return
+    if profileIndex >= profiles.len:
         names = out
         return
     var seen: ParserTextLookup
     seen.slots = []
     seen.buckets = []
     seen.totalCount = 0
-    var visibleNameCache: ParserTextSeqCacheEntry[]
     os.ProcessResourceGuardCheck()
     let visibleNames = ParserCachedVisibleUnqualifiedExternalCallNames(profiles,
                                                                          profileIndexLookup,
                                                                          profileIndex,
                                                                          visibleNameCache)
     ParserAppendDirectExternalCallNames(out, seen, visibleNames)
-    var qualifiedNameCache: ParserQualifiedTextSeqCacheEntry[]
     var activeProfileFlags: bool[] = ParserBoolSeqInit(profiles.len, false)
     activeProfileFlags[profileIndex] = true
     os.ProcessResourceGuardCheck()
@@ -6065,7 +6102,9 @@ fn ParserBuildProfileCallLookupCache(profiles: NormalizedExprCallProfile[]): Par
 fn ParserProfileCallLookupCacheEnsureIndex(profiles: NormalizedExprCallProfile[],
                                              profileIndex: int32,
                                              cache: var ParserProfileCallLookupCacheEntry[]): int32 =
-    if profileIndex < 0 || profileIndex >= profiles.len:
+    if profileIndex < 0:
+        return -1
+    if profileIndex >= profiles.len:
         return -1
     while cache.len <= profileIndex:
         if cache.len % 256 == 0:
@@ -6078,8 +6117,12 @@ fn ParserProfileCallLookupCacheEnsureIndex(profiles: NormalizedExprCallProfile[]
         empty.importcLookup.buckets = []
         empty.importcLookup.totalCount = 0
         add(cache, empty)
-    if cache[profileIndex].localLookup.slots.len <= 0 &&
-       cache[profileIndex].importcLookup.slots.len <= 0:
+    let entry = cache[profileIndex]
+    var shouldBuild = false
+    if entry.localLookup.slots.len <= 0:
+        if entry.importcLookup.slots.len <= 0:
+            shouldBuild = true
+    if shouldBuild:
         os.ProcessResourceGuardCheck()
         cache[profileIndex] = ParserBuildProfileCallLookups(profiles[profileIndex])
     return profileIndex
@@ -7258,6 +7301,8 @@ fn ParserReadNormalizedExprLayerForSourceClosureWithExternalPackageRoots(workspa
         add(sourceProfiles, profile)
     let profileIndexLookup = ParserSourcePathIndexLookupBuild(sourceProfiles)
     ParserBindImportEdgeTargetProfileIndices(sourceProfiles, profileIndexLookup)
+    var externalVisibleNameCache: ParserTextSeqCacheEntry[]
+    var externalQualifiedNameCache: ParserQualifiedTextSeqCacheEntry[]
     for i in 0..<sourceProfiles.len:
         os.ProcessResourceGuardCheck()
         if os.GetEnv("CHENG_TRACE_PARSE_SOURCE") == "1":
@@ -7265,10 +7310,12 @@ fn ParserReadNormalizedExprLayerForSourceClosureWithExternalPackageRoots(workspa
             echo(strutil.Join(["parse_source ", tracePath], ""))
         var sourceExprLayer = NormalizedExprLayer()
         var sourceExternalCallNames: str[]
-        ParserCollectExternalCallNames(sourceProfiles,
-                                         profileIndexLookup,
-                                         i,
-                                         sourceExternalCallNames)
+        ParserCollectExternalCallNamesCached(sourceProfiles,
+                                               profileIndexLookup,
+                                               i,
+                                               externalVisibleNameCache,
+                                               externalQualifiedNameCache,
+                                               sourceExternalCallNames)
         if !ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourceProfiles[i].sourcePath,
                                                                              sourceProfiles[i].text,
                                                                              sourceProfiles[i].importcCallNames,

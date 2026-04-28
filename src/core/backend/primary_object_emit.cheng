@@ -181,11 +181,7 @@ fn PrimaryObjectEmitExpectedWordsForPlanFunction(plan: pobj.PrimaryObjectPlan,
     if functionIndex < 0 || functionIndex >= plan.functionBodyKinds.len:
         return 0
     if functionIndex < plan.functionBodyIRs.len &&
-       (pobj.PrimaryBodyIrIsCallSequenceReturnInt32(plan.functionBodyIRs[functionIndex]) ||
-        pobj.PrimaryBodyIrIsCallSequenceReturnI32Const(plan.functionBodyIRs[functionIndex]) ||
-        pobj.PrimaryBodyIrIsCallSequenceReturnStr(plan.functionBodyIRs[functionIndex]) ||
-        pobj.PrimaryBodyIrIsCallSequenceReturnAggregate(plan.functionBodyIRs[functionIndex]) ||
-        plan.functionBodyIRs[functionIndex].ops.len == 4):
+       pobj.PrimaryBodyIrIsEmissionSupported(plan.functionBodyIRs[functionIndex]):
         if functionIndex >= plan.functionWordCounts.len:
             return 0
         return plan.functionWordCounts[functionIndex]
@@ -827,6 +823,64 @@ fn PrimaryObjectEmitCfgCallAsm(plan: pobj.PrimaryObjectPlan,
             add(chunks, Fmt"  str x0, [sp, #{IntToStr(resultSlot.stackOffset)}]\n")
     return Ok[str](strutil.Join(chunks, ""))
 
+fn PrimaryObjectEmitCfgResultProjectAsm(bodyIR: coreir.BodyIR,
+                                         op: coreir.BodyOp,
+                                         ordinal: int32,
+                                         opIndex: int32): Result[str] =
+    if !pobj.PrimaryBodyIrProjectOpSupported(bodyIR, op):
+        return Err[str](" primary object emit: cfg result project unsupported")
+    let projectKind = op.operands[0]
+    let sourceSlot = bodyIR.localSlots[op.operands[1]]
+    let targetSlot = bodyIR.localSlots[op.target]
+    var chunks: str[]
+    if projectKind == coreir.BodyResultProjectIsErrTag:
+        let doneLabel = Fmt"L_cheng_body_ir_result_project_is_err_{IntToStr(ordinal)}_{IntToStr(opIndex)}"
+        add(chunks, Fmt"  ldr w9, [sp, #{IntToStr(sourceSlot.stackOffset + coreir.ResultStrOkOffset)}]\n")
+        add(chunks, "  cmp w9, #0\n")
+        add(chunks, "  mov w9, #0\n")
+        add(chunks, Fmt"  b.ne {doneLabel}\n")
+        add(chunks, "  mov w9, #1\n")
+        add(chunks, Fmt"{doneLabel}:\n")
+        add(chunks, Fmt"  str w9, [sp, #{IntToStr(targetSlot.stackOffset)}]\n")
+        return Ok[str](strutil.Join(chunks, ""))
+    var sourceFieldOffset = coreir.ResultStrValueOffset
+    if projectKind == coreir.BodyResultProjectErrorStrTag:
+        sourceFieldOffset = coreir.ResultStrErrMsgOffset
+    elif projectKind != coreir.BodyResultProjectValueStrTag:
+        return Err[str](" primary object emit: cfg result project kind unsupported")
+    for copyIndex in 0..<3:
+        let sourceOffset = sourceSlot.stackOffset + sourceFieldOffset + copyIndex * 8
+        let targetOffset = targetSlot.stackOffset + copyIndex * 8
+        add(chunks, Fmt"  ldr x9, [sp, #{IntToStr(sourceOffset)}]\n")
+        add(chunks, Fmt"  str x9, [sp, #{IntToStr(targetOffset)}]\n")
+    return Ok[str](strutil.Join(chunks, ""))
+
+fn PrimaryObjectEmitCfgLocalWriteAsm(bodyIR: coreir.BodyIR,
+                                      op: coreir.BodyOp): Result[str] =
+    var chunks: str[]
+    if pobj.PrimaryBodyIrLoadConstOpSupported(bodyIR, op):
+        let targetSlot = bodyIR.localSlots[op.target]
+        add(chunks, Fmt"  mov w9, #{IntToStr(op.operands[1])}\n")
+        add(chunks, Fmt"  str w9, [sp, #{IntToStr(targetSlot.stackOffset)}]\n")
+        return Ok[str](strutil.Join(chunks, ""))
+    if !pobj.PrimaryBodyIrLocalCopyOpSupported(bodyIR, op):
+        return Err[str](" primary object emit: cfg local write unsupported")
+    let sourceSlot = bodyIR.localSlots[op.operands[0]]
+    let targetSlot = bodyIR.localSlots[op.target]
+    if sourceSlot.typeKind == coreir.LocalI32Tag:
+        add(chunks, Fmt"  ldr w9, [sp, #{IntToStr(sourceSlot.stackOffset)}]\n")
+        add(chunks, Fmt"  str w9, [sp, #{IntToStr(targetSlot.stackOffset)}]\n")
+        return Ok[str](strutil.Join(chunks, ""))
+    let copyChunks = pobj.PrimaryLocalSlotSizeOf(sourceSlot) / 8
+    if copyChunks <= 0:
+        return Err[str](" primary object emit: cfg local copy size unsupported")
+    for copyIndex in 0..<copyChunks:
+        let sourceOffset = sourceSlot.stackOffset + copyIndex * 8
+        let targetOffset = targetSlot.stackOffset + copyIndex * 8
+        add(chunks, Fmt"  ldr x9, [sp, #{IntToStr(sourceOffset)}]\n")
+        add(chunks, Fmt"  str x9, [sp, #{IntToStr(targetOffset)}]\n")
+    return Ok[str](strutil.Join(chunks, ""))
+
 fn PrimaryObjectEmitCfgEpilogueAsm(frameBytes: int32): str =
     var out = ""
     out = strutil.Join([out, "  ldp x29, x30, [sp]\n"], "")
@@ -875,15 +929,25 @@ fn PrimaryObjectEmitCfgTermAsm(bodyIR: coreir.BodyIR,
     let trueLabel = PrimaryObjectEmitCfgBlockLabel(ordinal, term.trueBlock)
     let falseLabel = PrimaryObjectEmitCfgBlockLabel(ordinal, term.falseBlock)
     var out = Fmt"  ldr w9, [sp, #{IntToStr(slot.stackOffset)}]\n"
-    if term.conditionKind == coreir.BodyCondLocalZeroTag:
-        out = strutil.Join([out, Fmt"  cbz w9, {trueLabel}\n"], "")
-    elif term.conditionKind == coreir.BodyCondLocalNonZeroTag:
-        out = strutil.Join([out, Fmt"  cbnz w9, {trueLabel}\n"], "")
-    elif term.conditionKind == coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag:
-        out = strutil.Join([out, "  cmp w9, #0\n"], "")
-        out = strutil.Join([out, Fmt"  b.le {trueLabel}\n"], "")
+    out = strutil.Join([out, "  cmp w9, #0\n"], "")
+    var suffix = ""
+    if term.conditionKind == coreir.BodyCondLocalZeroTag ||
+       term.conditionKind == coreir.BodyCondI32EqTag:
+        suffix = "eq"
+    elif term.conditionKind == coreir.BodyCondLocalNonZeroTag ||
+         term.conditionKind == coreir.BodyCondI32NeTag:
+        suffix = "ne"
+    elif term.conditionKind == coreir.BodyCondI32LtTag:
+        suffix = "lt"
+    elif term.conditionKind == coreir.BodyCondI32LeTag:
+        suffix = "le"
+    elif term.conditionKind == coreir.BodyCondI32GtTag:
+        suffix = "gt"
+    elif term.conditionKind == coreir.BodyCondI32GeTag:
+        suffix = "ge"
     else:
         return Err[str](" primary object emit: cfg condition unsupported")
+    out = strutil.Join([out, Fmt"  b.{suffix} {trueLabel}\n"], "")
     out = strutil.Join([out, Fmt"  b {falseLabel}\n"], "")
     return Ok[str](out)
 
@@ -931,18 +995,35 @@ fn PrimaryObjectEmitCallCfgReturnInt32FunctionAsm(plan: pobj.PrimaryObjectPlan,
         add(chunks, Fmt"{PrimaryObjectEmitCfgBlockLabel(ordinal, blockIndex)}:\n")
         for opIndex in block.opStart..<(block.opStart + block.opCount):
             let op = bodyIR.ops[opIndex]
-            if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
+            if op.kind == coreir.BodyOpCallTag && op.operands.len >= 1:
+                let callAsmRes = PrimaryObjectEmitCfgCallAsm(plan,
+                                                             bodyIR,
+                                                             functionIndex,
+                                                             op.operands[0],
+                                                             frameBytes,
+                                                             paramSaveOffset,
+                                                             paramSaveCount)
+                if IsErr(callAsmRes):
+                    return Err[str](Error(callAsmRes))
+                add(chunks, Value(callAsmRes))
+            elif op.kind == coreir.BodyOpResultProjectTag:
+                let projectAsmRes = PrimaryObjectEmitCfgResultProjectAsm(bodyIR,
+                                                                         op,
+                                                                         ordinal,
+                                                                         opIndex)
+                if IsErr(projectAsmRes):
+                    return Err[str](Error(projectAsmRes))
+                add(chunks, Value(projectAsmRes))
+            elif op.kind == coreir.BodyOpLoadConstTag ||
+                 op.kind == coreir.BodyOpLoadLocalTag ||
+                 op.kind == coreir.BodyOpStoreLocalTag ||
+                 op.kind == coreir.BodyOpCopyLocalTag:
+                let localWriteAsmRes = PrimaryObjectEmitCfgLocalWriteAsm(bodyIR, op)
+                if IsErr(localWriteAsmRes):
+                    return Err[str](Error(localWriteAsmRes))
+                add(chunks, Value(localWriteAsmRes))
+            else:
                 return Err[str](" primary object emit: cfg op unsupported")
-            let callAsmRes = PrimaryObjectEmitCfgCallAsm(plan,
-                                                         bodyIR,
-                                                         functionIndex,
-                                                         op.operands[0],
-                                                         frameBytes,
-                                                         paramSaveOffset,
-                                                         paramSaveCount)
-            if IsErr(callAsmRes):
-                return Err[str](Error(callAsmRes))
-            add(chunks, Value(callAsmRes))
         if block.termIndex < 0 || block.termIndex >= bodyIR.terms.len:
             return Err[str](" primary object emit: cfg term missing")
         let termAsmRes = PrimaryObjectEmitCfgTermAsm(bodyIR,

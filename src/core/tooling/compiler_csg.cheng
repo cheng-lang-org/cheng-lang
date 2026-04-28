@@ -190,6 +190,7 @@ type
         sourceBundleCid: layout.FixedBytes32
         exprLayer: parser.NormalizedExprLayer
         typedExprFacts: TypedExprFact[]
+        typedIr: texpr.TypedExprIr
         nodeCount: int32
         edgeCount: int32
         nodes: CompilerCsgNode[]
@@ -318,6 +319,7 @@ fn CompilerCsgClone(csg: CompilerCsg): CompilerCsg =
     out.sourceBundleCid = csg.sourceBundleCid
     out.exprLayer = parser.NormalizedExprLayerClone(csg.exprLayer)
     out.typedExprFacts = texpr.TypedExprFactsClone(csg.typedExprFacts)
+    out.typedIr = texpr.TypedExprIrClone(csg.typedIr)
     out.nodeCount = csg.nodeCount
     out.edgeCount = csg.edgeCount
     out.nodes = CompilerCsgCloneNodes(csg.nodes)
@@ -1007,12 +1009,24 @@ fn CompilerCsgShouldExportSymbol(emitKind: creq.CompilerEmit,
 fn CompilerCsgSourceTextLookup(overrides: CompilerCsgSourceText[],
                                  sourcePath: str,
                                  out: var str): bool =
+    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
     for i in 0..<overrides.len:
-        if overrides[i].sourcePath != sourcePath:
+        let overrideSourcePath = parser.ParserNormalizePath(overrides[i].sourcePath)
+        if overrideSourcePath != normalizedSourcePath:
             continue
         out = overrides[i].text
         return true
     return false
+
+fn CompilerCsgRestoreSourceTextOverrides(overrides: CompilerCsgSourceText[],
+                                           sourceTexts: var TypedExprSourceText[]) =
+    for i in 0..<sourceTexts.len:
+        var sourceText = sourceTexts[i]
+        var overrideText = ""
+        if !CompilerCsgSourceTextLookup(overrides, sourceText.sourcePath, overrideText):
+            continue
+        sourceText.text = overrideText
+        sourceTexts[i] = sourceText
 
 fn CompilerCsgSourceModulePath(workspaceRoot: str,
                                  packageRoot: str,
@@ -1826,6 +1840,8 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
         add(exprCallProfiles, profile)
     let profileIndexLookup = parser.ParserSourcePathIndexLookupBuild(exprCallProfiles)
     parser.ParserBindImportEdgeTargetProfileIndices(exprCallProfiles, profileIndexLookup)
+    var externalVisibleNameCache: parser.ParserTextSeqCacheEntry[]
+    var externalQualifiedNameCache: parser.ParserQualifiedTextSeqCacheEntry[]
     for sourceIndex in 0..<exprCallProfiles.len:
         if sourceIndex % 16 == 0:
             os.ProcessResourceGuardCheck()
@@ -1838,10 +1854,12 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
         if ownerModuleNodeId <= 0:
             continue
         var sourceExternalCalls: str[]
-        parser.ParserCollectExternalCallNames(exprCallProfiles,
-                                                profileIndexLookup,
-                                                sourceIndex,
-                                                sourceExternalCalls)
+        parser.ParserCollectExternalCallNamesCached(exprCallProfiles,
+                                                      profileIndexLookup,
+                                                      sourceIndex,
+                                                      externalVisibleNameCache,
+                                                      externalQualifiedNameCache,
+                                                      sourceExternalCalls)
         var sourceExprLayer = parser.NormalizedExprLayer()
         let sourceExprRes = CompilerCsgExprLayerForText(sourcePath,
                                                           profile.text,
@@ -1949,6 +1967,15 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
             return false
         err = " compiler csg: typed expr build failed"
         return false
+    CompilerCsgRestoreSourceTextOverrides(sourceTextOverrides, typedSourceTexts)
+    var typedIr: texpr.TypedExprIr
+    var typedIrErr = ""
+    if !texpr.TypedExprBuildIrWithFacts(typedSourceTexts, typedExprFacts, typedIr, typedIrErr):
+        if typedIrErr != "":
+            err = typedIrErr
+            return false
+        err = " compiler csg: typed ir build failed"
+        return false
     typedSourceTexts = []
     os.ProcessResourceGuardCheck()
     let canonicalGraphCid = CompilerCsgCanonicalGraphCid(linkPlan.packageId,
@@ -1977,6 +2004,7 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
     out.sourceBundleCid = sourceBundleCid
     out.exprLayer = exprLayer
     out.typedExprFacts = typedExprFacts
+    out.typedIr = typedIr
     out.nodes = nodes
     out.edges = edges
     out.nodeCount = nodes.len

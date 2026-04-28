@@ -371,6 +371,76 @@ fn PrimaryBodyIrProjectOpWordCount(bodyIR: coreir.BodyIR,
         return 0
     return 6
 
+fn PrimaryBodyIrHasSemanticSurface(bodyIR: coreir.BodyIR): bool =
+    return bodyIR.ops.len > 0 ||
+           bodyIR.blocks.len > 0 ||
+           bodyIR.terms.len > 0 ||
+           bodyIR.localSlots.len > 0 ||
+           bodyIR.callSequence.len > 0
+
+fn PrimaryBodyIrLoadConstOpSupported(bodyIR: coreir.BodyIR,
+                                      op: coreir.BodyOp): bool =
+    if op.kind != coreir.BodyOpLoadConstTag:
+        return false
+    if op.operands.len < 2:
+        return false
+    if op.target < 0 || op.target >= bodyIR.localSlots.len:
+        return false
+    let targetSlot = bodyIR.localSlots[op.target]
+    if targetSlot.typeKind != coreir.LocalI32Tag:
+        return false
+    if op.operands[0] != coreir.LocalI32Tag:
+        return false
+    return op.operands[1] >= 0 && op.operands[1] <= 65535
+
+fn PrimaryBodyIrLocalCopyOpSupported(bodyIR: coreir.BodyIR,
+                                      op: coreir.BodyOp): bool =
+    if op.kind != coreir.BodyOpStoreLocalTag &&
+       op.kind != coreir.BodyOpCopyLocalTag &&
+       op.kind != coreir.BodyOpLoadLocalTag:
+        return false
+    if op.kind == coreir.BodyOpLoadLocalTag &&
+       op.operands.len >= 3 &&
+       op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag:
+        return false
+    if op.operands.len < 1:
+        return false
+    let sourceSlotIndex = op.operands[0]
+    if sourceSlotIndex < 0 || sourceSlotIndex >= bodyIR.localSlots.len:
+        return false
+    if op.target < 0 || op.target >= bodyIR.localSlots.len:
+        return false
+    let sourceSlot = bodyIR.localSlots[sourceSlotIndex]
+    let targetSlot = bodyIR.localSlots[op.target]
+    if sourceSlot.typeKind != targetSlot.typeKind:
+        return false
+    let sourceSize = PrimaryLocalSlotSizeOf(sourceSlot)
+    let targetSize = PrimaryLocalSlotSizeOf(targetSlot)
+    if sourceSize <= 0 || targetSize <= 0 || sourceSize != targetSize:
+        return false
+    if sourceSlot.typeKind == coreir.LocalI32Tag ||
+       sourceSlot.typeKind == coreir.LocalF64Tag ||
+       sourceSlot.typeKind == coreir.LocalPtrTag ||
+       sourceSlot.typeKind == coreir.LocalStrTag ||
+       sourceSlot.typeKind == coreir.LocalAggregateTag:
+        return sourceSize % 8 == 0 ||
+               sourceSlot.typeKind == coreir.LocalI32Tag
+    return false
+
+fn PrimaryBodyIrLocalWriteOpWordCount(bodyIR: coreir.BodyIR,
+                                       op: coreir.BodyOp): int32 =
+    if PrimaryBodyIrLoadConstOpSupported(bodyIR, op):
+        return 2
+    if !PrimaryBodyIrLocalCopyOpSupported(bodyIR, op):
+        return 0
+    let slot = bodyIR.localSlots[op.target]
+    if slot.typeKind == coreir.LocalI32Tag:
+        return 2
+    let copySize = PrimaryLocalSlotSizeOf(slot)
+    if copySize <= 0 || copySize % 8 != 0:
+        return 0
+    return (copySize / 8) * 2
+
 fn PrimaryBodyIrOpWordCount(bodyIR: coreir.BodyIR,
                              op: coreir.BodyOp): int32 =
     if op.kind == coreir.BodyOpCallTag:
@@ -380,6 +450,11 @@ fn PrimaryBodyIrOpWordCount(bodyIR: coreir.BodyIR,
         if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
             return 0
         return PrimaryBodyIrCallOpWordCount(bodyIR, bodyIR.callSequence[callOrdinal])
+    if op.kind == coreir.BodyOpLoadConstTag ||
+       op.kind == coreir.BodyOpLoadLocalTag ||
+       op.kind == coreir.BodyOpStoreLocalTag ||
+       op.kind == coreir.BodyOpCopyLocalTag:
+        return PrimaryBodyIrLocalWriteOpWordCount(bodyIR, op)
     if op.kind == coreir.BodyOpResultProjectTag:
         return PrimaryBodyIrProjectOpWordCount(bodyIR, op)
     return 0
@@ -746,31 +821,37 @@ fn PrimaryBodyIrTermReturnsI32(term: coreir.BodyTerm,
                                 bodyIR: coreir.BodyIR): bool =
     if term.kind != coreir.BodyTermReturnTag:
         return false
+    if term.operands.len >= 2:
+        return term.operands[0] == PrimaryStatementReturnModeI32Const()
     if term.operands.len <= 0:
         if term.resultSlot < 0 || term.resultSlot >= bodyIR.localSlots.len:
             return false
         return bodyIR.localSlots[term.resultSlot].typeKind == coreir.LocalI32Tag
-    if term.operands[0] == coreir.LocalI32Tag:
-        if term.resultSlot < 0 || term.resultSlot >= bodyIR.localSlots.len:
-            return false
-        return bodyIR.localSlots[term.resultSlot].typeKind == coreir.LocalI32Tag
-    if term.operands.len < 2:
+    if term.operands[0] != coreir.LocalI32Tag:
         return false
-    return term.operands[0] == PrimaryStatementReturnModeI32Const()
+    if term.resultSlot < 0 || term.resultSlot >= bodyIR.localSlots.len:
+        return false
+    return bodyIR.localSlots[term.resultSlot].typeKind == coreir.LocalI32Tag
 
 fn PrimaryBodyIrCbrConditionSupported(term: coreir.BodyTerm,
                                        bodyIR: coreir.BodyIR): bool =
     if term.kind != coreir.BodyTermCbrTag:
-        return false
-    if term.conditionKind != coreir.BodyCondLocalNonZeroTag &&
-       term.conditionKind != coreir.BodyCondLocalZeroTag:
         return false
     var slotIndex = term.lhsSlot
     if slotIndex < 0:
         slotIndex = term.resultSlot
     if slotIndex < 0 || slotIndex >= bodyIR.localSlots.len:
         return false
-    return bodyIR.localSlots[slotIndex].typeKind == coreir.LocalI32Tag
+    if bodyIR.localSlots[slotIndex].typeKind != coreir.LocalI32Tag:
+        return false
+    return term.conditionKind == coreir.BodyCondLocalNonZeroTag ||
+           term.conditionKind == coreir.BodyCondLocalZeroTag ||
+           term.conditionKind == coreir.BodyCondI32EqTag ||
+           term.conditionKind == coreir.BodyCondI32NeTag ||
+           term.conditionKind == coreir.BodyCondI32LtTag ||
+           term.conditionKind == coreir.BodyCondI32LeTag ||
+           term.conditionKind == coreir.BodyCondI32GtTag ||
+           term.conditionKind == coreir.BodyCondI32GeTag
 
 fn PrimaryBodyIrIsCallCfgReturnInt32(bodyIR: coreir.BodyIR): bool =
     if bodyIR.callSequence.len <= 0 ||
@@ -790,6 +871,12 @@ fn PrimaryBodyIrIsCallCfgReturnInt32(bodyIR: coreir.BodyIR): bool =
                 return false
         elif op.kind == coreir.BodyOpResultProjectTag:
             if !PrimaryBodyIrProjectOpSupported(bodyIR, op):
+                return false
+        elif op.kind == coreir.BodyOpLoadConstTag ||
+             op.kind == coreir.BodyOpLoadLocalTag ||
+             op.kind == coreir.BodyOpStoreLocalTag ||
+             op.kind == coreir.BodyOpCopyLocalTag:
+            if PrimaryBodyIrLocalWriteOpWordCount(bodyIR, op) <= 0:
                 return false
         else:
             return false
@@ -822,6 +909,8 @@ fn PrimaryBodyIrIsCallCfgReturnInt32(bodyIR: coreir.BodyIR): bool =
             if nextBlock >= bodyIR.blocks.len:
                 return false
             if term.trueBlock == term.falseBlock:
+                return false
+            if term.trueBlock <= blockIndex || term.falseBlock <= blockIndex:
                 return false
             if term.trueBlock != nextBlock && term.falseBlock != nextBlock:
                 return false
@@ -909,7 +998,7 @@ fn PrimaryBodyIrNormalizeBlocksTerms(bodyIR: coreir.BodyIR): coreir.BodyIR =
             currentBlock = nextBlock
             continue
         if term.kind == coreir.BodyTermCbrTag:
-            if term.conditionKind != coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag:
+            if term.conditionKind != coreir.BodyCondI32LeTag:
                 return bodyIR
             if term.trueBlock < 0 || term.trueBlock >= bodyIR.blocks.len ||
                term.falseBlock < 0 || term.falseBlock >= bodyIR.blocks.len:
@@ -1575,7 +1664,7 @@ fn PrimaryBodyIrCallOpWordCount(bodyIR: coreir.BodyIR,
 fn PrimaryBodyIrTermWordCount(term: coreir.BodyTerm,
                                epilogueWordCount: int32): int32 =
     if term.kind == coreir.BodyTermReturnTag:
-        return epilogueWordCount + 2
+        return epilogueWordCount + 1
     if term.kind == coreir.BodyTermBrTag:
         return 1
     if term.kind == coreir.BodyTermCbrTag:
@@ -1834,8 +1923,6 @@ fn PrimaryBodyIrCallCfgReturnInt32WordCount(bodyIR: coreir.BodyIR): int32 =
     return wordCount
 
 fn PrimaryBodyIrWordCount(bodyIR: coreir.BodyIR): int32 =
-    if PrimaryBodyIrLocalInitPrefixLen(bodyIR) > 0:
-        return 0
     if PrimaryBodyIrIsResultRequestDispatch(bodyIR):
         return 12
     if PrimaryBodyIrIsCallCfgReturnInt32(bodyIR):
@@ -1937,6 +2024,8 @@ fn PrimaryBodyIrWordCount(bodyIR: coreir.BodyIR): int32 =
        PrimaryBodyIrIsCallSequenceReturnPtr(bodyIR) ||
        PrimaryBodyIrIsCallSequenceReturnI32Const(bodyIR):
         return PrimaryBodyIrCallSequenceReturnInt32WordCount(bodyIR)
+    if PrimaryBodyIrLocalInitPrefixLen(bodyIR) > 0:
+        return 0
     let statementMode = PrimaryBodyIrStatementReturnMode(bodyIR)
     if statementMode != PrimaryStatementReturnModeNone():
         if statementMode == PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0():
@@ -2040,6 +2129,9 @@ fn PrimaryBodyIrWordCount(bodyIR: coreir.BodyIR): int32 =
         wordCount = wordCount + epilogueWordCount
         return wordCount
     return 0
+
+fn PrimaryBodyIrIsEmissionSupported(bodyIR: coreir.BodyIR): bool =
+    return PrimaryBodyIrWordCount(bodyIR) > 0
 
 fn PrimaryBodyIrRequiresCallSequence(bodyIR: coreir.BodyIR): bool =
     if PrimaryBodyIrIsCallCfgReturnInt32(bodyIR):
@@ -2207,6 +2299,14 @@ fn PrimaryBodyIrRelocWordOffset(bodyIR: coreir.BodyIR,
                     if projectWordCount <= 0:
                         return -1
                     localWordIndex = localWordIndex + projectWordCount
+                elif op.kind == coreir.BodyOpLoadConstTag ||
+                     op.kind == coreir.BodyOpLoadLocalTag ||
+                     op.kind == coreir.BodyOpStoreLocalTag ||
+                     op.kind == coreir.BodyOpCopyLocalTag:
+                    let localWriteWordCount = PrimaryBodyIrLocalWriteOpWordCount(bodyIR, op)
+                    if localWriteWordCount <= 0:
+                        return -1
+                    localWordIndex = localWordIndex + localWriteWordCount
                 else:
                     return -1
             let term = bodyIR.terms[block.termIndex]
@@ -3063,6 +3163,40 @@ fn PrimaryArm64BCondWord(instructionDelta: int32,
         return 0
     return 1409286144 + conditionCode + instructionDelta * 32
 
+fn PrimaryBodyCondArm64TrueCode(conditionKind: int32): int32 =
+    if conditionKind == coreir.BodyCondLocalZeroTag ||
+       conditionKind == coreir.BodyCondI32EqTag:
+        return 0
+    if conditionKind == coreir.BodyCondLocalNonZeroTag ||
+       conditionKind == coreir.BodyCondI32NeTag:
+        return 1
+    if conditionKind == coreir.BodyCondI32LtTag:
+        return 11
+    if conditionKind == coreir.BodyCondI32LeTag:
+        return 13
+    if conditionKind == coreir.BodyCondI32GtTag:
+        return 12
+    if conditionKind == coreir.BodyCondI32GeTag:
+        return 10
+    return -1
+
+fn PrimaryBodyCondArm64FalseCode(conditionKind: int32): int32 =
+    if conditionKind == coreir.BodyCondLocalZeroTag ||
+       conditionKind == coreir.BodyCondI32EqTag:
+        return 1
+    if conditionKind == coreir.BodyCondLocalNonZeroTag ||
+       conditionKind == coreir.BodyCondI32NeTag:
+        return 0
+    if conditionKind == coreir.BodyCondI32LtTag:
+        return 10
+    if conditionKind == coreir.BodyCondI32LeTag:
+        return 12
+    if conditionKind == coreir.BodyCondI32GtTag:
+        return 13
+    if conditionKind == coreir.BodyCondI32GeTag:
+        return 11
+    return -1
+
 fn PrimaryArm64SpSubWord(offsetBytes: int32): int32 =
     return PrimaryArm64OffsetWord(-788528129, offsetBytes, 1, 4095)
 
@@ -3401,6 +3535,84 @@ fn PrimaryFillBodyIrResultProjectionOp(words: var int32[],
         PrimarySetInstructionWord(words, emitIndex, storeWord)
         emitIndex = emitIndex + 1
 
+fn PrimaryFillBodyIrLocalWriteOp(words: var int32[],
+                                  emitIndex: var int32,
+                                  bodyIR: coreir.BodyIR,
+                                  op: coreir.BodyOp) =
+    if PrimaryBodyIrLoadConstOpSupported(bodyIR, op):
+        let targetSlot = bodyIR.localSlots[op.target]
+        let movWord = PrimaryArm64RegisterWord(PrimaryMovI32ConstWord(op.operands[1]), 9)
+        if movWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, movWord)
+        emitIndex = emitIndex + 1
+        let storeBaseWord = PrimaryArm64RegisterWord(-1191181408, 9)
+        if storeBaseWord == 0:
+            return
+        let storeWord = PrimaryArm64OffsetWord(storeBaseWord,
+                                               targetSlot.stackOffset,
+                                               4,
+                                               4095)
+        if storeWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, storeWord)
+        emitIndex = emitIndex + 1
+        return
+    if !PrimaryBodyIrLocalCopyOpSupported(bodyIR, op):
+        return
+    let sourceSlot = bodyIR.localSlots[op.operands[0]]
+    let targetSlot = bodyIR.localSlots[op.target]
+    if sourceSlot.typeKind == coreir.LocalI32Tag:
+        let loadBaseWord = PrimaryArm64RegisterWord(-1186987104, 9)
+        if loadBaseWord == 0:
+            return
+        let loadWord = PrimaryArm64OffsetWord(loadBaseWord,
+                                              sourceSlot.stackOffset,
+                                              4,
+                                              4095)
+        if loadWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, loadWord)
+        emitIndex = emitIndex + 1
+        let storeBaseWord = PrimaryArm64RegisterWord(-1191181408, 9)
+        if storeBaseWord == 0:
+            return
+        let storeWord = PrimaryArm64OffsetWord(storeBaseWord,
+                                               targetSlot.stackOffset,
+                                               4,
+                                               4095)
+        if storeWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, storeWord)
+        emitIndex = emitIndex + 1
+        return
+    let copyChunks = PrimaryLocalSlotSizeOf(sourceSlot) / 8
+    for copyIndex in 0..<copyChunks:
+        let sourceOffset = sourceSlot.stackOffset + copyIndex * 8
+        let targetOffset = targetSlot.stackOffset + copyIndex * 8
+        let loadBaseWord = PrimaryArm64RegisterWord(-113245280, 9)
+        if loadBaseWord == 0:
+            return
+        let loadWord = PrimaryArm64OffsetWord(loadBaseWord,
+                                              sourceOffset,
+                                              8,
+                                              4095)
+        if loadWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, loadWord)
+        emitIndex = emitIndex + 1
+        let storeBaseWord = PrimaryArm64RegisterWord(-117439584, 9)
+        if storeBaseWord == 0:
+            return
+        let storeWord = PrimaryArm64OffsetWord(storeBaseWord,
+                                               targetOffset,
+                                               8,
+                                               4095)
+        if storeWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, storeWord)
+        emitIndex = emitIndex + 1
+
 fn PrimaryFillCallCfgReturnInt32Term(words: var int32[],
                                       emitIndex: var int32,
                                       bodyIR: coreir.BodyIR,
@@ -3535,6 +3747,17 @@ fn PrimaryFillCallCfgReturnInt32(words: var int32[],
                 let expectedAfterProject = beforeOpEmitIndex + PrimaryBodyIrProjectOpWordCount(bodyIR, op)
                 if emitIndex != expectedAfterProject:
                     return
+            elif op.kind == coreir.BodyOpLoadConstTag ||
+                 op.kind == coreir.BodyOpLoadLocalTag ||
+                 op.kind == coreir.BodyOpStoreLocalTag ||
+                 op.kind == coreir.BodyOpCopyLocalTag:
+                PrimaryFillBodyIrLocalWriteOp(words,
+                                              emitIndex,
+                                              bodyIR,
+                                              op)
+                let expectedAfterLocalWrite = beforeOpEmitIndex + PrimaryBodyIrLocalWriteOpWordCount(bodyIR, op)
+                if emitIndex != expectedAfterLocalWrite:
+                    return
             else:
                 return
         if block.termIndex < 0 || block.termIndex >= bodyIR.terms.len:
@@ -3547,7 +3770,7 @@ fn PrimaryFillCallCfgReturnInt32(words: var int32[],
                                               bodyIR,
                                               term,
                                               frameBytes)
-            if emitIndex != beforeReturnEmitIndex + epilogueWordCount + 2:
+            if emitIndex != beforeReturnEmitIndex + epilogueWordCount + 1:
                 return
         elif term.kind == coreir.BodyTermBrTag:
             let targetLocalOffset = PrimaryBodyIrCallCfgBlockLocalWordOffset(bodyIR,
@@ -3593,16 +3816,10 @@ fn PrimaryFillCallCfgReturnInt32(words: var int32[],
             var conditionCode: int32 = -1
             if term.trueBlock == nextBlock:
                 branchTargetBlock = term.falseBlock
-                if term.conditionKind == coreir.BodyCondLocalNonZeroTag:
-                    conditionCode = 0
-                elif term.conditionKind == coreir.BodyCondLocalZeroTag:
-                    conditionCode = 1
+                conditionCode = PrimaryBodyCondArm64FalseCode(term.conditionKind)
             elif term.falseBlock == nextBlock:
                 branchTargetBlock = term.trueBlock
-                if term.conditionKind == coreir.BodyCondLocalNonZeroTag:
-                    conditionCode = 1
-                elif term.conditionKind == coreir.BodyCondLocalZeroTag:
-                    conditionCode = 0
+                conditionCode = PrimaryBodyCondArm64TrueCode(term.conditionKind)
             if branchTargetBlock < 0 || conditionCode < 0:
                 return
             let targetLocalOffset = PrimaryBodyIrCallCfgBlockLocalWordOffset(bodyIR,
@@ -4547,11 +4764,12 @@ fn PrimaryObjectMissingTypedIrKind(lowering: var lower.LoweringPlanStub,
     if irIndex < 0 || irIndex >= lowering.primaryObjectIr.functions.len:
         return ""
     let irFunction = lowering.primaryObjectIr.functions[irIndex]
+    let bodyIrKind = PrimaryBodyIrMissingKind(irFunction.bodyIR, "")
+    if PrimaryBodyIrHasSemanticSurface(irFunction.bodyIR) &&
+       Len(bodyIrKind) > 0:
+        return bodyIrKind
     if irFunction.bodyKind != texpr.BodyKindUnsupported:
         return ""
-    let bodyIrKind = PrimaryBodyIrMissingKind(irFunction.bodyIR, "")
-    if Len(bodyIrKind) > 0:
-        return bodyIrKind
     for stmtIndex in 0..<irFunction.statements.len:
         let stmt = irFunction.statements[stmtIndex]
         if stmt.kind == texpr.TypedExprIrStmtIf:
@@ -4709,6 +4927,8 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
             let bodyIrWordCount = PrimaryBodyIrWordCount(normalizedBodyIR)
             if bodyIrWordCount > 0:
                 wordCounts[i] = bodyIrWordCount
+            elif PrimaryBodyIrHasSemanticSurface(normalizedBodyIR):
+                wordCounts[i] = 0
             elif lowering.primaryObjectIr.functions[irIndex].bodyKind == texpr.BodyKindStatementSequence:
                 wordCounts[i] = PrimaryStatementSequenceWordCount(lowering.primaryObjectIr.functions[irIndex].statementReturnMode)
             else:

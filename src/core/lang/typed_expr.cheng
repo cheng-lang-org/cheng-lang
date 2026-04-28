@@ -159,6 +159,8 @@ type
         endLineNumber: int32
         endColumnNumber: int32
         kind: parser.NormalizedExprKind
+        detailKind: parser.NormalizedExprDetailKind
+        surfaceText: str
         surfaceCallKind: TypedExprSurfaceCallKind
         callResolved: bool
         callReason: TypedExprCallReason
@@ -1007,6 +1009,8 @@ fn TypedExprFactClone(fact: TypedExprFact): TypedExprFact =
     out.endLineNumber = fact.endLineNumber
     out.endColumnNumber = fact.endColumnNumber
     out.kind = fact.kind
+    out.detailKind = fact.detailKind
+    out.surfaceText = fact.surfaceText
     out.surfaceCallKind = fact.surfaceCallKind
     out.callResolved = fact.callResolved
     out.callReason = fact.callReason
@@ -1052,6 +1056,10 @@ fn TypedExprFactEqual(lhs: TypedExprFact,
     if lhs.endColumnNumber != rhs.endColumnNumber:
         return false
     if lhs.kind != rhs.kind:
+        return false
+    if lhs.detailKind != rhs.detailKind:
+        return false
+    if lhs.surfaceText != rhs.surfaceText:
         return false
     if lhs.surfaceCallKind != rhs.surfaceCallKind:
         return false
@@ -1326,13 +1334,21 @@ fn TypedExprFactsForSource(facts: var TypedExprFact[],
         add(out, TypedExprFactClone(facts[i]))
     return out
 
-fn TypedExprFirstFactIndexForSource(facts: var TypedExprFact[],
-                                      sourcePathRaw: str): int32 =
+fn TypedExprFirstFactIndexForSourceFrom(facts: var TypedExprFact[],
+                                          sourcePathRaw: str,
+                                          startIndexRaw: int32): int32 =
     let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
-    for i in 0..<facts.len:
+    var startIndex = startIndexRaw
+    if startIndex < 0:
+        startIndex = 0
+    for i in startIndex..<facts.len:
         if facts[i].sourcePath == sourcePath:
             return i
     return -1
+
+fn TypedExprFirstFactIndexForSource(facts: var TypedExprFact[],
+                                      sourcePathRaw: str): int32 =
+    return TypedExprFirstFactIndexForSourceFrom(facts, sourcePathRaw, 0)
 
 fn TypedExprFactEndIndexForSource(facts: var TypedExprFact[],
                                     sourcePathRaw: str,
@@ -1539,6 +1555,12 @@ fn TypedExprFactsValidateCallResolution(exprLayer: var parser.NormalizedExprLaye
             return false
         if expr.kind != fact.kind:
             err = " typed expr: expr kind mismatch"
+            return false
+        if expr.detailKind != fact.detailKind:
+            err = " typed expr: expr detail kind mismatch"
+            return false
+        if expr.surfaceText != fact.surfaceText:
+            err = " typed expr: expr surface text mismatch"
             return false
         if expr.kind == parser.NormalizedExprResultIntrinsic:
             if fact.callKind != TypedExprCallResultIntrinsic:
@@ -4840,6 +4862,8 @@ fn TypedExprBuildFact(ctx: var TypedExprSourceContext,
     fact.endLineNumber = expr.endLineNumber
     fact.endColumnNumber = expr.endColumnNumber
     fact.kind = expr.kind
+    fact.detailKind = expr.detailKind
+    fact.surfaceText = expr.surfaceText
     fact.surfaceCallKind = TypedExprSurfaceCallNone
     fact.callResolved = false
     fact.callReason = TypedExprCallReasonNone
@@ -4865,6 +4889,18 @@ fn TypedExprBuildFact(ctx: var TypedExprSourceContext,
     fact.hasSink = sink.hasSink
     fact.sinkPlaceKind = sink.sinkPlaceKind
     fact.returnRoot = sink.returnRoot
+    if expr.kind == parser.NormalizedExprReturn:
+        fact.returnRoot = true
+        if sink.functionReturnType != "":
+            TypedExprApplyResolvedType(fact, ctx, sourceContexts, sink.functionReturnType, sink, false)
+        return fact
+    if expr.kind == parser.NormalizedExprIfStmt ||
+       expr.kind == parser.NormalizedExprElifStmt:
+        TypedExprApplyResolvedType(fact, ctx, sourceContexts, "bool", sink, false)
+        return fact
+    if expr.kind == parser.NormalizedExprElseStmt ||
+       expr.kind == parser.NormalizedExprForStmt:
+        return fact
     if expr.kind == parser.NormalizedExprRange:
         TypedExprApplyResolvedType(fact, ctx, sourceContexts, "range", sink, false)
         return fact
@@ -5216,36 +5252,75 @@ fn TypedExprIfConditionTextFromLine(lineRaw: str): str =
         return ""
     return chengpath.PathTrim(chengpath.TextSlice(trimmed, 3, trimmed.len - 4))
 
-fn TypedExprNearestEnclosingIf(ctx: var TypedExprSourceContext,
-                                scope: TypedExprFunctionScope,
-                                lineNumber: int32,
-                                lineIndent: int32,
-                                outLineNumber: var int32,
-                                outConditionText: var str) =
+fn TypedExprPruneEnclosingIfStack(ifLineNumbers: var int32[],
+                                   ifIndents: var int32[],
+                                   ifConditions: var str[],
+                                   lineIndent: int32) =
+    while ifIndents.len > 0 && ifIndents[ifIndents.len - 1] >= lineIndent:
+        let newLen = ifIndents.len - 1
+        ifLineNumbers.len = newLen
+        ifIndents.len = newLen
+        ifConditions.len = newLen
+
+fn TypedExprResetEnclosingIfStack(ifLineNumbers: var int32[],
+                                   ifIndents: var int32[],
+                                   ifConditions: var str[]) =
+    ifLineNumbers.len = 0
+    ifIndents.len = 0
+    ifConditions.len = 0
+
+fn TypedExprAdvanceEnclosingIfStack(ctx: var TypedExprSourceContext,
+                                     scope: TypedExprFunctionScope,
+                                     targetLineNumber: int32,
+                                     scanLineNumber: var int32,
+                                     ifLineNumbers: var int32[],
+                                     ifIndents: var int32[],
+                                     ifConditions: var str[]) =
+    if scanLineNumber <= scope.startLine:
+        scanLineNumber = scope.startLine + 1
+    while scanLineNumber < targetLineNumber:
+        if scanLineNumber > scope.endLine:
+            return
+        let rawLine = TypedExprSourceLine(ctx, scanLineNumber)
+        let trimmed = chengpath.PathTrim(parser.ParserStripLineComment(rawLine))
+        if trimmed != "":
+            if !parser.ParserHasLeadingIndent(rawLine):
+                TypedExprResetEnclosingIfStack(ifLineNumbers, ifIndents, ifConditions)
+            else:
+                let lineIndent = TypedExprLineIndentWidth(rawLine)
+                TypedExprPruneEnclosingIfStack(ifLineNumbers, ifIndents, ifConditions, lineIndent)
+                let conditionText = TypedExprIfConditionTextFromLine(rawLine)
+                if conditionText != "":
+                    add(ifLineNumbers, scanLineNumber)
+                    add(ifIndents, lineIndent)
+                    add(ifConditions, conditionText)
+        scanLineNumber = scanLineNumber + 1
+
+fn TypedExprSetCurrentLineEnclosingIf(ctx: var TypedExprSourceContext,
+                                       scope: TypedExprFunctionScope,
+                                       currentLineNumber: int32,
+                                       currentLineIndent: int32,
+                                       scanLineNumber: var int32,
+                                       ifLineNumbers: var int32[],
+                                       ifIndents: var int32[],
+                                       ifConditions: var str[],
+                                       outLineNumber: var int32,
+                                       outConditionText: var str) =
+    TypedExprAdvanceEnclosingIfStack(ctx,
+                                     scope,
+                                     currentLineNumber,
+                                     scanLineNumber,
+                                     ifLineNumbers,
+                                     ifIndents,
+                                     ifConditions)
+    TypedExprPruneEnclosingIfStack(ifLineNumbers, ifIndents, ifConditions, currentLineIndent)
     outLineNumber = 0
     outConditionText = ""
-    if lineNumber <= scope.startLine:
+    if ifLineNumbers.len <= 0:
         return
-    var bestIndent: int32 = -1
-    for sourceLineNumber in scope.startLine..<lineNumber:
-        if sourceLineNumber <= 0 || sourceLineNumber > ctx.lines.len:
-            continue
-        let rawLine = ctx.lines[sourceLineNumber - 1]
-        let trimmed = chengpath.PathTrim(parser.ParserStripLineComment(rawLine))
-        if trimmed == "":
-            continue
-        if !parser.ParserHasLeadingIndent(rawLine):
-            continue
-        let indent = TypedExprLineIndentWidth(rawLine)
-        if indent >= lineIndent:
-            continue
-        let conditionText = TypedExprIfConditionTextFromLine(rawLine)
-        if conditionText == "":
-            continue
-        if indent >= bestIndent:
-            bestIndent = indent
-            outLineNumber = sourceLineNumber
-            outConditionText = conditionText
+    let top = ifLineNumbers.len - 1
+    outLineNumber = ifLineNumbers[top]
+    outConditionText = ifConditions[top]
 
 fn TypedExprIrAddCallStatement(ir: var TypedExprIr,
                                 scope: TypedExprFunctionScope,
@@ -5268,10 +5343,16 @@ fn TypedExprIrAddCallStatement(ir: var TypedExprIr,
     stmt.exprId = fact.exprId
     stmt.kind = kind
     stmt.callKind = fact.callKind
-    stmt.detailKind = parser.NormalizedExprDetailNone
-    stmt.surfaceText = fact.callCallee
+    stmt.detailKind = fact.detailKind
+    stmt.surfaceText = fact.surfaceText
     if fact.callKind == TypedExprCallResultIntrinsic:
         stmt.detailKind = parser.ParserResultIntrinsicDetailKind(fact.callCallee)
+        if stmt.surfaceText == "":
+            stmt.surfaceText = fact.callCallee
+    elif kind == TypedExprIrStmtCall ||
+         kind == TypedExprIrStmtLetCall ||
+         kind == TypedExprIrStmtIfCall:
+        stmt.surfaceText = fact.callCallee
     stmt.bindingName = bindingName
     stmt.resultType = resultType
     stmt.callTarget = fact.callTarget
@@ -5308,6 +5389,10 @@ fn TypedExprIrAppendStatementsForScope(ir: var TypedExprIr,
     var currentLineIndent: int32
     var currentLineEnclosingIfLineNumber: int32
     var currentLineEnclosingIfConditionText = ""
+    var ifScanLineNumber = scope.startLine + 1
+    var ifLineNumbers: int32[]
+    var ifIndents: int32[]
+    var ifConditions: str[]
     for i in cursor..<endIndex:
         if facts[i].lineNumber <= scope.startLine || facts[i].lineNumber > scope.endLine:
             if facts[i].lineNumber > scope.endLine:
@@ -5322,12 +5407,16 @@ fn TypedExprIrAppendStatementsForScope(ir: var TypedExprIr,
             currentLineBindingRhsStartColumn = -1
             let lineRaw = TypedExprSourceLine(ctx, currentLineNumber)
             currentLineIndent = TypedExprLineIndentWidth(lineRaw)
-            TypedExprNearestEnclosingIf(ctx,
-                                        scope,
-                                        currentLineNumber,
-                                        currentLineIndent,
-                                        currentLineEnclosingIfLineNumber,
-                                        currentLineEnclosingIfConditionText)
+            TypedExprSetCurrentLineEnclosingIf(ctx,
+                                                scope,
+                                                currentLineNumber,
+                                                currentLineIndent,
+                                                ifScanLineNumber,
+                                                ifLineNumbers,
+                                                ifIndents,
+                                                ifConditions,
+                                                currentLineEnclosingIfLineNumber,
+                                                currentLineEnclosingIfConditionText)
             let trimmedLine = chengpath.PathTrim(lineRaw)
             var isBindingLine = false
             if parser.ParserStartsWith(trimmedLine, "let "):
@@ -5369,6 +5458,28 @@ fn TypedExprIrAppendStatementsForScope(ir: var TypedExprIr,
                     if currentLineBindingRootColumn < 0 ||
                        facts[j].columnNumber < currentLineBindingRootColumn:
                         currentLineBindingRootColumn = facts[j].columnNumber
+        if facts[i].kind == parser.NormalizedExprReturn:
+            let _ = TypedExprIrAddCallStatement(ir,
+                                                scope,
+                                                facts[i],
+                                                TypedExprIrStmtReturn,
+                                                "",
+                                                scope.returnType,
+                                                currentLineIndent,
+                                                currentLineEnclosingIfLineNumber,
+                                                currentLineEnclosingIfConditionText)
+            continue
+        if facts[i].kind == parser.NormalizedExprIfStmt ||
+           facts[i].kind == parser.NormalizedExprElifStmt ||
+           facts[i].kind == parser.NormalizedExprElseStmt ||
+           facts[i].kind == parser.NormalizedExprForStmt:
+            let _ = TypedExprIrAddControlStatementFromFact(ir,
+                                                           scope,
+                                                           facts[i],
+                                                           currentLineIndent,
+                                                           currentLineEnclosingIfLineNumber,
+                                                           currentLineEnclosingIfConditionText)
+            continue
         let isResultIntrinsic = facts[i].kind == parser.NormalizedExprResultIntrinsic
         let isNormalCall = facts[i].kind == parser.NormalizedExprCall
         if !isNormalCall && !isResultIntrinsic:
@@ -5513,6 +5624,17 @@ fn TypedExprControlStatementKindFromExpr(expr: parser.NormalizedExpr): TypedExpr
         return TypedExprIrStmtFor
     return TypedExprIrStmtUnsupported
 
+fn TypedExprControlStatementKindFromFact(fact: TypedExprFact): TypedExprIrStatementKind =
+    if fact.kind == parser.NormalizedExprIfStmt:
+        return TypedExprIrStmtIf
+    if fact.kind == parser.NormalizedExprElifStmt:
+        return TypedExprIrStmtElif
+    if fact.kind == parser.NormalizedExprElseStmt:
+        return TypedExprIrStmtElse
+    if fact.kind == parser.NormalizedExprForStmt:
+        return TypedExprIrStmtFor
+    return TypedExprIrStmtUnsupported
+
 fn TypedExprForBindingNameFromHeader(headerRaw: str): str =
     let header = chengpath.PathTrim(headerRaw)
     let inPos = parser.ParserFindText(header, " in ")
@@ -5521,6 +5643,49 @@ fn TypedExprForBindingNameFromHeader(headerRaw: str): str =
     return parser.ParserIdentPrefix(chengpath.PathTrim(chengpath.TextSlice(header,
                                                                            0,
                                                                            inPos)))
+
+fn TypedExprIrAddControlStatementFromFact(ir: var TypedExprIr,
+                                           scope: TypedExprFunctionScope,
+                                           fact: TypedExprFact,
+                                           lineIndent: int32,
+                                           enclosingIfLineNumber: int32,
+                                           enclosingIfConditionText: str): int32 =
+    let statementKind = TypedExprControlStatementKindFromFact(fact)
+    if statementKind == TypedExprIrStmtUnsupported:
+        return -1
+    var stmt: TypedExprIrStatement
+    stmt.sourcePath = fact.sourcePath
+    stmt.functionName = scope.name
+    stmt.statementIndex = ir.statements.len
+    stmt.lineNumber = fact.lineNumber
+    stmt.columnNumber = fact.columnNumber
+    stmt.lineIndent = lineIndent
+    stmt.enclosingIfLineNumber = enclosingIfLineNumber
+    stmt.enclosingIfConditionText = enclosingIfConditionText
+    stmt.exprId = fact.exprId
+    stmt.kind = statementKind
+    stmt.callKind = TypedExprCallNone
+    stmt.detailKind = fact.detailKind
+    stmt.surfaceText = chengpath.PathTrim(fact.surfaceText)
+    stmt.bindingName = ""
+    if statementKind == TypedExprIrStmtFor:
+        stmt.bindingName = TypedExprForBindingNameFromHeader(stmt.surfaceText)
+    stmt.resultType = ""
+    if statementKind == TypedExprIrStmtIf ||
+       statementKind == TypedExprIrStmtElif:
+        stmt.resultType = "bool"
+    elif statementKind == TypedExprIrStmtFor:
+        stmt.resultType = "range"
+    stmt.callTarget = ""
+    stmt.callTargetSourcePath = ""
+    stmt.callTargetImportc = false
+    stmt.callArgCount = 0
+    stmt.callArgsText = ""
+    stmt.loweringMode = TypedExprLowerDeferred
+    stmt.returnKind = TypedExprReturnDeferred
+    stmt.returnRoot = false
+    add(ir.statements, stmt)
+    return stmt.statementIndex
 
 fn TypedExprIrAddControlStatementFromExpr(ir: var TypedExprIr,
                                            scope: TypedExprFunctionScope,
@@ -5679,6 +5844,10 @@ fn TypedExprIrAppendStatementsForScopeFromExprLayer(ir: var TypedExprIr,
     var currentLineIndent: int32
     var currentLineEnclosingIfLineNumber: int32
     var currentLineEnclosingIfConditionText = ""
+    var ifScanLineNumber = scope.startLine + 1
+    var ifLineNumbers: int32[]
+    var ifIndents: int32[]
+    var ifConditions: str[]
     for i in cursor..<endIndex:
         let expr = exprLayer.exprs[i]
         if expr.lineNumber <= scope.startLine || expr.lineNumber > scope.endLine:
@@ -5696,12 +5865,16 @@ fn TypedExprIrAppendStatementsForScopeFromExprLayer(ir: var TypedExprIr,
             currentLineReturnExprStartColumn = -1
             let lineRaw = TypedExprSourceLine(ctx, currentLineNumber)
             currentLineIndent = TypedExprLineIndentWidth(lineRaw)
-            TypedExprNearestEnclosingIf(ctx,
-                                        scope,
-                                        currentLineNumber,
-                                        currentLineIndent,
-                                        currentLineEnclosingIfLineNumber,
-                                        currentLineEnclosingIfConditionText)
+            TypedExprSetCurrentLineEnclosingIf(ctx,
+                                                scope,
+                                                currentLineNumber,
+                                                currentLineIndent,
+                                                ifScanLineNumber,
+                                                ifLineNumbers,
+                                                ifIndents,
+                                                ifConditions,
+                                                currentLineEnclosingIfLineNumber,
+                                                currentLineEnclosingIfConditionText)
             let trimmedLine = chengpath.PathTrim(lineRaw)
             var isBindingLine = false
             if parser.ParserStartsWith(trimmedLine, "let "):
@@ -6055,18 +6228,28 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
                               ir: var TypedExprIr,
                               err: var str): bool =
     ir = TypedExprIr()
+    var nextFactSearchIndex: int32
     for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
+        var sourceForContext = sourceTexts[i]
+        if sourceForContext.text == "" && sourceForContext.sourcePath != "":
+            sourceForContext.text = chengpath.ReadTextFile("", sourceForContext.sourcePath)
         var ctx: TypedExprSourceContext
-        if !TypedExprBuildSourceContext(sourceTexts[i], ctx, err):
+        if !TypedExprBuildSourceContext(sourceForContext, ctx, err):
             err = " typed expr: build typed ir source context failed"
             return false
-        let sourceFactStart = TypedExprFirstFactIndexForSource(facts, ctx.sourcePath)
+        var sourceFactStart = TypedExprFirstFactIndexForSourceFrom(facts,
+                                                                    ctx.sourcePath,
+                                                                    nextFactSearchIndex)
+        if sourceFactStart < 0:
+            sourceFactStart = TypedExprFirstFactIndexForSource(facts, ctx.sourcePath)
         var sourceFactEnd: int32
         var factCursor: int32
         if sourceFactStart >= 0:
             sourceFactEnd = TypedExprFactEndIndexForSource(facts, ctx.sourcePath, sourceFactStart)
             factCursor = sourceFactStart
+            if sourceFactEnd > nextFactSearchIndex:
+                nextFactSearchIndex = sourceFactEnd
         else:
             sourceFactEnd = 0
             factCursor = 0
@@ -6079,6 +6262,8 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
                         break
                     factCursor = factIndex + 1
             TypedExprBuildIrForScope(ctx, ctx.scopes[j], facts, factCursor, sourceFactEnd, ir)
+        TypedExprClearSourceContextHeavyFields(ctx)
+        sourceTexts[i].text = ""
     err = ""
     return true
 

@@ -1,0 +1,222 @@
+import std/os
+import std/strutils as strutil
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/path as chengpath
+import cheng/core/lang/parser
+import cheng/core/lang/typed_expr as texpr
+
+fn reportFieldValue(report: str, key: str): str =
+    let taggedReport = strutil.Join(["\n", report], "")
+    let needle = strutil.Join(["\n", key, "="], "")
+    let fieldPos = parser.ParserFindText(taggedReport, needle)
+    if fieldPos < 0:
+        return ""
+    let valueStart = fieldPos + needle.len
+    let tail = chengpath.TextSlice(taggedReport, valueStart, taggedReport.len - valueStart)
+    let newlinePos = parser.ParserFindText(tail, "\n")
+    if newlinePos < 0:
+        return tail
+    if newlinePos == 0:
+        return ""
+    return chengpath.TextSlice(tail, 0, newlinePos)
+
+fn buildPlan(workspaceRoot: str,
+             packageRoot: str,
+             sourcePath: str,
+             outputPath: str): lower.LoweringPlanStub =
+    let req = creq.CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.EmitExe,
+        ""
+    )
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err = ""
+    assert(slplan.BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), " lowering cfg matrix: link plan")
+    assert(linkPlan.missingReasons.len == 0, " lowering cfg matrix: link plan ready")
+    var plan: lower.LoweringPlanStub
+    assert(lower.BuildLoweringPlanStub(linkPlan, plan, err), strutil.Join([" lowering cfg matrix: lowering ", err], ""))
+    return plan
+
+fn buildPrimaryReport(workspaceRoot: str,
+                      packageRoot: str,
+                      sourcePath: str,
+                      outputPath: str,
+                      exportRoot: str): str =
+    let req0 = creq.CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.EmitObj,
+        ""
+    )
+    let req = creq.CompilerRequestWithExportRootSymbols(req0, [exportRoot])
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err = ""
+    assert(slplan.BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), " lowering cfg matrix: primary link plan")
+    assert(linkPlan.missingReasons.len == 0, " lowering cfg matrix: primary link plan ready")
+    var plan: lower.LoweringPlanStub
+    assert(lower.BuildLoweringPlanStub(linkPlan, plan, err), strutil.Join([" lowering cfg matrix: primary lowering ", err], ""))
+    let primary = pobj.BuildPrimaryObjectPlan(linkPlan, plan)
+    return pobj.PrimaryObjectPlanReport(primary)
+
+fn assertFieldContains(report: str, key: str, needle: str, label: str) =
+    assert(chengpath.TextContains(reportFieldValue(report, key), needle), label)
+
+fn assertFieldEquals(report: str, key: str, expected: str, label: str) =
+    assert(reportFieldValue(report, key) == expected, label)
+
+fn assertFieldPositive(report: str, key: str, label: str) =
+    let value = reportFieldValue(report, key)
+    assert(value != "" && value != "0", label)
+
+fn assertPrimaryReady(report: str, relocCount: str, label: str) =
+    assertFieldEquals(report, "primary_object_first_missing_function", "", strutil.Join([label, " missing function"], ""))
+    assertFieldEquals(report, "primary_object_first_missing_body_kind", "", strutil.Join([label, " missing body"], ""))
+    assertFieldEquals(report, "primary_object_first_missing_typed_ir_kind", "", strutil.Join([label, " missing typed ir"], ""))
+    assertFieldEquals(report, "primary_object_first_call_sequence_drift_function", "", strutil.Join([label, " call drift function"], ""))
+    assertFieldEquals(report, "primary_object_first_call_sequence_drift_reason", "", strutil.Join([label, " call drift reason"], ""))
+    assertFieldEquals(report, "primary_object_reloc_count", relocCount, strutil.Join([label, " reloc"], ""))
+    assertFieldPositive(report, "primary_object_instruction_word_count", strutil.Join([label, " words"], ""))
+
+fn main(): int32 =
+    let workspaceRoot: str = os.GetEnvDefault("CHENG_SMOKE_ROOT", ".")
+    let packageRoot: str = workspaceRoot
+    let smokeLabel: str = os.GetEnvDefault("CHENG_SMOKE_LABEL", "host")
+    let outDir: str = chengpath.PathJoin(workspaceRoot, strutil.Join(["artifacts/lowering_cfg_matrix/", smokeLabel], ""))
+    assert(chengpath.MkdirP(workspaceRoot, outDir), " lowering cfg matrix: mkdir")
+
+    let letLocalPath = chengpath.PathJoin(packageRoot, "src/tests/let_call_return_result_direct_object_smoke.cheng")
+    let letLocalOut = chengpath.PathJoin(outDir, "let_call_return_result_direct_object_smoke")
+    let letLocalPlan = buildPlan(workspaceRoot, packageRoot, letLocalPath, letLocalOut)
+    let letLocalReport = lower.LoweringPlanStubReport(letLocalPlan)
+    assertFieldContains(letLocalReport, "primary_object_ir_body_kinds", texpr.BodyKindStatementSequence,
+                        " lowering cfg matrix: let local body ir")
+    assertFieldContains(letLocalReport, "primary_object_ir_statement_sequence_kinds", "let_call|return",
+                        " lowering cfg matrix: let local stmt_let_call return local")
+    assertFieldContains(letLocalReport, "primary_object_ir_statement_sequence_bindings", "value",
+                        " lowering cfg matrix: let local binding")
+    assertFieldContains(letLocalReport, "primary_object_ir_statement_sequence_result_types", "int32",
+                        " lowering cfg matrix: let local result type")
+    assertFieldContains(letLocalReport, "primary_object_ir_body_ir_call_counts", "1",
+                        " lowering cfg matrix: let local call count")
+    assertFieldContains(letLocalReport, "primary_object_ir_call_sequence_targets", "LeafResult",
+                        " lowering cfg matrix: let local target")
+    assertPrimaryReady(buildPrimaryReport(workspaceRoot, packageRoot, letLocalPath, letLocalOut, "main"),
+                       "1",
+                       " lowering cfg matrix: let local primary ready")
+
+    let linearPath = chengpath.PathJoin(packageRoot, "src/tests/backend_matrix_stmt_call_return_i32.cheng")
+    let linearOut = chengpath.PathJoin(outDir, "backend_matrix_stmt_call_return_i32")
+    let linearPlan = buildPlan(workspaceRoot, packageRoot, linearPath, linearOut)
+    let linearReport = lower.LoweringPlanStubReport(linearPlan)
+    assertFieldContains(linearReport, "primary_object_ir_body_kinds", texpr.BodyKindStatementSequence,
+                        " lowering cfg matrix: linear body ir")
+    assertFieldContains(linearReport, "primary_object_ir_statement_sequence_kinds", "call|return",
+                        " lowering cfg matrix: linear stmt_call return call")
+    assertFieldContains(linearReport, "primary_object_ir_statement_sequence_targets", "Touch|Ret11",
+                        " lowering cfg matrix: linear stmt targets")
+    assertFieldContains(linearReport, "primary_object_ir_body_ir_call_counts", "2",
+                        " lowering cfg matrix: linear call count")
+    assertFieldContains(linearReport, "primary_object_ir_call_sequence_targets", "Touch",
+                        " lowering cfg matrix: linear touch target")
+    assertFieldContains(linearReport, "primary_object_ir_call_sequence_targets", "Ret11",
+                        " lowering cfg matrix: linear return target")
+    assertPrimaryReady(buildPrimaryReport(workspaceRoot, packageRoot, linearPath, linearOut, "main"),
+                       "2",
+                       " lowering cfg matrix: linear primary ready")
+
+    let constPath = chengpath.PathJoin(packageRoot, "src/tests/backend_matrix_stmt_call_return_const.cheng")
+    let constOut = chengpath.PathJoin(outDir, "backend_matrix_stmt_call_return_const")
+    let constPlan = buildPlan(workspaceRoot, packageRoot, constPath, constOut)
+    let constReport = lower.LoweringPlanStubReport(constPlan)
+    assertFieldContains(constReport, "primary_object_ir_body_kinds", texpr.BodyKindStatementSequence,
+                        " lowering cfg matrix: return const body ir")
+    assertFieldContains(constReport, "primary_object_ir_statement_sequence_kinds", "call|return",
+                        " lowering cfg matrix: stmt_call return const")
+    assertFieldContains(constReport, "primary_object_ir_call_sequence_targets", "Touch",
+                        " lowering cfg matrix: return const target")
+    assertFieldContains(constReport, "primary_object_ir_body_ir_call_counts", "1",
+                        " lowering cfg matrix: return const call count")
+    assertPrimaryReady(buildPrimaryReport(workspaceRoot, packageRoot, constPath, constOut, "main"),
+                       "1",
+                       " lowering cfg matrix: return const primary ready")
+
+    let guardPath = chengpath.PathJoin(packageRoot, "src/tests/backend_matrix_cfg_if_guard.cheng")
+    let guardOut = chengpath.PathJoin(outDir, "backend_matrix_cfg_if_guard")
+    let guardPlan = buildPlan(workspaceRoot, packageRoot, guardPath, guardOut)
+    let guardReport = lower.LoweringPlanStubReport(guardPlan)
+    assertFieldContains(guardReport, "primary_object_ir_body_kinds", texpr.BodyKindStatementSequence,
+                        " lowering cfg matrix: guard body ir")
+    assertFieldContains(guardReport, "primary_object_ir_statement_sequence_kinds", "let_call",
+                        " lowering cfg matrix: guard stmt_let_call")
+    assertFieldContains(guardReport, "primary_object_ir_statement_sequence_kinds", "if",
+                        " lowering cfg matrix: guard if")
+    assertFieldContains(guardReport, "primary_object_ir_statement_sequence_kinds", "return",
+                        " lowering cfg matrix: guard return")
+    assertFieldContains(guardReport, "primary_object_ir_body_ir_call_counts", "2",
+                        " lowering cfg matrix: guard call count")
+    assertFieldContains(guardReport, "primary_object_ir_call_sequence_targets", "Count",
+                        " lowering cfg matrix: guard count target")
+    assertFieldContains(guardReport, "primary_object_ir_call_sequence_targets", "Call",
+                        " lowering cfg matrix: guard final target")
+    assertPrimaryReady(buildPrimaryReport(workspaceRoot, packageRoot, guardPath, guardOut, "main"),
+                       "2",
+                       " lowering cfg matrix: guard primary ready")
+
+    let guardTakenPath = chengpath.PathJoin(packageRoot, "src/tests/backend_matrix_cfg_if_guard_taken.cheng")
+    let guardTakenOut = chengpath.PathJoin(outDir, "backend_matrix_cfg_if_guard_taken")
+    let guardTakenPlan = buildPlan(workspaceRoot, packageRoot, guardTakenPath, guardTakenOut)
+    let guardTakenReport = lower.LoweringPlanStubReport(guardTakenPlan)
+    assertFieldContains(guardTakenReport, "primary_object_ir_body_kinds", texpr.BodyKindStatementSequence,
+                        " lowering cfg matrix: guard taken body ir")
+    assertFieldContains(guardTakenReport, "primary_object_ir_statement_sequence_kinds", "let_call",
+                        " lowering cfg matrix: guard taken stmt_let_call")
+    assertFieldContains(guardTakenReport, "primary_object_ir_statement_sequence_kinds", "if",
+                        " lowering cfg matrix: guard taken if")
+    assertFieldContains(guardTakenReport, "primary_object_ir_statement_sequence_kinds", "return",
+                        " lowering cfg matrix: guard taken return")
+    assertFieldContains(guardTakenReport, "primary_object_ir_call_sequence_targets", "Count",
+                        " lowering cfg matrix: guard taken count target")
+    assertFieldContains(guardTakenReport, "primary_object_ir_call_sequence_targets", "Call",
+                        " lowering cfg matrix: guard taken final target")
+    assertPrimaryReady(buildPrimaryReport(workspaceRoot, packageRoot, guardTakenPath, guardTakenOut, "main"),
+                       "2",
+                       " lowering cfg matrix: guard taken primary ready")
+
+    let resultPath = chengpath.PathJoin(packageRoot, "src/tests/result_request_dispatch_fixture.cheng")
+    let resultOut = chengpath.PathJoin(outDir, "result_request_dispatch_fixture")
+    let resultPlan = buildPlan(workspaceRoot, packageRoot, resultPath, resultOut)
+    let resultReport = lower.LoweringPlanStubReport(resultPlan)
+    assertFieldContains(resultReport, "expr_surface_result_intrinsic_count", "3",
+                        " lowering cfg matrix: result intrinsic surface count")
+    assertFieldContains(resultReport, "primary_object_ir_statement_sequence_kinds", "result_intrinsic",
+                        " lowering cfg matrix: result intrinsic statements")
+    assertFieldContains(resultReport, "primary_object_ir_statement_sequence_kinds", "if",
+                        " lowering cfg matrix: result guard if")
+    assertFieldContains(resultReport, "primary_object_ir_statement_sequence_kinds", "return",
+                        " lowering cfg matrix: result returns")
+    assertFieldContains(resultReport, "primary_object_ir_body_kinds", texpr.BodyKindStatementSequence,
+                        " lowering cfg matrix: result body ir")
+    assertFieldContains(resultReport, "primary_object_ir_body_ir_call_counts", "2",
+                        " lowering cfg matrix: result call count")
+    assertFieldContains(resultReport, "primary_object_ir_call_sequence_targets", "BackendDriverDispatchMinRunSystemLinkExecConcreteRequest",
+                        " lowering cfg matrix: result concrete target")
+    assertFieldContains(resultReport, "primary_object_ir_call_sequence_targets", "BackendDriverDispatchMinUnsupported",
+                        " lowering cfg matrix: result unsupported target")
+    assertPrimaryReady(buildPrimaryReport(workspaceRoot,
+                                          packageRoot,
+                                          resultPath,
+                                          resultOut,
+                                          "BackendDriverDispatchMinRunSystemLinkExecWithRequest"),
+                       "2",
+                       " lowering cfg matrix: result primary ready")
+
+    echo(" lowering_cfg_matrix_smoke ok")
+    return 0
