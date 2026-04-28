@@ -1,0 +1,142 @@
+import std/os
+import std/result
+import std/times
+import std/strings
+import std/strutils as strutil
+import cheng/codex/core/engine
+import cheng/codex/core/store
+import cheng/codex/core/text as textutil
+import cheng/codex/protocol/types
+
+fn codexTestPrint(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn main(): int32 =
+    let epoch = int32(times.EpochTimeSeconds())
+    let epochStr = intToStr(epoch)
+    let homeName = strutil.Join(["codex-approval-", epochStr], "")
+    let home = os.JoinPath("/tmp", homeName)
+    let cwd = os.GetCurrentDir()
+
+    # ====================================================
+    # Test 1: autoApprove=true allows shell execution
+    # ====================================================
+    var reqAuto: types.CodexExecRequest
+    reqAuto.cwd = cwd
+    reqAuto.promptText = "auto approved"
+    reqAuto.commandText = "echo auto-approve-test"
+    reqAuto.autoApprove = true
+    let resAuto = engine.codexExecuteShell(home, reqAuto)
+    assert(IsOk(resAuto), "approval: autoApprove=true exec succeeds")
+    let runAuto = Value(resAuto)
+    assert(runAuto.ok, "approval: autoApprove=true rc ok")
+    assert(strings.StrContains(runAuto.outputText, "auto-approve-test"),
+           "approval: autoApprove output correct")
+
+    # ====================================================
+    # Test 2: autoApprove=false blocks shell execution
+    # ====================================================
+    var reqDeny: types.CodexExecRequest
+    reqDeny.cwd = cwd
+    reqDeny.promptText = "denied shell"
+    reqDeny.commandText = "echo should-not-execute"
+    reqDeny.autoApprove = false
+    let resDeny = engine.codexExecuteShell(home, reqDeny)
+    assert(IsErr(resDeny), "approval: autoApprove=false blocked")
+    let errMsg = Error(resDeny)
+    assert(textutil.codexTextNonEmpty(errMsg), "approval: error message non-empty")
+    assert(strings.StrContains(errMsg, "auto-approve") ||
+           strings.StrContains(errMsg, "approve"),
+           "approval: error mentions approval")
+
+    # ====================================================
+    # Test 3: Sessions with approval semantics via appendTurn
+    # ====================================================
+    var deniedTurn: types.CodexTurn
+    deniedTurn.promptText = "denied command"
+    deniedTurn.commandText = "rm -rf /"
+    deniedTurn.outputText = "approval denied"
+    deniedTurn.assistantText = "command failed rc=126"
+    deniedTurn.exitCode = 126
+    deniedTurn.approved = false
+
+    assert(!deniedTurn.approved, "approval: denied turn not approved")
+    assert(deniedTurn.exitCode == 126, "approval: denied exit code is 126")
+
+    # This mirrors the TUI behavior when user denies approval:
+    # engine.codexAppendTurn(session, prompt, command, "approval denied", 126, false)
+    var session = engine.codexNewSession(cwd, "Approval Test", "", "")
+    engine.codexAppendTurn(session, "run rm -rf /", "rm -rf /", "approval denied", 126, false)
+    assert(session.turns.len == 1, "approval: turn appended after denial")
+    assert(!session.turns[0].approved, "approval: turn not approved")
+    assert(session.turns[0].exitCode == 126, "approval: turn exit code 126")
+    assert(session.lastExitCode == 126, "approval: session last exit code 126")
+    assert(strings.StrContains(session.turns[0].assistantText, "failed"),
+           "approval: assistant text mentions failure")
+
+    # ====================================================
+    # Test 4: Approved turn semantics via appendTurn
+    # ====================================================
+    engine.codexAppendTurn(session, "approved command", "echo ok", "output ok", 0, true)
+    assert(session.turns.len == 2, "approval: two turns total")
+    assert(session.turns[1].approved, "approval: turn 1 approved")
+    assert(session.turns[1].exitCode == 0, "approval: turn 1 exit code 0")
+    assert(session.lastExitCode == 0, "approval: session last exit 0 after approved turn")
+
+    # ====================================================
+    # Test 5: Save/load session with mixed approval states
+    # ====================================================
+    let saveRes = store.codexStoreSessionWrite(home, session)
+    assert(IsOk(saveRes), "approval: save mixed session")
+    let loadRes = store.codexStoreSessionRead(home, session.sessionId)
+    assert(IsOk(loadRes), "approval: load mixed session")
+    let loaded = Value(loadRes)
+    assert(loaded.turns.len == 2, "approval: loaded 2 turns")
+    assert(!loaded.turns[0].approved, "approval: loaded turn[0] not approved")
+    assert(loaded.turns[0].exitCode == 126, "approval: loaded turn[0] exit 126")
+    assert(loaded.turns[1].approved, "approval: loaded turn[1] approved")
+    assert(loaded.turns[1].exitCode == 0, "approval: loaded turn[1] exit 0")
+
+    # ====================================================
+    # Test 6: Verify approval decision when switching sessions
+    # ====================================================
+    # A new session with autoApprove=false should reject
+    var reqNew: types.CodexExecRequest
+    reqNew.cwd = cwd
+    reqNew.promptText = "new session no approve"
+    reqNew.commandText = "echo new-session-deny"
+    reqNew.autoApprove = false
+    let resNew = engine.codexExecuteShell(home, reqNew)
+    assert(IsErr(resNew), "approval: new session no auto-approve rejected")
+
+    # ====================================================
+    # Test 7: Error handling when command missing
+    # ====================================================
+    var reqEmpty: types.CodexExecRequest
+    reqEmpty.cwd = cwd
+    reqEmpty.promptText = "no command"
+    reqEmpty.commandText = ""
+    reqEmpty.autoApprove = true
+    let resEmpty = engine.codexExecuteShell(home, reqEmpty)
+    assert(IsErr(resEmpty), "approval: empty command rejected even with autoApprove")
+    let emptyErr = Error(resEmpty)
+    assert(strings.StrContains(emptyErr, "missing"), "approval: error mentions missing command")
+
+    # ====================================================
+    # Test 8: assistantText reflects approval via codexAssistantSummary
+    # ====================================================
+    # Approved turn with output
+    let approvedSummary = engine.codexAssistantSummary(0, "some output")
+    assert(strings.StrContains(approvedSummary, "ok"), "approval: approved summary says ok")
+
+    # Denied/errored turn with output
+    let deniedSummary = engine.codexAssistantSummary(126, "approval denied")
+    assert(strings.StrContains(deniedSummary, "failed"), "approval: denied summary says failed")
+    assert(strings.StrContains(deniedSummary, "126"), "approval: denied summary has rc 126")
+
+    # Success with no output
+    let noOutputSummary = engine.codexAssistantSummary(0, "")
+    assert(strings.StrContains(noOutputSummary, "no output"), "approval: no output summary")
+
+    codexTestPrint("approval_decision_smoke ok")
+    return 0

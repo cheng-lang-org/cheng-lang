@@ -1,0 +1,212 @@
+import std/os
+import std/result
+import std/times
+import std/strings
+import std/strutils as strutil
+import cheng/codex/core/store
+import cheng/codex/core/text as textutil
+import cheng/codex/protocol/types
+
+fn codexTestPrint(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn main(): int32 =
+    let epoch = int32(times.EpochTimeSeconds())
+    let epochStr = intToStr(epoch)
+
+    # ---- Setup: create a temp home ----
+    let homeName = strutil.Join(["codex-skill-store-", epochStr], "")
+    let home = os.JoinPath("/tmp", homeName)
+
+    # ==================================================
+    # PART 1: Plugin storage (proxy for skill storage)
+    # ==================================================
+
+    # ---- 1a. Add a plugin ----
+    let addRes = store.codexStoreAddPlugin(home, "skill-plugin-one")
+    assert(IsOk(addRes), "skill: add plugin one")
+    assert(Value(addRes), "skill: plugin one was newly added")
+
+    # ---- 1b. Add a second plugin ----
+    let addRes2 = store.codexStoreAddPlugin(home, "skill-plugin-two")
+    assert(IsOk(addRes2), "skill: add plugin two")
+
+    # ---- 1c. Add a plugin with path ----
+    let addNamedRes = store.codexStoreSaveNamedPlugin(home, "skill-plugin-path", "/opt/skills/my-skill")
+    assert(IsOk(addNamedRes), "skill: add plugin with path")
+
+    # ---- 1d. List plugins ----
+    let pluginNames = store.codexStoreListPlugins(home)
+    assert(pluginNames.len >= 3, "skill: at least 3 plugins listed")
+    var foundOne = false
+    var foundTwo = false
+    var foundPath = false
+    for i in 0..<pluginNames.len:
+        if pluginNames[i] == "skill-plugin-one":
+            foundOne = true
+        if pluginNames[i] == "skill-plugin-two":
+            foundTwo = true
+        if pluginNames[i] == "skill-plugin-path":
+            foundPath = true
+    assert(foundOne, "skill: plugin one in list")
+    assert(foundTwo, "skill: plugin two in list")
+    assert(foundPath, "skill: plugin path in list")
+
+    # ---- 1e. List plugin specs (with metadata) ----
+    let specs = store.codexStoreListPluginSpecs(home)
+    assert(specs.len >= 3, "skill: at least 3 plugin specs")
+    var foundSpec = false
+    for i in 0..<specs.len:
+        if specs[i].name == "skill-plugin-path":
+            foundSpec = true
+            assert(specs[i].path == "/opt/skills/my-skill", "skill: plugin spec path")
+            assert(specs[i].enabled, "skill: plugin spec enabled")
+    assert(foundSpec, "skill: plugin path spec found")
+
+    # ---- 1f. Get a specific plugin ----
+    let getRes = store.codexStoreGetPluginSpec(home, "skill-plugin-one")
+    assert(IsOk(getRes), "skill: get plugin one")
+    let spec = Value(getRes)
+    assert(spec.name == "skill-plugin-one", "skill: get spec name")
+    assert(spec.enabled, "skill: get spec enabled")
+
+    # ---- 1g. Get non-existent plugin ----
+    let getMissing = store.codexStoreGetPluginSpec(home, "non-existent-plugin")
+    assert(IsErr(getMissing), "skill: get non-existent plugin fails")
+    assert(textutil.codexTextNonEmpty(Error(getMissing)), "skill: get error message non-empty")
+
+    # ---- 1h. Remove a plugin ----
+    let removeRes = store.codexStoreRemovePlugin(home, "skill-plugin-one")
+    assert(IsOk(removeRes), "skill: remove plugin one")
+    assert(Value(removeRes), "skill: plugin one was removed")
+
+    let pluginNamesAfter = store.codexStoreListPlugins(home)
+    var stillFound = false
+    for i in 0..<pluginNamesAfter.len:
+        if pluginNamesAfter[i] == "skill-plugin-one":
+            stillFound = true
+    assert(!stillFound, "skill: plugin one no longer listed after remove")
+
+    # ---- 1i. Remove again (already gone) ----
+    let removeAgain = store.codexStoreRemovePlugin(home, "skill-plugin-one")
+    assert(IsOk(removeAgain), "skill: remove already-removed plugin")
+    assert(!Value(removeAgain), "skill: remove returns false (not removed)")
+
+    # ---- 1j. Add plugin with empty name fails ----
+    let addEmpty = store.codexStoreAddPlugin(home, "")
+    assert(IsErr(addEmpty), "skill: add empty name fails")
+
+    # ---- 1k. Remove plugin with empty name fails ----
+    let removeEmpty = store.codexStoreRemovePlugin(home, "")
+    assert(IsErr(removeEmpty), "skill: remove empty name fails")
+
+    # ==================================================
+    # PART 2: MCP server storage (similar pattern)
+    # ==================================================
+
+    # ---- 2a. Add MCP server ----
+    let mcpAddRes = store.codexStoreAddMcpServer(home, "test-mcp-server")
+    assert(IsOk(mcpAddRes), "skill: add mcp server")
+    assert(Value(mcpAddRes), "skill: mcp server newly added")
+
+    # ---- 2b. Add MCP server with full spec ----
+    var mcpSpec: types.CodexMcpServerSpec
+    mcpSpec.name = "full-mcp-server"
+    mcpSpec.transportKind = "stdio"
+    mcpSpec.launchCommand = "echo mcp"
+    mcpSpec.cwd = "/tmp"
+    mcpSpec.url = ""
+    mcpSpec.bearerTokenEnvVar = ""
+    mcpSpec.enabled = true
+    let mcpSaveRes = store.codexStoreSaveMcpServerSpec(home, mcpSpec)
+    assert(IsOk(mcpSaveRes), "skill: save full mcp spec")
+
+    # ---- 2c. List MCP servers ----
+    let mcpServers = store.codexStoreListMcpServers(home)
+    assert(mcpServers.len >= 2, "skill: at least 2 mcp servers")
+    var foundMcp1 = false
+    var foundMcp2 = false
+    for i in 0..<mcpServers.len:
+        if mcpServers[i] == "test-mcp-server":
+            foundMcp1 = true
+        if mcpServers[i] == "full-mcp-server":
+            foundMcp2 = true
+    assert(foundMcp1, "skill: mcp server in list")
+    assert(foundMcp2, "skill: full mcp in list")
+
+    # ---- 2d. Get specific MCP server ----
+    let mcpGetRes = store.codexStoreGetMcpServerSpec(home, "full-mcp-server")
+    assert(IsOk(mcpGetRes), "skill: get mcp spec")
+    let mcpLoaded = Value(mcpGetRes)
+    assert(mcpLoaded.name == "full-mcp-server", "skill: mcp spec name")
+    assert(mcpLoaded.transportKind == "stdio", "skill: mcp spec transport")
+    assert(mcpLoaded.enabled, "skill: mcp spec enabled")
+
+    # ---- 2e. Remove MCP server ----
+    let mcpRemoveRes = store.codexStoreRemoveMcpServer(home, "test-mcp-server")
+    assert(IsOk(mcpRemoveRes), "skill: remove mcp server")
+    let mcpListAfter = store.codexStoreListMcpServers(home)
+    var mcpRemoved = true
+    for i in 0..<mcpListAfter.len:
+        if mcpListAfter[i] == "test-mcp-server":
+            mcpRemoved = false
+    assert(mcpRemoved, "skill: mcp server no longer listed")
+
+    # ==================================================
+    # PART 3: Generic file-based storage
+    # ==================================================
+
+    # ---- 3a. Write and read text index ----
+    var items: str[]
+    add(items, "skill-item-a")
+    add(items, "skill-item-b")
+    add(items, "skill-item-c")
+    let indexPath = os.JoinPath(home, "skill-index.test")
+    assert(store.codexStoreWriteText(indexPath, store.codexStoreLineIndexText(items)), "skill: write line index")
+    let readLines = store.codexStoreReadNonEmptyLines(indexPath)
+    assert(readLines.len == 3, "skill: read 3 lines")
+    assert(readLines[0] == "skill-item-a", "skill: line[0] content")
+    assert(readLines[1] == "skill-item-b", "skill: line[1] content")
+    assert(readLines[2] == "skill-item-c", "skill: line[2] content")
+
+    # ---- 3b. Store writetext file exists ----
+    assert(store.codexStoreFileExists(indexPath), "skill: index file exists")
+    let rmIndex = os.RemoveFile(indexPath)
+
+    # ---- 3c. Verify has line ----
+    assert(store.codexStoreHasLine(readLines, "skill-item-b"), "skill: has line returns true")
+    assert(!store.codexStoreHasLine(readLines, "skill-item-missing"), "skill: has line returns false")
+
+    # ---- 3d. Add unique line ----
+    let uniquePath = os.JoinPath(home, "unique.test")
+    let addLine1 = store.codexStoreAddUniqueLine(uniquePath, "unique-value-1")
+    assert(IsOk(addLine1), "skill: add unique line 1")
+    assert(Value(addLine1), "skill: line 1 was added (new)")
+    let addLine1Again = store.codexStoreAddUniqueLine(uniquePath, "unique-value-1")
+    assert(IsOk(addLine1Again), "skill: add unique line 1 again")
+    assert(!Value(addLine1Again), "skill: line 1 was not added again (duplicate)")
+    let addLine2 = store.codexStoreAddUniqueLine(uniquePath, "unique-value-2")
+    assert(IsOk(addLine2), "skill: add unique line 2")
+    let uniqueLines = store.codexStoreReadNonEmptyLines(uniquePath)
+    assert(uniqueLines.len == 2, "skill: 2 unique lines")
+    let rmUnique = os.RemoveFile(uniquePath)
+
+    # ---- 3e. Remove line ----
+    let removeLinePath = os.JoinPath(home, "remove.test")
+    let _addA = store.codexStoreAddUniqueLine(removeLinePath, "line-a")
+    let _addB = store.codexStoreAddUniqueLine(removeLinePath, "line-b")
+    let _addC = store.codexStoreAddUniqueLine(removeLinePath, "line-c")
+    let removeLineRes = store.codexStoreRemoveLine(removeLinePath, "line-b")
+    assert(IsOk(removeLineRes), "skill: remove line")
+    assert(Value(removeLineRes), "skill: line was removed")
+    let remaining = store.codexStoreReadNonEmptyLines(removeLinePath)
+    assert(remaining.len == 2, "skill: 2 lines remain after removal")
+    var hasB = false
+    for i in 0..<remaining.len:
+        if remaining[i] == "line-b":
+            hasB = true
+    assert(!hasB, "skill: line-b removed from list")
+    let rmRemove = os.RemoveFile(removeLinePath)
+
+    codexTestPrint("store_skill_smoke ok")
+    return 0

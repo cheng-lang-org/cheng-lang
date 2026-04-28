@@ -130,6 +130,20 @@ type
         errorCount: int32
         firstError: str
 
+    # WorkStealingQueue and FunctionTaskWorkerPool are future ws executor types.
+    # Temporarily using simple int32 placeholders until pure Cheng backend handles generic types.
+    WorkStealingQueue = ref
+        tasks: FunctionTask[]
+        head: int32
+        tail: int32
+        mutex: int32
+
+    FunctionTaskWorkerPool = ref
+        results: FunctionTaskResult[]
+        resultMutex: int32
+        activeWorkers: int32
+        activeMutex: int32
+
 const
     FunctionTaskScheduleSerial = "serial"
     FunctionTaskScheduleWorkStealing = "ws"
@@ -417,3 +431,58 @@ fn FunctionTaskMergeReportSetError(report: var FunctionTaskMergeReport,
     report.errorCount = report.errorCount + 1
     if report.firstError.len <= 0:
         report.firstError = msg
+
+# -- Work-stealing queue operations --
+
+fn WorkStealingQueueNew(): WorkStealingQueue =
+    var q: WorkStealingQueue = new[WorkStealingQueue]()
+    if q != nil:
+        q.head = 0
+        q.tail = 0
+        q.mutex = sync.mutexNew(0)
+    return q
+
+fn WorkStealingQueuePush(q: var WorkStealingQueue, task: FunctionTask): bool =
+    if q == nil:
+        return false
+    let _ = sync.mutexLock(q.mutex)
+    add(q.tasks, task)
+    q.tail = q.tasks.len
+    sync.mutexUnlock(q.mutex)
+    return true
+
+fn WorkStealingQueuePop(q: var WorkStealingQueue): FunctionTask =
+    var empty: FunctionTask
+    empty.funcIndex = InvalidFunctionIndex()
+    if q == nil:
+        return empty
+    let _ = sync.mutexLock(q.mutex)
+    if q.tail <= q.head:
+        sync.mutexUnlock(q.mutex)
+        return empty
+    q.tail = q.tail - 1
+    let task = q.tasks[q.tail]
+    sync.mutexUnlock(q.mutex)
+    return task
+
+fn WorkStealingQueueSteal(q: var WorkStealingQueue): FunctionTask =
+    var empty: FunctionTask
+    empty.funcIndex = InvalidFunctionIndex()
+    if q == nil:
+        return empty
+    let _ = sync.mutexLock(q.mutex)
+    if q.tail <= q.head:
+        sync.mutexUnlock(q.mutex)
+        return empty
+    let task = q.tasks[q.head]
+    q.head = q.head + 1
+    sync.mutexUnlock(q.mutex)
+    return task
+
+fn WorkStealingQueueEmpty(q: var WorkStealingQueue): bool =
+    if q == nil:
+        return true
+    let _ = sync.mutexLock(q.mutex)
+    let empty = q.tail <= q.head
+    sync.mutexUnlock(q.mutex)
+    return empty

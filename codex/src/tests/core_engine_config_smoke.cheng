@@ -1,0 +1,85 @@
+import std/os
+import std/result
+import std/times
+import std/strings
+import std/strutils as strutil
+import cheng/codex/core/engine
+import cheng/codex/core/store
+import cheng/codex/core/text as textutil
+import cheng/codex/protocol/types
+
+fn codexTestPrint(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn main(): int32 =
+    let epoch = int32(times.EpochTimeSeconds())
+    let epochStr = intToStr(epoch)
+
+    # ---- Create a temp home directory ----
+    let homeName = strutil.Join(["codex-config-", epochStr], "")
+    let home = os.JoinPath("/tmp", homeName)
+
+    # ---- codexStoreHome with explicit path ----
+    let resolvedHome = store.codexStoreHome(home)
+    assert(resolvedHome == store.codexStorePathAbsolute(home), "config: store home resolves explicit path")
+
+    # ---- Verify default home paths ----
+    let sessionsDir = store.codexSessionsDir(resolvedHome)
+    assert(strings.StrContains(sessionsDir, "sessions"), "config: sessions dir path")
+    let authPath = store.codexAuthPath(resolvedHome)
+    assert(strings.StrContains(authPath, "auth.env"), "config: auth path")
+    let pluginDir = store.codexPluginsDir(resolvedHome)
+    assert(strings.StrContains(pluginDir, "plugins"), "config: plugins dir")
+    let mcpPath = store.codexMcpPath(resolvedHome)
+    assert(strings.StrContains(mcpPath, "mcp_servers.env"), "config: mcp path")
+    let lastSessionPath = store.codexLastSessionPath(resolvedHome)
+    assert(strings.StrContains(lastSessionPath, "last_session"), "config: last session path")
+    let sessionIndexPath = store.codexSessionIndexPath(resolvedHome)
+    assert(strings.StrContains(sessionIndexPath, "sessions.index"), "config: session index path")
+
+    # ---- Save auth key (config) ----
+    let saveAuthRes = store.codexStoreSaveApiKey(resolvedHome, "config-test-key-abc")
+    assert(IsOk(saveAuthRes), "config: save api key")
+
+    # ---- Read back auth key ----
+    let loadedKey = store.codexStoreReadApiKey(resolvedHome)
+    assert(loadedKey == "config-test-key-abc", "config: read api key matches")
+
+    # ---- Verify auth file exists ----
+    let actualAuthPath = store.codexAuthPath(resolvedHome)
+    assert(store.codexStoreFileExists(actualAuthPath), "config: auth file exists")
+
+    # ---- Save a different key (overwrite) ----
+    let saveAuthRes2 = store.codexStoreSaveApiKey(resolvedHome, "updated-key-xyz")
+    assert(IsOk(saveAuthRes2), "config: save updated api key")
+    let loadedKey2 = store.codexStoreReadApiKey(resolvedHome)
+    assert(loadedKey2 == "updated-key-xyz", "config: read updated api key")
+
+    # ---- Clear auth key ----
+    assert(store.codexStoreClearApiKey(resolvedHome), "config: clear api key")
+    let loadedKey3 = store.codexStoreReadApiKey(resolvedHome)
+    assert(loadedKey3 == "", "config: api key cleared")
+
+    # ---- Write and read an arbitrary config file ----
+    let configFilePath = os.JoinPath(resolvedHome, "config.test")
+    let configContent = strutil.Join(["key1=value1\n", "key2=value2\n"], "")
+    assert(store.codexStoreWriteText(configFilePath, configContent), "config: write config file")
+    let readConfig = store.codexStoreReadText(configFilePath)
+    assert(readConfig == configContent, "config: read config file content")
+    let rmConfig = os.RemoveFile(configFilePath)
+
+    # ---- EnsureDir ----
+    let nestedDir = os.JoinPath(resolvedHome, "a", "b", "c")
+    assert(store.codexStoreEnsureDir(nestedDir), "config: ensure nested dir")
+    assert(os.DirExists(nestedDir), "config: nested dir exists")
+
+    # ---- WriteText with ensureDir ----
+    let deepPath = os.JoinPath(nestedDir, "deep.txt")
+    assert(store.codexStoreWriteText(deepPath, "deep-content"), "config: write to deep path")
+    assert(store.codexStoreFileExists(deepPath), "config: deep file exists")
+    let deepContent = store.codexStoreReadText(deepPath)
+    assert(deepContent == "deep-content", "config: deep file content")
+    let rmDeep = os.RemoveFile(deepPath)
+
+    codexTestPrint("core_engine_config_smoke ok")
+    return 0

@@ -1,0 +1,131 @@
+import std/os
+import std/result
+import std/times
+import std/strings
+import std/strutils as strutil
+import cheng/codex/core/engine
+import cheng/codex/core/store
+import cheng/codex/protocol/types
+
+fn codexTestPrint(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn main(): int32 =
+    let epoch = int32(times.EpochTimeSeconds())
+    let homeName = strutil.Join(["codex-multi-turn-", intToStr(epoch)], "")
+    let home = os.JoinPath("/tmp", homeName)
+    let cwd = os.GetCurrentDir()
+
+    # ---- Step 1: Create initial session ----
+    let session = engine.codexNewSession(cwd, "Multi-Turn Test", "multi turn test", "")
+    assert(session.sessionId != "", "multi: session id generated")
+    assert(session.turns.len == 0, "multi: initial turns empty")
+
+    # Save the empty session
+    let saveInit = store.codexStoreSessionWrite(home, session)
+    assert(IsOk(saveInit), "multi: save initial session")
+
+    # ---- Step 2: Turn 1 ----
+    var req1: types.CodexExecRequest
+    req1.sessionId = session.sessionId
+    req1.promptText = "first command"
+    req1.commandText = "echo turn-one"
+    req1.autoApprove = true
+    let res1 = engine.codexExecuteShell(home, req1)
+    assert(IsOk(res1), "multi: exec turn 1")
+    let run1 = Value(res1)
+    assert(run1.ok, "multi: turn 1 succeeded")
+    assert(strings.StrContains(run1.outputText, "turn-one"), "multi: turn 1 output correct")
+
+    # Verify session has 1 turn
+    let load1 = store.codexStoreSessionRead(home, session.sessionId)
+    assert(IsOk(load1), "multi: load after turn 1")
+    let sess1 = Value(load1)
+    assert(sess1.turns.len == 1, "multi: turn count after turn 1")
+    assert(sess1.turns[0].commandText == "echo turn-one", "multi: turn[0] command")
+    assert(sess1.turns[0].promptText == "first command", "multi: turn[0] prompt")
+
+    # ---- Step 3: Turn 2 (same session) ----
+    var req2: types.CodexExecRequest
+    req2.sessionId = session.sessionId
+    req2.promptText = "second command"
+    req2.commandText = "echo turn-two"
+    req2.autoApprove = true
+    let res2 = engine.codexExecuteShell(home, req2)
+    assert(IsOk(res2), "multi: exec turn 2")
+    let run2 = Value(res2)
+    assert(run2.ok, "multi: turn 2 succeeded")
+
+    # Verify session has 2 turns
+    let load2 = store.codexStoreSessionRead(home, session.sessionId)
+    assert(IsOk(load2), "multi: load after turn 2")
+    let sess2 = Value(load2)
+    assert(sess2.turns.len == 2, "multi: turn count after turn 2")
+    assert(sess2.turns[1].commandText == "echo turn-two", "multi: turn[1] command")
+    assert(sess2.turns[1].promptText == "second command", "multi: turn[1] prompt")
+
+    # ---- Step 4: Turn 3 (same session) ----
+    var req3: types.CodexExecRequest
+    req3.sessionId = session.sessionId
+    req3.promptText = "third command"
+    req3.commandText = "echo turn-three"
+    req3.autoApprove = true
+    let res3 = engine.codexExecuteShell(home, req3)
+    assert(IsOk(res3), "multi: exec turn 3")
+    let run3 = Value(res3)
+    assert(run3.ok, "multi: turn 3 succeeded")
+
+    # ---- Step 5: Verify final session state ----
+    let loadFinal = store.codexStoreSessionRead(home, session.sessionId)
+    assert(IsOk(loadFinal), "multi: load final")
+    let sessFinal = Value(loadFinal)
+    assert(sessFinal.turns.len == 3, "multi: final turn count == 3")
+    assert(sessFinal.turns.len == 3, "multi: assert 3 turns")
+
+    # Verify turn ordering and content
+    assert(sessFinal.turns[0].commandText == "echo turn-one", "multi: turn[0] is first")
+    assert(sessFinal.turns[1].commandText == "echo turn-two", "multi: turn[1] is second")
+    assert(sessFinal.turns[2].commandText == "echo turn-three", "multi: turn[2] is third")
+
+    # Verify all approved
+    assert(sessFinal.turns[0].approved, "multi: turn[0] approved")
+    assert(sessFinal.turns[1].approved, "multi: turn[1] approved")
+    assert(sessFinal.turns[2].approved, "multi: turn[2] approved")
+
+    # Verify all exit codes are 0
+    assert(sessFinal.turns[0].exitCode == 0, "multi: turn[0] exit code 0")
+    assert(sessFinal.turns[1].exitCode == 0, "multi: turn[1] exit code 0")
+    assert(sessFinal.turns[2].exitCode == 0, "multi: turn[2] exit code 0")
+
+    # Verify all prompt texts
+    assert(sessFinal.turns[0].promptText == "first command", "multi: turn[0] prompt")
+    assert(sessFinal.turns[1].promptText == "second command", "multi: turn[1] prompt")
+    assert(sessFinal.turns[2].promptText == "third command", "multi: turn[2] prompt")
+
+    # ---- Step 6: Verify session metadata ----
+    assert(sessFinal.lastExitCode == 0, "multi: session last exit code 0")
+    assert(sessFinal.sessionId == session.sessionId, "multi: session id preserved")
+
+    # ---- Step 7: Verify session listing ----
+    let sessions = store.codexStoreListSessions(home)
+    assert(sessions.len >= 1, "multi: at least one session in index")
+
+    # Find our session in the listing
+    var found = false
+    for i in 0..<sessions.len:
+        if sessions[i].sessionId == session.sessionId:
+            found = true
+            assert(sessions[i].turnCount == 3, "multi: summary turn count 3")
+            assert(sessions[i].lastExitCode == 0, "multi: summary last exit code 0")
+    assert(found, "multi: session found in listing")
+
+    # ---- Step 8: Load last session and verify ----
+    let lastRes = store.codexStoreLoadLastSession(home)
+    assert(IsOk(lastRes), "multi: load last session")
+    let lastSession = Value(lastRes)
+    assert(lastSession.turns.len == 3, "multi: last session has 3 turns")
+    assert(lastSession.turns[len(lastSession.turns) - 1].commandText == "echo turn-three",
+           "multi: last turn is turn three")
+
+    codexTestPrint("core_engine_multi_turn_smoke ok")
+    return 0

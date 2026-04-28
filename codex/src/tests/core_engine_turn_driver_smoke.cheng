@@ -1,0 +1,88 @@
+import std/os
+import std/result
+import std/times
+import std/strings
+import std/strutils as strutil
+import cheng/codex/core/engine
+import cheng/codex/core/store
+import cheng/codex/core/text as textutil
+import cheng/codex/protocol/types
+
+fn codexTestPrint(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn main(): int32 =
+    let epoch = int32(times.EpochTimeSeconds())
+    let homeName = strutil.Join(["codex-turn-driver-", intToStr(epoch)], "")
+    let home = os.JoinPath("/tmp", homeName)
+    let cwd = os.GetCurrentDir()
+
+    # ---- Create a new session via engine ----
+    let session = engine.codexNewSession(cwd, "Turn Driver Test", "create session", "echo first")
+    assert(textutil.codexTextNonEmpty(session.sessionId), "turn: session id generated")
+    assert(session.title == "Turn Driver Test", "turn: session title")
+    assert(session.cwd == cwd, "turn: session cwd")
+    assert(session.turns.len == 0, "turn: initially no turns")
+
+    # ---- Save the empty session ----
+    let saveEmpty = store.codexStoreSessionWrite(home, session)
+    assert(IsOk(saveEmpty), "turn: save empty session")
+
+    # ---- Append a turn ----
+    var mutableSession = session
+    engine.codexAppendTurn(mutableSession,
+                           "run echo test",
+                           "echo turn-driver-output",
+                           "turn-driver-output",
+                           0,
+                           true)
+    assert(mutableSession.turns.len == 1, "turn: one turn after append")
+    assert(mutableSession.turns[0].promptText == "run echo test", "turn: turn[0] prompt")
+    assert(mutableSession.turns[0].commandText == "echo turn-driver-output", "turn: turn[0] command")
+    assert(mutableSession.turns[0].outputText == "turn-driver-output", "turn: turn[0] output")
+    assert(mutableSession.turns[0].exitCode == 0, "turn: turn[0] exit code")
+    assert(mutableSession.turns[0].approved, "turn: turn[0] approved")
+    assert(mutableSession.lastExitCode == 0, "turn: session last exit code after append")
+
+    # ---- Check assistant summary ----
+    let assistantText = mutableSession.turns[0].assistantText
+    assert(textutil.codexTextNonEmpty(assistantText), "turn: assistant summary generated")
+    assert(strings.StrContains(assistantText, "ok"), "turn: assistant text mentions ok")
+
+    # ---- Save session with turns ----
+    let saveTurns = store.codexStoreSessionWrite(home, mutableSession)
+    assert(IsOk(saveTurns), "turn: save session with turns")
+
+    # ---- Load session back and verify ----
+    let loadRes = store.codexStoreSessionRead(home, mutableSession.sessionId)
+    assert(IsOk(loadRes), "turn: load session")
+    let loaded = Value(loadRes)
+    assert(loaded.turns.len == 1, "turn: loaded turn count")
+    assert(loaded.turns[0].commandText == "echo turn-driver-output", "turn: loaded turn command")
+    assert(loaded.turns[0].outputText == "turn-driver-output", "turn: loaded turn output")
+    assert(loaded.turns[0].exitCode == 0, "turn: loaded turn exit code")
+
+    # ---- Append a second turn ----
+    engine.codexAppendTurn(mutableSession,
+                           "second prompt",
+                           "echo second-turn",
+                           "second-turn-output",
+                           0,
+                           false)
+    assert(mutableSession.turns.len == 2, "turn: two turns")
+    assert(!mutableSession.turns[1].approved, "turn: second turn not approved")
+
+    # ---- Verify turn ordering ----
+    assert(mutableSession.turns[0].commandText == "echo turn-driver-output", "turn: turn[0] unchanged")
+    assert(mutableSession.turns[1].commandText == "echo second-turn", "turn: turn[1] is second")
+
+    # ---- Test that load-last-session works ----
+    let saveTwo = store.codexStoreSessionWrite(home, mutableSession)
+    assert(IsOk(saveTwo), "turn: save two-turn session")
+    let lastRes = store.codexStoreLoadLastSession(home)
+    assert(IsOk(lastRes), "turn: load last session")
+    let lastSession = Value(lastRes)
+    assert(lastSession.turns.len == 2, "turn: last session turn count")
+
+    codexTestPrint("core_engine_turn_driver_smoke ok")
+    return 0

@@ -379,6 +379,88 @@ fn MachOTextExecutableBytes(text: Bytes,
     obuf.ObjectBufferWriteBytes(out, text)
     return Ok[Bytes](obuf.ObjectBufferToBytes(out))
 
+fn MachOTextDataExecutableBytes(text: Bytes,
+                                 data: Bytes,
+                                 entryTextOffset: int32): Result[Bytes] =
+    let dataSize = BytesLen(data)
+    if dataSize <= 0:
+        return MachOTextExecutableBytes(text, entryTextOffset)
+    let textSize = BytesLen(text)
+    if textSize <= 0:
+        return Err[Bytes](" macho executable writer: missing text")
+    if entryTextOffset < 0 || entryTextOffset >= textSize:
+        return Err[Bytes](" macho executable writer: entry offset out of range")
+    let segmentSize = MachOSegmentCommandSize + MachOSection64Size
+    let loadCommandBytes = segmentSize * 2 + MachOEntryPointCommandSize
+    let textOffset = MachOHeaderSize + loadCommandBytes
+    let dataFileOffset = MachOAlign(textOffset + textSize, 8)
+    let textFileEnd = textOffset + textSize
+    let textVmEnd = MachOAlign(textFileEnd, MachOPageSize)
+    let dataVmEnd = MachOAlign(dataFileOffset + dataSize, MachOPageSize)
+    let textVmSize = textVmEnd
+    let dataVmAddr = UInt64(MachOVmBase) + UInt64(textVmEnd)
+    var dataVmSize = dataVmEnd - textVmEnd
+    if dataVmSize <= 0:
+        dataVmSize = MachOPageSize
+    let entryFileOffset = textOffset + entryTextOffset
+    var out = obuf.ObjectBufferInit(dataFileOffset + dataSize + 64)
+    MachOWriteHeader64(out,
+                       MachOFileTypeExecute,
+                       3,
+                       loadCommandBytes,
+                       0x200001)
+    obuf.ObjectBufferWriteU32LE(out, UInt64(MachOLoadCommandSegment64))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(segmentSize))
+    MachOWritePaddedAscii(out, "__TEXT", 16)
+    obuf.ObjectBufferWriteU64LE(out, UInt64(MachOVmBase))
+    obuf.ObjectBufferWriteU64LE(out, UInt64(textVmSize))
+    obuf.ObjectBufferWriteU64LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU64LE(out, UInt64(textFileEnd))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(5))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(5))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(1))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    MachOWritePaddedAscii(out, "__text", 16)
+    MachOWritePaddedAscii(out, "__TEXT", 16)
+    obuf.ObjectBufferWriteU64LE(out, UInt64(MachOVmBase) + UInt64(textOffset))
+    obuf.ObjectBufferWriteU64LE(out, UInt64(textSize))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(textOffset))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(2))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0x80000400))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(MachOLoadCommandSegment64))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(segmentSize))
+    MachOWritePaddedAscii(out, "__DATA", 16)
+    obuf.ObjectBufferWriteU64LE(out, dataVmAddr)
+    obuf.ObjectBufferWriteU64LE(out, UInt64(dataVmSize))
+    obuf.ObjectBufferWriteU64LE(out, UInt64(dataFileOffset))
+    obuf.ObjectBufferWriteU64LE(out, UInt64(dataSize))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(3))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(3))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(1))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    MachOWritePaddedAscii(out, "__data", 16)
+    MachOWritePaddedAscii(out, "__DATA", 16)
+    obuf.ObjectBufferWriteU64LE(out, dataVmAddr)
+    obuf.ObjectBufferWriteU64LE(out, UInt64(dataSize))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(dataFileOffset))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(3))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU32LE(out, UInt64(0))
+    MachOWriteEntryPointCommand(out, entryFileOffset)
+    obuf.ObjectBufferWriteBytes(out, text)
+    obuf.ObjectBufferAlign(out, 8, 0)
+    obuf.ObjectBufferWriteBytes(out, data)
+    return Ok[Bytes](obuf.ObjectBufferToBytes(out))
+
 fn MachOTextObjectWrite(rootDir: str,
                          outputPath: str,
                          text: Bytes,
@@ -403,6 +485,25 @@ fn MachOTextExecutableWrite(rootDir: str,
                              text: Bytes,
                              entryTextOffset: int32): Result[MachOObjectWriterResult] =
     let bytesRes = MachOTextExecutableBytes(text, entryTextOffset)
+    if IsErr(bytesRes):
+        return Err[MachOObjectWriterResult](Error(bytesRes))
+    let bytes = Value(bytesRes)
+    let payload = BytesToString(bytes)
+    if !chengpath.WriteTextFile(rootDir, outputPath, payload):
+        return Err[MachOObjectWriterResult](Fmt" macho executable writer: failed to write executable: {outputPath}")
+    var out: MachOObjectWriterResult
+    out.objectPath = outputPath
+    out.bytesWritten = BytesLen(bytes)
+    out.symbolCount = 0
+    out.relocCount = 0
+    return Ok[MachOObjectWriterResult](out)
+
+fn MachOTextDataExecutableWrite(rootDir: str,
+                                 outputPath: str,
+                                 text: Bytes,
+                                 data: Bytes,
+                                 entryTextOffset: int32): Result[MachOObjectWriterResult] =
+    let bytesRes = MachOTextDataExecutableBytes(text, data, entryTextOffset)
     if IsErr(bytesRes):
         return Err[MachOObjectWriterResult](Error(bytesRes))
     let bytes = Value(bytesRes)

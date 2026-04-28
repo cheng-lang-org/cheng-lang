@@ -28,6 +28,45 @@ fn BodyIrNoAliasIsPtrDerefLoad(op: coreir.BodyOp): bool =
            op.operands.len >= 3 &&
            op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag
 
+fn BodyIrAnalyzeOwnership(bodyIR: var coreir.BodyIR) =
+    if bodyIR.localSlots.len <= 0:
+        return
+    var refCount: int32[]
+    for _ in 0..<bodyIR.localSlots.len:
+        add(refCount, 0)
+    for opIndex in 0..<bodyIR.ops.len:
+        let op = bodyIR.ops[opIndex]
+        if BodyIrNoAliasLocalValid(bodyIR, op.target):
+            refCount[op.target] = refCount[op.target] + 1
+        if op.kind == coreir.BodyOpCallTag:
+            var callOrdinal = 0
+            for ci in 0..<bodyIR.callSequence.len:
+                if bodyIR.callSequence[ci].resultSlot == op.target:
+                    callOrdinal = ci
+                    break
+            if callOrdinal < bodyIR.callSequence.len:
+                let args = bodyIR.callSequence[callOrdinal].argSlots
+                for ai in 0..<args.len:
+                    if BodyIrNoAliasLocalValid(bodyIR, args[ai]):
+                        refCount[args[ai]] = refCount[args[ai]] + 1
+        elif op.kind == coreir.BodyOpCopyLocalTag ||
+             op.kind == coreir.BodyOpStoreLocalTag:
+            if op.operands.len > 0 && !BodyIrNoAliasIsPtrDerefLoad(op):
+                let srcSlot = op.operands[0]
+                if BodyIrNoAliasLocalValid(bodyIR, srcSlot):
+                    refCount[srcSlot] = refCount[srcSlot] + 1
+        elif op.kind == coreir.BodyOpLoadLocalTag:
+            if op.operands.len > 0 && !BodyIrNoAliasIsPtrDerefLoad(op):
+                let srcSlot = op.operands[0]
+                if BodyIrNoAliasLocalValid(bodyIR, srcSlot):
+                    refCount[srcSlot] = refCount[srcSlot] + 1
+        elif op.operands.len > 0:
+            for oi in 0..<op.operands.len:
+                if BodyIrNoAliasLocalValid(bodyIR, op.operands[oi]):
+                    refCount[op.operands[oi]] = refCount[op.operands[oi]] + 1
+    for si in 0..<bodyIR.localSlots.len:
+        bodyIR.localSlots[si].noAlias = refCount[si] <= 1
+
 fn BodyIrNoAliasForwardLocals(bodyIR: coreir.BodyIR): coreir.BodyIR =
     if bodyIR.blocks.len > 0 || bodyIR.terms.len > 0:
         return bodyIR

@@ -161,6 +161,9 @@ type
         importc: bool
         explicitExportName: str
         surfaceKeyword: str
+        ffiMapPtrArg: int32
+        ffiMapLenArg: int32
+        ffiOutPtrArgs: str
 
     NormalizedTypeDecl =
         name: str
@@ -6405,6 +6408,89 @@ fn ParserIsImportcAnnotation(lineRaw: str): bool =
 fn ParserIsImportcAnnotationExact(line: str): bool =
     return ParserStartsWithExact(line, "@importc(")
 
+fn ParserFfiMapAnnotationExact(line: str): bool =
+    return ParserStartsWithExact(line, "@ffi_map(")
+
+fn ParserFfiOutPtrsAnnotationExact(line: str): bool =
+    return ParserStartsWithExact(line, "@ffi_out_ptrs(")
+
+fn ParserArgIndexFromName(name: str): int32 =
+    if !ParserStartsWithExact(name, "arg"):
+        return -1
+    let numPart = chengpath.TextSlice(name, 3, name.len - 3)
+    if numPart.len <= 0:
+        return -1
+    var val: int32
+    for i in 0..<numPart.len:
+        let ch = numPart[i]
+        if ch < '0' || ch > '9':
+            return -1
+        val = val * 10 + Int32(ch - '0')
+    return val
+
+fn ParserParseFfiMapAnnotation(line: str,
+                                ptrArg: var int32,
+                                lenArg: var int32): bool =
+    ptrArg = -1
+    lenArg = -1
+    if !ParserFfiMapAnnotationExact(line):
+        return false
+    let openPos = ParserFindText(line, "(")
+    let closePos = ParserFindText(line, ")")
+    if openPos < 0 || closePos <= openPos:
+        return false
+    let content = chengpath.TextSlice(line, openPos + 1, closePos - openPos - 1)
+    let parts = ParserSplitTopLevelCsv(content)
+    if parts.len == 0:
+        return false
+    var hasEquals = false
+    for i in 0..<parts.len:
+        if ParserFindText(chengpath.PathTrim(parts[i]), "=") >= 0:
+            hasEquals = true
+            break
+    if !hasEquals && parts.len == 2:
+        ptrArg = ParserArgIndexFromName(chengpath.PathTrim(parts[0]))
+        lenArg = ParserArgIndexFromName(chengpath.PathTrim(parts[1]))
+    else:
+        for i in 0..<parts.len:
+            let part = chengpath.PathTrim(parts[i])
+            let eqPos = ParserFindText(part, "=")
+            if eqPos < 0:
+                continue
+            let key = chengpath.PathTrim(chengpath.TextSlice(part, 0, eqPos))
+            let value = chengpath.PathTrim(chengpath.TextSlice(part, eqPos + 1, part.len - eqPos - 1))
+            let idx = ParserArgIndexFromName(value)
+            if idx < 0:
+                continue
+            if key == "ptr":
+                ptrArg = idx
+            elif key == "len":
+                lenArg = idx
+    return true
+
+fn ParserParseFfiOutPtrsAnnotation(line: str): str =
+    if !ParserFfiOutPtrsAnnotationExact(line):
+        return ""
+    let openPos = ParserFindText(line, "(")
+    let closePos = ParserFindText(line, ")")
+    if openPos < 0 || closePos <= openPos:
+        return ""
+    let content = chengpath.TextSlice(line, openPos + 1, closePos - openPos - 1)
+    let parts = ParserSplitTopLevelCsv(content)
+    if parts.len == 0:
+        return ""
+    var indices: int32[]
+    for i in 0..<parts.len:
+        let idx = ParserArgIndexFromName(chengpath.PathTrim(parts[i]))
+        if idx >= 0:
+            add(indices, idx)
+    if indices.len <= 0:
+        return ""
+    var out: str = IntToStr(indices[0])
+    for i in 1..<indices.len:
+        out = ParserConcat3(out, ",", IntToStr(indices[i]))
+    return out
+
 fn ParserHasLeadingIndent(lineRaw: str): bool =
     if Len(lineRaw) <= 0:
         return false
@@ -6543,6 +6629,9 @@ fn ParserReadNormalizedFunctionDeclsLines(lines: str[],
     decls = emptyDecls
     var pendingImportc = false
     var pendingExplicitExportName: str
+    var pendingFfiMapPtrArg: int32 = -1
+    var pendingFfiMapLenArg: int32 = -1
+    var pendingFfiOutPtrArgs: str
     for i in 0..<lines.len:
         if i % 256 == 0:
             os.ProcessResourceGuardCheck()
@@ -6567,6 +6656,15 @@ fn ParserReadNormalizedFunctionDeclsLines(lines: str[],
                 pendingImportc = true
                 pendingExplicitExportName = ""
                 continue
+            var ffiMapPtr: int32
+            var ffiMapLen: int32
+            if ParserParseFfiMapAnnotation(trimmed, ffiMapPtr, ffiMapLen):
+                pendingFfiMapPtrArg = ffiMapPtr
+                pendingFfiMapLenArg = ffiMapLen
+                continue
+            if ParserFfiOutPtrsAnnotationExact(trimmed):
+                pendingFfiOutPtrArgs = ParserParseFfiOutPtrsAnnotation(trimmed)
+                continue
             continue
         var keyword: str
         let prefixLen = ParserTopLevelFunctionPrefixLenKeywordRange(lineRaw,
@@ -6576,6 +6674,9 @@ fn ParserReadNormalizedFunctionDeclsLines(lines: str[],
         if keyword == "":
             pendingImportc = false
             pendingExplicitExportName = ""
+            pendingFfiMapPtrArg = -1
+            pendingFfiMapLenArg = -1
+            pendingFfiOutPtrArgs = ""
             continue
         if keyword != "fn":
             err = ParserConcat3("unsupported top-level function alias '", keyword, "'")
@@ -6587,6 +6688,9 @@ fn ParserReadNormalizedFunctionDeclsLines(lines: str[],
         if functionName == "":
             pendingImportc = false
             pendingExplicitExportName = ""
+            pendingFfiMapPtrArg = -1
+            pendingFfiMapLenArg = -1
+            pendingFfiOutPtrArgs = ""
             continue
         let inlineImportc = prefixLen == Len("importc fn ")
         var decl: NormalizedFunctionDecl
@@ -6595,9 +6699,15 @@ fn ParserReadNormalizedFunctionDeclsLines(lines: str[],
         decl.importc = pendingImportc || inlineImportc
         decl.explicitExportName = decl.importc ? "" : pendingExplicitExportName
         decl.surfaceKeyword = inlineImportc ? "importc fn" : "fn"
+        decl.ffiMapPtrArg = pendingFfiMapPtrArg
+        decl.ffiMapLenArg = pendingFfiMapLenArg
+        decl.ffiOutPtrArgs = pendingFfiOutPtrArgs
         add(decls, decl)
         pendingImportc = false
         pendingExplicitExportName = ""
+        pendingFfiMapPtrArg = -1
+        pendingFfiMapLenArg = -1
+        pendingFfiOutPtrArgs = ""
     err = ""
     return true
 

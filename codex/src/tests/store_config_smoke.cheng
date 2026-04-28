@@ -1,0 +1,151 @@
+import std/os
+import std/result
+import std/times
+import std/strings
+import std/strutils as strutil
+import cheng/codex/core/store
+import cheng/codex/core/text as textutil
+import cheng/codex/protocol/types
+
+fn codexTestPrint(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn main(): int32 =
+    let epoch = int32(times.EpochTimeSeconds())
+    let epochStr = intToStr(epoch)
+
+    # ---- Setup: create a temp home ----
+    let homeName = strutil.Join(["codex-store-config-", epochStr], "")
+    let home = os.JoinPath("/tmp", homeName)
+    let cwd = os.GetCurrentDir()
+
+    # -----------------------------------------------
+    # 1. Build a session with one turn
+    # -----------------------------------------------
+    var session: types.CodexSession
+    session.sessionId = strutil.Join(["store-config-session-", epochStr], "")
+    session.title = "Store Config Round Trip"
+    session.cwd = cwd
+    session.createdAt = times.EpochTimeSeconds()
+    session.updatedAt = session.createdAt
+    session.lastExitCode = -1
+
+    var turn: types.CodexTurn
+    turn.promptText = "store config test"
+    turn.commandText = "echo store-test"
+    turn.outputText = "store-test-output"
+    turn.assistantText = "command ok rc=0"
+    turn.exitCode = 0
+    turn.approved = true
+    add(session.turns, turn)
+
+    # -----------------------------------------------
+    # 2. Write session via store
+    # -----------------------------------------------
+    let writeRes = store.codexStoreSessionWrite(home, session)
+    assert(IsOk(writeRes), "store-config: write session")
+
+    # -----------------------------------------------
+    # 3. Read session back
+    # -----------------------------------------------
+    let readRes = store.codexStoreSessionRead(home, session.sessionId)
+    assert(IsOk(readRes), "store-config: read session")
+    let loaded = Value(readRes)
+
+    # -----------------------------------------------
+    # 4. Assert all fields match
+    # -----------------------------------------------
+    assert(loaded.sessionId == session.sessionId, "store-config: session id match")
+    assert(loaded.title == session.title, "store-config: title match")
+    assert(loaded.cwd == session.cwd, "store-config: cwd match")
+    assert(loaded.createdAt == session.createdAt, "store-config: created at match")
+    assert(loaded.updatedAt >= session.updatedAt, "store-config: updated at >= original")
+    assert(loaded.lastExitCode == -1, "store-config: last exit code match")
+    assert(loaded.turns.len == 1, "store-config: turn count match")
+    assert(loaded.turns[0].promptText == "store config test", "store-config: turn prompt match")
+    assert(loaded.turns[0].commandText == "echo store-test", "store-config: turn command match")
+    assert(loaded.turns[0].outputText == "store-test-output", "store-config: turn output match")
+    assert(loaded.turns[0].exitCode == 0, "store-config: turn exit code match")
+    assert(loaded.turns[0].approved, "store-config: turn approved match")
+
+    # -----------------------------------------------
+    # 5. Add a second turn, write, read back
+    # -----------------------------------------------
+    var turn2: types.CodexTurn
+    turn2.promptText = "second turn"
+    turn2.commandText = "echo second"
+    turn2.outputText = "second-output"
+    turn2.assistantText = "command ok rc=0"
+    turn2.exitCode = 0
+    turn2.approved = true
+
+    var mutableSession = loaded
+    add(mutableSession.turns, turn2)
+    mutableSession.lastExitCode = 0
+    mutableSession.updatedAt = times.EpochTimeSeconds()
+
+    let writeRes2 = store.codexStoreSessionWrite(home, mutableSession)
+    assert(IsOk(writeRes2), "store-config: write session with 2 turns")
+
+    let readRes2 = store.codexStoreSessionRead(home, mutableSession.sessionId)
+    assert(IsOk(readRes2), "store-config: read session with 2 turns")
+    let loaded2 = Value(readRes2)
+    assert(loaded2.turns.len == 2, "store-config: 2 turns after re-write")
+    assert(loaded2.turns[0].commandText == "echo store-test", "store-config: turn[0] preserved")
+    assert(loaded2.turns[1].commandText == "echo second", "store-config: turn[1] is new")
+
+    # -----------------------------------------------
+    # 6. Test session summary round-trip
+    # -----------------------------------------------
+    let summary = store.codexStoreSummaryFromSession(loaded2)
+    assert(summary.sessionId == mutableSession.sessionId, "store-config: summary id")
+    assert(summary.title == mutableSession.title, "store-config: summary title")
+    assert(summary.cwd == mutableSession.cwd, "store-config: summary cwd")
+    assert(summary.updatedAt == mutableSession.updatedAt, "store-config: summary updated at")
+    assert(summary.lastExitCode == mutableSession.lastExitCode, "store-config: summary last exit code")
+    assert(summary.turnCount == 2, "store-config: summary turn count")
+
+    # Test summary serialization (line format)
+    let line = store.codexStoreSummaryLine(summary)
+    assert(textutil.codexTextNonEmpty(line), "store-config: summary line non-empty")
+    var parsedSummary: types.CodexSessionSummary
+    assert(store.codexStoreSummaryFromLine(line, parsedSummary), "store-config: parse summary line")
+    assert(parsedSummary.sessionId == summary.sessionId, "store-config: parsed summary id")
+    assert(parsedSummary.turnCount == 2, "store-config: parsed summary turn count")
+
+    # -----------------------------------------------
+    # 7. Test session index
+    # -----------------------------------------------
+    let sessions = store.codexStoreListSessions(home)
+    assert(sessions.len >= 1, "store-config: at least one session in index")
+    var found = false
+    for i in 0..<sessions.len:
+        if sessions[i].sessionId == mutableSession.sessionId:
+            found = true
+            assert(sessions[i].turnCount == 2, "store-config: index turn count")
+    assert(found, "store-config: session found in index")
+
+    # -----------------------------------------------
+    # 8. Test count sessions
+    # -----------------------------------------------
+    let count = store.codexStoreCountSessions(home)
+    assert(count >= 1, "store-config: session count >= 1")
+
+    # -----------------------------------------------
+    # 9. Test last session load
+    # -----------------------------------------------
+    let lastRes = store.codexStoreLoadLastSession(home)
+    assert(IsOk(lastRes), "store-config: load last session")
+    let lastSession = Value(lastRes)
+    assert(lastSession.sessionId == mutableSession.sessionId, "store-config: last session matches")
+    assert(lastSession.turns.len == 2, "store-config: last session turn count")
+
+    # -----------------------------------------------
+    # 10. Test session text generation
+    # -----------------------------------------------
+    let sessionText = store.codexStoreSessionText(session)
+    assert(textutil.codexTextNonEmpty(sessionText), "store-config: session text non-empty")
+    assert(strings.StrContains(sessionText, "store_config_test"), "store-config: session text contains hex prompt")
+
+    codexTestPrint("store_config_smoke ok")
+    return 0

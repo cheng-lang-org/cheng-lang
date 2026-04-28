@@ -1,0 +1,165 @@
+import std/os
+import std/result
+import std/times
+import std/strings
+import std/strutils as strutil
+import cheng/codex/core/engine
+import cheng/codex/core/store
+import cheng/codex/core/text as textutil
+import cheng/codex/protocol/types
+
+fn codexTestPrint(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn main(): int32 =
+    let epoch = int32(times.EpochTimeSeconds())
+    let epochStr = intToStr(epoch)
+    let homeName = strutil.Join(["codex-cli-exec-", epochStr], "")
+    let home = os.JoinPath("/tmp", homeName)
+    let cwd = os.GetCurrentDir()
+
+    # ============================================================
+    # Test 1: Basic shell exec with simple command
+    # ============================================================
+    var req1: types.CodexExecRequest
+    req1.cwd = cwd
+    req1.promptText = "exec test one"
+    req1.commandText = "printf cli-exec-smoke"
+    req1.autoApprove = true
+    let execRes1 = engine.codexExecuteShell(home, req1)
+    assert(IsOk(execRes1), "cli-exec: exec result ok")
+    let run1 = Value(execRes1)
+    assert(run1.ok, "cli-exec: shell rc ok")
+    assert(run1.outputText == "cli-exec-smoke", "cli-exec: output correct")
+    assert(run1.exitCode == 0, "cli-exec: exit code 0")
+    assert(textutil.codexTextNonEmpty(run1.assistantText), "cli-exec: assistant text present")
+    assert(strings.StrContains(run1.assistantText, "ok"), "cli-exec: assistant text says ok")
+
+    # ---- Verify session was persisted ----
+    let lastRes1 = store.codexStoreLoadLastSession(home)
+    assert(IsOk(lastRes1), "cli-exec: last session after exec 1")
+    let session1 = Value(lastRes1)
+    assert(session1.turns.len == 1, "cli-exec: turn count 1")
+    assert(session1.turns[0].commandText == "printf cli-exec-smoke", "cli-exec: turn command")
+    assert(session1.turns[0].outputText == "cli-exec-smoke", "cli-exec: turn output")
+    assert(session1.turns[0].exitCode == 0, "cli-exec: turn exit code")
+    assert(session1.turns[0].approved, "cli-exec: turn approved")
+    assert(textutil.codexTextNonEmpty(session1.sessionId), "cli-exec: session id present")
+    assert(session1.cwd == cwd, "cli-exec: session cwd matches")
+
+    # ============================================================
+    # Test 2: Exec with session ID (appends to existing session)
+    # ============================================================
+    var req2: types.CodexExecRequest
+    req2.sessionId = session1.sessionId
+    req2.cwd = cwd
+    req2.promptText = "exec test two"
+    req2.commandText = "printf exec-second-call"
+    req2.autoApprove = true
+    let execRes2 = engine.codexExecuteShell(home, req2)
+    assert(IsOk(execRes2), "cli-exec: second exec ok")
+    let run2 = Value(execRes2)
+    assert(run2.ok, "cli-exec: second rc ok")
+    assert(run2.outputText == "exec-second-call", "cli-exec: second output")
+
+    # ---- Verify session has 2 turns ----
+    let lastRes2 = store.codexStoreLoadLastSession(home)
+    assert(IsOk(lastRes2), "cli-exec: last session after exec 2")
+    let session2 = Value(lastRes2)
+    assert(session2.turns.len == 2, "cli-exec: turn count 2")
+    assert(session2.turns[0].commandText == "printf cli-exec-smoke", "cli-exec: turn[0] preserved")
+    assert(session2.turns[1].commandText == "printf exec-second-call", "cli-exec: turn[1] appended")
+    assert(session2.turns[0].exitCode == 0, "cli-exec: turn[0] exit code 0")
+    assert(session2.turns[1].exitCode == 0, "cli-exec: turn[1] exit code 0")
+
+    # ============================================================
+    # Test 3: Exec with failing command
+    # ============================================================
+    var req3: types.CodexExecRequest
+    req3.sessionId = session1.sessionId
+    req3.cwd = cwd
+    req3.promptText = "exec failing"
+    req3.commandText = "exit 2"
+    req3.autoApprove = true
+    let execRes3 = engine.codexExecuteShell(home, req3)
+    assert(IsOk(execRes3), "cli-exec: failing exec ok")
+    let run3 = Value(execRes3)
+    assert(!run3.ok, "cli-exec: failing exec rc not ok")
+    assert(run3.exitCode == 2, "cli-exec: exit code 2")
+    assert(strings.StrContains(run3.assistantText, "failed"), "cli-exec: assistant mentions failure")
+
+    # ---- Verify session updated ----
+    let lastRes3 = store.codexStoreLoadLastSession(home)
+    assert(IsOk(lastRes3), "cli-exec: last session after failing exec")
+    let session3 = Value(lastRes3)
+    assert(session3.turns.len == 3, "cli-exec: turn count 3")
+    assert(session3.turns[2].exitCode == 2, "cli-exec: last exit code 2")
+    assert(session3.lastExitCode == 2, "cli-exec: session lastExitCode 2")
+
+    # ============================================================
+    # Test 4: Exec with multi-word output
+    # ============================================================
+    var req4: types.CodexExecRequest
+    req4.cwd = cwd
+    req4.promptText = "multi-word"
+    req4.commandText = "printf 'hello world from codex'"
+    req4.autoApprove = true
+    let execRes4 = engine.codexExecuteShell(home, req4)
+    assert(IsOk(execRes4), "cli-exec: multi-word exec ok")
+    let run4 = Value(execRes4)
+    assert(run4.ok, "cli-exec: multi-word rc ok")
+    assert(run4.outputText == "hello world from codex", "cli-exec: multi-word output correct")
+
+    # ============================================================
+    # Test 5: Exec with autoApprove=false should fail
+    # ============================================================
+    var req5: types.CodexExecRequest
+    req5.cwd = cwd
+    req5.promptText = "no auto approve"
+    req5.commandText = "echo should-not-run"
+    req5.autoApprove = false
+    let execRes5 = engine.codexExecuteShell(home, req5)
+    assert(IsErr(execRes5), "cli-exec: no auto-approve returns error")
+    assert(textutil.codexTextNonEmpty(Error(execRes5)), "cli-exec: error message non-empty")
+
+    # ============================================================
+    # Test 6: Exec with empty command should fail
+    # ============================================================
+    var req6: types.CodexExecRequest
+    req6.cwd = cwd
+    req6.promptText = "empty command"
+    req6.commandText = ""
+    req6.autoApprove = true
+    let execRes6 = engine.codexExecuteShell(home, req6)
+    assert(IsErr(execRes6), "cli-exec: empty command returns error")
+
+    # ============================================================
+    # Test 7: Session listing via store
+    # ============================================================
+    let sessions = store.codexStoreListSessions(home)
+    assert(sessions.len >= 3, "cli-exec: at least 3 sessions in index")
+    var foundSession1 = false
+    var foundSession4 = false
+    for i in 0..<sessions.len:
+        if sessions[i].sessionId == session1.sessionId:
+            foundSession1 = true
+            assert(sessions[i].turnCount == 3, "cli-exec: session1 turn count in index")
+            assert(sessions[i].lastExitCode == 2, "cli-exec: session1 last exit in index")
+        if strings.StrContains(sessions[i].title, "Exec Request Test") ||
+           strings.StrContains(sessions[i].title, "multi-word") ||
+           strings.StrContains(sessions[i].title, "cli-exec"):
+            foundSession4 = true
+    assert(foundSession1, "cli-exec: session1 found in listing")
+
+    # ============================================================
+    # Test 8: Auth flow (config persistence)
+    # ============================================================
+    let saveAuth = store.codexStoreSaveApiKey(home, "cli-exec-key")
+    assert(IsOk(saveAuth), "cli-exec: save auth key")
+    let loadedKey = store.codexStoreReadApiKey(home)
+    assert(loadedKey == "cli-exec-key", "cli-exec: load auth key")
+    assert(store.codexStoreClearApiKey(home), "cli-exec: clear auth key")
+    assert(store.codexStoreReadApiKey(home) == "", "cli-exec: auth key cleared")
+
+    codexTestPrint("cli_exec_smoke ok")
+    return 0

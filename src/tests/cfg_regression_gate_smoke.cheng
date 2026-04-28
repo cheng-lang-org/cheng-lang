@@ -1,0 +1,81 @@
+# cfg_regression_gate_smoke.cheng
+# Regression gate for the general CFG codegen pipeline.
+# Compiles ALL existing minimal fixtures through the pipeline
+# (system_link_plan -> lowering_plan -> primary_object_plan)
+# and verifies that missing-reasons are cleared.
+#
+# Unlike the shell variant, this Cheng smoke uses the pipeline API
+# directly and cannot shell out to run executables.
+#
+# Fixtures verified:
+#   ordinary_zero_exit_fixture  -- zero-return entry point
+#   int32_const_return_direct_fixture -- call-chain with const return
+#   float64_mul_backend_smoke  -- float64 multiplication with cmp
+#   function_task_contract_smoke -- function task types contract
+
+import std/os
+import std/strutils as strutil
+import std/strings
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/primary_object_plan as pobj
+
+fn check(cond: bool, code: int32): int32 =
+    if cond:
+        return 0
+    return code
+
+fn compilePlan(rootDir: str,
+               sourceName: str,
+               emitKind: int32): int32 =
+    let sourcePath = os.JoinPath(rootDir, "src/tests", sourceName)
+    let outputPath = os.JoinPath(rootDir, "artifacts/regression_gate", sourceName)
+    let req = creq.CompilerRequestNew(
+        rootDir,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        emitKind,
+        ""
+    )
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err = ""
+    if !slplan.BuildSystemLinkPlanStub(rootDir, req, linkPlan, err):
+        return 2
+    if linkPlan.missingReasons.len > 0:
+        return 3
+    var loweringPlan: lower.LoweringPlanStub
+    if !lower.BuildLoweringPlanStub(linkPlan, loweringPlan, err):
+        return 4
+    if loweringPlan.missingReasons.len > 0:
+        return 5
+    let primary = pobj.BuildPrimaryObjectPlan(linkPlan, loweringPlan)
+    if primary.missingReasons.len > 0:
+        return 6
+    if primary.firstMissingFunction != "":
+        return 7
+    return 0
+
+fn main(): int32 =
+    let rootDir = os.GetCurrentDir()
+
+    let artifactsDir = os.JoinPath(rootDir, "artifacts/regression_gate")
+    if os.DirExists(artifactsDir):
+        discard os.RemoveDir(artifactsDir)
+    discard os.Mkdir(artifactsDir)
+
+    let c1 = check(compilePlan(rootDir, "ordinary_zero_exit_fixture.cheng", creq.EmitExe) == 0, 11)
+    if c1 != 0: return c1
+
+    let c2 = check(compilePlan(rootDir, "int32_const_return_direct_fixture.cheng", creq.EmitExe) == 0, 12)
+    if c2 != 0: return c2
+
+    let c3 = check(compilePlan(rootDir, "float64_mul_backend_smoke.cheng", creq.EmitExe) == 0, 13)
+    if c3 != 0: return c3
+
+    let c4 = check(compilePlan(rootDir, "function_task_contract_smoke.cheng", creq.EmitExe) == 0, 14)
+    if c4 != 0: return c4
+
+    echo(" cfg_regression_gate_smoke ok")
+    return 0

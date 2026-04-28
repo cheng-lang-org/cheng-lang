@@ -1,0 +1,77 @@
+import std/os
+import std/result
+import std/times
+import std/strings
+import std/strutils as strutil
+import cheng/codex/core/engine
+import cheng/codex/core/store
+import cheng/codex/protocol/types
+
+fn codexTestPrint(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn main(): int32 =
+    let cwd = os.GetCurrentDir()
+    let epoch = int32(times.EpochTimeSeconds())
+    let epochStr = intToStr(epoch)
+
+    # ---- shell tool: echo ----
+    var output = ""
+    var exitCode = int32(-1)
+    engine.codexShellCapture("echo tool-test-123", cwd, output, exitCode)
+    assert(exitCode == 0, "tool: shell echo exit code")
+    assert(strings.StrContains(output, "tool-test-123"), "tool: shell echo output")
+
+    # ---- shell tool: multi-word output ----
+    output = ""
+    exitCode = -1
+    engine.codexShellCapture("printf 'hello world from shell'", cwd, output, exitCode)
+    assert(exitCode == 0, "tool: shell printf exit code")
+    assert(output == "hello world from shell", "tool: shell printf output")
+
+    # ---- shell tool: failure case ----
+    output = ""
+    exitCode = -1
+    engine.codexShellCapture("exit 42", cwd, output, exitCode)
+    assert(exitCode == 42, "tool: shell exit 42")
+
+    # ---- read_file tool ----
+    let readPath = strutil.Join(["/tmp/codex-tool-read-", epochStr], "")
+    assert(store.codexStoreWriteText(readPath, "read-file-content-xyz"), "tool: write test file for read")
+    assert(store.codexStoreFileExists(readPath), "tool: test file exists")
+    let readContent = store.codexStoreReadText(readPath)
+    assert(readContent == "read-file-content-xyz", "tool: read file content")
+    let rmRead = os.RemoveFile(readPath)
+
+    # ---- write_file tool ----
+    let writePath = strutil.Join(["/tmp/codex-tool-write-", epochStr], "")
+    let writeContent = "written-by-tool"
+    assert(store.codexStoreWriteText(writePath, writeContent), "tool: write file via store")
+    let verifyContent = store.codexStoreReadText(writePath)
+    assert(verifyContent == "written-by-tool", "tool: verify written file content")
+    let rmWrite = os.RemoveFile(writePath)
+
+    # ---- non-existent file ----
+    let missingPath = strutil.Join(["/tmp/codex-tool-missing-", epochStr], "")
+    assert(!store.codexStoreFileExists(missingPath), "tool: missing file not exist")
+    let missingContent = store.codexStoreReadText(missingPath)
+    assert(missingContent == "", "tool: missing file returns empty string")
+
+    # ---- ensure dir + write ----
+    let dirPath = strutil.Join(["/tmp/codex-tool-subdir-", epochStr], "")
+    let fileInDir = os.JoinPath(dirPath, "nested.txt")
+    assert(store.codexStoreWriteText(fileInDir, "nested-content"), "tool: write to nested path")
+    assert(store.codexStoreFileExists(fileInDir), "tool: nested file exists")
+    let nestedContent = store.codexStoreReadText(fileInDir)
+    assert(nestedContent == "nested-content", "tool: nested file content")
+    let rmNested = os.RemoveFile(fileInDir)
+
+    # ---- non-zero exit: command not found (syntax check) ----
+    # Use a command that is guaranteed to fail
+    output = ""
+    exitCode = -1
+    engine.codexShellCapture("false", cwd, output, exitCode)
+    assert(exitCode != 0, "tool: false command non-zero exit")
+
+    codexTestPrint("core_engine_tool_dispatch_smoke ok")
+    return 0
