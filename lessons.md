@@ -1,6 +1,22 @@
 # Lessons
 
 - 2026-04-27: 纯 Cheng 自举任务中，C seed forced build 只能在 artifact 完全不可用时做一次明确恢复；不能在同一轮修复中反复刷新 backend_driver 来推进问题。后续定位和验收必须只用 `artifacts/backend_driver/cheng system-link-exec` / 纯 `build-backend-driver` 路径。
+- 2026-04-28: 最小 backend driver 入口不能把命令 if 链直接内联进 `main` 后保留最终 `return 2`；当前旧 pure driver 会把这种入口误降成恒定 `return_i32_const_2` 并产出 tiny candidate，必须用真实 callSequence/BodyIR 证明命令分发。
+- 2026-04-28: backend driver 候选 exe 不能走 `DirectObjectEmitStandaloneMain` 的 no-runtime 快路径；候选必须保留 runtime entry bridge、argv 初始化、provider objects、line map 和 `.map`，standalone direct 只给 provider-free fixture。
+- 2026-04-28: `30-80ms` 冷自举口径是已有纯 Cheng 编译器冷进程编出 backend driver 候选 exe + `.map`；不能和 dev hotpatch warm state、C seed/stage 链或 production regression 混算。
+- 2026-04-28: 编译 `backend_driver_dispatch_min.cheng` 候选时发现 report 仍是 `standalone_no_runtime=1` 且 `status` 返回 2，必须在 min driver 中先硬失败这条坏路径，再补 runtime-entry/provider-object direct 链路。
+- 2026-04-28: 已安装 min driver 的 `system-link-exec` 仍是旧 standalone 执行器时，单纯修改 `backend_driver_dispatch_min.cheng` 源码不会让纯自举自激活；旧执行器会继续产出 18K no-runtime 假候选，真正验收必须由当前运行中的 driver 自身走 runtime-entry/provider-object 链路。
+- 2026-04-28: standalone gate 源码改完后再用旧 artifact 编译 min driver，报告仍是 `standalone_no_runtime=1/provider_object_count=0/line_map=-` 且 candidate `status` rc=2；这类结果只能证明运行 artifact stale，不能当作源码修复失败或纯自举进展。
+- 2026-04-28: 已安装旧 `artifacts/backend_driver/cheng` 不能靠改入口源码形状产出真实命令分发 candidate；三层 wrapper、直接 main 六分支、helper-only 都会落成 `return 2/0` 或旧 standalone，必须刷新可执行 artifact 本身的 lowering/runtime 能力后再自举验证。
+- 2026-04-28: direct writer 主线里 `rawbytes.Bytes` 必须作为确定复合 ABI 类型处理，槽大小 16 字节；如果 typed/lowering 把它留成 polymorphic/deferred，`DirectObjectEmitStandaloneText -> DirectObjectEmitPlanText` 这类返回 Bytes 的函数会先撞 ABI 缺口，不能给函数名做特判。
+- 2026-04-28: min driver 的 not-ready 报告不能在旧 pure artifact 自举前展开复合 plan 字段和多段 Fmt；旧 primary builder 会在 primary 阶段 bounds crash。先保持静态 hard-fail，等新 artifact 带稳定复合字段/CFG 后再打开详细 first-missing 报告。
+- 2026-04-28: CFG lowering 的 final `return Call(...)` 不能复用上一条 call 的 result slot；必须把 final return call 自身 append 进 `fnIr.callSequence` 和 `fnIr.bodyIR.callSequence`，否则 legacy/BodyIR call 序列会漂移。
+- 2026-04-28: 当前已安装 backend_driver 的 `BuildPrimaryObjectPlan` 机器码存在 caller-saved 活值污染：`for callOrdinal in 0..<callSequence.len` 的循环条件把 `x9` 跨 `bl cheng_bounds_check` 当活值用，编译 `backend_driver_dispatch_min.cheng` 时在 target `main` 的单 call 序列上复现 `idx=1 len=1`。后续 codegen 必须在 bounds check 后从栈/local reload 循环 index，不能依赖 caller-saved 临时寄存器。
+- 2026-04-28: 对旧 artifact 做 `/tmp` 二进制 NOP 热补丁只能用于定位；它既不是源码修复，也不能作为纯 Cheng 自举证明。最终验收仍必须由未热补丁的纯 Cheng 源码产物跑通。
+- 2026-04-28: 修改 `backend_driver_dispatch_min.cheng` 的 not-ready 报告源码不会改变已安装旧 artifact 的报错内容；旧 artifact 的 NotReady 函数已编死为 `plan_not_ready`，诊断必须在 lldb 里读 `primaryPlan` 参数字段，或先产出新候选后再看新报告。
+- 2026-04-28: 旧 installed backend driver 对 `main` 有两类陈旧缺陷：单 call wrapper 会触发 `BuildPrimaryObjectPlan` 的 caller-saved/bounds 污染；带顶层局部/if 或 `ParamStr -> dispatch` 的入口会被旧 lowering 标成 `cfg_no_top_if`。源码最终不能保留为绕旧 artifact 的变形入口，必须修 codegen/lowering 后用语义正确入口自举。
+- 2026-04-28: `/tmp` 二进制桥连续修复两个 `BuildPrimaryObjectPlan` loop-index reload 点后，旧 artifact 已能越过 primary bounds；新的真实缺口是 `BackendDriverDispatchMinRunSystemLinkExecFromCmdline` 这种多 let + if/Result 主体仍被旧 lowering 标成 `cfg_no_top_if`。继续改入口 wrapper 只会移动 first missing，必须补通用 CFG/Result lowering。
+- 2026-04-28: `run-host-smokes lowering_plan_smoke` 已不属于当前最小 backend_driver 命令面；直接用 `system-link-exec` 编译该 smoke 会在 `lowering_plan` 阶段超过 150 秒，未生成 report。后续不要把这类长跑当日常验证，先让 `dispatch_min` 自身 report 输出 phase/RSS/CPU/first-missing，再用单次 self probe 定位。
 - 2026-04-27: `runtime/native` 是遗留 C runtime 源目录；新增运行时桥必须先落到 `src/core/runtime/*provider*.cheng` 纯 Cheng provider，并同步 direct runtime export roots，不能继续扩展 C 源。
 - 2026-04-27: 顶层 `runtime/` 目录属于旧 C/头文件 runtime surface；纯 Cheng 主线只保留 `src/core/runtime` provider 和 `src/runtime` Cheng 包源码，顶层目录回潮要由 compiler runtime audit 硬报。
 - 2026-04-27: RSS 守卫里的 process-group 语义必须按进程组求和；不能用单 pid RSS bridge 替代，否则会低估编译器子进程内存。
@@ -222,3 +238,4 @@
 - pure self-build 报 `body_ir_call_ops_...` 且函数包含错误分支/早返回时，不能靠扩大帧或当直线 call sequence 放行；下一段必须 lowering 成 guard/return CFG，否则会无条件执行失败分支。
 - 未跟踪文件也要先确认归属；不是自己明确创建或被用户指定处理的文件，不能删除、重命名或重写。误删后先原样恢复，再继续自己的范围。
 - 外部并行编译/构建不属于当前验证链路时，不要等待；只确认是否争用同一安装产物或同一报告路径，自己的命令照跑，真实冲突交给工具链硬失败暴露。
+- pure self 探针长时间停在 `compiler_csg` 时，先用 `sample` 抓当前安装产物的调用栈；本轮证据显示热点在 `ParserLineStartsWithStatementKeyword -> PathTrim/Strip -> NewStringCopy`，应优先改成索引范围比较，避免每行每关键字反复分配。

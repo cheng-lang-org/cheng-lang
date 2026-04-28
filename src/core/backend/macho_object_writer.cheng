@@ -1,5 +1,5 @@
 import std/result
-import std/rawbytes as rawbytes
+import std/rawbytes
 import std/strformat
 import cheng/core/tooling/path as chengpath
 import cheng/core/backend/object_buffer as obuf
@@ -180,17 +180,17 @@ fn MachOWriteRelocation(buf: var obuf.ObjectBuffer,
     obuf.ObjectBufferWriteU32LE(buf, UInt64(word))
     return Ok[bool](true)
 
-fn MachOTextObjectBytes(text: rawbytes.Bytes,
+fn MachOTextObjectBytes(text: Bytes,
                          symbols: osym.ObjectSymbolTable,
-                         relocs: orel.ObjectRelocTable): Result[rawbytes.Bytes] =
+                         relocs: orel.ObjectRelocTable): Result[Bytes] =
     let relocCount = orel.ObjectRelocsCount(relocs)
     let symbolCount = osym.ObjectSymbolsCount(symbols)
     if symbolCount <= 0:
-        return Err[rawbytes.Bytes](" macho object writer: missing symbols")
+        return Err[Bytes](" macho object writer: missing symbols")
     let segmentSize = MachOSegmentCommandSize + MachOSection64Size
     let loadCommandBytes = segmentSize + MachOSymtabCommandSize
     let textOffset = MachOHeaderSize + loadCommandBytes
-    let textSize = rawbytes.BytesLen(text)
+    let textSize = BytesLen(text)
     var relocOffset = 0
     var symoff = MachOAlign(textOffset + textSize, 8)
     if relocCount > 0:
@@ -245,28 +245,28 @@ fn MachOTextObjectBytes(text: rawbytes.Bytes,
     for i in 0..<relocCount:
         let relocRes = MachOWriteRelocation(out, orel.ObjectRelocsAt(relocs, i), symbolCount)
         if IsErr(relocRes):
-            return Err[rawbytes.Bytes](Error(relocRes))
+            return Err[Bytes](Error(relocRes))
     obuf.ObjectBufferAlign(out, 8, 0)
     for i in 0..<symbolCount:
         MachOWriteNlist64(out, strOffsets[i], osym.ObjectSymbolsAt(symbols, i))
     obuf.ObjectBufferWriteBytes(out, obuf.ObjectBufferToBytes(strtab))
-    return Ok[rawbytes.Bytes](obuf.ObjectBufferToBytes(out))
+    return Ok[Bytes](obuf.ObjectBufferToBytes(out))
 
-fn MachOTextDataObjectBytes(text: rawbytes.Bytes,
-                             data: rawbytes.Bytes,
+fn MachOTextDataObjectBytes(text: Bytes,
+                             data: Bytes,
                              symbols: osym.ObjectSymbolTable,
-                             relocs: orel.ObjectRelocTable): Result[rawbytes.Bytes] =
-    let dataSize = rawbytes.BytesLen(data)
+                             relocs: orel.ObjectRelocTable): Result[Bytes] =
+    let dataSize = BytesLen(data)
     if dataSize <= 0:
         return MachOTextObjectBytes(text, symbols, relocs)
     let relocCount = orel.ObjectRelocsCount(relocs)
     let symbolCount = osym.ObjectSymbolsCount(symbols)
     if symbolCount <= 0:
-        return Err[rawbytes.Bytes](" macho object writer: missing symbols")
+        return Err[Bytes](" macho object writer: missing symbols")
     let segmentSize = MachOSegmentCommandSize + MachOSection64Size * 2
     let loadCommandBytes = segmentSize + MachOSymtabCommandSize
     let textOffset = MachOHeaderSize + loadCommandBytes
-    let textSize = rawbytes.BytesLen(text)
+    let textSize = BytesLen(text)
     let dataAddr = MachOAlign(textSize, 8)
     let dataOffset = textOffset + dataAddr
     var relocOffset = 0
@@ -322,20 +322,20 @@ fn MachOTextDataObjectBytes(text: rawbytes.Bytes,
     for i in 0..<relocCount:
         let relocRes = MachOWriteRelocation(out, orel.ObjectRelocsAt(relocs, i), symbolCount)
         if IsErr(relocRes):
-            return Err[rawbytes.Bytes](Error(relocRes))
+            return Err[Bytes](Error(relocRes))
     obuf.ObjectBufferAlign(out, 8, 0)
     for i in 0..<symbolCount:
         MachOWriteNlist64(out, strOffsets[i], osym.ObjectSymbolsAt(symbols, i))
     obuf.ObjectBufferWriteBytes(out, obuf.ObjectBufferToBytes(strtab))
-    return Ok[rawbytes.Bytes](obuf.ObjectBufferToBytes(out))
+    return Ok[Bytes](obuf.ObjectBufferToBytes(out))
 
-fn MachOTextExecutableBytes(text: rawbytes.Bytes,
-                             entryTextOffset: int32): Result[rawbytes.Bytes] =
-    let textSize = rawbytes.BytesLen(text)
+fn MachOTextExecutableBytes(text: Bytes,
+                             entryTextOffset: int32): Result[Bytes] =
+    let textSize = BytesLen(text)
     if textSize <= 0:
-        return Err[rawbytes.Bytes](" macho executable writer: missing text")
+        return Err[Bytes](" macho executable writer: missing text")
     if entryTextOffset < 0 || entryTextOffset >= textSize:
-        return Err[rawbytes.Bytes](" macho executable writer: entry offset out of range")
+        return Err[Bytes](" macho executable writer: entry offset out of range")
     let segmentSize = MachOSegmentCommandSize + MachOSection64Size
     let loadCommandBytes = segmentSize + MachOEntryPointCommandSize
     let textOffset = MachOHeaderSize + loadCommandBytes
@@ -377,61 +377,61 @@ fn MachOTextExecutableBytes(text: rawbytes.Bytes,
 
     MachOWriteEntryPointCommand(out, entryFileOffset)
     obuf.ObjectBufferWriteBytes(out, text)
-    return Ok[rawbytes.Bytes](obuf.ObjectBufferToBytes(out))
+    return Ok[Bytes](obuf.ObjectBufferToBytes(out))
 
 fn MachOTextObjectWrite(rootDir: str,
                          outputPath: str,
-                         text: rawbytes.Bytes,
+                         text: Bytes,
                          symbols: osym.ObjectSymbolTable,
                          relocs: orel.ObjectRelocTable): Result[MachOObjectWriterResult] =
     let bytesRes = MachOTextObjectBytes(text, symbols, relocs)
     if IsErr(bytesRes):
         return Err[MachOObjectWriterResult](Error(bytesRes))
     let bytes = Value(bytesRes)
-    let payload = rawbytes.BytesToString(bytes)
+    let payload = BytesToString(bytes)
     if !chengpath.WriteTextFile(rootDir, outputPath, payload):
         return Err[MachOObjectWriterResult](Fmt" macho object writer: failed to write object: {outputPath}")
     var out: MachOObjectWriterResult
     out.objectPath = outputPath
-    out.bytesWritten = rawbytes.BytesLen(bytes)
+    out.bytesWritten = BytesLen(bytes)
     out.symbolCount = osym.ObjectSymbolsCount(symbols)
     out.relocCount = orel.ObjectRelocsCount(relocs)
     return Ok[MachOObjectWriterResult](out)
 
 fn MachOTextExecutableWrite(rootDir: str,
                              outputPath: str,
-                             text: rawbytes.Bytes,
+                             text: Bytes,
                              entryTextOffset: int32): Result[MachOObjectWriterResult] =
     let bytesRes = MachOTextExecutableBytes(text, entryTextOffset)
     if IsErr(bytesRes):
         return Err[MachOObjectWriterResult](Error(bytesRes))
     let bytes = Value(bytesRes)
-    let payload = rawbytes.BytesToString(bytes)
+    let payload = BytesToString(bytes)
     if !chengpath.WriteTextFile(rootDir, outputPath, payload):
         return Err[MachOObjectWriterResult](Fmt" macho executable writer: failed to write executable: {outputPath}")
     var out: MachOObjectWriterResult
     out.objectPath = outputPath
-    out.bytesWritten = rawbytes.BytesLen(bytes)
+    out.bytesWritten = BytesLen(bytes)
     out.symbolCount = 0
     out.relocCount = 0
     return Ok[MachOObjectWriterResult](out)
 
 fn MachOTextDataObjectWrite(rootDir: str,
                              outputPath: str,
-                             text: rawbytes.Bytes,
-                             data: rawbytes.Bytes,
+                             text: Bytes,
+                             data: Bytes,
                              symbols: osym.ObjectSymbolTable,
                              relocs: orel.ObjectRelocTable): Result[MachOObjectWriterResult] =
     let bytesRes = MachOTextDataObjectBytes(text, data, symbols, relocs)
     if IsErr(bytesRes):
         return Err[MachOObjectWriterResult](Error(bytesRes))
     let bytes = Value(bytesRes)
-    let payload = rawbytes.BytesToString(bytes)
+    let payload = BytesToString(bytes)
     if !chengpath.WriteTextFile(rootDir, outputPath, payload):
         return Err[MachOObjectWriterResult](Fmt" macho object writer: failed to write object: {outputPath}")
     var out: MachOObjectWriterResult
     out.objectPath = outputPath
-    out.bytesWritten = rawbytes.BytesLen(bytes)
+    out.bytesWritten = BytesLen(bytes)
     out.symbolCount = osym.ObjectSymbolsCount(symbols)
     out.relocCount = orel.ObjectRelocsCount(relocs)
     return Ok[MachOObjectWriterResult](out)

@@ -115,6 +115,25 @@ type
         ownerModulePath: str
         targetModulePath: str
 
+    CompilerCsgTextSet =
+        lookup: parser.ParserTextLookup
+        emptySeen: bool
+
+    CompilerCsgImportPairLookupBucket =
+        ownerLen: int32
+        ownerFirstCode: int32
+        ownerLastCode: int32
+        ownerHash: int32
+        targetLen: int32
+        targetFirstCode: int32
+        targetLastCode: int32
+        targetHash: int32
+        items: CompilerCsgImportPair[]
+
+    CompilerCsgImportPairLookup =
+        slots: int32[]
+        buckets: CompilerCsgImportPairLookupBucket[]
+
     TypedExprAbiClass = texpr.TypedExprAbiClass
     TypedExprValueKind = texpr.TypedExprValueKind
     TypedExprPlaceKind = texpr.TypedExprPlaceKind
@@ -474,6 +493,26 @@ fn CompilerCsgAddUnique(items: var str[],
             return
     add(items, text)
 
+fn CompilerCsgTextSetInit(minCap: int32): CompilerCsgTextSet =
+    var out: CompilerCsgTextSet
+    out.lookup = parser.ParserTextLookupInit(minCap)
+    return out
+
+fn CompilerCsgTextSetInsert(seen: var CompilerCsgTextSet,
+                              text: str): bool =
+    if text == "":
+        if seen.emptySeen:
+            return false
+        seen.emptySeen = true
+        return true
+    return parser.ParserTextLookupInsertExact(seen.lookup, text)
+
+fn CompilerCsgAddUniqueFast(items: var str[],
+                              seen: var CompilerCsgTextSet,
+                              text: str) =
+    if CompilerCsgTextSetInsert(seen, text):
+        add(items, text)
+
 fn CompilerCsgStrLess(left: str,
                         right: str): bool =
     if left == right:
@@ -490,33 +529,135 @@ fn CompilerCsgStrLess(left: str,
 fn CompilerCsgSortStrs(items: var str[]) =
     if items.len <= 1:
         return
-    for i in 1..<items.len:
-        let value = items[i]
-        var j = i
-        for _ in range(i):
-            if !CompilerCsgStrLess(value, items[j - 1]):
-                break
-            items[j] = items[j - 1]
-            j = j - 1
-        items[j] = value
+    let count = items.len
+    var scratch: str[]
+    for i in 0..<count:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        add(scratch, items[i])
+    var width: int32 = 1
+    var readScratch = false
+    while width < count:
+        if readScratch:
+            CompilerCsgMergeSortStrsPass(scratch, items, width)
+        else:
+            CompilerCsgMergeSortStrsPass(items, scratch, width)
+        readScratch = !readScratch
+        if width > count / 2:
+            width = count
+        else:
+            width = width * 2
+    if readScratch:
+        for i in 0..<count:
+            if i % 4096 == 0:
+                os.ProcessResourceGuardCheck()
+            items[i] = scratch[i]
+
+fn CompilerCsgMergeSortStrsPass(src: var str[],
+                                  dst: var str[],
+                                  width: int32) =
+    let count = src.len
+    var leftStart: int32
+    while leftStart < count:
+        if leftStart % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        let midRaw = leftStart + width
+        let mid = midRaw < count ? midRaw : count
+        let rightEndRaw = leftStart + width * 2
+        let rightEnd = rightEndRaw < count ? rightEndRaw : count
+        var left = leftStart
+        var right = mid
+        for outIndex in leftStart..<rightEnd:
+            if outIndex % 4096 == 0:
+                os.ProcessResourceGuardCheck()
+            if left < mid && (right >= rightEnd || !CompilerCsgStrLess(src[right], src[left])):
+                dst[outIndex] = src[left]
+                left = left + 1
+            else:
+                dst[outIndex] = src[right]
+                right = right + 1
+        leftStart = leftStart + width * 2
+
+fn CompilerCsgSourcePathModulePairLess(leftSource: str,
+                                         leftModule: str,
+                                         rightSource: str,
+                                         rightModule: str): bool =
+    if leftModule != rightModule:
+        return CompilerCsgStrLess(leftModule, rightModule)
+    return CompilerCsgStrLess(leftSource, rightSource)
 
 fn CompilerCsgSortSourcePathModulePairs(sources: var str[],
                                          modules: var str[]) =
     if sources.len <= 1:
         return
-    for i in 1..<sources.len:
-        let sourceValue = sources[i]
-        let moduleValue = modules[i]
-        var j = i
-        for _ in range(i):
-            if !CompilerCsgStrLess(moduleValue, modules[j - 1]) &&
-               !(moduleValue == modules[j - 1] && CompilerCsgStrLess(sourceValue, sources[j - 1])):
-                break
-            sources[j] = sources[j - 1]
-            modules[j] = modules[j - 1]
-            j = j - 1
-        sources[j] = sourceValue
-        modules[j] = moduleValue
+    let count = sources.len
+    var sourceScratch: str[]
+    var moduleScratch: str[]
+    for i in 0..<count:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        add(sourceScratch, sources[i])
+        add(moduleScratch, modules[i])
+    var width: int32 = 1
+    var readScratch = false
+    while width < count:
+        if readScratch:
+            CompilerCsgMergeSortSourcePathModulePairsPass(sourceScratch,
+                                                           moduleScratch,
+                                                           sources,
+                                                           modules,
+                                                           width)
+        else:
+            CompilerCsgMergeSortSourcePathModulePairsPass(sources,
+                                                           modules,
+                                                           sourceScratch,
+                                                           moduleScratch,
+                                                           width)
+        readScratch = !readScratch
+        if width > count / 2:
+            width = count
+        else:
+            width = width * 2
+    if readScratch:
+        for i in 0..<count:
+            if i % 4096 == 0:
+                os.ProcessResourceGuardCheck()
+            sources[i] = sourceScratch[i]
+            modules[i] = moduleScratch[i]
+
+fn CompilerCsgMergeSortSourcePathModulePairsPass(srcSources: var str[],
+                                                   srcModules: var str[],
+                                                   dstSources: var str[],
+                                                   dstModules: var str[],
+                                                   width: int32) =
+    let count = srcSources.len
+    var leftStart: int32
+    while leftStart < count:
+        if leftStart % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        let midRaw = leftStart + width
+        let mid = midRaw < count ? midRaw : count
+        let rightEndRaw = leftStart + width * 2
+        let rightEnd = rightEndRaw < count ? rightEndRaw : count
+        var left = leftStart
+        var right = mid
+        for outIndex in leftStart..<rightEnd:
+            if outIndex % 4096 == 0:
+                os.ProcessResourceGuardCheck()
+            if left < mid &&
+               (right >= rightEnd ||
+                !CompilerCsgSourcePathModulePairLess(srcSources[right],
+                                                     srcModules[right],
+                                                     srcSources[left],
+                                                     srcModules[left])):
+                dstSources[outIndex] = srcSources[left]
+                dstModules[outIndex] = srcModules[left]
+                left = left + 1
+            else:
+                dstSources[outIndex] = srcSources[right]
+                dstModules[outIndex] = srcModules[right]
+                right = right + 1
+        leftStart = leftStart + width * 2
 
 fn CompilerCsgAddUniqueImportPair(pairs: var CompilerCsgImportPair[],
                                     ownerModulePath: str,
@@ -530,6 +671,196 @@ fn CompilerCsgAddUniqueImportPair(pairs: var CompilerCsgImportPair[],
     add(pairs, CompilerCsgImportPair(ownerModulePath: ownerModulePath,
                                        targetModulePath: targetModulePath))
 
+fn CompilerCsgTextHash(text: str): int32 =
+    var h: int32
+    for i in 0..<text.len:
+        h = h * 131 + Int32(text[i])
+    if h < 0:
+        h = -h
+    return h
+
+fn CompilerCsgTextFirstCode(text: str): int32 =
+    if text.len <= 0:
+        return 0
+    return Int32(text[0])
+
+fn CompilerCsgTextLastCode(text: str): int32 =
+    if text.len <= 0:
+        return 0
+    return Int32(text[text.len - 1])
+
+fn CompilerCsgImportPairLookupInit(minCap: int32): CompilerCsgImportPairLookup =
+    var lookup: CompilerCsgImportPairLookup
+    lookup.slots = []
+    lookup.buckets = []
+    var cap: int32 = 32
+    while cap < minCap:
+        cap = cap * 2
+    for i in 0..<cap:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        add(lookup.slots, 0)
+    return lookup
+
+fn CompilerCsgImportPairLookupHash(ownerLen: int32,
+                                     ownerFirstCode: int32,
+                                     ownerLastCode: int32,
+                                     ownerHash: int32,
+                                     targetLen: int32,
+                                     targetFirstCode: int32,
+                                     targetLastCode: int32,
+                                     targetHash: int32): int64 =
+    var h: int64 = Int64(ownerHash)
+    h = h * 131 + Int64(ownerLen)
+    h = h * 131 + Int64(ownerFirstCode)
+    h = h * 131 + Int64(ownerLastCode)
+    h = h * 131 + Int64(targetHash)
+    h = h * 131 + Int64(targetLen)
+    h = h * 131 + Int64(targetFirstCode)
+    h = h * 131 + Int64(targetLastCode)
+    if h < 0:
+        h = -h
+    return h
+
+fn CompilerCsgImportPairLookupSlotForParts(lookup: CompilerCsgImportPairLookup,
+                                             ownerLen: int32,
+                                             ownerFirstCode: int32,
+                                             ownerLastCode: int32,
+                                             ownerHash: int32,
+                                             targetLen: int32,
+                                             targetFirstCode: int32,
+                                             targetLastCode: int32,
+                                             targetHash: int32): int32 =
+    if lookup.slots.len <= 0:
+        return -1
+    let mask = lookup.slots.len - 1
+    var probe: int32 = Int32(CompilerCsgImportPairLookupHash(ownerLen,
+                                                               ownerFirstCode,
+                                                               ownerLastCode,
+                                                               ownerHash,
+                                                               targetLen,
+                                                               targetFirstCode,
+                                                               targetLastCode,
+                                                               targetHash) & Int64(mask))
+    var scanned: int32
+    while scanned <= mask:
+        let bucketIndexPlus1 = lookup.slots[probe]
+        if bucketIndexPlus1 == 0:
+            return probe
+        let bucketIndex = bucketIndexPlus1 - 1
+        if lookup.buckets[bucketIndex].ownerLen == ownerLen &&
+           lookup.buckets[bucketIndex].ownerFirstCode == ownerFirstCode &&
+           lookup.buckets[bucketIndex].ownerLastCode == ownerLastCode &&
+           lookup.buckets[bucketIndex].ownerHash == ownerHash &&
+           lookup.buckets[bucketIndex].targetLen == targetLen &&
+           lookup.buckets[bucketIndex].targetFirstCode == targetFirstCode &&
+           lookup.buckets[bucketIndex].targetLastCode == targetLastCode &&
+           lookup.buckets[bucketIndex].targetHash == targetHash:
+            return probe
+        probe = (probe + 1) & mask
+        scanned = scanned + 1
+    return -1
+
+fn CompilerCsgImportPairLookupRehash(lookup: var CompilerCsgImportPairLookup,
+                                       newCap: int32) =
+    var slots: int32[]
+    for i in 0..<newCap:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        add(slots, 0)
+    lookup.slots = slots
+    for bucketIndex in 0..<lookup.buckets.len:
+        if bucketIndex % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        let slot = CompilerCsgImportPairLookupSlotForParts(lookup,
+                                                            lookup.buckets[bucketIndex].ownerLen,
+                                                            lookup.buckets[bucketIndex].ownerFirstCode,
+                                                            lookup.buckets[bucketIndex].ownerLastCode,
+                                                            lookup.buckets[bucketIndex].ownerHash,
+                                                            lookup.buckets[bucketIndex].targetLen,
+                                                            lookup.buckets[bucketIndex].targetFirstCode,
+                                                            lookup.buckets[bucketIndex].targetLastCode,
+                                                            lookup.buckets[bucketIndex].targetHash)
+        if slot >= 0:
+            lookup.slots[slot] = bucketIndex + 1
+
+fn CompilerCsgImportPairLookupGrow(lookup: var CompilerCsgImportPairLookup) =
+    var nextCap: int32 = lookup.slots.len * 2
+    if nextCap < 32:
+        nextCap = 32
+    CompilerCsgImportPairLookupRehash(lookup, nextCap)
+
+fn CompilerCsgImportPairLookupEnsureBucket(lookup: var CompilerCsgImportPairLookup,
+                                             ownerModulePath: str,
+                                             targetModulePath: str): int32 =
+    if lookup.slots.len <= 0:
+        lookup = CompilerCsgImportPairLookupInit(32)
+    if (lookup.buckets.len + 1) * 10 >= lookup.slots.len * 7:
+        CompilerCsgImportPairLookupGrow(lookup)
+    let ownerLen = ownerModulePath.len
+    let ownerFirstCode = CompilerCsgTextFirstCode(ownerModulePath)
+    let ownerLastCode = CompilerCsgTextLastCode(ownerModulePath)
+    let ownerHash = CompilerCsgTextHash(ownerModulePath)
+    let targetLen = targetModulePath.len
+    let targetFirstCode = CompilerCsgTextFirstCode(targetModulePath)
+    let targetLastCode = CompilerCsgTextLastCode(targetModulePath)
+    let targetHash = CompilerCsgTextHash(targetModulePath)
+    let slot = CompilerCsgImportPairLookupSlotForParts(lookup,
+                                                        ownerLen,
+                                                        ownerFirstCode,
+                                                        ownerLastCode,
+                                                        ownerHash,
+                                                        targetLen,
+                                                        targetFirstCode,
+                                                        targetLastCode,
+                                                        targetHash)
+    if slot < 0:
+        return -1
+    let existing = lookup.slots[slot]
+    if existing > 0:
+        return existing - 1
+    var bucket: CompilerCsgImportPairLookupBucket
+    bucket.ownerLen = ownerLen
+    bucket.ownerFirstCode = ownerFirstCode
+    bucket.ownerLastCode = ownerLastCode
+    bucket.ownerHash = ownerHash
+    bucket.targetLen = targetLen
+    bucket.targetFirstCode = targetFirstCode
+    bucket.targetLastCode = targetLastCode
+    bucket.targetHash = targetHash
+    bucket.items = []
+    add(lookup.buckets, bucket)
+    lookup.slots[slot] = lookup.buckets.len
+    return lookup.buckets.len - 1
+
+fn CompilerCsgImportPairLookupInsert(lookup: var CompilerCsgImportPairLookup,
+                                       ownerModulePath: str,
+                                       targetModulePath: str): bool =
+    let bucketIndex = CompilerCsgImportPairLookupEnsureBucket(lookup,
+                                                               ownerModulePath,
+                                                               targetModulePath)
+    if bucketIndex < 0:
+        return false
+    for i in 0..<lookup.buckets[bucketIndex].items.len:
+        let item = lookup.buckets[bucketIndex].items[i]
+        if item.ownerModulePath == ownerModulePath &&
+           item.targetModulePath == targetModulePath:
+            return false
+    add(lookup.buckets[bucketIndex].items,
+        CompilerCsgImportPair(ownerModulePath: ownerModulePath,
+                                targetModulePath: targetModulePath))
+    return true
+
+fn CompilerCsgAddUniqueImportPairFast(pairs: var CompilerCsgImportPair[],
+                                        seen: var CompilerCsgImportPairLookup,
+                                        ownerModulePath: str,
+                                        targetModulePath: str) =
+    if CompilerCsgImportPairLookupInsert(seen,
+                                          ownerModulePath,
+                                          targetModulePath):
+        add(pairs, CompilerCsgImportPair(ownerModulePath: ownerModulePath,
+                                           targetModulePath: targetModulePath))
+
 fn CompilerCsgImportPairLess(left: CompilerCsgImportPair,
                                right: CompilerCsgImportPair): bool =
     if left.ownerModulePath != right.ownerModulePath:
@@ -539,15 +870,54 @@ fn CompilerCsgImportPairLess(left: CompilerCsgImportPair,
 fn CompilerCsgSortImportPairs(pairs: var CompilerCsgImportPair[]) =
     if pairs.len <= 1:
         return
-    for i in 1..<pairs.len:
-        let value = pairs[i]
-        var j = i
-        for _ in range(i):
-            if !CompilerCsgImportPairLess(value, pairs[j - 1]):
-                break
-            pairs[j] = pairs[j - 1]
-            j = j - 1
-        pairs[j] = value
+    let count = pairs.len
+    var scratch: CompilerCsgImportPair[]
+    for i in 0..<count:
+        if i % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        add(scratch, pairs[i])
+    var width: int32 = 1
+    var readScratch = false
+    while width < count:
+        if readScratch:
+            CompilerCsgMergeSortImportPairsPass(scratch, pairs, width)
+        else:
+            CompilerCsgMergeSortImportPairsPass(pairs, scratch, width)
+        readScratch = !readScratch
+        if width > count / 2:
+            width = count
+        else:
+            width = width * 2
+    if readScratch:
+        for i in 0..<count:
+            if i % 4096 == 0:
+                os.ProcessResourceGuardCheck()
+            pairs[i] = scratch[i]
+
+fn CompilerCsgMergeSortImportPairsPass(src: var CompilerCsgImportPair[],
+                                         dst: var CompilerCsgImportPair[],
+                                         width: int32) =
+    let count = src.len
+    var leftStart: int32
+    while leftStart < count:
+        if leftStart % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        let midRaw = leftStart + width
+        let mid = midRaw < count ? midRaw : count
+        let rightEndRaw = leftStart + width * 2
+        let rightEnd = rightEndRaw < count ? rightEndRaw : count
+        var left = leftStart
+        var right = mid
+        for outIndex in leftStart..<rightEnd:
+            if outIndex % 4096 == 0:
+                os.ProcessResourceGuardCheck()
+            if left < mid && (right >= rightEnd || !CompilerCsgImportPairLess(src[right], src[left])):
+                dst[outIndex] = src[left]
+                left = left + 1
+            else:
+                dst[outIndex] = src[right]
+                right = right + 1
+        leftStart = leftStart + width * 2
 
 fn CompilerCsgModuleNodeId(nodes: CompilerCsgNode[],
                              modulePath: str): int32 =
@@ -558,6 +928,29 @@ fn CompilerCsgModuleNodeId(nodes: CompilerCsgNode[],
         if node.modulePath == modulePath:
             return node.nodeId
     return -1
+
+fn CompilerCsgModuleIndex(modules: str[],
+                            modulePath: str): int32 =
+    var lo: int32
+    var hi = modules.len
+    while lo < hi:
+        let mid = lo + (hi - lo) / 2
+        let item = modules[mid]
+        if item == modulePath:
+            return mid
+        if CompilerCsgStrLess(item, modulePath):
+            lo = mid + 1
+        else:
+            hi = mid
+    return -1
+
+fn CompilerCsgModuleNodeIdIndexed(modules: str[],
+                                    moduleNodeIds: int32[],
+                                    modulePath: str): int32 =
+    let index = CompilerCsgModuleIndex(modules, modulePath)
+    if index < 0 || index >= moduleNodeIds.len:
+        return -1
+    return moduleNodeIds[index]
 
 fn CompilerCsgSymbolExported(functionName: str,
                                entryFlag: int32): bool =
@@ -1282,19 +1675,23 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
     err = ""
     var modules: str[]
     var importPairs: CompilerCsgImportPair[]
+    var moduleSeen = CompilerCsgTextSetInit(linkPlan.ownerModulePaths.len +
+                                              linkPlan.importEdges.len * 2 + 8)
+    var importPairSeen = CompilerCsgImportPairLookupInit(linkPlan.importEdges.len * 2 + 8)
     for i in 0..<linkPlan.ownerModulePaths.len:
         if i % 256 == 0:
             os.ProcessResourceGuardCheck()
-        CompilerCsgAddUnique(modules, linkPlan.ownerModulePaths[i])
+        CompilerCsgAddUniqueFast(modules, moduleSeen, linkPlan.ownerModulePaths[i])
     for i in 0..<linkPlan.importEdges.len:
         if i % 256 == 0:
             os.ProcessResourceGuardCheck()
-        CompilerCsgAddUnique(modules, linkPlan.importEdges[i].ownerModulePath)
+        CompilerCsgAddUniqueFast(modules, moduleSeen, linkPlan.importEdges[i].ownerModulePath)
         if linkPlan.importEdges[i].resolved:
-            CompilerCsgAddUnique(modules, linkPlan.importEdges[i].targetModulePath)
-            CompilerCsgAddUniqueImportPair(importPairs,
-                                             linkPlan.importEdges[i].ownerModulePath,
-                                             linkPlan.importEdges[i].targetModulePath)
+            CompilerCsgAddUniqueFast(modules, moduleSeen, linkPlan.importEdges[i].targetModulePath)
+            CompilerCsgAddUniqueImportPairFast(importPairs,
+                                                importPairSeen,
+                                                linkPlan.importEdges[i].ownerModulePath,
+                                                linkPlan.importEdges[i].targetModulePath)
     CompilerCsgSortStrs(modules)
     CompilerCsgSortImportPairs(importPairs)
     var nodes: CompilerCsgNode[]
@@ -1331,6 +1728,7 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
     packageNode.factCid = CompilerCsgBufCid(packageBuf)
     add(nodes, packageNode)
     let packageNodeId = packageNode.nodeId
+    var moduleNodeIds: int32[]
     for i in 0..<modules.len:
         if i % 256 == 0:
             os.ProcessResourceGuardCheck()
@@ -1364,13 +1762,18 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
         CompilerCsgAppendText(moduleBuf, moduleNode.exportSymbolName)
         moduleNode.factCid = CompilerCsgBufCid(moduleBuf)
         add(nodes, moduleNode)
+        add(moduleNodeIds, moduleNode.nodeId)
         CompilerCsgAddEdge(edges, packageNodeId, moduleNode.nodeId, CompilerCsgEdgeKindContains)
     for i in 0..<importPairs.len:
         if i % 256 == 0:
             os.ProcessResourceGuardCheck()
         let pair = importPairs[i]
-        let fromNodeId = CompilerCsgModuleNodeId(nodes, pair.ownerModulePath)
-        let toNodeId = CompilerCsgModuleNodeId(nodes, pair.targetModulePath)
+        let fromNodeId = CompilerCsgModuleNodeIdIndexed(modules,
+                                                        moduleNodeIds,
+                                                        pair.ownerModulePath)
+        let toNodeId = CompilerCsgModuleNodeIdIndexed(modules,
+                                                      moduleNodeIds,
+                                                      pair.targetModulePath)
         if fromNodeId <= 0 || toNodeId <= 0:
             continue
         CompilerCsgAddEdge(edges, fromNodeId, toNodeId, CompilerCsgEdgeKindImports)
@@ -1395,12 +1798,10 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
         if sourceIndex % 16 == 0:
             os.ProcessResourceGuardCheck()
         let sourcePath = orderedSources[sourceIndex]
-        let ownerModulePath = CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
-                                                            linkPlan.packageRoot,
-                                                            externalPackageRoots,
-                                                            sourceTextOverrides,
-                                                            sourcePath)
-        let ownerModuleNodeId = CompilerCsgModuleNodeId(nodes, ownerModulePath)
+        let ownerModulePath = orderedSourceModules[sourceIndex]
+        let ownerModuleNodeId = CompilerCsgModuleNodeIdIndexed(modules,
+                                                               moduleNodeIds,
+                                                               ownerModulePath)
         if ownerModuleNodeId <= 0:
             continue
         var text = ""
@@ -1430,12 +1831,10 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
             os.ProcessResourceGuardCheck()
         var profile = exprCallProfiles[sourceIndex]
         let sourcePath = profile.sourcePath
-        let ownerModulePath = CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
-                                                            linkPlan.packageRoot,
-                                                            externalPackageRoots,
-                                                            sourceTextOverrides,
-                                                            sourcePath)
-        let ownerModuleNodeId = CompilerCsgModuleNodeId(nodes, ownerModulePath)
+        let ownerModulePath = orderedSourceModules[sourceIndex]
+        let ownerModuleNodeId = CompilerCsgModuleNodeIdIndexed(modules,
+                                                               moduleNodeIds,
+                                                               ownerModulePath)
         if ownerModuleNodeId <= 0:
             continue
         var sourceExternalCalls: str[]

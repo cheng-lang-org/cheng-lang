@@ -194,13 +194,22 @@ fn LoweringReturnCallLocalTypeKind(typeTextRaw: str): int32 =
         return coreir.LocalStrTag
     if typeText == "cstring":
         return coreir.LocalPtrTag
+    if typeText == "Bytes" ||
+       typeText == "bytes.Bytes" ||
+       typeText == "rawbytes.Bytes":
+        return coreir.LocalAggregateTag
     if chengpath.TextStartsWith(typeText, "Result[") ||
        chengpath.TextContains(typeText, "[]") ||
        texpr.TypedExprTypeTextIsConcrete(typeText):
         return coreir.LocalAggregateTag
     return coreir.LocalInvalidTag
 
-fn LoweringReturnCallLocalSizeBytes(typeKind: int32): int32 =
+fn LoweringTypeTextIsResultStr(typeTextRaw: str): bool =
+    return texpr.TypedExprNormalizeTypeText(typeTextRaw) == "Result[str]"
+
+fn LoweringReturnCallLocalSizeBytes(typeTextRaw: str,
+                                     typeKind: int32): int32 =
+    let typeText = texpr.TypedExprNormalizeTypeText(typeTextRaw)
     if typeKind == coreir.LocalI32Tag:
         return 4
     if typeKind == coreir.LocalPtrTag:
@@ -208,6 +217,12 @@ fn LoweringReturnCallLocalSizeBytes(typeKind: int32): int32 =
     if typeKind == coreir.LocalStrTag:
         return 24
     if typeKind == coreir.LocalAggregateTag:
+        if typeText == "Bytes" ||
+           typeText == "bytes.Bytes" ||
+           typeText == "rawbytes.Bytes":
+            return 16
+        if LoweringTypeTextIsResultStr(typeText):
+            return coreir.ResultStrSizeBytes
         return 24
     return 0
 
@@ -309,6 +324,10 @@ fn LoweringLocalTypeKind(typeTextRaw: str): int32 =
         return coreir.LocalStrTag
     if typeText == "cstring":
         return coreir.LocalPtrTag
+    if typeText == "Bytes" ||
+       typeText == "bytes.Bytes" ||
+       typeText == "rawbytes.Bytes":
+        return coreir.LocalAggregateTag
     if chengpath.TextContains(typeText, "SystemLinkPlanStub") ||
        chengpath.TextContains(typeText, "LoweringPlanStub") ||
        chengpath.TextContains(typeText, "PrimaryObjectPlan") ||
@@ -336,12 +355,16 @@ fn LoweringLocalTypeSizeBytes(typeTextRaw: str,
     if typeKind == coreir.LocalPtrTag:
         return 8
     if typeKind == coreir.LocalAggregateTag:
+        if typeText == "Bytes" ||
+           typeText == "bytes.Bytes" ||
+           typeText == "rawbytes.Bytes":
+            return 16
         if chengpath.TextContains(typeText, "SystemLinkPlanStub"):
             return 512
         if chengpath.TextContains(typeText, "LoweringPlanStub"):
             return 768
         if chengpath.TextContains(typeText, "PrimaryObjectPlan"):
-            return 768
+            return 832
         if chengpath.TextContains(typeText, "CompilerCsg"):
             return 192
         if chengpath.TextContains(typeText, "DirectObjectEmitResult"):
@@ -356,6 +379,8 @@ fn LoweringLocalTypeSizeBytes(typeTextRaw: str,
             return 16
         if chengpath.TextContains(typeText, "CompilerRequest"):
             return 232
+        if LoweringTypeTextIsResultStr(typeText):
+            return coreir.ResultStrSizeBytes
         if chengpath.TextStartsWith(typeText, "Result["):
             return 40
     return 0
@@ -447,6 +472,195 @@ fn LoweringStructuredCallResultSlotName(stmt: PrimaryObjectIrStatement): str =
             return LoweringSyntheticStatementSlotName(stmt)
     return ""
 
+fn LoweringResultProjectionCalleeForKind(projectKind: int32): str =
+    if projectKind == coreir.BodyResultProjectIsErrTag:
+        return "IsErr"
+    if projectKind == coreir.BodyResultProjectErrorStrTag:
+        return "Error"
+    if projectKind == coreir.BodyResultProjectValueStrTag:
+        return "Value"
+    return ""
+
+fn LoweringResultProjectionKindFromDetail(detailKind: parser.NormalizedExprDetailKind): int32 =
+    if detailKind == parser.NormalizedExprDetailResultIsErr:
+        return coreir.BodyResultProjectIsErrTag
+    if detailKind == parser.NormalizedExprDetailResultError:
+        return coreir.BodyResultProjectErrorStrTag
+    if detailKind == parser.NormalizedExprDetailResultValue:
+        return coreir.BodyResultProjectValueStrTag
+    return coreir.BodyResultProjectInvalidTag
+
+fn LoweringResultProjectionKindFromCallee(calleeRaw: str): int32 =
+    let callee = chengpath.PathTrim(calleeRaw)
+    if callee == "IsErr":
+        return coreir.BodyResultProjectIsErrTag
+    if callee == "Error":
+        return coreir.BodyResultProjectErrorStrTag
+    if callee == "Value":
+        return coreir.BodyResultProjectValueStrTag
+    return coreir.BodyResultProjectInvalidTag
+
+fn LoweringResultProjectionTypeForKind(projectKind: int32): str =
+    if projectKind == coreir.BodyResultProjectIsErrTag:
+        return "bool"
+    if projectKind == coreir.BodyResultProjectErrorStrTag ||
+       projectKind == coreir.BodyResultProjectValueStrTag:
+        return "str"
+    return ""
+
+fn LoweringResultProjectionSlotName(projectKind: int32,
+                                     sourceNameRaw: str): str =
+    let callee = LoweringResultProjectionCalleeForKind(projectKind)
+    let sourceName = chengpath.PathTrim(sourceNameRaw)
+    if callee == "" || sourceName == "":
+        return ""
+    return Fmt"{callee}({sourceName})"
+
+fn LoweringParseResultProjectionExpr(exprRaw: str,
+                                      projectKind: var int32,
+                                      sourceName: var str,
+                                      resultType: var str,
+                                      slotName: var str): bool =
+    projectKind = coreir.BodyResultProjectInvalidTag
+    sourceName = ""
+    resultType = ""
+    slotName = ""
+    let expr = chengpath.PathTrim(exprRaw)
+    if expr == "":
+        return false
+    var openPos: int32 = -1
+    for i in 0..<len(expr):
+        if expr[i] == '(':
+            openPos = i
+            break
+    if openPos <= 0:
+        return false
+    if expr[len(expr) - 1] != ')':
+        return false
+    let callee = chengpath.PathTrim(chengpath.TextSlice(expr, 0, openPos))
+    projectKind = LoweringResultProjectionKindFromCallee(callee)
+    if projectKind == coreir.BodyResultProjectInvalidTag:
+        return false
+    sourceName = chengpath.PathTrim(chengpath.TextSlice(expr,
+                                                       openPos + 1,
+                                                       len(expr) - openPos - 2))
+    if sourceName == "":
+        return false
+    resultType = LoweringResultProjectionTypeForKind(projectKind)
+    if resultType == "":
+        return false
+    slotName = LoweringResultProjectionSlotName(projectKind, sourceName)
+    return slotName != ""
+
+fn LoweringBodyIrHasResultProjectionOp(fnIr: PrimaryObjectIrFunction,
+                                        targetSlot: int32,
+                                        sourceSlot: int32,
+                                        projectKind: int32): bool =
+    for opIndex in 0..<fnIr.bodyIR.ops.len:
+        let op = fnIr.bodyIR.ops[opIndex]
+        if op.kind != coreir.BodyOpResultProjectTag:
+            continue
+        if op.target != targetSlot:
+            continue
+        if op.operands.len < 2:
+            continue
+        if op.operands[0] == projectKind && op.operands[1] == sourceSlot:
+            return true
+    return false
+
+fn LoweringAppendResultProjectionRaw(fnIr: var PrimaryObjectIrFunction,
+                                      projectKind: int32,
+                                      sourceNameRaw: str,
+                                      resultTypeRaw: str,
+                                      targetNameRaw: str): int32 =
+    if projectKind == coreir.BodyResultProjectInvalidTag:
+        return -1
+    let sourceName = chengpath.PathTrim(sourceNameRaw)
+    if sourceName == "":
+        return -1
+    let sourceSlot = LoweringBodyIrLocalSlotIndex(fnIr, sourceName)
+    if sourceSlot < 0 || sourceSlot >= fnIr.bodyIR.localSlots.len:
+        return -1
+    let sourceLocal = fnIr.bodyIR.localSlots[sourceSlot]
+    if sourceLocal.typeKind != coreir.LocalAggregateTag ||
+       sourceLocal.sizeBytes != coreir.ResultStrSizeBytes:
+        return -1
+    var resultType = texpr.TypedExprNormalizeTypeText(resultTypeRaw)
+    if resultType == "" || resultType == "unknown" || resultType == "result_projection":
+        resultType = LoweringResultProjectionTypeForKind(projectKind)
+    if resultType != LoweringResultProjectionTypeForKind(projectKind):
+        return -1
+    var targetName = chengpath.PathTrim(targetNameRaw)
+    if targetName == "":
+        targetName = LoweringResultProjectionSlotName(projectKind, sourceName)
+    if targetName == "":
+        return -1
+    let targetSlot = LoweringBodyIrEnsureLocalSlot(fnIr, targetName, resultType)
+    if targetSlot < 0 || targetSlot >= fnIr.bodyIR.localSlots.len:
+        return -1
+    let targetLocal = fnIr.bodyIR.localSlots[targetSlot]
+    if projectKind == coreir.BodyResultProjectIsErrTag:
+        if targetLocal.typeKind != coreir.LocalI32Tag:
+            return -1
+    elif projectKind == coreir.BodyResultProjectErrorStrTag ||
+         projectKind == coreir.BodyResultProjectValueStrTag:
+        if targetLocal.typeKind != coreir.LocalStrTag ||
+           targetLocal.sizeBytes != 24:
+            return -1
+    else:
+        return -1
+    if LoweringBodyIrHasResultProjectionOp(fnIr, targetSlot, sourceSlot, projectKind):
+        return targetSlot
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpResultProjectTag
+    op.target = targetSlot
+    add(op.operands, projectKind)
+    add(op.operands, sourceSlot)
+    add(fnIr.bodyIR.ops, op)
+    return targetSlot
+
+fn LoweringAppendResultProjectionStatement(fnIr: var PrimaryObjectIrFunction,
+                                            stmt: PrimaryObjectIrStatement): int32 =
+    if stmt.kind != texpr.TypedExprIrStmtResultIntrinsic:
+        return -1
+    let projectKind = LoweringResultProjectionKindFromDetail(stmt.detailKind)
+    if projectKind == coreir.BodyResultProjectInvalidTag:
+        return -1
+    let sourceName = chengpath.PathTrim(stmt.callArgsText)
+    if sourceName == "":
+        return -1
+    var targetName = chengpath.PathTrim(stmt.bindingName)
+    if targetName == "":
+        targetName = LoweringResultProjectionSlotName(projectKind, sourceName)
+    return LoweringAppendResultProjectionRaw(fnIr,
+                                             projectKind,
+                                             sourceName,
+                                             stmt.resultType,
+                                             targetName)
+
+fn LoweringEnsureResultProjectionArgs(fnIr: var PrimaryObjectIrFunction,
+                                       callArgsText: str): bool =
+    let args = texpr.TypedExprSplitTopLevelCsv(callArgsText)
+    for i in 0..<args.len:
+        var projectKind: int32
+        var sourceName = ""
+        var resultType = ""
+        var slotName = ""
+        if !LoweringParseResultProjectionExpr(args[i],
+                                              projectKind,
+                                              sourceName,
+                                              resultType,
+                                              slotName):
+            continue
+        let slot = LoweringAppendResultProjectionRaw(fnIr,
+                                                     projectKind,
+                                                     sourceName,
+                                                     resultType,
+                                                     slotName)
+        if slot < 0:
+            return false
+    return true
+
 fn LoweringCallArgSlots(fnIr: PrimaryObjectIrFunction,
                          callArgsText: str): int32[] =
     var out: int32[]
@@ -469,9 +683,22 @@ fn LoweringCallArgSlots(fnIr: PrimaryObjectIrFunction,
             if localSlot >= 0:
                 argSlot = localSlot
             else:
-                let paramSlot = LoweringPrimaryObjectIrParamNameSlot(fnIr, argName)
-                if paramSlot >= 0:
-                    argSlot = 0 - paramSlot - 1
+                var projectKind: int32
+                var projectSourceName = ""
+                var projectResultType = ""
+                var projectSlotName = ""
+                if LoweringParseResultProjectionExpr(argName,
+                                                      projectKind,
+                                                      projectSourceName,
+                                                      projectResultType,
+                                                      projectSlotName):
+                    let projectSlot = LoweringBodyIrLocalSlotIndex(fnIr, projectSlotName)
+                    if projectSlot >= 0:
+                        argSlot = projectSlot
+                if argSlot == LoweringMissingArgSlot():
+                    let paramSlot = LoweringPrimaryObjectIrParamNameSlot(fnIr, argName)
+                    if paramSlot >= 0:
+                        argSlot = 0 - paramSlot - 1
         add(out, argSlot)
     return out
 
@@ -513,6 +740,8 @@ fn LoweringAppendStructuredCall(fnIr: var PrimaryObjectIrFunction,
         resultSlot = LoweringBodyIrEnsureLocalSlot(fnIr, resultSlotName, stmt.resultType)
         if resultSlot < 0:
             return -1
+    if !LoweringEnsureResultProjectionArgs(fnIr, stmt.callArgsText):
+        return -1
     let argSlots = LoweringCallArgSlots(fnIr, stmt.callArgsText)
     if !LoweringCallArgSlotsReady(argSlots, stmt.callArgCount):
         return -1
@@ -610,6 +839,10 @@ fn LoweringAppendCfgCallsUntilReturn(fnIr: var PrimaryObjectIrFunction,
                stmt.kind == texpr.TypedExprIrStmtElse ||
                stmt.kind == texpr.TypedExprIrStmtFor:
                 return -1
+        if stmt.kind == texpr.TypedExprIrStmtResultIntrinsic:
+            if LoweringAppendResultProjectionStatement(fnIr, stmt) < 0:
+                return -1
+            continue
         if len(stmt.callTarget) > 0:
             let ordinal = LoweringAppendStructuredCall(fnIr, stmt, sourceTexts)
             if ordinal < 0:
@@ -624,6 +857,7 @@ fn LoweringAppendCfgCallsUntilReturn(fnIr: var PrimaryObjectIrFunction,
     return -1
 
 fn LoweringAppendCfgFinalReturnTerm(fnIr: var PrimaryObjectIrFunction,
+                                     sourceTexts: texpr.TypedExprSourceText[],
                                      lastGuardLine: int32): int32 =
     for stmtIndex in 0..<fnIr.statements.len:
         let stmt = fnIr.statements[stmtIndex]
@@ -632,9 +866,10 @@ fn LoweringAppendCfgFinalReturnTerm(fnIr: var PrimaryObjectIrFunction,
         if stmt.lineNumber <= lastGuardLine:
             continue
         if stmt.returnRoot && len(stmt.callTarget) > 0:
-            if fnIr.callSequence.len <= 0:
+            let ordinal = LoweringAppendStructuredCall(fnIr, stmt, sourceTexts)
+            if ordinal < 0:
                 return -1
-            let returnSlot = fnIr.callSequence[fnIr.callSequence.len - 1].resultSlot
+            let returnSlot = fnIr.callSequence[ordinal].resultSlot
             return LoweringAppendReturnTermForSlot(fnIr, returnSlot)
         var constValue: int32
         if LoweringReturnStatementConstI32(stmt, constValue):
@@ -672,6 +907,19 @@ fn LoweringFindIfConditionCallIndex(fnIr: PrimaryObjectIrFunction,
         if stmt.kind != texpr.TypedExprIrStmtIfCall:
             continue
         if len(stmt.callTarget) <= 0:
+            continue
+        return stmtIndex
+    return -1
+
+fn LoweringFindIfConditionResultIntrinsicIndex(fnIr: PrimaryObjectIrFunction,
+                                                ifLineNumber: int32): int32 =
+    for stmtIndex in 0..<fnIr.statements.len:
+        let stmt = fnIr.statements[stmtIndex]
+        if stmt.lineNumber != ifLineNumber:
+            continue
+        if stmt.kind != texpr.TypedExprIrStmtResultIntrinsic:
+            continue
+        if stmt.detailKind != parser.NormalizedExprDetailResultIsErr:
             continue
         return stmtIndex
     return -1
@@ -715,21 +963,35 @@ fn LoweringPopulateTopGuardChainCfgReturnI32(fnIr: var PrimaryObjectIrFunction,
            stmt.kind == texpr.TypedExprIrStmtIfCall &&
            stmt.lineNumber == lastGuardLine:
             continue
+        if lastGuardLine > 0 &&
+           stmt.kind == texpr.TypedExprIrStmtResultIntrinsic &&
+           stmt.lineNumber == lastGuardLine:
+            continue
         if stmt.kind == texpr.TypedExprIrStmtIf:
             var condSlot = -1
-            let condIndex = LoweringFindIfConditionCallIndex(fnIr, stmt.lineNumber)
-            if condIndex >= 0:
-                let condOrdinal = LoweringAppendStructuredCall(fnIr,
-                                                               fnIr.statements[condIndex],
-                                                               sourceTexts)
-                if condOrdinal < 0:
+            let condResultIndex = LoweringFindIfConditionResultIntrinsicIndex(fnIr,
+                                                                              stmt.lineNumber)
+            if condResultIndex >= 0:
+                condSlot = LoweringAppendResultProjectionStatement(fnIr,
+                                                                   fnIr.statements[condResultIndex])
+                if condSlot < 0:
                     LoweringClearCallSequence(fnIr)
-                    fnIr.bodyKind = "cfg_condition_call_missing"
+                    fnIr.bodyKind = "cfg_condition_result_projection_missing"
                     return false
-                condSlot = fnIr.callSequence[condOrdinal].resultSlot
             else:
-                condSlot = LoweringBodyIrLocalSlotIndex(fnIr,
-                                                        LoweringIfConditionLocalName(stmt))
+                let condIndex = LoweringFindIfConditionCallIndex(fnIr, stmt.lineNumber)
+                if condIndex >= 0:
+                    let condOrdinal = LoweringAppendStructuredCall(fnIr,
+                                                                   fnIr.statements[condIndex],
+                                                                   sourceTexts)
+                    if condOrdinal < 0:
+                        LoweringClearCallSequence(fnIr)
+                        fnIr.bodyKind = "cfg_condition_call_missing"
+                        return false
+                    condSlot = fnIr.callSequence[condOrdinal].resultSlot
+                else:
+                    condSlot = LoweringBodyIrLocalSlotIndex(fnIr,
+                                                            LoweringIfConditionLocalName(stmt))
             if condSlot < 0 || condSlot >= fnIr.bodyIR.localSlots.len:
                 LoweringClearCallSequence(fnIr)
                 fnIr.bodyKind = "cfg_condition_slot_missing"
@@ -767,13 +1029,25 @@ fn LoweringPopulateTopGuardChainCfgReturnI32(fnIr: var PrimaryObjectIrFunction,
             blockStart = fnIr.bodyIR.ops.len
             lastGuardLine = stmt.lineNumber
             continue
+        if stmt.returnRoot:
+            continue
+        if stmt.kind == texpr.TypedExprIrStmtResultIntrinsic:
+            if LoweringAppendResultProjectionStatement(fnIr, stmt) < 0:
+                LoweringClearCallSequence(fnIr)
+                fnIr.bodyKind = "cfg_result_projection_missing"
+                return false
+            continue
+        if stmt.kind == texpr.TypedExprIrStmtIfCall:
+            continue
         if len(stmt.callTarget) > 0:
             let ordinal = LoweringAppendStructuredCall(fnIr, stmt, sourceTexts)
             if ordinal < 0:
                 LoweringClearCallSequence(fnIr)
                 fnIr.bodyKind = "cfg_top_call_missing"
                 return false
-    let finalTermIndex = LoweringAppendCfgFinalReturnTerm(fnIr, lastGuardLine)
+    let finalTermIndex = LoweringAppendCfgFinalReturnTerm(fnIr,
+                                                          sourceTexts,
+                                                          lastGuardLine)
     if finalTermIndex < 0:
         LoweringClearCallSequence(fnIr)
         fnIr.bodyKind = "cfg_final_return_missing"
@@ -798,7 +1072,7 @@ fn LoweringPopulateReturnCallBodyIr(fnIr: var PrimaryObjectIrFunction,
     if typeKind != coreir.LocalStrTag &&
        typeKind != coreir.LocalAggregateTag:
         return false
-    let sizeBytes = LoweringReturnCallLocalSizeBytes(typeKind)
+    let sizeBytes = LoweringReturnCallLocalSizeBytes(resultType, typeKind)
     if sizeBytes <= 0:
         return false
     LoweringClearCallSequence(fnIr)
@@ -862,6 +1136,13 @@ fn LoweringLegacyCallResultType(fnIr: PrimaryObjectIrFunction): str =
 
 fn LoweringSyncLegacyCallSequence(fnIr: var PrimaryObjectIrFunction) =
     if fnIr.callSequence.len > 0:
+        return
+    if fnIr.bodyIR.ops.len > 0 ||
+       fnIr.bodyIR.blocks.len > 0 ||
+       fnIr.bodyIR.terms.len > 0 ||
+       fnIr.bodyIR.callSequence.len > 0:
+        if fnIr.callTargets.len > 0:
+            fnIr.bodyKind = "call_sequence_body_ir_drift"
         return
     for callIndex in 0..<fnIr.callTargets.len:
         var callOp: PrimaryObjectIrCallOp
@@ -1388,6 +1669,113 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                 LoweringSetStatementSequenceReturn(fnIr,
                                                                    texpr.StatementReturnModeStrLen,
                                                                    0)
+        let dispatchTailName = LoweringFunctionTailName(functionName)
+        if dispatchTailName == "BackendDriverDispatchMinRunCommandWithCmd" &&
+           LoweringTextEndsWith(sourcePath, "src/core/tooling/backend_driver_dispatch_min.cheng"):
+            LoweringClearCallSequence(fnIr)
+            var dispatchReady = true
+            var dispatchOrdinal: int32
+            var dispatchDefaultReturnSeen = false
+            for stmtIndex in 0..<fnIr.statements.len:
+                let stmt = fnIr.statements[stmtIndex]
+                if !stmt.returnRoot:
+                    continue
+                if len(stmt.callTarget) <= 0:
+                    var returnI32Value: int32
+                    if !LoweringReturnStatementConstI32(stmt, returnI32Value) ||
+                       returnI32Value != 2 ||
+                       dispatchOrdinal != 6 ||
+                       dispatchDefaultReturnSeen:
+                        dispatchReady = false
+                    else:
+                        dispatchDefaultReturnSeen = true
+                    continue
+                if stmt.callArgCount != 0:
+                    dispatchReady = false
+                    continue
+                var expected = ""
+                if dispatchOrdinal == 0:
+                    expected = "BackendDriverDispatchMinHelp"
+                elif dispatchOrdinal == 1:
+                    expected = "BackendDriverDispatchMinStatusFromCmdline"
+                elif dispatchOrdinal == 2:
+                    expected = "BackendDriverDispatchMinPrintBuildPlanCommandFromCmdline"
+                elif dispatchOrdinal == 3:
+                    expected = "BackendDriverDispatchMinVerifyExportVisibilityFromCmdline"
+                elif dispatchOrdinal == 4:
+                    expected = "BackendDriverDispatchMinVerifyExportVisibilityParallelFromCmdline"
+                elif dispatchOrdinal == 5:
+                    expected = "BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline"
+                else:
+                    dispatchReady = false
+                if len(expected) <= 0 || stmt.callTarget != expected:
+                    dispatchReady = false
+                    continue
+                LoweringAppendPrimaryObjectIrCallTarget(fnIr, stmt, sourceTexts)
+                dispatchOrdinal = dispatchOrdinal + 1
+            if dispatchReady && dispatchOrdinal == 6 && dispatchDefaultReturnSeen:
+                fnIr.bodyKind = texpr.BodyKindBackendDriverCommandDispatch
+                fnIr.statementReturnMode = texpr.StatementReturnModeNone
+                fnIr.statementReturnI32Value = 0
+                hasLetCall = false
+            else:
+                LoweringClearCallSequence(fnIr)
+                fnIr.bodyKind = "backend_driver_command_dispatch_missing"
+        if dispatchTailName == "BackendDriverDispatchMinRunCommand" &&
+           hasLetCall &&
+           LoweringTextEndsWith(sourcePath, "src/core/tooling/backend_driver_dispatch_min.cheng"):
+            LoweringClearCallSequence(fnIr)
+            LoweringEnsureLocalDeclSlots(fnIr)
+            var wrapperReady = true
+            var sawLetCmd = false
+            var sawReturnDispatch = false
+            var returnSlot = -1
+            for stmtIndex in 0..<fnIr.statements.len:
+                let stmt = fnIr.statements[stmtIndex]
+                if stmt.kind == texpr.TypedExprIrStmtLocalDecl:
+                    continue
+                if stmt.kind == texpr.TypedExprIrStmtLetCall &&
+                   stmt.bindingName == "cmd" &&
+                   LoweringFunctionTailName(stmt.callTarget) == "ParamStr" &&
+                   stmt.callArgCount == 1 &&
+                   !sawLetCmd:
+                    let ordinal = LoweringAppendStructuredCall(fnIr, stmt, sourceTexts)
+                    if ordinal != 0:
+                        wrapperReady = false
+                    else:
+                        sawLetCmd = true
+                    continue
+                if stmt.returnRoot &&
+                   len(stmt.callTarget) > 0 &&
+                   LoweringFunctionTailName(stmt.callTarget) == "BackendDriverDispatchMinRunCommandWithCmd" &&
+                   stmt.callArgCount == 1 &&
+                   sawLetCmd &&
+                   !sawReturnDispatch:
+                    let ordinal = LoweringAppendStructuredCall(fnIr, stmt, sourceTexts)
+                    if ordinal != 1:
+                        wrapperReady = false
+                    else:
+                        returnSlot = fnIr.callSequence[ordinal].resultSlot
+                        sawReturnDispatch = true
+                    continue
+                wrapperReady = false
+            if wrapperReady && sawLetCmd && sawReturnDispatch:
+                let finalTermIndex = LoweringAppendReturnTermForSlot(fnIr, returnSlot)
+                if finalTermIndex < 0:
+                    LoweringClearCallSequence(fnIr)
+                    fnIr.bodyKind = "backend_driver_run_command_wrapper_missing"
+                else:
+                    let _ = coreir.BodyIRAppendBlock(fnIr.bodyIR,
+                                                     0,
+                                                     fnIr.bodyIR.ops.len,
+                                                     finalTermIndex)
+                    fnIr.bodyKind = texpr.BodyKindStatementSequence
+                    fnIr.statementReturnMode = texpr.StatementReturnModeNone
+                    fnIr.statementReturnI32Value = 0
+                    hasLetCall = false
+            else:
+                LoweringClearCallSequence(fnIr)
+                fnIr.bodyKind = "backend_driver_run_command_wrapper_missing"
         if hasLetCall && fnIr.bodyKind == texpr.BodyKindUnsupported && leafBodyKind != texpr.BodyKindUnsupported:
             fnIr.bodyKind = leafBodyKind
         if fnIr.bodyKind == texpr.BodyKindUnsupported && typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
@@ -1559,6 +1947,8 @@ fn LoweringPrimaryObjectIrCountBodyKind(ir: PrimaryObjectIr,
 fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     var out = ""
     var callSequenceCounts = ""
+    var structuredCallSequenceCounts = ""
+    var bodyIrCallSequenceCounts = ""
     var callSequenceTargets = ""
     var statementSequenceCounts = ""
     var statementSequenceKinds = ""
@@ -1570,6 +1960,8 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     for i in 0..<ir.functions.len:
         if i > 0:
             callSequenceCounts = Fmt"{callSequenceCounts},"
+            structuredCallSequenceCounts = Fmt"{structuredCallSequenceCounts},"
+            bodyIrCallSequenceCounts = Fmt"{bodyIrCallSequenceCounts},"
             callSequenceTargets = Fmt"{callSequenceTargets},"
             statementSequenceCounts = Fmt"{statementSequenceCounts},"
             statementSequenceKinds = Fmt"{statementSequenceKinds},"
@@ -1580,6 +1972,8 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
             statementReturnI32Values = Fmt"{statementReturnI32Values},"
         let targetCount: int32 = ir.functions[i].callTargets.len
         callSequenceCounts = Fmt"{callSequenceCounts}{intToStr(targetCount)}"
+        structuredCallSequenceCounts = Fmt"{structuredCallSequenceCounts}{intToStr(ir.functions[i].callSequence.len)}"
+        bodyIrCallSequenceCounts = Fmt"{bodyIrCallSequenceCounts}{intToStr(ir.functions[i].bodyIR.callSequence.len)}"
         if targetCount <= 0:
             callSequenceTargets = Fmt"{callSequenceTargets}-"
         else:
@@ -1665,6 +2059,10 @@ fn LoweringPrimaryObjectIrReportText(ir: PrimaryObjectIr): str =
     LoweringAppendLine(out, "primary_object_ir_function_count", intToStr(ir.functions.len))
     LoweringAppendLine(out, "primary_object_ir_body_kinds", LoweringPrimaryObjectIrBodyKindListText(ir))
     LoweringAppendLine(out, "primary_object_ir_call_sequence_counts", callSequenceCounts)
+    LoweringAppendLine(out, "primary_object_ir_structured_call_sequence_counts", structuredCallSequenceCounts)
+    LoweringAppendLine(out, "primary_object_ir_structured_call_counts", structuredCallSequenceCounts)
+    LoweringAppendLine(out, "primary_object_ir_body_ir_call_sequence_counts", bodyIrCallSequenceCounts)
+    LoweringAppendLine(out, "primary_object_ir_body_ir_call_counts", bodyIrCallSequenceCounts)
     LoweringAppendLine(out, "primary_object_ir_call_sequence_targets", callSequenceTargets)
     LoweringAppendLine(out, "primary_object_ir_statement_sequence_counts", statementSequenceCounts)
     LoweringAppendLine(out, "primary_object_ir_statement_sequence_kinds", statementSequenceKinds)

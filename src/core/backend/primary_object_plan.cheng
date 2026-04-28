@@ -44,6 +44,11 @@ type
         firstMissingBodyKind: str
         firstMissingTypedIrKind: str
         firstMissingLineNumber: int32
+        firstCallSequenceDriftFunction: str
+        firstCallSequenceDriftOrdinal: int32
+        firstCallSequenceDriftLegacyCount: int32
+        firstCallSequenceDriftBodyIrCount: int32
+        firstCallSequenceDriftReason: str
         missingReasons: str[]
         pipelineStage: str
 
@@ -325,6 +330,8 @@ fn PrimaryBodyOpKindText(kind: int32): str =
         return "store_local"
     if kind == coreir.BodyOpCopyLocalTag:
         return "copy_local"
+    if kind == coreir.BodyOpResultProjectTag:
+        return "result_project"
     return "invalid"
 
 fn PrimaryBodyIrOpTargetsLocal(bodyIR: coreir.BodyIR,
@@ -332,6 +339,50 @@ fn PrimaryBodyIrOpTargetsLocal(bodyIR: coreir.BodyIR,
     if op.target < 0:
         return false
     return op.target < bodyIR.localSlots.len
+
+fn PrimaryBodyIrProjectOpSupported(bodyIR: coreir.BodyIR,
+                                    op: coreir.BodyOp): bool =
+    if op.kind != coreir.BodyOpResultProjectTag:
+        return false
+    if op.operands.len < 2:
+        return false
+    let projectKind = op.operands[0]
+    let sourceSlotIndex = op.operands[1]
+    if sourceSlotIndex < 0 || sourceSlotIndex >= bodyIR.localSlots.len:
+        return false
+    if op.target < 0 || op.target >= bodyIR.localSlots.len:
+        return false
+    let sourceSlot = bodyIR.localSlots[sourceSlotIndex]
+    let targetSlot = bodyIR.localSlots[op.target]
+    if sourceSlot.typeKind != coreir.LocalAggregateTag ||
+       sourceSlot.sizeBytes != coreir.ResultStrSizeBytes:
+        return false
+    if projectKind == coreir.BodyResultProjectIsErrTag:
+        return targetSlot.typeKind == coreir.LocalI32Tag
+    if projectKind == coreir.BodyResultProjectErrorStrTag ||
+       projectKind == coreir.BodyResultProjectValueStrTag:
+        return targetSlot.typeKind == coreir.LocalStrTag &&
+               targetSlot.sizeBytes == 24
+    return false
+
+fn PrimaryBodyIrProjectOpWordCount(bodyIR: coreir.BodyIR,
+                                    op: coreir.BodyOp): int32 =
+    if !PrimaryBodyIrProjectOpSupported(bodyIR, op):
+        return 0
+    return 6
+
+fn PrimaryBodyIrOpWordCount(bodyIR: coreir.BodyIR,
+                             op: coreir.BodyOp): int32 =
+    if op.kind == coreir.BodyOpCallTag:
+        if op.operands.len < 1:
+            return 0
+        let callOrdinal = op.operands[0]
+        if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
+            return 0
+        return PrimaryBodyIrCallOpWordCount(bodyIR, bodyIR.callSequence[callOrdinal])
+    if op.kind == coreir.BodyOpResultProjectTag:
+        return PrimaryBodyIrProjectOpWordCount(bodyIR, op)
+    return 0
 
 fn PrimaryBodyIrLocalInitPrefixLen(bodyIR: coreir.BodyIR): int32 =
     var prefixLen: int32
@@ -729,14 +780,18 @@ fn PrimaryBodyIrIsCallCfgReturnInt32(bodyIR: coreir.BodyIR): bool =
         return false
     for opIndex in 0..<bodyIR.ops.len:
         let op = bodyIR.ops[opIndex]
-        if op.kind != coreir.BodyOpCallTag:
-            return false
-        if op.operands.len < 1:
-            return false
-        let callOrdinal = op.operands[0]
-        if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
-            return false
-        if op.target != bodyIR.callSequence[callOrdinal].resultSlot:
+        if op.kind == coreir.BodyOpCallTag:
+            if op.operands.len < 1:
+                return false
+            let callOrdinal = op.operands[0]
+            if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
+                return false
+            if op.target != bodyIR.callSequence[callOrdinal].resultSlot:
+                return false
+        elif op.kind == coreir.BodyOpResultProjectTag:
+            if !PrimaryBodyIrProjectOpSupported(bodyIR, op):
+                return false
+        else:
             return false
     var returnTermCount: int32
     for blockIndex in 0..<bodyIR.blocks.len:
@@ -1759,13 +1814,21 @@ fn PrimaryBodyIrCallCfgReturnInt32WordCount(bodyIR: coreir.BodyIR): int32 =
         for localOpIndex in 0..<block.opCount:
             let opIndex = block.opStart + localOpIndex
             let op = bodyIR.ops[opIndex]
-            if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
+            if op.kind == coreir.BodyOpCallTag:
+                if op.operands.len < 1:
+                    return 0
+                let callOrdinal = op.operands[0]
+                if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
+                    return 0
+                let callOp = bodyIR.callSequence[callOrdinal]
+                wordCount = wordCount + PrimaryBodyIrCallOpWordCount(bodyIR, callOp)
+            elif op.kind == coreir.BodyOpResultProjectTag:
+                let projectWordCount = PrimaryBodyIrProjectOpWordCount(bodyIR, op)
+                if projectWordCount <= 0:
+                    return 0
+                wordCount = wordCount + projectWordCount
+            else:
                 return 0
-            let callOrdinal = op.operands[0]
-            if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
-                return 0
-            let callOp = bodyIR.callSequence[callOrdinal]
-            wordCount = wordCount + PrimaryBodyIrCallOpWordCount(bodyIR, callOp)
         let term = bodyIR.terms[block.termIndex]
         wordCount = wordCount + PrimaryBodyIrTermWordCount(term, epilogueWordCount)
     return wordCount
@@ -2078,13 +2141,10 @@ fn PrimaryBodyIrCallCfgBlockLocalWordOffset(bodyIR: coreir.BodyIR,
         for localOpIndex in 0..<block.opCount:
             let opIndex = block.opStart + localOpIndex
             let op = bodyIR.ops[opIndex]
-            if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
+            let opWordCount = PrimaryBodyIrOpWordCount(bodyIR, op)
+            if opWordCount <= 0:
                 return -1
-            let currentCallOrdinal = op.operands[0]
-            if currentCallOrdinal < 0 || currentCallOrdinal >= bodyIR.callSequence.len:
-                return -1
-            let callOp = bodyIR.callSequence[currentCallOrdinal]
-            localWordIndex = localWordIndex + PrimaryBodyIrCallOpWordCount(bodyIR, callOp)
+            localWordIndex = localWordIndex + opWordCount
         let term = bodyIR.terms[block.termIndex]
         localWordIndex = localWordIndex + PrimaryBodyIrTermWordCount(term, epilogueWordCount)
     return localWordIndex
@@ -2119,28 +2179,36 @@ fn PrimaryBodyIrRelocWordOffset(bodyIR: coreir.BodyIR,
             for localOpIndex in 0..<block.opCount:
                 let opIndex = block.opStart + localOpIndex
                 let op = bodyIR.ops[opIndex]
-                if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
+                if op.kind == coreir.BodyOpCallTag:
+                    if op.operands.len < 1:
+                        return -1
+                    let currentCallOrdinal = op.operands[0]
+                    if currentCallOrdinal < 0 || currentCallOrdinal >= bodyIR.callSequence.len:
+                        return -1
+                    let callOp = bodyIR.callSequence[currentCallOrdinal]
+                    localWordIndex = localWordIndex + PrimaryCallOpRegisterArgCount(callOp)
+                    if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
+                        let resultSlot = bodyIR.localSlots[callOp.resultSlot]
+                        if resultSlot.typeKind == coreir.LocalStrTag ||
+                           resultSlot.typeKind == coreir.LocalAggregateTag:
+                            localWordIndex = localWordIndex + 1
+                    localWordIndex = localWordIndex + PrimaryCallOpStackPreCallWordCount(callOp)
+                    if currentCallOrdinal == callOrdinal:
+                        return wordOffset + localWordIndex
+                    localWordIndex = localWordIndex + 1
+                    localWordIndex = localWordIndex + PrimaryCallOpStackPostCallWordCount(callOp)
+                    if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
+                        let resultSlot = bodyIR.localSlots[callOp.resultSlot]
+                        if resultSlot.typeKind == coreir.LocalI32Tag ||
+                           resultSlot.typeKind == coreir.LocalPtrTag:
+                            localWordIndex = localWordIndex + 1
+                elif op.kind == coreir.BodyOpResultProjectTag:
+                    let projectWordCount = PrimaryBodyIrProjectOpWordCount(bodyIR, op)
+                    if projectWordCount <= 0:
+                        return -1
+                    localWordIndex = localWordIndex + projectWordCount
+                else:
                     return -1
-                let currentCallOrdinal = op.operands[0]
-                if currentCallOrdinal < 0 || currentCallOrdinal >= bodyIR.callSequence.len:
-                    return -1
-                let callOp = bodyIR.callSequence[currentCallOrdinal]
-                localWordIndex = localWordIndex + PrimaryCallOpRegisterArgCount(callOp)
-                if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
-                    let resultSlot = bodyIR.localSlots[callOp.resultSlot]
-                    if resultSlot.typeKind == coreir.LocalStrTag ||
-                       resultSlot.typeKind == coreir.LocalAggregateTag:
-                        localWordIndex = localWordIndex + 1
-                localWordIndex = localWordIndex + PrimaryCallOpStackPreCallWordCount(callOp)
-                if currentCallOrdinal == callOrdinal:
-                    return wordOffset + localWordIndex
-                localWordIndex = localWordIndex + 1
-                localWordIndex = localWordIndex + PrimaryCallOpStackPostCallWordCount(callOp)
-                if callOp.resultSlot >= 0 && callOp.resultSlot < bodyIR.localSlots.len:
-                    let resultSlot = bodyIR.localSlots[callOp.resultSlot]
-                    if resultSlot.typeKind == coreir.LocalI32Tag ||
-                       resultSlot.typeKind == coreir.LocalPtrTag:
-                        localWordIndex = localWordIndex + 1
             let term = bodyIR.terms[block.termIndex]
             localWordIndex = localWordIndex + PrimaryBodyIrTermWordCount(term, epilogueWordCount)
         return -1
@@ -3251,6 +3319,88 @@ fn PrimaryFillBodyIrCallOp(words: var int32[],
                                       storeWord)
             emitIndex = emitIndex + 1
 
+fn PrimaryFillBodyIrResultProjectionOp(words: var int32[],
+                                        emitIndex: var int32,
+                                        bodyIR: coreir.BodyIR,
+                                        op: coreir.BodyOp) =
+    if !PrimaryBodyIrProjectOpSupported(bodyIR, op):
+        return
+    let projectKind = op.operands[0]
+    let sourceSlot = bodyIR.localSlots[op.operands[1]]
+    let targetSlot = bodyIR.localSlots[op.target]
+    if projectKind == coreir.BodyResultProjectIsErrTag:
+        let loadBaseWord = PrimaryArm64RegisterWord(-1186987104, 9)
+        if loadBaseWord == 0:
+            return
+        let loadWord = PrimaryArm64OffsetWord(loadBaseWord,
+                                              sourceSlot.stackOffset + coreir.ResultStrOkOffset,
+                                              4,
+                                              4095)
+        if loadWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, loadWord)
+        emitIndex = emitIndex + 1
+        let cmpWord = PrimaryArm64CmpWRegZeroWord(9)
+        if cmpWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, cmpWord)
+        emitIndex = emitIndex + 1
+        PrimarySetInstructionWord(words,
+                                  emitIndex,
+                                  PrimaryArm64RegisterWord(PrimaryMovI32ConstWord(0), 9))
+        emitIndex = emitIndex + 1
+        let branchWord = PrimaryArm64BCondWord(2, 1)
+        if branchWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, branchWord)
+        emitIndex = emitIndex + 1
+        PrimarySetInstructionWord(words,
+                                  emitIndex,
+                                  PrimaryArm64RegisterWord(PrimaryMovI32ConstWord(1), 9))
+        emitIndex = emitIndex + 1
+        let storeBaseWord = PrimaryArm64RegisterWord(-1191181408, 9)
+        if storeBaseWord == 0:
+            return
+        let storeWord = PrimaryArm64OffsetWord(storeBaseWord,
+                                               targetSlot.stackOffset,
+                                               4,
+                                               4095)
+        if storeWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, storeWord)
+        emitIndex = emitIndex + 1
+        return
+    var sourceFieldOffset = coreir.ResultStrValueOffset
+    if projectKind == coreir.BodyResultProjectErrorStrTag:
+        sourceFieldOffset = coreir.ResultStrErrMsgOffset
+    elif projectKind != coreir.BodyResultProjectValueStrTag:
+        return
+    for copyIndex in 0..<3:
+        let sourceOffset = sourceSlot.stackOffset + sourceFieldOffset + copyIndex * 8
+        let targetOffset = targetSlot.stackOffset + copyIndex * 8
+        let loadBaseWord = PrimaryArm64RegisterWord(-113245280, 9)
+        if loadBaseWord == 0:
+            return
+        let loadWord = PrimaryArm64OffsetWord(loadBaseWord,
+                                              sourceOffset,
+                                              8,
+                                              4095)
+        if loadWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, loadWord)
+        emitIndex = emitIndex + 1
+        let storeBaseWord = PrimaryArm64RegisterWord(-117439584, 9)
+        if storeBaseWord == 0:
+            return
+        let storeWord = PrimaryArm64OffsetWord(storeBaseWord,
+                                               targetOffset,
+                                               8,
+                                               4095)
+        if storeWord == 0:
+            return
+        PrimarySetInstructionWord(words, emitIndex, storeWord)
+        emitIndex = emitIndex + 1
+
 fn PrimaryFillCallCfgReturnInt32Term(words: var int32[],
                                       emitIndex: var int32,
                                       bodyIR: coreir.BodyIR,
@@ -3359,22 +3509,33 @@ fn PrimaryFillCallCfgReturnInt32(words: var int32[],
             if opIndex < 0 || opIndex >= bodyIR.ops.len:
                 return
             let op = bodyIR.ops[opIndex]
-            if op.kind != coreir.BodyOpCallTag || op.operands.len < 1:
-                return
-            let callOrdinal = op.operands[0]
-            if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
-                return
-            let callOp = bodyIR.callSequence[callOrdinal]
-            let beforeCallEmitIndex = emitIndex
-            PrimaryFillBodyIrCallOp(words,
-                                    emitIndex,
-                                    bodyIR,
-                                    callOp,
-                                    frameBytes,
-                                    paramSaveCount,
-                                    paramSaveOffset)
-            let expectedAfterCall = beforeCallEmitIndex + PrimaryBodyIrCallOpWordCount(bodyIR, callOp)
-            if emitIndex != expectedAfterCall:
+            let beforeOpEmitIndex = emitIndex
+            if op.kind == coreir.BodyOpCallTag:
+                if op.operands.len < 1:
+                    return
+                let callOrdinal = op.operands[0]
+                if callOrdinal < 0 || callOrdinal >= bodyIR.callSequence.len:
+                    return
+                let callOp = bodyIR.callSequence[callOrdinal]
+                PrimaryFillBodyIrCallOp(words,
+                                        emitIndex,
+                                        bodyIR,
+                                        callOp,
+                                        frameBytes,
+                                        paramSaveCount,
+                                        paramSaveOffset)
+                let expectedAfterCall = beforeOpEmitIndex + PrimaryBodyIrCallOpWordCount(bodyIR, callOp)
+                if emitIndex != expectedAfterCall:
+                    return
+            elif op.kind == coreir.BodyOpResultProjectTag:
+                PrimaryFillBodyIrResultProjectionOp(words,
+                                                    emitIndex,
+                                                    bodyIR,
+                                                    op)
+                let expectedAfterProject = beforeOpEmitIndex + PrimaryBodyIrProjectOpWordCount(bodyIR, op)
+                if emitIndex != expectedAfterProject:
+                    return
+            else:
                 return
         if block.termIndex < 0 || block.termIndex >= bodyIR.terms.len:
             return
@@ -4491,6 +4652,11 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
     var firstMissingBodyKind = ""
     var firstMissingTypedIrKind = ""
     var firstMissingLineNumber: int32
+    var firstCallSequenceDriftFunction = ""
+    var firstCallSequenceDriftOrdinal: int32 = -1
+    var firstCallSequenceDriftLegacyCount: int32
+    var firstCallSequenceDriftBodyIrCount: int32
+    var firstCallSequenceDriftReason = ""
     var irIndexes: int32[]
     var wordCounts: int32[]
     var reachable: bool[]
@@ -4656,26 +4822,32 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                             firstMissingBodyKind = "call_sequence_body_ir_drift"
                             firstMissingTypedIrKind = ""
                             firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                if callSequenceReady && bodyIrRequiresCalls:
-                    var driftCallCount = lowering.primaryObjectIr.functions[irIndex].callSequence.len
-                    if lowering.primaryObjectIr.functions[irIndex].bodyIR.callSequence.len < driftCallCount:
-                        driftCallCount = lowering.primaryObjectIr.functions[irIndex].bodyIR.callSequence.len
-                    for callOrdinal in 0..<driftCallCount:
-                        let callOp = lowering.primaryObjectIr.functions[irIndex].callSequence[callOrdinal]
-                        let bodyCallOp = lowering.primaryObjectIr.functions[irIndex].bodyIR.callSequence[callOrdinal]
-                        if callOp.targetSymbol != bodyCallOp.targetSymbol ||
-                           callOp.resultSlot != bodyCallOp.resultSlot ||
-                           callOp.argSlots.len != bodyCallOp.argSlots.len:
-                            callSequenceReady = false
-                            bodySemanticsMissing = true
-                            if Len(firstMissingFunction) <= 0:
-                                firstMissingFunction = lowering.functionNames[currentIndex]
-                                firstMissingBodyKind = "call_sequence_body_ir_drift"
-                                firstMissingTypedIrKind = ""
-                                firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                            break
-                        for argIndex in 0..<callOp.argSlots.len:
-                            if callOp.argSlots[argIndex] != bodyCallOp.argSlots[argIndex]:
+                        if Len(firstCallSequenceDriftFunction) <= 0:
+                            firstCallSequenceDriftFunction = lowering.functionNames[currentIndex]
+                            firstCallSequenceDriftOrdinal = -1
+                            firstCallSequenceDriftLegacyCount = callSequenceLen
+                            firstCallSequenceDriftBodyIrCount = bodyCallSequenceLen
+                            firstCallSequenceDriftReason = "length_mismatch"
+                    elif bodyIrRequiresCalls:
+                        for callOrdinal in 0..<callSequenceLen:
+                            let callOp = lowering.primaryObjectIr.functions[irIndex].callSequence[callOrdinal]
+                            let bodyCallOp = lowering.primaryObjectIr.functions[irIndex].bodyIR.callSequence[callOrdinal]
+                            var driftReason = ""
+                            if callOp.targetSymbol != bodyCallOp.targetSymbol:
+                                driftReason = "target_symbol_mismatch"
+                            elif callOp.resultSlot != bodyCallOp.resultSlot:
+                                driftReason = "result_slot_mismatch"
+                            else:
+                                let argSlotCount = callOp.argSlots.len
+                                let bodyArgSlotCount = bodyCallOp.argSlots.len
+                                if argSlotCount != bodyArgSlotCount:
+                                    driftReason = "arg_count_mismatch"
+                                else:
+                                    for argIndex in 0..<argSlotCount:
+                                        if callOp.argSlots[argIndex] != bodyCallOp.argSlots[argIndex]:
+                                            driftReason = "arg_slot_mismatch"
+                                            break
+                            if Len(driftReason) > 0:
                                 callSequenceReady = false
                                 bodySemanticsMissing = true
                                 if Len(firstMissingFunction) <= 0:
@@ -4683,11 +4855,16 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                                     firstMissingBodyKind = "call_sequence_body_ir_drift"
                                     firstMissingTypedIrKind = ""
                                     firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                                if Len(firstCallSequenceDriftFunction) <= 0:
+                                    firstCallSequenceDriftFunction = lowering.functionNames[currentIndex]
+                                    firstCallSequenceDriftOrdinal = callOrdinal
+                                    firstCallSequenceDriftLegacyCount = callSequenceLen
+                                    firstCallSequenceDriftBodyIrCount = bodyCallSequenceLen
+                                    firstCallSequenceDriftReason = driftReason
                                 break
-                        if !callSequenceReady:
-                            break
                 if callSequenceReady:
-                    for callOrdinal in 0..<lowering.primaryObjectIr.functions[irIndex].callSequence.len:
+                    let frontierCallSequenceLen = lowering.primaryObjectIr.functions[irIndex].callSequence.len
+                    for callOrdinal in 0..<frontierCallSequenceLen:
                         let callOp = lowering.primaryObjectIr.functions[irIndex].callSequence[callOrdinal]
                         if callOp.importc:
                             continue
@@ -4772,26 +4949,32 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                         firstMissingBodyKind = "call_sequence_body_ir_drift"
                         firstMissingTypedIrKind = ""
                         firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-            if callSequenceReady && bodyIrRequiresCalls:
-                var driftCallCount = lowering.primaryObjectIr.functions[irIndex].callSequence.len
-                if lowering.primaryObjectIr.functions[irIndex].bodyIR.callSequence.len < driftCallCount:
-                    driftCallCount = lowering.primaryObjectIr.functions[irIndex].bodyIR.callSequence.len
-                for callOrdinal in 0..<driftCallCount:
-                    let callOp = lowering.primaryObjectIr.functions[irIndex].callSequence[callOrdinal]
-                    let bodyCallOp = lowering.primaryObjectIr.functions[irIndex].bodyIR.callSequence[callOrdinal]
-                    if callOp.targetSymbol != bodyCallOp.targetSymbol ||
-                       callOp.resultSlot != bodyCallOp.resultSlot ||
-                       callOp.argSlots.len != bodyCallOp.argSlots.len:
-                        callSequenceReady = false
-                        bodySemanticsMissing = true
-                        if Len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[i]
-                            firstMissingBodyKind = "call_sequence_body_ir_drift"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
-                        break
-                    for argIndex in 0..<callOp.argSlots.len:
-                        if callOp.argSlots[argIndex] != bodyCallOp.argSlots[argIndex]:
+                    if Len(firstCallSequenceDriftFunction) <= 0:
+                        firstCallSequenceDriftFunction = lowering.functionNames[i]
+                        firstCallSequenceDriftOrdinal = -1
+                        firstCallSequenceDriftLegacyCount = callSequenceLen
+                        firstCallSequenceDriftBodyIrCount = bodyCallSequenceLen
+                        firstCallSequenceDriftReason = "length_mismatch"
+                elif bodyIrRequiresCalls:
+                    for callOrdinal in 0..<callSequenceLen:
+                        let callOp = lowering.primaryObjectIr.functions[irIndex].callSequence[callOrdinal]
+                        let bodyCallOp = lowering.primaryObjectIr.functions[irIndex].bodyIR.callSequence[callOrdinal]
+                        var driftReason = ""
+                        if callOp.targetSymbol != bodyCallOp.targetSymbol:
+                            driftReason = "target_symbol_mismatch"
+                        elif callOp.resultSlot != bodyCallOp.resultSlot:
+                            driftReason = "result_slot_mismatch"
+                        else:
+                            let argSlotCount = callOp.argSlots.len
+                            let bodyArgSlotCount = bodyCallOp.argSlots.len
+                            if argSlotCount != bodyArgSlotCount:
+                                driftReason = "arg_count_mismatch"
+                            else:
+                                for argIndex in 0..<argSlotCount:
+                                    if callOp.argSlots[argIndex] != bodyCallOp.argSlots[argIndex]:
+                                        driftReason = "arg_slot_mismatch"
+                                        break
+                        if Len(driftReason) > 0:
                             callSequenceReady = false
                             bodySemanticsMissing = true
                             if Len(firstMissingFunction) <= 0:
@@ -4799,11 +4982,16 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                                 firstMissingBodyKind = "call_sequence_body_ir_drift"
                                 firstMissingTypedIrKind = ""
                                 firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                            if Len(firstCallSequenceDriftFunction) <= 0:
+                                firstCallSequenceDriftFunction = lowering.functionNames[i]
+                                firstCallSequenceDriftOrdinal = callOrdinal
+                                firstCallSequenceDriftLegacyCount = callSequenceLen
+                                firstCallSequenceDriftBodyIrCount = bodyCallSequenceLen
+                                firstCallSequenceDriftReason = driftReason
                             break
-                    if !callSequenceReady:
-                        break
             if callSequenceReady:
-                for callOrdinal in 0..<lowering.primaryObjectIr.functions[irIndex].callSequence.len:
+                let reachableCallSequenceLen = lowering.primaryObjectIr.functions[irIndex].callSequence.len
+                for callOrdinal in 0..<reachableCallSequenceLen:
                     let callOp = lowering.primaryObjectIr.functions[irIndex].callSequence[callOrdinal]
                     if callOp.importc:
                         if Len(callOp.importcSymbol) <= 0:
@@ -4851,8 +5039,9 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                 wordNeedsCallSequence = true
         if wordNeedsCallSequence:
             var requiredCallCount = PrimaryStatementSequenceRequiredCallCount(statementMode)
+            let wordCallSequenceLen = lowering.primaryObjectIr.functions[irIndex].callSequence.len
             if bodyIrRequiresCalls:
-                requiredCallCount = lowering.primaryObjectIr.functions[irIndex].callSequence.len
+                requiredCallCount = wordCallSequenceLen
             elif requiredCallCount <= 0:
                 requiredCallCount = 1
                 if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
@@ -4863,7 +5052,7 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                     requiredCallCount = 6
                 elif bodyKind == texpr.BodyKindResultRequestDispatch:
                     requiredCallCount = 2
-            if lowering.primaryObjectIr.functions[irIndex].callSequence.len < requiredCallCount:
+            if wordCallSequenceLen < requiredCallCount:
                 bodySemanticsMissing = true
                 if Len(firstMissingFunction) <= 0:
                     firstMissingFunction = lowering.functionNames[i]
@@ -4888,8 +5077,9 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                 planNeedsCallSequence = true
         if planNeedsCallSequence:
             var planRequiredCallCount = PrimaryStatementSequenceRequiredCallCount(planStatementMode)
+            let objectCallSequenceLen = lowering.primaryObjectIr.functions[irIndex].callSequence.len
             if bodyIrRequiresCalls:
-                planRequiredCallCount = lowering.primaryObjectIr.functions[irIndex].callSequence.len
+                planRequiredCallCount = objectCallSequenceLen
             elif planRequiredCallCount <= 0:
                 planRequiredCallCount = 1
                 if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
@@ -4900,7 +5090,7 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                     planRequiredCallCount = 6
                 elif bodyKind == texpr.BodyKindResultRequestDispatch:
                     planRequiredCallCount = 2
-            if lowering.primaryObjectIr.functions[irIndex].callSequence.len < planRequiredCallCount:
+            if objectCallSequenceLen < planRequiredCallCount:
                 bodySemanticsMissing = true
                 if Len(firstMissingFunction) <= 0:
                     firstMissingFunction = lowering.functionNames[i]
@@ -4940,7 +5130,8 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                 add(plan.dataLabels, argvLabel)
                 add(plan.dataPayloadTexts, "zero:8")
         if PrimaryBodyIrStatementReturnMode(lowering.primaryObjectIr.functions[irIndex].bodyIR) == PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0():
-            for callOrdinal in 0..<lowering.primaryObjectIr.functions[irIndex].callSequence.len:
+            let literalCallSequenceLen = lowering.primaryObjectIr.functions[irIndex].callSequence.len
+            for callOrdinal in 0..<literalCallSequenceLen:
                 var literalContent = ""
                 if !PrimarySimpleStringLiteralContent(lowering.primaryObjectIr.functions[irIndex].callSequence[callOrdinal].argsText,
                                                        literalContent):
@@ -4973,8 +5164,9 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                 relocNeedsCallSequence = true
         if relocNeedsCallSequence:
             var relocCallCount = PrimaryStatementSequenceRequiredCallCount(planStatementMode)
+            let planCallSequenceLen = lowering.primaryObjectIr.functions[irIndex].callSequence.len
             if bodyIrRequiresCalls:
-                relocCallCount = lowering.primaryObjectIr.functions[irIndex].callSequence.len
+                relocCallCount = planCallSequenceLen
             elif relocCallCount <= 0:
                 relocCallCount = 1
                 if texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
@@ -4986,7 +5178,7 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                 elif bodyKind == texpr.BodyKindResultRequestDispatch:
                     relocCallCount = 2
             for callOrdinal in 0..<relocCallCount:
-                if callOrdinal >= lowering.primaryObjectIr.functions[irIndex].callSequence.len:
+                if callOrdinal >= planCallSequenceLen:
                     bodySemanticsMissing = true
                     if Len(firstMissingFunction) <= 0:
                         firstMissingFunction = lowering.functionNames[i]
@@ -5138,6 +5330,11 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
     plan.firstMissingBodyKind = firstMissingBodyKind
     plan.firstMissingTypedIrKind = firstMissingTypedIrKind
     plan.firstMissingLineNumber = firstMissingLineNumber
+    plan.firstCallSequenceDriftFunction = firstCallSequenceDriftFunction
+    plan.firstCallSequenceDriftOrdinal = firstCallSequenceDriftOrdinal
+    plan.firstCallSequenceDriftLegacyCount = firstCallSequenceDriftLegacyCount
+    plan.firstCallSequenceDriftBodyIrCount = firstCallSequenceDriftBodyIrCount
+    plan.firstCallSequenceDriftReason = firstCallSequenceDriftReason
     plan.missingReasons = PrimaryObjectMissingReasons(linkPlan,
                                                         lowering,
                                                         itemIds,
@@ -5186,5 +5383,10 @@ primary_object_first_missing_function={plan.firstMissingFunction}
 primary_object_first_missing_body_kind={plan.firstMissingBodyKind}
 primary_object_first_missing_typed_ir_kind={plan.firstMissingTypedIrKind}
 primary_object_first_missing_line_number={plan.firstMissingLineNumber}
+primary_object_first_call_sequence_drift_function={plan.firstCallSequenceDriftFunction}
+primary_object_first_call_sequence_drift_ordinal={plan.firstCallSequenceDriftOrdinal}
+primary_object_first_call_sequence_drift_legacy_count={plan.firstCallSequenceDriftLegacyCount}
+primary_object_first_call_sequence_drift_body_ir_count={plan.firstCallSequenceDriftBodyIrCount}
+primary_object_first_call_sequence_drift_reason={plan.firstCallSequenceDriftReason}
 primary_object_pipeline_stage={plan.pipelineStage}
 """

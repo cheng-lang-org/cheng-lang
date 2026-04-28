@@ -1,0 +1,55 @@
+import std/os
+import std/result
+import std/strutils as strutil
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/lang/parser
+import cheng/core/tooling/compiler_csg as ccsg
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/path as chengpath
+
+fn reportFieldValue(report: str, key: str): str =
+    let taggedReport = strutil.Join(["\n", report], "")
+    let needle = strutil.Join(["\n", key, "="], "")
+    let fieldPos = parser.ParserFindText(taggedReport, needle)
+    if fieldPos < 0:
+        return ""
+    let valueStart = fieldPos + needle.len
+    let tail = chengpath.TextSlice(taggedReport, valueStart, taggedReport.len - valueStart)
+    let newlinePos = parser.ParserFindText(tail, "\n")
+    if newlinePos < 0:
+        return tail
+    if newlinePos == 0:
+        return ""
+    return chengpath.TextSlice(tail, 0, newlinePos)
+
+fn main(): int32 =
+    let workspaceRoot = chengpath.PathCurrentDir()
+    let packageRoot = workspaceRoot
+    let sourcePath = chengpath.PathJoin(packageRoot, "src/core/tooling/backend_driver_dispatch_min.cheng")
+    let outputPath = chengpath.PathJoin(workspaceRoot, "artifacts/probes/backend_driver_min_lowering_drift_probe")
+    let req = creq.CompilerRequestNew(packageRoot,
+                                      sourcePath,
+                                      outputPath,
+                                      "arm64-apple-darwin",
+                                      creq.EmitExe,
+                                      "")
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err = ""
+    assert(slplan.BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err),
+           strutil.Join(["backend driver min lowering drift: link plan ", err], ""))
+    let sourceBundleRes = slplan.SystemLinkPlanSourceBundleCid(linkPlan)
+    assert(IsOk(sourceBundleRes), "backend driver min lowering drift: source bundle")
+    var csg: ccsg.CompilerCsg
+    var csgErr = ""
+    assert(ccsg.BuildCompilerCsgInto(linkPlan, Value(sourceBundleRes), csg, csgErr),
+           strutil.Join(["backend driver min lowering drift: csg ", csgErr], ""))
+    var plan: lower.LoweringPlanStub
+    assert(lower.BuildLoweringPlanStubFromCompilerCsg(linkPlan, csg, plan, err),
+           strutil.Join(["backend driver min lowering drift: lowering ", err], ""))
+    let report = lower.LoweringPlanStubReport(plan)
+    echo(strutil.Join(["call_sequence_counts=", reportFieldValue(report, "primary_object_ir_call_sequence_counts")], ""))
+    echo(strutil.Join(["body_ir_call_counts=", reportFieldValue(report, "primary_object_ir_body_ir_call_counts")], ""))
+    echo(strutil.Join(["body_kinds=", reportFieldValue(report, "primary_object_ir_body_kinds")], ""))
+    echo(strutil.Join(["call_targets=", reportFieldValue(report, "primary_object_ir_call_sequence_targets")], ""))
+    return 0
