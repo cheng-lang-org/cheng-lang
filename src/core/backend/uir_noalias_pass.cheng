@@ -504,6 +504,69 @@ fn uirNoAliasRunFunc(func: UirCoreFunc, changedAny: var bool, forwardedLoads: va
             changedAny = true
     return funcChanged
 
+fn uirNoAliasAnalyzeOwnershipExpr(func: UirCoreFunc, localCount: int32, addressTaken: var bool[]) =
+    var emptyBases: int32[]
+    for bi in 0..<uirCoreFuncBlocksLen(func):
+        let blk: UirBlockId = uirCoreFuncBlockAt(func, bi)
+        if blk <= 0:
+            continue
+        let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+        for si in 0..<stmtCount:
+            var st: UirStmtId = uirCoreBlockStmtAt(blk, si)
+            let kind: UirStmtKind = uirCoreStmtKindOf(st)
+            if kind == msStore:
+                let addrExpr: UirExpr = uirCoreStmtAddrExprOf(st)
+                if addrExpr > 0:
+                    let base = uirNoAliasResolveAddrBaseSlot(addrExpr, emptyBases)
+                    if base >= 0 && base < localCount:
+                        addressTaken[base] = true
+            elif kind == msCall:
+                let callExpr: UirExpr = uirCoreStmtExprOf(st)
+                if callExpr > 0:
+                    for ai in 0..<uirExprArgCount(callExpr):
+                        let arg: UirExpr = uirExprArgAt(callExpr, ai)
+                        if arg > 0:
+                            let base = uirNoAliasResolveAddrBaseSlot(arg, emptyBases)
+                            if base >= 0 && base < localCount:
+                                addressTaken[base] = true
+
+fn uirNoAliasBuildOwnershipMask(func: UirCoreFunc,
+                                  noAliasMask: var bool[],
+                                  aliasSafeMask: var bool[]): int32 =
+    let localCount: int32 = uirCoreFuncLocalsLen(func)
+    if localCount <= 0:
+        return 0
+    var addressTaken: bool[]
+    var storeCount: int32[]
+    for _ in 0..<localCount:
+        add(noAliasMask, false)
+        add(aliasSafeMask, false)
+        add(addressTaken, false)
+        add(storeCount, 0)
+    var emptyBases: int32[]
+    uirNoAliasAnalyzeOwnershipExpr(func, localCount, addressTaken)
+    for bi in 0..<uirCoreFuncBlocksLen(func):
+        let blk: UirBlockId = uirCoreFuncBlockAt(func, bi)
+        if blk <= 0:
+            continue
+        let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+        for si in 0..<stmtCount:
+            var st: UirStmtId = uirCoreBlockStmtAt(blk, si)
+            let kind: UirStmtKind = uirCoreStmtKindOf(st)
+            if kind == msStore:
+                let base = uirNoAliasResolveAddrBaseSlot(uirCoreStmtAddrExprOf(st), emptyBases)
+                if base >= 0 && base < localCount:
+                    storeCount[base] = storeCount[base] + 1
+    var ownedCount: int32 = 0
+    for li in 0..<localCount:
+        if !addressTaken[li] && storeCount[li] == 1:
+            noAliasMask[li] = true
+            aliasSafeMask[li] = true
+            ownedCount = ownedCount + 1
+        elif !addressTaken[li] && storeCount[li] == 0:
+            aliasSafeMask[li] = true
+    return ownedCount
+
 fn uirNoAliasEmitReport(forwardedLoads: int32, mem2regLoads: int32, mem2regStores: int32,
                         changedFuncs: int32, proofBackedChanges: int32, proofCheckedFuncs: int32,
                         proofSkippedFuncs: int32, proofRequired: bool, njvlLite: bool,
