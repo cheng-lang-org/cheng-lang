@@ -1,0 +1,1028 @@
+import std/result
+import std/rawbytes
+import std/strformat
+import std/strings
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/object_buffer as obuf
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/backend/target_matrix as tmat
+import cheng/core/lang/typed_expr as texpr
+
+const
+    DirectExeMachOPageSize = 16384
+    DirectExeMachOVmBase = 0x100000000
+    DirectExeMachOSymalign = 8
+    DirectExeElfPageSize = 4096
+    DirectExeElfTextBase = 0x400000
+
+type
+    DirectExeEmitResult =
+        outputPath: str
+        bytesWritten: int32
+        symbolCount: int32
+        layoutMs: int64
+        emitMs: int64
+        entryByteOffset: int32
+        targetTriple: str
+
+    DirectExeResolvedSym =
+        name: str
+        value: int64
+        sectionNum: int32
+        defined: bool
+        funcIndex: int32
+        size: int64
+
+@importc("cheng_monotime_ns")
+fn DirectExeMonoTimeNsBridge(): int64
+
+fn DirectExeNowMs(): int64 =
+    return DirectExeMonoTimeNsBridge() / int64(1000000)
+
+fn DirectExeAlign(value: int32, align: int32): int32 =
+    if align <= 1:
+        return value
+    let mask = align - 1
+    return (value + mask) & (0 - align)
+
+fn DirectExePageAlign(value: int32, pageSize: int32): int32 =
+    return DirectExeAlign(value, pageSize)
+
+fn DirectExeIsDarwinArm64(triple: str): bool =
+    return triple == "arm64-apple-darwin" || triple == "aarch64-apple-darwin"
+
+fn DirectExeIsLinuxAarch64(triple: str): bool =
+    return tmat.TargetIsLinuxAarch64(triple)
+
+fn DirectExeIsElfFormat(format: str): bool =
+    return format == "elf"
+
+fn DirectExeIsMachOFormat(format: str): bool =
+    return format == "macho"
+
+fn DirectExeEntryFunctionIndex(plan: pobj.PrimaryObjectPlan): int32 =
+    if Len(plan.entryFunctionSymbol) > 0:
+        for i in 0..<plan.symbolNames.len:
+            if plan.symbolNames[i] == plan.entryFunctionSymbol:
+                return i
+    if plan.symbolNames.len > 0:
+        return 0
+    return -1
+
+fn DirectExeRealFunctionLimit(plan: pobj.PrimaryObjectPlan): int32 =
+    for i in 0..<plan.functionBodyKinds.len:
+        if plan.functionBodyKinds[i] == texpr.BodyKindEntryBridge:
+            return i
+    return plan.functionBodyKinds.len
+
+fn DirectExePayloadByteCount(payloadText: str): int32 =
+    let zeroPrefix = "zero:"
+    if chengpath.TextStartsWith(payloadText, zeroPrefix):
+        let raw = strings.SliceBytes(payloadText, Len(zeroPrefix), Len(payloadText) - Len(zeroPrefix))
+        var value: int32
+        for i in 0..<Len(raw):
+            let ch = raw[i]
+            if ch < '0' || ch > '9':
+                return value
+            value = value * 10 + int32(ch) - int32('0')
+        return value
+    let cstringPrefix = "cstring:"
+    if chengpath.TextStartsWith(payloadText, cstringPrefix):
+        let raw = strings.SliceBytes(payloadText, Len(cstringPrefix), Len(payloadText) - Len(cstringPrefix))
+        var count: int32 = 1
+        var escaped = false
+        for i in 0..<Len(raw):
+            if escaped:
+                escaped = false
+                count = count + 1
+            elif raw[i] == char(92):
+                escaped = true
+            else:
+                count = count + 1
+        if escaped:
+            count = count + 1
+        return count
+    return 0
+
+fn DirectExeEmitWriteU8(buf: var obuf.ObjectBuffer,
+                          value: int32) =
+    obuf.ObjectBufferWriteU8(buf, value)
+
+fn DirectExeEmitWriteU16LE(buf: var obuf.ObjectBuffer,
+                             value: uint64) =
+    obuf.ObjectBufferWriteU16LE(buf, value)
+
+fn DirectExeEmitWriteU32LE(buf: var obuf.ObjectBuffer,
+                             value: uint64) =
+    obuf.ObjectBufferWriteU32LE(buf, value)
+
+fn DirectExeEmitWriteU64LE(buf: var obuf.ObjectBuffer,
+                             value: uint64) =
+    obuf.ObjectBufferWriteU64LE(buf, value)
+
+fn DirectExeEmitWriteCString(buf: var obuf.ObjectBuffer,
+                               text: str) =
+    for i in 0..<Len(text):
+        obuf.ObjectBufferWriteU8(buf, Int32(text[i]) & 255)
+    obuf.ObjectBufferWriteU8(buf, 0)
+
+fn DirectExeEmitWritePadded(buf: var obuf.ObjectBuffer,
+                              text: str,
+                              width: int32) =
+    for i in 0..<width:
+        if i < Len(text):
+            obuf.ObjectBufferWriteU8(buf, Int32(text[i]) & 255)
+        else:
+            obuf.ObjectBufferWriteU8(buf, 0)
+
+fn DirectExeEmitCStringPayloadByte(raw: str,
+                                     index: int32): int32 =
+    if index < 0 || index >= Len(raw):
+        return 0
+    let ch = raw[index]
+    if ch == 'n':
+        return 10
+    if ch == 'r':
+        return 13
+    if ch == 't':
+        return 9
+    if ch == '0':
+        return 0
+    return int32(ch)
+
+fn DirectExeEmitWriteCStringPayload(data: var obuf.ObjectBuffer,
+                                      payloadText: str) =
+    let prefix = "cstring:"
+    if !chengpath.TextStartsWith(payloadText, prefix):
+        return
+    let raw = strings.SliceBytes(payloadText, Len(prefix), Len(payloadText) - Len(prefix))
+    var escaped = false
+    for i in 0..<Len(raw):
+        if escaped:
+            obuf.ObjectBufferWriteU8(data, DirectExeEmitCStringPayloadByte(raw, i))
+            escaped = false
+        elif raw[i] == char(92):
+            escaped = true
+        else:
+            obuf.ObjectBufferWriteU8(data, int32(raw[i]))
+    if escaped:
+        obuf.ObjectBufferWriteU8(data, int32(char(92)))
+    obuf.ObjectBufferWriteU8(data, 0)
+
+fn DirectExeEmitPlanDataByteCount(plan: pobj.PrimaryObjectPlan): int32 =
+    var total: int32
+    for i in 0..<plan.dataLabels.len:
+        var payloadText = ""
+        if i < plan.dataPayloadTexts.len:
+            payloadText = plan.dataPayloadTexts[i]
+        total = total + DirectExePayloadByteCount(payloadText)
+    return total
+
+fn DirectExeEmitPlanDataBytes(plan: pobj.PrimaryObjectPlan): Bytes =
+    var data = obuf.ObjectBufferInit(64)
+    for i in 0..<plan.dataLabels.len:
+        var payloadText = ""
+        if i < plan.dataPayloadTexts.len:
+            payloadText = plan.dataPayloadTexts[i]
+        if chengpath.TextStartsWith(payloadText, "cstring:"):
+            DirectExeEmitWriteCStringPayload(data, payloadText)
+        else:
+            let count = DirectExePayloadByteCount(payloadText)
+            obuf.ObjectBufferWriteZeros(data, count)
+    return obuf.ObjectBufferToBytes(data)
+
+fn DirectExeEmitTextBytesFromWords(words: int32[]): Bytes =
+    var text = obuf.ObjectBufferInit(words.len * 4 + 16)
+    for i in 0..<words.len:
+        let word = words[i]
+        obuf.ObjectBufferWriteU8(text, word & 255)
+        obuf.ObjectBufferWriteU8(text, (word >> 8) & 255)
+        obuf.ObjectBufferWriteU8(text, (word >> 16) & 255)
+        obuf.ObjectBufferWriteU8(text, (word >> 24) & 255)
+    return obuf.ObjectBufferToBytes(text)
+
+fn DirectExeBuildResolvedSyms(plan: pobj.PrimaryObjectPlan,
+                                textVA: int64,
+                                dataVA: int64,
+                                functionLimit: int32): DirectExeResolvedSym[] =
+    var syms: DirectExeResolvedSym[]
+    for i in 0..<functionLimit:
+        if i >= plan.functionWordOffsets.len || i >= plan.symbolNames.len:
+            continue
+        var s: DirectExeResolvedSym
+        s.name = plan.symbolNames[i]
+        s.value = textVA + int64(plan.functionWordOffsets[i] * 4)
+        s.sectionNum = 1
+        s.defined = true
+        s.funcIndex = i
+        s.size = int64(plan.functionWordCounts[i] * 4)
+        add(syms, s)
+    var dataAccum: int32
+    for i in 0..<plan.dataLabels.len:
+        var payloadSize: int32
+        if i < plan.dataPayloadTexts.len:
+            payloadSize = DirectExePayloadByteCount(plan.dataPayloadTexts[i])
+        var s: DirectExeResolvedSym
+        s.name = plan.dataLabels[i]
+        s.value = dataVA + int64(dataAccum)
+        s.sectionNum = 2
+        s.defined = true
+        s.funcIndex = -1
+        s.size = int64(payloadSize)
+        add(syms, s)
+        dataAccum = dataAccum + payloadSize
+    for relocIndex in 0..<plan.relocTargetSymbols.len:
+        let targetName = plan.relocTargetSymbols[relocIndex]
+        if Len(targetName) <= 0:
+            continue
+        var already = false
+        for si in 0..<syms.len:
+            if syms[si].name == targetName:
+                already = true
+                break
+        if already:
+            continue
+        var s: DirectExeResolvedSym
+        s.name = targetName
+        s.value = int64(0)
+        s.sectionNum = 0
+        s.defined = false
+        s.funcIndex = -1
+        s.size = int64(0)
+        add(syms, s)
+    return syms
+
+fn DirectExeFindSym(syms: DirectExeResolvedSym[],
+                      name: str): int32 =
+    for i in 0..<syms.len:
+        if syms[i].name == name:
+            return i
+    return -1
+
+fn DirectExeWordCopy(src: int32[]): int32[] =
+    var out: int32[]
+    for i in 0..<src.len:
+        add(out, src[i])
+    return out
+
+fn DirectExePatchBranch(words: var int32[],
+                          wordOff: int32,
+                          srcVA: int64,
+                          tgtVA: int64) =
+    if wordOff < 0 || wordOff >= words.len:
+        return
+    let offset = tgtVA - srcVA
+    if offset < int64(-134217728) || offset > int64(134217727):
+        return
+    let instr = words[wordOff]
+    let imm26 = int32(offset / int64(4)) & 0x3ffffff
+    words[wordOff] = (instr & 0xfc000000) | imm26
+
+fn DirectExePatchAdrpAdd(words: var int32[],
+                           adrpOff: int32,
+                           srcVA: int64,
+                           tgtVA: int64) =
+    if adrpOff < 0 || adrpOff + 1 >= words.len:
+        return
+    let srcPage = srcVA >> 12
+    let tgtPage = tgtVA >> 12
+    let pageDelta = tgtPage - srcPage
+    let imm21 = int32(pageDelta & 0x1fffff)
+    let immlo = imm21 & 3
+    let immhi = (imm21 >> 2) & 0x7ffff
+    let adrp = words[adrpOff]
+    words[adrpOff] = (adrp & 0x9f00001f) | (immlo << 29) | (immhi << 5)
+    let addInstr = words[adrpOff + 1]
+    let pageOff = int32(tgtVA & 0xfff)
+    words[adrpOff + 1] = (addInstr & 0xffc003ff) | (pageOff << 10)
+
+fn DirectExePatchAddImm12(words: var int32[],
+                            addOff: int32,
+                            tgtVA: int64) =
+    if addOff < 0 || addOff >= words.len:
+        return
+    let instr = words[addOff]
+    let pageOff = int32(tgtVA & 0xfff)
+    words[addOff] = (instr & 0xffc003ff) | (pageOff << 10)
+
+fn DirectExePatchAbs64(words: var int32[],
+                         wordOff: int32,
+                         tgtVA: int64) =
+    if wordOff < 0 || wordOff + 1 >= words.len:
+        return
+    let lo32 = int32(tgtVA & 0xffffffff)
+    let hi32 = int32((tgtVA >> 32) & 0xffffffff)
+    words[wordOff] = lo32
+    words[wordOff + 1] = hi32
+
+fn DirectExeIsAdrp(instr: int32): bool =
+    return (instr >> 24) == 0x90
+
+fn DirectExeIsBranch(instr: int32): bool =
+    let top = (instr >> 26) & 0x3f
+    return top == 37
+
+fn DirectExeIsAdrpAddCstring(plan: pobj.PrimaryObjectPlan,
+                               wordOff: int32): bool =
+    if wordOff < 0 || wordOff + 1 >= plan.instructionWords.len:
+        return false
+    let w0 = plan.instructionWords[wordOff]
+    let w1 = plan.instructionWords[wordOff + 1]
+    return DirectExeIsAdrp(w0) && ((w1 >> 10) & 0xfff) == 0
+
+fn DirectExePatchAllRelocs(plan: pobj.PrimaryObjectPlan,
+                             words: var int32[],
+                             syms: DirectExeResolvedSym[],
+                             textVA: int64) =
+    for ri in 0..<plan.relocWordOffsets.len:
+        if ri >= plan.relocTargetSymbols.len:
+            continue
+        let wordOff = plan.relocWordOffsets[ri]
+        if wordOff < 0 || wordOff >= words.len:
+            continue
+        let tgtName = plan.relocTargetSymbols[ri]
+        if Len(tgtName) <= 0:
+            continue
+        let si = DirectExeFindSym(syms, tgtName)
+        if si < 0:
+            continue
+        let tgtVA = syms[si].value
+        if tgtVA == int64(0) && !syms[si].defined:
+            continue
+        let srcVA = textVA + int64(wordOff * 4)
+        let instr = words[wordOff]
+        if DirectExeIsBranch(instr):
+            DirectExePatchBranch(words, wordOff, srcVA, tgtVA)
+        elif DirectExeIsAdrp(instr):
+            DirectExePatchAdrpAdd(words, wordOff, srcVA, tgtVA)
+        elif (instr >> 24) == 0x91:
+            DirectExePatchAddImm12(words, wordOff, tgtVA)
+        else:
+            DirectExePatchAbs64(words, wordOff, tgtVA)
+
+fn DirectExeWriteMachOHeader(out: var obuf.ObjectBuffer,
+                               cmdCount: int32,
+                               cmdBytes: int32) =
+    DirectExeEmitWriteU32LE(out, UInt64(0xfeedfacf))
+    DirectExeEmitWriteU32LE(out, UInt64(0x0100000c))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(2))
+    DirectExeEmitWriteU32LE(out, UInt64(cmdCount))
+    DirectExeEmitWriteU32LE(out, UInt64(cmdBytes))
+    DirectExeEmitWriteU32LE(out, UInt64(0x200001))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+
+fn DirectExeWriteMachOSegText(out: var obuf.ObjectBuffer,
+                                vmAddr: int64,
+                                vmSize: int64,
+                                fileOff: int32,
+                                fileSize: int32,
+                                textVA: int64,
+                                textSize: int32,
+                                textFileOff: int32) =
+    DirectExeEmitWriteU32LE(out, UInt64(0x19))
+    DirectExeEmitWriteU32LE(out, UInt64(152))
+    DirectExeEmitWritePadded(out, "__TEXT", 16)
+    DirectExeEmitWriteU64LE(out, UInt64(vmAddr))
+    DirectExeEmitWriteU64LE(out, UInt64(vmSize))
+    DirectExeEmitWriteU64LE(out, UInt64(fileOff))
+    DirectExeEmitWriteU64LE(out, UInt64(fileSize))
+    DirectExeEmitWriteU32LE(out, UInt64(5))
+    DirectExeEmitWriteU32LE(out, UInt64(5))
+    DirectExeEmitWriteU32LE(out, UInt64(1))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWritePadded(out, "__text", 16)
+    DirectExeEmitWritePadded(out, "__TEXT", 16)
+    DirectExeEmitWriteU64LE(out, UInt64(textVA))
+    DirectExeEmitWriteU64LE(out, UInt64(textSize))
+    DirectExeEmitWriteU32LE(out, UInt64(textFileOff))
+    DirectExeEmitWriteU32LE(out, UInt64(2))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0x80000400))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+
+fn DirectExeWriteMachOSegData(out: var obuf.ObjectBuffer,
+                                vmAddr: int64,
+                                vmSize: int64,
+                                fileOff: int32,
+                                fileSize: int32,
+                                dataVA: int64,
+                                dataSize: int32,
+                                dataFileOff: int32) =
+    DirectExeEmitWriteU32LE(out, UInt64(0x19))
+    DirectExeEmitWriteU32LE(out, UInt64(152))
+    DirectExeEmitWritePadded(out, "__DATA", 16)
+    DirectExeEmitWriteU64LE(out, UInt64(vmAddr))
+    DirectExeEmitWriteU64LE(out, UInt64(vmSize))
+    DirectExeEmitWriteU64LE(out, UInt64(fileOff))
+    DirectExeEmitWriteU64LE(out, UInt64(fileSize))
+    DirectExeEmitWriteU32LE(out, UInt64(3))
+    DirectExeEmitWriteU32LE(out, UInt64(3))
+    DirectExeEmitWriteU32LE(out, UInt64(1))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWritePadded(out, "__data", 16)
+    DirectExeEmitWritePadded(out, "__DATA", 16)
+    DirectExeEmitWriteU64LE(out, UInt64(dataVA))
+    DirectExeEmitWriteU64LE(out, UInt64(dataSize))
+    DirectExeEmitWriteU32LE(out, UInt64(dataFileOff))
+    DirectExeEmitWriteU32LE(out, UInt64(3))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+
+fn DirectExeWriteMachOSegLinkEdit(out: var obuf.ObjectBuffer,
+                                    vmAddr: int64,
+                                    vmSize: int64,
+                                    fileOff: int32,
+                                    fileSize: int32) =
+    DirectExeEmitWriteU32LE(out, UInt64(0x19))
+    DirectExeEmitWriteU32LE(out, UInt64(72))
+    DirectExeEmitWritePadded(out, "__LINKEDIT", 16)
+    DirectExeEmitWriteU64LE(out, UInt64(vmAddr))
+    DirectExeEmitWriteU64LE(out, UInt64(vmSize))
+    DirectExeEmitWriteU64LE(out, UInt64(fileOff))
+    DirectExeEmitWriteU64LE(out, UInt64(fileSize))
+    DirectExeEmitWriteU32LE(out, UInt64(1))
+    DirectExeEmitWriteU32LE(out, UInt64(1))
+    DirectExeEmitWriteU32LE(out, UInt64(1))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+
+fn DirectExeWriteMachOSymtab(out: var obuf.ObjectBuffer,
+                               symoff: int32,
+                               nsyms: int32,
+                               stroff: int32,
+                               strsize: int32) =
+    DirectExeEmitWriteU32LE(out, UInt64(2))
+    DirectExeEmitWriteU32LE(out, UInt64(24))
+    DirectExeEmitWriteU32LE(out, UInt64(symoff))
+    DirectExeEmitWriteU32LE(out, UInt64(nsyms))
+    DirectExeEmitWriteU32LE(out, UInt64(stroff))
+    DirectExeEmitWriteU32LE(out, UInt64(strsize))
+
+fn DirectExeWriteMachODysymtab(out: var obuf.ObjectBuffer) =
+    DirectExeEmitWriteU32LE(out, UInt64(0xb))
+    DirectExeEmitWriteU32LE(out, UInt64(24))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+
+fn DirectExeWriteMachOLoadDylinker(out: var obuf.ObjectBuffer) =
+    DirectExeEmitWriteU32LE(out, UInt64(0xe))
+    DirectExeEmitWriteU32LE(out, UInt64(24))
+    DirectExeEmitWriteU32LE(out, UInt64(16))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+
+fn DirectExeWriteMachOMain(out: var obuf.ObjectBuffer,
+                             entryOff: int32) =
+    DirectExeEmitWriteU32LE(out, UInt64(0x80000028))
+    DirectExeEmitWriteU32LE(out, UInt64(24))
+    DirectExeEmitWriteU64LE(out, UInt64(entryOff))
+    DirectExeEmitWriteU64LE(out, UInt64(0))
+
+fn DirectExeWriteMachONlist64(out: var obuf.ObjectBuffer,
+                                strIdx: int32,
+                                nType: int32,
+                                nSect: int32,
+                                nDesc: int32,
+                                value: int64) =
+    DirectExeEmitWriteU32LE(out, UInt64(strIdx))
+    obuf.ObjectBufferWriteU8(out, nType)
+    obuf.ObjectBufferWriteU8(out, nSect)
+    DirectExeEmitWriteU16LE(out, UInt64(nDesc))
+    DirectExeEmitWriteU64LE(out, UInt64(value))
+
+fn DirectExeBuildMachOStringTable(syms: DirectExeResolvedSym[],
+                                    stridxs: var int32[]): Bytes =
+    var st = obuf.ObjectBufferInit(128)
+    obuf.ObjectBufferWriteU8(st, 0)
+    for i in 0..<syms.len:
+        add(stridxs, obuf.ObjectBufferOffset(st))
+        DirectExeEmitWriteCString(st, syms[i].name)
+    return obuf.ObjectBufferToBytes(st)
+
+fn DirectExeEmitMachOSegCount(textHasData: bool): int32 =
+    if textHasData:
+        return 3
+    return 2
+
+fn DirectExeEmitMachOCmdSize(textHasData: bool): int32 =
+    let segs = DirectExeEmitMachOSegCount(textHasData)
+    return segs * 152 + 4 * 24
+
+fn DirectExeEmitMachOTextVmEnd(textByteSize: int32, dataByteSize: int32): int32 =
+    let cmdSize = DirectExeEmitMachOCmdSize(dataByteSize > 0)
+    return DirectExePageAlign(32 + cmdSize + textByteSize, DirectExeMachOPageSize)
+
+fn DirectExeEmitMachO(out: var obuf.ObjectBuffer,
+                        syms: DirectExeResolvedSym[],
+                        textBytes: Bytes,
+                        dataBytes: Bytes,
+                        textVA: int64,
+                        dataVA: int64,
+                        textByteSize: int32,
+                        dataByteSize: int32,
+                        entryByteOff: int32) =
+    let textHasData = dataByteSize > 0
+    let segCount = DirectExeEmitMachOSegCount(textHasData)
+    let cmdBytes = DirectExeEmitMachOCmdSize(textHasData)
+    let hdrLoadEnd = 32 + cmdBytes
+    let textFileOff = hdrLoadEnd
+    let textFileEnd = textFileOff + textByteSize
+    let textAlign = 8
+    let dataFileOff = DirectExeAlign(textFileEnd, textAlign)
+    let dataFileEnd = dataFileOff + dataByteSize
+    let textVmEnd = DirectExePageAlign(textFileEnd, DirectExeMachOPageSize)
+    let textVmSize = int64(textVmEnd)
+    var dataFileSize = dataByteSize
+    let dataVmAddr = int64(DirectExeMachOVmBase) + int64(textVmEnd)
+    var dataVmSize = int64(DirectExeMachOPageSize)
+    if dataByteSize > 0:
+        dataVmSize = int64(DirectExePageAlign(dataVmAddr + int64(dataByteSize), DirectExeMachOPageSize)) - int64(DirectExeMachOVmBase) - int64(textVmEnd)
+    var linkeditFileOff = DirectExeAlign(dataFileEnd, 8)
+    let nsyms = syms.len
+    var stridxs: int32[]
+    let strBytes = DirectExeBuildMachOStringTable(syms, stridxs)
+    let strSize = BytesLen(strBytes)
+    let symSize = nsyms * 16
+    let symoff = linkeditFileOff
+    let stroff = symoff + symSize
+    let linkeditFileSize = stroff + strSize - linkeditFileOff
+    let linkeditFileEnd = stroff + strSize
+    let linkeditVmAddr = int64(DirectExeMachOVmBase) + int64(textVmEnd) + dataVmSize
+    let linkeditVmSize = int64(DirectExePageAlign(linkeditFileSize, DirectExeMachOPageSize))
+    DirectExeWriteMachOHeader(out, segCount, cmdBytes)
+    DirectExeWriteMachOSegText(out,
+                                int64(DirectExeMachOVmBase),
+                                textVmSize,
+                                0,
+                                textFileEnd,
+                                textVA,
+                                textByteSize,
+                                textFileOff)
+    if textHasData:
+        DirectExeWriteMachOSegData(out,
+                                    dataVmAddr,
+                                    dataVmSize,
+                                    int64(dataFileOff),
+                                    int64(dataFileSize),
+                                    dataVA,
+                                    dataByteSize,
+                                    dataFileOff)
+    DirectExeWriteMachOSegLinkEdit(out,
+                                    linkeditVmAddr,
+                                    linkeditVmSize,
+                                    linkeditFileOff,
+                                    linkeditFileSize)
+    DirectExeWriteMachOSymtab(out, symoff, nsyms, stroff, strSize)
+    DirectExeWriteMachODysymtab(out)
+    DirectExeWriteMachOLoadDylinker(out)
+    DirectExeWriteMachOMain(out, entryByteOff + textFileOff)
+    obuf.ObjectBufferWriteBytes(out, textBytes)
+    obuf.ObjectBufferAlign(out, textAlign, 0)
+    obuf.ObjectBufferWriteBytes(out, dataBytes)
+    obuf.ObjectBufferAlign(out, 8, 0)
+    for i in 0..<nsyms:
+        var nType: int32
+        var nSect: int32
+        var value: int64
+        if syms[i].defined:
+            if syms[i].sectionNum == 1:
+                nSect = 1
+                nType = 15
+            else:
+                nSect = 2
+                nType = 15
+            value = syms[i].value
+        else:
+            nType = 1
+            nSect = 0
+            value = int64(0)
+        DirectExeWriteMachONlist64(out, stridxs[i], nType, nSect, 0, value)
+    obuf.ObjectBufferWriteBytes(out, strBytes)
+
+fn DirectExeEmitElfEhdr(out: var obuf.ObjectBuffer,
+                          entryVA: int64,
+                          phoff: int32,
+                          shoff: int32,
+                          phnum: int32,
+                          shnum: int32,
+                          shstrndx: int32) =
+    obuf.ObjectBufferWriteU8(out, 127)
+    obuf.ObjectBufferWriteU8(out, int32('E'))
+    obuf.ObjectBufferWriteU8(out, int32('L'))
+    obuf.ObjectBufferWriteU8(out, int32('F'))
+    obuf.ObjectBufferWriteU8(out, 2)
+    obuf.ObjectBufferWriteU8(out, 1)
+    obuf.ObjectBufferWriteU8(out, 1)
+    obuf.ObjectBufferWriteU8(out, 0)
+    for _ in 0..<8:
+        obuf.ObjectBufferWriteU8(out, 0)
+    obuf.ObjectBufferWriteU16LE(out, UInt64(2))
+    obuf.ObjectBufferWriteU16LE(out, UInt64(183))
+    DirectExeEmitWriteU32LE(out, UInt64(1))
+    DirectExeEmitWriteU64LE(out, UInt64(entryVA))
+    DirectExeEmitWriteU64LE(out, UInt64(phoff))
+    DirectExeEmitWriteU64LE(out, UInt64(shoff))
+    DirectExeEmitWriteU32LE(out, UInt64(0))
+    obuf.ObjectBufferWriteU16LE(out, UInt64(64))
+    obuf.ObjectBufferWriteU16LE(out, UInt64(56))
+    obuf.ObjectBufferWriteU16LE(out, UInt64(phnum))
+    obuf.ObjectBufferWriteU16LE(out, UInt64(64))
+    obuf.ObjectBufferWriteU16LE(out, UInt64(shnum))
+    obuf.ObjectBufferWriteU16LE(out, UInt64(shstrndx))
+
+fn DirectExeEmitElfPhdr(out: var obuf.ObjectBuffer,
+                          pType: int32,
+                          flags: int32,
+                          fileOff: int64,
+                          vaddr: int64,
+                          fileSize: int64,
+                          memSize: int64,
+                          align: int64) =
+    DirectExeEmitWriteU32LE(out, UInt64(pType))
+    DirectExeEmitWriteU32LE(out, UInt64(flags))
+    DirectExeEmitWriteU64LE(out, UInt64(fileOff))
+    DirectExeEmitWriteU64LE(out, UInt64(vaddr))
+    DirectExeEmitWriteU64LE(out, UInt64(vaddr))
+    DirectExeEmitWriteU64LE(out, UInt64(fileSize))
+    DirectExeEmitWriteU64LE(out, UInt64(memSize))
+    DirectExeEmitWriteU64LE(out, UInt64(align))
+
+fn DirectExeEmitElfShdr(out: var obuf.ObjectBuffer,
+                          nameIdx: int32,
+                          shType: int32,
+                          flags: int64,
+                          vaddr: int64,
+                          offset: int64,
+                          size: int64,
+                          link: int32,
+                          info: int32,
+                          addralign: int64,
+                          entsize: int64) =
+    DirectExeEmitWriteU32LE(out, UInt64(nameIdx))
+    DirectExeEmitWriteU32LE(out, UInt64(shType))
+    DirectExeEmitWriteU64LE(out, UInt64(flags))
+    DirectExeEmitWriteU64LE(out, UInt64(vaddr))
+    DirectExeEmitWriteU64LE(out, UInt64(offset))
+    DirectExeEmitWriteU64LE(out, UInt64(size))
+    DirectExeEmitWriteU32LE(out, UInt64(link))
+    DirectExeEmitWriteU32LE(out, UInt64(info))
+    DirectExeEmitWriteU64LE(out, UInt64(addralign))
+    DirectExeEmitWriteU64LE(out, UInt64(entsize))
+
+fn DirectExeEmitElfSym(out: var obuf.ObjectBuffer,
+                         nameIdx: int32,
+                         info: int32,
+                         other: int32,
+                         shndx: int32,
+                         value: int64,
+                         size: int64) =
+    DirectExeEmitWriteU32LE(out, UInt64(nameIdx))
+    obuf.ObjectBufferWriteU8(out, info)
+    obuf.ObjectBufferWriteU8(out, other)
+    obuf.ObjectBufferWriteU16LE(out, UInt64(shndx))
+    DirectExeEmitWriteU64LE(out, UInt64(value))
+    DirectExeEmitWriteU64LE(out, UInt64(size))
+
+fn DirectExeEmitElfBuildShStrtab(): Bytes =
+    var out = obuf.ObjectBufferInit(64)
+    obuf.ObjectBufferWriteU8(out, 0)
+    DirectExeEmitWriteCString(out, ".shstrtab")
+    DirectExeEmitWriteCString(out, ".text")
+    DirectExeEmitWriteCString(out, ".data")
+    DirectExeEmitWriteCString(out, ".symtab")
+    DirectExeEmitWriteCString(out, ".strtab")
+    return obuf.ObjectBufferToBytes(out)
+
+fn DirectExeEmitElfBuildStrtab(syms: DirectExeResolvedSym[]): Bytes =
+    var out = obuf.ObjectBufferInit(128)
+    obuf.ObjectBufferWriteU8(out, 0)
+    for i in 0..<syms.len:
+        if Len(syms[i].name) > 0:
+            DirectExeEmitWriteCString(out, syms[i].name)
+    return obuf.ObjectBufferToBytes(out)
+
+fn DirectExeEmitElfFindStrIdx(strBytes: Bytes,
+                                name: str): int32 =
+    let blen = BytesLen(strBytes)
+    var idx: int32
+    while idx < blen:
+        if strBytes[idx] == 0:
+            idx = idx + 1
+            continue
+        var match = true
+        for si in 0..<Len(name):
+            let bpos = idx + si
+            if bpos >= blen:
+                match = false
+                break
+            if strBytes[bpos] != Int32(name[si]) & 255:
+                match = false
+                break
+        if match:
+            let endCh = idx + Len(name)
+            if endCh < blen && strBytes[endCh] == 0:
+                return idx
+        while idx < blen && strBytes[idx] != 0:
+            idx = idx + 1
+    return 0
+
+fn DirectExeEmitElf(out: var obuf.ObjectBuffer,
+                      syms: DirectExeResolvedSym[],
+                      textBytes: Bytes,
+                      dataBytes: Bytes,
+                      textVA: int64,
+                      dataVA: int64,
+                      textByteSize: int32,
+                      dataByteSize: int32,
+                      entryVA: int64) =
+    let textHasData = dataByteSize > 0
+    let phnum: int32 = 2
+    let ehdrPhdrSize = int32(64) + phnum * int32(56)
+    let textFileOff = DirectExePageAlign(ehdrPhdrSize, DirectExeElfPageSize)
+    let textFileEnd = textFileOff + textByteSize
+    let textFileSize = textByteSize
+    let dataFileOff = DirectExePageAlign(textFileEnd, DirectExeElfPageSize)
+    let dataFileEnd = dataFileOff + dataByteSize
+    let shstrtabBytes = DirectExeEmitElfBuildShStrtab()
+    let shstrtabSize = BytesLen(shstrtabBytes)
+    let strtabBytes = DirectExeEmitElfBuildStrtab(syms)
+    let strtabSize = BytesLen(strtabBytes)
+    let totalSyms = syms.len + 1
+    let symtabSize = totalSyms * 24
+    let shstrtabOff = DirectExeAlign(dataFileEnd, 8)
+    let symtabOff = shstrtabOff + shstrtabSize
+    let strtabOff = symtabOff + symtabSize
+    let shoff = DirectExeAlign(strtabOff + strtabSize, 8)
+    let shnum: int32 = 6
+    let textMemSize = int64(DirectExePageAlign(textByteSize, DirectExeElfPageSize))
+    var dataMemSize = int64(0)
+    if dataByteSize > 0:
+        dataMemSize = int64(DirectExePageAlign(dataByteSize, DirectExeElfPageSize))
+    let strBytesPtr = strtabBytes
+    DirectExeEmitElfEhdr(out,
+                          entryVA,
+                          64,
+                          shoff,
+                          phnum,
+                          shnum,
+                          1)
+    DirectExeEmitElfPhdr(out,
+                          1,
+                          5,
+                          int64(textFileOff),
+                          textVA,
+                          int64(textFileSize),
+                          textMemSize,
+                          int64(DirectExeElfPageSize))
+    DirectExeEmitElfPhdr(out,
+                          1,
+                          6,
+                          int64(dataFileOff),
+                          dataVA,
+                          int64(dataByteSize),
+                          dataMemSize,
+                          int64(DirectExeElfPageSize))
+    obuf.ObjectBufferAlign(out, DirectExeElfPageSize, 0)
+    obuf.ObjectBufferWriteBytes(out, textBytes)
+    obuf.ObjectBufferAlign(out, DirectExeElfPageSize, 0)
+    obuf.ObjectBufferWriteBytes(out, dataBytes)
+    obuf.ObjectBufferAlign(out, 8, 0)
+    obuf.ObjectBufferWriteBytes(out, shstrtabBytes)
+    DirectExeEmitElfSym(out,
+                         0,
+                         0,
+                         0,
+                         0,
+                         int64(0),
+                         int64(0))
+    for i in 0..<syms.len:
+        var stInfo: int32
+        var shndx: int32
+        var value: int64
+        var size: int64
+        if syms[i].defined:
+            if syms[i].sectionNum == 1:
+                shndx = 2
+                stInfo = 18
+            else:
+                shndx = 3
+                stInfo = 17
+            value = syms[i].value
+            size = syms[i].size
+        else:
+            shndx = 0
+            stInfo = 16
+            value = int64(0)
+            size = int64(0)
+        let nameIdx = DirectExeEmitElfFindStrIdx(strBytesPtr, syms[i].name)
+        DirectExeEmitElfSym(out,
+                             nameIdx,
+                             stInfo,
+                             0,
+                             shndx,
+                             value,
+                             size)
+    obuf.ObjectBufferWriteBytes(out, strtabBytes)
+    obuf.ObjectBufferAlign(out, 8, 0)
+    let shstrtabNameIdx: int32 = 1
+    DirectExeEmitElfShdr(out,
+                          0,
+                          0,
+                          int64(0),
+                          int64(0),
+                          int64(0),
+                          int64(0),
+                          0,
+                          0,
+                          int64(0),
+                          int64(0))
+    DirectExeEmitElfShdr(out,
+                          shstrtabNameIdx,
+                          3,
+                          int64(0),
+                          int64(0),
+                          int64(shstrtabOff),
+                          int64(shstrtabSize),
+                          0,
+                          0,
+                          int64(1),
+                          int64(0))
+    let textNameIdx = DirectExeEmitElfFindStrIdx(shstrtabBytes, ".text")
+    DirectExeEmitElfShdr(out,
+                          textNameIdx,
+                          1,
+                          int64(6),
+                          int64(textVA),
+                          int64(textFileOff),
+                          int64(textByteSize),
+                          0,
+                          0,
+                          int64(16),
+                          int64(0))
+    let dataNameIdx = DirectExeEmitElfFindStrIdx(shstrtabBytes, ".data")
+    DirectExeEmitElfShdr(out,
+                          dataNameIdx,
+                          1,
+                          int64(3),
+                          int64(dataVA),
+                          int64(dataFileOff),
+                          int64(dataByteSize),
+                          0,
+                          0,
+                          int64(8),
+                          int64(0))
+    let symtabNameIdx = DirectExeEmitElfFindStrIdx(shstrtabBytes, ".symtab")
+    DirectExeEmitElfShdr(out,
+                          symtabNameIdx,
+                          2,
+                          int64(0),
+                          int64(0),
+                          int64(symtabOff),
+                          int64(symtabSize),
+                          5,
+                          1,
+                          int64(8),
+                          int64(24))
+    let strtabNameIdx = DirectExeEmitElfFindStrIdx(shstrtabBytes, ".strtab")
+    DirectExeEmitElfShdr(out,
+                          strtabNameIdx,
+                          3,
+                          int64(0),
+                          int64(0),
+                          int64(strtabOff),
+                          int64(strtabSize),
+                          0,
+                          0,
+                          int64(1),
+                          int64(0))
+
+fn DirectExeEmitTargetSupported(plan: pobj.PrimaryObjectPlan): bool =
+    if DirectExeIsMachOFormat(plan.objectFormat) &&
+       DirectExeIsDarwinArm64(plan.targetTriple):
+        return true
+    if DirectExeIsElfFormat(plan.objectFormat) &&
+       DirectExeIsLinuxAarch64(plan.targetTriple):
+        return true
+    return false
+
+fn DirectExeEmitResultReportText(result: DirectExeEmitResult): str =
+    var out = Fmt"direct_exe_output_path={result.outputPath}"
+    out = Fmt"{out}\nexec_phase_direct_exe_bytes={strings.IntToStr(result.bytesWritten)}"
+    out = Fmt"{out}\nexec_phase_direct_exe_symbols={strings.IntToStr(result.symbolCount)}"
+    out = Fmt"{out}\nexec_phase_direct_exe_layout_ms={strings.Int64ToStr(result.layoutMs)}"
+    out = Fmt"{out}\nexec_phase_direct_exe_emit_ms={strings.Int64ToStr(result.emitMs)}"
+    out = Fmt"{out}\nexec_phase_direct_exe_entry_offset={strings.IntToStr(result.entryByteOffset)}"
+    return out
+
+fn DirectExeEmitBuild(plan: pobj.PrimaryObjectPlan): Result[DirectExeEmitResult] =
+    let startMs = DirectExeNowMs()
+    if !DirectExeEmitTargetSupported(plan):
+        return Err[DirectExeEmitResult](Fmt" direct exe emit: unsupported target: {plan.targetTriple}")
+    let textByteSize = plan.instructionWords.len * 4
+    if textByteSize <= 0:
+        return Err[DirectExeEmitResult](" direct exe emit: empty instruction words")
+    let entryIndex = DirectExeEntryFunctionIndex(plan)
+    if entryIndex < 0 || entryIndex >= plan.functionWordOffsets.len:
+        return Err[DirectExeEmitResult](" direct exe emit: missing entry function")
+    let isMachO = DirectExeIsMachOFormat(plan.objectFormat)
+    var textVA: int64
+    var dataVA: int64
+    var pageSize: int32
+    if isMachO:
+        pageSize = DirectExeMachOPageSize
+        textVA = int64(DirectExeMachOVmBase)
+    else:
+        pageSize = DirectExeElfPageSize
+        textVA = int64(DirectExeElfTextBase)
+    let dataByteSize = DirectExeEmitPlanDataByteCount(plan)
+    if isMachO:
+        let textVmEnd = DirectExeEmitMachOTextVmEnd(textByteSize, dataByteSize)
+        dataVA = int64(DirectExeMachOVmBase) + int64(textVmEnd)
+    else:
+        dataVA = textVA + int64(DirectExePageAlign(textByteSize, pageSize))
+    let entryByteOff = plan.functionWordOffsets[entryIndex] * 4
+    let entryVA = textVA + int64(entryByteOff)
+    let layoutMs = DirectExeNowMs() - startMs
+    let funcLimit = DirectExeRealFunctionLimit(plan)
+    var syms = DirectExeBuildResolvedSyms(plan, textVA, dataVA, funcLimit)
+    var words = DirectExeWordCopy(plan.instructionWords)
+    DirectExePatchAllRelocs(plan, words, syms, textVA)
+    let textBytes = DirectExeEmitTextBytesFromWords(words)
+    let dataBytes = DirectExeEmitPlanDataBytes(plan)
+    var out = obuf.ObjectBufferInit(textByteSize + dataByteSize + 4096)
+    if isMachO:
+        DirectExeEmitMachO(out,
+                            syms,
+                            textBytes,
+                            dataBytes,
+                            textVA,
+                            dataVA,
+                            textByteSize,
+                            dataByteSize,
+                            entryByteOff)
+    else:
+        DirectExeEmitElf(out,
+                          syms,
+                          textBytes,
+                          dataBytes,
+                          textVA,
+                          dataVA,
+                          textByteSize,
+                          dataByteSize,
+                          entryVA)
+    let bufBytes = obuf.ObjectBufferToBytes(out)
+    let emitMs = DirectExeNowMs() - startMs
+    if Len(plan.outputPath) <= 0:
+        return Err[DirectExeEmitResult](" direct exe emit: missing output path")
+    let payload = BytesToString(bufBytes)
+    if !chengpath.WriteTextFile("", plan.outputPath, payload):
+        return Err[DirectExeEmitResult](Fmt" direct exe emit: failed to write: {plan.outputPath}")
+    var emitResult: DirectExeEmitResult
+    emitResult.outputPath = plan.outputPath
+    emitResult.bytesWritten = BytesLen(bufBytes)
+    emitResult.symbolCount = syms.len
+    emitResult.layoutMs = layoutMs
+    emitResult.emitMs = emitMs
+    emitResult.entryByteOffset = entryByteOff
+    emitResult.targetTriple = plan.targetTriple
+    return Ok[DirectExeEmitResult](emitResult)
+
+fn DirectExeEmitValidateBuild(plan: pobj.PrimaryObjectPlan): Result[bool] =
+    if !DirectExeEmitTargetSupported(plan):
+        return Err[bool](Fmt" direct exe emit: unsupported target: {plan.targetTriple}")
+    if Len(plan.outputPath) <= 0:
+        return Err[bool](" direct exe emit: missing output path")
+    if plan.instructionWords.len <= 0:
+        return Err[bool](" direct exe emit: empty instruction words")
+    if plan.functionBodyKinds.len <= 0:
+        return Err[bool](" direct exe emit: empty function list")
+    if plan.symbolNames.len != plan.functionBodyKinds.len:
+        return Err[bool](" direct exe emit: symbol/function count mismatch")
+    if plan.functionWordOffsets.len != plan.functionBodyKinds.len:
+        return Err[bool](" direct exe emit: offset/function count mismatch")
+    if plan.functionWordCounts.len != plan.functionBodyKinds.len:
+        return Err[bool](" direct exe emit: wordcount/function count mismatch")
+    if Len(plan.entryFunctionSymbol) > 0:
+        let ei = DirectExeEntryFunctionIndex(plan)
+        if ei < 0:
+            return Err[bool](Fmt" direct exe emit: entry symbol not found: {plan.entryFunctionSymbol}")
+    return Ok[bool](true)
+
+fn DirectExeEmitCanBuild(plan: pobj.PrimaryObjectPlan): bool =
+    return IsOk(DirectExeEmitValidateBuild(plan))

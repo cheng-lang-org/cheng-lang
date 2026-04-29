@@ -67,6 +67,7 @@ fn HostSmokeDefaultSmokes(): str[] =
         "backend_driver_resource_guard_contract_smoke",
         "compiler_budget_contract_smoke",
         "runtime_c_baseline_contract_smoke",
+        "thread_atomic_orc_runtime_gate_smoke",
         "runtime_link_input_surface_smoke",
         "runtime_zero_c_surface_smoke",
         "composite_call_regression_smoke",
@@ -78,6 +79,9 @@ fn HostSmokeDefaultSmokes(): str[] =
         "object_native_link_plan_smoke",
         "function_task_contract_smoke",
         "function_task_executor_contract_smoke",
+        "body_ir_dod_soa_contract_smoke",
+        "body_ir_noalias_proof_smoke",
+        "cfg_body_ir_contract_smoke",
         "compiler_world_manifest_closure_smoke",
         "compiler_migration_publish_smoke",
         "compiler_csg_egraph_active_contract_smoke",
@@ -131,7 +135,26 @@ fn HostSmokeRunTimeoutSec(smokeName: str): int32 =
         return 180
     if smokeName == "perf_memory_contract_smoke":
         return 600
+    if smokeName == "thread_atomic_orc_runtime_gate_smoke":
+        return 420
     return 90
+
+fn HostSmokeCompileReportOk(root: str,
+                              smokeName: str,
+                              reportPath: str): bool =
+    if smokeName != "thread_atomic_orc_runtime_gate_smoke":
+        return true
+    if !chengpath.FileExistsNonEmpty(root, reportPath):
+        HostSmokePrintErr(strutil.Join(["host smokes: missing compile report: ", reportPath], ""))
+        return false
+    let reportText = os.ReadFile(reportPath)
+    if strings.StrContains(reportText, "system_link_exec_runtime_standalone_no_runtime=1"):
+        HostSmokePrintErr("host smokes: thread/atomic/ORC gate compiled through standalone no-runtime path")
+        return false
+    if strings.StrContains(reportText, "provider_object_count=0"):
+        HostSmokePrintErr("host smokes: thread/atomic/ORC gate compiled without runtime providers")
+        return false
+    return true
 
 fn HostSmokeCompileEnv(): str[] =
     var out: str[]
@@ -145,6 +168,28 @@ fn HostSmokeCompileEnv(): str[] =
     add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
     return out
 
+fn HostSmokeExpectedRunMarker(smokeName: str): str =
+    if smokeName == "function_task_contract_smoke":
+        return " function_task_contract_smoke ok"
+    if smokeName == "function_task_executor_contract_smoke":
+        return " function_task_executor_contract_smoke ok"
+    if smokeName == "body_ir_dod_soa_contract_smoke":
+        return " body_ir_dod_soa_contract_smoke ok"
+    if smokeName == "body_ir_noalias_proof_smoke":
+        return " body_ir_noalias_proof_smoke ok"
+    if smokeName == "cfg_body_ir_contract_smoke":
+        return " cfg_body_ir_contract_smoke ok"
+    return ""
+
+fn HostSmokeRunMarkerOk(smokeName: str, outputText: str): bool =
+    let marker = HostSmokeExpectedRunMarker(smokeName)
+    if len(marker) <= 0:
+        return true
+    if strings.StrContains(outputText, marker):
+        return true
+    HostSmokePrintErr(strutil.Join(["host smokes: missing run marker for ", smokeName, ": ", marker], ""))
+    return false
+
 fn HostSmokeRunOne(root: str,
                      compiler: str,
                      outDir: str,
@@ -155,6 +200,7 @@ fn HostSmokeRunOne(root: str,
         return 1
     let outBin = os.JoinPath(outDir, smokeName)
     let compileLog = strutil.Join([outBin, ".compile.log"], "")
+    let reportPath = strutil.Join([outBin, ".compile.report.txt"], "")
     let runLog = strutil.Join([outBin, ".run.log"], "")
     if chengpath.PathFileExists(outBin):
         os.RemoveFile(outBin)
@@ -162,6 +208,8 @@ fn HostSmokeRunOne(root: str,
         os.RemoveFile(strutil.Join([outBin, ".map"], ""))
     if chengpath.PathFileExists(compileLog):
         os.RemoveFile(compileLog)
+    if chengpath.PathFileExists(reportPath):
+        os.RemoveFile(reportPath)
     if chengpath.PathFileExists(runLog):
         os.RemoveFile(runLog)
     HostSmokePrintLine(strutil.Join(["[cheng host smokes] compile ", smokeName], ""))
@@ -174,7 +222,8 @@ fn HostSmokeRunOne(root: str,
                                                  "--in", src,
                                                  "--emit", "exe",
                                                  "--target", "arm64-apple-darwin",
-                                                 "--out", outBin
+                                                 "--out", outBin,
+                                                 "--report-out", reportPath
                                              ],
                                              HostSmokeCompileEnv(),
                                              root,
@@ -187,6 +236,8 @@ fn HostSmokeRunOne(root: str,
         return compileRun.exitCode
     if !chengpath.FileExistsNonEmpty(root, outBin):
         HostSmokePrintErr(strutil.Join(["host smokes: compile missing output: ", outBin], ""))
+        return 1
+    if !HostSmokeCompileReportOk(root, smokeName, reportPath):
         return 1
     HostSmokePrintLine(strutil.Join(["[cheng host smokes] run ", smokeName], ""))
     let run = hostops.RunFileLogged(root,
@@ -205,6 +256,8 @@ fn HostSmokeRunOne(root: str,
             HostSmokePrintLine(runOutput)
     if !hostops.LoggedRunOk(run):
         return run.exitCode
+    if !HostSmokeRunMarkerOk(smokeName, run.output):
+        return 1
     return 0
 
 fn HostSmokeCanRun(args: str[]): bool =

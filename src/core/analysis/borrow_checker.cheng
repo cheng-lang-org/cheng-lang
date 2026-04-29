@@ -1,0 +1,297 @@
+module borrow_checker
+
+type
+    LifetimeId = int32
+
+    BorrowId = int32
+
+    VarId = int32
+
+    BorrowState = enum
+        Unused
+        SharedBorrow
+        UniqueBorrow
+        Moved
+
+    BorrowKind = enum
+        Shared
+        Unique
+
+    BorrowRecord =
+        id: BorrowId
+        varId: VarId
+        kind: BorrowKind
+        lifetimeStart: LifetimeId
+        lifetimeEnd: LifetimeId
+
+    Lifetime =
+        id: LifetimeId
+        parentId: LifetimeId
+        depth: int32
+        ended: bool
+
+    VarState =
+        varId: VarId
+        state: BorrowState
+        currentBorrowId: BorrowId
+        moveSite: int32
+
+    BorrowCtx =
+        lifetimes: Lifetime[]
+        lifetimeStack: int32[]
+        borrowRecords: BorrowRecord[]
+        activeBorrows: BorrowId[]
+        varStates: VarState[]
+        nextLifetimeId: LifetimeId
+        nextBorrowId: BorrowId
+        nextVarId: VarId
+
+    BorrowCheckError = enum
+        Ok
+        ErrBorrowAfterMove
+        ErrAliasConflict
+        ErrUseAfterMove
+        ErrReturnEscape
+        ErrGlobalEscape
+        ErrCallEscape
+        ErrBorrowOfMoved
+        ErrBorrowOfBorrow
+
+fn BorrowCtxNew(): BorrowCtx =
+    var out: BorrowCtx
+    out.lifetimes = []
+    out.lifetimeStack = []
+    out.borrowRecords = []
+    out.activeBorrows = []
+    out.varStates = []
+    out.nextLifetimeId = 0
+    out.nextBorrowId = 0
+    out.nextVarId = 0
+    return out
+
+fn BorrowCtxGetVarState(ctx: BorrowCtx, varId: VarId, outState: var VarState): bool =
+    for i in 0..<ctx.varStates.len:
+        if ctx.varStates[i].varId == varId:
+            outState = ctx.varStates[i]
+            return true
+    return false
+
+fn BorrowCtxSetVarState(ctx: var BorrowCtx, state: VarState) =
+    for i in 0..<ctx.varStates.len:
+        if ctx.varStates[i].varId == state.varId:
+            ctx.varStates[i] = state
+            return
+    add(ctx.varStates, state)
+
+fn BorrowCtxAddLifetime(ctx: var BorrowCtx, parentId: LifetimeId): LifetimeId =
+    var lt: Lifetime
+    lt.id = ctx.nextLifetimeId
+    lt.parentId = parentId
+    lt.depth = 0
+    if parentId >= 0 && parentId < ctx.lifetimes.len:
+        lt.depth = ctx.lifetimes[parentId].depth + 1
+    else
+        lt.depth = 0
+    lt.ended = false
+    add(ctx.lifetimes, lt)
+    ctx.nextLifetimeId = ctx.nextLifetimeId + 1
+    return lt.id
+
+fn BorrowCtxPushScope(ctx: var BorrowCtx): LifetimeId =
+    let parentId = if ctx.lifetimeStack.len > 0
+        ctx.lifetimeStack[ctx.lifetimeStack.len - 1]
+    else
+        -1
+    let ltId = BorrowCtxAddLifetime(ctx, parentId)
+    add(ctx.lifetimeStack, ltId)
+    return ltId
+
+fn BorrowCtxPopScope(ctx: var BorrowCtx) =
+    if ctx.lifetimeStack.len <= 0
+        return
+    let currentId = ctx.lifetimeStack[ctx.lifetimeStack.len - 1]
+    if currentId >= 0 && currentId < ctx.lifetimes.len
+        ctx.lifetimes[currentId].ended = true
+    discard pop(ctx.lifetimeStack)
+
+fn BorrowCtxCurrentLifetime(ctx: BorrowCtx): LifetimeId =
+    if ctx.lifetimeStack.len > 0
+        return ctx.lifetimeStack[ctx.lifetimeStack.len - 1]
+    return -1
+
+fn BorrowCtxIsLifetimeActive(ctx: BorrowCtx, ltId: LifetimeId): bool =
+    if ltId < 0 || ltId >= ctx.lifetimes.len
+        return false
+    if ctx.lifetimes[ltId].ended
+        return false
+    return true
+
+fn BorrowCtxIsLifetimeWithin(ctx: BorrowCtx, inner: LifetimeId, outer: LifetimeId): bool =
+    if inner < 0 || outer < 0
+        return false
+    var current = inner
+    while current >= 0 && current < ctx.lifetimes.len
+        if current == outer
+            return true
+        current = ctx.lifetimes[current].parentId
+    return false
+
+fn BorrowCtxEndLifetime(ctx: var BorrowCtx, ltId: LifetimeId, releasedBorrows: var BorrowId[]) =
+    if ltId < 0 || ltId >= ctx.lifetimes.len
+        return
+    ctx.lifetimes[ltId].ended = true
+    var i = 0
+    while i < ctx.activeBorrows.len
+        let borrowId = ctx.activeBorrows[i]
+        if borrowId >= 0 && borrowId < ctx.nextBorrowId
+            let borrow = getBorrowRecord(ctx, borrowId)
+            if borrow.lifetimeEnd == ltId || BorrowCtxIsLifetimeWithin(ctx, borrow.lifetimeEnd, ltId)
+                add(releasedBorrows, borrowId)
+                remove(ctx.activeBorrows, i)
+                continue
+        i = i + 1
+
+fn getBorrowRecord(ctx: BorrowCtx, borrowId: BorrowId): BorrowRecord =
+    var empty: BorrowRecord
+    if borrowId < 0 || borrowId >= ctx.borrowRecords.len
+        return empty
+    for i in 0..<ctx.borrowRecords.len
+        let borrow = ctx.borrowRecords[i]
+        if borrow.id == borrowId
+            return borrow
+    return empty
+
+fn getBorrowRecordByIndex(ctx: BorrowCtx, index: int32): BorrowRecord =
+    var empty: BorrowRecord
+    if index < 0 || index >= ctx.borrowRecords.len
+        return empty
+    return ctx.borrowRecords[index]
+
+fn BorrowCtxAddBorrow(ctx: var BorrowCtx, varId: VarId, kind: BorrowKind, lifetimeId: LifetimeId): BorrowCheckError =
+    var state: VarState
+    if BorrowCtxGetVarState(ctx, varId, state)
+        if state.state == BorrowStateMoved
+            return ErrBorrowOfMoved
+        if state.state == BorrowStateSharedBorrow && kind == Unique
+            return ErrAliasConflict
+        if state.state == BorrowStateUniqueBorrow
+            return ErrAliasConflict
+    else
+        state.varId = varId
+        state.state = BorrowStateUnused
+        state.currentBorrowId = -1
+        state.moveSite = -1
+
+    var borrow: BorrowRecord
+    borrow.id = ctx.nextBorrowId
+    borrow.varId = varId
+    borrow.kind = kind
+    borrow.lifetimeStart = BorrowCtxCurrentLifetime(ctx)
+    borrow.lifetimeEnd = lifetimeId
+
+    add(ctx.borrowRecords, borrow)
+    add(ctx.activeBorrows, borrow.id)
+    ctx.nextBorrowId = ctx.nextBorrowId + 1
+
+    if kind == Shared
+        state.state = BorrowStateSharedBorrow
+    else
+        state.state = BorrowStateUniqueBorrow
+    state.currentBorrowId = borrow.id
+    BorrowCtxSetVarState(ctx, state)
+
+    return Ok
+
+fn BorrowCtxCheckBorrow(ctx: BorrowCtx, varId: VarId, kind: BorrowKind, lifetimeId: LifetimeId): BorrowCheckError =
+    var state: VarState
+    if !BorrowCtxGetVarState(ctx, varId, state)
+        return Ok
+    if state.state == BorrowStateMoved
+        return ErrBorrowOfMoved
+    if kind == Unique
+        if state.state == BorrowStateSharedBorrow
+            return ErrAliasConflict
+        if state.state == BorrowStateUniqueBorrow
+            return ErrAliasConflict
+    return Ok
+
+fn BorrowCtxCheckMove(ctx: BorrowCtx, varId: VarId, siteId: int32): BorrowCheckError =
+    var state: VarState
+    if !BorrowCtxGetVarState(ctx, varId, state)
+        return Ok
+    if state.state == BorrowStateMoved
+        return ErrUseAfterMove
+    if state.state == BorrowStateSharedBorrow
+        for i in 0..<ctx.activeBorrows.len
+            let borrowId = ctx.activeBorrows[i]
+            let borrow = getBorrowRecord(ctx, borrowId)
+            if borrow.varId == varId
+                return ErrUseAfterMove
+    return Ok
+
+fn BorrowCtxApplyMove(ctx: var BorrowCtx, varId: VarId, siteId: int32) =
+    var state: VarState
+    if !BorrowCtxGetVarState(ctx, varId, state)
+        state.varId = varId
+        state.state = BorrowStateUnused
+        state.currentBorrowId = -1
+        state.moveSite = -1
+    state.state = BorrowStateMoved
+    state.moveSite = siteId
+    BorrowCtxSetVarState(ctx, state)
+    var i = 0
+    while i < ctx.activeBorrows.len
+        let borrowId = ctx.activeBorrows[i]
+        let borrow = getBorrowRecord(ctx, borrowId)
+        if borrow.varId == varId
+            remove(ctx.activeBorrows, i)
+        else
+            i = i + 1
+
+fn BorrowCtxCheckReturnEscape(ctx: BorrowCtx, varId: VarId, returnLifetime: LifetimeId): BorrowCheckError =
+    var state: VarState
+    if !BorrowCtxGetVarState(ctx, varId, state)
+        return Ok
+    if state.state == BorrowStateSharedBorrow || state.state == BorrowStateUniqueBorrow
+        if state.currentBorrowId >= 0
+            let borrow = getBorrowRecord(ctx, state.currentBorrowId)
+            if !BorrowCtxIsLifetimeWithin(ctx, borrow.lifetimeEnd, returnLifetime)
+                return ErrReturnEscape
+    return Ok
+
+fn BorrowCtxCheckGlobalEscape(ctx: BorrowCtx, varId: VarId): BorrowCheckError =
+    var state: VarState
+    if !BorrowCtxGetVarState(ctx, varId, state)
+        return Ok
+    if state.state == BorrowStateSharedBorrow || state.state == BorrowStateUniqueBorrow
+        return ErrGlobalEscape
+    return Ok
+
+fn BorrowCtxCheckCallEscape(ctx: BorrowCtx, varId: VarId): BorrowCheckError =
+    var state: VarState
+    if !BorrowCtxGetVarState(ctx, varId, state)
+        return Ok
+    if state.state == BorrowStateSharedBorrow || state.state == BorrowStateUniqueBorrow
+        return ErrCallEscape
+    return Ok
+
+fn BorrowCheckErrorText(err: BorrowCheckError): str =
+    if err == Ok
+        return "ok"
+    if err == ErrBorrowAfterMove
+        return "borrow after move"
+    if err == ErrAliasConflict
+        return "aliasing conflict: cannot have both shared and unique borrow"
+    if err == ErrUseAfterMove
+        return "use after move"
+    if err == ErrReturnEscape
+        return "borrowed value escapes via return"
+    if err == ErrGlobalEscape
+        return "borrowed value assigned to global variable"
+    if err == ErrCallEscape
+        return "borrowed value escapes through function call"
+    if err == ErrBorrowOfMoved
+        return "cannot borrow moved value"
+    if err == ErrBorrowOfBorrow
+        return "cannot borrow a borrow directly"
+    return "unknown error"

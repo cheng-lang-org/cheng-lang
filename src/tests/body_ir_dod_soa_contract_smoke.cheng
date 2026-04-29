@@ -19,7 +19,7 @@ fn makeSlot(id: int32,
     slot.stackOffset = stackOffset
     slot.sizeBytes = sizeBytes
     slot.alignBytes = alignBytes
-    slot.noAlias = true
+    ir.BodyIRApplyLocalSlotDefaultProof(slot)
     return slot
 
 fn buildBody(): ir.BodyIR =
@@ -82,12 +82,25 @@ fn main(): int32 =
     if c9 != 0: return c9
     let c10 = check(report.invalidRefCount == 0, 20)
     if c10 != 0: return c10
-    let c11 = check(strings.StrContains(text, "body_ir_dod_soa_arrays=ops,callSequence,localSlots,blocks,terms,cstringLiterals"), 21)
+    let c11 = check(report.flatScalarArrayCount == ir.BodyIRFlatSoAScalarArrayCount(), 21)
     if c11 != 0: return c11
-    let c12 = check(strings.StrContains(text, "body_ir_dod_soa_no_naked_pointer_key=1"), 22)
+    let c12 = check(report.flatStringArrayCount == ir.BodyIRFlatSoAStringArrayCount(), 22)
     if c12 != 0: return c12
-    let c13 = check(strings.StrContains(text, "body_ir_dod_soa_invalid_ref_count=0"), 23)
+    let c13 = check(report.nestedPayloadArrayCount == 0, 23)
     if c13 != 0: return c13
+    let c18 = check(strings.StrContains(text, "body_ir_dod_soa_arrays=ops,callSequence,localSlots,blocks,terms,cstringLiterals"), 28)
+    if c18 != 0: return c18
+    let c19 = check(strings.StrContains(text, "body_ir_dod_soa_no_naked_pointer_key=1"), 29)
+    if c19 != 0: return c19
+    let c20 = check(strings.StrContains(text, "body_ir_dod_soa_invalid_ref_count=0"), 30)
+    if c20 != 0: return c20
+    let flat = ir.BodyIRFlattenSoA(body)
+    let c21 = check(ir.BodyIRFlatSoAIsAligned(flat), 31)
+    if c21 != 0: return c21
+    let c22 = check(flat.opKinds.len == body.ops.len && flat.operands.len == 3, 32)
+    if c22 != 0: return c22
+    let c23 = check(flat.callArgSlots.len == 1 && flat.localNoAliasFlags.len == 3, 33)
+    if c23 != 0: return c23
 
     var broken = body
     broken.ops[0].operands = [4]
@@ -101,6 +114,47 @@ fn main(): int32 =
     if c16 != 0: return c16
     let c17 = check(strings.StrContains(brokenText, "body_ir_dod_soa_invalid_ref_count=1"), 27)
     if c17 != 0: return c17
+
+    var mismatch = body
+    mismatch.ops[0].target = 2
+    let mismatchReport = ir.BodyIRDodSoAContractCheck(mismatch)
+    let c24 = check(!mismatchReport.ok, 34)
+    if c24 != 0: return c24
+    let c25 = check(strings.StrContains(mismatchReport.firstInvalidRefOwner, "target_result_mismatch"), 35)
+    if c25 != 0: return c25
+
+    var badConstArg = body
+    badConstArg.callSequence[0].argSlots = [-7]
+    let badConstReport = ir.BodyIRDodSoAContractCheck(badConstArg)
+    let c26 = check(!badConstReport.ok, 36)
+    if c26 != 0: return c26
+
+    var cbrBody = body
+    var cbrTerm: ir.BodyTerm
+    cbrTerm.kind = ir.BodyTermCbrTag
+    cbrTerm.conditionKind = ir.BodyCondInvalidTag
+    cbrTerm.lhsSlot = 1
+    cbrTerm.trueBlock = 0
+    cbrTerm.falseBlock = 0
+    cbrBody.terms = []
+    let cbrTermIndex = ir.BodyIRAppendTerm(cbrBody, cbrTerm)
+    cbrBody.blocks[0].termIndex = cbrTermIndex
+    let cbrReport = ir.BodyIRDodSoAContractCheck(cbrBody)
+    let c27 = check(!cbrReport.ok, 37)
+    if c27 != 0: return c27
+    let c28 = check(strings.StrContains(cbrReport.firstInvalidRefOwner, "conditionKind"), 38)
+    if c28 != 0: return c28
+
+    var missingLoad = body
+    var loadOp: ir.BodyOp
+    loadOp.kind = ir.BodyOpLoadLocalTag
+    loadOp.target = 1
+    add(missingLoad.ops, loadOp)
+    let missingLoadReport = ir.BodyIRDodSoAContractCheck(missingLoad)
+    let c29 = check(!missingLoadReport.ok, 39)
+    if c29 != 0: return c29
+    let c30 = check(strings.StrContains(missingLoadReport.firstInvalidRefOwner, "source"), 40)
+    if c30 != 0: return c30
 
     echo(" body_ir_dod_soa_contract_smoke ok")
     return 0

@@ -1,0 +1,63 @@
+import std/os
+import std/strings
+import cheng/core/tooling/determinism_gate as detgate
+
+fn main(): int32 =
+    let testPath1 = "/tmp/determinism_test_file1.txt"
+    let testPath2 = "/tmp/determinism_test_file2.txt"
+    let content = "test content for determinism gate"
+    let fh1 = os.OpenFile(testPath1, 0x241)
+    let fh2 = os.OpenFile(testPath2, 0x241)
+    if fh1 < 0 || fh2 < 0:
+        echo("determinism_gate_smoke: FAIL - cannot create test files")
+        return 1
+    os.WriteFile(fh1, content)
+    os.WriteFile(fh2, content)
+    os.CloseFile(fh1)
+    os.CloseFile(fh2)
+
+    var gate = detgate.DeterminismGateNew(testPath1, testPath2)
+    if !detgate.DeterminismGateVerifyOutputDeterminism(gate):
+        echo("determinism_gate_smoke: FAIL - identical files mismatch")
+        os.RemoveFile(testPath1)
+        os.RemoveFile(testPath2)
+        return 1
+
+    let fh3 = os.OpenFile(testPath2, 0x241)
+    if fh3 < 0:
+        echo("determinism_gate_smoke: FAIL - cannot reopen test file")
+        os.RemoveFile(testPath1)
+        os.RemoveFile(testPath2)
+        return 1
+    os.WriteFile(fh3, "different content")
+    os.CloseFile(fh3)
+
+    var gate2 = detgate.DeterminismGateNew(testPath1, testPath2)
+    if detgate.DeterminismGateVerifyOutputDeterminism(gate2):
+        echo("determinism_gate_smoke: FAIL - different files matched")
+        os.RemoveFile(testPath1)
+        os.RemoveFile(testPath2)
+        return 1
+
+    let sha1 = detgate.DeterminismGateSha256File(testPath1)
+    let sha2 = detgate.DeterminismGateSha256File(testPath2)
+    if strings.Len(sha1) == 0 || strings.Len(sha2) == 0:
+        echo("determinism_gate_smoke: FAIL - sha256 empty")
+        os.RemoveFile(testPath1)
+        os.RemoveFile(testPath2)
+        return 1
+    if !detgate.DeterminismGateCompareShas(sha1, sha1):
+        echo("determinism_gate_smoke: FAIL - sha comparison false negative")
+        os.RemoveFile(testPath1)
+        os.RemoveFile(testPath2)
+        return 1
+    if detgate.DeterminismGateCompareShas(sha1, sha2):
+        echo("determinism_gate_smoke: FAIL - sha comparison false positive")
+        os.RemoveFile(testPath1)
+        os.RemoveFile(testPath2)
+        return 1
+
+    os.RemoveFile(testPath1)
+    os.RemoveFile(testPath2)
+    echo("determinism_gate_smoke: PASS")
+    return 0

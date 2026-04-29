@@ -1,4 +1,7 @@
+import std/atomic
+import std/async_rt as async
 import std/strings
+import std/thread
 import std/os as os
 import std/strformat
 import std/result
@@ -72,6 +75,19 @@ type
         wordCount: int32
         words: int32[]
         errorCode: int32
+
+    PrimaryFunctionCodegenWorkerCtx = ref
+        workerId: int32
+
+var
+    primaryFunctionCodegenWsTasks: PrimaryFunctionCodegenTask[]
+    primaryFunctionCodegenWsResults: PrimaryFunctionCodegenTaskResult[]
+    primaryFunctionCodegenWsBodyIRs: coreir.BodyIR[]
+    primaryFunctionCodegenWsReturnStringLiteralLens: int32[]
+    primaryFunctionCodegenWsShardHeads: atomic.I32[]
+    primaryFunctionCodegenWsShardTails: atomic.I32[]
+    primaryFunctionCodegenWsDoneCount: atomic.I32
+    primaryFunctionCodegenWsWorkerCount: int32
 
 fn PrimaryTargetSymbolName(targetTriple: str,
                              raw: str): str =
@@ -4561,7 +4577,7 @@ fn PrimaryBuildFunctionCodegenTaskPlan(functionBodyKinds: str[],
         plan.schedule = "serial_task_plan"
         plan.jobCount = PrimaryFunctionCodegenTaskPlanSerialJobCount()
     else:
-        plan.schedule = "parallel_requested_unavailable"
+        plan.schedule = "ws"
         plan.jobCount = requestedJobs
     for i in 0..<functionBodyKinds.len:
         var task: PrimaryFunctionCodegenTask
@@ -4860,6 +4876,164 @@ fn PrimaryRunFunctionCodegenTasksSerial(instructionWords: var int32[],
             firstErrorFunctionIndex = task.functionIndex
             return false
     return true
+
+fn PrimaryFunctionCodegenWorkerCountFor(plan: PrimaryFunctionCodegenTaskPlan): int32 =
+    if plan.tasks.len <= 0:
+        return 0
+    var count = plan.jobCount
+    if count <= 0:
+        count = 1
+    if count > plan.tasks.len:
+        count = plan.tasks.len
+    return count
+
+fn PrimaryFunctionCodegenWsResetState() =
+    primaryFunctionCodegenWsTasks = []
+    primaryFunctionCodegenWsResults = []
+    primaryFunctionCodegenWsBodyIRs = []
+    primaryFunctionCodegenWsReturnStringLiteralLens = []
+    primaryFunctionCodegenWsShardHeads = []
+    primaryFunctionCodegenWsShardTails = []
+    primaryFunctionCodegenWsDoneCount = nil
+    primaryFunctionCodegenWsWorkerCount = 0
+
+fn PrimaryFunctionCodegenWsPopOwn(workerId: int32,
+                                   taskIndex: var int32): bool =
+    if workerId < 0 || workerId >= primaryFunctionCodegenWsWorkerCount:
+        return false
+    let headCell = primaryFunctionCodegenWsShardHeads[workerId]
+    let tailCell = primaryFunctionCodegenWsShardTails[workerId]
+    let nextTail = atomic.LoadI32(tailCell) - 1
+    atomic.StoreI32(tailCell, nextTail)
+    let head = atomic.LoadI32(headCell)
+    if head < nextTail:
+        taskIndex = nextTail
+        return true
+    atomic.StoreI32(tailCell, head)
+    if head == nextTail:
+        if atomic.CasI32(headCell, head, head + 1):
+            taskIndex = nextTail
+            atomic.StoreI32(tailCell, head + 1)
+            return true
+    atomic.StoreI32(tailCell, atomic.LoadI32(headCell))
+    return false
+
+fn PrimaryFunctionCodegenWsStealFrom(victimId: int32,
+                                      taskIndex: var int32): bool =
+    if victimId < 0 || victimId >= primaryFunctionCodegenWsWorkerCount:
+        return false
+    let headCell = primaryFunctionCodegenWsShardHeads[victimId]
+    let tailCell = primaryFunctionCodegenWsShardTails[victimId]
+    while true:
+        let head = atomic.LoadI32(headCell)
+        let tail = atomic.LoadI32(tailCell)
+        if head >= tail:
+            return false
+        if atomic.CasI32(headCell, head, head + 1):
+            taskIndex = head
+            return true
+
+fn PrimaryFunctionCodegenWsTakeTask(workerId: int32,
+                                     taskIndex: var int32): bool =
+    if PrimaryFunctionCodegenWsPopOwn(workerId, taskIndex):
+        return true
+    var offset = 1
+    while offset < primaryFunctionCodegenWsWorkerCount:
+        let victimId = (workerId + offset) % primaryFunctionCodegenWsWorkerCount
+        if PrimaryFunctionCodegenWsStealFrom(victimId, taskIndex):
+            return true
+        offset = offset + 1
+    return false
+
+fn PrimaryFunctionCodegenWsWorkerMain(raw: ptr) =
+    if raw == nil:
+        return
+    let ctx: PrimaryFunctionCodegenWorkerCtx = PrimaryFunctionCodegenWorkerCtx(raw)
+    let workerId = ctx.workerId
+    while true:
+        var taskIndex: int32
+        if !PrimaryFunctionCodegenWsTakeTask(workerId, taskIndex):
+            break
+        if taskIndex >= 0 && taskIndex < primaryFunctionCodegenWsTasks.len:
+            let result = PrimaryExecuteFunctionCodegenTask(primaryFunctionCodegenWsTasks[taskIndex],
+                                                           primaryFunctionCodegenWsBodyIRs,
+                                                           primaryFunctionCodegenWsReturnStringLiteralLens)
+            primaryFunctionCodegenWsResults[taskIndex] = result
+    let _ = atomic.AddI32(primaryFunctionCodegenWsDoneCount, 1)
+    memRelease(ctx)
+
+fn PrimaryRunFunctionCodegenTasksWorkStealing(instructionWords: var int32[],
+                                               plan: PrimaryFunctionCodegenTaskPlan,
+                                               functionBodyIRs: coreir.BodyIR[],
+                                               functionReturnStringLiteralLens: int32[],
+                                               firstErrorFunctionIndex: var int32): bool =
+    firstErrorFunctionIndex = -1
+    if plan.tasks.len <= 0:
+        return true
+    let workerCount = PrimaryFunctionCodegenWorkerCountFor(plan)
+    if workerCount <= 0:
+        return true
+    PrimaryFunctionCodegenWsResetState()
+    primaryFunctionCodegenWsWorkerCount = workerCount
+    primaryFunctionCodegenWsBodyIRs = functionBodyIRs
+    primaryFunctionCodegenWsReturnStringLiteralLens = functionReturnStringLiteralLens
+    primaryFunctionCodegenWsDoneCount = atomic.NewI32(0)
+    if primaryFunctionCodegenWsDoneCount == nil:
+        firstErrorFunctionIndex = -1
+        PrimaryFunctionCodegenWsResetState()
+        return false
+    for ti in 0..<plan.tasks.len:
+        add(primaryFunctionCodegenWsTasks, plan.tasks[ti])
+        add(primaryFunctionCodegenWsResults, PrimaryFunctionCodegenTaskResultNew(plan.tasks[ti]))
+    for workerId in 0..<workerCount:
+        let start = (plan.tasks.len * workerId) / workerCount
+        let finish = (plan.tasks.len * (workerId + 1)) / workerCount
+        let head = atomic.NewI32(start)
+        let tail = atomic.NewI32(finish)
+        if head == nil || tail == nil:
+            firstErrorFunctionIndex = -1
+            PrimaryFunctionCodegenWsResetState()
+            return false
+        add(primaryFunctionCodegenWsShardHeads, head)
+        add(primaryFunctionCodegenWsShardTails, tail)
+    for workerId in 0..<workerCount:
+        let ctx = new[PrimaryFunctionCodegenWorkerCtx]()
+        if ctx == nil:
+            firstErrorFunctionIndex = -1
+            PrimaryFunctionCodegenWsResetState()
+            return false
+        ctx.workerId = workerId
+        memRetain(ctx)
+        async.spawnPtr(PrimaryFunctionCodegenWsWorkerMain, ctx)
+    while atomic.LoadI32(primaryFunctionCodegenWsDoneCount) < workerCount:
+        thread.Yield()
+    var ok = true
+    for taskIndex in 0..<plan.tasks.len:
+        if !PrimaryMergeFunctionCodegenTaskResult(instructionWords,
+                                                   plan.tasks[taskIndex],
+                                                   primaryFunctionCodegenWsResults[taskIndex]):
+            firstErrorFunctionIndex = plan.tasks[taskIndex].functionIndex
+            ok = false
+            break
+    PrimaryFunctionCodegenWsResetState()
+    return ok
+
+fn PrimaryRunFunctionCodegenTasks(instructionWords: var int32[],
+                                   plan: PrimaryFunctionCodegenTaskPlan,
+                                   functionBodyIRs: coreir.BodyIR[],
+                                   functionReturnStringLiteralLens: int32[],
+                                   firstErrorFunctionIndex: var int32): bool =
+    if plan.schedule == "ws" && plan.jobCount > PrimaryFunctionCodegenTaskPlanSerialJobCount():
+        return PrimaryRunFunctionCodegenTasksWorkStealing(instructionWords,
+                                                          plan,
+                                                          functionBodyIRs,
+                                                          functionReturnStringLiteralLens,
+                                                          firstErrorFunctionIndex)
+    return PrimaryRunFunctionCodegenTasksSerial(instructionWords,
+                                                plan,
+                                                functionBodyIRs,
+                                                functionReturnStringLiteralLens,
+                                                firstErrorFunctionIndex)
 
 fn PrimaryObjectMissingReasons(linkPlan: slplan.SystemLinkPlanStub,
                                  lowering: lower.LoweringPlanStub,
@@ -5673,7 +5847,7 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
                                                               functionStatementCallCounts,
                                                               functionWordOffsets,
                                                               functionWordCounts)
-    if functionTaskPlan.jobCount != PrimaryFunctionCodegenTaskPlanSerialJobCount():
+    if functionTaskPlan.jobCount < 0:
         bodySemanticsMissing = true
         if Len(firstMissingFunction) <= 0:
             firstMissingFunction = "BACKEND_JOBS"
@@ -5681,11 +5855,11 @@ fn BuildPrimaryObjectPlan(linkPlan: var slplan.SystemLinkPlanStub,
             firstMissingTypedIrKind = ""
             firstMissingLineNumber = 0
     var firstTaskCodegenErrorFunctionIndex: int32
-    if !PrimaryRunFunctionCodegenTasksSerial(instructionWords,
-                                             functionTaskPlan,
-                                             functionBodyIRs,
-                                             functionReturnStringLiteralLens,
-                                             firstTaskCodegenErrorFunctionIndex):
+    if !PrimaryRunFunctionCodegenTasks(instructionWords,
+                                       functionTaskPlan,
+                                       functionBodyIRs,
+                                       functionReturnStringLiteralLens,
+                                       firstTaskCodegenErrorFunctionIndex):
         bodySemanticsMissing = true
         if Len(firstMissingFunction) <= 0:
             firstMissingFunction = Fmt"function_index:{firstTaskCodegenErrorFunctionIndex}"
@@ -6144,6 +6318,44 @@ fn PrimaryObjectPlanEmitBodyIrReturnTerm(words: var int32[],
         else:
             return false
     return PrimaryObjectPlanEmitBodyIrEpilogue(words, emitIndex, frameBytes)
+
+fn PrimaryBodyCondArm64TrueCode(conditionKind: int32): int32 =
+    if conditionKind == coreir.BodyCondI32EqTag:
+        return a64.A64CondEQ
+    if conditionKind == coreir.BodyCondI32NeTag:
+        return a64.A64CondNE
+    if conditionKind == coreir.BodyCondI32LtTag:
+        return a64.A64CondLT
+    if conditionKind == coreir.BodyCondI32LeTag:
+        return a64.A64CondLE
+    if conditionKind == coreir.BodyCondI32GtTag:
+        return a64.A64CondGT
+    if conditionKind == coreir.BodyCondI32GeTag:
+        return a64.A64CondGE
+    if conditionKind == coreir.BodyCondLocalNonZeroTag:
+        return a64.A64CondNE
+    if conditionKind == coreir.BodyCondLocalZeroTag:
+        return a64.A64CondEQ
+    return -1
+
+fn PrimaryBodyCondArm64FalseCode(conditionKind: int32): int32 =
+    if conditionKind == coreir.BodyCondI32EqTag:
+        return a64.A64CondNE
+    if conditionKind == coreir.BodyCondI32NeTag:
+        return a64.A64CondEQ
+    if conditionKind == coreir.BodyCondI32LtTag:
+        return a64.A64CondGE
+    if conditionKind == coreir.BodyCondI32LeTag:
+        return a64.A64CondGT
+    if conditionKind == coreir.BodyCondI32GtTag:
+        return a64.A64CondLE
+    if conditionKind == coreir.BodyCondI32GeTag:
+        return a64.A64CondLT
+    if conditionKind == coreir.BodyCondLocalNonZeroTag:
+        return a64.A64CondEQ
+    if conditionKind == coreir.BodyCondLocalZeroTag:
+        return a64.A64CondNE
+    return -1
 
 fn PrimaryObjectPlanEmitBodyIrTerm(words: var int32[],
                                      emitIndex: var int32,

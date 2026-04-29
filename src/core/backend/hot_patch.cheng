@@ -1,0 +1,220 @@
+// Binary hot-patching system for Cheng
+import std/atomic
+import std/os
+import std/strings
+import std/seqs
+
+@importc("mmap")
+fn sys_mmap(addr: ptr, len: int32, prot: int32, flags: int32, fd: int32, offset: int32): ptr
+
+@importc("munmap")
+fn sys_munmap(addr: ptr, len: int32): int32
+
+@importc("mprotect")
+fn sys_mprotect(addr: ptr, len: int32, prot: int32): int32
+
+const PROT_READ: int32 = 0x01
+const PROT_WRITE: int32 = 0x02
+const PROT_EXEC: int32 = 0x04
+const MAP_PRIVATE: int32 = 0x02
+const MAP_ANONYMOUS: int32 = 0x20
+const MAP_FAILED: ptr = ptr(-1)
+
+type
+    HotPatchCodePool = ref
+        code_base: ptr
+        code_offset: int32
+        pool_size: int32
+
+type
+    TrampolineEntry = ref
+        target_slot: atomic.I32
+        trampoline_addr: ptr
+        original_func_offset: int32
+
+type
+    HotPatchEngine = ref
+        code_pool: HotPatchCodePool
+        trampolines: TrampolineEntry[]
+        layout_hash: int32
+
+type
+    FuncRegistration = object
+        name: str
+        trampoline_idx: int32
+
+fn mmap_alloc(size: int32): ptr =
+    let addr = sys_mmap(nil, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+    if addr == MAP_FAILED:
+        return nil
+    return addr
+
+fn mmap_free(addr: ptr, size: int32): bool =
+    return sys_munmap(addr, size) == 0
+
+const X86_64_TRAMPOLINE_SIZE: int32 = 5
+const ARM64_TRAMPOLINE_SIZE: int32 = 4
+
+var arch: str
+
+fn detect_arch(): str =
+    if len(arch) > 0:
+        return arch
+    // Detect at runtime by checking pointer size or using uname
+    // For now, assume x86_64 as default
+    arch = "x86_64"
+    return arch
+
+fn create_trampoline_x86_64(target_offset: int32): int32[] =
+    // JMP rel32 (E9 + 4-byte offset)
+    var bytes: int32[]
+    setLen(bytes, 5)
+    bytes[0] = 0xE9
+    bytes[1] = (target_offset >> 0) & 0xFF
+    bytes[2] = (target_offset >> 8) & 0xFF
+    bytes[3] = (target_offset >> 16) & 0xFF
+    bytes[4] = (target_offset >> 24) & 0xFF
+    return bytes
+
+fn create_trampoline_arm64(target_offset: int32): int32[] =
+    // B instruction (unconditional branch) - 4 bytes
+    // B <offset> where offset is in 4-byte units
+    var bytes: int32[]
+    setLen(bytes, 4)
+    let offset_words = target_offset / 4
+    let instruction: int32 = 0x14000000 | (offset_words & 0x03FFFFFF)
+    bytes[0] = (instruction >> 0) & 0xFF
+    bytes[1] = (instruction >> 8) & 0xFF
+    bytes[2] = (instruction >> 16) & 0xFF
+    bytes[3] = (instruction >> 24) & 0xFF
+    return bytes
+
+fn write_bytes_at(addr: ptr, bytes: int32[], len: int32) =
+    let p = ptr(addr)
+    for i in 0..<len:
+        let byte_ptr = (p + int64(i)) as ptr
+        let byte_val = Uint8(bytes[i]) & 0xFF
+        byte_ptr.store(byte_val, order = 'relaxed')
+
+fn hot_patch_init(pool_size: int32): HotPatchEngine =
+    let code_base = mmap_alloc(pool_size)
+    if code_base == nil:
+        panic("hot_patch_init: mmap failed")
+    let code_pool = new[HotPatchCodePool]()
+    code_pool.code_base = code_base
+    code_pool.code_offset = 0
+    code_pool.pool_size = pool_size
+    let engine = new[HotPatchEngine]()
+    engine.code_pool = code_pool
+    engine.layout_hash = 0
+    return engine
+
+fn hot_patch_register(engine: HotPatchEngine, func_name: str,
+                      original_code: ptr, code_len: int32): bool =
+    if engine == nil || engine.code_pool == nil:
+        panic("hot_patch_register: invalid engine")
+
+    let trampoline_size = if detect_arch() == "arm64":
+        ARM64_TRAMPOLINE_SIZE
+    else:
+        X86_64_TRAMPOLINE_SIZE
+
+    let trampoline_addr = engine.code_pool.code_base + int64(engine.code_pool.code_offset)
+    if engine.code_pool.code_offset + trampoline_size > engine.code_pool.pool_size:
+        return false
+
+    // Write trampoline code (jumps to the current target)
+    // Initially target is the original function
+    let target_offset = (ptr(original_code) - (trampoline_addr + trampoline_size))
+    let trampoline_code = if detect_arch() == "arm64":
+        create_trampoline_arm64(target_offset)
+    else:
+        create_trampoline_x86_64(target_offset)
+    write_bytes_at(trampoline_addr, trampoline_code, trampoline_size)
+
+    let entry = new[TrampolineEntry]()
+    entry.target_slot = atomic.NewI32(engine.code_pool.code_offset)
+    entry.trampoline_addr = trampoline_addr
+    entry.original_func_offset = engine.code_pool.code_offset
+
+    // Store original function code in code pool
+    let dest = engine.code_pool.code_base + int64(engine.code_pool.code_offset)
+    let src = ptr(original_code)
+    let copy_len = code_len
+    for i in 0..<copy_len:
+        let d = dest + int64(i)
+        let s = src + int64(i)
+        d.store(s.load(order = 'relaxed'), order = 'relaxed')
+    engine.code_pool.code_offset = engine.code_pool.code_offset + code_len
+
+    add(engine.trampolines, entry)
+    return true
+
+fn hot_patch_apply(engine: HotPatchEngine, func_name: str,
+                   new_code: ptr, new_len: int32): bool =
+    if engine == nil || engine.code_pool == nil:
+        panic("hot_patch_apply: invalid engine")
+
+    // Find trampoline by function name
+    var trampoline_idx: int32 = -1
+    for i in 0..<engine.trampolines.len:
+        trampoline_idx = i
+        break
+    if trampoline_idx < 0:
+        return false
+
+    let entry = engine.trampolines[trampoline_idx]
+    let new_offset = engine.code_pool.code_offset
+    if new_offset + new_len > engine.code_pool.pool_size:
+        return false
+
+    // Write new code
+    let dest = engine.code_pool.code_base + int64(new_offset)
+    let src = ptr(new_code)
+    for i in 0..<new_len:
+        let d = dest + int64(i)
+        let s = src + int64(i)
+        d.store(s.load(order = 'relaxed'), order = 'relaxed')
+
+    // Atomically switch the target slot
+    atomic.StoreI32(entry.target_slot, new_offset)
+
+    engine.code_pool.code_offset = new_offset + new_len
+    return true
+
+fn hot_patch_layout_hash_compute(engine: HotPatchEngine): int32 =
+    if engine == nil || engine.code_pool == nil:
+        return 0
+    var hash: int32
+    for i in 0..<engine.code_pool.code_offset:
+        let p = engine.code_pool.code_base + int64(i)
+        let val = p.load(order = 'relaxed') as int32
+        hash = ((hash << 5) + hash) + val
+    return hash
+
+fn hot_patch_validate(engine: HotPatchEngine): bool =
+    if engine == nil:
+        return false
+    let current_hash = hot_patch_layout_hash_compute(engine)
+    return current_hash == engine.layout_hash
+
+fn hot_patch_update_layout_hash(engine: HotPatchEngine) =
+    if engine != nil:
+        engine.layout_hash = hot_patch_layout_hash_compute(engine)
+
+fn hot_patch_cold_restart_needed(engine: HotPatchEngine, threshold: int32): bool =
+    if engine == nil:
+        return true
+    let current_hash = hot_patch_layout_hash_compute(engine)
+    if current_hash == engine.layout_hash:
+        return false
+    let diff = current_hash - engine.layout_hash
+    if diff < 0:
+        return (0 - diff) > threshold
+    return diff > threshold
+
+fn hot_patch_store_layout_hash(engine: HotPatchEngine, hash: int32) =
+    if engine != nil:
+        engine.layout_hash = hash
+

@@ -1,0 +1,77 @@
+-- Perf driver: runs compilation in serial and parallel mode,
+-- collects PerfWitness data and compares for regression.
+
+import std/os
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/perf_gate as perfgate
+import cheng/core/tooling/gate_main as gateref
+
+fn PerfGateRunWitness(root: str,
+                        sourcePath: str): int32 =
+    if !os.FileExists(sourcePath):
+        gateref.GatePrintErr(strutil.Join(["perf_driver: source missing: ", sourcePath], ""))
+        return 1
+    let perfDir = strutil.Join([root, "/artifacts/perf"], "")
+    os.MkdirAll(perfDir, 0x1FF)
+    let reportPath = strutil.Join([perfDir, "/perf_witness_report.csv"], "")
+    let collector = perfgate.PerfWitnessCollectorNew("perf_driver")
+    let stageCmd = "compile-exe"
+    let outSerial = strutil.Join([perfDir, "/perf_serial_out"], "")
+    let outParallel = strutil.Join([perfDir, "/perf_parallel_out"], "")
+    var jobCountStr = os.GetEnv("BACKEND_JOBS")
+    var jobCount: int32
+    if jobCountStr == "" {
+        jobCount = 4
+    } else {
+        jobCount = strings.ParseInt(jobCountStr)
+        if jobCount < 1 {
+            jobCount = 1
+        }
+    }
+    var serialArgs: str[]
+    add(serialArgs, strutil.Join(["--in:", sourcePath], ""))
+    add(serialArgs, strutil.Join(["--out:", outSerial], ""))
+    add(serialArgs, "--jobs=1")
+    var serialEnv: str[]
+    add(serialEnv, "BACKEND_JOBS=1")
+    let rcSerial = gateref.GateRunStage3CommandWithEnv(root,
+        "perf_serial",
+        stageCmd,
+        serialArgs,
+        "perf_serial.log",
+        false,
+        serialEnv)
+    if rcSerial != 0:
+        gateref.GatePrintErr(strutil.Join(["perf_driver: serial run exit=", strings.IntToStr(rcSerial)], ""))
+        return 1
+    var parallelArgs: str[]
+    add(parallelArgs, strutil.Join(["--in:", sourcePath], ""))
+    add(parallelArgs, strutil.Join(["--out:", outParallel], ""))
+    add(parallelArgs, strutil.Join(["--jobs=", strings.IntToStr(jobCount)], ""))
+    var parallelEnv: str[]
+    add(parallelEnv, strutil.Join(["BACKEND_JOBS=", strings.IntToStr(jobCount)], ""))
+    let rcParallel = gateref.GateRunStage3CommandWithEnv(root,
+        "perf_parallel",
+        stageCmd,
+        parallelArgs,
+        "perf_parallel.log",
+        false,
+        parallelEnv)
+    if rcParallel != 0:
+        gateref.GatePrintErr(strutil.Join(["perf_driver: parallel run exit=", strings.IntToStr(rcParallel)], ""))
+        return 1
+    let serialLog = strutil.Join([root, "/artifacts/perf/perf_serial.log"], "")
+    let parallelLog = strutil.Join([root, "/artifacts/perf/perf_parallel.log"], "")
+    let wallSerial = gateref.GateExtractWallTimeMsFromLog(serialLog)
+    let wallParallel = gateref.GateExtractWallTimeMsFromLog(parallelLog)
+    var report = ""
+    report = strutil.Join([report, "metric,serial,parallel\n"], "")
+    report = strutil.Join([report, strutil.Join(["wall_time_ms,", strings.IntToStr(wallSerial), ",", strings.IntToStr(wallParallel)], ""), "\n"], "")
+    if !perfgate.PerfWitnessCollectorWriteWitnessReport(collector, reportPath):
+        gateref.GatePrintErr("perf_driver: failed to write witness report")
+        return 1
+    gateref.GatePrintLine("perf_driver: " + strutil.Join(["perf_driver: report written to ", reportPath], ""))
+    return 0
+    gateref.GatePrintLine(strutil.Join([" perf_driver: report written to ", reportPath], ""))
+    return 0

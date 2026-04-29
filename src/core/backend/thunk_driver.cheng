@@ -1,0 +1,43 @@
+-- Thunk driver: orchestrates UIR thunk synthesis for importc FFI functions.
+-- Scans importc functions, determines which need thunks, synthesizes them.
+
+import std/strformat
+import cheng/core/backend/uir_thunk_synthesis as thunk
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/ir/core_types as coreir
+
+type
+    ThunkDriverResult =
+        ctx: thunk.UirThunkSynthesisCtx
+        synthesizedCount: int32
+        diagCount: int32
+
+fn ThunkDriverResultNew(): ThunkDriverResult =
+    var out: ThunkDriverResult
+    out.synthesizedCount = 0
+    out.diagCount = 0
+    return out
+
+fn ThunkDriverRun(loweringPlan: var lower.LoweringPlanStub): ThunkDriverResult =
+    var result = ThunkDriverResultNew()
+    var ctx = thunk.UirThunkSynthesisCtxNew()
+    for funcIdx in 0..<loweringPlan.functionNames.len:
+        let funcName = loweringPlan.functionNames[funcIdx]
+        if len(funcName) <= 0:
+            continue
+        let sourceId: coreir.FuncId = funcIdx as coreir.FuncId
+        var paramKinds: int32[]
+        var returnKinds: int32[]
+        if loweringPlan.functionCallConvs[funcIdx] == lower.LoweringCallConvInternal():
+            let thunkFuncId = thunk.UirThunkSynthesizeForImportCall(ctx,
+                sourceId,
+                paramKinds,
+                returnKinds)
+            if thunkFuncId != thunk.InvalidThunkFuncId():
+                result.synthesizedCount = result.synthesizedCount + 1
+    result.ctx = ctx
+    result.diagCount = ctx.diags.len
+    return result
+
+fn ThunkDriverReportText(result: ThunkDriverResult): str =
+    return thunk.UirThunkSynthesisReport(result.ctx)

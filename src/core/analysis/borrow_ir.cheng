@@ -1,0 +1,133 @@
+module borrow_ir
+
+import cheng/core/ir/core_types as coreir
+import cheng/core/analysis/borrow_checker as bc
+
+type
+    BorrowAnnotation =
+        slotId: int32
+        borrowId: bc.BorrowId
+        lifetimeId: bc.LifetimeId
+        kind: bc.BorrowKind
+
+    BorrowIRState =
+        annotations: BorrowAnnotation[]
+        borrowCtx: bc.BorrowCtx
+
+fn BorrowIRStateNew(): BorrowIRState =
+    var out: BorrowIRState
+    out.annotations = []
+    out.borrowCtx = bc.BorrowCtxNew()
+    return out
+
+fn BorrowIRAnnotateSlot(state: var BorrowIRState,
+                         slotId: int32,
+                         borrowId: bc.BorrowId,
+                         lifetimeId: bc.LifetimeId,
+                         kind: bc.BorrowKind) =
+    var ann: BorrowAnnotation
+    ann.slotId = slotId
+    ann.borrowId = borrowId
+    ann.lifetimeId = lifetimeId
+    ann.kind = kind
+    add(state.annotations, ann)
+
+fn BorrowIRGetSlotAnnotation(state: BorrowIRState,
+                             slotId: int32,
+                             outAnn: var BorrowAnnotation): bool =
+    for i in 0..<state.annotations.len
+        if state.annotations[i].slotId == slotId
+            outAnn = state.annotations[i]
+            return true
+    return false
+
+fn borrowIRCheckCallArgs(state: var BorrowIRState,
+                         callIdx: int32,
+                         callOp: coreir.CallOp): bool =
+    for argIdx in 0..<callOp.argSlots.len
+        let argSlot = callOp.argSlots[argIdx]
+        if argSlot < 0
+            continue
+        let err = bc.BorrowCtxCheckCallEscape(state.borrowCtx, argSlot)
+        if err != bc.Ok
+            return false
+    return true
+
+fn borrowIRProcessOp(state: var BorrowIRState,
+                     op: coreir.BodyOp,
+                     opIndex: int32,
+                     callSequence: coreir.CallOp[]): bool =
+    if op.kind == coreir.BodyOpCallTag
+        if op.operands.len < 1
+            return false
+        let callOrdinal = op.operands[0]
+        if callOrdinal >= 0 && callOrdinal < callSequence.len
+            return borrowIRCheckCallArgs(state, callOrdinal, callSequence[callOrdinal])
+    elif op.kind == coreir.BodyOpStoreLocalTag
+        if op.operands.len >= 1
+            let srcSlot = op.operands[0]
+            let err = bc.BorrowCtxCheckGlobalEscape(state.borrowCtx, srcSlot)
+            if err != bc.Ok
+                return false
+    elif op.kind == coreir.BodyOpReturnTag
+        let resultSlot = op.target
+        if resultSlot >= 0
+            let returnLifetime = bc.BorrowCtxAddLifetime(state.borrowCtx, -1)
+            let err = bc.BorrowCtxCheckReturnEscape(state.borrowCtx, resultSlot, returnLifetime)
+            if err != bc.Ok
+                return false
+    return true
+
+fn borrowIRProcessTerm(state: var BorrowIRState,
+                       term: coreir.BodyTerm): bool =
+    let resultSlot = term.resultSlot
+    if resultSlot >= 0
+        let returnLifetime = bc.BorrowCtxAddLifetime(state.borrowCtx, -1)
+        let err = bc.BorrowCtxCheckReturnEscape(state.borrowCtx, resultSlot, returnLifetime)
+        if err != bc.Ok
+            return false
+    return true
+
+fn borrowIRProcessBlock(state: var BorrowIRState,
+                        block: coreir.BodyBlock,
+                        ops: coreir.BodyOp[],
+                        terms: coreir.BodyTerm[],
+                        callSequence: coreir.CallOp[]): bool =
+    bc.BorrowCtxPushScope(state.borrowCtx)
+    let startIdx = block.opStart
+    let endIdx = block.opStart + block.opCount
+    for opIdx in startIdx..<endIdx
+        if opIdx < 0 || opIdx >= ops.len
+            return false
+        if !borrowIRProcessOp(state, ops[opIdx], opIdx, callSequence)
+            return false
+    if block.termIndex >= 0 && block.termIndex < terms.len
+        if !borrowIRProcessTerm(state, terms[block.termIndex])
+            return false
+    bc.BorrowCtxPopScope(state.borrowCtx)
+    return true
+
+fn borrowIRProcessLinear(state: var BorrowIRState,
+                         ops: coreir.BodyOp[],
+                         callSequence: coreir.CallOp[]): bool =
+    bc.BorrowCtxPushScope(state.borrowCtx)
+    for opIdx in 0..<ops.len
+        if !borrowIRProcessOp(state, ops[opIdx], opIdx, callSequence)
+            return false
+    bc.BorrowCtxPopScope(state.borrowCtx)
+    return true
+
+fn BorrowIRPass(bodyIR: var coreir.BodyIR): bool =
+    var state: BorrowIRState = BorrowIRStateNew()
+    if bodyIR.blocks.len > 0
+        for blockIdx in 0..<bodyIR.blocks.len
+            let block = bodyIR.blocks[blockIdx]
+            if !borrowIRProcessBlock(state, block, bodyIR.ops, bodyIR.terms, bodyIR.callSequence)
+                return false
+    else
+        if !borrowIRProcessLinear(state, bodyIR.ops, bodyIR.callSequence)
+            return false
+    for i in 0..<state.annotations.len
+        let ann = state.annotations[i]
+        bodyIR.localSlots[ann.slotId].noAlias = (ann.kind == bc.Unique)
+    return true

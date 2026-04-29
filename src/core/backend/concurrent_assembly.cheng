@@ -1,0 +1,297 @@
+# Concurrent Binary Assembly - Pass 3 of 30-80ms cold bootstrap architecture.
+# After all functions have been compiled (Pass 2 work-stealing), we assemble
+# the final binary using multiple threads to concurrently memcpy machine code
+# into the right positions in a shared mmap'd memory buffer.
+#
+# Flow: mmap buffer -> divide functions across workers -> concurrent memcpy ->
+#       emit data section -> return filled buffer pointer
+#
+# Each worker writes to a disjoint region; no locks needed.
+
+import std/atomic
+import std/async_rt as async
+import std/thread
+import std/os
+import std/system
+import std/rawmem_support
+import std/result
+import cheng/core/backend/primary_object_plan as pobj
+
+# -- mmap FFI (same pattern as hot_patch.cheng) --
+
+@importc("mmap")
+fn sys_mmap(addr: ptr, len: int32, prot: int32, flags: int32, fd: int32, offset: int32): ptr
+
+@importc("munmap")
+fn sys_munmap(addr: ptr, len: int32): int32
+
+const PROT_READ: int32 = 0x01
+const PROT_WRITE: int32 = 0x02
+const MAP_PRIVATE: int32 = 0x02
+const MAP_ANONYMOUS: int32 = 0x20
+const MAP_FAILED: ptr = ptr(-1)
+
+# -- Types --
+
+type
+    ConcurrentAssemblyCtx =
+        targetBuffer: ptr
+        bufferSize: int32
+        textVA: int64
+        textFileOffset: int32
+        dataFileOffset: int32
+        functionOffsets: int32[]
+        functionSizes: int32[]
+        completedCount: atomic.I32
+        workerCount: int32
+        errorCount: atomic.I32
+        totalFunctions: int32
+        assemblyTimeNs: int64
+
+    AssemblyWorkerCtx = ref
+        workerId: int32
+        targetBuffer: ptr
+        bufferSize: int32
+        functionOffsets: int32[]
+        functionSizes: int32[]
+        wordOffsets: int32[]
+        wordCounts: int32[]
+        instructionWords: int32[]
+        completedCount: atomic.I32
+        errorCount: atomic.I32
+        functionIndices: int32[]
+
+# -- Worker count helper --
+
+fn ConcurrentAssemblyWorkerCountFor(functionCount: int32, maxWorkers: int32): int32 =
+    if functionCount <= 0 || maxWorkers <= 0:
+        return 0
+    var count = maxWorkers
+    if count > functionCount:
+        count = functionCount
+    # cap at reasonable hardware limit; actual core count determined at spawn time
+    if count > 64:
+        count = 64
+    return count
+
+# -- Word-to-bytes copy (uses RawmemCopy: source int32[] native LE layout matches output) --
+
+fn ConcurrentAssemblyCopyWords(dest: ptr, destByteOffset: int32,
+                                src: int32[], srcWordOffset: int32,
+                                wordCount: int32) =
+    if wordCount <= 0:
+        return
+    let destPtr = rawmem_support.RawmemPtrAdd(dest, destByteOffset)
+    let srcPtr = rawmem_support.RawmemPtrAdd(rawmem_support.RawmemAsVoid(src),
+                                              srcWordOffset * 4)
+    rawmem_support.RawmemCopy(destPtr, srcPtr, wordCount * 4)
+
+# -- Worker main function (spawned via async.spawnPtr) --
+
+fn ConcurrentAssemblyWorkerMain(raw: ptr) =
+    if raw == nil:
+        return
+    let ctx: AssemblyWorkerCtx = AssemblyWorkerCtx(raw)
+    if ctx == nil:
+        return
+    for i in 0..<ctx.functionIndices.len:
+        let funcIndex = ctx.functionIndices[i]
+        if funcIndex < 0:
+            let _ = atomic.AddI32(ctx.errorCount, 1)
+            let _ = atomic.AddI32(ctx.completedCount, 1)
+            continue
+        # Validate array indices
+        if funcIndex >= ctx.wordOffsets.len ||
+           funcIndex >= ctx.wordCounts.len ||
+           funcIndex >= ctx.functionOffsets.len ||
+           funcIndex >= ctx.functionSizes.len:
+            let _ = atomic.AddI32(ctx.errorCount, 1)
+            let _ = atomic.AddI32(ctx.completedCount, 1)
+            continue
+        let srcWordOffset = ctx.wordOffsets[funcIndex]
+        let wordCount = ctx.wordCounts[funcIndex]
+        if wordCount <= 0:
+            let _ = atomic.AddI32(ctx.completedCount, 1)
+            continue
+        let destOffset = ctx.functionOffsets[funcIndex]
+        let byteCount = wordCount * 4
+        # Bounds check: destination must fit in mmap'd buffer
+        if destOffset < 0 || destOffset + byteCount > ctx.bufferSize:
+            let _ = atomic.AddI32(ctx.errorCount, 1)
+            let _ = atomic.AddI32(ctx.completedCount, 1)
+            continue
+        # Bounds check: source range must fit in instructionWords
+        if srcWordOffset < 0 || srcWordOffset + wordCount > ctx.instructionWords.len:
+            let _ = atomic.AddI32(ctx.errorCount, 1)
+            let _ = atomic.AddI32(ctx.completedCount, 1)
+            continue
+        # Concurrent-safe memcpy: each worker writes to a disjoint offset range
+        ConcurrentAssemblyCopyWords(ctx.targetBuffer, destOffset,
+                                     ctx.instructionWords, srcWordOffset, wordCount)
+        let _ = atomic.AddI32(ctx.completedCount, 1)
+    memRelease(ctx)
+
+# -- Data section assembly (serial, typically small compared to code) --
+
+fn ConcurrentAssemblyEmitDataSection(targetBuffer: ptr, bufferSize: int32,
+                                      dataWords: int32[], dataFileOffset: int32) =
+    if dataWords.len <= 0 || dataFileOffset < 0:
+        return
+    let dataByteCount = dataWords.len * 4
+    if dataFileOffset + dataByteCount > bufferSize:
+        return
+    ConcurrentAssemblyCopyWords(targetBuffer, dataFileOffset,
+                                 dataWords, 0, dataWords.len)
+
+# -- Main orchestrator: mmap, concurrent copy, data section, return filled buffer --
+
+fn ConcurrentAssemblyAssemble(instructionWords: int32[],
+                               functionWordOffsets: int32[],
+                               functionWordCounts: int32[],
+                               dataWords: int32[],
+                               textFileOffset: int32,
+                               dataFileOffset: int32,
+                               textVA: int64,
+                               bufferSize: int32,
+                               workerCount: int32): Result[ptr] =
+    let totalFunctions = functionWordCounts.len
+    if totalFunctions <= 0:
+        return Err[ptr]("concurrent_assembly: no functions to assemble")
+    let actualWorkers = ConcurrentAssemblyWorkerCountFor(totalFunctions, workerCount)
+    if actualWorkers <= 0:
+        return Err[ptr]("concurrent_assembly: effective worker count is zero")
+    # mmap the output buffer
+    let targetBuffer = sys_mmap(nil, bufferSize,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+    if targetBuffer == MAP_FAILED:
+        return Err[ptr]("concurrent_assembly: mmap failed")
+    # Compute per-function byte offsets and sizes in the target buffer
+    var functionOffsets: int32[]
+    var functionSizes: int32[]
+    var nextOffset = textFileOffset
+    for fi in 0..<totalFunctions:
+        let wordCount = functionWordCounts[fi]
+        let byteSize = wordCount * 4
+        add(functionOffsets, nextOffset)
+        add(functionSizes, byteSize)
+        nextOffset = nextOffset + byteSize
+    # Create shared atomic counters
+    let completedCount = atomic.NewI32(0)
+    let errorCount = atomic.NewI32(0)
+    if completedCount == nil || errorCount == nil:
+        let _ = sys_munmap(targetBuffer, bufferSize)
+        return Err[ptr]("concurrent_assembly: atomic allocation failed")
+    # Spawn workers
+    for workerId in 0..<actualWorkers:
+        let start = (totalFunctions * workerId) / actualWorkers
+        let finish = (totalFunctions * (workerId + 1)) / actualWorkers
+        if start >= finish:
+            continue
+        # Build function index list for this worker
+        var indices: int32[]
+        for fi in start..<finish:
+            add(indices, fi)
+        let workerCtx = new[AssemblyWorkerCtx]()
+        if workerCtx == nil:
+            let _ = sys_munmap(targetBuffer, bufferSize)
+            return Err[ptr]("concurrent_assembly: worker ctx allocation failed")
+        workerCtx.workerId = workerId
+        workerCtx.targetBuffer = targetBuffer
+        workerCtx.bufferSize = bufferSize
+        workerCtx.functionOffsets = functionOffsets
+        workerCtx.functionSizes = functionSizes
+        workerCtx.wordOffsets = functionWordOffsets
+        workerCtx.wordCounts = functionWordCounts
+        workerCtx.instructionWords = instructionWords
+        workerCtx.completedCount = completedCount
+        workerCtx.errorCount = errorCount
+        workerCtx.functionIndices = indices
+        memRetain(workerCtx)
+        async.spawnPtr(ConcurrentAssemblyWorkerMain, workerCtx)
+    # Busy-wait for all workers to complete
+    while atomic.LoadI32(completedCount) < totalFunctions:
+        thread.Yield()
+    # Check for errors
+    let errors = atomic.LoadI32(errorCount)
+    if errors > 0:
+        let _ = sys_munmap(targetBuffer, bufferSize)
+        return Err[ptr](Fmt"concurrent_assembly: {errors} worker error(s)")
+    # Emit data section (serial, typically small)
+    ConcurrentAssemblyEmitDataSection(targetBuffer, bufferSize, dataWords, dataFileOffset)
+    return Ok[ptr](targetBuffer)
+
+# -- Public API --
+
+fn ConcurrentAssemblyNew(functionCount: int32, workerCount: int32): ConcurrentAssemblyCtx =
+    var ctx: ConcurrentAssemblyCtx
+    ctx.totalFunctions = functionCount
+    ctx.workerCount = workerCount
+    ctx.completedCount = atomic.NewI32(0)
+    ctx.errorCount = atomic.NewI32(0)
+    ctx.targetBuffer = nil
+    ctx.bufferSize = 0
+    ctx.textVA = 0
+    ctx.textFileOffset = 0
+    ctx.dataFileOffset = 0
+    ctx.functionOffsets = []
+    ctx.functionSizes = []
+    ctx.assemblyTimeNs = 0
+    return ctx
+
+fn ConcurrentAssemblyAssembleExecutable(ctx: var ConcurrentAssemblyCtx,
+                                         plan: pobj.PrimaryObjectPlan): Result[ptr] =
+    let instructionWords = plan.instructionWords
+    let functionWordOffsets = plan.functionWordOffsets
+    let functionWordCounts = plan.functionWordCounts
+    var dataWords: int32[]
+    let result = ConcurrentAssemblyAssemble(instructionWords,
+                                             functionWordOffsets,
+                                             functionWordCounts,
+                                             dataWords,
+                                             ctx.textFileOffset,
+                                             ctx.dataFileOffset,
+                                             ctx.textVA,
+                                             ctx.bufferSize,
+                                             ctx.workerCount)
+    if result.ok:
+        ctx.targetBuffer = result.value
+    return result
+
+fn ConcurrentAssemblyFree(ctx: var ConcurrentAssemblyCtx) =
+    if ctx.targetBuffer != nil && ctx.bufferSize > 0:
+        let _ = sys_munmap(ctx.targetBuffer, ctx.bufferSize)
+    ctx.targetBuffer = nil
+
+fn ConcurrentAssemblyReport(ctx: ConcurrentAssemblyCtx): str =
+    var out = "concurrent_assembly:"
+    out = Fmt"{out} total_functions={ctx.totalFunctions}"
+    if ctx.completedCount != nil:
+        out = Fmt"{out} completed={atomic.LoadI32(ctx.completedCount)}"
+    if ctx.errorCount != nil:
+        out = Fmt"{out} errors={atomic.LoadI32(ctx.errorCount)}"
+    out = Fmt"{out} buffer_size={ctx.bufferSize}"
+    return out
+
+fn ConcurrentAssemblyVerify(ctx: ConcurrentAssemblyCtx): bool =
+    if ctx.completedCount == nil || ctx.errorCount == nil:
+        return false
+    let completed = atomic.LoadI32(ctx.completedCount)
+    let errors = atomic.LoadI32(ctx.errorCount)
+    if errors > 0:
+        return false
+    return completed == ctx.totalFunctions
+
+# -- Write-to-disk (single syscall) --
+
+fn ConcurrentAssemblyFlushToDisk(ctx: ConcurrentAssemblyCtx,
+                                  outputPath: str): bool =
+    if ctx.targetBuffer == nil || ctx.bufferSize <= 0:
+        return false
+    if len(outputPath) <= 0:
+        return false
+    let bufView: str = NewStringCopy(ctx.targetBuffer, ctx.bufferSize)
+    if len(bufView) != ctx.bufferSize:
+        return false
+    os.WriteFile(outputPath, bufView)
+    return true

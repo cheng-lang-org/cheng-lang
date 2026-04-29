@@ -1,0 +1,95 @@
+-- Work-stealing scheduler determinism test
+-- Verifies BACKEND_JOBS=1 and BACKEND_JOBS=4 produce bit-identical outputs
+
+import std/os
+import std/strings
+import std/strutils as strutil
+import cheng/core/tooling/gate_main as gate
+import cheng/core/ir/function_task as ftask
+
+const DeterminismTempDir = "/tmp/function_task_ws_det"
+
+fn randomSourceFile(rootDir: str): str =
+    return strutil.Join([rootDir, "src/tests/fixtures/function_task_simple.cheng"], "")
+
+fn compileWithJobs(rootDir: str, sourcePath: str, jobs: int32, outPath: str): int32 =
+    if !os.FileExists(sourcePath):
+        gate.GatePrintErr(strutil.Join(["source missing: ", sourcePath], ""))
+        return 1
+    os.MkdirAll(DeterminismTempDir, 0x1FF)
+    let stageCmd = "compile-exe"
+    var args: str[]
+    add(args, strutil.Join(["--in:", sourcePath], ""))
+    add(args, strutil.Join(["--out:", outPath], ""))
+    add(args, strutil.Join(["--jobs=", strings.IntToStr(jobs)], ""))
+    var env: str[]
+    add(env, strutil.Join(["BACKEND_JOBS=", strings.IntToStr(jobs)], ""))
+    let rc = gate.GateRunStage3CommandWithEnv(rootDir,
+        strutil.Join(["ws_det_jobs_", strings.IntToStr(jobs)], ""),
+        stageCmd,
+        args,
+        strutil.Join(["ws_det_jobs_", strings.IntToStr(jobs), ".log"], ""),
+        false,
+        env)
+    if rc != 0:
+        gate.GatePrintErr(strutil.Join(["compile failed jobs=", strings.IntToStr(jobs), " exit=", strings.IntToStr(rc)], ""))
+    return rc
+
+fn sha256File(path: str): str =
+    if !os.FileExists(path):
+        return ""
+    let content = os.ReadFile(path)
+    if strings.Len(content) == 0:
+        return ""
+    return gate.GateSha256(content)
+
+fn main(): int32 =
+    let rootDir = os.GetEnv("CHENG_ROOT")
+    if rootDir == "":
+        gate.GatePrintErr("CHENG_ROOT not set")
+        return 1
+
+    let sourcePath = randomSourceFile(rootDir)
+    let outSingle = strutil.Join([DeterminismTempDir, "/ws_det_single.exe"], "")
+    let outParallel = strutil.Join([DeterminismTempDir, "/ws_det_parallel.exe"], "")
+
+    os.RemoveFile(outSingle)
+    os.RemoveFile(outParallel)
+
+    let rcSingle = compileWithJobs(rootDir, sourcePath, 1, outSingle)
+    if rcSingle != 0:
+        gate.GatePrintErr("single-threaded compilation failed")
+        return 1
+
+    let rcParallel = compileWithJobs(rootDir, sourcePath, 4, outParallel)
+    if rcParallel != 0:
+        gate.GatePrintErr("parallel compilation failed")
+        return 1
+
+    let shaSingle = sha256File(outSingle)
+    let shaParallel = sha256File(outParallel)
+
+    if shaSingle == "":
+        gate.GatePrintErr("failed to read single output")
+        return 1
+    if shaParallel == "":
+        gate.GatePrintErr("failed to read parallel output")
+        return 1
+
+    if shaSingle != shaParallel:
+        gate.GatePrintErr(strutil.Join(["determinism FAIL: SHA mismatch\n  single: ", shaSingle, "\n  parallel: ", shaParallel], ""))
+        return 1
+
+    if ftask.FunctionTaskWorkStealingLastWorkerCount() != 4 {
+        gate.GatePrintErr("Work stealing worker count mismatch")
+        return 1
+    }
+
+    let completed = ftask.FunctionTaskWorkStealingLastCompletedWorkerCount()
+    if completed != 4 {
+        gate.GatePrintErr("Work stealing completed workers mismatch: ", completed)
+        return 1
+    }
+
+    gate.GatePrintLine("function_task_ws_determinism_smoke: PASS")
+    return 0

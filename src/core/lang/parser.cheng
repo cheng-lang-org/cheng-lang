@@ -778,27 +778,87 @@ fn ParserLineIsMultilineStringClose(lineRaw: str,
     indentOut = ParserTextSliceFast(lineRaw, 0, start)
     return true
 
-fn ParserAppendShortStringEscaped(out: var buffer.ByteBuffer,
-                                    text: str) =
+fn ParserEscapedShortStringLen(text: str): int32 =
+    var outLen: int32
     for i in 0..<text.len:
-        let ch = text[i]
-        if ch == Char(34):
-            buffer.AppendByte(out, 92)
-            buffer.AppendByte(out, 34)
-        elif ch == '\\':
-            buffer.AppendByte(out, 92)
-            buffer.AppendByte(out, 92)
-        elif Int32(ch) == 10:
-            buffer.AppendByte(out, 92)
-            buffer.AppendByte(out, 110)
-        elif Int32(ch) == 13:
-            buffer.AppendByte(out, 92)
-            buffer.AppendByte(out, 110)
-        elif Int32(ch) == 9:
-            buffer.AppendByte(out, 92)
-            buffer.AppendByte(out, 116)
+        let code = Int32(text[i])
+        if code == 34 || code == 92 || code == 10 || code == 13 || code == 9:
+            outLen = outLen + 2
         else:
-            buffer.AppendText(out, ParserTextSliceFast(text, i, 1))
+            outLen = outLen + 1
+    return outLen
+
+fn ParserWriteShortStringEscaped(out: var str,
+                                   writePos: var int32,
+                                   text: str) =
+    for i in 0..<text.len:
+        let code = Int32(text[i])
+        if code == 34:
+            ParserWriteByteFast(out, writePos, 92)
+            ParserWriteByteFast(out, writePos, 34)
+        elif code == 92:
+            ParserWriteByteFast(out, writePos, 92)
+            ParserWriteByteFast(out, writePos, 92)
+        elif code == 10:
+            ParserWriteByteFast(out, writePos, 92)
+            ParserWriteByteFast(out, writePos, 110)
+        elif code == 13:
+            ParserWriteByteFast(out, writePos, 92)
+            ParserWriteByteFast(out, writePos, 110)
+        elif code == 9:
+            ParserWriteByteFast(out, writePos, 92)
+            ParserWriteByteFast(out, writePos, 116)
+        else:
+            ParserWriteByteFast(out, writePos, code)
+
+fn ParserMeasureMultilineStringRewrite(lines: str[],
+                                         outLen: var int32,
+                                         err: var str): bool =
+    outLen = 0
+    err = ""
+    var i: int32
+    while i < lines.len:
+        let line = ParserLineWithoutTrailingCr(lines[i])
+        let openPos = ParserFindMultilineStringOpenOnLine(line)
+        if openPos < 0:
+            outLen = outLen + line.len
+            if i + 1 < lines.len:
+                outLen = outLen + 1
+            i = i + 1
+            continue
+        if !ParserOnlyInlineSpaces(line, openPos + 3, line.len):
+            err = Fmt"multiline string opener must be followed by a newline at line {i + 1}"
+            return false
+        var closeIndex: int32 = -1
+        var closeIndent = ""
+        for candidate in i + 1..<lines.len:
+            let closeLine = ParserLineWithoutTrailingCr(lines[candidate])
+            if ParserLineIsMultilineStringClose(closeLine, closeIndent):
+                closeIndex = candidate
+                break
+        if closeIndex < 0:
+            err = Fmt"unterminated multiline string starting at line {i + 1}"
+            return false
+        outLen = outLen + openPos + 1
+        for bodyIndex in i + 1..<closeIndex:
+            let bodyLine = ParserLineWithoutTrailingCr(lines[bodyIndex])
+            if ParserHasNonTrimChar(bodyLine):
+                if closeIndent != "" && !ParserTextEqualsAt(bodyLine, 0, closeIndent):
+                    err = Fmt"multiline string body indentation is shallower than closing delimiter at line {bodyIndex + 1}"
+                    return false
+                let bodyText = ParserTextSliceFast(bodyLine,
+                                                    closeIndent.len,
+                                                    bodyLine.len - closeIndent.len)
+                outLen = outLen + ParserEscapedShortStringLen(bodyText)
+            if bodyIndex + 1 < closeIndex:
+                outLen = outLen + 2
+        outLen = outLen + 1
+        var newlineCount = closeIndex - i
+        if closeIndex + 1 < lines.len:
+            newlineCount = newlineCount + 1
+        outLen = outLen + newlineCount
+        i = closeIndex + 1
+    return true
 
 fn ParserRewriteMultilineStringSourceText(textRaw: str,
                                             rewrittenOut: var str,
@@ -808,34 +868,41 @@ fn ParserRewriteMultilineStringSourceText(textRaw: str,
         err = ""
         return true
     let lines = ParserSplitChar(textRaw, '\n')
-    var out = buffer.NewByteBuffer()
+    var outLen: int32
+    if !ParserMeasureMultilineStringRewrite(lines, outLen, err):
+        return false
+    if outLen <= 0:
+        rewrittenOut = ""
+        err = ""
+        return true
+    var out = NewStringAlloc(outLen)
+    let outPtr = RawmemAsVoid(out)
+    var writePos: int32
     var i: int32
     while i < lines.len:
         let line = ParserLineWithoutTrailingCr(lines[i])
         let openPos = ParserFindMultilineStringOpenOnLine(line)
         if openPos < 0:
-            buffer.AppendText(out, line)
+            ParserWriteTextFast(outPtr, writePos, line)
             if i + 1 < lines.len:
-                buffer.AppendByte(out, 10)
+                ParserWriteByteFast(out, writePos, 10)
             i = i + 1
             continue
         if !ParserOnlyInlineSpaces(line, openPos + 3, line.len):
             err = Fmt"multiline string opener must be followed by a newline at line {i + 1}"
             return false
-        var closeIndex = i + 1
+        var closeIndex: int32 = -1
         var closeIndent = ""
-        var foundClose = false
-        while closeIndex < lines.len:
-            let closeLine = ParserLineWithoutTrailingCr(lines[closeIndex])
+        for candidate in i + 1..<lines.len:
+            let closeLine = ParserLineWithoutTrailingCr(lines[candidate])
             if ParserLineIsMultilineStringClose(closeLine, closeIndent):
-                foundClose = true
+                closeIndex = candidate
                 break
-            closeIndex = closeIndex + 1
-        if !foundClose:
+        if closeIndex < 0:
             err = Fmt"unterminated multiline string starting at line {i + 1}"
             return false
-        buffer.AppendText(out, ParserTextSliceFast(line, 0, openPos))
-        buffer.AppendByte(out, 34)
+        ParserWriteTextFast(outPtr, writePos, ParserTextSliceFast(line, 0, openPos))
+        ParserWriteByteFast(out, writePos, 34)
         for bodyIndex in i + 1..<closeIndex:
             let bodyLine = ParserLineWithoutTrailingCr(lines[bodyIndex])
             var bodyText = ""
@@ -846,18 +913,20 @@ fn ParserRewriteMultilineStringSourceText(textRaw: str,
                 bodyText = ParserTextSliceFast(bodyLine,
                                                 closeIndent.len,
                                                 bodyLine.len - closeIndent.len)
-            ParserAppendShortStringEscaped(out, bodyText)
+            ParserWriteShortStringEscaped(out, writePos, bodyText)
             if bodyIndex + 1 < closeIndex:
-                buffer.AppendByte(out, 92)
-                buffer.AppendByte(out, 110)
-        buffer.AppendByte(out, 34)
+                ParserWriteByteFast(out, writePos, 92)
+                ParserWriteByteFast(out, writePos, 110)
+        ParserWriteByteFast(out, writePos, 34)
         var newlineCount = closeIndex - i
         if closeIndex + 1 < lines.len:
             newlineCount = newlineCount + 1
         for _ in 0..<newlineCount:
-            buffer.AppendByte(out, 10)
+            ParserWriteByteFast(out, writePos, 10)
         i = closeIndex + 1
-    rewrittenOut = rawbytes.BytesToString(buffer.ToBytes(out))
+    if writePos != outLen:
+        panic("parser multiline string rewrite length mismatch")
+    rewrittenOut = out
     err = ""
     return true
 

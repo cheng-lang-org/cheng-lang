@@ -107,7 +107,8 @@ let c = RunResult(outputText: "ok")
 - `cheng` 固定 dev-only；release 仅允许 `release-compile`。`cheng`/`release-compile` 不接受 `--linker` 或 `BACKEND_LINKER` 覆盖，链接器由命令轨道固定。
 - Dev 默认 self-link/direct-exe/host runner hotpatch；Release 默认 system linker/substrate runtime。`100ms` 编译和二进制原地更新只属于 dev host-only dedicated witness。
 - `BACKEND_JOBS` 是唯一公开 worker 数控制面；`BACKEND_FN_SCHED=serial` 只保留给内部诊断、perf 对照和低内存 bring-up。
-- `run-production-regression` 是当前聚合回归入口；它会串起 driver 自举、stage0/stage3/backend_driver 命令面 smoke、driver build report 合同、perf gate 合同、ORC/perf 合同、文档/skill 一致性、显式默认值正反例与防回潮门禁、跨目标 smoke 和 stage2/stage3 libp2p smoke。
+- `run-production-regression` 是当前聚合回归入口；它会串起 driver 自举、stage0/stage3/backend_driver 命令面 smoke、driver build report 合同、function task 合同、BodyIR DoD/SoA/noalias/CFG 合同、perf gate 合同、线程/原子/ORC runtime provider 合同、文档/skill 一致性、显式默认值正反例与防回潮门禁、跨目标 smoke 和 stage2/stage3 libp2p smoke。
+- `thread_atomic_orc_runtime_gate_smoke` 是线程/原子/ORC 真实 runtime provider 门禁；它必须同时检查 provider object、非 standalone no-runtime、真实符号引用和运行 marker。
 - `perf_memory_contract_smoke` 是当前正式性能/内存门禁；`orc_perf_contract` 看 ORC retain/release 与 alloc/free/live，`*_compile_exec_phase_summary` 看编译 phase 摘要，`*_compile_gap_breakdown` 看 planner 之外的 object materialize/provider cache/native link/line-map 真耗时。
 - 内建画像/门禁优先用 `artifacts/bootstrap/cheng.stage3 profile-run/profile-report` 与 `artifacts/backend_driver/cheng run-host-smokes perf_memory_contract_smoke`；不要再把外层脚本当默认路径。
 - `perf_memory_contract_smoke` 默认优先测 `artifacts/backend_driver/cheng`；只有显式 `CHENG_SMOKE_COMPILER` 才覆盖。
@@ -116,7 +117,7 @@ let c = RunResult(outputText: "ok")
 - `build-backend-driver` 的候选编译必须强制 `BACKEND_INCREMENTAL=0`、`BACKEND_MULTI_MODULE_CACHE=0`、`CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1`，并默认注入 8GiB RSS 守卫与 `CHENG_PROGRESS=1`。
 - backend driver 的 `system-link-exec` 不支持或 primary/object/native materializer 未就绪时必须硬失败并写报告，不能默认转发到 stage3 掩盖缺口。
 - 纯 Cheng 自举主线不能继续用源码行字符串扫描扩展 statement 支持；下一步必须消费 parser/typed facts/NormalizedExpr 的结构化 statement/CFG/call sequence IR。
-- `primary_object_emit` 当前仍是 `.s` 文本生成再 `cc -c` 产 `.o`；真正直写 `.o` 必须走 Mach-O/ELF/COFF object writer 主线。
+- `primary_object_emit` 的 `.s` 文本路径只保留为 fallback/debug 对拍；Darwin arm64 主线优先使用 direct object writer，真正生产缺口必须在 Mach-O/ELF/COFF object writer 或 direct-exe 主线补齐，不能用 `.s` fallback 冒充完成。
 
 ## 任务流
 

@@ -1,0 +1,135 @@
+-- Pure Cheng handle table: zero C dependency. Thread-safe via atomic spin lock.
+-- uint64 handle = (generation << 32) | slot_index
+-- Stale detection: released handles cannot be reused with old generation.
+
+import std/atomic
+
+const
+    HandleTableSlotCount = 4096
+    HandleTableGenerationShift: uint64 = 32
+    HandleTableSlotIndexMask: uint64 = 0xFFFFFFFF
+    HandleTableErrOk = 0
+    HandleTableErrStale = 1
+    HandleTableErrInvalid = 2
+    HandleTableErrFull = 3
+
+type
+    HandleTableSlot =
+        generation: int32
+        value: int32
+
+type
+    HandleTableState = ptr
+        slots: ptr
+        inUse: int32
+        lock: int32
+
+state: HandleTableState
+
+fn handle_table_init() =
+    if state != nil:
+        return
+    let raw = atomic.Malloc(int32(HandleTableSlotCount * 8))
+    if raw == nil:
+        panic("handle_table: init allocation failed")
+        return
+    state = HandleTableState(raw)
+    state.lock = 0
+    state.inUse = 0
+    for i in 0..<HandleTableSlotCount:
+        let p = raw + i * 8
+        atomic.StoreI32(p, -1)
+        atomic.StoreI32(p + 4, 0)
+
+fn handle_table_lock() =
+    while true:
+        if atomic.CasI32(&state.lock, 0, 1):
+            break
+
+fn handle_table_unlock() =
+    atomic.StoreI32(&state.lock, 0)
+
+fn handle_table_new_i32(value: int32): uint64 =
+    if state == nil:
+        handle_table_init()
+    handle_table_lock()
+    if state.inUse >= HandleTableSlotCount:
+        handle_table_unlock()
+        panic("handle_table: exhausted")
+        return 0
+    let base = state.slots
+    var freeSlot = -1
+    for i in 0..<HandleTableSlotCount:
+        let off = base + i * 8
+        if atomic.LoadI32(off) < 0:
+            freeSlot = i
+            break
+    if freeSlot < 0:
+        handle_table_unlock()
+        panic("handle_table: free slot not found despite inUse count")
+        return 0
+    let newGen = 1
+    let off = base + freeSlot * 8
+    atomic.StoreI32(off, newGen)
+    atomic.StoreI32(off + 4, value)
+    state.inUse = state.inUse + 1
+    handle_table_unlock()
+    return (uint64(newGen) << HandleTableGenerationShift) | uint64(freeSlot)
+
+fn handle_table_get_i32(handle: uint64, outValue: var int32): int32 =
+    let slotIndex = int32(handle & HandleTableSlotIndexMask)
+    let generation = int32((handle >> HandleTableGenerationShift) & HandleTableSlotIndexMask)
+    if slotIndex < 0 || slotIndex >= HandleTableSlotCount:
+        return HandleTableErrInvalid
+    if state == nil:
+        return HandleTableErrInvalid
+    handle_table_lock()
+    let base = state.slots
+    let off = base + slotIndex * 8
+    let curGen = atomic.LoadI32(off)
+    if curGen != generation:
+        handle_table_unlock()
+        return HandleTableErrStale
+    outValue = atomic.LoadI32(off + 4)
+    handle_table_unlock()
+    return HandleTableErrOk
+
+fn handle_table_add_i32(handle: uint64, delta: int32, outValue: var int32): int32 =
+    let slotIndex = int32(handle & HandleTableSlotIndexMask)
+    let generation = int32((handle >> HandleTableGenerationShift) & HandleTableSlotIndexMask)
+    if slotIndex < 0 || slotIndex >= HandleTableSlotCount:
+        return HandleTableErrInvalid
+    if state == nil:
+        return HandleTableErrInvalid
+    handle_table_lock()
+    let base = state.slots
+    let off = base + slotIndex * 8
+    let curGen = atomic.LoadI32(off)
+    if curGen != generation:
+        handle_table_unlock()
+        return HandleTableErrStale
+    let newValue = atomic.LoadI32(off + 4) + delta
+    atomic.StoreI32(off + 4, newValue)
+    outValue = newValue
+    handle_table_unlock()
+    return HandleTableErrOk
+
+fn handle_table_release_i32(handle: uint64): int32 =
+    let slotIndex = int32(handle & HandleTableSlotIndexMask)
+    let generation = int32((handle >> HandleTableGenerationShift) & HandleTableSlotIndexMask)
+    if slotIndex < 0 || slotIndex >= HandleTableSlotCount:
+        return HandleTableErrInvalid
+    if state == nil:
+        return HandleTableErrInvalid
+    handle_table_lock()
+    let base = state.slots
+    let off = base + slotIndex * 8
+    let curGen = atomic.LoadI32(off)
+    if curGen != generation:
+        handle_table_unlock()
+        return HandleTableErrStale
+    atomic.StoreI32(off, -1)
+    atomic.StoreI32(off + 4, 0)
+    state.inUse = state.inUse - 1
+    handle_table_unlock()
+    return HandleTableErrOk

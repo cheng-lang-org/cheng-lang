@@ -1,12 +1,28 @@
-# Function task executor: serial oracle plus explicit ws-unavailable failure.
+# Function task executor: serial oracle plus real worker execution.
 # Contract: BACKEND_JOBS=1 output MUST be bit-identical to old inline serial code.
 
+import std/atomic
+import std/async_rt as async
+import std/thread
 import cheng/core/ir/core_types as coreir
 import cheng/core/ir/function_task as ftask
 
 type
     FunctionTaskWorker =
         task: ftask.FunctionTask
+
+    FunctionTaskWorkerCtx = ref
+        workerId: int32
+
+var
+    functionTaskWsTasks: ftask.FunctionTask[]
+    functionTaskWsResults: ftask.FunctionTaskResult[]
+    functionTaskWsShardHeads: atomic.I32[]
+    functionTaskWsShardTails: atomic.I32[]
+    functionTaskWsDoneCount: atomic.I32
+    functionTaskWsWorkerCount: int32
+    functionTaskWsLastWorkerCount: int32
+    functionTaskWsLastCompletedWorkerCount: int32
 
 fn FunctionTaskExecuteBodyIr(task: ftask.FunctionTask): ftask.FunctionTaskResult =
     var result = ftask.FunctionTaskResultEmpty(task.funcIndex)
@@ -24,15 +40,143 @@ fn FunctionTaskExecuteSerial(plan: ftask.FunctionTaskPlan): ftask.FunctionTaskRe
         add(results, result)
     return results
 
-fn FunctionTaskWorkerUnavailableResult(): ftask.FunctionTaskResult =
+fn FunctionTaskWorkerErrorResult(message: str): ftask.FunctionTaskResult =
     var result = ftask.FunctionTaskResultEmpty(ftask.InvalidFunctionIndex())
-    result.outputKind = "worker_spawn_unavailable"
-    ftask.FunctionTaskPlanAppendDiag(result, "function_task_worker_spawn_unavailable")
+    result.outputKind = "worker_error"
+    ftask.FunctionTaskPlanAppendDiag(result, message)
     return result
 
+fn FunctionTaskWorkStealingWorkerCountFor(plan: ftask.FunctionTaskPlan): int32 =
+    if plan.tasks.len <= 0:
+        return 0
+    var count = plan.jobCount
+    if count <= 0:
+        count = 1
+    if count > plan.tasks.len:
+        count = plan.tasks.len
+    return count
+
+fn FunctionTaskWsPopOwn(workerId: int32, taskIndex: var int32): bool =
+    if workerId < 0 || workerId >= functionTaskWsWorkerCount:
+        return false
+    let headCell = functionTaskWsShardHeads[workerId]
+    let tailCell = functionTaskWsShardTails[workerId]
+    let nextTail = atomic.LoadI32(tailCell) - 1
+    atomic.StoreI32(tailCell, nextTail)
+    let head = atomic.LoadI32(headCell)
+    if head < nextTail:
+        taskIndex = nextTail
+        return true
+    atomic.StoreI32(tailCell, head)
+    if head == nextTail:
+        if atomic.CasI32(headCell, head, head + 1):
+            taskIndex = nextTail
+            atomic.StoreI32(tailCell, head + 1)
+            return true
+    atomic.StoreI32(tailCell, atomic.LoadI32(headCell))
+    return false
+
+fn FunctionTaskWsStealFrom(victimId: int32, taskIndex: var int32): bool =
+    if victimId < 0 || victimId >= functionTaskWsWorkerCount:
+        return false
+    let headCell = functionTaskWsShardHeads[victimId]
+    let tailCell = functionTaskWsShardTails[victimId]
+    while true:
+        let head = atomic.LoadI32(headCell)
+        let tail = atomic.LoadI32(tailCell)
+        if head >= tail:
+            return false
+        if atomic.CasI32(headCell, head, head + 1):
+            taskIndex = head
+            return true
+
+fn FunctionTaskWsTakeTask(workerId: int32, taskIndex: var int32): bool =
+    if FunctionTaskWsPopOwn(workerId, taskIndex):
+        return true
+    var offset = 1
+    while offset < functionTaskWsWorkerCount:
+        let victimId = (workerId + offset) % functionTaskWsWorkerCount
+        if FunctionTaskWsStealFrom(victimId, taskIndex):
+            return true
+        offset = offset + 1
+    return false
+
+fn FunctionTaskWsWorkerMain(raw: ptr) =
+    if raw == nil:
+        return
+    let ctx: FunctionTaskWorkerCtx = FunctionTaskWorkerCtx(raw)
+    let workerId = ctx.workerId
+    while true:
+        var taskIndex: int32
+        if !FunctionTaskWsTakeTask(workerId, taskIndex):
+            break
+        if taskIndex >= 0 && taskIndex < functionTaskWsTasks.len:
+            let result = FunctionTaskExecuteOne(functionTaskWsTasks[taskIndex])
+            functionTaskWsResults[taskIndex] = result
+    let _ = atomic.AddI32(functionTaskWsDoneCount, 1)
+    memRelease(ctx)
+
+fn FunctionTaskWsResetState() =
+    functionTaskWsTasks = []
+    functionTaskWsResults = []
+    functionTaskWsShardHeads = []
+    functionTaskWsShardTails = []
+    functionTaskWsDoneCount = nil
+    functionTaskWsWorkerCount = 0
+
+fn FunctionTaskWorkStealingLastWorkerCount(): int32 =
+    return functionTaskWsLastWorkerCount
+
+fn FunctionTaskWorkStealingLastCompletedWorkerCount(): int32 =
+    return functionTaskWsLastCompletedWorkerCount
+
 fn FunctionTaskExecuteWorkStealing(plan: ftask.FunctionTaskPlan): ftask.FunctionTaskResult[] =
+    if plan.tasks.len <= 0:
+        return []
+    let workerCount = FunctionTaskWorkStealingWorkerCountFor(plan)
+    if workerCount <= 0:
+        return []
+    FunctionTaskWsResetState()
+    functionTaskWsWorkerCount = workerCount
+    functionTaskWsDoneCount = atomic.NewI32(0)
+    if functionTaskWsDoneCount == nil:
+        var err: ftask.FunctionTaskResult[]
+        add(err, FunctionTaskWorkerErrorResult("function_task_worker_atomic_alloc_failed"))
+        return err
+    for ti in 0..<plan.tasks.len:
+        add(functionTaskWsTasks, plan.tasks[ti])
+        add(functionTaskWsResults, ftask.FunctionTaskResultEmpty(plan.tasks[ti].funcIndex))
+    for workerId in 0..<workerCount:
+        let start = (plan.tasks.len * workerId) / workerCount
+        let finish = (plan.tasks.len * (workerId + 1)) / workerCount
+        let head = atomic.NewI32(start)
+        let tail = atomic.NewI32(finish)
+        if head == nil || tail == nil:
+            FunctionTaskWsResetState()
+            var err: ftask.FunctionTaskResult[]
+            add(err, FunctionTaskWorkerErrorResult("function_task_worker_queue_alloc_failed"))
+            return err
+        add(functionTaskWsShardHeads, head)
+        add(functionTaskWsShardTails, tail)
+    functionTaskWsLastWorkerCount = workerCount
+    functionTaskWsLastCompletedWorkerCount = 0
+    for workerId in 0..<workerCount:
+        let ctx = new[FunctionTaskWorkerCtx]()
+        if ctx == nil:
+            FunctionTaskWsResetState()
+            var err: ftask.FunctionTaskResult[]
+            add(err, FunctionTaskWorkerErrorResult("function_task_worker_ctx_alloc_failed"))
+            return err
+        ctx.workerId = workerId
+        memRetain(ctx)
+        async.spawnPtr(FunctionTaskWsWorkerMain, ctx)
+    while atomic.LoadI32(functionTaskWsDoneCount) < workerCount:
+        thread.Yield()
+    functionTaskWsLastCompletedWorkerCount = atomic.LoadI32(functionTaskWsDoneCount)
     var results: ftask.FunctionTaskResult[]
-    add(results, FunctionTaskWorkerUnavailableResult())
+    for taskIndex in 0..<functionTaskWsResults.len:
+        add(results, functionTaskWsResults[taskIndex])
+    FunctionTaskWsResetState()
     return results
 
 fn FunctionTaskExecuteAuto(plan: ftask.FunctionTaskPlan): ftask.FunctionTaskResult[] =

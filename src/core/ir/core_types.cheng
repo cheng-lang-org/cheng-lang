@@ -299,6 +299,9 @@ type
         stackOffset: int32
         sizeBytes: int32
         alignBytes: int32
+        ownership: OwnershipKind
+        aliasClass: AliasClass
+        escapeKind: EscapeKind
         noAlias: bool
 
     CallOp =
@@ -320,10 +323,49 @@ type
         terms: BodyTerm[]
         cstringLiterals: CStringLiteralEntry[]
 
+    BodyIRFlatSoA =
+        opKinds: int32[]
+        opTargets: int32[]
+        opOperandStarts: int32[]
+        opOperandCounts: int32[]
+        operands: int32[]
+        callTargetSymbols: str[]
+        callResultSlots: int32[]
+        callRelocWordOffsets: int32[]
+        callArgStarts: int32[]
+        callArgCounts: int32[]
+        callArgSlots: int32[]
+        localIds: int32[]
+        localTypeKinds: int32[]
+        localStackOffsets: int32[]
+        localSizeBytes: int32[]
+        localAlignBytes: int32[]
+        localOwnershipKinds: int32[]
+        localAliasClasses: int32[]
+        localEscapeKinds: int32[]
+        localNoAliasFlags: int32[]
+        blockIds: int32[]
+        blockOpStarts: int32[]
+        blockOpCounts: int32[]
+        blockTermIndices: int32[]
+        termKinds: int32[]
+        termCondKinds: int32[]
+        termResultSlots: int32[]
+        termLhsSlots: int32[]
+        termRhsSlots: int32[]
+        termTrueBlocks: int32[]
+        termFalseBlocks: int32[]
+        cstringIds: int32[]
+        cstringTexts: str[]
+        cstringDataLabels: str[]
+
     BodyIRDodSoAContractReport =
         ok: bool
         indexWidthBits: int32
         independentArrayCount: int32
+        flatScalarArrayCount: int32
+        flatStringArrayCount: int32
+        nestedPayloadArrayCount: int32
         opCount: int32
         callCount: int32
         localCount: int32
@@ -468,6 +510,115 @@ fn BodyIRAppendTerm(bodyIR: var BodyIR, term: BodyTerm): int32 =
     add(bodyIR.terms, term)
     return termIndex
 
+fn BodyIRLocalTypePlainNoAliasProof(typeKind: int32): bool =
+    return typeKind == LocalI32Tag ||
+           typeKind == LocalF64Tag
+
+fn BodyIRApplyLocalSlotDefaultProof(slot: var LocalSlot) =
+    slot.ownership = OwnPlain
+    slot.aliasClass = AliasUnknown
+    slot.escapeKind = EscapeNone
+    slot.noAlias = false
+    if BodyIRLocalTypePlainNoAliasProof(slot.typeKind):
+        slot.aliasClass = AliasNoAlias
+        slot.noAlias = true
+
+fn BodyIRFlattenSoA(bodyIR: BodyIR): BodyIRFlatSoA =
+    var out: BodyIRFlatSoA
+    for opIndex in 0..<bodyIR.ops.len:
+        let op = bodyIR.ops[opIndex]
+        add(out.opKinds, op.kind)
+        add(out.opTargets, op.target)
+        add(out.opOperandStarts, out.operands.len)
+        add(out.opOperandCounts, op.operands.len)
+        for operandIndex in 0..<op.operands.len:
+            add(out.operands, op.operands[operandIndex])
+    for callIndex in 0..<bodyIR.callSequence.len:
+        let callOp = bodyIR.callSequence[callIndex]
+        add(out.callTargetSymbols, callOp.targetSymbol)
+        add(out.callResultSlots, callOp.resultSlot)
+        add(out.callRelocWordOffsets, callOp.relocWordOffset)
+        add(out.callArgStarts, out.callArgSlots.len)
+        add(out.callArgCounts, callOp.argSlots.len)
+        for argIndex in 0..<callOp.argSlots.len:
+            add(out.callArgSlots, callOp.argSlots[argIndex])
+    for localIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[localIndex]
+        add(out.localIds, slot.id)
+        add(out.localTypeKinds, slot.typeKind)
+        add(out.localStackOffsets, slot.stackOffset)
+        add(out.localSizeBytes, slot.sizeBytes)
+        add(out.localAlignBytes, slot.alignBytes)
+        add(out.localOwnershipKinds, int32(slot.ownership))
+        add(out.localAliasClasses, int32(slot.aliasClass))
+        add(out.localEscapeKinds, int32(slot.escapeKind))
+        if slot.noAlias:
+            add(out.localNoAliasFlags, 1)
+        else:
+            add(out.localNoAliasFlags, 0)
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        add(out.blockIds, block.id)
+        add(out.blockOpStarts, block.opStart)
+        add(out.blockOpCounts, block.opCount)
+        add(out.blockTermIndices, block.termIndex)
+    for termIndex in 0..<bodyIR.terms.len:
+        let term = bodyIR.terms[termIndex]
+        add(out.termKinds, term.kind)
+        add(out.termCondKinds, term.condKind)
+        add(out.termResultSlots, term.resultSlot)
+        add(out.termLhsSlots, term.lhsSlot)
+        add(out.termRhsSlots, term.rhsSlot)
+        add(out.termTrueBlocks, term.trueBlock)
+        add(out.termFalseBlocks, term.falseBlock)
+    for literalIndex in 0..<bodyIR.cstringLiterals.len:
+        let literal = bodyIR.cstringLiterals[literalIndex]
+        add(out.cstringIds, literal.id)
+        add(out.cstringTexts, literal.text)
+        add(out.cstringDataLabels, literal.dataLabel)
+    return out
+
+fn BodyIRFlatSoAScalarArrayCount(): int32 =
+    return 32
+
+fn BodyIRFlatSoAStringArrayCount(): int32 =
+    return 3
+
+fn BodyIRFlatSoAIsAligned(flat: BodyIRFlatSoA): bool =
+    if flat.opKinds.len != flat.opTargets.len ||
+       flat.opKinds.len != flat.opOperandStarts.len ||
+       flat.opKinds.len != flat.opOperandCounts.len:
+        return false
+    if flat.callTargetSymbols.len != flat.callResultSlots.len ||
+       flat.callTargetSymbols.len != flat.callRelocWordOffsets.len ||
+       flat.callTargetSymbols.len != flat.callArgStarts.len ||
+       flat.callTargetSymbols.len != flat.callArgCounts.len:
+        return false
+    if flat.localIds.len != flat.localTypeKinds.len ||
+       flat.localIds.len != flat.localStackOffsets.len ||
+       flat.localIds.len != flat.localSizeBytes.len ||
+       flat.localIds.len != flat.localAlignBytes.len ||
+       flat.localIds.len != flat.localOwnershipKinds.len ||
+       flat.localIds.len != flat.localAliasClasses.len ||
+       flat.localIds.len != flat.localEscapeKinds.len ||
+       flat.localIds.len != flat.localNoAliasFlags.len:
+        return false
+    if flat.blockIds.len != flat.blockOpStarts.len ||
+       flat.blockIds.len != flat.blockOpCounts.len ||
+       flat.blockIds.len != flat.blockTermIndices.len:
+        return false
+    if flat.termKinds.len != flat.termCondKinds.len ||
+       flat.termKinds.len != flat.termResultSlots.len ||
+       flat.termKinds.len != flat.termLhsSlots.len ||
+       flat.termKinds.len != flat.termRhsSlots.len ||
+       flat.termKinds.len != flat.termTrueBlocks.len ||
+       flat.termKinds.len != flat.termFalseBlocks.len:
+        return false
+    if flat.cstringIds.len != flat.cstringTexts.len ||
+       flat.cstringIds.len != flat.cstringDataLabels.len:
+        return false
+    return true
+
 fn bodyIRDodBoolText(value: bool): str =
     if value:
         return "1"
@@ -478,6 +629,9 @@ fn bodyIRDodBodyOpKindValid(kind: int32): bool =
 
 fn bodyIRDodBodyTermKindValid(kind: int32): bool =
     return kind >= BodyTermReturnTag && kind <= BodyTermCbrTag
+
+fn bodyIRDodBodyCondKindValid(kind: int32): bool =
+    return kind >= BodyCondLocalNonZeroTag && kind <= BodyCondI32GeTag
 
 fn bodyIRDodMarkInvalid(report: var BodyIRDodSoAContractReport,
                          owner: str,
@@ -514,7 +668,10 @@ fn bodyIRDodCheckCallArgRef(report: var BodyIRDodSoAContractReport,
         bodyIRDodMarkInvalid(report, owner, value, limit)
         return
     if value < 0:
-        report.encodedParamRefCount = report.encodedParamRefCount + 1
+        if CallArgSlotIsConst(value):
+            report.encodedParamRefCount = report.encodedParamRefCount + 1
+            return
+        bodyIRDodMarkInvalid(report, owner, value, limit)
         return
     bodyIRDodCheckLocalRef(report, owner, value, limit)
 
@@ -619,6 +776,11 @@ fn bodyIRDodCheckTerm(bodyIR: BodyIR,
                                term.trueBlock,
                                bodyIR.blocks.len)
     elif term.kind == BodyTermCbrTag:
+        if !bodyIRDodBodyCondKindValid(term.conditionKind):
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"terms[{termIndex}].conditionKind",
+                                 term.conditionKind,
+                                 BodyCondI32GeTag)
         bodyIRDodCheckBlockRef(report,
                                Fmt"terms[{termIndex}].trueBlock",
                                term.trueBlock,
@@ -676,7 +838,7 @@ fn bodyIRDodCheckOp(bodyIR: BodyIR,
         return
     bodyIRDodCheckOpTarget(bodyIR, report, opIndex, op)
     if op.kind == BodyOpCallTag:
-        if op.operands.len < 1:
+        if op.operands.len != 1:
             bodyIRDodMarkInvalid(report,
                                  Fmt"ops[{opIndex}].callOrdinal",
                                  -1,
@@ -686,6 +848,13 @@ fn bodyIRDodCheckOp(bodyIR: BodyIR,
                               Fmt"ops[{opIndex}].callOrdinal",
                               op.operands[0],
                               bodyIR.callSequence.len)
+        if op.operands[0] >= 0 && op.operands[0] < bodyIR.callSequence.len:
+            let callOp = bodyIR.callSequence[op.operands[0]]
+            if op.target != callOp.resultSlot:
+                bodyIRDodMarkInvalid(report,
+                                     Fmt"ops[{opIndex}].target_result_mismatch",
+                                     op.target,
+                                     callOp.resultSlot)
     elif op.kind == BodyOpLoadLocalTag:
         if op.operands.len >= 3 && op.operands[0] == BodyLoadLocalPtrDerefI32Tag:
             bodyIRDodCheckLocalRef(report,
@@ -697,6 +866,11 @@ fn bodyIRDodCheckOp(bodyIR: BodyIR,
                                    Fmt"ops[{opIndex}].source",
                                    op.operands[0],
                                    bodyIR.localSlots.len)
+        else:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"ops[{opIndex}].source",
+                                 -1,
+                                 bodyIR.localSlots.len)
     elif op.kind == BodyOpStoreLocalTag ||
          op.kind == BodyOpCopyLocalTag:
         if op.operands.len < 1:
@@ -710,12 +884,22 @@ fn bodyIRDodCheckOp(bodyIR: BodyIR,
                                    op.operands[0],
                                    bodyIR.localSlots.len)
     elif op.kind == BodyOpBinOpTag:
+        if op.operands.len < 4:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"ops[{opIndex}].binop_arity",
+                                 op.operands.len,
+                                 4)
         for operandIndex in 2..<op.operands.len:
             bodyIRDodCheckLocalRef(report,
                                    Fmt"ops[{opIndex}].operands[{operandIndex}]",
                                    op.operands[operandIndex],
                                    bodyIR.localSlots.len)
     elif op.kind == BodyOpCmpTag:
+        if op.operands.len < 3:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"ops[{opIndex}].cmp_arity",
+                                 op.operands.len,
+                                 3)
         for operandIndex in 1..<op.operands.len:
             bodyIRDodCheckLocalRef(report,
                                    Fmt"ops[{opIndex}].operands[{operandIndex}]",
@@ -764,6 +948,9 @@ fn BodyIRDodSoAContractCheck(bodyIR: BodyIR): BodyIRDodSoAContractReport =
     report.ok = true
     report.indexWidthBits = 32
     report.independentArrayCount = 6
+    report.flatScalarArrayCount = BodyIRFlatSoAScalarArrayCount()
+    report.flatStringArrayCount = BodyIRFlatSoAStringArrayCount()
+    report.nestedPayloadArrayCount = 0
     report.opCount = bodyIR.ops.len
     report.callCount = bodyIR.callSequence.len
     report.localCount = bodyIR.localSlots.len
@@ -776,6 +963,12 @@ fn BodyIRDodSoAContractCheck(bodyIR: BodyIR): BodyIRDodSoAContractReport =
     bodyIRDodCheckOps(bodyIR, report)
     bodyIRDodCheckBlocks(bodyIR, report)
     bodyIRDodCheckTerms(bodyIR, report)
+    let flat = BodyIRFlattenSoA(bodyIR)
+    if !BodyIRFlatSoAIsAligned(flat):
+        bodyIRDodMarkInvalid(report,
+                             "flat_soa_alignment",
+                             0,
+                             1)
     if report.pointerKeyCount != 0:
         report.ok = false
     return report
@@ -786,6 +979,9 @@ fn BodyIRDodSoAContractReportText(report: BodyIRDodSoAContractReport): str =
     body_ir_dod_soa_index_width_bits={report.indexWidthBits}
     body_ir_dod_soa_independent_array_count={report.independentArrayCount}
     body_ir_dod_soa_arrays=ops,callSequence,localSlots,blocks,terms,cstringLiterals
+    body_ir_dod_soa_flat_scalar_array_count={report.flatScalarArrayCount}
+    body_ir_dod_soa_flat_string_array_count={report.flatStringArrayCount}
+    body_ir_dod_soa_nested_payload_array_count={report.nestedPayloadArrayCount}
     body_ir_dod_soa_op_count={report.opCount}
     body_ir_dod_soa_call_count={report.callCount}
     body_ir_dod_soa_local_count={report.localCount}

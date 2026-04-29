@@ -1,0 +1,186 @@
+// Compile mode dispatch for Cheng compiler
+// Dev mode: self-link + direct-exe + hotpatch (100ms recompile)
+// Release mode: full system-link pipeline (UIR -> .o -> system linker)
+// Bootstrap mode: staged artifact chain
+// No mode falls back to another -- fail fast on mismatch.
+
+import std/result
+import std/strformat
+import std/strings
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/backend/direct_object_emit as dobj
+import cheng/core/backend/direct_exe_emit as dexe
+import cheng/core/backend/target_matrix as tmat
+
+type
+    CompileMode = enum
+        CompileModeUnknown
+        CompileModeDev
+        CompileModeRelease
+        CompileModeBootstrap
+
+    CompileModeSwitch =
+        mode: CompileMode
+        targetTriple: str
+        reason: str
+        isDirectExe: bool
+        isHotPatch: bool
+        jobCount: int32
+
+    CompileModeContract =
+        requireDeterminism: bool
+        requireHotPatch: bool
+        requireCrossCompile: bool
+        requireDirectExe: bool
+        allowBootstrap: bool
+
+fn CompileModeBoolText(value: bool): str =
+    if value:
+        return "true"
+    return "false"
+
+fn CompileModeText(mode: CompileMode): str =
+    if mode == CompileModeDev:
+        return "dev"
+    if mode == CompileModeRelease:
+        return "release"
+    if mode == CompileModeBootstrap:
+        return "bootstrap"
+    return "unknown"
+
+fn CompileModeIsDevHostTarget(targetTriple: str): bool =
+    if targetTriple == "arm64-apple-darwin" ||
+       targetTriple == "aarch64-apple-darwin":
+        return true
+    if tmat.TargetIsLinuxAarch64(targetTriple):
+        return true
+    return false
+
+fn CompileModeDetect(targetTriple: str,
+                     emitKind: str,
+                     jobCount: int32,
+                     forceMode: str): CompileModeSwitch =
+    var out: CompileModeSwitch
+    out.jobCount = jobCount
+    out.targetTriple = targetTriple
+    if forceMode == "dev":
+        out.mode = CompileModeDev
+        out.reason = "force dev mode by caller"
+        out.isDirectExe = true
+        out.isHotPatch = true
+        return out
+    if forceMode == "release":
+        out.mode = CompileModeRelease
+        out.reason = "force release mode by caller"
+        out.isDirectExe = false
+        out.isHotPatch = false
+        return out
+    if forceMode == "bootstrap":
+        out.mode = CompileModeBootstrap
+        out.reason = "force bootstrap mode by caller"
+        out.isDirectExe = false
+        out.isHotPatch = false
+        return out
+    if emitKind == "exe" || emitKind == "object":
+        if CompileModeIsDevHostTarget(targetTriple):
+            out.mode = CompileModeDev
+            out.reason = Fmt"dev mode: direct exe supported for {targetTriple}"
+            out.isDirectExe = true
+            out.isHotPatch = true
+            return out
+        out.mode = CompileModeRelease
+        out.reason = Fmt"release mode: {targetTriple} requires system linker"
+        out.isDirectExe = false
+        out.isHotPatch = false
+        return out
+    out.mode = CompileModeDev
+    out.reason = "dev mode: default (favor speed)"
+    out.isDirectExe = false
+    out.isHotPatch = true
+    return out
+
+fn CompileModeValidatePath(mode: CompileModeSwitch,
+                           plan: pobj.PrimaryObjectPlan): bool =
+    if mode.mode == CompileModeDev:
+        if !dobj.DirectObjectEmitTargetSupported(plan) &&
+           !dexe.DirectExeEmitTargetSupported(plan):
+            return false
+        if Len(plan.outputPath) <= 0:
+            return false
+        return true
+    if mode.mode == CompileModeRelease:
+        if plan.objectFormat == "unknown" ||
+           Len(plan.outputPath) <= 0:
+            return false
+        return true
+    if mode.mode == CompileModeBootstrap:
+        if Len(plan.entrySymbol) <= 0:
+            return false
+        return true
+    return false
+
+fn CompileModeEmitObject(mode: CompileModeSwitch,
+                         plan: pobj.PrimaryObjectPlan): Result[dobj.DirectObjectEmitResult] =
+    if mode.mode == CompileModeDev:
+        if !dobj.DirectObjectEmitTargetSupported(plan):
+            return Err[dobj.DirectObjectEmitResult](
+                Fmt"compile mode: dev object emit unsupported for {plan.targetTriple}")
+        if Len(plan.outputPath) <= 0:
+            return Err[dobj.DirectObjectEmitResult](
+                "compile mode: dev object emit missing output path")
+        return dobj.DirectObjectEmitPlanObject("", plan)
+    if mode.mode == CompileModeRelease:
+        return Err[dobj.DirectObjectEmitResult](
+            "compile mode: release object emit uses primary_object_emit pipeline, not direct emit")
+    if mode.mode == CompileModeBootstrap:
+        return Err[dobj.DirectObjectEmitResult](
+            "compile mode: bootstrap object emit uses staged artifact chain, not direct emit")
+    return Err[dobj.DirectObjectEmitResult](
+        "compile mode: unknown mode for object emit")
+
+fn CompileModeEmitExecutable(mode: CompileModeSwitch,
+                             plan: pobj.PrimaryObjectPlan): Result[dexe.DirectExeEmitResult] =
+    if mode.mode == CompileModeDev:
+        if !dexe.DirectExeEmitTargetSupported(plan):
+            return Err[dexe.DirectExeEmitResult](
+                Fmt"compile mode: dev exe emit unsupported for {plan.targetTriple}")
+        if Len(plan.outputPath) <= 0:
+            return Err[dexe.DirectExeEmitResult](
+                "compile mode: dev exe emit missing output path")
+        return dexe.DirectExeEmitBuild(plan)
+    if mode.mode == CompileModeRelease:
+        return Err[dexe.DirectExeEmitResult](
+            "compile mode: release exe emit uses system linker, not direct exe")
+    if mode.mode == CompileModeBootstrap:
+        return Err[dexe.DirectExeEmitResult](
+            "compile mode: bootstrap exe emit uses staged artifact chain, not direct exe")
+    return Err[dexe.DirectExeEmitResult](
+        "compile mode: unknown mode for executable emit")
+
+fn CompileModeReport(mode: CompileModeSwitch): str =
+    var out = Fmt"compile_mode={CompileModeText(mode.mode)}"
+    out = Fmt"{out}\ncompile_mode_reason={mode.reason}"
+    out = Fmt"{out}\ncompile_mode_direct_exe={CompileModeBoolText(mode.isDirectExe)}"
+    out = Fmt"{out}\ncompile_mode_hot_patch={CompileModeBoolText(mode.isHotPatch)}"
+    out = Fmt"{out}\ncompile_mode_job_count={strings.IntToStr(mode.jobCount)}"
+    out = Fmt"{out}\ncompile_mode_target={mode.targetTriple}"
+    return out
+
+fn CompileModeGateCheck(mode: CompileModeSwitch,
+                        contract: CompileModeContract): bool =
+    if contract.requireDeterminism &&
+       mode.mode != CompileModeRelease:
+        return false
+    if contract.requireHotPatch &&
+       mode.mode != CompileModeDev:
+        return false
+    if contract.requireCrossCompile &&
+       mode.mode != CompileModeRelease:
+        return false
+    if contract.requireDirectExe &&
+       mode.mode != CompileModeDev:
+        return false
+    if !contract.allowBootstrap &&
+       mode.mode == CompileModeBootstrap:
+        return false
+    return true

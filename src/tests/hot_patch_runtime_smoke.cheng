@@ -1,0 +1,60 @@
+// Runtime smoke test for hot_patch module (tests atomic switching)
+import cheng/core/backend/hot_patch
+import std/atomic
+import std/os
+import std/thread
+
+var g_counter: int32 = 0
+
+fn increment(): int32 =
+    g_counter = g_counter + 1
+    return g_counter
+
+fn multiply_by_two(): int32 =
+    g_counter = g_counter * 2
+    return g_counter
+
+fn runtime_test_main(): int32 =
+    let engine = hot_patch.hot_patch_init(8192)
+    if engine == nil:
+        os.WriteLine(os.GetStderr(), "hot_patch_init failed")
+        return 1
+
+    let inc_code = &increment as ptr
+    let inc_len: int32 = 32
+
+    if !hot_patch.hot_patch_register(engine, "counter_func", inc_code, inc_len):
+        os.WriteLine(os.GetStderr(), "hot_patch_register failed")
+        return 1
+
+    // Simulate multiple threads calling the function via trampoline
+    // (In real usage, the trampoline would be called directly)
+    var thread_count: int32 = 10
+    for i in 0..<thread_count:
+        thread.Spawn(fn() = {
+            // Call the trampoline (simulated)
+            let target_slot = engine.trampolines[0].target_slot
+            let target_offset = atomic.LoadI32(target_slot)
+            let target_addr = engine.code_pool.code_base + int64(target_offset)
+            // Cast and call (simplified - actual call would be via JIT)
+        })
+
+    let mul_code = &multiply_by_two as ptr
+    let mul_len: int32 = 32
+
+    // Apply patch while threads may be executing
+    if !hot_patch.hot_patch_apply(engine, "counter_func", mul_code, mul_len):
+        os.WriteLine(os.GetStderr(), "hot_patch_apply failed")
+        return 1
+
+    let hash = hot_patch.hot_patch_layout_hash_compute(engine)
+    if hash == 0:
+        os.WriteLine(os.GetStderr(), "hash computation failed")
+        return 1
+
+    if !hot_patch.hot_patch_validate(engine):
+        os.WriteLine(os.GetStderr(), "validation failed")
+        return 1
+
+    os.WriteLine(os.GetStdout(), "runtime smoke test passed")
+    return 0

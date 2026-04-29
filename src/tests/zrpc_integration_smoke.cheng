@@ -1,0 +1,190 @@
+-- ZRPC integration smoke test for handle_table
+-- Tests: new, get, add, release, generation reuse, stale detection
+
+import cheng/core/runtime/handle_table as ht
+
+fn test_basic_handle_ops(): int32 =
+    -- Test new, get, add, release cycle
+    let h = ht.handle_table_new_i32(100)
+    if h == 0:
+        echo("FAIL: new returned zero")
+        return 1
+
+    var got: int32
+    let get_rc = ht.handle_table_get_i32(h, got)
+    if get_rc != ht.HandleTableErrOk:
+        echo("FAIL: get error ", get_rc)
+        return 2
+    if got != 100:
+        echo("FAIL: get value mismatch: got ", got, " expected 100")
+        return 3
+
+    let add_rc = ht.handle_table_add_i32(h, 25, got)
+    if add_rc != ht.HandleTableErrOk:
+        echo("FAIL: add error ", add_rc)
+        return 4
+    if got != 125:
+        echo("FAIL: add result mismatch: got ", got, " expected 125")
+        return 5
+
+    let release_rc = ht.handle_table_release_i32(h)
+    if release_rc != ht.HandleTableErrOk:
+        echo("FAIL: release error ", release_rc)
+        return 6
+
+    echo("OK: basic handle ops")
+    return 0
+
+fn test_generation_reuse(): int32 =
+    -- After release, a new handle can reuse the slot with incremented generation
+    let h1 = ht.handle_table_new_i32(10)
+    if h1 == 0:
+        echo("FAIL: h1 new failed")
+        return 1
+
+    var got: int32
+    let get_rc = ht.handle_table_get_i32(h1, got)
+    if get_rc != ht.HandleTableErrOk:
+        echo("FAIL: h1 get error")
+        return 2
+    if got != 10:
+        echo("FAIL: h1 value mismatch")
+        return 3
+
+    let release_rc = ht.handle_table_release_i32(h1)
+    if release_rc != ht.HandleTableErrOk:
+        echo("FAIL: h1 release error")
+        return 4
+
+    -- Slot is now free; new handle may reuse same slot with generation>1
+    let h2 = ht.handle_table_new_i32(20)
+    if h2 == 0:
+        echo("FAIL: h2 new failed")
+        return 5
+
+    let get2_rc = ht.handle_table_get_i32(h2, got)
+    if get2_rc != ht.HandleTableErrOk:
+        echo("FAIL: h2 get error")
+        return 6
+    if got != 20:
+        echo("FAIL: h2 value mismatch")
+        return 7
+
+    -- Different handle values (different generation)
+    if h1 == h2:
+        echo("FAIL: handles identical despite release")
+        return 8
+
+    echo("OK: generation reuse")
+    return 0
+
+fn test_stale_detection(): int32 =
+    -- After release, using the old handle should fail with stale error
+    let h = ht.handle_table_new_i32(50)
+    if h == 0:
+        echo("FAIL: new failed")
+        return 1
+
+    let release_rc = ht.handle_table_release_i32(h)
+    if release_rc != ht.HandleTableErrOk:
+        echo("FAIL: release failed")
+        return 2
+
+    var got: int32
+    let get_rc = ht.handle_table_get_i32(h, got)
+    if get_rc != ht.HandleTableErrStale:
+        echo("FAIL: expected stale, got rc=", get_rc)
+        return 3
+
+    let add_rc = ht.handle_table_add_i32(h, 10, got)
+    if add_rc != ht.HandleTableErrStale:
+        echo("FAIL: add on stale expected stale, got rc=", add_rc)
+        return 4
+
+    let release2_rc = ht.handle_table_release_i32(h)
+    if release2_rc != ht.HandleTableErrStale:
+        echo("FAIL: release on stale expected stale, got rc=", release2_rc)
+        return 5
+
+    echo("OK: stale detection")
+    return 0
+
+fn test_concurrent_safety_basic(): int32 =
+    -- Even without threading, verify that operations don't corrupt state
+    const N = 100
+    var handles: uint64[N]
+    var i: int32 = 0
+
+    while i < N:
+        let h = ht.handle_table_new_i32(i)
+        if h == 0:
+            echo("FAIL: concurrent new failed at ", i)
+            return 1
+        handles[i] = h
+        i = i + 1
+
+    i = 0
+    while i < N:
+        var got: int32
+        let rc = ht.handle_table_get_i32(handles[i], got)
+        if rc != ht.HandleTableErrOk:
+            echo("FAIL: concurrent get failed at ", i, " rc=", rc)
+            return 2
+        if got != i:
+            echo("FAIL: concurrent get value mismatch at ", i, ": got ", got, " expected ", i)
+            return 3
+        i = i + 1
+
+    i = 0
+    while i < N:
+        let rc = ht.handle_table_release_i32(handles[i])
+        if rc != ht.HandleTableErrOk:
+            echo("FAIL: concurrent release failed at ", i, " rc=", rc)
+            return 4
+        i = i + 1
+
+    echo("OK: concurrent safety basic")
+    return 0
+
+fn test_error_codes(): int32 =
+    -- Test invalid handle detection
+    let invalid_handle: uint64 = 0xFFFFFFFFFFFFFFFF
+    var got: int32
+    let get_rc = ht.handle_table_get_i32(invalid_handle, got)
+    if get_rc != ht.HandleTableErrInvalid:
+        echo("FAIL: invalid handle get expected Invalid, got ", get_rc)
+        return 1
+
+    let add_rc = ht.handle_table_add_i32(invalid_handle, 1, got)
+    if add_rc != ht.HandleTableErrInvalid:
+        echo("FAIL: invalid handle add expected Invalid, got ", add_rc)
+        return 2
+
+    let release_rc = ht.handle_table_release_i32(invalid_handle)
+    if release_rc != ht.HandleTableErrInvalid:
+        echo("FAIL: invalid handle release expected Invalid, got ", release_rc)
+        return 3
+
+    echo("OK: error codes")
+    return 0
+
+fn main(): int32 =
+    echo("=== ZRPC Integration Smoke Test ===")
+
+    let r1 = test_basic_handle_ops()
+    if r1 != 0: return r1
+
+    let r2 = test_generation_reuse()
+    if r2 != 0: return r2
+
+    let r3 = test_stale_detection()
+    if r3 != 0: return r3
+
+    let r4 = test_concurrent_safety_basic()
+    if r4 != 0: return r4
+
+    let r5 = test_error_codes()
+    if r5 != 0: return r5
+
+    echo("ALL ZRPC TESTS PASSED")
+    return 0

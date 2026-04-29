@@ -79,6 +79,13 @@ type
     PrimaryObjectIr =
         functions: PrimaryObjectIrFunction[]
 
+    LoweringResolvedCallFactCursor =
+        sourcePath: str
+        normalizedSourcePath: str
+        startIndex: int32
+        endIndex: int32
+        cursorIndex: int32
+
     LoweringPlanStub =
         workspaceRoot: str
         packageRoot: str
@@ -159,24 +166,111 @@ fn LoweringTypedIrFunctionIndex(ir: texpr.TypedExprIr,
                 return i
     return -1
 
+fn LoweringBuildResolvedCallFactCursors(facts: ccsg.TypedExprFact[]): LoweringResolvedCallFactCursor[] =
+    var out: LoweringResolvedCallFactCursor[]
+    var factIndex: int32
+    while factIndex < facts.len:
+        let sourcePath = facts[factIndex].sourcePath
+        let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+        var cursor: LoweringResolvedCallFactCursor
+        cursor.sourcePath = sourcePath
+        cursor.normalizedSourcePath = normalizedSourcePath
+        cursor.startIndex = factIndex
+        var endIndex = factIndex + 1
+        while endIndex < facts.len:
+            let nextSourcePath = facts[endIndex].sourcePath
+            if nextSourcePath == sourcePath || nextSourcePath == normalizedSourcePath:
+                endIndex = endIndex + 1
+            elif parser.ParserNormalizePath(nextSourcePath) == normalizedSourcePath:
+                endIndex = endIndex + 1
+            else:
+                break
+        cursor.endIndex = endIndex
+        cursor.cursorIndex = cursor.startIndex
+        add(out, cursor)
+        factIndex = endIndex
+    return out
+
+fn LoweringResolvedCallFactCursorIndex(cursors: LoweringResolvedCallFactCursor[],
+                                        sourcePath: str,
+                                        normalizedSourcePath: str): int32 =
+    for i in 0..<cursors.len:
+        if cursors[i].sourcePath == sourcePath ||
+           cursors[i].sourcePath == normalizedSourcePath ||
+           cursors[i].normalizedSourcePath == sourcePath ||
+           cursors[i].normalizedSourcePath == normalizedSourcePath:
+            return i
+    return -1
+
+fn LoweringResolvedCallFactCursorStartForLine(facts: ccsg.TypedExprFact[],
+                                               cursor: var LoweringResolvedCallFactCursor,
+                                               lineNumber: int32): int32 =
+    if cursor.startIndex < 0 || cursor.endIndex <= cursor.startIndex:
+        return 0
+    var startIndex = cursor.cursorIndex
+    if startIndex < cursor.startIndex || startIndex >= cursor.endIndex:
+        startIndex = cursor.startIndex
+    elif facts[startIndex].lineNumber > lineNumber:
+        startIndex = cursor.startIndex
+    for i in startIndex..<cursor.endIndex:
+        if facts[i].lineNumber >= lineNumber:
+            cursor.cursorIndex = i
+            return i
+    cursor.cursorIndex = cursor.endIndex
+    return cursor.endIndex
+
 fn LoweringFindResolvedCallFactIndex(facts: ccsg.TypedExprFact[],
-                                      sourcePath: str,
+                                      cursor: var LoweringResolvedCallFactCursor,
                                       lineNumber: int32): int32 =
     if lineNumber <= 0:
         return -1
-    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
-    for i in 0..<facts.len:
+    let startIndex = LoweringResolvedCallFactCursorStartForLine(facts, cursor, lineNumber)
+    for i in startIndex..<cursor.endIndex:
+        if facts[i].lineNumber > lineNumber:
+            cursor.cursorIndex = i
+            return -1
         if facts[i].lineNumber != lineNumber:
             continue
         if !facts[i].callResolved:
             continue
         if len(facts[i].callTarget) <= 0:
             continue
-        if facts[i].sourcePath != sourcePath &&
-           facts[i].sourcePath != normalizedSourcePath &&
-           parser.ParserNormalizePath(facts[i].sourcePath) != normalizedSourcePath:
-            continue
+        cursor.cursorIndex = i
         return i
+    cursor.cursorIndex = cursor.endIndex
+    return -1
+
+fn LoweringFindResolvedCallFactIndexInLineRange(facts: ccsg.TypedExprFact[],
+                                                 cursor: var LoweringResolvedCallFactCursor,
+                                                 startLineInclusive: int32,
+                                                 endLineExclusive: int32,
+                                                 requiredArgCount: int32,
+                                                 argTextRaw: str,
+                                                 skipFactIndex: int32): int32 =
+    if endLineExclusive <= startLineInclusive:
+        return -1
+    let requireArgText = len(argTextRaw) > 0
+    var argText = ""
+    if requireArgText:
+        argText = chengpath.PathTrim(argTextRaw)
+    let startIndex = LoweringResolvedCallFactCursorStartForLine(facts, cursor, startLineInclusive)
+    for i in startIndex..<cursor.endIndex:
+        if facts[i].lineNumber >= endLineExclusive:
+            cursor.cursorIndex = i
+            return -1
+        if i == skipFactIndex:
+            continue
+        if !facts[i].callResolved:
+            continue
+        if len(facts[i].callTarget) <= 0:
+            continue
+        if requiredArgCount >= 0 && facts[i].callArgCount != requiredArgCount:
+            continue
+        if requireArgText && chengpath.PathTrim(facts[i].callArgsText) != argText:
+            continue
+        cursor.cursorIndex = i
+        return i
+    cursor.cursorIndex = cursor.endIndex
     return -1
 
 fn LoweringPrimaryObjectIrBodyKindForCallArgCount(callArgCount: int32): str =
@@ -477,7 +571,7 @@ fn LoweringBodyIrEnsureLocalSlot(fnIr: var PrimaryObjectIrFunction,
     slot.sizeBytes = sizeBytes
     slot.alignBytes = alignBytes
     slot.stackOffset = LoweringBodyIrNextLocalOffset(fnIr.bodyIR, alignBytes)
-    slot.noAlias = true
+    coreir.BodyIRApplyLocalSlotDefaultProof(slot)
     add(fnIr.bodyIR.localSlots, slot)
     return slot.id
 
@@ -1817,8 +1911,17 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                  sourceTexts: texpr.TypedExprSourceText[]): PrimaryObjectIr =
     var ir: PrimaryObjectIr
     let letCallReturnLiteralStart = texpr.BodyKindLetCallReturnI32ConstPrefixLen
+    var resolvedCallFactCursors = LoweringBuildResolvedCallFactCursors(plan.typedExprFacts)
+    var resolvedCallFactCursorIndex: int32 = -1
+    var activeFactSourcePath = ""
     for i in 0..<plan.functionNames.len:
         let sourcePath = plan.functionSourcePaths[i]
+        if sourcePath != activeFactSourcePath:
+            let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+            resolvedCallFactCursorIndex = LoweringResolvedCallFactCursorIndex(resolvedCallFactCursors,
+                                                                              sourcePath,
+                                                                              normalizedSourcePath)
+            activeFactSourcePath = sourcePath
         let functionName = plan.functionNames[i]
         var fnIr: PrimaryObjectIrFunction
         fnIr.sourcePath = sourcePath
@@ -1934,8 +2037,10 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                 LoweringClearCallSequence(fnIr)
                 fnIr.bodyKind = savedLeafBodyKind
         if fnIr.bodyKind == texpr.BodyKindUnsupported || hasLetCall:
-            var callIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
-                                                              sourcePath,
+            var callIndex = -1
+            if resolvedCallFactCursorIndex >= 0:
+                callIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                              resolvedCallFactCursors[resolvedCallFactCursorIndex],
                                                               bodyLineNumber)
             if callIndex < 0:
                 if letCallReturnKind == texpr.BodyKindLetCallStrThenCallArg0ReturnI32Const0:
@@ -1943,24 +2048,14 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                         let typedFn = plan.typedIr.functions[typedFnIndex]
                         if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
                             let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                            let normalizedFunctionSourcePath = parser.ParserNormalizePath(sourcePath)
-                            for factIndex in 0..<plan.typedExprFacts.len:
-                                if plan.typedExprFacts[factIndex].lineNumber <= typedFn.signatureLineNumber ||
-                                   plan.typedExprFacts[factIndex].lineNumber >= returnNode.operand0NodeIndex:
-                                    continue
-                                if !plan.typedExprFacts[factIndex].callResolved:
-                                    continue
-                                if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
-                                    continue
-                                if plan.typedExprFacts[factIndex].callArgCount != 0:
-                                    continue
-                                let factSourcePath = plan.typedExprFacts[factIndex].sourcePath
-                                if factSourcePath != sourcePath &&
-                                   factSourcePath != normalizedFunctionSourcePath &&
-                                   parser.ParserNormalizePath(factSourcePath) != normalizedFunctionSourcePath:
-                                    continue
-                                callIndex = factIndex
-                                break
+                            if resolvedCallFactCursorIndex >= 0:
+                                callIndex = LoweringFindResolvedCallFactIndexInLineRange(plan.typedExprFacts,
+                                                                                         resolvedCallFactCursors[resolvedCallFactCursorIndex],
+                                                                                         typedFn.signatureLineNumber + 1,
+                                                                                         returnNode.operand0NodeIndex,
+                                                                                         0,
+                                                                                         "",
+                                                                                         -1)
             if callIndex >= 0:
                 let fact = plan.typedExprFacts[callIndex]
                 if fact.returnRoot && letCallReturnKind == texpr.BodyKindUnsupported:
@@ -1996,22 +2091,20 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                             let typedFn = plan.typedIr.functions[typedFnIndex]
                             if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
                                 let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                                var secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
-                                                                                        sourcePath,
+                                var secondCallIndex = -1
+                                if resolvedCallFactCursorIndex >= 0:
+                                    secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                                        resolvedCallFactCursors[resolvedCallFactCursorIndex],
                                                                                         returnNode.operand0NodeIndex)
                                 if secondCallIndex < 0:
-                                    for factIndex in 0..<plan.typedExprFacts.len:
-                                        if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
-                                            continue
-                                        if plan.typedExprFacts[factIndex].lineNumber <= bodyLineNumber ||
-                                           plan.typedExprFacts[factIndex].lineNumber > returnNode.lineNumber:
-                                            continue
-                                        if !plan.typedExprFacts[factIndex].callResolved:
-                                            continue
-                                        if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
-                                            continue
-                                        secondCallIndex = factIndex
-                                        break
+                                    if resolvedCallFactCursorIndex >= 0:
+                                        secondCallIndex = LoweringFindResolvedCallFactIndexInLineRange(plan.typedExprFacts,
+                                                                                                       resolvedCallFactCursors[resolvedCallFactCursorIndex],
+                                                                                                       bodyLineNumber + 1,
+                                                                                                       returnNode.lineNumber + 1,
+                                                                                                       -1,
+                                                                                                       "",
+                                                                                                       -1)
                                 if secondCallIndex >= 0:
                                     let secondFact = plan.typedExprFacts[secondCallIndex]
                                     let secondArgText = chengpath.PathTrim(secondFact.callArgsText)
@@ -2097,47 +2190,34 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                     var functionEndLine: int32 = typedFn.endLineNumber + 1
                     if functionEndLine <= bodyLineNumber:
                         functionEndLine = 2147483647
-                    var firstCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
-                                                                           sourcePath,
+                    var firstCallIndex = -1
+                    if resolvedCallFactCursorIndex >= 0:
+                        firstCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                           resolvedCallFactCursors[resolvedCallFactCursorIndex],
                                                                            bodyLineNumber)
                     if firstCallIndex < 0:
-                        for factIndex in 0..<plan.typedExprFacts.len:
-                            if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
-                                continue
-                            if plan.typedExprFacts[factIndex].lineNumber < bodyLineNumber ||
-                               plan.typedExprFacts[factIndex].lineNumber >= functionEndLine:
-                                continue
-                            if !plan.typedExprFacts[factIndex].callResolved:
-                                continue
-                            if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
-                                continue
-                            if plan.typedExprFacts[factIndex].callArgCount != 0:
-                                continue
-                            firstCallIndex = factIndex
-                            break
-                    var secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
-                                                                            sourcePath,
+                        if resolvedCallFactCursorIndex >= 0:
+                            firstCallIndex = LoweringFindResolvedCallFactIndexInLineRange(plan.typedExprFacts,
+                                                                                          resolvedCallFactCursors[resolvedCallFactCursorIndex],
+                                                                                          bodyLineNumber,
+                                                                                          functionEndLine,
+                                                                                          0,
+                                                                                          "",
+                                                                                          -1)
+                    var secondCallIndex = -1
+                    if resolvedCallFactCursorIndex >= 0:
+                        secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                            resolvedCallFactCursors[resolvedCallFactCursorIndex],
                                                                             returnNode.operand0NodeIndex)
                     if secondCallIndex < 0:
-                        for factIndex in 0..<plan.typedExprFacts.len:
-                            if factIndex == firstCallIndex:
-                                continue
-                            if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
-                                continue
-                            if plan.typedExprFacts[factIndex].lineNumber <= bodyLineNumber ||
-                               plan.typedExprFacts[factIndex].lineNumber >= functionEndLine:
-                                continue
-                            if !plan.typedExprFacts[factIndex].callResolved:
-                                continue
-                            if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
-                                continue
-                            if plan.typedExprFacts[factIndex].callArgCount != 1:
-                                continue
-                            let argText = chengpath.PathTrim(plan.typedExprFacts[factIndex].callArgsText)
-                            if argText != returnNode.surfaceText:
-                                continue
-                            secondCallIndex = factIndex
-                            break
+                        if resolvedCallFactCursorIndex >= 0:
+                            secondCallIndex = LoweringFindResolvedCallFactIndexInLineRange(plan.typedExprFacts,
+                                                                                           resolvedCallFactCursors[resolvedCallFactCursorIndex],
+                                                                                           bodyLineNumber + 1,
+                                                                                           functionEndLine,
+                                                                                           1,
+                                                                                           returnNode.surfaceText,
+                                                                                           firstCallIndex)
                     if firstCallIndex >= 0 && secondCallIndex >= 0:
                         let firstFact = plan.typedExprFacts[firstCallIndex]
                         let secondFact = plan.typedExprFacts[secondCallIndex]

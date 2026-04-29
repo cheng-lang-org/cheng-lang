@@ -1,0 +1,182 @@
+module borrow_checker_smoke
+
+import cheng/core/analysis/borrow_checker as bc
+import cheng/core/analysis/borrow_ir as bir
+import cheng/core/ir/core_types as ir
+import std/io
+
+fn test_legal_borrow(): bool =
+    var ctx = bc.BorrowCtxNew()
+    bc.BorrowCtxPushScope(ctx)
+    let varId: bc.VarId = 0
+    let lifetimeId = bc.BorrowCtxCurrentLifetime(ctx)
+    let err = bc.BorrowCtxCheckBorrow(ctx, varId, bc.Shared, lifetimeId)
+    if err != bc.Ok
+        io.Printf("legal borrow failed: %s\n", bc.BorrowCheckErrorText(err))
+        return false
+    bc.BorrowCtxAddBorrow(ctx, varId, bc.Shared, lifetimeId)
+    bc.BorrowCtxPopScope(ctx)
+    io.Printf("test_legal_borrow: ok\n")
+    return true
+
+fn test_illegal_borrow_unique_conflict(): bool =
+    var ctx = bc.BorrowCtxNew()
+    bc.BorrowCtxPushScope(ctx)
+    let varId: bc.VarId = 0
+    let lifetimeId = bc.BorrowCtxCurrentLifetime(ctx)
+    let err1 = bc.BorrowCtxCheckBorrow(ctx, varId, bc.Unique, lifetimeId)
+    if err1 != bc.Ok
+        io.Printf("first unique borrow failed: %s\n", bc.BorrowCheckErrorText(err1))
+        return false
+    bc.BorrowCtxAddBorrow(ctx, varId, bc.Unique, lifetimeId)
+    let err2 = bc.BorrowCtxCheckBorrow(ctx, varId, bc.Shared, lifetimeId)
+    if err2 != bc.ErrAliasConflict
+        io.Printf("expected alias conflict, got %s\n", bc.BorrowCheckErrorText(err2))
+        return false
+    bc.BorrowCtxPopScope(ctx)
+    io.Printf("test_illegal_borrow_unique_conflict: ok\n")
+    return true
+
+fn test_use_after_move(): bool =
+    var ctx = bc.BorrowCtxNew()
+    bc.BorrowCtxPushScope(ctx)
+    let varId: bc.VarId = 0
+    let siteId: int32 = 1
+    let err1 = bc.BorrowCtxCheckMove(ctx, varId, siteId)
+    if err1 != bc.Ok
+        io.Printf("check move on unused var: %s\n", bc.BorrowCheckErrorText(err1))
+        return false
+    bc.BorrowCtxApplyMove(ctx, varId, siteId)
+    let err2 = bc.BorrowCtxCheckMove(ctx, varId, siteId + 1)
+    if err2 != bc.ErrUseAfterMove
+        io.Printf("expected use after move, got %s\n", bc.BorrowCheckErrorText(err2))
+        return false
+    bc.BorrowCtxPopScope(ctx)
+    io.Printf("test_use_after_move: ok\n")
+    return true
+
+fn test_return_escape(): bool =
+    var ctx = bc.BorrowCtxNew()
+    bc.BorrowCtxPushScope(ctx)
+    let varId: bc.VarId = 0
+    let borrowLifetime = bc.BorrowCtxAddLifetime(ctx, -1)
+    let err1 = bc.BorrowCtxCheckBorrow(ctx, varId, bc.Shared, borrowLifetime)
+    if err1 != bc.Ok
+        io.Printf("borrow check: %s\n", bc.BorrowCheckErrorText(err1))
+        return false
+    bc.BorrowCtxAddBorrow(ctx, varId, bc.Shared, borrowLifetime)
+    let returnLifetime = bc.BorrowCtxAddLifetime(ctx, -1)
+    let err2 = bc.BorrowCtxCheckReturnEscape(ctx, varId, returnLifetime)
+    if err2 != bc.ErrReturnEscape
+        io.Printf("expected return escape, got %s\n", bc.BorrowCheckErrorText(err2))
+        return false
+    bc.BorrowCtxPopScope(ctx)
+    io.Printf("test_return_escape: ok\n")
+    return true
+
+fn test_global_escape(): bool =
+    var ctx = bc.BorrowCtxNew()
+    bc.BorrowCtxPushScope(ctx)
+    let varId: bc.VarId = 0
+    let lifetimeId = bc.BorrowCtxCurrentLifetime(ctx)
+    let err1 = bc.BorrowCtxCheckBorrow(ctx, varId, bc.Shared, lifetimeId)
+    if err1 != bc.Ok
+        io.Printf("borrow check: %s\n", bc.BorrowCheckErrorText(err1))
+        return false
+    bc.BorrowCtxAddBorrow(ctx, varId, bc.Shared, lifetimeId)
+    let err2 = bc.BorrowCtxCheckGlobalEscape(ctx, varId)
+    if err2 != bc.ErrGlobalEscape
+        io.Printf("expected global escape, got %s\n", bc.BorrowCheckErrorText(err2))
+        return false
+    bc.BorrowCtxPopScope(ctx)
+    io.Printf("test_global_escape: ok\n")
+    return true
+
+fn test_call_escape(): bool =
+    var ctx = bc.BorrowCtxNew()
+    bc.BorrowCtxPushScope(ctx)
+    let varId: bc.VarId = 0
+    let lifetimeId = bc.BorrowCtxCurrentLifetime(ctx)
+    let err1 = bc.BorrowCtxCheckBorrow(ctx, varId, bc.Shared, lifetimeId)
+    if err1 != bc.Ok
+        io.Printf("borrow check: %s\n", bc.BorrowCheckErrorText(err1))
+        return false
+    bc.BorrowCtxAddBorrow(ctx, varId, bc.Shared, lifetimeId)
+    let err2 = bc.BorrowCtxCheckCallEscape(ctx, varId)
+    if err2 != bc.ErrCallEscape
+        io.Printf("expected call escape, got %s\n", bc.BorrowCheckErrorText(err2))
+        return false
+    bc.BorrowCtxPopScope(ctx)
+    io.Printf("test_call_escape: ok\n")
+    return true
+
+fn test_borrow_of_moved(): bool =
+    var ctx = bc.BorrowCtxNew()
+    bc.BorrowCtxPushScope(ctx)
+    let varId: bc.VarId = 0
+    bc.BorrowCtxApplyMove(ctx, varId, 1)
+    let lifetimeId = bc.BorrowCtxCurrentLifetime(ctx)
+    let err = bc.BorrowCtxCheckBorrow(ctx, varId, bc.Shared, lifetimeId)
+    if err != bc.ErrBorrowOfMoved
+        io.Printf("expected borrow of moved, got %s\n", bc.BorrowCheckErrorText(err))
+        return false
+    bc.BorrowCtxPopScope(ctx)
+    io.Printf("test_borrow_of_moved: ok\n")
+    return true
+
+fn test_borrow_ir_empty_body(): bool =
+    var bodyIR = ir.BodyIRNew()
+    if !bir.BorrowIRPass(bodyIR)
+        io.Printf("borrow_ir empty body failed\n")
+        return false
+    io.Printf("test_borrow_ir_empty_body: ok\n")
+    return true
+
+fn main(): int32 =
+    var passed: int32
+    var failed: int32
+
+    if test_legal_borrow()
+        passed = passed + 1
+    else
+        failed = failed + 1
+
+    if test_illegal_borrow_unique_conflict()
+        passed = passed + 1
+    else
+        failed = failed + 1
+
+    if test_use_after_move()
+        passed = passed + 1
+    else
+        failed = failed + 1
+
+    if test_return_escape()
+        passed = passed + 1
+    else
+        failed = failed + 1
+
+    if test_global_escape()
+        passed = passed + 1
+    else
+        failed = failed + 1
+
+    if test_call_escape()
+        passed = passed + 1
+    else
+        failed = failed + 1
+
+    if test_borrow_of_moved()
+        passed = passed + 1
+    else
+        failed = failed + 1
+
+    if test_borrow_ir_empty_body()
+        passed = passed + 1
+    else
+        failed = failed + 1
+
+    io.Printf("\nborrow_checker_smoke: %d passed, %d failed\n", passed, failed)
+    if failed > 0
+        return 1
+    return 0

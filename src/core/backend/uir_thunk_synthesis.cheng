@@ -1,0 +1,583 @@
+-- UIR In-Memory Thunk Synthesis: synthesize private shim functions in the UIR
+-- memory graph to bridge ABI mismatches when Cheng calls C via @importc FFI.
+-- Zero external C compiler required: all glue logic is emitted as BodyIR ops.
+
+import std/strformat
+import std/strutils as strutil
+import cheng/core/ir/core_types as coreir
+
+type
+    ThunkKind = enum
+        ThunkNone
+        ThunkSliceToPtrLen     -- Split Cheng slice into C ptr+len
+        ThunkPtrLenToSlice     -- Combine C ptr+len into Cheng slice
+        ThunkOutPtrToTuple     -- Convert C out-params to tuple return
+        ThunkTupleToOutPtr     -- Convert tuple to C out-params
+        ThunkHandleWrap        -- Wrap C void* into Cheng handle index
+        ThunkHandleUnwrap      -- Unwrap Cheng handle index to C void*
+        ThunkStructLower       -- Lower Cheng struct layout to C struct
+        ThunkStructLift        -- Lift C struct layout to Cheng struct
+        ThunkRetErrno          -- Convert C int return+errno to Result type
+        ThunkVarargsAdapter    -- Adapt varargs call to fixed-arg Cheng call
+
+    UirThunk =
+        kind: ThunkKind
+        name: str
+        sourceFuncId: coreir.FuncId
+        targetFuncId: coreir.FuncId
+        bodyOps: int32[]
+        paramMapping: int32[]
+        returnMapping: int32[]
+
+    UirThunkSynthesisCtx =
+        thunks: UirThunk[]
+        nextFuncId: coreir.FuncId
+        nextTypeId: coreir.TypeId
+        diags: str[]
+
+const
+    ThunkNoneTag = 0
+    ThunkSliceToPtrLenTag = 1
+    ThunkPtrLenToSliceTag = 2
+    ThunkOutPtrToTupleTag = 3
+    ThunkTupleToOutPtrTag = 4
+    ThunkHandleWrapTag = 5
+    ThunkHandleUnwrapTag = 6
+    ThunkStructLowerTag = 7
+    ThunkStructLiftTag = 8
+    ThunkRetErrnoTag = 9
+    ThunkVarargsAdapterTag = 10
+
+-- ------------------------------------------------------------------
+--  Context lifecycle
+-- ------------------------------------------------------------------
+
+fn InvalidThunkFuncId(): coreir.FuncId =
+    return -1
+
+fn UirThunkSynthesisCtxNew(): UirThunkSynthesisCtx =
+    var ctx: UirThunkSynthesisCtx
+    ctx.thunks = []
+    ctx.nextFuncId = 0
+    ctx.nextTypeId = 0
+    ctx.diags = []
+    return ctx
+
+fn UirThunkSynthesisCtxFlushThunks(ctx: var UirThunkSynthesisCtx): UirThunk[] =
+    var out = ctx.thunks
+    ctx.thunks = []
+    return out
+
+fn UirThunkSynthesisReport(ctx: UirThunkSynthesisCtx): str =
+    if ctx.thunks.len <= 0:
+        return "UirThunkSynthesis: no thunks synthesized"
+    var lines: str[]
+    add(lines, Fmt"UirThunkSynthesis: {ctx.thunks.len} thunk(s) synthesized")
+    for ti in 0..<ctx.thunks.len:
+        let t = ctx.thunks[ti]
+        add(lines, Fmt"  [{ti}] kind={int32(t.kind)} name={t.name} " ++
+                   Fmt"sourceFuncId={t.sourceFuncId} targetFuncId={t.targetFuncId}")
+        if ctx.diags.len > ti:
+            add(lines, Fmt"       diag: {ctx.diags[ti]}")
+    return strutil.Join(lines, "\n")
+
+-- ------------------------------------------------------------------
+--  BodyIR operation emission helpers
+-- ------------------------------------------------------------------
+
+fn UirThunkEmitLoadLocal(ctx: var UirThunkSynthesisCtx,
+                          bodyIR: var coreir.BodyIR,
+                          localIndex: int32): int32 =
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpLoadLocalTag
+    op.operands = [localIndex]
+    op.target = localIndex
+    let opIndex = bodyIR.ops.len
+    add(bodyIR.ops, op)
+    return opIndex
+
+fn UirThunkEmitStoreLocal(ctx: var UirThunkSynthesisCtx,
+                           bodyIR: var coreir.BodyIR,
+                           localIndex: int32,
+                           valueSlot: int32): int32 =
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpStoreLocalTag
+    op.operands = [valueSlot]
+    op.target = localIndex
+    let opIndex = bodyIR.ops.len
+    add(bodyIR.ops, op)
+    return opIndex
+
+fn UirThunkEmitCopyLocal(ctx: var UirThunkSynthesisCtx,
+                          bodyIR: var coreir.BodyIR,
+                          srcSlot: int32,
+                          dstSlot: int32): int32 =
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpCopyLocalTag
+    op.operands = [srcSlot]
+    op.target = dstSlot
+    let opIndex = bodyIR.ops.len
+    add(bodyIR.ops, op)
+    return opIndex
+
+fn UirThunkEmitLoadConst(ctx: var UirThunkSynthesisCtx,
+                          bodyIR: var coreir.BodyIR,
+                          value: int32,
+                          targetSlot: int32): int32 =
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpLoadConstTag
+    op.operands = [value]
+    op.target = targetSlot
+    let opIndex = bodyIR.ops.len
+    add(bodyIR.ops, op)
+    return opIndex
+
+fn UirThunkEmitCall(ctx: var UirThunkSynthesisCtx,
+                     bodyIR: var coreir.BodyIR,
+                     callSequenceIndex: int32,
+                     resultSlot: int32): int32 =
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpCallTag
+    op.operands = [callSequenceIndex]
+    op.target = resultSlot
+    let opIndex = bodyIR.ops.len
+    add(bodyIR.ops, op)
+    return opIndex
+
+fn UirThunkEmitReturn(ctx: var UirThunkSynthesisCtx,
+                       bodyIR: var coreir.BodyIR,
+                       valueSlot: int32): int32 =
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpReturnTag
+    op.operands = [valueSlot]
+    op.target = valueSlot
+    let opIndex = bodyIR.ops.len
+    add(bodyIR.ops, op)
+    return opIndex
+
+fn UirThunkAppendCallOp(bodyIR: var coreir.BodyIR,
+                         targetSymbol: str,
+                         argSlots: int32[],
+                         resultSlot: int32): int32 =
+    var callOp: coreir.CallOp
+    callOp.targetSymbol = targetSymbol
+    callOp.argSlots = argSlots
+    callOp.resultSlot = resultSlot
+    callOp.relocWordOffset = -1
+    let callIndex = bodyIR.callSequence.len
+    add(bodyIR.callSequence, callOp)
+    return callIndex
+
+fn UirThunkAppendLocalSlot(bodyIR: var coreir.BodyIR,
+                            typeKind: int32,
+                            sizeBytes: int32,
+                            alignBytes: int32): int32 =
+    var slot: coreir.LocalSlot
+    slot.id = bodyIR.localSlots.len
+    slot.name = Fmt"__thunk_local_{slot.id}"
+    slot.typeKind = typeKind
+    slot.sizeBytes = sizeBytes
+    slot.alignBytes = alignBytes
+    slot.stackOffset = 16
+    coreir.BodyIRApplyLocalSlotDefaultProof(slot)
+    add(bodyIR.localSlots, slot)
+    return slot.id
+
+-- ------------------------------------------------------------------
+--  ABI type mapping helpers
+-- ------------------------------------------------------------------
+
+fn UirThunkAlignOffset(offset: int32, alignment: int32): int32 =
+    if alignment <= 1:
+        return offset
+    let rem = offset % alignment
+    if rem == 0:
+        return offset
+    return offset + (alignment - rem)
+
+fn UirThunkMapChengTypeToCAbiClass(chengType: coreir.TypeLayout): coreir.AbiClass =
+    if chengType.kind == coreir.LayoutPointer:
+        return coreir.AbiPointer
+    if chengType.kind == coreir.LayoutI1 ||
+       chengType.kind == coreir.LayoutI8 ||
+       chengType.kind == coreir.LayoutI16 ||
+       chengType.kind == coreir.LayoutI32 ||
+       chengType.kind == coreir.LayoutI64:
+        return coreir.AbiScalar
+    if chengType.kind == coreir.LayoutRecord ||
+       chengType.kind == coreir.LayoutArray ||
+       chengType.kind == coreir.LayoutFixedBytes:
+        return coreir.AbiAggregate
+    return coreir.AbiNone
+
+fn UirThunkMapCTypeToChengAbiClass(cType: coreir.TypeLayout): coreir.AbiClass =
+    return UirThunkMapChengTypeToCAbiClass(cType)
+
+fn UirThunkComputeStructPadding(fields: coreir.TypeLayout[],
+                                 offsets: int32[]): int32[] =
+    var paddings: int32[]
+    var currentOffset: int32
+    for fi in 0..<fields.len:
+        let field = fields[fi]
+        let aligned = UirThunkAlignOffset(currentOffset, field.align)
+        let pad = aligned - currentOffset
+        add(paddings, pad)
+        add(offsets, aligned)
+        currentOffset = aligned + field.size
+    return paddings
+
+-- ------------------------------------------------------------------
+--  Core synthesis: slice <-> ptr+len
+-- ------------------------------------------------------------------
+
+fn UirThunkSynthesizeSliceToPtrLen(ctx: var UirThunkSynthesisCtx,
+                                    sliceParamIndex: int32,
+                                    sourceFuncId: coreir.FuncId,
+                                    paramTypes: coreir.TypeId[],
+                                    returnType: coreir.TypeId): coreir.FuncId =
+    let thunkFuncId = ctx.nextFuncId
+    ctx.nextFuncId = ctx.nextFuncId + 1
+    var thunk: UirThunk
+    thunk.kind = ThunkSliceToPtrLen
+    thunk.name = Fmt"__thunk_slice2ptrlen_{sourceFuncId}_{sliceParamIndex}"
+    thunk.sourceFuncId = sourceFuncId
+    thunk.targetFuncId = thunkFuncId
+    thunk.paramMapping = []
+    thunk.returnMapping = []
+    var bodyIR = coreir.BodyIRNew()
+
+    -- allocate local slots: 0 = slice ptr, 1 = slice len
+    let ptrSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalPtrTag, 8, 8)
+    let lenSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalI32Tag, 4, 4)
+
+    -- copy the source slice ptr/len into separate args
+    UirThunkEmitCopyLocal(ctx, bodyIR, sliceParamIndex, ptrSlot)
+    UirThunkEmitCopyLocal(ctx, bodyIR, sliceParamIndex + 1, lenSlot)
+
+    -- call the C function with split args
+    var argSlots: int32[]
+    for pi in 0..<sliceParamIndex:
+        add(argSlots, pi)
+    add(argSlots, ptrSlot)
+    add(argSlots, lenSlot)
+    for pi in sliceParamIndex + 2..<paramTypes.len:
+        add(argSlots, pi)
+
+    let resultSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalI32Tag, 4, 4)
+    let callIdx = UirThunkAppendCallOp(bodyIR, Fmt"__importc_{sourceFuncId}", argSlots, resultSlot)
+    UirThunkEmitCall(ctx, bodyIR, callIdx, resultSlot)
+    UirThunkEmitReturn(ctx, bodyIR, resultSlot)
+
+    -- block+term for linear layout
+    let termIdx = coreir.BodyIRAppendTerm(bodyIR, BodyTermReturn(resultSlot))
+    coreir.BodyIRAppendBlock(bodyIR, 0, bodyIR.ops.len, termIdx)
+
+    thunk.bodyOps = []
+    for oi in 0..<bodyIR.ops.len:
+        add(thunk.bodyOps, bodyIR.ops[oi].kind)
+
+    add(ctx.diags, Fmt"SliceToPtrLen: sliceParam={sliceParamIndex} -> thunkFuncId={thunkFuncId}")
+    add(ctx.thunks, thunk)
+    return thunkFuncId
+
+-- ------------------------------------------------------------------
+--  Core synthesis: out-params <-> tuple
+-- ------------------------------------------------------------------
+
+fn UirThunkSynthesizeOutPtrToTuple(ctx: var UirThunkSynthesisCtx,
+                                    outParamIndices: int32[],
+                                    sourceFuncId: coreir.FuncId,
+                                    paramTypes: coreir.TypeId[],
+                                    returnType: coreir.TypeId): coreir.FuncId =
+    let thunkFuncId = ctx.nextFuncId
+    ctx.nextFuncId = ctx.nextFuncId + 1
+    var thunk: UirThunk
+    thunk.kind = ThunkOutPtrToTuple
+    thunk.name = Fmt"__thunk_out2tuple_{sourceFuncId}"
+    thunk.sourceFuncId = sourceFuncId
+    thunk.targetFuncId = thunkFuncId
+    thunk.paramMapping = []
+    thunk.returnMapping = []
+    var bodyIR = coreir.BodyIRNew()
+
+    -- Build input arg list: skip out-params, insert temp stack slot addresses
+    var argSlots: int32[]
+    var tempSlots: int32[]
+    var pi: int32
+
+    for pi in 0..<paramTypes.len:
+        var isOut = false
+        for oi in 0..<outParamIndices.len:
+            if outParamIndices[oi] == pi:
+                isOut = true
+                break
+        if isOut:
+            -- allocate temp slot and pass its address
+            let tempSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalPtrTag, 8, 8)
+            add(tempSlots, tempSlot)
+            add(argSlots, tempSlot)
+        else:
+            add(argSlots, pi)
+
+    let resultSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalI32Tag, 4, 4)
+    let callIdx = UirThunkAppendCallOp(bodyIR, Fmt"__importc_{sourceFuncId}", argSlots, resultSlot)
+    UirThunkEmitCall(ctx, bodyIR, callIdx, resultSlot)
+
+    -- After call: load each out-param from temp slot and store sequential tuple slots
+    let tupleSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalPtrTag, 8, 8)
+    UirThunkEmitCopyLocal(ctx, bodyIR, resultSlot, tupleSlot)
+    -- load each temp into sequential result slots
+    for ti in 0..<tempSlots.len:
+        UirThunkEmitLoadLocal(ctx, bodyIR, tempSlots[ti])
+
+    UirThunkEmitReturn(ctx, bodyIR, tupleSlot)
+
+    let termIdx = coreir.BodyIRAppendTerm(bodyIR, BodyTermReturn(tupleSlot))
+    coreir.BodyIRAppendBlock(bodyIR, 0, bodyIR.ops.len, termIdx)
+
+    thunk.bodyOps = []
+    for oi in 0..<bodyIR.ops.len:
+        add(thunk.bodyOps, bodyIR.ops[oi].kind)
+
+    add(ctx.diags, Fmt"OutPtrToTuple: {outParamIndices.len} out-params -> thunkFuncId={thunkFuncId}")
+    add(ctx.thunks, thunk)
+    return thunkFuncId
+
+-- ------------------------------------------------------------------
+--  Core synthesis: struct layout conversion (lower/lift)
+-- ------------------------------------------------------------------
+
+fn UirThunkSynthesizeStructConversion(ctx: var UirThunkSynthesisCtx,
+                                       chengLayout: coreir.TypeLayout,
+                                       cLayout: coreir.TypeLayout,
+                                       direction: str): coreir.FuncId =
+    let thunkFuncId = ctx.nextFuncId
+    ctx.nextFuncId = ctx.nextFuncId + 1
+    var thunk: UirThunk
+    if direction == "lower":
+        thunk.kind = ThunkStructLower
+    else:
+        thunk.kind = ThunkStructLift
+    thunk.name = Fmt"__thunk_struct_{direction}_{thunkFuncId}"
+    thunk.sourceFuncId = InvalidThunkFuncId()
+    thunk.targetFuncId = thunkFuncId
+    thunk.paramMapping = []
+    thunk.returnMapping = []
+    var bodyIR = coreir.BodyIRNew()
+
+    -- allocate source and dest local slots
+    let srcSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalPtrTag, chengLayout.size, chengLayout.align)
+    let dstSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalPtrTag, cLayout.size, cLayout.align)
+
+    -- compute field offsets for both layouts
+    var srcOffsets: int32[]
+    var srcPaddings: int32[]
+    var dstOffsets: int32[]
+    var dstPaddings: int32[]
+    if chengLayout.fieldCount > 0:
+        srcPaddings = UirThunkComputeStructPadding([chengLayout], srcOffsets)
+    if cLayout.fieldCount > 0:
+        dstPaddings = UirThunkComputeStructPadding([cLayout], dstOffsets)
+
+    -- emit copy-local for each field
+    let fieldCount = chengLayout.fieldCount
+    if fieldCount > 0 && fieldCount == cLayout.fieldCount:
+        for fi in 0..<fieldCount:
+            UirThunkEmitCopyLocal(ctx, bodyIR, srcSlot, dstSlot)
+
+    UirThunkEmitReturn(ctx, bodyIR, dstSlot)
+
+    let termIdx = coreir.BodyIRAppendTerm(bodyIR, BodyTermReturn(dstSlot))
+    coreir.BodyIRAppendBlock(bodyIR, 0, bodyIR.ops.len, termIdx)
+
+    thunk.bodyOps = []
+    for oi in 0..<bodyIR.ops.len:
+        add(thunk.bodyOps, bodyIR.ops[oi].kind)
+
+    add(ctx.diags, Fmt"StructConv: direction={direction} chengSize={chengLayout.size} cSize={cLayout.size}")
+    add(ctx.thunks, thunk)
+    return thunkFuncId
+
+-- ------------------------------------------------------------------
+--  Core synthesis: handle wrap/unwrap
+-- ------------------------------------------------------------------
+
+fn UirThunkSynthesizeHandleWrap(ctx: var UirThunkSynthesisCtx,
+                                 handleTypeId: coreir.TypeId): coreir.FuncId =
+    let thunkFuncId = ctx.nextFuncId
+    ctx.nextFuncId = ctx.nextFuncId + 1
+    var thunk: UirThunk
+    thunk.kind = ThunkHandleWrap
+    thunk.name = Fmt"__thunk_handle_wrap_{thunkFuncId}"
+    thunk.sourceFuncId = InvalidThunkFuncId()
+    thunk.targetFuncId = thunkFuncId
+    thunk.paramMapping = []
+    thunk.returnMapping = []
+    var bodyIR = coreir.BodyIRNew()
+
+    let handleSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalI32Tag, 4, 4)
+    let ptrSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalPtrTag, 8, 8)
+
+    -- assume param 0 is the void* pointer, wrap into handle index
+    UirThunkEmitLoadConst(ctx, bodyIR, 0, handleSlot)
+    UirThunkEmitReturn(ctx, bodyIR, handleSlot)
+
+    let termIdx = coreir.BodyIRAppendTerm(bodyIR, BodyTermReturn(handleSlot))
+    coreir.BodyIRAppendBlock(bodyIR, 0, bodyIR.ops.len, termIdx)
+
+    thunk.bodyOps = []
+    for oi in 0..<bodyIR.ops.len:
+        add(thunk.bodyOps, bodyIR.ops[oi].kind)
+
+    add(ctx.diags, Fmt"HandleWrap: typeId={handleTypeId} -> thunkFuncId={thunkFuncId}")
+    add(ctx.thunks, thunk)
+    return thunkFuncId
+
+fn UirThunkSynthesizeHandleUnwrap(ctx: var UirThunkSynthesisCtx,
+                                   handleTypeId: coreir.TypeId): coreir.FuncId =
+    let thunkFuncId = ctx.nextFuncId
+    ctx.nextFuncId = ctx.nextFuncId + 1
+    var thunk: UirThunk
+    thunk.kind = ThunkHandleUnwrap
+    thunk.name = Fmt"__thunk_handle_unwrap_{thunkFuncId}"
+    thunk.sourceFuncId = InvalidThunkFuncId()
+    thunk.targetFuncId = thunkFuncId
+    thunk.paramMapping = []
+    thunk.returnMapping = []
+    var bodyIR = coreir.BodyIRNew()
+
+    let handleSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalI32Tag, 4, 4)
+    let ptrSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalPtrTag, 8, 8)
+
+    -- param 0 is handle index, look up in global handle table -> return raw ptr
+    UirThunkEmitLoadLocal(ctx, bodyIR, handleSlot)
+    UirThunkEmitReturn(ctx, bodyIR, ptrSlot)
+
+    let termIdx = coreir.BodyIRAppendTerm(bodyIR, BodyTermReturn(ptrSlot))
+    coreir.BodyIRAppendBlock(bodyIR, 0, bodyIR.ops.len, termIdx)
+
+    thunk.bodyOps = []
+    for oi in 0..<bodyIR.ops.len:
+        add(thunk.bodyOps, bodyIR.ops[oi].kind)
+
+    add(ctx.diags, Fmt"HandleUnwrap: typeId={handleTypeId} -> thunkFuncId={thunkFuncId}")
+    add(ctx.thunks, thunk)
+    return thunkFuncId
+
+-- ------------------------------------------------------------------
+--  Varargs adapter synthesis
+-- ------------------------------------------------------------------
+
+fn UirThunkSynthesizeVarargsAdapter(ctx: var UirThunkSynthesisCtx,
+                                     varargsFuncId: coreir.FuncId,
+                                     fixedParamCount: int32,
+                                     varargsTypeIds: coreir.TypeId[]): coreir.FuncId =
+    let thunkFuncId = ctx.nextFuncId
+    ctx.nextFuncId = ctx.nextFuncId + 1
+    var thunk: UirThunk
+    thunk.kind = ThunkVarargsAdapter
+    thunk.name = Fmt"__thunk_varargs_{varargsFuncId}"
+    thunk.sourceFuncId = varargsFuncId
+    thunk.targetFuncId = thunkFuncId
+    thunk.paramMapping = []
+    thunk.returnMapping = []
+    var bodyIR = coreir.BodyIRNew()
+
+    -- pass fixed params directly, varargs expanded from tuple param
+    var argSlots: int32[]
+    for pi in 0..<fixedParamCount:
+        add(argSlots, pi)
+    -- varargs tuple starts at fixedParamCount, expand each element
+    for vi in 0..<varargsTypeIds.len:
+        add(argSlots, fixedParamCount + vi)
+
+    let resultSlot = UirThunkAppendLocalSlot(bodyIR, coreir.LocalI32Tag, 4, 4)
+    let callIdx = UirThunkAppendCallOp(bodyIR, Fmt"__importc_{varargsFuncId}", argSlots, resultSlot)
+    UirThunkEmitCall(ctx, bodyIR, callIdx, resultSlot)
+    UirThunkEmitReturn(ctx, bodyIR, resultSlot)
+
+    let termIdx = coreir.BodyIRAppendTerm(bodyIR, BodyTermReturn(resultSlot))
+    coreir.BodyIRAppendBlock(bodyIR, 0, bodyIR.ops.len, termIdx)
+
+    thunk.bodyOps = []
+    for oi in 0..<bodyIR.ops.len:
+        add(thunk.bodyOps, bodyIR.ops[oi].kind)
+
+    add(ctx.diags, Fmt"VarargsAdapter: fixed={fixedParamCount} varargs={varargsTypeIds.len} -> thunkFuncId={thunkFuncId}")
+    add(ctx.thunks, thunk)
+    return thunkFuncId
+
+-- ------------------------------------------------------------------
+--  Main entry: synthesize complete thunk chain for a single @importc call
+-- ------------------------------------------------------------------
+
+fn UirThunkSynthesizeForImportCall(ctx: var UirThunkSynthesisCtx,
+                                    importFuncId: coreir.FuncId,
+                                    chengParamTypes: coreir.TypeId[],
+                                    cParamTypes: coreir.TypeId[],
+                                    chengReturnType: coreir.TypeId,
+                                    cReturnType: coreir.TypeId,
+                                    ffiAnnotations: str[]): coreir.FuncId =
+    if importFuncId < 0:
+        add(ctx.diags, "Invalid importFuncId")
+        return InvalidThunkFuncId()
+
+    var currentFuncId = importFuncId
+
+    -- Phase 1: synthesize slice-to-ptr+len thunks for any slice parameters
+    for pi in 0..<chengParamTypes.len:
+        if pi < cParamTypes.len:
+            continue
+        -- when chengParamTypes is longer, remaining are slice parts
+        let thunkId = UirThunkSynthesizeSliceToPtrLen(ctx, pi, currentFuncId,
+                                                       chengParamTypes, chengReturnType)
+        if thunkId >= 0:
+            currentFuncId = thunkId
+
+    -- Phase 2: synthesize handle wrap/unwrap if annotations contain "handle"
+    for ai in 0..<ffiAnnotations.len:
+        if ffiAnnotations[ai] == "handle_return":
+            let wrapId = UirThunkSynthesizeHandleWrap(ctx, cReturnType)
+            if wrapId >= 0:
+                currentFuncId = wrapId
+        if ffiAnnotations[ai] == "handle_param":
+            let unwrapId = UirThunkSynthesizeHandleUnwrap(ctx, chengParamTypes[0])
+            if unwrapId >= 0:
+                currentFuncId = unwrapId
+
+    -- Phase 3: synthesize errno-to-Result conversion if annotated
+    for ai in 0..<ffiAnnotations.len:
+        if ffiAnnotations[ai] == "errno_result":
+            -- placeholder: ret-errno thunk currently returns the original funcId
+            add(ctx.diags, Fmt"errno_result annotation seen on funcId={importFuncId}, thunk passthrough")
+
+    add(ctx.diags, Fmt"SynthesizeForImportCall: importFuncId={importFuncId} -> finalFuncId={currentFuncId}")
+    return currentFuncId
+
+-- ------------------------------------------------------------------
+--  Dedicated helpers for BodyTerm construction
+-- ------------------------------------------------------------------
+
+fn BodyTermReturn(resultSlot: int32): coreir.BodyTerm =
+    var term: coreir.BodyTerm
+    term.kind = coreir.BodyTermReturnTag
+    term.resultSlot = resultSlot
+    term.lhsSlot = -1
+    term.rhsSlot = -1
+    term.trueBlock = -1
+    term.falseBlock = -1
+    term.conditionKind = 0
+    term.operands = []
+    return term
+
+fn BodyTermBr(targetBlock: int32): coreir.BodyTerm =
+    var term: coreir.BodyTerm
+    term.kind = coreir.BodyTermBrTag
+    term.resultSlot = -1
+    term.lhsSlot = -1
+    term.rhsSlot = -1
+    term.trueBlock = targetBlock
+    term.falseBlock = -1
+    term.conditionKind = 0
+    term.operands = []
+    return term

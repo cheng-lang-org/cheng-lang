@@ -1,0 +1,54 @@
+import std/strformat
+import std/strutils as strutil
+import cheng/core/backend/uir_thunk_synthesis as thunk
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/ir/core_types as coreir
+
+type
+    ThunkSynthesisCtx = thunk.UirThunkSynthesisCtx
+
+fn ThunkDetermineParamKinds(paramType: str): int32 =
+    -- Returns: 0 = normal, 1 = slice (needs ptr+len split), 2 = out-ptr (needs tuple conversion), 3 = handle (needs wrap)
+    let typeText = coreir.NormalizeTypeText(paramType)
+    if typeText == "Handle" or typeText == "HandleType":
+        return 3
+    if strutil.Contains(typeText, "[]"):
+        -- slice type - needs ptr+len split
+        if strutil.HasPrefix(typeText, "[]") or strutil.HasPrefix(typeText, "partial[]"):
+            return 1
+    return 0
+
+fn ThunkDetermineReturnKinds(returnType: str): int32 =
+    -- Returns: 0 = normal, 1 = needs errno conversion, 2 = needs handle wrap
+    let typeText = coreir.NormalizeTypeText(returnType)
+    if typeText == "Handle" or typeText == "HandleType":
+        return 2
+    if strutil.HasPrefix(typeText, "Result["):
+        return 1
+    return 0
+
+fn ThunkSynthesisRun(loweringPlan: lower.LoweringPlanStub): thunk.UirThunkSynthesisCtx =
+    var ctx = thunk.UirThunkSynthesisCtxNew()
+
+    for fi in 0..<loweringPlan.functionNames.len:
+        let callConv = loweringPlan.functionCallConvs[fi]
+        if callConv != lower.LoweringCallConvInternal():
+            continue
+
+        -- importc function found, synthesize thunks
+        let funcName = loweringPlan.functionNames[fi]
+        let funcId = fi  -- use index as FuncId
+        let paramKinds: int32[] = []
+        let returnKinds = ThunkDetermineReturnKinds(loweringPlan.functionResultLayoutKinds[fi])
+
+        -- Simplified: for now, just record that thunk synthesis occurred
+        -- Full implementation would parse param/return types and synthesize appropriate thunks
+        _ = thunk.UirThunkSyllthesizeForImportCall(ctx, funcId, paramKinds, returnKinds)
+
+    return ctx
+
+fn ThunkSynthesisReportText(ctx: thunk.UirThunkSynthesisCtx): str =
+    return thunk.UirThunkSynthesisReport(ctx)
+
+fn ThunkSynthesisGetThunks(ctx: thunk.UirThunkSynthesisCtx): thunk.UirThunk[] =
+    return ctx.thunks

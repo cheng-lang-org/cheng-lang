@@ -264,3 +264,12 @@
 - 修改编译器源码里的 CSG/lowering/typed 热路径不会加速当前正在运行的旧 `artifacts/backend_driver/cheng`；self-probe 的耗时反映的是已安装编译器本体。性能修补必须先通过纯 Cheng 候选产物刷新后，才能用下一轮 A 编 B / B 编同入口衡量。
 - `TypedExprBuildFacts` 不能先构建 source context 又按 source 重建同一个 context；应复用已构建 context，只为当前 source 填 `exprLineColumns`。多行字符串 rewrite、import edge 解析和 binding 扫描都属于 source-local 固定事实，不应在 facts/IR 阶段重复做。
 - 已经有 `ctx.lines` 时不要再把原始 source text 传给 import edge parser；应调用 lines 版本读取 import edges，避免对含多行字符串的 source 再做一次 rewrite 和 split。
+- 并行子代理改同一批核心文件后，`git diff --check` 不足以发现所有坏合并；必须额外扫描 Git 冲突标记三件套，并抽查冲突附近函数体是否出现“无标记但语义断裂”的拼接。
+- 纯 self-probe 超过 30 秒必须先 `sample` 当前 live 编译器，再决定优化点；本轮证据显示旧产物热点分别在 `ParserRewriteMultilineStringSourceText -> AppendText/AppendBytes` 和 `LoweringFindResolvedCallFactIndex -> ParserNormalizePath/PathTrim`，不能盲目继续补 body kind。
+- 多行字符串 rewrite 不能用 ByteBuffer 在循环里逐片段 append；应先精确测长、一次分配、线性写入，末尾用写入长度合同 hard-fail，避免 O(n²) 复制。
+- lowering 查找 resolved call fact 不能按调用点全量扫 facts 或每条 fact 重复 normalize path；必须按 source 建游标/范围，路径归一化只做 source 级一次，且不复制 facts 大数组。
+- runtime/provider gate 自身也必须检查自己的 compile report；如果 gate 程序本身被旧 driver 编成 `standalone_no_runtime=1/provider_object_count=0` 或入口是 `mov w0,#0; ret`，即使运行退出 0 也是假绿。
+- 函数级并行完成口径必须接入 active primary task path；只改 `core/ir/function_task_executor` 的库级 executor 不能代表 `BACKEND_JOBS>1` 编译主链已并行。
+- work-stealing owner pop 最后一项必须走 CAS；`head < nextTail` 才能直接拿本地任务，`head == nextTail` 若不用 CAS 会和 thief 重复执行同一个 task。
+- 短 smoke 不能只看退出码；关键合同 smoke 必须输出固定 marker，host smoke gate 必须检查 marker，防止旧 driver 把入口折成 `mov w0,#0; ret` 后假绿。
+- 纯 Cheng 源码当前没有通用下标 bounds-check ARM64 emitter；旧 artifact 的 `x9`/caller-saved bounds 崩溃来自 seed 生成的机器码，不能通过改受害的 Cheng 循环或入口形状来证明修复。

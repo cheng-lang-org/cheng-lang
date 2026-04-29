@@ -1,211 +1,105 @@
 import std/os
 import std/strings
 import std/strutils as strutil
-import std/result
 import cheng/core/lang/intern as langintern
 
 type
-    BenchSample =
-        benchId: langintern.InternId
-        nsPerOpMilli: int64
+    PerfWitness =
+        wallTimeNs: int64
+        rssBytes: int64
+        taskCount: int32
+        stealCount: int32
+        waitCount: int32
+        mergeTimeNs: int64
+        ioTimeNs: int64
 
-    BenchDataset =
-        samples: BenchSample[]
+    PerfWitnessCollector =
+        serial: PerfWitness
+        parallel: PerfWitness
+        logPrefix: str
 
-    BenchCompareRow =
-        benchId: langintern.InternId
-        baseNsPerOpMilli: int64
-        candidateNsPerOpMilli: int64
-        ratioMilli: int64
-        missingCandidate: bool
-        missingBaseline: bool
-        tooSlow: bool
+fn PerfWitnessZero(): PerfWitness =
+    return PerfWitness(
+        wallTimeNs: 0,
+        rssBytes: 0,
+        taskCount: 0,
+        stealCount: 0,
+        waitCount: 0,
+        mergeTimeNs: 0,
+        ioTimeNs: 0
+    )
 
-    BenchCompare =
-        rows: BenchCompareRow[]
-        ok: bool
+fn PerfWitnessCollectorNew(logPrefix: str): PerfWitnessCollector =
+    return PerfWitnessCollector(
+        serial: PerfWitnessZero(),
+        parallel: PerfWitnessZero(),
+        logPrefix: logPrefix
+    )
 
-fn BenchIsSpace(ch: char): bool =
-    let code = int32(ch)
-    if code == 32:
-        return true
-    if code == 9:
-        return true
-    if code == 10:
-        return true
-    if code == 13:
-        return true
-    return false
-
-fn BenchFirstField(line: str): str =
-    let n: int32 = len(line)
-    var stop: int32
-    while stop < n:
-        if BenchIsSpace(line[stop]):
-            break
-        stop = stop + 1
-    if stop <= 0:
-        return ""
-    return strings.SliceBytes(line, 0, stop)
-
-fn BenchFindValue(line: str, key: str): str =
-    let n: int32 = len(line)
-    let keyLen: int32 = len(key)
-    if n <= 0 || keyLen <= 0 || keyLen > n:
-        return ""
-    var i: int32
-    while i <= n - keyLen:
-        if strings.SliceBytes(line, i, keyLen) == key:
-            let start: int32 = i + keyLen
-            var stop: int32 = start
-            while stop < n:
-                let ch: char = line[stop]
-                if (ch >= '0' && ch <= '9') || ch == '.':
-                    stop = stop + 1
-                else:
-                    break
-            if stop > start:
-                return strings.SliceBytes(line, start, stop - start)
-            return ""
-        i = i + 1
-    return ""
-
-fn BenchParseDecimalMilli(raw: str): int64 =
-    if len(raw) <= 0:
-        return -1
-    var whole: int64
-    var frac: int64
-    var fracDigits: int32
-    var seenDot: bool
-    for i in 0..<len(raw):
-        let ch: char = raw[i]
-        if ch == '.':
-            if seenDot:
-                return -1
-            seenDot = true
-        elif ch >= '0' && ch <= '9':
-            let digit: int64 = int64(int32(ch) - int32('0'))
-            if !seenDot:
-                whole = whole * int64(10) + digit
-            elif fracDigits < 3:
-                frac = frac * int64(10) + digit
-                fracDigits = fracDigits + 1
-        else:
-            return -1
-    for fracDigits in fracDigits..<3:
-        frac = frac * int64(10)
-    return whole * int64(1000) + frac
-
-fn BenchDatasetLookup(dataset: BenchDataset, benchId: langintern.InternId): int64 =
-    for i in 0..<dataset.samples.len:
-        let sample: BenchSample = dataset.samples[i]
-        if sample.benchId == benchId:
-            return sample.nsPerOpMilli
-    return -1
-
-fn BenchDatasetLoadText(pool: langintern.InternPool, text: str): BenchDataset =
-    var samples: BenchSample[]
-    var out: BenchDataset
-    let lines: str[] = strutil.Split(text, '\n')
-    var i: int32
-    for i in i..<lines.len:
-        let line: str = strutil.Strip(lines[i])
-        if len(line) <= 0:
-            continue
-        if strutil.StartsWith(line, "sink="):
-            continue
-        let name: str = BenchFirstField(line)
-        let nsText: str = BenchFindValue(line, "ns_per_op=")
-        let nsMilli: int64 = BenchParseDecimalMilli(nsText)
-        if len(name) <= 0 || nsMilli < int64(0):
-            continue
-        let benchId: langintern.InternId = langintern.Intern(pool, name)
-        add(samples, BenchSample(benchId: benchId, nsPerOpMilli: nsMilli))
-    out.samples.len = samples.len
-    out.samples.cap = samples.cap
-    out.samples.buffer = samples.buffer
-    return out
-
-fn BenchDatasetLoadFile(pool: langintern.InternPool, path: str): BenchDataset =
-    if !os.FileExists(path):
-        return BenchDataset(samples: [])
-    return BenchDatasetLoadText(pool, os.ReadFile(path))
-
-fn BenchCompare(base: BenchDataset, candidate: BenchDataset, maxRatioMilli: int64): BenchCompare =
-    var rows: BenchCompareRow[]
-    var out: BenchCompare
-    out.ok = true
-    var i: int32
-    for i in i..<base.samples.len:
-        let sample: BenchSample = base.samples[i]
-        let candidateMilli: int64 = BenchDatasetLookup(candidate, sample.benchId)
-        var row: BenchCompareRow
-        row.benchId = sample.benchId
-        row.baseNsPerOpMilli = sample.nsPerOpMilli
-        row.candidateNsPerOpMilli = candidateMilli
-        row.ratioMilli = -1
-        row.missingCandidate = candidateMilli < int64(0)
-        row.missingBaseline = false
-        row.tooSlow = false
-        if row.missingCandidate:
-            out.ok = false
-        else:
-            let ratioMilli: int64 = (candidateMilli * int64(1000)) / sample.nsPerOpMilli
-            row.ratioMilli = ratioMilli
-            if maxRatioMilli > int64(0):
-                if ratioMilli > maxRatioMilli:
-                    row.tooSlow = true
-            out.ok = false
-add(rows, row)
-    i = 0
-    for i in i..<candidate.samples.len:
-        let sample: BenchSample = candidate.samples[i]
-        if BenchDatasetLookup(base, sample.benchId) < int64(0):
-            add(rows, BenchCompareRow(
-                benchId: sample.benchId,
-                baseNsPerOpMilli: -1,
-                candidateNsPerOpMilli: sample.nsPerOpMilli,
-                ratioMilli: -1,
-                missingCandidate: false,
-                missingBaseline: true,
-                tooSlow: false
-            ))
-            out.ok = false
-    out.rows.len = rows.len
-    out.rows.cap = rows.cap
-    out.rows.buffer = rows.buffer
-    return out
-
-fn BenchMilliText(milliValue: int64): str =
-    if milliValue < 0:
-        return "missing"
-    let wholePart: int64 = milliValue / int64(1000)
-    let fracPart: int64 = milliValue % int64(1000)
-    let wholeText: str = strings.Int64ToStr(wholePart)
-    var fracText: str = strings.Int64ToStr(fracPart)
-    if len(fracText) == 1:
-        fracText = strutil.Join(["00", fracText], "")
-    elif len(fracText) == 2:
-        fracText = strutil.Join(["0", fracText], "")
-    return strutil.Join([wholeText, ".", fracText], "")
-
-fn BenchCompareReport(pool: langintern.InternPool, compare: BenchCompare): str =
-    var rows: str[]
-    add(rows, "bench base_ns cand_ns ratio")
-    for i in 0..<compare.rows.len:
-        let row: BenchCompareRow = compare.rows[i]
-        let benchNameRes = langintern.LookupIntern(pool, row.benchId)
-        var benchName: str = "unknown"
-        if IsOk(benchNameRes):
-            benchName = Value(benchNameRes)
-        var ratioText: str = "NA"
-        if row.ratioMilli >= int64(0):
-            ratioText = BenchMilliText(row.ratioMilli)
-        add(rows,
-            strutil.Join([benchName, " ", BenchMilliText(row.baseNsPerOpMilli), " ", BenchMilliText(row.candidateNsPerOpMilli), " ", ratioText], "")
-        )
-    if compare.ok:
-        add(rows, " compare: ok")
+fn PerfWitnessCollectorCollectWitness(collector: var PerfWitnessCollector, isParallel: bool, witness: PerfWitness) =
+    if isParallel:
+        collector.parallel = witness
     else:
-        add(rows, " compare: failed")
-    return strutil.Join([strutil.Join(rows, "\n"), "\n"], "")
+        collector.serial = witness
+
+fn PerfWitnessCollectorCompareWitness(collector: PerfWitnessCollector): str =
+    var out = ""
+    out = strutil.Join([out, "perf_witness_compare\n"], "")
+    out = strutil.Join([out, "metric,serial,parallel,ratio\n"], "")
+
+    let wallRatio = (collector.serial.wallTimeNs * 1000) / (collector.parallel.wallTimeNs + 1)
+    out = strutil.Join([out, strutil.Join(["wall_time_ns,", strings.Int64ToStr(collector.serial.wallTimeNs), ",", strings.Int64ToStr(collector.parallel.wallTimeNs), ",", strings.Int64ToStr(wallRatio)], ""), "\n"], "")
+
+    let rssRatio = (collector.serial.rssBytes * 1000) / (collector.parallel.rssBytes + 1)
+    out = strutil.Join([out, strutil.Join(["rss_bytes,", strings.Int64ToStr(collector.serial.rssBytes), ",", strings.Int64ToStr(collector.parallel.rssBytes), ",", strings.Int64ToStr(rssRatio)], ""), "\n"], "")
+
+    out = strutil.Join([out, strutil.Join(["task_count,", strings.IntToStr(collector.serial.taskCount), ",", strings.IntToStr(collector.parallel.taskCount), ",NA"], ""), "\n"], "")
+    out = strutil.Join([out, strutil.Join(["steal_count,", strings.IntToStr(collector.serial.stealCount), ",", strings.IntToStr(collector.parallel.stealCount), ",NA"], ""), "\n"], "")
+    out = strutil.Join([out, strutil.Join(["wait_count,", strings.IntToStr(collector.serial.waitCount), ",", strings.IntToStr(collector.parallel.waitCount), ",NA"], ""), "\n"], "")
+    out = strutil.Join([out, strutil.Join(["merge_time_ns,", strings.Int64ToStr(collector.serial.mergeTimeNs), ",", strings.Int64ToStr(collector.parallel.mergeTimeNs), ",", strings.Int64ToStr((collector.serial.mergeTimeNs * 1000) / (collector.parallel.mergeTimeNs + 1))], ""), "\n"], "")
+    out = strutil.Join([out, strutil.Join(["io_time_ns,", strings.Int64ToStr(collector.serial.ioTimeNs), ",", strings.Int64ToStr(collector.parallel.ioTimeNs), ",", strings.Int64ToStr((collector.serial.ioTimeNs * 1000) / (collector.parallel.ioTimeNs + 1))], ""), "\n"], "")
+    return out
+
+fn PerfWitnessCollectorWriteWitnessReport(collector: PerfWitnessCollector, outPath: str): bool =
+    let report = PerfWitnessCollectorCompareWitness(collector)
+    return strings.WriteFile(outPath, report) == 0
+
+fn PerfWitnessCollectorCheckPerfRegression(collector: PerfWitnessCollector, maxWallRatioMilli: int64, maxRssRatioMilli: int64): bool =
+    if collector.serial.wallTimeNs <= 0 || collector.parallel.wallTimeNs <= 0:
+        return true
+    let wallRatio = (collector.serial.wallTimeNs * 1000) / collector.parallel.wallTimeNs
+    if maxWallRatioMilli > 0 && wallRatio > maxWallRatioMilli:
+        return false
+    if collector.serial.rssBytes <= 0 || collector.parallel.rssBytes <= 0:
+        return true
+    let rssRatio = (collector.serial.rssBytes * 1000) / collector.parallel.rssBytes
+    if maxRssRatioMilli > 0 && rssRatio > maxRssRatioMilli:
+        return false
+    return true
+
+fn PerfWitnessFromString(line: str, out: var PerfWitness): bool =
+    let parts = strutil.Split(line, ' ')
+    if parts.len < 14:
+        return false
+    let wallIdx = strutil.Find(parts, "wall_time_ns=")
+    let rssIdx = strutil.Find(parts, "rss_bytes=")
+    let taskIdx = strutil.Find(parts, "task_count=")
+    let stealIdx = strutil.Find(parts, "steal_count=")
+    let waitIdx = strutil.Find(parts, "wait_count=")
+    let mergeIdx = strutil.Find(parts, "merge_time_ns=")
+    let ioIdx = strutil.Find(parts, "io_time_ns=")
+    if wallIdx < 0 || rssIdx < 0:
+        return false
+    out.wallTimeNs = strutil.ParseInt64(strings.DropPrefix(parts[wallIdx], "wall_time_ns="))
+    out.rssBytes = strutil.ParseInt64(strings.DropPrefix(parts[rssIdx], "rss_bytes="))
+    if taskIdx >= 0:
+        out.taskCount = int32(strutil.ParseInt(strings.DropPrefix(parts[taskIdx], "task_count=")))
+    if stealIdx >= 0:
+        out.stealCount = int32(strutil.ParseInt(strings.DropPrefix(parts[stealIdx], "steal_count=")))
+    if waitIdx >= 0:
+        out.waitCount = int32(strutil.ParseInt(strings.DropPrefix(parts[waitIdx], "wait_count=")))
+    if mergeIdx >= 0:
+        out.mergeTimeNs = strutil.ParseInt64(strings.DropPrefix(parts[mergeIdx], "merge_time_ns="))
+    if ioIdx >= 0:
+        out.ioTimeNs = strutil.ParseInt64(strings.DropPrefix(parts[ioIdx], "io_time_ns="))
+    return true

@@ -1,18 +1,56 @@
-import std/system
-import cheng/core/lang/intern as langintern
+import std/strings
 import cheng/core/tooling/perf_gate as perfgate
 
-fn main() =
-    let pool: langintern.InternPool = langintern.InternPoolNew()
-    let base: perfgate.BenchDataset = perfgate.BenchDatasetLoadText(
-        pool,
-        "sha256 ns_per_op=10.000\nx25519 ns_per_op=20.500\n")
-    let candidate: perfgate.BenchDataset = perfgate.BenchDatasetLoadText(
-        pool,
-        "sha256 ns_per_op=10.100\nx25519 ns_per_op=20.500\n")
-    let compare: perfgate.BenchCompare = perfgate.BenchCompare(base, candidate, int64(1010))
-    assert(compare.ok, " perf gate: within threshold")
-    assert(compare.rows.len == 2, " perf gate: rows")
-    let report: str = perfgate.BenchCompareReport(pool, compare)
-    assert(report != "", " perf gate: report")
-    echo(" perf_gate_smoke ok")
+fn main(): int32 =
+    var witness: perfgate.PerfWitness = perfgate.PerfWitnessZero()
+    witness.wallTimeNs = 1000000000
+    witness.rssBytes = 104857600
+    witness.taskCount = 42
+    witness.stealCount = 3
+    witness.waitCount = 5
+    witness.mergeTimeNs = 5000000
+    witness.ioTimeNs = 2000000
+
+    var collector = perfgate.PerfWitnessCollectorNew("test")
+    perfgate.PerfWitnessCollectorCollectWitness(collector, false, witness)
+
+    var witness2: perfgate.PerfWitness = perfgate.PerfWitnessZero()
+    witness2.wallTimeNs = 60000000
+    witness2.rssBytes = 52428800
+    witness2.taskCount = 24
+    witness2.stealCount = 1
+    witness2.waitCount = 2
+    witness2.mergeTimeNs = 3000000
+    witness2.ioTimeNs = 1000000
+    perfgate.PerfWitnessCollectorCollectWitness(collector, true, witness2)
+
+    let report = perfgate.PerfWitnessCollectorCompareWitness(collector)
+    if strings.Len(report) == 0:
+        echo("perf_gate_smoke: FAIL - report empty")
+        return 1
+
+    if !perfgate.PerfWitnessCollectorCheckPerfRegression(collector, 1200, 1200):
+        echo("perf_gate_smoke: FAIL - regression false positive")
+        return 1
+
+    var witness3: perfgate.PerfWitness = perfgate.PerfWitnessZero()
+    witness3.wallTimeNs = 2000000000
+    witness3.rssBytes = 209715200
+    var collector2 = perfgate.PerfWitnessCollectorNew("test_regression")
+    perfgate.PerfWitnessCollectorCollectWitness(collector2, false, witness)
+    perfgate.PerfWitnessCollectorCollectWitness(collector2, true, witness3)
+    if perfgate.PerfWitnessCollectorCheckPerfRegression(collector2, 100, 100):
+        echo("perf_gate_smoke: FAIL - regression false negative")
+        return 1
+
+    let line = "wall_time_ns=1000000000 rss_bytes=104857600 task_count=42 steal_count=3 wait_count=5 merge_time_ns=5000000 io_time_ns=2000000"
+    var parsed: perfgate.PerfWitness = perfgate.PerfWitnessZero()
+    if !perfgate.PerfWitnessFromString(line, parsed):
+        echo("perf_gate_smoke: FAIL - parse failed")
+        return 1
+    if parsed.wallTimeNs != 1000000000 || parsed.rssBytes != 104857600 || parsed.taskCount != 42:
+        echo("perf_gate_smoke: FAIL - parse mismatch")
+        return 1
+
+    echo("perf_gate_smoke: PASS")
+    return 0

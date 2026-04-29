@@ -19,6 +19,14 @@ fn BodyIrNoAliasLocalValid(bodyIR: coreir.BodyIR,
                             slot: int32): bool =
     return slot >= 0 && slot < bodyIR.localSlots.len
 
+fn BodyIrNoAliasLocalProof(bodyIR: coreir.BodyIR,
+                            slot: int32): bool =
+    if !BodyIrNoAliasLocalValid(bodyIR, slot):
+        return false
+    let local = bodyIR.localSlots[slot]
+    return local.noAlias ||
+           coreir.IsOwnershipNoAlias(local.ownership, local.aliasClass)
+
 fn BodyIrNoAliasInvalidateAll(knownSource: var int32[]) =
     for i in 0..<knownSource.len:
         knownSource[i] = -1
@@ -110,7 +118,8 @@ fn BodyIrAnalyzeOwnership(bodyIR: var coreir.BodyIR) =
             if op.operands.len >= 1 && BodyIrNoAliasLocalValid(bodyIR, op.operands[0]):
                 refCount[op.operands[0]] = refCount[op.operands[0]] + 1
     for si in 0..<bodyIR.localSlots.len:
-        bodyIR.localSlots[si].noAlias = refCount[si] <= 1
+        let proofBacked = BodyIrNoAliasLocalProof(bodyIR, si)
+        bodyIR.localSlots[si].noAlias = proofBacked && refCount[si] <= 1
 
 fn BodyIrNoAliasRewriteOperand(op: var coreir.BodyOp,
                                 operandIndex: int32,
@@ -126,7 +135,8 @@ fn BodyIrNoAliasInvalidateTarget(op: coreir.BodyOp,
         BodyIrNoAliasInvalidateAliasesOf(op.target, knownSource)
         knownSource[op.target] = -1
 
-fn BodyIrNoAliasForwardOp(op: var coreir.BodyOp,
+fn BodyIrNoAliasForwardOp(bodyIR: coreir.BodyIR,
+                           op: var coreir.BodyOp,
                            knownSource: var int32[],
                            allowDropSelfCopy: bool,
                            dropOp: var bool) =
@@ -139,7 +149,10 @@ fn BodyIrNoAliasForwardOp(op: var coreir.BodyOp,
         if op.operands.len > 0:
             let sourceSlot = BodyIrNoAliasResolveSource(knownSource, op.operands[0])
             op.operands[0] = sourceSlot
-            BodyIrNoAliasSetKnownSource(op.target, sourceSlot, knownSource)
+            if BodyIrNoAliasLocalProof(bodyIR, sourceSlot):
+                BodyIrNoAliasSetKnownSource(op.target, sourceSlot, knownSource)
+            else:
+                BodyIrNoAliasInvalidateTarget(op, knownSource)
             if allowDropSelfCopy && op.target == sourceSlot:
                 dropOp = true
         else:
@@ -150,7 +163,10 @@ fn BodyIrNoAliasForwardOp(op: var coreir.BodyOp,
         if op.operands.len > 0:
             let sourceSlot = BodyIrNoAliasResolveSource(knownSource, op.operands[0])
             op.operands[0] = sourceSlot
-            BodyIrNoAliasSetKnownSource(op.target, sourceSlot, knownSource)
+            if BodyIrNoAliasLocalProof(bodyIR, sourceSlot):
+                BodyIrNoAliasSetKnownSource(op.target, sourceSlot, knownSource)
+            else:
+                BodyIrNoAliasInvalidateTarget(op, knownSource)
         else:
             BodyIrNoAliasInvalidateTarget(op, knownSource)
         return
@@ -213,7 +229,7 @@ fn BodyIrNoAliasForwardLocalsInBlocks(bodyIR: coreir.BodyIR): coreir.BodyIR =
         for opIndex in block.opStart..<(block.opStart + block.opCount):
             var op = out.ops[opIndex]
             var dropOp = false
-            BodyIrNoAliasForwardOp(op, knownSource, false, dropOp)
+            BodyIrNoAliasForwardOp(bodyIR, op, knownSource, false, dropOp)
             out.ops[opIndex] = op
         out.terms[block.termIndex] = BodyIrNoAliasForwardTerm(out.terms[block.termIndex],
                                                               knownSource)
@@ -230,7 +246,7 @@ fn BodyIrNoAliasForwardLocalsLinear(bodyIR: coreir.BodyIR): coreir.BodyIR =
     for opIndex in 0..<bodyIR.ops.len:
         var op = bodyIR.ops[opIndex]
         var dropOp = false
-        BodyIrNoAliasForwardOp(op, knownSource, true, dropOp)
+        BodyIrNoAliasForwardOp(bodyIR, op, knownSource, true, dropOp)
         if dropOp:
             continue
         add(out.ops, op)
