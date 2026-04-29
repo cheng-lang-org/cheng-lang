@@ -1,0 +1,53 @@
+import std/os
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/ir/core_types as ir
+
+fn main(): int32 =
+    let rootDir = os.GetCurrentDir()
+    let req = creq.CompilerRequestNew(
+        rootDir,
+        os.JoinPath(rootDir, "src/tests/local_var_stmt_general_cfg_fixture.cheng"),
+        os.JoinPath(rootDir, "artifacts/zero_exit/local_var_stmt_general_cfg_fixture.o"),
+        "arm64-apple-darwin",
+        creq.EmitObj,
+        ""
+    )
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err: str
+    assert(slplan.BuildSystemLinkPlanStub(rootDir, req, linkPlan, err),
+           " local var stmt cfg smoke: link plan")
+    var loweringPlan: lower.LoweringPlanStub
+    assert(lower.BuildLoweringPlanStub(linkPlan, loweringPlan, err),
+           " local var stmt cfg smoke: lowering plan")
+    let primary = pobj.BuildPrimaryObjectPlan(linkPlan, loweringPlan)
+    assert(primary.missingReasons.len == 0,
+           " local var stmt cfg smoke: primary missing reasons")
+    assert(primary.functionBodyIRs.len == 1,
+           " local var stmt cfg smoke: function count")
+    let bodyIR = primary.functionBodyIRs[0]
+    assert(bodyIR.localSlots.len == 2,
+           " local var stmt cfg smoke: local slot count")
+    assert(bodyIR.ops.len == 3,
+           " local var stmt cfg smoke: local op count")
+    assert(bodyIR.ops[0].kind == ir.BodyOpLoadConstTag,
+           " local var stmt cfg smoke: default zero op")
+    assert(bodyIR.ops[1].kind == ir.BodyOpLoadConstTag,
+           " local var stmt cfg smoke: literal op")
+    assert(bodyIR.ops[2].kind == ir.BodyOpCopyLocalTag,
+           " local var stmt cfg smoke: assign copy op")
+    assert(bodyIR.blocks.len == 3,
+           " local var stmt cfg smoke: block count")
+    assert(bodyIR.terms.len == 3,
+           " local var stmt cfg smoke: term count")
+    assert(bodyIR.terms[bodyIR.blocks[0].termIndex].kind == ir.BodyTermCbrTag,
+           " local var stmt cfg smoke: entry cbr")
+    assert(pobj.PrimaryBodyIrGeneralCfgWordCount(bodyIR) > 0,
+           " local var stmt cfg smoke: primary general cfg word count")
+    assert(primary.functionWordCounts[0] == pobj.PrimaryBodyIrGeneralCfgWordCount(bodyIR),
+           " local var stmt cfg smoke: plan word count")
+    echo(" local_var_stmt_general_cfg_smoke ok")
+    return 0
+

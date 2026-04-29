@@ -45474,7 +45474,7 @@ static bool cheng_seed_emit_for_statement(const ChengSeedSystemLinkPlanStub *pla
                                 local_count,
                                 start_expr,
                                 "i32",
-                                19,
+                                11,
                                 call_arg_base,
                                 string_temp_base,
                                 string_temp_stride,
@@ -45488,7 +45488,7 @@ static bool cheng_seed_emit_for_statement(const ChengSeedSystemLinkPlanStub *pla
                 start_expr);
         return false;
     }
-    cheng_seed_emit_store_slot(out, cap, &locals[counter_local_index], 19);
+    cheng_seed_emit_store_slot(out, cap, &locals[counter_local_index], 11);
     snprintf(start_label, sizeof(start_label), "L_cheng_for_start_%d", label_id);
     snprintf(continue_label, sizeof(continue_label), "L_cheng_for_continue_%d", label_id);
     snprintf(end_label, sizeof(end_label), "L_cheng_for_end_%d", label_id);
@@ -45496,7 +45496,7 @@ static bool cheng_seed_emit_for_statement(const ChengSeedSystemLinkPlanStub *pla
         return false;
     }
     cheng_seed_text_appendf(out, cap, "%s:\n", start_label);
-    cheng_seed_emit_load_slot(out, cap, &locals[counter_local_index], 19);
+    cheng_seed_emit_load_slot(out, cap, &locals[counter_local_index], 11);
     if (!cheng_seed_codegen_expr_scalar(plan,
                                 lowering,
                                 function,
@@ -45530,7 +45530,7 @@ static bool cheng_seed_emit_for_statement(const ChengSeedSystemLinkPlanStub *pla
                             end_label);
         } else {
             cheng_seed_text_appendf(out, cap,
-                            "  cmp x19, x10\n"
+                            "  cmp x11, x10\n"
                             "  b.gt %s\n",
                             end_label);
         }
@@ -45540,11 +45540,11 @@ static bool cheng_seed_emit_for_statement(const ChengSeedSystemLinkPlanStub *pla
                             "  cmpq %s, %s\n"
                             "  jge %s\n",
                             cheng_seed_x64_qreg_name(10),
-                            cheng_seed_x64_qreg_name(9),
+                            cheng_seed_x64_qreg_name(11),
                             end_label);
         } else {
             cheng_seed_text_appendf(out, cap,
-                            "  cmp x19, x10\n"
+                            "  cmp x11, x10\n"
                             "  b.ge %s\n",
                             end_label);
         }
@@ -45638,13 +45638,13 @@ static bool cheng_seed_emit_for_statement(const ChengSeedSystemLinkPlanStub *pla
             return false;
         }
         cheng_seed_text_appendf(out, cap, "%s:\n", continue_label);
-        cheng_seed_emit_load_slot(out, cap, &locals[counter_local_index], 19);
+        cheng_seed_emit_load_slot(out, cap, &locals[counter_local_index], 11);
         if (cheng_seed_active_target_is_linux_x86_64()) {
-            cheng_seed_text_appendf(out, cap, "  addq $1, %s\n", cheng_seed_x64_qreg_name(9));
+            cheng_seed_text_appendf(out, cap, "  addq $1, %s\n", cheng_seed_x64_qreg_name(11));
         } else {
-            cheng_seed_text_appendf(out, cap, "  add x19, x19, #1\n");
+            cheng_seed_text_appendf(out, cap, "  add x11, x11, #1\n");
         }
-        cheng_seed_emit_store_slot(out, cap, &locals[counter_local_index], 19);
+        cheng_seed_emit_store_slot(out, cap, &locals[counter_local_index], 11);
         cheng_seed_emit_jump_label(out, cap, start_label);
         cheng_seed_text_appendf(out, cap, "%s:\n", end_label);
         cheng_seed_pop_loop_labels();

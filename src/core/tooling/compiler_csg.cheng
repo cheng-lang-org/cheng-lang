@@ -227,6 +227,12 @@ type
         modulePath: str
         text: str
 
+    CompilerCsgSourceTextLookupEntry =
+        sourcePath: str
+        normalizedSourcePath: str
+        modulePath: str
+        text: str
+
     CompilerLegacySourceUnit =
         sourcePath: str
         modulePath: str
@@ -1024,12 +1030,55 @@ fn CompilerCsgSourceTextLookup(overrides: CompilerCsgSourceText[],
         return true
     return false
 
+fn CompilerCsgSourceTextLookupBuild(overrides: CompilerCsgSourceText[]): CompilerCsgSourceTextLookupEntry[] =
+    var out: CompilerCsgSourceTextLookupEntry[]
+    for i in 0..<overrides.len:
+        if i % 64 == 0:
+            os.ProcessResourceGuardCheck()
+        var entry: CompilerCsgSourceTextLookupEntry
+        entry.sourcePath = overrides[i].sourcePath
+        entry.normalizedSourcePath = parser.ParserNormalizePath(overrides[i].sourcePath)
+        entry.modulePath = overrides[i].modulePath
+        entry.text = overrides[i].text
+        add(out, entry)
+    return out
+
+fn CompilerCsgSourceTextLookupFast(overrides: CompilerCsgSourceTextLookupEntry[],
+                                    sourcePath: str,
+                                    normalizedSourcePath: str,
+                                    out: var str): bool =
+    for i in 0..<overrides.len:
+        if overrides[i].sourcePath != sourcePath:
+            continue
+        out = overrides[i].text
+        return true
+    for i in 0..<overrides.len:
+        if overrides[i].normalizedSourcePath != normalizedSourcePath:
+            continue
+        out = overrides[i].text
+        return true
+    return false
+
 fn CompilerCsgRestoreSourceTextOverrides(overrides: CompilerCsgSourceText[],
                                            sourceTexts: var TypedExprSourceText[]) =
     for i in 0..<sourceTexts.len:
         var sourceText = sourceTexts[i]
         var overrideText = ""
         if !CompilerCsgSourceTextLookup(overrides, sourceText.sourcePath, overrideText):
+            continue
+        sourceText.text = overrideText
+        sourceTexts[i] = sourceText
+
+fn CompilerCsgRestoreSourceTextOverridesFast(overrides: CompilerCsgSourceTextLookupEntry[],
+                                               sourceTexts: var TypedExprSourceText[]) =
+    for i in 0..<sourceTexts.len:
+        var sourceText = sourceTexts[i]
+        let normalizedSourcePath = parser.ParserNormalizePath(sourceText.sourcePath)
+        var overrideText = ""
+        if !CompilerCsgSourceTextLookupFast(overrides,
+                                             sourceText.sourcePath,
+                                             normalizedSourcePath,
+                                             overrideText):
             continue
         sourceText.text = overrideText
         sourceTexts[i] = sourceText
@@ -1048,6 +1097,21 @@ fn CompilerCsgSourceModulePath(workspaceRoot: str,
                                                                          packageRoot,
                                                                          externalPackageRoots,
                                                                          sourcePath)
+
+fn CompilerCsgSourceModulePathFast(workspaceRoot: str,
+                                    packageRoot: str,
+                                    externalPackageRoots: parser.ParserExternalPackageRoot[],
+                                    overrides: CompilerCsgSourceTextLookupEntry[],
+                                    sourcePath: str): str =
+    for i in 0..<overrides.len:
+        if overrides[i].sourcePath != sourcePath:
+            continue
+        if overrides[i].modulePath.len > 0:
+            return overrides[i].modulePath
+    return parser.ParserSourcePathToModulePathWithExternalPackageRoots(workspaceRoot,
+                                                                        packageRoot,
+                                                                        externalPackageRoots,
+                                                                        sourcePath)
 
 fn CompilerCsgIsBrowserAbiSupportModule(modulePath: str): bool =
     if modulePath == browsercodec.BrowserContentCodecModulePath():
@@ -1715,6 +1779,7 @@ fn CompilerCsgExprLayerForProfile(sourcePath: str,
                                    currentProfile: parser.NormalizedExprCallProfile,
                                    profiles: parser.NormalizedExprCallProfile[],
                                    profileIndexLookup: parser.ParserSourcePathIndexLookup,
+                                   profileCallLookupCache: var parser.ParserProfileCallLookupCacheEntry[],
                                    layer: var parser.NormalizedExprLayer): Result[bool] =
     if sourcePath == "":
         return Err[bool]("missing source path")
@@ -1729,7 +1794,6 @@ fn CompilerCsgExprLayerForProfile(sourcePath: str,
     parser.ParserTextLookupAddAllExact(knownCallLookup, localCallNames)
     parser.ParserTextLookupAddAllExact(knownCallLookup, externalCallNames)
     parser.ParserTextLookupAddAllExact(knownCallLookup, importcCallNames)
-    var profileCallLookupCache = parser.ParserBuildProfileCallLookupCache(profiles)
     var inTypeBlock = false
     var typeBlockIndent: int32 = -1
     for i in 0..<currentProfile.lines.len:
@@ -1944,17 +2008,18 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
     var typedSourceTexts: TypedExprSourceText[]
     var exprCallProfiles: parser.NormalizedExprCallProfile[]
     let externalPackageRoots = slplan.SystemLinkPlanExternalPackageRoots(linkPlan)
+    let sourceTextLookup = CompilerCsgSourceTextLookupBuild(sourceTextOverrides)
     for i in 0..<linkPlan.sourceClosurePaths.len:
         if i % 64 == 0:
             os.ProcessResourceGuardCheck()
         let sourcePath = linkPlan.sourceClosurePaths[i]
         add(orderedSources, sourcePath)
         add(orderedSourceModules,
-            CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
-                                          linkPlan.packageRoot,
-                                          externalPackageRoots,
-                                          sourceTextOverrides,
-                                          sourcePath))
+            CompilerCsgSourceModulePathFast(linkPlan.workspaceRoot,
+                                             linkPlan.packageRoot,
+                                             externalPackageRoots,
+                                             sourceTextLookup,
+                                             sourcePath))
     CompilerCsgSortSourcePathModulePairs(orderedSources, orderedSourceModules)
     for sourceIndex in 0..<orderedSources.len:
         if sourceIndex % 16 == 0:
@@ -1967,7 +2032,8 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
         if ownerModuleNodeId <= 0:
             continue
         var text = ""
-        if !CompilerCsgSourceTextLookup(sourceTextOverrides, sourcePath, text):
+        let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+        if !CompilerCsgSourceTextLookupFast(sourceTextLookup, sourcePath, normalizedSourcePath, text):
             text = chengpath.ReadTextFile("", sourcePath)
         add(typedSourceTexts, texpr.TypedExprSourceTextNewWithExternalPackageRoots(linkPlan.workspaceRoot,
                                                                                       linkPlan.packageRoot,
@@ -1990,6 +2056,7 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
     parser.ParserBindImportEdgeTargetProfileIndices(exprCallProfiles, profileIndexLookup)
     var externalVisibleNameCache: parser.ParserTextSeqCacheEntry[]
     var externalQualifiedNameCache: parser.ParserQualifiedTextSeqCacheEntry[]
+    var profileCallLookupCache = parser.ParserBuildProfileCallLookupCache(exprCallProfiles)
     for sourceIndex in 0..<exprCallProfiles.len:
         if sourceIndex % 16 == 0:
             os.ProcessResourceGuardCheck()
@@ -2016,6 +2083,7 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
                                                             profile,
                                                             exprCallProfiles,
                                                             profileIndexLookup,
+                                                            profileCallLookupCache,
                                                             sourceExprLayer)
         if IsErr(sourceExprRes):
             err = Error(sourceExprRes)
@@ -2114,7 +2182,7 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
             return false
         err = " compiler csg: typed expr build failed"
         return false
-    CompilerCsgRestoreSourceTextOverrides(sourceTextOverrides, typedSourceTexts)
+    CompilerCsgRestoreSourceTextOverridesFast(sourceTextLookup, typedSourceTexts)
     var typedIr: texpr.TypedExprIr
     var typedIrErr = ""
     if !texpr.TypedExprBuildIrWithFacts(typedSourceTexts, typedExprFacts, typedIr, typedIrErr):
@@ -2295,25 +2363,26 @@ fn CompilerCsgReport(csg: CompilerCsg): str =
     var out = ""
     let typedExprFacts = csg.typedExprFacts
     let loweringRules = texpr.TypedExprLoweringRulesFromFacts(typedExprFacts)
+    let exprCounts = parser.NormalizedExprLayerKindCountsBuild(csg.exprLayer)
     out = strutil.Join([out, "version=1\n"], "")
     out = strutil.Join([out, "package_id=", csg.packageId, "\n"], "")
     out = strutil.Join([out, "source_bundle_cid=", layout.FixedBytes32Hex(csg.sourceBundleCid), "\n"], "")
     out = strutil.Join([out, "expr_surface_source_count=", IntToStr(csg.exprLayer.sourceCount), "\n"], "")
-    out = strutil.Join([out, "expr_surface_expr_count=", IntToStr(parser.NormalizedExprLayerExprCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_if_count=", IntToStr(parser.NormalizedExprLayerIfCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_range_count=", IntToStr(parser.NormalizedExprLayerRangeCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_comprehension_count=", IntToStr(parser.NormalizedExprLayerComprehensionCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_fmt_count=", IntToStr(parser.NormalizedExprLayerStrFormatCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_result_intrinsic_count=", IntToStr(parser.NormalizedExprLayerResultIntrinsicCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_try_count=", IntToStr(parser.NormalizedExprLayerTryCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_default_init_count=", IntToStr(parser.NormalizedExprLayerDefaultInitCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_constructor_count=", IntToStr(parser.NormalizedExprLayerConstructorCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_return_count=", IntToStr(parser.NormalizedExprLayerReturnCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_assign_count=", IntToStr(parser.NormalizedExprLayerAssignCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_if_stmt_count=", IntToStr(parser.NormalizedExprLayerIfStmtCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_elif_stmt_count=", IntToStr(parser.NormalizedExprLayerElifStmtCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_else_stmt_count=", IntToStr(parser.NormalizedExprLayerElseStmtCount(csg.exprLayer)), "\n"], "")
-    out = strutil.Join([out, "expr_surface_for_stmt_count=", IntToStr(parser.NormalizedExprLayerForStmtCount(csg.exprLayer)), "\n"], "")
+    out = strutil.Join([out, "expr_surface_expr_count=", IntToStr(exprCounts.exprCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_if_count=", IntToStr(exprCounts.ifCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_range_count=", IntToStr(exprCounts.rangeCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_comprehension_count=", IntToStr(exprCounts.comprehensionCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_fmt_count=", IntToStr(exprCounts.strFormatCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_result_intrinsic_count=", IntToStr(exprCounts.resultIntrinsicCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_try_count=", IntToStr(exprCounts.tryCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_default_init_count=", IntToStr(exprCounts.defaultInitCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_constructor_count=", IntToStr(exprCounts.constructorCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_return_count=", IntToStr(exprCounts.returnCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_assign_count=", IntToStr(exprCounts.assignCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_if_stmt_count=", IntToStr(exprCounts.ifStmtCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_elif_stmt_count=", IntToStr(exprCounts.elifStmtCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_else_stmt_count=", IntToStr(exprCounts.elseStmtCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_for_stmt_count=", IntToStr(exprCounts.forStmtCount), "\n"], "")
     out = strutil.Join([out, "expr_surface_question_residual_count=", IntToStr(csg.exprLayer.questionResidualCount), "\n"], "")
     out = strutil.Join([out, texpr.TypedExprReportText(typedExprFacts, loweringRules)], "")
     out = strutil.Join([out, CompilerCsgEgraphActiveContractReport(), "\n"], "")

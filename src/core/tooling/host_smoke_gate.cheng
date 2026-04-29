@@ -1,4 +1,5 @@
 import std/os
+import std/parseutils
 import std/strings
 import std/strutils as strutil
 import cheng/core/tooling/host_ops as hostops
@@ -66,6 +67,7 @@ fn HostSmokeDefaultSmokes(): str[] =
         "build_backend_driver_report_smoke",
         "backend_driver_resource_guard_contract_smoke",
         "compiler_budget_contract_smoke",
+        "host_smoke_gate_contract_smoke",
         "runtime_c_baseline_contract_smoke",
         "thread_atomic_orc_runtime_gate_smoke",
         "runtime_link_input_surface_smoke",
@@ -139,6 +141,32 @@ fn HostSmokeRunTimeoutSec(smokeName: str): int32 =
         return 420
     return 90
 
+fn HostSmokeReportValue(reportText: str,
+                         key: str): str =
+    let prefix = strutil.Join([key, "="], "")
+    let lines = strutil.Split(reportText, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        if strutil.StartsWith(line, prefix):
+            return chengpath.TextSlice(line, len(prefix), len(line) - len(prefix))
+    return ""
+
+fn HostSmokeReportPositiveInt(reportText: str,
+                               key: str,
+                               outValue: var int32): bool =
+    let valueText = HostSmokeReportValue(reportText, key)
+    if len(valueText) <= 0:
+        HostSmokePrintErr(strutil.Join(["host smokes: missing report field: ", key], ""))
+        return false
+    let parsed = parseutils.ParseInt32(valueText, outValue)
+    if parsed != len(valueText):
+        HostSmokePrintErr(strutil.Join(["host smokes: invalid integer report field: ", key], ""))
+        return false
+    if outValue <= 0:
+        HostSmokePrintErr(strutil.Join(["host smokes: non-positive report field: ", key], ""))
+        return false
+    return true
+
 fn HostSmokeCompileReportOk(root: str,
                               smokeName: str,
                               reportPath: str): bool =
@@ -148,10 +176,14 @@ fn HostSmokeCompileReportOk(root: str,
         HostSmokePrintErr(strutil.Join(["host smokes: missing compile report: ", reportPath], ""))
         return false
     let reportText = os.ReadFile(reportPath)
-    if strings.StrContains(reportText, "system_link_exec_runtime_standalone_no_runtime=1"):
+    if HostSmokeReportValue(reportText, "system_link_exec_runtime_execute") != "1":
+        HostSmokePrintErr("host smokes: thread/atomic/ORC gate missing runtime execute marker")
+        return false
+    if HostSmokeReportValue(reportText, "system_link_exec_runtime_standalone_no_runtime") == "1":
         HostSmokePrintErr("host smokes: thread/atomic/ORC gate compiled through standalone no-runtime path")
         return false
-    if strings.StrContains(reportText, "provider_object_count=0"):
+    var providerCount: int32
+    if !HostSmokeReportPositiveInt(reportText, "provider_object_count", providerCount):
         HostSmokePrintErr("host smokes: thread/atomic/ORC gate compiled without runtime providers")
         return false
     return true
@@ -163,12 +195,15 @@ fn HostSmokeCompileEnv(): str[] =
     add(out, "CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1")
     add(out, "BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0")
     add(out, "BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0")
-    add(out, "CHENG_NO_BACKEND_DRIVER_HANDOFF=1")
     add(out, "CHENG_PROGRESS=1")
     add(out, "CHENG_PROCESS_MAX_RSS_BYTES=8589934592")
     return out
 
 fn HostSmokeExpectedRunMarker(smokeName: str): str =
+    if smokeName == "host_smoke_gate_contract_smoke":
+        return " host_smoke_gate_contract_smoke ok"
+    if smokeName == "thread_atomic_orc_runtime_gate_smoke":
+        return " thread_atomic_orc_runtime_gate_smoke ok"
     if smokeName == "function_task_contract_smoke":
         return " function_task_contract_smoke ok"
     if smokeName == "function_task_executor_contract_smoke":

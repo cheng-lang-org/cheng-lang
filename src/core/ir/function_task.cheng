@@ -1,9 +1,10 @@
 # Function task model: pure Cheng data types for function-level parallel compilation.
-# Phase 1: types and deterministic serial execution (jobs=1).
-# No threading, no raw ptr/cast, no C bridge in this module.
+# Phase 3: work-stealing scheduler foundation. Serial (jobs=1) remains deterministic.
+# No raw ptr/cast, no C bridge in this module.
 
 import cheng/core/ir/core_types as coreir
 import std/strutils as strutil
+import std/sync as sync
 
 type
     UirFnTask =
@@ -185,6 +186,20 @@ type
         taskCount: int32
         errorCount: int32
         firstError: str
+
+    WorkStealingQueue = ref
+        tasks: FunctionTask[]
+        head: int32
+        tail: int32
+        mutex: sync.Mutex[int32]
+
+    FunctionTaskWorkerPool = ref
+        queues: WorkStealingQueue[]
+        workerCount: int32
+        results: FunctionTaskResult[]
+        resultMutex: sync.Mutex[int32]
+        activeWorkers: int32
+        activeMutex: sync.Mutex[int32]
 
 const
     FunctionTaskScheduleSerial = "serial"
@@ -707,3 +722,98 @@ fn FunctionTaskMergeReportSetError(report: var FunctionTaskMergeReport,
     report.errorCount = report.errorCount + 1
     if report.firstError.len <= 0:
         report.firstError = msg
+
+# -- Work-stealing queue operations --
+
+fn WorkStealingQueueNew(): WorkStealingQueue =
+    var q: WorkStealingQueue = new[WorkStealingQueue]()
+    if q != nil:
+        q.head = 0
+        q.tail = 0
+        q.mutex = sync.mutexNew(0)
+    return q
+
+fn WorkStealingQueuePush(q: var WorkStealingQueue, task: FunctionTask): bool =
+    if q == nil:
+        return false
+    let _ = sync.mutexLock(q.mutex)
+    add(q.tasks, task)
+    q.tail = q.tasks.len
+    sync.mutexUnlock(q.mutex)
+    return true
+
+fn WorkStealingQueuePop(q: var WorkStealingQueue): FunctionTask =
+    var empty: FunctionTask
+    empty.funcIndex = InvalidFunctionIndex()
+    if q == nil:
+        return empty
+    let _ = sync.mutexLock(q.mutex)
+    if q.tail <= q.head:
+        sync.mutexUnlock(q.mutex)
+        return empty
+    q.tail = q.tail - 1
+    let task = q.tasks[q.tail]
+    sync.mutexUnlock(q.mutex)
+    return task
+
+fn WorkStealingQueueSteal(q: var WorkStealingQueue): FunctionTask =
+    var empty: FunctionTask
+    empty.funcIndex = InvalidFunctionIndex()
+    if q == nil:
+        return empty
+    let _ = sync.mutexLock(q.mutex)
+    if q.tail <= q.head:
+        sync.mutexUnlock(q.mutex)
+        return empty
+    let task = q.tasks[q.head]
+    q.head = q.head + 1
+    sync.mutexUnlock(q.mutex)
+    return task
+
+fn WorkStealingQueueEmpty(q: var WorkStealingQueue): bool =
+    if q == nil:
+        return true
+    let _ = sync.mutexLock(q.mutex)
+    let empty = q.tail <= q.head
+    sync.mutexUnlock(q.mutex)
+    return empty
+
+fn FunctionTaskWorkerPoolNew(workerCount: int32): FunctionTaskWorkerPool =
+    var pool: FunctionTaskWorkerPool = new[FunctionTaskWorkerPool]()
+    if pool != nil:
+        pool.workerCount = workerCount
+        pool.resultMutex = sync.mutexNew(0)
+        pool.activeMutex = sync.mutexNew(0)
+        pool.activeWorkers = 0
+    return pool
+
+fn FunctionTaskWorkerPoolAddResult(pool: var FunctionTaskWorkerPool,
+                                    result: FunctionTaskResult) =
+    if pool == nil:
+        return
+    let _ = sync.mutexLock(pool.resultMutex)
+    add(pool.results, result)
+    sync.mutexUnlock(pool.resultMutex)
+
+fn FunctionTaskWorkerPoolWorkerStart(pool: var FunctionTaskWorkerPool) =
+    if pool == nil:
+        return
+    let _ = sync.mutexLock(pool.activeMutex)
+    pool.activeWorkers = pool.activeWorkers + 1
+    sync.mutexUnlock(pool.activeMutex)
+
+fn FunctionTaskWorkerPoolWorkerDone(pool: var FunctionTaskWorkerPool) =
+    if pool == nil:
+        return
+    let _ = sync.mutexLock(pool.activeMutex)
+    if pool.activeWorkers > 0:
+        pool.activeWorkers = pool.activeWorkers - 1
+    sync.mutexUnlock(pool.activeMutex)
+
+fn FunctionTaskWorkerPoolAllDone(pool: var FunctionTaskWorkerPool): bool =
+    if pool == nil:
+        return true
+    let _ = sync.mutexLock(pool.activeMutex)
+    let done = pool.activeWorkers <= 0
+    sync.mutexUnlock(pool.activeMutex)
+    return done

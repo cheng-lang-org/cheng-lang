@@ -1,0 +1,56 @@
+import std/os
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/ir/core_types as ir
+
+fn main(): int32 =
+    let rootDir = os.GetCurrentDir()
+    let req = creq.CompilerRequestNew(
+        rootDir,
+        os.JoinPath(rootDir, "src/tests/stmt_call_general_cfg_fixture.cheng"),
+        os.JoinPath(rootDir, "artifacts/zero_exit/stmt_call_general_cfg_fixture.o"),
+        "arm64-apple-darwin",
+        creq.EmitObj,
+        ""
+    )
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err: str
+    assert(slplan.BuildSystemLinkPlanStub(rootDir, req, linkPlan, err),
+           " stmt call cfg smoke: link plan")
+    var loweringPlan: lower.LoweringPlanStub
+    assert(lower.BuildLoweringPlanStub(linkPlan, loweringPlan, err),
+           " stmt call cfg smoke: lowering plan")
+    let primary = pobj.BuildPrimaryObjectPlan(linkPlan, loweringPlan)
+    assert(primary.missingReasons.len == 0,
+           " stmt call cfg smoke: primary missing reasons")
+    assert(primary.functionBodyIRs.len >= 2,
+           " stmt call cfg smoke: function count")
+    var bodyIndex: int32 = -1
+    for fi in 0..<primary.functionBodyIRs.len:
+        let candidate = primary.functionBodyIRs[fi]
+        for oi in 0..<candidate.ops.len:
+            if candidate.ops[oi].kind == ir.BodyOpCallTag:
+                bodyIndex = fi
+                break
+        if bodyIndex >= 0:
+            break
+    assert(bodyIndex >= 0,
+           " stmt call cfg smoke: body with call")
+    let bodyIR = primary.functionBodyIRs[bodyIndex]
+    assert(bodyIR.ops.len >= 1,
+           " stmt call cfg smoke: op count")
+    var hasCall = false
+    for oi in 0..<bodyIR.ops.len:
+        if bodyIR.ops[oi].kind == ir.BodyOpCallTag:
+            hasCall = true
+            break
+    assert(hasCall,
+           " stmt call cfg smoke: call op")
+    assert(pobj.PrimaryBodyIrGeneralCfgWordCount(bodyIR) > 0,
+           " stmt call cfg smoke: primary general cfg word count")
+    assert(primary.functionWordCounts[bodyIndex] == pobj.PrimaryBodyIrGeneralCfgWordCount(bodyIR),
+           " stmt call cfg smoke: plan word count")
+    echo(" stmt_call_general_cfg_smoke ok")
+    return 0

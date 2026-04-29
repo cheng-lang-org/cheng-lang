@@ -904,13 +904,6 @@ fn DirectObjectEmitValidateStandaloneExecutable(plan: pobj.PrimaryObjectPlan): R
     let entryTextOffset = DirectObjectEmitStandaloneEntryTextOffset(plan)
     if entryTextOffset < 0:
         return Err[bool](" direct object emit: executable missing entry offset")
-    let functionLimit = DirectObjectEmitRealFunctionLimit(plan)
-    if DirectObjectEmitPlanDataByteCount(plan, functionLimit) > 0:
-        return Err[bool](" direct object emit: executable data segment not implemented")
-    if plan.relocSourceItemIds.len > 0 ||
-       plan.relocWordOffsets.len > 0 ||
-       plan.relocTargetSymbols.len > 0:
-        return Err[bool](" direct object emit: executable relocations not implemented")
     return Ok[bool](true)
 
 fn DirectObjectEmitStandaloneExecutable(rootDir: str,
@@ -922,8 +915,39 @@ fn DirectObjectEmitStandaloneExecutable(rootDir: str,
     if Len(outputPath) <= 0:
         return Err[DirectObjectEmitResult](" direct object emit: executable missing output path")
     let text = DirectObjectEmitStandaloneText(plan)
+    let data = DirectObjectEmitPlanData(plan, DirectObjectEmitRealFunctionLimit(plan))
     let entryTextOffset = DirectObjectEmitStandaloneEntryTextOffset(plan)
-    let writeRes = macho.MachOTextExecutableWrite(rootDir, outputPath, text, entryTextOffset)
+    let dataSize = BytesLen(data)
+    var writeRes: Result[macho.MachOObjectWriterResult]
+    if dataSize > 0:
+        writeRes = macho.MachOTextDataExecutableWrite(rootDir, outputPath, text, data, entryTextOffset)
+    else:
+        writeRes = macho.MachOTextExecutableWrite(rootDir, outputPath, text, entryTextOffset)
+    if IsErr(writeRes):
+        return Err[DirectObjectEmitResult](Error(writeRes))
+    let write = Value(writeRes)
+    var out: DirectObjectEmitResult
+    out.objectPath = write.objectPath
+    out.outputKind = DirectObjectEmitOutputKindExecutable()
+    out.bytesWritten = write.bytesWritten
+    out.symbolCount = write.symbolCount
+    out.relocCount = write.relocCount
+    out.directObjectLayoutMs = DirectObjectEmitZeroMs()
+    out.directObjectEmitMs = DirectObjectEmitZeroMs()
+    return Ok[DirectObjectEmitResult](out)
+
+fn DirectObjectEmitStandaloneExecutableWithData(rootDir: str,
+                                                  plan: pobj.PrimaryObjectPlan,
+                                                  outputPath: str): Result[DirectObjectEmitResult] =
+    let validRes = DirectObjectEmitValidateStandaloneExecutable(plan)
+    if IsErr(validRes):
+        return Err[DirectObjectEmitResult](Error(validRes))
+    if Len(outputPath) <= 0:
+        return Err[DirectObjectEmitResult](" direct object emit: executable missing output path")
+    let text = DirectObjectEmitStandaloneText(plan)
+    let data = DirectObjectEmitPlanData(plan, DirectObjectEmitRealFunctionLimit(plan))
+    let entryTextOffset = DirectObjectEmitStandaloneEntryTextOffset(plan)
+    let writeRes = macho.MachOTextDataExecutableWrite(rootDir, outputPath, text, data, entryTextOffset)
     if IsErr(writeRes):
         return Err[DirectObjectEmitResult](Error(writeRes))
     let write = Value(writeRes)

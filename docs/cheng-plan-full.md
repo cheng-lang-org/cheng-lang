@@ -13,6 +13,17 @@
 4. 路径澄清：`Linkerless` 与 `函数级并发` 仍是远景目标，不属于当前默认发布链路的全部默认行为；当前默认发布链路固定为稳定优先的 `UIR -> .o -> system-link` 收敛路径，不再将 system-link 写成备用成功路径。
 5. sidecar 路径澄清：公开 sidecar 表面已收敛为 Cheng strict-fresh contract；文档与实现都不再把 `emergency_c` 或 `dist/releases/current/cheng` 作为公开备用选项。strict sidecar/proof 的 active compile chain 还必须保持 Cheng-only contract：不得在 active surface 重新引用 `backend_driver_c_sidecar_*`、`driver_c_build_module_stage1*` 或 `backend_driver_uir_sidecar_runtime_compat.c`。
 
+### 2026-04-29 收口状态
+
+本文件的收口口径固定为“能被当前仓库命令复现”，不再把远景设计、C seed 强制刷新、旧缓存或 compile-only 结果写成完成。纯 Cheng 自举只认 `artifacts/backend_driver/cheng system-link-exec` 或 `artifacts/bootstrap/cheng.stage3 build-backend-driver` 在不设置 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 时产出可执行候选并通过 zero-exit selftest；C seed forced build 只允许作为打破陈旧 artifact 死锁的恢复动作，不能计入完成证明。
+
+本轮实测边界如下：
+
+- 已收口：`bootstrap/stage1_bootstrap.cheng`、`bootstrap/driver_bootstrap_contract.cheng` 与 cold bootstrap v2 的 `supported_commands` 对齐为 `print-contract,self-check,compile-bootstrap,bootstrap-bridge,build-backend-driver`；`stage3 self-check --in:bootstrap/stage1_bootstrap.cheng` 与 `stage3 self-check --in:bootstrap/driver_bootstrap_contract.cheng` 均通过。
+- 已收口：backend linker 源码闭包中的稳定语法回潮已清理，`elf_object_linker.cheng`、`elf_riscv64_linker.cheng`、`coff_object_linker.cheng` 不再以显式默认初始化、Nim 风格 `if ... then ... else ...` 或字符串 `+` 诊断拼接阻断 pure probe。
+- 未完成：当前 installed backend driver 的 pure self probe 已越过 `system_link_plan`、`compiler_csg`、`lowering_plan`，但在 `primary_object_plan` 复现既有 bounds/codegen artifact 污染；受控 seed 恢复继续推进到真实 plan 缺口，报告 `primary_object_unsupported_function_count=64`，首批缺口为 `stmt_var`、`stmt_if`、`stmt_for`、`stmt_let` 和通用 call/CFG 语义。该状态不得写成纯 Cheng 自举完成。
+- 下一闭环：先落通用 `TypedStmt -> BodyIR CFG -> primary/direct emit`，覆盖 `var/let` local、`if`/guard、`for` 计数循环、字符串/数组局部值、Result/Value 调用参数与多路 return-call；再以未设置 C seed forced 的 `build-backend-driver --require-rebuild` 作为完成证明。
+
 目前在最前沿的系统级语言（如 **Zig, Jai, Roc, Cranelift**）中，已经验证了这套自研破局方案。以下是为你量身定制的架构蓝图，可以让你自研的 `cheng` 语言大放异彩：
 
 命令前缀约定（文内命令可直接执行）：
@@ -90,11 +101,11 @@ LLVM 的优化是通用且保守的。它最难做好的优化是“别名分析
 | 切片 | 当前状态 | owner 文件 | 验证命令 | 完成标准 |
 | --- | --- | --- | --- | --- |
 | 基线事实锁定 | 已有 serial 起点 | `src/core/backend/primary_object_plan.cheng`、`src/core/ir/function_task*.cheng` | `rg -n 'serial_task_plan|FunctionTaskExecuteSerial|function_task_job_count' src/core/backend/primary_object_plan.cheng src/core/ir/function_task*.cheng` | 报告仍可证明 `serial_task_plan + job_count=1`，不把它写成已完成 `ws`。 |
-| `UirFnTask/UirFnTaskResult` | 待实现 | `src/core/ir/function_task.cheng`、`src/core/ir/low_uir.cheng`、`src/core/backend/lowering_plan.cheng` | `rg -n 'type[[:space:]]+UirFnTask|type[[:space:]]+UirFnTaskResult|BodyIR' src/core/ir src/core/backend/lowering_plan.cheng` | task 只含函数索引、声明序、源码 span、成本提示、泛型 epoch；result 承载产物 ID、diag、cstring、alias、generic request、profile。 |
-| `ws` 调度器 | 待实现 | `src/core/ir/function_task_executor.cheng`、`src/std/sync.cheng`、必要时 `src/core/runtime/*provider*.cheng` | 新增 `function_task_ws_determinism_smoke` 后跑 `BACKEND_JOBS=1` 与默认 jobs 的 `system-link-exec` 对照 | 真实 `function_task_schedule=ws`、`job_count>1`、worker 出错硬失败、merge 按声明序稳定。 |
-| determinism gate | 待实现 | `src/core/tooling/gate_main.cheng`、`src/core/tooling/perf_gate.cheng` | `artifacts/bootstrap/cheng.stage3 verify_backend_determinism_strict` 与 `artifacts/bootstrap/cheng.stage3 verify_backend_exe_determinism_strict` | `.o/.exe/report/reloc/cstring` 在 jobs 和环境扰动下 SHA 一致。 |
+| `UirFnTask/UirFnTaskResult` | 已落地最小模型，待接全量 selfhost 产物 | `src/core/ir/function_task.cheng`、`src/core/ir/low_uir.cheng`、`src/core/backend/lowering_plan.cheng` | `rg -n 'type[[:space:]]+UirFnTask|type[[:space:]]+UirFnTaskResult|BodyIR' src/core/ir src/core/backend/lowering_plan.cheng` | task 已包含函数索引、声明序、源码 span、成本提示、泛型 epoch；result 承载产物 ID、diag、cstring、alias、generic request、profile。完成仍需 full driver selfhost 报告证明这些字段进入真实产物合并。 |
+| `ws` 调度器 | 已落地 work-stealing 执行器，待接默认自举闭包 | `src/core/ir/function_task_executor.cheng`、`src/std/sync.cheng`、必要时 `src/core/runtime/*provider*.cheng` | `function_task_ws_determinism_smoke`；再跑 `BACKEND_JOBS=1` 与默认 jobs 的 `system-link-exec` 对照 | 真实 `function_task_schedule=ws`、`job_count>1`、worker 出错硬失败、merge 按声明序稳定。当前未通过 full backend selfhost，不能切默认。 |
+| determinism gate | 已落地最小 SHA gate/driver，严格 selfhost gate 待闭环 | `src/core/tooling/determinism_gate.cheng`、`src/core/tooling/determinism_driver.cheng`、`src/core/tooling/gate_main.cheng` | `determinism_gate_smoke`、`gate_determinism_smoke`，再跑 `artifacts/bootstrap/cheng.stage3 verify_backend_determinism_strict` 与 `artifacts/bootstrap/cheng.stage3 verify_backend_exe_determinism_strict` | `.o/.exe/report/reloc/cstring` 在 jobs 和环境扰动下 SHA 一致；strict 命令缺失或未接 full selfhost 时不得记完成。 |
 | perf witness | 待实现 | `src/core/tooling/perf_gate.cheng`、`src/core/tooling/backend_driver_dispatch_min.cheng` | `artifacts/bootstrap/cheng.stage3 verify_backend_selfhost_parallel_perf` | witness 写出 serial/ws 同输入对照、RSS、wall time、task count、steal/wait/merge 计数。 |
-| dev/release 切换 | 待实现 | `src/core/tooling/backend_driver_dispatch_min.cheng`、`src/core/tooling/compiler_request.cheng`、`src/core/backend/system_link_exec.cheng` | `print-build-plan`、jobs=1/jobs=N 的 `ordinary_zero_exit_fixture`、`primary_object_codegen_smoke`、`program_selfhost_smoke` | dev 先切；release 需额外证明 object-first/system-link 产物 SHA、reloc、真实退出码一致。 |
+| dev/release 切换 | 已落地模式模型，待接 CLI 和发布门禁 | `src/core/backend/compile_mode_switch.cheng`、`src/core/tooling/backend_driver_dispatch_min.cheng`、`src/core/tooling/compiler_request.cheng`、`src/core/backend/system_link_exec.cheng` | `print-build-plan`、jobs=1/jobs=N 的 `ordinary_zero_exit_fixture`、`primary_object_codegen_smoke`、`program_selfhost_smoke` | dev 先切；release 需额外证明 object-first/system-link 产物 SHA、reloc、真实退出码一致。未通过 full selfhost 前不得宣布默认切换。 |
 
 禁做项：不得把未完成的 `ws` 写成默认已实现；不得让 `serial` 接管 `ws` 错误后算成功；不得在 task 内复制完整 `BodyIR`；不得改 direct writer 重新猜 relocation；不得用 mock、旧缓存或 compile-only 结果当通过。
 

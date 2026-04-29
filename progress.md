@@ -1,5 +1,6 @@
 # 当前进度
 
+- 2026-04-29 收口复核：`stage3 self-check --in:bootstrap/stage1_bootstrap.cheng` 与 `stage3 self-check --in:bootstrap/driver_bootstrap_contract.cheng` 已通过，cold bootstrap `supported_commands` 收口为 `print-contract,self-check,compile-bootstrap,bootstrap-bridge,build-backend-driver`；`docs/cheng-plan-full.md` 已补 pure self 完成口径。pure self probe 已越过 parser/CSG/lowering，但当前 installed driver 仍在 `primary_object_plan` 复现旧 bounds/codegen 污染；受控 seed 恢复到真实 plan 缺口，报告 `primary_object_unsupported_function_count=64`，首批缺口为 `stmt_var/stmt_if/stmt_for/stmt_let`，因此不能宣称全量纯 Cheng backend driver 自举完成。
 - `bootstrap/cheng_seed.c` 已完成命名清理，并能用 `cc -std=c11 -O2 -Wall -Wextra -pedantic` 构建 `artifacts/bootstrap/cheng.stage0`。
 - `artifacts/bootstrap/cheng.stage0 bootstrap-bridge` 已通过。
 - `artifacts/bootstrap/cheng.stage3 status` 已确认主入口指向 `src/core/tooling/compiler_main.cheng`。

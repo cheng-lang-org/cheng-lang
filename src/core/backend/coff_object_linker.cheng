@@ -10,6 +10,7 @@ import std/os
 import std/result
 import std/seqs
 import std/strings
+import std/strformat
 import cheng/core/backend/aarch64_encode
 import cheng/core/backend/linker_shared_core
 
@@ -210,7 +211,7 @@ fn coffStrFromBytes(buf: bytes.ByteBuffer, off: uint64, size: uint64): str =
 fn coffReadFixedStr8(buf: bytes.ByteBuffer, off: uint64): str =
     if off + 8 > uint64(buf.len):
         return ""
-    var n: uint64 = 0
+    var n: uint64
     for __for_n in 0..<8:
         if bytes.bufByteAt(buf, int32(off + __for_n)) == 0:
             n = __for_n
@@ -224,7 +225,7 @@ fn coffReadCStringAt(buf: bytes.ByteBuffer, off: uint64, maxSize: uint64): str =
         return ""
     if off >= uint64(buf.len):
         return ""
-    var n: uint64 = 0
+    var n: uint64
     for __for_n in 0..<maxSize:
         if !(off + __for_n < uint64(buf.len)):
             n = __for_n
@@ -259,38 +260,38 @@ fn coffReadRelObj(path: str): Result[CoffObjFile] =
     out.path = path
     out.buf = bytes.readFileBytes(path)
     if out.buf.data == nil || out.buf.len < 20:
-        return Err[CoffObjFile]("coff_linker: failed to read obj: " + path)
+        return Err[CoffObjFile](Fmt"coff_linker: failed to read obj: {path}")
 
     let machine: uint16 = coffBufU16AtRead(out.buf, 0)
     if machine != IMAGE_FILE_MACHINE_ARM64:
-        return Err[CoffObjFile]("coff_linker: expected coff-arm64: " + path)
+        return Err[CoffObjFile](Fmt"coff_linker: expected coff-arm64: {path}")
     let nsects: uint16 = coffBufU16AtRead(out.buf, 2)
     let symPtr: uint32 = coffBufU32AtRead(out.buf, 8)
     let symCount: uint32 = coffBufU32AtRead(out.buf, 12)
     let optSize: uint16 = coffBufU16AtRead(out.buf, 16)
     if optSize != 0:
-        return Err[CoffObjFile]("coff_linker: expected relocatable obj (no optional header): " + path)
+        return Err[CoffObjFile](Fmt"coff_linker: expected relocatable obj (no optional header): {path}")
 
     let secTableOff: uint64 = uint64(20)
     let secSize: uint64 = uint64(40)
     if uint64(nsects) == 0:
-        return Err[CoffObjFile]("coff_linker: missing sections: " + path)
+        return Err[CoffObjFile](Fmt"coff_linker: missing sections: {path}")
     if secTableOff + uint64(nsects) * secSize > uint64(out.buf.len):
-        return Err[CoffObjFile]("coff_linker: section headers truncated: " + path)
+        return Err[CoffObjFile](Fmt"coff_linker: section headers truncated: {path}")
 
     let symTableOff: uint64 = uint64(symPtr)
     let symTableSize: uint64 = uint64(symCount) * uint64(18)
     if symPtr == 0 || symCount == 0:
-        return Err[CoffObjFile]("coff_linker: missing symbol table: " + path)
+        return Err[CoffObjFile](Fmt"coff_linker: missing symbol table: {path}")
     if symTableOff + symTableSize > uint64(out.buf.len):
-        return Err[CoffObjFile]("coff_linker: symbol table truncated: " + path)
+        return Err[CoffObjFile](Fmt"coff_linker: symbol table truncated: {path}")
 
     let strPtr: uint64 = symTableOff + symTableSize
     if strPtr + 4 > uint64(out.buf.len):
-        return Err[CoffObjFile]("coff_linker: missing string table: " + path)
+        return Err[CoffObjFile](Fmt"coff_linker: missing string table: {path}")
     let strSize: uint64 = uint64(coffBufU32AtRead(out.buf, int32(strPtr)))
     if strSize < 4 || strPtr + strSize > uint64(out.buf.len):
-        return Err[CoffObjFile]("coff_linker: invalid string table: " + path)
+        return Err[CoffObjFile](Fmt"coff_linker: invalid string table: {path}")
 
     out.textIndex = 0
     out.rdataIndex = 0
@@ -330,7 +331,7 @@ fn coffReadRelObj(path: str): Result[CoffObjFile] =
                 let relOff: uint64 = uint64(relPtr)
                 let relSize: uint64 = uint64(relCount) * 10
                 if relOff + relSize > uint64(out.buf.len):
-                    return Err[CoffObjFile]("coff_linker: relocations truncated: " + path)
+                    return Err[CoffObjFile](Fmt"coff_linker: relocations truncated: {path}")
                 for ri in 0..<relCount:
                     let ro: uint64 = relOff + uint64(ri) * 10
                     var r: CoffObjReloc = new(CoffObjReloc)
@@ -354,11 +355,11 @@ fn coffReadRelObj(path: str): Result[CoffObjFile] =
             out.bssSize = vsize
 
     if out.textIndex == 0:
-        return Err[CoffObjFile]("coff_linker: missing .text section: " + path)
+        return Err[CoffObjFile](Fmt"coff_linker: missing .text section: {path}")
 
     # Parse symbols.
     out.symbols = []
-    var symi: uint32 = 0
+    var symi: uint32
     for __for_guard_symi in 0..<symCount:
         if !(symi < symCount):
             break
@@ -416,7 +417,7 @@ fn coffWriteU64AtSeq(buf: var uint8[], off: uint32, v: uint64) =
 fn coffWriteFixedStr8AtSeq(buf: var uint8[], off: uint32, s: str) =
     if uint64(off) + 8 > uint64(buf.len):
         return
-    var i: int32 = 0
+    var i: int32
     if s != nil:
         for __for_guard_i in 0..<8:
             if !(i < len(s) && i < 8):
@@ -502,7 +503,7 @@ fn coffSymRvaLocal(obj: CoffObjFile, lay: CoffLinkObjLayout, sym: CoffObjSymbol,
     if sym == nil:
         return Err[uint64]("coff_linker: nil symbol")
     if sym.sect == 0:
-        return Err[uint64]("coff_linker: undefined symbol: " + sym.name)
+        return Err[uint64](Fmt"coff_linker: undefined symbol: {sym.name}")
     if obj == nil || lay == nil:
         return Err[uint64]("coff_linker: invalid layout")
     if sym.sect == obj.textIndex:
@@ -513,16 +514,16 @@ fn coffSymRvaLocal(obj: CoffObjFile, lay: CoffLinkObjLayout, sym: CoffObjSymbol,
         return Ok[uint64](dataRva + lay.dataOff + uint64(sym.value))
     if sym.sect == obj.bssIndex:
         return Ok[uint64](bssRva + lay.bssOff + uint64(sym.value))
-    return Err[uint64]("coff_linker: unsupported symbol section: " + sym.name)
+    return Err[uint64](Fmt"coff_linker: unsupported symbol section: {sym.name}")
 
 fn coffDefAdd(defs: var CoffLinkDef[], defIndex: var hashmaps.HashMapStrInt, name: str, rva: uint64): Result[bool] =
     if len(name) == 0:
         return Ok[bool](true)
-    let key: str = name + ""
-    var exists: bool = false
+    let key: str = Fmt"{name}"
+    var exists: bool
     let _existing: int32 = hashmaps.hashMapStrIntGetMut(defIndex, key, exists)
     if exists:
-        return Err[bool]("coff_linker: duplicate symbol: " + name)
+        return Err[bool](Fmt"coff_linker: duplicate symbol: {name}")
     var d: CoffLinkDef = new(CoffLinkDef)
     d.name = key
     d.rva = rva
@@ -536,10 +537,10 @@ fn coffDefLookup(defs: CoffLinkDef[], defIndex: hashmaps.HashMapStrInt, name: st
     let idxPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, name)
     let idx: int32 = idxPlus1 - 1
     if idxPlus1 <= 0 || idx < 0 || idx >= defs.len:
-        return Err[uint64]("coff_linker: unresolved symbol: " + name)
+        return Err[uint64](Fmt"coff_linker: unresolved symbol: {name}")
     let d: CoffLinkDef = defs[idx]
     if d == nil:
-        return Err[uint64]("coff_linker: unresolved symbol: " + name)
+        return Err[uint64](Fmt"coff_linker: unresolved symbol: {name}")
     return Ok[uint64](d.rva)
 
 fn coffEncBr(rn: int32): uint32 =
@@ -610,7 +611,7 @@ fn coffBuildIdataImports(idataRva: uint32, imports: CoffImport[], outImportDirSi
     for ii in 0..<imports.len:
         let imp: CoffImport = imports[ii]
         if imp != nil && len(imp.dll) > 0:
-            var found: bool = false
+            var found: bool
             let _seenDll: int32 = hashmaps.hashMapStrIntGetEx(dllIndex, imp.dll, found)
             if !found:
                 hashmaps.hashMapStrIntPut(dllIndex, imp.dll, dllNames.len)
@@ -633,7 +634,7 @@ fn coffBuildIdataImports(idataRva: uint32, imports: CoffImport[], outImportDirSi
         dllImportCounts.len = dllCount
     for di in 0..<dllCount:
         let dn: str = dllNames[di]
-        var cnt: int32 = 0
+        var cnt: int32
         for ii in 0..<imports.len:
             let imp: CoffImport = imports[ii]
             if imp != nil && (imp.dll == dn):
@@ -668,7 +669,7 @@ fn coffBuildIdataImports(idataRva: uint32, imports: CoffImport[], outImportDirSi
         let iltOff: uint32 = iltOffs[di]
         let iatOff: uint32 = iatOffs[di]
 
-        var fi: int32 = 0
+        var fi: int32
         for ii in 0..<imports.len:
             let imp: CoffImport = imports[ii]
             if imp != nil && (imp.dll == dn):
@@ -734,7 +735,7 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
 
     var rdata: uint8[]
     var dataSeg: uint8[]
-    var bssSize: uint64 = 0
+    var bssSize: uint64
     var maxBssAlign: uint64 = 1
 
     for li in 0..<objs.len:
@@ -768,7 +769,7 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
         for si0 in 0..<o0.symbols.len:
             let s0: CoffObjSymbol = o0.symbols[si0]
             if s0 != nil && s0.sect != 0 && s0.storage == IMAGE_SYM_CLASS_EXTERNAL && len(s0.name) > 0:
-                var found: bool = false
+                var found: bool
                 let _seenDef0: int32 = hashmaps.hashMapStrIntGetEx(defNames, s0.name, found)
                 if !found:
                     hashmaps.hashMapStrIntPut(defNames, s0.name, 1)
@@ -787,21 +788,21 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
             let sym0: CoffObjSymbol = o1.symbols[int32(r0.symIndex)]
             if sym0 != nil && sym0.sect == 0 && len(sym0.name) > 0:
                 if r0.rtype != IMAGE_REL_ARM64_BRANCH26:
-                    return Err[bool]("coff_linker: unsupported undefined reloc for import: " + sym0.name + " type=" + intToStr(int32(r0.rtype)))
-                var foundImp: bool = false
+                    return Err[bool](Fmt"coff_linker: unsupported undefined reloc for import: {sym0.name} type={intToStr(int32(r0.rtype))}")
+                var foundImp: bool
                 let _seenImp0: int32 = hashmaps.hashMapStrIntGetEx(importSet, sym0.name, foundImp)
                 if !foundImp:
                     hashmaps.hashMapStrIntPut(importSet, sym0.name, 1)
                     add(importNames, sym0.name)
 
     # Always import ExitProcess for the entry.
-    var hasExit: bool = false
+    var hasExit: bool
     let _seenExit: int32 = hashmaps.hashMapStrIntGetEx(importSet, "ExitProcess", hasExit)
     if !hasExit:
         hashmaps.hashMapStrIntPut(importSet, "ExitProcess", 1)
         add(importNames, "ExitProcess")
     # Keep ABI probes stable across fixtures by always materializing a CRT import.
-    var hasPuts: bool = false
+    var hasPuts: bool
     let _seenPuts: int32 = hashmaps.hashMapStrIntGetEx(importSet, "puts", hasPuts)
     if !hasPuts:
         hashmaps.hashMapStrIntPut(importSet, "puts", 1)
@@ -849,7 +850,7 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
         nextRva = coffAlignUp(nextRva + coffAlignUp(uint64(dataSeg.len), uint64(PE_SECTION_ALIGN)), uint64(PE_SECTION_ALIGN))
     let idataRva: uint64 = nextRva
 
-    var importDirSize: uint32 = 0
+    var importDirSize: uint32
     let idata: uint8[] = coffBuildIdataImports(uint32(idataRva), imports, &importDirSize)
     nextRva = coffAlignUp(nextRva + coffAlignUp(uint64(idata.len), uint64(PE_SECTION_ALIGN)), uint64(PE_SECTION_ALIGN))
     let bssRva: uint64 = hasBss ? nextRva : uint64(0)
@@ -886,7 +887,7 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
             let sym: CoffObjSymbol = o3.symbols[int32(r0.symIndex)]
             if sym == nil:
                 return Err[bool]("coff_linker: nil relocation symbol")
-            var targetRva: uint64 = 0
+            var targetRva: uint64
             if sym.sect != 0:
                 let addrRes2: Result[uint64] = coffSymRvaLocal(o3, lay3, sym, textRva, rdataRva, dataRva, bssRva)
                 if !IsOk[uint64](addrRes2):
@@ -898,21 +899,21 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
                 if defIdxPlus1 > 0 && defIdx >= 0 && defIdx < defs.len:
                     let d: CoffLinkDef = defs[defIdx]
                     if d == nil:
-                        return Err[bool]("coff_linker: unresolved symbol: " + sym.name)
+                        return Err[bool](Fmt"coff_linker: unresolved symbol: {sym.name}")
                     targetRva = d.rva
                 else:
-                    var foundImp: bool = false
+                    var foundImp: bool
                     let impIdxRaw: int32 = hashmaps.hashMapStrIntGetEx(importIndex, sym.name, foundImp)
                     var impIdx: int32 = impIdxRaw - 1
                     if !foundImp || impIdx < 0 || impIdx >= imports.len:
                         impIdx = coffFindImportByName(imports, sym.name)
                     if impIdx < 0 || impIdx >= imports.len:
-                        return Err[bool]("coff_linker: unresolved symbol: " + sym.name)
+                        return Err[bool](Fmt"coff_linker: unresolved symbol: {sym.name}")
                     if r0.rtype != IMAGE_REL_ARM64_BRANCH26:
-                        return Err[bool]("coff_linker: unsupported reloc against import: " + sym.name + " type=" + intToStr(int32(r0.rtype)))
+                        return Err[bool](Fmt"coff_linker: unsupported reloc against import: {sym.name} type={intToStr(int32(r0.rtype))}")
                     let imp: CoffImport = imports[impIdx]
                     if imp == nil:
-                        return Err[bool]("coff_linker: unresolved symbol: " + sym.name)
+                        return Err[bool](Fmt"coff_linker: unresolved symbol: {sym.name}")
                     targetRva = textRva + imp.stubOff
             let placeOff: uint64 = lay3.textOff + uint64(r0.off)
             let placeRva: uint64 = textRva + placeOff
@@ -930,7 +931,7 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
                 if !IsOk[bool](addRes):
                     return Err[bool](ErrorInfoOf[bool](addRes))
             else:
-                return Err[bool]("coff_linker: unsupported reloc type: " + intToStr(int32(r0.rtype)))
+                return Err[bool](Fmt"coff_linker: unsupported reloc type: {intToStr(int32(r0.rtype))}")
 
     # Patch _start stub calls (main + ExitProcess stub).
     let mainRvaRes: Result[uint64] = coffDefLookup(defs, defIndex, "main")
@@ -1064,7 +1065,7 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
 
     # Section headers.
     let secHdrOff: uint32 = w
-    var secIdx: uint32 = 0
+    var secIdx: uint32
 
     # .text
     coffWritePeSectionHeader(out, secHdrOff + secIdx * 40,
@@ -1132,5 +1133,5 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
         out[int32(idataRawPtr + i)] = idata[int32(i)]
 
     if !linkerCoreWriteFileAtomic(outputPath, out):
-        return Err[bool]("coff_linker: failed to write output atomically: " + outputPath)
+        return Err[bool](Fmt"coff_linker: failed to write output atomically: {outputPath}")
     return Ok[bool](true)

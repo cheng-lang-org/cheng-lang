@@ -318,6 +318,9 @@ type
         sourcePath: str
         name: str
         returnType: str
+        ffiMapPtrArg: int32
+        ffiMapLenArg: int32
+        ffiOutPtrArgs: str
 
     TypedExprImportedModule =
         qualifier: str
@@ -4595,6 +4598,47 @@ fn TypedExprLookupCallTargetReturnTypeFromFact(sourceContexts: var TypedExprSour
         return TypedExprLookupImportcReturnType(sourceContexts[targetIndex], fact.callCallee)
     return TypedExprLookupLocalFunctionReturnType(sourceContexts[targetIndex], fact.callCallee)
 
+fn TypedExprCountFunctionParams(lineRaw: str): int32 =
+    let line = chengpath.PathTrim(lineRaw)
+    let openPos = parser.ParserFindText(line, "(")
+    if openPos < 0:
+        return 0
+    let closePos = TypedExprFindMatchingParen(line, openPos)
+    if closePos <= openPos:
+        return 0
+    let paramsText = chengpath.TextSlice(line, openPos + 1, closePos - openPos - 1)
+    let trimmed = chengpath.PathTrim(paramsText)
+    if trimmed == "":
+        return 0
+    let params = TypedExprSplitTopLevelCsv(trimmed)
+    return params.len
+
+fn TypedExprValidateFfiAnnotations(decl: parser.NormalizedFunctionDecl,
+                                    paramCount: int32): str[] =
+    var errors: str[]
+    if decl.ffiMapPtrArg >= 0 || decl.ffiMapLenArg >= 0:
+        if decl.ffiMapPtrArg < 0 || decl.ffiMapLenArg < 0:
+            add(errors, Fmt"@{decl.name}: @ffi_map requires both ptr and len args")
+        else:
+            if decl.ffiMapPtrArg >= paramCount:
+                add(errors, Fmt"@{decl.name}: @ffi_map ptr arg index {decl.ffiMapPtrArg} out of range (param count={paramCount})")
+            if decl.ffiMapLenArg >= paramCount:
+                add(errors, Fmt"@{decl.name}: @ffi_map len arg index {decl.ffiMapLenArg} out of range (param count={paramCount})")
+    if decl.ffiOutPtrArgs != "":
+        let parts = TypedExprSplitTopLevelCsv(decl.ffiOutPtrArgs)
+        for i in 0..<parts.len:
+            let part = chengpath.PathTrim(parts[i])
+            if part == "":
+                continue
+            var idx: int32
+            for j in 0..<part.len:
+                let ch = part[j]
+                if ch >= '0' && ch <= '9':
+                    idx = idx * 10 + Int32(ch - '0')
+            if idx < 0 || idx >= paramCount:
+                add(errors, Fmt"@{decl.name}: @ffi_out_ptrs arg index {idx} out of range (param count={paramCount})")
+    return errors
+
 fn TypedExprFirstExprColumnAfter(ctx: var TypedExprSourceContext,
                                    lineNumber: int32,
                                    minColumn: int32): int32 =
@@ -5112,7 +5156,15 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
                 importcFn.sourcePath = source.sourcePath
                 importcFn.name = decl.name
                 importcFn.returnType = TypedExprParseFunctionReturnType(declHeader)
+                importcFn.ffiMapPtrArg = decl.ffiMapPtrArg
+                importcFn.ffiMapLenArg = decl.ffiMapLenArg
+                importcFn.ffiOutPtrArgs = decl.ffiOutPtrArgs
                 add(ctx.importcFunctions, importcFn)
+                let paramCount = TypedExprCountFunctionParams(declHeader)
+                let ffiErrors = TypedExprValidateFfiAnnotations(decl, paramCount)
+                if ffiErrors.len > 0:
+                    err = ffiErrors[0]
+                    return false
             continue
         if decl.lineIndex <= 0 || decl.lineIndex > ctx.lines.len:
             continue
@@ -6299,3 +6351,93 @@ fn TypedExprBuildFacts(sourceTexts: var TypedExprSourceText[],
         return false
     err = ""
     return true
+
+fn TypedExprCheckNoPointerSurface(line: str, lineNumber: int32, sourcePath: str): str =
+    let trimmed = chengpath.PathTrim(line)
+    if Len(trimmed) <= 0:
+        return ""
+    var i: int32
+    for i in 0..<trimmed.len:
+        if trimmed[i] == '*':
+            if i + 1 < trimmed.len:
+                let next = trimmed[i + 1]
+                if (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || next == '_':
+                    if i <= 0:
+                        return Fmt"ZRPC no-pointer violation at {sourcePath}:{lineNumber}: raw pointer type not allowed in Cheng surface. Use @ffi_map, @ffi_out_ptrs, handles, or borrows instead."
+                    let prev = trimmed[i - 1]
+                    if !((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') || prev == '_' || prev == ')'):
+                        return Fmt"ZRPC no-pointer violation at {sourcePath}:{lineNumber}: raw pointer type not allowed in Cheng surface. Use @ffi_map, @ffi_out_ptrs, handles, or borrows instead."
+        if i + 4 < trimmed.len:
+            let slice = chengpath.TextSlice(trimmed, i, 4)
+            if slice == "void":
+                if trimmed[i + 4] == '*':
+                    return Fmt"ZRPC no-pointer violation at {sourcePath}:{lineNumber}: raw pointer type not allowed in Cheng surface. Use @ffi_map, @ffi_out_ptrs, handles, or borrows instead."
+    var searchStart: int32
+    while searchStart < trimmed.len:
+        let ptrPos = parser.ParserFindText(chengpath.TextSlice(trimmed, searchStart, trimmed.len - searchStart), "ptr")
+        if ptrPos < 0:
+            break
+        let absPtrPos = searchStart + ptrPos
+        let beforeIsAlpha = absPtrPos > 0 &&
+            ((trimmed[absPtrPos - 1] >= 'a' && trimmed[absPtrPos - 1] <= 'z') ||
+             (trimmed[absPtrPos - 1] >= 'A' && trimmed[absPtrPos - 1] <= 'Z') ||
+             (trimmed[absPtrPos - 1] >= '0' && trimmed[absPtrPos - 1] <= '9') ||
+             trimmed[absPtrPos - 1] == '_')
+        let afterPtrPos = absPtrPos + 3
+        let afterIsAlpha = afterPtrPos < trimmed.len &&
+            ((trimmed[afterPtrPos] >= 'a' && trimmed[afterPtrPos] <= 'z') ||
+             (trimmed[afterPtrPos] >= 'A' && trimmed[afterPtrPos] <= 'Z') ||
+             (trimmed[afterPtrPos] >= '0' && trimmed[afterPtrPos] <= '9') ||
+             trimmed[afterPtrPos] == '_')
+        if !beforeIsAlpha && !afterIsAlpha:
+            var searchPos = absPtrPos - 1
+            while searchPos >= 0:
+                if trimmed[searchPos] == ':':
+                    return Fmt"ZRPC no-pointer violation at {sourcePath}:{lineNumber}: raw pointer type not allowed in Cheng surface. Use @ffi_map, @ffi_out_ptrs, handles, or borrows instead."
+                if trimmed[searchPos] == ',' || trimmed[searchPos] == '(':
+                    break
+                searchPos = searchPos - 1
+        searchStart = absPtrPos + 3
+    return ""
+
+fn TypedExprEnforceNoPointerPolicy(sourceText: TypedExprSourceText): str[] =
+    var violations: str[]
+    let normalizedPath = parser.ParserNormalizePath(sourceText.sourcePath)
+    if chengpath.TextContains(normalizedPath, "src/core/"):
+        return violations
+    if chengpath.TextContains(normalizedPath, "src/tooling/"):
+        return violations
+    var normalizedText = ""
+    var rewriteErr = ""
+    if !parser.ParserRewriteMultilineStringSourceText(sourceText.text, normalizedText, rewriteErr):
+        return violations
+    var decls: parser.NormalizedFunctionDecl[]
+    if !parser.ParserReadNormalizedFunctionDecls(normalizedText, decls, rewriteErr):
+        return violations
+    var importcStartLines: int32[]
+    var importcEndLines: int32[]
+    let lines = parser.ParserSplitChar(normalizedText, '\n')
+    let totalLines = lines.len
+    for i in 0..<decls.len:
+        if decls[i].importc:
+            let startLine = decls[i].lineIndex
+            var endLine: int32
+            if i + 1 < decls.len:
+                endLine = decls[i + 1].lineIndex - 1
+            else:
+                endLine = totalLines
+            add(importcStartLines, startLine)
+            add(importcEndLines, endLine)
+    for i in 0..<lines.len:
+        let lineNumber = i + 1
+        var inImportc = false
+        for j in 0..<importcStartLines.len:
+            if lineNumber >= importcStartLines[j] && lineNumber <= importcEndLines[j]:
+                inImportc = true
+                break
+        if inImportc:
+            continue
+        let violation = TypedExprCheckNoPointerSurface(lines[i], lineNumber, sourceText.sourcePath)
+        if violation != "":
+            add(violations, violation)
+    return violations

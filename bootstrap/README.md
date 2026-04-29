@@ -43,9 +43,10 @@ key = value
 - `supported_commands`
 
 `stage1_bootstrap.cheng` 现在只保留 cold bootstrap 事实，源码路径统一收进 `bootstrap/compiler_bootstrap_manifest.cheng`。
-seed 现在已支持：
+seed cold bootstrap 合同现在声明：
 
-- `print-contract` / `self-check` / `status` / `compile-bootstrap` 直接吃最小 v2 合同
+- `print-contract` / `self-check` / `compile-bootstrap` / `bootstrap-bridge` / `build-backend-driver` 直接吃最小 v2 合同
+- `system-link-exec` 是 backend driver 与 seed 内部构建恢复命令，不写入 cold bootstrap `supported_commands` 合同
 - 由 live 合同编出来的 wrapped stage0/stage1/stage2/stage3 会沿用各自 embedded contract source path，不再硬绑 `stage1_bootstrap.cheng`
 - ordinary 入口和 seed C 里的 remote compile / BFT fresh shell 也都已并回同一路径 helper，不再各自手写 `stage1_bootstrap.cheng`
 
