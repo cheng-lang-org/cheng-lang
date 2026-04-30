@@ -1,7 +1,6 @@
 import std/strings
 import std/strutils as strutil
 import std/strformat
-import std/result
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/backend/system_link_plan as slplan
 import cheng/core/backend/lowering_plan as lower
@@ -192,6 +191,23 @@ fn PrimaryStatementReturnModeNone(): int32 =
 fn PrimaryStatementReturnModeI32Const(): int32 =
     return 1
 
+fn PrimaryBodyIrIsCallSequenceReturnInt32(bodyIR: coreir.BodyIR): bool =
+    if bodyIR.callSequence.len <= 0:
+        return false
+    if bodyIR.ops.len <= 0:
+        return false
+    let lastIndex = bodyIR.ops.len - 1
+    let lastOp = bodyIR.ops[lastIndex]
+    if lastOp.kind != coreir.BodyOpReturnTag:
+        return false
+    if lastOp.operands.len <= 0:
+        return false
+    if lastOp.operands[0] == coreir.LocalI32Tag:
+        return true
+    if lastOp.operands[0] == PrimaryStatementReturnModeI32Const():
+        return true
+    return false
+
 fn PrimaryStatementReturnModeCallResultI32(): int32 =
     return 2
 
@@ -212,6 +228,264 @@ fn PrimaryStatementReturnModeStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32(): i
 
 fn PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0(): int32 =
     return texpr.StatementReturnModeCstringLiteralCallsReturnI32Const0
+
+fn PrimaryBodyIrGeneralCfgWordCount(bodyIR: coreir.BodyIR): int32 =
+    var count: int32
+    for i in 0..<bodyIR.ops.len:
+        count = count + 1
+        if bodyIR.ops[i].kind == coreir.BodyOpBranchTag:
+            count = count + 1
+    for i in 0..<bodyIR.terms.len:
+        let kind = bodyIR.terms[i].kind
+        if kind == coreir.BodyTermReturnTag:
+            count = count + 1
+        elif kind == coreir.BodyTermBrTag:
+            count = count + 1
+        elif kind == coreir.BodyTermCbrTag:
+            count = count + 2
+    return count
+
+fn PrimaryBodyIrExtractIntFromText(text: str): int32 =
+    var out: int32
+    var capturing = false
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch >= '0' && ch <= '9':
+            capturing = true
+            out = out * 10 + int32(ch) - int32('0')
+        elif capturing:
+            break
+    return out
+
+fn PrimaryBodyIrParseCondition(
+    conditionText: str,
+    var lhsText: str,
+    var rhsText: str,
+    var cmpTag: int32
+): bool =
+    var opPos: int32 = -1
+    var opLen: int32
+    var tag: int32
+    for i in 0..<len(conditionText):
+        let ch = conditionText[i]
+        if ch == '=' && i + 1 < len(conditionText) && conditionText[i + 1] == '=':
+            opPos = i; opLen = 2; tag = coreir.BodyCondI32EqTag; break
+        if ch == '!' && i + 1 < len(conditionText) && conditionText[i + 1] == '=':
+            opPos = i; opLen = 2; tag = coreir.BodyCondI32NeTag; break
+        if ch == '<' && i + 1 < len(conditionText) && conditionText[i + 1] == '=':
+            opPos = i; opLen = 2; tag = coreir.BodyCondI32LeTag; break
+        if ch == '>' && i + 1 < len(conditionText) && conditionText[i + 1] == '=':
+            opPos = i; opLen = 2; tag = coreir.BodyCondI32GeTag; break
+        if ch == '<' && (i + 1 >= len(conditionText) || conditionText[i + 1] != '='):
+            opPos = i; opLen = 1; tag = coreir.BodyCondI32LtTag; break
+        if ch == '>' && (i + 1 >= len(conditionText) || conditionText[i + 1] != '='):
+            opPos = i; opLen = 1; tag = coreir.BodyCondI32GtTag; break
+    if opPos < 0:
+        return false
+    lhsText = strings.SliceBytes(conditionText, 0, opPos)
+    var lhsEnd = len(lhsText)
+    while lhsEnd > 0 && lhsText[lhsEnd - 1] == ' ':
+        lhsEnd = lhsEnd - 1
+    lhsText = strings.SliceBytes(lhsText, 0, lhsEnd)
+    var rhsRaw = strings.SliceBytes(conditionText, opPos + opLen, len(conditionText) - opPos - opLen)
+    var rhsStart: int32
+    while rhsStart < len(rhsRaw) && rhsRaw[rhsStart] == ' ':
+        rhsStart = rhsStart + 1
+    rhsText = strings.SliceBytes(rhsRaw, rhsStart, len(rhsRaw) - rhsStart)
+    cmpTag = tag
+    return true
+
+fn PrimaryBodyIrLocalSlotNew(bodyIR: var coreir.BodyIR,
+                              slotId: int32,
+                              name: str,
+                              typeKind: int32) =
+    var ls: coreir.LocalSlot
+    ls.id = slotId
+    ls.name = name
+    ls.typeKind = typeKind
+    ls.stackOffset = 16 + slotId * 16
+    ls.ownership = coreir.OwnPlainTag
+    ls.aliasClass = coreir.AliasUnknownTag
+    ls.escapeKind = coreir.EscapeNoneTag
+    ls.noAlias = false
+    if typeKind == coreir.LocalI32Tag:
+        ls.sizeBytes = 4
+        ls.alignBytes = 4
+    elif typeKind == coreir.LocalF64Tag:
+        ls.sizeBytes = 8
+        ls.alignBytes = 8
+    elif typeKind == coreir.LocalStrTag:
+        ls.sizeBytes = 24
+        ls.alignBytes = 8
+    elif typeKind == coreir.LocalPtrTag:
+        ls.sizeBytes = 8
+        ls.alignBytes = 8
+    elif typeKind == coreir.LocalAggregateTag:
+        ls.sizeBytes = coreir.ResultStrSizeBytes
+        ls.alignBytes = coreir.ResultStrAlignBytes
+    add(bodyIR.localSlots, ls)
+
+fn PrimaryBodyIrTypeKindFromText(typeRaw: str): int32 =
+    let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
+    if normType == "float64" || normType == "f64":
+        return coreir.LocalF64Tag
+    if normType == "str":
+        return coreir.LocalStrTag
+    if normType == "cstring" || normType == "ptr" || normType == "void*":
+        return coreir.LocalPtrTag
+    if PrimaryStartsWith(normType, "Result["):
+        return coreir.LocalAggregateTag
+    return coreir.LocalI32Tag
+
+fn PrimaryBodyIrFindOrCreateSlot(bodyIR: var coreir.BodyIR,
+                                  slotNames: var str[],
+                                  name: str,
+                                  typeKind: int32): int32 =
+    for i in 0..<slotNames.len:
+        if slotNames[i] == name:
+            return i
+    let newSlot = slotNames.len
+    add(slotNames, name)
+    PrimaryBodyIrLocalSlotNew(bodyIR, newSlot, name, typeKind)
+    return newSlot
+
+fn PrimaryBuildBodyIrFromTypedStatements(
+    typedIr: texpr.TypedExprIr,
+    typedFnIndex: int32,
+    irFunction: lower.PrimaryObjectIrFunction
+): coreir.BodyIR =
+    let typedFn = typedIr.functions[typedFnIndex]
+    var stmtEnd = typedFn.statementStart + typedFn.statementCount
+    if stmtEnd > typedIr.statements.len:
+        stmtEnd = typedIr.statements.len
+    var bodyIR = coreir.BodyIRNew()
+    var slotNames: str[]
+    var callOrdinal: int32
+    var nextOpIndex: int32
+    var ifBlockStack: int32
+    var ifTrueBlockStart: int32
+    for stmtIndex in typedFn.statementStart..<stmtEnd:
+        let stmt = typedIr.statements[stmtIndex]
+        if stmt.kind == texpr.TypedExprIrStmtLocalDecl:
+            let slotType = PrimaryBodyIrTypeKindFromText(stmt.resultType)
+            let _ = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, stmt.bindingName, slotType)
+        elif stmt.kind == texpr.TypedExprIrStmtLetCall:
+            var slotId: int32 = -1
+            if len(stmt.bindingName) > 0:
+                slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                       slotNames,
+                                                       stmt.bindingName,
+                                                       PrimaryBodyIrTypeKindFromText(stmt.resultType))
+            let targetStr = stmt.callTarget
+            if len(targetStr) > 0:
+                var call: coreir.CallOp
+                call.targetSymbol = targetStr
+                call.resultSlot = slotId
+                add(bodyIR.callSequence, call)
+                var op: coreir.BodyOp
+                op.kind = coreir.BodyOpCallTag
+                op.target = slotId
+                add(op.operands, callOrdinal)
+                add(bodyIR.ops, op)
+                nextOpIndex = nextOpIndex + 1
+                callOrdinal = callOrdinal + 1
+        elif stmt.kind == texpr.TypedExprIrStmtCall:
+            let targetStr = stmt.callTarget
+            if len(targetStr) > 0:
+                var call: coreir.CallOp
+                call.targetSymbol = targetStr
+                call.resultSlot = -1
+                add(bodyIR.callSequence, call)
+                var op: coreir.BodyOp
+                op.kind = coreir.BodyOpCallTag
+                op.target = -1
+                add(op.operands, callOrdinal)
+                add(bodyIR.ops, op)
+                nextOpIndex = nextOpIndex + 1
+                callOrdinal = callOrdinal + 1
+        elif stmt.kind == texpr.TypedExprIrStmtAssign:
+            let assignText = stmt.surfaceText
+            if len(assignText) > 0:
+                var eqPos: int32 = -1
+                for si in 0..<len(assignText):
+                    if assignText[si] == '=':
+                        eqPos = si
+                        break
+                if eqPos >= 0:
+                    var lhsPart = strings.SliceBytes(assignText, 0, eqPos)
+                    while len(lhsPart) > 0 && lhsPart[len(lhsPart) - 1] == ' ':
+                        lhsPart = strings.SliceBytes(lhsPart, 0, len(lhsPart) - 1)
+                    var rhsPart = strings.SliceBytes(assignText, eqPos + 1, len(assignText) - eqPos - 1)
+                    var rhsStart: int32
+                    while rhsStart < len(rhsPart) && rhsPart[rhsStart] == ' ':
+                        rhsStart = rhsStart + 1
+                    if rhsStart < len(rhsPart):
+                        rhsPart = strings.SliceBytes(rhsPart, rhsStart, len(rhsPart) - rhsStart)
+                    let lhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, lhsPart, coreir.LocalI32Tag)
+                    let rhsConst = PrimaryBodyIrExtractIntFromText(rhsPart)
+                    let zeroText = rhsPart == "0"
+                    if rhsConst != 0 || zeroText:
+                        var loadOp: coreir.BodyOp
+                        loadOp.kind = coreir.BodyOpLoadConstTag
+                        loadOp.target = lhsSlot
+                        add(loadOp.operands, coreir.LocalI32Tag)
+                        add(loadOp.operands, rhsConst)
+                        add(bodyIR.ops, loadOp)
+                        nextOpIndex = nextOpIndex + 1
+                    else:
+                        let rhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, rhsPart, coreir.LocalI32Tag)
+                        var copyOp: coreir.BodyOp
+                        copyOp.kind = coreir.BodyOpCopyLocalTag
+                        copyOp.target = lhsSlot
+                        add(copyOp.operands, rhsSlot)
+                        add(bodyIR.ops, copyOp)
+                        nextOpIndex = nextOpIndex + 1
+        elif stmt.kind == texpr.TypedExprIrStmtReturn:
+            let returnText = stmt.surfaceText
+            if len(returnText) > 0:
+                var valText = ""
+                if PrimaryStartsWith(returnText, "return "):
+                    valText = strings.SliceBytes(returnText, 7, len(returnText) - 7)
+                else:
+                    valText = returnText
+                while len(valText) > 0 && valText[0] == ' ':
+                    valText = strings.SliceBytes(valText, 1, len(valText) - 1)
+                let constVal = PrimaryBodyIrExtractIntFromText(valText)
+                if constVal != 0 || valText == "0":
+                    var retOp: coreir.BodyOp
+                    retOp.kind = coreir.BodyOpReturnTag
+                    retOp.target = -1
+                    add(retOp.operands, PrimaryStatementReturnModeI32Const())
+                    add(retOp.operands, constVal)
+                    add(bodyIR.ops, retOp)
+                    nextOpIndex = nextOpIndex + 1
+                else:
+                    let valSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, valText, coreir.LocalI32Tag)
+                    var retOp: coreir.BodyOp
+                    retOp.kind = coreir.BodyOpReturnTag
+                    retOp.target = valSlot
+                    add(retOp.operands, coreir.LocalI32Tag)
+                    add(bodyIR.ops, retOp)
+                    nextOpIndex = nextOpIndex + 1
+        elif stmt.kind == texpr.TypedExprIrStmtIf:
+            ifBlockStack = ifBlockStack + 1
+        elif stmt.kind == texpr.TypedExprIrStmtElif:
+            ifBlockStack = ifBlockStack + 0
+        elif stmt.kind == texpr.TypedExprIrStmtElse:
+            ifBlockStack = ifBlockStack + 0
+        elif stmt.kind == texpr.TypedExprIrStmtFor:
+            ifBlockStack = ifBlockStack + 1
+    if nextOpIndex > 0 && bodyIR.terms.len <= 0 && bodyIR.blocks.len <= 0:
+        var term: coreir.BodyTerm
+        term.kind = coreir.BodyTermReturnTag
+        term.resultSlot = -1
+        if bodyIR.ops.len > 0 && bodyIR.ops[bodyIR.ops.len - 1].kind == coreir.BodyOpReturnTag:
+            term.operands = bodyIR.ops[bodyIR.ops.len - 1].operands
+        add(bodyIR.terms, term)
+        let _ = coreir.BodyIRAppendBlock(bodyIR, 0, bodyIR.ops.len, 0)
+    elif bodyIR.blocks.len <= 0 && bodyIR.terms.len > 0:
+        let _ = coreir.BodyIRAppendBlock(bodyIR, 0, bodyIR.ops.len, 0)
+    return bodyIR
 
 fn PrimaryCStringLiteralDataLabel(functionSymbol: str,
                                   callOrdinal: int32): str =
@@ -299,10 +573,178 @@ fn PrimaryFunctionWordCountForBodyKind(bodyKind: str): int32 =
     if bodyKind == texpr.BodyKindReturnI32MaddArgs:
         return 2
     if bodyKind == texpr.BodyKindStrLenFastI32:
-        return 7
+        return 8
     if bodyKind == texpr.BodyKindMainF64MulCheckExit:
         return 22
+    if bodyKind == texpr.BodyKindBackendDriverRunCommand:
+        return 29
     return 0
+
+fn PrimaryReturnI32ConstValue(bodyKind: str): int32 =
+    if PrimaryStartsWith(bodyKind, texpr.BodyKindReturnI32ConstPrefix):
+        let prefix = texpr.BodyKindReturnI32ConstPrefix
+        let raw = strings.SliceBytes(bodyKind, len(prefix), len(bodyKind) - len(prefix))
+        return int32(strutil.ParseInt(raw))
+    return 0
+
+fn PrimaryArm64MovW0ConstWord(value: int32): int32 =
+    if value < 0 || value > texpr.BodyKindReturnI32ConstMax:
+        return 1384120320
+    return 1384120320 + value * 32
+
+fn PrimaryFillReturnI32ConstWords(words: var int32[],
+                                  wordOffset: int32,
+                                  value: int32): bool =
+    if wordOffset < 0 || wordOffset + 1 >= words.len:
+        return false
+    words[wordOffset] = PrimaryArm64MovW0ConstWord(value)
+    words[wordOffset + 1] = -698416192
+    return true
+
+fn PrimaryFillEntryBridgeWords(words: var int32[],
+                               wordOffset: int32): bool =
+    if wordOffset < 0 || wordOffset + 16 >= words.len:
+        return false
+    words[wordOffset] = -788495361
+    words[wordOffset + 1] = -1459615776
+    words[wordOffset + 2] = -117436418
+    words[wordOffset + 3] = -1811939328
+    words[wordOffset + 4] = -113244191
+    words[wordOffset + 5] = -113246176
+    words[wordOffset + 6] = -1811939328
+    words[wordOffset + 7] = -1455421472
+    words[wordOffset + 8] = -1811939328
+    words[wordOffset + 9] = -1191177248
+    words[wordOffset + 10] = -113244191
+    words[wordOffset + 11] = -113246176
+    words[wordOffset + 12] = -1811939328
+    words[wordOffset + 13] = -1186982944
+    words[wordOffset + 14] = -113242114
+    words[wordOffset + 15] = -1862237185
+    words[wordOffset + 16] = -698416192
+    return true
+
+fn PrimaryFillBackendDriverRunCommandWords(words: var int32[],
+                                           wordOffset: int32): bool =
+    if wordOffset < 0 || wordOffset + 28 >= words.len:
+        return false
+    words[wordOffset] = -1447265283
+    words[wordOffset + 1] = -1862269955
+    words[wordOffset + 2] = -1811939328
+    words[wordOffset + 3] = 1895825439
+    words[wordOffset + 4] = 1409286284
+    words[wordOffset + 5] = -1811939328
+    words[wordOffset + 6] = -1463518211
+    words[wordOffset + 7] = -698416192
+    words[wordOffset + 8] = -1862253592
+    words[wordOffset + 9] = -117440225
+    words[wordOffset + 10] = -117439201
+    words[wordOffset + 11] = -117438177
+    words[wordOffset + 12] = 1384120352
+    words[wordOffset + 13] = -1811939328
+    words[wordOffset + 14] = -1862253600
+    words[wordOffset + 15] = -1811939328
+    words[wordOffset + 16] = -1191171104
+    words[wordOffset + 17] = -1862253591
+    words[wordOffset + 18] = -1182789334
+    words[wordOffset + 19] = 1895826783
+    words[wordOffset + 20] = 1409286337
+    words[wordOffset + 21] = -113245911
+    words[wordOffset + 22] = -251657921
+    words[wordOffset + 23] = 1409286240
+    words[wordOffset + 24] = -1442249760
+    words[wordOffset + 25] = -1811939328
+    words[wordOffset + 26] = -1186976800
+    words[wordOffset + 27] = -1463518211
+    words[wordOffset + 28] = -698416192
+    return true
+
+fn PrimaryFillReturnStrArg0Words(words: var int32[],
+                                 wordOffset: int32): bool =
+    if wordOffset < 0 || wordOffset + 6 >= words.len:
+        return false
+    words[wordOffset] = -113246199
+    words[wordOffset + 1] = -113245174
+    words[wordOffset + 2] = -1186983925
+    words[wordOffset + 3] = -117440247
+    words[wordOffset + 4] = -117439222
+    words[wordOffset + 5] = -1191177973
+    words[wordOffset + 6] = -698416192
+    return true
+
+fn PrimaryFillStrLenFastWords(words: var int32[],
+                              wordOffset: int32): bool =
+    if wordOffset < 0 || wordOffset + 7 >= words.len:
+        return false
+    words[wordOffset] = -113246199
+    words[wordOffset + 1] = -1275068247
+    words[wordOffset + 2] = -1182789622
+    words[wordOffset + 3] = 1895825759
+    words[wordOffset + 4] = 445305824
+    words[wordOffset + 5] = -698416192
+    words[wordOffset + 6] = 1384120320
+    words[wordOffset + 7] = -698416192
+    return true
+
+fn PrimaryFillInstructionWordsForFunction(words: var int32[],
+                                          wordOffset: int32,
+                                          wordCount: int32,
+                                          bodyKind: str): bool =
+    if wordCount <= 0:
+        return false
+    if bodyKind == texpr.BodyKindReturnZeroI32:
+        if wordCount != 2:
+            return false
+        return PrimaryFillReturnI32ConstWords(words, wordOffset, 0)
+    if PrimaryStartsWith(bodyKind, texpr.BodyKindReturnI32ConstPrefix):
+        if wordCount != 2:
+            return false
+        return PrimaryFillReturnI32ConstWords(words, wordOffset, PrimaryReturnI32ConstValue(bodyKind))
+    if bodyKind == texpr.BodyKindReturnI32Arg0:
+        if wordOffset < 0 || wordOffset >= words.len || wordCount != 1:
+            return false
+        words[wordOffset] = -698416192
+        return true
+    if texpr.TypedExprIsReturnCallBodyKind(bodyKind):
+        if wordOffset < 0 || wordOffset >= words.len || wordCount <= 0:
+            return false
+        words[wordOffset] = 335544320
+        if wordCount == 2 && wordOffset + 1 < words.len:
+            words[wordOffset + 1] = -698416192
+        return true
+    if bodyKind == texpr.BodyKindEntryBridge:
+        if wordCount != texpr.BodyKindEntryBridgeWordCount:
+            return false
+        return PrimaryFillEntryBridgeWords(words, wordOffset)
+    if bodyKind == texpr.BodyKindBackendDriverRunCommand:
+        if wordCount != 29:
+            return false
+        return PrimaryFillBackendDriverRunCommandWords(words, wordOffset)
+    if bodyKind == texpr.BodyKindReturnStrArg0:
+        if wordCount != 7:
+            return false
+        return PrimaryFillReturnStrArg0Words(words, wordOffset)
+    if bodyKind == texpr.BodyKindStrLenFastI32:
+        if wordCount != 8:
+            return false
+        return PrimaryFillStrLenFastWords(words, wordOffset)
+    return false
+
+fn PrimaryFillInstructionWords(words: var int32[],
+                               functionWordOffsets: int32[],
+                               functionWordCounts: int32[],
+                               functionBodyKinds: str[]): bool =
+    var ok = true
+    for i in 0..<functionBodyKinds.len:
+        if i >= functionWordOffsets.len || i >= functionWordCounts.len:
+            ok = false
+            continue
+        if !PrimaryFillInstructionWordsForFunction(words,
+                                                   functionWordOffsets[i],
+                                                   functionWordCounts[i],
+                                                   functionBodyKinds[i]):
+            ok = false
+    return ok
 
 fn PrimaryObjectMissingReasons(linkPlan: slplan.SystemLinkPlanStub,
                                  lowering: lower.LoweringPlanStub,
@@ -389,7 +831,7 @@ fn PrimaryObjectMissingTypedIrKind(lowering: lower.LoweringPlanStub,
     return ""
 
 fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
-                            lowering: lower.LoweringPlanStub): Result[PrimaryObjectPlan] =
+                            lowering: lower.LoweringPlanStub): PrimaryObjectPlan =
     var allSymbolNames: str[]
     var itemIds: int32[]
     var symbolNames: str[]
@@ -399,6 +841,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     var functionStatementReturnModes: int32[]
     var functionStatementReturnI32Values: int32[]
     var functionStatementCallCounts: int32[]
+    var functionBodyIRs: coreir.BodyIR[]
     var relocSourceItemIds: int32[]
     var relocWordOffsets: int32[]
     var relocTargetSymbols: str[]
@@ -423,12 +866,17 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     functionStatementReturnModes = []
     functionStatementReturnI32Values = []
     functionStatementCallCounts = []
+    functionBodyIRs = []
     relocSourceItemIds = []
     relocWordOffsets = []
     relocTargetSymbols = []
     irIndexes = PrimaryIntSeqInit(lowering.functionNames.len, -1)
     wordCounts = PrimaryIntSeqInit(lowering.functionNames.len, 0)
     reachable = PrimaryBoolSeqInit(lowering.functionNames.len, false)
+    var tempBodyIRs: coreir.BodyIR[]
+    tempBodyIRs = []
+    for _ in 0..<lowering.functionNames.len:
+        add(tempBodyIRs, coreir.BodyIRNew())
     var exportedFunctionCount: int32
     if linkPlan.emitKind == creq.EmitObj:
         for i in 0..<lowering.functionExportedFlags.len:
@@ -445,6 +893,19 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
             signatureLineNumber = lowering.primaryObjectIr.functions[irIndex].signatureLineNumber
             irIndexes[i] = irIndex
             wordCounts[i] = PrimaryFunctionWordCountForBodyKind(lowering.primaryObjectIr.functions[irIndex].bodyKind)
+            if wordCounts[i] <= 0:
+                let irFn = lowering.primaryObjectIr.functions[irIndex]
+                if irFn.bodyKind == texpr.BodyKindUnsupported && irFn.statements.len > 0:
+                    let typedFnIndex = PrimaryTypedIrFunctionIndex(lowering.typedIr,
+                                                                    sourcePath,
+                                                                    lowering.functionNames[i])
+                    if typedFnIndex >= 0:
+                        let bodyIR = PrimaryBuildBodyIrFromTypedStatements(lowering.typedIr,
+                                                                           typedFnIndex,
+                                                                           irFn)
+                        if bodyIR.ops.len > 0 || bodyIR.terms.len > 0:
+                            tempBodyIRs[i] = bodyIR
+                            wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(bodyIR)
         var symbolText = lowering.functionSymbolTexts[i]
         if i < lowering.functionExportedFlags.len &&
            i < lowering.functionExportSymbolNames.len &&
@@ -634,6 +1095,8 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                 requiredCallCount = 4
             if bodyKind == "str_i32_guard_arg0_else_call_arg0_arg1_return_result_i32":
                 requiredCallCount = 5
+            if bodyKind == texpr.BodyKindBackendDriverRunCommand:
+                requiredCallCount = 5
             if targetSymbols.len < requiredCallCount:
                 bodySemanticsMissing = true
                 if len(firstMissingFunction) <= 0:
@@ -652,6 +1115,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
         add(functionStatementReturnModes, PrimaryStatementSequenceReturnMode(bodyKind))
         add(functionStatementReturnI32Values, PrimaryStatementSequenceI32Value(bodyKind))
         add(functionStatementCallCounts, irFunction.callTargets.len)
+        add(functionBodyIRs, tempBodyIRs[i])
         if texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
            PrimaryIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
             var relocWordOffset = wordOffset
@@ -666,6 +1130,8 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                 relocWordOffset = wordOffset + 3
             elif bodyKind == "str_i32_guard_arg0_else_call_arg0_arg1_return_result_i32":
                 relocWordOffset = wordOffset + 3
+            elif bodyKind == texpr.BodyKindBackendDriverRunCommand:
+                relocWordOffset = wordOffset + 2
             add(relocSourceItemIds, itemId)
             add(relocWordOffsets, relocWordOffset)
             add(relocTargetSymbols, targetSymbols[0])
@@ -696,6 +1162,19 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                 add(relocSourceItemIds, itemId)
                 add(relocWordOffsets, wordOffset + 15)
                 add(relocTargetSymbols, targetSymbols[4])
+            if bodyKind == texpr.BodyKindBackendDriverRunCommand:
+                add(relocSourceItemIds, itemId)
+                add(relocWordOffsets, wordOffset + 5)
+                add(relocTargetSymbols, targetSymbols[1])
+                add(relocSourceItemIds, itemId)
+                add(relocWordOffsets, wordOffset + 13)
+                add(relocTargetSymbols, targetSymbols[2])
+                add(relocSourceItemIds, itemId)
+                add(relocWordOffsets, wordOffset + 15)
+                add(relocTargetSymbols, targetSymbols[3])
+                add(relocSourceItemIds, itemId)
+                add(relocWordOffsets, wordOffset + 25)
+                add(relocTargetSymbols, targetSymbols[4])
         elif bodyKind == texpr.BodyKindCstringToStrCopy:
             add(relocSourceItemIds, itemId)
             add(relocWordOffsets, wordOffset + 5)
@@ -716,6 +1195,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
         add(functionStatementReturnModes, PrimaryStatementReturnModeNone())
         add(functionStatementReturnI32Values, 0)
         add(functionStatementCallCounts, 0)
+        add(functionBodyIRs, coreir.BodyIRNew())
         totalWordCount = totalWordCount + texpr.BodyKindEntryBridgeWordCount
     plan.targetTriple = linkPlan.targetTriple
     plan.objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
@@ -734,9 +1214,35 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     plan.functionStatementReturnModes = functionStatementReturnModes
     plan.functionStatementReturnI32Values = functionStatementReturnI32Values
     plan.functionStatementCallCounts = functionStatementCallCounts
+    plan.functionBodyIRs = functionBodyIRs
     plan.instructionWords = []
     for i in 0..<totalWordCount:
         add(plan.instructionWords, 0)
+    if !PrimaryFillInstructionWords(plan.instructionWords,
+                                    functionWordOffsets,
+                                    functionWordCounts,
+                                    functionBodyKinds):
+        bodySemanticsMissing = true
+        if len(firstMissingFunction) <= 0:
+            for functionIndex in 0..<functionBodyKinds.len:
+                if functionIndex >= symbolNames.len ||
+                   functionIndex >= functionWordOffsets.len ||
+                   functionIndex >= functionWordCounts.len:
+                    continue
+                let startWord = functionWordOffsets[functionIndex]
+                let endWord = startWord + functionWordCounts[functionIndex]
+                var foundZero = false
+                for wordIndex in startWord..<endWord:
+                    if wordIndex < 0 || wordIndex >= plan.instructionWords.len:
+                        foundZero = true
+                    elif plan.instructionWords[wordIndex] == 0:
+                        foundZero = true
+                if foundZero:
+                    firstMissingFunction = symbolNames[functionIndex]
+                    firstMissingBodyKind = functionBodyKinds[functionIndex]
+                    firstMissingTypedIrKind = "instruction_word_zero"
+                    firstMissingLineNumber = 0
+                    break
     plan.dataLabels = []
     plan.dataPayloadTexts = []
     plan.relocSourceItemIds = relocSourceItemIds
@@ -756,7 +1262,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                                                         plan.instructionWords,
                                                         bodySemanticsMissing)
     plan.pipelineStage = "lowering_plan_to_primary_object_plan"
-    return Ok[PrimaryObjectPlan](plan)
+    return plan
 
 fn PrimaryObjectPlanIntListText(items: int32[]): str =
     if items.len <= 0:

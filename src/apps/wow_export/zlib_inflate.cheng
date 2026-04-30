@@ -1,15 +1,11 @@
 import std/bytes as bytes
-import std/rawmem_support as rawmem_support
 import std/result
 import std/seqs
 import std/strings as strings
 import std/strformat
-import std/system
 import std/strutils as strutil
 
 type
-    UInt8Ptr = uint8 *
-
     DeflateBitReader =
         buf: bytes.ByteBuffer
         bitPos: int32
@@ -31,14 +27,7 @@ const
     ZlibFastDecodeBits = 12
 
 fn zlibMakeByteBuffer(len: int32): bytes.ByteBuffer =
-    var out: bytes.ByteBuffer
-    if len <= 0:
-        out.len = 0
-        out.data = nil
-        return out
-    out.len = len
-    out.data = alloc(len)
-    return out
+    return bytes.NewByteBuffer(len)
 
 fn zlibMakeIntArray(count: int32, value: int32): int32[] =
     var out: int32[]
@@ -50,13 +39,12 @@ fn zlibMakeIntArray(count: int32, value: int32): int32[] =
 fn zlibByteAt(buf: bytes.ByteBuffer, idx: int32): int32 =
     if idx < 0 || idx >= buf.len:
         return -1
-    let value: uint8 = *(UInt8Ptr(rawmem_support.RawmemPtrAdd(buf.data, idx)))
-    return int32(value)
+    return bytes.BufByteAt(buf, idx)
 
 fn zlibSetByte(buf: bytes.ByteBuffer, idx: int32, value: int32) =
     if idx < 0 || idx >= buf.len:
         return
-    rawmem_support.RawmemWriteI8(buf.data, idx, int8(value & 255))
+    bytes.BufSetByte(buf, idx, value & 255)
 
 fn zlibBitMask(count: int32): int32 =
     if count <= 0:
@@ -345,20 +333,10 @@ fn zlibCopyBackReference(out: bytes.ByteBuffer,
         return Err[bool]("wowExport zlib: back-reference exceeds expected size")
     if length == 0:
         return Ok[bool](true)
-    if distance == 1:
-        let value: int32 = zlibByteAt(out, outPos - 1)
-        rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(out.data, outPos), value, length)
-        outPos = outPos + length
-        return Ok[bool](true)
     var copied: int32
     while copied < length:
-        var chunk: int32 = distance
-        if chunk > length - copied:
-            chunk = length - copied
-        rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(out.data, outPos + copied),
-            rawmem_support.RawmemPtrAdd(out.data, outPos + copied - distance),
-            chunk)
-        copied = copied + chunk
+        zlibSetByte(out, outPos + copied, zlibByteAt(out, outPos + copied - distance))
+        copied = copied + 1
     outPos = outPos + length
     return Ok[bool](true)
 

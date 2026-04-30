@@ -8382,6 +8382,91 @@ static bool cheng_seed_parse_top_level_var_binding_text(const char *statement,
                                                 char *expr_out,
                                                 size_t expr_cap);
 
+static bool cheng_seed_try_resolve_builtin_enum_member_i64(const char *expr_text,
+                                                           int64_t *value_out) {
+    char expr[4096];
+    const char *member;
+    const char *dot;
+    cheng_seed_trim_copy_text(expr_text, expr, sizeof(expr));
+    if (expr[0] == '\0' || value_out == NULL) {
+        return false;
+    }
+    dot = strrchr(expr, '.');
+    if (dot == NULL || dot[1] == '\0') {
+        return false;
+    }
+    member = dot + 1;
+#define CHENG_SEED_ENUM_MEMBER(name, value) \
+    if (strcmp(member, name) == 0) { *value_out = (value); return true; }
+    CHENG_SEED_ENUM_MEMBER("AbiNone", 0)
+    CHENG_SEED_ENUM_MEMBER("AbiScalar", 1)
+    CHENG_SEED_ENUM_MEMBER("AbiPointer", 2)
+    CHENG_SEED_ENUM_MEMBER("AbiAggregate", 3)
+    CHENG_SEED_ENUM_MEMBER("AbiVector", 4)
+    CHENG_SEED_ENUM_MEMBER("LayoutInvalid", 0)
+    CHENG_SEED_ENUM_MEMBER("LayoutVoid", 1)
+    CHENG_SEED_ENUM_MEMBER("LayoutI1", 2)
+    CHENG_SEED_ENUM_MEMBER("LayoutI8", 3)
+    CHENG_SEED_ENUM_MEMBER("LayoutI16", 4)
+    CHENG_SEED_ENUM_MEMBER("LayoutI32", 5)
+    CHENG_SEED_ENUM_MEMBER("LayoutI64", 6)
+    CHENG_SEED_ENUM_MEMBER("LayoutFixedBytes", 7)
+    CHENG_SEED_ENUM_MEMBER("LayoutArray", 8)
+    CHENG_SEED_ENUM_MEMBER("LayoutRecord", 9)
+    CHENG_SEED_ENUM_MEMBER("LayoutPointer", 10)
+    CHENG_SEED_ENUM_MEMBER("OwnInvalid", 0)
+    CHENG_SEED_ENUM_MEMBER("OwnPlain", 1)
+    CHENG_SEED_ENUM_MEMBER("OwnMove", 2)
+    CHENG_SEED_ENUM_MEMBER("OwnBorrowShared", 3)
+    CHENG_SEED_ENUM_MEMBER("OwnBorrowUnique", 4)
+    CHENG_SEED_ENUM_MEMBER("AliasUnknown", 0)
+    CHENG_SEED_ENUM_MEMBER("AliasUnique", 1)
+    CHENG_SEED_ENUM_MEMBER("AliasNoAlias", 2)
+    CHENG_SEED_ENUM_MEMBER("AliasMayAlias", 3)
+    CHENG_SEED_ENUM_MEMBER("EscapeInvalid", 0)
+    CHENG_SEED_ENUM_MEMBER("EscapeNone", 1)
+    CHENG_SEED_ENUM_MEMBER("EscapeArg", 2)
+    CHENG_SEED_ENUM_MEMBER("EscapeReturn", 3)
+    CHENG_SEED_ENUM_MEMBER("EscapeGlobal", 4)
+    CHENG_SEED_ENUM_MEMBER("ValueInvalid", 0)
+    CHENG_SEED_ENUM_MEMBER("ValueImmediate", 1)
+    CHENG_SEED_ENUM_MEMBER("ValueStack", 2)
+    CHENG_SEED_ENUM_MEMBER("ValueAddress", 3)
+    CHENG_SEED_ENUM_MEMBER("ValueBorrow", 4)
+    CHENG_SEED_ENUM_MEMBER("ValuePhi", 5)
+    CHENG_SEED_ENUM_MEMBER("ValueCallResult", 6)
+    CHENG_SEED_ENUM_MEMBER("BodyOpInvalid", 0)
+    CHENG_SEED_ENUM_MEMBER("BodyOpLoadConst", 1)
+    CHENG_SEED_ENUM_MEMBER("BodyOpCall", 2)
+    CHENG_SEED_ENUM_MEMBER("BodyOpBinOp", 3)
+    CHENG_SEED_ENUM_MEMBER("BodyOpCmp", 4)
+    CHENG_SEED_ENUM_MEMBER("BodyOpBranch", 5)
+    CHENG_SEED_ENUM_MEMBER("BodyOpReturn", 6)
+    CHENG_SEED_ENUM_MEMBER("BodyOpLoadLocal", 7)
+    CHENG_SEED_ENUM_MEMBER("BodyOpStoreLocal", 8)
+    CHENG_SEED_ENUM_MEMBER("BodyOpCopyLocal", 9)
+    CHENG_SEED_ENUM_MEMBER("BodyOpResultProject", 10)
+    CHENG_SEED_ENUM_MEMBER("LocalInvalid", 0)
+    CHENG_SEED_ENUM_MEMBER("LocalI32", 1)
+    CHENG_SEED_ENUM_MEMBER("LocalF64", 2)
+    CHENG_SEED_ENUM_MEMBER("LocalStr", 3)
+    CHENG_SEED_ENUM_MEMBER("LocalPtr", 4)
+    CHENG_SEED_ENUM_MEMBER("BodyTermInvalid", 0)
+    CHENG_SEED_ENUM_MEMBER("BodyTermReturn", 1)
+    CHENG_SEED_ENUM_MEMBER("BodyTermBr", 2)
+    CHENG_SEED_ENUM_MEMBER("BodyTermCbr", 3)
+    CHENG_SEED_ENUM_MEMBER("BodyCondInvalid", 0)
+    CHENG_SEED_ENUM_MEMBER("BodyCondLocalNonZero", 1)
+    CHENG_SEED_ENUM_MEMBER("BodyCondI32Eq", 2)
+    CHENG_SEED_ENUM_MEMBER("BodyCondI32Ne", 3)
+    CHENG_SEED_ENUM_MEMBER("BodyCondI32Lt", 4)
+    CHENG_SEED_ENUM_MEMBER("BodyCondI32Le", 5)
+    CHENG_SEED_ENUM_MEMBER("BodyCondI32Gt", 6)
+    CHENG_SEED_ENUM_MEMBER("BodyCondI32Ge", 7)
+#undef CHENG_SEED_ENUM_MEMBER
+    return false;
+}
+
 static bool cheng_seed_try_resolve_i64_top_level_const_expr(const char *expr_text,
                                                     const ChengSeedLoweringPlanStub *lowering,
                                                     const char *owner_module_path,
@@ -8496,7 +8581,7 @@ static bool cheng_seed_try_resolve_i64_top_level_const_expr(const char *expr_tex
     }
     index = cheng_seed_find_top_level_const_index_by_symbol(lowering, symbol_text);
     if (index < 0) {
-        return false;
+        return cheng_seed_try_resolve_builtin_enum_member_i64(expr, value_out);
     }
     existing = &lowering->consts[index];
     if (strcmp(existing->abi_class, "i32") != 0 &&
@@ -30979,6 +31064,30 @@ static bool cheng_seed_prepare_expr_call_state_impl(const ChengSeedSystemLinkPla
         if (strcmp(callee, "sizeof") == 0 && arg_count == 1U) {
             return true;
         }
+        if (strcmp(callee, "len") == 0 && arg_count == 1U) {
+            return cheng_seed_prepare_expr_call_state(plan,
+                                              lowering,
+                                              current_function,
+                                              aliases,
+                                              alias_count,
+                                              locals,
+                                              local_count,
+                                              local_cap,
+                                              next_offset_io,
+                                              args[0],
+                                              call_depth,
+                                              max_call_depth_io) &&
+                   cheng_seed_prepare_composite_expr_temp(plan,
+                                              lowering,
+                                              current_function,
+                                              aliases,
+                                              alias_count,
+                                              locals,
+                                              local_count,
+                                              local_cap,
+                                              next_offset_io,
+                                              args[0]);
+        }
         {
             char cast_target_type[256];
             char cast_target_abi[32];
@@ -34831,6 +34940,11 @@ static bool cheng_seed_codegen_intrinsic_len_expr(const ChengSeedSystemLinkPlanS
                                           size_t local_count,
                                           const char *arg_expr,
                                           int target_reg,
+                                          int32_t call_arg_base,
+                                          int32_t string_temp_base,
+                                          int32_t string_temp_stride,
+                                          int32_t *string_label_index_io,
+                                          int call_depth,
                                           char *out,
                                           size_t cap) {
     char trimmed[4096];
@@ -34838,6 +34952,8 @@ static bool cheng_seed_codegen_intrinsic_len_expr(const ChengSeedSystemLinkPlanS
     char field_abi[32];
     char arg_type[256];
     char arg_abi[32];
+    char temp_name[128];
+    int32_t local_index = -1;
     cheng_seed_trim_copy_text(arg_expr, trimmed, sizeof(trimmed));
     if (cheng_seed_parse_string_literal_text(trimmed, field_type, sizeof(field_type))) {
         return cheng_seed_emit_mov_imm(out, cap, target_reg, (int64_t)strlen(field_type));
@@ -34879,13 +34995,41 @@ static bool cheng_seed_codegen_intrinsic_len_expr(const ChengSeedSystemLinkPlanS
                                 field_abi,
                                 sizeof(field_abi),
                                 15,
-                                0,
-                                0,
-                                0,
-                                0,
+                                call_arg_base,
+                                string_temp_base,
+                                string_temp_stride,
+                                call_depth,
                                 out,
                                 cap)) {
-        return false;
+        local_index = cheng_seed_find_local_slot(locals, local_count, trimmed);
+        if (local_index < 0) {
+            cheng_seed_expr_temp_name(current_function, trimmed, temp_name, sizeof(temp_name));
+            local_index = cheng_seed_find_local_slot(locals, local_count, temp_name);
+        }
+        if (local_index < 0 ||
+            !cheng_seed_materialize_composite_expr_into_slot(plan,
+                                                     lowering,
+                                                     current_function,
+                                                     aliases,
+                                                     alias_count,
+                                                     locals,
+                                                     local_count,
+                                                     "__cheng_len_expr",
+                                                     0U,
+                                                     trimmed,
+                                                     &locals[local_index],
+                                                     call_arg_base,
+                                                     string_temp_base,
+                                                     string_temp_stride,
+                                                     string_label_index_io,
+                                                     call_depth + 1,
+                                                     out,
+                                                     cap) ||
+            !cheng_seed_emit_local_value_address(out, cap, &locals[local_index], 15)) {
+            return false;
+        }
+        snprintf(field_type, sizeof(field_type), "%s", locals[local_index].type_text);
+        snprintf(field_abi, sizeof(field_abi), "%s", locals[local_index].abi_class);
     }
     {
         const char *len_source_type = field_type[0] != '\0' ? field_type : arg_type;
@@ -35649,6 +35793,11 @@ static bool cheng_seed_codegen_expr_scalar(const ChengSeedSystemLinkPlanStub *pl
                                                  local_count,
                                                  len_arg,
                                                  target_reg,
+                                                 call_arg_base,
+                                                 string_temp_base,
+                                                 string_temp_stride,
+                                                 NULL,
+                                                 call_depth,
                                                  out,
                                                  cap);
         }
@@ -35983,6 +36132,11 @@ static bool cheng_seed_codegen_expr_scalar(const ChengSeedSystemLinkPlanStub *pl
                                                  local_count,
                                                  arg_text,
                                                  target_reg,
+                                                 call_arg_base,
+                                                 string_temp_base,
+                                                 string_temp_stride,
+                                                 NULL,
+                                                 call_depth,
                                                  out,
                                                  cap);
         }
@@ -36216,6 +36370,9 @@ static bool cheng_seed_codegen_expr_scalar(const ChengSeedSystemLinkPlanStub *pl
         return cheng_seed_emit_mov_imm(out, cap, target_reg, char_value);
     }
     if (cheng_seed_parse_int_literal_text(expr, &literal_value)) {
+        return cheng_seed_emit_mov_imm(out, cap, target_reg, literal_value);
+    }
+    if (cheng_seed_try_resolve_builtin_enum_member_i64(expr, &literal_value)) {
         return cheng_seed_emit_mov_imm(out, cap, target_reg, literal_value);
     }
     {

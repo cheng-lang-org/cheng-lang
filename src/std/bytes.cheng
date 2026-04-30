@@ -32,6 +32,8 @@ fn bytesFopen(filename, mode: cstring): File =
 fn bytesFclose(f: File): int32
 @importc("cheng_fread")
 fn bytesFread(ptr: ptr, size, n: int64, stream: File): int32
+@importc("cheng_fseek")
+fn bytesFseek(stream: File, offset: int64, whence: int32): int32
 @importc("driver_c_read_file_all")
 fn bytesReadFileAllRaw(path: cstring): cstring
 @importc("cheng_file_size")
@@ -100,6 +102,38 @@ fn readFileBytes(path: str): ByteBuffer =
     let _ = bytesFclose(f)
     out.len = lenRead
     out.data = buf
+    return out
+
+fn readFileSlice(path: str, offset: int32, count: int32): ByteBuffer =
+    var empty: ByteBuffer = emptyBytes()
+    if offset < 0 || count <= 0:
+        return empty
+    let f: File = bytesFopen(path, "rb")
+    if f == nil:
+        return empty
+    let size64: int64 = bytesFileSize(path)
+    if size64 <= 0 || int64(offset) + int64(count) > size64:
+        let _ = bytesFclose(f)
+        return empty
+    if bytesFseek(f, int64(offset), 0) != 0:
+        let _ = bytesFclose(f)
+        return empty
+    var out: ByteBuffer = newByteBuffer(count)
+    if out.data == nil:
+        let _ = bytesFclose(f)
+        return empty
+    var lenRead: int32
+    while lenRead < count:
+        let avail: int32 = count - lenRead
+        let dst: ptr = rawmem_support.RawmemPtrAdd(out.data, lenRead)
+        let got: int32 = bytesFread(dst, 1, avail, f)
+        if got <= 0:
+            break
+        lenRead = lenRead + got
+    let _ = bytesFclose(f)
+    if lenRead != count:
+        freeByteBuffer(out)
+        return empty
     return out
 
 fn bufByteAt(buf: ByteBuffer, idx: int32): int32 =
@@ -223,6 +257,12 @@ fn decodeJpegRgba(data: ByteBuffer): ByteBuffer =
 
 fn ReadFileBytes(path: str): ByteBuffer =
     return readFileBytes(path)
+
+fn ReadFileSlice(path: str, offset: int32, count: int32): ByteBuffer =
+    return readFileSlice(path, offset, count)
+
+fn NewByteBuffer(len: int32): ByteBuffer =
+    return newByteBuffer(len)
 
 fn FreeByteBuffer(buf: var ByteBuffer) =
     freeByteBuffer(buf)

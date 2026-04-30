@@ -7,6 +7,7 @@ import std/strutils as strutil
 import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/direct_object_emit as direct
+import cheng/core/backend/wasm_module_emit as wasmemit
 import cheng/core/backend/system_link_plan as slplan
 import cheng/core/backend/line_map as linemap
 import cheng/core/backend/target_matrix as tmat
@@ -142,12 +143,30 @@ fn BackendDriverDispatchMinAppendOutputFileSizeReport(out: var str,
 
 fn BackendDriverDispatchMinAppendPrimaryPlanReport(out: var str,
                                                     primaryPlan: pobj.PrimaryObjectPlan) =
-    let _ = primaryPlan
+    var missingReasons = "-"
+    if primaryPlan.missingReasons.len > 0:
+        missingReasons = BackendDriverDispatchMinCsv(primaryPlan.missingReasons)
+    var firstMissingFunction = "-"
+    if len(primaryPlan.firstMissingFunction) > 0:
+        firstMissingFunction = primaryPlan.firstMissingFunction
+    var firstMissingBodyKind = "-"
+    if len(primaryPlan.firstMissingBodyKind) > 0:
+        firstMissingBodyKind = primaryPlan.firstMissingBodyKind
+    var firstMissingTypedIrKind = "-"
+    if len(primaryPlan.firstMissingTypedIrKind) > 0:
+        firstMissingTypedIrKind = primaryPlan.firstMissingTypedIrKind
     BackendDriverDispatchMinAppendLine(out, "primary_object_probe_summary=-")
-    BackendDriverDispatchMinAppendLine(out, "primary_object_first_missing_function=-")
-    BackendDriverDispatchMinAppendLine(out, "primary_object_first_missing_body_kind=-")
-    BackendDriverDispatchMinAppendLine(out, "primary_object_first_missing_typed_ir_kind=-")
-    BackendDriverDispatchMinAppendLine(out, "primary_object_first_missing_line_number=0")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_missing_reasons={missingReasons}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_item_count={primaryPlan.itemIds.len}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_symbol_count={primaryPlan.symbolNames.len}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_function_word_offset_count={primaryPlan.functionWordOffsets.len}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_function_word_count_count={primaryPlan.functionWordCounts.len}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_body_kind_count={primaryPlan.functionBodyKinds.len}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_instruction_word_count={primaryPlan.instructionWords.len}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_first_missing_function={firstMissingFunction}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_first_missing_body_kind={firstMissingBodyKind}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_first_missing_typed_ir_kind={firstMissingTypedIrKind}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"primary_object_first_missing_line_number={primaryPlan.firstMissingLineNumber}")
     BackendDriverDispatchMinAppendLine(out, "primary_object_first_call_sequence_drift_function=-")
     BackendDriverDispatchMinAppendLine(out, "primary_object_first_call_sequence_drift_ordinal=0")
     BackendDriverDispatchMinAppendLine(out, "primary_object_first_call_sequence_drift_legacy_count=0")
@@ -556,8 +575,12 @@ fn BackendDriverDispatchMinProviderExportRoots(modulePath: str,
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fclose")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fread")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fwrite")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fseek")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fflush")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fgetc")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_file_size")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_dir_exists")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_list_dir")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_seq_header_buffer_get")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_seq_header_len_get")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_seq_header_len_set")
@@ -1059,6 +1082,8 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterBrowserReady(driver
                                                                            loweringPlan: lower.LoweringPlanStub,
                                                                            primaryPlan: pobj.PrimaryObjectPlan,
                                                                            phaseProfile: var BackendDriverDispatchMinPhaseProfile): int32 =
+    if tmat.TargetIsWasm(linkPlan.targetTriple):
+        return BackendDriverDispatchMinRunSystemLinkExecEmitWasm(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
     if !BackendDriverDispatchMinIsTargetSupported(linkPlan.targetTriple):
         let reason = Fmt"backend driver direct system-link-exec: unsupported direct target: {linkPlan.targetTriple}"
         let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
@@ -1073,6 +1098,8 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterBrowserReady(driver
                                                                reportPath,
                                                                reason)
         return BackendDriverDispatchMinUnsupported(reason)
+    if linkPlan.emitKind == creq.EmitExe && direct.DirectObjectEmitCanStandaloneMain(primaryPlan):
+        return BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
     if linkPlan.emitKind == creq.EmitExe && linkPlan.providerModules.len > 0:
         return BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
     return BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
@@ -1081,7 +1108,8 @@ fn BackendDriverDispatchMinIsTargetSupported(triple: str): bool =
     return tmat.TargetIsDarwinArm64(triple) ||
            tmat.TargetIsLinuxAarch64(triple) ||
            tmat.TargetIsAndroidAarch64(triple) ||
-           tmat.TargetIsOhosAarch64(triple)
+           tmat.TargetIsOhosAarch64(triple) ||
+           tmat.TargetIsWasm(triple)
 
 fn BackendDriverDispatchMinBaseName(path: str): str =
     var lastSep = -1
@@ -1159,7 +1187,11 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitObj(driverRoot: str, reportPath:
     BackendDriverDispatchMinAppendPhaseReport(objReport, phaseProfile)
     BackendDriverDispatchMinAppendResourceReport(objReport)
     BackendDriverDispatchMinAppendOutputFileSizeReport(objReport, driverRoot, object.objectPath)
-    BackendDriverDispatchMinAppendLine(objReport, direct.DirectObjectEmitResultReportText(object))
+    BackendDriverDispatchMinAppendLine(objReport, Fmt"direct_object_output_kind={object.outputKind}")
+    BackendDriverDispatchMinAppendLine(objReport, Fmt"exec_phase_direct_object_layout_ms={strings.Int64ToStr(object.directObjectLayoutMs)}")
+    BackendDriverDispatchMinAppendLine(objReport, Fmt"exec_phase_direct_object_emit_ms={strings.Int64ToStr(object.directObjectEmitMs)}")
+    BackendDriverDispatchMinAppendLine(objReport, Fmt"direct_object_bytes={strings.IntToStr(object.bytesWritten)}")
+    BackendDriverDispatchMinAppendLine(objReport, Fmt"direct_object_reloc_count={strings.IntToStr(object.relocCount)}")
     if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, objReport):
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
     return 0
@@ -1205,7 +1237,11 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitShared(driverRoot: str,
     BackendDriverDispatchMinAppendLine(sharedReport, Fmt"native_primary_object={objectPath}")
     BackendDriverDispatchMinAppendLine(sharedReport, Fmt"native_link_log={nativeLinkLogPath}")
     BackendDriverDispatchMinAppendLine(sharedReport, "primary_object_direct=1")
-    BackendDriverDispatchMinAppendLine(sharedReport, direct.DirectObjectEmitResultReportText(object))
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"direct_object_output_kind={object.outputKind}")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"exec_phase_direct_object_layout_ms={strings.Int64ToStr(object.directObjectLayoutMs)}")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"exec_phase_direct_object_emit_ms={strings.Int64ToStr(object.directObjectEmitMs)}")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"direct_object_bytes={strings.IntToStr(object.bytesWritten)}")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"direct_object_reloc_count={strings.IntToStr(object.relocCount)}")
     BackendDriverDispatchMinAppendPhaseReport(sharedReport, phaseProfile)
     BackendDriverDispatchMinAppendResourceReport(sharedReport)
     BackendDriverDispatchMinAppendOutputFileSizeReport(sharedReport, driverRoot, linkPlan.outputPath)
@@ -1293,7 +1329,11 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
     BackendDriverDispatchMinAppendPhaseReport(exeReport, phaseProfile)
     BackendDriverDispatchMinAppendResourceReport(exeReport)
     BackendDriverDispatchMinAppendOutputFileSizeReport(exeReport, driverRoot, linkPlan.outputPath)
-    BackendDriverDispatchMinAppendLine(exeReport, direct.DirectObjectEmitResultReportText(object))
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_output_kind={object.outputKind}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"exec_phase_direct_object_layout_ms={strings.Int64ToStr(object.directObjectLayoutMs)}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"exec_phase_direct_object_emit_ms={strings.Int64ToStr(object.directObjectEmitMs)}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_bytes={strings.IntToStr(object.bytesWritten)}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_reloc_count={strings.IntToStr(object.relocCount)}")
     if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, exeReport):
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
     return 0
@@ -1330,6 +1370,43 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot: str, r
     BackendDriverDispatchMinAppendResourceReport(exeReport)
     BackendDriverDispatchMinAppendOutputFileSizeReport(exeReport, driverRoot, linkPlan.outputPath)
     if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, exeReport):
+        return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
+    return 0
+
+fn BackendDriverDispatchMinRunSystemLinkExecEmitWasm(driverRoot: str,
+                                                      reportPath: str,
+                                                      linkPlan: slplan.SystemLinkPlanStub,
+                                                      loweringPlan: lower.LoweringPlanStub,
+                                                      primaryPlan: pobj.PrimaryObjectPlan,
+                                                      phaseProfile: var BackendDriverDispatchMinPhaseProfile): int32 =
+    let _ = loweringPlan
+    phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs()
+    BackendDriverDispatchMinProgress("direct_object_emit", "begin")
+    let outputPath = linkPlan.outputPath
+    let wasmRes = direct.DirectObjectEmitWasmMainModule(driverRoot, primaryPlan, outputPath)
+    if IsErr(wasmRes):
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, Error(wasmRes))
+        return BackendDriverDispatchMinUnsupported(Error(wasmRes))
+    let wasmResult = Value(wasmRes)
+    phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs() - phaseProfile.directObjectEmitNs
+    BackendDriverDispatchMinProgress("direct_object_emit", "done")
+    var wasmReport = ""
+    BackendDriverDispatchMinAppendLine(wasmReport, "system_link_exec_runtime_execute=1")
+    BackendDriverDispatchMinAppendLine(wasmReport, "system_link_exec_emit=wasm")
+    BackendDriverDispatchMinAppendLine(wasmReport, Fmt"primary_object={wasmResult.objectPath}")
+    BackendDriverDispatchMinAppendLine(wasmReport, "primary_object_direct=1")
+    BackendDriverDispatchMinAppendLine(wasmReport, "native_link_log=-")
+    BackendDriverDispatchMinAppendLine(wasmReport, "line_map=-")
+    BackendDriverDispatchMinAppendPrimaryPlanReport(wasmReport, primaryPlan)
+    BackendDriverDispatchMinAppendPhaseReport(wasmReport, phaseProfile)
+    BackendDriverDispatchMinAppendResourceReport(wasmReport)
+    BackendDriverDispatchMinAppendOutputFileSizeReport(wasmReport, driverRoot, outputPath)
+    BackendDriverDispatchMinAppendLine(wasmReport, Fmt"direct_object_output_kind={wasmResult.outputKind}")
+    BackendDriverDispatchMinAppendLine(wasmReport, Fmt"exec_phase_direct_object_layout_ms={strings.Int64ToStr(wasmResult.directObjectLayoutMs)}")
+    BackendDriverDispatchMinAppendLine(wasmReport, Fmt"exec_phase_direct_object_emit_ms={strings.Int64ToStr(wasmResult.directObjectEmitMs)}")
+    BackendDriverDispatchMinAppendLine(wasmReport, Fmt"direct_object_bytes={strings.IntToStr(wasmResult.bytesWritten)}")
+    BackendDriverDispatchMinAppendLine(wasmReport, Fmt"direct_object_reloc_count={strings.IntToStr(wasmResult.relocCount)}")
+    if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, wasmReport):
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
     return 0
 

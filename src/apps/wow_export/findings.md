@@ -1,5 +1,7 @@
 # wowExport Findings
 
+- `wow_export` 用户模块的 no-pointer 回归已重新收敛：`casc_index/tact_index/casc_archive/build_info/config/cdn_config` 不再自建 C FFI/cstring/free/ptr_add 文件读取或目录 listing，改走 `std/os` 与 `std/bytes`；`binary.HexSlice` 和 `zlib_inflate` 不再使用业务层 `RawmemPtrAdd/RawmemCopy/RawmemSet/UInt8Ptr`。
+- `std/bytes` 现在提供 `ReadFileSlice` 与 `NewByteBuffer`，C 文件 I/O 和 ByteBuffer 分配集中在标准库边界；runtime provider roots 同步补齐 `cheng_fseek/cheng_file_size/cheng_dir_exists/cheng_list_dir`，正式 `artifacts/backend_driver/cheng` 可编译运行相关 wowExport smoke。
 - Northshire MAID `adt_split` payloads are now parsed as real chunk streams, not only format headers: slot 1 carries `FDDM/MDDF` and `FDOM/MODF` placement tables plus terrain chunks, slot 3 carries `PMAM` plus terrain chunks, while slots 2 and 4 are metadata-style split streams without `KNCM/MCNK`.
 - The four audited Northshire MAID tiles currently provide `2164` ADT split chunks, `2048` `KNCM/MCNK` chunks, `4345` `FDDM/MDDF` doodad placements, and `32` `FDOM/MODF` world model placements; preview/render now fail if these parsed facts disappear.
 - `MDDF` records are parsed at 36-byte stride as nameID, uniqueID, position, rotation, scale and flags. Current Northshire aggregate position span is `1125287,221256,1145929`, with scale range `133..3389`.

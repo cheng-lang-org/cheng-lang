@@ -17,78 +17,78 @@ const
     Libp2pPeerIdIdentityCode: int32 = 0
 
 fn Libp2pEncodeBase58(data: Bytes): str =
-    return base58.encodeBase58(data)
+    return base58.EncodeBase58(data)
 
 fn Libp2pDecodeBase58(text: str): Result[Bytes] =
     if len(text) <= 0:
         return Err[Bytes](" libp2p peer: empty peer text")
-    let decoded = base58.decodeBase58(text)
+    let decoded = base58.DecodeBase58(text)
     if IsErr(decoded):
         return Err[Bytes](" libp2p peer: invalid peer text")
-    if bytesLen(Value(decoded)) <= 0:
+    if BytesLen(Value(decoded)) <= 0:
         return Err[Bytes](" libp2p peer: invalid peer text")
     return decoded
 
 fn Libp2pPeerSeedBytes(seed: str): Bytes =
-    return sha256.sha256Digest(bytesFromString(strutil.Join(["cheng.libp2p.peer|", seed], "")))
+    return sha256.Sha256Digest(BytesFromString(strutil.Join(["cheng.libp2p.peer|", seed], "")))
 
 fn Libp2pClampEd25519Scalar(out: var Bytes) =
-    if bytesLen(out) != Libp2pEd25519PubKeySize:
+    if BytesLen(out) != Libp2pEd25519PubKeySize:
         return
-    bytesSet(out, 0, bytesGet(out, 0) & 248)
-    bytesSet(out, 31, (bytesGet(out, 31) & 63) | 64)
+    BytesSet(out, 0, BytesGet(out, 0) & 248)
+    BytesSet(out, 31, (BytesGet(out, 31) & 63) | 64)
 
 fn Libp2pPeerPublicKeyValid(pubKeyBytes: Bytes): bool =
-    if bytesLen(pubKeyBytes) != Libp2pEd25519PubKeySize:
+    if BytesLen(pubKeyBytes) != Libp2pEd25519PubKeySize:
         return false
     var point: ref10.GeP3
-    return ref10.geFromBytesNegateVartime(point, pubKeyBytes)
+    return ref10.GeFromBytesNegateVartime(point, pubKeyBytes)
 
 fn Libp2pPeerPublicKeyFromSeedBytes(seedBytes: Bytes): Result[layout.FixedBytes32] =
-    if bytesLen(seedBytes) != Libp2pEd25519PubKeySize:
+    if BytesLen(seedBytes) != Libp2pEd25519PubKeySize:
         return Err[layout.FixedBytes32](" libp2p peer: invalid seed size")
-    let expanded = sha512.sha512Digest(seedBytes)
-    if bytesLen(expanded) < Libp2pEd25519PubKeySize:
+    let expanded = sha512.Sha512Digest(seedBytes)
+    if BytesLen(expanded) < Libp2pEd25519PubKeySize:
         return Err[layout.FixedBytes32](" libp2p peer: invalid expanded seed")
-    var scalar = bytesSlice(expanded, 0, Libp2pEd25519PubKeySize)
+    var scalar = BytesSlice(expanded, 0, Libp2pEd25519PubKeySize)
     Libp2pClampEd25519Scalar(scalar)
     var point: ref10.GeP3
-    ref10.geScalarMultBase(point, scalar)
-    return layout.FixedBytes32FromBytes(ref10.geP3ToBytes(point))
+    ref10.GeScalarMultBase(point, scalar)
+    return layout.FixedBytes32FromBytes(ref10.GeP3ToBytes(point))
 
 fn Libp2pPeerProtoBytes(pubKey: layout.FixedBytes32): Bytes =
-    let out = bytesAlloc(Libp2pPeerProtoSize)
+    let out = BytesAlloc(Libp2pPeerProtoSize)
     let pubKeyBytes = layout.FixedBytes32ToBytes(pubKey)
-    bytesSet(out, 0, 0x08)
-    bytesSet(out, 1, Libp2pEd25519KeyType)
-    bytesSet(out, 2, 0x12)
-    bytesSet(out, 3, 0x20)
+    BytesSet(out, 0, 0x08)
+    BytesSet(out, 1, Libp2pEd25519KeyType)
+    BytesSet(out, 2, 0x12)
+    BytesSet(out, 3, 0x20)
     for i in 0..<Libp2pEd25519PubKeySize:
-        bytesSet(out, 4 + i, bytesGet(pubKeyBytes, i))
+        BytesSet(out, 4 + i, BytesGet(pubKeyBytes, i))
     return out
 
 fn Libp2pPeerIdBytes(pubKey: layout.FixedBytes32): Bytes =
-    let out = bytesAlloc(Libp2pPeerIdBytesSize)
+    let out = BytesAlloc(Libp2pPeerIdBytesSize)
     let protoBytes = Libp2pPeerProtoBytes(pubKey)
-    bytesSet(out, 0, Libp2pPeerIdIdentityCode)
-    bytesSet(out, 1, Libp2pPeerProtoSize)
+    BytesSet(out, 0, Libp2pPeerIdIdentityCode)
+    BytesSet(out, 1, Libp2pPeerProtoSize)
     for i in 0..<Libp2pPeerProtoSize:
-        bytesSet(out, 2 + i, bytesGet(protoBytes, i))
+        BytesSet(out, 2 + i, BytesGet(protoBytes, i))
     return out
 
 fn Libp2pPeerPublicKeyFromPeerIdBytes(peerIdBytes: Bytes): Result[layout.FixedBytes32] =
-    if bytesLen(peerIdBytes) != Libp2pPeerIdBytesSize:
+    if BytesLen(peerIdBytes) != Libp2pPeerIdBytesSize:
         return Err[layout.FixedBytes32](" libp2p peer: invalid peer id size")
-    if bytesGet(peerIdBytes, 0) != Libp2pPeerIdIdentityCode:
+    if BytesGet(peerIdBytes, 0) != Libp2pPeerIdIdentityCode:
         return Err[layout.FixedBytes32](" libp2p peer: unsupported multihash")
-    if bytesGet(peerIdBytes, 1) != Libp2pPeerProtoSize:
+    if BytesGet(peerIdBytes, 1) != Libp2pPeerProtoSize:
         return Err[layout.FixedBytes32](" libp2p peer: invalid peer id payload")
-    if bytesGet(peerIdBytes, 2) != 0x08 ||
-       bytesGet(peerIdBytes, 3) != Libp2pEd25519KeyType ||
-       bytesGet(peerIdBytes, 4) != 0x12 ||
-       bytesGet(peerIdBytes, 5) != 0x20:
+    if BytesGet(peerIdBytes, 2) != 0x08 ||
+       BytesGet(peerIdBytes, 3) != Libp2pEd25519KeyType ||
+       BytesGet(peerIdBytes, 4) != 0x12 ||
+       BytesGet(peerIdBytes, 5) != 0x20:
         return Err[layout.FixedBytes32](" libp2p peer: unsupported key protobuf")
-    let pubKeyBytes = bytesSlice(peerIdBytes, 6, Libp2pEd25519PubKeySize)
+    let pubKeyBytes = BytesSlice(peerIdBytes, 6, Libp2pEd25519PubKeySize)
     if !Libp2pPeerPublicKeyValid(pubKeyBytes):
         return Err[layout.FixedBytes32](" libp2p peer: invalid ed25519 public key")
     return layout.FixedBytes32FromBytes(pubKeyBytes)
@@ -121,12 +121,12 @@ fn Libp2pPeerIdFillFromText(out: var types.Libp2pPeerId, text: str): Result[bool
 
 fn Libp2pPeerIdFromBytes(data: Bytes): types.Libp2pPeerId =
     var out: types.Libp2pPeerId
-    if bytesLen(data) == Libp2pEd25519PubKeySize && Libp2pPeerPublicKeyValid(data):
+    if BytesLen(data) == Libp2pEd25519PubKeySize && Libp2pPeerPublicKeyValid(data):
         let fixedRes = layout.FixedBytes32FromBytes(data)
         if IsOk(fixedRes):
             out.value = Value(fixedRes)
             return out
-    let hashed = sha256.sha256Digest(data)
+    let hashed = sha256.Sha256Digest(data)
     let pubKeyRes = Libp2pPeerPublicKeyFromSeedBytes(hashed)
     if IsOk(pubKeyRes):
         out.value = Value(pubKeyRes)

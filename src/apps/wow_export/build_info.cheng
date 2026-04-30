@@ -5,7 +5,6 @@ import std/seqs
 import std/strings as strings
 import std/strformat
 import std/strutils as strutils
-import std/system as system
 
 type
     WowBuildEntry =
@@ -28,13 +27,6 @@ const
     DefaultVersion = "12.0.5.67165"
     DefaultBuildKey = "02482dc9c788698c83e7ae0e24ab2bb7"
     DefaultLocale = "zhCN"
-
-@importc("driver_c_read_file_all")
-fn buildInfoReadFileAllRaw(path: cstring): cstring
-@importc("driver_c_read_file_all_bridge")
-fn buildInfoReadFileAllBridge(path: cstring): str
-@importc("cheng_file_exists")
-fn buildInfoFileExistsRaw(path: cstring): int32
 
 @exportc("bitand_0")
 fn wowExportBitand0(a: int32, b: int32): int32 =
@@ -162,21 +154,10 @@ fn ParseBuildInfoText(text: str): Result[WowBuildEntry[]] =
     return Ok[WowBuildEntry[]](out)
 
 fn LoadBuildInfoText(clientPath: str): Result[str] =
-    let clientBytes: rawbytes.Bytes = rawbytes.BytesFromString(clientPath)
-    let suffixBytes: rawbytes.Bytes = rawbytes.BytesFromString("/.build.info")
-    var pathBytesNoNull: rawbytes.Bytes = rawbytes.BytesConcat(clientBytes, suffixBytes)
-    var pathBytes: rawbytes.Bytes = rawbytes.BytesAlloc(pathBytesNoNull.len + 1)
-    rawbytes.BytesCopyInto(pathBytes, 0, pathBytesNoNull)
-    rawbytes.BytesSet(pathBytes, pathBytesNoNull.len, 0)
-    rawbytes.BytesFree(clientBytes)
-    rawbytes.BytesFree(suffixBytes)
-    rawbytes.BytesFree(pathBytesNoNull)
-    let pathRaw: cstring = cstring(pathBytes.data)
-    if buildInfoFileExistsRaw(pathRaw) == 0:
-        rawbytes.BytesFree(pathBytes)
+    let path: str = BuildInfoPath(clientPath)
+    if !os.FileExists(path):
         return Err[str]("wowExport build-info: missing .build.info")
-    let text: str = buildInfoReadFileAllBridge(pathRaw)
-    rawbytes.BytesFree(pathBytes)
+    let text: str = os.ReadFile(path)
     if strings.Len(text) == 0:
         return Err[str]("wowExport build-info: failed to read .build.info")
     return Ok[str](text)
@@ -272,63 +253,10 @@ fn buildInfoFieldBytesEq(line: rawbytes.Bytes, idx: int32, expected: str): bool 
 fn LoadBuild(clientPath: str, product: str, version: str): Result[WowBuildEntry] =
     let keepBitand0: int32 = wowExportBitand0(0, 0)
     keepBitand0
-    let clientBytes: rawbytes.Bytes = rawbytes.BytesFromString(clientPath)
-    let suffixBytes: rawbytes.Bytes = rawbytes.BytesFromString("/.build.info")
-    var pathBytesNoNull: rawbytes.Bytes = rawbytes.BytesConcat(clientBytes, suffixBytes)
-    var pathBytes: rawbytes.Bytes = rawbytes.BytesAlloc(pathBytesNoNull.len + 1)
-    rawbytes.BytesCopyInto(pathBytes, 0, pathBytesNoNull)
-    rawbytes.BytesSet(pathBytes, pathBytesNoNull.len, 0)
-    rawbytes.BytesFree(clientBytes)
-    rawbytes.BytesFree(suffixBytes)
-    rawbytes.BytesFree(pathBytesNoNull)
-    let pathRaw: cstring = cstring(pathBytes.data)
-    if buildInfoFileExistsRaw(pathRaw) == 0:
-        rawbytes.BytesFree(pathBytes)
-        return Err[WowBuildEntry]("wowExport build-info: missing .build.info")
-    let textRaw: cstring = buildInfoReadFileAllRaw(pathRaw)
-    rawbytes.BytesFree(pathBytes)
-    if textRaw == nil:
-        return Err[WowBuildEntry]("wowExport build-info: failed to read .build.info")
-    let textLen: int32 = system.c_strlen(textRaw)
-    if textLen <= 0:
-        free(ptr(textRaw))
-        return Err[WowBuildEntry]("wowExport build-info: failed to read .build.info")
-    var textBytes: rawbytes.Bytes
-    textBytes.data = ptr(textRaw)
-    textBytes.len = textLen
-    let n: int32 = textBytes.len
-    var lineIndex: int32
-    var lineStart: int32
-    var i: int32
-    for i in i..<= n:
-        if i == n || rawbytes.BytesGet(textBytes, i) == int32('\n'):
-            var lineLen: int32 = i - lineStart
-            if lineLen > 0 && rawbytes.BytesGet(textBytes, lineStart + lineLen - 1) == int32('\r'):
-                lineLen = lineLen - 1
-            if lineLen > 0 && lineIndex > 0:
-                let lineBytes: rawbytes.Bytes = rawbytes.BytesSliceView(textBytes, lineStart, lineLen)
-                if buildInfoFieldBytesEq(lineBytes, 1, "1") &&
-                    buildInfoFieldBytesEq(lineBytes, 12, version) &&
-                    buildInfoFieldBytesEq(lineBytes, 14, product):
-                    var entry: WowBuildEntry
-                    entry.branch = buildInfoFieldBytes(lineBytes, 0)
-                    entry.active = true
-                    entry.buildKey = buildInfoFieldBytes(lineBytes, 2)
-                    entry.cdnKey = buildInfoFieldBytes(lineBytes, 3)
-                    entry.installKey = buildInfoFieldBytes(lineBytes, 4)
-                    entry.cdnPath = buildInfoFieldBytes(lineBytes, 6)
-                    entry.cdnHosts = buildInfoFieldBytes(lineBytes, 7)
-                    entry.cdnServers = buildInfoFieldBytes(lineBytes, 8)
-                    entry.tags = buildInfoFieldBytes(lineBytes, 9)
-                    entry.version = buildInfoFieldBytes(lineBytes, 12)
-                    entry.keyRing = buildInfoFieldBytes(lineBytes, 13)
-                    entry.product = buildInfoFieldBytes(lineBytes, 14)
-                    free(ptr(textRaw))
-                    return Ok[WowBuildEntry](entry)
-            lineIndex = lineIndex + 1
-            lineStart = i + 1
-    free(ptr(textRaw))
-    return Err[WowBuildEntry]("wowExport build-info: active build not found")
+    let entriesRes: Result[WowBuildEntry[]] = LoadBuildInfo(clientPath)
+    if IsErr(entriesRes):
+        return Err[WowBuildEntry](Error(entriesRes))
+    return FindBuild(Value(entriesRes), product, version)
 
 fn LoadBuildInfo(clientPath: str): Result[WowBuildEntry[]] =
     let textRes: Result[str] = LoadBuildInfoText(clientPath)

@@ -1,5 +1,7 @@
 # 当前发现
 
+- 2026-04-30 pure self 最新 blocker 已从 lowering/primary 入口识别变成 direct materialization：`backend_driver_dispatch_min.cheng` 的 self `system-link-exec` 报告 1590 个 primary object item，但 `_DirectObjectEmitWriteObject` 对应 function body 仍是 `unsupported` 且 instruction words 未填充。说明 BodyIR 进入了 plan，消费端还没有把通用 BodyIR 降成机器码；正确修法是补 BodyIR -> arm64 words/relocs，不是继续扩特殊 body kind 或放宽 plan ready。
+
 - `chain_node` 是应用/领域入口，不属于编译器 core 门禁；继续放在核心 gate 会把迁移验证拖进无关大编译。
 - 机械去前缀后要复扫 `PathJoin(root, "")`、`PathAbsolute(root, "")` 这类空路径残留；它们通常表示旧子目录被替换掉了。
 - r2c 实验脚本不能再创建旧目录 symlink；生成包只应链接确实需要的 runtime/native 和 std 支持目录。

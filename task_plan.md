@@ -30,7 +30,7 @@
 - 已完成：同一 `str` sret/local/arg0 切片已支持无显式类型的 `let value = EmptyText()`；typed_expr 只识别 let-call 语句形状，lowering 必须从 typed call fact 的返回类型证明首个 call 是 `str` 后才产出 `let_call_noarg_str_then_call_arg0_return_i32_const_0`。
 - 已推进：`strLenFast` 现在由 `typed_expr` 生成结构化 IR，`lowering_plan` 映射为 `str_len_fast_i32`，direct Mach-O writer 和文本汇编 fallback 均有真实 arm64 指令。
 - 已推进：return-call 生成改为依赖 typed fact 的 `returnRoot`，普通 binding call 不再触发 `return_call_*`；新增 `non_return_call_not_primary_fixture` 做防回潮探针。
-- 下一步：继续把 backend driver 自身 `BackendDriverMain` 命令分发从第 3397 行 `stmt_let_call` 推进到通用 statement scheduler、复合/标量 local slot、call result 和控制流 codegen；在它完成前，纯 `system-link-exec` 自举会硬失败为 `primary_object_body_semantics_missing`，不能用假 stub 或 C seed fallback 冒充完成。
+- 下一步：当前纯 self probe 已越过旧 `BackendDriverMain`/入口 statement blocker，新的硬缺口是 `_DirectObjectEmitWriteObject` 的 `instruction_word_zero`；继续把 `PrimaryObjectPlan.functionBodyIRs` 中的通用 BodyIR/statement sequence 正式物化为 Darwin arm64 instruction words 和 relocation，先覆盖 `DirectObjectEmitWriteObject` 这类多 statement、多 call、Result/composite local 路径。完成前纯 `system-link-exec` 自举仍会硬失败为 `primary_object_body_semantics_missing`，不能用假 stub、跳过 unsupported 函数或 C seed fallback 冒充完成。
 - 已推进：纯 Cheng 推理内核与 smoke 已按新规范把计数型 `while` 改为 `for ... in range`，字符串组合改走 `Fmt`。
 - 本次边界审计切片：
   - provider objects -> `src/core/backend/provider_object_materializer.cheng`; 验证用 `artifacts/backend_driver/cheng debug-report --root:. --in:src/tests/ordinary_call_chain_fixture.cheng --target:arm64-apple-darwin --emit:obj`

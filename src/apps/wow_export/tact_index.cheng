@@ -3,13 +3,9 @@ import std/os as os
 import std/result
 import std/strings as strings
 import std/strformat
-import std/system as system
 import cheng/apps/wow_export/binary as binary
 import cheng/apps/wow_export/build_info as build_info
 import std/strutils as strutil
-
-type
-    File = ptr
 
 type
     TactIndexFooter =
@@ -73,45 +69,14 @@ type
         footer: TactIndexFooter
         first: TactIndexEntry
 
-@importc("cheng_fopen")
-fn tactIndexFopen(filename, mode: cstring): File
-@importc("cheng_fclose")
-fn tactIndexFclose(f: File): int32
-@importc("cheng_fread")
-fn tactIndexFread(dst: ptr, size, n: int64, stream: File): int32
-@importc("cheng_file_size")
-fn tactIndexFileSize(path: cstring): int64
-
 const
     tactIndexFooterMaxHashBytes = 16
     tactIndexKeyHexBytes = 16
 
-fn tactIndexReadFileBytesRaw(path: cstring): Result[bytes.ByteBuffer] =
-    let f: File = tactIndexFopen(path, "rb")
-    if f == nil:
+fn tactIndexReadFileBytes(path: str): Result[bytes.ByteBuffer] =
+    let out: bytes.ByteBuffer = bytes.ReadFileBytes(path)
+    if out.len <= 0:
         return Err[bytes.ByteBuffer]("wowExport tact-index: failed to open local index")
-    let size64: int64 = tactIndexFileSize(path)
-    if size64 <= 0 || size64 > int64(2147483647):
-        let _ = tactIndexFclose(f)
-        return Err[bytes.ByteBuffer]("wowExport tact-index: invalid local index size")
-    let total: int32 = int32(size64)
-    var out: bytes.ByteBuffer
-    out.len = total
-    out.data = alloc(total)
-    if out.data == nil:
-        let _ = tactIndexFclose(f)
-        return Err[bytes.ByteBuffer]("wowExport tact-index: alloc failed")
-    var lenRead: int32
-    while lenRead < total:
-        let want: int32 = total - lenRead
-        let dst: ptr = system.system_ptr_add(out.data, lenRead)
-        let got: int32 = tactIndexFread(dst, 1, int64(want), f)
-        if got <= 0:
-            let _ = tactIndexFclose(f)
-            bytes.FreeByteBuffer(out)
-            return Err[bytes.ByteBuffer]("wowExport tact-index: truncated local index")
-        lenRead = lenRead + got
-    let _ = tactIndexFclose(f)
     return Ok[bytes.ByteBuffer](out)
 
 fn tactIndexReadUIntBEAt(buf: bytes.ByteBuffer, idx: int32, width: int32): Result[int32] =
@@ -436,7 +401,7 @@ fn tactIndexLookupPrefixLoaded(buf: bytes.ByteBuffer,
     return Ok[TactIndexLookup](out)
 
 fn LoadTactIndexEntryAtPathIndex(path: str, entryIndex: int32): Result[TactIndexEntry] =
-    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytesRaw(system.strToCStringTemp(path))
+    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytes(path)
     if IsErr(readRes):
         return Err[TactIndexEntry](strutil.Join([Error(readRes), " path=", path], ""))
     let buf: bytes.ByteBuffer = Value(readRes)
@@ -457,7 +422,7 @@ fn LoadTactIndexEntryAtPathIndex(path: str, entryIndex: int32): Result[TactIndex
     return entryRes
 
 fn LoadTactIndexLookupFromPath(path: str, keyHex: str): Result[TactIndexLookup] =
-    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytesRaw(system.strToCStringTemp(path))
+    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytes(path)
     if IsErr(readRes):
         return Err[TactIndexLookup](strutil.Join([Error(readRes), " path=", path], ""))
     let buf: bytes.ByteBuffer = Value(readRes)
@@ -471,7 +436,7 @@ fn LoadTactIndexLookupFromPath(path: str, keyHex: str): Result[TactIndexLookup] 
     return lookupRes
 
 fn LoadTactIndexLookupPrefixFromPath(path: str, keyPrefixHex: str): Result[TactIndexLookup] =
-    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytesRaw(system.strToCStringTemp(path))
+    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytes(path)
     if IsErr(readRes):
         return Err[TactIndexLookup](strutil.Join([Error(readRes), " path=", path], ""))
     let buf: bytes.ByteBuffer = Value(readRes)
@@ -596,7 +561,7 @@ fn LoadTactIndexFollowChainFromPath(path: str, startKeyHex: str, maxDepth: int32
     return Ok[TactIndexFollowChain](chain)
 
 fn LoadTactIndexSummaryFromPath(path: str): Result[TactIndexSummary] =
-    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytesRaw(system.strToCStringTemp(path))
+    let readRes: Result[bytes.ByteBuffer] = tactIndexReadFileBytes(path)
     if IsErr(readRes):
         return Err[TactIndexSummary](strutil.Join([Error(readRes), " path=", path], ""))
     let buf: bytes.ByteBuffer = Value(readRes)

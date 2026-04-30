@@ -79,6 +79,10 @@
 
 验证：
 
+- no-pointer 重新收敛：`casc_index/tact_index/casc_archive/build_info/config/cdn_config` 已移除业务层 `File = ptr`、`@importc` 文件 I/O、`cstring` path 构造、`free(ptr(...))` 和 `system_ptr_add`；`binary.HexSlice` 与 `zlib_inflate` 已移除业务层 rawmem 指针操作；`render/blp/blte/cdn_fetch/zlib` 的 ByteBuffer 分配改为 `std/bytes.NewByteBuffer`。
+- std/runtime 底座：`std/bytes` 新增 `ReadFileSlice` 和 `NewByteBuffer`；`system_link_exec_runtime_direct` 与 `backend_driver_dispatch_min` 的 program_support roots 已补 `cheng_fseek/cheng_file_size/cheng_dir_exists/cheng_list_dir`。
+- 静态扫描：`rg 'File\\s*=\\s*ptr|@importc\\(|system_ptr_add|RawmemPtrAdd|RawmemCopy|RawmemSet|UInt8Ptr|free\\(ptr|alloc\\(' -- src/apps/wow_export/*.cheng` 无命中。
+- 正式 `artifacts/backend_driver/cheng` 验证通过：`no_pointer_read_file_bytes_smoke`、`wow_export_tact_index_smoke`、`wow_export_zlib_smoke`、`wow_export_blte_smoke`、`wow_export_encoding_smoke`、`wow_export_render_smoke`、`wow_export_northshire_mvp_smoke`。
 - `wow_export_render_smoke` 通过。
 - `wow_export_northshire_mvp_smoke` 通过。
 - `git diff --check -- src/apps/wow_export src/tests/wow_export_*` 通过。
