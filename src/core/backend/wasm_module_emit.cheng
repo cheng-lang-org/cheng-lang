@@ -1,0 +1,551 @@
+import std/result
+import std/rawbytes
+import std/rawmem_support
+import cheng/core/backend/object_buffer as obuf
+
+# Wasm binary module emitter.
+#
+# Extracted from the C seed's wasm backend (cheng_seed.c lines ~49927-58171).
+# Provides low-level primitives and composable section builders for
+# constructing a valid wasm32 module in binary format.
+#
+# Section IDs (wasm binary format):
+#   1  = Type   (function signatures)
+#   2  = Import (declared imports)
+#   3  = Function (type indices for defined functions)
+#   5  = Memory (memory declarations) -- unused here; memory is imported
+#   6  = Global  (global variables)
+#   7  = Export  (exported entities)
+#   10 = Code   (function bodies)
+#   11 = Data   (data segments)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Section IDs
+let WasmSectionIdType: int32 = 1
+let WasmSectionIdImport: int32 = 2
+let WasmSectionIdFunction: int32 = 3
+let WasmSectionIdMemory: int32 = 5
+let WasmSectionIdGlobal: int32 = 6
+let WasmSectionIdExport: int32 = 7
+let WasmSectionIdCode: int32 = 10
+let WasmSectionIdData: int32 = 11
+
+# Value types
+let WasmValTypeI32: int32 = 0x7f
+let WasmValTypeI64: int32 = 0x7e
+let WasmValTypeF32: int32 = 0x7d
+let WasmValTypeF64: int32 = 0x7c
+
+# Import kinds
+let WasmImportKindFunction: int32 = 0
+let WasmImportKindMemory: int32 = 2
+
+# Export kinds
+let WasmExportKindFunction: int32 = 0
+let WasmExportKindMemory: int32 = 2
+let WasmExportKindGlobal: int32 = 3
+
+# Global mutability
+let WasmGlobalMut: int32 = 1
+let WasmGlobalConst: int32 = 0
+
+# Memory attributes for import (min pages, max pages placeholder)
+let WasmMemoryMinPages: int32 = 1
+let WasmMemoryMaxPages: int32 = 512
+
+# Instruction opcodes
+let WasmOpUnreachable: int32 = 0x00
+let WasmOpNop: int32 = 0x01
+let WasmOpBlock: int32 = 0x02
+let WasmOpLoop: int32 = 0x03
+let WasmOpIf: int32 = 0x04
+let WasmOpElse: int32 = 0x05
+let WasmOpEnd: int32 = 0x0b
+let WasmOpReturn: int32 = 0x0f
+let WasmOpCall: int32 = 0x10
+let WasmOpLocalGet: int32 = 0x20
+let WasmOpLocalSet: int32 = 0x21
+let WasmOpLocalTee: int32 = 0x22
+let WasmOpGlobalGet: int32 = 0x23
+let WasmOpGlobalSet: int32 = 0x24
+let WasmOpI32Load: int32 = 0x28
+let WasmOpI32Load8U: int32 = 0x2d
+let WasmOpI32Store: int32 = 0x36
+let WasmOpI32Store8: int32 = 0x3a
+let WasmOpI32Store16: int32 = 0x3b
+let WasmOpI32Const: int32 = 0x41
+let WasmOpI32Eqz: int32 = 0x45
+let WasmOpI32Eq: int32 = 0x46
+let WasmOpI32Ne: int32 = 0x47
+let WasmOpI32LtS: int32 = 0x48
+let WasmOpI32LtU: int32 = 0x49
+let WasmOpI32GtS: int32 = 0x4a
+let WasmOpI32GtU: int32 = 0x4b
+let WasmOpI32LeS: int32 = 0x4c
+let WasmOpI32LeU: int32 = 0x4d
+let WasmOpI32GeS: int32 = 0x4e
+let WasmOpI32GeU: int32 = 0x4f
+let WasmOpI32Add: int32 = 0x6a
+let WasmOpI32Sub: int32 = 0x6b
+let WasmOpI32Mul: int32 = 0x6c
+let WasmOpI32And: int32 = 0x71
+let WasmOpI32Shl: int32 = 0x74
+let WasmOpI32ShrS: int32 = 0x75
+let WasmOpI32ShrU: int32 = 0x76
+let WasmOpSelect: int32 = 0x1b
+
+# Block type encodings used with block/loop/if
+let WasmBlockTypeEmpty: int32 = 0x40
+
+# ---------------------------------------------------------------------------
+# Low-level byte helpers
+# ---------------------------------------------------------------------------
+
+fn WasmModuleWriteUleb(buf: var obuf.ObjectBuffer,
+                        valueRaw: int32) =
+    var value = valueRaw
+    if value < 0:
+        value = 0
+    while true:
+        var byteValue = value & 127
+        value = value >> 7
+        if value != 0:
+            byteValue = byteValue | 128
+            obuf.ObjectBufferWriteU8(buf, byteValue)
+        else:
+            obuf.ObjectBufferWriteU8(buf, byteValue)
+            break
+
+fn WasmModuleWriteSlebI32(buf: var obuf.ObjectBuffer,
+                           valueRaw: int32) =
+    var value = valueRaw
+    while true:
+        var byteValue = value & 127
+        value = value >> 7
+        let signSet = (byteValue & 64) != 0
+        let done = (value == 0 && !signSet) || (value == -1 && signSet)
+        if !done:
+            byteValue = byteValue | 128
+        obuf.ObjectBufferWriteU8(buf, byteValue)
+        if done:
+            break
+
+fn WasmModuleWriteName(buf: var obuf.ObjectBuffer,
+                        name: str) =
+    WasmModuleWriteUleb(buf, Len(name))
+    for i in 0..<Len(name):
+        obuf.ObjectBufferWriteU8(buf, int32(name[i]) & 255)
+
+fn WasmModuleWriteSection(out: var obuf.ObjectBuffer,
+                           sectionId: int32,
+                           payload: obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(out, sectionId)
+    WasmModuleWriteUleb(out, obuf.ObjectBufferLen(payload))
+    obuf.ObjectBufferWriteBytes(out, obuf.ObjectBufferToBytes(payload))
+
+fn WasmModuleWriteMemoryArg(buf: var obuf.ObjectBuffer,
+                             alignLog2: int32,
+                             offset: int32) =
+    WasmModuleWriteUleb(buf, alignLog2)
+    WasmModuleWriteUleb(buf, offset)
+
+# ---------------------------------------------------------------------------
+# Module header
+# ---------------------------------------------------------------------------
+
+fn WasmModuleWriteHeader(out: var obuf.ObjectBuffer) =
+    # Emit the 8-byte wasm magic header: \0asm + version 1 (little-endian u32).
+    obuf.ObjectBufferWriteU8(out, 0)
+    obuf.ObjectBufferWriteU8(out, int32('a'))
+    obuf.ObjectBufferWriteU8(out, int32('s'))
+    obuf.ObjectBufferWriteU8(out, int32('m'))
+    obuf.ObjectBufferWriteU8(out, 1)
+    obuf.ObjectBufferWriteU8(out, 0)
+    obuf.ObjectBufferWriteU8(out, 0)
+    obuf.ObjectBufferWriteU8(out, 0)
+
+# ---------------------------------------------------------------------------
+# Instruction opcode emitters
+# ---------------------------------------------------------------------------
+
+fn WasmModuleEmitUnreachable(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpUnreachable)
+
+fn WasmModuleEmitNop(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpNop)
+
+fn WasmModuleEmitEnd(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpEnd)
+
+fn WasmModuleEmitReturn(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpReturn)
+
+fn WasmModuleEmitCall(body: var obuf.ObjectBuffer,
+                       functionIndex: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpCall)
+    WasmModuleWriteUleb(body, functionIndex)
+
+fn WasmModuleEmitI32Const(body: var obuf.ObjectBuffer,
+                           value: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Const)
+    WasmModuleWriteSlebI32(body, value)
+
+fn WasmModuleEmitLocalGet(body: var obuf.ObjectBuffer,
+                           localIndex: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpLocalGet)
+    WasmModuleWriteUleb(body, localIndex)
+
+fn WasmModuleEmitLocalSet(body: var obuf.ObjectBuffer,
+                           localIndex: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpLocalSet)
+    WasmModuleWriteUleb(body, localIndex)
+
+fn WasmModuleEmitLocalTee(body: var obuf.ObjectBuffer,
+                           localIndex: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpLocalTee)
+    WasmModuleWriteUleb(body, localIndex)
+
+fn WasmModuleEmitGlobalGet(body: var obuf.ObjectBuffer,
+                            globalIndex: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpGlobalGet)
+    WasmModuleWriteUleb(body, globalIndex)
+
+fn WasmModuleEmitGlobalSet(body: var obuf.ObjectBuffer,
+                            globalIndex: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpGlobalSet)
+    WasmModuleWriteUleb(body, globalIndex)
+
+fn WasmModuleEmitI32Add(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Add)
+
+fn WasmModuleEmitI32Sub(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Sub)
+
+fn WasmModuleEmitI32Mul(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Mul)
+
+fn WasmModuleEmitI32And(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32And)
+
+fn WasmModuleEmitI32Shl(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Shl)
+
+fn WasmModuleEmitI32ShrS(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32ShrS)
+
+fn WasmModuleEmitI32ShrU(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32ShrU)
+
+fn WasmModuleEmitI32Eqz(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Eqz)
+
+fn WasmModuleEmitI32Eq(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Eq)
+
+fn WasmModuleEmitI32Ne(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Ne)
+
+fn WasmModuleEmitI32LtS(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32LtS)
+
+fn WasmModuleEmitI32LtU(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32LtU)
+
+fn WasmModuleEmitI32GtS(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32GtS)
+
+fn WasmModuleEmitI32GtU(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32GtU)
+
+fn WasmModuleEmitI32LeS(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32LeS)
+
+fn WasmModuleEmitI32LeU(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32LeU)
+
+fn WasmModuleEmitI32GeS(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32GeS)
+
+fn WasmModuleEmitI32GeU(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32GeU)
+
+fn WasmModuleEmitI32Load(body: var obuf.ObjectBuffer,
+                          alignLog2: int32,
+                          offset: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Load)
+    WasmModuleWriteMemoryArg(body, alignLog2, offset)
+
+fn WasmModuleEmitI32Load8U(body: var obuf.ObjectBuffer,
+                            alignLog2: int32,
+                            offset: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Load8U)
+    WasmModuleWriteMemoryArg(body, alignLog2, offset)
+
+fn WasmModuleEmitI32Store(body: var obuf.ObjectBuffer,
+                           alignLog2: int32,
+                           offset: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Store)
+    WasmModuleWriteMemoryArg(body, alignLog2, offset)
+
+fn WasmModuleEmitI32Store8(body: var obuf.ObjectBuffer,
+                            alignLog2: int32,
+                            offset: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Store8)
+    WasmModuleWriteMemoryArg(body, alignLog2, offset)
+
+fn WasmModuleEmitI32Store16(body: var obuf.ObjectBuffer,
+                             alignLog2: int32,
+                             offset: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpI32Store16)
+    WasmModuleWriteMemoryArg(body, alignLog2, offset)
+
+fn WasmModuleEmitSelect(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpSelect)
+
+fn WasmModuleEmitBlock(body: var obuf.ObjectBuffer,
+                        blockType: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpBlock)
+    obuf.ObjectBufferWriteU8(body, blockType)
+
+fn WasmModuleEmitLoop(body: var obuf.ObjectBuffer,
+                       blockType: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpLoop)
+    obuf.ObjectBufferWriteU8(body, blockType)
+
+fn WasmModuleEmitIf(body: var obuf.ObjectBuffer,
+                     blockType: int32) =
+    obuf.ObjectBufferWriteU8(body, WasmOpIf)
+    obuf.ObjectBufferWriteU8(body, blockType)
+
+fn WasmModuleEmitElse(body: var obuf.ObjectBuffer) =
+    obuf.ObjectBufferWriteU8(body, WasmOpElse)
+
+# ---------------------------------------------------------------------------
+# Section builders
+# ---------------------------------------------------------------------------
+
+# Build type section payload for a single function type signature.
+# Emits: count(u32) + functype(u8) + params(u32) + params* + results(u32) + results*
+fn WasmModuleBuildTypeSectionPayload(paramCount: int32,
+                                      hasResult: bool): obuf.ObjectBuffer =
+    var sec = obuf.ObjectBufferInit(16)
+    WasmModuleWriteUleb(sec, 1)
+    obuf.ObjectBufferWriteU8(sec, 0x60)
+    WasmModuleWriteUleb(sec, paramCount)
+    for _ in 0..<paramCount:
+        obuf.ObjectBufferWriteU8(sec, WasmValTypeI32)
+    if hasResult:
+        WasmModuleWriteUleb(sec, 1)
+        obuf.ObjectBufferWriteU8(sec, WasmValTypeI32)
+    else:
+        WasmModuleWriteUleb(sec, 0)
+    return sec
+
+# Build the import section payload for a set of function imports
+# plus an implicit memory import ("env" "memory").
+# Memory import is always first, followed by function imports.
+fn WasmModuleBuildImportSectionPayload(importNames: str[]): obuf.ObjectBuffer =
+    let totalImports = importNames.len + 1
+    var sec = obuf.ObjectBufferInit(64)
+    WasmModuleWriteUleb(sec, totalImports)
+    # Memory import: (import "env" "memory" (memory 1 512))
+    WasmModuleWriteName(sec, "env")
+    WasmModuleWriteName(sec, "memory")
+    obuf.ObjectBufferWriteU8(sec, WasmImportKindMemory)
+    obuf.ObjectBufferWriteU8(sec, WasmMemoryMinPages)
+    WasmModuleWriteUleb(sec, WasmMemoryMaxPages)
+    # Function imports
+    for i in 0..<importNames.len:
+        WasmModuleWriteName(sec, "env")
+        WasmModuleWriteName(sec, importNames[i])
+        obuf.ObjectBufferWriteU8(sec, WasmImportKindFunction)
+        WasmModuleWriteUleb(sec, 0)
+    return sec
+
+# Build the function section payload.
+# Maps each defined function to its type index in the type section.
+fn WasmModuleBuildFunctionSectionPayload(functionTypeIndices: int32[]): obuf.ObjectBuffer =
+    var sec = obuf.ObjectBufferInit(16)
+    WasmModuleWriteUleb(sec, functionTypeIndices.len)
+    for i in 0..<functionTypeIndices.len:
+        WasmModuleWriteUleb(sec, functionTypeIndices[i])
+    return sec
+
+# Build the global section payload for a single mutable i32 global.
+fn WasmModuleBuildGlobalSectionPayload(globalInitExprBytes: Bytes): obuf.ObjectBuffer =
+    var sec = obuf.ObjectBufferInit(16)
+    WasmModuleWriteUleb(sec, 1)
+    obuf.ObjectBufferWriteU8(sec, WasmValTypeI32)
+    obuf.ObjectBufferWriteU8(sec, WasmGlobalMut)
+    obuf.ObjectBufferWriteBytes(sec, globalInitExprBytes)
+    return sec
+
+# Build the export section payload.
+# Each export: name (str), kind (u8), index (uleb).
+fn WasmModuleBuildExportSectionPayload(exportNames: str[],
+                                        exportKinds: int32[],
+                                        exportIndices: int32[]): obuf.ObjectBuffer =
+    var sec = obuf.ObjectBufferInit(32)
+    WasmModuleWriteUleb(sec, exportNames.len)
+    for i in 0..<exportNames.len:
+        WasmModuleWriteName(sec, exportNames[i])
+        obuf.ObjectBufferWriteU8(sec, exportKinds[i])
+        WasmModuleWriteUleb(sec, exportIndices[i])
+    return sec
+
+# Initialize a code section payload by writing the function count.
+# Returns the buffer to which individual bodies are appended.
+fn WasmModuleInitCodePayload(functionCount: int32): obuf.ObjectBuffer =
+    var sec = obuf.ObjectBufferInit(128)
+    WasmModuleWriteUleb(sec, functionCount)
+    return sec
+
+# Append a single function body to the code section payload.
+# The body bytes already include the locals declaration prefix and bytecode.
+# This writes: uleb(bodySize) + bodyBytes.
+fn WasmModuleAppendFunctionBody(codePayload: var obuf.ObjectBuffer,
+                                 bodyBytes: Bytes) =
+    WasmModuleWriteUleb(codePayload, BytesLen(bodyBytes))
+    obuf.ObjectBufferWriteBytes(codePayload, bodyBytes)
+
+# Build a function body with a locals declaration prefix.
+# localsDecl is encoded as uleb(count) + valtype for each group.
+# For no locals, pass an empty Bytes.
+fn WasmModuleBuildFunctionBody(localsDecl: Bytes,
+                                bytecode: Bytes): Bytes =
+    var body = obuf.ObjectBufferInit(32)
+    WasmModuleWriteUleb(body, BytesLen(localsDecl) + BytesLen(bytecode))
+    obuf.ObjectBufferWriteBytes(body, localsDecl)
+    obuf.ObjectBufferWriteBytes(body, bytecode)
+    return obuf.ObjectBufferToBytes(body)
+
+# Build a data section payload with one active data segment.
+# data segment: 0x00 (active, memory 0) + i32.const(offset) + end + size + data.
+fn WasmModuleBuildDataSectionPayload(offset: int32,
+                                      dataBytes: Bytes): obuf.ObjectBuffer =
+    var sec = obuf.ObjectBufferInit(32)
+    WasmModuleWriteUleb(sec, 1)
+    obuf.ObjectBufferWriteU8(sec, 0x00)
+    obuf.ObjectBufferWriteU8(sec, WasmOpI32Const)
+    WasmModuleWriteSlebI32(sec, offset)
+    obuf.ObjectBufferWriteU8(sec, WasmOpEnd)
+    WasmModuleWriteUleb(sec, BytesLen(dataBytes))
+    obuf.ObjectBufferWriteBytes(sec, dataBytes)
+    return sec
+
+# String literal pool: accumulates C-style strings into a data segment.
+type
+    WasmStringLiteralPool =
+        buffer: obuf.ObjectBuffer
+        baseAddr: int32
+        initialized: bool
+
+fn WasmStringLiteralPoolInit(pool: var WasmStringLiteralPool,
+                               baseAddr: int32) =
+    pool.buffer = obuf.ObjectBufferInit(64)
+    pool.baseAddr = baseAddr
+    pool.initialized = true
+
+fn WasmStringLiteralPoolDispose(pool: var WasmStringLiteralPool) =
+    if pool.initialized:
+        pool.buffer = obuf.ObjectBufferInit(64)
+        pool.initialized = false
+
+fn WasmStringLiteralPoolRegister(pool: var WasmStringLiteralPool,
+                                  text: str,
+                                  addrOut: var int32,
+                                  lenOut: var int32): bool =
+    if !pool.initialized || Len(text) <= 0:
+        return false
+    addrOut = pool.baseAddr + obuf.ObjectBufferLen(pool.buffer)
+    lenOut = Len(text)
+    for i in 0..<Len(text):
+        obuf.ObjectBufferWriteU8(pool.buffer, int32(text[i]))
+    return true
+
+fn WasmStringLiteralPoolBuildDataSection(pool: WasmStringLiteralPool): obuf.ObjectBuffer =
+    if !pool.initialized || obuf.ObjectBufferLen(pool.buffer) <= 0:
+        return obuf.ObjectBufferInit(0)
+    return WasmModuleBuildDataSectionPayload(pool.baseAddr,
+                                              obuf.ObjectBufferToBytes(pool.buffer))
+
+# ---------------------------------------------------------------------------
+# High-level module builder
+# ---------------------------------------------------------------------------
+
+# Build an entire wasm module from its constituent parts.
+#
+# Parameters:
+#   typePayload       - the type section payload (from WasmModuleBuildTypeSectionPayload)
+#   importPayload     - the import section payload (from WasmModuleBuildImportSectionPayload),
+#                        pass empty buffer to skip
+#   functionPayload  - the function section payload (from WasmModuleBuildFunctionSectionPayload)
+#   globalPayload    - the global section payload, pass empty buffer to skip
+#   exportPayload    - the export section payload (from WasmModuleBuildExportSectionPayload)
+#   codePayload      - the code section payload (from WasmModuleInitCodePayload / AppendFunctionBody)
+#   dataPayload      - the data section payload, pass empty buffer to skip
+fn WasmModuleAssemble(typePayload: obuf.ObjectBuffer,
+                       importPayload: obuf.ObjectBuffer,
+                       functionPayload: obuf.ObjectBuffer,
+                       globalPayload: obuf.ObjectBuffer,
+                       exportPayload: obuf.ObjectBuffer,
+                       codePayload: obuf.ObjectBuffer,
+                       dataPayload: obuf.ObjectBuffer): Bytes =
+    var out = obuf.ObjectBufferInit(256)
+    WasmModuleWriteHeader(out)
+    WasmModuleWriteSection(out, WasmSectionIdType, typePayload)
+    if obuf.ObjectBufferLen(importPayload) > 0:
+        WasmModuleWriteSection(out, WasmSectionIdImport, importPayload)
+    WasmModuleWriteSection(out, WasmSectionIdFunction, functionPayload)
+    if obuf.ObjectBufferLen(globalPayload) > 0:
+        WasmModuleWriteSection(out, WasmSectionIdGlobal, globalPayload)
+    WasmModuleWriteSection(out, WasmSectionIdExport, exportPayload)
+    WasmModuleWriteSection(out, WasmSectionIdCode, codePayload)
+    if obuf.ObjectBufferLen(dataPayload) > 0:
+        WasmModuleWriteSection(out, WasmSectionIdData, dataPayload)
+    return obuf.ObjectBufferToBytes(out)
+
+# ---------------------------------------------------------------------------
+# "Hello world" minimal module: main() -> 0
+#
+# Emits:
+#   Type  section: 1 type (params=0, result=i32)
+#   Function section: 1 function at type index 0
+#   Export section: export "main" as function index 0
+#   Code   section: 1 body = i32.const 0 + end
+#
+# The resulting .wasm file is 37 bytes.
+# ---------------------------------------------------------------------------
+
+fn WasmModuleBuildReturnZeroModule(): Bytes =
+    var codePayload = WasmModuleInitCodePayload(1)
+    var bodyBytes = obuf.ObjectBufferInit(8)
+    # No locals
+    WasmModuleWriteUleb(bodyBytes, 0)
+    # i32.const 0; end
+    WasmModuleEmitI32Const(bodyBytes, 0)
+    WasmModuleEmitEnd(bodyBytes)
+    WasmModuleAppendFunctionBody(codePayload, obuf.ObjectBufferToBytes(bodyBytes))
+
+    var functionTypes: int32[]
+    add(functionTypes, 0)
+
+    var exportNames: str[]
+    add(exportNames, "main")
+    var exportKinds: int32[]
+    add(exportKinds, WasmExportKindFunction)
+    var exportIndices: int32[]
+    add(exportIndices, 0)
+
+    let moduleBytes = WasmModuleAssemble(
+        WasmModuleBuildTypeSectionPayload(0, true),
+        obuf.ObjectBufferInit(0),
+        WasmModuleBuildFunctionSectionPayload(functionTypes),
+        obuf.ObjectBufferInit(0),
+        WasmModuleBuildExportSectionPayload(exportNames, exportKinds, exportIndices),
+        codePayload,
+        obuf.ObjectBufferInit(0))
+    return moduleBytes

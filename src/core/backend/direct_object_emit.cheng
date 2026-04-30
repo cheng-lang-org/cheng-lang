@@ -49,6 +49,14 @@ fn DirectObjectEmitTargetSupported(plan: pobj.PrimaryObjectPlan): bool =
         return true
     return DirectObjectEmitWasmTargetSupported(plan)
 
+fn DirectObjectEmitPlanForTarget(plan: pobj.PrimaryObjectPlan,
+                                 targetTriple: str,
+                                 objectFormat: str): pobj.PrimaryObjectPlan =
+    var out = plan
+    out.targetTriple = targetTriple
+    out.objectFormat = objectFormat
+    return out
+
 fn DirectObjectEmitWriteObject(rootDir: str,
                                plan: pobj.PrimaryObjectPlan,
                                text: Bytes,
@@ -567,6 +575,30 @@ fn DirectObjectEmitEntryBridgeTargetSymbol(plan: pobj.PrimaryObjectPlan): str =
         return plan.symbolNames[0]
     return ""
 
+fn DirectObjectEmitPlanFunctionCount(plan: pobj.PrimaryObjectPlan): int32 =
+    var count = plan.functionBodyKinds.len
+    if plan.functionWordCounts.len < count:
+        count = plan.functionWordCounts.len
+    if plan.functionWordOffsets.len < count:
+        count = plan.functionWordOffsets.len
+    if plan.itemIds.len < count:
+        count = plan.itemIds.len
+    return count
+
+fn DirectObjectEmitPlanSymbolNameAt(plan: pobj.PrimaryObjectPlan,
+                                    index: int32): str =
+    if index >= 0 && index < plan.symbolNames.len:
+        return plan.symbolNames[index]
+    if index >= 0 &&
+       index < plan.functionBodyKinds.len &&
+       plan.functionBodyKinds[index] == texpr.BodyKindEntryBridge:
+        return pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_program_argv_entry")
+    if index >= 0 && index < plan.itemIds.len:
+        return pobj.PrimaryTargetSymbolName(plan.targetTriple, Fmt"cheng_synthetic_item_{strings.IntToStr(plan.itemIds[index])}")
+    if index >= 0:
+        return pobj.PrimaryTargetSymbolName(plan.targetTriple, Fmt"cheng_synthetic_fn_{strings.IntToStr(index)}")
+    return ""
+
 fn DirectObjectEmitEntryBridgeIndex(plan: pobj.PrimaryObjectPlan): int32 =
     for i in 0..<plan.functionBodyKinds.len:
         if plan.functionBodyKinds[i] == texpr.BodyKindEntryBridge:
@@ -577,7 +609,7 @@ fn DirectObjectEmitRealFunctionLimit(plan: pobj.PrimaryObjectPlan): int32 =
     let bridgeIndex = DirectObjectEmitEntryBridgeIndex(plan)
     if bridgeIndex >= 0:
         return bridgeIndex
-    return plan.functionBodyKinds.len
+    return DirectObjectEmitPlanFunctionCount(plan)
 
 fn DirectObjectEmitEntryFunctionIndex(plan: pobj.PrimaryObjectPlan,
                                        functionLimit: int32): int32 =
@@ -1005,7 +1037,7 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
         let bodyKind = plan.functionBodyKinds[i]
         if DirectObjectEmitExpectedWordsForPlanFunction(plan, i) <= 0 ||
            bodyKind == texpr.BodyKindEntryBridge:
-            return Err[bool](Fmt" direct object emit: standalone unsupported body kind: {bodyKind}")
+            return Err[bool](" direct object emit: standalone unsupported body kind")
     return Err[bool](" direct object emit: standalone object requires unsupported codegen")
 
 fn DirectObjectEmitValidateStandaloneMain(plan: pobj.PrimaryObjectPlan): Result[bool] =
@@ -1030,23 +1062,28 @@ fn DirectObjectEmitCanReturnZeroObject(plan: pobj.PrimaryObjectPlan): bool =
 fn DirectObjectEmitValidatePlanObject(plan: pobj.PrimaryObjectPlan): Result[bool] =
     if DirectObjectEmitCanPlanObject(plan):
         if !DirectObjectEmitTargetSupported(plan):
-            return Err[bool](Fmt" direct object emit: unsupported target: {plan.targetTriple}")
-        if plan.symbolNames.len != plan.functionBodyKinds.len ||
-           plan.symbolNames.len != plan.functionWordCounts.len ||
-           plan.symbolNames.len != plan.functionWordOffsets.len:
-            return Err[bool](" direct object emit: malformed function symbol/word tables")
+            return Err[bool](" direct object emit: unsupported target")
+        let functionCount = DirectObjectEmitPlanFunctionCount(plan)
+        if plan.symbolNames.len > functionCount:
+            return Err[bool](" direct object emit: malformed symbol/body-kind tables: symbols-extra")
+        if plan.functionBodyKinds.len != functionCount:
+            return Err[bool](" direct object emit: malformed symbol/body-kind tables: body-table-extra")
+        if plan.functionWordCounts.len != functionCount:
+            return Err[bool](" direct object emit: malformed symbol/word-count tables")
+        if plan.functionWordOffsets.len != functionCount:
+            return Err[bool](" direct object emit: malformed symbol/word-offset tables")
         if !DirectObjectEmitInstructionWordsMaterialized(plan):
             return Err[bool](" direct object emit: missing instruction words")
         var requiredWords: int32
-        for i in 0..<plan.functionWordOffsets.len:
+        for i in 0..<functionCount:
             let endWord = plan.functionWordOffsets[i] + plan.functionWordCounts[i]
             if endWord > requiredWords:
                 requiredWords = endWord
         if requiredWords != plan.instructionWords.len:
-            return Err[bool](Fmt" direct object emit: instruction word count mismatch expected={strings.IntToStr(requiredWords)} actual={strings.IntToStr(plan.instructionWords.len)}")
+            return Err[bool](" direct object emit: instruction word count mismatch")
         return Ok[bool](true)
     if !DirectObjectEmitTargetSupported(plan):
-        return Err[bool](Fmt" direct object emit: unsupported target: {plan.targetTriple}")
+        return Err[bool](" direct object emit: unsupported target")
     if Len(plan.outputPath) <= 0:
         return Err[bool](" direct object emit: missing output path")
     if plan.missingReasons.len > 0:
@@ -1113,11 +1150,15 @@ fn DirectObjectEmitPlanData(plan: pobj.PrimaryObjectPlan,
 
 fn DirectObjectEmitPlanSymbols(plan: pobj.PrimaryObjectPlan): osym.ObjectSymbolTable =
     var symbols = osym.ObjectSymbolsInit()
-    for i in 0..<plan.symbolNames.len:
+    let functionCount = DirectObjectEmitPlanFunctionCount(plan)
+    for i in 0..<functionCount:
         let offset = int64(plan.functionWordOffsets[i] * 4)
         let size = int64(plan.functionWordCounts[i] * 4)
+        let symbolName = DirectObjectEmitPlanSymbolNameAt(plan, i)
+        if Len(symbolName) <= 0:
+            continue
         DirectObjectEmitRequireIndex(osym.ObjectSymbolsAddDefined(symbols,
-                                                                  plan.symbolNames[i],
+                                                                  symbolName,
                                                                   0,
                                                                   offset,
                                                                   size,
@@ -1137,7 +1178,7 @@ fn DirectObjectEmitPlanSymbols(plan: pobj.PrimaryObjectPlan): osym.ObjectSymbolT
                                                                   false),
                                      "direct object emit: add plan data symbol")
         dataOffset = dataOffset + payloadSize
-    for i in 0..<plan.symbolNames.len:
+    for i in 0..<functionCount:
         if DirectObjectEmitFunctionLooksEntryBridgeWords(plan, i):
             DirectObjectEmitRequireIndex(osym.ObjectSymbolsAddUndefined(symbols,
                                                                         DirectObjectEmitEntryBridgeSetCmdLineSymbol(plan),
@@ -1326,9 +1367,23 @@ fn DirectObjectEmitPlanObject(rootDir: str,
     out.directObjectEmitMs = write.directObjectEmitMs
     return Ok[DirectObjectEmitResult](out)
 
+fn DirectObjectEmitPlanObjectForTarget(rootDir: str,
+                                       plan: pobj.PrimaryObjectPlan,
+                                       targetTriple: str,
+                                       objectFormat: str): Result[DirectObjectEmitResult] =
+    let emitPlan = DirectObjectEmitPlanForTarget(plan, targetTriple, objectFormat)
+    return DirectObjectEmitPlanObject(rootDir, emitPlan)
+
 fn DirectObjectEmitStandaloneMain(rootDir: str,
                                    plan: pobj.PrimaryObjectPlan): Result[DirectObjectEmitResult] =
     let validRes = DirectObjectEmitValidateStandaloneMain(plan)
     if IsErr(validRes):
         return Err[DirectObjectEmitResult](Error(validRes))
     return DirectObjectEmitWriteStandaloneMain(rootDir, plan)
+
+fn DirectObjectEmitStandaloneMainForTarget(rootDir: str,
+                                           plan: pobj.PrimaryObjectPlan,
+                                           targetTriple: str,
+                                           objectFormat: str): Result[DirectObjectEmitResult] =
+    let emitPlan = DirectObjectEmitPlanForTarget(plan, targetTriple, objectFormat)
+    return DirectObjectEmitStandaloneMain(rootDir, emitPlan)

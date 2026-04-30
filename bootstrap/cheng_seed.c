@@ -3230,7 +3230,7 @@ static bool cheng_seed_flag_present(int argc, char **argv, const char *flag) {
 #define CHENG_MAX_ASM_LOCALS 1024
 #define CHENG_MAX_TYPE_TEXT 512
 #define CHENG_MAX_DEFAULT_EXPR 4096
-#define CHENG_PROVIDER_OBJECT_CACHE_VERSION "provider-object-cache-v11"
+#define CHENG_PROVIDER_OBJECT_CACHE_VERSION "provider-object-cache-v12"
 #define CHENG_PRIMARY_OBJECT_CACHE_VERSION "primary-object-cache-v1"
 
 typedef struct {
@@ -45543,6 +45543,7 @@ static bool cheng_seed_emit_for_statement(const ChengSeedSystemLinkPlanStub *pla
                 end_expr);
         return false;
     }
+    cheng_seed_emit_load_slot(out, cap, &locals[counter_local_index], 11);
     if (end_inclusive) {
         if (cheng_seed_active_target_is_linux_x86_64()) {
             cheng_seed_text_appendf(out, cap,
@@ -48720,6 +48721,11 @@ static bool cheng_seed_provider_export_roots_for_module(const ChengSeedSystemLin
             "cheng_rawmem_write_i8",
             "cheng_register_line_map_from_argv0",
             "cheng_seq_set_grow",
+            "cheng_seq_header_buffer_get",
+            "cheng_seq_header_len_get",
+            "cheng_seq_header_len_set",
+            "cheng_seq_string_release_range_compat",
+            "cheng_seq_zero_tail_raw",
             "cheng_seq_string_buffer_register_compat",
             "cheng_seq_string_elem_bytes_compat",
             "cheng_seq_string_register_compat",
