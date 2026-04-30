@@ -1,0 +1,166 @@
+const
+    VpnProxyTunMtu = 1500
+    VpnProxyTunTcpPayloadChunkBytes = 1200
+    VpnProxyTunMaxTcpSessions = 256
+    VpnProxyTunMaxServerRetransmitSegments = 64
+    VpnProxyTunMaxServerRetransmitBytes = 262144
+    VpnProxyTunConnectTimeoutMs = 3000
+    VpnProxyTunSendWaitTimeoutMs = 3000
+    VpnProxyTunSocketReadIdleTimeoutMs = 0
+    VpnProxyTunHotPathLogLimit = 80
+    VpnProxyTunFakeDnsHost = "198.18.0.1"
+    VpnProxyTunFakeIpPrefix = "198.18."
+    VpnProxyTunRouteModeGlobal = 1
+    VpnProxyTunTransportDirect = 0
+    VpnProxyTunTransportProxy = 1
+    VpnProxyTunTransportDirectSs = 2
+    VpnProxyTunUdpForward = 0
+    VpnProxyTunUdpDrop = 1
+    VpnProxyTunUdpReject = 2
+    VpnProxyTunRuleDomain = 1
+    VpnProxyTunRuleDomainSuffix = 2
+    VpnProxyTunRuleDomainKeyword = 3
+    VpnProxyTunRuleTargetDirect = 0
+    VpnProxyTunRuleTargetProxy = 1
+    VpnProxyTunRuleTargetReject = 2
+
+fn VpnProxyTunMtuValue(): int32 =
+    return VpnProxyTunMtu
+
+fn VpnProxyTunTcpPayloadChunkBytesValue(): int32 =
+    return VpnProxyTunTcpPayloadChunkBytes
+
+fn VpnProxyTunHotPathLogLimitValue(): int64 =
+    return Int64(VpnProxyTunHotPathLogLimit)
+
+fn VpnProxyTunLowerAsciiChar(ch: char): char =
+    if ch >= 'A' && ch <= 'Z':
+        return Char(Int32(ch) + 32)
+    return ch
+
+fn VpnProxyTunRegionEqualsAsciiFold(value: str, start: int32, suffix: str): bool =
+    if start < 0:
+        return false
+    if start + len(suffix) > len(value):
+        return false
+    for i in 0..<len(suffix):
+        if VpnProxyTunLowerAsciiChar(value[start + i]) != VpnProxyTunLowerAsciiChar(suffix[i]):
+            return false
+    return true
+
+fn VpnProxyTunEndsWithDomain(valueRaw: str, suffixRaw: str): bool =
+    let valueLen: int32 = len(valueRaw)
+    let suffixLen: int32 = len(suffixRaw)
+    if valueLen == suffixLen:
+        return VpnProxyTunRegionEqualsAsciiFold(valueRaw, 0, suffixRaw)
+    if valueLen <= suffixLen:
+        return false
+    if valueRaw[valueLen - suffixLen - 1] != '.':
+        return false
+    return VpnProxyTunRegionEqualsAsciiFold(valueRaw, valueLen - suffixLen, suffixRaw)
+
+fn VpnProxyTunStartsWithText(valueRaw: str, prefixRaw: str): bool =
+    if len(valueRaw) < len(prefixRaw):
+        return false
+    return VpnProxyTunRegionEqualsAsciiFold(valueRaw, 0, prefixRaw)
+
+fn VpnProxyTunContainsAsciiFold(valueRaw: str, needleRaw: str): bool =
+    if len(needleRaw) <= 0:
+        return true
+    if len(valueRaw) < len(needleRaw):
+        return false
+    for i in 0..<(len(valueRaw) - len(needleRaw) + 1):
+        if VpnProxyTunRegionEqualsAsciiFold(valueRaw, i, needleRaw):
+            return true
+    return false
+
+fn VpnProxyTunRuleMatchesDomain(domain: str, ruleKind: int32, pattern: str): bool =
+    if ruleKind == VpnProxyTunRuleDomain:
+        return len(domain) == len(pattern) && VpnProxyTunRegionEqualsAsciiFold(domain, 0, pattern)
+    if ruleKind == VpnProxyTunRuleDomainSuffix:
+        return VpnProxyTunEndsWithDomain(domain, pattern)
+    if ruleKind == VpnProxyTunRuleDomainKeyword:
+        return VpnProxyTunContainsAsciiFold(domain, pattern)
+    return false
+
+fn VpnProxyTunRuleShouldFakeDomain(domain: str, ruleKind: int32, pattern: str, target: int32): bool =
+    return VpnProxyTunRuleMatchesDomain(domain, ruleKind, pattern) && target == VpnProxyTunRuleTargetProxy
+
+fn VpnProxyTunShouldFakeDomain(domain: str): bool =
+    return VpnProxyTunEndsWithDomain(domain, "google.com") ||
+           VpnProxyTunEndsWithDomain(domain, "gstatic.com") ||
+           VpnProxyTunEndsWithDomain(domain, "googleapis.com") ||
+           VpnProxyTunEndsWithDomain(domain, "googleusercontent.com") ||
+           VpnProxyTunEndsWithDomain(domain, "ggpht.com") ||
+           VpnProxyTunEndsWithDomain(domain, "youtube.com") ||
+           VpnProxyTunEndsWithDomain(domain, "ytimg.com") ||
+           VpnProxyTunEndsWithDomain(domain, "googlevideo.com") ||
+           VpnProxyTunEndsWithDomain(domain, "gmail.com") ||
+           VpnProxyTunEndsWithDomain(domain, "httpdns-browser.platform.dbankcloud.cn")
+
+fn VpnProxyTunIsFakeIp(ipText: str): bool =
+    return len(ipText) >= 7 &&
+           ipText[0] == '1' &&
+           ipText[1] == '9' &&
+           ipText[2] == '8' &&
+           ipText[3] == '.' &&
+           ipText[4] == '1' &&
+           ipText[5] == '8' &&
+           ipText[6] == '.'
+
+fn VpnProxyTunShouldProxyIpDirectly(ipText: str): bool =
+    return VpnProxyTunStartsWithText(ipText, "216.239.") ||
+           VpnProxyTunStartsWithText(ipText, "142.250.") ||
+           VpnProxyTunStartsWithText(ipText, "142.251.") ||
+           VpnProxyTunStartsWithText(ipText, "172.217.") ||
+           VpnProxyTunStartsWithText(ipText, "172.253.") ||
+           VpnProxyTunStartsWithText(ipText, "74.125.") ||
+           VpnProxyTunStartsWithText(ipText, "64.233.") ||
+           VpnProxyTunStartsWithText(ipText, "108.177.") ||
+           VpnProxyTunStartsWithText(ipText, "173.194.") ||
+           VpnProxyTunStartsWithText(ipText, "209.85.") ||
+           VpnProxyTunStartsWithText(ipText, "91.108.") ||
+           VpnProxyTunStartsWithText(ipText, "149.154.")
+
+fn VpnProxyTunTransportForTarget(ipText: str, fakeDomain: str): int32 =
+    if len(fakeDomain) > 0 || VpnProxyTunIsFakeIp(ipText) || VpnProxyTunShouldProxyIpDirectly(ipText):
+        return VpnProxyTunTransportDirectSs
+    return VpnProxyTunTransportDirect
+
+fn VpnProxyTunUdpActionForTarget(ipText: str, port: int32): int32 =
+    if port == 443 && (VpnProxyTunIsFakeIp(ipText) || VpnProxyTunShouldProxyIpDirectly(ipText)):
+        return VpnProxyTunUdpDrop
+    return VpnProxyTunUdpForward
+
+fn VpnProxyTunTcpChunkBytes(mtu: int32): int32 =
+    var maxPayload: int32
+    if mtu <= 0:
+        maxPayload = VpnProxyTunTcpPayloadChunkBytes
+    else:
+        maxPayload = mtu - 300
+    if maxPayload < 512:
+        return 512
+    if maxPayload > VpnProxyTunTcpPayloadChunkBytes:
+        return VpnProxyTunTcpPayloadChunkBytes
+    return maxPayload
+
+fn VpnProxyTunSessionLimit(): int32 =
+    return VpnProxyTunMaxTcpSessions
+
+fn VpnProxyTunMaxRetransmitSegments(): int32 =
+    return VpnProxyTunMaxServerRetransmitSegments
+
+fn VpnProxyTunMaxRetransmitBytes(): int32 =
+    return VpnProxyTunMaxServerRetransmitBytes
+
+fn VpnProxyTunReadIdleTimeoutMs(): int32 =
+    return VpnProxyTunSocketReadIdleTimeoutMs
+
+fn VpnProxyTunShouldClearConnectedReadTimeout(): bool =
+    return VpnProxyTunSocketReadIdleTimeoutMs == 0
+
+fn VpnProxyTunShouldLogHotPath(currentCount: int64): bool =
+    return currentCount < Int64(VpnProxyTunHotPathLogLimit)
+
+fn VpnProxyTunRouteMode(): int32 =
+    return VpnProxyTunRouteModeGlobal

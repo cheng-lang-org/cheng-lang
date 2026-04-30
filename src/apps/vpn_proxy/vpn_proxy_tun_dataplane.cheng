@@ -1,0 +1,318 @@
+import std/rawbytes as rawbytes
+import std/strutils as strutil
+import cheng/apps/vpn_proxy/vpn_proxy_tun_policy as policy
+
+const
+    VpnTunProtoTcp = 6
+    VpnTunProtoUdp = 17
+    VpnTunPacketDrop = 0
+    VpnTunPacketUdpForward = 1
+    VpnTunPacketUdpDrop = 2
+    VpnTunPacketTcpOpen = 3
+    VpnTunPacketTcpPayload = 4
+    VpnTunPacketTcpAck = 5
+    VpnTunPacketTcpClose = 6
+    VpnTunEventNone = 0
+    VpnTunEventStarted = 1
+    VpnTunEventStopped = 2
+    VpnTunEventSessionOpen = 3
+    VpnTunEventSessionClose = 4
+    VpnTunEventTraffic = 5
+    VpnTunEventDns = 6
+    VpnTunEventError = 7
+
+type
+    VpnTunIpv4Packet =
+        valid: bool
+        proto: int32
+        srcIp: int32
+        dstIp: int32
+        srcPort: int32
+        dstPort: int32
+        ipHeaderLen: int32
+        transportHeaderLen: int32
+        payloadOffset: int32
+        payloadLen: int32
+        tcpFlags: int32
+        tcpSeq: int32
+        tcpAck: int32
+        dstIpText: str
+
+    VpnTunPacketDecision =
+        action: int32
+        transport: int32
+        targetHost: str
+        targetPort: int32
+        eventKind: int32
+        uploadBytes: int64
+        downloadBytes: int64
+
+    VpnTunServerSegment =
+        seq: int32
+        payload: rawbytes.Bytes
+
+    VpnTunTcpSession =
+        key: int64
+        srcIp: int32
+        dstIp: int32
+        srcPort: int32
+        dstPort: int32
+        clientSeq: int32
+        clientAck: int32
+        serverSeq: int32
+        state: int32
+        transport: int32
+        targetHost: str
+        serverHistoryBytes: int32
+        serverHistory: VpnTunServerSegment[]
+
+    VpnTunRuntimeStats =
+        activeSessions: int32
+        openedSessions: int64
+        closedSessions: int64
+        uploadBytes: int64
+        downloadBytes: int64
+        droppedPackets: int64
+        dnsQueries: int64
+        errors: int64
+
+    VpnTunRuntime =
+        sessions: VpnTunTcpSession[]
+        stats: VpnTunRuntimeStats
+        running: bool
+        lastEventKind: int32
+        lastEventText: str
+
+fn VpnTunReadU8(packet: rawbytes.Bytes, offset: int32): int32 =
+    return rawbytes.BytesLen(packet) > offset ? rawbytes.BytesGet(packet, offset) & 255 : 0
+
+fn VpnTunReadU16BE(packet: rawbytes.Bytes, offset: int32): int32 =
+    if rawbytes.BytesLen(packet) < offset + 2:
+        return 0
+    return (VpnTunReadU8(packet, offset) << 8) | VpnTunReadU8(packet, offset + 1)
+
+fn VpnTunReadU32BE(packet: rawbytes.Bytes, offset: int32): int32 =
+    if rawbytes.BytesLen(packet) < offset + 4:
+        return 0
+    return (VpnTunReadU8(packet, offset) << 24) |
+           (VpnTunReadU8(packet, offset + 1) << 16) |
+           (VpnTunReadU8(packet, offset + 2) << 8) |
+           VpnTunReadU8(packet, offset + 3)
+
+fn VpnTunIpTextAt(packet: rawbytes.Bytes, offset: int32): str =
+    return strutil.Join([IntToStr(VpnTunReadU8(packet, offset)),
+                         ".",
+                         IntToStr(VpnTunReadU8(packet, offset + 1)),
+                         ".",
+                         IntToStr(VpnTunReadU8(packet, offset + 2)),
+                         ".",
+                         IntToStr(VpnTunReadU8(packet, offset + 3))], "")
+
+fn VpnTunSessionKey(srcIp: int32, srcPort: int32, dstIp: int32, dstPort: int32): int64 =
+    var h: int64 = int64(146959810)
+    h = (h * int64(16777619)) + Int64(srcIp)
+    h = (h * int64(16777619)) + Int64(srcPort)
+    h = (h * int64(16777619)) + Int64(dstIp)
+    h = (h * int64(16777619)) + Int64(dstPort)
+    return h
+
+fn VpnTunParseIpv4(packet: rawbytes.Bytes, out: var VpnTunIpv4Packet): bool =
+    out.valid = false
+    if rawbytes.BytesLen(packet) < 20:
+        return false
+    let verIhl: int32 = VpnTunReadU8(packet, 0)
+    let version: int32 = (verIhl >> 4) & 15
+    let ihl: int32 = (verIhl & 15) * 4
+    if version != 4 || ihl < 20:
+        return false
+    let totalLen: int32 = VpnTunReadU16BE(packet, 2)
+    if totalLen < ihl || totalLen > rawbytes.BytesLen(packet):
+        return false
+    out.proto = VpnTunReadU8(packet, 9)
+    out.srcIp = VpnTunReadU32BE(packet, 12)
+    out.dstIp = VpnTunReadU32BE(packet, 16)
+    out.ipHeaderLen = ihl
+    out.dstIpText = VpnTunIpTextAt(packet, 16)
+    if out.proto == VpnTunProtoUdp:
+        if totalLen < ihl + 8:
+            return false
+        out.srcPort = VpnTunReadU16BE(packet, ihl)
+        out.dstPort = VpnTunReadU16BE(packet, ihl + 2)
+        out.transportHeaderLen = 8
+        out.payloadOffset = ihl + 8
+        out.payloadLen = totalLen - out.payloadOffset
+        out.valid = true
+        return true
+    if out.proto == VpnTunProtoTcp:
+        if totalLen < ihl + 20:
+            return false
+        let tcpOff: int32 = ((VpnTunReadU8(packet, ihl + 12) >> 4) & 15) * 4
+        if tcpOff < 20 || totalLen < ihl + tcpOff:
+            return false
+        out.srcPort = VpnTunReadU16BE(packet, ihl)
+        out.dstPort = VpnTunReadU16BE(packet, ihl + 2)
+        out.tcpSeq = VpnTunReadU32BE(packet, ihl + 4)
+        out.tcpAck = VpnTunReadU32BE(packet, ihl + 8)
+        out.tcpFlags = VpnTunReadU8(packet, ihl + 13)
+        out.transportHeaderLen = tcpOff
+        out.payloadOffset = ihl + tcpOff
+        out.payloadLen = totalLen - out.payloadOffset
+        out.valid = true
+        return true
+    out.valid = true
+    return true
+
+fn VpnTunFindSession(runtime: VpnTunRuntime, key: int64): int32 =
+    for i in 0..<runtime.sessions.len:
+        if runtime.sessions[i].key == key:
+            return i
+    return -1
+
+fn VpnTunDropAckedServerSegments(session: var VpnTunTcpSession, ack: int32) =
+    var kept: VpnTunServerSegment[]
+    kept = []
+    var keptBytes: int32
+    for i in 0..<session.serverHistory.len:
+        let segment = session.serverHistory[i]
+        let endSeq: int32 = segment.seq + rawbytes.BytesLen(segment.payload)
+        if endSeq > ack:
+            add(kept, segment)
+            keptBytes = keptBytes + rawbytes.BytesLen(segment.payload)
+    session.serverHistory = kept
+    session.serverHistoryBytes = keptBytes
+
+fn VpnTunRememberServerSegment(session: var VpnTunTcpSession, seq: int32, payload: rawbytes.Bytes) =
+    if rawbytes.BytesLen(payload) <= 0:
+        return
+    var segment: VpnTunServerSegment
+    segment.seq = seq
+    segment.payload = rawbytes.BytesSlice(payload, 0, rawbytes.BytesLen(payload))
+    add(session.serverHistory, segment)
+    session.serverHistoryBytes = session.serverHistoryBytes + rawbytes.BytesLen(segment.payload)
+    while session.serverHistory.len > policy.VpnProxyTunMaxRetransmitSegments() ||
+          session.serverHistoryBytes > policy.VpnProxyTunMaxRetransmitBytes():
+        if session.serverHistory.len <= 0:
+            break
+        session.serverHistoryBytes = session.serverHistoryBytes - rawbytes.BytesLen(session.serverHistory[0].payload)
+        delete(session.serverHistory, 0)
+
+fn VpnTunInitRuntime(out: var VpnTunRuntime) =
+    out.sessions = []
+    out.running = true
+    out.lastEventKind = VpnTunEventStarted
+    out.lastEventText = "vpn tun dataplane started"
+
+fn VpnTunStopRuntime(runtime: var VpnTunRuntime) =
+    runtime.sessions = []
+    runtime.stats.activeSessions = 0
+    runtime.running = false
+    runtime.lastEventKind = VpnTunEventStopped
+    runtime.lastEventText = "vpn tun dataplane stopped"
+
+fn VpnTunDecidePacket(runtime: var VpnTunRuntime,
+                      packet: rawbytes.Bytes,
+                      fakeDomain: str,
+                      out: var VpnTunPacketDecision): bool =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(packet, parsed):
+        runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+        runtime.lastEventKind = VpnTunEventError
+        runtime.lastEventText = "vpn tun dataplane invalid packet"
+        out.action = VpnTunPacketDrop
+        return false
+
+    if parsed.proto == VpnTunProtoUdp:
+        let udpAction: int32 = policy.VpnProxyTunUdpActionForTarget(parsed.dstIpText, parsed.dstPort)
+        if udpAction == policy.VpnProxyTunUdpDrop:
+            runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+            out.action = VpnTunPacketUdpDrop
+            out.eventKind = VpnTunEventTraffic
+            return true
+        out.action = VpnTunPacketUdpForward
+        out.targetHost = parsed.dstIpText
+        out.targetPort = parsed.dstPort
+        out.eventKind = VpnTunEventTraffic
+        return true
+
+    if parsed.proto != VpnTunProtoTcp:
+        out.action = VpnTunPacketDrop
+        return true
+
+    let key: int64 = VpnTunSessionKey(parsed.srcIp, parsed.srcPort, parsed.dstIp, parsed.dstPort)
+    let index: int32 = VpnTunFindSession(runtime, key)
+    let isSyn: bool = (parsed.tcpFlags & 2) != 0
+    let isAck: bool = (parsed.tcpFlags & 16) != 0
+    let isFin: bool = (parsed.tcpFlags & 1) != 0
+    let isRst: bool = (parsed.tcpFlags & 4) != 0
+
+    if isSyn && !isAck:
+        if index >= 0:
+            out.action = VpnTunPacketTcpAck
+            out.transport = runtime.sessions[index].transport
+            out.targetHost = runtime.sessions[index].targetHost
+            out.targetPort = runtime.sessions[index].dstPort
+            return true
+        if runtime.sessions.len >= policy.VpnProxyTunSessionLimit():
+            runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+            out.action = VpnTunPacketDrop
+            return true
+        var session: VpnTunTcpSession
+        session.key = key
+        session.srcIp = parsed.srcIp
+        session.dstIp = parsed.dstIp
+        session.srcPort = parsed.srcPort
+        session.dstPort = parsed.dstPort
+        session.clientSeq = parsed.tcpSeq + 1
+        session.clientAck = parsed.tcpAck
+        session.serverSeq = 1
+        session.state = 2
+        session.transport = policy.VpnProxyTunTransportForTarget(parsed.dstIpText, fakeDomain)
+        session.targetHost = len(fakeDomain) > 0 ? fakeDomain : parsed.dstIpText
+        session.serverHistory = []
+        add(runtime.sessions, session)
+        runtime.stats.openedSessions = runtime.stats.openedSessions + int64(1)
+        runtime.stats.activeSessions = runtime.sessions.len
+        runtime.lastEventKind = VpnTunEventSessionOpen
+        runtime.lastEventText = session.targetHost
+        out.action = VpnTunPacketTcpOpen
+        out.transport = session.transport
+        out.targetHost = session.targetHost
+        out.targetPort = session.dstPort
+        out.eventKind = VpnTunEventSessionOpen
+        return true
+
+    if index < 0:
+        out.action = VpnTunPacketDrop
+        return true
+
+    runtime.sessions[index].clientAck = parsed.tcpAck
+    VpnTunDropAckedServerSegments(runtime.sessions[index], parsed.tcpAck)
+
+    if isFin || isRst:
+        delete(runtime.sessions, index)
+        runtime.stats.closedSessions = runtime.stats.closedSessions + int64(1)
+        runtime.stats.activeSessions = runtime.sessions.len
+        runtime.lastEventKind = VpnTunEventSessionClose
+        runtime.lastEventText = parsed.dstIpText
+        out.action = VpnTunPacketTcpClose
+        out.eventKind = VpnTunEventSessionClose
+        return true
+
+    if parsed.payloadLen > 0:
+        runtime.sessions[index].clientSeq = parsed.tcpSeq + parsed.payloadLen
+        runtime.stats.uploadBytes = runtime.stats.uploadBytes + Int64(parsed.payloadLen)
+        runtime.lastEventKind = VpnTunEventTraffic
+        runtime.lastEventText = runtime.sessions[index].targetHost
+        out.action = VpnTunPacketTcpPayload
+        out.transport = runtime.sessions[index].transport
+        out.targetHost = runtime.sessions[index].targetHost
+        out.targetPort = runtime.sessions[index].dstPort
+        out.eventKind = VpnTunEventTraffic
+        out.uploadBytes = Int64(parsed.payloadLen)
+        return true
+
+    out.action = VpnTunPacketTcpAck
+    out.transport = runtime.sessions[index].transport
+    out.targetHost = runtime.sessions[index].targetHost
+    out.targetPort = runtime.sessions[index].dstPort
+    return true

@@ -1,0 +1,104 @@
+import std/rawbytes as rawbytes
+import cheng/apps/vpn_proxy/vpn_proxy_tun_dataplane as tun
+import cheng/apps/vpn_proxy/vpn_proxy_tun_policy as policy
+
+fn put8(buf: var rawbytes.Bytes, idx: int32, value: int32) =
+    rawbytes.BytesSet(buf, idx, value & 255)
+
+fn put16(buf: var rawbytes.Bytes, idx: int32, value: int32) =
+    put8(buf, idx, (value >> 8) & 255)
+    put8(buf, idx + 1, value & 255)
+
+fn put32(buf: var rawbytes.Bytes, idx: int32, value: int32) =
+    put8(buf, idx, (value >> 24) & 255)
+    put8(buf, idx + 1, (value >> 16) & 255)
+    put8(buf, idx + 2, (value >> 8) & 255)
+    put8(buf, idx + 3, value & 255)
+
+fn ipv4Base(proto: int32, totalLen: int32): rawbytes.Bytes =
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(totalLen)
+    put8(out, 0, 0x45)
+    put16(out, 2, totalLen)
+    put8(out, 8, 64)
+    put8(out, 9, proto)
+    put8(out, 12, 10)
+    put8(out, 13, 8)
+    put8(out, 14, 0)
+    put8(out, 15, 2)
+    return out
+
+fn tcpSynPacket(): rawbytes.Bytes =
+    var out: rawbytes.Bytes = ipv4Base(tun.VpnTunProtoTcp, 40)
+    put8(out, 16, 198)
+    put8(out, 17, 18)
+    put8(out, 18, 0)
+    put8(out, 19, 2)
+    put16(out, 20, 40000)
+    put16(out, 22, 443)
+    put32(out, 24, 1000)
+    put8(out, 32, 0x50)
+    put8(out, 33, 0x02)
+    return out
+
+fn tcpPayloadPacket(): rawbytes.Bytes =
+    var out: rawbytes.Bytes = ipv4Base(tun.VpnTunProtoTcp, 45)
+    put8(out, 16, 198)
+    put8(out, 17, 18)
+    put8(out, 18, 0)
+    put8(out, 19, 2)
+    put16(out, 20, 40000)
+    put16(out, 22, 443)
+    put32(out, 24, 1001)
+    put32(out, 28, 2)
+    put8(out, 32, 0x50)
+    put8(out, 33, 0x18)
+    put8(out, 40, int32('h'))
+    put8(out, 41, int32('e'))
+    put8(out, 42, int32('l'))
+    put8(out, 43, int32('l'))
+    put8(out, 44, int32('o'))
+    return out
+
+fn udpGoogleQuicPacket(): rawbytes.Bytes =
+    var out: rawbytes.Bytes = ipv4Base(tun.VpnTunProtoUdp, 28)
+    put8(out, 16, 142)
+    put8(out, 17, 250)
+    put8(out, 18, 73)
+    put8(out, 19, 74)
+    put16(out, 20, 50000)
+    put16(out, 22, 443)
+    put16(out, 24, 8)
+    return out
+
+fn main(): int32 =
+    var runtime: tun.VpnTunRuntime
+    tun.VpnTunInitRuntime(runtime)
+    assert(runtime.running, " tun dataplane runtime started")
+
+    var synDecision: tun.VpnTunPacketDecision
+    let synPacket: rawbytes.Bytes = tcpSynPacket()
+    assert(tun.VpnTunDecidePacket(runtime, synPacket, "www.google.com", synDecision),
+           " tun dataplane tcp syn decision")
+    assert(synDecision.action == tun.VpnTunPacketTcpOpen, " tun dataplane opens tcp session")
+    assert(synDecision.transport == policy.VpnProxyTunTransportDirectSs, " tun dataplane fake domain direct ss")
+    assert(runtime.stats.activeSessions == 1, " tun dataplane active session count")
+
+    var payloadDecision: tun.VpnTunPacketDecision
+    let payloadPacket: rawbytes.Bytes = tcpPayloadPacket()
+    assert(tun.VpnTunDecidePacket(runtime, payloadPacket, "www.google.com", payloadDecision),
+           " tun dataplane tcp payload decision")
+    assert(payloadDecision.action == tun.VpnTunPacketTcpPayload, " tun dataplane payload action")
+    assert(runtime.stats.uploadBytes == int64(5), " tun dataplane upload accounting")
+
+    var quicDecision: tun.VpnTunPacketDecision
+    let quicPacket: rawbytes.Bytes = udpGoogleQuicPacket()
+    assert(tun.VpnTunDecidePacket(runtime, quicPacket, "", quicDecision),
+           " tun dataplane udp decision")
+    assert(quicDecision.action == tun.VpnTunPacketUdpDrop, " tun dataplane drops google quic")
+    assert(runtime.stats.droppedPackets == int64(1), " tun dataplane drop accounting")
+
+    tun.VpnTunStopRuntime(runtime)
+    assert(!runtime.running, " tun dataplane runtime stopped")
+
+    echo(" vpn_proxy_tun_dataplane_smoke ok")
+    return 0

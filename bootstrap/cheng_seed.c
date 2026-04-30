@@ -208,8 +208,7 @@ static const char *ChengSeed_SUPPORTED_COMMANDS_V2[] = {
     "self-check",
     "compile-bootstrap",
     "bootstrap-bridge",
-    "build-backend-driver",
-    "system-link-exec"
+    "build-backend-driver"
 };
 
 static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
@@ -31499,6 +31498,30 @@ static bool cheng_seed_emit_sp_load_reg(char *out,
     return true;
 }
 
+static bool cheng_seed_emit_sp_store_pair(char *out, size_t cap, int left_reg, int right_reg, int32_t offset) {
+    if (offset >= -512 && offset <= 504 && (offset % 8) == 0) {
+        cheng_seed_text_appendf(out, cap, "  stp x%d, x%d, [sp, #%d]\n", left_reg, right_reg, offset);
+        return true;
+    }
+    if (!cheng_seed_emit_sp_offset_address(out, cap, 16, offset)) {
+        return false;
+    }
+    cheng_seed_text_appendf(out, cap, "  stp x%d, x%d, [x16]\n", left_reg, right_reg);
+    return true;
+}
+
+static bool cheng_seed_emit_sp_load_pair(char *out, size_t cap, int left_reg, int right_reg, int32_t offset) {
+    if (offset >= -512 && offset <= 504 && (offset % 8) == 0) {
+        cheng_seed_text_appendf(out, cap, "  ldp x%d, x%d, [sp, #%d]\n", left_reg, right_reg, offset);
+        return true;
+    }
+    if (!cheng_seed_emit_sp_offset_address(out, cap, 16, offset)) {
+        return false;
+    }
+    cheng_seed_text_appendf(out, cap, "  ldp x%d, x%d, [x16]\n", left_reg, right_reg);
+    return true;
+}
+
 static bool cheng_seed_emit_function_epilogue(char *out, size_t cap, int32_t frame_size) {
     if (cheng_seed_active_target_is_linux_x86_64()) {
         if (!cheng_seed_emit_sp_adjust(out, cap, false, frame_size)) {
@@ -31518,10 +31541,10 @@ static bool cheng_seed_emit_function_epilogue(char *out, size_t cap, int32_t fra
     if (save_offset < 0) {
         return false;
     }
-    cheng_seed_text_appendf(out, cap,
-        "  ldp x21, x22, [sp, #%d]\n"
-        "  ldp x19, x20, [sp, #%d]\n",
-        save_offset - 32, save_offset - 16);
+    if (!cheng_seed_emit_sp_load_pair(out, cap, 21, 22, save_offset - 32) ||
+        !cheng_seed_emit_sp_load_pair(out, cap, 19, 20, save_offset - 16)) {
+        return false;
+    }
     if (save_offset <= 504 && (save_offset % 8) == 0) {
         cheng_seed_text_appendf(out, cap, "  ldp x29, x30, [sp, #%d]\n", save_offset);
     } else if (!cheng_seed_emit_sp_offset_address(out, cap, 16, save_offset)) {
@@ -46681,10 +46704,12 @@ static bool cheng_seed_try_emit_scalar_function(const ChengSeedSystemLinkPlanStu
                 free(owned_lines);
                 return false;
             }
-            cheng_seed_text_appendf(out, cap,
-                "  stp x19, x20, [sp, #%d]\n"
-                "  stp x21, x22, [sp, #%d]\n",
-                save_offset - 16, save_offset - 32);
+            if (!cheng_seed_emit_sp_store_pair(out, cap, 19, 20, save_offset - 16) ||
+                !cheng_seed_emit_sp_store_pair(out, cap, 21, 22, save_offset - 32)) {
+                free(lines);
+                free(owned_lines);
+                return false;
+            }
             if (save_offset <= 504 && (save_offset % 8) == 0) {
                 cheng_seed_text_appendf(out, cap, "  stp x29, x30, [sp, #%d]\n", save_offset);
             } else if (!cheng_seed_emit_sp_offset_address(out, cap, 16, save_offset)) {
@@ -48198,10 +48223,12 @@ static bool cheng_seed_append_module_global_init_function(const ChengSeedSystemL
                 free(owned);
                 return false;
             }
-            cheng_seed_text_appendf(out, cap,
-                "  stp x19, x20, [sp, #%d]\n"
-                "  stp x21, x22, [sp, #%d]\n",
-                save_offset - 16, save_offset - 32);
+            if (!cheng_seed_emit_sp_store_pair(out, cap, 19, 20, save_offset - 16) ||
+                !cheng_seed_emit_sp_store_pair(out, cap, 21, 22, save_offset - 32)) {
+                free(lines);
+                free(owned);
+                return false;
+            }
             if (save_offset <= 504 && (save_offset % 8) == 0) {
                 cheng_seed_text_appendf(out, cap, "  stp x29, x30, [sp, #%d]\n", save_offset);
             } else if (!cheng_seed_emit_sp_offset_address(out, cap, 16, save_offset)) {
@@ -64220,16 +64247,20 @@ done:
         cheng_seed_restore_env_value("CHENG_NO_BACKEND_DRIVER_HANDOFF", saved_backend_driver_handoff, had_backend_driver_handoff);
         cheng_seed_restore_env_value("CHENG_PARENT_RSS_GUARD", saved_parent_rss_guard, had_parent_rss_guard);
     }
-    if (rc != 0 && candidate_out[0] != '\0') {
+    const char *keep_failed_candidate = getenv("CHENG_KEEP_FAILED_CANDIDATE");
+    bool keep_failed_candidate_files = keep_failed_candidate != NULL &&
+                                       keep_failed_candidate[0] != '\0' &&
+                                       strcmp(keep_failed_candidate, "0") != 0;
+    if (rc != 0 && !keep_failed_candidate_files && candidate_out[0] != '\0') {
         unlink(candidate_out);
     }
-    if (rc != 0 && candidate_build_out[0] != '\0') {
+    if (rc != 0 && !keep_failed_candidate_files && candidate_build_out[0] != '\0') {
         unlink(candidate_build_out);
     }
-    if (rc != 0 && candidate_out_map[0] != '\0') {
+    if (rc != 0 && !keep_failed_candidate_files && candidate_out_map[0] != '\0') {
         unlink(candidate_out_map);
     }
-    if (rc != 0 && candidate_build_out_map[0] != '\0') {
+    if (rc != 0 && !keep_failed_candidate_files && candidate_build_out_map[0] != '\0') {
         unlink(candidate_build_out_map);
     }
     cheng_seed_release_pid_lock(lock_path, &lock_held);

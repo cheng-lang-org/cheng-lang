@@ -2,12 +2,14 @@ import std/result
 import std/rawbytes
 import std/strformat
 import std/strings
+import std/strutils as strutil
 import cheng/core/tooling/path as chengpath
 import cheng/core/backend/macho_object_writer as macho
 import cheng/core/backend/object_buffer as obuf
 import cheng/core/backend/object_symbols as osym
 import cheng/core/backend/object_relocs as orel
 import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/backend/target_matrix as tmat
 import cheng/core/lang/typed_expr as texpr
 
 type
@@ -40,6 +42,11 @@ fn DirectObjectEmitResultReportText(result: DirectObjectEmitResult): str =
 fn DirectObjectEmitTargetSupported(plan: pobj.PrimaryObjectPlan): bool =
     if plan.targetTriple == "arm64-apple-darwin" && plan.objectFormat == "macho":
         return true
+    if plan.objectFormat == "elf" &&
+       (tmat.TargetIsLinuxAarch64(plan.targetTriple) ||
+        tmat.TargetIsAndroidAarch64(plan.targetTriple) ||
+        tmat.TargetIsOhosAarch64(plan.targetTriple)):
+        return true
     return DirectObjectEmitWasmTargetSupported(plan)
 
 fn DirectObjectEmitWriteObject(rootDir: str,
@@ -48,12 +55,11 @@ fn DirectObjectEmitWriteObject(rootDir: str,
                                data: Bytes,
                                symbols: osym.ObjectSymbolTable,
                                relocs: orel.ObjectRelocTable): Result[DirectObjectEmitResult] =
-    var writeRes: Result[macho.MachOObjectWriterResult]
     if plan.objectFormat == "elf":
         return Err[DirectObjectEmitResult](" direct object emit: ELF writer is outside min driver closure")
     if plan.objectFormat == "coff":
         return Err[DirectObjectEmitResult](" direct object emit: COFF writer is outside min driver closure")
-    writeRes = macho.MachOTextDataObjectWrite(rootDir, plan.outputPath, text, data, symbols, relocs)
+    var writeRes = macho.MachOTextDataObjectWrite(rootDir, plan.outputPath, text, data, symbols, relocs)
     if IsErr(writeRes):
         return Err[DirectObjectEmitResult](Error(writeRes))
     let write = Value(writeRes)
@@ -461,15 +467,10 @@ fn DirectObjectEmitWriteCStringPayload(data: var obuf.ObjectBuffer,
 
 fn DirectObjectEmitCStringLiteralDataLabel(functionSymbol: str,
                                            callOrdinal: int32): str =
-    return pobj.PrimaryCStringLiteralDataLabel(functionSymbol, callOrdinal)
+    return strutil.Join([functionSymbol, "__cheng_cstring_", IntToStr(callOrdinal)], "")
 
 fn DirectObjectEmitCstringLiteralCallCount(plan: pobj.PrimaryObjectPlan,
                                             functionIndex: int32): int32 =
-    if functionIndex >= 0 &&
-       functionIndex < plan.functionStatementReturnModes.len &&
-       plan.functionStatementReturnModes[functionIndex] == pobj.PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0() &&
-       functionIndex < plan.functionStatementCallCounts.len:
-        return plan.functionStatementCallCounts[functionIndex]
     return 0
 
 fn DirectObjectEmitDataLabelByTail(plan: pobj.PrimaryObjectPlan,
@@ -660,10 +661,6 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
     if entryIndex < 0:
         return false
     let entryBodyKind = plan.functionBodyKinds[entryIndex]
-    var entryBodyIrReady = false
-    if entryIndex < plan.functionBodyIRs.len:
-        let entryBodyIR = plan.functionBodyIRs[entryIndex]
-        entryBodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnSupported(entryBodyIR)
     if entryBodyKind != texpr.BodyKindReturnZeroI32 &&
        !DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindReturnCallNoargI32 &&
@@ -674,8 +671,7 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
        !texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindResultRequestDispatch &&
        entryBodyKind != texpr.BodyKindStatementSequence &&
-       entryBodyKind != texpr.BodyKindMainF64MulCheckExit &&
-       !entryBodyIrReady:
+       entryBodyKind != texpr.BodyKindMainF64MulCheckExit:
         return false
     if DirectObjectEmitStandaloneNeedsMainWrapper(plan):
         let wrapperSize = DirectObjectEmitStandaloneWrapperByteSize(plan, functionLimit)
@@ -713,16 +709,9 @@ fn DirectObjectEmitCanStandaloneMain(plan: pobj.PrimaryObjectPlan): bool =
         let cstringCallCount = DirectObjectEmitCstringLiteralCallCount(plan, i)
         if cstringCallCount > 0:
             continue
-        var bodyIrReady = false
-        if i < plan.functionBodyIRs.len:
-            let bodyIR = plan.functionBodyIRs[i]
-            bodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnSupported(bodyIR)
-        if bodyIrReady ||
-           bodyKind == texpr.BodyKindStatementSequence ||
+        if bodyKind == texpr.BodyKindStatementSequence ||
            texpr.TypedExprIsCallRelocBodyKind(bodyKind) ||
            DirectObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
-            if bodyIrReady && i < plan.functionBodyIRs.len:
-                requiredStatementCallCount = plan.functionBodyIRs[i].callSequence.len
             if requiredStatementCallCount <= 0:
                 requiredStatementCallCount = 1
             for callOrdinal in 0..<requiredStatementCallCount:
@@ -881,8 +870,9 @@ fn DirectObjectEmitStandaloneRelocs(plan: pobj.PrimaryObjectPlan,
                                              literalSymbol,
                                              "direct object emit: add cstring page reloc")
         if plan.functionBodyKinds[i] == texpr.BodyKindReturnStrLiteral:
+            let returnLiteralLabel = strutil.Join([plan.symbolNames[i], "__cheng_return_str_literal"], "")
             let literalSymbol = DirectObjectEmitDataLabelExact(plan,
-                                                               pobj.PrimaryReturnStrLiteralDataLabel(plan.symbolNames[i]))
+                                                               returnLiteralLabel)
             DirectObjectEmitAddPageRelocPair(relocs,
                                              symbols,
                                              functionByteOffset + int64(8),
@@ -999,10 +989,6 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
     if entryIndex < 0:
         return Err[bool](" direct object emit: standalone missing entry function")
     let entryBodyKind = plan.functionBodyKinds[entryIndex]
-    var entryBodyIrReady = false
-    if entryIndex < plan.functionBodyIRs.len:
-        let entryBodyIR = plan.functionBodyIRs[entryIndex]
-        entryBodyIrReady = pobj.PrimaryBodyIrIsCallSequenceReturnSupported(entryBodyIR)
     if entryBodyKind != texpr.BodyKindReturnZeroI32 &&
        !DirectObjectEmitIsReturnI32ConstBodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindReturnCallNoargI32 &&
@@ -1013,8 +999,7 @@ fn DirectObjectEmitValidateStandaloneShape(plan: pobj.PrimaryObjectPlan): Result
        !texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(entryBodyKind) &&
        entryBodyKind != texpr.BodyKindResultRequestDispatch &&
        entryBodyKind != texpr.BodyKindStatementSequence &&
-       entryBodyKind != texpr.BodyKindMainF64MulCheckExit &&
-       !entryBodyIrReady:
+       entryBodyKind != texpr.BodyKindMainF64MulCheckExit:
         return Err[bool](" direct object emit: standalone entry must be direct-provider-free")
     for i in 0..<functionLimit:
         let bodyKind = plan.functionBodyKinds[i]
@@ -1030,7 +1015,7 @@ fn DirectObjectEmitValidateStandaloneMain(plan: pobj.PrimaryObjectPlan): Result[
     return Ok[bool](true)
 
 fn DirectObjectEmitCanPlanObject(plan: pobj.PrimaryObjectPlan): bool =
-    return plan.objectFormat == "macho" &&
+    return (plan.objectFormat == "macho" || plan.objectFormat == "elf") &&
            Len(plan.outputPath) > 0 &&
            plan.missingReasons.len <= 0
 
@@ -1253,8 +1238,9 @@ fn DirectObjectEmitPlanRelocs(plan: pobj.PrimaryObjectPlan,
                                              literalSymbol,
                                              "direct object emit: add plan cstring page reloc")
         if plan.functionBodyKinds[i] == texpr.BodyKindReturnStrLiteral:
+            let returnLiteralLabel = strutil.Join([plan.symbolNames[i], "__cheng_return_str_literal"], "")
             let literalSymbol = DirectObjectEmitDataLabelExact(plan,
-                                                               pobj.PrimaryReturnStrLiteralDataLabel(plan.symbolNames[i]))
+                                                               returnLiteralLabel)
             DirectObjectEmitAddPageRelocPair(relocs,
                                              symbols,
                                              functionByteOffset + int64(8),

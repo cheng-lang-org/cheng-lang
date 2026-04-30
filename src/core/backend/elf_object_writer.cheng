@@ -80,19 +80,6 @@ fn elfWriteShdr(buf: var obuf.ObjectBuffer,
     obuf.ObjectBufferWriteU64LE(buf, uint64(addralign))
     obuf.ObjectBufferWriteU64LE(buf, uint64(entsize))
 
-fn elfRelocType(kind: orel.ObjectRelocKind): Result[uint64] =
-    if kind == orel.ObjectRelocAbs64:
-        return Ok[uint64](R_AARCH64_ABS64)
-    if kind == orel.ObjectRelocAbs32:
-        return Ok[uint64](R_AARCH64_ABS32)
-    if kind == orel.ObjectRelocBranch26:
-        return Ok[uint64](R_AARCH64_CALL26)
-    if kind == orel.ObjectRelocPage21:
-        return Ok[uint64](R_AARCH64_ADR_PREL_PG_HI21)
-    if kind == orel.ObjectRelocPageOff12:
-        return Ok[uint64](R_AARCH64_ADD_ABS_LO12_NC)
-    return Err[uint64](" elf object writer: unsupported relocation kind")
-
 fn elfWriteSym(buf: var obuf.ObjectBuffer,
                nameOff: int32,
                info: uint64,
@@ -117,7 +104,7 @@ fn elfWriteRela(buf: var obuf.ObjectBuffer,
 fn ElfTextObjectBytes(text: rawbytes.Bytes,
                        symbols: osym.ObjectSymbolTable,
                        relocs: orel.ObjectRelocTable): Result[rawbytes.Bytes] =
-    var emptyData = rawbytes.emptyBytes()
+    var emptyData = rawbytes.EmptyBytes()
     return elfBuild(text, emptyData, symbols, relocs)
 
 fn ElfTextDataObjectBytes(text: rawbytes.Bytes,
@@ -135,8 +122,8 @@ fn elfBuild(text: rawbytes.Bytes,
     if symbolCount <= 0:
         return Err[rawbytes.Bytes](" elf object writer: missing symbols")
 
-    let textSize = int64(rawbytes.bytesLen(text))
-    let dataSize = int64(rawbytes.bytesLen(data))
+    let textSize = int64(rawbytes.BytesLen(text))
+    let dataSize = int64(rawbytes.BytesLen(data))
     let hasData = dataSize > int64(0)
 
     # Section indices: 0=null, 1=.text, 2=.data(opt), 3/4=.rela.text(opt), N-2=.symtab, N-1=.strtab, N=.shstrtab
@@ -198,14 +185,14 @@ fn elfBuild(text: rawbytes.Bytes,
     obuf.ObjectBufferWriteU8(out, int32(69))
     obuf.ObjectBufferWriteU8(out, int32(76))
     obuf.ObjectBufferWriteU8(out, int32(70))
-    obuf.ObjectBufferWriteU8(out, int32(ELFCLASS64))
-    obuf.ObjectBufferWriteU8(out, int32(ELFDATA2LSB))
-    obuf.ObjectBufferWriteU8(out, int32(EV_CURRENT))
+    obuf.ObjectBufferWriteU8(out, 2)
+    obuf.ObjectBufferWriteU8(out, 1)
+    obuf.ObjectBufferWriteU8(out, 1)
     obuf.ObjectBufferWriteU8(out, int32(0))
     obuf.ObjectBufferWriteU64LE(out, uint64(0))
-    obuf.ObjectBufferWriteU16LE(out, ET_REL)
-    obuf.ObjectBufferWriteU16LE(out, EM_AARCH64)
-    obuf.ObjectBufferWriteU32LE(out, EV_CURRENT)
+    obuf.ObjectBufferWriteU16LE(out, uint64(1))
+    obuf.ObjectBufferWriteU16LE(out, uint64(183))
+    obuf.ObjectBufferWriteU32LE(out, uint64(1))
     obuf.ObjectBufferWriteU64LE(out, uint64(0))
     obuf.ObjectBufferWriteU64LE(out, uint64(0))
     obuf.ObjectBufferWriteU32LE(out, uint64(0))
@@ -227,10 +214,17 @@ fn elfBuild(text: rawbytes.Bytes,
         obuf.ObjectBufferAlign(out, int32(8), 0)
         for i in 0..<relocCount:
             let reloc = orel.ObjectRelocsAt(relocs, i)
-            let typeRes = elfRelocType(reloc.kind)
-            if IsErr(typeRes):
-                return Err[rawbytes.Bytes](Error(typeRes))
-            let rType = Value(typeRes)
+            var rType: uint64 = R_AARCH64_ABS64
+            if int32(reloc.kind) == int32(orel.ObjectRelocAbs32):
+                rType = R_AARCH64_ABS32
+            elif int32(reloc.kind) == int32(orel.ObjectRelocBranch26):
+                rType = R_AARCH64_CALL26
+            elif int32(reloc.kind) == int32(orel.ObjectRelocPage21):
+                rType = R_AARCH64_ADR_PREL_PG_HI21
+            elif int32(reloc.kind) == int32(orel.ObjectRelocPageOff12):
+                rType = R_AARCH64_ADD_ABS_LO12_NC
+            elif int32(reloc.kind) != int32(orel.ObjectRelocAbs64):
+                return Err[rawbytes.Bytes](" elf object writer: unsupported relocation kind")
             let rSym = uint64(reloc.symbolIndex)
             let info = (rSym << 32) | rType
             elfWriteRela(out, reloc.offset, info, reloc.addend)
@@ -240,8 +234,8 @@ fn elfBuild(text: rawbytes.Bytes,
     elfWriteSym(out, int32(0), uint64(0), int32(0), int64(0), int64(0))
     for i in 0..<symbolCount:
         let sym = osym.ObjectSymbolsAt(symbols, i)
-        var bind = STB_LOCAL
-        var stType = STT_NOTYPE
+        var bind: uint64 = STB_LOCAL
+        var stType: uint64 = STT_NOTYPE
         var shndx = int32(0)
         if sym.undefined:
             shndx = int32(0)
@@ -309,7 +303,7 @@ fn elfWriteResult(rootDir: str,
                   data: rawbytes.Bytes,
                   symbols: osym.ObjectSymbolTable,
                   relocs: orel.ObjectRelocTable): Result[ElfWriterResult] =
-    let dataSize = rawbytes.bytesLen(data)
+    let dataSize = rawbytes.BytesLen(data)
     var bytesRes: Result[rawbytes.Bytes]
     if dataSize > 0:
         bytesRes = ElfTextDataObjectBytes(text, data, symbols, relocs)
@@ -318,12 +312,12 @@ fn elfWriteResult(rootDir: str,
     if IsErr(bytesRes):
         return Err[ElfWriterResult](Error(bytesRes))
     let bytes = Value(bytesRes)
-    let payload = rawbytes.bytesToString(bytes)
+    let payload = rawbytes.BytesToString(bytes)
     if !chengpath.WriteTextFile(rootDir, outputPath, payload):
         return Err[ElfWriterResult](Fmt" elf object writer: failed to write object: {outputPath}")
     var out: ElfWriterResult
     out.objectPath = outputPath
-    out.bytesWritten = rawbytes.bytesLen(bytes)
+    out.bytesWritten = rawbytes.BytesLen(bytes)
     out.symbolCount = osym.ObjectSymbolsCount(symbols)
     out.relocCount = orel.ObjectRelocsCount(relocs)
     return Ok[ElfWriterResult](out)
@@ -333,7 +327,7 @@ fn ElfTextObjectWrite(rootDir: str,
                        text: rawbytes.Bytes,
                        symbols: osym.ObjectSymbolTable,
                        relocs: orel.ObjectRelocTable): Result[ElfWriterResult] =
-    var emptyData = rawbytes.emptyBytes()
+    var emptyData = rawbytes.EmptyBytes()
     return elfWriteResult(rootDir, outputPath, text, emptyData, symbols, relocs)
 
 fn ElfTextDataObjectWrite(rootDir: str,
