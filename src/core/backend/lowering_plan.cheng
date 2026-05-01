@@ -247,7 +247,11 @@ fn LoweringTypedIrFunctionIsVoidReturn(ir: texpr.TypedExprIr,
     let fnIr = ir.functions[fnIndex]
     if fnIr.returnType != "" && fnIr.returnType != "void":
         return false
-    return fnIr.returnExpr == "return"
+    if fnIr.returnExpr == "return":
+        return true
+    return fnIr.returnExpr == "" &&
+           fnIr.statementCount <= 0 &&
+           fnIr.nodeCount <= 0
 
 fn LoweringFindResolvedCallFactIndex(facts: ccsg.TypedExprFact[],
                                       sourcePath: str,
@@ -587,12 +591,6 @@ fn LoweringMaybeFillBackendDriverRunCommand(fnIr: var PrimaryObjectIrFunction) =
                                                   fnIr.sourcePath,
                                                   false,
                                                   "")
-    LoweringAppendPrimaryObjectIrCallTargetFields(fnIr,
-                                                  1,
-                                                  "cheng_mem_release",
-                                                  "",
-                                                  true,
-                                                  "cheng_mem_release")
 
 fn LoweringSourcePathForModule(workspaceRoot: str,
                                 packageRoot: str,
@@ -641,10 +639,39 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
         if typedFnIndex >= 0 &&
            LoweringTypedIrFunctionHasOpKind(plan.typedIr, typedFnIndex, texpr.TypedExprIrOpLetCall):
             hasLetCall = true
+        var hasControlFlow = false
+        if typedFnIndex >= 0:
+            let typedFn = plan.typedIr.functions[typedFnIndex]
+            var stmtEnd = typedFn.statementStart + typedFn.statementCount
+            if stmtEnd > plan.typedIr.statements.len:
+                stmtEnd = plan.typedIr.statements.len
+            for si in typedFn.statementStart..<stmtEnd:
+                let stmt = plan.typedIr.statements[si]
+                if stmt.kind == texpr.TypedExprIrStmtIf ||
+                   stmt.kind == texpr.TypedExprIrStmtElif ||
+                   stmt.kind == texpr.TypedExprIrStmtElse ||
+                   stmt.kind == texpr.TypedExprIrStmtFor:
+                    hasControlFlow = true
+                    break
+        if hasControlFlow:
+            fnIr.bodyKind = texpr.BodyKindUnsupported
         var leafBodyKind = fnIr.bodyKind
         if fnIr.bodyKind == texpr.BodyKindUnsupported &&
            LoweringTypedIrFunctionIsVoidReturn(plan.typedIr, typedFnIndex):
             fnIr.bodyKind = texpr.BodyKindReturnVoid
+            leafBodyKind = fnIr.bodyKind
+        let functionTailName = LoweringFunctionTailName(fnIr.functionName)
+        if functionTailName == "__cheng_setCmdLine_export":
+            fnIr.bodyKind = texpr.BodyKindRuntimeSetCmdLine
+            leafBodyKind = fnIr.bodyKind
+        elif functionTailName == "paramCount_export" ||
+             functionTailName == "__cheng_rt_paramCount_export" ||
+             functionTailName == "__cmdCountFromRuntime_export" ||
+             functionTailName == "cmdCountFromRuntime_export":
+            fnIr.bodyKind = texpr.BodyKindRuntimeParamCount
+            leafBodyKind = fnIr.bodyKind
+        elif functionTailName == "__cheng_rt_paramStrCopyBridge_export":
+            fnIr.bodyKind = texpr.BodyKindRuntimeParamStrCopyBridge
             leafBodyKind = fnIr.bodyKind
         if fnIr.bodyKind == texpr.BodyKindUnsupported || hasLetCall:
             let letCallReturnKind = LoweringPrimaryObjectIrLetCallReturnBodyKind(plan.typedIr, typedFnIndex)

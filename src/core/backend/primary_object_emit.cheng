@@ -1745,7 +1745,7 @@ fn PrimaryObjectEmitEntryBridgeAsm(plan: pobj.PrimaryObjectPlan,
                                     entrySymbol: str,
                                     ordinal: int32): str =
     let setCmdLine = pobj.PrimaryTargetSymbolName(plan.targetTriple, "__cheng_setCmdLine")
-    let lineMap = pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_register_line_map_from_argv0")
+    let lineMap = pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_native_register_line_map_from_argv0")
     let profileFlush = pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_debug_profile_flush_from_argv0")
     let labelOrdinal = IntToStr(ordinal)
     var out = ""
@@ -1794,6 +1794,83 @@ fn PrimaryObjectEmitRuntimeSetCmdLineFunctionAsm(plan: pobj.PrimaryObjectPlan,
     out = strutil.Join([out, Fmt"  adrp x16, {argvSymbol}@PAGE\n"], "")
     out = strutil.Join([out, Fmt"  add x16, x16, {argvSymbol}@PAGEOFF\n"], "")
     out = strutil.Join([out, "  str x1, [x16]\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitRuntimeParamCountFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                 functionIndex: int32,
+                                                 ordinal: int32): Result[str] =
+    if functionIndex < 0 || functionIndex >= plan.symbolNames.len:
+        return Err[str](" primary object emit: missing runtime param-count symbol")
+    let argcSymbol = PrimaryObjectEmitDataLabelByTail(plan, "__cheng_saved_argc")
+    if len(argcSymbol) <= 0:
+        return Err[str](" primary object emit: runtime param-count argc missing")
+    let symbolName = plan.symbolNames[functionIndex]
+    let labelOrdinal = IntToStr(ordinal)
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, Fmt"  adrp x16, {argcSymbol}@PAGE\n"], "")
+    out = strutil.Join([out, Fmt"  add x16, x16, {argcSymbol}@PAGEOFF\n"], "")
+    out = strutil.Join([out, "  ldr w0, [x16]\n"], "")
+    out = strutil.Join([out, "  subs w0, w0, #1\n"], "")
+    out = strutil.Join([out, "  csel w0, w0, wzr, ge\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
+    return Ok[str](out)
+
+fn PrimaryObjectEmitRuntimeParamStrCopyBridgeFunctionAsm(plan: pobj.PrimaryObjectPlan,
+                                                         functionIndex: int32,
+                                                         ordinal: int32): Result[str] =
+    if functionIndex < 0 || functionIndex >= plan.symbolNames.len:
+        return Err[str](" primary object emit: missing runtime param-str symbol")
+    let argcSymbol = PrimaryObjectEmitDataLabelByTail(plan, "__cheng_saved_argc")
+    let argvSymbol = PrimaryObjectEmitDataLabelByTail(plan, "__cheng_saved_argv")
+    if len(argcSymbol) <= 0 || len(argvSymbol) <= 0:
+        return Err[str](" primary object emit: runtime param-str globals missing")
+    let strlenSymbol = pobj.PrimaryTargetSymbolName(plan.targetTriple, "strlen")
+    let symbolName = plan.symbolNames[functionIndex]
+    let labelOrdinal = IntToStr(ordinal)
+    let emptyLabel = Fmt"L_cheng_runtime_param_str_empty_{labelOrdinal}"
+    var out = ""
+    out = strutil.Join([out, Fmt".globl {symbolName}\n"], "")
+    out = strutil.Join([out, Fmt"{symbolName}:\n"], "")
+    out = strutil.Join([out, "  sub sp, sp, #32\n"], "")
+    out = strutil.Join([out, "  str x8, [sp, #16]\n"], "")
+    out = strutil.Join([out, "  str x30, [sp, #24]\n"], "")
+    out = strutil.Join([out, Fmt"  adrp x16, {argcSymbol}@PAGE\n"], "")
+    out = strutil.Join([out, Fmt"  add x16, x16, {argcSymbol}@PAGEOFF\n"], "")
+    out = strutil.Join([out, "  ldr w9, [x16]\n"], "")
+    out = strutil.Join([out, "  cmp w0, #0\n"], "")
+    out = strutil.Join([out, Fmt"  b.lt {emptyLabel}\n"], "")
+    out = strutil.Join([out, "  cmp w0, w9\n"], "")
+    out = strutil.Join([out, Fmt"  b.ge {emptyLabel}\n"], "")
+    out = strutil.Join([out, Fmt"  adrp x16, {argvSymbol}@PAGE\n"], "")
+    out = strutil.Join([out, Fmt"  add x16, x16, {argvSymbol}@PAGEOFF\n"], "")
+    out = strutil.Join([out, "  ldr x10, [x16]\n"], "")
+    out = strutil.Join([out, Fmt"  cbz x10, {emptyLabel}\n"], "")
+    out = strutil.Join([out, "  sxtw x11, w0\n"], "")
+    out = strutil.Join([out, "  ldr x0, [x10, x11, lsl #3]\n"], "")
+    out = strutil.Join([out, Fmt"  cbz x0, {emptyLabel}\n"], "")
+    out = strutil.Join([out, "  str x0, [sp, #8]\n"], "")
+    out = strutil.Join([out, Fmt"  bl {strlenSymbol}\n"], "")
+    out = strutil.Join([out, "  ldr x9, [sp, #8]\n"], "")
+    out = strutil.Join([out, "  ldr x8, [sp, #16]\n"], "")
+    out = strutil.Join([out, "  str x9, [x8]\n"], "")
+    out = strutil.Join([out, "  str w0, [x8, #8]\n"], "")
+    out = strutil.Join([out, "  str wzr, [x8, #12]\n"], "")
+    out = strutil.Join([out, "  str wzr, [x8, #16]\n"], "")
+    out = strutil.Join([out, "  ldr x30, [sp, #24]\n"], "")
+    out = strutil.Join([out, "  add sp, sp, #32\n"], "")
+    out = strutil.Join([out, "  ret\n"], "")
+    out = strutil.Join([out, Fmt"{emptyLabel}:\n"], "")
+    out = strutil.Join([out, "  ldr x8, [sp, #16]\n"], "")
+    out = strutil.Join([out, "  str xzr, [x8]\n"], "")
+    out = strutil.Join([out, "  str xzr, [x8, #8]\n"], "")
+    out = strutil.Join([out, "  str wzr, [x8, #16]\n"], "")
+    out = strutil.Join([out, "  ldr x30, [sp, #24]\n"], "")
+    out = strutil.Join([out, "  add sp, sp, #32\n"], "")
     out = strutil.Join([out, "  ret\n"], "")
     out = strutil.Join([out, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n"], "")
     return Ok[str](out)
@@ -1850,7 +1927,7 @@ fn PrimaryObjectEmitEntryBridgeRelocTargetAtLocalWord(plan: pobj.PrimaryObjectPl
     if localWordIndex == 3:
         return pobj.PrimaryTargetSymbolName(plan.targetTriple, "__cheng_setCmdLine")
     if localWordIndex == 6:
-        return pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_register_line_map_from_argv0")
+        return pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_native_register_line_map_from_argv0")
     if localWordIndex == 8:
         return PrimaryObjectEmitEntryBridgeTargetSymbol(plan)
     if localWordIndex == 12:
@@ -1972,7 +2049,7 @@ fn PrimaryObjectEmitPlanExternAsm(plan: pobj.PrimaryObjectPlan): str =
         if !PrimaryObjectEmitFunctionLooksEntryBridgeWords(plan, i):
             continue
         let setCmdLine = pobj.PrimaryTargetSymbolName(plan.targetTriple, "__cheng_setCmdLine")
-        let lineMap = pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_register_line_map_from_argv0")
+        let lineMap = pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_native_register_line_map_from_argv0")
         let profileFlush = pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_debug_profile_flush_from_argv0")
         if !PrimaryObjectEmitSymbolInPlan(plan, setCmdLine):
             add(chunks, Fmt".extern {setCmdLine}\n")
@@ -2142,6 +2219,16 @@ fn PrimaryObjectEmitObjectAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
             if IsErr(setCmdRes):
                 return Err[str](Error(setCmdRes))
             add(chunks, Value(setCmdRes))
+        elif bodyKind == texpr.BodyKindRuntimeParamCount:
+            let paramCountRes = PrimaryObjectEmitRuntimeParamCountFunctionAsm(plan, i, i)
+            if IsErr(paramCountRes):
+                return Err[str](Error(paramCountRes))
+            add(chunks, Value(paramCountRes))
+        elif bodyKind == texpr.BodyKindRuntimeParamStrCopyBridge:
+            let paramStrRes = PrimaryObjectEmitRuntimeParamStrCopyBridgeFunctionAsm(plan, i, i)
+            if IsErr(paramStrRes):
+                return Err[str](Error(paramStrRes))
+            add(chunks, Value(paramStrRes))
         elif bodyKind == texpr.BodyKindBackendDriverCommandDispatch:
             let dispatchRes = PrimaryObjectEmitBackendDriverCommandDispatchFunctionAsm(plan, i, i)
             if IsErr(dispatchRes):
@@ -2282,6 +2369,16 @@ fn PrimaryObjectEmitAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
             if IsErr(setCmdRes):
                 return Err[str](Error(setCmdRes))
             add(chunks, Value(setCmdRes))
+        elif bodyKind == texpr.BodyKindRuntimeParamCount:
+            let paramCountRes = PrimaryObjectEmitRuntimeParamCountFunctionAsm(plan, i, i)
+            if IsErr(paramCountRes):
+                return Err[str](Error(paramCountRes))
+            add(chunks, Value(paramCountRes))
+        elif bodyKind == texpr.BodyKindRuntimeParamStrCopyBridge:
+            let paramStrRes = PrimaryObjectEmitRuntimeParamStrCopyBridgeFunctionAsm(plan, i, i)
+            if IsErr(paramStrRes):
+                return Err[str](Error(paramStrRes))
+            add(chunks, Value(paramStrRes))
         elif bodyKind == texpr.BodyKindBackendDriverCommandDispatch:
             let dispatchRes = PrimaryObjectEmitBackendDriverCommandDispatchFunctionAsm(plan, i, i)
             if IsErr(dispatchRes):

@@ -2029,6 +2029,9 @@ static bool cheng_seed_backend_driver_ready(const ChengSeedBootstrapPaths *paths
 
 static bool cheng_seed_backend_driver_available_for_build(const ChengSeedBootstrapPaths *paths) {
     char map_path[PATH_MAX];
+    if (!cheng_seed_backend_driver_handoff_enabled()) {
+        return false;
+    }
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
     }
@@ -47140,6 +47143,19 @@ static bool cheng_seed_try_emit_scalar_function(const ChengSeedSystemLinkPlanStu
                 free(owned_lines);
                 return false;
             }
+            if (i < line_count) {
+                char next_line_copy[4096];
+                char *next_trimmed;
+                snprintf(next_line_copy, sizeof(next_line_copy), "%s", lines[i]);
+                next_trimmed = cheng_seed_trim_inplace(next_line_copy);
+                if (*next_trimmed == '\0' ||
+                    cheng_seed_line_indent(lines[i]) <= 0 ||
+                    cheng_seed_is_top_level_decl_start(next_trimmed)) {
+                    saw_return = true;
+                }
+            } else {
+                saw_return = true;
+            }
             continue;
         }
         if (cheng_seed_startswith(statement, "while ")) {
@@ -64904,10 +64920,10 @@ static int cheng_seed_try_exec_backend_driver_cli_passthrough(const ChengSeedBoo
 }
 
 static bool cheng_seed_backend_driver_handoff_enabled(void) {
-    const char *disable_handoff = getenv("CHENG_NO_BACKEND_DRIVER_HANDOFF");
-    return !(disable_handoff != NULL &&
-             disable_handoff[0] != '\0' &&
-             !cheng_seed_streq(disable_handoff, "0"));
+    const char *enable_handoff = getenv("CHENG_BACKEND_DRIVER_HANDOFF");
+    return enable_handoff != NULL &&
+           enable_handoff[0] != '\0' &&
+           !cheng_seed_streq(enable_handoff, "0");
 }
 
 static bool cheng_seed_command_prefers_backend_driver_passthrough(const char *cmd) {
@@ -66262,7 +66278,8 @@ static int cheng_seed_cmd_system_link_exec(int argc, char **argv) {
                      lowering->missing_reason_count <= 0U &&
                      primary->missing_reason_count <= 0U &&
                      object_plan->missing_reason_count <= 0U &&
-                     native_link->missing_reason_count <= 0U;
+                     (cheng_seed_streq(plan->emit_kind, "obj") ||
+                      native_link->missing_reason_count <= 0U);
     if (primary->missing_reason_count > 0U) {
         if (cheng_seed_plan_reasons_contains(primary->missing_reasons,
                                      primary->missing_reason_count,

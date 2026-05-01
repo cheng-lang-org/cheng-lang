@@ -54,6 +54,36 @@ fn DirectObjectEmitWriteObjectTextOnly(rootDir: str,
     out.directObjectEmitMs = DirectObjectEmitZeroMs()
     return Ok[DirectObjectEmitResult](out)
 
+fn DirectObjectEmitWriteObjectForFormat(rootDir: str,
+                                         plan: pobj.PrimaryObjectPlan,
+                                         objectFormat: str,
+                                         text: Bytes,
+                                         data: Bytes,
+                                         symbols: osym.ObjectSymbolTable,
+                                         relocs: orel.ObjectRelocTable): Result[DirectObjectEmitResult] =
+    if objectFormat == "elf":
+        return Err[DirectObjectEmitResult](" direct object emit: ELF writer is outside min driver closure")
+    if objectFormat == "coff":
+        return Err[DirectObjectEmitResult](" direct object emit: COFF writer is outside min driver closure")
+    let writeRes = macho.MachOTextDataObjectWrite(rootDir,
+                                                  plan.outputPath,
+                                                  text,
+                                                  data,
+                                                  symbols,
+                                                  relocs)
+    if IsErr(writeRes):
+        return Err[DirectObjectEmitResult](Error(writeRes))
+    let write = Value(writeRes)
+    var out: DirectObjectEmitResult
+    out.objectPath = write.objectPath
+    out.outputKind = DirectObjectEmitOutputKindObject()
+    out.bytesWritten = write.bytesWritten
+    out.symbolCount = write.symbolCount
+    out.relocCount = write.relocCount
+    out.directObjectLayoutMs = DirectObjectEmitZeroMs()
+    out.directObjectEmitMs = DirectObjectEmitZeroMs()
+    return Ok[DirectObjectEmitResult](out)
+
 fn DirectObjectEmitRequireIndex(index: int32, label: str) =
     if index < 0:
         system.Assert(false, label)
@@ -523,7 +553,7 @@ fn DirectObjectEmitEntryBridgeSetCmdLineSymbol(plan: pobj.PrimaryObjectPlan): st
     return pobj.PrimaryTargetSymbolName(plan.targetTriple, "__cheng_setCmdLine")
 
 fn DirectObjectEmitEntryBridgeLineMapSymbol(plan: pobj.PrimaryObjectPlan): str =
-    return pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_register_line_map_from_argv0")
+    return pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_native_register_line_map_from_argv0")
 
 fn DirectObjectEmitEntryBridgeProfileFlushSymbol(plan: pobj.PrimaryObjectPlan): str =
     return pobj.PrimaryTargetSymbolName(plan.targetTriple, "cheng_debug_profile_flush_from_argv0")
@@ -1285,6 +1315,25 @@ fn DirectObjectEmitPlanRelocs(plan: pobj.PrimaryObjectPlan,
                                              functionByteOffset + int64(12),
                                              DirectObjectEmitRuntimeDataLabelForOrdinal(plan, 1),
                                              "direct object emit: add plan argv page reloc")
+        if i < plan.functionBodyKinds.len &&
+           plan.functionBodyKinds[i] == texpr.BodyKindRuntimeParamCount:
+            DirectObjectEmitAddPageRelocPair(relocs,
+                                             symbols,
+                                             functionByteOffset,
+                                             DirectObjectEmitRuntimeDataLabelForOrdinal(plan, 0),
+                                             "direct object emit: add plan param-count argc page reloc")
+        if i < plan.functionBodyKinds.len &&
+           plan.functionBodyKinds[i] == texpr.BodyKindRuntimeParamStrCopyBridge:
+            DirectObjectEmitAddPageRelocPair(relocs,
+                                             symbols,
+                                             functionByteOffset + int64(12),
+                                             DirectObjectEmitRuntimeDataLabelForOrdinal(plan, 0),
+                                             "direct object emit: add plan param-str argc page reloc")
+            DirectObjectEmitAddPageRelocPair(relocs,
+                                             symbols,
+                                             functionByteOffset + int64(40),
+                                             DirectObjectEmitRuntimeDataLabelForOrdinal(plan, 1),
+                                             "direct object emit: add plan param-str argv page reloc")
         if DirectObjectEmitFunctionLooksEntryBridgeWords(plan, i):
             let baseByteOffset = plan.functionWordOffsets[i] * 4
             DirectObjectEmitAddBranchReloc(relocs,

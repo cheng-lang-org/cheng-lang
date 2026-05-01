@@ -50,7 +50,7 @@ type
         lineMapNs: int64
         totalNs: int64
 
-@importc("monotime_ns")
+@importc("cheng_monotime_ns")
 fn BackendDriverDispatchMinMonoTimeNsBridge(): int64
 
 @importc("getrusage")
@@ -448,6 +448,16 @@ fn BackendDriverDispatchMinHelp(): int32 =
     return 0
 
 fn BackendDriverDispatchMinCurrentCompiler(rootDir: str): str =
+    let handoffText = strutil.Strip(os.GetEnv("CHENG_BACKEND_DRIVER_HANDOFF"))
+    let handoffEnabled = len(handoffText) > 0 && handoffText != "0"
+    let handoffDisabled = !handoffEnabled
+    if handoffDisabled:
+        let stage0 = chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage0")
+        if chengpath.FileExistsNonEmpty(rootDir, stage0):
+            return stage0
+        let stage3 = chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage3")
+        if chengpath.FileExistsNonEmpty(rootDir, stage3):
+            return stage3
     let raw = cmdline.ProgramName()
     if len(raw) <= 0:
         return ""
@@ -534,7 +544,10 @@ fn BackendDriverDispatchMinProgramSupportRootCandidate(symbol: str): bool =
         return false
     if chengpath.TextContains(symbol, "driver_c_get_env_bridge"):
         return false
-    if chengpath.TextContains(symbol, "driver_c_") || chengpath.TextContains(symbol, "alloc") || chengpath.TextContains(symbol, "copyMem"):
+    if chengpath.TextContains(symbol, "driver_c_") ||
+       chengpath.TextContains(symbol, "cheng_mem_") ||
+       chengpath.TextContains(symbol, "alloc") ||
+       chengpath.TextContains(symbol, "copyMem"):
         return true
     if chengpath.TextContains(symbol, "driver_c_"):
         return true
@@ -558,16 +571,21 @@ fn BackendDriverDispatchMinProviderExportRoots(modulePath: str,
     if modulePath == "runtime/compiler_runtime":
         return "main"
     if modulePath == "runtime/program_support_get_env_bridge":
-        for i in 0..<primaryPlan.relocTargetSymbols.len:
-            let symbol = primaryPlan.relocTargetSymbols[i]
-            if symbol == "driver_c_get_env_bridge" || symbol == "_driver_c_get_env_bridge":
-                return "driver_c_get_env_bridge"
-        return ""
+        return "driver_c_get_env_bridge"
     if modulePath == "runtime/debug_runtime":
-        return "debug_profile_flush_from_argv0,native_register_line_map_from_argv0,native_dump_backtrace_and_exit"
+        return "cheng_debug_profile_flush_from_argv0,cheng_native_register_line_map_from_argv0,cheng_native_dump_backtrace_and_exit"
     var roots: str[]
     var seen = ccsg.CompilerCsgTextSetInit(primaryPlan.relocTargetSymbols.len + 32)
     if modulePath == "runtime/program_support_host_runtime":
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_program_support_host_trace")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_malloc")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_free")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_realloc")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_puts_runtime")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_fopen")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_fclose")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_exit_runtime")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_getenv")
         for i in 0..<primaryPlan.relocTargetSymbols.len:
             let symbol = primaryPlan.relocTargetSymbols[i]
             if chengpath.TextContains(symbol, "host_") ||
@@ -576,12 +594,31 @@ fn BackendDriverDispatchMinProviderExportRoots(modulePath: str,
                 BackendDriverDispatchMinAddRootUnique(roots, seen, symbol)
         return BackendDriverDispatchMinCsv(roots)
     if modulePath == "runtime/program_support":
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "copyMem")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "setMem")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "ptr_add")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "store_ptr")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "load_ptr")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_malloc")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_free")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_mem_retain")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_mem_release")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_register_line_map_from_argv0")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_cstrlen")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_str_to_cstring_temp_bridge")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "driver_c_str_from_utf8_copy_bridge")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "paramCount")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "paramStr")
+        for i in 0..<primaryPlan.functionBodyKinds.len:
+            if primaryPlan.functionBodyKinds[i] == "entry_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "__cheng_setCmdLine")
         for i in 0..<primaryPlan.relocTargetSymbols.len:
             let symbol = primaryPlan.relocTargetSymbols[i]
             if BackendDriverDispatchMinProgramSupportRootCandidate(symbol):
                 BackendDriverDispatchMinAddRootUnique(roots, seen, symbol)
         return BackendDriverDispatchMinCsv(roots)
     if modulePath == "runtime/core_runtime":
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "core_runtime_stub_trace")
         for i in 0..<primaryPlan.relocTargetSymbols.len:
             let symbol = primaryPlan.relocTargetSymbols[i]
             if symbol == "core_runtime_stub_trace" || symbol == "_core_runtime_stub_trace":
