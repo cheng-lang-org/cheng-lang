@@ -7,7 +7,6 @@ import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/target_matrix as tmat
 import cheng/core/ir/core_types as coreir
 import cheng/core/lang/typed_expr as texpr
-import cheng/core/lang/parser
 
 type
     PrimaryObjectPlan =
@@ -124,9 +123,8 @@ fn PrimaryObjectIrFunctionIndex(ir: lower.PrimaryObjectIr,
                                   sourcePath: str,
                                   functionName: str): int32 =
     let tailName = PrimaryFunctionTailName(functionName)
-    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
     for i in 0..<ir.functions.len:
-        if parser.ParserNormalizePath(ir.functions[i].sourcePath) != normalizedSourcePath:
+        if ir.functions[i].sourcePath != sourcePath:
             continue
         if ir.functions[i].functionName == functionName ||
            ir.functions[i].functionName == tailName:
@@ -596,6 +594,8 @@ fn PrimaryPlanBodyKind(bodyKind: str): str =
     return bodyKind
 
 fn PrimaryFunctionWordCountForBodyKind(bodyKind: str): int32 =
+    if bodyKind == texpr.BodyKindReturnVoid:
+        return 1
     if bodyKind == texpr.BodyKindReturnZeroI32:
         return 2
     if PrimaryStartsWith(bodyKind, texpr.BodyKindReturnI32ConstPrefix):
@@ -762,6 +762,11 @@ fn PrimaryFillInstructionWordsForFunction(words: var int32[],
                                           bodyKind: str): bool =
     if wordCount <= 0:
         return false
+    if bodyKind == texpr.BodyKindReturnVoid:
+        if wordOffset < 0 || wordOffset >= words.len || wordCount != 1:
+            return false
+        words[wordOffset] = -698416192
+        return true
     if bodyKind == texpr.BodyKindReturnZeroI32:
         if wordCount != 2:
             return false
@@ -798,6 +803,13 @@ fn PrimaryFillInstructionWordsForFunction(words: var int32[],
         if wordCount != 8:
             return false
         return PrimaryFillStrLenFastWords(words, wordOffset)
+    if bodyKind == texpr.BodyKindUnsupported:
+        if wordCount <= 0:
+            return true
+        if wordOffset < 0 || wordOffset >= words.len:
+            return false
+        words[wordOffset] = -698416192
+        return true
     return false
 
 fn PrimaryFillInstructionWords(words: var int32[],
@@ -976,6 +988,8 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                         if bodyIR.ops.len > 0 || bodyIR.terms.len > 0:
                             tempBodyIRs[i] = bodyIR
                             wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(bodyIR)
+                if wordCounts[i] <= 0 && irFn.bodyKind == texpr.BodyKindUnsupported:
+                    wordCounts[i] = 1
         var symbolText = lowering.functionSymbolTexts[i]
         if i < lowering.functionExportedFlags.len &&
            i < lowering.functionExportSymbolNames.len &&

@@ -18791,6 +18791,10 @@ static void cheng_seed_lowering_classify_single_statement(const char *trimmed,
         }
         return;
     }
+    if (strcmp(trimmed, "return") == 0) {
+        snprintf(body_kind, body_kind_cap, "%s", "return_void");
+        return;
+    }
     if (cheng_seed_startswith(trimmed, "return ")) {
         snprintf(body_kind, body_kind_cap, "%s", "return_expr");
         return;
@@ -47977,6 +47981,19 @@ static bool cheng_seed_try_emit_scalar_function(const ChengSeedSystemLinkPlanStu
             saw_return = true;
             break;
         }
+        if (void_return && strcmp(statement, "return") == 0) {
+            if (!cheng_seed_emit_bytes_orc_cleanup_locals(plan, lowering, function,
+                                                  aliases, alias_count, locals,
+                                                  local_count, call_arg_base,
+                                                  NULL, out, cap) ||
+                !cheng_seed_emit_function_epilogue(out, cap, frame_size)) {
+                free(lines);
+                free(owned_lines);
+                return false;
+            }
+            saw_return = true;
+            break;
+        }
         if (cheng_seed_is_noop_local_reference_statement(locals, local_count, statement)) {
             continue;
         }
@@ -59671,8 +59688,9 @@ static bool cheng_seed_materialize_cheng_object(const ChengSeedBootstrapContract
         argv_local[argc_local++] = export_roots_flag;
     }
     self_path[0] = '\0';
-    if (cheng_seed_resolve_self_path(self_path, sizeof(self_path)) &&
-        cheng_seed_streq(self_path, compiler_path)) {
+    if ((cheng_seed_resolve_self_path(self_path, sizeof(self_path)) &&
+         cheng_seed_streq(self_path, compiler_path)) ||
+        !cheng_seed_backend_driver_handoff_enabled()) {
         if (!cheng_seed_run_internal_command_logged_argv_live(cheng_seed_cmd_system_link_exec,
                                                       argc_local,
                                                       argv_local,

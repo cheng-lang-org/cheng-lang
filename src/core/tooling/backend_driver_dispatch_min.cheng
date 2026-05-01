@@ -50,7 +50,7 @@ type
         lineMapNs: int64
         totalNs: int64
 
-@importc("cheng_monotime_ns")
+@importc("monotime_ns")
 fn BackendDriverDispatchMinMonoTimeNsBridge(): int64
 
 @importc("getrusage")
@@ -219,12 +219,12 @@ fn BackendDriverDispatchMinDefaultMaxRssBytes(): int64 =
     return int64(8589934592)
 
 fn BackendDriverDispatchMinConfiguredMaxRssBytes(): int64 =
-    let parentGuardRaw = os.GetEnv("CHENG_PARENT_RSS_GUARD")
+    let parentGuardRaw = os.GetEnv("PARENT_RSS_GUARD")
     if strings.Len(parentGuardRaw) > 0:
         return int64(0)
-    var raw = os.GetEnv("CHENG_PROCESS_MAX_RSS_BYTES")
+    var raw = os.GetEnv("PROCESS_MAX_RSS_BYTES")
     if strings.Len(raw) <= 0:
-        raw = os.GetEnv("CHENG_MAX_RSS_BYTES")
+        raw = os.GetEnv("MAX_RSS_BYTES")
     if strings.Len(raw) <= 0:
         return BackendDriverDispatchMinDefaultMaxRssBytes()
     let parsed = BackendDriverDispatchMinParseUnsignedInt64(raw)
@@ -271,7 +271,7 @@ fn BackendDriverDispatchMinProgressResourceGuardCheck() =
     BackendDriverDispatchMinResourceGuardCheckWithMax(maxRssBytes)
 
 fn BackendDriverDispatchMinProgressEnabled(): bool =
-    let raw = os.GetEnv("CHENG_PROGRESS")
+    let raw = os.GetEnv("PROGRESS")
     return len(raw) > 0 && raw != "0" && raw != "false"
 
 fn BackendDriverDispatchMinProgress(phase: str,
@@ -454,7 +454,7 @@ fn BackendDriverDispatchMinCurrentCompiler(rootDir: str): str =
     return chengpath.PathAbsolute(rootDir, raw)
 
 fn BackendDriverDispatchMinArtifactsDir(rootDir: str): str =
-    let custom = os.GetEnv("CHENG_VERIFY_EXPORT_VISIBILITY_DIR")
+    let custom = os.GetEnv("VERIFY_EXPORT_VISIBILITY_DIR")
     if len(custom) > 0:
         return chengpath.PathAbsolute(rootDir, custom)
     return chengpath.PathAbsolute(rootDir, "artifacts/forward/verify_export_visibility")
@@ -485,7 +485,7 @@ fn BackendDriverDispatchMinCompileFixture(rootDir: str,
                                            logPath: str,
                                            outOutput: var str): int32 =
     let reportPath = Fmt"{outPath}.report.txt"
-    let command = Fmt"CHENG_PARENT_RSS_GUARD=1 CHENG_PROGRESS=1 CHENG_PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(packageRoot)} --in:{os.QuoteShell(inputPath)} --emit:exe --target:arm64-apple-darwin --out:{os.QuoteShell(outPath)} --report-out:{os.QuoteShell(reportPath)}"
+    let command = Fmt"PARENT_RSS_GUARD=1 PROGRESS=1 PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(packageRoot)} --in:{os.QuoteShell(inputPath)} --emit:exe --target:arm64-apple-darwin --out:{os.QuoteShell(outPath)} --report-out:{os.QuoteShell(reportPath)}"
     let run = os.ExecShellCmdEx(command, uint64(1), rootDir)
     outOutput = os.ExecCmdResultOutput(run)
     let _ = chengpath.WriteTextFile(rootDir, logPath, outOutput)
@@ -528,13 +528,13 @@ fn BackendDriverDispatchMinProviderSourcePath(rootDir: str,
     return ""
 
 fn BackendDriverDispatchMinProgramSupportRootCandidate(symbol: str): bool =
-    if chengpath.TextContains(symbol, "cheng_debug_profile_flush_from_argv0"):
+    if chengpath.TextContains(symbol, "debug_profile_flush_from_argv0"):
         return false
-    if chengpath.TextContains(symbol, "cheng_native_register_line_map_from_argv0"):
+    if chengpath.TextContains(symbol, "native_register_line_map_from_argv0"):
         return false
     if chengpath.TextContains(symbol, "driver_c_get_env_bridge"):
         return false
-    if chengpath.TextContains(symbol, "cheng_"):
+    if chengpath.TextContains(symbol, "driver_c_") || chengpath.TextContains(symbol, "alloc") || chengpath.TextContains(symbol, "copyMem"):
         return true
     if chengpath.TextContains(symbol, "driver_c_"):
         return true
@@ -558,81 +558,72 @@ fn BackendDriverDispatchMinProviderExportRoots(modulePath: str,
     if modulePath == "runtime/compiler_runtime":
         return "main"
     if modulePath == "runtime/program_support_get_env_bridge":
-        return "driver_c_get_env_bridge"
+        for i in 0..<primaryPlan.relocTargetSymbols.len:
+            let symbol = primaryPlan.relocTargetSymbols[i]
+            if symbol == "driver_c_get_env_bridge" || symbol == "_driver_c_get_env_bridge":
+                return "driver_c_get_env_bridge"
+        return ""
     if modulePath == "runtime/debug_runtime":
-        return "cheng_debug_profile_flush_from_argv0,cheng_native_register_line_map_from_argv0,cheng_native_dump_backtrace_and_exit"
-    if modulePath == "runtime/program_support_host_runtime":
-        return "cheng_program_support_host_trace,cheng_host_close,cheng_host_open_runtime,cheng_host_read_runtime,cheng_host_statfs,cheng_host_sysconf,cheng_host_chdir_runtime,cheng_host_clock_gettime,cheng_host_closedir,cheng_host_creat_runtime,cheng_host_dup2_runtime,cheng_host_execvp,cheng_host_exit_immediate_runtime,cheng_host_exit_runtime,cheng_host_fclose,cheng_host_fcntl,cheng_host_fdopen,cheng_host_fflush,cheng_host_fgetc,cheng_host_fgets,cheng_host_fopen,cheng_host_fork_runtime,cheng_host_free,cheng_host_fread,cheng_host_fseek,cheng_host_ftell,cheng_host_fwrite,cheng_host_getcwd,cheng_host_getentropy,cheng_host_getenv,cheng_host_grantpt_runtime,cheng_host_ioctl_runtime,cheng_host_list_dir,cheng_host_malloc,cheng_host_mkdir,cheng_host_opendir,cheng_host_pipe_runtime,cheng_host_poll,cheng_host_posix_openpt_runtime,cheng_host_ptsname_runtime,cheng_host_puts_runtime,cheng_host_read_runtime,cheng_host_realloc,cheng_host_setenv,cheng_host_setpgid_runtime,cheng_host_setsid_runtime,cheng_host_stat,cheng_host_strerror,cheng_host_time,cheng_host_unlockpt_runtime,cheng_host_usleep,cheng_host_waitpid_runtime,cheng_host_write_runtime"
+        return "debug_profile_flush_from_argv0,native_register_line_map_from_argv0,native_dump_backtrace_and_exit"
     var roots: str[]
     var seen = ccsg.CompilerCsgTextSetInit(primaryPlan.relocTargetSymbols.len + 32)
+    if modulePath == "runtime/program_support_host_runtime":
+        for i in 0..<primaryPlan.relocTargetSymbols.len:
+            let symbol = primaryPlan.relocTargetSymbols[i]
+            if chengpath.TextContains(symbol, "host_") ||
+               symbol == "program_support_host_trace" ||
+               symbol == "_program_support_host_trace":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, symbol)
+        return BackendDriverDispatchMinCsv(roots)
     if modulePath == "runtime/program_support":
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "__cheng_setCmdLine")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_register_line_map_from_argv0")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "get_stderr")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "get_stdout")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "get_stdin")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fopen")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fclose")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fread")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fwrite")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fseek")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fflush")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_fgetc")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_file_size")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_dir_exists")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_list_dir")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_seq_header_buffer_get")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_seq_header_len_get")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_seq_header_len_set")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_seq_string_release_range_compat")
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_seq_zero_tail_raw")
         for i in 0..<primaryPlan.relocTargetSymbols.len:
             let symbol = primaryPlan.relocTargetSymbols[i]
             if BackendDriverDispatchMinProgramSupportRootCandidate(symbol):
                 BackendDriverDispatchMinAddRootUnique(roots, seen, symbol)
         return BackendDriverDispatchMinCsv(roots)
     if modulePath == "runtime/core_runtime":
-        BackendDriverDispatchMinAddRootUnique(roots, seen, "core_runtime_stub_trace")
         for i in 0..<primaryPlan.relocTargetSymbols.len:
             let symbol = primaryPlan.relocTargetSymbols[i]
-            if symbol == "cheng_native_errno_code_bridge" || symbol == "_cheng_native_errno_code_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_errno_code_bridge")
-            if symbol == "cheng_native_af_inet_bridge" || symbol == "_cheng_native_af_inet_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_af_inet_bridge")
-            if symbol == "cheng_native_af_inet6_bridge" || symbol == "_cheng_native_af_inet6_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_af_inet6_bridge")
-            if symbol == "cheng_native_sock_stream_bridge" || symbol == "_cheng_native_sock_stream_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_sock_stream_bridge")
-            if symbol == "cheng_native_sock_dgram_bridge" || symbol == "_cheng_native_sock_dgram_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_sock_dgram_bridge")
-            if symbol == "cheng_native_ipproto_ip_bridge" || symbol == "_cheng_native_ipproto_ip_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_ipproto_ip_bridge")
-            if symbol == "cheng_native_sol_socket_bridge" || symbol == "_cheng_native_sol_socket_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_sol_socket_bridge")
-            if symbol == "cheng_native_so_reuseaddr_bridge" || symbol == "_cheng_native_so_reuseaddr_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_so_reuseaddr_bridge")
-            if symbol == "cheng_native_so_broadcast_bridge" || symbol == "_cheng_native_so_broadcast_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_so_broadcast_bridge")
-            if symbol == "cheng_native_msg_waitall_bridge" || symbol == "_cheng_native_msg_waitall_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_msg_waitall_bridge")
-            if symbol == "cheng_native_sockaddr_use_len_field_bridge" || symbol == "_cheng_native_sockaddr_use_len_field_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_sockaddr_use_len_field_bridge")
-            if symbol == "cheng_native_system_cpu_logical_cores_value_bridge" || symbol == "_cheng_native_system_cpu_logical_cores_value_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_system_cpu_logical_cores_value_bridge")
-            if symbol == "cheng_native_system_memory_total_bytes_value_bridge" || symbol == "_cheng_native_system_memory_total_bytes_value_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_system_memory_total_bytes_value_bridge")
-            if symbol == "cheng_native_system_memory_available_bytes_value_bridge" || symbol == "_cheng_native_system_memory_available_bytes_value_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_system_memory_available_bytes_value_bridge")
-            if symbol == "cheng_native_process_rss_bytes_value_bridge" || symbol == "_cheng_native_process_rss_bytes_value_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_process_rss_bytes_value_bridge")
-            if symbol == "cheng_native_process_group_rss_bytes_value_bridge" || symbol == "_cheng_native_process_group_rss_bytes_value_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_process_group_rss_bytes_value_bridge")
-            if symbol == "cheng_native_system_disk_total_bytes_value_bridge" || symbol == "_cheng_native_system_disk_total_bytes_value_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_system_disk_total_bytes_value_bridge")
-            if symbol == "cheng_native_system_disk_available_bytes_value_bridge" || symbol == "_cheng_native_system_disk_available_bytes_value_bridge":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_native_system_disk_available_bytes_value_bridge")
-            if symbol == "cheng_mobile_biometric_fingerprint_authorize_bridge_native" || symbol == "_cheng_mobile_biometric_fingerprint_authorize_bridge_native":
-                BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_mobile_biometric_fingerprint_authorize_bridge_native")
+            if symbol == "core_runtime_stub_trace" || symbol == "_core_runtime_stub_trace":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "core_runtime_stub_trace")
+            if symbol == "native_errno_code_bridge" || symbol == "_native_errno_code_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_errno_code_bridge")
+            if symbol == "native_af_inet_bridge" || symbol == "_native_af_inet_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_af_inet_bridge")
+            if symbol == "native_af_inet6_bridge" || symbol == "_native_af_inet6_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_af_inet6_bridge")
+            if symbol == "native_sock_stream_bridge" || symbol == "_native_sock_stream_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_sock_stream_bridge")
+            if symbol == "native_sock_dgram_bridge" || symbol == "_native_sock_dgram_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_sock_dgram_bridge")
+            if symbol == "native_ipproto_ip_bridge" || symbol == "_native_ipproto_ip_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_ipproto_ip_bridge")
+            if symbol == "native_sol_socket_bridge" || symbol == "_native_sol_socket_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_sol_socket_bridge")
+            if symbol == "native_so_reuseaddr_bridge" || symbol == "_native_so_reuseaddr_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_so_reuseaddr_bridge")
+            if symbol == "native_so_broadcast_bridge" || symbol == "_native_so_broadcast_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_so_broadcast_bridge")
+            if symbol == "native_msg_waitall_bridge" || symbol == "_native_msg_waitall_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_msg_waitall_bridge")
+            if symbol == "native_sockaddr_use_len_field_bridge" || symbol == "_native_sockaddr_use_len_field_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_sockaddr_use_len_field_bridge")
+            if symbol == "native_system_cpu_logical_cores_value_bridge" || symbol == "_native_system_cpu_logical_cores_value_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_system_cpu_logical_cores_value_bridge")
+            if symbol == "native_system_memory_total_bytes_value_bridge" || symbol == "_native_system_memory_total_bytes_value_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_system_memory_total_bytes_value_bridge")
+            if symbol == "native_system_memory_available_bytes_value_bridge" || symbol == "_native_system_memory_available_bytes_value_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_system_memory_available_bytes_value_bridge")
+            if symbol == "native_process_rss_bytes_value_bridge" || symbol == "_native_process_rss_bytes_value_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_process_rss_bytes_value_bridge")
+            if symbol == "native_process_group_rss_bytes_value_bridge" || symbol == "_native_process_group_rss_bytes_value_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_process_group_rss_bytes_value_bridge")
+            if symbol == "native_system_disk_total_bytes_value_bridge" || symbol == "_native_system_disk_total_bytes_value_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_system_disk_total_bytes_value_bridge")
+            if symbol == "native_system_disk_available_bytes_value_bridge" || symbol == "_native_system_disk_available_bytes_value_bridge":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "native_system_disk_available_bytes_value_bridge")
+            if symbol == "mobile_biometric_fingerprint_authorize_bridge_native" || symbol == "_mobile_biometric_fingerprint_authorize_bridge_native":
+                BackendDriverDispatchMinAddRootUnique(roots, seen, "mobile_biometric_fingerprint_authorize_bridge_native")
         return BackendDriverDispatchMinCsv(roots)
     return ""
 
@@ -653,7 +644,7 @@ fn BackendDriverDispatchMinCompileProviderObject(rootDir: str,
     let reportPath = Fmt"{objectPath}.report.txt"
     let logPath = Fmt"{objectPath}.compile.log"
     let _ = primaryPlan
-    var command = Fmt"CHENG_PARENT_RSS_GUARD=1 CHENG_PROGRESS=1 CHENG_PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(rootDir)} --in:{os.QuoteShell(sourcePath)} --emit:obj --target:{linkPlan.targetTriple} --out:{os.QuoteShell(objectPath)} --report-out:{os.QuoteShell(reportPath)}"
+    var command = Fmt"PARENT_RSS_GUARD=1 PROGRESS=1 PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(rootDir)} --in:{os.QuoteShell(sourcePath)} --emit:obj --target:{linkPlan.targetTriple} --out:{os.QuoteShell(objectPath)} --report-out:{os.QuoteShell(reportPath)}"
     if len(exportRootsText) > 0:
         command = Fmt"{command} --symbol-visibility:internal --export-roots:{os.QuoteShell(exportRootsText)}"
     let run = os.ExecShellCmdEx(command, uint64(1), rootDir)
@@ -1282,15 +1273,13 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
         add(providerCompileLogPaths, Fmt"{providerObjectPath}.compile.log")
         let providerExportRoots = BackendDriverDispatchMinProviderExportRoots(modulePath, primaryPlan)
         add(providerExportRootTexts, providerExportRoots)
+        if len(providerExportRoots) <= 0:
+            continue
         if !BackendDriverDispatchMinCompileProviderObject(driverRoot, compilerPath, linkPlan, primaryPlan, modulePath, providerSourcePath, providerObjectPath, providerExportRoots):
             let reason = Fmt"backend driver direct system-link-exec: provider object failed: {modulePath}"
             let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
             return BackendDriverDispatchMinUnsupported(reason)
         add(providerObjectPaths, providerObjectPath)
-    if providerObjectPaths.len != linkPlan.providerModules.len:
-        let reason = "backend driver direct system-link-exec: provider object count mismatch"
-        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
-        return BackendDriverDispatchMinUnsupported(reason)
     phaseProfile.providerObjectNs = BackendDriverDispatchMinNowNs() - phaseProfile.providerObjectNs
     BackendDriverDispatchMinProgress("provider_object", "done")
     let primaryObjectPath = chengpath.PathAbsolute(driverRoot, object.objectPath)
