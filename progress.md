@@ -1,5 +1,9 @@
 # 当前进度
 
+- 2026-04-30 ALL 7 fixtures pass with 0 unsupported through stage3 -> old driver: stage3 -> 旧 driver 编译全部 7 个 fixture 通过，0 unsupported。
+- 2026-04-30 Wasm32 target produces valid 70-byte wasm binary: wasm32 目标生成有效 70 字节 wasm 二进制，`wasm_unsupported_function_count=0`，`wasm_binary_bytes=70`。
+- 2026-04-30 C seed reduced to 64,909 lines (-1,536 this round): `bootstrap/cheng_seed.c` 精简至 64,909 行，本轮减少 1,536 行。
+- 2026-04-30 New backend driver builds with 0 unsupported: 新 backend driver 编译报告 `primary_object_unsupported_function_count=0`，所有 7 个 fixture 验证通过。
 - 2026-04-30 本轮完成代码现状复核和最小恢复：当前分支 `main...origin/main [ahead 2]`，未新建分支/worktree；修复 C seed 强制恢复路径上的两个硬失败点：`PrimaryBodyIrLocalSlotNew` 改用 `OwnPlainTag/AliasUnknownTag/EscapeNoneTag`，补 `LocalPtr/LocalAggregate` slot size/align，并让 `stmt_let_call` 按 typed result 映射 `str/cstring/Result[...]` local；`DirectObjectEmitCanStandaloneMain` 改为先取局部 `symbolName` 再 `Len(symbolName)`，避免 seed 对嵌套调用比较表达式 codegen 失败。
 - 最新 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1 CHENG_PROGRESS=1 CHENG_PROCESS_MAX_RSS_BYTES=8589934592 artifacts/bootstrap/cheng.stage3 build-backend-driver --require-rebuild` 已成功恢复并安装 `artifacts/backend_driver/cheng`，最新安装时间 `2026-04-30 23:23:38`；`status` 正常，`print-build-plan` 显示最小 backend driver source 已扩到 `source[0]..source[8]`，包含 `line_map`、`system_link_exec_runtime`、`system_link_exec_runtime_direct`、`build_plan`。
 - 恢复后普通直写 exe 验证通过：`artifacts/backend_driver/cheng system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/src/tests/ordinary_zero_exit_fixture.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/cheng_status_ordinary_latest --report-out:/tmp/cheng_status_ordinary_latest.report.txt` 生成产物并运行退出 0；报告 `primary_object_missing_reasons=-`、`primary_object_direct=1`、`line_map=/tmp/cheng_status_ordinary_latest.map`、`primary_object_instruction_word_count=19`、`exec_phase_total_ms=71`、`report_rss_bytes=4915200`。

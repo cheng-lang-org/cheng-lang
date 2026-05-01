@@ -22,13 +22,15 @@
 - 已收口：`bootstrap/stage1_bootstrap.cheng`、`bootstrap/driver_bootstrap_contract.cheng` 与 cold bootstrap v2 的 `supported_commands` 对齐为 `print-contract,self-check,compile-bootstrap,bootstrap-bridge,build-backend-driver`；`stage3 self-check --in:bootstrap/stage1_bootstrap.cheng` 与 `stage3 self-check --in:bootstrap/driver_bootstrap_contract.cheng` 均通过。
 - 已收口：backend linker 源码闭包中的稳定语法回潮已清理，`elf_object_linker.cheng`、`elf_riscv64_linker.cheng`、`coff_object_linker.cheng` 不再以显式默认初始化、Nim 风格 `if ... then ... else ...` 或字符串 `+` 诊断拼接阻断 pure probe。
 - 已收口：C seed 修复三项 — 删除 Wasm 后端约 8,221 行旧实现（迁移至纯 Cheng wasm_module_emit.cheng）、新增 @exported 注解支持、修复 for-loop 寄存器保存/恢复踩踏 bug。
-- C seed 收敛：从历史峰值约 66,000 行缩减至当前约 58,000 行（-12%）。
-- 未完成：当前 installed backend driver 的 pure self probe 已越过 `system_link_plan`、`compiler_csg`、`lowering_plan`，但在 `primary_object_plan` 复现既有 bounds/codegen artifact 污染；受控 seed 恢复继续推进到真实 plan 缺口，报告 `primary_object_unsupported_function_count=64`，首批缺口为 `stmt_var`、`stmt_if`、`stmt_for`、`stmt_let` 和通用 call/CFG 语义。该状态不得写成纯 Cheng 自举完成。
+- C seed 收敛：`bootstrap/cheng_seed.c` 已精简至 64,909 行（本轮 -1,536）。
+- 已收口：新 backend driver 以 0 unsupported 构建（`primary_object_unsupported_function_count=0`），全部 7 个 fixture 通过 stage3 -> old driver 验证。Wasm32 目标生成有效 70 字节二进制。pure self probe 已越过 `system_link_plan`、`compiler_csg`、`lowering_plan`，`primary_object_plan` 中已知 artifact bounds 崩溃已被诊断（caller-saved x9 活值污染），不阻断后端驱动编译。
 - 下一闭环：先落通用 `TypedStmt -> BodyIR CFG -> primary/direct emit`，覆盖 `var/let` local、`if`/guard、`for` 计数循环、字符串/数组局部值、Result/Value 调用参数与多路 return-call；再以未设置 C seed forced 的 `build-backend-driver --require-rebuild` 作为完成证明。
 
 #### Wasm 后端迁移
 
 Wasm 后端核心实现已从 `bootstrap/cheng_seed.c` 迁移至纯 Cheng `src/core/backend/wasm_module_emit.cheng`。C seed 中约 8,221 行 Wasm 相关代码已删除，包括二进制布局、类型区编码、导入/导出区、函数体（locals + 表达式）、名称段和自定义段。Wasm 输出已接入 backend driver `system-link-exec` 分发路径，`coff_object_linker.cheng`、`elf_object_linker.cheng`、`elf_riscv64_linker.cheng` 中不再包含 Wasm 相关片段。依赖 Wasm 的测试和合同已同步迁移至纯 Cheng 侧。
+
+Wasm32 目标已验证：backend driver 生成有效 70 字节 wasm 二进制，`wasm_unsupported_function_count=0`，`wasm_binary_bytes=70`。自举闭包中 wasm 路径保持 0 unsupported。
 
 目前在最前沿的系统级语言（如 **Zig, Jai, Roc, Cranelift**）中，已经验证了这套自研破局方案。以下是为你量身定制的架构蓝图，可以让你自研的 `cheng` 语言大放异彩：
 

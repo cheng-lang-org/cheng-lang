@@ -7,6 +7,7 @@ import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/target_matrix as tmat
 import cheng/core/ir/core_types as coreir
 import cheng/core/lang/typed_expr as texpr
+import cheng/core/lang/parser
 
 type
     PrimaryObjectPlan =
@@ -123,8 +124,9 @@ fn PrimaryObjectIrFunctionIndex(ir: lower.PrimaryObjectIr,
                                   sourcePath: str,
                                   functionName: str): int32 =
     let tailName = PrimaryFunctionTailName(functionName)
+    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
     for i in 0..<ir.functions.len:
-        if ir.functions[i].sourcePath != sourcePath:
+        if parser.ParserNormalizePath(ir.functions[i].sourcePath) != normalizedSourcePath:
             continue
         if ir.functions[i].functionName == functionName ||
            ir.functions[i].functionName == tailName:
@@ -348,6 +350,74 @@ fn PrimaryBodyIrFindOrCreateSlot(bodyIR: var coreir.BodyIR,
     add(slotNames, name)
     PrimaryBodyIrLocalSlotNew(bodyIR, newSlot, name, typeKind)
     return newSlot
+
+fn PrimaryBuildBodyIrCfgAppendOp(bodyIR: var coreir.BodyIR,
+                                    op: coreir.BodyOp): int32 =
+    add(bodyIR.ops, op)
+    return bodyIR.ops.len - 1
+
+fn PrimaryBuildBodyIrCfgBeginBlock(bodyIR: var coreir.BodyIR,
+                                     pendingBlockStart: var int32):
+    pendingBlockStart = bodyIR.ops.len
+
+fn PrimaryBuildBodyIrCfgEndBlockReturn(bodyIR: var coreir.BodyIR,
+                                         pendingBlockStart: var int32,
+                                         returnOperands: int32[]):
+    let opStart = pendingBlockStart
+    let opCount = bodyIR.ops.len - pendingBlockStart
+    var term: coreir.BodyTerm
+    term.kind = coreir.BodyTermReturnTag
+    term.resultSlot = -1
+    term.operands = returnOperands
+    let termIndex = coreir.BodyIRAppendTerm(bodyIR, term)
+    let _ = coreir.BodyIRAppendBlock(bodyIR, opStart, opCount, termIndex)
+    pendingBlockStart = bodyIR.ops.len
+
+fn PrimaryBuildBodyIrCfgEndBlockCbr(bodyIR: var coreir.BodyIR,
+                                      pendingBlockStart: var int32,
+                                      condSlot: int32,
+                                      condKind: int32): int32 =
+    let opStart = pendingBlockStart
+    let opCount = bodyIR.ops.len - pendingBlockStart
+    var term: coreir.BodyTerm
+    term.kind = coreir.BodyTermCbrTag
+    term.conditionKind = condKind
+    term.resultSlot = condSlot
+    term.lhsSlot = -1
+    term.rhsSlot = -1
+    term.trueBlock = bodyIR.blocks.len + 1
+    term.falseBlock = bodyIR.blocks.len + 2
+    let termIndex = coreir.BodyIRAppendTerm(bodyIR, term)
+    let _ = coreir.BodyIRAppendBlock(bodyIR, opStart, opCount, termIndex)
+    pendingBlockStart = bodyIR.ops.len
+    return termIndex
+
+fn PrimaryBuildBodyIrCfgEndBlockBr(bodyIR: var coreir.BodyIR,
+                                     pendingBlockStart: var int32):
+    let opStart = pendingBlockStart
+    let opCount = bodyIR.ops.len - pendingBlockStart
+    var term: coreir.BodyTerm
+    term.kind = coreir.BodyTermBrTag
+    term.conditionKind = coreir.BodyCondInvalidTag
+    term.resultSlot = -1
+    term.lhsSlot = -1
+    term.rhsSlot = -1
+    term.trueBlock = -1
+    term.falseBlock = -1
+    let termIndex = coreir.BodyIRAppendTerm(bodyIR, term)
+    let _ = coreir.BodyIRAppendBlock(bodyIR, opStart, opCount, termIndex)
+    pendingBlockStart = bodyIR.ops.len
+
+fn PrimaryBuildBodyIrCfgResolveBranchTargets(bodyIR: var coreir.BodyIR,
+                                                blockTermTargets: var int32[]):
+    for bi in 0..<bodyIR.terms.len:
+        if bodyIR.terms[bi].kind == coreir.BodyTermCbrTag:
+            if bi < blockTermTargets.len && blockTermTargets[bi] >= 0:
+                bodyIR.terms[bi].falseBlock = blockTermTargets[bi]
+            elif bodyIR.terms[bi].falseBlock >= bodyIR.blocks.len:
+                bodyIR.terms[bi].trueBlock = -1
+                bodyIR.terms[bi].falseBlock = -1
+                bodyIR.terms[bi].kind = coreir.BodyTermBrTag
 
 fn PrimaryBuildBodyIrFromTypedStatements(
     typedIr: texpr.TypedExprIr,
