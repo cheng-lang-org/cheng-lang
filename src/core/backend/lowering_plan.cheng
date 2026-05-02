@@ -62,6 +62,12 @@ type
         resolvedCallFactEntrySourceIndexes: int32[]
         resolvedCallFactEntryLineNumbers: int32[]
         resolvedCallFactEntryFactIndexes: int32[]
+        typedFunctionIndexSourcePaths: str[]
+        typedFunctionIndexBucketHeads: int32[]
+        typedFunctionIndexEntryNext: int32[]
+        typedFunctionIndexEntrySourceIndexes: int32[]
+        typedFunctionIndexEntryNames: str[]
+        typedFunctionIndexEntryIndexes: int32[]
         typedIr: texpr.TypedExprIr
         typedReturnOps: texpr.TypedExprReturnOpFact[]
         primaryObjectIr: PrimaryObjectIr
@@ -141,6 +147,12 @@ fn LoweringPrimaryObjectIrBodyKindFromTypedIrOp(node: texpr.TypedExprIrNode): st
         return texpr.BodyKindReturnI32AsrArgs
     if node.opKind == texpr.TypedExprIrOpI32Madd:
         return texpr.BodyKindReturnI32MaddArgs
+    if node.opKind == texpr.TypedExprIrOpI32Arg0GeZeroAndLeConst:
+        return Fmt"{texpr.BodyKindReturnI32Arg0GeZeroAndLeConstPrefix}{node.literalText}"
+    if node.opKind == texpr.TypedExprIrOpI32Arg0XorConst:
+        return Fmt"{texpr.BodyKindReturnI32Arg0XorConstPrefix}{node.literalText}"
+    if node.opKind == texpr.TypedExprIrOpU32Arg0AndArg1ShlArg2:
+        return texpr.BodyKindReturnU32Arg0AndArg1ShlArg2
     if node.opKind == texpr.TypedExprIrOpI32IfArg0LeZeroConstElseConst:
         var commaIndex = -1
         for i in 0..<len(node.literalText):
@@ -181,6 +193,124 @@ fn LoweringTypedIrFunctionIndex(ir: texpr.TypedExprIr,
             continue
         if ir.functions[i].functionName == functionName ||
            ir.functions[i].functionName == tailName:
+            return i
+    return -1
+
+fn LoweringTypedFunctionIndexBucketCount(functionCount: int32): int32 =
+    var need = functionCount * 2 + 16
+    if need < 16:
+        need = 16
+    var out = 1
+    while out < need:
+        out = out * 2
+    return out
+
+fn LoweringTypedFunctionIndexBucket(sourceIndex: int32,
+                                     functionName: str,
+                                     bucketCount: int32): int32 =
+    if sourceIndex < 0 || len(functionName) <= 0 || bucketCount <= 0:
+        return -1
+    return ((sourceIndex + 1) * 131 + len(functionName) * 17) & (bucketCount - 1)
+
+fn LoweringTypedFunctionIndexSourceIndex(sourcePaths: str[],
+                                          sourcePath: str): int32 =
+    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+    for i in 0..<sourcePaths.len:
+        if sourcePaths[i] == normalizedSourcePath:
+            return i
+    return -1
+
+fn LoweringTypedFunctionIndexFindOrAddSource(plan: var LoweringPlanStub,
+                                              sourcePath: str): int32 =
+    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+    if len(normalizedSourcePath) <= 0:
+        return -1
+    for i in 0..<plan.typedFunctionIndexSourcePaths.len:
+        if plan.typedFunctionIndexSourcePaths[i] == normalizedSourcePath:
+            return i
+    add(plan.typedFunctionIndexSourcePaths, normalizedSourcePath)
+    return plan.typedFunctionIndexSourcePaths.len - 1
+
+fn LoweringBuildTypedFunctionIndexAdd(plan: var LoweringPlanStub,
+                                       bucketTails: var int32[],
+                                       sourceIndex: int32,
+                                       functionName: str,
+                                       functionIndex: int32) =
+    let bucket = LoweringTypedFunctionIndexBucket(sourceIndex,
+                                                  functionName,
+                                                  plan.typedFunctionIndexBucketHeads.len)
+    if bucket < 0:
+        return
+    let entryIndex = plan.typedFunctionIndexEntryIndexes.len
+    add(plan.typedFunctionIndexEntryNext, -1)
+    add(plan.typedFunctionIndexEntrySourceIndexes, sourceIndex)
+    add(plan.typedFunctionIndexEntryNames, functionName)
+    add(plan.typedFunctionIndexEntryIndexes, functionIndex)
+    if plan.typedFunctionIndexBucketHeads[bucket] < 0:
+        plan.typedFunctionIndexBucketHeads[bucket] = entryIndex
+    else:
+        plan.typedFunctionIndexEntryNext[bucketTails[bucket]] = entryIndex
+    bucketTails[bucket] = entryIndex
+
+fn LoweringBuildTypedFunctionIndex(plan: var LoweringPlanStub) =
+    plan.typedFunctionIndexSourcePaths = []
+    plan.typedFunctionIndexBucketHeads = []
+    plan.typedFunctionIndexEntryNext = []
+    plan.typedFunctionIndexEntrySourceIndexes = []
+    plan.typedFunctionIndexEntryNames = []
+    plan.typedFunctionIndexEntryIndexes = []
+    let bucketCount = LoweringTypedFunctionIndexBucketCount(plan.typedIr.functions.len)
+    var bucketTails: int32[]
+    for bucketIndex in 0..<bucketCount:
+        add(plan.typedFunctionIndexBucketHeads, -1)
+        add(bucketTails, -1)
+    for functionIndex in 0..<plan.typedIr.functions.len:
+        let typedFn = plan.typedIr.functions[functionIndex]
+        let sourceIndex = LoweringTypedFunctionIndexFindOrAddSource(plan, typedFn.sourcePath)
+        LoweringBuildTypedFunctionIndexAdd(plan,
+                                           bucketTails,
+                                           sourceIndex,
+                                           typedFn.functionName,
+                                           functionIndex)
+
+fn LoweringPlanTypedIrFunctionIndexByName(plan: LoweringPlanStub,
+                                           sourcePath: str,
+                                           functionName: str): int32 =
+    if len(functionName) <= 0:
+        return -1
+    let sourceIndex = LoweringTypedFunctionIndexSourceIndex(plan.typedFunctionIndexSourcePaths, sourcePath)
+    let bucket = LoweringTypedFunctionIndexBucket(sourceIndex,
+                                                  functionName,
+                                                  plan.typedFunctionIndexBucketHeads.len)
+    if bucket < 0:
+        return -1
+    var entryIndex = plan.typedFunctionIndexBucketHeads[bucket]
+    while entryIndex >= 0:
+        if entryIndex >= plan.typedFunctionIndexEntryIndexes.len:
+            return -1
+        if plan.typedFunctionIndexEntrySourceIndexes[entryIndex] == sourceIndex &&
+           plan.typedFunctionIndexEntryNames[entryIndex] == functionName:
+            return plan.typedFunctionIndexEntryIndexes[entryIndex]
+        entryIndex = plan.typedFunctionIndexEntryNext[entryIndex]
+    return -1
+
+fn LoweringPlanTypedIrFunctionIndex(plan: LoweringPlanStub,
+                                     sourcePath: str,
+                                     functionName: str): int32 =
+    let directIndex = LoweringPlanTypedIrFunctionIndexByName(plan, sourcePath, functionName)
+    if directIndex >= 0:
+        return directIndex
+    let tailName = LoweringFunctionTailName(functionName)
+    if tailName != functionName:
+        let tailIndex = LoweringPlanTypedIrFunctionIndexByName(plan, sourcePath, tailName)
+        if tailIndex >= 0:
+            return tailIndex
+    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+    for i in 0..<plan.typedIr.functions.len:
+        if parser.ParserNormalizePath(plan.typedIr.functions[i].sourcePath) != normalizedSourcePath:
+            continue
+        if plan.typedIr.functions[i].functionName == functionName ||
+           plan.typedIr.functions[i].functionName == tailName:
             return i
     return -1
 
@@ -237,6 +367,11 @@ fn LoweringPrimaryObjectIrLeafBodyKindFromTypedIr(ir: texpr.TypedExprIr,
                                                    functionName: str,
                                                    bodyLineNumber: var int32): str =
     let fnIndex = LoweringTypedIrFunctionIndex(ir, sourcePath, functionName)
+    return LoweringPrimaryObjectIrLeafBodyKindFromTypedIrIndex(ir, fnIndex, bodyLineNumber)
+
+fn LoweringPrimaryObjectIrLeafBodyKindFromTypedIrIndex(ir: texpr.TypedExprIr,
+                                                        fnIndex: int32,
+                                                        bodyLineNumber: var int32): str =
     if fnIndex < 0:
         bodyLineNumber = 0
         return texpr.BodyKindUnsupported
@@ -582,10 +717,16 @@ fn LoweringStatementCallTargetCount(fnIr: PrimaryObjectIrFunction): int32 =
 
 fn LoweringFillGeneralCfgCallSequenceFromStatements(fnIr: var PrimaryObjectIrFunction,
                                                      sourceTexts: texpr.TypedExprSourceText[]) =
-    if fnIr.callTargets.len > 0:
+    if fnIr.bodyKind != texpr.BodyKindUnsupported && fnIr.callTargets.len > 0:
         return
     if LoweringStatementCallTargetCount(fnIr) <= 0:
         return
+    if fnIr.bodyKind == texpr.BodyKindUnsupported:
+        fnIr.callArgCounts = []
+        fnIr.callTargets = []
+        fnIr.callTargetSourcePaths = []
+        fnIr.callTargetImportcFlags = []
+        fnIr.callImportcSymbols = []
     for stmtIndex in 0..<fnIr.statements.len:
         let stmt = fnIr.statements[stmtIndex]
         if LoweringStatementCarriesCallTarget(stmt):
@@ -753,13 +894,13 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
     var fnIr: PrimaryObjectIrFunction
     fnIr.sourcePath = sourcePath
     fnIr.functionName = functionName
-    let typedFnIndex = LoweringTypedIrFunctionIndex(plan.typedIr, sourcePath, functionName)
+    let typedFnIndex = LoweringPlanTypedIrFunctionIndex(plan, sourcePath, functionName)
     if typedFnIndex >= 0:
         fnIr.signatureLineNumber = plan.typedIr.functions[typedFnIndex].signatureLineNumber
         LoweringAppendPrimaryObjectIrStatements(fnIr, plan.typedIr, typedFnIndex, sourceTexts)
         LoweringFillPrimaryObjectIrParams(fnIr, plan.typedIr, typedFnIndex)
     var bodyLineNumber: int32
-    fnIr.bodyKind = LoweringPrimaryObjectIrLeafBodyKindFromTypedIr(plan.typedIr, sourcePath, functionName, bodyLineNumber)
+    fnIr.bodyKind = LoweringPrimaryObjectIrLeafBodyKindFromTypedIrIndex(plan.typedIr, typedFnIndex, bodyLineNumber)
     fnIr.bodyLineNumber = bodyLineNumber
     var hasLetCall = false
     if typedFnIndex >= 0 && LoweringTypedIrFunctionHasOpKind(plan.typedIr, typedFnIndex, texpr.TypedExprIrOpLetCall):
@@ -1057,7 +1198,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                     add(fnIr.callTargets, stmt.callTarget)
                     add(fnIr.callTargetSourcePaths, stmt.callTargetSourcePath)
                     add(fnIr.callTargetImportcFlags, stmt.callTargetImportc)
-                    add(fnIr.callImportcSymbols, stmt.callImportcSymbol)
+                        add(fnIr.callImportcSymbols, stmt.callImportcSymbol)
                 if fnIr.callTargets.len == 1:
                     fnIr.bodyKind = texpr.BodyKindCallArg0Const0ReturnI32Const0
     if fnIr.bodyKind == texpr.BodyKindUnsupported:
@@ -1375,6 +1516,7 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
     if !texpr.TypedExprBuildIrWithFacts(typedSourceTexts, plan.typedExprFacts, plan.typedIr, typedIrErr):
         err = typedIrErr
         return false
+    LoweringBuildTypedFunctionIndex(plan)
     plan.typedReturnOps = texpr.TypedExprReturnOpFactsFromIr(plan.typedIr)
     plan.primaryObjectIr = LoweringBuildPrimaryObjectIr(plan, typedSourceTexts)
     var loweringErr = ""
