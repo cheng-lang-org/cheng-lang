@@ -32,6 +32,8 @@ type
         signatureLineNumber: int32
         bodyLineNumber: int32
         bodyKind: str
+        paramNames: str[]
+        paramTypes: str[]
         statementCount: int32
         statements: PrimaryObjectIrStatement[]
         callTargetCount: int32
@@ -449,6 +451,27 @@ fn LoweringAppendPrimaryObjectIrStatements(fnIr: var PrimaryObjectIrFunction,
         add(fnIr.statements, stmt)
     fnIr.statementCount = fnIr.statements.len
 
+fn LoweringFillPrimaryObjectIrParams(fnIr: var PrimaryObjectIrFunction,
+                                      typedIr: texpr.TypedExprIr,
+                                      typedFnIndex: int32) =
+    if typedFnIndex < 0 || typedFnIndex >= typedIr.functions.len:
+        return
+    let typedFn = typedIr.functions[typedFnIndex]
+    var nodeEnd = typedFn.nodeStart + typedFn.nodeCount
+    if nodeEnd > typedIr.nodes.len:
+        nodeEnd = typedIr.nodes.len
+    for nodeIndex in typedFn.nodeStart..<nodeEnd:
+        let node = typedIr.nodes[nodeIndex]
+        if node.opKind != texpr.TypedExprIrOpParamRef:
+            continue
+        if node.paramSlot < 0:
+            continue
+        while fnIr.paramNames.len <= node.paramSlot:
+            add(fnIr.paramNames, "")
+            add(fnIr.paramTypes, "")
+        fnIr.paramNames[node.paramSlot] = node.paramName
+        fnIr.paramTypes[node.paramSlot] = node.resultType
+
 fn LoweringAppendPrimaryObjectIrCallTarget(fnIr: var PrimaryObjectIrFunction,
                                             stmt: PrimaryObjectIrStatement,
                                             sourceTexts: texpr.TypedExprSourceText[]) =
@@ -472,10 +495,24 @@ fn LoweringStatementCarriesCallTarget(stmt: PrimaryObjectIrStatement): bool =
            stmt.kind == texpr.TypedExprIrStmtCall ||
            stmt.kind == texpr.TypedExprIrStmtIfCall
 
-fn LoweringFillCallSequenceFromStatementsIfEmpty(fnIr: var PrimaryObjectIrFunction,
-                                                  sourceTexts: texpr.TypedExprSourceText[]) =
-    if fnIr.callTargets.len > 0:
+fn LoweringStatementCallTargetCount(fnIr: PrimaryObjectIrFunction): int32 =
+    var count: int32
+    for stmtIndex in 0..<fnIr.statements.len:
+        if LoweringStatementCarriesCallTarget(fnIr.statements[stmtIndex]):
+            count = count + 1
+    return count
+
+fn LoweringFillGeneralCfgCallSequenceFromStatements(fnIr: var PrimaryObjectIrFunction,
+                                                     sourceTexts: texpr.TypedExprSourceText[]) =
+    if fnIr.bodyKind != texpr.BodyKindUnsupported:
         return
+    if LoweringStatementCallTargetCount(fnIr) <= 0:
+        return
+    fnIr.callArgCounts = []
+    fnIr.callTargets = []
+    fnIr.callTargetSourcePaths = []
+    fnIr.callTargetImportcFlags = []
+    fnIr.callImportcSymbols = []
     for stmtIndex in 0..<fnIr.statements.len:
         let stmt = fnIr.statements[stmtIndex]
         if LoweringStatementCarriesCallTarget(stmt):
@@ -645,6 +682,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
     if typedFnIndex >= 0:
         fnIr.signatureLineNumber = plan.typedIr.functions[typedFnIndex].signatureLineNumber
         LoweringAppendPrimaryObjectIrStatements(fnIr, plan.typedIr, typedFnIndex, sourceTexts)
+        LoweringFillPrimaryObjectIrParams(fnIr, plan.typedIr, typedFnIndex)
     var bodyLineNumber: int32
     fnIr.bodyKind = LoweringPrimaryObjectIrLeafBodyKindFromTypedIr(plan.typedIr, sourcePath, functionName, bodyLineNumber)
     fnIr.bodyLineNumber = bodyLineNumber
@@ -951,7 +989,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
         LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr, sourceTexts)
     LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr, sourceTexts)
     LoweringMaybeFillBackendDriverRunCommand(fnIr)
-    LoweringFillCallSequenceFromStatementsIfEmpty(fnIr, sourceTexts)
+    LoweringFillGeneralCfgCallSequenceFromStatements(fnIr, sourceTexts)
     fnIr.callTargetCount = fnIr.callTargets.len
     return fnIr
 
@@ -1247,8 +1285,6 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
     plan.compilerCsgCid = compilerCsg.graphCid
     plan.exprLayer = parser.NormalizedExprLayerClone(compilerCsg.exprLayer)
     plan.typedExprFacts = texpr.TypedExprFactsClone(compilerCsg.typedExprFacts)
-    plan.typedIr = texpr.TypedExprIrClone(compilerCsg.typedIr)
-    plan.typedReturnOps = texpr.TypedExprReturnOpFactsFromIr(plan.typedIr)
     var typedSourceTexts: texpr.TypedExprSourceText[]
     for i in 0..<sourceClosurePaths.len:
         let sourcePath = sourceClosurePaths[i]
@@ -1259,6 +1295,11 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
                                                                   externalPackageRoots,
                                                                   sourcePath,
                                                                   sourceText))
+    var typedIrErr = ""
+    if !texpr.TypedExprBuildIrWithFacts(typedSourceTexts, plan.typedExprFacts, plan.typedIr, typedIrErr):
+        err = typedIrErr
+        return false
+    plan.typedReturnOps = texpr.TypedExprReturnOpFactsFromIr(plan.typedIr)
     plan.primaryObjectIr = LoweringBuildPrimaryObjectIr(plan, typedSourceTexts)
     var loweringErr = ""
     if !texpr.TypedExprBuildLoweringRules(plan.typedExprFacts, plan.loweringRules, loweringErr):
@@ -1334,11 +1375,14 @@ fn BuildLoweringPlanStub(linkPlan: slplan.SystemLinkPlanStub,
         err = Error(sourceBundleRes)
         return false
     let sourceBundleCid = Value(sourceBundleRes)
-    let csgRes = ccsg.BuildCompilerCsg(linkPlan, sourceBundleCid)
-    if IsErr(csgRes):
-        err = Error(csgRes)
+    var csg: ccsg.CompilerCsg
+    var csgErr = ""
+    if !ccsg.BuildCompilerCsgInto(linkPlan, sourceBundleCid, csg, csgErr):
+        err = csgErr
         return false
-    let csg = ccsg.CompilerCsgClone(Value(csgRes))
+    if csgErr != "":
+        err = csgErr
+        return false
     return BuildLoweringPlanStubFromCompilerCsg(linkPlan, csg, plan, err)
 
 fn LoweringPlanStubReport(plan: LoweringPlanStub): str =
