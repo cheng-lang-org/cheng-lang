@@ -2099,9 +2099,311 @@ fn PrimaryObjectEmitDataAsm(plan: pobj.PrimaryObjectPlan): str =
 
 fn PrimaryObjectEmitObjectAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
     return PrimaryObjectEmitPlanAsmText(plan)
+    let validRes = PrimaryObjectEmitValidateObjectShape(plan)
+    if !IsOk(validRes):
+        return Err[str](Error(validRes))
+    var chunks: str[]
+    add(chunks, ".text\n.p2align 2\n")
+    for i in 0..<plan.symbolNames.len:
+        let bodyKind = plan.functionBodyKinds[i]
+        if i < plan.functionBodyIRs.len:
+            let bodyIrAsmRes = PrimaryObjectEmitLeafBodyIRFunctionAsm(plan, i, i)
+            if IsOk(bodyIrAsmRes):
+                add(chunks, Value(bodyIrAsmRes))
+                continue
+        if bodyKind == texpr.BodyKindReturnVoid:
+            add(chunks, PrimaryObjectEmitReturnVoidFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnZeroI32:
+            add(chunks, PrimaryObjectEmitReturnZeroFunctionAsm(plan.symbolNames[i], i))
+        elif PrimaryObjectEmitIsReturnI32ConstBodyKind(bodyKind):
+            let imm = PrimaryObjectEmitParseSuffixI32(bodyKind, texpr.BodyKindReturnI32ConstPrefix)
+            add(chunks, PrimaryObjectEmitReturnI32ConstFunctionAsm(plan.symbolNames[i], i, imm))
+        elif bodyKind == texpr.BodyKindReturnI32Arg0:
+            add(chunks, PrimaryObjectEmitReturnI32Arg0FunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32Arg1:
+            add(chunks, PrimaryObjectEmitReturnI32Arg1FunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32Arg2:
+            add(chunks, PrimaryObjectEmitReturnI32Arg2FunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32Arg3:
+            add(chunks, PrimaryObjectEmitReturnI32Arg3FunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnF64MulArgs:
+            add(chunks, PrimaryObjectEmitF64MulArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32AddArgs:
+            add(chunks, PrimaryObjectEmitI32AddArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32SubArgs:
+            add(chunks, PrimaryObjectEmitI32SubArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32MulArgs:
+            add(chunks, PrimaryObjectEmitI32MulArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32AsrArgs:
+            add(chunks, PrimaryObjectEmitI32AsrArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32MaddArgs:
+            let labelOrdinal = IntToStr(i)
+            add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
+            add(chunks, Fmt"{plan.symbolNames[i]}:\n")
+            add(chunks, "  madd w0, w0, w1, w2\n")
+            add(chunks, "  ret\n")
+            add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+        elif bodyKind == texpr.BodyKindReturnU64Arg0AndConst4NotZero:
+            let labelOrdinal = IntToStr(i)
+            add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
+            add(chunks, Fmt"{plan.symbolNames[i]}:\n")
+            add(chunks, "  tst x0, #4\n")
+            add(chunks, "  cset w0, ne\n")
+            add(chunks, "  ret\n")
+            add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+        elif bodyKind == texpr.BodyKindReturnU64Arg0OrConst4:
+            let labelOrdinal = IntToStr(i)
+            add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
+            add(chunks, Fmt"{plan.symbolNames[i]}:\n")
+            add(chunks, "  orr x0, x0, #4\n")
+            add(chunks, "  ret\n")
+            add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+        elif bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
+            add(chunks, PrimaryObjectEmitI32IfArg0LeZeroConstElseFunctionAsm(plan.symbolNames[i], i, 0, 7))
+        elif bodyKind == texpr.BodyKindStrLenFastI32:
+            add(chunks, PrimaryObjectEmitStrLenFastFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnStrEmpty:
+            add(chunks, PrimaryObjectEmitReturnStrEmptyFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnStrArg0:
+            add(chunks, PrimaryObjectEmitReturnStrArg0FunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnStrLiteral:
+            let literalAsmRes = PrimaryObjectEmitReturnStrLiteralFunctionAsm(plan, i, i)
+            if IsErr(literalAsmRes):
+                return Err[str](Error(literalAsmRes))
+            add(chunks, Value(literalAsmRes))
+        elif bodyKind == texpr.BodyKindCstringToStrCopy:
+            let cstringAsmRes = PrimaryObjectEmitCstringToStrCopyFunctionAsm(plan, i, i)
+            if IsErr(cstringAsmRes):
+                return Err[str](Error(cstringAsmRes))
+            add(chunks, Value(cstringAsmRes))
+        elif bodyKind == texpr.BodyKindMainF64MulCheckExit:
+            add(chunks, PrimaryObjectEmitF64MulCheckExitFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindStatementSequence:
+            let callAsmRes = PrimaryObjectEmitStatementSequenceFunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif PrimaryObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+            let imm = Value(PrimaryObjectEmitParseLetCallNoargReturnI32ConstBodyKind(bodyKind))
+            let callAsmRes = PrimaryObjectEmitLetCallNoargReturnI32ConstFunctionAsm(plan, i, i, imm)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitLetCallNoargReturnResultI32FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
+            let callAsmRes = PrimaryObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitLetCallNoargStrReturnLenI32FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitLetCallNoargStrThenCallArg0ReturnI32Const0FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsReturnCallBodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitReturnCallFunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif bodyKind == texpr.BodyKindRuntimeSetCmdLine:
+            let setCmdRes = PrimaryObjectEmitRuntimeSetCmdLineFunctionAsm(plan, i, i)
+            if IsErr(setCmdRes):
+                return Err[str](Error(setCmdRes))
+            add(chunks, Value(setCmdRes))
+        elif bodyKind == texpr.BodyKindRuntimeParamCount:
+            let paramCountRes = PrimaryObjectEmitRuntimeParamCountFunctionAsm(plan, i, i)
+            if IsErr(paramCountRes):
+                return Err[str](Error(paramCountRes))
+            add(chunks, Value(paramCountRes))
+        elif bodyKind == texpr.BodyKindRuntimeParamStrCopyBridge:
+            let paramStrRes = PrimaryObjectEmitRuntimeParamStrCopyBridgeFunctionAsm(plan, i, i)
+            if IsErr(paramStrRes):
+                return Err[str](Error(paramStrRes))
+            add(chunks, Value(paramStrRes))
+        elif bodyKind == texpr.BodyKindBackendDriverCommandDispatch:
+            let dispatchRes = PrimaryObjectEmitBackendDriverCommandDispatchFunctionAsm(plan, i, i)
+            if IsErr(dispatchRes):
+                return Err[str](Error(dispatchRes))
+            add(chunks, Value(dispatchRes))
+        elif bodyKind == texpr.BodyKindResultRequestDispatch:
+            let resultDispatchRes = PrimaryObjectEmitResultRequestDispatchFunctionAsm(plan, i, i)
+            if IsErr(resultDispatchRes):
+                return Err[str](Error(resultDispatchRes))
+            add(chunks, Value(resultDispatchRes))
+        else:
+            return Err[str](" primary object emit: object plan unsupported function body kind")
+    add(chunks, PrimaryObjectEmitDataAsm(plan))
+    if plan.objectFormat == "macho":
+        add(chunks, ".subsections_via_symbols\n")
+    return Ok[str](strutil.Join(chunks, ""))
 
 fn PrimaryObjectEmitAsmText(plan: pobj.PrimaryObjectPlan): Result[str] =
     return PrimaryObjectEmitPlanAsmText(plan)
+    let validRes = PrimaryObjectEmitValidateReturnZeroShape(plan)
+    if !IsOk(validRes):
+        return Err[str](Error(validRes))
+    var bridgeIndex = PrimaryObjectEmitEntryBridgeIndex(plan)
+    if bridgeIndex < 1 && plan.functionBodyKinds.len == 2:
+        if plan.functionBodyKinds[0] == texpr.BodyKindReturnZeroI32 ||
+           PrimaryObjectEmitIsReturnI32ConstBodyKind(plan.functionBodyKinds[0]):
+            if plan.functionBodyKinds[1] == texpr.BodyKindEntryBridge:
+                bridgeIndex = 1
+    var functionLimit = plan.symbolNames.len
+    if bridgeIndex >= 0:
+        functionLimit = bridgeIndex
+    var chunks: str[]
+    add(chunks, ".text\n.p2align 2\n")
+    for i in 0..<functionLimit:
+        let bodyKind = plan.functionBodyKinds[i]
+        if i < plan.functionBodyIRs.len:
+            let bodyIrAsmRes = PrimaryObjectEmitLeafBodyIRFunctionAsm(plan, i, i)
+            if IsOk(bodyIrAsmRes):
+                add(chunks, Value(bodyIrAsmRes))
+                continue
+        if bodyKind == texpr.BodyKindReturnVoid:
+            add(chunks, PrimaryObjectEmitReturnVoidFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnZeroI32:
+            add(chunks, PrimaryObjectEmitReturnZeroFunctionAsm(plan.symbolNames[i], i))
+        elif PrimaryObjectEmitIsReturnI32ConstBodyKind(bodyKind):
+            let imm = PrimaryObjectEmitParseSuffixI32(bodyKind, texpr.BodyKindReturnI32ConstPrefix)
+            add(chunks, PrimaryObjectEmitReturnI32ConstFunctionAsm(plan.symbolNames[i], i, imm))
+        elif bodyKind == texpr.BodyKindReturnF64MulArgs:
+            add(chunks, PrimaryObjectEmitF64MulArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32AddArgs:
+            add(chunks, PrimaryObjectEmitI32AddArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32SubArgs:
+            add(chunks, PrimaryObjectEmitI32SubArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32MulArgs:
+            add(chunks, PrimaryObjectEmitI32MulArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32AsrArgs:
+            add(chunks, PrimaryObjectEmitI32AsrArgsFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnI32MaddArgs:
+            let labelOrdinal = IntToStr(i)
+            add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
+            add(chunks, Fmt"{plan.symbolNames[i]}:\n")
+            add(chunks, "  madd w0, w0, w1, w2\n")
+            add(chunks, "  ret\n")
+            add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+        elif bodyKind == texpr.BodyKindReturnU64Arg0AndConst4NotZero:
+            let labelOrdinal = IntToStr(i)
+            add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
+            add(chunks, Fmt"{plan.symbolNames[i]}:\n")
+            add(chunks, "  tst x0, #4\n")
+            add(chunks, "  cset w0, ne\n")
+            add(chunks, "  ret\n")
+            add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+        elif bodyKind == texpr.BodyKindReturnU64Arg0OrConst4:
+            let labelOrdinal = IntToStr(i)
+            add(chunks, Fmt".globl {plan.symbolNames[i]}\n")
+            add(chunks, Fmt"{plan.symbolNames[i]}:\n")
+            add(chunks, "  orr x0, x0, #4\n")
+            add(chunks, "  ret\n")
+            add(chunks, Fmt"L_cheng_embedded_line_map_end_{labelOrdinal}:\n")
+        elif bodyKind == texpr.BodyKindIfArg0LeZeroReturnI32Const0ElseI32Const7:
+            add(chunks, PrimaryObjectEmitI32IfArg0LeZeroConstElseFunctionAsm(plan.symbolNames[i], i, 0, 7))
+        elif bodyKind == texpr.BodyKindStrLenFastI32:
+            add(chunks, PrimaryObjectEmitStrLenFastFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnStrEmpty:
+            add(chunks, PrimaryObjectEmitReturnStrEmptyFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnStrArg0:
+            add(chunks, PrimaryObjectEmitReturnStrArg0FunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindReturnStrLiteral:
+            let literalAsmRes = PrimaryObjectEmitReturnStrLiteralFunctionAsm(plan, i, i)
+            if IsErr(literalAsmRes):
+                return Err[str](Error(literalAsmRes))
+            add(chunks, Value(literalAsmRes))
+        elif bodyKind == texpr.BodyKindCstringToStrCopy:
+            let cstringAsmRes = PrimaryObjectEmitCstringToStrCopyFunctionAsm(plan, i, i)
+            if IsErr(cstringAsmRes):
+                return Err[str](Error(cstringAsmRes))
+            add(chunks, Value(cstringAsmRes))
+        elif bodyKind == texpr.BodyKindMainF64MulCheckExit:
+            add(chunks, PrimaryObjectEmitF64MulCheckExitFunctionAsm(plan.symbolNames[i], i))
+        elif bodyKind == texpr.BodyKindStatementSequence:
+            let callAsmRes = PrimaryObjectEmitStatementSequenceFunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif PrimaryObjectEmitIsLetCallNoargReturnI32ConstBodyKind(bodyKind):
+            let imm = Value(PrimaryObjectEmitParseLetCallNoargReturnI32ConstBodyKind(bodyKind))
+            let callAsmRes = PrimaryObjectEmitLetCallNoargReturnI32ConstFunctionAsm(plan, i, i, imm)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsLetCallNoargReturnResultI32BodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitLetCallNoargReturnResultI32FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif bodyKind == texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32:
+            let callAsmRes = PrimaryObjectEmitLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitLetCallNoargStrReturnLenI32FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitLetCallNoargStrThenCallArg0ReturnI32Const0FunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif texpr.TypedExprIsReturnCallBodyKind(bodyKind):
+            let callAsmRes = PrimaryObjectEmitReturnCallFunctionAsm(plan, i, i)
+            if IsErr(callAsmRes):
+                return Err[str](Error(callAsmRes))
+            add(chunks, Value(callAsmRes))
+        elif bodyKind == texpr.BodyKindRuntimeSetCmdLine:
+            let setCmdRes = PrimaryObjectEmitRuntimeSetCmdLineFunctionAsm(plan, i, i)
+            if IsErr(setCmdRes):
+                return Err[str](Error(setCmdRes))
+            add(chunks, Value(setCmdRes))
+        elif bodyKind == texpr.BodyKindRuntimeParamCount:
+            let paramCountRes = PrimaryObjectEmitRuntimeParamCountFunctionAsm(plan, i, i)
+            if IsErr(paramCountRes):
+                return Err[str](Error(paramCountRes))
+            add(chunks, Value(paramCountRes))
+        elif bodyKind == texpr.BodyKindRuntimeParamStrCopyBridge:
+            let paramStrRes = PrimaryObjectEmitRuntimeParamStrCopyBridgeFunctionAsm(plan, i, i)
+            if IsErr(paramStrRes):
+                return Err[str](Error(paramStrRes))
+            add(chunks, Value(paramStrRes))
+        elif bodyKind == texpr.BodyKindBackendDriverCommandDispatch:
+            let dispatchRes = PrimaryObjectEmitBackendDriverCommandDispatchFunctionAsm(plan, i, i)
+            if IsErr(dispatchRes):
+                return Err[str](Error(dispatchRes))
+            add(chunks, Value(dispatchRes))
+        elif bodyKind == texpr.BodyKindResultRequestDispatch:
+            let resultDispatchRes = PrimaryObjectEmitResultRequestDispatchFunctionAsm(plan, i, i)
+            if IsErr(resultDispatchRes):
+                return Err[str](Error(resultDispatchRes))
+            add(chunks, Value(resultDispatchRes))
+        else:
+            return Err[str](" primary object emit: unsupported function body kind")
+    if bridgeIndex >= 0:
+        var entryTargetSymbol = plan.entryFunctionSymbol
+        if len(entryTargetSymbol) <= 0:
+            entryTargetSymbol = plan.symbolNames[0]
+        let bridgeAsm = PrimaryObjectEmitEntryBridgeAsm(plan,
+                                                        plan.symbolNames[bridgeIndex],
+                                                        entryTargetSymbol,
+                                                        bridgeIndex)
+        add(chunks, bridgeAsm)
+    add(chunks, PrimaryObjectEmitDataAsm(plan))
+    if plan.objectFormat == "macho":
+        add(chunks, ".subsections_via_symbols\n")
+    return Ok[str](strutil.Join(chunks, ""))
 
 fn PrimaryObjectEmitCompileArgv(plan: pobj.PrimaryObjectPlan,
                                  asmPath: str): Result[str[]] =
