@@ -8,23 +8,26 @@
 
 - `artifacts/bootstrap/cheng.stage3` 可用，`self-check --in:bootstrap/stage1_bootstrap.cheng` 通过。
 - bootstrap v2 合同仍只暴露：`print-contract,self-check,compile-bootstrap,bootstrap-bridge,build-backend-driver`。
-- `src/core/tooling` 是当前命令面、bootstrap bridge、backend driver、gate 与发布闭环的唯一源码位置。
-- Wasm 后端核心源码已迁入 `src/core/backend/wasm_module_emit.cheng`，不再把 Wasm 主实现继续堆进 C seed。
-- 当前安装的 `artifacts/backend_driver/cheng` 命令面已恢复可观测：`help` 输出 usage，`status --root --in --out` 写出 argv/CFG 字段，`print-build-plan` 可运行。
-- `ordinary_zero_exit_fixture` 已能通过当前 backend driver 的 provider-backed `system-link-exec` 编译并运行退出 0；报告写出 `system_link_exec_runtime_standalone_no_runtime=0`、`provider_object_count=6`、`object_link_input_count=7`。
-- `void_tail_if_fallthrough_fixture` 已覆盖真实 BodyIR call：主对象有 `_TailIf` BR26 relocation，main 保存/恢复 `x30` 与 `sp`，可执行运行退出 0。
-- `artifacts/bootstrap/cheng.stage3 build-backend-driver --require-rebuild` 在未设置 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 时可刷新并安装 driver；这还不是 A/B 纯 Cheng 自举完成证明。
-- `TypedStmt -> BodyIR CFG -> primary/direct emit` 是当前核心缺口；路线图不得再用入口特判、源码字符串扫描或旧 artifact 热补丁伪装完成。
-- 函数任务数据模型与执行器源码已存在：`src/core/ir/function_task.cheng`、`src/core/ir/function_task_executor.cheng`。`BACKEND_JOBS=1` 仍是串行 oracle，`BACKEND_JOBS>1` 必须用产物 SHA、report、marker 和真实 worker 错误传播证明。
+- `ordinary_zero_exit_fixture` 已能通过 backend driver 编译并运行退出 0；report: `provider_object_count=6`、`standalone_no_runtime=0`。
+- `void_tail_if_fallthrough_fixture` 编译运行退出 0；report `missing_reasons=-`。
+- `let_call_return_result_direct_object_smoke` 编译运行退出 7；report `instruction_word_count=24`。
+
+### 新增成立（本次会话）
+
+- **ARM64 编码器集成**：`src/core/backend/aarch64_encode.cheng`（504 行，46 个 `A64Enc*` 函数）已接入所有 manifest 和 build plan，`primary_object_plan.cheng` 的 BodyIR fill 管线已全部替换为编码器调用（`A64EncRet`/`A64EncMovz`/`A64EncBlPlaceholder`/`A64EncCmpImm`/`A64EncBCond` 等）。
+- **C seed `@exported` 支持**：`bootstrap/cheng_seed.c` 新增 `cheng_seed_exported_symbol_from_annotation`，`@exported("name")` 注解现在被正确识别。
+- **C seed `&&`/`||` emit 支持**：if 条件代码生成可处理 `&&` 和 `||` 运算符（prepare 阶段仍受限）。
+- **自举递归防护**：`backend_driver_dispatch_min.cheng` 的 `BackendDriverDispatchMinCurrentCompiler` 新增 `CHENG_NO_BACKEND_DRIVER_HANDOFF` 检查，防止 provider 编译时无限递归。
+- **BodyIR word count 修复**：`PrimaryBodyIrGeneralCfgWordCount` 中 ReturnOp 从 +2 修正为 +1，ReturnTerm 从 +1 修正为 +3，消除数组越界。
+- **Lowering call target 注册**：非 return-root 的 `BodyKindUnsupported` 函数现在正确注册 call target。
+- **自举编译首次通过**：backend driver 在 `CHENG_BACKEND_DRIVER_HANDOFF=1` 下成功编译自身入口模块和全部 6 个 provider，7 个 `.o` 链接成功，无 crash/hang/bounds check 失败。当前仅编译入口模块（47 items, 179 words），非完整 manifest 模块集（1059 items, 16796 words）。
 
 ### 当前阻断
 
-- 复杂 runtime smoke 仍是假绿：`atomic_i32_runtime_smoke` 与 `compiler_runtime_smoke` 已 provider-linked，但主函数仍会被降成 `mov w0,#0; ret`，没有执行 assert/echo/runtime 调用，不能当线程/原子/ORC runtime 通过。
-- BodyIR call argument、Result 投影、复杂 statement CFG 仍未完整证明；当前只证明了无参/未用参 call 的 relocation 与返回帧恢复。
-- 当前 driver 可用不等于纯自举完成；还缺 A 编 B、B 再编同一 witness、关键 report 字段一致的闭环。
-- roadmap 不能宣称“纯 Cheng 自举完成”“work-stealing 默认可用”“100ms 已达成”。
-- `docs/function-parallelism.md` 明确写着：真实 `ws` 源码路径已接入，但当前安装 artifact 尚未形成可验收证明。
-- `compiler_csg` 侧已有 canonical egraph 合同；UIR egraph 当前仍是 unavailable，不能写成后端优化已接入。
+- `PrimaryBuildBodyIrFromTypedStatements` 仍是 no-op 版本（`if/elif/else` 只递增 `ifBlockStack`）。完整 CFG 版本（含 Cbr/Return/Block 创建）已写好但 C seed 的 prepare 阶段不支持 for 循环内的函数调用与嵌套 if。
+- Cbr 比较指令（`subs wzr` + `b.cond` + `b`）的编码逻辑已在 `PrimaryBodyIRFillBlockTerm` 中就位，但 BodyIR 无 Cbr term 可填充（因为 BodyIR builder 不创建 Cbr）。
+- 自举编译仅覆盖入口模块，需要 manifest-based 全量编译才能产出完整 backend driver。
+- 任何 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 结果都不计入路线图进度。
 
 ## 总目标
 
@@ -42,7 +45,8 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 |---|---|---|---|
 | `src/core/tooling/backend_driver_main.cheng`、`src/core/tooling/backend_driver_dispatch_min.cheng`、`src/core/tooling/compiler_request.cheng` | 恢复 `help/status/print-build-plan/system-link-exec` 的可观测命令面 | `artifacts/backend_driver/cheng help`、`status --root --in --out`、`print-build-plan` 必须输出固定字段 | 当前已过；以后静默退出视为失败 |
 | `src/core/backend/system_link_plan.cheng`、`src/core/backend/primary_object_plan.cheng`、`src/core/backend/system_link_exec*.cheng` | 修复 `ordinary_zero_exit_fixture` 的崩溃，报告必须写出 phase、provider、standalone 状态 | `artifacts/backend_driver/cheng system-link-exec --root:/Users/lbcheng/cheng-lang --in:src/tests/ordinary_zero_exit_fixture.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/cheng_roadmap_zero --report-out:/tmp/cheng_roadmap_zero.report.txt && /tmp/cheng_roadmap_zero` | 当前退出码 0，`provider_object_count=6`，`standalone_no_runtime=0` |
-| `bootstrap/cheng_seed.c` | 只允许修 blocker 或删旧路径，不新增生产能力 | `cc -std=c11 -Wall -Wextra -pedantic -fsyntax-only bootstrap/cheng_seed.c` | 不得把 C seed forced build 算作完成；现有 unused-function warning 需后续消掉 |
+| TailIf / structured statements | 只做最小验证入口，不归入完整 CFG 完成项 | `void_tail_if_fallthrough_fixture` 必须 provider-backed 编译、运行退出 0，并在 object relocation 中看到 `_TailIf` | 当前最小 witness 已过；不得写成 structured statements 已完成 |
+| `bootstrap/cheng_seed.c` | 只允许修 blocker 或删旧路径，不新增生产能力 | `cc -std=c11 -Wall -Wextra -pedantic -fsyntax-only bootstrap/cheng_seed.c` | forced C seed build 不计进度；现有 unused-function warning 需后续消掉 |
 
 硬规则：
 - 不用旧缓存、热补丁、compile-only、mock 或 C seed forced build 当通过。
@@ -52,11 +56,11 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 | files | action | verify | done |
 |---|---|---|---|
-| `src/core/tooling/compiler_main.cheng`、`src/core/tooling/backend_driver_main.cheng` | `build-backend-driver --require-rebuild` 走当前 Cheng 主链，不设置 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` | `artifacts/bootstrap/cheng.stage3 build-backend-driver --require-rebuild` | 产出新 `artifacts/backend_driver/cheng` 和 `.map` |
+| `src/core/tooling/compiler_main.cheng`、`src/core/tooling/backend_driver_main.cheng` | `build-backend-driver --require-rebuild` 走当前 Cheng 主链，不设置 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` | `artifacts/bootstrap/cheng.stage3 build-backend-driver --require-rebuild` | 当前重建已过；产出新 `artifacts/backend_driver/cheng` 和 `.map` 只是前置，不能替代 A/B witness |
 | `artifacts/backend_driver/cheng` | A 编 B，B 再编同一最小 fixture | `system-link-exec ordinary_zero_exit_fixture` + 运行退出码 | A/B 编译报告关键字段一致 |
 | build report | 锁住 unsupported、RSS、provider、line-map | `rg 'unsupported|provider_object_count|system_link_exec_runtime|line_map' artifacts/backend_driver/builds/pid-*/build_backend_driver*.report.txt` | `unsupported=0` 只能和真实运行成功一起算通过 |
 
-完成标准：新 driver 的 `help/status/print-build-plan/system-link-exec` 都可观测，普通 fixture 与 runtime/provider fixture 都真实运行成功。
+完成标准：新 driver 的 `help/status/print-build-plan/system-link-exec` 都可观测，普通 fixture 与 runtime/provider fixture 都真实运行成功；forced C seed build 对该阶段贡献为 0。
 
 ## 阶段 2：TypedStmt -> BodyIR CFG -> primary/direct emit
 
@@ -65,19 +69,24 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 | 切片 | owner 文件 | done |
 |---|---|---|
 | `let/var/赋值` 栈槽 | `src/core/backend/lowering_plan.cheng`、`src/core/ir/*`、`src/core/backend/primary_object_plan.cheng` | 不靠源码行字符串扫描，BodyIR local/load/store 结构化表达 |
-| `if/elif/else` 与 guard CFG | 同上 | 多路 return、fallthrough、terminated 状态都在 CFG 中表达 |
+| TailIf / `if/elif/else` 与 guard CFG | 同上 | TailIf void fallthrough 最小 witness 已过；多路 return、fallthrough、terminated 状态都必须在 CFG 中表达后才算完整完成 |
 | `for range` 计数循环 | parser/typed facts/lowering/primary | index reload 不依赖 caller-saved 临时寄存器 |
-| call statement 与 return-call | lowering/BodyIR/primary/direct writer | `BodyOpCallTag` 基础 relocation 已过；下一步证明 arg passing、call result、Result/Option 解包和复杂 CFG 不折零 |
+| `stmt_let_call`、call statement 与 return-call | lowering/BodyIR/primary/direct writer | `let value:int32 = Noarg(); return value` provider-backed witness 已过；`Call(int32(0)); return 0` 仍是文本形状 witness；arg passing、ref/local、str sret、call statement、`Result/Option` 解包和复杂 CFG 仍未过 |
 | `Result/Value` 投影 | typed facts + BodyIR op | 不用函数名特判，不用 fallback |
-| `str`/`Bytes`/复合 local ABI | primary/direct writer | sret/local slot/arg passing 按 ABI 证明 |
+| `str`/`Bytes`/复合 local ABI | primary/direct writer | sret/local slot/arg passing 按 ABI 证明；atomic/compiler runtime 的 `stmt_let_call` 未通过前不能写完成 |
 
 验证入口：
 - `cfg_body_ir_contract_smoke`
 - `cfg_lowering_smoke`
 - `cfg_multi_stmt_smoke`
 - `cfg_result_project_smoke`
+- `cfg_return_call_local_arg_smoke`
+- `void_tail_if_fallthrough_fixture`
+- `let_call_return_result_direct_object_smoke`
 - `primary_object_codegen_smoke`
 - `ordinary_zero_exit_fixture`
+- `atomic_i32_runtime_smoke`
+- `compiler_runtime_smoke`
 
 ## 阶段 3：函数级并行
 
@@ -103,7 +112,8 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 | 能力 | 当前口径 | done |
 |---|---|---|
 | provider-free standalone direct exe | 可作为最小 witness | 必须用退出码、`otool -tV`、`otool -rv`、report 共同证明 |
-| provider-backed executable | 仍是关键缺口 | `provider_object_count>0`，不能走 `standalone_no_runtime=1` |
+| provider-backed ordinary executable | 阶段 0 ordinary witness 已通 | `provider_object_count>0`、`standalone_no_runtime=0`、真实退出码 0；不外推到 runtime smoke |
+| provider-backed runtime executable | 仍是关键缺口 | atomic/compiler runtime 必须执行 marker/assert/runtime 调用，不能走 `standalone_no_runtime=1` 或折零 |
 | direct object writer | Darwin arm64 主线优先 | writer 消费 primary plan 的机器字和 reloc，不再按 body kind 重猜 |
 | release system-link | 发布稳定主线 | direct-exe 未证明前不得替代 release |
 | hotpatch | dev host-only witness | 只在 `self-link + direct-exe + host runner` 口径证明，release 不参与 |
@@ -149,10 +159,10 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 ## 当前优先级
 
-1. 禁止复杂主体假降级为 `return_zero_i32`：有前置语句、调用、副作用、if/for/assert/echo 时必须生成真实 CFG，或 unsupported 硬失败。
-2. 补通 runtime smoke 的真实执行：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke` 必须输出 marker，主对象不能是 `mov w0,#0; ret`。
+1. 保持伪完成硬失败：reachable `unsupported` 不得分配机器字或填 `ret`；有前置语句、调用、副作用、if/for/assert/echo 时必须生成真实 CFG，或 unsupported 硬失败。
+2. 补通 runtime smoke 的真实执行：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke` 必须越过 `stmt_let_call` BodyIR/ABI 缺口并输出 marker，主对象不能是 `mov w0,#0; ret`。
 3. 做 A/B 纯自举证明：A 编 B，B 再编同一 witness，report 关键字段一致。
-4. 继续补 `TypedStmt -> BodyIR CFG -> primary/direct emit` 的结构化 IR 缺口，尤其是 call argument、call result、Result 投影和复合 ABI。
+4. 继续把 noarg i32 call-result 扩展到结构化 call ABI：call argument、ref/local、str sret、call statement、Result 投影和复合 ABI。
 5. 再推进函数级并行 determinism/perf witness 与 dev 默认切换。
 
 ## 诊断命令

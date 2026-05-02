@@ -6508,6 +6508,7 @@ static bool cheng_seed_is_annotation_line(const char *trimmed);
 static bool cheng_seed_annotation_named(const char *trimmed, const char *name);
 static bool cheng_seed_parse_ffi_handle_consume_annotation(const char *trimmed, int32_t *out_idx);
 static bool cheng_seed_exportc_symbol_from_annotation(char *trimmed, char *out, size_t cap);
+static bool cheng_seed_exported_symbol_from_annotation(char *trimmed, char *out, size_t cap);
 static void cheng_seed_parse_import_aliases_from_lines(char **lines,
                                                size_t line_count,
                                                ChengSeedImportAlias *aliases,
@@ -6926,7 +6927,8 @@ static bool cheng_seed_top_level_function_export_symbol_from_lines(char **lines,
             continue;
         }
         if (cheng_seed_compiler_top_level_export_symbol_from_annotation(trimmed, out, cap) ||
-            cheng_seed_exportc_symbol_from_annotation(trimmed, out, cap)) {
+            cheng_seed_exportc_symbol_from_annotation(trimmed, out, cap) ||
+            cheng_seed_exported_symbol_from_annotation(trimmed, out, cap)) {
             return true;
         }
         if (cheng_seed_is_annotation_line(trimmed)) {
@@ -6959,6 +6961,9 @@ static bool cheng_seed_source_text_has_explicit_compiler_exports(const char *tex
                                                                 export_symbol,
                                                                 sizeof(export_symbol)) ||
             cheng_seed_exportc_symbol_from_annotation(trimmed,
+                                                                export_symbol,
+                                                                sizeof(export_symbol)) ||
+            cheng_seed_exported_symbol_from_annotation(trimmed,
                                                                 export_symbol,
                                                                 sizeof(export_symbol))) {
             out = true;
@@ -18109,6 +18114,27 @@ static bool cheng_seed_exportc_symbol_from_annotation(char *trimmed, char *out, 
     char *close_quote;
     if (!cheng_seed_startswith(trimmed, "@exportc(") &&
         !cheng_seed_startswith(trimmed, "@ exportc(")) {
+        return false;
+    }
+    out[0] = '\0';
+    open_quote = strchr(trimmed, '"');
+    if (open_quote == NULL) {
+        return false;
+    }
+    close_quote = strchr(open_quote + 1, '"');
+    if (close_quote == NULL || close_quote == open_quote + 1) {
+        return false;
+    }
+    *close_quote = '\0';
+    snprintf(out, cap, "%s", open_quote + 1);
+    return true;
+}
+
+static bool cheng_seed_exported_symbol_from_annotation(char *trimmed, char *out, size_t cap) {
+    char *open_quote;
+    char *close_quote;
+    if (!cheng_seed_startswith(trimmed, "@exported(") &&
+        !cheng_seed_startswith(trimmed, "@ exported(")) {
         return false;
     }
     out[0] = '\0';

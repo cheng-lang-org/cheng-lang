@@ -14,7 +14,6 @@ import cheng/core/backend/line_map as linemap
 import cheng/core/backend/native_link_exec as nlink
 import cheng/core/backend/native_link_plan as nplan
 import cheng/core/backend/direct_object_emit as direct
-import cheng/core/backend/primary_object_emit as pemit
 import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/system_link_exec as sexec
 import cheng/core/backend/system_link_plan as slplan
@@ -135,9 +134,9 @@ fn SystemLinkExecRuntimeProviderCodegenCid(rootDir: str): Result[layout.FixedByt
     let primaryPlanRes = SystemLinkExecRuntimeCacheAppendSourceFile(buf, rootDir, "src/core/backend/primary_object_plan.cheng")
     if IsErr(primaryPlanRes):
         return Err[layout.FixedBytes32](Error(primaryPlanRes))
-    let primaryEmitRes = SystemLinkExecRuntimeCacheAppendSourceFile(buf, rootDir, "src/core/backend/primary_object_emit.cheng")
-    if IsErr(primaryEmitRes):
-        return Err[layout.FixedBytes32](Error(primaryEmitRes))
+    let aarch64EncodeRes = SystemLinkExecRuntimeCacheAppendSourceFile(buf, rootDir, "src/core/backend/aarch64_encode.cheng")
+    if IsErr(aarch64EncodeRes):
+        return Err[layout.FixedBytes32](Error(aarch64EncodeRes))
     let nativePlanRes = SystemLinkExecRuntimeCacheAppendSourceFile(buf, rootDir, "src/core/backend/native_link_plan.cheng")
     if IsErr(nativePlanRes):
         return Err[layout.FixedBytes32](Error(nativePlanRes))
@@ -332,7 +331,6 @@ fn SystemLinkExecRuntimeMaterializePrimaryObject(rootDir: str,
                                                   objectOnly: bool,
                                                   result: var SystemLinkExecRuntimeResult): Result[bool] =
     let startNs = SystemLinkExecRuntimeNowNs()
-    var emitRes: Result[pemit.PrimaryObjectEmitResult]
     var useStandalone = false
     if !objectOnly && standaloneMain:
         useStandalone = direct.DirectObjectEmitCanStandaloneMain(plan)
@@ -364,28 +362,11 @@ fn SystemLinkExecRuntimeMaterializePrimaryObject(rootDir: str,
                                                        startNs,
                                                        Value(directPlanRes),
                                                        result)
-    if objectOnly:
-        emitRes = pemit.PrimaryObjectEmitRunObjectLogged(rootDir,
-                                                         "system_link_exec_primary_object",
-                                                         plan)
-    elif useStandalone:
-        emitRes = pemit.PrimaryObjectEmitRunStandaloneMainLogged(rootDir,
-                                                                 "system_link_exec_primary_object_standalone",
-                                                                 plan)
-    else:
-        emitRes = pemit.PrimaryObjectEmitRunLogged(rootDir,
-                                                   "system_link_exec_primary_object",
-                                                   plan)
     result.primaryObjectNs = SystemLinkExecRuntimeNowNs() - startNs
-    if IsErr(emitRes):
-        return Err[bool](Error(emitRes))
-    let emit = Value(emitRes)
-    result.primaryObjectPath = emit.objectPath
-    result.primaryObjectAsmPath = emit.asmPath
-    result.primaryObjectCompileLogPath = emit.compileLogPath
-    if !chengpath.FileExistsNonEmpty(rootDir, emit.objectPath):
-        return Err[bool](Fmt" system link exec runtime: primary object missing after emit: {emit.objectPath}")
-    return Ok[bool](true)
+    let validateRes = direct.DirectObjectEmitValidatePlanObject(plan)
+    if IsErr(validateRes):
+        return Err[bool](Error(validateRes))
+    return Err[bool](" system link exec runtime: direct object emitter rejected plan")
 
 fn SystemLinkExecRuntimeProviderCompileArgs(plan: sexec.SystemLinkExecPlan,
                                              sourcePath: str,

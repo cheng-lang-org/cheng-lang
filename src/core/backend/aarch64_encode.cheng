@@ -11,6 +11,8 @@ const
     A64X6 = 6
     A64X7 = 7
     A64X8 = 8
+    A64X9 = 9
+    A64X10 = 10
     A64FP = 29
     A64LR = 30
     A64SP = 31
@@ -43,7 +45,7 @@ fn a64RegOk(reg: int32): bool =
 fn a64RequireReg(reg: int32) =
     system.Assert(a64RegOk(reg), " aarch64 encode: register out of range")
 
-fn a64Word(raw: uint32): int32 =
+fn int32(raw: uint32): int32 =
     return int32(raw)
 
 fn a64RegField(reg: int32, shift: int32): uint32 =
@@ -54,15 +56,15 @@ fn a64ImmField(value: int32, mask: int32, shift: int32): uint32 =
     return uint32(value & mask) << uint32(shift)
 
 fn a64Make1(base: uint32, rd: int32): int32 =
-    return a64Word(base | a64RegField(rd, 0))
+    return int32(base | a64RegField(rd, 0))
 
 fn a64Make2(base: uint32, rn: int32, rd: int32): int32 =
-    return a64Word(base |
+    return int32(base |
                    a64RegField(rn, 5) |
                    a64RegField(rd, 0))
 
 fn a64Make3(base: uint32, rm: int32, rn: int32, rd: int32): int32 =
-    return a64Word(base |
+    return int32(base |
                    a64RegField(rm, 16) |
                    a64RegField(rn, 5) |
                    a64RegField(rd, 0))
@@ -86,19 +88,19 @@ fn a64CondInvert(cond: int32): int32 =
     return cond ^ 1
 
 fn A64EncRet(): int32 =
-    return a64Word(uint32(0xD65F03C0))
+    return int32(uint32(0xD65F03C0))
 
 fn A64EncBlPlaceholder(): int32 =
-    return a64Word(uint32(0x94000000))
+    return int32(uint32(0x94000000))
 
 fn A64EncBPlaceholder(): int32 =
-    return a64Word(uint32(0x14000000))
+    return int32(uint32(0x14000000))
 
 fn A64EncBImm(deltaWords: int64): Result[int32] =
     if deltaWords < -33554432 || deltaWords > 33554431:
         return Err[int32](" aarch64 encode: b offset out of range")
     let imm26: uint32 = uint32(uint64(deltaWords) & uint64(0x03ffffff))
-    return Ok[int32](a64Word(uint32(0x14000000) | imm26))
+    return Ok[int32](int32(uint32(0x14000000) | imm26))
 
 fn A64EncBCond(deltaWords: int64, cond: int32): Result[int32] =
     if !a64CondOk(cond):
@@ -106,16 +108,38 @@ fn A64EncBCond(deltaWords: int64, cond: int32): Result[int32] =
     if deltaWords < -262144 || deltaWords > 262143:
         return Err[int32](" aarch64 encode: b.cond offset out of range")
     let imm19: uint32 = uint32(uint64(deltaWords) & uint64(0x7ffff))
-    return Ok[int32](a64Word(uint32(0x54000000) |
+    return Ok[int32](int32(uint32(0x54000000) |
                              (imm19 << uint32(5)) |
                              uint32(cond)))
+
+fn A64EncCbz(is64: bool, rt: int32, deltaWords: int64): Result[int32] =
+    if !a64RegOk(rt):
+        return Err[int32](" aarch64 encode: cbz register out of range")
+    if deltaWords < -262144 || deltaWords > 262143:
+        return Err[int32](" aarch64 encode: cbz offset out of range")
+    let base: uint32 = is64 ? uint32(0xB4000000) : uint32(0x34000000)
+    let imm19: uint32 = uint32(uint64(deltaWords) & uint64(0x7ffff))
+    return Ok[int32](int32(base |
+                             (imm19 << uint32(5)) |
+                             a64RegField(rt, 0)))
+
+fn A64EncCbnz(is64: bool, rt: int32, deltaWords: int64): Result[int32] =
+    if !a64RegOk(rt):
+        return Err[int32](" aarch64 encode: cbnz register out of range")
+    if deltaWords < -262144 || deltaWords > 262143:
+        return Err[int32](" aarch64 encode: cbnz offset out of range")
+    let base: uint32 = is64 ? uint32(0xB5000000) : uint32(0x35000000)
+    let imm19: uint32 = uint32(uint64(deltaWords) & uint64(0x7ffff))
+    return Ok[int32](int32(base |
+                             (imm19 << uint32(5)) |
+                             a64RegField(rt, 0)))
 
 fn A64EncMovz(is64: bool, rd: int32, imm16: int32, hw: int32): int32 =
     a64RequireReg(rd)
     a64RequireImm16(imm16)
     a64RequireHw(is64, hw)
     let base: uint32 = is64 ? uint32(0xD2800000) : uint32(0x52800000)
-    return a64Word(base |
+    return int32(base |
                    a64ImmField(hw, 3, 21) |
                    a64ImmField(imm16, 0xffff, 5) |
                    a64RegField(rd, 0))
@@ -125,7 +149,7 @@ fn A64EncMovk(is64: bool, rd: int32, imm16: int32, hw: int32): int32 =
     a64RequireImm16(imm16)
     a64RequireHw(is64, hw)
     let base: uint32 = is64 ? uint32(0xF2800000) : uint32(0x72800000)
-    return a64Word(base |
+    return int32(base |
                    a64ImmField(hw, 3, 21) |
                    a64ImmField(imm16, 0xffff, 5) |
                    a64RegField(rd, 0))
@@ -146,7 +170,7 @@ fn A64EncAddImm(is64: bool, rd: int32, rn: int32, imm12: int32): Result[int32] =
     if imm12 < 0 || imm12 > 4095:
         return Err[int32](" aarch64 encode: add imm12 out of range")
     let base: uint32 = is64 ? uint32(0x91000000) : uint32(0x11000000)
-    return Ok[int32](a64Word(base |
+    return Ok[int32](int32(base |
                              a64ImmField(imm12, 0xfff, 10) |
                              a64RegField(rn, 5) |
                              a64RegField(rd, 0)))
@@ -157,7 +181,7 @@ fn A64EncSubImm(is64: bool, rd: int32, rn: int32, imm12: int32): Result[int32] =
     if imm12 < 0 || imm12 > 4095:
         return Err[int32](" aarch64 encode: sub imm12 out of range")
     let base: uint32 = is64 ? uint32(0xD1000000) : uint32(0x51000000)
-    return Ok[int32](a64Word(base |
+    return Ok[int32](int32(base |
                              a64ImmField(imm12, 0xfff, 10) |
                              a64RegField(rn, 5) |
                              a64RegField(rd, 0)))
@@ -184,7 +208,7 @@ fn A64EncMul(is64: bool, rd: int32, rn: int32, rm: int32): int32 =
 
 fn A64EncMsub(is64: bool, rd: int32, rn: int32, rm: int32, ra: int32): int32 =
     let base: uint32 = is64 ? uint32(0x9B008000) : uint32(0x1B008000)
-    return a64Word(base |
+    return int32(base |
                    a64RegField(rm, 16) |
                    a64RegField(ra, 10) |
                    a64RegField(rn, 5) |
@@ -196,9 +220,31 @@ fn A64EncAsrv(is64: bool, rd: int32, rn: int32, rm: int32): int32 =
 
 fn A64EncCmpReg(is64: bool, rn: int32, rm: int32): int32 =
     let base: uint32 = is64 ? uint32(0xEB00001F) : uint32(0x6B00001F)
-    return a64Word(base |
+    return int32(base |
                    a64RegField(rm, 16) |
                    a64RegField(rn, 5))
+
+fn A64EncCmpImm(is64: bool, rn: int32, imm12: int32): Result[int32] =
+    if !a64RegOk(rn):
+        return Err[int32](" aarch64 encode: cmp imm register out of range")
+    if imm12 < 0 || imm12 > 4095:
+        return Err[int32](" aarch64 encode: cmp imm12 out of range")
+    let base: uint32 = is64 ? uint32(0xF100001F) : uint32(0x7100001F)
+    return Ok[int32](int32(base |
+                             a64ImmField(imm12, 0xfff, 10) |
+                             a64RegField(rn, 5)))
+
+fn A64EncCsel(is64: bool, rd: int32, rn: int32, rm: int32, cond: int32): Result[int32] =
+    if !a64RegOk(rd) || !a64RegOk(rn) || !a64RegOk(rm):
+        return Err[int32](" aarch64 encode: csel register out of range")
+    if !a64CondOk(cond):
+        return Err[int32](" aarch64 encode: csel condition out of range")
+    let base: uint32 = is64 ? uint32(0x9A800000) : uint32(0x1A800000)
+    return Ok[int32](int32(base |
+                             a64RegField(rm, 16) |
+                             a64ImmField(cond, 0xf, 12) |
+                             a64RegField(rn, 5) |
+                             a64RegField(rd, 0)))
 
 fn A64EncFmovDx(rd: int32, rn: int32): int32 =
     return a64Make2(uint32(0x9E670000), rn, rd)
@@ -207,7 +253,7 @@ fn A64EncFmovXd(rd: int32, rn: int32): int32 =
     return a64Make2(uint32(0x9E660000), rn, rd)
 
 fn A64EncFcmpD(rn: int32, rm: int32): int32 =
-    return a64Word(uint32(0x1E602000) |
+    return int32(uint32(0x1E602000) |
                    a64RegField(rm, 16) |
                    a64RegField(rn, 5))
 
@@ -230,7 +276,7 @@ fn A64EncScvtfDx(rd: int32, rn: int32): int32 =
     return a64Make2(uint32(0x9E620000), rn, rd)
 
 fn A64EncSvc(imm16: int32): int32 =
-    return a64Word(uint32(0xD4000001) |
+    return int32(uint32(0xD4000001) |
                    a64ImmField(imm16, 0xffff, 5))
 
 fn A64EncEorReg(is64: bool, rd: int32, rn: int32, rm: int32): int32 =
@@ -259,7 +305,7 @@ fn A64EncLsrv(is64: bool, rd: int32, rn: int32, rm: int32): int32 =
 fn A64EncStrbImm(rt: int32, rn: int32, offsetBytes: int32): Result[int32] =
     if offsetBytes < 0 || offsetBytes > 4095:
         return Err[int32](" aarch64 encode: strb offset out of range")
-    return Ok[int32](a64Word(uint32(0x39000000) |
+    return Ok[int32](int32(uint32(0x39000000) |
                              a64ImmField(offsetBytes, 0xfff, 10) |
                              a64RegField(rn, 5) |
                              a64RegField(rt, 0)))
@@ -267,7 +313,7 @@ fn A64EncStrbImm(rt: int32, rn: int32, offsetBytes: int32): Result[int32] =
 fn A64EncLdrbImm(rt: int32, rn: int32, offsetBytes: int32): Result[int32] =
     if offsetBytes < 0 || offsetBytes > 4095:
         return Err[int32](" aarch64 encode: ldrb offset out of range")
-    return Ok[int32](a64Word(uint32(0x39400000) |
+    return Ok[int32](int32(uint32(0x39400000) |
                              a64ImmField(offsetBytes, 0xfff, 10) |
                              a64RegField(rn, 5) |
                              a64RegField(rt, 0)))
@@ -275,7 +321,7 @@ fn A64EncLdrbImm(rt: int32, rn: int32, offsetBytes: int32): Result[int32] =
 fn A64EncLdrsbImm(rt: int32, rn: int32, offsetBytes: int32): Result[int32] =
     if offsetBytes < 0 || offsetBytes > 4095:
         return Err[int32](" aarch64 encode: ldrsb offset out of range")
-    return Ok[int32](a64Word(uint32(0x39C00000) |
+    return Ok[int32](int32(uint32(0x39C00000) |
                              a64ImmField(offsetBytes, 0xfff, 10) |
                              a64RegField(rn, 5) |
                              a64RegField(rt, 0)))
@@ -286,7 +332,7 @@ fn A64EncStrhImm(rt: int32, rn: int32, offsetBytes: int32): Result[int32] =
     let imm12: int32 = offsetBytes / 2
     if imm12 < 0 || imm12 > 4095:
         return Err[int32](" aarch64 encode: strh offset out of range")
-    return Ok[int32](a64Word(uint32(0x79000000) |
+    return Ok[int32](int32(uint32(0x79000000) |
                              a64ImmField(imm12, 0xfff, 10) |
                              a64RegField(rn, 5) |
                              a64RegField(rt, 0)))
@@ -297,7 +343,7 @@ fn A64EncLdrhImm(rt: int32, rn: int32, offsetBytes: int32): Result[int32] =
     let imm12: int32 = offsetBytes / 2
     if imm12 < 0 || imm12 > 4095:
         return Err[int32](" aarch64 encode: ldrh offset out of range")
-    return Ok[int32](a64Word(uint32(0x79400000) |
+    return Ok[int32](int32(uint32(0x79400000) |
                              a64ImmField(imm12, 0xfff, 10) |
                              a64RegField(rn, 5) |
                              a64RegField(rt, 0)))
@@ -308,7 +354,7 @@ fn A64EncLdrshImm(rt: int32, rn: int32, offsetBytes: int32): Result[int32] =
     let imm12: int32 = offsetBytes / 2
     if imm12 < 0 || imm12 > 4095:
         return Err[int32](" aarch64 encode: ldrsh offset out of range")
-    return Ok[int32](a64Word(uint32(0x79C00000) |
+    return Ok[int32](int32(uint32(0x79C00000) |
                              a64ImmField(imm12, 0xfff, 10) |
                              a64RegField(rn, 5) |
                              a64RegField(rt, 0)))
@@ -323,7 +369,7 @@ fn A64EncStrImm(is64: bool, rt: int32, rn: int32, offsetBytes: int64): Result[in
     if imm12 < 0 || imm12 > 4095:
         return Err[int32](" aarch64 encode: str offset out of range")
     let base: uint32 = is64 ? uint32(0xF9000000) : uint32(0xB9000000)
-    return Ok[int32](a64Word(base |
+    return Ok[int32](int32(base |
                              a64ImmField(int32(imm12), 0xfff, 10) |
                              a64RegField(rn, 5) |
                              a64RegField(rt, 0)))
@@ -338,7 +384,20 @@ fn A64EncLdrImm(is64: bool, rt: int32, rn: int32, offsetBytes: int64): Result[in
     if imm12 < 0 || imm12 > 4095:
         return Err[int32](" aarch64 encode: ldr offset out of range")
     let base: uint32 = is64 ? uint32(0xF9400000) : uint32(0xB9400000)
-    return Ok[int32](a64Word(base |
+    return Ok[int32](int32(base |
+                             a64ImmField(int32(imm12), 0xfff, 10) |
+                             a64RegField(rn, 5) |
+                             a64RegField(rt, 0)))
+
+fn A64EncLdrswImm(rt: int32, rn: int32, offsetBytes: int64): Result[int32] =
+    if !a64RegOk(rt) || !a64RegOk(rn):
+        return Err[int32](" aarch64 encode: ldrsw register out of range")
+    if offsetBytes < 0 || offsetBytes % int64(4) != 0:
+        return Err[int32](" aarch64 encode: ldrsw offset not aligned")
+    let imm12: int64 = offsetBytes / int64(4)
+    if imm12 < 0 || imm12 > 4095:
+        return Err[int32](" aarch64 encode: ldrsw offset out of range")
+    return Ok[int32](int32(uint32(0xB9800000) |
                              a64ImmField(int32(imm12), 0xfff, 10) |
                              a64RegField(rn, 5) |
                              a64RegField(rt, 0)))
@@ -359,7 +418,7 @@ fn a64EncPair64(base: uint32,
             return Err[int32](" aarch64 encode: stp offset out of range")
         return Err[int32](" aarch64 encode: ldp offset out of range")
     let imm7 = int32(offsetBytes / int64(8))
-    return Ok[int32](a64Word(base |
+    return Ok[int32](int32(base |
                              a64ImmField(imm7, 0x7f, 15) |
                              a64RegField(rt2, 10) |
                              a64RegField(rn, 5) |
@@ -427,7 +486,7 @@ fn A64EncTstImm64(rn: int32, imm: uint64): Result[int32] =
     var immsValue: int32
     if !a64LogicalImm64(imm, nValue, immrValue, immsValue):
         return Err[int32](" aarch64 encode: logical immediate out of range")
-    return Ok[int32](a64Word(uint32(0xF200001F) |
+    return Ok[int32](int32(uint32(0xF200001F) |
                              a64ImmField(nValue, 1, 22) |
                              a64ImmField(immrValue, 0x3f, 16) |
                              a64ImmField(immsValue, 0x3f, 10) |
@@ -438,7 +497,7 @@ fn A64EncCset(rd: int32, cond: int32): Result[int32] =
         return Err[int32](" aarch64 encode: register out of range")
     if cond < 0 || cond > 13:
         return Err[int32](" aarch64 encode: cset condition out of range")
-    return Ok[int32](a64Word(uint32(0x1A800400) |
+    return Ok[int32](int32(uint32(0x1A800400) |
                              a64RegField(A64ZR, 16) |
                              a64ImmField(a64CondInvert(cond), 0xf, 12) |
                              a64RegField(A64ZR, 5) |
