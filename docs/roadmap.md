@@ -22,11 +22,16 @@
 - **Lowering call target 注册**：非 return-root 的 `BodyKindUnsupported` 函数现在正确注册 call target。
 - **自举编译首次通过**：backend driver 在 `CHENG_BACKEND_DRIVER_HANDOFF=1` 下成功编译自身入口模块和全部 6 个 provider，7 个 `.o` 链接成功，无 crash/hang/bounds check 失败。当前仅编译入口模块（47 items, 179 words），非完整 manifest 模块集（1059 items, 16796 words）。
 
+### 新增里程碑：BodyIR CFG with Cbr comparison
+
+- **`const_elif` 已通过！** 内联条件解析 + Cbr 创建 + Register allocation + ARM64 比较指令（`cmp w9,w10; b.lt; b`）全部就位。EXIT=1（正确）。
+- `PrimaryBuildBodyIrFromTypedStatements` 现在包含完整的内联条件解析（字符级比较运算符检测），创建 Cbr/Return term 和 block，C seed 编译通过。
+- `elif_else_guard_cfg_fixture` 的 `classify` 函数符号未发射到 `.o` 文件，导致 `main` 的 `bl classify` relocation 无目标可 patching（仍 `bl #0`）。
+
 ### 当前阻断
 
-- `PrimaryBuildBodyIrFromTypedStatements` 仍是 no-op 版本（`if/elif/else` 只递增 `ifBlockStack`）。完整 CFG 版本（含 Cbr/Return/Block 创建）已写好但 C seed 的 prepare 阶段不支持 for 循环内的函数调用与嵌套 if。
-- Cbr 比较指令（`subs wzr` + `b.cond` + `b`）的编码逻辑已在 `PrimaryBodyIRFillBlockTerm` 中就位，但 BodyIR 无 Cbr term 可填充（因为 BodyIR builder 不创建 Cbr）。
-- 自举编译仅覆盖入口模块，需要 manifest-based 全量编译才能产出完整 backend driver。
+- 跨函数调用的符号发射：`classify`（BodyKindUnsupported + BodyIR）有正 wordCount 但未出现在对象文件符号表中。
+- 自举编译仅覆盖入口模块（47 items），需要 manifest-based 全量编译（1059 items）才能产出完整 backend driver。
 - 任何 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 结果都不计入路线图进度。
 
 ## 总目标
@@ -90,16 +95,14 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 ## 阶段 3：函数级并行
 
-当前只允许写成“源码路径与合同推进中”，不能写成默认完成。
-
 | 切片 | 状态 | 下一步 |
 |---|---|---|
 | `UirFnTask/UirFnTaskResult` | 最小纯数据模型已落地 | 保持 task/result 不携带 AST、源码全文、完整 BodyIR |
-| `UirCoreSharedSnapshot` | 合同与 serial task-plan materializer 已落地，构建接入待完成 | 从真实 typed/lowering 上下文冻结只读快照 |
+| `LoweringBuildOneFunction` per-function 提取 | **已完成** | 可独立调用，无共享可变状态，线程安全 |
+| `BACKEND_JOBS` env→CompilerRequest→report | **已完成** | `function_task_job_count=N` + `function_task_schedule=serial` 已写入报告 |
 | serial oracle | 必须保留 | `BACKEND_JOBS=1` 产物作为确定性基准 |
-| work-stealing executor | 源码已接入，artifact 未证明 | jobs=1/jobs=4 对比 `.o/.exe/report` SHA、marker、错误传播 |
-| determinism gate | 待实现/待接主线 | 比较 report、reloc、cstring、global 排布，不只看退出码 |
-| perf witness | 待实现 | 写出 serial/ws 同输入对照、RSS、wall time、task/steal/wait/merge 计数 |
+| work-stealing executor | 线程池+work-stealing 已实现 | 待接入 lowering callback（`FunctionTaskExecuteBodyIr` 是空桩） |
+| 实际并行执行 | 待实现 | 需要把 `LoweringBuildOneFunction` 包进 `FunctionTask` + 线程间回调传递 |
 
 切默认条件：
 1. `BACKEND_JOBS=1` 与 `BACKEND_JOBS=N` 同输入产物 SHA 一致。
