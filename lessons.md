@@ -1,5 +1,6 @@
 # Lessons
 
+- 2026-05-02: 用户要找“某版文档”时，不能只按最早提交或近似描述还原；必须先用用户给出的精确短语全历史搜索，确认命中提交后再改文件。
 - 2026-04-27: 纯 Cheng 自举任务中，C seed forced build 只能在 artifact 完全不可用时做一次明确恢复；不能在同一轮修复中反复刷新 backend_driver 来推进问题。后续定位和验收必须只用 `artifacts/backend_driver/cheng system-link-exec` / 纯 `build-backend-driver` 路径。
 - 2026-04-28: 最小 backend driver 入口不能把命令 if 链直接内联进 `main` 后保留最终 `return 2`；当前旧 pure driver 会把这种入口误降成恒定 `return_i32_const_2` 并产出 tiny candidate，必须用真实 callSequence/BodyIR 证明命令分发。
 - 2026-04-28: backend driver 候选 exe 不能走 `DirectObjectEmitStandaloneMain` 的 no-runtime 快路径；候选必须保留 runtime entry bridge、argv 初始化、provider objects、line map 和 `.map`，standalone direct 只给 provider-free fixture。

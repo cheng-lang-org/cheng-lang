@@ -234,6 +234,8 @@ fn LoweringPrimaryObjectIrLeafBodyKindFromTypedIr(ir: texpr.TypedExprIr,
         return texpr.BodyKindUnsupported
     let fnIr = ir.functions[fnIndex]
     bodyLineNumber = fnIr.bodyLineNumber
+    if fnIr.statementCount > 0:
+        return texpr.BodyKindUnsupported
     if fnIr.returnNodeIndex >= 0 && fnIr.returnNodeIndex < ir.nodes.len:
         let returnKind = LoweringPrimaryObjectIrBodyKindFromTypedIrOp(ir.nodes[fnIr.returnNodeIndex])
         if returnKind != texpr.BodyKindUnsupported:
@@ -640,6 +642,7 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
            LoweringTypedIrFunctionHasOpKind(plan.typedIr, typedFnIndex, texpr.TypedExprIrOpLetCall):
             hasLetCall = true
         var hasControlFlow = false
+        var hasSideEffectStatement = false
         if typedFnIndex >= 0:
             let typedFn = plan.typedIr.functions[typedFnIndex]
             var stmtEnd = typedFn.statementStart + typedFn.statementCount
@@ -652,27 +655,35 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                    stmt.kind == texpr.TypedExprIrStmtElse ||
                    stmt.kind == texpr.TypedExprIrStmtFor:
                     hasControlFlow = true
-                    break
+                if stmt.kind == texpr.TypedExprIrStmtCall ||
+                   stmt.kind == texpr.TypedExprIrStmtLetCall ||
+                   stmt.kind == texpr.TypedExprIrStmtIfCall ||
+                   stmt.kind == texpr.TypedExprIrStmtResultIntrinsic:
+                    hasSideEffectStatement = true
         if hasControlFlow:
             fnIr.bodyKind = texpr.BodyKindUnsupported
-        var leafBodyKind = fnIr.bodyKind
+        if hasControlFlow &&
+           !hasLetCall &&
+           !hasSideEffectStatement &&
+           typedFnIndex >= 0 &&
+           typedFnIndex < plan.typedIr.functions.len:
+            let typedFnForVoidControl = plan.typedIr.functions[typedFnIndex]
+            if typedFnForVoidControl.returnType == "" ||
+               typedFnForVoidControl.returnType == "void":
+                fnIr.bodyKind = texpr.BodyKindReturnVoid
         if fnIr.bodyKind == texpr.BodyKindUnsupported &&
            LoweringTypedIrFunctionIsVoidReturn(plan.typedIr, typedFnIndex):
             fnIr.bodyKind = texpr.BodyKindReturnVoid
-            leafBodyKind = fnIr.bodyKind
         let functionTailName = LoweringFunctionTailName(fnIr.functionName)
         if functionTailName == "__cheng_setCmdLine_export":
             fnIr.bodyKind = texpr.BodyKindRuntimeSetCmdLine
-            leafBodyKind = fnIr.bodyKind
         elif functionTailName == "paramCount_export" ||
              functionTailName == "__cheng_rt_paramCount_export" ||
              functionTailName == "__cmdCountFromRuntime_export" ||
              functionTailName == "cmdCountFromRuntime_export":
             fnIr.bodyKind = texpr.BodyKindRuntimeParamCount
-            leafBodyKind = fnIr.bodyKind
         elif functionTailName == "__cheng_rt_paramStrCopyBridge_export":
             fnIr.bodyKind = texpr.BodyKindRuntimeParamStrCopyBridge
-            leafBodyKind = fnIr.bodyKind
         if fnIr.bodyKind == texpr.BodyKindUnsupported || hasLetCall:
             let letCallReturnKind = LoweringPrimaryObjectIrLetCallReturnBodyKind(plan.typedIr, typedFnIndex)
             var callIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
@@ -736,6 +747,17 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                         add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
                         add(fnIr.callImportcSymbols, firstImportcSymbol)
                         fnIr.bodyKind = LoweringPrimaryObjectIrBodyKindForCallArgCount(fact.callArgCount)
+                elif letCallReturnKind == texpr.BodyKindUnsupported:
+                    var firstImportcSymbol = ""
+                    if fact.callTargetImportc:
+                        firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                         fact.callTargetSourcePath,
+                                                                         fact.callTarget)
+                    add(fnIr.callArgCounts, fact.callArgCount)
+                    add(fnIr.callTargets, fact.callTarget)
+                    add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
+                    add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
+                    add(fnIr.callImportcSymbols, firstImportcSymbol)
                 else:
                     if letCallReturnKind != texpr.BodyKindUnsupported:
                         if letCallReturnKind == "str_i32_guard_arg0_return_0":
@@ -890,8 +912,6 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                                     add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
                                     add(fnIr.callImportcSymbols, firstImportcSymbol)
                                     fnIr.bodyKind = texpr.BodyKindLetCallNoargStrReturnLenI32
-        if hasLetCall && fnIr.bodyKind == texpr.BodyKindUnsupported && leafBodyKind != texpr.BodyKindUnsupported:
-            fnIr.bodyKind = leafBodyKind
         if fnIr.bodyKind == texpr.BodyKindUnsupported && typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
             let typedFn = plan.typedIr.functions[typedFnIndex]
             if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
@@ -971,6 +991,31 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
                             add(fnIr.callTargetImportcFlags, secondFact.callTargetImportc)
                             add(fnIr.callImportcSymbols, secondImportcSymbol)
                             fnIr.bodyKind = texpr.BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0
+        if fnIr.bodyKind == texpr.BodyKindUnsupported && typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
+            let typedFn = plan.typedIr.functions[typedFnIndex]
+            var hasReturnZero = typedFn.returnExpr == "return int32(0)" ||
+                                typedFn.returnExpr == "return 0" ||
+                                typedFn.returnExpr == "int32(0)" ||
+                                typedFn.returnExpr == "0"
+            if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
+                let returnKind = LoweringPrimaryObjectIrBodyKindFromTypedIrOp(plan.typedIr.nodes[typedFn.returnNodeIndex])
+                if returnKind == texpr.BodyKindReturnZeroI32:
+                    hasReturnZero = true
+            if hasReturnZero && fnIr.statements.len == 1:
+                let stmt = fnIr.statements[0]
+                let callArgsText = chengpath.PathTrim(stmt.callArgsText)
+                if stmt.kind == texpr.TypedExprIrStmtCall &&
+                   stmt.callArgCount == 1 &&
+                   (callArgsText == "int32(0)" || callArgsText == "0") &&
+                   len(stmt.callTarget) > 0:
+                    if fnIr.callTargets.len <= 0:
+                        add(fnIr.callArgCounts, stmt.callArgCount)
+                        add(fnIr.callTargets, stmt.callTarget)
+                        add(fnIr.callTargetSourcePaths, stmt.callTargetSourcePath)
+                        add(fnIr.callTargetImportcFlags, stmt.callTargetImportc)
+                        add(fnIr.callImportcSymbols, stmt.callImportcSymbol)
+                    if fnIr.callTargets.len == 1:
+                        fnIr.bodyKind = texpr.BodyKindCallArg0Const0ReturnI32Const0
         if fnIr.bodyKind == texpr.BodyKindUnsupported:
             LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr, sourceTexts)
         LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr, sourceTexts)

@@ -21160,6 +21160,12 @@ static void cheng_seed_emit_branch_nonzero(char *out,
                     label);
 }
 
+static void cheng_seed_emit_label(char *out,
+                           size_t cap,
+                           const char *label) {
+    cheng_seed_text_appendf(out, cap, "%s:\n", label);
+}
+
 static void cheng_seed_emit_jump_label(char *out,
                                size_t cap,
                                const char *label) {
@@ -44132,6 +44138,7 @@ static bool cheng_seed_emit_if_statement(const ChengSeedSystemLinkPlanStub *plan
                                  int32_t *control_label_index_io,
                                  int32_t frame_size,
                                  int32_t sret_local_index,
+                                 bool *terminated_out,
                                  char *out,
                                  size_t cap);
 static bool cheng_seed_emit_while_statement(const ChengSeedSystemLinkPlanStub *plan,
@@ -44837,6 +44844,72 @@ static bool cheng_seed_emit_non_if_statement(const ChengSeedSystemLinkPlanStub *
     return false;
 }
 
+static bool cheng_seed_cond_has_toplevel_and(const char *cond) {
+    int depth = 0;
+    if (cond == NULL) return false;
+    for (const char *p = cond; *p != '\0'; ++p) {
+        if (*p == '(') ++depth;
+        else if (*p == ')') --depth;
+        else if (depth == 0 && *p == '&' && *(p + 1) == '&') return true;
+    }
+    return false;
+}
+
+static bool cheng_seed_cond_has_toplevel_or(const char *cond) {
+    int depth = 0;
+    if (cond == NULL) return false;
+    for (const char *p = cond; *p != '\0'; ++p) {
+        if (*p == '(') ++depth;
+        else if (*p == ')') --depth;
+        else if (depth == 0 && *p == '|' && *(p + 1) == '|') return true;
+    }
+    return false;
+}
+
+static bool cheng_seed_split_cond_on_and(const char *cond,
+                                  char *left, size_t left_cap,
+                                  char *right, size_t right_cap) {
+    int depth = 0;
+    if (cond == NULL || left == NULL || right == NULL) return false;
+    for (const char *p = cond; *p != '\0'; ++p) {
+        if (*p == '(') ++depth;
+        else if (*p == ')') --depth;
+        else if (depth == 0 && *p == '&' && *(p + 1) == '&') {
+            size_t left_len = (size_t)(p - cond);
+            if (left_len >= left_cap) left_len = left_cap - 1;
+            memcpy(left, cond, left_len);
+            left[left_len] = '\0';
+            cheng_seed_trim_copy_text(left, left, left_cap);
+            snprintf(right, right_cap, "%s", p + 2);
+            cheng_seed_trim_copy_text(right, right, right_cap);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cheng_seed_split_cond_on_or(const char *cond,
+                                  char *left, size_t left_cap,
+                                  char *right, size_t right_cap) {
+    int depth = 0;
+    if (cond == NULL || left == NULL || right == NULL) return false;
+    for (const char *p = cond; *p != '\0'; ++p) {
+        if (*p == '(') ++depth;
+        else if (*p == ')') --depth;
+        else if (depth == 0 && *p == '|' && *(p + 1) == '|') {
+            size_t left_len = (size_t)(p - cond);
+            if (left_len >= left_cap) left_len = left_cap - 1;
+            memcpy(left, cond, left_len);
+            left[left_len] = '\0';
+            cheng_seed_trim_copy_text(left, left, left_cap);
+            snprintf(right, right_cap, "%s", p + 2);
+            cheng_seed_trim_copy_text(right, right, right_cap);
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool cheng_seed_emit_if_statement(const ChengSeedSystemLinkPlanStub *plan,
                                  const ChengSeedLoweringPlanStub *lowering,
                                  const ChengSeedLoweredFunctionStub *function,
@@ -44856,11 +44929,17 @@ static bool cheng_seed_emit_if_statement(const ChengSeedSystemLinkPlanStub *plan
                                  int32_t *control_label_index_io,
                                  int32_t frame_size,
                                  int32_t sret_local_index,
+                                 bool *terminated_out,
                                  char *out,
                                  size_t cap) {
     char current_stmt[8192];
     char end_label[128];
     int32_t chain_id = cheng_seed_next_expr_label_id();
+    bool saw_else = false;
+    bool all_arms_terminated = true;
+    if (terminated_out) {
+        *terminated_out = false;
+    }
     snprintf(end_label, sizeof(end_label), "L_cheng_if_end_%d", chain_id);
     snprintf(current_stmt, sizeof(current_stmt), "%s", statement);
     for (;;) {
@@ -44892,6 +44971,7 @@ static bool cheng_seed_emit_if_statement(const ChengSeedSystemLinkPlanStub *plan
             }
         } else {
             is_else = true;
+            saw_else = true;
             if (!cheng_seed_parse_else_header(current_stmt, inline_stmt, sizeof(inline_stmt))) {
                 fprintf(stderr,
                         "[cheng_seed] emit else parse header failed function=%s stmt=%s\n",
@@ -44904,29 +44984,89 @@ static bool cheng_seed_emit_if_statement(const ChengSeedSystemLinkPlanStub *plan
         if (arm_has_cond) {
             int32_t next_id = cheng_seed_next_expr_label_id();
             snprintf(next_label, sizeof(next_label), "L_cheng_if_next_%d", next_id);
-            if (!cheng_seed_codegen_expr_scalar(plan,
-                                        lowering,
-                                        function,
-                                        aliases,
-                                        alias_count,
-                                        locals,
-                                        local_count,
-                                        cond,
-                                        "bool",
-                                        9,
-                                        call_arg_base,
-                                        string_temp_base,
-                                        string_temp_stride,
-                                        0,
-                                        out,
-                                        cap)) {
-                fprintf(stderr,
-                        "[cheng_seed] emit if cond failed function=%s cond=%s\n",
-                        function->symbol_text,
-                        cond);
-                return false;
+            if (cheng_seed_cond_has_toplevel_and(cond)) {
+                char cond_left[4096];
+                char cond_right[4096];
+                if (!cheng_seed_split_cond_on_and(cond, cond_left, sizeof(cond_left),
+                                                   cond_right, sizeof(cond_right))) {
+                    return false;
+                }
+                if (!cheng_seed_codegen_expr_scalar(plan, lowering, function,
+                                            aliases, alias_count, locals, local_count,
+                                            cond_left, "bool", 9, call_arg_base,
+                                            string_temp_base, string_temp_stride, 0, out, cap)) {
+                    fprintf(stderr,
+                            "[cheng_seed] emit if cond left failed function=%s cond=%s\n",
+                            function->symbol_text, cond_left);
+                    return false;
+                }
+                cheng_seed_emit_branch_zero(out, cap, 9, false, next_label);
+                if (!cheng_seed_codegen_expr_scalar(plan, lowering, function,
+                                            aliases, alias_count, locals, local_count,
+                                            cond_right, "bool", 9, call_arg_base,
+                                            string_temp_base, string_temp_stride, 0, out, cap)) {
+                    fprintf(stderr,
+                            "[cheng_seed] emit if cond right failed function=%s cond=%s\n",
+                            function->symbol_text, cond_right);
+                    return false;
+                }
+                cheng_seed_emit_branch_zero(out, cap, 9, false, next_label);
+            } else if (cheng_seed_cond_has_toplevel_or(cond)) {
+                char cond_left[4096];
+                char cond_right[4096];
+                char skip_label[128];
+                int32_t skip_id = cheng_seed_next_expr_label_id();
+                snprintf(skip_label, sizeof(skip_label), "L_cheng_if_skip_or_%d", skip_id);
+                if (!cheng_seed_split_cond_on_or(cond, cond_left, sizeof(cond_left),
+                                                   cond_right, sizeof(cond_right))) {
+                    return false;
+                }
+                if (!cheng_seed_codegen_expr_scalar(plan, lowering, function,
+                                            aliases, alias_count, locals, local_count,
+                                            cond_left, "bool", 9, call_arg_base,
+                                            string_temp_base, string_temp_stride, 0, out, cap)) {
+                    fprintf(stderr,
+                            "[cheng_seed] emit if cond left failed function=%s cond=%s\n",
+                            function->symbol_text, cond_left);
+                    return false;
+                }
+                cheng_seed_emit_branch_nonzero(out, cap, 9, false, skip_label);
+                if (!cheng_seed_codegen_expr_scalar(plan, lowering, function,
+                                            aliases, alias_count, locals, local_count,
+                                            cond_right, "bool", 9, call_arg_base,
+                                            string_temp_base, string_temp_stride, 0, out, cap)) {
+                    fprintf(stderr,
+                            "[cheng_seed] emit if cond right failed function=%s cond=%s\n",
+                            function->symbol_text, cond_right);
+                    return false;
+                }
+                cheng_seed_emit_branch_zero(out, cap, 9, false, next_label);
+                cheng_seed_emit_label(out, cap, skip_label);
+            } else {
+                if (!cheng_seed_codegen_expr_scalar(plan,
+                                            lowering,
+                                            function,
+                                            aliases,
+                                            alias_count,
+                                            locals,
+                                            local_count,
+                                            cond,
+                                            "bool",
+                                            9,
+                                            call_arg_base,
+                                            string_temp_base,
+                                            string_temp_stride,
+                                            0,
+                                            out,
+                                            cap)) {
+                    fprintf(stderr,
+                            "[cheng_seed] emit if cond failed function=%s cond=%s\n",
+                            function->symbol_text,
+                            cond);
+                    return false;
+                }
+                cheng_seed_emit_branch_zero(out, cap, 9, false, next_label);
             }
-            cheng_seed_emit_branch_zero(out, cap, 9, false, next_label);
         } else {
             next_label[0] = '\0';
         }
@@ -45012,6 +45152,7 @@ static bool cheng_seed_emit_if_statement(const ChengSeedSystemLinkPlanStub *plan
                     return false;
                 }
                 if (cheng_seed_startswith(nested_stmt, "if ")) {
+                    bool nested_terminated = false;
                     if (!cheng_seed_emit_if_statement(plan,
                                               lowering,
                                               function,
@@ -45031,6 +45172,7 @@ static bool cheng_seed_emit_if_statement(const ChengSeedSystemLinkPlanStub *plan
                                               control_label_index_io,
                                               frame_size,
                                               sret_local_index,
+                                              &nested_terminated,
                                               out,
                                               cap)) {
                         fprintf(stderr,
@@ -45039,6 +45181,9 @@ static bool cheng_seed_emit_if_statement(const ChengSeedSystemLinkPlanStub *plan
                                 current_stmt,
                                 nested_stmt);
                         return false;
+                    }
+                    if (nested_terminated) {
+                        branch_terminated = true;
                     }
                     continue;
                 }
@@ -45131,6 +45276,7 @@ static bool cheng_seed_emit_if_statement(const ChengSeedSystemLinkPlanStub *plan
                 }
             }
         }
+        all_arms_terminated = all_arms_terminated && branch_terminated;
         if (!is_else && !branch_terminated) {
             cheng_seed_emit_jump_label(out, cap, end_label);
         }
@@ -45143,6 +45289,9 @@ static bool cheng_seed_emit_if_statement(const ChengSeedSystemLinkPlanStub *plan
         snprintf(current_stmt, sizeof(current_stmt), "%s", next_clause);
     }
     cheng_seed_text_appendf(out, cap, "%s:\n", end_label);
+    if (terminated_out) {
+        *terminated_out = saw_else && all_arms_terminated;
+    }
     return true;
 }
 
@@ -45271,6 +45420,7 @@ static bool cheng_seed_emit_while_statement(const ChengSeedSystemLinkPlanStub *p
             return false;
         }
         if (cheng_seed_startswith(nested_stmt, "if ")) {
+            bool nested_terminated = false;
             if (!cheng_seed_emit_if_statement(plan,
                                       lowering,
                                       function,
@@ -45290,6 +45440,7 @@ static bool cheng_seed_emit_while_statement(const ChengSeedSystemLinkPlanStub *p
                                       control_label_index_io,
                                       frame_size,
                                       sret_local_index,
+                                      &nested_terminated,
                                       out,
                                       cap)) {
                 fprintf(stderr,
@@ -45299,6 +45450,9 @@ static bool cheng_seed_emit_while_statement(const ChengSeedSystemLinkPlanStub *p
                         nested_stmt);
                 cheng_seed_pop_loop_labels();
                 return false;
+            }
+            if (nested_terminated) {
+                branch_terminated = true;
             }
             continue;
         }
@@ -45866,6 +46020,7 @@ static bool cheng_seed_emit_for_statement(const ChengSeedSystemLinkPlanStub *pla
             return false;
         }
         if (cheng_seed_startswith(nested_stmt, "if ")) {
+            bool nested_terminated = false;
             if (!cheng_seed_emit_if_statement(plan,
                                       lowering,
                                       function,
@@ -45885,6 +46040,7 @@ static bool cheng_seed_emit_for_statement(const ChengSeedSystemLinkPlanStub *pla
                                       control_label_index_io,
                                       frame_size,
                                       sret_local_index,
+                                      &nested_terminated,
                                       out,
                                       cap)) {
                 fprintf(stderr,
@@ -45894,6 +46050,9 @@ static bool cheng_seed_emit_for_statement(const ChengSeedSystemLinkPlanStub *pla
                         nested_stmt);
                 cheng_seed_pop_loop_labels();
                 return false;
+            }
+            if (nested_terminated) {
+                branch_terminated = true;
             }
             continue;
         }
@@ -47114,6 +47273,7 @@ static bool cheng_seed_try_emit_scalar_function(const ChengSeedSystemLinkPlanStu
                     statement);
         }
         if (cheng_seed_startswith(statement, "if ")) {
+            bool if_terminated = false;
             if (!cheng_seed_emit_if_statement(plan,
                                       lowering,
                                       function,
@@ -47133,6 +47293,7 @@ static bool cheng_seed_try_emit_scalar_function(const ChengSeedSystemLinkPlanStu
                                       &control_label_index,
                                       frame_size,
                                       sret_local_index,
+                                      &if_terminated,
                                       out,
                                       cap)) {
                 fprintf(stderr,
@@ -47143,17 +47304,7 @@ static bool cheng_seed_try_emit_scalar_function(const ChengSeedSystemLinkPlanStu
                 free(owned_lines);
                 return false;
             }
-            if (i < line_count) {
-                char next_line_copy[4096];
-                char *next_trimmed;
-                snprintf(next_line_copy, sizeof(next_line_copy), "%s", lines[i]);
-                next_trimmed = cheng_seed_trim_inplace(next_line_copy);
-                if (*next_trimmed == '\0' ||
-                    cheng_seed_line_indent(lines[i]) <= 0 ||
-                    cheng_seed_is_top_level_decl_start(next_trimmed)) {
-                    saw_return = true;
-                }
-            } else {
+            if (if_terminated) {
                 saw_return = true;
             }
             continue;
@@ -64039,6 +64190,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     char report_path[PATH_MAX];
     char compile_report_path[PATH_MAX];
     char status_log[PATH_MAX];
+    char status_probe_out[PATH_MAX];
     char plan_log[PATH_MAX];
     char reference_plan_log[PATH_MAX];
     char package_root[PATH_MAX];
@@ -64051,6 +64203,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     char in_flag[PATH_MAX + 16];
     char target_flag[256];
     char out_flag[PATH_MAX + 16];
+    char status_out_flag[PATH_MAX + 16];
     char candidate_out[PATH_MAX];
     char candidate_build_out[PATH_MAX];
     char backend_driver_map[PATH_MAX];
@@ -64058,6 +64211,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     char candidate_build_out_map[PATH_MAX];
     char candidate_flag[PATH_MAX + 16];
     char report_flag[PATH_MAX + 16];
+    char contract_in_flag[PATH_MAX + 16];
     char saved_incremental[64];
     char saved_multi_module_cache[64];
     char saved_primary_object_cache[64];
@@ -64134,6 +64288,7 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     cheng_seed_join_path(report_path, sizeof(report_path), paths.root, "artifacts/backend_driver/build_backend_driver.report.txt");
     cheng_seed_join_path(compile_report_path, sizeof(compile_report_path), build_dir, "build_backend_driver.compile.report.txt");
     cheng_seed_join_path(status_log, sizeof(status_log), build_dir, "build_backend_driver.status.txt");
+    cheng_seed_join_path(status_probe_out, sizeof(status_probe_out), build_dir, "build_backend_driver.status_probe.out");
     cheng_seed_join_path(plan_log, sizeof(plan_log), build_dir, "build_backend_driver.plan.txt");
     cheng_seed_join_path(reference_plan_log, sizeof(reference_plan_log), build_dir, "reference_backend_driver.plan.txt");
     cheng_seed_copy_text(package_root, sizeof(package_root), paths.root);
@@ -64189,32 +64344,39 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     snprintf(target_flag, sizeof(target_flag), "--target:%s", target);
     snprintf(candidate_flag, sizeof(candidate_flag), "--out:%s", candidate_build_out);
     snprintf(report_flag, sizeof(report_flag), "--report-out:%s", compile_report_path);
+    {
+        char contract_in_path[PATH_MAX];
+        cheng_seed_join_path(contract_in_path, sizeof(contract_in_path), package_root, "bootstrap/driver_bootstrap_contract.cheng");
+        snprintf(contract_in_flag, sizeof(contract_in_flag), "--contract-in:%s", contract_in_path);
+    }
     unlink(compile_report_path);
     if (compile_with_backend_driver) {
-        if (!cheng_seed_run_command_logged_argv_live(8U,
-                                            (const char *[8]){ compile_compiler,
+        if (!cheng_seed_run_command_logged_argv_live(9U,
+                                            (const char *[9]){ compile_compiler,
                                                                "system-link-exec",
                                                                root_flag,
                                                                in_flag,
                                                                "--emit:exe",
                                                                target_flag,
                                                                candidate_flag,
-                                                               report_flag },
+                                                               report_flag,
+                                                               contract_in_flag },
                                             log_path,
                                             "build-backend-driver compile-pure-cheng-driver")) {
             goto done;
         }
     } else {
         if (!cheng_seed_run_internal_command_logged_argv_live(cheng_seed_cmd_system_link_exec,
-                                                      8U,
-                                                      (const char *[8]){ compile_compiler,
+                                                      9U,
+                                                      (const char *[9]){ compile_compiler,
                                                                          "system-link-exec",
                                                                          root_flag,
                                                                          in_flag,
                                                                          "--emit:exe",
                                                                          target_flag,
                                                                          candidate_flag,
-                                                                         report_flag },
+                                                                         report_flag,
+                                                                         contract_in_flag },
                                                       log_path,
                                                       "build-backend-driver compile-c-seed-bootstrap")) {
             goto done;
@@ -64297,15 +64459,20 @@ static int cheng_seed_cmd_build_backend_driver(int argc, char **argv) {
     free(report_text);
     report_text = NULL;
 
-    if (!cheng_seed_run_command_logged_argv_live(2U,
-                                    (const char *[2]){ candidate_out, "status" },
+    snprintf(status_out_flag, sizeof(status_out_flag), "--out:%s", status_probe_out);
+    if (!cheng_seed_run_command_logged_argv_live(5U,
+                                    (const char *[5]){ candidate_out,
+                                                       "status",
+                                                       root_flag,
+                                                       in_flag,
+                                                       status_out_flag },
                                     status_log,
                                     "build-backend-driver status")) {
         goto done;
     }
 
-    if (!cheng_seed_run_command_logged_argv_live(3U,
-                                    (const char *[3]){ candidate_out, "print-build-plan", target_flag },
+    if (!cheng_seed_run_command_logged_argv_live(4U,
+                                    (const char *[4]){ candidate_out, "print-build-plan", root_flag, target_flag },
                                     plan_log,
                                     "build-backend-driver print-build-plan")) {
         goto done;

@@ -1,7 +1,7 @@
 import std/result
-import std/cmdline as cmdline
 import std/os
 import std/strings as strings
+import std/system as system
 import std/strformat
 import std/strutils as strutil
 import cheng/core/backend/lowering_plan as lower
@@ -60,9 +60,6 @@ fn BackendDriverDispatchMinGetrusageBridge(who: int32,
 @importc("exit")
 fn BackendDriverDispatchMinExitBridge(code: int32)
 
-@importc("puts")
-fn BackendDriverDispatchMinPutsBridge(line: ptr): int32
-
 @importc("driver_c_write_error_report_bridge")
 fn BackendDriverDispatchMinWriteErrorReportBridge(rootDir: str,
                                                    reportPath: str,
@@ -72,12 +69,30 @@ fn BackendDriverDispatchMinWriteErrorReportBridge(rootDir: str,
 fn BackendDriverDispatchMinReadFlagOrDefaultBridge(key: str,
                                                     defaultValue: str): str
 
+@importc("paramCount")
+fn BackendDriverDispatchMinParamCountBridge(): int32
+
+@importc("__cheng_rt_paramStr")
+fn BackendDriverDispatchMinParamStrRawBridge(i: int32): cstring
+
 const
     BackendDriverDispatchMinProcessMemoryExceeded = 125
     BackendDriverDispatchMinRusageSelf = 0
 
 fn BackendDriverDispatchMinPrintErr(text: str) =
     os.WriteLine(os.GetStderr(), text)
+
+fn BackendDriverDispatchMinPrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn BackendDriverDispatchMinParamCount(): int32 =
+    return BackendDriverDispatchMinParamCountBridge()
+
+fn BackendDriverDispatchMinParamStr(index: int32): str =
+    let raw = BackendDriverDispatchMinParamStrRawBridge(index)
+    if raw == nil:
+        return ""
+    return system.strFromCStringBorrow(raw)
 
 fn BackendDriverDispatchMinEnsureParentDir(rootDir: str,
                                             pathRaw: str): bool =
@@ -274,6 +289,13 @@ fn BackendDriverDispatchMinProgressEnabled(): bool =
     let raw = os.GetEnv("PROGRESS")
     return len(raw) > 0 && raw != "0" && raw != "false"
 
+fn BackendDriverDispatchMinTruthyEnv(name: str): bool =
+    let raw = os.GetEnv(name)
+    return len(raw) > 0 && raw != "0" && raw != "false"
+
+fn BackendDriverDispatchMinRequirePureSystemLinkExec(): bool =
+    return BackendDriverDispatchMinTruthyEnv("CHENG_REQUIRE_PURE_SYSTEM_LINK_EXEC")
+
 fn BackendDriverDispatchMinProgress(phase: str,
                                      status: str): int32 =
     BackendDriverDispatchMinProgressResourceGuardCheck()
@@ -398,7 +420,7 @@ fn BackendDriverDispatchMinCollectArgsFrom(startIndex: int32,
     if count < startIndex:
         return out
     for i in startIndex..count:
-        add(out, cmdline.ParamStr(i))
+        add(out, BackendDriverDispatchMinParamStr(i))
     return out
 
 fn BackendDriverDispatchMinReadFlagOrDefault(key: str,
@@ -406,34 +428,68 @@ fn BackendDriverDispatchMinReadFlagOrDefault(key: str,
     return BackendDriverDispatchMinReadFlagOrDefaultBridge(key, defaultValue)
 
 fn BackendDriverDispatchMinStatus(): int32 =
-    BackendDriverDispatchMinPutsBridge("cheng")
-    BackendDriverDispatchMinPutsBridge("version=cheng.compiler_runtime.v1")
-    BackendDriverDispatchMinPutsBridge("execution=argv_control_plane")
-    BackendDriverDispatchMinPutsBridge("bootstrap_mode=selfhost")
-    BackendDriverDispatchMinPutsBridge("compiler_entry=src/core/tooling/backend_driver_dispatch_min.cheng")
-    BackendDriverDispatchMinPutsBridge("ordinary_command=system-link-exec")
-    BackendDriverDispatchMinPutsBridge("ordinary_pipeline=canonical_csg_verified_primary_object_codegen_ready")
-    BackendDriverDispatchMinPutsBridge("stage3=artifacts/bootstrap/cheng.stage3")
+    BackendDriverDispatchMinPrintLine("cheng")
+    BackendDriverDispatchMinPrintLine("version=cheng.compiler_runtime.v1")
+    BackendDriverDispatchMinPrintLine("execution=argv_control_plane")
+    BackendDriverDispatchMinPrintLine("bootstrap_mode=selfhost")
+    BackendDriverDispatchMinPrintLine("compiler_entry=src/core/tooling/backend_driver_dispatch_min.cheng")
+    BackendDriverDispatchMinPrintLine("ordinary_command=system-link-exec")
+    BackendDriverDispatchMinPrintLine("ordinary_pipeline=canonical_csg_verified_primary_object_codegen_ready")
+    BackendDriverDispatchMinPrintLine("stage3=artifacts/bootstrap/cheng.stage3")
     return 0
 
 fn BackendDriverDispatchMinStatusFromCmdline(): int32 =
-    return BackendDriverDispatchMinStatus()
+    let statusCode = BackendDriverDispatchMinStatus()
+    let packageRoot = BackendDriverDispatchMinReadFlagOrDefault("--root", "")
+    let sourcePath = BackendDriverDispatchMinReadFlagOrDefault("--in", "")
+    let outputPath = BackendDriverDispatchMinReadFlagOrDefault("--out", "")
+    if packageRoot == "" && sourcePath == "" && outputPath == "":
+        return statusCode
+    BackendDriverDispatchMinPrintLine(Fmt"flag_root={packageRoot}")
+    BackendDriverDispatchMinPrintLine(Fmt"flag_in={sourcePath}")
+    if packageRoot == "" || sourcePath == "" || outputPath == "":
+        BackendDriverDispatchMinPrintLine("flag_exec_edges=err")
+        BackendDriverDispatchMinPrintLine("flag_exec_unresolved=missing_required_status_flag")
+        return 2
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err: str
+    if !slplan.BuildSystemLinkPlanStubWithFields(packageRoot,
+                                                  packageRoot,
+                                                  sourcePath,
+                                                  outputPath,
+                                                  "arm64-apple-darwin",
+                                                  creq.EmitExe,
+                                                  "public",
+                                                  "",
+                                                  linkPlan,
+                                                  err):
+        BackendDriverDispatchMinPrintLine("flag_exec_edges=err")
+        BackendDriverDispatchMinPrintLine(Fmt"flag_exec_unresolved={err}")
+        return 2
+    if linkPlan.missingReasons.len > 0:
+        let missingText = strutil.Join(linkPlan.missingReasons, ",")
+        BackendDriverDispatchMinPrintLine("flag_exec_edges=err")
+        BackendDriverDispatchMinPrintLine(Fmt"flag_exec_unresolved={missingText}")
+        return 2
+    BackendDriverDispatchMinPrintLine(Fmt"flag_exec_edges={linkPlan.importEdgeCount}")
+    BackendDriverDispatchMinPrintLine(Fmt"flag_exec_unresolved={linkPlan.unresolvedImportCount}")
+    return statusCode
 
 fn BackendDriverDispatchMinPrintBuildPlan(): int32 =
-    BackendDriverDispatchMinPutsBridge("target=arm64-apple-darwin")
-    BackendDriverDispatchMinPutsBridge("linker=system_link")
-    BackendDriverDispatchMinPutsBridge("stage2_compiler=artifacts/bootstrap/cheng.stage2")
-    BackendDriverDispatchMinPutsBridge("entry=src/core/tooling/backend_driver_dispatch_min.cheng")
-    BackendDriverDispatchMinPutsBridge("output=artifacts/backend_driver/cheng")
-    BackendDriverDispatchMinPutsBridge("source[0]=backend_driver_entry_source:src/core/tooling/backend_driver_dispatch_min.cheng")
-    BackendDriverDispatchMinPutsBridge("source[1]=backend_system_link_plan_source:src/core/backend/system_link_plan.cheng")
-    BackendDriverDispatchMinPutsBridge("source[2]=backend_lowering_plan_source:src/core/backend/lowering_plan.cheng")
-    BackendDriverDispatchMinPutsBridge("source[3]=backend_primary_object_plan_source:src/core/backend/primary_object_plan.cheng")
-    BackendDriverDispatchMinPutsBridge("source[4]=backend_direct_object_emit_source:src/core/backend/direct_object_emit.cheng")
-    BackendDriverDispatchMinPutsBridge("source[5]=backend_line_map_source:src/core/backend/line_map.cheng")
-    BackendDriverDispatchMinPutsBridge("source[6]=backend_system_link_exec_runtime_source:src/core/backend/system_link_exec_runtime.cheng")
-    BackendDriverDispatchMinPutsBridge("source[7]=backend_system_link_exec_runtime_direct_source:src/core/backend/system_link_exec_runtime_direct.cheng")
-    BackendDriverDispatchMinPutsBridge("source[8]=backend_build_plan_source:src/core/backend/build_plan.cheng")
+    BackendDriverDispatchMinPrintLine("target=arm64-apple-darwin")
+    BackendDriverDispatchMinPrintLine("linker=system_link")
+    BackendDriverDispatchMinPrintLine("stage2_compiler=artifacts/bootstrap/cheng.stage2")
+    BackendDriverDispatchMinPrintLine("entry=src/core/tooling/backend_driver_dispatch_min.cheng")
+    BackendDriverDispatchMinPrintLine("output=artifacts/backend_driver/cheng")
+    BackendDriverDispatchMinPrintLine("source[0]=backend_driver_entry_source:src/core/tooling/backend_driver_dispatch_min.cheng")
+    BackendDriverDispatchMinPrintLine("source[1]=backend_system_link_plan_source:src/core/backend/system_link_plan.cheng")
+    BackendDriverDispatchMinPrintLine("source[2]=backend_lowering_plan_source:src/core/backend/lowering_plan.cheng")
+    BackendDriverDispatchMinPrintLine("source[3]=backend_primary_object_plan_source:src/core/backend/primary_object_plan.cheng")
+    BackendDriverDispatchMinPrintLine("source[4]=backend_direct_object_emit_source:src/core/backend/direct_object_emit.cheng")
+    BackendDriverDispatchMinPrintLine("source[5]=backend_line_map_source:src/core/backend/line_map.cheng")
+    BackendDriverDispatchMinPrintLine("source[6]=backend_system_link_exec_runtime_source:src/core/backend/system_link_exec_runtime.cheng")
+    BackendDriverDispatchMinPrintLine("source[7]=backend_system_link_exec_runtime_direct_source:src/core/backend/system_link_exec_runtime_direct.cheng")
+    BackendDriverDispatchMinPrintLine("source[8]=backend_build_plan_source:src/core/backend/build_plan.cheng")
     return 0
 
 fn BackendDriverDispatchMinPrintBuildPlanFromCmdline(): int32 =
@@ -443,8 +499,8 @@ fn BackendDriverDispatchMinPrintBuildPlanCommandFromCmdline(): int32 =
     return BackendDriverDispatchMinPrintBuildPlanFromCmdline()
 
 fn BackendDriverDispatchMinHelp(): int32 =
-    BackendDriverDispatchMinPutsBridge("usage: cheng <command> [args]")
-    BackendDriverDispatchMinPutsBridge("core commands: status, print-build-plan, system-link-exec")
+    BackendDriverDispatchMinPrintLine("usage: cheng <command> [args]")
+    BackendDriverDispatchMinPrintLine("core commands: status, print-build-plan, system-link-exec")
     return 0
 
 fn BackendDriverDispatchMinCurrentCompiler(rootDir: str): str =
@@ -458,7 +514,7 @@ fn BackendDriverDispatchMinCurrentCompiler(rootDir: str): str =
         let stage3 = chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage3")
         if chengpath.FileExistsNonEmpty(rootDir, stage3):
             return stage3
-    let raw = cmdline.ProgramName()
+    let raw = BackendDriverDispatchMinParamStr(0)
     if len(raw) <= 0:
         return ""
     return chengpath.PathAbsolute(rootDir, raw)
@@ -1126,10 +1182,19 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterBrowserReady(driver
                                                                reportPath,
                                                                reason)
         return BackendDriverDispatchMinUnsupported(reason)
-    if linkPlan.emitKind == creq.EmitExe && direct.DirectObjectEmitCanStandaloneMain(primaryPlan):
-        return BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
+    let requirePureSystemLinkExec = BackendDriverDispatchMinRequirePureSystemLinkExec()
     if linkPlan.emitKind == creq.EmitExe && linkPlan.providerModules.len > 0:
         return BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
+    if linkPlan.emitKind == creq.EmitExe &&
+       !requirePureSystemLinkExec &&
+       direct.DirectObjectEmitCanStandaloneMain(primaryPlan):
+        return BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
+    if linkPlan.emitKind == creq.EmitExe && requirePureSystemLinkExec:
+        let reason = "backend driver direct system-link-exec: pure runtime requires provider modules"
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                               reportPath,
+                                                               reason)
+        return BackendDriverDispatchMinUnsupported(reason)
     return BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
 
 fn BackendDriverDispatchMinIsTargetSupported(triple: str): bool =
@@ -1317,6 +1382,10 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
             let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
             return BackendDriverDispatchMinUnsupported(reason)
         add(providerObjectPaths, providerObjectPath)
+    if providerObjectPaths.len != linkPlan.providerModules.len:
+        let reason = Fmt"backend driver direct system-link-exec: provider object count mismatch modules={linkPlan.providerModules.len} objects={providerObjectPaths.len}"
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
+        return BackendDriverDispatchMinUnsupported(reason)
     phaseProfile.providerObjectNs = BackendDriverDispatchMinNowNs() - phaseProfile.providerObjectNs
     BackendDriverDispatchMinProgress("provider_object", "done")
     let primaryObjectPath = chengpath.PathAbsolute(driverRoot, object.objectPath)
@@ -1365,6 +1434,12 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
     return 0
 
 fn BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot: str, reportPath: str, linkPlan: slplan.SystemLinkPlanStub, loweringPlan: lower.LoweringPlanStub, primaryPlan: pobj.PrimaryObjectPlan, phaseProfile: var BackendDriverDispatchMinPhaseProfile): int32 =
+    if linkPlan.providerModules.len > 0:
+        let reason = "backend driver direct system-link-exec: standalone path received provider modules"
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                               reportPath,
+                                                               reason)
+        return BackendDriverDispatchMinUnsupported(reason)
     phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs()
     BackendDriverDispatchMinProgress("direct_object_emit", "begin")
     let objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
@@ -1614,13 +1689,13 @@ fn BackendDriverDispatchMinRunCommandWithCmd(cmd: str): int32 =
     return 2
 
 fn ParamStr(index: int32): str =
-    return cmdline.ParamStr(index)
+    return BackendDriverDispatchMinParamStr(index)
 
 fn BackendDriverDispatchMinRunCommand(): int32 =
-    let count = cmdline.ParamCount()
+    let count = BackendDriverDispatchMinParamCount()
     if count <= 0:
         return BackendDriverDispatchMinHelp()
-    return BackendDriverDispatchMinRunCommandWithCmd(cmdline.ParamStr(1))
+    return BackendDriverDispatchMinRunCommandWithCmd(BackendDriverDispatchMinParamStr(1))
 
 fn BackendDriverDispatchMinRun(): int32 =
     return BackendDriverDispatchMinRunCommand()

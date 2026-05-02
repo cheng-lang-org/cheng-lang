@@ -399,6 +399,7 @@ const
     BodyKindLetCallNoargStrReturnLenI32 = "let_call_noarg_str_return_len_i32"
     BodyKindLetCallStrThenCallArg0ReturnI32Const0 = "let_call_str_then_call_arg0_return_i32_const_0"
     BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0 = "let_call_noarg_str_then_call_arg0_return_i32_const_0"
+    BodyKindCallArg0Const0ReturnI32Const0 = "call_arg0_const_0_return_i32_const_0"
     BodyKindStrI32GuardArg0Return0 = "str_i32_guard_arg0_return_0"
     BodyKindStrI32GuardArg0ElseCallArg0Arg1ReturnResultI32 = "str_i32_guard_arg0_else_call_arg0_arg1_return_result_i32"
     BodyKindCstringToStrCopy = "cstring_to_str_copy"
@@ -440,6 +441,7 @@ fn TypedExprIsCallRelocBodyKind(bodyKind: str): bool =
            bodyKind == BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32 ||
            TypedExprIsLetCallNoargStrReturnLenI32BodyKind(bodyKind) ||
            TypedExprIsLetCallNoargStrThenCallArg0ReturnI32Const0BodyKind(bodyKind) ||
+           bodyKind == BodyKindCallArg0Const0ReturnI32Const0 ||
            bodyKind == BodyKindBackendDriverCommandDispatch ||
            bodyKind == BodyKindBackendDriverRunCommand ||
            bodyKind == BodyKindResultRequestDispatch ||
@@ -5477,6 +5479,378 @@ fn TypedExprIrAppendStatementsForScope(ir: var TypedExprIr,
                                             currentLineEnclosingIfLineNumber,
                                             currentLineEnclosingIfConditionText)
 
+fn TypedExprFactIsIrCallStatementCandidate(fact: TypedExprFact): bool =
+    let isResultIntrinsic = fact.kind == parser.NormalizedExprResultIntrinsic
+    let isNormalCall = fact.kind == parser.NormalizedExprCall
+    if !isNormalCall && !isResultIntrinsic:
+        return false
+    if isNormalCall && fact.callKind == TypedExprCallBuiltin:
+        return false
+    if isNormalCall && (!fact.callResolved || fact.callTarget == ""):
+        return false
+    return true
+
+fn TypedExprExprIsStructuredStatement(expr: parser.NormalizedExpr): bool =
+    if expr.kind == parser.NormalizedExprReturn:
+        return true
+    if expr.kind == parser.NormalizedExprAssign:
+        return true
+    if expr.kind == parser.NormalizedExprIfStmt ||
+       expr.kind == parser.NormalizedExprElifStmt ||
+       expr.kind == parser.NormalizedExprElseStmt ||
+       expr.kind == parser.NormalizedExprForStmt:
+        return true
+    return false
+
+fn TypedExprScopeHasDirectLeafControlBody(ctx: var TypedExprSourceContext,
+                                           scope: TypedExprFunctionScope,
+                                           params: TypedExprParam[]): bool =
+    var bodyLineNumber: int32
+    var thenConst = ""
+    var elseConst = ""
+    if TypedExprFunctionBodyIsI32IfArg0LeZeroConstElseConst(ctx,
+                                                            scope,
+                                                            params,
+                                                            bodyLineNumber,
+                                                            thenConst,
+                                                            elseConst):
+        return true
+    if TypedExprFunctionBodyMatchesF64MulCheckExit(ctx, scope):
+        return true
+    if TypedExprFunctionBodyMatchesStrLenFast(ctx, scope, params):
+        return true
+    return false
+
+fn TypedExprTextIsI32Zero(textRaw: str): bool =
+    let text = chengpath.PathTrim(textRaw)
+    return text == "0" || text == "int32(0)"
+
+fn TypedExprScopeNeedsStructuredStatements(ctx: var TypedExprSourceContext,
+                                            scope: TypedExprFunctionScope,
+                                            params: TypedExprParam[],
+                                            returnExpr: str,
+                                            facts: var TypedExprFact[],
+                                            factStartIndex: int32,
+                                            factEndIndexRaw: int32,
+                                            exprLayer: var parser.NormalizedExprLayer,
+                                            exprStartIndex: int32,
+                                            exprEndIndexRaw: int32): bool =
+    var exprEndIndex = exprEndIndexRaw
+    if exprEndIndex < 0 || exprEndIndex > exprLayer.exprs.len:
+        exprEndIndex = exprLayer.exprs.len
+    var hasControlStatement = false
+    var hasAssignStatement = false
+    var hasForStatement = false
+    for i in exprStartIndex..<exprEndIndex:
+        let expr = exprLayer.exprs[i]
+        if expr.lineNumber <= scope.startLine || expr.lineNumber > scope.endLine:
+            if expr.lineNumber > scope.endLine:
+                break
+            continue
+        if expr.kind == parser.NormalizedExprAssign:
+            hasAssignStatement = true
+        elif expr.kind == parser.NormalizedExprForStmt:
+            hasForStatement = true
+            hasControlStatement = true
+        elif expr.kind == parser.NormalizedExprIfStmt ||
+             expr.kind == parser.NormalizedExprElifStmt ||
+             expr.kind == parser.NormalizedExprElseStmt:
+            hasControlStatement = true
+    if hasAssignStatement || hasForStatement:
+        return true
+    if hasControlStatement:
+        if scope.returnType == "" || scope.returnType == "void":
+            return true
+        if !TypedExprScopeHasDirectLeafControlBody(ctx, scope, params):
+            return true
+    var factEndIndex = factEndIndexRaw
+    if factEndIndex < 0 || factEndIndex > facts.len:
+        factEndIndex = facts.len
+    var callCount: int32
+    var onlyCallIndex: int32 = -1
+    for i in factStartIndex..<factEndIndex:
+        let fact = facts[i]
+        if fact.lineNumber <= scope.startLine || fact.lineNumber > scope.endLine:
+            if fact.lineNumber > scope.endLine:
+                break
+            continue
+        if !TypedExprFactIsIrCallStatementCandidate(fact):
+            continue
+        callCount = callCount + 1
+        onlyCallIndex = i
+        if callCount > 1:
+            return true
+    if callCount <= 0:
+        return false
+    let onlyFact = facts[onlyCallIndex]
+    if onlyFact.returnRoot && !onlyFact.hasSink:
+        return false
+    if onlyFact.kind == parser.NormalizedExprCall &&
+       !onlyFact.returnRoot &&
+       !onlyFact.hasSink &&
+       onlyFact.callArgCount == 1 &&
+       TypedExprTextIsI32Zero(onlyFact.callArgsText) &&
+       TypedExprTextIsI32Zero(returnExpr):
+        return false
+    return true
+
+fn TypedExprNextStructuredStatementExprIndex(exprLayer: var parser.NormalizedExprLayer,
+                                              cursorRaw: int32,
+                                              endIndexRaw: int32,
+                                              scope: TypedExprFunctionScope): int32 =
+    var cursor = cursorRaw
+    if cursor < 0:
+        cursor = 0
+    var endIndex = endIndexRaw
+    if endIndex < 0 || endIndex > exprLayer.exprs.len:
+        endIndex = exprLayer.exprs.len
+    for i in cursor..<endIndex:
+        let expr = exprLayer.exprs[i]
+        if expr.lineNumber <= scope.startLine:
+            continue
+        if expr.lineNumber > scope.endLine:
+            return -1
+        if TypedExprExprIsStructuredStatement(expr):
+            return i
+    return -1
+
+fn TypedExprNextCallStatementFactIndex(facts: var TypedExprFact[],
+                                        cursorRaw: int32,
+                                        endIndexRaw: int32,
+                                        scope: TypedExprFunctionScope): int32 =
+    var cursor = cursorRaw
+    if cursor < 0:
+        cursor = 0
+    var endIndex = endIndexRaw
+    if endIndex < 0 || endIndex > facts.len:
+        endIndex = facts.len
+    for i in cursor..<endIndex:
+        let fact = facts[i]
+        if fact.lineNumber <= scope.startLine:
+            continue
+        if fact.lineNumber > scope.endLine:
+            return -1
+        if TypedExprFactIsIrCallStatementCandidate(fact):
+            return i
+    return -1
+
+fn TypedExprStructuredExprComesBeforeFact(expr: parser.NormalizedExpr,
+                                           fact: TypedExprFact): bool =
+    if expr.lineNumber < fact.lineNumber:
+        return true
+    if expr.lineNumber > fact.lineNumber:
+        return false
+    return expr.columnNumber <= fact.columnNumber
+
+fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
+                                                             ctx: var TypedExprSourceContext,
+                                                             scope: TypedExprFunctionScope,
+                                                             facts: var TypedExprFact[],
+                                                             factStartIndex: int32,
+                                                             factEndIndexRaw: int32,
+                                                             exprLayer: var parser.NormalizedExprLayer,
+                                                             exprStartIndex: int32,
+                                                             exprEndIndexRaw: int32,
+                                                             includeStructuredStatements: bool) =
+    var factCursor = factStartIndex
+    if factCursor < 0:
+        factCursor = 0
+    var factEndIndex = factEndIndexRaw
+    if factEndIndex < 0 || factEndIndex > facts.len:
+        factEndIndex = facts.len
+    var exprCursor = exprStartIndex
+    if exprCursor < 0:
+        exprCursor = 0
+    var exprEndIndex = exprEndIndexRaw
+    if exprEndIndex < 0 || exprEndIndex > exprLayer.exprs.len:
+        exprEndIndex = exprLayer.exprs.len
+    var currentLineNumber: int32 = -1
+    var currentLineHasIf = false
+    var currentLineBindingName = ""
+    var currentLineBindingType = ""
+    var currentLineBindingRootColumn: int32 = -1
+    var currentLineBindingRhsStartColumn: int32 = -1
+    var currentLineReturnRootColumn: int32 = -1
+    var currentLineReturnExprStartColumn: int32 = -1
+    var currentLineIndent: int32
+    var currentLineEnclosingIfLineNumber: int32
+    var currentLineEnclosingIfConditionText = ""
+    var emptySourceContexts: TypedExprSourceContext[]
+    while true:
+        var exprIndex: int32 = -1
+        if includeStructuredStatements:
+            exprIndex = TypedExprNextStructuredStatementExprIndex(exprLayer,
+                                                                  exprCursor,
+                                                                  exprEndIndex,
+                                                                  scope)
+        let factIndex = TypedExprNextCallStatementFactIndex(facts,
+                                                            factCursor,
+                                                            factEndIndex,
+                                                            scope)
+        if exprIndex < 0 && factIndex < 0:
+            break
+        var useExpr = false
+        if exprIndex >= 0:
+            if factIndex < 0:
+                useExpr = true
+            else:
+                useExpr = TypedExprStructuredExprComesBeforeFact(exprLayer.exprs[exprIndex],
+                                                                 facts[factIndex])
+        var lineNumber: int32
+        if useExpr:
+            lineNumber = exprLayer.exprs[exprIndex].lineNumber
+        else:
+            lineNumber = facts[factIndex].lineNumber
+        if lineNumber != currentLineNumber:
+            currentLineNumber = lineNumber
+            currentLineHasIf = false
+            currentLineBindingName = ""
+            currentLineBindingType = ""
+            currentLineBindingRootColumn = -1
+            currentLineBindingRhsStartColumn = -1
+            currentLineReturnRootColumn = -1
+            currentLineReturnExprStartColumn = -1
+            let lineRaw = TypedExprSourceLine(ctx, currentLineNumber)
+            currentLineIndent = TypedExprLineIndentWidth(lineRaw)
+            TypedExprNearestEnclosingIf(ctx,
+                                        scope,
+                                        currentLineNumber,
+                                        currentLineIndent,
+                                        currentLineEnclosingIfLineNumber,
+                                        currentLineEnclosingIfConditionText)
+            let trimmedLine = chengpath.PathTrim(lineRaw)
+            var isBindingLine = false
+            if parser.ParserStartsWith(trimmedLine, "let "):
+                isBindingLine = true
+            elif parser.ParserStartsWith(trimmedLine, "var "):
+                isBindingLine = true
+            elif parser.ParserStartsWith(trimmedLine, "const "):
+                isBindingLine = true
+            if isBindingLine:
+                currentLineBindingName = TypedExprLetCallBindingNameFromBody(trimmedLine)
+                var bindingName = ""
+                var bindingType = ""
+                var bindingRhsColumn: int32 = -1
+                if TypedExprParseBindingLine(lineRaw, bindingName, bindingType, bindingRhsColumn):
+                    currentLineBindingName = bindingName
+                    currentLineBindingType = bindingType
+                let eqPos = TypedExprFindTopLevelTextToken(lineRaw, "=")
+                if eqPos >= 0:
+                    var rhsStartColumn = eqPos + 2
+                    for column in rhsStartColumn..lineRaw.len:
+                        if parser.ParserIsInlineSpace(lineRaw[column - 1]):
+                            rhsStartColumn = column + 1
+                        else:
+                            rhsStartColumn = column
+                            break
+                    currentLineBindingRhsStartColumn = rhsStartColumn
+            let firstToken = parser.ParserFirstToken(chengpath.PathTrim(lineRaw))
+            if firstToken == "return":
+                let returnPos = parser.ParserFindText(lineRaw, "return")
+                currentLineReturnExprStartColumn = returnPos + 7
+            elif scope.startLine == currentLineNumber:
+                let inlineEqPos = TypedExprFindTopLevelTextToken(lineRaw, "=")
+                if inlineEqPos >= 0:
+                    currentLineReturnExprStartColumn = inlineEqPos + 2
+                else:
+                    currentLineReturnExprStartColumn = -1
+            for j in exprStartIndex..<exprEndIndex:
+                let lineExpr = exprLayer.exprs[j]
+                if lineExpr.lineNumber != currentLineNumber:
+                    if lineExpr.lineNumber > currentLineNumber:
+                        break
+                    continue
+                if lineExpr.kind == parser.NormalizedExprIf:
+                    currentLineHasIf = true
+                    break
+            for j in factStartIndex..<factEndIndex:
+                let lineFact = facts[j]
+                if lineFact.lineNumber != currentLineNumber:
+                    if lineFact.lineNumber > currentLineNumber:
+                        break
+                    continue
+                if currentLineBindingRhsStartColumn > 0 &&
+                   (lineFact.kind == parser.NormalizedExprCall ||
+                    lineFact.kind == parser.NormalizedExprResultIntrinsic) &&
+                   lineFact.columnNumber >= currentLineBindingRhsStartColumn:
+                    if currentLineBindingRootColumn < 0 ||
+                       lineFact.columnNumber < currentLineBindingRootColumn:
+                        currentLineBindingRootColumn = lineFact.columnNumber
+                if currentLineReturnExprStartColumn > 0 &&
+                   (lineFact.kind == parser.NormalizedExprCall ||
+                    lineFact.kind == parser.NormalizedExprResultIntrinsic) &&
+                   lineFact.columnNumber >= currentLineReturnExprStartColumn:
+                    if currentLineReturnRootColumn < 0 ||
+                       lineFact.columnNumber < currentLineReturnRootColumn:
+                        currentLineReturnRootColumn = lineFact.columnNumber
+        if useExpr:
+            let expr = exprLayer.exprs[exprIndex]
+            if expr.kind == parser.NormalizedExprReturn:
+                let _ = TypedExprIrAddCallStatementFromExpr(ir,
+                                                            ctx,
+                                                            emptySourceContexts,
+                                                            scope,
+                                                            expr,
+                                                            TypedExprIrStmtReturn,
+                                                            "",
+                                                            scope.returnType,
+                                                            currentLineIndent,
+                                                            currentLineEnclosingIfLineNumber,
+                                                            currentLineEnclosingIfConditionText,
+                                                            true)
+            elif expr.kind == parser.NormalizedExprAssign:
+                let _ = TypedExprIrAddAssignStatementFromExpr(ir,
+                                                              ctx,
+                                                              scope,
+                                                              expr,
+                                                              currentLineIndent,
+                                                              currentLineEnclosingIfLineNumber,
+                                                              currentLineEnclosingIfConditionText)
+            else:
+                let _ = TypedExprIrAddControlStatementFromExpr(ir,
+                                                               scope,
+                                                               expr,
+                                                               currentLineIndent,
+                                                               currentLineEnclosingIfLineNumber,
+                                                               currentLineEnclosingIfConditionText)
+            exprCursor = exprIndex + 1
+            continue
+        let fact = facts[factIndex]
+        var statementKind = TypedExprIrStmtCall
+        if fact.kind == parser.NormalizedExprResultIntrinsic:
+            statementKind = TypedExprIrStmtResultIntrinsic
+        else:
+            if fact.hasSink &&
+               (fact.sinkPlaceKind == TypedExprPlaceLocal ||
+                fact.sinkPlaceKind == TypedExprPlaceGlobal):
+                statementKind = TypedExprIrStmtLetCall
+            elif currentLineBindingRootColumn == fact.columnNumber:
+                statementKind = TypedExprIrStmtLetCall
+            elif currentLineHasIf:
+                statementKind = TypedExprIrStmtIfCall
+        var statementBindingName = ""
+        if statementKind == TypedExprIrStmtLetCall ||
+           (statementKind == TypedExprIrStmtResultIntrinsic &&
+            (fact.hasSink || currentLineBindingRootColumn == fact.columnNumber)):
+            statementBindingName = currentLineBindingName
+        var statementResultType = fact.typeText
+        if (statementKind == TypedExprIrStmtLetCall ||
+            statementKind == TypedExprIrStmtResultIntrinsic) &&
+           Len(currentLineBindingType) > 0:
+            statementResultType = currentLineBindingType
+        if Len(statementResultType) <= 0:
+            statementResultType = TypedExprLookupLocalFunctionReturnType(ctx, fact.callTarget)
+        let _ = TypedExprIrAddCallStatement(ir,
+                                            scope,
+                                            fact,
+                                            statementKind,
+                                            statementBindingName,
+                                            statementResultType,
+                                            currentLineIndent,
+                                            currentLineEnclosingIfLineNumber,
+                                            currentLineEnclosingIfConditionText)
+        factCursor = factIndex + 1
+
 fn TypedExprLookupCallTargetReturnTypeFromExpr(currentCtx: var TypedExprSourceContext,
                                                 sourceContexts: var TypedExprSourceContext[],
                                                 expr: parser.NormalizedExpr): str =
@@ -6032,6 +6406,104 @@ fn TypedExprBuildIrForScope(ctx: var TypedExprSourceContext,
     fnIr.nodeCount = ir.nodes.len - nodeStart
     add(ir.functions, fnIr)
 
+fn TypedExprBuildIrForScopeWithFactsAndExprLayer(ctx: var TypedExprSourceContext,
+                                                  scope: TypedExprFunctionScope,
+                                                  facts: var TypedExprFact[],
+                                                  factStartIndex: int32,
+                                                  factEndIndex: int32,
+                                                  exprLayer: var parser.NormalizedExprLayer,
+                                                  exprStartIndex: int32,
+                                                  exprEndIndex: int32,
+                                                  ir: var TypedExprIr) =
+    let nodeStart = ir.nodes.len
+    let statementStart = ir.statements.len
+    var fnIr: TypedExprIrFunction
+    fnIr.sourcePath = ctx.sourcePath
+    fnIr.functionName = scope.name
+    fnIr.signatureLineNumber = scope.startLine
+    fnIr.endLineNumber = scope.endLine
+    fnIr.returnType = scope.returnType
+    fnIr.nodeStart = nodeStart
+    fnIr.statementStart = statementStart
+    fnIr.returnNodeIndex = -1
+    if scope.startLine <= 0 || scope.startLine > ctx.lines.len:
+        add(ir.functions, fnIr)
+        return
+    var bodyLineNumber: int32
+    let bodyText = TypedExprFunctionBodyLine(ctx, scope, bodyLineNumber)
+    var returnExpr = TypedExprReturnExprFromBody(bodyText)
+    var returnLineNumber = bodyLineNumber
+    let bodyTrim = chengpath.PathTrim(bodyText)
+    if !parser.ParserStartsWith(bodyTrim, "return ") &&
+       !parser.ParserStartsWith(bodyTrim, "if "):
+        let topLevelReturnExpr = TypedExprFunctionTopLevelReturnExpr(ctx,
+                                                                    scope,
+                                                                    returnLineNumber)
+        if topLevelReturnExpr != "":
+            returnExpr = topLevelReturnExpr
+        else:
+            returnExpr = ""
+    let params = TypedExprFunctionParams(TypedExprFunctionDeclHeaderText(ctx.lines, scope.startLine))
+    var paramNodeIndices: int32[]
+    TypedExprIrAddParamNodes(ir,
+                             ctx.sourcePath,
+                             scope.name,
+                             scope.startLine,
+                             params,
+                             paramNodeIndices)
+    TypedExprIrAppendLocalDeclStatementsForScope(ir, ctx, scope)
+    let includeStructuredStatements = TypedExprScopeNeedsStructuredStatements(ctx,
+                                                                             scope,
+                                                                             params,
+                                                                             returnExpr,
+                                                                             facts,
+                                                                             factStartIndex,
+                                                                             factEndIndex,
+                                                                             exprLayer,
+                                                                             exprStartIndex,
+                                                                             exprEndIndex)
+    TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir,
+                                                             ctx,
+                                                             scope,
+                                                             facts,
+                                                             factStartIndex,
+                                                             factEndIndex,
+                                                             exprLayer,
+                                                             exprStartIndex,
+                                                             exprEndIndex,
+                                                             includeStructuredStatements)
+    let firstBindingCallFactIndex: int32 = TypedExprIrFirstBindingCallFactIndex(facts,
+                                                                                bodyLineNumber,
+                                                                                factStartIndex,
+                                                                                factEndIndex)
+    if firstBindingCallFactIndex >= 0:
+        let _ = TypedExprIrAddLetCallNode(ir,
+                                          ctx.sourcePath,
+                                          scope.name,
+                                          bodyLineNumber,
+                                          facts[firstBindingCallFactIndex].exprId)
+        var letCallReturnLineNumber: int32
+        var letCallReturnExpr = ""
+        if TypedExprFunctionBodyIsI32LetCallThenReturnConst(ctx,
+                                                            scope,
+                                                            letCallReturnLineNumber,
+                                                            letCallReturnExpr):
+            returnLineNumber = letCallReturnLineNumber
+            returnExpr = letCallReturnExpr
+    let returnNodeIndex = TypedExprIrBuildReturnNode(ir,
+                                                     ctx,
+                                                     scope,
+                                                     returnLineNumber,
+                                                     returnExpr,
+                                                     params,
+                                                     paramNodeIndices)
+    fnIr.bodyLineNumber = bodyLineNumber
+    fnIr.returnExpr = returnExpr
+    fnIr.returnNodeIndex = returnNodeIndex
+    fnIr.statementCount = ir.statements.len - statementStart
+    fnIr.nodeCount = ir.nodes.len - nodeStart
+    add(ir.functions, fnIr)
+
 fn TypedExprBuildIrForScopeFromExprLayer(ctx: var TypedExprSourceContext,
                                           sourceContexts: var TypedExprSourceContext[],
                                           scope: TypedExprFunctionScope,
@@ -6116,11 +6588,35 @@ fn TypedExprExprLayerEndIndexForSource(exprLayer: var parser.NormalizedExprLayer
             return i
     return exprLayer.exprs.len
 
+fn TypedExprReadNormalizedExprLayerForSourceTexts(sourceTexts: var TypedExprSourceText[],
+                                                   exprLayer: var parser.NormalizedExprLayer,
+                                                   err: var str): bool =
+    exprLayer = parser.NormalizedExprLayer()
+    for i in 0..<sourceTexts.len:
+        os.ProcessResourceGuardCheck()
+        var sourceText = sourceTexts[i].text
+        if sourceText == "" && sourceTexts[i].sourcePath != "":
+            sourceText = chengpath.ReadTextFile("", sourceTexts[i].sourcePath)
+        var sourceExprLayer: parser.NormalizedExprLayer
+        if !parser.ParserReadNormalizedExprLayerFromText(sourceTexts[i].sourcePath,
+                                                         sourceText,
+                                                         sourceExprLayer,
+                                                         err):
+            return false
+        parser.NormalizedExprLayerAdd(exprLayer, sourceExprLayer)
+    err = ""
+    return true
+
 fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
                               facts: var TypedExprFact[],
                               ir: var TypedExprIr,
                               err: var str): bool =
     ir = TypedExprIr()
+    var exprLayer: parser.NormalizedExprLayer
+    if facts.len > 0:
+        if !TypedExprReadNormalizedExprLayerForSourceTexts(sourceTexts, exprLayer, err):
+            err = Fmt" typed expr: build typed ir normalized expr layer failed: {err}"
+            return false
     for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
         var ctx: TypedExprSourceContext
@@ -6136,6 +6632,15 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
         else:
             sourceFactEnd = 0
             factCursor = 0
+        let sourceExprStart = TypedExprExprLayerFirstIndexForSource(exprLayer, ctx.sourcePath)
+        var sourceExprEnd: int32
+        var exprCursor: int32
+        if facts.len > 0 && sourceExprStart >= 0:
+            sourceExprEnd = TypedExprExprLayerEndIndexForSource(exprLayer, ctx.sourcePath, sourceExprStart)
+            exprCursor = sourceExprStart
+        else:
+            sourceExprEnd = 0
+            exprCursor = 0
         for j in 0..<ctx.scopes.len:
             if j % 128 == 0:
                 os.ProcessResourceGuardCheck()
@@ -6144,7 +6649,23 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
                     if facts[factIndex].lineNumber > ctx.scopes[j].startLine:
                         break
                     factCursor = factIndex + 1
-            TypedExprBuildIrForScope(ctx, ctx.scopes[j], facts, factCursor, sourceFactEnd, ir)
+            if exprCursor < sourceExprEnd:
+                for exprIndex in exprCursor..<sourceExprEnd:
+                    if exprLayer.exprs[exprIndex].lineNumber > ctx.scopes[j].startLine:
+                        break
+                    exprCursor = exprIndex + 1
+            if facts.len > 0:
+                TypedExprBuildIrForScopeWithFactsAndExprLayer(ctx,
+                                                              ctx.scopes[j],
+                                                              facts,
+                                                              factCursor,
+                                                              sourceFactEnd,
+                                                              exprLayer,
+                                                              exprCursor,
+                                                              sourceExprEnd,
+                                                              ir)
+            else:
+                TypedExprBuildIrForScope(ctx, ctx.scopes[j], facts, factCursor, sourceFactEnd, ir)
     err = ""
     return true
 

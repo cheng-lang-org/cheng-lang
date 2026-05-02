@@ -3497,6 +3497,59 @@ fn CompilerBuildBackendDriverSmokeReport(prefix: str,
     out = out + prefix + "_run_log=" + runLogPath + "\n"
     return out
 
+fn CompilerBuildBackendDriverStatusArgs(rootDir: str,
+                                          packageRoot: str,
+                                          compilerEntrySource: str): str[] =
+    let statusOut = chengpath.PathAbsolute(rootDir, "artifacts/backend_driver/build_backend_driver.status_probe.out")
+    return [
+        "status",
+        "--root:" + packageRoot,
+        "--in:" + compilerEntrySource,
+        "--out:" + statusOut
+    ]
+
+fn CompilerBuildBackendDriverStatusLogOk(logPath: str,
+                                           packageRoot: str,
+                                           compilerEntrySource: str): bool =
+    let statusText = chengpath.ReadTextFile("", logPath)
+    if strutil.Contains(statusText, "flag_root=" + packageRoot) &&
+       strutil.Contains(statusText, "flag_in=" + compilerEntrySource) &&
+       strutil.Contains(statusText, "execution=argv_control_plane") &&
+       strutil.Contains(statusText, "flag_exec_edges=") &&
+       !strutil.Contains(statusText, "flag_exec_edges=err"):
+        return true
+    return false
+
+fn CompilerBuildBackendDriverInstalledPairOk(backendDriverOut: str,
+                                               backendDriverMapOut: str,
+                                               candidateBinarySize: int64,
+                                               candidateMapSize: int64,
+                                               candidateMapText: str,
+                                               compilerEntrySource: str,
+                                               installReport: var str): bool =
+    if !chengpath.PathFileExists(backendDriverOut):
+        installReport = installReport + "installed_pair_sync=missing_binary\n"
+        return false
+    if !chengpath.PathFileExists(backendDriverMapOut):
+        installReport = installReport + "installed_pair_sync=missing_map\n"
+        return false
+    if chengpath.PathFileSize(backendDriverOut) != candidateBinarySize:
+        installReport = installReport + "installed_pair_sync=binary_size_drift\n"
+        return false
+    if chengpath.PathFileSize(backendDriverMapOut) != candidateMapSize:
+        installReport = installReport + "installed_pair_sync=map_size_drift\n"
+        return false
+    let installedMapText = chengpath.ReadTextFile("", backendDriverMapOut)
+    if installedMapText != candidateMapText:
+        installReport = installReport + "installed_pair_sync=map_content_drift\n"
+        return false
+    if !strutil.Contains(installedMapText, "cheng_line_map_v1") ||
+       !strutil.Contains(installedMapText, compilerEntrySource):
+        installReport = installReport + "installed_pair_sync=map_source_drift\n"
+        return false
+    installReport = installReport + "installed_pair_sync=ok\n"
+    return true
+
 fn CompilerBackendDriverDefaultMaxRssBytesText(): str =
     return "8589934592"
 
@@ -3842,13 +3895,18 @@ fn CompilerBuildBackendDriver(rootDir: str): int32 =
     if !chengpath.WriteTextFile(rootDir, compileLogPath, compileLogText):
         CompilerPrintErr(" compiler: failed to write backend driver compile log: " + compileLogPath)
         return 2
-    let statusArgs = ["status"]
+    let statusArgs = CompilerBuildBackendDriverStatusArgs(rootDir,
+                                                            packageRoot,
+                                                            compilerEntrySource)
     if !CompilerRunFileEnvLogged(rootDir,
                                    backendDriverCandidateOut,
                                    statusArgs,
                                    noHandoffEnv,
                                    statusLogPath,
                                    "build-backend-driver status"):
+        return 2
+    if !CompilerBuildBackendDriverStatusLogOk(statusLogPath, packageRoot, compilerEntrySource):
+        CompilerPrintErr(" compiler: backend driver candidate status did not exercise argv provider path")
         return 2
     if !CompilerRunFileEnvLogged(rootDir,
                                    backendDriverCandidateOut,
@@ -3959,6 +4017,16 @@ fn CompilerBuildBackendDriver(rootDir: str): int32 =
                                            freshNodeSmokeCompileLogPath,
                                            freshNodeSmokeRunLogPath):
         return 2
+    let candidateBinarySize = chengpath.PathFileSize(backendDriverCandidateOut)
+    let candidateMapSize = chengpath.PathFileSize(backendDriverCandidateMapOut)
+    let candidateMapText = chengpath.ReadTextFile("", backendDriverCandidateMapOut)
+    if candidateBinarySize <= Int64(0) ||
+       candidateMapSize <= Int64(0) ||
+       len(candidateMapText) <= 0 ||
+       !strutil.Contains(candidateMapText, "cheng_line_map_v1") ||
+       !strutil.Contains(candidateMapText, compilerEntrySource):
+        CompilerPrintErr(" compiler: backend driver candidate map is not from current candidate source")
+        return 2
     var installReport = ""
     if !CompilerBootstrapInstallCandidate(rootDir,
                                             backendDriverCandidateMapOut,
@@ -3976,6 +4044,16 @@ fn CompilerBuildBackendDriver(rootDir: str): int32 =
                                             installReport):
         CompilerPrintErr(" compiler: failed to install backend driver output: " + backendDriverOut)
         return 2
+    if !CompilerBuildBackendDriverInstalledPairOk(backendDriverOut,
+                                                   backendDriverMapOut,
+                                                   candidateBinarySize,
+                                                   candidateMapSize,
+                                                   candidateMapText,
+                                                   compilerEntrySource,
+                                                   installReport):
+        chengpath.WriteTextFile(rootDir, installLogPath, installReport)
+        CompilerPrintErr(" compiler: installed backend driver binary/map are not the same candidate batch")
+        return 2
     if !CompilerRunFileEnvLogged(rootDir,
                                    backendDriverOut,
                                    statusArgs,
@@ -3984,6 +4062,11 @@ fn CompilerBuildBackendDriver(rootDir: str): int32 =
                                    "build-backend-driver installed status"):
         installReport = installReport + "installed_status=failed\n"
         chengpath.WriteTextFile(rootDir, installLogPath, installReport)
+        return 2
+    if !CompilerBuildBackendDriverStatusLogOk(installedStatusLogPath, packageRoot, compilerEntrySource):
+        installReport = installReport + "installed_status=argv_provider_drift\n"
+        chengpath.WriteTextFile(rootDir, installLogPath, installReport)
+        CompilerPrintErr(" compiler: installed backend driver status did not exercise argv provider path")
         return 2
     installReport = installReport + "installed_status=ok\n"
     if !CompilerRunFileEnvLogged(rootDir,
