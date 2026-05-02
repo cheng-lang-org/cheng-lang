@@ -614,177 +614,232 @@ fn LoweringSourcePathForModule(workspaceRoot: str,
                                                                                          targetModulePath)
     return parser.ParserNormalizePath(fallbackSourcePath)
 
-fn LoweringBuildOneFunction(plan: LoweringPlanStub,
-                             sourceTexts: texpr.TypedExprSourceText[],
-                             i: int32,
-                             letCallReturnLiteralStart: int32): PrimaryObjectIrFunction =
-    let sourcePath = plan.functionSourcePaths[i]
-    let functionName = plan.functionNames[i]
-    var fnIr: PrimaryObjectIrFunction
-    fnIr.sourcePath = sourcePath
-    fnIr.functionName = functionName
-    let typedFnIndex = LoweringTypedIrFunctionIndex(plan.typedIr, sourcePath, functionName)
-    if typedFnIndex >= 0:
-        fnIr.signatureLineNumber = plan.typedIr.functions[typedFnIndex].signatureLineNumber
-        LoweringAppendPrimaryObjectIrStatements(fnIr, plan.typedIr, typedFnIndex, sourceTexts)
-    var bodyLineNumber: int32
-    fnIr.bodyKind = LoweringPrimaryObjectIrLeafBodyKindFromTypedIr(plan.typedIr, sourcePath, functionName, bodyLineNumber)
-    fnIr.bodyLineNumber = bodyLineNumber
-    var hasLetCall = false
-    if typedFnIndex >= 0 && LoweringTypedIrFunctionHasOpKind(plan.typedIr, typedFnIndex, texpr.TypedExprIrOpLetCall):
-        hasLetCall = true
-    var hasControlFlow = false
-    var hasSideEffectStatement = false
-    if typedFnIndex >= 0:
-        let typedFn = plan.typedIr.functions[typedFnIndex]
-        var stmtEnd = typedFn.statementStart + typedFn.statementCount
-        if stmtEnd > plan.typedIr.statements.len:
-            stmtEnd = plan.typedIr.statements.len
-        for si in typedFn.statementStart..<stmtEnd:
-            let stmt = plan.typedIr.statements[si]
-            if stmt.kind == texpr.TypedExprIrStmtIf || stmt.kind == texpr.TypedExprIrStmtElif || stmt.kind == texpr.TypedExprIrStmtElse || stmt.kind == texpr.TypedExprIrStmtFor:
-                hasControlFlow = true
-            if stmt.kind == texpr.TypedExprIrStmtCall || stmt.kind == texpr.TypedExprIrStmtLetCall || stmt.kind == texpr.TypedExprIrStmtIfCall || stmt.kind == texpr.TypedExprIrStmtResultIntrinsic:
-                hasSideEffectStatement = true
-    if hasControlFlow:
-        fnIr.bodyKind = texpr.BodyKindUnsupported
-    if hasControlFlow && !hasLetCall && !hasSideEffectStatement && typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
-        let typedFnForVoidControl = plan.typedIr.functions[typedFnIndex]
-        if typedFnForVoidControl.returnType == "" || typedFnForVoidControl.returnType == "void":
+fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
+                                 sourceTexts: texpr.TypedExprSourceText[]): PrimaryObjectIr =
+    var ir: PrimaryObjectIr
+    let letCallReturnLiteralStart = texpr.BodyKindLetCallReturnI32ConstPrefixLen
+    for i in 0..<plan.functionNames.len:
+        let sourcePath = plan.functionSourcePaths[i]
+        let functionName = plan.functionNames[i]
+        var fnIr: PrimaryObjectIrFunction
+        fnIr.sourcePath = sourcePath
+        fnIr.functionName = functionName
+        let typedFnIndex = LoweringTypedIrFunctionIndex(plan.typedIr, sourcePath, functionName)
+        if typedFnIndex >= 0:
+            fnIr.signatureLineNumber = plan.typedIr.functions[typedFnIndex].signatureLineNumber
+            LoweringAppendPrimaryObjectIrStatements(fnIr,
+                                                     plan.typedIr,
+                                                     typedFnIndex,
+                                                     sourceTexts)
+        var bodyLineNumber: int32
+        fnIr.bodyKind = LoweringPrimaryObjectIrLeafBodyKindFromTypedIr(plan.typedIr,
+                                                                       sourcePath,
+                                                                       functionName,
+                                                                       bodyLineNumber)
+        fnIr.bodyLineNumber = bodyLineNumber
+        var hasLetCall = false
+        if typedFnIndex >= 0 &&
+           LoweringTypedIrFunctionHasOpKind(plan.typedIr, typedFnIndex, texpr.TypedExprIrOpLetCall):
+            hasLetCall = true
+        var hasControlFlow = false
+        var hasSideEffectStatement = false
+        if typedFnIndex >= 0:
+            let typedFn = plan.typedIr.functions[typedFnIndex]
+            var stmtEnd = typedFn.statementStart + typedFn.statementCount
+            if stmtEnd > plan.typedIr.statements.len:
+                stmtEnd = plan.typedIr.statements.len
+            for si in typedFn.statementStart..<stmtEnd:
+                let stmt = plan.typedIr.statements[si]
+                if stmt.kind == texpr.TypedExprIrStmtIf ||
+                   stmt.kind == texpr.TypedExprIrStmtElif ||
+                   stmt.kind == texpr.TypedExprIrStmtElse ||
+                   stmt.kind == texpr.TypedExprIrStmtFor:
+                    hasControlFlow = true
+                if stmt.kind == texpr.TypedExprIrStmtCall ||
+                   stmt.kind == texpr.TypedExprIrStmtLetCall ||
+                   stmt.kind == texpr.TypedExprIrStmtIfCall ||
+                   stmt.kind == texpr.TypedExprIrStmtResultIntrinsic:
+                    hasSideEffectStatement = true
+        if hasControlFlow:
+            fnIr.bodyKind = texpr.BodyKindUnsupported
+        if hasControlFlow &&
+           !hasLetCall &&
+           !hasSideEffectStatement &&
+           typedFnIndex >= 0 &&
+           typedFnIndex < plan.typedIr.functions.len:
+            let typedFnForVoidControl = plan.typedIr.functions[typedFnIndex]
+            if typedFnForVoidControl.returnType == "" ||
+               typedFnForVoidControl.returnType == "void":
+                fnIr.bodyKind = texpr.BodyKindReturnVoid
+        if fnIr.bodyKind == texpr.BodyKindUnsupported &&
+           LoweringTypedIrFunctionIsVoidReturn(plan.typedIr, typedFnIndex):
             fnIr.bodyKind = texpr.BodyKindReturnVoid
-    if fnIr.bodyKind == texpr.BodyKindUnsupported && LoweringTypedIrFunctionIsVoidReturn(plan.typedIr, typedFnIndex):
-        fnIr.bodyKind = texpr.BodyKindReturnVoid
-    let functionTailName = LoweringFunctionTailName(fnIr.functionName)
-    if functionTailName == "__cheng_setCmdLine_export":
-        fnIr.bodyKind = texpr.BodyKindRuntimeSetCmdLine
-    elif functionTailName == "paramCount_export" || functionTailName == "__cheng_rt_paramCount_export" || functionTailName == "__cmdCountFromRuntime_export" || functionTailName == "cmdCountFromRuntime_export":
-        fnIr.bodyKind = texpr.BodyKindRuntimeParamCount
-    elif functionTailName == "__cheng_rt_paramStrCopyBridge_export":
-        fnIr.bodyKind = texpr.BodyKindRuntimeParamStrCopyBridge
-    if fnIr.bodyKind == texpr.BodyKindUnsupported || hasLetCall:
-        let letCallReturnKind = LoweringPrimaryObjectIrLetCallReturnBodyKind(plan.typedIr, typedFnIndex)
-        var callIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, bodyLineNumber)
-        if callIndex < 0:
-            if letCallReturnKind == "str_i32_guard_arg0_return_0":
-                if typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
-                    let typedFn = plan.typedIr.functions[typedFnIndex]
-                    if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
-                        let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                        for factIndex in 0..<plan.typedExprFacts.len:
-                            if parser.ParserNormalizePath(plan.typedExprFacts[factIndex].sourcePath) != sourcePath:
-                                continue
-                            if plan.typedExprFacts[factIndex].lineNumber <= typedFn.signatureLineNumber || plan.typedExprFacts[factIndex].lineNumber >= returnNode.operand0NodeIndex:
-                                continue
-                            if !plan.typedExprFacts[factIndex].callResolved:
-                                continue
-                            if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
-                                continue
-                            if plan.typedExprFacts[factIndex].callArgCount != 0:
-                                continue
-                            callIndex = factIndex
-                            break
-            elif letCallReturnKind == texpr.BodyKindLetCallStrThenCallArg0ReturnI32Const0:
-                if typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
-                    let typedFn = plan.typedIr.functions[typedFnIndex]
-                    if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
-                        let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                        for factIndex in 0..<plan.typedExprFacts.len:
-                            if parser.ParserNormalizePath(plan.typedExprFacts[factIndex].sourcePath) != sourcePath:
-                                continue
-                            if plan.typedExprFacts[factIndex].lineNumber <= typedFn.signatureLineNumber || plan.typedExprFacts[factIndex].lineNumber >= returnNode.operand0NodeIndex:
-                                continue
-                            if !plan.typedExprFacts[factIndex].callResolved:
-                                continue
-                            if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
-                                continue
-                            if plan.typedExprFacts[factIndex].callArgCount != 0:
-                                continue
-                            callIndex = factIndex
-                            break
-        if callIndex >= 0:
-            let fact = plan.typedExprFacts[callIndex]
-            if fact.returnRoot:
-                if letCallReturnKind == texpr.BodyKindUnsupported:
-                    if LoweringReturnCallArgsPassThrough(sourceTexts, sourcePath, functionName, fact.callArgsText, fact.callArgCount):
+        let functionTailName = LoweringFunctionTailName(fnIr.functionName)
+        if functionTailName == "__cheng_setCmdLine_export":
+            fnIr.bodyKind = texpr.BodyKindRuntimeSetCmdLine
+        elif functionTailName == "paramCount_export" ||
+             functionTailName == "__cheng_rt_paramCount_export" ||
+             functionTailName == "__cmdCountFromRuntime_export" ||
+             functionTailName == "cmdCountFromRuntime_export":
+            fnIr.bodyKind = texpr.BodyKindRuntimeParamCount
+        elif functionTailName == "__cheng_rt_paramStrCopyBridge_export":
+            fnIr.bodyKind = texpr.BodyKindRuntimeParamStrCopyBridge
+        if fnIr.bodyKind == texpr.BodyKindUnsupported || hasLetCall:
+            let letCallReturnKind = LoweringPrimaryObjectIrLetCallReturnBodyKind(plan.typedIr, typedFnIndex)
+            var callIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                              sourcePath,
+                                                              bodyLineNumber)
+            if callIndex < 0:
+                if letCallReturnKind == "str_i32_guard_arg0_return_0":
+                    if typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
+                        let typedFn = plan.typedIr.functions[typedFnIndex]
+                        if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
+                            let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
+                            for factIndex in 0..<plan.typedExprFacts.len:
+                                if parser.ParserNormalizePath(plan.typedExprFacts[factIndex].sourcePath) != sourcePath:
+                                    continue
+                                if plan.typedExprFacts[factIndex].lineNumber <= typedFn.signatureLineNumber ||
+                                   plan.typedExprFacts[factIndex].lineNumber >= returnNode.operand0NodeIndex:
+                                    continue
+                                if !plan.typedExprFacts[factIndex].callResolved:
+                                    continue
+                                if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
+                                    continue
+                                if plan.typedExprFacts[factIndex].callArgCount != 0:
+                                    continue
+                                callIndex = factIndex
+                                break
+                elif letCallReturnKind == texpr.BodyKindLetCallStrThenCallArg0ReturnI32Const0:
+                    if typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
+                        let typedFn = plan.typedIr.functions[typedFnIndex]
+                        if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
+                            let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
+                            for factIndex in 0..<plan.typedExprFacts.len:
+                                if parser.ParserNormalizePath(plan.typedExprFacts[factIndex].sourcePath) != sourcePath:
+                                    continue
+                                if plan.typedExprFacts[factIndex].lineNumber <= typedFn.signatureLineNumber ||
+                                   plan.typedExprFacts[factIndex].lineNumber >= returnNode.operand0NodeIndex:
+                                    continue
+                                if !plan.typedExprFacts[factIndex].callResolved:
+                                    continue
+                                if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
+                                    continue
+                                if plan.typedExprFacts[factIndex].callArgCount != 0:
+                                    continue
+                                callIndex = factIndex
+                                break
+            if callIndex >= 0:
+                let fact = plan.typedExprFacts[callIndex]
+                if fact.returnRoot && letCallReturnKind == texpr.BodyKindUnsupported:
+                    if LoweringReturnCallArgsPassThrough(sourceTexts,
+                                                         sourcePath,
+                                                         functionName,
+                                                         fact.callArgsText,
+                                                         fact.callArgCount):
                         var firstImportcSymbol = ""
                         if fact.callTargetImportc:
-                            firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
+                            firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                             fact.callTargetSourcePath,
+                                                                             fact.callTarget)
                         add(fnIr.callArgCounts, fact.callArgCount)
                         add(fnIr.callTargets, fact.callTarget)
                         add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
                         add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
                         add(fnIr.callImportcSymbols, firstImportcSymbol)
                         fnIr.bodyKind = LoweringPrimaryObjectIrBodyKindForCallArgCount(fact.callArgCount)
-            elif letCallReturnKind == texpr.BodyKindUnsupported:
-                var firstImportcSymbol = ""
-                if fact.callTargetImportc:
-                    firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
-                add(fnIr.callArgCounts, fact.callArgCount)
-                add(fnIr.callTargets, fact.callTarget)
-                add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
-                add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
-                add(fnIr.callImportcSymbols, firstImportcSymbol)
-            else:
-                if letCallReturnKind != texpr.BodyKindUnsupported:
-                    if letCallReturnKind == "str_i32_guard_arg0_return_0":
-                        if typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
+                elif letCallReturnKind == texpr.BodyKindUnsupported:
+                    var firstImportcSymbol = ""
+                    if fact.callTargetImportc:
+                        firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                         fact.callTargetSourcePath,
+                                                                         fact.callTarget)
+                    add(fnIr.callArgCounts, fact.callArgCount)
+                    add(fnIr.callTargets, fact.callTarget)
+                    add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
+                    add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
+                    add(fnIr.callImportcSymbols, firstImportcSymbol)
+                else:
+                    if letCallReturnKind != texpr.BodyKindUnsupported:
+                        if letCallReturnKind == "str_i32_guard_arg0_return_0":
+                            if typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
+                                let typedFn = plan.typedIr.functions[typedFnIndex]
+                                if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
+                                    let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
+                                    let secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                                           sourcePath,
+                                                                                           returnNode.operand0NodeIndex)
+                                    let thirdCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                                          sourcePath,
+                                                                                          returnNode.operand1NodeIndex)
+                                    let fourthCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                                           sourcePath,
+                                                                                           returnNode.operand2NodeIndex)
+                                    if secondCallIndex >= 0 && thirdCallIndex >= 0 && fourthCallIndex >= 0:
+                                        let secondFact = plan.typedExprFacts[secondCallIndex]
+                                        let thirdFact = plan.typedExprFacts[thirdCallIndex]
+                                        let fourthFact = plan.typedExprFacts[fourthCallIndex]
+                                        let secondArgText = chengpath.PathTrim(secondFact.callArgsText)
+                                        let fourthArgText = chengpath.PathTrim(fourthFact.callArgsText)
+                                        if fact.callArgCount == 0 &&
+                                           secondFact.callArgCount == 1 &&
+                                           thirdFact.callArgCount == 0 &&
+                                           fourthFact.callArgCount == 1 &&
+                                           secondArgText == returnNode.surfaceText &&
+                                           fourthArgText == returnNode.surfaceText:
+                                            var firstImportcSymbol = ""
+                                            if fact.callTargetImportc:
+                                                firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                                 fact.callTargetSourcePath,
+                                                                                                 fact.callTarget)
+                                            var secondImportcSymbol = ""
+                                            if secondFact.callTargetImportc:
+                                                secondImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                                   secondFact.callTargetSourcePath,
+                                                                                                   secondFact.callTarget)
+                                            var thirdImportcSymbol = ""
+                                            if thirdFact.callTargetImportc:
+                                                thirdImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                                 thirdFact.callTargetSourcePath,
+                                                                                                 thirdFact.callTarget)
+                                            var fourthImportcSymbol = ""
+                                            if fourthFact.callTargetImportc:
+                                                fourthImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                                   fourthFact.callTargetSourcePath,
+                                                                                                   fourthFact.callTarget)
+                                            add(fnIr.callArgCounts, 0)
+                                            add(fnIr.callTargets, fact.callTarget)
+                                            add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
+                                            add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
+                                            add(fnIr.callImportcSymbols, firstImportcSymbol)
+                                            add(fnIr.callArgCounts, 1)
+                                            add(fnIr.callTargets, secondFact.callTarget)
+                                            add(fnIr.callTargetSourcePaths, secondFact.callTargetSourcePath)
+                                            add(fnIr.callTargetImportcFlags, secondFact.callTargetImportc)
+                                            add(fnIr.callImportcSymbols, secondImportcSymbol)
+                                            add(fnIr.callArgCounts, 0)
+                                            add(fnIr.callTargets, thirdFact.callTarget)
+                                            add(fnIr.callTargetSourcePaths, thirdFact.callTargetSourcePath)
+                                            add(fnIr.callTargetImportcFlags, thirdFact.callTargetImportc)
+                                            add(fnIr.callImportcSymbols, thirdImportcSymbol)
+                                            add(fnIr.callArgCounts, 1)
+                                            add(fnIr.callTargets, fourthFact.callTarget)
+                                            add(fnIr.callTargetSourcePaths, fourthFact.callTargetSourcePath)
+                                            add(fnIr.callTargetImportcFlags, fourthFact.callTargetImportc)
+                                            add(fnIr.callImportcSymbols, fourthImportcSymbol)
+                                            fnIr.bodyKind = "str_i32_guard_arg0_return_0"
+                        elif letCallReturnKind == texpr.BodyKindLetCallStrThenCallArg0ReturnI32Const0:
                             let typedFn = plan.typedIr.functions[typedFnIndex]
                             if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
                                 let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                                let secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, returnNode.operand0NodeIndex)
-                                let thirdCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, returnNode.operand1NodeIndex)
-                                let fourthCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, returnNode.operand2NodeIndex)
-                                if secondCallIndex >= 0 && thirdCallIndex >= 0 && fourthCallIndex >= 0:
-                                    let secondFact = plan.typedExprFacts[secondCallIndex]
-                                    let thirdFact = plan.typedExprFacts[thirdCallIndex]
-                                    let fourthFact = plan.typedExprFacts[fourthCallIndex]
-                                    let secondArgText = chengpath.PathTrim(secondFact.callArgsText)
-                                    let fourthArgText = chengpath.PathTrim(fourthFact.callArgsText)
-                                    if fact.callArgCount == 0 && secondFact.callArgCount == 1 && thirdFact.callArgCount == 0 && fourthFact.callArgCount == 1 && secondArgText == returnNode.surfaceText && fourthArgText == returnNode.surfaceText:
-                                        var firstImportcSymbol = ""
-                                        if fact.callTargetImportc:
-                                            firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
-                                        var secondImportcSymbol = ""
-                                        if secondFact.callTargetImportc:
-                                            secondImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, secondFact.callTargetSourcePath, secondFact.callTarget)
-                                        var thirdImportcSymbol = ""
-                                        if thirdFact.callTargetImportc:
-                                            thirdImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, thirdFact.callTargetSourcePath, thirdFact.callTarget)
-                                        var fourthImportcSymbol = ""
-                                        if fourthFact.callTargetImportc:
-                                            fourthImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fourthFact.callTargetSourcePath, fourthFact.callTarget)
-                                        add(fnIr.callArgCounts, 0)
-                                        add(fnIr.callTargets, fact.callTarget)
-                                        add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
-                                        add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
-                                        add(fnIr.callImportcSymbols, firstImportcSymbol)
-                                        add(fnIr.callArgCounts, 1)
-                                        add(fnIr.callTargets, secondFact.callTarget)
-                                        add(fnIr.callTargetSourcePaths, secondFact.callTargetSourcePath)
-                                        add(fnIr.callTargetImportcFlags, secondFact.callTargetImportc)
-                                        add(fnIr.callImportcSymbols, secondImportcSymbol)
-                                        add(fnIr.callArgCounts, 0)
-                                        add(fnIr.callTargets, thirdFact.callTarget)
-                                        add(fnIr.callTargetSourcePaths, thirdFact.callTargetSourcePath)
-                                        add(fnIr.callTargetImportcFlags, thirdFact.callTargetImportc)
-                                        add(fnIr.callImportcSymbols, thirdImportcSymbol)
-                                        add(fnIr.callArgCounts, 1)
-                                        add(fnIr.callTargets, fourthFact.callTarget)
-                                        add(fnIr.callTargetSourcePaths, fourthFact.callTargetSourcePath)
-                                        add(fnIr.callTargetImportcFlags, fourthFact.callTargetImportc)
-                                        add(fnIr.callImportcSymbols, fourthImportcSymbol)
-                                        fnIr.bodyKind = "str_i32_guard_arg0_return_0"
-                    elif letCallReturnKind == texpr.BodyKindLetCallStrThenCallArg0ReturnI32Const0:
-                        if typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
-                            let typedFn = plan.typedIr.functions[typedFnIndex]
-                            if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
-                                let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                                var secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, returnNode.operand0NodeIndex)
+                                var secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                                        sourcePath,
+                                                                                        returnNode.operand0NodeIndex)
                                 if secondCallIndex < 0:
                                     for factIndex in 0..<plan.typedExprFacts.len:
                                         if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
                                             continue
-                                        if plan.typedExprFacts[factIndex].lineNumber <= bodyLineNumber || plan.typedExprFacts[factIndex].lineNumber > returnNode.lineNumber:
+                                        if plan.typedExprFacts[factIndex].lineNumber <= bodyLineNumber ||
+                                           plan.typedExprFacts[factIndex].lineNumber > returnNode.lineNumber:
                                             continue
                                         if !plan.typedExprFacts[factIndex].callResolved:
                                             continue
@@ -796,13 +851,20 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                                     let secondFact = plan.typedExprFacts[secondCallIndex]
                                     let secondArgText = chengpath.PathTrim(secondFact.callArgsText)
                                     let firstFactType = texpr.TypedExprNormalizeTypeText(fact.typeText)
-                                    if firstFactType == "str" && fact.callArgCount == 0 && secondFact.callArgCount == 1 && secondArgText == returnNode.surfaceText:
+                                    if firstFactType == "str" &&
+                                       fact.callArgCount == 0 &&
+                                       secondFact.callArgCount == 1 &&
+                                       secondArgText == returnNode.surfaceText:
                                         var firstImportcSymbol = ""
                                         if fact.callTargetImportc:
-                                            firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
+                                            firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                             fact.callTargetSourcePath,
+                                                                                             fact.callTarget)
                                         var secondImportcSymbol = ""
                                         if secondFact.callTargetImportc:
-                                            secondImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, secondFact.callTargetSourcePath, secondFact.callTarget)
+                                            secondImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                               secondFact.callTargetSourcePath,
+                                                                                               secondFact.callTarget)
                                         add(fnIr.callArgCounts, 0)
                                         add(fnIr.callTargets, fact.callTarget)
                                         add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
@@ -814,137 +876,155 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                                         add(fnIr.callTargetImportcFlags, secondFact.callTargetImportc)
                                         add(fnIr.callImportcSymbols, secondImportcSymbol)
                                         fnIr.bodyKind = texpr.BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0
-                    elif fact.callArgCount == 0:
-                        let factType = texpr.TypedExprNormalizeTypeText(fact.typeText)
-                        if factType == "int32":
-                            var firstImportcSymbol = ""
-                            if fact.callTargetImportc:
-                                firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
-                            if letCallReturnKind == texpr.BodyKindLetCallReturnResultI32:
-                                fnIr.bodyKind = texpr.BodyKindLetCallNoargReturnResultI32
-                            elif letCallReturnKind == texpr.BodyKindLetCallI32IfResultLeZeroReturnZeroElseResultI32:
-                                fnIr.bodyKind = texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32
-                            elif chengpath.TextStartsWith(letCallReturnKind, texpr.BodyKindLetCallReturnI32ConstPrefix):
-                                let literalText = chengpath.TextSlice(letCallReturnKind, letCallReturnLiteralStart, len(letCallReturnKind) - letCallReturnLiteralStart)
-                                fnIr.bodyKind = Fmt"{texpr.BodyKindLetCallNoargReturnI32ConstPrefix}{literalText}"
-                            if fnIr.bodyKind != texpr.BodyKindUnsupported:
-                                add(fnIr.callArgCounts, fact.callArgCount)
-                                add(fnIr.callTargets, fact.callTarget)
-                                add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
-                                add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
-                                add(fnIr.callImportcSymbols, firstImportcSymbol)
-                        elif factType == "str":
-                            if letCallReturnKind == texpr.BodyKindLetCallReturnStrLenI32:
+                        elif fact.callArgCount == 0:
+                            let factType = texpr.TypedExprNormalizeTypeText(fact.typeText)
+                            if factType == "int32":
                                 var firstImportcSymbol = ""
                                 if fact.callTargetImportc:
-                                    firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
-                                add(fnIr.callArgCounts, fact.callArgCount)
-                                add(fnIr.callTargets, fact.callTarget)
-                                add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
-                                add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
-                                add(fnIr.callImportcSymbols, firstImportcSymbol)
-                                fnIr.bodyKind = texpr.BodyKindLetCallNoargStrReturnLenI32
-    if fnIr.bodyKind == texpr.BodyKindUnsupported && typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
-        let typedFn = plan.typedIr.functions[typedFnIndex]
-        if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
-            let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-            if returnNode.opKind == texpr.TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0:
-                var functionEndLine: int32 = typedFn.endLineNumber + 1
-                if functionEndLine <= bodyLineNumber:
-                    functionEndLine = 2147483647
-                var firstCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, bodyLineNumber)
-                if firstCallIndex < 0:
-                    for factIndex in 0..<plan.typedExprFacts.len:
-                        if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
-                            continue
-                        if plan.typedExprFacts[factIndex].lineNumber < bodyLineNumber || plan.typedExprFacts[factIndex].lineNumber >= functionEndLine:
-                            continue
-                        if !plan.typedExprFacts[factIndex].callResolved:
-                            continue
-                        if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
-                            continue
-                        if plan.typedExprFacts[factIndex].callArgCount != 0:
-                            continue
-                        firstCallIndex = factIndex
-                        break
-                var secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, returnNode.operand0NodeIndex)
-                if secondCallIndex < 0:
-                    for factIndex in 0..<plan.typedExprFacts.len:
-                        if factIndex == firstCallIndex:
-                            continue
-                        if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
-                            continue
-                        if plan.typedExprFacts[factIndex].lineNumber <= bodyLineNumber || plan.typedExprFacts[factIndex].lineNumber >= functionEndLine:
-                            continue
-                        if !plan.typedExprFacts[factIndex].callResolved:
-                            continue
-                        if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
-                            continue
-                        if plan.typedExprFacts[factIndex].callArgCount != 1:
-                            continue
-                        let argText = chengpath.PathTrim(plan.typedExprFacts[factIndex].callArgsText)
-                        if argText != returnNode.surfaceText:
-                            continue
-                        secondCallIndex = factIndex
-                        break
-                if firstCallIndex >= 0 && secondCallIndex >= 0:
-                    let firstFact = plan.typedExprFacts[firstCallIndex]
-                    let secondFact = plan.typedExprFacts[secondCallIndex]
-                    let secondArgText = chengpath.PathTrim(secondFact.callArgsText)
-                    let firstFactType = texpr.TypedExprNormalizeTypeText(firstFact.typeText)
-                    if firstFactType == "str" && firstFact.callArgCount == 0 && secondFact.callArgCount == 1 && secondArgText == returnNode.surfaceText:
-                        var firstImportcSymbol = ""
-                        if firstFact.callTargetImportc:
-                            firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, firstFact.callTargetSourcePath, firstFact.callTarget)
-                        var secondImportcSymbol = ""
-                        if secondFact.callTargetImportc:
-                            secondImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, secondFact.callTargetSourcePath, secondFact.callTarget)
-                        add(fnIr.callArgCounts, 0)
-                        add(fnIr.callTargets, firstFact.callTarget)
-                        add(fnIr.callTargetSourcePaths, firstFact.callTargetSourcePath)
-                        add(fnIr.callTargetImportcFlags, firstFact.callTargetImportc)
-                        add(fnIr.callImportcSymbols, firstImportcSymbol)
-                        add(fnIr.callArgCounts, 1)
-                        add(fnIr.callTargets, secondFact.callTarget)
-                        add(fnIr.callTargetSourcePaths, secondFact.callTargetSourcePath)
-                        add(fnIr.callTargetImportcFlags, secondFact.callTargetImportc)
-                        add(fnIr.callImportcSymbols, secondImportcSymbol)
-                        fnIr.bodyKind = texpr.BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0
-    if fnIr.bodyKind == texpr.BodyKindUnsupported && typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
-        let typedFn = plan.typedIr.functions[typedFnIndex]
-        var hasReturnZero = typedFn.returnExpr == "return int32(0)" || typedFn.returnExpr == "return 0" || typedFn.returnExpr == "int32(0)" || typedFn.returnExpr == "0"
-        if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
-            let returnKind = LoweringPrimaryObjectIrBodyKindFromTypedIrOp(plan.typedIr.nodes[typedFn.returnNodeIndex])
-            if returnKind == texpr.BodyKindReturnZeroI32:
-                hasReturnZero = true
-        if hasReturnZero && fnIr.statements.len == 1:
-            let stmt = fnIr.statements[0]
-            let callArgsText = chengpath.PathTrim(stmt.callArgsText)
-            if stmt.kind == texpr.TypedExprIrStmtCall && stmt.callArgCount == 1 && (callArgsText == "int32(0)" || callArgsText == "0") && len(stmt.callTarget) > 0:
-                if fnIr.callTargets.len <= 0:
-                    add(fnIr.callArgCounts, stmt.callArgCount)
-                    add(fnIr.callTargets, stmt.callTarget)
-                    add(fnIr.callTargetSourcePaths, stmt.callTargetSourcePath)
-                    add(fnIr.callTargetImportcFlags, stmt.callTargetImportc)
-                    add(fnIr.callImportcSymbols, stmt.callImportcSymbol)
-                if fnIr.callTargets.len == 1:
-                    fnIr.bodyKind = texpr.BodyKindCallArg0Const0ReturnI32Const0
-    if fnIr.bodyKind == texpr.BodyKindUnsupported:
-        LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr, sourceTexts)
-    LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr, sourceTexts)
-    LoweringMaybeFillBackendDriverRunCommand(fnIr)
-    fnIr.callTargetCount = fnIr.callTargets.len
-    return fnIr
-
-fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
-                                 sourceTexts: texpr.TypedExprSourceText[]): PrimaryObjectIr =
-    var ir: PrimaryObjectIr
-    let letCallReturnLiteralStart = texpr.BodyKindLetCallReturnI32ConstPrefixLen
-    for i in 0..<plan.functionNames.len:
-        let fnIr = LoweringBuildOneFunction(plan, sourceTexts, i, letCallReturnLiteralStart)
+                                    firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                     fact.callTargetSourcePath,
+                                                                                     fact.callTarget)
+                                if letCallReturnKind == texpr.BodyKindLetCallReturnResultI32:
+                                    fnIr.bodyKind = texpr.BodyKindLetCallNoargReturnResultI32
+                                elif letCallReturnKind == texpr.BodyKindLetCallI32IfResultLeZeroReturnZeroElseResultI32:
+                                    fnIr.bodyKind = texpr.BodyKindLetCallNoargI32IfResultLeZeroReturnZeroElseResultI32
+                                elif chengpath.TextStartsWith(letCallReturnKind, texpr.BodyKindLetCallReturnI32ConstPrefix):
+                                    let literalText = chengpath.TextSlice(letCallReturnKind,
+                                                                          letCallReturnLiteralStart,
+                                                                          len(letCallReturnKind) - letCallReturnLiteralStart)
+                                    fnIr.bodyKind = Fmt"{texpr.BodyKindLetCallNoargReturnI32ConstPrefix}{literalText}"
+                                if fnIr.bodyKind != texpr.BodyKindUnsupported:
+                                    add(fnIr.callArgCounts, fact.callArgCount)
+                                    add(fnIr.callTargets, fact.callTarget)
+                                    add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
+                                    add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
+                                    add(fnIr.callImportcSymbols, firstImportcSymbol)
+                            elif factType == "str":
+                                if letCallReturnKind == texpr.BodyKindLetCallReturnStrLenI32:
+                                    var firstImportcSymbol = ""
+                                    if fact.callTargetImportc:
+                                        firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                         fact.callTargetSourcePath,
+                                                                                         fact.callTarget)
+                                    add(fnIr.callArgCounts, fact.callArgCount)
+                                    add(fnIr.callTargets, fact.callTarget)
+                                    add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
+                                    add(fnIr.callTargetImportcFlags, fact.callTargetImportc)
+                                    add(fnIr.callImportcSymbols, firstImportcSymbol)
+                                    fnIr.bodyKind = texpr.BodyKindLetCallNoargStrReturnLenI32
+        if fnIr.bodyKind == texpr.BodyKindUnsupported && typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
+            let typedFn = plan.typedIr.functions[typedFnIndex]
+            if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
+                let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
+                if returnNode.opKind == texpr.TypedExprIrOpLetCallStrThenCallArg0ReturnI32Const0:
+                    var functionEndLine: int32 = typedFn.endLineNumber + 1
+                    if functionEndLine <= bodyLineNumber:
+                        functionEndLine = 2147483647
+                    var firstCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                           sourcePath,
+                                                                           bodyLineNumber)
+                    if firstCallIndex < 0:
+                        for factIndex in 0..<plan.typedExprFacts.len:
+                            if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
+                                continue
+                            if plan.typedExprFacts[factIndex].lineNumber < bodyLineNumber ||
+                               plan.typedExprFacts[factIndex].lineNumber >= functionEndLine:
+                                continue
+                            if !plan.typedExprFacts[factIndex].callResolved:
+                                continue
+                            if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
+                                continue
+                            if plan.typedExprFacts[factIndex].callArgCount != 0:
+                                continue
+                            firstCallIndex = factIndex
+                            break
+                    var secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts,
+                                                                            sourcePath,
+                                                                            returnNode.operand0NodeIndex)
+                    if secondCallIndex < 0:
+                        for factIndex in 0..<plan.typedExprFacts.len:
+                            if factIndex == firstCallIndex:
+                                continue
+                            if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
+                                continue
+                            if plan.typedExprFacts[factIndex].lineNumber <= bodyLineNumber ||
+                               plan.typedExprFacts[factIndex].lineNumber >= functionEndLine:
+                                continue
+                            if !plan.typedExprFacts[factIndex].callResolved:
+                                continue
+                            if len(plan.typedExprFacts[factIndex].callTarget) <= 0:
+                                continue
+                            if plan.typedExprFacts[factIndex].callArgCount != 1:
+                                continue
+                            let argText = chengpath.PathTrim(plan.typedExprFacts[factIndex].callArgsText)
+                            if argText != returnNode.surfaceText:
+                                continue
+                            secondCallIndex = factIndex
+                            break
+                    if firstCallIndex >= 0 && secondCallIndex >= 0:
+                        let firstFact = plan.typedExprFacts[firstCallIndex]
+                        let secondFact = plan.typedExprFacts[secondCallIndex]
+                        let secondArgText = chengpath.PathTrim(secondFact.callArgsText)
+                        let firstFactType = texpr.TypedExprNormalizeTypeText(firstFact.typeText)
+                        if firstFactType == "str" &&
+                           firstFact.callArgCount == 0 &&
+                           secondFact.callArgCount == 1 &&
+                           secondArgText == returnNode.surfaceText:
+                            var firstImportcSymbol = ""
+                            if firstFact.callTargetImportc:
+                                firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                 firstFact.callTargetSourcePath,
+                                                                                 firstFact.callTarget)
+                            var secondImportcSymbol = ""
+                            if secondFact.callTargetImportc:
+                                secondImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
+                                                                                  secondFact.callTargetSourcePath,
+                                                                                  secondFact.callTarget)
+                            add(fnIr.callArgCounts, 0)
+                            add(fnIr.callTargets, firstFact.callTarget)
+                            add(fnIr.callTargetSourcePaths, firstFact.callTargetSourcePath)
+                            add(fnIr.callTargetImportcFlags, firstFact.callTargetImportc)
+                            add(fnIr.callImportcSymbols, firstImportcSymbol)
+                            add(fnIr.callArgCounts, 1)
+                            add(fnIr.callTargets, secondFact.callTarget)
+                            add(fnIr.callTargetSourcePaths, secondFact.callTargetSourcePath)
+                            add(fnIr.callTargetImportcFlags, secondFact.callTargetImportc)
+                            add(fnIr.callImportcSymbols, secondImportcSymbol)
+                            fnIr.bodyKind = texpr.BodyKindLetCallNoargStrThenCallArg0ReturnI32Const0
+        if fnIr.bodyKind == texpr.BodyKindUnsupported && typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
+            let typedFn = plan.typedIr.functions[typedFnIndex]
+            var hasReturnZero = typedFn.returnExpr == "return int32(0)" ||
+                                typedFn.returnExpr == "return 0" ||
+                                typedFn.returnExpr == "int32(0)" ||
+                                typedFn.returnExpr == "0"
+            if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
+                let returnKind = LoweringPrimaryObjectIrBodyKindFromTypedIrOp(plan.typedIr.nodes[typedFn.returnNodeIndex])
+                if returnKind == texpr.BodyKindReturnZeroI32:
+                    hasReturnZero = true
+            if hasReturnZero && fnIr.statements.len == 1:
+                let stmt = fnIr.statements[0]
+                let callArgsText = chengpath.PathTrim(stmt.callArgsText)
+                if stmt.kind == texpr.TypedExprIrStmtCall &&
+                   stmt.callArgCount == 1 &&
+                   (callArgsText == "int32(0)" || callArgsText == "0") &&
+                   len(stmt.callTarget) > 0:
+                    if fnIr.callTargets.len <= 0:
+                        add(fnIr.callArgCounts, stmt.callArgCount)
+                        add(fnIr.callTargets, stmt.callTarget)
+                        add(fnIr.callTargetSourcePaths, stmt.callTargetSourcePath)
+                        add(fnIr.callTargetImportcFlags, stmt.callTargetImportc)
+                        add(fnIr.callImportcSymbols, stmt.callImportcSymbol)
+                    if fnIr.callTargets.len == 1:
+                        fnIr.bodyKind = texpr.BodyKindCallArg0Const0ReturnI32Const0
+        if fnIr.bodyKind == texpr.BodyKindUnsupported:
+            LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr, sourceTexts)
+        LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr, sourceTexts)
+        LoweringMaybeFillBackendDriverRunCommand(fnIr)
+        fnIr.callTargetCount = fnIr.callTargets.len
         add(ir.functions, fnIr)
     return ir
-(lineRaw: str): bool =
+
+fn LoweringIsImportcAnnotation(lineRaw: str): bool =
     let line = chengpath.PathTrim(lineRaw)
     if line == "":
         return false
