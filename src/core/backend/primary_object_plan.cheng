@@ -358,6 +358,8 @@ fn PrimaryBodyIrLocalSlotNew(bodyIR: var coreir.BodyIR,
 
 fn PrimaryBodyIrTypeKindFromText(typeRaw: str): int32 =
     let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
+    if PrimaryStartsWith(normType, "var"):
+        return coreir.LocalPtrTag
     if normType == "float64" || normType == "f64":
         return coreir.LocalF64Tag
     if normType == "str":
@@ -374,6 +376,28 @@ fn PrimaryBodyIrTypeKindFromText(typeRaw: str): int32 =
         return coreir.LocalAggregateTag
     return coreir.LocalI32Tag
 
+fn PrimaryBodyIrTypeTextIsVarI32(typeRaw: str): bool =
+    let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
+    return normType == "varint32" || normType == "vari32" || normType == "varbool"
+
+fn PrimaryBodyIrNameInList(names: str[], name: str): bool =
+    for i in 0..<names.len:
+        if names[i] == name:
+            return true
+    return false
+
+fn PrimaryBodyIrReturnTypeIsVoid(typeRaw: str): bool =
+    let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
+    return normType == "" || normType == "void"
+
+fn PrimaryBodyIrCallFullText(stmt: texpr.TypedExprIrStatement): str =
+    if stmt.callArgCount > 0:
+        return Fmt"{stmt.surfaceText}({stmt.callArgsText})"
+    return Fmt"{stmt.surfaceText}()"
+
+fn PrimaryBodyIrVarI32ValueSlotName(name: str): str =
+    return Fmt"{name}#var_i32_value"
+
 fn PrimaryBodyIrFindOrCreateSlot(bodyIR: var coreir.BodyIR,
                                   slotNames: var str[],
                                   name: str,
@@ -385,6 +409,38 @@ fn PrimaryBodyIrFindOrCreateSlot(bodyIR: var coreir.BodyIR,
     add(slotNames, name)
     PrimaryBodyIrLocalSlotNew(bodyIR, newSlot, name, typeKind)
     return newSlot
+
+fn PrimaryBodyIrFindSlotIndex(slotNames: str[], name: str): int32 =
+    for i in 0..<slotNames.len:
+        if slotNames[i] == name:
+            return i
+    return -1
+
+fn PrimaryBodyIrCanonicalArgName(argRaw: str): str =
+    let arg = strutil.Strip(argRaw)
+    var openPos: int32 = -1
+    for i in 0..<len(arg):
+        if arg[i] == '(':
+            openPos = i
+            break
+    if openPos <= 0:
+        return arg
+    var tailStart: int32
+    for i in 0..<openPos:
+        if arg[i] == '.':
+            tailStart = i + 1
+    if tailStart <= 0:
+        return arg
+    return strings.SliceBytes(arg, tailStart, len(arg) - tailStart)
+
+fn PrimaryBodyIrFindArgSlot(slotNames: str[], argName: str): int32 =
+    let exact = PrimaryBodyIrFindSlotIndex(slotNames, argName)
+    if exact >= 0:
+        return exact
+    let canonical = PrimaryBodyIrCanonicalArgName(argName)
+    if canonical != argName:
+        return PrimaryBodyIrFindSlotIndex(slotNames, canonical)
+    return -1
 
 fn PrimaryBodyIrMarkParamSlot(bodyIR: var coreir.BodyIR,
                                slotId: int32,
@@ -534,51 +590,179 @@ fn PrimaryBodyIrSeedParamSlots(bodyIR: var coreir.BodyIR,
                                                    PrimaryBodyIrTypeKindFromText(irFunction.paramTypes[paramIndex]))
         PrimaryBodyIrMarkParamSlot(bodyIR, slotId, paramIndex)
 
+fn PrimaryBodyIrCollectVarI32ParamNames(irFunction: lower.PrimaryObjectIrFunction): str[] =
+    var out: str[]
+    for paramIndex in 0..<irFunction.paramNames.len:
+        if paramIndex >= irFunction.paramTypes.len:
+            return out
+        if PrimaryBodyIrTypeTextIsVarI32(irFunction.paramTypes[paramIndex]):
+            add(out, irFunction.paramNames[paramIndex])
+    return out
+
 fn PrimaryBodyIrCallArgNames(callArgsText: str): str[] =
     var out: str[]
-    let pieces = strutil.Split(callArgsText, ',')
+    let pieces = texpr.TypedExprSplitTopLevelCsv(callArgsText)
     for i in 0..<pieces.len:
         let name = strutil.Strip(pieces[i])
         if len(name) > 0:
             add(out, name)
     return out
 
+fn PrimaryBodyIrTargetFunctionIndex(typedIr: texpr.TypedExprIr,
+                                     sourcePath: str,
+                                     functionName: str): int32 =
+    let tailName = PrimaryFunctionTailName(functionName)
+    for i in 0..<typedIr.functions.len:
+        if typedIr.functions[i].sourcePath != sourcePath:
+            continue
+        if typedIr.functions[i].functionName == functionName ||
+           typedIr.functions[i].functionName == tailName:
+            return i
+    return -1
+
+fn PrimaryBodyIrTargetParamIsVarI32(typedIr: texpr.TypedExprIr,
+                                     stmt: texpr.TypedExprIrStatement,
+                                     argIndex: int32): bool =
+    if stmt.callTargetImportc || argIndex < 0:
+        return false
+    let fnIndex = PrimaryBodyIrTargetFunctionIndex(typedIr,
+                                                  stmt.callTargetSourcePath,
+                                                  stmt.callTarget)
+    if fnIndex < 0 || fnIndex >= typedIr.functions.len:
+        return false
+    let targetFn = typedIr.functions[fnIndex]
+    var nodeEnd = targetFn.nodeStart + targetFn.nodeCount
+    if nodeEnd > typedIr.nodes.len:
+        nodeEnd = typedIr.nodes.len
+    for nodeIndex in targetFn.nodeStart..<nodeEnd:
+        let node = typedIr.nodes[nodeIndex]
+        if node.opKind != texpr.TypedExprIrOpParamRef:
+            continue
+        if node.paramSlot != argIndex:
+            continue
+        return PrimaryBodyIrTypeTextIsVarI32(node.resultType)
+    return false
+
+fn PrimaryBodyIrAppendInvalidOp(bodyIR: var coreir.BodyIR) =
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpInvalidTag
+    op.target = -1
+    add(bodyIR.ops, op)
+
+fn PrimaryBodyIrAppendVarI32Load(bodyIR: var coreir.BodyIR,
+                                  addressSlot: int32,
+                                  valueSlot: int32) =
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpIndexedLoadTag
+    op.target = valueSlot
+    add(op.operands, addressSlot)
+    add(op.operands, valueSlot)
+    add(bodyIR.ops, op)
+
+fn PrimaryBodyIrAppendVarI32Store(bodyIR: var coreir.BodyIR,
+                                   addressSlot: int32,
+                                   valueSlot: int32) =
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpIndexedStoreTag
+    op.target = addressSlot
+    add(op.operands, addressSlot)
+    add(op.operands, valueSlot)
+    add(bodyIR.ops, op)
+
+fn PrimaryBodyIrI32ValueSlotForText(bodyIR: var coreir.BodyIR,
+                                     slotNames: var str[],
+                                     varI32ParamNames: str[],
+                                     textRaw: str): int32 =
+    let text = strutil.Strip(textRaw)
+    if len(text) <= 0:
+        return -1
+    let constVal = PrimaryBodyIrExtractIntFromText(text)
+    if constVal != 0 || PrimaryBodyIrTextIsI32Zero(text):
+        let slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, text, coreir.LocalI32Tag)
+        var constOp: coreir.BodyOp
+        constOp.kind = coreir.BodyOpLoadConstTag
+        constOp.target = slotId
+        add(constOp.operands, coreir.LocalI32Tag)
+        add(constOp.operands, constVal)
+        add(bodyIR.ops, constOp)
+        return slotId
+    let slotId = PrimaryBodyIrFindArgSlot(slotNames, text)
+    if slotId < 0:
+        return -1
+    if PrimaryBodyIrNameInList(varI32ParamNames, text):
+        let valueSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                      slotNames,
+                                                      PrimaryBodyIrVarI32ValueSlotName(text),
+                                                      coreir.LocalI32Tag)
+        PrimaryBodyIrAppendVarI32Load(bodyIR, slotId, valueSlot)
+        return valueSlot
+    if PrimaryBodyIrSlotType(bodyIR, slotId) != coreir.LocalI32Tag:
+        return -1
+    return slotId
+
 fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                                 slotNames: var str[],
                                 call: var coreir.CallOp,
-                                callArgsText: str,
-                                callArgCount: int32) =
-    if callArgCount <= 0:
-        return
-    let argNames = PrimaryBodyIrCallArgNames(callArgsText)
+                                typedIr: texpr.TypedExprIr,
+                                stmt: texpr.TypedExprIrStatement,
+                                varI32ParamNames: str[]): bool =
+    if stmt.callArgCount <= 0:
+        return true
+    let argNames = PrimaryBodyIrCallArgNames(stmt.callArgsText)
     for argIndex in 0..<argNames.len:
         let argName = argNames[argIndex]
+        let targetNeedsAddress = PrimaryBodyIrTargetParamIsVarI32(typedIr, stmt, argIndex)
         if PrimaryBodyIrTextIsI32Zero(argName):
+            if targetNeedsAddress:
+                return false
             add(call.argSlots, coreir.CallArgSlotConstFalse())
         elif argName == "true":
+            if targetNeedsAddress:
+                return false
             add(call.argSlots, coreir.CallArgSlotConstTrue())
         elif argName == "false":
+            if targetNeedsAddress:
+                return false
             add(call.argSlots, coreir.CallArgSlotConstFalse())
         else:
-            let slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+            var slotId = PrimaryBodyIrFindArgSlot(slotNames, argName)
+            if targetNeedsAddress:
+                if slotId < 0:
+                    return false
+                if PrimaryBodyIrSlotType(bodyIR, slotId) != coreir.LocalPtrTag:
+                    return false
+            elif PrimaryBodyIrNameInList(varI32ParamNames, argName):
+                slotId = PrimaryBodyIrI32ValueSlotForText(bodyIR, slotNames, varI32ParamNames, argName)
+            elif slotId < 0:
+                if PrimaryBodyIrTextHasCallSurface(argName):
+                    return false
+                slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR,
                                                        slotNames,
                                                        argName,
                                                        coreir.LocalI32Tag)
+            if slotId < 0:
+                return false
             add(call.argSlots, slotId)
+    return true
 
 fn PrimaryBodyIrAppendCallOp(bodyIR: var coreir.BodyIR,
                               slotNames: var str[],
+                              typedIr: texpr.TypedExprIr,
                               stmt: texpr.TypedExprIrStatement,
                               resultSlot: int32,
+                              varI32ParamNames: str[],
                               callOrdinal: var int32): int32 =
     var call: coreir.CallOp
     call.targetSymbol = stmt.callTarget
     call.resultSlot = resultSlot
-    PrimaryBodyIrAppendCallArgs(bodyIR,
-                                slotNames,
-                                call,
-                                stmt.callArgsText,
-                                stmt.callArgCount)
+    if !PrimaryBodyIrAppendCallArgs(bodyIR,
+                                    slotNames,
+                                    call,
+                                    typedIr,
+                                    stmt,
+                                    varI32ParamNames):
+        PrimaryBodyIrAppendInvalidOp(bodyIR)
+        return resultSlot
     add(bodyIR.callSequence, call)
     var op: coreir.BodyOp
     op.kind = coreir.BodyOpCallTag
@@ -686,6 +870,81 @@ fn PrimaryBuildBodyIrCfgResolveBranchTargets(bodyIR: var coreir.BodyIR,
                 bodyIR.terms[bi].falseBlock = -1
                 bodyIR.terms[bi].kind = coreir.BodyTermBrTag
 
+fn PrimaryBodyIrTextHasFieldOrIndex(text: str): bool =
+    for i in 0..<len(text):
+        if text[i] == '.' || text[i] == '[' || text[i] == ']':
+            return true
+    return false
+
+fn PrimaryBodyIrTextHasCallSurface(text: str): bool =
+    for i in 0..<len(text):
+        if text[i] == '(' || text[i] == ')':
+            return true
+    return false
+
+fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
+                                 slotNames: var str[],
+                                 varI32ParamNames: str[],
+                                 stmt: texpr.TypedExprIrStatement): bool =
+    let lhsName = strutil.Strip(stmt.bindingName)
+    let rhsText = strutil.Strip(stmt.surfaceText)
+    if len(lhsName) <= 0 || len(rhsText) <= 0:
+        return false
+    if PrimaryBodyIrTextHasFieldOrIndex(lhsName):
+        return false
+    let lhsSlot = PrimaryBodyIrFindSlotIndex(slotNames, lhsName)
+    if lhsSlot < 0:
+        return false
+    let lhsIsVarI32 = PrimaryBodyIrNameInList(varI32ParamNames, lhsName)
+    if !lhsIsVarI32 && PrimaryBodyIrSlotType(bodyIR, lhsSlot) != coreir.LocalI32Tag:
+        return false
+    var targetSlot = lhsSlot
+    if lhsIsVarI32:
+        targetSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                  slotNames,
+                                                  PrimaryBodyIrVarI32ValueSlotName(lhsName),
+                                                  coreir.LocalI32Tag)
+    let addPos = texpr.TypedExprFindTopLevelTextToken(rhsText, "+")
+    if addPos >= 0:
+        let rhsLhs = strutil.Strip(strings.SliceBytes(rhsText, 0, addPos))
+        let rhsRhs = strutil.Strip(strings.SliceBytes(rhsText,
+                                                     addPos + 1,
+                                                     len(rhsText) - addPos - 1))
+        let lhsValueSlot = PrimaryBodyIrI32ValueSlotForText(bodyIR,
+                                                            slotNames,
+                                                            varI32ParamNames,
+                                                            rhsLhs)
+        let rhsValueSlot = PrimaryBodyIrI32ValueSlotForText(bodyIR,
+                                                            slotNames,
+                                                            varI32ParamNames,
+                                                            rhsRhs)
+        if lhsValueSlot < 0 || rhsValueSlot < 0:
+            return false
+        var op: coreir.BodyOp
+        op.kind = coreir.BodyOpBinOpTag
+        op.target = targetSlot
+        add(op.operands, coreir.LocalI32Tag)
+        add(op.operands, int32(texpr.TypedExprIrOpI32Add))
+        add(op.operands, lhsValueSlot)
+        add(op.operands, rhsValueSlot)
+        add(bodyIR.ops, op)
+    else:
+        let valueSlot = PrimaryBodyIrI32ValueSlotForText(bodyIR,
+                                                         slotNames,
+                                                         varI32ParamNames,
+                                                         rhsText)
+        if valueSlot < 0:
+            return false
+        if valueSlot != targetSlot:
+            var copyOp: coreir.BodyOp
+            copyOp.kind = coreir.BodyOpCopyLocalTag
+            copyOp.target = targetSlot
+            add(copyOp.operands, valueSlot)
+            add(bodyIR.ops, copyOp)
+    if lhsIsVarI32:
+        PrimaryBodyIrAppendVarI32Store(bodyIR, lhsSlot, targetSlot)
+    return true
+
 fn PrimaryBuildBodyIrFromTypedStatements(
     typedIr: texpr.TypedExprIr,
     typedFnIndex: int32,
@@ -707,6 +966,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
     skipStatementUntilIndex = -1
     completedReturnLineNumber = -1
     PrimaryBodyIrSeedParamSlots(bodyIR, slotNames, irFunction)
+    let varI32ParamNames = PrimaryBodyIrCollectVarI32ParamNames(irFunction)
     for stmtIndex in typedFn.statementStart..<stmtEnd:
         if stmtIndex <= skipStatementUntilIndex:
             continue
@@ -722,8 +982,10 @@ fn PrimaryBuildBodyIrFromTypedStatements(
             if len(targetStr) > 0:
                 let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                   slotNames,
+                                                  typedIr,
                                                   stmt,
                                                   slotId,
+                                                  varI32ParamNames,
                                                   callOrdinal)
                 nextOpIndex = nextOpIndex + 1
         elif stmt.kind == texpr.TypedExprIrStmtCall:
@@ -745,10 +1007,19 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 resultSlot = -1
                 let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                   slotNames,
+                                                  typedIr,
                                                   stmt,
                                                   resultSlot,
+                                                  varI32ParamNames,
                                                   callOrdinal)
                 nextOpIndex = nextOpIndex + 1
+        elif stmt.kind == texpr.TypedExprIrStmtAssign:
+            if !PrimaryBodyIrAppendI32Assign(bodyIR,
+                                             slotNames,
+                                             varI32ParamNames,
+                                             stmt):
+                PrimaryBodyIrAppendInvalidOp(bodyIR)
+            nextOpIndex = nextOpIndex + 1
         elif stmt.kind == texpr.TypedExprIrStmtReturn:
             if stmt.lineNumber == completedReturnLineNumber:
                 continue
@@ -776,10 +1047,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                     continue
                 var lookaheadName = lookaheadStmt.bindingName
                 if len(lookaheadName) <= 0:
-                    if lookaheadStmt.callArgCount > 0:
-                        lookaheadName = Fmt"{lookaheadStmt.surfaceText}({lookaheadStmt.callArgsText})"
-                    else:
-                        lookaheadName = Fmt"{lookaheadStmt.surfaceText}()"
+                    lookaheadName = PrimaryBodyIrCallFullText(lookaheadStmt)
                 if len(valText) > 0 && lookaheadName == valText:
                     returnRootStmtIndex = lookaheadIndex
                     break
@@ -800,10 +1068,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                         continue
                     var dependencyName = callStmt.bindingName
                     if len(dependencyName) <= 0:
-                        if callStmt.callArgCount > 0:
-                            dependencyName = Fmt"{callStmt.surfaceText}({callStmt.callArgsText})"
-                        else:
-                            dependencyName = Fmt"{callStmt.surfaceText}()"
+                        dependencyName = PrimaryBodyIrCallFullText(callStmt)
                     if !strutil.Contains(rootStmt.callArgsText, dependencyName):
                         continue
                     let resultTypeKind = PrimaryBodyIrTypeKindFromText(callStmt.resultType)
@@ -813,25 +1078,26 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                                    resultTypeKind)
                     let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                       slotNames,
+                                                      typedIr,
                                                       callStmt,
                                                       resultSlot,
+                                                      varI32ParamNames,
                                                       callOrdinal)
                     nextOpIndex = nextOpIndex + 1
                 let rootResultTypeKind = PrimaryBodyIrTypeKindFromText(rootStmt.resultType)
                 var rootResultName = rootStmt.bindingName
                 if len(rootResultName) <= 0:
-                    if rootStmt.callArgCount > 0:
-                        rootResultName = Fmt"{rootStmt.surfaceText}({rootStmt.callArgsText})"
-                    else:
-                        rootResultName = Fmt"{rootStmt.surfaceText}()"
+                    rootResultName = PrimaryBodyIrCallFullText(rootStmt)
                 let rootResultSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
                                                                    slotNames,
                                                                    rootResultName,
                                                                    rootResultTypeKind)
                 let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                   slotNames,
+                                                  typedIr,
                                                   rootStmt,
                                                   rootResultSlot,
+                                                  varI32ParamNames,
                                                   callOrdinal)
                 PrimaryBodyIrAppendReturnTerm(bodyIR,
                                               currentBlockStart,
@@ -1131,6 +1397,8 @@ fn PrimaryBuildBodyIrFromTypedStatements(
             if bodyIR.ops.len > 0:
                 if bodyIR.ops[bodyIR.ops.len - 1].kind == coreir.BodyOpReturnTag:
                     fallbackTerm.operands = bodyIR.ops[bodyIR.ops.len - 1].operands
+            if fallbackTerm.operands.len <= 0 && PrimaryBodyIrReturnTypeIsVoid(typedFn.returnType):
+                add(fallbackTerm.operands, coreir.LocalInvalidTag)
             add(bodyIR.terms, fallbackTerm)
             let _ = coreir.BodyIRAppendBlock(bodyIR, 0, bodyIR.ops.len, 0)
         else:
@@ -1142,6 +1410,8 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 if bodyIR.ops.len > 0:
                     if bodyIR.ops[bodyIR.ops.len - 1].kind == coreir.BodyOpReturnTag:
                         remainTerm.operands = bodyIR.ops[bodyIR.ops.len - 1].operands
+                if remainTerm.operands.len <= 0 && PrimaryBodyIrReturnTypeIsVoid(typedFn.returnType):
+                    add(remainTerm.operands, coreir.LocalInvalidTag)
                 let remainTermIndex = coreir.BodyIRAppendTerm(bodyIR, remainTerm)
                 let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, remainingOpCount, remainTermIndex)
     for ti in 0..<bodyIR.terms.len:
@@ -2644,6 +2914,8 @@ fn PrimaryObjectMissingTypedIrKind(lowering: lower.LoweringPlanStub,
             return "stmt_if_call"
         if stmt.kind == texpr.TypedExprIrStmtCall:
             return "stmt_call"
+        if stmt.kind == texpr.TypedExprIrStmtAssign:
+            return "stmt_assign"
     let typedIndex = PrimaryTypedIrFunctionIndex(lowering.typedIr,
                                                 irFunction.sourcePath,
                                                 irFunction.functionName)
@@ -2669,6 +2941,8 @@ fn PrimaryObjectMissingTypedIrKind(lowering: lower.LoweringPlanStub,
                 return "stmt_if_call"
             if lowering.typedIr.statements[stmtIndex].kind == texpr.TypedExprIrStmtCall:
                 return "stmt_call"
+            if lowering.typedIr.statements[stmtIndex].kind == texpr.TypedExprIrStmtAssign:
+                return "stmt_assign"
     return ""
 
 fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
