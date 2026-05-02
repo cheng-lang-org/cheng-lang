@@ -1,5 +1,6 @@
 # Lessons
 
+- 2026-05-02: C seed 只是一段临时引导工具，不能把优化 1108 item 的 C seed 全量编译当主线；正确路径是打穿 backend driver 自举 47 item 卡点，让原生 driver 接管全量闭包后再兑现 lowering hashmap、函数级并行和增量缓存。
 - 2026-05-02: 并行推进时不要杀其它助手/用户进程；发现同类 build/system-link-exec 进程只能避开共享输出、等待或报告冲突，必须相互配合。
 - 2026-05-02: 用户要找“某版文档”时，不能只按最早提交或近似描述还原；必须先用用户给出的精确短语全历史搜索，确认命中提交后再改文件。
 - 2026-04-27: 纯 Cheng 自举任务中，C seed forced build 只能在 artifact 完全不可用时做一次明确恢复；不能在同一轮修复中反复刷新 backend_driver 来推进问题。后续定位和验收必须只用 `artifacts/backend_driver/cheng system-link-exec` / 纯 `build-backend-driver` 路径。

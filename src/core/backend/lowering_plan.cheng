@@ -452,6 +452,8 @@ fn LoweringAppendPrimaryObjectIrStatements(fnIr: var PrimaryObjectIrFunction,
 fn LoweringAppendPrimaryObjectIrCallTarget(fnIr: var PrimaryObjectIrFunction,
                                             stmt: PrimaryObjectIrStatement,
                                             sourceTexts: texpr.TypedExprSourceText[]) =
+    if len(stmt.callTarget) <= 0:
+        return
     var importcSymbol = ""
     if stmt.callTargetImportc:
         importcSymbol = LoweringImportcTargetSymbol(sourceTexts,
@@ -462,6 +464,22 @@ fn LoweringAppendPrimaryObjectIrCallTarget(fnIr: var PrimaryObjectIrFunction,
     add(fnIr.callTargetSourcePaths, stmt.callTargetSourcePath)
     add(fnIr.callTargetImportcFlags, stmt.callTargetImportc)
     add(fnIr.callImportcSymbols, importcSymbol)
+
+fn LoweringStatementCarriesCallTarget(stmt: PrimaryObjectIrStatement): bool =
+    if len(stmt.callTarget) <= 0:
+        return false
+    return stmt.kind == texpr.TypedExprIrStmtLetCall ||
+           stmt.kind == texpr.TypedExprIrStmtCall ||
+           stmt.kind == texpr.TypedExprIrStmtIfCall
+
+fn LoweringFillCallSequenceFromStatementsIfEmpty(fnIr: var PrimaryObjectIrFunction,
+                                                  sourceTexts: texpr.TypedExprSourceText[]) =
+    if fnIr.callTargets.len > 0:
+        return
+    for stmtIndex in 0..<fnIr.statements.len:
+        let stmt = fnIr.statements[stmtIndex]
+        if LoweringStatementCarriesCallTarget(stmt):
+            LoweringAppendPrimaryObjectIrCallTarget(fnIr, stmt, sourceTexts)
 
 fn LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr: var PrimaryObjectIrFunction,
                                                            sourceTexts: texpr.TypedExprSourceText[]) =
@@ -933,6 +951,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
         LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr, sourceTexts)
     LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr, sourceTexts)
     LoweringMaybeFillBackendDriverRunCommand(fnIr)
+    LoweringFillCallSequenceFromStatementsIfEmpty(fnIr, sourceTexts)
     fnIr.callTargetCount = fnIr.callTargets.len
     return fnIr
 
@@ -944,7 +963,7 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
         let fnIr = LoweringBuildOneFunction(plan, sourceTexts, i, letCallReturnLiteralStart)
         add(ir.functions, fnIr)
     return ir
-(lineRaw: str): bool =
+fn LoweringIsImportcAnnotation(lineRaw: str): bool =
     let line = chengpath.PathTrim(lineRaw)
     if line == "":
         return false
@@ -1169,7 +1188,7 @@ fn LoweringSequentialNameIds(count: int32): langintern.InternId[] =
     return out
 
 fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
-                                          compilerCsg: ccsg.CompilerCsg,
+                                          compilerCsg: var ccsg.CompilerCsg,
                                           plan: var LoweringPlanStub,
                                           err: var str): bool =
     plan.functionSourcePaths = []
@@ -1228,6 +1247,8 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
     plan.compilerCsgCid = compilerCsg.graphCid
     plan.exprLayer = parser.NormalizedExprLayerClone(compilerCsg.exprLayer)
     plan.typedExprFacts = texpr.TypedExprFactsClone(compilerCsg.typedExprFacts)
+    plan.typedIr = texpr.TypedExprIrClone(compilerCsg.typedIr)
+    plan.typedReturnOps = texpr.TypedExprReturnOpFactsFromIr(plan.typedIr)
     var typedSourceTexts: texpr.TypedExprSourceText[]
     for i in 0..<sourceClosurePaths.len:
         let sourcePath = sourceClosurePaths[i]
@@ -1238,15 +1259,6 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
                                                                   externalPackageRoots,
                                                                   sourcePath,
                                                                   sourceText))
-    var typedIrErr = ""
-    if !texpr.TypedExprBuildIrWithFacts(typedSourceTexts, plan.typedExprFacts, plan.typedIr, typedIrErr):
-        err = typedIrErr
-        return false
-    plan.typedReturnOps = texpr.TypedExprReturnOpFactsFromIr(plan.typedIr)
-    var callErr = ""
-    if !texpr.TypedExprFactsValidateCallResolution(plan.exprLayer, plan.typedExprFacts, callErr):
-        err = callErr
-        return false
     plan.primaryObjectIr = LoweringBuildPrimaryObjectIr(plan, typedSourceTexts)
     var loweringErr = ""
     if !texpr.TypedExprBuildLoweringRules(plan.typedExprFacts, plan.loweringRules, loweringErr):

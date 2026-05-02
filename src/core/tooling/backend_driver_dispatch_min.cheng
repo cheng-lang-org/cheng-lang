@@ -1201,12 +1201,13 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterBrowserReady(driver
                                                                reason)
         return BackendDriverDispatchMinUnsupported(reason)
     let requirePureSystemLinkExec = BackendDriverDispatchMinRequirePureSystemLinkExec()
-    if linkPlan.emitKind == creq.EmitExe && linkPlan.providerModules.len > 0:
-        return BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
     if linkPlan.emitKind == creq.EmitExe &&
        !requirePureSystemLinkExec &&
+       tmat.TargetIsDarwinArm64(linkPlan.targetTriple) &&
        direct.DirectObjectEmitCanStandaloneMain(primaryPlan):
         return BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
+    if linkPlan.emitKind == creq.EmitExe && linkPlan.providerModules.len > 0:
+        return BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot, reportPath, linkPlan, loweringPlan, primaryPlan, phaseProfile)
     if linkPlan.emitKind == creq.EmitExe && requirePureSystemLinkExec:
         let reason = "backend driver direct system-link-exec: pure runtime requires provider modules"
         let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
@@ -1452,42 +1453,59 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
     return 0
 
 fn BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot: str, reportPath: str, linkPlan: slplan.SystemLinkPlanStub, loweringPlan: lower.LoweringPlanStub, primaryPlan: pobj.PrimaryObjectPlan, phaseProfile: var BackendDriverDispatchMinPhaseProfile): int32 =
-    if linkPlan.providerModules.len > 0:
-        let reason = "backend driver direct system-link-exec: standalone path received provider modules"
+    if !tmat.TargetIsDarwinArm64(linkPlan.targetTriple):
+        let reason = Fmt"backend driver direct system-link-exec: standalone linkerless exe unsupported target: {linkPlan.targetTriple}"
         let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
                                                                reportPath,
                                                                reason)
         return BackendDriverDispatchMinUnsupported(reason)
     phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs()
     BackendDriverDispatchMinProgress("direct_object_emit", "begin")
-    let objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
-    let objectRes = direct.DirectObjectEmitStandaloneMainForTarget(driverRoot, primaryPlan, linkPlan.targetTriple, objectFormat)
+    let objectRes = direct.DirectObjectEmitStandaloneExecutable(driverRoot, primaryPlan, linkPlan.outputPath)
     if IsErr(objectRes):
         let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, Error(objectRes))
         return BackendDriverDispatchMinUnsupported(Error(objectRes))
     let object = Value(objectRes)
     phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs() - phaseProfile.directObjectEmitNs
     BackendDriverDispatchMinProgress("direct_object_emit", "done")
-    let objectPath = chengpath.PathAbsolute(driverRoot, object.objectPath)
     let outputPath = chengpath.PathAbsolute(driverRoot, linkPlan.outputPath)
-    let nativeCommand = Fmt"cc -arch arm64 {os.QuoteShell(objectPath)} -o {os.QuoteShell(outputPath)}"
     var lineMapPath: str
-    let linkCode = BackendDriverDispatchMinNativeLinkAndLineMap(driverRoot, nativeCommand, outputPath, linkPlan, loweringPlan, reportPath, phaseProfile, lineMapPath)
-    if linkCode != 0:
-        return linkCode
+    if !chengpath.FileExistsNonEmpty(driverRoot, linkPlan.outputPath):
+        let reason = Fmt"backend driver direct system-link-exec: linkerless output missing after emit: {linkPlan.outputPath}"
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
+        return BackendDriverDispatchMinUnsupported(reason)
+    let chmodRun = os.ExecShellCmdEx(Fmt"chmod 755 {os.QuoteShell(outputPath)}", uint64(0), driverRoot)
+    if os.ExecCmdResultExitCode(chmodRun) != 0:
+        let reason = Fmt"backend driver direct system-link-exec: chmod failed for linkerless output: {linkPlan.outputPath}"
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
+        return BackendDriverDispatchMinUnsupported(reason)
+    phaseProfile.lineMapNs = BackendDriverDispatchMinNowNs()
+    let lineMapRaw = linemap.LineMapPathForOutput(linkPlan.outputPath)
+    if len(lineMapRaw) > 0:
+        let lineMapText = linemap.LineMapText(linkPlan, loweringPlan)
+        if !chengpath.WriteTextFile(driverRoot, lineMapRaw, lineMapText):
+            let reason = Fmt"backend driver direct system-link-exec: failed to write line-map: {lineMapRaw}"
+            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
+            return BackendDriverDispatchMinUnsupported(reason)
+        lineMapPath = lineMapRaw
+    phaseProfile.lineMapNs = BackendDriverDispatchMinNowNs() - phaseProfile.lineMapNs
     var exeReport = ""
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_execute=1")
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_no_runtime=1")
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_direct_entry=1")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"primary_object={object.objectPath}")
     BackendDriverDispatchMinAppendLine(exeReport, "provider_object_count=0")
-    BackendDriverDispatchMinAppendLine(exeReport, Fmt"native_link_log={linkPlan.outputPath}.native_link.log")
+    BackendDriverDispatchMinAppendLine(exeReport, "native_link_log=-")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"line_map={lineMapPath}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"debug_line_map_path={lineMapPath}")
     BackendDriverDispatchMinAppendLine(exeReport, "primary_object_direct=1")
     BackendDriverDispatchMinAppendPrimaryPlanReport(exeReport, primaryPlan)
     BackendDriverDispatchMinAppendPhaseReport(exeReport, phaseProfile)
     BackendDriverDispatchMinAppendResourceReport(exeReport)
     BackendDriverDispatchMinAppendOutputFileSizeReport(exeReport, driverRoot, linkPlan.outputPath)
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_output_kind={object.outputKind}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_bytes={strings.IntToStr(object.bytesWritten)}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_reloc_count={strings.IntToStr(object.relocCount)}")
     if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, exeReport):
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
     return 0
