@@ -56,6 +56,12 @@ type
         compilerCsgCid: layout.FixedBytes32
         exprLayer: parser.NormalizedExprLayer
         typedExprFacts: ccsg.TypedExprFact[]
+        resolvedCallFactSourcePaths: str[]
+        resolvedCallFactBucketHeads: int32[]
+        resolvedCallFactEntryNext: int32[]
+        resolvedCallFactEntrySourceIndexes: int32[]
+        resolvedCallFactEntryLineNumbers: int32[]
+        resolvedCallFactEntryFactIndexes: int32[]
         typedIr: texpr.TypedExprIr
         typedReturnOps: texpr.TypedExprReturnOpFact[]
         primaryObjectIr: PrimaryObjectIr
@@ -257,22 +263,93 @@ fn LoweringTypedIrFunctionIsVoidReturn(ir: texpr.TypedExprIr,
            fnIr.statementCount <= 0 &&
            fnIr.nodeCount <= 0
 
-fn LoweringFindResolvedCallFactIndex(facts: ccsg.TypedExprFact[],
+fn LoweringResolvedCallFactIndexBucketCount(factCount: int32): int32 =
+    var need = factCount * 2 + 16
+    if need < 16:
+        need = 16
+    var out = 1
+    while out < need:
+        out = out * 2
+    return out
+
+fn LoweringResolvedCallFactBucket(sourceIndex: int32,
+                                   lineNumber: int32,
+                                   bucketCount: int32): int32 =
+    if sourceIndex < 0 || lineNumber <= 0 || bucketCount <= 0:
+        return -1
+    return ((sourceIndex + 1) * 131 + lineNumber) & (bucketCount - 1)
+
+fn LoweringResolvedCallFactSourceIndex(sourcePaths: str[],
+                                        sourcePath: str): int32 =
+    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+    for i in 0..<sourcePaths.len:
+        if sourcePaths[i] == normalizedSourcePath:
+            return i
+    return -1
+
+fn LoweringResolvedCallFactFindOrAddSource(plan: var LoweringPlanStub,
+                                            sourcePath: str): int32 =
+    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+    if len(normalizedSourcePath) <= 0:
+        return -1
+    for i in 0..<plan.resolvedCallFactSourcePaths.len:
+        if plan.resolvedCallFactSourcePaths[i] == normalizedSourcePath:
+            return i
+    add(plan.resolvedCallFactSourcePaths, normalizedSourcePath)
+    return plan.resolvedCallFactSourcePaths.len - 1
+
+fn LoweringBuildResolvedCallFactIndex(plan: var LoweringPlanStub) =
+    plan.resolvedCallFactSourcePaths = []
+    plan.resolvedCallFactBucketHeads = []
+    plan.resolvedCallFactEntryNext = []
+    plan.resolvedCallFactEntrySourceIndexes = []
+    plan.resolvedCallFactEntryLineNumbers = []
+    plan.resolvedCallFactEntryFactIndexes = []
+    let bucketCount = LoweringResolvedCallFactIndexBucketCount(plan.typedExprFacts.len)
+    var bucketTails: int32[]
+    for bucketIndex in 0..<bucketCount:
+        add(plan.resolvedCallFactBucketHeads, -1)
+        add(bucketTails, -1)
+    for factIndex in 0..<plan.typedExprFacts.len:
+        let fact = plan.typedExprFacts[factIndex]
+        if fact.lineNumber <= 0:
+            continue
+        if !fact.callResolved:
+            continue
+        if len(fact.callTarget) <= 0:
+            continue
+        let sourceIndex = LoweringResolvedCallFactFindOrAddSource(plan, fact.sourcePath)
+        let bucket = LoweringResolvedCallFactBucket(sourceIndex, fact.lineNumber, bucketCount)
+        if bucket < 0:
+            continue
+        let entryIndex = plan.resolvedCallFactEntryFactIndexes.len
+        add(plan.resolvedCallFactEntryNext, -1)
+        add(plan.resolvedCallFactEntrySourceIndexes, sourceIndex)
+        add(plan.resolvedCallFactEntryLineNumbers, fact.lineNumber)
+        add(plan.resolvedCallFactEntryFactIndexes, factIndex)
+        if plan.resolvedCallFactBucketHeads[bucket] < 0:
+            plan.resolvedCallFactBucketHeads[bucket] = entryIndex
+        else:
+            plan.resolvedCallFactEntryNext[bucketTails[bucket]] = entryIndex
+        bucketTails[bucket] = entryIndex
+
+fn LoweringFindResolvedCallFactIndex(plan: LoweringPlanStub,
                                       sourcePath: str,
                                       lineNumber: int32): int32 =
     if lineNumber <= 0:
         return -1
-    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
-    for i in 0..<facts.len:
-        if parser.ParserNormalizePath(facts[i].sourcePath) != normalizedSourcePath:
-            continue
-        if facts[i].lineNumber != lineNumber:
-            continue
-        if !facts[i].callResolved:
-            continue
-        if len(facts[i].callTarget) <= 0:
-            continue
-        return i
+    let sourceIndex = LoweringResolvedCallFactSourceIndex(plan.resolvedCallFactSourcePaths, sourcePath)
+    let bucket = LoweringResolvedCallFactBucket(sourceIndex, lineNumber, plan.resolvedCallFactBucketHeads.len)
+    if bucket < 0:
+        return -1
+    var entryIndex = plan.resolvedCallFactBucketHeads[bucket]
+    while entryIndex >= 0:
+        if entryIndex >= plan.resolvedCallFactEntryFactIndexes.len:
+            return -1
+        if plan.resolvedCallFactEntrySourceIndexes[entryIndex] == sourceIndex &&
+           plan.resolvedCallFactEntryLineNumbers[entryIndex] == lineNumber:
+            return plan.resolvedCallFactEntryFactIndexes[entryIndex]
+        entryIndex = plan.resolvedCallFactEntryNext[entryIndex]
     return -1
 
 fn LoweringPrimaryObjectIrBodyKindForCallArgCount(callArgCount: int32): str =
@@ -505,8 +582,6 @@ fn LoweringStatementCallTargetCount(fnIr: PrimaryObjectIrFunction): int32 =
 
 fn LoweringFillGeneralCfgCallSequenceFromStatements(fnIr: var PrimaryObjectIrFunction,
                                                      sourceTexts: texpr.TypedExprSourceText[]) =
-    if fnIr.bodyKind != texpr.BodyKindUnsupported:
-        return
     if fnIr.callTargets.len > 0:
         return
     if LoweringStatementCallTargetCount(fnIr) <= 0:
@@ -717,7 +792,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
         fnIr.bodyKind = texpr.BodyKindRuntimeParamStrCopyBridge
     if fnIr.bodyKind == texpr.BodyKindUnsupported || hasLetCall:
         let letCallReturnKind = LoweringPrimaryObjectIrLetCallReturnBodyKind(plan.typedIr, typedFnIndex)
-        var callIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, bodyLineNumber)
+        var callIndex = LoweringFindResolvedCallFactIndex(plan, sourcePath, bodyLineNumber)
         if callIndex < 0:
             if letCallReturnKind == "str_i32_guard_arg0_return_0":
                 if typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
@@ -785,9 +860,9 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                             let typedFn = plan.typedIr.functions[typedFnIndex]
                             if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
                                 let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                                let secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, returnNode.operand0NodeIndex)
-                                let thirdCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, returnNode.operand1NodeIndex)
-                                let fourthCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, returnNode.operand2NodeIndex)
+                                let secondCallIndex = LoweringFindResolvedCallFactIndex(plan, sourcePath, returnNode.operand0NodeIndex)
+                                let thirdCallIndex = LoweringFindResolvedCallFactIndex(plan, sourcePath, returnNode.operand1NodeIndex)
+                                let fourthCallIndex = LoweringFindResolvedCallFactIndex(plan, sourcePath, returnNode.operand2NodeIndex)
                                 if secondCallIndex >= 0 && thirdCallIndex >= 0 && fourthCallIndex >= 0:
                                     let secondFact = plan.typedExprFacts[secondCallIndex]
                                     let thirdFact = plan.typedExprFacts[thirdCallIndex]
@@ -833,7 +908,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                             let typedFn = plan.typedIr.functions[typedFnIndex]
                             if typedFn.returnNodeIndex >= 0 && typedFn.returnNodeIndex < plan.typedIr.nodes.len:
                                 let returnNode = plan.typedIr.nodes[typedFn.returnNodeIndex]
-                                var secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, returnNode.operand0NodeIndex)
+                                var secondCallIndex = LoweringFindResolvedCallFactIndex(plan, sourcePath, returnNode.operand0NodeIndex)
                                 if secondCallIndex < 0:
                                     for factIndex in 0..<plan.typedExprFacts.len:
                                         if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
@@ -906,7 +981,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                 var functionEndLine: int32 = typedFn.endLineNumber + 1
                 if functionEndLine <= bodyLineNumber:
                     functionEndLine = 2147483647
-                var firstCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, bodyLineNumber)
+                var firstCallIndex = LoweringFindResolvedCallFactIndex(plan, sourcePath, bodyLineNumber)
                 if firstCallIndex < 0:
                     for factIndex in 0..<plan.typedExprFacts.len:
                         if plan.typedExprFacts[factIndex].sourcePath != sourcePath:
@@ -921,7 +996,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                             continue
                         firstCallIndex = factIndex
                         break
-                var secondCallIndex = LoweringFindResolvedCallFactIndex(plan.typedExprFacts, sourcePath, returnNode.operand0NodeIndex)
+                var secondCallIndex = LoweringFindResolvedCallFactIndex(plan, sourcePath, returnNode.operand0NodeIndex)
                 if secondCallIndex < 0:
                     for factIndex in 0..<plan.typedExprFacts.len:
                         if factIndex == firstCallIndex:
@@ -1283,6 +1358,7 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
     plan.compilerCsgCid = compilerCsg.graphCid
     plan.exprLayer = parser.NormalizedExprLayerClone(compilerCsg.exprLayer)
     plan.typedExprFacts = texpr.TypedExprFactsClone(compilerCsg.typedExprFacts)
+    LoweringBuildResolvedCallFactIndex(plan)
     var typedSourceTexts: texpr.TypedExprSourceText[]
     for i in 0..<sourceClosurePaths.len:
         let sourcePath = sourceClosurePaths[i]
