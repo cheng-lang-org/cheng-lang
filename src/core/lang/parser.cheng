@@ -1747,32 +1747,43 @@ fn ParserSourceExists(path: str): bool =
     return chengpath.PathFileSize(path) > Int64(0)
 
 fn ParserExprIsResultIntrinsicName(name: str): bool =
-    if name == "Ok" || name == "Err":
-        return true
-    if name == "Value" || name == "Error":
-        return true
-    if name == "IsOk" || name == "IsErr":
-        return true
-    if name == "ErrorInfoOf":
-        return true
-    return false
+    return ParserResultIntrinsicDetailKind(name) != NormalizedExprDetailNone
 
-fn ParserResultIntrinsicDetailKind(name: str): NormalizedExprDetailKind =
-    if name == "Ok":
-        return NormalizedExprDetailResultOk
-    if name == "Err":
-        return NormalizedExprDetailResultErr
-    if name == "Value":
-        return NormalizedExprDetailResultValue
-    if name == "Error":
-        return NormalizedExprDetailResultError
-    if name == "IsOk":
-        return NormalizedExprDetailResultIsOk
-    if name == "IsErr":
-        return NormalizedExprDetailResultIsErr
-    if name == "ErrorInfoOf":
+fn ParserResultIntrinsicDetailKindRange(text: str,
+                                          start: int32,
+                                          stop: int32): NormalizedExprDetailKind =
+    if start < 0 || stop > text.len || stop <= start:
+        return NormalizedExprDetailNone
+    let tokenLen = stop - start
+    let first = text[start]
+    if tokenLen == 2:
+        if first == 'O' && ParserTextRangeEquals(text, start, tokenLen, "Ok"):
+            return NormalizedExprDetailResultOk
+        return NormalizedExprDetailNone
+    if tokenLen == 3:
+        if first == 'E' && ParserTextRangeEquals(text, start, tokenLen, "Err"):
+            return NormalizedExprDetailResultErr
+        return NormalizedExprDetailNone
+    if tokenLen == 4:
+        if first == 'I' && ParserTextRangeEquals(text, start, tokenLen, "IsOk"):
+            return NormalizedExprDetailResultIsOk
+        return NormalizedExprDetailNone
+    if tokenLen == 5:
+        if first == 'V' && ParserTextRangeEquals(text, start, tokenLen, "Value"):
+            return NormalizedExprDetailResultValue
+        if first == 'E' && ParserTextRangeEquals(text, start, tokenLen, "Error"):
+            return NormalizedExprDetailResultError
+        if first == 'I' && ParserTextRangeEquals(text, start, tokenLen, "IsErr"):
+            return NormalizedExprDetailResultIsErr
+        return NormalizedExprDetailNone
+    if tokenLen == 11 &&
+       first == 'E' &&
+       ParserTextRangeEquals(text, start, tokenLen, "ErrorInfoOf"):
         return NormalizedExprDetailResultErrorInfoOf
     return NormalizedExprDetailNone
+
+fn ParserResultIntrinsicDetailKind(name: str): NormalizedExprDetailKind =
+    return ParserResultIntrinsicDetailKindRange(name, 0, name.len)
 
 fn ParserFmtExprDetailKind(modeRaw: str): NormalizedExprDetailKind =
     if modeRaw == "fmt_literal":
@@ -2405,8 +2416,11 @@ fn ParserAppendSimpleSurfaceExprsLine(sourcePath: str,
             if !ParserIsIdentChar(lineRaw[stop]):
                 break
             stop = stop + 1
-        let ident = ParserTextSliceFast(lineRaw, i, stop - i)
-        if appendIfExprs && ident == "if":
+        let identLen = stop - i
+        if appendIfExprs &&
+           identLen == 2 &&
+           lineRaw[i] == 'i' &&
+           ParserTextRangeEquals(lineRaw, i, identLen, "if"):
             NormalizedExprLayerAppend(layer,
                                         sourcePath,
                                         lineNumber,
@@ -2414,15 +2428,61 @@ fn ParserAppendSimpleSurfaceExprsLine(sourcePath: str,
                                         NormalizedExprIf,
                                         NormalizedExprDetailIfKeyword,
                                         "if")
-        elif appendResultIntrinsics && ParserExprIsResultIntrinsicName(ident):
-            NormalizedExprLayerAppend(layer,
-                                        sourcePath,
-                                        lineNumber,
-                                        i + 1,
-                                        NormalizedExprResultIntrinsic,
-                                        ParserResultIntrinsicDetailKind(ident),
-                                        ident)
+        elif appendResultIntrinsics:
+            let detailKind = ParserResultIntrinsicDetailKindRange(lineRaw, i, stop)
+            if detailKind != NormalizedExprDetailNone:
+                let ident = ParserTextSliceFast(lineRaw, i, identLen)
+                NormalizedExprLayerAppend(layer,
+                                            sourcePath,
+                                            lineNumber,
+                                            i + 1,
+                                            NormalizedExprResultIntrinsic,
+                                            detailKind,
+                                            ident)
         i = stop
+
+fn ParserStatementHeadKeywordCodeRange(lineRaw: str,
+                                         start: int32,
+                                         stop: int32): int32 =
+    if start < 0 || stop > lineRaw.len || stop <= start:
+        return 0
+    let tokenLen = stop - start
+    let first = lineRaw[start]
+    if tokenLen == 2:
+        if first == 'f' && ParserTextRangeEquals(lineRaw, start, tokenLen, "fn"):
+            return 1
+        if first == 'i' && ParserTextRangeEquals(lineRaw, start, tokenLen, "if"):
+            return 1
+        return 0
+    if tokenLen == 3:
+        if first == 'l' && ParserTextRangeEquals(lineRaw, start, tokenLen, "let"):
+            return 1
+        if first == 'v' && ParserTextRangeEquals(lineRaw, start, tokenLen, "var"):
+            return 1
+        if first == 'f' && ParserTextRangeEquals(lineRaw, start, tokenLen, "for"):
+            return 1
+        return 0
+    if tokenLen == 4:
+        if first == 't' && ParserTextRangeEquals(lineRaw, start, tokenLen, "type"):
+            return 1
+        if first == 'e' && ParserTextRangeEquals(lineRaw, start, tokenLen, "elif"):
+            return 1
+        return 0
+    if tokenLen == 5:
+        if first == 'c' && ParserTextRangeEquals(lineRaw, start, tokenLen, "const"):
+            return 1
+        if first == 'e' && ParserTextRangeEquals(lineRaw, start, tokenLen, "else"):
+            return 1
+        if first == 'w' && ParserTextRangeEquals(lineRaw, start, tokenLen, "while"):
+            return 1
+        return 0
+    if tokenLen == 6:
+        if first == 'i' && ParserTextRangeEquals(lineRaw, start, tokenLen, "import"):
+            return 1
+        if first == 'r' && ParserTextRangeEquals(lineRaw, start, tokenLen, "return"):
+            return 1
+        return 0
+    return 0
 
 fn ParserPreviousNonSpaceChar(lineRaw: str,
                                 stopExclusive: int32): char =
@@ -2557,29 +2617,7 @@ fn ParserLineIsAssignmentStmtCandidate(lineRaw: str): bool =
         tokenStop = tokenStop + 1
     if tokenStop <= start:
         return ParserFindTopLevelAssignmentEq(lineRaw) >= 0
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "let"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "var"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "const"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "fn"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "type"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "import"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "if"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "elif"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "else"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "for"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "while"):
-        return false
-    if ParserLineTokenEquals(lineRaw, start, tokenStop, "return"):
+    if ParserStatementHeadKeywordCodeRange(lineRaw, start, tokenStop) != 0:
         return false
     return ParserFindTopLevelAssignmentEq(lineRaw) >= 0
 

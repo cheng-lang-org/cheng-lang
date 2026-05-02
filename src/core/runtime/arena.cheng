@@ -1,0 +1,182 @@
+import std/seqs
+
+const
+    ArenaDefaultAlignment = 8
+    ArenaMaxInt32 = 2147483647
+
+type
+    Arena =
+        storage: uint8[]
+        usedBytes: int32
+        capacityBytes: int32
+        alignmentBytes: int32
+        generation: int32
+
+    ArenaBytes =
+        offset: int32
+        len: int32
+        alignmentBytes: int32
+        generation: int32
+
+fn arenaPowerOfTwo(value: int32): bool =
+    if value <= 0:
+        return false
+    return (value & (value - 1)) == 0
+
+fn arenaRequireAlignment(alignmentBytes: int32) =
+    if !arenaPowerOfTwo(alignmentBytes):
+        panic("arena: alignment must be a positive power of two")
+
+fn arenaRequireLive(arena: Arena) =
+    if arena.capacityBytes <= 0:
+        panic("arena: uninitialized")
+    if arena.alignmentBytes <= 0:
+        panic("arena: corrupt alignment")
+    if arena.storage.len != arena.capacityBytes:
+        panic("arena: corrupt storage length")
+    if arena.usedBytes < 0 || arena.usedBytes > arena.capacityBytes:
+        panic("arena: corrupt used bytes")
+    if arena.generation <= 0:
+        panic("arena: corrupt generation")
+
+fn arenaAlignUp(value: int32, alignmentBytes: int32): int32 =
+    arenaRequireAlignment(alignmentBytes)
+    let mask = alignmentBytes - 1
+    if value < 0 || value > ArenaMaxInt32 - mask:
+        panic("arena: alignment overflow")
+    return (value + mask) & (0 - alignmentBytes)
+
+fn ArenaInit(capacityBytes: int32, alignmentBytes: int32): Arena =
+    if capacityBytes <= 0:
+        panic("arena: capacity must be positive")
+    arenaRequireAlignment(alignmentBytes)
+    var out: Arena
+    out.capacityBytes = capacityBytes
+    out.alignmentBytes = alignmentBytes
+    out.generation = 1
+    setLen(out.storage, capacityBytes)
+    if out.storage.len != capacityBytes:
+        panic("arena: allocation failed")
+    return out
+
+fn ArenaInit(capacityBytes: int32): Arena =
+    return ArenaInit(capacityBytes, ArenaDefaultAlignment)
+
+fn ArenaCreate(initialCapacity: int32): Arena =
+    return ArenaInit(initialCapacity, ArenaDefaultAlignment)
+
+fn ArenaRelease(arena: var Arena) =
+    arena.storage = []
+    arena.usedBytes = 0
+    arena.capacityBytes = 0
+    arena.alignmentBytes = 0
+    arena.generation = 0
+
+fn ArenaDestroy(arena: var Arena) =
+    ArenaRelease(arena)
+
+fn ArenaReset(arena: var Arena) =
+    arenaRequireLive(arena)
+    if arena.generation >= ArenaMaxInt32:
+        panic("arena: generation overflow")
+    arena.usedBytes = 0
+    arena.generation = arena.generation + 1
+
+fn ArenaUsed(arena: Arena): int32 =
+    arenaRequireLive(arena)
+    return arena.usedBytes
+
+fn ArenaCapacity(arena: Arena): int32 =
+    arenaRequireLive(arena)
+    return arena.capacityBytes
+
+fn ArenaAlignment(arena: Arena): int32 =
+    arenaRequireLive(arena)
+    return arena.alignmentBytes
+
+fn ArenaRemaining(arena: Arena): int32 =
+    arenaRequireLive(arena)
+    return arena.capacityBytes - arena.usedBytes
+
+fn ArenaAllocBytesAligned(arena: var Arena,
+                           byteCount: int32,
+                           alignmentBytes: int32): ArenaBytes =
+    arenaRequireLive(arena)
+    arenaRequireAlignment(alignmentBytes)
+    if byteCount < 0:
+        panic("arena: negative allocation")
+    var out: ArenaBytes
+    let alignedOffset = arenaAlignUp(arena.usedBytes, alignmentBytes)
+    if byteCount == 0:
+        out.offset = alignedOffset
+        out.len = 0
+        out.alignmentBytes = alignmentBytes
+        out.generation = arena.generation
+        return out
+    if alignedOffset > ArenaMaxInt32 - byteCount:
+        panic("arena: allocation overflow")
+    let nextUsed = alignedOffset + byteCount
+    if nextUsed > arena.capacityBytes:
+        panic("arena: out of memory")
+    arena.usedBytes = nextUsed
+    out.offset = alignedOffset
+    out.len = byteCount
+    out.alignmentBytes = alignmentBytes
+    out.generation = arena.generation
+    return out
+
+fn ArenaAllocBytes(arena: var Arena, byteCount: int32): ArenaBytes =
+    arenaRequireLive(arena)
+    return ArenaAllocBytesAligned(arena, byteCount, arena.alignmentBytes)
+
+fn ArenaAlloc(arena: var Arena, byteCount: int32): ArenaBytes =
+    return ArenaAllocBytes(arena, byteCount)
+
+fn arenaRequireBytes(arena: Arena, bytes: ArenaBytes) =
+    arenaRequireLive(arena)
+    if bytes.generation != arena.generation:
+        panic("arena: stale allocation")
+    if bytes.offset < 0 || bytes.len < 0:
+        panic("arena: corrupt allocation")
+    if bytes.offset > ArenaMaxInt32 - bytes.len:
+        panic("arena: allocation range overflow")
+    if bytes.offset + bytes.len > arena.usedBytes:
+        panic("arena: allocation outside used range")
+    arenaRequireAlignment(bytes.alignmentBytes)
+    if arenaAlignUp(bytes.offset, bytes.alignmentBytes) != bytes.offset:
+        panic("arena: allocation offset misaligned")
+
+fn ArenaBytesOffset(bytes: ArenaBytes): int32 =
+    return bytes.offset
+
+fn ArenaBytesLen(bytes: ArenaBytes): int32 =
+    return bytes.len
+
+fn ArenaBytesAlignment(bytes: ArenaBytes): int32 =
+    return bytes.alignmentBytes
+
+fn ArenaGetByte(arena: Arena, bytes: ArenaBytes, index: int32): int32 =
+    arenaRequireBytes(arena, bytes)
+    if index < 0 || index >= bytes.len:
+        panic("arena: read out of bounds")
+    return int32(arena.storage[bytes.offset + index])
+
+fn ArenaSetByte(arena: var Arena, bytes: ArenaBytes, index: int32, value: int32) =
+    arenaRequireBytes(arena, bytes)
+    if index < 0 || index >= bytes.len:
+        panic("arena: write out of bounds")
+    arena.storage[bytes.offset + index] = uint8(value & 255)
+
+fn ArenaFillBytes(arena: var Arena, bytes: ArenaBytes, value: int32) =
+    arenaRequireBytes(arena, bytes)
+    let b = uint8(value & 255)
+    for i in 0..<bytes.len:
+        arena.storage[bytes.offset + i] = b
+
+fn ArenaAllocZeroBytes(arena: var Arena, byteCount: int32): ArenaBytes =
+    let bytes = ArenaAllocBytes(arena, byteCount)
+    ArenaFillBytes(arena, bytes, 0)
+    return bytes
+
+fn ArenaAllocZero(arena: var Arena, byteCount: int32): ArenaBytes =
+    return ArenaAllocZeroBytes(arena, byteCount)
