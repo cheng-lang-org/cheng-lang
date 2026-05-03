@@ -715,6 +715,101 @@ fn PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR: var coreir.BodyIR,
                                               rootName,
                                               rootType)
 
+fn PrimaryBodyIrBindingTypeForName(typedIr: texpr.TypedExprIr,
+                                    typedFn: texpr.TypedExprIrFunction,
+                                    irFunction: lower.PrimaryObjectIrFunction,
+                                    lineNumber: int32,
+                                    nameRaw: str): str =
+    let name = strutil.Strip(nameRaw)
+    if name == "":
+        return ""
+    for i in 0..<irFunction.paramNames.len:
+        if i >= irFunction.paramTypes.len:
+            continue
+        if irFunction.paramNames[i] == name:
+            return irFunction.paramTypes[i]
+    var stmtEnd = typedFn.statementStart + typedFn.statementCount
+    if stmtEnd > typedIr.statements.len:
+        stmtEnd = typedIr.statements.len
+    var foundType = ""
+    for i in typedFn.statementStart..<stmtEnd:
+        let stmt = typedIr.statements[i]
+        if stmt.lineNumber >= lineNumber:
+            continue
+        if stmt.bindingName != name:
+            continue
+        if stmt.resultType != "" &&
+           stmt.resultType != "unknown" &&
+           stmt.resultType != "call_expr":
+            foundType = stmt.resultType
+    return foundType
+
+fn PrimaryBodyIrMaterializeFieldArgSlot(bodyIR: var coreir.BodyIR,
+                                         slotNames: var str[],
+                                         typedIr: texpr.TypedExprIr,
+                                         typedFn: texpr.TypedExprIrFunction,
+                                         irFunction: lower.PrimaryObjectIrFunction,
+                                         sourcePath: str,
+                                         lineNumber: int32,
+                                         argTextRaw: str): int32 =
+    let argText = strutil.Strip(argTextRaw)
+    if !texpr.TypedExprTextIsSimpleFieldPath(argText):
+        return -1
+    if strutil.Contains(argText, "->"):
+        return -1
+    let rootName = texpr.TypedExprAssignLhsRootName(argText)
+    let fieldPath = texpr.TypedExprAssignFieldPath(argText)
+    if rootName == "" || fieldPath == "":
+        return -1
+    let rootType = PrimaryBodyIrBindingTypeForName(typedIr,
+                                                   typedFn,
+                                                   irFunction,
+                                                   lineNumber,
+                                                   rootName)
+    if rootType == "":
+        return -1
+    var fieldType = ""
+    var fieldOffsetBytes: int32
+    var fieldSizeBytes: int32
+    var fieldAlignBytes: int32
+    if !texpr.TypedExprIrLookupFieldPathMeta(typedIr,
+                                             sourcePath,
+                                             rootType,
+                                             fieldPath,
+                                             fieldType,
+                                             fieldOffsetBytes,
+                                             fieldSizeBytes,
+                                             fieldAlignBytes):
+        return -1
+    let baseSlot = PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR,
+                                                          slotNames,
+                                                          typedIr,
+                                                          sourcePath,
+                                                          rootName,
+                                                          rootType)
+    if baseSlot < 0:
+        return -1
+    let valueSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                       slotNames,
+                                                       typedIr,
+                                                       sourcePath,
+                                                       Fmt"{argText}#field_arg",
+                                                       fieldType)
+    if valueSlot < 0 ||
+       fieldOffsetBytes < 0 ||
+       fieldSizeBytes <= 0 ||
+       PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < fieldSizeBytes:
+        return -1
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpFieldLoadTag
+    op.target = valueSlot
+    add(op.operands, baseSlot)
+    add(op.operands, valueSlot)
+    add(op.operands, fieldOffsetBytes)
+    add(op.operands, fieldSizeBytes)
+    add(bodyIR.ops, op)
+    return valueSlot
+
 fn PrimaryBodyIrMarkParamSlot(bodyIR: var coreir.BodyIR,
                                slotId: int32,
                                paramSlot: int32) =
@@ -1183,6 +1278,8 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                                 slotNames: var str[],
                                 call: var coreir.CallOp,
                                 typedIr: texpr.TypedExprIr,
+                                typedFn: texpr.TypedExprIrFunction,
+                                irFunction: lower.PrimaryObjectIrFunction,
                                 stmt: texpr.TypedExprIrStatement,
                                 varI32ParamNames: str[],
                                 failureDetail0: var int32,
@@ -1258,6 +1355,32 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
             add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
         else:
             var slotId = PrimaryBodyIrFindArgSlot(slotNames, argName)
+            let fieldRootName = texpr.TypedExprAssignLhsRootName(argName)
+            let fieldRootType = PrimaryBodyIrBindingTypeForName(typedIr,
+                                                                typedFn,
+                                                                irFunction,
+                                                                stmt.lineNumber,
+                                                                fieldRootName)
+            if fieldRootType != "" && texpr.TypedExprTextIsSimpleFieldPath(argName):
+                if targetNeedsAddress:
+                    failureDetail0 = 32
+                    failureDetail1 = argIndex
+                    return false
+                slotId = PrimaryBodyIrMaterializeFieldArgSlot(bodyIR,
+                                                              slotNames,
+                                                              typedIr,
+                                                              typedFn,
+                                                              irFunction,
+                                                              stmt.sourcePath,
+                                                              stmt.lineNumber,
+                                                              argName)
+                if slotId < 0:
+                    failureDetail0 = 43
+                    failureDetail1 = argIndex
+                    return false
+                add(call.argSlots, slotId)
+                add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
+                continue
             if targetNeedsAddress:
                 if slotId < 0:
                     let valueType = texpr.TypedExprStripVarType(targetParamType)
@@ -1310,6 +1433,10 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                                                                  argName,
                                                                  coreir.LocalI32Tag)
                     if slotId < 0:
+                        if PrimaryBodyIrTextHasFieldOrIndex(argName):
+                            failureDetail0 = 44
+                            failureDetail1 = argIndex
+                            return false
                         slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR,
                                                                slotNames,
                                                                argName,
@@ -1325,6 +1452,8 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
 fn PrimaryBodyIrAppendCallOp(bodyIR: var coreir.BodyIR,
                               slotNames: var str[],
                               typedIr: texpr.TypedExprIr,
+                              typedFn: texpr.TypedExprIrFunction,
+                              irFunction: lower.PrimaryObjectIrFunction,
                               stmt: texpr.TypedExprIrStatement,
                               resultSlot: int32,
                               varI32ParamNames: str[],
@@ -1344,6 +1473,8 @@ fn PrimaryBodyIrAppendCallOp(bodyIR: var coreir.BodyIR,
                                     slotNames,
                                     call,
                                     typedIr,
+                                    typedFn,
+                                    irFunction,
                                     stmt,
                                     varI32ParamNames,
                                     failureDetail0,
