@@ -2640,11 +2640,14 @@ fn PrimaryFillInstructionWords(words: var int32[],
                                functionWordOffsets: int32[],
                                functionWordCounts: int32[],
                                functionBodyKinds: str[],
-                               functionBodyIRs: coreir.BodyIR[]): bool =
+                               functionBodyIRs: coreir.BodyIR[],
+                               failedIndex: var int32): bool =
     var ok = true
+    failedIndex = -1
     for i in 0..<functionBodyKinds.len:
         if i >= functionWordOffsets.len || i >= functionWordCounts.len:
             ok = false
+            failedIndex = i
             continue
         let wordCount = functionWordCounts[i]
         let hasBodyIR = i < functionBodyIRs.len &&
@@ -2655,11 +2658,13 @@ fn PrimaryFillInstructionWords(words: var int32[],
             let emitted = PrimaryBodyIRFillWords(words, offset, wordCount, bodyIR)
             if emitted != wordCount:
                 ok = false
+                failedIndex = i
         elif !PrimaryFillInstructionWordsForFunction(words,
                                                       functionWordOffsets[i],
                                                       functionWordCounts[i],
                                                       functionBodyKinds[i]):
             ok = false
+            failedIndex = i
     return ok
 
 fn PrimaryBodyIrWordCount(bodyIR: coreir.BodyIR): int32 =
@@ -3702,18 +3707,24 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     plan.instructionWords = []
     for i in 0..<totalWordCount:
         add(plan.instructionWords, 0)
+    var primaryFillFailedIndex: int32
+    primaryFillFailedIndex = -1
     if !PrimaryFillInstructionWords(plan.instructionWords,
                                     functionWordOffsets,
                                     functionWordCounts,
                                     functionInstructionBodyKinds,
-                                    planBodyIRs):
+                                    planBodyIRs,
+                                    primaryFillFailedIndex):
         bodySemanticsMissing = true
         if len(firstMissingFunction) <= 0:
-            if functionBodyKinds.len > 0:
-                firstMissingFunction = symbolNames[0] + "_fill_failed"
-                firstMissingBodyKind = functionBodyKinds[0]
-                firstMissingTypedIrKind = "fill_returned_false"
-                firstMissingLineNumber = 0
+            if primaryFillFailedIndex >= 0 && primaryFillFailedIndex < symbolNames.len:
+                firstMissingFunction = symbolNames[primaryFillFailedIndex]
+                firstMissingBodyKind = functionBodyKinds[primaryFillFailedIndex]
+            else:
+                firstMissingFunction = "unknown_index"
+                firstMissingBodyKind = "-"
+            firstMissingTypedIrKind = "fill_returned_false"
+            firstMissingLineNumber = 0
             for functionIndex in 0..<functionBodyKinds.len:
                 if functionIndex >= symbolNames.len ||
                    functionIndex >= functionWordOffsets.len ||
