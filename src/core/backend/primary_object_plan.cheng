@@ -384,15 +384,36 @@ fn PrimaryBodyIrParseCondition(
     cmpTag = tag
     return true
 
-fn PrimaryBodyIrLocalSlotNew(bodyIR: var coreir.BodyIR,
-                              slotId: int32,
-                              name: str,
-                              typeKind: int32) =
+fn PrimaryBodyIrNextLocalStackOffset(bodyIR: coreir.BodyIR,
+                                      sizeBytes: int32,
+                                      alignBytes: int32): int32 =
+    var offset: int32 = 16
+    for i in 0..<bodyIR.localSlots.len:
+        if PrimaryBodyIrLocalIsParam(bodyIR.localSlots[i]):
+            continue
+        let slotSize = PrimaryLocalSlotSizeOf(bodyIR.localSlots[i])
+        if slotSize <= 0:
+            continue
+        let slotEnd = bodyIR.localSlots[i].stackOffset + slotSize
+        if slotEnd > offset:
+            offset = slotEnd
+    var align = alignBytes
+    if align <= 0:
+        align = 1
+    if align > 16:
+        align = 16
+    return ((offset + align - 1) / align) * align
+
+fn PrimaryBodyIrLocalSlotNewSized(bodyIR: var coreir.BodyIR,
+                                   slotId: int32,
+                                   name: str,
+                                   typeKind: int32,
+                                   sizeBytes: int32,
+                                   alignBytes: int32) =
     var ls: coreir.LocalSlot
     ls.id = slotId
     ls.name = name
     ls.typeKind = typeKind
-    ls.stackOffset = 16 + slotId * 16
     ls.ownership = coreir.OwnPlainTag
     ls.aliasClass = coreir.AliasUnknownTag
     ls.escapeKind = coreir.EscapeNoneTag
@@ -415,7 +436,18 @@ fn PrimaryBodyIrLocalSlotNew(bodyIR: var coreir.BodyIR,
     elif typeKind == coreir.LocalAggregateTag:
         ls.sizeBytes = coreir.ResultStrSizeBytes
         ls.alignBytes = coreir.ResultStrAlignBytes
+    if sizeBytes > 0:
+        ls.sizeBytes = sizeBytes
+    if alignBytes > 0:
+        ls.alignBytes = alignBytes
+    ls.stackOffset = PrimaryBodyIrNextLocalStackOffset(bodyIR, ls.sizeBytes, ls.alignBytes)
     add(bodyIR.localSlots, ls)
+
+fn PrimaryBodyIrLocalSlotNew(bodyIR: var coreir.BodyIR,
+                              slotId: int32,
+                              name: str,
+                              typeKind: int32) =
+    PrimaryBodyIrLocalSlotNewSized(bodyIR, slotId, name, typeKind, 0, 0)
 
 fn PrimaryBodyIrTypeKindFromText(typeRaw: str): int32 =
     let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
@@ -443,6 +475,33 @@ fn PrimaryBodyIrTypeKindFromText(typeRaw: str): int32 =
     if PrimaryStartsWith(normType, "Result["):
         return coreir.LocalAggregateTag
     return coreir.LocalI32Tag
+
+fn PrimaryBodyIrTypeShapeFromText(typedIr: texpr.TypedExprIr,
+                                   sourcePath: str,
+                                   typeRaw: str,
+                                   typeKind: var int32,
+                                   sizeBytes: var int32,
+                                   alignBytes: var int32) =
+    typeKind = PrimaryBodyIrTypeKindFromText(typeRaw)
+    sizeBytes = 0
+    alignBytes = 0
+    var layoutSize: int32
+    var layoutAlign: int32
+    var layoutFieldCount: int32
+    if !texpr.TypedExprIrLookupTypeLayout(typedIr,
+                                          sourcePath,
+                                          typeRaw,
+                                          layoutSize,
+                                          layoutAlign,
+                                          layoutFieldCount):
+        return
+    if layoutSize <= 0 || layoutAlign <= 0:
+        return
+    sizeBytes = layoutSize
+    alignBytes = layoutAlign
+    if typeKind == coreir.LocalI32Tag &&
+       (layoutFieldCount > 0 || layoutSize > 8):
+        typeKind = coreir.LocalAggregateTag
 
 fn PrimaryBodyIrTypeTextIsVarI32(typeRaw: str): bool =
     let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
@@ -477,6 +536,37 @@ fn PrimaryBodyIrFindOrCreateSlot(bodyIR: var coreir.BodyIR,
     add(slotNames, name)
     PrimaryBodyIrLocalSlotNew(bodyIR, newSlot, name, typeKind)
     return newSlot
+
+fn PrimaryBodyIrFindOrCreateSlotSized(bodyIR: var coreir.BodyIR,
+                                       slotNames: var str[],
+                                       name: str,
+                                       typeKind: int32,
+                                       sizeBytes: int32,
+                                       alignBytes: int32): int32 =
+    for i in 0..<slotNames.len:
+        if slotNames[i] == name:
+            return i
+    let newSlot = slotNames.len
+    add(slotNames, name)
+    PrimaryBodyIrLocalSlotNewSized(bodyIR, newSlot, name, typeKind, sizeBytes, alignBytes)
+    return newSlot
+
+fn PrimaryBodyIrFindOrCreateTypedSlot(bodyIR: var coreir.BodyIR,
+                                       slotNames: var str[],
+                                       typedIr: texpr.TypedExprIr,
+                                       sourcePath: str,
+                                       name: str,
+                                       typeRaw: str): int32 =
+    var typeKind: int32
+    var sizeBytes: int32
+    var alignBytes: int32
+    PrimaryBodyIrTypeShapeFromText(typedIr, sourcePath, typeRaw, typeKind, sizeBytes, alignBytes)
+    return PrimaryBodyIrFindOrCreateSlotSized(bodyIR,
+                                              slotNames,
+                                              name,
+                                              typeKind,
+                                              sizeBytes,
+                                              alignBytes)
 
 fn PrimaryBodyIrFindSlotIndex(slotNames: str[], name: str): int32 =
     for i in 0..<slotNames.len:
@@ -781,6 +871,7 @@ fn PrimaryBodyIrAppendTypedStrLiteralCondition(bodyIR: var coreir.BodyIR,
 
 fn PrimaryBodyIrSeedParamSlots(bodyIR: var coreir.BodyIR,
                                 slotNames: var str[],
+                                typedIr: texpr.TypedExprIr,
                                 irFunction: lower.PrimaryObjectIrFunction) =
     for paramIndex in 0..<irFunction.paramNames.len:
         if paramIndex >= irFunction.paramTypes.len:
@@ -788,10 +879,12 @@ fn PrimaryBodyIrSeedParamSlots(bodyIR: var coreir.BodyIR,
         let paramName = irFunction.paramNames[paramIndex]
         if len(paramName) <= 0:
             continue
-        let slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR,
-                                                   slotNames,
-                                                   paramName,
-                                                   PrimaryBodyIrTypeKindFromText(irFunction.paramTypes[paramIndex]))
+        let slotId = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                        slotNames,
+                                                        typedIr,
+                                                        irFunction.sourcePath,
+                                                        paramName,
+                                                        irFunction.paramTypes[paramIndex])
         PrimaryBodyIrMarkParamSlot(bodyIR, slotId, paramIndex)
 
 fn PrimaryBodyIrCollectVarI32ParamNames(irFunction: lower.PrimaryObjectIrFunction): str[] =
@@ -1321,10 +1414,12 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
             let valueByteCount = stmt.assignValueFieldSizeBytes
             if valueBaseSlot < 0 || valueByteCount <= 0 || valueByteCount != byteCount:
                 return false
-            valueSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
-                                                      slotNames,
-                                                      Fmt"{stmt.assignValueRootName}.{stmt.assignValueFieldName}#field_value",
-                                                      PrimaryBodyIrTypeKindFromText(stmt.assignValueFieldType))
+            valueSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                           slotNames,
+                                                           typedIr,
+                                                           stmt.sourcePath,
+                                                           Fmt"{stmt.assignValueRootName}.{stmt.assignValueFieldName}#field_value",
+                                                           stmt.assignValueFieldType)
             if PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < valueByteCount:
                 return false
             var loadOp: coreir.BodyOp
@@ -1377,7 +1472,12 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
             return false
         var valueSlot = PrimaryBodyIrFindArgSlot(slotNames, rhsText)
         if valueSlot < 0:
-            valueSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, rhsText, PrimaryBodyIrTypeKindFromText(stmt.resultType))
+            valueSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                           slotNames,
+                                                           typedIr,
+                                                           stmt.sourcePath,
+                                                           rhsText,
+                                                           stmt.resultType)
         if valueSlot < 0:
             return false
         var storeOp: coreir.BodyOp
@@ -1470,15 +1570,19 @@ fn PrimaryBuildBodyIrFromTypedStatements(
     pendingFalseTerm = -1
     skipStatementUntilIndex = -1
     completedReturnLineNumber = -1
-    PrimaryBodyIrSeedParamSlots(bodyIR, slotNames, irFunction)
+    PrimaryBodyIrSeedParamSlots(bodyIR, slotNames, typedIr, irFunction)
     let varI32ParamNames = PrimaryBodyIrCollectVarI32ParamNames(irFunction)
     for stmtIndex in typedFn.statementStart..<stmtEnd:
         if stmtIndex <= skipStatementUntilIndex:
             continue
         let stmt = typedIr.statements[stmtIndex]
         if stmt.kind == texpr.TypedExprIrStmtLocalDecl:
-            let slotType = PrimaryBodyIrTypeKindFromText(stmt.resultType)
-            let _ = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, stmt.bindingName, slotType)
+            let _ = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                       slotNames,
+                                                       typedIr,
+                                                       stmt.sourcePath,
+                                                       stmt.bindingName,
+                                                       stmt.resultType)
         elif stmt.kind == texpr.TypedExprIrStmtLetCall:
             var slotId: int32 = -1
             if len(stmt.bindingName) > 0:
@@ -1510,7 +1614,12 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                                      stmt.callTarget)
                 if targetFnIndex >= 0 && targetFnIndex < typedIr.functions.len:
                     resultTypeText = typedIr.functions[targetFnIndex].returnType
-                slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, stmt.bindingName, PrimaryBodyIrTypeKindFromText(resultTypeText))
+                slotId = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                            slotNames,
+                                                            typedIr,
+                                                            stmt.sourcePath,
+                                                            stmt.bindingName,
+                                                            resultTypeText)
             let targetStr = stmt.callTarget
             if len(targetStr) > 0:
                 let _ = PrimaryBodyIrAppendCallOp(bodyIR,
@@ -1555,10 +1664,12 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                         feedsSameLineCall = true
                         break
                 if feedsSameLineCall:
-                    resultSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
-                                                               slotNames,
-                                                               fullCallText,
-                                                               PrimaryBodyIrTypeKindFromText(stmt.resultType))
+                    resultSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                                    slotNames,
+                                                                    typedIr,
+                                                                    stmt.sourcePath,
+                                                                    fullCallText,
+                                                                    stmt.resultType)
                 let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                   slotNames,
                                                   typedIr,
@@ -1630,11 +1741,12 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                         dependencyName = PrimaryBodyIrCallFullText(callStmt)
                     if !strutil.Contains(rootStmt.callArgsText, dependencyName):
                         continue
-                    let resultTypeKind = PrimaryBodyIrTypeKindFromText(callStmt.resultType)
-                    let resultSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
-                                                                   slotNames,
-                                                                   dependencyName,
-                                                                   resultTypeKind)
+                    let resultSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                                        slotNames,
+                                                                        typedIr,
+                                                                        callStmt.sourcePath,
+                                                                        dependencyName,
+                                                                        callStmt.resultType)
                     let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                       slotNames,
                                                       typedIr,
@@ -1647,10 +1759,12 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 var rootResultName = rootStmt.bindingName
                 if len(rootResultName) <= 0:
                     rootResultName = PrimaryBodyIrCallFullText(rootStmt)
-                let rootResultSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
-                                                                   slotNames,
-                                                                   rootResultName,
-                                                                   rootResultTypeKind)
+                let rootResultSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                                        slotNames,
+                                                                        typedIr,
+                                                                        rootStmt.sourcePath,
+                                                                        rootResultName,
+                                                                        rootStmt.resultType)
                 let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                   slotNames,
                                                   typedIr,
@@ -1694,7 +1808,12 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                   true)
                 else:
                     let returnTypeKind = PrimaryBodyIrTypeKindFromText(typedFn.returnType)
-                    let valSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, valText, returnTypeKind)
+                    let valSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                                     slotNames,
+                                                                     typedIr,
+                                                                     typedFn.sourcePath,
+                                                                     valText,
+                                                                     typedFn.returnType)
                     PrimaryBodyIrAppendReturnTerm(bodyIR,
                                                   currentBlockStart,
                                                   valSlot,
@@ -4295,7 +4414,10 @@ fn PrimaryBodyIROpSizeAt(bodyIR: coreir.BodyIR,
            accessOffset % 4 == 0 &&
            valueOffset % 4 == 0:
             return count + (byteCount / 4) * 2
-        return 0
+        var extra = byteCount / 8
+        if byteCount % 8 > 0:
+            extra = extra + 1
+        return count + extra * 2
     return 0
 
 fn PrimaryBodyIROpSize(op: coreir.BodyOp): int32 =
