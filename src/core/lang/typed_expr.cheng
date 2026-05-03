@@ -272,6 +272,20 @@ type
         surfaceText: str
         bindingName: str
         resultType: str
+        assignRootName: str
+        assignRootType: str
+        assignFieldName: str
+        assignFieldType: str
+        assignFieldOffsetBytes: int32
+        assignFieldSizeBytes: int32
+        assignFieldAlignBytes: int32
+        assignValueRootName: str
+        assignValueRootType: str
+        assignValueFieldName: str
+        assignValueFieldType: str
+        assignValueFieldOffsetBytes: int32
+        assignValueFieldSizeBytes: int32
+        assignValueFieldAlignBytes: int32
         callTarget: str
         callTargetSourcePath: str
         callTargetImportc: bool
@@ -321,6 +335,14 @@ type
         name: str
         typeText: str
 
+    TypedExprTypeFieldDecl =
+        ownerType: str
+        fieldName: str
+        fieldType: str
+        offsetBytes: int32
+        sizeBytes: int32
+        alignBytes: int32
+
     TypedExprImportcFunction =
         sourcePath: str
         name: str
@@ -344,6 +366,7 @@ type
         importcFunctions: TypedExprImportcFunction[]
         importedModules: TypedExprImportedModule[]
         declaredTypes: str[]
+        typeFields: TypedExprTypeFieldDecl[]
         exprLineColumns: TypedExprLineExprColumns[]
 
     TypedExprSinkInfo =
@@ -826,6 +849,20 @@ fn TypedExprIrStatementClone(stmt: TypedExprIrStatement): TypedExprIrStatement =
     out.surfaceText = stmt.surfaceText
     out.bindingName = stmt.bindingName
     out.resultType = stmt.resultType
+    out.assignRootName = stmt.assignRootName
+    out.assignRootType = stmt.assignRootType
+    out.assignFieldName = stmt.assignFieldName
+    out.assignFieldType = stmt.assignFieldType
+    out.assignFieldOffsetBytes = stmt.assignFieldOffsetBytes
+    out.assignFieldSizeBytes = stmt.assignFieldSizeBytes
+    out.assignFieldAlignBytes = stmt.assignFieldAlignBytes
+    out.assignValueRootName = stmt.assignValueRootName
+    out.assignValueRootType = stmt.assignValueRootType
+    out.assignValueFieldName = stmt.assignValueFieldName
+    out.assignValueFieldType = stmt.assignValueFieldType
+    out.assignValueFieldOffsetBytes = stmt.assignValueFieldOffsetBytes
+    out.assignValueFieldSizeBytes = stmt.assignValueFieldSizeBytes
+    out.assignValueFieldAlignBytes = stmt.assignValueFieldAlignBytes
     out.callTarget = stmt.callTarget
     out.callTargetSourcePath = stmt.callTargetSourcePath
     out.callTargetImportc = stmt.callTargetImportc
@@ -4141,6 +4178,91 @@ fn TypedExprSplitTopLevelCsv(itemsRaw: str): str[] =
     add(out, TypedExprSliceTrim(itemsRaw, start, itemsRaw.len - start))
     return out
 
+fn TypedExprAlignBytes(value: int32, alignRaw: int32): int32 =
+    var align = alignRaw
+    if align <= 1:
+        return value
+    let rem = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn TypedExprStripVarType(typeRaw: str): str =
+    let typeText = TypedExprNormalizeTypeText(typeRaw)
+    if parser.ParserStartsWith(typeText, "var") && typeText.len > 3:
+        return chengpath.TextSlice(typeText, 3, typeText.len - 3)
+    return typeText
+
+fn TypedExprTypeLeafName(typeRaw: str): str =
+    let typeText = TypedExprStripVarType(typeRaw)
+    var start: int32
+    for i in 0..<typeText.len:
+        if typeText[i] == '.':
+            start = i + 1
+        elif i + 1 < typeText.len && typeText[i] == ':' && typeText[i + 1] == ':':
+            start = i + 2
+    if start > 0 && start < typeText.len:
+        return chengpath.TextSlice(typeText, start, typeText.len - start)
+    return typeText
+
+fn TypedExprTypeFieldDeclMatches(field: TypedExprTypeFieldDecl,
+                                  ownerTypeRaw: str,
+                                  fieldNameRaw: str): bool =
+    return field.ownerType == TypedExprTypeLeafName(ownerTypeRaw) &&
+           field.fieldName == parser.ParserIdentPrefix(chengpath.PathTrim(fieldNameRaw))
+
+fn TypedExprContextHasTypeField(ctx: var TypedExprSourceContext,
+                                 ownerTypeRaw: str): bool =
+    let ownerType = TypedExprTypeLeafName(ownerTypeRaw)
+    for i in 0..<ctx.typeFields.len:
+        if ctx.typeFields[i].ownerType == ownerType:
+            return true
+    return false
+
+fn TypedExprAddTypeFieldDecl(ctx: var TypedExprSourceContext,
+                              ownerTypeRaw: str,
+                              fieldNameRaw: str,
+                              fieldTypeRaw: str) =
+    let ownerType = TypedExprTypeLeafName(ownerTypeRaw)
+    let fieldName = parser.ParserIdentPrefix(chengpath.PathTrim(fieldNameRaw))
+    let fieldType = TypedExprNormalizeTypeText(fieldTypeRaw)
+    if ownerType == "" || fieldName == "" || fieldType == "":
+        return
+    var decl: TypedExprTypeFieldDecl
+    decl.ownerType = ownerType
+    decl.fieldName = fieldName
+    decl.fieldType = fieldType
+    add(ctx.typeFields, decl)
+
+fn TypedExprParseTypeFieldLine(lineRaw: str,
+                                fieldName: var str,
+                                fieldType: var str): bool =
+    fieldName = ""
+    fieldType = ""
+    let line = chengpath.PathTrim(parser.ParserStripLineComment(lineRaw))
+    if line == "":
+        return false
+    if TypedExprFindTopLevelToken(line, "=") >= 0:
+        return false
+    let colonPos = TypedExprFindTopLevelToken(line, ":")
+    if colonPos <= 0:
+        return false
+    fieldName = parser.ParserIdentPrefix(chengpath.TextSlice(line, 0, colonPos))
+    fieldType = TypedExprNormalizeTypeText(chengpath.TextSlice(line,
+                                                               colonPos + 1,
+                                                               line.len - colonPos - 1))
+    return fieldName != "" && fieldType != ""
+
+fn TypedExprFindTypeFieldDecl(ctx: var TypedExprSourceContext,
+                               ownerTypeRaw: str,
+                               fieldNameRaw: str,
+                               out: var TypedExprTypeFieldDecl): bool =
+    for i in 0..<ctx.typeFields.len:
+        if TypedExprTypeFieldDeclMatches(ctx.typeFields[i], ownerTypeRaw, fieldNameRaw):
+            out = ctx.typeFields[i]
+            return true
+    return false
+
 fn TypedExprMaybeAddBinding(bindings: var TypedExprBinding[],
                               sourcePath: str,
                               functionName: str,
@@ -4376,6 +4498,309 @@ fn TypedExprSourceContextLookup(sourceContexts: var TypedExprSourceContext[],
         if sourceContexts[i].sourcePath == sourcePath:
             return i
     return -1
+
+fn TypedExprFieldContextLookup(currentCtx: var TypedExprSourceContext,
+                                sourceContexts: var TypedExprSourceContext[],
+                                ownerTypeRaw: str): int32 =
+    let ownerType = TypedExprTypeLeafName(ownerTypeRaw)
+    let typeText = TypedExprStripVarType(ownerTypeRaw)
+    let dotPos = TypedExprQualifiedTypeDot(typeText)
+    if dotPos > 0:
+        let qualifier = chengpath.PathTrim(chengpath.TextSlice(typeText, 0, dotPos))
+        let targetPath = TypedExprLookupQualifiedModuleSourcePath(currentCtx,
+                                                                  sourceContexts,
+                                                                  qualifier)
+        let targetIndex = TypedExprSourceContextLookup(sourceContexts, targetPath)
+        if targetIndex >= 0 && TypedExprContextHasTypeField(sourceContexts[targetIndex], ownerType):
+            return targetIndex
+        return -1
+    if TypedExprContextHasTypeField(currentCtx, ownerType):
+        return -2
+    var found: int32 = -1
+    for i in 0..<sourceContexts.len:
+        if !TypedExprContextHasTypeField(sourceContexts[i], ownerType):
+            continue
+        if found >= 0:
+            return -1
+        found = i
+    return found
+
+fn TypedExprTypeLayoutImpl(currentCtx: var TypedExprSourceContext,
+                            sourceContexts: var TypedExprSourceContext[],
+                            typeRaw: str,
+                            sizeBytes: var int32,
+                            alignBytes: var int32,
+                            depth: int32): bool =
+    sizeBytes = 0
+    alignBytes = 0
+    if depth > 64:
+        return false
+    let typeText = TypedExprStripVarType(typeRaw)
+    if typeText == "":
+        return false
+    if typeText == "bool" || typeText == "int8" || typeText == "uint8" || typeText == "u8":
+        sizeBytes = 1
+        alignBytes = 1
+        return true
+    if typeText == "int16" || typeText == "uint16" || typeText == "u16":
+        sizeBytes = 2
+        alignBytes = 2
+        return true
+    if typeText == "int32" || typeText == "int" ||
+       typeText == "uint32" || typeText == "u32" ||
+       typeText == "char":
+        sizeBytes = 4
+        alignBytes = 4
+        return true
+    if typeText == "int64" || typeText == "uint64" ||
+       typeText == "u64" || typeText == "float32" ||
+       typeText == "float64":
+        sizeBytes = 8
+        alignBytes = 8
+        return true
+    if typeText == "ptr" || typeText == "cstring" ||
+       parser.ParserStartsWith(typeText, "ref"):
+        sizeBytes = 8
+        alignBytes = 8
+        return true
+    if typeText == "str":
+        sizeBytes = 24
+        alignBytes = 8
+        return true
+    if typeText == "Bytes" || typeText == "bytes.Bytes" || typeText == "rawbytes.Bytes":
+        sizeBytes = 16
+        alignBytes = 8
+        return true
+    if typeText == "FixedBytes32" || typeText == "layout.FixedBytes32" || typeText == "bytes_layout.FixedBytes32":
+        sizeBytes = 32
+        alignBytes = 1
+        return true
+    if typeText == "FixedBytes64" || typeText == "layout.FixedBytes64" || typeText == "bytes_layout.FixedBytes64":
+        sizeBytes = 64
+        alignBytes = 1
+        return true
+    if typeText == "FixedBytes65" || typeText == "layout.FixedBytes65" || typeText == "bytes_layout.FixedBytes65":
+        sizeBytes = 65
+        alignBytes = 1
+        return true
+    if typeText.len >= 2 && chengpath.TextSlice(typeText, typeText.len - 2, 2) == "[]":
+        sizeBytes = 16
+        alignBytes = 8
+        return true
+    if parser.ParserStartsWith(typeText, "seq[") ||
+       parser.ParserStartsWith(typeText, "array["):
+        sizeBytes = 16
+        alignBytes = 8
+        return true
+    if parser.ParserStartsWith(typeText, "Result[") &&
+       typeText.len > 8 &&
+       chengpath.TextSlice(typeText, typeText.len - 1, 1) == "]":
+        let inner = chengpath.TextSlice(typeText, 7, typeText.len - 8)
+        var valueSize: int32
+        var valueAlign: int32
+        var errSize: int32
+        var errAlign: int32
+        if !TypedExprTypeLayoutImpl(currentCtx, sourceContexts, inner, valueSize, valueAlign, depth + 1):
+            return false
+        if !TypedExprTypeLayoutImpl(currentCtx, sourceContexts, "ErrorInfo", errSize, errAlign, depth + 1):
+            return false
+        let valueOffset = TypedExprAlignBytes(1, valueAlign)
+        let errOffset = TypedExprAlignBytes(valueOffset + valueSize, errAlign)
+        alignBytes = valueAlign
+        if errAlign > alignBytes:
+            alignBytes = errAlign
+        if alignBytes <= 0:
+            alignBytes = 1
+        sizeBytes = TypedExprAlignBytes(errOffset + errSize, alignBytes)
+        return true
+    let ctxIndex = TypedExprFieldContextLookup(currentCtx, sourceContexts, typeText)
+    var ownerCtx = currentCtx
+    if ctxIndex >= 0:
+        ownerCtx = sourceContexts[ctxIndex]
+    elif ctxIndex != -2:
+        if TypedExprSourceHasDeclaredType(currentCtx, TypedExprTypeLeafName(typeText)):
+            sizeBytes = 4
+            alignBytes = 4
+            return true
+        return false
+    if !TypedExprContextHasTypeField(ownerCtx, typeText):
+        if TypedExprSourceHasDeclaredType(ownerCtx, TypedExprTypeLeafName(typeText)):
+            sizeBytes = 4
+            alignBytes = 4
+            return true
+        return false
+    var offset: int32
+    var maxAlign: int32 = 1
+    let ownerType = TypedExprTypeLeafName(typeText)
+    for i in 0..<ownerCtx.typeFields.len:
+        let field = ownerCtx.typeFields[i]
+        if field.ownerType != ownerType:
+            continue
+        var fieldSize: int32
+        var fieldAlign: int32
+        if !TypedExprTypeLayoutImpl(ownerCtx, sourceContexts, field.fieldType, fieldSize, fieldAlign, depth + 1):
+            return false
+        if fieldAlign <= 0:
+            fieldAlign = 1
+        offset = TypedExprAlignBytes(offset, fieldAlign)
+        offset = offset + fieldSize
+        if fieldAlign > maxAlign:
+            maxAlign = fieldAlign
+    sizeBytes = TypedExprAlignBytes(offset, maxAlign)
+    alignBytes = maxAlign
+    return true
+
+fn TypedExprTypeLayout(currentCtx: var TypedExprSourceContext,
+                        sourceContexts: var TypedExprSourceContext[],
+                        typeRaw: str,
+                        sizeBytes: var int32,
+                        alignBytes: var int32): bool =
+    return TypedExprTypeLayoutImpl(currentCtx, sourceContexts, typeRaw, sizeBytes, alignBytes, 0)
+
+fn TypedExprResolveFieldMeta(currentCtx: var TypedExprSourceContext,
+                              sourceContexts: var TypedExprSourceContext[],
+                              baseTypeRaw: str,
+                              fieldNameRaw: str,
+                              fieldType: var str,
+                              fieldOffsetBytes: var int32,
+                              fieldSizeBytes: var int32,
+                              fieldAlignBytes: var int32): bool =
+    fieldType = ""
+    fieldOffsetBytes = 0
+    fieldSizeBytes = 0
+    fieldAlignBytes = 0
+    let baseType = TypedExprStripVarType(baseTypeRaw)
+    let fieldName = parser.ParserIdentPrefix(chengpath.PathTrim(fieldNameRaw))
+    if fieldName == "":
+        return false
+    if baseType == "str":
+        if fieldName == "data":
+            fieldType = "ptr"
+            fieldOffsetBytes = 0
+        elif fieldName == "len":
+            fieldType = "int32"
+            fieldOffsetBytes = 8
+        elif fieldName == "storeId" || fieldName == "store_id":
+            fieldType = "int32"
+            fieldOffsetBytes = 12
+        elif fieldName == "flags":
+            fieldType = "int32"
+            fieldOffsetBytes = 16
+        else:
+            return false
+        return TypedExprTypeLayout(currentCtx, sourceContexts, fieldType, fieldSizeBytes, fieldAlignBytes)
+    if baseType == "Bytes" || baseType == "bytes.Bytes" || baseType == "rawbytes.Bytes":
+        if fieldName == "data":
+            fieldType = "ptr"
+            fieldOffsetBytes = 0
+        elif fieldName == "len":
+            fieldType = "int32"
+            fieldOffsetBytes = 8
+        else:
+            return false
+        return TypedExprTypeLayout(currentCtx, sourceContexts, fieldType, fieldSizeBytes, fieldAlignBytes)
+    if baseType.len >= 2 && chengpath.TextSlice(baseType, baseType.len - 2, 2) == "[]":
+        if fieldName == "len":
+            fieldType = "int32"
+            fieldOffsetBytes = 0
+        elif fieldName == "cap":
+            fieldType = "int32"
+            fieldOffsetBytes = 4
+        elif fieldName == "buffer":
+            fieldType = "ptr"
+            fieldOffsetBytes = 8
+        else:
+            return false
+        return TypedExprTypeLayout(currentCtx, sourceContexts, fieldType, fieldSizeBytes, fieldAlignBytes)
+    if parser.ParserStartsWith(baseType, "Result[") &&
+       baseType.len > 8 &&
+       chengpath.TextSlice(baseType, baseType.len - 1, 1) == "]":
+        let inner = chengpath.TextSlice(baseType, 7, baseType.len - 8)
+        var valueSize: int32
+        var valueAlign: int32
+        if !TypedExprTypeLayout(currentCtx, sourceContexts, inner, valueSize, valueAlign):
+            return false
+        if fieldName == "ok":
+            fieldType = "bool"
+            fieldOffsetBytes = 0
+        elif fieldName == "value":
+            fieldType = inner
+            fieldOffsetBytes = TypedExprAlignBytes(1, valueAlign)
+        elif fieldName == "err" || fieldName == "error":
+            var errSize: int32
+            var errAlign: int32
+            if !TypedExprTypeLayout(currentCtx, sourceContexts, "ErrorInfo", errSize, errAlign):
+                return false
+            fieldType = "ErrorInfo"
+            fieldOffsetBytes = TypedExprAlignBytes(TypedExprAlignBytes(1, valueAlign) + valueSize, errAlign)
+        else:
+            return false
+        return TypedExprTypeLayout(currentCtx, sourceContexts, fieldType, fieldSizeBytes, fieldAlignBytes)
+    let ctxIndex = TypedExprFieldContextLookup(currentCtx, sourceContexts, baseType)
+    var ownerCtx = currentCtx
+    if ctxIndex >= 0:
+        ownerCtx = sourceContexts[ctxIndex]
+    elif ctxIndex != -2:
+        return false
+    let ownerType = TypedExprTypeLeafName(baseType)
+    var offset: int32
+    for i in 0..<ownerCtx.typeFields.len:
+        let field = ownerCtx.typeFields[i]
+        if field.ownerType != ownerType:
+            continue
+        var size: int32
+        var align: int32
+        if !TypedExprTypeLayout(ownerCtx, sourceContexts, field.fieldType, size, align):
+            return false
+        if align <= 0:
+            align = 1
+        offset = TypedExprAlignBytes(offset, align)
+        if field.fieldName == fieldName:
+            fieldType = field.fieldType
+            fieldOffsetBytes = offset
+            fieldSizeBytes = size
+            fieldAlignBytes = align
+            return true
+        offset = offset + size
+    return false
+
+fn TypedExprResolveFieldPathMeta(currentCtx: var TypedExprSourceContext,
+                                  sourceContexts: var TypedExprSourceContext[],
+                                  rootTypeRaw: str,
+                                  fieldPathRaw: str,
+                                  fieldType: var str,
+                                  fieldOffsetBytes: var int32,
+                                  fieldSizeBytes: var int32,
+                                  fieldAlignBytes: var int32): bool =
+    fieldType = TypedExprStripVarType(rootTypeRaw)
+    fieldOffsetBytes = 0
+    fieldSizeBytes = 0
+    fieldAlignBytes = 0
+    let parts = parser.ParserSplitChar(chengpath.PathTrim(fieldPathRaw), '.')
+    if parts.len <= 0:
+        return false
+    for i in 0..<parts.len:
+        let part = parser.ParserIdentPrefix(parts[i])
+        if part == "":
+            return false
+        var nextType = ""
+        var nextOffset: int32
+        var nextSize: int32
+        var nextAlign: int32
+        if !TypedExprResolveFieldMeta(currentCtx,
+                                      sourceContexts,
+                                      fieldType,
+                                      part,
+                                      nextType,
+                                      nextOffset,
+                                      nextSize,
+                                      nextAlign):
+            return false
+        fieldOffsetBytes = fieldOffsetBytes + nextOffset
+        fieldType = nextType
+        fieldSizeBytes = nextSize
+        fieldAlignBytes = nextAlign
+    return true
 
 fn TypedExprSourceLine(ctx: var TypedExprSourceContext,
                          lineNumber: int32): str =
@@ -5239,6 +5664,8 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
                                        bindingName,
                                        bindingType)
     var inTypeBlock = false
+    var currentTypeName = ""
+    var currentTypeIndent: int32
     for i in 0..<ctx.lines.len:
         let rawLine = ctx.lines[i]
         let trimmed = chengpath.PathTrim(parser.ParserStripLineComment(rawLine))
@@ -5246,15 +5673,26 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
             if trimmed == "":
                 continue
             inTypeBlock = trimmed == "type"
+            currentTypeName = ""
+            currentTypeIndent = 0
             continue
         if !inTypeBlock:
             continue
+        let lineIndent = TypedExprLineIndentWidth(rawLine)
         let declaredType = TypedExprParseTypeDeclName(trimmed)
-        if declaredType == "":
+        if declaredType != "":
+            currentTypeName = declaredType
+            currentTypeIndent = lineIndent
+            if parser.ParserStringSeqContainsExact(ctx.declaredTypes, declaredType):
+                continue
+            add(ctx.declaredTypes, declaredType)
             continue
-        if parser.ParserStringSeqContainsExact(ctx.declaredTypes, declaredType):
+        if currentTypeName == "" || lineIndent <= currentTypeIndent:
             continue
-        add(ctx.declaredTypes, declaredType)
+        var fieldName = ""
+        var fieldType = ""
+        if TypedExprParseTypeFieldLine(trimmed, fieldName, fieldType):
+            TypedExprAddTypeFieldDecl(ctx, currentTypeName, fieldName, fieldType)
     if source.workspaceRoot != "" && source.packageRoot != "":
         let ownerModulePath = parser.ParserSourcePathToModulePathWithExternalPackageRoots(source.workspaceRoot,
                                                                                              source.packageRoot,
@@ -5673,6 +6111,7 @@ fn TypedExprStructuredExprComesBeforeFact(expr: parser.NormalizedExpr,
 
 fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
                                                              ctx: var TypedExprSourceContext,
+                                                             sourceContexts: var TypedExprSourceContext[],
                                                              scope: TypedExprFunctionScope,
                                                              facts: var TypedExprFact[],
                                                              factStartIndex: int32,
@@ -5830,6 +6269,7 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
             elif expr.kind == parser.NormalizedExprAssign:
                 let _ = TypedExprIrAddAssignStatementFromExpr(ir,
                                                               ctx,
+                                                              sourceContexts,
                                                               scope,
                                                               expr,
                                                               currentLineIndent,
@@ -6038,6 +6478,7 @@ fn TypedExprIrAddControlStatementFromExpr(ir: var TypedExprIr,
 
 fn TypedExprIrAddAssignStatementFromExpr(ir: var TypedExprIr,
                                           ctx: var TypedExprSourceContext,
+                                          sourceContexts: var TypedExprSourceContext[],
                                           scope: TypedExprFunctionScope,
                                           expr: parser.NormalizedExpr,
                                           lineIndent: int32,
@@ -6263,6 +6704,7 @@ fn TypedExprIrAppendStatementsForScopeFromExprLayer(ir: var TypedExprIr,
         if expr.kind == parser.NormalizedExprAssign:
             let _ = TypedExprIrAddAssignStatementFromExpr(ir,
                                                           ctx,
+                                                          sourceContexts,
                                                           scope,
                                                           expr,
                                                           currentLineIndent,
