@@ -570,6 +570,19 @@ fn LoweringCallArgNames(callArgsText: str): str[] =
             add(out, name)
     return out
 
+fn LoweringReturnExprMatchesCallFact(returnExprRaw: str,
+                                      fact: ccsg.TypedExprFact): bool =
+    let returnExpr = chengpath.PathTrim(returnExprRaw)
+    if len(returnExpr) <= 0:
+        return false
+    var surface = fact.callCallee
+    if len(fact.callQualifier) > 0:
+        surface = Fmt"{fact.callQualifier}.{fact.callCallee}"
+    var expected = Fmt"{surface}()"
+    if fact.callArgCount > 0:
+        expected = Fmt"{surface}({chengpath.PathTrim(fact.callArgsText)})"
+    return returnExpr == expected
+
 fn LoweringReturnCallArgsPassThrough(sourceTexts: texpr.TypedExprSourceText[],
                                       sourcePath: str,
                                       functionName: str,
@@ -1003,7 +1016,16 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                             break
         if callIndex >= 0:
             let fact = plan.typedExprFacts[callIndex]
-            if fact.returnRoot:
+            var directReturnRoot = fact.returnRoot
+            if !directReturnRoot &&
+               typedFnIndex >= 0 &&
+               typedFnIndex < plan.typedIr.functions.len:
+                let returnTypedFn = plan.typedIr.functions[typedFnIndex]
+                if texpr.TypedExprNormalizeTypeText(returnTypedFn.returnType) == "int32" &&
+                   fact.lineNumber == bodyLineNumber &&
+                   LoweringReturnExprMatchesCallFact(returnTypedFn.returnExpr, fact):
+                    directReturnRoot = true
+            if directReturnRoot:
                 if letCallReturnKind == texpr.BodyKindUnsupported:
                     if LoweringReturnCallArgsPassThrough(sourceTexts, sourcePath, functionName, fact.callArgsText, fact.callArgCount):
                         var firstImportcSymbol = ""
