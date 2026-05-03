@@ -63,6 +63,15 @@ type
         firstMissingBodyIrFirstZeroOpOperand0: int32
         firstMissingBodyIrFirstZeroOpOperand1: int32
         firstMissingBodyIrFirstZeroOpOperand2: int32
+        firstMissingBodyIrFirstZeroOpOperand3: int32
+        firstMissingBodyIrFirstZeroBaseSlotName: str
+        firstMissingBodyIrFirstZeroBaseSlotType: int32
+        firstMissingBodyIrFirstZeroBaseSlotSize: int32
+        firstMissingBodyIrFirstZeroBaseSlotOffset: int32
+        firstMissingBodyIrFirstZeroValueSlotName: str
+        firstMissingBodyIrFirstZeroValueSlotType: int32
+        firstMissingBodyIrFirstZeroValueSlotSize: int32
+        firstMissingBodyIrFirstZeroValueSlotOffset: int32
         firstMissingBodyIrFirstZeroTermIndex: int32
         firstMissingBodyIrFirstZeroTermKind: int32
         firstMissingCallTargetOrdinal: int32
@@ -404,6 +413,23 @@ fn PrimaryBodyIrNextLocalStackOffset(bodyIR: coreir.BodyIR,
         align = 16
     return ((offset + align - 1) / align) * align
 
+fn PrimaryBodyIrReflowLocalStackOffsets(bodyIR: var coreir.BodyIR) =
+    var offset: int32 = 16
+    for i in 0..<bodyIR.localSlots.len:
+        if PrimaryBodyIrLocalIsParam(bodyIR.localSlots[i]):
+            continue
+        let slotSize = PrimaryLocalSlotSizeOf(bodyIR.localSlots[i])
+        if slotSize <= 0:
+            continue
+        var align = bodyIR.localSlots[i].alignBytes
+        if align <= 0:
+            align = 1
+        if align > 16:
+            align = 16
+        offset = ((offset + align - 1) / align) * align
+        bodyIR.localSlots[i].stackOffset = offset
+        offset = offset + slotSize
+
 fn PrimaryBodyIrLocalSlotNewSized(bodyIR: var coreir.BodyIR,
                                    slotId: int32,
                                    name: str,
@@ -545,6 +571,25 @@ fn PrimaryBodyIrFindOrCreateSlotSized(bodyIR: var coreir.BodyIR,
                                        alignBytes: int32): int32 =
     for i in 0..<slotNames.len:
         if slotNames[i] == name:
+            if i < bodyIR.localSlots.len && sizeBytes > 0 && alignBytes > 0:
+                var slot = bodyIR.localSlots[i]
+                let currentSize = PrimaryLocalSlotSizeOf(slot)
+                var changed = false
+                if currentSize < sizeBytes:
+                    slot.sizeBytes = sizeBytes
+                    changed = true
+                if slot.alignBytes < alignBytes:
+                    slot.alignBytes = alignBytes
+                    changed = true
+                if slot.typeKind != typeKind &&
+                   (slot.typeKind == coreir.LocalI32Tag ||
+                    slot.typeKind == coreir.LocalAggregateTag ||
+                    typeKind == coreir.LocalAggregateTag):
+                    slot.typeKind = typeKind
+                    changed = true
+                if changed:
+                    bodyIR.localSlots[i] = slot
+                    PrimaryBodyIrReflowLocalStackOffsets(bodyIR)
             return i
     let newSlot = slotNames.len
     add(slotNames, name)
@@ -4665,6 +4710,24 @@ fn PrimaryObjectPlanCaptureBodyIrDetails(plan: var PrimaryObjectPlan,
             plan.firstMissingBodyIrFirstZeroOpOperand1 = op.operands[1]
         if op.operands.len > 2:
             plan.firstMissingBodyIrFirstZeroOpOperand2 = op.operands[2]
+        if op.operands.len > 3:
+            plan.firstMissingBodyIrFirstZeroOpOperand3 = op.operands[3]
+        if op.operands.len > 0:
+            let baseSlot = op.operands[0]
+            if baseSlot >= 0 && baseSlot < bodyIR.localSlots.len:
+                let slot = bodyIR.localSlots[baseSlot]
+                plan.firstMissingBodyIrFirstZeroBaseSlotName = slot.name
+                plan.firstMissingBodyIrFirstZeroBaseSlotType = slot.typeKind
+                plan.firstMissingBodyIrFirstZeroBaseSlotSize = PrimaryLocalSlotSizeOf(slot)
+                plan.firstMissingBodyIrFirstZeroBaseSlotOffset = slot.stackOffset
+        if op.operands.len > 1:
+            let valueSlot = op.operands[1]
+            if valueSlot >= 0 && valueSlot < bodyIR.localSlots.len:
+                let slot = bodyIR.localSlots[valueSlot]
+                plan.firstMissingBodyIrFirstZeroValueSlotName = slot.name
+                plan.firstMissingBodyIrFirstZeroValueSlotType = slot.typeKind
+                plan.firstMissingBodyIrFirstZeroValueSlotSize = PrimaryLocalSlotSizeOf(slot)
+                plan.firstMissingBodyIrFirstZeroValueSlotOffset = slot.stackOffset
         break
     for termIndex in 0..<bodyIR.terms.len:
         if PrimaryBodyIRTermSize(bodyIR, termIndex) > 0:

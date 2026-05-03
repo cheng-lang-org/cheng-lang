@@ -63,6 +63,8 @@ type
         resolvedCallFactEntryLineNumbers: int32[]
         resolvedCallFactEntryFactIndexes: int32[]
         typedFunctionIndexSourcePaths: str[]
+        typedFunctionIndexSourceBucketHeads: int32[]
+        typedFunctionIndexSourceEntryNext: int32[]
         typedFunctionIndexBucketHeads: int32[]
         typedFunctionIndexEntryNext: int32[]
         typedFunctionIndexEntrySourceIndexes: int32[]
@@ -226,12 +228,26 @@ fn LoweringTypedFunctionIndexBucket(sourceIndex: int32,
         return -1
     return ((sourceIndex + 1) * 131 + len(functionName) * 17) & (bucketCount - 1)
 
-fn LoweringTypedFunctionIndexSourceIndex(sourcePaths: str[],
-                                          sourcePath: str): int32 =
+fn LoweringTypedFunctionIndexSourceBucket(sourcePath: str,
+                                           bucketCount: int32): int32 =
+    if len(sourcePath) <= 0 || bucketCount <= 0:
+        return -1
+    return parser.ParserTextLookupContentHash(sourcePath) & (bucketCount - 1)
+
+fn LoweringTypedFunctionIndexSourceIndexInPlan(plan: LoweringPlanStub,
+                                                sourcePath: str): int32 =
     let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
-    for i in 0..<sourcePaths.len:
-        if sourcePaths[i] == normalizedSourcePath:
-            return i
+    let bucket = LoweringTypedFunctionIndexSourceBucket(normalizedSourcePath,
+                                                        plan.typedFunctionIndexSourceBucketHeads.len)
+    if bucket < 0:
+        return -1
+    var entryIndex = plan.typedFunctionIndexSourceBucketHeads[bucket]
+    while entryIndex >= 0:
+        if entryIndex >= plan.typedFunctionIndexSourcePaths.len:
+            return -1
+        if plan.typedFunctionIndexSourcePaths[entryIndex] == normalizedSourcePath:
+            return entryIndex
+        entryIndex = plan.typedFunctionIndexSourceEntryNext[entryIndex]
     return -1
 
 fn LoweringTypedFunctionIndexFindOrAddSource(plan: var LoweringPlanStub,
@@ -239,11 +255,18 @@ fn LoweringTypedFunctionIndexFindOrAddSource(plan: var LoweringPlanStub,
     let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
     if len(normalizedSourcePath) <= 0:
         return -1
-    for i in 0..<plan.typedFunctionIndexSourcePaths.len:
-        if plan.typedFunctionIndexSourcePaths[i] == normalizedSourcePath:
-            return i
+    let existingIndex = LoweringTypedFunctionIndexSourceIndexInPlan(plan, normalizedSourcePath)
+    if existingIndex >= 0:
+        return existingIndex
+    let bucket = LoweringTypedFunctionIndexSourceBucket(normalizedSourcePath,
+                                                        plan.typedFunctionIndexSourceBucketHeads.len)
+    if bucket < 0:
+        return -1
+    let sourceIndex = plan.typedFunctionIndexSourcePaths.len
     add(plan.typedFunctionIndexSourcePaths, normalizedSourcePath)
-    return plan.typedFunctionIndexSourcePaths.len - 1
+    add(plan.typedFunctionIndexSourceEntryNext, plan.typedFunctionIndexSourceBucketHeads[bucket])
+    plan.typedFunctionIndexSourceBucketHeads[bucket] = sourceIndex
+    return sourceIndex
 
 fn LoweringBuildTypedFunctionIndexAdd(plan: var LoweringPlanStub,
                                        bucketTails: var int32[],
@@ -268,6 +291,8 @@ fn LoweringBuildTypedFunctionIndexAdd(plan: var LoweringPlanStub,
 
 fn LoweringBuildTypedFunctionIndex(plan: var LoweringPlanStub) =
     plan.typedFunctionIndexSourcePaths = []
+    plan.typedFunctionIndexSourceBucketHeads = []
+    plan.typedFunctionIndexSourceEntryNext = []
     plan.typedFunctionIndexBucketHeads = []
     plan.typedFunctionIndexEntryNext = []
     plan.typedFunctionIndexEntrySourceIndexes = []
@@ -276,6 +301,7 @@ fn LoweringBuildTypedFunctionIndex(plan: var LoweringPlanStub) =
     let bucketCount = LoweringTypedFunctionIndexBucketCount(plan.typedIr.functions.len)
     var bucketTails: int32[]
     for bucketIndex in 0..<bucketCount:
+        add(plan.typedFunctionIndexSourceBucketHeads, -1)
         add(plan.typedFunctionIndexBucketHeads, -1)
         add(bucketTails, -1)
     for functionIndex in 0..<plan.typedIr.functions.len:
@@ -292,7 +318,7 @@ fn LoweringPlanTypedIrFunctionIndexByName(plan: LoweringPlanStub,
                                            functionName: str): int32 =
     if len(functionName) <= 0:
         return -1
-    let sourceIndex = LoweringTypedFunctionIndexSourceIndex(plan.typedFunctionIndexSourcePaths, sourcePath)
+    let sourceIndex = LoweringTypedFunctionIndexSourceIndexInPlan(plan, sourcePath)
     let bucket = LoweringTypedFunctionIndexBucket(sourceIndex,
                                                   functionName,
                                                   plan.typedFunctionIndexBucketHeads.len)
@@ -1579,7 +1605,11 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
                                                                   sourcePath,
                                                                   sourceText))
     var typedIrErr = ""
-    if !texpr.TypedExprBuildIrWithFacts(typedSourceTexts, plan.typedExprFacts, plan.typedIr, typedIrErr):
+    if !texpr.TypedExprBuildIrWithFactsAndExprLayer(typedSourceTexts,
+                                                     plan.typedExprFacts,
+                                                     plan.exprLayer,
+                                                     plan.typedIr,
+                                                     typedIrErr):
         err = typedIrErr
         return false
     LoweringBuildTypedFunctionIndex(plan)

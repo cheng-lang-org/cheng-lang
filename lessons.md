@@ -1,5 +1,7 @@
 # Lessons
 
+- 2026-05-03: primary object 不能把 `T[]`、object、Result 这类复合类型继续落成默认 i32；typed_expr 必须输出确定 type layout，BodyIR slot 要用 layout size/align 分配非重叠栈槽，否则 `parsed.field` 这类 FieldLoad 会在 primary word count 阶段硬失败。
+- 2026-05-03: typed expr 里带 `callQualifier` 的调用必须强制走 import alias 解析，不能因为 `callTargetSourcePath` 已被 parser/CSG 预填为当前 source 就跳过；alias 解析失败要暴露 `unknown_qualified_target`，不能用全局同名函数扫描兜底。
 - 2026-05-02: C seed 只是一段临时引导工具，不能把优化 1108 item 的 C seed 全量编译当主线；正确路径是打穿 backend driver 自举 47 item 卡点，让原生 driver 接管全量闭包后再兑现 lowering hashmap、函数级并行和增量缓存。
 - 2026-05-02: 并行推进时不要杀其它助手/用户进程；发现同类 build/system-link-exec 进程只能避开共享输出、等待或报告冲突，必须相互配合。
 - 2026-05-02: 用户要找“某版文档”时，不能只按最早提交或近似描述还原；必须先用用户给出的精确短语全历史搜索，确认命中提交后再改文件。

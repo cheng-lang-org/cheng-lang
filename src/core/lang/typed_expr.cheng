@@ -113,6 +113,7 @@ type
         TypedExprIrOpStrI32GuardArg0Return0
         TypedExprIrOpCstringToStrCopy
         TypedExprIrOpIfCall
+        TypedExprIrOpLocalBoolEnumTernary
 
     TypedExprIrStatementKind = enum
         TypedExprIrStmtUnsupported
@@ -233,6 +234,11 @@ type
         sourcePath: str
         text: str
 
+    TypedExprSourceRangeIndex =
+        sourcePaths: str[]
+        starts: int32[]
+        ends: int32[]
+
     TypedExprReturnOpFact =
         sourcePath: str
         functionName: str
@@ -337,6 +343,15 @@ type
         importcSourcePaths: str[]
         importcNames: str[]
         importcReturnTypes: str[]
+        typeLayoutSourcePaths: str[]
+        typeLayoutNames: str[]
+        typeLayoutSizeBytes: int32[]
+        typeLayoutAlignBytes: int32[]
+        typeLayoutFieldCounts: int32[]
+        enumValueSourcePaths: str[]
+        enumValueNames: str[]
+        enumValueTypes: str[]
+        enumValueOrdinals: int32[]
 
     TypedExprFunctionScope =
         sourcePath: str
@@ -383,6 +398,7 @@ type
 
     TypedExprSourceContext =
         sourcePath: str
+        normalizedSourcePath: str
         lines: str[]
         scopes: TypedExprFunctionScope[]
         bindings: TypedExprBinding[]
@@ -390,6 +406,9 @@ type
         importedModules: TypedExprImportedModule[]
         declaredTypes: str[]
         typeFields: TypedExprTypeFieldDecl[]
+        enumValueNames: str[]
+        enumValueTypes: str[]
+        enumValueOrdinals: int32[]
         exprLineColumns: TypedExprLineExprColumns[]
 
     TypedExprSinkInfo =
@@ -479,6 +498,8 @@ const
     TypedExprIrCondNone = 0
     TypedExprIrCondStrEqLiteral = 1
     TypedExprIrCondStrNeLiteral = 2
+    TypedExprIrCondStrEqLocal = 3
+    TypedExprIrCondStrNeLocal = 4
 
 fn TypedExprIsReturnCallBodyKind(bodyKind: str): bool =
     return bodyKind == BodyKindReturnCallNoargI32 ||
@@ -821,6 +842,8 @@ fn TypedExprIrOpKindText(kind: TypedExprIrOpKind): str =
         return "let_call_str_then_call_arg0_return_i32_const_0"
     if kind == TypedExprIrOpCstringToStrCopy:
         return "cstring_to_str_copy"
+    if kind == TypedExprIrOpLocalBoolEnumTernary:
+        return "local_bool_enum_ternary"
     return "unsupported"
 
 fn TypedExprIrStatementKindText(kind: TypedExprIrStatementKind): str =
@@ -968,6 +991,24 @@ fn TypedExprIrClone(ir: var TypedExprIr): TypedExprIr =
         add(out.importcNames, ir.importcNames[i])
     for i in 0..<ir.importcReturnTypes.len:
         add(out.importcReturnTypes, ir.importcReturnTypes[i])
+    for i in 0..<ir.typeLayoutSourcePaths.len:
+        add(out.typeLayoutSourcePaths, ir.typeLayoutSourcePaths[i])
+    for i in 0..<ir.typeLayoutNames.len:
+        add(out.typeLayoutNames, ir.typeLayoutNames[i])
+    for i in 0..<ir.typeLayoutSizeBytes.len:
+        add(out.typeLayoutSizeBytes, ir.typeLayoutSizeBytes[i])
+    for i in 0..<ir.typeLayoutAlignBytes.len:
+        add(out.typeLayoutAlignBytes, ir.typeLayoutAlignBytes[i])
+    for i in 0..<ir.typeLayoutFieldCounts.len:
+        add(out.typeLayoutFieldCounts, ir.typeLayoutFieldCounts[i])
+    for i in 0..<ir.enumValueSourcePaths.len:
+        add(out.enumValueSourcePaths, ir.enumValueSourcePaths[i])
+    for i in 0..<ir.enumValueNames.len:
+        add(out.enumValueNames, ir.enumValueNames[i])
+    for i in 0..<ir.enumValueTypes.len:
+        add(out.enumValueTypes, ir.enumValueTypes[i])
+    for i in 0..<ir.enumValueOrdinals.len:
+        add(out.enumValueOrdinals, ir.enumValueOrdinals[i])
     return out
 
 fn TypedExprReturnOpFactClone(fact: TypedExprReturnOpFact): TypedExprReturnOpFact =
@@ -1469,24 +1510,38 @@ fn TypedExprFactsForSource(facts: var TypedExprFact[],
         add(out, TypedExprFactClone(facts[i]))
     return out
 
-fn TypedExprFirstFactIndexForSource(facts: var TypedExprFact[],
-                                      sourcePathRaw: str): int32 =
+fn TypedExprSourceRangeIndexAdd(index: var TypedExprSourceRangeIndex,
+                                 sourcePathRaw: str,
+                                 startIndex: int32,
+                                 endIndex: int32) =
+    add(index.sourcePaths, parser.ParserNormalizePath(sourcePathRaw))
+    add(index.starts, startIndex)
+    add(index.ends, endIndex)
+
+fn TypedExprSourceRangeIndexFind(index: var TypedExprSourceRangeIndex,
+                                  sourcePathRaw: str): int32 =
     let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
-    for i in 0..<facts.len:
-        if facts[i].sourcePath == sourcePath:
+    for i in 0..<index.sourcePaths.len:
+        if index.sourcePaths[i] == sourcePath:
             return i
     return -1
 
-fn TypedExprFactEndIndexForSource(facts: var TypedExprFact[],
-                                    sourcePathRaw: str,
-                                    startIndex: int32): int32 =
-    if startIndex < 0:
-        return 0
-    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
-    for i in startIndex..<facts.len:
-        if facts[i].sourcePath != sourcePath:
-            return i
-    return facts.len
+fn TypedExprSourceRangeIndexBuildFromFacts(facts: var TypedExprFact[]): TypedExprSourceRangeIndex =
+    var index: TypedExprSourceRangeIndex
+    index.sourcePaths = []
+    index.starts = []
+    index.ends = []
+    var cursor: int32
+    while cursor < facts.len:
+        let sourcePath = parser.ParserNormalizePath(facts[cursor].sourcePath)
+        var endIndex = cursor + 1
+        while endIndex < facts.len:
+            if parser.ParserNormalizePath(facts[endIndex].sourcePath) != sourcePath:
+                break
+            endIndex = endIndex + 1
+        TypedExprSourceRangeIndexAdd(index, sourcePath, cursor, endIndex)
+        cursor = endIndex
+    return index
 
 fn TypedExprFactUsesImportBuffer(fact: TypedExprFact): bool =
     return fact.loweringMode == TypedExprLowerImportBuffer &&
@@ -1740,7 +1795,8 @@ fn TypedExprFactsValidateCallResolution(exprLayer: var parser.NormalizedExprLaye
         var target = expr.callTarget
         var targetSourcePath = expr.callTargetSourcePath
         var targetImportc = expr.callTargetImportc
-        if qualifier != "" &&
+        if surfaceKind == TypedExprSurfaceCallExternal &&
+           qualifier != "" &&
            expr.callArgCount <= 0 &&
            expr.callReason == parser.NormalizedExprCallReasonUnknownQualifiedTarget &&
            TypedExprSymbolExportedByCase(callee):
@@ -1771,7 +1827,8 @@ fn TypedExprFactsValidateCallResolution(exprLayer: var parser.NormalizedExprLaye
                     err = Fmt" typed expr: qualified type constructor drift at {expr.sourcePath}:{expr.lineNumber}"
                     return false
                 continue
-        if qualifier != "":
+        if qualifier != "" &&
+           surfaceKind != TypedExprSurfaceCallMember:
             let sourceContextIndex = TypedExprSourceContextLookup(sourceContexts, expr.sourcePath)
             if sourceContextIndex < 0:
                 err = Fmt" typed expr: missing source context for qualified call at {expr.sourcePath}:{expr.lineNumber}"
@@ -4636,6 +4693,10 @@ fn TypedExprTypeTextIsConcrete(typeRaw: str): bool =
        typeText == "result_projection" ||
        typeText == "branch_join":
         return false
+    if typeText.len == 1 &&
+       typeText[0] >= 'A' &&
+       typeText[0] <= 'Z':
+        return false
     return true
 
 fn TypedExprMaybeAddInferredCallBinding(ctx: var TypedExprSourceContext,
@@ -4737,6 +4798,64 @@ fn TypedExprBindingRhsCallReturnType(ctx: var TypedExprSourceContext,
                                                                  "",
                                                                  callee)
 
+fn TypedExprLookupEnumConstType(ctx: var TypedExprSourceContext,
+                                 sourceContexts: var TypedExprSourceContext[],
+                                 nameRaw: str): str =
+    let name = parser.ParserIdentPrefix(chengpath.PathTrim(nameRaw))
+    if name == "":
+        return ""
+    var found = ""
+    for i in 0..<ctx.enumValueNames.len:
+        if i >= ctx.enumValueTypes.len:
+            continue
+        if ctx.enumValueNames[i] != name:
+            continue
+        if found != "" && found != ctx.enumValueTypes[i]:
+            return ""
+        found = ctx.enumValueTypes[i]
+    for sourceIndex in 0..<sourceContexts.len:
+        for i in 0..<sourceContexts[sourceIndex].enumValueNames.len:
+            if i >= sourceContexts[sourceIndex].enumValueTypes.len:
+                continue
+            if sourceContexts[sourceIndex].enumValueNames[i] != name:
+                continue
+            if found != "" && found != sourceContexts[sourceIndex].enumValueTypes[i]:
+                return ""
+            found = sourceContexts[sourceIndex].enumValueTypes[i]
+    return found
+
+fn TypedExprBindingRhsCompareType(rhsRaw: str): str =
+    let eqPos = TypedExprFindTopLevelTextToken(rhsRaw, "==")
+    if eqPos >= 0:
+        return "bool"
+    let nePos = TypedExprFindTopLevelTextToken(rhsRaw, "!=")
+    if nePos >= 0:
+        return "bool"
+    return ""
+
+fn TypedExprBindingRhsTernaryType(ctx: var TypedExprSourceContext,
+                                   sourceContexts: var TypedExprSourceContext[],
+                                   rhsRaw: str): str =
+    let qPos = TypedExprFindTopLevelTextToken(rhsRaw, "?")
+    if qPos < 0:
+        return ""
+    let colonPos = TypedExprFindTopLevelTextToken(rhsRaw, ":")
+    if colonPos <= qPos:
+        return ""
+    let trueText = chengpath.PathTrim(chengpath.TextSlice(rhsRaw,
+                                                         qPos + 1,
+                                                         colonPos - qPos - 1))
+    let falseText = chengpath.PathTrim(chengpath.TextSlice(rhsRaw,
+                                                          colonPos + 1,
+                                                          rhsRaw.len - colonPos - 1))
+    let trueType = TypedExprLookupEnumConstType(ctx, sourceContexts, trueText)
+    if trueType == "":
+        return ""
+    let falseType = TypedExprLookupEnumConstType(ctx, sourceContexts, falseText)
+    if falseType == trueType:
+        return trueType
+    return ""
+
 fn TypedExprScopeIndexForLine(scopes: TypedExprFunctionScope[],
                                 lineNumber: int32): int32 =
     for i in 0..<scopes.len:
@@ -4769,8 +4888,10 @@ fn TypedExprParseBindingLine(lineRaw: str,
     let bindingName = parser.ParserIdentPrefix(rawName)
     if bindingName == "":
         return false
-    let colonPos = TypedExprFindTopLevelToken(tail, ":")
+    var colonPos = TypedExprFindTopLevelToken(tail, ":")
     let eqPos = TypedExprFindTopLevelToken(tail, "=")
+    if eqPos >= 0 && colonPos > eqPos:
+        colonPos = -1
     if colonPos < 0:
         if eqPos < 0:
             return false
@@ -4868,6 +4989,51 @@ fn TypedExprIrAddLocalDeclStatement(ir: var TypedExprIr,
     stmt.surfaceText = rhsText
     stmt.bindingName = bindingName
     stmt.resultType = bindingType
+    stmt.conditionKind = TypedExprIrCondNone
+    stmt.conditionLhsText = ""
+    stmt.conditionRhsText = ""
+    stmt.conditionLiteralText = ""
+    stmt.assignRootName = ""
+    stmt.assignRootType = ""
+    stmt.assignFieldName = ""
+    stmt.assignFieldType = ""
+    stmt.assignFieldOffsetBytes = 0
+    stmt.assignFieldSizeBytes = 0
+    stmt.assignFieldAlignBytes = 0
+    stmt.assignValueRootName = ""
+    stmt.assignValueRootType = ""
+    stmt.assignValueFieldName = ""
+    stmt.assignValueFieldType = ""
+    stmt.assignValueFieldOffsetBytes = 0
+    stmt.assignValueFieldSizeBytes = 0
+    stmt.assignValueFieldAlignBytes = 0
+    stmt.assignValueOpKind = TypedExprIrOpUnsupported
+    stmt.assignValueLhsText = ""
+    stmt.assignValueRhsText = ""
+    stmt.assignValueRhsConst = 0
+    stmt.assignValueRhsHasConst = false
+    var eqPos = TypedExprFindTopLevelTextToken(rhsText, "==")
+    var cmpKind = TypedExprIrCondStrEqLocal
+    if eqPos < 0:
+        eqPos = TypedExprFindTopLevelTextToken(rhsText, "!=")
+        cmpKind = TypedExprIrCondStrNeLocal
+    if eqPos >= 0:
+        stmt.conditionKind = cmpKind
+        stmt.conditionLhsText = chengpath.PathTrim(chengpath.TextSlice(rhsText, 0, eqPos))
+        stmt.conditionRhsText = chengpath.PathTrim(chengpath.TextSlice(rhsText,
+                                                                       eqPos + 2,
+                                                                       rhsText.len - eqPos - 2))
+    let qPos = TypedExprFindTopLevelTextToken(rhsText, "?")
+    let colonPos = TypedExprFindTopLevelTextToken(rhsText, ":")
+    if qPos >= 0 && colonPos > qPos:
+        stmt.assignValueOpKind = TypedExprIrOpLocalBoolEnumTernary
+        stmt.assignValueLhsText = chengpath.PathTrim(chengpath.TextSlice(rhsText, 0, qPos))
+        stmt.assignValueRhsText = chengpath.PathTrim(chengpath.TextSlice(rhsText,
+                                                                         qPos + 1,
+                                                                         colonPos - qPos - 1))
+        stmt.conditionRhsText = chengpath.PathTrim(chengpath.TextSlice(rhsText,
+                                                                       colonPos + 1,
+                                                                       rhsText.len - colonPos - 1))
     stmt.callTarget = ""
     stmt.callTargetSourcePath = ""
     stmt.callTargetImportc = false
@@ -4902,6 +5068,44 @@ fn TypedExprIrAppendLocalDeclStatementsForScope(ir: var TypedExprIr,
         if Len(bindingType) <= 0:
             bindingType = TypedExprLiteralBindingType(rhsText)
         if Len(bindingType) <= 0:
+            bindingType = TypedExprBindingRhsCompareType(rhsText)
+        if Len(bindingType) <= 0:
+            let callHead = TypedExprBindingRhsCallHead(rhsText)
+            let callLeaf = TypedExprQualifiedCallLeaf(callHead)
+            if callLeaf == "Value" ||
+               callLeaf == "IsOk" ||
+               callLeaf == "IsErr" ||
+               callLeaf == "Error" ||
+               callLeaf == "ErrorInfoOf":
+                let openPos = TypedExprFindTopLevelToken(rhsText, "(")
+                let closePos = TypedExprFindMatchingParen(rhsText, openPos)
+                if openPos > 0 && closePos > openPos:
+                    var argsText = chengpath.PathTrim(chengpath.TextSlice(rhsText,
+                                                                          openPos + 1,
+                                                                          closePos - openPos - 1))
+                    let commaPos = TypedExprFindTopLevelToken(argsText, ",")
+                    if commaPos >= 0:
+                        argsText = chengpath.PathTrim(chengpath.TextSlice(argsText, 0, commaPos))
+                    let resultArgName = parser.ParserIdentPrefix(argsText)
+                    if resultArgName != "":
+                        var resultArgType = TypedExprLookupBindingType(ctx,
+                                                                       TypedExprScopeIndexForLine(ctx.scopes, lineNumber),
+                                                                       lineNumber,
+                                                                       resultArgName)
+                        if resultArgType == "":
+                            resultArgType = TypedExprIrPriorBindingType(ir,
+                                                                        scope.name,
+                                                                        lineNumber,
+                                                                        resultArgName)
+                        if callLeaf == "Value":
+                            bindingType = TypedExprResultSuccessType(resultArgType)
+                        elif callLeaf == "IsOk" || callLeaf == "IsErr":
+                            bindingType = "bool"
+                        elif callLeaf == "Error":
+                            bindingType = "str"
+                        elif callLeaf == "ErrorInfoOf":
+                            bindingType = "ErrorInfo"
+        if Len(bindingType) <= 0:
             let scopeIndex = TypedExprScopeIndexForLine(ctx.scopes, lineNumber)
             bindingType = TypedExprLookupBindingType(ctx,
                                                      scopeIndex,
@@ -4911,6 +5115,12 @@ fn TypedExprIrAppendLocalDeclStatementsForScope(ir: var TypedExprIr,
             bindingType = TypedExprBindingRhsCallReturnType(ctx,
                                                             sourceContexts,
                                                             rhsText)
+            if !TypedExprTypeTextIsConcrete(bindingType):
+                bindingType = ""
+        if Len(bindingType) <= 0:
+            bindingType = TypedExprBindingRhsTernaryType(ctx,
+                                                         sourceContexts,
+                                                         rhsText)
         if Len(bindingType) <= 0:
             bindingType = TypedExprConstructorBindingType(rhsText)
         if Len(bindingType) <= 0:
@@ -4928,8 +5138,7 @@ fn TypedExprSourceContextLookup(sourceContexts: var TypedExprSourceContext[],
                                   sourcePathRaw: str): int32 =
     let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
     for i in 0..<sourceContexts.len:
-        let candidateSourcePath = parser.ParserNormalizePath(sourceContexts[i].sourcePath)
-        if candidateSourcePath == sourcePath:
+        if sourceContexts[i].normalizedSourcePath == sourcePath:
             return i
     return -1
 
@@ -5129,6 +5338,237 @@ fn TypedExprTypeLayout(currentCtx: var TypedExprSourceContext,
                         sizeBytes: var int32,
                         alignBytes: var int32): bool =
     return TypedExprTypeLayoutImpl(currentCtx, sourceContexts, typeRaw, sizeBytes, alignBytes, 0)
+
+fn TypedExprContextFieldCountForType(ctx: var TypedExprSourceContext,
+                                      typeRaw: str): int32 =
+    let ownerType = TypedExprTypeLeafName(typeRaw)
+    var count: int32
+    for i in 0..<ctx.typeFields.len:
+        if ctx.typeFields[i].ownerType == ownerType:
+            count = count + 1
+    return count
+
+fn TypedExprIrAppendTypeLayout(ir: var TypedExprIr,
+                                sourcePathRaw: str,
+                                typeNameRaw: str,
+                                sizeBytes: int32,
+                                alignBytes: int32,
+                                fieldCount: int32) =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let typeName = TypedExprTypeLeafName(typeNameRaw)
+    if sourcePath == "" || typeName == "" || sizeBytes <= 0 || alignBytes <= 0:
+        return
+    for i in 0..<ir.typeLayoutSourcePaths.len:
+        if i >= ir.typeLayoutNames.len:
+            continue
+        if parser.ParserNormalizePath(ir.typeLayoutSourcePaths[i]) == sourcePath &&
+           ir.typeLayoutNames[i] == typeName:
+            return
+    add(ir.typeLayoutSourcePaths, sourcePath)
+    add(ir.typeLayoutNames, typeName)
+    add(ir.typeLayoutSizeBytes, sizeBytes)
+    add(ir.typeLayoutAlignBytes, alignBytes)
+    add(ir.typeLayoutFieldCounts, fieldCount)
+
+fn TypedExprIrAppendTypeLayoutsFromContext(ir: var TypedExprIr,
+                                            ctx: var TypedExprSourceContext,
+                                            sourceContexts: var TypedExprSourceContext[]) =
+    for i in 0..<ctx.declaredTypes.len:
+        let typeName = ctx.declaredTypes[i]
+        var sizeBytes: int32
+        var alignBytes: int32
+        if !TypedExprTypeLayout(ctx, sourceContexts, typeName, sizeBytes, alignBytes):
+            continue
+        let fieldCount = TypedExprContextFieldCountForType(ctx, typeName)
+        TypedExprIrAppendTypeLayout(ir,
+                                    ctx.sourcePath,
+                                    typeName,
+                                    sizeBytes,
+                                    alignBytes,
+                                    fieldCount)
+
+fn TypedExprIrAppendEnumValuesFromContext(ir: var TypedExprIr,
+                                           ctx: var TypedExprSourceContext) =
+    for i in 0..<ctx.enumValueNames.len:
+        if i >= ctx.enumValueTypes.len || i >= ctx.enumValueOrdinals.len:
+            continue
+        let name = ctx.enumValueNames[i]
+        let typeName = ctx.enumValueTypes[i]
+        if name == "" || typeName == "":
+            continue
+        var seen = false
+        for j in 0..<ir.enumValueNames.len:
+            if j >= ir.enumValueSourcePaths.len:
+                continue
+            if parser.ParserNormalizePath(ir.enumValueSourcePaths[j]) == parser.ParserNormalizePath(ctx.sourcePath) &&
+               ir.enumValueNames[j] == name:
+                seen = true
+                break
+        if seen:
+            continue
+        add(ir.enumValueSourcePaths, parser.ParserNormalizePath(ctx.sourcePath))
+        add(ir.enumValueNames, name)
+        add(ir.enumValueTypes, typeName)
+        add(ir.enumValueOrdinals, ctx.enumValueOrdinals[i])
+
+fn TypedExprIrLookupEnumConstValue(ir: TypedExprIr,
+                                    sourcePathRaw: str,
+                                    nameRaw: str,
+                                    typeNameOut: var str,
+                                    valueOut: var int32): bool =
+    typeNameOut = ""
+    valueOut = 0
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let name = parser.ParserIdentPrefix(chengpath.PathTrim(nameRaw))
+    if name == "":
+        return false
+    var foundIndex: int32 = -1
+    for i in 0..<ir.enumValueNames.len:
+        if i >= ir.enumValueSourcePaths.len ||
+           i >= ir.enumValueTypes.len ||
+           i >= ir.enumValueOrdinals.len:
+            continue
+        if ir.enumValueNames[i] != name:
+            continue
+        if sourcePath != "" &&
+           parser.ParserNormalizePath(ir.enumValueSourcePaths[i]) == sourcePath:
+            foundIndex = i
+            break
+        if foundIndex < 0:
+            foundIndex = i
+        elif ir.enumValueTypes[foundIndex] != ir.enumValueTypes[i] ||
+             ir.enumValueOrdinals[foundIndex] != ir.enumValueOrdinals[i]:
+            return false
+    if foundIndex < 0:
+        return false
+    typeNameOut = ir.enumValueTypes[foundIndex]
+    valueOut = ir.enumValueOrdinals[foundIndex]
+    return true
+
+fn TypedExprIrBuiltinTypeLayout(typeRaw: str,
+                                 sizeBytes: var int32,
+                                 alignBytes: var int32,
+                                 fieldCount: var int32): bool =
+    sizeBytes = 0
+    alignBytes = 0
+    fieldCount = 0
+    let typeText = TypedExprStripVarType(typeRaw)
+    if typeText.len >= 2 && chengpath.TextSlice(typeText, typeText.len - 2, 2) == "[]":
+        sizeBytes = 16
+        alignBytes = 8
+        fieldCount = 3
+        return true
+    if parser.ParserStartsWith(typeText, "seq[") ||
+       parser.ParserStartsWith(typeText, "array["):
+        sizeBytes = 16
+        alignBytes = 8
+        fieldCount = 3
+        return true
+    if typeText == "str":
+        sizeBytes = 24
+        alignBytes = 8
+        fieldCount = 4
+        return true
+    if typeText == "Bytes" || typeText == "bytes.Bytes" || typeText == "rawbytes.Bytes":
+        sizeBytes = 16
+        alignBytes = 8
+        fieldCount = 2
+        return true
+    if typeText == "FixedBytes32" || typeText == "layout.FixedBytes32" || typeText == "bytes_layout.FixedBytes32":
+        sizeBytes = 32
+        alignBytes = 1
+        fieldCount = 1
+        return true
+    if typeText == "FixedBytes64" || typeText == "layout.FixedBytes64" || typeText == "bytes_layout.FixedBytes64":
+        sizeBytes = 64
+        alignBytes = 1
+        fieldCount = 1
+        return true
+    if typeText == "FixedBytes65" || typeText == "layout.FixedBytes65" || typeText == "bytes_layout.FixedBytes65":
+        sizeBytes = 65
+        alignBytes = 1
+        fieldCount = 1
+        return true
+    if typeText == "ErrorInfo":
+        sizeBytes = 32
+        alignBytes = 8
+        fieldCount = 2
+        return true
+    return false
+
+fn TypedExprIrLookupTypeLayout(ir: TypedExprIr,
+                                sourcePathRaw: str,
+                                typeRaw: str,
+                                sizeBytes: var int32,
+                                alignBytes: var int32,
+                                fieldCount: var int32): bool =
+    if TypedExprIrBuiltinTypeLayout(typeRaw, sizeBytes, alignBytes, fieldCount):
+        return true
+    let normalizedType = TypedExprStripVarType(typeRaw)
+    if parser.ParserStartsWith(normalizedType, "Result[") &&
+       normalizedType.len > 8 &&
+       chengpath.TextSlice(normalizedType, normalizedType.len - 1, 1) == "]":
+        let inner = chengpath.TextSlice(normalizedType, 7, normalizedType.len - 8)
+        var valueSize: int32
+        var valueAlign: int32
+        var valueFieldCount: int32
+        if !TypedExprIrLookupTypeLayout(ir,
+                                        sourcePathRaw,
+                                        inner,
+                                        valueSize,
+                                        valueAlign,
+                                        valueFieldCount):
+            return false
+        var errSize: int32
+        var errAlign: int32
+        var errFieldCount: int32
+        if !TypedExprIrLookupTypeLayout(ir,
+                                        sourcePathRaw,
+                                        "ErrorInfo",
+                                        errSize,
+                                        errAlign,
+                                        errFieldCount):
+            return false
+        let valueOffset = TypedExprAlignBytes(1, valueAlign)
+        let errOffset = TypedExprAlignBytes(valueOffset + valueSize, errAlign)
+        alignBytes = valueAlign
+        if errAlign > alignBytes:
+            alignBytes = errAlign
+        if alignBytes <= 0:
+            alignBytes = 1
+        sizeBytes = TypedExprAlignBytes(errOffset + errSize, alignBytes)
+        fieldCount = 3
+        return true
+    sizeBytes = 0
+    alignBytes = 0
+    fieldCount = 0
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let typeName = TypedExprTypeLeafName(typeRaw)
+    if typeName == "":
+        return false
+    var foundIndex: int32 = -1
+    for i in 0..<ir.typeLayoutNames.len:
+        if ir.typeLayoutNames[i] != typeName:
+            continue
+        if i < ir.typeLayoutSourcePaths.len &&
+           parser.ParserNormalizePath(ir.typeLayoutSourcePaths[i]) == sourcePath:
+            foundIndex = i
+            break
+        if foundIndex < 0:
+            foundIndex = i
+        elif i < ir.typeLayoutSourcePaths.len &&
+             foundIndex < ir.typeLayoutSourcePaths.len &&
+             parser.ParserNormalizePath(ir.typeLayoutSourcePaths[i]) != parser.ParserNormalizePath(ir.typeLayoutSourcePaths[foundIndex]):
+            return false
+    if foundIndex < 0 ||
+       foundIndex >= ir.typeLayoutSizeBytes.len ||
+       foundIndex >= ir.typeLayoutAlignBytes.len ||
+       foundIndex >= ir.typeLayoutFieldCounts.len:
+        return false
+    sizeBytes = ir.typeLayoutSizeBytes[foundIndex]
+    alignBytes = ir.typeLayoutAlignBytes[foundIndex]
+    fieldCount = ir.typeLayoutFieldCounts[foundIndex]
+    return sizeBytes > 0 && alignBytes > 0
 
 fn TypedExprResolveFieldMeta(currentCtx: var TypedExprSourceContext,
                               sourceContexts: var TypedExprSourceContext[],
@@ -5719,7 +6159,8 @@ fn TypedExprResolveQualifiedCallTargetReturnType(currentCtx: var TypedExprSource
 fn TypedExprLookupCallTargetReturnTypeFromFact(currentCtx: var TypedExprSourceContext,
                                                 sourceContexts: var TypedExprSourceContext[],
                                                  fact: TypedExprFact): str =
-    if fact.callQualifier != "":
+    if fact.callQualifier != "" &&
+       fact.surfaceCallKind != TypedExprSurfaceCallMember:
         var resolvedSourcePath = ""
         var resolvedTargetName = ""
         var resolvedImportc = false
@@ -6250,7 +6691,8 @@ fn TypedExprBuildFact(ctx: var TypedExprSourceContext,
             return fact
         let detailReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, fact)
         if detailReturnType != "":
-            if fact.callQualifier != "":
+            if fact.callQualifier != "" &&
+               fact.surfaceCallKind != TypedExprSurfaceCallMember:
                 let targetSourcePath = TypedExprLookupQualifiedModuleSourcePath(ctx,
                                                                                 sourceContexts,
                                                                                 fact.callQualifier)
@@ -6381,6 +6823,7 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
                                  ctx: var TypedExprSourceContext,
                                  err: var str): bool =
     ctx.sourcePath = source.sourcePath
+    ctx.normalizedSourcePath = parser.ParserNormalizePath(source.sourcePath)
     var normalizedText = ""
     if !parser.ParserRewriteMultilineStringSourceText(source.text, normalizedText, err):
         return false
@@ -6391,6 +6834,9 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
     ctx.importedModules = []
     ctx.declaredTypes = []
     ctx.typeFields = []
+    ctx.enumValueNames = []
+    ctx.enumValueTypes = []
+    ctx.enumValueOrdinals = []
     ctx.exprLineColumns = []
     var decls: parser.NormalizedFunctionDecl[]
     if !parser.ParserReadNormalizedFunctionDecls(normalizedText, decls, err):
@@ -6475,6 +6921,8 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
     var inTypeBlock = false
     var currentTypeName = ""
     var currentTypeIndent: int32
+    var currentTypeIsEnum = false
+    var currentEnumOrdinal: int32
     for i in 0..<ctx.lines.len:
         let rawLine = ctx.lines[i]
         let trimmed = chengpath.PathTrim(parser.ParserStripLineComment(rawLine))
@@ -6484,6 +6932,8 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
             inTypeBlock = trimmed == "type"
             currentTypeName = ""
             currentTypeIndent = 0
+            currentTypeIsEnum = false
+            currentEnumOrdinal = 0
             continue
         if !inTypeBlock:
             continue
@@ -6492,11 +6942,21 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
         if declaredType != "":
             currentTypeName = declaredType
             currentTypeIndent = lineIndent
+            currentTypeIsEnum = parser.ParserFindText(trimmed, "enum") >= 0
+            currentEnumOrdinal = 0
             if parser.ParserStringSeqContainsExact(ctx.declaredTypes, declaredType):
                 continue
             add(ctx.declaredTypes, declaredType)
             continue
         if currentTypeName == "" || lineIndent <= currentTypeIndent:
+            continue
+        if currentTypeIsEnum:
+            let enumName = parser.ParserIdentPrefix(trimmed)
+            if enumName != "":
+                add(ctx.enumValueNames, enumName)
+                add(ctx.enumValueTypes, currentTypeName)
+                add(ctx.enumValueOrdinals, currentEnumOrdinal)
+                currentEnumOrdinal = currentEnumOrdinal + 1
             continue
         var fieldName = ""
         var fieldType = ""
@@ -6954,7 +7414,9 @@ fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
                 statementFact.callTargetSourcePath = ctx.sourcePath
                 statementFact.callTargetImportc = true
     if statementFact.kind == parser.NormalizedExprCall &&
-       (statementFact.callTargetSourcePath == "" || statementFact.callQualifier != ""):
+       (statementFact.callTargetSourcePath == "" ||
+        (statementFact.callQualifier != "" &&
+         statementFact.surfaceCallKind != TypedExprSurfaceCallMember)):
         var resolvedSourcePath = ""
         var resolvedTargetName = ""
         var resolvedImportc = false
@@ -6970,7 +7432,8 @@ fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
             statementFact.callTarget = resolvedTargetName
             statementFact.callTargetSourcePath = resolvedSourcePath
             statementFact.callTargetImportc = resolvedImportc
-        elif statementFact.callQualifier != "":
+        elif statementFact.callQualifier != "" &&
+             statementFact.surfaceCallKind != TypedExprSurfaceCallMember:
             return -1
     var statementKind = TypedExprIrStmtCall
     if statementFact.kind == parser.NormalizedExprResultIntrinsic:
@@ -6996,8 +7459,48 @@ fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
         statementKind == TypedExprIrStmtResultIntrinsic) &&
        Len(currentLineBindingType) > 0:
         statementResultType = currentLineBindingType
+    var resultCallName = ""
+    if statementFact.kind == parser.NormalizedExprResultIntrinsic:
+        resultCallName = statementFact.callCallee
+    elif statementFact.kind == parser.NormalizedExprCall:
+        resultCallName = TypedExprQualifiedCallLeaf(statementFact.callCallee)
+        if resultCallName == "":
+            resultCallName = TypedExprQualifiedCallLeaf(statementFact.callTarget)
+    if resultCallName != "":
+        if resultCallName == "Value" ||
+           resultCallName == "IsOk" ||
+           resultCallName == "IsErr" ||
+           resultCallName == "Error" ||
+           resultCallName == "ErrorInfoOf":
+            var argsText = chengpath.PathTrim(statementFact.callArgsText)
+            let commaPos = TypedExprFindTopLevelToken(argsText, ",")
+            if commaPos >= 0:
+                argsText = chengpath.PathTrim(chengpath.TextSlice(argsText, 0, commaPos))
+            let resultArgName = parser.ParserIdentPrefix(argsText)
+            if resultArgName != "":
+                let resultScopeIndex = TypedExprScopeIndexForLine(ctx.scopes, statementFact.lineNumber)
+                var resultArgType = TypedExprLookupBindingType(ctx,
+                                                               resultScopeIndex,
+                                                               statementFact.lineNumber,
+                                                               resultArgName)
+                if resultArgType == "":
+                    resultArgType = TypedExprIrPriorBindingType(ir,
+                                                                scope.name,
+                                                                statementFact.lineNumber,
+                                                                resultArgName)
+                if resultCallName == "Value":
+                    let resultInnerType = TypedExprResultSuccessType(resultArgType)
+                    if resultInnerType != "":
+                        statementResultType = resultInnerType
+                elif resultCallName == "IsOk" || resultCallName == "IsErr":
+                    statementResultType = "bool"
+                elif resultCallName == "Error":
+                    statementResultType = "str"
+                elif resultCallName == "ErrorInfoOf":
+                    statementResultType = "ErrorInfo"
     if statementFact.kind == parser.NormalizedExprCall &&
-       localImportcReturnType == "":
+       localImportcReturnType == "" &&
+       !TypedExprTypeTextIsConcrete(statementResultType):
         let resolvedReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, statementFact)
         if resolvedReturnType != "":
             statementResultType = resolvedReturnType
@@ -7454,7 +7957,8 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
 fn TypedExprLookupCallTargetReturnTypeFromExpr(currentCtx: var TypedExprSourceContext,
                                                 sourceContexts: var TypedExprSourceContext[],
                                                 expr: parser.NormalizedExpr): str =
-    if expr.callQualifier != "":
+    if expr.callQualifier != "" &&
+       TypedExprSurfaceCallKindFromParser(expr.callSurfaceKind) != TypedExprSurfaceCallMember:
         var resolvedSourcePath = ""
         var resolvedTargetName = ""
         var resolvedImportc = false
@@ -7944,7 +8448,9 @@ fn TypedExprIrAddCallStatementFromExpr(ir: var TypedExprIr,
                 stmt.callTargetSourcePath = ctx.sourcePath
                 stmt.callTargetImportc = true
     if expr.kind == parser.NormalizedExprCall &&
-       (stmt.callTargetSourcePath == "" || expr.callQualifier != ""):
+       (stmt.callTargetSourcePath == "" ||
+        (expr.callQualifier != "" &&
+         TypedExprSurfaceCallKindFromParser(expr.callSurfaceKind) != TypedExprSurfaceCallMember)):
         var resolvedSourcePath = ""
         var resolvedTargetName = ""
         var resolvedImportc = false
@@ -7961,7 +8467,8 @@ fn TypedExprIrAddCallStatementFromExpr(ir: var TypedExprIr,
             stmt.callTargetSourcePath = resolvedSourcePath
             stmt.callTargetImportc = resolvedImportc
         else:
-            if expr.callQualifier != "":
+            if expr.callQualifier != "" &&
+               TypedExprSurfaceCallKindFromParser(expr.callSurfaceKind) != TypedExprSurfaceCallMember:
                 stmt.callTarget = ""
                 stmt.callTargetSourcePath = ""
                 stmt.callTargetImportc = false
@@ -8486,14 +8993,6 @@ fn TypedExprBuildIrForScopeFromExprLayer(ctx: var TypedExprSourceContext,
     fnIr.nodeCount = ir.nodes.len - nodeStart
     add(ir.functions, fnIr)
 
-fn TypedExprExprLayerFirstIndexForSource(exprLayer: var parser.NormalizedExprLayer,
-                                          sourcePathRaw: str): int32 =
-    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
-    for i in 0..<exprLayer.exprs.len:
-        if parser.ParserNormalizePath(exprLayer.exprs[i].sourcePath) == sourcePath:
-            return i
-    return -1
-
 fn TypedExprExprLayerEndIndexForSource(exprLayer: var parser.NormalizedExprLayer,
                                         sourcePathRaw: str,
                                         startIndex: int32): int32 =
@@ -8504,6 +9003,23 @@ fn TypedExprExprLayerEndIndexForSource(exprLayer: var parser.NormalizedExprLayer
         if parser.ParserNormalizePath(exprLayer.exprs[i].sourcePath) != sourcePath:
             return i
     return exprLayer.exprs.len
+
+fn TypedExprSourceRangeIndexBuildFromExprLayer(exprLayer: var parser.NormalizedExprLayer): TypedExprSourceRangeIndex =
+    var index: TypedExprSourceRangeIndex
+    index.sourcePaths = []
+    index.starts = []
+    index.ends = []
+    var cursor: int32
+    while cursor < exprLayer.exprs.len:
+        let sourcePath = parser.ParserNormalizePath(exprLayer.exprs[cursor].sourcePath)
+        var endIndex = cursor + 1
+        while endIndex < exprLayer.exprs.len:
+            if parser.ParserNormalizePath(exprLayer.exprs[endIndex].sourcePath) != sourcePath:
+                break
+            endIndex = endIndex + 1
+        TypedExprSourceRangeIndexAdd(index, sourcePath, cursor, endIndex)
+        cursor = endIndex
+    return index
 
 fn TypedExprReadNormalizedExprLayerForSourceTexts(sourceTexts: var TypedExprSourceText[],
                                                    exprLayer: var parser.NormalizedExprLayer,
@@ -8524,16 +9040,12 @@ fn TypedExprReadNormalizedExprLayerForSourceTexts(sourceTexts: var TypedExprSour
     err = ""
     return true
 
-fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
-                              facts: var TypedExprFact[],
-                              ir: var TypedExprIr,
-                              err: var str): bool =
+fn TypedExprBuildIrWithFactsAndExprLayer(sourceTexts: var TypedExprSourceText[],
+                                          facts: var TypedExprFact[],
+                                          exprLayer: var parser.NormalizedExprLayer,
+                                          ir: var TypedExprIr,
+                                          err: var str): bool =
     ir = TypedExprIr()
-    var exprLayer: parser.NormalizedExprLayer
-    if facts.len > 0:
-        if !TypedExprReadNormalizedExprLayerForSourceTexts(sourceTexts, exprLayer, err):
-            err = Fmt" typed expr: build typed ir normalized expr layer failed: {err}"
-            return false
     var contexts: TypedExprSourceContext[]
     if facts.len > 0:
         for i in 0..<sourceTexts.len:
@@ -8545,24 +9057,36 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
             if !TypedExprBuildSourceContext(sourceForContext, context, err):
                 err = " typed expr: build typed ir source context failed"
                 return false
-            TypedExprClearSourceContextHeavyFields(context)
             sourceTexts[i].text = ""
             add(contexts, context)
+    var factSourceRanges: TypedExprSourceRangeIndex
+    var exprSourceRanges: TypedExprSourceRangeIndex
+    if facts.len > 0:
+        factSourceRanges = TypedExprSourceRangeIndexBuildFromFacts(facts)
+        exprSourceRanges = TypedExprSourceRangeIndexBuildFromExprLayer(exprLayer)
     for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
-        var sourceForIr = sourceTexts[i]
-        if sourceForIr.text == "" && sourceForIr.sourcePath != "":
-            sourceForIr.text = chengpath.ReadTextFile("", sourceForIr.sourcePath)
         var ctx: TypedExprSourceContext
-        if !TypedExprBuildSourceContext(sourceForIr, ctx, err):
-            err = " typed expr: build typed ir source context failed"
-            return false
+        if facts.len > 0 && i < contexts.len:
+            ctx = contexts[i]
+        else:
+            var sourceForIr = sourceTexts[i]
+            if sourceForIr.text == "" && sourceForIr.sourcePath != "":
+                sourceForIr.text = chengpath.ReadTextFile("", sourceForIr.sourcePath)
+            if !TypedExprBuildSourceContext(sourceForIr, ctx, err):
+                err = " typed expr: build typed ir source context failed"
+                return false
         TypedExprIrAppendImportcFunctionsFromContext(ir, ctx)
-        let sourceFactStart = TypedExprFirstFactIndexForSource(facts, ctx.sourcePath)
+        TypedExprIrAppendEnumValuesFromContext(ir, ctx)
+        if contexts.len > 0:
+            TypedExprIrAppendTypeLayoutsFromContext(ir, ctx, contexts)
+        let sourceFactRange = TypedExprSourceRangeIndexFind(factSourceRanges, ctx.sourcePath)
+        var sourceFactStart: int32
         var sourceFactEnd: int32
         var factCursor: int32
-        if sourceFactStart >= 0:
-            sourceFactEnd = TypedExprFactEndIndexForSource(facts, ctx.sourcePath, sourceFactStart)
+        if sourceFactRange >= 0:
+            sourceFactStart = factSourceRanges.starts[sourceFactRange]
+            sourceFactEnd = factSourceRanges.ends[sourceFactRange]
             factCursor = sourceFactStart
             TypedExprAppendInferredCallBindings(ctx,
                                                 contexts,
@@ -8589,11 +9113,13 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
             add(ir.globalSourcePaths, binding.sourcePath)
             add(ir.globalNames, binding.name)
             add(ir.globalTypes, binding.typeText)
-        let sourceExprStart = TypedExprExprLayerFirstIndexForSource(exprLayer, ctx.sourcePath)
+        let sourceExprRange = TypedExprSourceRangeIndexFind(exprSourceRanges, ctx.sourcePath)
+        var sourceExprStart: int32
         var sourceExprEnd: int32
         var exprCursor: int32
-        if facts.len > 0 && sourceExprStart >= 0:
-            sourceExprEnd = TypedExprExprLayerEndIndexForSource(exprLayer, ctx.sourcePath, sourceExprStart)
+        if facts.len > 0 && sourceExprRange >= 0:
+            sourceExprStart = exprSourceRanges.starts[sourceExprRange]
+            sourceExprEnd = exprSourceRanges.ends[sourceExprRange]
             exprCursor = sourceExprStart
         else:
             sourceExprEnd = 0
@@ -8624,8 +9150,26 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
                                                               ir)
             else:
                 TypedExprBuildIrForScope(ctx, ctx.scopes[j], facts, factCursor, sourceFactEnd, ir)
+        if facts.len > 0 && i < contexts.len:
+            TypedExprClearSourceContextHeavyFields(contexts[i])
+        sourceTexts[i].text = ""
     err = ""
     return true
+
+fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
+                              facts: var TypedExprFact[],
+                              ir: var TypedExprIr,
+                              err: var str): bool =
+    var exprLayer: parser.NormalizedExprLayer
+    if facts.len > 0:
+        if !TypedExprReadNormalizedExprLayerForSourceTexts(sourceTexts, exprLayer, err):
+            err = Fmt" typed expr: build typed ir normalized expr layer failed: {err}"
+            return false
+    return TypedExprBuildIrWithFactsAndExprLayer(sourceTexts,
+                                                 facts,
+                                                 exprLayer,
+                                                 ir,
+                                                 err)
 
 fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
                                   exprLayer: var parser.NormalizedExprLayer,
@@ -8633,6 +9177,7 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
                                   err: var str): bool =
     ir = TypedExprIr()
     var contexts: TypedExprSourceContext[]
+    var exprSourceRanges = TypedExprSourceRangeIndexBuildFromExprLayer(exprLayer)
     for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
         var sourceForContext = sourceTexts[i]
@@ -8642,19 +9187,14 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
         if !TypedExprBuildSourceContext(sourceForContext, ctx, err):
             err = " typed expr: build typed ir source context failed"
             return false
-        TypedExprClearSourceContextHeavyFields(ctx)
         sourceTexts[i].text = ""
         add(contexts, ctx)
     for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
-        var sourceForIr = sourceTexts[i]
-        if sourceForIr.text == "" && sourceForIr.sourcePath != "":
-            sourceForIr.text = chengpath.ReadTextFile("", sourceForIr.sourcePath)
-        var ctxForIr: TypedExprSourceContext
-        if !TypedExprBuildSourceContext(sourceForIr, ctxForIr, err):
-            err = " typed expr: build typed ir source context failed"
-            return false
+        var ctxForIr = contexts[i]
         TypedExprIrAppendImportcFunctionsFromContext(ir, ctxForIr)
+        TypedExprIrAppendEnumValuesFromContext(ir, ctxForIr)
+        TypedExprIrAppendTypeLayoutsFromContext(ir, ctxForIr, contexts)
         for bindingIndex in 0..<ctxForIr.bindings.len:
             let binding = ctxForIr.bindings[bindingIndex]
             if !binding.globalFlag:
@@ -8672,11 +9212,13 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
             add(ir.globalSourcePaths, binding.sourcePath)
             add(ir.globalNames, binding.name)
             add(ir.globalTypes, binding.typeText)
-        let sourceExprStart = TypedExprExprLayerFirstIndexForSource(exprLayer, ctxForIr.sourcePath)
+        let sourceExprRange = TypedExprSourceRangeIndexFind(exprSourceRanges, ctxForIr.sourcePath)
+        var sourceExprStart: int32
         var sourceExprEnd: int32
         var exprCursor: int32
-        if sourceExprStart >= 0:
-            sourceExprEnd = TypedExprExprLayerEndIndexForSource(exprLayer, ctxForIr.sourcePath, sourceExprStart)
+        if sourceExprRange >= 0:
+            sourceExprStart = exprSourceRanges.starts[sourceExprRange]
+            sourceExprEnd = exprSourceRanges.ends[sourceExprRange]
             exprCursor = sourceExprStart
         else:
             sourceExprEnd = 0
@@ -8698,7 +9240,7 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
                                                   exprCursor,
                                                   sourceExprEnd,
                                                   ir)
-        TypedExprClearSourceContextHeavyFields(ctxForIr)
+        TypedExprClearSourceContextHeavyFields(contexts[i])
         sourceTexts[i].text = ""
         os.ProcessResourceGuardCheck()
     err = ""
