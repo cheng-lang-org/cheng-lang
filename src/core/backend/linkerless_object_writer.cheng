@@ -1,0 +1,336 @@
+import std/result
+import std/rawbytes
+import std/strformat
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend/object_buffer as obuf
+import cheng/core/backend/object_symbols as osym
+import cheng/core/backend/object_relocs as orel
+import cheng/core/backend/macho_object_writer as macho
+import cheng/core/backend/direct_object_emit as directemit
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/lang/typed_expr as texpr
+
+const
+    LinkerlessAlign = 8
+
+type
+    LinkerlessSymbolInfo =
+        name: str
+        strOffset: int32
+        index: int32
+        sectionIndex: int32  ; 0 for text, 1 for data, -1 for undefined
+        value: int64
+        global: bool
+
+fn linkerlessComputeDataSize(plan: pobj.PrimaryObjectPlan): int32 =
+    var total: int32
+    for i in 0..<plan.dataLabels.len:
+        var payloadText = ""
+        if i < plan.dataPayloadTexts.len:
+            payloadText = plan.dataPayloadTexts[i]
+        total = total + directemit.DirectObjectEmitPayloadByteCount(payloadText)
+    return total
+
+fn linkerlessComputeSymbolInfos(plan: pobj.PrimaryObjectPlan,
+                                 functionLimit: int32,
+                                 dataSize: int32,
+                                 dataAddr: int32,
+                                 outSymbols: var LinkerlessSymbolInfo[],
+                                 outStrTab: var obuf.ObjectBuffer): Result[int32] =
+    var symbols: LinkerlessSymbolInfo[]
+    var strtab = obuf.ObjectBufferInit(128)
+    obuf.ObjectBufferWriteU8(strtab, 0)
+    var strOffsets: int32[]
+    add(strOffsets, 0)
+
+    fn addSymbol(name: str, sectionIndex: int32, value: int64, global: bool): int32 =
+        let idx = len(symbols)
+        let strOff = obuf.ObjectBufferOffset(strtab)
+        macho.MachOWriteCString(strtab, name)
+        add(strOffsets, strOff)
+        var sym: LinkerlessSymbolInfo
+        sym.name = name
+        sym.strOffset = strOff
+        sym.index = idx
+        sym.sectionIndex = sectionIndex
+        sym.value = value
+        sym.global = global
+        add(symbols, sym)
+        return idx
+
+    ; function symbols (defined in text section)
+    for i in 0..<functionLimit:
+        let name = directemit.DirectObjectEmitPlanSymbolNameAt(plan, i)
+        if len(name) <= 0:
+            continue
+        let offset = int64(plan.functionWordOffsets[i] * 4)
+        let _ = addSymbol(name, 0, offset, true)
+
+    ; data symbols (defined in data section)
+    var dataOffset: int32
+    for i in 0..<plan.dataLabels.len:
+        let label = plan.dataLabels[i]
+        var payloadText = ""
+        if i < plan.dataPayloadTexts.len:
+            payloadText = plan.dataPayloadTexts[i]
+        let size = directemit.DirectObjectEmitPayloadByteCount(payloadText)
+        let value = int64(dataAddr) + int64(dataOffset)
+        let _ = addSymbol(label, 1, value, false)
+        dataOffset = dataOffset + size
+
+    ; collect undefined symbols from relocs (only those not already defined)
+    var undefSet: str[]
+    fn hasUndef(name: str): bool =
+        for i in 0..<len(undefSet):
+            if undefSet[i] == name:
+                return true
+        return false
+    for relocIdx in 0..<plan.relocTargetSymbols.len:
+        let target = plan.relocTargetSymbols[relocIdx]
+        if len(target) <= 0:
+            continue
+        ; skip if already defined in functions or data
+        var defined = false
+        for i in 0..<functionLimit:
+            if directemit.DirectObjectEmitPlanSymbolNameAt(plan, i) == target:
+                defined = true
+                break
+        if !defined:
+            for i in 0..<plan.dataLabels.len:
+                if plan.dataLabels[i] == target:
+                    defined = true
+                    break
+        if !defined && !hasUndef(target):
+            add(undefSet, target)
+    for i in 0..<len(undefSet):
+        let _ = addSymbol(undefSet[i], -1, 0, true)
+
+    outSymbols = symbols
+    outStrTab = strtab
+    return Ok[int32](len(symbols))
+
+fn linkerlessRelocKindForWordOffset(plan: pobj.PrimaryObjectPlan,
+                                     wordOffset: int32): Result[orel.ObjectRelocKind] =
+    if wordOffset < 0 || wordOffset + 1 >= plan.instructionWords.len:
+        return Err[orel.ObjectRelocKind](" linkerless: word offset out of range")
+    let word = plan.instructionWords[wordOffset]
+    let nextWord = plan.instructionWords[wordOffset + 1]
+    ; check for ADRP (0x90000000) + ADD (0x91000000) pair
+    ; ADRP: bits 31:24 = 0x90, ADD: bits 31:24 = 0x91
+    let adrpMask = word & 0x9f000000
+    let addMask = nextWord & 0x9f000000
+    if adrpMask == 0x90000000 && addMask == 0x91000000:
+        return Ok[orel.ObjectRelocKind](orel.ObjectRelocPage21)
+    ; check for BL (0x94000000)
+    let blMask = word & 0xfc000000
+    if blMask == 0x94000000:
+        return Ok[orel.ObjectRelocKind](orel.ObjectRelocBranch26)
+    return Err[orel.ObjectRelocKind](" linkerless: unsupported relocation pattern")
+
+fn linkerlessWriteRelocation(buf: var obuf.ObjectBuffer,
+                              plan: pobj.PrimaryObjectPlan,
+                              wordOffset: int32,
+                              targetSymbolIndex: int32): Result[bool] =
+    let kindRes = linkerlessRelocKindForWordOffset(plan, wordOffset)
+    if IsErr(kindRes):
+        return Err[bool](Error(kindRes))
+    let kind = Value(kindRes)
+
+    let typeRes = macho.MachORelocType(kind)
+    if IsErr(typeRes):
+        return Err[bool](Error(typeRes))
+    let lengthRes = macho.MachORelocLength(kind)
+    if IsErr(lengthRes):
+        return Err[bool](Error(lengthRes))
+
+    let relocType = Value(typeRes)
+    let relocLength = Value(lengthRes)
+    let relocOffset = wordOffset * 4
+    let pcRelative = (kind == orel.ObjectRelocBranch26)
+
+    var word = targetSymbolIndex & 0x00ffffff
+    if pcRelative:
+        word = word | (1 << 24)
+    word = word | ((relocLength & 3) << 25)
+    word = word | (1 << 27)
+    word = word | ((relocType & 15) << 28)
+
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(relocOffset))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(word))
+    return Ok[bool](true)
+
+fn WriteLinkerlessObject(rootDir: str,
+                         plan: pobj.PrimaryObjectPlan,
+                         outputPath: str): Result[macho.MachOObjectWriterResult] =
+    ; preflight checks
+    if plan.objectFormat != "macho":
+        return Err[macho.MachOObjectWriterResult](" linkerless: only Mach-O supported")
+    if plan.targetTriple != "arm64-apple-darwin":
+        return Err[macho.MachOObjectWriterResult](Fmt" linkerless: unsupported target {plan.targetTriple}")
+    if len(plan.instructionWords) <= 0:
+        return Err[macho.MachOObjectWriterResult](" linkerless: empty instruction words")
+
+    let functionLimit = directemit.DirectObjectEmitRealFunctionLimit(plan)
+    if functionLimit <= 0:
+        return Err[macho.MachOObjectWriterResult](" linkerless: no real functions")
+
+    let textSize = len(plan.instructionWords) * 4
+    let dataSize = linkerlessComputeDataSize(plan)
+    let hasData = dataSize > 0
+
+    let headerSize = 32
+    let segmentCmdSize = 72
+    let sectionHeaderSize = 80
+    let symtabCmdSize = 24
+    let sectionCount = if hasData: 2 else: 1
+    let loadCommandsSize = segmentCmdSize + sectionCount * sectionHeaderSize + symtabCmdSize
+    let textOffset = headerSize + loadCommandsSize
+    let dataOffsetAligned = (textOffset + textSize + (LinkerlessAlign - 1)) & (0 - LinkerlessAlign)
+    let dataOffset = if hasData: dataOffsetAligned else: textOffset + textSize
+    let dataAddr = directemit.DirectObjectEmitDataSectionAddr(plan)
+
+    ; build symbol infos and string table
+    var symbols: LinkerlessSymbolInfo[]
+    var strtab: obuf.ObjectBuffer
+    let symbolRes = linkerlessComputeSymbolInfos(plan, functionLimit, dataSize, dataAddr, symbols, strtab)
+    if IsErr(symbolRes):
+        return Err[macho.MachOObjectWriterResult](Error(symbolRes))
+    let symbolCount = Value(symbolRes)
+    let strtabBytes = obuf.ObjectBufferToBytes(strtab)
+    let strSize = BytesLen(strtabBytes)
+
+    ; count relocations (only those where source item is in real functions)
+    var relocCount: int32
+    var relocWordOffsets: int32[]
+    var relocTargetIndices: int32[]
+    for relocIdx in 0..<plan.relocTargetSymbols.len:
+        if relocIdx >= plan.relocSourceItemIds.len || relocIdx >= plan.relocWordOffsets.len:
+            continue
+        let sourceItemId = plan.relocSourceItemIds[relocIdx]
+        var sourceInReal = false
+        for i in 0..<functionLimit:
+            if i < plan.itemIds.len && plan.itemIds[i] == sourceItemId:
+                sourceInReal = true
+                break
+        if !sourceInReal:
+            continue
+        let targetName = plan.relocTargetSymbols[relocIdx]
+        ; find symbol index
+        var targetIdx: int32 = -1
+        for s in 0..<len(symbols):
+            if symbols[s].name == targetName:
+                targetIdx = symbols[s].index
+                break
+        if targetIdx < 0:
+            continue
+        add(relocWordOffsets, plan.relocWordOffsets[relocIdx])
+        add(relocTargetIndices, targetIdx)
+        relocCount = relocCount + 1
+
+    ; compute offsets
+    let relocOffset = (dataOffset + dataSize + (LinkerlessAlign - 1)) & (0 - LinkerlessAlign)
+    let symoff = (relocOffset + relocCount * 8 + (LinkerlessAlign - 1)) & (0 - LinkerlessAlign)
+    let stroff = symoff + symbolCount * macho.MachONlist64Size
+    let totalSize = stroff + strSize
+
+    ; allocate buffer
+    var buf = obuf.ObjectBufferInit(totalSize)
+
+    ; write Mach-O header
+    macho.MachOWriteHeader64(buf,
+                             macho.MachOFileTypeObject,
+                             2,
+                             loadCommandsSize,
+                             0)
+
+    ; write LC_SEGMENT_64
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(macho.MachOLoadCommandSegment64))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(segmentCmdSize))
+    macho.MachOWritePaddedAscii(buf, "", 16)
+    obuf.ObjectBufferWriteU64LE(buf, UInt64(0))
+    let segmentFileSize = if hasData: dataOffset + dataSize else: textOffset + textSize
+    obuf.ObjectBufferWriteU64LE(buf, UInt64(segmentFileSize))
+    obuf.ObjectBufferWriteU64LE(buf, UInt64(textOffset))
+    obuf.ObjectBufferWriteU64LE(buf, UInt64(segmentFileSize))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(7))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(7))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(sectionCount))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(0))
+
+    ; write section headers
+    ; __text section
+    macho.MachOWriteTextSectionCommand(buf, textOffset, textSize, relocOffset, relocCount)
+    if hasData:
+        macho.MachOWriteDataSectionCommand(buf, dataAddr, dataOffset, dataSize)
+
+    ; write LC_SYMTAB
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(macho.MachOLoadCommandSymtab))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(symtabCmdSize))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(symoff))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(symbolCount))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(stroff))
+    obuf.ObjectBufferWriteU32LE(buf, UInt64(strSize))
+
+    ; write text bytes
+    for i in 0..<plan.instructionWords.len:
+        let w = plan.instructionWords[i]
+        obuf.ObjectBufferWriteU8(buf, w & 255)
+        obuf.ObjectBufferWriteU8(buf, (w >> 8) & 255)
+        obuf.ObjectBufferWriteU8(buf, (w >> 16) & 255)
+        obuf.ObjectBufferWriteU8(buf, (w >> 24) & 255)
+
+    ; align and write data
+    obuf.ObjectBufferAlign(buf, LinkerlessAlign, 0)
+    if hasData:
+        let dataBytes = directemit.DirectObjectEmitPlanData(plan, functionLimit)
+        obuf.ObjectBufferWriteBytes(buf, dataBytes)
+
+    ; write relocation entries
+    obuf.ObjectBufferAlign(buf, LinkerlessAlign, 0)
+    for i in 0..<relocCount:
+        let writeRes = linkerlessWriteRelocation(buf,
+                                                 plan,
+                                                 relocWordOffsets[i],
+                                                 relocTargetIndices[i])
+        if IsErr(writeRes):
+            return Err[macho.MachOObjectWriterResult](Error(writeRes))
+
+    ; write symbol table
+    obuf.ObjectBufferAlign(buf, LinkerlessAlign, 0)
+    for s in 0..<symbolCount:
+        let sym = symbols[s]
+        ; nlist64 fields: str index, type, section, desc, value
+        obuf.ObjectBufferWriteU32LE(buf, UInt64(sym.strOffset))
+        if sym.sectionIndex < 0:
+            ; undefined
+            let ntype = if sym.global: 1 else: 0
+            obuf.ObjectBufferWriteU8(buf, ntype)
+            obuf.ObjectBufferWriteU8(buf, 0)
+            obuf.ObjectBufferWriteU16LE(buf, UInt64(0))
+            obuf.ObjectBufferWriteU64LE(buf, UInt64(0))
+        else:
+            let ntype = 14
+            let ntype2 = if sym.global: 15 else: 14
+            obuf.ObjectBufferWriteU8(buf, ntype2)
+            obuf.ObjectBufferWriteU8(buf, sym.sectionIndex + 1)
+            obuf.ObjectBufferWriteU16LE(buf, UInt64(0))
+            obuf.ObjectBufferWriteU64LE(buf, UInt64(sym.value))
+
+    ; write string table
+    obuf.ObjectBufferWriteBytes(buf, strtabBytes)
+
+    ; final sanity check
+    if obuf.ObjectBufferLen(buf) != totalSize:
+        return Err[macho.MachOObjectWriterResult](" linkerless: buffer size mismatch")
+
+    let finalBytes = obuf.ObjectBufferToBytes(buf)
+    let payload = BytesToString(finalBytes)
+    if !chengpath.WriteTextFile(rootDir, outputPath, payload):
+        return Err[macho.MachOObjectWriterResult](Fmt" linkerless: failed to write {outputPath}")
+
+    var out: macho.MachOObjectWriterResult
+    out.objectPath = outputPath
+    out.bytesWritten = BytesLen(finalBytes)
+    out.symbolCount = symbolCount
+    out.relocCount = relocCount
+    return Ok[macho.MachOObjectWriterResult](out)

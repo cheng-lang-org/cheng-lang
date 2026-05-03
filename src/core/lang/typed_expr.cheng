@@ -81,7 +81,12 @@ type
         TypedExprIrOpParamRef
         TypedExprIrOpReturnStrArg0
         TypedExprIrOpReturnComposite16Arg0
+        TypedExprIrOpReturnComposite16Field0Arg0
         TypedExprIrOpReturnSeqLenArg0
+        TypedExprIrOpReturnBytesLenArg0
+        TypedExprIrOpReturnCharArg0
+        TypedExprIrOpReturnI64FromI32Arg0
+        TypedExprIrOpReturnBoolI32Arg0Range0To31
         TypedExprIrOpI32Const
         TypedExprIrOpI32Add
         TypedExprIrOpI32Sub
@@ -400,7 +405,12 @@ const
     BodyKindStrLenFastI32 = "str_len_fast_i32"
     BodyKindReturnStrArg0 = "return_str_arg0"
     BodyKindReturnComposite16Arg0 = "return_composite16_arg0"
+    BodyKindReturnComposite16Field0Arg0 = "return_composite16_field0_arg0"
     BodyKindReturnSeqLenArg0 = "return_seq_len_arg0"
+    BodyKindReturnBytesLenArg0 = "return_bytes_len_arg0"
+    BodyKindReturnCharArg0 = "return_char_arg0"
+    BodyKindReturnI64FromI32Arg0 = "return_i64_from_i32_arg0"
+    BodyKindReturnBoolI32Arg0Range0To31 = "return_bool_i32_arg0_range_0_31"
     BodyKindReturnStrEmpty = "return_str_empty"
     BodyKindReturnStrLiteral = "return_str_literal"
     BodyKindMainF64MulCheckExit = "main_f64_mul_check_exit"
@@ -732,8 +742,18 @@ fn TypedExprIrOpKindText(kind: TypedExprIrOpKind): str =
         return "return_str_arg0"
     if kind == TypedExprIrOpReturnComposite16Arg0:
         return "return_composite16_arg0"
+    if kind == TypedExprIrOpReturnComposite16Field0Arg0:
+        return "return_composite16_field0_arg0"
     if kind == TypedExprIrOpReturnSeqLenArg0:
         return "return_seq_len_arg0"
+    if kind == TypedExprIrOpReturnBytesLenArg0:
+        return "return_bytes_len_arg0"
+    if kind == TypedExprIrOpReturnCharArg0:
+        return "return_char_arg0"
+    if kind == TypedExprIrOpReturnI64FromI32Arg0:
+        return "return_i64_from_i32_arg0"
+    if kind == TypedExprIrOpReturnBoolI32Arg0Range0To31:
+        return "return_bool_i32_arg0_range_0_31"
     if kind == TypedExprIrOpI32Const:
         return "i32_const"
     if kind == TypedExprIrOpI32Add:
@@ -1021,7 +1041,7 @@ fn TypedExprBuiltinTypeCallResult(expr: parser.NormalizedExpr): str =
     if expr.kind != parser.NormalizedExprCall:
         return ""
     let callee = chengpath.PathTrim(expr.callCallee)
-    if callee == "len":
+    if callee == "len" || callee == "Len":
         return "int32"
     if callee == "bool" ||
        callee == "char" ||
@@ -2835,6 +2855,50 @@ fn TypedExprFunctionTopLevelReturnExpr(ctx: var TypedExprSourceContext,
             return TypedExprReturnExprFromBody(bodyTrim)
     return ""
 
+fn TypedExprFunctionSingleExpressionBodyExpr(ctx: var TypedExprSourceContext,
+                                             scope: TypedExprFunctionScope,
+                                             returnLineNumber: var int32): str =
+    returnLineNumber = 0
+    if scope.returnType == "" || scope.returnType == "void":
+        return ""
+    var bodyIndent: int32 = -1
+    var bodyCount: int32
+    var exprText = ""
+    for i in scope.startLine..<ctx.lines.len:
+        let bodyRaw = ctx.lines[i]
+        let bodyTrim = chengpath.PathTrim(bodyRaw)
+        if bodyTrim == "":
+            continue
+        if !parser.ParserHasLeadingIndent(bodyRaw):
+            break
+        let lineIndent = TypedExprLineIndentWidth(bodyRaw)
+        if bodyIndent < 0:
+            bodyIndent = lineIndent
+        if lineIndent != bodyIndent:
+            return ""
+        bodyCount = bodyCount + 1
+        if bodyCount > 1:
+            return ""
+        exprText = bodyTrim
+        returnLineNumber = i + 1
+    if bodyCount != 1:
+        return ""
+    if parser.ParserStartsWith(exprText, "let ") ||
+       parser.ParserStartsWith(exprText, "var ") ||
+       parser.ParserStartsWith(exprText, "const ") ||
+       parser.ParserStartsWith(exprText, "if ") ||
+       parser.ParserStartsWith(exprText, "elif ") ||
+       parser.ParserStartsWith(exprText, "else") ||
+       parser.ParserStartsWith(exprText, "for ") ||
+       parser.ParserStartsWith(exprText, "while ") ||
+       parser.ParserStartsWith(exprText, "case ") ||
+       parser.ParserStartsWith(exprText, "return ") ||
+       parser.ParserStartsWith(exprText, "yield ") ||
+       parser.ParserStartsWith(exprText, "break") ||
+       parser.ParserStartsWith(exprText, "continue"):
+        return ""
+    return exprText
+
 fn TypedExprFunctionParams(lineRaw: str): TypedExprParam[] =
     var out: TypedExprParam[]
     let line = chengpath.PathTrim(lineRaw)
@@ -3997,6 +4061,19 @@ fn TypedExprIrBuildReturnNode(ir: var TypedExprIr,
        params.len == 1 &&
        returnExpr == Fmt"{params[0].name}.len":
         let paramTypeText = TypedExprNormalizeTypeText(params[0].typeText)
+        if paramTypeText == "Bytes" ||
+           paramTypeText == "bytes.Bytes" ||
+           paramTypeText == "rawbytes.Bytes":
+            return TypedExprIrAddOpNode(ir,
+                                        ctx.sourcePath,
+                                        scope.name,
+                                        bodyLineNumber,
+                                        TypedExprIrOpReturnBytesLenArg0,
+                                        "int32",
+                                        returnExpr,
+                                        paramNodeIndices[0],
+                                        -1,
+                                        -1)
         if (paramTypeText.len >= 2 && chengpath.TextSlice(paramTypeText, paramTypeText.len - 2, 2) == "[]") ||
            parser.ParserStartsWith(paramTypeText, "seq["):
             return TypedExprIrAddOpNode(ir,
@@ -4009,6 +4086,48 @@ fn TypedExprIrBuildReturnNode(ir: var TypedExprIr,
                                         paramNodeIndices[0],
                                         -1,
                                         -1)
+    if scope.returnType == "char" &&
+       params.len == 1:
+        if (params[0].typeText == "char" && returnExpr == params[0].name) ||
+           (params[0].typeText == "int32" && returnExpr == Fmt"char({params[0].name})"):
+            return TypedExprIrAddOpNode(ir,
+                                        ctx.sourcePath,
+                                        scope.name,
+                                        bodyLineNumber,
+                                        TypedExprIrOpReturnCharArg0,
+                                        "char",
+                                        returnExpr,
+                                        paramNodeIndices[0],
+                                        -1,
+                                        -1)
+    if scope.returnType == "int64" &&
+       params.len == 1 &&
+       params[0].typeText == "int32" &&
+       returnExpr == Fmt"int64({params[0].name})":
+        return TypedExprIrAddOpNode(ir,
+                                    ctx.sourcePath,
+                                    scope.name,
+                                    bodyLineNumber,
+                                    TypedExprIrOpReturnI64FromI32Arg0,
+                                    "int64",
+                                    returnExpr,
+                                    paramNodeIndices[0],
+                                    -1,
+                                    -1)
+    if scope.returnType == "bool" &&
+       params.len == 1 &&
+       params[0].typeText == "int32" &&
+       returnExpr == Fmt"{params[0].name} >= 0 && {params[0].name} <= 31":
+        return TypedExprIrAddOpNode(ir,
+                                    ctx.sourcePath,
+                                    scope.name,
+                                    bodyLineNumber,
+                                    TypedExprIrOpReturnBoolI32Arg0Range0To31,
+                                    "bool",
+                                    returnExpr,
+                                    paramNodeIndices[0],
+                                    -1,
+                                    -1)
     if params.len == 1 &&
        returnExpr == params[0].name &&
        TypedExprNormalizeTypeText(scope.returnType) == TypedExprNormalizeTypeText(params[0].typeText):
@@ -4025,6 +4144,25 @@ fn TypedExprIrBuildReturnNode(ir: var TypedExprIr,
                                         TypedExprIrOpReturnComposite16Arg0,
                                         returnTypeText,
                                         params[0].name,
+                                        paramNodeIndices[0],
+                                        -1,
+                                        -1)
+    if params.len == 1 &&
+       returnExpr == Fmt"{params[0].name}.data":
+        let returnTypeText = TypedExprNormalizeTypeText(scope.returnType)
+        let paramTypeText = TypedExprNormalizeTypeText(params[0].typeText)
+        if (returnTypeText == "Bytes" ||
+            returnTypeText == "bytes.Bytes" ||
+            returnTypeText == "rawbytes.Bytes") &&
+           (paramTypeText == "ByteBuffer" ||
+            paramTypeText == "buffer.ByteBuffer"):
+            return TypedExprIrAddOpNode(ir,
+                                        ctx.sourcePath,
+                                        scope.name,
+                                        bodyLineNumber,
+                                        TypedExprIrOpReturnComposite16Field0Arg0,
+                                        returnTypeText,
+                                        returnExpr,
                                         paramNodeIndices[0],
                                         -1,
                                         -1)
@@ -5608,6 +5746,10 @@ fn TypedExprBuildFact(ctx: var TypedExprSourceContext,
                 builtinTypeText = "str"
             TypedExprApplyResolvedType(fact, ctx, sourceContexts, builtinTypeText, sink, true)
             return fact
+        if !fact.callResolved:
+            fact.typeText = "call_expr"
+            fact.placeKind = TypedExprPlaceCallResult
+            return fact
         let detailReturnType = TypedExprLookupCallTargetReturnTypeFromFact(sourceContexts, fact)
         if detailReturnType != "":
             var targetCtx = TypedExprSourceContextForPathOrCurrent(ctx,
@@ -5646,6 +5788,20 @@ fn TypedExprBuildFact(ctx: var TypedExprSourceContext,
                 let targetSourcePath = TypedExprLookupQualifiedModuleSourcePath(ctx,
                                                                                   sourceContexts,
                                                                                   fact.callQualifier)
+                var targetImportc = false
+                let targetIndex = TypedExprSourceContextLookup(sourceContexts, targetSourcePath)
+                if targetIndex >= 0:
+                    let localReturnType = TypedExprLookupLocalFunctionReturnType(sourceContexts[targetIndex],
+                                                                                  fact.callCallee)
+                    if localReturnType == "":
+                        let importReturnType = TypedExprLookupImportcReturnType(sourceContexts[targetIndex],
+                                                                                fact.callCallee)
+                        targetImportc = importReturnType != ""
+                fact.callResolved = true
+                fact.callReason = TypedExprCallReasonNone
+                fact.callTarget = fact.callCallee
+                fact.callTargetSourcePath = targetSourcePath
+                fact.callTargetImportc = targetImportc
                 var targetCtx = TypedExprSourceContextForPathOrCurrent(ctx,
                                                                          sourceContexts,
                                                                          targetSourcePath)
@@ -7086,7 +7242,10 @@ fn TypedExprBuildIrForScope(ctx: var TypedExprSourceContext,
         if topLevelReturnExpr != "":
             returnExpr = topLevelReturnExpr
         else:
-            returnExpr = ""
+            let singleExpr = TypedExprFunctionSingleExpressionBodyExpr(ctx,
+                                                                       scope,
+                                                                       returnLineNumber)
+            returnExpr = singleExpr
     let params = TypedExprFunctionParams(TypedExprFunctionDeclHeaderText(ctx.lines, scope.startLine))
     var paramNodeIndices: int32[]
     TypedExprIrAddParamNodes(ir,
@@ -7166,7 +7325,10 @@ fn TypedExprBuildIrForScopeWithFactsAndExprLayer(ctx: var TypedExprSourceContext
         if topLevelReturnExpr != "":
             returnExpr = topLevelReturnExpr
         else:
-            returnExpr = ""
+            let singleExpr = TypedExprFunctionSingleExpressionBodyExpr(ctx,
+                                                                       scope,
+                                                                       returnLineNumber)
+            returnExpr = singleExpr
     let params = TypedExprFunctionParams(TypedExprFunctionDeclHeaderText(ctx.lines, scope.startLine))
     var paramNodeIndices: int32[]
     TypedExprIrAddParamNodes(ir,
@@ -7263,7 +7425,10 @@ fn TypedExprBuildIrForScopeFromExprLayer(ctx: var TypedExprSourceContext,
         if topLevelReturnExpr != "":
             returnExpr = topLevelReturnExpr
         else:
-            returnExpr = ""
+            let singleExpr = TypedExprFunctionSingleExpressionBodyExpr(ctx,
+                                                                       scope,
+                                                                       returnLineNumber)
+            returnExpr = singleExpr
     let params = TypedExprFunctionParams(TypedExprFunctionDeclHeaderText(ctx.lines, scope.startLine))
     var paramNodeIndices: int32[]
     TypedExprIrAddParamNodes(ir,

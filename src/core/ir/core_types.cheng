@@ -418,9 +418,24 @@ fn CallArgSlotConstTrue(): int32 =
 fn CallArgSlotConstFalse(): int32 =
     return 0 - 2147483645
 
+fn CallArgSlotCStringBase(): int32 =
+    return 0 - 2147483000
+
+fn CallArgSlotCString(literalId: int32): int32 =
+    return CallArgSlotCStringBase() + literalId
+
 fn CallArgSlotIsConst(slot: int32): bool =
     return slot == CallArgSlotConstTrue() ||
            slot == CallArgSlotConstFalse()
+
+fn CallArgSlotIsCString(slot: int32): bool =
+    return slot >= CallArgSlotCStringBase() &&
+           slot < 0
+
+fn CallArgSlotCStringId(slot: int32): int32 =
+    if !CallArgSlotIsCString(slot):
+        return -1
+    return slot - CallArgSlotCStringBase()
 
 fn CallArgSlotConstI32Value(slot: int32): int32 =
     if slot == CallArgSlotConstTrue():
@@ -673,17 +688,22 @@ fn bodyIRDodCheckMaybeLocalRef(report: var BodyIRDodSoAContractReport,
 fn bodyIRDodCheckCallArgRef(report: var BodyIRDodSoAContractReport,
                              owner: str,
                              value: int32,
-                             limit: int32) =
+                             localLimit: int32,
+                             cstringLimit: int32) =
     if value == CallArgSlotMissing():
-        bodyIRDodMarkInvalid(report, owner, value, limit)
+        bodyIRDodMarkInvalid(report, owner, value, localLimit)
         return
     if value < 0:
         if CallArgSlotIsConst(value):
             report.encodedParamRefCount = report.encodedParamRefCount + 1
             return
-        bodyIRDodMarkInvalid(report, owner, value, limit)
+        if CallArgSlotIsCString(value):
+            let literalId = CallArgSlotCStringId(value)
+            bodyIRDodCheckCStringRef(report, owner, literalId, cstringLimit)
+            return
+        bodyIRDodMarkInvalid(report, owner, value, localLimit)
         return
-    bodyIRDodCheckLocalRef(report, owner, value, limit)
+    bodyIRDodCheckLocalRef(report, owner, value, localLimit)
 
 fn bodyIRDodCheckBlockRef(report: var BodyIRDodSoAContractReport,
                            owner: str,
@@ -817,7 +837,8 @@ fn bodyIRDodCheckCallSequence(bodyIR: BodyIR,
             bodyIRDodCheckCallArgRef(report,
                                      Fmt"callSequence[{callIndex}].argSlots[{argIndex}]",
                                      callOp.argSlots[argIndex],
-                                     bodyIR.localSlots.len)
+                                     bodyIR.localSlots.len,
+                                     bodyIR.cstringLiterals.len)
 
 fn bodyIRDodCheckOpTarget(bodyIR: BodyIR,
                            report: var BodyIRDodSoAContractReport,
