@@ -141,6 +141,7 @@ type
         LocalF64,
         LocalStr,
         LocalPtr,
+        LocalAggregate,
         LocalI64
 
 const
@@ -177,6 +178,17 @@ const
     LocalPtrTag = 4
     LocalAggregateTag = 5
     LocalI64Tag = 6
+    BodyPlaceStackValueTag = 0
+    BodyPlaceParamAddressTag = 1
+    BodyPlaceBorrowAddressTag = 2
+    BodyPlaceGlobalAddressTag = 3
+    BodyCallPassStackValueTag = 0
+    BodyCallPassParamAddressTag = 1
+    BodyCallPassBorrowAddressTag = 2
+    BodyCallPassSretResultTag = 3
+    BodyCallPassByAddressAggregateTag = 4
+    BodyCallPassGlobalAddressTag = 5
+    BodyCallPassPtrNilTag = 6
     BodyBranchIfLocalNilReturnI32ConstTag = 1
     BodyBranchIfLocalLeZeroReturnI32ConstTag = 2
     BodyBranchIfLocalLeZeroReturnCallNoargTag = 3
@@ -314,6 +326,7 @@ type
         id: int32
         name: str
         typeKind: int32
+        placeKind: int32
         stackOffset: int32
         sizeBytes: int32
         alignBytes: int32
@@ -325,7 +338,9 @@ type
     CallOp =
         targetSymbol: str
         argSlots: int32[]
+        argPassKinds: int32[]
         resultSlot: int32
+        resultPassKind: int32
         relocWordOffset: int32
 
     CStringLiteralEntry =
@@ -349,12 +364,15 @@ type
         operands: int32[]
         callTargetSymbols: str[]
         callResultSlots: int32[]
+        callResultPassKinds: int32[]
         callRelocWordOffsets: int32[]
         callArgStarts: int32[]
         callArgCounts: int32[]
         callArgSlots: int32[]
+        callArgPassKinds: int32[]
         localIds: int32[]
         localTypeKinds: int32[]
+        localPlaceKinds: int32[]
         localStackOffsets: int32[]
         localSizeBytes: int32[]
         localAlignBytes: int32[]
@@ -426,18 +444,32 @@ fn CallArgSlotConstTrue(): int32 =
 fn CallArgSlotConstFalse(): int32 =
     return 0 - 2147483645
 
+fn CallArgSlotConstPtrNil(): int32 =
+    return 0 - 2147483644
+
 fn CallArgSlotCStringBase(): int32 =
     return 0 - 2147483000
+
+fn CallArgSlotAddressBase(): int32 =
+    return 0 - 2147482000
 
 fn CallArgSlotCString(literalId: int32): int32 =
     return CallArgSlotCStringBase() + literalId
 
+fn CallArgSlotAddress(slotId: int32): int32 =
+    return CallArgSlotAddressBase() + slotId
+
 fn CallArgSlotIsConst(slot: int32): bool =
     return slot == CallArgSlotConstTrue() ||
-           slot == CallArgSlotConstFalse()
+           slot == CallArgSlotConstFalse() ||
+           slot == CallArgSlotConstPtrNil()
 
 fn CallArgSlotIsCString(slot: int32): bool =
     return slot >= CallArgSlotCStringBase() &&
+           slot < CallArgSlotAddressBase()
+
+fn CallArgSlotIsAddress(slot: int32): bool =
+    return slot >= CallArgSlotAddressBase() &&
            slot < 0
 
 fn CallArgSlotCStringId(slot: int32): int32 =
@@ -445,10 +477,17 @@ fn CallArgSlotCStringId(slot: int32): int32 =
         return -1
     return slot - CallArgSlotCStringBase()
 
+fn CallArgSlotAddressId(slot: int32): int32 =
+    if !CallArgSlotIsAddress(slot):
+        return -1
+    return slot - CallArgSlotAddressBase()
+
 fn CallArgSlotConstI32Value(slot: int32): int32 =
     if slot == CallArgSlotConstTrue():
         return 1
     if slot == CallArgSlotConstFalse():
+        return 0
+    if slot == CallArgSlotConstPtrNil():
         return 0
     return 0
 
@@ -549,6 +588,7 @@ fn BodyIRLocalTypePlainNoAliasProof(typeKind: int32): bool =
            typeKind == LocalF64Tag
 
 fn BodyIRApplyLocalSlotDefaultProof(slot: var LocalSlot) =
+    slot.placeKind = BodyPlaceStackValueTag
     slot.ownership = OwnPlain
     slot.aliasClass = AliasUnknown
     slot.escapeKind = EscapeNone
@@ -571,15 +611,19 @@ fn BodyIRFlattenSoA(bodyIR: BodyIR): BodyIRFlatSoA =
         let callOp = bodyIR.callSequence[callIndex]
         add(out.callTargetSymbols, callOp.targetSymbol)
         add(out.callResultSlots, callOp.resultSlot)
+        add(out.callResultPassKinds, callOp.resultPassKind)
         add(out.callRelocWordOffsets, callOp.relocWordOffset)
         add(out.callArgStarts, out.callArgSlots.len)
         add(out.callArgCounts, callOp.argSlots.len)
         for argIndex in 0..<callOp.argSlots.len:
             add(out.callArgSlots, callOp.argSlots[argIndex])
+            if argIndex < callOp.argPassKinds.len:
+                add(out.callArgPassKinds, callOp.argPassKinds[argIndex])
     for localIndex in 0..<bodyIR.localSlots.len:
         let slot = bodyIR.localSlots[localIndex]
         add(out.localIds, slot.id)
         add(out.localTypeKinds, slot.typeKind)
+        add(out.localPlaceKinds, slot.placeKind)
         add(out.localStackOffsets, slot.stackOffset)
         add(out.localSizeBytes, slot.sizeBytes)
         add(out.localAlignBytes, slot.alignBytes)
@@ -613,7 +657,7 @@ fn BodyIRFlattenSoA(bodyIR: BodyIR): BodyIRFlatSoA =
     return out
 
 fn BodyIRFlatSoAScalarArrayCount(): int32 =
-    return 32
+    return 35
 
 fn BodyIRFlatSoAStringArrayCount(): int32 =
     return 3
@@ -624,11 +668,15 @@ fn BodyIRFlatSoAIsAligned(flat: BodyIRFlatSoA): bool =
        flat.opKinds.len != flat.opOperandCounts.len:
         return false
     if flat.callTargetSymbols.len != flat.callResultSlots.len ||
+       flat.callTargetSymbols.len != flat.callResultPassKinds.len ||
        flat.callTargetSymbols.len != flat.callRelocWordOffsets.len ||
        flat.callTargetSymbols.len != flat.callArgStarts.len ||
        flat.callTargetSymbols.len != flat.callArgCounts.len:
         return false
+    if flat.callArgSlots.len != flat.callArgPassKinds.len:
+        return false
     if flat.localIds.len != flat.localTypeKinds.len ||
+       flat.localIds.len != flat.localPlaceKinds.len ||
        flat.localIds.len != flat.localStackOffsets.len ||
        flat.localIds.len != flat.localSizeBytes.len ||
        flat.localIds.len != flat.localAlignBytes.len ||
@@ -659,7 +707,42 @@ fn bodyIRDodBoolText(value: bool): str =
     return "0"
 
 fn bodyIRDodBodyOpKindValid(kind: int32): bool =
-    return kind >= BodyOpLoadConstTag && kind <= BodyOpGlobalStoreTag
+    return kind >= BodyOpLoadConstTag && kind <= BodyOpStrEqTag
+
+fn bodyIRDodLocalTypeKindValid(kind: int32): bool =
+    return kind == LocalI32Tag ||
+           kind == LocalF64Tag ||
+           kind == LocalStrTag ||
+           kind == LocalPtrTag ||
+           kind == LocalAggregateTag ||
+           kind == LocalI64Tag
+
+fn bodyIRDodPlaceKindValid(kind: int32): bool =
+    return kind == BodyPlaceStackValueTag ||
+           kind == BodyPlaceParamAddressTag ||
+           kind == BodyPlaceBorrowAddressTag ||
+           kind == BodyPlaceGlobalAddressTag
+
+fn bodyIRDodCallPassKindValid(kind: int32): bool =
+    return kind == BodyCallPassStackValueTag ||
+           kind == BodyCallPassParamAddressTag ||
+           kind == BodyCallPassBorrowAddressTag ||
+           kind == BodyCallPassSretResultTag ||
+           kind == BodyCallPassByAddressAggregateTag ||
+           kind == BodyCallPassGlobalAddressTag ||
+           kind == BodyCallPassPtrNilTag
+
+fn bodyIRDodCallArgPassKindValid(kind: int32): bool =
+    return kind == BodyCallPassStackValueTag ||
+           kind == BodyCallPassParamAddressTag ||
+           kind == BodyCallPassBorrowAddressTag ||
+           kind == BodyCallPassByAddressAggregateTag ||
+           kind == BodyCallPassGlobalAddressTag ||
+           kind == BodyCallPassPtrNilTag
+
+fn bodyIRDodCallResultPassKindValid(kind: int32): bool =
+    return kind == BodyCallPassStackValueTag ||
+           kind == BodyCallPassSretResultTag
 
 fn bodyIRDodBodyTermKindValid(kind: int32): bool =
     return kind >= BodyTermReturnTag && kind <= BodyTermCbrTag
@@ -697,8 +780,31 @@ fn bodyIRDodCheckMaybeLocalRef(report: var BodyIRDodSoAContractReport,
 fn bodyIRDodCheckCallArgRef(report: var BodyIRDodSoAContractReport,
                              owner: str,
                              value: int32,
+                             passKind: int32,
                              localLimit: int32,
                              cstringLimit: int32) =
+    if !bodyIRDodCallArgPassKindValid(passKind):
+        bodyIRDodMarkInvalid(report, owner, passKind, BodyCallPassPtrNilTag)
+        return
+    if passKind == BodyCallPassPtrNilTag:
+        report.encodedParamRefCount = report.encodedParamRefCount + 1
+        if value != CallArgSlotConstPtrNil():
+            bodyIRDodMarkInvalid(report, owner, value, CallArgSlotConstPtrNil())
+        return
+    if passKind == BodyCallPassGlobalAddressTag:
+        report.encodedParamRefCount = report.encodedParamRefCount + 1
+        if value < 0:
+            bodyIRDodMarkInvalid(report, owner, value, 0)
+        return
+    if passKind == BodyCallPassParamAddressTag ||
+       passKind == BodyCallPassBorrowAddressTag ||
+       passKind == BodyCallPassByAddressAggregateTag:
+        if !CallArgSlotIsAddress(value):
+            bodyIRDodMarkInvalid(report, owner, value, CallArgSlotAddressBase())
+            return
+        let addressSlotId = CallArgSlotAddressId(value)
+        bodyIRDodCheckLocalRef(report, owner, addressSlotId, localLimit)
+        return
     if value == CallArgSlotMissing():
         bodyIRDodMarkInvalid(report, owner, value, localLimit)
         return
@@ -709,6 +815,10 @@ fn bodyIRDodCheckCallArgRef(report: var BodyIRDodSoAContractReport,
         if CallArgSlotIsCString(value):
             let literalId = CallArgSlotCStringId(value)
             bodyIRDodCheckCStringRef(report, owner, literalId, cstringLimit)
+            return
+        if CallArgSlotIsAddress(value):
+            let slotId = CallArgSlotAddressId(value)
+            bodyIRDodCheckLocalRef(report, owner, slotId, localLimit)
             return
         bodyIRDodMarkInvalid(report, owner, value, localLimit)
         return
@@ -755,6 +865,16 @@ fn bodyIRDodCheckLocalSlots(bodyIR: BodyIR,
                                  Fmt"localSlots[{localIndex}].id",
                                  slot.id,
                                  bodyIR.localSlots.len)
+        if !bodyIRDodLocalTypeKindValid(slot.typeKind):
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"localSlots[{localIndex}].typeKind",
+                                 slot.typeKind,
+                                 LocalI64Tag)
+        if !bodyIRDodPlaceKindValid(slot.placeKind):
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"localSlots[{localIndex}].placeKind",
+                                 slot.placeKind,
+                                 BodyPlaceGlobalAddressTag)
 
 fn bodyIRDodCheckCStringLiterals(bodyIR: BodyIR,
                                   report: var BodyIRDodSoAContractReport) =
@@ -838,6 +958,17 @@ fn bodyIRDodCheckCallSequence(bodyIR: BodyIR,
                                report: var BodyIRDodSoAContractReport) =
     for callIndex in 0..<bodyIR.callSequence.len:
         let callOp = bodyIR.callSequence[callIndex]
+        if callOp.argSlots.len != callOp.argPassKinds.len:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"callSequence[{callIndex}].argPassKinds_len",
+                                 callOp.argPassKinds.len,
+                                 callOp.argSlots.len)
+            return
+        if !bodyIRDodCallResultPassKindValid(callOp.resultPassKind):
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"callSequence[{callIndex}].resultPassKind",
+                                 callOp.resultPassKind,
+                                 BodyCallPassSretResultTag)
         bodyIRDodCheckMaybeLocalRef(report,
                                     Fmt"callSequence[{callIndex}].resultSlot",
                                     callOp.resultSlot,
@@ -846,6 +977,7 @@ fn bodyIRDodCheckCallSequence(bodyIR: BodyIR,
             bodyIRDodCheckCallArgRef(report,
                                      Fmt"callSequence[{callIndex}].argSlots[{argIndex}]",
                                      callOp.argSlots[argIndex],
+                                     callOp.argPassKinds[argIndex],
                                      bodyIR.localSlots.len,
                                      bodyIR.cstringLiterals.len)
 
@@ -941,7 +1073,7 @@ fn bodyIRDodCheckOp(bodyIR: BodyIR,
         bodyIRDodMarkInvalid(report,
                              Fmt"ops[{opIndex}].kind",
                              op.kind,
-                             BodyOpFieldStoreTag)
+                             BodyOpStrEqTag)
         return
     bodyIRDodCheckOpTarget(bodyIR, report, opIndex, op)
     if op.kind == BodyOpCallTag:
