@@ -501,7 +501,11 @@ fn PrimaryBodyIrTypeKindFromText(typeRaw: str): int32 =
     if PrimaryStartsWith(normType, "Result["):
         return coreir.LocalAggregateTag
     if len(normType) > 0:
-        let firstCh = normType[0]
+        var leafStart = 0
+        for ci in 0..<len(normType):
+            if normType[ci] == '.':
+                leafStart = ci + 1
+        let firstCh = normType[leafStart]
         if firstCh >= 'A' && firstCh <= 'Z':
             return coreir.LocalAggregateTag
     return coreir.LocalI32Tag
@@ -790,6 +794,8 @@ fn PrimaryBodyIrCallArgWordCount(bodyIR: coreir.BodyIR,
         return 1
     if coreir.CallArgSlotIsCString(argSlot):
         return 2
+    if coreir.CallArgSlotIsAddress(argSlot):
+        return 1
     return PrimaryBodyIrLoadSlotWordCount(bodyIR, argSlot)
 
 fn PrimaryIncomingParamStackOffset(frameBytes: int32,
@@ -998,16 +1004,16 @@ fn PrimaryBodyIrTargetFunctionIndex(typedIr: texpr.TypedExprIr,
             found = i
     return found
 
-fn PrimaryBodyIrTargetParamIsVarI32(typedIr: texpr.TypedExprIr,
-                                     stmt: texpr.TypedExprIrStatement,
-                                     argIndex: int32): bool =
+fn PrimaryBodyIrTargetParamType(typedIr: texpr.TypedExprIr,
+                                 stmt: texpr.TypedExprIrStatement,
+                                 argIndex: int32): str =
     if stmt.callTargetImportc || argIndex < 0:
-        return false
+        return ""
     let fnIndex = PrimaryBodyIrTargetFunctionIndex(typedIr,
                                                   stmt.callTargetSourcePath,
                                                   stmt.callTarget)
     if fnIndex < 0 || fnIndex >= typedIr.functions.len:
-        return false
+        return ""
     let targetFn = typedIr.functions[fnIndex]
     var nodeEnd = targetFn.nodeStart + targetFn.nodeCount
     if nodeEnd > typedIr.nodes.len:
@@ -1018,8 +1024,19 @@ fn PrimaryBodyIrTargetParamIsVarI32(typedIr: texpr.TypedExprIr,
             continue
         if node.paramSlot != argIndex:
             continue
-        return PrimaryBodyIrTypeTextIsVarI32(node.resultType)
-    return false
+        return node.resultType
+    return ""
+
+fn PrimaryBodyIrTypeTextIsVarParam(typeRaw: str): bool =
+    let normType = texpr.TypedExprNormalizeTypeText(typeRaw)
+    return PrimaryStartsWith(normType, "var")
+
+fn PrimaryBodyIrTargetParamIsVarI32(typedIr: texpr.TypedExprIr,
+                                     stmt: texpr.TypedExprIrStatement,
+                                     argIndex: int32): bool =
+    return PrimaryBodyIrTypeTextIsVarI32(PrimaryBodyIrTargetParamType(typedIr,
+                                                                      stmt,
+                                                                      argIndex))
 
 fn PrimaryBodyIrAppendInvalidOp(bodyIR: var coreir.BodyIR,
                                 lineNumber: int32,
@@ -1149,7 +1166,8 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
     let argNames = PrimaryBodyIrCallArgNames(stmt.callArgsText)
     for argIndex in 0..<argNames.len:
         let argName = argNames[argIndex]
-        let targetNeedsAddress = PrimaryBodyIrTargetParamIsVarI32(typedIr, stmt, argIndex)
+        let targetParamType = PrimaryBodyIrTargetParamType(typedIr, stmt, argIndex)
+        let targetNeedsAddress = PrimaryBodyIrTypeTextIsVarParam(targetParamType)
         if PrimaryBodyIrTextIsI32Zero(argName):
             if targetNeedsAddress:
                 failureDetail0 = 11
@@ -1209,13 +1227,38 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
             var slotId = PrimaryBodyIrFindArgSlot(slotNames, argName)
             if targetNeedsAddress:
                 if slotId < 0:
+                    let valueType = texpr.TypedExprStripVarType(targetParamType)
+                    var layoutSourcePath = stmt.callTargetSourcePath
+                    if layoutSourcePath == "":
+                        layoutSourcePath = stmt.sourcePath
+                    slotId = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                                slotNames,
+                                                                typedIr,
+                                                                layoutSourcePath,
+                                                                argName,
+                                                                valueType)
+                elif !(PrimaryBodyIrLocalIsParam(bodyIR.localSlots[slotId]) &&
+                       PrimaryBodyIrSlotType(bodyIR, slotId) == coreir.LocalPtrTag):
+                    let valueType = texpr.TypedExprStripVarType(targetParamType)
+                    var layoutSourcePath = stmt.callTargetSourcePath
+                    if layoutSourcePath == "":
+                        layoutSourcePath = stmt.sourcePath
+                    slotId = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                                slotNames,
+                                                                typedIr,
+                                                                layoutSourcePath,
+                                                                argName,
+                                                                valueType)
+                if slotId < 0:
                     failureDetail0 = 31
                     failureDetail1 = argIndex
                     return false
-                if PrimaryBodyIrSlotType(bodyIR, slotId) != coreir.LocalPtrTag:
-                    failureDetail0 = 32
-                    failureDetail1 = PrimaryBodyIrSlotType(bodyIR, slotId)
-                    return false
+                if PrimaryBodyIrLocalIsParam(bodyIR.localSlots[slotId]) &&
+                   PrimaryBodyIrSlotType(bodyIR, slotId) == coreir.LocalPtrTag:
+                    add(call.argSlots, slotId)
+                else:
+                    add(call.argSlots, coreir.CallArgSlotAddress(slotId))
+                continue
             elif PrimaryBodyIrNameInList(varI32ParamNames, argName):
                 slotId = PrimaryBodyIrI32ValueSlotForText(bodyIR, slotNames, varI32ParamNames, argName)
             elif slotId < 0:
@@ -3326,6 +3369,17 @@ fn PrimaryBodyIRFillCallArgToReg(words: var int32[],
         words[offset] = a64.A64EncAdrp(reg)
         words[offset + 1] = Value(a64.A64EncAddImm(true, reg, reg, 0))
         return offset + 2
+    if coreir.CallArgSlotIsAddress(argSlot):
+        let slotId = coreir.CallArgSlotAddressId(argSlot)
+        let slotOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                       slotId,
+                                                       frameBytes,
+                                                       paramSaveOffset,
+                                                       paramSaveCount)
+        if slotOffset < 0 || slotOffset > 4095:
+            return -1
+        words[offset] = Value(a64.A64EncAddImm(true, reg, a64.A64SP, slotOffset))
+        return offset + 1
     return PrimaryBodyIRLoadSlotToReg(words,
                                       offset,
                                       bodyIR,
