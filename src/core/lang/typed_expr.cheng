@@ -354,6 +354,13 @@ type
         typeLayoutSizeBytes: int32[]
         typeLayoutAlignBytes: int32[]
         typeLayoutFieldCounts: int32[]
+        typeFieldSourcePaths: str[]
+        typeFieldOwnerTypes: str[]
+        typeFieldNames: str[]
+        typeFieldTypes: str[]
+        typeFieldOffsetBytes: int32[]
+        typeFieldSizeBytes: int32[]
+        typeFieldAlignBytes: int32[]
         enumValueSourcePaths: str[]
         enumValueNames: str[]
         enumValueTypes: str[]
@@ -1013,6 +1020,20 @@ fn TypedExprIrClone(ir: var TypedExprIr): TypedExprIr =
         add(out.typeLayoutAlignBytes, ir.typeLayoutAlignBytes[i])
     for i in 0..<ir.typeLayoutFieldCounts.len:
         add(out.typeLayoutFieldCounts, ir.typeLayoutFieldCounts[i])
+    for i in 0..<ir.typeFieldSourcePaths.len:
+        add(out.typeFieldSourcePaths, ir.typeFieldSourcePaths[i])
+    for i in 0..<ir.typeFieldOwnerTypes.len:
+        add(out.typeFieldOwnerTypes, ir.typeFieldOwnerTypes[i])
+    for i in 0..<ir.typeFieldNames.len:
+        add(out.typeFieldNames, ir.typeFieldNames[i])
+    for i in 0..<ir.typeFieldTypes.len:
+        add(out.typeFieldTypes, ir.typeFieldTypes[i])
+    for i in 0..<ir.typeFieldOffsetBytes.len:
+        add(out.typeFieldOffsetBytes, ir.typeFieldOffsetBytes[i])
+    for i in 0..<ir.typeFieldSizeBytes.len:
+        add(out.typeFieldSizeBytes, ir.typeFieldSizeBytes[i])
+    for i in 0..<ir.typeFieldAlignBytes.len:
+        add(out.typeFieldAlignBytes, ir.typeFieldAlignBytes[i])
     for i in 0..<ir.enumValueSourcePaths.len:
         add(out.enumValueSourcePaths, ir.enumValueSourcePaths[i])
     for i in 0..<ir.enumValueNames.len:
@@ -5481,6 +5502,49 @@ fn TypedExprIrAppendTypeLayout(ir: var TypedExprIr,
     add(ir.typeLayoutAlignBytes, alignBytes)
     add(ir.typeLayoutFieldCounts, fieldCount)
 
+fn TypedExprIrAppendTypeFieldLayout(ir: var TypedExprIr,
+                                     sourcePathRaw: str,
+                                     ownerTypeRaw: str,
+                                     fieldNameRaw: str,
+                                     fieldTypeRaw: str,
+                                     fieldOffsetBytes: int32,
+                                     fieldSizeBytes: int32,
+                                     fieldAlignBytes: int32) =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let ownerType = TypedExprNormalizeTypeText(ownerTypeRaw)
+    let fieldName = parser.ParserIdentPrefix(chengpath.PathTrim(fieldNameRaw))
+    let fieldType = TypedExprNormalizeTypeText(fieldTypeRaw)
+    if sourcePath == "" || ownerType == "" || fieldName == "" || fieldType == "":
+        return
+    if fieldOffsetBytes < 0 || fieldSizeBytes <= 0 || fieldAlignBytes <= 0:
+        return
+    for i in 0..<ir.typeFieldOwnerTypes.len:
+        if i >= ir.typeFieldSourcePaths.len || i >= ir.typeFieldNames.len:
+            continue
+        if parser.ParserNormalizePath(ir.typeFieldSourcePaths[i]) == sourcePath &&
+           ir.typeFieldOwnerTypes[i] == ownerType &&
+           ir.typeFieldNames[i] == fieldName:
+            return
+    add(ir.typeFieldSourcePaths, sourcePath)
+    add(ir.typeFieldOwnerTypes, ownerType)
+    add(ir.typeFieldNames, fieldName)
+    add(ir.typeFieldTypes, fieldType)
+    add(ir.typeFieldOffsetBytes, fieldOffsetBytes)
+    add(ir.typeFieldSizeBytes, fieldSizeBytes)
+    add(ir.typeFieldAlignBytes, fieldAlignBytes)
+
+fn TypedExprMaybeQualifyImportedFieldType(importedCtx: var TypedExprSourceContext,
+                                           qualifier: str,
+                                           fieldTypeRaw: str): str =
+    let fieldType = TypedExprNormalizeTypeText(fieldTypeRaw)
+    if qualifier == "" || fieldType == "":
+        return fieldType
+    if TypedExprQualifiedTypeDot(fieldType) > 0:
+        return fieldType
+    if TypedExprSourceHasDeclaredType(importedCtx, fieldType):
+        return Fmt"{qualifier}.{fieldType}"
+    return fieldType
+
 fn TypedExprIrAppendTypeLayoutsFromContext(ir: var TypedExprIr,
                                             ctx: var TypedExprSourceContext,
                                             sourceContexts: var TypedExprSourceContext[]) =
@@ -5497,6 +5561,32 @@ fn TypedExprIrAppendTypeLayoutsFromContext(ir: var TypedExprIr,
                                     sizeBytes,
                                     alignBytes,
                                     fieldCount)
+        let ownerType = TypedExprTypeLeafName(typeName)
+        for fieldIndex in 0..<ctx.typeFields.len:
+            let field = ctx.typeFields[fieldIndex]
+            if field.ownerType != ownerType:
+                continue
+            var fieldType = ""
+            var fieldOffsetBytes: int32
+            var fieldSizeBytes: int32
+            var fieldAlignBytes: int32
+            if !TypedExprResolveFieldPathMeta(ctx,
+                                             sourceContexts,
+                                             typeName,
+                                             field.fieldName,
+                                             fieldType,
+                                             fieldOffsetBytes,
+                                             fieldSizeBytes,
+                                             fieldAlignBytes):
+                continue
+            TypedExprIrAppendTypeFieldLayout(ir,
+                                             ctx.sourcePath,
+                                             typeName,
+                                             field.fieldName,
+                                             fieldType,
+                                             fieldOffsetBytes,
+                                             fieldSizeBytes,
+                                             fieldAlignBytes)
     for importIndex in 0..<ctx.importedModules.len:
         let qualifier = ctx.importedModules[importIndex].qualifier
         let targetSourcePath = ctx.importedModules[importIndex].targetSourcePath
@@ -5523,6 +5613,34 @@ fn TypedExprIrAppendTypeLayoutsFromContext(ir: var TypedExprIr,
                                         importedSizeBytes,
                                         importedAlignBytes,
                                         importedFieldCount)
+            let importedOwnerType = TypedExprTypeLeafName(importedTypeName)
+            for fieldIndex in 0..<sourceContexts[targetIndex].typeFields.len:
+                let field = sourceContexts[targetIndex].typeFields[fieldIndex]
+                if field.ownerType != importedOwnerType:
+                    continue
+                var fieldType = ""
+                var fieldOffsetBytes: int32
+                var fieldSizeBytes: int32
+                var fieldAlignBytes: int32
+                if !TypedExprResolveFieldPathMeta(sourceContexts[targetIndex],
+                                                 sourceContexts,
+                                                 importedTypeName,
+                                                 field.fieldName,
+                                                 fieldType,
+                                                 fieldOffsetBytes,
+                                                 fieldSizeBytes,
+                                                 fieldAlignBytes):
+                    continue
+                TypedExprIrAppendTypeFieldLayout(ir,
+                                                 ctx.sourcePath,
+                                                 Fmt"{qualifier}.{importedTypeName}",
+                                                 field.fieldName,
+                                                 TypedExprMaybeQualifyImportedFieldType(sourceContexts[targetIndex],
+                                                                                        qualifier,
+                                                                                        fieldType),
+                                                 fieldOffsetBytes,
+                                                 fieldSizeBytes,
+                                                 fieldAlignBytes)
 
 fn TypedExprIrAppendEnumValuesFromContext(ir: var TypedExprIr,
                                            ctx: var TypedExprSourceContext) =
@@ -5764,6 +5882,82 @@ fn TypedExprIrLookupTypeLayout(ir: TypedExprIr,
     alignBytes = ir.typeLayoutAlignBytes[foundIndex]
     fieldCount = ir.typeLayoutFieldCounts[foundIndex]
     return sizeBytes > 0 && alignBytes > 0
+
+fn TypedExprIrLookupSingleFieldMeta(ir: TypedExprIr,
+                                     sourcePathRaw: str,
+                                     ownerTypeRaw: str,
+                                     fieldNameRaw: str,
+                                     fieldType: var str,
+                                     fieldOffsetBytes: var int32,
+                                     fieldSizeBytes: var int32,
+                                     fieldAlignBytes: var int32): bool =
+    fieldType = ""
+    fieldOffsetBytes = 0
+    fieldSizeBytes = 0
+    fieldAlignBytes = 0
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let ownerType = TypedExprStripVarType(ownerTypeRaw)
+    let fieldName = parser.ParserIdentPrefix(chengpath.PathTrim(fieldNameRaw))
+    if sourcePath == "" || ownerType == "" || fieldName == "":
+        return false
+    for i in 0..<ir.typeFieldOwnerTypes.len:
+        if i >= ir.typeFieldSourcePaths.len ||
+           i >= ir.typeFieldNames.len ||
+           i >= ir.typeFieldTypes.len ||
+           i >= ir.typeFieldOffsetBytes.len ||
+           i >= ir.typeFieldSizeBytes.len ||
+           i >= ir.typeFieldAlignBytes.len:
+            continue
+        if parser.ParserNormalizePath(ir.typeFieldSourcePaths[i]) != sourcePath:
+            continue
+        if ir.typeFieldOwnerTypes[i] != ownerType:
+            continue
+        if ir.typeFieldNames[i] != fieldName:
+            continue
+        fieldType = ir.typeFieldTypes[i]
+        fieldOffsetBytes = ir.typeFieldOffsetBytes[i]
+        fieldSizeBytes = ir.typeFieldSizeBytes[i]
+        fieldAlignBytes = ir.typeFieldAlignBytes[i]
+        return fieldType != "" && fieldOffsetBytes >= 0 && fieldSizeBytes > 0 && fieldAlignBytes > 0
+    return false
+
+fn TypedExprIrLookupFieldPathMeta(ir: TypedExprIr,
+                                   sourcePathRaw: str,
+                                   ownerTypeRaw: str,
+                                   fieldPathRaw: str,
+                                   fieldType: var str,
+                                   fieldOffsetBytes: var int32,
+                                   fieldSizeBytes: var int32,
+                                   fieldAlignBytes: var int32): bool =
+    fieldType = TypedExprStripVarType(ownerTypeRaw)
+    fieldOffsetBytes = 0
+    fieldSizeBytes = 0
+    fieldAlignBytes = 0
+    let parts = parser.ParserSplitChar(chengpath.PathTrim(fieldPathRaw), '.')
+    if fieldType == "" || parts.len <= 0:
+        return false
+    for i in 0..<parts.len:
+        let part = parser.ParserIdentPrefix(parts[i])
+        if part == "":
+            return false
+        var nextType = ""
+        var nextOffset: int32
+        var nextSize: int32
+        var nextAlign: int32
+        if !TypedExprIrLookupSingleFieldMeta(ir,
+                                             sourcePathRaw,
+                                             fieldType,
+                                             part,
+                                             nextType,
+                                             nextOffset,
+                                             nextSize,
+                                             nextAlign):
+            return false
+        fieldOffsetBytes = fieldOffsetBytes + nextOffset
+        fieldType = nextType
+        fieldSizeBytes = nextSize
+        fieldAlignBytes = nextAlign
+    return true
 
 fn TypedExprResolveFieldMeta(currentCtx: var TypedExprSourceContext,
                               sourceContexts: var TypedExprSourceContext[],
