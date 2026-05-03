@@ -680,6 +680,24 @@ fn PrimaryBodyIrFindArgSlot(slotNames: str[], argName: str): int32 =
         return PrimaryBodyIrFindSlotIndex(slotNames, canonical)
     return -1
 
+fn PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR: var coreir.BodyIR,
+                                           slotNames: var str[],
+                                           typedIr: texpr.TypedExprIr,
+                                           sourcePath: str,
+                                           rootName: str,
+                                           rootTypeRaw: str): int32 =
+    let rootType = texpr.TypedExprNormalizeTypeText(rootTypeRaw)
+    if rootName == "":
+        return -1
+    if rootType == "" || PrimaryStartsWith(rootType, "var"):
+        return PrimaryBodyIrFindArgSlot(slotNames, rootName)
+    return PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                              slotNames,
+                                              typedIr,
+                                              sourcePath,
+                                              rootName,
+                                              rootType)
+
 fn PrimaryBodyIrMarkParamSlot(bodyIR: var coreir.BodyIR,
                                slotId: int32,
                                paramSlot: int32) =
@@ -1438,7 +1456,12 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
         if PrimaryBodyIrTextHasFieldOrIndex(lhsName):
             return false
         let lhsSlot = PrimaryBodyIrFindSlotIndex(slotNames, lhsName)
-        let baseSlot = PrimaryBodyIrFindArgSlot(slotNames, stmt.assignValueRootName)
+        let baseSlot = PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR,
+                                                              slotNames,
+                                                              typedIr,
+                                                              stmt.sourcePath,
+                                                              stmt.assignValueRootName,
+                                                              stmt.assignValueRootType)
         let byteCount = stmt.assignValueFieldSizeBytes
         if lhsSlot < 0 || baseSlot < 0 || byteCount <= 0 ||
            PrimaryLocalSlotSizeOf(bodyIR.localSlots[lhsSlot]) < byteCount:
@@ -1453,14 +1476,24 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
         add(bodyIR.ops, loadOp)
         return true
     if stmt.assignFieldName != "":
-        let baseSlot = PrimaryBodyIrFindArgSlot(slotNames, stmt.assignRootName)
+        let baseSlot = PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR,
+                                                              slotNames,
+                                                              typedIr,
+                                                              stmt.sourcePath,
+                                                              stmt.assignRootName,
+                                                              stmt.assignRootType)
         let byteCount = stmt.assignFieldSizeBytes
         if baseSlot < 0 || byteCount <= 0:
             return false
         var valueSlot: int32
         valueSlot = -1
         if stmt.assignValueFieldName != "":
-            let valueBaseSlot = PrimaryBodyIrFindArgSlot(slotNames, stmt.assignValueRootName)
+            let valueBaseSlot = PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR,
+                                                                       slotNames,
+                                                                       typedIr,
+                                                                       stmt.sourcePath,
+                                                                       stmt.assignValueRootName,
+                                                                       stmt.assignValueRootType)
             let valueByteCount = stmt.assignValueFieldSizeBytes
             if valueBaseSlot < 0 || valueByteCount <= 0 || valueByteCount != byteCount:
                 return false
@@ -1515,9 +1548,12 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
         if dotPos < 0:
             return false
         let rootName = strutil.Strip(strings.SliceBytes(lhsName, 0, dotPos))
-        var baseSlot = PrimaryBodyIrFindSlotIndex(slotNames, rootName)
-        if baseSlot < 0:
-            baseSlot = PrimaryBodyIrFindArgSlot(slotNames, rootName)
+        var baseSlot = PrimaryBodyIrFindOrCreateFieldBaseSlot(bodyIR,
+                                                              slotNames,
+                                                              typedIr,
+                                                              stmt.sourcePath,
+                                                              rootName,
+                                                              stmt.assignRootType)
         if baseSlot < 0:
             return false
         var valueSlot = PrimaryBodyIrFindArgSlot(slotNames, rhsText)
@@ -4460,7 +4496,7 @@ fn PrimaryBodyIROpSizeAt(bodyIR: coreir.BodyIR,
                 count = count + 1
             else:
                 let baseSize = PrimaryLocalSlotSizeOf(bodyIR.localSlots[baseSlot])
-                if baseSize > 0 && byteOffset > baseSize - byteCount:
+                if baseSize > 0 && byteOffset >= 0 && byteCount > 0 && byteOffset + byteCount > baseSize && byteOffset < baseSize:
                     return 0
                 accessOffset = baseOffset + byteOffset
         let valueOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
