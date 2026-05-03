@@ -1601,8 +1601,6 @@ fn PrimaryFunctionWordCountForBodyKind(bodyKind: str): int32 =
         return 6
     if bodyKind == texpr.BodyKindRuntimeParamStrCopyBridge:
         return 35
-    if bodyKind == texpr.BodyKindBackendDriverCommandCode:
-        return 357
     if bodyKind == texpr.BodyKindBackendDriverRunCommand:
         return 18
     return 0
@@ -1781,65 +1779,6 @@ fn PrimaryFillBackendDriverRunCommandWords(words: var int32[],
     words[wordOffset + 17] = a64.A64EncRet()
     return true
 
-fn PrimaryFillBackendDriverCommandCodeCase(words: var int32[],
-                                           wordOffset: int32,
-                                           caseOffset: int32,
-                                           commandText: str,
-                                           commandCode: int32): int32 =
-    let caseWordCount = 4 + len(commandText) * 3
-    let nextOffset = caseOffset + caseWordCount
-    if wordOffset < 0 || caseOffset < 0 || wordOffset + nextOffset - 1 >= words.len:
-        return -1
-    var pos = wordOffset + caseOffset
-    let nextWord = wordOffset + nextOffset
-    words[pos] = Value(a64.A64EncCmpImm(false, a64.A64X10, len(commandText)))
-    words[pos + 1] = Value(a64.A64EncBCond(int64(nextWord - (pos + 1)), a64.A64CondNE))
-    pos = pos + 2
-    for i in 0..<len(commandText):
-        words[pos] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, i))
-        words[pos + 1] = Value(a64.A64EncCmpImm(false, a64.A64X11, int32(commandText[i])))
-        words[pos + 2] = Value(a64.A64EncBCond(int64(nextWord - (pos + 2)), a64.A64CondNE))
-        pos = pos + 3
-    words[pos] = PrimaryArm64MovW0ConstWord(commandCode)
-    words[pos + 1] = a64.A64EncRet()
-    return nextOffset
-
-fn PrimaryFillBackendDriverCommandCodeWords(words: var int32[],
-                                            wordOffset: int32): bool =
-    if wordOffset < 0 || wordOffset + 356 >= words.len:
-        return false
-    words[wordOffset] = Value(a64.A64EncLdrImm(true, a64.A64X9, a64.A64X0, int64(0)))
-    words[wordOffset + 1] = Value(a64.A64EncLdrImm(false, a64.A64X10, a64.A64X0, int64(8)))
-    var pos: int32
-    pos = 2
-    pos = PrimaryFillBackendDriverCommandCodeCase(words, wordOffset, pos, "help", 0)
-    if pos < 0:
-        return false
-    pos = PrimaryFillBackendDriverCommandCodeCase(words, wordOffset, pos, "-h", 0)
-    if pos < 0:
-        return false
-    pos = PrimaryFillBackendDriverCommandCodeCase(words, wordOffset, pos, "--help", 0)
-    if pos < 0:
-        return false
-    pos = PrimaryFillBackendDriverCommandCodeCase(words, wordOffset, pos, "status", 1)
-    if pos < 0:
-        return false
-    pos = PrimaryFillBackendDriverCommandCodeCase(words, wordOffset, pos, "print-build-plan", 2)
-    if pos < 0:
-        return false
-    pos = PrimaryFillBackendDriverCommandCodeCase(words, wordOffset, pos, "verify-export-visibility", 3)
-    if pos < 0:
-        return false
-    pos = PrimaryFillBackendDriverCommandCodeCase(words, wordOffset, pos, "verify-export-visibility-parallel", 4)
-    if pos < 0:
-        return false
-    pos = PrimaryFillBackendDriverCommandCodeCase(words, wordOffset, pos, "system-link-exec", 5)
-    if pos < 0 || pos + 2 != 357:
-        return false
-    words[wordOffset + pos] = a64.A64EncMovn(false, a64.A64X0, 0, 0)
-    words[wordOffset + pos + 1] = a64.A64EncRet()
-    return true
-
 fn PrimaryFillReturnStrArg0Words(words: var int32[],
                                  wordOffset: int32): bool =
     if wordOffset < 0 || wordOffset + 6 >= words.len:
@@ -1936,10 +1875,6 @@ fn PrimaryFillInstructionWordsForFunction(words: var int32[],
         if wordCount != 35:
             return false
         return PrimaryFillRuntimeParamStrCopyBridgeWords(words, wordOffset)
-    if bodyKind == texpr.BodyKindBackendDriverCommandCode:
-        if wordCount != 357:
-            return false
-        return PrimaryFillBackendDriverCommandCodeWords(words, wordOffset)
     if bodyKind == texpr.BodyKindBackendDriverRunCommand:
         if wordCount != 18:
             return false
@@ -2717,19 +2652,14 @@ fn PrimaryFillInstructionWords(words: var int32[],
         let wordCount = functionWordCounts[i]
         let hasBodyIR = i < functionBodyIRs.len &&
                         (functionBodyIRs[i].ops.len > 0 || functionBodyIRs[i].terms.len > 0)
-        if wordCount > 0 && hasBodyIR:
+        if hasBodyIR:
             let bodyIR = functionBodyIRs[i]
             let offset = functionWordOffsets[i]
             let emitted = PrimaryBodyIRFillWords(words, offset, wordCount, bodyIR)
-            if emitted != wordCount &&
-               !PrimaryFillInstructionWordsForFunction(words,
-                                                        functionWordOffsets[i],
-                                                        functionWordCounts[i],
-                                                        functionBodyKinds[i]):
+            if emitted != wordCount:
                 ok = false
                 failedIndex = i
-        elif wordCount > 0 &&
-             !PrimaryFillInstructionWordsForFunction(words,
+        elif !PrimaryFillInstructionWordsForFunction(words,
                                                       functionWordOffsets[i],
                                                       functionWordCounts[i],
                                                       functionBodyKinds[i]):
@@ -3377,6 +3307,8 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                                 if bodyIR.ops.len > 0 || bodyIR.terms.len > 0:
                                     tempBodyIRs[i] = bodyIR
                                     wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(bodyIR)
+                if wordCounts[i] <= 0:
+                    wordCounts[i] = 1
         var symbolText = lowering.functionSymbolTexts[i]
         if i < lowering.functionExportedFlags.len &&
            i < lowering.functionExportSymbolNames.len &&
