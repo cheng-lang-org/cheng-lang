@@ -55,6 +55,12 @@ type
         firstMissingBodyIrLastTermResultType: int32
         firstMissingBodyIrLastCallResultSlot: int32
         firstMissingBodyIrLastCallResultType: int32
+        firstMissingBodyIrFirstZeroOpIndex: int32
+        firstMissingBodyIrFirstZeroOpKind: int32
+        firstMissingBodyIrFirstZeroOpTarget: int32
+        firstMissingBodyIrFirstZeroOpOperand0: int32
+        firstMissingBodyIrFirstZeroTermIndex: int32
+        firstMissingBodyIrFirstZeroTermKind: int32
         missingReasons: str[]
         pipelineStage: str
 
@@ -714,10 +720,13 @@ fn PrimaryBodyIrTargetParamIsVarI32(typedIr: texpr.TypedExprIr,
         return PrimaryBodyIrTypeTextIsVarI32(node.resultType)
     return false
 
-fn PrimaryBodyIrAppendInvalidOp(bodyIR: var coreir.BodyIR) =
+fn PrimaryBodyIrAppendInvalidOp(bodyIR: var coreir.BodyIR,
+                                lineNumber: int32,
+                                statementKind: int32) =
     var op: coreir.BodyOp
     op.kind = coreir.BodyOpInvalidTag
-    op.target = -1
+    op.target = lineNumber
+    add(op.operands, statementKind)
     add(bodyIR.ops, op)
 
 fn PrimaryBodyIrAppendVarI32Load(bodyIR: var coreir.BodyIR,
@@ -840,7 +849,9 @@ fn PrimaryBodyIrAppendCallOp(bodyIR: var coreir.BodyIR,
                                     typedIr,
                                     stmt,
                                     varI32ParamNames):
-        PrimaryBodyIrAppendInvalidOp(bodyIR)
+        PrimaryBodyIrAppendInvalidOp(bodyIR,
+                                     stmt.lineNumber,
+                                     int32(stmt.kind))
         return resultSlot
     add(bodyIR.callSequence, call)
     var op: coreir.BodyOp
@@ -1182,7 +1193,9 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                              slotNames,
                                              varI32ParamNames,
                                              stmt):
-                PrimaryBodyIrAppendInvalidOp(bodyIR)
+                PrimaryBodyIrAppendInvalidOp(bodyIR,
+                                             stmt.lineNumber,
+                                             int32(stmt.kind))
             nextOpIndex = nextOpIndex + 1
         elif stmt.kind == texpr.TypedExprIrStmtReturn:
             if stmt.lineNumber == completedReturnLineNumber:
@@ -3500,7 +3513,9 @@ fn PrimaryBodyIROpSizeAt(bodyIR: coreir.BodyIR,
     if op.kind == coreir.BodyOpReturnTag:
         return 1
     if op.kind == coreir.BodyOpLoadConstTag:
-        if op.operands.len >= 2 && op.operands[0] == coreir.LocalI32Tag:
+        if op.operands.len >= 2:
+            if op.operands[0] == coreir.LocalI32Tag:
+                return 2
             return 2
         return 0
     if op.kind == coreir.BodyOpCopyLocalTag ||
@@ -3800,6 +3815,25 @@ fn PrimaryObjectPlanCaptureBodyIrDetails(plan: var PrimaryObjectPlan,
     plan.firstMissingBodyIrBlockCount = bodyIR.blocks.len
     plan.firstMissingBodyIrCallCount = bodyIR.callSequence.len
     plan.firstMissingBodyIrSlotCount = bodyIR.localSlots.len
+    plan.firstMissingBodyIrFirstZeroOpIndex = -1
+    plan.firstMissingBodyIrFirstZeroTermIndex = -1
+    for opIndex in 0..<bodyIR.ops.len:
+        if PrimaryBodyIROpSizeAt(bodyIR, opIndex) > 0:
+            continue
+        let op = bodyIR.ops[opIndex]
+        plan.firstMissingBodyIrFirstZeroOpIndex = opIndex
+        plan.firstMissingBodyIrFirstZeroOpKind = op.kind
+        plan.firstMissingBodyIrFirstZeroOpTarget = op.target
+        if op.operands.len > 0:
+            plan.firstMissingBodyIrFirstZeroOpOperand0 = op.operands[0]
+        break
+    for termIndex in 0..<bodyIR.terms.len:
+        if PrimaryBodyIRTermSize(bodyIR, termIndex) > 0:
+            continue
+        let term = bodyIR.terms[termIndex]
+        plan.firstMissingBodyIrFirstZeroTermIndex = termIndex
+        plan.firstMissingBodyIrFirstZeroTermKind = term.kind
+        break
     if bodyIR.terms.len > 0:
         let term = bodyIR.terms[bodyIR.terms.len - 1]
         plan.firstMissingBodyIrLastTermKind = term.kind
