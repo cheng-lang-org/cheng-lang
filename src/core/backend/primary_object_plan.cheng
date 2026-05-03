@@ -810,6 +810,12 @@ fn PrimaryBodyIrMaterializeFieldArgSlot(bodyIR: var coreir.BodyIR,
     add(bodyIR.ops, op)
     return valueSlot
 
+fn PrimaryBodyIrAlignedOffset(offset: int32, alignRaw: int32): int32 =
+    var align = alignRaw
+    if align <= 0:
+        align = 1
+    return ((offset + align - 1) / align) * align
+
 fn PrimaryBodyIrMarkParamSlot(bodyIR: var coreir.BodyIR,
                                slotId: int32,
                                paramSlot: int32) =
@@ -1961,6 +1967,63 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                        stmt.sourcePath,
                                                        stmt.bindingName,
                                                        stmt.resultType)
+        elif stmt.kind == texpr.TypedExprIrStmtResultIntrinsic:
+            let argNames = PrimaryBodyIrCallArgNames(stmt.callArgsText)
+            var sourceSlot: int32 = -1
+            if argNames.len > 0:
+                sourceSlot = PrimaryBodyIrFindArgSlot(slotNames, argNames[0])
+            var targetSlot: int32 = -1
+            if stmt.bindingName != "":
+                targetSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                                slotNames,
+                                                                typedIr,
+                                                                stmt.sourcePath,
+                                                                stmt.bindingName,
+                                                                stmt.resultType)
+            let resultIntrinsicName = PrimaryCallTargetTailName(stmt.callCallee)
+            var projectKind = coreir.BodyResultProjectInvalidTag
+            var projectOffset: int32
+            var projectByteCount: int32
+            if resultIntrinsicName == "Value":
+                var valueTypeKind: int32
+                var valueSizeBytes: int32
+                var valueAlignBytes: int32
+                PrimaryBodyIrTypeShapeFromText(typedIr,
+                                               stmt.sourcePath,
+                                               stmt.resultType,
+                                               valueTypeKind,
+                                               valueSizeBytes,
+                                               valueAlignBytes)
+                projectKind = coreir.BodyResultProjectValueStrTag
+                projectOffset = PrimaryBodyIrAlignedOffset(1, valueAlignBytes)
+                projectByteCount = valueSizeBytes
+            elif resultIntrinsicName == "Error":
+                projectKind = coreir.BodyResultProjectErrorStrTag
+                projectOffset = coreir.ResultStrErrMsgOffset
+                projectByteCount = 24
+            elif resultIntrinsicName == "IsErr":
+                projectKind = coreir.BodyResultProjectIsErrTag
+            if sourceSlot < 0 ||
+               targetSlot < 0 ||
+               projectKind == coreir.BodyResultProjectInvalidTag ||
+               (projectKind != coreir.BodyResultProjectIsErrTag &&
+                projectByteCount <= 0):
+                PrimaryBodyIrAppendInvalidOp(bodyIR,
+                                             stmt.lineNumber,
+                                             int32(stmt.kind),
+                                             61,
+                                             projectKind)
+            else:
+                var op: coreir.BodyOp
+                op.kind = coreir.BodyOpResultProjectTag
+                op.target = targetSlot
+                add(op.operands, projectKind)
+                add(op.operands, sourceSlot)
+                if projectKind != coreir.BodyResultProjectIsErrTag:
+                    add(op.operands, projectOffset)
+                    add(op.operands, projectByteCount)
+                add(bodyIR.ops, op)
+                nextOpIndex = nextOpIndex + 1
         elif stmt.kind == texpr.TypedExprIrStmtLetCall:
             var slotId: int32 = -1
             if len(stmt.bindingName) > 0:
@@ -3796,6 +3859,37 @@ fn PrimaryBodyIRFillCmpOp(words: var int32[],
                                        paramSaveOffset,
                                        paramSaveCount)
 
+fn PrimaryBodyIRCopyMemoryWordCount(byteCount: int32): int32 =
+    if byteCount <= 0:
+        return 0
+    return byteCount * 2
+
+fn PrimaryBodyIRFillCopyMemory(words: var int32[],
+                                offset: int32,
+                                sourceReg: int32,
+                                sourceOffset: int32,
+                                targetReg: int32,
+                                targetOffset: int32,
+                                byteCount: int32): int32 =
+    if byteCount <= 0 ||
+       sourceOffset < 0 ||
+       targetOffset < 0 ||
+       sourceOffset + byteCount - 1 > 4095 ||
+       targetOffset + byteCount - 1 > 4095:
+        return -1
+    var pos = offset
+    for copyIndex in 0..<byteCount:
+        if pos + 1 >= words.len:
+            return -1
+        words[pos] = Value(a64.A64EncLdrbImm(a64.A64X11,
+                                             sourceReg,
+                                             sourceOffset + copyIndex))
+        words[pos + 1] = Value(a64.A64EncStrbImm(a64.A64X11,
+                                                 targetReg,
+                                                 targetOffset + copyIndex))
+        pos = pos + 2
+    return pos
+
 fn PrimaryBodyIRFillResultProjectOp(words: var int32[],
                                      offset: int32,
                                      bodyIR: coreir.BodyIR,
@@ -3820,18 +3914,21 @@ fn PrimaryBodyIRFillResultProjectOp(words: var int32[],
         words[offset + 5] = Value(a64.A64EncStrImm(false, a64.A64X9, a64.A64SP, int64(targetOffset)))
         return offset + 6
     var fieldOffset = coreir.ResultStrValueOffset
+    var byteCount = 24
     if op.operands[0] == coreir.BodyResultProjectErrorStrTag:
         fieldOffset = coreir.ResultStrErrMsgOffset
     elif op.operands[0] != coreir.BodyResultProjectValueStrTag:
         return -1
-    var pos = offset
-    for copyIndex in 0..<3:
-        if pos + 1 >= words.len:
-            return -1
-        words[pos] = Value(a64.A64EncLdrImm(true, a64.A64X9, a64.A64SP, int64(sourceOffset + fieldOffset + copyIndex * 8)))
-        words[pos + 1] = Value(a64.A64EncStrImm(true, a64.A64X9, a64.A64SP, int64(targetOffset + copyIndex * 8)))
-        pos = pos + 2
-    return pos
+    if op.operands.len >= 4:
+        fieldOffset = op.operands[2]
+        byteCount = op.operands[3]
+    return PrimaryBodyIRFillCopyMemory(words,
+                                       offset,
+                                       a64.A64SP,
+                                       sourceOffset + fieldOffset,
+                                       a64.A64SP,
+                                       targetOffset,
+                                       byteCount)
 
 fn PrimaryBodyIRGlobalOpIs64(bodyIR: coreir.BodyIR,
                               op: coreir.BodyOp): bool =
@@ -4778,6 +4875,8 @@ fn PrimaryBodyIROpSizeAt(bodyIR: coreir.BodyIR,
             return 6
         if op.operands[0] == coreir.BodyResultProjectValueStrTag ||
            op.operands[0] == coreir.BodyResultProjectErrorStrTag:
+            if op.operands.len >= 4:
+                return PrimaryBodyIRCopyMemoryWordCount(op.operands[3])
             return 6
         return 0
     if op.kind == coreir.BodyOpBinOpTag:

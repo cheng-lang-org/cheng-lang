@@ -5088,6 +5088,53 @@ fn TypedExprIrPopulateAssignCallMeta(stmt: var TypedExprIrStatement,
                                                         lineNumber,
                                                         argsText)
 
+fn TypedExprIrBindAssignStatementCallFact(stmt: var TypedExprIrStatement,
+                                           ctx: var TypedExprSourceContext,
+                                           sourceContexts: var TypedExprSourceContext[],
+                                           scope: TypedExprFunctionScope,
+                                           fact: TypedExprFact) =
+    if fact.kind != parser.NormalizedExprCall &&
+       fact.kind != parser.NormalizedExprResultIntrinsic:
+        return
+    if fact.callCallee == "" && fact.callTarget == "":
+        return
+    stmt.callKind = TypedExprCallNone
+    stmt.callQualifier = fact.callQualifier
+    stmt.callCallee = fact.callCallee
+    stmt.callTarget = fact.callTarget
+    stmt.callTargetSourcePath = fact.callTargetSourcePath
+    stmt.callTargetImportc = fact.callTargetImportc
+    var resolvedCallReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx,
+                                                                             sourceContexts,
+                                                                             fact)
+    if fact.callQualifier != "" &&
+       fact.surfaceCallKind != TypedExprSurfaceCallMember:
+        var resolvedSourcePath = ""
+        var resolvedTargetName = ""
+        var resolvedImportc = false
+        let qualifiedReturnType = TypedExprResolveQualifiedCallTargetReturnType(ctx,
+                                                                                sourceContexts,
+                                                                                fact.callQualifier,
+                                                                                fact.callCallee,
+                                                                                fact.callTarget,
+                                                                                resolvedSourcePath,
+                                                                                resolvedTargetName,
+                                                                                resolvedImportc)
+        if qualifiedReturnType != "":
+            resolvedCallReturnType = qualifiedReturnType
+            stmt.callTarget = resolvedTargetName
+            stmt.callTargetSourcePath = resolvedSourcePath
+            stmt.callTargetImportc = resolvedImportc
+    if resolvedCallReturnType != "":
+        stmt.resultType = resolvedCallReturnType
+    stmt.callArgCount = fact.callArgCount
+    stmt.callArgsText = fact.callArgsText
+    stmt.callArgTypesText = TypedExprIrCallArgTypesText(ctx,
+                                                        sourceContexts,
+                                                        scope,
+                                                        fact.lineNumber,
+                                                        fact.callArgsText)
+
 fn TypedExprIrAddLocalDeclStatement(ir: var TypedExprIr,
                                      scope: TypedExprFunctionScope,
                                      sourcePath: str,
@@ -8365,14 +8412,27 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
                                                             currentLineEnclosingIfConditionText,
                                                             true)
             elif expr.kind == parser.NormalizedExprAssign:
-                let _ = TypedExprIrAddAssignStatementFromExpr(ir,
-                                                              ctx,
-                                                              sourceContexts,
-                                                              scope,
-                                                              expr,
-                                                              currentLineIndent,
-                                                              currentLineEnclosingIfLineNumber,
-                                                              currentLineEnclosingIfConditionText)
+                let assignStmtIndex = TypedExprIrAddAssignStatementFromExpr(ir,
+                                                                            ctx,
+                                                                            sourceContexts,
+                                                                            scope,
+                                                                            expr,
+                                                                            currentLineIndent,
+                                                                            currentLineEnclosingIfLineNumber,
+                                                                            currentLineEnclosingIfConditionText)
+                if assignStmtIndex >= 0 &&
+                   assignStmtIndex < ir.statements.len &&
+                   factIndex >= 0 &&
+                   factIndex < facts.len &&
+                   facts[factIndex].lineNumber == expr.lineNumber &&
+                   facts[factIndex].columnNumber > expr.columnNumber:
+                    var assignStmt = ir.statements[assignStmtIndex]
+                    TypedExprIrBindAssignStatementCallFact(assignStmt,
+                                                           ctx,
+                                                           sourceContexts,
+                                                           scope,
+                                                           facts[factIndex])
+                    ir.statements[assignStmtIndex] = assignStmt
             else:
                 let _ = TypedExprIrAddControlStatementFromExpr(ir,
                                                                ctx,
