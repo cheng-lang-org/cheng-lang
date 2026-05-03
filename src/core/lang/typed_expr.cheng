@@ -2224,6 +2224,7 @@ fn TypedExprIrReportText(ir: var TypedExprIr): str =
     var out = ""
     TypedExprReportAppendLine(out, "typed_ir_function_count", IntToStr(ir.functions.len))
     TypedExprReportAppendLine(out, "typed_ir_statement_count", IntToStr(ir.statements.len))
+    TypedExprReportAppendLine(out, "typed_ir_global_count", IntToStr(ir.globalNames.len))
     TypedExprReportAppendLine(out, "typed_ir_local_decl_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtLocalDecl)))
     TypedExprReportAppendLine(out, "typed_ir_let_call_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtLetCall)))
     TypedExprReportAppendLine(out, "typed_ir_if_call_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtIfCall)))
@@ -4727,7 +4728,8 @@ fn TypedExprSourceContextLookup(sourceContexts: var TypedExprSourceContext[],
                                   sourcePathRaw: str): int32 =
     let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
     for i in 0..<sourceContexts.len:
-        if sourceContexts[i].sourcePath == sourcePath:
+        let candidateSourcePath = parser.ParserNormalizePath(sourceContexts[i].sourcePath)
+        if candidateSourcePath == sourcePath:
             return i
     return -1
 
@@ -5366,11 +5368,22 @@ fn TypedExprLookupUnqualifiedImportedFunctionReturnType(currentCtx: var TypedExp
     targetImportcOut = foundImportc
     return foundReturnType
 
-fn TypedExprLookupCallTargetReturnTypeFromFact(sourceContexts: var TypedExprSourceContext[],
+fn TypedExprLookupCallTargetReturnTypeFromFact(currentCtx: var TypedExprSourceContext,
+                                                sourceContexts: var TypedExprSourceContext[],
                                                  fact: TypedExprFact): str =
     if fact.callTargetSourcePath == "":
+        if fact.callQualifier != "":
+            return TypedExprLookupExternalFunctionReturnTypeFromContexts(currentCtx,
+                                                                         sourceContexts,
+                                                                         fact.callQualifier,
+                                                                         fact.callCallee)
+        if fact.callTargetImportc:
+            return TypedExprLookupImportcReturnType(currentCtx, fact.callCallee)
+        return TypedExprLookupLocalFunctionReturnType(currentCtx, fact.callTarget)
+    let targetSourcePath = parser.ParserNormalizePath(fact.callTargetSourcePath)
+    if targetSourcePath == "":
         return ""
-    let targetIndex = TypedExprSourceContextLookup(sourceContexts, fact.callTargetSourcePath)
+    let targetIndex = TypedExprSourceContextLookup(sourceContexts, targetSourcePath)
     if targetIndex < 0:
         return ""
     if fact.callTargetImportc:
@@ -5847,7 +5860,7 @@ fn TypedExprBuildFact(ctx: var TypedExprSourceContext,
             fact.typeText = "call_expr"
             fact.placeKind = TypedExprPlaceCallResult
             return fact
-        let detailReturnType = TypedExprLookupCallTargetReturnTypeFromFact(sourceContexts, fact)
+        let detailReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, fact)
         if detailReturnType != "":
             var targetCtx = TypedExprSourceContextForPathOrCurrent(ctx,
                                                                      sourceContexts,
@@ -6027,7 +6040,7 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
             if inGlobalVarBlock && parser.ParserHasLeadingIndent(rawLineForBinding):
                 var globalName = ""
                 var globalType = ""
-                if TypedExprReadTypeFieldDeclFromLine(rawLineForBinding, globalName, globalType):
+                if TypedExprParseTypeFieldLine(rawLineForBinding, globalName, globalType):
                     TypedExprMaybeAddBinding(ctx.bindings,
                                                source.sourcePath,
                                                "",
@@ -6374,6 +6387,7 @@ fn TypedExprFactCallArgsContainFact(rootFact: TypedExprFact,
 
 fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
                                            ctx: var TypedExprSourceContext,
+                                           sourceContexts: var TypedExprSourceContext[],
                                            scope: TypedExprFunctionScope,
                                            fact: TypedExprFact,
                                            currentLineHasIf: bool,
@@ -6405,7 +6419,19 @@ fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
         statementKind == TypedExprIrStmtResultIntrinsic) &&
        Len(currentLineBindingType) > 0:
         statementResultType = currentLineBindingType
-    if Len(statementResultType) <= 0:
+    if fact.kind == parser.NormalizedExprCall:
+        let resolvedReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, fact)
+        if resolvedReturnType != "":
+            statementResultType = resolvedReturnType
+    if Len(statementResultType) <= 0 ||
+       statementResultType == "call_expr" ||
+       statementResultType == "unknown":
+        let resolvedReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, fact)
+        if resolvedReturnType != "":
+            statementResultType = resolvedReturnType
+    if Len(statementResultType) <= 0 ||
+       statementResultType == "call_expr" ||
+       statementResultType == "unknown":
         statementResultType = TypedExprLookupLocalFunctionReturnType(ctx, fact.callTarget)
     return TypedExprIrAddCallStatement(ir,
                                        scope,
@@ -6419,6 +6445,7 @@ fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
 
 fn TypedExprIrAppendFactDependenciesForScope(ir: var TypedExprIr,
                                               ctx: var TypedExprSourceContext,
+                                              sourceContexts: var TypedExprSourceContext[],
                                               scope: TypedExprFunctionScope,
                                               facts: var TypedExprFact[],
                                               rootFactIndex: int32,
@@ -6451,6 +6478,7 @@ fn TypedExprIrAppendFactDependenciesForScope(ir: var TypedExprIr,
             continue
         TypedExprIrAppendFactDependenciesForScope(ir,
                                                   ctx,
+                                                  sourceContexts,
                                                   scope,
                                                   facts,
                                                   depIndex,
@@ -6466,6 +6494,7 @@ fn TypedExprIrAppendFactDependenciesForScope(ir: var TypedExprIr,
                                                   currentLineEnclosingIfConditionText)
         let _ = TypedExprIrAppendFactStatementForScope(ir,
                                                        ctx,
+                                                       sourceContexts,
                                                        scope,
                                                        dependencyFact,
                                                        currentLineHasIf,
@@ -6811,6 +6840,7 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
         let fact = facts[factIndex]
         TypedExprIrAppendFactDependenciesForScope(ir,
                                                   ctx,
+                                                  sourceContexts,
                                                   scope,
                                                   facts,
                                                   factIndex,
@@ -6827,6 +6857,7 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
         if !TypedExprProcessedFactContains(processedFactIndexes, factIndex):
             let _ = TypedExprIrAppendFactStatementForScope(ir,
                                                            ctx,
+                                                           sourceContexts,
                                                            scope,
                                                            fact,
                                                            currentLineHasIf,
@@ -6844,6 +6875,13 @@ fn TypedExprLookupCallTargetReturnTypeFromExpr(currentCtx: var TypedExprSourceCo
                                                 expr: parser.NormalizedExpr): str =
     let sourcePath = parser.ParserNormalizePath(expr.callTargetSourcePath)
     if sourcePath == "":
+        if expr.callQualifier != "":
+            let externalReturnType = TypedExprLookupExternalFunctionReturnTypeFromContexts(currentCtx,
+                                                                                          sourceContexts,
+                                                                                          expr.callQualifier,
+                                                                                          expr.callCallee)
+            if externalReturnType != "":
+                return externalReturnType
         if expr.callTargetImportc:
             return TypedExprLookupImportcReturnType(currentCtx, expr.callCallee)
         return TypedExprLookupLocalFunctionReturnType(currentCtx, expr.callTarget)
@@ -7289,8 +7327,7 @@ fn TypedExprIrAddCallStatementFromExpr(ir: var TypedExprIr,
                                                    "0")
         stmt.callArgNodeStart = nodeIndex
         stmt.callArgNodeCount = 1
-    if expr.kind == parser.NormalizedExprCall &&
-       stmt.resultType == "unknown":
+    if expr.kind == parser.NormalizedExprCall:
         let callReturnType = TypedExprLookupCallTargetReturnTypeFromExpr(ctx, sourceContexts, expr)
         if callReturnType != "":
             stmt.resultType = callReturnType
@@ -7859,6 +7896,23 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
         if !TypedExprBuildSourceContext(sourceForIr, ctx, err):
             err = " typed expr: build typed ir source context failed"
             return false
+        for bindingIndex in 0..<ctx.bindings.len:
+            let binding = ctx.bindings[bindingIndex]
+            if !binding.globalFlag:
+                continue
+            var seenGlobal = false
+            for globalIndex in 0..<ir.globalNames.len:
+                if globalIndex >= ir.globalSourcePaths.len:
+                    continue
+                if ir.globalSourcePaths[globalIndex] == binding.sourcePath &&
+                   ir.globalNames[globalIndex] == binding.name:
+                    seenGlobal = true
+                    break
+            if seenGlobal:
+                continue
+            add(ir.globalSourcePaths, binding.sourcePath)
+            add(ir.globalNames, binding.name)
+            add(ir.globalTypes, binding.typeText)
         let sourceFactStart = TypedExprFirstFactIndexForSource(facts, ctx.sourcePath)
         var sourceFactEnd: int32
         var factCursor: int32
@@ -7933,6 +7987,23 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
         if !TypedExprBuildSourceContext(sourceForIr, ctxForIr, err):
             err = " typed expr: build typed ir source context failed"
             return false
+        for bindingIndex in 0..<ctxForIr.bindings.len:
+            let binding = ctxForIr.bindings[bindingIndex]
+            if !binding.globalFlag:
+                continue
+            var seenGlobal = false
+            for globalIndex in 0..<ir.globalNames.len:
+                if globalIndex >= ir.globalSourcePaths.len:
+                    continue
+                if ir.globalSourcePaths[globalIndex] == binding.sourcePath &&
+                   ir.globalNames[globalIndex] == binding.name:
+                    seenGlobal = true
+                    break
+            if seenGlobal:
+                continue
+            add(ir.globalSourcePaths, binding.sourcePath)
+            add(ir.globalNames, binding.name)
+            add(ir.globalTypes, binding.typeText)
         let sourceExprStart = TypedExprExprLayerFirstIndexForSource(exprLayer, ctxForIr.sourcePath)
         var sourceExprEnd: int32
         var exprCursor: int32

@@ -11,6 +11,7 @@ import cheng/core/backend/object_symbols as osym
 import cheng/core/backend/object_relocs as orel
 import cheng/core/backend/primary_object_plan as pobj
 import cheng/core/backend/target_matrix as tmat
+import cheng/core/ir/core_types as coreir
 import cheng/core/lang/typed_expr as texpr
 
 type
@@ -429,6 +430,17 @@ fn DirectObjectEmitPayloadByteCount(payloadText: str): int32 =
         return count
     return 0
 
+fn DirectObjectEmitPayloadAlign(payloadText: str): int32 =
+    let zeroPrefix = "zero:"
+    if chengpath.TextStartsWith(payloadText, zeroPrefix):
+        let raw = strings.SliceBytes(payloadText, Len(zeroPrefix), Len(payloadText) - Len(zeroPrefix))
+        let count = DirectObjectEmitParsePositiveI32(raw)
+        if count >= 8:
+            return 8
+        if count >= 4:
+            return 4
+    return 1
+
 fn DirectObjectEmitCStringPayloadByte(raw: str,
                                        index: int32): int32 =
     if index < 0 || index >= Len(raw):
@@ -494,8 +506,57 @@ fn DirectObjectEmitDataLabelExact(plan: pobj.PrimaryObjectPlan,
             return plan.dataLabels[i]
     return ""
 
+fn DirectObjectEmitGlobalOpKind(kind: int32): bool =
+    return kind == coreir.BodyOpGlobalLoadTag ||
+           kind == coreir.BodyOpGlobalStoreTag
+
+fn DirectObjectEmitGlobalDataLabel(plan: pobj.PrimaryObjectPlan,
+                                    bodyIR: coreir.BodyIR,
+                                    slotIndex: int32): str =
+    if slotIndex < 0 || slotIndex >= bodyIR.localSlots.len:
+        return ""
+    return pobj.PrimaryGlobalDataLabel(plan.targetTriple,
+                                       bodyIR.localSlots[slotIndex].name)
+
+fn DirectObjectEmitGlobalPayloadText(bodyIR: coreir.BodyIR,
+                                      slotIndex: int32): str =
+    if slotIndex < 0 || slotIndex >= bodyIR.localSlots.len:
+        system.Assert(false, "direct object emit: invalid global slot")
+        return ""
+    if bodyIR.localSlots[slotIndex].sizeBytes > 0:
+        return Fmt"zero:{bodyIR.localSlots[slotIndex].sizeBytes}"
+    system.Assert(false, "direct object emit: invalid global slot size")
+    return ""
+
+fn DirectObjectEmitAppendGlobalData(plan: pobj.PrimaryObjectPlan,
+                                     functionLimit: int32,
+                                     labels: var str[],
+                                     payloads: var str[]) =
+    for functionIndex in 0..<functionLimit:
+        if functionIndex >= plan.functionBodyIRs.len:
+            continue
+        let bodyIR = plan.functionBodyIRs[functionIndex]
+        for opIndex in 0..<bodyIR.ops.len:
+            let op = bodyIR.ops[opIndex]
+            if !DirectObjectEmitGlobalOpKind(op.kind) ||
+               op.operands.len <= 0:
+                continue
+            let label = DirectObjectEmitGlobalDataLabel(plan, bodyIR, op.operands[0])
+            if label == "":
+                continue
+            if DirectObjectEmitDataLabelExact(plan, label) != "":
+                continue
+            if DirectObjectEmitWasmStringIndex(labels, label) >= 0:
+                continue
+            let payloadText = DirectObjectEmitGlobalPayloadText(bodyIR, op.operands[0])
+            if payloadText == "":
+                system.Assert(false, "direct object emit: missing global payload")
+                continue
+            add(labels, label)
+            add(payloads, payloadText)
+
 fn DirectObjectEmitFunctionLooksEntryBridgeWords(plan: pobj.PrimaryObjectPlan,
-                                                  functionIndex: int32): bool =
+                                                   functionIndex: int32): bool =
     if Len(plan.entryFunctionSymbol) <= 0:
         return false
     if functionIndex < 0 ||
@@ -840,8 +901,11 @@ fn DirectObjectEmitStandaloneSymbols(plan: pobj.PrimaryObjectPlan): osym.ObjectS
     let dataAddr = DirectObjectEmitStandaloneDataSectionAddr(plan)
     for i in 0..<plan.dataLabels.len:
         var payloadSize: int32
+        var payloadText = ""
         if i < plan.dataPayloadTexts.len:
-            payloadSize = DirectObjectEmitPayloadByteCount(plan.dataPayloadTexts[i])
+            payloadText = plan.dataPayloadTexts[i]
+            payloadSize = DirectObjectEmitPayloadByteCount(payloadText)
+        dataOffset = DirectObjectEmitAlign(dataOffset, DirectObjectEmitPayloadAlign(payloadText))
         DirectObjectEmitRequireIndex(osym.ObjectSymbolsAddDefined(symbols,
                                                                   plan.dataLabels[i],
                                                                   1,
@@ -850,6 +914,26 @@ fn DirectObjectEmitStandaloneSymbols(plan: pobj.PrimaryObjectPlan): osym.ObjectS
                                                                   false),
                                      "direct object emit: add data symbol")
         dataOffset = dataOffset + payloadSize
+    var globalLabels: str[]
+    var globalPayloads: str[]
+    globalLabels = []
+    globalPayloads = []
+    DirectObjectEmitAppendGlobalData(plan, functionLimit, globalLabels, globalPayloads)
+    for i in 0..<globalLabels.len:
+        var payloadSize2: int32
+        var payloadText2 = ""
+        if i < globalPayloads.len:
+            payloadText2 = globalPayloads[i]
+            payloadSize2 = DirectObjectEmitPayloadByteCount(payloadText2)
+        dataOffset = DirectObjectEmitAlign(dataOffset, DirectObjectEmitPayloadAlign(payloadText2))
+        DirectObjectEmitRequireIndex(osym.ObjectSymbolsAddDefined(symbols,
+                                                                  globalLabels[i],
+                                                                  1,
+                                                                  int64(dataAddr + dataOffset),
+                                                                  int64(payloadSize2),
+                                                                  false),
+                                     "direct object emit: add standalone global data symbol")
+        dataOffset = dataOffset + payloadSize2
     for i in 0..<plan.relocTargetSymbols.len:
         if Len(plan.relocTargetSymbols[i]) <= 0:
             continue
@@ -920,6 +1004,29 @@ fn DirectObjectEmitStandaloneRelocs(plan: pobj.PrimaryObjectPlan,
                                              functionByteOffset + int64(8),
                                              literalSymbol,
                                              "direct object emit: add return str literal page reloc")
+        if i < plan.functionBodyIRs.len:
+            let bodyIR = plan.functionBodyIRs[i]
+            for blockIndex in 0..<bodyIR.blocks.len:
+                let block = bodyIR.blocks[blockIndex]
+                let opEnd = block.opStart + block.opCount
+                var wordPos = plan.functionWordOffsets[i] + pobj.PrimaryBodyIRBlockStart(bodyIR, blockIndex)
+                if block.opStart < 0 || opEnd > bodyIR.ops.len:
+                    continue
+                for opIndex in block.opStart..<opEnd:
+                    let op = bodyIR.ops[opIndex]
+                    if DirectObjectEmitGlobalOpKind(op.kind) &&
+                       op.operands.len > 0:
+                        let globalSymbol = DirectObjectEmitGlobalDataLabel(plan, bodyIR, op.operands[0])
+                        if globalSymbol != "":
+                            DirectObjectEmitAddPageRelocPair(relocs,
+                                                             symbols,
+                                                             int64(wordPos * 4),
+                                                             globalSymbol,
+                                                             "direct object emit: add standalone global page reloc")
+                    let opSize = pobj.PrimaryBodyIROpSizeAt(bodyIR, opIndex)
+                    if opSize <= 0:
+                        break
+                    wordPos = wordPos + opSize
     return relocs
 
 fn DirectObjectEmitStandaloneEntryTextOffset(plan: pobj.PrimaryObjectPlan): int32 =
@@ -1157,13 +1264,24 @@ fn DirectObjectEmitPlanText(plan: pobj.PrimaryObjectPlan): Bytes =
 
 fn DirectObjectEmitPlanDataByteCount(plan: pobj.PrimaryObjectPlan,
                                       functionLimit: int32): int32 =
-    let _ = functionLimit
     var total: int32
     for i in 0..<plan.dataLabels.len:
         var payloadText = ""
         if i < plan.dataPayloadTexts.len:
             payloadText = plan.dataPayloadTexts[i]
+        total = DirectObjectEmitAlign(total, DirectObjectEmitPayloadAlign(payloadText))
         total = total + DirectObjectEmitPayloadByteCount(payloadText)
+    var globalLabels: str[]
+    var globalPayloads: str[]
+    globalLabels = []
+    globalPayloads = []
+    DirectObjectEmitAppendGlobalData(plan, functionLimit, globalLabels, globalPayloads)
+    for i in 0..<globalLabels.len:
+        var globalPayloadText = ""
+        if i < globalPayloads.len:
+            globalPayloadText = globalPayloads[i]
+        total = DirectObjectEmitAlign(total, DirectObjectEmitPayloadAlign(globalPayloadText))
+        total = total + DirectObjectEmitPayloadByteCount(globalPayloadText)
     return total
 
 fn DirectObjectEmitPlanData(plan: pobj.PrimaryObjectPlan,
@@ -1173,11 +1291,24 @@ fn DirectObjectEmitPlanData(plan: pobj.PrimaryObjectPlan,
         var payloadText = ""
         if i < plan.dataPayloadTexts.len:
             payloadText = plan.dataPayloadTexts[i]
+        obuf.ObjectBufferAlign(data, DirectObjectEmitPayloadAlign(payloadText), 0)
         if chengpath.TextStartsWith(payloadText, "cstring:"):
             DirectObjectEmitWriteCStringPayload(data, payloadText)
         else:
             let count = DirectObjectEmitPayloadByteCount(payloadText)
             obuf.ObjectBufferWriteZeros(data, count)
+    var globalLabels: str[]
+    var globalPayloads: str[]
+    globalLabels = []
+    globalPayloads = []
+    DirectObjectEmitAppendGlobalData(plan, functionLimit, globalLabels, globalPayloads)
+    for i in 0..<globalLabels.len:
+        var globalPayloadText = ""
+        if i < globalPayloads.len:
+            globalPayloadText = globalPayloads[i]
+        obuf.ObjectBufferAlign(data, DirectObjectEmitPayloadAlign(globalPayloadText), 0)
+        let count = DirectObjectEmitPayloadByteCount(globalPayloadText)
+        obuf.ObjectBufferWriteZeros(data, count)
     return obuf.ObjectBufferToBytes(data)
 
 fn DirectObjectEmitPlanSymbols(plan: pobj.PrimaryObjectPlan): osym.ObjectSymbolTable =
@@ -1204,8 +1335,11 @@ fn DirectObjectEmitPlanSymbolsForTarget(plan: pobj.PrimaryObjectPlan,
     let dataAddr = DirectObjectEmitDataSectionAddr(plan)
     for i in 0..<plan.dataLabels.len:
         var payloadSize: int32
+        var payloadText = ""
         if i < plan.dataPayloadTexts.len:
-            payloadSize = DirectObjectEmitPayloadByteCount(plan.dataPayloadTexts[i])
+            payloadText = plan.dataPayloadTexts[i]
+            payloadSize = DirectObjectEmitPayloadByteCount(payloadText)
+        dataOffset = DirectObjectEmitAlign(dataOffset, DirectObjectEmitPayloadAlign(payloadText))
         DirectObjectEmitRequireIndex(osym.ObjectSymbolsAddDefined(symbols,
                                                                   plan.dataLabels[i],
                                                                   1,
@@ -1214,6 +1348,26 @@ fn DirectObjectEmitPlanSymbolsForTarget(plan: pobj.PrimaryObjectPlan,
                                                                   false),
                                      "direct object emit: add plan data symbol")
         dataOffset = dataOffset + payloadSize
+    var globalLabels: str[]
+    var globalPayloads: str[]
+    globalLabels = []
+    globalPayloads = []
+    DirectObjectEmitAppendGlobalData(plan, functionCount, globalLabels, globalPayloads)
+    for i in 0..<globalLabels.len:
+        var payloadSize2: int32
+        var payloadText2 = ""
+        if i < globalPayloads.len:
+            payloadText2 = globalPayloads[i]
+            payloadSize2 = DirectObjectEmitPayloadByteCount(payloadText2)
+        dataOffset = DirectObjectEmitAlign(dataOffset, DirectObjectEmitPayloadAlign(payloadText2))
+        DirectObjectEmitRequireIndex(osym.ObjectSymbolsAddDefined(symbols,
+                                                                  globalLabels[i],
+                                                                  1,
+                                                                  int64(dataAddr + dataOffset),
+                                                                  int64(payloadSize2),
+                                                                  false),
+                                     "direct object emit: add plan global data symbol")
+        dataOffset = dataOffset + payloadSize2
     for i in 0..<functionCount:
         if DirectObjectEmitFunctionLooksEntryBridgeWords(plan, i):
             DirectObjectEmitRequireIndex(osym.ObjectSymbolsAddUndefined(symbols,
@@ -1379,6 +1533,29 @@ fn DirectObjectEmitPlanRelocs(plan: pobj.PrimaryObjectPlan,
                                            symbols,
                                            int64(baseByteOffset + 48),
                                            DirectObjectEmitEntryBridgeProfileFlushSymbol(plan))
+        if i < plan.functionBodyIRs.len:
+            let bodyIR = plan.functionBodyIRs[i]
+            for blockIndex in 0..<bodyIR.blocks.len:
+                let block = bodyIR.blocks[blockIndex]
+                let opEnd = block.opStart + block.opCount
+                var wordPos = plan.functionWordOffsets[i] + pobj.PrimaryBodyIRBlockStart(bodyIR, blockIndex)
+                if block.opStart < 0 || opEnd > bodyIR.ops.len:
+                    continue
+                for opIndex in block.opStart..<opEnd:
+                    let op = bodyIR.ops[opIndex]
+                    if DirectObjectEmitGlobalOpKind(op.kind) &&
+                       op.operands.len > 0:
+                        let globalSymbol = DirectObjectEmitGlobalDataLabel(plan, bodyIR, op.operands[0])
+                        if globalSymbol != "":
+                            DirectObjectEmitAddPageRelocPair(relocs,
+                                                             symbols,
+                                                             int64(wordPos * 4),
+                                                             globalSymbol,
+                                                             "direct object emit: add plan global page reloc")
+                    let opSize = pobj.PrimaryBodyIROpSizeAt(bodyIR, opIndex)
+                    if opSize <= 0:
+                        break
+                    wordPos = wordPos + opSize
     return relocs
 
 fn DirectObjectEmitReturnZeroObject(rootDir: str,
