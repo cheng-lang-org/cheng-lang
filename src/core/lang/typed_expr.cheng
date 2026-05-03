@@ -6209,6 +6209,135 @@ fn TypedExprFactIsIrCallStatementCandidate(fact: TypedExprFact): bool =
         return false
     return true
 
+fn TypedExprProcessedFactContains(processedFactIndexes: int32[],
+                                    factIndex: int32): bool =
+    for i in 0..<processedFactIndexes.len:
+        if processedFactIndexes[i] == factIndex:
+            return true
+    return false
+
+fn TypedExprFactFullCallText(fact: TypedExprFact): str =
+    let surface = TypedExprQualifiedCallSurface(fact.callQualifier, fact.callCallee)
+    if fact.callArgCount > 0:
+        return Fmt"{surface}({fact.callArgsText})"
+    return Fmt"{surface}()"
+
+fn TypedExprFactCallArgsContainFact(rootFact: TypedExprFact,
+                                      dependencyFact: TypedExprFact): bool =
+    if rootFact.lineNumber != dependencyFact.lineNumber:
+        return false
+    if dependencyFact.columnNumber <= rootFact.columnNumber:
+        return false
+    let dependencyText = TypedExprFactFullCallText(dependencyFact)
+    if dependencyText == "" || rootFact.callArgsText == "":
+        return false
+    return strutil.Contains(rootFact.callArgsText, dependencyText)
+
+fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
+                                           ctx: var TypedExprSourceContext,
+                                           scope: TypedExprFunctionScope,
+                                           fact: TypedExprFact,
+                                           currentLineHasIf: bool,
+                                           currentLineBindingName: str,
+                                           currentLineBindingType: str,
+                                           currentLineBindingRootColumn: int32,
+                                           currentLineIndent: int32,
+                                           currentLineEnclosingIfLineNumber: int32,
+                                           currentLineEnclosingIfConditionText: str): int32 =
+    var statementKind = TypedExprIrStmtCall
+    if fact.kind == parser.NormalizedExprResultIntrinsic:
+        statementKind = TypedExprIrStmtResultIntrinsic
+    else:
+        if fact.hasSink &&
+           (fact.sinkPlaceKind == TypedExprPlaceLocal ||
+            fact.sinkPlaceKind == TypedExprPlaceGlobal):
+            statementKind = TypedExprIrStmtLetCall
+        elif currentLineBindingRootColumn == fact.columnNumber:
+            statementKind = TypedExprIrStmtLetCall
+        elif currentLineHasIf:
+            statementKind = TypedExprIrStmtIfCall
+    var statementBindingName = ""
+    if statementKind == TypedExprIrStmtLetCall ||
+       (statementKind == TypedExprIrStmtResultIntrinsic &&
+        (fact.hasSink || currentLineBindingRootColumn == fact.columnNumber)):
+        statementBindingName = currentLineBindingName
+    var statementResultType = fact.typeText
+    if (statementKind == TypedExprIrStmtLetCall ||
+        statementKind == TypedExprIrStmtResultIntrinsic) &&
+       Len(currentLineBindingType) > 0:
+        statementResultType = currentLineBindingType
+    if Len(statementResultType) <= 0:
+        statementResultType = TypedExprLookupLocalFunctionReturnType(ctx, fact.callTarget)
+    return TypedExprIrAddCallStatement(ir,
+                                       scope,
+                                       fact,
+                                       statementKind,
+                                       statementBindingName,
+                                       statementResultType,
+                                       currentLineIndent,
+                                       currentLineEnclosingIfLineNumber,
+                                       currentLineEnclosingIfConditionText)
+
+fn TypedExprIrAppendFactDependenciesForScope(ir: var TypedExprIr,
+                                              ctx: var TypedExprSourceContext,
+                                              scope: TypedExprFunctionScope,
+                                              facts: var TypedExprFact[],
+                                              rootFactIndex: int32,
+                                              factStartIndex: int32,
+                                              factEndIndex: int32,
+                                              processedFactIndexes: var int32[],
+                                              currentLineHasIf: bool,
+                                              currentLineBindingName: str,
+                                              currentLineBindingType: str,
+                                              currentLineBindingRootColumn: int32,
+                                              currentLineIndent: int32,
+                                              currentLineEnclosingIfLineNumber: int32,
+                                              currentLineEnclosingIfConditionText: str) =
+    if rootFactIndex < 0 || rootFactIndex >= facts.len:
+        return
+    let rootFact = facts[rootFactIndex]
+    for depIndex in factStartIndex..<factEndIndex:
+        if depIndex == rootFactIndex:
+            continue
+        if TypedExprProcessedFactContains(processedFactIndexes, depIndex):
+            continue
+        let dependencyFact = facts[depIndex]
+        if dependencyFact.lineNumber < rootFact.lineNumber:
+            continue
+        if dependencyFact.lineNumber > rootFact.lineNumber:
+            break
+        if !TypedExprFactIsIrCallStatementCandidate(dependencyFact):
+            continue
+        if !TypedExprFactCallArgsContainFact(rootFact, dependencyFact):
+            continue
+        TypedExprIrAppendFactDependenciesForScope(ir,
+                                                  ctx,
+                                                  scope,
+                                                  facts,
+                                                  depIndex,
+                                                  factStartIndex,
+                                                  factEndIndex,
+                                                  processedFactIndexes,
+                                                  currentLineHasIf,
+                                                  currentLineBindingName,
+                                                  currentLineBindingType,
+                                                  currentLineBindingRootColumn,
+                                                  currentLineIndent,
+                                                  currentLineEnclosingIfLineNumber,
+                                                  currentLineEnclosingIfConditionText)
+        let _ = TypedExprIrAppendFactStatementForScope(ir,
+                                                       ctx,
+                                                       scope,
+                                                       dependencyFact,
+                                                       currentLineHasIf,
+                                                       currentLineBindingName,
+                                                       currentLineBindingType,
+                                                       currentLineBindingRootColumn,
+                                                       currentLineIndent,
+                                                       currentLineEnclosingIfLineNumber,
+                                                       currentLineEnclosingIfConditionText)
+        add(processedFactIndexes, depIndex)
+
 fn TypedExprExprIsStructuredStatement(expr: parser.NormalizedExpr): bool =
     if expr.kind == parser.NormalizedExprReturn:
         return true
@@ -6336,7 +6465,8 @@ fn TypedExprNextStructuredStatementExprIndex(exprLayer: var parser.NormalizedExp
 fn TypedExprNextCallStatementFactIndex(facts: var TypedExprFact[],
                                         cursorRaw: int32,
                                         endIndexRaw: int32,
-                                        scope: TypedExprFunctionScope): int32 =
+                                        scope: TypedExprFunctionScope,
+                                        processedFactIndexes: int32[]): int32 =
     var cursor = cursorRaw
     if cursor < 0:
         cursor = 0
@@ -6349,6 +6479,8 @@ fn TypedExprNextCallStatementFactIndex(facts: var TypedExprFact[],
             continue
         if fact.lineNumber > scope.endLine:
             return -1
+        if TypedExprProcessedFactContains(processedFactIndexes, i):
+            continue
         if TypedExprFactIsIrCallStatementCandidate(fact):
             return i
     return -1
@@ -6395,6 +6527,7 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
     var currentLineIndent: int32
     var currentLineEnclosingIfLineNumber: int32
     var currentLineEnclosingIfConditionText = ""
+    var processedFactIndexes: int32[]
     while true:
         var exprIndex: int32 = -1
         if includeStructuredStatements:
@@ -6405,7 +6538,8 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
         let factIndex = TypedExprNextCallStatementFactIndex(facts,
                                                             factCursor,
                                                             factEndIndex,
-                                                            scope)
+                                                            scope,
+                                                            processedFactIndexes)
         if exprIndex < 0 && factIndex < 0:
             break
         var useExpr = false
@@ -6536,39 +6670,34 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
             exprCursor = exprIndex + 1
             continue
         let fact = facts[factIndex]
-        var statementKind = TypedExprIrStmtCall
-        if fact.kind == parser.NormalizedExprResultIntrinsic:
-            statementKind = TypedExprIrStmtResultIntrinsic
-        else:
-            if fact.hasSink &&
-               (fact.sinkPlaceKind == TypedExprPlaceLocal ||
-                fact.sinkPlaceKind == TypedExprPlaceGlobal):
-                statementKind = TypedExprIrStmtLetCall
-            elif currentLineBindingRootColumn == fact.columnNumber:
-                statementKind = TypedExprIrStmtLetCall
-            elif currentLineHasIf:
-                statementKind = TypedExprIrStmtIfCall
-        var statementBindingName = ""
-        if statementKind == TypedExprIrStmtLetCall ||
-           (statementKind == TypedExprIrStmtResultIntrinsic &&
-            (fact.hasSink || currentLineBindingRootColumn == fact.columnNumber)):
-            statementBindingName = currentLineBindingName
-        var statementResultType = fact.typeText
-        if (statementKind == TypedExprIrStmtLetCall ||
-            statementKind == TypedExprIrStmtResultIntrinsic) &&
-           Len(currentLineBindingType) > 0:
-            statementResultType = currentLineBindingType
-        if Len(statementResultType) <= 0:
-            statementResultType = TypedExprLookupLocalFunctionReturnType(ctx, fact.callTarget)
-        let _ = TypedExprIrAddCallStatement(ir,
-                                            scope,
-                                            fact,
-                                            statementKind,
-                                            statementBindingName,
-                                            statementResultType,
-                                            currentLineIndent,
-                                            currentLineEnclosingIfLineNumber,
-                                            currentLineEnclosingIfConditionText)
+        TypedExprIrAppendFactDependenciesForScope(ir,
+                                                  ctx,
+                                                  scope,
+                                                  facts,
+                                                  factIndex,
+                                                  factStartIndex,
+                                                  factEndIndex,
+                                                  processedFactIndexes,
+                                                  currentLineHasIf,
+                                                  currentLineBindingName,
+                                                  currentLineBindingType,
+                                                  currentLineBindingRootColumn,
+                                                  currentLineIndent,
+                                                  currentLineEnclosingIfLineNumber,
+                                                  currentLineEnclosingIfConditionText)
+        if !TypedExprProcessedFactContains(processedFactIndexes, factIndex):
+            let _ = TypedExprIrAppendFactStatementForScope(ir,
+                                                           ctx,
+                                                           scope,
+                                                           fact,
+                                                           currentLineHasIf,
+                                                           currentLineBindingName,
+                                                           currentLineBindingType,
+                                                           currentLineBindingRootColumn,
+                                                           currentLineIndent,
+                                                           currentLineEnclosingIfLineNumber,
+                                                           currentLineEnclosingIfConditionText)
+            add(processedFactIndexes, factIndex)
         factCursor = factIndex + 1
 
 fn TypedExprLookupCallTargetReturnTypeFromExpr(currentCtx: var TypedExprSourceContext,
