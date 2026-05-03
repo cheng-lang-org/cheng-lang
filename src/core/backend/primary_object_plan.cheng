@@ -686,6 +686,10 @@ fn PrimaryBodyIrTextIsI32Zero(textRaw: str): bool =
     let text = strutil.Strip(textRaw)
     return text == "0" || text == "int32(0)"
 
+fn PrimaryBodyIrTextIsI32One(textRaw: str): bool =
+    let text = strutil.Strip(textRaw)
+    return text == "1" || text == "int32(1)"
+
 fn PrimaryBodyIrTextIsStringLiteral(textRaw: str): bool =
     let text = strutil.Strip(textRaw)
     return len(text) >= 2 &&
@@ -717,6 +721,63 @@ fn PrimaryBodyIrConditionText(textRaw: str): str =
     if len(text) > 0 && text[len(text) - 1] == ':':
         text = strutil.Strip(strings.SliceBytes(text, 0, len(text) - 1))
     return text
+
+fn PrimaryBodyIrAppendConditionTerm(bodyIR: var coreir.BodyIR,
+                                     conditionSlot: int32,
+                                     conditionKind: int32,
+                                     currentBlockStart: var int32,
+                                     pendingFalseTerm: var int32) =
+    var term: coreir.BodyTerm
+    term.kind = coreir.BodyTermCbrTag
+    term.conditionKind = conditionKind
+    term.lhsSlot = conditionSlot
+    term.rhsSlot = -1
+    term.trueBlock = -1
+    term.falseBlock = -1
+    term.resultSlot = -1
+    let termIndex = coreir.BodyIRAppendTerm(bodyIR, term)
+    let opCount = bodyIR.ops.len - currentBlockStart
+    let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, opCount, termIndex)
+    currentBlockStart = bodyIR.ops.len
+    pendingFalseTerm = termIndex
+
+fn PrimaryBodyIrAppendTypedStrLiteralCondition(bodyIR: var coreir.BodyIR,
+                                                slotNames: var str[],
+                                                stmt: texpr.TypedExprIrStatement,
+                                                currentBlockStart: var int32,
+                                                pendingFalseTerm: var int32): bool =
+    if stmt.conditionKind != texpr.TypedExprIrCondStrEqLiteral &&
+       stmt.conditionKind != texpr.TypedExprIrCondStrNeLiteral:
+        return false
+    let conditionLhsText = stmt.conditionLhsText
+    let conditionLiteralText = stmt.conditionLiteralText
+    let strSlot = PrimaryBodyIrFindArgSlot(slotNames, conditionLhsText)
+    if strSlot < 0:
+        return false
+    if PrimaryBodyIrSlotType(bodyIR, strSlot) != coreir.LocalStrTag:
+        return false
+    let resultSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                   slotNames,
+                                                   Fmt"{conditionLhsText}#str_eq_literal#{conditionLiteralText}",
+                                                   coreir.LocalI32Tag)
+    let literalId = coreir.BodyIRAppendCStringLiteral(bodyIR,
+                                                      conditionLiteralText,
+                                                      "")
+    var op: coreir.BodyOp
+    op.kind = coreir.BodyOpStrEqLiteralTag
+    op.target = resultSlot
+    add(op.operands, strSlot)
+    add(op.operands, literalId)
+    add(bodyIR.ops, op)
+    var condKind = coreir.BodyCondLocalNonZeroTag
+    if stmt.conditionKind == texpr.TypedExprIrCondStrNeLiteral:
+        condKind = coreir.BodyCondLocalZeroTag
+    PrimaryBodyIrAppendConditionTerm(bodyIR,
+                                     resultSlot,
+                                     condKind,
+                                     currentBlockStart,
+                                     pendingFalseTerm)
+    return true
 
 fn PrimaryBodyIrSeedParamSlots(bodyIR: var coreir.BodyIR,
                                 slotNames: var str[],
@@ -930,6 +991,12 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                 failureDetail1 = argIndex
                 return false
             add(call.argSlots, coreir.CallArgSlotConstFalse())
+        elif PrimaryBodyIrTextIsI32One(argName):
+            if targetNeedsAddress:
+                failureDetail0 = 12
+                failureDetail1 = argIndex
+                return false
+            add(call.argSlots, coreir.CallArgSlotConstTrue())
         elif argName == "true":
             if targetNeedsAddress:
                 failureDetail0 = 12
@@ -1039,10 +1106,16 @@ fn PrimaryBodyIrAppendCallOp(bodyIR: var coreir.BodyIR,
     return resultSlot
 
 fn PrimaryBodyIrPatchCallTargetSymbols(bodyIR: var coreir.BodyIR,
-                                         callTargets: str[]) =
+                                         callTargets: str[],
+                                         callImportcSymbols: str[]) =
     for ci in 0..<bodyIR.callSequence.len:
-        if ci < callTargets.len && len(callTargets[ci]) > 0:
-            bodyIR.callSequence[ci].targetSymbol = callTargets[ci]
+        var targetSymbol = ""
+        if ci < callImportcSymbols.len && len(callImportcSymbols[ci]) > 0:
+            targetSymbol = callImportcSymbols[ci]
+        elif ci < callTargets.len && len(callTargets[ci]) > 0:
+            targetSymbol = callTargets[ci]
+        if len(targetSymbol) > 0:
+            bodyIR.callSequence[ci].targetSymbol = targetSymbol
 
 fn PrimaryBodyIrAppendReturnTerm(bodyIR: var coreir.BodyIR,
                                   currentBlockStart: var int32,
@@ -1268,9 +1341,16 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
                                                          varI32ParamNames,
                                                          rhsText)
         else:
-            valueSlot = PrimaryBodyIrFindArgSlot(slotNames, rhsText)
+            if rhsText == "[]" || rhsText == "{}":
+                valueSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                           slotNames,
+                                                           Fmt"{stmt.assignFieldName}_zero",
+                                                           coreir.LocalAggregateTag)
+            else:
+                valueSlot = PrimaryBodyIrFindArgSlot(slotNames, rhsText)
         if valueSlot < 0 ||
-           PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < byteCount:
+           (rhsText != "[]" && rhsText != "{}" &&
+            PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < byteCount):
             return false
         var storeOp: coreir.BodyOp
         storeOp.kind = coreir.BodyOpFieldStoreTag
@@ -1403,6 +1483,28 @@ fn PrimaryBuildBodyIrFromTypedStatements(
             var slotId: int32 = -1
             if len(stmt.bindingName) > 0:
                 var resultTypeText = stmt.resultType
+                var importcSourcePath = stmt.callTargetSourcePath
+                if importcSourcePath == "":
+                    importcSourcePath = stmt.sourcePath
+                let importcResultType = texpr.TypedExprIrLookupImportcReturnType(typedIr,
+                                                                                  importcSourcePath,
+                                                                                  stmt.callTarget)
+                if importcResultType != "":
+                    resultTypeText = importcResultType
+                if resultTypeText != "str":
+                    for conditionStmtIndex in typedFn.statementStart..<stmtEnd:
+                        let conditionStmt = typedIr.statements[conditionStmtIndex]
+                        if conditionStmt.lineNumber <= stmt.lineNumber:
+                            continue
+                        if conditionStmt.kind != texpr.TypedExprIrStmtIf &&
+                           conditionStmt.kind != texpr.TypedExprIrStmtElif:
+                            continue
+                        if conditionStmt.conditionKind != texpr.TypedExprIrCondStrEqLiteral &&
+                           conditionStmt.conditionKind != texpr.TypedExprIrCondStrNeLiteral:
+                            continue
+                        if conditionStmt.conditionLhsText == stmt.bindingName:
+                            resultTypeText = "str"
+                            break
                 let targetFnIndex = PrimaryBodyIrTargetFunctionIndex(typedIr,
                                                                      stmt.callTargetSourcePath,
                                                                      stmt.callTarget)
@@ -1600,6 +1702,12 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                   0,
                                                   false)
         elif stmt.kind == texpr.TypedExprIrStmtIf:
+            if PrimaryBodyIrAppendTypedStrLiteralCondition(bodyIR,
+                                                           slotNames,
+                                                           stmt,
+                                                           currentBlockStart,
+                                                           pendingFalseTerm):
+                continue
             let condText = PrimaryBodyIrConditionText(stmt.surfaceText)
             var cmpOpPos: int32
             cmpOpPos = -1
@@ -1726,6 +1834,12 @@ fn PrimaryBuildBodyIrFromTypedStatements(
         elif stmt.kind == texpr.TypedExprIrStmtElif:
             if pendingFalseTerm >= 0:
                 bodyIR.terms[pendingFalseTerm].falseBlock = bodyIR.blocks.len
+                if PrimaryBodyIrAppendTypedStrLiteralCondition(bodyIR,
+                                                               slotNames,
+                                                               stmt,
+                                                               currentBlockStart,
+                                                               pendingFalseTerm):
+                    continue
                 let condText = PrimaryBodyIrConditionText(stmt.surfaceText)
                 var cmpOpPos: int32
                 cmpOpPos = -1
@@ -2791,6 +2905,120 @@ fn PrimaryBodyIRStoreRegToSlot(words: var int32[],
         return offset + 1
     return -1
 
+fn PrimaryBodyIRLoadStrValueAddressToReg(words: var int32[],
+                                          offset: int32,
+                                          bodyIR: coreir.BodyIR,
+                                          slotIndex: int32,
+                                          reg: int32,
+                                          frameBytes: int32,
+                                          paramSaveOffset: int32,
+                                          paramSaveCount: int32): int32 =
+    if offset < 0 || offset >= words.len:
+        return -1
+    if PrimaryBodyIrSlotType(bodyIR, slotIndex) != coreir.LocalStrTag:
+        return -1
+    let stackOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                   slotIndex,
+                                                   frameBytes,
+                                                   paramSaveOffset,
+                                                   paramSaveCount)
+    if stackOffset < 0:
+        return -1
+    if PrimaryBodyIrLocalIsParam(bodyIR.localSlots[slotIndex]):
+        words[offset] = Value(a64.A64EncLdrImm(true,
+                                               reg,
+                                               a64.A64SP,
+                                               int64(stackOffset)))
+        return offset + 1
+    if stackOffset > 4095:
+        return -1
+    words[offset] = Value(a64.A64EncAddImm(true, reg, a64.A64SP, stackOffset))
+    return offset + 1
+
+fn PrimaryBodyIRStrEqLiteralWordCount(bodyIR: coreir.BodyIR,
+                                       op: coreir.BodyOp): int32 =
+    if op.operands.len < 2:
+        return 0
+    if op.target < 0 || op.target >= bodyIR.localSlots.len:
+        return 0
+    if bodyIR.localSlots[op.target].typeKind != coreir.LocalI32Tag:
+        return 0
+    let strSlot = op.operands[0]
+    if strSlot < 0 ||
+       strSlot >= bodyIR.localSlots.len ||
+       bodyIR.localSlots[strSlot].typeKind != coreir.LocalStrTag:
+        return 0
+    let literalId = op.operands[1]
+    if literalId < 0 || literalId >= bodyIR.cstringLiterals.len:
+        return 0
+    let literalLen = len(bodyIR.cstringLiterals[literalId].text)
+    if literalLen > 4095:
+        return 0
+    return 9 + literalLen * 3
+
+fn PrimaryBodyIRFillStrEqLiteralOp(words: var int32[],
+                                    offset: int32,
+                                    bodyIR: coreir.BodyIR,
+                                    op: coreir.BodyOp,
+                                    frameBytes: int32,
+                                    paramSaveOffset: int32,
+                                    paramSaveCount: int32): int32 =
+    if op.operands.len < 2:
+        return -1
+    let literalId = op.operands[1]
+    if literalId < 0 || literalId >= bodyIR.cstringLiterals.len:
+        return -1
+    let literalText = bodyIR.cstringLiterals[literalId].text
+    let literalLen = len(literalText)
+    let wordCount = PrimaryBodyIRStrEqLiteralWordCount(bodyIR, op)
+    if wordCount <= 0 || offset < 0 || offset + wordCount > words.len:
+        return -1
+    let failIndex = offset + wordCount - 2
+    let storeIndex = offset + wordCount - 1
+    var pos = PrimaryBodyIRLoadStrValueAddressToReg(words,
+                                                    offset,
+                                                    bodyIR,
+                                                    op.operands[0],
+                                                    a64.A64X10,
+                                                    frameBytes,
+                                                    paramSaveOffset,
+                                                    paramSaveCount)
+    if pos < 0 || pos + 3 >= words.len:
+        return -1
+    words[pos] = Value(a64.A64EncLdrImm(true, a64.A64X9, a64.A64X10, int64(0)))
+    pos = pos + 1
+    words[pos] = Value(a64.A64EncLdrImm(false, a64.A64X11, a64.A64X10, int64(8)))
+    pos = pos + 1
+    words[pos] = Value(a64.A64EncCmpImm(false, a64.A64X11, literalLen))
+    pos = pos + 1
+    words[pos] = Value(a64.A64EncBCond(int64(failIndex - pos), a64.A64CondNE))
+    pos = pos + 1
+    for byteIndex in 0..<literalLen:
+        if pos + 2 >= words.len:
+            return -1
+        words[pos] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, byteIndex))
+        pos = pos + 1
+        words[pos] = Value(a64.A64EncCmpImm(false, a64.A64X11, int32(literalText[byteIndex])))
+        pos = pos + 1
+        words[pos] = Value(a64.A64EncBCond(int64(failIndex - pos), a64.A64CondNE))
+        pos = pos + 1
+    if pos + 3 >= words.len:
+        return -1
+    words[pos] = a64.A64EncMovz(false, a64.A64X11, 1, 0)
+    pos = pos + 1
+    words[pos] = Value(a64.A64EncBImm(int64(storeIndex - pos)))
+    pos = pos + 1
+    words[pos] = a64.A64EncMovz(false, a64.A64X11, 0, 0)
+    pos = pos + 1
+    return PrimaryBodyIRStoreRegToSlot(words,
+                                       pos,
+                                       bodyIR,
+                                       op.target,
+                                       a64.A64X11,
+                                       frameBytes,
+                                       paramSaveOffset,
+                                       paramSaveCount)
+
 fn PrimaryBodyIRCopySlot(words: var int32[],
                           offset: int32,
                           bodyIR: coreir.BodyIR,
@@ -3173,6 +3401,8 @@ fn PrimaryBodyIRFillBlockOp(words: var int32[],
         return PrimaryBodyIRFillCmpOp(words, offset, bodyIR, op, frameBytes, paramSaveOffset, paramSaveCount)
     if op.kind == coreir.BodyOpResultProjectTag:
         return PrimaryBodyIRFillResultProjectOp(words, offset, bodyIR, op, frameBytes, paramSaveOffset, paramSaveCount)
+    if op.kind == coreir.BodyOpStrEqLiteralTag:
+        return PrimaryBodyIRFillStrEqLiteralOp(words, offset, bodyIR, op, frameBytes, paramSaveOffset, paramSaveCount)
     if op.kind == coreir.BodyOpGlobalLoadTag:
         return PrimaryBodyIRFillGlobalLoadOp(words, offset, bodyIR, op, frameBytes, paramSaveOffset, paramSaveCount)
     if op.kind == coreir.BodyOpGlobalStoreTag:
@@ -3985,6 +4215,8 @@ fn PrimaryBodyIROpSizeAt(bodyIR: coreir.BodyIR,
         if op.operands.len < 3:
             return 0
         return 5
+    if op.kind == coreir.BodyOpStrEqLiteralTag:
+        return PrimaryBodyIRStrEqLiteralWordCount(bodyIR, op)
     if op.kind == coreir.BodyOpGlobalLoadTag ||
        op.kind == coreir.BodyOpGlobalStoreTag:
         if op.operands.len < 1 ||
@@ -4459,7 +4691,9 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                                 var bodyIR = PrimaryBuildBodyIrFromTypedStatements(lowering.typedIr,
                                 typedFnIndex,
                                 irFn)
-                                PrimaryBodyIrPatchCallTargetSymbols(bodyIR, irFn.callTargets)
+                                PrimaryBodyIrPatchCallTargetSymbols(bodyIR,
+                                                                    irFn.callTargets,
+                                                                    irFn.callImportcSymbols)
                                 if bodyIR.ops.len > 0 || bodyIR.terms.len > 0:
                                     tempBodyIRs[i] = bodyIR
                                     wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(bodyIR)
