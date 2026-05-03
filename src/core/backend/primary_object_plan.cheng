@@ -895,6 +895,70 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
     let rhsText = strutil.Strip(stmt.surfaceText)
     if len(lhsName) <= 0 || len(rhsText) <= 0:
         return false
+    if stmt.assignFieldName == "" &&
+       stmt.assignValueFieldName != "":
+        if PrimaryBodyIrTextHasFieldOrIndex(lhsName):
+            return false
+        let lhsSlot = PrimaryBodyIrFindSlotIndex(slotNames, lhsName)
+        let baseSlot = PrimaryBodyIrFindArgSlot(slotNames, stmt.assignValueRootName)
+        let byteCount = stmt.assignValueFieldSizeBytes
+        if lhsSlot < 0 || baseSlot < 0 || byteCount <= 0 ||
+           PrimaryLocalSlotSizeOf(bodyIR.localSlots[lhsSlot]) < byteCount:
+            return false
+        var loadOp: coreir.BodyOp
+        loadOp.kind = coreir.BodyOpFieldLoadTag
+        loadOp.target = lhsSlot
+        add(loadOp.operands, baseSlot)
+        add(loadOp.operands, lhsSlot)
+        add(loadOp.operands, stmt.assignValueFieldOffsetBytes)
+        add(loadOp.operands, byteCount)
+        add(bodyIR.ops, loadOp)
+        return true
+    if stmt.assignFieldName != "":
+        let baseSlot = PrimaryBodyIrFindArgSlot(slotNames, stmt.assignRootName)
+        let byteCount = stmt.assignFieldSizeBytes
+        if baseSlot < 0 || byteCount <= 0:
+            return false
+        var valueSlot: int32
+        valueSlot = -1
+        if stmt.assignValueFieldName != "":
+            let valueBaseSlot = PrimaryBodyIrFindArgSlot(slotNames, stmt.assignValueRootName)
+            let valueByteCount = stmt.assignValueFieldSizeBytes
+            if valueBaseSlot < 0 || valueByteCount <= 0 || valueByteCount != byteCount:
+                return false
+            valueSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                      slotNames,
+                                                      Fmt"{stmt.assignValueRootName}.{stmt.assignValueFieldName}#field_value",
+                                                      PrimaryBodyIrTypeKindFromText(stmt.assignValueFieldType))
+            if PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < valueByteCount:
+                return false
+            var loadOp: coreir.BodyOp
+            loadOp.kind = coreir.BodyOpFieldLoadTag
+            loadOp.target = valueSlot
+            add(loadOp.operands, valueBaseSlot)
+            add(loadOp.operands, valueSlot)
+            add(loadOp.operands, stmt.assignValueFieldOffsetBytes)
+            add(loadOp.operands, valueByteCount)
+            add(bodyIR.ops, loadOp)
+        elif byteCount == 4:
+            valueSlot = PrimaryBodyIrI32ValueSlotForText(bodyIR,
+                                                         slotNames,
+                                                         varI32ParamNames,
+                                                         rhsText)
+        else:
+            valueSlot = PrimaryBodyIrFindArgSlot(slotNames, rhsText)
+        if valueSlot < 0 ||
+           PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < byteCount:
+            return false
+        var storeOp: coreir.BodyOp
+        storeOp.kind = coreir.BodyOpFieldStoreTag
+        storeOp.target = baseSlot
+        add(storeOp.operands, baseSlot)
+        add(storeOp.operands, valueSlot)
+        add(storeOp.operands, stmt.assignFieldOffsetBytes)
+        add(storeOp.operands, byteCount)
+        add(bodyIR.ops, storeOp)
+        return true
     if PrimaryBodyIrTextHasFieldOrIndex(lhsName):
         return false
     let lhsSlot = PrimaryBodyIrFindSlotIndex(slotNames, lhsName)
@@ -2165,6 +2229,162 @@ fn PrimaryBodyIRFillBlockOp(words: var int32[],
         return PrimaryBodyIRFillCmpOp(words, offset, bodyIR, op, frameBytes, paramSaveOffset, paramSaveCount)
     if op.kind == coreir.BodyOpResultProjectTag:
         return PrimaryBodyIRFillResultProjectOp(words, offset, bodyIR, op, frameBytes, paramSaveOffset, paramSaveCount)
+    if op.kind == coreir.BodyOpFieldLoadTag:
+        if op.operands.len < 4:
+            return -1
+        let baseSlot = op.operands[0]
+        let valueSlot = op.operands[1]
+        let byteOffset = op.operands[2]
+        let byteCount = op.operands[3]
+        if op.target != valueSlot ||
+           baseSlot < 0 || baseSlot >= bodyIR.localSlots.len ||
+           valueSlot < 0 || valueSlot >= bodyIR.localSlots.len ||
+           byteOffset < 0 || byteCount <= 0 ||
+           PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < byteCount:
+            return -1
+        var pos = offset
+        var sourceReg = a64.A64SP
+        var sourceOffset = byteOffset
+        if bodyIR.localSlots[baseSlot].typeKind == coreir.LocalPtrTag:
+            pos = PrimaryBodyIRLoadSlotToReg(words,
+                                             pos,
+                                             bodyIR,
+                                             baseSlot,
+                                             a64.A64X9,
+                                             frameBytes,
+                                             paramSaveOffset,
+                                             paramSaveCount)
+            if pos < 0:
+                return -1
+            sourceReg = a64.A64X9
+        else:
+            let baseOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                           baseSlot,
+                                                           frameBytes,
+                                                           paramSaveOffset,
+                                                           paramSaveCount)
+            let baseSize = PrimaryLocalSlotSizeOf(bodyIR.localSlots[baseSlot])
+            if baseOffset < 0 || baseSize <= 0 || byteOffset > baseSize - byteCount:
+                return -1
+            sourceOffset = baseOffset + byteOffset
+        let targetOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                         valueSlot,
+                                                         frameBytes,
+                                                         paramSaveOffset,
+                                                         paramSaveCount)
+        if targetOffset < 0:
+            return -1
+        if byteCount % 8 == 0 &&
+           sourceOffset % 8 == 0 &&
+           targetOffset % 8 == 0:
+            for copyIndex in 0..<(byteCount / 8):
+                if pos + 1 >= words.len:
+                    return -1
+                words[pos] = Value(a64.A64EncLdrImm(true,
+                                                    a64.A64X10,
+                                                    sourceReg,
+                                                    int64(sourceOffset + copyIndex * 8)))
+                words[pos + 1] = Value(a64.A64EncStrImm(true,
+                                                        a64.A64X10,
+                                                        a64.A64SP,
+                                                        int64(targetOffset + copyIndex * 8)))
+                pos = pos + 2
+            return pos
+        if byteCount % 4 == 0 &&
+           sourceOffset % 4 == 0 &&
+           targetOffset % 4 == 0:
+            for copyIndex in 0..<(byteCount / 4):
+                if pos + 1 >= words.len:
+                    return -1
+                words[pos] = Value(a64.A64EncLdrImm(false,
+                                                    a64.A64X10,
+                                                    sourceReg,
+                                                    int64(sourceOffset + copyIndex * 4)))
+                words[pos + 1] = Value(a64.A64EncStrImm(false,
+                                                        a64.A64X10,
+                                                        a64.A64SP,
+                                                        int64(targetOffset + copyIndex * 4)))
+                pos = pos + 2
+            return pos
+        return -1
+    if op.kind == coreir.BodyOpFieldStoreTag:
+        if op.operands.len < 4:
+            return -1
+        let baseSlot = op.operands[0]
+        let valueSlot = op.operands[1]
+        let byteOffset = op.operands[2]
+        let byteCount = op.operands[3]
+        if op.target != baseSlot ||
+           baseSlot < 0 || baseSlot >= bodyIR.localSlots.len ||
+           valueSlot < 0 || valueSlot >= bodyIR.localSlots.len ||
+           byteOffset < 0 || byteCount <= 0 ||
+           PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < byteCount:
+            return -1
+        let sourceOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                         valueSlot,
+                                                         frameBytes,
+                                                         paramSaveOffset,
+                                                         paramSaveCount)
+        if sourceOffset < 0:
+            return -1
+        var pos = offset
+        var targetReg = a64.A64SP
+        var targetOffset = byteOffset
+        if bodyIR.localSlots[baseSlot].typeKind == coreir.LocalPtrTag:
+            pos = PrimaryBodyIRLoadSlotToReg(words,
+                                             pos,
+                                             bodyIR,
+                                             baseSlot,
+                                             a64.A64X9,
+                                             frameBytes,
+                                             paramSaveOffset,
+                                             paramSaveCount)
+            if pos < 0:
+                return -1
+            targetReg = a64.A64X9
+        else:
+            let baseOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                           baseSlot,
+                                                           frameBytes,
+                                                           paramSaveOffset,
+                                                           paramSaveCount)
+            let baseSize = PrimaryLocalSlotSizeOf(bodyIR.localSlots[baseSlot])
+            if baseOffset < 0 || baseSize <= 0 || byteOffset > baseSize - byteCount:
+                return -1
+            targetOffset = baseOffset + byteOffset
+        if byteCount % 8 == 0 &&
+           sourceOffset % 8 == 0 &&
+           targetOffset % 8 == 0:
+            for copyIndex in 0..<(byteCount / 8):
+                if pos + 1 >= words.len:
+                    return -1
+                words[pos] = Value(a64.A64EncLdrImm(true,
+                                                    a64.A64X10,
+                                                    a64.A64SP,
+                                                    int64(sourceOffset + copyIndex * 8)))
+                words[pos + 1] = Value(a64.A64EncStrImm(true,
+                                                        a64.A64X10,
+                                                        targetReg,
+                                                        int64(targetOffset + copyIndex * 8)))
+                pos = pos + 2
+            return pos
+        if byteCount % 4 == 0 &&
+           sourceOffset % 4 == 0 &&
+           targetOffset % 4 == 0:
+            for copyIndex in 0..<(byteCount / 4):
+                if pos + 1 >= words.len:
+                    return -1
+                words[pos] = Value(a64.A64EncLdrImm(false,
+                                                    a64.A64X10,
+                                                    a64.A64SP,
+                                                    int64(sourceOffset + copyIndex * 4)))
+                words[pos + 1] = Value(a64.A64EncStrImm(false,
+                                                        a64.A64X10,
+                                                        targetReg,
+                                                        int64(targetOffset + copyIndex * 4)))
+                pos = pos + 2
+            return pos
+        return -1
     if op.kind == coreir.BodyOpIndexedLoadTag:
         if op.operands.len < 2:
             return -1
@@ -2429,15 +2649,11 @@ fn PrimaryFillInstructionWords(words: var int32[],
         let wordCount = functionWordCounts[i]
         let hasBodyIR = i < functionBodyIRs.len &&
                         (functionBodyIRs[i].ops.len > 0 || functionBodyIRs[i].terms.len > 0)
-        if wordCount > 0 && hasBodyIR:
+        if hasBodyIR:
             let bodyIR = functionBodyIRs[i]
             let offset = functionWordOffsets[i]
             let emitted = PrimaryBodyIRFillWords(words, offset, wordCount, bodyIR)
-            if emitted != wordCount &&
-               !PrimaryFillInstructionWordsForFunction(words,
-                                                        functionWordOffsets[i],
-                                                        functionWordCounts[i],
-                                                        functionBodyKinds[i]):
+            if emitted != wordCount:
                 ok = false
         elif !PrimaryFillInstructionWordsForFunction(words,
                                                       functionWordOffsets[i],
@@ -2689,6 +2905,56 @@ fn PrimaryBodyIROpSizeAt(bodyIR: coreir.BodyIR,
         if op.operands.len < 2:
             return 0
         return 3
+    if op.kind == coreir.BodyOpFieldLoadTag ||
+       op.kind == coreir.BodyOpFieldStoreTag:
+        if op.operands.len < 4:
+            return 0
+        let baseSlot = op.operands[0]
+        let valueSlot = op.operands[1]
+        let byteOffset = op.operands[2]
+        let byteCount = op.operands[3]
+        if baseSlot < 0 || baseSlot >= bodyIR.localSlots.len ||
+           valueSlot < 0 || valueSlot >= bodyIR.localSlots.len ||
+           byteOffset < 0 || byteCount <= 0 ||
+           PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < byteCount:
+            return 0
+        if op.kind == coreir.BodyOpFieldLoadTag && op.target != valueSlot:
+            return 0
+        if op.kind == coreir.BodyOpFieldStoreTag && op.target != baseSlot:
+            return 0
+        let frameBytes = PrimaryBodyIrFrameBytes(bodyIR)
+        let paramSaveOffset = PrimaryBodyIrParamSaveOffset(bodyIR)
+        let paramSaveCount = PrimaryBodyIrParamSaveCount(bodyIR)
+        var accessOffset = byteOffset
+        var count: int32
+        if bodyIR.localSlots[baseSlot].typeKind == coreir.LocalPtrTag:
+            count = count + 1
+        else:
+            let baseOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                           baseSlot,
+                                                           frameBytes,
+                                                           paramSaveOffset,
+                                                           paramSaveCount)
+            let baseSize = PrimaryLocalSlotSizeOf(bodyIR.localSlots[baseSlot])
+            if baseOffset < 0 || baseSize <= 0 || byteOffset > baseSize - byteCount:
+                return 0
+            accessOffset = baseOffset + byteOffset
+        let valueOffset = PrimaryBodyIrLocalStackOffset(bodyIR,
+                                                        valueSlot,
+                                                        frameBytes,
+                                                        paramSaveOffset,
+                                                        paramSaveCount)
+        if valueOffset < 0:
+            return 0
+        if byteCount % 8 == 0 &&
+           accessOffset % 8 == 0 &&
+           valueOffset % 8 == 0:
+            return count + (byteCount / 8) * 2
+        if byteCount % 4 == 0 &&
+           accessOffset % 4 == 0 &&
+           valueOffset % 4 == 0:
+            return count + (byteCount / 4) * 2
+        return 0
     return 0
 
 fn PrimaryBodyIROpSize(op: coreir.BodyOp): int32 =
