@@ -4389,6 +4389,23 @@ fn TypedExprTypeLeafName(typeRaw: str): str =
         return chengpath.TextSlice(typeText, start, typeText.len - start)
     return typeText
 
+fn TypedExprPointerPointeeType(currentCtx: var TypedExprSourceContext,
+                                sourceContexts: var TypedExprSourceContext[],
+                                typeRaw: str): str =
+    let typeText = chengpath.PathTrim(TypedExprStripVarType(typeRaw))
+    if typeText == "":
+        return ""
+    if typeText.len > 0 && typeText[typeText.len - 1] == '*':
+        return chengpath.PathTrim(chengpath.TextSlice(typeText, 0, typeText.len - 1))
+    let leaf = TypedExprTypeLeafName(typeText)
+    if leaf.len > 3 &&
+       chengpath.TextSlice(leaf, leaf.len - 3, 3) == "Ptr":
+        let pointeeLeaf = chengpath.TextSlice(leaf, 0, leaf.len - 3)
+        let ctxIndex = TypedExprFieldContextLookup(currentCtx, sourceContexts, pointeeLeaf)
+        if ctxIndex >= 0 || ctxIndex == -2:
+            return pointeeLeaf
+    return typeText
+
 fn TypedExprTypeFieldDeclMatches(field: TypedExprTypeFieldDecl,
                                   ownerTypeRaw: str,
                                   fieldNameRaw: str): bool =
@@ -6814,34 +6831,48 @@ fn TypedExprAssignLhsRootName(lhsRaw: str): str =
     let lhs = chengpath.PathTrim(lhsRaw)
     if lhs == "":
         return ""
-    let dotPos = parser.ParserFindText(lhs, ".")
+    var dotPos = parser.ParserFindText(lhs, "->")
+    if dotPos < 0:
+        dotPos = parser.ParserFindText(lhs, ".")
     if dotPos > 0:
         return parser.ParserIdentPrefix(chengpath.TextSlice(lhs, 0, dotPos))
     return parser.ParserIdentPrefix(lhs)
 
 fn TypedExprAssignFieldName(lhsRaw: str): str =
     let lhs = chengpath.PathTrim(lhsRaw)
-    let dotPos = parser.ParserFindText(lhs, ".")
+    var sepLen = 1
+    var dotPos = parser.ParserFindText(lhs, "->")
+    if dotPos >= 0:
+        sepLen = 2
+    else:
+        dotPos = parser.ParserFindText(lhs, ".")
     if dotPos < 0 || dotPos + 1 >= lhs.len:
         return ""
     return parser.ParserIdentPrefix(chengpath.TextSlice(lhs,
-                                                       dotPos + 1,
-                                                       lhs.len - dotPos - 1))
+                                                       dotPos + sepLen,
+                                                       lhs.len - dotPos - sepLen))
 
 fn TypedExprAssignFieldPath(lhsRaw: str): str =
     let lhs = chengpath.PathTrim(lhsRaw)
-    let dotPos = parser.ParserFindText(lhs, ".")
+    var sepLen = 1
+    var dotPos = parser.ParserFindText(lhs, "->")
+    if dotPos >= 0:
+        sepLen = 2
+    else:
+        dotPos = parser.ParserFindText(lhs, ".")
     if dotPos < 0 || dotPos + 1 >= lhs.len:
         return ""
     return chengpath.PathTrim(chengpath.TextSlice(lhs,
-                                                  dotPos + 1,
-                                                  lhs.len - dotPos - 1))
+                                                  dotPos + sepLen,
+                                                  lhs.len - dotPos - sepLen))
 
 fn TypedExprTextIsSimpleFieldPath(textRaw: str): bool =
     let text = chengpath.PathTrim(textRaw)
     if text == "":
         return false
-    if parser.ParserFindText(text, ".") <= 0:
+    let arrowPos = parser.ParserFindText(text, "->")
+    let dotPos = parser.ParserFindText(text, ".")
+    if arrowPos <= 0 && dotPos <= 0:
         return false
     if parser.ParserFindText(text, "(") >= 0 ||
        parser.ParserFindText(text, ")") >= 0 ||
@@ -6851,7 +6882,7 @@ fn TypedExprTextIsSimpleFieldPath(textRaw: str): bool =
        parser.ParserFindText(text, "}") >= 0 ||
        parser.ParserFindText(text, " ") >= 0 ||
        parser.ParserFindText(text, "+") >= 0 ||
-       parser.ParserFindText(text, "-") >= 0 ||
+       (parser.ParserFindText(text, "-") >= 0 && arrowPos < 0) ||
        parser.ParserFindText(text, "*") >= 0 ||
        parser.ParserFindText(text, "/") >= 0 ||
        parser.ParserFindText(text, "?") >= 0 ||
@@ -6937,13 +6968,16 @@ fn TypedExprIrPopulateAssignLhsMeta(stmt: var TypedExprIrStatement,
     if fieldPath == "":
         return rootType
     stmt.assignFieldName = fieldPath
+    var fieldRootType = rootType
+    if parser.ParserFindText(lhsRaw, "->") > 0:
+        fieldRootType = TypedExprPointerPointeeType(ctx, sourceContexts, rootType)
     var fieldType = ""
     var fieldOffset: int32
     var fieldSize: int32
     var fieldAlign: int32
     if TypedExprResolveFieldPathMeta(ctx,
                                      sourceContexts,
-                                     rootType,
+                                     fieldRootType,
                                      fieldPath,
                                      fieldType,
                                      fieldOffset,
@@ -6954,7 +6988,7 @@ fn TypedExprIrPopulateAssignLhsMeta(stmt: var TypedExprIrStatement,
         stmt.assignFieldSizeBytes = fieldSize
         stmt.assignFieldAlignBytes = fieldAlign
         return fieldType
-    fieldType = TypedExprAssignFieldType(rootType, TypedExprAssignFieldName(lhsRaw))
+    fieldType = TypedExprAssignFieldType(fieldRootType, TypedExprAssignFieldName(lhsRaw))
     if fieldType != "":
         stmt.assignFieldType = fieldType
         var sizeBytes: int32
@@ -6988,13 +7022,16 @@ fn TypedExprIrPopulateAssignValueMeta(stmt: var TypedExprIrStatement,
     let rootType = TypedExprLookupBindingType(ctx, scopeIndex, lineNumber, rootName)
     if rootType == "":
         return
+    var fieldRootType = rootType
+    if parser.ParserFindText(valueRaw, "->") > 0:
+        fieldRootType = TypedExprPointerPointeeType(ctx, sourceContexts, rootType)
     var fieldType = ""
     var fieldOffset: int32
     var fieldSize: int32
     var fieldAlign: int32
     if !TypedExprResolveFieldPathMeta(ctx,
                                       sourceContexts,
-                                      rootType,
+                                      fieldRootType,
                                       fieldPath,
                                       fieldType,
                                       fieldOffset,
