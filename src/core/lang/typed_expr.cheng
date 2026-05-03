@@ -1740,6 +1740,37 @@ fn TypedExprFactsValidateCallResolution(exprLayer: var parser.NormalizedExprLaye
         var target = expr.callTarget
         var targetSourcePath = expr.callTargetSourcePath
         var targetImportc = expr.callTargetImportc
+        if qualifier != "" &&
+           expr.callArgCount <= 0 &&
+           expr.callReason == parser.NormalizedExprCallReasonUnknownQualifiedTarget &&
+           TypedExprSymbolExportedByCase(callee):
+            let sourceContextIndex = TypedExprSourceContextLookup(sourceContexts, expr.sourcePath)
+            if sourceContextIndex < 0:
+                err = Fmt" typed expr: missing source context for qualified type constructor at {expr.sourcePath}:{expr.lineNumber}"
+                return false
+            let typeSourcePath = TypedExprLookupQualifiedModuleSourcePath(sourceContexts[sourceContextIndex],
+                                                                          sourceContexts,
+                                                                          qualifier)
+            let typeSourceIndex = TypedExprSourceContextLookup(sourceContexts, typeSourcePath)
+            if typeSourceIndex >= 0 &&
+               TypedExprSourceHasDeclaredType(sourceContexts[typeSourceIndex], callee):
+                let qualifiedType = TypedExprNormalizeTypeText(Fmt"{qualifier}.{callee}")
+                if fact.surfaceCallKind != TypedExprSurfaceCallNone ||
+                   fact.callResolved ||
+                   fact.callReason != TypedExprCallReasonNone ||
+                   fact.callQualifier != "" ||
+                   fact.callCallee != "" ||
+                   fact.callTarget != "" ||
+                   fact.callTargetSourcePath != "" ||
+                   fact.callTargetImportc ||
+                   fact.callKind != TypedExprCallNone ||
+                   fact.typeText != qualifiedType ||
+                   fact.abiClass == TypedExprAbiPolymorphic ||
+                   fact.loweringMode == TypedExprLowerDeferred ||
+                   fact.returnKind == TypedExprReturnDeferred:
+                    err = Fmt" typed expr: qualified type constructor drift at {expr.sourcePath}:{expr.lineNumber}"
+                    return false
+                continue
         if qualifier != "":
             let sourceContextIndex = TypedExprSourceContextLookup(sourceContexts, expr.sourcePath)
             if sourceContextIndex < 0:
@@ -6176,12 +6207,21 @@ fn TypedExprBuildFact(ctx: var TypedExprSourceContext,
         return fact
     if expr.kind == parser.NormalizedExprCall:
         if expr.callArgCount <= 0 &&
-           expr.callQualifier != "" &&
-           TypedExprSymbolExportedByCase(expr.callCallee) &&
-           expr.callReason == parser.NormalizedExprCallReasonUnknownQualifiedTarget:
-            var typeName = Fmt"{expr.callQualifier}.{expr.callCallee}"
-            TypedExprApplyResolvedType(fact, ctx, sourceContexts, typeName, sink, false)
-            return fact
+           TypedExprSymbolExportedByCase(expr.callCallee):
+            var typeName = ""
+            if expr.callQualifier != "":
+                let typeSourcePath = TypedExprLookupQualifiedModuleSourcePath(ctx,
+                                                                              sourceContexts,
+                                                                              expr.callQualifier)
+                let typeSourceIndex = TypedExprSourceContextLookup(sourceContexts, typeSourcePath)
+                if typeSourceIndex >= 0 &&
+                   TypedExprSourceHasDeclaredType(sourceContexts[typeSourceIndex], expr.callCallee):
+                    typeName = Fmt"{expr.callQualifier}.{expr.callCallee}"
+            elif TypedExprSourceHasDeclaredType(ctx, expr.callCallee):
+                typeName = expr.callCallee
+            if typeName != "":
+                TypedExprApplyResolvedType(fact, ctx, sourceContexts, typeName, sink, false)
+                return fact
         fact.surfaceCallKind = TypedExprSurfaceCallKindFromParser(expr.callSurfaceKind)
         fact.callResolved = expr.callResolved
         fact.callReason = TypedExprCallReasonFromParser(expr.callReason)
