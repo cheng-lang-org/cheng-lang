@@ -66,6 +66,7 @@ type
         firstMissingCallTargetOrdinal: int32
         firstMissingCallTarget: str
         firstMissingCallTargetSourcePath: str
+        firstMissingCallTargetCandidateSourcePath: str
         missingReasons: str[]
         pipelineStage: str
 
@@ -238,6 +239,18 @@ fn PrimaryFunctionTargetIndex(functionSymbolTexts: str[],
            PrimaryFunctionTailName(functionSymbolTexts[i]) == targetTail:
             return i
     return -1
+
+fn PrimaryFunctionTargetCandidateSourcePath(functionSymbolTexts: str[],
+                                             functionSourcePaths: str[],
+                                             targetText: str): str =
+    let targetTail = PrimaryCallTargetTailName(targetText)
+    for i in 0..<functionSymbolTexts.len:
+        if i >= functionSourcePaths.len:
+            continue
+        if functionSymbolTexts[i] == targetText ||
+           PrimaryFunctionTailName(functionSymbolTexts[i]) == targetTail:
+            return functionSourcePaths[i]
+    return ""
 
 fn PrimaryBoolSeqInit(count: int32,
                        value: bool): bool[] =
@@ -1065,10 +1078,14 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
         add(bodyIR.ops, loadOp)
         return true
     if stmt.assignFieldName != "":
-        let baseSlot = PrimaryBodyIrFindArgSlot(slotNames, stmt.assignRootName)
-        let byteCount = stmt.assignFieldSizeBytes
-        if baseSlot < 0 || byteCount <= 0:
+        var baseSlot = PrimaryBodyIrFindArgSlot(slotNames, stmt.assignRootName)
+        if baseSlot < 0:
+            baseSlot = PrimaryBodyIrFindSlotIndex(slotNames, stmt.assignRootName)
+        if baseSlot < 0:
             return false
+        var byteCount = stmt.assignFieldSizeBytes
+        if byteCount <= 0:
+            byteCount = 8
         var valueSlot: int32
         valueSlot = -1
         if stmt.assignValueFieldName != "":
@@ -4043,6 +4060,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     var firstMissingCallTargetOrdinal: int32
     var firstMissingCallTarget = ""
     var firstMissingCallTargetSourcePath = ""
+    var firstMissingCallTargetCandidateSourcePath = ""
     firstMissingCallTargetOrdinal = -1
     var needsRuntimeCommandData = false
     var irIndexes: int32[]
@@ -4230,6 +4248,9 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                                     firstMissingCallTarget = irFunction.callTargets[callOrdinal]
                                 if callOrdinal < irFunction.callTargetSourcePaths.len:
                                     firstMissingCallTargetSourcePath = irFunction.callTargetSourcePaths[callOrdinal]
+                                firstMissingCallTargetCandidateSourcePath = PrimaryFunctionTargetCandidateSourcePath(lowering.functionSymbolTexts,
+                                                                                                                      lowering.functionSourcePaths,
+                                                                                                                      firstMissingCallTarget)
                             break
                         if !reachable[targetIndex]:
                             reachable[targetIndex] = true
@@ -4345,6 +4366,9 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                                     firstMissingCallTarget = irFunction.callTargets[callOrdinal]
                                 if callOrdinal < irFunction.callTargetSourcePaths.len:
                                     firstMissingCallTargetSourcePath = irFunction.callTargetSourcePaths[callOrdinal]
+                                firstMissingCallTargetCandidateSourcePath = PrimaryFunctionTargetCandidateSourcePath(lowering.functionSymbolTexts,
+                                                                                                                      lowering.functionSourcePaths,
+                                                                                                                      firstMissingCallTarget)
                             break
                     add(targetSymbols, targetSymbol)
             if !callSequenceReady:
@@ -4629,6 +4653,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     plan.firstMissingCallTargetOrdinal = firstMissingCallTargetOrdinal
     plan.firstMissingCallTarget = firstMissingCallTarget
     plan.firstMissingCallTargetSourcePath = firstMissingCallTargetSourcePath
+    plan.firstMissingCallTargetCandidateSourcePath = firstMissingCallTargetCandidateSourcePath
     plan.missingReasons = PrimaryObjectMissingReasons(linkPlan,
                                                         lowering,
                                                         itemIds,
@@ -4700,6 +4725,7 @@ fn PrimaryObjectPlanReport(plan: PrimaryObjectPlan): str =
     PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_call_target_ordinal", strings.IntToStr(plan.firstMissingCallTargetOrdinal))
     PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_call_target", plan.firstMissingCallTarget)
     PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_call_target_source_path", plan.firstMissingCallTargetSourcePath)
+    PrimaryObjectPlanAppendLine(out, "primary_object_first_missing_call_target_candidate_source_path", plan.firstMissingCallTargetCandidateSourcePath)
     PrimaryObjectPlanAppendLine(out, "primary_object_missing_reasons", slplan.SystemLinkPlanListText(plan.missingReasons))
     out = Fmt"{out}primary_object_pipeline_stage={plan.pipelineStage}"
     return out
