@@ -1040,6 +1040,8 @@ fn TypedExprExprIsBuiltinStringifyCall(expr: parser.NormalizedExpr): bool =
 fn TypedExprBuiltinTypeCallResult(expr: parser.NormalizedExpr): str =
     if expr.kind != parser.NormalizedExprCall:
         return ""
+    if chengpath.PathTrim(expr.callQualifier) != "":
+        return ""
     let callee = chengpath.PathTrim(expr.callCallee)
     if callee == "len" || callee == "Len":
         return "int32"
@@ -5840,6 +5842,29 @@ fn TypedExprBuildFact(ctx: var TypedExprSourceContext,
         return fact
     return fact
 
+fn TypedExprFunctionScopeEndLine(lines: str[],
+                                  startLine: int32,
+                                  nextDeclLine: int32): int32 =
+    if startLine <= 0 || startLine > lines.len:
+        return startLine
+    var upper = lines.len
+    if nextDeclLine > startLine:
+        upper = nextDeclLine - 1
+    if upper < startLine:
+        return startLine
+    var endLine = startLine
+    if startLine + 1 > upper:
+        return endLine
+    for lineNumber in (startLine + 1)..upper:
+        let rawLine = lines[lineNumber - 1]
+        let trimmed = chengpath.PathTrim(parser.ParserStripLineComment(rawLine))
+        if trimmed == "":
+            continue
+        if !parser.ParserHasLeadingIndent(rawLine):
+            return endLine
+        endLine = lineNumber
+    return endLine
+
 fn TypedExprBuildSourceContext(source: TypedExprSourceText,
                                  ctx: var TypedExprSourceContext,
                                  err: var str): bool =
@@ -5883,10 +5908,12 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
         scope.sourcePath = source.sourcePath
         scope.name = decl.name
         scope.startLine = decl.lineIndex
+        var nextDeclLine: int32
         if i + 1 < decls.len:
-            scope.endLine = decls[i + 1].lineIndex - 1
-        else:
-            scope.endLine = ctx.lines.len
+            nextDeclLine = decls[i + 1].lineIndex
+        scope.endLine = TypedExprFunctionScopeEndLine(ctx.lines,
+                                                      scope.startLine,
+                                                      nextDeclLine)
         let declHeader = TypedExprFunctionDeclHeaderText(ctx.lines, decl.lineIndex)
         scope.returnType = TypedExprParseFunctionReturnType(declHeader)
         add(ctx.scopes, scope)
