@@ -279,6 +279,10 @@ type
         surfaceText: str
         bindingName: str
         resultType: str
+        conditionKind: int32
+        conditionLhsText: str
+        conditionRhsText: str
+        conditionLiteralText: str
         assignRootName: str
         assignRootType: str
         assignFieldName: str
@@ -330,6 +334,9 @@ type
         globalSourcePaths: str[]
         globalNames: str[]
         globalTypes: str[]
+        importcSourcePaths: str[]
+        importcNames: str[]
+        importcReturnTypes: str[]
 
     TypedExprFunctionScope =
         sourcePath: str
@@ -361,6 +368,7 @@ type
     TypedExprImportcFunction =
         sourcePath: str
         name: str
+        importName: str
         returnType: str
         ffiMapPtrArg: int32
         ffiMapLenArg: int32
@@ -468,6 +476,9 @@ const
     StatementReturnModeStrLen = 4
     StatementReturnModeStrThenCallReturnI32Const0 = 5
     StatementReturnModeCstringLiteralCallsReturnI32Const0 = 6
+    TypedExprIrCondNone = 0
+    TypedExprIrCondStrEqLiteral = 1
+    TypedExprIrCondStrNeLiteral = 2
 
 fn TypedExprIsReturnCallBodyKind(bodyKind: str): bool =
     return bodyKind == BodyKindReturnCallNoargI32 ||
@@ -886,6 +897,10 @@ fn TypedExprIrStatementClone(stmt: TypedExprIrStatement): TypedExprIrStatement =
     out.surfaceText = stmt.surfaceText
     out.bindingName = stmt.bindingName
     out.resultType = stmt.resultType
+    out.conditionKind = stmt.conditionKind
+    out.conditionLhsText = stmt.conditionLhsText
+    out.conditionRhsText = stmt.conditionRhsText
+    out.conditionLiteralText = stmt.conditionLiteralText
     out.assignRootName = stmt.assignRootName
     out.assignRootType = stmt.assignRootType
     out.assignFieldName = stmt.assignFieldName
@@ -947,6 +962,12 @@ fn TypedExprIrClone(ir: var TypedExprIr): TypedExprIr =
         add(out.globalNames, ir.globalNames[i])
     for i in 0..<ir.globalTypes.len:
         add(out.globalTypes, ir.globalTypes[i])
+    for i in 0..<ir.importcSourcePaths.len:
+        add(out.importcSourcePaths, ir.importcSourcePaths[i])
+    for i in 0..<ir.importcNames.len:
+        add(out.importcNames, ir.importcNames[i])
+    for i in 0..<ir.importcReturnTypes.len:
+        add(out.importcReturnTypes, ir.importcReturnTypes[i])
     return out
 
 fn TypedExprReturnOpFactClone(fact: TypedExprReturnOpFact): TypedExprReturnOpFact =
@@ -4548,6 +4569,118 @@ fn TypedExprAppendParamBindings(bindings: var TypedExprBinding[],
                                    nameText,
                                    typeText)
 
+fn TypedExprTypeTextIsConcrete(typeRaw: str): bool =
+    let typeText = TypedExprNormalizeTypeText(typeRaw)
+    if typeText == "":
+        return false
+    if typeText == "unknown" ||
+       typeText == "call_expr" ||
+       typeText == "constructor_expr" ||
+       typeText == "default_init_expr" ||
+       typeText == "result_projection" ||
+       typeText == "branch_join":
+        return false
+    return true
+
+fn TypedExprMaybeAddInferredCallBinding(ctx: var TypedExprSourceContext,
+                                         sourceContexts: var TypedExprSourceContext[],
+                                         fact: TypedExprFact) =
+    if parser.ParserNormalizePath(fact.sourcePath) != parser.ParserNormalizePath(ctx.sourcePath):
+        return
+    if fact.kind != parser.NormalizedExprCall &&
+       fact.kind != parser.NormalizedExprResultIntrinsic:
+        return
+    if !fact.hasSink:
+        return
+    if fact.sinkPlaceKind != TypedExprPlaceLocal &&
+       fact.sinkPlaceKind != TypedExprPlaceGlobal:
+        return
+    let lineRaw = TypedExprSourceLine(ctx, fact.lineNumber)
+    var bindingName = ""
+    var explicitType = ""
+    var rhsStartColumn: int32 = -1
+    if !TypedExprParseBindingLine(lineRaw, bindingName, explicitType, rhsStartColumn):
+        return
+    if bindingName == "" || explicitType != "":
+        return
+    let scopeIndex = TypedExprScopeIndexForLine(ctx.scopes, fact.lineNumber)
+    var typeText = ""
+    if fact.kind == parser.NormalizedExprCall:
+        typeText = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, fact)
+    if !TypedExprTypeTextIsConcrete(typeText):
+        typeText = fact.typeText
+    if !TypedExprTypeTextIsConcrete(typeText):
+        return
+    var functionName = ""
+    var globalFlag = true
+    if scopeIndex >= 0:
+        functionName = ctx.scopes[scopeIndex].name
+        globalFlag = false
+    TypedExprMaybeAddBinding(ctx.bindings,
+                             ctx.sourcePath,
+                             functionName,
+                             globalFlag,
+                             fact.lineNumber,
+                             bindingName,
+                             typeText)
+
+fn TypedExprAppendInferredCallBindings(ctx: var TypedExprSourceContext,
+                                        sourceContexts: var TypedExprSourceContext[],
+                                        facts: var TypedExprFact[],
+                                        startIndex: int32,
+                                        endIndexRaw: int32) =
+    var endIndex = endIndexRaw
+    if endIndex < 0 || endIndex > facts.len:
+        endIndex = facts.len
+    for i in startIndex..<endIndex:
+        TypedExprMaybeAddInferredCallBinding(ctx, sourceContexts, facts[i])
+
+fn TypedExprBindingRhsCallHead(rhsRaw: str): str =
+    let rhs = chengpath.PathTrim(rhsRaw)
+    if rhs == "":
+        return ""
+    let openPos = TypedExprFindTopLevelToken(rhs, "(")
+    if openPos <= 0:
+        return ""
+    if rhs[rhs.len - 1] != ')':
+        return ""
+    return chengpath.PathTrim(chengpath.TextSlice(rhs, 0, openPos))
+
+fn TypedExprBindingRhsCallReturnType(ctx: var TypedExprSourceContext,
+                                      sourceContexts: var TypedExprSourceContext[],
+                                      rhsRaw: str): str =
+    let callHead = TypedExprBindingRhsCallHead(rhsRaw)
+    if callHead == "":
+        return ""
+    let qualifier = TypedExprQualifiedCallQualifier(callHead)
+    let callee = TypedExprQualifiedCallLeaf(callHead)
+    if callee == "":
+        return ""
+    if qualifier != "":
+        var targetSourcePath = ""
+        var targetName = ""
+        var targetImportc = false
+        return TypedExprResolveQualifiedCallTargetReturnType(ctx,
+                                                             sourceContexts,
+                                                             qualifier,
+                                                             callee,
+                                                             callHead,
+                                                             targetSourcePath,
+                                                             targetName,
+                                                             targetImportc)
+    let importcReturnType = TypedExprLookupLocalImportcReturnTypeForCall(ctx,
+                                                                         callee,
+                                                                         callee)
+    if importcReturnType != "":
+        return importcReturnType
+    let localReturnType = TypedExprLookupLocalFunctionReturnType(ctx, callee)
+    if localReturnType != "":
+        return localReturnType
+    return TypedExprLookupExternalFunctionReturnTypeFromContexts(ctx,
+                                                                 sourceContexts,
+                                                                 "",
+                                                                 callee)
+
 fn TypedExprScopeIndexForLine(scopes: TypedExprFunctionScope[],
                                 lineNumber: int32): int32 =
     for i in 0..<scopes.len:
@@ -4691,6 +4824,7 @@ fn TypedExprIrAddLocalDeclStatement(ir: var TypedExprIr,
 
 fn TypedExprIrAppendLocalDeclStatementsForScope(ir: var TypedExprIr,
                                                  ctx: var TypedExprSourceContext,
+                                                 sourceContexts: var TypedExprSourceContext[],
                                                  scope: TypedExprFunctionScope) =
     if scope.startLine + 1 > scope.endLine:
         return
@@ -4713,6 +4847,16 @@ fn TypedExprIrAppendLocalDeclStatementsForScope(ir: var TypedExprIr,
             bindingType = TypedExprLiteralBindingType(rhsText)
         if Len(bindingType) <= 0:
             bindingType = TypedExprConstructorBindingType(rhsText)
+        if Len(bindingType) <= 0:
+            let scopeIndex = TypedExprScopeIndexForLine(ctx.scopes, lineNumber)
+            bindingType = TypedExprLookupBindingType(ctx,
+                                                     scopeIndex,
+                                                     lineNumber,
+                                                     bindingName)
+        if Len(bindingType) <= 0:
+            bindingType = TypedExprBindingRhsCallReturnType(ctx,
+                                                            sourceContexts,
+                                                            rhsText)
         if Len(bindingType) <= 0:
             continue
         TypedExprIrAddLocalDeclStatement(ir,
@@ -5086,6 +5230,37 @@ fn TypedExprClearSourceContextHeavyFields(ctx: var TypedExprSourceContext) =
     ctx.bindings = []
     ctx.exprLineColumns = []
 
+fn TypedExprAnnotationQuotedValue(lineRaw: str,
+                                   annotationName: str): str =
+    let trimmed = chengpath.PathTrim(lineRaw)
+    let prefix = Fmt"@{annotationName}(\""
+    if !parser.ParserStartsWith(trimmed, prefix):
+        return ""
+    let start = len(prefix)
+    for i in start..<len(trimmed):
+        if trimmed[i] == '"':
+            return chengpath.TextSlice(trimmed, start, i - start)
+    return ""
+
+fn TypedExprImportcAnnotationNameForDecl(lines: str[],
+                                          lineIndex: int32): str =
+    if lineIndex <= 1 || lineIndex > lines.len:
+        return ""
+    var cursor = lineIndex - 1
+    while cursor >= 1:
+        let trimmed = chengpath.PathTrim(lines[cursor - 1])
+        if trimmed == "":
+            cursor = cursor - 1
+            continue
+        let importName = TypedExprAnnotationQuotedValue(trimmed, "importc")
+        if importName != "":
+            return importName
+        if parser.ParserStartsWith(trimmed, "@"):
+            cursor = cursor - 1
+            continue
+        return ""
+    return ""
+
 fn TypedExprLookupBindingType(ctx: var TypedExprSourceContext,
                                 scopeIndex: int32,
                                 lineNumber: int32,
@@ -5122,23 +5297,96 @@ fn TypedExprLookupBindingType(ctx: var TypedExprSourceContext,
 
 fn TypedExprLookupImportcReturnType(ctx: var TypedExprSourceContext,
                                       nameRaw: str): str =
-    let name = parser.ParserIdentPrefix(chengpath.PathTrim(nameRaw))
-    if name == "":
+    let trimmedName = chengpath.PathTrim(nameRaw)
+    let name = parser.ParserIdentPrefix(trimmedName)
+    if name == "" && trimmedName == "":
         return ""
     for i in 0..<ctx.importcFunctions.len:
-        if ctx.importcFunctions[i].name == name:
+        if ctx.importcFunctions[i].name == name ||
+           ctx.importcFunctions[i].importName == name ||
+           ctx.importcFunctions[i].importName == trimmedName ||
+           ctx.importcFunctions[i].name == trimmedName:
             if ctx.importcFunctions[i].returnType == "":
                 return "void"
             return ctx.importcFunctions[i].returnType
     return ""
 
+fn TypedExprLookupLocalImportcReturnTypeForCall(ctx: var TypedExprSourceContext,
+                                                 calleeRaw: str,
+                                                 targetRaw: str): str =
+    let calleeFound = TypedExprLookupImportcReturnType(ctx, calleeRaw)
+    if calleeFound != "":
+        return calleeFound
+    return TypedExprLookupImportcReturnType(ctx, targetRaw)
+
+fn TypedExprIrAddImportcReturnType(ir: var TypedExprIr,
+                                    sourcePathRaw: str,
+                                    nameRaw: str,
+                                    returnTypeRaw: str) =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let name = parser.ParserIdentPrefix(chengpath.PathTrim(nameRaw))
+    let returnType = TypedExprNormalizeTypeText(returnTypeRaw)
+    if sourcePath == "" || name == "" || returnType == "":
+        return
+    for i in 0..<ir.importcNames.len:
+        if i >= ir.importcSourcePaths.len:
+            continue
+        if parser.ParserNormalizePath(ir.importcSourcePaths[i]) == sourcePath &&
+           ir.importcNames[i] == name:
+            return
+    add(ir.importcSourcePaths, sourcePath)
+    add(ir.importcNames, name)
+    add(ir.importcReturnTypes, returnType)
+
+fn TypedExprIrAppendImportcFunctionsFromContext(ir: var TypedExprIr,
+                                                 ctx: var TypedExprSourceContext) =
+    for i in 0..<ctx.importcFunctions.len:
+        let importcFn = ctx.importcFunctions[i]
+        TypedExprIrAddImportcReturnType(ir,
+                                        ctx.sourcePath,
+                                        importcFn.name,
+                                        importcFn.returnType)
+        if importcFn.importName != "":
+            TypedExprIrAddImportcReturnType(ir,
+                                            ctx.sourcePath,
+                                            importcFn.importName,
+                                            importcFn.returnType)
+
+fn TypedExprIrLookupImportcReturnType(ir: TypedExprIr,
+                                       sourcePathRaw: str,
+                                       nameRaw: str): str =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let trimmedName = chengpath.PathTrim(nameRaw)
+    let name = parser.ParserIdentPrefix(trimmedName)
+    if name == "" && trimmedName == "":
+        return ""
+    var foundExact = ""
+    var foundAny = ""
+    for i in 0..<ir.importcNames.len:
+        if i >= ir.importcSourcePaths.len || i >= ir.importcReturnTypes.len:
+            continue
+        if ir.importcNames[i] != name && ir.importcNames[i] != trimmedName:
+            continue
+        if foundAny != "" && foundAny != ir.importcReturnTypes[i]:
+            return ""
+        foundAny = ir.importcReturnTypes[i]
+        if sourcePath != "" &&
+           parser.ParserNormalizePath(ir.importcSourcePaths[i]) == sourcePath:
+            if foundExact != "" && foundExact != ir.importcReturnTypes[i]:
+                return ""
+            foundExact = ir.importcReturnTypes[i]
+    if foundExact != "":
+        return foundExact
+    return foundAny
+
 fn TypedExprLookupImportcReturnTypeFromContexts(sourceContexts: var TypedExprSourceContext[],
                                                   nameRaw: str): str =
-    let name = parser.ParserIdentPrefix(chengpath.PathTrim(nameRaw))
-    if name == "":
+    let trimmedName = chengpath.PathTrim(nameRaw)
+    let name = parser.ParserIdentPrefix(trimmedName)
+    if name == "" && trimmedName == "":
         return ""
     for i in 0..<sourceContexts.len:
-        let found = TypedExprLookupImportcReturnType(sourceContexts[i], name)
+        let found = TypedExprLookupImportcReturnType(sourceContexts[i], trimmedName)
         if found != "":
             return found
     return ""
@@ -5435,7 +5683,9 @@ fn TypedExprLookupCallTargetReturnTypeFromFact(currentCtx: var TypedExprSourceCo
                                                                          fact.callQualifier,
                                                                          fact.callCallee)
         if fact.callTargetImportc:
-            return TypedExprLookupImportcReturnType(currentCtx, fact.callCallee)
+            return TypedExprLookupLocalImportcReturnTypeForCall(currentCtx,
+                                                                fact.callCallee,
+                                                                fact.callTarget)
         return TypedExprLookupLocalFunctionReturnType(currentCtx, fact.callTarget)
     let targetSourcePath = parser.ParserNormalizePath(fact.callTargetSourcePath)
     if targetSourcePath == "":
@@ -5444,7 +5694,9 @@ fn TypedExprLookupCallTargetReturnTypeFromFact(currentCtx: var TypedExprSourceCo
     if targetIndex < 0:
         return ""
     if fact.callTargetImportc:
-        return TypedExprLookupImportcReturnType(sourceContexts[targetIndex], fact.callCallee)
+        return TypedExprLookupLocalImportcReturnTypeForCall(sourceContexts[targetIndex],
+                                                            fact.callCallee,
+                                                            fact.callTarget)
     return TypedExprLookupLocalFunctionReturnType(sourceContexts[targetIndex], fact.callCallee)
 
 fn TypedExprCountFunctionParams(lineRaw: str): int32 =
@@ -6072,6 +6324,7 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
                 var importcFn: TypedExprImportcFunction
                 importcFn.sourcePath = source.sourcePath
                 importcFn.name = decl.name
+                importcFn.importName = TypedExprImportcAnnotationNameForDecl(ctx.lines, decl.lineIndex)
                 importcFn.returnType = TypedExprParseFunctionReturnType(declHeader)
                 importcFn.ffiMapPtrArg = decl.ffiMapPtrArg
                 importcFn.ffiMapLenArg = decl.ffiMapLenArg
@@ -6217,6 +6470,112 @@ fn TypedExprIfConditionTextFromLine(lineRaw: str): str =
     if trimmed[trimmed.len - 1] != ':':
         return ""
     return chengpath.PathTrim(chengpath.TextSlice(trimmed, 3, trimmed.len - 4))
+
+fn TypedExprIrConditionTextFromSurface(textRaw: str): str =
+    var text = chengpath.PathTrim(textRaw)
+    if parser.ParserStartsWith(text, "if "):
+        text = chengpath.PathTrim(chengpath.TextSlice(text, 3, text.len - 3))
+    elif parser.ParserStartsWith(text, "elif "):
+        text = chengpath.PathTrim(chengpath.TextSlice(text, 5, text.len - 5))
+    if text.len > 0 && text[text.len - 1] == ':':
+        text = chengpath.PathTrim(chengpath.TextSlice(text, 0, text.len - 1))
+    return text
+
+fn TypedExprIrSimpleBindingName(textRaw: str): str =
+    let text = chengpath.PathTrim(textRaw)
+    let name = parser.ParserIdentPrefix(text)
+    if name == "" || name.len != text.len:
+        return ""
+    return name
+
+fn TypedExprIrShortStringLiteralPayload(textRaw: str,
+                                         payload: var str): bool =
+    payload = ""
+    let text = chengpath.PathTrim(textRaw)
+    if text.len < 2 || text[0] != '"' || text[text.len - 1] != '"':
+        return false
+    for i in 1..<(text.len - 1):
+        if text[i] == '\\':
+            return false
+    payload = chengpath.TextSlice(text, 1, text.len - 2)
+    return true
+
+fn TypedExprIrPriorBindingType(ir: TypedExprIr,
+                                functionName: str,
+                                lineNumber: int32,
+                                bindingName: str): str =
+    var foundType = ""
+    for i in 0..<ir.statements.len:
+        let prev = ir.statements[i]
+        if prev.functionName != functionName:
+            continue
+        if prev.lineNumber >= lineNumber:
+            continue
+        if prev.bindingName != bindingName:
+            continue
+        if prev.resultType != "" && prev.resultType != "unknown" && prev.resultType != "call_expr":
+            foundType = prev.resultType
+            continue
+        var sourcePath = prev.callTargetSourcePath
+        if sourcePath == "":
+            sourcePath = prev.sourcePath
+        let importcReturnType = TypedExprIrLookupImportcReturnType(ir, sourcePath, prev.callTarget)
+        if importcReturnType != "":
+            foundType = importcReturnType
+    return foundType
+
+fn TypedExprIrPopulateConditionMeta(stmt: var TypedExprIrStatement,
+                                     ir: TypedExprIr,
+                                     ctx: var TypedExprSourceContext,
+                                     sourceContexts: var TypedExprSourceContext[],
+                                     lineNumber: int32) =
+    let _ = sourceContexts
+    stmt.conditionKind = TypedExprIrCondNone
+    stmt.conditionLhsText = ""
+    stmt.conditionRhsText = ""
+    stmt.conditionLiteralText = ""
+    if stmt.kind != TypedExprIrStmtIf && stmt.kind != TypedExprIrStmtElif:
+        return
+    let conditionText = TypedExprIrConditionTextFromSurface(stmt.surfaceText)
+    if conditionText == "":
+        return
+    var opPos = TypedExprFindTopLevelTextToken(conditionText, "==")
+    var conditionKind = TypedExprIrCondStrEqLiteral
+    if opPos < 0:
+        opPos = TypedExprFindTopLevelTextToken(conditionText, "!=")
+        conditionKind = TypedExprIrCondStrNeLiteral
+    if opPos < 0:
+        return
+    let lhsText = chengpath.PathTrim(chengpath.TextSlice(conditionText, 0, opPos))
+    let rhsText = chengpath.PathTrim(chengpath.TextSlice(conditionText,
+                                                         opPos + 2,
+                                                         conditionText.len - opPos - 2))
+    var literalPayload = ""
+    var valueName = TypedExprIrSimpleBindingName(lhsText)
+    var literalSide = rhsText
+    if valueName == "" || !TypedExprIrShortStringLiteralPayload(literalSide, literalPayload):
+        valueName = TypedExprIrSimpleBindingName(rhsText)
+        literalSide = lhsText
+        if valueName == "" || !TypedExprIrShortStringLiteralPayload(literalSide, literalPayload):
+            return
+    let scopeIndex = TypedExprScopeIndexForLine(ctx.scopes, lineNumber)
+    var valueType = TypedExprNormalizeTypeText(TypedExprLookupBindingType(ctx,
+                                                                          scopeIndex,
+                                                                          lineNumber,
+                                                                          valueName))
+    if valueType != "str":
+        let priorType = TypedExprNormalizeTypeText(TypedExprIrPriorBindingType(ir,
+                                                                               stmt.functionName,
+                                                                               lineNumber,
+                                                                               valueName))
+        if priorType != "":
+            valueType = priorType
+    if valueType != "str":
+        return
+    stmt.conditionKind = conditionKind
+    stmt.conditionLhsText = valueName
+    stmt.conditionRhsText = literalSide
+    stmt.conditionLiteralText = literalPayload
 
 fn TypedExprNearestEnclosingIf(ctx: var TypedExprSourceContext,
                                 scope: TypedExprFunctionScope,
@@ -6406,16 +6765,38 @@ fn TypedExprIrAppendStatementsForScope(ir: var TypedExprIr,
            (statementKind == TypedExprIrStmtResultIntrinsic &&
             (facts[i].hasSink || currentLineBindingRootColumn == facts[i].columnNumber)):
             statementBindingName = currentLineBindingName
-        var statementResultType = facts[i].typeText
+        var statementFact = facts[i]
+        var statementLocalImportcReturnType = ""
+        if statementFact.kind == parser.NormalizedExprCall:
+            statementLocalImportcReturnType = TypedExprLookupLocalImportcReturnTypeForCall(ctx,
+                                                                                           statementFact.callCallee,
+                                                                                           statementFact.callTarget)
+            if statementLocalImportcReturnType == "":
+                var importcSourcePath = statementFact.callTargetSourcePath
+                if importcSourcePath == "":
+                    importcSourcePath = ctx.sourcePath
+                statementLocalImportcReturnType = TypedExprIrLookupImportcReturnType(ir,
+                                                                                     importcSourcePath,
+                                                                                     statementFact.callTarget)
+            if statementLocalImportcReturnType != "" && !statementFact.callTargetImportc:
+                if statementFact.callTargetSourcePath == "" ||
+                   parser.ParserNormalizePath(statementFact.callTargetSourcePath) == parser.ParserNormalizePath(ctx.sourcePath):
+                    if statementFact.callCallee != "":
+                        statementFact.callTarget = statementFact.callCallee
+                    statementFact.callTargetSourcePath = ctx.sourcePath
+                    statementFact.callTargetImportc = true
+        var statementResultType = statementFact.typeText
+        if statementLocalImportcReturnType != "":
+            statementResultType = statementLocalImportcReturnType
         if (statementKind == TypedExprIrStmtLetCall ||
             statementKind == TypedExprIrStmtResultIntrinsic) &&
            Len(currentLineBindingType) > 0:
             statementResultType = currentLineBindingType
         if Len(statementResultType) <= 0:
-            statementResultType = TypedExprLookupLocalFunctionReturnType(ctx, facts[i].callTarget)
+            statementResultType = TypedExprLookupLocalFunctionReturnType(ctx, statementFact.callTarget)
         let _ = TypedExprIrAddCallStatement(ir,
                                             scope,
-                                            facts[i],
+                                            statementFact,
                                             statementKind,
                                             statementBindingName,
                                             statementResultType,
@@ -6468,9 +6849,28 @@ fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
                                            currentLineBindingType: str,
                                            currentLineBindingRootColumn: int32,
                                            currentLineIndent: int32,
-                                            currentLineEnclosingIfLineNumber: int32,
-                                            currentLineEnclosingIfConditionText: str): int32 =
+                                           currentLineEnclosingIfLineNumber: int32,
+                                           currentLineEnclosingIfConditionText: str): int32 =
     var statementFact = fact
+    var localImportcReturnType = ""
+    if statementFact.kind == parser.NormalizedExprCall:
+        localImportcReturnType = TypedExprLookupLocalImportcReturnTypeForCall(ctx,
+                                                                              statementFact.callCallee,
+                                                                              statementFact.callTarget)
+        if localImportcReturnType == "":
+            var importcSourcePath = statementFact.callTargetSourcePath
+            if importcSourcePath == "":
+                importcSourcePath = ctx.sourcePath
+            localImportcReturnType = TypedExprIrLookupImportcReturnType(ir,
+                                                                        importcSourcePath,
+                                                                        statementFact.callTarget)
+        if localImportcReturnType != "" && !statementFact.callTargetImportc:
+            if statementFact.callTargetSourcePath == "" ||
+               parser.ParserNormalizePath(statementFact.callTargetSourcePath) == parser.ParserNormalizePath(ctx.sourcePath):
+                if statementFact.callCallee != "":
+                    statementFact.callTarget = statementFact.callCallee
+                statementFact.callTargetSourcePath = ctx.sourcePath
+                statementFact.callTargetImportc = true
     if statementFact.kind == parser.NormalizedExprCall &&
        statementFact.callTargetSourcePath == "":
         var resolvedSourcePath = ""
@@ -6506,11 +6906,14 @@ fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
         (statementFact.hasSink || currentLineBindingRootColumn == statementFact.columnNumber)):
         statementBindingName = currentLineBindingName
     var statementResultType = statementFact.typeText
+    if localImportcReturnType != "":
+        statementResultType = localImportcReturnType
     if (statementKind == TypedExprIrStmtLetCall ||
         statementKind == TypedExprIrStmtResultIntrinsic) &&
        Len(currentLineBindingType) > 0:
         statementResultType = currentLineBindingType
-    if statementFact.kind == parser.NormalizedExprCall:
+    if statementFact.kind == parser.NormalizedExprCall &&
+       localImportcReturnType == "":
         let resolvedReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, statementFact)
         if resolvedReturnType != "":
             statementResultType = resolvedReturnType
@@ -6921,6 +7324,8 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
                                                               currentLineEnclosingIfConditionText)
             else:
                 let _ = TypedExprIrAddControlStatementFromExpr(ir,
+                                                               ctx,
+                                                               sourceContexts,
                                                                scope,
                                                                expr,
                                                                currentLineIndent,
@@ -6987,13 +7392,17 @@ fn TypedExprLookupCallTargetReturnTypeFromExpr(currentCtx: var TypedExprSourceCo
             if externalReturnType != "":
                 return externalReturnType
         if expr.callTargetImportc:
-            return TypedExprLookupImportcReturnType(currentCtx, expr.callCallee)
+            return TypedExprLookupLocalImportcReturnTypeForCall(currentCtx,
+                                                                expr.callCallee,
+                                                                expr.callTarget)
         return TypedExprLookupLocalFunctionReturnType(currentCtx, expr.callTarget)
     let targetIndex = TypedExprSourceContextLookup(sourceContexts, sourcePath)
     if targetIndex < 0:
         return ""
     if expr.callTargetImportc:
-        return TypedExprLookupImportcReturnType(sourceContexts[targetIndex], expr.callCallee)
+        return TypedExprLookupLocalImportcReturnTypeForCall(sourceContexts[targetIndex],
+                                                            expr.callCallee,
+                                                            expr.callTarget)
     return TypedExprLookupLocalFunctionReturnType(sourceContexts[targetIndex], expr.callCallee)
 
 fn TypedExprResultIntrinsicTypeFromExpr(ctx: var TypedExprSourceContext,
@@ -7286,6 +7695,8 @@ fn TypedExprForBindingNameFromHeader(headerRaw: str): str =
                                                                            inPos)))
 
 fn TypedExprIrAddControlStatementFromExpr(ir: var TypedExprIr,
+                                           ctx: var TypedExprSourceContext,
+                                           sourceContexts: var TypedExprSourceContext[],
                                            scope: TypedExprFunctionScope,
                                            expr: parser.NormalizedExpr,
                                            lineIndent: int32,
@@ -7327,6 +7738,7 @@ fn TypedExprIrAddControlStatementFromExpr(ir: var TypedExprIr,
     stmt.loweringMode = TypedExprLowerDeferred
     stmt.returnKind = TypedExprReturnDeferred
     stmt.returnRoot = false
+    TypedExprIrPopulateConditionMeta(stmt, ir, ctx, sourceContexts, expr.lineNumber)
     add(ir.statements, stmt)
     return stmt.statementIndex
 
@@ -7420,7 +7832,28 @@ fn TypedExprIrAddCallStatementFromExpr(ir: var TypedExprIr,
     stmt.callTargetSourcePath = expr.callTargetSourcePath
     stmt.callTargetImportc = expr.callTargetImportc
     var resolvedCallReturnType = ""
-    if expr.kind == parser.NormalizedExprCall && stmt.callTargetSourcePath == "":
+    var localImportcReturnType = ""
+    if expr.kind == parser.NormalizedExprCall:
+        localImportcReturnType = TypedExprLookupLocalImportcReturnTypeForCall(ctx,
+                                                                              expr.callCallee,
+                                                                              expr.callTarget)
+        if localImportcReturnType == "":
+            var importcSourcePath = expr.callTargetSourcePath
+            if importcSourcePath == "":
+                importcSourcePath = ctx.sourcePath
+            localImportcReturnType = TypedExprIrLookupImportcReturnType(ir,
+                                                                        importcSourcePath,
+                                                                        expr.callTarget)
+        if localImportcReturnType != "" && !stmt.callTargetImportc:
+            if stmt.callTargetSourcePath == "" ||
+               parser.ParserNormalizePath(stmt.callTargetSourcePath) == parser.ParserNormalizePath(ctx.sourcePath):
+                resolvedCallReturnType = localImportcReturnType
+                if expr.callCallee != "":
+                    stmt.callTarget = expr.callCallee
+                stmt.callTargetSourcePath = ctx.sourcePath
+                stmt.callTargetImportc = true
+    if expr.kind == parser.NormalizedExprCall &&
+       (stmt.callTargetSourcePath == "" || expr.callQualifier != ""):
         var resolvedSourcePath = ""
         var resolvedTargetName = ""
         var resolvedImportc = false
@@ -7436,6 +7869,13 @@ fn TypedExprIrAddCallStatementFromExpr(ir: var TypedExprIr,
             stmt.callTarget = resolvedTargetName
             stmt.callTargetSourcePath = resolvedSourcePath
             stmt.callTargetImportc = resolvedImportc
+        else:
+            if localImportcReturnType != "":
+                resolvedCallReturnType = localImportcReturnType
+                if expr.callCallee != "":
+                    stmt.callTarget = expr.callCallee
+                stmt.callTargetSourcePath = ctx.sourcePath
+                stmt.callTargetImportc = true
     stmt.callArgCount = expr.callArgCount
     stmt.callArgsText = expr.callArgsText
     stmt.callArgNodeStart = -1
@@ -7599,6 +8039,8 @@ fn TypedExprIrAppendStatementsForScopeFromExprLayer(ir: var TypedExprIr,
            expr.kind == parser.NormalizedExprElseStmt ||
            expr.kind == parser.NormalizedExprForStmt:
             let _ = TypedExprIrAddControlStatementFromExpr(ir,
+                                                           ctx,
+                                                           sourceContexts,
                                                            scope,
                                                            expr,
                                                            currentLineIndent,
@@ -7743,7 +8185,8 @@ fn TypedExprBuildIrForScope(ctx: var TypedExprSourceContext,
                              scope.startLine,
                              params,
                              paramNodeIndices)
-    TypedExprIrAppendLocalDeclStatementsForScope(ir, ctx, scope)
+    var emptySourceContexts: TypedExprSourceContext[]
+    TypedExprIrAppendLocalDeclStatementsForScope(ir, ctx, emptySourceContexts, scope)
     TypedExprIrAppendStatementsForScope(ir, ctx, scope, facts, factStartIndex, factEndIndex)
     let firstBindingCallFactIndex: int32 = TypedExprIrFirstBindingCallFactIndex(facts,
                                                                                 bodyLineNumber,
@@ -7826,7 +8269,7 @@ fn TypedExprBuildIrForScopeWithFactsAndExprLayer(ctx: var TypedExprSourceContext
                              scope.startLine,
                              params,
                              paramNodeIndices)
-    TypedExprIrAppendLocalDeclStatementsForScope(ir, ctx, scope)
+    TypedExprIrAppendLocalDeclStatementsForScope(ir, ctx, sourceContexts, scope)
     let includeStructuredStatements = TypedExprScopeNeedsStructuredStatements(ctx,
                                                                              scope,
                                                                              params,
@@ -7926,7 +8369,7 @@ fn TypedExprBuildIrForScopeFromExprLayer(ctx: var TypedExprSourceContext,
                              scope.startLine,
                              params,
                              paramNodeIndices)
-    TypedExprIrAppendLocalDeclStatementsForScope(ir, ctx, scope)
+    TypedExprIrAppendLocalDeclStatementsForScope(ir, ctx, sourceContexts, scope)
     TypedExprIrAppendStatementsForScopeFromExprLayer(ir,
                                                      ctx,
                                                      sourceContexts,
@@ -8019,6 +8462,21 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
         if !TypedExprBuildSourceContext(sourceForIr, ctx, err):
             err = " typed expr: build typed ir source context failed"
             return false
+        TypedExprIrAppendImportcFunctionsFromContext(ir, ctx)
+        let sourceFactStart = TypedExprFirstFactIndexForSource(facts, ctx.sourcePath)
+        var sourceFactEnd: int32
+        var factCursor: int32
+        if sourceFactStart >= 0:
+            sourceFactEnd = TypedExprFactEndIndexForSource(facts, ctx.sourcePath, sourceFactStart)
+            factCursor = sourceFactStart
+            TypedExprAppendInferredCallBindings(ctx,
+                                                contexts,
+                                                facts,
+                                                sourceFactStart,
+                                                sourceFactEnd)
+        else:
+            sourceFactEnd = 0
+            factCursor = 0
         for bindingIndex in 0..<ctx.bindings.len:
             let binding = ctx.bindings[bindingIndex]
             if !binding.globalFlag:
@@ -8036,15 +8494,6 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
             add(ir.globalSourcePaths, binding.sourcePath)
             add(ir.globalNames, binding.name)
             add(ir.globalTypes, binding.typeText)
-        let sourceFactStart = TypedExprFirstFactIndexForSource(facts, ctx.sourcePath)
-        var sourceFactEnd: int32
-        var factCursor: int32
-        if sourceFactStart >= 0:
-            sourceFactEnd = TypedExprFactEndIndexForSource(facts, ctx.sourcePath, sourceFactStart)
-            factCursor = sourceFactStart
-        else:
-            sourceFactEnd = 0
-            factCursor = 0
         let sourceExprStart = TypedExprExprLayerFirstIndexForSource(exprLayer, ctx.sourcePath)
         var sourceExprEnd: int32
         var exprCursor: int32
@@ -8110,6 +8559,7 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
         if !TypedExprBuildSourceContext(sourceForIr, ctxForIr, err):
             err = " typed expr: build typed ir source context failed"
             return false
+        TypedExprIrAppendImportcFunctionsFromContext(ir, ctxForIr)
         for bindingIndex in 0..<ctxForIr.bindings.len:
             let binding = ctxForIr.bindings[bindingIndex]
             if !binding.globalFlag:
