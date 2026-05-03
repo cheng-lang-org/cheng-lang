@@ -80,6 +80,8 @@ type
         TypedExprIrOpUnsupported
         TypedExprIrOpParamRef
         TypedExprIrOpReturnStrArg0
+        TypedExprIrOpReturnComposite16Arg0
+        TypedExprIrOpReturnSeqLenArg0
         TypedExprIrOpI32Const
         TypedExprIrOpI32Add
         TypedExprIrOpI32Sub
@@ -397,6 +399,8 @@ const
     BodyKindReturnF64MulArgs = "return_f64_mul_args"
     BodyKindStrLenFastI32 = "str_len_fast_i32"
     BodyKindReturnStrArg0 = "return_str_arg0"
+    BodyKindReturnComposite16Arg0 = "return_composite16_arg0"
+    BodyKindReturnSeqLenArg0 = "return_seq_len_arg0"
     BodyKindReturnStrEmpty = "return_str_empty"
     BodyKindReturnStrLiteral = "return_str_literal"
     BodyKindMainF64MulCheckExit = "main_f64_mul_check_exit"
@@ -726,6 +730,10 @@ fn TypedExprIrOpKindText(kind: TypedExprIrOpKind): str =
         return "param_ref"
     if kind == TypedExprIrOpReturnStrArg0:
         return "return_str_arg0"
+    if kind == TypedExprIrOpReturnComposite16Arg0:
+        return "return_composite16_arg0"
+    if kind == TypedExprIrOpReturnSeqLenArg0:
+        return "return_seq_len_arg0"
     if kind == TypedExprIrOpI32Const:
         return "i32_const"
     if kind == TypedExprIrOpI32Add:
@@ -3985,6 +3993,41 @@ fn TypedExprIrBuildReturnNode(ir: var TypedExprIr,
                                                bodyLineNumber,
                                                paramNodeIndices[0],
                                                params[0].name)
+    if scope.returnType == "int32" &&
+       params.len == 1 &&
+       returnExpr == Fmt"{params[0].name}.len":
+        let paramTypeText = TypedExprNormalizeTypeText(params[0].typeText)
+        if (paramTypeText.len >= 2 && chengpath.TextSlice(paramTypeText, paramTypeText.len - 2, 2) == "[]") ||
+           parser.ParserStartsWith(paramTypeText, "seq["):
+            return TypedExprIrAddOpNode(ir,
+                                        ctx.sourcePath,
+                                        scope.name,
+                                        bodyLineNumber,
+                                        TypedExprIrOpReturnSeqLenArg0,
+                                        "int32",
+                                        returnExpr,
+                                        paramNodeIndices[0],
+                                        -1,
+                                        -1)
+    if params.len == 1 &&
+       returnExpr == params[0].name &&
+       TypedExprNormalizeTypeText(scope.returnType) == TypedExprNormalizeTypeText(params[0].typeText):
+        let returnTypeText = TypedExprNormalizeTypeText(scope.returnType)
+        if returnTypeText == "Bytes" ||
+           returnTypeText == "bytes.Bytes" ||
+           returnTypeText == "rawbytes.Bytes" ||
+           (returnTypeText.len >= 2 && chengpath.TextSlice(returnTypeText, returnTypeText.len - 2, 2) == "[]") ||
+           parser.ParserStartsWith(returnTypeText, "seq["):
+            return TypedExprIrAddOpNode(ir,
+                                        ctx.sourcePath,
+                                        scope.name,
+                                        bodyLineNumber,
+                                        TypedExprIrOpReturnComposite16Arg0,
+                                        returnTypeText,
+                                        params[0].name,
+                                        paramNodeIndices[0],
+                                        -1,
+                                        -1)
     if scope.returnType == "int32":
         let returnParamIndex = TypedExprIrParamNodeIndex(params,
                                                          paramNodeIndices,
