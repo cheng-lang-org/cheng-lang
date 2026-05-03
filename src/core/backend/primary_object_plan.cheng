@@ -1108,6 +1108,29 @@ fn PrimaryBodyIrTargetFunctionIndex(typedIr: texpr.TypedExprIr,
             found = i
     return found
 
+fn PrimaryBodyIrCallResultLayoutSourcePath(stmt: texpr.TypedExprIrStatement): str =
+    if stmt.callTargetSourcePath != "":
+        return stmt.callTargetSourcePath
+    return stmt.sourcePath
+
+fn PrimaryBodyIrResolvedCallResultType(typedIr: texpr.TypedExprIr,
+                                        stmt: texpr.TypedExprIrStatement): str =
+    var resultType = stmt.resultType
+    var importcSourcePath = stmt.callTargetSourcePath
+    if importcSourcePath == "":
+        importcSourcePath = stmt.sourcePath
+    let importcResultType = texpr.TypedExprIrLookupImportcReturnType(typedIr,
+                                                                      importcSourcePath,
+                                                                      stmt.callTarget)
+    if importcResultType != "":
+        return importcResultType
+    let targetFnIndex = PrimaryBodyIrTargetFunctionIndex(typedIr,
+                                                         stmt.callTargetSourcePath,
+                                                         stmt.callTarget)
+    if targetFnIndex >= 0 && targetFnIndex < typedIr.functions.len:
+        resultType = typedIr.functions[targetFnIndex].returnType
+    return resultType
+
 fn PrimaryBodyIrTargetParamType(typedIr: texpr.TypedExprIr,
                                  stmt: texpr.TypedExprIrStatement,
                                  argIndex: int32): str =
@@ -1722,18 +1745,19 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
                                                               stmt.sourcePath,
                                                               stmt.assignRootName,
                                                               stmt.assignRootType)
-        let byteCount = stmt.assignFieldSizeBytes
+        var byteCount = stmt.assignFieldSizeBytes
         if baseSlot < 0 || byteCount <= 0:
             return false
         var valueSlot: int32
         valueSlot = -1
         if stmt.callTarget != "":
+            let callResultType = PrimaryBodyIrResolvedCallResultType(typedIr, stmt)
             valueSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
                                                            slotNames,
                                                            typedIr,
-                                                           stmt.sourcePath,
+                                                           PrimaryBodyIrCallResultLayoutSourcePath(stmt),
                                                            rhsText,
-                                                           stmt.resultType)
+                                                           callResultType)
             if valueSlot < 0 ||
                PrimaryLocalSlotSizeOf(bodyIR.localSlots[valueSlot]) < byteCount:
                 return false
@@ -1754,7 +1778,10 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
                                                                        stmt.assignValueRootName,
                                                                        stmt.assignValueRootType)
             let valueByteCount = stmt.assignValueFieldSizeBytes
-            if valueBaseSlot < 0 || valueByteCount <= 0 || valueByteCount != byteCount:
+            if valueBaseSlot < 0:
+            if valueByteCount <= 0:
+                valueByteCount = byteCount
+            if valueByteCount != byteCount:
                 return false
             valueSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
                                                            slotNames,
@@ -1968,7 +1995,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 slotId = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
                                                             slotNames,
                                                             typedIr,
-                                                            stmt.sourcePath,
+                                                            PrimaryBodyIrCallResultLayoutSourcePath(stmt),
                                                             stmt.bindingName,
                                                             resultTypeText)
             let targetStr = stmt.callTarget
