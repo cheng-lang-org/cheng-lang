@@ -365,6 +365,10 @@ type
         enumValueNames: str[]
         enumValueTypes: str[]
         enumValueOrdinals: int32[]
+        sourceContextIndexSourcePaths: str[]
+        sourceContextIndexBucketHeads: int32[]
+        sourceContextIndexEntryNext: int32[]
+        sourceContextIndexEntryIndexes: int32[]
 
     TypedExprFunctionScope =
         sourcePath: str
@@ -5313,6 +5317,67 @@ fn TypedExprIrAppendLocalDeclStatementsForScope(ir: var TypedExprIr,
                                          bindingType,
                                          rhsText)
 
+fn TypedExprSourceContextIndexBucketCount(ctxCount: int32): int32 =
+    var need = ctxCount * 2 + 8
+    if need < 16:
+        need = 16
+    var out = 1
+    while out < need:
+        out = out * 2
+    return out
+
+fn TypedExprSourceContextIndexHash(sourcePath: str, bucketCount: int32): int32 =
+    if bucketCount <= 0:
+        return -1
+    var h: int32
+    for i in 0..<len(sourcePath):
+        h = h * 31 + int32(sourcePath[i])
+    if h < 0:
+        h = -h
+    return h & (bucketCount - 1)
+
+fn TypedExprBuildSourceContextIndex(ir: var TypedExprIr,
+                                      sourceContexts: var TypedExprSourceContext[]) =
+    ir.sourceContextIndexSourcePaths = []
+    ir.sourceContextIndexBucketHeads = []
+    ir.sourceContextIndexEntryNext = []
+    ir.sourceContextIndexEntryIndexes = []
+    let bucketCount = TypedExprSourceContextIndexBucketCount(sourceContexts.len)
+    var bucketTails: int32[]
+    for bucketIndex in 0..<bucketCount:
+        add(ir.sourceContextIndexBucketHeads, -1)
+        add(bucketTails, -1)
+    for ctxIndex in 0..<sourceContexts.len:
+        let sourcePath = sourceContexts[ctxIndex].normalizedSourcePath
+        if sourcePath == "":
+            continue
+        let bucket = TypedExprSourceContextIndexHash(sourcePath, bucketCount)
+        let entryIndex = ir.sourceContextIndexEntryIndexes.len
+        add(ir.sourceContextIndexEntryNext, -1)
+        add(ir.sourceContextIndexEntryIndexes, ctxIndex)
+        add(ir.sourceContextIndexSourcePaths, sourcePath)
+        if ir.sourceContextIndexBucketHeads[bucket] < 0:
+            ir.sourceContextIndexBucketHeads[bucket] = entryIndex
+        else:
+            ir.sourceContextIndexEntryNext[bucketTails[bucket]] = entryIndex
+        bucketTails[bucket] = entryIndex
+
+fn TypedExprSourceContextLookupWithIndex(ir: TypedExprIr,
+                                           sourcePathRaw: str): int32 =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    if sourcePath == "" || ir.sourceContextIndexBucketHeads.len <= 0:
+        return -1
+    let bucket = TypedExprSourceContextIndexHash(sourcePath,
+                                                  ir.sourceContextIndexBucketHeads.len)
+    var entryIndex = ir.sourceContextIndexBucketHeads[bucket]
+    while entryIndex >= 0:
+        if entryIndex >= ir.sourceContextIndexEntryIndexes.len:
+            return -1
+        if ir.sourceContextIndexSourcePaths[entryIndex] == sourcePath:
+            return ir.sourceContextIndexEntryIndexes[entryIndex]
+        entryIndex = ir.sourceContextIndexEntryNext[entryIndex]
+    return -1
+
 fn TypedExprSourceContextLookup(sourceContexts: var TypedExprSourceContext[],
                                   sourcePathRaw: str): int32 =
     let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
@@ -5320,6 +5385,15 @@ fn TypedExprSourceContextLookup(sourceContexts: var TypedExprSourceContext[],
         if sourceContexts[i].normalizedSourcePath == sourcePath:
             return i
     return -1
+
+fn TypedExprSourceContextLookupFast(ir: TypedExprIr,
+                                      sourceContexts: var TypedExprSourceContext[],
+                                      sourcePathRaw: str): int32 =
+    if ir.sourceContextIndexBucketHeads.len > 0:
+        let fastResult = TypedExprSourceContextLookupWithIndex(ir, sourcePathRaw)
+        if fastResult >= 0:
+            return fastResult
+    return TypedExprSourceContextLookup(sourceContexts, sourcePathRaw)
 
 fn TypedExprFieldContextLookup(currentCtx: var TypedExprSourceContext,
                                 sourceContexts: var TypedExprSourceContext[],
