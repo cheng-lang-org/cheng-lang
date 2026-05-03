@@ -4242,15 +4242,17 @@ fn TypedExprParseTypeFieldLine(lineRaw: str,
     let line = chengpath.PathTrim(parser.ParserStripLineComment(lineRaw))
     if line == "":
         return false
-    if TypedExprFindTopLevelToken(line, "=") >= 0:
-        return false
     let colonPos = TypedExprFindTopLevelToken(line, ":")
     if colonPos <= 0:
         return false
+    let eqPos = TypedExprFindTopLevelToken(line, "=")
     fieldName = parser.ParserIdentPrefix(chengpath.TextSlice(line, 0, colonPos))
+    var typeEnd = line.len
+    if eqPos > colonPos:
+        typeEnd = eqPos
     fieldType = TypedExprNormalizeTypeText(chengpath.TextSlice(line,
                                                                colonPos + 1,
-                                                               line.len - colonPos - 1))
+                                                               typeEnd - colonPos - 1))
     return fieldName != "" && fieldType != ""
 
 fn TypedExprFindTypeFieldDecl(ctx: var TypedExprSourceContext,
@@ -4525,6 +4527,34 @@ fn TypedExprFieldContextLookup(currentCtx: var TypedExprSourceContext,
         found = i
     return found
 
+fn TypedExprDeclaredTypeContextLookup(currentCtx: var TypedExprSourceContext,
+                                       sourceContexts: var TypedExprSourceContext[],
+                                       typeRaw: str): int32 =
+    let typeText = TypedExprStripVarType(typeRaw)
+    let leaf = TypedExprTypeLeafName(typeText)
+    if leaf == "":
+        return -1
+    let dotPos = TypedExprQualifiedTypeDot(typeText)
+    if dotPos > 0:
+        let qualifier = chengpath.PathTrim(chengpath.TextSlice(typeText, 0, dotPos))
+        let targetPath = TypedExprLookupQualifiedModuleSourcePath(currentCtx,
+                                                                  sourceContexts,
+                                                                  qualifier)
+        let targetIndex = TypedExprSourceContextLookup(sourceContexts, targetPath)
+        if targetIndex >= 0 && TypedExprSourceHasDeclaredType(sourceContexts[targetIndex], leaf):
+            return targetIndex
+        return -1
+    if TypedExprSourceHasDeclaredType(currentCtx, leaf):
+        return -2
+    var found: int32 = -1
+    for i in 0..<sourceContexts.len:
+        if !TypedExprSourceHasDeclaredType(sourceContexts[i], leaf):
+            continue
+        if found >= 0:
+            return -1
+        found = i
+    return found
+
 fn TypedExprTypeLayoutImpl(currentCtx: var TypedExprSourceContext,
                             sourceContexts: var TypedExprSourceContext[],
                             typeRaw: str,
@@ -4613,6 +4643,17 @@ fn TypedExprTypeLayoutImpl(currentCtx: var TypedExprSourceContext,
             alignBytes = 1
         sizeBytes = TypedExprAlignBytes(errOffset + errSize, alignBytes)
         return true
+    let declaredIndex = TypedExprDeclaredTypeContextLookup(currentCtx, sourceContexts, typeText)
+    if declaredIndex == -2:
+        if !TypedExprContextHasTypeField(currentCtx, typeText):
+            sizeBytes = 4
+            alignBytes = 4
+            return true
+    elif declaredIndex >= 0:
+        if !TypedExprContextHasTypeField(sourceContexts[declaredIndex], typeText):
+            sizeBytes = 4
+            alignBytes = 4
+            return true
     let ctxIndex = TypedExprFieldContextLookup(currentCtx, sourceContexts, typeText)
     var ownerCtx = currentCtx
     if ctxIndex >= 0:
@@ -5602,6 +5643,7 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
     ctx.importcFunctions = []
     ctx.importedModules = []
     ctx.declaredTypes = []
+    ctx.typeFields = []
     ctx.exprLineColumns = []
     var decls: parser.NormalizedFunctionDecl[]
     if !parser.ParserReadNormalizedFunctionDecls(normalizedText, decls, err):
@@ -6143,7 +6185,6 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
     var currentLineIndent: int32
     var currentLineEnclosingIfLineNumber: int32
     var currentLineEnclosingIfConditionText = ""
-    var emptySourceContexts: TypedExprSourceContext[]
     while true:
         var exprIndex: int32 = -1
         if includeStructuredStatements:
@@ -6256,7 +6297,7 @@ fn TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir: var TypedExprIr,
             if expr.kind == parser.NormalizedExprReturn:
                 let _ = TypedExprIrAddCallStatementFromExpr(ir,
                                                             ctx,
-                                                            emptySourceContexts,
+                                                            sourceContexts,
                                                             scope,
                                                             expr,
                                                             TypedExprIrStmtReturn,
@@ -6372,6 +6413,38 @@ fn TypedExprAssignFieldName(lhsRaw: str): str =
                                                        dotPos + 1,
                                                        lhs.len - dotPos - 1))
 
+fn TypedExprAssignFieldPath(lhsRaw: str): str =
+    let lhs = chengpath.PathTrim(lhsRaw)
+    let dotPos = parser.ParserFindText(lhs, ".")
+    if dotPos < 0 || dotPos + 1 >= lhs.len:
+        return ""
+    return chengpath.PathTrim(chengpath.TextSlice(lhs,
+                                                  dotPos + 1,
+                                                  lhs.len - dotPos - 1))
+
+fn TypedExprTextIsSimpleFieldPath(textRaw: str): bool =
+    let text = chengpath.PathTrim(textRaw)
+    if text == "":
+        return false
+    if parser.ParserFindText(text, ".") <= 0:
+        return false
+    if parser.ParserFindText(text, "(") >= 0 ||
+       parser.ParserFindText(text, ")") >= 0 ||
+       parser.ParserFindText(text, "[") >= 0 ||
+       parser.ParserFindText(text, "]") >= 0 ||
+       parser.ParserFindText(text, "{") >= 0 ||
+       parser.ParserFindText(text, "}") >= 0 ||
+       parser.ParserFindText(text, " ") >= 0 ||
+       parser.ParserFindText(text, "+") >= 0 ||
+       parser.ParserFindText(text, "-") >= 0 ||
+       parser.ParserFindText(text, "*") >= 0 ||
+       parser.ParserFindText(text, "/") >= 0 ||
+       parser.ParserFindText(text, "?") >= 0 ||
+       parser.ParserFindText(text, ":") >= 0 ||
+       parser.ParserFindText(text, ",") >= 0:
+        return false
+    return true
+
 fn TypedExprAssignFieldType(rootTypeRaw: str,
                              fieldNameRaw: str): str =
     let rootType = TypedExprNormalizeTypeText(rootTypeRaw)
@@ -6395,6 +6468,7 @@ fn TypedExprAssignFieldType(rootTypeRaw: str,
     return ""
 
 fn TypedExprAssignStatementType(ctx: var TypedExprSourceContext,
+                                 sourceContexts: var TypedExprSourceContext[],
                                  scope: TypedExprFunctionScope,
                                  lineNumber: int32,
                                  lhsRaw: str): str =
@@ -6406,10 +6480,119 @@ fn TypedExprAssignStatementType(ctx: var TypedExprSourceContext,
     let fieldName = TypedExprAssignFieldName(lhsRaw)
     if fieldName == "":
         return rootType
+    let fieldPath = TypedExprAssignFieldPath(lhsRaw)
+    var resolvedFieldType = ""
+    var resolvedOffset: int32
+    var resolvedSize: int32
+    var resolvedAlign: int32
+    if TypedExprResolveFieldPathMeta(ctx,
+                                     sourceContexts,
+                                     rootType,
+                                     fieldPath,
+                                     resolvedFieldType,
+                                     resolvedOffset,
+                                     resolvedSize,
+                                     resolvedAlign):
+        return resolvedFieldType
     let fieldType = TypedExprAssignFieldType(rootType, fieldName)
     if fieldType != "":
        return fieldType
     return ""
+
+fn TypedExprIrPopulateAssignLhsMeta(stmt: var TypedExprIrStatement,
+                                     ctx: var TypedExprSourceContext,
+                                     sourceContexts: var TypedExprSourceContext[],
+                                     scope: TypedExprFunctionScope,
+                                     lineNumber: int32,
+                                     lhsRaw: str): str =
+    let rootName = TypedExprAssignLhsRootName(lhsRaw)
+    stmt.assignRootName = rootName
+    stmt.assignRootType = ""
+    stmt.assignFieldName = ""
+    stmt.assignFieldType = ""
+    stmt.assignFieldOffsetBytes = 0
+    stmt.assignFieldSizeBytes = 0
+    stmt.assignFieldAlignBytes = 0
+    if rootName == "":
+        return ""
+    let scopeIndex = TypedExprScopeIndexForLine(ctx.scopes, lineNumber)
+    let rootType = TypedExprLookupBindingType(ctx, scopeIndex, lineNumber, rootName)
+    stmt.assignRootType = rootType
+    let fieldPath = TypedExprAssignFieldPath(lhsRaw)
+    if fieldPath == "":
+        return rootType
+    stmt.assignFieldName = fieldPath
+    var fieldType = ""
+    var fieldOffset: int32
+    var fieldSize: int32
+    var fieldAlign: int32
+    if TypedExprResolveFieldPathMeta(ctx,
+                                     sourceContexts,
+                                     rootType,
+                                     fieldPath,
+                                     fieldType,
+                                     fieldOffset,
+                                     fieldSize,
+                                     fieldAlign):
+        stmt.assignFieldType = fieldType
+        stmt.assignFieldOffsetBytes = fieldOffset
+        stmt.assignFieldSizeBytes = fieldSize
+        stmt.assignFieldAlignBytes = fieldAlign
+        return fieldType
+    fieldType = TypedExprAssignFieldType(rootType, TypedExprAssignFieldName(lhsRaw))
+    if fieldType != "":
+        stmt.assignFieldType = fieldType
+        var sizeBytes: int32
+        var alignBytes: int32
+        if TypedExprTypeLayout(ctx, sourceContexts, fieldType, sizeBytes, alignBytes):
+            stmt.assignFieldSizeBytes = sizeBytes
+            stmt.assignFieldAlignBytes = alignBytes
+        return fieldType
+    return ""
+
+fn TypedExprIrPopulateAssignValueMeta(stmt: var TypedExprIrStatement,
+                                       ctx: var TypedExprSourceContext,
+                                       sourceContexts: var TypedExprSourceContext[],
+                                       scope: TypedExprFunctionScope,
+                                       lineNumber: int32,
+                                       valueRaw: str) =
+    stmt.assignValueRootName = ""
+    stmt.assignValueRootType = ""
+    stmt.assignValueFieldName = ""
+    stmt.assignValueFieldType = ""
+    stmt.assignValueFieldOffsetBytes = 0
+    stmt.assignValueFieldSizeBytes = 0
+    stmt.assignValueFieldAlignBytes = 0
+    if !TypedExprTextIsSimpleFieldPath(valueRaw):
+        return
+    let rootName = TypedExprAssignLhsRootName(valueRaw)
+    let fieldPath = TypedExprAssignFieldPath(valueRaw)
+    if rootName == "" || fieldPath == "":
+        return
+    let scopeIndex = TypedExprScopeIndexForLine(ctx.scopes, lineNumber)
+    let rootType = TypedExprLookupBindingType(ctx, scopeIndex, lineNumber, rootName)
+    if rootType == "":
+        return
+    var fieldType = ""
+    var fieldOffset: int32
+    var fieldSize: int32
+    var fieldAlign: int32
+    if !TypedExprResolveFieldPathMeta(ctx,
+                                      sourceContexts,
+                                      rootType,
+                                      fieldPath,
+                                      fieldType,
+                                      fieldOffset,
+                                      fieldSize,
+                                      fieldAlign):
+        return
+    stmt.assignValueRootName = rootName
+    stmt.assignValueRootType = rootType
+    stmt.assignValueFieldName = fieldPath
+    stmt.assignValueFieldType = fieldType
+    stmt.assignValueFieldOffsetBytes = fieldOffset
+    stmt.assignValueFieldSizeBytes = fieldSize
+    stmt.assignValueFieldAlignBytes = fieldAlign
 
 fn TypedExprControlStatementKindFromExpr(expr: parser.NormalizedExpr): TypedExprIrStatementKind =
     if expr.kind == parser.NormalizedExprIfStmt:
@@ -6503,7 +6686,18 @@ fn TypedExprIrAddAssignStatementFromExpr(ir: var TypedExprIr,
     stmt.detailKind = expr.detailKind
     stmt.surfaceText = rhsText
     stmt.bindingName = lhsText
-    stmt.resultType = TypedExprAssignStatementType(ctx, scope, expr.lineNumber, lhsText)
+    stmt.resultType = TypedExprIrPopulateAssignLhsMeta(stmt,
+                                                       ctx,
+                                                       sourceContexts,
+                                                       scope,
+                                                       expr.lineNumber,
+                                                       lhsText)
+    TypedExprIrPopulateAssignValueMeta(stmt,
+                                       ctx,
+                                       sourceContexts,
+                                       scope,
+                                       expr.lineNumber,
+                                       rhsText)
     if stmt.resultType == "":
         stmt.resultType = "unknown"
     stmt.callTarget = ""
@@ -6892,6 +7086,7 @@ fn TypedExprBuildIrForScope(ctx: var TypedExprSourceContext,
     add(ir.functions, fnIr)
 
 fn TypedExprBuildIrForScopeWithFactsAndExprLayer(ctx: var TypedExprSourceContext,
+                                                  sourceContexts: var TypedExprSourceContext[],
                                                   scope: TypedExprFunctionScope,
                                                   facts: var TypedExprFact[],
                                                   factStartIndex: int32,
@@ -6949,6 +7144,7 @@ fn TypedExprBuildIrForScopeWithFactsAndExprLayer(ctx: var TypedExprSourceContext
                                                                              exprEndIndex)
     TypedExprIrAppendStatementsForScopeWithFactsAndExprLayer(ir,
                                                              ctx,
+                                                             sourceContexts,
                                                              scope,
                                                              facts,
                                                              factStartIndex,
@@ -7102,10 +7298,27 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
         if !TypedExprReadNormalizedExprLayerForSourceTexts(sourceTexts, exprLayer, err):
             err = Fmt" typed expr: build typed ir normalized expr layer failed: {err}"
             return false
+    var contexts: TypedExprSourceContext[]
+    if facts.len > 0:
+        for i in 0..<sourceTexts.len:
+            os.ProcessResourceGuardCheck()
+            var sourceForContext = sourceTexts[i]
+            if sourceForContext.text == "" && sourceForContext.sourcePath != "":
+                sourceForContext.text = chengpath.ReadTextFile("", sourceForContext.sourcePath)
+            var context: TypedExprSourceContext
+            if !TypedExprBuildSourceContext(sourceForContext, context, err):
+                err = " typed expr: build typed ir source context failed"
+                return false
+            TypedExprClearSourceContextHeavyFields(context)
+            sourceTexts[i].text = ""
+            add(contexts, context)
     for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
+        var sourceForIr = sourceTexts[i]
+        if sourceForIr.text == "" && sourceForIr.sourcePath != "":
+            sourceForIr.text = chengpath.ReadTextFile("", sourceForIr.sourcePath)
         var ctx: TypedExprSourceContext
-        if !TypedExprBuildSourceContext(sourceTexts[i], ctx, err):
+        if !TypedExprBuildSourceContext(sourceForIr, ctx, err):
             err = " typed expr: build typed ir source context failed"
             return false
         let sourceFactStart = TypedExprFirstFactIndexForSource(facts, ctx.sourcePath)
@@ -7141,6 +7354,7 @@ fn TypedExprBuildIrWithFacts(sourceTexts: var TypedExprSourceText[],
                     exprCursor = exprIndex + 1
             if facts.len > 0:
                 TypedExprBuildIrForScopeWithFactsAndExprLayer(ctx,
+                                                              contexts,
                                                               ctx.scopes[j],
                                                               facts,
                                                               factCursor,

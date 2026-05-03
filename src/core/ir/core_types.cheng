@@ -124,7 +124,12 @@ type
         BodyOpLoadLocal,
         BodyOpStoreLocal,
         BodyOpCopyLocal,
-        BodyOpResultProject
+        BodyOpResultProject,
+        BodyOpStrEqLiteral,
+        BodyOpIndexedLoad,
+        BodyOpIndexedStore,
+        BodyOpFieldLoad,
+        BodyOpFieldStore
 
 type
     LocalType = enum
@@ -149,6 +154,8 @@ const
     BodyOpStrEqLiteralTag = 11
     BodyOpIndexedLoadTag = 12
     BodyOpIndexedStoreTag = 13
+    BodyOpFieldLoadTag = 14
+    BodyOpFieldStoreTag = 15
     AbiScalarTag = 1
     AbiAggregateTag = 3
     LayoutFixedBytesTag = 7
@@ -628,7 +635,7 @@ fn bodyIRDodBoolText(value: bool): str =
     return "0"
 
 fn bodyIRDodBodyOpKindValid(kind: int32): bool =
-    return kind >= BodyOpLoadConstTag && kind <= BodyOpIndexedStoreTag
+    return kind >= BodyOpLoadConstTag && kind <= BodyOpFieldStoreTag
 
 fn bodyIRDodBodyTermKindValid(kind: int32): bool =
     return kind >= BodyTermReturnTag && kind <= BodyTermCbrTag
@@ -829,6 +836,73 @@ fn bodyIRDodCheckOpTarget(bodyIR: BodyIR,
                            op.target,
                            bodyIR.localSlots.len)
 
+fn bodyIRDodCheckFieldAccessOp(bodyIR: BodyIR,
+                                report: var BodyIRDodSoAContractReport,
+                                opIndex: int32,
+                                op: BodyOp,
+                                isStore: bool) =
+    if op.operands.len != 4:
+        bodyIRDodMarkInvalid(report,
+                             Fmt"ops[{opIndex}].fieldAccessArity",
+                             op.operands.len,
+                             4)
+        return
+
+    let baseSlot = op.operands[0]
+    let valueSlot = op.operands[1]
+    let byteOffset = op.operands[2]
+    let byteCount = op.operands[3]
+    bodyIRDodCheckLocalRef(report,
+                           Fmt"ops[{opIndex}].fieldAccessBase",
+                           baseSlot,
+                           bodyIR.localSlots.len)
+    bodyIRDodCheckLocalRef(report,
+                           Fmt"ops[{opIndex}].fieldAccessValue",
+                           valueSlot,
+                           bodyIR.localSlots.len)
+    if byteOffset < 0:
+        bodyIRDodMarkInvalid(report,
+                             Fmt"ops[{opIndex}].fieldAccessByteOffset",
+                             byteOffset,
+                             0)
+    if byteCount <= 0:
+        bodyIRDodMarkInvalid(report,
+                             Fmt"ops[{opIndex}].fieldAccessByteCount",
+                             byteCount,
+                             1)
+
+    if isStore:
+        if op.target != baseSlot:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"ops[{opIndex}].fieldStoreTargetBaseMismatch",
+                                 op.target,
+                                 baseSlot)
+    else:
+        if op.target != valueSlot:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"ops[{opIndex}].fieldLoadTargetValueMismatch",
+                                 op.target,
+                                 valueSlot)
+
+    if baseSlot < 0 || baseSlot >= bodyIR.localSlots.len ||
+       valueSlot < 0 || valueSlot >= bodyIR.localSlots.len ||
+       byteOffset < 0 || byteCount <= 0:
+        return
+
+    let base = bodyIR.localSlots[baseSlot]
+    let value = bodyIR.localSlots[valueSlot]
+    if value.sizeBytes != byteCount:
+        bodyIRDodMarkInvalid(report,
+                             Fmt"ops[{opIndex}].fieldAccessValueByteCount",
+                             byteCount,
+                             value.sizeBytes)
+    if base.typeKind != LocalPtrTag:
+        if base.sizeBytes <= 0 || byteOffset > base.sizeBytes - byteCount:
+            bodyIRDodMarkInvalid(report,
+                                 Fmt"ops[{opIndex}].fieldAccessBaseRange",
+                                 byteOffset,
+                                 base.sizeBytes)
+
 fn bodyIRDodCheckOp(bodyIR: BodyIR,
                      report: var BodyIRDodSoAContractReport,
                      opIndex: int32) =
@@ -837,7 +911,7 @@ fn bodyIRDodCheckOp(bodyIR: BodyIR,
         bodyIRDodMarkInvalid(report,
                              Fmt"ops[{opIndex}].kind",
                              op.kind,
-                             BodyOpIndexedStoreTag)
+                             BodyOpFieldStoreTag)
         return
     bodyIRDodCheckOpTarget(bodyIR, report, opIndex, op)
     if op.kind == BodyOpCallTag:
@@ -970,6 +1044,10 @@ fn bodyIRDodCheckOp(bodyIR: BodyIR,
                                    Fmt"ops[{opIndex}].indexedStoreValue",
                                    op.operands[1],
                                    bodyIR.localSlots.len)
+    elif op.kind == BodyOpFieldLoadTag:
+        bodyIRDodCheckFieldAccessOp(bodyIR, report, opIndex, op, false)
+    elif op.kind == BodyOpFieldStoreTag:
+        bodyIRDodCheckFieldAccessOp(bodyIR, report, opIndex, op, true)
 
 fn bodyIRDodCheckOps(bodyIR: BodyIR,
                       report: var BodyIRDodSoAContractReport) =
