@@ -304,7 +304,7 @@ fn PrimaryStatementReturnModeCstringLiteralCallsReturnI32Const0(): int32 =
 
 fn PrimaryBodyIrGeneralCfgWordCount(bodyIR: coreir.BodyIR): int32 =
     let frameBytes = PrimaryBodyIrFrameBytes(bodyIR)
-    if frameBytes <= 0 || frameBytes > 4095:
+    if frameBytes <= 0:
         return 0
     var count = PrimaryBodyIrPrologueWordCount(bodyIR)
     for i in 0..<bodyIR.ops.len:
@@ -658,7 +658,12 @@ fn PrimaryBodyIrParamCopyCount(bodyIR: coreir.BodyIR): int32 =
     return count
 
 fn PrimaryBodyIrPrologueWordCount(bodyIR: coreir.BodyIR): int32 =
-    return 4 + PrimaryBodyIrParamSaveCount(bodyIR)
+    var frameBytes = PrimaryBodyIrFrameBytes(bodyIR)
+    var extraSub = 0
+    while frameBytes > 4095:
+        extraSub = extraSub + 1
+        frameBytes = frameBytes - 4095
+    return 4 + extraSub + PrimaryBodyIrParamSaveCount(bodyIR)
 
 fn PrimaryBodyIrLocalReg(slotId: int32): int32 =
     var reg = a64.A64X9 + slotId
@@ -3924,13 +3929,21 @@ fn PrimaryBodyIRFillWords(words: var int32[], wordOffset: int32, wordCount: int3
     if wordOffset < 0 ||
        wordCount < prologueCount ||
        wordOffset + wordCount > words.len ||
-       frameBytes <= 0 ||
-       frameBytes > 4095:
+       frameBytes <= 0:
         return -1
-    words[wordOffset] = Value(a64.A64EncSubImm(true, a64.A64SP, a64.A64SP, frameBytes))
-    words[wordOffset + 1] = Value(a64.A64EncStp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
-    words[wordOffset + 2] = Value(a64.A64EncAddImm(true, a64.A64FP, a64.A64SP, 0))
-    var prologueOffset = wordOffset + 3
+    var prologuePos = wordOffset
+    var remain = frameBytes
+    while remain > 4095:
+        words[prologuePos] = Value(a64.A64EncSubImm(true, a64.A64SP, a64.A64SP, 4095))
+        prologuePos = prologuePos + 1
+        remain = remain - 4095
+    words[prologuePos] = Value(a64.A64EncSubImm(true, a64.A64SP, a64.A64SP, remain))
+    prologuePos = prologuePos + 1
+    words[prologuePos] = Value(a64.A64EncStp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
+    prologuePos = prologuePos + 1
+    words[prologuePos] = Value(a64.A64EncAddImm(true, a64.A64FP, a64.A64SP, 0))
+    prologuePos = prologuePos + 1
+    var prologueOffset = prologuePos
     for paramIndex in 0..<paramSaveCount:
         if prologueOffset >= wordOffset + prologueCount:
             return -1
