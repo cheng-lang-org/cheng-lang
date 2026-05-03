@@ -293,6 +293,11 @@ type
         assignValueFieldOffsetBytes: int32
         assignValueFieldSizeBytes: int32
         assignValueFieldAlignBytes: int32
+        assignValueOpKind: TypedExprIrOpKind
+        assignValueLhsText: str
+        assignValueRhsText: str
+        assignValueRhsConst: int32
+        assignValueRhsHasConst: bool
         callTarget: str
         callTargetSourcePath: str
         callTargetImportc: bool
@@ -322,6 +327,9 @@ type
         functions: TypedExprIrFunction[]
         statements: TypedExprIrStatement[]
         nodes: TypedExprIrNode[]
+        globalSourcePaths: str[]
+        globalNames: str[]
+        globalTypes: str[]
 
     TypedExprFunctionScope =
         sourcePath: str
@@ -892,6 +900,11 @@ fn TypedExprIrStatementClone(stmt: TypedExprIrStatement): TypedExprIrStatement =
     out.assignValueFieldOffsetBytes = stmt.assignValueFieldOffsetBytes
     out.assignValueFieldSizeBytes = stmt.assignValueFieldSizeBytes
     out.assignValueFieldAlignBytes = stmt.assignValueFieldAlignBytes
+    out.assignValueOpKind = stmt.assignValueOpKind
+    out.assignValueLhsText = stmt.assignValueLhsText
+    out.assignValueRhsText = stmt.assignValueRhsText
+    out.assignValueRhsConst = stmt.assignValueRhsConst
+    out.assignValueRhsHasConst = stmt.assignValueRhsHasConst
     out.callTarget = stmt.callTarget
     out.callTargetSourcePath = stmt.callTargetSourcePath
     out.callTargetImportc = stmt.callTargetImportc
@@ -928,6 +941,12 @@ fn TypedExprIrClone(ir: var TypedExprIr): TypedExprIr =
         add(out.statements, TypedExprIrStatementClone(ir.statements[i]))
     for i in 0..<ir.nodes.len:
         add(out.nodes, TypedExprIrNodeClone(ir.nodes[i]))
+    for i in 0..<ir.globalSourcePaths.len:
+        add(out.globalSourcePaths, ir.globalSourcePaths[i])
+    for i in 0..<ir.globalNames.len:
+        add(out.globalNames, ir.globalNames[i])
+    for i in 0..<ir.globalTypes.len:
+        add(out.globalTypes, ir.globalTypes[i])
     return out
 
 fn TypedExprReturnOpFactClone(fact: TypedExprReturnOpFact): TypedExprReturnOpFact =
@@ -3077,6 +3096,16 @@ fn TypedExprIrIsI32ConstLiteral(textRaw: str): bool =
             return false
         constValue = constValue * 10 + digit
     return true
+
+fn TypedExprIrParseI32Const(textRaw: str): int32 =
+    let text = chengpath.PathTrim(textRaw)
+    var constValue: int32
+    for i in 0..<text.len:
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return 0
+        constValue = constValue * 10 + Int32(ch) - Int32('0')
+    return constValue
 
 fn TypedExprIrAddI32ConstNode(ir: var TypedExprIr,
                                sourcePath: str,
@@ -5984,11 +6013,28 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
         scope.returnType = TypedExprParseFunctionReturnType(declHeader)
         add(ctx.scopes, scope)
         TypedExprAppendParamBindings(ctx.bindings, scope, declHeader)
+    var inGlobalVarBlock = false
     for i in 0..<ctx.lines.len:
+        let rawLineForBinding = ctx.lines[i]
+        let trimmedForBinding = chengpath.PathTrim(parser.ParserStripLineComment(rawLineForBinding))
+        if !parser.ParserHasLeadingIndent(rawLineForBinding):
+            if trimmedForBinding != "":
+                inGlobalVarBlock = trimmedForBinding == "var"
         var bindingName = ""
         var bindingType = ""
         var rhsStartColumn: int32 = -1
-        if !TypedExprParseBindingLine(ctx.lines[i], bindingName, bindingType, rhsStartColumn):
+        if !TypedExprParseBindingLine(rawLineForBinding, bindingName, bindingType, rhsStartColumn):
+            if inGlobalVarBlock && parser.ParserHasLeadingIndent(rawLineForBinding):
+                var globalName = ""
+                var globalType = ""
+                if TypedExprReadTypeFieldDeclFromLine(rawLineForBinding, globalName, globalType):
+                    TypedExprMaybeAddBinding(ctx.bindings,
+                                               source.sourcePath,
+                                               "",
+                                               true,
+                                               i + 1,
+                                               globalName,
+                                               globalType)
             continue
         let lineNumber = i + 1
         let scopeIndex = TypedExprScopeIndexForLine(ctx.scopes, lineNumber)
@@ -7012,6 +7058,37 @@ fn TypedExprIrPopulateAssignValueMeta(stmt: var TypedExprIrStatement,
     stmt.assignValueFieldOffsetBytes = 0
     stmt.assignValueFieldSizeBytes = 0
     stmt.assignValueFieldAlignBytes = 0
+    stmt.assignValueOpKind = TypedExprIrOpUnsupported
+    stmt.assignValueLhsText = ""
+    stmt.assignValueRhsText = ""
+    stmt.assignValueRhsConst = 0
+    stmt.assignValueRhsHasConst = false
+    let addPos = TypedExprFindTopLevelTextToken(valueRaw, "+")
+    if addPos >= 0:
+        let lhsText = chengpath.PathTrim(chengpath.TextSlice(valueRaw, 0, addPos))
+        let rhsText = chengpath.PathTrim(chengpath.TextSlice(valueRaw,
+                                                             addPos + 1,
+                                                             valueRaw.len - addPos - 1))
+        if lhsText != "" && rhsText != "":
+            stmt.assignValueOpKind = TypedExprIrOpI32Add
+            stmt.assignValueLhsText = lhsText
+            stmt.assignValueRhsText = rhsText
+            if TypedExprIrIsI32ConstLiteral(rhsText):
+                stmt.assignValueRhsConst = TypedExprIrParseI32Const(rhsText)
+                stmt.assignValueRhsHasConst = true
+    let subPos = TypedExprFindTopLevelTextToken(valueRaw, "-")
+    if stmt.assignValueOpKind == TypedExprIrOpUnsupported && subPos >= 0:
+        let lhsText = chengpath.PathTrim(chengpath.TextSlice(valueRaw, 0, subPos))
+        let rhsText = chengpath.PathTrim(chengpath.TextSlice(valueRaw,
+                                                             subPos + 1,
+                                                             valueRaw.len - subPos - 1))
+        if lhsText != "" && rhsText != "":
+            stmt.assignValueOpKind = TypedExprIrOpI32Sub
+            stmt.assignValueLhsText = lhsText
+            stmt.assignValueRhsText = rhsText
+            if TypedExprIrIsI32ConstLiteral(rhsText):
+                stmt.assignValueRhsConst = TypedExprIrParseI32Const(rhsText)
+                stmt.assignValueRhsHasConst = true
     if !TypedExprTextIsSimpleFieldPath(valueRaw):
         return
     let rootName = TypedExprAssignLhsRootName(valueRaw)
