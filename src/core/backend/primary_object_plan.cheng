@@ -59,6 +59,8 @@ type
         firstMissingBodyIrFirstZeroOpKind: int32
         firstMissingBodyIrFirstZeroOpTarget: int32
         firstMissingBodyIrFirstZeroOpOperand0: int32
+        firstMissingBodyIrFirstZeroOpOperand1: int32
+        firstMissingBodyIrFirstZeroOpOperand2: int32
         firstMissingBodyIrFirstZeroTermIndex: int32
         firstMissingBodyIrFirstZeroTermKind: int32
         missingReasons: str[]
@@ -642,6 +644,16 @@ fn PrimaryBodyIrStringLiteralPayload(textRaw: str): str =
         return ""
     return strings.SliceBytes(text, 1, len(text) - 2)
 
+fn PrimaryBodyIrCstringCastArgText(textRaw: str): str =
+    let text = strutil.Strip(textRaw)
+    if len(text) <= 9:
+        return ""
+    if !PrimaryStartsWith(text, "cstring("):
+        return ""
+    if text[len(text) - 1] != ')':
+        return ""
+    return strutil.Strip(strings.SliceBytes(text, 8, len(text) - 9))
+
 fn PrimaryBodyIrConditionText(textRaw: str): str =
     var text = strutil.Strip(textRaw)
     if PrimaryStartsWith(text, "if "):
@@ -722,11 +734,15 @@ fn PrimaryBodyIrTargetParamIsVarI32(typedIr: texpr.TypedExprIr,
 
 fn PrimaryBodyIrAppendInvalidOp(bodyIR: var coreir.BodyIR,
                                 lineNumber: int32,
-                                statementKind: int32) =
+                                statementKind: int32,
+                                detail0: int32,
+                                detail1: int32) =
     var op: coreir.BodyOp
     op.kind = coreir.BodyOpInvalidTag
     op.target = lineNumber
     add(op.operands, statementKind)
+    add(op.operands, detail0)
+    add(op.operands, detail1)
     add(bodyIR.ops, op)
 
 fn PrimaryBodyIrAppendVarI32Load(bodyIR: var coreir.BodyIR,
@@ -785,7 +801,9 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                                 call: var coreir.CallOp,
                                 typedIr: texpr.TypedExprIr,
                                 stmt: texpr.TypedExprIrStatement,
-                                varI32ParamNames: str[]): bool =
+                                varI32ParamNames: str[],
+                                failureDetail0: var int32,
+                                failureDetail1: var int32): bool =
     if stmt.callArgCount <= 0:
         return true
     let argNames = PrimaryBodyIrCallArgNames(stmt.callArgsText)
@@ -794,18 +812,48 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
         let targetNeedsAddress = PrimaryBodyIrTargetParamIsVarI32(typedIr, stmt, argIndex)
         if PrimaryBodyIrTextIsI32Zero(argName):
             if targetNeedsAddress:
+                failureDetail0 = 11
+                failureDetail1 = argIndex
                 return false
             add(call.argSlots, coreir.CallArgSlotConstFalse())
         elif argName == "true":
             if targetNeedsAddress:
+                failureDetail0 = 12
+                failureDetail1 = argIndex
                 return false
             add(call.argSlots, coreir.CallArgSlotConstTrue())
         elif argName == "false":
             if targetNeedsAddress:
+                failureDetail0 = 13
+                failureDetail1 = argIndex
                 return false
             add(call.argSlots, coreir.CallArgSlotConstFalse())
+        elif PrimaryBodyIrCstringCastArgText(argName) != "":
+            if targetNeedsAddress:
+                failureDetail0 = 21
+                failureDetail1 = argIndex
+                return false
+            let castArg = PrimaryBodyIrCstringCastArgText(argName)
+            if PrimaryBodyIrTextIsStringLiteral(castArg):
+                let literalId = coreir.BodyIRAppendCStringLiteral(bodyIR,
+                                                                  PrimaryBodyIrStringLiteralPayload(castArg),
+                                                                  "")
+                add(call.argSlots, coreir.CallArgSlotCString(literalId))
+            else:
+                let slotId = PrimaryBodyIrFindArgSlot(slotNames, castArg)
+                if slotId < 0:
+                    failureDetail0 = 22
+                    failureDetail1 = argIndex
+                    return false
+                if PrimaryBodyIrSlotType(bodyIR, slotId) != coreir.LocalPtrTag:
+                    failureDetail0 = 23
+                    failureDetail1 = PrimaryBodyIrSlotType(bodyIR, slotId)
+                    return false
+                add(call.argSlots, slotId)
         elif PrimaryBodyIrTextIsStringLiteral(argName):
             if targetNeedsAddress:
+                failureDetail0 = 14
+                failureDetail1 = argIndex
                 return false
             let literalId = coreir.BodyIRAppendCStringLiteral(bodyIR,
                                                               PrimaryBodyIrStringLiteralPayload(argName),
@@ -815,13 +863,19 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
             var slotId = PrimaryBodyIrFindArgSlot(slotNames, argName)
             if targetNeedsAddress:
                 if slotId < 0:
+                    failureDetail0 = 31
+                    failureDetail1 = argIndex
                     return false
                 if PrimaryBodyIrSlotType(bodyIR, slotId) != coreir.LocalPtrTag:
+                    failureDetail0 = 32
+                    failureDetail1 = PrimaryBodyIrSlotType(bodyIR, slotId)
                     return false
             elif PrimaryBodyIrNameInList(varI32ParamNames, argName):
                 slotId = PrimaryBodyIrI32ValueSlotForText(bodyIR, slotNames, varI32ParamNames, argName)
             elif slotId < 0:
                 if PrimaryBodyIrTextHasCallSurface(argName):
+                    failureDetail0 = 41
+                    failureDetail1 = argIndex
                     return false
                 else:
                     slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR,
@@ -829,6 +883,8 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                                                            argName,
                                                            coreir.LocalI32Tag)
             if slotId < 0:
+                failureDetail0 = 42
+                failureDetail1 = argIndex
                 return false
             add(call.argSlots, slotId)
     return true
@@ -843,15 +899,21 @@ fn PrimaryBodyIrAppendCallOp(bodyIR: var coreir.BodyIR,
     var call: coreir.CallOp
     call.targetSymbol = stmt.callTarget
     call.resultSlot = resultSlot
+    var failureDetail0: int32
+    var failureDetail1: int32
     if !PrimaryBodyIrAppendCallArgs(bodyIR,
                                     slotNames,
                                     call,
                                     typedIr,
                                     stmt,
-                                    varI32ParamNames):
+                                    varI32ParamNames,
+                                    failureDetail0,
+                                    failureDetail1):
         PrimaryBodyIrAppendInvalidOp(bodyIR,
                                      stmt.lineNumber,
-                                     int32(stmt.kind))
+                                     int32(stmt.kind),
+                                     failureDetail0,
+                                     failureDetail1)
         return resultSlot
     add(bodyIR.callSequence, call)
     var op: coreir.BodyOp
@@ -1045,7 +1107,33 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
         add(bodyIR.ops, storeOp)
         return true
     if PrimaryBodyIrTextHasFieldOrIndex(lhsName):
-        return false
+        var dotPos: int32
+        dotPos = -1
+        for ci in 0..<len(lhsName):
+            if lhsName[ci] == '.':
+                dotPos = ci
+        if dotPos < 0:
+            return false
+        let rootName = strutil.Strip(strings.SliceBytes(lhsName, 0, dotPos))
+        var baseSlot = PrimaryBodyIrFindSlotIndex(slotNames, rootName)
+        if baseSlot < 0:
+            baseSlot = PrimaryBodyIrFindArgSlot(slotNames, rootName)
+        if baseSlot < 0:
+            return false
+        var valueSlot = PrimaryBodyIrFindArgSlot(slotNames, rhsText)
+        if valueSlot < 0:
+            valueSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, rhsText, PrimaryBodyIrTypeKindFromText(stmt.resultType))
+        if valueSlot < 0:
+            return false
+        var storeOp: coreir.BodyOp
+        storeOp.kind = coreir.BodyOpFieldStoreTag
+        storeOp.target = baseSlot
+        add(storeOp.operands, baseSlot)
+        add(storeOp.operands, valueSlot)
+        add(storeOp.operands, 0)
+        add(storeOp.operands, 8)
+        add(bodyIR.ops, storeOp)
+        return true
     let lhsSlot = PrimaryBodyIrFindSlotIndex(slotNames, lhsName)
     if lhsSlot < 0:
         return false
@@ -1203,7 +1291,9 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                              stmt):
                 PrimaryBodyIrAppendInvalidOp(bodyIR,
                                              stmt.lineNumber,
-                                             int32(stmt.kind))
+                                             int32(stmt.kind),
+                                             0,
+                                             0)
             nextOpIndex = nextOpIndex + 1
         elif stmt.kind == texpr.TypedExprIrStmtReturn:
             if stmt.lineNumber == completedReturnLineNumber:
@@ -3834,6 +3924,10 @@ fn PrimaryObjectPlanCaptureBodyIrDetails(plan: var PrimaryObjectPlan,
         plan.firstMissingBodyIrFirstZeroOpTarget = op.target
         if op.operands.len > 0:
             plan.firstMissingBodyIrFirstZeroOpOperand0 = op.operands[0]
+        if op.operands.len > 1:
+            plan.firstMissingBodyIrFirstZeroOpOperand1 = op.operands[1]
+        if op.operands.len > 2:
+            plan.firstMissingBodyIrFirstZeroOpOperand2 = op.operands[2]
         break
     for termIndex in 0..<bodyIR.terms.len:
         if PrimaryBodyIRTermSize(bodyIR, termIndex) > 0:
