@@ -5368,10 +5368,67 @@ fn TypedExprLookupUnqualifiedImportedFunctionReturnType(currentCtx: var TypedExp
     targetImportcOut = foundImportc
     return foundReturnType
 
+fn TypedExprResolveQualifiedCallTargetReturnType(currentCtx: var TypedExprSourceContext,
+                                                  sourceContexts: var TypedExprSourceContext[],
+                                                  qualifierRaw: str,
+                                                  calleeRaw: str,
+                                                  targetRaw: str,
+                                                  targetSourcePathOut: var str,
+                                                  targetNameOut: var str,
+                                                  targetImportcOut: var bool): str =
+    targetSourcePathOut = ""
+    targetNameOut = ""
+    targetImportcOut = false
+    var qualifier = chengpath.PathTrim(qualifierRaw)
+    let target = chengpath.PathTrim(targetRaw)
+    if qualifier == "" && target != "":
+        qualifier = TypedExprQualifiedCallQualifier(target)
+    var callee = parser.ParserIdentPrefix(chengpath.PathTrim(calleeRaw))
+    if (callee == "" || TypedExprQualifiedCallDot(callee) >= 0) && target != "":
+        callee = TypedExprQualifiedCallLeaf(target)
+    if qualifier == "" || callee == "":
+        return ""
+    let targetSourcePath = TypedExprLookupQualifiedModuleSourcePath(currentCtx,
+                                                                    sourceContexts,
+                                                                    qualifier)
+    if targetSourcePath == "":
+        return ""
+    let targetIndex = TypedExprSourceContextLookup(sourceContexts, targetSourcePath)
+    if targetIndex < 0:
+        return ""
+    let localReturnType = TypedExprLookupLocalFunctionReturnType(sourceContexts[targetIndex],
+                                                                  callee)
+    if localReturnType != "":
+        targetSourcePathOut = targetSourcePath
+        targetNameOut = callee
+        targetImportcOut = false
+        return localReturnType
+    let importReturnType = TypedExprLookupImportcReturnType(sourceContexts[targetIndex],
+                                                            callee)
+    if importReturnType != "":
+        targetSourcePathOut = targetSourcePath
+        targetNameOut = callee
+        targetImportcOut = true
+        return importReturnType
+    return ""
+
 fn TypedExprLookupCallTargetReturnTypeFromFact(currentCtx: var TypedExprSourceContext,
                                                 sourceContexts: var TypedExprSourceContext[],
                                                  fact: TypedExprFact): str =
     if fact.callTargetSourcePath == "":
+        var resolvedSourcePath = ""
+        var resolvedTargetName = ""
+        var resolvedImportc = false
+        let qualifiedReturnType = TypedExprResolveQualifiedCallTargetReturnType(currentCtx,
+                                                                                sourceContexts,
+                                                                                fact.callQualifier,
+                                                                                fact.callCallee,
+                                                                                fact.callTarget,
+                                                                                resolvedSourcePath,
+                                                                                resolvedTargetName,
+                                                                                resolvedImportc)
+        if qualifiedReturnType != "":
+            return qualifiedReturnType
         if fact.callQualifier != "":
             return TypedExprLookupExternalFunctionReturnTypeFromContexts(currentCtx,
                                                                          sourceContexts,
@@ -6411,15 +6468,33 @@ fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
                                            currentLineBindingType: str,
                                            currentLineBindingRootColumn: int32,
                                            currentLineIndent: int32,
-                                           currentLineEnclosingIfLineNumber: int32,
-                                           currentLineEnclosingIfConditionText: str): int32 =
+                                            currentLineEnclosingIfLineNumber: int32,
+                                            currentLineEnclosingIfConditionText: str): int32 =
+    var statementFact = fact
+    if statementFact.kind == parser.NormalizedExprCall &&
+       statementFact.callTargetSourcePath == "":
+        var resolvedSourcePath = ""
+        var resolvedTargetName = ""
+        var resolvedImportc = false
+        let resolvedReturnType = TypedExprResolveQualifiedCallTargetReturnType(ctx,
+                                                                               sourceContexts,
+                                                                               statementFact.callQualifier,
+                                                                               statementFact.callCallee,
+                                                                               statementFact.callTarget,
+                                                                               resolvedSourcePath,
+                                                                               resolvedTargetName,
+                                                                               resolvedImportc)
+        if resolvedReturnType != "":
+            statementFact.callTarget = resolvedTargetName
+            statementFact.callTargetSourcePath = resolvedSourcePath
+            statementFact.callTargetImportc = resolvedImportc
     var statementKind = TypedExprIrStmtCall
-    if fact.kind == parser.NormalizedExprResultIntrinsic:
+    if statementFact.kind == parser.NormalizedExprResultIntrinsic:
         statementKind = TypedExprIrStmtResultIntrinsic
     else:
-        if fact.hasSink &&
-           (fact.sinkPlaceKind == TypedExprPlaceLocal ||
-            fact.sinkPlaceKind == TypedExprPlaceGlobal):
+        if statementFact.hasSink &&
+           (statementFact.sinkPlaceKind == TypedExprPlaceLocal ||
+            statementFact.sinkPlaceKind == TypedExprPlaceGlobal):
             statementKind = TypedExprIrStmtLetCall
         elif currentLineBindingRootColumn == fact.columnNumber:
             statementKind = TypedExprIrStmtLetCall
@@ -6428,30 +6503,30 @@ fn TypedExprIrAppendFactStatementForScope(ir: var TypedExprIr,
     var statementBindingName = ""
     if statementKind == TypedExprIrStmtLetCall ||
        (statementKind == TypedExprIrStmtResultIntrinsic &&
-        (fact.hasSink || currentLineBindingRootColumn == fact.columnNumber)):
+        (statementFact.hasSink || currentLineBindingRootColumn == statementFact.columnNumber)):
         statementBindingName = currentLineBindingName
-    var statementResultType = fact.typeText
+    var statementResultType = statementFact.typeText
     if (statementKind == TypedExprIrStmtLetCall ||
         statementKind == TypedExprIrStmtResultIntrinsic) &&
        Len(currentLineBindingType) > 0:
         statementResultType = currentLineBindingType
-    if fact.kind == parser.NormalizedExprCall:
-        let resolvedReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, fact)
+    if statementFact.kind == parser.NormalizedExprCall:
+        let resolvedReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, statementFact)
         if resolvedReturnType != "":
             statementResultType = resolvedReturnType
     if Len(statementResultType) <= 0 ||
        statementResultType == "call_expr" ||
        statementResultType == "unknown":
-        let resolvedReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, fact)
+        let resolvedReturnType = TypedExprLookupCallTargetReturnTypeFromFact(ctx, sourceContexts, statementFact)
         if resolvedReturnType != "":
             statementResultType = resolvedReturnType
     if Len(statementResultType) <= 0 ||
        statementResultType == "call_expr" ||
        statementResultType == "unknown":
-        statementResultType = TypedExprLookupLocalFunctionReturnType(ctx, fact.callTarget)
+        statementResultType = TypedExprLookupLocalFunctionReturnType(ctx, statementFact.callTarget)
     return TypedExprIrAddCallStatement(ir,
                                        scope,
-                                       fact,
+                                       statementFact,
                                        statementKind,
                                        statementBindingName,
                                        statementResultType,
@@ -6891,6 +6966,19 @@ fn TypedExprLookupCallTargetReturnTypeFromExpr(currentCtx: var TypedExprSourceCo
                                                 expr: parser.NormalizedExpr): str =
     let sourcePath = parser.ParserNormalizePath(expr.callTargetSourcePath)
     if sourcePath == "":
+        var resolvedSourcePath = ""
+        var resolvedTargetName = ""
+        var resolvedImportc = false
+        let qualifiedReturnType = TypedExprResolveQualifiedCallTargetReturnType(currentCtx,
+                                                                                sourceContexts,
+                                                                                expr.callQualifier,
+                                                                                expr.callCallee,
+                                                                                expr.callTarget,
+                                                                                resolvedSourcePath,
+                                                                                resolvedTargetName,
+                                                                                resolvedImportc)
+        if qualifiedReturnType != "":
+            return qualifiedReturnType
         if expr.callQualifier != "":
             let externalReturnType = TypedExprLookupExternalFunctionReturnTypeFromContexts(currentCtx,
                                                                                           sourceContexts,
@@ -7331,6 +7419,23 @@ fn TypedExprIrAddCallStatementFromExpr(ir: var TypedExprIr,
     stmt.callTarget = expr.callTarget
     stmt.callTargetSourcePath = expr.callTargetSourcePath
     stmt.callTargetImportc = expr.callTargetImportc
+    var resolvedCallReturnType = ""
+    if expr.kind == parser.NormalizedExprCall && stmt.callTargetSourcePath == "":
+        var resolvedSourcePath = ""
+        var resolvedTargetName = ""
+        var resolvedImportc = false
+        resolvedCallReturnType = TypedExprResolveQualifiedCallTargetReturnType(ctx,
+                                                                               sourceContexts,
+                                                                               expr.callQualifier,
+                                                                               expr.callCallee,
+                                                                               expr.callTarget,
+                                                                               resolvedSourcePath,
+                                                                               resolvedTargetName,
+                                                                               resolvedImportc)
+        if resolvedCallReturnType != "":
+            stmt.callTarget = resolvedTargetName
+            stmt.callTargetSourcePath = resolvedSourcePath
+            stmt.callTargetImportc = resolvedImportc
     stmt.callArgCount = expr.callArgCount
     stmt.callArgsText = expr.callArgsText
     stmt.callArgNodeStart = -1
@@ -7344,7 +7449,9 @@ fn TypedExprIrAddCallStatementFromExpr(ir: var TypedExprIr,
         stmt.callArgNodeStart = nodeIndex
         stmt.callArgNodeCount = 1
     if expr.kind == parser.NormalizedExprCall:
-        let callReturnType = TypedExprLookupCallTargetReturnTypeFromExpr(ctx, sourceContexts, expr)
+        var callReturnType = resolvedCallReturnType
+        if callReturnType == "":
+            callReturnType = TypedExprLookupCallTargetReturnTypeFromExpr(ctx, sourceContexts, expr)
         if callReturnType != "":
             stmt.resultType = callReturnType
     stmt.loweringMode = TypedExprLowerDeferred
