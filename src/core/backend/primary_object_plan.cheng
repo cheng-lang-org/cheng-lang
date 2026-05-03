@@ -440,6 +440,7 @@ fn PrimaryBodyIrLocalSlotNewSized(bodyIR: var coreir.BodyIR,
     ls.id = slotId
     ls.name = name
     ls.typeKind = typeKind
+    ls.placeKind = coreir.BodyPlaceStackValueTag
     ls.ownership = coreir.OwnPlainTag
     ls.aliasClass = coreir.AliasUnknownTag
     ls.escapeKind = coreir.EscapeNoneTag
@@ -1166,6 +1167,7 @@ fn PrimaryBodyIrScalarValueSlotForText(bodyIR: var coreir.BodyIR,
                                                    slotNames,
                                                    globalSlotName,
                                                    typeKind)
+    bodyIR.localSlots[globalSlot].placeKind = coreir.BodyPlaceGlobalAddressTag
     let valueSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
                                                   slotNames,
                                                   Fmt"{globalSlotName}#global_value",
@@ -1198,24 +1200,28 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                 failureDetail1 = argIndex
                 return false
             add(call.argSlots, coreir.CallArgSlotConstFalse())
+            add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
         elif PrimaryBodyIrTextIsI32One(argName):
             if targetNeedsAddress:
                 failureDetail0 = 12
                 failureDetail1 = argIndex
                 return false
             add(call.argSlots, coreir.CallArgSlotConstTrue())
+            add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
         elif argName == "true":
             if targetNeedsAddress:
                 failureDetail0 = 12
                 failureDetail1 = argIndex
                 return false
             add(call.argSlots, coreir.CallArgSlotConstTrue())
+            add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
         elif argName == "false":
             if targetNeedsAddress:
                 failureDetail0 = 13
                 failureDetail1 = argIndex
                 return false
             add(call.argSlots, coreir.CallArgSlotConstFalse())
+            add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
         elif PrimaryBodyIrCstringCastArgText(argName) != "":
             if targetNeedsAddress:
                 failureDetail0 = 21
@@ -1227,6 +1233,7 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                                                                   PrimaryBodyIrStringLiteralPayload(castArg),
                                                                   "")
                 add(call.argSlots, coreir.CallArgSlotCString(literalId))
+                add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
             else:
                 let slotId = PrimaryBodyIrFindArgSlot(slotNames, castArg)
                 if slotId < 0:
@@ -1238,6 +1245,7 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                     failureDetail1 = PrimaryBodyIrSlotType(bodyIR, slotId)
                     return false
                 add(call.argSlots, slotId)
+                add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
         elif PrimaryBodyIrTextIsStringLiteral(argName):
             if targetNeedsAddress:
                 failureDetail0 = 14
@@ -1247,6 +1255,7 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                                                               PrimaryBodyIrStringLiteralPayload(argName),
                                                               "")
             add(call.argSlots, coreir.CallArgSlotCString(literalId))
+            add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
         else:
             var slotId = PrimaryBodyIrFindArgSlot(slotNames, argName)
             if targetNeedsAddress:
@@ -1280,8 +1289,10 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                 if PrimaryBodyIrLocalIsParam(bodyIR.localSlots[slotId]) &&
                    PrimaryBodyIrSlotType(bodyIR, slotId) == coreir.LocalPtrTag:
                     add(call.argSlots, slotId)
+                    add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
                 else:
                     add(call.argSlots, coreir.CallArgSlotAddress(slotId))
+                    add(call.argPassKinds, coreir.BodyCallPassParamAddressTag)
                 continue
             elif PrimaryBodyIrNameInList(varI32ParamNames, argName):
                 slotId = PrimaryBodyIrI32ValueSlotForText(bodyIR, slotNames, varI32ParamNames, argName)
@@ -1308,6 +1319,7 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                 failureDetail1 = argIndex
                 return false
             add(call.argSlots, slotId)
+            add(call.argPassKinds, coreir.BodyCallPassStackValueTag)
     return true
 
 fn PrimaryBodyIrAppendCallOp(bodyIR: var coreir.BodyIR,
@@ -1320,6 +1332,12 @@ fn PrimaryBodyIrAppendCallOp(bodyIR: var coreir.BodyIR,
     var call: coreir.CallOp
     call.targetSymbol = stmt.callTarget
     call.resultSlot = resultSlot
+    call.resultPassKind = coreir.BodyCallPassStackValueTag
+    if resultSlot >= 0 && resultSlot < bodyIR.localSlots.len:
+        let resultType = bodyIR.localSlots[resultSlot].typeKind
+        if resultType == coreir.LocalStrTag ||
+           resultType == coreir.LocalAggregateTag:
+            call.resultPassKind = coreir.BodyCallPassSretResultTag
     var failureDetail0: int32
     var failureDetail1: int32
     if !PrimaryBodyIrAppendCallArgs(bodyIR,
@@ -1533,6 +1551,7 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
                                                        slotNames,
                                                        lhsGlobalSlotName,
                                                        lhsGlobalTypeKind)
+        bodyIR.localSlots[globalSlot].placeKind = coreir.BodyPlaceGlobalAddressTag
         var storeOp: coreir.BodyOp
         storeOp.kind = coreir.BodyOpGlobalStoreTag
         storeOp.target = valueSlot
@@ -4354,7 +4373,7 @@ fn PrimaryBodyIrAppendGlobalDataLabels(bodyIR: coreir.BodyIR,
                                         dataPayloadTexts: var str[]) =
     for slotIndex in 0..<bodyIR.localSlots.len:
         let slot = bodyIR.localSlots[slotIndex]
-        if slot.escapeKind != coreir.EscapeGlobalTag:
+        if slot.placeKind != coreir.BodyPlaceGlobalAddressTag:
             continue
         let label = PrimaryGlobalDataLabel(targetTriple, slot.name)
         if PrimaryObjectDataLabelIndex(dataLabels, label) >= 0:
