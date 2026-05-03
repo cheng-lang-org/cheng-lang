@@ -5281,6 +5281,45 @@ fn TypedExprLookupExternalFunctionReturnTypeFromContexts(currentCtx: var TypedEx
             return importcFound
     return ""
 
+fn TypedExprLookupUnqualifiedImportedFunctionReturnType(currentCtx: var TypedExprSourceContext,
+                                                          sourceContexts: var TypedExprSourceContext[],
+                                                          nameRaw: str,
+                                                          targetSourcePathOut: var str,
+                                                          targetImportcOut: var bool): str =
+    targetSourcePathOut = ""
+    targetImportcOut = false
+    let name = parser.ParserIdentPrefix(chengpath.PathTrim(nameRaw))
+    if name == "":
+        return ""
+    var foundReturnType = ""
+    var foundSourcePath = ""
+    var foundImportc = false
+    for i in 0..<currentCtx.importedModules.len:
+        let importedSourcePath = parser.ParserNormalizePath(currentCtx.importedModules[i].targetSourcePath)
+        let targetIndex = TypedExprSourceContextLookup(sourceContexts, importedSourcePath)
+        if targetIndex < 0:
+            continue
+        let localReturnType = TypedExprLookupLocalFunctionReturnType(sourceContexts[targetIndex], name)
+        if localReturnType != "":
+            if foundReturnType != "":
+                return ""
+            foundReturnType = localReturnType
+            foundSourcePath = importedSourcePath
+            foundImportc = false
+            continue
+        let importcReturnType = TypedExprLookupImportcReturnType(sourceContexts[targetIndex], name)
+        if importcReturnType != "":
+            if foundReturnType != "":
+                return ""
+            foundReturnType = importcReturnType
+            foundSourcePath = importedSourcePath
+            foundImportc = true
+    if foundReturnType == "":
+        return ""
+    targetSourcePathOut = foundSourcePath
+    targetImportcOut = foundImportc
+    return foundReturnType
+
 fn TypedExprLookupCallTargetReturnTypeFromFact(sourceContexts: var TypedExprSourceContext[],
                                                  fact: TypedExprFact): str =
     if fact.callTargetSourcePath == "":
@@ -5792,23 +5831,33 @@ fn TypedExprBuildFact(ctx: var TypedExprSourceContext,
                 TypedExprApplyResolvedType(fact, ctx, sourceContexts, localReturnType, sink, true)
                 return fact
         elif fact.surfaceCallKind == TypedExprSurfaceCallExternal:
-            let externalReturnType = TypedExprLookupExternalFunctionReturnTypeFromContexts(ctx,
-                                                                                             sourceContexts,
-                                                                                             fact.callQualifier,
-                                                                                             fact.callCallee)
-            if externalReturnType != "":
-                let targetSourcePath = TypedExprLookupQualifiedModuleSourcePath(ctx,
-                                                                                  sourceContexts,
-                                                                                  fact.callQualifier)
-                var targetImportc = false
-                let targetIndex = TypedExprSourceContextLookup(sourceContexts, targetSourcePath)
-                if targetIndex >= 0:
-                    let localReturnType = TypedExprLookupLocalFunctionReturnType(sourceContexts[targetIndex],
-                                                                                  fact.callCallee)
-                    if localReturnType == "":
-                        let importReturnType = TypedExprLookupImportcReturnType(sourceContexts[targetIndex],
-                                                                                fact.callCallee)
-                        targetImportc = importReturnType != ""
+            var targetSourcePath = ""
+            var targetImportc = false
+            var externalReturnType = ""
+            if fact.callQualifier == "":
+                externalReturnType = TypedExprLookupUnqualifiedImportedFunctionReturnType(ctx,
+                                                                                          sourceContexts,
+                                                                                          fact.callCallee,
+                                                                                          targetSourcePath,
+                                                                                          targetImportc)
+            else:
+                externalReturnType = TypedExprLookupExternalFunctionReturnTypeFromContexts(ctx,
+                                                                                           sourceContexts,
+                                                                                           fact.callQualifier,
+                                                                                           fact.callCallee)
+                if externalReturnType != "":
+                    targetSourcePath = TypedExprLookupQualifiedModuleSourcePath(ctx,
+                                                                                sourceContexts,
+                                                                                fact.callQualifier)
+                    let targetIndex = TypedExprSourceContextLookup(sourceContexts, targetSourcePath)
+                    if targetIndex >= 0:
+                        let localReturnType = TypedExprLookupLocalFunctionReturnType(sourceContexts[targetIndex],
+                                                                                      fact.callCallee)
+                        if localReturnType == "":
+                            let importReturnType = TypedExprLookupImportcReturnType(sourceContexts[targetIndex],
+                                                                                    fact.callCallee)
+                            targetImportc = importReturnType != ""
+            if externalReturnType != "" && targetSourcePath != "":
                 fact.callResolved = true
                 fact.callReason = TypedExprCallReasonNone
                 fact.callTarget = fact.callCallee
