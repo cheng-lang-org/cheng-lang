@@ -2012,6 +2012,74 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
         PrimaryBodyIrAppendVarI32Store(bodyIR, lhsSlot, targetSlot)
     return true
 
+fn PrimaryBodyIrBuildForRangeLoop(bodyIR: var coreir.BodyIR,
+                                    slotNames: var str[],
+                                    nextOpIndex: var int32,
+                                    currentBlockStart: var int32,
+                                    typedIr: texpr.TypedExprIr,
+                                    stmt: texpr.TypedExprIrStatement,
+                                    stmtIndex: int32,
+                                    stmtEnd: int32,
+                                    pendingFalseTerm: var int32): int32 =
+    let header = strutil.Strip(stmt.surfaceText)
+    var forBodyEnd = stmtEnd
+    var scanIdx = stmtIndex + 1
+    while scanIdx < stmtEnd:
+        let s = typedIr.statements[scanIdx]
+        if s.lineIndent > 0 && s.lineIndent <= stmt.lineIndent:
+            forBodyEnd = scanIdx
+            break
+        scanIdx = scanIdx + 1
+    var rangeText = header
+    var inAt = -1
+    var ci = 0
+    while ci < len(rangeText) - 3:
+        if rangeText[ci] == ' ' && rangeText[ci + 1] == 'i' && rangeText[ci + 2] == 'n' && rangeText[ci + 3] == ' ':
+            inAt = ci
+            break
+        ci = ci + 1
+    if inAt > 0:
+        rangeText = chengpath.TextSlice(rangeText, inAt + 4, len(rangeText) - inAt - 4)
+        if len(rangeText) > 0 && rangeText[len(rangeText) - 1] == ':':
+            rangeText = chengpath.TextSlice(rangeText, 0, len(rangeText) - 1)
+        rangeText = strutil.Strip(rangeText)
+    var rangeStart: int32
+    var rangeEnd = rangeText
+    var exclAt = -1
+    ci = 0
+    while ci < len(rangeText) - 2:
+        if rangeText[ci] == '.' && rangeText[ci + 1] == '.' && rangeText[ci + 2] == '<':
+            exclAt = ci
+            break
+        ci = ci + 1
+    if exclAt > 0:
+        rangeStart = PrimaryBodyIrExtractIntFromText(strutil.Strip(chengpath.TextSlice(rangeText, 0, exclAt)))
+        rangeEnd = strutil.Strip(chengpath.TextSlice(rangeText, exclAt + 3, len(rangeText) - exclAt - 3))
+    let idxSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, stmt.bindingName, coreir.LocalI32Tag)
+    var initOp: coreir.BodyOp
+    initOp.kind = coreir.BodyOpLoadConstTag
+    initOp.target = idxSlot
+    add(initOp.operands, coreir.LocalI32Tag)
+    add(initOp.operands, rangeStart)
+    add(bodyIR.ops, initOp)
+    nextOpIndex = nextOpIndex + 1
+    let boundSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, rangeEnd, coreir.LocalI32Tag)
+    var cbrTerm: coreir.BodyTerm
+    cbrTerm.kind = coreir.BodyTermCbrTag
+    cbrTerm.conditionKind = coreir.BodyCondI32LtTag
+    cbrTerm.lhsSlot = idxSlot
+    cbrTerm.rhsSlot = boundSlot
+    cbrTerm.resultSlot = -1
+    cbrTerm.trueBlock = -1
+    cbrTerm.falseBlock = -1
+    let cbrIdx = coreir.BodyIRAppendTerm(bodyIR, cbrTerm)
+    let cbrBlockCount = bodyIR.ops.len - currentBlockStart
+    let hdrBlockIdx = bodyIR.blocks.len
+    let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, cbrBlockCount, cbrIdx)
+    currentBlockStart = bodyIR.ops.len
+    pendingFalseTerm = cbrIdx
+    return forBodyEnd
+
 fn PrimaryBuildBodyIrFromTypedStatements(
     typedIr: texpr.TypedExprIr,
     typedFnIndex: int32,
@@ -2707,7 +2775,8 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 bodyIR.terms[pendingFalseTerm].falseBlock = bodyIR.blocks.len
                 pendingFalseTerm = -1
         elif stmt.kind == texpr.TypedExprIrStmtFor:
-            nextOpIndex = nextOpIndex + 1
+            let forBodyEnd = PrimaryBodyIrBuildForRangeLoop(bodyIR, slotNames, nextOpIndex, currentBlockStart, typedIr, stmt, stmtIndex, stmtEnd, pendingFalseTerm)
+            skipStatementUntilIndex = forBodyEnd
     if bodyIR.ops.len > currentBlockStart:
         if bodyIR.blocks.len <= 0:
             var fallbackTerm: coreir.BodyTerm
@@ -2751,30 +2820,37 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                         bodyIR.terms[ti].falseBlock = ti + 1
                     else:
                         bodyIR.terms[ti].falseBlock = ti
-    if bodyIR.blocks.len <= 0 && typedFn.returnType != "" &&
-       typedFn.returnType != "void":
-        var returnTypeKind: int32
-        returnTypeKind = coreir.LocalInvalidTag
-        var returnTypeSize: int32
-        var returnTypeAlign: int32
-        PrimaryBodyIrTypeShapeFromText(typedIr,
-                                       typedFn.sourcePath,
-                                       typedFn.returnType,
-                                       returnTypeKind,
-                                       returnTypeSize,
-                                       returnTypeAlign)
-        let returnSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
-                                                            slotNames,
-                                                            typedIr,
-                                                            typedFn.sourcePath,
-                                                            "__unsupported_return",
-                                                            typedFn.returnType)
-        PrimaryBodyIrAppendReturnTerm(bodyIR,
-                                      currentBlockStart,
-                                      returnSlot,
-                                      returnTypeKind,
-                                      0,
-                                      false)
+    if bodyIR.blocks.len <= 0:
+        if typedFn.returnType != "" && typedFn.returnType != "void":
+            var returnTypeKind: int32
+            returnTypeKind = coreir.LocalInvalidTag
+            var returnTypeSize: int32
+            var returnTypeAlign: int32
+            PrimaryBodyIrTypeShapeFromText(typedIr,
+                                           typedFn.sourcePath,
+                                           typedFn.returnType,
+                                           returnTypeKind,
+                                           returnTypeSize,
+                                           returnTypeAlign)
+            let returnSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                                slotNames,
+                                                                typedIr,
+                                                                typedFn.sourcePath,
+                                                                "__unsupported_return",
+                                                                typedFn.returnType)
+            PrimaryBodyIrAppendReturnTerm(bodyIR,
+                                          currentBlockStart,
+                                          returnSlot,
+                                          returnTypeKind,
+                                          0,
+                                          false)
+        else:
+            PrimaryBodyIrAppendReturnTerm(bodyIR,
+                                          currentBlockStart,
+                                          -1,
+                                          coreir.LocalInvalidTag,
+                                          0,
+                                          false)
     return bodyIR
 
 
