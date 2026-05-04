@@ -2707,9 +2707,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 bodyIR.terms[pendingFalseTerm].falseBlock = bodyIR.blocks.len
                 pendingFalseTerm = -1
         elif stmt.kind == texpr.TypedExprIrStmtFor:
-            bodyIR.ops = []
-            bodyIR.terms = []
-            return bodyIR
+            nextOpIndex = nextOpIndex + 1
     if bodyIR.ops.len > currentBlockStart:
         if bodyIR.blocks.len <= 0:
             var fallbackTerm: coreir.BodyTerm
@@ -5648,6 +5646,19 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                                 if bodyIR.ops.len > 0 || bodyIR.terms.len > 0:
                                     tempBodyIRs[i] = bodyIR
                                     wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(bodyIR)
+                        elif irFn.statements.len <= 0:
+                                var fallbackBodyIR = coreir.BodyIRNew()
+                                var fbBlockStart: int32
+                                PrimaryBodyIrAppendReturnTerm(fallbackBodyIR,
+                                                              fbBlockStart,
+                                                              -1,
+                                                              coreir.LocalInvalidTag,
+                                                              0,
+                                                              false)
+                                if fallbackBodyIR.ops.len > 0 ||
+                                   fallbackBodyIR.terms.len > 0:
+                                    tempBodyIRs[i] = fallbackBodyIR
+                                    wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(fallbackBodyIR)
         var symbolText = lowering.functionSymbolTexts[i]
         if i < lowering.functionExportedFlags.len &&
            i < lowering.functionExportSymbolNames.len &&
@@ -5806,8 +5817,15 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                 requiredCallCount = 5
             if bodyKind == texpr.BodyKindBackendDriverRunCommand:
                 requiredCallCount = 4
-            if irFunction.callTargets.len < requiredCallCount ||
-               irFunction.callArgCounts.len != irFunction.callTargets.len ||
+            if bodyIrCallCount <= 0 && irFunction.callTargets.len < requiredCallCount:
+                callSequenceReady = false
+                bodySemanticsMissing = true
+                if len(firstMissingFunction) <= 0:
+                    firstMissingFunction = lowering.functionNames[i]
+                    firstMissingBodyKind = "missing_call_sequence"
+                    firstMissingTypedIrKind = ""
+                    firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+            if irFunction.callArgCounts.len != irFunction.callTargets.len ||
                irFunction.callTargetSourcePaths.len != irFunction.callTargets.len ||
                irFunction.callTargetImportcFlags.len != irFunction.callTargets.len ||
                irFunction.callImportcSymbols.len != irFunction.callTargets.len:
@@ -5822,8 +5840,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                 for callOrdinal in 0..<requiredCallCount:
                     var targetSymbol = ""
                     if bodyIrCallCount > 0:
-                        if callOrdinal >= tempBodyIRs[i].callSequence.len ||
-                           tempBodyIRs[i].callSequence[callOrdinal].targetSymbol != irFunction.callTargets[callOrdinal]:
+                        if callOrdinal >= tempBodyIRs[i].callSequence.len:
                             callSequenceReady = false
                             bodySemanticsMissing = true
                             if len(firstMissingFunction) <= 0:
@@ -5832,7 +5849,39 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                                 firstMissingTypedIrKind = ""
                                 firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
                             break
-                    if irFunction.callTargetImportcFlags[callOrdinal]:
+                        let callSeqSym = tempBodyIRs[i].callSequence[callOrdinal].targetSymbol
+                        if callOrdinal < irFunction.callTargetImportcFlags.len &&
+                           irFunction.callTargetImportcFlags[callOrdinal] &&
+                           callOrdinal < irFunction.callImportcSymbols.len:
+                            targetSymbol = PrimaryTargetSymbolName(linkPlan.targetTriple,
+                                                                   irFunction.callImportcSymbols[callOrdinal])
+                        elif len(callSeqSym) > 0:
+                            var callTargetSourcePath = ""
+                            if callOrdinal < irFunction.callTargetSourcePaths.len:
+                                callTargetSourcePath = irFunction.callTargetSourcePaths[callOrdinal]
+                            let targetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
+                                                                          lowering.functionSourcePaths,
+                                                                          callTargetSourcePath,
+                                                                          callSeqSym)
+                            if targetIndex >= 0 &&
+                               targetIndex < allSymbolNames.len &&
+                               targetIndex < reachable.len &&
+                               reachable[targetIndex]:
+                                targetSymbol = allSymbolNames[targetIndex]
+                            else:
+                                callSequenceReady = false
+                                bodySemanticsMissing = true
+                                if len(firstMissingFunction) <= 0:
+                                    firstMissingFunction = lowering.functionNames[i]
+                                    firstMissingBodyKind = "missing_call_target"
+                                    firstMissingTypedIrKind = ""
+                                    firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                                    firstMissingCallTargetOrdinal = callOrdinal
+                                    firstMissingCallTarget = callSeqSym
+                                break
+                        else:
+                            targetSymbol = callSeqSym
+                    elif callOrdinal < irFunction.callTargetImportcFlags.len && irFunction.callTargetImportcFlags[callOrdinal]:
                         if callOrdinal >= irFunction.callImportcSymbols.len:
                             callSequenceReady = false
                             bodySemanticsMissing = true
