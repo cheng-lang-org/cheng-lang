@@ -1463,9 +1463,73 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                 slotId = PrimaryBodyIrI32ValueSlotForText(bodyIR, slotNames, varI32ParamNames, argName)
             elif slotId < 0:
                 if PrimaryBodyIrTextHasCallSurface(argName):
-                    failureDetail0 = 41
-                    failureDetail1 = argIndex
-                    return false
+                    var binOpPos: int32
+                    binOpPos = -1
+                    for bi in 0..<len(argName):
+                        if argName[bi] == '/':
+                            binOpPos = bi
+                            break
+                    if binOpPos < 0:
+                        for bi in 0..<len(argName):
+                            if argName[bi] == '+':
+                                binOpPos = bi
+                                break
+                    if binOpPos < 0:
+                        for bi in 0..<len(argName):
+                            if argName[bi] == '-':
+                                binOpPos = bi
+                                break
+                    if binOpPos > 0 && binOpPos + 1 < len(argName):
+                        let binLeftRaw = strings.SliceBytes(argName, 0, binOpPos)
+                        let binLeftText = strutil.Strip(binLeftRaw)
+                        let binRightRaw = strings.SliceBytes(argName,
+                                                              binOpPos + 1,
+                                                              len(argName) - binOpPos - 1)
+                        let binRightText = strutil.Strip(binRightRaw)
+                        if binLeftText != "" && binRightText != "":
+                            let lhsSlot: int32 = PrimaryBodyIrFindArgSlot(slotNames,
+                                                                          binLeftText)
+                            let rhsSlot: int32 = PrimaryBodyIrFindArgSlot(slotNames,
+                                                                          binRightText)
+                            if lhsSlot >= 0 && rhsSlot >= 0:
+                                var binOpKind: int32
+                                binOpKind = 0
+                                if argName[binOpPos] == '/':
+                                    binOpKind = int32(texpr.TypedExprIrOpI32Sdiv)
+                                elif argName[binOpPos] == '+':
+                                    binOpKind = int32(texpr.TypedExprIrOpI32Add)
+                                elif argName[binOpPos] == '-':
+                                    binOpKind = int32(texpr.TypedExprIrOpI32Sub)
+                                if binOpKind != 0:
+                                    var binTypeKind: int32
+                                    binTypeKind = bodyIR.localSlots[lhsSlot].typeKind
+                                    let rhsTypeKind2 = bodyIR.localSlots[rhsSlot].typeKind
+                                    if binTypeKind != rhsTypeKind2:
+                                        if binTypeKind == coreir.LocalI32Tag && rhsTypeKind2 == coreir.LocalI64Tag:
+                                            binTypeKind = coreir.LocalI64Tag
+                                        elif binTypeKind == coreir.LocalI64Tag && rhsTypeKind2 == coreir.LocalI32Tag:
+                                            binTypeKind = coreir.LocalI64Tag
+                                    var binResultTag: int32
+                                    binResultTag = coreir.LocalI32Tag
+                                    if binTypeKind == coreir.LocalI64Tag:
+                                        binResultTag = coreir.LocalI64Tag
+                                    slotId = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                                           slotNames,
+                                                                           argName,
+                                                                           binResultTag)
+                                    if slotId >= 0:
+                                        var binOp: coreir.BodyOp
+                                        binOp.kind = coreir.BodyOpBinOpTag
+                                        binOp.target = slotId
+                                        add(binOp.operands, binTypeKind)
+                                        add(binOp.operands, binOpKind)
+                                        add(binOp.operands, lhsSlot)
+                                        add(binOp.operands, rhsSlot)
+                                        add(bodyIR.ops, binOp)
+                    if slotId < 0:
+                        failureDetail0 = 41
+                        failureDetail1 = argIndex
+                        return false
                 else:
                     slotId = PrimaryBodyIrScalarValueSlotForText(bodyIR,
                                                                  slotNames,
@@ -2214,7 +2278,8 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                     if callStmt.kind != texpr.TypedExprIrStmtCall &&
                        callStmt.kind != texpr.TypedExprIrStmtLetCall:
                         continue
-                    if len(callStmt.callTarget) <= 0:
+                    if len(callStmt.callTarget) <= 0 &&
+                       len(callStmt.surfaceText) <= 0:
                         continue
                     var dependencyName = callStmt.bindingName
                     if len(dependencyName) <= 0:
@@ -3829,6 +3894,9 @@ fn PrimaryBodyIRFillBinOp(words: var int32[],
         pos = pos + 1
     elif opKind == int32(texpr.TypedExprIrOpI32Asr):
         words[pos] = a64.A64EncAsrv(opIs64, a64.A64X9, a64.A64X9, a64.A64X10)
+        pos = pos + 1
+    elif opKind == int32(texpr.TypedExprIrOpI32Sdiv):
+        words[pos] = a64.A64EncSdiv(opIs64, a64.A64X9, a64.A64X9, a64.A64X10)
         pos = pos + 1
     elif opKind == int32(texpr.TypedExprIrOpI32Madd):
         if op.operands.len < 5:

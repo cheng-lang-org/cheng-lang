@@ -96,6 +96,8 @@ type
         TypedExprIrOpU64Arg0AndConst4NotZero
         TypedExprIrOpI32Arg0GeZeroAndLeConst
         TypedExprIrOpI32Arg0XorConst
+        TypedExprIrOpI32Sdiv
+        TypedExprIrOpI64Sdiv
         TypedExprIrOpU32Arg0AndArg1ShlArg2
         TypedExprIrOpU64OrArg0Const4
         TypedExprIrOpI32IfArg0LeZeroConstElseConst
@@ -9052,6 +9054,16 @@ fn TypedExprIrPopulateAssignValueMeta(stmt: var TypedExprIrStatement,
             if TypedExprIrIsI32ConstLiteral(rhsText):
                 stmt.assignValueRhsConst = TypedExprIrParseI32Const(rhsText)
                 stmt.assignValueRhsHasConst = true
+    let divPos = TypedExprFindTopLevelTextToken(valueRaw, "/")
+    if stmt.assignValueOpKind == TypedExprIrOpUnsupported && divPos >= 0:
+        let lhsText = chengpath.PathTrim(chengpath.TextSlice(valueRaw, 0, divPos))
+        let rhsText = chengpath.PathTrim(chengpath.TextSlice(valueRaw,
+                                                             divPos + 1,
+                                                             valueRaw.len - divPos - 1))
+        if lhsText != "" && rhsText != "":
+            stmt.assignValueOpKind = TypedExprIrOpI32Sdiv
+            stmt.assignValueLhsText = lhsText
+            stmt.assignValueRhsText = rhsText
     if !TypedExprTextIsSimpleFieldPath(valueRaw):
         return
     let rootName = TypedExprAssignLhsRootName(valueRaw)
@@ -9385,11 +9397,48 @@ fn TypedExprIrAddCallStatementFromExpr(ir: var TypedExprIr,
             callReturnType = TypedExprLookupCallTargetReturnTypeFromExpr(ctx, sourceContexts, expr)
         if callReturnType != "":
             stmt.resultType = callReturnType
+    stmt.callArgsText = TypedExprDecomposeCallArgText(ir, stmt)
     stmt.loweringMode = TypedExprLowerDeferred
     stmt.returnKind = TypedExprReturnDeferred
     stmt.returnRoot = returnRoot
     add(ir.statements, stmt)
     return stmt.statementIndex
+
+fn TypedExprDecomposeCallArgText(ir: var TypedExprIr,
+                                  stmt: var TypedExprIrStatement): str =
+    let argsText = stmt.callArgsText
+    if argsText == "":
+        return argsText
+    var result = argsText
+    var startIdx = ir.statements.len - 1
+    while startIdx >= 0:
+        if ir.statements[startIdx].lineNumber < stmt.lineNumber:
+            break
+        startIdx = startIdx - 1
+    var checkIdx = startIdx + 1
+    while checkIdx >= 0 && checkIdx < ir.statements.len:
+        let prevStmt = ir.statements[checkIdx]
+        if prevStmt.lineNumber != stmt.lineNumber:
+            break
+        var refText = prevStmt.bindingName
+        if len(refText) <= 0:
+            refText = prevStmt.surfaceText
+        if len(refText) <= 0:
+            checkIdx = checkIdx + 1
+            continue
+        if !strutil.Contains(result, refText):
+            checkIdx = checkIdx + 1
+            continue
+        var sourceText = prevStmt.surfaceText
+        if len(sourceText) <= 0:
+            sourceText = prevStmt.callArgsText
+        if len(sourceText) <= 0:
+            sourceText = prevStmt.callTarget
+        if len(sourceText) > 0 && sourceText != refText:
+            if strutil.Contains(result, sourceText):
+                result = strutil.Replace(result, sourceText, refText)
+        checkIdx = checkIdx + 1
+    return result
 
 fn TypedExprIrAppendStatementsForScopeFromExprLayer(ir: var TypedExprIr,
                                                      ctx: var TypedExprSourceContext,
