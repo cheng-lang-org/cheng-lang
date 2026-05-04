@@ -5504,6 +5504,10 @@ fn TypedExprTypeLayoutImpl(currentCtx: var TypedExprSourceContext,
         sizeBytes = 4
         alignBytes = 4
         return true
+    if typeText == "CompilerEmit" || typeText == "creq.CompilerEmit" || typeText == "compiler_request.CompilerEmit":
+        sizeBytes = 4
+        alignBytes = 4
+        return true
     if typeText == "int64" || typeText == "uint64" ||
        typeText == "u64" || typeText == "float32" ||
        typeText == "float64":
@@ -5585,11 +5589,14 @@ fn TypedExprTypeLayoutImpl(currentCtx: var TypedExprSourceContext,
     if ctxIndex >= 0:
         ownerCtx = sourceContexts[ctxIndex]
     elif ctxIndex != -2:
-        if TypedExprSourceHasDeclaredType(currentCtx, TypedExprTypeLeafName(typeText)):
+        if declaredIndex >= 0:
+            ownerCtx = sourceContexts[declaredIndex]
+        elif TypedExprSourceHasDeclaredType(currentCtx, TypedExprTypeLeafName(typeText)):
             sizeBytes = 4
             alignBytes = 4
             return true
-        return false
+        else:
+            return false
     if !TypedExprContextHasTypeField(ownerCtx, typeText):
         if TypedExprSourceHasDeclaredType(ownerCtx, TypedExprTypeLeafName(typeText)):
             sizeBytes = 4
@@ -5715,10 +5722,56 @@ fn TypedExprIrLookupTypeAliasTargetSourcePath(ir: TypedExprIr,
     for i in 0..<ir.typeAliasSourcePaths.len:
         if i >= ir.typeAliasQualifiers.len || i >= ir.typeAliasTargetSourcePaths.len:
             continue
-        if parser.ParserNormalizePath(ir.typeAliasSourcePaths[i]) == sourcePath &&
+        if (parser.ParserNormalizePath(ir.typeAliasSourcePaths[i]) == sourcePath ||
+            TypedExprPathNormalizedEquals(ir.typeAliasSourcePaths[i], sourcePathRaw)) &&
            ir.typeAliasQualifiers[i] == qualifier:
             return parser.ParserNormalizePath(ir.typeAliasTargetSourcePaths[i])
     return ""
+
+fn TypedExprPathTrimStart(text: str): int32 =
+    var start: int32
+    while start < text.len:
+        let code = Int32(text[start])
+        if code != 32 && code != 9 && code != 10 && code != 13:
+            break
+        start = start + 1
+    return start
+
+fn TypedExprPathTrimStop(text: str,
+                          start: int32): int32 =
+    var stop = text.len
+    while stop > start:
+        let code = Int32(text[stop - 1])
+        if code != 32 && code != 9 && code != 10 && code != 13:
+            break
+        stop = stop - 1
+    return stop
+
+fn TypedExprPathNormalizedStop(text: str,
+                                start: int32,
+                                stopRaw: int32): int32 =
+    var stop = stopRaw
+    while stop > start + 1:
+        let last = text[stop - 1]
+        if last != '/' && last != '\\':
+            break
+        stop = stop - 1
+    return stop
+
+fn TypedExprPathNormalizedEquals(left: str,
+                                  right: str): bool =
+    let leftStart = TypedExprPathTrimStart(left)
+    let rightStart = TypedExprPathTrimStart(right)
+    let leftStop = TypedExprPathNormalizedStop(left, leftStart, TypedExprPathTrimStop(left, leftStart))
+    let rightStop = TypedExprPathNormalizedStop(right, rightStart, TypedExprPathTrimStop(right, rightStart))
+    let leftLen = leftStop - leftStart
+    let rightLen = rightStop - rightStart
+    if leftLen != rightLen:
+        return false
+    for i in 0..<leftLen:
+        if left[leftStart + i] != right[rightStart + i]:
+            return false
+    return true
 
 fn TypedExprIrAppendTypeAliasesFromFacts(ir: var TypedExprIr,
                                           facts: var TypedExprFact[]) =
@@ -6109,7 +6162,8 @@ fn TypedExprIrLookupSingleFieldMeta(ir: TypedExprIr,
            i >= ir.typeFieldSizeBytes.len ||
            i >= ir.typeFieldAlignBytes.len:
             continue
-        if parser.ParserNormalizePath(ir.typeFieldSourcePaths[i]) != sourcePath:
+        if parser.ParserNormalizePath(ir.typeFieldSourcePaths[i]) != sourcePath &&
+           !TypedExprPathNormalizedEquals(ir.typeFieldSourcePaths[i], sourcePathRaw):
             continue
         if ir.typeFieldOwnerTypes[i] != ownerType:
             continue
@@ -6138,7 +6192,8 @@ fn TypedExprIrLookupSingleFieldMeta(ir: TypedExprIr,
                    i >= ir.typeFieldSizeBytes.len ||
                    i >= ir.typeFieldAlignBytes.len:
                     continue
-                if parser.ParserNormalizePath(ir.typeFieldSourcePaths[i]) != targetSourcePath:
+                if parser.ParserNormalizePath(ir.typeFieldSourcePaths[i]) != targetSourcePath &&
+                   !TypedExprPathNormalizedEquals(ir.typeFieldSourcePaths[i], targetSourcePath):
                     continue
                 if ir.typeFieldOwnerTypes[i] != ownerLeaf:
                     continue
