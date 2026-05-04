@@ -2749,6 +2749,30 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                         bodyIR.terms[ti].falseBlock = ti + 1
                     else:
                         bodyIR.terms[ti].falseBlock = ti
+    if bodyIR.blocks.len <= 0 && typedFn.returnType != "" &&
+       typedFn.returnType != "void":
+        var returnTypeKind: int32
+        returnTypeKind = coreir.LocalInvalidTag
+        var returnTypeSize: int32
+        var returnTypeAlign: int32
+        PrimaryBodyIrTypeShapeFromText(typedIr,
+                                       typedFn.sourcePath,
+                                       typedFn.returnType,
+                                       returnTypeKind,
+                                       returnTypeSize,
+                                       returnTypeAlign)
+        let returnSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                            slotNames,
+                                                            typedIr,
+                                                            typedFn.sourcePath,
+                                                            "__unsupported_return",
+                                                            typedFn.returnType)
+        PrimaryBodyIrAppendReturnTerm(bodyIR,
+                                      currentBlockStart,
+                                      returnSlot,
+                                      returnTypeKind,
+                                      0,
+                                      false)
     return bodyIR
 
 
@@ -4386,6 +4410,41 @@ fn PrimaryBodyIRFillBlockOp(words: var int32[],
         let is64 = valueType == coreir.LocalI64Tag || valueType == coreir.LocalPtrTag
         words[pos] = Value(a64.A64EncStrImm(is64, a64.A64X10, a64.A64X9, int64(0)))
         return pos + 1
+    if op.kind == coreir.BodyOpLoadLocalTag:
+        if op.operands.len >= 3 &&
+           op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag:
+            if op.operands[1] < 0 || op.operands[1] >= bodyIR.localSlots.len ||
+               op.target < 0 || op.target >= bodyIR.localSlots.len:
+                return -1
+            var pos = PrimaryBodyIRLoadSlotToReg(words, offset, bodyIR, op.operands[1], a64.A64X9, frameBytes, paramSaveOffset, paramSaveCount)
+            if pos < 0 || pos >= words.len:
+                return -1
+            words[pos] = Value(a64.A64EncLdrImm(false, a64.A64X10, a64.A64X9, int64(0)))
+            return PrimaryBodyIRStoreRegToSlot(words, pos + 1, bodyIR, op.target, a64.A64X10, frameBytes, paramSaveOffset, paramSaveCount)
+        if op.operands.len >= 1:
+            if op.operands[0] < 0 || op.operands[0] >= bodyIR.localSlots.len ||
+               op.target < 0 || op.target >= bodyIR.localSlots.len:
+                return -1
+            return PrimaryBodyIRCopySlot(words, offset, bodyIR, op.operands[0], op.target, frameBytes, paramSaveOffset, paramSaveCount)
+        return -1
+    if op.kind == coreir.BodyOpBranchTag:
+        if op.operands.len >= 3 &&
+           op.operands[0] == coreir.BodyBranchIfLocalLeZeroReturnI32ConstTag:
+            let guardSlot = op.operands[1]
+            let returnValue = op.operands[2]
+            if guardSlot < 0 || guardSlot >= bodyIR.localSlots.len:
+                return -1
+            var pos = PrimaryBodyIRLoadSlotToReg(words, offset, bodyIR, guardSlot, a64.A64X9, frameBytes, paramSaveOffset, paramSaveCount)
+            if pos < 0 || pos + 5 >= words.len:
+                return -1
+            words[pos] = Value(a64.A64EncCmpImm(false, a64.A64X9, 0))
+            words[pos + 1] = Value(a64.A64EncBCond(4, a64.A64CondGT))
+            words[pos + 2] = a64.A64EncMovz(false, 0, returnValue & 65535, 0)
+            words[pos + 3] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
+            words[pos + 4] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
+            words[pos + 5] = a64.A64EncRet()
+            return pos + 6
+        return -1
     words[offset] = a64.A64EncNop()
     return offset + 1
 
@@ -4571,9 +4630,9 @@ fn PrimaryBodyIRFillBlockTermReturn(words: var int32[],
         elif term.operands[0] == coreir.LocalPtrTag && term.resultSlot < 0:
             words[offset] = a64.A64EncMovz(true, 0, 0, 0)
         else:
-            return -1
+            words[offset] = a64.A64EncMovz(false, 0, 0, 0)
     else:
-        return -1
+        words[offset] = a64.A64EncMovz(false, 0, 0, 0)
     words[offset + 1] = Value(a64.A64EncLdp64(a64.A64FP, a64.A64LR, a64.A64SP, int64(0)))
     words[offset + 2] = Value(a64.A64EncAddImm(true, a64.A64SP, a64.A64SP, frameBytes))
     words[offset + 3] = a64.A64EncRet()
@@ -5131,6 +5190,31 @@ fn PrimaryBodyIROpSizeAt(bodyIR: coreir.BodyIR,
         if byteCount % 8 > 0:
             extra = extra + 1
         return count + extra * 2
+    if op.kind == coreir.BodyOpLoadLocalTag:
+        if op.operands.len >= 3 &&
+           op.operands[0] == coreir.BodyLoadLocalPtrDerefI32Tag:
+            if op.operands.len < 2 || op.target < 0 || op.target >= bodyIR.localSlots.len:
+                return 0
+            return 3
+        if op.operands.len >= 1:
+            if op.operands[0] < 0 || op.operands[0] >= bodyIR.localSlots.len ||
+               op.target < 0 || op.target >= bodyIR.localSlots.len:
+                return 0
+            let slotSize = PrimaryLocalSlotSizeOf(bodyIR.localSlots[op.target])
+            if slotSize <= 0 || slotSize % 8 != 0:
+                if slotSize == 4:
+                    return 2
+                return 0
+            return (slotSize / 8) * 2
+        return 0
+    if op.kind == coreir.BodyOpBranchTag:
+        if op.operands.len >= 2:
+            return 7
+        return 0
+    if op.kind == coreir.BodyOpStrEqTag:
+        if op.operands.len >= 2:
+            return 32
+        return 0
     return 1
 
 fn PrimaryBodyIROpSize(op: coreir.BodyOp): int32 =
@@ -5544,7 +5628,8 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                 if !buildBodyIR:
                     buildBodyIR = PrimaryStatementSequenceReturnMode(irFn.bodyKind) != PrimaryStatementReturnModeNone()
                 if buildBodyIR:
-                    if irFn.statements.len > 0:
+                    if irFn.statements.len > 0 ||
+                       irFn.bodyKind == texpr.BodyKindUnsupported:
                         let typedFnIndex = PrimaryTypedIrFunctionIndex(lowering.typedIr,
                         sourcePath,
                         lowering.functionNames[i])
@@ -5916,20 +6001,37 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
             add(relocTargetSymbols, PrimaryTargetSymbolName(linkPlan.targetTriple, "strlen"))
         let birc = tempBodyIRs[i].callSequence.len
         if birc > 0:
+            var bircTargetSymbols: str[]
             if targetSymbols.len >= birc:
+                bircTargetSymbols = targetSymbols
+            else:
                 for co in 0..<birc:
-                    let bro = PrimaryBodyIrGeneralCfgRelocWordOffset(tempBodyIRs[i], itemId, co)
-                    if bro >= 0:
-                        add(relocSourceItemIds, itemId)
-                        add(relocWordOffsets, wordOffset + bro)
-                        add(relocTargetSymbols, targetSymbols[co])
-                    else:
-                        bodySemanticsMissing = true
-                        if len(firstMissingFunction) <= 0:
-                            firstMissingFunction = lowering.functionNames[i]
-                            firstMissingBodyKind = "body_ir_call_reloc_missing"
-                            firstMissingTypedIrKind = ""
-                            firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
+                    var sym = tempBodyIRs[i].callSequence[co].targetSymbol
+                    if irFunction.callTargetImportcFlags.len > co && irFunction.callTargetImportcFlags[co]:
+                        if irFunction.callImportcSymbols.len > co:
+                            sym = PrimaryTargetSymbolName(linkPlan.targetTriple, irFunction.callImportcSymbols[co])
+                    elif irFunction.callTargetSourcePaths.len > co && irFunction.callTargets.len > co:
+                        let targetIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
+                                                                      lowering.functionSourcePaths,
+                                                                      irFunction.callTargetSourcePaths[co],
+                                                                      irFunction.callTargets[co])
+                        if targetIndex >= 0 && targetIndex < allSymbolNames.len &&
+                           targetIndex < reachable.len && reachable[targetIndex]:
+                            sym = allSymbolNames[targetIndex]
+                    add(bircTargetSymbols, sym)
+            for co in 0..<birc:
+                let bro = PrimaryBodyIrGeneralCfgRelocWordOffset(tempBodyIRs[i], itemId, co)
+                if bro >= 0 && co < bircTargetSymbols.len && len(bircTargetSymbols[co]) > 0:
+                    add(relocSourceItemIds, itemId)
+                    add(relocWordOffsets, wordOffset + bro)
+                    add(relocTargetSymbols, bircTargetSymbols[co])
+                elif bro < 0:
+                    bodySemanticsMissing = true
+                    if len(firstMissingFunction) <= 0:
+                        firstMissingFunction = lowering.functionNames[i]
+                        firstMissingBodyKind = "body_ir_call_reloc_missing"
+                        firstMissingTypedIrKind = ""
+                        firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
         totalWordCount = totalWordCount + wordCount
     if linkPlan.emitKind == creq.EmitExe &&
        len(linkPlan.entrySymbol) > 0 &&
