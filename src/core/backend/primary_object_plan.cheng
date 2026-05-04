@@ -2021,40 +2021,46 @@ fn PrimaryBodyIrBuildForRangeLoop(bodyIR: var coreir.BodyIR,
                                     stmtIndex: int32,
                                     stmtEnd: int32,
                                     pendingFalseTerm: var int32): int32 =
-    let header = strutil.Strip(stmt.surfaceText)
+    let headerText = strutil.Strip(stmt.surfaceText)
     var forBodyEnd = stmtEnd
-    var scanIdx = stmtIndex + 1
-    while scanIdx < stmtEnd:
-        let s = typedIr.statements[scanIdx]
-        if s.lineIndent > 0 && s.lineIndent <= stmt.lineIndent:
-            forBodyEnd = scanIdx
+    for si in stmtIndex + 1..<stmtEnd:
+        let scanStmt = typedIr.statements[si]
+        if scanStmt.lineIndent > 0 && scanStmt.lineIndent <= stmt.lineIndent:
+            forBodyEnd = si
             break
-        scanIdx = scanIdx + 1
-    var rangeText = header
-    var inAt = -1
-    var ci = 0
-    while ci < len(rangeText) - 3:
-        if rangeText[ci] == ' ' && rangeText[ci + 1] == 'i' && rangeText[ci + 2] == 'n' && rangeText[ci + 3] == ' ':
-            inAt = ci
+    var inPos = -1
+    var endCheckN = len(headerText) - 3
+    for ci in 0..<endCheckN:
+        if headerText[ci] == ' ' && headerText[ci + 1] == 'i' && headerText[ci + 2] == 'n' && headerText[ci + 3] == ' ':
+            inPos = ci
             break
-        ci = ci + 1
-    if inAt > 0:
-        rangeText = chengpath.TextSlice(rangeText, inAt + 4, len(rangeText) - inAt - 4)
-        if len(rangeText) > 0 && rangeText[len(rangeText) - 1] == ':':
-            rangeText = chengpath.TextSlice(rangeText, 0, len(rangeText) - 1)
+    var rangeText = headerText
+    if inPos > 0:
+        var afterIn = inPos + 4
+        var rangeLen = len(headerText) - afterIn
+        rangeText = strings.SliceBytes(headerText, afterIn, rangeLen)
+        var rLen = len(rangeText)
+        if rLen > 0:
+            var lastCh = rangeText[rLen - 1]
+            if lastCh == ':':
+                rangeText = strings.SliceBytes(rangeText, 0, rLen - 1)
         rangeText = strutil.Strip(rangeText)
     var rangeStart: int32
     var rangeEnd = rangeText
-    var exclAt = -1
-    ci = 0
-    while ci < len(rangeText) - 2:
+    var exclPos = -1
+    var exclCheckN = len(rangeText) - 2
+    for ci in 0..<exclCheckN:
         if rangeText[ci] == '.' && rangeText[ci + 1] == '.' && rangeText[ci + 2] == '<':
-            exclAt = ci
+            exclPos = ci
             break
-        ci = ci + 1
-    if exclAt > 0:
-        rangeStart = PrimaryBodyIrExtractIntFromText(strutil.Strip(chengpath.TextSlice(rangeText, 0, exclAt)))
-        rangeEnd = strutil.Strip(chengpath.TextSlice(rangeText, exclAt + 3, len(rangeText) - exclAt - 3))
+    if exclPos > 0:
+        var startText = strings.SliceBytes(rangeText, 0, exclPos)
+        var stripped = strutil.Strip(startText)
+        rangeStart = PrimaryBodyIrExtractIntFromText(stripped)
+        var afterExcl = exclPos + 3
+        var endLen = len(rangeText) - afterExcl
+        rangeEnd = strings.SliceBytes(rangeText, afterExcl, endLen)
+        rangeEnd = strutil.Strip(rangeEnd)
     let idxSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, stmt.bindingName, coreir.LocalI32Tag)
     var initOp: coreir.BodyOp
     initOp.kind = coreir.BodyOpLoadConstTag
@@ -2073,9 +2079,8 @@ fn PrimaryBodyIrBuildForRangeLoop(bodyIR: var coreir.BodyIR,
     cbrTerm.trueBlock = -1
     cbrTerm.falseBlock = -1
     let cbrIdx = coreir.BodyIRAppendTerm(bodyIR, cbrTerm)
-    let cbrBlockCount = bodyIR.ops.len - currentBlockStart
-    let hdrBlockIdx = bodyIR.blocks.len
-    let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, cbrBlockCount, cbrIdx)
+    let blockCount = bodyIR.ops.len - currentBlockStart
+    let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, blockCount, cbrIdx)
     currentBlockStart = bodyIR.ops.len
     pendingFalseTerm = cbrIdx
     return forBodyEnd
@@ -2097,12 +2102,54 @@ fn PrimaryBuildBodyIrFromTypedStatements(
     var pendingFalseTerm: int32
     var skipStatementUntilIndex: int32
     var completedReturnLineNumber: int32
+    var pendingForEndIdx: int32
+    var pendingForIdxSlot: int32
+    var pendingForHdrBlk: int32
     pendingFalseTerm = -1
     skipStatementUntilIndex = -1
     completedReturnLineNumber = -1
+    pendingForEndIdx = -1
+    pendingForIdxSlot = -1
+    pendingForHdrBlk = -1
     PrimaryBodyIrSeedParamSlots(bodyIR, slotNames, typedIr, irFunction)
     let varI32ParamNames = PrimaryBodyIrCollectVarI32ParamNames(irFunction)
     for stmtIndex in typedFn.statementStart..<stmtEnd:
+        if pendingForEndIdx > 0 && stmtIndex >= pendingForEndIdx:
+            var oneSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, "_for_one", coreir.LocalI32Tag)
+            var oneInit: coreir.BodyOp
+            oneInit.kind = coreir.BodyOpLoadConstTag
+            oneInit.target = oneSlot
+            add(oneInit.operands, coreir.LocalI32Tag)
+            add(oneInit.operands, 1)
+            add(bodyIR.ops, oneInit)
+            nextOpIndex = nextOpIndex + 1
+            var incOp: coreir.BodyOp
+            incOp.kind = coreir.BodyOpBinOpTag
+            incOp.target = pendingForIdxSlot
+            add(incOp.operands, coreir.LocalI32Tag)
+            add(incOp.operands, int32(texpr.TypedExprIrOpI32Add))
+            add(incOp.operands, pendingForIdxSlot)
+            add(incOp.operands, oneSlot)
+            add(bodyIR.ops, incOp)
+            nextOpIndex = nextOpIndex + 1
+            var brTerm: coreir.BodyTerm
+            brTerm.kind = coreir.BodyTermBrTag
+            brTerm.trueBlock = pendingForHdrBlk
+            brTerm.falseBlock = -1
+            brTerm.conditionKind = coreir.BodyCondInvalidTag
+            brTerm.lhsSlot = -1
+            brTerm.rhsSlot = -1
+            brTerm.resultSlot = -1
+            let brIdx = coreir.BodyIRAppendTerm(bodyIR, brTerm)
+            let backBlockCount = bodyIR.ops.len - currentBlockStart
+            let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, backBlockCount, brIdx)
+            currentBlockStart = bodyIR.ops.len
+            if pendingFalseTerm >= 0 && pendingFalseTerm < bodyIR.terms.len:
+                bodyIR.terms[pendingFalseTerm].falseBlock = bodyIR.blocks.len
+            pendingForEndIdx = -1
+            pendingForIdxSlot = -1
+            pendingForHdrBlk = -1
+            pendingFalseTerm = -1
         if stmtIndex <= skipStatementUntilIndex:
             continue
         let stmt = typedIr.statements[stmtIndex]
@@ -2776,7 +2823,16 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 pendingFalseTerm = -1
         elif stmt.kind == texpr.TypedExprIrStmtFor:
             let forBodyEnd = PrimaryBodyIrBuildForRangeLoop(bodyIR, slotNames, nextOpIndex, currentBlockStart, typedIr, stmt, stmtIndex, stmtEnd, pendingFalseTerm)
-            skipStatementUntilIndex = forBodyEnd
+            skipStatementUntilIndex = forBodyEnd - 1
+            pendingForEndIdx = forBodyEnd
+            if pendingFalseTerm >= 0 && pendingFalseTerm < bodyIR.terms.len:
+                pendingForIdxSlot = bodyIR.terms[pendingFalseTerm].lhsSlot
+            var bi = bodyIR.blocks.len - 1
+            while bi >= 0:
+                if bodyIR.blocks[bi].termIndex == pendingFalseTerm:
+                    pendingForHdrBlk = bi
+                    break
+                bi = bi - 1
     if bodyIR.ops.len > currentBlockStart:
         if bodyIR.blocks.len <= 0:
             var fallbackTerm: coreir.BodyTerm
@@ -2820,35 +2876,54 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                         bodyIR.terms[ti].falseBlock = ti + 1
                     else:
                         bodyIR.terms[ti].falseBlock = ti
-    if bodyIR.blocks.len <= 0:
-        if typedFn.returnType != "" && typedFn.returnType != "void":
-            var returnTypeKind: int32
-            returnTypeKind = coreir.LocalInvalidTag
-            var returnTypeSize: int32
-            var returnTypeAlign: int32
-            PrimaryBodyIrTypeShapeFromText(typedIr,
-                                           typedFn.sourcePath,
-                                           typedFn.returnType,
-                                           returnTypeKind,
-                                           returnTypeSize,
-                                           returnTypeAlign)
+    if bodyIR.blocks.len <= 0 && typedFn.returnType != "" &&
+       typedFn.returnType != "void":
+        if typedFn.returnType == "bool" || typedFn.returnType == "int32" ||
+           typedFn.returnType == "int" || typedFn.returnType == "uint32":
+            let defaultSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                            slotNames,
+                                                            "__default_return",
+                                                            coreir.LocalI32Tag)
+            var constOp: coreir.BodyOp
+            constOp.kind = coreir.BodyOpLoadConstTag
+            constOp.target = defaultSlot
+            add(constOp.operands, coreir.LocalI32Tag)
+            add(constOp.operands, 0)
+            add(bodyIR.ops, constOp)
+            PrimaryBodyIrAppendReturnTerm(bodyIR,
+                                          currentBlockStart,
+                                          defaultSlot,
+                                          coreir.LocalI32Tag,
+                                          0,
+                                          false)
+        elif typedFn.returnType == "int64" || typedFn.returnType == "uint64":
+            let defaultSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                            slotNames,
+                                                            "__default_return",
+                                                            coreir.LocalI64Tag)
+            var constOp: coreir.BodyOp
+            constOp.kind = coreir.BodyOpLoadConstTag
+            constOp.target = defaultSlot
+            add(constOp.operands, coreir.LocalI64Tag)
+            add(constOp.operands, 0)
+            add(bodyIR.ops, constOp)
+            PrimaryBodyIrAppendReturnTerm(bodyIR,
+                                          currentBlockStart,
+                                          defaultSlot,
+                                          coreir.LocalI64Tag,
+                                          0,
+                                          false)
+        else:
             let returnSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
                                                                 slotNames,
                                                                 typedIr,
                                                                 typedFn.sourcePath,
-                                                                "__unsupported_return",
+                                                                "__default_return",
                                                                 typedFn.returnType)
             PrimaryBodyIrAppendReturnTerm(bodyIR,
                                           currentBlockStart,
                                           returnSlot,
-                                          returnTypeKind,
-                                          0,
-                                          false)
-        else:
-            PrimaryBodyIrAppendReturnTerm(bodyIR,
-                                          currentBlockStart,
-                                          -1,
-                                          coreir.LocalInvalidTag,
+                                          coreir.LocalI32Tag,
                                           0,
                                           false)
     return bodyIR
@@ -5712,6 +5787,13 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                         let typedFnIndex = PrimaryTypedIrFunctionIndex(lowering.typedIr,
                         sourcePath,
                         lowering.functionNames[i])
+                        if typedFnIndex < 0:
+                            bodySemanticsMissing = true
+                            if len(firstMissingFunction) <= 0:
+                                firstMissingFunction = lowering.functionNames[i]
+                                firstMissingBodyKind = "typed_ir_function_index_missing"
+                                firstMissingTypedIrKind = ""
+                                firstMissingLineNumber = 0
                         if typedFnIndex >= 0:
                                 var bodyIR = PrimaryBuildBodyIrFromTypedStatements(lowering.typedIr,
                                 typedFnIndex,
@@ -5722,6 +5804,13 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                                 if bodyIR.ops.len > 0 || bodyIR.terms.len > 0:
                                     tempBodyIRs[i] = bodyIR
                                     wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(bodyIR)
+                                elif irFn.statements.len > 0:
+                                    bodySemanticsMissing = true
+                                    if len(firstMissingFunction) <= 0:
+                                        firstMissingFunction = lowering.functionNames[i]
+                                        firstMissingBodyKind = "body_ir_empty_after_build"
+                                        firstMissingTypedIrKind = ""
+                                        firstMissingLineNumber = PrimaryObjectMissingLineNumber(lowering, irIndex)
                         elif irFn.statements.len <= 0:
                                 var fallbackBodyIR = coreir.BodyIRNew()
                                 var fbBlockStart: int32
