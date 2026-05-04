@@ -361,6 +361,9 @@ type
         typeFieldOffsetBytes: int32[]
         typeFieldSizeBytes: int32[]
         typeFieldAlignBytes: int32[]
+        typeAliasSourcePaths: str[]
+        typeAliasQualifiers: str[]
+        typeAliasTargetSourcePaths: str[]
         enumValueSourcePaths: str[]
         enumValueNames: str[]
         enumValueTypes: str[]
@@ -1038,6 +1041,12 @@ fn TypedExprIrClone(ir: var TypedExprIr): TypedExprIr =
         add(out.typeFieldSizeBytes, ir.typeFieldSizeBytes[i])
     for i in 0..<ir.typeFieldAlignBytes.len:
         add(out.typeFieldAlignBytes, ir.typeFieldAlignBytes[i])
+    for i in 0..<ir.typeAliasSourcePaths.len:
+        add(out.typeAliasSourcePaths, ir.typeAliasSourcePaths[i])
+    for i in 0..<ir.typeAliasQualifiers.len:
+        add(out.typeAliasQualifiers, ir.typeAliasQualifiers[i])
+    for i in 0..<ir.typeAliasTargetSourcePaths.len:
+        add(out.typeAliasTargetSourcePaths, ir.typeAliasTargetSourcePaths[i])
     for i in 0..<ir.enumValueSourcePaths.len:
         add(out.enumValueSourcePaths, ir.enumValueSourcePaths[i])
     for i in 0..<ir.enumValueNames.len:
@@ -5654,6 +5663,40 @@ fn TypedExprIrAppendTypeFieldLayout(ir: var TypedExprIr,
     add(ir.typeFieldSizeBytes, fieldSizeBytes)
     add(ir.typeFieldAlignBytes, fieldAlignBytes)
 
+fn TypedExprIrAppendTypeAlias(ir: var TypedExprIr,
+                               sourcePathRaw: str,
+                               qualifierRaw: str,
+                               targetSourcePathRaw: str) =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let qualifier = parser.ParserIdentPrefix(chengpath.PathTrim(qualifierRaw))
+    let targetSourcePath = parser.ParserNormalizePath(targetSourcePathRaw)
+    if sourcePath == "" || qualifier == "" || targetSourcePath == "":
+        return
+    for i in 0..<ir.typeAliasSourcePaths.len:
+        if i >= ir.typeAliasQualifiers.len || i >= ir.typeAliasTargetSourcePaths.len:
+            continue
+        if parser.ParserNormalizePath(ir.typeAliasSourcePaths[i]) == sourcePath &&
+           ir.typeAliasQualifiers[i] == qualifier:
+            return
+    add(ir.typeAliasSourcePaths, sourcePath)
+    add(ir.typeAliasQualifiers, qualifier)
+    add(ir.typeAliasTargetSourcePaths, targetSourcePath)
+
+fn TypedExprIrLookupTypeAliasTargetSourcePath(ir: TypedExprIr,
+                                               sourcePathRaw: str,
+                                               qualifierRaw: str): str =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let qualifier = parser.ParserIdentPrefix(chengpath.PathTrim(qualifierRaw))
+    if sourcePath == "" || qualifier == "":
+        return ""
+    for i in 0..<ir.typeAliasSourcePaths.len:
+        if i >= ir.typeAliasQualifiers.len || i >= ir.typeAliasTargetSourcePaths.len:
+            continue
+        if parser.ParserNormalizePath(ir.typeAliasSourcePaths[i]) == sourcePath &&
+           ir.typeAliasQualifiers[i] == qualifier:
+            return parser.ParserNormalizePath(ir.typeAliasTargetSourcePaths[i])
+    return ""
+
 fn TypedExprMaybeQualifyImportedFieldType(importedCtx: var TypedExprSourceContext,
                                            qualifier: str,
                                            fieldTypeRaw: str): str =
@@ -5713,6 +5756,7 @@ fn TypedExprIrAppendTypeLayoutsFromContext(ir: var TypedExprIr,
         let targetSourcePath = ctx.importedModules[importIndex].targetSourcePath
         if qualifier == "" || targetSourcePath == "":
             continue
+        TypedExprIrAppendTypeAlias(ir, ctx.sourcePath, qualifier, targetSourcePath)
         let targetIndex = TypedExprSourceContextLookup(sourceContexts, targetSourcePath)
         if targetIndex < 0:
             continue
@@ -6040,42 +6084,35 @@ fn TypedExprIrLookupSingleFieldMeta(ir: TypedExprIr,
         fieldSizeBytes = ir.typeFieldSizeBytes[i]
         fieldAlignBytes = ir.typeFieldAlignBytes[i]
         return fieldType != "" && fieldOffsetBytes >= 0 && fieldSizeBytes > 0 && fieldAlignBytes > 0
-    if TypedExprQualifiedTypeDot(ownerType) > 0:
-        var found = false
-        var foundType = ""
-        var foundOffset: int32
-        var foundSize: int32
-        var foundAlign: int32
-        for i in 0..<ir.typeFieldOwnerTypes.len:
-            if i >= ir.typeFieldSourcePaths.len ||
-               i >= ir.typeFieldNames.len ||
-               i >= ir.typeFieldTypes.len ||
-               i >= ir.typeFieldOffsetBytes.len ||
-               i >= ir.typeFieldSizeBytes.len ||
-               i >= ir.typeFieldAlignBytes.len:
-                continue
-            if ir.typeFieldOwnerTypes[i] != ownerType:
-                continue
-            if ir.typeFieldNames[i] != fieldName:
-                continue
-            if !found:
-                found = true
-                foundType = ir.typeFieldTypes[i]
-                foundOffset = ir.typeFieldOffsetBytes[i]
-                foundSize = ir.typeFieldSizeBytes[i]
-                foundAlign = ir.typeFieldAlignBytes[i]
-                continue
-            if foundType != ir.typeFieldTypes[i] ||
-               foundOffset != ir.typeFieldOffsetBytes[i] ||
-               foundSize != ir.typeFieldSizeBytes[i] ||
-               foundAlign != ir.typeFieldAlignBytes[i]:
-                return false
-        if found:
-            fieldType = foundType
-            fieldOffsetBytes = foundOffset
-            fieldSizeBytes = foundSize
-            fieldAlignBytes = foundAlign
-            return fieldType != "" && fieldOffsetBytes >= 0 && fieldSizeBytes > 0 && fieldAlignBytes > 0
+    let dotPos = TypedExprQualifiedTypeDot(ownerType)
+    if dotPos > 0:
+        let qualifier = chengpath.PathTrim(chengpath.TextSlice(ownerType, 0, dotPos))
+        let ownerLeaf = chengpath.PathTrim(chengpath.TextSlice(ownerType,
+                                                               dotPos + 1,
+                                                               ownerType.len - dotPos - 1))
+        let targetSourcePath = TypedExprIrLookupTypeAliasTargetSourcePath(ir,
+                                                                          sourcePath,
+                                                                          qualifier)
+        if targetSourcePath != "" && ownerLeaf != "":
+            for i in 0..<ir.typeFieldOwnerTypes.len:
+                if i >= ir.typeFieldSourcePaths.len ||
+                   i >= ir.typeFieldNames.len ||
+                   i >= ir.typeFieldTypes.len ||
+                   i >= ir.typeFieldOffsetBytes.len ||
+                   i >= ir.typeFieldSizeBytes.len ||
+                   i >= ir.typeFieldAlignBytes.len:
+                    continue
+                if parser.ParserNormalizePath(ir.typeFieldSourcePaths[i]) != targetSourcePath:
+                    continue
+                if ir.typeFieldOwnerTypes[i] != ownerLeaf:
+                    continue
+                if ir.typeFieldNames[i] != fieldName:
+                    continue
+                fieldType = ir.typeFieldTypes[i]
+                fieldOffsetBytes = ir.typeFieldOffsetBytes[i]
+                fieldSizeBytes = ir.typeFieldSizeBytes[i]
+                fieldAlignBytes = ir.typeFieldAlignBytes[i]
+                return fieldType != "" && fieldOffsetBytes >= 0 && fieldSizeBytes > 0 && fieldAlignBytes > 0
     return false
 
 fn TypedExprIrLookupFieldPathMeta(ir: TypedExprIr,
