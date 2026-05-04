@@ -2012,6 +2012,79 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
         PrimaryBodyIrAppendVarI32Store(bodyIR, lhsSlot, targetSlot)
     return true
 
+fn PrimaryBodyIrBuildForRangeLoop(bodyIR: var coreir.BodyIR,
+                                    slotNames: var str[],
+                                    nextOpIndex: var int32,
+                                    currentBlockStart: var int32,
+                                    typedIr: texpr.TypedExprIr,
+                                    stmt: texpr.TypedExprIrStatement,
+                                    stmtIndex: int32,
+                                    stmtEnd: int32,
+                                    pendingFalseTerm: var int32): int32 =
+    let headerText = strutil.Strip(stmt.surfaceText)
+    var forBodyEnd = stmtEnd
+    for si in stmtIndex + 1..<stmtEnd:
+        let scanStmt = typedIr.statements[si]
+        if scanStmt.lineIndent > 0 && scanStmt.lineIndent <= stmt.lineIndent:
+            forBodyEnd = si
+            break
+    var inPos = -1
+    var endCheckN = len(headerText) - 3
+    for ci in 0..<endCheckN:
+        if headerText[ci] == ' ' && headerText[ci + 1] == 'i' && headerText[ci + 2] == 'n' && headerText[ci + 3] == ' ':
+            inPos = ci
+            break
+    var rangeText = headerText
+    if inPos > 0:
+        var afterIn = inPos + 4
+        var rangeLen = len(headerText) - afterIn
+        rangeText = strings.SliceBytes(headerText, afterIn, rangeLen)
+        var rLen = len(rangeText)
+        if rLen > 0:
+            var lastCh = rangeText[rLen - 1]
+            if lastCh == ':':
+                rangeText = strings.SliceBytes(rangeText, 0, rLen - 1)
+        rangeText = strutil.Strip(rangeText)
+    var rangeStart: int32
+    var rangeEnd = rangeText
+    var exclPos = -1
+    var exclCheckN = len(rangeText) - 2
+    for ci in 0..<exclCheckN:
+        if rangeText[ci] == '.' && rangeText[ci + 1] == '.' && rangeText[ci + 2] == '<':
+            exclPos = ci
+            break
+    if exclPos > 0:
+        var startText = strings.SliceBytes(rangeText, 0, exclPos)
+        var stripped = strutil.Strip(startText)
+        rangeStart = PrimaryBodyIrExtractIntFromText(stripped)
+        var afterExcl = exclPos + 3
+        var endLen = len(rangeText) - afterExcl
+        rangeEnd = strings.SliceBytes(rangeText, afterExcl, endLen)
+        rangeEnd = strutil.Strip(rangeEnd)
+    let idxSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, stmt.bindingName, coreir.LocalI32Tag)
+    var initOp: coreir.BodyOp
+    initOp.kind = coreir.BodyOpLoadConstTag
+    initOp.target = idxSlot
+    add(initOp.operands, coreir.LocalI32Tag)
+    add(initOp.operands, rangeStart)
+    add(bodyIR.ops, initOp)
+    nextOpIndex = nextOpIndex + 1
+    let boundSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, rangeEnd, coreir.LocalI32Tag)
+    var cbrTerm: coreir.BodyTerm
+    cbrTerm.kind = coreir.BodyTermCbrTag
+    cbrTerm.conditionKind = coreir.BodyCondI32LtTag
+    cbrTerm.lhsSlot = idxSlot
+    cbrTerm.rhsSlot = boundSlot
+    cbrTerm.resultSlot = -1
+    cbrTerm.trueBlock = -1
+    cbrTerm.falseBlock = -1
+    let cbrIdx = coreir.BodyIRAppendTerm(bodyIR, cbrTerm)
+    let blockCount = bodyIR.ops.len - currentBlockStart
+    let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, blockCount, cbrIdx)
+    currentBlockStart = bodyIR.ops.len
+    pendingFalseTerm = cbrIdx
+    return forBodyEnd
+
 fn PrimaryBuildBodyIrFromTypedStatements(
     typedIr: texpr.TypedExprIr,
     typedFnIndex: int32,
@@ -2029,12 +2102,54 @@ fn PrimaryBuildBodyIrFromTypedStatements(
     var pendingFalseTerm: int32
     var skipStatementUntilIndex: int32
     var completedReturnLineNumber: int32
+    var pendingForEndIdx: int32
+    var pendingForIdxSlot: int32
+    var pendingForHdrBlk: int32
     pendingFalseTerm = -1
     skipStatementUntilIndex = -1
     completedReturnLineNumber = -1
+    pendingForEndIdx = -1
+    pendingForIdxSlot = -1
+    pendingForHdrBlk = -1
     PrimaryBodyIrSeedParamSlots(bodyIR, slotNames, typedIr, irFunction)
     let varI32ParamNames = PrimaryBodyIrCollectVarI32ParamNames(irFunction)
     for stmtIndex in typedFn.statementStart..<stmtEnd:
+        if pendingForEndIdx > 0 && stmtIndex >= pendingForEndIdx:
+            var oneSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, "_for_one", coreir.LocalI32Tag)
+            var oneInit: coreir.BodyOp
+            oneInit.kind = coreir.BodyOpLoadConstTag
+            oneInit.target = oneSlot
+            add(oneInit.operands, coreir.LocalI32Tag)
+            add(oneInit.operands, 1)
+            add(bodyIR.ops, oneInit)
+            nextOpIndex = nextOpIndex + 1
+            var incOp: coreir.BodyOp
+            incOp.kind = coreir.BodyOpBinOpTag
+            incOp.target = pendingForIdxSlot
+            add(incOp.operands, coreir.LocalI32Tag)
+            add(incOp.operands, int32(texpr.TypedExprIrOpI32Add))
+            add(incOp.operands, pendingForIdxSlot)
+            add(incOp.operands, oneSlot)
+            add(bodyIR.ops, incOp)
+            nextOpIndex = nextOpIndex + 1
+            var brTerm: coreir.BodyTerm
+            brTerm.kind = coreir.BodyTermBrTag
+            brTerm.trueBlock = pendingForHdrBlk
+            brTerm.falseBlock = -1
+            brTerm.conditionKind = coreir.BodyCondInvalidTag
+            brTerm.lhsSlot = -1
+            brTerm.rhsSlot = -1
+            brTerm.resultSlot = -1
+            let brIdx = coreir.BodyIRAppendTerm(bodyIR, brTerm)
+            let backBlockCount = bodyIR.ops.len - currentBlockStart
+            let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, backBlockCount, brIdx)
+            currentBlockStart = bodyIR.ops.len
+            if pendingFalseTerm >= 0 && pendingFalseTerm < bodyIR.terms.len:
+                bodyIR.terms[pendingFalseTerm].falseBlock = bodyIR.blocks.len
+            pendingForEndIdx = -1
+            pendingForIdxSlot = -1
+            pendingForHdrBlk = -1
+            pendingFalseTerm = -1
         if stmtIndex <= skipStatementUntilIndex:
             continue
         let stmt = typedIr.statements[stmtIndex]
@@ -2707,7 +2822,17 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 bodyIR.terms[pendingFalseTerm].falseBlock = bodyIR.blocks.len
                 pendingFalseTerm = -1
         elif stmt.kind == texpr.TypedExprIrStmtFor:
-            nextOpIndex = nextOpIndex + 1
+            let forBodyEnd = PrimaryBodyIrBuildForRangeLoop(bodyIR, slotNames, nextOpIndex, currentBlockStart, typedIr, stmt, stmtIndex, stmtEnd, pendingFalseTerm)
+            skipStatementUntilIndex = forBodyEnd - 1
+            pendingForEndIdx = forBodyEnd
+            if pendingFalseTerm >= 0 && pendingFalseTerm < bodyIR.terms.len:
+                pendingForIdxSlot = bodyIR.terms[pendingFalseTerm].lhsSlot
+            var bi = bodyIR.blocks.len - 1
+            while bi >= 0:
+                if bodyIR.blocks[bi].termIndex == pendingFalseTerm:
+                    pendingForHdrBlk = bi
+                    break
+                bi = bi - 1
     if bodyIR.ops.len > currentBlockStart:
         if bodyIR.blocks.len <= 0:
             var fallbackTerm: coreir.BodyTerm
