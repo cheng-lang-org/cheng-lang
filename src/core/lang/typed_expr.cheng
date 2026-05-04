@@ -521,6 +521,11 @@ const
     TypedExprIrCondStrEqLocal = 3
     TypedExprIrCondStrNeLocal = 4
 
+var typedExprCachedIndexSourcePaths: str[]
+var typedExprCachedIndexBucketHeads: int32[]
+var typedExprCachedIndexEntryNext: int32[]
+var typedExprCachedIndexEntryIndexes: int32[]
+
 fn TypedExprIsReturnCallBodyKind(bodyKind: str): bool =
     return bodyKind == BodyKindReturnCallNoargI32 ||
            bodyKind == BodyKindReturnCallArg0I32 ||
@@ -5370,6 +5375,10 @@ fn TypedExprBuildSourceContextIndex(ir: var TypedExprIr,
         else:
             ir.sourceContextIndexEntryNext[bucketTails[bucket]] = entryIndex
         bucketTails[bucket] = entryIndex
+    typedExprCachedIndexSourcePaths = ir.sourceContextIndexSourcePaths
+    typedExprCachedIndexBucketHeads = ir.sourceContextIndexBucketHeads
+    typedExprCachedIndexEntryNext = ir.sourceContextIndexEntryNext
+    typedExprCachedIndexEntryIndexes = ir.sourceContextIndexEntryIndexes
 
 fn TypedExprSourceContextLookupWithIndex(ir: TypedExprIr,
                                            sourcePathRaw: str): int32 =
@@ -5390,6 +5399,16 @@ fn TypedExprSourceContextLookupWithIndex(ir: TypedExprIr,
 fn TypedExprSourceContextLookup(sourceContexts: var TypedExprSourceContext[],
                                   sourcePathRaw: str): int32 =
     let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    if typedExprCachedIndexBucketHeads.len > 0:
+        let bucket = TypedExprSourceContextIndexHash(sourcePath,
+                                                      typedExprCachedIndexBucketHeads.len)
+        var entryIndex = typedExprCachedIndexBucketHeads[bucket]
+        while entryIndex >= 0:
+            if entryIndex >= typedExprCachedIndexEntryIndexes.len:
+                break
+            if typedExprCachedIndexSourcePaths[entryIndex] == sourcePath:
+                return typedExprCachedIndexEntryIndexes[entryIndex]
+            entryIndex = typedExprCachedIndexEntryNext[entryIndex]
     for i in 0..<sourceContexts.len:
         if sourceContexts[i].normalizedSourcePath == sourcePath:
             return i
@@ -5696,6 +5715,21 @@ fn TypedExprIrLookupTypeAliasTargetSourcePath(ir: TypedExprIr,
            ir.typeAliasQualifiers[i] == qualifier:
             return parser.ParserNormalizePath(ir.typeAliasTargetSourcePaths[i])
     return ""
+
+fn TypedExprIrAppendTypeAliasesFromFacts(ir: var TypedExprIr,
+                                          facts: var TypedExprFact[]) =
+    for i in 0..<facts.len:
+        let fact = facts[i]
+        if fact.kind != parser.NormalizedExprCall:
+            continue
+        if fact.callQualifier == "" || fact.callTargetSourcePath == "":
+            continue
+        if fact.surfaceCallKind == TypedExprSurfaceCallMember:
+            continue
+        TypedExprIrAppendTypeAlias(ir,
+                                   fact.sourcePath,
+                                   fact.callQualifier,
+                                   fact.callTargetSourcePath)
 
 fn TypedExprMaybeQualifyImportedFieldType(importedCtx: var TypedExprSourceContext,
                                            qualifier: str,
@@ -9828,6 +9862,7 @@ fn TypedExprBuildIrWithFactsAndExprLayer(sourceTexts: var TypedExprSourceText[],
         factSourceRanges = TypedExprSourceRangeIndexBuildFromFacts(facts)
         exprSourceRanges = TypedExprSourceRangeIndexBuildFromExprLayer(exprLayer)
         TypedExprBuildSourceContextIndex(ir, contexts)
+        TypedExprIrAppendTypeAliasesFromFacts(ir, facts)
     for i in 0..<sourceTexts.len:
         os.ProcessResourceGuardCheck()
         var ctx: TypedExprSourceContext
