@@ -2823,7 +2823,6 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                 pendingFalseTerm = -1
         elif stmt.kind == texpr.TypedExprIrStmtFor:
             let forBodyEnd = PrimaryBodyIrBuildForRangeLoop(bodyIR, slotNames, nextOpIndex, currentBlockStart, typedIr, stmt, stmtIndex, stmtEnd, pendingFalseTerm)
-            skipStatementUntilIndex = forBodyEnd - 1
             pendingForEndIdx = forBodyEnd
             if pendingFalseTerm >= 0 && pendingFalseTerm < bodyIR.terms.len:
                 pendingForIdxSlot = bodyIR.terms[pendingFalseTerm].lhsSlot
@@ -2833,6 +2832,42 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                     pendingForHdrBlk = bi
                     break
                 bi = bi - 1
+    if pendingForEndIdx > 0:
+        var fos = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, "_for_one", coreir.LocalI32Tag)
+        var foi: coreir.BodyOp
+        foi.kind = coreir.BodyOpLoadConstTag
+        foi.target = fos
+        add(foi.operands, coreir.LocalI32Tag)
+        add(foi.operands, 1)
+        add(bodyIR.ops, foi)
+        nextOpIndex = nextOpIndex + 1
+        var incOp: coreir.BodyOp
+        incOp.kind = coreir.BodyOpBinOpTag
+        incOp.target = pendingForIdxSlot
+        add(incOp.operands, coreir.LocalI32Tag)
+        add(incOp.operands, int32(texpr.TypedExprIrOpI32Add))
+        add(incOp.operands, pendingForIdxSlot)
+        add(incOp.operands, fos)
+        add(bodyIR.ops, incOp)
+        nextOpIndex = nextOpIndex + 1
+        var brTerm: coreir.BodyTerm
+        brTerm.kind = coreir.BodyTermBrTag
+        brTerm.trueBlock = pendingForHdrBlk
+        brTerm.falseBlock = -1
+        brTerm.conditionKind = coreir.BodyCondInvalidTag
+        brTerm.lhsSlot = -1
+        brTerm.rhsSlot = -1
+        brTerm.resultSlot = -1
+        let brIdx = coreir.BodyIRAppendTerm(bodyIR, brTerm)
+        let backCount = bodyIR.ops.len - currentBlockStart
+        let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, backCount, brIdx)
+        currentBlockStart = bodyIR.ops.len
+        if pendingFalseTerm >= 0 && pendingFalseTerm < bodyIR.terms.len:
+            bodyIR.terms[pendingFalseTerm].falseBlock = bodyIR.blocks.len
+        pendingForEndIdx = -1
+        pendingForIdxSlot = -1
+        pendingForHdrBlk = -1
+        pendingFalseTerm = -1
     if bodyIR.ops.len > currentBlockStart:
         if bodyIR.blocks.len <= 0:
             var fallbackTerm: coreir.BodyTerm
@@ -5615,20 +5650,45 @@ fn PrimaryObjectPlanCaptureBodyIrDetails(plan: var PrimaryObjectPlan,
         if call.resultSlot >= 0 && call.resultSlot < bodyIR.localSlots.len:
             plan.firstMissingBodyIrLastCallResultType = bodyIR.localSlots[call.resultSlot].typeKind
 
+fn PrimaryPathSuffixMatch(left: str,
+                            right: str): bool =
+    if PrimaryPathNormalizedEquals(left, right):
+        return true
+    if left.len >= right.len:
+        var suffixStart = left.len - right.len
+        if suffixStart > 0:
+            let sep = left[suffixStart - 1]
+            if sep != '/' && sep != '\\':
+                return false
+        for i in 0..<right.len:
+            if left[suffixStart + i] != right[i]:
+                return false
+        return true
+    else:
+        var suffixStart = right.len - left.len
+        if suffixStart > 0:
+            let sep = right[suffixStart - 1]
+            if sep != '/' && sep != '\\':
+                return false
+        for i in 0..<left.len:
+            if right[suffixStart + i] != left[i]:
+                return false
+        return true
+
 fn PrimaryTypedIrFunctionIndex(ir: texpr.TypedExprIr,
                                 sourcePath: str,
                                 functionName: str): int32 =
     let tailName = PrimaryFunctionTailName(functionName)
     for i in 0..<ir.functions.len:
-        if !PrimaryPathNormalizedEquals(ir.functions[i].sourcePath, sourcePath):
-            continue
-        if ir.functions[i].functionName == functionName ||
-           ir.functions[i].functionName == tailName:
-            return i
+        if PrimaryPathNormalizedEquals(ir.functions[i].sourcePath, sourcePath):
+            if ir.functions[i].functionName == functionName ||
+               ir.functions[i].functionName == tailName:
+                return i
     for i in 0..<ir.functions.len:
-        if ir.functions[i].functionName == functionName ||
-           ir.functions[i].functionName == tailName:
-            return i
+        if PrimaryPathSuffixMatch(ir.functions[i].sourcePath, sourcePath):
+            if ir.functions[i].functionName == functionName ||
+               ir.functions[i].functionName == tailName:
+                return i
     return -1
 
 fn PrimaryObjectMissingTypedIrKind(lowering: lower.LoweringPlanStub,
