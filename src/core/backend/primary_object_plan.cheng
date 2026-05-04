@@ -2220,6 +2220,19 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                   callOrdinal)
                 nextOpIndex = nextOpIndex + 1
         elif stmt.kind == texpr.TypedExprIrStmtAssign:
+            var assignLineHasReturn = false
+            for checkIdx in typedFn.statementStart..<stmtEnd:
+                let checkStmt = typedIr.statements[checkIdx]
+                if checkStmt.lineNumber != stmt.lineNumber:
+                    if checkStmt.lineNumber > stmt.lineNumber:
+                        break
+                    continue
+                if checkStmt.kind == texpr.TypedExprIrStmtReturn:
+                    assignLineHasReturn = true
+                    break
+            if assignLineHasReturn:
+                nextOpIndex = nextOpIndex + 1
+                continue
             if !PrimaryBodyIrAppendI32Assign(bodyIR,
                                              slotNames,
                                              varI32ParamNames,
@@ -2284,8 +2297,6 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                     var dependencyName = callStmt.bindingName
                     if len(dependencyName) <= 0:
                         dependencyName = PrimaryBodyIrCallFullText(callStmt)
-                    if !strutil.Contains(rootStmt.callArgsText, dependencyName):
-                        continue
                     let resultSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
                                                                         slotNames,
                                                                         typedIr,
@@ -2301,6 +2312,49 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                       resultSlot,
                                                       varI32ParamNames,
                                                       callOrdinal)
+                    nextOpIndex = nextOpIndex + 1
+                for assignDepIndex in typedFn.statementStart..<stmtEnd:
+                    let assignDepStmt = typedIr.statements[assignDepIndex]
+                    if assignDepStmt.lineNumber != stmt.lineNumber:
+                        continue
+                    if assignDepStmt.kind != texpr.TypedExprIrStmtAssign:
+                        continue
+                    if assignDepStmt.assignValueOpKind == texpr.TypedExprIrOpUnsupported:
+                        continue
+                    var assignDepName = assignDepStmt.bindingName
+                    if len(assignDepName) <= 0:
+                        assignDepName = assignDepStmt.surfaceText
+                    if len(assignDepName) <= 0:
+                        continue
+                    let lhsSlot = PrimaryBodyIrFindArgSlot(slotNames,
+                                                           assignDepStmt.assignValueLhsText)
+                    if lhsSlot < 0:
+                        continue
+                    let rhsSlot = PrimaryBodyIrFindArgSlot(slotNames,
+                                                           assignDepStmt.assignValueRhsText)
+                    if rhsSlot < 0:
+                        continue
+                    var opTypeKind = bodyIR.localSlots[lhsSlot].typeKind
+                    let rhsTypeKind = bodyIR.localSlots[rhsSlot].typeKind
+                    if opTypeKind != rhsTypeKind:
+                        if opTypeKind == coreir.LocalI32Tag && rhsTypeKind == coreir.LocalI64Tag:
+                            opTypeKind = coreir.LocalI64Tag
+                        elif opTypeKind == coreir.LocalI64Tag && rhsTypeKind == coreir.LocalI32Tag:
+                            opTypeKind = coreir.LocalI64Tag
+                    let assignResultSlot = PrimaryBodyIrFindOrCreateTypedSlot(bodyIR,
+                                                                              slotNames,
+                                                                              typedIr,
+                                                                              assignDepStmt.sourcePath,
+                                                                              assignDepName,
+                                                                              assignDepStmt.resultType)
+                    var binOp: coreir.BodyOp
+                    binOp.kind = coreir.BodyOpBinOpTag
+                    binOp.target = assignResultSlot
+                    add(binOp.operands, opTypeKind)
+                    add(binOp.operands, int32(assignDepStmt.assignValueOpKind))
+                    add(binOp.operands, lhsSlot)
+                    add(binOp.operands, rhsSlot)
+                    add(bodyIR.ops, binOp)
                     nextOpIndex = nextOpIndex + 1
                 var rootResultTypeKind: int32
                 var rootResultTypeSizeBytes: int32
