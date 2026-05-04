@@ -9057,13 +9057,13 @@ fn TypedExprIrPopulateAssignValueMeta(stmt: var TypedExprIrStatement,
     let divPos = TypedExprFindTopLevelTextToken(valueRaw, "/")
     if stmt.assignValueOpKind == TypedExprIrOpUnsupported && divPos >= 0:
         let lhsText = chengpath.PathTrim(chengpath.TextSlice(valueRaw, 0, divPos))
-        let rhsText = chengpath.PathTrim(chengpath.TextSlice(valueRaw,
-                                                             divPos + 1,
-                                                             valueRaw.len - divPos - 1))
-        if lhsText != "" && rhsText != "":
+        let rhsText2 = chengpath.PathTrim(chengpath.TextSlice(valueRaw,
+                                                              divPos + 1,
+                                                              valueRaw.len - divPos - 1))
+        if lhsText != "" && rhsText2 != "":
             stmt.assignValueOpKind = TypedExprIrOpI32Sdiv
             stmt.assignValueLhsText = lhsText
-            stmt.assignValueRhsText = rhsText
+            stmt.assignValueRhsText = rhsText2
     if !TypedExprTextIsSimpleFieldPath(valueRaw):
         return
     let rootName = TypedExprAssignLhsRootName(valueRaw)
@@ -9397,181 +9397,11 @@ fn TypedExprIrAddCallStatementFromExpr(ir: var TypedExprIr,
             callReturnType = TypedExprLookupCallTargetReturnTypeFromExpr(ctx, sourceContexts, expr)
         if callReturnType != "":
             stmt.resultType = callReturnType
-    stmt.callArgsText = TypedExprDecomposeCallArgText(ir, stmt)
     stmt.loweringMode = TypedExprLowerDeferred
     stmt.returnKind = TypedExprReturnDeferred
     stmt.returnRoot = returnRoot
     add(ir.statements, stmt)
     return stmt.statementIndex
-
-fn TypedExprDecomposeCallArgText(ir: var TypedExprIr,
-                                  stmt: var TypedExprIrStatement): str =
-    let argsText = stmt.callArgsText
-    if argsText == "":
-        return argsText
-    var result = argsText
-    var startIdx = ir.statements.len - 1
-    while startIdx >= 0:
-        if ir.statements[startIdx].lineNumber < stmt.lineNumber:
-            break
-        startIdx = startIdx - 1
-    var checkIdx = startIdx + 1
-    while checkIdx >= 0 && checkIdx < ir.statements.len:
-        let prevStmt = ir.statements[checkIdx]
-        if prevStmt.lineNumber != stmt.lineNumber:
-            break
-        var sourceText = ""
-        if prevStmt.callKind != TypedExprCallNone &&
-           len(prevStmt.surfaceText) > 0 &&
-           len(prevStmt.callArgsText) > 0:
-            sourceText = Fmt"{prevStmt.surfaceText}({prevStmt.callArgsText})"
-        if len(sourceText) <= 0:
-            sourceText = prevStmt.surfaceText
-        if len(sourceText) <= 0:
-            sourceText = prevStmt.callArgsText
-        if len(sourceText) <= 0:
-            sourceText = prevStmt.callTarget
-        if len(sourceText) <= 0:
-            checkIdx = checkIdx + 1
-            continue
-        var refText = prevStmt.bindingName
-        if len(refText) <= 0:
-            refText = sourceText
-        if len(refText) <= 0:
-            checkIdx = checkIdx + 1
-            continue
-        if len(sourceText) > 0 && sourceText != refText:
-            if strutil.Contains(result, sourceText):
-                result = strutil.Replace(result, sourceText, refText)
-        checkIdx = checkIdx + 1
-    return TypedExprDecomposeCallArgBinOpText(ir, stmt, result)
-
-fn TypedExprDecomposeCallArgBinOpText(ir: var TypedExprIr,
-                                       stmt: var TypedExprIrStatement,
-                                       result: str): str =
-    var out = result
-    for bi in 0..<len(out):
-        if out[bi] != '/':
-            continue
-        if bi <= 0 || bi + 1 >= len(out):
-            continue
-        let leftRaw = chengpath.TextSlice(out, 0, bi)
-        let leftText = strutil.Strip(leftRaw)
-        let rightRaw = chengpath.TextSlice(out, bi + 1, len(out) - bi - 1)
-        let rightText = strutil.Strip(rightRaw)
-        if leftText == "" || rightText == "":
-            continue
-        if !TypedExprTextIsKnownNameInScope(ir, stmt, leftText):
-            continue
-        if !TypedExprTextIsKnownNameInScope(ir, stmt, rightText):
-            continue
-        var assignStmt: TypedExprIrStatement
-        assignStmt.sourcePath = stmt.sourcePath
-        assignStmt.functionName = stmt.functionName
-        assignStmt.statementIndex = ir.statements.len
-        assignStmt.lineNumber = stmt.lineNumber
-        assignStmt.columnNumber = stmt.columnNumber
-        assignStmt.lineIndent = stmt.lineIndent
-        assignStmt.enclosingIfLineNumber = stmt.enclosingIfLineNumber
-        assignStmt.enclosingIfConditionText = stmt.enclosingIfConditionText
-        assignStmt.exprId = stmt.exprId
-        assignStmt.kind = TypedExprIrStmtAssign
-        assignStmt.callKind = TypedExprCallNone
-        assignStmt.detailKind = stmt.detailKind
-        assignStmt.surfaceText = out
-        assignStmt.bindingName = TypedExprDecomposeGenBindingName(ir, stmt)
-        assignStmt.resultType = "int64"
-        assignStmt.conditionKind = TypedExprIrCondNone
-        assignStmt.conditionLhsText = ""
-        assignStmt.conditionRhsText = ""
-        assignStmt.conditionLiteralText = ""
-        assignStmt.assignRootName = ""
-        assignStmt.assignRootType = ""
-        assignStmt.assignRootSourcePath = ""
-        assignStmt.assignRootGlobalFlag = false
-        assignStmt.assignPlaceKind = TypedExprPlaceTemporary
-        assignStmt.assignFieldName = ""
-        assignStmt.assignFieldType = ""
-        assignStmt.assignFieldOffsetBytes = 0
-        assignStmt.assignFieldSizeBytes = 0
-        assignStmt.assignFieldAlignBytes = 0
-        assignStmt.assignValueRootName = ""
-        assignStmt.assignValueRootType = ""
-        assignStmt.assignValueFieldName = ""
-        assignStmt.assignValueFieldType = ""
-        assignStmt.assignValueFieldOffsetBytes = 0
-        assignStmt.assignValueFieldSizeBytes = 0
-        assignStmt.assignValueFieldAlignBytes = 0
-        assignStmt.assignValueOpKind = TypedExprIrOpI32Sdiv
-        assignStmt.assignValueLhsText = leftText
-        assignStmt.assignValueRhsText = rightText
-        assignStmt.assignValueRhsConst = 0
-        assignStmt.assignValueRhsHasConst = false
-        assignStmt.callQualifier = ""
-        assignStmt.callCallee = ""
-        assignStmt.callTarget = ""
-        assignStmt.callTargetSourcePath = ""
-        assignStmt.callTargetImportc = false
-        assignStmt.callArgCount = 0
-        assignStmt.callArgsText = ""
-        assignStmt.callArgTypesText = ""
-        assignStmt.callArgNodeStart = -1
-        assignStmt.callArgNodeCount = 0
-        assignStmt.loweringMode = TypedExprLowerLocalAddress
-        assignStmt.returnKind = TypedExprReturnDeferred
-        assignStmt.returnRoot = false
-        add(ir.statements, assignStmt)
-        for fi in 0..<ir.functions.len:
-            if ir.functions[fi].functionName == stmt.functionName:
-                ir.functions[fi].statementCount = ir.functions[fi].statementCount + 1
-                break
-        out = assignStmt.bindingName
-        break
-    return out
-
-fn TypedExprDecomposeGenBindingName(ir: var TypedExprIr,
-                                     stmt: var TypedExprIrStatement): str =
-    var n = ir.statements.len
-    while true:
-        let candidate = Fmt"__decompose_{stmt.lineNumber}_{n}"
-        var ok = true
-        for i in 0..<ir.statements.len:
-            if ir.statements[i].bindingName == candidate:
-                ok = false
-                break
-        if ok:
-            return candidate
-        n = n + 1
-
-fn TypedExprTextIsKnownNameInScope(ir: var TypedExprIr,
-                                    stmt: var TypedExprIrStatement,
-                                    name: str): bool =
-    if len(name) <= 0:
-        return false
-    var hasSpecialChar = false
-    for ci in 0..<len(name):
-        if name[ci] == '(' || name[ci] == ')' ||
-           name[ci] == '/' || name[ci] == '+' ||
-           name[ci] == '-' || name[ci] == '*' ||
-           name[ci] == ' ':
-            hasSpecialChar = true
-            break
-    if !hasSpecialChar:
-        return true
-    for i in 0..<ir.statements.len:
-        if ir.statements[i].functionName != stmt.functionName:
-            continue
-        if ir.statements[i].lineNumber > stmt.lineNumber:
-            continue
-        if ir.statements[i].bindingName == name:
-            return true
-        if ir.statements[i].callKind != TypedExprCallNone &&
-           len(ir.statements[i].surfaceText) > 0 &&
-           len(ir.statements[i].callArgsText) > 0:
-            let fullText = Fmt"{ir.statements[i].surfaceText}({ir.statements[i].callArgsText})"
-            if fullText == name:
-                return true
-    return false
 
 fn TypedExprIrAppendStatementsForScopeFromExprLayer(ir: var TypedExprIr,
                                                      ctx: var TypedExprSourceContext,
