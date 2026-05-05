@@ -63,6 +63,8 @@ static int32_t bo(BI *bi,int32_t k,int32_t t,int32_t x,int32_t y){G(bi->ok,bi->o
 static int32_t bt(BI *bi,int32_t k,int32_t c,int32_t l,int32_t r,int32_t s,int32_t tb,int32_t fb){G(bi->tk,bi->tn,bi->tc2,16);G(bi->tc,bi->tn,bi->tc2,16);G(bi->tl,bi->tn,bi->tc2,16);G(bi->tr,bi->tn,bi->tc2,16);G(bi->ts,bi->tn,bi->tc2,16);G(bi->tt,bi->tn,bi->tc2,16);G(bi->tf,bi->tn,bi->tc2,16);int32_t i=bi->tn++;bi->tk[i]=k;bi->tc[i]=c;bi->tl[i]=l;bi->tr[i]=r;bi->ts[i]=s;bi->tt[i]=tb;bi->tf[i]=fb;return i;}
 static int32_t bb(BI *bi,int32_t os,int32_t oc,int32_t ti){G(bi->bs,bi->bn,bi->bc2,16);G(bi->bc,bi->bn,bi->bc2,16);G(bi->bt,bi->bn,bi->bc2,16);int32_t i=bi->bn++;bi->bs[i]=os;bi->bc[i]=oc;bi->bt[i]=ti;return i;}
 static int32_t bs(BI *bi,int32_t ty,int32_t sz){G(bi->st,bi->sn,bi->sc,32);G(bi->so,bi->sn,bi->sc,32);G(bi->ss,bi->sn,bi->sc,32);int32_t i=bi->sn++;bi->st[i]=ty;bi->so[i]=0;bi->ss[i]=sz;return i;}
+static void bi_blk(BI *bi){int32_t os=bi->on;if(bi->bn>0)os=bi->bs[bi->bn-1]+bi->bc[bi->bn-1];bb(bi,os,0,-1);}
+static void bi_end(BI *bi,int32_t ti){if(bi->bn>0){bi->bt[bi->bn-1]=ti;bi->bc[bi->bn-1]=bi->on-bi->bs[bi->bn-1];}}
 
 /* ================================================================
  * Symbol table
@@ -140,26 +142,36 @@ static bool p_fn(P *p,BI *bi){
     if(seq(colon,":"))ret=p_tok(p);else ret=colon;
     S eq=p_tok(p);if(!seq(eq,"=")){p_line(p);return false;}
     st_add_fn(p->st,name,arity,ret);
-    /* Parse body: return <expr> */
-    S kw2=p_tok(p);
-    if(seq(kw2,"return")){
-        S val=p_tok(p);
-        int32_t rv=s_parse_i32(val);
-        int32_t sl=bs(bi,SLOT_I32,4);
-        bo(bi,OP_LDC,sl,rv,0);
-        bt(bi,TM_RET,0,sl,0,-1,-1,-1);
-        bb(bi,0,bi->on,bi->tn-1);
-    } else if(seq(kw2,"let")){
-        /* let x = <expr> - skip for now */
-        p_line(p);return true;
-    } else if(seq(kw2,"if")){
-        /* if/else - skip for now */
-        p_line(p);return true;
-    } else if(seq(kw2,"match")){
-        /* match - skip for now */
-        p_line(p);return true;
+    /* Parse body */
+    bi_blk(bi);
+    /* Skip inline whitespace after = */
+    while(p->pos<p->src.n&&(p->src.p[p->pos]==' '||p->src.p[p->pos]=='\t'))p->pos++;
+    /* Same-line body? */
+    if(p->pos<p->src.n&&p->src.p[p->pos]!='\n'&&p->src.p[p->pos]!='\r'){
+        S kw2=p_tok(p);
+        if(seq(kw2,"return")){
+            S val=p_tok(p);int32_t rv=s_parse_i32(val);
+            int32_t sl=bs(bi,SLOT_I32,4);bo(bi,OP_LDC,sl,rv,0);
+            int32_t ti=bt(bi,TM_RET,0,sl,0,-1,-1,-1);bi_end(bi,ti);
+        } else { p_line(p); }
+    } else {
+        /* Multi-line: skip newline, parse indented statements */
+        while(p->pos<p->src.n&&(p->src.p[p->pos]=='\n'||p->src.p[p->pos]=='\r'))p->pos++;
+        int32_t base=0;
+        while(p->pos<p->src.n){
+            /* Calculate current line indent */
+            int32_t li=p->pos;while(li>0&&p->src.p[li-1]!='\n')li--;
+            int32_t ind=0;while(li+ind<p->src.n&&(p->src.p[li+ind]==' '||p->src.p[li+ind]=='\t'))ind++;
+            if(ind<=base)break;
+            S kw2=p_tok(p);
+            if(seq(kw2,"return")){
+                S val=p_tok(p);int32_t rv=s_parse_i32(val);
+                int32_t sl=bs(bi,SLOT_I32,4);bo(bi,OP_LDC,sl,rv,0);
+                int32_t ti=bt(bi,TM_RET,0,sl,0,-1,-1,-1);bi_end(bi,ti);
+            } else { p_line(p); }
+        }
     }
-    p_line(p);return true;
+    return true;
 }
 
 /* ================================================================
@@ -245,6 +257,7 @@ int main(int argc,char **argv){
     BI *bi=bn(a);
     int32_t rv=42;
 
+    BI *main_bi=NULL;
     if(src){
         S sf=sf_open(src);
         if(sf.n>0){
@@ -254,9 +267,9 @@ int main(int argc,char **argv){
                 S kw=p_peek(&p);
                 if(seq(kw,"type")){p_type(&p);}
                 else if(seq(kw,"fn")){
-                    BI *fbi=bn(a);p_fn(&p,fbi);
-                    /* extract return value from first function */
-                    if(st->n==1)for(int32_t i=0;i<fbi->on;i++)if(fbi->ok[i]==OP_LDC){rv=fbi->o0[i];break;}
+                    BI *fbi=bn(a);bool pf=p_fn(&p,fbi);
+                    if(st->n==1||seq(st->fns[st->n-1].name,"main"))main_bi=fbi;
+                    else if(!main_bi)for(int32_t i=0;i<fbi->on;i++)if(fbi->ok[i]==OP_LDC){rv=fbi->o0[i];break;}
                 }
                 else{p_line(&p);}
             }
@@ -264,17 +277,19 @@ int main(int argc,char **argv){
         }
     }
 
-    /* Build main function IR */
-    int32_t sl=bs(bi,SLOT_I32,4);
-    bo(bi,OP_LDC,sl,rv,0);
-    bt(bi,TM_RET,0,sl,0,-1,-1,-1);
-    bb(bi,0,bi->on,bi->tn-1);
+    BI *out_bi=main_bi?main_bi:bi;
+    if(!main_bi){
+        int32_t sl=bs(out_bi,SLOT_I32,4);
+        bo(out_bi,OP_LDC,sl,rv,0);
+        int32_t ti=bt(out_bi,TM_RET,0,sl,0,-1,-1,-1);
+        bb(out_bi,0,out_bi->on,ti);
+    }
 
     CB *c=cn(a,256);
-    cg_func(c,bi,rv,16);
+    cg_func(c,out_bi,rv,16);
     int rc=out_cc(out,c);
-    printf("cheng_cold: %s  src=%s  fns=%d  types=%d  ops=%d  code=%dw  arena=%zuKB\n",
-           rc?"FAIL":"OK",src?src:"(demo)",st->n,st->tn,bi->on,c->n,a->t/1024);
+    printf("cheng_cold: %s  src=%s  fns=%d  types=%d  ops=%d  blks=%d  code=%dw  arena=%zuKB\n",
+           rc?"FAIL":"OK",src?src:"(demo)",st->n,st->tn,out_bi->on,out_bi->bn,c->n,a->t/1024);
     munmap(a,sizeof(Ar));
     return rc;
 }
