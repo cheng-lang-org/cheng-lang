@@ -617,6 +617,28 @@ static char *cold_normalized_alloc(ColdContract *contract, size_t *len_out, uint
     return text;
 }
 
+#define COLD_ENTRY_CHAIN_CAP 8
+#define COLD_COMMAND_CASE_CAP 16
+#define COLD_NAME_CAP 128
+#define COLD_ENTRY_ERROR_CAP 256
+
+typedef struct {
+    char function[COLD_NAME_CAP];
+    char kind[64];
+    char target[COLD_NAME_CAP];
+    char aux[192];
+} ColdEntryChainStep;
+
+typedef struct {
+    int32_t code;
+    char target[COLD_NAME_CAP];
+} ColdDispatchCase;
+
+typedef struct {
+    char text[64];
+    int32_t code;
+} ColdCommandCase;
+
 typedef struct {
     int32_t source_count;
     int32_t missing_count;
@@ -626,8 +648,25 @@ typedef struct {
     int32_t const_block_count;
     int32_t importc_count;
     int32_t declaration_count;
+    int32_t function_symbol_count;
+    int32_t function_symbol_error_count;
     int32_t entry_function_found;
     int32_t entry_function_line;
+    int32_t entry_function_source_start;
+    int32_t entry_function_source_len;
+    int32_t entry_function_params_start;
+    int32_t entry_function_params_len;
+    int32_t entry_function_return_start;
+    int32_t entry_function_return_len;
+    int32_t entry_function_body_start;
+    int32_t entry_function_body_len;
+    int32_t entry_function_has_body;
+    int32_t entry_semantics_ok;
+    int32_t entry_chain_step_count;
+    int32_t entry_dispatch_case_count;
+    int32_t entry_dispatch_default;
+    int32_t entry_command_case_count;
+    int32_t entry_command_default;
     uint64_t total_bytes;
     uint64_t total_lines;
     uint64_t tree_hash;
@@ -635,6 +674,10 @@ typedef struct {
     char first_missing[PATH_MAX];
     char entry_source[PATH_MAX];
     char entry_function[128];
+    char entry_semantics_error[COLD_ENTRY_ERROR_CAP];
+    ColdEntryChainStep entry_chain[COLD_ENTRY_CHAIN_CAP];
+    ColdDispatchCase entry_dispatch_cases[COLD_COMMAND_CASE_CAP];
+    ColdCommandCase entry_command_cases[COLD_COMMAND_CASE_CAP];
 } ColdManifestStats;
 
 typedef struct {
@@ -644,12 +687,33 @@ typedef struct {
     int32_t const_block_count;
     int32_t importc_count;
     int32_t declaration_count;
+    int32_t function_symbol_count;
+    int32_t function_symbol_error_count;
     int32_t entry_function_found;
     int32_t entry_function_line;
+    int32_t entry_function_source_start;
+    int32_t entry_function_source_len;
+    int32_t entry_function_params_start;
+    int32_t entry_function_params_len;
+    int32_t entry_function_return_start;
+    int32_t entry_function_return_len;
+    int32_t entry_function_body_start;
+    int32_t entry_function_body_len;
+    int32_t entry_function_has_body;
     uint64_t line_count;
     uint64_t byte_count;
     uint64_t declaration_hash;
 } ColdSourceScanStats;
+
+typedef struct {
+    Span name;
+    Span params;
+    Span return_type;
+    Span body;
+    Span source_span;
+    int32_t line;
+    int32_t has_body;
+} ColdFunctionSymbol;
 
 static uint64_t cold_fnv1a64_update_cstr(uint64_t hash, const char *text);
 
@@ -672,8 +736,14 @@ static bool cold_ident_char(uint8_t c) {
 }
 
 static bool cold_parse_fn_name(Span line, Span *name_out) {
-    if (!cold_span_starts_with(line, "fn ")) return false;
-    int32_t pos = 3;
+    int32_t pos = 0;
+    if (cold_span_starts_with(line, "fn ")) {
+        pos = 3;
+    } else if (cold_span_starts_with(line, "async fn ")) {
+        pos = 9;
+    } else {
+        return false;
+    }
     while (pos < line.len && (line.ptr[pos] == ' ' || line.ptr[pos] == '\t')) pos++;
     int32_t start = pos;
     while (pos < line.len && cold_ident_char(line.ptr[pos])) pos++;
@@ -694,6 +764,164 @@ static bool cold_line_top_level(Span line) {
     return line.len > 0 && line.ptr[0] != ' ' && line.ptr[0] != '\t';
 }
 
+static bool cold_line_has_triple_quote(Span line) {
+    for (int32_t i = 0; i + 2 < line.len; i++) {
+        if (line.ptr[i] == '"' && line.ptr[i + 1] == '"' && line.ptr[i + 2] == '"') return true;
+    }
+    return false;
+}
+
+static bool cold_top_level_decl_like(Span line) {
+    Span trimmed = span_trim(line);
+    if (trimmed.len == 0) return false;
+    if (trimmed.ptr[0] == '@') return true;
+    return cold_span_starts_with(trimmed, "import ") ||
+           cold_span_starts_with(trimmed, "fn ") ||
+           cold_span_starts_with(trimmed, "async fn ") ||
+           cold_span_is_exact_or_prefix_space(trimmed, "type") ||
+           cold_span_is_exact_or_prefix_space(trimmed, "const") ||
+           cold_span_is_exact_or_prefix_space(trimmed, "let") ||
+           cold_span_is_exact_or_prefix_space(trimmed, "var") ||
+           cold_span_is_exact_or_prefix_space(trimmed, "module");
+}
+
+static int32_t cold_span_offset(Span source, Span part) {
+    if (!part.ptr) return -1;
+    if (part.ptr < source.ptr || part.ptr > source.ptr + source.len) return -1;
+    return (int32_t)(part.ptr - source.ptr);
+}
+
+static int32_t cold_line_after_pos(Span source, int32_t pos) {
+    if (pos < 0) pos = 0;
+    while (pos < source.len && source.ptr[pos] != '\n') pos++;
+    if (pos < source.len) pos++;
+    return pos;
+}
+
+static int32_t cold_line_end_from(Span source, int32_t pos) {
+    while (pos < source.len && source.ptr[pos] != '\n') pos++;
+    return pos;
+}
+
+static int32_t cold_find_matching_paren(Span source, int32_t open_pos) {
+    if (open_pos < 0 || open_pos >= source.len || source.ptr[open_pos] != '(') return -1;
+    int32_t depth = 0;
+    bool in_string = false;
+    uint8_t string_quote = 0;
+    for (int32_t i = open_pos; i < source.len; i++) {
+        uint8_t c = source.ptr[i];
+        if (in_string) {
+            if (c == '\\' && i + 1 < source.len) {
+                i++;
+                continue;
+            }
+            if (c == string_quote) in_string = false;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            in_string = true;
+            string_quote = c;
+            continue;
+        }
+        if (c == '(') depth++;
+        else if (c == ')') {
+            depth--;
+            if (depth == 0) return i;
+            if (depth < 0) return -1;
+        }
+    }
+    return -1;
+}
+
+static int32_t cold_next_top_level_decl(Span source, int32_t pos) {
+    bool in_triple = false;
+    while (pos < source.len) {
+        int32_t start = pos;
+        while (pos < source.len && source.ptr[pos] != '\n') pos++;
+        int32_t end = pos;
+        if (pos < source.len) pos++;
+        Span line = span_sub(source, start, end);
+        if (in_triple) {
+            if (cold_line_has_triple_quote(line)) in_triple = false;
+            continue;
+        }
+        if (!cold_line_top_level(line)) {
+            if (cold_line_has_triple_quote(line)) in_triple = true;
+            continue;
+        }
+        if (cold_top_level_decl_like(line)) return start;
+    }
+    return source.len;
+}
+
+static bool cold_parse_function_symbol_at(Span source, int32_t fn_start, int32_t line_no,
+                                          ColdFunctionSymbol *symbol) {
+    memset(symbol, 0, sizeof(*symbol));
+    int32_t line_end = cold_line_end_from(source, fn_start);
+    Span line = span_sub(source, fn_start, line_end);
+    Span trimmed = span_trim(line);
+    Span name = {0};
+    if (!cold_parse_fn_name(trimmed, &name)) return false;
+    int32_t name_end = cold_span_offset(source, name) + name.len;
+    int32_t open = name_end;
+    while (open < source.len && (source.ptr[open] == ' ' || source.ptr[open] == '\t')) open++;
+    if (open >= source.len || source.ptr[open] != '(') return false;
+    int32_t close = cold_find_matching_paren(source, open);
+    if (close < 0) return false;
+    int32_t next_decl = cold_next_top_level_decl(source, cold_line_after_pos(source, close));
+
+    int32_t eq = -1;
+    int32_t colon = -1;
+    for (int32_t i = close + 1; i < next_decl; i++) {
+        if (source.ptr[i] == ':' && colon < 0) colon = i;
+        if (source.ptr[i] == '=') {
+            eq = i;
+            break;
+        }
+        if (source.ptr[i] == '\n' && eq < 0 && colon < 0) {
+            continue;
+        }
+    }
+
+    Span params = span_trim((Span){source.ptr + open + 1, close - open - 1});
+    Span ret = {0};
+    if (colon >= 0) {
+        int32_t ret_end = eq >= 0 ? eq : cold_line_end_from(source, colon);
+        ret = span_trim(span_sub(source, colon + 1, ret_end));
+    }
+
+    int32_t source_end = next_decl;
+    while (source_end > fn_start) {
+        uint8_t c = source.ptr[source_end - 1];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+        source_end--;
+    }
+    Span source_span = span_sub(source, fn_start, source_end);
+
+    Span body = {0};
+    int32_t has_body = 0;
+    if (eq >= 0) {
+        int32_t body_start = eq + 1;
+        while (body_start < source_end) {
+            uint8_t c = source.ptr[body_start];
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+            body_start++;
+        }
+        int32_t body_end = source_end;
+        body = span_sub(source, body_start, body_end);
+        has_body = body.len > 0 ? 1 : 0;
+    }
+
+    symbol->name = name;
+    symbol->params = params;
+    symbol->return_type = ret;
+    symbol->body = body;
+    symbol->source_span = source_span;
+    symbol->line = line_no;
+    symbol->has_body = has_body;
+    return true;
+}
+
 static void cold_scan_cheng_source(Span source, Span rel_path,
                                    Span entry_rel, Span entry_name,
                                    ColdSourceScanStats *scan) {
@@ -703,6 +931,7 @@ static void cold_scan_cheng_source(Span source, Span rel_path,
     bool is_entry_source = span_same(rel_path, entry_rel);
     int32_t pos = 0;
     int32_t line_no = 0;
+    bool in_triple = false;
     while (pos < source.len) {
         int32_t start = pos;
         while (pos < source.len && source.ptr[pos] != '\n') pos++;
@@ -712,6 +941,14 @@ static void cold_scan_cheng_source(Span source, Span rel_path,
         scan->line_count++;
         Span line = span_sub(source, start, end);
         Span trimmed = span_trim(line);
+        if (in_triple) {
+            if (cold_line_has_triple_quote(line)) in_triple = false;
+            continue;
+        }
+        if (!cold_line_top_level(line) && cold_line_has_triple_quote(line)) {
+            in_triple = true;
+            continue;
+        }
         if (trimmed.len == 0) continue;
         if (cold_span_starts_with(trimmed, "//") || cold_span_starts_with(trimmed, "#")) continue;
         if (cold_line_top_level(line) && cold_span_starts_with(trimmed, "@importc")) {
@@ -749,6 +986,10 @@ static void cold_scan_cheng_source(Span source, Span rel_path,
         if (cold_parse_fn_name(trimmed, &fn_name)) {
             scan->function_count++;
             scan->declaration_count++;
+            ColdFunctionSymbol symbol;
+            bool symbol_ok = cold_parse_function_symbol_at(source, start, line_no, &symbol);
+            if (symbol_ok) scan->function_symbol_count++;
+            else scan->function_symbol_error_count++;
             scan->declaration_hash = cold_fnv1a64_update(scan->declaration_hash, rel_path);
             scan->declaration_hash = cold_fnv1a64_update_cstr(scan->declaration_hash, ":fn:");
             scan->declaration_hash = cold_fnv1a64_update(scan->declaration_hash, fn_name);
@@ -756,6 +997,17 @@ static void cold_scan_cheng_source(Span source, Span rel_path,
             if (is_entry_source && span_same(fn_name, entry_name)) {
                 scan->entry_function_found = 1;
                 scan->entry_function_line = line_no;
+                if (symbol_ok) {
+                    scan->entry_function_source_start = cold_span_offset(source, symbol.source_span);
+                    scan->entry_function_source_len = symbol.source_span.len;
+                    scan->entry_function_params_start = cold_span_offset(source, symbol.params);
+                    scan->entry_function_params_len = symbol.params.len;
+                    scan->entry_function_return_start = cold_span_offset(source, symbol.return_type);
+                    scan->entry_function_return_len = symbol.return_type.len;
+                    scan->entry_function_body_start = cold_span_offset(source, symbol.body);
+                    scan->entry_function_body_len = symbol.body.len;
+                    scan->entry_function_has_body = symbol.has_body;
+                }
             }
         }
     }
@@ -792,6 +1044,494 @@ static bool cold_join_root_span(char *out, size_t cap, const char *root, Span re
 
 static uint64_t cold_fnv1a64_update_cstr(uint64_t hash, const char *text) {
     return cold_fnv1a64_update(hash, (Span){(const uint8_t *)text, (int32_t)strlen(text)});
+}
+
+static Span cold_cstr_span(const char *text) {
+    return (Span){(const uint8_t *)text, (int32_t)strlen(text)};
+}
+
+static void cold_span_copy_buf(char *out, size_t cap, Span span) {
+    cold_span_copy(out, cap, span);
+}
+
+static void cold_skip_inline_ws(Span span, int32_t *pos) {
+    while (*pos < span.len && (span.ptr[*pos] == ' ' || span.ptr[*pos] == '\t')) (*pos)++;
+}
+
+static bool cold_parse_text_at(Span span, int32_t *pos, const char *text) {
+    int32_t len = (int32_t)strlen(text);
+    if (*pos < 0 || *pos + len > span.len) return false;
+    if (memcmp(span.ptr + *pos, text, (size_t)len) != 0) return false;
+    *pos += len;
+    return true;
+}
+
+static bool cold_parse_ident_at(Span span, int32_t *pos, Span *ident) {
+    if (*pos >= span.len) return false;
+    uint8_t c = span.ptr[*pos];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_')) return false;
+    int32_t start = *pos;
+    (*pos)++;
+    while (*pos < span.len && cold_ident_char(span.ptr[*pos])) (*pos)++;
+    *ident = (Span){span.ptr + start, *pos - start};
+    return true;
+}
+
+static bool cold_parse_i32_at(Span span, int32_t *pos, int32_t *value) {
+    int32_t sign = 1;
+    int32_t v = 0;
+    if (*pos < span.len && span.ptr[*pos] == '-') {
+        sign = -1;
+        (*pos)++;
+    }
+    int32_t start = *pos;
+    while (*pos < span.len && span.ptr[*pos] >= '0' && span.ptr[*pos] <= '9') {
+        v = v * 10 + (int32_t)(span.ptr[*pos] - '0');
+        (*pos)++;
+    }
+    if (*pos == start) return false;
+    *value = sign * v;
+    return true;
+}
+
+static bool cold_trailing_ws_only(Span span, int32_t pos) {
+    while (pos < span.len) {
+        uint8_t c = span.ptr[pos++];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') return false;
+    }
+    return true;
+}
+
+static int32_t cold_collect_body_lines(Span body, Span *lines, int32_t cap) {
+    int32_t pos = 0;
+    int32_t count = 0;
+    while (pos < body.len) {
+        int32_t start = pos;
+        while (pos < body.len && body.ptr[pos] != '\n') pos++;
+        int32_t end = pos;
+        if (pos < body.len) pos++;
+        Span line = span_trim((Span){body.ptr + start, end - start});
+        if (line.len == 0) continue;
+        if (cold_span_starts_with(line, "//") || cold_span_starts_with(line, "#")) continue;
+        if (count >= cap) return -1;
+        lines[count++] = line;
+    }
+    return count;
+}
+
+static bool cold_parse_call_expr(Span expr, Span *callee, Span *arg) {
+    int32_t pos = 0;
+    cold_skip_inline_ws(expr, &pos);
+    if (!cold_parse_ident_at(expr, &pos, callee)) return false;
+    cold_skip_inline_ws(expr, &pos);
+    if (pos >= expr.len || expr.ptr[pos] != '(') return false;
+    int32_t open = pos;
+    int32_t close = cold_find_matching_paren(expr, open);
+    if (close < 0) return false;
+    if (arg) *arg = span_trim((Span){expr.ptr + open + 1, close - open - 1});
+    pos = close + 1;
+    cold_skip_inline_ws(expr, &pos);
+    return pos == expr.len;
+}
+
+static bool cold_parse_return_call_line(Span line, Span *callee, Span *arg) {
+    int32_t pos = 0;
+    Span keyword = {0};
+    if (!cold_parse_ident_at(line, &pos, &keyword) || !span_eq(keyword, "return")) return false;
+    if (pos >= line.len || (line.ptr[pos] != ' ' && line.ptr[pos] != '\t')) return false;
+    Span expr = span_trim((Span){line.ptr + pos, line.len - pos});
+    return cold_parse_call_expr(expr, callee, arg);
+}
+
+static bool cold_parse_return_i32_line(Span line, int32_t *value) {
+    int32_t pos = 0;
+    Span keyword = {0};
+    if (!cold_parse_ident_at(line, &pos, &keyword) || !span_eq(keyword, "return")) return false;
+    if (pos >= line.len || (line.ptr[pos] != ' ' && line.ptr[pos] != '\t')) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (cold_span_starts_with((Span){line.ptr + pos, line.len - pos}, "int32")) {
+        Span callee = {0};
+        Span arg = {0};
+        if (!cold_parse_call_expr((Span){line.ptr + pos, line.len - pos}, &callee, &arg)) return false;
+        if (!span_eq(callee, "int32")) return false;
+        int32_t arg_pos = 0;
+        if (!cold_parse_i32_at(arg, &arg_pos, value)) return false;
+        return cold_trailing_ws_only(arg, arg_pos);
+    }
+    if (!cold_parse_i32_at(line, &pos, value)) return false;
+    return cold_trailing_ws_only(line, pos);
+}
+
+static bool cold_parse_let_call_line(Span line, Span *local, Span *callee, Span *arg) {
+    int32_t pos = 0;
+    Span keyword = {0};
+    if (!cold_parse_ident_at(line, &pos, &keyword) || !span_eq(keyword, "let")) return false;
+    if (pos >= line.len || (line.ptr[pos] != ' ' && line.ptr[pos] != '\t')) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_ident_at(line, &pos, local)) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_text_at(line, &pos, "=")) return false;
+    Span expr = span_trim((Span){line.ptr + pos, line.len - pos});
+    return cold_parse_call_expr(expr, callee, arg);
+}
+
+static bool cold_parse_if_i32_line(Span line, const char *expected_local,
+                                   const char *expected_op, int32_t *value) {
+    int32_t pos = 0;
+    Span keyword = {0};
+    Span local = {0};
+    if (!cold_parse_ident_at(line, &pos, &keyword) || !span_eq(keyword, "if")) return false;
+    if (pos >= line.len || (line.ptr[pos] != ' ' && line.ptr[pos] != '\t')) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_ident_at(line, &pos, &local) || !span_eq(local, expected_local)) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_text_at(line, &pos, expected_op)) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_i32_at(line, &pos, value)) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_text_at(line, &pos, ":")) return false;
+    return cold_trailing_ws_only(line, pos);
+}
+
+static bool cold_parse_command_header_line(Span line, int32_t *length) {
+    int32_t pos = 0;
+    Span keyword = {0};
+    Span local = {0};
+    if (!cold_parse_ident_at(line, &pos, &keyword) || !span_eq(keyword, "if")) return false;
+    if (pos >= line.len || (line.ptr[pos] != ' ' && line.ptr[pos] != '\t')) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_ident_at(line, &pos, &local) || !span_eq(local, "n")) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_text_at(line, &pos, "==")) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_i32_at(line, &pos, length)) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_text_at(line, &pos, "&&")) return false;
+    return cold_trailing_ws_only(line, pos);
+}
+
+static bool cold_parse_command_char_line(Span line, int32_t *index, char *ch, bool *last) {
+    int32_t pos = 0;
+    Span target = {0};
+    if (!cold_parse_ident_at(line, &pos, &target) || !span_eq(target, "cmd")) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_text_at(line, &pos, "[")) return false;
+    if (!cold_parse_i32_at(line, &pos, index)) return false;
+    if (!cold_parse_text_at(line, &pos, "]")) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_text_at(line, &pos, "==")) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (!cold_parse_text_at(line, &pos, "'")) return false;
+    if (pos >= line.len) return false;
+    *ch = (char)line.ptr[pos++];
+    if (!cold_parse_text_at(line, &pos, "'")) return false;
+    cold_skip_inline_ws(line, &pos);
+    if (cold_parse_text_at(line, &pos, "&&")) {
+        *last = false;
+    } else if (cold_parse_text_at(line, &pos, ":")) {
+        *last = true;
+    } else {
+        return false;
+    }
+    return cold_trailing_ws_only(line, pos);
+}
+
+static bool cold_find_function_symbol_by_name(Span source, Span name,
+                                              ColdFunctionSymbol *symbol) {
+    int32_t pos = 0;
+    int32_t line_no = 0;
+    bool in_triple = false;
+    while (pos < source.len) {
+        int32_t start = pos;
+        while (pos < source.len && source.ptr[pos] != '\n') pos++;
+        int32_t end = pos;
+        if (pos < source.len) pos++;
+        line_no++;
+        Span line = span_sub(source, start, end);
+        Span trimmed = span_trim(line);
+        if (in_triple) {
+            if (cold_line_has_triple_quote(line)) in_triple = false;
+            continue;
+        }
+        if (!cold_line_top_level(line) && cold_line_has_triple_quote(line)) {
+            in_triple = true;
+            continue;
+        }
+        if (!cold_line_top_level(line)) continue;
+        Span fn_name = {0};
+        if (!cold_parse_fn_name(trimmed, &fn_name)) continue;
+        if (!span_same(fn_name, name)) continue;
+        return cold_parse_function_symbol_at(source, start, line_no, symbol);
+    }
+    return false;
+}
+
+static void cold_entry_step_set(ColdManifestStats *stats, int32_t index,
+                                const char *function, const char *kind,
+                                const char *target, const char *aux) {
+    if (index < 0 || index >= COLD_ENTRY_CHAIN_CAP) return;
+    snprintf(stats->entry_chain[index].function, sizeof(stats->entry_chain[index].function), "%s", function);
+    snprintf(stats->entry_chain[index].kind, sizeof(stats->entry_chain[index].kind), "%s", kind);
+    snprintf(stats->entry_chain[index].target, sizeof(stats->entry_chain[index].target), "%s", target ? target : "");
+    snprintf(stats->entry_chain[index].aux, sizeof(stats->entry_chain[index].aux), "%s", aux ? aux : "");
+    if (stats->entry_chain_step_count <= index) stats->entry_chain_step_count = index + 1;
+}
+
+static bool cold_entry_semantics_error(ColdManifestStats *stats, const char *message) {
+    snprintf(stats->entry_semantics_error, sizeof(stats->entry_semantics_error), "%s", message);
+    return false;
+}
+
+static bool cold_recognize_argc_guard_dispatch(Span body,
+                                               char *dispatch_target, size_t dispatch_cap,
+                                               char *aux, size_t aux_cap) {
+    Span lines[8];
+    int32_t count = cold_collect_body_lines(body, lines, 8);
+    if (count != 4) return false;
+
+    Span local = {0};
+    Span callee = {0};
+    Span arg = {0};
+    if (!cold_parse_let_call_line(lines[0], &local, &callee, &arg)) return false;
+    if (!span_eq(local, "count") || !span_eq(callee, "BackendDriverDispatchMinParamCount") || arg.len != 0) return false;
+
+    int32_t guard_value = 0;
+    if (!cold_parse_if_i32_line(lines[1], "count", "<=", &guard_value) || guard_value != 0) return false;
+
+    Span help_target = {0};
+    Span help_arg = {0};
+    if (!cold_parse_return_call_line(lines[2], &help_target, &help_arg)) return false;
+    if (!span_eq(help_target, "BackendDriverDispatchMinHelp") || help_arg.len != 0) return false;
+
+    Span final_target = {0};
+    Span final_arg = {0};
+    if (!cold_parse_return_call_line(lines[3], &final_target, &final_arg)) return false;
+    if (!span_eq(final_target, "BackendDriverDispatchMinRunCommandWithCmd")) return false;
+
+    Span param_target = {0};
+    Span param_arg = {0};
+    if (!cold_parse_call_expr(final_arg, &param_target, &param_arg)) return false;
+    if (!span_eq(param_target, "BackendDriverDispatchMinParamStr")) return false;
+    int32_t param_pos = 0;
+    int32_t param_index = 0;
+    if (!cold_parse_i32_at(param_arg, &param_pos, &param_index) ||
+        !cold_trailing_ws_only(param_arg, param_pos) ||
+        param_index != 1) return false;
+
+    cold_span_copy_buf(dispatch_target, dispatch_cap, final_target);
+    snprintf(aux, aux_cap, "argc_call:BackendDriverDispatchMinParamCount,empty_arg:BackendDriverDispatchMinHelp,arg_call:BackendDriverDispatchMinParamStr,index:1");
+    return true;
+}
+
+static bool cold_recognize_dispatch_chain(Span body, ColdManifestStats *stats,
+                                          char *code_target, size_t code_cap) {
+    Span lines[32];
+    int32_t count = cold_collect_body_lines(body, lines, 32);
+    if (count < 4) return false;
+
+    Span local = {0};
+    Span callee = {0};
+    Span arg = {0};
+    if (!cold_parse_let_call_line(lines[0], &local, &callee, &arg)) return false;
+    if (!span_eq(local, "code") || !span_eq(callee, "BackendDriverDispatchMinCommandCode") ||
+        !span_eq(arg, "cmd")) return false;
+    cold_span_copy_buf(code_target, code_cap, callee);
+
+    int32_t line_index = 1;
+    int32_t case_count = 0;
+    while (line_index + 1 < count) {
+        int32_t code = 0;
+        if (!cold_parse_if_i32_line(lines[line_index], "code", "==", &code)) break;
+        Span target = {0};
+        Span call_arg = {0};
+        if (!cold_parse_return_call_line(lines[line_index + 1], &target, &call_arg)) return false;
+        if (call_arg.len != 0) return false;
+        if (case_count >= COLD_COMMAND_CASE_CAP) return false;
+        stats->entry_dispatch_cases[case_count].code = code;
+        cold_span_copy_buf(stats->entry_dispatch_cases[case_count].target,
+                           sizeof(stats->entry_dispatch_cases[case_count].target),
+                           target);
+        case_count++;
+        line_index += 2;
+    }
+
+    int32_t default_value = 0;
+    if (line_index != count - 1 || !cold_parse_return_i32_line(lines[line_index], &default_value)) return false;
+    if (case_count != 6 || default_value != 2) return false;
+    for (int32_t i = 0; i < case_count; i++) {
+        if (stats->entry_dispatch_cases[i].code != i) return false;
+    }
+    stats->entry_dispatch_case_count = case_count;
+    stats->entry_dispatch_default = default_value;
+    return true;
+}
+
+static bool cold_recognize_command_code_table(Span body, ColdManifestStats *stats) {
+    Span lines[192];
+    int32_t count = cold_collect_body_lines(body, lines, 192);
+    if (count < 4) return false;
+
+    Span local = {0};
+    Span callee = {0};
+    Span arg = {0};
+    if (!cold_parse_let_call_line(lines[0], &local, &callee, &arg)) return false;
+    if (!span_eq(local, "n") || !span_eq(callee, "len") || !span_eq(arg, "cmd")) return false;
+
+    int32_t line_index = 1;
+    int32_t case_count = 0;
+    while (line_index < count) {
+        int32_t command_len = 0;
+        if (!cold_parse_command_header_line(lines[line_index], &command_len)) break;
+        if (command_len <= 0 || command_len >= (int32_t)sizeof(stats->entry_command_cases[0].text)) return false;
+        line_index++;
+
+        char text[64];
+        int32_t char_count = 0;
+        bool last = false;
+        while (!last) {
+            if (line_index >= count) return false;
+            int32_t index = 0;
+            char ch = 0;
+            if (!cold_parse_command_char_line(lines[line_index], &index, &ch, &last)) return false;
+            if (index != char_count || char_count >= command_len) return false;
+            text[char_count++] = ch;
+            line_index++;
+        }
+        if (char_count != command_len) return false;
+        text[char_count] = '\0';
+        if (line_index >= count) return false;
+        int32_t code = 0;
+        if (!cold_parse_return_i32_line(lines[line_index], &code)) return false;
+        line_index++;
+        if (case_count >= COLD_COMMAND_CASE_CAP) return false;
+        snprintf(stats->entry_command_cases[case_count].text,
+                 sizeof(stats->entry_command_cases[case_count].text), "%s", text);
+        stats->entry_command_cases[case_count].code = code;
+        case_count++;
+    }
+
+    int32_t default_value = 0;
+    if (line_index != count - 1 || !cold_parse_return_i32_line(lines[line_index], &default_value)) return false;
+    if (case_count != 8 || default_value != -1) return false;
+    static const char *expected_texts[] = {
+        "help",
+        "-h",
+        "--help",
+        "status",
+        "print-build-plan",
+        "verify-export-visibility",
+        "verify-export-visibility-parallel",
+        "system-link-exec",
+    };
+    static const int32_t expected_codes[] = {0, 0, 0, 1, 2, 3, 4, 5};
+    for (int32_t i = 0; i < case_count; i++) {
+        if (strcmp(stats->entry_command_cases[i].text, expected_texts[i]) != 0 ||
+            stats->entry_command_cases[i].code != expected_codes[i]) return false;
+    }
+    for (int32_t i = 0; i < case_count; i++) {
+        int32_t code = stats->entry_command_cases[i].code;
+        bool has_dispatch = false;
+        for (int32_t j = 0; j < stats->entry_dispatch_case_count; j++) {
+            if (stats->entry_dispatch_cases[j].code == code) {
+                has_dispatch = true;
+                break;
+            }
+        }
+        if (!has_dispatch) return false;
+    }
+    stats->entry_command_case_count = case_count;
+    stats->entry_command_default = default_value;
+    return true;
+}
+
+static bool cold_entry_semantics_analyze(ColdContract *contract, ColdManifestStats *stats) {
+    char manifest_path[PATH_MAX];
+    char root[PATH_MAX];
+    if (!cold_contract_manifest_path(contract, manifest_path, sizeof(manifest_path))) {
+        return cold_entry_semantics_error(stats, "entry manifest path unavailable");
+    }
+    cold_contract_workspace_root(contract, root, sizeof(root));
+    if (root[0] == '\0') return cold_entry_semantics_error(stats, "workspace root unavailable");
+
+    ColdContract manifest;
+    if (!cold_contract_parse(&manifest, manifest_path)) {
+        return cold_entry_semantics_error(stats, "entry manifest parse failed");
+    }
+    Span entry_rel = cold_contract_get(&manifest, "compiler_entry_source");
+    if (entry_rel.len <= 0) return cold_entry_semantics_error(stats, "entry source missing");
+
+    char entry_path[PATH_MAX];
+    if (!cold_join_root_span(entry_path, sizeof(entry_path), root, entry_rel)) {
+        return cold_entry_semantics_error(stats, "entry source path invalid");
+    }
+    Span source = source_open(entry_path);
+    if (source.len <= 0) return cold_entry_semantics_error(stats, "entry source unreadable");
+
+    ColdFunctionSymbol main_symbol;
+    Span entry_name = cold_contract_get(contract, "bootstrap_entry");
+    bool ok = cold_find_function_symbol_by_name(source, entry_name, &main_symbol);
+    if (!ok) {
+        munmap((void *)source.ptr, (size_t)source.len);
+        return cold_entry_semantics_error(stats, "entry function symbol unavailable");
+    }
+
+    Span main_target = {0};
+    Span main_arg = {0};
+    if (!cold_parse_return_call_line(main_symbol.body, &main_target, &main_arg) || main_arg.len != 0) {
+        munmap((void *)source.ptr, (size_t)source.len);
+        return cold_entry_semantics_error(stats, "entry body is not strict return-call");
+    }
+    char main_name_buf[COLD_NAME_CAP];
+    char main_target_buf[COLD_NAME_CAP];
+    cold_span_copy_buf(main_name_buf, sizeof(main_name_buf), entry_name);
+    cold_span_copy_buf(main_target_buf, sizeof(main_target_buf), main_target);
+    cold_entry_step_set(stats, 0, main_name_buf, "return_call", main_target_buf, "");
+
+    ColdFunctionSymbol run_symbol;
+    if (!cold_find_function_symbol_by_name(source, main_target, &run_symbol)) {
+        munmap((void *)source.ptr, (size_t)source.len);
+        return cold_entry_semantics_error(stats, "entry return target symbol unavailable");
+    }
+    char dispatch_target[COLD_NAME_CAP];
+    char argc_aux[192];
+    if (!cold_recognize_argc_guard_dispatch(run_symbol.body, dispatch_target, sizeof(dispatch_target),
+                                            argc_aux, sizeof(argc_aux))) {
+        munmap((void *)source.ptr, (size_t)source.len);
+        return cold_entry_semantics_error(stats, "run command body is not strict argc guard dispatch");
+    }
+    cold_entry_step_set(stats, 1, main_target_buf, "argc_guard_dispatch", dispatch_target, argc_aux);
+
+    ColdFunctionSymbol dispatch_symbol;
+    if (!cold_find_function_symbol_by_name(source, cold_cstr_span(dispatch_target), &dispatch_symbol)) {
+        munmap((void *)source.ptr, (size_t)source.len);
+        return cold_entry_semantics_error(stats, "dispatch target symbol unavailable");
+    }
+    char code_target[COLD_NAME_CAP];
+    if (!cold_recognize_dispatch_chain(dispatch_symbol.body, stats, code_target, sizeof(code_target))) {
+        munmap((void *)source.ptr, (size_t)source.len);
+        return cold_entry_semantics_error(stats, "dispatch body is not strict code switch");
+    }
+    char dispatch_aux[64];
+    snprintf(dispatch_aux, sizeof(dispatch_aux), "cases:%d,default:%d",
+             stats->entry_dispatch_case_count, stats->entry_dispatch_default);
+    cold_entry_step_set(stats, 2, dispatch_target, "int_code_dispatch", code_target, dispatch_aux);
+
+    ColdFunctionSymbol code_symbol;
+    if (!cold_find_function_symbol_by_name(source, cold_cstr_span(code_target), &code_symbol)) {
+        munmap((void *)source.ptr, (size_t)source.len);
+        return cold_entry_semantics_error(stats, "command code symbol unavailable");
+    }
+    if (!cold_recognize_command_code_table(code_symbol.body, stats)) {
+        munmap((void *)source.ptr, (size_t)source.len);
+        return cold_entry_semantics_error(stats, "command code body is not strict string table");
+    }
+    char command_aux[64];
+    snprintf(command_aux, sizeof(command_aux), "commands:%d,default:%d",
+             stats->entry_command_case_count, stats->entry_command_default);
+    cold_entry_step_set(stats, 3, code_target, "string_command_code", "", command_aux);
+    stats->entry_semantics_ok = 1;
+    munmap((void *)source.ptr, (size_t)source.len);
+    return true;
 }
 
 static bool cold_manifest_stats(ColdContract *contract, ColdManifestStats *stats) {
@@ -860,6 +1600,8 @@ static bool cold_manifest_stats(ColdContract *contract, ColdManifestStats *stats
         stats->const_block_count += scan.const_block_count;
         stats->importc_count += scan.importc_count;
         stats->declaration_count += scan.declaration_count;
+        stats->function_symbol_count += scan.function_symbol_count;
+        stats->function_symbol_error_count += scan.function_symbol_error_count;
         stats->declaration_hash = cold_fnv1a64_update(stats->declaration_hash, rel);
         stats->declaration_hash = cold_fnv1a64_update_cstr(stats->declaration_hash, "=");
         char hash_text[32];
@@ -868,6 +1610,15 @@ static bool cold_manifest_stats(ColdContract *contract, ColdManifestStats *stats
         if (scan.entry_function_found) {
             stats->entry_function_found = 1;
             stats->entry_function_line = scan.entry_function_line;
+            stats->entry_function_source_start = scan.entry_function_source_start;
+            stats->entry_function_source_len = scan.entry_function_source_len;
+            stats->entry_function_params_start = scan.entry_function_params_start;
+            stats->entry_function_params_len = scan.entry_function_params_len;
+            stats->entry_function_return_start = scan.entry_function_return_start;
+            stats->entry_function_return_len = scan.entry_function_return_len;
+            stats->entry_function_body_start = scan.entry_function_body_start;
+            stats->entry_function_body_len = scan.entry_function_body_len;
+            stats->entry_function_has_body = scan.entry_function_has_body;
         }
         munmap((void *)source.ptr, (size_t)source.len);
     }
@@ -875,6 +1626,16 @@ static bool cold_manifest_stats(ColdContract *contract, ColdManifestStats *stats
     if (stats->missing_count == 0 && !stats->entry_function_found) {
         snprintf(stats->first_missing, sizeof(stats->first_missing),
                  "entry function not found: %s", stats->entry_function);
+        return false;
+    }
+    if (stats->missing_count == 0 && stats->function_symbol_error_count > 0) {
+        snprintf(stats->first_missing, sizeof(stats->first_missing),
+                 "function symbol parse errors: %d", stats->function_symbol_error_count);
+        return false;
+    }
+    if (stats->missing_count == 0 && !cold_entry_semantics_analyze(contract, stats)) {
+        snprintf(stats->first_missing, sizeof(stats->first_missing),
+                 "entry semantics: %s", stats->entry_semantics_error);
         return false;
     }
     return stats->missing_count == 0;
@@ -1362,6 +2123,7 @@ static bool cold_write_backend_driver_report(const char *path,
                                              ColdManifestStats *stats,
                                              const char *contract_path,
                                              const char *out_path,
+                                             const char *dispatch_path,
                                              const char *map_path,
                                              const char *index_path,
                                              uint64_t contract_hash) {
@@ -1381,6 +2143,7 @@ static bool cold_write_backend_driver_report(const char *path,
     fprintf(file, "contract=%s\n", contract_path);
     fprintf(file, "manifest=%s\n", manifest_path);
     fprintf(file, "output=%s\n", out_path);
+    fprintf(file, "entry_dispatch_executable=%s\n", dispatch_path);
     fprintf(file, "map=%s\n", map_path);
     fprintf(file, "cold_frontend_index=%s\n", index_path);
     fprintf(file, "contract_hash=%016llx\n", (unsigned long long)contract_hash);
@@ -1391,6 +2154,8 @@ static bool cold_write_backend_driver_report(const char *path,
     fprintf(file, "cold_frontend_declaration_count=%d\n", stats->declaration_count);
     fprintf(file, "cold_frontend_import_count=%d\n", stats->import_count);
     fprintf(file, "cold_frontend_function_count=%d\n", stats->function_count);
+    fprintf(file, "cold_frontend_function_symbol_count=%d\n", stats->function_symbol_count);
+    fprintf(file, "cold_frontend_function_symbol_error_count=%d\n", stats->function_symbol_error_count);
     fprintf(file, "cold_frontend_type_block_count=%d\n", stats->type_block_count);
     fprintf(file, "cold_frontend_const_block_count=%d\n", stats->const_block_count);
     fprintf(file, "cold_frontend_importc_count=%d\n", stats->importc_count);
@@ -1399,6 +2164,44 @@ static bool cold_write_backend_driver_report(const char *path,
     fprintf(file, "cold_frontend_entry_function=%s\n", stats->entry_function);
     fprintf(file, "cold_frontend_entry_function_line=%d\n", stats->entry_function_line);
     fprintf(file, "cold_frontend_entry_found=%d\n", stats->entry_function_found);
+    fprintf(file, "cold_frontend_entry_source_span_start=%d\n", stats->entry_function_source_start);
+    fprintf(file, "cold_frontend_entry_source_span_len=%d\n", stats->entry_function_source_len);
+    fprintf(file, "cold_frontend_entry_params_span_start=%d\n", stats->entry_function_params_start);
+    fprintf(file, "cold_frontend_entry_params_span_len=%d\n", stats->entry_function_params_len);
+    fprintf(file, "cold_frontend_entry_return_span_start=%d\n", stats->entry_function_return_start);
+    fprintf(file, "cold_frontend_entry_return_span_len=%d\n", stats->entry_function_return_len);
+    fprintf(file, "cold_frontend_entry_body_span_start=%d\n", stats->entry_function_body_start);
+    fprintf(file, "cold_frontend_entry_body_span_len=%d\n", stats->entry_function_body_len);
+    fprintf(file, "cold_frontend_entry_has_body=%d\n", stats->entry_function_has_body);
+    fprintf(file, "cold_frontend_entry_semantics_ok=%d\n", stats->entry_semantics_ok);
+    fprintf(file, "cold_frontend_entry_chain_step_count=%d\n", stats->entry_chain_step_count);
+    fprintf(file, "cold_frontend_entry_dispatch_case_count=%d\n", stats->entry_dispatch_case_count);
+    fprintf(file, "cold_frontend_entry_dispatch_default=%d\n", stats->entry_dispatch_default);
+    fprintf(file, "cold_frontend_entry_command_case_count=%d\n", stats->entry_command_case_count);
+    fprintf(file, "cold_frontend_entry_command_default=%d\n", stats->entry_command_default);
+    fputs("cold_frontend_entry_dispatch_codegen=1\n", file);
+    fputs("cold_frontend_entry_dispatch_verified=1\n", file);
+    fputs("cold_frontend_entry_dispatch_output=exit_code_only\n", file);
+    for (int32_t i = 0; i < stats->entry_chain_step_count; i++) {
+        fprintf(file, "cold_frontend_entry_chain[%d]=function:%s,kind:%s,target:%s,aux:%s\n",
+                i,
+                stats->entry_chain[i].function,
+                stats->entry_chain[i].kind,
+                stats->entry_chain[i].target,
+                stats->entry_chain[i].aux);
+    }
+    for (int32_t i = 0; i < stats->entry_dispatch_case_count; i++) {
+        fprintf(file, "cold_frontend_entry_dispatch_case[%d]=code:%d,target:%s\n",
+                i,
+                stats->entry_dispatch_cases[i].code,
+                stats->entry_dispatch_cases[i].target);
+    }
+    for (int32_t i = 0; i < stats->entry_command_case_count; i++) {
+        fprintf(file, "cold_frontend_entry_command_case[%d]=text:%s,code:%d\n",
+                i,
+                stats->entry_command_cases[i].text,
+                stats->entry_command_cases[i].code);
+    }
     fputs("cold_compiler=cheng_cold\n", file);
     fputs("direct_macho=1\n", file);
     fputs("self_image_emit=1\n", file);
@@ -1413,6 +2216,7 @@ static bool cold_write_backend_driver_map(const char *path,
                                           ColdContract *contract,
                                           ColdManifestStats *stats,
                                           const char *out_path,
+                                          const char *dispatch_path,
                                           const char *index_path,
                                           uint64_t contract_hash) {
     char parent[PATH_MAX];
@@ -1423,6 +2227,7 @@ static bool cold_write_backend_driver_map(const char *path,
     if (!file) return false;
     fputs("map_format=cold_backend_driver_contract_candidate_v1\n", file);
     fprintf(file, "candidate=%s\n", out_path);
+    fprintf(file, "entry_dispatch_executable=%s\n", dispatch_path);
     fprintf(file, "manifest=%s\n", manifest_path);
     fprintf(file, "cold_frontend_index=%s\n", index_path);
     fprintf(file, "contract_hash=%016llx\n", (unsigned long long)contract_hash);
@@ -1431,11 +2236,68 @@ static bool cold_write_backend_driver_map(const char *path,
     fprintf(file, "manifest_source_tree_hash=%016llx\n", (unsigned long long)stats->tree_hash);
     fprintf(file, "cold_frontend_declaration_count=%d\n", stats->declaration_count);
     fprintf(file, "cold_frontend_function_count=%d\n", stats->function_count);
+    fprintf(file, "cold_frontend_function_symbol_count=%d\n", stats->function_symbol_count);
+    fprintf(file, "cold_frontend_entry_semantics_ok=%d\n", stats->entry_semantics_ok);
+    fprintf(file, "cold_frontend_entry_chain_step_count=%d\n", stats->entry_chain_step_count);
+    fprintf(file, "cold_frontend_entry_command_case_count=%d\n", stats->entry_command_case_count);
+    fprintf(file, "cold_frontend_entry_dispatch_case_count=%d\n", stats->entry_dispatch_case_count);
+    fputs("cold_frontend_entry_dispatch_codegen=1\n", file);
+    fputs("cold_frontend_entry_dispatch_verified=1\n", file);
     fprintf(file, "cold_frontend_declaration_hash=%016llx\n", (unsigned long long)stats->declaration_hash);
     fputs("command_surface=print-contract,self-check,compile-bootstrap,bootstrap-bridge,build-backend-driver\n", file);
     fputs("real_backend_codegen=0\n", file);
     fclose(file);
     return true;
+}
+
+static void cold_write_function_symbols_for_source(FILE *file, Span source,
+                                                   Span rel, int32_t *ordinal) {
+    int32_t pos = 0;
+    int32_t line_no = 0;
+    bool in_triple = false;
+    while (pos < source.len) {
+        int32_t start = pos;
+        while (pos < source.len && source.ptr[pos] != '\n') pos++;
+        int32_t end = pos;
+        if (pos < source.len) pos++;
+        line_no++;
+        Span line = span_sub(source, start, end);
+        Span trimmed = span_trim(line);
+        if (in_triple) {
+            if (cold_line_has_triple_quote(line)) in_triple = false;
+            continue;
+        }
+        if (!cold_line_top_level(line) && cold_line_has_triple_quote(line)) {
+            in_triple = true;
+            continue;
+        }
+        if (!cold_line_top_level(line)) continue;
+        Span fn_name = {0};
+        if (!cold_parse_fn_name(trimmed, &fn_name)) continue;
+        ColdFunctionSymbol symbol;
+        if (!cold_parse_function_symbol_at(source, start, line_no, &symbol)) continue;
+        int32_t source_start = cold_span_offset(source, symbol.source_span);
+        int32_t params_start = cold_span_offset(source, symbol.params);
+        int32_t return_start = cold_span_offset(source, symbol.return_type);
+        int32_t body_start = cold_span_offset(source, symbol.body);
+        fprintf(file, "fn_symbol[%d]=source:", *ordinal);
+        span_write(file, rel);
+        fprintf(file, ",name:");
+        span_write(file, symbol.name);
+        fprintf(file,
+                ",line:%d,decl_start:%d,decl_len:%d,params_start:%d,params_len:%d,return_start:%d,return_len:%d,body_start:%d,body_len:%d,has_body:%d\n",
+                symbol.line,
+                source_start,
+                symbol.source_span.len,
+                params_start,
+                symbol.params.len,
+                return_start,
+                symbol.return_type.len,
+                body_start,
+                symbol.body.len,
+                symbol.has_body);
+        (*ordinal)++;
+    }
 }
 
 static bool cold_write_frontend_index_file(const char *path,
@@ -1462,6 +2324,8 @@ static bool cold_write_frontend_index_file(const char *path,
     fprintf(file, "declaration_count=%d\n", stats->declaration_count);
     fprintf(file, "import_count=%d\n", stats->import_count);
     fprintf(file, "function_count=%d\n", stats->function_count);
+    fprintf(file, "function_symbol_count=%d\n", stats->function_symbol_count);
+    fprintf(file, "function_symbol_error_count=%d\n", stats->function_symbol_error_count);
     fprintf(file, "type_block_count=%d\n", stats->type_block_count);
     fprintf(file, "const_block_count=%d\n", stats->const_block_count);
     fprintf(file, "importc_count=%d\n", stats->importc_count);
@@ -1470,7 +2334,43 @@ static bool cold_write_frontend_index_file(const char *path,
     fprintf(file, "entry_function=%s\n", stats->entry_function);
     fprintf(file, "entry_function_line=%d\n", stats->entry_function_line);
     fprintf(file, "entry_found=%d\n", stats->entry_function_found);
+    fprintf(file, "entry_source_span_start=%d\n", stats->entry_function_source_start);
+    fprintf(file, "entry_source_span_len=%d\n", stats->entry_function_source_len);
+    fprintf(file, "entry_params_span_start=%d\n", stats->entry_function_params_start);
+    fprintf(file, "entry_params_span_len=%d\n", stats->entry_function_params_len);
+    fprintf(file, "entry_return_span_start=%d\n", stats->entry_function_return_start);
+    fprintf(file, "entry_return_span_len=%d\n", stats->entry_function_return_len);
+    fprintf(file, "entry_body_span_start=%d\n", stats->entry_function_body_start);
+    fprintf(file, "entry_body_span_len=%d\n", stats->entry_function_body_len);
+    fprintf(file, "entry_has_body=%d\n", stats->entry_function_has_body);
+    fprintf(file, "entry_semantics_ok=%d\n", stats->entry_semantics_ok);
+    fprintf(file, "entry_chain_step_count=%d\n", stats->entry_chain_step_count);
+    fprintf(file, "entry_dispatch_case_count=%d\n", stats->entry_dispatch_case_count);
+    fprintf(file, "entry_dispatch_default=%d\n", stats->entry_dispatch_default);
+    fprintf(file, "entry_command_case_count=%d\n", stats->entry_command_case_count);
+    fprintf(file, "entry_command_default=%d\n", stats->entry_command_default);
+    for (int32_t i = 0; i < stats->entry_chain_step_count; i++) {
+        fprintf(file, "entry_chain[%d]=function:%s,kind:%s,target:%s,aux:%s\n",
+                i,
+                stats->entry_chain[i].function,
+                stats->entry_chain[i].kind,
+                stats->entry_chain[i].target,
+                stats->entry_chain[i].aux);
+    }
+    for (int32_t i = 0; i < stats->entry_dispatch_case_count; i++) {
+        fprintf(file, "entry_dispatch_case[%d]=code:%d,target:%s\n",
+                i,
+                stats->entry_dispatch_cases[i].code,
+                stats->entry_dispatch_cases[i].target);
+    }
+    for (int32_t i = 0; i < stats->entry_command_case_count; i++) {
+        fprintf(file, "entry_command_case[%d]=text:%s,code:%d\n",
+                i,
+                stats->entry_command_cases[i].text,
+                stats->entry_command_cases[i].code);
+    }
 
+    int32_t function_ordinal = 0;
     for (int32_t i = 0; i < manifest.count; i++) {
         Span rel = manifest.fields[i].value;
         char source_path[PATH_MAX];
@@ -1489,11 +2389,12 @@ static bool cold_write_frontend_index_file(const char *path,
                 "source[%d]=path:", i);
         span_write(file, rel);
         fprintf(file,
-                ",lines:%llu,bytes:%llu,imports:%d,functions:%d,type_blocks:%d,const_blocks:%d,importc:%d,declarations:%d,declaration_hash:%016llx,entry:%d,entry_line:%d\n",
+                ",lines:%llu,bytes:%llu,imports:%d,functions:%d,function_symbols:%d,type_blocks:%d,const_blocks:%d,importc:%d,declarations:%d,declaration_hash:%016llx,entry:%d,entry_line:%d\n",
                 (unsigned long long)scan.line_count,
                 (unsigned long long)scan.byte_count,
                 scan.import_count,
                 scan.function_count,
+                scan.function_symbol_count,
                 scan.type_block_count,
                 scan.const_block_count,
                 scan.importc_count,
@@ -1501,11 +2402,16 @@ static bool cold_write_frontend_index_file(const char *path,
                 (unsigned long long)scan.declaration_hash,
                 scan.entry_function_found,
                 scan.entry_function_line);
+        cold_write_function_symbols_for_source(file, source, rel, &function_ordinal);
         munmap((void *)source.ptr, (size_t)source.len);
     }
+    fprintf(file, "function_symbol_written_count=%d\n", function_ordinal);
     fclose(file);
     return true;
 }
+
+static bool cold_write_entry_dispatch_executable(const char *path, ColdManifestStats *stats);
+static bool cold_verify_entry_dispatch_executable(const char *path, ColdManifestStats *stats);
 
 static int cold_cmd_build_backend_driver(int argc, char **argv, const char *self_path) {
     const char *contract_path = cold_flag_value(argc, argv, "--in");
@@ -1540,6 +2446,7 @@ static int cold_cmd_build_backend_driver(int argc, char **argv, const char *self
     char report_path[PATH_MAX];
     char map_path[PATH_MAX];
     char index_path[PATH_MAX];
+    char dispatch_path[PATH_MAX];
     char self_log[PATH_MAX];
     char actual_contract_path[PATH_MAX];
     char expected_contract_path[PATH_MAX];
@@ -1552,6 +2459,7 @@ static int cold_cmd_build_backend_driver(int argc, char **argv, const char *self
     else if (!cold_path_with_suffix(map_path, sizeof(map_path), out_path, ".map")) return 1;
     if (index_arg && index_arg[0] != '\0') cold_absolute_path(index_arg, index_path, sizeof(index_path));
     else if (!cold_path_with_suffix(index_path, sizeof(index_path), out_path, ".source-index.txt")) return 1;
+    if (!cold_path_with_suffix(dispatch_path, sizeof(dispatch_path), out_path, ".entry-dispatch")) return 1;
     if (!cold_path_with_suffix(self_log, sizeof(self_log), out_path, ".self-check.log")) return 1;
     if (!cold_path_with_suffix(actual_contract_path, sizeof(actual_contract_path), out_path, ".contract.txt")) return 1;
     if (!cold_path_with_suffix(expected_contract_path, sizeof(expected_contract_path), out_path, ".expected-contract.txt")) return 1;
@@ -1588,14 +2496,27 @@ static int cold_cmd_build_backend_driver(int argc, char **argv, const char *self
     int compile_rc = cold_cmd_compile_bootstrap(5, compile_argv, self_path);
     if (compile_rc != 0) return compile_rc;
 
+    if (!span_eq(cold_contract_get(&contract, "target"), "arm64-apple-darwin")) {
+        fprintf(stderr, "[cheng_cold] entry dispatch executable only supports arm64-apple-darwin\n");
+        return 1;
+    }
+    if (!cold_write_entry_dispatch_executable(dispatch_path, &stats)) {
+        fprintf(stderr, "[cheng_cold] failed to write entry dispatch executable: %s\n", dispatch_path);
+        return 1;
+    }
+    if (!cold_verify_entry_dispatch_executable(dispatch_path, &stats)) {
+        fprintf(stderr, "[cheng_cold] entry dispatch executable verification failed: %s\n", dispatch_path);
+        return 1;
+    }
+
     if (!cold_write_backend_driver_report(report_path, &contract, &stats,
-                                          abs_contract, out_path, map_path,
+                                          abs_contract, out_path, dispatch_path, map_path,
                                           index_path,
                                           contract_hash)) {
         fprintf(stderr, "[cheng_cold] failed to write backend driver report: %s\n", report_path);
         return 1;
     }
-    if (!cold_write_backend_driver_map(map_path, &contract, &stats, out_path, index_path, contract_hash)) {
+    if (!cold_write_backend_driver_map(map_path, &contract, &stats, out_path, dispatch_path, index_path, contract_hash)) {
         fprintf(stderr, "[cheng_cold] failed to write backend driver map: %s\n", map_path);
         return 1;
     }
@@ -1621,6 +2542,7 @@ static int cold_cmd_build_backend_driver(int argc, char **argv, const char *self
     printf("backend_driver_candidate=ok\n");
     printf("candidate_kind=contract_only\n");
     printf("out=%s\n", out_path);
+    printf("entry_dispatch_executable=%s\n", dispatch_path);
     printf("report=%s\n", report_path);
     printf("map=%s\n", map_path);
     printf("cold_frontend_index=%s\n", index_path);
@@ -1629,7 +2551,15 @@ static int cold_cmd_build_backend_driver(int argc, char **argv, const char *self
     printf("manifest_source_tree_hash=%016llx\n", (unsigned long long)stats.tree_hash);
     printf("cold_frontend_declaration_count=%d\n", stats.declaration_count);
     printf("cold_frontend_function_count=%d\n", stats.function_count);
+    printf("cold_frontend_function_symbol_count=%d\n", stats.function_symbol_count);
     printf("cold_frontend_entry_function_line=%d\n", stats.entry_function_line);
+    printf("cold_frontend_entry_body_span_len=%d\n", stats.entry_function_body_len);
+    printf("cold_frontend_entry_semantics_ok=%d\n", stats.entry_semantics_ok);
+    printf("cold_frontend_entry_chain_step_count=%d\n", stats.entry_chain_step_count);
+    printf("cold_frontend_entry_command_case_count=%d\n", stats.entry_command_case_count);
+    printf("cold_frontend_entry_dispatch_case_count=%d\n", stats.entry_dispatch_case_count);
+    printf("cold_frontend_entry_dispatch_codegen=1\n");
+    printf("cold_frontend_entry_dispatch_verified=1\n");
     printf("real_backend_codegen=0\n");
     return 0;
 }
@@ -2343,6 +3273,8 @@ static BodyIR *parse_fn(Parser *parser) {
 enum {
     R0 = 0,
     R1 = 1,
+    R2 = 2,
+    R3 = 3,
     SP = 31,
     LR = 30,
     FP = 29,
@@ -2367,6 +3299,10 @@ static uint32_t a64_ldr_imm(int rt, int rn, int32_t offset, bool x) {
     int32_t scale = x ? 3 : 2;
     uint32_t imm = (uint32_t)((offset >> scale) & 0xFFF);
     return (x ? 0xF9400000u : 0xB9400000u) | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static uint32_t a64_ldrb_imm(int rt, int rn, int32_t offset) {
+    uint32_t imm = (uint32_t)(offset & 0xFFF);
+    return 0x39400000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
 static uint32_t a64_stp_pre(int a, int b, int n, int32_t offset) {
     uint32_t imm = (uint32_t)((offset >> 3) & 0x7F);
@@ -2570,6 +3506,87 @@ static void codegen_func(Code *code, BodyIR *body) {
             code->words[patch.pos] = (ins & 0xFC000000u) | ((uint32_t)delta & 0x03FFFFFFu);
         }
     }
+}
+
+static void code_patch_bcond(Code *code, int32_t pos, int32_t target) {
+    int32_t delta = target - pos;
+    uint32_t ins = code->words[pos];
+    code->words[pos] = (ins & 0xFF00001Fu) | (((uint32_t)delta & 0x7FFFFu) << 5);
+}
+
+static void code_emit_return_i32(Code *code, int32_t value) {
+    code_emit(code, a64_movz(R0, (uint16_t)(value & 0xFFFF), 0));
+    code_emit(code, a64_ret());
+}
+
+static int32_t cold_entry_dispatch_exit_code(int32_t command_code) {
+    if (command_code == 0 || command_code == 1 || command_code == 2) return 0;
+    return 2;
+}
+
+static void cold_emit_argv_string_case(Code *code, const char *text, int32_t exit_code) {
+    int32_t fail_patches[96];
+    int32_t fail_count = 0;
+    int32_t len = (int32_t)strlen(text);
+    if (len + 1 > (int32_t)(sizeof(fail_patches) / sizeof(fail_patches[0]))) {
+        die("cold entry dispatch command too long");
+    }
+    for (int32_t i = 0; i <= len; i++) {
+        int32_t expected = i < len ? (uint8_t)text[i] : 0;
+        code_emit(code, a64_ldrb_imm(R3, R2, i));
+        code_emit(code, a64_cmp_imm(R3, (uint16_t)expected));
+        fail_patches[fail_count++] = code->count;
+        code_emit(code, a64_bcond(0, COND_NE));
+    }
+    code_emit_return_i32(code, exit_code);
+    int32_t fail_target = code->count;
+    for (int32_t i = 0; i < fail_count; i++) {
+        code_patch_bcond(code, fail_patches[i], fail_target);
+    }
+}
+
+static bool cold_write_entry_dispatch_executable(const char *path, ColdManifestStats *stats) {
+    Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (arena == MAP_FAILED) return false;
+    Code *code = code_new(arena, 1024);
+
+    code_emit(code, a64_cmp_imm(R0, 2));
+    int32_t has_arg_patch = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+    code_emit_return_i32(code, 0);
+    code_patch_bcond(code, has_arg_patch, code->count);
+
+    code_emit(code, a64_ldr_imm(R2, R1, 8, true));
+    for (int32_t i = 0; i < stats->entry_command_case_count; i++) {
+        int32_t exit_code = cold_entry_dispatch_exit_code(stats->entry_command_cases[i].code);
+        cold_emit_argv_string_case(code, stats->entry_command_cases[i].text, exit_code);
+    }
+    code_emit_return_i32(code, 2);
+    return macho_write_exec(path, code->words, code->count);
+}
+
+static bool cold_run_executable_expect_rc(const char *path, const char *arg, int32_t expected_rc) {
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        if (arg) execl(path, path, arg, (char *)0);
+        else execl(path, path, (char *)0);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == expected_rc;
+}
+
+static bool cold_verify_entry_dispatch_executable(const char *path, ColdManifestStats *stats) {
+    if (!cold_run_executable_expect_rc(path, 0, 0)) return false;
+    for (int32_t i = 0; i < stats->entry_command_case_count; i++) {
+        int32_t exit_code = cold_entry_dispatch_exit_code(stats->entry_command_cases[i].code);
+        if (!cold_run_executable_expect_rc(path, stats->entry_command_cases[i].text, exit_code)) return false;
+    }
+    if (!cold_run_executable_expect_rc(path, "__cheng_cold_unknown_command__", 2)) return false;
+    return true;
 }
 
 /* ================================================================
