@@ -142,34 +142,76 @@ static bool p_fn(P *p,BI *bi){
     if(seq(colon,":"))ret=p_tok(p);else ret=colon;
     S eq=p_tok(p);if(!seq(eq,"=")){p_line(p);return false;}
     st_add_fn(p->st,name,arity,ret);
-    /* Parse body */
     bi_blk(bi);
-    /* Skip inline whitespace after = */
+    /* Skip inline ws after = */
     while(p->pos<p->src.n&&(p->src.p[p->pos]==' '||p->src.p[p->pos]=='\t'))p->pos++;
-    /* Same-line body? */
-    if(p->pos<p->src.n&&p->src.p[p->pos]!='\n'&&p->src.p[p->pos]!='\r'){
-        S kw2=p_tok(p);
-        if(seq(kw2,"return")){
+    /* Determine body style: same-line or indented block */
+    bool multi=p->pos<p->src.n&&(p->src.p[p->pos]=='\n'||p->src.p[p->pos]=='\r');
+    if(multi){while(p->pos<p->src.n&&(p->src.p[p->pos]=='\n'||p->src.p[p->pos]=='\r'))p->pos++;}
+    int32_t base=0;
+    /* Parse statements */
+    int32_t pending_cbr=-1,cbr_blk=-1,true_blk=-1;/* for if/else chaining */
+    for(int si=0;;si++){
+        if(multi){
+            int32_t li=p->pos;while(li>0&&p->src.p[li-1]!='\n')li--;
+            int32_t ind=0;while(li+ind<p->src.n&&(p->src.p[li+ind]==' '||p->src.p[li+ind]=='\t'))ind++;
+            if(si>0&&ind<=base)break;
+        }
+        S kw=p_tok(p);if(kw.n==0)break;
+        if(seq(kw,"return")){
             S val=p_tok(p);int32_t rv=s_parse_i32(val);
             int32_t sl=bs(bi,SLOT_I32,4);bo(bi,OP_LDC,sl,rv,0);
             int32_t ti=bt(bi,TM_RET,0,sl,0,-1,-1,-1);bi_end(bi,ti);
-        } else { p_line(p); }
-    } else {
-        /* Multi-line: skip newline, parse indented statements */
-        while(p->pos<p->src.n&&(p->src.p[p->pos]=='\n'||p->src.p[p->pos]=='\r'))p->pos++;
-        int32_t base=0;
-        while(p->pos<p->src.n){
-            /* Calculate current line indent */
-            int32_t li=p->pos;while(li>0&&p->src.p[li-1]!='\n')li--;
-            int32_t ind=0;while(li+ind<p->src.n&&(p->src.p[li+ind]==' '||p->src.p[li+ind]=='\t'))ind++;
-            if(ind<=base)break;
-            S kw2=p_tok(p);
-            if(seq(kw2,"return")){
-                S val=p_tok(p);int32_t rv=s_parse_i32(val);
-                int32_t sl=bs(bi,SLOT_I32,4);bo(bi,OP_LDC,sl,rv,0);
-                int32_t ti=bt(bi,TM_RET,0,sl,0,-1,-1,-1);bi_end(bi,ti);
-            } else { p_line(p); }
-        }
+        }else if(seq(kw,"if")){
+            /* Parse: if <lhs> <op> <rhs>: */
+            S l=p_tok(p);int32_t lv=s_parse_i32(l);
+            S op=p_tok(p);int32_t cond=0;
+            if(seq(op,"=="))cond=COND_EQ;else if(seq(op,"!="))cond=COND_NE;
+            else if(seq(op,"<"))cond=COND_LT;else if(seq(op,">"))cond=COND_GT;
+            else if(seq(op,"<="))cond=COND_LE;else if(seq(op,">="))cond=COND_GE;
+            S r=p_tok(p);int32_t rv2=s_parse_i32(r);
+            S col=p_tok(p);if(!seq(col,":")){p_line(p);continue;}
+            /* Emit CMP, close block with CBR term */
+            bo(bi,OP_CMP,lv,rv2,0);
+            int32_t cbr=bt(bi,TM_CBR,cond,0,0,-1,-1,-1);
+            bi_end(bi,cbr);/* close current block (CMP+CBR) */
+            cbr_blk=bi->bn-1;/* block index of CBR term */
+            bi_blk(bi);/* start true block */
+            true_blk=bi->bn-1;/* block index of true body */
+            /* Check for same-line body after : */
+            if(!multi){
+                S body_kw=p_tok(p);
+                if(seq(body_kw,"return")){
+                    S bv=p_tok(p);int32_t brv=s_parse_i32(bv);
+                    int32_t bsl=bs(bi,SLOT_I32,4);bo(bi,OP_LDC,bsl,brv,0);
+                    int32_t bti=bt(bi,TM_RET,0,bsl,0,-1,-1,-1);bi_end(bi,bti);
+                }
+            }
+            pending_cbr=cbr;
+        }else if(seq(kw,"else")){
+            S col=p_tok(p);if(!seq(col,":")){p_line(p);continue;}
+            /* True block was already closed by its return/bi_end. */
+            /* Set CBR false→next block, true→stored true block */
+            if(pending_cbr>=0&&pending_cbr<bi->tn){
+                bi->tf[pending_cbr]=bi->bn;/* false→this new block */
+                bi->tt[pending_cbr]=true_blk;/* true→true block */
+            }
+            bi_blk(bi);/* start false block */
+            if(!multi){
+                S body_kw=p_tok(p);
+                if(seq(body_kw,"return")){
+                    S bv=p_tok(p);int32_t brv=s_parse_i32(bv);
+                    int32_t bsl=bs(bi,SLOT_I32,4);bo(bi,OP_LDC,bsl,brv,0);
+                    int32_t bti=bt(bi,TM_RET,0,bsl,0,-1,-1,-1);bi_end(bi,bti);
+                }
+            }
+            pending_cbr=-1;
+        }else{ p_line(p); }
+        if(!multi)break;/* single statement for same-line body */
+    }
+    /* Resolve pending if without else: false falls through to end */
+    if(pending_cbr>=0&&pending_cbr<bi->tn){
+        bi->tf[pending_cbr]=-1;bi->tt[pending_cbr]=true_blk;
     }
     return true;
 }
@@ -200,37 +242,56 @@ typedef struct {uint32_t *w;int32_t n,c;Ar *a;} CB;
 static CB *cn(Ar *a,int32_t c){CB *x=aa(a,sizeof(CB));x->w=aa(a,c*4);x->n=0;x->c=c;x->a=a;return x;}
 static void e(CB *c,uint32_t w){if(c->n>=c->c){int32_t nc=c->c*2;uint32_t*nw=aa(c->a,nc*4);memcpy(nw,c->w,c->n*4);c->w=nw;c->c=nc;}c->w[c->n++]=w;}
 
-/* Codegen: emit prologue + body + epilogue */
+/* Codegen: walk blocks, emit ops+terms, two-pass branch patching */
 static void cg_func(CB *c,BI *bi,int32_t rv,int32_t frame){
+    if(bi->bn<=0){/* flat IR (no blocks) */
+        e(c,_spp(FP,LR,SP,-16,1));e(c,_ai(FP,SP,16,1));
+        if(frame>0)e(c,_si(SP,SP,frame,1));
+        for(int32_t i=0;i<bi->on;i++){if(bi->ok[i]==OP_LDC)e(c,_mz(R0,bi->o0[i],0));}
+        e(c,_sti(R0,SP,0,0));if(frame>0)e(c,_ai(SP,SP,frame,1));
+        e(c,_lpp(FP,LR,SP,16,1));e(c,_rt());return;
+    }
     e(c,_spp(FP,LR,SP,-16,1));e(c,_ai(FP,SP,16,1));
     if(frame>0)e(c,_si(SP,SP,frame,1));
-    /* Body: emit ops */
-    for(int32_t i=0;i<bi->on;i++){
-        switch(bi->ok[i]){
-        case OP_LDC: e(c,_mz(R0,bi->o0[i],0)); break;
-        case OP_BINOP:
-            /* Load lhs to R0, rhs to R1, apply op, result in R0 */
-            e(c,_mz(R0,bi->o0[i],0));
-            e(c,_mz(R1,bi->o1[i],0));
-            switch(bi->ot[i]){
-            case BIN_ADD: e(c,_add(R0,R0,R1,0)); break;
-            case BIN_SUB: e(c,_sub(R0,R0,R1,0)); break;
-            case BIN_MUL: e(c,_mul(R0,R0,R1,0)); break;
-            case BIN_DIV: e(c,_sdiv(R0,R0,R1,0)); break;
+    /* Track block start positions for branch patching */
+    int32_t *bp=calloc(bi->bn,sizeof(int32_t));
+    /* Branch patches: fixed-size (max 64 branches) */
+    int32_t brp[64],brt[64];int32_t brn=0;
+    for(int32_t b=0;b<bi->bn;b++){
+        bp[b]=c->n;
+        int32_t os=bi->bs[b],oe=os+bi->bc[b];if(oe>bi->on)oe=bi->on;
+        for(int32_t oi=os;oi<oe;oi++){
+            switch(bi->ok[oi]){
+            case OP_LDC:e(c,_mz(R0,bi->o0[oi],0));break;
+            case OP_CMP:e(c,_mz(R0,bi->o0[oi],0));e(c,_ci(R0,bi->o1[oi],0));break;
             }
-            break;
-        case OP_CMP:
-            e(c,_mz(R0,bi->o0[i],0));
-            e(c,_ci(R0,bi->o1[i],0));
-            break;
+        }
+        /* Emit terminator */
+        int32_t ti=bi->bt[b];
+        if(ti>=0&&ti<bi->tn){
+            int32_t tk=bi->tk[ti],tb2=bi->tt[ti],fb=bi->tf[ti];
+            if(tk==TM_RET){
+                e(c,_sti(R0,SP,0,0));if(frame>0)e(c,_ai(SP,SP,frame,1));
+                e(c,_lpp(FP,LR,SP,16,1));e(c,_rt());
+            }else if(tk==TM_BR&&brn<63){
+                brp[brn]=c->n;brt[brn]=tb2;brn++;e(c,_b(0));
+            }else if(tk==TM_CBR&&brn<62){
+                brp[brn]=c->n;brt[brn]=tb2;brn++;
+                brp[brn]=c->n+1;brt[brn]=fb;brn++;
+                e(c,_bc(0,bi->tc[ti]));e(c,_b(0));
+            }
         }
     }
-    /* Store result */
-    e(c,_sti(R0,SP,0,0));
-    /* Terms - for now just return */
-    if(frame>0)e(c,_ai(SP,SP,frame,1));
-    e(c,_lpp(FP,LR,SP,16,1));
-    e(c,_rt());
+    /* Patch branch offsets */
+    for(int32_t i=0;i<brn;i++){
+        int32_t pos=brp[i],tgt=brt[i];
+        int32_t tw=(tgt>=0&&tgt<bi->bn)?bp[tgt]:c->n;
+        int32_t delta=tw-pos;
+        uint32_t ins=c->w[pos];
+        if((ins&0xFC000000)==0x54000000)c->w[pos]=(ins&0xFF00001F)|((uint32_t)(delta&0x7FFFF)<<5);
+        else c->w[pos]=(ins&0xFC000000)|((uint32_t)(delta&0x3FFFFFF));
+    }
+    free(bp);
 }
 
 /* ================================================================
