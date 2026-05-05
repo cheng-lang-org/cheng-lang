@@ -182,16 +182,64 @@ static void cg_return_const(CB *c, int32_t val) {
 }
 
 /* ================================================================
- * Output: write .s then compile with cc
+ * Output: direct Mach-O (patch pre-built template) or fallback to cc
  * ================================================================ */
 
-static int out_cc(const char *path, CB *c) {
+static int out_direct(const char *path, CB *c) {
+    /* Try direct Mach-O via template patching */
+    const char *tmpl = "bootstrap/cheng_cold_template";
+    int fd = open(tmpl, O_RDONLY);
+    if (fd >= 0) {
+        struct stat st; fstat(fd, &st);
+        uint8_t *buf = mmap(0, st.st_size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (buf && buf != MAP_FAILED) {
+            uint32_t *w = (uint32_t*)buf;
+            int32_t ncmds = w[4];
+            int32_t off = 32;
+            for (int i = 0; i < ncmds; i++) {
+                uint32_t cmd = w[off/4], csz = w[off/4+1];
+                if (cmd == 0x19) {
+                    char sn[17]; memcpy(sn, buf+off+8, 16); sn[16]=0;
+                    if (strncmp(sn, "__TEXT", 6) == 0) {
+                        int32_t ns = w[off/4+16], so = off + 72;
+                        for (int s = 0; s < ns; s++) {
+                            char nm[17]; memcpy(nm, buf+so, 16); nm[16]=0;
+                            if (strncmp(nm, "__text", 6) == 0) {
+                                int32_t to = w[so/4+12];
+                                int32_t cs = c->n * 4, ms = w[so/4+10];
+                                if (cs <= ms) {
+                                    memcpy(buf + to, c->words, cs);
+                                    w[so/4+10] = cs;
+                                    int out_fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0755);
+                                    if (out_fd >= 0) {
+                                        write(out_fd, buf, st.st_size);
+                                        close(out_fd);
+                                        munmap(buf, st.st_size);
+                                        char cmd[256]; snprintf(cmd, sizeof(cmd), "codesign -s - %s 2>/dev/null", path);
+                                        system(cmd);
+                                        return 0;
+                                    }
+                                }
+                                break;
+                            }
+                            so += 80;
+                        }
+                        break;
+                    }
+                }
+                off += csz;
+            }
+            munmap(buf, st.st_size);
+        }
+    }
+    /* Fallback: write .s and compile with cc */
     char sp[512]; snprintf(sp,sizeof(sp),"%s.s",path);
-    FILE *f=fopen(sp,"w"); if(!f)return 1;
-    fprintf(f,".global _main\n.align 2\n_main:\n");
-    for(int32_t i=0;i<c->n;i++)fprintf(f,"  .long %u\n",c->w[i]);
+    FILE *f = fopen(sp, "w"); if (!f) return 1;
+    fprintf(f, ".global _main\n.align 2\n_main:\n");
+    for (int32_t i = 0; i < c->n; i++) fprintf(f, "  .long %u\n", c->words[i]);
     fclose(f);
-    char cmd[1024]; snprintf(cmd,sizeof(cmd),"cc -arch arm64 -o %s %s 2>&1",path,sp);
+    char cmd[1024]; snprintf(cmd, sizeof(cmd), "cc -arch arm64 -o %s %s 2>&1", path, sp);
     return system(cmd);
 }
 
