@@ -5750,6 +5750,45 @@ fn PrimaryObjectMissingTypedIrKind(lowering: lower.LoweringPlanStub,
                 return "stmt_assign"
     return ""
 
+fn PrimaryBuildBodyIrForFunction(lowering: lower.LoweringPlanStub,
+                                   irFn: lower.PrimaryObjectIrFunction,
+                                   i: int32,
+                                   tempBodyIRs: var coreir.BodyIR[],
+                                   wordCounts: var int32[]) =
+    var buildBodyIR = irFn.bodyKind == texpr.BodyKindUnsupported ||
+                      irFn.bodyKind == texpr.BodyKindStatementSequence
+    if !buildBodyIR:
+        buildBodyIR = PrimaryStatementSequenceReturnMode(irFn.bodyKind) != PrimaryStatementReturnModeNone()
+    if buildBodyIR:
+        if irFn.statements.len > 0 ||
+           irFn.bodyKind == texpr.BodyKindUnsupported ||
+           irFn.bodyKind == texpr.BodyKindStatementSequence:
+            let typedFnIndex = irFn.typedFunctionIndex
+            if typedFnIndex >= 0:
+                var bodyIR = PrimaryBuildBodyIrFromTypedStatements(lowering.typedIr,
+                typedFnIndex,
+                irFn)
+                PrimaryBodyIrPatchCallTargetSymbols(bodyIR,
+                                                    irFn.callTargets,
+                                                    irFn.callImportcSymbols)
+                if bodyIR.ops.len > 0 || bodyIR.terms.len > 0:
+                    tempBodyIRs[i] = bodyIR
+                    wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(bodyIR)
+                else:
+                    var fb2 = coreir.BodyIRNew()
+                    var fbs2: int32
+                    PrimaryBodyIrAppendReturnTerm(fb2, fbs2, -1, coreir.LocalInvalidTag, 0, false)
+                    if fb2.ops.len > 0 || fb2.terms.len > 0:
+                        tempBodyIRs[i] = fb2
+                        wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(fb2)
+            elif irFn.statements.len <= 0 || typedFnIndex < 0:
+                var fb = coreir.BodyIRNew()
+                var fbs: int32
+                PrimaryBodyIrAppendReturnTerm(fb, fbs, -1, coreir.LocalInvalidTag, 0, false)
+                if fb.ops.len > 0 || fb.terms.len > 0:
+                    tempBodyIRs[i] = fb
+                    wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(fb)
+
 fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                             lowering: lower.LoweringPlanStub): PrimaryObjectPlan =
     var allSymbolNames: str[]
@@ -5834,65 +5873,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
             wordCounts[i] = PrimaryFunctionWordCountForBodyKind(lowering.primaryObjectIr.functions[irIndex].bodyKind)
             if wordCounts[i] <= 0:
                 let irFn = lowering.primaryObjectIr.functions[irIndex]
-                var buildBodyIR = irFn.bodyKind == texpr.BodyKindUnsupported ||
-                                  irFn.bodyKind == texpr.BodyKindStatementSequence
-                if !buildBodyIR:
-                    buildBodyIR = PrimaryStatementSequenceReturnMode(irFn.bodyKind) != PrimaryStatementReturnModeNone()
-                if buildBodyIR:
-                    if irFn.statements.len > 0 ||
-                       irFn.bodyKind == texpr.BodyKindUnsupported ||
-                       irFn.bodyKind == texpr.BodyKindStatementSequence:
-                        let typedFnIndex = PrimaryTypedIrFunctionIndex(lowering.typedIr,
-                        sourcePath,
-                        lowering.functionNames[i])
-                        if typedFnIndex >= 0:
-                                var bodyIR = PrimaryBuildBodyIrFromTypedStatements(lowering.typedIr,
-                                typedFnIndex,
-                                irFn)
-                                PrimaryBodyIrPatchCallTargetSymbols(bodyIR,
-                                                                    irFn.callTargets,
-                                                                    irFn.callImportcSymbols)
-                                if bodyIR.ops.len > 0 || bodyIR.terms.len > 0:
-                                    tempBodyIRs[i] = bodyIR
-                                    wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(bodyIR)
-                                else:
-                                    var fallbackBodyIR2 = coreir.BodyIRNew()
-                                    var fbBlockStart2: int32
-                                    PrimaryBodyIrAppendReturnTerm(fallbackBodyIR2,
-                                                                  fbBlockStart2,
-                                                                  -1,
-                                                                  coreir.LocalInvalidTag,
-                                                                  0,
-                                                                  false)
-                                    if fallbackBodyIR2.ops.len > 0 ||
-                                       fallbackBodyIR2.terms.len > 0:
-                                        tempBodyIRs[i] = fallbackBodyIR2
-                                        wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(fallbackBodyIR2)
-                        elif irFn.statements.len <= 0 || typedFnIndex < 0:
-                                var fallbackBodyIR = coreir.BodyIRNew()
-                                var fbBlockStart: int32
-                                PrimaryBodyIrAppendReturnTerm(fallbackBodyIR,
-                                                              fbBlockStart,
-                                                              -1,
-                                                              coreir.LocalInvalidTag,
-                                                              0,
-                                                              false)
-                                if fallbackBodyIR.ops.len > 0 ||
-                                   fallbackBodyIR.terms.len > 0:
-                                    tempBodyIRs[i] = fallbackBodyIR
-                                    wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(fallbackBodyIR)
-        if wordCounts[i] <= 0 && buildBodyIR:
-            var finalBodyIR = coreir.BodyIRNew()
-            var finalBlockStart: int32
-            PrimaryBodyIrAppendReturnTerm(finalBodyIR,
-                                          finalBlockStart,
-                                          -1,
-                                          coreir.LocalInvalidTag,
-                                          0,
-                                          false)
-            if finalBodyIR.ops.len > 0 || finalBodyIR.terms.len > 0:
-                tempBodyIRs[i] = finalBodyIR
-                wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(finalBodyIR)
+                PrimaryBuildBodyIrForFunction(lowering, irFn, i, tempBodyIRs, wordCounts)
         var symbolText = lowering.functionSymbolTexts[i]
         if i < lowering.functionExportedFlags.len &&
            i < lowering.functionExportSymbolNames.len &&
