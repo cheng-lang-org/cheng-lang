@@ -1,6 +1,7 @@
 import std/result
 import std/os as os
 import std/strutils as strutil
+import std/thread
 import cheng/std/bytes_layout as layout
 import cheng/std/crypto/hash256
 import cheng/core/tooling/compiler_request as creq
@@ -2054,37 +2055,118 @@ fn BuildCompilerCsgWithOverridesInto(linkPlan: slplan.SystemLinkPlanStub,
                                              sourceTextLookup,
                                              sourcePath))
     CompilerCsgSortSourcePathModulePairs(orderedSources, orderedSourceModules)
-    for sourceIndex in 0..<orderedSources.len:
-        if sourceIndex % 16 == 0:
-            os.ProcessResourceGuardCheck()
-        let sourcePath = orderedSources[sourceIndex]
-        let ownerModulePath = orderedSourceModules[sourceIndex]
-        let ownerModuleNodeId = CompilerCsgModuleNodeIdIndexed(modules,
-                                                               moduleNodeIds,
-                                                               ownerModulePath)
-        if ownerModuleNodeId <= 0:
-            continue
-        var text = ""
-        let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
-        if !CompilerCsgSourceTextLookupFast(sourceTextLookup, sourcePath, normalizedSourcePath, text):
-            text = chengpath.ReadTextFile("", sourcePath)
-        add(typedSourceTexts, texpr.TypedExprSourceTextNewWithExternalPackageRoots(linkPlan.workspaceRoot,
-                                                                                      linkPlan.packageRoot,
-                                                                                      externalPackageRoots,
-                                                                                      sourcePath,
-                                                                                      text))
-        var profile: parser.NormalizedExprCallProfile
-        var profileErr = ""
-        if !parser.ParserBuildExprCallProfileWithExternalPackageRoots(linkPlan.workspaceRoot,
-                                                                        linkPlan.packageRoot,
-                                                                        externalPackageRoots,
-                                                                        sourcePath,
-                                                                        text,
-                                                                        profile,
-                                                                        profileErr):
-            err = " compiler csg: normalized decl read failed"
-            return false
-        add(exprCallProfiles, profile)
+    var sourceCount = orderedSources.len
+    var typedSourceTextsByIndex: texpr.TypedExprSourceText[]
+    var exprCallProfilesByIndex: parser.NormalizedExprCallProfile[]
+    for _ in 0..<sourceCount:
+        add(typedSourceTextsByIndex, texpr.TypedExprSourceText{})
+        add(exprCallProfilesByIndex, parser.NormalizedExprCallProfile{})
+    if thread.Parallelism() >= 4 && sourceCount > 64:
+        var chunkCount = thread.Parallelism()
+        if chunkCount > sourceCount:
+            chunkCount = sourceCount
+        var chunkSize = sourceCount / chunkCount
+        if chunkSize <= 0:
+            chunkSize = 1
+        for chunkIndex in 0..<chunkCount:
+            let startIdx = chunkIndex * chunkSize
+            var endIdx = startIdx + chunkSize
+            if chunkIndex == chunkCount - 1:
+                endIdx = sourceCount
+            if !thread.Spawn(fn() =
+                for sourceIndex in startIdx..<endIdx:
+                    let sourcePath = orderedSources[sourceIndex]
+                    let ownerModulePath = orderedSourceModules[sourceIndex]
+                    let ownerModuleNodeId = CompilerCsgModuleNodeIdIndexed(modules,
+                                                                           moduleNodeIds,
+                                                                           ownerModulePath)
+                    if ownerModuleNodeId <= 0:
+                        continue
+                    var text = ""
+                    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+                    if !CompilerCsgSourceTextLookupFast(sourceTextLookup, sourcePath, normalizedSourcePath, text):
+                        text = chengpath.ReadTextFile("", sourcePath)
+                    typedSourceTextsByIndex[sourceIndex] = texpr.TypedExprSourceTextNewWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                                                                  linkPlan.packageRoot,
+                                                                                                                  externalPackageRoots,
+                                                                                                                  sourcePath,
+                                                                                                                  text)
+                    var profile: parser.NormalizedExprCallProfile
+                    var profileErr = ""
+                    if !parser.ParserBuildExprCallProfileWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                                    linkPlan.packageRoot,
+                                                                                    externalPackageRoots,
+                                                                                    sourcePath,
+                                                                                    text,
+                                                                                    profile,
+                                                                                    profileErr):
+                        err = " compiler csg: normalized decl read failed"
+                    exprCallProfilesByIndex[sourceIndex] = profile
+            ):
+                for sourceIndex in startIdx..<endIdx:
+                    let sourcePath = orderedSources[sourceIndex]
+                    let ownerModulePath = orderedSourceModules[sourceIndex]
+                    let ownerModuleNodeId = CompilerCsgModuleNodeIdIndexed(modules,
+                                                                           moduleNodeIds,
+                                                                           ownerModulePath)
+                    if ownerModuleNodeId <= 0:
+                        continue
+                    var text = ""
+                    let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+                    if !CompilerCsgSourceTextLookupFast(sourceTextLookup, sourcePath, normalizedSourcePath, text):
+                        text = chengpath.ReadTextFile("", sourcePath)
+                    typedSourceTextsByIndex[sourceIndex] = texpr.TypedExprSourceTextNewWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                                                                  linkPlan.packageRoot,
+                                                                                                                  externalPackageRoots,
+                                                                                                                  sourcePath,
+                                                                                                                  text)
+                    var profile: parser.NormalizedExprCallProfile
+                    var profileErr = ""
+                    parser.ParserBuildExprCallProfileWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                                linkPlan.packageRoot,
+                                                                                externalPackageRoots,
+                                                                                sourcePath,
+                                                                                text,
+                                                                                profile,
+                                                                                profileErr)
+                    exprCallProfilesByIndex[sourceIndex] = profile
+        for sourceIndex in 0..<sourceCount:
+            let profile = exprCallProfilesByIndex[sourceIndex]
+            if profile.sourcePath != "":
+                add(typedSourceTexts, typedSourceTextsByIndex[sourceIndex])
+                add(exprCallProfiles, profile)
+    else:
+        for sourceIndex in 0..<sourceCount:
+            if sourceIndex % 16 == 0:
+                os.ProcessResourceGuardCheck()
+            let sourcePath = orderedSources[sourceIndex]
+            let ownerModulePath = orderedSourceModules[sourceIndex]
+            let ownerModuleNodeId = CompilerCsgModuleNodeIdIndexed(modules,
+                                                                   moduleNodeIds,
+                                                                   ownerModulePath)
+            if ownerModuleNodeId <= 0:
+                continue
+            var text = ""
+            let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
+            if !CompilerCsgSourceTextLookupFast(sourceTextLookup, sourcePath, normalizedSourcePath, text):
+                text = chengpath.ReadTextFile("", sourcePath)
+            add(typedSourceTexts, texpr.TypedExprSourceTextNewWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                                          linkPlan.packageRoot,
+                                                                                          externalPackageRoots,
+                                                                                          sourcePath,
+                                                                                          text))
+            var profile: parser.NormalizedExprCallProfile
+            var profileErr = ""
+            if !parser.ParserBuildExprCallProfileWithExternalPackageRoots(linkPlan.workspaceRoot,
+                                                                            linkPlan.packageRoot,
+                                                                            externalPackageRoots,
+                                                                            sourcePath,
+                                                                            text,
+                                                                            profile,
+                                                                            profileErr):
+                err = " compiler csg: normalized decl read failed"
+                return false
+            add(exprCallProfiles, profile)
     let profileIndexLookup = parser.ParserSourcePathIndexLookupBuild(exprCallProfiles)
     parser.ParserBindImportEdgeTargetProfileIndices(exprCallProfiles, profileIndexLookup)
     var externalVisibleNameCache: parser.ParserTextSeqCacheEntry[]
