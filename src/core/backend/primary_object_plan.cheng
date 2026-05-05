@@ -2,13 +2,14 @@ import std/result
 import std/strings
 import std/strutils as strutil
 import std/strformat
-import std/thread
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/backend/aarch64_encode as a64
 import cheng/core/backend/system_link_plan as slplan
 import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/target_matrix as tmat
 import cheng/core/ir/core_types as coreir
+import cheng/core/ir/function_task as ftask
+import cheng/core/ir/function_task_executor as ftaskexec
 import cheng/core/lang/typed_expr as texpr
 import cheng/core/backend/primary_object_plan_symbols as pobj_syms
 
@@ -5682,46 +5683,38 @@ fn PrimaryObjectPlanLoweringPhase(state: var PrimaryObjectPlanPhaseState,
             continue
         let irFn = lowering.primaryObjectIr.functions[irIndex]
         state.wordCounts[i] = PrimaryFunctionWordCountForBodyKind(irFn.bodyKind)
+        if state.wordCounts[i] <= 0 ||
+           PrimaryStatementSequenceReturnMode(irFn.bodyKind) != PrimaryStatementReturnModeNone():
+            PrimaryBuildBodyIrForFunction(lowering, irFn, i, state.tempBodyIRs, state.wordCounts)
 
 fn PrimaryObjectPlanExecuteTaskPhase(state: var PrimaryObjectPlanPhaseState,
                                       lowering: lower.LoweringPlanStub) =
-    var buildQueue: int32[]
+    var plan: ftask.FunctionTaskPlan
+    plan.jobCount = 1
     for i in 0..<lowering.functionNames.len:
         if state.irIndexes[i] < 0:
             continue
-        let irFn = lowering.primaryObjectIr.functions[state.irIndexes[i]]
-        if state.wordCounts[i] <= 0 ||
-           PrimaryStatementSequenceReturnMode(irFn.bodyKind) != PrimaryStatementReturnModeNone():
-            add(buildQueue, i)
-    if buildQueue.len <= 0:
-        return
-    if thread.Parallelism() >= 4 && buildQueue.len > 16:
-        var chunkCount = thread.Parallelism()
-        if chunkCount > buildQueue.len:
-            chunkCount = buildQueue.len
-        var chunkSize = buildQueue.len / chunkCount
-        if chunkSize <= 0:
-            chunkSize = 1
-        for chunkIndex in 0..<chunkCount:
-            let startIdx = chunkIndex * chunkSize
-            var endIdx = startIdx + chunkSize
-            if chunkIndex == chunkCount - 1:
-                endIdx = buildQueue.len
-            if !thread.Spawn(fn() =
-                for qi in startIdx..<endIdx:
-                    let i = buildQueue[qi]
-                    let irFn = lowering.primaryObjectIr.functions[state.irIndexes[i]]
-                    PrimaryBuildBodyIrForFunction(lowering, irFn, i, state.tempBodyIRs, state.wordCounts)
-            ):
-                for qi in startIdx..<endIdx:
-                    let i = buildQueue[qi]
-                    let irFn = lowering.primaryObjectIr.functions[state.irIndexes[i]]
-                    PrimaryBuildBodyIrForFunction(lowering, irFn, i, state.tempBodyIRs, state.wordCounts)
-    else:
-        for qi in 0..<buildQueue.len:
-            let i = buildQueue[qi]
-            let irFn = lowering.primaryObjectIr.functions[state.irIndexes[i]]
-            PrimaryBuildBodyIrForFunction(lowering, irFn, i, state.tempBodyIRs, state.wordCounts)
+        var task: ftask.FunctionTask
+        task.funcIndex = i
+        task.declOrdinal = i
+        task.extra.bodyIR = state.tempBodyIRs[i]
+        task.extra.bodyKind = lowering.primaryObjectIr.functions[state.irIndexes[i]].bodyKind
+        task.extra.statementMode = PrimaryStatementSequenceReturnMode(task.extra.bodyKind)
+        task.extra.statementCallCount = lowering.primaryObjectIr.functions[state.irIndexes[i]].callTargets.len
+        task.extra.functionName = lowering.functionNames[i]
+        task.extra.symbolText = lowering.functionSymbolTexts[i]
+        task.extra.sourcePath = lowering.functionSourcePaths[i]
+        add(plan.tasks, task)
+    let results = ftaskexec.FunctionTaskExecuteAuto(plan)
+    for ri in 0..<results.len:
+        let result = results[ri]
+        if result.funcIndex >= 0 && result.funcIndex < state.wordCounts.len:
+            if result.wordCount > 0 && state.wordCounts[result.funcIndex] > 0 &&
+               result.wordCount != state.wordCounts[result.funcIndex]:
+                if len(state.error.functionName) <= 0:
+                    state.error.functionName = lowering.functionNames[result.funcIndex]
+                    state.error.bodyKind = "function_task_word_count_mismatch"
+                    state.bodySemanticsMissing = true
 
 fn PrimaryCallSequenceNeedsReloc(bodyKind: str, bodyIrCallCount: int32): bool =
     if bodyIrCallCount > 0:
@@ -6168,69 +6161,12 @@ fn PrimaryObjectPlanFillAndCheckPhase(state: var PrimaryObjectPlanPhaseState,
         add(plan.instructionWords, 0)
     var primaryFillFailedIndex: int32
     primaryFillFailedIndex = -1
-    var fillChunkCount = 1
-    if state.functionBodyKinds.len > 64:
-        fillChunkCount = 4
-        if thread.Parallelism() >= 4:
-            fillChunkCount = thread.Parallelism()
-    if fillChunkCount > 1 && state.functionBodyKinds.len > 1:
-        var chunkSize = state.functionBodyKinds.len / fillChunkCount
-        if chunkSize <= 0:
-            chunkSize = 1
-        var chunkFailedFlags: bool[]
-        var chunkFailedIndices: int32[]
-        for ci in 0..<fillChunkCount:
-            add(chunkFailedFlags, false)
-            add(chunkFailedIndices, -1)
-        var spawned: int32
-        for chunkIndex in 0..<fillChunkCount:
-            let startIndex = chunkIndex * chunkSize
-            var endIndex = startIndex + chunkSize
-            if chunkIndex == fillChunkCount - 1:
-                endIndex = state.functionBodyKinds.len
-            if !thread.Spawn(fn() =
-                var fi: int32
-                fi = -1
-                if !PrimaryFillFunctionChunk(plan.instructionWords,
-                                              state.functionWordOffsets,
-                                              state.functionWordCounts,
-                                              state.functionInstructionBodyKinds,
-                                              state.planBodyIRs,
-                                              startIndex,
-                                              endIndex,
-                                              fi):
-                    chunkFailedFlags[chunkIndex] = true
-                    chunkFailedIndices[chunkIndex] = fi
-            ):
-                var fi2: int32
-                fi2 = -1
-                PrimaryFillFunctionChunk(plan.instructionWords,
-                                          state.functionWordOffsets,
-                                          state.functionWordCounts,
-                                          state.functionInstructionBodyKinds,
-                                          state.planBodyIRs,
-                                          startIndex,
-                                          endIndex,
-                                          fi2)
-                if fi2 >= 0:
-                    chunkFailedFlags[chunkIndex] = true
-                    chunkFailedIndices[chunkIndex] = fi2
-            else:
-                spawned = spawned + 1
-        while spawned > 0:
-            thread.Yield()
-            spawned = spawned - 1
-        for ci in 0..<fillChunkCount:
-            if chunkFailedFlags[ci]:
-                primaryFillFailedIndex = chunkFailedIndices[ci]
-                break
-    else:
-        PrimaryFillInstructionWords(plan.instructionWords,
-                                    state.functionWordOffsets,
-                                    state.functionWordCounts,
-                                    state.functionInstructionBodyKinds,
-                                    state.planBodyIRs,
-                                    primaryFillFailedIndex)
+    PrimaryFillInstructionWords(plan.instructionWords,
+                                state.functionWordOffsets,
+                                state.functionWordCounts,
+                                state.functionInstructionBodyKinds,
+                                state.planBodyIRs,
+                                primaryFillFailedIndex)
     for functionIndex in 0..<state.functionBodyKinds.len:
         if functionIndex >= state.symbolNames.len ||
            functionIndex >= state.functionWordOffsets.len ||
