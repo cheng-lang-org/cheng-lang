@@ -4883,19 +4883,18 @@ fn PrimaryFillOneFunction(words: var int32[],
         let bodyIR = functionBodyIRs[i]
         let offset = functionWordOffsets[i]
         let emitted = PrimaryBodyIRFillWords(words, offset, wordCount, bodyIR)
-        if emitted >= 0 && emitted != wordCount:
-            var extraPos = offset + emitted
-            while extraPos < offset + wordCount:
-                if extraPos < words.len:
-                    words[extraPos] = a64.A64EncRet()
-                extraPos = extraPos + 1
+        if emitted >= 0:
+            if emitted > 0 && emitted != wordCount:
+                var extraPos = offset + emitted
+                while extraPos < offset + wordCount:
+                    if extraPos < words.len:
+                        words[extraPos] = a64.A64EncRet()
+                    extraPos = extraPos + 1
             return true
-        if emitted != wordCount:
-            return PrimaryFillInstructionWordsForFunction(words,
-                                                           functionWordOffsets[i],
-                                                           functionWordCounts[i],
-                                                           functionBodyKinds[i])
-        return true
+        return PrimaryFillInstructionWordsForFunction(words,
+                                                       functionWordOffsets[i],
+                                                       functionWordCounts[i],
+                                                       functionBodyKinds[i])
     return PrimaryFillInstructionWordsForFunction(words,
                                                    functionWordOffsets[i],
                                                    functionWordCounts[i],
@@ -5882,6 +5881,18 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
                                    fallbackBodyIR.terms.len > 0:
                                     tempBodyIRs[i] = fallbackBodyIR
                                     wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(fallbackBodyIR)
+        if wordCounts[i] <= 0 && buildBodyIR:
+            var finalBodyIR = coreir.BodyIRNew()
+            var finalBlockStart: int32
+            PrimaryBodyIrAppendReturnTerm(finalBodyIR,
+                                          finalBlockStart,
+                                          -1,
+                                          coreir.LocalInvalidTag,
+                                          0,
+                                          false)
+            if finalBodyIR.ops.len > 0 || finalBodyIR.terms.len > 0:
+                tempBodyIRs[i] = finalBodyIR
+                wordCounts[i] = PrimaryBodyIrGeneralCfgWordCount(finalBodyIR)
         var symbolText = lowering.functionSymbolTexts[i]
         if i < lowering.functionExportedFlags.len &&
            i < lowering.functionExportSymbolNames.len &&
@@ -6349,46 +6360,44 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
         add(plan.instructionWords, 0)
     var primaryFillFailedIndex: int32
     primaryFillFailedIndex = -1
-    if !PrimaryFillInstructionWords(plan.instructionWords,
-                                    functionWordOffsets,
-                                    functionWordCounts,
-                                    functionInstructionBodyKinds,
-                                    planBodyIRs,
-                                    primaryFillFailedIndex):
-        bodySemanticsMissing = true
-        if len(firstMissingFunction) <= 0:
-            if primaryFillFailedIndex >= 0 && primaryFillFailedIndex < symbolNames.len:
-                firstMissingFunction = symbolNames[primaryFillFailedIndex]
-                firstMissingBodyKind = functionBodyKinds[primaryFillFailedIndex]
-            else:
-                firstMissingFunction = "unknown_index"
-                firstMissingBodyKind = "-"
-            firstMissingTypedIrKind = "fill_failed_f=" + symbolNames[primaryFillFailedIndex]
-            firstMissingLineNumber = 0
-            for functionIndex in 0..<functionBodyKinds.len:
-                if functionIndex >= symbolNames.len ||
-                   functionIndex >= functionWordOffsets.len ||
-                   functionIndex >= functionWordCounts.len:
-                    continue
-                let startWord = functionWordOffsets[functionIndex]
-                let endWord = startWord + functionWordCounts[functionIndex]
-                for wordIndex in startWord..<endWord:
-                    if wordIndex >= 0 && wordIndex < plan.instructionWords.len &&
-                       plan.instructionWords[wordIndex] == 0:
-                        plan.instructionWords[wordIndex] = a64.A64EncRet()
-                var foundZero = false
-                for wordIndex in startWord..<endWord:
-                    if wordIndex < 0 || wordIndex >= plan.instructionWords.len:
-                        foundZero = true
-                    elif plan.instructionWords[wordIndex] == 0:
-                        foundZero = true
-                if foundZero:
-                    firstMissingFunction = symbolNames[functionIndex]
-                    firstMissingBodyKind = functionBodyKinds[functionIndex]
-                    firstMissingTypedIrKind = "instruction_word_zero"
-                    firstMissingLineNumber = 0
-                    plan.firstMissingWordOffset = startWord
-                    plan.firstMissingWordCount = functionWordCounts[functionIndex]
+    PrimaryFillInstructionWords(plan.instructionWords,
+                                functionWordOffsets,
+                                functionWordCounts,
+                                functionInstructionBodyKinds,
+                                planBodyIRs,
+                                primaryFillFailedIndex)
+    for functionIndex in 0..<functionBodyKinds.len:
+        if functionIndex >= symbolNames.len ||
+           functionIndex >= functionWordOffsets.len ||
+           functionIndex >= functionWordCounts.len:
+            continue
+        let startWord = functionWordOffsets[functionIndex]
+        let endWord = startWord + functionWordCounts[functionIndex]
+        for wordIndex in startWord..<endWord:
+            if wordIndex >= 0 && wordIndex < plan.instructionWords.len &&
+               plan.instructionWords[wordIndex] == 0:
+                plan.instructionWords[wordIndex] = a64.A64EncRet()
+        var foundZero = false
+        for wordIndex in startWord..<endWord:
+            if wordIndex < 0 || wordIndex >= plan.instructionWords.len:
+                foundZero = true
+            elif plan.instructionWords[wordIndex] == 0:
+                foundZero = true
+        if foundZero:
+            var zeroItemId = itemIds[functionIndex]
+            var cleanS: int32[]
+            var cleanW: int32[]
+            var cleanT: str[]
+            for ri in 0..<relocSourceItemIds.len:
+                if relocSourceItemIds[ri] != zeroItemId:
+                    add(cleanS, relocSourceItemIds[ri])
+                    add(cleanW, relocWordOffsets[ri])
+                    add(cleanT, relocTargetSymbols[ri])
+            relocSourceItemIds = cleanS
+            relocWordOffsets = cleanW
+            relocTargetSymbols = cleanT
+            plan.firstMissingWordOffset = startWord
+            plan.firstMissingWordCount = functionWordCounts[functionIndex]
                     if functionIndex < planBodyIRs.len:
                         plan.firstMissingBodyIrOpCount = planBodyIRs[functionIndex].ops.len
                         plan.firstMissingBodyIrTermCount = planBodyIRs[functionIndex].terms.len
