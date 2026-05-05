@@ -2,12 +2,15 @@ import std/result
 import std/strings
 import std/strutils as strutil
 import std/strformat
+import std/thread
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/backend/aarch64_encode as a64
 import cheng/core/backend/system_link_plan as slplan
 import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/target_matrix as tmat
 import cheng/core/ir/core_types as coreir
+import cheng/core/ir/function_task as ftask
+import cheng/core/ir/function_task_executor as ftaskexec
 import cheng/core/lang/typed_expr as texpr
 import cheng/core/backend/primary_object_plan_symbols as pobj_syms
 
@@ -974,6 +977,143 @@ fn PrimaryBodyIrConditionText(textRaw: str): str =
     if len(text) > 0 && text[len(text) - 1] == ':':
         text = strutil.Strip(strings.SliceBytes(text, 0, len(text) - 1))
     return text
+
+fn PrimaryBodyIrConditionHasAnd(condText: str): bool =
+    for i in 0..<len(condText) - 1:
+        if condText[i] == '&' && condText[i + 1] == '&':
+            return true
+    return false
+
+fn PrimaryBodyIrSplitAndConditions(condText: str): str[] =
+    var parts: str[]
+    var start: int32
+    var i: int32
+    while i < len(condText):
+        if i + 1 < len(condText) && condText[i] == '&' && condText[i + 1] == '&':
+            add(parts, strutil.Strip(strings.SliceBytes(condText, start, i - start)))
+            start = i + 2
+            i = i + 2
+        else:
+            i = i + 1
+    if start < len(condText):
+        add(parts, strutil.Strip(strings.SliceBytes(condText, start, len(condText) - start)))
+    return parts
+
+fn PrimaryBodyIrEmitConditionOps(bodyIR: var coreir.BodyIR,
+                                   slotNames: var str[],
+                                   condText: str,
+                                   lhsSlot: var int32,
+                                   rhsSlot: var int32,
+                                   cmpTag: var int32,
+                                   nextOpIndex: var int32): bool =
+    var cmpOpPos: int32
+    cmpOpPos = -1
+    var cmpOpLen: int32
+    cmpOpLen = 0
+    cmpTag = 0
+    for ci in 0..<len(condText):
+        let ch = condText[ci]
+        if ch == '=':
+            if ci + 1 < len(condText):
+                if condText[ci + 1] == '=':
+                    cmpOpPos = ci
+                    cmpOpLen = 2
+                    cmpTag = coreir.BodyCondI32EqTag
+                    break
+        if ch == '!':
+            if ci + 1 < len(condText):
+                if condText[ci + 1] == '=':
+                    cmpOpPos = ci
+                    cmpOpLen = 2
+                    cmpTag = coreir.BodyCondI32NeTag
+                    break
+        if ch == '<':
+            if ci + 1 < len(condText):
+                if condText[ci + 1] == '=':
+                    cmpOpPos = ci
+                    cmpOpLen = 2
+                    cmpTag = coreir.BodyCondI32LeTag
+                    break
+            cmpOpPos = ci
+            cmpOpLen = 1
+            cmpTag = coreir.BodyCondI32LtTag
+            break
+        if ch == '>':
+            if ci + 1 < len(condText):
+                if condText[ci + 1] == '=':
+                    cmpOpPos = ci
+                    cmpOpLen = 2
+                    cmpTag = coreir.BodyCondI32GeTag
+                    break
+            cmpOpPos = ci
+            cmpOpLen = 1
+            cmpTag = coreir.BodyCondI32GtTag
+            break
+    if cmpOpPos < 0:
+        return false
+    var condLhs = strings.SliceBytes(condText, 0, cmpOpPos)
+    var lhsEnd = len(condLhs)
+    while lhsEnd > 0:
+        if condLhs[lhsEnd - 1] != ' ':
+            break
+        lhsEnd = lhsEnd - 1
+    if lhsEnd > 0:
+        condLhs = strings.SliceBytes(condLhs, 0, lhsEnd)
+    var condRhsRaw = strings.SliceBytes(condText, cmpOpPos + cmpOpLen, len(condText) - cmpOpPos - cmpOpLen)
+    var rhsStartPos: int32
+    rhsStartPos = 0
+    while rhsStartPos < len(condRhsRaw):
+        if condRhsRaw[rhsStartPos] != ' ':
+            break
+        rhsStartPos = rhsStartPos + 1
+    var condRhs = condRhsRaw
+    if rhsStartPos > 0:
+        condRhs = strings.SliceBytes(condRhsRaw, rhsStartPos, len(condRhsRaw) - rhsStartPos)
+    let lhsConst = PrimaryBodyIrExtractIntFromText(condLhs)
+    if lhsConst != 0:
+        lhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condLhs, coreir.LocalI32Tag)
+        var lhOp: coreir.BodyOp
+        lhOp.kind = coreir.BodyOpLoadConstTag
+        lhOp.target = lhsSlot
+        add(lhOp.operands, coreir.LocalI32Tag)
+        add(lhOp.operands, lhsConst)
+        add(bodyIR.ops, lhOp)
+        nextOpIndex = nextOpIndex + 1
+    else:
+        if PrimaryBodyIrTextIsI32Zero(condLhs):
+            lhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condLhs, coreir.LocalI32Tag)
+            var lhOpZ: coreir.BodyOp
+            lhOpZ.kind = coreir.BodyOpLoadConstTag
+            lhOpZ.target = lhsSlot
+            add(lhOpZ.operands, coreir.LocalI32Tag)
+            add(lhOpZ.operands, 0)
+            add(bodyIR.ops, lhOpZ)
+            nextOpIndex = nextOpIndex + 1
+        else:
+            lhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condLhs, coreir.LocalI32Tag)
+    let rhsConst = PrimaryBodyIrExtractIntFromText(condRhs)
+    if rhsConst != 0:
+        rhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condRhs, coreir.LocalI32Tag)
+        var rhOp: coreir.BodyOp
+        rhOp.kind = coreir.BodyOpLoadConstTag
+        rhOp.target = rhsSlot
+        add(rhOp.operands, coreir.LocalI32Tag)
+        add(rhOp.operands, rhsConst)
+        add(bodyIR.ops, rhOp)
+        nextOpIndex = nextOpIndex + 1
+    else:
+        if PrimaryBodyIrTextIsI32Zero(condRhs):
+            rhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condRhs, coreir.LocalI32Tag)
+            var rhOpZ: coreir.BodyOp
+            rhOpZ.kind = coreir.BodyOpLoadConstTag
+            rhOpZ.target = rhsSlot
+            add(rhOpZ.operands, coreir.LocalI32Tag)
+            add(rhOpZ.operands, 0)
+            add(bodyIR.ops, rhOpZ)
+            nextOpIndex = nextOpIndex + 1
+        else:
+            rhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condRhs, coreir.LocalI32Tag)
+    return true
 
 fn PrimaryBodyIrAppendConditionTerm(bodyIR: var coreir.BodyIR,
                                      conditionSlot: int32,
@@ -2071,7 +2211,9 @@ fn PrimaryBuildBodyIrFromTypedStatements(
     var pendingForIdxSlot: int32
     var pendingForHdrBlk: int32
     var pendingForCbrTerm: int32
+    var pendingCompoundFalseTerms: int32[]
     pendingFalseTerm = -1
+    pendingCompoundFalseTerms = []
     skipStatementUntilIndex = -1
     completedReturnLineNumber = -1
     pendingForEndIdx = -1
@@ -2118,6 +2260,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
             pendingForHdrBlk = -1
             pendingForCbrTerm = -1
             pendingFalseTerm = -1
+            pendingCompoundFalseTerms = []
         if stmtIndex <= skipStatementUntilIndex:
             continue
         let stmt = typedIr.statements[stmtIndex]
@@ -2531,131 +2674,59 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                            pendingFalseTerm):
                 continue
             let condText = PrimaryBodyIrConditionText(stmt.surfaceText)
-            var cmpOpPos: int32
-            cmpOpPos = -1
-            var cmpOpLen: int32
-            cmpOpLen = 0
-            var cmpTag: int32
-            cmpTag = 0
-            for ci in 0..<len(condText):
-                let ch = condText[ci]
-                if ch == '=':
-                    if ci + 1 < len(condText):
-                        if condText[ci + 1] == '=':
-                            cmpOpPos = ci
-                            cmpOpLen = 2
-                            cmpTag = coreir.BodyCondI32EqTag
-                            break
-                if ch == '!':
-                    if ci + 1 < len(condText):
-                        if condText[ci + 1] == '=':
-                            cmpOpPos = ci
-                            cmpOpLen = 2
-                            cmpTag = coreir.BodyCondI32NeTag
-                            break
-                if ch == '<':
-                    if ci + 1 < len(condText):
-                        if condText[ci + 1] == '=':
-                            cmpOpPos = ci
-                            cmpOpLen = 2
-                            cmpTag = coreir.BodyCondI32LeTag
-                            break
-                    cmpOpPos = ci
-                    cmpOpLen = 1
-                    cmpTag = coreir.BodyCondI32LtTag
-                    break
-                if ch == '>':
-                    if ci + 1 < len(condText):
-                        if condText[ci + 1] == '=':
-                            cmpOpPos = ci
-                            cmpOpLen = 2
-                            cmpTag = coreir.BodyCondI32GeTag
-                            break
-                    cmpOpPos = ci
-                    cmpOpLen = 1
-                    cmpTag = coreir.BodyCondI32GtTag
-                    break
-            if cmpOpPos >= 0:
-                var condLhs = strings.SliceBytes(condText, 0, cmpOpPos)
-                var lhsEnd = len(condLhs)
-                while lhsEnd > 0:
-                    if condLhs[lhsEnd - 1] != ' ':
-                        break
-                    lhsEnd = lhsEnd - 1
-                if lhsEnd > 0:
-                    condLhs = strings.SliceBytes(condLhs, 0, lhsEnd)
-                var condRhsRaw = strings.SliceBytes(condText, cmpOpPos + cmpOpLen, len(condText) - cmpOpPos - cmpOpLen)
-                var rhsStartPos: int32
-                rhsStartPos = 0
-                while rhsStartPos < len(condRhsRaw):
-                    if condRhsRaw[rhsStartPos] != ' ':
-                        break
-                    rhsStartPos = rhsStartPos + 1
-                var condRhs = condRhsRaw
-                if rhsStartPos > 0:
-                    condRhs = strings.SliceBytes(condRhsRaw, rhsStartPos, len(condRhsRaw) - rhsStartPos)
-                let lhsConst = PrimaryBodyIrExtractIntFromText(condLhs)
+            if PrimaryBodyIrConditionHasAnd(condText):
+                let subConds = PrimaryBodyIrSplitAndConditions(condText)
+                for partIndex in 0..<subConds.len:
+                    let subCondText = subConds[partIndex]
+                    var lhsSlot: int32
+                    var rhsSlot: int32
+                    var cmpTag: int32
+                    if !PrimaryBodyIrEmitConditionOps(bodyIR, slotNames, subCondText, lhsSlot, rhsSlot, cmpTag, nextOpIndex):
+                        continue
+                    var cbrTerm: coreir.BodyTerm
+                    cbrTerm.kind = coreir.BodyTermCbrTag
+                    cbrTerm.conditionKind = cmpTag
+                    cbrTerm.lhsSlot = lhsSlot
+                    cbrTerm.rhsSlot = rhsSlot
+                    cbrTerm.trueBlock = -1
+                    cbrTerm.falseBlock = -1
+                    cbrTerm.resultSlot = -1
+                    if partIndex < subConds.len - 1:
+                        cbrTerm.trueBlock = bodyIR.blocks.len + 1
+                    let cbrTermIndex = coreir.BodyIRAppendTerm(bodyIR, cbrTerm)
+                    let cbrBlockOpCount = bodyIR.ops.len - currentBlockStart
+                    let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, cbrBlockOpCount, cbrTermIndex)
+                    currentBlockStart = bodyIR.ops.len
+                    if partIndex < subConds.len - 1:
+                        add(pendingCompoundFalseTerms, cbrTermIndex)
+                    else:
+                        pendingFalseTerm = cbrTermIndex
+            else:
                 var lhsSlot: int32
-                if lhsConst != 0:
-                    lhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condLhs, coreir.LocalI32Tag)
-                    var lhOp: coreir.BodyOp
-                    lhOp.kind = coreir.BodyOpLoadConstTag
-                    lhOp.target = lhsSlot
-                    add(lhOp.operands, coreir.LocalI32Tag)
-                    add(lhOp.operands, lhsConst)
-                    add(bodyIR.ops, lhOp)
-                    nextOpIndex = nextOpIndex + 1
-                else:
-                    if PrimaryBodyIrTextIsI32Zero(condLhs):
-                        lhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condLhs, coreir.LocalI32Tag)
-                        var lhOpZ: coreir.BodyOp
-                        lhOpZ.kind = coreir.BodyOpLoadConstTag
-                        lhOpZ.target = lhsSlot
-                        add(lhOpZ.operands, coreir.LocalI32Tag)
-                        add(lhOpZ.operands, 0)
-                        add(bodyIR.ops, lhOpZ)
-                        nextOpIndex = nextOpIndex + 1
-                    else:
-                        lhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condLhs, coreir.LocalI32Tag)
-                let rhsConst = PrimaryBodyIrExtractIntFromText(condRhs)
                 var rhsSlot: int32
-                if rhsConst != 0:
-                    rhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condRhs, coreir.LocalI32Tag)
-                    var rhOp: coreir.BodyOp
-                    rhOp.kind = coreir.BodyOpLoadConstTag
-                    rhOp.target = rhsSlot
-                    add(rhOp.operands, coreir.LocalI32Tag)
-                    add(rhOp.operands, rhsConst)
-                    add(bodyIR.ops, rhOp)
-                    nextOpIndex = nextOpIndex + 1
-                else:
-                    if PrimaryBodyIrTextIsI32Zero(condRhs):
-                        rhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condRhs, coreir.LocalI32Tag)
-                        var rhOpZ: coreir.BodyOp
-                        rhOpZ.kind = coreir.BodyOpLoadConstTag
-                        rhOpZ.target = rhsSlot
-                        add(rhOpZ.operands, coreir.LocalI32Tag)
-                        add(rhOpZ.operands, 0)
-                        add(bodyIR.ops, rhOpZ)
-                        nextOpIndex = nextOpIndex + 1
-                    else:
-                        rhsSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR, slotNames, condRhs, coreir.LocalI32Tag)
-                var cbrTerm: coreir.BodyTerm
-                cbrTerm.kind = coreir.BodyTermCbrTag
-                cbrTerm.conditionKind = cmpTag
-                cbrTerm.lhsSlot = lhsSlot
-                cbrTerm.rhsSlot = rhsSlot
-                cbrTerm.trueBlock = -1
-                cbrTerm.falseBlock = -1
-                cbrTerm.resultSlot = -1
-                let cbrTermIndex = coreir.BodyIRAppendTerm(bodyIR, cbrTerm)
-                let cbrBlockOpCount = bodyIR.ops.len - currentBlockStart
-                let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, cbrBlockOpCount, cbrTermIndex)
-                currentBlockStart = bodyIR.ops.len
-                pendingFalseTerm = cbrTermIndex
+                var cmpTag: int32
+                if PrimaryBodyIrEmitConditionOps(bodyIR, slotNames, condText, lhsSlot, rhsSlot, cmpTag, nextOpIndex):
+                    var cbrTerm: coreir.BodyTerm
+                    cbrTerm.kind = coreir.BodyTermCbrTag
+                    cbrTerm.conditionKind = cmpTag
+                    cbrTerm.lhsSlot = lhsSlot
+                    cbrTerm.rhsSlot = rhsSlot
+                    cbrTerm.trueBlock = -1
+                    cbrTerm.falseBlock = -1
+                    cbrTerm.resultSlot = -1
+                    let cbrTermIndex = coreir.BodyIRAppendTerm(bodyIR, cbrTerm)
+                    let cbrBlockOpCount = bodyIR.ops.len - currentBlockStart
+                    let _ = coreir.BodyIRAppendBlock(bodyIR, currentBlockStart, cbrBlockOpCount, cbrTermIndex)
+                    currentBlockStart = bodyIR.ops.len
+                    pendingFalseTerm = cbrTermIndex
         elif stmt.kind == texpr.TypedExprIrStmtElif:
             if pendingFalseTerm >= 0:
                 bodyIR.terms[pendingFalseTerm].falseBlock = bodyIR.blocks.len
+                for pcti in 0..<pendingCompoundFalseTerms.len:
+                    if pendingCompoundFalseTerms[pcti] >= 0 &&
+                       pendingCompoundFalseTerms[pcti] < bodyIR.terms.len:
+                        bodyIR.terms[pendingCompoundFalseTerms[pcti]].falseBlock = bodyIR.blocks.len
+                pendingCompoundFalseTerms = []
                 if PrimaryBodyIrAppendTypedStrLiteralCondition(bodyIR,
                                                                slotNames,
                                                                stmt,
@@ -2788,6 +2859,11 @@ fn PrimaryBuildBodyIrFromTypedStatements(
         elif stmt.kind == texpr.TypedExprIrStmtElse:
             if pendingFalseTerm >= 0:
                 bodyIR.terms[pendingFalseTerm].falseBlock = bodyIR.blocks.len
+                for pcti in 0..<pendingCompoundFalseTerms.len:
+                    if pendingCompoundFalseTerms[pcti] >= 0 &&
+                       pendingCompoundFalseTerms[pcti] < bodyIR.terms.len:
+                        bodyIR.terms[pendingCompoundFalseTerms[pcti]].falseBlock = bodyIR.blocks.len
+                pendingCompoundFalseTerms = []
                 pendingFalseTerm = -1
         elif stmt.kind == texpr.TypedExprIrStmtFor:
             let forBodyEnd = PrimaryBodyIrBuildForRangeLoop(bodyIR, slotNames, nextOpIndex, currentBlockStart, typedIr, stmt, stmtIndex, stmtEnd, pendingFalseTerm)
@@ -2838,6 +2914,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
         pendingForHdrBlk = -1
         pendingForCbrTerm = -1
         pendingFalseTerm = -1
+        pendingCompoundFalseTerms = []
     if bodyIR.ops.len > currentBlockStart:
         if bodyIR.blocks.len <= 0:
             var fallbackTerm: coreir.BodyTerm
@@ -3026,10 +3103,6 @@ fn PrimaryFunctionWordCountForBodyKind(bodyKind: str): int32 =
         return 6
     if bodyKind == texpr.BodyKindRuntimeParamStrCopyBridge:
         return 35
-    if bodyKind == texpr.BodyKindBackendDriverCommandCode:
-        return 357
-    if bodyKind == texpr.BodyKindBackendDriverRunCommand:
-        return 18
     return 0
 
 fn PrimaryReturnI32ConstValue(bodyKind: str): int32 =
@@ -3302,373 +3375,6 @@ fn PrimaryFillInstructionWordsForFunction(words: var int32[],
         if wordCount != 35:
             return false
         return PrimaryFillRuntimeParamStrCopyBridgeWords(words, wordOffset)
-    if bodyKind == texpr.BodyKindBackendDriverCommandCode:
-        if wordCount != 357:
-            return false
-        if wordOffset < 0 || wordOffset + 356 >= words.len:
-            return false
-        words[wordOffset] = Value(a64.A64EncLdrImm(true, a64.A64X9, a64.A64X0, int64(0)))
-        words[wordOffset + 1] = Value(a64.A64EncLdrImm(false, a64.A64X10, a64.A64X0, int64(8)))
-        words[wordOffset + 2] = Value(a64.A64EncCmpImm(false, a64.A64X10, 4))
-        words[wordOffset + 3] = Value(a64.A64EncBCond(int64(15), a64.A64CondNE))
-        words[wordOffset + 4] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 0))
-        words[wordOffset + 5] = Value(a64.A64EncCmpImm(false, a64.A64X11, 104))
-        words[wordOffset + 6] = Value(a64.A64EncBCond(int64(12), a64.A64CondNE))
-        words[wordOffset + 7] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 1))
-        words[wordOffset + 8] = Value(a64.A64EncCmpImm(false, a64.A64X11, 101))
-        words[wordOffset + 9] = Value(a64.A64EncBCond(int64(9), a64.A64CondNE))
-        words[wordOffset + 10] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 2))
-        words[wordOffset + 11] = Value(a64.A64EncCmpImm(false, a64.A64X11, 108))
-        words[wordOffset + 12] = Value(a64.A64EncBCond(int64(6), a64.A64CondNE))
-        words[wordOffset + 13] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 3))
-        words[wordOffset + 14] = Value(a64.A64EncCmpImm(false, a64.A64X11, 112))
-        words[wordOffset + 15] = Value(a64.A64EncBCond(int64(3), a64.A64CondNE))
-        words[wordOffset + 16] = PrimaryArm64MovW0ConstWord(0)
-        words[wordOffset + 17] = a64.A64EncRet()
-        words[wordOffset + 18] = Value(a64.A64EncCmpImm(false, a64.A64X10, 2))
-        words[wordOffset + 19] = Value(a64.A64EncBCond(int64(9), a64.A64CondNE))
-        words[wordOffset + 20] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 0))
-        words[wordOffset + 21] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 22] = Value(a64.A64EncBCond(int64(6), a64.A64CondNE))
-        words[wordOffset + 23] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 1))
-        words[wordOffset + 24] = Value(a64.A64EncCmpImm(false, a64.A64X11, 104))
-        words[wordOffset + 25] = Value(a64.A64EncBCond(int64(3), a64.A64CondNE))
-        words[wordOffset + 26] = PrimaryArm64MovW0ConstWord(0)
-        words[wordOffset + 27] = a64.A64EncRet()
-        words[wordOffset + 28] = Value(a64.A64EncCmpImm(false, a64.A64X10, 6))
-        words[wordOffset + 29] = Value(a64.A64EncBCond(int64(21), a64.A64CondNE))
-        words[wordOffset + 30] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 0))
-        words[wordOffset + 31] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 32] = Value(a64.A64EncBCond(int64(18), a64.A64CondNE))
-        words[wordOffset + 33] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 1))
-        words[wordOffset + 34] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 35] = Value(a64.A64EncBCond(int64(15), a64.A64CondNE))
-        words[wordOffset + 36] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 2))
-        words[wordOffset + 37] = Value(a64.A64EncCmpImm(false, a64.A64X11, 104))
-        words[wordOffset + 38] = Value(a64.A64EncBCond(int64(12), a64.A64CondNE))
-        words[wordOffset + 39] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 3))
-        words[wordOffset + 40] = Value(a64.A64EncCmpImm(false, a64.A64X11, 101))
-        words[wordOffset + 41] = Value(a64.A64EncBCond(int64(9), a64.A64CondNE))
-        words[wordOffset + 42] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 4))
-        words[wordOffset + 43] = Value(a64.A64EncCmpImm(false, a64.A64X11, 108))
-        words[wordOffset + 44] = Value(a64.A64EncBCond(int64(6), a64.A64CondNE))
-        words[wordOffset + 45] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 5))
-        words[wordOffset + 46] = Value(a64.A64EncCmpImm(false, a64.A64X11, 112))
-        words[wordOffset + 47] = Value(a64.A64EncBCond(int64(3), a64.A64CondNE))
-        words[wordOffset + 48] = PrimaryArm64MovW0ConstWord(0)
-        words[wordOffset + 49] = a64.A64EncRet()
-        words[wordOffset + 50] = Value(a64.A64EncCmpImm(false, a64.A64X10, 6))
-        words[wordOffset + 51] = Value(a64.A64EncBCond(int64(21), a64.A64CondNE))
-        words[wordOffset + 52] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 0))
-        words[wordOffset + 53] = Value(a64.A64EncCmpImm(false, a64.A64X11, 115))
-        words[wordOffset + 54] = Value(a64.A64EncBCond(int64(18), a64.A64CondNE))
-        words[wordOffset + 55] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 1))
-        words[wordOffset + 56] = Value(a64.A64EncCmpImm(false, a64.A64X11, 116))
-        words[wordOffset + 57] = Value(a64.A64EncBCond(int64(15), a64.A64CondNE))
-        words[wordOffset + 58] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 2))
-        words[wordOffset + 59] = Value(a64.A64EncCmpImm(false, a64.A64X11, 97))
-        words[wordOffset + 60] = Value(a64.A64EncBCond(int64(12), a64.A64CondNE))
-        words[wordOffset + 61] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 3))
-        words[wordOffset + 62] = Value(a64.A64EncCmpImm(false, a64.A64X11, 116))
-        words[wordOffset + 63] = Value(a64.A64EncBCond(int64(9), a64.A64CondNE))
-        words[wordOffset + 64] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 4))
-        words[wordOffset + 65] = Value(a64.A64EncCmpImm(false, a64.A64X11, 117))
-        words[wordOffset + 66] = Value(a64.A64EncBCond(int64(6), a64.A64CondNE))
-        words[wordOffset + 67] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 5))
-        words[wordOffset + 68] = Value(a64.A64EncCmpImm(false, a64.A64X11, 115))
-        words[wordOffset + 69] = Value(a64.A64EncBCond(int64(3), a64.A64CondNE))
-        words[wordOffset + 70] = PrimaryArm64MovW0ConstWord(1)
-        words[wordOffset + 71] = a64.A64EncRet()
-        words[wordOffset + 72] = Value(a64.A64EncCmpImm(false, a64.A64X10, 16))
-        words[wordOffset + 73] = Value(a64.A64EncBCond(int64(51), a64.A64CondNE))
-        words[wordOffset + 74] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 0))
-        words[wordOffset + 75] = Value(a64.A64EncCmpImm(false, a64.A64X11, 112))
-        words[wordOffset + 76] = Value(a64.A64EncBCond(int64(48), a64.A64CondNE))
-        words[wordOffset + 77] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 1))
-        words[wordOffset + 78] = Value(a64.A64EncCmpImm(false, a64.A64X11, 114))
-        words[wordOffset + 79] = Value(a64.A64EncBCond(int64(45), a64.A64CondNE))
-        words[wordOffset + 80] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 2))
-        words[wordOffset + 81] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 82] = Value(a64.A64EncBCond(int64(42), a64.A64CondNE))
-        words[wordOffset + 83] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 3))
-        words[wordOffset + 84] = Value(a64.A64EncCmpImm(false, a64.A64X11, 110))
-        words[wordOffset + 85] = Value(a64.A64EncBCond(int64(39), a64.A64CondNE))
-        words[wordOffset + 86] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 4))
-        words[wordOffset + 87] = Value(a64.A64EncCmpImm(false, a64.A64X11, 116))
-        words[wordOffset + 88] = Value(a64.A64EncBCond(int64(36), a64.A64CondNE))
-        words[wordOffset + 89] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 5))
-        words[wordOffset + 90] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 91] = Value(a64.A64EncBCond(int64(33), a64.A64CondNE))
-        words[wordOffset + 92] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 6))
-        words[wordOffset + 93] = Value(a64.A64EncCmpImm(false, a64.A64X11, 98))
-        words[wordOffset + 94] = Value(a64.A64EncBCond(int64(30), a64.A64CondNE))
-        words[wordOffset + 95] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 7))
-        words[wordOffset + 96] = Value(a64.A64EncCmpImm(false, a64.A64X11, 117))
-        words[wordOffset + 97] = Value(a64.A64EncBCond(int64(27), a64.A64CondNE))
-        words[wordOffset + 98] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 8))
-        words[wordOffset + 99] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 100] = Value(a64.A64EncBCond(int64(24), a64.A64CondNE))
-        words[wordOffset + 101] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 9))
-        words[wordOffset + 102] = Value(a64.A64EncCmpImm(false, a64.A64X11, 108))
-        words[wordOffset + 103] = Value(a64.A64EncBCond(int64(21), a64.A64CondNE))
-        words[wordOffset + 104] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 10))
-        words[wordOffset + 105] = Value(a64.A64EncCmpImm(false, a64.A64X11, 100))
-        words[wordOffset + 106] = Value(a64.A64EncBCond(int64(18), a64.A64CondNE))
-        words[wordOffset + 107] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 11))
-        words[wordOffset + 108] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 109] = Value(a64.A64EncBCond(int64(15), a64.A64CondNE))
-        words[wordOffset + 110] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 12))
-        words[wordOffset + 111] = Value(a64.A64EncCmpImm(false, a64.A64X11, 112))
-        words[wordOffset + 112] = Value(a64.A64EncBCond(int64(12), a64.A64CondNE))
-        words[wordOffset + 113] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 13))
-        words[wordOffset + 114] = Value(a64.A64EncCmpImm(false, a64.A64X11, 108))
-        words[wordOffset + 115] = Value(a64.A64EncBCond(int64(9), a64.A64CondNE))
-        words[wordOffset + 116] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 14))
-        words[wordOffset + 117] = Value(a64.A64EncCmpImm(false, a64.A64X11, 97))
-        words[wordOffset + 118] = Value(a64.A64EncBCond(int64(6), a64.A64CondNE))
-        words[wordOffset + 119] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 15))
-        words[wordOffset + 120] = Value(a64.A64EncCmpImm(false, a64.A64X11, 110))
-        words[wordOffset + 121] = Value(a64.A64EncBCond(int64(3), a64.A64CondNE))
-        words[wordOffset + 122] = PrimaryArm64MovW0ConstWord(2)
-        words[wordOffset + 123] = a64.A64EncRet()
-        words[wordOffset + 124] = Value(a64.A64EncCmpImm(false, a64.A64X10, 24))
-        words[wordOffset + 125] = Value(a64.A64EncBCond(int64(75), a64.A64CondNE))
-        words[wordOffset + 126] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 0))
-        words[wordOffset + 127] = Value(a64.A64EncCmpImm(false, a64.A64X11, 118))
-        words[wordOffset + 128] = Value(a64.A64EncBCond(int64(72), a64.A64CondNE))
-        words[wordOffset + 129] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 1))
-        words[wordOffset + 130] = Value(a64.A64EncCmpImm(false, a64.A64X11, 101))
-        words[wordOffset + 131] = Value(a64.A64EncBCond(int64(69), a64.A64CondNE))
-        words[wordOffset + 132] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 2))
-        words[wordOffset + 133] = Value(a64.A64EncCmpImm(false, a64.A64X11, 114))
-        words[wordOffset + 134] = Value(a64.A64EncBCond(int64(66), a64.A64CondNE))
-        words[wordOffset + 135] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 3))
-        words[wordOffset + 136] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 137] = Value(a64.A64EncBCond(int64(63), a64.A64CondNE))
-        words[wordOffset + 138] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 4))
-        words[wordOffset + 139] = Value(a64.A64EncCmpImm(false, a64.A64X11, 102))
-        words[wordOffset + 140] = Value(a64.A64EncBCond(int64(60), a64.A64CondNE))
-        words[wordOffset + 141] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 5))
-        words[wordOffset + 142] = Value(a64.A64EncCmpImm(false, a64.A64X11, 121))
-        words[wordOffset + 143] = Value(a64.A64EncBCond(int64(57), a64.A64CondNE))
-        words[wordOffset + 144] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 6))
-        words[wordOffset + 145] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 146] = Value(a64.A64EncBCond(int64(54), a64.A64CondNE))
-        words[wordOffset + 147] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 7))
-        words[wordOffset + 148] = Value(a64.A64EncCmpImm(false, a64.A64X11, 101))
-        words[wordOffset + 149] = Value(a64.A64EncBCond(int64(51), a64.A64CondNE))
-        words[wordOffset + 150] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 8))
-        words[wordOffset + 151] = Value(a64.A64EncCmpImm(false, a64.A64X11, 120))
-        words[wordOffset + 152] = Value(a64.A64EncBCond(int64(48), a64.A64CondNE))
-        words[wordOffset + 153] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 9))
-        words[wordOffset + 154] = Value(a64.A64EncCmpImm(false, a64.A64X11, 112))
-        words[wordOffset + 155] = Value(a64.A64EncBCond(int64(45), a64.A64CondNE))
-        words[wordOffset + 156] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 10))
-        words[wordOffset + 157] = Value(a64.A64EncCmpImm(false, a64.A64X11, 111))
-        words[wordOffset + 158] = Value(a64.A64EncBCond(int64(42), a64.A64CondNE))
-        words[wordOffset + 159] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 11))
-        words[wordOffset + 160] = Value(a64.A64EncCmpImm(false, a64.A64X11, 114))
-        words[wordOffset + 161] = Value(a64.A64EncBCond(int64(39), a64.A64CondNE))
-        words[wordOffset + 162] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 12))
-        words[wordOffset + 163] = Value(a64.A64EncCmpImm(false, a64.A64X11, 116))
-        words[wordOffset + 164] = Value(a64.A64EncBCond(int64(36), a64.A64CondNE))
-        words[wordOffset + 165] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 13))
-        words[wordOffset + 166] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 167] = Value(a64.A64EncBCond(int64(33), a64.A64CondNE))
-        words[wordOffset + 168] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 14))
-        words[wordOffset + 169] = Value(a64.A64EncCmpImm(false, a64.A64X11, 118))
-        words[wordOffset + 170] = Value(a64.A64EncBCond(int64(30), a64.A64CondNE))
-        words[wordOffset + 171] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 15))
-        words[wordOffset + 172] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 173] = Value(a64.A64EncBCond(int64(27), a64.A64CondNE))
-        words[wordOffset + 174] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 16))
-        words[wordOffset + 175] = Value(a64.A64EncCmpImm(false, a64.A64X11, 115))
-        words[wordOffset + 176] = Value(a64.A64EncBCond(int64(24), a64.A64CondNE))
-        words[wordOffset + 177] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 17))
-        words[wordOffset + 178] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 179] = Value(a64.A64EncBCond(int64(21), a64.A64CondNE))
-        words[wordOffset + 180] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 18))
-        words[wordOffset + 181] = Value(a64.A64EncCmpImm(false, a64.A64X11, 98))
-        words[wordOffset + 182] = Value(a64.A64EncBCond(int64(18), a64.A64CondNE))
-        words[wordOffset + 183] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 19))
-        words[wordOffset + 184] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 185] = Value(a64.A64EncBCond(int64(15), a64.A64CondNE))
-        words[wordOffset + 186] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 20))
-        words[wordOffset + 187] = Value(a64.A64EncCmpImm(false, a64.A64X11, 108))
-        words[wordOffset + 188] = Value(a64.A64EncBCond(int64(12), a64.A64CondNE))
-        words[wordOffset + 189] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 21))
-        words[wordOffset + 190] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 191] = Value(a64.A64EncBCond(int64(9), a64.A64CondNE))
-        words[wordOffset + 192] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 22))
-        words[wordOffset + 193] = Value(a64.A64EncCmpImm(false, a64.A64X11, 116))
-        words[wordOffset + 194] = Value(a64.A64EncBCond(int64(6), a64.A64CondNE))
-        words[wordOffset + 195] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 23))
-        words[wordOffset + 196] = Value(a64.A64EncCmpImm(false, a64.A64X11, 121))
-        words[wordOffset + 197] = Value(a64.A64EncBCond(int64(3), a64.A64CondNE))
-        words[wordOffset + 198] = PrimaryArm64MovW0ConstWord(3)
-        words[wordOffset + 199] = a64.A64EncRet()
-        words[wordOffset + 200] = Value(a64.A64EncCmpImm(false, a64.A64X10, 33))
-        words[wordOffset + 201] = Value(a64.A64EncBCond(int64(102), a64.A64CondNE))
-        words[wordOffset + 202] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 0))
-        words[wordOffset + 203] = Value(a64.A64EncCmpImm(false, a64.A64X11, 118))
-        words[wordOffset + 204] = Value(a64.A64EncBCond(int64(99), a64.A64CondNE))
-        words[wordOffset + 205] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 1))
-        words[wordOffset + 206] = Value(a64.A64EncCmpImm(false, a64.A64X11, 101))
-        words[wordOffset + 207] = Value(a64.A64EncBCond(int64(96), a64.A64CondNE))
-        words[wordOffset + 208] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 2))
-        words[wordOffset + 209] = Value(a64.A64EncCmpImm(false, a64.A64X11, 114))
-        words[wordOffset + 210] = Value(a64.A64EncBCond(int64(93), a64.A64CondNE))
-        words[wordOffset + 211] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 3))
-        words[wordOffset + 212] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 213] = Value(a64.A64EncBCond(int64(90), a64.A64CondNE))
-        words[wordOffset + 214] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 4))
-        words[wordOffset + 215] = Value(a64.A64EncCmpImm(false, a64.A64X11, 102))
-        words[wordOffset + 216] = Value(a64.A64EncBCond(int64(87), a64.A64CondNE))
-        words[wordOffset + 217] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 5))
-        words[wordOffset + 218] = Value(a64.A64EncCmpImm(false, a64.A64X11, 121))
-        words[wordOffset + 219] = Value(a64.A64EncBCond(int64(84), a64.A64CondNE))
-        words[wordOffset + 220] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 6))
-        words[wordOffset + 221] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 222] = Value(a64.A64EncBCond(int64(81), a64.A64CondNE))
-        words[wordOffset + 223] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 7))
-        words[wordOffset + 224] = Value(a64.A64EncCmpImm(false, a64.A64X11, 101))
-        words[wordOffset + 225] = Value(a64.A64EncBCond(int64(78), a64.A64CondNE))
-        words[wordOffset + 226] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 8))
-        words[wordOffset + 227] = Value(a64.A64EncCmpImm(false, a64.A64X11, 120))
-        words[wordOffset + 228] = Value(a64.A64EncBCond(int64(75), a64.A64CondNE))
-        words[wordOffset + 229] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 9))
-        words[wordOffset + 230] = Value(a64.A64EncCmpImm(false, a64.A64X11, 112))
-        words[wordOffset + 231] = Value(a64.A64EncBCond(int64(72), a64.A64CondNE))
-        words[wordOffset + 232] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 10))
-        words[wordOffset + 233] = Value(a64.A64EncCmpImm(false, a64.A64X11, 111))
-        words[wordOffset + 234] = Value(a64.A64EncBCond(int64(69), a64.A64CondNE))
-        words[wordOffset + 235] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 11))
-        words[wordOffset + 236] = Value(a64.A64EncCmpImm(false, a64.A64X11, 114))
-        words[wordOffset + 237] = Value(a64.A64EncBCond(int64(66), a64.A64CondNE))
-        words[wordOffset + 238] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 12))
-        words[wordOffset + 239] = Value(a64.A64EncCmpImm(false, a64.A64X11, 116))
-        words[wordOffset + 240] = Value(a64.A64EncBCond(int64(63), a64.A64CondNE))
-        words[wordOffset + 241] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 13))
-        words[wordOffset + 242] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 243] = Value(a64.A64EncBCond(int64(60), a64.A64CondNE))
-        words[wordOffset + 244] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 14))
-        words[wordOffset + 245] = Value(a64.A64EncCmpImm(false, a64.A64X11, 118))
-        words[wordOffset + 246] = Value(a64.A64EncBCond(int64(57), a64.A64CondNE))
-        words[wordOffset + 247] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 15))
-        words[wordOffset + 248] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 249] = Value(a64.A64EncBCond(int64(54), a64.A64CondNE))
-        words[wordOffset + 250] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 16))
-        words[wordOffset + 251] = Value(a64.A64EncCmpImm(false, a64.A64X11, 115))
-        words[wordOffset + 252] = Value(a64.A64EncBCond(int64(51), a64.A64CondNE))
-        words[wordOffset + 253] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 17))
-        words[wordOffset + 254] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 255] = Value(a64.A64EncBCond(int64(48), a64.A64CondNE))
-        words[wordOffset + 256] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 18))
-        words[wordOffset + 257] = Value(a64.A64EncCmpImm(false, a64.A64X11, 98))
-        words[wordOffset + 258] = Value(a64.A64EncBCond(int64(45), a64.A64CondNE))
-        words[wordOffset + 259] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 19))
-        words[wordOffset + 260] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 261] = Value(a64.A64EncBCond(int64(42), a64.A64CondNE))
-        words[wordOffset + 262] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 20))
-        words[wordOffset + 263] = Value(a64.A64EncCmpImm(false, a64.A64X11, 108))
-        words[wordOffset + 264] = Value(a64.A64EncBCond(int64(39), a64.A64CondNE))
-        words[wordOffset + 265] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 21))
-        words[wordOffset + 266] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 267] = Value(a64.A64EncBCond(int64(36), a64.A64CondNE))
-        words[wordOffset + 268] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 22))
-        words[wordOffset + 269] = Value(a64.A64EncCmpImm(false, a64.A64X11, 116))
-        words[wordOffset + 270] = Value(a64.A64EncBCond(int64(33), a64.A64CondNE))
-        words[wordOffset + 271] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 23))
-        words[wordOffset + 272] = Value(a64.A64EncCmpImm(false, a64.A64X11, 121))
-        words[wordOffset + 273] = Value(a64.A64EncBCond(int64(30), a64.A64CondNE))
-        words[wordOffset + 274] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 24))
-        words[wordOffset + 275] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 276] = Value(a64.A64EncBCond(int64(27), a64.A64CondNE))
-        words[wordOffset + 277] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 25))
-        words[wordOffset + 278] = Value(a64.A64EncCmpImm(false, a64.A64X11, 112))
-        words[wordOffset + 279] = Value(a64.A64EncBCond(int64(24), a64.A64CondNE))
-        words[wordOffset + 280] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 26))
-        words[wordOffset + 281] = Value(a64.A64EncCmpImm(false, a64.A64X11, 97))
-        words[wordOffset + 282] = Value(a64.A64EncBCond(int64(21), a64.A64CondNE))
-        words[wordOffset + 283] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 27))
-        words[wordOffset + 284] = Value(a64.A64EncCmpImm(false, a64.A64X11, 114))
-        words[wordOffset + 285] = Value(a64.A64EncBCond(int64(18), a64.A64CondNE))
-        words[wordOffset + 286] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 28))
-        words[wordOffset + 287] = Value(a64.A64EncCmpImm(false, a64.A64X11, 97))
-        words[wordOffset + 288] = Value(a64.A64EncBCond(int64(15), a64.A64CondNE))
-        words[wordOffset + 289] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 29))
-        words[wordOffset + 290] = Value(a64.A64EncCmpImm(false, a64.A64X11, 108))
-        words[wordOffset + 291] = Value(a64.A64EncBCond(int64(12), a64.A64CondNE))
-        words[wordOffset + 292] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 30))
-        words[wordOffset + 293] = Value(a64.A64EncCmpImm(false, a64.A64X11, 108))
-        words[wordOffset + 294] = Value(a64.A64EncBCond(int64(9), a64.A64CondNE))
-        words[wordOffset + 295] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 31))
-        words[wordOffset + 296] = Value(a64.A64EncCmpImm(false, a64.A64X11, 101))
-        words[wordOffset + 297] = Value(a64.A64EncBCond(int64(6), a64.A64CondNE))
-        words[wordOffset + 298] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 32))
-        words[wordOffset + 299] = Value(a64.A64EncCmpImm(false, a64.A64X11, 108))
-        words[wordOffset + 300] = Value(a64.A64EncBCond(int64(3), a64.A64CondNE))
-        words[wordOffset + 301] = PrimaryArm64MovW0ConstWord(4)
-        words[wordOffset + 302] = a64.A64EncRet()
-        words[wordOffset + 303] = Value(a64.A64EncCmpImm(false, a64.A64X10, 16))
-        words[wordOffset + 304] = Value(a64.A64EncBCond(int64(51), a64.A64CondNE))
-        words[wordOffset + 305] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 0))
-        words[wordOffset + 306] = Value(a64.A64EncCmpImm(false, a64.A64X11, 115))
-        words[wordOffset + 307] = Value(a64.A64EncBCond(int64(48), a64.A64CondNE))
-        words[wordOffset + 308] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 1))
-        words[wordOffset + 309] = Value(a64.A64EncCmpImm(false, a64.A64X11, 121))
-        words[wordOffset + 310] = Value(a64.A64EncBCond(int64(45), a64.A64CondNE))
-        words[wordOffset + 311] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 2))
-        words[wordOffset + 312] = Value(a64.A64EncCmpImm(false, a64.A64X11, 115))
-        words[wordOffset + 313] = Value(a64.A64EncBCond(int64(42), a64.A64CondNE))
-        words[wordOffset + 314] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 3))
-        words[wordOffset + 315] = Value(a64.A64EncCmpImm(false, a64.A64X11, 116))
-        words[wordOffset + 316] = Value(a64.A64EncBCond(int64(39), a64.A64CondNE))
-        words[wordOffset + 317] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 4))
-        words[wordOffset + 318] = Value(a64.A64EncCmpImm(false, a64.A64X11, 101))
-        words[wordOffset + 319] = Value(a64.A64EncBCond(int64(36), a64.A64CondNE))
-        words[wordOffset + 320] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 5))
-        words[wordOffset + 321] = Value(a64.A64EncCmpImm(false, a64.A64X11, 109))
-        words[wordOffset + 322] = Value(a64.A64EncBCond(int64(33), a64.A64CondNE))
-        words[wordOffset + 323] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 6))
-        words[wordOffset + 324] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 325] = Value(a64.A64EncBCond(int64(30), a64.A64CondNE))
-        words[wordOffset + 326] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 7))
-        words[wordOffset + 327] = Value(a64.A64EncCmpImm(false, a64.A64X11, 108))
-        words[wordOffset + 328] = Value(a64.A64EncBCond(int64(27), a64.A64CondNE))
-        words[wordOffset + 329] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 8))
-        words[wordOffset + 330] = Value(a64.A64EncCmpImm(false, a64.A64X11, 105))
-        words[wordOffset + 331] = Value(a64.A64EncBCond(int64(24), a64.A64CondNE))
-        words[wordOffset + 332] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 9))
-        words[wordOffset + 333] = Value(a64.A64EncCmpImm(false, a64.A64X11, 110))
-        words[wordOffset + 334] = Value(a64.A64EncBCond(int64(21), a64.A64CondNE))
-        words[wordOffset + 335] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 10))
-        words[wordOffset + 336] = Value(a64.A64EncCmpImm(false, a64.A64X11, 107))
-        words[wordOffset + 337] = Value(a64.A64EncBCond(int64(18), a64.A64CondNE))
-        words[wordOffset + 338] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 11))
-        words[wordOffset + 339] = Value(a64.A64EncCmpImm(false, a64.A64X11, 45))
-        words[wordOffset + 340] = Value(a64.A64EncBCond(int64(15), a64.A64CondNE))
-        words[wordOffset + 341] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 12))
-        words[wordOffset + 342] = Value(a64.A64EncCmpImm(false, a64.A64X11, 101))
-        words[wordOffset + 343] = Value(a64.A64EncBCond(int64(12), a64.A64CondNE))
-        words[wordOffset + 344] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 13))
-        words[wordOffset + 345] = Value(a64.A64EncCmpImm(false, a64.A64X11, 120))
-        words[wordOffset + 346] = Value(a64.A64EncBCond(int64(9), a64.A64CondNE))
-        words[wordOffset + 347] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 14))
-        words[wordOffset + 348] = Value(a64.A64EncCmpImm(false, a64.A64X11, 101))
-        words[wordOffset + 349] = Value(a64.A64EncBCond(int64(6), a64.A64CondNE))
-        words[wordOffset + 350] = Value(a64.A64EncLdrbImm(a64.A64X11, a64.A64X9, 15))
-        words[wordOffset + 351] = Value(a64.A64EncCmpImm(false, a64.A64X11, 99))
-        words[wordOffset + 352] = Value(a64.A64EncBCond(int64(3), a64.A64CondNE))
-        words[wordOffset + 353] = PrimaryArm64MovW0ConstWord(5)
-        words[wordOffset + 354] = a64.A64EncRet()
-        words[wordOffset + 355] = a64.A64EncMovn(false, a64.A64X0, 0, 0)
-        words[wordOffset + 356] = a64.A64EncRet()
-        return true
-    if bodyKind == texpr.BodyKindBackendDriverRunCommand:
-        if wordCount != 18:
-            return false
-        return PrimaryFillBackendDriverRunCommandWords(words, wordOffset)
     if bodyKind == texpr.BodyKindReturnStrArg0:
         if wordCount != 7:
             return false
@@ -4934,6 +4640,69 @@ fn PrimaryFillInstructionWords(words: var int32[],
             failedIndex = i
     return ok
 
+fn PrimaryFillFunctionChunk(words: var int32[],
+                             functionWordOffsets: int32[],
+                             functionWordCounts: int32[],
+                             functionBodyKinds: str[],
+                             functionBodyIRs: coreir.BodyIR[],
+                             startIndex: int32,
+                             endIndex: int32,
+                             failedIndex: var int32): bool =
+    var ok = true
+    failedIndex = -1
+    var limit = endIndex
+    if limit > functionBodyKinds.len:
+        limit = functionBodyKinds.len
+    for i in startIndex..<limit:
+        if !PrimaryFillOneFunction(words,
+                                    functionWordOffsets,
+                                    functionWordCounts,
+                                    functionBodyKinds,
+                                    functionBodyIRs,
+                                    i):
+            ok = false
+            failedIndex = i
+    return ok
+
+fn PrimaryFillInstructionWordsChunked(words: var int32[],
+                                       functionWordOffsets: int32[],
+                                       functionWordCounts: int32[],
+                                       functionBodyKinds: str[],
+                                       functionBodyIRs: coreir.BodyIR[],
+                                       chunkCount: int32,
+                                       failedIndex: var int32): bool =
+    if chunkCount <= 1 || functionBodyKinds.len <= 1:
+        return PrimaryFillInstructionWords(words,
+                                            functionWordOffsets,
+                                            functionWordCounts,
+                                            functionBodyKinds,
+                                            functionBodyIRs,
+                                            failedIndex)
+    var ok = true
+    failedIndex = -1
+    var chunkSize = functionBodyKinds.len / chunkCount
+    if chunkSize <= 0:
+        chunkSize = 1
+    for chunkIndex in 0..<chunkCount:
+        let startIndex = chunkIndex * chunkSize
+        var endIndex = startIndex + chunkSize
+        if chunkIndex == chunkCount - 1:
+            endIndex = functionBodyKinds.len
+        var chunkFailedIndex: int32
+        chunkFailedIndex = -1
+        if !PrimaryFillFunctionChunk(words,
+                                      functionWordOffsets,
+                                      functionWordCounts,
+                                      functionBodyKinds,
+                                      functionBodyIRs,
+                                      startIndex,
+                                      endIndex,
+                                      chunkFailedIndex):
+            ok = false
+            if failedIndex < 0:
+                failedIndex = chunkFailedIndex
+    return ok
+
 fn PrimaryBodyIrWordCount(bodyIR: coreir.BodyIR): int32 =
     return PrimaryBodyIrGeneralCfgWordCount(bodyIR)
 
@@ -5789,7 +5558,8 @@ fn PrimaryBuildBodyIrForFunction(lowering: lower.LoweringPlanStub,
                                    tempBodyIRs: var coreir.BodyIR[],
                                    wordCounts: var int32[]) =
     var buildBodyIR = irFn.bodyKind == texpr.BodyKindUnsupported ||
-                      irFn.bodyKind == texpr.BodyKindStatementSequence
+                      irFn.bodyKind == texpr.BodyKindStatementSequence ||
+                      wordCounts[i] <= 0
     if !buildBodyIR:
         buildBodyIR = PrimaryStatementSequenceReturnMode(irFn.bodyKind) != PrimaryStatementReturnModeNone()
     if buildBodyIR:
@@ -5917,6 +5687,35 @@ fn PrimaryObjectPlanLoweringPhase(state: var PrimaryObjectPlanPhaseState,
         if state.wordCounts[i] <= 0 ||
            PrimaryStatementSequenceReturnMode(irFn.bodyKind) != PrimaryStatementReturnModeNone():
             PrimaryBuildBodyIrForFunction(lowering, irFn, i, state.tempBodyIRs, state.wordCounts)
+
+fn PrimaryObjectPlanExecuteTaskPhase(state: var PrimaryObjectPlanPhaseState,
+                                      lowering: lower.LoweringPlanStub) =
+    var plan: ftask.FunctionTaskPlan
+    plan.jobCount = 1
+    for i in 0..<lowering.functionNames.len:
+        if state.irIndexes[i] < 0:
+            continue
+        var task: ftask.FunctionTask
+        task.funcIndex = i
+        task.declOrdinal = i
+        task.extra.bodyIR = state.tempBodyIRs[i]
+        task.extra.bodyKind = lowering.primaryObjectIr.functions[state.irIndexes[i]].bodyKind
+        task.extra.statementMode = PrimaryStatementSequenceReturnMode(task.extra.bodyKind)
+        task.extra.statementCallCount = lowering.primaryObjectIr.functions[state.irIndexes[i]].callTargets.len
+        task.extra.functionName = lowering.functionNames[i]
+        task.extra.symbolText = lowering.functionSymbolTexts[i]
+        task.extra.sourcePath = lowering.functionSourcePaths[i]
+        add(plan.tasks, task)
+    let results = ftaskexec.FunctionTaskExecuteAuto(plan)
+    for ri in 0..<results.len:
+        let result = results[ri]
+        if result.funcIndex >= 0 && result.funcIndex < state.wordCounts.len:
+            if result.wordCount > 0 && state.wordCounts[result.funcIndex] > 0 &&
+               result.wordCount != state.wordCounts[result.funcIndex]:
+                if len(state.error.functionName) <= 0:
+                    state.error.functionName = lowering.functionNames[result.funcIndex]
+                    state.error.bodyKind = "function_task_word_count_mismatch"
+                    state.bodySemanticsMissing = true
 
 fn PrimaryCallSequenceNeedsReloc(bodyKind: str, bodyIrCallCount: int32): bool =
     if bodyIrCallCount > 0:
@@ -6363,12 +6162,69 @@ fn PrimaryObjectPlanFillAndCheckPhase(state: var PrimaryObjectPlanPhaseState,
         add(plan.instructionWords, 0)
     var primaryFillFailedIndex: int32
     primaryFillFailedIndex = -1
-    PrimaryFillInstructionWords(plan.instructionWords,
-                                state.functionWordOffsets,
-                                state.functionWordCounts,
-                                state.functionInstructionBodyKinds,
-                                state.planBodyIRs,
-                                primaryFillFailedIndex)
+    var fillChunkCount = 1
+    if state.functionBodyKinds.len > 64:
+        fillChunkCount = 4
+        if thread.Parallelism() >= 4:
+            fillChunkCount = thread.Parallelism()
+    if fillChunkCount > 1 && state.functionBodyKinds.len > 1:
+        var chunkSize = state.functionBodyKinds.len / fillChunkCount
+        if chunkSize <= 0:
+            chunkSize = 1
+        var chunkFailedFlags: bool[]
+        var chunkFailedIndices: int32[]
+        for ci in 0..<fillChunkCount:
+            add(chunkFailedFlags, false)
+            add(chunkFailedIndices, -1)
+        var spawned: int32
+        for chunkIndex in 0..<fillChunkCount:
+            let startIndex = chunkIndex * chunkSize
+            var endIndex = startIndex + chunkSize
+            if chunkIndex == fillChunkCount - 1:
+                endIndex = state.functionBodyKinds.len
+            if !thread.Spawn(fn() =
+                var fi: int32
+                fi = -1
+                if !PrimaryFillFunctionChunk(plan.instructionWords,
+                                              state.functionWordOffsets,
+                                              state.functionWordCounts,
+                                              state.functionInstructionBodyKinds,
+                                              state.planBodyIRs,
+                                              startIndex,
+                                              endIndex,
+                                              fi):
+                    chunkFailedFlags[chunkIndex] = true
+                    chunkFailedIndices[chunkIndex] = fi
+            ):
+                var fi2: int32
+                fi2 = -1
+                PrimaryFillFunctionChunk(plan.instructionWords,
+                                          state.functionWordOffsets,
+                                          state.functionWordCounts,
+                                          state.functionInstructionBodyKinds,
+                                          state.planBodyIRs,
+                                          startIndex,
+                                          endIndex,
+                                          fi2)
+                if fi2 >= 0:
+                    chunkFailedFlags[chunkIndex] = true
+                    chunkFailedIndices[chunkIndex] = fi2
+            else:
+                spawned = spawned + 1
+        while spawned > 0:
+            thread.Yield()
+            spawned = spawned - 1
+        for ci in 0..<fillChunkCount:
+            if chunkFailedFlags[ci]:
+                primaryFillFailedIndex = chunkFailedIndices[ci]
+                break
+    else:
+        PrimaryFillInstructionWords(plan.instructionWords,
+                                    state.functionWordOffsets,
+                                    state.functionWordCounts,
+                                    state.functionInstructionBodyKinds,
+                                    state.planBodyIRs,
+                                    primaryFillFailedIndex)
     for functionIndex in 0..<state.functionBodyKinds.len:
         if functionIndex >= state.symbolNames.len ||
            functionIndex >= state.functionWordOffsets.len ||
@@ -6474,6 +6330,7 @@ fn BuildPrimaryObjectPlan(linkPlan: slplan.SystemLinkPlanStub,
     PrimaryObjectPlanInitPhase(state, linkPlan, lowering)
     PrimaryObjectPlanLinkPhase(state, linkPlan, lowering)
     PrimaryObjectPlanLoweringPhase(state, lowering)
+    PrimaryObjectPlanExecuteTaskPhase(state, lowering)
     PrimaryObjectPlanReachabilityPhase(state, lowering, plan)
     PrimaryObjectPlanBuildItemsPhase(state, linkPlan, lowering, plan)
     PrimaryObjectPlanFillAndCheckPhase(state, linkPlan, lowering, plan)
