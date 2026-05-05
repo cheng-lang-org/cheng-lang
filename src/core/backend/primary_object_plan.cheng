@@ -2,6 +2,9 @@ import std/result
 import std/strings
 import std/strutils as strutil
 import std/strformat
+import std/atomic
+import std/async_rt as async
+import std/thread
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/backend/aarch64_encode as a64
 import cheng/core/backend/system_link_plan as slplan
@@ -9,7 +12,6 @@ import cheng/core/backend/lowering_plan as lower
 import cheng/core/backend/target_matrix as tmat
 import cheng/core/ir/core_types as coreir
 import cheng/core/lang/typed_expr as texpr
-import cheng/core/backend/primary_object_plan_symbols as pobj_syms
 
 type
     PrimaryObjectErrorBodyIrDetail =
@@ -127,48 +129,139 @@ type
 
 fn PrimaryTargetSymbolName(targetTriple: str,
                              raw: str): str =
-    return pobj_syms.PrimaryTargetSymbolName(targetTriple, raw)
+    if targetTriple == "arm64-apple-darwin" ||
+       targetTriple == "aarch64-apple-ios" ||
+       targetTriple == "arm64-apple-ios":
+        if len(raw) > 0 && raw[0] == '_':
+            return raw
+        if len(raw) >= 2 && raw[0] == 'L' && raw[1] == '_':
+            return raw
+        return Fmt"_{raw}"
+    return raw
+
 
 fn PrimarySanitizeSymbolPart(text: str): str =
-    return pobj_syms.PrimarySanitizeSymbolPart(text)
+    var out = ""
+    for i in 0..<len(text):
+        let ch = text[i]
+        let digit = ch >= '0' && ch <= '9'
+        let upper = ch >= 'A' && ch <= 'Z'
+        let lower = ch >= 'a' && ch <= 'z'
+        if digit || upper || lower || ch == '_':
+            out = Fmt"{out}{strings.SliceBytes(text, i, 1)}"
+        else:
+            out = Fmt"{out}_"
+    return out
+
 
 fn PrimarySymbolNameForFunction(targetTriple: str,
                                   symbolText: str,
                                   signatureLineNumber: int32,
                                   emitKind: creq.CompilerEmit): str =
-    return pobj_syms.PrimarySymbolNameForFunction(targetTriple,
-                                                   symbolText,
-                                                   signatureLineNumber,
-                                                   emitKind)
+    var raw = symbolText
+    var lineScoped = false
+    if len(raw) == 0:
+        raw = "cheng_primary_unnamed"
+    if len(raw) >= 2:
+        for i in 0..<(len(raw) - 1):
+            if raw[i] == ':' && raw[i + 1] == ':':
+                lineScoped = true
+    raw = PrimarySanitizeSymbolPart(raw)
+    if lineScoped && signatureLineNumber > 0:
+        raw = Fmt"{raw}__L{strings.IntToStr(signatureLineNumber)}"
+    return PrimaryTargetSymbolName(targetTriple, raw)
+
 
 fn PrimaryRuntimeEntryBridgeSymbol(linkPlan: slplan.SystemLinkPlanStub): str =
-    return pobj_syms.PrimaryRuntimeEntryBridgeSymbol(linkPlan)
+    var raw = "cheng_program_argv_entry"
+    if linkPlan.moduleKind == slplan.SystemCompilerControlPlane:
+        raw = "cheng_tooling_argv_entry"
+    return PrimaryTargetSymbolName(linkPlan.targetTriple, raw)
+
 
 fn PrimaryStartsWith(text: str,
                       prefix: str): bool =
-    return pobj_syms.PrimaryStartsWith(text, prefix)
+    if len(prefix) > len(text):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
+
 
 fn PrimaryPathTrimStart(text: str): int32 =
-    return pobj_syms.PrimaryPathTrimStart(text)
+    var start: int32
+    while start < len(text):
+        let code = Int32(text[start])
+        if code != 32 && code != 9 && code != 10 && code != 13:
+            break
+        start = start + 1
+    return start
+
 
 fn PrimaryPathTrimStop(text: str,
                          start: int32): int32 =
-    return pobj_syms.PrimaryPathTrimStop(text, start)
+    var stop = len(text)
+    while stop > start:
+        let code = Int32(text[stop - 1])
+        if code != 32 && code != 9 && code != 10 && code != 13:
+            break
+        stop = stop - 1
+    return stop
+
 
 fn PrimaryPathNormalizedStop(text: str,
                                start: int32,
                                stopRaw: int32): int32 =
-    return pobj_syms.PrimaryPathNormalizedStop(text, start, stopRaw)
+    var stop = stopRaw
+    while stop > start + 1:
+        let last = text[stop - 1]
+        if last != '/' && last != '\\':
+            break
+        stop = stop - 1
+    return stop
+
 
 fn PrimaryPathNormalizedEquals(left: str,
                                  right: str): bool =
-    return pobj_syms.PrimaryPathNormalizedEquals(left, right)
+    let leftStart = PrimaryPathTrimStart(left)
+    let rightStart = PrimaryPathTrimStart(right)
+    let leftStop = PrimaryPathNormalizedStop(left, leftStart, PrimaryPathTrimStop(left, leftStart))
+    let rightStop = PrimaryPathNormalizedStop(right, rightStart, PrimaryPathTrimStop(right, rightStart))
+    let leftLen = leftStop - leftStart
+    let rightLen = rightStop - rightStart
+    if leftLen != rightLen:
+        return false
+    for i in 0..<leftLen:
+        if left[leftStart + i] != right[rightStart + i]:
+            return false
+    return true
+
 
 fn PrimaryFunctionTailName(functionName: str): str =
-    return pobj_syms.PrimaryFunctionTailName(functionName)
+    var tailStart = 0
+    if len(functionName) >= 2:
+        for j in 0..<(len(functionName) - 1):
+            if functionName[j] == ':' && functionName[j + 1] == ':':
+                tailStart = j + 2
+    if tailStart > 0 && tailStart < len(functionName):
+        return strings.SliceBytes(functionName, tailStart, len(functionName) - tailStart)
+    return functionName
+
 
 fn PrimaryCallTargetTailName(targetText: str): str =
-    return pobj_syms.PrimaryCallTargetTailName(targetText)
+    var tailStart = 0
+    for i in 0..<len(targetText):
+        if targetText[i] == '.':
+            tailStart = i + 1
+    if len(targetText) >= 2:
+        for j in 0..<(len(targetText) - 1):
+            if targetText[j] == ':' && targetText[j + 1] == ':':
+                tailStart = j + 2
+    if tailStart > 0 && tailStart < len(targetText):
+        return strings.SliceBytes(targetText, tailStart, len(targetText) - tailStart)
+    return targetText
+
 
 fn PrimaryObjectIrFunctionIndex(ir: lower.PrimaryObjectIr,
                                   sourcePath: str,
@@ -4699,6 +4792,106 @@ fn PrimaryFillInstructionWordsChunked(words: var int32[],
             if failedIndex < 0:
                 failedIndex = chunkFailedIndex
     return ok
+
+# -- Parallel fill: workers fill disjoint word ranges concurrently --
+
+type
+    PrimaryFillWorkerCtx =
+        words: var int32[]
+        functionWordOffsets: int32[]
+        functionWordCounts: int32[]
+        functionBodyKinds: str[]
+        functionBodyIRs: coreir.BodyIR[]
+        startIndex: int32
+        endIndex: int32
+        ok: bool
+        workerId: int32
+        completedCount: ptr
+        errorCount: ptr
+
+fn PrimaryFillWorkerMain(ctx: ptr) =
+    let w = memCastToVar(ctx)
+    if w == nil:
+        if w.errorCount != nil:
+            let _ = atomic.AddI32(w.errorCount, 1)
+        if w.completedCount != nil:
+            let _ = atomic.AddI32(w.completedCount, 1)
+        return
+    var failedIndex: int32
+    failedIndex = -1
+    let chunkOk = PrimaryFillFunctionChunk(w.words,
+                                            w.functionWordOffsets,
+                                            w.functionWordCounts,
+                                            w.functionBodyKinds,
+                                            w.functionBodyIRs,
+                                            w.startIndex,
+                                            w.endIndex,
+                                            failedIndex)
+    w.ok = chunkOk
+    if !chunkOk && w.errorCount != nil:
+        let _ = atomic.AddI32(w.errorCount, 1)
+    if w.completedCount != nil:
+        let _ = atomic.AddI32(w.completedCount, 1)
+
+fn PrimaryFillInstructionWordsParallel(words: var int32[],
+                                        functionWordOffsets: int32[],
+                                        functionWordCounts: int32[],
+                                        functionBodyKinds: str[],
+                                        functionBodyIRs: coreir.BodyIR[],
+                                        jobCount: int32,
+                                        failedIndex: var int32): bool =
+    if jobCount <= 1:
+        return PrimaryFillInstructionWords(words,
+                                            functionWordOffsets,
+                                            functionWordCounts,
+                                            functionBodyKinds,
+                                            functionBodyIRs,
+                                            failedIndex)
+    let totalFunctions = functionBodyKinds.len
+    if totalFunctions <= 0:
+        failedIndex = -1
+        return true
+    let workerCount = jobCount
+    let completedCount = atomic.NewI32(0)
+    let errorCount = atomic.NewI32(0)
+    if completedCount == nil || errorCount == nil:
+        return PrimaryFillInstructionWords(words,
+                                            functionWordOffsets,
+                                            functionWordCounts,
+                                            functionBodyKinds,
+                                            functionBodyIRs,
+                                            failedIndex)
+    failedIndex = -1
+    var ctxs: PrimaryFillWorkerCtx[]
+    for workerId in 0..<workerCount:
+        let start = (totalFunctions * workerId) / workerCount
+        let finish = (totalFunctions * (workerId + 1)) / workerCount
+        if start >= finish:
+            continue
+        var ctx: PrimaryFillWorkerCtx
+        ctx.words = words
+        ctx.functionWordOffsets = functionWordOffsets
+        ctx.functionWordCounts = functionWordCounts
+        ctx.functionBodyKinds = functionBodyKinds
+        ctx.functionBodyIRs = functionBodyIRs
+        ctx.startIndex = start
+        ctx.endIndex = finish
+        ctx.ok = true
+        ctx.workerId = workerId
+        ctx.completedCount = completedCount
+        ctx.errorCount = errorCount
+        add(ctxs, ctx)
+        let ctxPtr = &ctxs[ctxs.len - 1]
+        async.spawnPtr(PrimaryFillWorkerMain, memCastToVoid(ctxPtr))
+    while atomic.LoadI32(completedCount) < ctxs.len:
+        thread.Yield()
+    var allOk = true
+    for ci in 0..<ctxs.len:
+        if !ctxs[ci].ok:
+            allOk = false
+            if failedIndex < 0:
+                failedIndex = ctxs[ci].startIndex
+    return allOk
 
 fn PrimaryBodyIrWordCount(bodyIR: coreir.BodyIR): int32 =
     return PrimaryBodyIrGeneralCfgWordCount(bodyIR)
