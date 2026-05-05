@@ -58,6 +58,8 @@ type
         exprLayer: parser.NormalizedExprLayer
         typedExprFacts: ccsg.TypedExprFact[]
         resolvedCallFactSourcePaths: str[]
+        resolvedCallFactSourceBucketHeads: int32[]
+        resolvedCallFactSourceEntryNext: int32[]
         resolvedCallFactBucketHeads: int32[]
         resolvedCallFactEntryNext: int32[]
         resolvedCallFactEntrySourceIndexes: int32[]
@@ -453,6 +455,12 @@ fn LoweringResolvedCallFactIndexBucketCount(factCount: int32): int32 =
         out = out * 2
     return out
 
+fn LoweringResolvedCallFactSourceBucket(sourcePath: str,
+                                         bucketCount: int32): int32 =
+    if len(sourcePath) <= 0 || bucketCount <= 0:
+        return -1
+    return parser.ParserTextLookupContentHash(sourcePath) & (bucketCount - 1)
+
 fn LoweringResolvedCallFactBucket(sourceIndex: int32,
                                    lineNumber: int32,
                                    bucketCount: int32): int32 =
@@ -460,12 +468,20 @@ fn LoweringResolvedCallFactBucket(sourceIndex: int32,
         return -1
     return ((sourceIndex + 1) * 131 + lineNumber) & (bucketCount - 1)
 
-fn LoweringResolvedCallFactSourceIndex(sourcePaths: str[],
+fn LoweringResolvedCallFactSourceIndex(plan: LoweringPlanStub,
                                         sourcePath: str): int32 =
     let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
-    for i in 0..<sourcePaths.len:
-        if sourcePaths[i] == normalizedSourcePath:
-            return i
+    let bucket = LoweringResolvedCallFactSourceBucket(normalizedSourcePath,
+                                                       plan.resolvedCallFactSourceBucketHeads.len)
+    if bucket < 0:
+        return -1
+    var entryIndex = plan.resolvedCallFactSourceBucketHeads[bucket]
+    while entryIndex >= 0:
+        if entryIndex >= plan.resolvedCallFactSourcePaths.len:
+            return -1
+        if plan.resolvedCallFactSourcePaths[entryIndex] == normalizedSourcePath:
+            return entryIndex
+        entryIndex = plan.resolvedCallFactSourceEntryNext[entryIndex]
     return -1
 
 fn LoweringResolvedCallFactFindOrAddSource(plan: var LoweringPlanStub,
@@ -473,19 +489,31 @@ fn LoweringResolvedCallFactFindOrAddSource(plan: var LoweringPlanStub,
     let normalizedSourcePath = parser.ParserNormalizePath(sourcePath)
     if len(normalizedSourcePath) <= 0:
         return -1
-    for i in 0..<plan.resolvedCallFactSourcePaths.len:
-        if plan.resolvedCallFactSourcePaths[i] == normalizedSourcePath:
-            return i
+    let existingIndex = LoweringResolvedCallFactSourceIndex(plan, normalizedSourcePath)
+    if existingIndex >= 0:
+        return existingIndex
+    let bucket = LoweringResolvedCallFactSourceBucket(normalizedSourcePath,
+                                                       plan.resolvedCallFactSourceBucketHeads.len)
+    if bucket < 0:
+        return -1
+    let entryIndex = plan.resolvedCallFactSourcePaths.len
     add(plan.resolvedCallFactSourcePaths, normalizedSourcePath)
-    return plan.resolvedCallFactSourcePaths.len - 1
+    add(plan.resolvedCallFactSourceEntryNext, plan.resolvedCallFactSourceBucketHeads[bucket])
+    plan.resolvedCallFactSourceBucketHeads[bucket] = entryIndex
+    return entryIndex
 
 fn LoweringBuildResolvedCallFactIndex(plan: var LoweringPlanStub) =
     plan.resolvedCallFactSourcePaths = []
+    plan.resolvedCallFactSourceBucketHeads = []
+    plan.resolvedCallFactSourceEntryNext = []
     plan.resolvedCallFactBucketHeads = []
     plan.resolvedCallFactEntryNext = []
     plan.resolvedCallFactEntrySourceIndexes = []
     plan.resolvedCallFactEntryLineNumbers = []
     plan.resolvedCallFactEntryFactIndexes = []
+    let sourceBucketCount = LoweringResolvedCallFactIndexBucketCount(plan.typedExprFacts.len / 4 + 4)
+    for bucketIndex in 0..<sourceBucketCount:
+        add(plan.resolvedCallFactSourceBucketHeads, -1)
     let bucketCount = LoweringResolvedCallFactIndexBucketCount(plan.typedExprFacts.len)
     var bucketTails: int32[]
     for bucketIndex in 0..<bucketCount:
@@ -519,7 +547,7 @@ fn LoweringFindResolvedCallFactIndex(plan: LoweringPlanStub,
                                       lineNumber: int32): int32 =
     if lineNumber <= 0:
         return -1
-    let sourceIndex = LoweringResolvedCallFactSourceIndex(plan.resolvedCallFactSourcePaths, sourcePath)
+    let sourceIndex = LoweringResolvedCallFactSourceIndex(plan, sourcePath)
     let bucket = LoweringResolvedCallFactBucket(sourceIndex, lineNumber, plan.resolvedCallFactBucketHeads.len)
     if bucket < 0:
         return -1
