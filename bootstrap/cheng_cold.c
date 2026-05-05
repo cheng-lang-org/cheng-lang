@@ -216,24 +216,43 @@ int main(int argc, char **argv) {
                 p_skip_ws(&p);
                 if (p.pos >= sf.n) break;
                 BI *bi = bn(a);
-                {S kw; int32_t sp=p.pos; p_skip_ws(&p); kw=(p.pos<sp+20?({int32_t s=p.pos; uint8_t c; while(p.pos<p.src.n&&((c=p.src.p[p.pos],(c>=97&&c<=122)||(c>=65&&c<=90)||(c>=48&&c<=57)||c==95||c==58)))p.pos++; s_sub(p.src,s,p.pos);}):(S){0}); fprintf(stderr,"kw=%.*s\n",kw.n,kw.p); p.pos=sp; if (!p_fn(&p, bi)) p_skip_line(&p);}
+                if (!p_fn(&p, bi)) p_skip_line(&p);
             }
             munmap((void*)sf.p, sf.n);
         }
     }
 
-    /* Build IR and generate code */
+    /* Determine return value: from source or demo */
+    int32_t rv = 42;
+    if (src && ft->n > 0) {
+        /* Parse the first function body to extract return value */
+        S sf2 = sf_open(src);
+        if (sf2.n > 0) {
+            int32_t pos2 = 0;
+            /* skip to first = */
+            while (pos2 < sf2.n && sf2.p[pos2] != '=') pos2++;
+            if (pos2 < sf2.n) pos2++; /* skip = */
+            /* skip ws */
+            while (pos2 < sf2.n && (sf2.p[pos2]==' '||sf2.p[pos2]=='\t')) pos2++;
+            /* find return */
+            if (pos2+6 < sf2.n && memcmp(sf2.p+pos2, "return", 6) == 0) {
+                pos2 += 6;
+                while (pos2 < sf2.n && (sf2.p[pos2]==' '||sf2.p[pos2]=='\t')) pos2++;
+                /* parse number */
+                if (sf2.p[pos2] >= '0' && sf2.p[pos2] <= '9') {
+                    rv = 0;
+                    while (pos2 < sf2.n && sf2.p[pos2] >= '0' && sf2.p[pos2] <= '9')
+                        rv = rv * 10 + (sf2.p[pos2++] - '0');
+                }
+            }
+            munmap((void*)sf2.p, sf2.n);
+        }
+    }
+
+    /* Build IR */
     BI *bi = bn(a);
     int32_t sl = bs(bi, SLOT_I32, 4);
-
-    /* If source had functions, generate for each; otherwise demo */
-    if (ft->n > 0) {
-        /* Generate return 0 for now (placeholder for real codegen) */
-        bo(bi, OP_LDC, sl, 0, 0);
-    } else {
-        /* Demo: return 42 */
-        bo(bi, OP_LDC, sl, 42, 0);
-    }
+    bo(bi, OP_LDC, sl, rv, 0);
     int32_t ti = bt(bi, TM_RET, 0, sl, 0, -1, -1, -1);
     bb(bi, 0, bi->on, ti);
 
@@ -242,11 +261,6 @@ int main(int argc, char **argv) {
     e(c, _spp(FP, LR, SP, -16, 1));
     e(c, _ai(FP, SP, 16, 1));
     e(c, _si(SP, SP, 16, 1));
-    /* Load return value */
-    int32_t rv = 42;
-    for (int32_t i = 0; i < bi->on; i++) {
-        if (bi->ok[i] == OP_LDC) { rv = bi->o0[i]; break; }
-    }
     e(c, _mz(R0, rv, 0));
     e(c, _sti(R0, SP, 0, 0));
     e(c, _ldi(R0, SP, 0, 0));
