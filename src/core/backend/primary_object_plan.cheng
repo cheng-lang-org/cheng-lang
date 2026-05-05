@@ -2,9 +2,6 @@ import std/result
 import std/strings
 import std/strutils as strutil
 import std/strformat
-import std/atomic
-import std/async_rt as async
-import std/thread
 import cheng/core/tooling/compiler_request as creq
 import cheng/core/backend/aarch64_encode as a64
 import cheng/core/backend/system_link_plan as slplan
@@ -4793,119 +4790,6 @@ fn PrimaryFillInstructionWordsChunked(words: var int32[],
                 failedIndex = chunkFailedIndex
     return ok
 
-# -- Parallel fill: workers fill disjoint word ranges concurrently --
-
-type
-    PrimaryFillWorkerCtx =
-        words: int32[]
-        functionWordOffsets: int32[]
-        functionWordCounts: int32[]
-        functionBodyKinds: str[]
-        functionBodyIRs: coreir.BodyIR[]
-        startIndex: int32
-        endIndex: int32
-        ok: bool
-        workerId: int32
-        completedCount: ptr
-        errorCount: ptr
-
-fn PrimaryFillWorkerMain(raw: ptr) =
-    if raw == nil:
-        return
-    let w: PrimaryFillWorkerCtx = PrimaryFillWorkerCtx(raw)
-    if w == nil:
-        let _ = atomic.AddI32(w.errorCount, 1)
-        let _ = atomic.AddI32(w.completedCount, 1)
-        return
-    var failedIndex: int32
-    failedIndex = -1
-    let chunkOk = PrimaryFillFunctionChunk(w.words,
-                                            w.functionWordOffsets,
-                                            w.functionWordCounts,
-                                            w.functionBodyKinds,
-                                            w.functionBodyIRs,
-                                            w.startIndex,
-                                            w.endIndex,
-                                            failedIndex)
-    w.ok = chunkOk
-    if !chunkOk && w.errorCount != nil:
-        let _ = atomic.AddI32(w.errorCount, 1)
-    if w.completedCount != nil:
-        let _ = atomic.AddI32(w.completedCount, 1)
-    memRelease(raw)
-
-fn PrimaryFillInstructionWordsParallel(words: var int32[],
-                                        functionWordOffsets: int32[],
-                                        functionWordCounts: int32[],
-                                        functionBodyKinds: str[],
-                                        functionBodyIRs: coreir.BodyIR[],
-                                        jobCount: int32,
-                                        failedIndex: var int32): bool =
-    if jobCount <= 1:
-        return PrimaryFillInstructionWords(words,
-                                            functionWordOffsets,
-                                            functionWordCounts,
-                                            functionBodyKinds,
-                                            functionBodyIRs,
-                                            failedIndex)
-    let totalFunctions = functionBodyKinds.len
-    if totalFunctions <= 0:
-        failedIndex = -1
-        return true
-    let workerCount = jobCount
-    let completedCount = atomic.NewI32(0)
-    let errorCount = atomic.NewI32(0)
-    if completedCount == nil || errorCount == nil:
-        return PrimaryFillInstructionWords(words,
-                                            functionWordOffsets,
-                                            functionWordCounts,
-                                            functionBodyKinds,
-                                            functionBodyIRs,
-                                            failedIndex)
-    failedIndex = -1
-    var spawnedCount = 0
-    var ctxs: ptr[]
-    for workerId in 0..<workerCount:
-        let start = (totalFunctions * workerId) / workerCount
-        let finish = (totalFunctions * (workerId + 1)) / workerCount
-        if start >= finish:
-            continue
-        let ctx = new(PrimaryFillWorkerCtx)
-        if ctx == nil:
-            continue
-        ctx.words = words
-        ctx.functionWordOffsets = functionWordOffsets
-        ctx.functionWordCounts = functionWordCounts
-        ctx.functionBodyKinds = functionBodyKinds
-        ctx.functionBodyIRs = functionBodyIRs
-        ctx.startIndex = start
-        ctx.endIndex = finish
-        ctx.ok = true
-        ctx.workerId = workerId
-        ctx.completedCount = completedCount
-        ctx.errorCount = errorCount
-        memRetain(ctx)
-        add(ctxs, ctx)
-        spawnedCount = spawnedCount + 1
-        async.spawnPtr(PrimaryFillWorkerMain, ctx)
-    if spawnedCount <= 0:
-        return PrimaryFillInstructionWords(words,
-                                            functionWordOffsets,
-                                            functionWordCounts,
-                                            functionBodyKinds,
-                                            functionBodyIRs,
-                                            failedIndex)
-    while atomic.LoadI32(completedCount) < spawnedCount:
-        thread.Yield()
-    var allOk = true
-    for ci in 0..<ctxs.len:
-        let w: PrimaryFillWorkerCtx = PrimaryFillWorkerCtx(ctxs[ci])
-        if w != nil && !w.ok:
-            allOk = false
-            if failedIndex < 0:
-                failedIndex = w.startIndex
-    return allOk
-
 fn PrimaryBodyIrWordCount(bodyIR: coreir.BodyIR): int32 =
     return PrimaryBodyIrGeneralCfgWordCount(bodyIR)
 
@@ -6336,7 +6220,7 @@ fn PrimaryObjectPlanFillAndCheckPhase(state: var PrimaryObjectPlanPhaseState,
         add(plan.instructionWords, 0)
     var primaryFillFailedIndex: int32
     primaryFillFailedIndex = -1
-    PrimaryFillInstructionWordsParallel(plan.instructionWords,
+    PrimaryFillInstructionWords(plan.instructionWords,
                                         state.functionWordOffsets,
                                         state.functionWordCounts,
                                         state.functionInstructionBodyKinds,
