@@ -81,6 +81,10 @@ type
     UInt8Ptr = uint8 *
     Int32Ptr = int32 *
     UInt64Ptr = uint64 *
+    ChengDarwinThreadTask =
+        fnPtr: ptr
+        ctx: ptr
+    ChengDarwinThreadTaskPtr = ChengDarwinThreadTask *
 
 fn cheng_ptr_plus(base: ptr, off: int32): ptr =
     if base == nil:
@@ -346,3 +350,34 @@ fn cheng_native_system_disk_available_bytes_value_bridge_export(): int64 =
 fn cheng_mobile_biometric_fingerprint_authorize_bridge_native_export(requestWire: str): str =
     let _ = requestWire
     return cheng_str_copy_cstring("ok=0\nfeature32_hex=\ndevice_binding_seed_hex=\ndevice_label_hex=\nsensor_id_hex=\nhardware_attestation_hex=\nerror_hex=76332062696f6d65747269633a206d6f62696c6520686f737420627269646765206d697373696e67\n")
+
+fn cheng_darwin_thread_entry(raw: ptr): ptr =
+    if raw == nil:
+        return nil
+    let task: ChengDarwinThreadTaskPtr = ChengDarwinThreadTaskPtr(raw)
+    let fnPtr: ptr = task->fnPtr
+    let ctx: ptr = task->ctx
+    cheng_runtime_free(raw)
+    if fnPtr != nil:
+        cheng_darwin_call_indirect_void(fnPtr, ctx)
+    return nil
+
+@exportc("cheng_darwin_thread_spawn")
+fn cheng_darwin_thread_spawn_export(fnPtr: ptr, ctx: ptr): int32 =
+    if fnPtr == nil:
+        return 0
+    let mem: ptr = cheng_runtime_malloc(int32(sizeof(ChengDarwinThreadTask)))
+    if mem == nil:
+        return 0
+    let task: ChengDarwinThreadTaskPtr = ChengDarwinThreadTaskPtr(mem)
+    task->fnPtr = fnPtr
+    task->ctx = ctx
+    var thread: ptr
+    let rc = cheng_darwin_pthread_create(ptr(&thread), nil, &cheng_darwin_thread_entry, mem)
+    if rc != 0:
+        cheng_runtime_free(mem)
+        return 0
+    if cheng_darwin_pthread_detach(thread) != 0:
+        cheng_runtime_free(mem)
+        return 0
+    return 1
