@@ -1,5 +1,9 @@
 # Lessons
 
+- 2026-05-05: mmap source scanner 的行循环必须写成 `while (pos < len)`；`while (pos <= len)` 在 EOF 空尾行会不推进，`build-backend-driver` 这类全 manifest 扫描会卡死。
+- 2026-05-05: cold backend driver 的 contract-only candidate 必须对 `system-link-exec`、`status` 等后端命令显式硬失败；不能让未知命令落到 toy `<out> [source]` 模式，否则会生成假成功产物。
+- 2026-05-05: cold bootstrap `compile-bootstrap` 用 self-image emit 嵌入合同时，patch slot 不能按第一个 magic 字符串命中；第一个常在 `__TEXT,__cstring`，会破坏 dyld/入口并表现为 PC 跑到 Mach-O header。必须选择真正预留的数据槽，并保留 magic 以支持 stage1 再编 stage2。
+- 2026-05-05: 冷编译器原型里实现 ADT/tagged union 与 pattern dispatch 是正确方向；Arena + SoA IR 适合直接表达 tag/payload/switch。边界是先在 cold core 内部打通 `BODY_OP_TAG_LOAD`、`BODY_OP_PAYLOAD_LOAD`、`BODY_TERM_SWITCH` 和 direct Mach-O witness，再考虑公开完整 ADT 语法，不能用现有主编译器 fallback 冒充。
 - 2026-05-05: `30-80ms` 冷自举不是现有 backend driver 局部优化的下一步；当前 BodyIR 收敛、函数并行、direct object writer 只能把现有架构推向秒级/十秒级。要逼近 `30-80ms`，必须另起极限冷自举架构线：源码 mmap span 引用、阶段/per-worker arena、SoA dense IR、无锁 work-stealing、linkerless executable image，并用冷进程 A/B 编译 backend driver 候选 exe + `.map` 证明。
 - 2026-05-03: primary object 不能把 `T[]`、object、Result 这类复合类型继续落成默认 i32；typed_expr 必须输出确定 type layout，BodyIR slot 要用 layout size/align 分配非重叠栈槽，否则 `parsed.field` 这类 FieldLoad 会在 primary word count 阶段硬失败。
 - 2026-05-03: typed expr 里带 `callQualifier` 的调用必须强制走 import alias 解析，不能因为 `callTargetSourcePath` 已被 parser/CSG 预填为当前 source 就跳过；alias 解析失败要暴露 `unknown_qualified_target`，不能用全局同名函数扫描兜底。

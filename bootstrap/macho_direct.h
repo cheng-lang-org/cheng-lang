@@ -48,6 +48,7 @@ typedef struct {
 
 /* Initialize: allocate buffer, write header, reserve space for load commands */
 static bool macho_init(MachOWriter *mw, int32_t code_words, int32_t code_size) {
+    (void)code_words;
     /* Layout: [header 32] [load commands] [padding to 728] [code] [padding to page] */
     /* Reserve 16KB for header+commands+code (more than enough) */
     mw->cap = PAGE_SIZE * 2;
@@ -151,9 +152,9 @@ static bool macho_finalize(MachOWriter *mw, const char *path) {
     h[4] = mw->ncmds;
     h[5] = sizeofcmds;
     
-    /* Pad to page boundary, plus extra page for code signature */
+    /* Pad to page boundary and keep one LINKEDIT page for codesign. */
     int32_t total = ((mw->code_offset + mw->code_limit + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-    total += PAGE_SIZE; /* extra page for codesign */
+    total += PAGE_SIZE;
     if (total > mw->cap) total = mw->cap;
     
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
@@ -163,7 +164,7 @@ static bool macho_finalize(MachOWriter *mw, const char *path) {
     free(mw->buf);
     
     /* Adhoc sign */
-    char cmd[256]; snprintf(cmd, sizeof(cmd), "codesign -s - %s 2>/dev/null", path);
+    char cmd[256]; snprintf(cmd, sizeof(cmd), "codesign --force -s - %s 2>/dev/null", path);
     system(cmd);
     return true;
 }
@@ -194,7 +195,7 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
     uint64_t linkedit_addr = text_addr + PAGE_SIZE;
     macho_add_segment(&mw, "__LINKEDIT",
         linkedit_addr, PAGE_SIZE,
-        PAGE_SIZE, 0,
+        PAGE_SIZE, PAGE_SIZE,
         1, 1, 0);
     
     /* DYLD_INFO_ONLY: minimal (no rebase/bind/export) */
@@ -257,14 +258,6 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
         uint32_t *w = (uint32_t*)(mw.buf + off);
         w[2] = code_off; w[3] = 0;  /* entryoff */
         w[4] = 0; w[5] = 0;         /* stacksize */
-    }
-    
-    /* CODE_SIGNATURE: placeholder (filled by codesign) */
-    {
-        int32_t off = macho_append_cmd(&mw, LC_CODE_SIGNATURE, 16);
-        uint32_t *w = (uint32_t*)(mw.buf + off);
-        w[2] = PAGE_SIZE;  /* dataoff: at page boundary */
-        w[3] = PAGE_SIZE;  /* datasize: one page for signature */
     }
     
     macho_write_text(&mw, code, code_words);
