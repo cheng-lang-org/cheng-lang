@@ -1,5 +1,6 @@
 # Lessons
 
+- 2026-05-05: `30-80ms` 冷自举不是现有 backend driver 局部优化的下一步；当前 BodyIR 收敛、函数并行、direct object writer 只能把现有架构推向秒级/十秒级。要逼近 `30-80ms`，必须另起极限冷自举架构线：源码 mmap span 引用、阶段/per-worker arena、SoA dense IR、无锁 work-stealing、linkerless executable image，并用冷进程 A/B 编译 backend driver 候选 exe + `.map` 证明。
 - 2026-05-03: primary object 不能把 `T[]`、object、Result 这类复合类型继续落成默认 i32；typed_expr 必须输出确定 type layout，BodyIR slot 要用 layout size/align 分配非重叠栈槽，否则 `parsed.field` 这类 FieldLoad 会在 primary word count 阶段硬失败。
 - 2026-05-03: typed expr 里带 `callQualifier` 的调用必须强制走 import alias 解析，不能因为 `callTargetSourcePath` 已被 parser/CSG 预填为当前 source 就跳过；alias 解析失败要暴露 `unknown_qualified_target`，不能用全局同名函数扫描兜底。
 - 2026-05-02: C seed 只是一段临时引导工具，不能把优化 1108 item 的 C seed 全量编译当主线；正确路径是打穿 backend driver 自举 47 item 卡点，让原生 driver 接管全量闭包后再兑现 lowering hashmap、函数级并行和增量缓存。

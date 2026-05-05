@@ -40,9 +40,33 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 | 主线 | 目标 | 当前完成口径 |
 |---|---|---|
-| Dev 轨 | `self-link + direct-exe + host runner hotpatch`，最终冷反馈进入 100ms 口径 | 只在专用 witness 证明后才可写成达成 |
+| Dev 轨 | `self-link + direct-exe + host runner hotpatch`，目标是 host-only 交互反馈进入 100ms 口径 | 只在专用 witness 证明后才可写成达成；不等同于 `30-80ms` 纯冷自举 |
 | Release 轨 | `UIR -> .o -> system-link` 稳定闭环 | 当前仍是发布主线 |
 | 语义特化 | Ownership/No-Alias、BodyIR DoD/SoA、No-pointer FFI、E-Graph | 合同与 smoke 分段推进，不能用 compile-only 通过 |
+
+关键边界：
+- 当前阶段 0 到阶段 4 是现有架构收敛线，目标是正确性闭环、可观测报告和秒级/十秒级性能，不承诺逼近 `30-80ms`。
+- `30-80ms` 冷自举是独立极限架构线，不是 BodyIR kind 收敛、函数并行或 compound 条件补齐后的自然结果。
+- 任何 warm daemon、hotpatch、C seed、旧缓存、系统 linker 或 compile-only 结果，都不能计入 `30-80ms` 冷自举证明。
+
+## `30-80ms` 冷自举极限架构
+
+口径：已有纯 Cheng 编译器冷进程编出 backend driver 候选 `exe + .map`。这个目标要求重写编译器热路径，不是修补现有 backend driver。
+
+| 维度 | 当前收敛线 | 极限架构硬约束 |
+|---|---|---|
+| 源码 | `ReadTextFile`、字符串物化、重复 normalize | mmap 源码闭包；token、AST、typed facts 只保存 source span |
+| 内存 | 热路径仍可能逐对象分配与复制复合数组 | phase arena + per-worker arena；阶段结束整页释放 |
+| IR 布局 | 混合对象、数组和历史 body kind 兼容字段 | SoA dense arrays；op、term、block、local、call 全用 `int32` 索引 |
+| 前端事实 | parser/typed/lowering 之间仍有重复扫描和派生表复制 | 单次扫描生成结构化事实；后续阶段只借用 span 与 fact id |
+| 链接 | `.o` materialize 后经系统 linker 或 direct object 局部 witness | linkerless executable image；dev host-only 直接写可执行布局 |
+| 并行 | task plan 与 executor 可见，但 active 主链还未证明真并行收益 | lock-free work-stealing、真实 atomic CAS、per-worker arena、稳定顺序 merge |
+
+验收：
+- A 编 B，B 再编同一 backend driver 候选 `exe + .map`，两次 report 关键字段一致。
+- report 必须写出 `source_storage=mmap_span`、`allocation=phase_arena`、`ir_layout=soa_dense`、`linkerless_image=1`、`system_link=0`、`hot_path_node_malloc=0`。
+- 冷进程计时只覆盖同一语义闭包：parse、typed facts、lowering、machine image、map 生成；不能混入 daemon、hotpatch 或缓存命中。
+- 失败必须 hard-fail，不允许回退到现有 `system-link-exec`、`.s` fallback、C seed 或串行 executor。
 
 ## 阶段 0：修活当前 backend driver
 
@@ -101,7 +125,7 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 | `LoweringBuildOneFunction` per-function 提取 | **已完成** | 可独立调用，无共享可变状态，线程安全 |
 | `BACKEND_JOBS` env→CompilerRequest→report | **已完成** | `function_task_job_count=N` + `function_task_schedule=serial` 已写入报告 |
 | serial oracle | 必须保留 | `BACKEND_JOBS=1` 产物作为确定性基准 |
-| work-stealing executor | 线程池+work-stealing 已实现 | 待接入 lowering callback（`FunctionTaskExecuteBodyIr` 是空桩） |
+| work-stealing executor | 库级 executor 可见，但未接入 active lowering 主链 | 待接入 lowering callback（`FunctionTaskExecuteBodyIr` 是空桩）；接入前不得宣称主链并行完成 |
 | 实际并行执行 | 待实现 | 需要把 `LoweringBuildOneFunction` 包进 `FunctionTask` + 线程间回调传递 |
 
 切默认条件：
@@ -109,6 +133,7 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 2. worker 任一失败硬失败，不能串行接管。
 3. report 明确写 `function_task_schedule=ws`、`job_count>1`。
 4. smoke 必须检查 marker，防止入口被折成直接 `return 0` 假绿。
+5. 这条阶段只解决现有架构内的函数级并行；`30-80ms` 极限冷自举另需 per-worker arena 与无锁 work-stealing 证明。
 
 ## 阶段 4：Linkerless / direct-exe
 
@@ -118,6 +143,7 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 | provider-backed ordinary executable | 阶段 0 ordinary witness 已通 | `provider_object_count>0`、`standalone_no_runtime=0`、真实退出码 0；不外推到 runtime smoke |
 | provider-backed runtime executable | 仍是关键缺口 | atomic/compiler runtime 必须执行 marker/assert/runtime 调用，不能走 `standalone_no_runtime=1` 或折零 |
 | direct object writer | Darwin arm64 主线优先 | writer 消费 primary plan 的机器字和 reloc，不再按 body kind 重猜 |
+| in-memory executable image | 归入 `30-80ms` 极限架构线 | 当前阶段不把 `.o` 直写或 provider-free direct exe 外推为极限 linkerless |
 | release system-link | 发布稳定主线 | direct-exe 未证明前不得替代 release |
 | hotpatch | dev host-only witness | 只在 `self-link + direct-exe + host runner` 口径证明，release 不参与 |
 
@@ -167,6 +193,7 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 3. 做 A/B 纯自举证明：A 编 B，B 再编同一 witness，report 关键字段一致。
 4. 继续把 noarg i32 call-result 扩展到结构化 call ABI：call argument、ref/local、str sret、call statement、Result 投影和复合 ABI。
 5. 再推进函数级并行 determinism/perf witness 与 dev 默认切换。
+6. 若目标切到 `30-80ms` 冷自举，停止把局部 body kind、spawn 并行或 `.o` 直写当主线，先立极限架构的 mmap/arena/SoA/linkerless image 最小 witness。
 
 ## 诊断命令
 
