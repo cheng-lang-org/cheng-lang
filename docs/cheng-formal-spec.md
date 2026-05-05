@@ -298,7 +298,11 @@ typeExpr       ::= procType
                   | enumType
                   | refType
                   | varType
+                  | algebraicType
                   | typePostfix ;
+
+algebraicType  ::= variantType { "|" variantType } ;
+variantType    ::= ident [ "(" [ fieldDecl { ("," | ";") fieldDecl } ] ")" ] ;
 
 procType       ::= "fn" paramList [ ":" typeExpr ] ;
 tupleType      ::= "tuple" "[" tupleElem { ("," | ";") tupleElem } "]" ;
@@ -335,6 +339,7 @@ statementCore  ::= bindingDecl
                   | continueStmt
                   | deferStmt
                   | ifStmt
+                  | matchStmt
                   | whileStmt
                   | forStmt
                   | caseStmt
@@ -360,6 +365,11 @@ deferStmt      ::= "defer" ":" suite ;
 ifStmt         ::= "if" expression ":" suite
                    { "elif" expression ":" suite }
                    [ "else" ":" suite ] ;
+
+matchStmt      ::= "match" expression ":" NEWLINE
+                   INDENT matchArm { NEWLINE matchArm } DEDENT
+                 | "match" expression ":" matchArm ;
+matchArm       ::= pattern ":" suite ;
 
 whileStmt      ::= "while" expression ":" suite ;
 
@@ -396,7 +406,10 @@ pattern        ::= ident [ ":" typeExpr ]
                   | "[" [ pattern { "," pattern } ] "]"
                   | "{" pattern { "," pattern } "}"
                   | rangePattern
-                  | objectPattern ;
+                  | objectPattern
+                  | variantPattern ;
+
+variantPattern ::= ident [ "(" [ ident { "," ident } ] ")" ] ;
 
 rangePattern   ::= pattern (".." | "..<") pattern ;
 objectPattern  ::= ident "(" patternArg { "," patternArg } ")" ;

@@ -34,6 +34,14 @@
 - 自举编译仅覆盖入口模块（47 items），需要 manifest-based 全量编译（1059 items）才能产出完整 backend driver。
 - 任何 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 结果都不计入路线图进度。
 
+### 新增（2026-05-05）
+
+- **代数类型 + 模式匹配**：语法已写入 `docs/cheng-formal-spec.md` §1.2。
+  - `type Option[T] = Some(value: T) | None`——tagged union，`|` 分隔 variant。
+  - `match expr: Variant(x): suite Variant2: suite`——编译为 tag compare + CBNZ/TBNZ 跳转链（≤4 variant）或 PC-relative 跳转表（5+ variant）。
+  - 冷编译器原型 `bootstrap/cheng_cold.c` 已包含 SoA BodyIR 层面的 `OP_TAG`/`OP_PAYLOAD`/`TM_SWITCH` 支持。
+  - 完整编译器（`src/`）待实现：typed_expr 层的代数类型 layout、lowering 的 match→CBR 转换、ARM64 的 SWITCH term 回填。
+
 ## 总目标
 
 Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用三条工程主线降维：
