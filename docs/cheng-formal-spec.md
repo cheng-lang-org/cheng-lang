@@ -369,7 +369,7 @@ ifStmt         ::= "if" expression ":" suite
 matchStmt      ::= "match" expression ":" NEWLINE
                    INDENT matchArm { NEWLINE matchArm } DEDENT
                  | "match" expression ":" matchArm ;
-matchArm       ::= pattern ":" suite ;
+matchArm       ::= pattern "=>" suite ;
 
 whileStmt      ::= "while" expression ":" suite ;
 

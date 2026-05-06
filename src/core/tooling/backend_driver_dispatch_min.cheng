@@ -548,33 +548,35 @@ fn BackendDriverDispatchMinPrintBuildPlanCommandFromCmdline(): int32 =
 
 fn BackendDriverDispatchMinHelp(): int32 =
     BackendDriverDispatchMinPrintLine("usage: cheng <command> [args]")
-    BackendDriverDispatchMinPrintLine("core commands: status, print-build-plan, system-link-exec")
+    BackendDriverDispatchMinPrintLine("core commands: status, print-build-plan, system-link-exec, run-host-smokes cold_csg_sidecar_smoke")
     return 0
 
 fn BackendDriverDispatchMinCurrentCompiler(rootDir: str): str =
+    let raw = BackendDriverDispatchMinParamStr(0)
+    if len(raw) > 0:
+        let current = chengpath.PathAbsolute(rootDir, raw)
+        if chengpath.FileExistsNonEmpty(rootDir, current):
+            return current
     let noHandoffText = strutil.Strip(os.GetEnv("CHENG_NO_BACKEND_DRIVER_HANDOFF"))
     let noHandoffForced = len(noHandoffText) > 0 && noHandoffText != "0"
     if noHandoffForced:
-        let stage0 = chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage0")
-        if chengpath.FileExistsNonEmpty(rootDir, stage0):
-            return stage0
         let stage3 = chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage3")
         if chengpath.FileExistsNonEmpty(rootDir, stage3):
             return stage3
+        let stage0 = chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage0")
+        if chengpath.FileExistsNonEmpty(rootDir, stage0):
+            return stage0
     let handoffText = strutil.Strip(os.GetEnv("CHENG_BACKEND_DRIVER_HANDOFF"))
     let handoffEnabled = len(handoffText) > 0 && handoffText != "0"
     let handoffDisabled = !handoffEnabled
     if handoffDisabled:
-        let stage0 = chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage0")
-        if chengpath.FileExistsNonEmpty(rootDir, stage0):
-            return stage0
         let stage3 = chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage3")
         if chengpath.FileExistsNonEmpty(rootDir, stage3):
             return stage3
-    let raw = BackendDriverDispatchMinParamStr(0)
-    if len(raw) <= 0:
-        return ""
-    return chengpath.PathAbsolute(rootDir, raw)
+        let stage0 = chengpath.PathAbsolute(rootDir, "artifacts/bootstrap/cheng.stage0")
+        if chengpath.FileExistsNonEmpty(rootDir, stage0):
+            return stage0
+    return ""
 
 fn BackendDriverDispatchMinArtifactsDir(rootDir: str): str =
     let custom = os.GetEnv("VERIFY_EXPORT_VISIBILITY_DIR")
@@ -659,6 +661,8 @@ fn BackendDriverDispatchMinProgramSupportRootCandidate(symbol: str): bool =
         return false
     if chengpath.TextContains(symbol, "system_ptr_add"):
         return false
+    if chengpath.TextContains(symbol, "cheng_strutils_join_bridge"):
+        return true
     if chengpath.TextContains(symbol, "driver_c_") ||
        chengpath.TextContains(symbol, "cheng_mem_") ||
        chengpath.TextContains(symbol, "alloc") ||
@@ -701,6 +705,7 @@ fn BackendDriverDispatchMinProviderExportRoots(modulePath: str,
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_fclose")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_exit_runtime")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_getenv")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_host_getcwd")
         for i in 0..<primaryPlan.relocTargetSymbols.len:
             let symbol = primaryPlan.relocTargetSymbols[i]
             if chengpath.TextContains(symbol, "host_") ||
@@ -720,8 +725,17 @@ fn BackendDriverDispatchMinProviderExportRoots(modulePath: str,
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_mem_release")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_register_line_map_from_argv0")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_cstrlen")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_strutils_join_bridge")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_str_to_cstring_temp_bridge")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "driver_c_str_from_utf8_copy_bridge")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_os_is_absolute_bridge")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_os_join_path_bridge")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_os_file_exists_bridge")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_os_dir_exists_bridge")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_os_file_size_bridge")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_read_file_bridge")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "driver_c_create_dir_all_bridge")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "driver_c_write_text_file_bridge")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "paramCount")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "paramStr")
         for i in 0..<primaryPlan.functionBodyKinds.len:
@@ -1084,25 +1098,18 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterCsg(driverRoot: str
     BackendDriverDispatchMinProgress("compiler_csg", "done")
     let coldCsgOut = BackendDriverDispatchMinReadFlagOrDefault("--cold-csg-out", "")
     if len(coldCsgOut) > 0:
-        var coldFacts = ""
-        var coldErr = ""
-        let coldSourceText = chengpath.ReadTextFile(driverRoot, linkPlan.entryPath)
-        if len(coldSourceText) <= 0:
-            let reason = Fmt"backend driver direct system-link-exec: failed to read cold csg source: {linkPlan.entryPath}"
+        var coldFacts: str
+        var coldFactsErr: str
+        if !ccsg.CompilerColdCsgFactsFromCompilerCsgInto(csg,
+                                                          linkPlan.entrySymbol,
+                                                          coldFacts,
+                                                          coldFactsErr):
+            let reason = Fmt"backend driver direct system-link-exec: failed to build cold csg facts: {coldFactsErr}"
             let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
                                                                    reportPath,
                                                                    reason)
             return BackendDriverDispatchMinUnsupported(reason)
-        if !ccsg.CompilerColdCsgFactsFromCompilerCsgIntoWithSource(csg,
-                                                                    linkPlan.entrySymbol,
-                                                                    coldSourceText,
-                                                                    coldFacts,
-                                                                    coldErr):
-            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
-                                                                   reportPath,
-                                                                   coldErr)
-            return BackendDriverDispatchMinUnsupported(coldErr)
-        if !BackendDriverDispatchMinWriteReport(driverRoot, coldCsgOut, coldFacts):
+        if !chengpath.WriteTextFile(driverRoot, coldCsgOut, coldFacts):
             let reason = Fmt"backend driver direct system-link-exec: failed to write cold csg facts: {coldCsgOut}"
             let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
                                                                    reportPath,
@@ -1648,6 +1655,293 @@ fn BackendDriverDispatchMinRunSystemLinkExecFromCmdline(): int32 =
 fn BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline(): int32 =
     return BackendDriverDispatchMinRunSystemLinkExecFromCmdline()
 
+fn BackendDriverDispatchMinElapsedMsText(startNs: int64): str =
+    let elapsedNs = BackendDriverDispatchMinNowNs() - startNs
+    return BackendDriverDispatchMinPhaseMsText(elapsedNs)
+
+fn BackendDriverDispatchMinRemoveIfExists(path: str) =
+    if chengpath.PathFileExists(path):
+        let _ = os.RemoveFile(path)
+
+fn BackendDriverDispatchMinRunShellLogged(rootDir: str,
+                                           command: str,
+                                           logPath: str): os.ExecCmdResult =
+    let run = os.ExecShellCmdEx(command, uint64(1), rootDir)
+    let _ = chengpath.WriteTextFile(rootDir, logPath, os.ExecCmdResultOutput(run))
+    return run
+
+fn BackendDriverDispatchMinHostSmokeExpectContains(label: str,
+                                                    text: str,
+                                                    needle: str): bool =
+    if chengpath.TextContains(text, needle):
+        return true
+    BackendDriverDispatchMinPrintErr(Fmt"{label}: missing marker: {needle}")
+    return false
+
+fn BackendDriverDispatchMinHostSmokeExpectNotContains(label: str,
+                                                       text: str,
+                                                       needle: str): bool =
+    if !chengpath.TextContains(text, needle):
+        return true
+    BackendDriverDispatchMinPrintErr(Fmt"{label}: forbidden marker: {needle}")
+    return false
+
+fn BackendDriverDispatchMinRunColdCsgSidecarSmoke(rootDir: str): int32 =
+    let smokeName = "cold_csg_sidecar_smoke"
+    let compilerPath = BackendDriverDispatchMinCurrentCompiler(rootDir)
+    if len(compilerPath) <= 0 || !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct: missing compiler: {compilerPath}")
+    let label = BackendDriverDispatchMinReadFlagOrDefault("--label", "dispatch_min")
+    let outDir = chengpath.PathAbsolute(rootDir, Fmt"artifacts/hostrun/{label}")
+    if !BackendDriverDispatchMinEnsureDir(rootDir, outDir):
+        return 1
+    let src = chengpath.PathAbsolute(rootDir, "src/tests/backend_matrix_cfg_if_guard.cheng")
+    if !chengpath.FileExistsNonEmpty(rootDir, src):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold sidecar missing source: {src}")
+        return 1
+    let matchSrc = chengpath.PathAbsolute(rootDir, "src/tests/cold_csg_match_fixture.cheng")
+    if !chengpath.FileExistsNonEmpty(rootDir, matchSrc):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold sidecar missing source: {matchSrc}")
+        return 1
+    let outBin = chengpath.PathJoin(outDir, smokeName)
+    let factsPath = Fmt"{outBin}.cold.csg"
+    let reportPath = Fmt"{outBin}.compile.report.txt"
+    let compileLog = Fmt"{outBin}.compile.log"
+    let runLog = Fmt"{outBin}.run.log"
+    let coldCompiler = chengpath.PathJoin(outDir, "cheng_cold_sidecar_probe")
+    let coldBuildLog = Fmt"{coldCompiler}.build.log"
+    let coldOut = Fmt"{outBin}.from_facts"
+    let coldReport = Fmt"{coldOut}.report.txt"
+    let coldCompileLog = Fmt"{coldOut}.compile.log"
+    let coldRunLog = Fmt"{coldOut}.run.log"
+    let matchBin = chengpath.PathJoin(outDir, "cold_csg_match_smoke")
+    let matchFactsPath = Fmt"{matchBin}.cold.csg"
+    let matchReportPath = Fmt"{matchBin}.compile.report.txt"
+    let matchCompileLog = Fmt"{matchBin}.compile.log"
+    let matchColdOut = Fmt"{matchBin}.from_facts"
+    let matchColdReport = Fmt"{matchColdOut}.report.txt"
+    let matchColdCompileLog = Fmt"{matchColdOut}.compile.log"
+    let matchColdRunLog = Fmt"{matchColdOut}.run.log"
+    BackendDriverDispatchMinRemoveIfExists(outBin)
+    BackendDriverDispatchMinRemoveIfExists(factsPath)
+    BackendDriverDispatchMinRemoveIfExists(reportPath)
+    BackendDriverDispatchMinRemoveIfExists(compileLog)
+    BackendDriverDispatchMinRemoveIfExists(runLog)
+    BackendDriverDispatchMinRemoveIfExists(coldCompiler)
+    BackendDriverDispatchMinRemoveIfExists(coldBuildLog)
+    BackendDriverDispatchMinRemoveIfExists(coldOut)
+    BackendDriverDispatchMinRemoveIfExists(coldReport)
+    BackendDriverDispatchMinRemoveIfExists(coldCompileLog)
+    BackendDriverDispatchMinRemoveIfExists(coldRunLog)
+    BackendDriverDispatchMinRemoveIfExists(Fmt"{outBin}.map")
+    BackendDriverDispatchMinRemoveIfExists(Fmt"{coldOut}.map")
+    BackendDriverDispatchMinRemoveIfExists(matchBin)
+    BackendDriverDispatchMinRemoveIfExists(matchFactsPath)
+    BackendDriverDispatchMinRemoveIfExists(matchReportPath)
+    BackendDriverDispatchMinRemoveIfExists(matchCompileLog)
+    BackendDriverDispatchMinRemoveIfExists(matchColdOut)
+    BackendDriverDispatchMinRemoveIfExists(matchColdReport)
+    BackendDriverDispatchMinRemoveIfExists(matchColdCompileLog)
+    BackendDriverDispatchMinRemoveIfExists(matchColdRunLog)
+    BackendDriverDispatchMinRemoveIfExists(Fmt"{matchBin}.map")
+    BackendDriverDispatchMinRemoveIfExists(Fmt"{matchColdOut}.map")
+    BackendDriverDispatchMinPrintLine("[cheng host smokes] cold csg sidecar")
+    var startNs = BackendDriverDispatchMinNowNs()
+    let compileCommand = Fmt"CHENG_NO_BACKEND_DRIVER_HANDOFF=1 CHENG_BACKEND_DRIVER_HANDOFF=0 PARENT_RSS_GUARD=1 PROGRESS=1 PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(rootDir)} --in:{os.QuoteShell(src)} --emit:exe --target:arm64-apple-darwin --out:{os.QuoteShell(outBin)} --report-out:{os.QuoteShell(reportPath)} --cold-csg-out:{os.QuoteShell(factsPath)}"
+    let compileRun = BackendDriverDispatchMinRunShellLogged(rootDir,
+                                                            compileCommand,
+                                                            compileLog)
+    let compileRc = os.ExecCmdResultExitCode(compileRun)
+    BackendDriverDispatchMinPrintLine(Fmt"cold_sidecar_backend_compile_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={compileRc}")
+    if compileRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold sidecar compile failed log={compileLog}")
+        return compileRc
+    if !chengpath.FileExistsNonEmpty(rootDir, factsPath):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold sidecar missing facts: {factsPath}")
+        return 1
+    let facts = chengpath.ReadTextFile(rootDir, factsPath)
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, facts, "cold_csg_entry=main"):
+        return 1
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, facts, "cold_csg_stmt\t2\t4\tvar_t\tcount\tint32\tCount()"):
+        return 1
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, facts, "cold_csg_stmt\t2\t4\tif\tcount <= 0"):
+        return 1
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, facts, "cold_csg_stmt\t2\t4\treturn\tCall()"):
+        return 1
+    startNs = BackendDriverDispatchMinNowNs()
+    let runRc = BackendDriverDispatchMinRunExecutable(rootDir, outBin, runLog)
+    BackendDriverDispatchMinPrintLine(Fmt"cold_sidecar_backend_run_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={runRc}")
+    if runRc != 13:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold sidecar executable exit mismatch log={runLog}")
+        return 1
+    startNs = BackendDriverDispatchMinNowNs()
+    let ccCommand = Fmt"cc -std=c11 -Wall -Wextra -O2 bootstrap/cheng_cold.c -o {os.QuoteShell(coldCompiler)}"
+    let ccRun = BackendDriverDispatchMinRunShellLogged(rootDir, ccCommand, coldBuildLog)
+    let ccRc = os.ExecCmdResultExitCode(ccRun)
+    BackendDriverDispatchMinPrintLine(Fmt"cold_sidecar_cc_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={ccRc}")
+    if ccRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold compiler build failed log={coldBuildLog}")
+        return ccRc
+    startNs = BackendDriverDispatchMinNowNs()
+    let coldCompileCommand = Fmt"{os.QuoteShell(coldCompiler)} system-link-exec --csg-in:{os.QuoteShell(factsPath)} --out:{os.QuoteShell(coldOut)} --report-out:{os.QuoteShell(coldReport)}"
+    let coldCompileRun = BackendDriverDispatchMinRunShellLogged(rootDir,
+                                                                coldCompileCommand,
+                                                                coldCompileLog)
+    let coldCompileRc = os.ExecCmdResultExitCode(coldCompileRun)
+    BackendDriverDispatchMinPrintLine(Fmt"cold_sidecar_facts_compile_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={coldCompileRc}")
+    let coldCompileOutput = os.ExecCmdResultOutput(coldCompileRun)
+    if len(coldCompileOutput) > 0:
+        BackendDriverDispatchMinPrintLine(coldCompileOutput)
+    if coldCompileRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold facts compile failed log={coldCompileLog}")
+        return coldCompileRc
+    startNs = BackendDriverDispatchMinNowNs()
+    let coldRunRc = BackendDriverDispatchMinRunExecutable(rootDir, coldOut, coldRunLog)
+    BackendDriverDispatchMinPrintLine(Fmt"cold_sidecar_facts_run_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={coldRunRc}")
+    if coldRunRc != 13:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold facts executable exit mismatch log={coldRunLog}")
+        return 1
+    let coldReportText = chengpath.ReadTextFile(rootDir, coldReport)
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, coldReportText, "cold_compile_elapsed_ms="):
+        return 1
+    if !BackendDriverDispatchMinHostSmokeExpectNotContains(smokeName, coldReportText, "elapsed_us"):
+        return 1
+    startNs = BackendDriverDispatchMinNowNs()
+    let matchCompileCommand = Fmt"CHENG_NO_BACKEND_DRIVER_HANDOFF=1 CHENG_BACKEND_DRIVER_HANDOFF=0 PARENT_RSS_GUARD=1 PROGRESS=1 PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(rootDir)} --in:{os.QuoteShell(matchSrc)} --emit:exe --target:arm64-apple-darwin --out:{os.QuoteShell(matchBin)} --report-out:{os.QuoteShell(matchReportPath)} --cold-csg-out:{os.QuoteShell(matchFactsPath)}"
+    let matchCompileRun = BackendDriverDispatchMinRunShellLogged(rootDir,
+                                                                 matchCompileCommand,
+                                                                 matchCompileLog)
+    let matchCompileRc = os.ExecCmdResultExitCode(matchCompileRun)
+    BackendDriverDispatchMinPrintLine(Fmt"cold_match_backend_compile_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={matchCompileRc}")
+    if matchCompileRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold match compile failed log={matchCompileLog}")
+        return matchCompileRc
+    if !chengpath.FileExistsNonEmpty(rootDir, matchFactsPath):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold match missing facts: {matchFactsPath}")
+        return 1
+    let matchFacts = chengpath.ReadTextFile(rootDir, matchFactsPath)
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, matchFacts, "cold_csg_type\tOption\tSome:1:i,None:0"):
+        return 1
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, matchFacts, "cold_csg_stmt\t0\t4\tmatch\tresult"):
+        return 1
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, matchFacts, "cold_csg_stmt\t0\t8\tcase\tSome\tvalue"):
+        return 1
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, matchFacts, "cold_csg_stmt\t0\t8\tcase\tNone\t"):
+        return 1
+    startNs = BackendDriverDispatchMinNowNs()
+    let matchColdCompileCommand = Fmt"{os.QuoteShell(coldCompiler)} system-link-exec --csg-in:{os.QuoteShell(matchFactsPath)} --out:{os.QuoteShell(matchColdOut)} --report-out:{os.QuoteShell(matchColdReport)}"
+    let matchColdCompileRun = BackendDriverDispatchMinRunShellLogged(rootDir,
+                                                                     matchColdCompileCommand,
+                                                                     matchColdCompileLog)
+    let matchColdCompileRc = os.ExecCmdResultExitCode(matchColdCompileRun)
+    BackendDriverDispatchMinPrintLine(Fmt"cold_match_facts_compile_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={matchColdCompileRc}")
+    let matchColdCompileOutput = os.ExecCmdResultOutput(matchColdCompileRun)
+    if len(matchColdCompileOutput) > 0:
+        BackendDriverDispatchMinPrintLine(matchColdCompileOutput)
+    if matchColdCompileRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold match facts compile failed log={matchColdCompileLog}")
+        return matchColdCompileRc
+    startNs = BackendDriverDispatchMinNowNs()
+    let matchColdRunRc = BackendDriverDispatchMinRunExecutable(rootDir, matchColdOut, matchColdRunLog)
+    BackendDriverDispatchMinPrintLine(Fmt"cold_match_facts_run_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={matchColdRunRc}")
+    if matchColdRunRc != 7:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cold match facts executable exit mismatch log={matchColdRunLog}")
+        return 1
+    let matchColdReportText = chengpath.ReadTextFile(rootDir, matchColdReport)
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, matchColdReportText, "cold_csg_lowering=1"):
+        return 1
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, matchColdReportText, "cold_body_switch_count="):
+        return 1
+    BackendDriverDispatchMinPrintLine(" cold_csg_sidecar_smoke ok")
+    return 0
+
+fn BackendDriverDispatchMinRunChengSkillConsistencySmoke(rootDir: str): int32 =
+    let smokeName = "cheng_skill_consistency_smoke"
+    let compilerPath = BackendDriverDispatchMinCurrentCompiler(rootDir)
+    if len(compilerPath) <= 0 || !chengpath.FileExistsNonEmpty(rootDir, compilerPath):
+        return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct: missing compiler: {compilerPath}")
+    let label = BackendDriverDispatchMinReadFlagOrDefault("--label", "dispatch_min")
+    let outDir = chengpath.PathAbsolute(rootDir, Fmt"artifacts/hostrun/{label}")
+    if !BackendDriverDispatchMinEnsureDir(rootDir, outDir):
+        return 1
+    let src = chengpath.PathAbsolute(rootDir, "src/tests/cheng_skill_consistency_smoke.cheng")
+    if !chengpath.FileExistsNonEmpty(rootDir, src):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: missing source: {src}")
+        return 1
+    let outBin = chengpath.PathJoin(outDir, smokeName)
+    let reportPath = Fmt"{outBin}.compile.report.txt"
+    let compileLog = Fmt"{outBin}.compile.log"
+    let runLog = Fmt"{outBin}.run.log"
+    let smokeReport = chengpath.PathJoin(rootDir, "artifacts/cheng_skill_consistency/cheng_cheng_skill_consistency.report.txt")
+    BackendDriverDispatchMinRemoveIfExists(outBin)
+    BackendDriverDispatchMinRemoveIfExists(reportPath)
+    BackendDriverDispatchMinRemoveIfExists(compileLog)
+    BackendDriverDispatchMinRemoveIfExists(runLog)
+    BackendDriverDispatchMinRemoveIfExists(Fmt"{outBin}.map")
+    BackendDriverDispatchMinRemoveIfExists(smokeReport)
+    BackendDriverDispatchMinPrintLine("[cheng host smokes] cheng skill consistency")
+    var startNs = BackendDriverDispatchMinNowNs()
+    let compileCommand = Fmt"CHENG_NO_BACKEND_DRIVER_HANDOFF=1 CHENG_BACKEND_DRIVER_HANDOFF=0 BACKEND_INCREMENTAL=0 BACKEND_MULTI_MODULE_CACHE=0 CHENG_DISABLE_PRIMARY_OBJECT_CACHE=1 BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=0 BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=0 CHENG_PROGRESS=1 CHENG_PROCESS_MAX_RSS_BYTES=8589934592 {os.QuoteShell(compilerPath)} system-link-exec --root:{os.QuoteShell(rootDir)} --in:{os.QuoteShell(src)} --emit:exe --target:arm64-apple-darwin --out:{os.QuoteShell(outBin)} --report-out:{os.QuoteShell(reportPath)}"
+    let compileRun = BackendDriverDispatchMinRunShellLogged(rootDir,
+                                                            compileCommand,
+                                                            compileLog)
+    let compileRc = os.ExecCmdResultExitCode(compileRun)
+    BackendDriverDispatchMinPrintLine(Fmt"cheng_skill_compile_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={compileRc}")
+    if compileRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cheng skill compile failed log={compileLog}")
+        return compileRc
+    if !chengpath.FileExistsNonEmpty(rootDir, outBin):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cheng skill output missing: {outBin}")
+        return 1
+    startNs = BackendDriverDispatchMinNowNs()
+    let runRc = BackendDriverDispatchMinRunExecutable(rootDir, outBin, runLog)
+    BackendDriverDispatchMinPrintLine(Fmt"cheng_skill_run_ms={BackendDriverDispatchMinElapsedMsText(startNs)} rc={runRc}")
+    let runText = chengpath.ReadTextFile(rootDir, runLog)
+    if runRc != 0:
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cheng skill run failed log={runLog}")
+        return runRc
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, runText, " cheng_skill_consistency_smoke ok"):
+        return 1
+    if !chengpath.FileExistsNonEmpty(rootDir, smokeReport):
+        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: cheng skill report missing: {smokeReport}")
+        return 1
+    let smokeReportText = chengpath.ReadTextFile(rootDir, smokeReport)
+    if !BackendDriverDispatchMinHostSmokeExpectContains(smokeName, smokeReportText, "algebraic_type_match_surface=ok"):
+        return 1
+    BackendDriverDispatchMinPrintLine(" cheng_skill_consistency_smoke ok")
+    return 0
+
+fn BackendDriverDispatchMinRunHostSmokesFromCmdline(): int32 =
+    let count = BackendDriverDispatchMinParamCount()
+    var requestedCold = false
+    var requestedSkill = false
+    var unknown = ""
+    if count >= 2:
+        for i in 2..count:
+            let arg = BackendDriverDispatchMinParamStr(i)
+            if BackendDriverDispatchMinStartsWith(arg, "--"):
+                continue
+            if arg == "cold_csg_sidecar_smoke":
+                requestedCold = true
+            elif arg == "cheng_skill_consistency_smoke":
+                requestedSkill = true
+            else:
+                unknown = arg
+    if len(unknown) > 0:
+        return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct: dispatch_min run-host-smokes unsupported smoke: {unknown}")
+    if !requestedCold && !requestedSkill:
+        return BackendDriverDispatchMinUnsupported("backend driver direct: dispatch_min run-host-smokes requires cold_csg_sidecar_smoke or cheng_skill_consistency_smoke")
+    let rootDir = BackendDriverDispatchMinReadFlagOrDefault("--root", chengpath.PathCurrentDir())
+    if requestedCold:
+        let coldRc = BackendDriverDispatchMinRunColdCsgSidecarSmoke(rootDir)
+        if coldRc != 0:
+            return coldRc
+    if requestedSkill:
+        let skillRc = BackendDriverDispatchMinRunChengSkillConsistencySmoke(rootDir)
+        if skillRc != 0:
+            return skillRc
+    return 0
+
 fn BackendDriverDispatchMinCommandCode(cmd: str): int32 =
     let n = len(cmd)
     if n == 4 &&
@@ -1773,6 +2067,23 @@ fn BackendDriverDispatchMinCommandCode(cmd: str): int32 =
        cmd[14] == 'e' &&
        cmd[15] == 'c':
         return int32(5)
+    if n == 15 &&
+       cmd[0] == 'r' &&
+       cmd[1] == 'u' &&
+       cmd[2] == 'n' &&
+       cmd[3] == '-' &&
+       cmd[4] == 'h' &&
+       cmd[5] == 'o' &&
+       cmd[6] == 's' &&
+       cmd[7] == 't' &&
+       cmd[8] == '-' &&
+       cmd[9] == 's' &&
+       cmd[10] == 'm' &&
+       cmd[11] == 'o' &&
+       cmd[12] == 'k' &&
+       cmd[13] == 'e' &&
+       cmd[14] == 's':
+        return int32(6)
     return int32(-1)
 
 fn BackendDriverDispatchMinRunCommandWithCmd(cmd: str): int32 =
@@ -1789,6 +2100,8 @@ fn BackendDriverDispatchMinRunCommandWithCmd(cmd: str): int32 =
         return BackendDriverDispatchMinVerifyExportVisibilityParallelFromCmdline()
     if code == 5:
         return BackendDriverDispatchMinRunSystemLinkExecCommandFromCmdline()
+    if code == 6:
+        return BackendDriverDispatchMinRunHostSmokesFromCmdline()
     return 2
 
 fn ParamStr(index: int32): str =

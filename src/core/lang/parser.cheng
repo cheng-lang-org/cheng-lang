@@ -46,6 +46,8 @@ type
         NormalizedExprElifStmt
         NormalizedExprElseStmt
         NormalizedExprForStmt
+        NormalizedExprMatchStmt
+        NormalizedExprCaseStmt
 
     NormalizedExprDetailKind = enum
         NormalizedExprDetailNone
@@ -155,6 +157,8 @@ type
         elifStmtCount: int32
         elseStmtCount: int32
         forStmtCount: int32
+        matchStmtCount: int32
+        caseStmtCount: int32
 
     ParsedSourceStub =
         workspaceRoot: str
@@ -297,6 +301,10 @@ fn NormalizedExprKindText(kind: NormalizedExprKind): str =
         return "ElseStmt"
     if kind == NormalizedExprForStmt:
         return "ForStmt"
+    if kind == NormalizedExprMatchStmt:
+        return "MatchStmt"
+    if kind == NormalizedExprCaseStmt:
+        return "CaseStmt"
     return "UnknownExpr"
 
 fn NormalizedExprDetailKindCode(detailKind: NormalizedExprDetailKind): int32 =
@@ -419,6 +427,10 @@ fn NormalizedExprKindCode(kind: NormalizedExprKind): int32 =
         return 14
     if kind == NormalizedExprForStmt:
         return 15
+    if kind == NormalizedExprMatchStmt:
+        return 16
+    if kind == NormalizedExprCaseStmt:
+        return 17
     return 0
 
 fn NormalizedExprLookupTextFirstCode(text: str): int32 =
@@ -1350,6 +1362,10 @@ fn NormalizedExprLayerKindCountsBuild(layer: NormalizedExprLayer): NormalizedExp
             counts.elseStmtCount = counts.elseStmtCount + 1
         elif kind == NormalizedExprForStmt:
             counts.forStmtCount = counts.forStmtCount + 1
+        elif kind == NormalizedExprMatchStmt:
+            counts.matchStmtCount = counts.matchStmtCount + 1
+        elif kind == NormalizedExprCaseStmt:
+            counts.caseStmtCount = counts.caseStmtCount + 1
     return counts
 
 fn NormalizedExprLayerIfCount(layer: NormalizedExprLayer): int32 =
@@ -1393,6 +1409,12 @@ fn NormalizedExprLayerElseStmtCount(layer: NormalizedExprLayer): int32 =
 
 fn NormalizedExprLayerForStmtCount(layer: NormalizedExprLayer): int32 =
     return NormalizedExprLayerCountKind(layer, NormalizedExprForStmt)
+
+fn NormalizedExprLayerMatchStmtCount(layer: NormalizedExprLayer): int32 =
+    return NormalizedExprLayerCountKind(layer, NormalizedExprMatchStmt)
+
+fn NormalizedExprLayerCaseStmtCount(layer: NormalizedExprLayer): int32 =
+    return NormalizedExprLayerCountKind(layer, NormalizedExprCaseStmt)
 
 fn NormalizedExprLayerCallCount(layer: NormalizedExprLayer): int32 =
     return NormalizedExprLayerCountKind(layer, NormalizedExprCall)
@@ -2777,6 +2799,55 @@ fn ParserAppendControlStmtExprsLine(sourcePath: str,
                                    payload,
                                    lineRaw.len)
 
+fn ParserAppendMatchStmtExprsLine(sourcePath: str,
+                                   lineNumber: int32,
+                                   lineRaw: str,
+                                   layer: var NormalizedExprLayer) =
+    var lineStart: int32
+    var lineStop: int32
+    if !ParserTrimmedCommentRange(lineRaw, lineStart, lineStop):
+        return
+    if ParserLineRangeStartsWithStatementKeyword(lineRaw, lineStart, lineStop, "match"):
+        let payloadStart = lineStart + 6
+        var payloadStop = lineStop
+        let colonPos = ParserFindTopLevelTokenRange(lineRaw,
+                                                    payloadStart,
+                                                    lineStop,
+                                                    ":")
+        if colonPos > payloadStart:
+            payloadStop = colonPos
+        elif lineStop > payloadStart && lineRaw[lineStop - 1] == '{':
+            payloadStop = lineStop - 1
+        let payload = ParserTrimmedSliceRange(lineRaw, payloadStart, payloadStop)
+        if payload == "":
+            return
+        NormalizedExprLayerAppendSpan(layer,
+                                       sourcePath,
+                                       lineNumber,
+                                       lineStart + 1,
+                                       NormalizedExprMatchStmt,
+                                       NormalizedExprDetailNone,
+                                       payload,
+                                       lineRaw.len)
+        return
+    let arrow = ParserFindTopLevelTokenRange(lineRaw,
+                                             lineStart,
+                                             lineStop,
+                                             "=>")
+    if arrow <= lineStart:
+        return
+    let arm = ParserTrimmedSliceRange(lineRaw, lineStart, arrow)
+    if arm == "":
+        return
+    NormalizedExprLayerAppendSpan(layer,
+                                   sourcePath,
+                                   lineNumber,
+                                   lineStart + 1,
+                                   NormalizedExprCaseStmt,
+                                   NormalizedExprDetailNone,
+                                   arm,
+                                   lineRaw.len)
+
 fn ParserAppendFmtExprsLine(sourcePath: str,
                               lineNumber: int32,
                               lineRaw: str,
@@ -3266,7 +3337,7 @@ fn ParserFindTopLevelAssignmentEq(textRaw: str): int32 =
                 prev = textRaw[i - 1]
             if i + 1 < textRaw.len:
                 next = textRaw[i + 1]
-            if prev == '=' || prev == '!' || prev == '<' || prev == '>' || next == '=':
+            if prev == '=' || prev == '!' || prev == '<' || prev == '>' || next == '=' || next == '>':
                 continue
             return i
     return -1
@@ -5651,6 +5722,7 @@ fn ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfilesCached(sourcePa
         ParserAppendReturnStmtExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendAssignStmtExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendControlStmtExprsLine(sourcePath, lineNumber, line, layer)
+        ParserAppendMatchStmtExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendRangeExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendComprehensionExprsLine(sourcePath, lineNumber, line, layer)
         ParserAppendFmtExprsLine(sourcePath, lineNumber, line, layer)

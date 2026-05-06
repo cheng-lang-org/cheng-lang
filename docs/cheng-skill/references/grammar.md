@@ -14,6 +14,7 @@
 - `cheng/<pkg>/<path>` 为兼容别名，推荐迁移为 `<pkg>/<path>`。
 - 对非相对/非绝对模块路径，解析器可回退尝试 `<workspace>/src/<module>.cheng`。
 - 导出采用 Go 风格：标识符首字符为 ASCII 大写字母即导出；小写字母或 `_` 开头保持模块私有。
+- 代数类型使用 `|` 分隔 variant，例如 `type Option[T] = Some(value: T) | None`；模式匹配写 `match value:`，arm 使用 `=>`，例如 `Some(x) => return x`。
 - 内建字符串类型仅 `str`、`cstring`（`string` 非内建类型名）。
 - 编译器 `stage1` 主链路会显式拒绝 `string` 类型名。
 - no-pointer 生产口径下，用户源码模块默认禁指针；旧兼容名 `ABI=v2_noptr` 与 `STAGE1_NO_POINTERS_NON_C_ABI=1` 只保留在内部实现/兼容 gate 中，`@importc/@exportc` 同样不提供裸指针绕过路径。
@@ -44,6 +45,22 @@ import libp2p/[crypto,transport]
 - 类型：`type` `enum` `ref` `tuple` `set`。
 - 抽象：`trait` `concept`。
 - 元编程：`template` `macro`。
+
+## 代数类型与模式匹配
+```cheng
+type Option[T] = Some(value: T) | None
+
+fn fallback(value: Option[int32]): int32 =
+    match value:
+        Some(x) =>
+            return x
+        None =>
+            return 0
+```
+
+- Variant payload 写字段列表；无 payload variant 只写名字。
+- `match` arm 分隔符固定为 `=>`。
+- 多字段 payload 可按位置绑定：`Ok(value, extra) => ...`。
 
 ## 类型转换与默认初始化
 - 显式转换：`T(x)`（`T` 为类型表达式）。

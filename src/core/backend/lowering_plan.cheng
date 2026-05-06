@@ -688,13 +688,36 @@ fn LoweringFunctionDeclMatches(lineRaw: str,
     let next = rest[len(tailName)]
     return next == '(' || next == '[' || next == ':' || next == ' '
 
-fn LoweringImportcTargetSymbol(sourceTexts: texpr.TypedExprSourceText[],
-                                targetSourcePath: str,
-                                functionName: str): str =
+fn LoweringFindImportcTargetSymbol(sourceTexts: texpr.TypedExprSourceText[],
+                                    targetSourcePath: str,
+                                    functionName: str,
+                                    symbolOut: var str): bool =
     let normalizedTargetSourcePath = parser.ParserNormalizePath(targetSourcePath)
+    symbolOut = ""
+    if normalizedTargetSourcePath != "":
+        for sourceIndex in 0..<sourceTexts.len:
+            if parser.ParserNormalizePath(sourceTexts[sourceIndex].sourcePath) != normalizedTargetSourcePath:
+                continue
+            let lines = parser.ParserSplitChar(sourceTexts[sourceIndex].text, '\n')
+            var pendingImportc = ""
+            for lineIndex in 0..<lines.len:
+                let importcName = LoweringAnnotationQuotedValue(lines[lineIndex], "importc")
+                if len(importcName) > 0:
+                    pendingImportc = importcName
+                    continue
+                if LoweringFunctionDeclMatches(lines[lineIndex], functionName):
+                    if len(pendingImportc) <= 0:
+                        return false
+                    symbolOut = pendingImportc
+                    return true
+                let trimmed = chengpath.PathTrim(lines[lineIndex])
+                if chengpath.TextStartsWith(trimmed, "fn "):
+                    pendingImportc = ""
+            break
+    var foundSymbol = ""
+    var foundCount: int32
+    var ambiguous = false
     for sourceIndex in 0..<sourceTexts.len:
-        if parser.ParserNormalizePath(sourceTexts[sourceIndex].sourcePath) != normalizedTargetSourcePath:
-            continue
         let lines = parser.ParserSplitChar(sourceTexts[sourceIndex].text, '\n')
         var pendingImportc = ""
         for lineIndex in 0..<lines.len:
@@ -703,13 +726,65 @@ fn LoweringImportcTargetSymbol(sourceTexts: texpr.TypedExprSourceText[],
                 pendingImportc = importcName
                 continue
             if LoweringFunctionDeclMatches(lines[lineIndex], functionName):
-                if len(pendingImportc) > 0:
-                    return pendingImportc
-                return functionName
+                if len(pendingImportc) <= 0:
+                    if normalizedTargetSourcePath != "":
+                        return false
+                    break
+                let candidate = pendingImportc
+                if normalizedTargetSourcePath != "":
+                    symbolOut = candidate
+                    return true
+                if foundCount > 0 && foundSymbol != candidate:
+                    ambiguous = true
+                foundSymbol = candidate
+                foundCount = foundCount + 1
+                break
             let trimmed = chengpath.PathTrim(lines[lineIndex])
             if chengpath.TextStartsWith(trimmed, "fn "):
                 pendingImportc = ""
-        return functionName
+    if foundCount > 0 && !ambiguous:
+        symbolOut = foundSymbol
+        return true
+    return false
+
+fn LoweringImportcTargetSymbol(sourceTexts: texpr.TypedExprSourceText[],
+                                targetSourcePath: str,
+                                functionName: str): str =
+    var symbol = ""
+    if LoweringFindImportcTargetSymbol(sourceTexts,
+                                       targetSourcePath,
+                                       functionName,
+                                       symbol):
+        return symbol
+    return functionName
+
+fn LoweringFindImportcTargetSymbolTyped(typedIr: texpr.TypedExprIr,
+                                         sourceTexts: texpr.TypedExprSourceText[],
+                                         targetSourcePath: str,
+                                         functionName: str,
+                                         symbolOut: var str): bool =
+    let typedSymbol = texpr.TypedExprIrLookupImportcTargetSymbol(typedIr,
+                                                                 targetSourcePath,
+                                                                 functionName)
+    if typedSymbol != "":
+        symbolOut = typedSymbol
+        return true
+    return LoweringFindImportcTargetSymbol(sourceTexts,
+                                           targetSourcePath,
+                                           functionName,
+                                           symbolOut)
+
+fn LoweringImportcTargetSymbolTyped(typedIr: texpr.TypedExprIr,
+                                     sourceTexts: texpr.TypedExprSourceText[],
+                                     targetSourcePath: str,
+                                     functionName: str): str =
+    var symbol = ""
+    if LoweringFindImportcTargetSymbolTyped(typedIr,
+                                            sourceTexts,
+                                            targetSourcePath,
+                                            functionName,
+                                            symbol):
+        return symbol
     return functionName
 
 fn LoweringAppendPrimaryObjectIrStatements(fnIr: var PrimaryObjectIrFunction,
@@ -743,16 +818,25 @@ fn LoweringAppendPrimaryObjectIrStatements(fnIr: var PrimaryObjectIrFunction,
         stmt.callTargetImportc = typedStmt.callTargetImportc
         stmt.callArgCount = typedStmt.callArgCount
         stmt.callArgsText = typedStmt.callArgsText
-        if typedStmt.callTargetImportc:
-            stmt.callImportcSymbol = LoweringImportcTargetSymbol(sourceTexts,
-                                                                 typedStmt.callTargetSourcePath,
-                                                                 typedStmt.callTarget)
+        var importcSourcePath = typedStmt.callTargetSourcePath
+        if len(importcSourcePath) <= 0:
+            importcSourcePath = typedStmt.sourcePath
+        var importcSymbol = ""
+        if LoweringFindImportcTargetSymbolTyped(typedIr,
+                                                sourceTexts,
+                                                importcSourcePath,
+                                                typedStmt.callTarget,
+                                                importcSymbol):
+            stmt.callTargetSourcePath = importcSourcePath
+            stmt.callTargetImportc = true
+            stmt.callImportcSymbol = importcSymbol
         add(fnIr.statements, stmt)
     fnIr.statementCount = fnIr.statements.len
     for stmtIdx in 0..<fnIr.statements.len:
         if LoweringStatementCarriesCallTarget(fnIr.statements[stmtIdx]):
             LoweringAppendPrimaryObjectIrCallTarget(fnIr,
                                                      fnIr.statements[stmtIdx],
+                                                     typedIr,
                                                      sourceTexts)
 
 fn LoweringFillPrimaryObjectIrParams(fnIr: var PrimaryObjectIrFunction,
@@ -778,18 +862,32 @@ fn LoweringFillPrimaryObjectIrParams(fnIr: var PrimaryObjectIrFunction,
 
 fn LoweringAppendPrimaryObjectIrCallTarget(fnIr: var PrimaryObjectIrFunction,
                                             stmt: PrimaryObjectIrStatement,
+                                            typedIr: texpr.TypedExprIr,
                                             sourceTexts: texpr.TypedExprSourceText[]) =
     if len(stmt.callTarget) <= 0:
         return
     var importcSymbol = ""
-    if stmt.callTargetImportc:
-        importcSymbol = LoweringImportcTargetSymbol(sourceTexts,
-                                                     stmt.callTargetSourcePath,
-                                                     stmt.callTarget)
+    var callTargetImportc = stmt.callTargetImportc
+    var callTargetSourcePath = stmt.callTargetSourcePath
+    var importcSourcePath = callTargetSourcePath
+    if len(importcSourcePath) <= 0:
+        importcSourcePath = stmt.sourcePath
+    if LoweringFindImportcTargetSymbolTyped(typedIr,
+                                            sourceTexts,
+                                            importcSourcePath,
+                                            stmt.callTarget,
+                                            importcSymbol):
+        callTargetImportc = true
+        callTargetSourcePath = importcSourcePath
+    elif stmt.callTargetImportc:
+        importcSymbol = LoweringImportcTargetSymbolTyped(typedIr,
+                                                         sourceTexts,
+                                                         importcSourcePath,
+                                                         stmt.callTarget)
     add(fnIr.callArgCounts, stmt.callArgCount)
     add(fnIr.callTargets, stmt.callTarget)
-    add(fnIr.callTargetSourcePaths, stmt.callTargetSourcePath)
-    add(fnIr.callTargetImportcFlags, stmt.callTargetImportc)
+    add(fnIr.callTargetSourcePaths, callTargetSourcePath)
+    add(fnIr.callTargetImportcFlags, callTargetImportc)
     add(fnIr.callImportcSymbols, importcSymbol)
 
 fn LoweringStatementCarriesCallTarget(stmt: PrimaryObjectIrStatement): bool =
@@ -808,6 +906,7 @@ fn LoweringStatementCallTargetCount(fnIr: PrimaryObjectIrFunction): int32 =
     return count
 
 fn LoweringFillGeneralCfgCallSequenceFromStatements(fnIr: var PrimaryObjectIrFunction,
+                                                     typedIr: texpr.TypedExprIr,
                                                      sourceTexts: texpr.TypedExprSourceText[]) =
     if fnIr.bodyKind != texpr.BodyKindUnsupported && fnIr.callTargets.len > 0:
         return
@@ -817,9 +916,10 @@ fn LoweringFillGeneralCfgCallSequenceFromStatements(fnIr: var PrimaryObjectIrFun
         for stmtIndex in 0..<fnIr.statements.len:
             let stmt = fnIr.statements[stmtIndex]
             if LoweringStatementCarriesCallTarget(stmt):
-                LoweringAppendPrimaryObjectIrCallTarget(fnIr, stmt, sourceTexts)
+                LoweringAppendPrimaryObjectIrCallTarget(fnIr, stmt, typedIr, sourceTexts)
 
 fn LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr: var PrimaryObjectIrFunction,
+                                                           typedIr: texpr.TypedExprIr,
                                                            sourceTexts: texpr.TypedExprSourceText[]) =
     if fnIr.bodyKind != "str_i32_guard_arg0_return_0":
         return
@@ -851,12 +951,13 @@ fn LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr: var PrimaryObjec
     if chengpath.PathTrim(second.callArgsText) != firstName ||
        chengpath.PathTrim(fourth.callArgsText) != firstName:
         return
-    LoweringAppendPrimaryObjectIrCallTarget(fnIr, first, sourceTexts)
-    LoweringAppendPrimaryObjectIrCallTarget(fnIr, second, sourceTexts)
-    LoweringAppendPrimaryObjectIrCallTarget(fnIr, third, sourceTexts)
-    LoweringAppendPrimaryObjectIrCallTarget(fnIr, fourth, sourceTexts)
+    LoweringAppendPrimaryObjectIrCallTarget(fnIr, first, typedIr, sourceTexts)
+    LoweringAppendPrimaryObjectIrCallTarget(fnIr, second, typedIr, sourceTexts)
+    LoweringAppendPrimaryObjectIrCallTarget(fnIr, third, typedIr, sourceTexts)
+    LoweringAppendPrimaryObjectIrCallTarget(fnIr, fourth, typedIr, sourceTexts)
 
 fn LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr: var PrimaryObjectIrFunction,
+                                                               typedIr: texpr.TypedExprIr,
                                                                sourceTexts: texpr.TypedExprSourceText[]) =
     if fnIr.callTargets.len > 0:
         return
@@ -898,11 +999,11 @@ fn LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr: var PrimaryO
     if fifthArgs[0] != firstName || fifthArgs[1] != thirdName:
         return
     fnIr.bodyKind = "str_i32_guard_arg0_else_call_arg0_arg1_return_result_i32"
-    LoweringAppendPrimaryObjectIrCallTarget(fnIr, first, sourceTexts)
-    LoweringAppendPrimaryObjectIrCallTarget(fnIr, second, sourceTexts)
-    LoweringAppendPrimaryObjectIrCallTarget(fnIr, third, sourceTexts)
-    LoweringAppendPrimaryObjectIrCallTarget(fnIr, fourth, sourceTexts)
-    LoweringAppendPrimaryObjectIrCallTarget(fnIr, fifth, sourceTexts)
+    LoweringAppendPrimaryObjectIrCallTarget(fnIr, first, typedIr, sourceTexts)
+    LoweringAppendPrimaryObjectIrCallTarget(fnIr, second, typedIr, sourceTexts)
+    LoweringAppendPrimaryObjectIrCallTarget(fnIr, third, typedIr, sourceTexts)
+    LoweringAppendPrimaryObjectIrCallTarget(fnIr, fourth, typedIr, sourceTexts)
+    LoweringAppendPrimaryObjectIrCallTarget(fnIr, fifth, typedIr, sourceTexts)
 
 fn LoweringAppendPrimaryObjectIrCallTargetFields(fnIr: var PrimaryObjectIrFunction,
                                                   callArgCount: int32,
@@ -1094,7 +1195,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                     if LoweringReturnCallArgsPassThrough(sourceTexts, sourcePath, functionName, fact.callArgsText, fact.callArgCount):
                         var firstImportcSymbol = ""
                         if fact.callTargetImportc:
-                            firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
+                            firstImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, fact.callTargetSourcePath, fact.callTarget)
                         add(fnIr.callArgCounts, fact.callArgCount)
                         add(fnIr.callTargets, fact.callTarget)
                         add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
@@ -1104,7 +1205,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
             elif letCallReturnKind == texpr.BodyKindUnsupported:
                 var firstImportcSymbol = ""
                 if fact.callTargetImportc:
-                    firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
+                    firstImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, fact.callTargetSourcePath, fact.callTarget)
                 add(fnIr.callArgCounts, fact.callArgCount)
                 add(fnIr.callTargets, fact.callTarget)
                 add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
@@ -1129,16 +1230,16 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                                     if fact.callArgCount == 0 && secondFact.callArgCount == 1 && thirdFact.callArgCount == 0 && fourthFact.callArgCount == 1 && secondArgText == returnNode.surfaceText && fourthArgText == returnNode.surfaceText:
                                         var firstImportcSymbol = ""
                                         if fact.callTargetImportc:
-                                            firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
+                                            firstImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, fact.callTargetSourcePath, fact.callTarget)
                                         var secondImportcSymbol = ""
                                         if secondFact.callTargetImportc:
-                                            secondImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, secondFact.callTargetSourcePath, secondFact.callTarget)
+                                            secondImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, secondFact.callTargetSourcePath, secondFact.callTarget)
                                         var thirdImportcSymbol = ""
                                         if thirdFact.callTargetImportc:
-                                            thirdImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, thirdFact.callTargetSourcePath, thirdFact.callTarget)
+                                            thirdImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, thirdFact.callTargetSourcePath, thirdFact.callTarget)
                                         var fourthImportcSymbol = ""
                                         if fourthFact.callTargetImportc:
-                                            fourthImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fourthFact.callTargetSourcePath, fourthFact.callTarget)
+                                            fourthImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, fourthFact.callTargetSourcePath, fourthFact.callTarget)
                                         add(fnIr.callArgCounts, 0)
                                         add(fnIr.callTargets, fact.callTarget)
                                         add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
@@ -1185,10 +1286,10 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                                     if firstFactType == "str" && fact.callArgCount == 0 && secondFact.callArgCount == 1 && secondArgText == returnNode.surfaceText:
                                         var firstImportcSymbol = ""
                                         if fact.callTargetImportc:
-                                            firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
+                                            firstImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, fact.callTargetSourcePath, fact.callTarget)
                                         var secondImportcSymbol = ""
                                         if secondFact.callTargetImportc:
-                                            secondImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, secondFact.callTargetSourcePath, secondFact.callTarget)
+                                            secondImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, secondFact.callTargetSourcePath, secondFact.callTarget)
                                         add(fnIr.callArgCounts, 0)
                                         add(fnIr.callTargets, fact.callTarget)
                                         add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
@@ -1205,7 +1306,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                         if factType == "int32":
                             var firstImportcSymbol = ""
                             if fact.callTargetImportc:
-                                firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
+                                firstImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, fact.callTargetSourcePath, fact.callTarget)
                             if letCallReturnKind == texpr.BodyKindLetCallReturnResultI32:
                                 fnIr.bodyKind = texpr.BodyKindLetCallNoargReturnResultI32
                             elif letCallReturnKind == texpr.BodyKindLetCallI32IfResultLeZeroReturnZeroElseResultI32:
@@ -1223,7 +1324,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                             if letCallReturnKind == texpr.BodyKindLetCallReturnStrLenI32:
                                 var firstImportcSymbol = ""
                                 if fact.callTargetImportc:
-                                    firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, fact.callTargetSourcePath, fact.callTarget)
+                                    firstImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, fact.callTargetSourcePath, fact.callTarget)
                                 add(fnIr.callArgCounts, fact.callArgCount)
                                 add(fnIr.callTargets, fact.callTarget)
                                 add(fnIr.callTargetSourcePaths, fact.callTargetSourcePath)
@@ -1281,10 +1382,10 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                     if firstFactType == "str" && firstFact.callArgCount == 0 && secondFact.callArgCount == 1 && secondArgText == returnNode.surfaceText:
                         var firstImportcSymbol = ""
                         if firstFact.callTargetImportc:
-                            firstImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, firstFact.callTargetSourcePath, firstFact.callTarget)
+                            firstImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, firstFact.callTargetSourcePath, firstFact.callTarget)
                         var secondImportcSymbol = ""
                         if secondFact.callTargetImportc:
-                            secondImportcSymbol = LoweringImportcTargetSymbol(sourceTexts, secondFact.callTargetSourcePath, secondFact.callTarget)
+                            secondImportcSymbol = LoweringImportcTargetSymbolTyped(plan.typedIr, sourceTexts, secondFact.callTargetSourcePath, secondFact.callTarget)
                         add(fnIr.callArgCounts, 0)
                         add(fnIr.callTargets, firstFact.callTarget)
                         add(fnIr.callTargetSourcePaths, firstFact.callTargetSourcePath)
@@ -1316,8 +1417,8 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                 if fnIr.callTargets.len == 1:
                     fnIr.bodyKind = texpr.BodyKindCallArg0Const0ReturnI32Const0
     if fnIr.bodyKind == texpr.BodyKindUnsupported:
-        LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr, sourceTexts)
-    LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr, sourceTexts)
+    LoweringMaybeFillStrI32GuardElseCallSequenceFromStatements(fnIr, plan.typedIr, sourceTexts)
+    LoweringMaybeFillStrI32GuardCallSequenceFromStatements(fnIr, plan.typedIr, sourceTexts)
     LoweringMaybeFillBackendDriverRunCommand(fnIr)
     if fnIr.bodyKind == texpr.BodyKindUnsupported && typedFnIndex >= 0 && typedFnIndex < plan.typedIr.functions.len:
         let commandCodeTailName = LoweringFunctionTailName(fnIr.functionName)
@@ -1333,7 +1434,7 @@ fn LoweringBuildOneFunction(plan: LoweringPlanStub,
                 fnIr.callTargetSourcePaths = []
                 fnIr.callTargetImportcFlags = []
                 fnIr.callImportcSymbols = []
-    LoweringFillGeneralCfgCallSequenceFromStatements(fnIr, sourceTexts)
+    LoweringFillGeneralCfgCallSequenceFromStatements(fnIr, plan.typedIr, sourceTexts)
     if fnIr.bodyKind == texpr.BodyKindUnsupported && fnIr.statements.len > 0:
         fnIr.bodyKind = texpr.BodyKindStatementSequence
     fnIr.callTargetCount = fnIr.callTargets.len

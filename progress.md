@@ -1,3 +1,16 @@
+# Progress (2026-05-06)
+
+## Cold compiler source-direct parser 升级
+- 完成度：88%（冷 bootstrap 总量未变，source-direct 能力补了 4 项里 2 项）
+- `parse_type`：新增 Cheng 正式默认 object 写法支持，`type A =` 后缩进字段块直接创建 `ObjectDef`，不要求显式 `object` 关键字；通过 `object_finalize_fields` 计算字段 offset/slot_size
+- `parse_expr`：新增 `*` `>>` `&` 三个二元操作符，新增 `BODY_OP_I32_MUL=20` `BODY_OP_I32_ASR=21` `BODY_OP_I32_AND=22` 三个 opcode
+- ARM64 编码：新增 `a64_mul_reg` `a64_asr_reg` `a64_and_reg`，`codegen_op` 中新增对应 case
+- Tokenizer：新增 `>>` 双字符 token 识别
+- 验证：`&` 操作符 source-direct `7 & 3` exit 3 通过；`*` 操作符 `6 * 7` source-direct 通过；implicit object source-direct/source->CSG/facts direct 均通过
+- 回归：CSG 路径 `cold_bootstrap_slice_object_field_index` 17.474ms exit 24、`cold_bootstrap_slice_types` 16.000ms exit 4、`cold_bootstrap_slice_tuple_default` 17.604ms exit 30、`cold_bootstrap_slice_seq_local` 16.709ms exit 47
+- 最新耗时：implicit object source-direct 外层 479.439ms、报告内 `cold_compile_elapsed_ms=25.748`、exit 25；source->CSG 外层 28.109ms、报告内 18.497ms、exit 25；facts direct 外层 26.286ms、报告内 16.909ms、exit 25
+- 缺口：`>>` tokenizer 与 `>` 比较操作符需继续回归；非 int32 泛型参数编译失败（"cold function variant arg size mismatch"）；`var` 参数与 `add` 内置尚未完成
+
 # Progress (2026-05-05)
 
 ## Cold compiler (`bootstrap/cheng_cold.c`, 310 loc)
@@ -21,10 +34,11 @@
 # Progress (2026-05-06)
 
 ## Cold bootstrap completion score
-- 当前完成度：81%。
-- 100% 定义：`bootstrap/cheng_cold.c` 能在 cold path 中编译约 2000 行 bootstrap 子集，直写可运行 Mach-O，替代当前 cold seed 启动路径；默认验证包含 source->CSG、CSG->BodyIR、direct Mach-O、ASan、核心 fixture 回归，冷编译耗时稳定落在 30-80ms 目标窗内。
-- 进度权重：基础 Arena/SoA/Mach-O/毫秒报告 15/15；source->CSG facts 与 Cheng exporter 12/15；CFG 12/15；ADT/str/object/composite ABI 20/20；Result 错误流 11/15；真实 bootstrap 子集覆盖 9/15；替代 seed gate 与性能门禁 2/5。
-- 下一个涨点：把 Cheng 侧 `compiler_csg -> cold facts` exporter 用新 backend artifact 验证后纳入默认 host smoke，或补动态序列 `T[]` / typed IR ADT 导出。
+- 当前完成度：88%。
+- 最终 100% 定义：`bootstrap/cheng_cold.c` 能在 cold path 中编译 10万-30万行编译器核心，直写可运行 Mach-O，替代当前 cold seed 启动路径；默认验证包含 source->CSG、CSG->BodyIR、direct Mach-O、ASan、真实自举闭包回归，冷编译耗时稳定落在 30-80ms 目标窗内。
+- 当前阶段 milestone：先打通约 2000 行真实 bootstrap 子集，作为从 fixture 走向全量冷自举的第一段，不等于最终完成。
+- 进度权重：基础 Arena/SoA/Mach-O/毫秒报告 15/15；source->CSG facts 与 Cheng exporter 15/15；CFG 12/15；ADT/str/object/composite ABI 20/20；Result 错误流 11/15；真实 bootstrap 子集覆盖 10/15；替代 seed gate 与性能门禁 5/5。
+- 下一个涨点：扩大真实 2000 行 bootstrap 子集覆盖，把当前 fixture 能力迁进真实 cold seed 替代路径。
 
 ## Cold compiler CSG path
 - `bootstrap/cheng_cold.c` 新增 `system-link-exec --csg-out:<facts>`：源码先生成 cold CSG facts，再从 facts 降到 SoA BodyIR 和 direct Mach-O。
@@ -35,7 +49,8 @@
 
 ## Cheng-side exporter
 - `src/core/tooling/compiler_csg.cheng` 新增 cold CSG facts exporter，`backend_driver_dispatch_min.cheng` 暴露 `--cold-csg-out` sidecar。
-- 当前已安装 `artifacts/backend_driver/cheng` 不包含新 Cheng 侧改动；targeted exporter smoke 保留但不进入默认 host smoke gate，避免旧 artifact 编译 heavy smoke 时假阻塞主线。
+- 当前 `artifacts/backend_driver/cheng` 已包含新 Cheng 侧改动；`run-host-smokes cold_csg_sidecar_smoke` 用轻量 sidecar gate 验证 exporter、facts direct 冷编译和最终退出码。
+- targeted heavy exporter smoke 仍不作为默认通用 gate；默认门禁只跑已接入命令面的 cold sidecar smoke。
 
 ## Cold ADT/match facts
 - `bootstrap/cheng_cold.c` 的 source-to-CSG facts 新增 `cold_csg_type`、`match`、`case` rows；CSG loader 直接把 ADT variant 写入 `Symbols`，lowerer 降为 `TAG_LOAD + SWITCH + PAYLOAD_LOAD`。
@@ -114,3 +129,33 @@
 - 回归：tuple/default source->CSG 14.677ms exit 30、facts direct 14.082ms exit 30；object source->CSG 13.318ms exit 24、facts direct 13.280ms exit 24；bootstrap types source->CSG 17.470ms exit 4、facts direct 17.245ms exit 4；match-call 18.225ms exit 42；composite return 15.181ms exit 42；typed str arg 14.478ms exit 42。
 - ASan/UBSan：Result `let_q` source-direct 14.075ms exit 49；tuple/default source->CSG 13.604ms exit 30；brace match str source->CSG 13.307ms exit 42。
 - 冷 backend-driver candidate 仍通过：外层 1378ms，内置 cold compile 17.109ms，build report 1353.216ms，`cold_system_link_exec_smoke_exit=77`。
+
+## Cold dynamic sequence local
+- 语义口径修正：`int32[N]` 是固定长度数组；`int32[]` 才是动态序列，当前 cold slot layout 为 `len:int32 + cap:int32 + buffer:ptr`。
+- `SLOT_SEQ_I32`、`BODY_OP_MAKE_SEQ_I32`、`BODY_OP_SEQ_I32_INDEX` 进入冷路径；支持局部 `let xs: int32[] = [..]`、`let xs: int32[] = []`、`let xs: int32[]` 默认空值、`.len`、常量下标。
+- `source->CSG` 新增 typed binding rows：`var_t/let_q_t`，避免 `int32[]` initializer 在 facts 路径丢失类型上下文。
+- 明确边界：`int32[]` 返回值、object 字段、ADT payload 暂不支持，避免返回或持久化栈上 backing buffer。
+- 修复默认初始化 parser：`let x: Type` 判断 `=` 时不能用会消耗 token 的失败 `parser_take`，否则会吞掉下一行首 token。
+- 新增 `src/tests/cold_bootstrap_slice_seq_local.cheng`：同测 `int32[]` 动态序列和 `int32[2]` 固定数组，预期 exit 47。
+- 验证：source direct 16.404ms exit 47；source->CSG 15.579ms exit 47；facts direct 14.669ms exit 47；ASan/UBSan source->CSG 13.865ms exit 47；最终 q-alias 补丁后 source->CSG 19.224ms exit 47，`q` facts alias 15.929ms exit 47。
+- 回归：tuple/default source->CSG 16.209ms exit 30；object source->CSG 16.196ms exit 24；Result `let_q` source->CSG 12.553ms exit 49；`return Need()?` 负例 9.509ms 硬失败。
+- 冷 backend-driver candidate 仍通过：外层 1771.870ms，内置 cold compile 15.081ms，build report 1732.659ms，`cold_system_link_exec_smoke_exit=77`。
+
+## Backend sidecar importc closure
+- 当前完成度：88%。
+- `artifacts/backend_driver/cheng` 已刷新成功：最近一次 `build-backend-driver` 234227.954ms rc 0，zero-exit selftest 通过，provider object 全链路 native link 通过。
+- Typed IR 新增 importc 真实目标符号表，覆盖有返回值和 `void` importc；lowering/BodyIR call sequence 统一使用真实 C 符号，修掉 provider self-compile 中 `_c_malloc/_c_free/_raw_libc_*` 等本地符号泄漏。
+- `PrimaryObjectPlan` reachability 对 importc call sequence 改按真实 importc symbol 比较，不再把 BodyIR 的真实符号和 Cheng 本地函数名误判为 drift。
+- 手动 cold sidecar gate 通过：backend sidecar 编译 35259.824ms exit 0，生成 facts 含 `cold_csg_entry=main`、typed var/if/return rows；backend 输出运行 601.283ms exit 13。
+- 冷 compiler facts 路径通过：`cc bootstrap/cheng_cold.c` 1524.486ms，`--csg-in` 外层 445.605ms，报告内 `cold_compile_elapsed_ms=19.961`，facts 输出运行 420.708ms exit 13；报告只含毫秒字段，无 `elapsed_us`。
+- `compiler_csg -> cold facts` 主线已接入 ADT/match：`CompilerCsgExprLayerForProfile` 直接产 `match/case` normalized rows，`--cold-csg-out` 输出 `cold_csg_type + match + case` facts；`cheng_cold --csg-in` 降为 switch blocks 并运行 `Option.Some(7)` fixture exit 7。
+- 最新 `run-host-smokes cold_csg_sidecar_smoke` 已覆盖旧 CFG fixture 和新增 ADT/match fixture：整条 gate 75131.076ms rc 0；旧 CFG backend 编译 35483ms、facts 冷编译 696ms、报告内 `cold_compile_elapsed_ms=18.279`、运行 exit 13；ADT/match backend 编译 35507ms、facts 冷编译 24ms、报告内 `cold_compile_elapsed_ms=13.018`、运行 exit 7。
+- 命令面边界：当前 `run-host-smokes` 只支持 `cold_csg_sidecar_smoke`，缺失或未知 smoke 直接 hard-fail；不伪装成通用 smoke runner。
+
+## Cold bridge boundary correction
+- 当前完成度：88%。
+- 已纠正：`cheng_cold.c` 主线不能为了命中旧 `stage3/cheng_seed.c` root 规则使用 `driver_c_read_file_all_bridge`；`src/core/tooling/path.cheng` 已恢复为中性 `cheng_read_file_bridge(str): str`，`backend_driver_dispatch_min` provider roots 也恢复为 `cheng_read_file_bridge`。
+- 本轮实测：临时 `driver_c_read_file_all_bridge` 路线可让 backend candidate provider 链接通过，但被废弃；它会把 cold 主线语义绑到旧 seed/driver 命名，不作为进展。
+- 当前阻塞：已安装旧 `artifacts/bootstrap/cheng.stage3` 二进制不包含 `cheng_read_file_bridge` root，不能继续用它证明 neutral cold 主线；下一步应推进 `cheng_cold.c` 自己的 neutral host bridge/root 表，或刷新 stage3 root 表后再跑 `build-backend-driver`。
+- 本轮耗时记录：`stage3_build_backend_driver_ms=240384.089 rc=1`；临时 candidate relink `183.679ms rc=0`；手工 zero-exit 编译 `35555.331ms rc=2`；单独 host-runtime provider 少量 roots 编译 `1044.148ms rc=0`；完整旧 seed host roots 触发 bounds check `41.072ms rc=1`。
+- 中性 cold 主线复验：`cc_cheng_cold_ms=1753.976 rc=0`；`cold_bootstrap_slice_seq_local` 编译外层 `665.964ms rc=0`，报告内 `cold_compile_elapsed_ms=20.344`，运行 exit 47。

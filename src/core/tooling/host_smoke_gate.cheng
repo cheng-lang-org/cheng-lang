@@ -84,6 +84,7 @@ fn HostSmokeDefaultSmokes(): str[] =
         "body_ir_dod_soa_contract_smoke",
         "body_ir_noalias_proof_smoke",
         "cfg_body_ir_contract_smoke",
+        "cold_csg_sidecar_smoke",
         "compiler_world_manifest_closure_smoke",
         "compiler_migration_publish_smoke",
         "compiler_csg_egraph_active_contract_smoke",
@@ -218,6 +219,22 @@ fn HostSmokeExpectedRunMarker(smokeName: str): str =
         return " cold_csg_facts_exporter_smoke ok"
     return ""
 
+fn HostSmokeExpectContains(label: str,
+                            text: str,
+                            needle: str): bool =
+    if strings.StrContains(text, needle):
+        return true
+    HostSmokePrintErr(strutil.Join([label, ": missing marker: ", needle], ""))
+    return false
+
+fn HostSmokeExpectNotContains(label: str,
+                               text: str,
+                               needle: str): bool =
+    if !strings.StrContains(text, needle):
+        return true
+    HostSmokePrintErr(strutil.Join([label, ": forbidden marker: ", needle], ""))
+    return false
+
 fn HostSmokeRunMarkerOk(smokeName: str, outputText: str): bool =
     let marker = HostSmokeExpectedRunMarker(smokeName)
     if len(marker) <= 0:
@@ -227,10 +244,147 @@ fn HostSmokeRunMarkerOk(smokeName: str, outputText: str): bool =
     HostSmokePrintErr(strutil.Join(["host smokes: missing run marker for ", smokeName, ": ", marker], ""))
     return false
 
+fn HostSmokeRunColdCsgSidecarSmoke(root: str,
+                                    compiler: str,
+                                    outDir: str): int32 =
+    let smokeName = "cold_csg_sidecar_smoke"
+    let src = chengpath.PathAbsolute(root, "src/tests/backend_matrix_cfg_if_guard.cheng")
+    if !chengpath.FileExistsNonEmpty(root, src):
+        HostSmokePrintErr(strutil.Join(["host smokes: missing source: ", src], ""))
+        return 1
+    let outBin = os.JoinPath(outDir, smokeName)
+    let factsPath = strutil.Join([outBin, ".cold.csg"], "")
+    let reportPath = strutil.Join([outBin, ".compile.report.txt"], "")
+    let compileLog = strutil.Join([outBin, ".compile.log"], "")
+    let runLog = strutil.Join([outBin, ".run.log"], "")
+    let coldCompiler = os.JoinPath(outDir, "cheng_cold_sidecar_probe")
+    let coldBuildLog = strutil.Join([coldCompiler, ".build.log"], "")
+    let coldOut = strutil.Join([outBin, ".from_facts"], "")
+    let coldReport = strutil.Join([coldOut, ".report.txt"], "")
+    let coldCompileLog = strutil.Join([coldOut, ".compile.log"], "")
+    let coldRunLog = strutil.Join([coldOut, ".run.log"], "")
+    let paths: str[] = [
+        outBin,
+        factsPath,
+        reportPath,
+        compileLog,
+        runLog,
+        coldCompiler,
+        coldBuildLog,
+        coldOut,
+        coldReport,
+        coldCompileLog,
+        coldRunLog,
+        strutil.Join([outBin, ".map"], ""),
+        strutil.Join([coldOut, ".map"], "")
+    ]
+    for i in 0..<paths.len:
+        if chengpath.PathFileExists(paths[i]):
+            os.RemoveFile(paths[i])
+    HostSmokePrintLine("[cheng host smokes] cold csg sidecar")
+    let compileRun = hostops.RunFileLogged(root,
+                                             "host_smokes_compile_cold_csg_sidecar",
+                                             compiler,
+                                             [
+                                                 "system-link-exec",
+                                                 "--root", root,
+                                                 "--in", src,
+                                                 "--emit", "exe",
+                                                 "--target", "arm64-apple-darwin",
+                                                 "--out", outBin,
+                                                 "--report-out", reportPath,
+                                                 "--cold-csg-out", factsPath
+                                             ],
+                                             HostSmokeCompileEnv(),
+                                             root,
+                                             300,
+                                             compileLog)
+    if !hostops.LoggedRunOk(compileRun):
+        HostSmokePrintErr(strutil.Join(["host smokes: cold csg sidecar compile failed: ", hostops.LoggedRunSummary(compileRun)], ""))
+        return compileRun.exitCode
+    if !chengpath.FileExistsNonEmpty(root, factsPath):
+        HostSmokePrintErr(strutil.Join(["host smokes: cold csg sidecar missing facts: ", factsPath], ""))
+        return 1
+    let facts = chengpath.ReadTextFile(root, factsPath)
+    if !HostSmokeExpectContains(smokeName, facts, "cold_csg_entry=main"):
+        return 1
+    if !HostSmokeExpectContains(smokeName, facts, "cold_csg_stmt\t2\t4\tvar_t\tcount\tint32\tCount()"):
+        return 1
+    if !HostSmokeExpectContains(smokeName, facts, "cold_csg_stmt\t2\t4\tif\tcount <= 0"):
+        return 1
+    if !HostSmokeExpectContains(smokeName, facts, "cold_csg_stmt\t2\t4\treturn\tCall()"):
+        return 1
+    let run = hostops.RunFileLogged(root,
+                                      "host_smokes_run_cold_csg_sidecar",
+                                      outBin,
+                                      [],
+                                      [],
+                                      root,
+                                      30,
+                                      runLog)
+    if run.exitCode != 13:
+        HostSmokePrintErr(strutil.Join(["host smokes: cold csg sidecar executable exit mismatch: ", hostops.LoggedRunSummary(run)], ""))
+        return 1
+    let coldBuild = hostops.RunProgramLogged(root,
+                                             "host_smokes_build_cold_csg_sidecar_compiler",
+                                             "cc",
+                                             [
+                                                 "-std=c11",
+                                                 "-Wall",
+                                                 "-Wextra",
+                                                 "-O2",
+                                                 "bootstrap/cheng_cold.c",
+                                                 "-o",
+                                                 coldCompiler
+                                             ],
+                                             [],
+                                             root,
+                                             60,
+                                             coldBuildLog)
+    if !hostops.LoggedRunOk(coldBuild):
+        HostSmokePrintErr(strutil.Join(["host smokes: cold csg sidecar cold compiler build failed: ", hostops.LoggedRunSummary(coldBuild)], ""))
+        return coldBuild.exitCode
+    let coldCompile = hostops.RunFileLogged(root,
+                                            "host_smokes_compile_cold_csg_sidecar_facts",
+                                            coldCompiler,
+                                            [
+                                                "system-link-exec",
+                                                strutil.Join(["--csg-in:", factsPath], ""),
+                                                strutil.Join(["--out:", coldOut], ""),
+                                                strutil.Join(["--report-out:", coldReport], "")
+                                            ],
+                                            [],
+                                            root,
+                                            30,
+                                            coldCompileLog)
+    if !hostops.LoggedRunOk(coldCompile):
+        HostSmokePrintErr(strutil.Join(["host smokes: cold csg sidecar facts compile failed: ", hostops.LoggedRunSummary(coldCompile)], ""))
+        return coldCompile.exitCode
+    let coldRun = hostops.RunFileLogged(root,
+                                        "host_smokes_run_cold_csg_sidecar_facts",
+                                        coldOut,
+                                        [],
+                                        [],
+                                        root,
+                                        30,
+                                        coldRunLog)
+    if coldRun.exitCode != 13:
+        HostSmokePrintErr(strutil.Join(["host smokes: cold csg sidecar facts executable exit mismatch: ", hostops.LoggedRunSummary(coldRun)], ""))
+        return 1
+    let coldReportText = chengpath.ReadTextFile(root, coldReport)
+    if !HostSmokeExpectContains(smokeName, coldReportText, "cold_compile_elapsed_ms="):
+        return 1
+    if !HostSmokeExpectNotContains(smokeName, coldReportText, "elapsed_us"):
+        return 1
+    HostSmokePrintLine(" cold_csg_sidecar_smoke ok")
+    return 0
+
 fn HostSmokeRunOne(root: str,
                      compiler: str,
                      outDir: str,
                      smokeName: str): int32 =
+    if smokeName == "cold_csg_sidecar_smoke":
+        return HostSmokeRunColdCsgSidecarSmoke(root, compiler, outDir)
     let src = chengpath.PathAbsolute(root, strutil.Join(["src/tests/", smokeName, ".cheng"], ""))
     if !chengpath.FileExistsNonEmpty(root, src):
         HostSmokePrintErr(strutil.Join(["host smokes: missing source: ", src], ""))

@@ -1865,6 +1865,7 @@ fn CompilerCsgExprLayerForProfile(sourcePath: str,
         parser.ParserAppendReturnStmtExprsLine(sourcePath, lineNumber, line, layer)
         parser.ParserAppendAssignStmtExprsLine(sourcePath, lineNumber, line, layer)
         parser.ParserAppendControlStmtExprsLine(sourcePath, lineNumber, line, layer)
+        parser.ParserAppendMatchStmtExprsLine(sourcePath, lineNumber, line, layer)
         parser.ParserAppendRangeExprsLine(sourcePath, lineNumber, line, layer)
         parser.ParserAppendComprehensionExprsLine(sourcePath, lineNumber, line, layer)
         parser.ParserAppendFmtExprsLine(sourcePath, lineNumber, line, layer)
@@ -2413,6 +2414,12 @@ fn CompilerColdCsgTextIsFactSafe(text: str): bool =
             return false
     return true
 
+fn CompilerColdCsgPayloadIsLineSafe(text: str): bool =
+    for i in 0..<text.len:
+        if text[i] == '\n' || text[i] == '\r':
+            return false
+    return true
+
 fn CompilerColdCsgTailName(nameRaw: str): str =
     var tailStart: int32
     if nameRaw.len >= 2:
@@ -2477,8 +2484,8 @@ fn CompilerColdCsgReturnExpr(stmt: texpr.TypedExprIrStatement,
     return expr
 
 fn CompilerColdCsgTypeSupported(typeRaw: str): bool =
-    let t = std.strutils.TrimSpace(typeRaw)
-    if t == "" || t == "int32" || t == "int" || t == "str" || t == "cstring" ||
+    let t = chengpath.PathTrim(typeRaw)
+    if t == "" || t == "int32" || t == "int" || t == "bool" || t == "str" || t == "cstring" ||
        t == "int32[]" || t == "int[]":
         return true
     if t.len > 1 && t[0] >= 'A' && t[0] <= 'Z':
@@ -2488,14 +2495,14 @@ fn CompilerColdCsgTypeSupported(typeRaw: str): bool =
 fn CompilerColdCsgParamSpec(name: str,
                              typeRaw: str,
                              err: var str): str =
-    let typeText = std.strutils.TrimSpace(typeRaw)
+    let typeText = chengpath.PathTrim(typeRaw)
     if name == "" || !CompilerColdCsgTextIsFactSafe(name):
         err = Fmt"cold csg export unsafe param name: {name}"
         return ""
     if !CompilerColdCsgTypeSupported(typeText):
         err = Fmt"cold csg export unsupported param type: {name}:{typeText}"
         return ""
-    if typeText == "" || typeText == "int32" || typeText == "int":
+    if typeText == "" || typeText == "int32" || typeText == "int" || typeText == "bool":
         return Fmt"{name}:i"
     if typeText == "str" || typeText == "cstring":
         return Fmt"{name}:s"
@@ -2521,9 +2528,9 @@ fn CompilerColdCsgFunctionParamsCsv(csg: var CompilerCsg,
     if maxSlot >= 8:
         err = Fmt"cold csg export too many params: {fnIr.functionName}"
         return ""
-    var out = ""
+    var out: str
     for slot in 0..maxSlot:
-        var name = ""
+        var name: str
         for nodeIndex in fnIr.nodeStart..<nodeEnd:
             let node = csg.typedIr.nodes[nodeIndex]
             if node.opKind == texpr.TypedExprIrOpParamRef && node.paramSlot == slot:
@@ -2567,6 +2574,45 @@ fn CompilerColdCsgAppendFunctionRows(csg: var CompilerCsg,
         CompilerColdCsgAppendLine(out, Fmt"cold_csg_function\t{IntToStr(i)}\t{name}\t{params}\t{returnType}")
     return true
 
+fn CompilerColdCsgAppendTypedTypeRows(csg: var CompilerCsg,
+                                       out: var str,
+                                       err: var str): bool =
+    for i in 0..<csg.typedIr.coldCsgTypeRows.len:
+        let row = csg.typedIr.coldCsgTypeRows[i]
+        if row.typeName == "" || row.specs == "" ||
+           !CompilerColdCsgTextIsFactSafe(row.typeName) ||
+           !CompilerColdCsgTextIsFactSafe(row.specs):
+            err = "cold csg export unsafe typed type row"
+            return false
+        if row.rowKind == texpr.TypedExprColdCsgTypeObject:
+            CompilerColdCsgAppendLine(out, Fmt"cold_csg_object\t{row.typeName}\t{row.specs}")
+        else:
+            CompilerColdCsgAppendLine(out, Fmt"cold_csg_type\t{row.typeName}\t{row.specs}")
+    return true
+
+fn CompilerColdCsgAppendTypedStatementRowsForFunction(csg: var CompilerCsg,
+                                                       fnIr: texpr.TypedExprIrFunction,
+                                                       out: var str,
+                                                       emitted: var int32,
+                                                       err: var str): bool =
+    let fnIndex = CompilerColdCsgFunctionIndex(csg, fnIr.functionName)
+    if fnIndex < 0:
+        err = Fmt"cold csg export missing function index: {fnIr.functionName}"
+        return false
+    for i in 0..<csg.typedIr.coldCsgStatementRows.len:
+        let row = csg.typedIr.coldCsgStatementRows[i]
+        if CompilerColdCsgTailName(row.functionName) != CompilerColdCsgTailName(fnIr.functionName):
+            continue
+        if row.kind == "unsupported":
+            err = Fmt"cold csg export unsupported typed statement at {row.sourcePath}:{IntToStr(row.lineNumber)}: {row.payloadText}"
+            return false
+        if row.payloadText == "" || !CompilerColdCsgPayloadIsLineSafe(row.payloadText):
+            err = Fmt"cold csg export unsafe typed statement row at {row.sourcePath}:{IntToStr(row.lineNumber)}"
+            return false
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(row.lineIndent)}\t{row.payloadText}")
+        emitted = emitted + 1
+    return true
+
 fn CompilerColdCsgAppendForStmt(fnIndex: int32,
                                  stmt: texpr.TypedExprIrStatement,
                                  out: var str,
@@ -2598,6 +2644,62 @@ fn CompilerColdCsgAppendForStmt(fnIndex: int32,
     CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(stmt.lineIndent)}\tfor_range\t{iterName}\t{startExpr}\t{endExpr}\t{mode}")
     return true
 
+fn CompilerColdCsgHasLocalDeclAtLine(csg: var CompilerCsg,
+                                      fnIr: texpr.TypedExprIrFunction,
+                                      lineNumber: int32,
+                                      bindingName: str): bool =
+    if bindingName == "":
+        return false
+    let stmtEnd = fnIr.statementStart + fnIr.statementCount
+    for stmtIndex in fnIr.statementStart..<stmtEnd:
+        if stmtIndex < 0 || stmtIndex >= csg.typedIr.statements.len:
+            continue
+        let stmt = csg.typedIr.statements[stmtIndex]
+        if stmt.kind == texpr.TypedExprIrStmtLocalDecl &&
+           stmt.lineNumber == lineNumber &&
+           stmt.bindingName == bindingName:
+            return true
+    return false
+
+fn CompilerColdCsgHasNonCallStatementAtLine(csg: var CompilerCsg,
+                                             fnIr: texpr.TypedExprIrFunction,
+                                             lineNumber: int32): bool =
+    let stmtEnd = fnIr.statementStart + fnIr.statementCount
+    for stmtIndex in fnIr.statementStart..<stmtEnd:
+        if stmtIndex < 0 || stmtIndex >= csg.typedIr.statements.len:
+            continue
+        let stmt = csg.typedIr.statements[stmtIndex]
+        if stmt.lineNumber != lineNumber:
+            continue
+        if stmt.kind != texpr.TypedExprIrStmtCall:
+            return true
+    return false
+
+fn CompilerColdCsgHasColdTypeRow(csg: var CompilerCsg,
+                                  typeRaw: str): bool =
+    let typeName = chengpath.PathTrim(typeRaw)
+    if typeName == "":
+        return false
+    for i in 0..<csg.typedIr.coldCsgTypeRows.len:
+        if csg.typedIr.coldCsgTypeRows[i].typeName == typeName:
+            return true
+    return false
+
+fn CompilerColdCsgShouldEmitTypedLocal(csg: var CompilerCsg,
+                                        typeRaw: str): bool =
+    let typeText = chengpath.PathTrim(typeRaw)
+    if typeText == "" ||
+       typeText == "int32" ||
+       typeText == "int" ||
+       typeText == "str" ||
+       typeText == "cstring" ||
+       typeText == "int32[]" ||
+       typeText == "int[]":
+        return true
+    if parser.ParserStartsWith(typeText, "int32["):
+        return true
+    return CompilerColdCsgHasColdTypeRow(csg, typeText)
+
 fn CompilerColdCsgAppendStatementRow(csg: var CompilerCsg,
                                       fnIr: texpr.TypedExprIrFunction,
                                       stmt: texpr.TypedExprIrStatement,
@@ -2617,9 +2719,14 @@ fn CompilerColdCsgAppendStatementRow(csg: var CompilerCsg,
                 return true
             err = Fmt"cold csg export unsupported local decl: {fnIr.functionName}"
             return false
+        if stmt.resultType != "" && CompilerColdCsgShouldEmitTypedLocal(csg, stmt.resultType):
+            CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(stmt.lineIndent)}\tvar_t\t{stmt.bindingName}\t{stmt.resultType}\t{stmt.surfaceText}")
+            return true
         CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(stmt.lineIndent)}\tvar\t{stmt.bindingName}\t{stmt.surfaceText}")
         return true
     if stmt.kind == texpr.TypedExprIrStmtLetCall:
+        if CompilerColdCsgHasLocalDeclAtLine(csg, fnIr, stmt.lineNumber, stmt.bindingName):
+            return true
         if !CompilerColdCsgTypeSupported(stmt.resultType):
             err = Fmt"cold csg export unsupported let-call result type: {stmt.bindingName}:{stmt.resultType}"
             return false
@@ -2632,6 +2739,8 @@ fn CompilerColdCsgAppendStatementRow(csg: var CompilerCsg,
         CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(stmt.lineIndent)}\tvar\t{stmt.bindingName}\t{callExpr}")
         return true
     if stmt.kind == texpr.TypedExprIrStmtCall:
+        if CompilerColdCsgHasNonCallStatementAtLine(csg, fnIr, stmt.lineNumber):
+            return true
         if stmt.callTarget == "":
             err = Fmt"cold csg export missing call target: {fnIr.functionName}"
             return false
@@ -2674,8 +2783,218 @@ fn CompilerColdCsgAppendStatementRow(csg: var CompilerCsg,
         return true
     if stmt.kind == texpr.TypedExprIrStmtFor:
         return CompilerColdCsgAppendForStmt(fnIndex, stmt, out, err)
+    if stmt.kind == texpr.TypedExprIrStmtMatch:
+        let target = chengpath.PathTrim(stmt.surfaceText)
+        if target == "" || !CompilerColdCsgTextIsFactSafe(target):
+            err = Fmt"cold csg export unsupported match target: {fnIr.functionName}"
+            return false
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(stmt.lineIndent)}\tmatch\t{target}")
+        return true
+    if stmt.kind == texpr.TypedExprIrStmtCase:
+        let arm = chengpath.PathTrim(stmt.surfaceText)
+        var variant = arm
+        var bind: str
+        let open = parser.ParserFindText(arm, "(")
+        if open > 0:
+            if arm.len <= open + 1 || arm[arm.len - 1] != ')':
+                err = Fmt"cold csg export malformed case arm: {arm}"
+                return false
+            variant = chengpath.PathTrim(chengpath.TextSlice(arm, 0, open))
+            bind = chengpath.PathTrim(chengpath.TextSlice(arm, open + 1, arm.len - open - 2))
+        if variant == "" ||
+           !CompilerColdCsgTextIsFactSafe(variant) ||
+           !CompilerColdCsgTextIsFactSafe(bind):
+            err = Fmt"cold csg export unsupported case arm: {arm}"
+            return false
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(stmt.lineIndent)}\tcase\t{variant}\t{bind}")
+        return true
     err = Fmt"cold csg export unsupported statement kind: {texpr.TypedExprIrStatementKindText(stmt.kind)}"
     return false
+
+fn CompilerColdCsgAppendExprCaseRow(fnIndex: int32,
+                                     indent: int32,
+                                     armRaw: str,
+                                     out: var str,
+                                     err: var str): bool =
+    let arm = chengpath.PathTrim(armRaw)
+    var variant = arm
+    var bind: str
+    let open = parser.ParserFindText(arm, "(")
+    if open > 0:
+        if arm.len <= open + 1 || arm[arm.len - 1] != ')':
+            err = Fmt"cold csg export malformed case arm: {arm}"
+            return false
+        variant = chengpath.PathTrim(chengpath.TextSlice(arm, 0, open))
+        bind = chengpath.PathTrim(chengpath.TextSlice(arm, open + 1, arm.len - open - 2))
+    if variant == "" ||
+       !CompilerColdCsgTextIsFactSafe(variant) ||
+       !CompilerColdCsgTextIsFactSafe(bind):
+        err = Fmt"cold csg export unsupported case arm: {arm}"
+        return false
+    CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(indent)}\tcase\t{variant}\t{bind}")
+    return true
+
+fn CompilerColdCsgAppendExprLayerStatementRow(fnIndex: int32,
+                                               expr: parser.NormalizedExpr,
+                                               out: var str,
+                                               err: var str): bool =
+    var indent = expr.columnNumber - 1
+    if indent < 0:
+        indent = 0
+    if expr.kind == parser.NormalizedExprReturn:
+        let exprText = chengpath.PathTrim(expr.surfaceText)
+        if exprText == "" || !CompilerColdCsgTextIsFactSafe(exprText):
+            err = "cold csg export unsafe normalized return"
+            return false
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(indent)}\treturn\t{exprText}")
+        return true
+    if expr.kind == parser.NormalizedExprIfStmt:
+        let payload = chengpath.PathTrim(expr.surfaceText)
+        if payload == "" || !CompilerColdCsgTextIsFactSafe(payload):
+            err = "cold csg export unsafe normalized if"
+            return false
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(indent)}\tif\t{payload}")
+        return true
+    if expr.kind == parser.NormalizedExprElifStmt:
+        let payload = chengpath.PathTrim(expr.surfaceText)
+        if payload == "" || !CompilerColdCsgTextIsFactSafe(payload):
+            err = "cold csg export unsafe normalized elif"
+            return false
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(indent)}\telif\t{payload}")
+        return true
+    if expr.kind == parser.NormalizedExprElseStmt:
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(indent)}\telse")
+        return true
+    if expr.kind == parser.NormalizedExprForStmt:
+        let payload = chengpath.PathTrim(expr.surfaceText)
+        let inPos = parser.ParserFindText(payload, " in ")
+        if inPos <= 0:
+            err = Fmt"cold csg export unsupported normalized for: {payload}"
+            return false
+        let iterName = chengpath.PathTrim(chengpath.TextSlice(payload, 0, inPos))
+        let rangeText = chengpath.PathTrim(chengpath.TextSlice(payload,
+                                                               inPos + 4,
+                                                               payload.len - inPos - 4))
+        var startExpr: str
+        var endExpr: str
+        var inclusive = false
+        if !parser.ParserParseRangeExpr(rangeText, startExpr, endExpr, inclusive):
+            err = Fmt"cold csg export unsupported normalized range: {payload}"
+            return false
+        var mode = "lt"
+        if inclusive:
+            mode = "le"
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(indent)}\tfor_range\t{iterName}\t{startExpr}\t{endExpr}\t{mode}")
+        return true
+    if expr.kind == parser.NormalizedExprMatchStmt:
+        let target = chengpath.PathTrim(expr.surfaceText)
+        if target == "" || !CompilerColdCsgTextIsFactSafe(target):
+            err = "cold csg export unsafe normalized match"
+            return false
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(indent)}\tmatch\t{target}")
+        return true
+    if expr.kind == parser.NormalizedExprCaseStmt:
+        return CompilerColdCsgAppendExprCaseRow(fnIndex, indent, expr.surfaceText, out, err)
+    if expr.kind == parser.NormalizedExprAssign:
+        let lhs = chengpath.PathTrim(expr.surfaceText)
+        let rhs = chengpath.PathTrim(expr.callArgsText)
+        if lhs == "" || rhs == "" ||
+           !CompilerColdCsgTextIsFactSafe(lhs) ||
+           !CompilerColdCsgTextIsFactSafe(rhs):
+            err = "cold csg export unsafe normalized assign"
+            return false
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t{IntToStr(indent)}\tassign\t{lhs}\t{rhs}")
+        return true
+    return true
+
+fn CompilerColdCsgExprIsStructuredStatement(expr: parser.NormalizedExpr): bool =
+    return expr.kind == parser.NormalizedExprReturn ||
+           expr.kind == parser.NormalizedExprAssign ||
+           expr.kind == parser.NormalizedExprIfStmt ||
+           expr.kind == parser.NormalizedExprElifStmt ||
+           expr.kind == parser.NormalizedExprElseStmt ||
+           expr.kind == parser.NormalizedExprForStmt ||
+           expr.kind == parser.NormalizedExprMatchStmt ||
+           expr.kind == parser.NormalizedExprCaseStmt
+
+fn CompilerColdCsgStatementKindMatchesExpr(stmt: texpr.TypedExprIrStatement,
+                                            expr: parser.NormalizedExpr): bool =
+    if stmt.kind == texpr.TypedExprIrStmtReturn && expr.kind == parser.NormalizedExprReturn:
+        return true
+    if stmt.kind == texpr.TypedExprIrStmtAssign && expr.kind == parser.NormalizedExprAssign:
+        return true
+    if stmt.kind == texpr.TypedExprIrStmtIf && expr.kind == parser.NormalizedExprIfStmt:
+        return true
+    if stmt.kind == texpr.TypedExprIrStmtElif && expr.kind == parser.NormalizedExprElifStmt:
+        return true
+    if stmt.kind == texpr.TypedExprIrStmtElse && expr.kind == parser.NormalizedExprElseStmt:
+        return true
+    if stmt.kind == texpr.TypedExprIrStmtFor && expr.kind == parser.NormalizedExprForStmt:
+        return true
+    if stmt.kind == texpr.TypedExprIrStmtMatch && expr.kind == parser.NormalizedExprMatchStmt:
+        return true
+    if stmt.kind == texpr.TypedExprIrStmtCase && expr.kind == parser.NormalizedExprCaseStmt:
+        return true
+    return false
+
+fn CompilerColdCsgFunctionHasStatementForExpr(csg: var CompilerCsg,
+                                               fnIr: texpr.TypedExprIrFunction,
+                                               expr: parser.NormalizedExpr): bool =
+    let stmtEnd = fnIr.statementStart + fnIr.statementCount
+    for stmtIndex in fnIr.statementStart..<stmtEnd:
+        if stmtIndex < 0 || stmtIndex >= csg.typedIr.statements.len:
+            continue
+        let stmt = csg.typedIr.statements[stmtIndex]
+        if stmt.lineNumber == expr.lineNumber &&
+           CompilerColdCsgStatementKindMatchesExpr(stmt, expr):
+            return true
+    return false
+
+fn CompilerColdCsgAppendFunctionStatementRows(csg: var CompilerCsg,
+                                               fnIr: texpr.TypedExprIrFunction,
+                                               out: var str,
+                                               emitted: var int32,
+                                               err: var str): bool =
+    let fnIndex = CompilerColdCsgFunctionIndex(csg, fnIr.functionName)
+    if fnIndex < 0:
+        err = Fmt"cold csg export missing function index: {fnIr.functionName}"
+        return false
+    let firstLine = fnIr.signatureLineNumber + 1
+    let lastLine = fnIr.endLineNumber
+    if firstLine > lastLine:
+        return true
+    for lineNumber in firstLine..lastLine:
+        let stmtEnd = fnIr.statementStart + fnIr.statementCount
+        for stmtIndex in fnIr.statementStart..<stmtEnd:
+            if stmtIndex < 0 || stmtIndex >= csg.typedIr.statements.len:
+                continue
+            let stmt = csg.typedIr.statements[stmtIndex]
+            if stmt.lineNumber != lineNumber:
+                continue
+            if !CompilerColdCsgAppendStatementRow(csg, fnIr, stmt, out, err):
+                return false
+            emitted = emitted + 1
+        for exprIndex in 0..<csg.exprLayer.exprs.len:
+            let expr = csg.exprLayer.exprs[exprIndex]
+            if expr.lineNumber != lineNumber:
+                continue
+            if parser.ParserNormalizePath(expr.sourcePath) != parser.ParserNormalizePath(fnIr.sourcePath):
+                continue
+            if !CompilerColdCsgExprIsStructuredStatement(expr):
+                continue
+            if CompilerColdCsgFunctionHasStatementForExpr(csg, fnIr, expr):
+                continue
+            if !CompilerColdCsgAppendExprLayerStatementRow(fnIndex, expr, out, err):
+                return false
+            emitted = emitted + 1
+    if emitted <= 0:
+        let returnExpr = chengpath.PathTrim(fnIr.returnExpr)
+        if returnExpr == "" || !CompilerColdCsgTextIsFactSafe(returnExpr):
+            err = Fmt"cold csg export function has no statements: {fnIr.functionName}"
+            return false
+        CompilerColdCsgAppendLine(out, Fmt"cold_csg_stmt\t{IntToStr(fnIndex)}\t4\treturn\t{returnExpr}")
+        emitted = emitted + 1
+    return true
 
 fn CompilerColdCsgAppendTypeRowsFromSource(source: str,
                                              out: var str): bool =
@@ -3300,21 +3619,33 @@ fn CompilerColdCsgFactsFromCompilerCsgInto(csg: var CompilerCsg,
         return false
     CompilerColdCsgAppendLine(out, "cold_csg_version=1")
     CompilerColdCsgAppendLine(out, Fmt"cold_csg_entry={entrySymbol}")
+    if !CompilerColdCsgAppendTypedTypeRows(csg, out, err):
+        return false
     if !CompilerColdCsgAppendFunctionRows(csg, out, err):
         return false
+    if csg.typedIr.coldCsgStatementRows.len > 0:
+        for fnIndex in 0..<csg.typedIr.functions.len:
+            let fnIr = csg.typedIr.functions[fnIndex]
+            var emitted = 0
+            if !CompilerColdCsgAppendTypedStatementRowsForFunction(csg,
+                                                                   fnIr,
+                                                                   out,
+                                                                   emitted,
+                                                                   err):
+                return false
+            if emitted <= 0:
+                err = Fmt"cold csg export function has no typed cold statements: {fnIr.functionName}"
+                return false
+        return true
     for fnIndex in 0..<csg.typedIr.functions.len:
         let fnIr = csg.typedIr.functions[fnIndex]
-        if fnIr.statementCount <= 0:
-            err = Fmt"cold csg export function has no statements: {fnIr.functionName}"
+        var emitted = 0
+        if !CompilerColdCsgAppendFunctionStatementRows(csg,
+                                                       fnIr,
+                                                       out,
+                                                       emitted,
+                                                       err):
             return false
-        let stmtEnd = fnIr.statementStart + fnIr.statementCount
-        for stmtIndex in fnIr.statementStart..<stmtEnd:
-            if stmtIndex < 0 || stmtIndex >= csg.typedIr.statements.len:
-                err = Fmt"cold csg export statement index out of range: {fnIr.functionName}"
-                return false
-            let stmt = csg.typedIr.statements[stmtIndex]
-            if !CompilerColdCsgAppendStatementRow(csg, fnIr, stmt, out, err):
-                return false
     return true
 
 fn CompilerColdCsgFactsFromCompilerCsgIntoWithSource(csg: var CompilerCsg,
@@ -3369,6 +3700,8 @@ fn CompilerCsgReport(csg: CompilerCsg): str =
     out = strutil.Join([out, "expr_surface_elif_stmt_count=", IntToStr(exprCounts.elifStmtCount), "\n"], "")
     out = strutil.Join([out, "expr_surface_else_stmt_count=", IntToStr(exprCounts.elseStmtCount), "\n"], "")
     out = strutil.Join([out, "expr_surface_for_stmt_count=", IntToStr(exprCounts.forStmtCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_match_stmt_count=", IntToStr(exprCounts.matchStmtCount), "\n"], "")
+    out = strutil.Join([out, "expr_surface_case_stmt_count=", IntToStr(exprCounts.caseStmtCount), "\n"], "")
     out = strutil.Join([out, "expr_surface_question_residual_count=", IntToStr(csg.exprLayer.questionResidualCount), "\n"], "")
     out = strutil.Join([out, texpr.TypedExprReportText(typedExprFacts, loweringRules)], "")
     out = strutil.Join([out, CompilerCsgEgraphActiveContractReport(), "\n"], "")

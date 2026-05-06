@@ -6130,6 +6130,432 @@ fn driver_c_create_dir_all_bridge_export(path: str) =
 fn driver_c_write_text_file_bridge_export(path: str, content: str) =
     cheng_write_text_file(path, content)
 
+fn driver_c_cold_csg_append_str(out: var str, part: str) =
+    cheng_runtime_concat_assign(out, part)
+
+fn driver_c_cold_csg_append_cstr(out: var str, raw: ptr) =
+    var text = cheng_str_copy_cstring(raw)
+    cheng_runtime_concat_assign(out, text)
+    cheng_str_dispose(text)
+
+fn driver_c_cold_csg_append_i32(out: var str, value: int32) =
+    let raw = driver_c_i32_to_str_export(value)
+    if raw == nil:
+        return
+    cheng_runtime_concat_assign_cstring(out, raw)
+    cheng_free_export(raw)
+
+fn driver_c_cold_csg_append_range(out: var str,
+                                   text: str,
+                                   start: int32,
+                                   endIndex: int32) =
+    if endIndex <= start:
+        return
+    var part = driver_c_str_slice_bridge_export(text, start, endIndex - start)
+    cheng_runtime_concat_assign(out, part)
+    cheng_str_dispose(part)
+
+fn driver_c_cold_csg_append_line(out: var str) =
+    if cheng_str_len(out) > 0:
+        cheng_runtime_concat_assign_cstring(out, "\n")
+
+fn driver_c_cold_csg_byte(text: str, idx: int32): int32 =
+    if idx < 0 || idx >= cheng_str_len(text):
+        return 0
+    let data = cheng_str_data(text)
+    if data == nil:
+        return 0
+    return int32(*(UInt8Ptr(cheng_ptr_plus(data, idx))))
+
+fn driver_c_cold_csg_is_space(ch: int32): bool =
+    return ch == int32(' ') || ch == int32('\t') || ch == int32('\r') || ch == int32('\n')
+
+fn driver_c_cold_csg_trim_start(text: str, start: int32, endIndex: int32): int32 =
+    var i = start
+    while i < endIndex && driver_c_cold_csg_is_space(driver_c_cold_csg_byte(text, i)):
+        i = i + 1
+    return i
+
+fn driver_c_cold_csg_trim_end(text: str, start: int32, endIndex: int32): int32 =
+    var i = endIndex
+    while i > start && driver_c_cold_csg_is_space(driver_c_cold_csg_byte(text, i - 1)):
+        i = i - 1
+    return i
+
+fn driver_c_cold_csg_line_indent(text: str, start: int32, endIndex: int32): int32 =
+    var out: int32
+    var i = start
+    while i < endIndex:
+        let ch = driver_c_cold_csg_byte(text, i)
+        if ch == int32(' '):
+            out = out + 1
+        elif ch == int32('\t'):
+            out = out + 4
+        else:
+            break
+        i = i + 1
+    return out
+
+fn driver_c_cold_csg_cstr_len(raw: ptr): int32 =
+    if raw == nil:
+        return 0
+    return cheng_cstrlen_raw(raw)
+
+fn driver_c_cold_csg_range_eq_cstr(text: str,
+                                    start: int32,
+                                    endIndex: int32,
+                                    raw: ptr): bool =
+    let rawLen = driver_c_cold_csg_cstr_len(raw)
+    if endIndex - start != rawLen:
+        return false
+    for i in 0..<rawLen:
+        if driver_c_cold_csg_byte(text, start + i) != int32(*(UInt8Ptr(cheng_ptr_plus(raw, i)))):
+            return false
+    return true
+
+fn driver_c_cold_csg_starts_with_cstr(text: str,
+                                       start: int32,
+                                       endIndex: int32,
+                                       raw: ptr): bool =
+    let rawLen = driver_c_cold_csg_cstr_len(raw)
+    if endIndex - start < rawLen:
+        return false
+    for i in 0..<rawLen:
+        if driver_c_cold_csg_byte(text, start + i) != int32(*(UInt8Ptr(cheng_ptr_plus(raw, i)))):
+            return false
+    return true
+
+fn driver_c_cold_csg_find_char(text: str,
+                                start: int32,
+                                endIndex: int32,
+                                ch: int32): int32 =
+    for i in start..<endIndex:
+        if driver_c_cold_csg_byte(text, i) == ch:
+            return i
+    return -1
+
+fn driver_c_cold_csg_find_assign_eq(text: str,
+                                     start: int32,
+                                     endIndex: int32): int32 =
+    for i in start..<endIndex:
+        if driver_c_cold_csg_byte(text, i) != int32('='):
+            continue
+        if i + 1 < endIndex && driver_c_cold_csg_byte(text, i + 1) == int32('='):
+            continue
+        if i > start:
+            let prev = driver_c_cold_csg_byte(text, i - 1)
+            if prev == int32('!') || prev == int32('<') || prev == int32('>'):
+                continue
+        return i
+    return -1
+
+fn driver_c_cold_csg_ident_end(text: str, start: int32, endIndex: int32): int32 =
+    var i = start
+    while i < endIndex:
+        let ch = driver_c_cold_csg_byte(text, i)
+        if (ch >= int32('A') && ch <= int32('Z')) ||
+           (ch >= int32('a') && ch <= int32('z')) ||
+           (ch >= int32('0') && ch <= int32('9')) ||
+           ch == int32('_'):
+            i = i + 1
+        else:
+            break
+    return i
+
+fn driver_c_cold_csg_strip_trailing_colon(text: str,
+                                           start: int32,
+                                           endIndex: int32): int32 =
+    var out = driver_c_cold_csg_trim_end(text, start, endIndex)
+    if out > start && driver_c_cold_csg_byte(text, out - 1) == int32(':'):
+        out = driver_c_cold_csg_trim_end(text, start, out - 1)
+    return out
+
+fn driver_c_cold_csg_append_type_spec(out: var str,
+                                       source: str,
+                                       typeStartRaw: int32,
+                                       typeEndRaw: int32) =
+    let typeStart = driver_c_cold_csg_trim_start(source, typeStartRaw, typeEndRaw)
+    let typeEnd = driver_c_cold_csg_trim_end(source, typeStart, typeEndRaw)
+    if driver_c_cold_csg_range_eq_cstr(source, typeStart, typeEnd, "int32") ||
+       driver_c_cold_csg_range_eq_cstr(source, typeStart, typeEnd, "int"):
+        cheng_runtime_concat_assign_cstring(out, "i")
+        return
+    if driver_c_cold_csg_range_eq_cstr(source, typeStart, typeEnd, "str") ||
+       driver_c_cold_csg_range_eq_cstr(source, typeStart, typeEnd, "cstring"):
+        cheng_runtime_concat_assign_cstring(out, "s")
+        return
+    driver_c_cold_csg_append_range(out, source, typeStart, typeEnd)
+
+fn driver_c_cold_csg_append_params(out: var str,
+                                    source: str,
+                                    paramsStart: int32,
+                                    paramsEnd: int32) =
+    var segmentStart = paramsStart
+    var emitted: int32
+    var i = paramsStart
+    while i <= paramsEnd:
+        if i < paramsEnd && driver_c_cold_csg_byte(source, i) != int32(','):
+            i = i + 1
+            continue
+        let segStart = driver_c_cold_csg_trim_start(source, segmentStart, i)
+        let segEnd = driver_c_cold_csg_trim_end(source, segStart, i)
+        if segEnd > segStart:
+            let colon = driver_c_cold_csg_find_char(source, segStart, segEnd, int32(':'))
+            if colon > segStart:
+                if emitted > 0:
+                    cheng_runtime_concat_assign_cstring(out, ",")
+                driver_c_cold_csg_append_range(out,
+                                               source,
+                                               segStart,
+                                               driver_c_cold_csg_trim_end(source, segStart, colon))
+                cheng_runtime_concat_assign_cstring(out, ":")
+                driver_c_cold_csg_append_type_spec(out, source, colon + 1, segEnd)
+                emitted = emitted + 1
+        segmentStart = i + 1
+        i = i + 1
+
+fn driver_c_cold_csg_append_function_row(out: var str,
+                                          source: str,
+                                          lineStart: int32,
+                                          lineEndRaw: int32,
+                                          fnIndex: int32): bool =
+    let lineStartTrim = driver_c_cold_csg_trim_start(source, lineStart, lineEndRaw)
+    let lineEnd = driver_c_cold_csg_trim_end(source, lineStartTrim, lineEndRaw)
+    if !driver_c_cold_csg_starts_with_cstr(source, lineStartTrim, lineEnd, "fn "):
+        return false
+    let nameStart = driver_c_cold_csg_trim_start(source, lineStartTrim + 3, lineEnd)
+    let nameEnd = driver_c_cold_csg_ident_end(source, nameStart, lineEnd)
+    if nameEnd <= nameStart:
+        return false
+    let open = driver_c_cold_csg_find_char(source, nameEnd, lineEnd, int32('('))
+    if open < 0:
+        return false
+    let close = driver_c_cold_csg_find_char(source, open + 1, lineEnd, int32(')'))
+    if close < 0:
+        return false
+    driver_c_cold_csg_append_line(out)
+    cheng_runtime_concat_assign_cstring(out, "cold_csg_function\t")
+    driver_c_cold_csg_append_i32(out, fnIndex)
+    cheng_runtime_concat_assign_cstring(out, "\t")
+    driver_c_cold_csg_append_range(out, source, nameStart, nameEnd)
+    cheng_runtime_concat_assign_cstring(out, "\t")
+    driver_c_cold_csg_append_params(out, source, open + 1, close)
+    cheng_runtime_concat_assign_cstring(out, "\t")
+    let colon = driver_c_cold_csg_find_char(source, close + 1, lineEnd, int32(':'))
+    var returnStart = -1
+    var returnEnd = -1
+    if colon >= 0:
+        let eq = driver_c_cold_csg_find_assign_eq(source, colon + 1, lineEnd)
+        returnStart = colon + 1
+        returnEnd = eq >= 0 ? eq : lineEnd
+    if returnStart >= 0:
+        let retStart = driver_c_cold_csg_trim_start(source, returnStart, returnEnd)
+        let retEnd = driver_c_cold_csg_trim_end(source, retStart, returnEnd)
+        if retEnd > retStart:
+            driver_c_cold_csg_append_range(out, source, retStart, retEnd)
+        else:
+            cheng_runtime_concat_assign_cstring(out, "int32")
+    else:
+        cheng_runtime_concat_assign_cstring(out, "int32")
+    return true
+
+fn driver_c_cold_csg_append_stmt_prefix(out: var str,
+                                         fnIndex: int32,
+                                         indent: int32) =
+    driver_c_cold_csg_append_line(out)
+    cheng_runtime_concat_assign_cstring(out, "cold_csg_stmt\t")
+    driver_c_cold_csg_append_i32(out, fnIndex)
+    cheng_runtime_concat_assign_cstring(out, "\t")
+    driver_c_cold_csg_append_i32(out, indent)
+    cheng_runtime_concat_assign_cstring(out, "\t")
+
+fn driver_c_cold_csg_append_control_stmt(out: var str,
+                                          source: str,
+                                          fnIndex: int32,
+                                          indent: int32,
+                                          start: int32,
+                                          endIndex: int32,
+                                          keyword: ptr,
+                                          keywordLen: int32) =
+    driver_c_cold_csg_append_stmt_prefix(out, fnIndex, indent)
+    cheng_runtime_concat_assign_cstring(out, keyword)
+    cheng_runtime_concat_assign_cstring(out, "\t")
+    let payloadStart = driver_c_cold_csg_trim_start(source, start + keywordLen, endIndex)
+    let payloadEnd = driver_c_cold_csg_strip_trailing_colon(source, payloadStart, endIndex)
+    driver_c_cold_csg_append_range(out, source, payloadStart, payloadEnd)
+
+fn driver_c_cold_csg_append_binding_stmt(out: var str,
+                                          source: str,
+                                          fnIndex: int32,
+                                          indent: int32,
+                                          restStartRaw: int32,
+                                          restEnd: int32): bool =
+    let restStart = driver_c_cold_csg_trim_start(source, restStartRaw, restEnd)
+    let eq = driver_c_cold_csg_find_assign_eq(source, restStart, restEnd)
+    if eq <= restStart:
+        let colon = driver_c_cold_csg_find_char(source, restStart, restEnd, int32(':'))
+        if colon <= restStart:
+            return false
+        driver_c_cold_csg_append_stmt_prefix(out, fnIndex, indent)
+        cheng_runtime_concat_assign_cstring(out, "default\t")
+        driver_c_cold_csg_append_range(out,
+                                       source,
+                                       restStart,
+                                       driver_c_cold_csg_ident_end(source, restStart, colon))
+        cheng_runtime_concat_assign_cstring(out, "\t")
+        driver_c_cold_csg_append_range(out,
+                                       source,
+                                       driver_c_cold_csg_trim_start(source, colon + 1, restEnd),
+                                       driver_c_cold_csg_trim_end(source, colon + 1, restEnd))
+        return true
+    let headStart = restStart
+    let headEnd = driver_c_cold_csg_trim_end(source, headStart, eq)
+    let nameEnd = driver_c_cold_csg_ident_end(source, headStart, headEnd)
+    if nameEnd <= headStart:
+        return false
+    let colon = driver_c_cold_csg_find_char(source, headStart, headEnd, int32(':'))
+    var exprStart = driver_c_cold_csg_trim_start(source, eq + 1, restEnd)
+    var exprEnd = driver_c_cold_csg_trim_end(source, exprStart, restEnd)
+    var kindRaw: ptr = "var"
+    var question = false
+    if exprEnd > exprStart && driver_c_cold_csg_byte(source, exprEnd - 1) == int32('?'):
+        exprEnd = driver_c_cold_csg_trim_end(source, exprStart, exprEnd - 1)
+        kindRaw = "let_q"
+        question = true
+    if colon > headStart:
+        if question:
+            kindRaw = "let_q_t"
+        else:
+            kindRaw = "var_t"
+    driver_c_cold_csg_append_stmt_prefix(out, fnIndex, indent)
+    cheng_runtime_concat_assign_cstring(out, kindRaw)
+    cheng_runtime_concat_assign_cstring(out, "\t")
+    driver_c_cold_csg_append_range(out, source, headStart, nameEnd)
+    cheng_runtime_concat_assign_cstring(out, "\t")
+    if colon > headStart:
+        driver_c_cold_csg_append_range(out,
+                                       source,
+                                       driver_c_cold_csg_trim_start(source, colon + 1, headEnd),
+                                       driver_c_cold_csg_trim_end(source, colon + 1, headEnd))
+        cheng_runtime_concat_assign_cstring(out, "\t")
+    driver_c_cold_csg_append_range(out, source, exprStart, exprEnd)
+    return true
+
+fn driver_c_cold_csg_append_source_stmt(out: var str,
+                                         source: str,
+                                         fnIndex: int32,
+                                         lineStart: int32,
+                                         lineEndRaw: int32): bool =
+    var trimStart = driver_c_cold_csg_trim_start(source, lineStart, lineEndRaw)
+    var trimEnd = driver_c_cold_csg_trim_end(source, trimStart, lineEndRaw)
+    if trimEnd <= trimStart:
+        return true
+    if driver_c_cold_csg_byte(source, trimStart) == 35:
+        return true
+    if driver_c_cold_csg_starts_with_cstr(source, trimStart, trimEnd, "//"):
+        return true
+    var indent = driver_c_cold_csg_line_indent(source, lineStart, lineEndRaw)
+    if driver_c_cold_csg_starts_with_cstr(source, trimStart, trimEnd, "return "):
+        driver_c_cold_csg_append_stmt_prefix(out, fnIndex, indent)
+        cheng_runtime_concat_assign_cstring(out, "return\t")
+        driver_c_cold_csg_append_range(out,
+                                       source,
+                                       driver_c_cold_csg_trim_start(source, trimStart + 7, trimEnd),
+                                       trimEnd)
+        return true
+    if driver_c_cold_csg_starts_with_cstr(source, trimStart, trimEnd, "if "):
+        driver_c_cold_csg_append_control_stmt(out, source, fnIndex, indent, trimStart, trimEnd, "if", 2)
+        return true
+    if driver_c_cold_csg_starts_with_cstr(source, trimStart, trimEnd, "elif "):
+        driver_c_cold_csg_append_control_stmt(out, source, fnIndex, indent, trimStart, trimEnd, "elif", 4)
+        return true
+    if driver_c_cold_csg_range_eq_cstr(source,
+                                       trimStart,
+                                       driver_c_cold_csg_strip_trailing_colon(source, trimStart, trimEnd),
+                                       "else"):
+        driver_c_cold_csg_append_stmt_prefix(out, fnIndex, indent)
+        cheng_runtime_concat_assign_cstring(out, "else")
+        return true
+    if driver_c_cold_csg_starts_with_cstr(source, trimStart, trimEnd, "let "):
+        return driver_c_cold_csg_append_binding_stmt(out, source, fnIndex, indent, trimStart + 4, trimEnd)
+    if driver_c_cold_csg_starts_with_cstr(source, trimStart, trimEnd, "var "):
+        return driver_c_cold_csg_append_binding_stmt(out, source, fnIndex, indent, trimStart + 4, trimEnd)
+    if driver_c_cold_csg_starts_with_cstr(source, trimStart, trimEnd, "const "):
+        return driver_c_cold_csg_append_binding_stmt(out, source, fnIndex, indent, trimStart + 6, trimEnd)
+    var eq = driver_c_cold_csg_find_assign_eq(source, trimStart, trimEnd)
+    if eq > trimStart:
+        driver_c_cold_csg_append_stmt_prefix(out, fnIndex, indent)
+        cheng_runtime_concat_assign_cstring(out, "assign\t")
+        driver_c_cold_csg_append_range(out,
+                                       source,
+                                       trimStart,
+                                       driver_c_cold_csg_trim_end(source, trimStart, eq))
+        cheng_runtime_concat_assign_cstring(out, "\t")
+        driver_c_cold_csg_append_range(out,
+                                       source,
+                                       driver_c_cold_csg_trim_start(source, eq + 1, trimEnd),
+                                       trimEnd)
+        return true
+    var open = driver_c_cold_csg_find_char(source, trimStart, trimEnd, 40)
+    if open > trimStart && trimEnd > open + 1 && driver_c_cold_csg_byte(source, trimEnd - 1) == 41:
+        driver_c_cold_csg_append_stmt_prefix(out, fnIndex, indent)
+        cheng_runtime_concat_assign_cstring(out, "call\t")
+        driver_c_cold_csg_append_range(out,
+                                       source,
+                                       trimStart,
+                                       driver_c_cold_csg_trim_end(source, trimStart, open))
+        cheng_runtime_concat_assign_cstring(out, "\t")
+        driver_c_cold_csg_append_range(out, source, open + 1, trimEnd - 1)
+        return true
+    return false
+
+@exportc("driver_c_write_cold_csg_source_bridge")
+fn driver_c_write_cold_csg_source_bridge_export(sourcePath: str,
+                                                 entrySymbol: str,
+                                                 outputPath: str): int32 =
+    var source = cheng_read_text_file(sourcePath)
+    if cheng_str_len(source) <= 0:
+        cheng_str_dispose(source)
+        return 0
+    var out = cheng_str_copy_cstring("cold_csg_version=1\ncold_csg_entry=")
+    if cheng_str_len(entrySymbol) > 0:
+        driver_c_cold_csg_append_str(out, entrySymbol)
+    else:
+        cheng_runtime_concat_assign_cstring(out, "main")
+    var lineStart: int32
+    var functionIndex: int32
+    var currentFunction = -1
+    let n = cheng_str_len(source)
+    var i: int32
+    while i <= n:
+        if i < n && driver_c_cold_csg_byte(source, i) != int32('\n'):
+            i = i + 1
+            continue
+        let lineEnd = i
+        let trimStart = driver_c_cold_csg_trim_start(source, lineStart, lineEnd)
+        let trimEnd = driver_c_cold_csg_trim_end(source, trimStart, lineEnd)
+        if trimEnd > trimStart:
+            let indent = driver_c_cold_csg_line_indent(source, lineStart, lineEnd)
+            if indent == 0 && driver_c_cold_csg_starts_with_cstr(source, trimStart, trimEnd, "fn "):
+                if driver_c_cold_csg_append_function_row(out, source, lineStart, lineEnd, functionIndex):
+                    currentFunction = functionIndex
+                    functionIndex = functionIndex + 1
+                else:
+                    cheng_str_dispose(source)
+                    cheng_str_dispose(out)
+                    return 0
+            elif currentFunction >= 0 && indent > 0:
+                if !driver_c_cold_csg_append_source_stmt(out, source, currentFunction, lineStart, lineEnd):
+                    cheng_str_dispose(source)
+                    cheng_str_dispose(out)
+                    return 0
+        lineStart = i + 1
+        i = i + 1
+    let ok = cheng_write_text_file(outputPath, out)
+    cheng_str_dispose(source)
+    cheng_str_dispose(out)
+    return ok ? 1 : 0
+
 @exportc("driver_c_write_error_report_bridge")
 fn driver_c_write_error_report_bridge_export(rootDir: str,
                                               reportPath: str,

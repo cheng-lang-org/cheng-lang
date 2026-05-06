@@ -1,7 +1,24 @@
-# Findings (2026-05-05)
+# Findings (2026-05-06)
+
+## Cold compiler source-direct capability gaps (2026-05-06)
+- source-direct parser 不支持的语法：`type X = object` 声明、`&` `*` `>>` 操作符、`var` 参数、对象字段赋值、`add` 内置函数、`str == str` 比较
+- CSG 路径已支持这些能力（通过 `cold_emit_csg_type_rows` / `cold_csg_object` / `cold_csg_statement_row` 等）
+- 冷编译器不需要支持 Cheng 全部语法，只需支持真实编译器源码实际用到的子集
+
+## Cold compiler source-direct parser fixes (2026-05-06)
+- 新增 `object` 类型声明支持：`parse_type` 中检测 RHS 为 `object` 时解析缩进字段行，创建 `ObjectDef`，新增 `object_finalize_fields` 计算 slot layout
+- 新增 `*` `>>` `&` 操作符：新增 `BODY_OP_I32_MUL=20` `BODY_OP_I32_ASR=21` `BODY_OP_I32_AND=22` 三个 BodyIR opcode，ARM64 编码 `a64_mul_reg` `a64_asr_reg` `a64_and_reg`
+- 新增 `>>` tokenizer 支持（双字符 token 识别）
+- `&` 和 `*` 已验证通过 source-direct 路径；`>>` 有 tokenizer 冲突待修
+
+## Cold compiler remaining gaps
+- 非 int32 泛型参数（`Result[ObjectType, ADTType]`）不工作：`cold_validate_call_args` 中 variant field size 用默认 64 而非实际 type table 值
+- `var` 参数不支持：`parse_param_specs` 不识别 `var` 关键字
+- `add` 内置函数在 CSG 路径识别为 "unknown function call"
+- source-direct object constructor 对 `int32[N]` 字段有数组长度解析 bug
 
 ## Architecture
-- Cold compiler (`cheng_cold.c` 310loc C) + full compiler (`src/` Cheng) coexistence model validated.
+- Cold compiler (`cheng_cold.c` ~8000loc C) + full compiler (`src/` Cheng) coexistence model validated.
 - `bootstrap-bridge` path works (stage3→stage2). C seed cold-start has known limits (thread/memRetain/atomic).
 - Mach-O direct write: 12 load commands in `macho_direct.h` (280loc). Codesign page alignment is the remaining gap.
 
@@ -36,7 +53,7 @@
 - 生成 facts 后再 `--csg-in` 能稳定复现同一退出值，说明事实格式和 lowerer 已形成可回归合同。
 
 ## Gate
-- `cold_csg_facts_exporter_smoke` 不能进入默认 host smoke：旧 backend artifact 还不能稳定编译这个 heavy exporter driver。保留 targeted 文件，等 backend driver 刷新后再纳入默认 gate。
+- `cold_csg_facts_exporter_smoke` 这种重型 exporter driver 不进入默认 host smoke；当前默认口径是轻量 `cold_csg_sidecar_smoke`，直接验证 backend exporter、cold facts path 和最终可执行退出码。
 
 ## Cold ADT/match
 - ADT/match 的直接源码 parser 已存在，真正缺口是 facts 合同：没有 type/match/case row 时，`--csg-out -> --csg-in` 无法证明冷路径支持代数类型。
@@ -93,3 +110,20 @@
 - tuple 在 cold bootstrap subset 里可以先降为 object layout：无 tag、字段从 offset 0 开始，constructor/field load/composite ABI 复用同一套机制。
 - typed default init 不能靠 expression parser 猜；source->CSG 需要显式 `default` statement row，lowerer 再按 type table 分配 slot 并清零。
 - 当前 default init 已覆盖 `int32`、`str/cstring`、ADT、object/tuple、`int32[N]`；动态序列 `T[]` 还没有 slot layout，必须作为下一层结构化能力补齐。
+
+## Cold dynamic sequence local
+- `int32[N]` 是固定长度数组，不是容量提示；动态序列必须用 `int32[]`，两者 slot layout 和 ABI 不能混用。
+- 局部 `int32[]` 可以用栈内 backing buffer 证明 `len/cap/buffer` header、`.len` 和常量下标；但返回值、object 字段、ADT payload 不能指向当前函数栈，必须先有逃逸/堆分配语义再开放。
+- typed binding facts 是动态序列的硬前提；`var xs [..]` 没有类型上下文时空 `[]` 无法严格 lower。
+- `parser_take` 失败会消费 token；默认初始化判断必须用 `parser_peek`，否则 `let x: Type` 会吞掉下一行语句头。
+
+## Backend importc self-compile
+- provider object 不能靠源码文本二次扫描恢复 `@importc`；`TypedExprBuildIrWithFactsAndExprLayer` 会清空 `sourceTexts.text`，lowering 后扫文本会得到空表。正确做法是 Typed IR 持有结构化 importc target symbol。
+- `void` importc 也必须进入 importc symbol table；只记录有返回类型的 importc 会漏掉 `c_free/raw_libc_free/raw_libc_exit/native_cheng_register_line_map_from_argv0_runtime` 这类关键 runtime bridge。
+- BodyIR call sequence 对 importc 应保存真实 C 符号；reachability drift 检查也必须按真实 C 符号比较，不能拿 Cheng 本地声明名比较。
+- `run-host-smokes cold_csg_sidecar_smoke` 已进入当前 `dispatch_min` 命令面；它只承诺这一条 cold sidecar gate，缺失或未知 smoke 必须 hard-fail，不能用空 runner 或通用占位 runner 冒充 host smoke 通过。
+
+## Backend cold facts ADT/match
+- `ParserReadNormalizedExprLayer...` 不是 backend driver 主线；`CompilerCsgExprLayerForProfile` 才是 `compiler_csg` 当前热路径。新增语法能力必须接到 profile path，否则 facts 导出会只看到 return/assign，漏掉 match/case。
+- `=>` 不能被 assignment parser 当成 `=`；否则 `Some(value) =>` 会污染 assign statement，后续 exporter 会报 variant constructor 类型错误。
+- ADT/match 的默认 gate 不能只检查 facts 文本；必须继续跑 `cheng_cold --csg-in` 和最终可执行退出码，才能证明 `cold_csg_type/match/case -> BodyIR switch -> Mach-O` 全链路真实可用。

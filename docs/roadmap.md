@@ -38,7 +38,7 @@
 
 - **代数类型 + 模式匹配**：语法已写入 `docs/cheng-formal-spec.md` §1.2。
   - `type Option[T] = Some(value: T) | None`——tagged union，`|` 分隔 variant。
-  - `match expr: Variant(x): suite Variant2: suite`——编译为 tag compare + CBNZ/TBNZ 跳转链（≤4 variant）或 PC-relative 跳转表（5+ variant）。
+  - `match expr: Variant(x) => suite Variant2 => suite`——编译为 tag compare + CBNZ/TBNZ 跳转链（≤4 variant）或 PC-relative 跳转表（5+ variant）。
   - 冷编译器原型 `bootstrap/cheng_cold.c` 已包含 SoA BodyIR 层面的 `OP_TAG`/`OP_PAYLOAD`/`TM_SWITCH` 支持。
   - 完整编译器（`src/`）待实现：typed_expr 层的代数类型 layout、lowering 的 match→CBR 转换、ARM64 的 SWITCH term 回填。
 

@@ -130,6 +130,12 @@ type
         TypedExprIrStmtElif
         TypedExprIrStmtElse
         TypedExprIrStmtFor
+        TypedExprIrStmtMatch
+        TypedExprIrStmtCase
+
+    TypedExprColdCsgTypeRowKind = enum
+        TypedExprColdCsgTypeAdt
+        TypedExprColdCsgTypeObject
 
     TypedExprArgPassKind = enum
         TypedExprArgPassValue
@@ -341,16 +347,33 @@ type
         nodeCount: int32
         returnNodeIndex: int32
 
+    TypedExprColdCsgTypeRow =
+        sourcePath: str
+        rowKind: TypedExprColdCsgTypeRowKind
+        typeName: str
+        specs: str
+
+    TypedExprColdCsgStatementRow =
+        sourcePath: str
+        functionName: str
+        lineNumber: int32
+        lineIndent: int32
+        kind: str
+        payloadText: str
+
     TypedExprIr =
         functions: TypedExprIrFunction[]
         statements: TypedExprIrStatement[]
         nodes: TypedExprIrNode[]
+        coldCsgTypeRows: TypedExprColdCsgTypeRow[]
+        coldCsgStatementRows: TypedExprColdCsgStatementRow[]
         globalSourcePaths: str[]
         globalNames: str[]
         globalTypes: str[]
         importcSourcePaths: str[]
         importcNames: str[]
         importcReturnTypes: str[]
+        importcTargetSymbols: str[]
         typeLayoutSourcePaths: str[]
         typeLayoutNames: str[]
         typeLayoutSizeBytes: int32[]
@@ -428,6 +451,8 @@ type
         importedModules: TypedExprImportedModule[]
         declaredTypes: str[]
         typeFields: TypedExprTypeFieldDecl[]
+        coldCsgTypeRows: TypedExprColdCsgTypeRow[]
+        coldCsgStatementRows: TypedExprColdCsgStatementRow[]
         enumValueNames: str[]
         enumValueTypes: str[]
         enumValueOrdinals: int32[]
@@ -896,7 +921,16 @@ fn TypedExprIrStatementKindText(kind: TypedExprIrStatementKind): str =
         return "else"
     if kind == TypedExprIrStmtFor:
         return "for"
+    if kind == TypedExprIrStmtMatch:
+        return "match"
+    if kind == TypedExprIrStmtCase:
+        return "case"
     return "unsupported"
+
+fn TypedExprColdCsgTypeRowKindText(kind: TypedExprColdCsgTypeRowKind): str =
+    if kind == TypedExprColdCsgTypeObject:
+        return "object"
+    return "adt"
 
 fn TypedExprReturnOpKindFromIrOp(kind: TypedExprIrOpKind): TypedExprReturnOpKind =
     if kind == TypedExprIrOpI32Add:
@@ -1004,6 +1038,24 @@ fn TypedExprIrFunctionClone(fnIr: TypedExprIrFunction): TypedExprIrFunction =
     out.returnNodeIndex = fnIr.returnNodeIndex
     return out
 
+fn TypedExprColdCsgTypeRowClone(row: TypedExprColdCsgTypeRow): TypedExprColdCsgTypeRow =
+    var out: TypedExprColdCsgTypeRow
+    out.sourcePath = row.sourcePath
+    out.rowKind = row.rowKind
+    out.typeName = row.typeName
+    out.specs = row.specs
+    return out
+
+fn TypedExprColdCsgStatementRowClone(row: TypedExprColdCsgStatementRow): TypedExprColdCsgStatementRow =
+    var out: TypedExprColdCsgStatementRow
+    out.sourcePath = row.sourcePath
+    out.functionName = row.functionName
+    out.lineNumber = row.lineNumber
+    out.lineIndent = row.lineIndent
+    out.kind = row.kind
+    out.payloadText = row.payloadText
+    return out
+
 fn TypedExprIrClone(ir: var TypedExprIr): TypedExprIr =
     var out: TypedExprIr
     for i in 0..<ir.functions.len:
@@ -1012,6 +1064,10 @@ fn TypedExprIrClone(ir: var TypedExprIr): TypedExprIr =
         add(out.statements, TypedExprIrStatementClone(ir.statements[i]))
     for i in 0..<ir.nodes.len:
         add(out.nodes, TypedExprIrNodeClone(ir.nodes[i]))
+    for i in 0..<ir.coldCsgTypeRows.len:
+        add(out.coldCsgTypeRows, TypedExprColdCsgTypeRowClone(ir.coldCsgTypeRows[i]))
+    for i in 0..<ir.coldCsgStatementRows.len:
+        add(out.coldCsgStatementRows, TypedExprColdCsgStatementRowClone(ir.coldCsgStatementRows[i]))
     for i in 0..<ir.globalSourcePaths.len:
         add(out.globalSourcePaths, ir.globalSourcePaths[i])
     for i in 0..<ir.globalNames.len:
@@ -1024,6 +1080,8 @@ fn TypedExprIrClone(ir: var TypedExprIr): TypedExprIr =
         add(out.importcNames, ir.importcNames[i])
     for i in 0..<ir.importcReturnTypes.len:
         add(out.importcReturnTypes, ir.importcReturnTypes[i])
+    for i in 0..<ir.importcTargetSymbols.len:
+        add(out.importcTargetSymbols, ir.importcTargetSymbols[i])
     for i in 0..<ir.typeLayoutSourcePaths.len:
         add(out.typeLayoutSourcePaths, ir.typeLayoutSourcePaths[i])
     for i in 0..<ir.typeLayoutNames.len:
@@ -1118,6 +1176,14 @@ fn TypedExprIrCountStatementKind(ir: var TypedExprIr,
     var count: int32
     for i in 0..<ir.statements.len:
         if ir.statements[i].kind == kind:
+            count = count + 1
+    return count
+
+fn TypedExprIrCountColdCsgStatementKind(ir: var TypedExprIr,
+                                         kind: str): int32 =
+    var count: int32
+    for i in 0..<ir.coldCsgStatementRows.len:
+        if ir.coldCsgStatementRows[i].kind == kind:
             count = count + 1
     return count
 
@@ -2411,6 +2477,10 @@ fn TypedExprIrReportText(ir: var TypedExprIr): str =
     var out = ""
     TypedExprReportAppendLine(out, "typed_ir_function_count", IntToStr(ir.functions.len))
     TypedExprReportAppendLine(out, "typed_ir_statement_count", IntToStr(ir.statements.len))
+    TypedExprReportAppendLine(out, "typed_ir_cold_csg_type_row_count", IntToStr(ir.coldCsgTypeRows.len))
+    TypedExprReportAppendLine(out, "typed_ir_cold_csg_statement_row_count", IntToStr(ir.coldCsgStatementRows.len))
+    TypedExprReportAppendLine(out, "typed_ir_cold_csg_match_statement_count", IntToStr(TypedExprIrCountColdCsgStatementKind(ir, "match")))
+    TypedExprReportAppendLine(out, "typed_ir_cold_csg_case_statement_count", IntToStr(TypedExprIrCountColdCsgStatementKind(ir, "case")))
     TypedExprReportAppendLine(out, "typed_ir_global_count", IntToStr(ir.globalNames.len))
     TypedExprReportAppendLine(out, "typed_ir_local_decl_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtLocalDecl)))
     TypedExprReportAppendLine(out, "typed_ir_let_call_statement_count", IntToStr(TypedExprIrCountStatementKind(ir, TypedExprIrStmtLetCall)))
@@ -4673,6 +4743,224 @@ fn TypedExprParseTypeFieldLine(lineRaw: str,
                                                                typeEnd - colonPos - 1))
     return fieldName != "" && fieldType != ""
 
+fn TypedExprColdCsgTextIsFactSafe(text: str): bool =
+    for i in 0..<text.len:
+        if text[i] == '\t' || text[i] == '\n' || text[i] == '\r':
+            return false
+    return true
+
+fn TypedExprColdCsgLineHasTripleQuote(line: str): bool =
+    return parser.ParserFindText(line, "\"\"\"") >= 0
+
+fn TypedExprColdCsgLineTopLevel(line: str): bool =
+    let trimmed = chengpath.PathTrim(line)
+    if trimmed == "":
+        return false
+    return TypedExprLineIndentWidth(line) == 0
+
+fn TypedExprColdCsgStripTrailingColon(textRaw: str): str =
+    var text = chengpath.PathTrim(textRaw)
+    if text.len > 0 && text[text.len - 1] == ':':
+        text = chengpath.PathTrim(chengpath.TextSlice(text, 0, text.len - 1))
+    return text
+
+fn TypedExprColdCsgStripTrailingOpenBrace(textRaw: str): str =
+    var text = chengpath.PathTrim(textRaw)
+    if text.len > 0 && text[text.len - 1] == '{':
+        text = chengpath.PathTrim(chengpath.TextSlice(text, 0, text.len - 1))
+    return text
+
+fn TypedExprColdCsgControlPayload(surfaceRaw: str, keyword: str): str =
+    let surface = TypedExprColdCsgStripTrailingColon(surfaceRaw)
+    if !parser.ParserStartsWith(surface, keyword):
+        return surface
+    if surface.len <= keyword.len:
+        return ""
+    return chengpath.PathTrim(chengpath.TextSlice(surface,
+                                                  keyword.len,
+                                                  surface.len - keyword.len))
+
+fn TypedExprColdCsgFieldKindCodeFromTypeName(typeName: str): str =
+    let t = TypedExprNormalizeTypeText(typeName)
+    if t == "str" || t == "cstring":
+        return "s"
+    if t == "int32[]" || t == "int[]":
+        return ""
+    if t.len > 1 && t[0] >= 'A' && t[0] <= 'Z':
+        return "v"
+    return "i"
+
+fn TypedExprColdCsgObjectFieldSpec(typeName: str): str =
+    let t = TypedExprNormalizeTypeText(typeName)
+    if t == "int32[]" || t == "int[]":
+        return ""
+    if parser.ParserStartsWith(t, "int32[") && t.len > 7 && t[t.len - 1] == ']':
+        return Fmt"a{chengpath.TextSlice(t, 6, t.len - 7)}"
+    return TypedExprColdCsgFieldKindCodeFromTypeName(t)
+
+fn TypedExprColdCsgFieldDeclSpec(declRaw: str): str =
+    let decl = chengpath.PathTrim(declRaw)
+    let colon = parser.ParserFindText(decl, ":")
+    if colon <= 0:
+        return ""
+    let name = parser.ParserIdentPrefix(chengpath.TextSlice(decl, 0, colon))
+    var typeText = chengpath.PathTrim(chengpath.TextSlice(decl,
+                                                          colon + 1,
+                                                          decl.len - colon - 1))
+    let eq = parser.ParserFindText(typeText, "=")
+    if eq >= 0:
+        typeText = chengpath.PathTrim(chengpath.TextSlice(typeText, 0, eq))
+    if name == "" || typeText == "":
+        return ""
+    let spec = TypedExprColdCsgObjectFieldSpec(typeText)
+    if spec == "":
+        return ""
+    return Fmt"{name}:{spec}"
+
+fn TypedExprColdCsgObjectSpecsFromLines(lines: str[],
+                                         startIndex: int32,
+                                         endIndex: int32): str =
+    var out = ""
+    for i in startIndex..<endIndex:
+        let trimmed = chengpath.PathTrim(lines[i])
+        if trimmed == "":
+            continue
+        let spec = TypedExprColdCsgFieldDeclSpec(lines[i])
+        if spec == "":
+            return ""
+        if out != "":
+            out = Fmt"{out},"
+        out = Fmt"{out}{spec}"
+    return out
+
+fn TypedExprColdCsgTupleSpecsFromText(fieldsRaw: str): str =
+    let parts = strutil.Split(fieldsRaw, ',')
+    var out = ""
+    for i in 0..<parts.len:
+        let trimmed = chengpath.PathTrim(parts[i])
+        if trimmed == "":
+            continue
+        let spec = TypedExprColdCsgFieldDeclSpec(parts[i])
+        if spec == "":
+            return ""
+        if out != "":
+            out = Fmt"{out},"
+        out = Fmt"{out}{spec}"
+    return out
+
+fn TypedExprColdCsgTypeEntryParts(lineRaw: str,
+                                   name: var str,
+                                   rhs: var str): bool =
+    name = ""
+    rhs = ""
+    let line = chengpath.PathTrim(lineRaw)
+    let eq = TypedExprFindTopLevelToken(line, "=")
+    if eq <= 0:
+        return false
+    let left = chengpath.PathTrim(chengpath.TextSlice(line, 0, eq))
+    name = TypedExprParseTypeDeclName(Fmt"{left} = x")
+    rhs = chengpath.PathTrim(chengpath.TextSlice(line, eq + 1, line.len - eq - 1))
+    return name != ""
+
+fn TypedExprColdCsgTupleObjectSpecs(typeName: str,
+                                     rhsRaw: str): str =
+    let rhs = chengpath.PathTrim(rhsRaw)
+    let open = parser.ParserFindText(rhs, "[")
+    if open <= 0 || rhs.len <= open + 1 || rhs[rhs.len - 1] != ']':
+        return ""
+    let fields = chengpath.TextSlice(rhs, open + 1, rhs.len - open - 2)
+    return TypedExprColdCsgTupleSpecsFromText(fields)
+
+fn TypedExprColdCsgJoinIndentedLines(lines: str[],
+                                      startIndex: int32,
+                                      endIndex: int32): str =
+    var out = ""
+    for i in startIndex..<endIndex:
+        let part = chengpath.PathTrim(lines[i])
+        if part == "":
+            continue
+        if out != "":
+            out = Fmt"{out} "
+        out = Fmt"{out}{part}"
+    return out
+
+fn TypedExprColdCsgVariantSpecsFromText(text: str): str =
+    var out: str
+    var pos = 0
+    var emitted = 0
+    while pos < Len(text):
+        while pos < Len(text) && (text[pos] == ' ' || text[pos] == '|'):
+            pos = pos + 1
+        if pos >= Len(text):
+            break
+        var nameEnd = pos
+        while nameEnd < Len(text) && text[nameEnd] != ' ' && text[nameEnd] != '(' && text[nameEnd] != '|':
+            nameEnd = nameEnd + 1
+        if nameEnd <= pos:
+            break
+        let variantName = chengpath.TextSlice(text, pos, nameEnd - pos)
+        pos = nameEnd
+        var fieldCount = 0
+        var fieldKinds: str
+        while pos < Len(text) && text[pos] == ' ':
+            pos = pos + 1
+        if pos < Len(text) && text[pos] == '(':
+            pos = pos + 1
+            var depth = 1
+            let fieldStart = pos
+            while pos < Len(text) && depth > 0:
+                if text[pos] == '(':
+                    depth = depth + 1
+                elif text[pos] == ')':
+                    depth = depth - 1
+                if depth > 0:
+                    pos = pos + 1
+            if depth == 0:
+                let fields = chengpath.TextSlice(text, fieldStart, pos - fieldStart)
+                pos = pos + 1
+                var fp = 0
+                while fp < Len(fields):
+                    while fp < Len(fields) && fields[fp] == ' ':
+                        fp = fp + 1
+                    if fp >= Len(fields):
+                        break
+                    var nameStop = fp
+                    while nameStop < Len(fields) && fields[nameStop] != ' ' && fields[nameStop] != ':':
+                        nameStop = nameStop + 1
+                    if nameStop <= fp:
+                        break
+                    fp = nameStop
+                    while fp < Len(fields) && (fields[fp] == ' ' || fields[fp] == ':'):
+                        fp = fp + 1
+                    var typeStop = fp
+                    var bracketDepth = 0
+                    while typeStop < Len(fields):
+                        if fields[typeStop] == '[':
+                            bracketDepth = bracketDepth + 1
+                        elif fields[typeStop] == ']':
+                            bracketDepth = bracketDepth - 1
+                        elif fields[typeStop] == ',' && bracketDepth == 0:
+                            break
+                        typeStop = typeStop + 1
+                    let fieldType = chengpath.PathTrim(chengpath.TextSlice(fields, fp, typeStop - fp))
+                    if Len(fieldType) > 0:
+                        fieldKinds = Fmt"{fieldKinds}{TypedExprColdCsgFieldKindCodeFromTypeName(fieldType)}"
+                    fieldCount = fieldCount + 1
+                    fp = typeStop
+                    while fp < Len(fields) && fields[fp] == ',':
+                        fp = fp + 1
+        if emitted > 0:
+            out = Fmt"{out},"
+        out = Fmt"{out}{variantName}:{IntToStr(fieldCount)}"
+        if Len(fieldKinds) > 0:
+            out = Fmt"{out}:{fieldKinds}"
+        emitted = emitted + 1
+        while pos < Len(text) && text[pos] == ' ':
+            pos = pos + 1
+        if pos < Len(text) && text[pos] == '|':
+            pos = pos + 1
+    return out
+
 fn TypedExprFindTypeFieldDecl(ctx: var TypedExprSourceContext,
                                ownerTypeRaw: str,
                                fieldNameRaw: str,
@@ -5714,6 +6002,23 @@ fn TypedExprIrAppendTypeAlias(ir: var TypedExprIr,
     add(ir.typeAliasQualifiers, qualifier)
     add(ir.typeAliasTargetSourcePaths, targetSourcePath)
 
+fn TypedExprIrAppendColdCsgRowsFromContext(ir: var TypedExprIr,
+                                            ctx: var TypedExprSourceContext) =
+    for i in 0..<ctx.coldCsgTypeRows.len:
+        let row = ctx.coldCsgTypeRows[i]
+        var seen = false
+        for existingIndex in 0..<ir.coldCsgTypeRows.len:
+            let existing = ir.coldCsgTypeRows[existingIndex]
+            if existing.sourcePath == row.sourcePath &&
+               existing.rowKind == row.rowKind &&
+               existing.typeName == row.typeName:
+                seen = true
+                break
+        if !seen:
+            add(ir.coldCsgTypeRows, TypedExprColdCsgTypeRowClone(row))
+    for i in 0..<ctx.coldCsgStatementRows.len:
+        add(ir.coldCsgStatementRows, TypedExprColdCsgStatementRowClone(ctx.coldCsgStatementRows[i]))
+
 fn TypedExprIrLookupTypeAliasTargetSourcePath(ir: TypedExprIr,
                                                sourcePathRaw: str,
                                                qualifierRaw: str): str =
@@ -6576,35 +6881,49 @@ fn TypedExprLookupLocalImportcReturnTypeForCall(ctx: var TypedExprSourceContext,
 fn TypedExprIrAddImportcReturnType(ir: var TypedExprIr,
                                     sourcePathRaw: str,
                                     nameRaw: str,
-                                    returnTypeRaw: str) =
+                                    returnTypeRaw: str,
+                                    targetSymbolRaw: str) =
     let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
     let name = parser.ParserIdentPrefix(chengpath.PathTrim(nameRaw))
-    let returnType = TypedExprNormalizeTypeText(returnTypeRaw)
-    if sourcePath == "" || name == "" || returnType == "":
+    var returnType = TypedExprNormalizeTypeText(returnTypeRaw)
+    if returnType == "":
+        returnType = "void"
+    var targetSymbol = chengpath.PathTrim(targetSymbolRaw)
+    if targetSymbol == "":
+        targetSymbol = name
+    if sourcePath == "" || name == "":
         return
     for i in 0..<ir.importcNames.len:
         if i >= ir.importcSourcePaths.len:
             continue
         if parser.ParserNormalizePath(ir.importcSourcePaths[i]) == sourcePath &&
            ir.importcNames[i] == name:
+            if targetSymbol != "" && i < ir.importcTargetSymbols.len && ir.importcTargetSymbols[i] == "":
+                ir.importcTargetSymbols[i] = targetSymbol
             return
     add(ir.importcSourcePaths, sourcePath)
     add(ir.importcNames, name)
     add(ir.importcReturnTypes, returnType)
+    add(ir.importcTargetSymbols, targetSymbol)
 
 fn TypedExprIrAppendImportcFunctionsFromContext(ir: var TypedExprIr,
                                                  ctx: var TypedExprSourceContext) =
     for i in 0..<ctx.importcFunctions.len:
         let importcFn = ctx.importcFunctions[i]
+        var targetSymbol = importcFn.importName
+        if targetSymbol == "":
+            targetSymbol = importcFn.name
         TypedExprIrAddImportcReturnType(ir,
                                         ctx.sourcePath,
                                         importcFn.name,
-                                        importcFn.returnType)
+                                        importcFn.returnType,
+                                        targetSymbol)
         if importcFn.importName != "":
             TypedExprIrAddImportcReturnType(ir,
                                             ctx.sourcePath,
                                             importcFn.importName,
-                                            importcFn.returnType)
+                                            importcFn.returnType,
+                                            targetSymbol)
 
 fn TypedExprIrLookupImportcReturnType(ir: TypedExprIr,
                                        sourcePathRaw: str,
@@ -6629,6 +6948,38 @@ fn TypedExprIrLookupImportcReturnType(ir: TypedExprIr,
             if foundExact != "" && foundExact != ir.importcReturnTypes[i]:
                 return ""
             foundExact = ir.importcReturnTypes[i]
+    if foundExact != "":
+        return foundExact
+    return foundAny
+
+fn TypedExprIrLookupImportcTargetSymbol(ir: TypedExprIr,
+                                         sourcePathRaw: str,
+                                         nameRaw: str): str =
+    let sourcePath = parser.ParserNormalizePath(sourcePathRaw)
+    let trimmedName = chengpath.PathTrim(nameRaw)
+    let name = parser.ParserIdentPrefix(trimmedName)
+    if name == "" && trimmedName == "":
+        return ""
+    var foundExact = ""
+    var foundAny = ""
+    for i in 0..<ir.importcNames.len:
+        if i >= ir.importcSourcePaths.len:
+            continue
+        if ir.importcNames[i] != name && ir.importcNames[i] != trimmedName:
+            continue
+        var symbol = ""
+        if i < ir.importcTargetSymbols.len:
+            symbol = ir.importcTargetSymbols[i]
+        if symbol == "":
+            symbol = ir.importcNames[i]
+        if foundAny != "" && foundAny != symbol:
+            return ""
+        foundAny = symbol
+        if sourcePath != "" &&
+           parser.ParserNormalizePath(ir.importcSourcePaths[i]) == sourcePath:
+            if foundExact != "" && foundExact != symbol:
+                return ""
+            foundExact = symbol
     if foundExact != "":
         return foundExact
     return foundAny
@@ -7577,6 +7928,473 @@ fn TypedExprFunctionScopeEndLine(lines: str[],
         endLine = lineNumber
     return endLine
 
+fn TypedExprColdCsgAddTypeRow(ctx: var TypedExprSourceContext,
+                               rowKind: TypedExprColdCsgTypeRowKind,
+                               typeNameRaw: str,
+                               specsRaw: str) =
+    let typeName = parser.ParserIdentPrefix(chengpath.PathTrim(typeNameRaw))
+    let specs = chengpath.PathTrim(specsRaw)
+    if typeName == "" || specs == "":
+        return
+    for i in 0..<ctx.coldCsgTypeRows.len:
+        if ctx.coldCsgTypeRows[i].rowKind == rowKind &&
+           ctx.coldCsgTypeRows[i].typeName == typeName:
+            return
+    var row: TypedExprColdCsgTypeRow
+    row.sourcePath = ctx.sourcePath
+    row.rowKind = rowKind
+    row.typeName = typeName
+    row.specs = specs
+    add(ctx.coldCsgTypeRows, row)
+
+fn TypedExprColdCsgAppendTypeEntryRowsToContext(ctx: var TypedExprSourceContext,
+                                                 entryIndex: int32,
+                                                 entryIndent: int32,
+                                                 typeName: str,
+                                                 rhs: str,
+                                                 nextIndex: var int32): bool =
+    nextIndex = entryIndex + 1
+    if parser.ParserStartsWith(rhs, "object"):
+        let fieldStart = nextIndex
+        var fieldEnd = nextIndex
+        while nextIndex < ctx.lines.len:
+            let fieldLine = ctx.lines[nextIndex]
+            let fieldTrimmed = chengpath.PathTrim(fieldLine)
+            if fieldTrimmed == "":
+                nextIndex = nextIndex + 1
+                continue
+            if TypedExprColdCsgLineTopLevel(fieldLine) ||
+               TypedExprLineIndentWidth(fieldLine) <= entryIndent:
+                break
+            fieldEnd = nextIndex + 1
+            nextIndex = nextIndex + 1
+        let specs = TypedExprColdCsgObjectSpecsFromLines(ctx.lines, fieldStart, fieldEnd)
+        if specs == "":
+            return false
+        TypedExprColdCsgAddTypeRow(ctx, TypedExprColdCsgTypeObject, typeName, specs)
+        return true
+    if parser.ParserStartsWith(rhs, "tuple["):
+        let specs = TypedExprColdCsgTupleObjectSpecs(typeName, rhs)
+        if specs == "":
+            return false
+        TypedExprColdCsgAddTypeRow(ctx, TypedExprColdCsgTypeObject, typeName, specs)
+        return true
+    var variants = rhs
+    if variants == "":
+        let variantStart = nextIndex
+        var variantEnd = nextIndex
+        while nextIndex < ctx.lines.len:
+            let variantLine = ctx.lines[nextIndex]
+            let variantTrimmed = chengpath.PathTrim(variantLine)
+            if variantTrimmed == "":
+                nextIndex = nextIndex + 1
+                continue
+            if TypedExprColdCsgLineTopLevel(variantLine) ||
+               TypedExprLineIndentWidth(variantLine) <= entryIndent:
+                break
+            variantEnd = nextIndex + 1
+            nextIndex = nextIndex + 1
+        variants = TypedExprColdCsgJoinIndentedLines(ctx.lines, variantStart, variantEnd)
+    let specs = TypedExprColdCsgVariantSpecsFromText(chengpath.PathTrim(variants))
+    if specs == "":
+        return false
+    TypedExprColdCsgAddTypeRow(ctx, TypedExprColdCsgTypeAdt, typeName, specs)
+    return true
+
+fn TypedExprColdCsgAppendTypeRowsToContext(ctx: var TypedExprSourceContext) =
+    var inTriple = false
+    var i = 0
+    while i < ctx.lines.len:
+        let rawLine = ctx.lines[i]
+        if inTriple:
+            if TypedExprColdCsgLineHasTripleQuote(rawLine):
+                inTriple = false
+            i = i + 1
+            continue
+        let line = chengpath.PathTrim(parser.ParserStripLineComment(rawLine))
+        if line == "":
+            i = i + 1
+            continue
+        if !TypedExprColdCsgLineTopLevel(rawLine):
+            if TypedExprColdCsgLineHasTripleQuote(rawLine):
+                inTriple = true
+            i = i + 1
+            continue
+        if line == "type":
+            i = i + 1
+            var blockIndent = -1
+            while i < ctx.lines.len:
+                let entryRaw = ctx.lines[i]
+                let entryTrimmed = chengpath.PathTrim(parser.ParserStripLineComment(entryRaw))
+                if entryTrimmed == "":
+                    i = i + 1
+                    continue
+                if TypedExprColdCsgLineTopLevel(entryRaw):
+                    break
+                let entryIndent = TypedExprLineIndentWidth(entryRaw)
+                if blockIndent < 0:
+                    blockIndent = entryIndent
+                if entryIndent > blockIndent:
+                    i = i + 1
+                    continue
+                var typeName = ""
+                var rhs = ""
+                if !TypedExprColdCsgTypeEntryParts(entryTrimmed, typeName, rhs):
+                    i = i + 1
+                    continue
+                var nextIndex = i + 1
+                if !TypedExprColdCsgAppendTypeEntryRowsToContext(ctx,
+                                                                 i,
+                                                                 entryIndent,
+                                                                 typeName,
+                                                                 rhs,
+                                                                 nextIndex):
+                    i = i + 1
+                    continue
+                i = nextIndex
+            continue
+        if !parser.ParserStartsWith(line, "type "):
+            if TypedExprColdCsgLineHasTripleQuote(rawLine):
+                inTriple = true
+            i = i + 1
+            continue
+        let tail = chengpath.PathTrim(chengpath.TextSlice(line, 5, line.len - 5))
+        var typeName = ""
+        var rhs = ""
+        if !TypedExprColdCsgTypeEntryParts(tail, typeName, rhs):
+            i = i + 1
+            continue
+        var nextIndex = i + 1
+        if TypedExprColdCsgAppendTypeEntryRowsToContext(ctx,
+                                                        i,
+                                                        TypedExprLineIndentWidth(rawLine),
+                                                        typeName,
+                                                        rhs,
+                                                        nextIndex):
+            i = nextIndex
+        else:
+            i = i + 1
+
+fn TypedExprColdCsgAddStatementRow(ctx: var TypedExprSourceContext,
+                                    functionName: str,
+                                    lineNumber: int32,
+                                    lineIndent: int32,
+                                    kind: str,
+                                    payloadText: str) =
+    if functionName == "" || kind == "":
+        return
+    var row: TypedExprColdCsgStatementRow
+    row.sourcePath = ctx.sourcePath
+    row.functionName = functionName
+    row.lineNumber = lineNumber
+    row.lineIndent = lineIndent
+    row.kind = kind
+    row.payloadText = payloadText
+    add(ctx.coldCsgStatementRows, row)
+
+fn TypedExprColdCsgUnsupportedRow(ctx: var TypedExprSourceContext,
+                                   functionName: str,
+                                   lineNumber: int32,
+                                   lineIndent: int32,
+                                   text: str) =
+    TypedExprColdCsgAddStatementRow(ctx,
+                                    functionName,
+                                    lineNumber,
+                                    lineIndent,
+                                    "unsupported",
+                                    Fmt"unsupported\t{text}")
+
+fn TypedExprColdCsgFindAssignEq(text: str): int32 =
+    var bracketDepth: int32
+    var parenDepth: int32
+    var braceDepth: int32
+    for i in 0..<text.len:
+        let ch = text[i]
+        if ch == '[':
+            bracketDepth = bracketDepth + 1
+        elif ch == ']':
+            bracketDepth = bracketDepth - 1
+        elif ch == '(':
+            parenDepth = parenDepth + 1
+        elif ch == ')':
+            parenDepth = parenDepth - 1
+        elif ch == '{':
+            braceDepth = braceDepth + 1
+        elif ch == '}':
+            braceDepth = braceDepth - 1
+        elif ch == '=' && bracketDepth == 0 && parenDepth == 0 && braceDepth == 0:
+            if i + 1 < text.len && text[i + 1] == '=':
+                continue
+            if i > 0:
+                let prev = text[i - 1]
+                if prev == '<' || prev == '>' || prev == '!' || prev == '=':
+                    continue
+            return i
+    return -1
+
+fn TypedExprColdCsgBindingNameFromHead(headRaw: str): str =
+    return parser.ParserIdentPrefix(parser.ParserFirstToken(chengpath.PathTrim(headRaw)))
+
+fn TypedExprColdCsgBindingTypeFromHead(headRaw: str): str =
+    let head = chengpath.PathTrim(headRaw)
+    let colon = parser.ParserFindText(head, ":")
+    if colon <= 0:
+        return ""
+    return TypedExprNormalizeTypeText(chengpath.TextSlice(head, colon + 1, head.len - colon - 1))
+
+fn TypedExprColdCsgExprHasQuestionSuffix(exprRaw: str,
+                                          stripped: var str): bool =
+    stripped = chengpath.PathTrim(exprRaw)
+    if stripped.len <= 1 || stripped[stripped.len - 1] != '?':
+        return false
+    var depth = 0
+    for i in 0..<(stripped.len - 1):
+        if stripped[i] == '(':
+            depth = depth + 1
+        elif stripped[i] == ')':
+            depth = depth - 1
+    if depth != 0:
+        return false
+    stripped = chengpath.PathTrim(chengpath.TextSlice(stripped, 0, stripped.len - 1))
+    return true
+
+fn TypedExprColdCsgAppendSourceStatementRowToContext(ctx: var TypedExprSourceContext,
+                                                      functionName: str,
+                                                      lineNumber: int32,
+                                                      indent: int32,
+                                                      trimmedRaw: str) =
+    let trimmed = chengpath.PathTrim(trimmedRaw)
+    if trimmed == "" || trimmed == "{" || trimmed == "}":
+        return
+    let arrow = parser.ParserFindText(trimmed, "=>")
+    if arrow > 0:
+        let arm = chengpath.PathTrim(chengpath.TextSlice(trimmed, 0, arrow))
+        let body = chengpath.PathTrim(chengpath.TextSlice(trimmed,
+                                                          arrow + 2,
+                                                          trimmed.len - arrow - 2))
+        var variant = arm
+        var bind = ""
+        let open = parser.ParserFindText(arm, "(")
+        if open > 0:
+            if arm.len <= open + 1 || arm[arm.len - 1] != ')':
+                TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+                return
+            variant = chengpath.PathTrim(chengpath.TextSlice(arm, 0, open))
+            bind = chengpath.PathTrim(chengpath.TextSlice(arm, open + 1, arm.len - open - 2))
+        if !TypedExprColdCsgTextIsFactSafe(variant) || !TypedExprColdCsgTextIsFactSafe(bind):
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        TypedExprColdCsgAddStatementRow(ctx,
+                                        functionName,
+                                        lineNumber,
+                                        indent,
+                                        "case",
+                                        Fmt"case\t{variant}\t{bind}")
+        if body != "":
+            TypedExprColdCsgAppendSourceStatementRowToContext(ctx,
+                                                              functionName,
+                                                              lineNumber,
+                                                              indent + 4,
+                                                              body)
+        return
+    if parser.ParserStartsWith(trimmed, "match "):
+        let restRaw = chengpath.PathTrim(chengpath.TextSlice(trimmed, 6, trimmed.len - 6))
+        let target = TypedExprColdCsgStripTrailingColon(TypedExprColdCsgStripTrailingOpenBrace(restRaw))
+        if target == "" || !TypedExprColdCsgTextIsFactSafe(target):
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        TypedExprColdCsgAddStatementRow(ctx, functionName, lineNumber, indent, "match", Fmt"match\t{target}")
+        return
+    if parser.ParserStartsWith(trimmed, "return "):
+        let expr = chengpath.PathTrim(chengpath.TextSlice(trimmed, 7, trimmed.len - 7))
+        var qExpr = ""
+        if TypedExprColdCsgExprHasQuestionSuffix(expr, qExpr) ||
+           expr == "" ||
+           !TypedExprColdCsgTextIsFactSafe(expr):
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        TypedExprColdCsgAddStatementRow(ctx, functionName, lineNumber, indent, "return", Fmt"return\t{expr}")
+        return
+    var bindingPrefixLen = 0
+    if parser.ParserStartsWith(trimmed, "let ") || parser.ParserStartsWith(trimmed, "var "):
+        bindingPrefixLen = 4
+    elif parser.ParserStartsWith(trimmed, "const "):
+        bindingPrefixLen = 6
+    if bindingPrefixLen > 0:
+        let rest = chengpath.PathTrim(chengpath.TextSlice(trimmed,
+                                                          bindingPrefixLen,
+                                                          trimmed.len - bindingPrefixLen))
+        let eq = TypedExprColdCsgFindAssignEq(rest)
+        if eq <= 0:
+            let colon = parser.ParserFindText(rest, ":")
+            if colon <= 0:
+                TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+                return
+            let name = TypedExprColdCsgBindingNameFromHead(chengpath.TextSlice(rest, 0, colon))
+            let typeText = TypedExprNormalizeTypeText(chengpath.TextSlice(rest,
+                                                                          colon + 1,
+                                                                          rest.len - colon - 1))
+            if name == "" || typeText == "" ||
+               !TypedExprColdCsgTextIsFactSafe(name) ||
+               !TypedExprColdCsgTextIsFactSafe(typeText):
+                TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+                return
+            TypedExprColdCsgAddStatementRow(ctx,
+                                            functionName,
+                                            lineNumber,
+                                            indent,
+                                            "default",
+                                            Fmt"default\t{name}\t{typeText}")
+            return
+        let head = chengpath.TextSlice(rest, 0, eq)
+        let name = TypedExprColdCsgBindingNameFromHead(head)
+        let typeText = TypedExprColdCsgBindingTypeFromHead(head)
+        var expr = chengpath.PathTrim(chengpath.TextSlice(rest, eq + 1, rest.len - eq - 1))
+        var qExpr = ""
+        var kind = "var"
+        if TypedExprColdCsgExprHasQuestionSuffix(expr, qExpr):
+            expr = qExpr
+            kind = "let_q"
+        if typeText != "":
+            if kind == "var":
+                kind = "var_t"
+            else:
+                kind = "let_q_t"
+        if name == "" || expr == "" ||
+           !TypedExprColdCsgTextIsFactSafe(name) ||
+           !TypedExprColdCsgTextIsFactSafe(expr) ||
+           !TypedExprColdCsgTextIsFactSafe(typeText):
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        if typeText != "":
+            TypedExprColdCsgAddStatementRow(ctx,
+                                            functionName,
+                                            lineNumber,
+                                            indent,
+                                            kind,
+                                            Fmt"{kind}\t{name}\t{typeText}\t{expr}")
+        else:
+            TypedExprColdCsgAddStatementRow(ctx,
+                                            functionName,
+                                            lineNumber,
+                                            indent,
+                                            kind,
+                                            Fmt"{kind}\t{name}\t{expr}")
+        return
+    if parser.ParserStartsWith(trimmed, "if "):
+        let condition = TypedExprColdCsgControlPayload(trimmed, "if")
+        if condition == "" || !TypedExprColdCsgTextIsFactSafe(condition):
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        TypedExprColdCsgAddStatementRow(ctx, functionName, lineNumber, indent, "if", Fmt"if\t{condition}")
+        return
+    if parser.ParserStartsWith(trimmed, "elif "):
+        let condition = TypedExprColdCsgControlPayload(trimmed, "elif")
+        if condition == "" || !TypedExprColdCsgTextIsFactSafe(condition):
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        TypedExprColdCsgAddStatementRow(ctx, functionName, lineNumber, indent, "elif", Fmt"elif\t{condition}")
+        return
+    if TypedExprColdCsgStripTrailingColon(trimmed) == "else":
+        TypedExprColdCsgAddStatementRow(ctx, functionName, lineNumber, indent, "else", "else")
+        return
+    if parser.ParserStartsWith(trimmed, "while "):
+        let condition = TypedExprColdCsgControlPayload(trimmed, "while")
+        if condition == "" || !TypedExprColdCsgTextIsFactSafe(condition):
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        TypedExprColdCsgAddStatementRow(ctx, functionName, lineNumber, indent, "while", Fmt"while\t{condition}")
+        return
+    if parser.ParserStartsWith(trimmed, "for "):
+        let payload = TypedExprColdCsgControlPayload(trimmed, "for")
+        let inPos = parser.ParserFindText(payload, " in ")
+        if inPos <= 0:
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        let iterName = chengpath.PathTrim(chengpath.TextSlice(payload, 0, inPos))
+        let rangeText = chengpath.PathTrim(chengpath.TextSlice(payload,
+                                                               inPos + 4,
+                                                               payload.len - inPos - 4))
+        var startExpr = ""
+        var endExpr = ""
+        var inclusive = false
+        if !parser.ParserParseRangeExpr(rangeText, startExpr, endExpr, inclusive):
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        var mode = "lt"
+        if inclusive:
+            mode = "le"
+        if !TypedExprColdCsgTextIsFactSafe(iterName) ||
+           !TypedExprColdCsgTextIsFactSafe(startExpr) ||
+           !TypedExprColdCsgTextIsFactSafe(endExpr):
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        TypedExprColdCsgAddStatementRow(ctx,
+                                        functionName,
+                                        lineNumber,
+                                        indent,
+                                        "for_range",
+                                        Fmt"for_range\t{iterName}\t{startExpr}\t{endExpr}\t{mode}")
+        return
+    if trimmed == "break" || trimmed == "continue":
+        TypedExprColdCsgAddStatementRow(ctx, functionName, lineNumber, indent, trimmed, trimmed)
+        return
+    let eq = TypedExprColdCsgFindAssignEq(trimmed)
+    if eq > 0:
+        let name = chengpath.PathTrim(chengpath.TextSlice(trimmed, 0, eq))
+        let expr = chengpath.PathTrim(chengpath.TextSlice(trimmed, eq + 1, trimmed.len - eq - 1))
+        if name == "" || expr == "" ||
+           !TypedExprColdCsgTextIsFactSafe(name) ||
+           !TypedExprColdCsgTextIsFactSafe(expr):
+            TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+            return
+        TypedExprColdCsgAddStatementRow(ctx, functionName, lineNumber, indent, "assign", Fmt"assign\t{name}\t{expr}")
+        return
+    let open = parser.ParserFindText(trimmed, "(")
+    if open > 0 && trimmed.len > open + 1:
+        var close = trimmed.len - 1
+        var kind = "call"
+        if trimmed[close] == '?':
+            kind = "call_q"
+            close = close - 1
+        if close > open && trimmed[close] == ')':
+            let callee = chengpath.PathTrim(chengpath.TextSlice(trimmed, 0, open))
+            let args = chengpath.PathTrim(chengpath.TextSlice(trimmed, open + 1, close - open - 1))
+            if callee == "" || !TypedExprColdCsgTextIsFactSafe(callee) || !TypedExprColdCsgTextIsFactSafe(args):
+                TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+                return
+            TypedExprColdCsgAddStatementRow(ctx, functionName, lineNumber, indent, kind, Fmt"{kind}\t{callee}\t{args}")
+            return
+    TypedExprColdCsgUnsupportedRow(ctx, functionName, lineNumber, indent, trimmed)
+
+fn TypedExprColdCsgAppendStatementRowsToContext(ctx: var TypedExprSourceContext) =
+    for scopeIndex in 0..<ctx.scopes.len:
+        let scope = ctx.scopes[scopeIndex]
+        if scope.startLine + 1 > scope.endLine:
+            continue
+        var inTriple = false
+        for lineNumber in (scope.startLine + 1)..scope.endLine:
+            let rawLine = ctx.lines[lineNumber - 1]
+            if inTriple:
+                if TypedExprColdCsgLineHasTripleQuote(rawLine):
+                    inTriple = false
+                continue
+            if TypedExprColdCsgLineTopLevel(rawLine):
+                if TypedExprColdCsgLineHasTripleQuote(rawLine):
+                    inTriple = true
+                continue
+            let trimmed = chengpath.PathTrim(parser.ParserStripLineComment(rawLine))
+            if trimmed == "" ||
+               parser.ParserStartsWith(trimmed, "#") ||
+               parser.ParserStartsWith(trimmed, "//"):
+                continue
+            let indent = TypedExprLineIndentWidth(rawLine)
+            TypedExprColdCsgAppendSourceStatementRowToContext(ctx,
+                                                              scope.name,
+                                                              lineNumber,
+                                                              indent,
+                                                              trimmed)
+
 fn TypedExprBuildSourceContext(source: TypedExprSourceText,
                                  ctx: var TypedExprSourceContext,
                                  err: var str): bool =
@@ -7592,6 +8410,8 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
     ctx.importedModules = []
     ctx.declaredTypes = []
     ctx.typeFields = []
+    ctx.coldCsgTypeRows = []
+    ctx.coldCsgStatementRows = []
     ctx.enumValueNames = []
     ctx.enumValueTypes = []
     ctx.enumValueOrdinals = []
@@ -7744,6 +8564,7 @@ fn TypedExprBuildSourceContext(source: TypedExprSourceText,
             importedModule.qualifier = qualifier
             importedModule.targetSourcePath = parser.ParserNormalizePath(importEdges[i].targetSourcePath)
             add(ctx.importedModules, importedModule)
+    TypedExprColdCsgAppendTypeRowsToContext(ctx)
     err = ""
     return true
 
@@ -8383,7 +9204,9 @@ fn TypedExprExprIsStructuredStatement(expr: parser.NormalizedExpr): bool =
     if expr.kind == parser.NormalizedExprIfStmt ||
        expr.kind == parser.NormalizedExprElifStmt ||
        expr.kind == parser.NormalizedExprElseStmt ||
-       expr.kind == parser.NormalizedExprForStmt:
+       expr.kind == parser.NormalizedExprForStmt ||
+       expr.kind == parser.NormalizedExprMatchStmt ||
+       expr.kind == parser.NormalizedExprCaseStmt:
         return true
     return false
 
@@ -8439,7 +9262,9 @@ fn TypedExprScopeNeedsStructuredStatements(ctx: var TypedExprSourceContext,
             hasControlStatement = true
         elif expr.kind == parser.NormalizedExprIfStmt ||
              expr.kind == parser.NormalizedExprElifStmt ||
-             expr.kind == parser.NormalizedExprElseStmt:
+             expr.kind == parser.NormalizedExprElseStmt ||
+             expr.kind == parser.NormalizedExprMatchStmt ||
+             expr.kind == parser.NormalizedExprCaseStmt:
             hasControlStatement = true
     if hasAssignStatement || hasForStatement:
         return true
@@ -9109,6 +9934,10 @@ fn TypedExprControlStatementKindFromExpr(expr: parser.NormalizedExpr): TypedExpr
         return TypedExprIrStmtElse
     if expr.kind == parser.NormalizedExprForStmt:
         return TypedExprIrStmtFor
+    if expr.kind == parser.NormalizedExprMatchStmt:
+        return TypedExprIrStmtMatch
+    if expr.kind == parser.NormalizedExprCaseStmt:
+        return TypedExprIrStmtCase
     return TypedExprIrStmtUnsupported
 
 fn TypedExprForBindingNameFromHeader(headerRaw: str): str =
@@ -9542,7 +10371,9 @@ fn TypedExprIrAppendStatementsForScopeFromExprLayer(ir: var TypedExprIr,
         if expr.kind == parser.NormalizedExprIfStmt ||
            expr.kind == parser.NormalizedExprElifStmt ||
            expr.kind == parser.NormalizedExprElseStmt ||
-           expr.kind == parser.NormalizedExprForStmt:
+           expr.kind == parser.NormalizedExprForStmt ||
+           expr.kind == parser.NormalizedExprMatchStmt ||
+           expr.kind == parser.NormalizedExprCaseStmt:
             let _ = TypedExprIrAddControlStatementFromExpr(ir,
                                                            ctx,
                                                            sourceContexts,
@@ -9986,6 +10817,7 @@ fn TypedExprBuildIrWithFactsAndExprLayer(sourceTexts: var TypedExprSourceText[],
         TypedExprIrAppendImportcFunctionsFromContext(ir, ctx)
         TypedExprIrAppendEnumValuesFromContext(ir, ctx)
         TypedExprIrAppendTypeLayoutsFromContext(ir, ctx, contexts)
+        TypedExprIrAppendColdCsgRowsFromContext(ir, ctx)
         let sourceFactRange = TypedExprSourceRangeIndexFind(factSourceRanges, ctx.sourcePath)
         var sourceFactStart: int32
         var sourceFactEnd: int32
@@ -10101,6 +10933,7 @@ fn TypedExprBuildIrFromExprLayer(sourceTexts: var TypedExprSourceText[],
         TypedExprIrAppendImportcFunctionsFromContext(ir, ctxForIr)
         TypedExprIrAppendEnumValuesFromContext(ir, ctxForIr)
         TypedExprIrAppendTypeLayoutsFromContext(ir, ctxForIr, contexts)
+        TypedExprIrAppendColdCsgRowsFromContext(ir, ctxForIr)
         for bindingIndex in 0..<ctxForIr.bindings.len:
             let binding = ctxForIr.bindings[bindingIndex]
             if !binding.globalFlag:

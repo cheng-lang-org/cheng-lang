@@ -208,7 +208,8 @@ static const char *ChengSeed_SUPPORTED_COMMANDS_V2[] = {
     "self-check",
     "compile-bootstrap",
     "bootstrap-bridge",
-    "build-backend-driver"
+    "build-backend-driver",
+    "system-link-exec"
 };
 
 static const char *ChengSeed_REQUIRED_MANIFEST_KEYS[] = {
@@ -49125,6 +49126,7 @@ static bool cheng_seed_provider_export_roots_for_module(const ChengSeedSystemLin
             "driver_c_progress_bridge",
             "driver_c_stderr_line_return2_bridge",
             "driver_c_u64_to_str",
+            "driver_c_write_cold_csg_source_bridge",
             "driver_c_write_error_report_bridge",
             "driver_c_write_text_file_bridge",
             "get_stderr",

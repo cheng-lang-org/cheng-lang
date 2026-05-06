@@ -28,10 +28,10 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - 模块与包：支持 `module`、`import`、`import ... as ...`、前缀分组导入 `import pkg/[a,b]`、包根 `cheng-package.toml`、`<pkg>/<path>` 模块路径、仓内 `src/` 回退解析；导出规则是 Go 风格首字母大写导出。
 - 包解析与锁定：支持 `package_id`、依赖 channel、`cheng.lock.toml`、内容寻址包缓存、本地包根搜索与源码直发记录；编译期导入不联网，只消费本地解析结果。
 - 顶层声明：支持 `let/var/const`、`type`、`fn`、`iterator`、`macro`、`template`、`concept`、`trait`；旧 `proc/method/converter` 已移除。
-- 例程与类型：支持普通函数、`async fn`、迭代器、匿名函数、闭包、函数指针、泛型/`where`、具名参数、默认参数；支持 `bool`、整数、浮点、`char`、`str`、`cstring`、`nil`、`enum`、`set[T]`、`tuple[...]`、`object/ref object`、`var T` 借用、`fn(...)`、点限定类型名、`new(Type)`、`T()` 复合零值物化。
+- 例程与类型：支持普通函数、`async fn`、迭代器、匿名函数、闭包、函数指针、泛型/`where`、具名参数、默认参数；支持 `bool`、整数、浮点、`char`、`str`、`cstring`、`nil`、`enum`、代数类型/tagged union（如 `type Option[T] = Some(value: T) | None`）、`set[T]`、`tuple[...]`、`object/ref object`、`var T` 借用、`fn(...)`、点限定类型名、`new(Type)`、`T()` 复合零值物化。
 - 容器与数据：动态序列 `T[]`，定长数组 `T[N]`，字面量 `[]/[a,b]`，列表生成式 `[expr for pat in iter if cond]`，对象字段默认值，tuple 元素默认值，隐式默认值初始化，Table/HashMap 键值迭代。
 - 表达式：成员访问、下标/切片、小括号调用、具名实参、区间 `a..b`/`a..<b`、三目 `?:`、`if/when/case` 表达式、postfix `expr?` 解包、`$x` 字符串化、静态运算符重载、`TypeExpr(expr)` 显式类型转换。
-- 控制流：`if/elif/else`、`while`、`for ... in ...`、`case/of`、`when`、`block`、`break`、`continue`、`return`、`yield`、`defer`；支持单行 `suite ::= statement`。
+- 控制流：`if/elif/else`、`match` 模式匹配、`while`、`for ... in ...`、`case/of`、`when`、`block`、`break`、`continue`、`return`、`yield`、`defer`；支持单行 `suite ::= statement`。
 - 字符串与格式化：内建字符串类型只有 `str/cstring`；支持短字符串 `"..."` 与多行字符串 `"""..."""`；只保留 `Fmt"..."` / `Fmt"""..."""` 插值；动态数组拼接用 `std/strutils.Join(parts, "")`，按行拼接用 `Lines(parts)`；`str` 默认非空值语义，判空用 `len(s)`。
 - 所有权与并发：固定 `MM=orc`；支持 ownership 分类、moveHint、Borrowed/Owned/Unmanaged、`share/share_mt`、`Arc[T]`、`Mutex[T]`、`RwLock[T]`、`Atomic[T]`；跨线程边界按 `@thread_boundary + Send/Sync` 检查。
 - FFI 与 ABI：支持 `@importc/@exportc`、`@ffi_map`、`@ffi_out_ptrs`、`@ffi_handle`、`@borrows`、`@escapes`；公开生产口径默认 no-pointer，按 `ZRPC` 禁止裸指针表面和指针算术。
@@ -40,6 +40,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - 逻辑运算：`&&` / `||` / `!`，其中 `&&` / `||` 按从左到右短路求值；按位异或：`^`。
 - 条件分支语法固定为 `if/elif/else`；`else if` 为非法写法（需改为 `elif`）。
 - `suite ::= statement` 为稳定语义，因此 `if x < 0: return 0` 这类单行 suite 是合法写法。
+- 代数类型使用 `|` 分隔 variant，variant payload 写字段列表；模式匹配写 `match value:` 后缩进 arms，arm 分隔符固定为 `=>`，例如 `Some(x) => return x`、`None => return 0`。
 - 条件表达式支持三目：`cond ? thenExpr : elseExpr`（右结合）。注意与 postfix `expr?`（Result/Option 解包）是不同语义。
 - 整除/取模：`/` 与 `%`；`div/mod` 已移除。
 - 字符串拼接操作符 `+` 已移除；字符串组合使用 `Fmt"..."`、`std/strutils.Join(...)` 或 `Lines(...)`。数值加法仍使用 `+`；`concat` 已移除。

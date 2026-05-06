@@ -18,6 +18,9 @@
 - BodyIR predicate/word count/reloc offset/emit必须消费同一op集合。
 - Cheng `expr?`：保留 `let/call` 解包传播；禁止 `return expr?`，除非语言层明确 return 自动包装规则。
 - 冷编译器当前语义：`int32[N]` 是固定长度数组，不是 `int32[]` 的容量提示；`int32[]` 才是动态序列 header。
+- `30-80ms` 冷自举口径是 10万-30万行编译器核心的极限架构目标；约 2000 行真实 bootstrap 子集只是阶段 milestone，不能写成最终 100% 定义。
+- `cheng_cold.c` 主线不能为命中旧 `stage3/cheng_seed.c` root 规则改用 `driver_c_*` bridge；冷路径用中性 `cheng_*` bridge + 显式 roots。
+- Cheng 复合类型默认写法是 `type A =` 后缩进字段块；`object` 关键字不是必需语法，冷 parser 必须按缩进字段声明判定 object。
 
 ## Resolved
 

@@ -1985,6 +1985,142 @@ fn BackendDriverRunBuildPlanReportSmoke(rootDir: str): int32 =
     BackendDriverPrintLine("build_plan_report_smoke ok")
     return 0
 
+fn BackendDriverRunColdCsgSidecarSmoke(rootDir: str,
+                                         compilerPath: str,
+                                         outDir: str,
+                                         label: str): int32 =
+    let smokeName = "cold_csg_sidecar_smoke"
+    let src = chengpath.PathAbsolute(rootDir, "src/tests/backend_matrix_cfg_if_guard.cheng")
+    if !chengpath.FileExistsNonEmpty(rootDir, src):
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: missing source: ", src], ""))
+        return 1
+    let outBin = os.JoinPath(outDir, smokeName)
+    let factsPath = strutil.Join([outBin, ".cold.csg"], "")
+    let reportPath = strutil.Join([outBin, ".compile.report.txt"], "")
+    let compileLog = strutil.Join([outBin, ".compile.log"], "")
+    let runLog = strutil.Join([outBin, ".run.log"], "")
+    let coldCompiler = os.JoinPath(outDir, "cheng_cold_sidecar_probe")
+    let coldBuildLog = strutil.Join([coldCompiler, ".build.log"], "")
+    let coldOut = strutil.Join([outBin, ".from_facts"], "")
+    let coldReport = strutil.Join([coldOut, ".report.txt"], "")
+    let coldCompileLog = strutil.Join([coldOut, ".compile.log"], "")
+    let coldRunLog = strutil.Join([coldOut, ".run.log"], "")
+    let paths: str[] = [
+        outBin,
+        factsPath,
+        reportPath,
+        compileLog,
+        runLog,
+        coldCompiler,
+        coldBuildLog,
+        coldOut,
+        coldReport,
+        coldCompileLog,
+        coldRunLog,
+        strutil.Join([outBin, ".map"], ""),
+        strutil.Join([coldOut, ".map"], "")
+    ]
+    for i in 0..<paths.len:
+        if chengpath.PathFileExists(paths[i]):
+            os.RemoveFile(paths[i])
+    BackendDriverPrintLine("[cheng backend driver host smokes] cold csg sidecar")
+    let compileRun = hostops.RunFileLogged(rootDir,
+                                             strutil.Join(["backend_driver_host_smoke_compile_", label, "_cold_csg_sidecar"], ""),
+                                             compilerPath,
+                                             [
+                                                 "system-link-exec",
+                                                 "--root", rootDir,
+                                                 "--in", src,
+                                                 "--emit", "exe",
+                                                 "--target", "arm64-apple-darwin",
+                                                 "--out", outBin,
+                                                 "--report-out", reportPath,
+                                                 "--cold-csg-out", factsPath
+                                             ],
+                                             BackendDriverHostSmokeCompileEnv(),
+                                             rootDir,
+                                             300,
+                                             compileLog)
+    if !hostops.LoggedRunOk(compileRun):
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: cold csg sidecar compile failed: ", hostops.LoggedRunSummary(compileRun)], ""))
+        return compileRun.exitCode
+    if !chengpath.FileExistsNonEmpty(rootDir, factsPath):
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: cold csg sidecar missing facts: ", factsPath], ""))
+        return 1
+    let facts = chengpath.ReadTextFile(rootDir, factsPath)
+    if !BackendDriverExpectContains(smokeName, facts, "cold_csg_entry=main"):
+        return 1
+    if !BackendDriverExpectContains(smokeName, facts, "cold_csg_stmt\t2\t4\tvar_t\tcount\tint32\tCount()"):
+        return 1
+    if !BackendDriverExpectContains(smokeName, facts, "cold_csg_stmt\t2\t4\tif\tcount <= 0"):
+        return 1
+    if !BackendDriverExpectContains(smokeName, facts, "cold_csg_stmt\t2\t4\treturn\tCall()"):
+        return 1
+    let run = hostops.RunFileLogged(rootDir,
+                                      strutil.Join(["backend_driver_host_smoke_run_", label, "_cold_csg_sidecar"], ""),
+                                      outBin,
+                                      [],
+                                      [],
+                                      rootDir,
+                                      30,
+                                      runLog)
+    if run.exitCode != 13:
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: cold csg sidecar executable exit mismatch: ", hostops.LoggedRunSummary(run)], ""))
+        return 1
+    let coldBuild = hostops.RunProgramLogged(rootDir,
+                                             strutil.Join(["backend_driver_host_smoke_build_", label, "_cold_csg_sidecar_compiler"], ""),
+                                             "cc",
+                                             [
+                                                 "-std=c11",
+                                                 "-Wall",
+                                                 "-Wextra",
+                                                 "-O2",
+                                                 "bootstrap/cheng_cold.c",
+                                                 "-o",
+                                                 coldCompiler
+                                             ],
+                                             [],
+                                             rootDir,
+                                             60,
+                                             coldBuildLog)
+    if !hostops.LoggedRunOk(coldBuild):
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: cold csg sidecar cold compiler build failed: ", hostops.LoggedRunSummary(coldBuild)], ""))
+        return coldBuild.exitCode
+    let coldCompile = hostops.RunFileLogged(rootDir,
+                                            strutil.Join(["backend_driver_host_smoke_compile_", label, "_cold_csg_sidecar_facts"], ""),
+                                            coldCompiler,
+                                            [
+                                                "system-link-exec",
+                                                strutil.Join(["--csg-in:", factsPath], ""),
+                                                strutil.Join(["--out:", coldOut], ""),
+                                                strutil.Join(["--report-out:", coldReport], "")
+                                            ],
+                                            [],
+                                            rootDir,
+                                            30,
+                                            coldCompileLog)
+    if !hostops.LoggedRunOk(coldCompile):
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: cold csg sidecar facts compile failed: ", hostops.LoggedRunSummary(coldCompile)], ""))
+        return coldCompile.exitCode
+    let coldRun = hostops.RunFileLogged(rootDir,
+                                        strutil.Join(["backend_driver_host_smoke_run_", label, "_cold_csg_sidecar_facts"], ""),
+                                        coldOut,
+                                        [],
+                                        [],
+                                        rootDir,
+                                        30,
+                                        coldRunLog)
+    if coldRun.exitCode != 13:
+        BackendDriverPrintErr(strutil.Join(["backend driver host smokes: cold csg sidecar facts executable exit mismatch: ", hostops.LoggedRunSummary(coldRun)], ""))
+        return 1
+    let coldReportText = chengpath.ReadTextFile(rootDir, coldReport)
+    if !BackendDriverExpectContains(smokeName, coldReportText, "cold_compile_elapsed_ms="):
+        return 1
+    if !BackendDriverExpectNotContains(smokeName, coldReportText, "elapsed_us"):
+        return 1
+    BackendDriverPrintLine(" cold_csg_sidecar_smoke ok")
+    return 0
+
 fn BackendDriverRunOneHostSmoke(rootDir: str,
                                   compilerPath: str,
                                   outDir: str,
@@ -2001,6 +2137,8 @@ fn BackendDriverRunOneHostSmoke(rootDir: str,
         return BackendDriverRunCommandSurfaceSmoke(rootDir, compilerPath, outDir, label)
     if smokeName == "build_plan_report_smoke":
         return BackendDriverRunBuildPlanReportSmoke(rootDir)
+    if smokeName == "cold_csg_sidecar_smoke":
+        return BackendDriverRunColdCsgSidecarSmoke(rootDir, compilerPath, outDir, label)
     let src = chengpath.PathAbsolute(rootDir, strutil.Join(["src/tests/", smokeName, ".cheng"], ""))
     if !chengpath.FileExistsNonEmpty(rootDir, src):
         BackendDriverPrintErr(strutil.Join(["backend driver host smokes: missing source: ", src], ""))
