@@ -1,21 +1,20 @@
 # Findings (2026-05-06)
 
-## Cold compiler source-direct capability gaps (2026-05-06)
-- source-direct parser 不支持的语法：`type X = object` 声明、`&` `*` `>>` 操作符、`var` 参数、对象字段赋值、`add` 内置函数、`str == str` 比较
-- CSG 路径已支持这些能力（通过 `cold_emit_csg_type_rows` / `cold_csg_object` / `cold_csg_statement_row` 等）
-- 冷编译器不需要支持 Cheng 全部语法，只需支持真实编译器源码实际用到的子集
+## Cold compiler current gaps (2026-05-06)
+- 冷编译器不需要支持 Cheng 全部语法，只需支持真实编译器源码实际用到的 bootstrap kernel 子集。
+- 本轮已补齐：默认 object 写法、`&/*/>>` 基础算术、非 int32 泛型 ADT payload、`var int32[]` 参数、`add(int32[], int32)`、object 字段上的动态序列引用。
+- 剩余缺口：对象字段赋值、`str == str` 比较、泛型字段 facts 的结构化格式、真实 bootstrap kernel 成片迁入。
 
 ## Cold compiler source-direct parser fixes (2026-05-06)
-- 新增 `object` 类型声明支持：`parse_type` 中检测 RHS 为 `object` 时解析缩进字段行，创建 `ObjectDef`，新增 `object_finalize_fields` 计算 slot layout
+- 新增默认 object 类型声明支持：`parse_type` 中对 `type A =` 后缩进 `name: Type` 字段行创建 `ObjectDef`，新增 `object_finalize_fields` 计算 slot layout；不要求 `object` 关键字
 - 新增 `*` `>>` `&` 操作符：新增 `BODY_OP_I32_MUL=20` `BODY_OP_I32_ASR=21` `BODY_OP_I32_AND=22` 三个 BodyIR opcode，ARM64 编码 `a64_mul_reg` `a64_asr_reg` `a64_and_reg`
 - 新增 `>>` tokenizer 支持（双字符 token 识别）
-- `&` 和 `*` 已验证通过 source-direct 路径；`>>` 有 tokenizer 冲突待修
+- `&` 和 `*` 已验证通过 source-direct 路径；`>>` 已进入 tokenizer/codegen，需随真实 kernel 切片继续扩大覆盖
 
-## Cold compiler remaining gaps
-- 非 int32 泛型参数（`Result[ObjectType, ADTType]`）不工作：`cold_validate_call_args` 中 variant field size 用默认 64 而非实际 type table 值
-- `var` 参数不支持：`parse_param_specs` 不识别 `var` 关键字
-- `add` 内置函数在 CSG 路径识别为 "unknown function call"
-- source-direct object constructor 对 `int32[N]` 字段有数组长度解析 bug
+## Cold var/generic completion
+- `Result[ObjType, Diag]` 已通过 source-direct、source->CSG、facts direct 三条路径，object payload/error 按实际 layout 传递、返回和 match。
+- `var int32[]` 参数和 `add(xs, value)` 已通过 source-direct、source->CSG、facts direct 三条路径；局部序列和 object 字段序列都能被 `add` 原地修改。
+- `add` 当前只承诺 `int32[]`，不承诺泛型 `T[]`；大范围开放前必须先把元素类型、扩容和拷贝规则结构化。
 
 ## Architecture
 - Cold compiler (`cheng_cold.c` ~8000loc C) + full compiler (`src/` Cheng) coexistence model validated.

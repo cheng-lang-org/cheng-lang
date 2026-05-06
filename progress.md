@@ -1,15 +1,16 @@
 # Progress (2026-05-06)
 
-## Cold compiler source-direct parser 升级
-- 完成度：88%（冷 bootstrap 总量未变，source-direct 能力补了 4 项里 2 项）
-- `parse_type`：新增 Cheng 正式默认 object 写法支持，`type A =` 后缩进字段块直接创建 `ObjectDef`，不要求显式 `object` 关键字；通过 `object_finalize_fields` 计算字段 offset/slot_size
-- `parse_expr`：新增 `*` `>>` `&` 三个二元操作符，新增 `BODY_OP_I32_MUL=20` `BODY_OP_I32_ASR=21` `BODY_OP_I32_AND=22` 三个 opcode
-- ARM64 编码：新增 `a64_mul_reg` `a64_asr_reg` `a64_and_reg`，`codegen_op` 中新增对应 case
-- Tokenizer：新增 `>>` 双字符 token 识别
-- 验证：`&` 操作符 source-direct `7 & 3` exit 3 通过；`*` 操作符 `6 * 7` source-direct 通过；implicit object source-direct/source->CSG/facts direct 均通过
-- 回归：CSG 路径 `cold_bootstrap_slice_object_field_index` 17.474ms exit 24、`cold_bootstrap_slice_types` 16.000ms exit 4、`cold_bootstrap_slice_tuple_default` 17.604ms exit 30、`cold_bootstrap_slice_seq_local` 16.709ms exit 47
-- 最新耗时：implicit object source-direct 外层 479.439ms、报告内 `cold_compile_elapsed_ms=25.748`、exit 25；source->CSG 外层 28.109ms、报告内 18.497ms、exit 25；facts direct 外层 26.286ms、报告内 16.909ms、exit 25
-- 缺口：`>>` tokenizer 与 `>` 比较操作符需继续回归；非 int32 泛型参数编译失败（"cold function variant arg size mismatch"）；`var` 参数与 `add` 内置尚未完成
+## Cold compiler bootstrap slice 扩展
+- 完成度：91%（四个本轮缺口已打通；剩余完成度取决于真实 2000 行 bootstrap kernel 覆盖，不靠再堆 fixture 计算）
+- `type A =` 后缩进字段块按 Cheng 正式默认 object 写法解析，不要求 `object` 关键字；字段 layout 走 `object_finalize_fields`
+- `*` `>>` `&` 已进入 tokenizer、BodyIR opcode 和 ARM64 codegen；`&`/`*` source-direct 已验证
+- 非 int32 泛型参数已支持：`Result[ObjType, Diag]` 会从泛型 ADT 单态化出真实 payload layout，object payload 和 object error 均按实际 slot size 传递/返回/match
+- `var int32[]` 参数和 `add(xs, value)` 已支持；动态序列 slot 为 `len/cap/buffer`，容量不足时用 Darwin `mmap` 扩容，object 字段 `b.items` 可通过 field ref 传给 `add`
+- 新增验证切片：`cold_bootstrap_slice_var_add` exit 26，`cold_bootstrap_slice_generic_result` exit 42
+- 最新耗时：`cc_cheng_cold_ms=1929.078 rc=0`；`var_add` 直编外层 448.593ms/报告 20.266ms，source->CSG 19.312ms/报告 16.368ms，facts direct 16.717ms/报告 14.037ms；`generic_result` 直编 18.621ms/报告 15.913ms，source->CSG 18.277ms/报告 15.458ms，facts direct 18.028ms/报告 15.318ms
+- ASan/UBSan：`cc_cheng_cold_asan_ms=2894.314 rc=0`；`var_add` source->CSG 611.681ms/报告 15.056ms，facts direct 46.161ms/报告 16.119ms；`generic_result` source->CSG 43.264ms/报告 15.662ms，facts direct 45.778ms/报告 16.493ms
+- 回归矩阵：17 个旧 CSG/source->facts 切片全部通过，报告内 `cold_compile_elapsed_ms` 范围 14.959ms-24.199ms，退出码符合预期
+- 剩余缺口：真实 bootstrap kernel 还未成片迁入；`add` 当前只承诺 `int32[]`；facts 文本格式对嵌套泛型字段仍需结构化化，不能继续靠逗号文本切分扩展
 
 # Progress (2026-05-05)
 
@@ -34,11 +35,11 @@
 # Progress (2026-05-06)
 
 ## Cold bootstrap completion score
-- 当前完成度：88%。
+- 当前完成度：91%。
 - 最终 100% 定义：`bootstrap/cheng_cold.c` 能在 cold path 中编译 10万-30万行编译器核心，直写可运行 Mach-O，替代当前 cold seed 启动路径；默认验证包含 source->CSG、CSG->BodyIR、direct Mach-O、ASan、真实自举闭包回归，冷编译耗时稳定落在 30-80ms 目标窗内。
 - 当前阶段 milestone：先打通约 2000 行真实 bootstrap 子集，作为从 fixture 走向全量冷自举的第一段，不等于最终完成。
-- 进度权重：基础 Arena/SoA/Mach-O/毫秒报告 15/15；source->CSG facts 与 Cheng exporter 15/15；CFG 12/15；ADT/str/object/composite ABI 20/20；Result 错误流 11/15；真实 bootstrap 子集覆盖 10/15；替代 seed gate 与性能门禁 5/5。
-- 下一个涨点：扩大真实 2000 行 bootstrap 子集覆盖，把当前 fixture 能力迁进真实 cold seed 替代路径。
+- 进度权重：基础 Arena/SoA/Mach-O/毫秒报告 15/15；source->CSG facts 与 Cheng exporter 15/15；CFG 12/15；ADT/str/object/composite ABI 20/20；Result/泛型错误流 13/15；真实 bootstrap 子集覆盖 11/15；替代 seed gate 与性能门禁 5/5。
+- 下一个涨点：迁入真实 bootstrap kernel 的源码片段，减少手写 slice 与真实编译器源码之间的距离。
 
 ## Cold compiler CSG path
 - `bootstrap/cheng_cold.c` 新增 `system-link-exec --csg-out:<facts>`：源码先生成 cold CSG facts，再从 facts 降到 SoA BodyIR 和 direct Mach-O。

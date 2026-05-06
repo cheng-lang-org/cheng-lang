@@ -14,11 +14,13 @@
 - 已完成：第二个真实 bootstrap slice `cold_bootstrap_slice_object_field_index` 通过，覆盖 object 布局、field load、`int32[N]` array literal/index、object sret 返回、object byref 参数 ABI。
 - 已完成：第三个真实 bootstrap slice `cold_bootstrap_slice_tuple_default` 通过，覆盖 type block 混合 object/tuple、tuple-as-object layout、typed default init、复合零值和 `int32[N]` 默认值。
 - 已完成：局部 `int32[]` 动态序列切片 `cold_bootstrap_slice_seq_local` 通过，覆盖 typed literal、typed empty literal、默认空值、`.len`、常量下标，并与 `int32[N]` 固定数组同测防语义混淆。
+- 已完成：`cold_bootstrap_slice_var_add` 通过，覆盖 `var int32[]` 参数、`add(int32[], int32)`、动态序列扩容、object 字段序列 field-ref 原地修改，三条路径均 exit 26。
+- 已完成：`cold_bootstrap_slice_generic_result` 通过，覆盖 `Result[ObjType, Diag]` 非 int32 泛型参数、object payload/error layout、复合返回、match payload 字段读取，三条路径均 exit 42。
 - 已完成：刷新 `artifacts/backend_driver/cheng`，修通 provider self-compile importc 符号闭包；zero-exit selftest 通过，cold sidecar 手动 gate 通过。
 - 已完成：Cheng 侧 `compiler_csg -> cold facts` exporter 经 backend sidecar 验证，facts direct 冷编译报告 `cold_compile_elapsed_ms=19.961`，无 `elapsed_us`。
 - 已完成：把 cold sidecar gate 下沉到当前 dispatch_min 命令面，`run-host-smokes cold_csg_sidecar_smoke` 可直接跑完 backend facts exporter、冷 compiler facts path 和最终可执行退出码校验。
 - 已完成：`compiler_csg -> cold facts` ADT/match 主线接通；默认 `cold_csg_sidecar_smoke` 现在同时覆盖 `Option.Some(7)` 的 `cold_csg_type/match/case` facts、`cheng_cold --csg-in` switch lowering 和 exit 7。
-- 下一步：把当前 fixture 能力迁到真实 bootstrap 子集，先从 isolated slices 推到约 2000 行 milestone；最终目标仍是 10万-30万行编译器核心冷自举，同时保留 `cold_compile_elapsed_ms` 作为 30-80ms 内核耗时合同。
+- 下一步：不再继续堆孤立 fixture；迁入真实 bootstrap kernel 源码片段，先形成约 2000 行可编译闭包。最终目标仍是 10万-30万行编译器核心冷自举，同时保留 `cold_compile_elapsed_ms` 作为 30-80ms 内核耗时合同。
 
 - 迁移目标：仓库根包固定为 `pkg://cheng`，唯一源码树为 `src`，编译器内核在 `src/core`。
 - 已完成：源码、测试、seed、r2c 工具路径和公开环境变量去掉旧版本标识。
