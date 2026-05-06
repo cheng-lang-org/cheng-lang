@@ -1,0 +1,122 @@
+import std/os
+import std/strutils as strutil
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/tooling/compiler_csg as ccsg
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+fn main(): int32 =
+    let workspaceRoot: str = os.GetEnvDefault("CHENG_SMOKE_ROOT", chengpath.PathCurrentDir())
+    let packageRoot: str = workspaceRoot
+    let outDir: str = chengpath.PathJoin(workspaceRoot, "artifacts/cold_csg_exporter")
+    assert(chengpath.MkdirP(workspaceRoot, outDir), " cold csg exporter: mkdir")
+    let fixturePath: str = chengpath.PathJoin(packageRoot, "src/tests/cold_csg_exporter_fixture.cheng")
+    let sourceText: str = chengpath.ReadTextFile(workspaceRoot, fixturePath)
+    assert(len(sourceText) > 0, " cold csg exporter: source")
+    let outputPath: str = chengpath.PathJoin(outDir, "cold_csg_exporter_fixture")
+    let factsPath: str = chengpath.PathJoin(outDir, "cold_csg_exporter_fixture.facts")
+    let req = creq.CompilerRequestNew(packageRoot,
+                                      fixturePath,
+                                      outputPath,
+                                      "arm64-apple-darwin",
+                                      creq.EmitExe,
+                                      "")
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err = ""
+    assert(slplan.BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err),
+           strutil.Join([" cold csg exporter: link plan ", err], ""))
+    let sourceBundleRes = slplan.SystemLinkPlanSourceBundleCid(linkPlan)
+    assert(IsOk(sourceBundleRes), " cold csg exporter: source bundle")
+    var csg: ccsg.CompilerCsg
+    var csgErr = ""
+    assert(ccsg.BuildCompilerCsgInto(linkPlan, Value(sourceBundleRes), csg, csgErr),
+           strutil.Join([" cold csg exporter: compiler csg ", csgErr], ""))
+    var facts = ""
+    var factsErr = ""
+    assert(ccsg.CompilerColdCsgFactsFromCompilerCsgIntoWithSource(csg,
+                                                                  "main",
+                                                                  sourceText,
+                                                                  facts,
+                                                                  factsErr),
+           strutil.Join([" cold csg exporter: facts ", factsErr], ""))
+    assert(chengpath.TextContains(facts, "cold_csg_entry=main"),
+           " cold csg exporter: entry")
+    assert(chengpath.TextContains(facts, "cold_csg_type\tIntResult\tOkInt:1:i,ErrStr:1:s"),
+           " cold csg exporter: adt type")
+    assert(chengpath.TextContains(facts, "cold_csg_function\t1\tCount\tseed:i\tIntResult"),
+           " cold csg exporter: composite return function")
+    assert(chengpath.TextContains(facts, "cold_csg_stmt\t1\t4\tfor_range\ti\t1\t3\tle"),
+           " cold csg exporter: inclusive range")
+    assert(chengpath.TextContains(facts, "cold_csg_stmt\t1\t8\telif\ti == 3"),
+           " cold csg exporter: elif")
+    assert(chengpath.TextContains(facts, "cold_csg_stmt\t1\t12\tassign\tx\tx + Touch(i)"),
+           " cold csg exporter: call expression assign")
+    assert(chengpath.TextContains(facts, "cold_csg_stmt\t2\t4\tmatch\tr"),
+           " cold csg exporter: match")
+    assert(chengpath.TextContains(facts, "cold_csg_stmt\t2\t8\tcase\tOkInt\tvalue"),
+           " cold csg exporter: OkInt case")
+    assert(chengpath.TextContains(facts, "cold_csg_stmt\t2\t8\tcase\tErrStr\te"),
+           " cold csg exporter: ErrStr case")
+    assert(chengpath.WriteTextFile(workspaceRoot, factsPath, facts),
+           " cold csg exporter: write facts")
+    let coldCompilerPath = chengpath.PathJoin(outDir, "cheng_cold_csg")
+    let coldBuildLog = chengpath.PathJoin(outDir, "cheng_cold_csg.build.log")
+    let coldBuild = hostops.RunProgramLogged(workspaceRoot,
+                                             "cold_csg_exporter_build_cold",
+                                             "cc",
+                                             [
+                                                 "-std=c11",
+                                                 "-Wall",
+                                                 "-Wextra",
+                                                 "-Werror",
+                                                 "-pedantic",
+                                                 "-O2",
+                                                 "-g",
+                                                 "bootstrap/cheng_cold.c",
+                                                 "-o",
+                                                 coldCompilerPath
+                                             ],
+                                             [],
+                                             workspaceRoot,
+                                             60,
+                                             coldBuildLog)
+    assert(hostops.LoggedRunOk(coldBuild),
+           strutil.Join([" cold csg exporter: cold compiler build ", hostops.LoggedRunSummary(coldBuild)], ""))
+    let coldOut = chengpath.PathJoin(outDir, "cold_csg_exporter_fixture.cold")
+    let coldReport = chengpath.PathJoin(outDir, "cold_csg_exporter_fixture.cold.report.txt")
+    let coldCompileLog = chengpath.PathJoin(outDir, "cold_csg_exporter_fixture.cold.compile.log")
+    let coldCompile = hostops.RunFileLogged(workspaceRoot,
+                                            "cold_csg_exporter_compile_facts",
+                                            coldCompilerPath,
+                                            [
+                                                "system-link-exec",
+                                                strutil.Join(["--csg-in:", factsPath], ""),
+                                                strutil.Join(["--out:", coldOut], ""),
+                                                strutil.Join(["--report-out:", coldReport], "")
+                                            ],
+                                            [],
+                                            workspaceRoot,
+                                            30,
+                                            coldCompileLog)
+    assert(hostops.LoggedRunOk(coldCompile),
+           strutil.Join([" cold csg exporter: cold compile ", hostops.LoggedRunSummary(coldCompile)], ""))
+    let coldRunLog = chengpath.PathJoin(outDir, "cold_csg_exporter_fixture.cold.run.log")
+    let coldRun = hostops.RunFileLogged(workspaceRoot,
+                                        "cold_csg_exporter_run_cold",
+                                        coldOut,
+                                        [],
+                                        [],
+                                        workspaceRoot,
+                                        30,
+                                        coldRunLog)
+    assert(coldRun.exitCode == 11,
+           strutil.Join([" cold csg exporter: cold run exit ", hostops.LoggedRunSummary(coldRun)], ""))
+    let coldReportText = chengpath.ReadTextFile(workspaceRoot, coldReport)
+    assert(chengpath.TextContains(coldReportText, "cold_compile_elapsed_ms="),
+           " cold csg exporter: ms report")
+    assert(!chengpath.TextContains(coldReportText, "elapsed_us"),
+           " cold csg exporter: no us report")
+    echo(strutil.Join(["cold_csg_facts_path=", factsPath], ""))
+    echo(" cold_csg_facts_exporter_smoke ok")
+    return 0

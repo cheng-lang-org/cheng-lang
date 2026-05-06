@@ -1,5 +1,20 @@
 # 当前任务计划
 
+- 已完成：冷编译器 `system-link-exec --csg-out:<facts>`，源码先生成 cold CSG facts，再经 facts 降 SoA BodyIR 和 direct Mach-O；backend-driver candidate smoke 已使用该路径，不再手写 facts。
+- 已完成：冷 CFG `if/elif/else` fallthrough 封口顺序修复，旧 source/facts 回归均通过。
+- 已完成：cold facts 覆盖 ADT/match：`cold_csg_type`、`match`、`case` rows 可从源码生成并降为 `TAG_LOAD + SWITCH + PAYLOAD_LOAD`。
+- 已完成：多字段 ADT payload：variant slot 按父类型最大字段数分配，constructor 和 match binding 支持多 payload word。
+- 已完成：`str/cstring` 最小 slot layout：string literal 生成 ptr/len，ADT payload 可携带 `str`，`len(str)` 可降为 i32。
+- 已完成：cold facts 覆盖复合返回 ABI：`fn -> str` 与 `fn -> ADT` 走 Darwin sret `x8`，source/CSG paths 均验证。
+- 已完成：cold 函数参数 ABI 支持 `str` 参数，facts 参数字段升级为 `name:i/name:s`，旧无类型参数仍按 i32 读取。
+- 已完成：cold facts 和 source-direct 覆盖真实 Result `?` 错误流的 `let_q/call_q`：Err 早返回原 Result，Ok 继续；`return expr?` 在 parser/exporter 入口硬失败。
+- 已推进：第一个真实 bootstrap slice `cold_bootstrap_slice_types` 通过，覆盖多行 ADT、nested variant payload、嵌套 match、variant 参数 ABI。
+- 已完成：大 ADT 参数 ABI 不再截断；source->CSG 保留 `name:TypeName`，CSG 根据 type table 解析真实 slot size，`>16 bytes` 参数按地址传递并在 callee 复制完整值。
+- 已完成：`match f():` 表达式目标回归；新增 `cold_csg_match_call_target_fixture.cheng`，`match Pick(1):` 经 source->CSG/direct Mach-O 运行 exit 42。
+- 已完成：第二个真实 bootstrap slice `cold_bootstrap_slice_object_field_index` 通过，覆盖 object 布局、field load、`int32[N]` array literal/index、object sret 返回、object byref 参数 ABI。
+- 已完成：第三个真实 bootstrap slice `cold_bootstrap_slice_tuple_default` 通过，覆盖 type block 混合 object/tuple、tuple-as-object layout、typed default init、复合零值和 `int32[N]` 默认值。
+- 下一步：把 Cheng 侧 `compiler_csg -> cold facts` exporter 从重型 smoke 拆成轻量 backend sidecar gate 后验证；再补动态序列 `T[]`、typed IR ADT/match 导出，向真实 2000 行 bootstrap 子集推进。
+
 - 迁移目标：仓库根包固定为 `pkg://cheng`，唯一源码树为 `src`，编译器内核在 `src/core`。
 - 已完成：源码、测试、seed、r2c 工具路径和公开环境变量去掉旧版本标识。
 - 已完成：`chain_node` 从核心编译门禁移除，保留为应用/领域手动命令。

@@ -543,7 +543,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 ### 1.2.1 语义约束（补充）
 
 - 表达式语句允许忽略返回值；语法级 `discard` 已移除（`discard x`/`discard(x)` 旧写法会报错），默认允许 unused-value。
-- `[]` / `[a, b, c]` 是列表字面量（历史序列字面量 `@[ ... ]` 已移除）：用于构造 `T[]`（动态序列）；`T[N]` 不是定长数组，而是 `T[]` 的“初始化 reserve 容量提示”（cap hint）类型标注。**空 `[]`** 必须有类型上下文：允许用于已有类型的赋值（`xs = []`）、`return []`、以及实参位置（参数类型已知）；禁止作为无类型上下文的独立表达式语句。
+- `[]` / `[a, b, c]` 是列表字面量（历史序列字面量 `@[ ... ]` 已移除）：用于构造 `T[]`（动态序列）或 `T[N]`（固定长度数组）。**空 `[]`** 必须有类型上下文：允许用于已有类型的赋值（`xs = []`）、`return []`、以及实参位置（参数类型已知）；禁止作为无类型上下文的独立表达式语句。
 - 调用语法统一使用小括号：`f()`、`f(x)`、`f(a, b)`、`f(name: value)`。空格单参调用 `f x` 属于迁移期旧表面；在 `CHENG_STRICT_CALL_SYNTAX=1` 的优雅语法门禁下直接报错，迁移提示为 `use f(x)`。字符串格式化只保留 Nim 风格 `Fmt"..."`；多行拼接使用 `Lines(...)`。
 - `Fmt` 为当前稳定公开格式化表面：`Fmt"label={expr}"` 与 `Fmt"""..."""` 用于插值字符串；无分隔动态数组拼接使用 `std/strutils.Join(parts, "")`，按换行拼接使用 `Lines(parts)` 或 `std/strutils.Join(parts, "\n")`。`Fmt(parts)`、`Fmt expr`、`Lines expr` 不再支持，小写 `fmt/lines` 不导出。
 - 多行字符串语法固定为 `"""` 后立刻换行，结束 `"""` 独占一行；结束符缩进作为公共缩进并从每个非空正文行剥离，正文缩进浅于结束符时编译期报错。开头换行和结束符前的分隔换行不进入字符串；源码换行统一归一为 `\n`。普通 `"""..."""` 不处理反斜杠转义也不插值；`Fmt"""..."""` 只处理 `{expr}` 插值，`{{` / `}}` 表示字面量大括号。
@@ -554,7 +554,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - `for ... in ...` 的 `in` 表达式支持：range 字面值（`a..<b` / `a..b`）、数组/Table/HashMap 的字面值、常量与变量；Table/HashMap 支持 `for k, v in tableOrMap` 键值迭代。
 - 容器/数组类型语法（统一后缀）：
   - `T[]`：动态序列（运行时布局为 `len/cap/buffer`，可扩容；零值为“空序列”；带类型标注省略初始化即可得到空序列，标准库不再提供 `newSeq/newSeqWithCap` 作为初始化入口）。
-  - `T[N]`：动态序列（`T[]`）的“初始化 reserve 容量提示”（cap hint）。`N` 为整数表达式（可为字面量/常量/变量表达式），在运行时求值；仅影响“省略初始化表达式”的隐式默认值初始化（额外执行一次 `reserve(..., N)`），不改变类型身份与 ABI（`T[N]` 与 `T[]` 类型等价）。
+  - `T[N]`：固定长度数组。`N` 是编译期常量，类型身份与 ABI 都包含长度；`T[N]` 与 `T[]` 不等价。
 - 指针与 `[]/[N]` 的后缀允许交错组合：`T*[]`、`T[]*`、`T*[N]`、`T[N]*`。
 - 旧容器语法已移除/禁用并在编译期报错：`seq[T]`、`openArray[T]`、`array[...]`、`seq_fixed[T, N]`（仅允许作为内部 lowering 目标）、`Table_fixed[V, N]`、`Table[V, N]`（容量不得作为类型参数）。
 - FFI 影子桥接（Raw Pointer Safety）：用户层不得显式暴露 `ptr + len`/`out-ptr`/`void*`。
@@ -562,7 +562,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
   - 出参桥接：优先 `@ffi_out_ptrs`，由后端回收为 tuple 返回。
   - 句柄桥接：优先 `@ffi_handle`，由 runtime 负责 `void* <-> handle(u32/u64)` 映射。
   - 借用桥接：优先 `@importc + var T`，在借用校验通过后桥接到 `T*`。
-- 设计结论：只保留 `T[]` 与 `T[N]`；`T[N]` 不改变类型/ABI，只影响“隐式默认值初始化”时的初始 reserve。
+- 设计结论：只保留 `T[]` 与 `T[N]`；`T[]` 表示动态序列，`T[N]` 表示固定长度数组。
 - no-pointer 门禁（生产口径）：当前默认公开编译口径下，用户源码模块默认禁指针；`@importc/@exportc` 等 C ABI 声明不再豁免。旧兼容名 `ABI=v2_noptr` 与 `STAGE1_NO_POINTERS_NON_C_ABI*` 仅保留为内部实现/兼容标识，不构成新的用户编译开关。
   - 禁用指针类型：`T*`、`void*`、`ref T`、`ptr[T]`。
   - 禁用指针操作：解引用（`*`/`->`）、取址（`&`）、`dataPtr/getPointer`、`ptr_add/load_ptr/store_ptr`、`copyMem/setMem/zeroMem`、`alloc/dealloc`。
@@ -687,6 +687,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - Cheng 支持三目条件表达式：`cond ? thenExpr : elseExpr`。
 - `?:` 为右结合，语义遵循 `conditionalExpr ::= logicalOr [ "?" expression ":" conditionalExpr ]`。
 - postfix `expr?` 表示 Result/Option 风格解包语义（失败分支提前返回/传播）；它与三目 `?:` 是两套独立语义。
+- `return expr?` 非法；需要先 `let value = expr?` 再 `return Ok(value)` 或返回其它显式构造值，语言层不做隐式 Ok 包装。
 - 推荐实践：当表达式中同时出现两类 `?`（例如 `x? ? a : b`）时，使用括号显式分组以避免可读性歧义。
 - 例：`flag ? 1 : false ? 2 : 0` 按右结合解析为 `flag ? 1 : (false ? 2 : 0)`。
 

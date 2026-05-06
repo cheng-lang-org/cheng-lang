@@ -16,6 +16,8 @@
 - 改CSG/lowering源码不加速已安装的旧`artifacts/backend_driver/cheng`。
 - BodyIR data side table：writer未消费前必须给明确missing kind。禁静默fallthrough。
 - BodyIR predicate/word count/reloc offset/emit必须消费同一op集合。
+- Cheng `expr?`：保留 `let/call` 解包传播；禁止 `return expr?`，除非语言层明确 return 自动包装规则。
+- 冷编译器当前语义：`int32[N]` 是固定长度数组，不是 `int32[]` 的容量提示；`int32[]` 才是动态序列 header。
 
 ## Resolved
 

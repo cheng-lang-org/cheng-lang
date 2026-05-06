@@ -151,8 +151,11 @@ fn BackendDriverDispatchMinAppendPhaseReport(out: var str,
 
 fn BackendDriverDispatchMinAppendResourceReport(out: var str) =
     let cpuUs = BackendDriverDispatchMinCurrentCpuUs()
+    var cpuMs = int64(-1)
+    if cpuUs >= int64(0):
+        cpuMs = cpuUs / int64(1000)
     let rssBytes = BackendDriverDispatchMinCurrentRssBytes()
-    BackendDriverDispatchMinAppendLine(out, Fmt"report_cpu_us={cpuUs}")
+    BackendDriverDispatchMinAppendLine(out, Fmt"report_cpu_ms={cpuMs}")
     BackendDriverDispatchMinAppendLine(out, Fmt"report_rss_bytes={rssBytes}")
 
 fn BackendDriverDispatchMinAppendOutputFileSizeReport(out: var str,
@@ -1079,6 +1082,32 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcretePlanAfterCsg(driverRoot: str
     var err: str
     phaseProfile.compilerCsgNs = BackendDriverDispatchMinNowNs() - phaseProfile.compilerCsgNs
     BackendDriverDispatchMinProgress("compiler_csg", "done")
+    let coldCsgOut = BackendDriverDispatchMinReadFlagOrDefault("--cold-csg-out", "")
+    if len(coldCsgOut) > 0:
+        var coldFacts = ""
+        var coldErr = ""
+        let coldSourceText = chengpath.ReadTextFile(driverRoot, linkPlan.entryPath)
+        if len(coldSourceText) <= 0:
+            let reason = Fmt"backend driver direct system-link-exec: failed to read cold csg source: {linkPlan.entryPath}"
+            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                                   reportPath,
+                                                                   reason)
+            return BackendDriverDispatchMinUnsupported(reason)
+        if !ccsg.CompilerColdCsgFactsFromCompilerCsgIntoWithSource(csg,
+                                                                    linkPlan.entrySymbol,
+                                                                    coldSourceText,
+                                                                    coldFacts,
+                                                                    coldErr):
+            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                                   reportPath,
+                                                                   coldErr)
+            return BackendDriverDispatchMinUnsupported(coldErr)
+        if !BackendDriverDispatchMinWriteReport(driverRoot, coldCsgOut, coldFacts):
+            let reason = Fmt"backend driver direct system-link-exec: failed to write cold csg facts: {coldCsgOut}"
+            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot,
+                                                                   reportPath,
+                                                                   reason)
+            return BackendDriverDispatchMinUnsupported(reason)
     var loweringPlan: lower.LoweringPlanStub
     phaseProfile.loweringPlanNs = BackendDriverDispatchMinNowNs()
     BackendDriverDispatchMinProgress("lowering_plan", "begin")
