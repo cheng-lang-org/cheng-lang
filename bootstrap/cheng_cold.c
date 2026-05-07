@@ -7358,8 +7358,18 @@ static int32_t parse_constructor(Parser *parser, BodyIR *body, Locals *locals,
             if (payload_count >= variant->field_count) die("too many variant constructor arguments");
             int32_t payload_kind = SLOT_I32;
             int32_t payload_slot = parse_expr(parser, body, locals, &payload_kind);
-            if (payload_kind != variant->field_kind[payload_count]) die("variant constructor payload kind mismatch");
-            if (body->slot_size[payload_slot] != variant->field_size[payload_count]) die("variant constructor payload size mismatch");
+            if (payload_kind != variant->field_kind[payload_count]) {
+                int32_t fk = variant->field_kind[payload_count];
+                if (!((fk == SLOT_VARIANT && (payload_kind == SLOT_VARIANT || payload_kind == SLOT_I32 || payload_kind == SLOT_STR)) ||
+                      (fk == SLOT_I32 && (payload_kind == SLOT_VARIANT || payload_kind == SLOT_I32 || payload_kind == SLOT_STR)) ||
+                      (fk == SLOT_STR && (payload_kind == SLOT_VARIANT || payload_kind == SLOT_I32)))) {
+                    die("variant constructor payload kind mismatch");
+                }
+            }
+            if (body->slot_size[payload_slot] != variant->field_size[payload_count]) {
+                if (payload_kind == variant->field_kind[payload_count])
+                    die("variant constructor payload size mismatch");
+            }
             payload_slots[payload_count] = payload_slot;
             payload_offsets[payload_count] = variant->field_offset[payload_count];
             payload_count++;
@@ -10062,8 +10072,14 @@ static int32_t parse_match(Parser *parser, BodyIR *body, Locals *locals,
     int32_t matched_slot = -1;
     Local *matched = locals_find(locals, expr);
     if (matched) {
-        if (matched->kind != SLOT_VARIANT) die("match target must be a variant value");
+        if (matched->kind != SLOT_VARIANT && matched->kind != SLOT_I32 && matched->kind != SLOT_STR)
+            die("match target must be a variant value");
         matched_slot = matched->slot;
+        if (matched->kind != SLOT_VARIANT) {
+            int32_t vs = body_slot(body, SLOT_VARIANT, 4);
+            body_op(body, BODY_OP_COPY_I32, vs, matched_slot, 0);
+            matched_slot = vs;
+        }
     } else {
         cold_match_eval_target(parser, body, locals, expr, &matched_slot);
     }
@@ -11897,8 +11913,14 @@ static int32_t csg_parse_match(ColdCsgLower *lower, BodyIR *body, Locals *locals
     int32_t matched_slot = -1;
     Local *matched = locals_find(locals, stmt.a);
     if (matched) {
-        if (matched->kind != SLOT_VARIANT) die("cold csg match target must be a variant value");
+        if (matched->kind != SLOT_VARIANT && matched->kind != SLOT_I32 && matched->kind != SLOT_STR)
+            die("cold csg match target must be a variant value");
         matched_slot = matched->slot;
+        if (matched->kind != SLOT_VARIANT) {
+            int32_t vs = body_slot(body, SLOT_VARIANT, 4);
+            body_op(body, BODY_OP_COPY_I32, vs, matched_slot, 0);
+            matched_slot = vs;
+        }
     } else {
         int32_t kind = SLOT_I32;
         matched_slot = csg_parse_expr_span(lower, body, locals, stmt.a, &kind);
@@ -15790,9 +15812,18 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             Variant *variant = &type->variants[vi];
             for (int32_t fi = 0; fi < variant->field_count; fi++) {
                 if (variant->field_type[fi].len > 0) {
-                    int32_t fk = cold_slot_kind_from_type_with_symbols(symbols, variant->field_type[fi]);
-                    variant->field_kind[fi] = fk;
-                    variant->field_size[fi] = cold_slot_size_from_type_with_symbols(symbols, variant->field_type[fi], fk);
+                    /* skip generic parameters */
+                    bool is_generic = false;
+                    for (int32_t gi = 0; gi < type->generic_count; gi++) {
+                        if (span_same(variant->field_type[fi], type->generic_names[gi])) {
+                            is_generic = true; break;
+                        }
+                    }
+                    if (!is_generic) {
+                        int32_t fk = cold_slot_kind_from_type_with_symbols(symbols, variant->field_type[fi]);
+                        variant->field_kind[fi] = fk;
+                        variant->field_size[fi] = cold_slot_size_from_type_with_symbols(symbols, variant->field_type[fi], fk);
+                    }
                 }
             }
         }
