@@ -7139,6 +7139,34 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
+    /* try Ok[T]/Err[T] constructor fallback before looking up in symbol table */
+    { Span base_name = name;
+      int32_t br2 = cold_span_find_char(name, '[');
+      if (br2 > 0) base_name = span_sub(name, 0, br2);
+      if (span_eq(base_name, "Err") && arg_count == 1) {
+          int32_t slot = cold_make_error_result_slot(parser, body, cold_cstr_span("Result"), "error");
+          if (kind_out) *kind_out = SLOT_OBJECT;
+          return slot;
+      }
+      if (span_eq(base_name, "Ok") && arg_count == 1) {
+          int32_t val = body->call_arg_slot[arg_start];
+          ObjectDef *robj = symbols_resolve_object(parser->symbols, cold_cstr_span("Result"));
+          if (!robj) die("Result type missing for Ok");
+          ObjectField *fok = object_find_field(robj, cold_cstr_span("ok"));
+          ObjectField *fval = object_find_field(robj, cold_cstr_span("value"));
+          ObjectField *ferr = object_find_field(robj, cold_cstr_span("err"));
+          if (!fok || !fval || !ferr) die("Result fields missing");
+          int32_t ps = body->call_arg_count;
+          body_call_arg_with_offset(body, cold_make_i32_const_slot(body, 1), fok->offset);
+          body_call_arg_with_offset(body, val, fval->offset);
+          body_call_arg_with_offset(body, cold_make_i32_const_slot(body, 0), ferr->offset);
+          int32_t slot = body_slot(body, SLOT_OBJECT, symbols_object_slot_size(robj));
+          body_slot_set_type(body, slot, robj->name);
+          body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, ps, 3);
+          if (kind_out) *kind_out = SLOT_OBJECT;
+          return slot;
+      }
+    }
     int32_t fn_index = symbols_find_fn_for_call(parser->symbols, name, body, arg_start, arg_count);
     if (fn_index < 0) {
         fprintf(stderr, "cheng_cold: unknown function call name=%.*s arity=%d\n",
@@ -11242,8 +11270,14 @@ static void cold_csg_ensure_stmts(ColdCsg *csg) {
 static int32_t cold_csg_count_variant_specs(Span specs) {
     int32_t count = 0;
     int32_t start = 0;
+    int32_t depth = 0;
     for (int32_t i = 0; i <= specs.len; i++) {
-        if (i < specs.len && specs.ptr[i] != ',') continue;
+        if (i < specs.len) {
+            uint8_t c = specs.ptr[i];
+            if (c == '[' || c == '(' || c == '<') depth++;
+            else if (c == ']' || c == ')' || c == '>') { if (depth > 0) depth--; }
+            if (c != ',' || depth > 0) continue;
+        }
         Span part = span_trim(span_sub(specs, start, i));
         if (part.len > 0) count++;
         start = i + 1;
@@ -11263,11 +11297,23 @@ static void cold_csg_add_type(ColdCsg *csg, Span *fields, int32_t field_count) {
         type->generic_count = cold_split_top_level_commas(fields[3],
                                                           type->generic_names,
                                                           COLD_MAX_VARIANT_FIELDS);
+        fprintf(stderr, "[DBG] type %.*s generic_count=%d names=", fields[1].len, fields[1].ptr, type->generic_count);
+        for (int32_t gi = 0; gi < type->generic_count; gi++)
+            fprintf(stderr, "%.*s,", type->generic_names[gi].len, type->generic_names[gi].ptr);
+        fprintf(stderr, "\n");
     }
     int32_t start = 0;
     int32_t vi = 0;
+    int32_t bracket_depth = 0;
     for (int32_t i = 0; i <= specs.len; i++) {
-        if (i < specs.len && specs.ptr[i] != ',') continue;
+        if (i < specs.len) {
+            uint8_t c = specs.ptr[i];
+            if (c == '[') bracket_depth++;
+            else if (c == ']' && bracket_depth > 0) bracket_depth--;
+            else if (c == '(' || c == '<') bracket_depth++;
+            else if (c == ')' || c == '>') { if (bracket_depth > 0) bracket_depth--; }
+            if (c != ',' || bracket_depth > 0) continue;
+        }
         Span part = span_trim(span_sub(specs, start, i));
         start = i + 1;
         if (part.len <= 0) continue;
@@ -15735,6 +15781,20 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
         if (source.len > 0) {
             cold_compile_csg_load_imported_types(workspace_root, source, symbols, arena);
             munmap((void *)source.ptr, (size_t)source.len);
+        }
+    }
+    /* re-resolve type variant field kinds now that imported types are available */
+    for (int32_t ti = 0; ti < symbols->type_count; ti++) {
+        TypeDef *type = &symbols->types[ti];
+        for (int32_t vi = 0; vi < type->variant_count; vi++) {
+            Variant *variant = &type->variants[vi];
+            for (int32_t fi = 0; fi < variant->field_count; fi++) {
+                if (variant->field_type[fi].len > 0) {
+                    int32_t fk = cold_slot_kind_from_type_with_symbols(symbols, variant->field_type[fi]);
+                    variant->field_kind[fi] = fk;
+                    variant->field_size[fi] = cold_slot_size_from_type_with_symbols(symbols, variant->field_type[fi], fk);
+                }
+            }
         }
     }
     /* re-register function signatures now that imported types are available */
