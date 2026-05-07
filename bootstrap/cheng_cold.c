@@ -15750,7 +15750,7 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         { char ws_root[PATH_MAX] = {0};
           const char *sm = strstr(src_path, "/src/");
           if (!sm) sm = strstr(src_path, "src/");
-          if (sm == src_path) { sm = 0; if (getcwd(ws_root, sizeof(ws_root))) {} }
+          if (sm == src_path) { char rp[PATH_MAX]; if (realpath(src_path, rp)) { const char *s = strstr(rp, "/src/"); if (s) { size_t rl = (size_t)(s - rp); memcpy(ws_root, rp, rl); ws_root[rl] = 0; } } }
           else if (sm) { size_t rl = (size_t)(sm - src_path); if (rl < sizeof(ws_root)) { memcpy(ws_root, src_path, rl); ws_root[rl] = 0; } }
           if (ws_root[0]) cold_compile_csg_load_imported_types(ws_root, mapped_source, symbols, arena);
         }
