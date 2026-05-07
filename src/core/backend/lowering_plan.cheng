@@ -1,5 +1,7 @@
 import std/result
 import std/strformat
+import std/strutils as strutil
+import std/os
 import cheng/std/bytes_layout as layout
 import cheng/core/tooling/path as chengpath
 import cheng/core/tooling/compiler_world as cworld
@@ -8,6 +10,8 @@ import cheng/core/lang/intern as langintern
 import cheng/core/lang/parser
 import cheng/core/lang/typed_expr as texpr
 import cheng/core/backend/system_link_plan as slplan
+import cheng/core/ir/function_task as ftask
+import cheng/core/ir/function_task_executor as ftexec
 
 type
     PrimaryObjectIrStatement =
@@ -1448,6 +1452,74 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
         let fnIr = LoweringBuildOneFunction(plan, sourceTexts, i, letCallReturnLiteralStart)
         add(ir.functions, fnIr)
     return ir
+
+# -- Parallel lowering via function-task work-stealing executor ------------------
+
+var loweringTaskSharedPlan: LoweringPlanStub
+var loweringTaskSharedSourceTexts: texpr.TypedExprSourceText[]
+var loweringTaskLetCallReturnLiteralStart: int32
+var loweringTaskBuiltFunctions: PrimaryObjectIrFunction[]
+
+fn LoweringTaskExecuteOne(task: ftask.FunctionTask): ftask.FunctionTaskResult =
+    var result = ftask.FunctionTaskResultEmpty(task.funcIndex)
+    if task.funcIndex < 0 || task.funcIndex >= loweringTaskSharedPlan.functionNames.len:
+        ftask.FunctionTaskPlanAppendDiag(result, "lowering_task_index_out_of_range")
+        return result
+    let fnIr = LoweringBuildOneFunction(loweringTaskSharedPlan,
+                                         loweringTaskSharedSourceTexts,
+                                         task.funcIndex,
+                                         loweringTaskLetCallReturnLiteralStart)
+    # Store the built function in the shared results array
+    loweringTaskBuiltFunctions[task.funcIndex] = fnIr
+    result.outputKind = ftask.FunctionTaskResultKindBodyIr()
+    result.outputI32Value = task.funcIndex
+    return result
+
+fn LoweringBuildPrimaryObjectIrParallel(plan: LoweringPlanStub,
+                                         sourceTexts: texpr.TypedExprSourceText[],
+                                         jobCount: int32): PrimaryObjectIr =
+    if plan.functionNames.len <= 0:
+        return PrimaryObjectIr()
+    if jobCount <= 1:
+        return LoweringBuildPrimaryObjectIr(plan, sourceTexts)
+
+    # Set up shared state for worker tasks (read-only after setup)
+    loweringTaskSharedPlan = plan
+    loweringTaskSharedSourceTexts = sourceTexts
+    loweringTaskLetCallReturnLiteralStart = texpr.BodyKindLetCallReturnI32ConstPrefixLen
+    loweringTaskBuiltFunctions = []
+    for i in 0..<plan.functionNames.len:
+        add(loweringTaskBuiltFunctions, PrimaryObjectIrFunction())
+
+    # Wire the executor to call our task runner
+    ftexec.loweringTaskRunFn = LoweringTaskExecuteOne
+
+    # Build task plan
+    var taskPlan: ftask.FunctionTaskPlan
+    taskPlan.schedule = ftask.FunctionTaskScheduleWorkStealing
+    taskPlan.jobCount = jobCount
+    for i in 0..<plan.functionNames.len:
+        var task = ftask.FunctionTask(funcIndex: i,
+                                       declOrdinal: i,
+                                       costHint: ftask.FunctionTaskCostHintDefault())
+        add(taskPlan.tasks, task)
+
+    # Execute (auto-routes to work-stealing when jobCount > 1)
+    let _ = ftexec.FunctionTaskExecuteAuto(taskPlan)
+
+    # Collect results from shared array into PrimaryObjectIr
+    var ir: PrimaryObjectIr
+    for i in 0..<plan.functionNames.len:
+        add(ir.functions, loweringTaskBuiltFunctions[i])
+
+    # Unwire executor and release shared state
+    ftexec.loweringTaskRunFn = nil
+    loweringTaskSharedPlan = LoweringPlanStub()
+    loweringTaskSharedSourceTexts = []
+    loweringTaskBuiltFunctions = []
+
+    return ir
+
 fn LoweringIsImportcAnnotation(lineRaw: str): bool =
     let line = chengpath.PathTrim(lineRaw)
     if line == "":
@@ -1753,7 +1825,21 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
         return false
     LoweringBuildTypedFunctionIndex(plan)
     plan.typedReturnOps = texpr.TypedExprReturnOpFactsFromIr(plan.typedIr)
-    plan.primaryObjectIr = LoweringBuildPrimaryObjectIr(plan, typedSourceTexts)
+    # Parallel lowering via work-stealing executor when BACKEND_JOBS > 1
+    let backendJobsRaw = os.GetEnv("BACKEND_JOBS")
+    var loweringJobCount: int32
+    loweringJobCount = 0
+    if backendJobsRaw != "":
+        var ok = false
+        (loweringJobCount, ok) = strutil.ParseI32(backendJobsRaw)
+        if !ok:
+            loweringJobCount = 0
+    if loweringJobCount <= 0:
+        loweringJobCount = 1
+    if loweringJobCount > 1:
+        plan.primaryObjectIr = LoweringBuildPrimaryObjectIrParallel(plan, typedSourceTexts, loweringJobCount)
+    else:
+        plan.primaryObjectIr = LoweringBuildPrimaryObjectIr(plan, typedSourceTexts)
     var loweringErr = ""
     if !texpr.TypedExprBuildLoweringRules(plan.typedExprFacts, plan.loweringRules, loweringErr):
         err = loweringErr
