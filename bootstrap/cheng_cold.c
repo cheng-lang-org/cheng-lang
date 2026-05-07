@@ -6186,6 +6186,45 @@ static void cold_collect_import_module_types(Symbols *symbols, Span alias, Span 
     }
 }
 
+static void cold_collect_import_module_consts(Symbols *symbols, Span alias, Span source) {
+    /* scan source for top-level "const" blocks and add constants with alias */
+    int32_t pos = 0;
+    while (pos < source.len) {
+        /* find next top-level line */
+        int32_t ls = pos;
+        while (ls < source.len && source.ptr[ls] != '\n') ls++;
+        int32_t le = ls;
+        if (ls < source.len) ls++;
+        Span line = span_sub(source, pos, le);
+        pos = ls;
+        Span trimmed = span_trim(line);
+        if (trimmed.len <= 0 || !cold_line_top_level(line)) continue;
+        if (!span_eq(trimmed, "const")) continue;
+        /* found const block: scan indented name=value lines */
+        while (pos < source.len) {
+            int32_t cs = pos;
+            while (pos < source.len && source.ptr[pos] != '\n') pos++;
+            int32_t ce = pos;
+            if (pos < source.len) pos++;
+            Span cline = span_sub(source, cs, ce);
+            Span ct = span_trim(cline);
+            if (ct.len <= 0 || cold_line_top_level(cline)) { pos = cs; break; }
+            int32_t ceq = cold_span_find_char(ct, '=');
+            if (ceq <= 0) continue;
+            Span cname = span_trim(span_sub(ct, 0, ceq));
+            Span cval = span_trim(span_sub(ct, ceq + 1, ct.len));
+            if (cname.len <= 0) continue;
+            Span aliased = cold_arena_join3(symbols->arena, alias, ".", cname);
+            if (cval.len >= 2 && cval.ptr[0] == '"' && cval.ptr[cval.len - 1] == '"') {
+                Span inner = span_sub(cval, 1, cval.len - 1);
+                symbols_add_str_const(symbols, aliased, cold_decode_string_content(symbols->arena, inner, false));
+            } else if (span_is_i32(cval)) {
+                symbols_add_const(symbols, aliased, span_i32(cval));
+            }
+        }
+    }
+}
+
 static void cold_collect_import_module_types_from_path(Symbols *symbols, Span alias,
                                                        Span module_path) {
     char path[PATH_MAX];
@@ -6195,6 +6234,7 @@ static void cold_collect_import_module_types_from_path(Symbols *symbols, Span al
     Span source = source_open(path);
     if (source.len <= 0) die("cold import source missing");
     cold_collect_import_module_types(symbols, alias, source);
+    cold_collect_import_module_consts(symbols, alias, source);
     munmap((void *)source.ptr, (size_t)source.len);
 }
 
