@@ -1,0 +1,91 @@
+type MiniReader =
+    bytes: int32[]
+    pos: int32
+    value: int32
+    error: int32
+
+type MiniRecord =
+    fieldCount: int32
+    kindCode: int32
+    fieldHexStart: int32[8]
+    fieldLen: int32[8]
+    fieldInt: int32[8]
+    fieldIsDecimal: int32[8]
+    error: int32
+
+fn MiniSetField(record: var MiniRecord, index: int32,
+                hexStart: int32, byteLen: int32): bool =
+    if index < 0 || index >= 8:
+        return false
+    record.fieldHexStart[index] = hexStart
+    record.fieldLen[index] = byteLen
+    return true
+
+fn MiniFieldHexStart(record: var MiniRecord, index: int32): int32 =
+    if index < 0 || index >= 8:
+        return -1
+    return record.fieldHexStart[index]
+
+fn MiniFieldLen(record: var MiniRecord, index: int32): int32 =
+    if index < 0 || index >= 8:
+        return -1
+    return record.fieldLen[index]
+
+fn MiniExpected(reader: var MiniReader, record: var MiniRecord,
+                index: int32, expected: str): bool =
+    let start: int32 = reader.pos
+    let fieldLen: int32 = len(expected)
+    if MiniSetField(record, index, start, fieldLen) == false:
+        reader.value = 1
+        return false
+    if MiniFieldLen(record, index) != fieldLen:
+        reader.value = 2
+        return false
+    return true
+
+fn MiniReadByte(reader: var MiniReader): int32 =
+    if reader.pos >= reader.bytes.len:
+        reader.error = 11
+        return -1
+    let value: int32 = reader.bytes[reader.pos]
+    reader.pos = reader.pos + 1
+    return value
+
+fn MiniExpectByte(reader: var MiniReader, expected: int32): bool =
+    let value: int32 = MiniReadByte(reader)
+    if value != expected:
+        reader.error = 13
+        return false
+    return true
+
+fn main(): int32 =
+    var reader: MiniReader
+    var record: MiniRecord
+    reader.bytes = [10]
+    reader.pos = 37
+    if MiniExpected(reader, record, 0, "cold_csg_entry") == false:
+        return 10 + reader.value
+    if MiniExpected(reader, record, 1, "main") == false:
+        return 40 + reader.value
+    if MiniFieldHexStart(record, 0) <= 0:
+        return 50
+    reader.pos = 0
+    if MiniExpectByte(reader, '\n') == false:
+        return 60 + reader.error
+    if MiniFieldHexStart(record, 0) <= 0:
+        return 70
+    if record.fieldCount != 0:
+        return 80 + record.fieldCount
+    if MiniFieldLen(record, 0) != len("cold_csg_entry"):
+        return 20
+    let firstHexAfterLenCall: int32 = MiniFieldHexStart(record, 0)
+    if firstHexAfterLenCall <= 0:
+        return 90
+    if MiniFieldLen(record, 0) != 14:
+        return 91
+    let firstHexAfterLen: int32 = MiniFieldHexStart(record, 0)
+    if firstHexAfterLen <= 0:
+        return 92
+    if MiniFieldHexStart(record, 0) != 37:
+        return 30 + MiniFieldHexStart(record, 0)
+    return 42

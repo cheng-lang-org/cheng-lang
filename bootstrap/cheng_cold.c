@@ -5162,6 +5162,7 @@ static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
     Span base_name = {0};
     Span args_span = {0};
     if (!cold_type_parse_generic_instance(type_name, &base_name, &args_span)) return 0;
+    if (symbols_find_type(symbols, base_name)) return 0; /* base is an ADT, not an object */
     ObjectDef *base = symbols_find_object(symbols, base_name);
     if (!base && span_eq(base_name, "Result")) base = symbols_ensure_std_result_base(symbols);
     if (!base) return 0;
@@ -6436,31 +6437,47 @@ static void parse_type(Parser *parser) {
         parser->pos = line_end;
         return;
     }
+    bool is_tuple_inline = cold_span_starts_with(rhs_check, "tuple[");
     bool implicit_object = cold_type_block_looks_like_object(rhs_check);
-    if (implicit_object || cold_span_starts_with(rhs_check, "object") || cold_span_starts_with(rhs_check, "tuple")) {
+    if (implicit_object || cold_span_starts_with(rhs_check, "object") || is_tuple_inline) {
         int32_t field_count = 0;
         Span field_names[COLD_MAX_OBJECT_FIELDS];
         Span field_types[COLD_MAX_OBJECT_FIELDS];
-        int32_t body_start = line.pos;
-        while (body_start < line_end && line.source.ptr[body_start] != '\n') body_start++;
-        if (body_start < line_end) body_start++;
-        int32_t body_indent = -1;
-        int32_t body_finish = body_start;
-        while (body_finish < line_end) {
-            int32_t indent = 0;
-            int32_t p = body_finish;
-            while (p < line_end && line.source.ptr[p] == ' ') { indent++; p++; }
-            if (p >= line_end || line.source.ptr[p] == '\n') { body_finish++; continue; }
-            if (body_indent < 0) body_indent = indent;
-            if (indent < body_indent || indent == 0) break;
-            while (body_finish < line_end && line.source.ptr[body_finish] != '\n') body_finish++;
-            if (body_finish < line_end) body_finish++;
+        Span fields_span = {0};
+        if (is_tuple_inline) {
+            Span inner = span_trim(span_sub(rhs_check, 6, rhs_check.len));
+            if (inner.len > 0 && inner.ptr[inner.len - 1] == ']')
+                inner = span_sub(inner, 0, inner.len - 1);
+            fields_span = inner;
+        } else {
+            int32_t body_start = line.pos;
+            while (body_start < line_end && line.source.ptr[body_start] != '\n') body_start++;
+            if (body_start < line_end) body_start++;
+            int32_t body_indent = -1;
+            int32_t body_finish = body_start;
+            while (body_finish < line_end) {
+                int32_t indent = 0;
+                int32_t p = body_finish;
+                while (p < line_end && line.source.ptr[p] == ' ') { indent++; p++; }
+                if (p >= line_end || line.source.ptr[p] == '\n') { body_finish++; continue; }
+                if (body_indent < 0) body_indent = indent;
+                if (indent < body_indent || indent == 0) break;
+                while (body_finish < line_end && line.source.ptr[body_finish] != '\n') body_finish++;
+                if (body_finish < line_end) body_finish++;
+            }
+            fields_span = span_trim(span_sub(line.source, body_start, body_finish));
         }
-        Span fields_span = span_trim(span_sub(line.source, body_start, body_finish));
         int32_t fp_pos = 0;
         while (fp_pos < fields_span.len) {
             int32_t ln_start = fp_pos;
-            while (fp_pos < fields_span.len && fields_span.ptr[fp_pos] != '\n') fp_pos++;
+            if (is_tuple_inline) {
+                while (fp_pos < fields_span.len) {
+                    if (fields_span.ptr[fp_pos] == ',' || fields_span.ptr[fp_pos] == ';') break;
+                    fp_pos++;
+                }
+            } else {
+                while (fp_pos < fields_span.len && fields_span.ptr[fp_pos] != '\n') fp_pos++;
+            }
             Span fline = span_sub(fields_span, ln_start, fp_pos);
             if (fp_pos < fields_span.len) fp_pos++;
             Span trimmed = span_trim(fline);
@@ -7187,6 +7204,15 @@ static int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *lo
         if (!parser_take(parser, ":")) die("expected : in object constructor field");
         int32_t value_kind = SLOT_I32;
         int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
+        if (field->kind == SLOT_SEQ_I32 && value_kind == SLOT_ARRAY_I32) {
+            int32_t count = body->slot_aux[value_slot];
+            int32_t seq_slot = body_slot(body, SLOT_SEQ_I32, 16);
+            body_slot_set_type(body, seq_slot, cold_cstr_span("int32[]"));
+            body_slot_set_array_len(body, seq_slot, count);
+            body_op3(body, BODY_OP_MAKE_SEQ_I32, seq_slot, value_slot, -1, count);
+            value_slot = seq_slot;
+            value_kind = SLOT_SEQ_I32;
+        }
         if (field->kind == SLOT_SEQ_I32 && value_kind == SLOT_ARRAY_I32) {
             int32_t count = body->slot_aux[value_slot];
             int32_t seq_slot = body_slot(body, SLOT_SEQ_I32, 16);
@@ -9535,6 +9561,15 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
         value_slot = seq_slot;
         value_kind = SLOT_SEQ_I32;
     }
+    if (field->kind == SLOT_SEQ_I32 && value_kind == SLOT_ARRAY_I32) {
+        int32_t count = body->slot_aux[value_slot];
+        int32_t seq_slot = body_slot(body, SLOT_SEQ_I32, 16);
+        body_slot_set_type(body, seq_slot, cold_cstr_span("int32[]"));
+        body_slot_set_array_len(body, seq_slot, count);
+        body_op3(body, BODY_OP_MAKE_SEQ_I32, seq_slot, value_slot, -1, count);
+        value_slot = seq_slot;
+        value_kind = SLOT_SEQ_I32;
+    }
     if (value_kind != field->kind) die("field assignment value kind mismatch");
     if (field->kind == SLOT_ARRAY_I32 && body->slot_aux[value_slot] != field->array_len) {
         die("field assignment array length mismatch");
@@ -10381,6 +10416,31 @@ static int32_t parse_statements_until(Parser *parser, BodyIR *body, Locals *loca
     return current;
 }
 
+static bool cold_same_line_has_content(Parser *parser) {
+    int32_t pos = parser->pos;
+    while (pos < parser->source.len) {
+        uint8_t c = parser->source.ptr[pos];
+        if (c == '\n' || c == '\r') return false;
+        if (c != ' ' && c != '\t') return true;
+        pos++;
+    }
+    return false;
+}
+
+static int32_t parse_inline_statements(Parser *parser, BodyIR *body, Locals *locals,
+                                      int32_t block, LoopCtx *loop) {
+    int32_t end = parse_statement(parser, body, locals, block, loop);
+    while (cold_same_line_has_content(parser) && parser->pos < parser->source.len &&
+           parser->source.ptr[parser->pos] == ';') {
+        parser->pos++;
+        if (!cold_same_line_has_content(parser)) break;
+        int32_t continue_block = end;
+        if (body->block_term[continue_block] >= 0) continue_block = body_block(body);
+        end = parse_statement(parser, body, locals, continue_block, loop);
+    }
+    return end;
+}
+
 static void cold_require_suite_indent(Parser *parser, int32_t parent_indent, const char *kind) {
     int32_t indent = parser_next_indent(parser);
     if (indent <= parent_indent) {
@@ -10392,15 +10452,21 @@ static void cold_require_suite_indent(Parser *parser, int32_t parent_indent, con
 static int32_t parse_if(Parser *parser, BodyIR *body, Locals *locals,
                         int32_t block, int32_t stmt_indent, LoopCtx *loop) {
     Span condition = parser_take_condition_span(parser);
+    bool true_inline = cold_same_line_has_content(parser);
     int32_t true_block = body_block(body);
     int32_t false_block = body_block(body);
     parse_condition_span(parser, body, locals, condition, block, true_block, false_block);
 
     body_reopen_block(body, true_block);
     int32_t saved_local_count = locals->count;
-    cold_require_suite_indent(parser, stmt_indent, "if");
-    int32_t true_indent = parser_next_indent(parser);
-    int32_t true_end = parse_statements_until(parser, body, locals, true_block, true_indent, "else", loop);
+    int32_t true_end;
+    if (true_inline) {
+        true_end = parse_inline_statements(parser, body, locals, true_block, loop);
+    } else {
+        cold_require_suite_indent(parser, stmt_indent, "if");
+        int32_t true_indent = parser_next_indent(parser);
+        true_end = parse_statements_until(parser, body, locals, true_block, true_indent, "else", loop);
+    }
     locals->count = saved_local_count;
     int32_t join_block = -1;
     if (body->block_term[true_end] < 0) {
@@ -10419,9 +10485,14 @@ static int32_t parse_if(Parser *parser, BodyIR *body, Locals *locals,
         if (branch_indent == stmt_indent && span_eq(branch_token, "else")) {
             parser_take(parser, "else");
             if (!parser_take(parser, ":")) die("expected : after else");
-            cold_require_suite_indent(parser, stmt_indent, "else");
-            int32_t false_indent = parser_next_indent(parser);
-            false_end = parse_statements_until(parser, body, locals, false_block, false_indent, 0, loop);
+            bool else_inline = cold_same_line_has_content(parser);
+            if (else_inline) {
+                false_end = parse_inline_statements(parser, body, locals, false_block, loop);
+            } else {
+                cold_require_suite_indent(parser, stmt_indent, "else");
+                int32_t false_indent = parser_next_indent(parser);
+                false_end = parse_statements_until(parser, body, locals, false_block, false_indent, 0, loop);
+            }
         }
     }
     locals->count = saved_local_count;
@@ -10473,13 +10544,19 @@ static int32_t parse_for(Parser *parser, BodyIR *body, Locals *locals,
                                   loop_block, -1);
     body_end_block(body, cond_block, cond_term);
 
-    cold_require_suite_indent(parser, stmt_indent, "for");
-    int32_t loop_indent = parser_next_indent(parser);
+    bool for_inline = cold_same_line_has_content(parser);
     int32_t saved_local_count = locals->count;
     locals_add(locals, name, iter_slot, SLOT_I32);
     LoopCtx loop = {0};
     loop.parent = parent_loop;
-    int32_t loop_end = parse_statements_until(parser, body, locals, loop_block, loop_indent, 0, &loop);
+    int32_t loop_end;
+    if (for_inline) {
+        loop_end = parse_inline_statements(parser, body, locals, loop_block, &loop);
+    } else {
+        cold_require_suite_indent(parser, stmt_indent, "for");
+        int32_t loop_indent = parser_next_indent(parser);
+        loop_end = parse_statements_until(parser, body, locals, loop_block, loop_indent, 0, &loop);
+    }
     locals->count = saved_local_count;
 
     int32_t increment_block = body_block(body);
@@ -10513,12 +10590,18 @@ static int32_t parse_while(Parser *parser, BodyIR *body, Locals *locals,
     parse_condition_span(parser, body, locals, condition, cond_block, loop_block, after_block);
 
     body_reopen_block(body, loop_block);
-    cold_require_suite_indent(parser, stmt_indent, "while");
-    int32_t loop_indent = parser_next_indent(parser);
+    bool while_inline = cold_same_line_has_content(parser);
     int32_t saved_local_count = locals->count;
     LoopCtx loop = {0};
     loop.parent = parent_loop;
-    int32_t loop_end = parse_statements_until(parser, body, locals, loop_block, loop_indent, 0, &loop);
+    int32_t loop_end;
+    if (while_inline) {
+        loop_end = parse_inline_statements(parser, body, locals, loop_block, &loop);
+    } else {
+        cold_require_suite_indent(parser, stmt_indent, "while");
+        int32_t loop_indent = parser_next_indent(parser);
+        loop_end = parse_statements_until(parser, body, locals, loop_block, loop_indent, 0, &loop);
+    }
     locals->count = saved_local_count;
 
     if (body->block_term[loop_end] < 0) body_branch_to(body, loop_end, cond_block);
@@ -11241,13 +11324,6 @@ static void csg_parse_let(ColdCsgLower *lower, BodyIR *body,
                           Locals *locals, Span name, Span expr) {
     int32_t kind = SLOT_I32;
     int32_t src_slot = csg_parse_expr_span(lower, body, locals, expr, &kind);
-    /* for I32 types, copy into a new slot to avoid aliasing with the source expression */
-    if (kind == SLOT_I32 || kind == SLOT_I32_REF) {
-        int32_t slot = body_slot(body, kind, 4);
-        body_op(body, BODY_OP_COPY_I32, slot, src_slot, 0);
-        locals_add(locals, name, slot, kind);
-        return;
-    }
     locals_add(locals, name, src_slot, kind);
 }
 
@@ -11286,13 +11362,6 @@ static int32_t csg_parse_typed_expr_span(ColdCsgLower *lower, BodyIR *body,
         if (body->slot_aux[slot] != declared_len) die("cold csg typed array length mismatch");
     } else if (declared_kind == SLOT_SEQ_I32) {
         if (!cold_parse_i32_seq_type(type)) die("cold csg typed int32[] missing dynamic sequence type");
-    }
-    /* for SLOT_I32/SLOT_I32_REF, copy into a new slot to avoid aliasing with the source */
-    if (declared_kind == SLOT_I32 || declared_kind == SLOT_I32_REF) {
-        int32_t dst_slot = body_slot(body, declared_kind, 4);
-        body_op(body, BODY_OP_COPY_I32, dst_slot, slot, 0);
-        body_slot_set_type(body, dst_slot, span_trim(type));
-        return dst_slot;
     }
     body_slot_set_type(body, slot, span_trim(type));
     return slot;
@@ -11789,15 +11858,9 @@ static BodyIR *cold_csg_lower_function(ColdCsg *csg, int32_t fn_index) {
  * ARM64 encoder
  * ================================================================ */
 enum {
-    R0 = 0,
-    R1 = 1,
-    R2 = 2,
-    R3 = 3,
-    R9 = 9,
-    R10 = 10,
-    SP = 31,
-    LR = 30,
-    FP = 29,
+    R0 = 0, R1 = 1, R2 = 2, R3 = 3, R4 = 4, R5 = 5, R6 = 6, R7 = 7, R8 = 8,
+    R9 = 9, R10 = 10, R11 = 11, R12 = 12,
+    SP = 31, LR = 30, FP = 29,
 };
 
 static uint32_t a64_ret(void) { return 0xD65F03C0u; }
@@ -12185,8 +12248,8 @@ static void codegen_store_params(Code *code, BodyIR *body) {
                 int32_t src_reg = in_regs ? base_reg : R9;
                 if (!in_regs) code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset, true));
                 for (int32_t off = 0; off < size; off += 8) {
-                    code_emit(code, a64_ldr_imm(R0, src_reg, off, true));
-                    a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + off, true);
+                    code_emit(code, a64_ldr_imm(R10, src_reg, off, true));
+                    a64_emit_str_sp_off(code, R10, body->slot_offset[slot] + off, true);
                 }
             } else {
                 if (in_regs) {
@@ -12206,8 +12269,8 @@ static void codegen_store_params(Code *code, BodyIR *body) {
                 int32_t src_reg = in_regs ? base_reg : R9;
                 if (!in_regs) code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset, true));
                 for (int32_t off = 0; off < size; off += 8) {
-                    code_emit(code, a64_ldr_imm(R0, src_reg, off, true));
-                    a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + off, true);
+                    code_emit(code, a64_ldr_imm(R10, src_reg, off, true));
+                    a64_emit_str_sp_off(code, R10, body->slot_offset[slot] + off, true);
                 }
             } else {
                 if (in_regs) {
@@ -14294,10 +14357,24 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             if (a < 0 || body->slot_kind[a] != SLOT_ARRAY_I32) die("int32[] literal missing backing array");
             code_emit(code, a64_movz(R0, (uint16_t)c, 0));
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
-            code_emit(code, a64_movz(R0, (uint16_t)c, 0));
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 4, false);
-            code_emit(code, a64_add_imm(R0, SP, (uint16_t)body->slot_offset[a], true));
-            a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 8, true);
+            int32_t data_bytes = c * 4;
+            codegen_mmap_const(code, data_bytes, R9, 6);
+            a64_emit_str_sp_off(code, R9, body->slot_offset[dst] + 8, true);
+            code_emit(code, a64_add_imm(R10, SP, (uint16_t)body->slot_offset[a], true));
+            code_emit(code, a64_movz_x(R11, (uint16_t)c, 0));
+            int32_t cp_start = code->count;
+            code_emit(code, a64_cmp_imm(R11, 0));
+            int32_t cp_done_patch = code->count;
+            code_emit(code, a64_bcond(0, COND_EQ));
+            code_emit(code, a64_ldr_imm(R12, R10, 0, false));
+            code_emit(code, a64_str_imm(R12, R9, 0, false));
+            code_emit(code, a64_add_imm(R10, R10, 4, true));
+            code_emit(code, a64_add_imm(R9, R9, 4, true));
+            code_emit(code, a64_sub_imm(R11, R11, 1, true));
+            int32_t cp_back = code->count;
+            code_emit(code, a64_b(cp_start - cp_back));
+            a64_patch_bcond(code, cp_done_patch, code->count);
         }
     } else if (kind == BODY_OP_SEQ_I32_INDEX) {
         if (body->slot_kind[a] != SLOT_SEQ_I32 && body->slot_kind[a] != SLOT_SEQ_I32_REF) die("int32[] index target kind mismatch");
@@ -15331,12 +15408,72 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
     }
     BodyIR **function_bodies = arena_alloc(arena, (size_t)symbols->function_cap * sizeof(BodyIR *));
     int32_t entry_function = -1;
+    /* Reconstruct source text from CSG facts and use source-direct parser for BodyIR parity */
+    size_t src_cap = 131072;
+    char *src = arena_alloc(arena, src_cap);
     for (int32_t i = 0; i < csg.function_count; i++) {
         int32_t symbol_index = csg.functions[i].symbol_index;
         if (symbol_index < 0 || symbol_index >= symbols->function_cap) die("cold csg function body table overflow");
-        function_bodies[symbol_index] = cold_csg_lower_function(&csg, i);
-        if ((csg.entry.len > 0 && span_same(csg.functions[i].name, csg.entry)) ||
-            (csg.entry.len == 0 && span_eq(csg.functions[i].name, "main"))) {
+        ColdCsgFunction *fn = &csg.functions[i];
+        int32_t u = 0;
+        u += snprintf(src + u, src_cap - (size_t)u, "fn %.*s(", fn->name.len, fn->name.ptr);
+        if (fn->params.len > 0)
+            u += snprintf(src + u, src_cap - (size_t)u, "%.*s", fn->params.len, fn->params.ptr);
+        u += snprintf(src + u, src_cap - (size_t)u, ")");
+        if (fn->ret.len > 0)
+            u += snprintf(src + u, src_cap - (size_t)u, ": %.*s", fn->ret.len, fn->ret.ptr);
+        u += snprintf(src + u, src_cap - (size_t)u, " =\n");
+        for (int32_t s = 0; s < fn->stmt_count; s++) {
+            ColdCsgStmt *st = &csg.stmts[fn->stmt_start + s];
+            for (int32_t sp = 0; sp < (st->indent > 0 ? st->indent : 4); sp++) src[u++] = ' ';
+            if (span_eq(st->kind, "return")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "return %.*s\n", st->a.len, st->a.ptr);
+            } else if (span_eq(st->kind, "let") || span_eq(st->kind, "var")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "%.*s %.*s = %.*s\n", st->kind.len, st->kind.ptr, st->a.len, st->a.ptr, st->b.len, st->b.ptr);
+            } else if (span_eq(st->kind, "var_t")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "var %.*s: %.*s = %.*s\n", st->a.len, st->a.ptr, st->b.len, st->b.ptr, st->c.len, st->c.ptr);
+            } else if (span_eq(st->kind, "assign")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "%.*s = %.*s\n", st->a.len, st->a.ptr, st->b.len, st->b.ptr);
+            } else if (span_eq(st->kind, "if")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "if %.*s:\n", st->a.len, st->a.ptr);
+            } else if (span_eq(st->kind, "elif")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "elif %.*s:\n", st->a.len, st->a.ptr);
+            } else if (span_eq(st->kind, "else")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "else:\n");
+            } else if (span_eq(st->kind, "while")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "while %.*s:\n", st->a.len, st->a.ptr);
+            } else if (span_eq(st->kind, "for_range")) {
+                const char *op = span_eq(st->d, "lt") ? "..<" : "..";
+                u += snprintf(src + u, src_cap - (size_t)u, "for %.*s in %.*s%s%.*s:\n",
+                             st->a.len, st->a.ptr, st->b.len, st->b.ptr, op, st->c.len, st->c.ptr);
+            } else if (span_eq(st->kind, "call")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "%.*s(%.*s)\n", st->a.len, st->a.ptr, st->b.len, st->b.ptr);
+            } else if (span_eq(st->kind, "call_q")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "%.*s(%.*s)?\n", st->a.len, st->a.ptr, st->b.len, st->b.ptr);
+            } else if (span_eq(st->kind, "let_q")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "let %.*s = %.*s?\n", st->a.len, st->a.ptr, st->b.len, st->b.ptr);
+            } else if (span_eq(st->kind, "match")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "match %.*s:\n", st->a.len, st->a.ptr);
+            } else if (span_eq(st->kind, "case")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "%.*s(%.*s) =>\n", st->a.len, st->a.ptr, st->b.len, st->b.ptr);
+            } else if (span_eq(st->kind, "break")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "break\n");
+            } else if (span_eq(st->kind, "continue")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "continue\n");
+            } else if (span_eq(st->kind, "default")) {
+                u += snprintf(src + u, src_cap - (size_t)u, "var %.*s: %.*s\n", st->a.len, st->a.ptr, st->b.len, st->b.ptr);
+            } else {
+                u += snprintf(src + u, src_cap - (size_t)u, "%.*s %.*s\n", st->kind.len, st->kind.ptr, st->a.len, st->a.ptr);
+            }
+        }
+        src[u] = '\0';
+        Parser p = {(Span){(const uint8_t *)src, u}, 0, arena, symbols};
+        int32_t psym = -1;
+        BodyIR *body = parse_fn(&p, &psym);
+        if (psym >= 0 && psym < symbols->function_cap)
+            function_bodies[psym] = body;
+        if ((csg.entry.len > 0 && span_same(fn->name, csg.entry)) ||
+            (csg.entry.len == 0 && span_eq(fn->name, "main"))) {
             entry_function = symbol_index;
         }
     }

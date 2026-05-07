@@ -1,0 +1,121 @@
+type Result[T] = Ok(value: T) | Err(error: str)
+
+fn a64RegField(reg: int32, shift: int32): uint32 =
+    return uint32(reg) << uint32(shift)
+
+fn a64ImmField(value: int32, mask: int32, shift: int32): uint32 =
+    return uint32(value & mask) << uint32(shift)
+
+fn A64EncRet(): int32 =
+    return int32(uint32(0xD65F03C0))
+
+fn A64EncNop(): int32 =
+    return int32(uint32(0xD503201F))
+
+fn A64EncBlPlaceholder(): int32 =
+    return int32(uint32(0x94000000))
+
+fn A64EncBPlaceholder(): int32 =
+    return int32(uint32(0x14000000))
+
+fn A64EncMovz32(rd: int32, imm16: int32, hw: int32): int32 =
+    return int32(uint32(0x52800000) |
+                 a64ImmField(hw, 3, 21) |
+                 a64ImmField(imm16, 0xffff, 5) |
+                 a64RegField(rd, 0))
+
+fn A64EncAddReg(is64: bool, rd: int32, rn: int32, rm: int32): int32 =
+    if is64:
+        return int32(uint32(0x8B000000) |
+                     a64RegField(rm, 16) |
+                     a64RegField(rn, 5) |
+                     a64RegField(rd, 0))
+    return int32(uint32(0x0B000000) |
+                 a64RegField(rm, 16) |
+                 a64RegField(rn, 5) |
+                 a64RegField(rd, 0))
+
+fn A64EncAndReg(is64: bool, rd: int32, rn: int32, rm: int32): int32 =
+    if is64:
+        return int32(uint32(0x8A000000) |
+                     a64RegField(rm, 16) |
+                     a64RegField(rn, 5) |
+                     a64RegField(rd, 0))
+    return int32(uint32(0x0A000000) |
+                 a64RegField(rm, 16) |
+                 a64RegField(rn, 5) |
+                 a64RegField(rd, 0))
+
+fn A64EncBImm(deltaWords: int64): Result[int32] =
+    if deltaWords < -33554432 || deltaWords > 33554431:
+        return Err(" aarch64 encode: b offset out of range")
+    let imm26: uint32 = uint32(uint64(deltaWords) & uint64(0x03ffffff))
+    return Ok(int32(uint32(0x14000000) | imm26))
+
+fn A64EncBCond(deltaWords: int64, cond: int32): Result[int32] =
+    if cond < 0 || cond > 15:
+        return Err(" aarch64 encode: condition out of range")
+    if deltaWords < -262144 || deltaWords > 262143:
+        return Err(" aarch64 encode: b.cond offset out of range")
+    let imm19: uint32 = uint32(uint64(deltaWords) & uint64(0x7ffff))
+    return Ok(int32(uint32(0x54000000) |
+                    (imm19 << uint32(5)) |
+                    uint32(cond)))
+
+fn A64CodeWordCount(byteCount: int32): int32 =
+    return (byteCount + 3) / 4
+
+fn A64RelocPageRemainder(byteOffset: int32): int32 =
+    return byteOffset % 4096
+
+fn A64SignedDivModRoundTrip(value: int32, unit: int32): int32 =
+    return (value / unit) * unit + (value % unit)
+
+fn main(): int32 =
+    if A64EncRet() != int32(uint32(0xD65F03C0)):
+        return 1
+    if A64EncNop() != int32(uint32(0xD503201F)):
+        return 2
+    if A64EncBlPlaceholder() != int32(uint32(0x94000000)):
+        return 3
+    if A64EncBPlaceholder() != int32(uint32(0x14000000)):
+        return 4
+    if A64EncMovz32(0, 42, 0) != int32(uint32(0x52800540)):
+        return 5
+    if A64EncAddReg(false, 0, 1, 2) != int32(uint32(0x0B020020)):
+        return 6
+    if A64EncAndReg(false, 0, 1, 2) != int32(uint32(0x0A020020)):
+        return 7
+
+    let branch = A64EncBImm(2)
+    match branch:
+        Ok(word) =>
+            if word != int32(uint32(0x14000002)):
+                return 8
+        Err(error) =>
+            return len(error)
+
+    let condBranch = A64EncBCond(3, 1)
+    match condBranch:
+        Ok(word) =>
+            if word != int32(uint32(0x54000061)):
+                return 9
+        Err(error) =>
+            return len(error)
+
+    let badCond = A64EncBCond(3, 99)
+    match badCond:
+        Ok(word) =>
+            return word
+        Err(error) =>
+            if len(error) != 39:
+                return 10
+
+    if A64CodeWordCount(17) != 5:
+        return 11
+    if A64RelocPageRemainder(4101) != 5:
+        return 12
+    if A64SignedDivModRoundTrip(-17, 4) != -17:
+        return 13
+
+    return 42
