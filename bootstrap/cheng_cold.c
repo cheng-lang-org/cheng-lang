@@ -7187,6 +7187,15 @@ static int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *lo
         if (!parser_take(parser, ":")) die("expected : in object constructor field");
         int32_t value_kind = SLOT_I32;
         int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
+        if (field->kind == SLOT_SEQ_I32 && value_kind == SLOT_ARRAY_I32) {
+            int32_t count = body->slot_aux[value_slot];
+            int32_t seq_slot = body_slot(body, SLOT_SEQ_I32, 16);
+            body_slot_set_type(body, seq_slot, cold_cstr_span("int32[]"));
+            body_slot_set_array_len(body, seq_slot, count);
+            body_op3(body, BODY_OP_MAKE_SEQ_I32, seq_slot, value_slot, -1, count);
+            value_slot = seq_slot;
+            value_kind = SLOT_SEQ_I32;
+        }
         if (value_kind != field->kind) die("object constructor field kind mismatch");
         if (field->kind == SLOT_ARRAY_I32 && body->slot_aux[value_slot] != field->array_len) {
             die("object constructor array length mismatch");
@@ -9508,6 +9517,24 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
     if (!parser_take(parser, "=")) die("expected = in field assignment");
     int32_t value_kind = SLOT_I32;
     int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
+    if (field->kind == SLOT_SEQ_I32 && value_kind == SLOT_ARRAY_I32) {
+        int32_t count = body->slot_aux[value_slot];
+        int32_t seq_slot = body_slot(body, SLOT_SEQ_I32, 16);
+        body_slot_set_type(body, seq_slot, cold_cstr_span("int32[]"));
+        body_slot_set_array_len(body, seq_slot, count);
+        body_op3(body, BODY_OP_MAKE_SEQ_I32, seq_slot, value_slot, -1, count);
+        value_slot = seq_slot;
+        value_kind = SLOT_SEQ_I32;
+    }
+    if (field->kind == SLOT_SEQ_I32_REF && value_kind == SLOT_ARRAY_I32) {
+        int32_t count = body->slot_aux[value_slot];
+        int32_t seq_slot = body_slot(body, SLOT_SEQ_I32, 16);
+        body_slot_set_type(body, seq_slot, cold_cstr_span("int32[]"));
+        body_slot_set_array_len(body, seq_slot, count);
+        body_op3(body, BODY_OP_MAKE_SEQ_I32, seq_slot, value_slot, -1, count);
+        value_slot = seq_slot;
+        value_kind = SLOT_SEQ_I32;
+    }
     if (value_kind != field->kind) die("field assignment value kind mismatch");
     if (field->kind == SLOT_ARRAY_I32 && body->slot_aux[value_slot] != field->array_len) {
         die("field assignment array length mismatch");
@@ -11213,8 +11240,15 @@ static void csg_parse_return(ColdCsgLower *lower, BodyIR *body,
 static void csg_parse_let(ColdCsgLower *lower, BodyIR *body,
                           Locals *locals, Span name, Span expr) {
     int32_t kind = SLOT_I32;
-    int32_t slot = csg_parse_expr_span(lower, body, locals, expr, &kind);
-    locals_add(locals, name, slot, kind);
+    int32_t src_slot = csg_parse_expr_span(lower, body, locals, expr, &kind);
+    /* for I32 types, copy into a new slot to avoid aliasing with the source expression */
+    if (kind == SLOT_I32 || kind == SLOT_I32_REF) {
+        int32_t slot = body_slot(body, kind, 4);
+        body_op(body, BODY_OP_COPY_I32, slot, src_slot, 0);
+        locals_add(locals, name, slot, kind);
+        return;
+    }
+    locals_add(locals, name, src_slot, kind);
 }
 
 static int32_t csg_parse_typed_expr_span(ColdCsgLower *lower, BodyIR *body,
@@ -11252,6 +11286,13 @@ static int32_t csg_parse_typed_expr_span(ColdCsgLower *lower, BodyIR *body,
         if (body->slot_aux[slot] != declared_len) die("cold csg typed array length mismatch");
     } else if (declared_kind == SLOT_SEQ_I32) {
         if (!cold_parse_i32_seq_type(type)) die("cold csg typed int32[] missing dynamic sequence type");
+    }
+    /* for SLOT_I32/SLOT_I32_REF, copy into a new slot to avoid aliasing with the source */
+    if (declared_kind == SLOT_I32 || declared_kind == SLOT_I32_REF) {
+        int32_t dst_slot = body_slot(body, declared_kind, 4);
+        body_op(body, BODY_OP_COPY_I32, dst_slot, slot, 0);
+        body_slot_set_type(body, dst_slot, span_trim(type));
+        return dst_slot;
     }
     body_slot_set_type(body, slot, span_trim(type));
     return slot;
