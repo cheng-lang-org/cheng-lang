@@ -1,10 +1,5 @@
 import std/result
 import std/strformat
-import std/strutils as strutil
-import std/os
-import std/atomic
-import std/async_rt as async
-import std/thread
 import cheng/std/bytes_layout as layout
 import cheng/core/tooling/path as chengpath
 import cheng/core/tooling/compiler_world as cworld
@@ -1453,83 +1448,6 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
         let fnIr = LoweringBuildOneFunction(plan, sourceTexts, i, letCallReturnLiteralStart)
         add(ir.functions, fnIr)
     return ir
-
-# -- Parallel lowering via atomic counter + async.spawn (no circular imports) ---
-
-var loweringParallelPlan: LoweringPlanStub
-var loweringParallelSourceTexts: texpr.TypedExprSourceText[]
-var loweringParallelLetCallReturnLiteralStart: int32
-var loweringParallelBuiltFunctions: PrimaryObjectIrFunction[]
-var loweringParallelNextIndex: atomic.I32
-var loweringParallelDoneCount: atomic.I32
-var loweringParallelFuncCount: int32
-var loweringParallelWorkerCount: int32
-
-fn LoweringParallelWorkerMain(workerId: int32) =
-    while true:
-        let i = atomic.FetchAddI32(loweringParallelNextIndex, 1)
-        if i >= loweringParallelFuncCount:
-            break
-        loweringParallelBuiltFunctions[i] = LoweringBuildOneFunction(
-            loweringParallelPlan,
-            loweringParallelSourceTexts,
-            i,
-            loweringParallelLetCallReturnLiteralStart)
-    let _ = atomic.AddI32(loweringParallelDoneCount, 1)
-
-fn LoweringBuildPrimaryObjectIrParallel(plan: LoweringPlanStub,
-                                         sourceTexts: texpr.TypedExprSourceText[],
-                                         jobCount: int32): PrimaryObjectIr =
-    let funcCount = plan.functionNames.len
-    if funcCount <= 0:
-        return PrimaryObjectIr()
-    if jobCount <= 1:
-        return LoweringBuildPrimaryObjectIr(plan, sourceTexts)
-
-    # Cap workers to function count
-    var workerCount = jobCount
-    if workerCount > funcCount:
-        workerCount = funcCount
-
-    # Set up shared read-only state
-    loweringParallelPlan = plan
-    loweringParallelSourceTexts = sourceTexts
-    loweringParallelLetCallReturnLiteralStart = texpr.BodyKindLetCallReturnI32ConstPrefixLen
-    loweringParallelFuncCount = funcCount
-    loweringParallelWorkerCount = workerCount
-
-    # Pre-allocate result array
-    loweringParallelBuiltFunctions = []
-    for i in 0..<funcCount:
-        add(loweringParallelBuiltFunctions, PrimaryObjectIrFunction())
-
-    # Atomic counter and done count
-    loweringParallelNextIndex = atomic.NewI32(0)
-    loweringParallelDoneCount = atomic.NewI32(0)
-
-    # Spawn worker threads (main thread works too)
-    for w in 1..<workerCount:
-        async.spawn(LoweringParallelWorkerMain, w)
-
-    # Main thread participates
-    LoweringParallelWorkerMain(0)
-
-    # Wait for all workers to finish
-    while atomic.LoadI32(loweringParallelDoneCount) < workerCount:
-        thread.Yield()
-
-    # Collect results
-    var ir: PrimaryObjectIr
-    for i in 0..<funcCount:
-        add(ir.functions, loweringParallelBuiltFunctions[i])
-
-    # Release shared state
-    loweringParallelPlan = LoweringPlanStub()
-    loweringParallelSourceTexts = []
-    loweringParallelBuiltFunctions = []
-
-    return ir
-
 fn LoweringIsImportcAnnotation(lineRaw: str): bool =
     let line = chengpath.PathTrim(lineRaw)
     if line == "":
@@ -1835,21 +1753,7 @@ fn BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.SystemLinkPlanStub,
         return false
     LoweringBuildTypedFunctionIndex(plan)
     plan.typedReturnOps = texpr.TypedExprReturnOpFactsFromIr(plan.typedIr)
-    # Parallel lowering via work-stealing executor when BACKEND_JOBS > 1
-    let backendJobsRaw = os.GetEnv("BACKEND_JOBS")
-    var loweringJobCount: int32
-    loweringJobCount = 0
-    if backendJobsRaw != "":
-        var ok = false
-        (loweringJobCount, ok) = strutil.ParseI32(backendJobsRaw)
-        if !ok:
-            loweringJobCount = 0
-    if loweringJobCount <= 0:
-        loweringJobCount = 1
-    if loweringJobCount > 1:
-        plan.primaryObjectIr = LoweringBuildPrimaryObjectIrParallel(plan, typedSourceTexts, loweringJobCount)
-    else:
-        plan.primaryObjectIr = LoweringBuildPrimaryObjectIr(plan, typedSourceTexts)
+    plan.primaryObjectIr = LoweringBuildPrimaryObjectIr(plan, typedSourceTexts)
     var loweringErr = ""
     if !texpr.TypedExprBuildLoweringRules(plan.typedExprFacts, plan.loweringRules, loweringErr):
         err = loweringErr
