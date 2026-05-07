@@ -139,6 +139,10 @@ static Span source_open(const char *path) {
         close(fd);
         return source;
     }
+    if (st.st_size > (off_t)INT32_MAX) {
+        close(fd);
+        return source;
+    }
     void *mem = mmap(0, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (mem == MAP_FAILED) return (Span){0};
@@ -177,7 +181,7 @@ static bool span_is_i32(Span s) {
 static int32_t span_i32(Span s) {
     int32_t i = 0;
     int32_t sign = 1;
-    int32_t value = 0;
+    int64_t value = 0;
     if (s.len > 0 && s.ptr[0] == '-') {
         sign = -1;
         i = 1;
@@ -185,9 +189,12 @@ static int32_t span_i32(Span s) {
     for (; i < s.len; i++) {
         uint8_t c = s.ptr[i];
         if (c < '0' || c > '9') break;
-        value = value * 10 + (int32_t)(c - '0');
+        value = value * 10 + (int64_t)(c - '0');
+        if (value > (int64_t)INT32_MAX + 1) return 0;
     }
-    return sign * value;
+    if (sign < 0 && value == (int64_t)INT32_MAX + 1) return INT32_MIN;
+    if (value > (int64_t)INT32_MAX) return 0;
+    return sign * (int32_t)value;
 }
 
 static Span span_trim(Span s) {
@@ -1901,10 +1908,29 @@ static int32_t cold_span_find_top_level_char(Span span, char needle) {
     return -1;
 }
 
-static Span cold_span_strip_trailing_colon(Span span) {
-    Span out = span_trim(span);
-    if (out.len > 0 && out.ptr[out.len - 1] == ':') out.len--;
-    return span_trim(out);
+/* Strip everything from the first ':' onward (the block delimiter), skipping
+   ':' inside string/char literals. Handles "if cond: // comment" -> "cond". */
+static Span cold_span_cut_at_block_colon(Span span) {
+    span = span_trim(span);
+    bool in_string = false;
+    bool in_char = false;
+    for (int32_t i = 0; i < span.len; i++) {
+        uint8_t c = span.ptr[i];
+        if (in_string) {
+            if (c == '\\' && i + 1 < span.len) { i++; continue; }
+            if (c == '"') in_string = false;
+            continue;
+        }
+        if (in_char) {
+            if (c == '\\' && i + 1 < span.len) { i++; continue; }
+            if (c == '\'') in_char = false;
+            continue;
+        }
+        if (c == '"') { in_string = true; continue; }
+        if (c == '\'') { in_char = true; continue; }
+        if (c == ':') return span_trim(span_sub(span, 0, i));
+    }
+    return span;
 }
 
 static int32_t cold_line_indent_width(Span line) {
@@ -2226,34 +2252,6 @@ static bool cold_emit_csg_object_specs(FILE *file, Span fields) {
     return emitted > 0;
 }
 
-static bool cold_emit_csg_tuple_specs(FILE *file, Span fields) {
-    int32_t pos = 0;
-    int32_t start = 0;
-    int32_t emitted = 0;
-    int32_t depth_square = 0;
-    int32_t depth_paren = 0;
-    for (; pos <= fields.len; pos++) {
-        uint8_t c = pos < fields.len ? fields.ptr[pos] : ',';
-        if (pos < fields.len) {
-            if (c == '[') depth_square++;
-            else if (c == ']') {
-                if (depth_square <= 0) return false;
-                depth_square--;
-            } else if (c == '(') depth_paren++;
-            else if (c == ')') {
-                if (depth_paren <= 0) return false;
-                depth_paren--;
-            }
-        }
-        if (pos < fields.len && !(c == ',' || c == ';')) continue;
-        if (depth_square != 0 || depth_paren != 0) continue;
-        Span part = span_trim(span_sub(fields, start, pos));
-        if (part.len > 0 && !cold_emit_csg_field_decl_spec(file, part, &emitted)) return false;
-        start = pos + 1;
-    }
-    return emitted > 0;
-}
-
 static bool cold_parse_type_entry_parts(Span trimmed, Span *type_name, Span *rhs) {
     int32_t p = 0;
     if (!cold_parse_ident_at(trimmed, &p, type_name)) return false;
@@ -2277,18 +2275,6 @@ static Span cold_type_entry_generic_params(Span trimmed) {
     int32_t open = p;
     if (!cold_skip_balanced_span(trimmed, &p, '[', ']')) return (Span){0};
     return span_trim(span_sub(trimmed, open + 1, p - 1));
-}
-
-static bool cold_emit_csg_tuple_object_row(FILE *file, Span type_name, Span rhs) {
-    int32_t open = cold_span_find_char(rhs, '[');
-    if (open <= 0 || rhs.len <= open + 1 || rhs.ptr[rhs.len - 1] != ']') return false;
-    Span fields = span_trim(span_sub(rhs, open + 1, rhs.len - 1));
-    fprintf(file, "cold_csg_object\t");
-    cold_write_span(file, type_name);
-    fputc('\t', file);
-    if (!cold_emit_csg_tuple_specs(file, fields)) return false;
-    fputc('\n', file);
-    return true;
 }
 
 /* ---- scanner helpers for cold_emit_csg_type_rows ---- */
@@ -2739,32 +2725,32 @@ static bool cold_emit_csg_statement_row(FILE *file, int32_t fn_index, int32_t in
         return true;
     }
     if (cold_span_starts_with(trimmed, "if ")) {
-        Span condition = cold_span_strip_trailing_colon(span_sub(trimmed, 3, trimmed.len));
+        Span condition = cold_span_cut_at_block_colon(span_sub(trimmed, 3, trimmed.len));
         fprintf(file, "cold_csg_stmt\t%d\t%d\tif\t", fn_index, indent);
         cold_write_span(file, condition);
         fputc('\n', file);
         return true;
     }
     if (cold_span_starts_with(trimmed, "elif ")) {
-        Span condition = cold_span_strip_trailing_colon(span_sub(trimmed, 5, trimmed.len));
+        Span condition = cold_span_cut_at_block_colon(span_sub(trimmed, 5, trimmed.len));
         fprintf(file, "cold_csg_stmt\t%d\t%d\telif\t", fn_index, indent);
         cold_write_span(file, condition);
         fputc('\n', file);
         return true;
     }
-    if (span_eq(cold_span_strip_trailing_colon(trimmed), "else")) {
+    if (span_eq(cold_span_cut_at_block_colon(trimmed), "else")) {
         fprintf(file, "cold_csg_stmt\t%d\t%d\telse\n", fn_index, indent);
         return true;
     }
     if (cold_span_starts_with(trimmed, "while ")) {
-        Span condition = cold_span_strip_trailing_colon(span_sub(trimmed, 6, trimmed.len));
+        Span condition = cold_span_cut_at_block_colon(span_sub(trimmed, 6, trimmed.len));
         fprintf(file, "cold_csg_stmt\t%d\t%d\twhile\t", fn_index, indent);
         cold_write_span(file, condition);
         fputc('\n', file);
         return true;
     }
     if (cold_span_starts_with(trimmed, "for ")) {
-        Span payload = cold_span_strip_trailing_colon(span_sub(trimmed, 4, trimmed.len));
+        Span payload = cold_span_cut_at_block_colon(span_sub(trimmed, 4, trimmed.len));
         int32_t in_pos = cold_span_find_text(payload, " in ");
         if (in_pos <= 0) return false;
         Span iter = span_trim(span_sub(payload, 0, in_pos));
@@ -3035,10 +3021,7 @@ static bool cold_emit_csg_statement_rows(FILE *file, Span source) {
             cold_span_starts_with(trimmed, "while ")) {
             int32_t kw_len = cold_span_starts_with(trimmed, "if ") ? 3 :
                              cold_span_starts_with(trimmed, "elif ") ? 5 : 6;
-            Span condition = span_trim(span_sub(trimmed, kw_len, trimmed.len));
-            /* strip trailing colon */
-            if (condition.len > 0 && condition.ptr[condition.len - 1] == ':')
-                condition = span_sub(condition, 0, condition.len - 1);
+            Span condition = cold_span_cut_at_block_colon(span_sub(trimmed, kw_len, trimmed.len));
             /* always scan ahead for continuation lines */
             int32_t cond_len = condition.len < (int32_t)sizeof(cond_buf) - 1 ? condition.len : (int32_t)sizeof(cond_buf) - 1;
             memcpy(cond_buf, condition.ptr, (size_t)cond_len);
@@ -4323,7 +4306,6 @@ static int32_t cold_slot_size_for_kind(int32_t kind) {
     if (kind == SLOT_STR) return 16;
     if (kind == SLOT_PTR) return 8;
     if (kind == SLOT_I32) return 4;
-    if (kind == SLOT_I32_REF) return 8;
     if (kind == SLOT_I32_REF) return 8;
     if (kind == SLOT_VARIANT) return 64;
     if (kind == SLOT_OBJECT) return 16;
@@ -11996,8 +11978,87 @@ static void function_patches_add(FunctionPatchList *patches, int32_t pos, int32_
     patches->items[patches->count++] = (FunctionPatch){pos, target_function};
 }
 
+/* ---- large immediate / large offset helpers ---- */
+
+static uint32_t a64_add_imm_shifted(int rd, int rn, uint16_t imm12, bool x64) {
+    return (x64 ? 0x91000000u : 0x11000000u) | ((uint32_t)rd) | ((uint32_t)rn << 5)
+           | ((uint32_t)(imm12 & 0xFFF) << 10) | (1u << 22);
+}
+
+static uint32_t a64_sub_imm_shifted(int rd, int rn, uint16_t imm12, bool x64) {
+    return (x64 ? 0xD1000000u : 0x51000000u) | ((uint32_t)rd) | ((uint32_t)rn << 5)
+           | ((uint32_t)(imm12 & 0xFFF) << 10) | (1u << 22);
+}
+
+/* Emit SUB with potentially large 64-bit immediate (two instructions if needed). */
+static void a64_emit_sub_large(Code *code, int rd, int rn, int32_t value, bool x64) {
+    if (value <= 0xFFF) {
+        code_emit(code, a64_sub_imm(rd, rn, (uint16_t)value, x64));
+        return;
+    }
+    if (value % 0x1000 == 0 && value / 0x1000 <= 0xFFF) {
+        code_emit(code, a64_sub_imm_shifted(rd, rn, (uint16_t)(value / 0x1000), x64));
+        return;
+    }
+    int32_t hi = (value >> 12) << 12;
+    int32_t lo = value - hi;
+    if (hi > 0)
+        code_emit(code, a64_sub_imm_shifted(rd, rn, (uint16_t)(hi / 0x1000), x64));
+    if (lo > 0)
+        code_emit(code, a64_sub_imm(rd, rd, (uint16_t)lo, x64));
+}
+
+/* Emit ADD with potentially large 64-bit immediate. */
+static void a64_emit_add_large(Code *code, int rd, int rn, int32_t value, bool x64) {
+    if (value <= 0xFFF) {
+        code_emit(code, a64_add_imm(rd, rn, (uint16_t)value, x64));
+        return;
+    }
+    if (value % 0x1000 == 0 && value / 0x1000 <= 0xFFF) {
+        code_emit(code, a64_add_imm_shifted(rd, rn, (uint16_t)(value / 0x1000), x64));
+        return;
+    }
+    int32_t hi = (value >> 12) << 12;
+    int32_t lo = value - hi;
+    if (hi > 0)
+        code_emit(code, a64_add_imm_shifted(rd, rn, (uint16_t)(hi / 0x1000), x64));
+    if (lo > 0)
+        code_emit(code, a64_add_imm(rd, rd, (uint16_t)lo, x64));
+}
+
+/* Emit 16-bit immediate into x16 (single movz for values 0-65535, two for larger). */
+static void a64_emit_mov_imm_x16(Code *code, int32_t value) {
+    code_emit(code, a64_movz_x(16, (uint16_t)(value & 0xFFFF), 0));
+    if (value > 0xFFFF)
+        code_emit(code, a64_movk(16, (uint16_t)((value >> 16) & 0xFFFF), 1));
+}
+
+/* Load from SP with potentially large unsigned offset. */
+static void a64_emit_ldr_sp_off(Code *code, int rt, int32_t offset, bool x64) {
+    int32_t max_off = x64 ? 32760 : 16380;
+    if (offset <= max_off) {
+        code_emit(code, a64_ldr_imm(rt, SP, offset, x64));
+    } else {
+        a64_emit_mov_imm_x16(code, offset);
+        code_emit(code, a64_add_reg_x(16, SP, 16));
+        code_emit(code, a64_ldr_imm(rt, 16, 0, x64));
+    }
+}
+
+/* Store to SP with potentially large unsigned offset. */
+static void a64_emit_str_sp_off(Code *code, int rt, int32_t offset, bool x64) {
+    int32_t max_off = x64 ? 32760 : 16380;
+    if (offset <= max_off) {
+        code_emit(code, a64_str_imm(rt, SP, offset, x64));
+    } else {
+        a64_emit_mov_imm_x16(code, offset);
+        code_emit(code, a64_add_reg_x(16, SP, 16));
+        code_emit(code, a64_str_imm(rt, 16, 0, x64));
+    }
+}
+
 static void emit_epilogue(Code *code, int32_t frame_size) {
-    if (frame_size > 0) code_emit(code, a64_add_imm(SP, SP, (uint16_t)frame_size, true));
+    if (frame_size > 0) a64_emit_add_large(code, SP, SP, frame_size, true);
     code_emit(code, a64_ldp_post(FP, LR, SP, 16));
     code_emit(code, a64_ret());
 }
@@ -12049,34 +12110,34 @@ static void codegen_store_params(Code *code, BodyIR *body) {
         int32_t incoming_stack_offset = 16 + stack_offset;
         if (kind == SLOT_I32) {
             if (in_regs) {
-                code_emit(code, a64_str_imm(base_reg, SP, body->slot_offset[slot], false));
+                a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], false);
             } else {
                 code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset, false));
-                code_emit(code, a64_str_imm(R9, SP, body->slot_offset[slot], false));
+                a64_emit_str_sp_off(code, R9, body->slot_offset[slot], false);
             }
         } else if (kind == SLOT_STR) {
             if (in_regs) {
-                code_emit(code, a64_str_imm(base_reg, SP, body->slot_offset[slot], true));
-                code_emit(code, a64_str_imm(base_reg + 1, SP, body->slot_offset[slot] + 8, true));
+                a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], true);
+                a64_emit_str_sp_off(code, base_reg + 1, body->slot_offset[slot] + 8, true);
             } else {
                 code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset, true));
-                code_emit(code, a64_str_imm(R9, SP, body->slot_offset[slot], true));
+                a64_emit_str_sp_off(code, R9, body->slot_offset[slot], true);
                 code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset + 8, true));
-                code_emit(code, a64_str_imm(R9, SP, body->slot_offset[slot] + 8, true));
+                a64_emit_str_sp_off(code, R9, body->slot_offset[slot] + 8, true);
             }
         } else if (kind == SLOT_I32_REF) {
             if (in_regs) {
-                code_emit(code, a64_str_imm(base_reg, SP, body->slot_offset[slot], true));
+                a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], true);
             } else {
                 code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset, true));
-                code_emit(code, a64_str_imm(R9, SP, body->slot_offset[slot], true));
+                a64_emit_str_sp_off(code, R9, body->slot_offset[slot], true);
             }
         } else if (kind == SLOT_STR_REF) {
             if (in_regs) {
-                code_emit(code, a64_str_imm(base_reg, SP, body->slot_offset[slot], true));
+                a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], true);
             } else {
                 code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset, true));
-                code_emit(code, a64_str_imm(R9, SP, body->slot_offset[slot], true));
+                a64_emit_str_sp_off(code, R9, body->slot_offset[slot], true);
             }
         } else if (kind == SLOT_VARIANT) {
             if (size > 16) {
@@ -12084,16 +12145,16 @@ static void codegen_store_params(Code *code, BodyIR *body) {
                 if (!in_regs) code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset, true));
                 for (int32_t off = 0; off < size; off += 8) {
                     code_emit(code, a64_ldr_imm(R0, src_reg, off, true));
-                    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[slot] + off, true));
+                    a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + off, true);
                 }
             } else {
                 if (in_regs) {
-                    code_emit(code, a64_str_imm(base_reg, SP, body->slot_offset[slot], true));
-                    code_emit(code, a64_str_imm(base_reg + 1, SP, body->slot_offset[slot] + 8, true));
+                    a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], true);
+                    a64_emit_str_sp_off(code, base_reg + 1, body->slot_offset[slot] + 8, true);
                 } else {
                     for (int32_t off = 0; off < size; off += 8) {
                         code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset + off, true));
-                        code_emit(code, a64_str_imm(R9, SP, body->slot_offset[slot] + off, true));
+                        a64_emit_str_sp_off(code, R9, body->slot_offset[slot] + off, true);
                     }
                 }
             }
@@ -12105,16 +12166,16 @@ static void codegen_store_params(Code *code, BodyIR *body) {
                 if (!in_regs) code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset, true));
                 for (int32_t off = 0; off < size; off += 8) {
                     code_emit(code, a64_ldr_imm(R0, src_reg, off, true));
-                    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[slot] + off, true));
+                    a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + off, true);
                 }
             } else {
                 if (in_regs) {
-                    code_emit(code, a64_str_imm(base_reg, SP, body->slot_offset[slot], true));
-                    code_emit(code, a64_str_imm(base_reg + 1, SP, body->slot_offset[slot] + 8, true));
+                    a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], true);
+                    a64_emit_str_sp_off(code, base_reg + 1, body->slot_offset[slot] + 8, true);
                 } else {
                     for (int32_t off = 0; off < size; off += 8) {
                         code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset + off, true));
-                        code_emit(code, a64_str_imm(R9, SP, body->slot_offset[slot] + off, true));
+                        a64_emit_str_sp_off(code, R9, body->slot_offset[slot] + off, true);
                     }
                 }
             }
@@ -12122,10 +12183,10 @@ static void codegen_store_params(Code *code, BodyIR *body) {
                    kind == SLOT_OBJECT_REF || kind == SLOT_OPAQUE ||
                    kind == SLOT_OPAQUE_REF) {
             if (in_regs) {
-                code_emit(code, a64_str_imm(base_reg, SP, body->slot_offset[slot], true));
+                a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], true);
             } else {
                 code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset, true));
-                code_emit(code, a64_str_imm(R9, SP, body->slot_offset[slot], true));
+                a64_emit_str_sp_off(code, R9, body->slot_offset[slot], true);
             }
         } else {
             die("unsupported cold parameter kind");
@@ -12138,7 +12199,7 @@ static void codegen_place_x_arg(Code *code, bool in_regs, int32_t base_reg,
     if (in_regs) {
         if (base_reg != src_reg) code_emit(code, a64_add_imm(base_reg, src_reg, 0, true));
     } else {
-        code_emit(code, a64_str_imm(src_reg, SP, stack_offset, true));
+        a64_emit_str_sp_off(code, src_reg, stack_offset, true);
     }
 }
 
@@ -12147,7 +12208,7 @@ static void codegen_place_w_arg(Code *code, bool in_regs, int32_t base_reg,
     if (in_regs) {
         if (base_reg != src_reg) code_emit(code, a64_add_imm(base_reg, src_reg, 0, true));
     } else {
-        code_emit(code, a64_str_imm(src_reg, SP, stack_offset, false));
+        a64_emit_str_sp_off(code, src_reg, stack_offset, false);
     }
 }
 
@@ -12167,7 +12228,7 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
         int32_t local_offset = body->slot_offset[arg_slot] + stack_bytes;
         if (fn->param_kind[i] == SLOT_I32_REF) {
             if (arg_kind == SLOT_I32_REF) {
-                code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
             } else if (arg_kind == SLOT_I32) {
                 code_emit(code, a64_add_imm(R9, SP, (uint16_t)local_offset, true));
             } else {
@@ -12178,7 +12239,7 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
         }
         if (fn->param_kind[i] == SLOT_SEQ_I32_REF) {
             if (arg_kind == SLOT_SEQ_I32_REF) {
-                code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
             } else if (arg_kind == SLOT_SEQ_I32) {
                 code_emit(code, a64_add_imm(R9, SP, (uint16_t)local_offset, true));
             } else {
@@ -12189,7 +12250,7 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
         }
         if (fn->param_kind[i] == SLOT_SEQ_STR_REF) {
             if (arg_kind == SLOT_SEQ_STR_REF) {
-                code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
             } else if (arg_kind == SLOT_SEQ_STR) {
                 code_emit(code, a64_add_imm(R9, SP, (uint16_t)local_offset, true));
             } else {
@@ -12200,7 +12261,7 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
         }
         if (fn->param_kind[i] == SLOT_STR_REF) {
             if (arg_kind == SLOT_STR_REF) {
-                code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
             } else if (arg_kind == SLOT_STR) {
                 code_emit(code, a64_add_imm(R9, SP, (uint16_t)local_offset, true));
             } else {
@@ -12211,7 +12272,7 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
         }
         if (fn->param_kind[i] == SLOT_OBJECT_REF) {
             if (arg_kind == SLOT_OBJECT_REF) {
-                code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
             } else if (arg_kind == SLOT_OBJECT) {
                 code_emit(code, a64_add_imm(R9, SP, (uint16_t)local_offset, true));
             } else {
@@ -12221,27 +12282,27 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
             continue;
         }
         if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
-            code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
+            a64_emit_ldr_sp_off(code, R9, local_offset, true);
             code_emit(code, a64_ldr_imm(R9, R9, 0, false));
             codegen_place_w_arg(code, in_regs, base_reg, stack_offset, R9);
             continue;
         }
         if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
-            code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
+            a64_emit_ldr_sp_off(code, R9, local_offset, true);
             if (in_regs) {
                 code_emit(code, a64_ldr_imm(base_reg, R9, 0, true));
                 code_emit(code, a64_ldr_imm(base_reg + 1, R9, 8, true));
             } else {
                 code_emit(code, a64_ldr_imm(R9, R9, 0, true));
-                code_emit(code, a64_str_imm(R9, SP, stack_offset, true));
-                code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
+                a64_emit_str_sp_off(code, R9, stack_offset, true);
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
                 code_emit(code, a64_ldr_imm(R9, R9, 8, true));
-                code_emit(code, a64_str_imm(R9, SP, stack_offset + 8, true));
+                a64_emit_str_sp_off(code, R9, stack_offset + 8, true);
             }
             continue;
         }
         if (fn->param_kind[i] == SLOT_OBJECT && arg_kind == SLOT_OBJECT_REF) {
-            code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
+            a64_emit_ldr_sp_off(code, R9, local_offset, true);
             if (param_size > 16) {
                 codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
             } else if (in_regs) {
@@ -12250,7 +12311,7 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
             } else {
                 for (int32_t off = 0; off < param_size; off += 8) {
                     code_emit(code, a64_ldr_imm(R10, R9, off, true));
-                    code_emit(code, a64_str_imm(R10, SP, stack_offset + off, true));
+                    a64_emit_str_sp_off(code, R10, stack_offset + off, true);
                 }
             }
             continue;
@@ -12266,23 +12327,23 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
         int32_t arg_size = body->slot_size[arg_slot];
         if (arg_kind == SLOT_VARIANT && arg_size != param_size) die("cold call arg size changed after lowering");
         if (arg_kind == SLOT_I32) {
-            code_emit(code, a64_ldr_imm(R9, SP, local_offset, false));
+            a64_emit_ldr_sp_off(code, R9, local_offset, false);
             codegen_place_w_arg(code, in_regs, base_reg, stack_offset, R9);
         } else if (arg_kind == SLOT_STR) {
             if (in_regs) {
-                code_emit(code, a64_ldr_imm(base_reg, SP, local_offset, true));
-                code_emit(code, a64_ldr_imm(base_reg + 1, SP, local_offset + 8, true));
+                a64_emit_ldr_sp_off(code, base_reg, local_offset, true);
+                a64_emit_ldr_sp_off(code, base_reg + 1, local_offset + 8, true);
             } else {
-                code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
-                code_emit(code, a64_str_imm(R9, SP, stack_offset, true));
-                code_emit(code, a64_ldr_imm(R9, SP, local_offset + 8, true));
-                code_emit(code, a64_str_imm(R9, SP, stack_offset + 8, true));
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
+                a64_emit_str_sp_off(code, R9, stack_offset, true);
+                a64_emit_ldr_sp_off(code, R9, local_offset + 8, true);
+                a64_emit_str_sp_off(code, R9, stack_offset + 8, true);
             }
         } else if (arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF ||
                    arg_kind == SLOT_OBJECT_REF || arg_kind == SLOT_I32_REF ||
                    arg_kind == SLOT_STR_REF || arg_kind == SLOT_SEQ_I32_REF ||
                    arg_kind == SLOT_SEQ_STR_REF) {
-            code_emit(code, a64_ldr_imm(R9, SP, local_offset, true));
+            a64_emit_ldr_sp_off(code, R9, local_offset, true);
             codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
         } else if (arg_kind == SLOT_VARIANT) {
             if (param_size > 16) {
@@ -12290,12 +12351,12 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
                 codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
             } else {
                 if (in_regs) {
-                    code_emit(code, a64_ldr_imm(base_reg, SP, local_offset, true));
-                    code_emit(code, a64_ldr_imm(base_reg + 1, SP, local_offset + 8, true));
+                    a64_emit_ldr_sp_off(code, base_reg, local_offset, true);
+                    a64_emit_ldr_sp_off(code, base_reg + 1, local_offset + 8, true);
                 } else {
                     for (int32_t off = 0; off < param_size; off += 8) {
-                        code_emit(code, a64_ldr_imm(R9, SP, local_offset + off, true));
-                        code_emit(code, a64_str_imm(R9, SP, stack_offset + off, true));
+                        a64_emit_ldr_sp_off(code, R9, local_offset + off, true);
+                        a64_emit_str_sp_off(code, R9, stack_offset + off, true);
                     }
                 }
             }
@@ -12307,12 +12368,12 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
                 codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
             } else {
                 if (in_regs) {
-                    code_emit(code, a64_ldr_imm(base_reg, SP, local_offset, true));
-                    code_emit(code, a64_ldr_imm(base_reg + 1, SP, local_offset + 8, true));
+                    a64_emit_ldr_sp_off(code, base_reg, local_offset, true);
+                    a64_emit_ldr_sp_off(code, base_reg + 1, local_offset + 8, true);
                 } else {
                     for (int32_t off = 0; off < param_size; off += 8) {
-                        code_emit(code, a64_ldr_imm(R9, SP, local_offset + off, true));
-                        code_emit(code, a64_str_imm(R9, SP, stack_offset + off, true));
+                        a64_emit_ldr_sp_off(code, R9, local_offset + off, true);
+                        a64_emit_str_sp_off(code, R9, stack_offset + off, true);
                     }
                 }
             }
@@ -12326,7 +12387,7 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
 static void codegen_zero_slot(Code *code, BodyIR *body, int32_t slot) {
     code_emit(code, a64_movz_x(R0, 0, 0));
     for (int32_t off = 0; off < body->slot_size[slot]; off += 8) {
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[slot] + off, true));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + off, true);
     }
 }
 
@@ -12345,28 +12406,28 @@ static void codegen_copy_slot_from_offset(Code *code, BodyIR *body,
     int32_t src_kind = body->slot_kind[src_slot];
     if (src_kind == SLOT_OBJECT_REF || src_kind == SLOT_SEQ_I32_REF ||
         src_kind == SLOT_SEQ_STR_REF || src_kind == SLOT_STR_REF) {
-        code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[src_slot], true));
+        a64_emit_ldr_sp_off(code, R2, body->slot_offset[src_slot], true);
         if (kind == SLOT_I32) {
             code_emit(code, a64_ldr_imm(R0, R2, src_offset, false));
-            code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst_slot], false));
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst_slot], false);
             return;
         }
         int32_t total = body->slot_size[dst_slot];
         for (int32_t off = 0; off < total; off += 8) {
             code_emit(code, a64_ldr_imm(R0, R2, src_offset + off, true));
-            code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst_slot] + off, true));
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst_slot] + off, true);
         }
         return;
     }
     if (kind == SLOT_I32) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[src_slot] + src_offset, false));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst_slot], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[src_slot] + src_offset, false);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst_slot], false);
         return;
     }
     int32_t total = body->slot_size[dst_slot];
     for (int32_t off = 0; off < total; off += 8) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[src_slot] + src_offset + off, true));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst_slot] + off, true));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[src_slot] + src_offset + off, true);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst_slot] + off, true);
     }
 }
 
@@ -12375,14 +12436,14 @@ static void codegen_store_slot_to_offset(Code *code, BodyIR *body,
                                          int32_t src_slot) {
     int32_t kind = body->slot_kind[src_slot];
     if (kind == SLOT_I32) {
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[src_slot], false));
-        code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst_slot] + dst_offset, false));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot], false);
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst_slot] + dst_offset, false);
         return;
     }
     int32_t total = body->slot_size[src_slot];
     for (int32_t off = 0; off < total; off += 8) {
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[src_slot] + off, true));
-        code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst_slot] + dst_offset + off, true));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot] + off, true);
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst_slot] + dst_offset + off, true);
     }
 }
 
@@ -12395,29 +12456,29 @@ static void codegen_store_slot_to_payload(Code *code, BodyIR *body,
         codegen_store_slot_to_offset(code, body, dst_slot, dst_offset, src_slot);
         return;
     }
-    code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[dst_slot], true));
+    a64_emit_ldr_sp_off(code, R2, body->slot_offset[dst_slot], true);
     int32_t kind = body->slot_kind[src_slot];
     if (kind == SLOT_I32) {
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[src_slot], false));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot], false);
         code_emit(code, a64_str_imm(R1, R2, dst_offset, false));
         return;
     }
     int32_t total = body->slot_size[src_slot];
     for (int32_t off = 0; off < total; off += 8) {
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[src_slot] + off, true));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot] + off, true);
         code_emit(code, a64_str_imm(R1, R2, dst_offset + off, true));
     }
 }
 
 static void codegen_str_eq(Code *code, BodyIR *body, int32_t dst, int32_t left, int32_t right) {
     if (body->slot_kind[left] != SLOT_STR || body->slot_kind[right] != SLOT_STR) die("str eq operands must be str");
-    code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[left] + 8, true));
-    code_emit(code, a64_ldr_imm(R3, SP, body->slot_offset[right] + 8, true));
+    a64_emit_ldr_sp_off(code, R2, body->slot_offset[left] + 8, true);
+    a64_emit_ldr_sp_off(code, R3, body->slot_offset[right] + 8, true);
     code_emit(code, a64_cmp_reg(R2, R3));
     int32_t len_ne = code->count;
     code_emit(code, a64_bcond(0, COND_NE));
-    code_emit(code, a64_ldr_imm(4, SP, body->slot_offset[left], true));
-    code_emit(code, a64_ldr_imm(5, SP, body->slot_offset[right], true));
+    a64_emit_ldr_sp_off(code, 4, body->slot_offset[left], true);
+    a64_emit_ldr_sp_off(code, 5, body->slot_offset[right], true);
     code_emit(code, a64_movz(6, 0, 0));
     int32_t loop = code->count;
     code_emit(code, a64_cmp_reg(6, R2));
@@ -12439,7 +12500,7 @@ static void codegen_str_eq(Code *code, BodyIR *body, int32_t dst, int32_t left, 
     int32_t false_label = code->count;
     code_emit(code, a64_movz(R0, 0, 0));
     int32_t done = code->count;
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     a64_patch_bcond(code, len_ne, false_label);
     a64_patch_bcond(code, done_equal, equal_label);
     a64_patch_bcond(code, byte_ne, false_label);
@@ -12465,20 +12526,20 @@ static void codegen_load_str_pair(Code *code, BodyIR *body, int32_t slot,
                                   int ptr_reg, int len_reg) {
     int32_t kind = body->slot_kind[slot];
     if (kind == SLOT_STR_REF) {
-        code_emit(code, a64_ldr_imm(ptr_reg, SP, body->slot_offset[slot], true));
+        a64_emit_ldr_sp_off(code, ptr_reg, body->slot_offset[slot], true);
         code_emit(code, a64_ldr_imm(len_reg, ptr_reg, 8, true));
         code_emit(code, a64_ldr_imm(ptr_reg, ptr_reg, 0, true));
         return;
     }
     if (kind != SLOT_STR) die("expected str slot");
-    code_emit(code, a64_ldr_imm(ptr_reg, SP, body->slot_offset[slot], true));
-    code_emit(code, a64_ldr_imm(len_reg, SP, body->slot_offset[slot] + 8, true));
+    a64_emit_ldr_sp_off(code, ptr_reg, body->slot_offset[slot], true);
+    a64_emit_ldr_sp_off(code, len_reg, body->slot_offset[slot] + 8, true);
 }
 
 static void codegen_store_str_pair(Code *code, BodyIR *body, int32_t slot,
                                    int ptr_reg, int len_reg) {
-    code_emit(code, a64_str_imm(ptr_reg, SP, body->slot_offset[slot], true));
-    code_emit(code, a64_str_imm(len_reg, SP, body->slot_offset[slot] + 8, true));
+    a64_emit_str_sp_off(code, ptr_reg, body->slot_offset[slot], true);
+    a64_emit_str_sp_off(code, len_reg, body->slot_offset[slot] + 8, true);
 }
 
 static void codegen_store_empty_str(Code *code, BodyIR *body, int32_t slot) {
@@ -12776,7 +12837,7 @@ static void codegen_parse_int_slot(Code *code, BodyIR *body, int32_t dst, int32_
     code_emit(code, a64_sub_reg(R0, 5, R0));
     a64_patch_bcond(code, positive_done, code->count);
     a64_patch_bcond(code, empty_done, code->count);
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
 }
 
 static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg);
@@ -12849,7 +12910,7 @@ static void codegen_str_join(Code *code, BodyIR *body, int32_t dst,
 static void codegen_str_split_char(Code *code, BodyIR *body, int32_t dst,
                                    int32_t text_slot, int32_t sep_slot) {
     codegen_load_str_pair(code, body, text_slot, 6, 7);
-    code_emit(code, a64_ldr_imm(11, SP, body->slot_offset[sep_slot], false));
+    a64_emit_ldr_sp_off(code, 11, body->slot_offset[sep_slot], false);
     code_emit(code, a64_movz(12, 1, 0));
     code_emit(code, a64_movz(13, 0, 0));
     int32_t count_loop = code->count;
@@ -12871,9 +12932,9 @@ static void codegen_str_split_char(Code *code, BodyIR *body, int32_t dst,
     code_emit(code, a64_add_reg_x(R1, R1, R1));
     code_emit(code, a64_add_reg_x(R1, R1, R1));
     codegen_mmap_len_reg(code, R1, 14, 60);
-    code_emit(code, a64_str_imm(12, SP, body->slot_offset[dst], false));
-    code_emit(code, a64_str_imm(12, SP, body->slot_offset[dst] + 4, false));
-    code_emit(code, a64_str_imm(14, SP, body->slot_offset[dst] + 8, true));
+    a64_emit_str_sp_off(code, 12, body->slot_offset[dst], false);
+    a64_emit_str_sp_off(code, 12, body->slot_offset[dst] + 4, false);
+    a64_emit_str_sp_off(code, 14, body->slot_offset[dst] + 8, true);
     code_emit(code, a64_movz(13, 0, 0));
     code_emit(code, a64_movz(15, 0, 0));
     code_emit(code, a64_movz(10, 0, 0));
@@ -12946,8 +13007,8 @@ static void codegen_str_strip(Code *code, BodyIR *body, int32_t dst, int32_t src
 static void codegen_str_slice(Code *code, BodyIR *body, int32_t dst,
                               int32_t text_slot, int32_t start_slot, int32_t len_slot) {
     codegen_load_str_pair(code, body, text_slot, R1, R2);
-    code_emit(code, a64_ldr_imm(3, SP, body->slot_offset[start_slot], false));
-    code_emit(code, a64_ldr_imm(4, SP, body->slot_offset[len_slot], false));
+    a64_emit_ldr_sp_off(code, 3, body->slot_offset[start_slot], false);
+    a64_emit_ldr_sp_off(code, 4, body->slot_offset[len_slot], false);
     code_emit(code, a64_cmp_imm(3, 0));
     int32_t start_non_negative = code->count;
     code_emit(code, a64_bcond(0, COND_GE));
@@ -12993,7 +13054,7 @@ static void codegen_text_set_base(Code *code, BodyIR *body, int32_t slot, int re
         return;
     }
     if (body->slot_kind[slot] == SLOT_OBJECT_REF) {
-        code_emit(code, a64_ldr_imm(reg, SP, body->slot_offset[slot], true));
+        a64_emit_ldr_sp_off(code, reg, body->slot_offset[slot], true);
         return;
     }
     die("text set base must be object");
@@ -13014,13 +13075,13 @@ static void codegen_text_set_insert(Code *code, BodyIR *body, Symbols *symbols,
     int32_t empty_new = code->count;
     code_emit(code, a64_bcond(0, COND_EQ));
     code_emit(code, a64_movz(R0, 0, 0));
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     int32_t empty_done = code->count;
     code_emit(code, a64_b(0));
     a64_patch_bcond(code, empty_new, code->count);
     code_emit(code, a64_movz(5, 1, 0));
     code_emit(code, a64_str_imm(5, 17, empty_offset, false));
-    code_emit(code, a64_str_imm(5, SP, body->slot_offset[dst], false));
+    a64_emit_str_sp_off(code, 5, body->slot_offset[dst], false);
     a64_patch_b(code, empty_done, code->count);
     int32_t all_done_from_empty = code->count;
     code_emit(code, a64_b(0));
@@ -13061,7 +13122,7 @@ static void codegen_text_set_insert(Code *code, BodyIR *body, Symbols *symbols,
     code_emit(code, a64_b(byte_loop - code->count));
     a64_patch_bcond(code, duplicate, code->count);
     code_emit(code, a64_movz(R0, 0, 0));
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     int32_t duplicate_done = code->count;
     code_emit(code, a64_b(0));
     int32_t next_item = code->count;
@@ -13114,7 +13175,7 @@ static void codegen_text_set_insert(Code *code, BodyIR *body, Symbols *symbols,
     code_emit(code, a64_add_imm(7, 7, 1, false));
     code_emit(code, a64_str_imm(7, 6, 0, false));
     code_emit(code, a64_movz(R0, 1, 0));
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     a64_patch_b(code, duplicate_done, code->count);
     a64_patch_b(code, all_done_from_empty, code->count);
 }
@@ -13240,15 +13301,15 @@ static void codegen_str_concat(Code *code, BodyIR *body, int32_t dst, int32_t le
     if (body->slot_kind[left] != SLOT_STR || body->slot_kind[right] != SLOT_STR) {
         die("str concat operands must be str");
     }
-    code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[left] + 8, true));
-    code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[right] + 8, true));
+    a64_emit_ldr_sp_off(code, R1, body->slot_offset[left] + 8, true);
+    a64_emit_ldr_sp_off(code, R2, body->slot_offset[right] + 8, true);
     code_emit(code, a64_add_reg(R1, R1, R2));
-    code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst] + 8, true));
+    a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + 8, true);
     code_emit(code, a64_cmp_imm(R1, 0));
     int32_t non_empty_pos = code->count;
     code_emit(code, a64_bcond(0, COND_NE));
     code_emit(code, a64_movz_x(R0, 0, 0));
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], true));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     int32_t empty_done = code->count;
     code_emit(code, a64_b(0));
 
@@ -13266,14 +13327,14 @@ static void codegen_str_concat(Code *code, BodyIR *body, int32_t dst, int32_t le
     code_emit(code, a64_bcond(0, COND_NE));
     code_emit(code, a64_brk(4));
     a64_patch_bcond(code, mmap_ok, code->count);
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], true));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     code_emit(code, a64_add_imm(6, R0, 0, true));
 
-    code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[left], true));
-    code_emit(code, a64_ldr_imm(R3, SP, body->slot_offset[left] + 8, true));
+    a64_emit_ldr_sp_off(code, R2, body->slot_offset[left], true);
+    a64_emit_ldr_sp_off(code, R3, body->slot_offset[left] + 8, true);
     codegen_copy_bytes(code, R2, R3, 6);
-    code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[right], true));
-    code_emit(code, a64_ldr_imm(R3, SP, body->slot_offset[right] + 8, true));
+    a64_emit_ldr_sp_off(code, R2, body->slot_offset[right], true);
+    a64_emit_ldr_sp_off(code, R3, body->slot_offset[right] + 8, true);
     codegen_copy_bytes(code, R2, R3, 6);
 
     a64_patch_b(code, empty_done, code->count);
@@ -13281,7 +13342,7 @@ static void codegen_str_concat(Code *code, BodyIR *body, int32_t dst, int32_t le
 
 static void codegen_i32_to_str(Code *code, BodyIR *body, int32_t dst, int32_t src) {
     if (body->slot_kind[src] != SLOT_I32) die("i32 to str source must be int32");
-    code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[src], false));
+    a64_emit_ldr_sp_off(code, R2, body->slot_offset[src], false);
 
     code_emit(code, a64_movz_x(R0, 0, 0));
     code_emit(code, a64_movz_x(R1, 16, 0));
@@ -13297,16 +13358,16 @@ static void codegen_i32_to_str(Code *code, BodyIR *body, int32_t dst, int32_t sr
     code_emit(code, a64_bcond(0, COND_NE));
     code_emit(code, a64_brk(6));
     a64_patch_bcond(code, mmap_ok, code->count);
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], true));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
 
-    code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[src], false));
+    a64_emit_ldr_sp_off(code, R2, body->slot_offset[src], false);
     code_emit(code, a64_cmp_imm(R2, 0));
     int32_t non_zero = code->count;
     code_emit(code, a64_bcond(0, COND_NE));
     code_emit(code, a64_movz(5, '0', 0));
     code_emit(code, a64_strb_imm(5, R0, 0));
     code_emit(code, a64_movz_x(8, 1, 0));
-    code_emit(code, a64_str_imm(8, SP, body->slot_offset[dst] + 8, true));
+    a64_emit_str_sp_off(code, 8, body->slot_offset[dst] + 8, true);
     int32_t zero_done = code->count;
     code_emit(code, a64_b(0));
 
@@ -13347,8 +13408,8 @@ static void codegen_i32_to_str(Code *code, BodyIR *body, int32_t dst, int32_t sr
     a64_patch_bcond(code, no_sign, code->count);
 
     code_emit(code, a64_add_imm(6, 6, 1, true));
-    code_emit(code, a64_str_imm(6, SP, body->slot_offset[dst], true));
-    code_emit(code, a64_str_imm(8, SP, body->slot_offset[dst] + 8, true));
+    a64_emit_str_sp_off(code, 6, body->slot_offset[dst], true);
+    a64_emit_str_sp_off(code, 8, body->slot_offset[dst] + 8, true);
     a64_patch_b(code, zero_done, code->count);
 }
 
@@ -13358,14 +13419,14 @@ static void codegen_str_index(Code *code, BodyIR *body, int32_t dst,
     if (str_kind != SLOT_STR && str_kind != SLOT_STR_REF) die("str index target must be str");
     if (body->slot_kind[index_slot] != SLOT_I32) die("str index must be int32");
     if (str_kind == SLOT_STR_REF) {
-        code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[str_slot], true));
+        a64_emit_ldr_sp_off(code, R2, body->slot_offset[str_slot], true);
         code_emit(code, a64_ldr_imm(R3, R2, 0, true));
         code_emit(code, a64_ldr_imm(4, R2, 8, true));
     } else {
-        code_emit(code, a64_ldr_imm(R3, SP, body->slot_offset[str_slot], true));
-        code_emit(code, a64_ldr_imm(4, SP, body->slot_offset[str_slot] + 8, true));
+        a64_emit_ldr_sp_off(code, R3, body->slot_offset[str_slot], true);
+        a64_emit_ldr_sp_off(code, 4, body->slot_offset[str_slot] + 8, true);
     }
-    code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[index_slot], false));
+    a64_emit_ldr_sp_off(code, R1, body->slot_offset[index_slot], false);
     code_emit(code, a64_cmp_imm(R1, 0));
     int32_t non_negative = code->count;
     code_emit(code, a64_bcond(0, COND_GE));
@@ -13378,7 +13439,7 @@ static void codegen_str_index(Code *code, BodyIR *body, int32_t dst,
     a64_patch_bcond(code, in_bounds, code->count);
     code_emit(code, a64_add_reg_x(R3, R3, R1));
     code_emit(code, a64_ldrb_imm(R0, R3, 0));
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
 }
 
 static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
@@ -13388,11 +13449,11 @@ static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
     if (body->slot_kind[index_slot] != SLOT_I32) die("str[] index must be int32");
     int header_reg = R2;
     if (seq_kind == SLOT_SEQ_STR_REF) {
-        code_emit(code, a64_ldr_imm(header_reg, SP, body->slot_offset[seq_slot], true));
+        a64_emit_ldr_sp_off(code, header_reg, body->slot_offset[seq_slot], true);
     } else {
         code_emit(code, a64_add_imm(header_reg, SP, (uint16_t)body->slot_offset[seq_slot], true));
     }
-    code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[index_slot], false));
+    a64_emit_ldr_sp_off(code, R1, body->slot_offset[index_slot], false);
     code_emit(code, a64_cmp_imm(R1, 0));
     int32_t non_negative = code->count;
     code_emit(code, a64_bcond(0, COND_GE));
@@ -13411,9 +13472,9 @@ static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
     code_emit(code, a64_add_reg_x(5, 5, 5));
     code_emit(code, a64_add_reg_x(4, 4, 5));
     code_emit(code, a64_ldr_imm(R0, 4, 0, true));
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], true));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     code_emit(code, a64_ldr_imm(R0, 4, 8, true));
-    code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst] + 8, true));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 8, true);
 }
 
 static void codegen_seq_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg) {
@@ -13423,7 +13484,7 @@ static void codegen_seq_header_addr(Code *code, BodyIR *body, int32_t seq_slot, 
         return;
     }
     if (kind == SLOT_SEQ_I32_REF) {
-        code_emit(code, a64_ldr_imm(reg, SP, body->slot_offset[seq_slot], true));
+        a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
         return;
     }
     die("seq header address target must be int32[]");
@@ -13436,7 +13497,7 @@ static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_sl
         return;
     }
     if (kind == SLOT_SEQ_STR_REF) {
-        code_emit(code, a64_ldr_imm(reg, SP, body->slot_offset[seq_slot], true));
+        a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
         return;
     }
     die("seq header address target must be str[]");
@@ -13452,7 +13513,7 @@ static void codegen_seq_i32_add(Code *code, BodyIR *body, int32_t seq_slot, int3
 
     int32_t store_label = code->count;
     code_emit(code, a64_ldr_imm(R3, R2, 8, true));
-    code_emit(code, a64_ldr_imm(4, SP, body->slot_offset[value_slot], false));
+    a64_emit_ldr_sp_off(code, 4, body->slot_offset[value_slot], false);
     code_emit(code, a64_str_w_reg_uxtw2(4, R3, R0));
     code_emit(code, a64_add_imm(R0, R0, 1, false));
     code_emit(code, a64_str_imm(R0, R2, 0, false));
@@ -13527,9 +13588,9 @@ static void codegen_seq_str_add(Code *code, BodyIR *body, int32_t seq_slot, int3
     code_emit(code, a64_add_reg_x(6, 6, 6));
     code_emit(code, a64_add_reg_x(6, 6, 6));
     code_emit(code, a64_add_reg_x(R3, R3, 6));
-    code_emit(code, a64_ldr_imm(4, SP, body->slot_offset[value_slot], true));
+    a64_emit_ldr_sp_off(code, 4, body->slot_offset[value_slot], true);
     code_emit(code, a64_str_imm(4, R3, 0, true));
-    code_emit(code, a64_ldr_imm(4, SP, body->slot_offset[value_slot] + 8, true));
+    a64_emit_ldr_sp_off(code, 4, body->slot_offset[value_slot] + 8, true);
     code_emit(code, a64_str_imm(4, R3, 8, true));
     code_emit(code, a64_add_imm(R0, R0, 1, false));
     code_emit(code, a64_str_imm(R0, R2, 0, false));
@@ -13594,23 +13655,23 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     int32_t c = body->op_c[op];
     if (kind == BODY_OP_I32_CONST) {
         codegen_mov_i32_const(code, R0, a);
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_BRK) {
         (void)dst;
         code_emit(code, a64_brk(a));
     } else if (kind == BODY_OP_LOAD_I32) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I32_REF_LOAD) {
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[a], true));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
         code_emit(code, a64_ldr_imm(R0, R1, 0, false));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I32_REF_STORE) {
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[dst], true));
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_str_imm(R0, R1, 0, false));
     } else if (kind == BODY_OP_PTR_CONST) {
         code_emit(code, a64_movz_x(R0, (uint16_t)a, 0));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], true));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     } else if (kind == BODY_OP_TIME_NS) {
         code_emit(code, a64_sub_imm(SP, SP, 32, true));
         code_emit(code, a64_add_imm(R0, SP, 0, true));
@@ -13626,8 +13687,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_b(0));
         int32_t time_ok_label = code->count;
         a64_patch_bcond(code, ok_jump, time_ok_label);
-        code_emit(code, a64_ldr_imm(R1, SP, 0, true));
-        code_emit(code, a64_ldr_imm(R2, SP, 8, true));
+        a64_emit_ldr_sp_off(code, R1, 0, true);
+        a64_emit_ldr_sp_off(code, R2, 8, true);
         a64_patch_b(code, time_done_jump, code->count);
         code_emit(code, a64_add_imm(SP, SP, 32, true));
         codegen_mov_i32_const(code, R3, 1000000000);
@@ -13635,11 +13696,11 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         codegen_mov_i32_const(code, R3, 1000);
         code_emit(code, a64_mul_reg(R2, R2, R3));
         code_emit(code, a64_add_reg(R0, R1, R2));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_GETRUSAGE) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         if (body->slot_kind[b] == SLOT_OBJECT_REF) {
-            code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], true));
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
         } else if (body->slot_kind[b] == SLOT_OBJECT) {
             code_emit(code, a64_add_imm(R1, SP, (uint16_t)body->slot_offset[b], true));
         } else {
@@ -13647,36 +13708,36 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         }
         code_emit(code, a64_movz_x(16, 117, 0));
         code_emit(code, a64_svc(0x80));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_EXIT) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_movz_x(16, 1, 0));
         code_emit(code, a64_svc(0x80));
         code_emit(code, a64_brk(0x4517));
     } else if (kind == BODY_OP_WRITE_LINE) {
         if (body->slot_kind[a] == SLOT_OPAQUE) {
-            code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], true));
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         } else if (body->slot_kind[a] == SLOT_I32) {
-            code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         } else {
             die("write line fd slot changed after lowering");
         }
         if (body->slot_kind[b] == SLOT_STR_REF) {
-            code_emit(code, a64_ldr_imm(R3, SP, body->slot_offset[b], true));
+            a64_emit_ldr_sp_off(code, R3, body->slot_offset[b], true);
             code_emit(code, a64_ldr_imm(R1, R3, 0, true));
             code_emit(code, a64_ldr_imm(R2, R3, 8, true));
         } else if (body->slot_kind[b] == SLOT_STR) {
-            code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], true));
-            code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[b] + 8, true));
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
+            a64_emit_ldr_sp_off(code, R2, body->slot_offset[b] + 8, true);
         } else {
             die("write line text slot changed after lowering");
         }
         code_emit(code, a64_movz_x(16, 4, 0));
         code_emit(code, a64_svc(0x80));
         if (body->slot_kind[a] == SLOT_OPAQUE) {
-            code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], true));
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         } else {
-            code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         }
         code_emit(code, a64_movz(R1, '\n', 0));
         code_emit(code, a64_strb_imm(R1, SP, body->slot_offset[dst]));
@@ -13685,12 +13746,12 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_movz_x(16, 4, 0));
         code_emit(code, a64_svc(0x80));
         code_emit(code, a64_movz(R0, 0, 0));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_ARGC_LOAD) {
-        code_emit(code, a64_str_imm(19, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, 19, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_ARGV_STR) {
         if (body->slot_kind[a] != SLOT_I32) die("argv string index changed after lowering");
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[a], false));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], false);
         code_emit(code, a64_cmp_imm(R1, 0));
         int32_t fail_neg = code->count;
         code_emit(code, a64_bcond(0, COND_LT));
@@ -13719,8 +13780,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_b(len_loop - code->count));
         int32_t len_done = code->count;
         a64_patch_bcond(code, len_done_pos, len_done);
-        code_emit(code, a64_str_imm(4, SP, body->slot_offset[dst], true));
-        code_emit(code, a64_str_imm(5, SP, body->slot_offset[dst] + 8, true));
+        a64_emit_str_sp_off(code, 4, body->slot_offset[dst], true);
+        a64_emit_str_sp_off(code, 5, body->slot_offset[dst] + 8, true);
         int32_t done_jump = code->count;
         code_emit(code, a64_b(0));
         int32_t zero_label = code->count;
@@ -13728,8 +13789,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_bcond(code, fail_high, zero_label);
         a64_patch_bcond(code, fail_null, zero_label);
         code_emit(code, a64_movz_x(R0, 0, 0));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], true));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst] + 8, true));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 8, true);
         a64_patch_b(code, done_jump, code->count);
     } else if (kind == BODY_OP_GETENV_STR) {
         codegen_getenv_str(code, body, dst, a);
@@ -13862,7 +13923,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_movz_x(16, 6, 0));
         code_emit(code, a64_svc(0x80));
         a64_patch_b(code, exists_done_jump, code->count);
-        code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_PATH_FILE_SIZE) {
         codegen_cstring_from_slot(code, body, a, 7, 46);
         code_emit(code, a64_add_imm(R0, 7, 0, true));
@@ -13889,7 +13950,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_movz_x(16, 6, 0));
         code_emit(code, a64_svc(0x80));
         a64_patch_b(code, size_done_jump, code->count);
-        code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_PATH_READ_TEXT) {
         codegen_cstring_from_slot(code, body, a, 7, 70);
         code_emit(code, a64_add_imm(R0, 7, 0, true));
@@ -13989,7 +14050,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_movz(R1, 1, 0));
         a64_patch_b(code, write_cmp_done, code->count);
         a64_patch_b(code, write_done_jump, code->count);
-        code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_REMOVE_FILE) {
         codegen_cstring_from_slot(code, body, a, 7, 71);
         code_emit(code, a64_add_imm(R0, 7, 0, true));
@@ -14005,7 +14066,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_bcond(code, remove_ok, remove_ok_label);
         code_emit(code, a64_movz(R1, 1, 0));
         a64_patch_b(code, remove_done, code->count);
-        code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_MKDIR_ONE) {
         codegen_cstring_from_slot(code, body, a, 7, 48);
         code_emit(code, a64_add_imm(R0, 7, 0, true));
@@ -14022,7 +14083,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_bcond(code, mkdir_ok, mkdir_ok_label);
         code_emit(code, a64_movz(R1, 1, 0));
         a64_patch_b(code, mkdir_done_jump, code->count);
-        code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_TEXT_CONTAINS) {
         codegen_load_str_pair(code, body, a, R2, R3);
         codegen_load_str_pair(code, body, b, 4, 5);
@@ -14069,26 +14130,26 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_bcond(code, no_match, false_label);
         code_emit(code, a64_movz(R0, 0, 0));
         a64_patch_b(code, contains_done_jump, code->count);
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_MAKE_VARIANT) {
         codegen_zero_slot(code, body, dst);
         code_emit(code, a64_movz_x(R0, (uint16_t)a, 0));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], true));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
         for (int32_t field_index = 0; field_index < c; field_index++) {
             int32_t arg_slot = body->call_arg_slot[b + field_index];
             int32_t payload_offset = body->call_arg_offset[b + field_index];
             if (body->slot_kind[arg_slot] == SLOT_STR) {
-                code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[arg_slot], true));
-                code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst] + payload_offset, true));
-                code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[arg_slot] + 8, true));
-                code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst] + payload_offset + 8, true));
+                a64_emit_ldr_sp_off(code, R1, body->slot_offset[arg_slot], true);
+                a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + payload_offset, true);
+                a64_emit_ldr_sp_off(code, R1, body->slot_offset[arg_slot] + 8, true);
+                a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + payload_offset + 8, true);
             } else if (body->slot_kind[arg_slot] == SLOT_I32) {
-                code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[arg_slot], false));
-                code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst] + payload_offset, false));
+                a64_emit_ldr_sp_off(code, R1, body->slot_offset[arg_slot], false);
+                a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + payload_offset, false);
             } else if (body->slot_kind[arg_slot] == SLOT_VARIANT) {
                 for (int32_t off = 0; off < body->slot_size[arg_slot]; off += 8) {
-                    code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[arg_slot] + off, true));
-                    code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst] + payload_offset + off, true));
+                    a64_emit_ldr_sp_off(code, R1, body->slot_offset[arg_slot] + off, true);
+                    a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + payload_offset + off, true);
                 }
             } else if (body->slot_kind[arg_slot] == SLOT_OBJECT ||
                        body->slot_kind[arg_slot] == SLOT_ARRAY_I32 ||
@@ -14096,16 +14157,16 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                        body->slot_kind[arg_slot] == SLOT_SEQ_STR ||
                        body->slot_kind[arg_slot] == SLOT_SEQ_OPAQUE) {
                 for (int32_t off = 0; off < body->slot_size[arg_slot]; off += 8) {
-                    code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[arg_slot] + off, true));
-                    code_emit(code, a64_str_imm(R1, SP, body->slot_offset[dst] + payload_offset + off, true));
+                    a64_emit_ldr_sp_off(code, R1, body->slot_offset[arg_slot] + off, true);
+                    a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + payload_offset + off, true);
                 }
             } else {
                 die("unsupported variant payload slot kind");
             }
         }
     } else if (kind == BODY_OP_TAG_LOAD) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_PAYLOAD_LOAD) {
         codegen_copy_slot_from_offset(code, body, dst, a, b);
     } else if (kind == BODY_OP_PAYLOAD_STORE) {
@@ -14125,15 +14186,15 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_bl(0));
         function_patches_add(function_patches, call_pos, a);
         if (stack_bytes > 0) code_emit(code, a64_add_imm(SP, SP, (uint16_t)stack_bytes, true));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_COPY_I32) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I32_ADD || kind == BODY_OP_I32_SUB) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, kind == BODY_OP_I32_ADD ? a64_add_reg(R0, R0, R1) : a64_sub_reg(R0, R0, R1));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_STR_LITERAL) {
         if (a < 0 || a >= body->string_literal_count) die("invalid string literal index");
         Span literal = body->string_literal[a];
@@ -14145,17 +14206,17 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         int32_t after_data = code->count;
         code->words[adr_pos] = a64_adr(R0, data_offset - adr_pos * 4);
         code->words[skip_pos] = a64_b(after_data - skip_pos);
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], true));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
         code_emit(code, a64_movz_x(R0, (uint16_t)literal.len, 0));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst] + 8, true));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 8, true);
     } else if (kind == BODY_OP_STR_LEN) {
         if (body->slot_kind[a] == SLOT_STR_REF) {
-            code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[a], true));
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
             code_emit(code, a64_ldr_imm(R0, R1, 8, true));
         } else {
-            code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a] + 8, true));
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[a] + 8, true);
         }
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_STR_EQ) {
         codegen_str_eq(code, body, dst, a, b);
     } else if (kind == BODY_OP_STR_CONCAT) {
@@ -14171,42 +14232,42 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         if (base_kind == SLOT_OBJECT) {
             code_emit(code, a64_add_imm(R0, SP, (uint16_t)(body->slot_offset[a] + b), true));
         } else if (base_kind == SLOT_OBJECT_REF) {
-            code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], true));
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
             if (b != 0) code_emit(code, a64_add_imm(R0, R0, (uint16_t)b, true));
         } else {
             die("field ref base must be object");
         }
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], true));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     } else if (kind == BODY_OP_STR_REF_STORE) {
         if (body->slot_kind[dst] != SLOT_STR_REF || body->slot_kind[a] != SLOT_STR) {
             die("str ref store kind mismatch");
         }
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[dst], true));
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], true));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         code_emit(code, a64_str_imm(R0, R1, 0, true));
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a] + 8, true));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a] + 8, true);
         code_emit(code, a64_str_imm(R0, R1, 8, true));
     } else if (kind == BODY_OP_MAKE_SEQ_I32) {
         codegen_zero_slot(code, body, dst);
         if (c > 0) {
             if (a < 0 || body->slot_kind[a] != SLOT_ARRAY_I32) die("int32[] literal missing backing array");
             code_emit(code, a64_movz(R0, (uint16_t)c, 0));
-            code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
             code_emit(code, a64_movz(R0, (uint16_t)c, 0));
-            code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst] + 4, false));
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 4, false);
             code_emit(code, a64_add_imm(R0, SP, (uint16_t)body->slot_offset[a], true));
-            code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst] + 8, true));
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 8, true);
         }
     } else if (kind == BODY_OP_SEQ_I32_INDEX) {
         if (body->slot_kind[a] != SLOT_SEQ_I32 && body->slot_kind[a] != SLOT_SEQ_I32_REF) die("int32[] index target kind mismatch");
         codegen_seq_header_addr(code, body, a, R2);
         code_emit(code, a64_ldr_imm(R0, R2, 8, true));
         code_emit(code, a64_ldr_imm(R0, R0, b, false));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_ARRAY_I32_INDEX_DYNAMIC) {
         if (body->slot_kind[a] != SLOT_ARRAY_I32) die("dynamic array index target kind mismatch");
         if (body->slot_aux[a] <= 0) die("dynamic array index target missing length");
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_cmp_imm(R1, 0));
         code_emit(code, a64_bcond(2, COND_GE));
         code_emit(code, a64_brk(2));
@@ -14215,11 +14276,11 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_brk(2));
         code_emit(code, a64_add_imm(R0, SP, (uint16_t)body->slot_offset[a], true));
         code_emit(code, a64_ldr_w_reg_uxtw2(R0, R0, R1));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_SEQ_I32_INDEX_DYNAMIC) {
         if (body->slot_kind[a] != SLOT_SEQ_I32 && body->slot_kind[a] != SLOT_SEQ_I32_REF) die("dynamic int32[] index target kind mismatch");
         codegen_seq_header_addr(code, body, a, R2);
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_cmp_imm(R1, 0));
         code_emit(code, a64_bcond(2, COND_GE));
         code_emit(code, a64_brk(2));
@@ -14229,15 +14290,15 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_brk(2));
         code_emit(code, a64_ldr_imm(R0, R2, 8, true));
         code_emit(code, a64_ldr_w_reg_uxtw2(R0, R0, R1));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_ARRAY_I32_INDEX_STORE) {
         int32_t base_kind = body->slot_kind[a];
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_cmp_imm(R1, 0));
         code_emit(code, a64_bcond(2, COND_GE));
         code_emit(code, a64_brk(2));
         if (base_kind == SLOT_OBJECT_REF) {
-            code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], true));
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
             if (body->slot_aux[a] > 0) {
                 code_emit(code, a64_cmp_imm(R1, (uint16_t)body->slot_aux[a]));
             }
@@ -14249,7 +14310,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         }
         code_emit(code, a64_bcond(2, COND_LT));
         code_emit(code, a64_brk(2));
-        code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[dst], false));
+        a64_emit_ldr_sp_off(code, R2, body->slot_offset[dst], false);
         if (base_kind == SLOT_OBJECT_REF) {
             code_emit(code, a64_str_w_reg_uxtw2(R2, R0, R1));
         } else {
@@ -14259,8 +14320,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_SEQ_I32_INDEX_STORE) {
         int32_t base_kind = body->slot_kind[a];
         if (base_kind == SLOT_OBJECT_REF) {
-            code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[a], true));
-            code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+            a64_emit_ldr_sp_off(code, R2, body->slot_offset[a], true);
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
             code_emit(code, a64_cmp_imm(R1, 0));
             code_emit(code, a64_bcond(2, COND_GE));
             code_emit(code, a64_brk(2));
@@ -14269,11 +14330,11 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             code_emit(code, a64_bcond(2, COND_LT));
             code_emit(code, a64_brk(2));
             code_emit(code, a64_ldr_imm(R0, R2, 8, true));
-            code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[dst], false));
+            a64_emit_ldr_sp_off(code, R2, body->slot_offset[dst], false);
             code_emit(code, a64_str_w_reg_uxtw2(R2, R0, R1));
         } else if (base_kind == SLOT_SEQ_I32 || base_kind == SLOT_SEQ_I32_REF) {
             codegen_seq_header_addr(code, body, a, R2);
-            code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
             code_emit(code, a64_cmp_imm(R1, 0));
             code_emit(code, a64_bcond(2, COND_GE));
             code_emit(code, a64_brk(2));
@@ -14282,7 +14343,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             code_emit(code, a64_bcond(2, COND_LT));
             code_emit(code, a64_brk(2));
             code_emit(code, a64_ldr_imm(R0, R2, 8, true));
-            code_emit(code, a64_ldr_imm(R2, SP, body->slot_offset[dst], false));
+            a64_emit_ldr_sp_off(code, R2, body->slot_offset[dst], false);
             code_emit(code, a64_str_w_reg_uxtw2(R2, R0, R1));
         } else die("int32[] index store target kind mismatch");
     } else if (kind == BODY_OP_SEQ_I32_ADD) {
@@ -14302,51 +14363,51 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         function_patches_add(function_patches, call_pos, a);
         if (stack_bytes > 0) code_emit(code, a64_add_imm(SP, SP, (uint16_t)stack_bytes, true));
         if (ret_kind == SLOT_I32) {
-            code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
         }
     } else if (kind == BODY_OP_COPY_COMPOSITE) {
         int32_t src_kind = body->slot_kind[a];
         if (src_kind == SLOT_STR) {
-            code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], true));
-            code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], true));
-            code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a] + 8, true));
-            code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst] + 8, true));
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[a] + 8, true);
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 8, true);
         } else if (src_kind == SLOT_VARIANT || src_kind == SLOT_OBJECT ||
                    src_kind == SLOT_ARRAY_I32 || src_kind == SLOT_SEQ_I32 ||
                    src_kind == SLOT_SEQ_STR || src_kind == SLOT_SEQ_OPAQUE) {
             int32_t total = body->slot_size[dst];
             for (int32_t off = 0; off < total; off += 8) {
-                code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a] + off, true));
-                code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst] + off, true));
+                a64_emit_ldr_sp_off(code, R0, body->slot_offset[a] + off, true);
+                a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + off, true);
             }
         } else {
             die("unsupported copy composite slot kind");
         }
     } else if (kind == BODY_OP_UNWRAP_OR_RETURN) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[dst], true));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[dst], true);
         code_emit(code, a64_cmp_imm(R0, (uint16_t)b));
         int32_t trap_pos = code->count;
         code_emit(code, a64_bcond(0, COND_NE));
         code_emit(code, a64_brk(1));
         code->words[trap_pos] = (code->words[trap_pos] & 0xFF00001Fu) | (2u << 5);
     } else if (kind == BODY_OP_I32_MUL) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_mul_reg(R0, R0, R1));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I32_DIV) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_cmp_imm(R1, 0));
         int32_t non_zero = code->count;
         code_emit(code, a64_bcond(0, COND_NE));
         code_emit(code, a64_brk(5));
         a64_patch_bcond(code, non_zero, code->count);
         code_emit(code, a64_sdiv_reg(R0, R0, R1));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I32_MOD) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_cmp_imm(R1, 0));
         int32_t mod_nz = code->count;
         code_emit(code, a64_bcond(0, COND_NE));
@@ -14354,10 +14415,10 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_bcond(code, mod_nz, code->count);
         code_emit(code, a64_sdiv_reg(R2, R0, R1));
         code_emit(code, a64_msub_reg(R0, R2, R1, R0));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I32_CMP) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_cmp_reg(R0, R1));
         code_emit(code, a64_movz(R2, 0, 0));
         int32_t true_pos = code->count;
@@ -14367,26 +14428,26 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_bcond(code, true_pos, code->count);
         code_emit(code, a64_movz(R2, 1, 0));
         a64_patch_b(code, done_pos, code->count);
-        code_emit(code, a64_str_imm(R2, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R2, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I32_SHL) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_lsl_reg(R0, R0, R1));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I32_ASR) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_asr_reg(R0, R0, R1));
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I32_AND || kind == BODY_OP_I32_OR || kind == BODY_OP_I32_XOR) {
-        code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[a], false));
-        code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[b], false));
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         uint32_t op_word;
         if (kind == BODY_OP_I32_AND) op_word = a64_and_reg(R0, R0, R1);
         else if (kind == BODY_OP_I32_OR) op_word = a64_orr_reg(R0, R0, R1);
         else op_word = a64_eor_reg(R0, R0, R1);
         code_emit(code, op_word);
-        code_emit(code, a64_str_imm(R0, SP, body->slot_offset[dst], false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else {
         die("unknown BodyIR op");
     }
@@ -14404,7 +14465,7 @@ static void codegen_switch(Code *code, BodyIR *body, PatchList *patches, int32_t
         case_index[found++] = i;
     }
     if (found != count) die("switch case owner mismatch");
-    code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[tag_slot], false));
+    a64_emit_ldr_sp_off(code, R0, body->slot_offset[tag_slot], false);
 
     if (count == 2 &&
         ((body->switch_tag[case_index[0]] == 0 && body->switch_tag[case_index[1]] == 1) ||
@@ -14436,9 +14497,9 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
     int32_t frame_size = align_i32(body->frame_size, 16);
     code_emit(code, a64_stp_pre(FP, LR, SP, -16));
     code_emit(code, a64_add_imm(FP, SP, 0, true));
-    if (frame_size > 0) code_emit(code, a64_sub_imm(SP, SP, (uint16_t)frame_size, true));
+    if (frame_size > 0) a64_emit_sub_large(code, SP, SP, frame_size, true);
     if (body->sret_slot >= 0) {
-        code_emit(code, a64_str_imm(8, SP, body->slot_offset[body->sret_slot], true));
+        a64_emit_str_sp_off(code, 8, body->slot_offset[body->sret_slot], true);
     }
     codegen_store_params(code, body);
 
@@ -14461,23 +14522,23 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
             int32_t value_slot = body->term_value[term];
             int32_t value_kind = body->slot_kind[value_slot];
             if (value_kind == SLOT_I32) {
-                code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[value_slot], false));
+                a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot], false);
             } else if (value_kind == SLOT_STR) {
                 if (body->sret_slot < 0) die("missing sret slot for str return");
-                code_emit(code, a64_ldr_imm(8, SP, body->slot_offset[body->sret_slot], true));
-                code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[value_slot], true));
+                a64_emit_ldr_sp_off(code, 8, body->slot_offset[body->sret_slot], true);
+                a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot], true);
                 code_emit(code, a64_str_imm(R0, 8, 0, true));
-                code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[value_slot] + 8, true));
+                a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot] + 8, true);
                 code_emit(code, a64_str_imm(R0, 8, 8, true));
             } else if (value_kind == SLOT_VARIANT || value_kind == SLOT_OBJECT ||
                        value_kind == SLOT_SEQ_I32 || value_kind == SLOT_SEQ_STR ||
                        value_kind == SLOT_SEQ_OPAQUE) {
                 if (body->sret_slot < 0) die("missing sret slot for composite return");
-                code_emit(code, a64_ldr_imm(8, SP, body->slot_offset[body->sret_slot], true));
+                a64_emit_ldr_sp_off(code, 8, body->slot_offset[body->sret_slot], true);
                 int32_t total = body->return_size;
                 if (body->slot_size[value_slot] < total) die("composite return slot smaller than return type");
                 for (int32_t off = 0; off < total; off += 8) {
-                    code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[value_slot] + off, true));
+                    a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot] + off, true);
                     code_emit(code, a64_str_imm(R0, 8, off, true));
                 }
             } else {
@@ -14492,8 +14553,8 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
             int32_t left = body->term_value[term];
             int32_t cond = body->term_case_start[term];
             int32_t right = body->term_case_count[term];
-            code_emit(code, a64_ldr_imm(R0, SP, body->slot_offset[left], false));
-            code_emit(code, a64_ldr_imm(R1, SP, body->slot_offset[right], false));
+            a64_emit_ldr_sp_off(code, R0, body->slot_offset[left], false);
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[right], false);
             code_emit(code, a64_cmp_reg(R0, R1));
             int32_t true_pos = code->count;
             code_emit(code, a64_bcond(0, cond));
@@ -15101,65 +15162,12 @@ static bool cold_import_is_active(const char *path) {
 }
 
 static void cold_import_push_active(const char *path) {
-    if (cold_active_import_count < 16)
-        snprintf(cold_active_imports[cold_active_import_count++], PATH_MAX, "%s", path);
+    if (cold_active_import_count >= 16) die("too many transitive imports");
+    snprintf(cold_active_imports[cold_active_import_count++], PATH_MAX, "%s", path);
 }
 
 static void cold_import_pop_active(void) {
     if (cold_active_import_count > 0) cold_active_import_count--;
-}
-
-static int cold_verify_manifest_imports(ColdContract *manifest, const char *workspace_root) {
-    int32_t issues = 0;
-    int32_t verified = 0;
-    for (int32_t mi = 0; mi < manifest->count; mi++) {
-        const char *key_start = (const char *)manifest->fields[mi].key.ptr;
-        int32_t key_len = manifest->fields[mi].key.len;
-        /* only process fields ending in "_source" */
-        if (key_len < 7 || memcmp(key_start + key_len - 7, "_source", 7) != 0) continue;
-        Span src_rel = manifest->fields[mi].value;
-        char src_path[PATH_MAX];
-        snprintf(src_path, sizeof(src_path), "%s/%.*s", workspace_root, src_rel.len, src_rel.ptr);
-        Span src = source_open(src_path);
-        if (src.len <= 0) continue;
-        /* walk import directives */
-        int32_t pos = 0;
-        while (pos < src.len) {
-            int32_t ls = pos;
-            while (pos < src.len && src.ptr[pos] != '\n') pos++;
-            int32_t le = pos;
-            if (pos < src.len) pos++;
-            Span line = span_trim(span_sub(src, ls, le));
-            if (!cold_span_starts_with(line, "import ")) continue;
-            Span rest = span_trim(span_sub(line, 7, line.len));
-            /* strip "as" alias */
-            for (int32_t ri = rest.len - 1; ri >= 2; ri--) {
-                if (rest.ptr[ri] == ' ' && rest.ptr[ri - 2] == 'a' && rest.ptr[ri - 1] == 's') {
-                    rest = span_trim(span_sub(rest, 0, ri - 2));
-                    break;
-                }
-            }
-            char ipath[PATH_MAX];
-            if (cold_resolve_import_source_path(workspace_root, rest, ipath, sizeof(ipath))) {
-                /* check if this import path exists in the manifest */
-                bool found = false;
-                for (int32_t fj = 0; fj < manifest->count; fj++) {
-                    Span fv = manifest->fields[fj].value;
-                    char fpath[PATH_MAX];
-                    snprintf(fpath, sizeof(fpath), "%s/%.*s", workspace_root, fv.len, fv.ptr);
-                    if (strcmp(ipath, fpath) == 0) { found = true; break; }
-                }
-                if (!found) {
-                    fprintf(stderr, "[cheng_cold] manifest missing: %s (imported by %s)\n", ipath, src_path);
-                    issues++;
-                }
-                verified++;
-            }
-        }
-        munmap((void *)src.ptr, (size_t)src.len);
-    }
-    fprintf(stderr, "[cheng_cold] manifest verify: %d imports checked, %d issues\n", verified, issues);
-    return issues > 0 ? 1 : 0;
 }
 
 static void cold_compile_csg_load_imported_types(const char *workspace_root,
