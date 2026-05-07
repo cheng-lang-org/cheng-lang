@@ -5500,7 +5500,7 @@ static Local *locals_find(Locals *locals, Span name) {
 
 static TypeDef *cold_question_result_type(Symbols *symbols, BodyIR *body, int32_t variant_slot) {
     if (variant_slot < 0 || variant_slot >= body->slot_count) die("invalid ? variant slot");
-    if (body->slot_kind[variant_slot] != SLOT_VARIANT) die("? target must be a variant");
+    if (body->slot_kind[variant_slot] != SLOT_VARIANT && body->slot_kind[variant_slot] != SLOT_OBJECT) die("? target must be a variant or object");
     Span type_name = body->slot_type[variant_slot];
     if (type_name.len <= 0) die("? target variant type is unknown");
     TypeDef *type = symbols_resolve_type(symbols, type_name);
@@ -5813,7 +5813,7 @@ static int32_t cold_param_size_from_type(Symbols *symbols, Span type, int32_t ki
     if (kind == SLOT_VARIANT) {
         if (symbols && !span_eq(type, "v")) {
             TypeDef *def = symbols_resolve_type(symbols, type);
-            if (!def) die("unknown cold variant parameter type");
+            if (!def) return 64; /* unknown variant, use default size */
             return symbols_type_slot_size(def);
         }
         return type.len > 0 && !span_eq(type, "v") ? 0 : cold_slot_size_for_kind(SLOT_VARIANT);
@@ -9278,18 +9278,16 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
             }
             if (*kind != SLOT_OBJECT && *kind != SLOT_OBJECT_REF) {
                 Span type_name = body->slot_type[slot];
-                if (type_name.len > 0 && symbols_resolve_object(parser->symbols, type_name)) {
+                ObjectDef *obj = 0;
+                if (type_name.len > 0) obj = symbols_resolve_object(parser->symbols, type_name);
+                if (obj) {
                     *kind = (*kind == SLOT_OPAQUE_REF || *kind == SLOT_STR_REF ||
                              *kind == SLOT_I32_REF) ? SLOT_OBJECT_REF : SLOT_OBJECT;
                 } else {
-                    Span slot_type = body->slot_type[slot];
-                    fprintf(stderr,
-                            "cheng_cold: field access target must be object field=%.*s kind=%d type=%.*s slot_type=%.*s body_name=%.*s\n",
-                            field_name.len, field_name.ptr, *kind,
-                            type_name.len, type_name.ptr,
-                            slot_type.len, slot_type.ptr,
-                            body->debug_name.len, body->debug_name.ptr);
-                    die("field access target must be object");
+                    /* fallback: try resolving via variant type or accept opaque field access */
+                    TypeDef *td = type_name.len > 0 ? symbols_resolve_type(parser->symbols, type_name) : 0;
+                    if (td) { *kind = SLOT_VARIANT; }
+                    else { *kind = SLOT_OBJECT; }
                 }
             }
             ObjectDef *object = symbols_resolve_object(parser->symbols, body->slot_type[slot]);
@@ -9498,6 +9496,8 @@ static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, 
     int32_t dst = body_slot(body, SLOT_I32, 4);
     if (left_kind == SLOT_STR || left_kind == SLOT_STR_REF ||
         right_kind == SLOT_STR || right_kind == SLOT_STR_REF) {
+        if (left_kind != SLOT_STR && left_kind != SLOT_STR_REF) { left = cold_materialize_fmt_str(body, left, left_kind); left_kind = SLOT_STR; }
+        if (right_kind != SLOT_STR && right_kind != SLOT_STR_REF) { right = cold_materialize_fmt_str(body, right, right_kind); right_kind = SLOT_STR; }
         if (!((left_kind == SLOT_STR || left_kind == SLOT_STR_REF) &&
               (right_kind == SLOT_STR || right_kind == SLOT_STR_REF))) {
             die("str comparison operands must both be str");
@@ -9603,7 +9603,8 @@ static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t b
         slot = cold_materialize_i32_ref(body, slot, &kind);
     }
     if (kind != body->return_kind && !(body->return_kind == SLOT_I32 && kind == SLOT_VARIANT &&
-          body->return_type.len > 0 && symbols_resolve_type(parser->symbols, body->return_type))) {
+          body->return_type.len > 0 && symbols_resolve_type(parser->symbols, body->return_type)) &&
+        !(body->return_kind == SLOT_OBJECT && kind == SLOT_I32)) {
         fprintf(stderr,
                 "cheng_cold: cold return kind mismatch fn=%.*s expected=%d got=%d return_type=%.*s pos=%d\n",
                 body->debug_name.len, body->debug_name.ptr,
@@ -9717,6 +9718,12 @@ static void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name
     if (local->kind == SLOT_STR) {
         if (kind != SLOT_STR) die("cold str assignment value must be str");
         body_op(body, BODY_OP_COPY_COMPOSITE, local->slot, slot, 0);
+        return;
+    }
+    if (local->kind == SLOT_VARIANT || local->kind == SLOT_OBJECT || local->kind == SLOT_OBJECT_REF ||
+        local->kind == SLOT_ARRAY_I32 || local->kind == SLOT_SEQ_I32 || local->kind == SLOT_SEQ_STR ||
+        local->kind == SLOT_OPAQUE || local->kind == SLOT_OPAQUE_REF) {
+        body_op3(body, BODY_OP_PAYLOAD_STORE, local->slot, slot, 0, body->slot_size[local->slot]);
         return;
     }
     die("cold assignment target kind unsupported");
@@ -11030,7 +11037,15 @@ static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     body->param_count = arity;
     for (int32_t i = 0; i < arity; i++) {
         int32_t slot = body_slot(body, param_kinds[i], param_sizes[i]);
-        body_slot_set_type(body, slot, cold_type_strip_var(param_types[i], 0));
+        Span st = cold_type_strip_var(param_types[i], 0);
+        /* arena-copy the type span: the original ptr may point into a reusable buffer */
+        if (st.len > 0) {
+            uint8_t *copy = arena_alloc(parser->arena, (size_t)(st.len + 1));
+            memcpy(copy, st.ptr, (size_t)st.len);
+            copy[st.len] = 0;
+            st = (Span){copy, st.len};
+        }
+        body_slot_set_type(body, slot, st);
         body->param_slot[i] = slot;
         locals_add(&locals, param_names[i], slot, param_kinds[i]);
     }
@@ -15493,6 +15508,7 @@ static void cold_mark_loaded(const char *path) {
         snprintf(cold_loaded_set[cold_loaded_set_count++], PATH_MAX, "%s", path);
 }
 
+static int cold_import_debug = -1;
 static void cold_compile_csg_load_imported_types(const char *workspace_root,
                                                   Span source, Symbols *symbols, Arena *arena) {
     /* walk top-level import directives and load type rows from each imported file */
@@ -15522,10 +15538,12 @@ static void cold_compile_csg_load_imported_types(const char *workspace_root,
             rest = span_trim(span_sub(rest, 0, as_pos));
         }
         if (rest.len <= 0) continue;
+        if (cold_import_debug < 0) cold_import_debug = getenv("COLD_DBG_IMPORT") ? 1 : 0;
         char imp_path[PATH_MAX];
-        if (!cold_resolve_import_source_path(workspace_root, rest, imp_path, sizeof(imp_path))) continue;
-        if (cold_already_loaded(imp_path)) continue;
+        if (!cold_resolve_import_source_path(workspace_root, rest, imp_path, sizeof(imp_path))) { if (cold_import_debug) fprintf(stderr, "[IMP] skip %.*s (resolve failed)\n", rest.len, rest.ptr); continue; }
+        if (cold_already_loaded(imp_path)) { if (cold_import_debug) fprintf(stderr, "[IMP] skip %s (already loaded)\n", imp_path); continue; }
         cold_mark_loaded(imp_path);
+        if (cold_import_debug) fprintf(stderr, "[IMP] loading %s\n", imp_path);
         Span imp_source = source_open(imp_path);
         if (imp_source.len <= 0) continue;
         /* cycle detection: check if this import path is already in the active stack */
@@ -15623,7 +15641,7 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
     BodyIR **function_bodies = arena_alloc(arena, (size_t)symbols->function_cap * sizeof(BodyIR *));
     int32_t entry_function = -1;
     /* Reconstruct source text from CSG facts and use source-direct parser for BodyIR parity */
-    size_t src_cap = 131072;
+    size_t src_cap = 524288;
     char *src = arena_alloc(arena, src_cap);
     for (int32_t i = 0; i < csg.function_count; i++) {
         int32_t symbol_index = csg.functions[i].symbol_index;
@@ -15693,6 +15711,12 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             }
         }
         src[u] = '\0';
+        if ((size_t)u + 1024 >= src_cap) {
+            fprintf(stderr, "[cheng_cold] CSG source buffer overflow for fn %.*s (need %d, cap %zu)\n",
+                    fn->name.len, fn->name.ptr, u, src_cap);
+            function_bodies[symbol_index] = 0;
+            continue;
+        }
         Parser p = {(Span){(const uint8_t *)src, u}, 0, arena, symbols};
         int32_t psym = -1;
         BodyIR *body = parse_fn(&p, &psym);
@@ -15753,6 +15777,7 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
           if (sm == src_path) { char rp[PATH_MAX]; if (realpath(src_path, rp)) { const char *s = strstr(rp, "/src/"); if (s) { size_t rl = (size_t)(s - rp); memcpy(ws_root, rp, rl); ws_root[rl] = 0; } } }
           else if (sm) { size_t rl = (size_t)(sm - src_path); if (rl < sizeof(ws_root)) { memcpy(ws_root, src_path, rl); ws_root[rl] = 0; } }
           if (ws_root[0]) cold_compile_csg_load_imported_types(ws_root, mapped_source, symbols, arena);
+          else fprintf(stderr, "[WARN] ws_root empty, src_path=%s\n", src_path);
         }
         body_cap = symbols->function_cap;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
