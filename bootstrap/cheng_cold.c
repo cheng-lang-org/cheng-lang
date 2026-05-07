@@ -2741,33 +2741,47 @@ static bool cold_emit_csg_statement_row(FILE *file, int32_t fn_index, int32_t in
         }
         return true;
     }
-    if (cold_span_starts_with(trimmed, "if ")) {
-        Span condition = cold_span_cut_at_block_colon(span_sub(trimmed, 3, trimmed.len));
-        fprintf(file, "cold_csg_stmt\t%d\t%d\tif\t", fn_index, indent);
-        cold_write_span_csg(file, condition);
-        fputc('\n', file);
-        return true;
-    }
-    if (cold_span_starts_with(trimmed, "elif ")) {
-        Span condition = cold_span_cut_at_block_colon(span_sub(trimmed, 5, trimmed.len));
-        fprintf(file, "cold_csg_stmt\t%d\t%d\telif\t", fn_index, indent);
-        cold_write_span_csg(file, condition);
-        fputc('\n', file);
-        return true;
-    }
+    /* helper: emit {if,elif,else,while,for} with optional inline suite after ':' */
+    #define EMIT_BLOCK_HEADER(kind, kw_len) do { \
+        Span _head = span_sub(trimmed, kw_len, trimmed.len); \
+        Span _cond = cold_span_cut_at_block_colon(_head); \
+        int32_t _colon = cold_span_find_char(_head, ':'); \
+        fprintf(file, "cold_csg_stmt\t%d\t%d\t%s\t", fn_index, indent, kind); \
+        cold_write_span_csg(file, _cond); \
+        fputc('\n', file); \
+        if (_colon >= 0 && _colon + 1 < _head.len) { \
+            Span _suite = span_trim(span_sub(_head, _colon + 1, _head.len)); \
+            if (_suite.len > 0) { \
+                /* split on ';' for multiple inline statements */ \
+                int32_t _sp = 0; \
+                while (_sp < _suite.len) { \
+                    int32_t _sc = cold_span_find_char(span_sub(_suite, _sp, _suite.len), ';'); \
+                    Span _stmt; \
+                    if (_sc >= 0) { _stmt = span_trim(span_sub(_suite, _sp, _sp + _sc)); _sp += _sc + 1; } \
+                    else { _stmt = span_trim(span_sub(_suite, _sp, _suite.len)); _sp = _suite.len; } \
+                    if (_stmt.len > 0) cold_emit_csg_statement_row(file, fn_index, indent + 4, _stmt); \
+                } \
+            } \
+        } \
+        return true; \
+    } while(0)
+
+    if (cold_span_starts_with(trimmed, "if ")) EMIT_BLOCK_HEADER("if", 3);
+    if (cold_span_starts_with(trimmed, "elif ")) EMIT_BLOCK_HEADER("elif", 5);
     if (span_eq(cold_span_cut_at_block_colon(trimmed), "else")) {
+        int32_t _colon = cold_span_find_char(trimmed, ':');
         fprintf(file, "cold_csg_stmt\t%d\t%d\telse\n", fn_index, indent);
+        if (_colon >= 0 && _colon + 1 < trimmed.len) {
+            Span _suite = span_trim(span_sub(trimmed, _colon + 1, trimmed.len));
+            if (_suite.len > 0) cold_emit_csg_statement_row(file, fn_index, indent + 4, _suite);
+        }
         return true;
     }
-    if (cold_span_starts_with(trimmed, "while ")) {
-        Span condition = cold_span_cut_at_block_colon(span_sub(trimmed, 6, trimmed.len));
-        fprintf(file, "cold_csg_stmt\t%d\t%d\twhile\t", fn_index, indent);
-        cold_write_span_csg(file, condition);
-        fputc('\n', file);
-        return true;
-    }
+    if (cold_span_starts_with(trimmed, "while ")) EMIT_BLOCK_HEADER("while", 6);
     if (cold_span_starts_with(trimmed, "for ")) {
-        Span payload = cold_span_cut_at_block_colon(span_sub(trimmed, 4, trimmed.len));
+        Span _head = span_sub(trimmed, 4, trimmed.len);
+        Span payload = cold_span_cut_at_block_colon(_head);
+        int32_t _colon = cold_span_find_char(_head, ':');
         int32_t in_pos = cold_span_find_text(payload, " in ");
         if (in_pos <= 0) return false;
         Span iter = span_trim(span_sub(payload, 0, in_pos));
@@ -2790,6 +2804,19 @@ static bool cold_emit_csg_statement_row(FILE *file, int32_t fn_index, int32_t in
         fputc('\t', file);
         cold_write_span_csg(file, end);
         fprintf(file, "\t%s\n", mode);
+        if (_colon >= 0 && _colon + 1 < _head.len) {
+            Span _suite = span_trim(span_sub(_head, _colon + 1, _head.len));
+            if (_suite.len > 0) {
+                int32_t _sp = 0;
+                while (_sp < _suite.len) {
+                    int32_t _sc = cold_span_find_char(span_sub(_suite, _sp, _suite.len), ';');
+                    Span _stmt;
+                    if (_sc >= 0) { _stmt = span_trim(span_sub(_suite, _sp, _sp + _sc)); _sp += _sc + 1; }
+                    else { _stmt = span_trim(span_sub(_suite, _sp, _suite.len)); _sp = _suite.len; }
+                    if (_stmt.len > 0) cold_emit_csg_statement_row(file, fn_index, indent + 4, _stmt);
+                }
+            }
+        }
         return true;
     }
     if (span_eq(trimmed, "break")) {
@@ -3097,6 +3124,26 @@ static bool cold_emit_csg_statement_rows(FILE *file, Span source) {
                     cold_span_starts_with(trimmed, "elif ") ? "elif" : "while");
             cold_write_span_csg(file, (Span){(const uint8_t *)cond_buf, cond_len});
             fputc('\n', file);
+            /* emit inline suite if present (e.g. `if cond: stmt`) */
+            {
+                int32_t _kw = cold_span_starts_with(trimmed, "if ") ? 3 :
+                              cold_span_starts_with(trimmed, "elif ") ? 5 : 6;
+                Span _head = span_sub(trimmed, _kw, trimmed.len);
+                int32_t _colon = cold_span_find_char(_head, ':');
+                if (_colon >= 0 && _colon + 1 < _head.len) {
+                    Span _suite = span_trim(span_sub(_head, _colon + 1, _head.len));
+                    if (_suite.len > 0) {
+                        int32_t _sp = 0;
+                        while (_sp < _suite.len) {
+                            int32_t _sc = cold_span_find_char(span_sub(_suite, _sp, _suite.len), ';');
+                            Span _stmt;
+                            if (_sc >= 0) { _stmt = span_trim(span_sub(_suite, _sp, _sp + _sc)); _sp += _sc + 1; }
+                            else { _stmt = span_trim(span_sub(_suite, _sp, _suite.len)); _sp = _suite.len; }
+                            if (_stmt.len > 0) cold_emit_csg_statement_row(file, fn_index, indent + 4, _stmt);
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -5205,7 +5252,7 @@ static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
         dst->kind = fk;
         dst->size = cold_slot_size_from_type_with_symbols(symbols, field_type, fk);
         dst->array_len = 0;
-        if (fk == SLOT_ARRAY_I32 && !cold_parse_i32_array_type(field_type, &dst->array_len)) {
+        if (fk == SLOT_ARRAY_I32 && !cold_parse_i32_array_type(field_type, &dst->array_len) && !cold_span_starts_with(span_trim(field_type), "uint8[")) {
             die("generic object array field missing length");
         }
     }
@@ -7336,7 +7383,13 @@ static int32_t parse_i32_array_literal(Parser *parser, BodyIR *body, Locals *loc
         break;
     }
     if (!parser_take(parser, "]")) die("expected ] after array literal");
-    if (count <= 0) die("cold array literal cannot be empty without type");
+    if (count <= 0) {
+        int32_t slot = body_slot(body, SLOT_SEQ_I32, 16);
+        body_slot_set_type(body, slot, cold_cstr_span("int32[]"));
+        body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, -1, 0);
+        *kind = SLOT_SEQ_I32;
+        return slot;
+    }
     if (first_kind == SLOT_STR || first_kind == SLOT_STR_REF) {
         int32_t slot = body_slot(body, SLOT_SEQ_STR, 16);
         body_slot_set_type(body, slot, cold_cstr_span("str[]"));
@@ -7691,7 +7744,6 @@ static bool cold_try_str_join_intrinsic(BodyIR *body, Span name,
     if (arg_count != 2) die("Join intrinsic arity mismatch");
     int32_t items = body->call_arg_slot[arg_start];
     int32_t sep = body->call_arg_slot[arg_start + 1];
-    fprintf(stderr, "[DBG] Join items kind=%d\n", body->slot_kind[items]);
     if (body->slot_kind[items] != SLOT_SEQ_STR && body->slot_kind[items] != SLOT_SEQ_STR_REF) {
         die("Join items must be str[]");
     }
@@ -9550,7 +9602,8 @@ static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t b
     if (body->return_kind == SLOT_I32) {
         slot = cold_materialize_i32_ref(body, slot, &kind);
     }
-    if (kind != body->return_kind) {
+    if (kind != body->return_kind && !(body->return_kind == SLOT_I32 && kind == SLOT_VARIANT &&
+          body->return_type.len > 0 && symbols_resolve_type(parser->symbols, body->return_type))) {
         fprintf(stderr,
                 "cheng_cold: cold return kind mismatch fn=%.*s expected=%d got=%d return_type=%.*s pos=%d\n",
                 body->debug_name.len, body->debug_name.ptr,
