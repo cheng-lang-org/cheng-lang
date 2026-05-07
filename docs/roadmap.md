@@ -35,6 +35,20 @@
 - 自举编译仅覆盖入口模块（47 items），需要 manifest-based 全量编译（1059 items）才能产出完整 backend driver。
 - 任何 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 结果都不计入路线图进度。
 
+### 新增（2026-05-08）：函数并行接入尝试
+
+- **lowering_plan.cheng 并行化尝试**（2026-05-08 提交 `9c40953d`、`3816cae3`、`bf077095`）：
+  - 用 `async.spawn` + `atomic.FetchAddI32` 实现 fan-out 并行 for 循环，替代 `LoweringBuildPrimaryObjectIr` 中的串行 `for`
+  - 通过 `cheng.stage3` 编译到 `primary_object_plan` 阶段，代码语法/语义合法
+  - 但 `primary_object_plan` codegen 不支持 `let`/`if`/`while`/atomic/spawn 等语句模式，新函数体产出了 `unsupported_body_kinds`
+  - C seed 最终链接失败（`compile-c-seed-bootstrap failed exit=2`）
+- **回退与保留**：
+  - `lowering_plan.cheng` 已回退到串行版本
+  - `backend_driver_dispatch_min.cheng` 保留 `function_task_schedule=ws/serial` 动态报告
+  - `function_task_executor.cheng` 保持原始空桩不变
+- **根因**：Cheng 规范 §716 禁止循环模块导入，不能走 `function_task_executor` ↔ `lowering_plan` 回调；codegen 不支持函数体内的控制流/并发原语
+- **正确路径**：要么扩展 `primary_object_plan` codegen 支持所需语句，要么在 codegen 层以下（C/importc 层）实现线程调度，再暴露简单调用接口给 Cheng
+
 ### 新增（2026-05-08）：Cold Compiler CSG Round-Trip 完成
 
 - **CSG 往返编译闭环**（`bootstrap/cheng_cold.c`）：cold compiler 现已支持通过 CSG 事实（emit → load → lower → codegen）编译源文件。
@@ -61,6 +75,10 @@
   - 符号索引对齐（`cold_csg_finalize` + 导入后重注册）
   - 参数类型 span arena 复制（防 src 缓冲区覆盖）
   - 类型字段导入后重解析（跳过泛型参数）
+  - 10 处 `die()` → 优雅降级（`array field missing length`、`params limit`、`add target`、`variant comparison`、`object slot missing type`、`field assignment kind` 等）
+  - 参数上限 8→32
+  - stdlib 白名单移除
+  - 42 个 manifest 源文件全部通过语法/语义检查（0 个直接产出二进制——它们是库模块，非独立程序）
 
 ### 新增（2026-05-05）
 
@@ -162,7 +180,8 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 | `BACKEND_JOBS` env→CompilerRequest→report | **已完成** | `function_task_job_count=N` + `function_task_schedule=serial` 已写入报告 |
 | serial oracle | 必须保留 | `BACKEND_JOBS=1` 产物作为确定性基准 |
 | work-stealing executor | 库级 executor 可见，但未接入 active lowering 主链 | 待接入 lowering callback（`FunctionTaskExecuteBodyIr` 是空桩）；接入前不得宣称主链并行完成 |
-| 实际并行执行 | 待实现 | 需要把 `LoweringBuildOneFunction` 包进 `FunctionTask` + 线程间回调传递 |
+| 实际并行执行 | **2026-05-08 尝试受阻** | `async.spawn` + `FetchAddI32` 方案通过语法/语义检查，但 codegen 不支持函数体内的并发原语；循环导入约束（§716）阻止了 executor 回调路径 |
+| dispatch report | **已完成** | `function_task_schedule` 动态报告 `ws`/`serial`，`function_task_job_count=N` |
 
 切默认条件：
 1. `BACKEND_JOBS=1` 与 `BACKEND_JOBS=N` 同输入产物 SHA 一致。
@@ -175,7 +194,7 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 | 能力 | 当前口径 | done |
 |---|---|---|
-| provider-free standalone direct exe | 可作为最小 witness | 必须用退出码、`otool -tV`、`otool -rv`、report 共同证明 |
+| provider-free standalone direct exe | 可作为最小 witness；**冷编译器 `system-link-exec` 已实现 linkerless Mach-O 直写**（`COLD_NO_SIGN=1` 确定性 SHA） | 必须用退出码、`otool -tV`、`otool -rv`、report 共同证明 |
 | provider-backed ordinary executable | 阶段 0 ordinary witness 已通 | `provider_object_count>0`、`standalone_no_runtime=0`、真实退出码 0；不外推到 runtime smoke |
 | provider-backed runtime executable | 仍是关键缺口 | atomic/compiler runtime 必须执行 marker/assert/runtime 调用，不能走 `standalone_no_runtime=1` 或折零 |
 | direct object writer | Darwin arm64 主线优先 | writer 消费 primary plan 的机器字和 reloc，不再按 body kind 重猜 |
