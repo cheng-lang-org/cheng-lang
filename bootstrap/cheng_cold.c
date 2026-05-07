@@ -2938,10 +2938,19 @@ static bool cold_emit_csg_statement_rows(FILE *file, Span source) {
                     if (ceq <= 0) continue;
                     Span cname = span_trim(span_sub(ct, 0, ceq));
                     Span cval = span_trim(span_sub(ct, ceq + 1, ct.len));
-                    if (cname.len <= 0 || !span_is_i32(cval)) continue;
-                    fprintf(file, "cold_csg_const\t%d\t", span_i32(cval));
-                    cold_write_span_csg(file, cname);
-                    fputc('\n', file);
+                    if (cname.len <= 0) continue;
+                    if (span_is_i32(cval)) {
+                        fprintf(file, "cold_csg_const\t%d\t", span_i32(cval));
+                        cold_write_span_csg(file, cname);
+                        fputc('\n', file);
+                    } else if (cval.len >= 2 && cval.ptr[0] == '"' && cval.ptr[cval.len - 1] == '"') {
+                        Span inner = span_sub(cval, 1, cval.len - 1);
+                        fprintf(file, "cold_csg_const_str\t");
+                        cold_write_span_csg(file, inner);
+                        fprintf(file, "\t");
+                        cold_write_span_csg(file, cname);
+                        fputc('\n', file);
+                    }
                 }
             } else if (cold_span_is_exact_or_prefix_space(trimmed_top, "type") ||
                        cold_span_is_exact_or_prefix_space(trimmed_top, "import") ||
@@ -4749,6 +4758,8 @@ typedef struct {
 typedef struct {
     Span name;
     int32_t value;
+    bool  is_str;
+    Span  str_val;
 } ConstDef;
 
 typedef struct {
@@ -4815,6 +4826,24 @@ static void symbols_add_const(Symbols *symbols, Span name, int32_t value) {
     ConstDef *constant = &symbols->consts[symbols->const_count++];
     constant->name = cold_arena_span_copy(symbols->arena, name);
     constant->value = value;
+    constant->is_str = false;
+    constant->str_val = (Span){0};
+}
+
+static void symbols_add_str_const(Symbols *symbols, Span name, Span str_val) {
+    if (symbols_find_const(symbols, name)) return;
+    if (symbols->const_count >= symbols->const_cap) {
+        int32_t next = symbols->const_cap * 2;
+        ConstDef *fresh = arena_alloc(symbols->arena, (size_t)next * sizeof(ConstDef));
+        memcpy(fresh, symbols->consts, (size_t)symbols->const_count * sizeof(ConstDef));
+        symbols->consts = fresh;
+        symbols->const_cap = next;
+    }
+    ConstDef *constant = &symbols->consts[symbols->const_count++];
+    constant->name = cold_arena_span_copy(symbols->arena, name);
+    constant->value = 0;
+    constant->is_str = true;
+    constant->str_val = cold_arena_span_copy(symbols->arena, str_val);
 }
 
 static bool cold_fn_param_kind_can_refine(int32_t existing, int32_t fresh) {
@@ -9207,6 +9236,13 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         Span qualified = parser_take_qualified_after_first(parser, token);
         ConstDef *constant = symbols_find_const(parser->symbols, qualified);
         if (constant) {
+            if (constant->is_str) {
+                int32_t literal_index = body_string_literal(body, constant->str_val);
+                int32_t slot = body_slot(body, SLOT_STR, 16);
+                body_op(body, BODY_OP_STR_LITERAL, slot, literal_index, 0);
+                *kind = SLOT_STR;
+                return slot;
+            }
             int32_t slot = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, slot, constant->value, 0);
             *kind = SLOT_I32;
@@ -9233,6 +9269,13 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     }
     ConstDef *constant = symbols_find_const(parser->symbols, token);
     if (constant) {
+        if (constant->is_str) {
+            int32_t literal_index = body_string_literal(body, constant->str_val);
+            int32_t slot = body_slot(body, SLOT_STR, 16);
+            body_op(body, BODY_OP_STR_LITERAL, slot, literal_index, 0);
+            *kind = SLOT_STR;
+            return slot;
+        }
         int32_t slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_I32_CONST, slot, constant->value, 0);
         *kind = SLOT_I32;
@@ -11401,6 +11444,16 @@ static void cold_csg_finalize(ColdCsg *csg) {
         int32_t sizes[COLD_MAX_I32_PARAMS];
         int32_t arity = parse_param_specs(csg->symbols, csg->functions[i].params,
                                           names, kinds, sizes, 0, COLD_MAX_I32_PARAMS);
+        /* refine kinds using symbols table (must match parse_fn's cold_slot_kind_from_type_with_symbols) */
+        Span tnames[COLD_MAX_I32_PARAMS];
+        int32_t refined_kinds[COLD_MAX_I32_PARAMS];
+        int32_t refined_sizes[COLD_MAX_I32_PARAMS];
+        int32_t r_arity = parse_param_specs(csg->symbols, csg->functions[i].params,
+                                            names, refined_kinds, refined_sizes, tnames, COLD_MAX_I32_PARAMS);
+        if (r_arity == arity) {
+            memcpy(kinds, refined_kinds, (size_t)arity * sizeof(int32_t));
+            memcpy(sizes, refined_sizes, (size_t)arity * sizeof(int32_t));
+        }
         csg->functions[i].symbol_index = symbols_add_fn(csg->symbols,
                                                         csg->functions[i].name,
                                                         arity,
@@ -11477,6 +11530,10 @@ static bool cold_csg_load(ColdCsg *csg, Arena *arena, Symbols *symbols, Span tex
         }
         if (span_eq(fields[0], "cold_csg_const") && field_count >= 3) {
             symbols_add_const(csg->symbols, fields[2], span_i32(fields[1]));
+            continue;
+        }
+        if (span_eq(fields[0], "cold_csg_const_str") && field_count >= 3) {
+            symbols_add_str_const(csg->symbols, fields[2], fields[1]);
             continue;
         }
         die("unknown cold csg row");
@@ -15413,6 +15470,8 @@ static bool cold_compile_csg_type_rows_from_source_into_symbols(Span source, Sym
             cold_csg_add_object(&csg, fields, fc);
         } else if (span_eq(fields[0], "cold_csg_const") && fc >= 3) {
             symbols_add_const(symbols, fields[2], span_i32(fields[1]));
+        } else if (span_eq(fields[0], "cold_csg_const_str") && fc >= 3) {
+            symbols_add_str_const(symbols, fields[2], fields[1]);
         }
     }
     /* NOTE: intentionally NOT munmap(text) -- object/type names from cold_csg_add_object /
@@ -15638,7 +15697,21 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
             munmap((void *)source.ptr, (size_t)source.len);
         }
     }
+    /* re-register function signatures now that imported types are available */
+    for (int32_t i = 0; i < csg.function_count; i++) {
+        Span names[COLD_MAX_I32_PARAMS];
+        int32_t kinds[COLD_MAX_I32_PARAMS];
+        int32_t sizes[COLD_MAX_I32_PARAMS];
+        Span tnames[COLD_MAX_I32_PARAMS];
+        int32_t arity = parse_param_specs(csg.symbols, csg.functions[i].params,
+                                          names, kinds, sizes, tnames, COLD_MAX_I32_PARAMS);
+        csg.functions[i].symbol_index = symbols_add_fn(csg.symbols,
+                                                        csg.functions[i].name,
+                                                        arity, kinds, sizes,
+                                                        csg.functions[i].ret);
+    }
     BodyIR **function_bodies = arena_alloc(arena, (size_t)symbols->function_cap * sizeof(BodyIR *));
+    memset(function_bodies, 0, (size_t)symbols->function_cap * sizeof(BodyIR *));
     int32_t entry_function = -1;
     /* Reconstruct source text from CSG facts and use source-direct parser for BodyIR parity */
     size_t src_cap = 524288;
@@ -15720,8 +15793,14 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
         Parser p = {(Span){(const uint8_t *)src, u}, 0, arena, symbols};
         int32_t psym = -1;
         BodyIR *body = parse_fn(&p, &psym);
-        if (psym >= 0 && psym < symbols->function_cap)
+        if (psym >= 0 && psym < symbols->function_cap) {
             function_bodies[psym] = body;
+            /* update the csg function's symbol_index to match the one used by parse_fn */
+            csg.functions[i].symbol_index = psym;
+        } else if (body) {
+            fprintf(stderr, "[cheng_cold] body index out of bounds: fn=%.*s psym=%d cap=%d\n",
+                    fn->name.len, fn->name.ptr, psym, symbols->function_cap);
+        }
         if ((csg.entry.len > 0 && span_same(fn->name, csg.entry)) ||
             (csg.entry.len == 0 && span_eq(fn->name, "main"))) {
             entry_function = symbol_index;
