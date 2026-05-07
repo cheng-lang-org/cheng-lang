@@ -15748,14 +15748,6 @@ static void cold_compile_csg_load_imported_types(const char *workspace_root,
             die("import cycle detected");
         }
         cold_import_push_active(imp_path);
-        /* skip stdlib imports that trigger pre-existing codegen bugs (CompilerCsgTextSet, etc.)
-           TODO: fix object layout resolution in codegen, then remove this skip */
-        if (cold_span_starts_with(rest, "std/") || cold_span_starts_with(rest, "std.")) {
-            munmap((void *)imp_source.ptr, (size_t)imp_source.len);
-            cold_import_pop_active();
-            continue;
-        }
-
         /* remember current object/type counts to detect newly added types */
         int32_t old_obj_count = symbols->object_count;
         int32_t old_type_count = symbols->type_count;
