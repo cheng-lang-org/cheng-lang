@@ -16,11 +16,44 @@
 - 已完成：局部 `int32[]` 动态序列切片 `cold_bootstrap_slice_seq_local` 通过，覆盖 typed literal、typed empty literal、默认空值、`.len`、常量下标，并与 `int32[N]` 固定数组同测防语义混淆。
 - 已完成：`cold_bootstrap_slice_var_add` 通过，覆盖 `var int32[]` 参数、`add(int32[], int32)`、动态序列扩容、object 字段序列 field-ref 原地修改，三条路径均 exit 26。
 - 已完成：`cold_bootstrap_slice_generic_result` 通过，覆盖 `Result[ObjType, Diag]` 非 int32 泛型参数、object payload/error layout、复合返回、match payload 字段读取，三条路径均 exit 42。
+- 已完成：`cold_bootstrap_slice_nested_generic_field` 通过，覆盖 ADT 字段类型 `Result[ObjType, Diag]` 的 CSG 顶层逗号切分和嵌套泛型 payload copy，三条路径均 exit 42。
+- 已完成：真实源码派生的 `cold_bootstrap_kernel_aarch64_encode` 通过，覆盖 hex 指令字、`uint32/int64/uint64` 标量转换、`|/^/<<`、多行表达式 source->CSG 合并、full 32-bit constant materialize、Result/match，source->CSG 与 facts direct 均 exit 42。
+- 已完成：cold int32 `/` 与 `%` 进入 source-direct、source->CSG、BodyIR 和 ARM64 codegen；`/` 降为 `sdiv`，`%` 降为 `sdiv+msub`，除数为 0 直接 `brk`；AArch64 encode 和 combined kernel 均覆盖 signed div/mod。
+- 已完成：真实源码派生的 `cold_bootstrap_kernel_frontend_scan` 通过，覆盖 `str[index]` byte load、字符字面量、`uint8` 参数、identifier/space 判断、indent 扫描、line comment 跳过、while/for 条件扫描，source-direct、source->CSG、facts direct 均 exit 42。
+- 已完成：binding initializer 物化独立 slot，修复 `var pos: int32 = start` 与参数共享 slot 导致 `pos - start` 恒为 0 的语义 bug；source-direct 与 CSG lowerer 同步修复。
+- 已完成：string literal escape decode、`return/let/var` bool value expression CFG lowering、`&&/||` 短路值语义；比较检测已避开 `<<`/`>>`，AArch64 encode kernel 恢复 exit 42。
+- 已完成：`cold_bootstrap_kernel_combined` 通过，把 frontend scan 与 AArch64 encode 真实源码派生切片合并成单一冷编译输入；source-direct、source->CSG、facts direct 均 exit 42。
+- 已完成：ASan/UBSan 关键 kernel 回归：combined/frontend scan/AArch64 encode 三条路径均通过，报告只输出 `cold_compile_elapsed_ms`。
+- 已完成：outline parser 派生扫描闭包并入 combined kernel；source-direct/source->CSG 均支持块注释跳过、字符串/字符 literal 跳过、括号/中括号平衡扫描、泛型签名里跳过注释中的 `=`。
+- 已完成：source->CSG 注释剥离和续行判断补齐字符串/字符感知；`ch == '(' || ch == '[' || ch == '{'` 这类真实 parser 条件不再误触发续行或条件 trailing-token hard-fail。
+- 已完成：direct Mach-O writer 的 `__TEXT` segment 改为按实际 code size 页面对齐，combined kernel 代码超过一页时 dyld 不再拒绝加载。
+- 已完成：object field assignment 进入 source-direct 与 CSG lowering：本地 object 和 `var object` 参数字段写回走 `BODY_OP_PAYLOAD_STORE`，覆盖 int32/bool/str/int32[N] 字段。
+- 已完成：`cold_bootstrap_slice_object_field_assign` 三条路径 exit 42；combined kernel 已并入状态对象字段更新，三条路径仍 exit 42。
+- 已完成：index assignment 进入 source-direct 与 CSG lowering：本地 `int32[N]`、本地 `int32[]`、object 字段固定数组、object 字段动态序列均可 `target[index] = value` 原地写回，`cold_bootstrap_slice_index_assign` 三条路径 exit 42。
+- 已完成：sequence escape 语义收紧：非空 `int32[]` 字面量 backing buffer 改为 mmap，不再指向当前函数栈帧；`Object(items: [..])` 和 `object.items = [..]` 按动态序列类型解析，`cold_bootstrap_slice_seq_escape` 三条路径 exit 42。
+- 已完成：单行 suite 进入 source-direct 与 source->CSG：`if/elif/else/while/for ...: stmt`、顶层 `stmt; stmt`、inline `break/continue` 均展开为同一套 CFG/statement rows，`cold_bootstrap_slice_inline_suite` 三条路径 exit 42。
+- 已完成：`--csg-out` 默认升级为 `cold_csg_version=2` 结构化 facts，每条 row 用长度前缀 hex field 承载；loader 按 version 硬分流，显式 v1 facts 仍可读取。
+- 已完成：`cold_bootstrap_slice_structured_facts_string` 覆盖原始 tab 字节字符串，v2 source->CSG 和 facts direct 均 exit 42；21 个核心 cold 切片 v2 矩阵全过。
 - 已完成：刷新 `artifacts/backend_driver/cheng`，修通 provider self-compile importc 符号闭包；zero-exit selftest 通过，cold sidecar 手动 gate 通过。
 - 已完成：Cheng 侧 `compiler_csg -> cold facts` exporter 经 backend sidecar 验证，facts direct 冷编译报告 `cold_compile_elapsed_ms=19.961`，无 `elapsed_us`。
 - 已完成：把 cold sidecar gate 下沉到当前 dispatch_min 命令面，`run-host-smokes cold_csg_sidecar_smoke` 可直接跑完 backend facts exporter、冷 compiler facts path 和最终可执行退出码校验。
 - 已完成：`compiler_csg -> cold facts` ADT/match 主线接通；默认 `cold_csg_sidecar_smoke` 现在同时覆盖 `Option.Some(7)` 的 `cold_csg_type/match/case` facts、`cheng_cold --csg-in` switch lowering 和 exit 7。
-- 下一步：不再继续堆孤立 fixture；迁入真实 bootstrap kernel 源码片段，先形成约 2000 行可编译闭包。最终目标仍是 10万-30万行编译器核心冷自举，同时保留 `cold_compile_elapsed_ms` 作为 30-80ms 内核耗时合同。
+- 已完成：combined kernel 并入 CSG v2 facts writer/reader byte-buffer slice：逐字段写 v2 record、reader 保存 `hexStart/len` span 信息、读取时流式 exact decode 校验 tab 字节字段，source-direct/source->CSG/facts direct 均 exit 42。
+- 已完成：combined kernel 并入 CSG v2 facts loader 扫描 slice：loader 对 v2 record 做单次扫描，记录 `hexStart/len/kindCode`，流式 exact 识别 `cold_csg_entry/function/stmt`，统计 record/field/byte/kind 计数，三条路径均 exit 42。
+- 已完成：combined kernel 并入 parser statement sequence 扫描 slice：逐行计算 indent/token/payload span，分类 `let/return/if/elif/else/match/case/var/generic` 为 int32 kindCode，checksum 覆盖三条路径均 exit 42。
+- 已完成：combined kernel 并入 statement facts 写入/读取 slice：`StatementWriteFacts` 把扫描结果写成 v2 `cold_csg_stmt` records，int 字段无字符串副本地写入 hex field，reader 单次读取时产出 `fieldInt/fieldIsDecimal` 并校验 checksum，三条路径均 exit 42。
+- 已完成：combined kernel 扩到 2035 行并通过三路径：新增 expression token scanner + v2 `cold_csg_expr_token` facts、dense packed layout cursor、phase arena reset、work-stealing CAS SoA 队列顺序模型。
+- 已完成：修通 cold call 嵌套参数错位、多行函数签名 source->CSG 续行误发 statement、object 复合字段 4 字节错位、复合拷贝 8 字节越界、表达式优先级错降五处 blocker。
+- 已完成：新增 `cold_workdeque_soa_regression` 与 `cold_soa_object_regression`，覆盖多定长数组 object、var object field array 读写、`range - start * 100` 优先级，以及 WorkDeque SoA checksum。
+- 已推进：`backend_driver_dispatch_min.cheng` 真实参数/返回类型面第一段进入 cold source-direct，覆盖 `alias.Type`、`Result[alias.Type]`、`var str`、`str[]`、`var str[]` 和 16 参数签名表；新增 `cold_bootstrap_backend_dispatch_type_surface`，source-direct exit 42。
+- 已推进：qualified call/import surface 第一段进入 cold source-direct，`alias.Fn(...)` 不再被误判为字段访问；直接 import module surface 已加载函数签名，bodyless `@importc fn` 只进符号表，imported overload 按参数 kind 解析。
+- 已完成：`backend_driver_dispatch_min.cheng` 继续越过 `Fmt"..."`、top-level `const`、imported enum/object field refinement、多行 bool 条件、`Result[T]` object helpers、`var int32/enum` 引用参数、Darwin stack 参数 ABI、stdio `WriteLine/Get_stdout/GetStderr`、真实 `argc/argv/envp -> ParamCount/ParamStr/GetEnv/ReadFlagOrDefault`、`gettimeofday/getrusage/exit` syscall、path surface、`ParseInt/Len/SliceBytes/Split/Strip/Join` 和 `CompilerCsgTextSet` 集合操作。
+- 已完成：冷端新增 `SystemLinkPlanStub` materializer、`slplan` field/list 访问、shell quote、read/remove file、ExecCmdResult field load、target matrix、line map、direct result/重后端 trap 面；`backend_driver_dispatch_min.cheng` 已可经 cold `system-link-exec` 生成 `backend_driver_dispatch_min_probe`。
+- 已完成：生成物 `backend_driver_dispatch_min_probe status --root:. --in:src/core/tooling/backend_driver_dispatch_min.cheng --out:...` 跑通，输出 `flag_exec_edges=0` 和 `flag_exec_unresolved=0`。
+- 已完成：生成物 `backend_driver_dispatch_min_probe system-link-exec --in:src/tests/ordinary_zero_exit_fixture.cheng` 已越过 `ccsg.BuildCompilerCsgInto`，在 `lower.BuildLoweringPlanStubFromCompilerCsg` 边界结构化返回 exit `2`，stderr 写出 `cold runtime unsupported: lower.BuildLoweringPlanStubFromCompilerCsg`，不再 SIGTRAP。
+- 已完成：cold 报告新增 `cold_max_frame_size/cold_max_frame_function` 和 `AfterSourceBundle/AfterCsg` 帧大小，当前 probe 为 `22032/BackendDriverDispatchMinAppendPrimaryPlanReport`、`784`、`1600`。
+- 已完成：`WriteTextFile(root,path,text)` 冷端按 root 解析 path；object field store 新增 slot 边界硬检查，避免物化器字段写越界静默污染调用方槽。
+- 下一步：先修 `AfterCsg` lowering 失败路径 report sidecar 未写出的问题；再补 ARM64 大帧/大偏移编码；再把 `lower.BuildLoweringPlanStubFromCompilerCsg -> pobj.BuildPrimaryObjectPlan -> direct.DirectObjectEmit*` 从结构化错误/运行时 trap 推进到真实 Cheng body/materializer；CSG writer 的多行函数签名续行边界仍需同步修。
 
 - 迁移目标：仓库根包固定为 `pkg://cheng`，唯一源码树为 `src`，编译器内核在 `src/core`。
 - 已完成：源码、测试、seed、r2c 工具路径和公开环境变量去掉旧版本标识。

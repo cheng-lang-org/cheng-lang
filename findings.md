@@ -2,8 +2,75 @@
 
 ## Cold compiler current gaps (2026-05-06)
 - 冷编译器不需要支持 Cheng 全部语法，只需支持真实编译器源码实际用到的 bootstrap kernel 子集。
-- 本轮已补齐：默认 object 写法、`&/*/>>` 基础算术、非 int32 泛型 ADT payload、`var int32[]` 参数、`add(int32[], int32)`、object 字段上的动态序列引用。
-- 剩余缺口：对象字段赋值、`str == str` 比较、泛型字段 facts 的结构化格式、真实 bootstrap kernel 成片迁入。
+- 本轮已补齐：默认 object 写法、`&/*/>>/|/^/<<` 基础算术、hex 指令字、标量转换、`str[index]` byte load、字符字面量、`uint8/char` 标量、string literal escape decode、bool value expression CFG lowering、单行 suite、object field assignment、index assignment、sequence escape、结构化 facts v2、parser statement sequence scanner、statement facts writer/reader、expr token facts writer/reader、phase arena、dense layout cursor、work-stealing CAS model、非 int32 泛型 ADT payload、`var int32[]` 参数、`add(int32[], int32)`、object 字段上的动态序列引用。
+- 真实源码派生的 AArch64 encode kernel 已通过 source-direct、source->CSG、facts direct；这证明冷路径能消费编译器实际用的 bit encoding 公式，但还不是完整 bootstrap kernel 闭包。
+- 真实源码派生的 frontend scan kernel 已通过 source-direct、source->CSG、facts direct；这证明冷路径能消费 lexer/outline parser 实际需要的 byte scanner 形状。
+- 真实源码派生的 combined kernel 已通过 source-direct、source->CSG、facts direct；这证明多个真实 kernel 可以在同一冷编译输入中共享类型表、函数表、CFG、对象状态更新、outline parser 扫描和 Mach-O emit。
+- 剩余缺口：更多真实 CSG stmt/expr facts、约 2000 行真实 bootstrap closure、必要的 object/sequence 逃逸语义；v2 facts 已消除 tab-separated payload 边界，但 source-direct 仍未支持真实多行字符串 statement。
+
+## Cold outline/parser closure
+- source->CSG 的注释处理必须先剥离 `///#/block comment`，并且不能进入字符串和字符字面量；否则真实 parser 源码里的注释会被 statement scanner 当成代码。
+- 续行判断和条件拆分都必须识别字符字面量；`'('`、`'['`、`'{'` 是 byte 常量，不是语法括号。
+- `match/if` 条件目标扫描需要同时跟踪 `()` 与 `[]`，因为真实签名和泛型类型经常在条件表达式里出现。
+- direct Mach-O 的 `__TEXT` segment 不能固定一页；code words 增长后必须按实际 text size 对齐，否则 dyld 会在加载时拒绝 `__text` section 越界。
+
+## Cold AArch64 encode kernel
+- 大指令常量不能用单条 `movz w`；必须 `movz + movk` 写满 32-bit word，否则 `0x94000000` 这类 branch opcode 会被截断。
+- 真实 encode 公式需要 `uint32(...)` 这类类型转换，但当前 cold subset 只承诺 int32-compatible bit pattern，不承诺完整 64-bit 算术语义。
+- bool expression detector 必须跳过 `<<`/`>>`；否则 shift 表达式会被误拆成比较条件，导致编码公式被错误 lowering。
+- source->CSG 续行合并是为了消费真实源码形状；它只能作为 bootstrap kernel 过渡合同，不能继续替代结构化 parser facts。
+
+## Cold div/mod
+- `/` 与 `%` 是正式 Cheng 算术表面，真实 runtime/debug/encoding 代码大量使用；cold subset 缺它们会卡住 2000 行 bootstrap closure。
+- ARM64 `sdiv` 对除数 0 不会自动 trap，因此 cold codegen 必须在发 `sdiv` 前显式比较并 `brk`，不能静默产出 0。
+- `%` 不需要新 runtime helper；用 `sdiv quotient` 后 `msub remainder = dividend - quotient * divisor`，与 signed division 的截断语义保持一致。
+
+## Cold frontend scan kernel
+- `str[index]` 是 lexer/parser kernel 的硬前提；实现必须是 bounds check 后按 byte load，不能把 `str` 当 int32 array 或展开成后处理。
+- 字符字面量可以先按 byte 值降为 i32；`uint8/char` 在 cold subset 中只承诺 scanner byte 语义，不承诺完整字符模型。
+- binding initializer 不能直接复用 initializer slot；`var pos = start` 必须分配新 slot 并 copy，否则局部变量赋值会反写参数。
+- string literal parser 必须先解码 escape 再生成 `ptr,len`；`"a\n"` 的运行时长度是 2，不是源码 span 长度 4。
+- 当前 facts 是 tab-separated 文本，字符串 literal 内的 raw tab/newline 无法安全承载；escape decode 只能修源码 literal 语义，真实 bootstrap kernel 应消费结构化 facts。
+
+## Cold sequence escape
+- 非空 `int32[]` 字面量不能把 header buffer 指向生成字面量的栈上 backing array；一旦该序列进入 object 字段或 sret 复合返回，就会形成悬空地址。
+- 当前冷路径把非空 `int32[]` 字面量直接 materialize 到 mmap buffer；空序列保持零 header，第一次 `add` 仍走现有扩容路径。
+- object 构造和字段赋值必须用字段/目标类型给 `[..]` 提供上下文；否则 `Object(items: [1,2])` 会被误降成固定数组而不是动态序列。
+
+## Cold inline suite
+- `src/core/lang/outline_parser.cheng` 这类真实 parser 源码大量使用 `if cond: return ...`、`elif cond: stmt`、`else: break`、`stmt; stmt`；不支持单行 suite 会让 bootstrap closure 被源码形状卡住。
+- source-direct 现在直接解析 inline suite；source->CSG 先把 inline body 展开成缩进 rows，再交给同一个 CSG lowerer，避免 direct/facts 路径分叉。
+- 分号在 `if cond: a; b` 中属于 inline suite body，不是外层同级 statement；拆分必须先识别 header colon/`=>`。
+
+## Cold combined bootstrap kernel
+- combined kernel 已把 frontend scanner 与 AArch64 encoder 放入单一源文件验证，避免两个孤立 fixture 共享不了符号/slot/CFG 的假进度。
+- combined kernel 已并入 `ScanState` 对象状态更新，覆盖本地 object 默认初始化、`var object` 参数、字段 bool 短路赋值、str 字段赋值和固定数组字段赋值。
+- combined kernel 已并入 outline parser 扫描闭包，覆盖块注释、字符串/字符跳过、括号/中括号平衡、签名中跳过注释里的 `=`。
+- combined kernel 已并入 parser statement sequence 扫描闭包：逐行计算 indent/token/payload span，分类为 int32 `kindCode`，checksum 不复制 statement 字符串。
+- combined kernel 已并入 statement facts writer/reader 闭包：scanner 输出直接写成 v2 `cold_csg_stmt` records，numeric field 在 writer/reader 两端都不经中间字符串。
+- combined kernel 已达到 2022 行：新增 expression token scanner/facts、phase arena reset、dense layout cursor 和 work-stealing CAS 顺序模型，三条冷路径均 exit 42。
+- combined kernel 已推进到 2035 行：FactRecordView 恢复 `fieldInt/fieldIsDecimal` SoA arrays，WorkDeque 恢复 `taskFn/taskRange` SoA arrays，并三条冷路径 exit 42。
+- `return <bool expr>` 和 typed bool binding 必须走 CFG lowering；把 bool 当 int32 表达式直接算会丢掉 `&&/||` 短路语义。
+- 约 2000 行 closure 的下一层不应继续靠文本续行和 tab facts 扩展；需要结构化 facts 承载 statement、expr、type layout 和 string bytes。
+- `range - start * 100` 暴露 cold parser 旧二元表达式全左结合 bug；冷路径必须按 `* / %`、`+ -`、shift、bitwise 层级解析，否则 backend driver 真实算术会被错降。
+- 复合 slot/字段拷贝必须精确到 4 字节尾部；`int32[3]` 这类非 8 字节倍数固定数组不能用盲目 64-bit loop 复制。
+
+## Cold structured facts v2
+- `--csg-out` 默认输出 `cold_csg_version=2`，row payload 统一为 `field_count + len:hexbytes`；tab/newline 不再是字段分隔语义的一部分。
+- v2 loader 按版本硬分流；legacy v1 只在文件显式 `cold_csg_version=1` 时读取，避免把旧格式当新格式猜。
+- 原始 tab 字节字符串 `"a<TAB>b"` 已通过 source->CSG 和 facts direct，证明 string/expression field 不再被 tab 拆裂。
+- combined kernel 已并入真实 byte-buffer writer/reader/loader slice：writer 逐字段输出 v2 record，reader 保存 encoded field span/len，不复制字段字符串；loader 单次扫描时对 kind 字段做流式 exact 匹配并产出 `kindCode`，decimal 字段 packed 到 `fieldInt`，expr token facts 同样走 v2 record，避免 hash 或二次字符串副本充当相等判定。
+- 嵌套 call 不能边解析边写 `call_arg` side table；`FactHexValue(FactReadByte(reader))` 会让外层参数起点指到内层 `reader`。现在函数调用统一本地收集参数后追加 dense table。
+- source->CSG 发 statement row 必须跳过多行函数签名续行；只靠“顶层 fn 行 + 后续缩进行”会把 `hexStart: int32...` 当成赋值语句。
+- object 布局必须按字段实际 size 对齐；`int32[N]` 字段放在 scalar 后若只按 kind=4 字节对齐，会被 64-bit payload copy 读写错位。
+- cold facts loader 的 record kind 分类应在读取第 0 字段时同步完成；用 `hexStart` 做二次随机解码会扩大到 var object + sequence field 的额外 ABI 面，不符合单次扫描生成结构化 facts 的目标。
+
+## Cold backend dispatch surface
+- `backend_driver_dispatch_min.cheng` 的第一层真实缺口不是 int32 ABI，而是导入后的类型表：`alias.Type`、`Result[alias.Type]`、`var str`、`str[]`、`var str[]` 必须有独立 slot/ABI，不能压成 int32。
+- imported module surface 只加载签名，不生成本地 body；一旦 reachable call 真要落到 imported 函数，仍必须走外部 ABI/linkerless image 方案，不能 no-op。
+- imported overload 不能按 name+arity 压扁；`std/system.panic(ptr)` 和 `std/system.panic(str)` 已证明必须按参数 kind 做解析。
+- `backend_driver_dispatch_min.cheng` 当前 source-direct 已越过参数/import/qualified call 层、`Fmt"..."`、`Result[T]` object helpers、stdio、真实 argv surface、path bridge 和 `SystemLinkPlanStub` materializer；新的硬 blocker 是重后端 CSG 构建：`ccsg.BuildCompilerCsgInto`。
+- `cold_bootstrap_backend_dispatch_type_surface --csg-out` 当前仍失败：旧 CSG statement scanner 会把多行函数签名续行当 statement，CSG writer 必须按 `ColdFunctionSymbol.body` 边界发 rows。
 
 ## Cold compiler source-direct parser fixes (2026-05-06)
 - 新增默认 object 类型声明支持：`parse_type` 中对 `type A =` 后缩进 `name: Type` 字段行创建 `ObjectDef`，新增 `object_finalize_fields` 计算 slot layout；不要求 `object` 关键字
@@ -13,7 +80,9 @@
 
 ## Cold var/generic completion
 - `Result[ObjType, Diag]` 已通过 source-direct、source->CSG、facts direct 三条路径，object payload/error 按实际 layout 传递、返回和 match。
+- `Box = Wrapped(Result[ObjType, Diag]) | Empty` 已通过 source-direct、source->CSG、facts direct 三条路径，证明 CSG variant row 不再按裸逗号误切泛型字段类型。
 - `var int32[]` 参数和 `add(xs, value)` 已通过 source-direct、source->CSG、facts direct 三条路径；局部序列和 object 字段序列都能被 `add` 原地修改。
+- `target[index] = value` 已通过 source-direct、source->CSG、facts direct 三条路径；本地 `int32[N]`/`int32[]` 和 object 字段数组/序列均写回原存储，不写临时副本。
 - `add` 当前只承诺 `int32[]`，不承诺泛型 `T[]`；大范围开放前必须先把元素类型、扩容和拷贝规则结构化。
 
 ## Architecture
@@ -103,6 +172,7 @@
 - `int32[N]` 是固定 slot，facts 必须携带长度；只用 `i` 会丢失 array bound，后续 `array[index]` 无法做 hard-fail 边界检查。
 - constructor 不能边解析字段边写全局 `call_arg` side table；嵌套 array/object/variant 会插入自己的 payload，打断父 constructor 的 dense payload 列表。正确做法是本地收集 slots/offsets，解析完成后一次性写入 side table。
 - object 返回和参数传递复用 composite ABI：返回走 sret `x8`，大 object 参数走 byref，callee 复制完整 slot。
+- object 字段写不能复用字段读取的临时 slot；必须对原 object 或 `var object` 参数地址发 `PAYLOAD_STORE`，否则只是改了拷贝。当前已覆盖 int32/bool/str/int32[N] 字段写回。
 
 ## Cold tuple/default init
 - `type` block 扫描必须按行首边界回退；object 字段扫描如果吞掉下一个同级 entry，后续 tuple/ADT row 会静默丢失。
@@ -126,3 +196,22 @@
 - `ParserReadNormalizedExprLayer...` 不是 backend driver 主线；`CompilerCsgExprLayerForProfile` 才是 `compiler_csg` 当前热路径。新增语法能力必须接到 profile path，否则 facts 导出会只看到 return/assign，漏掉 match/case。
 - `=>` 不能被 assignment parser 当成 `=`；否则 `Some(value) =>` 会污染 assign statement，后续 exporter 会报 variant constructor 类型错误。
 - ADT/match 的默认 gate 不能只检查 facts 文本；必须继续跑 `cheng_cold --csg-in` 和最终可执行退出码，才能证明 `cold_csg_type/match/case -> BodyIR switch -> Mach-O` 全链路真实可用。
+
+## Backend dispatch_min cold surface
+- `backend_driver_dispatch_min.cheng` 的第一层缺口不是表达式，而是签名类型面：模块限定类型、`Result[alias.Type]`、`var str`、`str[]/var str[]`、以及 8 参数上限会在进入函数体前硬失败。
+- `var T` 在签名预收集阶段不能要求本地 object/type 已解析；类型 block 还没进 symbols，必须先按引用槽位记录，等真正 parse/type layout 阶段再收紧。
+- qualified call 必须在赋值判断前识别；否则 `os.WriteLine(...)` 会被旧 parser 当成 `os` 字段赋值，错误位置偏离真实导入闭包。
+- CSG statement scanner 必须区分 bodyless `@importc fn` 和有函数体 `fn =`；无函数体声明只进函数符号表，不能把后续 `const` block 的缩进行挂到前一个函数。
+- 当前签名面、qualified/import surface、`os.GetStderr/Get_stdout/WriteLine`、argv/envp bridge、path ABI、常用 strutils 和 `CompilerCsgTextSet` 已过；`slplan.BuildSystemLinkPlanStubWithFields` 已由冷端 materializer 接住，`backend_driver_dispatch_min.cheng` 可被 cold 编成 Mach-O。
+- `CompilerCsgTextSet` 冷端不能依赖尚未进入符号表的 `parser.ParserTextLookup` 完整布局；当前实现只占用 `CompilerCsgTextSet.lookup` 首段作为自管 str-pair set，保持 Insert 的去重语义，后续源码闭包接入 ParserTextLookup 后应收回为正式 layout。
+- `std/result` 的当前语义是 object layout：`ok/value/err(ErrorInfo)`，不是旧 ADT `Ok|Err`；冷路径的 `IsErr/IsOk/Value/Error` 必须按 object field offset lowering，并让 `Result[T]` 实例参与真实复合 ABI。
+- Mach-O 入口 wrapper 调用真实 `main` 前会覆盖 `LR`；如果要保存 `argc/argv` 到 callee-saved register，必须同时保存入口 `LR`，否则 wrapper `ret` 会跳回自身形成死循环。
+- `SystemLinkPlanStub` materializer 当前只承诺 status/driver 消费所需字段；sourceClosure/runtime/provider 序列先保持空序列，避免未稳定的运行态 `str[] add` 污染 plan。
+- `ccsg.BuildCompilerCsgInto` 当前已越过控制边界：生成物可以进入下一层 lowering；这还不是完整 CSG 源码闭包，下一步仍要用真实 Cheng body/materializer 补齐 nodes/typed facts。
+- `lower.BuildLoweringPlanStubFromCompilerCsg` 当前必须结构化返回 false+error，不能 trap、空 report、成功对象或空对象继续执行；下一步要用真实 Cheng body/materializer 替换这个错误边界。
+- `AfterCsg` 层 lowering 失败路径当前 stderr 有错误文本，但 report sidecar 没写出；这是报告桥/参数 ABI 缺口，必须先修，不能只看 exit 2。
+- `WriteTextFile(root,path,text)` 只修 root/path 解析不够；pre-CSG 错误报告能写，AfterCsg lowering 报告仍缺失，说明问题在 AfterCsg 进入后的参数/局部槽/错误路径，而不是单纯相对路径。
+- 当前 probe 最大函数帧已到 `22032`，虽然 AfterCsg 自身只有 `1600`，但 ARM64 prologue/local address 的大立即数编码仍不能继续拖；完整自举前必须支持大栈帧和大偏移 load/store，不能靠当前小函数路径偶然通过。
+- object field store 必须检查 `field.offset + field.size <= object slot size`；materializer 写结构化 CSG/lowering/primary plan 时，越界应在冷编译阶段硬失败，不能等生成物运行时污染相邻槽。
+- `pobj/direct` 当前仍必须运行时 `brk` 暴露，不能返回成功对象或空对象继续执行；等 lowering 真正接通后再逐层替换为真实 Cheng body/materializer。
+- cold 编出 `backend_driver_dispatch_min_probe` 后必须跑生成物 `status`；只看 cold compiler 输出 `system_link_exec=1` 不足以证明 plan materializer 可运行。

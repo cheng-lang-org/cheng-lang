@@ -36,6 +36,10 @@
 #define LC_CODE_SIGNATURE 0x1D
 #define PAGE_SIZE 16384
 
+static int32_t macho_align_i32(int32_t value, int32_t align) {
+    return ((value + align - 1) / align) * align;
+}
+
 typedef struct {
     uint8_t  *buf;
     int32_t   cap;
@@ -49,9 +53,9 @@ typedef struct {
 /* Initialize: allocate buffer, write header, reserve space for load commands */
 static bool macho_init(MachOWriter *mw, int32_t code_words, int32_t code_size) {
     (void)code_words;
-    /* Layout: [header 32] [load commands] [padding to 728] [code] [padding to page] */
-    /* Reserve 16KB for header+commands+code (more than enough) */
-    mw->cap = PAGE_SIZE * 2;
+    /* Layout: [header 32] [load commands] [padding to 728] [code] [padding to page] [LINKEDIT page] */
+    int32_t text_file_size = macho_align_i32(728 + code_size, PAGE_SIZE);
+    mw->cap = text_file_size + PAGE_SIZE;
     mw->buf = calloc(1, mw->cap);
     if (!mw->buf) return false;
     mw->len = 0;
@@ -176,6 +180,7 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
     if (!macho_init(&mw, code_words, code_sz)) return false;
 
     int32_t code_off = mw.code_offset;
+    int32_t text_file_size = macho_align_i32(code_off + code_sz, PAGE_SIZE);
     uint64_t text_addr = 0x100000000ULL;
 
     /* PAGEZERO: 4GB guard page at vmaddr 0 */
@@ -183,8 +188,8 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
 
     /* TEXT: contains __text section */
     int32_t text_seg = macho_add_segment(&mw, "__TEXT",
-        text_addr, PAGE_SIZE,
-        0, PAGE_SIZE,
+        text_addr, (uint64_t)text_file_size,
+        0, (uint64_t)text_file_size,
         5, 5, 0);
     macho_add_section(&mw, "__text", "__TEXT",
         text_addr + code_off, code_sz, code_off,
@@ -192,10 +197,10 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
     macho_patch_segment(&mw, text_seg, 1);
 
     /* LINKEDIT: follows TEXT */
-    uint64_t linkedit_addr = text_addr + PAGE_SIZE;
+    uint64_t linkedit_addr = text_addr + (uint64_t)text_file_size;
     macho_add_segment(&mw, "__LINKEDIT",
         linkedit_addr, PAGE_SIZE,
-        PAGE_SIZE, PAGE_SIZE,
+        (uint64_t)text_file_size, PAGE_SIZE,
         1, 1, 0);
     
     /* DYLD_INFO_ONLY: minimal (no rebase/bind/export) */

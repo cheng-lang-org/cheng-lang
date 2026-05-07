@@ -21,6 +21,47 @@
 - `30-80ms` 冷自举口径是 10万-30万行编译器核心的极限架构目标；约 2000 行真实 bootstrap 子集只是阶段 milestone，不能写成最终 100% 定义。
 - `cheng_cold.c` 主线不能为命中旧 `stage3/cheng_seed.c` root 规则改用 `driver_c_*` bridge；冷路径用中性 `cheng_*` bridge + 显式 roots。
 - Cheng 复合类型默认写法是 `type A =` 后缩进字段块；`object` 关键字不是必需语法，冷 parser 必须按缩进字段声明判定 object。
+- 冷编译耗时报告统一输出毫秒字段 `cold_compile_elapsed_ms`；公开报告和回归输出不再出现 `elapsed_us`。
+- object 字段赋值必须写回原 object/ref 地址，用 `PAYLOAD_STORE`；不能复用字段读取临时 slot 再 copy。
+- object 字段下标赋值必须先 `FIELD_REF` 取字段地址，再 `I32_INDEX_STORE` 写原地数组/序列；不能先 `PAYLOAD_LOAD` 成临时数组再写。
+- 非空 `int32[]` 字面量不能用栈上 backing buffer；进入 object 字段或 sret 返回会悬空。冷路径统一 mmap backing buffer。
+- 单行 suite 展开时，`if cond: a; b` 里的分号属于 inline body；source-direct 与 source->CSG 必须按同一规则处理，不能把 `b` 提升成外层同级 statement。
+- cold CSG facts 默认 v2：字段必须长度前缀 + hex bytes；legacy v1 只能按显式 `cold_csg_version=1` 读取，不能猜格式。
+- cold source/condition scanner 必须字符串+字符 literal 感知；`'('` 这类 byte 常量不能影响括号深度或续行判断。
+- direct Mach-O 的 `__TEXT` segment 必须按实际 `code_offset + code_size` 页面对齐；固定一页会在 larger kernel 上被 dyld 拒绝。
+- cold call lowering：函数调用参数必须先收集到本地数组，表达式解析结束后再追加全局 `call_arg` side table；嵌套 call 会插入自己的参数，提前记录 `arg_start` 会错位。
+- cold object layout：复合字段按实际 field size 做 8 字节对齐；`int32[N]` 在 scalar 后按 4 字节对齐会被 64-bit payload copy 读写错位。
+- cold source->CSG：多行函数签名的续行必须跳到 `ColdFunctionSymbol.body` 起点后再发 statement row；否则参数续行会被当成赋值语句。
+- cold facts loader：record kind 必须在字段读取时同步 exact 匹配成结构化 `kindCode`；不要读完后靠 `hexStart` 二次随机解码分类，避免额外 var object/sequence ABI 面污染热路径。
+- cold source->CSG 旧文本扫描会看见字符串 literal 中的 raw `=>`；combined kernel 不要用 raw arrow 字符串证明 statement scanner，后续用结构化 facts 消掉这个边界。
+- cold imported surface：只加载签名，不生成 body；reachable imported call 必须走外部 ABI/linkerless image，不能 no-op。
+- cold imported overload：不能按 name+arity 去重；必须按参数 kind 解析，`system.panic(ptr/str)` 是回归点。
+- cold `Fmt"..."`：下一步必须结构化 lowering 字符串插值；禁止把它临时降成空串或普通 literal。
+- cold source-direct 当前不支持 `-object.field` 这种 unary field 表达式；写 `0 - object.field` 或先补 unary lowering，不能让测试误报 unknown identifier。
+- cold kernel 自检的长算术校验式先拆成命名 `kindScore/lineScore/countScore`，避免校验表达式自身掩盖 statement scanner 语义。
+- cold source-direct 的 `if` 条件里不要写跨行 call；先把 call 结果绑定到本地 int，再用单行 `if result != 0:`，否则旧条件扫描会在换行处报 `expected : after condition`。
+- cold parser 的二元表达式必须按优先级降级；`range - start * 100` 不能左结合成 `(range - start) * 100`，否则真实 work-deque/layout 算术会假坏。
+- cold 复合拷贝必须按真实 byte size 精确复制，8 字节主循环后补 4 字节尾；固定数组/object 字段不能用盲目 `off += 8` 写出字段边界。
+- cold object 多 SoA 定长数组已用 combined kernel 覆盖；后续不要再把 `fieldInt0..fieldInt7` 这类标量压扁当成通过。
+- cold qualified call 必须在赋值目标解析前识别；`alias.Fn(...)` 不能落进 `alias.field =` 路径。
+- cold CSG statement scanner 不能把 bodyless `@importc fn` 后续缩进行当作函数体；无函数体声明只进符号表，后续 `const/type` block 必须留在顶层。
+- cold `std/result` 当前是 object 语义，不是 ADT；`IsErr/IsOk/Value/Error` 必须按 `ok/value/err.msg` 字段 offset lowering，`Result[T]` 要实例化 object layout 后再走 ABI。
+- cold imported object layout 必须在所有 imported types/enums 收集后统一 refine；否则跨 import enum/object 字段会停在 opaque，后续 call ABI 和 field offset 都会漂。
+- cold Darwin 参数 ABI 超过 `x0-x7` 后必须显式 outgoing stack，并在 callee 从 `FP+16+offset` 读；不能继续用“最多 8 参数”的旧约束挡住 backend driver。
+- cold Mach-O 入口 wrapper 若用 `bl main`，必须先保存入口 `LR` 再恢复；否则 `main` 返回后 wrapper 的 `ret` 会跳回 wrapper 内部。
+- cold reachable imported path 函数是源码闭包/外部 ABI 问题；禁止把 `PathAbsolute/PathJoin/FileExistsNonEmpty/WriteTextFile` 临时降成 no-op 或 raw-return。
+- cold backend dispatch 的 syscall/stdlib/path bridge 过完后，下一层 blocker 会变成 `system_link_plan/parser/compiler_world` 源码闭包；禁止用空 `SystemLinkPlanStub` 或假 `missingReasons` 冒充通过。
+- cold `CompilerCsgTextSet` 若 ParserTextLookup layout 尚未进入符号表，只能实现自管 str-pair set 并保持 Insert 去重语义；不能把 Insert 改成 always-true。
+- cold `SystemLinkPlanStub` materializer 修完后要跑生成物自己的 `status` 路径；只看 cold 编译成功会漏掉运行态 plan/sequence/header 崩溃。
+- cold 重后端外部函数未进入源码闭包前只能运行时 `brk` 暴露；不能返回假成功 Result 或假 direct object。
+- cold plan 的 `str[]` 字段不要用未验证的 intrinsic 内部 `add` 构造；先保守零值，等动态序列逃逸语义稳定后再填 source/provider/runtime 列表。
+- cold `var str` 出参在 intrinsic 里可能表现为 `SLOT_STR` 或 `SLOT_STR_REF`；错误文本必须同时支持 copy 和 ref-store，否则生成 driver 会写出空 report。
+- cold 生成的 backend driver 必须验证失败路径 report 非空；只验证 `status` 不够，`system-link-exec` 的真实重后端边界也要能结构化失败。
+- cold `str[] add` 运行态扩容不能拿来承载新边界报告，除非先证明 mmap 失败检查和序列逃逸都稳定；否则会把 lower/primary 缺口变成崩溃。
+- cold `AfterCsg` 这类多参数复合函数的错误路径必须同时验 stderr 和 report sidecar；stderr 有文本但 report 缺失仍是失败。
+- cold `WriteTextFile(root,path,text)` 必须先按 root 解析 path；但 pre-CSG 能写、AfterCsg 不能写时，不要继续在路径层打补丁，要查参数/局部槽/错误路径。
+- cold 报告必须记录最大函数帧；`cold_max_frame_size` 进入 4KB 以上后，ARM64 prologue、local address、load/store offset 都必须补大立即数编码，不能继续依赖单条 imm12。
+- cold materializer 写 object field 前必须做 slot 边界检查；字段布局越界要在冷编译阶段 hard-fail，不能让生成物运行时污染相邻 slot。
 
 ## Resolved
 
