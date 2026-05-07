@@ -7319,13 +7319,15 @@ static int32_t parse_i32_array_literal(Parser *parser, BodyIR *body, Locals *loc
                                        int32_t *kind) {
     int32_t count = 0;
     int32_t element_slots[64];
+    int32_t element_kinds[64];
+    int32_t first_kind = SLOT_I32;
     while (!span_eq(parser_peek(parser), "]")) {
         if (count >= 64) die("cold array literal too large");
         int32_t value_kind = SLOT_I32;
         int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
-        /* accept any element type in array literals */
-        (void)value_kind;
+        if (count == 0) first_kind = value_kind;
         element_slots[count] = value_slot;
+        element_kinds[count] = value_kind;
         count++;
         if (span_eq(parser_peek(parser), ",")) {
             (void)parser_token(parser);
@@ -7335,10 +7337,19 @@ static int32_t parse_i32_array_literal(Parser *parser, BodyIR *body, Locals *loc
     }
     if (!parser_take(parser, "]")) die("expected ] after array literal");
     if (count <= 0) die("cold array literal cannot be empty without type");
-    int32_t payload_start = body->call_arg_count;
-    for (int32_t i = 0; i < count; i++) {
-        body_call_arg_with_offset(body, element_slots[i], i * 4);
+    if (first_kind == SLOT_STR || first_kind == SLOT_STR_REF) {
+        int32_t slot = body_slot(body, SLOT_SEQ_STR, 16);
+        body_slot_set_type(body, slot, cold_cstr_span("str[]"));
+        body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, -1, 0);
+        for (int32_t i = 0; i < count; i++)
+            body_op(body, BODY_OP_SEQ_STR_ADD, slot, element_slots[i], 0);
+        *kind = SLOT_SEQ_STR;
+        return slot;
     }
+    /* int32 array: original behavior */
+    int32_t payload_start = body->call_arg_count;
+    for (int32_t i = 0; i < count; i++)
+        body_call_arg_with_offset(body, element_slots[i], i * 4);
     int32_t slot = body_slot(body, SLOT_ARRAY_I32, align_i32(count * 4, 8));
     body_slot_set_array_len(body, slot, count);
     body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, payload_start, count);
@@ -7680,6 +7691,7 @@ static bool cold_try_str_join_intrinsic(BodyIR *body, Span name,
     if (arg_count != 2) die("Join intrinsic arity mismatch");
     int32_t items = body->call_arg_slot[arg_start];
     int32_t sep = body->call_arg_slot[arg_start + 1];
+    fprintf(stderr, "[DBG] Join items kind=%d\n", body->slot_kind[items]);
     if (body->slot_kind[items] != SLOT_SEQ_STR && body->slot_kind[items] != SLOT_SEQ_STR_REF) {
         die("Join items must be str[]");
     }
