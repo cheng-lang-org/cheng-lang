@@ -2472,7 +2472,20 @@ static bool cold_emit_csg_type_rows(FILE *file, Span source, bool warn_on_error)
                 if (span_eq(rhs, "ref")) continue;
 
                 /* --- rhs = tuple[...] --- */
-                if (cold_span_starts_with(rhs, "tuple[")) continue;
+                if (cold_span_starts_with(rhs, "tuple[")) {
+                    /* emit tuple as object */
+                    int32_t tb = cold_span_find_char(rhs, '[');
+                    int32_t te = rhs.len - 1;
+                    if (te >= 0 && rhs.ptr[te] == ']' && tb >= 0 && tb + 1 < te) {
+                        Span fields = span_trim(span_sub(rhs, tb + 1, te));
+                        fprintf(file, "cold_csg_object\t");
+                        cold_write_span(file, entry_name);
+                        fputs("\t", file);
+                        cold_emit_csg_object_specs(file, fields);
+                        fputc('\n', file);
+                    }
+                    continue;
+                }
 
                 /* --- rhs is variant spec on same line --- */
                 fprintf(file, "cold_csg_type\t");
@@ -2549,7 +2562,20 @@ static bool cold_emit_csg_type_rows(FILE *file, Span source, bool warn_on_error)
 
             if (span_eq(rhs, "ref")) goto check_progress;
 
-            if (cold_span_starts_with(rhs, "tuple[")) goto check_progress;
+            if (cold_span_starts_with(rhs, "tuple[")) {
+                /* single-line tuple: emit as object */
+                int32_t tb = cold_span_find_char(rhs, '[');
+                int32_t te = rhs.len - 1;
+                if (te >= 0 && rhs.ptr[te] == ']' && tb >= 0 && tb + 1 < te) {
+                    Span fields = span_trim(span_sub(rhs, tb + 1, te));
+                    fprintf(file, "cold_csg_object\t");
+                    cold_write_span(file, type_name);
+                    fputs("\t", file);
+                    cold_emit_csg_object_specs(file, fields);
+                    fputc('\n', file);
+                }
+                goto check_progress;
+            }
 
             /* rhs empty: variant block on following lines */
             if (rhs.len <= 0) {
