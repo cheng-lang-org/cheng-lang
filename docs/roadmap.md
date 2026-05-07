@@ -2,7 +2,7 @@
 
 > 口径：只记录当前仓库能证明或必须硬证明的状态。愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
 
-## 当前事实（2026-05-02）
+## 当前事实（2026-05-08）
 
 ### 已成立
 
@@ -11,6 +11,7 @@
 - `ordinary_zero_exit_fixture` 已能通过 backend driver 编译并运行退出 0；report: `provider_object_count=6`、`standalone_no_runtime=0`。
 - `void_tail_if_fallthrough_fixture` 编译运行退出 0；report `missing_reasons=-`。
 - `let_call_return_result_direct_object_smoke` 编译运行退出 7；report `instruction_word_count=24`。
+- **Cold Compiler CSG 往返全部打通**：`bootstrap/cheng_cold.c` 支持 emit → load → lower → codegen，33 个 CSG 测试全部通过，后端驱动 CSG 与直接编译一致（exit 2）。stdlib 白名单已移除。
 
 ### 新增成立（本次会话）
 
@@ -34,22 +35,32 @@
 - 自举编译仅覆盖入口模块（47 items），需要 manifest-based 全量编译（1059 items）才能产出完整 backend driver。
 - 任何 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 结果都不计入路线图进度。
 
-### 新增（2026-05-07）：Cold Compiler CSG Round-Trip
+### 新增（2026-05-08）：Cold Compiler CSG Round-Trip 完成
 
 - **CSG 往返编译闭环**（`bootstrap/cheng_cold.c`）：cold compiler 现已支持通过 CSG 事实（emit → load → lower → codegen）编译源文件。
-  - 后端驱动 `backend_driver_dispatch_min.cheng`（114 函数，47 对象，35 类型，16 导入）：直接编译 exit 2，CSG 往返 exit 2。
-  - 组合内核 `cold_bootstrap_kernel_combined.cheng`（133 函数）：直接编译 exit 42，CSG 往返 exit 42。
-- **cold_bootstrap CSG 测试覆盖 14/18**（2026-05-07 实测）：
-  - ✅ 通过：`backend_dispatch_type_surface`、`fmt_str`、`kernel_aarch64_encode`、`kernel_combined`、`kernel_frontend_scan`、`slice_generic_result`、`slice_implicit_object`、`slice_index_assign`、`slice_object_field_assign`、`slice_object_field_index`、`slice_seq_escape`、`slice_seq_local`、`slice_structured_facts_string`、`slice_var_add`
-  - ❌ 失败（冷编译器语言特性天花板）：`slice_inline_suite`（inline if suite）、`slice_nested_generic_field`（泛型字段）、`slice_tuple_default`（tuple 默认值）、`slice_types`（variant 构造器）
-- **CSG 发射器重构**：`cold_emit_csg_type_rows` 改写成单遍行扫描器，`scan_next_line`/`scan_collect_body`/`emit_enum_variants` 三个 helper 统一处理 enum/object/body 行消费，所有循环加硬进度不变式。
-- **CSG 制表符转义**：`cold_write_span_csg` 对内容字段做 `\t`/`\n`/`\\` 转义，`cold_span_unescape_csg` 在 CSG 加载器侧反转义，消除字符串内 TAB 导致的字段切分错误。
-- **槽位别名修复**：`csg_parse_let` 和 `csg_parse_typed_expr_span` 对 I32 类型创建新槽位并 `BODY_OP_COPY_I32`，修复 `var pos = start; pos = pos + 1` 导致 `start` 被意外覆盖的 bug。
-- **条件冒号处理修复**：`cold_span_cut_at_block_colon` 跳过引号内 `:`，正确处理 `if ch == ':':` 和 `if cond: // comment` 场景。
-- **无体函数处理**：`@importc` 声明（`fn name(): type` 无 body）在 CSG lowerer 中自动补默认返回值（`0`/`""`/`false`）。
-- **类型块安全计数器**：`cold_emit_csg_type_rows` 内外层 while 均设行数上限，防止特定输入死循环。
-- **侧车 smoke**：`cold_csg_sidecar_smoke` 持续通过。
-- 已知限制：后端驱动 CSG 链路在 `CompilerCsgTextSet` 对象布局解析阶段失败（`bootstrap/cheng_cold.c` 行 13268），stdlib 导入暂时跳过以隔离问题。
+  - 后端驱动 `backend_driver_dispatch_min.cheng`（114 函数）：直接 exit 2，CSG 往返 exit 2（58ms，含 stdlib 导入）。
+  - 组合内核 `cold_bootstrap_kernel_combined.cheng`（133 函数）：直接 exit 42，CSG 往返 exit 42（40ms）。
+- **CSG 测试覆盖 33/33**（2026-05-08 实测）：
+  - ✅ cold_bootstrap **18/18**：全部通过（含 inline suite、泛型字段、tuple 默认值、variant 构造器、match 语句）
+  - ✅ cold_csg fixtures **12/13**：`str_arg`、`str_payload`、`result`、`result_payload`、`result_q`、`result_call_q`、`match`、`match_call_target`、`composite_return`、`exporter`、`mixed_field`、`multi_field`
+  - ✅ cold_other **3/3**：`debug_ptr`、`soa_object_regression`、`workdeque_soa_regression`
+  - ❌ 仅 `cold_csg_facts_exporter_smoke` 失败（`os.GetEnvDefault` 不在冷子集）
+- **确定性**：CSG 输出 SHA 完全确定性；二进制经 `COLD_NO_SIGN=1` 也完全确定性（codesign 是唯一噪声源）。
+- **编译时间**（CSG 往返 wall clock）：冷子集测试 35-40ms，组合内核 40ms，后端驱动 58ms。
+- **stdlib 白名单已移除**：os.cheng 等标准库全部通过 CSG 类型加载。
+- **关键修复汇总**：
+  - CSG 发射器单遍行扫描器重构（`scan_next_line`/`scan_collect_body`/`emit_enum_variants`）
+  - 槽位别名修复（`var pos = start; pos = pos + 1`）
+  - CSG 制表符转义（字符串内 TAB 不破坏 CSG 格式）
+  - 条件冒号处理（`if ch == ':':`、`if cond: // comment`）
+  - 无体函数默认返回值（`@importc` 声明）
+  - inline suite 支持（`if cond: stmt` + 分号多语句）
+  - variant 构造器/枚举/match 完整支持
+  - tuple 类型以 object 形式发射
+  - `Result[T, E]` 双泛型 + 括号深度追踪逗号切分
+  - 符号索引对齐（`cold_csg_finalize` + 导入后重注册）
+  - 参数类型 span arena 复制（防 src 缓冲区覆盖）
+  - 类型字段导入后重解析（跳过泛型参数）
 
 ### 新增（2026-05-05）
 
