@@ -4268,7 +4268,10 @@ static void cold_usage(void) {
     puts("  cheng_cold compile-bootstrap --in:<path> --out:<path> [--report-out:<path>]");
     puts("  cheng_cold bootstrap-bridge [--in:<path>] [--out-dir:<path>]");
     puts("  cheng_cold build-backend-driver [--in:<contract>] [--out:<path>] [--out-dir:<dir>] [--report-out:<path>] [--map-out:<path>] [--index-out:<path>]");
-    puts("  cheng_cold system-link-exec --in:<source> [--csg-in:<facts>|--csg-out:<facts>] --out:<path> [--emit:exe] [--target:arm64-apple-darwin] [--report-out:<path>]");
+    puts("  cheng_cold system-link-exec --in:<source> [--csg-in:<facts>|--csg-out:<facts>] --out:<path> [--emit:exe|obj|csg] [--target:arm64-apple-darwin] [--report-out:<path>]");
+    puts("    --emit:exe   produce standalone executable (default)");
+    puts("    --emit:obj   emit CSG facts as intermediate object representation");
+    puts("    --emit:csg   same as --emit:obj");
     puts("  reserved backend commands hard-fail until their real paths exist");
     puts("  cheng_cold <out> [source]");
 }
@@ -16225,11 +16228,27 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         fprintf(stderr, "[cheng_cold] unsupported target: %s\n", target);
         return 2;
     }
-    if (strcmp(emit, "exe") != 0) {
+    if (strcmp(emit, "exe") != 0 && strcmp(emit, "obj") != 0 && strcmp(emit, "csg") != 0) {
         cold_write_system_link_exec_report(report_path, false, source_path, effective_csg_path, out_path,
                                            target, emit, 0, "unsupported emit");
         fprintf(stderr, "[cheng_cold] unsupported emit: %s\n", emit);
         return 2;
+    }
+    /* --emit:obj / --emit:csg = emit CSG facts as intermediate representation */
+    if (strcmp(emit, "obj") == 0 || strcmp(emit, "csg") == 0) {
+        if (!source_path || source_path[0] == '\0') {
+            cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
+                                               target, emit, 0, "missing --in for emit:obj/csg");
+            return 2;
+        }
+        if (!cold_emit_csg_facts_from_source_path(source_path, out_path)) {
+            cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
+                                               target, emit, 0, "cold csg emit failed");
+            return 2;
+        }
+        cold_write_system_link_exec_report(report_path, true, source_path, effective_csg_path, out_path,
+                                           target, emit, 0, "");
+        return 0;
     }
     if (csg_out_path && csg_out_path[0] != '\0') {
         if (!cold_emit_csg_facts_from_source_path(source_path, csg_out_path)) {
