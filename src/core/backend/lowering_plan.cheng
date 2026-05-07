@@ -2,6 +2,9 @@ import std/result
 import std/strformat
 import std/strutils as strutil
 import std/os
+import std/atomic
+import std/async_rt as async
+import std/thread
 import cheng/std/bytes_layout as layout
 import cheng/core/tooling/path as chengpath
 import cheng/core/tooling/compiler_world as cworld
@@ -10,8 +13,6 @@ import cheng/core/lang/intern as langintern
 import cheng/core/lang/parser
 import cheng/core/lang/typed_expr as texpr
 import cheng/core/backend/system_link_plan as slplan
-import cheng/core/ir/function_task as ftask
-import cheng/core/ir/function_task_executor as ftexec
 
 type
     PrimaryObjectIrStatement =
@@ -1453,70 +1454,79 @@ fn LoweringBuildPrimaryObjectIr(plan: LoweringPlanStub,
         add(ir.functions, fnIr)
     return ir
 
-# -- Parallel lowering via function-task work-stealing executor ------------------
+# -- Parallel lowering via atomic counter + async.spawn (no circular imports) ---
 
-var loweringTaskSharedPlan: LoweringPlanStub
-var loweringTaskSharedSourceTexts: texpr.TypedExprSourceText[]
-var loweringTaskLetCallReturnLiteralStart: int32
-var loweringTaskBuiltFunctions: PrimaryObjectIrFunction[]
+var loweringParallelPlan: LoweringPlanStub
+var loweringParallelSourceTexts: texpr.TypedExprSourceText[]
+var loweringParallelLetCallReturnLiteralStart: int32
+var loweringParallelBuiltFunctions: PrimaryObjectIrFunction[]
+var loweringParallelNextIndex: atomic.I32
+var loweringParallelDoneCount: atomic.I32
+var loweringParallelFuncCount: int32
+var loweringParallelWorkerCount: int32
 
-fn LoweringTaskExecuteOne(task: ftask.FunctionTask): ftask.FunctionTaskResult =
-    var result = ftask.FunctionTaskResultEmpty(task.funcIndex)
-    if task.funcIndex < 0 || task.funcIndex >= loweringTaskSharedPlan.functionNames.len:
-        ftask.FunctionTaskPlanAppendDiag(result, "lowering_task_index_out_of_range")
-        return result
-    let fnIr = LoweringBuildOneFunction(loweringTaskSharedPlan,
-                                         loweringTaskSharedSourceTexts,
-                                         task.funcIndex,
-                                         loweringTaskLetCallReturnLiteralStart)
-    # Store the built function in the shared results array
-    loweringTaskBuiltFunctions[task.funcIndex] = fnIr
-    result.outputKind = ftask.FunctionTaskResultKindBodyIr()
-    result.outputI32Value = task.funcIndex
-    return result
+fn LoweringParallelWorkerMain(workerId: int32) =
+    while true:
+        let i = atomic.FetchAddI32(loweringParallelNextIndex, 1)
+        if i >= loweringParallelFuncCount:
+            break
+        loweringParallelBuiltFunctions[i] = LoweringBuildOneFunction(
+            loweringParallelPlan,
+            loweringParallelSourceTexts,
+            i,
+            loweringParallelLetCallReturnLiteralStart)
+    let _ = atomic.AddI32(loweringParallelDoneCount, 1)
 
 fn LoweringBuildPrimaryObjectIrParallel(plan: LoweringPlanStub,
                                          sourceTexts: texpr.TypedExprSourceText[],
                                          jobCount: int32): PrimaryObjectIr =
-    if plan.functionNames.len <= 0:
+    let funcCount = plan.functionNames.len
+    if funcCount <= 0:
         return PrimaryObjectIr()
     if jobCount <= 1:
         return LoweringBuildPrimaryObjectIr(plan, sourceTexts)
 
-    # Set up shared state for worker tasks (read-only after setup)
-    loweringTaskSharedPlan = plan
-    loweringTaskSharedSourceTexts = sourceTexts
-    loweringTaskLetCallReturnLiteralStart = texpr.BodyKindLetCallReturnI32ConstPrefixLen
-    loweringTaskBuiltFunctions = []
-    for i in 0..<plan.functionNames.len:
-        add(loweringTaskBuiltFunctions, PrimaryObjectIrFunction())
+    # Cap workers to function count
+    var workerCount = jobCount
+    if workerCount > funcCount:
+        workerCount = funcCount
 
-    # Wire the executor to call our task runner
-    ftexec.loweringTaskRunFn = LoweringTaskExecuteOne
+    # Set up shared read-only state
+    loweringParallelPlan = plan
+    loweringParallelSourceTexts = sourceTexts
+    loweringParallelLetCallReturnLiteralStart = texpr.BodyKindLetCallReturnI32ConstPrefixLen
+    loweringParallelFuncCount = funcCount
+    loweringParallelWorkerCount = workerCount
 
-    # Build task plan
-    var taskPlan: ftask.FunctionTaskPlan
-    taskPlan.schedule = ftask.FunctionTaskScheduleWorkStealing
-    taskPlan.jobCount = jobCount
-    for i in 0..<plan.functionNames.len:
-        var task = ftask.FunctionTask(funcIndex: i,
-                                       declOrdinal: i,
-                                       costHint: ftask.FunctionTaskCostHintDefault())
-        add(taskPlan.tasks, task)
+    # Pre-allocate result array
+    loweringParallelBuiltFunctions = []
+    for i in 0..<funcCount:
+        add(loweringParallelBuiltFunctions, PrimaryObjectIrFunction())
 
-    # Execute (auto-routes to work-stealing when jobCount > 1)
-    let _ = ftexec.FunctionTaskExecuteAuto(taskPlan)
+    # Atomic counter and done count
+    loweringParallelNextIndex = atomic.NewI32(0)
+    loweringParallelDoneCount = atomic.NewI32(0)
 
-    # Collect results from shared array into PrimaryObjectIr
+    # Spawn worker threads (main thread works too)
+    for w in 1..<workerCount:
+        async.spawn(LoweringParallelWorkerMain, w)
+
+    # Main thread participates
+    LoweringParallelWorkerMain(0)
+
+    # Wait for all workers to finish
+    while atomic.LoadI32(loweringParallelDoneCount) < workerCount:
+        thread.Yield()
+
+    # Collect results
     var ir: PrimaryObjectIr
-    for i in 0..<plan.functionNames.len:
-        add(ir.functions, loweringTaskBuiltFunctions[i])
+    for i in 0..<funcCount:
+        add(ir.functions, loweringParallelBuiltFunctions[i])
 
-    # Unwire executor and release shared state
-    ftexec.loweringTaskRunFn = nil
-    loweringTaskSharedPlan = LoweringPlanStub()
-    loweringTaskSharedSourceTexts = []
-    loweringTaskBuiltFunctions = []
+    # Release shared state
+    loweringParallelPlan = LoweringPlanStub()
+    loweringParallelSourceTexts = []
+    loweringParallelBuiltFunctions = []
 
     return ir
 
