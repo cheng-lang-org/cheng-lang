@@ -17231,25 +17231,27 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
-        /* Import body compilation: works reliably for <500-symbol tables.
-           Above 500, codegen may crash on imported functions with unsupported
-           return types. The 500 cap is pragmatic until all codegen paths have
-           fallback stubs. import_mode + safe_memcmp infrastructure is ready
-           for full enablement once the remaining codegen dies are converted. */
+        /* Import body compilation: enabled for tables < 500 symbols.
+           The 500 cap is a capability boundary: import_mode + selective return
+           filter protect against arena corruption and unsupported returns,
+           but some imports trigger die() during body parsing (intrinsic
+           mismatches) that the per-function recovery handles. Removing the
+           cap requires fixing those intrinsic paths to handle edge cases. */
         if (symbols->function_count < 500) {
-            ColdErrorRecoveryEnabled = true;
-            if (setjmp(ColdErrorJumpBuf) == 0) {
-                cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
-            }
-            ColdErrorRecoveryEnabled = false;
+        ColdErrorRecoveryEnabled = true;
+        if (setjmp(ColdErrorJumpBuf) == 0) {
+            cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
         }
-        /* If any import had SEGV, arena may be corrupted. Clear imported bodies
-           to prevent codegen from crashing on corrupted data. */
+        ColdErrorRecoveryEnabled = false;
+        }
+        /* If any import had SEGV, skip import body compilation results.
+           Per-function setjmp recovery already skipped individual bad functions;
+           this clears the rest because the arena may be corrupted globally. */
         if (ColdImportSegvSaw) {
             ColdImportSegvSaw = 0;
-            /* Zero out all function_bodies entries that were set by imports.
-               Entry module functions (before symbol_count_at_entry) are untouched. */
-            for (int32_t i = 0; i < body_cap; i++) {
+            /* Only clear function bodies at indices >= the entry module's function
+               count (import signatures start after entry signatures). */
+            for (int32_t i = symbols->function_count; i < body_cap; i++) {
                 function_bodies[i] = NULL;
             }
         }
