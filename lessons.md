@@ -62,6 +62,7 @@
 - cold `WriteTextFile(root,path,text)` 必须先按 root 解析 path；但 pre-CSG 能写、AfterCsg 不能写时，不要继续在路径层打补丁，要查参数/局部槽/错误路径。
 - cold 报告必须记录最大函数帧；`cold_max_frame_size` 进入 4KB 以上后，ARM64 prologue、local address、load/store offset 都必须补大立即数编码，不能继续依赖单条 imm12。
 - cold materializer 写 object field 前必须做 slot 边界检查；字段布局越界要在冷编译阶段 hard-fail，不能让生成物运行时污染相邻 slot。
+- 用户已有代码不删；不确定归属的分支/函数只做旁路修复或严格检查，不能为收敛路线图直接移除。
 
 ## Resolved
 

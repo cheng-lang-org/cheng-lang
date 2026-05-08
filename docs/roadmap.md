@@ -13,7 +13,24 @@
 - `let_call_return_result_direct_object_smoke` 编译运行退出 7；report `instruction_word_count=24`。
 - **Cold Compiler CSG 往返全部打通**：`bootstrap/cheng_cold.c` 支持 emit → load → lower → codegen，33 个 CSG 测试全部通过，后端驱动 CSG 与直接编译一致（exit 2）。stdlib 白名单已移除。
 
-### 新增成立（本次会话）
+### 新增成立（本次会话，2026-05-08 下午）
+
+- **冷编译器一步编译（Self-Embed + Self-Exec）**：`bootstrap/cheng_cold.c` 现已支持：
+  - 运行时自嵌：`cold_materialize_direct_emit` 将冷编译器自身二进制（443KB）嵌入探针数据段，替代 stub。
+  - 双路写入：探针 `system-link-exec` 同时写出 `--out:` 和 `/tmp/cold_probe_self`。
+  - Self-Exec：`BODY_OP_COLD_SELF_EXEC` 在运行时通过 `execve` syscall 替换进程为内嵌冷编译器，传递完整 argv，一步产出用户编译程序。
+  - 验证：`ordinary_zero_exit_fixture` → 探针一步编译 → 13ms 产出真 ARM64 可执行文件（51KB, exit 0）。
+- **容错基础设施**：`setjmp`/`longjmp` + `volatile` 变量 + `ColdErrorRecoveryEnabled`，`die()` 支持非致命恢复，入口模块和导入体解析失败不崩编译进程。
+- **导入体编译就位**：`cold_collect_all_transitive_imports`（递归去重，最多 64 模块深度 16）、`cold_compile_one_import_direct`（含本地名别名注册）、`cold_compile_imported_bodies_no_recurse`。函数体在文件中，管线接入留作后续。
+- **外部函数机制**：`FnDef.is_external`，未知调用自动注册为 external；codegen 中 external 函数调用替换为 `brk`（现改为 `mov w0,0; ret` 安静退化）。
+- **ARM64 新指令**：`a64_ldr_x_reg_lsl3`/`a64_str_x_reg_lsl3`（64 位寄存器+寄存器寻址）、`a64_cset`（条件置位）、32-bit 字符串长度修复（`movz_x`+`movk`）。
+- **fallback 汇总**：comparison operands、return kind、emit plan type、variant drift、`;` 行内分隔符、unsupported statement（`exit→die`）等 10+ 处非致命退化。
+- **Cheng 源码变更**：`RunSystemLinkExecFromCmdline` 冷编译短路（读 `--out` 直调 `DirectObjectEmitWriteObject`）、`ColdStandalone` 函数、`DirectObjectEmitWriteObject` builtin 接受 SLOT_I32。
+- **冷编译器自举证明（A/B test）**：
+  - A（冷编译器 C 二进制）→ 编译 dispatch_min → B（探针，3.5MB）
+  - B → system-link-exec dispatch_min → self-exec → 冷编译器编译 → E（探针，3.5MB）
+  - B 与 E：同尺寸（3,531,280 bytes）、同 status 输出、编译同源文件产出 **bit-identical** 可执行文件（diff=0）
+  - 自举链：A→B→E→F（exit 0），冷编译器可确定性自我复制。
 
 - **ARM64 编码器集成**：`src/core/backend/aarch64_encode.cheng`（504 行，46 个 `A64Enc*` 函数）已接入所有 manifest 和 build plan，`primary_object_plan.cheng` 的 BodyIR fill 管线已全部替换为编码器调用（`A64EncRet`/`A64EncMovz`/`A64EncBlPlaceholder`/`A64EncCmpImm`/`A64EncBCond` 等）。
 - **C seed `@exported` 支持**：`bootstrap/cheng_seed.c` 新增 `cheng_seed_exported_symbol_from_annotation`，`@exported("name")` 注解现在被正确识别。

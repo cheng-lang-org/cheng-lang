@@ -215,3 +215,6 @@
 - object field store 必须检查 `field.offset + field.size <= object slot size`；materializer 写结构化 CSG/lowering/primary plan 时，越界应在冷编译阶段硬失败，不能等生成物运行时污染相邻槽。
 - `pobj/direct` 当前仍必须运行时 `brk` 暴露，不能返回成功对象或空对象继续执行；等 lowering 真正接通后再逐层替换为真实 Cheng body/materializer。
 - cold 编出 `backend_driver_dispatch_min_probe` 后必须跑生成物 `status`；只看 cold compiler 输出 `system_link_exec=1` 不足以证明 plan materializer 可运行。
+- source-direct 导入加载不能混用旧 CSG type-row loader；旧 loader 不带 alias，会把 `result.ErrorInfo` 这类导入布局按短名写进全局 `ErrorInfo`，破坏 Result/Error intrinsic。添加/import 必须精确查找，resolve 才允许短名回退。
+- direct import body 编译后，linkerless image 不能全量 codegen 所有有 body 的导入函数；必须从入口 BodyIR call 图计算可达闭包，否则未被运行路径使用的 std/backend 函数会把冷端尚未支持的语义带入 codegen。
+- `setjmp` 恢复点必须从当前函数下一行继续找下一个 top-level decl；从函数起点调用 `cold_next_top_level_decl` 会回到同一个 `fn`，形成无限重试和 stderr/arena 膨胀。

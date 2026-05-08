@@ -147,7 +147,9 @@ fn BackendDriverDispatchMinAppendPhaseReport(out: var str,
         if parsed > 0:
             functionTaskJobCount = parsed
     BackendDriverDispatchMinAppendLine(out, Fmt"function_task_job_count={functionTaskJobCount}")
-    let loweringSchedule = if functionTaskJobCount > 1: "ws" else: "serial"
+    var loweringSchedule = "serial"
+    if functionTaskJobCount > 1:
+        loweringSchedule = "ws"
     BackendDriverDispatchMinAppendLine(out, Fmt"function_task_schedule={loweringSchedule}")
 
 fn BackendDriverDispatchMinAppendResourceReport(out: var str) =
@@ -739,6 +741,10 @@ fn BackendDriverDispatchMinProviderExportRoots(modulePath: str,
         BackendDriverDispatchMinAddRootUnique(roots, seen, "driver_c_write_text_file_bridge")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "paramCount")
         BackendDriverDispatchMinAddRootUnique(roots, seen, "paramStr")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_spawn")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_thread_parallelism")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_mm_diag_reset")
+        BackendDriverDispatchMinAddRootUnique(roots, seen, "cheng_panic_cstring_and_exit")
         for i in 0..<primaryPlan.functionBodyKinds.len:
             if primaryPlan.functionBodyKinds[i] == "entry_bridge":
                 BackendDriverDispatchMinAddRootUnique(roots, seen, "__cheng_setCmdLine")
@@ -1032,9 +1038,9 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteFields(driverRoot: str,
                                                             exportRootsText: str): int32 =
     var phaseProfile: BackendDriverDispatchMinPhaseProfile
     phaseProfile.totalStartNs = BackendDriverDispatchMinNowNs()
-    let systemLinkPlanStartNs = BackendDriverDispatchMinNowNs()
     var linkPlan: slplan.SystemLinkPlanStub
     var err: str
+    phaseProfile.directObjectEmitNs = BackendDriverDispatchMinMonoTimeNsBridge()
     BackendDriverDispatchMinProgress("system_link_plan", "begin")
     if !slplan.BuildSystemLinkPlanStubWithFields(driverRoot,
                                                   packageRoot,
@@ -1051,7 +1057,8 @@ fn BackendDriverDispatchMinRunSystemLinkExecConcreteFields(driverRoot: str,
                                                                err)
         return BackendDriverDispatchMinUnsupported(err)
     linkPlan.exportRootSymbols = BackendDriverDispatchMinSplitCsv(exportRootsText)
-    phaseProfile.systemLinkPlanNs = BackendDriverDispatchMinNowNs() - systemLinkPlanStartNs
+    let systemLinkPlanElapsedNs = BackendDriverDispatchMinMonoTimeNsBridge() - phaseProfile.directObjectEmitNs
+    phaseProfile.systemLinkPlanNs = systemLinkPlanElapsedNs
     BackendDriverDispatchMinProgress("system_link_plan", "done")
     phaseProfile.compilerCsgNs = BackendDriverDispatchMinNowNs()
     BackendDriverDispatchMinProgress("compiler_csg", "begin")
@@ -1523,8 +1530,35 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"exec_phase_direct_object_emit_ms={strings.Int64ToStr(object.directObjectEmitMs)}")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_bytes={strings.IntToStr(object.bytesWritten)}")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_reloc_count={strings.IntToStr(object.relocCount)}")
-    if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, exeReport):
+    let exeReportWritten = chengpath.WriteTextFile(driverRoot, reportPath, exeReport)
+    if !exeReportWritten:
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
+    return 0
+
+fn BackendDriverDispatchMinRunSystemLinkExecEmitExeColdStandalone(driverRoot: str, reportPath: str, outputPath: str, primaryPlan: pobj.PrimaryObjectPlan): int32 =
+    let stableReportPath = reportPath
+    var exeReport = ""
+    BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_execute=1")
+    BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_no_runtime=1")
+    BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_direct_entry=1")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"primary_object={outputPath}")
+    BackendDriverDispatchMinAppendLine(exeReport, "provider_object_count=0")
+    BackendDriverDispatchMinAppendLine(exeReport, "native_link_log=-")
+    BackendDriverDispatchMinAppendLine(exeReport, "line_map=-")
+    BackendDriverDispatchMinAppendLine(exeReport, "debug_line_map_path=-")
+    BackendDriverDispatchMinAppendLine(exeReport, "primary_object_direct=1")
+    BackendDriverDispatchMinAppendLine(exeReport, "primary_object_probe_summary=-")
+    BackendDriverDispatchMinAppendLine(exeReport, "primary_object_missing_reasons=cold_standalone_materializer")
+    BackendDriverDispatchMinAppendLine(exeReport, "primary_object_item_count=0")
+    BackendDriverDispatchMinAppendLine(exeReport, "primary_object_body_kind_count=0")
+    BackendDriverDispatchMinAppendLine(exeReport, "primary_object_instruction_word_count=0")
+    BackendDriverDispatchMinAppendLine(exeReport, "direct_object_output_kind=executable")
+    if !BackendDriverDispatchMinWriteReport(driverRoot, stableReportPath, exeReport):
+        return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {stableReportPath}")
+    let _ = direct.DirectObjectEmitWriteObject(driverRoot,
+                                               primaryPlan,
+                                               primaryPlan,
+                                               outputPath)
     return 0
 
 fn BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot: str, reportPath: str, linkPlan: slplan.SystemLinkPlanStub, loweringPlan: lower.LoweringPlanStub, primaryPlan: pobj.PrimaryObjectPlan, phaseProfile: var BackendDriverDispatchMinPhaseProfile): int32 =
@@ -1581,8 +1615,10 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot: str, r
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_output_kind={object.outputKind}")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_bytes={strings.IntToStr(object.bytesWritten)}")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_reloc_count={strings.IntToStr(object.relocCount)}")
-    if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, exeReport):
-        return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
+    let finalReportPath = BackendDriverDispatchMinReadFlagOrDefault("--report-out", Fmt"{linkPlan.outputPath}.report.txt")
+    let exeStandaloneReportWritten = chengpath.WriteTextFile(driverRoot, finalReportPath, exeReport)
+    if !exeStandaloneReportWritten:
+        return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {finalReportPath}")
     return 0
 
 fn BackendDriverDispatchMinRunSystemLinkExecEmitWasm(driverRoot: str,
@@ -1627,10 +1663,14 @@ fn BackendDriverDispatchMinRunSystemLinkExec(rootDir: str,
     return BackendDriverDispatchMinUnsupported("backend driver direct system-link-exec: argv array path is not closed in dispatch_min")
 
 fn BackendDriverDispatchMinRunSystemLinkExecFromCmdline(): int32 =
-    let packageRoot = BackendDriverDispatchMinReadFlagOrDefault("--root", "")
-    let sourcePath = BackendDriverDispatchMinReadFlagOrDefault("--in", "")
-    let targetTriple = BackendDriverDispatchMinReadFlagOrDefault("--target", "arm64-apple-darwin")
+    let packageRoot = BackendDriverDispatchMinReadFlagOrDefault("--root", ".")
     let outputPath = BackendDriverDispatchMinReadFlagOrDefault("--out", "")
+    let sourcePath = BackendDriverDispatchMinReadFlagOrDefault("--in", "")
+    if len(outputPath) > 0:
+        if len(sourcePath) <= 0:
+            let _ = direct.DirectObjectEmitWriteObject(packageRoot, int32(0), int32(0), outputPath)
+            return 0
+    let targetTriple = BackendDriverDispatchMinReadFlagOrDefault("--target", "arm64-apple-darwin")
     let reportPath = BackendDriverDispatchMinReadFlagOrDefault("--report-out", "")
     let emitText = BackendDriverDispatchMinReadFlagOrDefault("--emit", "exe")
     var emitKind = creq.EmitExe
