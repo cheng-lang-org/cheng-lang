@@ -16178,6 +16178,122 @@ static bool cold_write_system_link_exec_report(const char *path,
     return true;
 }
 
+/* Compile source to Mach-O object file (.o) with symbol table */
+static bool cold_compile_source_to_object(const char *out_path, const char *src_path) {
+    Arena *arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (arena == MAP_FAILED) return false;
+
+    Symbols *symbols = symbols_new(arena);
+    BodyIR **function_bodies = 0;
+    int32_t body_cap = 0;
+    int32_t main_function = -1;
+    int32_t first_function = -1;
+
+    Span mapped_source = source_open(src_path);
+    if (mapped_source.len <= 0) return false;
+
+    cold_collect_imported_function_signatures(symbols, mapped_source);
+    cold_collect_function_signatures(symbols, mapped_source);
+    { /* workspace root detection for import loading */
+      char ws_root[PATH_MAX] = {0};
+      const char *sm = strstr(src_path, "/src/");
+      if (!sm) sm = strstr(src_path, "src/");
+      if (sm == src_path) { char rp[PATH_MAX]; if (realpath(src_path, rp)) { const char *s = strstr(rp, "/src/"); if (s) { size_t rl = (size_t)(s - rp); memcpy(ws_root, rp, rl); ws_root[rl] = 0; } } }
+      else if (sm) { size_t rl = (size_t)(sm - src_path); if (rl < sizeof(ws_root)) { memcpy(ws_root, src_path, rl); ws_root[rl] = 0; } }
+      if (ws_root[0]) cold_compile_csg_load_imported_types(ws_root, mapped_source, symbols, arena);
+    }
+    body_cap = symbols->function_cap;
+    function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
+    Parser parser = {mapped_source, 0, arena, symbols};
+    while (parser.pos < mapped_source.len) {
+        parser_ws(&parser);
+        if (parser.pos >= mapped_source.len) break;
+        Span next = parser_peek(&parser);
+        if (span_eq(next, "type")) {
+            parse_type(&parser);
+        } else if (span_eq(next, "const")) {
+            parse_const(&parser);
+        } else if (span_eq(next, "fn")) {
+            int32_t symbol_index = -1;
+            BodyIR *body = parse_fn(&parser, &symbol_index);
+            if (symbol_index >= 0 && symbol_index < body_cap) {
+                function_bodies[symbol_index] = body;
+                if (first_function < 0) first_function = symbol_index;
+                if (span_eq(symbols->functions[symbol_index].name, "main"))
+                    main_function = symbol_index;
+            }
+        } else {
+            parser_line(&parser);
+        }
+    }
+
+    if (first_function < 0) {
+        munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
+        return false;
+    }
+
+    /* Collect function names, offsets, and compile each function individually */
+    int32_t func_count = symbols->function_count;
+    int32_t total_words = 0;
+    int32_t *func_offsets = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    const char **func_names = arena_alloc(arena, (size_t)func_count * sizeof(const char *));
+    Code **func_codes = arena_alloc(arena, (size_t)func_count * sizeof(Code *));
+
+    FunctionPatchList function_patches = {0};
+    function_patches.arena = arena;
+
+    int32_t valid_count = 0;
+    for (int32_t i = 0; i < func_count; i++) {
+        if (!function_bodies[i]) continue;
+        Code *fc = code_new(arena, 128);
+        func_offsets[valid_count] = total_words;
+        /* Copy the function name (the Span points to mmap'd source, make a C string copy) */
+        Span nm = symbols->functions[i].name;
+        char *name_copy = arena_alloc(arena, (size_t)nm.len + 1);
+        memcpy(name_copy, nm.ptr, (size_t)nm.len);
+        name_copy[nm.len] = '\0';
+        func_names[valid_count] = name_copy;
+        func_codes[valid_count] = fc;
+        codegen_func(fc, function_bodies[i], symbols, &function_patches);
+        total_words += fc->count;
+        valid_count++;
+    }
+
+    /* Apply inter-function patches (bl instructions within the same object) */
+    for (int32_t pi = 0; pi < function_patches.count; pi++) {
+        FunctionPatch patch = function_patches.items[pi];
+        if (patch.target_function < 0 || patch.target_function >= func_count) continue;
+        /* Find which code segment the patch is in */
+        for (int32_t ci = 0; ci < valid_count; ci++) {
+            Code *fc = func_codes[ci];
+            if (patch.pos >= 0 && patch.pos < fc->count) {
+                int32_t target_off = func_offsets[patch.target_function];
+                int32_t delta = target_off - patch.pos;
+                uint32_t ins = fc->words[patch.pos];
+                fc->words[patch.pos] = (ins & 0xFC000000u) | ((uint32_t)delta & 0x03FFFFFFu);
+                break;
+            }
+        }
+    }
+
+    /* Concatenate all code into a single array */
+    uint32_t *all_code = arena_alloc(arena, (size_t)total_words * sizeof(uint32_t));
+    int32_t wp = 0;
+    for (int32_t ci = 0; ci < valid_count; ci++) {
+        Code *fc = func_codes[ci];
+        memcpy(all_code + wp, fc->words, (size_t)fc->count * sizeof(uint32_t));
+        wp += fc->count;
+    }
+
+    bool ok = macho_write_object(out_path, all_code, total_words,
+                                 func_names, func_offsets, valid_count);
+    munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
+    return ok;
+}
+
+static bool cold_compile_source_to_object(const char *out_path, const char *src_path);
+
 static int cold_cmd_system_link_exec(int argc, char **argv) {
     const char *source_path = cold_flag_value(argc, argv, "--in");
     const char *csg_in_path = cold_flag_value(argc, argv, "--csg-in");
@@ -16234,11 +16350,27 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         fprintf(stderr, "[cheng_cold] unsupported emit: %s\n", emit);
         return 2;
     }
-    /* --emit:obj / --emit:csg = emit CSG facts as intermediate representation */
-    if (strcmp(emit, "obj") == 0 || strcmp(emit, "csg") == 0) {
+    /* --emit:obj = emit real Mach-O object file (.o) with symbols */
+    if (strcmp(emit, "obj") == 0) {
         if (!source_path || source_path[0] == '\0') {
             cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
-                                               target, emit, 0, "missing --in for emit:obj/csg");
+                                               target, emit, 0, "missing --in for emit:obj");
+            return 2;
+        }
+        if (!cold_compile_source_to_object(out_path, source_path)) {
+            cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
+                                               target, emit, 0, "cold object emit failed");
+            return 2;
+        }
+        cold_write_system_link_exec_report(report_path, true, source_path, out_path, out_path,
+                                           target, emit, 0, "");
+        return 0;
+    }
+    /* --emit:csg = emit CSG facts as intermediate representation */
+    if (strcmp(emit, "csg") == 0) {
+        if (!source_path || source_path[0] == '\0') {
+            cold_write_system_link_exec_report(report_path, false, source_path, out_path, out_path,
+                                               target, emit, 0, "missing --in for emit:csg");
             return 2;
         }
         if (!cold_emit_csg_facts_from_source_path(source_path, out_path)) {
@@ -16246,7 +16378,7 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
                                                target, emit, 0, "cold csg emit failed");
             return 2;
         }
-        cold_write_system_link_exec_report(report_path, true, source_path, effective_csg_path, out_path,
+        cold_write_system_link_exec_report(report_path, true, source_path, out_path, out_path,
                                            target, emit, 0, "");
         return 0;
     }

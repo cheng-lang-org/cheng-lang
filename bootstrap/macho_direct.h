@@ -23,6 +23,7 @@
 
 /* Mach-O constants */
 #define MH_MAGIC_64   0xFEEDFACF
+#define MH_OBJECT     1
 #define MH_EXECUTE    2
 #define LC_SEGMENT64  0x19
 #define LC_MAIN       0x80000028
@@ -56,7 +57,7 @@ static bool macho_init(MachOWriter *mw, int32_t code_words, int32_t code_size) {
     /* Layout: [header 32] [load commands] [padding to 728] [code] [padding to page] [LINKEDIT page] */
     int32_t text_file_size = macho_align_i32(728 + code_size, PAGE_SIZE);
     mw->cap = text_file_size + PAGE_SIZE;
-    mw->buf = calloc(1, mw->cap);
+    mw->buf = (uint8_t *)calloc(1, mw->cap);
     if (!mw->buf) return false;
     mw->len = 0;
     
@@ -269,4 +270,127 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
     
     macho_write_text(&mw, code, code_words);
     return macho_finalize(&mw, path);
+}
+
+/* -- Mach-O object file (.o) writer (MH_OBJECT) -- */
+
+#define N_SECT 0x0E
+#define N_EXT  0x01
+
+typedef struct {
+    uint32_t n_strx;
+    uint8_t  n_type;
+    uint8_t  n_sect;
+    int16_t  n_desc;
+    uint64_t n_value;
+} nlist_64_t;
+
+static bool macho_write_object(const char *path,
+                               const uint32_t *code, int32_t code_words,
+                               const char **names, const int32_t *offsets,
+                               int32_t name_count) {
+    int32_t code_sz = code_words * 4;
+
+    /* Build string table first to know its size */
+    char strtab[4096];
+    int32_t str_off = 1; /* first byte is \0 */
+    int32_t name_stroff[128];
+    for (int32_t i = 0; i < name_count && i < 128; i++) {
+        name_stroff[i] = str_off;
+        int32_t nl = (int32_t)strlen(names[i]);
+        if (str_off + nl + 2 < (int32_t)sizeof(strtab)) {
+            strtab[str_off++] = '_';
+            memcpy(strtab + str_off, names[i], nl);
+            str_off += nl;
+            strtab[str_off++] = '\0';
+        }
+    }
+    strtab[str_off++] = '\0';
+
+    /* Build nlist entries */
+    nlist_64_t syms[128];
+    int32_t nsyms = name_count > 128 ? 128 : name_count;
+    for (int32_t i = 0; i < nsyms; i++) {
+        syms[i].n_strx  = name_stroff[i];
+        syms[i].n_type  = N_SECT | N_EXT;
+        syms[i].n_sect  = 1; /* section 1 = __text */
+        syms[i].n_desc  = 0;
+        syms[i].n_value = (uint64_t)(offsets[i] * 4);
+    }
+    int32_t sym_size = nsyms * (int32_t)sizeof(nlist_64_t);
+
+    /* Layout */
+    int32_t hdr_sz = 32;
+    int32_t seg_cmd_sz = 72 + 80; /* LC_SEGMENT_64 with one section */
+    int32_t symtab_cmd_sz = 24;   /* LC_SYMTAB */
+    int32_t cmd_sz = seg_cmd_sz + symtab_cmd_sz;
+    int32_t ncmds = 2;
+    int32_t code_off = hdr_sz + cmd_sz;
+    int32_t sym_off = code_off + code_sz;
+    int32_t str_off_file = sym_off + sym_size;
+    int32_t total_sz = str_off_file + str_off;
+
+    uint8_t *buf = (uint8_t *)calloc(1, total_sz);
+    if (!buf) return false;
+    uint32_t *w = (uint32_t *)buf;
+
+    /* Header */
+    w[0] = MH_MAGIC_64;
+    w[1] = CPU_TYPE_ARM64;
+    w[2] = CPU_SUBTYPE_ARM64_ALL;
+    w[3] = MH_OBJECT;
+    w[4] = ncmds;
+    w[5] = cmd_sz;
+    w[6] = 0;
+    w[7] = 0;
+    int32_t pos = hdr_sz;
+
+    /* LC_SEGMENT_64 (72 bytes) + one section (80 bytes) */
+    uint32_t *seg = (uint32_t *)(buf + pos);
+    seg[0]  = LC_SEGMENT64;
+    seg[1]  = seg_cmd_sz;
+    macho_segname(buf + pos + 8, "");
+    seg[6]  = 0; seg[7]  = 0;
+    seg[8]  = (uint32_t)code_sz; seg[9]  = 0;
+    seg[10] = (uint32_t)code_off; seg[11] = 0;
+    seg[12] = (uint32_t)code_sz; seg[13] = 0;
+    seg[14] = 7; seg[15] = 7;
+    seg[16] = 1; /* nsects */
+    seg[17] = 0;
+    /* Section header follows immediately after segment command */
+    uint32_t *sec = (uint32_t *)(buf + pos + 72);
+    macho_segname(buf + pos + 72, "__text");
+    macho_segname(buf + pos + 88, "");
+    sec[8]  = 0; sec[9]  = 0;
+    sec[10] = (uint32_t)code_sz; sec[11] = 0;
+    sec[12] = (uint32_t)code_off;
+    sec[13] = 2; /* align */
+    sec[14] = 0; sec[15] = 0; /* reloff */
+    sec[16] = 0; sec[17] = 0; /* nreloc */
+    sec[18] = 0x80000400; /* S_REGULAR | S_ATTR_SOME_INSTRUCTIONS */
+    sec[19] = 0;
+    pos += seg_cmd_sz;
+
+    /* LC_SYMTAB (24 bytes) */
+    uint32_t *st = (uint32_t *)(buf + pos);
+    st[0] = LC_SYMTAB;
+    st[1] = symtab_cmd_sz;
+    st[2] = (uint32_t)sym_off;
+    st[3] = nsyms;
+    st[4] = (uint32_t)str_off_file;
+    st[5] = (uint32_t)str_off;
+
+    /* Code */
+    memcpy(buf + code_off, code, code_sz);
+    /* Symbol table */
+    memcpy(buf + sym_off, syms, sym_size);
+    /* String table */
+    memcpy(buf + str_off_file, strtab, str_off);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { free(buf); return false; }
+    write(fd, buf, total_sz);
+    close(fd);
+    free(buf);
+    return true;
 }
