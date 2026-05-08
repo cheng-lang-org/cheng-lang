@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -8607,9 +8608,32 @@ static bool cold_try_path_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
+    if (span_eq(name, "BackendDriverDispatchMinWriteErrorReportBridge")) {
+        if (arg_count != 3) die("WriteErrorReportBridge arity mismatch");
+        int32_t root = body->call_arg_slot[arg_start];
+        int32_t raw = body->call_arg_slot[arg_start + 1];
+        int32_t reason = body->call_arg_slot[arg_start + 2];
+        root = cold_require_str_value(body, root, "WriteErrorReportBridge root");
+        raw = cold_require_str_value(body, raw, "WriteErrorReportBridge raw");
+        reason = cold_require_str_value(body, reason, "WriteErrorReportBridge reason");
+        int32_t path = cold_make_str_result_slot(body);
+        body_op(body, BODY_OP_PATH_ABSOLUTE, path, root, raw);
+        int32_t prefix = cold_make_str_literal_cstr_slot(body,
+            "system_link_exec_runtime_execute=0\n"
+            "system_link_exec=0\n"
+            "real_backend_codegen=0\n"
+            "error=");
+        int32_t with_reason = cold_concat_str_slots(body, prefix, reason);
+        int32_t newline = cold_make_str_literal_cstr_slot(body, "\n");
+        int32_t report = cold_concat_str_slots(body, with_reason, newline);
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_PATH_WRITE_TEXT, slot, path, report);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
     if (span_eq(name, "chengpath.WriteTextFile") ||
         span_eq(name, "chengpath.PathWriteTextFileBridge") ||
-        span_eq(name, "BackendDriverDispatchMinWriteErrorReportBridge") ||
         span_eq(name, "WriteTextFile") ||
         span_eq(name, "PathWriteTextFileBridge")) {
         int32_t path = -1;
@@ -8755,6 +8779,7 @@ static int32_t cold_make_empty_str_seq_slot(BodyIR *body, Span type_name) {
     return slot;
 }
 
+__attribute__((unused))
 static int32_t cold_make_empty_seq_slot_for_field(BodyIR *body, ObjectField *field) {
     if (field->kind != SLOT_SEQ_I32 && field->kind != SLOT_SEQ_STR &&
         field->kind != SLOT_SEQ_OPAQUE) {
@@ -9041,6 +9066,14 @@ static bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
+    if (span_eq(name, "BackendDriverDispatchMinIsColdCompilerProbe") ||
+        span_eq(name, "BackendDriverDispatchMinIsColdCompilerProbe")) {
+        if (arg_count != 0) die("IsColdCompilerProbe arity mismatch");
+        int32_t slot = cold_make_i32_const_slot(body, 1);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
     if (span_eq(name, "direct.DirectObjectEmitCanStandaloneMain") ||
         span_eq(name, "DirectObjectEmitCanStandaloneMain")) {
         if (arg_count != 1) die("DirectObjectEmitCanStandaloneMain arity mismatch");
@@ -9262,27 +9295,10 @@ static bool cold_try_csg_intrinsic(Parser *parser, BodyIR *body, Span name,
                     body->slot_type[source_bundle_cid].len, body->slot_type[source_bundle_cid].ptr);
             die("BuildCompilerCsgInto source bundle cid kind mismatch");
         }
-        ObjectDef *csg_object = symbols_resolve_object(parser->symbols, cold_cstr_span("ccsg.CompilerCsg"));
-        if (!csg_object) csg_object = symbols_resolve_object(parser->symbols, cold_cstr_span("CompilerCsg"));
-        if (!csg_object) die("CompilerCsg layout missing");
-        cold_store_object_field_slot(body, out_csg,
-                                     cold_required_object_field(csg_object, "version"),
-                                     cold_make_i32_const_slot(body, 1));
-        cold_store_object_field_slot(body, out_csg,
-                                     cold_required_object_field(csg_object, "packageId"),
-                                     cold_load_slplan_field(parser, body, link_plan, "packageId", 0));
-        ObjectField *nodes = cold_required_object_field(csg_object, "nodes");
-        cold_store_object_field_slot(body, out_csg, nodes,
-                                     cold_make_empty_seq_slot_for_field(body, nodes));
-        ObjectField *edges = cold_required_object_field(csg_object, "edges");
-        cold_store_object_field_slot(body, out_csg, edges,
-                                     cold_make_empty_seq_slot_for_field(body, edges));
-        ObjectField *typed_facts = cold_required_object_field(csg_object, "typedExprFacts");
-        cold_store_object_field_slot(body, out_csg, typed_facts,
-                                     cold_make_empty_seq_slot_for_field(body, typed_facts));
-        int32_t empty = cold_make_str_literal_cstr_slot(body, "");
-        cold_store_str_out_slot(body, err, empty, "BuildCompilerCsgInto err");
-        int32_t slot = cold_make_i32_const_slot(body, 1);
+        (void)out_csg;
+        int32_t msg = cold_make_str_literal_cstr_slot(body, "cold full compiler integration: CompilerCsg materializer is not connected");
+        cold_store_str_out_slot(body, err, msg, "BuildCompilerCsgInto err");
+        int32_t slot = cold_make_i32_const_slot(body, 0);
         if (kind_out) *kind_out = SLOT_I32;
         *slot_out = slot;
         return true;
@@ -13954,7 +13970,7 @@ static void cold_text_set_offsets(Symbols *symbols, BodyIR *body, int32_t slot,
 
 static void codegen_text_set_base(Code *code, BodyIR *body, int32_t slot, int reg) {
     if (body->slot_kind[slot] == SLOT_OBJECT) {
-        code_emit(code, a64_add_imm(reg, SP, (uint16_t)body->slot_offset[slot], true));
+        a64_emit_add_large(code, reg, SP, body->slot_offset[slot], true);
         return;
     }
     if (body->slot_kind[slot] == SLOT_OBJECT_REF) {
@@ -14423,7 +14439,7 @@ static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
     if (seq_kind == SLOT_SEQ_STR_REF) {
         a64_emit_ldr_sp_off(code, header_reg, body->slot_offset[seq_slot], true);
     } else {
-        code_emit(code, a64_add_imm(header_reg, SP, (uint16_t)body->slot_offset[seq_slot], true));
+        a64_emit_add_large(code, header_reg, SP, body->slot_offset[seq_slot], true);
     }
     a64_emit_ldr_sp_off(code, R1, body->slot_offset[index_slot], false);
     code_emit(code, a64_cmp_imm(R1, 0));
@@ -14452,7 +14468,7 @@ static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
 static void codegen_seq_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg) {
     int32_t kind = body->slot_kind[seq_slot];
     if (kind == SLOT_SEQ_I32) {
-        code_emit(code, a64_add_imm(reg, SP, (uint16_t)body->slot_offset[seq_slot], true));
+        a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
         return;
     }
     if (kind == SLOT_SEQ_I32_REF) {
@@ -14465,7 +14481,7 @@ static void codegen_seq_header_addr(Code *code, BodyIR *body, int32_t seq_slot, 
 static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg) {
     int32_t kind = body->slot_kind[seq_slot];
     if (kind == SLOT_SEQ_STR) {
-        code_emit(code, a64_add_imm(reg, SP, (uint16_t)body->slot_offset[seq_slot], true));
+        a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
         return;
     }
     if (kind == SLOT_SEQ_STR_REF) {
@@ -14748,7 +14764,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         }
         code_emit(code, a64_movz(R1, '\n', 0));
         code_emit(code, a64_strb_imm(R1, SP, body->slot_offset[dst]));
-        code_emit(code, a64_add_imm(R1, SP, (uint16_t)body->slot_offset[dst], true));
+        a64_emit_add_large(code, R1, SP, body->slot_offset[dst], true);
         code_emit(code, a64_movz_x(R2, 1, 0));
         code_emit(code, a64_movz_x(16, 4, 0));
         code_emit(code, a64_svc(0x80));
@@ -15272,7 +15288,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         int32_t call_pos = code->count;
         code_emit(code, a64_bl(0));
         function_patches_add(function_patches, call_pos, a);
-        if (stack_bytes > 0) code_emit(code, a64_add_imm(SP, SP, (uint16_t)stack_bytes, true));
+        if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
         int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind == SLOT_I64);
     } else if (kind == BODY_OP_COPY_I32) {
@@ -15325,7 +15341,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_FIELD_REF) {
         int32_t base_kind = body->slot_kind[a];
         if (base_kind == SLOT_OBJECT) {
-            code_emit(code, a64_add_imm(R0, SP, (uint16_t)(body->slot_offset[a] + b), true));
+            a64_emit_add_large(code, R0, SP, body->slot_offset[a] + b, true);
         } else if (base_kind == SLOT_OBJECT_REF) {
             a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
             if (b != 0) code_emit(code, a64_add_imm(R0, R0, (uint16_t)b, true));
@@ -15352,7 +15368,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             int32_t data_bytes = c * 4;
             codegen_mmap_const(code, data_bytes, R9, 6);
             a64_emit_str_sp_off(code, R9, body->slot_offset[dst] + 8, true);
-            code_emit(code, a64_add_imm(R10, SP, (uint16_t)body->slot_offset[a], true));
+            a64_emit_add_large(code, R10, SP, body->slot_offset[a], true);
             code_emit(code, a64_movz_x(R11, (uint16_t)c, 0));
             int32_t cp_start = code->count;
             code_emit(code, a64_cmp_imm(R11, 0));
@@ -15383,7 +15399,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_cmp_imm(R1, (uint16_t)body->slot_aux[a]));
         code_emit(code, a64_bcond(2, COND_LT));
         code_emit(code, a64_brk(2));
-        code_emit(code, a64_add_imm(R0, SP, (uint16_t)body->slot_offset[a], true));
+        a64_emit_add_large(code, R0, SP, body->slot_offset[a], true);
         code_emit(code, a64_ldr_w_reg_uxtw2(R0, R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_SEQ_I32_INDEX_DYNAMIC) {
@@ -15423,7 +15439,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         if (base_kind == SLOT_OBJECT_REF) {
             code_emit(code, a64_str_w_reg_uxtw2(R2, R0, R1));
         } else {
-            code_emit(code, a64_add_imm(R0, SP, (uint16_t)body->slot_offset[a], true));
+            a64_emit_add_large(code, R0, SP, body->slot_offset[a], true);
             code_emit(code, a64_str_w_reg_uxtw2(R2, R0, R1));
         }
     } else if (kind == BODY_OP_SEQ_I32_INDEX_STORE) {
@@ -15464,13 +15480,13 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         FnDef *fn = &symbols->functions[a];
         int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
         if (ret_kind != SLOT_I32 && ret_kind != SLOT_I64) {
-            code_emit(code, a64_add_imm(8, SP, (uint16_t)body->slot_offset[dst], true));
+            a64_emit_add_large(code, 8, SP, body->slot_offset[dst], true);
         }
         int32_t stack_bytes = codegen_load_call_args(code, body, fn, b);
         int32_t call_pos = code->count;
         code_emit(code, a64_bl(0));
         function_patches_add(function_patches, call_pos, a);
-        if (stack_bytes > 0) code_emit(code, a64_add_imm(SP, SP, (uint16_t)stack_bytes, true));
+        if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
         if (ret_kind == SLOT_I32) {
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
         } else if (ret_kind == SLOT_I64) {
@@ -16111,6 +16127,40 @@ typedef struct {
     size_t arena_kb;
     uint64_t elapsed_us;
 } ColdCompileStats;
+
+static void cold_print_exec_phase_report(FILE *file, ColdCompileStats *stats) {
+    unsigned long long total_ms = stats ? (unsigned long long)(stats->elapsed_us / 1000ULL) : 0ULL;
+    fputs("exec_phase_system_link_plan_ms=0\n", file);
+    fputs("exec_phase_compiler_csg_ms=0\n", file);
+    fputs("exec_phase_lowering_plan_ms=0\n", file);
+    fputs("exec_phase_primary_object_plan_ms=0\n", file);
+    fprintf(file, "exec_phase_direct_object_emit_ms=%llu\n", total_ms);
+    fputs("exec_phase_provider_objects_ms=0\n", file);
+    fputs("exec_phase_native_link_ms=0\n", file);
+    fputs("exec_phase_line_map_ms=0\n", file);
+    fprintf(file, "exec_phase_total_ms=%llu\n", total_ms);
+}
+
+static void cold_print_resource_report(FILE *file) {
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        fputs("report_cpu_ms=-1\n", file);
+        fputs("report_rss_bytes=-1\n", file);
+        return;
+    }
+    long long cpu_ms =
+        (long long)usage.ru_utime.tv_sec * 1000LL +
+        (long long)usage.ru_utime.tv_usec / 1000LL +
+        (long long)usage.ru_stime.tv_sec * 1000LL +
+        (long long)usage.ru_stime.tv_usec / 1000LL;
+#if defined(__APPLE__)
+    long long rss_bytes = (long long)usage.ru_maxrss;
+#else
+    long long rss_bytes = (long long)usage.ru_maxrss * 1024LL;
+#endif
+    fprintf(file, "report_cpu_ms=%lld\n", cpu_ms);
+    fprintf(file, "report_rss_bytes=%lld\n", rss_bytes);
+}
 
 static void cold_collect_body_stats(Symbols *symbols, BodyIR **function_bodies, int32_t function_count,
                                     ColdCompileStats *stats) {
@@ -16896,6 +16946,8 @@ static bool cold_write_system_link_exec_report(const char *path,
         fprintf(file, "cold_arena_kb=%zu\n", stats->arena_kb);
         cold_print_elapsed_ms(file, "cold_compile_elapsed_ms", stats->elapsed_us);
     }
+    cold_print_exec_phase_report(file, stats);
+    cold_print_resource_report(file);
     if (error && error[0] != '\0') fprintf(file, "error=%s\n", error);
     fclose(file);
     return true;
