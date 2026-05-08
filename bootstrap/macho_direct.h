@@ -365,10 +365,12 @@ static bool macho_write_object(const char *path,
     sec[10] = (uint32_t)code_sz; sec[11] = 0;
     sec[12] = (uint32_t)code_off;
     sec[13] = 2; /* align */
-    sec[14] = 0; sec[15] = 0; /* reloff */
-    sec[16] = 0; sec[17] = 0; /* nreloc */
-    sec[18] = 0x80000400; /* S_REGULAR | S_ATTR_SOME_INSTRUCTIONS */
-    sec[19] = 0;
+    sec[14] = 0; /* reloff */
+    sec[15] = 0; /* nreloc */
+    sec[16] = 0x80000400; /* flags: S_REGULAR | S_ATTR_SOME_INSTRUCTIONS */
+    sec[17] = 0; /* reserved1 */
+    sec[18] = 0; /* reserved2 */
+    sec[19] = 0; /* reserved3 if present */
     pos += seg_cmd_sz;
 
     /* LC_SYMTAB (24 bytes) */
