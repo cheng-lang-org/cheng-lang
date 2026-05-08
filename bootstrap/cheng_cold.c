@@ -7387,8 +7387,21 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
               param_kinds[ai] = body->slot_kind[body->call_arg_slot[arg_start + ai]];
               param_sizes[ai] = body->slot_size[body->call_arg_slot[arg_start + ai]];
           }
-          fn_index = symbols_add_fn(parser->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
-          parser->symbols->functions[fn_index].is_external = true; }
+          if (parser->import_mode) {
+              /* In import mode, do not add new symbols — skip unresolved calls */
+              fn_index = symbols_find_fn(parser->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
+          } else {
+              fn_index = symbols_add_fn(parser->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
+              parser->symbols->functions[fn_index].is_external = true;
+          }
+      }
+    }
+    if (parser->import_mode && fn_index < 0) {
+        /* Unresolved call in import mode: skip it, return a zero I32 slot */
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
+        if (kind_out) *kind_out = SLOT_I32;
+        return slot;
     }
     FnDef *fn = &parser->symbols->functions[fn_index];
     cold_validate_call_args(body, fn, arg_start, arg_count);
@@ -7504,8 +7517,19 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
               param_kinds[ai] = body->slot_kind[body->call_arg_slot[arg_start + ai]];
               param_sizes[ai] = body->slot_size[body->call_arg_slot[arg_start + ai]];
           }
-          fn_index = symbols_add_fn(owner->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
-          owner->symbols->functions[fn_index].is_external = true; }
+          if (owner->import_mode) {
+              fn_index = symbols_find_fn(owner->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
+          } else {
+              fn_index = symbols_add_fn(owner->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
+              owner->symbols->functions[fn_index].is_external = true;
+          }
+      }
+    }
+    if (owner->import_mode && fn_index < 0) {
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
+        if (kind_out) *kind_out = SLOT_I32;
+        return slot;
     }
     FnDef *fn = &owner->symbols->functions[fn_index];
     cold_validate_call_args(body, fn, arg_start, arg_count);
@@ -17064,6 +17088,7 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                wrong code, skip unsupported returns. */
             if (body->return_kind != SLOT_I32 && body->return_kind != SLOT_I64 &&
                 body->return_kind > 0) {
+                fprintf(stderr, "[DBG] skipping import body (kind=%d)\n", body->return_kind);
                 continue; /* keep stub */
             }
             function_bodies[(int32_t)symbol_index] = (BodyIR *)body;
@@ -17216,7 +17241,7 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
 
     if (src_path && src_path[0] != '\0') {
         mapped_source = source_open(src_path);
-        if (mapped_source.len <= 0) return false;
+        if (mapped_source.len <= 0) { fprintf(stderr, "[DBG] source_open returned empty\n"); return false; }
         cold_collect_imported_function_signatures(symbols, mapped_source);
         cold_collect_function_signatures(symbols, mapped_source);
         { char ws_root[PATH_MAX] = {0};
@@ -17232,11 +17257,9 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
         /* Import body compilation: enabled for tables < 500 symbols.
-           The 500 cap is a capability boundary: import_mode + selective return
-           filter protect against arena corruption and unsupported returns,
-           but some imports trigger die() during body parsing (intrinsic
-           mismatches) that the per-function recovery handles. Removing the
-           cap requires fixing those intrinsic paths to handle edge cases. */
+           import_mode protects against symbols_add_fn in parse_call paths.
+           Once all codegen edge cases (sret, composite returns in I32 fns)
+           are handled, the cap can be removed. */
         if (symbols->function_count < 500) {
         ColdErrorRecoveryEnabled = true;
         if (setjmp(ColdErrorJumpBuf) == 0) {
@@ -17244,6 +17267,8 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         }
         ColdErrorRecoveryEnabled = false;
         }
+        fprintf(stderr, "[DBG] after import compilation: mapped_source.len=%d, symbols fn_count=%d cap=%d\n",
+                mapped_source.len, symbols->function_count, symbols->function_cap);
         /* If any import had SEGV, skip import body compilation results.
            Per-function setjmp recovery already skipped individual bad functions;
            this clears the rest because the arena may be corrupted globally. */
@@ -17290,6 +17315,13 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         }
         if (main_function < 0) {
             if (!allow_demo) {
+                fprintf(stderr, "[DBG] no main in parsing loop (main=%d, first=%d)\n", main_function, first_function);
+                /* Dump first few entry-module function names */
+                for (int32_t di = first_function; di < symbols->function_count && di < first_function + 10; di++) {
+                    FnDef *dfn = &symbols->functions[di];
+                    if (dfn->name.ptr && dfn->name.len > 0 && dfn->name.len < 100)
+                        fprintf(stderr, "[DBG]   fn[%d]='%.*s'\n", di, dfn->name.len, dfn->name.ptr);
+                }
                 munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
                 return false;
             }
@@ -17299,6 +17331,7 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
 
     if (main_function < 0) {
         if (!allow_demo) {
+            fprintf(stderr, "[DBG] no main function after parsing (main=%d, first=%d)\n", main_function, first_function);
             if (mapped_source.len > 0) munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
             return false;
         }
@@ -17320,6 +17353,7 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         codegen_program(code, function_bodies, symbols->function_count, main_function, symbols);
     }
     if (output_direct_macho(out_path, code) != 0) {
+        fprintf(stderr, "[DBG] macho write failed\n");
         if (mapped_source.len > 0) munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
         return false;
     }
