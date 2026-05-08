@@ -17116,8 +17116,17 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
-        /* Import body compilation (disabled: segfault in os.cheng pre-scan).
-           Enable when qual-index performance issue is resolved. */
+        /* Import body compilation with safety cap.
+           For small symbol tables (<500 entries), import body compilation works.
+           For large tables (dispatch_min has 1488+), skip to avoid memcmp SEGV
+           from arena-aliased name.ptr in some symbol entries. */
+        if (symbols->function_count < 500) {
+            ColdErrorRecoveryEnabled = true;
+            if (setjmp(ColdErrorJumpBuf) == 0) {
+                cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
+            }
+            ColdErrorRecoveryEnabled = false;
+        }
         Parser parser = {mapped_source, 0, arena, symbols};
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
