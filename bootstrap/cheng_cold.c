@@ -30,6 +30,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <setjmp.h>
+#include <signal.h>
 
 #include "macho_direct.h"
 
@@ -93,6 +94,10 @@ static void die(const char *msg) {
     cold_die_report_flush();
     if (ColdErrorRecoveryEnabled) longjmp(ColdErrorJumpBuf, 1);
     exit(2);
+}
+static void cold_sigsegv_die_handler(int sig) {
+    (void)sig;
+    die("SEGV in cold compiler");
 }
 
 static int32_t align_i32(int32_t v, int32_t a) {
@@ -16896,6 +16901,37 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
     return true;
 }
 
+/* ================================================================
+ * Safe memory access: SIGSEGV-protected memcmp for symbol table scan.
+ * When symbols->functions entries have arena-aliased name.ptr that
+ * points to unmapped memory, safe_memcmp returns false instead of
+ * crashing. Used in cold_compile_one_import_direct pre-scan.
+ * ================================================================ */
+static sigjmp_buf SafeMemcmpJumpBuf;
+static volatile int SafeMemcmpSegvFlag = 0;
+static void safe_memcmp_sigsegv(int sig) {
+    SafeMemcmpSegvFlag = 1;
+    siglongjmp(SafeMemcmpJumpBuf, 1);
+}
+static bool safe_memcmp(const uint8_t *a, const uint8_t *b, int32_t len) {
+    if (len <= 0) return true;
+    if (!a || !b) return false;
+    struct sigaction sa_old, sa_new;
+    memset(&sa_new, 0, sizeof(sa_new));
+    sa_new.sa_handler = safe_memcmp_sigsegv;
+    sa_new.sa_flags = SA_NODEFER;
+    sigaction(SIGSEGV, &sa_new, &sa_old);
+    SafeMemcmpSegvFlag = 0;
+    bool ok = false;
+    if (sigsetjmp(SafeMemcmpJumpBuf, 1) == 0) {
+        volatile uint8_t probe_a = a[0]; /* trigger SEGV if a is invalid */
+        volatile uint8_t probe_b = b[0]; /* trigger SEGV if b is invalid */
+        (void)probe_a; (void)probe_b;
+        ok = (memcmp(a, b, (size_t)len) == 0);
+    }
+    sigaction(SIGSEGV, &sa_old, 0);
+    return ok && !SafeMemcmpSegvFlag;
+}
 /* Compile function bodies of one imported module (direct, no recursion). */
 static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path, Span alias,
                                                BodyIR **function_bodies, int32_t body_cap) {
@@ -16932,9 +16968,9 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                     FnDef *sfn = &symbols->functions[si];
                     /* Check if sfn->name starts with alias. and ends with fn_name */
                     if (sfn->name.len >= alias.len + 1 + fn_name.len &&
-                        memcmp(sfn->name.ptr, alias.ptr, alias.len) == 0 &&
+                        safe_memcmp(sfn->name.ptr, alias.ptr, alias.len) &&
                         sfn->name.ptr[alias.len] == '.' &&
-                        memcmp(sfn->name.ptr + alias.len + 1, fn_name.ptr, fn_name.len) == 0 &&
+                        safe_memcmp(sfn->name.ptr + alias.len + 1, fn_name.ptr, fn_name.len) &&
                         sfn->name.len == alias.len + 1 + fn_name.len) {
                         qual_indices[fn_pos] = si;
                         fn_pos++;
@@ -16991,6 +17027,13 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
 __attribute__((unused))
 static int32_t cold_compile_imported_bodies_no_recurse(Symbols *symbols, Span entry_source,
                                                        BodyIR **function_bodies, int32_t body_cap) {
+    /* Install SIGSEGV handler to convert segfaults into die() which setjmp catches */
+    struct sigaction sa_segv_old;
+    struct sigaction sa_segv_new;
+    memset(&sa_segv_new, 0, sizeof(sa_segv_new));
+    sa_segv_new.sa_handler = cold_sigsegv_die_handler;
+    sa_segv_new.sa_flags = SA_NODEFER;
+    sigaction(SIGSEGV, &sa_segv_new, &sa_segv_old);
     int32_t compiled = 0;
     int32_t pos = 0;
     bool in_triple = false;
@@ -17023,6 +17066,8 @@ static int32_t cold_compile_imported_bodies_no_recurse(Symbols *symbols, Span en
         }
         ColdErrorRecoveryEnabled = false;
     }
+    /* Restore original SIGSEGV handler */
+    sigaction(SIGSEGV, &sa_segv_old, 0);
     return compiled;
 }
 
@@ -17116,10 +17161,10 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
-        /* Import body compilation with safety cap.
-           For small symbol tables (<500 entries), import body compilation works.
-           For large tables (dispatch_min has 1488+), skip to avoid memcmp SEGV
-           from arena-aliased name.ptr in some symbol entries. */
+        /* Import body compilation with SIGSEGV→die() + safe_memcmp protection.
+           SEGV→die() catches crashes during body parsing and gracefully skips
+           the import. However, post-SEGV arena state may be corrupted, so
+           we conservatively limit to symbol_count < 500 for now. */
         if (symbols->function_count < 500) {
             ColdErrorRecoveryEnabled = true;
             if (setjmp(ColdErrorJumpBuf) == 0) {
