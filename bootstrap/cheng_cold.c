@@ -15131,10 +15131,13 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         /* a: bin_path slot. Exec with original argv, replacing argv[0] with bin_path.
            X19=argc, X20=argv (saved by entry trampoline). */
         codegen_cstring_from_slot(code, body, a, 7, 73);
-        /* Allocate new_argv on stack: (argc+1)*8 + 16-align */
+        /* Allocate new_argv on stack: (argc+1)*8, 16-byte aligned */
         code_emit(code, a64_add_imm(9, 19, 1, true));      /* X9 = argc+1 */
         code_emit(code, a64_lsl_imm(9, 9, 3, true));        /* X9 = (argc+1)*8 */
-        code_emit(code, a64_add_imm(9, 9, 16, true));       /* +16 */
+        code_emit(code, a64_add_imm(9, 9, 15, true));       /* +15 */
+        code_emit(code, a64_movz_x(10, 0xFFF0, 0));         /* X10 = 0xFFFFFFF0 */
+        code_emit(code, a64_movk(10, 0xFFFF, 1));           /* X10 = 0xFFFFFFFFFFFFFFF0 */
+        code_emit(code, a64_and_reg(9, 9, 10));             /* X9 &= ~0xF (16-byte align) */
         code_emit(code, a64_sub_reg_x(SP, SP, 9));          /* alloc */
         code_emit(code, a64_add_imm(10, SP, 0, true));      /* X10 = new_argv */
         /* new_argv[0] = bin_path */
