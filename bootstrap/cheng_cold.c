@@ -6156,6 +6156,11 @@ static bool cold_parse_import_line(Span trimmed, Span *module_out, Span *alias_o
 
 static bool cold_import_source_path(Span module_path, char *out, size_t out_cap) {
     if (module_path.len <= 0 || module_path.len >= PATH_MAX) return false;
+    /* strip quotes if present */
+    if (module_path.len >= 2 && module_path.ptr[0] == '"' && module_path.ptr[module_path.len - 1] == '"') {
+        module_path = span_sub(module_path, 1, module_path.len - 1);
+    }
+    if (module_path.len <= 0) return false;
     /* strip module_prefix from cheng-package.toml if present (default: "cheng/") */
     if (cold_span_starts_with(module_path, "cheng/")) {
         module_path = span_sub(module_path, 6, module_path.len);
@@ -6163,6 +6168,20 @@ static bool cold_import_source_path(Span module_path, char *out, size_t out_cap)
         /* std/ prefix maps directly to src/std/ */
     }
     if (module_path.len <= 0) return false;
+    /* Check if path already has prefix and suffix */
+    bool has_src_prefix = cold_span_starts_with(module_path, "src/");
+    bool has_cheng_suffix = module_path.len > 6 &&
+        module_path.ptr[module_path.len - 6] == '.' &&
+        module_path.ptr[module_path.len - 5] == 'c' &&
+        module_path.ptr[module_path.len - 4] == 'h' &&
+        module_path.ptr[module_path.len - 3] == 'e' &&
+        module_path.ptr[module_path.len - 2] == 'n' &&
+        module_path.ptr[module_path.len - 1] == 'g';
+    if (has_src_prefix && has_cheng_suffix) {
+        /* Path is already a full relative path like src/tests/foo.cheng */
+        int written = snprintf(out, out_cap, "%.*s", module_path.len, module_path.ptr);
+        return written > 0 && (size_t)written < out_cap;
+    }
     int written = snprintf(out, out_cap, "src/%.*s.cheng", module_path.len, module_path.ptr);
     return written > 0 && (size_t)written < out_cap;
 }
@@ -16883,8 +16902,45 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
     Span source = source_open(path);
     if (source.len <= 0) return 0;
     int32_t compiled = 0;
-    (void)alias;
+    /* Build alias-to-qualified index map by scanning the import file for fn names
+       and matching them against symbols->functions with the alias prefix.
+       Store qual_indices indexed by fn position in the import file. */
+    #define COLD_IMPORT_FN_MAP_CAP 128
+    int32_t qual_indices[COLD_IMPORT_FN_MAP_CAP];
+    for (int32_t i = 0; i < COLD_IMPORT_FN_MAP_CAP; i++) qual_indices[i] = -1;
+    int32_t fn_pos = 0;
+    {
+        int32_t scan_pos = 0;
+        int32_t line_start = 0;
+        while (scan_pos < source.len) {
+            while (scan_pos < source.len && source.ptr[scan_pos] != '\n') scan_pos++;
+            Span line = span_trim(span_sub(source, line_start, scan_pos));
+            if (scan_pos < source.len) scan_pos++;
+            line_start = scan_pos;
+            if (cold_span_starts_with(line, "fn ")) {
+                Span fn_name = span_sub(line, 3, line.len);
+                int32_t name_end = 0;
+                while (name_end < fn_name.len && (cold_ident_char(fn_name.ptr[name_end]) || fn_name.ptr[name_end] == '_' || fn_name.ptr[name_end] == '`')) name_end++;
+                fn_name = span_sub(fn_name, 0, name_end);
+                /* Search for qualified name in symbols */
+                for (int32_t si = 0; si < symbols->function_count && fn_pos < COLD_IMPORT_FN_MAP_CAP; si++) {
+                    FnDef *sfn = &symbols->functions[si];
+                    /* Check if sfn->name starts with alias. and ends with fn_name */
+                    if (sfn->name.len >= alias.len + 1 + fn_name.len &&
+                        memcmp(sfn->name.ptr, alias.ptr, alias.len) == 0 &&
+                        sfn->name.ptr[alias.len] == '.' &&
+                        memcmp(sfn->name.ptr + alias.len + 1, fn_name.ptr, fn_name.len) == 0 &&
+                        sfn->name.len == alias.len + 1 + fn_name.len) {
+                        qual_indices[fn_pos] = si;
+                        fn_pos++;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     Parser parser = {source, 0, symbols->arena, symbols};
+    fn_pos = 0;
     while (parser.pos < source.len) {
         parser_ws(&parser);
         if (parser.pos >= source.len) break;
@@ -16910,26 +16966,15 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
             if (symbol_index < 0 || symbol_index >= body_cap) continue;
             function_bodies[(int32_t)symbol_index] = (BodyIR *)body;
             compiled++;
-            { FnDef *qfn = &symbols->functions[(int32_t)symbol_index];
-              Span qname = qfn->name;
-              int32_t dot = -1;
-              for (int32_t ci = 0; ci < qname.len; ci++) if (qname.ptr[ci] == '.') dot = ci;
-              if (dot >= 0 && dot + 1 < qname.len) {
-                  Span local_name = span_sub(qname, dot + 1, qname.len);
-                  if (local_name.len > 0) {
-                      int32_t param_kinds[COLD_MAX_I32_PARAMS];
-                      int32_t param_sizes[COLD_MAX_I32_PARAMS];
-                      for (int32_t pi = 0; pi < qfn->arity && pi < COLD_MAX_I32_PARAMS; pi++) {
-                          param_kinds[pi] = qfn->param_kind[pi];
-                          param_sizes[pi] = qfn->param_size[pi];
-                      }
-                      int32_t local_index = symbols_add_fn(symbols, local_name, qfn->arity,
-                                                           param_kinds, param_sizes, qfn->ret);
-                      if (local_index >= 0 && local_index < body_cap && local_index != (int32_t)symbol_index)
-                          function_bodies[local_index] = (BodyIR *)body;
-                  }
-              }
+            /* Map to qualified index if available */
+            if (fn_pos < COLD_IMPORT_FN_MAP_CAP && qual_indices[fn_pos] >= 0) {
+                int32_t qi = qual_indices[fn_pos];
+                if (qi != (int32_t)symbol_index && qi < body_cap) {
+                    function_bodies[qi] = (BodyIR *)body;
+                    compiled++;
+                }
             }
+            fn_pos++;
         } else {
             parser_line(&parser);
         }
@@ -16962,8 +17007,12 @@ static int32_t cold_compile_imported_bodies_no_recurse(Symbols *symbols, Span en
         Span alias = {0};
         if (!cold_parse_import_line(span_trim(line), &module_path, &alias)) continue;
         char path[PATH_MAX];
-        if (!cold_import_source_path(module_path, path, sizeof(path))) continue;
-        compiled += cold_compile_one_import_direct(symbols, path, alias, function_bodies, body_cap);
+        if (!cold_import_source_path(module_path, path, sizeof(path))) {
+            fprintf(stderr, "[import_body] path resolve failed: %.*s\n", module_path.len, module_path.ptr);
+            continue;
+        }
+        int32_t n = cold_compile_one_import_direct(symbols, path, alias, function_bodies, body_cap);
+        compiled += n;
     }
     return compiled;
 }
@@ -17054,13 +17103,16 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
           if (ws_root[0]) cold_compile_csg_load_imported_types(ws_root, mapped_source, symbols, arena);
           else fprintf(stderr, "[WARN] ws_root empty, src_path=%s\n", src_path);
         }
-        /* Import body compilation ready but needs crash-proofing.
-           cold_compile_imported_bodies_no_recurse() is available after type system
-           stabilization. Enable after addressing segfault in body building phase. */
         body_cap = symbols->function_cap;
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
+        /* Import body compilation */
+        ColdErrorRecoveryEnabled = true;
+        if (setjmp(ColdErrorJumpBuf) == 0) {
+            cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
+        }
+        ColdErrorRecoveryEnabled = false;
         Parser parser = {mapped_source, 0, arena, symbols};
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
