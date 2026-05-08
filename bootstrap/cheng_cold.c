@@ -16756,6 +16756,9 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
           if (ws_root[0]) cold_compile_csg_load_imported_types(ws_root, mapped_source, symbols, arena);
           else fprintf(stderr, "[WARN] ws_root empty, src_path=%s\n", src_path);
         }
+        /* Import body compilation available but not wired in main pipeline:
+           cold_collect_all_transitive_imports + cold_compile_imported_bodies_no_recurse
+           Wired via cold_materialize_direct_emit / self-exec path instead. */
         body_cap = symbols->function_cap;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         Parser parser = {mapped_source, 0, arena, symbols};
