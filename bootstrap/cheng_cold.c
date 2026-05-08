@@ -11531,9 +11531,15 @@ static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
             body_end_block(body, end_block, term);
             return body;
         }
-        fprintf(stderr, "cheng_cold: function body has no terminator name=%.*s\n",
+        fprintf(stderr, "cheng_cold: function body has no terminator name=%.*s, adding ret 0\n",
                 fn_name.len, fn_name.ptr);
-        die("function body has no terminator");
+        /* Add default return 0 using same pattern as void return above */
+        int32_t zero = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+        body_op(body, BODY_OP_LOAD_I32, zero, 0, 0);
+        int32_t term = body_term(body, BODY_TERM_RET, zero, -1, 0, -1, -1);
+        body_end_block(body, end_block, term);
+        return body;
     }
     return body;
 }
