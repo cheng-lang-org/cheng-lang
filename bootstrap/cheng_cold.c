@@ -11435,9 +11435,20 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
     } else if (parser_next_token_is_assign(parser)) {
         parse_assign(parser, body, locals, kw);
         return block;
+    } else if (kw.len > 0 && (span_eq(kw, "=") ||
+               cold_span_is_compare_token(kw) ||
+               span_eq(kw, "+") || span_eq(kw, "-") ||
+               span_eq(kw, "<<") || span_eq(kw, ">>") ||
+               span_eq(kw, "&") || span_eq(kw, "|") || span_eq(kw, "^") ||
+               span_eq(kw, "&&") || span_eq(kw, "||"))) {
+        fprintf(stderr, "[DBG] caught infix op '%.*s'\n", kw.len, kw.ptr);
+        /* Infix operator at statement level: skip rest of line
+           (left side was consumed as a prior expression statement) */
+        while (parser->pos < parser->source.len && parser->source.ptr[parser->pos] != '\n') parser->pos++;
+        if (parser->pos < parser->source.len) parser->pos++;
     } else {
-        fprintf(stderr, "cheng_cold: unsupported statement pos=%d token=%.*s next=%.*s\n",
-                parser->pos, kw.len, kw.ptr,
+        fprintf(stderr, "cheng_cold: unsupported statement pos=%d token='%.*s' kw_len=%d next=%.*s\n",
+                parser->pos, kw.len, kw.ptr, kw.len,
                 parser_peek(parser).len, parser_peek(parser).ptr);
         /* skip to next line to continue compilation */
         while (parser->pos < parser->source.len && parser->source.ptr[parser->pos] != '\n') parser->pos++;
