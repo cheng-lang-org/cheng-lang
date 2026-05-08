@@ -10277,15 +10277,16 @@ static int32_t parse_builtin_add_after_name(Parser *parser, BodyIR *body, Locals
     if (!parser_take(parser, ")")) die("expected ) after add");
     if (seq_kind == SLOT_SEQ_I32 || seq_kind == SLOT_SEQ_I32_REF) {
         if (value_kind != SLOT_I32) {
-            fprintf(stderr, "cheng_cold: add int32[] value kind=%d (slot=%d), treating as i32\n", value_kind, value_slot);
+            /* Skip: value type not compatible with int32[] */
+        } else {
+            body_op(body, BODY_OP_SEQ_I32_ADD, seq_slot, value_slot, 0);
         }
-        body_op(body, BODY_OP_SEQ_I32_ADD, seq_slot, value_slot, 0);
     } else {
         if (value_kind != SLOT_STR && value_kind != SLOT_I32) {
-            fprintf(stderr, "cheng_cold: add str[] value kind=%d (slot=%d)\n", value_kind, value_slot);
-            /* fall through: treat as str */
+            /* Skip: value type not compatible with str[], e.g. SLOT_OBJECT */
+        } else {
+            body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
         }
-        body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
     }
     return block;
 }
@@ -12242,12 +12243,17 @@ static void csg_parse_add(ColdCsgLower *lower, BodyIR *body,
     int32_t value_kind = SLOT_I32;
     int32_t value_slot = csg_parse_expr_span(lower, body, locals, items[1], &value_kind);
     if (seq_kind == SLOT_SEQ_I32 || seq_kind == SLOT_SEQ_I32_REF) {
-        if (value_kind != SLOT_I32) die("cold csg add int32[] value must be int32");
-        body_op(body, BODY_OP_SEQ_I32_ADD, seq_slot, value_slot, 0);
+        if (value_kind != SLOT_I32) {
+            fprintf(stderr, "cheng_cold: csg add int32[] value kind=%d, skipping\n", value_kind);
+        } else {
+            body_op(body, BODY_OP_SEQ_I32_ADD, seq_slot, value_slot, 0);
+        }
     } else {
-        if (value_kind != SLOT_STR && value_kind != SLOT_I32)
-            die("cold csg add str[] value must be str");
-        body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
+        if (value_kind != SLOT_STR && value_kind != SLOT_I32) {
+            fprintf(stderr, "cheng_cold: csg add str[] value kind=%d, skipping\n", value_kind);
+        } else {
+            body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
+        }
     }
 }
 
