@@ -321,10 +321,11 @@ static bool macho_write_object(const char *path,
 
     /* Layout */
     int32_t hdr_sz = 32;
-    int32_t seg_cmd_sz = 72 + 80; /* LC_SEGMENT_64 with one section */
-    int32_t symtab_cmd_sz = 24;   /* LC_SYMTAB */
-    int32_t cmd_sz = seg_cmd_sz + symtab_cmd_sz;
-    int32_t ncmds = 2;
+    int32_t seg_cmd_sz = 72 + 80;        /* LC_SEGMENT_64 with one section */
+    int32_t build_ver_cmd_sz = 24;        /* LC_BUILD_VERSION */
+    int32_t symtab_cmd_sz = 24;           /* LC_SYMTAB */
+    int32_t cmd_sz = seg_cmd_sz + build_ver_cmd_sz + symtab_cmd_sz;
+    int32_t ncmds = 3;
     int32_t code_off = hdr_sz + cmd_sz;
     int32_t sym_off = code_off + code_sz;
     int32_t str_off_file = sym_off + sym_size;
@@ -349,7 +350,7 @@ static bool macho_write_object(const char *path,
     uint32_t *seg = (uint32_t *)(buf + pos);
     seg[0]  = LC_SEGMENT64;
     seg[1]  = seg_cmd_sz;
-    macho_segname(buf + pos + 8, "");
+    macho_segname(buf + pos + 8, "__TEXT");
     seg[6]  = 0; seg[7]  = 0;
     seg[8]  = (uint32_t)code_sz; seg[9]  = 0;
     seg[10] = (uint32_t)code_off; seg[11] = 0;
@@ -360,7 +361,7 @@ static bool macho_write_object(const char *path,
     /* Section header follows immediately after segment command */
     uint32_t *sec = (uint32_t *)(buf + pos + 72);
     macho_segname(buf + pos + 72, "__text");
-    macho_segname(buf + pos + 88, "");
+    macho_segname(buf + pos + 88, "__TEXT");
     sec[8]  = 0; sec[9]  = 0;
     sec[10] = (uint32_t)code_sz; sec[11] = 0;
     sec[12] = (uint32_t)code_off;
@@ -372,6 +373,16 @@ static bool macho_write_object(const char *path,
     sec[18] = 0; /* reserved2 */
     sec[19] = 0; /* reserved3 if present */
     pos += seg_cmd_sz;
+
+    /* LC_BUILD_VERSION (24 bytes) */
+    uint32_t *bv = (uint32_t *)(buf + pos);
+    bv[0] = 0x32; /* LC_BUILD_VERSION */
+    bv[1] = build_ver_cmd_sz;
+    bv[2] = 1;    /* PLATFORM_MACOS */
+    bv[3] = 0x000e0000; /* minos 14.0 */
+    bv[4] = 0x000e0000; /* sdk 14.0 */
+    bv[5] = 0;    /* ntools = 0 */
+    pos += build_ver_cmd_sz;
 
     /* LC_SYMTAB (24 bytes) */
     uint32_t *st = (uint32_t *)(buf + pos);
