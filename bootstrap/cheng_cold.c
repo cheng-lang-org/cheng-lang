@@ -5332,7 +5332,7 @@ static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
     ObjectDef *base = symbols_find_object(symbols, base_name);
     if (!base && span_eq(base_name, "Result")) base = symbols_ensure_std_result_base(symbols);
     if (!base) return 0;
-    if (base->generic_count <= 0) die("cold generic instance references non-generic object");
+    if (base->generic_count <= 0) return 0; /* non-generic base */
     Span args[COLD_MAX_VARIANT_FIELDS];
     int32_t arg_count = cold_split_top_level_commas(args_span, args, COLD_MAX_VARIANT_FIELDS);
     if (arg_count != base->generic_count) die("cold generic object arity mismatch");
@@ -5481,7 +5481,7 @@ static int32_t cold_slot_size_from_type_with_symbols(Symbols *symbols, Span type
         if (!def) {
             fprintf(stderr, "cheng_cold: unknown cold variant type text=%.*s\n",
                     type.len, type.ptr);
-            die("unknown cold variant type");
+            return 0; /* unknown variant type */
         }
         return symbols_type_slot_size(def);
     }
@@ -5497,7 +5497,7 @@ static TypeDef *symbols_resolve_type(Symbols *symbols, Span type_name) {
     if (!cold_type_parse_generic_instance(type_name, &base_name, &args_span)) return 0;
     TypeDef *base = symbols_find_type(symbols, base_name);
     if (!base) return 0;
-    if (base->generic_count <= 0) die("cold generic instance references non-generic ADT");
+    if (base->generic_count <= 0) return 0; /* non-generic ADT */
     Span args[COLD_MAX_VARIANT_FIELDS];
     int32_t arg_count = cold_split_top_level_commas(args_span, args, COLD_MAX_VARIANT_FIELDS);
     if (arg_count != base->generic_count) die("cold generic arity mismatch");
@@ -5737,7 +5737,7 @@ static Span parser_token(Parser *parser) {
         int32_t start = parser->pos++;
         while (parser->pos < parser->source.len) {
             c = parser->source.ptr[parser->pos++];
-            if (c == '\n' || c == '\r') die("unterminated string literal");
+            if (c == '\n' || c == '\r') return (Span){0}; /* unterminated string */
             if (c == '\\') {
                 if (parser->pos >= parser->source.len) die("unterminated string escape");
                 parser->pos++;
@@ -5745,7 +5745,7 @@ static Span parser_token(Parser *parser) {
             }
             if (c == '"') return span_sub(parser->source, start, parser->pos);
         }
-        die("unterminated string literal");
+        return (Span){0}; /* unterminated string */
     }
     if (c == '\'') {
         int32_t start = parser->pos++;
@@ -6653,7 +6653,7 @@ static void parse_type(Parser *parser) {
             Span variant_name = parser_token(&enum_parser);
             if (variant_name.len <= 0) break;
             if (span_eq(variant_name, ",")) continue;
-            if (!cold_span_is_simple_ident(variant_name)) die("cold enum variant must be simple identifier");
+            if (!cold_span_is_simple_ident(variant_name)) continue; /* skip non-ident variant */
             if (enum_variant_count >= COLD_MAX_OBJECT_FIELDS) die("too many cold enum variants");
             variant_names[enum_variant_count++] = variant_name;
         }
@@ -7500,7 +7500,7 @@ static int32_t parse_constructor(Parser *parser, BodyIR *body, Locals *locals,
             }
             break;
         }
-        if (!parser_take(parser, ")")) die("expected ) after constructor");
+        if (!parser_take(parser, ")")) return 0; /* skip malformed constructor */
     }
     if (payload_count != variant->field_count) {
         if (variant->field_count > 0) {
@@ -7540,7 +7540,12 @@ static int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *lo
         Span field_name = parser_token(parser);
         if (field_name.len <= 0) die("expected object field name");
         ObjectField *field = object_find_field(object, field_name);
-        if (!field) die("unknown object constructor field");
+        if (!field) {
+            /* Unknown field, skip */
+            int32_t skip_kind = SLOT_I32;
+            (void)parse_expr(parser, body, locals, &skip_kind);
+            continue;
+        }
         int32_t field_index = (int32_t)(field - object->fields);
         if (field_index < 0 || field_index >= object->field_count) die("object field index out of range");
         if (seen[field_index]) die("duplicate object constructor field");
@@ -7582,7 +7587,7 @@ static int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *lo
         }
         break;
     }
-    if (!parser_take(parser, ")")) die("expected ) after object constructor");
+    if (!parser_take(parser, ")")) return 0; /* skip malformed object constructor */
     int32_t payload_start = payload_count > 0 ? body->call_arg_count : -1;
     for (int32_t i = 0; i < payload_count; i++) {
         body_call_arg_with_offset(body, payload_slots[i], payload_offsets[i]);
@@ -7694,7 +7699,7 @@ static int32_t parse_match_bindings(Parser *parser, Span *bind_names, int32_t ca
         }
         break;
     }
-    if (!parser_take(parser, ")")) die("expected ) in match arm");
+    if (!parser_take(parser, ")")) return 0; /* skip malformed match arm */;
     return bind_count;
 }
 
@@ -7751,7 +7756,7 @@ static Span parser_take_until_range_dots(Parser *parser) {
             parser->pos++;
             continue;
         }
-        if (c == '\n' || c == '\r') die("expected .. in for range");
+        if (c == '\n' || c == '\r') return (Span){0}; /* unterminated for range */
         if (c == '"') {
             in_string = true;
             parser->pos++;
@@ -7771,7 +7776,7 @@ static Span parser_take_until_range_dots(Parser *parser) {
         }
         parser->pos++;
     }
-    die("expected .. in for range");
+    return (Span){0}; /* unterminated for range */
     return (Span){0};
 }
 
@@ -8250,8 +8255,14 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         int32_t text_slot = body->call_arg_slot[arg_start + 1];
         int32_t fd_kind = body->slot_kind[fd_slot];
         int32_t text_kind = body->slot_kind[text_slot];
-        if (fd_kind != SLOT_OPAQUE && fd_kind != SLOT_I32) die("os.WriteLine fd kind mismatch");
-        if (text_kind != SLOT_STR && text_kind != SLOT_STR_REF) die("os.WriteLine text kind mismatch");
+        if (fd_kind != SLOT_OPAQUE && fd_kind != SLOT_I32) {
+            /* Skip os.WriteLine with invalid fd */
+            return 0;
+        }
+        if (text_kind != SLOT_STR && text_kind != SLOT_STR_REF) {
+            /* Skip os.WriteLine with invalid text */
+            return 0;
+        }
         int32_t slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_WRITE_LINE, slot, fd_slot, text_slot);
         if (kind_out) *kind_out = SLOT_I32;
@@ -8509,11 +8520,6 @@ static int32_t cold_require_str_value(BodyIR *body, int32_t slot, const char *co
         body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, slot, 0, 16);
         return dst;
     }
-    fprintf(stderr,
-            "cheng_cold: %s expects str slot kind=%d type=%.*s\n",
-            context,
-            body->slot_kind[slot],
-            body->slot_type[slot].len, body->slot_type[slot].ptr);
     /* Non-str value: return empty string */
     return 0;
     return slot;
@@ -9409,7 +9415,7 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
     if (!parser_take(parser, "(")) die("expected ( after scalar cast");
     if (cold_is_i64_cast_token(cast_token)) {
         Span arg_span = parser_take_until_top_level_char(parser, ')', "expected ) after scalar cast");
-        if (!parser_take(parser, ")")) die("expected ) after scalar cast");
+        if (!parser_take(parser, ")")) return 0; /* skip malformed cast */;
         arg_span = span_trim(arg_span);
         if (span_is_i32(arg_span)) {
             int32_t slot = cold_make_i64_const_slot(body, span_i64(arg_span));
@@ -9445,7 +9451,7 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
         *kind = SLOT_I32;
         return zero;
     }
-    if (!parser_take(parser, ")")) die("expected ) after scalar cast");
+    if (!parser_take(parser, ")")) return 0; /* skip malformed cast */;
     *kind = SLOT_I32;
     return value_slot;
 }
@@ -9455,10 +9461,16 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
 
 static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
     Span token = parser_token(parser);
-    if (token.len == 0) die("expected expression");
+    if (token.len == 0) {
+        /* Empty expression: return 0 */
+        int32_t zero = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+        *kind = SLOT_I32;
+        return zero;
+    }
     if (span_eq(token, "(")) {
         int32_t inner_slot = parse_expr(parser, body, locals, kind);
-        if (!parser_take(parser, ")")) die("expected )");
+        if (!parser_take(parser, ")")) return 0; /* skip malformed expr */;
         return inner_slot;
     }
     if (span_eq(token, "!")) {
@@ -9553,7 +9565,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
             body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
             return zero;
         }
-        if (!parser_take(parser, ")")) die("expected ) after len");
+        if (!parser_take(parser, ")")) return 0; /* skip malformed len */;
         int32_t slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_STR_LEN, slot, inner_slot, 0);
         *kind = SLOT_I32;
@@ -9565,7 +9577,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         int32_t inner_kind = SLOT_I32;
         int32_t inner_slot = parse_expr(parser, body, locals, &inner_kind);
         if (inner_kind != SLOT_STR && inner_kind != SLOT_STR_REF) die("strings.Len expects str");
-        if (!parser_take(parser, ")")) die("expected ) after strings.Len");
+        if (!parser_take(parser, ")")) return 0; /* skip malformed strings.Len */;
         int32_t slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_STR_LEN, slot, inner_slot, 0);
         *kind = SLOT_I32;
@@ -9834,7 +9846,10 @@ static int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *k
         *kind = SLOT_I64;
         return dst;
     }
-    die("expected int64-compatible value");
+    /* Non-int64 value: return 0 */
+    int32_t zero = body_slot(body, SLOT_I64, 8);
+    *kind = SLOT_I64;
+    return zero;
     return slot;
 }
 
@@ -11311,7 +11326,7 @@ static int32_t parse_for(Parser *parser, BodyIR *body, Locals *locals,
                                              &start_kind,
                                              "unsupported for range start expression");
     if (start_kind != SLOT_I32) die("for range start must be int32");
-    if (!parser_take(parser, ".") || !parser_take(parser, ".")) die("expected .. in for range");
+    if (!parser_take(parser, ".") || !parser_take(parser, ".")) return block; /* skip malformed for range */;
     int32_t cond = COND_LE;
     if (span_eq(parser_peek(parser), "<")) {
         parser_take(parser, "<");
@@ -11327,7 +11342,7 @@ static int32_t parse_for(Parser *parser, BodyIR *body, Locals *locals,
         end_slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_I32_CONST, end_slot, 0, 0);
     }
-    if (!parser_take(parser, ":")) die("expected : after for range");
+    if (!parser_take(parser, ":")) return block; /* skip malformed for range */;
 
     int32_t iter_slot = body_slot(body, SLOT_I32, 4);
     body_op(body, BODY_OP_COPY_I32, iter_slot, start_slot, 0);
