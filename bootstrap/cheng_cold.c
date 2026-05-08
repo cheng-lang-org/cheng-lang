@@ -17081,15 +17081,31 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                 symbol_index = qual_indices[fn_pos];
             }
             if (symbol_index < 0 || symbol_index >= body_cap) continue;
-            /* Selective compilation: only compile bodies with return types
-               the cold codegen fully supports (int32, int64, void).
-               str/variant/object/composite returns keep their stubs.
-               This respects "Let it crash" – instead of silently producing
-               wrong code, skip unsupported returns. */
+            /* Selective compilation: skip bodies that cold codegen cannot handle.
+               Two checks:
+               1. Declared return kind must be I32, I64, or void.
+               2. Body must not contain composite return terms (nested
+                  variant/str/object returns inside I32-declared functions). */
+            bool skip_body = false;
             if (body->return_kind != SLOT_I32 && body->return_kind != SLOT_I64 &&
                 body->return_kind > 0) {
-                continue; /* keep stub */
+                skip_body = true;
             }
+            if (!skip_body) {
+                for (int32_t ti = 0; ti < body->term_count; ti++) {
+                    if (body->term_kind[ti] == BODY_TERM_RET) {
+                        int32_t val_slot = body->term_value[ti];
+                        if (val_slot >= 0 && val_slot < body->slot_count) {
+                            int32_t vk = body->slot_kind[val_slot];
+                            if (vk != SLOT_I32 && vk != SLOT_I64 && vk > 0) {
+                                skip_body = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (skip_body) { continue; /* keep stub */ }
             function_bodies[(int32_t)symbol_index] = (BodyIR *)body;
             compiled++;
             /* Map to qualified index if available */
@@ -17255,16 +17271,17 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
-        /* Import body compilation: enabled for tables < 500 symbols.
-           import_mode protects against symbols_add_fn in parse_call paths.
-           Once all codegen edge cases (sret, composite returns in I32 fns)
-           are handled, the cap can be removed. */
+        /* Import body compilation: import_mode guards all symbols_add_fn paths.
+           Selective filter (return kind + composite return scan) prevents
+           codegen from encountering unsupported patterns. The 500 cap is
+           a safety net while remaining intrinsic edge cases are resolved.
+           Remove when 'make dispatch_min full-import-build' passes. */
         if (symbols->function_count < 500) {
-        ColdErrorRecoveryEnabled = true;
-        if (setjmp(ColdErrorJumpBuf) == 0) {
-            cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
-        }
-        ColdErrorRecoveryEnabled = false;
+            ColdErrorRecoveryEnabled = true;
+            if (setjmp(ColdErrorJumpBuf) == 0) {
+                cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
+            }
+            ColdErrorRecoveryEnabled = false;
         }
         /* If any import had SEGV, skip import body compilation results.
            Per-function setjmp recovery already skipped individual bad functions;
