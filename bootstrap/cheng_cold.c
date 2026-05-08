@@ -17022,9 +17022,9 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
           if (ws_root[0]) cold_compile_csg_load_imported_types(ws_root, mapped_source, symbols, arena);
           else fprintf(stderr, "[WARN] ws_root empty, src_path=%s\n", src_path);
         }
-        /* Import body compilation: compile direct imports only (not transitive).
-           Transitive import body compilation is available but needs more type system work
-           to handle all imported module patterns without errors. */
+        /* Import body compilation ready but needs crash-proofing.
+           cold_compile_imported_bodies_no_recurse() is available after type system
+           stabilization. Enable after addressing segfault in body building phase. */
         body_cap = symbols->function_cap;
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
