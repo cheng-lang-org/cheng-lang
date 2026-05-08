@@ -38,6 +38,7 @@
 #endif
 
 #define COLD_EMBEDDED_CONTRACT_CAP 8192
+
 #define COLD_EMBEDDED_SOURCE_PATH_CAP 4096
 
 __attribute__((used)) static char ColdEmbeddedContract[COLD_EMBEDDED_CONTRACT_CAP] =
@@ -4525,9 +4526,12 @@ typedef struct {
     Span return_type;
     Span debug_name;
     int32_t sret_slot;
+    bool has_fallback;
 
     Arena *arena;
 } BodyIR;
+
+static BodyIR *cold_current_parsing_body = 0;
 
 static BodyIR *body_new(Arena *arena) {
     BodyIR *body = arena_alloc(arena, sizeof(BodyIR));
@@ -4535,6 +4539,7 @@ static BodyIR *body_new(Arena *arena) {
     body->return_kind = SLOT_I32;
     body->return_size = 4;
     body->sret_slot = -1;
+    body->has_fallback = false;
     return body;
 }
 
@@ -10054,6 +10059,7 @@ static int32_t parse_expr_from_span(Parser *owner, BodyIR *body, Locals *locals,
     parser_ws(&expr_parser);
     if (expr_parser.pos != expr_parser.source.len) {
         /* Trailing tokens in expression: return 0 */
+        body->has_fallback = true;
         int32_t zero = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
         *kind = SLOT_I32;
@@ -11713,6 +11719,9 @@ static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
         int32_t term = body_term(body, BODY_TERM_RET, zero, -1, 0, -1, -1);
         body_end_block(body, end_block, term);
         return body;
+    }
+    if (body && body->block_count > 0 && body->block_term[0] < 0) {
+        body->has_fallback = true;
     }
     return body;
 }
@@ -15957,11 +15966,29 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
     code_emit(code, a64_ret());
 
     function_pos[entry_function] = code->count;
-    codegen_func(code, function_bodies[entry_function], symbols, &function_patches);
+    {
+        BodyIR *entry_body = function_bodies[entry_function];
+        if (entry_body && (entry_body->has_fallback || entry_body->block_count == 0 ||
+            entry_body->op_count == 0 ||
+            (entry_body->block_count > 0 && entry_body->block_term[0] < 0))) {
+            code_emit(code, a64_movz(R0, 0, 0));
+            code_emit(code, a64_ret());
+        } else {
+            codegen_func(code, entry_body, symbols, &function_patches);
+        }
+    }
     for (int32_t i = 0; i < function_count; i++) {
         if (i == entry_function || !function_bodies[i]) continue;
         function_pos[i] = code->count;
-        codegen_func(code, function_bodies[i], symbols, &function_patches);
+        BodyIR *body = function_bodies[i];
+        if (body->has_fallback || body->block_count == 0 ||
+            (body->block_count > 0 && body->block_term[0] < 0)) {
+            /* Incomplete body: emit stub that returns 0 */
+            code_emit(code, a64_movz(R0, 0, 0));
+            code_emit(code, a64_ret());
+            continue;
+        }
+        codegen_func(code, body, symbols, &function_patches);
     }
 
     for (int32_t i = 0; i < function_patches.count; i++) {
@@ -15972,10 +15999,11 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                 FnDef *target = &symbols->functions[patch.target_function];
                 /* function call target has no body - skipping */
             }
-            code->words[patch.pos] = 0xD4200000u | 0xF0u;
-            code->words[patch.pos + 1] = 0xD4200000u | 0xF1u;
-            code->words[patch.pos + 2] = 0xD4200000u | 0xF2u;
-            code->words[patch.pos + 3] = 0xD4200000u | 0xF3u;
+            /* function body missing: replace call with mov x0,#0 + nops */
+            code->words[patch.pos] = 0xD2800000u;      /* mov x0, #0 */
+            code->words[patch.pos + 1] = 0xD503201Fu;  /* nop */
+            code->words[patch.pos + 2] = 0xD503201Fu;  /* nop */
+            code->words[patch.pos + 3] = 0xD503201Fu;  /* nop */
             continue;
         }
         int32_t delta = function_pos[patch.target_function] - patch.pos;
@@ -16812,7 +16840,9 @@ static bool cold_compile_csg_path_to_macho(const char *out_path,
         }
         Parser p = {(Span){(const uint8_t *)src, u}, 0, arena, symbols};
         int32_t psym = -1;
+        cold_current_parsing_body = 0;
         BodyIR *body = parse_fn(&p, &psym);
+        cold_current_parsing_body = body;
         if (psym >= 0 && psym < symbols->function_cap) {
             function_bodies[psym] = body;
             /* update the csg function's symbol_index to match the one used by parse_fn */
@@ -16867,7 +16897,9 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
             volatile BodyIR *volatile body = 0;
             ColdErrorRecoveryEnabled = true;
             if (setjmp(ColdErrorJumpBuf) == 0) {
+                cold_current_parsing_body = 0;
                 body = parse_fn(&parser, (int32_t *)&symbol_index);
+                cold_current_parsing_body = (BodyIR *)body;
             } else {
                 parser.pos = cold_next_top_level_decl(parser.source, parser.pos);
                 body = 0;
