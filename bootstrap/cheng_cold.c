@@ -6656,7 +6656,11 @@ static void parse_type(Parser *parser) {
         parser->pos = line_end;
         return;
     }
-    if (cold_span_find_top_level_char(rhs_check, ':') < 0 &&
+    /* Allow inline paren (field: Type, ...) for generic objects.
+       Skip the complex early-return check for parenthesized RHS. */
+    bool is_paren_rhs = rhs_check.len > 0 && rhs_check.ptr[0] == '(';
+    if (!is_paren_rhs &&
+        cold_span_find_top_level_char(rhs_check, ':') < 0 &&
         cold_span_find_top_level_char(rhs_check, '|') < 0 &&
         cold_span_find_top_level_char(rhs_check, '(') < 0 &&
         !cold_span_starts_with(rhs_check, "object") &&
@@ -6664,14 +6668,21 @@ static void parse_type(Parser *parser) {
         parser->pos = line_end;
         return;
     }
+    int32_t paren_find = cold_span_find_top_level_char(rhs_check, '|');
+    bool is_inline_paren = rhs_check.len > 2 && rhs_check.ptr[0] == '(' &&
+                           rhs_check.ptr[rhs_check.len - 1] == ')' &&
+                           paren_find < 0;
     bool is_tuple_inline = cold_span_starts_with(rhs_check, "tuple[");
     bool implicit_object = cold_type_block_looks_like_object(rhs_check);
-    if (implicit_object || cold_span_starts_with(rhs_check, "object") || is_tuple_inline) {
+    if (implicit_object || cold_span_starts_with(rhs_check, "object") || is_tuple_inline || is_inline_paren) {
         int32_t field_count = 0;
         Span field_names[COLD_MAX_OBJECT_FIELDS];
         Span field_types[COLD_MAX_OBJECT_FIELDS];
         Span fields_span = {0};
-        if (is_tuple_inline) {
+        if (is_inline_paren) {
+            Span inner = span_trim(span_sub(rhs_check, 1, rhs_check.len - 1));
+            fields_span = inner;
+        } else if (is_tuple_inline) {
             Span inner = span_trim(span_sub(rhs_check, 6, rhs_check.len));
             if (inner.len > 0 && inner.ptr[inner.len - 1] == ']')
                 inner = span_sub(inner, 0, inner.len - 1);
@@ -6697,7 +6708,7 @@ static void parse_type(Parser *parser) {
         int32_t fp_pos = 0;
         while (fp_pos < fields_span.len) {
             int32_t ln_start = fp_pos;
-            if (is_tuple_inline) {
+            if (is_tuple_inline || is_inline_paren) {
                 while (fp_pos < fields_span.len) {
                     if (fields_span.ptr[fp_pos] == ',' || fields_span.ptr[fp_pos] == ';') break;
                     fp_pos++;
