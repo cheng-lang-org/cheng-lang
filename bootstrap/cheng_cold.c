@@ -8134,7 +8134,7 @@ static bool cold_try_str_slice_intrinsic(BodyIR *body, Span name,
           span_eq(name, "SliceBytes") || span_eq(name, "SliceStr"))) {
         return false;
     }
-    if (arg_count != 3) { *slot_out = body_slot(body, SLOT_STR, 16); if (kind_out) *kind_out = SLOT_STR; return true; } /* arity mismatch fallback */
+    if (arg_count != 3) die("SliceBytes intrinsic arity mismatch");
     int32_t text = body->call_arg_slot[arg_start];
     int32_t start = body->call_arg_slot[arg_start + 1];
     int32_t len = body->call_arg_slot[arg_start + 2];
@@ -8144,7 +8144,7 @@ static bool cold_try_str_slice_intrinsic(BodyIR *body, Span name,
         return 0;
     }
     if (body->slot_kind[start] != SLOT_I32 || body->slot_kind[len] != SLOT_I32) {
-        *slot_out = body_slot(body, SLOT_STR, 16); if (kind_out) *kind_out = SLOT_STR; return true; /* fallback */
+        die("SliceBytes start/len must be int32");
     }
     int32_t slot = body_slot(body, SLOT_STR, 16);
     body_slot_set_type(body, slot, cold_cstr_span("str"));
@@ -8525,7 +8525,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
     if (span_eq(name, "system.strFromCStringBorrow") ||
         span_eq(name, "system.StrFromCStringBorrow") ||
         span_eq(name, "strFromCStringBorrow")) {
-        if (arg_count != 1) { *slot_out = body_slot(body, SLOT_STR, 16); if (kind_out) *kind_out = SLOT_STR; return true; } /* arity mismatch fallback */
+        if (arg_count != 1) die("strFromCStringBorrow intrinsic arity mismatch");
         int32_t arg_slot = body->call_arg_slot[arg_start];
         int32_t arg_kind = body->slot_kind[arg_slot];
         if (arg_kind == SLOT_STR) {
@@ -8541,7 +8541,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
             *slot_out = slot;
             return true;
         }
-        *slot_out = body_slot(body, SLOT_STR, 16); if (kind_out) *kind_out = SLOT_STR; return true; /* fallback */
+        die("strFromCStringBorrow expects cstring/str");
     }
     return false;
 }
@@ -10084,7 +10084,7 @@ static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, 
                 (right_kind == SLOT_I32 || right_kind == SLOT_VARIANT)) {
                 /* fall through to tag comparison */
             } else {
-                /* fall through: treat as tag comparison */
+                die("variant comparison operands must both be variants");
             }
         }
         if (cond != COND_EQ && cond != COND_NE) {
@@ -15950,12 +15950,7 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
             } else if (value_kind == SLOT_I64) {
                 a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot], true);
             } else if (value_kind == SLOT_STR) {
-                if (body->sret_slot < 0) {
-                    /* Fallback: return 0 for unsupported str return without sret */
-                    code_emit(code, a64_movz(R0, 0, 0));
-                    code_emit(code, a64_ret());
-                    return;
-                }
+                if (body->sret_slot < 0) die("missing sret slot for str return");
                 a64_emit_ldr_sp_off(code, 8, body->slot_offset[body->sret_slot], true);
                 a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot], true);
                 code_emit(code, a64_str_imm(R0, 8, 0, true));
@@ -15964,11 +15959,7 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
             } else if (value_kind == SLOT_VARIANT || value_kind == SLOT_OBJECT ||
                        value_kind == SLOT_SEQ_I32 || value_kind == SLOT_SEQ_STR ||
                        value_kind == SLOT_SEQ_OPAQUE) {
-                if (body->sret_slot < 0) {
-                    code_emit(code, a64_movz(R0, 0, 0));
-                    code_emit(code, a64_ret());
-                    return;
-                }
+                if (body->sret_slot < 0) die("missing sret slot for composite return");
                 a64_emit_ldr_sp_off(code, 8, body->slot_offset[body->sret_slot], true);
                 int32_t total = body->return_size;
                 if (body->slot_size[value_slot] < total) return; /* skip undersized slot */;
@@ -17066,6 +17057,15 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                 symbol_index = qual_indices[fn_pos];
             }
             if (symbol_index < 0 || symbol_index >= body_cap) continue;
+            /* Selective compilation: only compile bodies with return types
+               the cold codegen fully supports (int32, int64, void).
+               str/variant/object/composite returns keep their stubs.
+               This respects "Let it crash" – instead of silently producing
+               wrong code, skip unsupported returns. */
+            if (body->return_kind != SLOT_I32 && body->return_kind != SLOT_I64 &&
+                body->return_kind > 0) {
+                continue; /* keep stub */
+            }
             function_bodies[(int32_t)symbol_index] = (BodyIR *)body;
             compiled++;
             /* Map to qualified index if available */
