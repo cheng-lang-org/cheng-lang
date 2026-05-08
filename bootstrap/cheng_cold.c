@@ -16904,15 +16904,18 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
     int32_t compiled = 0;
     /* Build alias-to-qualified index map by scanning the import file for fn names
        and matching them against symbols->functions with the alias prefix.
-       Store qual_indices indexed by fn position in the import file. */
+       Store qual_indices indexed by fn position in the import file.
+       Safety: limit to COLD_IMPORT_FN_MAP_CAP and break early if fn_pos stalls. */
     #define COLD_IMPORT_FN_MAP_CAP 128
     int32_t qual_indices[COLD_IMPORT_FN_MAP_CAP];
     for (int32_t i = 0; i < COLD_IMPORT_FN_MAP_CAP; i++) qual_indices[i] = -1;
     int32_t fn_pos = 0;
+    int32_t scan_safety = 0;
     {
         int32_t scan_pos = 0;
         int32_t line_start = 0;
-        while (scan_pos < source.len) {
+        while (scan_pos < source.len && scan_safety < 100000) {
+            scan_safety++;
             while (scan_pos < source.len && source.ptr[scan_pos] != '\n') scan_pos++;
             Span line = span_trim(span_sub(source, line_start, scan_pos));
             if (scan_pos < source.len) scan_pos++;
@@ -16922,8 +16925,10 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                 int32_t name_end = 0;
                 while (name_end < fn_name.len && (cold_ident_char(fn_name.ptr[name_end]) || fn_name.ptr[name_end] == '_' || fn_name.ptr[name_end] == '`')) name_end++;
                 fn_name = span_sub(fn_name, 0, name_end);
-                /* Search for qualified name in symbols */
-                for (int32_t si = 0; si < symbols->function_count && fn_pos < COLD_IMPORT_FN_MAP_CAP; si++) {
+                /* Search for qualified name in symbols (safety-capped) */
+                int32_t search_limit = symbols->function_count;
+                if (search_limit > 2000) search_limit = 2000;
+                for (int32_t si = 0; si < search_limit && fn_pos < COLD_IMPORT_FN_MAP_CAP; si++) {
                     FnDef *sfn = &symbols->functions[si];
                     /* Check if sfn->name starts with alias. and ends with fn_name */
                     if (sfn->name.len >= alias.len + 1 + fn_name.len &&
@@ -17011,8 +17016,12 @@ static int32_t cold_compile_imported_bodies_no_recurse(Symbols *symbols, Span en
             fprintf(stderr, "[import_body] path resolve failed: %.*s\n", module_path.len, module_path.ptr);
             continue;
         }
-        int32_t n = cold_compile_one_import_direct(symbols, path, alias, function_bodies, body_cap);
-        compiled += n;
+        ColdErrorRecoveryEnabled = true;
+        if (setjmp(ColdErrorJumpBuf) == 0) {
+            int32_t n = cold_compile_one_import_direct(symbols, path, alias, function_bodies, body_cap);
+            compiled += n;
+        }
+        ColdErrorRecoveryEnabled = false;
     }
     return compiled;
 }
@@ -17107,9 +17116,12 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
-        /* Import body compilation: functional for simple cases (cross-module add works),
-           disabled by default pending fix for qual-index mapping in multi-import modules.
-           Enable with --import-body flag or after qual-index refactor. */
+        /* Import body compilation with per-import error recovery */
+        ColdErrorRecoveryEnabled = true;
+        if (setjmp(ColdErrorJumpBuf) == 0) {
+            cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
+        }
+        ColdErrorRecoveryEnabled = false;
         Parser parser = {mapped_source, 0, arena, symbols};
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
