@@ -17508,61 +17508,60 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         return false;
     }
 
-    /* Collect function names, offsets, and compile each function individually */
+    /* Compile all functions into a shared Code buffer with position tracking.
+       This enables cross-function BL instruction resolution (same approach
+       as codegen_program for the direct executable path). */
     int32_t func_count = symbols->function_count;
-    int32_t total_words = 0;
-    int32_t *func_offsets = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
-    const char **func_names = arena_alloc(arena, (size_t)func_count * sizeof(const char *));
-    Code **func_codes = arena_alloc(arena, (size_t)func_count * sizeof(Code *));
+    Code *shared = code_new(arena, 1024);
+    int32_t *symbol_offset = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    for (int32_t i = 0; i < func_count; i++) symbol_offset[i] = -1;
 
     FunctionPatchList function_patches = {0};
     function_patches.arena = arena;
 
-    int32_t valid_count = 0;
+    /* First pass: compile each function body into the shared buffer */
     for (int32_t i = 0; i < func_count; i++) {
         if (!function_bodies[i]) continue;
-        Code *fc = code_new(arena, 128);
-        func_offsets[valid_count] = total_words;
-        /* Copy the function name (the Span points to mmap'd source, make a C string copy) */
-        Span nm = symbols->functions[i].name;
-        char *name_copy = arena_alloc(arena, (size_t)nm.len + 1);
-        memcpy(name_copy, nm.ptr, (size_t)nm.len);
-        name_copy[nm.len] = '\0';
-        func_names[valid_count] = name_copy;
-        func_codes[valid_count] = fc;
-        codegen_func(fc, function_bodies[i], symbols, &function_patches);
-        total_words += fc->count;
-        valid_count++;
-    }
-
-    /* Apply inter-function patches (bl instructions within the same object) */
-    for (int32_t pi = 0; pi < function_patches.count; pi++) {
-        FunctionPatch patch = function_patches.items[pi];
-        if (patch.target_function < 0 || patch.target_function >= func_count) continue;
-        /* Find which code segment the patch is in */
-        for (int32_t ci = 0; ci < valid_count; ci++) {
-            Code *fc = func_codes[ci];
-            if (patch.pos >= 0 && patch.pos < fc->count) {
-                int32_t target_off = func_offsets[patch.target_function];
-                int32_t delta = target_off - patch.pos;
-                uint32_t ins = fc->words[patch.pos];
-                fc->words[patch.pos] = (ins & 0xFC000000u) | ((uint32_t)delta & 0x03FFFFFFu);
-                break;
-            }
+        symbol_offset[i] = shared->count;
+        BodyIR *body = function_bodies[i];
+        if (body->has_fallback || body->block_count == 0 ||
+            (body->block_count > 0 && body->block_term[0] < 0)) {
+            /* Stub: return 0 */
+            code_emit(shared, a64_movz(R0, 0, 0));
+            code_emit(shared, a64_ret());
+        } else {
+            codegen_func(shared, body, symbols, &function_patches);
         }
     }
 
-    /* Concatenate all code into a single array */
-    uint32_t *all_code = arena_alloc(arena, (size_t)total_words * sizeof(uint32_t));
-    int32_t wp = 0;
-    for (int32_t ci = 0; ci < valid_count; ci++) {
-        Code *fc = func_codes[ci];
-        memcpy(all_code + wp, fc->words, (size_t)fc->count * sizeof(uint32_t));
-        wp += fc->count;
+    /* Resolve inter-function patches */
+    for (int32_t pi = 0; pi < function_patches.count; pi++) {
+        FunctionPatch patch = function_patches.items[pi];
+        if (patch.target_function < 0 || patch.target_function >= func_count) continue;
+        int32_t target_off = symbol_offset[patch.target_function];
+        if (target_off < 0) continue; /* target has no body, patch stays as-is */
+        int32_t delta = target_off - (int32_t)patch.pos;
+        shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
+                                   ((uint32_t)delta & 0x03FFFFFFu);
     }
 
-    bool ok = macho_write_object(out_path, all_code, total_words,
-                                 func_names, func_offsets, valid_count);
+    /* Build name/offset arrays for macho_write_object */
+    const char **func_names = arena_alloc(arena, (size_t)func_count * sizeof(const char *));
+    int32_t *func_offsets = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    int32_t name_count = 0;
+    for (int32_t i = 0; i < func_count; i++) {
+        if (symbol_offset[i] < 0) continue;
+        func_offsets[name_count] = symbol_offset[i];
+        Span nm = symbols->functions[i].name;
+        char *nc = arena_alloc(arena, (size_t)nm.len + 1);
+        memcpy(nc, nm.ptr, (size_t)nm.len);
+        nc[nm.len] = '\0';
+        func_names[name_count] = nc;
+        name_count++;
+    }
+
+    bool ok = macho_write_object(out_path, shared->words, shared->count,
+                                 func_names, func_offsets, name_count);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;
 }
