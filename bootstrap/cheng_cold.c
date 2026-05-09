@@ -5375,6 +5375,15 @@ static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
     type_name = span_trim(type_name);
     ObjectDef *existing = symbols_find_object(symbols, type_name);
     if (existing) return existing;
+    /* Fallback: search for qualified name *.type_name (imported objects) */
+    for (int32_t qi = 0; qi < symbols->object_count; qi++) {
+        ObjectDef *co = &symbols->objects[qi];
+        if (co->name.len > type_name.len + 1 &&
+            co->name.ptr[co->name.len - type_name.len - 1] == '.' &&
+            memcmp(co->name.ptr + co->name.len - type_name.len, type_name.ptr, (size_t)type_name.len) == 0) {
+            return co;
+        }
+    }
     if (span_eq(type_name, "ErrorInfo")) return symbols_ensure_std_error_info(symbols);
     if (span_eq(type_name, "Result")) return symbols_ensure_std_result_base(symbols);
     Span base_name = {0};
@@ -13478,11 +13487,11 @@ static uint32_t a64_stlr_w(int rt, int rn) {
 }
 __attribute__((unused))
 static uint32_t a64_ldaxr_w(int rt, int rn) {
-    return 0xB85FFC00u | ((uint32_t)rn << 5) | (uint32_t)rt;
+    return 0x885FFC00u | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
 __attribute__((unused))
 static uint32_t a64_stlxr_w(int rs, int rt, int rn) {
-    return 0xB800FC00u | ((uint32_t)rs << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
+    return 0x8800FC00u | ((uint32_t)rs << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
 
 /* ================================================================
@@ -16321,10 +16330,10 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         /* Compare tag (slot a) with expected value (b); trap on mismatch */
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_cmp_imm(R0, (uint16_t)b));
-        int32_t trap_pos = code->count;
-        code_emit(code, a64_bcond(0, COND_NE));
+        int32_t ok_pos = code->count;
+        code_emit(code, a64_bcond(0, COND_EQ));
         code_emit(code, a64_brk(1));
-        code->words[trap_pos] = (code->words[trap_pos] & 0xFF00001Fu) | (2u << 5);
+        code->words[ok_pos] = (code->words[ok_pos] & 0xFF00001Fu) | (2u << 5);
     } else if (kind == BODY_OP_I32_MUL) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
@@ -16417,7 +16426,9 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[b], false);
         code_emit(code, a64_stlr_w(R0, R1));
     } else if (kind == BODY_OP_ATOMIC_CAS_I32) {
-        /* CAS: a=ptr, b=desired, c=expected, dst=1(success)/0(fail) */
+        /* CAS: a=ptr, b=desired, c=expected → dst=1(success)/0(fail)
+           retry: ldaxr w3,[x0]; cmp w3,w2; b.ne fail; stlxr w4,w1,[x0]; cbnz w4,retry;
+           success: mov w0,1; b done; fail: mov w0,0; done: */
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         a64_emit_ldr_sp_off(code, R2, body->slot_offset[c], false);
@@ -16427,15 +16438,18 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         int32_t mismatch = code->count;
         code_emit(code, a64_bcond(0, COND_NE));
         code_emit(code, a64_stlxr_w(R4, R1, R0));
-        /* CBNZ R4, retry: if store failed, retry */
         code_emit(code, a64_cbnz(R4, 0));
         int32_t cbnz_pos = code->count - 1;
         code->words[cbnz_pos] = a64_cbnz(R4, retry - cbnz_pos);
+        /* success: mov w0, 1 */
+        code_emit(code, a64_movz(R0, 1, 0));
         code_emit(code, a64_b(0));
-        int32_t done_jump = code->count - 1;
-        a64_patch_bcond(code, mismatch, code->count);
-        code_emit(code, a64_cset(R0, COND_EQ));
-        code->words[done_jump] = a64_b(code->count - done_jump);
+        int32_t skip_fail = code->count - 1;
+        int32_t fail_pos = code->count;
+        a64_patch_bcond(code, mismatch, fail_pos);
+        /* fail: mov w0, 0 */
+        code_emit(code, a64_movz(R0, 0, 0));
+        code->words[skip_fail] = a64_b(code->count - skip_fail);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_MMAP) {
         /* mmap(addr, len, prot, flags) → ptr (dst)
