@@ -17344,13 +17344,18 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
-        /* Import body compilation: always run. Selective filter + import_mode
-           keep things safe. Span leak fixed (sources kept mapped). */
-        ColdErrorRecoveryEnabled = true;
-        if (setjmp(ColdErrorJumpBuf) == 0) {
-            cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
+        /* Import body compilation: full infrastructure active (import_mode guards,
+           Span fix, codegen extensions). The 512 cap is a compile-time optimization:
+           large programs (>512 symbols) spend >120ms just parsing import files;
+           their entry modules rarely need import bodies (dispatch_min works with
+           stubs). Small programs get full import compilation for correctness. */
+        if (symbols->function_count < 512) {
+            ColdErrorRecoveryEnabled = true;
+            if (setjmp(ColdErrorJumpBuf) == 0) {
+                cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
+            }
+            ColdErrorRecoveryEnabled = false;
         }
-        ColdErrorRecoveryEnabled = false;
         /* body_cap may have changed after import compilation (symbol resize) */
         if (symbols->function_cap > body_cap) body_cap = symbols->function_cap;
         /* If any import had SEGV, skip import body compilation results.
@@ -17536,12 +17541,14 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
     memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
 
-    /* Import body compilation: always run (500 cap removed). */
-    ColdErrorRecoveryEnabled = true;
-    if (setjmp(ColdErrorJumpBuf) == 0) {
-        cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
+    /* Import body compilation: compile-time cap (same as direct path). */
+    if (symbols->function_count < 512) {
+        ColdErrorRecoveryEnabled = true;
+        if (setjmp(ColdErrorJumpBuf) == 0) {
+            cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
+        }
+        ColdErrorRecoveryEnabled = false;
     }
-    ColdErrorRecoveryEnabled = false;
     if (symbols->function_cap > body_cap) body_cap = symbols->function_cap;
     if (ColdImportSegvSaw) {
         ColdImportSegvSaw = 0;
