@@ -7677,13 +7677,18 @@ static int32_t body_slot_for_object_field(BodyIR *body, ObjectField *field) {
 
 static int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *locals,
                                         ObjectDef *object) {
-    if (!parser_take(parser, "(")) die("expected ( after object constructor");
+    bool curly = false;
+    if (parser_take(parser, "{")) {
+        curly = true;
+    } else if (!parser_take(parser, "(")) {
+        die("expected ( or { after object constructor");
+    }
     int32_t payload_count = 0;
     int32_t payload_slots[COLD_MAX_OBJECT_FIELDS];
     int32_t payload_offsets[COLD_MAX_OBJECT_FIELDS];
     bool seen[COLD_MAX_OBJECT_FIELDS];
     memset(seen, 0, sizeof(seen));
-    while (!span_eq(parser_peek(parser), ")")) {
+    while (!span_eq(parser_peek(parser), curly ? "}" : ")")) {
         Span field_name = parser_token(parser);
         if (field_name.len <= 0) return 0; /* skip empty field name */;
         ObjectField *field = object_find_field(object, field_name);
@@ -7734,7 +7739,7 @@ static int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *lo
         }
         break;
     }
-    if (!parser_take(parser, ")")) return 0; /* skip malformed object constructor */
+    if (!parser_take(parser, curly ? "}" : ")")) return 0; /* skip malformed object constructor */
     int32_t payload_start = payload_count > 0 ? body->call_arg_count : -1;
     for (int32_t i = 0; i < payload_count; i++) {
         body_call_arg_with_offset(body, payload_slots[i], payload_offsets[i]);
@@ -9766,6 +9771,13 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         int32_t slot = local->slot;
         *kind = local->kind;
         return slot;
+    }
+    if (span_eq(parser_peek(parser), "{")) {
+        /* object constructor with curly braces */
+        ObjectDef *obj = symbols_resolve_object(parser->symbols, token);
+        if (!obj) die("object type missing for constructor");
+        *kind = SLOT_OBJECT;
+        return parse_object_constructor(parser, body, locals, obj);
     }
     if (parser_next_is_qualified_call(parser) || span_eq(parser_peek(parser), "(") || span_eq(parser_peek(parser), "[")) {
         Span call_name = token;
