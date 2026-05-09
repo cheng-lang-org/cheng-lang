@@ -16604,39 +16604,39 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_fmov_s(0, R0)); code_emit(code, a64_fmov_s(1, R1));
         code_emit(code, a64_fadd_s(0, 0, 1));
-        code_emit(code, a64_fmov_s(R0, 0));
+        code_emit(code, a64_fmov_sr(R0, 0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_F32_SUB) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_fmov_s(0, R0)); code_emit(code, a64_fmov_s(1, R1));
         code_emit(code, a64_fsub_s(0, 0, 1));
-        code_emit(code, a64_fmov_s(R0, 0));
+        code_emit(code, a64_fmov_sr(R0, 0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_F32_MUL) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_fmov_s(0, R0)); code_emit(code, a64_fmov_s(1, R1));
         code_emit(code, a64_fmul_s(0, 0, 1));
-        code_emit(code, a64_fmov_s(R0, 0));
+        code_emit(code, a64_fmov_sr(R0, 0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_F32_DIV) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_fmov_s(0, R0)); code_emit(code, a64_fmov_s(1, R1));
         code_emit(code, a64_fdiv_s(0, 0, 1));
-        code_emit(code, a64_fmov_s(R0, 0));
+        code_emit(code, a64_fmov_sr(R0, 0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_F32_NEG) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_fmov_s(0, R0));
         code_emit(code, a64_fneg_s(0, 0));
-        code_emit(code, a64_fmov_s(R0, 0));
+        code_emit(code, a64_fmov_sr(R0, 0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_F32_FROM_I32) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_scvtf_s(0, R0));
-        code_emit(code, a64_fmov_s(R0, 0));
+        code_emit(code, a64_fmov_sr(R0, 0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_I32_FROM_F32) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
