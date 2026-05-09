@@ -10321,6 +10321,10 @@ static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, 
         left = cold_materialize_i64_value(body, left, &left_kind);
         right = cold_materialize_i64_value(body, right, &right_kind);
         body_op3(body, BODY_OP_I64_CMP, dst, left, right, cond);
+    } else if (left_kind == SLOT_PTR || right_kind == SLOT_PTR) {
+        left = cold_materialize_i64_value(body, left, &left_kind);
+        right = cold_materialize_i64_value(body, right, &right_kind);
+        body_op3(body, BODY_OP_I64_CMP, dst, left, right, cond);
     } else if (left_kind == SLOT_VARIANT || right_kind == SLOT_VARIANT) {
         if (left_kind != SLOT_VARIANT || right_kind != SLOT_VARIANT) {
             /* tolerate I32 mixed with VARIANT (enum tag comparison) */
