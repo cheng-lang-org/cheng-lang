@@ -6901,7 +6901,7 @@ static void parse_type(Parser *parser) {
             parser_take(&line, ")");
         }
         Variant *variant = &type->variants[vi];
-        variant->name = variant_name;
+        variant->name = cold_arena_span_copy(parser->arena, variant_name);
         variant->tag = vi;
         variant->field_count = field_count;
         for (int32_t i = 0; i < field_count; i++) {
@@ -7398,8 +7398,8 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
           }
           Variant *vc = symbols_find_variant(parser->symbols, base_name);
           if (!vc) vc = symbols_find_variant(parser->symbols, name);
-          if (!vc && name.len > base_name.len) {
-              /* qualified name: Type.Variant — split and try type lookup */
+          if (!vc) {
+              /* qualified name: Type.Variant — split and scan all types */
               int32_t dot = -1;
               for (int32_t i = name.len - 1; i > 0; i--) {
                   if (name.ptr[i] == '.') { dot = i; break; }
@@ -7407,11 +7407,44 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
               if (dot > 0) {
                   Span tn = span_sub(name, 0, dot);
                   Span vn = span_sub(name, dot + 1, name.len - dot - 1);
-                  TypeDef *ty = symbols_find_type(parser->symbols, tn);
-                  if (ty) vc = type_find_variant(ty, vn);
+                  for (int32_t ti = 0; ti < parser->symbols->type_count; ti++) {
+                      TypeDef *ty = &parser->symbols->types[ti];
+                      if (span_same(ty->name, tn)) {
+                          vc = type_find_variant(ty, vn);
+                          if (vc) break;
+                      }
+                  }
               }
           }
-          if (vc) { *kind_out = SLOT_VARIANT; return parse_constructor(parser, body, locals, vc); }
+          if (!vc) {
+              /* const-based lookup: Type.Variant registered as const = tag */
+              ConstDef *cst = symbols_find_const(parser->symbols, name);
+              if (cst) {
+                  int32_t tag = cst->value;
+                  for (int32_t ti = 0; ti < parser->symbols->type_count; ti++) {
+                      TypeDef *ty = &parser->symbols->types[ti];
+                      for (int32_t vi = 0; vi < ty->variant_count; vi++) {
+                          if (ty->variants[vi].tag == tag &&
+                              ty->variants[vi].field_count == arg_count) {
+                              vc = &ty->variants[vi];
+                              break;
+                          }
+                      }
+                      if (vc) break;
+                  }
+              }
+          }
+          if (vc) {
+              *kind_out = SLOT_VARIANT;
+              /* args already consumed; fill offsets from variant layout */
+              for (int32_t ai = 0; ai < arg_count && ai < vc->field_count; ai++) {
+                  body->call_arg_offset[arg_start + ai] = vc->field_offset[ai];
+              }
+              int32_t vz = symbols_variant_slot_size(parser->symbols, vc);
+              int32_t sl = body_slot(body, SLOT_VARIANT, vz);
+              body_op3(body, BODY_OP_MAKE_VARIANT, sl, vc->tag, arg_start, arg_count);
+              return sl;
+          }
         }
         { int32_t param_kinds[COLD_MAX_I32_PARAMS];
           int32_t param_sizes[COLD_MAX_I32_PARAMS];
