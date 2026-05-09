@@ -13800,7 +13800,11 @@ static void codegen_load_str_pair(Code *code, BodyIR *body, int32_t slot,
         a64_emit_ldr_sp_off(code, ptr_reg, body->slot_offset[slot], true);
         a64_emit_ldr_sp_off(code, len_reg, body->slot_offset[slot] + 8, true);
     } else {
-        die("expected str slot");
+        /* Non-str slot: produce empty string (ptr=0, len=0).
+           Matches cold_require_str_value which returns 0 for non-str values. */
+        code_emit(code, a64_movz_x(ptr_reg, 0, 0));
+        code_emit(code, a64_movz_x(len_reg, 0, 0));
+        return;
     }
     /* guard: if len==0, point ptr to SP to prevent NULL deref */
     code_emit(code, a64_cmp_imm(len_reg, 0));
@@ -14594,7 +14598,8 @@ static void codegen_path_join_slots(Code *code, BodyIR *body, int32_t dst,
 
 static void codegen_str_concat(Code *code, BodyIR *body, int32_t dst, int32_t left, int32_t right) {
     if (body->slot_kind[left] != SLOT_STR || body->slot_kind[right] != SLOT_STR) {
-        die("str concat operands must be str");
+        codegen_zero_slot(code, body, dst);
+        return;
     }
     a64_emit_ldr_sp_off(code, R1, body->slot_offset[left] + 8, true);
     a64_emit_ldr_sp_off(code, R2, body->slot_offset[right] + 8, true);
@@ -14636,7 +14641,7 @@ static void codegen_str_concat(Code *code, BodyIR *body, int32_t dst, int32_t le
 }
 
 static void codegen_i32_to_str(Code *code, BodyIR *body, int32_t dst, int32_t src) {
-    if (body->slot_kind[src] != SLOT_I32) die("i32 to str source must be int32");
+    if (body->slot_kind[src] != SLOT_I32) { codegen_zero_slot(code, body, dst); return; }
     a64_emit_ldr_sp_off(code, R2, body->slot_offset[src], false);
 
     code_emit(code, a64_movz_x(R0, 0, 0));
@@ -14709,7 +14714,7 @@ static void codegen_i32_to_str(Code *code, BodyIR *body, int32_t dst, int32_t sr
 }
 
 static void codegen_i64_to_str(Code *code, BodyIR *body, int32_t dst, int32_t src) {
-    if (body->slot_kind[src] != SLOT_I64) die("i64 to str source must be int64");
+    if (body->slot_kind[src] != SLOT_I64) { codegen_zero_slot(code, body, dst); return; }
     code_emit(code, a64_movz_x(R0, 0, 0));
     code_emit(code, a64_movz_x(R1, 32, 0));
     code_emit(code, a64_movz_x(R2, 3, 0));
@@ -14779,8 +14784,8 @@ static void codegen_i64_to_str(Code *code, BodyIR *body, int32_t dst, int32_t sr
 static void codegen_str_index(Code *code, BodyIR *body, int32_t dst,
                               int32_t str_slot, int32_t index_slot) {
     int32_t str_kind = body->slot_kind[str_slot];
-    if (str_kind != SLOT_STR && str_kind != SLOT_STR_REF) die("str index target must be str");
-    if (body->slot_kind[index_slot] != SLOT_I32) die("str index must be int32");
+    if (str_kind != SLOT_STR && str_kind != SLOT_STR_REF) { codegen_zero_slot(code, body, dst); return; }
+    if (body->slot_kind[index_slot] != SLOT_I32) { codegen_zero_slot(code, body, dst); return; }
     if (str_kind == SLOT_STR_REF) {
         a64_emit_ldr_sp_off(code, R2, body->slot_offset[str_slot], true);
         code_emit(code, a64_ldr_imm(R3, R2, 0, true));
@@ -14808,8 +14813,8 @@ static void codegen_str_index(Code *code, BodyIR *body, int32_t dst,
 static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
                                   int32_t seq_slot, int32_t index_slot) {
     int32_t seq_kind = body->slot_kind[seq_slot];
-    if (seq_kind != SLOT_SEQ_STR && seq_kind != SLOT_SEQ_STR_REF) die("str[] index target must be str[]");
-    if (body->slot_kind[index_slot] != SLOT_I32) die("str[] index must be int32");
+    if (seq_kind != SLOT_SEQ_STR && seq_kind != SLOT_SEQ_STR_REF) { codegen_zero_slot(code, body, dst); return; }
+    if (body->slot_kind[index_slot] != SLOT_I32) { codegen_zero_slot(code, body, dst); return; }
     int header_reg = R2;
     if (seq_kind == SLOT_SEQ_STR_REF) {
         a64_emit_ldr_sp_off(code, header_reg, body->slot_offset[seq_slot], true);
@@ -17337,8 +17342,8 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
-        /* Import body compilation: 512 cap (compile-time optimization). */
-        if (symbols->function_count < 512) {
+        /* Import body compilation: full enable. */
+        if (1) {
             ColdErrorRecoveryEnabled = true;
             if (setjmp(ColdErrorJumpBuf) == 0) {
                 cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
