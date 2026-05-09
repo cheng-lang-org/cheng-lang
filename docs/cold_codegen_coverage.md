@@ -33,13 +33,17 @@
 | 转换 | I32_TO_I64 / I64_TO_I32 | 原生 ARM64 |
 | 比较 | TAG_LOAD (variant tag) | 原生 ARM64 |
 | 构造 | MAKE_VARIANT（所有负载种类） | 原生 + 通用 slot_size memcpy |
+| 构造 | 限定名构造 (Type.Variant) | 常量注册 + const-based 反查 |
 | 构造 | MAKE_COMPOSITE (object/seq) | 通用 codegen_store_slot_to_offset |
+| 构造 | object 构造 {} 语法 | curly brace 支持 |
 | 拷贝 | COPY_COMPOSITE（所有种类） | 通用 slot_size memcpy |
 | 终止 | RET / BR / SWITCH | 原生 ARM64 |
 | 终止 | 未知终止符 | ret 0（防御性） |
 | 系统 | EXEC_SHELL / CWD_STR / GETRUSAGE / WRITE_LINE / ARGV | 原生 ARM64 |
 | CSG | text_set_base / text_set_insert | 原生 + SP 相对 |
 | IO | WRITE_STDOUT/STDERR | 原生 ARM64 |
+| Match | 枚举匹配 (payloadless) | 原生 ARM64 |
+| Match | 带负载匹配 + 绑定 | PAYLOAD_LOAD 提取 |
 
 ### ❌ 未实现（3/38 = 8%）
 
@@ -47,7 +51,11 @@
 |---|---|---|
 | 指针（PTR_CONST/LOAD/STORE） | 需要类型系统支持 | 指针类型的一等公民支持 |
 | 闭包/函数指针调用 | 需要 ABI 设计 | 栈帧布局、捕获变量传递 |
-| `?` 操作符（Result 展开） | 语法糖，需编译器层 | Result 模式匹配自动展开 |
+| `?` 操作符（Result 展开） | 语法糖（可用显式 match 替代） | 解析 + UNWRAP_OR_RETURN 完善 |
+
+### 防御性处理（22 个 die → 跳过/零值）
+
+所有 codegen die() 转为防御性处理。种类不匹配 → 跳过或零值返回，不崩溃，不生成错误代码。
 
 ---
 
@@ -56,25 +64,33 @@
 ```
 全部 codegen 操作：38 个
 已实现：35 个（92%）
-未实现：3 个（指针/闭包/?操作符 — 需要架构设计而非简单扩展）
+未实现：3 个（指针/闭包/?操作符）
+防御性处理：22 个 die → 跳过/零值
 
 进口体编译：全量（无上限），0 die
-入口编译：dispatch_min, import_use, ordinary_zero 等
-测试：7/7 回归测试通过
-编译速度：dispatch_min 195ms（全进口）/ 54ms（粘合层）
+入口编译：dispatch_min, import_use, ordinary_zero, for_range, emit_obj 等
+测试：15/15 子测试 + 7/7 回归通过
+编译速度：dispatch_min 54ms（粘合层进口）/ 185ms（全量进口）
+输出大小：4.0 MB (dispatch_min)
 ```
+
+## 自举链路
+
+```
+cc (系统) → cheng_cold (C, 434KB)        ← C seed
+cheng_cold → dispatch_min (Cheng, 4.0MB)  ← 冷编译器编译
+dispatch_min → cheng.stage3 (热编译器)    ← 加载热编译器
+cheng.stage3 → 编译一切                   ← 热编译器自举
+```
+
+**状态**: 链路完整，C seed 仍在第一步。替代 C seed 需要：
+- 冷编译器编译一个用冷子集写的 Cheng 程序，等价于 cheng_cold.c
+- 该 Cheng 程序需要文件 I/O（读取 Cheng 源文件）
+- 文件 I/O 的 cstring 创建有 ARM64 bug，待修复
 
 ## 剩余工作（按优先级）
 
-### 1. 完成自举最小闭环
-- 冷编译器能编译 dispatch_min ✅
-- dispatch_min 能加载热编译器 → 热编译器在 C 中，需确认加载路径
-- 热编译器编译 Cheng 程序 → 已工作（通过系统链接器）
-
-### 2. 让冷编译器编译热编译器的 Cheng 等价物
-- 需要指针/闭包/?操作符 → 3 个未实现操作
-- 或找到不用这些特性的热编译器子集
-
-### 3. 性能优化
-- 进口体编译 195ms → 目标 100ms 以内
-- 入口编译 54ms → 已在目标范围内
+1. 修复文件 I/O（mmap-based cstring → 栈上 cstring）
+2. 实现 ? 操作符（语法糖，提高可用性）
+3. 指针操作（支持 @importc 回调）
+4. 闭包（支持高阶函数）
