@@ -7339,6 +7339,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
             arg_kind != SLOT_SEQ_STR && arg_kind != SLOT_SEQ_STR_REF &&
             arg_kind != SLOT_SEQ_OPAQUE &&
             arg_kind != SLOT_OBJECT_REF &&
+            arg_kind != SLOT_PTR &&
             arg_kind != SLOT_OPAQUE && arg_kind != SLOT_OPAQUE_REF) die("unsupported cold function call arg kind");
         arg_slots[arg_count++] = arg_slot;
         if (span_eq(parser_peek(parser), ",")) (void)parser_token(parser);
@@ -7602,6 +7603,7 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
             arg_kind != SLOT_SEQ_STR && arg_kind != SLOT_SEQ_STR_REF &&
             arg_kind != SLOT_SEQ_OPAQUE &&
             arg_kind != SLOT_OBJECT_REF &&
+            arg_kind != SLOT_PTR &&
             arg_kind != SLOT_OPAQUE && arg_kind != SLOT_OPAQUE_REF) die("unsupported cold function call arg kind");
         arg_slots[arg_count++] = arg_slot;
         if (span_eq(parser_peek(&arg_parser), ",")) (void)parser_token(&arg_parser);
@@ -9917,6 +9919,19 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         Span tn = parser_token(parser);
         if (!parser_take(parser, ")")) die("new(Type): missing )");
         ObjectDef *nobj = symbols_find_object(parser->symbols, tn);
+        /* Try qualified name lookup if unqualified fails */
+        if (!nobj) {
+            int32_t qlen = 0;
+            for (int32_t qi = 0; qi < parser->symbols->object_count && qlen < 64; qi++) {
+                ObjectDef *co = &parser->symbols->objects[qi];
+                /* Check if name ends with ".tn" */
+                if (co->name.len > tn.len + 1 && co->name.ptr[co->name.len - tn.len - 1] == '.' &&
+                    memcmp(co->name.ptr + co->name.len - tn.len, tn.ptr, (size_t)tn.len) == 0) {
+                    nobj = co;
+                    break;
+                }
+            }
+        }
         if (nobj && nobj->slot_size > 0) {
             int32_t len = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, len, nobj->slot_size, 0);
@@ -10274,6 +10289,21 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
             }
             slot = dst;
             *kind = SLOT_I32;
+            continue;
+        }
+        if (span_eq(parser_peek(parser), "?")) {
+            (void)parser_token(parser);
+            if (*kind == SLOT_VARIANT) {
+                int32_t tag_slot = body_slot(body, SLOT_I32, 4);
+                body_op(body, BODY_OP_TAG_LOAD, tag_slot, slot, 0);
+                int32_t payload_slot = body_slot(body, SLOT_I32, 4);
+                body_op(body, BODY_OP_PAYLOAD_LOAD, payload_slot, slot, 8);
+                body_op3(body, BODY_OP_UNWRAP_OR_RETURN, payload_slot, tag_slot, 0, 0);
+                slot = payload_slot;
+                *kind = SLOT_I32;
+                continue;
+            }
+            /* Non-variant ?: no-op, return the slot itself */
             continue;
         }
         break;
@@ -10748,6 +10778,18 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
     if (field_name.len <= 0) die("expected field name in assignment");
     Span object_type = cold_type_strip_var(body->slot_type[local->slot], 0);
     ObjectDef *object = symbols_resolve_object(parser->symbols, object_type);
+    if (!object) {
+        /* Try qualified name fallback (imported objects use alias.TypeName) */
+        for (int32_t qoi = 0; qoi < parser->symbols->object_count; qoi++) {
+            ObjectDef *co = &parser->symbols->objects[qoi];
+            if (co->name.len > object_type.len + 1 &&
+                co->name.ptr[co->name.len - object_type.len - 1] == '.' &&
+                memcmp(co->name.ptr + co->name.len - object_type.len, object_type.ptr, (size_t)object_type.len) == 0) {
+                object = co;
+                break;
+            }
+        }
+    }
     if (!object) die("field assignment object type missing");
     ObjectField *field = object_find_field(object, field_name);
     if (!field) die("unknown field assignment target");
@@ -16276,7 +16318,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             }
         }
     } else if (kind == BODY_OP_UNWRAP_OR_RETURN) {
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[dst], true);
+        /* Compare tag (slot a) with expected value (b); trap on mismatch */
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_cmp_imm(R0, (uint16_t)b));
         int32_t trap_pos = code->count;
         code_emit(code, a64_bcond(0, COND_NE));
