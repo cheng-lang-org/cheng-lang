@@ -13695,28 +13695,9 @@ static void codegen_store_slot_to_payload(Code *code, BodyIR *body,
                                           int32_t dst_slot, int32_t dst_offset,
                                           int32_t src_slot) {
     int32_t dst_kind = body->slot_kind[dst_slot];
+    if (dst_kind != SLOT_OBJECT && dst_kind != SLOT_OBJECT_REF) die("payload store target must be object");
     if (dst_kind == SLOT_OBJECT) {
         codegen_store_slot_to_offset(code, body, dst_slot, dst_offset, src_slot);
-        return;
-    }
-    if (dst_kind != SLOT_OBJECT_REF) {
-        /* Non-object, non-ref slot: write directly to SP + offset + field_offset */
-        int32_t base_off = body->slot_offset[dst_slot];
-        int32_t total_off = base_off + dst_offset;
-        int32_t src_kind = body->slot_kind[src_slot];
-        if (src_kind == SLOT_I32) {
-            a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot], false);
-            a64_emit_str_sp_off(code, R1, total_off, false);
-        } else if (src_kind == SLOT_I64) {
-            a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot], true);
-            a64_emit_str_sp_off(code, R1, total_off, true);
-        } else {
-            int32_t sz = body->slot_size[src_slot];
-            for (int32_t off = 0; off < sz; off += 8) {
-                a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot] + off, true);
-                a64_emit_str_sp_off(code, R1, total_off + off, true);
-            }
-        }
         return;
     }
     a64_emit_ldr_sp_off(code, R2, body->slot_offset[dst_slot], true);
@@ -13800,11 +13781,7 @@ static void codegen_load_str_pair(Code *code, BodyIR *body, int32_t slot,
         a64_emit_ldr_sp_off(code, ptr_reg, body->slot_offset[slot], true);
         a64_emit_ldr_sp_off(code, len_reg, body->slot_offset[slot] + 8, true);
     } else {
-        /* Non-str slot: skip silently. Import body compilation may reference
-           str operations on non-str types; this produces a no-op. */
-        code_emit(code, a64_movz(ptr_reg, 0, 0));
-        code_emit(code, a64_movz(len_reg, 0, 0));
-        return;
+        die("expected str slot");
     }
     /* guard: if len==0, point ptr to SP to prevent NULL deref */
     code_emit(code, a64_cmp_imm(len_reg, 0));
@@ -14813,11 +14790,7 @@ static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
                                   int32_t seq_slot, int32_t index_slot) {
     int32_t seq_kind = body->slot_kind[seq_slot];
     if (seq_kind != SLOT_SEQ_STR && seq_kind != SLOT_SEQ_STR_REF) die("str[] index target must be str[]");
-    if (body->slot_kind[index_slot] != SLOT_I32) {
-        /* Non-int32 index: return empty str (zero-initialized slot) */
-        codegen_zero_slot(code, body, dst);
-        return;
-    }
+    if (body->slot_kind[index_slot] != SLOT_I32) die("str[] index must be int32");
     int header_reg = R2;
     if (seq_kind == SLOT_SEQ_STR_REF) {
         a64_emit_ldr_sp_off(code, header_reg, body->slot_offset[seq_slot], true);
@@ -14858,8 +14831,7 @@ static void codegen_seq_header_addr(Code *code, BodyIR *body, int32_t seq_slot, 
         a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
         return;
     }
-    /* Unknown seq kind: use SP-relative (same as inline seq_i32) */
-    a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
+    die("seq header address target must be int32[]");
 }
 
 static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg) {
@@ -14872,8 +14844,7 @@ static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_sl
         a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
         return;
     }
-    /* Unknown seq str kind: use SP-relative */
-    a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
+    die("seq header address target must be str[]");
 }
 
 static void codegen_seq_i32_add(Code *code, BodyIR *body, int32_t seq_slot, int32_t value_slot) {
