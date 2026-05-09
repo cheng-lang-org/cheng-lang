@@ -4409,6 +4409,10 @@ enum {
     BODY_OP_I64_DIV = 80,
     BODY_OP_I64_CMP = 81,
     BODY_OP_I64_TO_STR = 82,
+    BODY_OP_OPEN = 83,
+    BODY_OP_READ = 84,
+    BODY_OP_CLOSE = 85,
+    BODY_OP_MMAP = 86,
 };
 
 enum {
@@ -8660,6 +8664,51 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         }
         die("strFromCStringBorrow expects cstring/str");
     }
+    if (span_eq(name, "open")) {
+        if (arg_count != 2) return false;
+        int32_t path = body->call_arg_slot[arg_start];
+        int32_t flags = body->call_arg_slot[arg_start + 1];
+        if (body->slot_kind[path] != SLOT_STR && body->slot_kind[path] != SLOT_STR_REF) return false;
+        if (body->slot_kind[flags] != SLOT_I32) return false;
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_OPEN, slot, path, flags);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "read")) {
+        if (arg_count != 3) return false;
+        int32_t fd = body->call_arg_slot[arg_start];
+        int32_t buf = body->call_arg_slot[arg_start + 1];
+        int32_t count = body->call_arg_slot[arg_start + 2];
+        if (body->slot_kind[fd] != SLOT_I32 ||
+            body->slot_kind[count] != SLOT_I32) return false;
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op3(body, BODY_OP_READ, slot, fd, buf, count);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "close")) {
+        if (arg_count != 1) return false;
+        int32_t fd = body->call_arg_slot[arg_start];
+        if (body->slot_kind[fd] != SLOT_I32) return false;
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_CLOSE, slot, fd, 0);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "mmap")) {
+        if (arg_count != 1) return false;
+        int32_t len = body->call_arg_slot[arg_start];
+        if (body->slot_kind[len] != SLOT_I32) return false;
+        int32_t slot = body_slot(body, SLOT_I64, 8);
+        body_op(body, BODY_OP_MMAP, slot, len, 0);
+        if (kind_out) *kind_out = SLOT_I64;
+        *slot_out = slot;
+        return true;
+    }
     return false;
 }
 
@@ -9696,9 +9745,9 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         return parse_scalar_identity_cast(parser, body, locals, token, kind);
     }
     if (span_eq(token, "nil")) {
-        int32_t slot = body_slot(body, SLOT_STR, 16);
-        body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, -1, 0);
-        *kind = SLOT_STR;
+        int32_t slot = body_slot(body, SLOT_PTR, 8);
+        body_op(body, BODY_OP_PTR_CONST, slot, 0, 0);
+        *kind = SLOT_PTR;
         return slot;
     }
     if (token.len > 2 && token.ptr[0] == '0' &&
@@ -16114,6 +16163,38 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         else op_word = a64_eor_reg(R0, R0, R1);
         code_emit(code, op_word);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_OPEN) {
+        /* open(path_str, flags) → fd (dst)
+           a: path slot (SLOT_STR), b: flags slot (SLOT_I32) */
+        codegen_cstring_from_slot(code, body, a, 7, 55);
+        code_emit(code, a64_add_imm(R0, 7, 0, true));
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        code_emit(code, a64_movz_x(16, 5, 0));
+        code_emit(code, a64_svc(0x80));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_READ) {
+        /* read(fd, buf, count) → bytes_read (dst)
+           a: fd slot, b: buf slot, c: count slot */
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_add_large(code, R1, SP, body->slot_offset[b], true);
+        a64_emit_ldr_sp_off(code, R2, body->slot_offset[c], false);
+        code_emit(code, a64_movz_x(16, 3, 0));
+        code_emit(code, a64_svc(0x80));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_CLOSE) {
+        /* close(fd) → result (dst)
+           a: fd slot */
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        code_emit(code, a64_movz_x(16, 6, 0));
+        code_emit(code, a64_svc(0x80));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_MMAP) {
+        /* mmap(addr, len, prot, flags) → ptr (dst)
+           uses codegen_mmap_len_reg internally */
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], false);
+        codegen_mmap_len_reg(code, R1, 3, 56);
+        code_emit(code, a64_add_imm(R0, 3, 0, true));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     } else {
         ; /* unknown op: skip silently */
     }

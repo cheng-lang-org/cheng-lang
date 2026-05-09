@@ -49080,6 +49080,7 @@ static bool cheng_seed_provider_export_roots_for_module(const ChengSeedSystemLin
             "cheng_os_join_path_bridge",
             "cheng_panic_cstring_and_exit",
             "cheng_ptr_size",
+            "cheng_read_file_bridge",
             "cheng_pty_close_bridge",
             "cheng_pty_wait_bridge",
             "cheng_pty_wait_bridge_last_exit_code",
