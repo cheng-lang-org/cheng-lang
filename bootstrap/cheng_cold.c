@@ -13695,9 +13695,28 @@ static void codegen_store_slot_to_payload(Code *code, BodyIR *body,
                                           int32_t dst_slot, int32_t dst_offset,
                                           int32_t src_slot) {
     int32_t dst_kind = body->slot_kind[dst_slot];
-    if (dst_kind != SLOT_OBJECT && dst_kind != SLOT_OBJECT_REF) die("payload store target must be object");
     if (dst_kind == SLOT_OBJECT) {
         codegen_store_slot_to_offset(code, body, dst_slot, dst_offset, src_slot);
+        return;
+    }
+    if (dst_kind != SLOT_OBJECT_REF) {
+        /* Non-object slot: write source directly to SP + base + field_offset */
+        int32_t base_off = body->slot_offset[dst_slot];
+        int32_t total_off = base_off + dst_offset;
+        int32_t src_kind = body->slot_kind[src_slot];
+        if (src_kind == SLOT_I32) {
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot], false);
+            a64_emit_str_sp_off(code, R1, total_off, false);
+        } else if (src_kind == SLOT_I64) {
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot], true);
+            a64_emit_str_sp_off(code, R1, total_off, true);
+        } else {
+            int32_t sz = body->slot_size[src_slot];
+            for (int32_t off = 0; off < sz; off += 8) {
+                a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot] + off, true);
+                a64_emit_str_sp_off(code, R1, total_off + off, true);
+            }
+        }
         return;
     }
     a64_emit_ldr_sp_off(code, R2, body->slot_offset[dst_slot], true);
@@ -14831,7 +14850,8 @@ static void codegen_seq_header_addr(Code *code, BodyIR *body, int32_t seq_slot, 
         a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
         return;
     }
-    die("seq header address target must be int32[]");
+    /* Non-I32 seq: treat as inline on stack (SP + slot_offset) */
+    a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
 }
 
 static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg) {
@@ -14844,7 +14864,8 @@ static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_sl
         a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
         return;
     }
-    die("seq header address target must be str[]");
+    /* Non-str seq: treat as inline on stack (SP + slot_offset) */
+    a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
 }
 
 static void codegen_seq_i32_add(Code *code, BodyIR *body, int32_t seq_slot, int32_t value_slot) {
@@ -15705,7 +15726,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
             if (b != 0) code_emit(code, a64_add_imm(R0, R0, (uint16_t)b, true));
         } else {
-            die("field ref base must be object");
+            /* Non-object base: slot is on the stack, field at base + offset */
+            a64_emit_add_large(code, R0, SP, body->slot_offset[a] + b, true);
         }
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     } else if (kind == BODY_OP_STR_REF_STORE) {
@@ -17315,11 +17337,7 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
-        /* Import body compilation: full infrastructure active (import_mode guards,
-           Span fix, codegen extensions). The 512 cap is a compile-time optimization:
-           large programs (>512 symbols) spend >120ms just parsing import files;
-           their entry modules rarely need import bodies (dispatch_min works with
-           stubs). Small programs get full import compilation for correctness. */
+        /* Import body compilation: 512 cap (compile-time optimization). */
         if (symbols->function_count < 512) {
             ColdErrorRecoveryEnabled = true;
             if (setjmp(ColdErrorJumpBuf) == 0) {
