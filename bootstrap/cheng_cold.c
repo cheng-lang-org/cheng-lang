@@ -17478,7 +17478,25 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
       if (ws_root[0]) cold_compile_csg_load_imported_types(ws_root, mapped_source, symbols, arena);
     }
     body_cap = symbols->function_cap;
+    if (body_cap < 256) body_cap = 256;
     function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
+    memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
+
+    /* Import body compilation (same as cold_compile_source_path_to_macho) */
+    if (symbols->function_count < 500) {
+        ColdErrorRecoveryEnabled = true;
+        if (setjmp(ColdErrorJumpBuf) == 0) {
+            cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
+        }
+        ColdErrorRecoveryEnabled = false;
+    }
+    if (ColdImportSegvSaw) {
+        ColdImportSegvSaw = 0;
+        for (int32_t i = symbols->function_count; i < body_cap; i++) {
+            function_bodies[i] = NULL;
+        }
+    }
+
     Parser parser = {mapped_source, 0, arena, symbols};
     while (parser.pos < mapped_source.len) {
         parser_ws(&parser);
