@@ -9121,6 +9121,12 @@ static bool cold_try_slplan_intrinsic(Parser *parser, BodyIR *body, Span name,
         if (arg_count != 1) die("SystemLinkPlanListText arity mismatch");
         int32_t items = body->call_arg_slot[arg_start];
         if (body->slot_kind[items] != SLOT_SEQ_STR && body->slot_kind[items] != SLOT_SEQ_STR_REF) {
+            if (parser->import_mode) {
+                int32_t slot = body_slot(body, SLOT_STR, 16);
+                if (kind_out) *kind_out = SLOT_STR;
+                *slot_out = slot;
+                return true;
+            }
             die("SystemLinkPlanListText expects str[]");
         }
         int32_t sep = cold_make_str_literal_cstr_slot(body, ",");
