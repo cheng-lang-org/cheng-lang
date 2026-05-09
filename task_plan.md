@@ -52,10 +52,10 @@
 - 已完成：冷端重建直接导入体编译：入口 source-direct 先加载直接/传递 import 类型与签名，再对直接 import 做非递归 body parse；导入 Parser 带 alias，本地函数调用解析为 `alias.name`；声明函数进入 external 符号，真实 body 清 external；linkerless codegen 只发射入口可达函数闭包。
 - 已完成：生成物 `backend_driver_dispatch_min_probe status --root:. --in:src/core/tooling/backend_driver_dispatch_min.cheng --out:...` 跑通，输出 `flag_exec_edges=0` 和 `flag_exec_unresolved=0`。
 - 已完成：direct import body 版 `backend_driver_dispatch_min_probe` 编译报告 `cold_compile_elapsed_ms=153.175`，`status` exit 0；其 `system-link-exec --in:src/tests/ordinary_zero_exit_fixture.cheng --out:...` exit 0，产物 Mach-O 运行 exit 0。
-- 已完成：生成物 `backend_driver_dispatch_min_probe system-link-exec --in:src/tests/ordinary_zero_exit_fixture.cheng` 已越过 `ccsg.BuildCompilerCsgInto`，在 `lower.BuildLoweringPlanStubFromCompilerCsg` 边界结构化返回 exit `2`，stderr 写出 `cold runtime unsupported: lower.BuildLoweringPlanStubFromCompilerCsg`，不再 SIGTRAP。
+- 已完成：生成物 `backend_driver_dispatch_min_probe system-link-exec --in:src/tests/ordinary_zero_exit_fixture.cheng` 已去掉 cold probe direct emit 短路，真实进入 `system_link_plan -> compiler_csg`；当前在 `ccsg.BuildCompilerCsgInto` 边界结构化返回 exit `2`，stderr 写出 `cold full compiler integration: CompilerCsg materializer is not connected`，report sidecar 非空并包含 `exec_phase_*` key，不再 SIGTRAP、不再假写 output。
 - 已完成：cold 报告新增 `cold_max_frame_size/cold_max_frame_function` 和 `AfterSourceBundle/AfterCsg` 帧大小，当前 probe 为 `22032/BackendDriverDispatchMinAppendPrimaryPlanReport`、`784`、`1600`。
 - 已完成：`WriteTextFile(root,path,text)` 冷端按 root 解析 path；object field store 新增 slot 边界硬检查，避免物化器字段写越界静默污染调用方槽。
-- 下一步：先修 `AfterCsg` lowering 失败路径 report sidecar 未写出的问题；再补 ARM64 大帧/大偏移编码；再把 `lower.BuildLoweringPlanStubFromCompilerCsg -> pobj.BuildPrimaryObjectPlan -> direct.DirectObjectEmit*` 从结构化错误/运行时 trap 推进到真实 Cheng body/materializer；CSG writer 的多行函数签名续行边界仍需同步修。
+- 下一步：先接 `ccsg.BuildCompilerCsgInto` 的真实 CSG materializer；再补 ARM64 大帧/大偏移编码；再把 `lower.BuildLoweringPlanStubFromCompilerCsg -> pobj.BuildPrimaryObjectPlan -> direct.DirectObjectEmit*` 从结构化错误/运行时 trap 推进到真实 Cheng body/materializer；CSG writer 的多行函数签名续行边界仍需同步修。
 
 - 迁移目标：仓库根包固定为 `pkg://cheng`，唯一源码树为 `src`，编译器内核在 `src/core`。
 - 已完成：源码、测试、seed、r2c 工具路径和公开环境变量去掉旧版本标识。

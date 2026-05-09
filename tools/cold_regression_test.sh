@@ -1,7 +1,7 @@
 #!/bin/bash
 # Cold compiler regression test suite
 # Run: bash tools/cold_regression_test.sh
-set -euo pipefail
+set -uo pipefail
 
 COLD="${CHENG_COLD:-/tmp/cheng_cold}"
 [ -x "$COLD" ] || { echo "Build: cc -std=c11 -O2 -o /tmp/cheng_cold bootstrap/cheng_cold.c"; exit 1; }
@@ -44,9 +44,9 @@ assert "import_use" 3 "$ACT"
 quiet $COLD system-link-exec --in:src/core/tooling/backend_driver_dispatch_min.cheng \
     --target:arm64-apple-darwin --out:/tmp/ct_dm
 if [ -x /tmp/ct_dm ]; then
-    /tmp/ct_dm status --root:. --in:src/core/tooling/backend_driver_dispatch_min.cheng --out:/dev/null 2>/dev/null \
-        | grep -q 'flag_exec_edges=0'
-    assert "dispatch_min" 0 $?
+    STATUS=$(/tmp/ct_dm status --root:. --in:src/core/tooling/backend_driver_dispatch_min.cheng --out:/dev/null 2>/dev/null)
+    HAS_EDGES=$(echo "$STATUS" | grep -c 'flag_exec_edges=0' || true)
+    assert "dispatch_min" 1 "$HAS_EDGES"
 else
     assert "dispatch_min" 0 "COMPILE_FAILED"
 fi
@@ -85,6 +85,10 @@ else
     ACT="LINK_FAILED"
 fi
 assert "emit_obj_cross" 3 "$ACT"
+
+# 7: language subset coverage
+ACT=$(compile_run src/tests/cold_subset_coverage.cheng /tmp/ct_cov)
+assert "subset_coverage" 0 "$ACT"
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="

@@ -207,10 +207,10 @@
 - `std/result` 的当前语义是 object layout：`ok/value/err(ErrorInfo)`，不是旧 ADT `Ok|Err`；冷路径的 `IsErr/IsOk/Value/Error` 必须按 object field offset lowering，并让 `Result[T]` 实例参与真实复合 ABI。
 - Mach-O 入口 wrapper 调用真实 `main` 前会覆盖 `LR`；如果要保存 `argc/argv` 到 callee-saved register，必须同时保存入口 `LR`，否则 wrapper `ret` 会跳回自身形成死循环。
 - `SystemLinkPlanStub` materializer 当前只承诺 status/driver 消费所需字段；sourceClosure/runtime/provider 序列先保持空序列，避免未稳定的运行态 `str[] add` 污染 plan。
-- `ccsg.BuildCompilerCsgInto` 当前已越过控制边界：生成物可以进入下一层 lowering；这还不是完整 CSG 源码闭包，下一步仍要用真实 Cheng body/materializer 补齐 nodes/typed facts。
+- cold probe 的 `DirectObjectEmitWriteObject` cmdline 短路会把普通 `system-link-exec` 伪装成成功；全编译器接入必须移除该短路，让生成物真实走 `system_link_plan -> compiler_csg -> lowering`。
+- `ccsg.BuildCompilerCsgInto` 未接入时必须结构化失败并写 report sidecar；禁止返回空 `CompilerCsg` 或假成功去推进 lowering。
 - `lower.BuildLoweringPlanStubFromCompilerCsg` 当前必须结构化返回 false+error，不能 trap、空 report、成功对象或空对象继续执行；下一步要用真实 Cheng body/materializer 替换这个错误边界。
-- `AfterCsg` 层 lowering 失败路径当前 stderr 有错误文本，但 report sidecar 没写出；这是报告桥/参数 ABI 缺口，必须先修，不能只看 exit 2。
-- `WriteTextFile(root,path,text)` 只修 root/path 解析不够；pre-CSG 错误报告能写，AfterCsg lowering 报告仍缺失，说明问题在 AfterCsg 进入后的参数/局部槽/错误路径，而不是单纯相对路径。
+- `WriteTextFile(root,path,text)` 只修 root/path 解析不够；pre-CSG 错误报告能写时，后续不能继续在路径层打补丁，要查参数/局部槽/错误路径。
 - 当前 probe 最大函数帧已到 `22032`，虽然 AfterCsg 自身只有 `1600`，但 ARM64 prologue/local address 的大立即数编码仍不能继续拖；完整自举前必须支持大栈帧和大偏移 load/store，不能靠当前小函数路径偶然通过。
 - object field store 必须检查 `field.offset + field.size <= object slot size`；materializer 写结构化 CSG/lowering/primary plan 时，越界应在冷编译阶段硬失败，不能等生成物运行时污染相邻槽。
 - `pobj/direct` 当前仍必须运行时 `brk` 暴露，不能返回成功对象或空对象继续执行；等 lowering 真正接通后再逐层替换为真实 Cheng body/materializer。
