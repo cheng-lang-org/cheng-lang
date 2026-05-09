@@ -10144,6 +10144,7 @@ static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, 
                 (right_kind == SLOT_I32 || right_kind == SLOT_VARIANT)) {
                 /* fall through to tag comparison */
             } else {
+                if (parser->import_mode) { return 0; }
                 die("variant comparison operands must both be variants");
             }
         }
