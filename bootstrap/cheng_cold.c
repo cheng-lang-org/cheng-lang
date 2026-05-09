@@ -4421,6 +4421,24 @@ enum {
     BODY_OP_PTR_LOAD_I64 = 92,
     BODY_OP_PTR_STORE_I64 = 93,
     BODY_OP_WRITE_BYTES = 94,
+    BODY_OP_F32_CONST = 95,
+    BODY_OP_F64_CONST = 96,
+    BODY_OP_F32_ADD = 97,
+    BODY_OP_F64_ADD = 98,
+    BODY_OP_F32_SUB = 99,
+    BODY_OP_F64_SUB = 100,
+    BODY_OP_F32_MUL = 101,
+    BODY_OP_F64_MUL = 102,
+    BODY_OP_F32_DIV = 103,
+    BODY_OP_F64_DIV = 104,
+    BODY_OP_F32_CMP = 105,
+    BODY_OP_F64_CMP = 106,
+    BODY_OP_F32_NEG = 107,
+    BODY_OP_F64_NEG = 108,
+    BODY_OP_F32_FROM_I32 = 109,
+    BODY_OP_I32_FROM_F32 = 110,
+    BODY_OP_F64_FROM_I32 = 111,
+    BODY_OP_I32_FROM_F64 = 112,
 };
 
 enum {
@@ -4458,6 +4476,8 @@ enum {
     SLOT_I32_REF = 16,
     SLOT_I64 = 17,
     SLOT_I64_REF = 18,
+    SLOT_F32 = 19,
+    SLOT_F64 = 20,
 };
 
 #define COLD_MAX_I32_PARAMS 32
@@ -4485,6 +4505,8 @@ static int32_t cold_slot_size_for_kind(int32_t kind) {
     if (kind == SLOT_I64) return 8;
     if (kind == SLOT_I64_REF) return 8;
     if (kind == SLOT_I32_REF) return 8;
+    if (kind == SLOT_F32) return 4;
+    if (kind == SLOT_F64) return 8;
     if (kind == SLOT_VARIANT) return 64;
     if (kind == SLOT_OBJECT) return 16;
     if (kind == SLOT_ARRAY_I32) return 4;
@@ -4854,6 +4876,7 @@ typedef struct {
     int32_t slot_size;
     Span generic_names[COLD_MAX_VARIANT_FIELDS];
     int32_t generic_count;
+    bool is_ref;
 } ObjectDef;
 
 typedef struct {
@@ -5496,7 +5519,10 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (span_eq(type, "v")) return SLOT_VARIANT;
     if (span_eq(type, "o")) return SLOT_OPAQUE;
     if (span_eq(type, "ptr")) return SLOT_OPAQUE;
-    if (symbols && symbols_resolve_object(symbols, type)) return SLOT_OBJECT;
+    if (symbols) {
+        ObjectDef *obj = symbols_resolve_object(symbols, type);
+        if (obj) return obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
+    }
     if (known_type) return SLOT_VARIANT;
     if (cold_type_has_qualified_name(type)) return SLOT_OPAQUE;
     if (type.len > 1 && type.ptr[0] >= 'A' && type.ptr[0] <= 'Z') return SLOT_VARIANT;
@@ -5596,7 +5622,8 @@ static int32_t cold_return_kind_from_span(Symbols *symbols, Span ret) {
     if (cold_parse_opaque_seq_type(ret)) return SLOT_SEQ_OPAQUE;
     TypeDef *known_type = symbols_resolve_type(symbols, ret);
     if (known_type) return known_type->is_enum ? SLOT_I32 : SLOT_VARIANT;
-    if (symbols_resolve_object(symbols, ret)) return SLOT_OBJECT;
+    ObjectDef *ret_obj = symbols_resolve_object(symbols, ret);
+    if (ret_obj) return ret_obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
     if (span_eq(ret, "ptr")) return SLOT_OPAQUE;
     if (cold_type_has_qualified_name(ret)) return SLOT_OPAQUE;
     /* Treat unknown uppercase types and camelCase types as opaque objects */
@@ -5609,7 +5636,7 @@ static int32_t cold_return_kind_from_span(Symbols *symbols, Span ret) {
 
 static int32_t cold_return_slot_size(Symbols *symbols, Span ret, int32_t kind) {
     if (kind == SLOT_STR) return 16;
-    if (kind == SLOT_I64) return 8;
+    if (kind == SLOT_I64 || kind == SLOT_PTR) return 8;
     if (kind == SLOT_SEQ_I32 || kind == SLOT_SEQ_STR || kind == SLOT_SEQ_OPAQUE) return 16;
     if (kind == SLOT_VARIANT) return symbols_type_slot_size(symbols_resolve_type(symbols, span_trim(ret)));
     if (kind == SLOT_OBJECT) return symbols_object_slot_size(symbols_resolve_object(symbols, span_trim(ret)));
@@ -6010,6 +6037,7 @@ static int32_t cold_param_size_from_type(Symbols *symbols, Span type, int32_t ki
 
 static int32_t cold_arg_reg_count(int32_t kind, int32_t size) {
     if (kind == SLOT_I32 || kind == SLOT_I64 || kind == SLOT_I32_REF || kind == SLOT_I64_REF) return 1;
+    if (kind == SLOT_PTR) return 1;
     if (kind == SLOT_STR) return 2;
     if (kind == SLOT_VARIANT) return size > 16 ? 1 : 2;
     if (kind == SLOT_OBJECT || kind == SLOT_ARRAY_I32) return size > 16 ? 1 : 2;
@@ -6328,6 +6356,7 @@ static void cold_collect_import_module_types(Symbols *symbols, Span alias, Span 
         if (!symbols_find_object(symbols, qualified_name)) {
             ObjectDef *dst = symbols_add_object(symbols, qualified_name, src->field_count);
             dst->generic_count = src->generic_count;
+            dst->is_ref = src->is_ref;
             for (int32_t gi = 0; gi < src->generic_count; gi++) {
                 dst->generic_names[gi] = cold_arena_span_copy(symbols->arena, src->generic_names[gi]);
             }
@@ -6361,6 +6390,7 @@ static void cold_collect_import_module_types(Symbols *symbols, Span alias, Span 
                 dst->fields[fi].array_len = 4; /* default */
             }
         }
+        dst->is_ref = src->is_ref;
         object_finalize_fields(dst);
     }
 }
@@ -6825,6 +6855,7 @@ static void parse_type(Parser *parser) {
                     robj->fields[fi].array_len = 0;
                 }
                 object_finalize_fields(robj);
+                robj->is_ref = true;
             }
         }
         parser->pos = line_end;
@@ -13782,7 +13813,7 @@ static void codegen_store_params(Code *code, BodyIR *body) {
                 code_emit(code, a64_ldr_imm(R9, FP, incoming_stack_offset, false));
                 a64_emit_str_sp_off(code, R9, body->slot_offset[slot], false);
             }
-        } else if (kind == SLOT_I64) {
+        } else if (kind == SLOT_I64 || kind == SLOT_PTR) {
             if (in_regs) {
                 a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], true);
             } else {
@@ -13955,6 +13986,11 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
             codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
             continue;
         }
+        if (fn->param_kind[i] == SLOT_PTR) {
+            a64_emit_ldr_sp_off(code, R9, local_offset, true);
+            codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
+            continue;
+        }
         if (fn->param_kind[i] == SLOT_OBJECT_REF) {
             if (arg_kind == SLOT_OBJECT_REF) {
                 a64_emit_ldr_sp_off(code, R9, local_offset, true);
@@ -14114,6 +14150,27 @@ static uint32_t a64_sxtw(int rd, int rn) {
 static uint32_t a64_cbnz(int rt, int32_t offset_words) {
     return 0x35000000u | ((uint32_t)(offset_words & 0x7FFFF) << 5) | (uint32_t)rt;
 }
+
+static uint32_t a64_fadd_s(int rd, int rn, int rm) { return 0x1E202800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fadd_d(int rd, int rn, int rm) { return 0x1E602800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fsub_s(int rd, int rn, int rm) { return 0x1E203800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fsub_d(int rd, int rn, int rm) { return 0x1E603800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fmul_s(int rd, int rn, int rm) { return 0x1E200800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fmul_d(int rd, int rn, int rm) { return 0x1E600800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fdiv_s(int rd, int rn, int rm) { return 0x1E201800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fdiv_d(int rd, int rn, int rm) { return 0x1E601800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_scvtf_s(int rd, int rn) { return 0x1E220000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_scvtf_d(int rd, int rn) { return 0x1E620000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fcvtzs_w(int rd, int rn) { return 0x1E380000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fcvtzs_x(int rd, int rn) { return 0x9E380000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fneg_s(int rd, int rn) { return 0x1E214000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fneg_d(int rd, int rn) { return 0x1E614000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fcmp_s(int rn, int rm) { return 0x1E202000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5); }
+static uint32_t a64_fcmp_d(int rn, int rm) { return 0x1E602000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5); }
+static uint32_t a64_fmov_s(int rd, int rn) { return 0x1E270000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fmov_sr(int rd, int rn) { return 0x1E260000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fmov_d(int rd, int rn) { return 0x1E670000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static uint32_t a64_fmov_dr(int rd, int rn) { return 0x1E660000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
 
 static void codegen_copy_slot_from_offset(Code *code, BodyIR *body,
                                           int32_t dst_slot, int32_t src_slot,
@@ -16153,7 +16210,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         function_patches_add(function_patches, call_pos, a);
         if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
         int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
-        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind == SLOT_I64);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind == SLOT_I64 || ret_kind == SLOT_PTR);
     } else if (kind == BODY_OP_COPY_I32) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
@@ -16535,6 +16592,57 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_movz_x(16, 4, 0));
         code_emit(code, a64_svc(0x80));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_F32_CONST) {
+        float val; memcpy(&val, &a, 4);
+        int32_t bits; memcpy(&bits, &val, 4);
+        code_emit(code, a64_movz(R0, (uint16_t)(bits & 0xFFFF), 0));
+        if ((bits & 0xFFFF0000u) != 0) code_emit(code, a64_movk(R0, (uint16_t)((bits>>16)&0xFFFF), 1));
+        code_emit(code, a64_fmov_s(0, R0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_F32_ADD) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        code_emit(code, a64_fmov_s(0, R0)); code_emit(code, a64_fmov_s(1, R1));
+        code_emit(code, a64_fadd_s(0, 0, 1));
+        code_emit(code, a64_fmov_s(R0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_F32_SUB) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        code_emit(code, a64_fmov_s(0, R0)); code_emit(code, a64_fmov_s(1, R1));
+        code_emit(code, a64_fsub_s(0, 0, 1));
+        code_emit(code, a64_fmov_s(R0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_F32_MUL) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        code_emit(code, a64_fmov_s(0, R0)); code_emit(code, a64_fmov_s(1, R1));
+        code_emit(code, a64_fmul_s(0, 0, 1));
+        code_emit(code, a64_fmov_s(R0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_F32_DIV) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        code_emit(code, a64_fmov_s(0, R0)); code_emit(code, a64_fmov_s(1, R1));
+        code_emit(code, a64_fdiv_s(0, 0, 1));
+        code_emit(code, a64_fmov_s(R0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_F32_NEG) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        code_emit(code, a64_fmov_s(0, R0));
+        code_emit(code, a64_fneg_s(0, 0));
+        code_emit(code, a64_fmov_s(R0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_F32_FROM_I32) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        code_emit(code, a64_scvtf_s(0, R0));
+        code_emit(code, a64_fmov_s(R0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_I32_FROM_F32) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        code_emit(code, a64_fmov_s(0, R0));
+        code_emit(code, a64_fcvtzs_w(R0, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else {
         ; /* unknown op: skip silently */
     }
@@ -16610,7 +16718,7 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
             int32_t value_kind = body->slot_kind[value_slot];
             if (value_kind == SLOT_I32) {
                 a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot], false);
-            } else if (value_kind == SLOT_I64) {
+            } else if (value_kind == SLOT_I64 || value_kind == SLOT_PTR) {
                 a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot], true);
             } else if (value_kind == SLOT_STR) {
                 if (body->sret_slot < 0) die("missing sret slot for str return");
