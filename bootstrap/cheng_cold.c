@@ -6728,6 +6728,15 @@ static void parse_type(Parser *parser) {
             variant->field_count = 0;
             variant_finalize_layout(type, variant);
             symbols_add_const(parser->symbols, variant->name, vi);
+            /* also register qualified name: Type.Variant */
+            int32_t qn_len = type_name.len + 1 + variant->name.len;
+            char *qn_ptr = arena_alloc(parser->arena, (size_t)qn_len + 1);
+            memcpy(qn_ptr, type_name.ptr, (size_t)type_name.len);
+            qn_ptr[type_name.len] = '.';
+            memcpy(qn_ptr + type_name.len + 1, variant->name.ptr, (size_t)variant->name.len);
+            qn_ptr[qn_len] = '\0';
+            Span qn = {qn_ptr, qn_len};
+            symbols_add_const(parser->symbols, qn, vi);
         }
         parser->pos = line_end;
         return;
@@ -6901,6 +6910,15 @@ static void parse_type(Parser *parser) {
             variant->field_type[i] = field_types[i];
         }
         variant_finalize_layout(type, variant);
+        /* register qualified name as constant: Type.Variant → variant tag */
+        int32_t qn_len = type_name.len + 1 + variant->name.len;
+        char *qn_ptr = arena_alloc(parser->arena, (size_t)qn_len + 1);
+        memcpy(qn_ptr, type_name.ptr, (size_t)type_name.len);
+        qn_ptr[type_name.len] = '.';
+        memcpy(qn_ptr + type_name.len + 1, variant->name.ptr, (size_t)variant->name.len);
+        qn_ptr[qn_len] = '\0';
+        Span qn = {qn_ptr, qn_len};
+        symbols_add_const(parser->symbols, qn, variant->tag);
     }
     type->generic_count = generic_count;
     for (int32_t gi = 0; gi < generic_count; gi++) type->generic_names[gi] = generic_names[gi];
@@ -7380,6 +7398,19 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
           }
           Variant *vc = symbols_find_variant(parser->symbols, base_name);
           if (!vc) vc = symbols_find_variant(parser->symbols, name);
+          if (!vc && name.len > base_name.len) {
+              /* qualified name: Type.Variant — split and try type lookup */
+              int32_t dot = -1;
+              for (int32_t i = name.len - 1; i > 0; i--) {
+                  if (name.ptr[i] == '.') { dot = i; break; }
+              }
+              if (dot > 0) {
+                  Span tn = span_sub(name, 0, dot);
+                  Span vn = span_sub(name, dot + 1, name.len - dot - 1);
+                  TypeDef *ty = symbols_find_type(parser->symbols, tn);
+                  if (ty) vc = type_find_variant(ty, vn);
+              }
+          }
           if (vc) { *kind_out = SLOT_VARIANT; return parse_constructor(parser, body, locals, vc); }
         }
         { int32_t param_kinds[COLD_MAX_I32_PARAMS];
@@ -9711,6 +9742,18 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
             call_name = parser_take_qualified_after_first(parser, token);
         }
         if (!span_eq(parser_peek(parser), "(")) {
+            /* Not followed by '(' — try variant constructor (Type.Variant) */
+            Variant *vc = symbols_find_variant(parser->symbols, call_name);
+            if (vc) {
+                *kind = SLOT_VARIANT;
+                if (vc->field_count > 0) {
+                    return parse_constructor(parser, body, locals, vc);
+                }
+                int32_t vz = symbols_variant_slot_size(parser->symbols, vc);
+                int32_t sl = body_slot(body, SLOT_VARIANT, vz);
+                body_op3(body, BODY_OP_MAKE_VARIANT, sl, vc->tag, -1, 0);
+                return sl;
+            }
             /* Skip qualified expression that's not a call */
             int32_t zero = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
@@ -9721,6 +9764,40 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     /* token is not a local; try qualified constant/variant lookup, then bare constant */
     if (span_eq(parser_peek(parser), ".")) {
         Span qualified = parser_take_qualified_after_first(parser, token);
+        /* Try Type.Variant lookup before const lookup (const may be stale synthetic) */
+        Variant *qualified_variant = 0;
+        {
+            int32_t dot = -1;
+            for (int32_t i = qualified.len - 1; i > 0; i--) {
+                if (qualified.ptr[i] == '.') { dot = i; break; }
+            }
+            if (dot > 0) {
+                Span type_name = span_sub(qualified, 0, dot);
+                Span variant_name = span_sub(qualified, dot + 1, qualified.len - dot - 1);
+                TypeDef *ty = symbols_find_type(parser->symbols, type_name);
+                if (ty) qualified_variant = type_find_variant(ty, variant_name);
+            }
+            if (!qualified_variant) {
+                qualified_variant = symbols_find_variant(parser->symbols, qualified);
+                if (!qualified_variant) {
+                    int32_t br = cold_span_find_char(qualified, '[');
+                    if (br > 0) {
+                        qualified_variant = symbols_find_variant(parser->symbols, span_sub(qualified, 0, br));
+                    }
+                }
+            }
+        }
+        if (qualified_variant) {
+            *kind = SLOT_VARIANT;
+            if (qualified_variant->field_count > 0) {
+                return parse_constructor(parser, body, locals, qualified_variant);
+            }
+            /* payloadless variant: create directly */
+            int32_t variant_ty = symbols_variant_slot_size(parser->symbols, qualified_variant);
+            int32_t slot = body_slot(body, SLOT_VARIANT, variant_ty);
+            body_op3(body, BODY_OP_MAKE_VARIANT, slot, qualified_variant->tag, -1, 0);
+            return slot;
+        }
         ConstDef *constant = symbols_find_const(parser->symbols, qualified);
         if (constant) {
             if (constant->is_str) {
@@ -9735,17 +9812,30 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
             *kind = SLOT_I32;
             return slot;
         }
-        Variant *qualified_variant = symbols_find_variant(parser->symbols, qualified);
-        if (!qualified_variant) {
-            /* strip generic params: Err[int32] -> Err */
-            int32_t br = cold_span_find_char(qualified, '[');
-            if (br > 0) {
-                qualified_variant = symbols_find_variant(parser->symbols, span_sub(qualified, 0, br));
+        /* last-chance: Type.Variant qualified name via type lookup */
+        {
+            int32_t dot = -1;
+            for (int32_t i = qualified.len - 1; i > 0; i--) {
+                if (qualified.ptr[i] == '.') { dot = i; break; }
             }
-        }
-        if (qualified_variant && qualified_variant->field_count >= 0) {
-            *kind = SLOT_VARIANT;
-            return parse_constructor(parser, body, locals, qualified_variant);
+            if (dot > 0) {
+                Span tn = span_sub(qualified, 0, dot);
+                Span vn = span_sub(qualified, dot + 1, qualified.len - dot - 1);
+                TypeDef *ty = symbols_find_type(parser->symbols, tn);
+                if (ty) {
+                    Variant *vc = type_find_variant(ty, vn);
+                    if (vc) {
+                        *kind = SLOT_VARIANT;
+                        if (vc->field_count > 0) {
+                            return parse_constructor(parser, body, locals, vc);
+                        }
+                        int32_t vz = symbols_variant_slot_size(parser->symbols, vc);
+                        int32_t sl = body_slot(body, SLOT_VARIANT, vz);
+                        body_op3(body, BODY_OP_MAKE_VARIANT, sl, vc->tag, -1, 0);
+                        return sl;
+                    }
+                }
+            }
         }
         /* fallback: create synthetic const for unknown qualified enum-like identifiers */
         symbols_add_const(parser->symbols, qualified, 0);
