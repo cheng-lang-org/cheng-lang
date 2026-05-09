@@ -7341,6 +7341,34 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
                                   &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
     }
+    if (span_eq(name, "atomicLoadI32")) {
+        if (arg_count != 1) die("atomicLoadI32 expects 1 arg");
+        int32_t ptr = body->call_arg_slot[arg_start];
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_ATOMIC_LOAD_I32, slot, ptr, 0);
+        if (kind_out) *kind_out = SLOT_I32;
+        return slot;
+    }
+    if (span_eq(name, "atomicStoreI32")) {
+        if (arg_count != 2) die("atomicStoreI32 expects 2 args");
+        int32_t ptr = body->call_arg_slot[arg_start];
+        int32_t val = body->call_arg_slot[arg_start + 1];
+        body_op(body, BODY_OP_ATOMIC_STORE_I32, ptr, val, 0);
+        if (kind_out) *kind_out = SLOT_I32;
+        int32_t zero = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+        return zero;
+    }
+    if (span_eq(name, "atomicCasI32")) {
+        if (arg_count != 3) die("atomicCasI32 expects 3 args");
+        int32_t ptr = body->call_arg_slot[arg_start];
+        int32_t expect = body->call_arg_slot[arg_start + 1];
+        int32_t desired = body->call_arg_slot[arg_start + 2];
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op3(body, BODY_OP_ATOMIC_CAS_I32, slot, ptr, desired, expect);
+        if (kind_out) *kind_out = SLOT_I32;
+        return slot;
+    }
     if (cold_try_backend_intrinsic(parser, body, name, arg_start, arg_count,
                                    &intrinsic_slot, kind_out)) {
         return intrinsic_slot;
@@ -8667,7 +8695,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         }
         die("strFromCStringBorrow expects cstring/str");
     }
-    if (span_eq(name, "open")) {
+    if (span_eq(name, "cold_open")) {
         if (arg_count != 2) return false;
         int32_t path = body->call_arg_slot[arg_start];
         int32_t flags = body->call_arg_slot[arg_start + 1];
@@ -8679,7 +8707,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
-    if (span_eq(name, "read")) {
+    if (span_eq(name, "cold_read")) {
         if (arg_count != 3) return false;
         int32_t fd = body->call_arg_slot[arg_start];
         int32_t buf = body->call_arg_slot[arg_start + 1];
@@ -8692,7 +8720,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
-    if (span_eq(name, "close")) {
+    if (span_eq(name, "cold_close")) {
         if (arg_count != 1) return false;
         int32_t fd = body->call_arg_slot[arg_start];
         if (body->slot_kind[fd] != SLOT_I32) return false;
@@ -8702,7 +8730,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
-    if (span_eq(name, "mmap")) {
+    if (span_eq(name, "cold_mmap")) {
         if (arg_count != 1) return false;
         int32_t len = body->call_arg_slot[arg_start];
         if (body->slot_kind[len] != SLOT_I32) return false;
@@ -9726,21 +9754,47 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         return dst;
     }
     if (span_eq(token, "&")) {
-        /* address-of: parse inner expression and return its address */
-        int32_t inner_kind = SLOT_I32;
-        int32_t inner_slot = parse_primary(parser, body, locals, &inner_kind);
-        inner_slot = parse_postfix(parser, body, locals, inner_slot, &inner_kind);
-        /* If the postfix chain ended with FIELD_REF, the result is already an address.
-           Otherwise, compute SP-relative address of the local slot. */
-        if (inner_kind == SLOT_OBJECT_REF || inner_kind == SLOT_PTR) {
-            /* Already a pointer: just pass through */
+        /* address-of: parse base local, then handle .field chain with FIELD_REF */
+        Span base_name = parser_token(parser);
+        Local *alocal = locals_find(locals, base_name);
+        int32_t addr_slot;
+        if (alocal) {
+            addr_slot = alocal->slot;
+            *kind = alocal->kind;
+        } else {
+            /* Not a local: parse as expression and compute SP-relative address */
+            int32_t ek = SLOT_I32;
+            int32_t es = parse_primary(parser, body, locals, &ek);
+            if (ek != SLOT_PTR && ek != SLOT_OBJECT_REF) ek = SLOT_PTR;
+            addr_slot = body_slot(body, SLOT_PTR, 8);
+            body_op3(body, BODY_OP_FIELD_REF, addr_slot, es, 0, 0);
             *kind = SLOT_PTR;
-            return inner_slot;
+            return addr_slot;
         }
-        /* For stack-local address: compute SP + slot_offset */
-        int32_t addr_slot = body_slot(body, SLOT_PTR, 8);
-        body_op3(body, BODY_OP_FIELD_REF, addr_slot, inner_slot, 0, 0);
-        *kind = SLOT_PTR;
+        /* Process .field chain manually with FIELD_REF */
+        while (span_eq(parser_peek(parser), ".")) {
+            (void)parser_token(parser);
+            Span fname = parser_token(parser);
+            if (fname.len <= 0) die("expected field name after &");
+            ObjectDef *aobj = 0;
+            if (body->slot_type[addr_slot].len > 0) {
+                aobj = symbols_resolve_object(parser->symbols, body->slot_type[addr_slot]);
+            }
+            if (!aobj) {
+                /* Try finding object by field name */
+                for (int32_t oi = 0; oi < parser->symbols->object_count; oi++) {
+                    ObjectDef *cand = &parser->symbols->objects[oi];
+                    if (object_find_field(cand, fname)) { aobj = cand; break; }
+                }
+            }
+            if (!aobj) die("unknown object for address-of field access");
+            ObjectField *afield = object_find_field(aobj, fname);
+            if (!afield) die("unknown field in address-of");
+            int32_t ref_slot = body_slot(body, SLOT_PTR, 8);
+            body_op3(body, BODY_OP_FIELD_REF, ref_slot, addr_slot, afield->offset, 0);
+            addr_slot = ref_slot;
+            *kind = SLOT_PTR;
+        }
         return addr_slot;
     }
     if (span_eq(token, "[")) {
@@ -13294,6 +13348,22 @@ __attribute__((unused))
 static uint32_t a64_cset(int rd, int cond) {
     return 0x1A9F07E0u | ((uint32_t)rd) | ((uint32_t)(cond & 0xF) << 12);
 }
+__attribute__((unused))
+static uint32_t a64_ldar_w(int rt, int rn) {
+    return 0xB8DFFC00u | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+__attribute__((unused))
+static uint32_t a64_stlr_w(int rt, int rn) {
+    return 0xB89FFC00u | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+__attribute__((unused))
+static uint32_t a64_ldaxr_w(int rt, int rn) {
+    return 0xB85FFC00u | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+__attribute__((unused))
+static uint32_t a64_stlxr_w(int rs, int rt, int rn) {
+    return 0xB800FC00u | ((uint32_t)rs << 16) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
 
 /* ================================================================
  * Code generation
@@ -13857,6 +13927,10 @@ static void codegen_mov_i64_const(Code *code, int reg, uint64_t value) {
 
 static uint32_t a64_sxtw(int rd, int rn) {
     return 0x93407C00u | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+
+static uint32_t a64_cbnz(int rt, int32_t offset_words) {
+    return 0xB5000000u | ((uint32_t)(offset_words & 0x7FFFF) << 5) | (uint32_t)rt;
 }
 
 static void codegen_copy_slot_from_offset(Code *code, BodyIR *body,
@@ -16214,39 +16288,33 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_svc(0x80));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_ATOMIC_LOAD_I32) {
-        /* ldar w0, [x1] ; str w0, [sp, #dst] */
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
-        code_emit(code, a64_ldar(R0, R1));
+        code_emit(code, a64_ldar_w(R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_ATOMIC_STORE_I32) {
-        /* ldr x1, [sp, #a] ; ldr w0, [sp, #b] ; stlr w0, [x1] */
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[b], false);
-        code_emit(code, a64_stlr(R0, R1));
+        code_emit(code, a64_stlr_w(R0, R1));
     } else if (kind == BODY_OP_ATOMIC_CAS_I32) {
-        /* CAS: a=ptr, b=desired, aux=expected -> dst=old_value
-           ldaxr w3, [x0] ; cmp w3, w2 ; b.ne fail ; stlxr w4, w1, [x0] ; cbnz w4, retry ; cset w0, eq */
+        /* CAS: a=ptr, b=desired, c=expected, dst=1(success)/0(fail) */
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
-        int32_t expected_off = body->slot_offset[body->op_aux[dst]]; /* check if aux is stored per-op */
-        /* For simplicity: load expected from the explicit aux slot */
-        (void)expected_off;
-        /* Simple CAS: ldr w2 (expect), ldr w1 (desired), ldr x0 (ptr) */
-        int32_t expect_slot = body->op_aux[body->op_count > 0 ? body->op_count - 1 : 0];
-        a64_emit_ldr_sp_off(code, R2, body->slot_offset[expect_slot], false);
+        a64_emit_ldr_sp_off(code, R2, body->slot_offset[c], false);
         int32_t retry = code->count;
-        code_emit(code, a64_ldaxr(R3, R0));
+        code_emit(code, a64_ldaxr_w(R3, R0));
         code_emit(code, a64_cmp_reg(R3, R2));
-        int32_t fail_patch = code->count;
+        int32_t mismatch = code->count;
         code_emit(code, a64_bcond(0, COND_NE));
-        code_emit(code, a64_stlxr(R4, R1, R0));
-        code_emit(code, a64_cbz(R4, 0, true)); /* placeholder - will patch */
-        int32_t cbz_patch = code->count;
-        code_emit(code, a64_b(retry - code->count));
-        int32_t fail = code->count;
-        a64_patch_bcond(code, fail_patch, fail);
-        code_emit(code, a64_cset(R0, COND_EQ)); /* R0=0 for failure */
-        /* Note: the patch for cbz is not essential for single-threaded - skip */
+        code_emit(code, a64_stlxr_w(R4, R1, R0));
+        /* CBNZ R4, retry: if store failed, retry */
+        code_emit(code, a64_cbnz(R4, 0));
+        int32_t cbnz_pos = code->count - 1;
+        code->words[cbnz_pos] = a64_cbnz(R4, retry - cbnz_pos);
+        code_emit(code, a64_b(0));
+        int32_t done_jump = code->count - 1;
+        a64_patch_bcond(code, mismatch, code->count);
+        code_emit(code, a64_cset(R0, COND_EQ));
+        code->words[done_jump] = a64_b(code->count - done_jump);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_MMAP) {
         /* mmap(addr, len, prot, flags) → ptr (dst)
