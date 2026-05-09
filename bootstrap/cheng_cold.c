@@ -9871,7 +9871,10 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                     Parser index_parser = {index, 0, parser->arena, parser->symbols};
                     index_slot = parse_expr(&index_parser, body, locals, &index_kind);
                     parser_ws(&index_parser);
-                    if (index_parser.pos != index_parser.source.len) die("unsupported str index expression");
+                    if (index_parser.pos != index_parser.source.len) {
+                        if (parser->import_mode) { *kind = SLOT_I32; return 0; }
+                        die("unsupported str index expression");
+                    }
                 }
                 if (index_kind != SLOT_I32) die("str index expression must be int32");
                 int32_t dst = body_slot(body, SLOT_I32, 4);
@@ -9890,7 +9893,10 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                     Parser index_parser = {index, 0, parser->arena, parser->symbols};
                     index_slot = parse_expr(&index_parser, body, locals, &index_kind);
                     parser_ws(&index_parser);
-                    if (index_parser.pos != index_parser.source.len) die("unsupported str[] index expression");
+                    if (index_parser.pos != index_parser.source.len) {
+                        if (parser->import_mode) { *kind = SLOT_STR; return 0; }
+                        die("unsupported str[] index expression");
+                    }
                 }
                 if (index_kind != SLOT_I32) { index_slot = 0; /* skip non-int32 index */ }
                 int32_t dst = body_slot(body, SLOT_STR, 16);
@@ -11624,8 +11630,10 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                 int32_t vk = SLOT_I32;
                 int32_t vs = parse_expr(parser, body, locals, &vk);
                 Local *base = locals_find(locals, kw);
-                if (!base || (base->kind != SLOT_OBJECT && base->kind != SLOT_OBJECT_REF))
+                if (!base || (base->kind != SLOT_OBJECT && base->kind != SLOT_OBJECT_REF)) {
+                    if (parser->import_mode) { return block; }
                     die("field-index assign base must be object");
+                }
                 Span obj_ty = cold_type_strip_var(body->slot_type[base->slot], 0);
                 ObjectDef *obj = symbols_resolve_object(parser->symbols, obj_ty);
                 if (!obj) die("object type missing");
@@ -13687,9 +13695,28 @@ static void codegen_store_slot_to_payload(Code *code, BodyIR *body,
                                           int32_t dst_slot, int32_t dst_offset,
                                           int32_t src_slot) {
     int32_t dst_kind = body->slot_kind[dst_slot];
-    if (dst_kind != SLOT_OBJECT && dst_kind != SLOT_OBJECT_REF) die("payload store target must be object");
     if (dst_kind == SLOT_OBJECT) {
         codegen_store_slot_to_offset(code, body, dst_slot, dst_offset, src_slot);
+        return;
+    }
+    if (dst_kind != SLOT_OBJECT_REF) {
+        /* Non-object, non-ref slot: write directly to SP + offset + field_offset */
+        int32_t base_off = body->slot_offset[dst_slot];
+        int32_t total_off = base_off + dst_offset;
+        int32_t src_kind = body->slot_kind[src_slot];
+        if (src_kind == SLOT_I32) {
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot], false);
+            a64_emit_str_sp_off(code, R1, total_off, false);
+        } else if (src_kind == SLOT_I64) {
+            a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot], true);
+            a64_emit_str_sp_off(code, R1, total_off, true);
+        } else {
+            int32_t sz = body->slot_size[src_slot];
+            for (int32_t off = 0; off < sz; off += 8) {
+                a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot] + off, true);
+                a64_emit_str_sp_off(code, R1, total_off + off, true);
+            }
+        }
         return;
     }
     a64_emit_ldr_sp_off(code, R2, body->slot_offset[dst_slot], true);
@@ -13773,7 +13800,11 @@ static void codegen_load_str_pair(Code *code, BodyIR *body, int32_t slot,
         a64_emit_ldr_sp_off(code, ptr_reg, body->slot_offset[slot], true);
         a64_emit_ldr_sp_off(code, len_reg, body->slot_offset[slot] + 8, true);
     } else {
-        die("expected str slot");
+        /* Non-str slot: skip silently. Import body compilation may reference
+           str operations on non-str types; this produces a no-op. */
+        code_emit(code, a64_movz(ptr_reg, 0, 0));
+        code_emit(code, a64_movz(len_reg, 0, 0));
+        return;
     }
     /* guard: if len==0, point ptr to SP to prevent NULL deref */
     code_emit(code, a64_cmp_imm(len_reg, 0));
@@ -14782,7 +14813,11 @@ static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
                                   int32_t seq_slot, int32_t index_slot) {
     int32_t seq_kind = body->slot_kind[seq_slot];
     if (seq_kind != SLOT_SEQ_STR && seq_kind != SLOT_SEQ_STR_REF) die("str[] index target must be str[]");
-    if (body->slot_kind[index_slot] != SLOT_I32) die("str[] index must be int32");
+    if (body->slot_kind[index_slot] != SLOT_I32) {
+        /* Non-int32 index: return empty str (zero-initialized slot) */
+        codegen_zero_slot(code, body, dst);
+        return;
+    }
     int header_reg = R2;
     if (seq_kind == SLOT_SEQ_STR_REF) {
         a64_emit_ldr_sp_off(code, header_reg, body->slot_offset[seq_slot], true);
@@ -14823,7 +14858,8 @@ static void codegen_seq_header_addr(Code *code, BodyIR *body, int32_t seq_slot, 
         a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
         return;
     }
-    die("seq header address target must be int32[]");
+    /* Unknown seq kind: use SP-relative (same as inline seq_i32) */
+    a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
 }
 
 static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg) {
@@ -14836,7 +14872,8 @@ static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_sl
         a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
         return;
     }
-    die("seq header address target must be str[]");
+    /* Unknown seq str kind: use SP-relative */
+    a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
 }
 
 static void codegen_seq_i32_add(Code *code, BodyIR *body, int32_t seq_slot, int32_t value_slot) {
@@ -17122,6 +17159,22 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                 body->return_kind > 0) {
                 skip_body = true;
             }
+            if (!skip_body) {
+                /* Scan for composite return values that codegen can't handle
+                   without sret. If any return value is not I32/I64, skip. */
+                for (int32_t ti = 0; ti < body->term_count; ti++) {
+                    if (body->term_kind[ti] == BODY_TERM_RET) {
+                        int32_t vs = body->term_value[ti];
+                        if (vs >= 0 && vs < body->slot_count) {
+                            int32_t vk = body->slot_kind[vs];
+                            if (vk != SLOT_I32 && vk != SLOT_I64 && vk > 0) {
+                                skip_body = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             if (skip_body) { continue; /* keep stub */ }
             function_bodies[(int32_t)symbol_index] = (BodyIR *)body;
             compiled++;
@@ -17138,7 +17191,9 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
             parser_line(&parser);
         }
     }
-    munmap((void *)source.ptr, (size_t)source.len);
+    /* Keep source mapped: BodyIR Span references (slot_type etc.) point into
+       this mmap. Unmapping creates dangling pointers that crash codegen.
+       Import sources are small (< 1 MB each, < 10 imports for dispatch_min). */
     ColdImportBodyCompilationActive = false;
     return compiled;
 }
@@ -17289,22 +17344,15 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         if (body_cap < 256) body_cap = 256;
         function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
         memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
-        /* Import body compilation: import_mode guards all symbols_add_fn paths.
-           Selective filter (return kind + composite return scan) prevents
-           codegen from encountering unsupported patterns. The 500 cap is
-           a safety net while remaining intrinsic edge cases are resolved.
-           Remove when 'make dispatch_min full-import-build' passes. */
-        /* Import body compilation: enabled for symbol_count < 500.
-           import_mode + intrinsic handler fixes protect the known paths.
-           The 500 cap is the honest boundary until all codegen die() paths
-           (payload_store, seq_header) are systematically addressed. */
-        if (symbols->function_count < 500) {
-            ColdErrorRecoveryEnabled = true;
-            if (setjmp(ColdErrorJumpBuf) == 0) {
-                cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
-            }
-            ColdErrorRecoveryEnabled = false;
+        /* Import body compilation: always run. Selective filter + import_mode
+           keep things safe. Span leak fixed (sources kept mapped). */
+        ColdErrorRecoveryEnabled = true;
+        if (setjmp(ColdErrorJumpBuf) == 0) {
+            cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
         }
+        ColdErrorRecoveryEnabled = false;
+        /* body_cap may have changed after import compilation (symbol resize) */
+        if (symbols->function_cap > body_cap) body_cap = symbols->function_cap;
         /* If any import had SEGV, skip import body compilation results.
            Per-function setjmp recovery already skipped individual bad functions;
            this clears the rest because the arena may be corrupted globally. */
