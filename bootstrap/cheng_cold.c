@@ -6749,8 +6749,70 @@ static void parse_type(Parser *parser) {
         return;
     }
     if (cold_span_starts_with(rhs_check, "fn") ||
-        cold_span_starts_with(rhs_check, "ref") ||
         cold_type_is_builtin_surface(rhs_check)) {
+        parser->pos = line_end;
+        return;
+    }
+    if (cold_span_starts_with(rhs_check, "ref")) {
+        Span ref_body = span_trim(span_sub(rhs_check, 3, rhs_check.len));
+        Span fields_r = {0};
+        if (ref_body.len > 0) {
+            fields_r = ref_body;
+        } else {
+            int32_t bs = line_end + 1;
+            int32_t bi = -1;
+            int32_t bf = bs;
+            while (bf < parser->source.len) {
+                int32_t ind = 0;
+                int32_t p = bf;
+                while (p < parser->source.len && parser->source.ptr[p] == ' ') { ind++; p++; }
+                if (p >= parser->source.len || parser->source.ptr[p] == '\n') { bf++; continue; }
+                if (ind == 0 || (bi >= 0 && ind < bi)) break;
+                if (bi < 0) bi = ind;
+                while (bf < parser->source.len && parser->source.ptr[bf] != '\n') bf++;
+                if (bf < parser->source.len) bf++;
+            }
+            fields_r = span_sub(parser->source, bs, bf);
+        }
+        if (fields_r.len > 0) {
+            int32_t rfc = 0;
+            Span rfn[64];
+            Span rft[64];
+            int32_t fp = 0;
+            while (fp < fields_r.len) {
+                int32_t ln = fp;
+                while (fp < fields_r.len && fields_r.ptr[fp] != '\n') fp++;
+                Span fl = span_sub(fields_r, ln, fp);
+                if (fp < fields_r.len) fp++;
+                Span tr = span_trim(fl);
+                if (tr.len <= 0) continue;
+                if (rfc >= 64) break;
+                Parser rp = {tr, 0, 0, 0};
+                Span fn2 = parser_token(&rp);
+                if (fn2.len <= 0) continue;
+                if (!parser_take(&rp, ":")) continue;
+                Span ft = parser_take_type_span(&rp);
+                if (ft.len <= 0) continue;
+                rfn[rfc] = fn2;
+                rft[rfc] = ft;
+                rfc++;
+            }
+            if (rfc > 0) {
+                ObjectDef *robj = symbols_add_object(parser->symbols, type_name, rfc);
+                robj->generic_count = generic_count;
+                for (int32_t gi = 0; gi < generic_count; gi++) robj->generic_names[gi] = generic_names[gi];
+                for (int32_t fi = 0; fi < rfc; fi++) {
+                    robj->fields[fi].name = rfn[fi];
+                    int32_t fk = cold_slot_kind_from_type_with_symbols(parser->symbols, rft[fi]);
+                    if (fk == SLOT_VARIANT && !symbols_resolve_type(parser->symbols, rft[fi])) fk = SLOT_I32;
+                    robj->fields[fi].kind = fk;
+                    robj->fields[fi].size = cold_slot_size_from_type_with_symbols(parser->symbols, rft[fi], fk);
+                    robj->fields[fi].type_name = rft[fi];
+                    robj->fields[fi].array_len = 0;
+                }
+                object_finalize_fields(robj);
+            }
+        }
         parser->pos = line_end;
         return;
     }
@@ -9850,6 +9912,21 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         *kind = SLOT_I32;
         return slot;
     }
+    if (span_eq(token, "new") && span_eq(parser_peek(parser), "(")) {
+        (void)parser_token(parser);
+        Span tn = parser_token(parser);
+        if (!parser_take(parser, ")")) die("new(Type): missing )");
+        ObjectDef *nobj = symbols_find_object(parser->symbols, tn);
+        if (nobj && nobj->slot_size > 0) {
+            int32_t len = body_slot(body, SLOT_I32, 4);
+            body_op(body, BODY_OP_I32_CONST, len, nobj->slot_size, 0);
+            int32_t ns = body_slot(body, SLOT_PTR, 8);
+            body_op(body, BODY_OP_MMAP, ns, len, 0);
+            *kind = SLOT_PTR;
+            return ns;
+        }
+        die("new(Type): type missing or invalid");
+    }
     Variant *variant = symbols_find_variant(parser->symbols, token);
     if (variant) {
         *kind = SLOT_VARIANT;
@@ -10217,7 +10294,7 @@ static int32_t cold_materialize_i32_ref(BodyIR *body, int32_t slot, int32_t *kin
 }
 
 static int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *kind) {
-    if (*kind == SLOT_I64) return slot;
+    if (*kind == SLOT_I64 || *kind == SLOT_PTR) return slot;
     if (*kind == SLOT_I32) {
         int32_t dst = body_slot(body, SLOT_I64, 8);
         body_op(body, BODY_OP_I64_FROM_I32, dst, slot, 0);
@@ -10660,7 +10737,8 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
                                   Span base_name, int32_t block) {
     Local *local = locals_find(locals, base_name);
     if (!local) return block; /* skip non-local field assign */;
-    if (local->kind != SLOT_OBJECT && local->kind != SLOT_OBJECT_REF) {
+    if (local->kind != SLOT_OBJECT && local->kind != SLOT_OBJECT_REF &&
+        local->kind != SLOT_PTR) {
         int32_t skip_kind = SLOT_I32;
         (void)parse_expr(parser, body, locals, &skip_kind);
         return block;
@@ -16022,7 +16100,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         int32_t base_kind = body->slot_kind[a];
         if (base_kind == SLOT_OBJECT) {
             a64_emit_add_large(code, R0, SP, body->slot_offset[a] + b, true);
-        } else if (base_kind == SLOT_OBJECT_REF) {
+        } else if (base_kind == SLOT_OBJECT_REF || base_kind == SLOT_PTR) {
             a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
             if (b != 0) code_emit(code, a64_add_imm(R0, R0, (uint16_t)b, true));
         } else {
