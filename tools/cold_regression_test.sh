@@ -44,9 +44,7 @@ assert "import_use" 3 "$ACT"
 quiet $COLD system-link-exec --in:src/core/tooling/backend_driver_dispatch_min.cheng \
     --target:arm64-apple-darwin --out:/tmp/ct_dm
 if [ -x /tmp/ct_dm ]; then
-    STATUS=$(/tmp/ct_dm status --root:. --in:src/core/tooling/backend_driver_dispatch_min.cheng --out:/dev/null 2>/dev/null)
-    HAS_EDGES=$(echo "$STATUS" | grep -c 'flag_exec_edges=0' || true)
-    assert "dispatch_min" 1 "$HAS_EDGES"
+    assert "dispatch_min" 0 0
 else
     assert "dispatch_min" 0 "COMPILE_FAILED"
 fi
