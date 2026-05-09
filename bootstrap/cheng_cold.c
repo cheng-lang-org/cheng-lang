@@ -17536,14 +17536,13 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     function_bodies = arena_alloc(arena, (size_t)body_cap * sizeof(BodyIR *));
     memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
 
-    /* Import body compilation (same as cold_compile_source_path_to_macho) */
-    if (symbols->function_count < 500) {
-        ColdErrorRecoveryEnabled = true;
-        if (setjmp(ColdErrorJumpBuf) == 0) {
-            cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
-        }
-        ColdErrorRecoveryEnabled = false;
+    /* Import body compilation: always run (500 cap removed). */
+    ColdErrorRecoveryEnabled = true;
+    if (setjmp(ColdErrorJumpBuf) == 0) {
+        cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
     }
+    ColdErrorRecoveryEnabled = false;
+    if (symbols->function_cap > body_cap) body_cap = symbols->function_cap;
     if (ColdImportSegvSaw) {
         ColdImportSegvSaw = 0;
         for (int32_t i = symbols->function_count; i < body_cap; i++) {
