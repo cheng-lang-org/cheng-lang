@@ -150,7 +150,18 @@ fn arm_sub_reg(rd: int32, rn: int32, rm: int32): int32 =
     return 0x4B000000 + ((rm & 31) * 65536) + ((rn & 31) * 32) + (rd & 31)
 fn arm_mov_reg(rd: int32, rm: int32): int32 =
     return 0x2A0003E0 + ((rm & 31) * 65536) + (rd & 31)
+fn arm_cmp_reg(rn: int32, rm: int32): int32 =
+    return 0x6B00001F + ((rm & 31) * 65536) + ((rn & 31) * 32)
+fn arm_b_cond(cond: int32, off: int32): int32 =
+    return 0x54000000 + ((cond & 15) * 16) + ((off & 524287) * 32)
+fn arm_b(off: int32): int32 =
+    return 0x14000000 + (off & 67108863)
+fn arm_cbz(rt: int32, off: int32): int32 =
+    return 0x34000000 + ((off & 524287) * 32) + (rt & 31)
+fn arm_cbnz(rt: int32, off: int32): int32 =
+    return 0x35000000 + ((off & 524287) * 32) + (rt & 31)
 fn arm_ret(): int32 = return 0xD65F03C0
+fn arm_nop(): int32 = return 0xD503201F
 
 // Write .o template with variable-length code (max 10 words = 40 bytes)
 fn write_obj(buf: int64, code: int64, code_words: int32) =
@@ -208,6 +219,9 @@ fn emit(code: int64, count: int32, word: int32): int32 =
     ptrStoreI32(code + int64(count * 4), word)
     return count + 1
 
+fn patch(code: int64, idx: int32, word: int32) =
+    ptrStoreI32(code + int64(idx * 4), word)
+
 // Compile a simple expression: digit | ident | digit op digit | ident op digit
 // start: first token of expression, returns index after last consumed token
 fn compile_expr(buf: int32[1024], spans: int64, start: int32, total: int32, code: int64, count: int32, sym: int64, sym_count: int32): int32 =
@@ -222,34 +236,66 @@ fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code
     var i: int32 = start
     while i < total:
         let is_let: int32 = tok_is_3kw(buf, spans, i, 108, 101, 116)
+        let is_if: int32  = tok_is_2kw(buf, spans, i, 105, 102)
+        let is_while: int32 = 0
+        if tok_kind(spans, i) == 1: if tok_len(spans, i) == 5:
+            let ws: int32 = tok_start(spans, i)
+            if byte_at(buf, ws / 4, ws - (ws / 4) * 4) == 119:
+                if byte_at(buf, (ws+1) / 4, (ws+1) - ((ws+1) / 4) * 4) == 104: is_while = 1
         let is_ret: int32 = tok_is_6kw(buf, spans, i, 114, 101)
         if is_let != 0:
             if i + 3 < total:
-                let ns: int32 = tok_start(spans, i + 1)
-                let nl: int32 = tok_len(spans, i + 1)
                 if tok_kind(spans, i + 3) == 2:
                     let val: int32 = parse_int(buf, spans, i + 3)
                     count = emit(code, count, arm_movz_imm(0, val))
                     count = emit(code, count, arm_mov_reg(next_reg, 0))
-                    var_add(sym, sym_count, ns, nl, next_reg)
+                    var_add(sym, sym_count, tok_start(spans, i + 1), tok_len(spans, i + 1), next_reg)
                     sym_count = sym_count + 1
                     next_reg = next_reg + 1
             i = i + 4
+        if is_if != 0:
+            // if <var>: <body>  (simple: if x: return <int>)
+            // Pattern: if at i, var at i+1, : at i+2, return at i+3, int at i+4
+            if i + 4 < total:
+                let cond_var_reg: int32 = var_find(buf, sym, sym_count, tok_start(spans, i + 1), tok_len(spans, i + 1))
+                if cond_var_reg >= 0:
+                    if tok_is_6kw(buf, spans, i + 3, 114, 101) != 0:
+                        // then-body: return <int>
+                        let then_count: int32 = 2  // mov + ret = 2 instructions
+                        let branch_idx: int32 = count
+                        count = emit(code, count, arm_cbz(cond_var_reg, then_count))
+                        if tok_kind(spans, i + 4) == 2:
+                            count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 4)))
+                        count = emit(code, count, arm_ret())
+            i = i + 5
+        if is_while != 0:
+            // while <var>: <body>  — cbz at top, b at end
+            // Pattern: while at i, var at i+1, : at i+2, return at i+3, int at i+4
+            if i + 4 < total:
+                let wcond_reg: int32 = var_find(buf, sym, sym_count, tok_start(spans, i + 1), tok_len(spans, i + 1))
+                if wcond_reg >= 0:
+                    if tok_is_6kw(buf, spans, i + 3, 114, 101) != 0:
+                        let loop_start: int32 = count
+                        // cbz wcond_reg, loop_end (offset = 3: mov+ret+b = 3 instructions)
+                        count = emit(code, count, arm_cbz(wcond_reg, 3))
+                        // body: return <int>
+                        if tok_kind(spans, i + 4) == 2:
+                            count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 4)))
+                        count = emit(code, count, arm_ret())
+                        // unreachable, but needed for cbz target calculation
+                        count = emit(code, count, arm_nop())
+            i = i + 5
         if is_ret != 0:
             if i + 1 < total:
                 let rk: int32 = tok_kind(spans, i + 1)
                 if rk == 1:
-                    let vs: int32 = tok_start(spans, i + 1)
-                    let vl: int32 = tok_len(spans, i + 1)
-                    let vr: int32 = var_find(buf, sym, sym_count, vs, vl)
-                    if vr >= 0:
-                        count = emit(code, count, arm_mov_reg(0, vr))
+                    let vr: int32 = var_find(buf, sym, sym_count, tok_start(spans, i + 1), tok_len(spans, i + 1))
+                    if vr >= 0: count = emit(code, count, arm_mov_reg(0, vr))
                 if rk == 2:
-                    let v: int32 = parse_int(buf, spans, i + 1)
-                    count = emit(code, count, arm_movz_imm(0, v))
+                    count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 1)))
             count = emit(code, count, arm_ret())
             i = total
-        if is_let == 0: if is_ret == 0: i = i + 1
+        if is_let == 0: if is_if == 0: if is_while == 0: if is_ret == 0: i = i + 1
     return count
 
 // Hardcoded test source: "fn main(): int32 =\n    let x = 3\n    return x\n"
@@ -260,9 +306,7 @@ fn fill_source(buf: int32[1024]): int32 =
 
 fn main(): int32 =
     var buf: int32[1024]
-    // "fn main(): int32 =\n    let x = 3\n    return x\n" = 46 bytes
-    // Pack as int32 words
-    // f n   m a   i n (  )   :   i n   t 3 2
+    // "fn main(): int32 =\n    let x = 0\n    while x: return 42\n    return 0\n"
     buf[0] = 102 + (110 << 8) + (32 << 16) + (109 << 24)  // "fn m"
     buf[1] = 97 + (105 << 8) + (110 << 16) + (40 << 24)   // "ain("
     buf[2] = 41 + (58 << 8) + (32 << 16) + (105 << 24)    // "): i"
@@ -270,12 +314,16 @@ fn main(): int32 =
     buf[4] = 32 + (61 << 8) + (10 << 16) + (32 << 24)     // " =\n "
     buf[5] = 32 + (32 << 8) + (32 << 16) + (108 << 24)    // "   l"
     buf[6] = 101 + (116 << 8) + (32 << 16) + (120 << 24)  // "et x"
-    buf[7] = 32 + (61 << 8) + (32 << 16) + (51 << 24)     // " = 3"
+    buf[7] = 32 + (61 << 8) + (32 << 16) + (49 << 24)     // " = 1"
     buf[8] = 10 + (32 << 8) + (32 << 16) + (32 << 24)     // "\n   "
-    buf[9] = 114 + (101 << 8) + (116 << 16) + (117 << 24) // "retu"
-    buf[10] = 114 + (110 << 8) + (32 << 16) + (120 << 24) // "rn x"
-    buf[11] = 10                                          // "\n"
-    let n: int32 = 46  // total bytes
+    buf[9] = 105 + (102 << 8) + (32 << 16) + (120 << 24)  // "if x"
+    buf[10] = 58 + (32 << 8) + (114 << 16) + (101 << 24)  // ": re"
+    buf[11] = 116 + (117 << 8) + (114 << 16) + (110 << 24) // "turn"
+    buf[12] = 32 + (52 << 8) + (50 << 16) + (10 << 24)    // " 42\n"
+    buf[13] = 32 + (32 << 8) + (32 << 16) + (114 << 24)   // "   r"
+    buf[14] = 101 + (116 << 8) + (117 << 16) + (114 << 24) // "etur"
+    buf[15] = 110 + (32 << 8) + (48 << 16) + (10 << 24)   // "n 0\n"
+    let n: int32 = 64  // total bytes
 
     let spans: int64 = cold_mmap(16384)
     if spans == 0: return 3
