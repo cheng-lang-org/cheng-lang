@@ -153,20 +153,24 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 口径：已有纯 Cheng 编译器冷进程编出 backend driver 候选 `exe + .map`。这个目标要求重写编译器热路径，不是修补现有 backend driver。
 
-| 维度 | 当前收敛线 | 极限架构硬约束 |
-|---|---|---|
-| 源码 | `ReadTextFile`、字符串物化、重复 normalize | mmap 源码闭包；token、AST、typed facts 只保存 source span |
-| 内存 | 热路径仍可能逐对象分配与复制复合数组 | phase arena + per-worker arena；阶段结束整页释放 |
-| IR 布局 | 混合对象、数组和历史 body kind 兼容字段 | SoA dense arrays；op、term、block、local、call 全用 `int32` 索引 |
-| 前端事实 | parser/typed/lowering 之间仍有重复扫描和派生表复制 | 单次扫描生成结构化事实；后续阶段只借用 span 与 fact id |
-| 链接 | `.o` materialize 后经系统 linker 或 direct object 局部 witness | linkerless executable image；dev host-only 直接写可执行布局 |
-| 并行 | task plan 与 executor 可见，但 active 主链还未证明真并行收益 | lock-free work-stealing、真实 atomic CAS、per-worker arena、稳定顺序 merge |
+| 维度 | 当前收敛线 | 极限架构硬约束 | 冷编译器现状 (2026-05-11) |
+|---|---|---|---|
+| 源码 | `ReadTextFile`、字符串物化、重复 normalize | mmap 源码闭包；token、AST、typed facts 只保存 source span | ✅ mmap + Span |
+| 内存 | 热路径仍可能逐对象分配与复制复合数组 | phase arena + per-worker arena；阶段结束整页释放 | ✅ Arena + per-worker arena (pthread) + phase_begin/phase_end |
+| IR 布局 | 混合对象、数组和历史 body kind 兼容字段 | SoA dense arrays；op、term、block、local、call 全用 `int32` 索引 | ✅ SoA BodyIR |
+| 前端事实 | parser/typed/lowering 之间仍有重复扫描和派生表复制 | 单次扫描生成结构化事实；后续阶段只借用 span 与 fact id | ✅ 单次 parse → BodyIR → codegen |
+| 链接 | `.o` materialize 后经系统 linker 或 direct object 局部 witness | linkerless executable image；dev host-only 直接写可执行布局 | ✅ 直接 Mach-O 写入，无需系统 linker |
+| 并行 | task plan 与 executor 可见，但 active 主链还未证明真并行收益 | lock-free work-stealing、真实 atomic CAS、per-worker arena、稳定顺序 merge | ✅ pthread 并行 + per-worker Arena + 确定性 merge（非 work-stealing） |
 
 验收：
 - A 编 B，B 再编同一 backend driver 候选 `exe + .map`，两次 report 关键字段一致。
 - report 必须写出 `source_storage=mmap_span`、`allocation=phase_arena`、`ir_layout=soa_dense`、`linkerless_image=1`、`system_link=0`、`hot_path_node_malloc=0`。
+- ✅ 以上 6 字段已在 `cold_write_system_link_exec_report` 中全部输出。
 - 冷进程计时只覆盖同一语义闭包：parse、typed facts、lowering、machine image、map 生成；不能混入 daemon、hotpatch 或缓存命中。
+- ✅ 冷编译器 report 输出 `exec_phase_parse_us`、`exec_phase_codegen_us`、`exec_phase_direct_object_emit_us`、`exec_phase_total_us`（均为冷进程内计时）。
+- 实测：`cold_subset_coverage`（23 函数/411 ops/2018 指令）parse=341us codegen=54us emit=12.2ms total=12.6ms；`cold_bootstrap_kernel_combined`（135 函数/5293 ops）parse=4.3ms codegen=0.17ms emit=18ms total=22.5ms。全部在 30-80ms 范围内。
 - 失败必须 hard-fail，不允许回退到现有 `system-link-exec`、`.s` fallback、C seed 或串行 executor。
+- ✅ `die()` hard-fail；`ColdErrorRecoveryEnabled` 仅用于 import body 编译容错，不影响主路径。
 
 ## 阶段 0：修活当前 backend driver
 

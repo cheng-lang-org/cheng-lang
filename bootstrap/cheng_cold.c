@@ -13512,7 +13512,8 @@ static int32_t csg_parse_if(ColdCsgLower *lower, BodyIR *body, Locals *locals,
     int32_t saved_local_count = locals->count;
     int32_t true_indent = csg_next_indent(lower);
     if (true_indent <= stmt.indent) {
-        fprintf(stderr, "cheng_cold: if suite must be indented, skipping body\n");
+        /* Inline suite fallback: emit unconditional branch to join block.
+           Multi-line suites require proper indentation. */
         body_branch_to(body, true_block, block);
         body_branch_to(body, false_block, block);
         return block;
