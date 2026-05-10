@@ -72,9 +72,11 @@
 ### 新增（2026-05-11）：函数级并行（pthread 实现） + No-Alias 完善
 
 - **No-Alias 缓存完善**：`na_clobber(1)` / `na_clobber(2)` 在 I32_ADD/SUB/MUL/DIV/CMP/MOD 等使用 R1/R2 为临时寄存器的 op 中正确无效化缓存。I32_MOD 补充 `na_set(0, dst)` 结果缓存。消除潜在 stale cache 问题。
-- **函数级并行 codegen（pthread）**：
+- **函数级并行 codegen（pthread + lock-free work-stealing）**：
   - `cold_jobs_from_env()` 读取 `BACKEND_JOBS` 环境变量（1-16），默认 1（串行）。
-  - `codegen_worker_run` 线程函数：每个 worker 独立 Code buffer + FunctionPatchList + Arena（mmap 独立页），编译分配到的函数子集。
+  - `codegen_worker_run` 线程函数：每个 worker 独立 Code buffer + FunctionPatchList + Arena（mmap 独立页）。
+  - **Lock-free work-stealing**：共享 `int32_t next_fn` 计数器，worker 通过 `__atomic_fetch_add(&next_fn, 1, __ATOMIC_RELAXED)` 无锁竞争下一个函数索引。
+  - **确定性 merge**：合并阶段按函数索引序扫描，从对应 worker 的 local_code 中提取函数代码块并调整 patch 偏移，保证 `BACKEND_JOBS=N` 任意值下 `COLD_NO_SIGN=1` 产物 SHA 一致。
   - `codegen_program` 并行分支：入口函数串行编译后，剩余函数按 `BACKEND_JOBS` 均分到 worker 线程，`pthread_join` 后合并 code words、function patches（调整调用位偏移）、function positions。
   - `codegen_func` 的临时分配（`block_pos`、`PatchList`）改用 `code->arena`（worker 私有），消除跨线程 arena 竞争。
   - 确定性验证：`COLD_NO_SIGN=1` 下 `BACKEND_JOBS=1` 与 `BACKEND_JOBS=4` 产物 SHA 完全一致。
@@ -160,7 +162,7 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 | IR 布局 | 混合对象、数组和历史 body kind 兼容字段 | SoA dense arrays；op、term、block、local、call 全用 `int32` 索引 | ✅ SoA BodyIR |
 | 前端事实 | parser/typed/lowering 之间仍有重复扫描和派生表复制 | 单次扫描生成结构化事实；后续阶段只借用 span 与 fact id | ✅ 单次 parse → BodyIR → codegen |
 | 链接 | `.o` materialize 后经系统 linker 或 direct object 局部 witness | linkerless executable image；dev host-only 直接写可执行布局 | ✅ 直接 Mach-O 写入，无需系统 linker |
-| 并行 | task plan 与 executor 可见，但 active 主链还未证明真并行收益 | lock-free work-stealing、真实 atomic CAS、per-worker arena、稳定顺序 merge | ✅ pthread 并行 + per-worker Arena + 确定性 merge（非 work-stealing） |
+| 并行 | task plan 与 executor 可见，但 active 主链还未证明真并行收益 | lock-free work-stealing、真实 atomic CAS、per-worker arena、稳定顺序 merge | ✅ atomic fetch_add work-stealing + per-worker Arena + 函数索引序确定性 merge |
 
 验收：
 - A 编 B，B 再编同一 backend driver 候选 `exe + .map`，两次 report 关键字段一致。

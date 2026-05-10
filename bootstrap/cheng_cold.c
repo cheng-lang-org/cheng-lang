@@ -13960,23 +13960,25 @@ static void code_emit(Code *code, uint32_t word);
 static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
                          FunctionPatchList *function_patches);
 
-/* ---- parallel codegen worker ---- */
+/* ---- parallel codegen worker (lock-free work-stealing) ---- */
 
 typedef struct {
-    int32_t start_idx;
-    int32_t end_idx;
+    int32_t *next_fn;             /* shared atomic counter (accessed via __atomic builtins) */
     int32_t entry_function;
-    BodyIR **function_bodies;
     int32_t function_count;
+    BodyIR **function_bodies;
     Symbols *symbols;
     Code *local_code;
     FunctionPatchList local_patches;
     int32_t *local_function_pos;
+    int32_t *local_function_end;  /* end position in local_code for each function */
 } CodegenWorker;
 
 static void *codegen_worker_run(void *arg) {
     CodegenWorker *w = (CodegenWorker *)arg;
-    for (int32_t i = w->start_idx; i < w->end_idx; i++) {
+    for (;;) {
+        int32_t i = __atomic_fetch_add(w->next_fn, 1, __ATOMIC_RELAXED);
+        if (i >= w->function_count) break;
         if (i == w->entry_function || !w->function_bodies[i] ||
             w->function_bodies[i]->has_fallback) continue;
         w->local_function_pos[i] = w->local_code->count;
@@ -13985,9 +13987,10 @@ static void *codegen_worker_run(void *arg) {
             (body->block_count > 0 && body->block_term[0] < 0)) {
             code_emit(w->local_code, a64_movz(R0, 0, 0));
             code_emit(w->local_code, a64_ret());
-            continue;
+        } else {
+            codegen_func(w->local_code, body, w->symbols, &w->local_patches);
         }
-        codegen_func(w->local_code, body, w->symbols, &w->local_patches);
+        w->local_function_end[i] = w->local_code->count;
     }
     return NULL;
 }
@@ -17313,50 +17316,37 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
     if (num_jobs > 1 && remaining > 1) {
         int32_t active_jobs = num_jobs;
         if (active_jobs > remaining) active_jobs = remaining;
-        int32_t per_worker = remaining / active_jobs;
+
+        /* Shared atomic counter: workers pull next function index via fetch_add */
+        int32_t next_fn = 0;
 
         CodegenWorker *workers = arena_alloc(code->arena,
             (size_t)active_jobs * sizeof(CodegenWorker));
         pthread_t *threads = arena_alloc(code->arena,
             (size_t)active_jobs * sizeof(pthread_t));
 
-        int32_t cursor = 0;
         for (int32_t w = 0; w < active_jobs; w++) {
-            int32_t chunk = (w == active_jobs - 1) ? (remaining - cursor) : per_worker;
-            int32_t start_fn = 0, counted = 0;
-            for (start_fn = 0; start_fn < function_count; start_fn++) {
-                if (start_fn != entry_function && function_bodies[start_fn] &&
-                    !function_bodies[start_fn]->has_fallback) {
-                    if (counted == cursor) break;
-                    counted++;
-                }
-            }
-            int32_t end_fn = start_fn;
-            int32_t assigned = 0;
-            while (end_fn < function_count && assigned < chunk) {
-                if (end_fn != entry_function && function_bodies[end_fn] &&
-                    !function_bodies[end_fn]->has_fallback) assigned++;
-                end_fn++;
-            }
-
             Arena *w_arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
                                   MAP_PRIVATE | MAP_ANON, -1, 0);
             if (w_arena == MAP_FAILED) die("worker arena mmap failed");
             Code *w_code = code_new(w_arena, 256);
             workers[w] = (CodegenWorker){
-                .start_idx = start_fn, .end_idx = end_fn,
+                .next_fn = &next_fn,
                 .entry_function = entry_function,
-                .function_bodies = function_bodies,
                 .function_count = function_count,
+                .function_bodies = function_bodies,
                 .symbols = symbols,
                 .local_code = w_code,
                 .local_patches = {.arena = w_arena},
                 .local_function_pos = arena_alloc(w_arena,
                     (size_t)function_count * sizeof(int32_t)),
+                .local_function_end = arena_alloc(w_arena,
+                    (size_t)function_count * sizeof(int32_t)),
             };
-            for (int32_t i = 0; i < function_count; i++)
+            for (int32_t i = 0; i < function_count; i++) {
                 workers[w].local_function_pos[i] = -1;
-            cursor += assigned;
+                workers[w].local_function_end[i] = -1;
+            }
             if (pthread_create(&threads[w], NULL, codegen_worker_run, &workers[w]) != 0) {
                 die("codegen worker create failed");
             }
@@ -17366,20 +17356,43 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             if (pthread_join(threads[w], NULL) != 0) {
                 die("codegen worker join failed");
             }
-            CodegenWorker *wk = &workers[w];
+        }
+
+        /* Deterministic merge: copy functions in index order.
+           For each function, find which worker claimed it, then copy its
+           code block and adjust patch positions by the final offset. */
+        for (int32_t i = 0; i < function_count; i++) {
+            if (i == entry_function || !function_bodies[i] ||
+                function_bodies[i]->has_fallback) continue;
+            /* Find the worker that claimed this function */
+            CodegenWorker *wk = NULL;
+            for (int32_t w = 0; w < active_jobs; w++) {
+                if (workers[w].local_function_pos[i] >= 0) {
+                    wk = &workers[w];
+                    break;
+                }
+            }
+            if (!wk) continue;
             int32_t base_offset = code->count;
-            for (int32_t j = 0; j < wk->local_code->count; j++)
+            int32_t fn_start = wk->local_function_pos[i];
+            int32_t fn_end = wk->local_function_end[i];
+            function_pos[i] = base_offset;
+            /* Copy function code words */
+            for (int32_t j = fn_start; j < fn_end; j++)
                 code_emit(code, wk->local_code->words[j]);
+            /* Copy patches for this function (those between fn_start and fn_end) */
             for (int32_t j = 0; j < wk->local_patches.count; j++) {
-                function_patches_add(&function_patches,
-                    wk->local_patches.items[j].pos + base_offset,
-                    wk->local_patches.items[j].target_function);
+                int32_t pp = wk->local_patches.items[j].pos;
+                if (pp >= fn_start && pp < fn_end) {
+                    function_patches_add(&function_patches,
+                        pp - fn_start + base_offset,
+                        wk->local_patches.items[j].target_function);
+                }
             }
-            for (int32_t j = 0; j < function_count; j++) {
-                if (wk->local_function_pos[j] >= 0)
-                    function_pos[j] = wk->local_function_pos[j] + base_offset;
-            }
-            munmap(wk->local_code->arena, sizeof(Arena));
+        }
+
+        for (int32_t w = 0; w < active_jobs; w++) {
+            munmap(workers[w].local_code->arena, sizeof(Arena));
         }
     } else {
         for (int32_t i = 0; i < function_count; i++) {
@@ -18922,6 +18935,10 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     if (!target || target[0] == '\0') target = "arm64-apple-darwin";
     if (!emit || emit[0] == '\0') emit = "exe";
     const char *effective_csg_path = csg_in_path;
+
+    /* Parse diagnostic flags */
+    cold_diag_dump_per_fn = (cold_flag_value(argc, argv, "--diag:dump_per_fn") != NULL);
+    cold_diag_dump_slots = (cold_flag_value(argc, argv, "--diag:dump_slots") != NULL);
 
     /* ensure report sidecar is written even if die() fires */
     if (report_path && report_path[0] != '\0') {
