@@ -9,6 +9,7 @@
 - 并行子代理改同批文件：扫冲突标记+语义断裂，不只看`git diff --check`。
 - Runtime验证：锁`provider_object_count>0`+`standalone_no_runtime=0`+真实符号。不能只看exit 0。
 - 短smoke：要求输出marker，host gate检查marker。`mov w0,#0; ret`是假绿。
+- cold `compile_body` 已到单函数操作数/指令数安全边界；新增变量或一个 patch 调用都可能让生成二进制崩溃。先修 `cheng_cold.c` slot/register/codegen 扩容，别继续堆补丁。
 - 函数级并行：必须接入active primary task path。库级executor不算完成。
 - Work-stealing pop末项必须CAS；`head==nextTail`不用CAS会重复执行。
 - pthread detach失败必须硬退出；ctx已飞入线程后返回错误=use-after-free。

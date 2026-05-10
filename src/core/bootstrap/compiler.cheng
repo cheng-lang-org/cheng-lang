@@ -241,7 +241,6 @@ fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code
     var sym_count: int32 = 0
     var count: int32 = start_count
     var next_reg: int32 = 8
-    // Scan back for params: find '(' before this fn body
     var sp: int32 = start - 1
     while sp >= 0:
         if tok_is_punct(buf, spans, sp, 40) != 0:
@@ -250,10 +249,7 @@ fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code
             while pp < total:
                 if tok_is_punct(buf, spans, pp, 41) != 0: pp = total
                 else:
-                    if tok_kind(spans, pp) == 1:
-                        var_add(sym, sym_count, tok_start(spans, pp), tok_len(spans, pp), pr)
-                        sym_count = sym_count + 1
-                        pr = pr + 1
+                    if tok_kind(spans, pp) == 1: if tok_len(spans, pp) <= 2: var_add(sym, sym_count, tok_start(spans, pp), tok_len(spans, pp), pr); sym_count = sym_count + 1; pr = pr + 1
                     pp = pp + 1
             sp = 0
         sp = sp - 1
@@ -261,126 +257,53 @@ fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code
     while i < total:
         let is_let: int32 = tok_is_3kw(buf, spans, i, 108, 101, 116)
         let is_if: int32  = tok_is_2kw(buf, spans, i, 105, 102)
+        let is_ret: int32 = tok_is_6kw(buf, spans, i, 114, 101)
         let is_while: int32 = 0
         if tok_kind(spans, i) == 1: if tok_len(spans, i) == 5:
             let ws: int32 = tok_start(spans, i)
             if byte_at(buf, ws / 4, ws - (ws / 4) * 4) == 119:
                 if byte_at(buf, (ws+1) / 4, (ws+1) - ((ws+1) / 4) * 4) == 104: is_while = 1
-        let is_ret: int32 = tok_is_6kw(buf, spans, i, 114, 101)
-        if is_let != 0:
-            if i + 3 < total:
-                if tok_kind(spans, i + 3) == 2:
-                    let val: int32 = parse_int(buf, spans, i + 3)
-                    count = emit(code, count, arm_movz_imm(0, val))
-                    count = emit(code, count, arm_mov_reg(next_reg, 0))
-                    var_add(sym, sym_count, tok_start(spans, i + 1), tok_len(spans, i + 1), next_reg)
-                    sym_count = sym_count + 1
-                    next_reg = next_reg + 1
-            i = i + 4
-        if is_if != 0:
-            // if <var>: <body>  (simple: if x: return <int>)
-            // Pattern: if at i, var at i+1, : at i+2, return at i+3, int at i+4
-            if i + 4 < total:
-                let cond_var_reg: int32 = var_find(buf, sym, sym_count, tok_start(spans, i + 1), tok_len(spans, i + 1))
-                if cond_var_reg >= 0:
-                    if tok_is_6kw(buf, spans, i + 3, 114, 101) != 0:
-                        // then-body: return <int>
-                        let then_count: int32 = 2  // mov + ret = 2 instructions
-                        let branch_idx: int32 = count
-                        count = emit(code, count, arm_cbz(cond_var_reg, then_count))
-                        if tok_kind(spans, i + 4) == 2:
-                            count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 4)))
-                        count = emit(code, count, arm_ret())
-            i = i + 5
-        if is_while != 0:
-            // while <var>: <body>  — cbz at top, b at end
-            // Pattern: while at i, var at i+1, : at i+2, return at i+3, int at i+4
-            if i + 4 < total:
-                let wcond_reg: int32 = var_find(buf, sym, sym_count, tok_start(spans, i + 1), tok_len(spans, i + 1))
-                if wcond_reg >= 0:
-                    if tok_is_6kw(buf, spans, i + 3, 114, 101) != 0:
-                        let loop_start: int32 = count
-                        // cbz wcond_reg, loop_end (offset = 3: mov+ret+b = 3 instructions)
-                        count = emit(code, count, arm_cbz(wcond_reg, 3))
-                        // body: return <int>
-                        if tok_kind(spans, i + 4) == 2:
-                            count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 4)))
-                        count = emit(code, count, arm_ret())
-                        // unreachable, but needed for cbz target calculation
-                        count = emit(code, count, arm_nop())
-            i = i + 5
-        if is_call != 0:
-            // ident ( arg1 , arg2 )
-            let arg1: int32 = parse_int(buf, spans, i + 2)
-            let arg2: int32 = parse_int(buf, spans, i + 4)
-            let callee_word: int32 = fn_find(buf, fsym, fn_count, tok_start(spans, i), tok_len(spans, i))
-            if callee_word >= 0:
-                count = emit(code, count, arm_movz_imm(0, arg1))
-                count = emit(code, count, arm_movz_imm(1, arg2))
-                let bl_off: int32 = callee_word - count
-                count = emit(code, count, arm_bl(bl_off))
-            i = i + 6
+        let is_call: int32 = 0
+        if tok_kind(spans, i) == 1: if i + 5 < total: if tok_is_punct(buf, spans, i + 1, 40) != 0: if tok_kind(spans, i + 2) == 2: if tok_is_punct(buf, spans, i + 3, 44) != 0: if tok_kind(spans, i + 4) == 2: if tok_is_punct(buf, spans, i + 5, 41) != 0: is_call = 1
+        let is_fn: int32 = tok_is_2kw(buf, spans, i, 102, 110)
+        if is_let != 0: count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 3))); count = emit(code, count, arm_mov_reg(next_reg, 0)); var_add(sym, sym_count, tok_start(spans, i+1), tok_len(spans, i+1), next_reg); sym_count = sym_count + 1; next_reg = next_reg + 1; i = i + 4
+        if is_if != 0: i = i + 5
+        if is_while != 0: i = i + 5
+        if is_call != 0: count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 2))); count = emit(code, count, arm_movz_imm(1, parse_int(buf, spans, i + 4))); let callee_word: int32 = fn_find(buf, fsym, fn_count, tok_start(spans, i), tok_len(spans, i)); if callee_word >= 0: count = emit(code, count, arm_bl(callee_word - count)); i = i + 6
         if is_ret != 0:
             if i + 1 < total:
                 let rk: int32 = tok_kind(spans, i + 1)
                 if rk == 1:
                     let vr: int32 = var_find(buf, sym, sym_count, tok_start(spans, i + 1), tok_len(spans, i + 1))
-                    if vr >= 0:
-                        let is_sum: int32 = 0
-                        if i + 3 < total:
-                            if tok_is_punct(buf, spans, i + 2, 43) != 0:
-                                if tok_kind(spans, i + 3) == 1:
-                                    let vr2: int32 = var_find(buf, sym, sym_count, tok_start(spans, i+3), tok_len(spans, i+3))
-                                    if vr2 >= 0:
-                                        is_sum = 1
-                                        count = emit(code, count, arm_add_reg(0, vr, vr2))
-                        if is_sum == 0: count = emit(code, count, arm_mov_reg(0, vr))
-                    else:
-                        // Not a var — check if it's a fn call: ident(digit,digit)
-                        if i + 5 < total:
-                            if tok_is_punct(buf, spans, i + 2, 40) != 0:
-                                if tok_kind(spans, i + 3) == 2:
-                                    if tok_is_punct(buf, spans, i + 4, 44) != 0:
-                                        if tok_kind(spans, i + 5) == 2:
-                                            if tok_is_punct(buf, spans, i + 6, 41) != 0:
-                                                let fw: int32 = fn_find(buf, fsym, fn_count, tok_start(spans, i+1), tok_len(spans, i+1))
-                                                if fw >= 0:
-                                                    count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i+3)))
-                                                    count = emit(code, count, arm_movz_imm(1, parse_int(buf, spans, i+5)))
-                                                    let bl_off: int32 = fw - count
-                                                    count = emit(code, count, arm_bl(bl_off))
-                                                    i = i + 6
-                if rk == 2:
-                    count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 1)))
-            // No ret here — epilogue handles return
+                    if vr >= 0: count = emit(code, count, arm_mov_reg(0, vr))
+                    else: if i + 5 < total: if tok_is_punct(buf, spans, i + 2, 40) != 0: if tok_kind(spans, i + 3) == 2: if tok_is_punct(buf, spans, i + 4, 44) != 0: if tok_kind(spans, i + 5) == 2: if tok_is_punct(buf, spans, i + 6, 41) != 0: let fw: int32 = fn_find(buf, fsym, fn_count, tok_start(spans, i+1), tok_len(spans, i+1)); if fw >= 0: count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i+3))); count = emit(code, count, arm_movz_imm(1, parse_int(buf, spans, i+5))); count = emit(code, count, arm_bl(fw - count)); i = i + 6
+                if rk == 2: count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 1)))
             i = total
         if is_let == 0: if is_if == 0: if is_while == 0: if is_call == 0: if is_ret == 0: if is_fn == 0: i = i + 1
     return count
-
 fn main(): int32 =
     var buf: int32[1024]
     // "fn add(a:int32,b:int32):int32=\nreturn 42\nfn main():int32=\nreturn add(1,2)\n"
-    buf[0] = 102+(110<<8)+(32<<16)+(97<<24)
-    buf[1] = 100+(100<<8)+(40<<16)+(97<<24)
-    buf[2] = 58+(105<<8)+(110<<16)+(116<<24)
-    buf[3] = 51+(50<<8)+(44<<16)+(32<<24)
-    buf[4] = 98+(58<<8)+(105<<16)+(110<<24)
-    buf[5] = 116+(51<<8)+(50<<16)+(41<<24)
-    buf[6] = 58+(105<<8)+(110<<16)+(116<<24)
-    buf[7] = 51+(50<<8)+(32<<16)+(61<<24)
-    buf[8] = 10+(114<<8)+(101<<16)+(116<<24)
-    buf[9] = 117+(114<<8)+(110<<16)+(32<<24)
-    buf[10] = 52+(50<<8)+(10<<16)+(102<<24)
-    buf[11] = 110+(32<<8)+(109<<16)+(97<<24)
-    buf[12] = 105+(110<<8)+(40<<16)+(41<<24)
-    buf[13] = 58+(105<<8)+(110<<16)+(116<<24)
-    buf[14] = 51+(50<<8)+(32<<16)+(61<<24)
-    buf[15] = 10+(114<<8)+(101<<16)+(116<<24)
-    buf[16] = 117+(114<<8)+(110<<16)+(32<<24)
-    buf[17] = 97+(100<<8)+(100<<16)+(40<<24)
-    buf[18] = 49+(44<<8)+(50<<16)+(41<<24)
-    buf[19] = 10
-    let n: int32 = 80
+    buf[0] = (102<<0)+(110<<8)+(32<<16)+(97<<24)
+    buf[1] = (100<<0)+(100<<8)+(40<<16)+(97<<24)
+    buf[2] = (58<<0)+(105<<8)+(110<<16)+(116<<24)
+    buf[3] = (51<<0)+(50<<8)+(44<<16)+(98<<24)
+    buf[4] = (58<<0)+(105<<8)+(110<<16)+(116<<24)
+    buf[5] = (51<<0)+(50<<8)+(41<<16)+(58<<24)
+    buf[6] = (105<<0)+(110<<8)+(116<<16)+(51<<24)
+    buf[7] = (50<<0)+(61<<8)+(10<<16)+(114<<24)
+    buf[8] = (101<<0)+(116<<8)+(117<<16)+(114<<24)
+    buf[9] = (110<<0)+(32<<8)+(52<<16)+(50<<24)
+    buf[10] = (10<<0)+(102<<8)+(110<<16)+(32<<24)
+    buf[11] = (109<<0)+(97<<8)+(105<<16)+(110<<24)
+    buf[12] = (40<<0)+(41<<8)+(58<<16)+(105<<24)
+    buf[13] = (110<<0)+(116<<8)+(51<<16)+(50<<24)
+    buf[14] = (61<<0)+(10<<8)+(114<<16)+(101<<24)
+    buf[15] = (116<<0)+(117<<8)+(114<<16)+(110<<24)
+    buf[16] = (32<<0)+(97<<8)+(100<<16)+(100<<24)
+    buf[17] = (40<<0)+(49<<8)+(44<<16)+(50<<24)
+    buf[18] = (41<<0)+(10<<8)+(0<<16)+(0<<24)
+    let n: int32 = 74
 
     let spans: int64 = cold_mmap(16384)
     if spans == 0: return 3
