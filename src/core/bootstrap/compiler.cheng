@@ -96,6 +96,11 @@ fn tok_is_3kw(buf: int32[1024], spans: int64, idx: int32, c0: int32, c1: int32, 
     if byte_at(buf, (start+2) / 4, (start+2) - ((start+2) / 4) * 4) != c2: return 0
     return 1
 
+fn tok_is_punct(buf: int32[1024], spans: int64, idx: int32, ch: int32): int32 =
+    if tok_kind(spans, idx) != 4: return 0
+    let s: int32 = tok_start(spans, idx)
+    if byte_at(buf, s/4, s-(s/4)*4) == ch: return 1
+    return 0
 fn tok_is_6kw(buf: int32[1024], spans: int64, idx: int32, c0: int32, c1: int32): int32 =
     let k: int32 = tok_kind(spans, idx)
     if k != 1: return 0
@@ -169,8 +174,9 @@ fn arm_add_sp_16(): int32 = return 0x910043FF
 fn arm_ldp_post(): int32 = return 0xA8C17BFD
 fn arm_nop(): int32 = return 0xD503201F
 
-// Write .o template with variable-length code (max 10 words = 40 bytes)
+// Write .o template with dynamic code size (in bytes)
 fn write_obj(buf: int64, code: int64, code_words: int32) =
+    let code_bytes: int32 = code_words * 4
     var i: int32 = 0
     while i < 74:
         ptrStoreI32(buf + int64(i * 4), 0)
@@ -184,9 +190,9 @@ fn write_obj(buf: int64, code: int64, code_words: int32) =
     ptrStoreI32(buf + int64(36), 0x00000098)
     ptrStoreI32(buf + int64(40), 0x45545F5F)
     ptrStoreI32(buf + int64(44), 0x00005458)
-    ptrStoreI32(buf + int64(64), 0x00000028)
+    ptrStoreI32(buf + int64(64), code_bytes)
     ptrStoreI32(buf + int64(72), 0x000000E8)
-    ptrStoreI32(buf + int64(80), 0x00000028)
+    ptrStoreI32(buf + int64(80), code_bytes)
     ptrStoreI32(buf + int64(88), 0x00000007)
     ptrStoreI32(buf + int64(92), 0x00000007)
     ptrStoreI32(buf + int64(96), 0x00000001)
@@ -194,7 +200,7 @@ fn write_obj(buf: int64, code: int64, code_words: int32) =
     ptrStoreI32(buf + int64(108), 0x00007478)
     ptrStoreI32(buf + int64(120), 0x45545F5F)
     ptrStoreI32(buf + int64(124), 0x00005458)
-    ptrStoreI32(buf + int64(144), 0x00000028)
+    ptrStoreI32(buf + int64(144), code_bytes)
     ptrStoreI32(buf + int64(152), 0x000000E8)
     ptrStoreI32(buf + int64(156), 0x00000002)
     ptrStoreI32(buf + int64(168), 0x80000400)
@@ -234,7 +240,7 @@ fn compile_expr(buf: int32[1024], spans: int64, start: int32, total: int32, code
     return count
 
 // === Body compiler: handle let x = <int>; return x ===
-fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code: int64, start_count: int32): int32 =
+fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code: int64, start_count: int32, fsym: int64, fn_count: int32): int32 =
     let sym: int64 = cold_mmap(256)
     var sym_count: int32 = 0
     var count: int32 = start_count
@@ -291,6 +297,17 @@ fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code
                         // unreachable, but needed for cbz target calculation
                         count = emit(code, count, arm_nop())
             i = i + 5
+        if is_call != 0:
+            // ident ( arg1 , arg2 )
+            let arg1: int32 = parse_int(buf, spans, i + 2)
+            let arg2: int32 = parse_int(buf, spans, i + 4)
+            let callee_word: int32 = fn_find(buf, fsym, fn_count, tok_start(spans, i), tok_len(spans, i))
+            if callee_word >= 0:
+                count = emit(code, count, arm_movz_imm(0, arg1))
+                count = emit(code, count, arm_movz_imm(1, arg2))
+                let bl_off: int32 = callee_word - count
+                count = emit(code, count, arm_bl(bl_off))
+            i = i + 6
         if is_ret != 0:
             if i + 1 < total:
                 let rk: int32 = tok_kind(spans, i + 1)
@@ -301,7 +318,7 @@ fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code
                     count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 1)))
             // No ret here — epilogue handles return
             i = total
-        if is_let == 0: if is_if == 0: if is_while == 0: if is_ret == 0: i = i + 1
+        if is_let == 0: if is_if == 0: if is_while == 0: if is_call == 0: if is_ret == 0: if is_fn == 0: i = i + 1
     return count
 
 // Hardcoded test source: "fn main(): int32 =\n    let x = 3\n    return x\n"
@@ -313,14 +330,14 @@ fn fill_source(buf: int32[1024]): int32 =
 fn main(): int32 =
     var buf: int32[1024]
     // "fn main(): int32 =\n    return 42\n"
-    buf[0] = 102 + (110 << 8) + (32 << 16) + (109 << 24)
-    buf[1] = 97 + (105 << 8) + (110 << 16) + (40 << 24)
-    buf[2] = 41 + (58 << 8) + (32 << 16) + (105 << 24)
-    buf[3] = 110 + (116 << 8) + (51 << 16) + (50 << 24)
-    buf[4] = 32 + (61 << 8) + (10 << 16) + (32 << 24)
-    buf[5] = 32 + (32 << 8) + (32 << 16) + (114 << 24)
-    buf[6] = 101 + (116 << 8) + (117 << 16) + (114 << 24)
-    buf[7] = 110 + (32 << 8) + (52 << 16) + (50 << 24)
+    buf[0] = 102+(110<<8)+(32<<16)+(109<<24)
+    buf[1] = 97+(105<<8)+(110<<16)+(40<<24)
+    buf[2] = 41+(58<<8)+(32<<16)+(105<<24)
+    buf[3] = 110+(116<<8)+(51<<16)+(50<<24)
+    buf[4] = 32+(61<<8)+(10<<16)+(32<<24)
+    buf[5] = 32+(32<<8)+(32<<16)+(114<<24)
+    buf[6] = 101+(116<<8)+(117<<16)+(114<<24)
+    buf[7] = 110+(32<<8)+(52<<16)+(50<<24)
     buf[8] = 10
     let n: int32 = 34
 
@@ -332,10 +349,17 @@ fn main(): int32 =
     // Compile ALL functions: each fn → prologue + body + epilogue
     let code: int64 = cold_mmap(1024)
     if code == 0: return 6
+    let fsym: int64 = cold_mmap(256)
     var code_words: int32 = 0
+    var fn_count: int32 = 0
     var j: int32 = 0
     while j < total:
         if tok_is_2kw(buf, spans, j, 102, 110) != 0:
+            let fn_name_s: int32 = tok_start(spans, j + 1)
+            let fn_name_l: int32 = tok_len(spans, j + 1)
+            let fn_entry: int32 = code_words  // prologue starts here
+            fn_add(fsym, fn_count, fn_name_s, fn_name_l, fn_entry)
+            fn_count = fn_count + 1
             code_words = emit(code, code_words, arm_stp_pre())
             code_words = emit(code, code_words, arm_mov_fp())
             code_words = emit(code, code_words, arm_sub_sp_16())
@@ -345,7 +369,7 @@ fn main(): int32 =
                 if tok_kind(spans, k) == 4:
                     let c: int32 = byte_at(buf, tok_start(spans, k) / 4, tok_start(spans, k) - (tok_start(spans, k) / 4) * 4)
                     if c == 61:
-                        code_words = compile_body(buf, spans, k + 1, total, code, code_words)
+                        code_words = compile_body(buf, spans, k + 1, total, code, code_words, fsym, fn_count)
                         k = total
                 k = k + 1
             code_words = emit(code, code_words, arm_add_sp_16())
@@ -354,7 +378,6 @@ fn main(): int32 =
         j = j + 1
 
     if code_words <= 0: return 7
-
     let out: int64 = cold_mmap(4096)
     if out == 0: return 8
     write_obj(out, code, code_words)
