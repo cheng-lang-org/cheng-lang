@@ -5444,13 +5444,16 @@ static ObjectDef *symbols_resolve_object(Symbols *symbols, Span type_name) {
     type_name = span_trim(type_name);
     ObjectDef *existing = symbols_find_object(symbols, type_name);
     if (existing) return existing;
-    /* Fallback: search for qualified name *.type_name (imported objects) */
-    for (int32_t qi = 0; qi < symbols->object_count; qi++) {
-        ObjectDef *co = &symbols->objects[qi];
-        if (co->name.len > type_name.len + 1 &&
-            co->name.ptr[co->name.len - type_name.len - 1] == '.' &&
-            memcmp(co->name.ptr + co->name.len - type_name.len, type_name.ptr, (size_t)type_name.len) == 0) {
-            return co;
+    /* Fallback: search for qualified name *.type_name (imported objects).
+       Only for names starting with uppercase (type names). */
+    if (type_name.len > 0 && type_name.ptr[0] >= 'A' && type_name.ptr[0] <= 'Z') {
+        for (int32_t qi = 0; qi < symbols->object_count; qi++) {
+            ObjectDef *co = &symbols->objects[qi];
+            if (co->name.len > type_name.len + 1 &&
+                co->name.ptr[co->name.len - type_name.len - 1] == '.' &&
+                memcmp(co->name.ptr + co->name.len - type_name.len, type_name.ptr, (size_t)type_name.len) == 0) {
+                return co;
+            }
         }
     }
     if (span_eq(type_name, "ErrorInfo")) return symbols_ensure_std_error_info(symbols);
