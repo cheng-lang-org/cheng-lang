@@ -1,0 +1,49 @@
+// arena.cheng — Bump allocator (mmap-based)
+// Cold-compiler compatible: mmap + ptrStore/ptrLoad
+
+import libc
+
+// Arena layout: [base_addr(8)] [offset(4)] [cap(4)]
+// Returns base address, offset at +8, cap at +12
+
+fn arena_new(size: int32): int64 =
+    let base: int64 = cold_mmap(size)
+    if base == 0: return 0
+    ptrStoreI32(base + int64(8), 0)
+    ptrStoreI32(base + int64(12), size)
+    return base
+
+// Align n to multiple of 8
+fn align8(n: int32): int32 =
+    return ((n + 7) / 8) * 8
+
+fn arena_alloc(arena: int64, size: int32): int64 =
+    let off_addr: int64 = arena + int64(8)
+    let off: int32 = ptrLoadI32(off_addr)
+    let cap: int32 = ptrLoadI32(arena + int64(12))
+    let al: int32 = align8(off)
+    let new_off: int32 = al + size
+    if new_off > cap: return 0
+    ptrStoreI32(off_addr, new_off)
+    return arena + int64(al)
+
+fn arena_reset(arena: int64) =
+    ptrStoreI32(arena + int64(8), 0)
+
+fn arena_used(arena: int64): int32 =
+    return ptrLoadI32(arena + int64(8))
+
+fn arena_remaining(arena: int64): int32 =
+    let cap: int32 = ptrLoadI32(arena + int64(12))
+    return cap - ptrLoadI32(arena + int64(8))
+
+fn main(): int32 =
+    let a: int64 = arena_new(4096)
+    if a == 0: return 1
+    let p1: int64 = arena_alloc(a, 32)
+    if p1 == 0: return 2
+    let p2: int64 = arena_alloc(a, 64)
+    if p2 == 0: return 3
+    let used: int32 = arena_used(a)
+    if used > 0: return 42
+    return used
