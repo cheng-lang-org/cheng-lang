@@ -34,7 +34,15 @@ fn lex_all(buf: int32[1024], byte_len: int32, spans: int64): int32 =
     while pos < byte_len:
         let c: int32 = byte_at(buf, pos / 4, pos - (pos / 4) * 4)
         let alpha_chk: int32 = is_alpha(c)
-        if alpha_chk == 0: pos = pos + 1
+        if alpha_chk == 0:
+            // Store structural punctuation: ( ) : = { }
+            let is_p: int32 = 0
+            if c == 40: is_p = 1
+            if c == 41: is_p = 1
+            if c == 58: is_p = 1
+            if c == 61: is_p = 1
+            if is_p != 0: store_tok(spans, total, 4, pos, 1); total = total + 1
+            pos = pos + 1
         else:
             let start: int32 = pos
             pos = pos + 1
@@ -46,6 +54,15 @@ fn lex_all(buf: int32[1024], byte_len: int32, spans: int64): int32 =
             store_tok(spans, total, 1, start, pos - start)
             total = total + 1
     return total
+
+// Check if token at idx is punct with specific char
+fn tok_is_punct(buf: int32[1024], spans: int64, idx: int32, ch: int32): int32 =
+    let k: int32 = tok_kind(spans, idx)
+    if k != 4: return 0
+    let start: int32 = ptrLoadI32(spans + int64(idx * 12 + 4))
+    let c: int32 = byte_at(buf, start / 4, start - (start / 4) * 4)
+    if c == ch: return 1
+    return 0
 
 fn tok_is_2kw(buf: int32[1024], spans: int64, idx: int32, c0: int32, c1: int32): int32 =
     let k: int32 = tok_kind(spans, idx)
@@ -80,5 +97,21 @@ fn main(): int32 =
     if total <= 0: return 4
     let fn_count: int32 = count_kw(buf, spans, total, 102, 110)
     let if_count: int32 = count_kw(buf, spans, total, 105, 102)
-    if fn_count >= 5: if if_count >= 1: return 42
-    return 0
+    // Count fn with params: for each fn, count identifiers between ( and )
+    var total_params: int32 = 0
+    var j: int32 = 0
+    while j < total:
+        if tok_is_2kw(buf, spans, j, 102, 110) != 0:
+            // Found "fn". Skip fn + name, then find '('
+            var i: int32 = j + 2
+            if i >= total: j = j + 1
+            else:
+                if tok_is_punct(buf, spans, i, 40) != 0:
+                    i = i + 1
+                    while i < total:
+                        if tok_is_punct(buf, spans, i, 41) != 0: break
+                        if tok_kind(spans, i) == 1: total_params = total_params + 1
+                        i = i + 1
+        j = j + 1
+    if total_params >= 10: return 42
+    return total_params

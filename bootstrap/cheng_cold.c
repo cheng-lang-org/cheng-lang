@@ -10538,6 +10538,31 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
             *kind = SLOT_I32;
             continue;
         }
+        if (span_eq(parser_peek(parser), "(")) {
+            /* Indirect call through function pointer */
+            if (*kind == SLOT_PTR) {
+                int32_t call_slot = slot;
+                int32_t call_arg_start = body->call_arg_count;
+                (void)parser_token(parser); /* consume ( */
+                int32_t call_arg_count = 0;
+                while (!span_eq(parser_peek(parser), ")")) {
+                    if (call_arg_count >= COLD_MAX_I32_PARAMS) die("too many indirect call args");
+                    int32_t arg_kind = SLOT_I32;
+                    int32_t arg_slot = parse_expr(parser, body, locals, &arg_kind);
+                    body_call_arg(body, arg_slot);
+                    call_arg_count++;
+                    if (span_eq(parser_peek(parser), ",")) (void)parser_token(parser);
+                    else break;
+                }
+                if (!parser_take(parser, ")")) { /* skip malformed */ }
+                int32_t ret_slot = body_slot(body, SLOT_I32, 4);
+                body_op3(body, BODY_OP_CALL_PTR, ret_slot, call_slot, call_arg_start, 0);
+                slot = ret_slot;
+                *kind = SLOT_I32;
+                continue;
+            }
+            /* Non-PTR followed by (: treat as constructor or unknown */
+        }
         if (span_eq(parser_peek(parser), "?")) {
             /* ? is handled by parse_let_binding / parse_statement.
                parse_postfix must not consume it here. Just return so the caller sees it. */
