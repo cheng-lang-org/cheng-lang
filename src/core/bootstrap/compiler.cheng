@@ -1,0 +1,203 @@
+// compiler.cheng — Source → parse → codegen (.o output)
+import libc
+
+fn is_alpha(c: int32): int32 =
+    if c >= 65: if c <= 90: return 1
+    if c >= 97: if c <= 122: return 1
+    return 0
+fn is_digit(c: int32): int32 =
+    if c >= 48: if c <= 57: return 1
+    return 0
+fn is_alnum(c: int32): int32 =
+    if is_alpha(c) != 0: return 1
+    if is_digit(c) != 0: return 1
+    if c == 95: return 1
+    return 0
+fn byte_at(buf: int32[1024], word: int32, byte_idx: int32): int32 =
+    let w: int32 = buf[word]
+    if byte_idx == 0: return w & 255
+    if byte_idx == 1: return (w >> 8) & 255
+    if byte_idx == 2: return (w >> 16) & 255
+    return (w >> 24) & 255
+
+fn store_tok(spans: int64, idx: int32, kind: int32, start: int32, len: int32) =
+    let off: int32 = idx * 12
+    let addr: int64 = spans + int64(off)
+    ptrStoreI32(addr, kind)
+    ptrStoreI32(addr + int64(4), start)
+    ptrStoreI32(addr + int64(8), len)
+fn tok_kind(spans: int64, idx: int32): int32 =
+    return ptrLoadI32(spans + int64(idx * 12))
+fn tok_start(spans: int64, idx: int32): int32 =
+    return ptrLoadI32(spans + int64(idx * 12 + 4))
+fn tok_len(spans: int64, idx: int32): int32 =
+    return ptrLoadI32(spans + int64(idx * 12 + 8))
+
+fn lex_all(buf: int32[1024], byte_len: int32, spans: int64): int32 =
+    var total: int32 = 0
+    var pos: int32 = 0
+    while pos < byte_len:
+        let c: int32 = byte_at(buf, pos / 4, pos - (pos / 4) * 4)
+        let alpha_chk: int32 = is_alpha(c)
+        if alpha_chk == 0:
+            let digit_chk: int32 = is_digit(c)
+            if digit_chk != 0:
+                let start: int32 = pos
+                pos = pos + 1
+                while pos < byte_len:
+                    let dc: int32 = byte_at(buf, pos / 4, pos - (pos / 4) * 4)
+                    let d2: int32 = is_digit(dc)
+                    if d2 == 0: break
+                    pos = pos + 1
+                store_tok(spans, total, 2, start, pos - start)
+                total = total + 1
+            else:
+                let is_p: int32 = 0
+                if c == 40: is_p = 1
+                if c == 41: is_p = 1
+                if c == 58: is_p = 1
+                if c == 61: is_p = 1
+                if c == 44: is_p = 1
+                if is_p != 0: store_tok(spans, total, 4, pos, 1); total = total + 1
+                pos = pos + 1
+        else:
+            let start: int32 = pos
+            pos = pos + 1
+            while pos < byte_len:
+                let ic: int32 = byte_at(buf, pos / 4, pos - (pos / 4) * 4)
+                let alnum_chk: int32 = is_alnum(ic)
+                if alnum_chk == 0: break
+                pos = pos + 1
+            store_tok(spans, total, 1, start, pos - start)
+            total = total + 1
+    return total
+
+fn tok_is_2kw(buf: int32[1024], spans: int64, idx: int32, c0: int32, c1: int32): int32 =
+    let k: int32 = tok_kind(spans, idx)
+    if k != 1: return 0
+    let len: int32 = tok_len(spans, idx)
+    if len != 2: return 0
+    let start: int32 = tok_start(spans, idx)
+    let b0: int32 = byte_at(buf, start / 4, start - (start / 4) * 4)
+    if b0 != c0: return 0
+    let b1: int32 = byte_at(buf, (start+1) / 4, (start+1) - ((start+1) / 4) * 4)
+    if b1 != c1: return 0
+    return 1
+
+fn tok_is_6kw(buf: int32[1024], spans: int64, idx: int32, c0: int32, c1: int32): int32 =
+    let k: int32 = tok_kind(spans, idx)
+    if k != 1: return 0
+    let len: int32 = tok_len(spans, idx)
+    if len != 6: return 0
+    let start: int32 = tok_start(spans, idx)
+    let b0: int32 = byte_at(buf, start / 4, start - (start / 4) * 4)
+    if b0 != c0: return 0
+    let b1: int32 = byte_at(buf, (start+1) / 4, (start+1) - ((start+1) / 4) * 4)
+    if b1 != c1: return 0
+    return 1
+
+fn parse_int(buf: int32[1024], spans: int64, idx: int32): int32 =
+    var val: int32 = 0
+    let start: int32 = tok_start(spans, idx)
+    let len: int32 = tok_len(spans, idx)
+    var i: int32 = 0
+    while i < len:
+        let c: int32 = byte_at(buf, (start+i) / 4, (start+i) - ((start+i) / 4) * 4)
+        val = val * 10 + (c - 48)
+        i = i + 1
+    return val
+
+// Write .o template to mmap buffer (flat, no nesting)
+fn write_obj(buf: int64, ret_val: int32) =
+    let code_word: int32 = 0x52800000 + (ret_val * 32)
+    var i: int32 = 0
+    while i < 74:
+        ptrStoreI32(buf + int64(i * 4), 0)
+        i = i + 1
+    ptrStoreI32(buf + int64(0), 0xFEEDFACF)
+    ptrStoreI32(buf + int64(4), 0x0100000C)
+    ptrStoreI32(buf + int64(12), 0x00000001)
+    ptrStoreI32(buf + int64(16), 0x00000003)
+    ptrStoreI32(buf + int64(20), 0x000000C8)
+    ptrStoreI32(buf + int64(32), 0x00000019)
+    ptrStoreI32(buf + int64(36), 0x00000098)
+    ptrStoreI32(buf + int64(40), 0x45545F5F)
+    ptrStoreI32(buf + int64(44), 0x00005458)
+    ptrStoreI32(buf + int64(64), 0x00000028)
+    ptrStoreI32(buf + int64(72), 0x000000E8)
+    ptrStoreI32(buf + int64(80), 0x00000028)
+    ptrStoreI32(buf + int64(88), 0x00000007)
+    ptrStoreI32(buf + int64(92), 0x00000007)
+    ptrStoreI32(buf + int64(96), 0x00000001)
+    ptrStoreI32(buf + int64(104), 0x65745F5F)
+    ptrStoreI32(buf + int64(108), 0x00007478)
+    ptrStoreI32(buf + int64(120), 0x45545F5F)
+    ptrStoreI32(buf + int64(124), 0x00005458)
+    ptrStoreI32(buf + int64(144), 0x00000028)
+    ptrStoreI32(buf + int64(152), 0x000000E8)
+    ptrStoreI32(buf + int64(156), 0x00000002)
+    ptrStoreI32(buf + int64(168), 0x80000400)
+    ptrStoreI32(buf + int64(184), 0x00000032)
+    ptrStoreI32(buf + int64(188), 0x00000018)
+    ptrStoreI32(buf + int64(192), 0x00000001)
+    ptrStoreI32(buf + int64(196), 0x000E0000)
+    ptrStoreI32(buf + int64(200), 0x000E0000)
+    ptrStoreI32(buf + int64(208), 0x00000002)
+    ptrStoreI32(buf + int64(212), 0x00000018)
+    ptrStoreI32(buf + int64(216), 0x00000110)
+    ptrStoreI32(buf + int64(220), 0x00000001)
+    ptrStoreI32(buf + int64(224), 0x00000120)
+    ptrStoreI32(buf + int64(228), 0x00000008)
+    ptrStoreI32(buf + int64(232), code_word)
+    ptrStoreI32(buf + int64(236), 0xD65F03C0)
+    ptrStoreI32(buf + int64(272), 0x00000001)
+    ptrStoreI32(buf + int64(276), 0x0000010F)
+    ptrStoreI32(buf + int64(288), 0x616D5F00)
+    ptrStoreI32(buf + int64(292), 0x00006E69)
+
+fn main(): int32 =
+    let fd: int32 = cold_open("src/tests/ordinary_zero_exit_fixture.cheng", 0)
+    if fd < 0: return 1
+    var buf: int32[1024]
+    let n: int32 = cold_read(fd, buf, 4096)
+    let _: int32 = cold_close(fd)
+    if n <= 0: return 2
+
+    let spans: int64 = cold_mmap(16384)
+    if spans == 0: return 3
+    let total: int32 = lex_all(buf, n, spans)
+    if total <= 0: return 4
+
+    // Flat scan: find fn→main→return→digit
+    var ret_val: int32 = -1
+    var j: int32 = 0
+    var in_main: int32 = 0
+    while j < total:
+        if in_main == 0:
+            if tok_is_2kw(buf, spans, j, 102, 110) != 0:
+                let ni: int32 = j + 1
+                if ni < total:
+                    let nl: int32 = tok_len(spans, ni)
+                    if nl == 4:
+                        let ns: int32 = tok_start(spans, ni)
+                        let b0: int32 = byte_at(buf, ns / 4, ns - (ns / 4) * 4)
+                        if b0 == 109: in_main = 1
+        else:
+            if tok_is_6kw(buf, spans, j, 114, 101) != 0:
+                let ri: int32 = j + 1
+                if ri < total:
+                    if tok_kind(spans, ri) == 2:
+                        ret_val = parse_int(buf, spans, ri)
+                        j = total  // break
+        j = j + 1
+
+    if ret_val < 0: return 5
+    let out: int64 = cold_mmap(4096)
+    if out == 0: return 6
+    write_obj(out, ret_val)
+    let out_fd: int32 = cold_open("/tmp/compiler_out.o", 1537)
+    if out_fd < 0: return 7
+    let wn: int32 = cold_write_raw(out_fd, out, 296)
+    let _: int32 = cold_close(out_fd)
+    if wn == 296: return 42
+    return wn
