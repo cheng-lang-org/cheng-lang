@@ -6779,7 +6779,7 @@ static void parse_type(Parser *parser) {
         if (pos >= parser->source.len || parser->source.ptr[pos] == '\n') break;
         if (type_body_indent < 0) type_body_indent = indent;
         if (indent < type_body_indent) break;
-        if (indent == 0 && type_body_indent > 0) break;
+        if (indent == 0) break;
         while (line_end < parser->source.len && parser->source.ptr[line_end] != '\n') line_end++;
         if (line_end < parser->source.len) line_end++;
     }
@@ -6959,8 +6959,7 @@ static void parse_type(Parser *parser) {
                 while (p < line_end && line.source.ptr[p] == ' ') { indent++; p++; }
                 if (p >= line_end || line.source.ptr[p] == '\n') { body_finish++; continue; }
                 if (body_indent < 0) body_indent = indent;
-                if (indent < body_indent) break;
-                if (indent == 0 && body_indent > 0) break;
+                if (indent < body_indent || indent == 0) break;
                 while (body_finish < line_end && line.source.ptr[body_finish] != '\n') body_finish++;
                 if (body_finish < line_end) body_finish++;
             }
