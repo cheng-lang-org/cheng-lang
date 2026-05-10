@@ -7566,6 +7566,15 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
     }
     int32_t fn_index = symbols_find_fn_for_call(parser->symbols, name, body, arg_start, arg_count);
     if (fn_index < 0) {
+        /* Check for indirect call via local variable (function pointer) */
+        Local *indirect_local = locals_find(locals, name);
+        if (indirect_local && indirect_local->kind == SLOT_PTR) {
+            int32_t slot = body_slot(body, SLOT_I32, 4);
+            int32_t ret_kind_hint = 0;
+            body_op3(body, BODY_OP_CALL_PTR, slot, indirect_local->slot, arg_start, ret_kind_hint);
+            if (kind_out) *kind_out = SLOT_I32;
+            return slot;
+        }
         /* External function, will be registered below */
         /* try variant constructor: Err[int32] -> Err, or bare Err */
         { Span base_name = name;
@@ -7774,6 +7783,15 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
     }
     int32_t fn_index = symbols_find_fn_for_call(owner->symbols, name, body, arg_start, arg_count);
     if (fn_index < 0) {
+        /* Check for indirect call via local variable (function pointer) */
+        Local *indirect_local = locals_find(locals, name);
+        if (indirect_local && indirect_local->kind == SLOT_PTR) {
+            int32_t slot = body_slot(body, SLOT_I32, 4);
+            int32_t ret_kind_hint = 0;
+            body_op3(body, BODY_OP_CALL_PTR, slot, indirect_local->slot, arg_start, ret_kind_hint);
+            if (kind_out) *kind_out = SLOT_I32;
+            return slot;
+        }
         /* External function, will be registered below */
         { int32_t param_kinds[COLD_MAX_I32_PARAMS];
           int32_t param_sizes[COLD_MAX_I32_PARAMS];
@@ -10014,9 +10032,13 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
             *kind = alocal->kind;
         } else {
             /* Check if it's a function name: &fnName → function pointer */
-            int32_t fn_idx = symbols_find_fn_for_call(parser->symbols, base_name, 0, 0, 0);
+            int32_t fn_idx = -1;
+            for (int32_t si = 0; si < parser->symbols->function_count; si++) {
+                FnDef *sfn = &parser->symbols->functions[si];
+                if (span_same(sfn->name, base_name)) { fn_idx = si; break; }
+            }
             if (fn_idx < 0) {
-                /* Try qualified name lookup */
+                /* Try qualified name lookup (*.base_name) */
                 for (int32_t si = 0; si < parser->symbols->function_count; si++) {
                     FnDef *sfn = &parser->symbols->functions[si];
                     if (sfn->name.len > base_name.len + 1 &&
@@ -17081,7 +17103,13 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
         }
         int32_t delta = function_pos[patch.target_function] - patch.pos;
         uint32_t ins = code->words[patch.pos];
-        code->words[patch.pos] = (ins & 0xFC000000u) | ((uint32_t)delta & 0x03FFFFFFu);
+        if ((ins & 0xFC000000u) == 0x10000000u) {
+            /* ADR patch: encode byte offset */
+            code->words[patch.pos] = a64_adr(ins & 0x1Fu, delta * 4);
+        } else {
+            /* BL patch: encode word offset */
+            code->words[patch.pos] = (ins & 0xFC000000u) | ((uint32_t)delta & 0x03FFFFFFu);
+        }
     }
     code->words[entry_call_pos] = (code->words[entry_call_pos] & 0xFC000000u) |
                                   ((uint32_t)(function_pos[entry_function] - entry_call_pos) & 0x03FFFFFFu);

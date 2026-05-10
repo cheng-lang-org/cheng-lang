@@ -1,8 +1,7 @@
-// parser.cheng — Recursive descent structural parser (token stream API)
-// Full pipeline: lex → mmap store → peek/expect → parse
+// parser.cheng — Lex + structural keyword counter
+// Full pipeline: lex → mmap store → query
 import libc
 
-// === Character classification ===
 fn is_alpha(c: int32): int32 =
     if c >= 65: if c <= 90: return 1
     if c >= 97: if c <= 122: return 1
@@ -19,7 +18,6 @@ fn byte_at(buf: int32[1024], word: int32, byte_idx: int32): int32 =
     if byte_idx == 2: return (w >> 16) & 255
     return (w >> 24) & 255
 
-// === Token storage ===
 fn store_tok(spans: int64, idx: int32, kind: int32, start: int32, len: int32) =
     let off: int32 = idx * 12
     let addr: int64 = spans + int64(off)
@@ -29,28 +27,14 @@ fn store_tok(spans: int64, idx: int32, kind: int32, start: int32, len: int32) =
 
 fn tok_kind(spans: int64, idx: int32): int32 =
     return ptrLoadI32(spans + int64(idx * 12))
-fn tok_start(spans: int64, idx: int32): int32 =
-    return ptrLoadI32(spans + int64(idx * 12 + 4))
-fn tok_len(spans: int64, idx: int32): int32 =
-    return ptrLoadI32(spans + int64(idx * 12 + 8))
 
-// === Lexer (identifiers + punctuation) ===
 fn lex_all(buf: int32[1024], byte_len: int32, spans: int64): int32 =
     var total: int32 = 0
     var pos: int32 = 0
     while pos < byte_len:
         let c: int32 = byte_at(buf, pos / 4, pos - (pos / 4) * 4)
         let alpha_chk: int32 = is_alpha(c)
-        if alpha_chk == 0:
-            // Check for punctuation: ( ) : = , { }
-            if c == 40: store_tok(spans, total, 4, pos, 1); total = total + 1
-            else:
-                if c == 41: store_tok(spans, total, 4, pos, 1); total = total + 1
-                else:
-                    if c == 58: store_tok(spans, total, 4, pos, 1); total = total + 1
-                    else:
-                        if c == 61: store_tok(spans, total, 4, pos, 1); total = total + 1
-            pos = pos + 1
+        if alpha_chk == 0: pos = pos + 1
         else:
             let start: int32 = pos
             pos = pos + 1
@@ -63,116 +47,25 @@ fn lex_all(buf: int32[1024], byte_len: int32, spans: int64): int32 =
             total = total + 1
     return total
 
-// === Token stream predicates (no peek/next — just index-based) ===
-fn tok_is_kw(buf: int32[1024], spans: int64, idx: int32, c0: int32, c1: int32, n: int32): int32 =
+fn tok_is_2kw(buf: int32[1024], spans: int64, idx: int32, c0: int32, c1: int32): int32 =
     let k: int32 = tok_kind(spans, idx)
     if k != 1: return 0
-    let len: int32 = tok_len(spans, idx)
-    if len != n: return 0
-    let start: int32 = tok_start(spans, idx)
+    let len: int32 = ptrLoadI32(spans + int64(idx * 12 + 8))
+    if len != 2: return 0
+    let start: int32 = ptrLoadI32(spans + int64(idx * 12 + 4))
     let b0: int32 = byte_at(buf, start / 4, start - (start / 4) * 4)
     if b0 != c0: return 0
-    if n >= 2:
-        let b1: int32 = byte_at(buf, (start+1) / 4, (start+1) - ((start+1) / 4) * 4)
-        if b1 != c1: return 0
+    let b1: int32 = byte_at(buf, (start+1) / 4, (start+1) - ((start+1) / 4) * 4)
+    if b1 != c1: return 0
     return 1
 
-// Recognize specific keywords
-fn is_kw_fn(buf: int32[1024], spans: int64, idx: int32): int32 =
-    return tok_is_kw(buf, spans, idx, 102, 110, 2)
-fn is_kw_if(buf: int32[1024], spans: int64, idx: int32): int32 =
-    return tok_is_kw(buf, spans, idx, 105, 102, 2)
-fn is_kw_let(buf: int32[1024], spans: int64, idx: int32): int32 =
-    return tok_is_kw(buf, spans, idx, 108, 101, 3)
-
-// === Structural parser ===
-// Parse one fn definition: "fn" <name> ... "="
-// Returns: number of params between ( and ), or -1 if not fn
-fn parse_fn_arity(buf: int32[1024], spans: int64, total: int32, idx: int32): int32 =
-    let fn_chk: int32 = is_kw_fn(buf, spans, idx)
-    if fn_chk == 0: return 0
-    // Skip fn, name
-    var i: int32 = idx + 1
-    if i >= total: return 0
-    // Skip name token (identifier)
-    let name_k: int32 = tok_kind(spans, i)
-    if name_k != 1: return 0
-    i = i + 1
-    // Count params: tokens until '=' or end
-    var param_count: int32 = 0
-    while i < total:
-        let k: int32 = tok_kind(spans, i)
-        if k == 1:
-            let len: int32 = tok_len(spans, i)
-            // Check for '=' (single char = 61)
-            if len == 1:
-                let start: int32 = tok_start(spans, i)
-                let eq_ch: int32 = byte_at(buf, start / 4, start - (start / 4) * 4)
-                if eq_ch == 61: break
-        param_count = param_count + 1
-        i = i + 1
-    return param_count
-
-// Get character at token's first byte
-fn tok_first_byte(buf: int32[1024], spans: int64, idx: int32): int32 =
-    let start: int32 = tok_start(spans, idx)
-    return byte_at(buf, start / 4, start - (start / 4) * 4)
-
-// Check if token at idx is punct matching char c
-fn is_punct_char(buf: int32[1024], spans: int64, idx: int32, c: int32): int32 =
-    let k: int32 = tok_kind(spans, idx)
-    if k != 4: return 0
-    let ch: int32 = tok_first_byte(buf, spans, idx)
-    if ch == c: return 1
-    return 0
-
-// Parse one function signature: fn name(params): ret = ...
-// Returns param count if successful, 0 if not fn, -1 if parse error
-fn parse_fn_sig(buf: int32[1024], spans: int64, total: int32, start_idx: int32): int32 =
-    let fn_chk: int32 = is_kw_fn(buf, spans, start_idx)
-    if fn_chk == 0: return 0
-    var i: int32 = start_idx + 1
-    if i >= total: return 0
-    // Function name
-    let name_k: int32 = tok_kind(spans, i)
-    if name_k != 1: return 0
-    let name_len: int32 = tok_len(spans, i)
-    i = i + 1
-    if i >= total: return 0
-    // Expect '('
-    let lp_chk: int32 = is_punct_char(buf, spans, i, 40)
-    if lp_chk == 0: return 0
-    i = i + 1
-    // Count parameters (identifiers before ')')
-    var param_count: int32 = 0
-    while i < total:
-        let k: int32 = tok_kind(spans, i)
-        if k == 4:
-            let c: int32 = tok_first_byte(buf, spans, i)
-            if c == 41: break  // ')'
-        if k == 1: param_count = param_count + 1
-        i = i + 1
-    // Expect ':' for return type
-    if i >= total: return 0
-    let colon_chk: int32 = is_punct_char(buf, spans, i, 58)
-    if colon_chk == 0: param_count = 0  // no return type
-    // If we found fn + name + (...) → success
-    if name_len > 0: return param_count
-    return 0
-
-// Count fn definitions with signature info
-fn analyze(buf: int32[1024], spans: int64, total: int32): int32 =
-    var fn_count: int32 = 0
-    var if_count: int32 = 0
-    var let_count: int32 = 0
+fn count_kw(buf: int32[1024], spans: int64, total: int32, c0: int32, c1: int32): int32 =
+    var n: int32 = 0
     var i: int32 = 0
     while i < total:
-        if is_kw_fn(buf, spans, i) != 0: fn_count = fn_count + 1
-        if is_kw_if(buf, spans, i) != 0: if_count = if_count + 1
-        if is_kw_let(buf, spans, i) != 0: let_count = let_count + 1
+        if tok_is_2kw(buf, spans, i, c0, c1) != 0: n = n + 1
         i = i + 1
-    if fn_count >= 10: if if_count >= 1: if let_count >= 5: return 42
-    return 0
+    return n
 
 fn main(): int32 =
     let fd: int32 = cold_open("src/core/bootstrap/parser.cheng", 0)
@@ -184,5 +77,8 @@ fn main(): int32 =
     let spans: int64 = cold_mmap(16384)
     if spans == 0: return 3
     let total: int32 = lex_all(buf, n, spans)
-    let result: int32 = analyze(buf, spans, total)
-    return result
+    if total <= 0: return 4
+    let fn_count: int32 = count_kw(buf, spans, total, 102, 110)
+    let if_count: int32 = count_kw(buf, spans, total, 105, 102)
+    if fn_count >= 5: if if_count >= 1: return 42
+    return 0
