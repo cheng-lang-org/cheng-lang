@@ -16954,11 +16954,8 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
                 FnDef *target = &symbols->functions[patch.target_function];
                 /* function call target has no body - skipping */
             }
-            /* function body missing: replace call with mov x0,#0 + nops */
+            /* function body missing: replace call with mov x0,#0 */
             code->words[patch.pos] = 0xD2800000u;      /* mov x0, #0 */
-            code->words[patch.pos + 1] = 0xD503201Fu;  /* nop */
-            code->words[patch.pos + 2] = 0xD503201Fu;  /* nop */
-            code->words[patch.pos + 3] = 0xD503201Fu;  /* nop */
             continue;
         }
         int32_t delta = function_pos[patch.target_function] - patch.pos;
