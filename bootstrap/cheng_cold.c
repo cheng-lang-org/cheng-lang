@@ -12381,6 +12381,9 @@ static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     }
     if (symbol_index_out) *symbol_index_out = symbol_index;
 
+    /* Skip body parsing for import_mode: saved 29ms but breaks cross-module calls.
+       Reverted — need call-graph analysis to skip only uncalled imports. */
+
     BodyIR *body = body_new(parser->arena);
     body->return_kind = cold_return_kind_from_span(parser->symbols, ret);
     body->return_size = cold_return_slot_size(parser->symbols, ret, body->return_kind);
