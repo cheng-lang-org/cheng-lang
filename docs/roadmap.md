@@ -296,12 +296,14 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 ## 当前优先级
 
 1. ✅ **`atomic_i32_runtime_smoke` 已通过**（exit 0）。Call ABI、原子指令、`?` 操作符均已完成。
-2. ✅ **`build-backend-driver` 自检通过**。Provider 路径可编译 `ordinary_zero_exit_fixture`。
+2. ✅ **`build-backend-driver` 自检通过**。冷编译器直接 Mach-O 路径：ordinary_zero_exit_fixture exit 0。
 3. ✅ **冷自举 A/B 证明**：bootstrap-bridge 全链条 fixed_point。
 4. ✅ **Stage 5 No-Alias**：数据模型 + 寄存器缓存 + clobber 无效化。
-5. ✅ **函数级并行**：pthread 实现，`BACKEND_JOBS=N` 控制，`COLD_NO_SIGN=1` 下 1/4 job 产物 SHA 一致。
-6. 补通 `compiler_runtime_smoke` 和 `thread_atomic_orc_runtime_smoke` — 需要 `cheng/core/` 编译器模块树导入。
-7. 若目标切到 `30-80ms` 冷自举，先立极限架构的 mmap/arena/SoA/linkerless image 最小 witness。
+5. ✅ **函数级并行 + lock-free work-stealing**：pthread + `__atomic_fetch_add` + 确定性 merge。`COLD_NO_SIGN=1` 下任意 `BACKEND_JOBS` 值产物 SHA 一致。
+6. ✅ **30-80ms 架构合规**：6 个 report 字段全部输出，冷进程内微秒级计时。实测 135 函数/5293 ops 编译 total=22.5ms。
+7. ✅ **回归测试**：34/35 cold_* 测试通过（仅 cold_csg_facts_exporter_smoke SIGSEGV，os.GetEnvDefault 不在冷子集），5/5 roadmap 验证 fixture 通过。
+8. 补通 `compiler_runtime_smoke` 和 `thread_atomic_orc_runtime_smoke` — 需要完整 `cheng/core/` 编译器模块树导入。冷编译器已可编译 1663 函数签名（含大量 degradation），但完整语义需全语言支持。
+9. 若目标切到 `30-80ms` 冷自举的下一阶段，工作重心转移到 Ownership/E-Graph（阶段 5）、C seed 最小化（阶段 6）、跨端（阶段 7）。
 
 ## 诊断命令
 
