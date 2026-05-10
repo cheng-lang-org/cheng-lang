@@ -15827,6 +15827,14 @@ static void codegen_seq_str_add(Code *code, BodyIR *body, int32_t seq_slot, int3
     a64_patch_b(code, done_jump, code->count);
 }
 
+/* No-alias register cache: track which slot is in R0-R3 */
+#define NA_REGS 4
+static int32_t na_slot[NA_REGS];
+static void na_reset(void) { for(int i=0;i<NA_REGS;i++) na_slot[i]=-1; }
+static int na_find(int32_t s) { for(int i=0;i<NA_REGS;i++) if(na_slot[i]==s) return i; return -1; }
+static void na_set(int r, int32_t s) { if(r>=0&&r<NA_REGS) na_slot[r]=s; }
+static void na_clobber(int r) { if(r>=0&&r<NA_REGS) na_slot[r]=-1; }
+
 static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                        FunctionPatchList *function_patches, int32_t op) {
     int32_t kind = body->op_kind[op];
@@ -15837,6 +15845,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     if (kind == BODY_OP_I32_CONST) {
         codegen_mov_i32_const(code, R0, a);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_I64_CONST) {
         uint64_t bits = (uint32_t)a | ((uint64_t)(uint32_t)b << 32);
         codegen_mov_i64_const(code, R0, bits);
@@ -15845,7 +15854,9 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         (void)dst;
         code_emit(code, a64_brk(a));
     } else if (kind == BODY_OP_LOAD_I32) {
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[dst], false);
+        int __cr = na_find(dst);
+        if (__cr >= 0) { if (__cr != 0) code_emit(code, a64_add_imm(R0, __cr, 0, false)); }
+        else { a64_emit_ldr_sp_off(code, R0, body->slot_offset[dst], false); }
     } else if (kind == BODY_OP_I32_REF_LOAD) {
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
         code_emit(code, a64_ldr_imm(R0, R1, 0, false));
@@ -16491,13 +16502,17 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind == SLOT_I64 || ret_kind == SLOT_PTR);
     } else if (kind == BODY_OP_COPY_I32) {
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        int __cr2 = na_find(a);
+        if (__cr2 >= 0) { if (__cr2 != 0) code_emit(code, a64_add_imm(R0, __cr2, 0, false)); }
+        else { a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false); }
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_I32_ADD || kind == BODY_OP_I32_SUB) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, kind == BODY_OP_I32_ADD ? a64_add_reg(R0, R0, R1) : a64_sub_reg(R0, R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_STR_LITERAL) {
         if (a < 0 || a >= body->string_literal_count) die("invalid string literal index");
         Span literal = body->string_literal[a];
@@ -17024,6 +17039,7 @@ static void codegen_switch(Code *code, BodyIR *body, PatchList *patches, int32_t
 
 static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
                          FunctionPatchList *function_patches) {
+    na_reset();
     int32_t frame_size = align_i32(body->frame_size, 16);
     code_emit(code, a64_stp_pre(FP, LR, SP, -16));
     code_emit(code, a64_add_imm(FP, SP, 0, true));
