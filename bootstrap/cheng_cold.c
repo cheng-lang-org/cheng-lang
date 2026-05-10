@@ -4467,6 +4467,8 @@ enum {
     BODY_OP_I32_FROM_F32 = 110,
     BODY_OP_F64_FROM_I32 = 111,
     BODY_OP_I32_FROM_F64 = 112,
+    BODY_OP_FN_ADDR = 113,
+    BODY_OP_CALL_PTR = 114,
 };
 
 enum {
@@ -10002,7 +10004,8 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         return dst;
     }
     if (span_eq(token, "&")) {
-        /* address-of: parse base local, then handle .field chain with FIELD_REF */
+        /* address-of: parse base local, then handle .field chain with FIELD_REF.
+           Also handles &fnName (function pointer). */
         Span base_name = parser_token(parser);
         Local *alocal = locals_find(locals, base_name);
         int32_t addr_slot;
@@ -10010,7 +10013,28 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
             addr_slot = alocal->slot;
             *kind = alocal->kind;
         } else {
-            /* Not a local: parse as expression and compute SP-relative address */
+            /* Check if it's a function name: &fnName → function pointer */
+            int32_t fn_idx = symbols_find_fn_for_call(parser->symbols, base_name, 0, 0, 0);
+            if (fn_idx < 0) {
+                /* Try qualified name lookup */
+                for (int32_t si = 0; si < parser->symbols->function_count; si++) {
+                    FnDef *sfn = &parser->symbols->functions[si];
+                    if (sfn->name.len > base_name.len + 1 &&
+                        sfn->name.ptr[sfn->name.len - base_name.len - 1] == '.' &&
+                        memcmp(sfn->name.ptr + sfn->name.len - base_name.len,
+                               base_name.ptr, (size_t)base_name.len) == 0) {
+                        fn_idx = si;
+                        break;
+                    }
+                }
+            }
+            if (fn_idx >= 0) {
+                addr_slot = body_slot(body, SLOT_PTR, 8);
+                body_op(body, BODY_OP_FN_ADDR, addr_slot, fn_idx, 0);
+                *kind = SLOT_PTR;
+                return addr_slot;
+            }
+            /* Not a local or function: parse as expression and compute SP-relative address */
             int32_t ek = SLOT_I32;
             int32_t es = parse_primary(parser, body, locals, &ek);
             if (ek != SLOT_PTR && ek != SLOT_OBJECT_REF) ek = SLOT_PTR;
@@ -13708,6 +13732,9 @@ static uint32_t a64_b(int32_t offset_words) {
 static uint32_t a64_bl(int32_t offset_words) {
     return 0x94000000u | ((uint32_t)offset_words & 0x03FFFFFFu);
 }
+static uint32_t a64_blr(int rn) {
+    return 0xD63F0000u | ((uint32_t)rn << 5);
+}
 static uint32_t a64_bcond(int32_t offset_words, int cond) {
     return 0x54000000u | (((uint32_t)offset_words & 0x7FFFFu) << 5) | ((uint32_t)cond & 0xFu);
 }
@@ -16826,6 +16853,20 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_fmov_s(0, R0));
         code_emit(code, a64_fcvtzs_w(R0, 0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_FN_ADDR) {
+        /* Load function address via ADR + patch */
+        int32_t fn_index = a;
+        int32_t adr_pos = code->count;
+        code_emit(code, a64_adr(R0, 0));
+        function_patches_add(function_patches, adr_pos, fn_index);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_CALL_PTR) {
+        /* Indirect call: load fn ptr, call via BLR, store result */
+        int32_t fn_index = a;
+        a64_emit_ldr_sp_off(code, R9, body->slot_offset[fn_index], true);
+        code_emit(code, a64_blr(R9));
+        int32_t ret_kind = b;  /* b encodes ret_kind hint: 0=I32, 1=I64/PTR */
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind != 0);
     } else {
         ; /* unknown op: skip silently */
     }
