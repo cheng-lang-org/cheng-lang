@@ -18909,12 +18909,3 @@ int main(int argc, char **argv) {
     cold_print_elapsed_ms(stdout, "cold_compile_elapsed_ms", stats.elapsed_us);
     return rc;
 }
-
-/* ================================================================
- * Host runtime weak stubs for provider native link
- * ================================================================ */
-__attribute__((weak)) void* cheng_host_fdopen(int fd, const char* mode) { return 0; }
-__attribute__((weak)) int cheng_host_fflush(void* fp) { return 0; }
-__attribute__((weak)) unsigned long cheng_host_fread(void* ptr, unsigned long size, unsigned long nmemb, void* fp) { return 0; }
-__attribute__((weak)) unsigned long cheng_host_fwrite(const void* ptr, unsigned long size, unsigned long nmemb, void* fp) { return 0; }
-__attribute__((weak)) int cheng_native_system_cpu_logical_cores_value_bridge(void) { return 1; }
