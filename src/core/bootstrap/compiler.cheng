@@ -58,6 +58,9 @@ fn lex_all(buf: int32[1024], byte_len: int32, spans: int64): int32 =
                 if c == 58: is_p = 1
                 if c == 61: is_p = 1
                 if c == 44: is_p = 1
+                if c == 43: is_p = 1  // +
+                if c == 45: is_p = 1  // -
+                if c == 42: is_p = 1  // *
                 if is_p != 0: store_tok(spans, total, 4, pos, 1); total = total + 1
                 pos = pos + 1
         else:
@@ -107,9 +110,17 @@ fn parse_int(buf: int32[1024], spans: int64, idx: int32): int32 =
         i = i + 1
     return val
 
-// Write .o template to mmap buffer (flat, no nesting)
-fn write_obj(buf: int64, ret_val: int32) =
-    let code_word: int32 = 0x52800000 + (ret_val * 32)
+// ARM64 helpers
+fn arm_movz_imm(rd: int32, imm16: int32): int32 =
+    return 0x52800000 + (rd & 31) + (imm16 * 32)
+fn arm_add_reg(rd: int32, rn: int32, rm: int32): int32 =
+    return 0x0B000000 + ((rm & 31) * 65536) + ((rn & 31) * 32) + (rd & 31)
+fn arm_sub_reg(rd: int32, rn: int32, rm: int32): int32 =
+    return 0x4B000000 + ((rm & 31) * 65536) + ((rn & 31) * 32) + (rd & 31)
+fn arm_ret(): int32 = return 0xD65F03C0
+
+// Write .o template with variable-length code (max 10 words = 40 bytes)
+fn write_obj(buf: int64, code: int64, code_words: int32) =
     var i: int32 = 0
     while i < 74:
         ptrStoreI32(buf + int64(i * 4), 0)
@@ -148,12 +159,57 @@ fn write_obj(buf: int64, ret_val: int32) =
     ptrStoreI32(buf + int64(220), 0x00000001)
     ptrStoreI32(buf + int64(224), 0x00000120)
     ptrStoreI32(buf + int64(228), 0x00000008)
-    ptrStoreI32(buf + int64(232), code_word)
-    ptrStoreI32(buf + int64(236), 0xD65F03C0)
+    // Copy code words into code section (offset 232, max 10 words)
+    var ci: int32 = 0
+    while ci < code_words:
+        let word: int32 = ptrLoadI32(code + int64(ci * 4))
+        ptrStoreI32(buf + int64(232 + ci * 4), word)
+        ci = ci + 1
     ptrStoreI32(buf + int64(272), 0x00000001)
     ptrStoreI32(buf + int64(276), 0x0000010F)
     ptrStoreI32(buf + int64(288), 0x616D5F00)
     ptrStoreI32(buf + int64(292), 0x00006E69)
+
+// Compile expression tokens → ARM64 code words in mmap buffer
+// Returns number of code words
+fn compile_expr(buf: int32[1024], spans: int64, start: int32, total: int32, code: int64): int32 =
+    var count: int32 = 0
+    var i: int32 = start
+    var lhs: int32 = 0
+    var has_lhs: int32 = 0
+    var op: int32 = 0  // 0=none, 43='+', 45='-', 42='*'
+    while i < total:
+        let k: int32 = tok_kind(spans, i)
+        if k == 2:
+            let val: int32 = parse_int(buf, spans, i)
+            if has_lhs == 0:
+                // mov w0, #val
+                ptrStoreI32(code + int64(count * 4), arm_movz_imm(0, val))
+                count = count + 1
+                lhs = val
+                has_lhs = 1
+            else:
+                // mov w1, #val
+                ptrStoreI32(code + int64(count * 4), arm_movz_imm(1, val))
+                count = count + 1
+                if op == 43:
+                    ptrStoreI32(code + int64(count * 4), arm_add_reg(0, 0, 1))
+                    count = count + 1
+                    lhs = lhs + val
+                if op == 45:
+                    ptrStoreI32(code + int64(count * 4), arm_sub_reg(0, 0, 1))
+                    count = count + 1
+                    lhs = lhs - val
+        if k == 4:
+            let c: int32 = byte_at(buf, tok_start(spans, i) / 4, tok_start(spans, i) - (tok_start(spans, i) / 4) * 4)
+            if c == 43: op = 43
+            if c == 45: op = 45
+            if c == 42: op = 42
+        i = i + 1
+    // ret
+    ptrStoreI32(code + int64(count * 4), arm_ret())
+    count = count + 1
+    return count
 
 fn main(): int32 =
     let fd: int32 = cold_open("src/tests/ordinary_zero_exit_fixture.cheng", 0)
@@ -168,8 +224,8 @@ fn main(): int32 =
     let total: int32 = lex_all(buf, n, spans)
     if total <= 0: return 4
 
-    // Flat scan: find fn→main→return→digit
-    var ret_val: int32 = -1
+    // Flat scan: find fn→main→return, then compile expression
+    var expr_start: int32 = -1
     var j: int32 = 0
     var in_main: int32 = 0
     while j < total:
@@ -184,19 +240,23 @@ fn main(): int32 =
                         if b0 == 109: in_main = 1
         else:
             if tok_is_6kw(buf, spans, j, 114, 101) != 0:
-                let ri: int32 = j + 1
-                if ri < total:
-                    if tok_kind(spans, ri) == 2:
-                        ret_val = parse_int(buf, spans, ri)
-                        j = total  // break
+                expr_start = j + 1
+                j = total  // break
         j = j + 1
 
-    if ret_val < 0: return 5
+    if expr_start < 0: return 5
+
+    // Compile expression to ARM64 code words
+    let code: int64 = cold_mmap(256)
+    if code == 0: return 6
+    let code_words: int32 = compile_expr(buf, spans, expr_start, total, code)
+    if code_words <= 1: return 7
+
     let out: int64 = cold_mmap(4096)
-    if out == 0: return 6
-    write_obj(out, ret_val)
+    if out == 0: return 8
+    write_obj(out, code, code_words)
     let out_fd: int32 = cold_open("/tmp/compiler_out.o", 1537)
-    if out_fd < 0: return 7
+    if out_fd < 0: return 9
     let wn: int32 = cold_write_raw(out_fd, out, 296)
     let _: int32 = cold_close(out_fd)
     if wn == 296: return 42
