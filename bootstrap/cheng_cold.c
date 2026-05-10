@@ -12397,6 +12397,9 @@ static BodyIR *parse_fn(Parser *parser, int32_t *symbol_index_out) {
     body->param_count = arity;
     for (int32_t i = 0; i < arity; i++) {
         int32_t slot = body_slot(body, param_kinds[i], param_sizes[i]);
+        if (param_kinds[i] == SLOT_ARRAY_I32 && param_sizes[i] > 0) {
+            body_slot_set_array_len(body, slot, param_sizes[i] / 4);
+        }
         Span st = cold_type_strip_var(param_types[i], 0);
         /* arena-copy the type span: the original ptr may point into a reusable buffer */
         if (st.len > 0) {
@@ -16420,18 +16423,30 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_ldr_w_reg_uxtw2(R0, R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_SEQ_I32_INDEX_DYNAMIC) {
-        if (0) die("dynamic int32[] index target kind mismatch");
-        codegen_seq_header_addr(code, body, a, R2);
+        int32_t arr_kind = body->slot_kind[a];
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
         code_emit(code, a64_cmp_imm(R1, 0));
         code_emit(code, a64_bcond(2, COND_GE));
         code_emit(code, a64_brk(2));
-        code_emit(code, a64_ldr_imm(R3, R2, 0, false));
-        code_emit(code, a64_cmp_reg(R1, R3));
-        code_emit(code, a64_bcond(2, COND_LT));
-        code_emit(code, a64_brk(2));
-        code_emit(code, a64_ldr_imm(R0, R2, 8, true));
-        code_emit(code, a64_ldr_w_reg_uxtw2(R0, R0, R1));
+        if (arr_kind == SLOT_ARRAY_I32) {
+            /* Inline array: data at SP + slot_offset, length from slot_size */
+            int32_t arr_len = body->slot_size[a] / 4;
+            if (body->slot_aux[a] > 0) arr_len = body->slot_aux[a];
+            codegen_mov_i32_const(code, R3, arr_len);
+            code_emit(code, a64_cmp_reg(R1, R3));
+            code_emit(code, a64_bcond(2, COND_LT));
+            code_emit(code, a64_brk(2));
+            a64_emit_add_large(code, R2, SP, body->slot_offset[a], true);
+            code_emit(code, a64_ldr_w_reg_uxtw2(R0, R2, R1));
+        } else {
+            codegen_seq_header_addr(code, body, a, R2);
+            code_emit(code, a64_ldr_imm(R3, R2, 0, false));
+            code_emit(code, a64_cmp_reg(R1, R3));
+            code_emit(code, a64_bcond(2, COND_LT));
+            code_emit(code, a64_brk(2));
+            code_emit(code, a64_ldr_imm(R0, R2, 8, true));
+            code_emit(code, a64_ldr_w_reg_uxtw2(R0, R0, R1));
+        }
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_ARRAY_I32_INDEX_STORE) {
         int32_t base_kind = body->slot_kind[a];
