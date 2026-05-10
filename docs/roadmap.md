@@ -55,11 +55,12 @@
 - `PrimaryBuildBodyIrFromTypedStatements` 现在包含完整的内联条件解析（字符级比较运算符检测），创建 Cbr/Return term 和 block，C seed 编译通过。
 - `elif_else_guard_cfg_fixture` 的 `classify` 函数符号未发射到 `.o` 文件，导致 `main` 的 `bl classify` relocation 无目标可 patching（仍 `bl #0`）。
 
-### 当前阻断
+### 当前阻断（更新于 2026-05-10）
 
-- 跨函数调用的符号发射：`classify`（BodyKindUnsupported + BodyIR）有正 wordCount 但未出现在对象文件符号表中。
-- 自举编译仅覆盖入口模块（47 items），需要 manifest-based 全量编译（1059 items）才能产出完整 backend driver。
-- 任何 `CHENG_BUILD_BACKEND_DRIVER_FORCE_C_SEED=1` 结果都不计入路线图进度。
+- **`build-backend-driver` 自检**：新 backend driver 编译 `ordinary_zero_exit_fixture` 时 provider 路径报 "provider source unsupported"。冷编译器直接路径（`system-link-exec` with direct Mach-O）已正常工作。自检失败导致新 backend driver 无法落地（二进制停留在 5 月 8 日版本）。
+- **`compiler_runtime_smoke` / `thread_atomic_orc_runtime_smoke`**：需要完整 `cheng/core/` 编译器模块树导入，超出冷编译器当前设计范围（`std/*` 冷子集）。
+- **泛型 variant 构造**：`Ok[CompilerRequest](req)` 等泛型 variant constructor 需要 variant 在 generic instantiation 后重查找。
+- **闭包环境捕获**：函数指针（`&fnName` + BLR）已实现。带环境捕获的 lambda/closure 需要 env 结构 + trampoline，属于更高层编译器特性。
 
 ### 新增（2026-05-08）：函数并行接入尝试
 
@@ -269,11 +270,11 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 ## 当前优先级
 
-1. 保持伪完成硬失败：reachable `unsupported` 不得分配机器字或填 `ret`；有前置语句、调用、副作用、if/for/assert/echo 时必须生成真实 CFG，或 unsupported 硬失败。
-2. 补通 runtime smoke 的真实执行：`atomic_i32_runtime_smoke`、`thread_atomic_orc_runtime_smoke`、`compiler_runtime_smoke` 必须越过 `stmt_let_call` BodyIR/ABI 缺口并输出 marker，主对象不能是 `mov w0,#0; ret`。
-3. 做 A/B 纯自举证明：A 编 B，B 再编同一 witness，report 关键字段一致。
-4. 继续把 noarg i32 call-result 扩展到结构化 call ABI：call argument、ref/local、str sret、call statement、Result 投影和复合 ABI。
-5. 再推进函数级并行 determinism/perf witness 与 dev 默认切换。
+1. ✅ **`atomic_i32_runtime_smoke` 已通过**（exit 0）。Call ABI（ref/SLOT_PTR 参数/返回）、原子指令、`?` 操作符均已完成。
+2. 补通 `compiler_runtime_smoke` 和 `thread_atomic_orc_runtime_smoke` — 需要 `cheng/core/` 编译器模块树导入或提供 mock 实现。
+3. 修复 `build-backend-driver` 自检：让新编译的 backend driver 能通过 provider 路径编译 `ordinary_zero_exit_fixture`（当前直接 Mach-O 冷路径已工作，provider 路径报 "provider source unsupported"）。
+4. 做 A/B 纯自举证明：A 编 B，B 再编同一 witness，report 关键字段一致。
+5. 推进函数级并行 determinism/perf witness 与 dev 默认切换。
 6. 若目标切到 `30-80ms` 冷自举，停止把局部 body kind、spawn 并行或 `.o` 直写当主线，先立极限架构的 mmap/arena/SoA/linkerless image 最小 witness。
 
 ## 诊断命令
