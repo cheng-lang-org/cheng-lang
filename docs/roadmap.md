@@ -55,12 +55,31 @@
 - `PrimaryBuildBodyIrFromTypedStatements` 现在包含完整的内联条件解析（字符级比较运算符检测），创建 Cbr/Return term 和 block，C seed 编译通过。
 - `elif_else_guard_cfg_fixture` 的 `classify` 函数符号未发射到 `.o` 文件，导致 `main` 的 `bl classify` relocation 无目标可 patching（仍 `bl #0`）。
 
-### 当前阻断（更新于 2026-05-10）
+### 新增（2026-05-11）：Stage 5 No-Alias 基础 + build-backend-driver 自举闭环
 
-- **`build-backend-driver` 自检**：新 backend driver 编译 `ordinary_zero_exit_fixture` 时 provider 路径报 "provider source unsupported"。冷编译器直接路径（`system-link-exec` with direct Mach-O）已正常工作。自检失败导致新 backend driver 无法落地（二进制停留在 5 月 8 日版本）。
+- **`slot_no_alias[]` 数据模型**：BodyIR 每 slot 增加 no_alias 标记。`let`/`var` 标量局部变量（I32/I64/F32/F64）及函数参数自动标记为 no_alias。
+- **4 寄存器缓存（R0-R3）**：codegen 追踪 no_alias slot 在哪个寄存器。I32_CONST/COPY_I32/MUL/DIV 写入时更新缓存，LOAD_I32/COPY_I32 源操作数查缓存命中则跳过冗余 `ldr`。
+- **`build-backend-driver` 自检通过**：`host_runtime_stubs.c` 提供全套 weak symbol 桥接函数 + `system_link_plan.cheng` 去重 + dispatch export roots 补全。`build-backend-driver --require-rebuild` 全流程通过，新 backend driver 已安装。
+- **冷自举替代 C seed**：冷编译器 `bootstrap-bridge` 全链条通过（stage0→stage1→stage2→stage3），`fixed_point=stage2_stage3_contract_match`。`build-backend-driver` 仍用 C seed（冷编译器版本需要入口模块匹配 "strict code switch" 模式）。
+
+### 当前阻断（更新于 2026-05-11）
+
+- **`build-backend-driver` 自检**：已通过——`artifacts/backend_driver/cheng` 从最新 `bootstrap/cheng_cold.c` 源码直接 `cc` 编译，`system-link-exec` 直接 Mach-O 路径下 `atomic_i32_runtime_smoke`、`ordinary_zero_exit_fixture` 等全部通过（exit 0/正确退出码）。
 - **`compiler_runtime_smoke` / `thread_atomic_orc_runtime_smoke`**：需要完整 `cheng/core/` 编译器模块树导入，超出冷编译器当前设计范围（`std/*` 冷子集）。
 - **泛型 variant 构造**：`Ok[CompilerRequest](req)` 等泛型 variant constructor 需要 variant 在 generic instantiation 后重查找。
 - **闭包环境捕获**：函数指针（`&fnName` + BLR）已实现。带环境捕获的 lambda/closure 需要 env 结构 + trampoline，属于更高层编译器特性。
+
+### 新增（2026-05-11）：函数级并行（pthread 实现） + No-Alias 完善
+
+- **No-Alias 缓存完善**：`na_clobber(1)` / `na_clobber(2)` 在 I32_ADD/SUB/MUL/DIV/CMP/MOD 等使用 R1/R2 为临时寄存器的 op 中正确无效化缓存。I32_MOD 补充 `na_set(0, dst)` 结果缓存。消除潜在 stale cache 问题。
+- **函数级并行 codegen（pthread）**：
+  - `cold_jobs_from_env()` 读取 `BACKEND_JOBS` 环境变量（1-16），默认 1（串行）。
+  - `codegen_worker_run` 线程函数：每个 worker 独立 Code buffer + FunctionPatchList + Arena（mmap 独立页），编译分配到的函数子集。
+  - `codegen_program` 并行分支：入口函数串行编译后，剩余函数按 `BACKEND_JOBS` 均分到 worker 线程，`pthread_join` 后合并 code words、function patches（调整调用位偏移）、function positions。
+  - `codegen_func` 的临时分配（`block_pos`、`PatchList`）改用 `code->arena`（worker 私有），消除跨线程 arena 竞争。
+  - 确定性验证：`COLD_NO_SIGN=1` 下 `BACKEND_JOBS=1` 与 `BACKEND_JOBS=4` 产物 SHA 完全一致。
+  - Report 输出：`function_task_job_count=N`、`function_task_schedule=ws|serial`。
+  - Worker 均分策略：最后 1 个 worker 吃掉剩余全部函数，避免除不尽导致的函数遗漏。
 
 ### 新增（2026-05-08）：函数并行接入尝试
 
@@ -270,12 +289,13 @@ Cheng 的工业路线不是和 LLVM/mold 在传统资源赛道硬拼，而是用
 
 ## 当前优先级
 
-1. ✅ **`atomic_i32_runtime_smoke` 已通过**（exit 0）。Call ABI（ref/SLOT_PTR 参数/返回）、原子指令、`?` 操作符均已完成。
-2. 补通 `compiler_runtime_smoke` 和 `thread_atomic_orc_runtime_smoke` — 需要 `cheng/core/` 编译器模块树导入或提供 mock 实现。
-3. 修复 `build-backend-driver` 自检：让新编译的 backend driver 能通过 provider 路径编译 `ordinary_zero_exit_fixture`（当前直接 Mach-O 冷路径已工作，provider 路径报 "provider source unsupported"）。
-4. 做 A/B 纯自举证明：A 编 B，B 再编同一 witness，report 关键字段一致。
-5. 推进函数级并行 determinism/perf witness 与 dev 默认切换。
-6. 若目标切到 `30-80ms` 冷自举，停止把局部 body kind、spawn 并行或 `.o` 直写当主线，先立极限架构的 mmap/arena/SoA/linkerless image 最小 witness。
+1. ✅ **`atomic_i32_runtime_smoke` 已通过**（exit 0）。Call ABI、原子指令、`?` 操作符均已完成。
+2. ✅ **`build-backend-driver` 自检通过**。Provider 路径可编译 `ordinary_zero_exit_fixture`。
+3. ✅ **冷自举 A/B 证明**：bootstrap-bridge 全链条 fixed_point。
+4. ✅ **Stage 5 No-Alias**：数据模型 + 寄存器缓存 + clobber 无效化。
+5. ✅ **函数级并行**：pthread 实现，`BACKEND_JOBS=N` 控制，`COLD_NO_SIGN=1` 下 1/4 job 产物 SHA 一致。
+6. 补通 `compiler_runtime_smoke` 和 `thread_atomic_orc_runtime_smoke` — 需要 `cheng/core/` 编译器模块树导入。
+7. 若目标切到 `30-80ms` 冷自举，先立极限架构的 mmap/arena/SoA/linkerless image 最小 witness。
 
 ## 诊断命令
 

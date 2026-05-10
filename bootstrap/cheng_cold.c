@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <pthread.h>
 
 #include "macho_direct.h"
 
@@ -1530,7 +1531,7 @@ static bool cold_recognize_dispatch_chain(Span body, ColdManifestStats *stats,
 
     int32_t default_value = 0;
     if (line_index != count - 1 || !cold_parse_return_i32_line(lines[line_index], &default_value)) return false;
-    if (case_count != 6 || default_value != 2) return false;
+    if (case_count != 7 || default_value != 2) return false;
     for (int32_t i = 0; i < case_count; i++) {
         if (stats->entry_dispatch_cases[i].code != i) return false;
     }
@@ -1585,7 +1586,7 @@ static bool cold_recognize_command_code_table(Span body, ColdManifestStats *stat
 
     int32_t default_value = 0;
     if (line_index != count - 1 || !cold_parse_return_i32_line(lines[line_index], &default_value)) return false;
-    if (case_count != 8 || default_value != -1) return false;
+    if (case_count != 9 || default_value != -1) return false;
     static const char *expected_texts[] = {
         "help",
         "-h",
@@ -1595,8 +1596,9 @@ static bool cold_recognize_command_code_table(Span body, ColdManifestStats *stat
         "verify-export-visibility",
         "verify-export-visibility-parallel",
         "system-link-exec",
+        "run-host-smokes",
     };
-    static const int32_t expected_codes[] = {0, 0, 0, 1, 2, 3, 4, 5};
+    static const int32_t expected_codes[] = {0, 0, 0, 1, 2, 3, 4, 5, 6};
     for (int32_t i = 0; i < case_count; i++) {
         if (strcmp(stats->entry_command_cases[i].text, expected_texts[i]) != 0 ||
             stats->entry_command_cases[i].code != expected_codes[i]) return false;
@@ -13892,6 +13894,57 @@ typedef struct {
     Arena *arena;
 } FunctionPatchList;
 
+static void code_emit(Code *code, uint32_t word);
+static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
+                         FunctionPatchList *function_patches);
+
+/* ---- parallel codegen worker ---- */
+
+typedef struct {
+    int32_t start_idx;
+    int32_t end_idx;
+    int32_t entry_function;
+    BodyIR **function_bodies;
+    int32_t function_count;
+    Symbols *symbols;
+    Code *local_code;
+    FunctionPatchList local_patches;
+    int32_t *local_function_pos;
+} CodegenWorker;
+
+static void *codegen_worker_run(void *arg) {
+    CodegenWorker *w = (CodegenWorker *)arg;
+    for (int32_t i = w->start_idx; i < w->end_idx; i++) {
+        if (i == w->entry_function || !w->function_bodies[i] ||
+            w->function_bodies[i]->has_fallback) continue;
+        w->local_function_pos[i] = w->local_code->count;
+        BodyIR *body = w->function_bodies[i];
+        if (body->has_fallback || body->block_count == 0 ||
+            (body->block_count > 0 && body->block_term[0] < 0)) {
+            code_emit(w->local_code, a64_movz(R0, 0, 0));
+            code_emit(w->local_code, a64_ret());
+            continue;
+        }
+        codegen_func(w->local_code, body, w->symbols, &w->local_patches);
+    }
+    return NULL;
+}
+
+static int32_t cold_jobs_from_env(void) {
+    const char *env = getenv("BACKEND_JOBS");
+    if (!env || !env[0]) return 1;
+    int32_t n = 0;
+    for (const char *p = env; *p; p++) {
+        if (*p >= '0' && *p <= '9') n = n * 10 + (*p - '0');
+        else return 1;
+    }
+    if (n < 1) return 1;
+    if (n > 16) n = 16;
+    return n;
+}
+
+/* ---- end parallel codegen ---- */
+
 static Code *code_new(Arena *arena, int32_t cap) {
     Code *code = arena_alloc(arena, sizeof(Code));
     code->words = arena_alloc(arena, (size_t)cap * sizeof(uint32_t));
@@ -15827,13 +15880,11 @@ static void codegen_seq_str_add(Code *code, BodyIR *body, int32_t seq_slot, int3
     a64_patch_b(code, done_jump, code->count);
 }
 
-/* No-alias register cache: track which slot is in R0-R3 */
-#define NA_REGS 4
-static int32_t na_slot[NA_REGS];
-static void na_reset(void) { for(int i=0;i<NA_REGS;i++) na_slot[i]=-1; }
-static int na_find(int32_t s) { for(int i=0;i<NA_REGS;i++) if(na_slot[i]==s) return i; return -1; }
-static void na_set(int r, int32_t s) { if(r>=0&&r<NA_REGS) na_slot[r]=s; }
-static void na_clobber(int r) { if(r>=0&&r<NA_REGS) na_slot[r]=-1; }
+/* Disabled no-alias register cache: correctness first until it is CFG-aware. */
+static void na_reset(void) { }
+static int na_find(int32_t s) { (void)s; return -1; }
+static void na_set(int r, int32_t s) { (void)r; (void)s; }
+static void na_clobber(int r) { (void)r; }
 
 static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
                        FunctionPatchList *function_patches, int32_t op) {
@@ -16510,6 +16561,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_I32_ADD || kind == BODY_OP_I32_SUB) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        na_clobber(1);
         code_emit(code, kind == BODY_OP_I32_ADD ? a64_add_reg(R0, R0, R1) : a64_sub_reg(R0, R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
         if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
@@ -16754,11 +16806,14 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_I32_MUL) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        na_clobber(1);
         code_emit(code, a64_mul_reg(R0, R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_I32_DIV) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        na_clobber(1);
         code_emit(code, a64_cmp_imm(R1, 0));
         int32_t non_zero = code->count;
         code_emit(code, a64_bcond(0, COND_NE));
@@ -16766,20 +16821,25 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_bcond(code, non_zero, code->count);
         code_emit(code, a64_sdiv_reg(R0, R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_I32_MOD) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        na_clobber(1);
         code_emit(code, a64_cmp_imm(R1, 0));
         int32_t mod_nz = code->count;
         code_emit(code, a64_bcond(0, COND_NE));
         code_emit(code, a64_brk(5));
         a64_patch_bcond(code, mod_nz, code->count);
         code_emit(code, a64_sdiv_reg(R2, R0, R1));
+        na_clobber(2);
         code_emit(code, a64_msub_reg(R0, R2, R1, R0));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        if (body->slot_no_alias && body->slot_no_alias[dst]) na_set(0, dst);
     } else if (kind == BODY_OP_I32_CMP) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        na_clobber(1);
         code_emit(code, a64_cmp_reg(R0, R1));
         code_emit(code, a64_movz(R2, 0, 0));
         int32_t true_pos = code->count;
@@ -16790,6 +16850,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_movz(R2, 1, 0));
         a64_patch_b(code, done_pos, code->count);
         a64_emit_str_sp_off(code, R2, body->slot_offset[dst], false);
+        na_clobber(2);
     } else if (kind == BODY_OP_I32_SHL) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
@@ -17049,9 +17110,9 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
     }
     codegen_store_params(code, body);
 
-    int32_t *block_pos = arena_alloc(body->arena, (size_t)body->block_count * sizeof(int32_t));
+    int32_t *block_pos = arena_alloc(code->arena, (size_t)body->block_count * sizeof(int32_t));
     PatchList patches = {0};
-    patches.arena = body->arena;
+    patches.arena = code->arena;
 
     for (int32_t block = 0; block < body->block_count; block++) {
         block_pos[block] = code->count;
@@ -17180,19 +17241,98 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             codegen_func(code, entry_body, symbols, &function_patches);
         }
     }
+    int32_t num_jobs = cold_jobs_from_env();
+    int32_t remaining = 0;
     for (int32_t i = 0; i < function_count; i++) {
-        if (i == entry_function || !function_bodies[i] ||
-            function_bodies[i]->has_fallback) continue;
-        function_pos[i] = code->count;
-        BodyIR *body = function_bodies[i];
-        if (body->has_fallback || body->block_count == 0 ||
-            (body->block_count > 0 && body->block_term[0] < 0)) {
-            /* Incomplete body: emit stub that returns 0 */
-            code_emit(code, a64_movz(R0, 0, 0));
-            code_emit(code, a64_ret());
-            continue;
+        if (i != entry_function && function_bodies[i] &&
+            !function_bodies[i]->has_fallback) remaining++;
+    }
+
+    if (num_jobs > 1 && remaining > 1) {
+        int32_t active_jobs = num_jobs;
+        if (active_jobs > remaining) active_jobs = remaining;
+        int32_t per_worker = remaining / active_jobs;
+
+        CodegenWorker *workers = arena_alloc(code->arena,
+            (size_t)active_jobs * sizeof(CodegenWorker));
+        pthread_t *threads = arena_alloc(code->arena,
+            (size_t)active_jobs * sizeof(pthread_t));
+
+        int32_t cursor = 0;
+        for (int32_t w = 0; w < active_jobs; w++) {
+            int32_t chunk = (w == active_jobs - 1) ? (remaining - cursor) : per_worker;
+            int32_t start_fn = 0, counted = 0;
+            for (start_fn = 0; start_fn < function_count; start_fn++) {
+                if (start_fn != entry_function && function_bodies[start_fn] &&
+                    !function_bodies[start_fn]->has_fallback) {
+                    if (counted == cursor) break;
+                    counted++;
+                }
+            }
+            int32_t end_fn = start_fn;
+            int32_t assigned = 0;
+            while (end_fn < function_count && assigned < chunk) {
+                if (end_fn != entry_function && function_bodies[end_fn] &&
+                    !function_bodies[end_fn]->has_fallback) assigned++;
+                end_fn++;
+            }
+
+            Arena *w_arena = mmap(0, sizeof(Arena), PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (w_arena == MAP_FAILED) die("worker arena mmap failed");
+            Code *w_code = code_new(w_arena, 256);
+            workers[w] = (CodegenWorker){
+                .start_idx = start_fn, .end_idx = end_fn,
+                .entry_function = entry_function,
+                .function_bodies = function_bodies,
+                .function_count = function_count,
+                .symbols = symbols,
+                .local_code = w_code,
+                .local_patches = {.arena = w_arena},
+                .local_function_pos = arena_alloc(w_arena,
+                    (size_t)function_count * sizeof(int32_t)),
+            };
+            for (int32_t i = 0; i < function_count; i++)
+                workers[w].local_function_pos[i] = -1;
+            cursor += assigned;
+            if (pthread_create(&threads[w], NULL, codegen_worker_run, &workers[w]) != 0) {
+                die("codegen worker create failed");
+            }
         }
-        codegen_func(code, body, symbols, &function_patches);
+
+        for (int32_t w = 0; w < active_jobs; w++) {
+            if (pthread_join(threads[w], NULL) != 0) {
+                die("codegen worker join failed");
+            }
+            CodegenWorker *wk = &workers[w];
+            int32_t base_offset = code->count;
+            for (int32_t j = 0; j < wk->local_code->count; j++)
+                code_emit(code, wk->local_code->words[j]);
+            for (int32_t j = 0; j < wk->local_patches.count; j++) {
+                function_patches_add(&function_patches,
+                    wk->local_patches.items[j].pos + base_offset,
+                    wk->local_patches.items[j].target_function);
+            }
+            for (int32_t j = 0; j < function_count; j++) {
+                if (wk->local_function_pos[j] >= 0)
+                    function_pos[j] = wk->local_function_pos[j] + base_offset;
+            }
+            munmap(wk->local_code->arena, sizeof(Arena));
+        }
+    } else {
+        for (int32_t i = 0; i < function_count; i++) {
+            if (i == entry_function || !function_bodies[i] ||
+                function_bodies[i]->has_fallback) continue;
+            function_pos[i] = code->count;
+            BodyIR *body = function_bodies[i];
+            if (body->has_fallback || body->block_count == 0 ||
+                (body->block_count > 0 && body->block_term[0] < 0)) {
+                code_emit(code, a64_movz(R0, 0, 0));
+                code_emit(code, a64_ret());
+                continue;
+            }
+            codegen_func(code, body, symbols, &function_patches);
+        }
     }
 
     for (int32_t i = 0; i < function_patches.count; i++) {
@@ -17201,19 +17341,15 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             function_pos[patch.target_function] < 0) {
             if (patch.target_function >= 0 && patch.target_function < symbols->function_count) {
                 FnDef *target = &symbols->functions[patch.target_function];
-                /* function call target has no body - skipping */
             }
-            /* function body missing: replace call with mov x0,#0 */
             code->words[patch.pos] = 0xD2800000u;      /* mov x0, #0 */
             continue;
         }
         int32_t delta = function_pos[patch.target_function] - patch.pos;
         uint32_t ins = code->words[patch.pos];
         if ((ins & 0xFC000000u) == 0x10000000u) {
-            /* ADR patch: encode byte offset */
             code->words[patch.pos] = a64_adr(ins & 0x1Fu, delta * 4);
         } else {
-            /* BL patch: encode word offset */
             code->words[patch.pos] = (ins & 0xFC000000u) | ((uint32_t)delta & 0x03FFFFFFu);
         }
     }
@@ -18528,6 +18664,8 @@ static bool cold_write_system_link_exec_report(const char *path,
     fprintf(file, "output=%s\n", out_path ? out_path : "");
     fprintf(file, "direct_macho=%d\n", success ? 1 : 0);
     fprintf(file, "provider_object_count=0\n");
+    fprintf(file, "function_task_job_count=%d\n", cold_jobs_from_env());
+    fprintf(file, "function_task_schedule=%s\n", cold_jobs_from_env() > 1 ? "ws" : "serial");
     if (stats) {
         fprintf(file, "cold_csg_lowering=%d\n", stats->csg_lowering);
         fprintf(file, "cold_csg_statement_count=%d\n", stats->csg_statement_count);
