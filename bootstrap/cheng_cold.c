@@ -205,6 +205,34 @@ static bool span_is_i32(Span s) {
     return true;
 }
 
+static bool cold_span_is_float(Span s) {
+    if (s.len <= 1) return false;
+    int32_t i = 0;
+    if (s.ptr[0] == '-') i = 1;
+    bool has_dot = false;
+    for (; i < s.len; i++) {
+        uint8_t c = s.ptr[i];
+        if (c == '.') { if (has_dot) return false; has_dot = true; continue; }
+        if (c < '0' || c > '9') return false;
+    }
+    return has_dot;
+}
+static double cold_span_f64(Span s) {
+    double val = 0.0, frac = 0.0, div = 1.0;
+    int32_t i = 0, sign = 1;
+    if (s.ptr[0] == '-') { sign = -1; i = 1; }
+    while (i < s.len && s.ptr[i] >= '0' && s.ptr[i] <= '9') {
+        val = val * 10.0 + (double)(s.ptr[i++] - '0');
+    }
+    if (i < s.len && s.ptr[i] == '.') {
+        i++;
+        while (i < s.len && s.ptr[i] >= '0' && s.ptr[i] <= '9') {
+            frac = frac * 10.0 + (double)(s.ptr[i++] - '0');
+            div *= 10.0;
+        }
+    }
+    return sign * (val + frac / div);
+}
 static int32_t span_i32(Span s) {
     int32_t i = 0;
     int32_t sign = 1;
@@ -10001,6 +10029,21 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         *kind = SLOT_I32;
         return slot;
     }
+    if (cold_span_is_float(token)) {
+        double val = cold_span_f64(token);
+        int32_t bits_hi = (int32_t)(*((uint64_t*)&val) >> 32);
+        int32_t bits_lo = (int32_t)(*((uint64_t*)&val) & 0xFFFFFFFFu);
+        /* default float64: embed in code section as two int32 constants
+           or store as raw bits in op_a/op_b */
+        int32_t slot = body_slot(body, SLOT_F64, 8);
+        int32_t lo_slot = body_slot(body, SLOT_I32, 4);
+        int32_t hi_slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, lo_slot, bits_lo, 0);
+        body_op(body, BODY_OP_I32_CONST, hi_slot, bits_hi, 0);
+        body_op3(body, BODY_OP_F64_CONST, slot, lo_slot, hi_slot, 0);
+        *kind = SLOT_F64;
+        return slot;
+    }
     if (span_eq(token, "true") || span_eq(token, "false")) {
         int32_t slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_I32_CONST, slot, span_eq(token, "true") ? 1 : 0, 0);
@@ -16592,6 +16635,14 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_movz_x(16, 4, 0));
         code_emit(code, a64_svc(0x80));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_F64_CONST) {
+        /* Reconstruct 64-bit float from lo32/hi32 slots:
+           X0 = (uint64_t)lo32 | ((uint64_t)hi32 << 32)
+           BFI X0, X1, #32, #32 */
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        code_emit(code, 0xB3427C00u | ((uint32_t)R1 << 5) | (uint32_t)R0);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     } else if (kind == BODY_OP_F32_CONST) {
         float val; memcpy(&val, &a, 4);
         int32_t bits; memcpy(&bits, &val, 4);
