@@ -1,42 +1,84 @@
-// Bootstrap tokenizer v6 — direct array access (no pointer arithmetic)
-// Cold-compiler compatible: int32/str/while/if/array only
+// Bootstrap lexer v7 — byte-level token scanning with bitwise ops
+// Cold-compiler compatible: int32/str/while/if/array/bitwise
 
 import libc
 
 fn is_alpha(c: int32): int32 =
-    if c >= 65:
-        if c <= 90: return 1
-    if c >= 97:
-        if c <= 122: return 1
+    if c >= 65: if c <= 90: return 1
+    if c >= 97: if c <= 122: return 1
     return 0
 
 fn is_digit(c: int32): int32 =
-    if c >= 48:
-        if c <= 57: return 1
+    if c >= 48: if c <= 57: return 1
+    return 0
+
+fn is_alnum(c: int32): int32 =
+    if is_alpha(c) != 0: return 1
+    if is_digit(c) != 0: return 1
+    if c == 95: return 1
     return 0
 
 fn is_space(c: int32): int32 =
     if c == 32: return 1
     if c == 9: return 1
     if c == 10: return 1
+    if c == 13: return 1
     return 0
 
-// Count word-like tokens (alpha sequences) in buffer
-fn count_words(buf: int32[], len: int32): int32 =
-    var count: int32 = 0
-    var in_word: int32 = 0
-    var i: int32 = 0
-    while i < len / 4:
-        let c: int32 = buf[i]
+// Extract byte at position within an int32[4] word
+fn byte_at(buf: int32[], word: int32, byte_idx: int32): int32 =
+    let w: int32 = buf[word]
+    if byte_idx == 0: return w & 255
+    if byte_idx == 1: return (w >> 8) & 255
+    if byte_idx == 2: return (w >> 16) & 255
+    return (w >> 24) & 255
+
+fn lex_tokens(buf: int32[], word_count: int32): int32 =
+    var total: int32 = 0
+    var pos_w: int32 = 0
+    var pos_b: int32 = 0
+    var byte_total: int32 = word_count * 4
+    while pos_w < word_count:
+        if pos_b >= byte_total: break
+        let c: int32 = byte_at(buf, pos_w, pos_b)
         if c == 0: break
         if is_space(c) != 0:
-            in_word = 0
-        else:
-            if in_word == 0:
-                count = count + 1
-                in_word = 1
-        i = i + 1
-    return count
+            pos_b = pos_b + 1
+            if pos_b >= 4:
+                pos_b = 0
+                pos_w = pos_w + 1
+            continue
+        // Scan identifier
+        if is_alpha(c) != 0:
+            total = total + 1
+            while pos_w < word_count:
+                pos_b = pos_b + 1
+                if pos_b >= 4:
+                    pos_b = 0
+                    pos_w = pos_w + 1
+                if pos_w >= word_count: break
+                let nc: int32 = byte_at(buf, pos_w, pos_b)
+                if is_alnum(nc) == 0: break
+            continue
+        // Scan number
+        if is_digit(c) != 0:
+            total = total + 1
+            while pos_w < word_count:
+                pos_b = pos_b + 1
+                if pos_b >= 4:
+                    pos_b = 0
+                    pos_w = pos_w + 1
+                if pos_w >= word_count: break
+                let nc: int32 = byte_at(buf, pos_w, pos_b)
+                if is_digit(nc) == 0: break
+            continue
+        // Punct
+        total = total + 1
+        pos_b = pos_b + 1
+        if pos_b >= 4:
+            pos_b = 0
+            pos_w = pos_w + 1
+    return total
 
 fn main(): int32 =
     let fd: int32 = cold_open("README.md", 0)
@@ -45,6 +87,8 @@ fn main(): int32 =
     let n: int32 = cold_read(fd, buf, 4096)
     let _: int32 = cold_close(fd)
     if n <= 0: return 2
-    let count: int32 = count_words(buf, n)
-    if count > 0: return 42
-    return count
+    let word_count: int32 = n / 4
+    if word_count > 1024: return 3
+    let tokens: int32 = lex_tokens(buf, word_count)
+    if tokens > 0: return 42
+    return tokens
