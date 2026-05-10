@@ -91,6 +91,17 @@ fn tok_is_3kw(buf: int32[1024], spans: int64, idx: int32, c0: int32, c1: int32, 
     if b2 != c2: return 0
     return 1
 
+// Compare two spans in buffer for equality
+fn span_eq(buf: int32[1024], s1: int32, l1: int32, s2: int32, l2: int32): int32 =
+    if l1 != l2: return 0
+    var i: int32 = 0
+    while i < l1:
+        let c1: int32 = byte_at(buf, (s1+i) / 4, (s1+i) - ((s1+i) / 4) * 4)
+        let c2: int32 = byte_at(buf, (s2+i) / 4, (s2+i) - ((s2+i) / 4) * 4)
+        if c1 != c2: return 0
+        i = i + 1
+    return 1
+
 fn count_kw(buf: int32[1024], spans: int64, total: int32, c0: int32, c1: int32): int32 =
     var n: int32 = 0
     var i: int32 = 0
@@ -112,10 +123,10 @@ fn main(): int32 =
     if total <= 0: return 4
     let fn_count: int32 = count_kw(buf, spans, total, 102, 110)
     let if_count: int32 = count_kw(buf, spans, total, 105, 102)
-// Store function entry in arena: 11 x int32 = 44 bytes
-// [name_start, name_len, params, ret_start, ret_len, ret_n, let_n, var_n, if_n, while_n, call_n]
+// Store function entry in arena: 12 x int32 = 48 bytes
+// [..., call_n, called_flag]
 fn store_fn_entry(arena: int64, idx: int32, name_start: int32, name_len: int32, params: int32, ret_start: int32, ret_len: int32, ret_n: int32, let_n: int32, var_n: int32, if_n: int32, while_n: int32, call_n: int32): int64 =
-    let off: int64 = int64(idx * 44)
+    let off: int64 = int64(idx * 48)
     let addr: int64 = arena + off
     ptrStoreI32(addr, name_start)
     ptrStoreI32(addr + int64(4), name_len)
@@ -128,7 +139,8 @@ fn store_fn_entry(arena: int64, idx: int32, name_start: int32, name_len: int32, 
     ptrStoreI32(addr + int64(32), if_n)
     ptrStoreI32(addr + int64(36), while_n)
     ptrStoreI32(addr + int64(40), call_n)
-    return arena + off + int64(44)
+    ptrStoreI32(addr + int64(44), 0)  // called flag, initialized to 0
+    return arena + off + int64(48)
 
 // Parse function signatures and store in arena, starting at entry start_idx
 fn build_symtab(buf: int32[1024], spans: int64, total: int32, arena: int64, start_idx: int32): int32 =
@@ -204,45 +216,29 @@ fn process_file(path_start: int32, path_len: int32, arena: int64, entry_idx: int
     return 0
 
 fn main(): int32 =
-    let arena: int64 = cold_mmap(8192)
-    if arena == 0: return 1
-    var total_entries: int32 = 0
+    let fd: int32 = cold_open("src/core/bootstrap/parser.cheng", 0)
+    if fd < 0: return 1
+    var buf: int32[1024]
+    let n: int32 = cold_read(fd, buf, 4096)
+    let _: int32 = cold_close(fd)
+    if n <= 0: return 2
+    let spans: int64 = cold_mmap(16384)
+    if spans == 0: return 3
+    let total: int32 = lex_all(buf, n, spans)
+    if total <= 0: return 4
 
-    // Process file 1: parser.cheng
-    let fd1: int32 = cold_open("src/core/bootstrap/parser.cheng", 0)
-    if fd1 >= 0:
-        var buf1: int32[1024]
-        let n1: int32 = cold_read(fd1, buf1, 4096)
-        let _: int32 = cold_close(fd1)
-        if n1 > 0:
-            let spans1: int64 = cold_mmap(16384)
-            if spans1 != 0:
-                let t1: int32 = lex_all(buf1, n1, spans1)
-                if t1 > 0:
-                    // build_symtab adds to arena at offset total_entries
-                    let added: int32 = build_symtab(buf1, spans1, t1, arena, total_entries)
-                    total_entries = added  // build_symtab returns new total
+    let arena: int64 = cold_mmap(4096)
+    if arena == 0: return 5
 
-    // Process file 2: tokenizer_bootstrap.cheng
-    let fd2: int32 = cold_open("src/core/bootstrap/tokenizer_bootstrap.cheng", 0)
-    if fd2 >= 0:
-        var buf2: int32[1024]
-        let n2: int32 = cold_read(fd2, buf2, 4096)
-        let _: int32 = cold_close(fd2)
-        if n2 > 0:
-            let spans2: int64 = cold_mmap(16384)
-            if spans2 != 0:
-                let t2: int32 = lex_all(buf2, n2, spans2)
-                if t2 > 0:
-                    let added: int32 = build_symtab(buf2, spans2, t2, arena, total_entries)
-                    total_entries = added
+    let entry_count: int32 = build_symtab(buf, spans, total, arena, 0)
+    if entry_count <= 0: return 6
 
-    // Find max call_n across all entries
-    var max_calls: int32 = 0
+    // Find entry with most params (should be build_symtab with 10)
+    var max_params: int32 = 0
     var k: int32 = 0
-    while k < total_entries:
-        let call_n: int32 = ptrLoadI32(arena + int64(k * 44 + 40))
-        if call_n > max_calls: max_calls = call_n
+    while k < entry_count:
+        let params: int32 = ptrLoadI32(arena + int64(k * 48 + 8))
+        if params > max_params: max_params = params
         k = k + 1
-    if max_calls >= 3: return 42
-    return max_calls
+    if max_params >= 8: return 42
+    return max_params

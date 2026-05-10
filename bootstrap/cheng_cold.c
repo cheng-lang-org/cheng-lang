@@ -6779,7 +6779,7 @@ static void parse_type(Parser *parser) {
         if (pos >= parser->source.len || parser->source.ptr[pos] == '\n') break;
         if (type_body_indent < 0) type_body_indent = indent;
         if (indent < type_body_indent) break;
-        if (indent == 0) break;
+        if (indent == 0 && type_body_indent > 0) break;
         while (line_end < parser->source.len && parser->source.ptr[line_end] != '\n') line_end++;
         if (line_end < parser->source.len) line_end++;
     }
@@ -6959,7 +6959,8 @@ static void parse_type(Parser *parser) {
                 while (p < line_end && line.source.ptr[p] == ' ') { indent++; p++; }
                 if (p >= line_end || line.source.ptr[p] == '\n') { body_finish++; continue; }
                 if (body_indent < 0) body_indent = indent;
-                if (indent < body_indent || indent == 0) break;
+                if (indent < body_indent) break;
+                if (indent == 0 && body_indent > 0) break;
                 while (body_finish < line_end && line.source.ptr[body_finish] != '\n') body_finish++;
                 if (body_finish < line_end) body_finish++;
             }
@@ -7893,9 +7894,13 @@ static int32_t body_slot_for_object_field(BodyIR *body, ObjectField *field) {
 static int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *locals,
                                         ObjectDef *object) {
     bool curly = false;
-    if (parser_take(parser, "{")) {
+    Span open_tok = parser_peek(parser);
+    if (span_eq(open_tok, "{")) {
+        (void)parser_token(parser);
         curly = true;
-    } else if (!parser_take(parser, "(")) {
+    } else if (span_eq(open_tok, "(")) {
+        (void)parser_token(parser);
+    } else {
         die("expected ( or { after object constructor");
     }
     int32_t payload_count = 0;
