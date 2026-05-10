@@ -4585,6 +4585,7 @@ typedef struct {
     int32_t *slot_size;
     int32_t *slot_aux;
     Span *slot_type;
+    int32_t *slot_no_alias;
     int32_t slot_count;
     int32_t slot_cap;
     int32_t frame_size;
@@ -4636,18 +4637,22 @@ static void body_ensure_slots(BodyIR *body) {
     int32_t *size = arena_alloc(body->arena, (size_t)next * sizeof(int32_t));
     int32_t *aux = arena_alloc(body->arena, (size_t)next * sizeof(int32_t));
     Span *type = arena_alloc(body->arena, (size_t)next * sizeof(Span));
+    int32_t *no_alias = arena_alloc(body->arena, (size_t)next * sizeof(int32_t));
     if (body->slot_count > 0) {
         memcpy(kind, body->slot_kind, (size_t)body->slot_count * sizeof(int32_t));
         memcpy(offset, body->slot_offset, (size_t)body->slot_count * sizeof(int32_t));
         memcpy(size, body->slot_size, (size_t)body->slot_count * sizeof(int32_t));
         memcpy(aux, body->slot_aux, (size_t)body->slot_count * sizeof(int32_t));
         memcpy(type, body->slot_type, (size_t)body->slot_count * sizeof(Span));
+        if (body->slot_no_alias)
+            memcpy(no_alias, body->slot_no_alias, (size_t)body->slot_count * sizeof(int32_t));
     }
     body->slot_kind = kind;
     body->slot_offset = offset;
     body->slot_size = size;
     body->slot_aux = aux;
     body->slot_type = type;
+    body->slot_no_alias = no_alias;
     body->slot_cap = next;
 }
 
@@ -4769,6 +4774,7 @@ static int32_t body_slot(BodyIR *body, int32_t kind, int32_t size) {
     body->slot_size[idx] = size;
     body->slot_aux[idx] = 0;
     body->slot_type[idx] = (Span){0};
+    body->slot_no_alias[idx] = 0;
     body->frame_size += align_i32(size, align);
     return idx;
 }
@@ -10978,6 +10984,8 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
         if (type.len <= 0) die("expected = after let binding");
         int32_t kind = SLOT_I32;
         int32_t slot = body_default_slot(body, parser->symbols, type, &kind);
+        if (kind == SLOT_I32 || kind == SLOT_I64 || kind == SLOT_F32 || kind == SLOT_F64)
+            body->slot_no_alias[slot] = 1;
         locals_add(locals, name, slot, kind);
         return block;
     }
@@ -11055,6 +11063,8 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
             }
             body_slot_set_type(body, slot, type);
         }
+    if (kind == SLOT_I32 || kind == SLOT_I64 || kind == SLOT_F32 || kind == SLOT_F64)
+        body->slot_no_alias[slot] = 1;
     locals_add(locals, name, slot, kind);
     return block;
 }
