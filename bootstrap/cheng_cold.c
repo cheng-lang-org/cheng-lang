@@ -10407,6 +10407,23 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                 *kind = SLOT_I32;
                 continue;
             }
+            if ((*kind == SLOT_STR || *kind == SLOT_STR_REF) &&
+                (span_eq(field_name, "data") || span_eq(field_name, "flags") ||
+                 span_eq(field_name, "store_id"))) {
+                /* str internal fields: data→ptr at offset 0, others→zero */
+                if (span_eq(field_name, "data")) {
+                    int32_t ptr_slot = body_slot(body, SLOT_PTR, 8);
+                    body_op3(body, BODY_OP_PAYLOAD_LOAD, ptr_slot, slot, 0, 8);
+                    slot = ptr_slot;
+                    *kind = SLOT_PTR;
+                } else {
+                    int32_t zero = body_slot(body, SLOT_I32, 4);
+                    body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+                    slot = zero;
+                    *kind = SLOT_I32;
+                }
+                continue;
+            }
             if (*kind != SLOT_OBJECT && *kind != SLOT_OBJECT_REF) {
                 Span type_name = body->slot_type[slot];
                 ObjectDef *obj = 0;
