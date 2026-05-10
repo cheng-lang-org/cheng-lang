@@ -5300,6 +5300,17 @@ static ObjectDef *symbols_find_object(Symbols *symbols, Span name) {
         }
     }
     } /* close has_bracket check */
+    /* Fallback for unqualified names: search for *.name suffix (imported objects) */
+    {
+        for (int32_t i = 0; i < symbols->object_count; i++) {
+            ObjectDef *co = &symbols->objects[i];
+            if (co->name.len > name.len + 1 &&
+                co->name.ptr[co->name.len - name.len - 1] == '.' &&
+                memcmp(co->name.ptr + co->name.len - name.len, name.ptr, (size_t)name.len) == 0) {
+                return co;
+            }
+        }
+    }
     return 0;
 }
 
@@ -10471,7 +10482,7 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                 int32_t tag_slot = body_slot(body, SLOT_I32, 4);
                 body_op(body, BODY_OP_TAG_LOAD, tag_slot, slot, 0);
                 int32_t payload_slot = body_slot(body, SLOT_I32, 4);
-                body_op(body, BODY_OP_PAYLOAD_LOAD, payload_slot, slot, 8);
+                body_op3(body, BODY_OP_PAYLOAD_LOAD, payload_slot, slot, 8, 4);
                 body_op3(body, BODY_OP_UNWRAP_OR_RETURN, payload_slot, tag_slot, 0, 0);
                 slot = payload_slot;
                 *kind = SLOT_I32;
