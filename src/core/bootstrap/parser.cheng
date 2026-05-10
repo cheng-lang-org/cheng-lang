@@ -1,4 +1,5 @@
-// parser.cheng — keyword counter (inline scanning)
+// parser.cheng — Full lexer + keyword counter with mmap storage
+// Uses let fix: let snapshots value instead of aliasing
 import libc
 
 fn is_alpha(c: int32): int32 =
@@ -19,32 +20,48 @@ fn byte_at(buf: int32[1024], word: int32, byte_idx: int32): int32 =
     if byte_idx == 2: return (w >> 16) & 255
     return (w >> 24) & 255
 
-fn count_fn(buf: int32[1024], byte_len: int32): int32 =
-    var count: int32 = 0
+fn store_tok(spans: int64, idx: int32, kind: int32, start: int32, len: int32) =
+    let off: int32 = idx * 12
+    let addr: int64 = spans + int64(off)
+    ptrStoreI32(addr, kind)
+    ptrStoreI32(addr + int64(4), start)
+    ptrStoreI32(addr + int64(8), len)
+
+fn lex_idents(buf: int32[1024], byte_len: int32, spans: int64): int32 =
+    var total: int32 = 0
     var pos: int32 = 0
     while pos < byte_len:
         let c: int32 = byte_at(buf, pos / 4, pos - (pos / 4) * 4)
-        if c == 102:
-            let npos: int32 = pos + 1
-            if npos < byte_len:
-                let nc: int32 = byte_at(buf, npos / 4, npos - (npos / 4) * 4)
-                if nc == 110:
-                    let apos: int32 = pos + 2
-                    if apos < byte_len:
-                        let ac: int32 = byte_at(buf, apos / 4, apos - (apos / 4) * 4)
-                        let is_follow: int32 = is_alnum(ac)
-                        if is_follow == 0:
-                            var sp: int32 = apos
-                            while sp < byte_len:
-                                let sc: int32 = byte_at(buf, sp / 4, sp - (sp / 4) * 4)
-                                if sc != 32: break
-                                sp = sp + 1
-                            if sp < byte_len:
-                                let fc: int32 = byte_at(buf, sp / 4, sp - (sp / 4) * 4)
-                                let alpha_chk: int32 = is_alpha(fc)
-                                if alpha_chk != 0: count = count + 1
-                            pos = sp
-        pos = pos + 1
+        let alpha_chk: int32 = is_alpha(c)
+        if alpha_chk == 0: pos = pos + 1
+        else:
+            let start: int32 = pos
+            pos = pos + 1
+            while pos < byte_len:
+                let ic: int32 = byte_at(buf, pos / 4, pos - (pos / 4) * 4)
+                let alnum_chk: int32 = is_alnum(ic)
+                if alnum_chk == 0: break
+                pos = pos + 1
+            store_tok(spans, total, 1, start, pos - start)
+            total = total + 1
+    return total
+
+fn count_keyword(spans: int64, total: int32, buf: int32[1024], c0: int32, c1: int32, n: int32): int32 =
+    var count: int32 = 0
+    var i: int32 = 0
+    while i < total:
+        let k: int32 = ptrLoadI32(spans + int64(i * 12))
+        if k == 1:
+            let len: int32 = ptrLoadI32(spans + int64(i * 12 + 8))
+            if len == n:
+                let start: int32 = ptrLoadI32(spans + int64(i * 12 + 4))
+                let b0: int32 = byte_at(buf, start / 4, start - (start / 4) * 4)
+                if b0 == c0:
+                    if n == 1: count = count + 1
+                    else:
+                        let b1: int32 = byte_at(buf, (start+1) / 4, (start+1) - ((start+1) / 4) * 4)
+                        if b1 == c1: count = count + 1
+        i = i + 1
     return count
 
 fn main(): int32 =
@@ -54,6 +71,11 @@ fn main(): int32 =
     let n: int32 = cold_read(fd, buf, 4096)
     let _: int32 = cold_close(fd)
     if n <= 0: return 2
-    let fn_count: int32 = count_fn(buf, n)
-    if fn_count >= 1: return 42
+    let spans: int64 = cold_mmap(16384)
+    if spans == 0: return 3
+    let total: int32 = lex_idents(buf, n, spans)
+    if total <= 0: return 4
+    let fn_count: int32 = count_keyword(spans, total, buf, 102, 110, 2)
+    let ret_count: int32 = count_keyword(spans, total, buf, 105, 102, 2)  // if
+    if fn_count >= 3: if ret_count >= 1: return 42
     return fn_count

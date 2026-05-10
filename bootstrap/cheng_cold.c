@@ -10905,6 +10905,16 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
     } else {
         slot = parse_expr(parser, body, locals, &kind);
     }
+    /* For let bindings (not var), always copy to avoid aliasing the initializer slot */
+    if (!is_var && slot >= 0 && (kind == SLOT_I32 || kind == SLOT_I64)) {
+        int32_t copy_slot = body_slot(body, kind, cold_slot_size_for_kind(kind));
+        if (kind == SLOT_I32) {
+            body_op(body, BODY_OP_COPY_I32, copy_slot, slot, 0);
+        } else {
+            body_op(body, BODY_OP_COPY_I64, copy_slot, slot, 0);
+        }
+        slot = copy_slot;
+    }
     if (owned_slot >= 0 && kind == SLOT_I32 && body->slot_kind[owned_slot] == SLOT_I32) {
         body_op(body, BODY_OP_COPY_I32, owned_slot, slot, 0);
         slot = owned_slot;
