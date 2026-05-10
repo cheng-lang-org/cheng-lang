@@ -76,6 +76,21 @@ fn tok_is_2kw(buf: int32[1024], spans: int64, idx: int32, c0: int32, c1: int32):
     if b1 != c1: return 0
     return 1
 
+// Check if token at idx is specific 3-char keyword
+fn tok_is_3kw(buf: int32[1024], spans: int64, idx: int32, c0: int32, c1: int32, c2: int32): int32 =
+    let k: int32 = tok_kind(spans, idx)
+    if k != 1: return 0
+    let len: int32 = ptrLoadI32(spans + int64(idx * 12 + 8))
+    if len != 3: return 0
+    let start: int32 = ptrLoadI32(spans + int64(idx * 12 + 4))
+    let b0: int32 = byte_at(buf, start / 4, start - (start / 4) * 4)
+    if b0 != c0: return 0
+    let b1: int32 = byte_at(buf, (start+1) / 4, (start+1) - ((start+1) / 4) * 4)
+    if b1 != c1: return 0
+    let b2: int32 = byte_at(buf, (start+2) / 4, (start+2) - ((start+2) / 4) * 4)
+    if b2 != c2: return 0
+    return 1
+
 fn count_kw(buf: int32[1024], spans: int64, total: int32, c0: int32, c1: int32): int32 =
     var n: int32 = 0
     var i: int32 = 0
@@ -97,17 +112,22 @@ fn main(): int32 =
     if total <= 0: return 4
     let fn_count: int32 = count_kw(buf, spans, total, 102, 110)
     let if_count: int32 = count_kw(buf, spans, total, 105, 102)
-// Store function entry in arena: [name_start, name_len, param_count, ret_start, ret_len]
-// Returns pointer to next free slot
-fn store_fn_entry(arena: int64, idx: int32, name_start: int32, name_len: int32, params: int32, ret_start: int32, ret_len: int32): int64 =
-    let off: int64 = int64(idx * 20)
+// Store function entry in arena: 10 x int32 = 40 bytes
+// [name_start, name_len, params, ret_start, ret_len, ret_n, let_n, var_n, if_n, while_n]
+fn store_fn_entry(arena: int64, idx: int32, name_start: int32, name_len: int32, params: int32, ret_start: int32, ret_len: int32, ret_n: int32, let_n: int32, var_n: int32, if_n: int32, while_n: int32): int64 =
+    let off: int64 = int64(idx * 40)
     let addr: int64 = arena + off
     ptrStoreI32(addr, name_start)
     ptrStoreI32(addr + int64(4), name_len)
     ptrStoreI32(addr + int64(8), params)
     ptrStoreI32(addr + int64(12), ret_start)
     ptrStoreI32(addr + int64(16), ret_len)
-    return arena + off + int64(20)
+    ptrStoreI32(addr + int64(20), ret_n)
+    ptrStoreI32(addr + int64(24), let_n)
+    ptrStoreI32(addr + int64(28), var_n)
+    ptrStoreI32(addr + int64(32), if_n)
+    ptrStoreI32(addr + int64(36), while_n)
+    return arena + off + int64(40)
 
 // Parse function signatures and store in arena, starting at entry start_idx
 fn build_symtab(buf: int32[1024], spans: int64, total: int32, arena: int64, start_idx: int32): int32 =
@@ -135,7 +155,7 @@ fn build_symtab(buf: int32[1024], spans: int64, total: int32, arena: int64, star
                             if tok_is_punct(buf, spans, i, 41) != 0: break
                             if tok_kind(spans, i) == 1: param_count = param_count + 1
                             i = i + 1
-                        // After ')', look for ':' then return type
+                        // After ')', look for ':' then return type, then '='
                         if i < total:
                             if tok_is_punct(buf, spans, i, 41) != 0: i = i + 1
                             if i < total:
@@ -145,7 +165,20 @@ fn build_symtab(buf: int32[1024], spans: int64, total: int32, arena: int64, star
                                         if tok_kind(spans, i) == 1:
                                             ret_start = ptrLoadI32(spans + int64(i * 12 + 4))
                                             ret_len = ptrLoadI32(spans + int64(i * 12 + 8))
-                store_fn_entry(arena, entry_count, name_start, name_len, param_count, ret_start, ret_len)
+                                            i = i + 1
+                // Count body statements until next 'fn' or EOF
+                var ret_n: int32 = 0
+                var let_n: int32 = 0
+                var var_n: int32 = 0
+                var if_n: int32 = 0
+                var while_n: int32 = 0
+                while i < total:
+                    if tok_is_2kw(buf, spans, i, 102, 110) != 0: break
+                    if tok_is_2kw(buf, spans, i, 105, 102) != 0: if_n = if_n + 1
+                    if tok_is_3kw(buf, spans, i, 108, 101, 116) != 0: let_n = let_n + 1
+                    if tok_is_3kw(buf, spans, i, 118, 97, 114) != 0: var_n = var_n + 1
+                    i = i + 1
+                store_fn_entry(arena, entry_count, name_start, name_len, param_count, ret_start, ret_len, ret_n, let_n, var_n, if_n, while_n)
                 entry_count = entry_count + 1
         j = j + 1
     return entry_count
@@ -197,5 +230,11 @@ fn main(): int32 =
                     let added: int32 = build_symtab(buf2, spans2, t2, arena, total_entries)
                     total_entries = added
 
-    if total_entries >= 10: return 42
-    return total_entries
+    // Find first entry with let_n > 0
+    var k: int32 = 0
+    while k < total_entries:
+        let name_len: int32 = ptrLoadI32(arena + int64(k * 40 + 4))
+        let let_n: int32 = ptrLoadI32(arena + int64(k * 40 + 24))
+        if name_len > 0: if let_n > 0: return 42
+        k = k + 1
+    return 0
