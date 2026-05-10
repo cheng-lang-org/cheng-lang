@@ -1,14 +1,60 @@
-// Bootstrap lexer v9 — byte-level access + word counting (fixed array params)
-// Verified: byte_at via >>/&, cold_open/read/close, array param indexing
+// Bootstrap lexer v10 — full token classification + span storage
+// Cold-compiler: int32/int64/array/bitwise/mmap/ptr/while/if
 
 import libc
+
+// --- Token kinds ---
+fn TK_EOF(): int32 = return 0
+fn TK_IDENT(): int32 = return 1
+fn TK_NUMBER(): int32 = return 2
+fn TK_STRING(): int32 = return 3
+fn TK_PUNCT(): int32 = return 4
+
+// --- Character classification ---
+fn is_alpha(c: int32): int32 =
+    if c >= 65: if c <= 90: return 1
+    if c >= 97: if c <= 122: return 1
+    return 0
+
+fn is_digit(c: int32): int32 =
+    if c >= 48: if c <= 57: return 1
+    return 0
+
+fn is_alnum(c: int32): int32 =
+    if is_alpha(c) != 0: return 1
+    if is_digit(c) != 0: return 1
+    if c == 95: return 1
+    return 0
 
 fn is_space(c: int32): int32 =
     if c == 32: return 1
     if c == 9: return 1
     if c == 10: return 1
+    if c == 13: return 1
     return 0
 
+fn is_punct(c: int32): int32 =
+    if c == 40: return 1
+    if c == 41: return 1
+    if c == 91: return 1
+    if c == 93: return 1
+    if c == 123: return 1
+    if c == 125: return 1
+    if c == 44: return 1
+    if c == 59: return 1
+    if c == 58: return 1
+    if c == 46: return 1
+    if c == 61: return 1
+    if c == 43: return 1
+    if c == 45: return 1
+    if c == 42: return 1
+    if c == 47: return 1
+    if c == 33: return 1
+    if c == 60: return 1
+    if c == 62: return 1
+    return 0
+
+// --- Byte extraction ---
 fn byte_at(buf: int32[1024], word: int32, byte_idx: int32): int32 =
     let w: int32 = buf[word]
     if byte_idx == 0: return w & 255
@@ -16,21 +62,107 @@ fn byte_at(buf: int32[1024], word: int32, byte_idx: int32): int32 =
     if byte_idx == 2: return (w >> 16) & 255
     return (w >> 24) & 255
 
-fn count_words(buf: int32[1024], len: int32): int32 =
-    var count: int32 = 0
-    var in_word: int32 = 0
-    var i: int32 = 0
-    while i < len / 4:
-        let c: int32 = buf[i]
+// --- Store token span (kind, start, len) into mmap array ---
+fn store_token(spans: int64, idx: int32, kind: int32, start: int32, len: int32) =
+    let off: int32 = idx * 12
+    let addr: int64 = spans + int64(off)
+    ptrStoreI32(addr, kind)
+    ptrStoreI32(addr + int64(4), start)
+    ptrStoreI32(addr + int64(8), len)
+
+// --- Lex all tokens ---
+fn lex_all(buf: int32[1024], byte_len: int32, spans: int64): int32 =
+    var total: int32 = 0
+    var pos: int32 = 0
+    while pos < byte_len:
+        let word: int32 = pos / 4
+        let boff: int32 = pos - word * 4
+        let c: int32 = byte_at(buf, word, boff)
         if c == 0: break
+        // Skip whitespace
         if is_space(c) != 0:
-            in_word = 0
-        else:
-            if in_word == 0:
-                count = count + 1
-                in_word = 1
+            pos = pos + 1
+            continue
+        // Line comment //
+        if c == 47:
+            let npos = pos + 1
+            if npos < byte_len:
+                let nw: int32 = npos / 4
+                let nb: int32 = npos - nw * 4
+                let nc: int32 = byte_at(buf, nw, nb)
+                if nc == 47:
+                    store_token(spans, total, TK_PUNCT(), pos, 2)
+                    total = total + 1
+                    pos = pos + 2
+                    while pos < byte_len:
+                        let lw: int32 = pos / 4
+                        let lb: int32 = pos - lw * 4
+                        let lc: int32 = byte_at(buf, lw, lb)
+                        if lc == 10: break
+                        pos = pos + 1
+                    continue
+        // Identifier
+        if is_alpha(c) != 0:
+            let start: int32 = pos
+            var end: int32 = pos + 1
+            pos = pos + 1
+            while pos < byte_len:
+                let iw: int32 = pos / 4
+                let ib: int32 = pos - iw * 4
+                let ic: int32 = byte_at(buf, iw, ib)
+                if is_alnum(ic) == 0: break
+                end = pos + 1
+                pos = pos + 1
+            store_token(spans, total, TK_IDENT(), start, end - start)
+            total = total + 1
+            continue
+        // Number
+        if is_digit(c) != 0:
+            let start: int32 = pos
+            var end: int32 = pos + 1
+            pos = pos + 1
+            while pos < byte_len:
+                let dw: int32 = pos / 4
+                let db: int32 = pos - dw * 4
+                let dc: int32 = byte_at(buf, dw, db)
+                if is_digit(dc) == 0: break
+                end = pos + 1
+                pos = pos + 1
+            store_token(spans, total, TK_NUMBER(), start, end - start)
+            total = total + 1
+            continue
+        // String "..."
+        if c == 34:
+            let start: int32 = pos
+            pos = pos + 1
+            while pos < byte_len:
+                let sw: int32 = pos / 4
+                let sb: int32 = pos - sw * 4
+                let sc: int32 = byte_at(buf, sw, sb)
+                if sc == 34: break
+                pos = pos + 1
+            pos = pos + 1
+            store_token(spans, total, TK_STRING(), start, pos - start)
+            total = total + 1
+            continue
+        // Punctuation
+        if is_punct(c) != 0:
+            store_token(spans, total, TK_PUNCT(), pos, 1)
+            total = total + 1
+        pos = pos + 1
+    return total
+
+// --- Count tokens by kind ---
+fn count_by_kind(spans: int64, total: int32, kind: int32): int32 =
+    var n: int32 = 0
+    var i: int32 = 0
+    while i < total:
+        let off: int32 = i * 12
+        let addr: int64 = spans + int64(off)
+        let k: int32 = ptrLoadI32(addr)
+        if k == kind: n = n + 1
         i = i + 1
-    return count
+    return n
 
 fn main(): int32 =
     let fd: int32 = cold_open("README.md", 0)
@@ -39,8 +171,10 @@ fn main(): int32 =
     let n: int32 = cold_read(fd, buf, 4096)
     let _: int32 = cold_close(fd)
     if n <= 0: return 2
-    let c0: int32 = byte_at(buf, 0, 0)
-    if c0 != 35: return c0
-    let count: int32 = count_words(buf, n)
-    if count > 0: return 42
-    return count
+    let spans: int64 = cold_mmap(16384)
+    if spans == 0: return 3
+    let total: int32 = lex_all(buf, n, spans)
+    if total <= 0: return 4
+    let idents: int32 = count_by_kind(spans, total, TK_IDENT())
+    if idents > 10: return 42
+    return idents
