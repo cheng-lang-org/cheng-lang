@@ -33,6 +33,10 @@
 #include <signal.h>
 #include <pthread.h>
 
+/* Diagnostics: enable with --diag:dump_per_fn and --diag:dump_slots */
+static bool cold_diag_dump_per_fn = false;
+static bool cold_diag_dump_slots = false;
+
 #include "macho_direct.h"
 
 #ifndef MAP_ANON
