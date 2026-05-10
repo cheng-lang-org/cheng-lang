@@ -161,6 +161,12 @@ fn arm_cbz(rt: int32, off: int32): int32 =
 fn arm_cbnz(rt: int32, off: int32): int32 =
     return 0x35000000 + ((off & 524287) * 32) + (rt & 31)
 fn arm_ret(): int32 = return 0xD65F03C0
+// Prologue/epilogue
+fn arm_stp_pre(): int32 = return 0xA9BF7BFD
+fn arm_mov_fp(): int32 = return 0x910003FD
+fn arm_sub_sp_16(): int32 = return 0xD10043FF
+fn arm_add_sp_16(): int32 = return 0x910043FF
+fn arm_ldp_post(): int32 = return 0xA8C17BFD
 fn arm_nop(): int32 = return 0xD503201F
 
 // Write .o template with variable-length code (max 10 words = 40 bytes)
@@ -228,10 +234,10 @@ fn compile_expr(buf: int32[1024], spans: int64, start: int32, total: int32, code
     return count
 
 // === Body compiler: handle let x = <int>; return x ===
-fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code: int64): int32 =
+fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code: int64, start_count: int32): int32 =
     let sym: int64 = cold_mmap(256)
     var sym_count: int32 = 0
-    var count: int32 = 0
+    var count: int32 = start_count
     var next_reg: int32 = 8
     var i: int32 = start
     while i < total:
@@ -306,57 +312,41 @@ fn fill_source(buf: int32[1024]): int32 =
 
 fn main(): int32 =
     var buf: int32[1024]
-    // "fn main(): int32 =\n    let x = 0\n    while x: return 42\n    return 0\n"
-    buf[0] = 102 + (110 << 8) + (32 << 16) + (109 << 24)  // "fn m"
-    buf[1] = 97 + (105 << 8) + (110 << 16) + (40 << 24)   // "ain("
-    buf[2] = 41 + (58 << 8) + (32 << 16) + (105 << 24)    // "): i"
-    buf[3] = 110 + (116 << 8) + (51 << 16) + (50 << 24)   // "nt32"
-    buf[4] = 32 + (61 << 8) + (10 << 16) + (32 << 24)     // " =\n "
-    buf[5] = 32 + (32 << 8) + (32 << 16) + (108 << 24)    // "   l"
-    buf[6] = 101 + (116 << 8) + (32 << 16) + (120 << 24)  // "et x"
-    buf[7] = 32 + (61 << 8) + (32 << 16) + (49 << 24)     // " = 1"
-    buf[8] = 10 + (32 << 8) + (32 << 16) + (32 << 24)     // "\n   "
-    buf[9] = 105 + (102 << 8) + (32 << 16) + (120 << 24)  // "if x"
-    buf[10] = 58 + (32 << 8) + (114 << 16) + (101 << 24)  // ": re"
-    buf[11] = 116 + (117 << 8) + (114 << 16) + (110 << 24) // "turn"
-    buf[12] = 32 + (52 << 8) + (50 << 16) + (10 << 24)    // " 42\n"
-    buf[13] = 32 + (32 << 8) + (32 << 16) + (114 << 24)   // "   r"
-    buf[14] = 101 + (116 << 8) + (117 << 16) + (114 << 24) // "etur"
-    buf[15] = 110 + (32 << 8) + (48 << 16) + (10 << 24)   // "n 0\n"
-    let n: int32 = 64  // total bytes
+    // "fn main(): int32 =\n    return 42\n"
+    buf[0] = 102 + (110 << 8) + (32 << 16) + (109 << 24)
+    buf[1] = 97 + (105 << 8) + (110 << 16) + (40 << 24)
+    buf[2] = 41 + (58 << 8) + (32 << 16) + (105 << 24)
+    buf[3] = 110 + (116 << 8) + (51 << 16) + (50 << 24)
+    buf[4] = 32 + (61 << 8) + (10 << 16) + (32 << 24)
+    buf[5] = 32 + (32 << 8) + (32 << 16) + (114 << 24)
+    buf[6] = 101 + (116 << 8) + (117 << 16) + (114 << 24)
+    buf[7] = 110 + (32 << 8) + (52 << 16) + (50 << 24)
+    buf[8] = 10
+    let n: int32 = 34
 
     let spans: int64 = cold_mmap(16384)
     if spans == 0: return 3
     let total: int32 = lex_all(buf, n, spans)
     if total <= 0: return 4
 
-    // Flat scan: find '=' after main to locate body start
-    var body_start: int32 = -1
+    // Compile ALL functions: each fn → prologue + body + epilogue
+    let code: int64 = cold_mmap(1024)
+    if code == 0: return 6
+    var code_words: int32 = 0
     var j: int32 = 0
     while j < total:
         if tok_is_2kw(buf, spans, j, 102, 110) != 0:
-            // found "fn". Check if next is "main"
-            let ni: int32 = j + 1
-            if ni < total:
-                if tok_len(spans, ni) == 4:
-                    let b0: int32 = byte_at(buf, tok_start(spans, ni) / 4, tok_start(spans, ni) - (tok_start(spans, ni) / 4) * 4)
-                    if b0 == 109:
-                        // Scan forward for '='
-                        var k: int32 = ni
-                        while k < total:
-                            if tok_kind(spans, k) == 4:
-                                let c: int32 = byte_at(buf, tok_start(spans, k) / 4, tok_start(spans, k) - (tok_start(spans, k) / 4) * 4)
-                                if c == 61:
-                                    body_start = k + 1
-                                    k = total
-                            k = k + 1
+            // Find '=' and compile body
+            var k: int32 = j + 1
+            while k < total:
+                if tok_kind(spans, k) == 4:
+                    let c: int32 = byte_at(buf, tok_start(spans, k) / 4, tok_start(spans, k) - (tok_start(spans, k) / 4) * 4)
+                    if c == 61:
+                        code_words = compile_body(buf, spans, k + 1, total, code, code_words)
+                        k = total
+                k = k + 1
         j = j + 1
 
-    if body_start < 0: return 5
-
-    let code: int64 = cold_mmap(256)
-    if code == 0: return 6
-    let code_words: int32 = compile_body(buf, spans, body_start, total, code)
     if code_words <= 0: return 7
 
     let out: int64 = cold_mmap(4096)
