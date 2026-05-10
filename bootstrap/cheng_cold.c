@@ -10147,7 +10147,8 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         return parse_constructor(parser, body, locals, variant);
     }
     ObjectDef *object = symbols_find_object(parser->symbols, token);
-    if (object && span_eq(parser_peek(parser), "(")) {
+    if (object && (token.ptr[0] >= 'A' && token.ptr[0] <= 'Z') &&
+        span_eq(parser_peek(parser), "(")) {
         *kind = SLOT_OBJECT;
         return parse_object_constructor(parser, body, locals, object);
     }
@@ -10187,7 +10188,8 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         *kind = local->kind;
         return slot;
     }
-    if (span_eq(parser_peek(parser), "{")) {
+    if (span_eq(parser_peek(parser), "{") &&
+        token.len > 0 && token.ptr[0] >= 'A' && token.ptr[0] <= 'Z') {
         /* object constructor with curly braces */
         ObjectDef *obj = symbols_resolve_object(parser->symbols, token);
         if (!obj) die("object type missing for constructor");
