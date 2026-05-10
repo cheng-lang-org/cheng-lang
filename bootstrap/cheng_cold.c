@@ -8925,6 +8925,44 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
+    if (span_eq(name, "f32add")) {
+        if (arg_count != 2) return false;
+        int32_t a = body->call_arg_slot[arg_start];
+        int32_t b = body->call_arg_slot[arg_start + 1];
+        int32_t slot = body_slot(body, SLOT_F32, 4);
+        body_op(body, BODY_OP_F32_ADD, slot, a, b);
+        if (kind_out) *kind_out = SLOT_F32;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "f32mul")) {
+        if (arg_count != 2) return false;
+        int32_t a = body->call_arg_slot[arg_start];
+        int32_t b = body->call_arg_slot[arg_start + 1];
+        int32_t slot = body_slot(body, SLOT_F32, 4);
+        body_op(body, BODY_OP_F32_MUL, slot, a, b);
+        if (kind_out) *kind_out = SLOT_F32;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "i32fromf32")) {
+        if (arg_count != 1) return false;
+        int32_t a = body->call_arg_slot[arg_start];
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_FROM_F32, slot, a, 0);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "f32fromi32")) {
+        if (arg_count != 1) return false;
+        int32_t a = body->call_arg_slot[arg_start];
+        int32_t slot = body_slot(body, SLOT_F32, 4);
+        body_op(body, BODY_OP_F32_FROM_I32, slot, a, 0);
+        if (kind_out) *kind_out = SLOT_F32;
+        *slot_out = slot;
+        return true;
+    }
     return false;
 }
 
