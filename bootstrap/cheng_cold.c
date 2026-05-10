@@ -4394,6 +4394,7 @@ enum {
     BODY_OP_I32_OR = 37,
     BODY_OP_PTR_CONST = 38,
     BODY_OP_WRITE_LINE = 39,
+    BODY_OP_WRITE_RAW = 115,
     BODY_OP_ARGC_LOAD = 40,
     BODY_OP_ARGV_STR = 41,
     BODY_OP_CWD_STR = 42,
@@ -8968,6 +8969,18 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         if (body->slot_kind[fd] != SLOT_I32 || body->slot_kind[count] != SLOT_I32) return false;
         int32_t slot = body_slot(body, SLOT_I32, 4);
         body_op3(body, BODY_OP_WRITE_BYTES, slot, fd, buf, count);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
+    if (span_eq(name, "cold_write_raw")) {
+        if (arg_count != 3) return false;
+        int32_t fd = body->call_arg_slot[arg_start];
+        int32_t ptr = body->call_arg_slot[arg_start + 1];
+        int32_t count = body->call_arg_slot[arg_start + 2];
+        if (body->slot_kind[fd] != SLOT_I32 || body->slot_kind[count] != SLOT_I32) return false;
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op3(body, BODY_OP_WRITE_RAW, slot, fd, ptr, count);
         if (kind_out) *kind_out = SLOT_I32;
         *slot_out = slot;
         return true;
@@ -16853,6 +16866,13 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         code_emit(code, a64_str_imm(R0, R1, 0, true));
+    } else if (kind == BODY_OP_WRITE_RAW) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
+        a64_emit_ldr_sp_off(code, R2, body->slot_offset[c], false);
+        code_emit(code, a64_movz_x(16, 4, 0));
+        code_emit(code, a64_svc(0x80));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_WRITE_BYTES) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_add_large(code, R1, SP, body->slot_offset[b], true);
@@ -17134,7 +17154,8 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
         }
     }
     for (int32_t i = 0; i < function_count; i++) {
-        if (i == entry_function || !function_bodies[i]) continue;
+        if (i == entry_function || !function_bodies[i] ||
+            function_bodies[i]->has_fallback) continue;
         function_pos[i] = code->count;
         BodyIR *body = function_bodies[i];
         if (body->has_fallback || body->block_count == 0 ||
@@ -17569,7 +17590,7 @@ static void cold_collect_body_stats(Symbols *symbols, BodyIR **function_bodies, 
                                     ColdCompileStats *stats) {
     for (int32_t i = 0; i < function_count; i++) {
         BodyIR *body = function_bodies[i];
-        if (!body) continue;
+        if (!body || body->has_fallback) continue;
         int32_t frame_size = align_i32(body->frame_size, 16);
         if (frame_size > stats->max_frame_size) {
             stats->max_frame_size = frame_size;
@@ -17595,8 +17616,10 @@ static void cold_collect_body_stats(Symbols *symbols, BodyIR **function_bodies, 
         /* count parameters and ABI placement */
         int32_t fn_reg = 0;
         int32_t fn_stack = 0;
+        if (!body->slot_kind || !body->param_slot) continue;
         for (int32_t p = 0; p < body->param_count; p++) {
             int32_t slot = body->param_slot[p];
+            if (slot < 0 || slot >= body->slot_count) continue;
             int32_t kind = body->slot_kind[slot];
             int32_t size = body->slot_size[slot];
             int32_t base_reg = -1;
