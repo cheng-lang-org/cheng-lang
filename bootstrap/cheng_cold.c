@@ -16628,8 +16628,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_ldar_w(R0, R1));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else if (kind == BODY_OP_ATOMIC_STORE_I32) {
-        a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[b], false);
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_stlr_w(R0, R1));
     } else if (kind == BODY_OP_ATOMIC_CAS_I32) {
         /* CAS: a=ptr, b=desired, c=expected → dst=1(success)/0(fail)
