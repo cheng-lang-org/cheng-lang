@@ -1,0 +1,43 @@
+import std/os
+import std/strutils as strutil
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/path as chengpath
+
+fn main(): int32 =
+    let workspaceRoot: str = os.GetEnvDefault("CHENG_SMOKE_ROOT", ".")
+    let packageRoot: str = workspaceRoot
+    let sourcePath: str = chengpath.PathJoin(packageRoot, "src/tests/atomic_i32_runtime_smoke.cheng")
+    let outputPath: str = "/tmp/cheng_atomic_lowering_probe_target"
+    let req = creq.CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.EmitExe,
+        ""
+    )
+    var linkPlan: slplan.SystemLinkPlanStub
+    var err = ""
+    if !slplan.BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err):
+        echo(strutil.Join(["atomic lowering probe link err=", err], ""))
+        return 2
+    var plan: lower.LoweringPlanStub
+    if !lower.BuildLoweringPlanStub(linkPlan, plan, err):
+        echo(strutil.Join(["atomic lowering probe lowering err=", err], ""))
+        return 3
+    let primary = pobj.BuildPrimaryObjectPlan(linkPlan, plan)
+    let report = strutil.Join([
+        lower.LoweringPlanStubReport(plan),
+        "\n--- primary ---\n",
+        pobj.PrimaryObjectPlanReport(primary),
+        "\n"
+    ], "")
+    let reportPath = "/tmp/cheng_atomic_lowering_probe.report.txt"
+    if !chengpath.WriteTextFile("", reportPath, report):
+        echo("atomic lowering probe write report failed")
+        return 4
+    echo(reportPath)
+    return 0
