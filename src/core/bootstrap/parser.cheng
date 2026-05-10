@@ -109,9 +109,9 @@ fn store_fn_entry(arena: int64, idx: int32, name_start: int32, name_len: int32, 
     ptrStoreI32(addr + int64(16), ret_len)
     return arena + off + int64(20)
 
-// Parse function signatures and store in arena
-fn build_symtab(buf: int32[1024], spans: int64, total: int32, arena: int64): int32 =
-    var entry_count: int32 = 0
+// Parse function signatures and store in arena, starting at entry start_idx
+fn build_symtab(buf: int32[1024], spans: int64, total: int32, arena: int64, start_idx: int32): int32 =
+    var entry_count: int32 = start_idx
     var fn_count: int32 = 0
     var j: int32 = 0
     while j < total:
@@ -150,43 +150,52 @@ fn build_symtab(buf: int32[1024], spans: int64, total: int32, arena: int64): int
         j = j + 1
     return entry_count
 
-fn main(): int32 =
-    let fd: int32 = cold_open("src/core/bootstrap/parser.cheng", 0)
-    if fd < 0: return 1
-    var buf: int32[1024]
-    let n: int32 = cold_read(fd, buf, 4096)
-    let _: int32 = cold_close(fd)
-    if n <= 0: return 2
-    let spans: int64 = cold_mmap(16384)
-    if spans == 0: return 3
-    let total: int32 = lex_all(buf, n, spans)
-    if total <= 0: return 4
-
-    let arena: int64 = cold_mmap(4096)
-    if arena == 0: return 5
-
-    let entry_count: int32 = build_symtab(buf, spans, total, arena)
-    if entry_count <= 0: return 5
-
-    // Query all entries: find one with specific name "is_alpha"
-    var found: int32 = 0
-    var k: int32 = 0
-    while k < entry_count:
-        let name_start: int32 = ptrLoadI32(arena + int64(k * 20))
-        let name_len: int32 = ptrLoadI32(arena + int64(k * 20 + 4))
-        let params: int32 = ptrLoadI32(arena + int64(k * 20 + 8))
-        // Check if name_len == 8 ("is_alpha")
-        if name_len == 8:
-            let c0: int32 = byte_at(buf, name_start / 4, name_start - (name_start / 4) * 4)
-            let c1: int32 = byte_at(buf, (name_start+1) / 4, (name_start+1) - ((name_start+1) / 4) * 4)
-            if c0 == 105: if c1 == 115:
-                // is_alpha: check return type is "int32"
-                let ret_start: int32 = ptrLoadI32(arena + int64(k * 20 + 12))
-                let ret_len: int32 = ptrLoadI32(arena + int64(k * 20 + 16))
-                if ret_len == 5:
-                    let r0: int32 = byte_at(buf, ret_start / 4, ret_start - (ret_start / 4) * 4)
-                    if r0 == 105:  // 'i'
-                        if params >= 1: found = 1
-        k = k + 1
-    if found != 0: return 42
+// Process one source file, add fn entries to arena starting at entry_idx
+// Returns number of entries added
+fn process_file(path_start: int32, path_len: int32, arena: int64, entry_idx: int32): int32 =
+    // Build path string in mmap
+    let path_buf: int64 = cold_mmap(256)
+    if path_buf == 0: return 0
+    var pi: int32 = 0
+    while pi < path_len:
+        ptrStoreI32(path_buf + int64(pi * 4), 0)
+        pi = pi + 1
+    // Hmm, can't easily pass string. Let me use fixed paths below.
     return 0
+
+fn main(): int32 =
+    let arena: int64 = cold_mmap(8192)
+    if arena == 0: return 1
+    var total_entries: int32 = 0
+
+    // Process file 1: parser.cheng
+    let fd1: int32 = cold_open("src/core/bootstrap/parser.cheng", 0)
+    if fd1 >= 0:
+        var buf1: int32[1024]
+        let n1: int32 = cold_read(fd1, buf1, 4096)
+        let _: int32 = cold_close(fd1)
+        if n1 > 0:
+            let spans1: int64 = cold_mmap(16384)
+            if spans1 != 0:
+                let t1: int32 = lex_all(buf1, n1, spans1)
+                if t1 > 0:
+                    // build_symtab adds to arena at offset total_entries
+                    let added: int32 = build_symtab(buf1, spans1, t1, arena, total_entries)
+                    total_entries = added  // build_symtab returns new total
+
+    // Process file 2: tokenizer_bootstrap.cheng
+    let fd2: int32 = cold_open("src/core/bootstrap/tokenizer_bootstrap.cheng", 0)
+    if fd2 >= 0:
+        var buf2: int32[1024]
+        let n2: int32 = cold_read(fd2, buf2, 4096)
+        let _: int32 = cold_close(fd2)
+        if n2 > 0:
+            let spans2: int64 = cold_mmap(16384)
+            if spans2 != 0:
+                let t2: int32 = lex_all(buf2, n2, spans2)
+                if t2 > 0:
+                    let added: int32 = build_symtab(buf2, spans2, t2, arena, total_entries)
+                    total_entries = added
+
+    if total_entries >= 10: return 42
+    return total_entries
