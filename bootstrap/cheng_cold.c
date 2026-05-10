@@ -17737,7 +17737,7 @@ static bool cold_import_is_active(const char *path) {
 }
 
 static void cold_import_push_active(const char *path) {
-    if (cold_active_import_count >= 16) die("too many transitive imports");
+    if (cold_active_import_count >= 32) die("too many transitive imports");
     snprintf(cold_active_imports[cold_active_import_count++], PATH_MAX, "%s", path);
 }
 
@@ -18255,7 +18255,7 @@ static int32_t cold_compile_imported_bodies_no_recurse(Symbols *symbols, Span en
 static void cold_collect_transitive_imports_rec(Symbols *symbols, Span source,
                                                   char visited[][PATH_MAX], int32_t *visited_count,
                                                   int32_t depth) {
-    if (depth > 16 || *visited_count >= 64) return;
+    if (depth > 32 || *visited_count >= 128) return;
     int32_t pos = 0;
     bool in_triple = false;
     while (pos < source.len) {
