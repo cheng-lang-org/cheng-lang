@@ -7570,8 +7570,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
         Local *indirect_local = locals_find(locals, name);
         if (indirect_local && indirect_local->kind == SLOT_PTR) {
             int32_t slot = body_slot(body, SLOT_I32, 4);
-            int32_t ret_kind_hint = 0;
-            body_op3(body, BODY_OP_CALL_PTR, slot, indirect_local->slot, arg_start, ret_kind_hint);
+            body_op3(body, BODY_OP_CALL_PTR, slot, indirect_local->slot, arg_start, arg_count);
             if (kind_out) *kind_out = SLOT_I32;
             return slot;
         }
@@ -7787,8 +7786,7 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
         Local *indirect_local = locals_find(locals, name);
         if (indirect_local && indirect_local->kind == SLOT_PTR) {
             int32_t slot = body_slot(body, SLOT_I32, 4);
-            int32_t ret_kind_hint = 0;
-            body_op3(body, BODY_OP_CALL_PTR, slot, indirect_local->slot, arg_start, ret_kind_hint);
+            body_op3(body, BODY_OP_CALL_PTR, slot, indirect_local->slot, arg_start, arg_count);
             if (kind_out) *kind_out = SLOT_I32;
             return slot;
         }
@@ -10556,7 +10554,7 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                 }
                 if (!parser_take(parser, ")")) { /* skip malformed */ }
                 int32_t ret_slot = body_slot(body, SLOT_I32, 4);
-                body_op3(body, BODY_OP_CALL_PTR, ret_slot, call_slot, call_arg_start, 0);
+                body_op3(body, BODY_OP_CALL_PTR, ret_slot, call_slot, call_arg_start, call_arg_count);
                 slot = ret_slot;
                 *kind = SLOT_I32;
                 continue;
@@ -16908,12 +16906,26 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         function_patches_add(function_patches, adr_pos, fn_index);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     } else if (kind == BODY_OP_CALL_PTR) {
-        /* Indirect call: load fn ptr, call via BLR, store result */
-        int32_t fn_index = a;
-        a64_emit_ldr_sp_off(code, R9, body->slot_offset[fn_index], true);
+        /* Indirect call: load args into x0-x7, load fn ptr, call via BLR, store result.
+           a = fn_ptr_slot, b = call_arg_start, c = call_arg_count */
+        int32_t fn_ptr_slot = a;
+        int32_t call_arg_start = b;
+        int32_t call_arg_count = c;
+        /* Load args into registers */
+        for (int32_t ai = 0; ai < call_arg_count && ai < 8; ai++) {
+            int32_t arg_slot = body->call_arg_slot[call_arg_start + ai];
+            int32_t arg_kind = body->slot_kind[arg_slot];
+            if (arg_kind == SLOT_I32) {
+                a64_emit_ldr_sp_off(code, ai, body->slot_offset[arg_slot], false);
+            } else if (arg_kind == SLOT_I64 || arg_kind == SLOT_PTR) {
+                a64_emit_ldr_sp_off(code, ai, body->slot_offset[arg_slot], true);
+            } else {
+                a64_emit_ldr_sp_off(code, ai, body->slot_offset[arg_slot], true);
+            }
+        }
+        a64_emit_ldr_sp_off(code, R9, body->slot_offset[fn_ptr_slot], true);
         code_emit(code, a64_blr(R9));
-        int32_t ret_kind = b;  /* b encodes ret_kind hint: 0=I32, 1=I64/PTR */
-        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind != 0);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
     } else {
         ; /* unknown op: skip silently */
     }

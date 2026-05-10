@@ -97,21 +97,79 @@ fn main(): int32 =
     if total <= 0: return 4
     let fn_count: int32 = count_kw(buf, spans, total, 102, 110)
     let if_count: int32 = count_kw(buf, spans, total, 105, 102)
-    // Count fn with params: for each fn, count identifiers between ( and )
-    var total_params: int32 = 0
+// Store function entry in arena: [name_start, name_len, param_count, ret_start, ret_len]
+// Returns pointer to next free slot
+fn store_fn_entry(arena: int64, idx: int32, name_start: int32, name_len: int32, params: int32, ret_start: int32, ret_len: int32): int64 =
+    let off: int64 = int64(idx * 20)
+    let addr: int64 = arena + off
+    ptrStoreI32(addr, name_start)
+    ptrStoreI32(addr + int64(4), name_len)
+    ptrStoreI32(addr + int64(8), params)
+    ptrStoreI32(addr + int64(12), ret_start)
+    ptrStoreI32(addr + int64(16), ret_len)
+    return arena + off + int64(20)
+
+// Parse function signatures and store in arena
+fn build_symtab(buf: int32[1024], spans: int64, total: int32, arena: int64): int32 =
+    var entry_count: int32 = 0
+    var fn_count: int32 = 0
     var j: int32 = 0
     while j < total:
         if tok_is_2kw(buf, spans, j, 102, 110) != 0:
-            // Found "fn". Skip fn + name, then find '('
-            var i: int32 = j + 2
-            if i >= total: j = j + 1
+            fn_count = fn_count + 1
+            // j = fn, j+1 = name
+            let name_idx: int32 = j + 1
+            if name_idx >= total: j = j + 1
             else:
-                if tok_is_punct(buf, spans, i, 40) != 0:
-                    i = i + 1
-                    while i < total:
-                        if tok_is_punct(buf, spans, i, 41) != 0: break
-                        if tok_kind(spans, i) == 1: total_params = total_params + 1
+                let name_start: int32 = ptrLoadI32(spans + int64(name_idx * 12 + 4))
+                let name_len: int32 = ptrLoadI32(spans + int64(name_idx * 12 + 8))
+                // Find '(' after name
+                var i: int32 = name_idx + 1
+                var param_count: int32 = 0
+                var ret_start: int32 = 0
+                var ret_len: int32 = 0
+                if i < total:
+                    if tok_is_punct(buf, spans, i, 40) != 0:
                         i = i + 1
+                        while i < total:
+                            if tok_is_punct(buf, spans, i, 41) != 0: break
+                            if tok_kind(spans, i) == 1: param_count = param_count + 1
+                            i = i + 1
+                        // After ')', look for ':' then return type
+                        if i < total:
+                            if tok_is_punct(buf, spans, i, 41) != 0: i = i + 1
+                            if i < total:
+                                if tok_is_punct(buf, spans, i, 58) != 0:
+                                    i = i + 1
+                                    if i < total:
+                                        if tok_kind(spans, i) == 1:
+                                            ret_start = ptrLoadI32(spans + int64(i * 12 + 4))
+                                            ret_len = ptrLoadI32(spans + int64(i * 12 + 8))
+                store_fn_entry(arena, entry_count, name_start, name_len, param_count, ret_start, ret_len)
+                entry_count = entry_count + 1
         j = j + 1
-    if total_params >= 10: return 42
-    return total_params
+    return entry_count
+
+fn main(): int32 =
+    let fd: int32 = cold_open("src/core/bootstrap/parser.cheng", 0)
+    if fd < 0: return 1
+    var buf: int32[1024]
+    let n: int32 = cold_read(fd, buf, 4096)
+    let _: int32 = cold_close(fd)
+    if n <= 0: return 2
+    let spans: int64 = cold_mmap(16384)
+    if spans == 0: return 3
+    let total: int32 = lex_all(buf, n, spans)
+    if total <= 0: return 4
+
+    let arena: int64 = cold_mmap(4096)
+    if arena == 0: return 5
+
+    let entry_count: int32 = build_symtab(buf, spans, total, arena)
+    if entry_count <= 0: return 5
+
+    // Query first entry: return name_len + param_count*10
+    let name_len: int32 = ptrLoadI32(arena + int64(4))
+    let param_count: int32 = ptrLoadI32(arena + int64(8))
+    if name_len > 0: if param_count > 0: return 42
+    return 0
