@@ -10479,6 +10479,50 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
         if (span_eq(parser_peek(parser), "?")) {
             (void)parser_token(parser);
             if (*kind == SLOT_VARIANT) {
+                TypeDef *qtype = cold_question_result_type(parser->symbols, body, slot);
+                if (qtype && qtype->variant_count == 2 &&
+                    qtype->variants[0].field_count == 1 &&
+                    qtype->variants[1].field_count >= 1) {
+                    Variant *ok_v = &qtype->variants[0];
+                    Variant *err_v = &qtype->variants[1];
+                    int32_t tag_slot = body_slot(body, SLOT_I32, 4);
+                    body_op(body, BODY_OP_TAG_LOAD, tag_slot, slot, 0);
+                    int32_t err_tag_slot = body_slot(body, SLOT_I32, 4);
+                    body_op(body, BODY_OP_I32_CONST, err_tag_slot, err_v->tag, 0);
+                    int32_t ok_block = body_block(body);
+                    int32_t err_block = body_block(body);
+                    int32_t cbr_term = body_term(body, BODY_TERM_CBR, tag_slot, COND_EQ,
+                                                  err_tag_slot, err_block, ok_block);
+                    int32_t prev_block = body->block_count - 1;
+                    body_end_block(body, prev_block, cbr_term);
+                    /* err_block: return error */
+                    body_reopen_block(body, err_block);
+                    if (body->return_kind == SLOT_VARIANT &&
+                        body->return_type.len > 0 &&
+                        span_same(body->return_type, qtype->name)) {
+                        int32_t ret_term = body_term(body, BODY_TERM_RET, slot, -1, 0, -1, -1);
+                        body_end_block(body, err_block, ret_term);
+                    } else if (body->return_kind == SLOT_I32 &&
+                               err_v->field_count == 1 &&
+                               err_v->field_kind[0] == SLOT_I32) {
+                        int32_t err_payload = body_slot(body, SLOT_I32, 4);
+                        body_op(body, BODY_OP_PAYLOAD_LOAD, err_payload, slot,
+                                err_v->field_offset[0]);
+                        int32_t ret_term = body_term(body, BODY_TERM_RET, err_payload, -1, 0, -1, -1);
+                        body_end_block(body, err_block, ret_term);
+                    } else {
+                        die("? cannot be used on incompatible return type");
+                    }
+                    /* ok_block: unwrap payload */
+                    body_reopen_block(body, ok_block);
+                    int32_t payload_slot = body_slot(body, SLOT_I32, 4);
+                    body_op3(body, BODY_OP_PAYLOAD_LOAD, payload_slot, slot,
+                             ok_v->field_offset[0], ok_v->field_size[0]);
+                    slot = payload_slot;
+                    *kind = ok_v->field_kind[0];
+                    continue;
+                }
+                /* Fallback: simple BRK-based unwrap */
                 int32_t tag_slot = body_slot(body, SLOT_I32, 4);
                 body_op(body, BODY_OP_TAG_LOAD, tag_slot, slot, 0);
                 int32_t payload_slot = body_slot(body, SLOT_I32, 4);
