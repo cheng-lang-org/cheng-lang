@@ -235,17 +235,28 @@ fn emit(code: int64, count: int32, word: int32): int32 =
 fn patch(code: int64, idx: int32, word: int32) =
     ptrStoreI32(code + int64(idx * 4), word)
 
-// Compile a simple expression: digit | ident | digit op digit | ident op digit
-// start: first token of expression, returns index after last consumed token
-fn compile_expr(buf: int32[1024], spans: int64, start: int32, total: int32, code: int64, count: int32, sym: int64, sym_count: int32): int32 =
-    return count
-
 // === Body compiler: handle let x = <int>; return x ===
 fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code: int64, start_count: int32, fsym: int64, fn_count: int32): int32 =
     let sym: int64 = cold_mmap(256)
     var sym_count: int32 = 0
     var count: int32 = start_count
     var next_reg: int32 = 8
+    // Scan back for params: find '(' before this fn body
+    var sp: int32 = start - 1
+    while sp >= 0:
+        if tok_is_punct(buf, spans, sp, 40) != 0:
+            var pr: int32 = 0
+            var pp: int32 = sp + 1
+            while pp < total:
+                if tok_is_punct(buf, spans, pp, 41) != 0: pp = total
+                else:
+                    if tok_kind(spans, pp) == 1:
+                        var_add(sym, sym_count, tok_start(spans, pp), tok_len(spans, pp), pr)
+                        sym_count = sym_count + 1
+                        pr = pr + 1
+                    pp = pp + 1
+            sp = 0
+        sp = sp - 1
     var i: int32 = start
     while i < total:
         let is_let: int32 = tok_is_3kw(buf, spans, i, 108, 101, 116)
@@ -315,7 +326,15 @@ fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code
                 if rk == 1:
                     let vr: int32 = var_find(buf, sym, sym_count, tok_start(spans, i + 1), tok_len(spans, i + 1))
                     if vr >= 0:
-                        count = emit(code, count, arm_mov_reg(0, vr))
+                        let is_sum: int32 = 0
+                        if i + 3 < total:
+                            if tok_is_punct(buf, spans, i + 2, 43) != 0:
+                                if tok_kind(spans, i + 3) == 1:
+                                    let vr2: int32 = var_find(buf, sym, sym_count, tok_start(spans, i+3), tok_len(spans, i+3))
+                                    if vr2 >= 0:
+                                        is_sum = 1
+                                        count = emit(code, count, arm_add_reg(0, vr, vr2))
+                        if is_sum == 0: count = emit(code, count, arm_mov_reg(0, vr))
                     else:
                         // Not a var — check if it's a fn call: ident(digit,digit)
                         if i + 5 < total:
@@ -337,12 +356,6 @@ fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code
             i = total
         if is_let == 0: if is_if == 0: if is_while == 0: if is_call == 0: if is_ret == 0: if is_fn == 0: i = i + 1
     return count
-
-// Hardcoded test source: "fn main(): int32 =\n    let x = 3\n    return x\n"
-fn fill_source(buf: int32[1024]): int32 =
-    var i: int32 = 0
-    buf[0] = 0x6E206E66  // "fn \n" → wait, need proper packing
-    return 0
 
 fn main(): int32 =
     var buf: int32[1024]
