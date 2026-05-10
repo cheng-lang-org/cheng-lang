@@ -7655,9 +7655,9 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
     int32_t ret_kind = cold_return_kind_from_span(parser->symbols, fn->ret);
     int32_t slot = body_slot(body, ret_kind, cold_return_slot_size(parser->symbols, fn->ret, ret_kind));
     body_slot_set_type(body, slot, fn->ret);
-    bool has_composite = (ret_kind != SLOT_I32 && ret_kind != SLOT_I64);
+    bool has_composite = (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR);
     for (int32_t pi = 0; !has_composite && pi < fn->arity; pi++) {
-        if (fn->param_kind[pi] != SLOT_I32 && fn->param_kind[pi] != SLOT_I64) has_composite = true;
+        if (fn->param_kind[pi] != SLOT_I32 && fn->param_kind[pi] != SLOT_I64 && fn->param_kind[pi] != SLOT_PTR) has_composite = true;
     }
     if (!has_composite) {
         body_op(body, BODY_OP_CALL_I32, slot, fn_index, arg_start);
@@ -7784,9 +7784,9 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
     int32_t ret_kind = cold_return_kind_from_span(owner->symbols, fn->ret);
     int32_t slot = body_slot(body, ret_kind, cold_return_slot_size(owner->symbols, fn->ret, ret_kind));
     body_slot_set_type(body, slot, fn->ret);
-    bool has_composite = (ret_kind != SLOT_I32 && ret_kind != SLOT_I64);
+    bool has_composite = (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR);
     for (int32_t pi = 0; !has_composite && pi < fn->arity; pi++) {
-        if (fn->param_kind[pi] != SLOT_I32 && fn->param_kind[pi] != SLOT_I64) has_composite = true;
+        if (fn->param_kind[pi] != SLOT_I32 && fn->param_kind[pi] != SLOT_I64 && fn->param_kind[pi] != SLOT_PTR) has_composite = true;
     }
     if (!has_composite) {
         body_op(body, BODY_OP_CALL_I32, slot, fn_index, arg_start);
@@ -16493,7 +16493,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         if (a < 0 || a >= symbols->function_count) die("invalid function call target");
         FnDef *fn = &symbols->functions[a];
         int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
-        if (ret_kind != SLOT_I32 && ret_kind != SLOT_I64) {
+        if (ret_kind != SLOT_I32 && ret_kind != SLOT_I64 && ret_kind != SLOT_PTR) {
             a64_emit_add_large(code, 8, SP, body->slot_offset[dst], true);
         }
         int32_t stack_bytes = codegen_load_call_args(code, body, fn, b);
@@ -16503,7 +16503,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
         if (ret_kind == SLOT_I32) {
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
-        } else if (ret_kind == SLOT_I64) {
+        } else if (ret_kind == SLOT_I64 || ret_kind == SLOT_PTR) {
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
         }
     } else if (kind == BODY_OP_COPY_COMPOSITE) {
@@ -16832,11 +16832,18 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
                        value_kind == SLOT_SEQ_OPAQUE) {
                 if (body->sret_slot < 0) die("missing sret slot for composite return");
                 a64_emit_ldr_sp_off(code, 8, body->slot_offset[body->sret_slot], true);
-                int32_t total = body->return_size;
-                if (body->slot_size[value_slot] < total) return; /* skip undersized slot */;
-                for (int32_t off = 0; off < total; off += 8) {
+                int32_t copy_bytes = body->slot_size[value_slot];
+                if (copy_bytes > body->return_size) copy_bytes = body->return_size;
+                for (int32_t off = 0; off < copy_bytes; off += 8) {
                     a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot] + off, true);
                     code_emit(code, a64_str_imm(R0, 8, off, true));
+                }
+                /* Zero-fill remaining sret space if variant is smaller */
+                if (copy_bytes < body->return_size) {
+                    code_emit(code, a64_movz_x(R0, 0, 0));
+                    for (int32_t off = copy_bytes; off < body->return_size; off += 8) {
+                        code_emit(code, a64_str_imm(R0, 8, off, true));
+                    }
                 }
             } else {
                 /* Unsupported return kind: return 0 gracefully */
@@ -17912,6 +17919,8 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
             span_eq(next, "import") || span_eq(next, "module")) {
             parser_line(&parser);
         } else if (span_eq(next, "fn")) {
+            int32_t saved_fn_pos = fn_pos;
+            fn_pos++;
             volatile int32_t symbol_index = -1;
             volatile BodyIR *volatile body = 0;
             ColdErrorRecoveryEnabled = true;
@@ -17928,8 +17937,8 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
             if (!body) continue;
             /* In import_mode, symbols_find_fn returns -1 (local name doesn't match
                qualified symbol name). Use pre-scanned qual_indices instead. */
-            if (symbol_index < 0 && parser.import_mode && fn_pos < COLD_IMPORT_FN_MAP_CAP && qual_indices[fn_pos] >= 0) {
-                symbol_index = qual_indices[fn_pos];
+            if (symbol_index < 0 && parser.import_mode && saved_fn_pos < COLD_IMPORT_FN_MAP_CAP && qual_indices[saved_fn_pos] >= 0) {
+                symbol_index = qual_indices[saved_fn_pos];
             }
             if (symbol_index < 0 || symbol_index >= body_cap) continue;
             /* Selective compilation: skip bodies that cold codegen cannot handle.
@@ -17939,7 +17948,7 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                   variant/str/object returns inside I32-declared functions). */
             bool skip_body = false;
             if (body->return_kind != SLOT_I32 && body->return_kind != SLOT_I64 &&
-                body->return_kind > 0) {
+                body->return_kind != SLOT_PTR && body->return_kind > 0) {
                 skip_body = true;
             }
             if (!skip_body) {
@@ -17950,7 +17959,7 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
                         int32_t vs = body->term_value[ti];
                         if (vs >= 0 && vs < body->slot_count) {
                             int32_t vk = body->slot_kind[vs];
-                            if (vk != SLOT_I32 && vk != SLOT_I64 && vk > 0) {
+                            if (vk != SLOT_I32 && vk != SLOT_I64 && vk != SLOT_PTR && vk > 0) {
                                 skip_body = true;
                                 break;
                             }
@@ -17962,14 +17971,13 @@ static int32_t cold_compile_one_import_direct(Symbols *symbols, const char *path
             function_bodies[(int32_t)symbol_index] = (BodyIR *)body;
             compiled++;
             /* Map to qualified index if available */
-            if (fn_pos < COLD_IMPORT_FN_MAP_CAP && qual_indices[fn_pos] >= 0) {
-                int32_t qi = qual_indices[fn_pos];
+            if (saved_fn_pos < COLD_IMPORT_FN_MAP_CAP && qual_indices[saved_fn_pos] >= 0) {
+                int32_t qi = qual_indices[saved_fn_pos];
                 if (qi != (int32_t)symbol_index && qi < body_cap) {
                     function_bodies[qi] = (BodyIR *)body;
                     compiled++;
                 }
             }
-            fn_pos++;
         } else {
             parser_line(&parser);
         }
