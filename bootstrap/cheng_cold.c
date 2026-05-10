@@ -16790,6 +16790,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         codegen_cstring_from_slot(code, body, a, 7, 55);
         code_emit(code, a64_add_imm(R0, 7, 0, true));
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
+        code_emit(code, a64_movz_x(R2, 0644, 0));
         code_emit(code, a64_movz_x(16, 5, 0));
         code_emit(code, a64_svc(0x80));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);

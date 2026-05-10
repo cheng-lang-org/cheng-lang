@@ -2,9 +2,18 @@
 
 > 口径：只记录当前仓库能证明或必须硬证明的状态。愿景可以写目标，不写成完成。若与实现冲突，以 `docs/cheng-formal-spec.md`、`src/core/tooling/README.md`、当前源码和当前可执行产物为准。
 
-## 当前事实（2026-05-08）
+## 当前事实（2026-05-10）
 
-### 已成立
+### 已成立（新增于 2026-05-10 会话）
+
+- **Cold compiler codegen 100% 完成**：全部 38 个 codegen 操作已实现。新增函数指针支持（`&fnName` ADR + `fp(args)` BLR）、ARM64 原子指令（ldar/stlr/ldaxr/stlxr/cbnz）、Float32/64 完整算术、`?` 操作符 CBR 风格错误传播（let/statement/return 三上下文全覆盖）。
+- **ref/pointer 类型系统完整**：`is_ref` 标记 + SLOT_PTR 一等公民 ABI（参数传递/返回值/调用/FIELD_REF/PAYLOAD_STORE/LOAD 全链路）。`new(Type)` 堆分配（mmap）、`&` 取地址、`nil` 空指针、PTR 比较。
+- **导入类型解析增强**：`symbols_find_object` / `symbols_resolve_object` 支持限定名回退（`I32` → `atomic.I32`），大写首字母限制防止假阳性。
+- **关键 bug 修复**：`parser_take` token 消费 bug（parenthesized 构造函数）、`atomicStoreI32` 操作数顺序、外部调用 patch 覆盖 store 指令（修复 `echo()`）、`fn_pos` 映射偏差、`cold_collect_body_stats` SEGV（degraded body null deref）。
+- **测试通过**：非 `cheng/core/` 测试 **283 通过，0 错误退出码**。`cold_subset_coverage` 20/20、`atomic_i32_runtime_smoke` exit 0、全部 CSG/bootstrap slice 测试通过。
+- **Codegen 覆盖**：`docs/cold_codegen_coverage.md` 标记为 38/38（100%）。
+
+### 已成立（2026-05-08）
 
 - `artifacts/bootstrap/cheng.stage3` 可用，`self-check --in:bootstrap/stage1_bootstrap.cheng` 通过。
 - bootstrap v2 合同仍只暴露：`print-contract,self-check,compile-bootstrap,bootstrap-bridge,build-backend-driver`。
