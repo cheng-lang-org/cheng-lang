@@ -79,3 +79,34 @@ W void cheng_host_puts_runtime(const char* s) { puts(s); }
 W void cheng_program_support_host_trace(void) {}
 W void cheng_host_bytes_copy(void* d, const void* s, size_t n) { memcpy(d,s,n); }
 W void* cheng_host_ptr_plus(void* p, size_t off) { return (char*)p + off; }
+/* Runtime entry points needed by every Cheng program */
+W void __cheng_setCmdLine(int argc, const char** argv) {}
+W void cheng_debug_profile_flush_from_argv0(void) {}
+W void cheng_native_register_line_map_from_argv0(void) {}
+W void cheng_panic_cstring_and_exit(const char* msg) { exit(1); }
+/* Additional commonly-needed symbols */
+W int cheng_cstrlen(const char* s) { return (int)strlen(s); }
+W void cheng_strutils_join_bridge(void) {}
+W void cheng_str_to_cstring_temp_bridge(void) {}
+W void driver_c_str_from_utf8_copy_bridge(void) {}
+W void driver_c_get_env_bridge(void) {}
+W void* cheng_spawn(void* fn, void* arg) { return 0; }
+W int cheng_thread_parallelism(void) { return 1; }
+W void cheng_mm_diag_reset(void) {}
+W void cheng_mem_retain(void* p) {}
+W void cheng_mem_release(void* p) {}
+W int paramCount(void) { return 0; }
+W const char* paramStr(int i) { return ""; }
+W void* load_ptr(void** p) { return p ? *p : 0; }
+W void store_ptr(void** p, void* v) { if(p) *p = v; }
+W void* ptr_add(void* p, int off) { return (char*)p + off; }
+W void copyMem(void* d, const void* s, unsigned long n) { memcpy(d,s,n); }
+W void setMem(void* d, int v, unsigned long n) { memset(d,v,n); }
+W int cheng_os_is_absolute_bridge(const char* p) { return *p == '/'; }
+W char* cheng_os_join_path_bridge(const char* a, const char* b) { static char buf[4096]; snprintf(buf,sizeof(buf),"%s/%s",a,b); return buf; }
+W int cheng_os_file_exists_bridge(const char* p) { return access(p,F_OK)==0; }
+W int cheng_os_dir_exists_bridge(const char* p) { struct stat st; return stat(p,&st)==0 && S_ISDIR(st.st_mode); }
+W long cheng_os_file_size_bridge(const char* p) { struct stat st; return stat(p,&st)==0 ? st.st_size : 0; }
+W int driver_c_create_dir_all_bridge(const char* p) { return mkdir(p,0755); }
+W int driver_c_write_text_file_bridge(const char* p, const char* c) { FILE* f=fopen(p,"w"); if(!f)return 0; fputs(c,f); fclose(f); return 1; }
+W char* cheng_read_file_bridge(const char* p) { static char buf[65536]; FILE* f=fopen(p,"r"); if(!f)return 0; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f); buf[n]=0; return buf; }
