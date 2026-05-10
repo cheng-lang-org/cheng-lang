@@ -110,3 +110,15 @@ W long cheng_os_file_size_bridge(const char* p) { struct stat st; return stat(p,
 W int driver_c_create_dir_all_bridge(const char* p) { return mkdir(p,0755); }
 W int driver_c_write_text_file_bridge(const char* p, const char* c) { FILE* f=fopen(p,"w"); if(!f)return 0; fputs(c,f); fclose(f); return 1; }
 W char* cheng_read_file_bridge(const char* p) { static char buf[65536]; FILE* f=fopen(p,"r"); if(!f)return 0; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f); buf[n]=0; return buf; }
+/* Atomic bridge functions for std/atomic provider.
+   These use GCC __atomic builtins which generate proper ARM64 atomic instructions
+   (ldar/stlr/ldaxr/stlxr) matching the cold compiler's inline codegen. */
+W int cheng_atomic_cas_i32(void* p, int expect, int desired) {
+    return __sync_bool_compare_and_swap((volatile int*)p, expect, desired);
+}
+W void cheng_atomic_store_i32(void* p, int val) {
+    __atomic_store_n((int*)p, val, __ATOMIC_SEQ_CST);
+}
+W int cheng_atomic_load_i32(void* p) {
+    return __atomic_load_n((int*)p, __ATOMIC_SEQ_CST);
+}
