@@ -174,9 +174,8 @@ fn arm_add_sp_16(): int32 = return 0x910043FF
 fn arm_ldp_post(): int32 = return 0xA8C17BFD
 fn arm_nop(): int32 = return 0xD503201F
 
-// Write .o template with dynamic code size (in bytes)
+// Write .o template with 128-byte code section
 fn write_obj(buf: int64, code: int64, code_words: int32) =
-    let code_bytes: int32 = code_words * 4
     var i: int32 = 0
     while i < 74:
         ptrStoreI32(buf + int64(i * 4), 0)
@@ -190,9 +189,9 @@ fn write_obj(buf: int64, code: int64, code_words: int32) =
     ptrStoreI32(buf + int64(36), 0x00000098)
     ptrStoreI32(buf + int64(40), 0x45545F5F)
     ptrStoreI32(buf + int64(44), 0x00005458)
-    ptrStoreI32(buf + int64(64), code_bytes)
+    ptrStoreI32(buf + int64(64), 0x00000080)
     ptrStoreI32(buf + int64(72), 0x000000E8)
-    ptrStoreI32(buf + int64(80), code_bytes)
+    ptrStoreI32(buf + int64(80), 0x00000080)
     ptrStoreI32(buf + int64(88), 0x00000007)
     ptrStoreI32(buf + int64(92), 0x00000007)
     ptrStoreI32(buf + int64(96), 0x00000001)
@@ -200,7 +199,7 @@ fn write_obj(buf: int64, code: int64, code_words: int32) =
     ptrStoreI32(buf + int64(108), 0x00007478)
     ptrStoreI32(buf + int64(120), 0x45545F5F)
     ptrStoreI32(buf + int64(124), 0x00005458)
-    ptrStoreI32(buf + int64(144), code_bytes)
+    ptrStoreI32(buf + int64(144), 0x00000080)
     ptrStoreI32(buf + int64(152), 0x000000E8)
     ptrStoreI32(buf + int64(156), 0x00000002)
     ptrStoreI32(buf + int64(168), 0x80000400)
@@ -211,20 +210,20 @@ fn write_obj(buf: int64, code: int64, code_words: int32) =
     ptrStoreI32(buf + int64(200), 0x000E0000)
     ptrStoreI32(buf + int64(208), 0x00000002)
     ptrStoreI32(buf + int64(212), 0x00000018)
-    ptrStoreI32(buf + int64(216), 0x00000110)
+    ptrStoreI32(buf + int64(216), 360)
     ptrStoreI32(buf + int64(220), 0x00000001)
-    ptrStoreI32(buf + int64(224), 0x00000120)
+    ptrStoreI32(buf + int64(224), 376)
     ptrStoreI32(buf + int64(228), 0x00000008)
-    // Copy code words into code section (offset 232, max 10 words)
+    // Copy code words into code section (offset 232)
     var ci: int32 = 0
     while ci < code_words:
         let word: int32 = ptrLoadI32(code + int64(ci * 4))
         ptrStoreI32(buf + int64(232 + ci * 4), word)
         ci = ci + 1
-    ptrStoreI32(buf + int64(272), 0x00000001)
-    ptrStoreI32(buf + int64(276), 0x0000010F)
-    ptrStoreI32(buf + int64(288), 0x616D5F00)
-    ptrStoreI32(buf + int64(292), 0x00006E69)
+    ptrStoreI32(buf + int64(360), 0x00000001)
+    ptrStoreI32(buf + int64(364), 0x0000010F)
+    ptrStoreI32(buf + int64(376), 0x616D5F00)
+    ptrStoreI32(buf + int64(380), 0x00006E69)
 
 // Emit one ARM64 instruction word to code buffer
 fn emit(code: int64, count: int32, word: int32): int32 =
@@ -313,7 +312,23 @@ fn compile_body(buf: int32[1024], spans: int64, start: int32, total: int32, code
                 let rk: int32 = tok_kind(spans, i + 1)
                 if rk == 1:
                     let vr: int32 = var_find(buf, sym, sym_count, tok_start(spans, i + 1), tok_len(spans, i + 1))
-                    if vr >= 0: count = emit(code, count, arm_mov_reg(0, vr))
+                    if vr >= 0:
+                        count = emit(code, count, arm_mov_reg(0, vr))
+                    else:
+                        // Not a var — check if it's a fn call: ident(digit,digit)
+                        if i + 5 < total:
+                            if tok_is_punct(buf, spans, i + 2, 40) != 0:
+                                if tok_kind(spans, i + 3) == 2:
+                                    if tok_is_punct(buf, spans, i + 4, 44) != 0:
+                                        if tok_kind(spans, i + 5) == 2:
+                                            if tok_is_punct(buf, spans, i + 6, 41) != 0:
+                                                let fw: int32 = fn_find(buf, fsym, fn_count, tok_start(spans, i+1), tok_len(spans, i+1))
+                                                if fw >= 0:
+                                                    count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i+3)))
+                                                    count = emit(code, count, arm_movz_imm(1, parse_int(buf, spans, i+5)))
+                                                    let bl_off: int32 = fw - count
+                                                    count = emit(code, count, arm_bl(bl_off))
+                                                    i = i + 6
                 if rk == 2:
                     count = emit(code, count, arm_movz_imm(0, parse_int(buf, spans, i + 1)))
             // No ret here — epilogue handles return
@@ -383,7 +398,7 @@ fn main(): int32 =
     write_obj(out, code, code_words)
     let out_fd: int32 = cold_open("/tmp/compiler_out.o", 1537)
     if out_fd < 0: return 9
-    let wn: int32 = cold_write_raw(out_fd, out, 296)
+    let wn: int32 = cold_write_raw(out_fd, out, 384)
     let _: int32 = cold_close(out_fd)
-    if wn == 296: return 42
+    if wn == 384: return 42
     return wn
