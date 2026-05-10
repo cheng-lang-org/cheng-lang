@@ -5300,8 +5300,10 @@ static ObjectDef *symbols_find_object(Symbols *symbols, Span name) {
         }
     }
     } /* close has_bracket check */
-    /* Fallback for unqualified names: search for *.name suffix (imported objects) */
-    {
+    /* Fallback for unqualified names: search for *.name suffix (imported objects).
+       Only match names starting with uppercase (type names), to avoid false
+       positives on local variables / field names. */
+    if (name.len > 0 && name.ptr[0] >= 'A' && name.ptr[0] <= 'Z') {
         for (int32_t i = 0; i < symbols->object_count; i++) {
             ObjectDef *co = &symbols->objects[i];
             if (co->name.len > name.len + 1 &&
