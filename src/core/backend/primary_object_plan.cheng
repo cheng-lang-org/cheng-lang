@@ -596,6 +596,10 @@ fn PrimaryBodyIrTypeShapeFromText(typedIr: texpr.TypedExprIr,
                                           layoutAlign,
                                           layoutFieldCount):
         return
+    if typeKind == coreir.LocalPtrTag:
+        sizeBytes = 8
+        alignBytes = 8
+        return
     if layoutSize <= 0 || layoutAlign <= 0:
         return
     sizeBytes = layoutSize
@@ -1727,7 +1731,79 @@ fn PrimaryBodyIrLocalInitValueSlot(bodyIR: var coreir.BodyIR,
                                                targetTypeKind)
 
 fn PrimaryBodyIrDirectExternalCallTarget(symbolRaw: str): bool =
-    return symbolRaw == "driver_c_str_from_utf8_copy_bridge"
+    return symbolRaw == "driver_c_str_from_utf8_copy_bridge" ||
+           symbolRaw == "cheng_malloc" ||
+           symbolRaw == "setMem"
+
+fn PrimaryBodyIrAppendNewObjectValue(bodyIR: var coreir.BodyIR,
+                                      slotNames: var str[],
+                                      typedIr: texpr.TypedExprIr,
+                                      sourcePath: str,
+                                      newExprTextRaw: str,
+                                      targetSlot: int32,
+                                      callOrdinal: var int32): bool =
+    if targetSlot < 0 ||
+       targetSlot >= bodyIR.localSlots.len ||
+       PrimaryBodyIrSlotType(bodyIR, targetSlot) != coreir.LocalPtrTag:
+        return false
+    let newTypeText = PrimaryBodyIrWholeCallInnerForHead(newExprTextRaw, "new")
+    if newTypeText == "":
+        return false
+    var allocSize: int32
+    var allocAlign: int32
+    var fieldCount: int32
+    if !texpr.TypedExprIrLookupTypeLayout(typedIr,
+                                          sourcePath,
+                                          newTypeText,
+                                          allocSize,
+                                          allocAlign,
+                                          fieldCount):
+        return false
+    if allocSize <= 0 || allocAlign <= 0:
+        return false
+    let sizeSlot = PrimaryBodyIrLocalInitConstSlot(bodyIR,
+                                                   slotNames,
+                                                   Fmt"{bodyIR.localSlots[targetSlot].name}#new_size",
+                                                   coreir.LocalI32Tag,
+                                                   allocSize)
+    let zeroSlot = PrimaryBodyIrLocalInitConstSlot(bodyIR,
+                                                   slotNames,
+                                                   Fmt"{bodyIR.localSlots[targetSlot].name}#new_zero",
+                                                   coreir.LocalI32Tag,
+                                                   0)
+    if sizeSlot < 0 || zeroSlot < 0:
+        return false
+    var allocCall: coreir.CallOp
+    allocCall.targetSymbol = "cheng_malloc"
+    allocCall.resultSlot = targetSlot
+    allocCall.resultPassKind = coreir.BodyCallPassStackValueTag
+    add(allocCall.argSlots, sizeSlot)
+    add(allocCall.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(bodyIR.callSequence, allocCall)
+    var allocOp: coreir.BodyOp
+    allocOp.kind = coreir.BodyOpCallTag
+    allocOp.target = targetSlot
+    add(allocOp.operands, callOrdinal)
+    add(bodyIR.ops, allocOp)
+    callOrdinal = callOrdinal + 1
+    var zeroCall: coreir.CallOp
+    zeroCall.targetSymbol = "setMem"
+    zeroCall.resultSlot = -1
+    zeroCall.resultPassKind = coreir.BodyCallPassStackValueTag
+    add(zeroCall.argSlots, targetSlot)
+    add(zeroCall.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(zeroCall.argSlots, zeroSlot)
+    add(zeroCall.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(zeroCall.argSlots, sizeSlot)
+    add(zeroCall.argPassKinds, coreir.BodyCallPassStackValueTag)
+    add(bodyIR.callSequence, zeroCall)
+    var zeroOp: coreir.BodyOp
+    zeroOp.kind = coreir.BodyOpCallTag
+    zeroOp.target = -1
+    add(zeroOp.operands, callOrdinal)
+    add(bodyIR.ops, zeroOp)
+    callOrdinal = callOrdinal + 1
+    return true
 
 fn PrimaryBodyIrAppendStringLiteralValue(bodyIR: var coreir.BodyIR,
                                          slotNames: var str[],
@@ -1780,6 +1856,15 @@ fn PrimaryBodyIrAppendLocalDeclInitializer(bodyIR: var coreir.BodyIR,
     if rhsText == "" || targetSlot < 0 || targetSlot >= bodyIR.localSlots.len:
         return false
     let targetTypeKind = PrimaryBodyIrSlotType(bodyIR, targetSlot)
+    if targetTypeKind == coreir.LocalPtrTag &&
+       PrimaryBodyIrWholeCallInnerForHead(rhsText, "new") != "":
+        return PrimaryBodyIrAppendNewObjectValue(bodyIR,
+                                                 slotNames,
+                                                 typedIr,
+                                                 stmt.sourcePath,
+                                                 rhsText,
+                                                 targetSlot,
+                                                 callOrdinal)
     if targetTypeKind == coreir.LocalStrTag &&
        PrimaryBodyIrTextIsStringLiteral(rhsText):
         return PrimaryBodyIrAppendStringLiteralValue(bodyIR,
