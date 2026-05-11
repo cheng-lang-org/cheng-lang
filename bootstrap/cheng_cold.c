@@ -19221,17 +19221,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
         if (dup) continue;
         func_offsets[name_count] = symbol_offset[i];
-        /* Rename "main" to "cheng_program_argv_entry" to avoid _main
-           conflicts with the runtime CRT entry point. */
-        const char *name_ptr = NULL;
-        int32_t name_len = 0;
-        if (nm.len == 4 && memcmp(nm.ptr, "main", 4) == 0) {
-            name_ptr = "cheng_program_argv_entry";
-            name_len = 25;
-        } else {
-            name_ptr = (const char *)nm.ptr;
-            name_len = nm.len;
-        }
+        const char *name_ptr = (const char *)nm.ptr;
+        int32_t name_len = nm.len;
         char *nc = arena_alloc(arena, (size_t)name_len + 1);
         memcpy(nc, name_ptr, (size_t)name_len);
         nc[name_len] = '\0';
