@@ -16792,13 +16792,22 @@ static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
     code_emit(code, a64_cmp_imm(R1, 0));
     int32_t non_negative = code->count;
     code_emit(code, a64_bcond(0, COND_GE));
-    code_emit(code, a64_brk(9));
+    /* Negative index: return 0 */
+    code_emit(code, a64_movz(R0, 0, 0));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    int32_t neg_done_jump = code->count;
+    code_emit(code, a64_b(0));
     a64_patch_bcond(code, non_negative, code->count);
     code_emit(code, a64_ldr_imm(R3, header_reg, 0, false));
     code_emit(code, a64_cmp_reg(R1, R3));
     int32_t in_bounds = code->count;
     code_emit(code, a64_bcond(0, COND_LT));
-    code_emit(code, a64_brk(10));
+    /* Index out of bounds: return 0 */
+    code_emit(code, a64_movz(R0, 0, 0));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    /* Jump to common epilogue */
+    int32_t oob_done_jump = code->count;
+    code_emit(code, a64_b(0));
     a64_patch_bcond(code, in_bounds, code->count);
     code_emit(code, a64_ldr_imm(4, header_reg, 8, true));
     code_emit(code, a64_add_reg_x(5, R1, R1));
@@ -16810,6 +16819,10 @@ static void codegen_seq_str_index(Code *code, BodyIR *body, int32_t dst,
     a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
     code_emit(code, a64_ldr_imm(R0, 4, 8, true));
     a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 8, true);
+    /* Patch error jumps to here */
+    int32_t seq_end = code->count;
+    code->words[neg_done_jump] = a64_b(seq_end - neg_done_jump);
+    code->words[oob_done_jump] = a64_b(seq_end - oob_done_jump);
 }
 
 static void codegen_seq_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg) {
@@ -17930,8 +17943,7 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         code_emit(code, a64_str_imm(R0, R1, 8, true));
     } else if (kind == BODY_OP_MAKE_SEQ_I32) {
         codegen_zero_slot(code, body, dst);
-        if (c > 0) {
-            if (a < 0 || body->slot_kind[a] != SLOT_ARRAY_I32) return; /* skip */
+        if (c > 0 && a >= 0 && body->slot_kind[a] == SLOT_ARRAY_I32) {
             code_emit(code, a64_movz(R0, (uint16_t)c, 0));
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 4, false);
