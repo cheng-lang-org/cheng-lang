@@ -4231,39 +4231,9 @@ static int cold_cmd_build_backend_driver(int argc, char **argv, const char *self
         report_flag,
     };
     int compile_rc = cold_cmd_compile_bootstrap(5, compile_argv, self_path);
-    /* Accept non-zero rc: cheng_seed link may fail but .o files are produced */
-    (void)compile_rc;
-
-    /* Link .o files with cc as fallback for cheng_seed link failure */
-    {
-        char build_base[PATH_MAX];
-        char primary_path[PATH_MAX];
-        char link_cmd[PATH_MAX * 16];
-        snprintf(build_base, sizeof(build_base), "%s", out_path);
-        /* Find the parent build directory where .o files reside */
-        char *last_slash = strrchr(build_base, '/');
-        if (last_slash) {
-            size_t base_len = (size_t)(last_slash - build_base);
-            /* Look for primary.o in sibling pid-* directories */
-            /* Use the dispatch_path parent as build dir hint */
-            char build_hint[PATH_MAX];
-            snprintf(build_hint, sizeof(build_hint), "%.*s", (int)base_len, build_base);
-            /* Find .o files in build dir or pid-* subdirs */
-            snprintf(link_cmd, sizeof(link_cmd),
-                "for DIR in $(ls -dt %s/pid-*/ %s/ 2>/dev/null); do "
-                "  PRIMARY=$(ls \"$DIR\"cheng.build_candidate.primary.o 2>/dev/null | head -1); "
-                "  if [ -n \"$PRIMARY\" ]; then "
-                "    PROVIDERS=$(ls \"$DIR\"cheng.build_candidate.provider.*.o 2>/dev/null); "
-                "    cc -o %s $PRIMARY $PROVIDERS 2>/dev/null && exit 0; "
-                "    break; "
-                "  fi; "
-                "done; exit 1",
-                build_hint, build_hint, out_path);
-            int link_rc = system(link_cmd);
-            if (link_rc == 0) {
-                fputs("cold_cc_link=1\n", stdout);
-            }
-        }
+    if (compile_rc != 0) {
+        fprintf(stderr, "[cheng_cold] backend driver compile failed\n");
+        return 1;
     }
 
     if (!span_eq(cold_contract_get(&contract, "target"), "arm64-apple-darwin")) {
@@ -20484,10 +20454,11 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
                 code_emit(shared, a64_ret());
             } else {
                 /* Composite returns: zero the sret buffer */
-                if (body->sret_slot >= 0) {
-                    a64_emit_str_sp_off(shared, R0, body->slot_offset[body->sret_slot], true);
+                int32_t sret = body->sret_slot;
+                if (sret >= 0) {
+                    a64_emit_ldr_sp_off(shared, R0, body->slot_offset[sret], true);
+                    codegen_zero_slot(shared, body, sret);
                 }
-                codegen_zero_slot(shared, body, 0);
                 code_emit(shared, a64_ret());
             }
             continue;

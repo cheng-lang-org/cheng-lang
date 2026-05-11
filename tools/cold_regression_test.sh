@@ -196,6 +196,39 @@ else
 fi
 assert "dispatch_min_self_dispatch_status_marker" 1 "$ACT"
 
+rm -rf /tmp/ct_bd
+mkdir -p /tmp/ct_bd
+$COLD build-backend-driver --out:/tmp/ct_bd/cheng \
+    --report-out:/tmp/ct_bd/report.txt --map-out:/tmp/ct_bd/map.txt \
+    --index-out:/tmp/ct_bd/index.txt >/tmp/ct_bd/stdout.txt 2>/tmp/ct_bd/stderr.txt
+ACT=$?
+assert "build_backend_driver_cold_linkerless" 0 "$ACT"
+if [ -x /tmp/ct_bd/cheng ] &&
+   grep -q '^real_backend_codegen=1$' /tmp/ct_bd/report.txt 2>/dev/null &&
+   grep -q '^system_link_exec=1$' /tmp/ct_bd/report.txt 2>/dev/null &&
+   grep -q '^system_link_exec_scope=cold_subset_direct_macho$' /tmp/ct_bd/report.txt 2>/dev/null &&
+   ! grep -q 'cold_cc_link' /tmp/ct_bd/stdout.txt /tmp/ct_bd/report.txt /tmp/ct_bd/map.txt 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "build_backend_driver_no_cc_fallback" 1 "$ACT"
+if [ -x /tmp/ct_bd/cheng ]; then
+    /tmp/ct_bd/cheng status --root:. --in:src/core/tooling/backend_driver_dispatch_min.cheng \
+        --out:/tmp/ct_bd/status.out >/tmp/ct_bd/status.stdout 2>/tmp/ct_bd/status.stderr
+    ACT=$?
+else
+    ACT="STATUS_FAILED"
+fi
+assert "build_backend_driver_status" 0 "$ACT"
+if grep -q 'linkerless_image=1' /tmp/ct_bd/status.stdout 2>/dev/null &&
+   grep -q 'system_link=0' /tmp/ct_bd/status.stdout 2>/dev/null; then
+    ACT=1
+else
+    ACT=0
+fi
+assert "build_backend_driver_status_marker" 1 "$ACT"
+
 # 4: for_range
 cat > /tmp/ct_for.cheng << 'EOF'
 fn main(): int32 =
