@@ -274,8 +274,10 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
 
 /* -- Mach-O object file (.o) writer (MH_OBJECT) -- */
 
+#define N_UNDF 0x00
 #define N_SECT 0x0E
 #define N_EXT  0x01
+#define ARM64_RELOC_BRANCH26 2
 
 typedef struct {
     uint32_t n_strx;
@@ -285,22 +287,34 @@ typedef struct {
     uint64_t n_value;
 } nlist_64_t;
 
+typedef struct {
+    int32_t  r_address;
+    uint32_t r_symbolnum : 24;
+    uint32_t r_pcrel     : 1;
+    uint32_t r_length    : 2;
+    uint32_t r_extern    : 1;
+    uint32_t r_type      : 4;
+} relocation_info_t;
+
 static bool macho_write_object(const char *path,
                                const uint32_t *code, int32_t code_words,
                                const char **names, const int32_t *offsets,
-                               int32_t name_count) {
+                               int32_t name_count,
+                               int32_t local_count,
+                               const int32_t *reloc_offsets,
+                               const int32_t *reloc_symbols,
+                               int32_t reloc_count) {
     int32_t code_sz = code_words * 4;
 
     /* Build string table first to know its size */
     char strtab[65536];
     int32_t str_off = 1; /* first byte is \0 */
-    int32_t name_stroff[128];
-    for (int32_t i = 0; i < name_count && i < 128; i++) {
-        if (i>=85 && i<110) fprintf(stderr, "[macho] name[%d]=%s\n", i, names[i] ? names[i] : "(null)");
+    int32_t name_stroff[256];
+    for (int32_t i = 0; i < name_count && i < 256; i++) {
         name_stroff[i] = str_off;
         int32_t nl = (int32_t)strlen(names[i]);
         if (str_off + nl + 2 < (int32_t)sizeof(strtab)) {
-            strtab[str_off++] = '_';
+            if (names[i][0] != '_') strtab[str_off++] = '_';
             memcpy(strtab + str_off, names[i], nl);
             str_off += nl;
             strtab[str_off++] = '\0';
@@ -309,26 +323,50 @@ static bool macho_write_object(const char *path,
     strtab[str_off++] = '\0';
 
     /* Build nlist entries */
-    nlist_64_t syms[128];
-    int32_t nsyms = name_count > 128 ? 128 : name_count;
+    nlist_64_t syms[256];
+    int32_t nsyms = name_count > 256 ? 256 : name_count;
     for (int32_t i = 0; i < nsyms; i++) {
         syms[i].n_strx  = name_stroff[i];
-        syms[i].n_type  = N_SECT | N_EXT;
-        syms[i].n_sect  = 1; /* section 1 = __text */
+        if (offsets[i] < 0) {
+            syms[i].n_type  = N_UNDF | N_EXT;
+            syms[i].n_sect  = 0;
+            syms[i].n_value = 0;
+        } else if (i < local_count) {
+            syms[i].n_type  = N_SECT;
+            syms[i].n_sect  = 1;
+            syms[i].n_value = (uint64_t)(offsets[i] * 4);
+        } else {
+            syms[i].n_type  = N_SECT | N_EXT;
+            syms[i].n_sect  = 1;
+            syms[i].n_value = (uint64_t)(offsets[i] * 4);
+        }
         syms[i].n_desc  = 0;
-        syms[i].n_value = (uint64_t)(offsets[i] * 4);
     }
     int32_t sym_size = nsyms * (int32_t)sizeof(nlist_64_t);
 
+    /* Build relocation entries */
+    relocation_info_t relocs[256];
+    int32_t nreloc = reloc_count > 256 ? 256 : reloc_count;
+    for (int32_t i = 0; i < nreloc; i++) {
+        relocs[i].r_address    = reloc_offsets[i];
+        relocs[i].r_symbolnum  = (uint32_t)reloc_symbols[i];
+        relocs[i].r_pcrel      = 1;
+        relocs[i].r_length     = 2;  /* 4-byte instruction */
+        relocs[i].r_extern     = 1;
+        relocs[i].r_type       = ARM64_RELOC_BRANCH26;
+    }
+    int32_t reloc_size = nreloc * (int32_t)sizeof(relocation_info_t);
+
     /* Layout */
     int32_t hdr_sz = 32;
-    int32_t seg_cmd_sz = 72 + 80;        /* LC_SEGMENT_64 with one section */
-    int32_t build_ver_cmd_sz = 24;        /* LC_BUILD_VERSION */
-    int32_t symtab_cmd_sz = 24;           /* LC_SYMTAB */
+    int32_t seg_cmd_sz = 72 + 80;
+    int32_t build_ver_cmd_sz = 24;
+    int32_t symtab_cmd_sz = 24;
     int32_t cmd_sz = seg_cmd_sz + build_ver_cmd_sz + symtab_cmd_sz;
     int32_t ncmds = 3;
     int32_t code_off = hdr_sz + cmd_sz;
-    int32_t sym_off = code_off + code_sz;
+    int32_t reloc_off = code_off + code_sz;
+    int32_t sym_off = reloc_off + reloc_size;
     int32_t str_off_file = sym_off + sym_size;
     int32_t total_sz = str_off_file + str_off;
 
@@ -347,7 +385,7 @@ static bool macho_write_object(const char *path,
     w[7] = 0;
     int32_t pos = hdr_sz;
 
-    /* LC_SEGMENT_64 (72 bytes) + one section (80 bytes) */
+    /* LC_SEGMENT_64 + one section */
     uint32_t *seg = (uint32_t *)(buf + pos);
     seg[0]  = LC_SEGMENT64;
     seg[1]  = seg_cmd_sz;
@@ -359,7 +397,7 @@ static bool macho_write_object(const char *path,
     seg[14] = 7; seg[15] = 7;
     seg[16] = 1; /* nsects */
     seg[17] = 0;
-    /* Section header follows immediately after segment command */
+    /* Section header */
     uint32_t *sec = (uint32_t *)(buf + pos + 72);
     macho_segname(buf + pos + 72, "__text");
     macho_segname(buf + pos + 88, "__TEXT");
@@ -367,25 +405,25 @@ static bool macho_write_object(const char *path,
     sec[10] = (uint32_t)code_sz; sec[11] = 0;
     sec[12] = (uint32_t)code_off;
     sec[13] = 2; /* align */
-    sec[14] = 0; /* reloff */
-    sec[15] = 0; /* nreloc */
-    sec[16] = 0x80000400; /* flags: S_REGULAR | S_ATTR_SOME_INSTRUCTIONS */
-    sec[17] = 0; /* reserved1 */
-    sec[18] = 0; /* reserved2 */
-    sec[19] = 0; /* reserved3 if present */
+    sec[14] = (uint32_t)reloc_off;
+    sec[15] = nreloc;
+    sec[16] = 0x80000400;
+    sec[17] = 0;
+    sec[18] = 0;
+    sec[19] = 0;
     pos += seg_cmd_sz;
 
-    /* LC_BUILD_VERSION (24 bytes) */
+    /* LC_BUILD_VERSION */
     uint32_t *bv = (uint32_t *)(buf + pos);
-    bv[0] = 0x32; /* LC_BUILD_VERSION */
+    bv[0] = 0x32;
     bv[1] = build_ver_cmd_sz;
-    bv[2] = 1;    /* PLATFORM_MACOS */
-    bv[3] = 0x000e0000; /* minos 14.0 */
-    bv[4] = 0x000e0000; /* sdk 14.0 */
-    bv[5] = 0;    /* ntools = 0 */
+    bv[2] = 1;
+    bv[3] = 0x000e0000;
+    bv[4] = 0x000e0000;
+    bv[5] = 0;
     pos += build_ver_cmd_sz;
 
-    /* LC_SYMTAB (24 bytes) */
+    /* LC_SYMTAB */
     uint32_t *st = (uint32_t *)(buf + pos);
     st[0] = LC_SYMTAB;
     st[1] = symtab_cmd_sz;
@@ -396,6 +434,8 @@ static bool macho_write_object(const char *path,
 
     /* Code */
     memcpy(buf + code_off, code, code_sz);
+    /* Relocations */
+    memcpy(buf + reloc_off, relocs, reloc_size);
     /* Symbol table */
     memcpy(buf + sym_off, syms, sym_size);
     /* String table */
