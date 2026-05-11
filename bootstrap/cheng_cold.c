@@ -4622,11 +4622,6 @@ enum {
     BODY_OP_I32_FROM_F64 = 112,
     BODY_OP_FN_ADDR = 113,
     BODY_OP_CALL_PTR = 114,
-    BODY_OP_GLOBAL_ADDR = 116,
-    BODY_OP_GLOBAL_LOAD = 117,
-    BODY_OP_GLOBAL_STORE = 118,
-    BODY_OP_PTR_LOAD_U8 = 119,
-    BODY_OP_PTR_STORE_U8 = 120,
 };
 
 enum {
@@ -5098,18 +5093,6 @@ typedef struct {
 } ConstDef;
 
 typedef struct {
-    Span name;
-    Span target;
-} TypeAlias;
-
-typedef struct {
-    Span name;
-    Span type;
-    int32_t kind;
-    int32_t size;
-} GlobalDef;
-
-typedef struct {
     FnDef *functions;
     int32_t function_count;
     int32_t function_cap;
@@ -5122,12 +5105,6 @@ typedef struct {
     ConstDef *consts;
     int32_t const_count;
     int32_t const_cap;
-    TypeAlias *aliases;
-    int32_t alias_count;
-    int32_t alias_cap;
-    GlobalDef *globals;
-    int32_t global_count;
-    int32_t global_cap;
     Arena *arena;
 } Symbols;
 
@@ -5145,8 +5122,6 @@ typedef struct {
 } Locals;
 
 static Span cold_arena_span_copy(Arena *arena, Span text);
-static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type);
-static int32_t cold_slot_size_from_type_with_symbols(Symbols *symbols, Span type, int32_t kind);
 
 static Symbols *symbols_new(Arena *arena) {
     Symbols *symbols = arena_alloc(arena, sizeof(Symbols));
@@ -5155,14 +5130,10 @@ static Symbols *symbols_new(Arena *arena) {
     symbols->type_cap = 16;
     symbols->object_cap = 16;
     symbols->const_cap = 16;
-    symbols->alias_cap = 16;
-    symbols->global_cap = 64;
     symbols->functions = arena_alloc(arena, (size_t)symbols->function_cap * sizeof(FnDef));
     symbols->types = arena_alloc(arena, (size_t)symbols->type_cap * sizeof(TypeDef));
     symbols->objects = arena_alloc(arena, (size_t)symbols->object_cap * sizeof(ObjectDef));
     symbols->consts = arena_alloc(arena, (size_t)symbols->const_cap * sizeof(ConstDef));
-    symbols->aliases = arena_alloc(arena, (size_t)symbols->alias_cap * sizeof(TypeAlias));
-    symbols->globals = arena_alloc(arena, (size_t)symbols->global_cap * sizeof(GlobalDef));
     return symbols;
 }
 
@@ -5205,84 +5176,13 @@ static void symbols_add_str_const(Symbols *symbols, Span name, Span str_val) {
     constant->str_val = cold_arena_span_copy(symbols->arena, str_val);
 }
 
-static TypeAlias *symbols_find_alias(Symbols *symbols, Span name) {
-    name = span_trim(name);
-    for (int32_t i = 0; i < symbols->alias_count; i++) {
-        if (span_same(symbols->aliases[i].name, name)) return &symbols->aliases[i];
-    }
-    return 0;
-}
-
-static void symbols_add_alias(Symbols *symbols, Span name, Span target) {
-    name = span_trim(name);
-    target = span_trim(target);
-    if (name.len <= 0 || target.len <= 0) return;
-    TypeAlias *existing = symbols_find_alias(symbols, name);
-    if (existing) {
-        existing->target = cold_arena_span_copy(symbols->arena, target);
-        return;
-    }
-    if (symbols->alias_count >= symbols->alias_cap) {
-        int32_t next = symbols->alias_cap * 2;
-        TypeAlias *fresh = arena_alloc(symbols->arena, (size_t)next * sizeof(TypeAlias));
-        memcpy(fresh, symbols->aliases, (size_t)symbols->alias_count * sizeof(TypeAlias));
-        symbols->aliases = fresh;
-        symbols->alias_cap = next;
-    }
-    TypeAlias *alias = &symbols->aliases[symbols->alias_count++];
-    alias->name = cold_arena_span_copy(symbols->arena, name);
-    alias->target = cold_arena_span_copy(symbols->arena, target);
-}
-
-static GlobalDef *symbols_find_global(Symbols *symbols, Span name) {
-    name = span_trim(name);
-    for (int32_t i = 0; i < symbols->global_count; i++) {
-        if (span_same(symbols->globals[i].name, name)) return &symbols->globals[i];
-    }
-    return 0;
-}
-
-static int32_t symbols_global_index(Symbols *symbols, Span name) {
-    name = span_trim(name);
-    for (int32_t i = 0; i < symbols->global_count; i++) {
-        if (span_same(symbols->globals[i].name, name)) return i;
-    }
-    return -1;
-}
-
-static int32_t symbols_add_global(Symbols *symbols, Span name, Span type) {
-    name = span_trim(name);
-    type = span_trim(type);
-    int32_t existing = symbols_global_index(symbols, name);
-    if (existing >= 0) return existing;
-    if (symbols->global_count >= symbols->global_cap) {
-        int32_t next = symbols->global_cap * 2;
-        GlobalDef *fresh = arena_alloc(symbols->arena, (size_t)next * sizeof(GlobalDef));
-        memcpy(fresh, symbols->globals, (size_t)symbols->global_count * sizeof(GlobalDef));
-        symbols->globals = fresh;
-        symbols->global_cap = next;
-    }
-    int32_t kind = cold_slot_kind_from_type_with_symbols(symbols, type);
-    int32_t size = cold_slot_size_from_type_with_symbols(symbols, type, kind);
-    if (size <= 0) die("global variable has unknown size");
-    GlobalDef *global = &symbols->globals[symbols->global_count];
-    global->name = cold_arena_span_copy(symbols->arena, name);
-    global->type = cold_arena_span_copy(symbols->arena, type);
-    global->kind = kind;
-    global->size = size;
-    return symbols->global_count++;
-}
-
 static bool cold_fn_param_kind_can_refine(int32_t existing, int32_t fresh) {
     if (existing == fresh) return true;
     if (existing == SLOT_OPAQUE &&
-        (fresh == SLOT_OBJECT || fresh == SLOT_VARIANT || fresh == SLOT_SEQ_OPAQUE ||
-         fresh == SLOT_PTR)) return true;
+        (fresh == SLOT_OBJECT || fresh == SLOT_VARIANT || fresh == SLOT_SEQ_OPAQUE)) return true;
     if (existing == SLOT_OPAQUE_REF &&
         (fresh == SLOT_OBJECT_REF || fresh == SLOT_SEQ_I32_REF ||
-         fresh == SLOT_SEQ_STR_REF || fresh == SLOT_I32_REF || fresh == SLOT_STR_REF ||
-         fresh == SLOT_PTR)) return true;
-    if (existing == SLOT_VARIANT && fresh == SLOT_PTR) return true;
+         fresh == SLOT_SEQ_STR_REF || fresh == SLOT_I32_REF || fresh == SLOT_STR_REF)) return true;
     return false;
 }
 
@@ -5346,7 +5246,6 @@ static int32_t symbols_add_fn(Symbols *symbols, Span name, int32_t arity,
         symbols->function_cap = next;
     }
     FnDef *fn = &symbols->functions[symbols->function_count++];
-    memset(fn, 0, sizeof(*fn));
     fn->name = name;
     fn->arity = arity;
     for (int32_t i = 0; i < arity; i++) {
@@ -5801,84 +5700,12 @@ static bool cold_type_has_qualified_name(Span type) {
     return false;
 }
 
-static bool cold_type_has_pointer_suffix(Span type) {
-    type = cold_type_strip_var(type, 0);
-    type = span_trim(type);
-    if (span_eq(type, "ptr")) return true;
-    int32_t end = type.len - 1;
-    while (end >= 0 && (type.ptr[end] == ' ' || type.ptr[end] == '\t')) end--;
-    return end >= 0 && type.ptr[end] == '*';
-}
-
-static Span cold_resolve_alias_target(Symbols *symbols, Span type) {
-    type = cold_type_strip_var(type, 0);
-    type = span_trim(type);
-    for (int32_t depth = 0; symbols && depth < 32; depth++) {
-        TypeAlias *alias = symbols_find_alias(symbols, type);
-        if (!alias) break;
-        type = cold_type_strip_var(alias->target, 0);
-        type = span_trim(type);
-    }
-    return type;
-}
-
-static bool cold_type_is_pointer_like(Symbols *symbols, Span type) {
-    type = cold_type_strip_var(type, 0);
-    if (cold_type_has_pointer_suffix(type)) return true;
-    Span resolved = cold_resolve_alias_target(symbols, type);
-    return cold_type_has_pointer_suffix(resolved);
-}
-
-static Span cold_pointer_pointee_type(Symbols *symbols, Span type) {
-    type = cold_type_strip_var(type, 0);
-    type = span_trim(type);
-    Span resolved = cold_resolve_alias_target(symbols, type);
-    if (resolved.len > 0) type = resolved;
-    type = cold_type_strip_var(type, 0);
-    type = span_trim(type);
-    int32_t end = type.len - 1;
-    while (end >= 0 && (type.ptr[end] == ' ' || type.ptr[end] == '\t')) end--;
-    if (end < 0 || type.ptr[end] != '*') return (Span){0};
-    return span_trim(span_sub(type, 0, end));
-}
-
-static int32_t cold_pointer_pointee_memory_size(Symbols *symbols, Span pointee,
-                                                int32_t pointee_kind) {
-    pointee = span_trim(cold_type_strip_var(pointee, 0));
-    if (span_eq(pointee, "uint8") || span_eq(pointee, "char") ||
-        span_eq(pointee, "bool")) return 1;
-    if (span_eq(pointee, "uint16")) return 2;
-    if (pointee_kind == SLOT_I32) return 4;
-    if (pointee_kind == SLOT_I64 || pointee_kind == SLOT_PTR ||
-        pointee_kind == SLOT_OPAQUE || pointee_kind == SLOT_OPAQUE_REF ||
-        pointee_kind == SLOT_OBJECT_REF || pointee_kind == SLOT_STR_REF ||
-        pointee_kind == SLOT_SEQ_I32_REF || pointee_kind == SLOT_SEQ_STR_REF ||
-        pointee_kind == SLOT_I64_REF) return 8;
-    return cold_slot_size_from_type_with_symbols(symbols, pointee, pointee_kind);
-}
-
-static int32_t cold_sizeof_type(Symbols *symbols, Span type) {
-    type = span_trim(cold_type_strip_var(type, 0));
-    if (span_eq(type, "uint8") || span_eq(type, "char") ||
-        span_eq(type, "bool")) return 1;
-    if (span_eq(type, "uint16")) return 2;
-    if (span_eq(type, "int32") || span_eq(type, "int") ||
-        span_eq(type, "uint32") || span_eq(type, "i")) return 4;
-    if (span_eq(type, "int64") || span_eq(type, "uint64") ||
-        span_eq(type, "ptr") || cold_type_is_pointer_like(symbols, type)) return 8;
-    int32_t kind = cold_slot_kind_from_type_with_symbols(symbols, type);
-    int32_t size = cold_slot_size_from_type_with_symbols(symbols, type, kind);
-    if (size <= 0) die("sizeof type has unknown size");
-    return size;
-}
-
 static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type) {
     bool is_var = false;
     type = cold_type_strip_var(type, &is_var);
     int32_t array_len = 0;
     TypeDef *known_type = symbols ? symbols_resolve_type(symbols, type) : 0;
     bool known_enum = known_type && known_type->is_enum;
-    if (cold_type_is_pointer_like(symbols, type)) return is_var ? SLOT_OPAQUE_REF : SLOT_PTR;
     if (is_var && (span_eq(type, "int64") || span_eq(type, "uint64"))) return SLOT_I64_REF;
     if (is_var && (span_eq(type, "int32") || span_eq(type, "int") || span_eq(type, "i") ||
                    span_eq(type, "bool") || span_eq(type, "uint8") ||
@@ -5904,7 +5731,7 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (known_enum) return SLOT_I32;
     if (span_eq(type, "v")) return SLOT_VARIANT;
     if (span_eq(type, "o")) return SLOT_OPAQUE;
-    if (span_eq(type, "ptr")) return SLOT_PTR;
+    if (span_eq(type, "ptr")) return SLOT_OPAQUE;
     if (symbols) {
         ObjectDef *obj = symbols_resolve_object(symbols, type);
         if (obj) return obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
@@ -5921,8 +5748,7 @@ static int32_t cold_slot_size_from_type_with_symbols(Symbols *symbols, Span type
     bool is_var = false;
     type = cold_type_strip_var(type, &is_var);
     int32_t array_len = 0;
-    if (kind == SLOT_PTR ||
-        kind == SLOT_I32_REF || kind == SLOT_I64_REF ||
+    if (kind == SLOT_I32_REF || kind == SLOT_I64_REF ||
         kind == SLOT_SEQ_I32_REF || kind == SLOT_OBJECT_REF ||
         kind == SLOT_STR_REF || kind == SLOT_SEQ_STR_REF || kind == SLOT_OPAQUE_REF) return 8;
     if (kind == SLOT_ARRAY_I32) {
@@ -5997,7 +5823,6 @@ static TypeDef *symbols_resolve_type(Symbols *symbols, Span type_name) {
 
 static int32_t cold_return_kind_from_span(Symbols *symbols, Span ret) {
     ret = span_trim(ret);
-    if (cold_type_is_pointer_like(symbols, ret)) return SLOT_PTR;
     if (span_eq(ret, "str") || span_eq(ret, "cstring")) return SLOT_STR;
     if (span_eq(ret, "int64") || span_eq(ret, "uint64")) return SLOT_I64;
     if (span_eq(ret, "int32") || span_eq(ret, "int") || span_eq(ret, "i") ||
@@ -6012,7 +5837,7 @@ static int32_t cold_return_kind_from_span(Symbols *symbols, Span ret) {
     if (known_type) return known_type->is_enum ? SLOT_I32 : SLOT_VARIANT;
     ObjectDef *ret_obj = symbols_resolve_object(symbols, ret);
     if (ret_obj) return ret_obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
-    if (span_eq(ret, "ptr")) return SLOT_PTR;
+    if (span_eq(ret, "ptr")) return SLOT_OPAQUE;
     if (cold_type_has_qualified_name(ret)) return SLOT_OPAQUE;
     /* Treat unknown uppercase types and camelCase types as opaque objects */
     if (ret.len > 0 && ((ret.ptr[0] >= 'A' && ret.ptr[0] <= 'Z') ||
@@ -6373,7 +6198,6 @@ static Span parser_take_type_span(Parser *parser) {
 static int32_t cold_param_kind_from_type(Span type) {
     bool is_var = false;
     type = cold_type_strip_var(type, &is_var);
-    if (cold_type_has_pointer_suffix(type)) return is_var ? SLOT_OPAQUE_REF : SLOT_PTR;
     if (is_var && (span_eq(type, "int64") || span_eq(type, "uint64"))) return SLOT_I64_REF;
     if (is_var && (span_eq(type, "int32") || span_eq(type, "int") ||
                    span_eq(type, "bool") || span_eq(type, "uint8") ||
@@ -6397,7 +6221,7 @@ static int32_t cold_param_kind_from_type(Span type) {
     if (cold_parse_i32_seq_type(type)) return SLOT_SEQ_I32;
     if (cold_parse_str_seq_type(type)) return SLOT_SEQ_STR;
     if (cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE;
-    if (span_eq(type, "ptr")) return SLOT_PTR;
+    if (span_eq(type, "ptr")) return SLOT_OPAQUE;
     if (span_eq(type, "o") || cold_type_has_qualified_name(type)) return SLOT_OPAQUE;
     if (type.len > 1 && type.ptr[0] >= 'A' && type.ptr[0] <= 'Z') return SLOT_VARIANT;
     if (cold_parse_i32_array_type(type, 0)) return SLOT_ARRAY_I32;
@@ -6998,7 +6822,7 @@ static void cold_collect_function_signatures(Symbols *symbols, Span source) {
         Span param_names[COLD_MAX_I32_PARAMS];
         int32_t param_kinds[COLD_MAX_I32_PARAMS];
         int32_t param_sizes[COLD_MAX_I32_PARAMS];
-        int32_t arity = parse_param_specs(symbols, symbol.params, param_names, param_kinds,
+        int32_t arity = parse_param_specs(0, symbol.params, param_names, param_kinds,
                                           param_sizes, 0, COLD_MAX_I32_PARAMS);
         symbols_add_fn(symbols, symbol.name, arity, param_kinds, param_sizes, symbol.return_type);
     }
@@ -7153,11 +6977,6 @@ static void parse_type(Parser *parser) {
     }
 
     Span rhs_check = span_trim(span_sub(line.source, line.pos, line.source.len));
-    if (cold_type_has_pointer_suffix(rhs_check)) {
-        symbols_add_alias(parser->symbols, type_name, rhs_check);
-        parser->pos = line_end;
-        return;
-    }
     if (cold_span_starts_with(rhs_check, "enum")) {
         if (generic_count > 0) die("cold enum cannot be generic");
         Parser enum_parser = {rhs_check, 0, parser->arena, parser->symbols};
@@ -7443,66 +7262,6 @@ static void parse_type(Parser *parser) {
     parser_line(parser);
 }
 
-static void parse_global_var(Parser *parser);
-
-static void cold_collect_type_surfaces(Symbols *symbols, Span source) {
-    Parser parser = {source, 0, symbols->arena, symbols, false};
-    bool in_triple = false;
-    while (parser.pos < source.len) {
-        int32_t line_start = parser.pos;
-        int32_t line_end = line_start;
-        while (line_end < source.len && source.ptr[line_end] != '\n') line_end++;
-        Span line = span_sub(source, line_start, line_end);
-        int32_t next_pos = line_end < source.len ? line_end + 1 : line_end;
-        if (in_triple) {
-            if (cold_line_has_triple_quote(line)) in_triple = false;
-            parser.pos = next_pos;
-            continue;
-        }
-        if (!cold_line_top_level(line)) {
-            if (cold_line_has_triple_quote(line)) in_triple = true;
-            parser.pos = next_pos;
-            continue;
-        }
-        Span trimmed = span_trim(line);
-        if (cold_span_starts_with(trimmed, "type")) {
-            parser.pos = line_start;
-            parse_type(&parser);
-            continue;
-        }
-        parser.pos = next_pos;
-    }
-}
-
-static void cold_collect_global_surfaces(Symbols *symbols, Span source) {
-    Parser parser = {source, 0, symbols->arena, symbols, false};
-    bool in_triple = false;
-    while (parser.pos < source.len) {
-        int32_t line_start = parser.pos;
-        int32_t line_end = line_start;
-        while (line_end < source.len && source.ptr[line_end] != '\n') line_end++;
-        Span line = span_sub(source, line_start, line_end);
-        int32_t next_pos = line_end < source.len ? line_end + 1 : line_end;
-        if (in_triple) {
-            if (cold_line_has_triple_quote(line)) in_triple = false;
-            parser.pos = next_pos;
-            continue;
-        }
-        if (!cold_line_top_level(line)) {
-            if (cold_line_has_triple_quote(line)) in_triple = true;
-            parser.pos = next_pos;
-            continue;
-        }
-        Span trimmed = span_trim(line);
-        if (span_eq(trimmed, "var") || cold_span_starts_with(trimmed, "var ")) {
-            parser.pos = line_start;
-            parse_global_var(&parser);
-            continue;
-        }
-        parser.pos = next_pos;
-    }
-}
-
 static Span cold_strip_inline_comment(Span line) {
     bool in_string = false;
     uint8_t quote = 0;
@@ -7642,56 +7401,6 @@ static void parse_const(Parser *parser) {
     if (parser->pos < parser->source.len) parser->pos++;
 }
 
-static void parse_global_var_member_line(Parser *parser, Span line) {
-    Span trimmed = cold_strip_inline_comment(line);
-    if (trimmed.len <= 0) return;
-    if (cold_span_starts_with(trimmed, "var ")) {
-        trimmed = span_trim(span_sub(trimmed, 3, trimmed.len));
-    }
-    int32_t colon = cold_span_find_top_level_char(trimmed, ':');
-    if (colon <= 0) die("global var requires declared type");
-    Span name = span_trim(span_sub(trimmed, 0, colon));
-    Span type = span_trim(span_sub(trimmed, colon + 1, trimmed.len));
-    if (!cold_span_is_simple_ident(name)) die("global var requires simple name");
-    if (type.len <= 0) die("global var requires type");
-    symbols_add_global(parser->symbols, name, type);
-}
-
-static void parse_global_var(Parser *parser) {
-    int32_t line_start = parser->pos;
-    int32_t first_line_end = cold_line_end_from(parser->source, line_start);
-    Span first_line = span_trim(span_sub(parser->source, line_start, first_line_end));
-    if (span_eq(first_line, "var")) {
-        int32_t pos = first_line_end;
-        if (pos < parser->source.len) pos++;
-        int32_t group_indent = -1;
-        while (pos < parser->source.len) {
-            int32_t member_start = pos;
-            int32_t member_end = cold_line_end_from(parser->source, member_start);
-            Span line = span_sub(parser->source, member_start, member_end);
-            Span trimmed = span_trim(line);
-            if (trimmed.len == 0) {
-                pos = member_end;
-                if (pos < parser->source.len) pos++;
-                continue;
-            }
-            int32_t indent = cold_line_indent_width(line);
-            if (indent == 0) break;
-            if (group_indent < 0) group_indent = indent;
-            if (indent < group_indent) break;
-            parse_global_var_member_line(parser, line);
-            pos = member_end;
-            if (pos < parser->source.len) pos++;
-        }
-        parser->pos = pos;
-        return;
-    }
-    if (!cold_span_starts_with(first_line, "var ")) die("expected var");
-    parse_global_var_member_line(parser, first_line);
-    parser->pos = first_line_end;
-    if (parser->pos < parser->source.len) parser->pos++;
-}
-
 static int32_t parse_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind);
 static bool cold_is_i32_to_str_intrinsic(Span name);
 static bool cold_try_parse_int_intrinsic(BodyIR *body, Span name,
@@ -7750,11 +7459,6 @@ static void cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
             if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) die("cold var object arg kind mismatch");
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             continue;
-        } else if (fn->param_kind[i] == SLOT_PTR &&
-                   (arg_kind == SLOT_STR || arg_kind == SLOT_STR_REF)) {
-            continue;
-        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32) {
-            continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
@@ -7806,11 +7510,6 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
         } else if (fn->param_kind[i] == SLOT_OBJECT_REF) {
             if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) return false;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
-            continue;
-        } else if (fn->param_kind[i] == SLOT_PTR &&
-                   (arg_kind == SLOT_STR || arg_kind == SLOT_STR_REF)) {
-            continue;
-        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32) {
             continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
             continue;
@@ -7865,9 +7564,6 @@ static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
             int32_t arg_kind = body->slot_kind[arg_slot];
             int32_t param_kind = fn->param_kind[p];
             if (arg_kind == param_kind) continue;
-            if (param_kind == SLOT_PTR &&
-                (arg_kind == SLOT_STR || arg_kind == SLOT_STR_REF)) continue;
-            if (param_kind == SLOT_I64 && arg_kind == SLOT_I32) continue;
             if ((param_kind == SLOT_OPAQUE || param_kind == SLOT_OPAQUE_REF) &&
                 (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
                  arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
@@ -8037,25 +7733,6 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
     }
     int32_t fn_index = symbols_find_fn_for_call(parser->symbols, name, body, arg_start, arg_count);
     if (fn_index < 0) {
-        fprintf(stderr, "cheng_cold: unresolved call name=%.*s arity=%d",
-                name.len, name.ptr, arg_count);
-        for (int32_t di = 0; di < arg_count; di++) {
-            int32_t ds = body->call_arg_slot[arg_start + di];
-            fprintf(stderr, " arg%d_kind=%d", di, body->slot_kind[ds]);
-        }
-        fprintf(stderr, "\n");
-        for (int32_t fi = 0; fi < parser->symbols->function_count; fi++) {
-            FnDef *dbg_fn = &parser->symbols->functions[fi];
-            if (dbg_fn->arity != arg_count || !span_same(dbg_fn->name, name)) continue;
-            fprintf(stderr, "cheng_cold: candidate name=%.*s ret=%.*s",
-                    dbg_fn->name.len, dbg_fn->name.ptr,
-                    dbg_fn->ret.len, dbg_fn->ret.ptr);
-            for (int32_t pi = 0; pi < dbg_fn->arity; pi++) {
-                fprintf(stderr, " p%d_kind=%d p%d_size=%d",
-                        pi, dbg_fn->param_kind[pi], pi, dbg_fn->param_size[pi]);
-            }
-            fprintf(stderr, "\n");
-        }
         /* Check for indirect call via local variable (function pointer) */
         Local *indirect_local = locals_find(locals, name);
         if (indirect_local && indirect_local->kind == SLOT_PTR) {
@@ -8598,54 +8275,6 @@ static Span parser_take_until_top_level_char(Parser *parser, uint8_t delimiter,
     if (parser->pos >= parser->source.len) return (Span){0}; /* unterminated */
     Span expr = span_trim(span_sub(parser->source, start, parser->pos));
     if (expr.len <= 0) return (Span){0}; /* empty expr */
-    return expr;
-}
-
-static Span parser_take_statement_expr_span(Parser *parser) {
-    parser_inline_ws(parser);
-    int32_t start = parser->pos;
-    int32_t depth = 0;
-    bool in_string = false;
-    bool in_char = false;
-    while (parser->pos < parser->source.len) {
-        uint8_t c = parser->source.ptr[parser->pos];
-        if (in_string) {
-            if (c == '\\' && parser->pos + 1 < parser->source.len) {
-                parser->pos += 2;
-                continue;
-            }
-            if (c == '"') in_string = false;
-            parser->pos++;
-            continue;
-        }
-        if (in_char) {
-            if (c == '\\' && parser->pos + 1 < parser->source.len) {
-                parser->pos += 2;
-                continue;
-            }
-            if (c == '\'') in_char = false;
-            parser->pos++;
-            continue;
-        }
-        if (c == '"') {
-            in_string = true;
-            parser->pos++;
-            continue;
-        }
-        if (c == '\'') {
-            in_char = true;
-            parser->pos++;
-            continue;
-        }
-        if (depth == 0 && (c == '\n' || c == '\r' || c == ';')) break;
-        if (c == '(' || c == '[' || c == '{') depth++;
-        else if (c == ')' || c == ']' || c == '}') {
-            depth--;
-            if (depth < 0) die("unbalanced statement expression");
-        }
-        parser->pos++;
-    }
-    Span expr = span_trim(span_sub(parser->source, start, parser->pos));
     return expr;
 }
 
@@ -10482,8 +10111,6 @@ static bool cold_is_i64_cast_token(Span token) {
            span_eq(token, "UInt64");
 }
 
-static int32_t cold_materialize_i32_ref(BodyIR *body, int32_t slot, int32_t *kind);
-
 static int32_t cold_make_i64_const_slot(BodyIR *body, int64_t value) {
     uint64_t bits = (uint64_t)value;
     int32_t slot = body_slot(body, SLOT_I64, 8);
@@ -10515,10 +10142,6 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
             *kind = SLOT_I64;
             return value_slot;
         }
-        if (value_kind == SLOT_PTR) {
-            *kind = SLOT_I64;
-            return value_slot;
-        }
         if (value_kind != SLOT_I32) {
             /* Non-int32 cast source: return 0 */
             *kind = SLOT_I64;
@@ -10532,73 +10155,20 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
     }
     int32_t value_kind = SLOT_I32;
     int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
+    if (value_kind != SLOT_I32) {
+        /* Non-int32 scalar cast: return 0 */
+        int32_t zero = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+        *kind = SLOT_I32;
+        return zero;
+    }
     if (!parser_take(parser, ")")) return 0; /* skip malformed cast */;
-    value_slot = cold_materialize_i32_ref(body, value_slot, &value_kind);
-    if (value_kind == SLOT_I32) {
-        *kind = SLOT_I32;
-        return value_slot;
-    }
-    if (value_kind == SLOT_I64 || value_kind == SLOT_PTR) {
-        int32_t dst = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_COPY_I32, dst, value_slot, 0);
-        *kind = SLOT_I32;
-        return dst;
-    }
-    /* Non-int32 scalar cast: return 0 */
-    int32_t zero = body_slot(body, SLOT_I32, 4);
-    body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
     *kind = SLOT_I32;
-    return zero;
-}
-
-static int32_t cold_materialize_str_data_ptr(BodyIR *body, int32_t slot, int32_t *kind) {
-    if (*kind != SLOT_STR && *kind != SLOT_STR_REF) return slot;
-    int32_t dst = body_slot(body, SLOT_PTR, 8);
-    body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, slot, COLD_STR_DATA_OFFSET, 8);
-    *kind = SLOT_PTR;
-    return dst;
-}
-
-static bool cold_kind_is_pointer_sized_value(int32_t kind);
-
-static int32_t parse_pointer_cast(Parser *parser, BodyIR *body,
-                                  Locals *locals, Span cast_token,
-                                  int32_t *kind) {
-    if (!parser_take(parser, "(")) die("expected ( after pointer cast");
-    int32_t arg_start = parser->pos;
-    int32_t value_kind = SLOT_I32;
-    int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
-    Span arg_span = span_trim(span_sub(parser->source, arg_start, parser->pos));
-    if (!parser_take(parser, ")")) die("expected ) after pointer cast");
-    value_slot = cold_materialize_str_data_ptr(body, value_slot, &value_kind);
-    if (cold_kind_is_pointer_sized_value(value_kind)) {
-        int32_t dst = body_slot(body, SLOT_PTR, 8);
-        body_slot_set_type(body, dst, cast_token);
-        body_op(body, BODY_OP_COPY_I64, dst, value_slot, 0);
-        *kind = SLOT_PTR;
-        return dst;
-    }
-    Span slot_type = {0};
-    if (value_slot >= 0 && value_slot < body->slot_count) slot_type = body->slot_type[value_slot];
-    fprintf(stderr,
-            "cheng_cold: pointer cast source must be pointer-sized fn=%.*s cast=%.*s arg=%.*s kind=%d slot_type=%.*s\n",
-            body->debug_name.len, body->debug_name.ptr,
-            cast_token.len, cast_token.ptr,
-            arg_span.len, arg_span.ptr,
-            value_kind,
-            slot_type.len, slot_type.ptr);
-    die("pointer cast source must be pointer-sized");
-    return 0;
+    return value_slot;
 }
 
 static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                              int32_t slot, int32_t *kind);
-static int32_t cold_materialize_i32_ref(BodyIR *body, int32_t slot, int32_t *kind);
-static int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *kind);
-static int32_t parse_pointer_deref_load_after_star(Parser *parser, BodyIR *body,
-                                                   Locals *locals, int32_t *kind);
-static int32_t parse_pointer_deref_assign_after_star(Parser *parser, BodyIR *body,
-                                                     Locals *locals, int32_t block);
 
 static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
     Span token = parser_token(parser);
@@ -10632,32 +10202,21 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         *kind = SLOT_I32;
         return dst;
     }
-    if (span_eq(token, "*")) {
-        return parse_pointer_deref_load_after_star(parser, body, locals, kind);
-    }
-	    if (span_eq(token, "&")) {
-	        /* address-of: parse base local, then handle .field chain with FIELD_REF.
-	           Also handles &fnName (function pointer). */
-	        Span base_name = parser_token(parser);
-	        Local *alocal = locals_find(locals, base_name);
-	        int32_t addr_slot;
-	        if (alocal) {
-	            addr_slot = alocal->slot;
-	            *kind = alocal->kind;
-	        } else {
-	            int32_t global_index = symbols_global_index(parser->symbols, base_name);
-	            if (global_index >= 0) {
-	                GlobalDef *global = &parser->symbols->globals[global_index];
-	                addr_slot = body_slot(body, SLOT_PTR, 8);
-	                body_slot_set_type(body, addr_slot, global->type);
-	                body_op(body, BODY_OP_GLOBAL_ADDR, addr_slot, global_index, 0);
-	                *kind = SLOT_PTR;
-	            } else {
-	            /* Check if it's a function name: &fnName → function pointer */
-	            int32_t fn_idx = -1;
-	            for (int32_t si = 0; si < parser->symbols->function_count; si++) {
-	                FnDef *sfn = &parser->symbols->functions[si];
-	                if (span_same(sfn->name, base_name)) { fn_idx = si; break; }
+    if (span_eq(token, "&")) {
+        /* address-of: parse base local, then handle .field chain with FIELD_REF.
+           Also handles &fnName (function pointer). */
+        Span base_name = parser_token(parser);
+        Local *alocal = locals_find(locals, base_name);
+        int32_t addr_slot;
+        if (alocal) {
+            addr_slot = alocal->slot;
+            *kind = alocal->kind;
+        } else {
+            /* Check if it's a function name: &fnName → function pointer */
+            int32_t fn_idx = -1;
+            for (int32_t si = 0; si < parser->symbols->function_count; si++) {
+                FnDef *sfn = &parser->symbols->functions[si];
+                if (span_same(sfn->name, base_name)) { fn_idx = si; break; }
             }
             if (fn_idx < 0) {
                 /* Try qualified name lookup (*.base_name) */
@@ -10683,11 +10242,10 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
             int32_t es = parse_primary(parser, body, locals, &ek);
             if (ek != SLOT_PTR && ek != SLOT_OBJECT_REF) ek = SLOT_PTR;
             addr_slot = body_slot(body, SLOT_PTR, 8);
-	            body_op3(body, BODY_OP_FIELD_REF, addr_slot, es, 0, 0);
-	            *kind = SLOT_PTR;
-	            return addr_slot;
-	            }
-	        }
+            body_op3(body, BODY_OP_FIELD_REF, addr_slot, es, 0, 0);
+            *kind = SLOT_PTR;
+            return addr_slot;
+        }
         /* Process .field chain manually with FIELD_REF */
         while (span_eq(parser_peek(parser), ".")) {
             (void)parser_token(parser);
@@ -10733,21 +10291,8 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     if (span_eq(token, "Fmt")) {
         return parse_fmt_literal(parser, body, locals, kind);
     }
-    if (span_eq(token, "sizeof") && span_eq(parser_peek(parser), "(")) {
-        (void)parser_token(parser);
-        Span type = span_trim(parser_take_until_top_level_char(parser, ')',
-                                                                 "expected ) after sizeof"));
-        if (!parser_take(parser, ")")) die("expected ) after sizeof");
-        int32_t slot = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_I32_CONST, slot, cold_sizeof_type(parser->symbols, type), 0);
-        *kind = SLOT_I32;
-        return slot;
-    }
     if (cold_is_scalar_identity_cast(token) && span_eq(parser_peek(parser), "(")) {
         return parse_scalar_identity_cast(parser, body, locals, token, kind);
-    }
-    if (cold_type_is_pointer_like(parser->symbols, token) && span_eq(parser_peek(parser), "(")) {
-        return parse_pointer_cast(parser, body, locals, token, kind);
     }
     if (span_eq(token, "nil")) {
         int32_t slot = body_slot(body, SLOT_PTR, 8);
@@ -10863,23 +10408,13 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         *kind = SLOT_I32;
         return slot;
     }
-	    /* check if token is a local variable FIRST -- field access on locals is handled by parse_postfix */
-	    Local *local = locals_find(locals, token);
-	    if (local) {
-	        int32_t slot = local->slot;
-	        *kind = local->kind;
-	        return slot;
-	    }
-	    int32_t global_index = symbols_global_index(parser->symbols, token);
-	    if (global_index >= 0) {
-	        GlobalDef *global = &parser->symbols->globals[global_index];
-	        int32_t slot = body_slot(body, global->kind, global->size);
-	        body_slot_set_type(body, slot, global->type);
-	        body_op(body, BODY_OP_GLOBAL_LOAD, slot, global_index, 0);
-	        if (global->kind == SLOT_I32 || global->kind == SLOT_I64) body->slot_no_alias[slot] = 1;
-	        *kind = global->kind;
-	        return slot;
-	    }
+    /* check if token is a local variable FIRST -- field access on locals is handled by parse_postfix */
+    Local *local = locals_find(locals, token);
+    if (local) {
+        int32_t slot = local->slot;
+        *kind = local->kind;
+        return slot;
+    }
     if (span_eq(parser_peek(parser), "{") &&
         token.len > 0 && token.ptr[0] >= 'A' && token.ptr[0] <= 'Z') {
         /* object constructor with curly braces */
@@ -11236,138 +10771,6 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
     return slot;
 }
 
-static int32_t parse_pointer_deref_target_after_star(Parser *parser, BodyIR *body,
-                                                     Locals *locals,
-                                                     int32_t *ptr_kind,
-                                                     Span *pointee_type,
-                                                     int32_t *pointee_kind,
-                                                     int32_t *mem_size) {
-    int32_t target_kind = SLOT_I32;
-    int32_t target_slot = parse_primary(parser, body, locals, &target_kind);
-    target_slot = parse_postfix(parser, body, locals, target_slot, &target_kind);
-    if (!cold_kind_is_pointer_sized_value(target_kind)) die("pointer deref target must be pointer-sized");
-    Span ptr_type = target_slot >= 0 && target_slot < body->slot_count
-                    ? body->slot_type[target_slot] : (Span){0};
-    Span pointee = cold_pointer_pointee_type(parser->symbols, ptr_type);
-    if (pointee.len <= 0) die("pointer deref requires typed pointer");
-    int32_t pk = cold_slot_kind_from_type_with_symbols(parser->symbols, pointee);
-    int32_t width = cold_pointer_pointee_memory_size(parser->symbols, pointee, pk);
-    if (width <= 0) die("pointer deref pointee has unknown size");
-    if (ptr_kind) *ptr_kind = target_kind;
-    if (pointee_type) *pointee_type = pointee;
-    if (pointee_kind) *pointee_kind = pk;
-    if (mem_size) *mem_size = width;
-    return target_slot;
-}
-
-static int32_t parse_pointer_deref_load_after_star(Parser *parser, BodyIR *body,
-                                                   Locals *locals, int32_t *kind) {
-    int32_t ptr_kind = SLOT_I32;
-    Span pointee = {0};
-    int32_t pointee_kind = SLOT_I32;
-    int32_t mem_size = 0;
-    int32_t ptr_slot = parse_pointer_deref_target_after_star(parser, body, locals,
-                                                             &ptr_kind, &pointee,
-                                                             &pointee_kind, &mem_size);
-    (void)ptr_kind;
-    if (mem_size == 1) {
-        int32_t slot = body_slot(body, SLOT_I32, 4);
-        body_slot_set_type(body, slot, pointee);
-        body_op(body, BODY_OP_PTR_LOAD_U8, slot, ptr_slot, 0);
-        *kind = SLOT_I32;
-        return slot;
-    }
-    if (mem_size == 4 && pointee_kind == SLOT_I32) {
-        int32_t slot = body_slot(body, SLOT_I32, 4);
-        body_slot_set_type(body, slot, pointee);
-        body_op(body, BODY_OP_PTR_LOAD_I32, slot, ptr_slot, 0);
-        *kind = SLOT_I32;
-        return slot;
-    }
-    if (mem_size == 8 && (pointee_kind == SLOT_I64 || pointee_kind == SLOT_PTR ||
-                          pointee_kind == SLOT_OPAQUE || pointee_kind == SLOT_OPAQUE_REF ||
-                          pointee_kind == SLOT_OBJECT_REF || pointee_kind == SLOT_STR_REF ||
-                          pointee_kind == SLOT_SEQ_I32_REF || pointee_kind == SLOT_SEQ_STR_REF ||
-                          pointee_kind == SLOT_I64_REF)) {
-        int32_t result_kind = pointee_kind == SLOT_PTR ? SLOT_PTR : SLOT_I64;
-        int32_t slot = body_slot(body, result_kind, 8);
-        body_slot_set_type(body, slot, pointee);
-        body_op(body, BODY_OP_PTR_LOAD_I64, slot, ptr_slot, 0);
-        *kind = result_kind;
-        return slot;
-    }
-    die("unsupported pointer deref load width");
-    return 0;
-}
-
-static int32_t parse_pointer_deref_assign_after_star(Parser *parser, BodyIR *body,
-                                                     Locals *locals, int32_t block) {
-    Span target = span_trim(parser_take_until_top_level_char(parser, '=',
-                                                             "expected = after pointer deref assignment"));
-    if (!parser_take(parser, "=")) die("expected = after pointer deref target");
-    Parser target_parser = {target, 0, parser->arena, parser->symbols, parser->import_mode};
-    int32_t ptr_kind = SLOT_I32;
-    Span pointee = {0};
-    int32_t pointee_kind = SLOT_I32;
-    int32_t mem_size = 0;
-    int32_t ptr_slot = parse_pointer_deref_target_after_star(&target_parser, body, locals,
-                                                             &ptr_kind, &pointee,
-                                                             &pointee_kind, &mem_size);
-    (void)ptr_kind;
-    parser_ws(&target_parser);
-    if (target_parser.pos != target_parser.source.len) die("unsupported pointer deref target");
-    int32_t value_kind = SLOT_I32;
-    Span value_expr = parser_take_statement_expr_span(parser);
-    Parser value_parser = {value_expr, 0, parser->arena, parser->symbols, parser->import_mode};
-    int32_t value_slot = parse_expr(&value_parser, body, locals, &value_kind);
-    parser_inline_ws(&value_parser);
-    if (value_parser.pos != value_parser.source.len) die("unsupported trailing pointer store expression");
-    if (mem_size == 1) {
-        value_slot = cold_materialize_i32_ref(body, value_slot, &value_kind);
-        if (value_kind != SLOT_I32) die("uint8 pointer store value mismatch");
-        body_op(body, BODY_OP_PTR_STORE_U8, ptr_slot, value_slot, 0);
-        return block;
-    }
-    if (mem_size == 4 && pointee_kind == SLOT_I32) {
-        value_slot = cold_materialize_i32_ref(body, value_slot, &value_kind);
-        if (value_kind != SLOT_I32) die("int32 pointer store value mismatch");
-        body_op(body, BODY_OP_PTR_STORE_I32, ptr_slot, value_slot, 0);
-        return block;
-    }
-    if (mem_size == 8 && pointee_kind == SLOT_I64) {
-        if (value_kind == SLOT_I32) value_slot = cold_materialize_i64_value(body, value_slot, &value_kind);
-        if (value_kind != SLOT_I64) die("int64 pointer store value mismatch");
-        body_op(body, BODY_OP_PTR_STORE_I64, ptr_slot, value_slot, 0);
-        return block;
-    }
-    if (mem_size == 8 && (pointee_kind == SLOT_PTR || pointee_kind == SLOT_OPAQUE ||
-                          pointee_kind == SLOT_OPAQUE_REF || pointee_kind == SLOT_OBJECT_REF ||
-                          pointee_kind == SLOT_STR_REF || pointee_kind == SLOT_SEQ_I32_REF ||
-                          pointee_kind == SLOT_SEQ_STR_REF || pointee_kind == SLOT_I64_REF)) {
-        value_slot = cold_materialize_str_data_ptr(body, value_slot, &value_kind);
-        if (!cold_kind_is_pointer_sized_value(value_kind)) die("pointer store value mismatch");
-        body_op(body, BODY_OP_PTR_STORE_I64, ptr_slot, value_slot, 0);
-        return block;
-    }
-    die("unsupported pointer deref store width");
-    return block;
-}
-
-static ObjectField *cold_resolve_pointer_field(Parser *parser, BodyIR *body,
-                                               int32_t ptr_slot, Span field_name,
-                                               ObjectDef **object_out) {
-    if (ptr_slot < 0 || ptr_slot >= body->slot_count) die("pointer field base slot out of range");
-    Span ptr_type = body->slot_type[ptr_slot];
-    Span pointee = cold_pointer_pointee_type(parser->symbols, ptr_type);
-    if (pointee.len <= 0) die("pointer field access requires typed pointer");
-    ObjectDef *object = symbols_resolve_object(parser->symbols, pointee);
-    if (!object) die("pointer field access requires object pointee");
-    ObjectField *field = object_find_field(object, field_name);
-    if (!field) die("unknown pointer field");
-    if (object_out) *object_out = object;
-    return field;
-}
-
 static bool cold_span_is_compare_token(Span op);
 static int32_t cold_cond_from_compare_token(Span op);
 static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind);
@@ -11635,8 +11038,10 @@ static int32_t cold_cond_from_compare_token(Span op) {
 static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t block) {
     int32_t kind = SLOT_I32;
     int32_t slot = -1;
-    Span return_expr = parser_take_statement_expr_span(parser);
-    if (return_expr.len <= 0) {
+    parser_inline_ws(parser);
+    if (parser->pos >= parser->source.len ||
+        parser->source.ptr[parser->pos] == '\n' ||
+        parser->source.ptr[parser->pos] == '\r') {
         if (!cold_return_span_is_void(body->return_type)) die("non-void return requires value");
         slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
@@ -11645,24 +11050,22 @@ static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t b
         body_end_block(body, block, term);
         return;
     }
-    Parser return_parser = {return_expr, 0, parser->arena, parser->symbols, parser->import_mode};
-    Span next = parser_peek(&return_parser);
+    Span next = parser_peek(parser);
     Variant *return_variant = 0;
     if (body->return_kind == SLOT_VARIANT && body->return_type.len > 0) {
         TypeDef *return_type = symbols_resolve_type(parser->symbols, body->return_type);
         return_variant = type_find_variant(return_type, next);
     }
     if (return_variant) {
-        (void)parser_token(&return_parser);
-        slot = parse_constructor(&return_parser, body, locals, return_variant);
+        (void)parser_token(parser);
+        slot = parse_constructor(parser, body, locals, return_variant);
         kind = SLOT_VARIANT;
     } else {
-        slot = parse_expr(&return_parser, body, locals, &kind);
+        slot = parse_expr(parser, body, locals, &kind);
     }
-    parser_inline_ws(&return_parser);
-    if (return_parser.pos < return_parser.source.len &&
-        return_parser.source.ptr[return_parser.pos] == '?') {
-        (void)parser_token(&return_parser);  /* consume ? */
+    parser_inline_ws(parser);
+    if (parser->pos < parser->source.len && parser->source.ptr[parser->pos] == '?') {
+        (void)parser_token(parser);  /* consume ? */
         if (kind == SLOT_VARIANT) {
             TypeDef *rqtype = cold_question_result_type(parser->symbols, body, slot);
             if (rqtype && rqtype->variant_count == 2 &&
@@ -11713,15 +11116,6 @@ static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t b
         /* Non-variant ?: treat as unsupported */
         return;
     }
-    parser_inline_ws(&return_parser);
-    if (return_parser.pos != return_parser.source.len) {
-        fprintf(stderr, "cheng_cold: unsupported trailing return expression fn=%.*s expr=%.*s tail=%.*s\n",
-                body->debug_name.len, body->debug_name.ptr,
-                return_expr.len, return_expr.ptr,
-                return_parser.source.len - return_parser.pos,
-                return_parser.source.ptr + return_parser.pos);
-        die("unsupported trailing return expression");
-    }
     if (body->return_kind == SLOT_I32) {
         slot = cold_materialize_i32_ref(body, slot, &kind);
     } else if (body->return_kind == SLOT_I64 && kind == SLOT_I32) {
@@ -11735,94 +11129,6 @@ static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t b
     if (kind == SLOT_I32) body_op(body, BODY_OP_LOAD_I32, slot, 0, 0);
     int32_t term = body_term(body, BODY_TERM_RET, slot, -1, 0, -1, -1);
     body_end_block(body, block, term);
-}
-
-static int32_t body_branch_to(BodyIR *body, int32_t block, int32_t target_block);
-
-static bool parser_peek_question_starts_ternary(Parser *parser) {
-    int32_t pos = parser->pos;
-    while (pos < parser->source.len &&
-           (parser->source.ptr[pos] == ' ' || parser->source.ptr[pos] == '\t')) {
-        pos++;
-    }
-    if (pos >= parser->source.len || parser->source.ptr[pos] != '?') return false;
-    pos++;
-    int32_t depth = 0;
-    bool in_string = false;
-    bool in_char = false;
-    while (pos < parser->source.len) {
-        uint8_t c = parser->source.ptr[pos];
-        if (in_string) {
-            if (c == '\\' && pos + 1 < parser->source.len) {
-                pos += 2;
-                continue;
-            }
-            if (c == '"') in_string = false;
-            pos++;
-            continue;
-        }
-        if (in_char) {
-            if (c == '\\' && pos + 1 < parser->source.len) {
-                pos += 2;
-                continue;
-            }
-            if (c == '\'') in_char = false;
-            pos++;
-            continue;
-        }
-        if (c == '\n' || c == '\r') return false;
-        if (c == '"') {
-            in_string = true;
-            pos++;
-            continue;
-        }
-        if (c == '\'') {
-            in_char = true;
-            pos++;
-            continue;
-        }
-        if (depth == 0 && c == ':') return true;
-        if (c == '(' || c == '[' || c == '{') depth++;
-        else if (c == ')' || c == ']' || c == '}') {
-            depth--;
-            if (depth < 0) return false;
-        }
-        pos++;
-    }
-    return false;
-}
-
-static bool cold_kind_is_pointer_sized_value(int32_t kind) {
-    return kind == SLOT_PTR || kind == SLOT_I64 || kind == SLOT_OPAQUE ||
-           kind == SLOT_OPAQUE_REF || kind == SLOT_OBJECT_REF ||
-           kind == SLOT_STR_REF || kind == SLOT_SEQ_I32_REF ||
-           kind == SLOT_SEQ_STR_REF || kind == SLOT_I64_REF;
-}
-
-static void cold_store_typed_value_into_slot(BodyIR *body, int32_t dst_slot,
-                                             int32_t dst_kind, int32_t src_slot,
-                                             int32_t *src_kind) {
-    if (dst_kind == SLOT_I32) {
-        src_slot = cold_materialize_i32_ref(body, src_slot, src_kind);
-        if (*src_kind != SLOT_I32) die("ternary int32 branch type mismatch");
-        body_op(body, BODY_OP_COPY_I32, dst_slot, src_slot, 0);
-        return;
-    }
-    if (dst_kind == SLOT_I64) {
-        if (*src_kind == SLOT_I32) src_slot = cold_materialize_i64_value(body, src_slot, src_kind);
-        if (*src_kind != SLOT_I64) die("ternary int64 branch type mismatch");
-        body_op(body, BODY_OP_COPY_I64, dst_slot, src_slot, 0);
-        return;
-    }
-    if (dst_kind == SLOT_PTR) {
-        src_slot = cold_materialize_str_data_ptr(body, src_slot, src_kind);
-        if (!cold_kind_is_pointer_sized_value(*src_kind)) die("ternary pointer branch type mismatch");
-        body_op(body, BODY_OP_COPY_I64, dst_slot, src_slot, 0);
-        *src_kind = SLOT_PTR;
-        return;
-    }
-    if (*src_kind != dst_kind) die("ternary composite branch type mismatch");
-    body_op(body, BODY_OP_COPY_COMPOSITE, dst_slot, src_slot, 0);
 }
 
 static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
@@ -11869,52 +11175,6 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
         }
     } else {
         slot = parse_expr(parser, body, locals, &kind);
-    }
-    if (parser_peek_question_starts_ternary(parser)) {
-        if (type.len <= 0) die("ternary let requires declared type");
-        (void)parser_token(parser);
-        Span true_expr = parser_take_until_top_level_char(parser, ':',
-                                                          "expected : in ternary expression");
-        if (true_expr.len <= 0) die("expected true expression in ternary");
-        if (!parser_take(parser, ":")) die("expected : in ternary expression");
-
-        slot = cold_materialize_i32_ref(body, slot, &kind);
-        if (kind != SLOT_I32) die("ternary condition must be bool/int32");
-
-        int32_t result_kind = cold_slot_kind_from_type_with_symbols(parser->symbols, type);
-        int32_t result_size = cold_slot_size_from_type_with_symbols(parser->symbols, type, result_kind);
-        if (result_size <= 0) die("ternary result type has unknown size");
-        int32_t result_slot = body_slot(body, result_kind, result_size);
-        body_slot_set_type(body, result_slot, type);
-
-        int32_t zero = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
-        int32_t true_block = body_block(body);
-        int32_t false_block = body_block(body);
-        int32_t join_block = body_block(body);
-        int32_t cond_term = body_term(body, BODY_TERM_CBR, slot, COND_NE,
-                                      zero, true_block, false_block);
-        body_end_block(body, block, cond_term);
-
-        body_reopen_block(body, true_block);
-        Parser true_parser = {true_expr, 0, parser->arena, parser->symbols, parser->import_mode};
-        int32_t true_kind = SLOT_I32;
-        int32_t true_slot = parse_expr(&true_parser, body, locals, &true_kind);
-        parser_ws(&true_parser);
-        if (true_parser.pos != true_parser.source.len) die("unsupported ternary true expression");
-        cold_store_typed_value_into_slot(body, result_slot, result_kind, true_slot, &true_kind);
-        body_branch_to(body, true_block, join_block);
-
-        body_reopen_block(body, false_block);
-        int32_t false_kind = SLOT_I32;
-        int32_t false_slot = parse_expr(parser, body, locals, &false_kind);
-        cold_store_typed_value_into_slot(body, result_slot, result_kind, false_slot, &false_kind);
-        body_branch_to(body, false_block, join_block);
-
-        body_reopen_block(body, join_block);
-        slot = result_slot;
-        kind = result_kind;
-        block = join_block;
     }
     /* For let bindings (not var), always copy to avoid aliasing the initializer slot */
     if (!is_var && slot >= 0 && (kind == SLOT_I32 || kind == SLOT_I64)) {
@@ -11971,75 +11231,15 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
 
 static void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name) {
     Local *local = locals_find(locals, name);
-    int32_t global_index = -1;
-    GlobalDef *global = 0;
     if (!local) {
-        global_index = symbols_global_index(parser->symbols, name);
-        if (global_index >= 0) global = &parser->symbols->globals[global_index];
-    }
-    if (!local && !global) {
         /* Consume the value expression and continue */
-        if (!parser_take(parser, "=")) {
-            fprintf(stderr, "cheng_cold: expected = in assignment name=%.*s next=%.*s fn=%.*s\n",
-                    name.len, name.ptr,
-                    parser_peek(parser).len, parser_peek(parser).ptr,
-                    body->debug_name.len, body->debug_name.ptr);
-            die("expected = in assignment");
-        }
         int32_t dummy_kind = SLOT_I32;
-        Span dummy_expr = parser_take_statement_expr_span(parser);
-        Parser dummy_parser = {dummy_expr, 0, parser->arena, parser->symbols, parser->import_mode};
-        (void)parse_expr(&dummy_parser, body, locals, &dummy_kind);
-        parser_inline_ws(&dummy_parser);
-        if (dummy_parser.pos != dummy_parser.source.len) {
-            fprintf(stderr, "cheng_cold: unsupported trailing assignment expression fn=%.*s target=%.*s expr=%.*s tail=%.*s\n",
-                    body->debug_name.len, body->debug_name.ptr,
-                    name.len, name.ptr,
-                    dummy_expr.len, dummy_expr.ptr,
-                    dummy_parser.source.len - dummy_parser.pos,
-                    dummy_parser.source.ptr + dummy_parser.pos);
-            die("unsupported trailing assignment expression");
-        }
+        (void)parse_expr(parser, body, locals, &dummy_kind);
         return;
     }
-    if (!parser_take(parser, "=")) {
-        fprintf(stderr, "cheng_cold: expected = in assignment name=%.*s next=%.*s fn=%.*s\n",
-                name.len, name.ptr,
-                parser_peek(parser).len, parser_peek(parser).ptr,
-                body->debug_name.len, body->debug_name.ptr);
-        die("expected = in assignment");
-    }
+    if (!parser_take(parser, "=")) die("expected = in assignment");
     int32_t kind = SLOT_I32;
-    Span value_expr = parser_take_statement_expr_span(parser);
-    Parser value_parser = {value_expr, 0, parser->arena, parser->symbols, parser->import_mode};
-    int32_t slot = parse_expr(&value_parser, body, locals, &kind);
-    parser_inline_ws(&value_parser);
-    if (value_parser.pos != value_parser.source.len) {
-        fprintf(stderr, "cheng_cold: unsupported trailing assignment expression fn=%.*s target=%.*s expr=%.*s tail=%.*s\n",
-                body->debug_name.len, body->debug_name.ptr,
-                name.len, name.ptr,
-                value_expr.len, value_expr.ptr,
-                value_parser.source.len - value_parser.pos,
-                value_parser.source.ptr + value_parser.pos);
-        die("unsupported trailing assignment expression");
-    }
-    if (global) {
-        if (global->kind == SLOT_I32) {
-            slot = cold_materialize_i32_ref(body, slot, &kind);
-            if (kind != SLOT_I32) die("global int32 assignment type mismatch");
-        } else if (global->kind == SLOT_I64) {
-            if (kind == SLOT_I32) slot = cold_materialize_i64_value(body, slot, &kind);
-            if (kind != SLOT_I64) die("global int64 assignment type mismatch");
-        } else if (global->kind == SLOT_PTR) {
-            slot = cold_materialize_str_data_ptr(body, slot, &kind);
-            if (!cold_kind_is_pointer_sized_value(kind)) die("global pointer assignment type mismatch");
-            kind = SLOT_PTR;
-        } else if (kind != global->kind) {
-            die("global assignment type mismatch");
-        }
-        body_op(body, BODY_OP_GLOBAL_STORE, global_index, slot, 0);
-        return;
-    }
+    int32_t slot = parse_expr(parser, body, locals, &kind);
     if (local->kind == SLOT_I32) {
         slot = cold_materialize_i32_ref(body, slot, &kind);
         if (kind != SLOT_I32) {
@@ -13269,16 +12469,6 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
     int32_t stmt_indent = parser_next_indent(parser);
     Span kw = parser_token(parser);
     if (kw.len == 0) return block;
-    if (span_eq(kw, "=") || span_eq(kw, "==")) {
-        int32_t line_start = (int32_t)(kw.ptr - parser->source.ptr);
-        while (line_start > 0 && parser->source.ptr[line_start - 1] != '\n') line_start--;
-        int32_t line_end = (int32_t)(kw.ptr - parser->source.ptr);
-        while (line_end < parser->source.len && parser->source.ptr[line_end] != '\n') line_end++;
-        fprintf(stderr, "cheng_cold: statement op token=%.*s fn=%.*s line=%.*s\n",
-                kw.len, kw.ptr,
-                body->debug_name.len, body->debug_name.ptr,
-                line_end - line_start, parser->source.ptr + line_start);
-    }
     if (span_eq(kw, "let") || span_eq(kw, "var")) {
         return parse_let_binding(parser, body, locals, block, span_eq(kw, "var"));
     } else if (span_eq(kw, "return")) {
@@ -13302,8 +12492,6 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
         return block;
     } else if (span_eq(kw, "add")) {
         return parse_builtin_add_after_name(parser, body, locals, block);
-    } else if (span_eq(kw, "*")) {
-        return parse_pointer_deref_assign_after_star(parser, body, locals, block);
     } else if (parser_next_is_qualified_call(parser) || span_eq(parser_peek(parser), "(")) {
         Span call_name = kw;
         if (parser_next_is_qualified_call(parser)) {
@@ -14649,9 +13837,6 @@ static uint32_t a64_adr(int rd, int32_t offset_bytes) {
     uint32_t immhi = (imm >> 2) & 0x7FFFFu;
     return 0x10000000u | (immlo << 29) | (immhi << 5) | (uint32_t)rd;
 }
-static uint32_t a64_adrp(int rd) {
-    return 0x90000000u | (uint32_t)rd;
-}
 static uint32_t a64_add_imm(int rd, int rn, uint16_t value, bool x) {
     return (x ? 0x91000000u : 0x11000000u) | ((uint32_t)value << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
 }
@@ -14832,19 +14017,9 @@ static uint32_t a64_stlxr_w(int rs, int rt, int rn) {
  * Code generation
  * ================================================================ */
 typedef struct {
-    int32_t pos;
-    int32_t global_index;
-    uint8_t reloc_type;
-    uint8_t pcrel;
-} CodeGlobalReloc;
-
-typedef struct {
     uint32_t *words;
     int32_t count;
     int32_t cap;
-    CodeGlobalReloc *global_relocs;
-    int32_t global_reloc_count;
-    int32_t global_reloc_cap;
     Arena *arena;
 } Code;
 
@@ -14944,26 +14119,6 @@ static void code_emit(Code *code, uint32_t word) {
         code->cap = next;
     }
     code->words[code->count++] = word;
-}
-
-static void code_global_reloc_add(Code *code, int32_t pos, int32_t global_index,
-                                  uint8_t reloc_type, uint8_t pcrel) {
-    if (global_index < 0) die("invalid global reloc index");
-    if (code->global_reloc_count >= code->global_reloc_cap) {
-        int32_t next = code->global_reloc_cap ? code->global_reloc_cap * 2 : 32;
-        CodeGlobalReloc *fresh = arena_alloc(code->arena, (size_t)next * sizeof(CodeGlobalReloc));
-        if (code->global_reloc_count > 0) {
-            memcpy(fresh, code->global_relocs,
-                   (size_t)code->global_reloc_count * sizeof(CodeGlobalReloc));
-        }
-        code->global_relocs = fresh;
-        code->global_reloc_cap = next;
-    }
-    CodeGlobalReloc *reloc = &code->global_relocs[code->global_reloc_count++];
-    reloc->pos = pos;
-    reloc->global_index = global_index;
-    reloc->reloc_type = reloc_type;
-    reloc->pcrel = pcrel;
 }
 
 static void a64_patch_b(Code *code, int32_t pos, int32_t target) {
@@ -15453,77 +14608,6 @@ static void codegen_zero_slot(Code *code, BodyIR *body, int32_t slot) {
     code_emit(code, a64_movz_x(R0, 0, 0));
     for (int32_t off = 0; off < body->slot_size[slot]; off += 8) {
         a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + off, true);
-    }
-}
-
-static void codegen_global_addr_reg(Code *code, int32_t global_index, int reg) {
-    int32_t adrp_pos = code->count;
-    code_emit(code, a64_adrp(reg));
-    code_global_reloc_add(code, adrp_pos * 4, global_index,
-                          MACHO_ARM64_RELOC_GOT_LOAD_PAGE21, 1);
-    int32_t ldr_pos = code->count;
-    code_emit(code, a64_ldr_imm(reg, reg, 0, true));
-    code_global_reloc_add(code, ldr_pos * 4, global_index,
-                          MACHO_ARM64_RELOC_GOT_LOAD_PAGEOFF12, 0);
-}
-
-static void codegen_load_global_to_slot(Code *code, BodyIR *body,
-                                        Symbols *symbols, int32_t slot,
-                                        int32_t global_index) {
-    if (global_index < 0 || global_index >= symbols->global_count) die("invalid global load");
-    GlobalDef *global = &symbols->globals[global_index];
-    codegen_global_addr_reg(code, global_index, R1);
-    if (global->kind == SLOT_I32) {
-        code_emit(code, a64_ldr_imm(R0, R1, 0, false));
-        a64_emit_str_sp_off(code, R0, body->slot_offset[slot], false);
-        return;
-    }
-    if (global->kind == SLOT_I64 || global->kind == SLOT_PTR ||
-        global->kind == SLOT_OPAQUE || global->kind == SLOT_OPAQUE_REF ||
-        global->kind == SLOT_OBJECT_REF || global->kind == SLOT_STR_REF ||
-        global->kind == SLOT_SEQ_I32_REF || global->kind == SLOT_SEQ_STR_REF) {
-        code_emit(code, a64_ldr_imm(R0, R1, 0, true));
-        a64_emit_str_sp_off(code, R0, body->slot_offset[slot], true);
-        return;
-    }
-    for (int32_t off = 0; off + 8 <= global->size; off += 8) {
-        code_emit(code, a64_ldr_imm(R0, R1, off, true));
-        a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + off, true);
-    }
-    if ((global->size & 7) != 0) {
-        int32_t off = global->size & ~7;
-        code_emit(code, a64_ldr_imm(R0, R1, off, false));
-        a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + off, false);
-    }
-}
-
-static void codegen_store_slot_to_global(Code *code, BodyIR *body,
-                                         Symbols *symbols, int32_t global_index,
-                                         int32_t slot) {
-    if (global_index < 0 || global_index >= symbols->global_count) die("invalid global store");
-    GlobalDef *global = &symbols->globals[global_index];
-    codegen_global_addr_reg(code, global_index, R1);
-    if (global->kind == SLOT_I32) {
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[slot], false);
-        code_emit(code, a64_str_imm(R0, R1, 0, false));
-        return;
-    }
-    if (global->kind == SLOT_I64 || global->kind == SLOT_PTR ||
-        global->kind == SLOT_OPAQUE || global->kind == SLOT_OPAQUE_REF ||
-        global->kind == SLOT_OBJECT_REF || global->kind == SLOT_STR_REF ||
-        global->kind == SLOT_SEQ_I32_REF || global->kind == SLOT_SEQ_STR_REF) {
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[slot], true);
-        code_emit(code, a64_str_imm(R0, R1, 0, true));
-        return;
-    }
-    for (int32_t off = 0; off + 8 <= global->size; off += 8) {
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[slot] + off, true);
-        code_emit(code, a64_str_imm(R0, R1, off, true));
-    }
-    if ((global->size & 7) != 0) {
-        int32_t off = global->size & ~7;
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[slot] + off, false);
-        code_emit(code, a64_str_imm(R0, R1, off, false));
     }
 }
 
@@ -17665,13 +16749,6 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         if (stack_bytes > 0) a64_emit_add_large(code, SP, SP, stack_bytes, true);
         int32_t ret_kind = cold_return_kind_from_span(symbols, fn->ret);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], ret_kind == SLOT_I64 || ret_kind == SLOT_PTR);
-    } else if (kind == BODY_OP_GLOBAL_ADDR) {
-        codegen_global_addr_reg(code, a, R0);
-        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
-    } else if (kind == BODY_OP_GLOBAL_LOAD) {
-        codegen_load_global_to_slot(code, body, symbols, dst, a);
-    } else if (kind == BODY_OP_GLOBAL_STORE) {
-        codegen_store_slot_to_global(code, body, symbols, dst, a);
     } else if (kind == BODY_OP_COPY_I32) {
         int __cr2 = na_find(a);
         if (__cr2 >= 0) { if (__cr2 != 0) code_emit(code, a64_add_imm(R0, __cr2, 0, false)); }
@@ -18073,14 +17150,6 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         code_emit(code, a64_str_imm(R0, R1, 0, true));
-    } else if (kind == BODY_OP_PTR_LOAD_U8) {
-        a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
-        code_emit(code, a64_ldrb_imm(R0, R1, 0));
-        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
-    } else if (kind == BODY_OP_PTR_STORE_U8) {
-        a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
-        code_emit(code, a64_strb_imm(R0, R1, 0));
     } else if (kind == BODY_OP_WRITE_RAW) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
@@ -19717,8 +18786,6 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
         mapped_source = source_open(src_path);
         if (mapped_source.len <= 0) return false;
         cold_collect_imported_function_signatures(symbols, mapped_source);
-        cold_collect_type_surfaces(symbols, mapped_source);
-        cold_collect_global_surfaces(symbols, mapped_source);
         cold_collect_function_signatures(symbols, mapped_source);
         { char ws_root[PATH_MAX] = {0};
           const char *sm = strstr(src_path, "/src/");
@@ -19762,8 +18829,6 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
                 parse_type(&parser);
             } else if (span_eq(next, "const")) {
                 parse_const(&parser);
-            } else if (span_eq(next, "var")) {
-                parse_global_var(&parser);
             } else if (span_eq(next, "fn")) {
                 volatile int32_t symbol_index = -1;
                 volatile BodyIR *volatile body2 = 0;
@@ -19934,8 +18999,6 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     if (mapped_source.len <= 0) return false;
 
     cold_collect_imported_function_signatures(symbols, mapped_source);
-    cold_collect_type_surfaces(symbols, mapped_source);
-    cold_collect_global_surfaces(symbols, mapped_source);
     cold_collect_function_signatures(symbols, mapped_source);
     { /* workspace root detection for import loading */
       char ws_root[PATH_MAX] = {0};
@@ -19975,8 +19038,6 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             parse_type(&parser);
         } else if (span_eq(next, "const")) {
             parse_const(&parser);
-        } else if (span_eq(next, "var")) {
-            parse_global_var(&parser);
         } else if (span_eq(next, "fn")) {
             int32_t symbol_index = -1;
             BodyIR *body = parse_fn(&parser, &symbol_index);
@@ -20040,146 +19101,49 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         BodyIR *body = function_bodies[i];
         if (body->has_fallback || body->block_count == 0 ||
             (body->block_count > 0 && body->block_term[0] < 0)) {
-            if (body->return_kind == SLOT_STR) {
-                code_emit(shared, a64_movz(R0, 0, 0));
-                a64_emit_str_sp_off(shared, R0, body->slot_offset[0], true);
-                a64_emit_str_sp_off(shared, R0, body->slot_offset[0] + 8, true);
-                a64_emit_str_sp_off(shared, R0, body->slot_offset[0] + COLD_STR_STORE_ID_OFFSET, false);
-                a64_emit_str_sp_off(shared, R0, body->slot_offset[0] + COLD_STR_FLAGS_OFFSET, false);
-                code_emit(shared, a64_ret());
-            } else {
-                code_emit(shared, a64_movz(R0, 0, 0));
-                code_emit(shared, a64_ret());
-            }
+            /* Stub: return 0 */
+            code_emit(shared, a64_movz(R0, 0, 0));
+            code_emit(shared, a64_ret());
         } else {
             codegen_func(shared, body, symbols, &function_patches);
         }
     }
 
-    /* Resolve inter-function patches and collect external call relocations */
-    int32_t reloc_cap = func_count * 16 + shared->global_reloc_count + 16;
-    int32_t *reloc_offsets = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
-    int32_t *reloc_symbols = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
-    uint8_t *reloc_types = arena_alloc(arena, (size_t)reloc_cap * sizeof(uint8_t));
-    uint8_t *reloc_pcrels = arena_alloc(arena, (size_t)reloc_cap * sizeof(uint8_t));
-    int32_t reloc_count = 0;
+    /* Resolve inter-function patches */
     for (int32_t pi = 0; pi < function_patches.count; pi++) {
         FunctionPatch patch = function_patches.items[pi];
         if (patch.target_function < 0 || patch.target_function >= func_count) continue;
         int32_t target_off = symbol_offset[patch.target_function];
-        if (target_off < 0) {
-            if (reloc_count < reloc_cap) {
-                reloc_offsets[reloc_count] = (int32_t)patch.pos * 4;
-                reloc_symbols[reloc_count] = patch.target_function;
-                reloc_types[reloc_count] = MACHO_ARM64_RELOC_BRANCH26;
-                reloc_pcrels[reloc_count] = 1;
-                reloc_count++;
-            }
-            continue;
-        }
+        if (target_off < 0) continue; /* target has no body, patch stays as-is */
         int32_t delta = target_off - (int32_t)patch.pos;
-	        shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
-	                                   ((uint32_t)delta & 0x03FFFFFFu);
-	    }
-    int32_t branch_reloc_count = reloc_count;
+        shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
+                                   ((uint32_t)delta & 0x03FFFFFFu);
+    }
 
-    /* Build name/offset arrays: locals first, then external references */
-    int32_t name_cap = func_count + branch_reloc_count + shared->global_reloc_count +
-                       symbols->global_count + 16;
-    const char **func_names = arena_alloc(arena, (size_t)name_cap * sizeof(const char *));
-    int32_t *func_offsets = arena_alloc(arena, (size_t)name_cap * sizeof(int32_t));
-    uint64_t *symbol_values = arena_alloc(arena, (size_t)name_cap * sizeof(uint64_t));
-    int16_t *symbol_descs = arena_alloc(arena, (size_t)name_cap * sizeof(int16_t));
+    /* Build name/offset arrays for macho_write_object */
+    const char **func_names = arena_alloc(arena, (size_t)func_count * sizeof(const char *));
+    int32_t *func_offsets = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
     int32_t name_count = 0;
-    int32_t local_count = 0;
-    int32_t *ext_map = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
-    for (int32_t i = 0; i < func_count; i++) ext_map[i] = -1;
-    int32_t *global_map = arena_alloc(arena, (size_t)(symbols->global_count > 0 ? symbols->global_count : 1) * sizeof(int32_t));
-    for (int32_t i = 0; i < symbols->global_count; i++) global_map[i] = -1;
     for (int32_t i = 0; i < func_count; i++) {
         if (symbol_offset[i] < 0) continue;
         Span nm = symbols->functions[i].name;
+        /* Dedup: skip if this name already in table (first definition wins) */
         bool dup = false;
         for (int32_t j = 0; j < name_count; j++) {
             if (func_names[j] && (int32_t)strlen(func_names[j]) == nm.len &&
                 memcmp(func_names[j], nm.ptr, (size_t)nm.len) == 0) { dup = true; break; }
         }
         if (dup) continue;
-        if (nm.len >= 8 && memcmp(nm.ptr, "ParamStr", 8) == 0) fprintf(stderr, "[cold_name] sym[%d] %.*s\n", name_count, (int)nm.len, nm.ptr);
         func_offsets[name_count] = symbol_offset[i];
-        bool has_dot = false;
-        for (int32_t k = 0; k < nm.len; k++) { if (nm.ptr[k] == '.') { has_dot = true; break; } }
-        if (!has_dot) local_count++;
         char *nc = arena_alloc(arena, (size_t)nm.len + 1);
         memcpy(nc, nm.ptr, (size_t)nm.len);
         nc[nm.len] = '\0';
         func_names[name_count] = nc;
-        symbol_values[name_count] = 0;
-        symbol_descs[name_count] = 0;
         name_count++;
-    }
-    /* Standalone mode: all defined symbols global for CRT/linker.
-       Provider mode (CHENG_NO_IMPORT_BODIES=1): only main is global. */
-    if (!getenv("CHENG_NO_IMPORT_BODIES")) local_count = name_count;
-
-    /* External symbols for relocation entries: strip module prefix,
-       mark with offset=-1 for N_UNDF|N_EXT */
-    for (int32_t ri = 0; ri < branch_reloc_count; ri++) {
-        int32_t target = reloc_symbols[ri];
-        if (ext_map[target] >= 0) continue;
-        Span nm = symbols->functions[target].name;
-        const char *base = (const char *)nm.ptr;
-        int32_t blen = nm.len;
-        for (int32_t k = nm.len - 1; k > 0; k--) {
-            if (nm.ptr[k] == '.') { base = (const char *)(nm.ptr + k + 1); blen = nm.len - k - 1; break; }
-        }
-        char *nc = arena_alloc(arena, (size_t)blen + 1);
-        memcpy(nc, base, (size_t)blen);
-        nc[blen] = '\0';
-        func_names[name_count] = nc;
-        func_offsets[name_count] = -1;
-        symbol_values[name_count] = 0;
-        symbol_descs[name_count] = 0;
-        ext_map[target] = name_count;
-        name_count++;
-    }
-    for (int32_t gri = 0; gri < shared->global_reloc_count; gri++) {
-        int32_t target = shared->global_relocs[gri].global_index;
-        if (target < 0 || target >= symbols->global_count) die("invalid global reloc target");
-        if (global_map[target] >= 0) continue;
-        GlobalDef *global = &symbols->globals[target];
-        char *nc = arena_alloc(arena, (size_t)global->name.len + 1);
-        memcpy(nc, global->name.ptr, (size_t)global->name.len);
-        nc[global->name.len] = '\0';
-        func_names[name_count] = nc;
-        func_offsets[name_count] = -1;
-        symbol_values[name_count] = (uint64_t)global->size;
-        symbol_descs[name_count] = 0;
-        global_map[target] = name_count;
-        name_count++;
-    }
-    for (int32_t ri = 0; ri < branch_reloc_count; ri++) {
-        int32_t mapped = ext_map[reloc_symbols[ri]];
-        if (mapped >= 0) reloc_symbols[ri] = mapped;
-    }
-    for (int32_t gri = 0; gri < shared->global_reloc_count; gri++) {
-        if (reloc_count >= reloc_cap) die("global reloc overflow");
-        CodeGlobalReloc reloc = shared->global_relocs[gri];
-        int32_t mapped = global_map[reloc.global_index];
-        if (mapped < 0) die("missing global reloc symbol");
-        reloc_offsets[reloc_count] = reloc.pos;
-        reloc_symbols[reloc_count] = mapped;
-        reloc_types[reloc_count] = reloc.reloc_type;
-        reloc_pcrels[reloc_count] = reloc.pcrel;
-        reloc_count++;
     }
 
     bool ok = macho_write_object(out_path, shared->words, shared->count,
-                                 func_names, func_offsets,
-                                 symbol_values, symbol_descs,
-                                 name_count, local_count,
-                                 reloc_offsets, reloc_symbols,
-                                 reloc_types, reloc_pcrels, reloc_count);
+                                 func_names, func_offsets, name_count);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;
 }
