@@ -344,9 +344,9 @@ static bool macho_write_object(const char *path,
     }
     for (int32_t i = 0; i < nsyms; i++) {
         syms[i].n_strx  = name_stroff[i];
-        if (i < local_count) {
-            syms[i].n_type  = N_SECT | N_EXT;
-            syms[i].n_sect  = 1; /* section 1 = __text */
+        if (offsets[i] >= 0) {
+            syms[i].n_type  = (uint8_t)((i < local_count) ? (N_SECT | N_EXT) : N_SECT);
+            syms[i].n_sect  = 1;
             syms[i].n_desc  = symbol_descs ? symbol_descs[i] : 0;
             syms[i].n_value = (uint64_t)(offsets[i] * 4);
         } else {

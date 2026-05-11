@@ -4625,6 +4625,8 @@ enum {
     BODY_OP_GLOBAL_ADDR = 116,
     BODY_OP_GLOBAL_LOAD = 117,
     BODY_OP_GLOBAL_STORE = 118,
+    BODY_OP_PTR_LOAD_U8 = 119,
+    BODY_OP_PTR_STORE_U8 = 120,
 };
 
 enum {
@@ -5825,6 +5827,49 @@ static bool cold_type_is_pointer_like(Symbols *symbols, Span type) {
     if (cold_type_has_pointer_suffix(type)) return true;
     Span resolved = cold_resolve_alias_target(symbols, type);
     return cold_type_has_pointer_suffix(resolved);
+}
+
+static Span cold_pointer_pointee_type(Symbols *symbols, Span type) {
+    type = cold_type_strip_var(type, 0);
+    type = span_trim(type);
+    Span resolved = cold_resolve_alias_target(symbols, type);
+    if (resolved.len > 0) type = resolved;
+    type = cold_type_strip_var(type, 0);
+    type = span_trim(type);
+    int32_t end = type.len - 1;
+    while (end >= 0 && (type.ptr[end] == ' ' || type.ptr[end] == '\t')) end--;
+    if (end < 0 || type.ptr[end] != '*') return (Span){0};
+    return span_trim(span_sub(type, 0, end));
+}
+
+static int32_t cold_pointer_pointee_memory_size(Symbols *symbols, Span pointee,
+                                                int32_t pointee_kind) {
+    pointee = span_trim(cold_type_strip_var(pointee, 0));
+    if (span_eq(pointee, "uint8") || span_eq(pointee, "char") ||
+        span_eq(pointee, "bool")) return 1;
+    if (span_eq(pointee, "uint16")) return 2;
+    if (pointee_kind == SLOT_I32) return 4;
+    if (pointee_kind == SLOT_I64 || pointee_kind == SLOT_PTR ||
+        pointee_kind == SLOT_OPAQUE || pointee_kind == SLOT_OPAQUE_REF ||
+        pointee_kind == SLOT_OBJECT_REF || pointee_kind == SLOT_STR_REF ||
+        pointee_kind == SLOT_SEQ_I32_REF || pointee_kind == SLOT_SEQ_STR_REF ||
+        pointee_kind == SLOT_I64_REF) return 8;
+    return cold_slot_size_from_type_with_symbols(symbols, pointee, pointee_kind);
+}
+
+static int32_t cold_sizeof_type(Symbols *symbols, Span type) {
+    type = span_trim(cold_type_strip_var(type, 0));
+    if (span_eq(type, "uint8") || span_eq(type, "char") ||
+        span_eq(type, "bool")) return 1;
+    if (span_eq(type, "uint16")) return 2;
+    if (span_eq(type, "int32") || span_eq(type, "int") ||
+        span_eq(type, "uint32") || span_eq(type, "i")) return 4;
+    if (span_eq(type, "int64") || span_eq(type, "uint64") ||
+        span_eq(type, "ptr") || cold_type_is_pointer_like(symbols, type)) return 8;
+    int32_t kind = cold_slot_kind_from_type_with_symbols(symbols, type);
+    int32_t size = cold_slot_size_from_type_with_symbols(symbols, type, kind);
+    if (size <= 0) die("sizeof type has unknown size");
+    return size;
 }
 
 static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type) {
@@ -7705,6 +7750,11 @@ static void cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
             if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) die("cold var object arg kind mismatch");
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             continue;
+        } else if (fn->param_kind[i] == SLOT_PTR &&
+                   (arg_kind == SLOT_STR || arg_kind == SLOT_STR_REF)) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32) {
+            continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
@@ -7756,6 +7806,11 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
         } else if (fn->param_kind[i] == SLOT_OBJECT_REF) {
             if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) return false;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_PTR &&
+                   (arg_kind == SLOT_STR || arg_kind == SLOT_STR_REF)) {
+            continue;
+        } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I32) {
             continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
             continue;
@@ -7810,6 +7865,9 @@ static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
             int32_t arg_kind = body->slot_kind[arg_slot];
             int32_t param_kind = fn->param_kind[p];
             if (arg_kind == param_kind) continue;
+            if (param_kind == SLOT_PTR &&
+                (arg_kind == SLOT_STR || arg_kind == SLOT_STR_REF)) continue;
+            if (param_kind == SLOT_I64 && arg_kind == SLOT_I32) continue;
             if ((param_kind == SLOT_OPAQUE || param_kind == SLOT_OPAQUE_REF) &&
                 (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
                  arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
@@ -7979,6 +8037,25 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
     }
     int32_t fn_index = symbols_find_fn_for_call(parser->symbols, name, body, arg_start, arg_count);
     if (fn_index < 0) {
+        fprintf(stderr, "cheng_cold: unresolved call name=%.*s arity=%d",
+                name.len, name.ptr, arg_count);
+        for (int32_t di = 0; di < arg_count; di++) {
+            int32_t ds = body->call_arg_slot[arg_start + di];
+            fprintf(stderr, " arg%d_kind=%d", di, body->slot_kind[ds]);
+        }
+        fprintf(stderr, "\n");
+        for (int32_t fi = 0; fi < parser->symbols->function_count; fi++) {
+            FnDef *dbg_fn = &parser->symbols->functions[fi];
+            if (dbg_fn->arity != arg_count || !span_same(dbg_fn->name, name)) continue;
+            fprintf(stderr, "cheng_cold: candidate name=%.*s ret=%.*s",
+                    dbg_fn->name.len, dbg_fn->name.ptr,
+                    dbg_fn->ret.len, dbg_fn->ret.ptr);
+            for (int32_t pi = 0; pi < dbg_fn->arity; pi++) {
+                fprintf(stderr, " p%d_kind=%d p%d_size=%d",
+                        pi, dbg_fn->param_kind[pi], pi, dbg_fn->param_size[pi]);
+            }
+            fprintf(stderr, "\n");
+        }
         /* Check for indirect call via local variable (function pointer) */
         Local *indirect_local = locals_find(locals, name);
         if (indirect_local && indirect_local->kind == SLOT_PTR) {
@@ -8521,6 +8598,54 @@ static Span parser_take_until_top_level_char(Parser *parser, uint8_t delimiter,
     if (parser->pos >= parser->source.len) return (Span){0}; /* unterminated */
     Span expr = span_trim(span_sub(parser->source, start, parser->pos));
     if (expr.len <= 0) return (Span){0}; /* empty expr */
+    return expr;
+}
+
+static Span parser_take_statement_expr_span(Parser *parser) {
+    parser_inline_ws(parser);
+    int32_t start = parser->pos;
+    int32_t depth = 0;
+    bool in_string = false;
+    bool in_char = false;
+    while (parser->pos < parser->source.len) {
+        uint8_t c = parser->source.ptr[parser->pos];
+        if (in_string) {
+            if (c == '\\' && parser->pos + 1 < parser->source.len) {
+                parser->pos += 2;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            parser->pos++;
+            continue;
+        }
+        if (in_char) {
+            if (c == '\\' && parser->pos + 1 < parser->source.len) {
+                parser->pos += 2;
+                continue;
+            }
+            if (c == '\'') in_char = false;
+            parser->pos++;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            parser->pos++;
+            continue;
+        }
+        if (c == '\'') {
+            in_char = true;
+            parser->pos++;
+            continue;
+        }
+        if (depth == 0 && (c == '\n' || c == '\r' || c == ';')) break;
+        if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') {
+            depth--;
+            if (depth < 0) die("unbalanced statement expression");
+        }
+        parser->pos++;
+    }
+    Span expr = span_trim(span_sub(parser->source, start, parser->pos));
     return expr;
 }
 
@@ -10357,6 +10482,8 @@ static bool cold_is_i64_cast_token(Span token) {
            span_eq(token, "UInt64");
 }
 
+static int32_t cold_materialize_i32_ref(BodyIR *body, int32_t slot, int32_t *kind);
+
 static int32_t cold_make_i64_const_slot(BodyIR *body, int64_t value) {
     uint64_t bits = (uint64_t)value;
     int32_t slot = body_slot(body, SLOT_I64, 8);
@@ -10405,16 +10532,23 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
     }
     int32_t value_kind = SLOT_I32;
     int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
-    if (value_kind != SLOT_I32) {
-        /* Non-int32 scalar cast: return 0 */
-        int32_t zero = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
-        *kind = SLOT_I32;
-        return zero;
-    }
     if (!parser_take(parser, ")")) return 0; /* skip malformed cast */;
+    value_slot = cold_materialize_i32_ref(body, value_slot, &value_kind);
+    if (value_kind == SLOT_I32) {
+        *kind = SLOT_I32;
+        return value_slot;
+    }
+    if (value_kind == SLOT_I64 || value_kind == SLOT_PTR) {
+        int32_t dst = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_COPY_I32, dst, value_slot, 0);
+        *kind = SLOT_I32;
+        return dst;
+    }
+    /* Non-int32 scalar cast: return 0 */
+    int32_t zero = body_slot(body, SLOT_I32, 4);
+    body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
     *kind = SLOT_I32;
-    return value_slot;
+    return zero;
 }
 
 static int32_t cold_materialize_str_data_ptr(BodyIR *body, int32_t slot, int32_t *kind) {
@@ -10459,6 +10593,12 @@ static int32_t parse_pointer_cast(Parser *parser, BodyIR *body,
 
 static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                              int32_t slot, int32_t *kind);
+static int32_t cold_materialize_i32_ref(BodyIR *body, int32_t slot, int32_t *kind);
+static int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *kind);
+static int32_t parse_pointer_deref_load_after_star(Parser *parser, BodyIR *body,
+                                                   Locals *locals, int32_t *kind);
+static int32_t parse_pointer_deref_assign_after_star(Parser *parser, BodyIR *body,
+                                                     Locals *locals, int32_t block);
 
 static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
     Span token = parser_token(parser);
@@ -10491,6 +10631,9 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         body_op3(body, BODY_OP_I32_CMP, dst, value_slot, zero, COND_EQ);
         *kind = SLOT_I32;
         return dst;
+    }
+    if (span_eq(token, "*")) {
+        return parse_pointer_deref_load_after_star(parser, body, locals, kind);
     }
 	    if (span_eq(token, "&")) {
 	        /* address-of: parse base local, then handle .field chain with FIELD_REF.
@@ -10589,6 +10732,16 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     }
     if (span_eq(token, "Fmt")) {
         return parse_fmt_literal(parser, body, locals, kind);
+    }
+    if (span_eq(token, "sizeof") && span_eq(parser_peek(parser), "(")) {
+        (void)parser_token(parser);
+        Span type = span_trim(parser_take_until_top_level_char(parser, ')',
+                                                                 "expected ) after sizeof"));
+        if (!parser_take(parser, ")")) die("expected ) after sizeof");
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, slot, cold_sizeof_type(parser->symbols, type), 0);
+        *kind = SLOT_I32;
+        return slot;
     }
     if (cold_is_scalar_identity_cast(token) && span_eq(parser_peek(parser), "(")) {
         return parse_scalar_identity_cast(parser, body, locals, token, kind);
@@ -11083,6 +11236,138 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
     return slot;
 }
 
+static int32_t parse_pointer_deref_target_after_star(Parser *parser, BodyIR *body,
+                                                     Locals *locals,
+                                                     int32_t *ptr_kind,
+                                                     Span *pointee_type,
+                                                     int32_t *pointee_kind,
+                                                     int32_t *mem_size) {
+    int32_t target_kind = SLOT_I32;
+    int32_t target_slot = parse_primary(parser, body, locals, &target_kind);
+    target_slot = parse_postfix(parser, body, locals, target_slot, &target_kind);
+    if (!cold_kind_is_pointer_sized_value(target_kind)) die("pointer deref target must be pointer-sized");
+    Span ptr_type = target_slot >= 0 && target_slot < body->slot_count
+                    ? body->slot_type[target_slot] : (Span){0};
+    Span pointee = cold_pointer_pointee_type(parser->symbols, ptr_type);
+    if (pointee.len <= 0) die("pointer deref requires typed pointer");
+    int32_t pk = cold_slot_kind_from_type_with_symbols(parser->symbols, pointee);
+    int32_t width = cold_pointer_pointee_memory_size(parser->symbols, pointee, pk);
+    if (width <= 0) die("pointer deref pointee has unknown size");
+    if (ptr_kind) *ptr_kind = target_kind;
+    if (pointee_type) *pointee_type = pointee;
+    if (pointee_kind) *pointee_kind = pk;
+    if (mem_size) *mem_size = width;
+    return target_slot;
+}
+
+static int32_t parse_pointer_deref_load_after_star(Parser *parser, BodyIR *body,
+                                                   Locals *locals, int32_t *kind) {
+    int32_t ptr_kind = SLOT_I32;
+    Span pointee = {0};
+    int32_t pointee_kind = SLOT_I32;
+    int32_t mem_size = 0;
+    int32_t ptr_slot = parse_pointer_deref_target_after_star(parser, body, locals,
+                                                             &ptr_kind, &pointee,
+                                                             &pointee_kind, &mem_size);
+    (void)ptr_kind;
+    if (mem_size == 1) {
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_slot_set_type(body, slot, pointee);
+        body_op(body, BODY_OP_PTR_LOAD_U8, slot, ptr_slot, 0);
+        *kind = SLOT_I32;
+        return slot;
+    }
+    if (mem_size == 4 && pointee_kind == SLOT_I32) {
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_slot_set_type(body, slot, pointee);
+        body_op(body, BODY_OP_PTR_LOAD_I32, slot, ptr_slot, 0);
+        *kind = SLOT_I32;
+        return slot;
+    }
+    if (mem_size == 8 && (pointee_kind == SLOT_I64 || pointee_kind == SLOT_PTR ||
+                          pointee_kind == SLOT_OPAQUE || pointee_kind == SLOT_OPAQUE_REF ||
+                          pointee_kind == SLOT_OBJECT_REF || pointee_kind == SLOT_STR_REF ||
+                          pointee_kind == SLOT_SEQ_I32_REF || pointee_kind == SLOT_SEQ_STR_REF ||
+                          pointee_kind == SLOT_I64_REF)) {
+        int32_t result_kind = pointee_kind == SLOT_PTR ? SLOT_PTR : SLOT_I64;
+        int32_t slot = body_slot(body, result_kind, 8);
+        body_slot_set_type(body, slot, pointee);
+        body_op(body, BODY_OP_PTR_LOAD_I64, slot, ptr_slot, 0);
+        *kind = result_kind;
+        return slot;
+    }
+    die("unsupported pointer deref load width");
+    return 0;
+}
+
+static int32_t parse_pointer_deref_assign_after_star(Parser *parser, BodyIR *body,
+                                                     Locals *locals, int32_t block) {
+    Span target = span_trim(parser_take_until_top_level_char(parser, '=',
+                                                             "expected = after pointer deref assignment"));
+    if (!parser_take(parser, "=")) die("expected = after pointer deref target");
+    Parser target_parser = {target, 0, parser->arena, parser->symbols, parser->import_mode};
+    int32_t ptr_kind = SLOT_I32;
+    Span pointee = {0};
+    int32_t pointee_kind = SLOT_I32;
+    int32_t mem_size = 0;
+    int32_t ptr_slot = parse_pointer_deref_target_after_star(&target_parser, body, locals,
+                                                             &ptr_kind, &pointee,
+                                                             &pointee_kind, &mem_size);
+    (void)ptr_kind;
+    parser_ws(&target_parser);
+    if (target_parser.pos != target_parser.source.len) die("unsupported pointer deref target");
+    int32_t value_kind = SLOT_I32;
+    Span value_expr = parser_take_statement_expr_span(parser);
+    Parser value_parser = {value_expr, 0, parser->arena, parser->symbols, parser->import_mode};
+    int32_t value_slot = parse_expr(&value_parser, body, locals, &value_kind);
+    parser_inline_ws(&value_parser);
+    if (value_parser.pos != value_parser.source.len) die("unsupported trailing pointer store expression");
+    if (mem_size == 1) {
+        value_slot = cold_materialize_i32_ref(body, value_slot, &value_kind);
+        if (value_kind != SLOT_I32) die("uint8 pointer store value mismatch");
+        body_op(body, BODY_OP_PTR_STORE_U8, ptr_slot, value_slot, 0);
+        return block;
+    }
+    if (mem_size == 4 && pointee_kind == SLOT_I32) {
+        value_slot = cold_materialize_i32_ref(body, value_slot, &value_kind);
+        if (value_kind != SLOT_I32) die("int32 pointer store value mismatch");
+        body_op(body, BODY_OP_PTR_STORE_I32, ptr_slot, value_slot, 0);
+        return block;
+    }
+    if (mem_size == 8 && pointee_kind == SLOT_I64) {
+        if (value_kind == SLOT_I32) value_slot = cold_materialize_i64_value(body, value_slot, &value_kind);
+        if (value_kind != SLOT_I64) die("int64 pointer store value mismatch");
+        body_op(body, BODY_OP_PTR_STORE_I64, ptr_slot, value_slot, 0);
+        return block;
+    }
+    if (mem_size == 8 && (pointee_kind == SLOT_PTR || pointee_kind == SLOT_OPAQUE ||
+                          pointee_kind == SLOT_OPAQUE_REF || pointee_kind == SLOT_OBJECT_REF ||
+                          pointee_kind == SLOT_STR_REF || pointee_kind == SLOT_SEQ_I32_REF ||
+                          pointee_kind == SLOT_SEQ_STR_REF || pointee_kind == SLOT_I64_REF)) {
+        value_slot = cold_materialize_str_data_ptr(body, value_slot, &value_kind);
+        if (!cold_kind_is_pointer_sized_value(value_kind)) die("pointer store value mismatch");
+        body_op(body, BODY_OP_PTR_STORE_I64, ptr_slot, value_slot, 0);
+        return block;
+    }
+    die("unsupported pointer deref store width");
+    return block;
+}
+
+static ObjectField *cold_resolve_pointer_field(Parser *parser, BodyIR *body,
+                                               int32_t ptr_slot, Span field_name,
+                                               ObjectDef **object_out) {
+    if (ptr_slot < 0 || ptr_slot >= body->slot_count) die("pointer field base slot out of range");
+    Span ptr_type = body->slot_type[ptr_slot];
+    Span pointee = cold_pointer_pointee_type(parser->symbols, ptr_type);
+    if (pointee.len <= 0) die("pointer field access requires typed pointer");
+    ObjectDef *object = symbols_resolve_object(parser->symbols, pointee);
+    if (!object) die("pointer field access requires object pointee");
+    ObjectField *field = object_find_field(object, field_name);
+    if (!field) die("unknown pointer field");
+    if (object_out) *object_out = object;
+    return field;
+}
+
 static bool cold_span_is_compare_token(Span op);
 static int32_t cold_cond_from_compare_token(Span op);
 static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind);
@@ -11350,10 +11635,8 @@ static int32_t cold_cond_from_compare_token(Span op) {
 static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t block) {
     int32_t kind = SLOT_I32;
     int32_t slot = -1;
-    parser_inline_ws(parser);
-    if (parser->pos >= parser->source.len ||
-        parser->source.ptr[parser->pos] == '\n' ||
-        parser->source.ptr[parser->pos] == '\r') {
+    Span return_expr = parser_take_statement_expr_span(parser);
+    if (return_expr.len <= 0) {
         if (!cold_return_span_is_void(body->return_type)) die("non-void return requires value");
         slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
@@ -11362,22 +11645,24 @@ static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t b
         body_end_block(body, block, term);
         return;
     }
-    Span next = parser_peek(parser);
+    Parser return_parser = {return_expr, 0, parser->arena, parser->symbols, parser->import_mode};
+    Span next = parser_peek(&return_parser);
     Variant *return_variant = 0;
     if (body->return_kind == SLOT_VARIANT && body->return_type.len > 0) {
         TypeDef *return_type = symbols_resolve_type(parser->symbols, body->return_type);
         return_variant = type_find_variant(return_type, next);
     }
     if (return_variant) {
-        (void)parser_token(parser);
-        slot = parse_constructor(parser, body, locals, return_variant);
+        (void)parser_token(&return_parser);
+        slot = parse_constructor(&return_parser, body, locals, return_variant);
         kind = SLOT_VARIANT;
     } else {
-        slot = parse_expr(parser, body, locals, &kind);
+        slot = parse_expr(&return_parser, body, locals, &kind);
     }
-    parser_inline_ws(parser);
-    if (parser->pos < parser->source.len && parser->source.ptr[parser->pos] == '?') {
-        (void)parser_token(parser);  /* consume ? */
+    parser_inline_ws(&return_parser);
+    if (return_parser.pos < return_parser.source.len &&
+        return_parser.source.ptr[return_parser.pos] == '?') {
+        (void)parser_token(&return_parser);  /* consume ? */
         if (kind == SLOT_VARIANT) {
             TypeDef *rqtype = cold_question_result_type(parser->symbols, body, slot);
             if (rqtype && rqtype->variant_count == 2 &&
@@ -11427,6 +11712,15 @@ static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t b
         }
         /* Non-variant ?: treat as unsupported */
         return;
+    }
+    parser_inline_ws(&return_parser);
+    if (return_parser.pos != return_parser.source.len) {
+        fprintf(stderr, "cheng_cold: unsupported trailing return expression fn=%.*s expr=%.*s tail=%.*s\n",
+                body->debug_name.len, body->debug_name.ptr,
+                return_expr.len, return_expr.ptr,
+                return_parser.source.len - return_parser.pos,
+                return_parser.source.ptr + return_parser.pos);
+        die("unsupported trailing return expression");
     }
     if (body->return_kind == SLOT_I32) {
         slot = cold_materialize_i32_ref(body, slot, &kind);
@@ -11693,7 +11987,19 @@ static void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name
             die("expected = in assignment");
         }
         int32_t dummy_kind = SLOT_I32;
-        (void)parse_expr(parser, body, locals, &dummy_kind);
+        Span dummy_expr = parser_take_statement_expr_span(parser);
+        Parser dummy_parser = {dummy_expr, 0, parser->arena, parser->symbols, parser->import_mode};
+        (void)parse_expr(&dummy_parser, body, locals, &dummy_kind);
+        parser_inline_ws(&dummy_parser);
+        if (dummy_parser.pos != dummy_parser.source.len) {
+            fprintf(stderr, "cheng_cold: unsupported trailing assignment expression fn=%.*s target=%.*s expr=%.*s tail=%.*s\n",
+                    body->debug_name.len, body->debug_name.ptr,
+                    name.len, name.ptr,
+                    dummy_expr.len, dummy_expr.ptr,
+                    dummy_parser.source.len - dummy_parser.pos,
+                    dummy_parser.source.ptr + dummy_parser.pos);
+            die("unsupported trailing assignment expression");
+        }
         return;
     }
     if (!parser_take(parser, "=")) {
@@ -11704,7 +12010,19 @@ static void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name
         die("expected = in assignment");
     }
     int32_t kind = SLOT_I32;
-    int32_t slot = parse_expr(parser, body, locals, &kind);
+    Span value_expr = parser_take_statement_expr_span(parser);
+    Parser value_parser = {value_expr, 0, parser->arena, parser->symbols, parser->import_mode};
+    int32_t slot = parse_expr(&value_parser, body, locals, &kind);
+    parser_inline_ws(&value_parser);
+    if (value_parser.pos != value_parser.source.len) {
+        fprintf(stderr, "cheng_cold: unsupported trailing assignment expression fn=%.*s target=%.*s expr=%.*s tail=%.*s\n",
+                body->debug_name.len, body->debug_name.ptr,
+                name.len, name.ptr,
+                value_expr.len, value_expr.ptr,
+                value_parser.source.len - value_parser.pos,
+                value_parser.source.ptr + value_parser.pos);
+        die("unsupported trailing assignment expression");
+    }
     if (global) {
         if (global->kind == SLOT_I32) {
             slot = cold_materialize_i32_ref(body, slot, &kind);
@@ -12951,6 +13269,16 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
     int32_t stmt_indent = parser_next_indent(parser);
     Span kw = parser_token(parser);
     if (kw.len == 0) return block;
+    if (span_eq(kw, "=") || span_eq(kw, "==")) {
+        int32_t line_start = (int32_t)(kw.ptr - parser->source.ptr);
+        while (line_start > 0 && parser->source.ptr[line_start - 1] != '\n') line_start--;
+        int32_t line_end = (int32_t)(kw.ptr - parser->source.ptr);
+        while (line_end < parser->source.len && parser->source.ptr[line_end] != '\n') line_end++;
+        fprintf(stderr, "cheng_cold: statement op token=%.*s fn=%.*s line=%.*s\n",
+                kw.len, kw.ptr,
+                body->debug_name.len, body->debug_name.ptr,
+                line_end - line_start, parser->source.ptr + line_start);
+    }
     if (span_eq(kw, "let") || span_eq(kw, "var")) {
         return parse_let_binding(parser, body, locals, block, span_eq(kw, "var"));
     } else if (span_eq(kw, "return")) {
@@ -12974,6 +13302,8 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
         return block;
     } else if (span_eq(kw, "add")) {
         return parse_builtin_add_after_name(parser, body, locals, block);
+    } else if (span_eq(kw, "*")) {
+        return parse_pointer_deref_assign_after_star(parser, body, locals, block);
     } else if (parser_next_is_qualified_call(parser) || span_eq(parser_peek(parser), "(")) {
         Span call_name = kw;
         if (parser_next_is_qualified_call(parser)) {
@@ -17743,6 +18073,14 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         code_emit(code, a64_str_imm(R0, R1, 0, true));
+    } else if (kind == BODY_OP_PTR_LOAD_U8) {
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
+        code_emit(code, a64_ldrb_imm(R0, R1, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+    } else if (kind == BODY_OP_PTR_STORE_U8) {
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        code_emit(code, a64_strb_imm(R0, R1, 0));
     } else if (kind == BODY_OP_WRITE_RAW) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], true);
@@ -19780,6 +20118,10 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         symbol_descs[name_count] = 0;
         name_count++;
     }
+    /* Standalone mode: all defined symbols global for CRT/linker.
+       Provider mode (CHENG_NO_IMPORT_BODIES=1): only main is global. */
+    if (!getenv("CHENG_NO_IMPORT_BODIES")) local_count = name_count;
+
     /* External symbols for relocation entries: strip module prefix,
        mark with offset=-1 for N_UNDF|N_EXT */
     for (int32_t ri = 0; ri < branch_reloc_count; ri++) {
