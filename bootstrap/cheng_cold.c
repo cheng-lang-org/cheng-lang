@@ -2103,6 +2103,7 @@ static Span cold_type_strip_var(Span type, bool *is_var);
 static bool cold_parse_i32_array_type(Span type, int32_t *len_out);
 static bool cold_parse_i32_seq_type(Span type);
 static bool cold_parse_str_seq_type(Span type);
+static bool cold_parse_opaque_seq_type(Span type);
 static bool cold_type_has_qualified_name(Span type);
 static void cold_write_param_specs(FILE *file, Span params) {
     int32_t pos = 0;
@@ -2148,7 +2149,8 @@ static void cold_write_param_specs(FILE *file, Span params) {
             bool is_var_param = false;
             (void)cold_type_strip_var(param_type, &is_var_param);
             if ((is_var_param || kind_code == 'v' || kind_code == 'q' ||
-                 kind_code == 't' || kind_code == 'o') &&
+                 kind_code == 't' || kind_code == 'u' || kind_code == 'U' ||
+                 kind_code == 'o') &&
                 param_type.len > 0 && !span_eq(param_type, "v")) {
                 fputc(':', file);
                 cold_write_span(file, param_type);
@@ -2186,6 +2188,7 @@ static char cold_param_kind_code_from_type(Span type) {
     type = cold_type_strip_var(type, &is_var);
     if (is_var && (span_eq(type, "str") || span_eq(type, "cstring"))) return 'S';
     if (is_var && cold_parse_str_seq_type(type)) return 'T';
+    if (is_var && cold_parse_opaque_seq_type(type)) return 'U';
     if (is_var && cold_type_has_qualified_name(type)) return 'O';
     if (span_eq(type, "str") || span_eq(type, "cstring")) return 's';
     if (span_eq(type, "int64") || span_eq(type, "uint64")) return 'l';
@@ -2196,6 +2199,7 @@ static char cold_param_kind_code_from_type(Span type) {
         span_eq(type, "void") || type.len == 0) return 'i';
     if (cold_parse_i32_seq_type(type)) return 'q';
     if (cold_parse_str_seq_type(type)) return 't';
+    if (cold_parse_opaque_seq_type(type)) return 'u';
     if (span_eq(type, "ptr")) return 'o';
     if (cold_type_has_qualified_name(type)) return 'o';
     if (cold_span_starts_with(type, "uint8[")) return 'i';
@@ -4626,6 +4630,10 @@ enum {
     BODY_OP_SLOT_STORE_I32 = 117,
     BODY_OP_SLOT_STORE_I64 = 118,
     BODY_OP_EXEC_SHELL = 119,
+    BODY_OP_SEQ_OPAQUE_INDEX_DYNAMIC = 120,
+    BODY_OP_SEQ_OPAQUE_ADD = 121,
+    BODY_OP_SEQ_OPAQUE_INDEX_STORE = 122,
+    BODY_OP_SEQ_OPAQUE_REMOVE = 123,
 };
 
 enum {
@@ -4665,6 +4673,7 @@ enum {
     SLOT_I64_REF = 18,
     SLOT_F32 = 19,
     SLOT_F64 = 20,
+    SLOT_SEQ_OPAQUE_REF = 21,
 };
 
 enum {
@@ -4687,6 +4696,8 @@ static int32_t cold_slot_kind_from_code(char code) {
     if (code == 'q') return SLOT_SEQ_I32;
     if (code == 't') return SLOT_SEQ_STR;
     if (code == 'T') return SLOT_SEQ_STR_REF;
+    if (code == 'u') return SLOT_SEQ_OPAQUE;
+    if (code == 'U') return SLOT_SEQ_OPAQUE_REF;
     if (code == 'o') return SLOT_OPAQUE;
     if (code == 'O') return SLOT_OPAQUE_REF;
     die("unknown cold field kind code");
@@ -4711,6 +4722,7 @@ static int32_t cold_slot_size_for_kind(int32_t kind) {
     if (kind == SLOT_I32_REF || kind == SLOT_I64_REF ||
         kind == SLOT_SEQ_I32_REF || kind == SLOT_OBJECT_REF ||
         kind == SLOT_STR_REF || kind == SLOT_SEQ_STR_REF ||
+        kind == SLOT_SEQ_OPAQUE_REF ||
         kind == SLOT_OPAQUE || kind == SLOT_OPAQUE_REF) return 8;
     die("unknown cold slot kind size");
     return 4;
@@ -5182,6 +5194,8 @@ static void symbols_add_str_const(Symbols *symbols, Span name, Span str_val) {
 
 static bool cold_fn_param_kind_can_refine(int32_t existing, int32_t fresh) {
     if (existing == fresh) return true;
+    if (existing == SLOT_VARIANT &&
+        (fresh == SLOT_I32 || fresh == SLOT_OBJECT || fresh == SLOT_SEQ_OPAQUE)) return true;
     if (existing == SLOT_OPAQUE &&
         (fresh == SLOT_OBJECT || fresh == SLOT_VARIANT || fresh == SLOT_SEQ_OPAQUE)) return true;
     if (existing == SLOT_OPAQUE_REF &&
@@ -5440,6 +5454,26 @@ static Variant *type_find_variant(TypeDef *type, Span name) {
     if (!type) return 0;
     for (int32_t i = 0; i < type->variant_count; i++) {
         if (span_same(type->variants[i].name, name)) return &type->variants[i];
+    }
+    int32_t name_start = 0;
+    for (int32_t i = name.len - 1; i >= 0; i--) {
+        if (name.ptr[i] == '.') {
+            name_start = i + 1;
+            break;
+        }
+    }
+    Span short_name = span_sub(name, name_start, name.len);
+    for (int32_t i = 0; i < type->variant_count; i++) {
+        Span candidate = type->variants[i].name;
+        int32_t candidate_start = 0;
+        for (int32_t j = candidate.len - 1; j >= 0; j--) {
+            if (candidate.ptr[j] == '.') {
+                candidate_start = j + 1;
+                break;
+            }
+        }
+        if (span_same(span_sub(candidate, candidate_start, candidate.len), short_name))
+            return &type->variants[i];
     }
     return 0;
 }
@@ -5718,6 +5752,7 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (is_var && (span_eq(type, "str") || span_eq(type, "cstring"))) return SLOT_STR_REF;
     if (is_var && cold_parse_i32_seq_type(type)) return SLOT_SEQ_I32_REF;
     if (is_var && cold_parse_str_seq_type(type)) return SLOT_SEQ_STR_REF;
+    if (is_var && cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE_REF;
     if (is_var && symbols && symbols_resolve_object(symbols, type)) return SLOT_OBJECT_REF;
     if (is_var && cold_type_has_qualified_name(type)) return SLOT_OPAQUE_REF;
     if (cold_parse_i32_array_type(type, &array_len)) return SLOT_ARRAY_I32;
@@ -5754,7 +5789,8 @@ static int32_t cold_slot_size_from_type_with_symbols(Symbols *symbols, Span type
     int32_t array_len = 0;
     if (kind == SLOT_I32_REF || kind == SLOT_I64_REF ||
         kind == SLOT_SEQ_I32_REF || kind == SLOT_OBJECT_REF ||
-        kind == SLOT_STR_REF || kind == SLOT_SEQ_STR_REF || kind == SLOT_OPAQUE_REF) return 8;
+        kind == SLOT_STR_REF || kind == SLOT_SEQ_STR_REF ||
+        kind == SLOT_SEQ_OPAQUE_REF || kind == SLOT_OPAQUE_REF) return 8;
     if (kind == SLOT_ARRAY_I32) {
         int32_t elem_size = 4;
         if (cold_span_starts_with(span_trim(type), "uint8[")) {
@@ -5791,6 +5827,44 @@ static int32_t cold_slot_size_from_type_with_symbols(Symbols *symbols, Span type
         return symbols_type_slot_size(def);
     }
     return cold_slot_size_for_kind(kind);
+}
+
+static Span cold_seq_opaque_element_type(Span type) {
+    type = span_trim(cold_type_strip_var(type, 0));
+    if (cold_parse_opaque_seq_type(type)) {
+        return span_trim(span_sub(type, 0, type.len - 2));
+    }
+    return type;
+}
+
+static int32_t cold_seq_opaque_element_size_from_type(Symbols *symbols, Span type) {
+    Span elem = cold_seq_opaque_element_type(type);
+    if (elem.len <= 0) die("opaque sequence element type missing");
+    int32_t kind = cold_slot_kind_from_type_with_symbols(symbols, elem);
+    if (kind == SLOT_SEQ_OPAQUE || kind == SLOT_SEQ_OPAQUE_REF)
+        die("nested opaque sequence element unsupported");
+    int32_t size = cold_slot_size_from_type_with_symbols(symbols, elem, kind);
+    if (size <= 0) die("opaque sequence element size missing");
+    return size;
+}
+
+static void body_slot_set_seq_opaque_type(BodyIR *body, Symbols *symbols,
+                                          int32_t slot, Span type) {
+    body_slot_set_type(body, slot, cold_seq_opaque_element_type(type));
+    body->slot_aux[slot] = cold_seq_opaque_element_size_from_type(symbols, type);
+}
+
+static int32_t cold_seq_opaque_element_size_for_slot(Symbols *symbols, BodyIR *body,
+                                                     int32_t slot) {
+    if (slot >= 0 && slot < body->slot_count && body->slot_aux[slot] > 0) {
+        return body->slot_aux[slot];
+    }
+    if (slot < 0 || slot >= body->slot_count || body->slot_type[slot].len <= 0) {
+        die("opaque sequence element metadata missing");
+    }
+    int32_t size = cold_seq_opaque_element_size_from_type(symbols, body->slot_type[slot]);
+    body->slot_aux[slot] = size;
+    return size;
 }
 
 static TypeDef *symbols_resolve_type(Symbols *symbols, Span type_name) {
@@ -6250,6 +6324,7 @@ static int32_t cold_param_size_from_type(Symbols *symbols, Span type, int32_t ki
     if (kind == SLOT_I32_REF || kind == SLOT_I64_REF ||
         kind == SLOT_SEQ_I32_REF || kind == SLOT_OBJECT_REF ||
         kind == SLOT_STR_REF || kind == SLOT_SEQ_STR_REF ||
+        kind == SLOT_SEQ_OPAQUE_REF ||
         kind == SLOT_OPAQUE || kind == SLOT_OPAQUE_REF) return 8;
     if (kind == SLOT_OBJECT) return symbols ? symbols_object_slot_size(symbols_resolve_object(symbols, type)) : 0;
     if (kind == SLOT_ARRAY_I32) return cold_slot_size_from_type_with_symbols(symbols, type, kind);
@@ -6280,6 +6355,7 @@ static int32_t cold_arg_reg_count(int32_t kind, int32_t size) {
     if (kind == SLOT_I32_REF ||
         kind == SLOT_SEQ_I32_REF || kind == SLOT_OBJECT_REF ||
         kind == SLOT_STR_REF || kind == SLOT_SEQ_STR_REF ||
+        kind == SLOT_SEQ_OPAQUE_REF ||
         kind == SLOT_OPAQUE || kind == SLOT_OPAQUE_REF) return 1;
     die("unsupported cold call ABI kind");
     return 1;
@@ -7464,6 +7540,8 @@ static void cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
             if (arg_kind != SLOT_SEQ_I32 && arg_kind != SLOT_SEQ_I32_REF) die("cold var int32[] arg kind mismatch");
         } else if (fn->param_kind[i] == SLOT_SEQ_STR_REF) {
             if (arg_kind != SLOT_SEQ_STR && arg_kind != SLOT_SEQ_STR_REF) die("cold var str[] arg kind mismatch");
+        } else if (fn->param_kind[i] == SLOT_SEQ_OPAQUE_REF) {
+            if (arg_kind != SLOT_SEQ_OPAQUE && arg_kind != SLOT_SEQ_OPAQUE_REF) die("cold var opaque[] arg kind mismatch");
         } else if (fn->param_kind[i] == SLOT_STR_REF) {
             if (arg_kind != SLOT_STR && arg_kind != SLOT_STR_REF) die("cold var str arg kind mismatch");
         } else if (fn->param_kind[i] == SLOT_OBJECT_REF) {
@@ -7480,12 +7558,14 @@ static void cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
                    (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
                     arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                     arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
-                    arg_kind == SLOT_VARIANT || arg_kind == SLOT_OPAQUE)) {
+                    arg_kind == SLOT_VARIANT || arg_kind == SLOT_SEQ_OPAQUE ||
+                    arg_kind == SLOT_SEQ_OPAQUE_REF || arg_kind == SLOT_OPAQUE)) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OPAQUE_REF &&
                    (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
                     arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                     arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
+                    arg_kind == SLOT_SEQ_OPAQUE || arg_kind == SLOT_SEQ_OPAQUE_REF ||
                     arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF ||
                     arg_kind == SLOT_VARIANT)) {
             continue;
@@ -7496,10 +7576,12 @@ static void cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
         }
         int32_t arg_size = body->slot_size[arg_slot];
         int32_t param_size = fn->param_size[i] > 0 ? fn->param_size[i] : arg_size;
-        if ((arg_kind == SLOT_VARIANT || arg_kind == SLOT_OBJECT || arg_kind == SLOT_ARRAY_I32) &&
+        if ((arg_kind == SLOT_VARIANT || arg_kind == SLOT_OBJECT || arg_kind == SLOT_ARRAY_I32 ||
+             arg_kind == SLOT_SEQ_OPAQUE) &&
             fn->param_kind[i] != SLOT_I32_REF &&
             fn->param_kind[i] != SLOT_I32 &&
             fn->param_kind[i] != SLOT_OBJECT_REF &&
+            fn->param_kind[i] != SLOT_SEQ_OPAQUE_REF &&
             arg_size != param_size) {
             return; /* skip variant arg mismatch */
         }
@@ -7519,6 +7601,8 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
             if (arg_kind != SLOT_SEQ_I32 && arg_kind != SLOT_SEQ_I32_REF) return false;
         } else if (fn->param_kind[i] == SLOT_SEQ_STR_REF) {
             if (arg_kind != SLOT_SEQ_STR && arg_kind != SLOT_SEQ_STR_REF) return false;
+        } else if (fn->param_kind[i] == SLOT_SEQ_OPAQUE_REF) {
+            if (arg_kind != SLOT_SEQ_OPAQUE && arg_kind != SLOT_SEQ_OPAQUE_REF) return false;
         } else if (fn->param_kind[i] == SLOT_STR_REF) {
             if (arg_kind != SLOT_STR && arg_kind != SLOT_STR_REF) return false;
         } else if (fn->param_kind[i] == SLOT_OBJECT_REF) {
@@ -7533,13 +7617,15 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
             continue;
         } else if (fn->param_kind[i] == SLOT_OPAQUE &&
                    (arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
-                    arg_kind == SLOT_VARIANT || arg_kind == SLOT_OPAQUE)) {
+                    arg_kind == SLOT_VARIANT || arg_kind == SLOT_SEQ_OPAQUE ||
+                    arg_kind == SLOT_SEQ_OPAQUE_REF || arg_kind == SLOT_OPAQUE)) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OPAQUE_REF &&
                    (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
                     arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                     arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
                     arg_kind == SLOT_VARIANT ||
+                    arg_kind == SLOT_SEQ_OPAQUE || arg_kind == SLOT_SEQ_OPAQUE_REF ||
                     arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OBJECT && arg_kind == SLOT_OBJECT_REF) {
@@ -7549,10 +7635,12 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
         }
         int32_t arg_size = body->slot_size[arg_slot];
         int32_t param_size = fn->param_size[i] > 0 ? fn->param_size[i] : arg_size;
-        if ((arg_kind == SLOT_VARIANT || arg_kind == SLOT_OBJECT || arg_kind == SLOT_ARRAY_I32) &&
+        if ((arg_kind == SLOT_VARIANT || arg_kind == SLOT_OBJECT || arg_kind == SLOT_ARRAY_I32 ||
+             arg_kind == SLOT_SEQ_OPAQUE) &&
             fn->param_kind[i] != SLOT_I32_REF &&
             fn->param_kind[i] != SLOT_I32 &&
             fn->param_kind[i] != SLOT_OBJECT_REF &&
+            fn->param_kind[i] != SLOT_SEQ_OPAQUE_REF &&
             arg_size != param_size) {
             return false;
         }
@@ -7625,7 +7713,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
             arg_kind != SLOT_OBJECT && arg_kind != SLOT_ARRAY_I32 &&
             arg_kind != SLOT_SEQ_I32 && arg_kind != SLOT_SEQ_I32_REF &&
             arg_kind != SLOT_SEQ_STR && arg_kind != SLOT_SEQ_STR_REF &&
-            arg_kind != SLOT_SEQ_OPAQUE &&
+            arg_kind != SLOT_SEQ_OPAQUE && arg_kind != SLOT_SEQ_OPAQUE_REF &&
             arg_kind != SLOT_OBJECT_REF &&
             arg_kind != SLOT_PTR &&
             arg_kind != SLOT_OPAQUE && arg_kind != SLOT_OPAQUE_REF) die("unsupported cold function call arg kind");
@@ -7800,7 +7888,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
               }
               if (dot > 0) {
                   Span tn = span_sub(name, 0, dot);
-                  Span vn = span_sub(name, dot + 1, name.len - dot - 1);
+                  Span vn = span_sub(name, dot + 1, name.len);
                   for (int32_t ti = 0; ti < parser->symbols->type_count; ti++) {
                       TypeDef *ty = &parser->symbols->types[ti];
                       if (span_same(ty->name, tn)) {
@@ -7897,7 +7985,7 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
             arg_kind != SLOT_OBJECT && arg_kind != SLOT_ARRAY_I32 &&
             arg_kind != SLOT_SEQ_I32 && arg_kind != SLOT_SEQ_I32_REF &&
             arg_kind != SLOT_SEQ_STR && arg_kind != SLOT_SEQ_STR_REF &&
-            arg_kind != SLOT_SEQ_OPAQUE &&
+            arg_kind != SLOT_SEQ_OPAQUE && arg_kind != SLOT_SEQ_OPAQUE_REF &&
             arg_kind != SLOT_OBJECT_REF &&
             arg_kind != SLOT_PTR &&
             arg_kind != SLOT_OPAQUE && arg_kind != SLOT_OPAQUE_REF) die("unsupported cold function call arg kind");
@@ -8130,6 +8218,19 @@ static int32_t parse_object_constructor(Parser *parser, BodyIR *body, Locals *lo
             value_slot = seq_slot;
             value_kind = SLOT_SEQ_I32;
         }
+        if (field->kind == SLOT_SEQ_OPAQUE && value_kind == SLOT_SEQ_I32) {
+            int32_t seq_slot = body_slot(body, SLOT_SEQ_OPAQUE, 16);
+            body_slot_set_seq_opaque_type(body, parser->symbols, seq_slot, field->type_name);
+            body_op3(body, BODY_OP_MAKE_COMPOSITE, seq_slot, 0, -1, 0);
+            value_slot = seq_slot;
+            value_kind = SLOT_SEQ_OPAQUE;
+        }
+        if (value_kind == SLOT_VARIANT && field->kind == SLOT_I32) {
+            int32_t tag_slot = body_slot(body, SLOT_I32, 4);
+            body_op(body, BODY_OP_TAG_LOAD, tag_slot, value_slot, 0);
+            value_slot = tag_slot;
+            value_kind = SLOT_I32;
+        }
         if (value_kind != field->kind) {
             /* Skip mismatched field */
             continue;
@@ -8279,7 +8380,7 @@ static Span parser_take_until_top_level_char(Parser *parser, uint8_t delimiter,
             parser->pos++;
             continue;
         }
-        if (c == '\n' || c == '\r') return (Span){0}; /* unterminated */
+        if (c == '\n' || c == '\r') die(missing_message);
         if (c == '"') {
             in_string = true;
             parser->pos++;
@@ -8293,9 +8394,9 @@ static Span parser_take_until_top_level_char(Parser *parser, uint8_t delimiter,
         }
         parser->pos++;
     }
-    if (parser->pos >= parser->source.len) return (Span){0}; /* unterminated */
+    if (parser->pos >= parser->source.len) die(missing_message);
     Span expr = span_trim(span_sub(parser->source, start, parser->pos));
-    if (expr.len <= 0) return (Span){0}; /* empty expr */
+    if (expr.len <= 0) die(missing_message);
     return expr;
 }
 
@@ -10678,6 +10779,17 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         if (!span_eq(parser_peek(parser), "(")) {
             /* Not followed by '(' — try variant constructor (Type.Variant) */
             Variant *vc = symbols_find_variant(parser->symbols, call_name);
+            if (!vc) {
+                int32_t dot = -1;
+                for (int32_t i = call_name.len - 1; i > 0; i--) {
+                    if (call_name.ptr[i] == '.') { dot = i; break; }
+                }
+                if (dot > 0) {
+                    vc = symbols_find_variant(parser->symbols,
+                                              span_sub(call_name, dot + 1,
+                                                       call_name.len));
+                }
+            }
             if (vc) {
                 *kind = SLOT_VARIANT;
                 if (vc->field_count > 0) {
@@ -10707,7 +10819,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
             }
             if (dot > 0) {
                 Span type_name = span_sub(qualified, 0, dot);
-                Span variant_name = span_sub(qualified, dot + 1, qualified.len - dot - 1);
+                Span variant_name = span_sub(qualified, dot + 1, qualified.len);
                 TypeDef *ty = symbols_find_type(parser->symbols, type_name);
                 if (ty) qualified_variant = type_find_variant(ty, variant_name);
             }
@@ -10718,6 +10830,11 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
                     if (br > 0) {
                         qualified_variant = symbols_find_variant(parser->symbols, span_sub(qualified, 0, br));
                     }
+                }
+                if (!qualified_variant && dot > 0) {
+                    qualified_variant = symbols_find_variant(parser->symbols,
+                                                             span_sub(qualified, dot + 1,
+                                                                      qualified.len));
                 }
             }
         }
@@ -10754,7 +10871,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
             }
             if (dot > 0) {
                 Span tn = span_sub(qualified, 0, dot);
-                Span vn = span_sub(qualified, dot + 1, qualified.len - dot - 1);
+                Span vn = span_sub(qualified, dot + 1, qualified.len);
                 TypeDef *ty = symbols_find_type(parser->symbols, tn);
                 if (ty) {
                     Variant *vc = type_find_variant(ty, vn);
@@ -10816,7 +10933,7 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
             }
             if ((*kind == SLOT_SEQ_I32 || *kind == SLOT_SEQ_I32_REF ||
                  *kind == SLOT_SEQ_STR || *kind == SLOT_SEQ_STR_REF ||
-                 *kind == SLOT_SEQ_OPAQUE) &&
+                 *kind == SLOT_SEQ_OPAQUE || *kind == SLOT_SEQ_OPAQUE_REF) &&
                 span_eq(field_name, "len")) {
                 int32_t len_slot = body_slot(body, SLOT_I32, 4);
                 body_op3(body, BODY_OP_PAYLOAD_LOAD, len_slot, slot, 0, 4);
@@ -10893,6 +11010,8 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                 return zero;
             }
             int32_t dst = body_slot_for_object_field(body, field);
+            if (field->kind == SLOT_SEQ_OPAQUE)
+                body_slot_set_seq_opaque_type(body, parser->symbols, dst, field->type_name);
             body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, slot, field->offset, field->size);
             slot = dst;
             *kind = field->kind;
@@ -10946,27 +11065,37 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                 *kind = SLOT_STR;
                 continue;
             }
-            if (*kind != SLOT_ARRAY_I32 && *kind != SLOT_SEQ_I32 && *kind != SLOT_SEQ_I32_REF && *kind != SLOT_SEQ_OPAQUE) {
-                Span type_name = body->slot_type[slot];
-                *kind = SLOT_I32;
-                int32_t zero = body_slot(body, SLOT_I32, 4);
-                body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
-                return zero;
-            }
-            if (*kind == SLOT_SEQ_OPAQUE) {
-                int32_t dst = body_slot(body, SLOT_PTR, 8);
+            if (*kind == SLOT_SEQ_OPAQUE || *kind == SLOT_SEQ_OPAQUE_REF) {
+                int32_t index_kind = SLOT_I32;
                 int32_t index_slot = body_slot(body, SLOT_I32, 4);
                 if (span_is_i32(index)) {
                     body_op(body, BODY_OP_I32_CONST, index_slot, span_i32(index), 0);
                 } else {
                     Parser index_parser = {index, 0, parser->arena, parser->symbols};
-                    int32_t ik = SLOT_I32;
-                    index_slot = parse_expr(&index_parser, body, locals, &ik);
+                    index_slot = parse_expr(&index_parser, body, locals, &index_kind);
+                    parser_ws(&index_parser);
+                    if (index_parser.pos != index_parser.source.len) {
+                        if (parser->import_mode) { *kind = SLOT_I32; return 0; }
+                        die("unsupported opaque[] index expression");
+                    }
                 }
-                int32_t esz = body->slot_size[slot] > 0 ? body->slot_size[slot] : 16;
-                body_op3(body, BODY_OP_SEQ_OPAQUE_INDEX, dst, slot, index_slot, esz);
-                *kind = SLOT_PTR;
-                return dst;
+                if (index_kind != SLOT_I32) die("opaque[] index expression must be int32");
+                Span elem_type = cold_seq_opaque_element_type(body->slot_type[slot]);
+                int32_t elem_kind = cold_slot_kind_from_type_with_symbols(parser->symbols, elem_type);
+                int32_t elem_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, slot);
+                int32_t dst = body_slot(body, elem_kind, elem_size);
+                body_slot_set_type(body, dst, elem_type);
+                body_op3(body, BODY_OP_SEQ_OPAQUE_INDEX_DYNAMIC, dst, slot, index_slot, elem_size);
+                slot = dst;
+                *kind = elem_kind;
+                continue;
+            }
+            if (*kind != SLOT_ARRAY_I32 && *kind != SLOT_SEQ_I32 && *kind != SLOT_SEQ_I32_REF) {
+                Span type_name = body->slot_type[slot];
+                *kind = SLOT_I32;
+                int32_t zero = body_slot(body, SLOT_I32, 4);
+                body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+                return zero;
             }
             int32_t dst = body_slot(body, SLOT_I32, 4);
             if (span_is_i32(index)) {
@@ -11402,6 +11531,32 @@ static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t b
     body_end_block(body, block, term);
 }
 
+static Variant *cold_condition_variant_for_type(TypeDef *type, Span expr);
+static int32_t cold_make_payloadless_variant_slot(BodyIR *body, Symbols *symbols,
+                                                  TypeDef *type, Variant *variant);
+
+static int32_t parse_expected_payloadless_variant(Parser *parser, BodyIR *body,
+                                                  TypeDef *type, int32_t *kind) {
+    if (!type || !type_is_payloadless_enum(type)) return -1;
+    int32_t saved = parser->pos;
+    Span first = parser_token(parser);
+    if (first.len <= 0) {
+        parser->pos = saved;
+        return -1;
+    }
+    Span expr = first;
+    if (span_eq(parser_peek(parser), ".")) {
+        expr = parser_take_qualified_after_first(parser, first);
+    }
+    Variant *variant = cold_condition_variant_for_type(type, expr);
+    if (!variant || variant->field_count != 0) {
+        parser->pos = saved;
+        return -1;
+    }
+    if (kind) *kind = SLOT_VARIANT;
+    return cold_make_payloadless_variant_slot(body, parser->symbols, type, variant);
+}
+
 static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
                                   int32_t block, bool is_var) {
     (void)is_var;
@@ -11442,7 +11597,8 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
             slot = parse_constructor(parser, body, locals, declared_variant);
             kind = SLOT_VARIANT;
         } else {
-            slot = parse_expr(parser, body, locals, &kind);
+            slot = parse_expected_payloadless_variant(parser, body, declared_type, &kind);
+            if (slot < 0) slot = parse_expr(parser, body, locals, &kind);
         }
     } else {
         slot = parse_expr(parser, body, locals, &kind);
@@ -11498,7 +11654,10 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
             } else if (kind == SLOT_SEQ_I32) {
                 if (!cold_parse_i32_seq_type(type)) die("typed int32[] let missing dynamic sequence type");
             }
-            body_slot_set_type(body, slot, type);
+            if (kind == SLOT_SEQ_OPAQUE)
+                body_slot_set_seq_opaque_type(body, parser->symbols, slot, type);
+            else
+                body_slot_set_type(body, slot, type);
         }
     if (kind == SLOT_I32 || kind == SLOT_I64 || kind == SLOT_F32 || kind == SLOT_F64)
         body->slot_no_alias[slot] = 1;
@@ -11559,6 +11718,7 @@ static void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name
     }
     if (local->kind == SLOT_VARIANT || local->kind == SLOT_OBJECT || local->kind == SLOT_OBJECT_REF ||
         local->kind == SLOT_ARRAY_I32 || local->kind == SLOT_SEQ_I32 || local->kind == SLOT_SEQ_STR ||
+        local->kind == SLOT_SEQ_OPAQUE || local->kind == SLOT_SEQ_OPAQUE_REF ||
         local->kind == SLOT_OPAQUE || local->kind == SLOT_OPAQUE_REF) {
         body_op3(body, BODY_OP_PAYLOAD_STORE, local->slot, slot, 0, body->slot_size[local->slot]);
         return;
@@ -11631,6 +11791,13 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
         value_slot = seq_slot;
         value_kind = SLOT_SEQ_I32;
     }
+    if (field->kind == SLOT_SEQ_OPAQUE && value_kind == SLOT_SEQ_I32) {
+        int32_t seq_slot = body_slot(body, SLOT_SEQ_OPAQUE, 16);
+        body_slot_set_seq_opaque_type(body, parser->symbols, seq_slot, field->type_name);
+        body_op3(body, BODY_OP_MAKE_COMPOSITE, seq_slot, 0, -1, 0);
+        value_slot = seq_slot;
+        value_kind = SLOT_SEQ_OPAQUE;
+    }
     if (field->kind == SLOT_SEQ_I32_REF && value_kind == SLOT_ARRAY_I32) {
         int32_t count = body->slot_aux[value_slot];
         int32_t seq_slot = body_slot(body, SLOT_SEQ_I32, 16);
@@ -11648,6 +11815,12 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
         body_op3(body, BODY_OP_MAKE_SEQ_I32, seq_slot, value_slot, -1, count);
         value_slot = seq_slot;
         value_kind = SLOT_SEQ_I32;
+    }
+    if (value_kind == SLOT_VARIANT && field->kind == SLOT_I32) {
+        int32_t tag_slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_TAG_LOAD, tag_slot, value_slot, 0);
+        value_slot = tag_slot;
+        value_kind = SLOT_I32;
     }
     if (value_kind != field->kind) {
         if (field->kind == SLOT_I64 && value_kind == SLOT_I32) {
@@ -11676,16 +11849,13 @@ static int32_t parse_seq_lvalue_from_span(Parser *owner, BodyIR *body, Locals *l
     if (name.len <= 0) die("add target must name an int32[]");
     Local *local = locals_find(locals, name);
     if (!local) {
-        /* Skip add to non-local target, return dummy slot */
-        *kind_out = SLOT_I32;
-        return 0;
+        die("add target must be a local sequence");
     }
     int32_t slot = local->slot;
     int32_t kind = local->kind;
     if (span_eq(parser_peek(&parser), ".")) {
         if (kind != SLOT_OBJECT && kind != SLOT_OBJECT_REF) {
-            *kind_out = SLOT_I32;
-            return 0;
+            die("add field target base must be object");
         }
         (void)parser_token(&parser);
         Span field_name = parser_token(&parser);
@@ -11694,30 +11864,30 @@ static int32_t parse_seq_lvalue_from_span(Parser *owner, BodyIR *body, Locals *l
         ObjectDef *object = symbols_resolve_object(owner->symbols, object_type);
         if (!object) die("add field base object type missing");
         ObjectField *field = object_find_field(object, field_name);
-        if (!field || (field->kind != SLOT_SEQ_I32 && field->kind != SLOT_SEQ_STR)) {
-            /* tolerate non-sequence add targets */
-            if (kind_out) *kind_out = kind;
-            return slot;
+        if (!field || (field->kind != SLOT_SEQ_I32 && field->kind != SLOT_SEQ_STR &&
+                       field->kind != SLOT_SEQ_OPAQUE)) {
+            die("add field target must be sequence");
         }
-        int32_t ref_kind = field->kind == SLOT_SEQ_I32 ? SLOT_SEQ_I32_REF : SLOT_SEQ_STR_REF;
+        int32_t ref_kind = field->kind == SLOT_SEQ_I32 ? SLOT_SEQ_I32_REF :
+                           field->kind == SLOT_SEQ_STR ? SLOT_SEQ_STR_REF :
+                           SLOT_SEQ_OPAQUE_REF;
         int32_t ref_slot = body_slot(body, ref_kind, 8);
         body_slot_set_type(body, ref_slot,
-                           field->kind == SLOT_SEQ_I32 ? cold_cstr_span("int32[]")
-                                                       : cold_cstr_span("str[]"));
+                           field->kind == SLOT_SEQ_I32 ? cold_cstr_span("int32[]") :
+                           field->kind == SLOT_SEQ_STR ? cold_cstr_span("str[]") :
+                           field->type_name);
         body_op3(body, BODY_OP_FIELD_REF, ref_slot, slot, field->offset, 0);
         slot = ref_slot;
         kind = ref_kind;
     }
     parser_ws(&parser);
     if (parser.pos != parser.source.len) {
-        *kind_out = SLOT_I32;
-        return 0;
+        die("add target has unsupported suffix");
     }
     if (kind != SLOT_SEQ_I32 && kind != SLOT_SEQ_I32_REF &&
-        kind != SLOT_SEQ_STR && kind != SLOT_SEQ_STR_REF) {
-        /* tolerate non-sequence add (treat as no-op for OPAQUE types) */
-        if (kind_out) *kind_out = kind;
-        return slot;
+        kind != SLOT_SEQ_STR && kind != SLOT_SEQ_STR_REF &&
+        kind != SLOT_SEQ_OPAQUE && kind != SLOT_SEQ_OPAQUE_REF) {
+        die("add target must be sequence");
     }
     if (kind_out) *kind_out = kind;
     return slot;
@@ -11740,16 +11910,39 @@ static int32_t parse_builtin_add_after_name(Parser *parser, BodyIR *body, Locals
     }
     if (seq_kind == SLOT_SEQ_I32 || seq_kind == SLOT_SEQ_I32_REF) {
         if (value_kind != SLOT_I32) {
-            /* Skip: value type not compatible with int32[] */
-        } else {
-            body_op(body, BODY_OP_SEQ_I32_ADD, seq_slot, value_slot, 0);
+            die("add int32[] value kind mismatch");
         }
+        body_op(body, BODY_OP_SEQ_I32_ADD, seq_slot, value_slot, 0);
+    } else if (seq_kind == SLOT_SEQ_OPAQUE || seq_kind == SLOT_SEQ_OPAQUE_REF) {
+        int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, seq_slot);
+        body_op(body, BODY_OP_SEQ_OPAQUE_ADD, seq_slot, value_slot, element_size);
     } else {
         if (value_kind != SLOT_STR && value_kind != SLOT_I32) {
-            /* Skip: value type not compatible with str[], e.g. SLOT_OBJECT */
-        } else {
-            body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
+            die("add str[] value kind mismatch");
         }
+        body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
+    }
+    return block;
+}
+
+static int32_t parse_builtin_remove_after_name(Parser *parser, BodyIR *body, Locals *locals,
+                                               int32_t block) {
+    if (!parser_take(parser, "(")) die("expected ( after remove");
+    Span target = parser_take_until_top_level_char(parser, ',', "expected comma after remove target");
+    if (!parser_take(parser, ",")) die("expected comma after remove target");
+    int32_t seq_kind = SLOT_I32;
+    int32_t seq_slot = parse_seq_lvalue_from_span(parser, body, locals, target, &seq_kind);
+    int32_t index_kind = SLOT_I32;
+    int32_t index_slot = parse_expr(parser, body, locals, &index_kind);
+    if (!parser_take(parser, ")")) {
+        while (parser->pos < parser->source.len && parser->source.ptr[parser->pos] != '\n') parser->pos++;
+        if (parser->pos < parser->source.len) parser->pos++;
+        return block;
+    }
+    if (index_kind != SLOT_I32) die("remove index must be int32");
+    if (seq_kind == SLOT_SEQ_OPAQUE || seq_kind == SLOT_SEQ_OPAQUE_REF) {
+        int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, seq_slot);
+        body_op3(body, BODY_OP_SEQ_OPAQUE_REMOVE, seq_slot, index_slot, element_size, 0);
     }
     return block;
 }
@@ -12167,8 +12360,7 @@ static Span parser_take_condition_span(Parser *parser) {
                 line_start = parser->pos;
                 continue;
             }
-            /* Missing : after condition: return empty span */
-            return (Span){0};
+            die("expected : after condition");
         }
         if (c == '(' && !in_string && !in_char) depth++;
         else if (c == ')' && !in_string && !in_char) {
@@ -12182,7 +12374,7 @@ static Span parser_take_condition_span(Parser *parser) {
         }
         parser->pos++;
     }
-    return (Span){0};
+    die("expected : after condition");
     return (Span){0};
 }
 
@@ -12283,6 +12475,40 @@ static int32_t condition_find_top_binary(Span condition, const char *op) {
     return -1;
 }
 
+static Variant *cold_condition_variant_for_type(TypeDef *type, Span expr) {
+    if (!type || !type_is_payloadless_enum(type)) return 0;
+    expr = span_trim(expr);
+    if (expr.len <= 0) return 0;
+    int32_t end = expr.len;
+    while (end > 0) {
+        uint8_t c = expr.ptr[end - 1];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '.') break;
+        end--;
+    }
+    expr = span_trim(span_sub(expr, 0, end));
+    int32_t start = 0;
+    for (int32_t i = expr.len - 1; i >= 0; i--) {
+        if (expr.ptr[i] == '.') {
+            start = i + 1;
+            break;
+        }
+    }
+    Span variant_name = span_trim(span_sub(expr, start, expr.len));
+    if (variant_name.len <= 0) return 0;
+    return type_find_variant(type, variant_name);
+}
+
+static int32_t cold_make_payloadless_variant_slot(BodyIR *body, Symbols *symbols,
+                                                  TypeDef *type, Variant *variant) {
+    if (!type || !variant || variant->field_count != 0) die("payloadless variant expected");
+    int32_t slot = body_slot(body, SLOT_VARIANT, symbols_type_slot_size(type));
+    body_slot_set_type(body, slot, type->name);
+    body_op3(body, BODY_OP_MAKE_VARIANT, slot, variant->tag, -1, 0);
+    (void)symbols;
+    return slot;
+}
+
 static void parse_condition_span(Parser *owner, BodyIR *body, Locals *locals,
                                  Span condition, int32_t block,
                                  int32_t true_block, int32_t false_block) {
@@ -12322,6 +12548,7 @@ static void parse_condition_span(Parser *owner, BodyIR *body, Locals *locals,
     Parser leaf = {condition, 0, owner->arena, owner->symbols};
     int32_t left_kind = SLOT_I32;
     int32_t left = parse_expr(&leaf, body, locals, &left_kind);
+    int32_t left_end = leaf.pos;
     parser_ws(&leaf);
     if (leaf.pos == leaf.source.len) {
         if (left_kind != SLOT_I32) {
@@ -12335,17 +12562,37 @@ static void parse_condition_span(Parser *owner, BodyIR *body, Locals *locals,
         return;
     }
     int32_t cond = parse_compare_op(&leaf);
+    int32_t right_start = leaf.pos;
     int32_t right_kind = SLOT_I32;
     int32_t right = parse_expr(&leaf, body, locals, &right_kind);
+    int32_t right_end = leaf.pos;
     parser_ws(&leaf);
     if (leaf.pos != leaf.source.len) {
         /* Skip trailing condition tokens */
     }
     if (left_kind == SLOT_VARIANT || right_kind == SLOT_VARIANT) {
-        if (left_kind != SLOT_VARIANT || right_kind != SLOT_VARIANT) return; /* skip non-variant condition */;
         if (cond != COND_EQ && cond != COND_NE) die("variant condition supports == and !=");
         TypeDef *left_type = symbols_resolve_type(owner->symbols, body->slot_type[left]);
         TypeDef *right_type = symbols_resolve_type(owner->symbols, body->slot_type[right]);
+        if (left_kind == SLOT_VARIANT) {
+            Span right_expr = span_sub(condition, right_start, right_end);
+            Variant *rv = cold_condition_variant_for_type(left_type, right_expr);
+            if (rv) {
+                right = cold_make_payloadless_variant_slot(body, owner->symbols, left_type, rv);
+                right_kind = SLOT_VARIANT;
+                right_type = left_type;
+            }
+        }
+        if (right_kind == SLOT_VARIANT) {
+            Span left_expr = span_sub(condition, 0, left_end);
+            Variant *lv = cold_condition_variant_for_type(right_type, left_expr);
+            if (lv) {
+                left = cold_make_payloadless_variant_slot(body, owner->symbols, right_type, lv);
+                left_kind = SLOT_VARIANT;
+                left_type = right_type;
+            }
+        }
+        if (left_kind != SLOT_VARIANT || right_kind != SLOT_VARIANT) return; /* skip non-variant condition */;
         if (!left_type || left_type != right_type || !type_is_payloadless_enum(left_type)) {
             /* Variant equality with incompatible types: skip */
         }
@@ -12792,6 +13039,8 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
         return block;
     } else if (span_eq(kw, "add")) {
         return parse_builtin_add_after_name(parser, body, locals, block);
+    } else if (span_eq(kw, "remove")) {
+        return parse_builtin_remove_after_name(parser, body, locals, block);
     } else if (parser_next_is_qualified_call(parser) || span_eq(parser_peek(parser), "(")) {
         Span call_name = kw;
         if (parser_next_is_qualified_call(parser)) {
@@ -13639,7 +13888,13 @@ static int32_t csg_parse_typed_expr_span(ColdCsgLower *lower, BodyIR *body,
             if (parser.pos != parser.source.len) die("unsupported cold csg typed constructor tokens");
             *kind = SLOT_VARIANT;
         } else {
-            slot = csg_parse_expr_span(lower, body, locals, expr, kind);
+            slot = parse_expected_payloadless_variant(&parser, body, declared_type, kind);
+            if (slot >= 0) {
+                parser_ws(&parser);
+                if (parser.pos != parser.source.len) die("unsupported cold csg typed enum tokens");
+            } else {
+                slot = csg_parse_expr_span(lower, body, locals, expr, kind);
+            }
         }
     } else {
         slot = csg_parse_expr_span(lower, body, locals, expr, kind);
@@ -13652,7 +13907,10 @@ static int32_t csg_parse_typed_expr_span(ColdCsgLower *lower, BodyIR *body,
     } else if (declared_kind == SLOT_SEQ_I32) {
         if (!cold_parse_i32_seq_type(type)) die("cold csg typed int32[] missing dynamic sequence type");
     }
-    body_slot_set_type(body, slot, span_trim(type));
+    if (declared_kind == SLOT_SEQ_OPAQUE)
+        body_slot_set_seq_opaque_type(body, lower->csg->symbols, slot, span_trim(type));
+    else
+        body_slot_set_type(body, slot, span_trim(type));
     return slot;
 }
 
@@ -13695,7 +13953,23 @@ static void csg_parse_assign(ColdCsgLower *lower, BodyIR *body,
         if (lb > 0) {
             /* array field index assignment: obj.field[index] = value */
             int32_t idx_slot = csg_parse_expr_span(lower, body, locals, index_expr, &kind);
-            body_op3(body, BODY_OP_ARRAY_I32_INDEX_STORE, obj_local->slot, val_slot, idx_slot, 0);
+            int32_t ref_kind = field->kind == SLOT_SEQ_OPAQUE ? SLOT_SEQ_OPAQUE_REF : SLOT_OBJECT_REF;
+            int32_t ref_slot = body_slot(body, ref_kind, 8);
+            if (field->kind == SLOT_ARRAY_I32) body_slot_set_array_len(body, ref_slot, field->array_len);
+            if (field->kind == SLOT_SEQ_OPAQUE)
+                body_slot_set_seq_opaque_type(body, lower->csg->symbols, ref_slot, field->type_name);
+            body_op3(body, BODY_OP_FIELD_REF, ref_slot, obj_local->slot, field->offset, 0);
+            if (field->kind == SLOT_ARRAY_I32) {
+                body_op3(body, BODY_OP_ARRAY_I32_INDEX_STORE, val_slot, ref_slot, idx_slot, 0);
+            } else if (field->kind == SLOT_SEQ_I32 || field->kind == SLOT_SEQ_I32_REF) {
+                body_op3(body, BODY_OP_SEQ_I32_INDEX_STORE, val_slot, ref_slot, idx_slot, 0);
+            } else if (field->kind == SLOT_SEQ_OPAQUE) {
+                int32_t element_size = cold_seq_opaque_element_size_for_slot(lower->csg->symbols, body, ref_slot);
+                if (body->slot_size[val_slot] > element_size) die("cold csg opaque field store value too large");
+                body_op3(body, BODY_OP_SEQ_OPAQUE_INDEX_STORE, val_slot, ref_slot, idx_slot, element_size);
+            } else {
+                die("cold csg field index assignment target unsupported");
+            }
         } else {
             body_op3(body, BODY_OP_PAYLOAD_STORE, obj_local->slot, val_slot, field->offset, field->size);
         }
@@ -13711,7 +13985,17 @@ static void csg_parse_assign(ColdCsgLower *lower, BodyIR *body,
         int32_t kind2 = SLOT_I32;
         int32_t val_slot = csg_parse_expr_span(lower, body, locals, expr, &kind2);
         int32_t idx_slot = csg_parse_expr_span(lower, body, locals, idx_expr, &kind2);
-        body_op3(body, BODY_OP_ARRAY_I32_INDEX_STORE, arr_local->slot, val_slot, idx_slot, 0);
+        if (arr_local->kind == SLOT_ARRAY_I32) {
+            body_op3(body, BODY_OP_ARRAY_I32_INDEX_STORE, val_slot, arr_local->slot, idx_slot, 0);
+        } else if (arr_local->kind == SLOT_SEQ_I32 || arr_local->kind == SLOT_SEQ_I32_REF) {
+            body_op3(body, BODY_OP_SEQ_I32_INDEX_STORE, val_slot, arr_local->slot, idx_slot, 0);
+        } else if (arr_local->kind == SLOT_SEQ_OPAQUE || arr_local->kind == SLOT_SEQ_OPAQUE_REF) {
+            int32_t element_size = cold_seq_opaque_element_size_for_slot(lower->csg->symbols, body, arr_local->slot);
+            if (body->slot_size[val_slot] > element_size) die("cold csg opaque index store value too large");
+            body_op3(body, BODY_OP_SEQ_OPAQUE_INDEX_STORE, val_slot, arr_local->slot, idx_slot, element_size);
+        } else {
+            die("cold csg index assignment target unsupported");
+        }
         return;
     }
     Local *local = locals_find(locals, name);
@@ -13755,8 +14039,8 @@ static void csg_parse_assign(ColdCsgLower *lower, BodyIR *body,
         body_op(body, BODY_OP_COPY_I32, local->slot, slot, 0);
         return;
     }
-    if (local->kind == SLOT_SEQ_OPAQUE || local->kind == SLOT_SEQ_STR ||
-        local->kind == SLOT_SEQ_I32) {
+    if (local->kind == SLOT_SEQ_OPAQUE || local->kind == SLOT_SEQ_OPAQUE_REF ||
+        local->kind == SLOT_SEQ_STR || local->kind == SLOT_SEQ_I32) {
         body_op3(body, BODY_OP_MAKE_COMPOSITE, local->slot, slot, 0, 0);
         return;
     }
@@ -13778,12 +14062,31 @@ static void csg_parse_add(ColdCsgLower *lower, BodyIR *body,
         } else {
             body_op(body, BODY_OP_SEQ_I32_ADD, seq_slot, value_slot, 0);
         }
+    } else if (seq_kind == SLOT_SEQ_OPAQUE || seq_kind == SLOT_SEQ_OPAQUE_REF) {
+        int32_t element_size = cold_seq_opaque_element_size_for_slot(lower->csg->symbols, body, seq_slot);
+        body_op(body, BODY_OP_SEQ_OPAQUE_ADD, seq_slot, value_slot, element_size);
     } else {
         if (value_kind != SLOT_STR && value_kind != SLOT_I32) {
             fprintf(stderr, "cheng_cold: csg add str[] value kind=%d, skipping\n", value_kind);
         } else {
             body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
         }
+    }
+}
+
+static void csg_parse_remove(ColdCsgLower *lower, BodyIR *body,
+                             Locals *locals, Span args) {
+    Span items[2];
+    int32_t count = cold_split_top_level_commas(args, items, 2);
+    if (count != 2) die("cold csg remove expects two arguments");
+    int32_t seq_kind = SLOT_I32;
+    int32_t seq_slot = parse_seq_lvalue_from_span(&lower->owner, body, locals, items[0], &seq_kind);
+    int32_t index_kind = SLOT_I32;
+    int32_t index_slot = csg_parse_expr_span(lower, body, locals, items[1], &index_kind);
+    if (index_kind != SLOT_I32) die("cold csg remove index must be int32");
+    if (seq_kind == SLOT_SEQ_OPAQUE || seq_kind == SLOT_SEQ_OPAQUE_REF) {
+        int32_t element_size = cold_seq_opaque_element_size_for_slot(lower->csg->symbols, body, seq_slot);
+        body_op3(body, BODY_OP_SEQ_OPAQUE_REMOVE, seq_slot, index_slot, element_size, 0);
     }
 }
 
@@ -14068,6 +14371,10 @@ static int32_t csg_parse_statement(ColdCsgLower *lower, BodyIR *body,
     if (span_eq(stmt.kind, "call")) {
         if (span_eq(stmt.a, "add")) {
             csg_parse_add(lower, body, locals, stmt.b);
+            return block;
+        }
+        if (span_eq(stmt.a, "remove")) {
+            csg_parse_remove(lower, body, locals, stmt.b);
             return block;
         }
         int32_t ignored_kind = SLOT_I32;
@@ -14696,6 +15003,7 @@ static void codegen_store_params(Code *code, BodyIR *body) {
                 }
             }
         } else if (kind == SLOT_SEQ_I32_REF || kind == SLOT_SEQ_STR_REF ||
+                   kind == SLOT_SEQ_OPAQUE_REF ||
                    kind == SLOT_OBJECT_REF || kind == SLOT_OPAQUE ||
                    kind == SLOT_OPAQUE_REF) {
             if (in_regs) {
@@ -14786,6 +15094,17 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
             codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
             continue;
         }
+        if (fn->param_kind[i] == SLOT_SEQ_OPAQUE_REF) {
+            if (arg_kind == SLOT_SEQ_OPAQUE_REF) {
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
+            } else if (arg_kind == SLOT_SEQ_OPAQUE) {
+                a64_emit_add_large(code, R9, SP, local_offset, true);
+            } else {
+                a64_emit_add_large(code, R9, SP, local_offset, true);
+            }
+            codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
+            continue;
+        }
         if (fn->param_kind[i] == SLOT_STR_REF) {
             if (arg_kind == SLOT_STR_REF) {
                 a64_emit_ldr_sp_off(code, R9, local_offset, true);
@@ -14817,7 +15136,7 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
             if (arg_kind == SLOT_OPAQUE_REF || arg_kind == SLOT_OBJECT_REF ||
                 arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                 arg_kind == SLOT_STR_REF || arg_kind == SLOT_SEQ_I32_REF ||
-                arg_kind == SLOT_SEQ_STR_REF) {
+                arg_kind == SLOT_SEQ_STR_REF || arg_kind == SLOT_SEQ_OPAQUE_REF) {
                 a64_emit_ldr_sp_off(code, R9, local_offset, true);
             } else {
                 a64_emit_add_large(code, R9, SP, local_offset, true);
@@ -14877,7 +15196,9 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
                   (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
                    arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                    arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
-                   arg_kind == SLOT_VARIANT || arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)))
+                   arg_kind == SLOT_VARIANT || arg_kind == SLOT_SEQ_OPAQUE ||
+                   arg_kind == SLOT_SEQ_OPAQUE_REF ||
+                   arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)))
                 a64_emit_add_large(code, R9, SP, local_offset, true);
         }
         int32_t arg_size = body->slot_size[arg_slot];
@@ -14901,7 +15222,7 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
         } else if (arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF ||
                    arg_kind == SLOT_OBJECT_REF || arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
                    arg_kind == SLOT_STR_REF || arg_kind == SLOT_SEQ_I32_REF ||
-                   arg_kind == SLOT_SEQ_STR_REF) {
+                   arg_kind == SLOT_SEQ_STR_REF || arg_kind == SLOT_SEQ_OPAQUE_REF) {
             a64_emit_ldr_sp_off(code, R9, local_offset, true);
             codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
         } else if (arg_kind == SLOT_VARIANT) {
@@ -15006,7 +15327,8 @@ static void codegen_copy_slot_from_offset(Code *code, BodyIR *body,
     int32_t kind = body->slot_kind[dst_slot];
     int32_t src_kind = body->slot_kind[src_slot];
     if (src_kind == SLOT_OBJECT_REF || src_kind == SLOT_SEQ_I32_REF ||
-        src_kind == SLOT_SEQ_STR_REF || src_kind == SLOT_STR_REF ||
+        src_kind == SLOT_SEQ_STR_REF || src_kind == SLOT_SEQ_OPAQUE_REF ||
+        src_kind == SLOT_STR_REF ||
         src_kind == SLOT_PTR) {
         a64_emit_ldr_sp_off(code, R2, body->slot_offset[src_slot], true);
         if (kind == SLOT_I32) {
@@ -15057,7 +15379,8 @@ static void codegen_store_slot_to_payload(Code *code, BodyIR *body,
         codegen_store_slot_to_offset(code, body, dst_slot, dst_offset, src_slot);
         return;
     }
-    if (dst_kind != SLOT_OBJECT_REF && dst_kind != SLOT_PTR) {
+    if (dst_kind != SLOT_OBJECT_REF && dst_kind != SLOT_SEQ_OPAQUE_REF &&
+        dst_kind != SLOT_PTR) {
         /* Non-object slot: write source directly to SP + base + field_offset */
         int32_t base_off = body->slot_offset[dst_slot];
         int32_t total_off = base_off + dst_offset;
@@ -15190,7 +15513,8 @@ static bool cold_codegen_kind_is_64bit_scalar(int32_t kind) {
     return kind == SLOT_I64 || kind == SLOT_PTR || kind == SLOT_OPAQUE ||
            kind == SLOT_OPAQUE_REF || kind == SLOT_OBJECT_REF ||
            kind == SLOT_STR_REF || kind == SLOT_SEQ_I32_REF ||
-           kind == SLOT_SEQ_STR_REF || kind == SLOT_I64_REF;
+           kind == SLOT_SEQ_STR_REF || kind == SLOT_SEQ_OPAQUE_REF ||
+           kind == SLOT_I64_REF;
 }
 
 static void codegen_copy_slot_to_slot(Code *code, BodyIR *body, int32_t dst, int32_t src) {
@@ -16498,6 +16822,10 @@ static void codegen_seq_header_addr(Code *code, BodyIR *body, int32_t seq_slot, 
         a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
         return;
     }
+    if (kind == SLOT_SEQ_OPAQUE_REF || kind == SLOT_OBJECT_REF) {
+        a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
+        return;
+    }
     /* Non-I32 seq: treat as inline on stack (SP + slot_offset) */
     a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
 }
@@ -16514,6 +16842,19 @@ static void codegen_seq_str_header_addr(Code *code, BodyIR *body, int32_t seq_sl
     }
     /* Non-str seq: treat as inline on stack (SP + slot_offset) */
     a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
+}
+
+static void codegen_seq_opaque_header_addr(Code *code, BodyIR *body, int32_t seq_slot, int reg) {
+    int32_t kind = body->slot_kind[seq_slot];
+    if (kind == SLOT_SEQ_OPAQUE) {
+        a64_emit_add_large(code, reg, SP, body->slot_offset[seq_slot], true);
+        return;
+    }
+    if (kind == SLOT_SEQ_OPAQUE_REF || kind == SLOT_OBJECT_REF || kind == SLOT_PTR) {
+        a64_emit_ldr_sp_off(code, reg, body->slot_offset[seq_slot], true);
+        return;
+    }
+    die("opaque sequence header kind mismatch");
 }
 
 static void codegen_seq_i32_add(Code *code, BodyIR *body, int32_t seq_slot, int32_t value_slot) {
@@ -16658,6 +16999,153 @@ static void codegen_seq_str_add(Code *code, BodyIR *body, int32_t seq_slot, int3
     code_emit(code, a64_b(store_label - code->count));
 
     a64_patch_b(code, done_jump, code->count);
+}
+
+static int32_t codegen_seq_opaque_element_size(BodyIR *body, int32_t seq_slot, int32_t element_size) {
+    if (element_size <= 0 && seq_slot >= 0 && seq_slot < body->slot_count)
+        element_size = body->slot_aux[seq_slot];
+    if (element_size <= 0) die("opaque sequence element size missing in codegen");
+    return element_size;
+}
+
+static void codegen_slot_data_addr(Code *code, BodyIR *body, int32_t slot, int reg) {
+    int32_t kind = body->slot_kind[slot];
+    if (kind == SLOT_OBJECT_REF || kind == SLOT_OPAQUE_REF || kind == SLOT_PTR ||
+        kind == SLOT_SEQ_OPAQUE_REF || kind == SLOT_SEQ_I32_REF ||
+        kind == SLOT_SEQ_STR_REF || kind == SLOT_STR_REF) {
+        a64_emit_ldr_sp_off(code, reg, body->slot_offset[slot], true);
+        return;
+    }
+    a64_emit_add_large(code, reg, SP, body->slot_offset[slot], true);
+}
+
+static void codegen_seq_opaque_index(Code *code, BodyIR *body, int32_t dst,
+                                     int32_t seq_slot, int32_t index_slot,
+                                     int32_t element_size) {
+    element_size = codegen_seq_opaque_element_size(body, seq_slot, element_size);
+    if (body->slot_size[dst] > element_size) die("opaque sequence index destination too large");
+    codegen_seq_opaque_header_addr(code, body, seq_slot, R2);
+    a64_emit_ldr_sp_off(code, R1, body->slot_offset[index_slot], false);
+    code_emit(code, a64_cmp_imm(R1, 0));
+    code_emit(code, a64_bcond(2, COND_GE));
+    code_emit(code, a64_brk(120));
+    code_emit(code, a64_ldr_imm(R0, R2, 0, false));
+    code_emit(code, a64_cmp_reg(R1, R0));
+    code_emit(code, a64_bcond(2, COND_LT));
+    code_emit(code, a64_brk(120));
+    code_emit(code, a64_ldr_imm(R3, R2, 8, true));
+    codegen_mov_i32_const(code, 6, element_size);
+    code_emit(code, a64_mul_reg_x(6, R1, 6));
+    code_emit(code, a64_add_reg_x(R3, R3, 6));
+    a64_emit_add_large(code, 7, SP, body->slot_offset[dst], true);
+    codegen_mov_i32_const(code, 6, body->slot_size[dst]);
+    codegen_copy_bytes(code, R3, 6, 7);
+}
+
+static void codegen_seq_opaque_index_store(Code *code, BodyIR *body, int32_t value_slot,
+                                           int32_t seq_slot, int32_t index_slot,
+                                           int32_t element_size) {
+    element_size = codegen_seq_opaque_element_size(body, seq_slot, element_size);
+    if (body->slot_size[value_slot] > element_size) die("opaque sequence store value too large");
+    codegen_seq_opaque_header_addr(code, body, seq_slot, R2);
+    a64_emit_ldr_sp_off(code, R1, body->slot_offset[index_slot], false);
+    code_emit(code, a64_cmp_imm(R1, 0));
+    code_emit(code, a64_bcond(2, COND_GE));
+    code_emit(code, a64_brk(122));
+    code_emit(code, a64_ldr_imm(R0, R2, 0, false));
+    code_emit(code, a64_cmp_reg(R1, R0));
+    code_emit(code, a64_bcond(2, COND_LT));
+    code_emit(code, a64_brk(122));
+    code_emit(code, a64_ldr_imm(R3, R2, 8, true));
+    codegen_mov_i32_const(code, 6, element_size);
+    code_emit(code, a64_mul_reg_x(6, R1, 6));
+    code_emit(code, a64_add_reg_x(R3, R3, 6));
+    codegen_slot_data_addr(code, body, value_slot, 7);
+    codegen_mov_i32_const(code, 6, element_size);
+    codegen_copy_bytes(code, 7, 6, R3);
+}
+
+static void codegen_seq_opaque_add(Code *code, BodyIR *body, int32_t seq_slot,
+                                   int32_t value_slot, int32_t element_size) {
+    element_size = codegen_seq_opaque_element_size(body, seq_slot, element_size);
+    if (body->slot_size[value_slot] > element_size) die("opaque sequence add value too large");
+    codegen_seq_opaque_header_addr(code, body, seq_slot, R2);
+    code_emit(code, a64_ldr_imm(R0, R2, 0, false));
+    code_emit(code, a64_ldr_imm(R1, R2, 4, false));
+    code_emit(code, a64_cmp_reg(R0, R1));
+    int32_t grow_pos = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+
+    int32_t store_label = code->count;
+    codegen_seq_opaque_header_addr(code, body, seq_slot, R2);
+    code_emit(code, a64_ldr_imm(R0, R2, 0, false));
+    code_emit(code, a64_ldr_imm(R3, R2, 8, true));
+    codegen_mov_i32_const(code, 6, element_size);
+    code_emit(code, a64_mul_reg_x(6, R0, 6));
+    code_emit(code, a64_add_reg_x(R3, R3, 6));
+    codegen_slot_data_addr(code, body, value_slot, 7);
+    codegen_mov_i32_const(code, 6, element_size);
+    codegen_copy_bytes(code, 7, 6, R3);
+    code_emit(code, a64_add_imm(R0, R0, 1, false));
+    code_emit(code, a64_str_imm(R0, R2, 0, false));
+    int32_t done_jump = code->count;
+    code_emit(code, a64_b(0));
+
+    int32_t grow_label = code->count;
+    a64_patch_bcond(code, grow_pos, grow_label);
+    code_emit(code, a64_cmp_imm(R1, 0));
+    int32_t double_pos = code->count;
+    code_emit(code, a64_bcond(0, COND_NE));
+    code_emit(code, a64_movz(R1, 4, 0));
+    int32_t cap_ready_jump = code->count;
+    code_emit(code, a64_b(0));
+    int32_t double_label = code->count;
+    a64_patch_bcond(code, double_pos, double_label);
+    code_emit(code, a64_add_reg(R1, R1, R1));
+    int32_t cap_ready = code->count;
+    a64_patch_b(code, cap_ready_jump, cap_ready);
+    codegen_seq_opaque_header_addr(code, body, seq_slot, R2);
+    code_emit(code, a64_str_imm(R1, R2, 4, false));
+    codegen_mov_i32_const(code, 6, element_size);
+    code_emit(code, a64_mul_reg(R1, R1, 6));
+    codegen_mmap_len_reg(code, R1, 7, 121);
+    code_emit(code, a64_add_imm(8, 7, 0, true));
+
+    codegen_seq_opaque_header_addr(code, body, seq_slot, R2);
+    code_emit(code, a64_ldr_imm(R0, R2, 0, false));
+    code_emit(code, a64_ldr_imm(R3, R2, 8, true));
+    codegen_mov_i32_const(code, 6, element_size);
+    code_emit(code, a64_mul_reg(6, R0, 6));
+    codegen_copy_bytes(code, R3, 6, 7);
+    code_emit(code, a64_str_imm(8, R2, 8, true));
+    code_emit(code, a64_b(store_label - code->count));
+
+    a64_patch_b(code, done_jump, code->count);
+}
+
+static void codegen_seq_opaque_remove(Code *code, BodyIR *body, int32_t seq_slot,
+                                      int32_t index_slot, int32_t element_size) {
+    element_size = codegen_seq_opaque_element_size(body, seq_slot, element_size);
+    codegen_seq_opaque_header_addr(code, body, seq_slot, R2);
+    a64_emit_ldr_sp_off(code, R1, body->slot_offset[index_slot], false);
+    code_emit(code, a64_cmp_imm(R1, 0));
+    code_emit(code, a64_bcond(2, COND_GE));
+    code_emit(code, a64_brk(123));
+    code_emit(code, a64_ldr_imm(R0, R2, 0, false));
+    code_emit(code, a64_cmp_reg(R1, R0));
+    code_emit(code, a64_bcond(2, COND_LT));
+    code_emit(code, a64_brk(123));
+    code_emit(code, a64_ldr_imm(R3, R2, 8, true));
+    codegen_mov_i32_const(code, 10, element_size);
+    code_emit(code, a64_mul_reg_x(7, R1, 10));
+    code_emit(code, a64_add_reg_x(8, R3, 7));
+    code_emit(code, a64_add_imm(9, 8, (uint16_t)element_size, true));
+    code_emit(code, a64_sub_reg(6, R0, R1));
+    code_emit(code, a64_sub_imm(6, 6, 1, false));
+    code_emit(code, a64_mul_reg(6, 6, 10));
+    codegen_copy_bytes(code, 9, 6, 8);
+    code_emit(code, a64_sub_imm(R0, R0, 1, false));
+    code_emit(code, a64_str_imm(R0, R2, 0, false));
 }
 
 /* Disabled no-alias register cache: correctness first until it is CFG-aware. */
@@ -17570,6 +18058,14 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         codegen_seq_i32_add(code, body, dst, a);
     } else if (kind == BODY_OP_SEQ_STR_ADD) {
         codegen_seq_str_add(code, body, dst, a);
+    } else if (kind == BODY_OP_SEQ_OPAQUE_INDEX_DYNAMIC) {
+        codegen_seq_opaque_index(code, body, dst, a, b, c);
+    } else if (kind == BODY_OP_SEQ_OPAQUE_INDEX_STORE) {
+        codegen_seq_opaque_index_store(code, body, dst, a, b, c);
+    } else if (kind == BODY_OP_SEQ_OPAQUE_ADD) {
+        codegen_seq_opaque_add(code, body, dst, a, b);
+    } else if (kind == BODY_OP_SEQ_OPAQUE_REMOVE) {
+        codegen_seq_opaque_remove(code, body, dst, a, b);
     } else if (kind == BODY_OP_CALL_COMPOSITE) {
         if (a < 0 || a >= symbols->function_count) die("invalid function call target");
         FnDef *fn = &symbols->functions[a];
