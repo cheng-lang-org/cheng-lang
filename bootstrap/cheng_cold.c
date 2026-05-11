@@ -5105,6 +5105,8 @@ typedef struct {
     ConstDef *consts;
     int32_t const_count;
     int32_t const_cap;
+    int32_t global_count;
+    Span *globals;
     Arena *arena;
 } Symbols;
 
@@ -19073,6 +19075,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     }
 
     /* First pass: compile each function body into the shared buffer */
+    fprintf(stderr, "[cold_body] func_count=%d name_seen=%p\n", func_count, (void*)name_seen);
     for (int32_t i = 0; i < func_count; i++) {
         if (!function_bodies[i]) continue;
         /* Extract base name (last component) */
@@ -19094,7 +19097,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             }
             if (pbl == base_len && memcmp(pb, base, (size_t)base_len) == 0) { dup = true; break; }
         }
-        if (dup) { fprintf(stderr, "[cold_body] skip dup: %.*s\n", (int)nm.len, nm.ptr); continue; }
+        if (dup) { fprintf(stderr, "[cold_body] DUP %.*s\n", (int)nm.len, nm.ptr); continue; }
+        if (i < 20) fprintf(stderr, "[cold_body] keep[%d] %.*s base=%.*s\n", i, (int)nm.len, nm.ptr, base_len, base);
         name_seen[i] = true;
         symbol_offset[i] = shared->count;
         BodyIR *fn_body = function_bodies[i];
