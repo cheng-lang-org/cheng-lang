@@ -19181,23 +19181,35 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
     }
 
-    /* Resolve inter-function patches */
+    /* Resolve inter-function patches and collect external call relocations */
+    int32_t reloc_cap = func_count * 16;
+    int32_t *reloc_offsets = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+    int32_t *reloc_symbols = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+    int32_t reloc_count = 0;
     for (int32_t pi = 0; pi < function_patches.count; pi++) {
         FunctionPatch patch = function_patches.items[pi];
         if (patch.target_function < 0 || patch.target_function >= func_count) continue;
         int32_t target_off = symbol_offset[patch.target_function];
-        if (target_off < 0) continue; /* target has no body, patch stays as-is */
+        if (target_off < 0) {
+            if (reloc_count < reloc_cap) {
+                reloc_offsets[reloc_count] = (int32_t)patch.pos * 4;
+                reloc_symbols[reloc_count] = patch.target_function;
+                reloc_count++;
+            }
+            continue;
+        }
         int32_t delta = target_off - (int32_t)patch.pos;
         shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
                                    ((uint32_t)delta & 0x03FFFFFFu);
     }
 
-    /* Build name/offset arrays for macho_write_object.
-       Local symbols (no '.' in name) use N_SECT so linker allows duplicates. */
-    const char **func_names = arena_alloc(arena, (size_t)func_count * sizeof(const char *));
-    int32_t *func_offsets = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    /* Build name/offset arrays: locals first, then external references (offset=-1) */
+    int32_t name_cap = func_count + reloc_count;
+    const char **func_names = arena_alloc(arena, (size_t)name_cap * sizeof(const char *));
+    int32_t *func_offsets = arena_alloc(arena, (size_t)name_cap * sizeof(int32_t));
     int32_t name_count = 0;
-    int32_t local_count = 0;
+    int32_t *ext_map = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    for (int32_t i = 0; i < func_count; i++) ext_map[i] = -1;
     for (int32_t i = 0; i < func_count; i++) {
         if (symbol_offset[i] < 0) continue;
         Span nm = symbols->functions[i].name;
@@ -19208,23 +19220,54 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
                 memcmp(func_names[j], nm.ptr, (size_t)nm.len) == 0) { dup = true; break; }
         }
         if (dup) continue;
-        /* Local functions have no '.' in name */
-        bool has_dot = false;
-        for (int32_t k = 0; k < nm.len; k++) { if (nm.ptr[k] == '.') { has_dot = true; break; } }
-        if (!has_dot) local_count++;
         func_offsets[name_count] = symbol_offset[i];
-        char *nc = arena_alloc(arena, (size_t)nm.len + 1);
-        memcpy(nc, nm.ptr, (size_t)nm.len);
-        nc[nm.len] = '\0';
+        /* Rename "main" to "cheng_program_argv_entry" to avoid _main
+           conflicts with the runtime CRT entry point. */
+        const char *name_ptr = NULL;
+        int32_t name_len = 0;
+        if (nm.len == 4 && memcmp(nm.ptr, "main", 4) == 0) {
+            name_ptr = "cheng_program_argv_entry";
+            name_len = 25;
+        } else {
+            name_ptr = (const char *)nm.ptr;
+            name_len = nm.len;
+        }
+        char *nc = arena_alloc(arena, (size_t)name_len + 1);
+        memcpy(nc, name_ptr, (size_t)name_len);
+        nc[name_len] = '\0';
         func_names[name_count] = nc;
         name_count++;
     }
+    /* External function references for relocation entries.
+       Use base name (strip module prefix: "atomic.NewI32"->"NewI32")
+       and offset=-1 so the writer marks them N_UNDF|N_EXT. */
+    for (int32_t ri = 0; ri < reloc_count; ri++) {
+        int32_t target = reloc_symbols[ri];
+        if (ext_map[target] >= 0) continue;
+        Span nm = symbols->functions[target].name;
+        const char *base = (const char *)nm.ptr;
+        int32_t blen = nm.len;
+        for (int32_t k = nm.len - 1; k > 0; k--) {
+            if (nm.ptr[k] == '.') { base = (const char *)(nm.ptr + k + 1); blen = nm.len - k - 1; break; }
+        }
+        char *nc = arena_alloc(arena, (size_t)blen + 1);
+        memcpy(nc, base, (size_t)blen);
+        nc[blen] = '\0';
+        func_names[name_count] = nc;
+        func_offsets[name_count] = -1; /* sentinel: N_UNDF|N_EXT in writer */
+        ext_map[target] = name_count;
+        name_count++;
+    }
+    for (int32_t ri = 0; ri < reloc_count; ri++) {
+        int32_t mapped = ext_map[reloc_symbols[ri]];
+        if (mapped >= 0) reloc_symbols[ri] = mapped;
+    }
 
-    /* Only _main (first symbol) is global; rest are local to allow duplicates */
+    /* Only first symbol (cheng_program_argv_entry) is global; rest are local */
     int32_t global_count = (name_count > 0) ? 1 : 0;
     bool ok = macho_write_object(out_path, shared->words, shared->count,
                                  func_names, func_offsets, name_count, global_count,
-                                 0, 0, 0);
+                                 reloc_offsets, reloc_symbols, reloc_count);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;
 }
