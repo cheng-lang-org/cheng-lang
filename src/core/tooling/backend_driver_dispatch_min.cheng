@@ -1479,13 +1479,21 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitShared(driverRoot: str,
 fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, reportPath: str, linkPlan: slplan.SystemLinkPlanStub, loweringPlan: lower.LoweringPlanStub, primaryPlan: pobj.PrimaryObjectPlan, phaseProfile: var BackendDriverDispatchMinPhaseProfile): int32 =
     phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs()
     BackendDriverDispatchMinProgress("direct_object_emit", "begin")
-    let objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
-    let objectRes = direct.DirectObjectEmitPlanObjectForTarget(driverRoot, primaryPlan, linkPlan.targetTriple, objectFormat)
-    if IsErr(objectRes):
-        let reason = Error(objectRes)
-        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
-        return BackendDriverDispatchMinUnsupported(reason)
-    let object = Value(objectRes)
+    let sourcePath = chengpath.PathAbsolute(driverRoot, linkPlan.entryPath)
+    let objectPath = Fmt"{linkPlan.outputPath}.primary.o"
+    let coldBin = chengpath.PathAbsolute(driverRoot, "artifacts/cheng_cold")
+    let coldCmd = Fmt"CHENG_NO_IMPORT_BODIES=1 {os.QuoteShell(coldBin)} system-link-exec --in:{os.QuoteShell(sourcePath)} --emit:obj --target:{linkPlan.targetTriple} --out:{os.QuoteShell(objectPath)} --report-out:{os.QuoteShell(reportPath)}"
+    let coldRun = os.ExecShellCmdStatus(coldCmd, driverRoot)
+    var objectPath_final = objectPath
+    if coldRun != 0 || !chengpath.FileExistsNonEmpty(driverRoot, objectPath):
+        let objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
+        let objectRes = direct.DirectObjectEmitPlanObjectForTarget(driverRoot, primaryPlan, linkPlan.targetTriple, objectFormat)
+        if IsErr(objectRes):
+            let reason = Error(objectRes)
+            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
+            return BackendDriverDispatchMinUnsupported(reason)
+        let object = Value(objectRes)
+        objectPath_final = object.objectPath
     phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs() - phaseProfile.directObjectEmitNs
     BackendDriverDispatchMinProgress("direct_object_emit", "done")
     let currentCompilerPath = BackendDriverDispatchMinCurrentCompiler(driverRoot)
@@ -1538,7 +1546,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
         return BackendDriverDispatchMinUnsupported(reason)
     phaseProfile.providerObjectNs = BackendDriverDispatchMinNowNs() - phaseProfile.providerObjectNs
     BackendDriverDispatchMinProgress("provider_object", "done")
-    let primaryObjectPath = chengpath.PathAbsolute(driverRoot, object.objectPath)
+    let primaryObjectPath = chengpath.PathAbsolute(driverRoot, objectPath_final)
     let outputPath = chengpath.PathAbsolute(driverRoot, linkPlan.outputPath)
     let primaryLibPath = Fmt"{primaryObjectPath}.link.a"
     var nativeCommand = Fmt"ar rcs {os.QuoteShell(primaryLibPath)} {os.QuoteShell(primaryObjectPath)} && cc -arch arm64 {os.QuoteShell(primaryLibPath)}"
