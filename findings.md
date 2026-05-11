@@ -236,4 +236,5 @@
 - 生成版 `backend_driver_dispatch_min` 已能编译 `src/core/tooling/backend_driver_dispatch_min.cheng` 自身，二代产物 `status` 运行成功并输出 `bootstrap_mode=selfhost`、`flag_exec_edges=0`、`flag_exec_unresolved=0`。
 - `cold_cmd_build_backend_driver` 已删除旧的 compile 非零后扫描 `.o` 并用 `cc` 链接路径；现在 `compile-bootstrap` 失败即失败。`build_backend_driver_no_cc_fallback` 回归锁住输出和报告中不出现 `cold_cc_link`。
 - 本轮顺手修掉 `parse_call` import-mode 未解析调用返回 0 slot 的旧缺口；`parse_call` 与 `parse_call_from_args_span` 现在一致 hard-fail，`import_unresolved_hard_fail` 恢复稳定。
+- 浅导入边界已钉住：被导入模块内部裸名 `Helper` 走当前 import 模块局部名精确查找并运行 exit `39`；被导入模块再 import 叶子模块仍 hard-fail。该实现不是 alias 前缀，也不是 bare-name fallback。
 - `artifacts/backend_driver/cheng` 已替换为 cold linkerless 候选。替换前后均验证 `status`、`help`、三个 exe fixture、跨模块 `emit:obj`、自编译自身；正式入口还能再次 `build-backend-driver`，说明不是旁路候选通过。
