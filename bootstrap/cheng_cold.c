@@ -5494,6 +5494,7 @@ static ObjectDef *symbols_find_object(Symbols *symbols, Span name) {
 }
 
 static ObjectField *object_find_field(ObjectDef *object, Span name) {
+    if (!object) return 0;
     for (int32_t i = 0; i < object->field_count; i++) {
         if (span_same(object->fields[i].name, name)) return &object->fields[i];
     }
@@ -7813,10 +7814,6 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
       }
     }
     Span lookup_name = name;
-    if (parser->import_mode && parser->import_alias.len > 0 &&
-        cold_span_find_char(name, '.') < 0) {
-        lookup_name = cold_arena_join3(parser->arena, parser->import_alias, ".", name);
-    }
     int32_t fn_index = symbols_find_fn_for_call(parser->symbols, lookup_name, body, arg_start, arg_count);
     if (fn_index < 0) {
         /* Check for indirect call via local variable (function pointer) */
@@ -8031,10 +8028,6 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
         return intrinsic_slot;
     }
     Span lookup_name = name;
-    if (owner->import_mode && owner->import_alias.len > 0 &&
-        cold_span_find_char(name, '.') < 0) {
-        lookup_name = cold_arena_join3(owner->arena, owner->import_alias, ".", name);
-    }
     int32_t fn_index = symbols_find_fn_for_call(owner->symbols, lookup_name, body, arg_start, arg_count);
     if (fn_index < 0) {
         /* Check for indirect call via local variable (function pointer) */
@@ -13151,7 +13144,8 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
         }
         parser->pos = saved;
         int32_t ek = SLOT_I32;
-        (void)parse_postfix(parser, body, locals, locals_find(locals, kw)->slot, &ek);
+        { Local *lcl = locals_find(locals, kw);
+          if (lcl) (void)parse_postfix(parser, body, locals, lcl->slot, &ek); }
         return block;
     } else if (span_eq(kw, ";")) {
         /* Inline statement separator: skip and continue */
