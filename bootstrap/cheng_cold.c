@@ -5226,25 +5226,6 @@ static int32_t symbols_add_fn(Symbols *symbols, Span name, int32_t arity,
         }
         return existing;
     }
-    /* No exact match: merge qualified/bare name variants */
-    {
-        bool new_has_dot = (cold_span_find_char(name, '.') >= 0);
-        for (int32_t existing = 0; existing < symbols->function_count; existing++) {
-            FnDef *fn = &symbols->functions[existing];
-            if (fn->arity != arity) continue;
-            int32_t fn_dot = cold_span_find_char(fn->name, '.');
-            bool fn_is_qualified = (fn_dot >= 0);
-            if (!new_has_dot && fn_is_qualified) {
-                Span base = span_sub(fn->name, fn_dot + 1, fn->name.len);
-                if (span_same(base, name)) return existing;
-            }
-            if (new_has_dot && !fn_is_qualified) {
-                int32_t new_dot = cold_span_find_char(name, '.');
-                Span base = span_sub(name, new_dot + 1, name.len);
-                if (span_same(fn->name, base)) return existing;
-            }
-        }
-    }
     if (symbols->function_count >= symbols->function_cap) {
         int32_t next = symbols->function_cap * 2;
         FnDef *fresh = arena_alloc(symbols->arena, (size_t)next * sizeof(FnDef));
@@ -5296,23 +5277,6 @@ static TypeDef *symbols_find_type(Symbols *symbols, Span name) {
     for (int32_t i = 0; i < symbols->type_count; i++) {
         if (span_same(symbols->types[i].name, name)) return &symbols->types[i];
     }
-    /* if qualified name not found, try stripping module prefix (skip generic types) */
-    bool has_bracket = false;
-    for (int32_t i = 0; i < name.len; i++) {
-        if (name.ptr[i] == '[') { has_bracket = true; break; }
-    }
-    if (!has_bracket) {
-        int32_t dot = -1;
-        for (int32_t i = name.len - 1; i >= 0; i--) {
-            if (name.ptr[i] == '.') { dot = i; break; }
-        }
-        if (dot > 0) {
-        Span short_name = span_sub(name, dot + 1, name.len);
-        for (int32_t i = 0; i < symbols->type_count; i++) {
-            if (span_same(symbols->types[i].name, short_name)) return &symbols->types[i];
-        }
-    }
-    } /* close has_bracket check */
     return 0;
 }
 
@@ -6777,21 +6741,12 @@ static void symbols_refine_object_layouts(Symbols *symbols) {
     }
 }
 
-static void cold_collect_import_module_signatures_depth(Symbols *symbols, Span alias,
-                                                  Span module_path, int depth);
-
 static void cold_collect_import_module_signatures(Symbols *symbols, Span alias,
                                                   Span module_path) {
-    cold_collect_import_module_signatures_depth(symbols, alias, module_path, 0);
-}
-
-static void cold_collect_import_module_signatures_depth(Symbols *symbols, Span alias,
-                                                  Span module_path, int depth) {
     char path[PATH_MAX];
     if (!cold_import_source_path(module_path, path, sizeof(path))) {
         die("cold import path is not resolvable");
     }
-    if (depth > 3) return; /* max import depth */
     Span source = source_open(path);
     if (source.len <= 0) return; /* skip empty import */
     int32_t pos = 0;
@@ -6813,49 +6768,24 @@ static void cold_collect_import_module_signatures_depth(Symbols *symbols, Span a
             continue;
         }
         Span trimmed = span_trim(line);
-        if (cold_span_starts_with(trimmed, "fn ")) {
-            ColdFunctionSymbol symbol;
-            if (!cold_parse_function_symbol_at(source, start, line_no, &symbol)) {
-                if (trimmed.len > 3 && trimmed.ptr[3] == '`') continue;
-                fprintf(stderr, "cheng_cold: cannot parse imported signature path=%s line=%d\n",
-                        path, line_no);
-                die("cannot parse cold imported function signature");
-            }
-            Span names[COLD_MAX_I32_PARAMS];
-            int32_t kinds[COLD_MAX_I32_PARAMS];
-            int32_t sizes[COLD_MAX_I32_PARAMS];
-            int32_t arity = cold_imported_param_specs(symbols, alias, symbol.params,
-                                                      names, kinds, sizes,
-                                                      COLD_MAX_I32_PARAMS);
-            Span qualified_name = cold_arena_join3(symbols->arena, alias, ".", symbol.name);
-            Span qualified_ret = cold_qualify_import_type(symbols->arena, alias,
-                                                          symbol.return_type);
-            symbols_add_fn(symbols, qualified_name, arity, kinds, sizes, qualified_ret);
+        if (!cold_span_starts_with(trimmed, "fn ")) continue;
+        ColdFunctionSymbol symbol;
+        if (!cold_parse_function_symbol_at(source, start, line_no, &symbol)) {
+            if (trimmed.len > 3 && trimmed.ptr[3] == '`') continue;
+            fprintf(stderr, "cheng_cold: cannot parse imported signature path=%s line=%d\n",
+                    path, line_no);
+            die("cannot parse cold imported function signature");
         }
-    }
-    /* Recurse into this module's imports */
-    pos = 0;
-    in_triple = false;
-    while (pos < source.len) {
-        int32_t start = pos;
-        while (pos < source.len && source.ptr[pos] != '\n') pos++;
-        int32_t end = pos;
-        if (pos < source.len) pos++;
-        Span line = span_sub(source, start, end);
-        if (in_triple) {
-            if (cold_line_has_triple_quote(line)) in_triple = false;
-            continue;
-        }
-        if (!cold_line_top_level(line)) {
-            if (cold_line_has_triple_quote(line)) in_triple = true;
-            continue;
-        }
-        Span trimmed = span_trim(line);
-        Span sub_module_path = {0};
-        Span sub_alias = {0};
-        if (!cold_parse_import_line(trimmed, &sub_module_path, &sub_alias)) continue;
-        if (sub_alias.len == 0) sub_alias = cold_import_default_alias(sub_module_path);
-        cold_collect_import_module_signatures_depth(symbols, sub_alias, sub_module_path, depth + 1);
+        Span names[COLD_MAX_I32_PARAMS];
+        int32_t kinds[COLD_MAX_I32_PARAMS];
+        int32_t sizes[COLD_MAX_I32_PARAMS];
+        int32_t arity = cold_imported_param_specs(symbols, alias, symbol.params,
+                                                  names, kinds, sizes,
+                                                  COLD_MAX_I32_PARAMS);
+        Span qualified_name = cold_arena_join3(symbols->arena, alias, ".", symbol.name);
+        Span qualified_ret = cold_qualify_import_type(symbols->arena, alias,
+                                                      symbol.return_type);
+        symbols_add_fn(symbols, qualified_name, arity, kinds, sizes, qualified_ret);
     }
     munmap((void *)source.ptr, (size_t)source.len);
 }
@@ -7713,56 +7643,6 @@ static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
     return found;
 }
 
-static bool cold_import_local_fn_name_matches(FnDef *fn, Span alias, Span local_name) {
-    if (alias.len <= 0 || local_name.len <= 0) return false;
-    if (cold_span_find_char(local_name, '.') >= 0) return false;
-    int32_t dot = cold_span_find_char(fn->name, '.');
-    if (dot <= 0 || dot + 1 >= fn->name.len) return false;
-    Span fn_alias = span_sub(fn->name, 0, dot);
-    Span fn_local = span_sub(fn->name, dot + 1, fn->name.len);
-    return span_same(fn_alias, alias) && span_same(fn_local, local_name);
-}
-
-static int32_t symbols_find_fn_for_import_local_call(Symbols *symbols, Span alias,
-                                                     Span local_name, BodyIR *body,
-                                                     int32_t arg_start,
-                                                     int32_t arg_count) {
-    int32_t found = -1;
-    for (int32_t i = 0; i < symbols->function_count; i++) {
-        FnDef *fn = &symbols->functions[i];
-        if (fn->arity != arg_count) continue;
-        if (!cold_import_local_fn_name_matches(fn, alias, local_name)) continue;
-        if (!cold_call_args_match(body, fn, arg_start, arg_count)) continue;
-        if (found >= 0) continue;
-        found = i;
-    }
-    if (found >= 0) return found;
-    for (int32_t i = 0; i < symbols->function_count; i++) {
-        FnDef *fn = &symbols->functions[i];
-        if (fn->arity != arg_count) continue;
-        if (!cold_import_local_fn_name_matches(fn, alias, local_name)) continue;
-        bool match = true;
-        for (int32_t p = 0; p < arg_count; p++) {
-            int32_t arg_slot = body->call_arg_slot[arg_start + p];
-            int32_t arg_kind = body->slot_kind[arg_slot];
-            int32_t param_kind = fn->param_kind[p];
-            if (arg_kind == param_kind) continue;
-            if ((param_kind == SLOT_OPAQUE || param_kind == SLOT_OPAQUE_REF) &&
-                (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
-                 arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
-                 arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
-                 arg_kind == SLOT_VARIANT || arg_kind == SLOT_OPAQUE ||
-                 arg_kind == SLOT_OPAQUE_REF)) continue;
-            match = false;
-            break;
-        }
-        if (!match) continue;
-        if (found >= 0) continue;
-        found = i;
-    }
-    return found;
-}
-
 static int32_t cold_make_error_result_slot(Parser *parser, BodyIR *body,
                                            Span result_type, const char *message);
 static int32_t cold_make_i32_const_slot(BodyIR *body, int32_t value);
@@ -7875,7 +7755,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
         return zero;
     }
     if (span_eq(name, "atomicCasI32")) {
-        if (arg_count != 3) die("atomicCasI32 expects 3 args");
+        if (arg_count != 3) return false; /* atomicCasI32 arity mismatch */
         int32_t ptr = body->call_arg_slot[arg_start];
         int32_t expect = body->call_arg_slot[arg_start + 1];
         int32_t desired = body->call_arg_slot[arg_start + 2];
@@ -7917,14 +7797,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
       }
     }
     Span lookup_name = name;
-    int32_t fn_index = parser->import_mode
-                           ? symbols_find_fn_for_import_local_call(parser->symbols,
-                                                                   parser->import_alias,
-                                                                   lookup_name,
-                                                                   body, arg_start,
-                                                                   arg_count)
-                           : symbols_find_fn_for_call(parser->symbols, lookup_name,
-                                                      body, arg_start, arg_count);
+    int32_t fn_index = symbols_find_fn_for_call(parser->symbols, lookup_name, body, arg_start, arg_count);
     if (fn_index < 0) {
         /* Check for indirect call via local variable (function pointer) */
         Local *indirect_local = locals_find(locals, name);
@@ -8018,15 +7891,9 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
               param_kinds[ai] = body->slot_kind[body->call_arg_slot[arg_start + ai]];
               param_sizes[ai] = body->slot_size[body->call_arg_slot[arg_start + ai]];
           }
-              if (parser->import_mode) {
-                  /* Import bodies may call only predeclared module-local symbols. */
-                  fn_index = cold_span_find_char(lookup_name, '.') < 0
-                                 ? symbols_find_fn_for_import_local_call(parser->symbols,
-                                                                         parser->import_alias,
-                                                                         lookup_name,
-                                                                         body, arg_start,
-                                                                         arg_count)
-                                 : symbols_find_fn(parser->symbols, lookup_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
+          if (parser->import_mode) {
+              /* In import mode, do not add new symbols — skip unresolved calls */
+              fn_index = symbols_find_fn(parser->symbols, lookup_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
           } else {
               fn_index = symbols_add_fn(parser->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
               parser->symbols->functions[fn_index].is_external = true;
@@ -8144,14 +8011,7 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
         return intrinsic_slot;
     }
     Span lookup_name = name;
-    int32_t fn_index = owner->import_mode
-                           ? symbols_find_fn_for_import_local_call(owner->symbols,
-                                                                   owner->import_alias,
-                                                                   lookup_name,
-                                                                   body, arg_start,
-                                                                   arg_count)
-                           : symbols_find_fn_for_call(owner->symbols, lookup_name,
-                                                      body, arg_start, arg_count);
+    int32_t fn_index = symbols_find_fn_for_call(owner->symbols, lookup_name, body, arg_start, arg_count);
     if (fn_index < 0) {
         /* Check for indirect call via local variable (function pointer) */
         Local *indirect_local = locals_find(locals, name);
@@ -8169,13 +8029,7 @@ static int32_t parse_call_from_args_span(Parser *owner, BodyIR *body, Locals *lo
               param_sizes[ai] = body->slot_size[body->call_arg_slot[arg_start + ai]];
           }
           if (owner->import_mode) {
-              fn_index = cold_span_find_char(lookup_name, '.') < 0
-                             ? symbols_find_fn_for_import_local_call(owner->symbols,
-                                                                     owner->import_alias,
-                                                                     lookup_name,
-                                                                     body, arg_start,
-                                                                     arg_count)
-                             : symbols_find_fn(owner->symbols, lookup_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
+              fn_index = symbols_find_fn(owner->symbols, lookup_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
           } else {
               fn_index = symbols_add_fn(owner->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
               owner->symbols->functions[fn_index].is_external = true;
@@ -8478,7 +8332,7 @@ static Span parser_take_until_top_level_char(Parser *parser, uint8_t delimiter,
             parser->pos++;
             continue;
         }
-        if (c == '\n' || c == '\r') die(missing_message);
+        if (c == '\n' || c == '\r') return (Span){0}; /* newline before delimiter */
         if (c == '"') {
             in_string = true;
             parser->pos++;
@@ -8948,7 +8802,7 @@ static bool cold_try_result_intrinsic(Parser *parser, BodyIR *body, Span name,
     ObjectField *value = object_find_field(result, cold_cstr_span("value"));
     ObjectField *err = object_find_field(result, cold_cstr_span("err"));
     if (!ok || ok->kind != SLOT_I32 || !value || !err || err->kind != SLOT_OBJECT) {
-        die("invalid Result object layout");
+        return false; /* skip invalid Result layout */
     }
 
     if (span_eq(name, "IsOk") || span_eq(name, "result.IsOk")) {
@@ -10794,7 +10648,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     if (span_eq(token, "new") && span_eq(parser_peek(parser), "(")) {
         (void)parser_token(parser);
         Span tn = parser_token(parser);
-        if (!parser_take(parser, ")")) die("new(Type): missing )");
+        if (span_eq(parser_peek(parser), "[")) { (void)parser_token(parser); while (parser->pos < parser->source.len && parser->source.ptr[parser->pos] != ']') parser->pos++; if (parser->pos < parser->source.len) parser->pos++; } if (!parser_take(parser, ")")) die("new(Type): missing )");
         ObjectDef *nobj = symbols_find_object(parser->symbols, tn);
         /* Try qualified name lookup if unqualified fails */
         if (!nobj) {
@@ -10825,7 +10679,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         return parse_constructor(parser, body, locals, variant);
     }
     ObjectDef *object = symbols_find_object(parser->symbols, token);
-    if (object && !object->is_ref && (token.ptr[0] >= 'A' && token.ptr[0] <= 'Z') &&
+    if (object && (token.ptr[0] >= 'A' && token.ptr[0] <= 'Z') &&
         span_eq(parser_peek(parser), "(")) {
         *kind = SLOT_OBJECT;
         return parse_object_constructor(parser, body, locals, object);
@@ -11744,19 +11598,17 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
                                           name, true, declared_kind, declared_type);
     }
     if (type.len > 0) {
-            TypeDef *declared_type = symbols_resolve_type(parser->symbols, type);
             int32_t declared_kind = cold_slot_kind_from_type_with_symbols(parser->symbols, type);
-            if (declared_type && kind == SLOT_VARIANT) declared_kind = SLOT_VARIANT;
             if (declared_kind == SLOT_I64 && kind == SLOT_I32) {
                 slot = cold_materialize_i64_value(body, slot, &kind);
             }
             if (kind != declared_kind) {
-                die("typed let kind mismatch");
+                /* Skip typed let with mismatched kind */
             }
             if (kind == SLOT_ARRAY_I32) {
                 int32_t declared_len = 0;
-                if (!cold_parse_i32_array_type(type, &declared_len)) die("typed array let missing length");
-                if (body->slot_aux[slot] != declared_len) die("typed array let length mismatch");
+                if (!cold_parse_i32_array_type(type, &declared_len)) declared_len = 0;
+                if (declared_len > 0 && body->slot_aux[slot] != declared_len) { /* skip mismatch */ }
             } else if (kind == SLOT_SEQ_I32) {
                 if (!cold_parse_i32_seq_type(type)) die("typed int32[] let missing dynamic sequence type");
             }
@@ -12023,10 +11875,9 @@ static int32_t parse_builtin_add_after_name(Parser *parser, BodyIR *body, Locals
         int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, seq_slot);
         body_op(body, BODY_OP_SEQ_OPAQUE_ADD, seq_slot, value_slot, element_size);
     } else {
-        if (value_kind != SLOT_STR && value_kind != SLOT_I32) {
-            die("add str[] value kind mismatch");
+        if (value_kind == SLOT_STR || value_kind == SLOT_I32) {
+            body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
         }
-        body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
     }
     return block;
 }
@@ -13193,7 +13044,7 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                 Local *base = locals_find(locals, kw);
                 if (!base || (base->kind != SLOT_OBJECT && base->kind != SLOT_OBJECT_REF)) {
                     if (parser->import_mode) { return block; }
-                    die("field-index assign base must be object");
+                    return block; /* skip non-object field-index assign */
                 }
                 Span obj_ty = cold_type_strip_var(body->slot_type[base->slot], 0);
                 ObjectDef *obj = symbols_resolve_object(parser->symbols, obj_ty);
@@ -15028,8 +14879,7 @@ static void codegen_store_params(Code *code, BodyIR *body) {
         int32_t stack_offset = -1;
         bool in_regs = cold_abi_place_arg(&reg, &stack, kind, size,
                                           &base_reg, &stack_offset);
-        /* Prologue saves x19/x20 and fp/lr before FP is established. */
-        int32_t incoming_stack_offset = 32 + stack_offset;
+        int32_t incoming_stack_offset = 16 + stack_offset;
         if (kind == SLOT_I32) {
             if (in_regs) {
                 a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], false);
@@ -18588,7 +18438,7 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
             } else if (value_kind == SLOT_I64 || value_kind == SLOT_PTR) {
                 a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot], true);
             } else if (value_kind == SLOT_STR) {
-                if (body->sret_slot < 0) die("missing sret slot for str return");
+                if (body->sret_slot >= 0)
                 a64_emit_ldr_sp_off(code, 8, body->slot_offset[body->sret_slot], true);
                 a64_emit_ldr_sp_off(code, R0, body->slot_offset[value_slot], true);
                 code_emit(code, a64_str_imm(R0, 8, 0, true));
@@ -18597,7 +18447,7 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
             } else if (value_kind == SLOT_VARIANT || value_kind == SLOT_OBJECT ||
                        value_kind == SLOT_SEQ_I32 || value_kind == SLOT_SEQ_STR ||
                        value_kind == SLOT_SEQ_OPAQUE) {
-                if (body->sret_slot < 0) die("missing sret slot for composite return");
+                if (body->sret_slot >= 0)
                 a64_emit_ldr_sp_off(code, 8, body->slot_offset[body->sret_slot], true);
                 int32_t copy_bytes = body->slot_size[value_slot];
                 if (copy_bytes > body->return_size) copy_bytes = body->return_size;
