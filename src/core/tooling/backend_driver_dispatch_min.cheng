@@ -1387,9 +1387,31 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitObj(driverRoot: str, reportPath:
     let coldCmd = Fmt"{os.QuoteShell(coldBin)} system-link-exec --in:{os.QuoteShell(sourcePath)} --emit:obj --target:{linkPlan.targetTriple} --out:{os.QuoteShell(objectPath)} --report-out:{os.QuoteShell(reportPath)}"
     let coldRun = os.ExecShellCmdStatus(coldCmd, driverRoot)
     if coldRun != 0 || !chengpath.FileExistsNonEmpty(driverRoot, objectPath):
-        let reason = Fmt"backend driver direct: cold compiler --emit:obj failed exit={coldRun}"
-        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
-        return BackendDriverDispatchMinUnsupported(reason)
+        let objectRes = direct.DirectObjectEmitPlanObjectForTarget(driverRoot, primaryPlan, linkPlan.targetTriple, tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple))
+        if IsErr(objectRes):
+            let reason = Error(objectRes)
+            let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
+            return BackendDriverDispatchMinUnsupported(reason)
+        let object = Value(objectRes)
+        phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs() - phaseProfile.directObjectEmitNs
+        BackendDriverDispatchMinProgress("direct_object_emit", "done")
+        var objReport = ""
+        BackendDriverDispatchMinAppendLine(objReport, "system_link_exec_runtime_execute=0")
+        BackendDriverDispatchMinAppendLine(objReport, "system_link_exec_emit=obj")
+        BackendDriverDispatchMinAppendLine(objReport, Fmt"primary_object={object.objectPath}")
+        BackendDriverDispatchMinAppendLine(objReport, "primary_object_direct=1")
+        BackendDriverDispatchMinAppendPrimaryPlanReport(objReport, primaryPlan)
+        BackendDriverDispatchMinAppendPhaseReport(objReport, phaseProfile)
+        BackendDriverDispatchMinAppendResourceReport(objReport)
+        BackendDriverDispatchMinAppendOutputFileSizeReport(objReport, driverRoot, object.objectPath)
+        BackendDriverDispatchMinAppendLine(objReport, Fmt"direct_object_output_kind={object.outputKind}")
+        BackendDriverDispatchMinAppendLine(objReport, Fmt"exec_phase_direct_object_layout_ms={strings.Int64ToStr(object.directObjectLayoutMs)}")
+        BackendDriverDispatchMinAppendLine(objReport, Fmt"exec_phase_direct_object_emit_ms={strings.Int64ToStr(object.directObjectEmitMs)}")
+        BackendDriverDispatchMinAppendLine(objReport, Fmt"direct_object_bytes={strings.IntToStr(object.bytesWritten)}")
+        BackendDriverDispatchMinAppendLine(objReport, Fmt"direct_object_reloc_count={strings.IntToStr(object.relocCount)}")
+        if !BackendDriverDispatchMinWriteReport(driverRoot, reportPath, objReport):
+            return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
+        return 0
     var objReport = ""
     BackendDriverDispatchMinAppendLine(objReport, "system_link_exec_runtime_execute=0")
     BackendDriverDispatchMinAppendLine(objReport, "system_link_exec_emit=obj")
@@ -1408,20 +1430,18 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitShared(driverRoot: str,
                                                        phaseProfile: var BackendDriverDispatchMinPhaseProfile): int32 =
     phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs()
     BackendDriverDispatchMinProgress("direct_object_emit", "begin")
-        let sourcePath = chengpath.PathAbsolute(driverRoot, linkPlan.entryPath)
-    let objectPath = linkPlan.outputPath
-    let coldBin = chengpath.PathAbsolute(driverRoot, "artifacts/cheng_cold")
-    let coldCmd = Fmt"{os.QuoteShell(coldBin)} system-link-exec --in:{os.QuoteShell(sourcePath)} --emit:obj --target:{linkPlan.targetTriple} --out:{os.QuoteShell(objectPath)} --report-out:{os.QuoteShell(reportPath)}"
-    let coldRun = os.ExecShellCmdStatus(coldCmd, driverRoot)
-    if coldRun != 0 || !chengpath.FileExistsNonEmpty(driverRoot, objectPath):
-        let reason = Fmt"backend driver direct: cold compiler --emit:obj shared failed exit={coldRun}"
+    let objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
+    let objectRes = direct.DirectObjectEmitPlanObjectForTarget(driverRoot, primaryPlan, linkPlan.targetTriple, objectFormat)
+    if IsErr(objectRes):
+        let reason = Error(objectRes)
         let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
         return BackendDriverDispatchMinUnsupported(reason)
-    let objectPath_abs = chengpath.PathAbsolute(driverRoot, objectPath)
+    let object = Value(objectRes)
     phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs() - phaseProfile.directObjectEmitNs
     BackendDriverDispatchMinProgress("direct_object_emit", "done")
+    let objectPath = chengpath.PathAbsolute(driverRoot, object.objectPath)
     let outputPath = chengpath.PathAbsolute(driverRoot, linkPlan.outputPath)
-    let nativeCommand = BackendDriverDispatchMinSharedLinkCommand(linkPlan.targetTriple, objectPath_abs, outputPath)
+    let nativeCommand = BackendDriverDispatchMinSharedLinkCommand(linkPlan.targetTriple, objectPath, outputPath)
     let nativeLinkLogPath = Fmt"{linkPlan.outputPath}.native_link.log"
     phaseProfile.nativeLinkNs = BackendDriverDispatchMinNowNs()
     BackendDriverDispatchMinProgress("native_link", "begin")
@@ -1440,10 +1460,15 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitShared(driverRoot: str,
     var sharedReport = ""
     BackendDriverDispatchMinAppendLine(sharedReport, "system_link_exec_runtime_execute=0")
     BackendDriverDispatchMinAppendLine(sharedReport, "system_link_exec_emit=shared")
-    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"primary_object={objectPath}")
-    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"native_primary_object={objectPath_abs}")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"primary_object={object.objectPath}")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"native_primary_object={objectPath}")
     BackendDriverDispatchMinAppendLine(sharedReport, Fmt"native_link_log={nativeLinkLogPath}")
     BackendDriverDispatchMinAppendLine(sharedReport, "primary_object_direct=1")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"direct_object_output_kind={object.outputKind}")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"exec_phase_direct_object_layout_ms={strings.Int64ToStr(object.directObjectLayoutMs)}")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"exec_phase_direct_object_emit_ms={strings.Int64ToStr(object.directObjectEmitMs)}")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"direct_object_bytes={strings.IntToStr(object.bytesWritten)}")
+    BackendDriverDispatchMinAppendLine(sharedReport, Fmt"direct_object_reloc_count={strings.IntToStr(object.relocCount)}")
     BackendDriverDispatchMinAppendPhaseReport(sharedReport, phaseProfile)
     BackendDriverDispatchMinAppendResourceReport(sharedReport)
     BackendDriverDispatchMinAppendOutputFileSizeReport(sharedReport, driverRoot, linkPlan.outputPath)
@@ -1454,16 +1479,13 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitShared(driverRoot: str,
 fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, reportPath: str, linkPlan: slplan.SystemLinkPlanStub, loweringPlan: lower.LoweringPlanStub, primaryPlan: pobj.PrimaryObjectPlan, phaseProfile: var BackendDriverDispatchMinPhaseProfile): int32 =
     phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs()
     BackendDriverDispatchMinProgress("direct_object_emit", "begin")
-    let sourcePath = chengpath.PathAbsolute(driverRoot, linkPlan.entryPath)
-    let objectPath = Fmt"{linkPlan.outputPath}.primary.o"
-    let coldBin = chengpath.PathAbsolute(driverRoot, "artifacts/cheng_cold")
-    let coldCmd = Fmt"CHENG_NO_IMPORT_BODIES=1 {os.QuoteShell(coldBin)} system-link-exec --in:{os.QuoteShell(sourcePath)} --emit:obj --target:{linkPlan.targetTriple} --out:{os.QuoteShell(objectPath)} --report-out:{os.QuoteShell(reportPath)}"
-    let coldRun = os.ExecShellCmdStatus(coldCmd, driverRoot)
-    var objectPath_final = objectPath
-    if coldRun != 0 || !chengpath.FileExistsNonEmpty(driverRoot, objectPath):
-        let reason = Fmt"backend driver direct: cold compiler primary --emit:obj failed exit={coldRun}"
+    let objectFormat = tmat.TargetPrimaryObjectFormat(linkPlan.targetTriple)
+    let objectRes = direct.DirectObjectEmitPlanObjectForTarget(driverRoot, primaryPlan, linkPlan.targetTriple, objectFormat)
+    if IsErr(objectRes):
+        let reason = Error(objectRes)
         let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
         return BackendDriverDispatchMinUnsupported(reason)
+    let object = Value(objectRes)
     phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs() - phaseProfile.directObjectEmitNs
     BackendDriverDispatchMinProgress("direct_object_emit", "done")
     let currentCompilerPath = BackendDriverDispatchMinCurrentCompiler(driverRoot)
@@ -1516,7 +1538,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
         return BackendDriverDispatchMinUnsupported(reason)
     phaseProfile.providerObjectNs = BackendDriverDispatchMinNowNs() - phaseProfile.providerObjectNs
     BackendDriverDispatchMinProgress("provider_object", "done")
-    let primaryObjectPath = chengpath.PathAbsolute(driverRoot, objectPath_final)
+    let primaryObjectPath = chengpath.PathAbsolute(driverRoot, object.objectPath)
     let outputPath = chengpath.PathAbsolute(driverRoot, linkPlan.outputPath)
     let primaryLibPath = Fmt"{primaryObjectPath}.link.a"
     var nativeCommand = Fmt"ar rcs {os.QuoteShell(primaryLibPath)} {os.QuoteShell(primaryObjectPath)} && cc -arch arm64 {os.QuoteShell(primaryLibPath)}"
@@ -1534,7 +1556,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_execute=1")
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_no_runtime=0")
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_direct_entry=0")
-    BackendDriverDispatchMinAppendLine(exeReport, Fmt"primary_object={outputPath}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"primary_object={object.objectPath}")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"native_primary_object={primaryObjectPath}")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"provider_compiler={currentCompilerPath}")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"provider_modules={slplan.SystemLinkPlanListText(linkPlan.providerModules)}")
@@ -1555,10 +1577,11 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
     BackendDriverDispatchMinAppendPhaseReport(exeReport, phaseProfile)
     BackendDriverDispatchMinAppendResourceReport(exeReport)
     BackendDriverDispatchMinAppendOutputFileSizeReport(exeReport, driverRoot, linkPlan.outputPath)
-    BackendDriverDispatchMinAppendLine(exeReport, "direct_object_output_kind=obj")
-    BackendDriverDispatchMinAppendLine(exeReport, "exec_phase_direct_object_layout_ms=0")
-    BackendDriverDispatchMinAppendLine(exeReport, "exec_phase_direct_object_emit_ms=0")
-    BackendDriverDispatchMinAppendOutputFileSizeReport(exeReport, driverRoot, objectPath_final)
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_output_kind={object.outputKind}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"exec_phase_direct_object_layout_ms={strings.Int64ToStr(object.directObjectLayoutMs)}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"exec_phase_direct_object_emit_ms={strings.Int64ToStr(object.directObjectEmitMs)}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_bytes={strings.IntToStr(object.bytesWritten)}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_reloc_count={strings.IntToStr(object.relocCount)}")
     let exeReportWritten = chengpath.WriteTextFile(driverRoot, reportPath, exeReport)
     if !exeReportWritten:
         return BackendDriverDispatchMinUnsupported(Fmt"backend driver direct system-link-exec: failed to write report: {reportPath}")
@@ -1597,19 +1620,22 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot: str, r
                                                                reportPath,
                                                                reason)
         return BackendDriverDispatchMinUnsupported(reason)
-        phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs()
+    phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs()
     BackendDriverDispatchMinProgress("direct_object_emit", "begin")
-    let sourcePath = chengpath.PathAbsolute(driverRoot, linkPlan.entryPath)
+    let objectRes = direct.DirectObjectEmitStandaloneExecutable(driverRoot, primaryPlan, linkPlan.outputPath)
+    if IsErr(objectRes):
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, Error(objectRes))
+        return BackendDriverDispatchMinUnsupported(Error(objectRes))
+    let object = Value(objectRes)
+    phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs() - phaseProfile.directObjectEmitNs
+    BackendDriverDispatchMinProgress("direct_object_emit", "done")
     let outputPath = chengpath.PathAbsolute(driverRoot, linkPlan.outputPath)
-    let coldBin = chengpath.PathAbsolute(driverRoot, "artifacts/cheng_cold")
-    let coldCmd = Fmt"{os.QuoteShell(coldBin)} system-link-exec --in:{os.QuoteShell(sourcePath)} --emit:exe --target:{linkPlan.targetTriple} --out:{os.QuoteShell(outputPath)} --report-out:{os.QuoteShell(reportPath)}"
-    let coldRun = os.ExecShellCmdStatus(coldCmd, driverRoot)
-    if coldRun != 0 || !chengpath.FileExistsNonEmpty(driverRoot, outputPath):
-        let reason = Fmt"backend driver direct: cold compiler standalone exe failed exit={coldRun}"
+    var lineMapPath: str
+    if !chengpath.FileExistsNonEmpty(driverRoot, linkPlan.outputPath):
+        let reason = Fmt"backend driver direct system-link-exec: linkerless output missing after emit: {linkPlan.outputPath}"
         let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
         return BackendDriverDispatchMinUnsupported(reason)
-    phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs() - phaseProfile.directObjectEmitNs
-    BackendDriverDispatchMinProgress("direct_object_emit", "done")    let chmodRun = os.ExecShellCmdEx(Fmt"chmod 755 {os.QuoteShell(outputPath)}", uint64(0), driverRoot)
+    let chmodRun = os.ExecShellCmdEx(Fmt"chmod 755 {os.QuoteShell(outputPath)}", uint64(0), driverRoot)
     if os.ExecCmdResultExitCode(chmodRun) != 0:
         let reason = Fmt"backend driver direct system-link-exec: chmod failed for linkerless output: {linkPlan.outputPath}"
         let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
@@ -1628,7 +1654,7 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot: str, r
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_execute=1")
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_no_runtime=1")
     BackendDriverDispatchMinAppendLine(exeReport, "system_link_exec_runtime_standalone_direct_entry=1")
-    BackendDriverDispatchMinAppendLine(exeReport, Fmt"primary_object={outputPath}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"primary_object={object.objectPath}")
     BackendDriverDispatchMinAppendLine(exeReport, "provider_object_count=0")
     BackendDriverDispatchMinAppendLine(exeReport, "native_link_log=-")
     BackendDriverDispatchMinAppendLine(exeReport, Fmt"line_map={lineMapPath}")
@@ -1638,9 +1664,9 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeStandalone(driverRoot: str, r
     BackendDriverDispatchMinAppendPhaseReport(exeReport, phaseProfile)
     BackendDriverDispatchMinAppendResourceReport(exeReport)
     BackendDriverDispatchMinAppendOutputFileSizeReport(exeReport, driverRoot, linkPlan.outputPath)
-    BackendDriverDispatchMinAppendLine(exeReport, "direct_object_output_kind=exe")
-    BackendDriverDispatchMinAppendLine(exeReport, "direct_object_bytes=0")
-    BackendDriverDispatchMinAppendLine(exeReport, "direct_object_reloc_count=0")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_output_kind={object.outputKind}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_bytes={strings.IntToStr(object.bytesWritten)}")
+    BackendDriverDispatchMinAppendLine(exeReport, Fmt"direct_object_reloc_count={strings.IntToStr(object.relocCount)}")
     let finalReportPath = BackendDriverDispatchMinReadFlagOrDefault("--report-out", Fmt"{linkPlan.outputPath}.report.txt")
     let exeStandaloneReportWritten = chengpath.WriteTextFile(driverRoot, finalReportPath, exeReport)
     if !exeStandaloneReportWritten:

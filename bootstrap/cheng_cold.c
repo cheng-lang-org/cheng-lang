@@ -14901,8 +14901,8 @@ static void codegen_store_slot_to_payload(Code *code, BodyIR *body,
 
 static void codegen_str_eq(Code *code, BodyIR *body, int32_t dst, int32_t left, int32_t right) {
     if (body->slot_kind[left] != SLOT_STR || body->slot_kind[right] != SLOT_STR) return; /* skip non-str eq */
-    a64_emit_ldr_sp_off(code, R2, body->slot_offset[left] + 8, true);
-    a64_emit_ldr_sp_off(code, R3, body->slot_offset[right] + 8, true);
+    a64_emit_ldr_sp_off(code, R2, body->slot_offset[left] + 8, false);
+    a64_emit_ldr_sp_off(code, R3, body->slot_offset[right] + 8, false);
     code_emit(code, a64_cmp_reg(R2, R3));
     int32_t len_ne = code->count;
     code_emit(code, a64_bcond(0, COND_NE));
@@ -19252,14 +19252,23 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         if (dup) { fprintf(stderr, "[cold_body] skip dup: %.*s\n", (int)nm.len, nm.ptr); continue; }
         name_seen[i] = true;
         symbol_offset[i] = shared->count;
-        BodyIR *body = function_bodies[i];
-        if (body->has_fallback || body->block_count == 0 ||
-            (body->block_count > 0 && body->block_term[0] < 0)) {
-            /* Stub: return 0 */
-            code_emit(shared, a64_movz(R0, 0, 0));
-            code_emit(shared, a64_ret());
+        BodyIR *fn_body = function_bodies[i];
+        if (fn_body->has_fallback || fn_body->block_count == 0 ||
+            (fn_body->block_count > 0 && fn_body->block_term[0] < 0)) {
+            int32_t ret_kind = fn_body->return_kind;
+            if (ret_kind == SLOT_STR) {
+                code_emit(shared, a64_movz(R0, 0, 0));
+                a64_emit_str_sp_off(shared, R0, fn_body->slot_offset[0], true);
+                a64_emit_str_sp_off(shared, R0, fn_body->slot_offset[0] + 8, true);
+                a64_emit_str_sp_off(shared, R0, fn_body->slot_offset[0] + COLD_STR_STORE_ID_OFFSET, false);
+                a64_emit_str_sp_off(shared, R0, fn_body->slot_offset[0] + COLD_STR_FLAGS_OFFSET, false);
+                code_emit(shared, a64_ret());
+            } else {
+                code_emit(shared, a64_movz(R0, 0, 0));
+                code_emit(shared, a64_ret());
+            }
         } else {
-            codegen_func(shared, body, symbols, &function_patches);
+            codegen_func(shared, fn_body, symbols, &function_patches);
         }
     }
 
