@@ -292,10 +292,11 @@ static bool macho_write_object(const char *path,
     int32_t code_sz = code_words * 4;
 
     /* Build string table first to know its size */
-    char strtab[4096];
+    char strtab[65536];
     int32_t str_off = 1; /* first byte is \0 */
     int32_t name_stroff[128];
     for (int32_t i = 0; i < name_count && i < 128; i++) {
+        if (i>=85 && i<110) fprintf(stderr, "[macho] name[%d]=%s\n", i, names[i] ? names[i] : "(null)");
         name_stroff[i] = str_off;
         int32_t nl = (int32_t)strlen(names[i]);
         if (str_off + nl + 2 < (int32_t)sizeof(strtab)) {

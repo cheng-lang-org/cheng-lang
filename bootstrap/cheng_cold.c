@@ -7446,7 +7446,7 @@ static void cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
         int32_t arg_slot = body->call_arg_slot[arg_start + i];
         int32_t arg_kind = body->slot_kind[arg_slot];
         if (fn->param_kind[i] == SLOT_I32_REF) {
-            if (arg_kind != SLOT_I32 && arg_kind != SLOT_I32_REF) die("cold var int32 arg kind mismatch");
+            if (arg_kind != SLOT_I32 && arg_kind != SLOT_I32_REF && arg_kind != SLOT_VARIANT) die("cold var int32 arg kind mismatch");
         } else if (fn->param_kind[i] == SLOT_I64_REF) {
             if (arg_kind != SLOT_I64 && arg_kind != SLOT_I64_REF) die("cold var int64 arg kind mismatch");
         } else if (fn->param_kind[i] == SLOT_SEQ_I32_REF) {
@@ -7498,7 +7498,7 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
         int32_t arg_slot = body->call_arg_slot[arg_start + i];
         int32_t arg_kind = body->slot_kind[arg_slot];
         if (fn->param_kind[i] == SLOT_I32_REF) {
-            if (arg_kind != SLOT_I32 && arg_kind != SLOT_I32_REF) return false;
+            if (arg_kind != SLOT_I32 && arg_kind != SLOT_I32_REF && arg_kind != SLOT_VARIANT) return false;
         } else if (fn->param_kind[i] == SLOT_I64_REF) {
             if (arg_kind != SLOT_I64 && arg_kind != SLOT_I64_REF) return false;
         } else if (fn->param_kind[i] == SLOT_SEQ_I32_REF) {
@@ -7546,44 +7546,20 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
 static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
                                         BodyIR *body, int32_t arg_start,
                                         int32_t arg_count) {
-    bool diag_call_match = getenv("COLD_DIAG_CALL_MATCH") && getenv("COLD_DIAG_CALL_MATCH")[0];
-    if (diag_call_match) {
-        fprintf(stderr, "[call_match] lookup %.*s argc=%d args=", name.len, name.ptr, arg_count);
-        for (int32_t p = 0; p < arg_count; p++) {
-            int32_t arg_slot = body->call_arg_slot[arg_start + p];
-            fprintf(stderr, "%s%d/%d", p ? "," : "", body->slot_kind[arg_slot], body->slot_size[arg_slot]);
-        }
-        fputc('\n', stderr);
-    }
     /* first pass: exact match */
     int32_t found = -1;
     for (int32_t i = 0; i < symbols->function_count; i++) {
         FnDef *fn = &symbols->functions[i];
         if (fn->arity != arg_count || !span_same(fn->name, name)) continue;
-        if (diag_call_match) {
-            fprintf(stderr, "[call_match] cand exact fn[%d] params=", i);
-            for (int32_t p = 0; p < arg_count; p++)
-                fprintf(stderr, "%s%d/%d", p ? "," : "", fn->param_kind[p], fn->param_size[p]);
-            fputc('\n', stderr);
-        }
         if (!cold_call_args_match(body, fn, arg_start, arg_count)) continue;
         if (found >= 0) return -1; /* ambiguous: caller should report error */
         found = i;
     }
-    if (found >= 0) {
-        if (diag_call_match) fprintf(stderr, "[call_match] exact hit fn[%d]\n", found);
-        return found;
-    }
+    if (found >= 0) return found;
     /* second pass: OPAQUE-tolerant match (for CSG lowerer with less precise types) */
     for (int32_t i = 0; i < symbols->function_count; i++) {
         FnDef *fn = &symbols->functions[i];
         if (fn->arity != arg_count || !span_same(fn->name, name)) continue;
-        if (diag_call_match) {
-            fprintf(stderr, "[call_match] cand tolerant fn[%d] params=", i);
-            for (int32_t p = 0; p < arg_count; p++)
-                fprintf(stderr, "%s%d/%d", p ? "," : "", fn->param_kind[p], fn->param_size[p]);
-            fputc('\n', stderr);
-        }
         /* OPAQUE-tolerant matching */
         bool match = true;
         for (int32_t p = 0; p < arg_count; p++) {
@@ -7603,7 +7579,6 @@ static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
         if (found >= 0) return -1; /* ambiguous even with tolerance */
         found = i;
     }
-    if (diag_call_match) fprintf(stderr, "[call_match] result fn[%d]\n", found);
     return found;
 }
 
@@ -18860,12 +18835,6 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
                 function_bodies[i] = NULL;
             }
         }
-        { int32_t psc = 0; for (int32_t si = 0; si < symbols->function_count; si++) {
-        Span sn = symbols->functions[si].name;
-        if (sn.len >= 8 && memcmp(sn.ptr, "ParamStr", 8) == 0)
-            fprintf(stderr, "[cold_sym] sym[%d] name=%.*s\n", si, (int)sn.len, sn.ptr), psc++;
-      }
-      fprintf(stderr, "[cold_sym] total ParamStr in symbols: %d\n", psc); }
     Parser parser = {mapped_source, 0, arena, symbols};
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
@@ -19075,12 +19044,6 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
     }
 
-    { int32_t psc = 0; for (int32_t si = 0; si < symbols->function_count; si++) {
-        Span sn = symbols->functions[si].name;
-        if (sn.len >= 8 && memcmp(sn.ptr, "ParamStr", 8) == 0)
-            fprintf(stderr, "[cold_sym] sym[%d] name=%.*s\n", si, (int)sn.len, sn.ptr), psc++;
-      }
-      fprintf(stderr, "[cold_sym] total ParamStr in symbols: %d\n", psc); }
     Parser parser = {mapped_source, 0, arena, symbols};
     while (parser.pos < mapped_source.len) {
         parser_ws(&parser);
@@ -19190,10 +19153,15 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         if (dup) continue;
         if (nm.len==8 && memcmp(nm.ptr,"ParamStr",8)==0) fprintf(stderr, "[cold_name] ParamStr from sym[%d] off=%d\n", i, symbol_offset[i]);
         func_offsets[name_count] = symbol_offset[i];
-        char *nc = arena_alloc(arena, (size_t)nm.len + 1);
-        memcpy(nc, nm.ptr, (size_t)nm.len);
-        nc[nm.len] = '\0';
-        func_names[name_count] = nc;
+        if (getenv("CHENG_RENAME_MAIN") && nm.len == 4 && memcmp(nm.ptr, "main", 4) == 0) {
+            char *nc = arena_alloc(arena, 26);
+            memcpy(nc, "cheng_program_argv_entry", 25); nc[25] = '\0';
+            func_names[name_count] = nc;
+        } else {
+            char *nc = arena_alloc(arena, (size_t)nm.len + 1);
+            memcpy(nc, nm.ptr, (size_t)nm.len); nc[nm.len] = '\0';
+            func_names[name_count] = nc;
+        }
         name_count++;
     }
 
