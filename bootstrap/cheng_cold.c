@@ -14813,11 +14813,11 @@ static void codegen_load_str_pair(Code *code, BodyIR *body, int32_t slot,
     int32_t kind = body->slot_kind[slot];
     if (kind == SLOT_STR_REF) {
         a64_emit_ldr_sp_off(code, ptr_reg, body->slot_offset[slot], true);
-        code_emit(code, a64_ldr_imm(len_reg, ptr_reg, 8, true));
-        code_emit(code, a64_ldr_imm(ptr_reg, ptr_reg, 0, true));
+        code_emit(code, a64_ldr_imm(len_reg, ptr_reg, COLD_STR_LEN_OFFSET, false));
+        code_emit(code, a64_ldr_imm(ptr_reg, ptr_reg, COLD_STR_DATA_OFFSET, true));
     } else if (kind == SLOT_STR) {
-        a64_emit_ldr_sp_off(code, ptr_reg, body->slot_offset[slot], true);
-        a64_emit_ldr_sp_off(code, len_reg, body->slot_offset[slot] + 8, true);
+        a64_emit_ldr_sp_off(code, ptr_reg, body->slot_offset[slot] + COLD_STR_DATA_OFFSET, true);
+        a64_emit_ldr_sp_off(code, len_reg, body->slot_offset[slot] + COLD_STR_LEN_OFFSET, false);
     } else {
         /* Non-str slot: produce empty string (ptr=0, len=0).
            Matches cold_require_str_value which returns 0 for non-str values. */
@@ -14835,13 +14835,53 @@ static void codegen_load_str_pair(Code *code, BodyIR *body, int32_t slot,
 
 static void codegen_store_str_pair(Code *code, BodyIR *body, int32_t slot,
                                    int ptr_reg, int len_reg) {
-    a64_emit_str_sp_off(code, ptr_reg, body->slot_offset[slot], true);
-    a64_emit_str_sp_off(code, len_reg, body->slot_offset[slot] + 8, true);
+    a64_emit_str_sp_off(code, ptr_reg, body->slot_offset[slot] + COLD_STR_DATA_OFFSET, true);
+    a64_emit_str_sp_off(code, len_reg, body->slot_offset[slot] + COLD_STR_LEN_OFFSET, false);
+    code_emit(code, a64_movz(R0, 0, 0));
+    a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + COLD_STR_STORE_ID_OFFSET, false);
+    a64_emit_str_sp_off(code, R0, body->slot_offset[slot] + COLD_STR_FLAGS_OFFSET, false);
 }
 
 static void codegen_store_empty_str(Code *code, BodyIR *body, int32_t slot) {
     code_emit(code, a64_movz_x(R0, 0, 0));
     codegen_store_str_pair(code, body, slot, R0, R0);
+}
+
+static bool cold_codegen_kind_is_64bit_scalar(int32_t kind) {
+    return kind == SLOT_I64 || kind == SLOT_PTR || kind == SLOT_OPAQUE ||
+           kind == SLOT_OPAQUE_REF || kind == SLOT_OBJECT_REF ||
+           kind == SLOT_STR_REF || kind == SLOT_SEQ_I32_REF ||
+           kind == SLOT_SEQ_STR_REF || kind == SLOT_I64_REF;
+}
+
+static void codegen_copy_slot_to_slot(Code *code, BodyIR *body, int32_t dst, int32_t src) {
+    int32_t dst_kind = body->slot_kind[dst];
+    int32_t src_kind = body->slot_kind[src];
+    if (dst_kind == SLOT_I32) {
+        if (src_kind != SLOT_I32) die("select i32 source kind mismatch");
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[src], false);
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst], false);
+        return;
+    }
+    if (dst_kind == SLOT_STR) {
+        codegen_load_str_pair(code, body, src, R1, R2);
+        codegen_store_str_pair(code, body, dst, R1, R2);
+        return;
+    }
+    if (dst_kind == SLOT_I64 || dst_kind == SLOT_PTR || cold_codegen_kind_is_64bit_scalar(dst_kind)) {
+        if (!(src_kind == SLOT_I64 || src_kind == SLOT_PTR || cold_codegen_kind_is_64bit_scalar(src_kind))) {
+            die("select 64-bit source kind mismatch");
+        }
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[src], true);
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst], true);
+        return;
+    }
+    int32_t total = body->slot_size[dst];
+    if (body->slot_size[src] < total) die("select composite source too small");
+    for (int32_t off = 0; off < total; off += 8) {
+        a64_emit_ldr_sp_off(code, R1, body->slot_offset[src] + off, true);
+        a64_emit_str_sp_off(code, R1, body->slot_offset[dst] + off, true);
+    }
 }
 
 static void codegen_mmap_len_reg(Code *code, int len_reg, int dst_reg, int brk_imm) {
