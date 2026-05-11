@@ -1079,6 +1079,13 @@ fn PrimaryBodyIrCstringCastArgText(textRaw: str): str =
 
 fn PrimaryBodyIrPtrAddressArgName(textRaw: str): str =
     let text = strutil.Strip(textRaw)
+    if len(text) > 1 && text[0] == '&':
+        let rawName = strutil.Strip(strings.SliceBytes(text, 1, len(text) - 1))
+        if rawName == "" ||
+           PrimaryBodyIrTextHasCallSurface(rawName) ||
+           PrimaryBodyIrTextHasFieldOrIndex(rawName):
+            return ""
+        return rawName
     if len(text) <= 6:
         return ""
     if !PrimaryStartsWith(text, "ptr("):
@@ -1094,6 +1101,15 @@ fn PrimaryBodyIrPtrAddressArgName(textRaw: str): str =
        PrimaryBodyIrTextHasFieldOrIndex(name):
         return ""
     return name
+
+fn PrimaryBodyIrFunctionAddressSlotName(functionIndex: int32): str =
+    return Fmt"__cheng_function_address#{functionIndex}"
+
+fn PrimaryBodyIrFunctionAddressSlotIndex(slotName: str): int32 =
+    let prefix = "__cheng_function_address#"
+    if len(slotName) <= len(prefix) || !PrimaryStartsWith(slotName, prefix):
+        return -1
+    return int32(strutil.ParseInt(strings.SliceBytes(slotName, len(prefix), len(slotName) - len(prefix))))
 
 fn PrimaryBodyIrWholeCallInnerForHead(textRaw: str,
                                        headRaw: str): str =
@@ -1624,6 +1640,7 @@ fn PrimaryBodyIrScalarValueSlotForText(bodyIR: var coreir.BodyIR,
 
 fn PrimaryBodyIrAddressSlotForName(bodyIR: var coreir.BodyIR,
                                     slotNames: var str[],
+                                    lowering: lower.LoweringPlanStub,
                                     typedIr: texpr.TypedExprIr,
                                     typedFn: texpr.TypedExprIrFunction,
                                     irFunction: lower.PrimaryObjectIrFunction,
@@ -1648,6 +1665,17 @@ fn PrimaryBodyIrAddressSlotForName(bodyIR: var coreir.BodyIR,
                                                   sourcePath,
                                                   name,
                                                   bindingType)
+    let functionIndex = PrimaryFunctionTargetIndex(lowering.functionSymbolTexts,
+                                                   lowering.functionSourcePaths,
+                                                   sourcePath,
+                                                   name)
+    if functionIndex >= 0:
+        let functionSlot = PrimaryBodyIrFindOrCreateSlot(bodyIR,
+                                                         slotNames,
+                                                         PrimaryBodyIrFunctionAddressSlotName(functionIndex),
+                                                         coreir.LocalPtrTag)
+        bodyIR.localSlots[functionSlot].placeKind = coreir.BodyPlaceGlobalAddressTag
+        return functionSlot
     let globalType = PrimaryBodyIrTypedGlobalType(typedIr, sourcePath, name)
     if globalType == "":
         return -1
@@ -1954,6 +1982,7 @@ fn PrimaryBodyIrAppendLocalDeclInitializer(bodyIR: var coreir.BodyIR,
 fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
                                 slotNames: var str[],
                                 call: var coreir.CallOp,
+                                lowering: lower.LoweringPlanStub,
                                 typedIr: texpr.TypedExprIr,
                                 typedFn: texpr.TypedExprIrFunction,
                                 irFunction: lower.PrimaryObjectIrFunction,
@@ -2063,6 +2092,7 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
             let addressName = PrimaryBodyIrPtrAddressArgName(argName)
             let addressSlot = PrimaryBodyIrAddressSlotForName(bodyIR,
                                                               slotNames,
+                                                              lowering,
                                                               typedIr,
                                                               typedFn,
                                                               irFunction,
@@ -2245,6 +2275,7 @@ fn PrimaryBodyIrAppendCallArgs(bodyIR: var coreir.BodyIR,
 
 fn PrimaryBodyIrAppendCallOp(bodyIR: var coreir.BodyIR,
                               slotNames: var str[],
+                              lowering: lower.LoweringPlanStub,
                               typedIr: texpr.TypedExprIr,
                               typedFn: texpr.TypedExprIrFunction,
                               irFunction: lower.PrimaryObjectIrFunction,
@@ -2266,6 +2297,7 @@ fn PrimaryBodyIrAppendCallOp(bodyIR: var coreir.BodyIR,
     if !PrimaryBodyIrAppendCallArgs(bodyIR,
                                     slotNames,
                                     call,
+                                    lowering,
                                     typedIr,
                                     typedFn,
                                     irFunction,
@@ -2412,6 +2444,7 @@ fn PrimaryBodyIrTextHasCallSurface(text: str): bool =
 fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
                                  slotNames: var str[],
                                  varI32ParamNames: str[],
+                                 lowering: lower.LoweringPlanStub,
                                  typedIr: texpr.TypedExprIr,
                                  typedFn: texpr.TypedExprIrFunction,
                                  irFunction: lower.PrimaryObjectIrFunction,
@@ -2539,6 +2572,7 @@ fn PrimaryBodyIrAppendI32Assign(bodyIR: var coreir.BodyIR,
                 return false
             let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                               slotNames,
+                                              lowering,
                                               typedIr,
                                               typedFn,
                                               irFunction,
@@ -2778,6 +2812,7 @@ fn PrimaryBodyIrBuildForRangeLoop(bodyIR: var coreir.BodyIR,
     return forBodyEnd
 
 fn PrimaryBuildBodyIrFromTypedStatements(
+    lowering: lower.LoweringPlanStub,
     typedIr: texpr.TypedExprIr,
     typedFnIndex: int32,
     irFunction: lower.PrimaryObjectIrFunction
@@ -2963,6 +2998,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
             if len(targetStr) > 0:
                 let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                   slotNames,
+                                                  lowering,
                                                   typedIr,
                                                   typedFn,
                                                   irFunction,
@@ -3032,6 +3068,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                                     stmt.resultType)
                 let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                   slotNames,
+                                                  lowering,
                                                   typedIr,
                                                   typedFn,
                                                   irFunction,
@@ -3057,6 +3094,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
             if !PrimaryBodyIrAppendI32Assign(bodyIR,
                                              slotNames,
                                              varI32ParamNames,
+                                             lowering,
                                              typedIr,
                                              typedFn,
                                              irFunction,
@@ -3126,6 +3164,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                                         callStmt.resultType)
                     let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                       slotNames,
+                                                      lowering,
                                                       typedIr,
                                                       typedFn,
                                                       irFunction,
@@ -3197,6 +3236,7 @@ fn PrimaryBuildBodyIrFromTypedStatements(
                                                                         rootStmt.resultType)
                 let _ = PrimaryBodyIrAppendCallOp(bodyIR,
                                                   slotNames,
+                                                  lowering,
                                                   typedIr,
                                                   typedFn,
                                                   irFunction,
@@ -5539,6 +5579,8 @@ fn PrimaryBodyIrAppendGlobalDataLabels(bodyIR: coreir.BodyIR,
         let slot = bodyIR.localSlots[slotIndex]
         if slot.placeKind != coreir.BodyPlaceGlobalAddressTag:
             continue
+        if PrimaryBodyIrFunctionAddressSlotIndex(slot.name) >= 0:
+            continue
         let label = PrimaryGlobalDataLabel(targetTriple, slot.name)
         if PrimaryObjectDataLabelIndex(dataLabels, label) >= 0:
             continue
@@ -5554,6 +5596,7 @@ fn PrimaryBodyIrAppendCallCStringArgRelocs(bodyIR: coreir.BodyIR,
                                             itemId: int32,
                                             targetTriple: str,
                                             functionSymbol: str,
+                                            allSymbolNames: str[],
                                             callWordStart: int32,
                                             sourceItemIds: var int32[],
                                             wordOffsets: var int32[],
@@ -5575,9 +5618,13 @@ fn PrimaryBodyIrAppendCallCStringArgRelocs(bodyIR: coreir.BodyIR,
             if argSlot >= 0 &&
                argSlot < bodyIR.localSlots.len &&
                bodyIR.localSlots[argSlot].placeKind == coreir.BodyPlaceGlobalAddressTag:
+                var targetSymbol = PrimaryGlobalDataLabel(targetTriple, bodyIR.localSlots[argSlot].name)
+                let functionIndex = PrimaryBodyIrFunctionAddressSlotIndex(bodyIR.localSlots[argSlot].name)
+                if functionIndex >= 0 && functionIndex < allSymbolNames.len:
+                    targetSymbol = allSymbolNames[functionIndex]
                 add(sourceItemIds, itemId)
                 add(wordOffsets, pos)
-                add(targetSymbols, PrimaryGlobalDataLabel(targetTriple, bodyIR.localSlots[argSlot].name))
+                add(targetSymbols, targetSymbol)
         let argWords = PrimaryBodyIrCallArgWordCount(bodyIR, argSlot, passKind)
         if argWords <= 0:
             return
@@ -5597,9 +5644,13 @@ fn PrimaryBodyIrAppendCallCStringArgRelocs(bodyIR: coreir.BodyIR,
             if argSlot >= 0 &&
                argSlot < bodyIR.localSlots.len &&
                bodyIR.localSlots[argSlot].placeKind == coreir.BodyPlaceGlobalAddressTag:
+                var targetSymbol = PrimaryGlobalDataLabel(targetTriple, bodyIR.localSlots[argSlot].name)
+                let functionIndex = PrimaryBodyIrFunctionAddressSlotIndex(bodyIR.localSlots[argSlot].name)
+                if functionIndex >= 0 && functionIndex < allSymbolNames.len:
+                    targetSymbol = allSymbolNames[functionIndex]
                 add(sourceItemIds, itemId)
                 add(wordOffsets, pos)
-                add(targetSymbols, PrimaryGlobalDataLabel(targetTriple, bodyIR.localSlots[argSlot].name))
+                add(targetSymbols, targetSymbol)
         let argWords = PrimaryBodyIrCallArgWordCount(bodyIR, argSlot, passKind)
         if argWords <= 0:
             return
@@ -5610,6 +5661,7 @@ fn PrimaryBodyIrAppendCStringArgRelocs(bodyIR: coreir.BodyIR,
                                         functionWordOffset: int32,
                                         targetTriple: str,
                                         functionSymbol: str,
+                                        allSymbolNames: str[],
                                         sourceItemIds: var int32[],
                                         wordOffsets: var int32[],
                                         targetSymbols: var str[]) =
@@ -5629,6 +5681,7 @@ fn PrimaryBodyIrAppendCStringArgRelocs(bodyIR: coreir.BodyIR,
                                                             itemId,
                                                             targetTriple,
                                                             functionSymbol,
+                                                            allSymbolNames,
                                                             wordPos,
                                                             sourceItemIds,
                                                             wordOffsets,
@@ -6303,9 +6356,10 @@ fn PrimaryBuildBodyIrForFunction(lowering: lower.LoweringPlanStub,
            irFn.bodyKind == texpr.BodyKindStatementSequence:
             let typedFnIndex = irFn.typedFunctionIndex
             if typedFnIndex >= 0:
-                var bodyIR = PrimaryBuildBodyIrFromTypedStatements(lowering.typedIr,
-                typedFnIndex,
-                irFn)
+                var bodyIR = PrimaryBuildBodyIrFromTypedStatements(lowering,
+                                                                   lowering.typedIr,
+                                                                   typedFnIndex,
+                                                                   irFn)
                 PrimaryBodyIrPatchCallTargetSymbols(bodyIR,
                                                     irFn.callTargets,
                                                     irFn.callImportcSymbols)
@@ -6485,6 +6539,13 @@ fn PrimaryObjectPlanReachabilityPhase(state: var PrimaryObjectPlanPhaseState,
             var bodyIrCallCount: int32
             if currentIndex < state.tempBodyIRs.len:
                 bodyIrCallCount = state.tempBodyIRs[currentIndex].callSequence.len
+                for slotIndex in 0..<state.tempBodyIRs[currentIndex].localSlots.len:
+                    let functionIndex = PrimaryBodyIrFunctionAddressSlotIndex(state.tempBodyIRs[currentIndex].localSlots[slotIndex].name)
+                    if functionIndex >= 0 &&
+                       functionIndex < state.reachable.len &&
+                       !state.reachable[functionIndex]:
+                        state.reachable[functionIndex] = true
+                        add(nextFrontier, functionIndex)
             if PrimaryCallSequenceNeedsReloc(bodyKind, bodyIrCallCount):
                 var callSequenceReady = true
                 var requiredCallCount = PrimaryCallSequenceRequiredCallCount(bodyKind,
@@ -6752,6 +6813,7 @@ fn PrimaryObjectPlanBuildItemsPhase(state: var PrimaryObjectPlanPhaseState,
                                             wordOffset,
                                             linkPlan.targetTriple,
                                             state.allSymbolNames[i],
+                                            state.allSymbolNames,
                                             state.dataRelocSourceItemIds,
                                             state.dataRelocWordOffsets,
                                             state.dataRelocTargetSymbols)
