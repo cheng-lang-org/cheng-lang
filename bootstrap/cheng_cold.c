@@ -4622,7 +4622,9 @@ enum {
     BODY_OP_I32_FROM_F64 = 112,
     BODY_OP_FN_ADDR = 113,
     BODY_OP_CALL_PTR = 114,
-    BODY_OP_SELECT = 115,
+    BODY_OP_SELECT = 116,
+    BODY_OP_PTR_LOAD_U8 = 117,
+    BODY_OP_PTR_STORE_U8 = 118,
 };
 
 enum {
@@ -8490,6 +8492,56 @@ static bool cold_is_scalar_identity_cast(Span token) {
            span_eq(token, "uint64") || span_eq(token, "Uint64") ||
            span_eq(token, "UInt64") ||
            span_eq(token, "int64") || span_eq(token, "Int64");
+}
+
+static bool cold_is_field_access_token(Span token) {
+    return span_eq(token, ".") || span_eq(token, "->");
+}
+
+static Span cold_resolve_alias_target(Symbols *symbols, Span type) {
+    type = span_trim(type);
+    for (int32_t depth = 0; depth < 8; depth++) {
+        TypeAlias *alias = symbols_find_alias(symbols, type);
+        if (!alias) break;
+        type = span_trim(alias->target);
+    }
+    if (type.len > 1 && type.ptr[type.len - 1] == '*') {
+        type = span_trim(span_sub(type, 0, type.len - 1));
+    }
+    return type;
+}
+
+static bool cold_is_pointer_cast_token(Parser *parser, Span token) {
+    if (span_eq(token, "ptr")) return true;
+    return symbols_find_alias(parser ? parser->symbols : 0, token) != 0;
+}
+
+static bool cold_str_field_info(Span field_name, int32_t *offset, int32_t *kind, int32_t *size) {
+    if (span_eq(field_name, "data")) {
+        if (offset) *offset = COLD_STR_DATA_OFFSET;
+        if (kind) *kind = SLOT_PTR;
+        if (size) *size = 8;
+        return true;
+    }
+    if (span_eq(field_name, "len")) {
+        if (offset) *offset = COLD_STR_LEN_OFFSET;
+        if (kind) *kind = SLOT_I32;
+        if (size) *size = 4;
+        return true;
+    }
+    if (span_eq(field_name, "store_id") || span_eq(field_name, "storeId")) {
+        if (offset) *offset = COLD_STR_STORE_ID_OFFSET;
+        if (kind) *kind = SLOT_I32;
+        if (size) *size = 4;
+        return true;
+    }
+    if (span_eq(field_name, "flags")) {
+        if (offset) *offset = COLD_STR_FLAGS_OFFSET;
+        if (kind) *kind = SLOT_I32;
+        if (size) *size = 4;
+        return true;
+    }
+    return false;
 }
 
 static bool cold_is_i32_to_str_intrinsic(Span name) {
