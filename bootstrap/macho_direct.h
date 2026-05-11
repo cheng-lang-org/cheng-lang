@@ -288,8 +288,10 @@ typedef struct {
 static bool macho_write_object(const char *path,
                                const uint32_t *code, int32_t code_words,
                                const char **names, const int32_t *offsets,
-                               int32_t name_count) {
+                               int32_t name_count, int32_t global_count) {
     int32_t code_sz = code_words * 4;
+    if (global_count < 0) global_count = 0;
+    if (global_count > name_count) global_count = name_count;
 
     /* Build string table first to know its size */
     char strtab[4096];
@@ -312,7 +314,7 @@ static bool macho_write_object(const char *path,
     int32_t nsyms = name_count > 128 ? 128 : name_count;
     for (int32_t i = 0; i < nsyms; i++) {
         syms[i].n_strx  = name_stroff[i];
-        syms[i].n_type  = N_SECT | N_EXT;
+        syms[i].n_type  = (uint8_t)((i < global_count) ? (N_SECT | N_EXT) : N_SECT);
         syms[i].n_sect  = 1; /* section 1 = __text */
         syms[i].n_desc  = 0;
         syms[i].n_value = (uint64_t)(offsets[i] * 4);
