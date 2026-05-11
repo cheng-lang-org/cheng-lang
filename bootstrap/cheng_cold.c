@@ -7600,6 +7600,7 @@ static int32_t cold_make_error_result_slot(Parser *parser, BodyIR *body,
                                            Span result_type, const char *message);
 static int32_t cold_make_i32_const_slot(BodyIR *body, int32_t value);
 static int32_t cold_materialize_direct_emit(Parser *parser, BodyIR *body, int32_t output);
+static int32_t cold_materialize_self_exec(Parser *parser, BodyIR *body);
 static int32_t parse_constructor(Parser *parser, BodyIR *body, Locals *locals,
                                  Variant *variant);
 
@@ -9816,6 +9817,13 @@ static int32_t cold_make_error_result_slot(Parser *parser, BodyIR *body,
 static bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
                                        int32_t arg_start, int32_t arg_count,
                                        int32_t *slot_out, int32_t *kind_out) {
+    if (span_eq(name, "BackendDriverDispatchMinRunSystemLinkExecFromCmdline")) {
+        if (arg_count != 0) die("RunSystemLinkExecFromCmdline arity mismatch");
+        int32_t slot = cold_materialize_self_exec(parser, body);
+        if (kind_out) *kind_out = SLOT_I32;
+        *slot_out = slot;
+        return true;
+    }
     const char *target_needle = 0;
     if (span_eq(name, "tmat.TargetIsWasm") || span_eq(name, "TargetIsWasm")) {
         target_needle = "wasm";
@@ -19681,6 +19689,24 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
 static Span cold_cached_minimal_macho = {0};
 
 static char **ColdArgv0 = 0;
+
+static int32_t cold_materialize_self_exec(Parser *parser, BodyIR *body) {
+    if (cold_cached_minimal_macho.len <= 0) {
+        const char *self_path = ColdArgv0 ? ColdArgv0[0] : "/proc/self/exe";
+        cold_cached_minimal_macho = source_open(self_path);
+        if (cold_cached_minimal_macho.len <= 0) die("cold self binary materialize failed");
+    }
+    int32_t li = body_string_literal(body, cold_cached_minimal_macho);
+    int32_t bin_slot = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
+    body_op(body, BODY_OP_STR_LITERAL, bin_slot, li, 0);
+    int32_t temp_path = cold_make_str_literal_cstr_slot(body, "/tmp/cold_probe_self");
+    int32_t write_dst = body_slot(body, SLOT_I32, 4);
+    body_op(body, BODY_OP_PATH_WRITE_TEXT, write_dst, temp_path, bin_slot);
+    body_op(body, BODY_OP_CHMOD_X, write_dst, temp_path, 0);
+    int32_t exec_dst = body_slot(body, SLOT_I32, 4);
+    body_op(body, BODY_OP_COLD_SELF_EXEC, exec_dst, temp_path, 0);
+    return exec_dst;
+}
 
 static int32_t cold_materialize_direct_emit(Parser *parser, BodyIR *body, int32_t output) {
     if (cold_cached_minimal_macho.len <= 0) {
