@@ -5194,14 +5194,10 @@ static int32_t symbols_find_fn(Symbols *symbols, Span name, int32_t arity,
     }
     return -1;
 }
-static bool symbols_fn_arity_signature_match(FnDef *fn, int32_t arity,
-        const int32_t *param_kinds, const int32_t *param_sizes, Span ret);
-
 static int32_t symbols_add_fn(Symbols *symbols, Span name, int32_t arity,
                               const int32_t *param_kinds,
                               const int32_t *param_sizes,
                               Span ret) {
-    /* Exact name match first */
     for (int32_t existing = 0; existing < symbols->function_count; existing++) {
         FnDef *fn = &symbols->functions[existing];
         if (fn->arity != arity || !span_same(fn->name, name)) continue;
@@ -5230,17 +5226,24 @@ static int32_t symbols_add_fn(Symbols *symbols, Span name, int32_t arity,
         }
         return existing;
     }
-    /* No exact name match: try arity+signature match (ignore name) */
-    for (int32_t existing = 0; existing < symbols->function_count; existing++) {
-        FnDef *fn = &symbols->functions[existing];
-        if (fn->arity != arity) continue;
-        if (!span_same(fn->ret, ret)) continue;
-        bool match = true;
-        for (int32_t i = 0; i < arity; i++) {
-            int32_t new_kind = param_kinds ? param_kinds[i] : SLOT_I32;
-            if (fn->param_kind[i] != new_kind) { match = false; break; }
+    /* No exact match: merge qualified/bare name variants */
+    {
+        bool new_has_dot = (cold_span_find_char(name, '.') >= 0);
+        for (int32_t existing = 0; existing < symbols->function_count; existing++) {
+            FnDef *fn = &symbols->functions[existing];
+            if (fn->arity != arity) continue;
+            int32_t fn_dot = cold_span_find_char(fn->name, '.');
+            bool fn_is_qualified = (fn_dot >= 0);
+            if (!new_has_dot && fn_is_qualified) {
+                Span base = span_sub(fn->name, fn_dot + 1, fn->name.len);
+                if (span_same(base, name)) return existing;
+            }
+            if (new_has_dot && !fn_is_qualified) {
+                int32_t new_dot = cold_span_find_char(name, '.');
+                Span base = span_sub(name, new_dot + 1, name.len);
+                if (span_same(fn->name, base)) return existing;
+            }
         }
-        if (match) return existing; /* same function, different name */
     }
     if (symbols->function_count >= symbols->function_cap) {
         int32_t next = symbols->function_cap * 2;
@@ -9886,10 +9889,6 @@ static bool cold_try_slplan_intrinsic(Parser *parser, BodyIR *body, Span name,
             die("link plan error out must be str");
         }
         ObjectDef *plan = cold_slplan_object_from_slot(parser, body, plan_slot);
-        fprintf(stderr, "cheng_cold: slplan offsets symbolVisibility=%d browserBridgeObjectPath=%d emitKind=%d\n",
-                cold_required_object_field(plan, "symbolVisibility")->offset,
-                cold_required_object_field(plan, "browserBridgeObjectPath")->offset,
-                cold_required_object_field(plan, "emitKind")->offset);
 
         int32_t entry_abs = cold_make_str_result_slot(body);
         body_op(body, BODY_OP_PATH_ABSOLUTE, entry_abs, root_dir, source_raw);
@@ -10794,9 +10793,22 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     }
     if (span_eq(token, "new") && span_eq(parser_peek(parser), "(")) {
         (void)parser_token(parser);
-        Span tn = parser_take_type_span(parser);
+        Span tn = parser_token(parser);
         if (!parser_take(parser, ")")) die("new(Type): missing )");
-        ObjectDef *nobj = symbols_resolve_object(parser->symbols, tn);
+        ObjectDef *nobj = symbols_find_object(parser->symbols, tn);
+        /* Try qualified name lookup if unqualified fails */
+        if (!nobj) {
+            int32_t qlen = 0;
+            for (int32_t qi = 0; qi < parser->symbols->object_count && qlen < 64; qi++) {
+                ObjectDef *co = &parser->symbols->objects[qi];
+                /* Check if name ends with ".tn" */
+                if (co->name.len > tn.len + 1 && co->name.ptr[co->name.len - tn.len - 1] == '.' &&
+                    memcmp(co->name.ptr + co->name.len - tn.len, tn.ptr, (size_t)tn.len) == 0) {
+                    nobj = co;
+                    break;
+                }
+            }
+        }
         if (nobj && nobj->slot_size > 0) {
             int32_t len = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, len, nobj->slot_size, 0);
@@ -12010,10 +12022,9 @@ static int32_t parse_builtin_add_after_name(Parser *parser, BodyIR *body, Locals
         body_op(body, BODY_OP_SEQ_OPAQUE_ADD, seq_slot, value_slot, element_size);
     } else {
         if (value_kind != SLOT_STR && value_kind != SLOT_I32) {
-            /* skip incompatible add value */;
-        } else {
-            body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
+            die("add str[] value kind mismatch");
         }
+        body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
     }
     return block;
 }
@@ -13179,6 +13190,7 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                 int32_t vs = parse_expr(parser, body, locals, &vk);
                 Local *base = locals_find(locals, kw);
                 if (!base || (base->kind != SLOT_OBJECT && base->kind != SLOT_OBJECT_REF)) {
+                    if (parser->import_mode) { return block; }
                     die("field-index assign base must be object");
                 }
                 Span obj_ty = cold_type_strip_var(body->slot_type[base->slot], 0);
