@@ -4622,6 +4622,9 @@ enum {
     BODY_OP_I32_FROM_F64 = 112,
     BODY_OP_FN_ADDR = 113,
     BODY_OP_CALL_PTR = 114,
+    BODY_OP_GLOBAL_ADDR = 116,
+    BODY_OP_GLOBAL_LOAD = 117,
+    BODY_OP_GLOBAL_STORE = 118,
 };
 
 enum {
@@ -10373,6 +10376,10 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
             *kind = SLOT_I64;
             return value_slot;
         }
+        if (value_kind == SLOT_PTR) {
+            *kind = SLOT_I64;
+            return value_slot;
+        }
         if (value_kind != SLOT_I32) {
             /* Non-int32 cast source: return 0 */
             *kind = SLOT_I64;
@@ -10396,6 +10403,32 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
     if (!parser_take(parser, ")")) return 0; /* skip malformed cast */;
     *kind = SLOT_I32;
     return value_slot;
+}
+
+static int32_t parse_pointer_cast(Parser *parser, BodyIR *body,
+                                  Locals *locals, Span cast_token,
+                                  int32_t *kind) {
+    if (!parser_take(parser, "(")) die("expected ( after pointer cast");
+    int32_t value_kind = SLOT_I32;
+    int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
+    if (!parser_take(parser, ")")) die("expected ) after pointer cast");
+    if (value_kind == SLOT_PTR) {
+        body_slot_set_type(body, value_slot, cast_token);
+        *kind = SLOT_PTR;
+        return value_slot;
+    }
+    if (value_kind == SLOT_I64 || value_kind == SLOT_OPAQUE || value_kind == SLOT_OPAQUE_REF ||
+        value_kind == SLOT_OBJECT_REF || value_kind == SLOT_STR_REF ||
+        value_kind == SLOT_SEQ_I32_REF || value_kind == SLOT_SEQ_STR_REF ||
+        value_kind == SLOT_I64_REF) {
+        int32_t dst = body_slot(body, SLOT_PTR, 8);
+        body_slot_set_type(body, dst, cast_token);
+        body_op(body, BODY_OP_COPY_I64, dst, value_slot, 0);
+        *kind = SLOT_PTR;
+        return dst;
+    }
+    die("pointer cast source must be pointer-sized");
+    return 0;
 }
 
 static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
@@ -10468,6 +10501,13 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
                 *kind = SLOT_PTR;
                 return addr_slot;
             }
+            int32_t global_index = symbols_global_index(parser->symbols, base_name);
+            if (global_index >= 0) {
+                addr_slot = body_slot(body, SLOT_PTR, 8);
+                body_op(body, BODY_OP_GLOBAL_ADDR, addr_slot, global_index, 0);
+                *kind = SLOT_PTR;
+                return addr_slot;
+            }
             /* Not a local or function: parse as expression and compute SP-relative address */
             int32_t ek = SLOT_I32;
             int32_t es = parse_primary(parser, body, locals, &ek);
@@ -10522,8 +10562,22 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     if (span_eq(token, "Fmt")) {
         return parse_fmt_literal(parser, body, locals, kind);
     }
+    if (span_eq(token, "sizeof") && span_eq(parser_peek(parser), "(")) {
+        (void)parser_token(parser);
+        Span type = parser_take_type_span(parser);
+        if (!parser_take(parser, ")")) die("expected ) after sizeof");
+        int32_t size_kind = cold_slot_kind_from_type_with_symbols(parser->symbols, type);
+        int32_t size = cold_slot_size_from_type_with_symbols(parser->symbols, type, size_kind);
+        int32_t slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, slot, size, 0);
+        *kind = SLOT_I32;
+        return slot;
+    }
     if (cold_is_scalar_identity_cast(token) && span_eq(parser_peek(parser), "(")) {
         return parse_scalar_identity_cast(parser, body, locals, token, kind);
+    }
+    if (cold_type_is_pointer_like(parser->symbols, token) && span_eq(parser_peek(parser), "(")) {
+        return parse_pointer_cast(parser, body, locals, token, kind);
     }
     if (span_eq(token, "nil")) {
         int32_t slot = body_slot(body, SLOT_PTR, 8);
@@ -10645,6 +10699,17 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         int32_t slot = local->slot;
         *kind = local->kind;
         return slot;
+    }
+    {
+        int32_t global_index = symbols_global_index(parser->symbols, token);
+        if (global_index >= 0) {
+            GlobalDef *global = &parser->symbols->globals[global_index];
+            int32_t slot = body_slot(body, global->kind, global->size);
+            body_slot_set_type(body, slot, global->type);
+            body_op(body, BODY_OP_GLOBAL_LOAD, slot, global_index, 0);
+            *kind = global->kind;
+            return slot;
+        }
     }
     if (span_eq(parser_peek(parser), "{") &&
         token.len > 0 && token.ptr[0] >= 'A' && token.ptr[0] <= 'Z') {
@@ -11463,6 +11528,31 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
 static void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name) {
     Local *local = locals_find(locals, name);
     if (!local) {
+        int32_t global_index = symbols_global_index(parser->symbols, name);
+        if (global_index >= 0) {
+            if (!parser_take(parser, "=")) die("expected = in global assignment");
+            GlobalDef *global = &parser->symbols->globals[global_index];
+            int32_t value_kind = SLOT_I32;
+            int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
+            if (global->kind == SLOT_I32) {
+                value_slot = cold_materialize_i32_ref(body, value_slot, &value_kind);
+                if (value_kind != SLOT_I32) die("global int32 assignment type mismatch");
+            } else if (global->kind == SLOT_I64) {
+                if (value_kind == SLOT_I32) value_slot = cold_materialize_i64_value(body, value_slot, &value_kind);
+                if (value_kind != SLOT_I64) die("global int64 assignment type mismatch");
+            } else if (global->kind == SLOT_PTR) {
+                if (value_kind != SLOT_PTR && value_kind != SLOT_I64 &&
+                    value_kind != SLOT_OPAQUE && value_kind != SLOT_OPAQUE_REF &&
+                    value_kind != SLOT_OBJECT_REF && value_kind != SLOT_STR_REF &&
+                    value_kind != SLOT_SEQ_I32_REF && value_kind != SLOT_SEQ_STR_REF) {
+                    die("global pointer assignment type mismatch");
+                }
+            } else if (global->kind != value_kind && global->size > body->slot_size[value_slot]) {
+                die("global assignment type mismatch");
+            }
+            body_op(body, BODY_OP_GLOBAL_STORE, global_index, value_slot, 0);
+            return;
+        }
         /* Consume the value expression and continue */
         int32_t dummy_kind = SLOT_I32;
         (void)parse_expr(parser, body, locals, &dummy_kind);
@@ -14255,10 +14345,31 @@ static uint32_t a64_stlxr_w(int rs, int rt, int rn) {
  * Code generation
  * ================================================================ */
 typedef struct {
+    int32_t pos;
+    int32_t target_global;
+    int32_t reloc_type;
+    int32_t pcrel;
+} CodeGlobalReloc;
+
+typedef struct {
+    CodeGlobalReloc *items;
+    int32_t count;
+    int32_t cap;
+    Arena *arena;
+} CodeGlobalRelocList;
+
+enum {
+    COLD_RELOC_BRANCH26 = 2,
+    COLD_RELOC_GOT_LOAD_PAGE21 = 5,
+    COLD_RELOC_GOT_LOAD_PAGEOFF12 = 6,
+};
+
+typedef struct {
     uint32_t *words;
     int32_t count;
     int32_t cap;
     Arena *arena;
+    CodeGlobalRelocList global_relocs;
 } Code;
 
 typedef struct {
@@ -14345,6 +14456,7 @@ static Code *code_new(Arena *arena, int32_t cap) {
     code->words = arena_alloc(arena, (size_t)cap * sizeof(uint32_t));
     code->cap = cap;
     code->arena = arena;
+    code->global_relocs.arena = arena;
     return code;
 }
 
@@ -14402,6 +14514,20 @@ static void function_patches_add(FunctionPatchList *patches, int32_t pos, int32_
         patches->cap = next;
     }
     patches->items[patches->count++] = (FunctionPatch){pos, target_function};
+}
+
+static void code_global_reloc_add(Code *code, int32_t pos, int32_t target_global,
+                                  int32_t reloc_type, int32_t pcrel) {
+    CodeGlobalRelocList *relocs = &code->global_relocs;
+    if (!relocs->arena) relocs->arena = code->arena;
+    if (relocs->count >= relocs->cap) {
+        int32_t next = relocs->cap ? relocs->cap * 2 : 32;
+        CodeGlobalReloc *fresh = arena_alloc(relocs->arena, (size_t)next * sizeof(CodeGlobalReloc));
+        if (relocs->items) memcpy(fresh, relocs->items, (size_t)relocs->count * sizeof(CodeGlobalReloc));
+        relocs->items = fresh;
+        relocs->cap = next;
+    }
+    relocs->items[relocs->count++] = (CodeGlobalReloc){pos, target_global, reloc_type, pcrel};
 }
 
 /* ---- large immediate / large offset helpers ---- */
@@ -15090,6 +15216,60 @@ static bool cold_codegen_kind_is_64bit_scalar(int32_t kind) {
            kind == SLOT_OPAQUE_REF || kind == SLOT_OBJECT_REF ||
            kind == SLOT_STR_REF || kind == SLOT_SEQ_I32_REF ||
            kind == SLOT_SEQ_STR_REF || kind == SLOT_I64_REF;
+}
+
+static void codegen_global_addr_reg(Code *code, int reg, int32_t global_index) {
+    int32_t adrp_pos = code->count;
+    code_emit(code, a64_adrp(reg, 0));
+    code_global_reloc_add(code, adrp_pos, global_index, COLD_RELOC_GOT_LOAD_PAGE21, 1);
+    int32_t ldr_pos = code->count;
+    code_emit(code, a64_ldr_imm(reg, reg, 0, true));
+    code_global_reloc_add(code, ldr_pos, global_index, COLD_RELOC_GOT_LOAD_PAGEOFF12, 0);
+}
+
+static void codegen_load_global_to_slot(Code *code, BodyIR *body, Symbols *symbols,
+                                        int32_t dst, int32_t global_index) {
+    if (global_index < 0 || global_index >= symbols->global_count) die("invalid global load target");
+    int32_t kind = body->slot_kind[dst];
+    int32_t size = body->slot_size[dst];
+    codegen_global_addr_reg(code, R1, global_index);
+    if (kind == SLOT_I32) {
+        code_emit(code, a64_ldr_imm(R0, R1, 0, false));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        return;
+    }
+    if (kind == SLOT_I64 || kind == SLOT_PTR || cold_codegen_kind_is_64bit_scalar(kind)) {
+        code_emit(code, a64_ldr_imm(R0, R1, 0, true));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+        return;
+    }
+    for (int32_t off = 0; off < size; off += 8) {
+        code_emit(code, a64_ldr_imm(R0, R1, off, true));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + off, true);
+    }
+}
+
+static void codegen_store_slot_to_global(Code *code, BodyIR *body, Symbols *symbols,
+                                         int32_t global_index, int32_t src) {
+    if (global_index < 0 || global_index >= symbols->global_count) die("invalid global store target");
+    GlobalDef *global = &symbols->globals[global_index];
+    int32_t kind = global->kind;
+    int32_t size = global->size;
+    codegen_global_addr_reg(code, R1, global_index);
+    if (kind == SLOT_I32) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[src], false);
+        code_emit(code, a64_str_imm(R0, R1, 0, false));
+        return;
+    }
+    if (kind == SLOT_I64 || kind == SLOT_PTR || cold_codegen_kind_is_64bit_scalar(kind)) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[src], true);
+        code_emit(code, a64_str_imm(R0, R1, 0, true));
+        return;
+    }
+    for (int32_t off = 0; off < size; off += 8) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[src] + off, true);
+        code_emit(code, a64_str_imm(R0, R1, off, true));
+    }
 }
 
 static void codegen_copy_slot_to_slot(Code *code, BodyIR *body, int32_t dst, int32_t src) {
@@ -17051,6 +17231,13 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             a64_emit_add_large(code, R0, SP, body->slot_offset[a] + b, true);
         }
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_GLOBAL_ADDR) {
+        codegen_global_addr_reg(code, R0, a);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_GLOBAL_LOAD) {
+        codegen_load_global_to_slot(code, body, symbols, dst, a);
+    } else if (kind == BODY_OP_GLOBAL_STORE) {
+        codegen_store_slot_to_global(code, body, symbols, dst, a);
     } else if (kind == BODY_OP_STR_REF_STORE) {
         if (body->slot_kind[dst] != SLOT_STR_REF || body->slot_kind[a] != SLOT_STR) {
             return; /* skip mismatched str ref store */
@@ -19073,6 +19260,8 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
                 parse_type(&parser);
             } else if (span_eq(next, "const")) {
                 parse_const(&parser);
+            } else if (span_eq(next, "var")) {
+                parse_global_var(&parser);
             } else if (span_eq(next, "fn")) {
                 volatile int32_t symbol_index = -1;
                 volatile BodyIR *volatile body2 = 0;
@@ -19282,6 +19471,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             parse_type(&parser);
         } else if (span_eq(next, "const")) {
             parse_const(&parser);
+        } else if (span_eq(next, "var")) {
+            parse_global_var(&parser);
         } else if (span_eq(next, "fn")) {
             int32_t symbol_index = -1;
             BodyIR *body = parse_fn(&parser, &symbol_index);
@@ -19363,25 +19554,43 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
     }
 
-    /* Resolve inter-function patches */
+    /* Resolve inter-function patches and collect external call relocations */
+    int32_t reloc_cap = func_count * 16;
+    int32_t *reloc_offsets = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+    int32_t *reloc_symbols = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+    uint8_t *reloc_types = arena_alloc(arena, (size_t)reloc_cap * sizeof(uint8_t));
+    uint8_t *reloc_pcrels = arena_alloc(arena, (size_t)reloc_cap * sizeof(uint8_t));
+    int32_t reloc_count = 0;
     for (int32_t pi = 0; pi < function_patches.count; pi++) {
         FunctionPatch patch = function_patches.items[pi];
         if (patch.target_function < 0 || patch.target_function >= func_count) continue;
         int32_t target_off = symbol_offset[patch.target_function];
-        if (target_off < 0) continue; /* target has no body, patch stays as-is */
+        if (target_off < 0) {
+            if (reloc_count < reloc_cap) {
+                reloc_offsets[reloc_count] = (int32_t)patch.pos * 4;
+                reloc_symbols[reloc_count] = patch.target_function;
+                reloc_types[reloc_count] = 2;   /* ARM64_RELOC_BRANCH26 */
+                reloc_pcrels[reloc_count] = 1;
+                reloc_count++;
+            }
+            continue;
+        }
         int32_t delta = target_off - (int32_t)patch.pos;
         shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
                                    ((uint32_t)delta & 0x03FFFFFFu);
     }
 
-    /* Build name/offset arrays for macho_write_object */
-    const char **func_names = arena_alloc(arena, (size_t)func_count * sizeof(const char *));
-    int32_t *func_offsets = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    /* Build name/offset arrays: locals first, then external references */
+    int32_t name_cap = func_count + reloc_count;
+    const char **func_names = arena_alloc(arena, (size_t)name_cap * sizeof(const char *));
+    int32_t *func_offsets = arena_alloc(arena, (size_t)name_cap * sizeof(int32_t));
     int32_t name_count = 0;
+    int32_t local_count = 0;
+    int32_t *ext_map = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    for (int32_t i = 0; i < func_count; i++) ext_map[i] = -1;
     for (int32_t i = 0; i < func_count; i++) {
         if (symbol_offset[i] < 0) continue;
         Span nm = symbols->functions[i].name;
-        /* Dedup: skip if this name already in table (first definition wins) */
         bool dup = false;
         for (int32_t j = 0; j < name_count; j++) {
             if (func_names[j] && (int32_t)strlen(func_names[j]) == nm.len &&
@@ -19389,6 +19598,9 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
         if (dup) continue;
         func_offsets[name_count] = symbol_offset[i];
+        bool has_dot = false;
+        for (int32_t k = 0; k < nm.len; k++) { if (nm.ptr[k] == '.') { has_dot = true; break; } }
+        if (!has_dot) local_count++;
         if (getenv("CHENG_RENAME_MAIN") && nm.len == 4 && memcmp(nm.ptr, "main", 4) == 0) {
             char *nc = arena_alloc(arena, 26);
             memcpy(nc, "cheng_program_argv_entry", 25);
@@ -19402,12 +19614,36 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
         name_count++;
     }
+    /* External symbols for relocation entries: strip module prefix,
+       mark with offset=-1 so macho_write_object sets N_UNDF|N_EXT */
+    for (int32_t ri = 0; ri < reloc_count; ri++) {
+        int32_t target = reloc_symbols[ri];
+        if (ext_map[target] >= 0) continue;
+        Span nm = symbols->functions[target].name;
+        const char *base = (const char *)nm.ptr;
+        int32_t blen = nm.len;
+        for (int32_t k = nm.len - 1; k > 0; k--) {
+            if (nm.ptr[k] == '.') { base = (const char *)(nm.ptr + k + 1); blen = nm.len - k - 1; break; }
+        }
+        char *nc = arena_alloc(arena, (size_t)blen + 1);
+        memcpy(nc, base, (size_t)blen);
+        nc[blen] = '\0';
+        func_names[name_count] = nc;
+        func_offsets[name_count] = -1;
+        ext_map[target] = name_count;
+        name_count++;
+    }
+    for (int32_t ri = 0; ri < reloc_count; ri++) {
+        int32_t mapped = ext_map[reloc_symbols[ri]];
+        if (mapped >= 0) reloc_symbols[ri] = mapped;
+    }
 
     bool ok = macho_write_object(out_path, shared->words, shared->count,
                                  func_names, func_offsets,
                                  0, 0,
-                                 name_count, name_count,
-                                 0, 0, 0, 0, 0);
+                                 name_count, local_count,
+                                 reloc_offsets, reloc_symbols,
+                                 reloc_types, reloc_pcrels, reloc_count);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;
 }
