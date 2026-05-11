@@ -16627,7 +16627,9 @@ static bool cheng_seed_is_intrinsic_module_call(const char *module_path, const c
         return true;
     }
     if (strcmp(module_path, "std/strutils") == 0 &&
-        strcmp(function_name, "strip") == 0) {
+        (strcmp(function_name, "strip") == 0 ||
+         strcmp(function_name, "SliceStr") == 0 ||
+         strcmp(function_name, "Slice") == 0)) {
         return true;
     }
     return false;
