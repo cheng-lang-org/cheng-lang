@@ -13838,6 +13838,12 @@ static uint32_t a64_adr(int rd, int32_t offset_bytes) {
     uint32_t immhi = (imm >> 2) & 0x7FFFFu;
     return 0x10000000u | (immlo << 29) | (immhi << 5) | (uint32_t)rd;
 }
+static uint32_t a64_adrp(int rd, int32_t offset_pages) {
+    uint32_t imm = (uint32_t)offset_pages & 0x1FFFFFu;
+    uint32_t immlo = imm & 0x3u;
+    uint32_t immhi = (imm >> 2) & 0x7FFFFu;
+    return 0x90000000u | (immlo << 29) | (immhi << 5) | (uint32_t)rd;
+}
 static uint32_t a64_add_imm(int rd, int rn, uint16_t value, bool x) {
     return (x ? 0x91000000u : 0x11000000u) | ((uint32_t)value << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
 }
