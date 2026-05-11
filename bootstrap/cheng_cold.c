@@ -17119,6 +17119,18 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_b(code, done_pos, code->count);
         a64_emit_str_sp_off(code, R2, body->slot_offset[dst], false);
         na_clobber(2);
+    } else if (kind == BODY_OP_SELECT) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        code_emit(code, a64_cmp_imm(R0, 0));
+        int32_t false_pos = code->count;
+        code_emit(code, a64_bcond(0, COND_EQ));
+        codegen_copy_slot_to_slot(code, body, dst, b);
+        int32_t done_pos = code->count;
+        code_emit(code, a64_b(0));
+        a64_patch_bcond(code, false_pos, code->count);
+        codegen_copy_slot_to_slot(code, body, dst, c);
+        a64_patch_b(code, done_pos, code->count);
+        na_clobber(2);
     } else if (kind == BODY_OP_I32_SHL) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
@@ -19209,7 +19221,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     }
 
     bool ok = macho_write_object(out_path, shared->words, shared->count,
-                                 func_names, func_offsets, name_count, local_count);
+                                 func_names, func_offsets, name_count, local_count,
+                                 0, 0, 0);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;
 }
