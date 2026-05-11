@@ -288,7 +288,10 @@ typedef struct {
 static bool macho_write_object(const char *path,
                                const uint32_t *code, int32_t code_words,
                                const char **names, const int32_t *offsets,
-                               int32_t name_count) {
+                               int32_t name_count, int32_t local_count,
+                               const int32_t *reloc_offsets,
+                               const int32_t *reloc_symbols,
+                               int32_t reloc_count) {
     int32_t code_sz = code_words * 4;
 
     /* Build string table first to know its size */
