@@ -4623,6 +4623,9 @@ enum {
     BODY_OP_FN_ADDR = 113,
     BODY_OP_CALL_PTR = 114,
     BODY_OP_MAKE_SEQ_OPAQUE = 116,
+    BODY_OP_SLOT_STORE_I32 = 117,
+    BODY_OP_SLOT_STORE_I64 = 118,
+    BODY_OP_EXEC_SHELL = 119,
 };
 
 enum {
@@ -11520,7 +11523,7 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
     Local *local = locals_find(locals, base_name);
     if (!local) return block; /* skip non-local field assign */;
     if (local->kind != SLOT_OBJECT && local->kind != SLOT_OBJECT_REF &&
-        local->kind != SLOT_PTR) {
+        local->kind != SLOT_PTR && local->kind != SLOT_STR) {
         int32_t skip_kind = SLOT_I32;
         (void)parse_expr(parser, body, locals, &skip_kind);
         return block;
@@ -11528,6 +11531,23 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
     if (!parser_take(parser, ".")) die("expected . in field assignment");
     Span field_name = parser_token(parser);
     if (field_name.len <= 0) die("expected field name in assignment");
+    /* Str field assignment: use known offsets (data=0, len=8, store_id=12, flags=16) */
+    if (local->kind == SLOT_STR) {
+        if (!parser_take(parser, "=")) die("expected = in str field assignment");
+        int32_t value_kind = SLOT_I32;
+        int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
+        int32_t off = -1;
+        if (span_eq(field_name, "data")) off = COLD_STR_DATA_OFFSET;
+        else if (span_eq(field_name, "len")) off = COLD_STR_LEN_OFFSET;
+        else if (span_eq(field_name, "store_id")) off = COLD_STR_STORE_ID_OFFSET;
+        else if (span_eq(field_name, "flags")) off = COLD_STR_FLAGS_OFFSET;
+        if (off < 0) die("unknown str field");
+        if (off == COLD_STR_DATA_OFFSET)
+            body_op3(body, BODY_OP_SLOT_STORE_I64, local->slot, value_slot, off, 0);
+        else
+            body_op3(body, BODY_OP_SLOT_STORE_I32, local->slot, value_slot, off, 0);
+        return block;
+    }
     Span object_type = cold_type_strip_var(body->slot_type[local->slot], 0);
     ObjectDef *object = symbols_resolve_object(parser->symbols, object_type);
     if (!object) {
@@ -14165,6 +14185,14 @@ static uint32_t a64_lsl_imm(int rd, int rn, int shift, bool x) {
     }
     return 0x53000000u | ((uint32_t)(32 - shift) << 16) |
            ((uint32_t)(31 - shift) << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+static uint32_t a64_lsr_imm(int rd, int rn, int shift, bool x) {
+    if (x) {
+        return 0xD3400000u | ((uint32_t)shift << 16) |
+               (63u << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
+    }
+    return 0x53000000u | ((uint32_t)shift << 16) |
+           (31u << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
 }
 static uint32_t a64_eor_reg(int rd, int rn, int rm) {
     return 0x4A000000u | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31);
@@ -17428,6 +17456,12 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
         code_emit(code, a64_ldr_imm(R0, R1, 0, true));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_SLOT_STORE_I32) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + c, false);
+    } else if (kind == BODY_OP_SLOT_STORE_I64) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + c, true);
     } else if (kind == BODY_OP_PTR_STORE_I64) {
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
