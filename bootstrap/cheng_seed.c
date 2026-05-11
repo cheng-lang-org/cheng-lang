@@ -16650,6 +16650,26 @@ static bool cheng_seed_resolve_intrinsic_module_call_target(const char *module_p
                                    sizeof(target->symbol_name));
         return cheng_seed_call_target_set_signature(target, "str", 1U, param_types);
     }
+    if (strcmp(module_path, "std/strutils") == 0 &&
+        strcmp(function_name, "SliceStr") == 0) {
+        static const char *const param_types[] = { "str", "int32", "int32" };
+        snprintf(target->callee_name, sizeof(target->callee_name), "%s", "SliceStr");
+        cheng_seed_copy_target_symbol_name(plan,
+                                   "driver_c_str_slice_bridge",
+                                   target->symbol_name,
+                                   sizeof(target->symbol_name));
+        return cheng_seed_call_target_set_signature(target, "str", 3U, param_types);
+    }
+    if (strcmp(module_path, "std/strutils") == 0 &&
+        strcmp(function_name, "Slice") == 0) {
+        static const char *const param_types[] = { "str", "int32", "int32" };
+        snprintf(target->callee_name, sizeof(target->callee_name), "%s", "Slice");
+        cheng_seed_copy_target_symbol_name(plan,
+                                   "driver_c_str_slice_bridge",
+                                   target->symbol_name,
+                                   sizeof(target->symbol_name));
+        return cheng_seed_call_target_set_signature(target, "str", 3U, param_types);
+    }
     if (strcmp(module_path, "std/os") == 0 &&
         strcmp(function_name, "isAbsolute") == 0) {
         static const char *const param_types[] = { "str" };
