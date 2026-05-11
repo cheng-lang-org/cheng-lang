@@ -19018,9 +19018,34 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     FunctionPatchList function_patches = {0};
     function_patches.arena = arena;
 
+    /* Build map of emitted base names to prevent code duplication */
+    bool *name_seen = arena_alloc(arena, (size_t)func_count * sizeof(bool));
+    for (int32_t i = 0; i < func_count; i++) name_seen[i] = false;
+
     /* First pass: compile each function body into the shared buffer */
     for (int32_t i = 0; i < func_count; i++) {
         if (!function_bodies[i]) continue;
+        /* Extract base name (last component) */
+        Span nm = symbols->functions[i].name;
+        const char *base = nm.ptr;
+        int32_t base_len = nm.len;
+        for (int32_t k = nm.len - 1; k > 0; k--) {
+            if (nm.ptr[k] == '.' || nm.ptr[k] == ':') { base = nm.ptr + k + 1; base_len = nm.len - k - 1; break; }
+        }
+        /* Check if this base name already emitted */
+        bool dup = false;
+        for (int32_t j = 0; j < i; j++) {
+            if (!name_seen[j] || !function_bodies[j]) continue;
+            Span prev = symbols->functions[j].name;
+            const char *pb = prev.ptr;
+            int32_t pbl = prev.len;
+            for (int32_t k = prev.len - 1; k > 0; k--) {
+                if (prev.ptr[k] == '.' || prev.ptr[k] == ':') { pb = prev.ptr + k + 1; pbl = prev.len - k - 1; break; }
+            }
+            if (pbl == base_len && memcmp(pb, base, (size_t)base_len) == 0) { dup = true; break; }
+        }
+        if (dup) { fprintf(stderr, "[cold_body] skip dup: %.*s\n", (int)nm.len, nm.ptr); continue; }
+        name_seen[i] = true;
         symbol_offset[i] = shared->count;
         BodyIR *body = function_bodies[i];
         if (body->has_fallback || body->block_count == 0 ||
