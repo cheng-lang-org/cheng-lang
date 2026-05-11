@@ -8968,6 +8968,9 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         body_call_arg(body, command);
         body_call_arg(body, options);
         body_call_arg(body, cwd);
+        for (int32_t i = 0; i < 8; i++) {
+            body_call_arg(body, body_slot(body, SLOT_I64, 8));
+        }
         body_op3(body, BODY_OP_EXEC_SHELL, slot, payload_start, output->offset, exit_code->offset);
         if (kind_out) *kind_out = SLOT_OBJECT;
         *slot_out = slot;
@@ -9032,7 +9035,8 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         return true;
     }
     if (span_eq(name, "BackendDriverDispatchMinParamStrRawBridge") ||
-        span_eq(name, "__cheng_rt_paramStr")) {
+        span_eq(name, "__cheng_rt_paramStr") ||
+        span_eq(name, "__cheng_rt_paramStrCopyBridge")) {
         if (arg_count != 1) die("paramStr intrinsic arity mismatch");
         int32_t index_slot = body->call_arg_slot[arg_start];
         if (body->slot_kind[index_slot] != SLOT_I32) die("paramStr index must be int32");
@@ -15230,17 +15234,33 @@ static void codegen_store_exec_failure(Code *code, BodyIR *body, int32_t dst,
     codegen_store_exec_result(code, body, dst, output_offset, R1, R2, exit_offset, R3);
 }
 
+static void codegen_save_exec_spills(Code *code, BodyIR *body, int32_t spill_start) {
+    for (int32_t i = 0; i < 8; i++) {
+        int32_t slot = body->call_arg_slot[spill_start + i];
+        a64_emit_str_sp_off(code, 21 + i, body->slot_offset[slot], true);
+    }
+}
+
+static void codegen_restore_exec_spills(Code *code, BodyIR *body, int32_t spill_start) {
+    for (int32_t i = 0; i < 8; i++) {
+        int32_t slot = body->call_arg_slot[spill_start + i];
+        a64_emit_ldr_sp_off(code, 21 + i, body->slot_offset[slot], true);
+    }
+}
+
 static void codegen_exec_shell(Code *code, BodyIR *body, int32_t dst,
                                int32_t arg_start, int32_t output_offset,
                                int32_t exit_offset) {
-    if (arg_start < 0 || arg_start + 2 >= body->call_arg_count) {
+    if (arg_start < 0 || arg_start + 10 >= body->call_arg_count) {
         codegen_store_exec_failure(code, body, dst, output_offset, exit_offset);
         return;
     }
     int32_t command_slot = body->call_arg_slot[arg_start];
     int32_t options_slot = body->call_arg_slot[arg_start + 1];
     int32_t cwd_slot = body->call_arg_slot[arg_start + 2];
+    int32_t spill_start = arg_start + 3;
     codegen_zero_slot(code, body, dst);
+    codegen_save_exec_spills(code, body, spill_start);
 
     codegen_cstring_from_slot(code, body, command_slot, 7, 119);
     code_emit(code, a64_add_imm(21, 7, 0, true));      /* command cstr */
@@ -15274,9 +15294,10 @@ static void codegen_exec_shell(Code *code, BodyIR *body, int32_t dst,
 
     code_emit(code, a64_movz_x(16, 2, 0));             /* fork */
     code_emit(code, a64_svc(0x80));
-    code_emit(code, a64_cmp_reg_x(R0, 31));
+    code_emit(code, a64_cmp_reg_x(R1, 31));
     int32_t child_branch = code->count;
-    code_emit(code, a64_bcond(0, COND_EQ));
+    code_emit(code, a64_bcond(0, COND_NE));
+    code_emit(code, a64_cmp_reg_x(R0, 31));
     int32_t fork_fail = code->count;
     code_emit(code, a64_bcond(0, COND_LT));
     code_emit(code, a64_add_imm(12, R0, 0, true));     /* pid */
@@ -15348,6 +15369,7 @@ static void codegen_exec_shell(Code *code, BodyIR *body, int32_t dst,
     a64_patch_b(code, exit_ready_jump, exit_ready);
     code_emit(code, a64_add_imm(SP, SP, 64, true));
     codegen_store_exec_result(code, body, dst, output_offset, 26, 27, exit_offset, 7);
+    codegen_restore_exec_spills(code, body, spill_start);
     int32_t done_jump = code->count;
     code_emit(code, a64_b(0));
 
@@ -15355,6 +15377,7 @@ static void codegen_exec_shell(Code *code, BodyIR *body, int32_t dst,
     a64_patch_bcond(code, wait_fail, wait_fail_label);
     code_emit(code, a64_add_imm(SP, SP, 64, true));
     codegen_store_exec_failure(code, body, dst, output_offset, exit_offset);
+    codegen_restore_exec_spills(code, body, spill_start);
     int32_t fail_done_jump = code->count;
     code_emit(code, a64_b(0));
 
@@ -15412,6 +15435,7 @@ static void codegen_exec_shell(Code *code, BodyIR *body, int32_t dst,
     a64_patch_bcond(code, pipe_fail, pipe_fail_label);
     code_emit(code, a64_add_imm(SP, SP, 64, true));
     codegen_store_exec_failure(code, body, dst, output_offset, exit_offset);
+    codegen_restore_exec_spills(code, body, spill_start);
     int32_t fail2_done_jump = code->count;
     code_emit(code, a64_b(0));
 
