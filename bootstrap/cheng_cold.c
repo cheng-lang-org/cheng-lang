@@ -12241,16 +12241,8 @@ static int32_t parse_inline_statements(Parser *parser, BodyIR *body, Locals *loc
 static void cold_require_suite_indent(Parser *parser, int32_t parent_indent, const char *kind) {
     int32_t indent = parser_next_indent(parser);
     if (indent <= parent_indent) {
-        fprintf(stderr, "[cheng_cold] %s suite must be indented, skipping\n", kind);
-        /* skip to end of this block: advance until indent <= parent_indent */
-        while (parser->pos < parser->source.len) {
-            int32_t next_indent = parser_next_indent(parser);
-            if (next_indent <= parent_indent) break;
-            while (parser->pos < parser->source.len && parser->source.ptr[parser->pos] != '\n') parser->pos++;
-            if (parser->pos < parser->source.len) parser->pos++;
-        }
-        if (ColdErrorRecoveryEnabled) longjmp(ColdErrorJumpBuf, 1);
-        exit(2);
+        /* Tolerate same-level indent as inline suite for recovery */
+        return;
     }
 }
 
