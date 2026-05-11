@@ -4622,6 +4622,9 @@ enum {
     BODY_OP_I32_FROM_F64 = 112,
     BODY_OP_FN_ADDR = 113,
     BODY_OP_CALL_PTR = 114,
+    BODY_OP_GLOBAL_ADDR = 116,
+    BODY_OP_GLOBAL_LOAD = 117,
+    BODY_OP_GLOBAL_STORE = 118,
 };
 
 enum {
@@ -5098,6 +5101,13 @@ typedef struct {
 } TypeAlias;
 
 typedef struct {
+    Span name;
+    Span type;
+    int32_t kind;
+    int32_t size;
+} GlobalDef;
+
+typedef struct {
     FnDef *functions;
     int32_t function_count;
     int32_t function_cap;
@@ -5113,6 +5123,9 @@ typedef struct {
     TypeAlias *aliases;
     int32_t alias_count;
     int32_t alias_cap;
+    GlobalDef *globals;
+    int32_t global_count;
+    int32_t global_cap;
     Arena *arena;
 } Symbols;
 
@@ -5130,6 +5143,8 @@ typedef struct {
 } Locals;
 
 static Span cold_arena_span_copy(Arena *arena, Span text);
+static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type);
+static int32_t cold_slot_size_from_type_with_symbols(Symbols *symbols, Span type, int32_t kind);
 
 static Symbols *symbols_new(Arena *arena) {
     Symbols *symbols = arena_alloc(arena, sizeof(Symbols));
@@ -5139,11 +5154,13 @@ static Symbols *symbols_new(Arena *arena) {
     symbols->object_cap = 16;
     symbols->const_cap = 16;
     symbols->alias_cap = 16;
+    symbols->global_cap = 64;
     symbols->functions = arena_alloc(arena, (size_t)symbols->function_cap * sizeof(FnDef));
     symbols->types = arena_alloc(arena, (size_t)symbols->type_cap * sizeof(TypeDef));
     symbols->objects = arena_alloc(arena, (size_t)symbols->object_cap * sizeof(ObjectDef));
     symbols->consts = arena_alloc(arena, (size_t)symbols->const_cap * sizeof(ConstDef));
     symbols->aliases = arena_alloc(arena, (size_t)symbols->alias_cap * sizeof(TypeAlias));
+    symbols->globals = arena_alloc(arena, (size_t)symbols->global_cap * sizeof(GlobalDef));
     return symbols;
 }
 
@@ -5213,6 +5230,45 @@ static void symbols_add_alias(Symbols *symbols, Span name, Span target) {
     TypeAlias *alias = &symbols->aliases[symbols->alias_count++];
     alias->name = cold_arena_span_copy(symbols->arena, name);
     alias->target = cold_arena_span_copy(symbols->arena, target);
+}
+
+static GlobalDef *symbols_find_global(Symbols *symbols, Span name) {
+    name = span_trim(name);
+    for (int32_t i = 0; i < symbols->global_count; i++) {
+        if (span_same(symbols->globals[i].name, name)) return &symbols->globals[i];
+    }
+    return 0;
+}
+
+static int32_t symbols_global_index(Symbols *symbols, Span name) {
+    name = span_trim(name);
+    for (int32_t i = 0; i < symbols->global_count; i++) {
+        if (span_same(symbols->globals[i].name, name)) return i;
+    }
+    return -1;
+}
+
+static int32_t symbols_add_global(Symbols *symbols, Span name, Span type) {
+    name = span_trim(name);
+    type = span_trim(type);
+    int32_t existing = symbols_global_index(symbols, name);
+    if (existing >= 0) return existing;
+    if (symbols->global_count >= symbols->global_cap) {
+        int32_t next = symbols->global_cap * 2;
+        GlobalDef *fresh = arena_alloc(symbols->arena, (size_t)next * sizeof(GlobalDef));
+        memcpy(fresh, symbols->globals, (size_t)symbols->global_count * sizeof(GlobalDef));
+        symbols->globals = fresh;
+        symbols->global_cap = next;
+    }
+    int32_t kind = cold_slot_kind_from_type_with_symbols(symbols, type);
+    int32_t size = cold_slot_size_from_type_with_symbols(symbols, type, kind);
+    if (size <= 0) die("global variable has unknown size");
+    GlobalDef *global = &symbols->globals[symbols->global_count];
+    global->name = cold_arena_span_copy(symbols->arena, name);
+    global->type = cold_arena_span_copy(symbols->arena, type);
+    global->kind = kind;
+    global->size = size;
+    return symbols->global_count++;
 }
 
 static bool cold_fn_param_kind_can_refine(int32_t existing, int32_t fresh) {
@@ -7506,6 +7562,56 @@ static void parse_const(Parser *parser) {
     }
     if (!cold_span_starts_with(first_line, "const ")) die("expected const");
     parse_const_member_line(parser, first_line);
+    parser->pos = first_line_end;
+    if (parser->pos < parser->source.len) parser->pos++;
+}
+
+static void parse_global_var_member_line(Parser *parser, Span line) {
+    Span trimmed = cold_strip_inline_comment(line);
+    if (trimmed.len <= 0) return;
+    if (cold_span_starts_with(trimmed, "var ")) {
+        trimmed = span_trim(span_sub(trimmed, 3, trimmed.len));
+    }
+    int32_t colon = cold_span_find_top_level_char(trimmed, ':');
+    if (colon <= 0) die("global var requires declared type");
+    Span name = span_trim(span_sub(trimmed, 0, colon));
+    Span type = span_trim(span_sub(trimmed, colon + 1, trimmed.len));
+    if (!cold_span_is_simple_ident(name)) die("global var requires simple name");
+    if (type.len <= 0) die("global var requires type");
+    symbols_add_global(parser->symbols, name, type);
+}
+
+static void parse_global_var(Parser *parser) {
+    int32_t line_start = parser->pos;
+    int32_t first_line_end = cold_line_end_from(parser->source, line_start);
+    Span first_line = span_trim(span_sub(parser->source, line_start, first_line_end));
+    if (span_eq(first_line, "var")) {
+        int32_t pos = first_line_end;
+        if (pos < parser->source.len) pos++;
+        int32_t group_indent = -1;
+        while (pos < parser->source.len) {
+            int32_t member_start = pos;
+            int32_t member_end = cold_line_end_from(parser->source, member_start);
+            Span line = span_sub(parser->source, member_start, member_end);
+            Span trimmed = span_trim(line);
+            if (trimmed.len == 0) {
+                pos = member_end;
+                if (pos < parser->source.len) pos++;
+                continue;
+            }
+            int32_t indent = cold_line_indent_width(line);
+            if (indent == 0) break;
+            if (group_indent < 0) group_indent = indent;
+            if (indent < group_indent) break;
+            parse_global_var_member_line(parser, line);
+            pos = member_end;
+            if (pos < parser->source.len) pos++;
+        }
+        parser->pos = pos;
+        return;
+    }
+    if (!cold_span_starts_with(first_line, "var ")) die("expected var");
+    parse_global_var_member_line(parser, first_line);
     parser->pos = first_line_end;
     if (parser->pos < parser->source.len) parser->pos++;
 }
@@ -19476,11 +19582,11 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     }
 
     bool ok = macho_write_object(out_path, shared->words, shared->count,
-                                 func_names, func_offsets, name_count);
-    /* FIXME: relocation data (reloc_offsets/symbols/types/pcrels/count)
-       ready but macho_write_object signature pending update */
-    (void)reloc_offsets; (void)reloc_symbols; (void)reloc_types;
-    (void)reloc_pcrels; (void)reloc_count; (void)local_count;
+                                 func_names, func_offsets,
+                                 0, 0,
+                                 name_count, local_count,
+                                 reloc_offsets, reloc_symbols,
+                                 reloc_types, reloc_pcrels, reloc_count);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;
 }
