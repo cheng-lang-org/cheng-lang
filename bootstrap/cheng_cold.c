@@ -8952,7 +8952,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
             if (result->fields[0].name.len == 0) {
                 result->fields[0].name = cold_cstr_span("output");
                 result->fields[0].kind = SLOT_STR;
-                result->fields[0].size = 16;
+                result->fields[0].size = COLD_STR_SLOT_SIZE;
                 result->fields[1].name = cold_cstr_span("exitCode");
                 result->fields[1].kind = SLOT_I32;
                 result->fields[1].size = 4;
@@ -8962,12 +8962,13 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         ObjectField *output = cold_required_object_field(result, "output");
         ObjectField *exit_code = cold_required_object_field(result, "exitCode");
         if (output->kind != SLOT_STR || exit_code->kind != SLOT_I32) die("ExecCmdResult layout mismatch");
-        int32_t payload_start = body->call_arg_count;
-        body_call_arg_with_offset(body, cold_make_str_literal_cstr_slot(body, ""), output->offset);
-        body_call_arg_with_offset(body, cold_make_i32_const_slot(body, 0), exit_code->offset);
         int32_t slot = body_slot(body, SLOT_OBJECT, symbols_object_slot_size(result));
         body_slot_set_type(body, slot, result->name);
-        body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, payload_start, 2);
+        int32_t payload_start = body->call_arg_count;
+        body_call_arg(body, command);
+        body_call_arg(body, options);
+        body_call_arg(body, cwd);
+        body_op3(body, BODY_OP_EXEC_SHELL, slot, payload_start, output->offset, exit_code->offset);
         if (kind_out) *kind_out = SLOT_OBJECT;
         *slot_out = slot;
         return true;
@@ -8984,7 +8985,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
             result = symbols_add_object(parser->symbols, cold_cstr_span("ExecCmdResult"), 2);
             if (result->fields[0].name.len == 0) {
                 result->fields[0].name = cold_cstr_span("output");
-                result->fields[0].kind = SLOT_STR; result->fields[0].size = 16;
+                result->fields[0].kind = SLOT_STR; result->fields[0].size = COLD_STR_SLOT_SIZE;
                 result->fields[1].name = cold_cstr_span("exitCode");
                 result->fields[1].kind = SLOT_I32; result->fields[1].size = 4;
                 object_finalize_fields(result);
@@ -9008,7 +9009,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
             result = symbols_add_object(parser->symbols, cold_cstr_span("ExecCmdResult"), 2);
             if (result->fields[0].name.len == 0) {
                 result->fields[0].name = cold_cstr_span("output");
-                result->fields[0].kind = SLOT_STR; result->fields[0].size = 16;
+                result->fields[0].kind = SLOT_STR; result->fields[0].size = COLD_STR_SLOT_SIZE;
                 result->fields[1].name = cold_cstr_span("exitCode");
                 result->fields[1].kind = SLOT_I32; result->fields[1].size = 4;
                 object_finalize_fields(result);
@@ -15196,6 +15197,230 @@ static void codegen_cstring_from_slot(Code *code, BodyIR *body, int32_t slot,
     code_emit(code, a64_strb_imm(5, 6, 0));
 }
 
+static void codegen_cstring_literal(Code *code, int dst_reg, const char *text) {
+    int32_t adr_pos = code->count;
+    code_emit(code, a64_adr(dst_reg, 0));
+    int32_t skip_pos = code->count;
+    code_emit(code, a64_b(0));
+    int32_t data_offset = code_append_bytes(code, text, (int32_t)strlen(text) + 1);
+    int32_t after_data = code->count;
+    code->words[adr_pos] = a64_adr(dst_reg, data_offset - adr_pos * 4);
+    a64_patch_b(code, skip_pos, after_data);
+}
+
+static void codegen_store_exec_result(Code *code, BodyIR *body, int32_t dst,
+                                      int32_t output_offset, int output_ptr_reg,
+                                      int output_len_reg, int32_t exit_offset,
+                                      int exit_code_reg) {
+    int32_t base = body->slot_offset[dst];
+    a64_emit_str_sp_off(code, output_ptr_reg, base + output_offset + COLD_STR_DATA_OFFSET, true);
+    a64_emit_str_sp_off(code, output_len_reg, base + output_offset + COLD_STR_LEN_OFFSET, false);
+    code_emit(code, a64_movz(R0, 0, 0));
+    a64_emit_str_sp_off(code, R0, base + output_offset + COLD_STR_STORE_ID_OFFSET, false);
+    a64_emit_str_sp_off(code, R0, base + output_offset + COLD_STR_FLAGS_OFFSET, false);
+    a64_emit_str_sp_off(code, exit_code_reg, base + exit_offset, false);
+}
+
+static void codegen_store_exec_failure(Code *code, BodyIR *body, int32_t dst,
+                                       int32_t output_offset, int32_t exit_offset) {
+    code_emit(code, a64_movz_x(R1, 0, 0));
+    code_emit(code, a64_movz(R2, 0, 0));
+    code_emit(code, a64_movz(R3, 0, 0));
+    code_emit(code, a64_sub_imm(R3, R3, 1, false));
+    codegen_store_exec_result(code, body, dst, output_offset, R1, R2, exit_offset, R3);
+}
+
+static void codegen_exec_shell(Code *code, BodyIR *body, int32_t dst,
+                               int32_t arg_start, int32_t output_offset,
+                               int32_t exit_offset) {
+    if (arg_start < 0 || arg_start + 2 >= body->call_arg_count) {
+        codegen_store_exec_failure(code, body, dst, output_offset, exit_offset);
+        return;
+    }
+    int32_t command_slot = body->call_arg_slot[arg_start];
+    int32_t options_slot = body->call_arg_slot[arg_start + 1];
+    int32_t cwd_slot = body->call_arg_slot[arg_start + 2];
+    codegen_zero_slot(code, body, dst);
+
+    codegen_cstring_from_slot(code, body, command_slot, 7, 119);
+    code_emit(code, a64_add_imm(21, 7, 0, true));      /* command cstr */
+    codegen_cstring_from_slot(code, body, cwd_slot, 8, 119);
+    code_emit(code, a64_add_imm(22, 8, 0, true));      /* cwd cstr */
+    codegen_load_str_pair(code, body, cwd_slot, R2, R3);
+    code_emit(code, a64_add_imm(23, R3, 0, true));     /* cwd len */
+    if (body->slot_kind[options_slot] == SLOT_I32 || body->slot_kind[options_slot] == SLOT_I64) {
+        a64_emit_ldr_sp_off(code, 4, body->slot_offset[options_slot], false);
+    } else {
+        code_emit(code, a64_movz(4, 0, 0));
+    }
+    code_emit(code, a64_movz(5, 1, 0));
+    code_emit(code, a64_and_reg(13, 4, 5));            /* merge stderr bit */
+    codegen_cstring_literal(code, 24, "/bin/sh");
+    codegen_cstring_literal(code, 25, "-c");
+    codegen_mmap_const(code, 1024 * 1024 + 1, 26, 119); /* captured output */
+    code_emit(code, a64_movz_x(27, 0, 0));             /* used */
+    codegen_mov_i64_const(code, 28, 1024 * 1024);      /* cap */
+    codegen_mmap_const(code, 4096, 11, 119);           /* discard/status scratch */
+
+    code_emit(code, a64_sub_imm(SP, SP, 64, true));
+
+    code_emit(code, a64_movz_x(16, 42, 0));            /* pipe() -> x0 read, x1 write */
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_cmp_reg_x(R0, 31));
+    int32_t pipe_fail = code->count;
+    code_emit(code, a64_bcond(0, COND_LT));
+    code_emit(code, a64_add_imm(9, R0, 0, true));      /* read fd */
+    code_emit(code, a64_add_imm(10, R1, 0, true));     /* write fd */
+
+    code_emit(code, a64_movz_x(16, 2, 0));             /* fork */
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_cmp_reg_x(R0, 31));
+    int32_t child_branch = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    int32_t fork_fail = code->count;
+    code_emit(code, a64_bcond(0, COND_LT));
+    code_emit(code, a64_add_imm(12, R0, 0, true));     /* pid */
+
+    code_emit(code, a64_add_imm(R0, 10, 0, true));     /* parent close write */
+    code_emit(code, a64_movz_x(16, 6, 0));
+    code_emit(code, a64_svc(0x80));
+
+    int32_t read_loop = code->count;
+    code_emit(code, a64_cmp_reg_x(27, 28));
+    int32_t read_full = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+    code_emit(code, a64_add_reg_x(R1, 26, 27));
+    code_emit(code, a64_sub_reg_x(R2, 28, 27));
+    int32_t read_call_jump = code->count;
+    code_emit(code, a64_b(0));
+    int32_t read_full_label = code->count;
+    a64_patch_bcond(code, read_full, read_full_label);
+    code_emit(code, a64_add_imm(R1, 11, 0, true));
+    code_emit(code, a64_movz_x(R2, 4096, 0));
+    int32_t read_call = code->count;
+    a64_patch_b(code, read_call_jump, read_call);
+    code_emit(code, a64_add_imm(R0, 9, 0, true));
+    code_emit(code, a64_movz_x(16, 3, 0));
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_cmp_reg_x(R0, 31));
+    int32_t read_done = code->count;
+    code_emit(code, a64_bcond(0, COND_LE));
+    code_emit(code, a64_cmp_reg_x(27, 28));
+    int32_t discard_read = code->count;
+    code_emit(code, a64_bcond(0, COND_GE));
+    code_emit(code, a64_add_reg_x(27, 27, R0));
+    a64_patch_bcond(code, discard_read, code->count);
+    code_emit(code, a64_b(read_loop - code->count));
+    int32_t read_done_label = code->count;
+    a64_patch_bcond(code, read_done, read_done_label);
+
+    code_emit(code, a64_add_imm(R0, 9, 0, true));      /* parent close read */
+    code_emit(code, a64_movz_x(16, 6, 0));
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_add_reg_x(4, 26, 27));         /* terminate capture */
+    code_emit(code, a64_movz(5, 0, 0));
+    code_emit(code, a64_strb_imm(5, 4, 0));
+
+    code_emit(code, a64_add_imm(R0, 12, 0, true));     /* wait4(pid, scratch, 0, 0) */
+    code_emit(code, a64_add_imm(R1, 11, 0, true));
+    code_emit(code, a64_movz_x(R2, 0, 0));
+    code_emit(code, a64_movz_x(R3, 0, 0));
+    code_emit(code, a64_movz_x(16, 7, 0));
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_cmp_reg_x(R0, 31));
+    int32_t wait_fail = code->count;
+    code_emit(code, a64_bcond(0, COND_LT));
+    code_emit(code, a64_ldr_imm(4, 11, 0, false));     /* status */
+    code_emit(code, a64_movz(5, 0x7f, 0));
+    code_emit(code, a64_and_reg(6, 4, 5));             /* signal bits */
+    code_emit(code, a64_cmp_imm(6, 0));
+    int32_t signaled = code->count;
+    code_emit(code, a64_bcond(0, COND_NE));
+    code_emit(code, a64_lsr_imm(7, 4, 8, false));
+    code_emit(code, a64_movz(5, 0xff, 0));
+    code_emit(code, a64_and_reg(7, 7, 5));
+    int32_t exit_ready_jump = code->count;
+    code_emit(code, a64_b(0));
+    int32_t signaled_label = code->count;
+    a64_patch_bcond(code, signaled, signaled_label);
+    code_emit(code, a64_add_imm(7, 6, 128, false));
+    int32_t exit_ready = code->count;
+    a64_patch_b(code, exit_ready_jump, exit_ready);
+    code_emit(code, a64_add_imm(SP, SP, 64, true));
+    codegen_store_exec_result(code, body, dst, output_offset, 26, 27, exit_offset, 7);
+    int32_t done_jump = code->count;
+    code_emit(code, a64_b(0));
+
+    int32_t wait_fail_label = code->count;
+    a64_patch_bcond(code, wait_fail, wait_fail_label);
+    code_emit(code, a64_add_imm(SP, SP, 64, true));
+    codegen_store_exec_failure(code, body, dst, output_offset, exit_offset);
+    int32_t fail_done_jump = code->count;
+    code_emit(code, a64_b(0));
+
+    int32_t child_label = code->count;
+    a64_patch_bcond(code, child_branch, child_label);
+    code_emit(code, a64_add_imm(R0, 9, 0, true));      /* child close read */
+    code_emit(code, a64_movz_x(16, 6, 0));
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_add_imm(R0, 10, 0, true));     /* dup2(write, stdout) */
+    code_emit(code, a64_movz_x(R1, 1, 0));
+    code_emit(code, a64_movz_x(16, 90, 0));
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_cmp_imm(13, 0));
+    int32_t skip_stderr_dup = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    code_emit(code, a64_add_imm(R0, 10, 0, true));     /* dup2(write, stderr) */
+    code_emit(code, a64_movz_x(R1, 2, 0));
+    code_emit(code, a64_movz_x(16, 90, 0));
+    code_emit(code, a64_svc(0x80));
+    a64_patch_bcond(code, skip_stderr_dup, code->count);
+    code_emit(code, a64_add_imm(R0, 10, 0, true));     /* child close write */
+    code_emit(code, a64_movz_x(16, 6, 0));
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_cmp_imm(23, 0));
+    int32_t skip_chdir = code->count;
+    code_emit(code, a64_bcond(0, COND_EQ));
+    code_emit(code, a64_add_imm(R0, 22, 0, true));
+    code_emit(code, a64_movz_x(16, 12, 0));
+    code_emit(code, a64_svc(0x80));
+    a64_patch_bcond(code, skip_chdir, code->count);
+    code_emit(code, a64_str_imm(24, SP, 16, true));
+    code_emit(code, a64_str_imm(25, SP, 24, true));
+    code_emit(code, a64_str_imm(21, SP, 32, true));
+    code_emit(code, a64_str_imm(31, SP, 40, true));
+    code_emit(code, a64_add_imm(R0, 24, 0, true));
+    code_emit(code, a64_add_imm(R1, SP, 16, true));
+    code_emit(code, a64_movz_x(R2, 0, 0));
+    code_emit(code, a64_movz_x(16, 59, 0));
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_movz_x(R0, 127, 0));
+    code_emit(code, a64_movz_x(16, 1, 0));
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_brk(119));
+
+    int32_t fork_fail_label = code->count;
+    a64_patch_bcond(code, fork_fail, fork_fail_label);
+    code_emit(code, a64_add_imm(R0, 9, 0, true));
+    code_emit(code, a64_movz_x(16, 6, 0));
+    code_emit(code, a64_svc(0x80));
+    code_emit(code, a64_add_imm(R0, 10, 0, true));
+    code_emit(code, a64_movz_x(16, 6, 0));
+    code_emit(code, a64_svc(0x80));
+
+    int32_t pipe_fail_label = code->count;
+    a64_patch_bcond(code, pipe_fail, pipe_fail_label);
+    code_emit(code, a64_add_imm(SP, SP, 64, true));
+    codegen_store_exec_failure(code, body, dst, output_offset, exit_offset);
+    int32_t fail2_done_jump = code->count;
+    code_emit(code, a64_b(0));
+
+    int32_t done_label = code->count;
+    a64_patch_b(code, done_jump, done_label);
+    a64_patch_b(code, fail_done_jump, done_label);
+    a64_patch_b(code, fail2_done_jump, done_label);
+}
+
 static void codegen_shell_quote(Code *code, BodyIR *body, int32_t dst,
                                 int32_t text_slot) {
     codegen_load_str_pair(code, body, text_slot, 6, 7);
@@ -16557,6 +16782,8 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         codegen_str_strip(code, body, dst, a);
     } else if (kind == BODY_OP_SHELL_QUOTE) {
         codegen_shell_quote(code, body, dst, a);
+    } else if (kind == BODY_OP_EXEC_SHELL) {
+        codegen_exec_shell(code, body, dst, a, b, c);
     } else if (kind == BODY_OP_STR_SLICE) {
         codegen_str_slice(code, body, dst, a, b, c);
     } else if (kind == BODY_OP_TEXT_SET_INIT) {
