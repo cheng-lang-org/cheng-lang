@@ -114,6 +114,10 @@ W long cheng_os_file_size_bridge(const char* p) { struct stat st; return stat(p,
 W int driver_c_create_dir_all_bridge(const char* p) { return mkdir(p,0755); }
 W int driver_c_write_text_file_bridge(const char* p, const char* c) { FILE* f=fopen(p,"w"); if(!f)return 0; fputs(c,f); fclose(f); return 1; }
 W char* cheng_read_file_bridge(const char* p) { static char buf[65536]; FILE* f=fopen(p,"r"); if(!f)return 0; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f); buf[n]=0; return buf; }
+/* Additional symbols needed by std/atomic and cold-compiled primary */
+W void echo(const char* s) { puts(s); }
+W void* c_malloc(size_t sz) { return malloc(sz); }
+W void atomicPanicRaw(const char* msg) { cheng_panic_cstring_and_exit(msg); }
 /* Atomic bridge functions for std/atomic provider.
    These use GCC __atomic builtins which generate proper ARM64 atomic instructions
    (ldar/stlr/ldaxr/stlxr) matching the cold compiler's inline codegen. */
