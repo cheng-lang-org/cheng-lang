@@ -5726,6 +5726,7 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (is_var && (span_eq(type, "str") || span_eq(type, "cstring"))) return SLOT_STR_REF;
     if (is_var && cold_parse_i32_seq_type(type)) return SLOT_SEQ_I32_REF;
     if (is_var && cold_parse_str_seq_type(type)) return SLOT_SEQ_STR_REF;
+    if (is_var && cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE_REF;
     if (is_var && symbols && symbols_resolve_object(symbols, type)) return SLOT_OBJECT_REF;
     if (is_var && cold_type_has_qualified_name(type)) return SLOT_OPAQUE_REF;
     if (cold_parse_i32_array_type(type, &array_len)) return SLOT_ARRAY_I32;
@@ -5762,7 +5763,8 @@ static int32_t cold_slot_size_from_type_with_symbols(Symbols *symbols, Span type
     int32_t array_len = 0;
     if (kind == SLOT_I32_REF || kind == SLOT_I64_REF ||
         kind == SLOT_SEQ_I32_REF || kind == SLOT_OBJECT_REF ||
-        kind == SLOT_STR_REF || kind == SLOT_SEQ_STR_REF || kind == SLOT_OPAQUE_REF) return 8;
+        kind == SLOT_STR_REF || kind == SLOT_SEQ_STR_REF ||
+        kind == SLOT_SEQ_OPAQUE_REF || kind == SLOT_OPAQUE_REF) return 8;
     if (kind == SLOT_ARRAY_I32) {
         int32_t elem_size = 4;
         if (cold_span_starts_with(span_trim(type), "uint8[")) {
@@ -10961,6 +10963,22 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                 int32_t zero = body_slot(body, SLOT_I32, 4);
                 body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
                 return zero;
+            }
+            /* Opaque seq index: return ptr to element for field access */
+            if (*kind == SLOT_SEQ_OPAQUE) {
+                int32_t dst = body_slot(body, SLOT_PTR, 8);
+                int32_t index_slot = body_slot(body, SLOT_I32, 4);
+                if (span_is_i32(index)) {
+                    body_op(body, BODY_OP_I32_CONST, index_slot, span_i32(index), 0);
+                } else {
+                    Parser index_parser = {index, 0, parser->arena, parser->symbols};
+                    int32_t ik = SLOT_I32;
+                    index_slot = parse_expr(&index_parser, body, locals, &ik);
+                }
+                int32_t elem_size = body->slot_size[slot] > 0 ? body->slot_size[slot] : 16;
+                body_op3(body, BODY_OP_SEQ_OPAQUE_INDEX, dst, slot, index_slot, elem_size);
+                *kind = SLOT_PTR;
+                return dst;
             }
             int32_t dst = body_slot(body, SLOT_I32, 4);
             if (span_is_i32(index)) {
