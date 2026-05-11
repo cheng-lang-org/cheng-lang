@@ -5842,7 +5842,7 @@ static int32_t cold_return_kind_from_span(Symbols *symbols, Span ret) {
     if (cold_parse_str_seq_type(ret)) return SLOT_SEQ_STR;
     if (cold_parse_opaque_seq_type(ret)) return SLOT_SEQ_OPAQUE;
     TypeDef *known_type = symbols_resolve_type(symbols, ret);
-    if (known_type) return known_type->is_enum ? SLOT_I32 : SLOT_VARIANT;
+    if (known_type) return SLOT_VARIANT;
     ObjectDef *ret_obj = symbols_resolve_object(symbols, ret);
     if (ret_obj) return ret_obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
     if (span_eq(ret, "ptr")) return SLOT_OPAQUE;
