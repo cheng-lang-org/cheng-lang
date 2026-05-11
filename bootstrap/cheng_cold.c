@@ -8810,6 +8810,39 @@ static bool cold_name_is_write_line(Span name) {
            span_eq(name, "os.writeLine") || span_eq(name, "writeLine");
 }
 
+static bool cold_name_is_param_count(Span name) {
+    return span_eq(name, "BackendDriverDispatchMinParamCountBridge") ||
+           span_eq(name, "paramCount") ||
+           span_eq(name, "ParamCount") ||
+           span_eq(name, "cmdline.paramCount") ||
+           span_eq(name, "cmdline.ParamCount") ||
+           span_eq(name, "__cheng_rt_paramCount") ||
+           span_eq(name, "cmdline.__cheng_rt_paramCount");
+}
+
+static bool cold_name_is_param_str(Span name) {
+    return span_eq(name, "BackendDriverDispatchMinParamStrRawBridge") ||
+           span_eq(name, "__cheng_rt_paramStr") ||
+           span_eq(name, "__cheng_rt_paramStrCopyBridge") ||
+           span_eq(name, "ParamStr") ||
+           span_eq(name, "paramStr") ||
+           span_eq(name, "cmdline.ParamStr") ||
+           span_eq(name, "cmdline.paramStr") ||
+           span_eq(name, "cmdline.__cheng_rt_paramStr") ||
+           span_eq(name, "cmdline.__cheng_rt_paramStrCopyBridge");
+}
+
+static bool cold_name_is_read_flag_or_default(Span name) {
+    return span_eq(name, "BackendDriverDispatchMinReadFlagOrDefaultBridge") ||
+           span_eq(name, "BackendDriverDispatchMinReadFlagOrDefault") ||
+           span_eq(name, "driverReadFlagOrDefault") ||
+           span_eq(name, "cmdline.driverReadFlagOrDefault") ||
+           span_eq(name, "ReadFlagOrDefault") ||
+           span_eq(name, "readFlagOrDefault") ||
+           span_eq(name, "cmdline.ReadFlagOrDefault") ||
+           span_eq(name, "cmdline.readFlagOrDefault");
+}
+
 static int32_t cold_make_i32_const_slot(BodyIR *body, int32_t value);
 static int32_t cold_make_str_literal_cstr_slot(BodyIR *body, const char *text);
 static int32_t cold_require_str_value(BodyIR *body, int32_t slot, const char *context);
@@ -8848,8 +8881,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
-    if (span_eq(name, "BackendDriverDispatchMinParamCountBridge") ||
-        span_eq(name, "paramCount")) {
+    if (cold_name_is_param_count(name)) {
         if (arg_count != 0) die("paramCount intrinsic arity mismatch");
         int32_t slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_ARGC_LOAD, slot, 0, 0);
@@ -8893,8 +8925,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
-    if (span_eq(name, "BackendDriverDispatchMinReadFlagOrDefaultBridge") ||
-        span_eq(name, "BackendDriverDispatchMinReadFlagOrDefault")) {
+    if (cold_name_is_read_flag_or_default(name)) {
         if (arg_count != 2) die("ReadFlagOrDefault intrinsic arity mismatch");
         int32_t key = body->call_arg_slot[arg_start];
         int32_t default_value = body->call_arg_slot[arg_start + 1];
@@ -9034,9 +9065,7 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
-    if (span_eq(name, "BackendDriverDispatchMinParamStrRawBridge") ||
-        span_eq(name, "__cheng_rt_paramStr") ||
-        span_eq(name, "__cheng_rt_paramStrCopyBridge")) {
+    if (cold_name_is_param_str(name)) {
         if (arg_count != 1) die("paramStr intrinsic arity mismatch");
         int32_t index_slot = body->call_arg_slot[arg_start];
         if (body->slot_kind[index_slot] != SLOT_I32) die("paramStr index must be int32");
@@ -11539,23 +11568,6 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
     /* Str field assignment: use known offsets (data=0, len=8, store_id=12, flags=16) */
     if (local->kind == SLOT_STR) {
         if (!parser_take(parser, "=")) die("expected = in str field assignment");
-        int32_t value_kind = SLOT_I32;
-        int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
-        int32_t off = -1;
-        if (span_eq(field_name, "data")) off = COLD_STR_DATA_OFFSET;
-        else if (span_eq(field_name, "len")) off = COLD_STR_LEN_OFFSET;
-        else if (span_eq(field_name, "store_id")) off = COLD_STR_STORE_ID_OFFSET;
-        else if (span_eq(field_name, "flags")) off = COLD_STR_FLAGS_OFFSET;
-        if (off < 0) die("unknown str field");
-        if (off == COLD_STR_DATA_OFFSET)
-            body_op3(body, BODY_OP_SLOT_STORE_I64, local->slot, value_slot, off, 0);
-        else
-            body_op3(body, BODY_OP_SLOT_STORE_I32, local->slot, value_slot, off, 0);
-        return block;
-    }
-    /* Str field assignment: use known offsets */
-    if (local->kind == SLOT_STR) {
-        if (!parser_take(parser, "=")) die("expected =");
         int32_t value_kind = SLOT_I32;
         int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
         int32_t off = -1;
@@ -14529,6 +14541,7 @@ static void a64_emit_str_sp_off(Code *code, int rt, int32_t offset, bool x64) {
 static void emit_epilogue(Code *code, int32_t frame_size) {
     if (frame_size > 0) a64_emit_add_large(code, SP, SP, frame_size, true);
     code_emit(code, a64_ldp_post(FP, LR, SP, 16));
+    code_emit(code, a64_ldp_post(19, 20, SP, 16));
     code_emit(code, a64_ret());
 }
 
@@ -17730,12 +17743,6 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_SLOT_STORE_I64) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + c, true);
-    } else if (kind == BODY_OP_SLOT_STORE_I32) {
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
-        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + c, false);
-    } else if (kind == BODY_OP_SLOT_STORE_I64) {
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
-        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + c, true);
     } else if (kind == BODY_OP_PTR_STORE_I64) {
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[dst], true);
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
@@ -17889,6 +17896,7 @@ static void codegen_func(Code *code, BodyIR *body, Symbols *symbols,
                          FunctionPatchList *function_patches) {
     na_reset();
     int32_t frame_size = align_i32(body->frame_size, 16);
+    code_emit(code, a64_stp_pre(19, 20, SP, -16));
     code_emit(code, a64_stp_pre(FP, LR, SP, -16));
     code_emit(code, a64_add_imm(FP, SP, 0, true));
     if (frame_size > 0) a64_emit_sub_large(code, SP, SP, frame_size, true);
@@ -18011,6 +18019,8 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
     FunctionPatchList function_patches = {0};
     function_patches.arena = code->arena;
 
+    /* The Mach-O entry starts at this trampoline; function calls to the entry
+       symbol must still target the real body below. */
     code_emit(code, a64_add_imm(19, R0, 0, true));
     code_emit(code, a64_add_imm(20, R1, 0, true));
     code_emit(code, a64_add_imm(21, LR, 0, true));
@@ -18020,7 +18030,9 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
     code_emit(code, a64_add_imm(LR, 21, 0, true));
     code_emit(code, a64_ret());
 
-    function_pos[entry_function] = code->count;
+    /* Real entry function body starts here */
+    int32_t entry_body_pos = code->count;
+    function_pos[entry_function] = entry_body_pos;
     if (cold_diag_dump_per_fn || cold_diag_dump_slots) {
         fprintf(stderr, "[diag] entry fn ");
         cold_diag_fn_name(symbols->functions[entry_function].name);
@@ -18040,6 +18052,8 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             codegen_func(code, entry_body, symbols, &function_patches);
         }
     }
+    /* Patch trampoline BL to jump to real entry body */
+    code->words[entry_call_pos] = a64_bl(entry_body_pos - entry_call_pos);
     if (cold_diag_dump_per_fn || cold_diag_dump_slots) {
         fprintf(stderr, "[diag] entry fn ");
         cold_diag_fn_name(symbols->functions[entry_function].name);
@@ -19659,6 +19673,16 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     FunctionPatchList function_patches = {0};
     function_patches.arena = arena;
 
+    /* Entry trampoline: save argc/argv in callee-saved registers */
+    int32_t trampoline_bl_pos = shared->count + 4;
+    code_emit(shared, a64_add_imm(19, R0, 0, true));
+    code_emit(shared, a64_add_imm(20, R1, 0, true));
+    code_emit(shared, a64_add_imm(21, LR, 0, true));
+    code_emit(shared, a64_add_imm(22, R2, 0, true));
+    code_emit(shared, a64_bl(0));
+    code_emit(shared, a64_add_imm(LR, 21, 0, true));
+    code_emit(shared, a64_ret());
+
     /* Build map of emitted base names to prevent code duplication */
     bool *name_seen = arena_alloc(arena, (size_t)func_count * sizeof(bool));
     for (int32_t i = 0; i < func_count; i++) name_seen[i] = false;
@@ -19712,6 +19736,12 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
                                    ((uint32_t)delta & 0x03FFFFFFu);
     }
 
+    /* Patch entry trampoline BL to jump to main function body */
+    if (main_function >= 0 && symbol_offset[main_function] >= 0) {
+        int32_t target = symbol_offset[main_function];
+        shared->words[trampoline_bl_pos] = a64_bl(target - trampoline_bl_pos);
+    }
+
     /* Build name/offset arrays for macho_write_object */
     const char **func_names = arena_alloc(arena, (size_t)func_count * sizeof(const char *));
     int32_t *func_offsets = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
@@ -19727,7 +19757,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
         if (dup) continue;
         if (nm.len==8 && memcmp(nm.ptr,"ParamStr",8)==0) fprintf(stderr, "[cold_name] ParamStr from sym[%d] off=%d\n", i, symbol_offset[i]);
-        func_offsets[name_count] = symbol_offset[i];
+        /* Entry function uses trampoline offset (0) instead of body offset */
+        func_offsets[name_count] = (i == main_function) ? 0 : symbol_offset[i];
         if (getenv("CHENG_RENAME_MAIN") && nm.len == 4 && memcmp(nm.ptr, "main", 4) == 0) {
             char *nc = arena_alloc(arena, 26);
             memcpy(nc, "cheng_program_argv_entry", 25); nc[25] = '\0';

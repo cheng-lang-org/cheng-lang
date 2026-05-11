@@ -252,6 +252,10 @@ fn HostSmokeRunColdCsgSidecarSmoke(root: str,
     if !chengpath.FileExistsNonEmpty(root, src):
         HostSmokePrintErr(strutil.Join(["host smokes: missing source: ", src], ""))
         return 1
+    let matchSrc = chengpath.PathAbsolute(root, "src/tests/cold_csg_match_fixture.cheng")
+    if !chengpath.FileExistsNonEmpty(root, matchSrc):
+        HostSmokePrintErr(strutil.Join(["host smokes: missing source: ", matchSrc], ""))
+        return 1
     let outBin = os.JoinPath(outDir, smokeName)
     let factsPath = strutil.Join([outBin, ".cold.csg"], "")
     let reportPath = strutil.Join([outBin, ".compile.report.txt"], "")
@@ -263,6 +267,14 @@ fn HostSmokeRunColdCsgSidecarSmoke(root: str,
     let coldReport = strutil.Join([coldOut, ".report.txt"], "")
     let coldCompileLog = strutil.Join([coldOut, ".compile.log"], "")
     let coldRunLog = strutil.Join([coldOut, ".run.log"], "")
+    let matchBin = os.JoinPath(outDir, "cold_csg_match_smoke")
+    let matchFactsPath = strutil.Join([matchBin, ".cold.csg"], "")
+    let matchReportPath = strutil.Join([matchBin, ".compile.report.txt"], "")
+    let matchCompileLog = strutil.Join([matchBin, ".compile.log"], "")
+    let matchColdOut = strutil.Join([matchBin, ".from_facts"], "")
+    let matchColdReport = strutil.Join([matchColdOut, ".report.txt"], "")
+    let matchColdCompileLog = strutil.Join([matchColdOut, ".compile.log"], "")
+    let matchColdRunLog = strutil.Join([matchColdOut, ".run.log"], "")
     let paths: str[] = [
         outBin,
         factsPath,
@@ -276,7 +288,17 @@ fn HostSmokeRunColdCsgSidecarSmoke(root: str,
         coldCompileLog,
         coldRunLog,
         strutil.Join([outBin, ".map"], ""),
-        strutil.Join([coldOut, ".map"], "")
+        strutil.Join([coldOut, ".map"], ""),
+        matchBin,
+        matchFactsPath,
+        matchReportPath,
+        matchCompileLog,
+        matchColdOut,
+        matchColdReport,
+        matchColdCompileLog,
+        matchColdRunLog,
+        strutil.Join([matchBin, ".map"], ""),
+        strutil.Join([matchColdOut, ".map"], "")
     ]
     for i in 0..<paths.len:
         if chengpath.PathFileExists(paths[i]):
@@ -375,6 +397,70 @@ fn HostSmokeRunColdCsgSidecarSmoke(root: str,
     if !HostSmokeExpectContains(smokeName, coldReportText, "cold_compile_elapsed_ms="):
         return 1
     if !HostSmokeExpectNotContains(smokeName, coldReportText, "elapsed_us"):
+        return 1
+    let matchCompile = hostops.RunFileLogged(root,
+                                             "host_smokes_compile_cold_csg_match_sidecar",
+                                             compiler,
+                                             [
+                                                 "system-link-exec",
+                                                 "--root", root,
+                                                 "--in", matchSrc,
+                                                 "--emit", "exe",
+                                                 "--target", "arm64-apple-darwin",
+                                                 "--out", matchBin,
+                                                 "--report-out", matchReportPath,
+                                                 "--cold-csg-out", matchFactsPath
+                                             ],
+                                             HostSmokeCompileEnv(),
+                                             root,
+                                             300,
+                                             matchCompileLog)
+    if !hostops.LoggedRunOk(matchCompile):
+        HostSmokePrintErr(strutil.Join(["host smokes: cold csg match compile failed: ", hostops.LoggedRunSummary(matchCompile)], ""))
+        return matchCompile.exitCode
+    if !chengpath.FileExistsNonEmpty(root, matchFactsPath):
+        HostSmokePrintErr(strutil.Join(["host smokes: cold csg match missing facts: ", matchFactsPath], ""))
+        return 1
+    let matchFacts = chengpath.ReadTextFile(root, matchFactsPath)
+    if !HostSmokeExpectContains(smokeName, matchFacts, "cold_csg_type\tOption\tSome:1:i:T,None:0\tT"):
+        return 1
+    if !HostSmokeExpectContains(smokeName, matchFacts, "cold_csg_stmt\t0\t4\tmatch\tresult"):
+        return 1
+    if !HostSmokeExpectContains(smokeName, matchFacts, "cold_csg_stmt\t0\t8\tcase\tSome\tvalue"):
+        return 1
+    if !HostSmokeExpectContains(smokeName, matchFacts, "cold_csg_stmt\t0\t8\tcase\tNone\t"):
+        return 1
+    let matchColdCompile = hostops.RunFileLogged(root,
+                                                 "host_smokes_compile_cold_csg_match_facts",
+                                                 coldCompiler,
+                                                 [
+                                                     "system-link-exec",
+                                                     strutil.Join(["--csg-in:", matchFactsPath], ""),
+                                                     strutil.Join(["--out:", matchColdOut], ""),
+                                                     strutil.Join(["--report-out:", matchColdReport], "")
+                                                 ],
+                                                 [],
+                                                 root,
+                                                 30,
+                                                 matchColdCompileLog)
+    if !hostops.LoggedRunOk(matchColdCompile):
+        HostSmokePrintErr(strutil.Join(["host smokes: cold csg match facts compile failed: ", hostops.LoggedRunSummary(matchColdCompile)], ""))
+        return matchColdCompile.exitCode
+    let matchColdRun = hostops.RunFileLogged(root,
+                                             "host_smokes_run_cold_csg_match_facts",
+                                             matchColdOut,
+                                             [],
+                                             [],
+                                             root,
+                                             30,
+                                             matchColdRunLog)
+    if matchColdRun.exitCode != 7:
+        HostSmokePrintErr(strutil.Join(["host smokes: cold csg match facts executable exit mismatch: ", hostops.LoggedRunSummary(matchColdRun)], ""))
+        return 1
+    let matchColdReportText = chengpath.ReadTextFile(root, matchColdReport)
+    if !HostSmokeExpectContains(smokeName, matchColdReportText, "cold_csg_lowering=1"):
+        return 1
+    if !HostSmokeExpectContains(smokeName, matchColdReportText, "cold_body_switch_count="):
         return 1
     HostSmokePrintLine(" cold_csg_sidecar_smoke ok")
     return 0
