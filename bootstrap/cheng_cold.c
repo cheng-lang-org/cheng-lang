@@ -5731,7 +5731,7 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (known_enum) return SLOT_I32;
     if (span_eq(type, "v")) return SLOT_VARIANT;
     if (span_eq(type, "o")) return SLOT_OPAQUE;
-    if (span_eq(type, "ptr")) return SLOT_OPAQUE;
+    if (span_eq(type, "ptr")) return SLOT_PTR;
     if (symbols) {
         ObjectDef *obj = symbols_resolve_object(symbols, type);
         if (obj) return obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
@@ -6239,6 +6239,7 @@ static int32_t cold_param_size_from_type(Symbols *symbols, Span type, int32_t ki
     if (kind == SLOT_I32_REF || kind == SLOT_I64_REF ||
         kind == SLOT_SEQ_I32_REF || kind == SLOT_OBJECT_REF ||
         kind == SLOT_STR_REF || kind == SLOT_SEQ_STR_REF ||
+        kind == SLOT_PTR ||
         kind == SLOT_OPAQUE || kind == SLOT_OPAQUE_REF) return 8;
     if (kind == SLOT_OBJECT) return symbols ? symbols_object_slot_size(symbols_resolve_object(symbols, type)) : 0;
     if (kind == SLOT_ARRAY_I32) return cold_slot_size_from_type_with_symbols(symbols, type, kind);
@@ -19058,7 +19059,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     FunctionPatchList function_patches = {0};
     function_patches.arena = arena;
 
-    /* Build map of emitted base names (gated by CHENG_BODY_DEDUP) */
+    /* Build map of emitted base names to prevent code duplication */
     bool *name_seen = NULL;
     if (getenv("CHENG_BODY_DEDUP")) {
         name_seen = arena_alloc(arena, (size_t)func_count * sizeof(bool));
@@ -19075,9 +19076,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         for (int32_t k = nm.len - 1; k > 0; k--) {
             if (nm.ptr[k] == '.' || nm.ptr[k] == ':') { base = nm.ptr + k + 1; base_len = nm.len - k - 1; break; }
         }
-        /* Check if this base name already emitted (gated) */
+        /* Check if this base name already emitted */
         bool dup = false;
-        if (name_seen) {
         for (int32_t j = 0; j < i; j++) {
             if (!name_seen[j] || !function_bodies[j]) continue;
             Span prev = symbols->functions[j].name;
@@ -19088,9 +19088,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             }
             if (pbl == base_len && memcmp(pb, base, (size_t)base_len) == 0) { dup = true; break; }
         }
-        } /* if (name_seen) */
         if (dup) { fprintf(stderr, "[cold_body] skip dup: %.*s\n", (int)nm.len, nm.ptr); continue; }
-        if (name_seen) name_seen[i] = true;
+        name_seen[i] = true;
         symbol_offset[i] = shared->count;
         BodyIR *fn_body = function_bodies[i];
         if (fn_body->has_fallback || fn_body->block_count == 0 ||
