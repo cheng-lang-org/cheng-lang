@@ -19212,14 +19212,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     for (int32_t i = 0; i < func_count; i++) ext_map[i] = -1;
     for (int32_t i = 0; i < func_count; i++) {
         if (symbol_offset[i] < 0) continue;
+        if (symbols->functions[i].name.len >= 26 && memcmp(symbols->functions[i].name.ptr, "BackendDriverDispatchMinEmit", 26) == 0) fprintf(stderr, "[cold_sym] EMIT: %.*s off=%d\n", (int)symbols->functions[i].name.len, symbols->functions[i].name.ptr, symbol_offset[i]);
         Span nm = symbols->functions[i].name;
-        /* Dedup: skip if this name already in table (first definition wins) */
-        bool dup = false;
-        for (int32_t j = 0; j < name_count; j++) {
-            if (func_names[j] && (int32_t)strlen(func_names[j]) == nm.len &&
-                memcmp(func_names[j], nm.ptr, (size_t)nm.len) == 0) { dup = true; break; }
-        }
-        if (dup) continue;
         func_offsets[name_count] = symbol_offset[i];
         const char *name_ptr = (const char *)nm.ptr;
         int32_t name_len = nm.len;
@@ -19254,8 +19248,9 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         if (mapped >= 0) reloc_symbols[ri] = mapped;
     }
 
-    /* Only first symbol (cheng_program_argv_entry) is global; rest are local */
-    int32_t global_count = (name_count > 0) ? 1 : 0;
+    /* Provider mode: all symbols global. Primary mode (CHENG_NO_IMPORT_BODIES): only _main global. */
+    int32_t global_count = getenv("CHENG_NO_IMPORT_BODIES") ? 1 : name_count;
+    if (global_count < 1 && name_count > 0) global_count = 1;
     bool ok = macho_write_object(out_path, shared->words, shared->count,
                                  func_names, func_offsets, name_count, global_count,
                                  reloc_offsets, reloc_symbols, reloc_count);
