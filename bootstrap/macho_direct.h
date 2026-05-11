@@ -335,7 +335,7 @@ static bool macho_write_object(const char *path,
     for (int32_t i = 0; i < nsyms; i++) {
         syms[i].n_strx  = name_stroff[i];
         if (offsets[i] >= 0) {
-            syms[i].n_type  = (uint8_t)(i < local_count ? N_SECT : (N_SECT | N_EXT));
+            syms[i].n_type  = (uint8_t)((i < local_count) ? (N_SECT | N_EXT) : N_SECT);
             syms[i].n_sect  = 1;
             syms[i].n_desc  = 0;
             syms[i].n_value = (uint64_t)(offsets[i] * 4);
@@ -350,8 +350,9 @@ static bool macho_write_object(const char *path,
 
     /* Build relocation entries: ARM64_RELOC_BRANCH26 */
     int32_t reloc_sz = reloc_count * 8;
-    struct { int32_t r_address; uint32_t r_info; } *relocs =
-        (void *)calloc(reloc_count > 0 ? reloc_count : 1, 8);
+    typedef struct { int32_t r_address; uint32_t r_info; } ColdReloc;
+    ColdReloc *relocs = (ColdReloc *)malloc(256);
+    if (relocs) memset(relocs, 0, 256);
     if (!relocs) {
         free(strtab);
         free(name_stroff);
