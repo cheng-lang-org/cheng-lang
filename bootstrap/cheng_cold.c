@@ -19447,12 +19447,17 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
     const char *source_path = cold_flag_value(argc, argv, "--in");
     const char *csg_in_path = cold_flag_value(argc, argv, "--csg-in");
     const char *csg_out_path = cold_flag_value(argc, argv, "--csg-out");
+    const char *cold_csg_out_path = cold_flag_value(argc, argv, "--cold-csg-out");
     const char *out_path = cold_flag_value(argc, argv, "--out");
     const char *report_path = cold_flag_value(argc, argv, "--report-out");
     const char *target = cold_flag_value(argc, argv, "--target");
     const char *emit = cold_flag_value(argc, argv, "--emit");
     if (!target || target[0] == '\0') target = "arm64-apple-darwin";
     if (!emit || emit[0] == '\0') emit = "exe";
+    if ((!csg_out_path || csg_out_path[0] == '\0') &&
+        cold_csg_out_path && cold_csg_out_path[0] != '\0') {
+        csg_out_path = cold_csg_out_path;
+    }
     const char *effective_csg_path = csg_in_path;
 
     /* Parse diagnostic flags */
