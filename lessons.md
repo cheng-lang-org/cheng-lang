@@ -64,6 +64,15 @@
 - cold 报告必须记录最大函数帧；`cold_max_frame_size` 进入 4KB 以上后，ARM64 prologue、local address、load/store offset 都必须补大立即数编码，不能继续依赖单条 imm12。
 - cold materializer 写 object field 前必须做 slot 边界检查；字段布局越界要在冷编译阶段 hard-fail，不能让生成物运行时污染相邻 slot。
 - 用户已有代码不删；不确定归属的分支/函数只做旁路修复或严格检查，不能为收敛路线图直接移除。
+- 冷编译器符号/类型解析禁止后缀兜底；import 类型必须先显式 alias 规范化，查找只允许精确命中，缺失 hard-fail。
+- cold 未声明函数调用禁止自动注册 external；C ABI 必须有显式签名，`cstring` 参数按单指针 ABI 传递并生成 NUL 结尾缓冲。
+- cold direct Mach-O import body 必须按入口可达调用图精确拉取；禁止 upfront 全量解析 import body，禁止 setjmp/skip-body/SEGFAULT 恢复把解析错误藏起来。
+- cold 普通 `emit=exe` 不能因源码存在 `import` 自动切到 provider/system linker；`--link-providers` 只能显式开启。
+- cold Mach-O object writer 禁止固定 128/256 符号或重定位截断；符号表/reloc 表必须按真实数量分配，越界直接失败。
+- cold import-mode 未解析调用必须 hard-fail；禁止返回 `0` slot 让不可达坏 body 或缺失签名假通过。
+- cold 生成版 backend driver 不能只验自身可执行存在；必须跑它自己的 `system-link-exec ordinary_zero/import_use`，并锁定 direct Mach-O、`provider_object_count=0`、`system_link=0`。
+- cold 生成版 backend driver 自编译覆盖必须推进到 `cold_subset_coverage`；该用例锁住算术、位运算、CFG、match、object、Result?、mmap、ptr load/store、文件 I/O 的 linkerless 子集。
+- cold 生成版 backend driver 的 `emit:obj` 必须由生成物产出 `.o`，再用 `cc` 链接并运行跨模块 fixture；report 同时锁 `emit=obj`、`direct_macho=1`、`provider_object_count=0`、`system_link=0`，否则仍可能把对象 writer 缺口藏在 exe 路径里。
 
 ## Resolved
 

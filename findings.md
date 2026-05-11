@@ -218,3 +218,15 @@
 - source-direct 导入加载不能混用旧 CSG type-row loader；旧 loader 不带 alias，会把 `result.ErrorInfo` 这类导入布局按短名写进全局 `ErrorInfo`，破坏 Result/Error intrinsic。添加/import 必须精确查找，resolve 才允许短名回退。
 - direct import body 编译后，linkerless image 不能全量 codegen 所有有 body 的导入函数；必须从入口 BodyIR call 图计算可达闭包，否则未被运行路径使用的 std/backend 函数会把冷端尚未支持的语义带入 codegen。
 - `setjmp` 恢复点必须从当前函数下一行继续找下一个 top-level decl；从函数起点调用 `cold_next_top_level_decl` 会回到同一个 `fn`，形成无限重试和 stderr/arena 膨胀。
+- provider/system linker 不能作为普通 `emit=exe` 的 import 兜底；是否链接 provider 必须由显式 `--link-providers` 决定，否则会把 linker 成功/失败和 linkerless codegen 正确性混在一起。
+- object writer 的固定符号/重定位表会制造顺序敏感 bug；Mach-O object 必须按真实 name/reloc 数动态分配，超范围直接失败，不能静默截断。
+- import-mode unresolved call 返回 0 slot 会把缺失签名伪装成常量路径；现在必须 hard-fail，再由入口可达闭包保证只解析真实需要的 imported body。
+- 生成版 `backend_driver_dispatch_min` 的真实进展必须由生成物再次编译源码证明；现在 `ordinary_zero` 与 `import_use` 已作为 self-linkerless 回归钉子进入 `tools/cold_regression_test.sh`。
+- `cold_subset_coverage` 已成为生成版 self-linkerless 的下一层门禁；它比 `ordinary_zero/import_use` 更接近冷编译器真实语义面，能暴露 ptr/mmap/file IO/variant/object/CFG 的生成物退化。
+- 未声明函数自动注册 external 会把真实 ABI 缺失伪装成可链接对象；例如未声明 `puts` 会按 `str` 双寄存器 ABI 调 libc，输出污染。冷路径必须要求显式 C ABI 签名，`cstring` 按单指针传参。
+- upfront import body 编译会把未可达函数的解析错误和 codegen 缺口带进主路径；正确边界是入口 body 先成图，然后只对缺失的可达 import 目标按 alias+签名精确编译。这个路径不能带 setjmp 恢复、SIGSEGV 兜底或 composite skip。
+
+## Generated backend emit obj
+
+- 生成版 `backend_driver_dispatch_min` 已能对 `src/tests/import_use.cheng` 执行 `system-link-exec --emit:obj`，产出 arm64 Mach-O object；该 object 经 `cc` 链接后运行 exit `3`。
+- 回归新增 `dispatch_min_self_emit_obj_cross` 和 `dispatch_min_self_emit_obj_direct`，同时锁 `emit=obj/direct_macho=1/provider_object_count=0/system_link=0`，对象 writer 现在由生成物自己证明。

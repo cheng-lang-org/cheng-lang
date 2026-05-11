@@ -20395,7 +20395,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     memset(function_bodies, 0, (size_t)body_cap * sizeof(BodyIR *));
 
     /* Import body compilation: skip if CHENG_NO_IMPORT_BODIES=1 */
-    if (!getenv("CHENG_NO_IMPORT_BODIES") && symbols->function_count < 512) {
+    if (!getenv("CHENG_NO_IMPORT_BODIES") && symbols->function_count < 4096) {
         ColdErrorRecoveryEnabled = true;
         if (setjmp(ColdErrorJumpBuf) == 0) {
             cold_compile_imported_bodies_no_recurse(symbols, mapped_source, function_bodies, body_cap);
