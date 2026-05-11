@@ -4622,9 +4622,6 @@ enum {
     BODY_OP_I32_FROM_F64 = 112,
     BODY_OP_FN_ADDR = 113,
     BODY_OP_CALL_PTR = 114,
-    BODY_OP_SELECT = 116,
-    BODY_OP_PTR_LOAD_U8 = 117,
-    BODY_OP_PTR_STORE_U8 = 118,
 };
 
 enum {
@@ -5944,7 +5941,6 @@ static int32_t cold_lower_question_result(Symbols *symbols, BodyIR *body, Locals
                                           Span bind_name, bool bind_value,
                                           int32_t declared_kind, Span declared_type) {
     TypeDef *type = cold_question_result_type(symbols, body, variant_slot);
-    if (!type) die("? requires Result variant value");
     Variant *ok_variant = &type->variants[0];
     Variant *err_variant = &type->variants[1];
     if (bind_value && ok_variant->field_count != 1) die("? binding requires Ok to carry exactly one payload");
@@ -8494,56 +8490,6 @@ static bool cold_is_scalar_identity_cast(Span token) {
            span_eq(token, "int64") || span_eq(token, "Int64");
 }
 
-static bool cold_is_field_access_token(Span token) {
-    return span_eq(token, ".") || span_eq(token, "->");
-}
-
-static Span cold_resolve_alias_target(Symbols *symbols, Span type) {
-    type = span_trim(type);
-    for (int32_t depth = 0; depth < 8; depth++) {
-        TypeAlias *alias = symbols_find_alias(symbols, type);
-        if (!alias) break;
-        type = span_trim(alias->target);
-    }
-    if (type.len > 1 && type.ptr[type.len - 1] == '*') {
-        type = span_trim(span_sub(type, 0, type.len - 1));
-    }
-    return type;
-}
-
-static bool cold_is_pointer_cast_token(Parser *parser, Span token) {
-    if (span_eq(token, "ptr")) return true;
-    return symbols_find_alias(parser ? parser->symbols : 0, token) != 0;
-}
-
-static bool cold_str_field_info(Span field_name, int32_t *offset, int32_t *kind, int32_t *size) {
-    if (span_eq(field_name, "data")) {
-        if (offset) *offset = COLD_STR_DATA_OFFSET;
-        if (kind) *kind = SLOT_PTR;
-        if (size) *size = 8;
-        return true;
-    }
-    if (span_eq(field_name, "len")) {
-        if (offset) *offset = COLD_STR_LEN_OFFSET;
-        if (kind) *kind = SLOT_I32;
-        if (size) *size = 4;
-        return true;
-    }
-    if (span_eq(field_name, "store_id") || span_eq(field_name, "storeId")) {
-        if (offset) *offset = COLD_STR_STORE_ID_OFFSET;
-        if (kind) *kind = SLOT_I32;
-        if (size) *size = 4;
-        return true;
-    }
-    if (span_eq(field_name, "flags")) {
-        if (offset) *offset = COLD_STR_FLAGS_OFFSET;
-        if (kind) *kind = SLOT_I32;
-        if (size) *size = 4;
-        return true;
-    }
-    return false;
-}
-
 static bool cold_is_i32_to_str_intrinsic(Span name) {
     return span_eq(name, "int64ToStr") || span_eq(name, "uint64ToStr") ||
            span_eq(name, "Int64ToStr") || span_eq(name, "Uint64ToStr") ||
@@ -10192,7 +10138,7 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
         int32_t value_slot = parse_expr(&arg_parser, body, locals, &value_kind);
         parser_ws(&arg_parser);
         if (arg_parser.pos != arg_parser.source.len) return 0; /* skip unsupported cast */;
-        if (value_kind == SLOT_I64 || value_kind == SLOT_PTR) {
+        if (value_kind == SLOT_I64) {
             *kind = SLOT_I64;
             return value_slot;
         }
@@ -10219,91 +10165,6 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
     if (!parser_take(parser, ")")) return 0; /* skip malformed cast */;
     *kind = SLOT_I32;
     return value_slot;
-}
-
-static int32_t parse_pointer_alias_cast(Parser *parser, BodyIR *body,
-                                        Locals *locals, Span cast_token,
-                                        int32_t *kind) {
-    if (!parser_take(parser, "(")) die("expected ( after pointer cast");
-    int32_t value_kind = SLOT_I32;
-    int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
-    if (!parser_take(parser, ")")) die("expected ) after pointer cast");
-
-    Span target_type = {0};
-    TypeAlias *alias = symbols_find_alias(parser->symbols, cast_token);
-    if (alias) target_type = cold_resolve_alias_target(parser->symbols, alias->target);
-
-    if (value_kind == SLOT_STR || value_kind == SLOT_STR_REF) {
-        int32_t dst = body_slot(body, SLOT_PTR, 8);
-        body_slot_set_type(body, dst, target_type);
-        body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, value_slot, COLD_STR_DATA_OFFSET, 8);
-        *kind = SLOT_PTR;
-        return dst;
-    }
-
-    int32_t dst = body_slot(body, SLOT_PTR, 8);
-    body_slot_set_type(body, dst, target_type);
-    if (value_kind == SLOT_I32) {
-        body_op(body, BODY_OP_I64_FROM_I32, dst, value_slot, 0);
-    } else if (value_kind == SLOT_I64 || value_kind == SLOT_PTR ||
-               value_kind == SLOT_OPAQUE || value_kind == SLOT_OPAQUE_REF ||
-               value_kind == SLOT_OBJECT_REF || value_kind == SLOT_STR_REF ||
-               value_kind == SLOT_SEQ_I32_REF || value_kind == SLOT_SEQ_STR_REF ||
-               value_kind == SLOT_I64_REF) {
-        body_op(body, BODY_OP_COPY_I64, dst, value_slot, 0);
-    } else {
-        die("pointer cast expects pointer-sized value");
-    }
-    *kind = SLOT_PTR;
-    return dst;
-}
-
-static int32_t cold_deref_pointer(Parser *parser, BodyIR *body,
-                                  int32_t ptr_slot, int32_t *kind) {
-    if (*kind != SLOT_PTR && *kind != SLOT_I64 && *kind != SLOT_OPAQUE &&
-        *kind != SLOT_OPAQUE_REF && *kind != SLOT_OBJECT_REF) {
-        die("dereference expects pointer value");
-    }
-    Span target = cold_resolve_alias_target(parser->symbols, body->slot_type[ptr_slot]);
-    if (span_eq(target, "uint8") || span_eq(target, "char")) {
-        int32_t dst = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_PTR_LOAD_U8, dst, ptr_slot, 0);
-        *kind = SLOT_I32;
-        return dst;
-    }
-    if (span_eq(target, "int64") || span_eq(target, "uint64")) {
-        int32_t dst = body_slot(body, SLOT_I64, 8);
-        body_op(body, BODY_OP_PTR_LOAD_I64, dst, ptr_slot, 0);
-        *kind = SLOT_I64;
-        return dst;
-    }
-    if (span_eq(target, "ptr") || symbols_find_alias(parser->symbols, target) ||
-        (target.len > 1 && target.ptr[target.len - 1] == '*')) {
-        int32_t dst = body_slot(body, SLOT_PTR, 8);
-        body_op(body, BODY_OP_PTR_LOAD_I64, dst, ptr_slot, 0);
-        body_slot_set_type(body, dst, cold_resolve_alias_target(parser->symbols, target));
-        *kind = SLOT_PTR;
-        return dst;
-    }
-    if (span_eq(target, "str") || span_eq(target, "cstring")) {
-        int32_t dst = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
-        body_slot_set_type(body, dst, target);
-        body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, ptr_slot, 0, COLD_STR_SLOT_SIZE);
-        *kind = SLOT_STR;
-        return dst;
-    }
-    ObjectDef *object = symbols_resolve_object(parser->symbols, target);
-    if (object) {
-        int32_t dst = body_slot(body, SLOT_OBJECT, object->slot_size);
-        body_slot_set_type(body, dst, target);
-        body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, ptr_slot, 0, object->slot_size);
-        *kind = SLOT_OBJECT;
-        return dst;
-    }
-    int32_t dst = body_slot(body, SLOT_I32, 4);
-    body_op(body, BODY_OP_PTR_LOAD_I32, dst, ptr_slot, 0);
-    *kind = SLOT_I32;
-    return dst;
 }
 
 static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
@@ -10341,19 +10202,6 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         *kind = SLOT_I32;
         return dst;
     }
-    if (span_eq(token, "*")) {
-        int32_t ptr_kind = SLOT_I32;
-        int32_t ptr_slot;
-        if (span_eq(parser_peek(parser), "(")) {
-            (void)parser_token(parser);
-            ptr_slot = parse_expr(parser, body, locals, &ptr_kind);
-            if (!parser_take(parser, ")")) die("expected ) after dereference");
-        } else {
-            ptr_slot = parse_primary(parser, body, locals, &ptr_kind);
-            ptr_slot = parse_postfix(parser, body, locals, ptr_slot, &ptr_kind);
-        }
-        return cold_deref_pointer(parser, body, ptr_slot, &ptr_kind);
-    }
     if (span_eq(token, "&")) {
         /* address-of: parse base local, then handle .field chain with FIELD_REF.
            Also handles &fnName (function pointer). */
@@ -10361,10 +10209,8 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
         Local *alocal = locals_find(locals, base_name);
         int32_t addr_slot;
         if (alocal) {
-            addr_slot = body_slot(body, SLOT_PTR, 8);
-            body_slot_set_type(body, addr_slot, body->slot_type[alocal->slot]);
-            body_op3(body, BODY_OP_FIELD_REF, addr_slot, alocal->slot, 0, 0);
-            *kind = SLOT_PTR;
+            addr_slot = alocal->slot;
+            *kind = alocal->kind;
         } else {
             /* Check if it's a function name: &fnName → function pointer */
             int32_t fn_idx = -1;
@@ -10401,7 +10247,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
             return addr_slot;
         }
         /* Process .field chain manually with FIELD_REF */
-        while (cold_is_field_access_token(parser_peek(parser))) {
+        while (span_eq(parser_peek(parser), ".")) {
             (void)parser_token(parser);
             Span fname = parser_token(parser);
             if (fname.len <= 0) die("expected field name after &");
@@ -10444,9 +10290,6 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     }
     if (span_eq(token, "Fmt")) {
         return parse_fmt_literal(parser, body, locals, kind);
-    }
-    if (cold_is_pointer_cast_token(parser, token) && span_eq(parser_peek(parser), "(")) {
-        return parse_pointer_alias_cast(parser, body, locals, token, kind);
     }
     if (cold_is_scalar_identity_cast(token) && span_eq(parser_peek(parser), "(")) {
         return parse_scalar_identity_cast(parser, body, locals, token, kind);
@@ -10715,7 +10558,7 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
 static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                              int32_t slot, int32_t *kind) {
     for (;;) {
-        if (cold_is_field_access_token(parser_peek(parser))) {
+        if (span_eq(parser_peek(parser), ".")) {
             (void)parser_token(parser);
             Span field_name = parser_token(parser);
             if (field_name.len <= 0) die("expected field name");
@@ -10736,42 +10579,28 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                 *kind = SLOT_I32;
                 continue;
             }
-            if (*kind == SLOT_PTR) {
-                Span target_type = cold_resolve_alias_target(parser->symbols, body->slot_type[slot]);
-                int32_t str_off = 0;
-                int32_t str_kind = SLOT_I32;
-                int32_t str_size = 4;
-                if ((span_eq(target_type, "str") || span_eq(target_type, "cstring")) &&
-                    cold_str_field_info(field_name, &str_off, &str_kind, &str_size)) {
-                    int32_t dst = body_slot(body, str_kind, str_size);
-                    body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, slot, str_off, str_size);
-                    slot = dst;
-                    *kind = str_kind;
-                    continue;
-                }
-                ObjectDef *ptr_object = symbols_resolve_object(parser->symbols, target_type);
-                if (ptr_object) {
-                    ObjectField *field = object_find_field(ptr_object, field_name);
-                    if (!field) die("unknown pointer field");
-                    int32_t dst = body_slot_for_object_field(body, field);
-                    body_slot_set_type(body, dst, field->type_name);
-                    body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, slot, field->offset, field->size);
-                    slot = dst;
-                    *kind = field->kind;
-                    continue;
-                }
+            if ((*kind == SLOT_STR || *kind == SLOT_STR_REF) && span_eq(field_name, "len")) {
+                int32_t len_slot = body_slot(body, SLOT_I32, 4);
+                body_op(body, BODY_OP_STR_LEN, len_slot, slot, 0);
+                slot = len_slot;
+                *kind = SLOT_I32;
+                continue;
             }
-            if ((*kind == SLOT_STR || *kind == SLOT_STR_REF)) {
-                int32_t str_off = 0;
-                int32_t str_kind = SLOT_I32;
-                int32_t str_size = 4;
-                if (!cold_str_field_info(field_name, &str_off, &str_kind, &str_size)) {
-                    die("unknown str field");
+            if ((*kind == SLOT_STR || *kind == SLOT_STR_REF) &&
+                (span_eq(field_name, "data") || span_eq(field_name, "flags") ||
+                 span_eq(field_name, "store_id"))) {
+                /* str internal fields: data→ptr at offset 0, others→zero */
+                if (span_eq(field_name, "data")) {
+                    int32_t ptr_slot = body_slot(body, SLOT_PTR, 8);
+                    body_op3(body, BODY_OP_PAYLOAD_LOAD, ptr_slot, slot, 0, 8);
+                    slot = ptr_slot;
+                    *kind = SLOT_PTR;
+                } else {
+                    int32_t zero = body_slot(body, SLOT_I32, 4);
+                    body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+                    slot = zero;
+                    *kind = SLOT_I32;
                 }
-                int32_t dst = body_slot(body, str_kind, str_size);
-                body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, slot, str_off, str_size);
-                slot = dst;
-                *kind = str_kind;
                 continue;
             }
             if (*kind != SLOT_OBJECT && *kind != SLOT_OBJECT_REF) {
@@ -10969,11 +10798,6 @@ static int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *k
     return slot;
 }
 
-static int32_t cold_lower_select_expr(BodyIR *body, int32_t cond_slot, int32_t *cond_kind,
-                                      int32_t true_slot, int32_t *true_kind,
-                                      int32_t false_slot, int32_t *false_kind,
-                                      int32_t *out_kind);
-
 static int32_t parse_term(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
     int32_t left_kind = SLOT_I32;
     int32_t left = parse_primary(parser, body, locals, &left_kind);
@@ -11098,18 +10922,6 @@ static int32_t parse_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t 
         left = dst;
         left_kind = SLOT_I32;
     }
-    if (span_eq(parser_peek(parser), "?")) {
-        (void)parser_token(parser);
-        int32_t true_kind = SLOT_I32;
-        int32_t true_slot = parse_expr(parser, body, locals, &true_kind);
-        if (!parser_take(parser, ":")) die("expected : in ternary expression");
-        int32_t false_kind = SLOT_I32;
-        int32_t false_slot = parse_expr(parser, body, locals, &false_kind);
-        left = cold_lower_select_expr(body, left, &left_kind,
-                                      true_slot, &true_kind,
-                                      false_slot, &false_kind,
-                                      &left_kind);
-    }
     *kind = left_kind;
     return left;
 }
@@ -11210,58 +11022,6 @@ static bool cold_span_is_compare_token(Span op) {
     return span_eq(op, "==") || span_eq(op, "!=") ||
            span_eq(op, ">=") || span_eq(op, "<") ||
            span_eq(op, ">") || span_eq(op, "<=");
-}
-
-static bool cold_kind_is_64bit_scalar(int32_t kind) {
-    return kind == SLOT_I64 || kind == SLOT_PTR || kind == SLOT_OPAQUE ||
-           kind == SLOT_OPAQUE_REF || kind == SLOT_OBJECT_REF ||
-           kind == SLOT_STR_REF || kind == SLOT_SEQ_I32_REF ||
-           kind == SLOT_SEQ_STR_REF || kind == SLOT_I64_REF;
-}
-
-static int32_t cold_materialize_str_data_ptr(BodyIR *body, int32_t slot, int32_t *kind) {
-    if (*kind != SLOT_STR && *kind != SLOT_STR_REF) return slot;
-    int32_t dst = body_slot(body, SLOT_PTR, 8);
-    body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, slot, COLD_STR_DATA_OFFSET, 8);
-    *kind = SLOT_PTR;
-    return dst;
-}
-
-static int32_t cold_lower_select_expr(BodyIR *body, int32_t cond_slot, int32_t *cond_kind,
-                                      int32_t true_slot, int32_t *true_kind,
-                                      int32_t false_slot, int32_t *false_kind,
-                                      int32_t *out_kind) {
-    cond_slot = cold_materialize_i32_ref(body, cond_slot, cond_kind);
-    if (*cond_kind != SLOT_I32) die("ternary condition must be bool/int32");
-    if ((*true_kind == SLOT_STR || *true_kind == SLOT_STR_REF) &&
-        (*false_kind == SLOT_PTR || cold_kind_is_64bit_scalar(*false_kind))) {
-        true_slot = cold_materialize_str_data_ptr(body, true_slot, true_kind);
-    } else if ((*false_kind == SLOT_STR || *false_kind == SLOT_STR_REF) &&
-               (*true_kind == SLOT_PTR || cold_kind_is_64bit_scalar(*true_kind))) {
-        false_slot = cold_materialize_str_data_ptr(body, false_slot, false_kind);
-    }
-    if (*true_kind == SLOT_I32 && *false_kind == SLOT_I64) {
-        true_slot = cold_materialize_i64_value(body, true_slot, true_kind);
-    } else if (*true_kind == SLOT_I64 && *false_kind == SLOT_I32) {
-        false_slot = cold_materialize_i64_value(body, false_slot, false_kind);
-    }
-    if (*true_kind == SLOT_PTR && cold_kind_is_64bit_scalar(*false_kind)) {
-        *false_kind = SLOT_PTR;
-    } else if (*false_kind == SLOT_PTR && cold_kind_is_64bit_scalar(*true_kind)) {
-        *true_kind = SLOT_PTR;
-    }
-    if (*true_kind != *false_kind) die("ternary branch type mismatch");
-    int32_t size = body->slot_size[true_slot];
-    if (body->slot_size[false_slot] > size) size = body->slot_size[false_slot];
-    int32_t dst = body_slot(body, *true_kind, size);
-    if (body->slot_type[true_slot].len > 0) {
-        body_slot_set_type(body, dst, body->slot_type[true_slot]);
-    } else if (body->slot_type[false_slot].len > 0) {
-        body_slot_set_type(body, dst, body->slot_type[false_slot]);
-    }
-    body_op3(body, BODY_OP_SELECT, dst, cond_slot, true_slot, false_slot);
-    *out_kind = *true_kind;
-    return dst;
 }
 
 static int32_t cold_cond_from_compare_token(Span op) {
@@ -11539,12 +11299,10 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
         (void)parse_expr(parser, body, locals, &skip_kind);
         return block;
     }
-    if (!cold_is_field_access_token(parser_peek(parser))) die("expected . in field assignment");
-    (void)parser_token(parser);
+    if (!parser_take(parser, ".")) die("expected . in field assignment");
     Span field_name = parser_token(parser);
     if (field_name.len <= 0) die("expected field name in assignment");
     Span object_type = cold_type_strip_var(body->slot_type[local->slot], 0);
-    object_type = cold_resolve_alias_target(parser->symbols, object_type);
     ObjectDef *object = symbols_resolve_object(parser->symbols, object_type);
     if (!object) {
         /* Try qualified name fallback (imported objects use alias.TypeName) */
@@ -11608,49 +11366,6 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
         return block; /* skip length mismatch */;
     }
     body_op3(body, BODY_OP_PAYLOAD_STORE, local->slot, value_slot, field->offset, field->size);
-    return block;
-}
-
-static int32_t parse_deref_statement(Parser *parser, BodyIR *body, Locals *locals,
-                                     int32_t block) {
-    int32_t ptr_kind = SLOT_I32;
-    int32_t ptr_slot;
-    if (span_eq(parser_peek(parser), "(")) {
-        (void)parser_token(parser);
-        ptr_slot = parse_expr(parser, body, locals, &ptr_kind);
-        if (!parser_take(parser, ")")) die("expected ) after pointer lvalue");
-    } else {
-        ptr_slot = parse_primary(parser, body, locals, &ptr_kind);
-        ptr_slot = parse_postfix(parser, body, locals, ptr_slot, &ptr_kind);
-    }
-    if (!parser_take(parser, "=")) {
-        (void)cold_deref_pointer(parser, body, ptr_slot, &ptr_kind);
-        return block;
-    }
-    int32_t value_kind = SLOT_I32;
-    int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
-    Span target = cold_resolve_alias_target(parser->symbols, body->slot_type[ptr_slot]);
-    if (span_eq(target, "uint8") || span_eq(target, "char")) {
-        value_slot = cold_materialize_i32_ref(body, value_slot, &value_kind);
-        if (value_kind != SLOT_I32) die("uint8 pointer store expects int32 value");
-        body_op(body, BODY_OP_PTR_STORE_U8, ptr_slot, value_slot, 0);
-        return block;
-    }
-    if (span_eq(target, "int64") || span_eq(target, "uint64") || span_eq(target, "ptr") ||
-        symbols_find_alias(parser->symbols, target)) {
-        if (value_kind == SLOT_I32) value_slot = cold_materialize_i64_value(body, value_slot, &value_kind);
-        if (value_kind != SLOT_I64 && value_kind != SLOT_PTR) die("pointer store expects 64-bit value");
-        body_op(body, BODY_OP_PTR_STORE_I64, ptr_slot, value_slot, 0);
-        return block;
-    }
-    if (span_eq(target, "str") || span_eq(target, "cstring") ||
-        symbols_resolve_object(parser->symbols, target)) {
-        body_op3(body, BODY_OP_PAYLOAD_STORE, ptr_slot, value_slot, 0, body->slot_size[value_slot]);
-        return block;
-    }
-    value_slot = cold_materialize_i32_ref(body, value_slot, &value_kind);
-    if (value_kind != SLOT_I32) die("pointer store expects int32 value");
-    body_op(body, BODY_OP_PTR_STORE_I32, ptr_slot, value_slot, 0);
     return block;
 }
 
@@ -17333,18 +17048,6 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_patch_b(code, done_pos, code->count);
         a64_emit_str_sp_off(code, R2, body->slot_offset[dst], false);
         na_clobber(2);
-    } else if (kind == BODY_OP_SELECT) {
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
-        code_emit(code, a64_cmp_imm(R0, 0));
-        int32_t false_pos = code->count;
-        code_emit(code, a64_bcond(0, COND_EQ));
-        codegen_copy_slot_to_slot(code, body, dst, b);
-        int32_t done_pos = code->count;
-        code_emit(code, a64_b(0));
-        a64_patch_bcond(code, false_pos, code->count);
-        codegen_copy_slot_to_slot(code, body, dst, c);
-        a64_patch_b(code, done_pos, code->count);
-        na_clobber(2);
     } else if (kind == BODY_OP_I32_SHL) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[b], false);
@@ -19395,79 +19098,41 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
     }
 
-    /* Resolve inter-function patches and collect external call relocations */
-    int32_t reloc_cap = func_count * 16;
-    int32_t *reloc_offsets = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
-    int32_t *reloc_symbols = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
-    int32_t reloc_count = 0;
+    /* Resolve inter-function patches */
     for (int32_t pi = 0; pi < function_patches.count; pi++) {
         FunctionPatch patch = function_patches.items[pi];
         if (patch.target_function < 0 || patch.target_function >= func_count) continue;
         int32_t target_off = symbol_offset[patch.target_function];
-        if (target_off < 0) {
-            if (reloc_count < reloc_cap) {
-                reloc_offsets[reloc_count] = (int32_t)patch.pos * 4;
-                reloc_symbols[reloc_count] = patch.target_function;
-                reloc_count++;
-            }
-            continue;
-        }
+        if (target_off < 0) continue; /* target has no body, patch stays as-is */
         int32_t delta = target_off - (int32_t)patch.pos;
         shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
                                    ((uint32_t)delta & 0x03FFFFFFu);
     }
 
-    /* Build name/offset arrays: locals first, then external references (offset=-1) */
-    int32_t name_cap = func_count + reloc_count;
-    const char **func_names = arena_alloc(arena, (size_t)name_cap * sizeof(const char *));
-    int32_t *func_offsets = arena_alloc(arena, (size_t)name_cap * sizeof(int32_t));
+    /* Build name/offset arrays for macho_write_object */
+    const char **func_names = arena_alloc(arena, (size_t)func_count * sizeof(const char *));
+    int32_t *func_offsets = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
     int32_t name_count = 0;
-    int32_t *ext_map = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
-    for (int32_t i = 0; i < func_count; i++) ext_map[i] = -1;
     for (int32_t i = 0; i < func_count; i++) {
         if (symbol_offset[i] < 0) continue;
-        if (symbols->functions[i].name.len >= 26 && memcmp(symbols->functions[i].name.ptr, "BackendDriverDispatchMinEmit", 26) == 0) fprintf(stderr, "[cold_sym] EMIT: %.*s off=%d\n", (int)symbols->functions[i].name.len, symbols->functions[i].name.ptr, symbol_offset[i]);
         Span nm = symbols->functions[i].name;
-        func_offsets[name_count] = symbol_offset[i];
-        const char *name_ptr = (const char *)nm.ptr;
-        int32_t name_len = nm.len;
-        char *nc = arena_alloc(arena, (size_t)name_len + 1);
-        memcpy(nc, name_ptr, (size_t)name_len);
-        nc[name_len] = '\0';
-        func_names[name_count] = nc;
-        name_count++;
-    }
-    /* External function references for relocation entries.
-       Use base name (strip module prefix: "atomic.NewI32"->"NewI32")
-       and offset=-1 so the writer marks them N_UNDF|N_EXT. */
-    for (int32_t ri = 0; ri < reloc_count; ri++) {
-        int32_t target = reloc_symbols[ri];
-        if (ext_map[target] >= 0) continue;
-        Span nm = symbols->functions[target].name;
-        const char *base = (const char *)nm.ptr;
-        int32_t blen = nm.len;
-        for (int32_t k = nm.len - 1; k > 0; k--) {
-            if (nm.ptr[k] == '.') { base = (const char *)(nm.ptr + k + 1); blen = nm.len - k - 1; break; }
+        /* Dedup: skip if this name already in table (first definition wins) */
+        bool dup = false;
+        for (int32_t j = 0; j < name_count; j++) {
+            if (func_names[j] && (int32_t)strlen(func_names[j]) == nm.len &&
+                memcmp(func_names[j], nm.ptr, (size_t)nm.len) == 0) { dup = true; break; }
         }
-        char *nc = arena_alloc(arena, (size_t)blen + 1);
-        memcpy(nc, base, (size_t)blen);
-        nc[blen] = '\0';
+        if (dup) continue;
+        func_offsets[name_count] = symbol_offset[i];
+        char *nc = arena_alloc(arena, (size_t)nm.len + 1);
+        memcpy(nc, nm.ptr, (size_t)nm.len);
+        nc[nm.len] = '\0';
         func_names[name_count] = nc;
-        func_offsets[name_count] = -1; /* sentinel: N_UNDF|N_EXT in writer */
-        ext_map[target] = name_count;
         name_count++;
-    }
-    for (int32_t ri = 0; ri < reloc_count; ri++) {
-        int32_t mapped = ext_map[reloc_symbols[ri]];
-        if (mapped >= 0) reloc_symbols[ri] = mapped;
     }
 
-    /* Provider mode: all symbols global. Primary mode (CHENG_NO_IMPORT_BODIES): only _main global. */
-    int32_t global_count = getenv("CHENG_NO_IMPORT_BODIES") ? 1 : name_count;
-    if (global_count < 1 && name_count > 0) global_count = 1;
     bool ok = macho_write_object(out_path, shared->words, shared->count,
-                                 func_names, func_offsets, name_count, global_count,
-                                 reloc_offsets, reloc_symbols, reloc_count);
+                                 func_names, func_offsets, name_count);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;
 }
