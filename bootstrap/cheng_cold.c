@@ -10848,7 +10848,7 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                 }
                 continue;
             }
-            if (*kind != SLOT_OBJECT && *kind != SLOT_OBJECT_REF) {
+            if (*kind != SLOT_OBJECT && *kind != SLOT_OBJECT_REF && *kind != SLOT_PTR) {
                 Span type_name = body->slot_type[slot];
                 ObjectDef *obj = 0;
                 if (type_name.len > 0) obj = symbols_resolve_object(parser->symbols, type_name);
@@ -10948,11 +10948,25 @@ static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
             }
             if (*kind != SLOT_ARRAY_I32 && *kind != SLOT_SEQ_I32 && *kind != SLOT_SEQ_I32_REF && *kind != SLOT_SEQ_OPAQUE) {
                 Span type_name = body->slot_type[slot];
-                /* Skip index on non-array type */
                 *kind = SLOT_I32;
                 int32_t zero = body_slot(body, SLOT_I32, 4);
                 body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
                 return zero;
+            }
+            if (*kind == SLOT_SEQ_OPAQUE) {
+                int32_t dst = body_slot(body, SLOT_PTR, 8);
+                int32_t index_slot = body_slot(body, SLOT_I32, 4);
+                if (span_is_i32(index)) {
+                    body_op(body, BODY_OP_I32_CONST, index_slot, span_i32(index), 0);
+                } else {
+                    Parser index_parser = {index, 0, parser->arena, parser->symbols};
+                    int32_t ik = SLOT_I32;
+                    index_slot = parse_expr(&index_parser, body, locals, &ik);
+                }
+                int32_t esz = body->slot_size[slot] > 0 ? body->slot_size[slot] : 16;
+                body_op3(body, BODY_OP_SEQ_OPAQUE_INDEX, dst, slot, index_slot, esz);
+                *kind = SLOT_PTR;
+                return dst;
             }
             int32_t dst = body_slot(body, SLOT_I32, 4);
             if (span_is_i32(index)) {
@@ -12841,13 +12855,21 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                     Parser ip = {idx_span, 0, parser->arena, parser->symbols};
                     is = parse_expr(&ip, body, locals, &ik);
                 }
-                int32_t ref_slot = body_slot(body, SLOT_OBJECT_REF, 8);
+                int32_t ref_kind = fld->kind == SLOT_SEQ_OPAQUE ? SLOT_SEQ_OPAQUE_REF : SLOT_OBJECT_REF;
+                int32_t ref_slot = body_slot(body, ref_kind, 8);
                 if (fld->kind == SLOT_ARRAY_I32) body->slot_aux[ref_slot] = fld->array_len;
+                if (fld->kind == SLOT_SEQ_OPAQUE)
+                    body_slot_set_seq_opaque_type(body, parser->symbols, ref_slot, fld->type_name);
                 body_op3(body, BODY_OP_FIELD_REF, ref_slot, base->slot, fld->offset, 0);
                 if (fld->kind == SLOT_ARRAY_I32)
                     body_op3(body, BODY_OP_ARRAY_I32_INDEX_STORE, vs, ref_slot, is, 0);
                 else if (fld->kind == SLOT_SEQ_I32 || fld->kind == SLOT_SEQ_I32_REF)
                     body_op3(body, BODY_OP_SEQ_I32_INDEX_STORE, vs, ref_slot, is, 0);
+                else if (fld->kind == SLOT_SEQ_OPAQUE) {
+                    int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, ref_slot);
+                    if (body->slot_size[vs] > element_size) die("opaque sequence store value too large");
+                    body_op3(body, BODY_OP_SEQ_OPAQUE_INDEX_STORE, vs, ref_slot, is, element_size);
+                }
                 else {
                     /* Skip unsupported field-index assign */
                     (void)parse_expr(parser, body, locals, &vk);
@@ -12887,6 +12909,11 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                 body_op3(body, BODY_OP_ARRAY_I32_INDEX_STORE, vs, base->slot, is, 0);
             else if (base->kind == SLOT_SEQ_I32 || base->kind == SLOT_SEQ_I32_REF)
                 body_op3(body, BODY_OP_SEQ_I32_INDEX_STORE, vs, base->slot, is, 0);
+            else if (base->kind == SLOT_SEQ_OPAQUE || base->kind == SLOT_SEQ_OPAQUE_REF) {
+                int32_t element_size = cold_seq_opaque_element_size_for_slot(parser->symbols, body, base->slot);
+                if (body->slot_size[vs] > element_size) die("opaque sequence store value too large");
+                body_op3(body, BODY_OP_SEQ_OPAQUE_INDEX_STORE, vs, base->slot, is, element_size);
+            }
             else {
                 /* Skip unsupported index assign */
                 (void)parse_expr(parser, body, locals, &vk);
