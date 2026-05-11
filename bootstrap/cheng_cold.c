@@ -8962,20 +8962,23 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
         *slot_out = slot;
         return true;
     }
-    if (cold_name_is_write_line(name)) {
-        if (arg_count != 2) die("os.WriteLine arity mismatch");
-        int32_t fd_slot = body->call_arg_slot[arg_start];
-        int32_t text_slot = body->call_arg_slot[arg_start + 1];
+    if (cold_name_is_write_line(name) || span_eq(name, "echo")) {
+        bool is_echo = span_eq(name, "echo");
+        if ((is_echo && arg_count != 1) || (!is_echo && arg_count != 2))
+            die("os.WriteLine/echo arity mismatch");
+        int32_t fd_slot, text_slot;
+        if (is_echo) {
+            fd_slot = body_slot(body, SLOT_I32, 4);
+            body_op(body, BODY_OP_I32_CONST, fd_slot, 1, 0);
+            text_slot = body->call_arg_slot[arg_start];
+        } else {
+            fd_slot = body->call_arg_slot[arg_start];
+            text_slot = body->call_arg_slot[arg_start + 1];
+        }
         int32_t fd_kind = body->slot_kind[fd_slot];
         int32_t text_kind = body->slot_kind[text_slot];
-        if (fd_kind != SLOT_OPAQUE && fd_kind != SLOT_I32) {
-            /* Skip os.WriteLine with invalid fd */
-            return 0;
-        }
-        if (text_kind != SLOT_STR && text_kind != SLOT_STR_REF) {
-            /* Skip os.WriteLine with invalid text */
-            return 0;
-        }
+        if (fd_kind != SLOT_OPAQUE && fd_kind != SLOT_I32) return 0;
+        if (text_kind != SLOT_STR && text_kind != SLOT_STR_REF) return 0;
         int32_t slot = body_slot(body, SLOT_I32, 4);
         body_op(body, BODY_OP_WRITE_LINE, slot, fd_slot, text_slot);
         if (kind_out) *kind_out = SLOT_I32;
