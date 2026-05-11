@@ -75,6 +75,7 @@
 - cold 生成版 backend driver 的 `emit:obj` 必须由生成物产出 `.o`，再用 `cc` 链接并运行跨模块 fixture；report 同时锁 `emit=obj`、`direct_macho=1`、`provider_object_count=0`、`system_link=0`，否则仍可能把对象 writer 缺口藏在 exe 路径里。
 - cold import-mode 调用解析有 `parse_call` 和 `parse_call_from_args_span` 两条路径；两条都必须对未解析调用 hard-fail，任何返回 0 slot 都是假成功。
 - cold `build-backend-driver` 不能接受 compile 非零退出，也不能在失败后扫描 `.o` 再用 `cc` 链接；冷 linkerless 编译失败必须直接失败。
+- 替换 `artifacts/backend_driver/cheng` 前必须先跑候选门禁，再覆盖后跑正式入口同一组门禁；只验证候选旁路文件不算完成。
 
 ## Resolved
 
