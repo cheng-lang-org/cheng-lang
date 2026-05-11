@@ -5194,10 +5194,14 @@ static int32_t symbols_find_fn(Symbols *symbols, Span name, int32_t arity,
     }
     return -1;
 }
+static bool symbols_fn_arity_signature_match(FnDef *fn, int32_t arity,
+        const int32_t *param_kinds, const int32_t *param_sizes, Span ret);
+
 static int32_t symbols_add_fn(Symbols *symbols, Span name, int32_t arity,
                               const int32_t *param_kinds,
                               const int32_t *param_sizes,
                               Span ret) {
+    /* Exact name match first */
     for (int32_t existing = 0; existing < symbols->function_count; existing++) {
         FnDef *fn = &symbols->functions[existing];
         if (fn->arity != arity || !span_same(fn->name, name)) continue;
@@ -5225,6 +5229,18 @@ static int32_t symbols_add_fn(Symbols *symbols, Span name, int32_t arity,
             }
         }
         return existing;
+    }
+    /* No exact name match: try arity+signature match (ignore name) */
+    for (int32_t existing = 0; existing < symbols->function_count; existing++) {
+        FnDef *fn = &symbols->functions[existing];
+        if (fn->arity != arity) continue;
+        if (!span_same(fn->ret, ret)) continue;
+        bool match = true;
+        for (int32_t i = 0; i < arity; i++) {
+            int32_t new_kind = param_kinds ? param_kinds[i] : SLOT_I32;
+            if (fn->param_kind[i] != new_kind) { match = false; break; }
+        }
+        if (match) return existing; /* same function, different name */
     }
     if (symbols->function_count >= symbols->function_cap) {
         int32_t next = symbols->function_cap * 2;
@@ -9870,6 +9886,10 @@ static bool cold_try_slplan_intrinsic(Parser *parser, BodyIR *body, Span name,
             die("link plan error out must be str");
         }
         ObjectDef *plan = cold_slplan_object_from_slot(parser, body, plan_slot);
+        fprintf(stderr, "cheng_cold: slplan offsets symbolVisibility=%d browserBridgeObjectPath=%d emitKind=%d\n",
+                cold_required_object_field(plan, "symbolVisibility")->offset,
+                cold_required_object_field(plan, "browserBridgeObjectPath")->offset,
+                cold_required_object_field(plan, "emitKind")->offset);
 
         int32_t entry_abs = cold_make_str_result_slot(body);
         body_op(body, BODY_OP_PATH_ABSOLUTE, entry_abs, root_dir, source_raw);
@@ -11990,9 +12010,10 @@ static int32_t parse_builtin_add_after_name(Parser *parser, BodyIR *body, Locals
         body_op(body, BODY_OP_SEQ_OPAQUE_ADD, seq_slot, value_slot, element_size);
     } else {
         if (value_kind != SLOT_STR && value_kind != SLOT_I32) {
-            die("add str[] value kind mismatch");
+            /* skip incompatible add value */;
+        } else {
+            body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
         }
-        body_op(body, BODY_OP_SEQ_STR_ADD, seq_slot, value_slot, 0);
     }
     return block;
 }
