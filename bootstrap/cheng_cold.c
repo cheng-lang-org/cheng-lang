@@ -6884,6 +6884,21 @@ static void cold_collect_function_signatures(Symbols *symbols, Span source) {
 
 static void parse_type(Parser *parser);
 
+static bool cold_parse_pointer_alias_rhs(Span rhs, Span *target_out) {
+    rhs = span_trim(rhs);
+    if (span_eq(rhs, "ptr")) {
+        if (target_out) *target_out = rhs;
+        return true;
+    }
+    if (rhs.len > 1 && rhs.ptr[rhs.len - 1] == '*') {
+        Span target = span_trim(span_sub(rhs, 0, rhs.len - 1));
+        if (target.len <= 0) die("pointer alias target is empty");
+        if (target_out) *target_out = target;
+        return true;
+    }
+    return false;
+}
+
 static Span cold_normalize_grouped_type_member(Arena *arena, Span member, int32_t group_indent) {
     uint8_t *out = arena_alloc(arena, (size_t)member.len + 1);
     int32_t count = 0;
@@ -7031,6 +7046,12 @@ static void parse_type(Parser *parser) {
     }
 
     Span rhs_check = span_trim(span_sub(line.source, line.pos, line.source.len));
+    Span alias_target = {0};
+    if (cold_parse_pointer_alias_rhs(rhs_check, &alias_target)) {
+        symbols_add_alias(parser->symbols, type_name, alias_target);
+        parser->pos = line_end;
+        return;
+    }
     if (cold_span_starts_with(rhs_check, "enum")) {
         if (generic_count > 0) die("cold enum cannot be generic");
         Parser enum_parser = {rhs_check, 0, parser->arena, parser->symbols};
@@ -10196,12 +10217,11 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
             *kind = SLOT_I64;
             return value_slot;
         }
-        if (value_kind != SLOT_I32) {
-            /* Non-int32 cast source: return 0 */
+        if (value_kind == SLOT_PTR) {
             *kind = SLOT_I64;
-            int32_t zero = body_slot(body, SLOT_I64, 8);
-            return zero;
+            return value_slot;
         }
+        if (value_kind != SLOT_I32) die("int64/uint64 cast source must be int32/int64/ptr");
         int32_t dst = body_slot(body, SLOT_I64, 8);
         body_op(body, BODY_OP_I64_FROM_I32, dst, value_slot, 0);
         *kind = SLOT_I64;
