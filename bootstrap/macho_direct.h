@@ -275,6 +275,7 @@ static bool macho_write_exec(const char *path, const uint32_t *code, int32_t cod
 /* -- Mach-O object file (.o) writer (MH_OBJECT) -- */
 
 #define N_UNDF 0x00
+#define N_UNDF 0x00
 #define N_SECT 0x0E
 #define N_EXT  0x01
 
