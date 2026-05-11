@@ -10167,35 +10167,6 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
     return value_slot;
 }
 
-static int32_t cold_materialize_i64_value(BodyIR *body, int32_t slot, int32_t *kind);
-
-static int32_t parse_pointer_cast(Parser *parser, BodyIR *body,
-                                  Locals *locals, int32_t *kind) {
-    if (!parser_take(parser, "(")) die("expected ( after pointer cast");
-    int32_t value_kind = SLOT_I32;
-    int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
-    if (!parser_take(parser, ")")) return 0;
-    if (value_kind == SLOT_PTR) {
-        *kind = SLOT_PTR;
-        return value_slot;
-    }
-    if (value_kind == SLOT_I32) {
-        value_slot = cold_materialize_i64_value(body, value_slot, &value_kind);
-    }
-    if (value_kind == SLOT_I64 || value_kind == SLOT_OPAQUE || value_kind == SLOT_OPAQUE_REF ||
-        value_kind == SLOT_OBJECT_REF || value_kind == SLOT_STR_REF ||
-        value_kind == SLOT_SEQ_I32_REF || value_kind == SLOT_SEQ_STR_REF) {
-        int32_t ptr_slot = body_slot(body, SLOT_PTR, 8);
-        body_op(body, BODY_OP_COPY_I64, ptr_slot, value_slot, 0);
-        *kind = SLOT_PTR;
-        return ptr_slot;
-    }
-    int32_t zero = body_slot(body, SLOT_PTR, 8);
-    body_op(body, BODY_OP_PTR_CONST, zero, 0, 0);
-    *kind = SLOT_PTR;
-    return zero;
-}
-
 static int32_t parse_postfix(Parser *parser, BodyIR *body, Locals *locals,
                              int32_t slot, int32_t *kind);
 
@@ -10320,9 +10291,6 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     if (span_eq(token, "Fmt")) {
         return parse_fmt_literal(parser, body, locals, kind);
     }
-    if (cold_type_is_pointer_like(parser->symbols, token) && span_eq(parser_peek(parser), "(")) {
-        return parse_pointer_cast(parser, body, locals, kind);
-    }
     if (cold_is_scalar_identity_cast(token) && span_eq(parser_peek(parser), "(")) {
         return parse_scalar_identity_cast(parser, body, locals, token, kind);
     }
@@ -10445,15 +10413,6 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     if (local) {
         int32_t slot = local->slot;
         *kind = local->kind;
-        return slot;
-    }
-    GlobalDef *global = symbols_find_global(parser->symbols, token);
-    if (global) {
-        int32_t global_index = symbols_global_index(parser->symbols, global);
-        int32_t slot = body_slot(body, global->kind, global->size);
-        body_slot_set_type(body, slot, global->type);
-        body_op(body, BODY_OP_GLOBAL_LOAD, slot, global_index, 0);
-        *kind = global->kind;
         return slot;
     }
     if (span_eq(parser_peek(parser), "{") &&
@@ -11272,8 +11231,7 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
 
 static void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name) {
     Local *local = locals_find(locals, name);
-    GlobalDef *global = symbols_find_global(parser->symbols, name);
-    if (!local && !global) {
+    if (!local) {
         /* Consume the value expression and continue */
         int32_t dummy_kind = SLOT_I32;
         (void)parse_expr(parser, body, locals, &dummy_kind);
@@ -11282,28 +11240,6 @@ static void parse_assign(Parser *parser, BodyIR *body, Locals *locals, Span name
     if (!parser_take(parser, "=")) die("expected = in assignment");
     int32_t kind = SLOT_I32;
     int32_t slot = parse_expr(parser, body, locals, &kind);
-    if (!local && global) {
-        if (global->kind == SLOT_I64 && kind == SLOT_I32) {
-            slot = cold_materialize_i64_value(body, slot, &kind);
-        }
-        if (global->kind == SLOT_PTR && kind == SLOT_I32) {
-            slot = cold_materialize_i64_value(body, slot, &kind);
-        }
-        if (global->kind == SLOT_PTR && kind == SLOT_I64) {
-            int32_t ptr_slot = body_slot(body, SLOT_PTR, 8);
-            body_op(body, BODY_OP_COPY_I64, ptr_slot, slot, 0);
-            slot = ptr_slot;
-            kind = SLOT_PTR;
-        }
-        if (kind != global->kind &&
-            !(global->kind == SLOT_PTR && (kind == SLOT_OPAQUE || kind == SLOT_OPAQUE_REF ||
-                                           kind == SLOT_OBJECT_REF || kind == SLOT_STR_REF))) {
-            die("cold global assignment kind mismatch");
-        }
-        int32_t global_index = symbols_global_index(parser->symbols, global);
-        body_op(body, BODY_OP_GLOBAL_STORE, global_index, slot, 0);
-        return;
-    }
     if (local->kind == SLOT_I32) {
         slot = cold_materialize_i32_ref(body, slot, &kind);
         if (kind != SLOT_I32) {
@@ -19122,9 +19058,12 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     FunctionPatchList function_patches = {0};
     function_patches.arena = arena;
 
-    /* Build map of emitted base names to prevent code duplication */
-    bool *name_seen = arena_alloc(arena, (size_t)func_count * sizeof(bool));
-    for (int32_t i = 0; i < func_count; i++) name_seen[i] = false;
+    /* Build map of emitted base names (gated by CHENG_BODY_DEDUP) */
+    bool *name_seen = NULL;
+    if (getenv("CHENG_BODY_DEDUP")) {
+        name_seen = arena_alloc(arena, (size_t)func_count * sizeof(bool));
+        for (int32_t i = 0; i < func_count; i++) name_seen[i] = false;
+    }
 
     /* First pass: compile each function body into the shared buffer */
     for (int32_t i = 0; i < func_count; i++) {
@@ -19136,8 +19075,9 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         for (int32_t k = nm.len - 1; k > 0; k--) {
             if (nm.ptr[k] == '.' || nm.ptr[k] == ':') { base = nm.ptr + k + 1; base_len = nm.len - k - 1; break; }
         }
-        /* Check if this base name already emitted */
+        /* Check if this base name already emitted (gated) */
         bool dup = false;
+        if (name_seen) {
         for (int32_t j = 0; j < i; j++) {
             if (!name_seen[j] || !function_bodies[j]) continue;
             Span prev = symbols->functions[j].name;
@@ -19148,8 +19088,9 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             }
             if (pbl == base_len && memcmp(pb, base, (size_t)base_len) == 0) { dup = true; break; }
         }
+        } /* if (name_seen) */
         if (dup) { fprintf(stderr, "[cold_body] skip dup: %.*s\n", (int)nm.len, nm.ptr); continue; }
-        name_seen[i] = true;
+        if (name_seen) name_seen[i] = true;
         symbol_offset[i] = shared->count;
         BodyIR *fn_body = function_bodies[i];
         if (fn_body->has_fallback || fn_body->block_count == 0 ||
