@@ -15334,9 +15334,21 @@ static void codegen_copy_slot_from_offset(Code *code, BodyIR *body,
         src_kind == SLOT_STR_REF ||
         src_kind == SLOT_PTR) {
         a64_emit_ldr_sp_off(code, R2, body->slot_offset[src_slot], true);
+        /* Null check: if pointer is NULL, zero dst and return */
+        code_emit(code, a64_cmp_reg_x(R2, 31));
+        int32_t null_jump = code->count;
+        code_emit(code, a64_bcond(0, COND_EQ));
         if (kind == SLOT_I32) {
             code_emit(code, a64_ldr_imm(R0, R2, src_offset, false));
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst_slot], false);
+            int32_t done_b = code->count;
+            code_emit(code, a64_b(0));
+            /* Null case: zero dst */
+            int32_t null_case = code->count;
+            a64_patch_bcond(code, null_jump, null_case);
+            code_emit(code, a64_movz(R0, 0, 0));
+            a64_emit_str_sp_off(code, R0, body->slot_offset[dst_slot], false);
+            code->words[done_b] = a64_b(code->count - done_b);
             return;
         }
         int32_t total = body->slot_size[dst_slot];
@@ -15344,6 +15356,13 @@ static void codegen_copy_slot_from_offset(Code *code, BodyIR *body,
             code_emit(code, a64_ldr_imm(R0, R2, src_offset + off, true));
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst_slot] + off, true);
         }
+        int32_t done_b2 = code->count;
+        code_emit(code, a64_b(0));
+        /* Null case: zero entire dst slot */
+        int32_t null_case2 = code->count;
+        a64_patch_bcond(code, null_jump, null_case2);
+        codegen_zero_slot(code, body, dst_slot);
+        code->words[done_b2] = a64_b(code->count - done_b2);
         return;
     }
     if (kind == SLOT_I32) {
