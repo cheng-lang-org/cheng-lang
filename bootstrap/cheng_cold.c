@@ -5793,6 +5793,13 @@ static TypeDef *symbols_resolve_type(Symbols *symbols, Span type_name) {
     type_name = span_trim(type_name);
     TypeDef *existing = symbols_find_type(symbols, type_name);
     if (existing) return existing;
+    for (int32_t i = type_name.len - 1; i > 0; i--) {
+        if (type_name.ptr[i] == '.') {
+            TypeDef *suffix = symbols_find_type(symbols, span_sub(type_name, i + 1, type_name.len - i - 1));
+            if (suffix) return suffix;
+            break;
+        }
+    }
     Span base_name = {0};
     Span args_span = {0};
     if (!cold_type_parse_generic_instance(type_name, &base_name, &args_span)) return 0;
@@ -7459,6 +7466,8 @@ static void cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
             if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) die("cold var object arg kind mismatch");
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             continue;
+        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
+            continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
@@ -7485,6 +7494,7 @@ static void cold_validate_call_args(BodyIR *body, FnDef *fn, int32_t arg_start, 
         int32_t param_size = fn->param_size[i] > 0 ? fn->param_size[i] : arg_size;
         if ((arg_kind == SLOT_VARIANT || arg_kind == SLOT_OBJECT || arg_kind == SLOT_ARRAY_I32) &&
             fn->param_kind[i] != SLOT_I32_REF &&
+            fn->param_kind[i] != SLOT_I32 &&
             fn->param_kind[i] != SLOT_OBJECT_REF &&
             arg_size != param_size) {
             return; /* skip variant arg mismatch */
@@ -7511,6 +7521,8 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
             if (arg_kind != SLOT_OBJECT && arg_kind != SLOT_OBJECT_REF) return false;
         } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             continue;
+        } else if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
+            continue;
         } else if (fn->param_kind[i] == SLOT_I64 && arg_kind == SLOT_I64_REF) {
             continue;
         } else if (fn->param_kind[i] == SLOT_STR && arg_kind == SLOT_STR_REF) {
@@ -7535,6 +7547,7 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
         int32_t param_size = fn->param_size[i] > 0 ? fn->param_size[i] : arg_size;
         if ((arg_kind == SLOT_VARIANT || arg_kind == SLOT_OBJECT || arg_kind == SLOT_ARRAY_I32) &&
             fn->param_kind[i] != SLOT_I32_REF &&
+            fn->param_kind[i] != SLOT_I32 &&
             fn->param_kind[i] != SLOT_OBJECT_REF &&
             arg_size != param_size) {
             return false;
@@ -7552,7 +7565,7 @@ static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
         FnDef *fn = &symbols->functions[i];
         if (fn->arity != arg_count || !span_same(fn->name, name)) continue;
         if (!cold_call_args_match(body, fn, arg_start, arg_count)) continue;
-        if (found >= 0) return -1; /* ambiguous: caller should report error */
+        if (found >= 0) continue;
         found = i;
     }
     if (found >= 0) return found;
@@ -7576,7 +7589,7 @@ static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
             break;
         }
         if (!match) continue;
-        if (found >= 0) return -1; /* ambiguous even with tolerance */
+        if (found >= 0) continue;
         found = i;
     }
     return found;
@@ -8375,6 +8388,17 @@ static int32_t cold_materialize_fmt_str(BodyIR *body, int32_t slot, int32_t kind
     body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
     return zero;
     return slot;
+}
+
+static bool cold_slot_kind_is_str_like(int32_t kind) {
+    return kind == SLOT_STR || kind == SLOT_STR_REF;
+}
+
+static int32_t cold_materialize_str_data_ptr(BodyIR *body, int32_t slot, int32_t kind) {
+    if (!cold_slot_kind_is_str_like(kind)) die("str data ptr expects str slot");
+    int32_t dst = body_slot(body, SLOT_PTR, 8);
+    body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, slot, COLD_STR_DATA_OFFSET, 8);
+    return dst;
 }
 
 static int32_t cold_concat_str_slots(BodyIR *body, int32_t left, int32_t right) {
@@ -10944,12 +10968,24 @@ static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, 
     left = cold_materialize_i32_ref(body, left, &left_kind);
     right = cold_materialize_i32_ref(body, right, &right_kind);
     int32_t dst = body_slot(body, SLOT_I32, 4);
-    if (left_kind == SLOT_STR || left_kind == SLOT_STR_REF ||
-        right_kind == SLOT_STR || right_kind == SLOT_STR_REF) {
-        if (left_kind != SLOT_STR && left_kind != SLOT_STR_REF) { left = cold_materialize_fmt_str(body, left, left_kind); left_kind = SLOT_STR; }
-        if (right_kind != SLOT_STR && right_kind != SLOT_STR_REF) { right = cold_materialize_fmt_str(body, right, right_kind); right_kind = SLOT_STR; }
-        if (!((left_kind == SLOT_STR || left_kind == SLOT_STR_REF) &&
-              (right_kind == SLOT_STR || right_kind == SLOT_STR_REF))) {
+    if ((cold_slot_kind_is_str_like(left_kind) && right_kind == SLOT_PTR) ||
+        (left_kind == SLOT_PTR && cold_slot_kind_is_str_like(right_kind))) {
+        if (cond != COND_EQ && cond != COND_NE) die("str pointer comparison supports == and !=");
+        if (cold_slot_kind_is_str_like(left_kind)) {
+            left = cold_materialize_str_data_ptr(body, left, left_kind);
+            left_kind = SLOT_PTR;
+        }
+        if (cold_slot_kind_is_str_like(right_kind)) {
+            right = cold_materialize_str_data_ptr(body, right, right_kind);
+            right_kind = SLOT_PTR;
+        }
+        left = cold_materialize_i64_value(body, left, &left_kind);
+        right = cold_materialize_i64_value(body, right, &right_kind);
+        body_op3(body, BODY_OP_I64_CMP, dst, left, right, cond);
+    } else if (cold_slot_kind_is_str_like(left_kind) || cold_slot_kind_is_str_like(right_kind)) {
+        if (!cold_slot_kind_is_str_like(left_kind)) { left = cold_materialize_fmt_str(body, left, left_kind); left_kind = body->slot_kind[left]; }
+        if (!cold_slot_kind_is_str_like(right_kind)) { right = cold_materialize_fmt_str(body, right, right_kind); right_kind = body->slot_kind[right]; }
+        if (!(cold_slot_kind_is_str_like(left_kind) && cold_slot_kind_is_str_like(right_kind))) {
             die("str comparison operands must both be str");
         }
         if (cond != COND_EQ && cond != COND_NE) die("str comparison supports == and !=");
@@ -11192,6 +11228,12 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
     if (owned_slot >= 0 && kind == SLOT_I32 && body->slot_kind[owned_slot] == SLOT_I32) {
         body_op(body, BODY_OP_COPY_I32, owned_slot, slot, 0);
         slot = owned_slot;
+    } else if (owned_slot >= 0 && kind == SLOT_VARIANT && body->slot_kind[owned_slot] == SLOT_I32) {
+        int32_t tag_slot = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_TAG_LOAD, tag_slot, slot, 0);
+        body_op(body, BODY_OP_COPY_I32, owned_slot, tag_slot, 0);
+        slot = owned_slot;
+        kind = SLOT_I32;
     } else if (owned_slot >= 0 && body->slot_kind[owned_slot] == SLOT_I64) {
         if (kind == SLOT_I32) slot = cold_materialize_i64_value(body, slot, &kind);
         if (kind != SLOT_I64) die("typed int64 initializer kind mismatch");
@@ -14509,6 +14551,11 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
         if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             a64_emit_ldr_sp_off(code, R9, local_offset, true);
             code_emit(code, a64_ldr_imm(R9, R9, 0, false));
+            codegen_place_w_arg(code, in_regs, base_reg, stack_offset, R9);
+            continue;
+        }
+        if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_VARIANT) {
+            a64_emit_ldr_sp_off(code, R9, local_offset, false);
             codegen_place_w_arg(code, in_regs, base_reg, stack_offset, R9);
             continue;
         }
