@@ -6069,6 +6069,16 @@ static int32_t cold_lower_question_result(Symbols *symbols, BodyIR *body, Locals
                                           Span bind_name, bool bind_value,
                                           int32_t declared_kind, Span declared_type) {
     TypeDef *type = cold_question_result_type(symbols, body, variant_slot);
+    if (!type) {
+        Span slot_type = (variant_slot >= 0 && variant_slot < body->slot_count)
+                             ? body->slot_type[variant_slot]
+                             : (Span){0};
+        fprintf(stderr, "cheng_cold: ? requires Result-typed value fn=%.*s slot_kind=%d slot_type=%.*s\n",
+                body->debug_name.len, body->debug_name.ptr,
+                (variant_slot >= 0 && variant_slot < body->slot_count) ? body->slot_kind[variant_slot] : -1,
+                slot_type.len, slot_type.ptr);
+        die("? requires Result-typed value");
+    }
     Variant *ok_variant = &type->variants[0];
     Variant *err_variant = &type->variants[1];
     if (bind_value && ok_variant->field_count != 1) die("? binding requires Ok to carry exactly one payload");
