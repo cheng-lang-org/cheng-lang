@@ -10081,6 +10081,23 @@ static void cold_store_required_field_zero(BodyIR *body, int32_t object_slot,
                                  cold_required_object_field(object, field_name));
 }
 
+static bool cold_object_field_fits_slot(BodyIR *body, int32_t object_slot,
+                                        ObjectField *field) {
+    if (body->slot_kind[object_slot] != SLOT_OBJECT) return true;
+    return field->offset >= 0 &&
+           field->size >= 0 &&
+           field->offset + field->size <= body->slot_size[object_slot];
+}
+
+static void cold_store_required_field_if_fits(BodyIR *body, int32_t object_slot,
+                                              ObjectDef *object,
+                                              const char *field_name,
+                                              int32_t value_slot) {
+    ObjectField *field = cold_required_object_field(object, field_name);
+    if (!cold_object_field_fits_slot(body, object_slot, field)) return;
+    cold_store_object_field_slot(body, object_slot, field, value_slot);
+}
+
 static int32_t cold_make_csg_node_slot(BodyIR *body, ObjectDef *node_obj,
                                        int32_t node_id,
                                        int32_t node_kind,
@@ -10216,7 +10233,7 @@ static bool cold_try_csg_intrinsic(Parser *parser, BodyIR *body, Span name,
         }
         cold_store_required_field(body, out_csg, csg_obj, "version", cold_make_i32_const_slot(body, 1));
         cold_store_required_field(body, out_csg, csg_obj, "packageId", package_id);
-        cold_store_required_field(body, out_csg, csg_obj, "sourceBundleCid", source_bundle_cid);
+        cold_store_required_field_if_fits(body, out_csg, csg_obj, "sourceBundleCid", source_bundle_cid);
         cold_store_required_field_zero(body, out_csg, csg_obj, "exprLayer");
         cold_store_required_field_zero(body, out_csg, csg_obj, "typedExprFacts");
         cold_store_required_field_zero(body, out_csg, csg_obj, "typedIr");
@@ -10224,8 +10241,8 @@ static bool cold_try_csg_intrinsic(Parser *parser, BodyIR *body, Span name,
         cold_store_required_field(body, out_csg, csg_obj, "edgeCount", cold_make_i32_const_slot(body, 2));
         cold_store_required_field(body, out_csg, csg_obj, "nodes", nodes_seq);
         cold_store_required_field(body, out_csg, csg_obj, "edges", edges_seq);
-        cold_store_required_field(body, out_csg, csg_obj, "canonicalGraphCid", source_bundle_cid);
-        cold_store_required_field(body, out_csg, csg_obj, "graphCid", source_bundle_cid);
+        cold_store_required_field_if_fits(body, out_csg, csg_obj, "canonicalGraphCid", source_bundle_cid);
+        cold_store_required_field_if_fits(body, out_csg, csg_obj, "graphCid", source_bundle_cid);
         cold_store_str_out_slot(body, err, empty, "BuildCompilerCsgInto err");
         int32_t slot = cold_make_i32_const_slot(body, 1);
         if (kind_out) *kind_out = SLOT_I32;
