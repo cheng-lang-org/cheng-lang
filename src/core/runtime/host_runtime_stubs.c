@@ -81,8 +81,10 @@ W void cheng_host_bytes_copy(void* d, const void* s, size_t n) { memcpy(d,s,n); 
 W void* cheng_host_ptr_plus(void* p, size_t off) { return (char*)p + off; }
 /* Runtime entry points needed by every Cheng program */
 W void __cheng_setCmdLine(int argc, const char** argv) {}
-extern int main(void);
-W int cheng_program_argv_entry(int argc, const char** argv) { (void)argc; (void)argv; return main(); }
+/* cheng_program_argv_entry: provided by primary .o (strong), weak fallback here */
+W int cheng_program_argv_entry(int argc, const char** argv) { (void)argc; (void)argv; return 0; }
+/* CRT entry: calls cheng_program_argv_entry (from primary .o if available) */
+int main(int argc, const char** argv) { return cheng_program_argv_entry(argc, argv); }
 W void cheng_debug_profile_flush_from_argv0(void) {}
 W void cheng_native_register_line_map_from_argv0(void) {}
 W void cheng_panic_cstring_and_exit(const char* msg) { exit(1); }
