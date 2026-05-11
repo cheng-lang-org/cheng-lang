@@ -10056,6 +10056,81 @@ static bool cold_try_backend_intrinsic(Parser *parser, BodyIR *body, Span name,
     return false;
 }
 
+static ObjectDef *cold_resolve_object_any(Symbols *symbols, Span actual_type,
+                                          const char *qualified,
+                                          const char *unqualified) {
+    ObjectDef *object = 0;
+    if (actual_type.len > 0) object = symbols_resolve_object(symbols, cold_type_strip_var(actual_type, 0));
+    if (!object && qualified) object = symbols_resolve_object(symbols, cold_cstr_span(qualified));
+    if (!object && unqualified) object = symbols_resolve_object(symbols, cold_cstr_span(unqualified));
+    return object;
+}
+
+static void cold_store_required_field(BodyIR *body, int32_t object_slot,
+                                      ObjectDef *object,
+                                      const char *field_name,
+                                      int32_t value_slot) {
+    ObjectField *field = cold_required_object_field(object, field_name);
+    cold_store_object_field_slot(body, object_slot, field, value_slot);
+}
+
+static void cold_store_required_field_zero(BodyIR *body, int32_t object_slot,
+                                           ObjectDef *object,
+                                           const char *field_name) {
+    cold_store_object_field_zero(body, object_slot,
+                                 cold_required_object_field(object, field_name));
+}
+
+static int32_t cold_make_csg_node_slot(BodyIR *body, ObjectDef *node_obj,
+                                       int32_t node_id,
+                                       int32_t node_kind,
+                                       int32_t owner_node_id,
+                                       int32_t module_path,
+                                       int32_t symbol_text,
+                                       int32_t fact_text,
+                                       int32_t result_layout_kind,
+                                       int32_t effect_kind,
+                                       int32_t capability_kind,
+                                       int32_t call_conv,
+                                       int32_t entry_flag,
+                                       int32_t exported_flag,
+                                       int32_t export_symbol_name) {
+    int32_t slot = body_slot(body, SLOT_OBJECT, symbols_object_slot_size(node_obj));
+    body_slot_set_type(body, slot, node_obj->name);
+    body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, -1, 0);
+    cold_store_required_field(body, slot, node_obj, "nodeId", cold_make_i32_const_slot(body, node_id));
+    cold_store_required_field(body, slot, node_obj, "nodeKind", cold_make_i32_const_slot(body, node_kind));
+    cold_store_required_field(body, slot, node_obj, "ownerNodeId", cold_make_i32_const_slot(body, owner_node_id));
+    cold_store_required_field(body, slot, node_obj, "modulePath", module_path);
+    cold_store_required_field(body, slot, node_obj, "symbolText", symbol_text);
+    cold_store_required_field(body, slot, node_obj, "factText", fact_text);
+    cold_store_required_field(body, slot, node_obj, "resultLayoutKind", cold_make_i32_const_slot(body, result_layout_kind));
+    cold_store_required_field(body, slot, node_obj, "effectKind", cold_make_i32_const_slot(body, effect_kind));
+    cold_store_required_field(body, slot, node_obj, "capabilityKind", cold_make_i32_const_slot(body, capability_kind));
+    cold_store_required_field(body, slot, node_obj, "callConv", cold_make_i32_const_slot(body, call_conv));
+    cold_store_required_field(body, slot, node_obj, "entryFlag", cold_make_i32_const_slot(body, entry_flag));
+    cold_store_required_field(body, slot, node_obj, "exportedFlag", cold_make_i32_const_slot(body, exported_flag));
+    cold_store_required_field(body, slot, node_obj, "exportSymbolName", export_symbol_name);
+    cold_store_required_field_zero(body, slot, node_obj, "factCid");
+    return slot;
+}
+
+static int32_t cold_make_csg_edge_slot(BodyIR *body, ObjectDef *edge_obj,
+                                       int32_t edge_id,
+                                       int32_t from_node_id,
+                                       int32_t to_node_id,
+                                       int32_t edge_kind) {
+    int32_t slot = body_slot(body, SLOT_OBJECT, symbols_object_slot_size(edge_obj));
+    body_slot_set_type(body, slot, edge_obj->name);
+    body_op3(body, BODY_OP_MAKE_COMPOSITE, slot, 0, -1, 0);
+    cold_store_required_field(body, slot, edge_obj, "edgeId", cold_make_i32_const_slot(body, edge_id));
+    cold_store_required_field(body, slot, edge_obj, "fromNodeId", cold_make_i32_const_slot(body, from_node_id));
+    cold_store_required_field(body, slot, edge_obj, "toNodeId", cold_make_i32_const_slot(body, to_node_id));
+    cold_store_required_field(body, slot, edge_obj, "edgeKind", cold_make_i32_const_slot(body, edge_kind));
+    cold_store_required_field_zero(body, slot, edge_obj, "edgeCid");
+    return slot;
+}
+
 static bool cold_try_csg_intrinsic(Parser *parser, BodyIR *body, Span name,
                                    int32_t arg_start, int32_t arg_count,
                                    int32_t *slot_out, int32_t *kind_out) {
@@ -16881,6 +16956,39 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             int32_t src_slot = body->call_arg_slot[b + item_index];
             int32_t dst_offset = body->call_arg_offset[b + item_index];
             codegen_store_slot_to_offset(code, body, dst, dst_offset, src_slot);
+        }
+    } else if (kind == BODY_OP_MAKE_SEQ_OPAQUE) {
+        codegen_zero_slot(code, body, dst);
+        code_emit(code, a64_movz(R0, (uint16_t)c, 0));
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + 4, false);
+        if (c > 0) {
+            int32_t element_size = b;
+            if (element_size <= 0) die("opaque seq element size missing");
+            int32_t data_bytes = element_size * c;
+            codegen_mmap_const(code, data_bytes, R9, 117);
+            a64_emit_str_sp_off(code, R9, body->slot_offset[dst] + 8, true);
+            for (int32_t item_index = 0; item_index < c; item_index++) {
+                int32_t src_slot = body->call_arg_slot[a + item_index];
+                int32_t item_off = item_index * element_size;
+                int32_t copy_bytes = body->slot_size[src_slot];
+                if (copy_bytes > element_size) copy_bytes = element_size;
+                int32_t off = 0;
+                for (; off + 8 <= copy_bytes; off += 8) {
+                    a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot] + off, true);
+                    code_emit(code, a64_str_imm(R1, R9, item_off + off, true));
+                }
+                if (off + 4 <= copy_bytes) {
+                    a64_emit_ldr_sp_off(code, R1, body->slot_offset[src_slot] + off, false);
+                    code_emit(code, a64_str_imm(R1, R9, item_off + off, false));
+                    off += 4;
+                }
+                for (; off < copy_bytes; off++) {
+                    a64_emit_add_large(code, R10, SP, body->slot_offset[src_slot] + off, true);
+                    code_emit(code, a64_ldrb_imm(R1, R10, 0));
+                    code_emit(code, a64_strb_imm(R1, R9, item_off + off));
+                }
+            }
         }
     } else if (kind == BODY_OP_CALL_I32) {
         if (a < 0 || a >= symbols->function_count) die("invalid function call target");
