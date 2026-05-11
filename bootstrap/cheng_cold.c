@@ -10774,22 +10774,9 @@ static int32_t parse_primary(Parser *parser, BodyIR *body, Locals *locals, int32
     }
     if (span_eq(token, "new") && span_eq(parser_peek(parser), "(")) {
         (void)parser_token(parser);
-        Span tn = parser_token(parser);
+        Span tn = parser_take_type_span(parser);
         if (!parser_take(parser, ")")) die("new(Type): missing )");
-        ObjectDef *nobj = symbols_find_object(parser->symbols, tn);
-        /* Try qualified name lookup if unqualified fails */
-        if (!nobj) {
-            int32_t qlen = 0;
-            for (int32_t qi = 0; qi < parser->symbols->object_count && qlen < 64; qi++) {
-                ObjectDef *co = &parser->symbols->objects[qi];
-                /* Check if name ends with ".tn" */
-                if (co->name.len > tn.len + 1 && co->name.ptr[co->name.len - tn.len - 1] == '.' &&
-                    memcmp(co->name.ptr + co->name.len - tn.len, tn.ptr, (size_t)tn.len) == 0) {
-                    nobj = co;
-                    break;
-                }
-            }
-        }
+        ObjectDef *nobj = symbols_resolve_object(parser->symbols, tn);
         if (nobj && nobj->slot_size > 0) {
             int32_t len = body_slot(body, SLOT_I32, 4);
             body_op(body, BODY_OP_I32_CONST, len, nobj->slot_size, 0);
@@ -13171,7 +13158,6 @@ static int32_t parse_statement(Parser *parser, BodyIR *body, Locals *locals,
                 int32_t vs = parse_expr(parser, body, locals, &vk);
                 Local *base = locals_find(locals, kw);
                 if (!base || (base->kind != SLOT_OBJECT && base->kind != SLOT_OBJECT_REF)) {
-                    if (parser->import_mode) { return block; }
                     die("field-index assign base must be object");
                 }
                 Span obj_ty = cold_type_strip_var(body->slot_type[base->slot], 0);
