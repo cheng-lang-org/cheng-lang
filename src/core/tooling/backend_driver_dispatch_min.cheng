@@ -844,12 +844,19 @@ fn BackendDriverDispatchMinCompileProviderObject(rootDir: str,
         command = Fmt"{os.QuoteShell(coldBin)} system-link-exec --in:{os.QuoteShell(sourcePath)} --emit:obj --target:{linkPlan.targetTriple} --out:{os.QuoteShell(objectPath)} --report-out:{os.QuoteShell(reportPath)}"
     if len(exportRootsText) > 0:
         command = Fmt"{command} --symbol-visibility:internal --export-roots:{os.QuoteShell(exportRootsText)}"
-    let run = os.ExecShellCmdEx(command, uint64(1), rootDir)
-    let output = os.ExecCmdResultOutput(run)
-    let _ = chengpath.WriteTextFile(rootDir, logPath, output)
-    if os.ExecCmdResultExitCode(run) != 0:
-        BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: provider compile failed module={modulePath} log={logPath}")
-        return false
+    if isRuntime:
+        let run = os.ExecShellCmdEx(command, uint64(1), rootDir)
+        let output = os.ExecCmdResultOutput(run)
+        let _ = chengpath.WriteTextFile(rootDir, logPath, output)
+        if os.ExecCmdResultExitCode(run) != 0:
+            BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: provider compile failed module={modulePath} log={logPath}")
+            return false
+    else:
+        let exitCode = os.ExecShellCmdStatus(command, rootDir)
+        let _ = chengpath.WriteTextFile(rootDir, logPath, Fmt"cold_provider_exit_code={exitCode}")
+        if exitCode != 0:
+            BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: provider compile failed module={modulePath} log={logPath}")
+            return false
     if !chengpath.FileExistsNonEmpty(rootDir, objectPath):
         BackendDriverDispatchMinPrintErr(Fmt"backend driver direct: provider object missing: {objectPath}")
         return false
@@ -1479,7 +1486,13 @@ fn BackendDriverDispatchMinRunSystemLinkExecEmitExeProviders(driverRoot: str, re
     let object = Value(objectRes)
     phaseProfile.directObjectEmitNs = BackendDriverDispatchMinNowNs() - phaseProfile.directObjectEmitNs
     BackendDriverDispatchMinProgress("direct_object_emit", "done")
-    let stage3Path = BackendDriverDispatchMinCurrentCompiler(driverRoot)
+    var stage3Path = chengpath.PathAbsolute(driverRoot, "artifacts/bootstrap/cheng.stage3")
+    if !chengpath.FileExistsNonEmpty(driverRoot, stage3Path):
+        stage3Path = chengpath.PathAbsolute(driverRoot, "artifacts/bootstrap/cheng.stage0")
+    if !chengpath.FileExistsNonEmpty(driverRoot, stage3Path):
+        let reason = Fmt"backend driver direct system-link-exec: missing bootstrap compiler for provider objects: {stage3Path}"
+        let _ = BackendDriverDispatchMinWriteErrorReportBridge(driverRoot, reportPath, reason)
+        return BackendDriverDispatchMinUnsupported(reason)
     let selfPath = chengpath.PathAbsolute(driverRoot, "artifacts/backend_driver/cheng")
     if !chengpath.FileExistsNonEmpty(driverRoot, selfPath):
         let reason = Fmt"backend driver direct system-link-exec: missing self compiler for provider objects: {selfPath}"
