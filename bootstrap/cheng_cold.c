@@ -6260,7 +6260,7 @@ static int32_t cold_param_size_from_type(Symbols *symbols, Span type, int32_t ki
 static int32_t cold_arg_reg_count(int32_t kind, int32_t size) {
     if (kind == SLOT_I32 || kind == SLOT_I64 || kind == SLOT_I32_REF || kind == SLOT_I64_REF) return 1;
     if (kind == SLOT_PTR) return 1;
-    if (kind == SLOT_STR) return size > 16 ? 1 : 2;
+    if (kind == SLOT_STR) return 2;
     if (kind == SLOT_VARIANT) return size > 16 ? 1 : 2;
     if (kind == SLOT_OBJECT || kind == SLOT_ARRAY_I32) return size > 16 ? 1 : 2;
     if (kind == SLOT_SEQ_I32) return 2;
@@ -7520,7 +7520,10 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
                     arg_kind == SLOT_VARIANT || arg_kind == SLOT_OPAQUE)) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OPAQUE_REF &&
-                   (arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
+                   (arg_kind == SLOT_I32 || arg_kind == SLOT_I64 ||
+                    arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
+                    arg_kind == SLOT_OBJECT || arg_kind == SLOT_OBJECT_REF ||
+                    arg_kind == SLOT_VARIANT ||
                     arg_kind == SLOT_OPAQUE || arg_kind == SLOT_OPAQUE_REF)) {
             continue;
         } else if (fn->param_kind[i] == SLOT_OBJECT && arg_kind == SLOT_OBJECT_REF) {
@@ -7543,20 +7546,44 @@ static bool cold_call_args_match(BodyIR *body, FnDef *fn, int32_t arg_start, int
 static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
                                         BodyIR *body, int32_t arg_start,
                                         int32_t arg_count) {
+    bool diag_call_match = getenv("COLD_DIAG_CALL_MATCH") && getenv("COLD_DIAG_CALL_MATCH")[0];
+    if (diag_call_match) {
+        fprintf(stderr, "[call_match] lookup %.*s argc=%d args=", name.len, name.ptr, arg_count);
+        for (int32_t p = 0; p < arg_count; p++) {
+            int32_t arg_slot = body->call_arg_slot[arg_start + p];
+            fprintf(stderr, "%s%d/%d", p ? "," : "", body->slot_kind[arg_slot], body->slot_size[arg_slot]);
+        }
+        fputc('\n', stderr);
+    }
     /* first pass: exact match */
     int32_t found = -1;
     for (int32_t i = 0; i < symbols->function_count; i++) {
         FnDef *fn = &symbols->functions[i];
         if (fn->arity != arg_count || !span_same(fn->name, name)) continue;
+        if (diag_call_match) {
+            fprintf(stderr, "[call_match] cand exact fn[%d] params=", i);
+            for (int32_t p = 0; p < arg_count; p++)
+                fprintf(stderr, "%s%d/%d", p ? "," : "", fn->param_kind[p], fn->param_size[p]);
+            fputc('\n', stderr);
+        }
         if (!cold_call_args_match(body, fn, arg_start, arg_count)) continue;
         if (found >= 0) return -1; /* ambiguous: caller should report error */
         found = i;
     }
-    if (found >= 0) return found;
+    if (found >= 0) {
+        if (diag_call_match) fprintf(stderr, "[call_match] exact hit fn[%d]\n", found);
+        return found;
+    }
     /* second pass: OPAQUE-tolerant match (for CSG lowerer with less precise types) */
     for (int32_t i = 0; i < symbols->function_count; i++) {
         FnDef *fn = &symbols->functions[i];
         if (fn->arity != arg_count || !span_same(fn->name, name)) continue;
+        if (diag_call_match) {
+            fprintf(stderr, "[call_match] cand tolerant fn[%d] params=", i);
+            for (int32_t p = 0; p < arg_count; p++)
+                fprintf(stderr, "%s%d/%d", p ? "," : "", fn->param_kind[p], fn->param_size[p]);
+            fputc('\n', stderr);
+        }
         /* OPAQUE-tolerant matching */
         bool match = true;
         for (int32_t p = 0; p < arg_count; p++) {
@@ -7576,6 +7603,7 @@ static int32_t symbols_find_fn_for_call(Symbols *symbols, Span name,
         if (found >= 0) return -1; /* ambiguous even with tolerance */
         found = i;
     }
+    if (diag_call_match) fprintf(stderr, "[call_match] result fn[%d]\n", found);
     return found;
 }
 
@@ -14491,6 +14519,18 @@ static int32_t codegen_load_call_args(Code *code, BodyIR *body, FnDef *fn, int32
             codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
             continue;
         }
+        if (fn->param_kind[i] == SLOT_OPAQUE_REF) {
+            if (arg_kind == SLOT_OPAQUE_REF || arg_kind == SLOT_OBJECT_REF ||
+                arg_kind == SLOT_I32_REF || arg_kind == SLOT_I64_REF ||
+                arg_kind == SLOT_STR_REF || arg_kind == SLOT_SEQ_I32_REF ||
+                arg_kind == SLOT_SEQ_STR_REF) {
+                a64_emit_ldr_sp_off(code, R9, local_offset, true);
+            } else {
+                a64_emit_add_large(code, R9, SP, local_offset, true);
+            }
+            codegen_place_x_arg(code, in_regs, base_reg, stack_offset, R9);
+            continue;
+        }
         if (fn->param_kind[i] == SLOT_I32 && arg_kind == SLOT_I32_REF) {
             a64_emit_ldr_sp_off(code, R9, local_offset, true);
             code_emit(code, a64_ldr_imm(R9, R9, 0, false));
@@ -18820,7 +18860,13 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
                 function_bodies[i] = NULL;
             }
         }
-        Parser parser = {mapped_source, 0, arena, symbols};
+        { int32_t psc = 0; for (int32_t si = 0; si < symbols->function_count; si++) {
+        Span sn = symbols->functions[si].name;
+        if (sn.len >= 8 && memcmp(sn.ptr, "ParamStr", 8) == 0)
+            fprintf(stderr, "[cold_sym] sym[%d] name=%.*s\n", si, (int)sn.len, sn.ptr), psc++;
+      }
+      fprintf(stderr, "[cold_sym] total ParamStr in symbols: %d\n", psc); }
+    Parser parser = {mapped_source, 0, arena, symbols};
         while (parser.pos < mapped_source.len) {
             parser_ws(&parser);
             if (parser.pos >= mapped_source.len) break;
@@ -19029,6 +19075,12 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
     }
 
+    { int32_t psc = 0; for (int32_t si = 0; si < symbols->function_count; si++) {
+        Span sn = symbols->functions[si].name;
+        if (sn.len >= 8 && memcmp(sn.ptr, "ParamStr", 8) == 0)
+            fprintf(stderr, "[cold_sym] sym[%d] name=%.*s\n", si, (int)sn.len, sn.ptr), psc++;
+      }
+      fprintf(stderr, "[cold_sym] total ParamStr in symbols: %d\n", psc); }
     Parser parser = {mapped_source, 0, arena, symbols};
     while (parser.pos < mapped_source.len) {
         parser_ws(&parser);
@@ -19072,6 +19124,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     /* Build map of emitted base names to prevent code duplication */
     bool *name_seen = arena_alloc(arena, (size_t)func_count * sizeof(bool));
     for (int32_t i = 0; i < func_count; i++) name_seen[i] = false;
+    { int32_t bc = 0; for (int32_t bi = 0; bi < func_count; bi++) if (function_bodies[bi]) bc++;
+      fprintf(stderr, "[cold_obj] codegen entry: funcs=%d bodies=%d\n", func_count, bc); }
 
     /* First pass: compile each function body into the shared buffer */
     for (int32_t i = 0; i < func_count; i++) {
@@ -19134,6 +19188,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
                 memcmp(func_names[j], nm.ptr, (size_t)nm.len) == 0) { dup = true; break; }
         }
         if (dup) continue;
+        if (nm.len==8 && memcmp(nm.ptr,"ParamStr",8)==0) fprintf(stderr, "[cold_name] ParamStr from sym[%d] off=%d\n", i, symbol_offset[i]);
         func_offsets[name_count] = symbol_offset[i];
         char *nc = arena_alloc(arena, (size_t)nm.len + 1);
         memcpy(nc, nm.ptr, (size_t)nm.len);
@@ -19142,6 +19197,9 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         name_count++;
     }
 
+    fprintf(stderr, "[cold_final] name_count=%d\n", name_count);
+    for (int32_t di = 85; di < name_count && di < 110; di++) fprintf(stderr, "[cold_final] names[%d]=%s\n", di, func_names[di] ? func_names[di] : "(null)");
+    for (int32_t di = 0; di < name_count && di < 110; di++) { const char *n = func_names[di]; if (n && strcmp(n, "ParamStr")==0) fprintf(stderr, "[cold_final] names[%d]=%s\n", di, n); }
     bool ok = macho_write_object(out_path, shared->words, shared->count,
                                  func_names, func_offsets, name_count);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
@@ -19283,9 +19341,93 @@ static int cold_cmd_system_link_exec(int argc, char **argv) {
         }
     }
 
+        /* --link-providers: compile primary + each import + link with cc */
+    int link_providers = 0;
+    for (int di = 2; di < argc; di++) {
+        if (strcmp(argv[di], "--link-providers") == 0) { link_providers = 1; break; }
+    }
+
     ColdCompileStats stats = {0};
-    bool compiled = false;
-    if (effective_csg_path && effective_csg_path[0] != '\0') {
+    int compiled = 0;
+    if (link_providers && source_path && source_path[0] && strcmp(emit, "exe") == 0) {
+        char primary_o[PATH_MAX], host_stubs_o[PATH_MAX];
+        snprintf(primary_o, sizeof(primary_o), "%s.primary.o", out_path);
+        snprintf(host_stubs_o, sizeof(host_stubs_o), "%s.host_stubs.o", out_path);
+
+        setenv("CHENG_NO_IMPORT_BODIES", "1", 1);
+        if (!cold_compile_source_to_object(primary_o, source_path)) {
+            fprintf(stderr, "[cheng_cold] --link-providers: primary compile failed\n");
+            return 2;
+        }
+        unsetenv("CHENG_NO_IMPORT_BODIES");
+
+        { char cmd[PATH_MAX * 2];
+          snprintf(cmd, sizeof(cmd),
+            "cc -std=c11 -c -o %s src/core/runtime/host_runtime_stubs.c 2>/dev/null",
+            host_stubs_o);
+          int rc = system(cmd);
+          (void)rc;
+        }
+
+        Span source = source_open(source_path);
+        char import_paths[32][PATH_MAX];
+        int import_count = 0;
+        if (source.len > 0) {
+            int pos = 0;
+            while (pos < source.len && import_count < 32) {
+                while (pos < source.len && source.ptr[pos] != 'i') pos++;
+                if (pos >= source.len) break;
+                if (strncmp((const char *)(source.ptr + pos), "import ", 7) == 0) {
+                    pos += 7;
+                    int start = pos;
+                    while (pos < source.len && source.ptr[pos] != '\n') pos++;
+                    Span import_line = {source.ptr + start, pos - start};
+                    Span module_path = {0}, alias = {0};
+                    if (cold_parse_import_line(import_line, &module_path, &alias) &&
+                        module_path.len > 0) {
+                        char resolved[PATH_MAX];
+                        if (cold_import_source_path(module_path, resolved, sizeof(resolved))) {
+                            snprintf(import_paths[import_count], PATH_MAX, "%s", resolved);
+                            import_count++;
+                        }
+                    }
+                }
+                pos++;
+            }
+            munmap((void *)source.ptr, (size_t)source.len);
+        }
+
+        char provider_o[32][PATH_MAX];
+        int provider_count = 0;
+        for (int i = 0; i < import_count; i++) {
+            snprintf(provider_o[provider_count], PATH_MAX,
+              "%s.provider.%d.o", out_path, i);
+            if (!cold_compile_source_to_object(provider_o[provider_count], import_paths[i])) {
+                fprintf(stderr, "[cheng_cold] --link-providers: skip import %s\n",
+                  import_paths[i]);
+                continue;
+            }
+            provider_count++;
+        }
+
+        { char cmd[PATH_MAX * 8];
+          int off = snprintf(cmd, sizeof(cmd),
+            "cc -arch arm64 %s %s", host_stubs_o, primary_o);
+          for (int i = 0; i < provider_count; i++)
+              off += snprintf(cmd + off, sizeof(cmd) - off, " %s", provider_o[i]);
+          snprintf(cmd + off, sizeof(cmd) - off, " -lc -o %s", out_path);
+          int rc = system(cmd);
+          unlink(primary_o);
+          for (int i = 0; i < provider_count; i++) unlink(provider_o[i]);
+          if (rc != 0) {
+            fprintf(stderr, "[cheng_cold] --link-providers: link failed\n");
+            cold_write_system_link_exec_report(report_path, false, source_path, 0, out_path,
+                                               target, emit, &stats, "provider link failed");
+            return 2;
+          }
+          compiled = 1;
+        }
+    } else if (effective_csg_path && effective_csg_path[0]) {
         compiled = cold_compile_csg_path_to_macho(out_path, effective_csg_path, source_path,
                                                   workspace_root[0] ? workspace_root : 0, &stats);
     } else {
