@@ -5996,6 +5996,7 @@ static int32_t cold_lower_question_result(Symbols *symbols, BodyIR *body, Locals
                                           Span bind_name, bool bind_value,
                                           int32_t declared_kind, Span declared_type) {
     TypeDef *type = cold_question_result_type(symbols, body, variant_slot);
+    if (!type || !type->variants) return block;
     Variant *ok_variant = &type->variants[0];
     Variant *err_variant = &type->variants[1];
     if (bind_value && ok_variant->field_count != 1) die("? binding requires Ok to carry exactly one payload");
@@ -20439,7 +20440,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             (body->block_count > 0 && body->block_term[0] < 0)) {
             /* Emit stub that zero-initializes the return slot */
             symbol_offset[i] = shared->count;
-            if (body->return_kind == SLOT_STR) {
+            if (body->return_kind == SLOT_STR && body->slot_offset) {
                 code_emit(shared, a64_movz(R0, 0, 0));
                 a64_emit_str_sp_off(shared, R0, body->slot_offset[0], true);
                 a64_emit_str_sp_off(shared, R0, body->slot_offset[0] + 8, true);
@@ -20455,7 +20456,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             } else {
                 /* Composite returns: zero the sret buffer */
                 int32_t sret = body->sret_slot;
-                if (sret >= 0) {
+                if (sret >= 0 && body->slot_offset &&
+                    sret < body->slot_count) {
                     a64_emit_ldr_sp_off(shared, R0, body->slot_offset[sret], true);
                     codegen_zero_slot(shared, body, sret);
                 }
