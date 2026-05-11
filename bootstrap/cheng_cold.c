@@ -4622,6 +4622,7 @@ enum {
     BODY_OP_I32_FROM_F64 = 112,
     BODY_OP_FN_ADDR = 113,
     BODY_OP_CALL_PTR = 114,
+    BODY_OP_SELECT = 116,
 };
 
 enum {
@@ -10960,6 +10961,12 @@ static int32_t parse_arith_expr(Parser *parser, BodyIR *body, Locals *locals, in
     return left;
 }
 
+static int32_t cold_lower_select_expr(Parser *parser, BodyIR *body,
+                                      int32_t cond_slot, int32_t *cond_kind,
+                                      int32_t true_slot, int32_t *true_kind,
+                                      int32_t false_slot, int32_t *false_kind,
+                                      int32_t *out_kind);
+
 static int32_t parse_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
     int32_t left_kind = SLOT_I32;
     int32_t left = parse_compare_expr(parser, body, locals, &left_kind);
@@ -10975,8 +10982,75 @@ static int32_t parse_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t 
         left = dst;
         left_kind = SLOT_I32;
     }
+    if (span_eq(parser_peek(parser), "?")) {
+        (void)parser_token(parser);
+        int32_t true_kind = SLOT_I32;
+        int32_t true_slot = parse_expr(parser, body, locals, &true_kind);
+        if (!parser_take(parser, ":")) die("expected : in ternary expression");
+        int32_t false_kind = SLOT_I32;
+        int32_t false_slot = parse_expr(parser, body, locals, &false_kind);
+        left = cold_lower_select_expr(parser, body, left, &left_kind,
+                                      true_slot, &true_kind,
+                                      false_slot, &false_kind,
+                                      &left_kind);
+    }
     *kind = left_kind;
     return left;
+}
+
+static bool cold_expr_kind_is_64bit_scalar(int32_t kind) {
+    return kind == SLOT_I64 || kind == SLOT_PTR || kind == SLOT_OPAQUE ||
+           kind == SLOT_OPAQUE_REF || kind == SLOT_OBJECT_REF ||
+           kind == SLOT_STR_REF || kind == SLOT_SEQ_I32_REF ||
+           kind == SLOT_SEQ_STR_REF || kind == SLOT_I64_REF;
+}
+
+static int32_t cold_materialize_str_data_ptr(BodyIR *body, int32_t slot, int32_t *kind) {
+    if (*kind != SLOT_STR && *kind != SLOT_STR_REF) return slot;
+    int32_t dst = body_slot(body, SLOT_PTR, 8);
+    body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, slot, COLD_STR_DATA_OFFSET, 8);
+    *kind = SLOT_PTR;
+    return dst;
+}
+
+static int32_t cold_lower_select_expr(Parser *parser, BodyIR *body,
+                                      int32_t cond_slot, int32_t *cond_kind,
+                                      int32_t true_slot, int32_t *true_kind,
+                                      int32_t false_slot, int32_t *false_kind,
+                                      int32_t *out_kind) {
+    cond_slot = cold_materialize_i32_ref(body, cond_slot, cond_kind);
+    if (*cond_kind != SLOT_I32) die("ternary condition must be bool/int32");
+    if ((*true_kind == SLOT_STR || *true_kind == SLOT_STR_REF) &&
+        (*false_kind == SLOT_PTR || cold_expr_kind_is_64bit_scalar(*false_kind))) {
+        true_slot = cold_materialize_str_data_ptr(body, true_slot, true_kind);
+    } else if ((*false_kind == SLOT_STR || *false_kind == SLOT_STR_REF) &&
+               (*true_kind == SLOT_PTR || cold_expr_kind_is_64bit_scalar(*true_kind))) {
+        false_slot = cold_materialize_str_data_ptr(body, false_slot, false_kind);
+    }
+    if (*true_kind == SLOT_I32 && *false_kind == SLOT_I64) {
+        true_slot = cold_materialize_i64_value(body, true_slot, true_kind);
+    } else if (*true_kind == SLOT_I64 && *false_kind == SLOT_I32) {
+        false_slot = cold_materialize_i64_value(body, false_slot, false_kind);
+    }
+    if (*true_kind == SLOT_PTR && cold_expr_kind_is_64bit_scalar(*false_kind)) {
+        *false_kind = SLOT_PTR;
+    } else if (*false_kind == SLOT_PTR && cold_expr_kind_is_64bit_scalar(*true_kind)) {
+        *true_kind = SLOT_PTR;
+    }
+    if (*true_kind != *false_kind) {
+        Span near = span_sub(parser->source, parser->pos > 48 ? parser->pos - 48 : 0, parser->pos);
+        fprintf(stderr, "cheng_cold: ternary branch type mismatch near `%.*s`: true=%d false=%d\n",
+                near.len, near.ptr, *true_kind, *false_kind);
+        exit(2);
+    }
+    int32_t size = body->slot_size[true_slot];
+    if (body->slot_size[false_slot] > size) size = body->slot_size[false_slot];
+    int32_t dst = body_slot(body, *true_kind, size);
+    if (body->slot_type[true_slot].len > 0) body_slot_set_type(body, dst, body->slot_type[true_slot]);
+    else if (body->slot_type[false_slot].len > 0) body_slot_set_type(body, dst, body->slot_type[false_slot]);
+    body_op3(body, BODY_OP_SELECT, dst, cond_slot, true_slot, false_slot);
+    *out_kind = *true_kind;
+    return dst;
 }
 
 static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
@@ -16169,6 +16243,17 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_COPY_I64) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_SELECT) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        code_emit(code, a64_cmp_imm(R0, 0));
+        int32_t false_pos = code->count;
+        code_emit(code, a64_bcond(0, COND_EQ));
+        codegen_copy_slot_to_slot(code, body, dst, b);
+        int32_t done_pos = code->count;
+        code_emit(code, a64_b(0));
+        a64_patch_bcond(code, false_pos, code->count);
+        codegen_copy_slot_to_slot(code, body, dst, c);
+        a64_patch_b(code, done_pos, code->count);
     } else if (kind == BODY_OP_I64_FROM_I32) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_sxtw(R0, R0));
@@ -19177,10 +19262,18 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
         if (dup) continue;
         func_offsets[name_count] = symbol_offset[i];
-        char *nc = arena_alloc(arena, (size_t)nm.len + 1);
-        memcpy(nc, nm.ptr, (size_t)nm.len);
-        nc[nm.len] = '\0';
-        func_names[name_count] = nc;
+        /* Provider mode: rename main to cheng_program_argv_entry */
+        if (getenv("CHENG_RENAME_MAIN") && nm.len == 4 && memcmp(nm.ptr, "main", 4) == 0) {
+            char *nc = arena_alloc(arena, 26);
+            memcpy(nc, "cheng_program_argv_entry", 25);
+            nc[25] = '\0';
+            func_names[name_count] = nc;
+        } else {
+            char *nc = arena_alloc(arena, (size_t)nm.len + 1);
+            memcpy(nc, nm.ptr, (size_t)nm.len);
+            nc[nm.len] = '\0';
+            func_names[name_count] = nc;
+        }
         name_count++;
     }
 
