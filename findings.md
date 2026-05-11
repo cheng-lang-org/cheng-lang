@@ -230,3 +230,9 @@
 
 - 生成版 `backend_driver_dispatch_min` 已能对 `src/tests/import_use.cheng` 执行 `system-link-exec --emit:obj`，产出 arm64 Mach-O object；该 object 经 `cc` 链接后运行 exit `3`。
 - 回归新增 `dispatch_min_self_emit_obj_cross` 和 `dispatch_min_self_emit_obj_direct`，同时锁 `emit=obj/direct_macho=1/provider_object_count=0/system_link=0`，对象 writer 现在由生成物自己证明。
+
+## Cold linkerless backend driver
+
+- 生成版 `backend_driver_dispatch_min` 已能编译 `src/core/tooling/backend_driver_dispatch_min.cheng` 自身，二代产物 `status` 运行成功并输出 `bootstrap_mode=selfhost`、`flag_exec_edges=0`、`flag_exec_unresolved=0`。
+- `cold_cmd_build_backend_driver` 已删除旧的 compile 非零后扫描 `.o` 并用 `cc` 链接路径；现在 `compile-bootstrap` 失败即失败。`build_backend_driver_no_cc_fallback` 回归锁住输出和报告中不出现 `cold_cc_link`。
+- 本轮顺手修掉 `parse_call` import-mode 未解析调用返回 0 slot 的旧缺口；`parse_call` 与 `parse_call_from_args_span` 现在一致 hard-fail，`import_unresolved_hard_fail` 恢复稳定。

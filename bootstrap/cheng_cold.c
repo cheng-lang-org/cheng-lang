@@ -7911,7 +7911,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
               param_sizes[ai] = body->slot_size[body->call_arg_slot[arg_start + ai]];
           }
           if (parser->import_mode) {
-              /* Import bodies may call only predeclared symbols. */
+              /* In import mode, do not add new symbols — skip unresolved calls */
               fn_index = symbols_find_fn(parser->symbols, lookup_name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
           } else {
               fn_index = symbols_add_fn(parser->symbols, name, arg_count, param_kinds, param_sizes, cold_cstr_span("i"));
@@ -7920,11 +7920,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
       }
     }
     if (parser->import_mode && fn_index < 0) {
-        /* Skip unresolved import call: return zero slot */
-        int32_t slot = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
-        if (kind_out) *kind_out = SLOT_I32;
-        return slot;
+        die("unresolved cold import function call");
     }
     FnDef *fn = &parser->symbols->functions[fn_index];
     cold_validate_call_args(body, fn, arg_start, arg_count);
