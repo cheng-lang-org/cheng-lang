@@ -17126,6 +17126,9 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
         } else if (ret_kind == SLOT_I64 || ret_kind == SLOT_PTR) {
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+        } else if (ret_kind == SLOT_STR) {
+            a64_emit_str_sp_off(code, 31, body->slot_offset[dst] + COLD_STR_STORE_ID_OFFSET, false);
+            a64_emit_str_sp_off(code, 31, body->slot_offset[dst] + COLD_STR_FLAGS_OFFSET, false);
         }
     } else if (kind == BODY_OP_COPY_COMPOSITE) {
         int32_t src_kind = body->slot_kind[a];
@@ -18976,6 +18979,8 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
                 parse_type(&parser);
             } else if (span_eq(next, "const")) {
                 parse_const(&parser);
+            } else if (span_eq(next, "var")) {
+                parse_global_var(&parser);
             } else if (span_eq(next, "fn")) {
                 volatile int32_t symbol_index = -1;
                 volatile BodyIR *volatile body2 = 0;
@@ -19185,6 +19190,8 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             parse_type(&parser);
         } else if (span_eq(next, "const")) {
             parse_const(&parser);
+        } else if (span_eq(next, "var")) {
+            parse_global_var(&parser);
         } else if (span_eq(next, "fn")) {
             int32_t symbol_index = -1;
             BodyIR *body = parse_fn(&parser, &symbol_index);
