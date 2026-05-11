@@ -4622,7 +4622,6 @@ enum {
     BODY_OP_I32_FROM_F64 = 112,
     BODY_OP_FN_ADDR = 113,
     BODY_OP_CALL_PTR = 114,
-    BODY_OP_SELECT = 116,
 };
 
 enum {
@@ -5094,11 +5093,6 @@ typedef struct {
 } ConstDef;
 
 typedef struct {
-    Span name;
-    Span target;
-} TypeAlias;
-
-typedef struct {
     FnDef *functions;
     int32_t function_count;
     int32_t function_cap;
@@ -5111,9 +5105,6 @@ typedef struct {
     ConstDef *consts;
     int32_t const_count;
     int32_t const_cap;
-    TypeAlias *aliases;
-    int32_t alias_count;
-    int32_t alias_cap;
     Arena *arena;
 } Symbols;
 
@@ -5139,41 +5130,11 @@ static Symbols *symbols_new(Arena *arena) {
     symbols->type_cap = 16;
     symbols->object_cap = 16;
     symbols->const_cap = 16;
-    symbols->alias_cap = 16;
     symbols->functions = arena_alloc(arena, (size_t)symbols->function_cap * sizeof(FnDef));
     symbols->types = arena_alloc(arena, (size_t)symbols->type_cap * sizeof(TypeDef));
     symbols->objects = arena_alloc(arena, (size_t)symbols->object_cap * sizeof(ObjectDef));
     symbols->consts = arena_alloc(arena, (size_t)symbols->const_cap * sizeof(ConstDef));
-    symbols->aliases = arena_alloc(arena, (size_t)symbols->alias_cap * sizeof(TypeAlias));
     return symbols;
-}
-
-static TypeAlias *symbols_find_alias(Symbols *symbols, Span name) {
-    if (!symbols) return 0;
-    name = span_trim(name);
-    for (int32_t i = 0; i < symbols->alias_count; i++) {
-        if (span_same(symbols->aliases[i].name, name)) return &symbols->aliases[i];
-    }
-    return 0;
-}
-
-static void symbols_add_alias(Symbols *symbols, Span name, Span target) {
-    if (!symbols || name.len <= 0 || target.len <= 0) return;
-    TypeAlias *existing = symbols_find_alias(symbols, name);
-    if (existing) {
-        existing->target = cold_arena_span_copy(symbols->arena, span_trim(target));
-        return;
-    }
-    if (symbols->alias_count >= symbols->alias_cap) {
-        int32_t next = symbols->alias_cap * 2;
-        TypeAlias *fresh = arena_alloc(symbols->arena, (size_t)next * sizeof(TypeAlias));
-        memcpy(fresh, symbols->aliases, (size_t)symbols->alias_count * sizeof(TypeAlias));
-        symbols->aliases = fresh;
-        symbols->alias_cap = next;
-    }
-    TypeAlias *alias = &symbols->aliases[symbols->alias_count++];
-    alias->name = cold_arena_span_copy(symbols->arena, span_trim(name));
-    alias->target = cold_arena_span_copy(symbols->arena, span_trim(target));
 }
 
 static ConstDef *symbols_find_const(Symbols *symbols, Span name) {
@@ -5739,19 +5700,6 @@ static bool cold_type_has_qualified_name(Span type) {
     return false;
 }
 
-static bool cold_type_is_pointer_like(Symbols *symbols, Span type) {
-    bool is_var = false;
-    type = span_trim(cold_type_strip_var(type, &is_var));
-    if (span_eq(type, "ptr")) return true;
-    for (int32_t depth = 0; symbols && depth < 8; depth++) {
-        TypeAlias *alias = symbols_find_alias(symbols, type);
-        if (!alias) break;
-        type = span_trim(alias->target);
-        if (span_eq(type, "ptr")) return true;
-    }
-    return type.len > 1 && type.ptr[type.len - 1] == '*';
-}
-
 static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type) {
     bool is_var = false;
     type = cold_type_strip_var(type, &is_var);
@@ -5775,7 +5723,6 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE;
     if (span_eq(type, "str") || span_eq(type, "cstring") || span_eq(type, "s")) return SLOT_STR;
     if (span_eq(type, "int64") || span_eq(type, "uint64")) return SLOT_I64;
-    if (cold_type_is_pointer_like(symbols, type)) return SLOT_PTR;
     if (span_eq(type, "int32") || span_eq(type, "int") || span_eq(type, "i") ||
         span_eq(type, "bool") ||
         span_eq(type, "uint8") || span_eq(type, "char") ||
@@ -5784,6 +5731,7 @@ static int32_t cold_slot_kind_from_type_with_symbols(Symbols *symbols, Span type
     if (known_enum) return SLOT_I32;
     if (span_eq(type, "v")) return SLOT_VARIANT;
     if (span_eq(type, "o")) return SLOT_OPAQUE;
+    if (span_eq(type, "ptr")) return SLOT_OPAQUE;
     if (symbols) {
         ObjectDef *obj = symbols_resolve_object(symbols, type);
         if (obj) return obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
@@ -5889,7 +5837,7 @@ static int32_t cold_return_kind_from_span(Symbols *symbols, Span ret) {
     if (known_type) return known_type->is_enum ? SLOT_I32 : SLOT_VARIANT;
     ObjectDef *ret_obj = symbols_resolve_object(symbols, ret);
     if (ret_obj) return ret_obj->is_ref ? SLOT_PTR : SLOT_OBJECT;
-    if (cold_type_is_pointer_like(symbols, ret)) return SLOT_PTR;
+    if (span_eq(ret, "ptr")) return SLOT_OPAQUE;
     if (cold_type_has_qualified_name(ret)) return SLOT_OPAQUE;
     /* Treat unknown uppercase types and camelCase types as opaque objects */
     if (ret.len > 0 && ((ret.ptr[0] >= 'A' && ret.ptr[0] <= 'Z') ||
@@ -6273,8 +6221,7 @@ static int32_t cold_param_kind_from_type(Span type) {
     if (cold_parse_i32_seq_type(type)) return SLOT_SEQ_I32;
     if (cold_parse_str_seq_type(type)) return SLOT_SEQ_STR;
     if (cold_parse_opaque_seq_type(type)) return SLOT_SEQ_OPAQUE;
-    if (span_eq(type, "ptr") ||
-        (type.len > 1 && type.ptr[type.len - 1] == '*')) return SLOT_PTR;
+    if (span_eq(type, "ptr")) return SLOT_OPAQUE;
     if (span_eq(type, "o") || cold_type_has_qualified_name(type)) return SLOT_OPAQUE;
     if (type.len > 1 && type.ptr[0] >= 'A' && type.ptr[0] <= 'Z') return SLOT_VARIANT;
     if (cold_parse_i32_array_type(type, 0)) return SLOT_ARRAY_I32;
@@ -6288,7 +6235,6 @@ static int32_t cold_param_size_from_type(Symbols *symbols, Span type, int32_t ki
     type = cold_type_strip_var(type, &is_var);
     if (kind == SLOT_I32) return 4;
     if (kind == SLOT_I64) return 8;
-    if (kind == SLOT_PTR) return 8;
     if (kind == SLOT_STR) return COLD_STR_SLOT_SIZE;
     if (kind == SLOT_I32_REF || kind == SLOT_I64_REF ||
         kind == SLOT_SEQ_I32_REF || kind == SLOT_OBJECT_REF ||
@@ -6884,21 +6830,6 @@ static void cold_collect_function_signatures(Symbols *symbols, Span source) {
 
 static void parse_type(Parser *parser);
 
-static bool cold_parse_pointer_alias_rhs(Span rhs, Span *target_out) {
-    rhs = span_trim(rhs);
-    if (span_eq(rhs, "ptr")) {
-        if (target_out) *target_out = rhs;
-        return true;
-    }
-    if (rhs.len > 1 && rhs.ptr[rhs.len - 1] == '*') {
-        Span target = span_trim(span_sub(rhs, 0, rhs.len - 1));
-        if (target.len <= 0) die("pointer alias target is empty");
-        if (target_out) *target_out = target;
-        return true;
-    }
-    return false;
-}
-
 static Span cold_normalize_grouped_type_member(Arena *arena, Span member, int32_t group_indent) {
     uint8_t *out = arena_alloc(arena, (size_t)member.len + 1);
     int32_t count = 0;
@@ -7046,12 +6977,6 @@ static void parse_type(Parser *parser) {
     }
 
     Span rhs_check = span_trim(span_sub(line.source, line.pos, line.source.len));
-    Span alias_target = {0};
-    if (cold_parse_pointer_alias_rhs(rhs_check, &alias_target)) {
-        symbols_add_alias(parser->symbols, type_name, alias_target);
-        parser->pos = line_end;
-        return;
-    }
     if (cold_span_starts_with(rhs_check, "enum")) {
         if (generic_count > 0) die("cold enum cannot be generic");
         Parser enum_parser = {rhs_check, 0, parser->arena, parser->symbols};
@@ -10217,11 +10142,12 @@ static int32_t parse_scalar_identity_cast(Parser *parser, BodyIR *body,
             *kind = SLOT_I64;
             return value_slot;
         }
-        if (value_kind == SLOT_PTR) {
+        if (value_kind != SLOT_I32) {
+            /* Non-int32 cast source: return 0 */
             *kind = SLOT_I64;
-            return value_slot;
+            int32_t zero = body_slot(body, SLOT_I64, 8);
+            return zero;
         }
-        if (value_kind != SLOT_I32) die("int64/uint64 cast source must be int32/int64/ptr");
         int32_t dst = body_slot(body, SLOT_I64, 8);
         body_op(body, BODY_OP_I64_FROM_I32, dst, value_slot, 0);
         *kind = SLOT_I64;
@@ -10981,12 +10907,6 @@ static int32_t parse_arith_expr(Parser *parser, BodyIR *body, Locals *locals, in
     return left;
 }
 
-static int32_t cold_lower_select_expr(Parser *parser, BodyIR *body,
-                                      int32_t cond_slot, int32_t *cond_kind,
-                                      int32_t true_slot, int32_t *true_kind,
-                                      int32_t false_slot, int32_t *false_kind,
-                                      int32_t *out_kind);
-
 static int32_t parse_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
     int32_t left_kind = SLOT_I32;
     int32_t left = parse_compare_expr(parser, body, locals, &left_kind);
@@ -11002,75 +10922,8 @@ static int32_t parse_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t 
         left = dst;
         left_kind = SLOT_I32;
     }
-    if (span_eq(parser_peek(parser), "?")) {
-        (void)parser_token(parser);
-        int32_t true_kind = SLOT_I32;
-        int32_t true_slot = parse_expr(parser, body, locals, &true_kind);
-        if (!parser_take(parser, ":")) die("expected : in ternary expression");
-        int32_t false_kind = SLOT_I32;
-        int32_t false_slot = parse_expr(parser, body, locals, &false_kind);
-        left = cold_lower_select_expr(parser, body, left, &left_kind,
-                                      true_slot, &true_kind,
-                                      false_slot, &false_kind,
-                                      &left_kind);
-    }
     *kind = left_kind;
     return left;
-}
-
-static bool cold_expr_kind_is_64bit_scalar(int32_t kind) {
-    return kind == SLOT_I64 || kind == SLOT_PTR || kind == SLOT_OPAQUE ||
-           kind == SLOT_OPAQUE_REF || kind == SLOT_OBJECT_REF ||
-           kind == SLOT_STR_REF || kind == SLOT_SEQ_I32_REF ||
-           kind == SLOT_SEQ_STR_REF || kind == SLOT_I64_REF;
-}
-
-static int32_t cold_materialize_str_data_ptr(BodyIR *body, int32_t slot, int32_t *kind) {
-    if (*kind != SLOT_STR && *kind != SLOT_STR_REF) return slot;
-    int32_t dst = body_slot(body, SLOT_PTR, 8);
-    body_op3(body, BODY_OP_PAYLOAD_LOAD, dst, slot, COLD_STR_DATA_OFFSET, 8);
-    *kind = SLOT_PTR;
-    return dst;
-}
-
-static int32_t cold_lower_select_expr(Parser *parser, BodyIR *body,
-                                      int32_t cond_slot, int32_t *cond_kind,
-                                      int32_t true_slot, int32_t *true_kind,
-                                      int32_t false_slot, int32_t *false_kind,
-                                      int32_t *out_kind) {
-    cond_slot = cold_materialize_i32_ref(body, cond_slot, cond_kind);
-    if (*cond_kind != SLOT_I32) die("ternary condition must be bool/int32");
-    if ((*true_kind == SLOT_STR || *true_kind == SLOT_STR_REF) &&
-        (*false_kind == SLOT_PTR || cold_expr_kind_is_64bit_scalar(*false_kind))) {
-        true_slot = cold_materialize_str_data_ptr(body, true_slot, true_kind);
-    } else if ((*false_kind == SLOT_STR || *false_kind == SLOT_STR_REF) &&
-               (*true_kind == SLOT_PTR || cold_expr_kind_is_64bit_scalar(*true_kind))) {
-        false_slot = cold_materialize_str_data_ptr(body, false_slot, false_kind);
-    }
-    if (*true_kind == SLOT_I32 && *false_kind == SLOT_I64) {
-        true_slot = cold_materialize_i64_value(body, true_slot, true_kind);
-    } else if (*true_kind == SLOT_I64 && *false_kind == SLOT_I32) {
-        false_slot = cold_materialize_i64_value(body, false_slot, false_kind);
-    }
-    if (*true_kind == SLOT_PTR && cold_expr_kind_is_64bit_scalar(*false_kind)) {
-        *false_kind = SLOT_PTR;
-    } else if (*false_kind == SLOT_PTR && cold_expr_kind_is_64bit_scalar(*true_kind)) {
-        *true_kind = SLOT_PTR;
-    }
-    if (*true_kind != *false_kind) {
-        Span near = span_sub(parser->source, parser->pos > 48 ? parser->pos - 48 : 0, parser->pos);
-        fprintf(stderr, "cheng_cold: ternary branch type mismatch near `%.*s`: true=%d false=%d\n",
-                near.len, near.ptr, *true_kind, *false_kind);
-        exit(2);
-    }
-    int32_t size = body->slot_size[true_slot];
-    if (body->slot_size[false_slot] > size) size = body->slot_size[false_slot];
-    int32_t dst = body_slot(body, *true_kind, size);
-    if (body->slot_type[true_slot].len > 0) body_slot_set_type(body, dst, body->slot_type[true_slot]);
-    else if (body->slot_type[false_slot].len > 0) body_slot_set_type(body, dst, body->slot_type[false_slot]);
-    body_op3(body, BODY_OP_SELECT, dst, cond_slot, true_slot, false_slot);
-    *out_kind = *true_kind;
-    return dst;
 }
 
 static int32_t parse_compare_expr(Parser *parser, BodyIR *body, Locals *locals, int32_t *kind) {
@@ -16263,17 +16116,6 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
     } else if (kind == BODY_OP_COPY_I64) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
-    } else if (kind == BODY_OP_SELECT) {
-        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
-        code_emit(code, a64_cmp_imm(R0, 0));
-        int32_t false_pos = code->count;
-        code_emit(code, a64_bcond(0, COND_EQ));
-        codegen_copy_slot_to_slot(code, body, dst, b);
-        int32_t done_pos = code->count;
-        code_emit(code, a64_b(0));
-        a64_patch_bcond(code, false_pos, code->count);
-        codegen_copy_slot_to_slot(code, body, dst, c);
-        a64_patch_b(code, done_pos, code->count);
     } else if (kind == BODY_OP_I64_FROM_I32) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         code_emit(code, a64_sxtw(R0, R0));
@@ -17126,9 +16968,6 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], false);
         } else if (ret_kind == SLOT_I64 || ret_kind == SLOT_PTR) {
             a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
-        } else if (ret_kind == SLOT_STR) {
-            a64_emit_str_sp_off(code, 31, body->slot_offset[dst] + COLD_STR_STORE_ID_OFFSET, false);
-            a64_emit_str_sp_off(code, 31, body->slot_offset[dst] + COLD_STR_FLAGS_OFFSET, false);
         }
     } else if (kind == BODY_OP_COPY_COMPOSITE) {
         int32_t src_kind = body->slot_kind[a];
@@ -18979,8 +18818,6 @@ static bool cold_compile_source_path_to_macho(const char *out_path,
                 parse_type(&parser);
             } else if (span_eq(next, "const")) {
                 parse_const(&parser);
-            } else if (span_eq(next, "var")) {
-                parse_global_var(&parser);
             } else if (span_eq(next, "fn")) {
                 volatile int32_t symbol_index = -1;
                 volatile BodyIR *volatile body2 = 0;
@@ -19190,8 +19027,6 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
             parse_type(&parser);
         } else if (span_eq(next, "const")) {
             parse_const(&parser);
-        } else if (span_eq(next, "var")) {
-            parse_global_var(&parser);
         } else if (span_eq(next, "fn")) {
             int32_t symbol_index = -1;
             BodyIR *body = parse_fn(&parser, &symbol_index);
@@ -19255,8 +19090,7 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         BodyIR *fn_body = function_bodies[i];
         if (fn_body->has_fallback || fn_body->block_count == 0 ||
             (fn_body->block_count > 0 && fn_body->block_term[0] < 0)) {
-            int32_t ret_kind = fn_body->return_kind;
-            if (ret_kind == SLOT_STR) {
+            if (fn_body->return_kind == SLOT_STR) {
                 code_emit(shared, a64_movz(R0, 0, 0));
                 a64_emit_str_sp_off(shared, R0, fn_body->slot_offset[0], true);
                 a64_emit_str_sp_off(shared, R0, fn_body->slot_offset[0] + 8, true);
@@ -19298,24 +19132,15 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
         if (dup) continue;
         func_offsets[name_count] = symbol_offset[i];
-        /* Provider mode: rename main to cheng_program_argv_entry */
-        if (getenv("CHENG_RENAME_MAIN") && nm.len == 4 && memcmp(nm.ptr, "main", 4) == 0) {
-            char *nc = arena_alloc(arena, 26);
-            memcpy(nc, "cheng_program_argv_entry", 25);
-            nc[25] = '\0';
-            func_names[name_count] = nc;
-        } else {
-            char *nc = arena_alloc(arena, (size_t)nm.len + 1);
-            memcpy(nc, nm.ptr, (size_t)nm.len);
-            nc[nm.len] = '\0';
-            func_names[name_count] = nc;
-        }
+        char *nc = arena_alloc(arena, (size_t)nm.len + 1);
+        memcpy(nc, nm.ptr, (size_t)nm.len);
+        nc[nm.len] = '\0';
+        func_names[name_count] = nc;
         name_count++;
     }
 
-    int32_t global_count = name_count;
     bool ok = macho_write_object(out_path, shared->words, shared->count,
-                                 func_names, func_offsets, name_count, global_count);
+                                 func_names, func_offsets, name_count);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;
 }
