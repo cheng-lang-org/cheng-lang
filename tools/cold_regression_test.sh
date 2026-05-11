@@ -297,6 +297,9 @@ assert "emit_obj_cross" 3 "$ACT"
 ACT=$(compile_run src/tests/cold_subset_coverage.cheng /tmp/ct_cov)
 assert "subset_coverage" 0 "$ACT"
 
+ACT=$(compile_run src/tests/cold_stack_arg_abi.cheng /tmp/ct_stack_arg_abi)
+assert "stack_arg_abi" 0 "$ACT"
+
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

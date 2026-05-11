@@ -64,5 +64,7 @@
 - 当前硬边界：`ccsg.BuildCompilerCsgInto` 仍是严格未接入边界；下一步必须接真实 CSG materializer（至少 `CompilerCsg.nodes/edges/exprLayer/typedExprFacts/sourceBundleCid` 的结构化对象写入），再推进 `lowering_plan -> primary_object_plan -> direct_object_emit`，不能返回空 CSG 或假成功。
 - 距离完全体还差：真实 CSG source closure、真实 lowering plan、真实 primary object plan、direct object/exe/linkerless image、完整 ARM64 编码与重定位、每次编译稳定 phase/report sidecar、mmap span/phase arena/SoA/int32 index/单扫 facts、lock-free work-stealing 并行、10万-30万行核心 30-80ms 冷自举验证。
 - source->CSG 仍未同步本轮能力：`cold_bootstrap_backend_dispatch_type_surface --csg-out` 当前失败，原因是旧 statement scanner 仍会把多行函数签名续行当成 statement；下一步修 CSG writer 必须按 `ColdFunctionSymbol.body` 边界跳过签名续行。
+- 本轮修正 Darwin 入栈参数 ABI：callee prologue 保存 `x19/x20` 与 `fp/lr` 后，stack 参数从 `FP+32+offset` 读取；`cold_stack_arg_abi` 锁住第 9/10 个参数不再错读前一组字符串。`RunSystemLinkExecFromCmdline` cold self-exec 短路已移除，生成版 `backend_driver_dispatch_min` 现在可真实执行 `system-link-exec ordinary_zero_exit_fixture`，生成 Mach-O 运行 exit 0。
+- 回归当前为 `28/28 PASS`，新增 `stack_arg_abi`；同时移除 `symbols_add_fn` 的 bare/qualified name 合并和 direct emit 的最小 stub 兜底，失败路径改为 hard-fail。
 - 下一步继续把 expr token facts 接到 statement payload 并向 3000 行推进，同时保持 `cold_compile_elapsed_ms` 三路径一致。
 - 每轮继续记录 `cold_compile_elapsed_ms`，并保持 source-direct、source->CSG、facts direct 三路径一致。

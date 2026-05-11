@@ -238,3 +238,5 @@
 - 本轮顺手修掉 `parse_call` import-mode 未解析调用返回 0 slot 的旧缺口；`parse_call` 与 `parse_call_from_args_span` 现在一致 hard-fail，`import_unresolved_hard_fail` 恢复稳定。
 - 浅导入边界已钉住：被导入模块内部裸名 `Helper` 走当前 import 模块局部名精确查找并运行 exit `39`；被导入模块再 import 叶子模块仍 hard-fail。该实现不是 alias 前缀，也不是 bare-name fallback。
 - `artifacts/backend_driver/cheng` 已替换为 cold linkerless 候选。替换前后均验证 `status`、`help`、三个 exe fixture、跨模块 `emit:obj`、自编译自身；正式入口还能再次 `build-backend-driver`，说明不是旁路候选通过。
+- Darwin 入栈参数错读根因是 callee prologue 保存两组寄存器后才建立 `FP`；读 `FP+16+offset` 会把第 9 个参数错成第 7 个参数，现改为 `FP+32+offset`，并用 `cold_stack_arg_abi` 锁住。
+- `BackendDriverDispatchMinRunSystemLinkExecFromCmdline` 的 cold self-exec 短路已删除；生成版 backend driver 跑 `system-link-exec ordinary_zero_exit_fixture` 可生成 Mach-O 并运行 exit `0`。

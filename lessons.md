@@ -48,7 +48,7 @@
 - cold CSG statement scanner 不能把 bodyless `@importc fn` 后续缩进行当作函数体；无函数体声明只进符号表，后续 `const/type` block 必须留在顶层。
 - cold `std/result` 当前是 object 语义，不是 ADT；`IsErr/IsOk/Value/Error` 必须按 `ok/value/err.msg` 字段 offset lowering，`Result[T]` 要实例化 object layout 后再走 ABI。
 - cold imported object layout 必须在所有 imported types/enums 收集后统一 refine；否则跨 import enum/object 字段会停在 opaque，后续 call ABI 和 field offset 都会漂。
-- cold Darwin 参数 ABI 超过 `x0-x7` 后必须显式 outgoing stack，并在 callee 从 `FP+16+offset` 读；不能继续用“最多 8 参数”的旧约束挡住 backend driver。
+- cold Darwin 参数 ABI 超过 `x0-x7` 后必须显式 outgoing stack；callee prologue 保存 `x19/x20` 与 `fp/lr` 后才建立 `FP`，入栈参数必须从 `FP+32+offset` 读。
 - cold Mach-O 入口 wrapper 若用 `bl main`，必须先保存入口 `LR` 再恢复；否则 `main` 返回后 wrapper 的 `ret` 会跳回 wrapper 内部。
 - cold reachable imported path 函数是源码闭包/外部 ABI 问题；禁止把 `PathAbsolute/PathJoin/FileExistsNonEmpty/WriteTextFile` 临时降成 no-op 或 raw-return。
 - cold backend dispatch 的 syscall/stdlib/path bridge 过完后，下一层 blocker 会变成 `system_link_plan/parser/compiler_world` 源码闭包；禁止用空 `SystemLinkPlanStub` 或假 `missingReasons` 冒充通过。

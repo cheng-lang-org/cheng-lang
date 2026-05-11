@@ -1,5 +1,7 @@
 # 当前任务计划
 
+- 已完成：Darwin cold call ABI 入栈参数读取修正为 `FP+32+offset`；新增 `cold_stack_arg_abi` 防回归，生成版 `backend_driver_dispatch_min` 已能真实 `system-link-exec ordinary_zero_exit_fixture` 并运行 exit 0。
+- 已完成：移除 `RunSystemLinkExecFromCmdline` cold self-exec 短路、`symbols_add_fn` bare/qualified name 合并，以及 direct emit 最小 stub 兜底；相关失败现在 hard-fail。
 - 已完成：冷编译器 `system-link-exec --csg-out:<facts>`，源码先生成 cold CSG facts，再经 facts 降 SoA BodyIR 和 direct Mach-O；backend-driver candidate smoke 已使用该路径，不再手写 facts。
 - 已完成：冷 CFG `if/elif/else` fallthrough 封口顺序修复，旧 source/facts 回归均通过。
 - 已完成：cold facts 覆盖 ADT/match：`cold_csg_type`、`match`、`case` rows 可从源码生成并降为 `TAG_LOAD + SWITCH + PAYLOAD_LOAD`。

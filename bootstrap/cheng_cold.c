@@ -11744,12 +11744,14 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
                                           name, true, declared_kind, declared_type);
     }
     if (type.len > 0) {
+            TypeDef *declared_type = symbols_resolve_type(parser->symbols, type);
             int32_t declared_kind = cold_slot_kind_from_type_with_symbols(parser->symbols, type);
+            if (declared_type && kind == SLOT_VARIANT) declared_kind = SLOT_VARIANT;
             if (declared_kind == SLOT_I64 && kind == SLOT_I32) {
                 slot = cold_materialize_i64_value(body, slot, &kind);
             }
             if (kind != declared_kind) {
-                /* Skip typed let with mismatched kind */
+                die("typed let kind mismatch");
             }
             if (kind == SLOT_ARRAY_I32) {
                 int32_t declared_len = 0;
@@ -15026,7 +15028,8 @@ static void codegen_store_params(Code *code, BodyIR *body) {
         int32_t stack_offset = -1;
         bool in_regs = cold_abi_place_arg(&reg, &stack, kind, size,
                                           &base_reg, &stack_offset);
-        int32_t incoming_stack_offset = 16 + stack_offset;
+        /* Prologue saves x19/x20 and fp/lr before FP is established. */
+        int32_t incoming_stack_offset = 32 + stack_offset;
         if (kind == SLOT_I32) {
             if (in_regs) {
                 a64_emit_str_sp_off(code, base_reg, body->slot_offset[slot], false);
