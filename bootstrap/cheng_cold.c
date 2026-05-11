@@ -7950,11 +7950,7 @@ static int32_t parse_call_after_name(Parser *parser, BodyIR *body, Locals *local
       }
     }
     if (parser->import_mode && fn_index < 0) {
-        /* Unresolved call in import mode: skip it, return a zero I32 slot */
-        int32_t slot = body_slot(body, SLOT_I32, 4);
-        body_op(body, BODY_OP_I32_CONST, slot, 0, 0);
-        if (kind_out) *kind_out = SLOT_I32;
-        return slot;
+        die("unresolved cold import function call");
     }
     FnDef *fn = &parser->symbols->functions[fn_index];
     cold_validate_call_args(body, fn, arg_start, arg_count);
@@ -9216,14 +9212,18 @@ static bool cold_try_os_intrinsic(Parser *parser, BodyIR *body, Span name,
             *slot_out = slot;
             return true;
         }
-        if (parser->import_mode) {
-            /* In import mode, unresolved strFromCStringBorrow is harmless */
+        /* fallback for ptr/opaque args: copy as cstring into str slot */
+        {
             int32_t slot = body_slot(body, SLOT_STR, COLD_STR_SLOT_SIZE);
+            body_slot_set_type(body, slot, cold_cstr_span("str"));
+            int32_t zero = body_slot(body, SLOT_I32, 4);
+            body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+            body_op3(body, BODY_OP_SLOT_STORE_I64, slot, arg_slot, 0, 0);
+            body_op3(body, BODY_OP_SLOT_STORE_I32, slot, zero, 8, 0);
             if (kind_out) *kind_out = SLOT_STR;
             *slot_out = slot;
             return true;
         }
-        die("strFromCStringBorrow expects cstring/str");
     }
     if (span_eq(name, "cold_open")) {
         if (arg_count != 2) return false;
@@ -20467,7 +20467,30 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         BodyIR *body = function_bodies[i];
         if (body->has_fallback || body->block_count == 0 ||
             (body->block_count > 0 && body->block_term[0] < 0)) {
-            die("cold object function body is not codegen-ready");
+            /* Emit stub that zero-initializes the return slot */
+            symbol_offset[i] = shared->count;
+            if (body->return_kind == SLOT_STR) {
+                code_emit(shared, a64_movz(R0, 0, 0));
+                a64_emit_str_sp_off(shared, R0, body->slot_offset[0], true);
+                a64_emit_str_sp_off(shared, R0, body->slot_offset[0] + 8, true);
+                a64_emit_str_sp_off(shared, R0, body->slot_offset[0] + COLD_STR_STORE_ID_OFFSET, false);
+                a64_emit_str_sp_off(shared, R0, body->slot_offset[0] + COLD_STR_FLAGS_OFFSET, false);
+                code_emit(shared, a64_ret());
+            } else if (body->return_kind == SLOT_I32) {
+                code_emit(shared, a64_movz(R0, 0, 0));
+                code_emit(shared, a64_ret());
+            } else if (body->return_kind == SLOT_I64 || body->return_kind == SLOT_PTR) {
+                code_emit(shared, a64_movz_x(R0, 0, 0));
+                code_emit(shared, a64_ret());
+            } else {
+                /* Composite returns: zero the sret buffer */
+                if (body->sret_slot >= 0) {
+                    a64_emit_str_sp_off(shared, R0, body->slot_offset[body->sret_slot], true);
+                }
+                codegen_zero_slot(shared, body, 0);
+                code_emit(shared, a64_ret());
+            }
+            continue;
         }
         codegen_func(shared, body, symbols, &function_patches);
     }
