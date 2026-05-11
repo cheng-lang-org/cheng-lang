@@ -19220,8 +19220,10 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         name_count++;
     }
 
+    /* Only _main (first symbol) is global; rest are local to allow duplicates */
+    int32_t global_count = (name_count > 0) ? 1 : 0;
     bool ok = macho_write_object(out_path, shared->words, shared->count,
-                                 func_names, func_offsets, name_count, local_count,
+                                 func_names, func_offsets, name_count, global_count,
                                  0, 0, 0);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;

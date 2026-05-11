@@ -300,29 +300,42 @@ static bool macho_write_object(const char *path,
     if (reloc_count < 0) reloc_count = 0;
     if (reloc_count > 0 && (!reloc_offsets || !reloc_symbols)) return false;
 
-    /* Build string table first to know its size */
-    char strtab[4096];
+    int32_t nsyms = name_count;
+    int32_t str_cap = 1;
+    for (int32_t i = 0; i < nsyms; i++) {
+        str_cap += (int32_t)strlen(names[i]) + 2;
+    }
+    char *strtab = (char *)calloc((size_t)str_cap + 1, 1);
+    int32_t *name_stroff = (int32_t *)calloc((size_t)(nsyms > 0 ? nsyms : 1), sizeof(int32_t));
+    nlist_64_t *syms = (nlist_64_t *)calloc((size_t)(nsyms > 0 ? nsyms : 1), sizeof(nlist_64_t));
+    if (!strtab || !name_stroff || !syms) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
     int32_t str_off = 1; /* first byte is \0 */
-    int32_t name_stroff[128];
-    for (int32_t i = 0; i < name_count && i < 128; i++) {
+    for (int32_t i = 0; i < nsyms; i++) {
         name_stroff[i] = str_off;
         int32_t nl = (int32_t)strlen(names[i]);
-        if (str_off + nl + 2 < (int32_t)sizeof(strtab)) {
-            strtab[str_off++] = '_';
-            memcpy(strtab + str_off, names[i], nl);
-            str_off += nl;
-            strtab[str_off++] = '\0';
+        if (str_off + nl + 2 > str_cap) {
+            free(strtab);
+            free(name_stroff);
+            free(syms);
+            return false;
         }
+        strtab[str_off++] = '_';
+        memcpy(strtab + str_off, names[i], nl);
+        str_off += nl;
+        strtab[str_off++] = '\0';
     }
     strtab[str_off++] = '\0';
 
     /* Build nlist entries */
-    nlist_64_t syms[128];
-    int32_t nsyms = name_count > 128 ? 128 : name_count;
     for (int32_t i = 0; i < nsyms; i++) {
         syms[i].n_strx  = name_stroff[i];
-        if (i < local_count) {
-            syms[i].n_type  = N_SECT | N_EXT;
+        if (offsets[i] >= 0) {
+            syms[i].n_type  = (uint8_t)(i < local_count ? N_SECT : (N_SECT | N_EXT));
             syms[i].n_sect  = 1;
             syms[i].n_desc  = 0;
             syms[i].n_value = (uint64_t)(offsets[i] * 4);
@@ -339,6 +352,12 @@ static bool macho_write_object(const char *path,
     int32_t reloc_sz = reloc_count * 8;
     struct { int32_t r_address; uint32_t r_info; } *relocs =
         (void *)calloc(reloc_count > 0 ? reloc_count : 1, 8);
+    if (!relocs) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        return false;
+    }
     for (int32_t i = 0; i < reloc_count; i++) {
         uint32_t r_info = ((uint32_t)reloc_symbols[i] & 0xFFFFFF) |
                           (1u << 24) |  /* pcrel */
@@ -363,7 +382,13 @@ static bool macho_write_object(const char *path,
     int32_t total_sz = str_off_file + str_off;
 
     uint8_t *buf = (uint8_t *)calloc(1, total_sz);
-    if (!buf) { free(relocs); return false; }
+    if (!buf) {
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        free(relocs);
+        return false;
+    }
     uint32_t *w = (uint32_t *)buf;
 
     /* Header */
@@ -434,10 +459,20 @@ static bool macho_write_object(const char *path,
     memcpy(buf + str_off_file, strtab, str_off);
 
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { free(buf); free(relocs); return false; }
+    if (fd < 0) {
+        free(buf);
+        free(strtab);
+        free(name_stroff);
+        free(syms);
+        free(relocs);
+        return false;
+    }
     write(fd, buf, total_sz);
     close(fd);
     free(buf);
+    free(strtab);
+    free(name_stroff);
+    free(syms);
     free(relocs);
     return true;
 }
