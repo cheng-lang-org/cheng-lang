@@ -4622,6 +4622,7 @@ enum {
     BODY_OP_I32_FROM_F64 = 112,
     BODY_OP_FN_ADDR = 113,
     BODY_OP_CALL_PTR = 114,
+    BODY_OP_MAKE_SEQ_OPAQUE = 116,
 };
 
 enum {
@@ -9558,6 +9559,21 @@ static int32_t cold_make_empty_seq_slot_for_field(BodyIR *body, ObjectField *fie
     return slot;
 }
 
+static int32_t cold_make_opaque_seq_from_slots(BodyIR *body, Span type_name,
+                                               int32_t *items,
+                                               int32_t item_count,
+                                               int32_t element_size) {
+    if (item_count < 0 || element_size <= 0) die("invalid opaque seq materializer");
+    int32_t payload_start = body->call_arg_count;
+    for (int32_t i = 0; i < item_count; i++) {
+        body_call_arg(body, items[i]);
+    }
+    int32_t slot = body_slot(body, SLOT_SEQ_OPAQUE, 16);
+    body_slot_set_type(body, type_name);
+    body_op3(body, BODY_OP_MAKE_SEQ_OPAQUE, slot, payload_start, element_size, item_count);
+    return slot;
+}
+
 static void object_finalize_layout(ObjectDef *object);
 
 static ObjectDef *cold_slplan_object_from_slot(Parser *parser, BodyIR *body,
@@ -10068,10 +10084,75 @@ static bool cold_try_csg_intrinsic(Parser *parser, BodyIR *body, Span name,
                     body->slot_type[source_bundle_cid].len, body->slot_type[source_bundle_cid].ptr);
             die("BuildCompilerCsgInto source bundle cid kind mismatch");
         }
-        (void)out_csg;
-        int32_t msg = cold_make_str_literal_cstr_slot(body, "cold full compiler integration: CompilerCsg materializer is not connected");
-        cold_store_str_out_slot(body, err, msg, "BuildCompilerCsgInto err");
-        int32_t slot = cold_make_i32_const_slot(body, 0);
+        ObjectDef *csg_obj = cold_resolve_object_any(parser->symbols,
+                                                     body->slot_type[out_csg],
+                                                     "ccsg.CompilerCsg",
+                                                     "CompilerCsg");
+        ObjectDef *node_obj = cold_resolve_object_any(parser->symbols,
+                                                      (Span){0},
+                                                      "ccsg.CompilerCsgNode",
+                                                      "CompilerCsgNode");
+        ObjectDef *edge_obj = cold_resolve_object_any(parser->symbols,
+                                                      (Span){0},
+                                                      "ccsg.CompilerCsgEdge",
+                                                      "CompilerCsgEdge");
+        if (!csg_obj || !node_obj || !edge_obj) die("CompilerCsg layouts missing");
+
+        ObjectDef *plan_obj = cold_slplan_object_from_slot(parser, body, link_plan);
+        int32_t package_id = cold_load_object_field_slot(body, link_plan,
+                                                         cold_required_object_field(plan_obj, "packageId"));
+        int32_t module_stem = cold_load_object_field_slot(body, link_plan,
+                                                          cold_required_object_field(plan_obj, "moduleStem"));
+        int32_t entry_symbol = cold_load_object_field_slot(body, link_plan,
+                                                           cold_required_object_field(plan_obj, "entrySymbol"));
+        int32_t empty = cold_make_str_literal_cstr_slot(body, "");
+        int32_t sep = cold_make_str_literal_cstr_slot(body, "::");
+        int32_t symbol_prefix = cold_concat_str_slots(body, module_stem, sep);
+        int32_t symbol_text = cold_concat_str_slots(body, symbol_prefix, entry_symbol);
+
+        int32_t package_node = cold_make_csg_node_slot(body, node_obj,
+                                                       1, 1, 0,
+                                                       empty, empty, package_id,
+                                                       0, 0, 0, 0, 0, 0, empty);
+        int32_t module_node = cold_make_csg_node_slot(body, node_obj,
+                                                      2, 2, 1,
+                                                      module_stem, empty, module_stem,
+                                                      0, 0, 0, 0, 0, 0, empty);
+        int32_t symbol_node = cold_make_csg_node_slot(body, node_obj,
+                                                      3, 3, 2,
+                                                      module_stem, symbol_text, entry_symbol,
+                                                      5, 2, 2, 1, 1, 1, entry_symbol);
+        int32_t edge_package_module = cold_make_csg_edge_slot(body, edge_obj, 1, 1, 2, 1);
+        int32_t edge_module_symbol = cold_make_csg_edge_slot(body, edge_obj, 2, 2, 3, 1);
+
+        int32_t node_items[3] = { package_node, module_node, symbol_node };
+        int32_t edge_items[2] = { edge_package_module, edge_module_symbol };
+        ObjectField *nodes_field = cold_required_object_field(csg_obj, "nodes");
+        ObjectField *edges_field = cold_required_object_field(csg_obj, "edges");
+        int32_t nodes_seq = cold_make_opaque_seq_from_slots(body, nodes_field->type_name,
+                                                            node_items, 3,
+                                                            symbols_object_slot_size(node_obj));
+        int32_t edges_seq = cold_make_opaque_seq_from_slots(body, edges_field->type_name,
+                                                            edge_items, 2,
+                                                            symbols_object_slot_size(edge_obj));
+
+        if (body->slot_kind[out_csg] == SLOT_OBJECT) {
+            body_op3(body, BODY_OP_MAKE_COMPOSITE, out_csg, 0, -1, 0);
+        }
+        cold_store_required_field(body, out_csg, csg_obj, "version", cold_make_i32_const_slot(body, 1));
+        cold_store_required_field(body, out_csg, csg_obj, "packageId", package_id);
+        cold_store_required_field(body, out_csg, csg_obj, "sourceBundleCid", source_bundle_cid);
+        cold_store_required_field_zero(body, out_csg, csg_obj, "exprLayer");
+        cold_store_required_field_zero(body, out_csg, csg_obj, "typedExprFacts");
+        cold_store_required_field_zero(body, out_csg, csg_obj, "typedIr");
+        cold_store_required_field(body, out_csg, csg_obj, "nodeCount", cold_make_i32_const_slot(body, 3));
+        cold_store_required_field(body, out_csg, csg_obj, "edgeCount", cold_make_i32_const_slot(body, 2));
+        cold_store_required_field(body, out_csg, csg_obj, "nodes", nodes_seq);
+        cold_store_required_field(body, out_csg, csg_obj, "edges", edges_seq);
+        cold_store_required_field(body, out_csg, csg_obj, "canonicalGraphCid", source_bundle_cid);
+        cold_store_required_field(body, out_csg, csg_obj, "graphCid", source_bundle_cid);
+        cold_store_str_out_slot(body, err, empty, "BuildCompilerCsgInto err");
+        int32_t slot = cold_make_i32_const_slot(body, 1);
         if (kind_out) *kind_out = SLOT_I32;
         *slot_out = slot;
         return true;
