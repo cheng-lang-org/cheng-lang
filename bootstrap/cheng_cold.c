@@ -11553,6 +11553,23 @@ static int32_t parse_field_assign(Parser *parser, BodyIR *body, Locals *locals,
             body_op3(body, BODY_OP_SLOT_STORE_I32, local->slot, value_slot, off, 0);
         return block;
     }
+    /* Str field assignment: use known offsets */
+    if (local->kind == SLOT_STR) {
+        if (!parser_take(parser, "=")) die("expected =");
+        int32_t value_kind = SLOT_I32;
+        int32_t value_slot = parse_expr(parser, body, locals, &value_kind);
+        int32_t off = -1;
+        if (span_eq(field_name, "data")) off = COLD_STR_DATA_OFFSET;
+        else if (span_eq(field_name, "len")) off = COLD_STR_LEN_OFFSET;
+        else if (span_eq(field_name, "store_id")) off = COLD_STR_STORE_ID_OFFSET;
+        else if (span_eq(field_name, "flags")) off = COLD_STR_FLAGS_OFFSET;
+        if (off < 0) die("unknown str field");
+        if (off == COLD_STR_DATA_OFFSET)
+            body_op3(body, BODY_OP_SLOT_STORE_I64, local->slot, value_slot, off, 0);
+        else
+            body_op3(body, BODY_OP_SLOT_STORE_I32, local->slot, value_slot, off, 0);
+        return block;
+    }
     Span object_type = cold_type_strip_var(body->slot_type[local->slot], 0);
     ObjectDef *object = symbols_resolve_object(parser->symbols, object_type);
     if (!object) {
@@ -17707,6 +17724,12 @@ static void codegen_op(Code *code, BodyIR *body, Symbols *symbols,
         a64_emit_ldr_sp_off(code, R1, body->slot_offset[a], true);
         code_emit(code, a64_ldr_imm(R0, R1, 0, true));
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst], true);
+    } else if (kind == BODY_OP_SLOT_STORE_I32) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + c, false);
+    } else if (kind == BODY_OP_SLOT_STORE_I64) {
+        a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], true);
+        a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + c, true);
     } else if (kind == BODY_OP_SLOT_STORE_I32) {
         a64_emit_ldr_sp_off(code, R0, body->slot_offset[a], false);
         a64_emit_str_sp_off(code, R0, body->slot_offset[dst] + c, false);
