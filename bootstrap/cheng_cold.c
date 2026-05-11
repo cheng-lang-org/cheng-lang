@@ -11131,6 +11131,93 @@ static void parse_return(Parser *parser, BodyIR *body, Locals *locals, int32_t b
     body_end_block(body, block, term);
 }
 
+static int32_t body_branch_to(BodyIR *body, int32_t block, int32_t target_block);
+
+static bool parser_peek_question_starts_ternary(Parser *parser) {
+    int32_t pos = parser->pos;
+    while (pos < parser->source.len &&
+           (parser->source.ptr[pos] == ' ' || parser->source.ptr[pos] == '\t')) {
+        pos++;
+    }
+    if (pos >= parser->source.len || parser->source.ptr[pos] != '?') return false;
+    pos++;
+    int32_t depth = 0;
+    bool in_string = false;
+    bool in_char = false;
+    while (pos < parser->source.len) {
+        uint8_t c = parser->source.ptr[pos];
+        if (in_string) {
+            if (c == '\\' && pos + 1 < parser->source.len) {
+                pos += 2;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            pos++;
+            continue;
+        }
+        if (in_char) {
+            if (c == '\\' && pos + 1 < parser->source.len) {
+                pos += 2;
+                continue;
+            }
+            if (c == '\'') in_char = false;
+            pos++;
+            continue;
+        }
+        if (c == '\n' || c == '\r') return false;
+        if (c == '"') {
+            in_string = true;
+            pos++;
+            continue;
+        }
+        if (c == '\'') {
+            in_char = true;
+            pos++;
+            continue;
+        }
+        if (depth == 0 && c == ':') return true;
+        if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') {
+            depth--;
+            if (depth < 0) return false;
+        }
+        pos++;
+    }
+    return false;
+}
+
+static bool cold_kind_is_pointer_sized_value(int32_t kind) {
+    return kind == SLOT_PTR || kind == SLOT_I64 || kind == SLOT_OPAQUE ||
+           kind == SLOT_OPAQUE_REF || kind == SLOT_OBJECT_REF ||
+           kind == SLOT_STR_REF || kind == SLOT_SEQ_I32_REF ||
+           kind == SLOT_SEQ_STR_REF || kind == SLOT_I64_REF;
+}
+
+static void cold_store_typed_value_into_slot(BodyIR *body, int32_t dst_slot,
+                                             int32_t dst_kind, int32_t src_slot,
+                                             int32_t *src_kind) {
+    if (dst_kind == SLOT_I32) {
+        src_slot = cold_materialize_i32_ref(body, src_slot, src_kind);
+        if (*src_kind != SLOT_I32) die("ternary int32 branch type mismatch");
+        body_op(body, BODY_OP_COPY_I32, dst_slot, src_slot, 0);
+        return;
+    }
+    if (dst_kind == SLOT_I64) {
+        if (*src_kind == SLOT_I32) src_slot = cold_materialize_i64_value(body, src_slot, src_kind);
+        if (*src_kind != SLOT_I64) die("ternary int64 branch type mismatch");
+        body_op(body, BODY_OP_COPY_I64, dst_slot, src_slot, 0);
+        return;
+    }
+    if (dst_kind == SLOT_PTR) {
+        if (!cold_kind_is_pointer_sized_value(*src_kind)) die("ternary pointer branch type mismatch");
+        body_op(body, BODY_OP_COPY_I64, dst_slot, src_slot, 0);
+        *src_kind = SLOT_PTR;
+        return;
+    }
+    if (*src_kind != dst_kind) die("ternary composite branch type mismatch");
+    body_op(body, BODY_OP_COPY_COMPOSITE, dst_slot, src_slot, 0);
+}
+
 static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
                                   int32_t block, bool is_var) {
     (void)is_var;
@@ -11175,6 +11262,52 @@ static int32_t parse_let_binding(Parser *parser, BodyIR *body, Locals *locals,
         }
     } else {
         slot = parse_expr(parser, body, locals, &kind);
+    }
+    if (parser_peek_question_starts_ternary(parser)) {
+        if (type.len <= 0) die("ternary let requires declared type");
+        (void)parser_token(parser);
+        Span true_expr = parser_take_until_top_level_char(parser, ':',
+                                                          "expected : in ternary expression");
+        if (true_expr.len <= 0) die("expected true expression in ternary");
+        if (!parser_take(parser, ":")) die("expected : in ternary expression");
+
+        slot = cold_materialize_i32_ref(body, slot, &kind);
+        if (kind != SLOT_I32) die("ternary condition must be bool/int32");
+
+        int32_t result_kind = cold_slot_kind_from_type_with_symbols(parser->symbols, type);
+        int32_t result_size = cold_slot_size_from_type_with_symbols(parser->symbols, type, result_kind);
+        if (result_size <= 0) die("ternary result type has unknown size");
+        int32_t result_slot = body_slot(body, result_kind, result_size);
+        body_slot_set_type(body, result_slot, type);
+
+        int32_t zero = body_slot(body, SLOT_I32, 4);
+        body_op(body, BODY_OP_I32_CONST, zero, 0, 0);
+        int32_t true_block = body_block(body);
+        int32_t false_block = body_block(body);
+        int32_t join_block = body_block(body);
+        int32_t cond_term = body_term(body, BODY_TERM_CBR, slot, COND_NE,
+                                      zero, true_block, false_block);
+        body_end_block(body, block, cond_term);
+
+        body_reopen_block(body, true_block);
+        Parser true_parser = {true_expr, 0, parser->arena, parser->symbols, parser->import_mode};
+        int32_t true_kind = SLOT_I32;
+        int32_t true_slot = parse_expr(&true_parser, body, locals, &true_kind);
+        parser_ws(&true_parser);
+        if (true_parser.pos != true_parser.source.len) die("unsupported ternary true expression");
+        cold_store_typed_value_into_slot(body, result_slot, result_kind, true_slot, &true_kind);
+        body_branch_to(body, true_block, join_block);
+
+        body_reopen_block(body, false_block);
+        int32_t false_kind = SLOT_I32;
+        int32_t false_slot = parse_expr(parser, body, locals, &false_kind);
+        cold_store_typed_value_into_slot(body, result_slot, result_kind, false_slot, &false_kind);
+        body_branch_to(body, false_block, join_block);
+
+        body_reopen_block(body, join_block);
+        slot = result_slot;
+        kind = result_kind;
+        block = join_block;
     }
     /* For let bindings (not var), always copy to avoid aliasing the initializer slot */
     if (!is_var && slot >= 0 && (kind == SLOT_I32 || kind == SLOT_I64)) {
@@ -19117,25 +19250,43 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
     }
 
-    /* Resolve inter-function patches */
+    /* Resolve inter-function patches and collect external call relocations */
+    int32_t reloc_cap = func_count * 16;
+    int32_t *reloc_offsets = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+    int32_t *reloc_symbols = arena_alloc(arena, (size_t)reloc_cap * sizeof(int32_t));
+    uint8_t *reloc_types = arena_alloc(arena, (size_t)reloc_cap * sizeof(uint8_t));
+    uint8_t *reloc_pcrels = arena_alloc(arena, (size_t)reloc_cap * sizeof(uint8_t));
+    int32_t reloc_count = 0;
     for (int32_t pi = 0; pi < function_patches.count; pi++) {
         FunctionPatch patch = function_patches.items[pi];
         if (patch.target_function < 0 || patch.target_function >= func_count) continue;
         int32_t target_off = symbol_offset[patch.target_function];
-        if (target_off < 0) continue; /* target has no body, patch stays as-is */
+        if (target_off < 0) {
+            if (reloc_count < reloc_cap) {
+                reloc_offsets[reloc_count] = (int32_t)patch.pos * 4;
+                reloc_symbols[reloc_count] = patch.target_function;
+                reloc_types[reloc_count] = MACHO_ARM64_RELOC_BRANCH26;
+                reloc_pcrels[reloc_count] = 1;
+                reloc_count++;
+            }
+            continue;
+        }
         int32_t delta = target_off - (int32_t)patch.pos;
         shared->words[patch.pos] = (shared->words[patch.pos] & 0xFC000000u) |
                                    ((uint32_t)delta & 0x03FFFFFFu);
     }
 
-    /* Build name/offset arrays for macho_write_object */
-    const char **func_names = arena_alloc(arena, (size_t)func_count * sizeof(const char *));
-    int32_t *func_offsets = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    /* Build name/offset arrays: locals first, then external references */
+    int32_t name_cap = func_count + reloc_count;
+    const char **func_names = arena_alloc(arena, (size_t)name_cap * sizeof(const char *));
+    int32_t *func_offsets = arena_alloc(arena, (size_t)name_cap * sizeof(int32_t));
     int32_t name_count = 0;
+    int32_t local_count = 0;
+    int32_t *ext_map = arena_alloc(arena, (size_t)func_count * sizeof(int32_t));
+    for (int32_t i = 0; i < func_count; i++) ext_map[i] = -1;
     for (int32_t i = 0; i < func_count; i++) {
         if (symbol_offset[i] < 0) continue;
         Span nm = symbols->functions[i].name;
-        /* Dedup: skip if this name already in table (first definition wins) */
         bool dup = false;
         for (int32_t j = 0; j < name_count; j++) {
             if (func_names[j] && (int32_t)strlen(func_names[j]) == nm.len &&
@@ -19143,15 +19294,45 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
         }
         if (dup) continue;
         func_offsets[name_count] = symbol_offset[i];
+        bool has_dot = false;
+        for (int32_t k = 0; k < nm.len; k++) { if (nm.ptr[k] == '.') { has_dot = true; break; } }
+        if (!has_dot) local_count++;
         char *nc = arena_alloc(arena, (size_t)nm.len + 1);
         memcpy(nc, nm.ptr, (size_t)nm.len);
         nc[nm.len] = '\0';
         func_names[name_count] = nc;
         name_count++;
     }
+    /* External symbols for relocation entries: strip module prefix,
+       mark with offset=-1 for N_UNDF|N_EXT */
+    for (int32_t ri = 0; ri < reloc_count; ri++) {
+        int32_t target = reloc_symbols[ri];
+        if (ext_map[target] >= 0) continue;
+        Span nm = symbols->functions[target].name;
+        const char *base = (const char *)nm.ptr;
+        int32_t blen = nm.len;
+        for (int32_t k = nm.len - 1; k > 0; k--) {
+            if (nm.ptr[k] == '.') { base = (const char *)(nm.ptr + k + 1); blen = nm.len - k - 1; break; }
+        }
+        char *nc = arena_alloc(arena, (size_t)blen + 1);
+        memcpy(nc, base, (size_t)blen);
+        nc[blen] = '\0';
+        func_names[name_count] = nc;
+        func_offsets[name_count] = -1;
+        ext_map[target] = name_count;
+        name_count++;
+    }
+    for (int32_t ri = 0; ri < reloc_count; ri++) {
+        int32_t mapped = ext_map[reloc_symbols[ri]];
+        if (mapped >= 0) reloc_symbols[ri] = mapped;
+    }
 
     bool ok = macho_write_object(out_path, shared->words, shared->count,
-                                 func_names, func_offsets, name_count);
+                                 func_names, func_offsets,
+                                 0, 0,
+                                 name_count, local_count,
+                                 reloc_offsets, reloc_symbols,
+                                 reloc_types, reloc_pcrels, reloc_count);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;
 }
