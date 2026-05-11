@@ -9569,7 +9569,7 @@ static int32_t cold_make_opaque_seq_from_slots(BodyIR *body, Span type_name,
         body_call_arg(body, items[i]);
     }
     int32_t slot = body_slot(body, SLOT_SEQ_OPAQUE, 16);
-    body_slot_set_type(body, type_name);
+    body_slot_set_type(body, slot, type_name);
     body_op3(body, BODY_OP_MAKE_SEQ_OPAQUE, slot, payload_start, element_size, item_count);
     return slot;
 }
