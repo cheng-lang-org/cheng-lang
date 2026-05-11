@@ -17569,9 +17569,26 @@ static void codegen_program(Code *code, BodyIR **function_bodies,
             munmap(workers[w].local_code->arena, sizeof(Arena));
         }
     } else {
+        bool *name_seen = arena_alloc(code->arena, (size_t)function_count * sizeof(bool));
+        for (int32_t i = 0; i < function_count; i++) name_seen[i] = false;
         for (int32_t i = 0; i < function_count; i++) {
             if (i == entry_function || !function_bodies[i] ||
                 function_bodies[i]->has_fallback) continue;
+            Span nm = symbols->functions[i].name;
+            const char *base = nm.ptr; int32_t base_len = nm.len;
+            for (int32_t k = nm.len - 1; k > 0; k--)
+                if (nm.ptr[k] == '.' || nm.ptr[k] == ':') { base = nm.ptr + k + 1; base_len = nm.len - k - 1; break; }
+            bool dup = false;
+            for (int32_t j = 0; j < i; j++) {
+                if (!name_seen[j] || !function_bodies[j]) continue;
+                Span prev = symbols->functions[j].name;
+                const char *pb = prev.ptr; int32_t pbl = prev.len;
+                for (int32_t k = prev.len - 1; k > 0; k--)
+                    if (prev.ptr[k] == '.' || prev.ptr[k] == ':') { pb = prev.ptr + k + 1; pbl = prev.len - k - 1; break; }
+                if (pbl == base_len && memcmp(pb, base, (size_t)base_len) == 0) { dup = true; break; }
+            }
+            if (dup) continue;
+            name_seen[i] = true;
             function_pos[i] = code->count;
             if (cold_diag_dump_per_fn || cold_diag_dump_slots) {
                 fprintf(stderr, "[diag] fn[%d] ", i);
@@ -19154,7 +19171,10 @@ static bool cold_compile_source_to_object(const char *out_path, const char *src_
     }
 
     bool ok = macho_write_object(out_path, shared->words, shared->count,
-                                 func_names, func_offsets, name_count);
+                                 func_names, func_offsets,
+                                 0, 0,
+                                 name_count, name_count,
+                                 0, 0, 0, 0, 0);
     munmap((void *)mapped_source.ptr, (size_t)mapped_source.len);
     return ok;
 }
